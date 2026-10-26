@@ -333,5 +333,8 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu/intel_gpu_pll", smoke_combo_coeffs_match_prm_table);
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_pll",
+        smoke_combo_coeffs_match_prm_table
+    );
 }

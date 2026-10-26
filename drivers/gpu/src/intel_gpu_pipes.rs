@@ -689,7 +689,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu/intel_gpu_pipes", smoke_trans_ddi_func_ctl_and_mn);
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_pipes",
+        smoke_trans_ddi_func_ctl_and_mn
+    );
 
     fn smoke_primary_plane_rejects_bad_stride() -> TestResult {
         match build_primary_plane(1920, 1080, 1921, 0x1000, PixelFormat::Argb8888) {

@@ -765,7 +765,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             | dpclka_clk_off(phy);
         self.mmio.write32(DPCLKA_CFGCR0, selected);
         compiler_fence(Ordering::SeqCst);
-        self.mmio.write32(DPCLKA_CFGCR0, selected & !dpclka_clk_off(phy));
+        self.mmio
+            .write32(DPCLKA_CFGCR0, selected & !dpclka_clk_off(phy));
         compiler_fence(Ordering::SeqCst);
     }
 
@@ -842,8 +843,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.mmio.write32(wm_base + PLANE_WM_SAGV_OFFSET, 0);
         self.mmio.write32(wm_base + PLANE_WM_SAGV_TRANS_OFFSET, 0);
         self.mmio.write32(wm_base + PLANE_WM_TRANS_OFFSET, 0);
-        self.mmio
-            .write32(Pipe::A.base() + PLANE_BUF_CFG_OFFSET, PLANE_BUF_CFG_PREBOOT_A);
+        self.mmio.write32(
+            Pipe::A.base() + PLANE_BUF_CFG_OFFSET,
+            PLANE_BUF_CFG_PREBOOT_A,
+        );
         compiler_fence(Ordering::SeqCst);
     }
 
@@ -1526,7 +1529,9 @@ pub mod tests {
         ms.load_buf_trans(crate::intel_gpu_pll::LinkRate::DpHbr2);
         for (i, e) in HBR2_BUF_TRANS.iter().enumerate() {
             let off = Ddi::A.base() + DDI_BUF_TRANS_BASE_OFFSET + (i as u64) * 8;
-            if mmio.writes_to(off) != alloc::vec![e.lo] || mmio.writes_to(off + 4) != alloc::vec![e.hi] {
+            if mmio.writes_to(off) != alloc::vec![e.lo]
+                || mmio.writes_to(off + 4) != alloc::vec![e.hi]
+            {
                 return TestResult::Fail("BUF_TRANS entry not written");
             }
         }

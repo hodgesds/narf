@@ -421,7 +421,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu/intel_gpu_aux", smoke_aux_wire_packing_is_big_endian);
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_aux",
+        smoke_aux_wire_packing_is_big_endian
+    );
 
     fn smoke_aux_ctl_composition_and_success() -> TestResult {
         let mmio = MockMmio::default();
@@ -457,7 +460,10 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu/intel_gpu_aux", smoke_aux_ctl_composition_and_success);
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_aux",
+        smoke_aux_ctl_composition_and_success
+    );
 
     fn smoke_aux_timeout_retries_exactly_three_times() -> TestResult {
         let mmio = MockMmio::default();
