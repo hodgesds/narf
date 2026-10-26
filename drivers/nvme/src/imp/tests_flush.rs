@@ -476,7 +476,20 @@ fn smoke_nvme_suspend_drains_in_flight_io() -> TestResult {
             .store(false, core::sync::atomic::Ordering::Release);
         return TestResult::Fail("a never-drained suspend must report Busy");
     }
-    if super::with_controller_at(1, |c| c.is_ready() && !c.is_suspended()) != Some(true) {
+    // Inspect the controller directly, NOT through
+    // `with_controller_at`: that helper acquires the gate by spinning
+    // on it, and this fixture is itself the gate holder (the forgotten
+    // `acquire` above) — the helper would spin forever on a hold this
+    // fixture only releases in its failure arms or in the second
+    // suspend's model wait, wedging the run.
+    // SAFETY: `req_gate` is held by this fixture (the forgotten
+    // `acquire` guard), so no other reference into the cell can exist
+    // — the same argument `ControllerGuard::deref` makes.
+    let untouched = {
+        let c = unsafe { &*slot.ctrl.get() };
+        c.is_ready() && !c.is_suspended()
+    };
+    if !untouched {
         slot.req_gate
             .store(false, core::sync::atomic::Ordering::Release);
         return TestResult::Fail("a Busy suspend touched the controller");
