@@ -5,6 +5,8 @@
 //! generation folds `qid.version`, so it is the *server's* mutations
 //! — not just this client's — that must invalidate retained pages
 //! (#720/#681). The centrepiece scenario therefore faults a page in,
+//! retires the mapping (the page passes into the shared cache's
+//! bounded idle retention — the regime the generation governs),
 //! changes the file behind the client's back (`replace_data` on the
 //! loopback transport, the fixture's simulated external change),
 //! and requires a fault through a fresh open to serve the new bytes
@@ -124,6 +126,13 @@ fn map_shared(fd: u64, len: u64) -> Result<u64, &'static str> {
     }
 }
 
+fn unmap(base: u64, len: u64) -> Result<(), &'static str> {
+    match call(Syscall::Munmap.raw(), a1(base, len)) {
+        Some(0) => Ok(()),
+        _ => Err("munmap of the first mapping failed"),
+    }
+}
+
 fn mapped_frame(aspace: &AddressSpace, va: u64) -> Option<u64> {
     let region = aspace.lookup(VirtAddr::new(va))?;
     let index = ((va & !(PAGE - 1)) - region.base.as_u64()) / PAGE;
@@ -156,7 +165,7 @@ fn content(len: usize) -> alloc::vec::Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
 }
 
-/// The 9p generation contract end-to-end: a page retained under
+/// The 9p generation contract end-to-end: a page retained idle under
 /// version N must not be served to a fault that arrives after the
 /// server moved to version N+1 — the fold of (qid.path, qid.version)
 /// is the only thing standing between the second fault and stale
@@ -177,6 +186,21 @@ fn smoke_9p_external_change_invalidates_retained_pages() -> TestResult {
         // generation fold never exercised.
         let ops_before = open_narf(&fx.volume)?;
         let identity_before = ops_before.mmap_backing_identity();
+        // Retire the first mapping before the change, so the faulted
+        // page passes into the shared cache's bounded idle retention.
+        // That retention is the regime the generation governs
+        // (filesystem spec §3: an idle page is reused only while its
+        // recorded generation matches the file's current one). While
+        // any mapping stays live, the canonical frame is shared by
+        // construction — the cache keeps exactly one frame per
+        // (identity, offset) — so the fold cannot be exercised across
+        // a live mapping at all: a second fault would be served the
+        // shared frame whatever the generation said. (This is what
+        // the scenario originally asserted, and why it failed once
+        // the #903 EOF refusal stopped masking its second half: the
+        // stale serve it caught was the one-frame-per-key sharing,
+        // not a generation miss.)
+        unmap(base, 3 * PAGE)?;
         // The server-side file changes behind the client's back;
         // `replace_data` bumps the qid version like a real server's
         // write from another client would.

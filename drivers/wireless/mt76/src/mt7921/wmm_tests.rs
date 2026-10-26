@@ -367,7 +367,7 @@ fn mt76_wmm_current_policy_gates_edca_and_each_data_publication() -> TestResult 
     let count = baseline.backend.frames.len();
     if baseline.start_ethernet(&eth) != Err(Error::Authority)
         || baseline.backend.frames.len() != count
-        || baseline.data_pending.is_some()
+        || !baseline.data_pending.is_empty()
     {
         return TestResult::Fail("changed policy published QoS data");
     }
@@ -574,7 +574,7 @@ fn mt76_wmm_cleared_live_policy_never_bootstraps_or_revives_old_grant() -> TestR
         || session.station_permission.is_some()
         || session.security.is_some()
         || session.backend.frames.len() != before
-        || session.data_pending.is_some()
+        || !session.data_pending.is_empty()
         || !session.backend.owner.published
     {
         return TestResult::Fail(

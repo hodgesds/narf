@@ -56,6 +56,30 @@ pub struct Rtw88Device {
 static IFNAME: IrqSafeSpinLock<&'static str> = IrqSafeSpinLock::new("");
 
 impl Rtw88Device {
+    /// Exact distinct C21/C22 HT20 emission measurement metadata. No grant.
+    pub async fn ht20_request(&self) -> Result<super::Ht20Request, super::FirmwareError> {
+        if let Some(s) = &self.sibling {
+            s.lifecycle().ht20_request().await
+        } else {
+            self.firmware
+                .as_ref()
+                .ok_or(super::FirmwareError::Unsupported)?
+                .lifecycle()
+                .ht20_request()
+                .await
+        }
+    }
+    /// Metadata for the distinct N21L extension; N21S alone remains legacy1M.
+    pub async fn rtl8821c_legacy_wmm_request(
+        &self,
+    ) -> Result<super::C21LegacyWmmRequest, super::FirmwareError> {
+        self.sibling
+            .as_ref()
+            .ok_or(super::FirmwareError::Unsupported)?
+            .lifecycle()
+            .legacy_wmm_request()
+            .await
+    }
     /// Metadata for a separately measured C22 legacy12/WMM station recipe.
     /// Neither this request nor N22Cv2 alone grants the optional profile.
     pub async fn rtl8822c_legacy_wmm_request(
@@ -210,6 +234,9 @@ impl WirelessNetIface for Rtw88Device {
                 eht_supported: false,
             },
         }
+    }
+    fn phy_capabilities(&self, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
+        self.interface.as_ref()?.phy_capabilities(band)
     }
 
     async fn scan(&self, req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {

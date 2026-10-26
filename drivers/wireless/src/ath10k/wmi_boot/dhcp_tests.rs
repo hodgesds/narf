@@ -6,6 +6,8 @@ use alloc::{string::String, sync::Arc};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::Interface;
 use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessError};
+#[path = "ht_conversation_tests.rs"]
+mod ht_conversation_tests;
 #[path = "wmm_conversation_tests.rs"]
 mod wmm_conversation_tests;
 fn five_ghz_policy() -> narf_wireless::reg::RegulatoryDomain {
@@ -868,6 +870,32 @@ fn composition_profile(
     frequency: u16,
     qos: bool,
 ) -> Result<(), &'static str> {
+    composition_radio(
+        version,
+        dialect,
+        secured,
+        active_scan,
+        power_save,
+        frequency,
+        if qos { TestPhy::Wmm } else { TestPhy::Legacy },
+    )
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TestPhy {
+    Legacy,
+    Wmm,
+    Ht,
+}
+fn composition_radio(
+    version: u32,
+    dialect: Dialect,
+    secured: bool,
+    active_scan: bool,
+    power_save: bool,
+    frequency: u16,
+    phy: TestPhy,
+) -> Result<(), &'static str> {
+    let qos = phy != TestPhy::Legacy;
     let h = Harness::new_on(
         version,
         dialect,
@@ -882,6 +910,10 @@ fn composition_profile(
             f.wmm_offer = Some(WMM_PARAMETERS.to_vec());
             f.wmm_response = Some(WMM_PARAMETERS.to_vec());
         });
+    }
+    if phy == TestPhy::Ht {
+        ht_conversation_tests::enable(&h);
+        h.model(|m| m.data.as_mut().unwrap().rx_phy = Some((8, 7, 0x80)));
     }
     if power_save {
         h.model(|model| {

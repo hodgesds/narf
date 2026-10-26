@@ -68,6 +68,9 @@ impl Context {
     pub(super) fn started(&self) -> bool {
         self.active.is_some()
     }
+    pub(super) fn needs_service(&self) -> bool {
+        self.active.as_ref().is_some_and(|s| !s.incoming.is_empty())
+    }
     pub(super) fn has_pairwise(&self) -> bool {
         self.active.as_ref().is_some_and(|s| s.keys[0].is_some())
     }
@@ -138,7 +141,7 @@ impl Owner {
             protected: true,
         })
     }
-    fn security_api(&self) -> Result<u8, &'static str> {
+    pub(super) fn security_api(&self) -> Result<u8, &'static str> {
         // sta.c uses API_TKIP_MIC_KEYS to select the76-byte command and
         // iwl_fw_lookup_cmd_ver(..., new_api ? 2 : 1). Missing/UNKNOWN
         // table records therefore meanv2 here, not an absent command.
@@ -171,7 +174,7 @@ impl Owner {
         })
         .await
     }
-    async fn secure_using(
+    pub(super) async fn secure_using(
         &mut self,
         pmk: [u8; 32],
         mut nonce: impl FnMut() -> Result<[u8; 32], &'static str>,
@@ -242,7 +245,7 @@ impl Owner {
         })
         .await
     }
-    async fn service_security_using(
+    pub(super) async fn service_security_using(
         &mut self,
         mut nonce: impl FnMut() -> Result<[u8; 32], &'static str>,
         mut policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
@@ -265,6 +268,7 @@ impl Owner {
             .as_mut()
             .unwrap()
             .port_open = false;
+        self.clear_data_aggregate();
         self.phase = Phase::SecuringData;
         let result = self.security_loop(&mut nonce, &mut policy).await;
         self.finish_security(result)
@@ -516,6 +520,7 @@ impl Owner {
         &mut self,
         policy: &mut impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(), &'static str> {
+        self.clear_data_aggregate();
         let reply = self
             .qualified_link_command(1, 0x18, &super::auth::disable_tx(true), policy)
             .await?;
@@ -723,4 +728,4 @@ fn key_digest(key: &[u8]) -> [u8; 32] {
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "mvm_security_tests.rs"]
-mod tests;
+pub(super) mod tests;

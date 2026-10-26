@@ -1,10 +1,14 @@
 //! CONNAC2 cut-through management TX and two-phase token retirement.
 //! Linux ecd997b0189a: mt76_connac_mac.c, mt7921/{pci_mac,mac}.c.
 use super::firmware_transport::Error;
-use alloc::vec::Vec;
+use alloc::{collections::VecDeque, vec::Vec};
 
 pub(super) const HEADER: usize = 64; // 32-byte TXD + 32-byte hardware TXP.
 const TOKEN_LIMIT: u16 = 8192; // Linux MT7921_TOKEN_SIZE; zero is unused here.
+/// Less than the16-entry physical ring: producer equality never means a
+/// completely full ring, and each submitted payload keeps its own dual proof.
+pub(super) const PIPELINE: usize = 8;
+pub(super) const RING_SLOTS: usize = 16;
 
 /// Encode an unencrypted native frame at the selected AP basic rate.
 /// Publication remains private to the hardware backend until association
@@ -116,6 +120,21 @@ pub(super) fn ethernet_qos(
     Ok(bytes)
 }
 
+/// Only the completed originator owner selects this native eligibility.
+/// Firmware still chooses rate/sequence/aggregation and owns CCMP PN; no TX
+/// A-MSDU bit is enabled and each MSDU keeps its own token/terminal status.
+pub(super) fn ethernet_aggregated(
+    frame: &[u8],
+    payload: u64,
+    token: u16,
+    protected: bool,
+) -> Result<[u8; HEADER], Error> {
+    let mut out = ethernet_qos(frame, payload, token, 1, protected, true)?;
+    let word = u32::from_le_bytes(out[12..16].try_into().unwrap()) & !(1 << 28);
+    out[12..16].copy_from_slice(&word.to_le_bytes());
+    Ok(out)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Completion {
     pub token: u16,
@@ -159,35 +178,54 @@ pub(super) fn releases(bytes: &[u8]) -> Result<Vec<Completion>, Error> {
 #[derive(Debug)]
 struct Pending {
     token: u16,
+    slot: usize,
     dma: bool,
     firmware: Option<u8>,
 }
-/// A deliberately serialized first path: no slot reuse before BOTH proofs.
+/// No token/slot reuse before BOTH DMA and native firmware terminal proofs.
 #[derive(Debug)]
 pub(super) struct Tokens {
     next: u16,
-    pending: Option<Pending>,
+    pending: VecDeque<Pending>,
 }
 impl Tokens {
     pub fn new() -> Self {
         Self {
             next: 1,
-            pending: None,
+            pending: VecDeque::with_capacity(PIPELINE),
         }
     }
     pub fn available(&self) -> Result<u16, Error> {
-        if self.pending.is_some() {
+        if !self.pending.is_empty() {
             Err(Error::Busy)
         } else {
             Ok(self.next)
         }
     }
+    pub fn available_pipelined(&self) -> Result<u16, Error> {
+        if self.pending.len() >= PIPELINE || self.pending.iter().any(|p| p.token == self.next) {
+            Err(Error::Busy)
+        } else {
+            Ok(self.next)
+        }
+    }
+    pub fn owns_slot(&self, slot: usize) -> bool {
+        self.pending.iter().any(|p| p.slot == slot)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
     pub fn begin(&mut self, token: u16) -> Result<(), Error> {
-        if self.available()? != token {
+        self.available()?;
+        self.begin_at(token, 0)
+    }
+    pub fn begin_at(&mut self, token: u16, slot: usize) -> Result<(), Error> {
+        if self.available_pipelined()? != token || slot >= RING_SLOTS || self.owns_slot(slot) {
             return Err(Error::Ring);
         }
-        self.pending = Some(Pending {
+        self.pending.push_back(Pending {
             token,
+            slot,
             dma: false,
             firmware: None,
         });
@@ -199,29 +237,39 @@ impl Tokens {
         Ok(())
     }
     pub fn dma_done(&mut self) -> Result<(), Error> {
-        self.pending.as_mut().ok_or(Error::Ring)?.dma = true;
+        self.pending.front_mut().ok_or(Error::Ring)?.dma = true;
+        Ok(())
+    }
+    pub fn dma_done_at(&mut self, slot: usize) -> Result<(), Error> {
+        self.pending
+            .iter_mut()
+            .find(|p| p.slot == slot)
+            .ok_or(Error::Ring)?
+            .dma = true;
         Ok(())
     }
     pub fn firmware_done(&mut self, records: &[Completion]) -> Result<(), Error> {
-        let Some(pending) = self.pending.as_ref() else {
-            return Ok(());
-        };
-        let mut status = pending.firmware;
-        for record in records
-            .iter()
-            .filter(|record| record.token == pending.token)
-        {
-            if status.is_some_and(|old| old != record.status) {
-                return Err(Error::MalformedEvent);
+        // Validate the entire event against every owned token before updating
+        // any record. A contradictory later entry cannot partially retire an
+        // earlier payload from the same native TX-free packet.
+        for pending in &self.pending {
+            let mut status = pending.firmware;
+            for record in records.iter().filter(|r| r.token == pending.token) {
+                if status.is_some_and(|old| old != record.status) {
+                    return Err(Error::MalformedEvent);
+                }
+                status = Some(record.status);
             }
-            status = Some(record.status);
         }
-        // Commit only after every matching record was validated.
-        self.pending.as_mut().unwrap().firmware = status;
+        for pending in &mut self.pending {
+            if let Some(record) = records.iter().find(|r| r.token == pending.token) {
+                pending.firmware = Some(record.status);
+            }
+        }
         Ok(())
     }
     pub fn finish(&mut self) -> Option<Completion> {
-        let pending = self.pending.as_ref()?;
+        let pending = self.pending.front()?;
         if !pending.dma {
             return None;
         }
@@ -229,7 +277,7 @@ impl Tokens {
             token: pending.token,
             status: pending.firmware?,
         };
-        self.pending = None;
+        self.pending.pop_front();
         Some(result)
     }
 }

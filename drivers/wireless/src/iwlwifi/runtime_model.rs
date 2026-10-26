@@ -226,6 +226,7 @@ pub(in crate::iwlwifi) fn create_for_format(
         versions: Vec::new(),
         armed: false,
         failed: false,
+        station_stop: None,
     };
     (hardware, firmware)
 }

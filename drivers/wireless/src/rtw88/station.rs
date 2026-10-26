@@ -84,6 +84,7 @@ enum Kind {
     Association,
     Security,
     Data,
+    Decline,
 }
 struct Pending {
     id: u64,
@@ -112,6 +113,9 @@ pub(super) struct State {
     admission: Admission,
     prepared: bool,
     extension: Option<Arc<super::station_profile::Grant>>,
+    ht: Option<Arc<super::ht::Grant>>,
+    local_ht: Option<association::phy::LocalPhy>,
+    decline: Option<Vec<u8>>,
     wmm_requested: bool,
     wmm: Option<narf_wireless::wmm::Parameters>,
     data_profile: super::packet_format::DataProfile,
@@ -120,7 +124,7 @@ pub(super) struct State {
     peer: Option<ObservedBss>,
     plan: Option<JoinPlan>,
     security: Option<Security>,
-    incoming: VecDeque<Mpdu>,
+    incoming: VecDeque<(Mpdu, bool)>,
     received: VecDeque<Vec<u8>>,
     pending: Option<Pending>,
     delivered_reply: Option<Pending>,
@@ -152,6 +156,9 @@ impl State {
             admission,
             prepared: false,
             extension: None,
+            ht: None,
+            local_ht: None,
+            decline: None,
             wmm_requested: false,
             wmm: None,
             data_profile: super::packet_format::DataProfile::LEGACY,
@@ -198,6 +205,9 @@ impl State {
             && self.delivered_reply.is_none()
             && self.security.as_ref().is_none_or(Security::port_open)
     }
+    pub(super) fn receive_open(&self) -> bool {
+        self.peer().is_some() && self.security.as_ref().is_none_or(Security::port_open)
+    }
     pub(super) async fn start(&mut self, io: &mut impl Io) -> Result<(), Error> {
         if self.phase() != Phase::Prepared {
             return Err(Error::State);
@@ -214,6 +224,7 @@ impl State {
         self.admission.run(|| Ok(io.packet_start()))??;
         self.last_now = self.environment.now_ms();
         self.phase = Phase::Passive;
+        self.local_ht = io.station_ht_facts().and_then(super::ht::Facts::local);
         attempt.armed = false;
         Ok(())
     }
@@ -227,6 +238,7 @@ impl State {
         self.incoming.clear();
         self.received.clear();
         self.peer_commit = None;
+        self.decline = None;
         self.wmm = None;
         self.wmm_requested = false;
         self.data_profile = super::packet_format::DataProfile::LEGACY;
@@ -308,7 +320,11 @@ impl State {
     fn cache(&mut self, frame: &Mpdu, now: u64) {
         // This native profile exposes no calibrated per-frame dBm estimate.
         let signal = None;
-        let Ok(candidate) = association::observe(frame, 1, self.own, signal) else {
+        let observed = match &self.local_ht {
+            Some(p) => association::observe_with_phy(frame, 1, self.own, signal, p),
+            None => association::observe(frame, 1, self.own, signal),
+        };
+        let Ok(candidate) = observed else {
             return;
         };
         if candidate.basic_rates & 1 == 0 {
@@ -403,6 +419,9 @@ impl State {
                 break;
             }
             if let Some(frame) = step.frame {
+                if frame.phy.is_some_and(|p| !p.initial_channel()) {
+                    continue;
+                }
                 if self.lost(&frame) {
                     return Err(Error::PeerLost);
                 }
@@ -411,7 +430,9 @@ impl State {
                     if self.incoming.len() == 64 {
                         return Err(Error::State);
                     }
-                    self.incoming.push_back(frame);
+                    let admitted =
+                        self.established && self.security.as_ref().is_none_or(Security::port_open);
+                    self.incoming.push_back((frame, admitted));
                 }
             }
         }
@@ -425,6 +446,7 @@ impl State {
                     return Err(Error::State);
                 }
                 publication.invoke(|| Ok(security.reply_delivered(receipt.bytes.len())))??;
+                self.admission.retire_receive()?;
             }
         }
         for _ in 0..64 {
@@ -438,7 +460,7 @@ impl State {
             {
                 break;
             }
-            let Some(frame) = self.incoming.pop_front() else {
+            let Some((frame, data_admitted)) = self.incoming.pop_front() else {
                 break;
             };
             match self.phase {
@@ -485,7 +507,26 @@ impl State {
                             self.data_profile = super::packet_format::DataProfile {
                                 rates,
                                 qos: self.wmm.is_some(),
+                                mcs: 0,
+                                sgi: false,
                             };
+                            if let Some(h) = &self.ht {
+                                let negotiated = self
+                                    .plan
+                                    .as_ref()
+                                    .and_then(JoinPlan::negotiated_phy)
+                                    .ok_or(Error::Profile)?;
+                                if negotiated.width() != association::phy::Width::Twenty
+                                    || negotiated.ht().operation().protection() != 0
+                                {
+                                    return Err(Error::Profile);
+                                }
+                                self.data_profile = h.profile(
+                                    rates,
+                                    negotiated.ht().tx_mcs()[0],
+                                    negotiated.ht().tx_sgi20(),
+                                )?;
+                            }
                         }
                         self.peer_commit = Some((aid, short));
                         self.last_peer = now;
@@ -493,14 +534,90 @@ impl State {
                     }
                 }
                 Phase::FourWay | Phase::Open => {
+                    if self.ht.is_some() {
+                        if let Some(bytes) = super::ht::decline(
+                            frame.bytes(),
+                            self.own,
+                            self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
+                        ) {
+                            if self
+                                .decline
+                                .as_ref()
+                                .is_some_and(|pending| pending != &bytes)
+                            {
+                                return Err(Error::State);
+                            }
+                            self.decline = Some(bytes);
+                            continue;
+                        }
+                    }
                     if self.extension.is_some()
-                        && (frame.rate >= 12 || self.data_profile.rates & (1 << frame.rate) == 0)
+                        && (if frame.rate >= 12 {
+                            self.ht.is_none() || frame.rate >= 20
+                        } else {
+                            self.data_profile.rates & (1 << frame.rate) == 0
+                        })
                     {
                         continue;
                     }
+                    let qos = frame.bytes().get(24..26);
+                    let aggregate = frame.bytes().first() == Some(&0x88)
+                        && qos.is_some_and(|q| q[0] & 0x80 != 0);
                     if frame.bytes().first() == Some(&0x88)
-                        && (!self.data_profile.qos || frame.bytes().get(24..26) != Some(&[0, 0]))
+                        && (!self.data_profile.qos
+                            || if self.ht.is_some() {
+                                qos.is_none_or(|q| q[0] & 0x70 != 0 || q[1] != 0)
+                            } else {
+                                qos != Some(&[0, 0])
+                            })
                     {
+                        continue;
+                    }
+                    if !data_admitted
+                        && !plaintext_eapol(
+                            frame.bytes(),
+                            self.own,
+                            self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
+                        )
+                    {
+                        continue;
+                    }
+                    if aggregate {
+                        let b = frame.bytes();
+                        if self.ht.is_none()
+                            || frame.rate < 12
+                            || !self.established
+                            || b.len() < 26
+                            || b[1] & 0x87 != 2
+                            || b[22] & 15 != 0
+                            || b[10..16] != self.peer.as_ref().ok_or(Error::State)?.bss.bssid
+                            || b[16..22] == [0; 6]
+                            || b[16] & 1 != 0
+                        {
+                            continue;
+                        }
+                        let decoded = if let Some(s) = &mut self.security {
+                            if !s.port_open() {
+                                continue;
+                            }
+                            s.receive_amsdu(&frame)?
+                        } else if b[1] & 0x40 == 0 {
+                            narf_wireless::amsdu::decode(
+                                &b[26..],
+                                self.own,
+                                b[4..10].try_into().unwrap(),
+                            )
+                            .ok()
+                        } else {
+                            None
+                        };
+                        if let Some(frames) = decoded {
+                            if self.received.len().saturating_add(frames.len()) > 64 {
+                                return Err(Error::State);
+                            }
+                            self.received.extend(frames);
+                            self.last_peer = now;
+                        }
                         continue;
                     }
                     if let Some(security) = &mut self.security {
@@ -516,6 +633,7 @@ impl State {
                                     self.own,
                                     self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
                                     self.data_profile.qos,
+                                    self.ht.is_some(),
                                 ) {
                                     self.last_peer = now;
                                     if self.received.len() == 64 {
@@ -525,6 +643,10 @@ impl State {
                                 }
                             }
                             station_security::Rx::ReplyReady => {
+                                self.admission.retire_receive()?;
+                                self.received.clear();
+                                self.incoming.clear();
+                                self.decline = None;
                                 if self.established && !handshake_active {
                                     self.deadline = now.saturating_add(5000);
                                 }
@@ -536,6 +658,7 @@ impl State {
                         self.own,
                         self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
                         self.data_profile.qos,
+                        self.ht.is_some(),
                     ) {
                         self.last_peer = now;
                         if self.received.len() == 64 {
@@ -555,6 +678,8 @@ impl State {
                 .map(|bytes| bytes.to_vec())
             {
                 self.transmit(io, reply, Kind::Security)?;
+            } else if let Some(reply) = self.decline.take() {
+                self.transmit(io, reply, Kind::Decline)?;
             }
         }
         if idle
@@ -642,7 +767,32 @@ impl State {
         } else {
             SecurityMode::Open
         };
-        let mut plan = JoinPlan::prepare(&candidate.bss, self.own, ssid, mode)?;
+        let extension = io
+            .station_extension()?
+            .filter(|g| candidate.basic_rates & !g.rates() == 0);
+        let proposed = match &extension {
+            Some(g)
+                if g.wmm()
+                    && narf_wireless::wmm::Parameters::parse(
+                        &candidate.bss.information_elements,
+                    )
+                    .map_err(|_| Error::Profile)?
+                    .is_some() =>
+            {
+                io.station_ht_extension(g.clone())?
+            }
+            _ => None,
+        };
+        let mut plan = match &proposed {
+            Some(h) => JoinPlan::prepare_with_phy(&candidate.bss, self.own, ssid, mode, h.local())?,
+            None => JoinPlan::prepare(&candidate.bss, self.own, ssid, mode)?,
+        };
+        let ht = proposed.filter(|_| plan.offered_phy().is_some());
+        if plan.offered_phy().is_some_and(|p| {
+            p.width() != association::phy::Width::Twenty || p.ht().operation().protection() != 0
+        }) {
+            return Err(Error::Profile);
+        }
         plan.append_sme_ies(ies)?;
         if let Some(pmk) = pmk {
             let nonce = self.environment.nonce().ok_or(Error::Entropy)?;
@@ -663,8 +813,8 @@ impl State {
             armed: true,
         };
         // Missing/unqualified extension preserves the original CCK1 profile.
-        // C21 cannot supply this C22-only sealed grant through its native Io.
-        if let Some(grant) = io.station_extension()? {
+        // Each chip can supply only its own exact-board sealed extension.
+        if let Some(grant) = extension {
             if candidate.basic_rates & !grant.rates() == 0 {
                 let p = if grant.wmm() {
                     narf_wireless::wmm::Parameters::parse(&candidate.bss.information_elements)
@@ -680,6 +830,21 @@ impl State {
                     .run(|| io.station_bind_extension(grant.clone()))?;
                 self.extension = Some(grant);
             }
+        }
+        if let Some(h) = ht {
+            self.admission.run(|| io.station_bind_ht(h.clone()))?;
+            h.program(io, &self.admission).await?;
+            // RX may arrive at negotiated HT rates immediately after the AP's
+            // association response, before the awaited native peer commit.
+            // The native RX bound is the locally advertised MCS0..7, whereas
+            // ordinary TX remains phase-gated until the bound response.
+            let p = h.profile(
+                candidate.rates & self.extension.as_ref().ok_or(Error::State)?.rates(),
+                h.mcs(),
+                false,
+            )?;
+            self.admission.run(|| io.packet_profile(p))?;
+            self.ht = Some(h);
         }
         station_control::prepare_peer(io, bssid, &self.admission).await?;
         self.peer = Some(candidate);
@@ -777,10 +942,21 @@ pub(super) fn admitted(frame: &[u8], own: [u8; 6]) -> bool {
         )
 }
 fn ethernet(frame: &[u8], own: [u8; 6], peer: [u8; 6]) -> Option<Vec<u8>> {
-    ethernet_profile(frame, own, peer, false)
+    ethernet_profile(frame, own, peer, false, false)
 }
-fn ethernet_profile(frame: &[u8], own: [u8; 6], peer: [u8; 6], qos: bool) -> Option<Vec<u8>> {
-    let header = if frame.first() == Some(&0x88) && qos && frame.get(24..26) == Some(&[0, 0]) {
+fn ethernet_profile(
+    frame: &[u8],
+    own: [u8; 6],
+    peer: [u8; 6],
+    qos: bool,
+    ht: bool,
+) -> Option<Vec<u8>> {
+    let header = if frame.first() == Some(&0x88)
+        && qos
+        && frame
+            .get(24..26)
+            .is_some_and(|q| q[1] == 0 && if ht { q[0] & 0xf0 == 0 } else { q[0] == 0 })
+    {
         26
     } else {
         24
@@ -806,4 +982,17 @@ fn ethernet_profile(frame: &[u8], own: [u8; 6], peer: [u8; 6], qos: bool) -> Opt
     bytes.extend_from_slice(&frame[16..22]);
     bytes.extend_from_slice(&frame[header + 6..]);
     Some(bytes)
+}
+fn plaintext_eapol(b: &[u8], own: [u8; 6], ap: [u8; 6]) -> bool {
+    let at = if b.first() == Some(&0x88) { 26 } else { 24 };
+    b.len() >= at + 12
+        && b[1] & 0xc7 == 2
+        && b[4..10] == own
+        && b[10..16] == ap
+        && b[16..22] == ap
+        && (at != 26 || b[24] & 0xf0 == 0 && b[25] == 0)
+        && b[at..at + 8] == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]
+        && (1..=3).contains(&b[at + 8])
+        && b[at + 9] == 3
+        && usize::from(u16::from_be_bytes([b[at + 10], b[at + 11]])) + at + 12 == b.len()
 }

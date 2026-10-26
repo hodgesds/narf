@@ -2359,6 +2359,20 @@ impl KernelTask {
             // task that switched to this executor.
             unsafe { narf_arch::enable_interrupts() };
         }
+        if resume_irqs_masked && !narf_arch::interrupts_enabled() {
+            // The masked continuation did not re-park masked (it completed,
+            // or yielded with IRQs enabled), so no MASKED_EXCEPTION_RETURN
+            // was published for this return — and the switch above restored
+            // the executor context this call saved AFTER masking for the
+            // resume, so the executor would inherit the continuation's IRQ
+            // mask and silently stop servicing IRQs on this CPU. The entry
+            // contract is an IRQ-enabled executor (debug_asserted where this
+            // call masks for the resume); restore it.
+            // SAFETY: no task context is live on this CPU after the switch
+            // back, and the executor continuation resumed here was entered
+            // with IRQs enabled.
+            unsafe { narf_arch::enable_interrupts() };
+        }
         complete_direct_return(resumed_cpu);
         complete_direct_root_poll(resumed_cpu, self as *mut KernelTask);
         // Both a voluntary yield and an involuntary preemption resume here,
@@ -2495,6 +2509,21 @@ impl KernelTask {
         if MASKED_EXCEPTION_RETURN.inner[resumed_cpu].swap(false, Ordering::AcqRel) {
             // SAFETY: the masked exception continuation is suspended on its
             // private stack; the executor must accept the completion IRQ.
+            unsafe { narf_arch::enable_interrupts() };
+        }
+        if resume_irqs_masked && !narf_arch::interrupts_enabled() {
+            // The masked continuation did not re-park masked (it completed,
+            // or yielded with IRQs enabled), so no MASKED_EXCEPTION_RETURN
+            // was published for this return — and the switch above restored
+            // the executor context this call saved AFTER masking for the
+            // resume (kernel_switch carries DAIF with the context), so the
+            // executor would inherit the continuation's IRQ mask and
+            // silently stop servicing IRQs on this CPU. The entry contract
+            // is an IRQ-enabled executor (debug_asserted where this call
+            // masks for the resume); restore it.
+            // SAFETY: no task context is live on this CPU after the switch
+            // back, and the executor continuation resumed here was entered
+            // with IRQs enabled.
             unsafe { narf_arch::enable_interrupts() };
         }
         complete_direct_return(resumed_cpu);

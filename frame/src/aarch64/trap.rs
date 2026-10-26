@@ -475,18 +475,18 @@ fn try_heal_user_abort(esr: u64, far: u64, may_wait_for_reclaim: bool) -> HealOu
             bus = r == Err(narf_memory::AddressSpaceError::Bus);
             // A guard marker is a final SIGSEGV, never a stack grow.
             let guard_fault = r == Err(narf_memory::AddressSpaceError::GuardPage);
-            // SAFETY: same.
-            if !bus
-                && !guard_fault
-                && unsafe {
+            if !bus && !guard_fault {
+                // SAFETY: same identity-map argument.
+                if unsafe {
                     as_arc.try_grow_stack_with_limits(
                         v,
                         narf_userspace::handlers::current_stack_growth_limits,
                     )
                 }
                 .is_ok()
-            {
-                return HealOutcome::Healed;
+                {
+                    return HealOutcome::Healed;
+                }
             }
         }
     }

@@ -12,11 +12,11 @@
 //! implemented in `runtime`, `device`, and `connection`. The current MLD
 //! command profile targets Sc/BE211 firmware. Unsupported command
 //! versions fail startup explicitly. Gen2 has a retained API77 context-v1
-//! boot owner with RFH/TFH commands and NVM initialization. Native station
-//! admission and association stay gated until the remaining MVM station
-//! lifecycle is implemented. The retained boot owner supports force-passive
-//! scanning after optional DQA/current-MCC and actual idle MLD MAC/link
-//! preparation selected from the installed API77 command profile.
+//! boot owner with RFH/TFH commands and NVM initialization. The separate
+//! `mvm_device` publishes its retained legacy20 Open/WPA2 station worker only
+//! after exact discovered firmware selection and native initialization; actual
+//! signed platform power is required before station transmit. It supports
+//! passive scans, native MLME/keys/data and receipt-fenced local retirement.
 //!
 //! The station path supports 2.4/5 GHz legacy-rate Open or WPA2-PSK/CCMP
 //! networks. Firmware supplies channel/antenna data and enforces its
@@ -54,7 +54,10 @@ pub mod aggregation;
 pub mod bcast;
 pub mod boot_context;
 mod bootstrap;
+pub use bootstrap::gen2_ht20_transmit_power_request;
+pub use bootstrap::gen2_transmit_power_request;
 pub use bootstrap::{provision, provision_state, ProvisionState};
+pub use mvm_boot::PowerRequest as Gen2TransmitPowerRequest;
 pub mod connection;
 mod context_v1;
 pub mod data_queue;
@@ -73,6 +76,8 @@ pub mod iwl_msix;
 pub mod mac_ctx;
 pub mod mlme;
 mod mvm_boot;
+mod mvm_device;
+mod mvm_publication;
 pub mod pnvm;
 mod progress;
 pub mod qos;
@@ -150,9 +155,9 @@ unsafe impl Send for IwlDevice {}
 unsafe impl Sync for IwlDevice {}
 
 impl IwlDevice {
-    /// The Gen2 transport can initialise diagnostic RX/TX rings, but it
-    /// does not yet own the firmware command, response, and completion
-    /// lifecycle needed to make wireless control-plane operations safe.
+    /// This historical diagnostic facade does not own a native firmware
+    /// command, response, and completion lifecycle. The distinct retained
+    /// mvm_device exposes the Gen2 station implementation.
     ///
     /// Keeping this gate in one helper makes every exposed legacy operation
     /// fail before it allocates DMA memory or writes a hardware doorbell.
@@ -1255,7 +1260,8 @@ pub struct ParsedUcode<'a> {
     pub init_sections: Vec<FwSection<'a>>,
     /// Sections from the `SEC_RT` TLV stream (image type REGULAR).
     pub rt_sections: Vec<FwSection<'a>>,
-    /// Raw `FW_VERSION` triple, if present: (major, minor, api).
+    /// Raw display `FW_VERSION` triple: (major, minor, local component).
+    /// Header/API_NEW_VERSION selects the protocol API independently.
     pub fw_version: Option<(u32, u32, u32)>,
     /// PNVM version metadata when present; runtime ALIVE SKU selects
     /// the required calibration image (embedded or an external sibling).
@@ -1419,7 +1425,7 @@ pub fn parse_ucode(bytes: &[u8]) -> Result<ParsedUcode<'_>, ParseError> {
 
 /// PCI probe retains and parks the exact native binding, then defers all
 /// firmware resolution/startup to its retained executor-time continuation.
-/// Gen2 native station publication remains gated.
+/// Exact Gen2/API77 and supported Gen3 profiles use distinct retained owners.
 static OWNED: IrqSafeSpinLock<Option<narf_bus::BusAddr>> = IrqSafeSpinLock::new(None);
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
@@ -1440,8 +1446,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         }
     };
     // Retain the exact current native binding before even initial parking.
-    // Gen2's existing boot/passive APIs remain separate from native station publication.
-    let startup = if !extra && rx_rfh::CompletionFormat::for_mac(chip.mac).is_some() {
+    // Gen2 startup uses its own context-v1 and retained MVM station owner.
+    let startup = if !extra
+        && (chip.generation == Generation::Gen2
+            || rx_rfh::CompletionFormat::for_mac(chip.mac).is_some())
+    {
         Some(bootstrap::retain(device, cap, chip.clone()))
     } else {
         None
@@ -1477,14 +1486,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         chip.mac.prefix(),
         chip.rf_candidates,
     );
-
-    if rx_rfh::CompletionFormat::for_mac(chip.mac).is_none() {
-        let _ = writeln!(
-            narf_console::Writer,
-            "iwlwifi: Gen2 context-v1/RFH/MVM owner is not ready; device remains parked"
-        );
-        return Ok(());
-    }
 
     if let Some(owner) = startup {
         bootstrap::schedule(owner);

@@ -19,8 +19,10 @@ pub enum ProvisionState {
     Failed = 4,
 }
 struct State {
-    interface: Option<Arc<Device>>,
+    interface: Option<Arc<dyn narf_wireless::WirelessNetIface>>,
     discovery: Option<narf_bus::MmioRegion>,
+    gen2: Option<super::gen2_profile::Profile>,
+    mvm: Option<Arc<super::mvm_device::Device>>,
 }
 pub(super) struct Owner {
     device: BusDevice,
@@ -39,6 +41,8 @@ impl Owner {
             state: Mutex::new(State {
                 interface: None,
                 discovery: None,
+                gen2: None,
+                mvm: None,
             }),
         }
     }
@@ -98,6 +102,33 @@ impl Owner {
         ),
         &'static str,
     > {
+        if self.chip.generation == super::Generation::Gen2 {
+            let region = match state.discovery {
+                Some(region) => region,
+                None => {
+                    let region = super::mmio::map(&self.device, &self.cap)?;
+                    state.discovery = Some(region);
+                    region
+                }
+            };
+            use super::transport::IwlMmio;
+            let mut io = super::IwlMmioImpl::new(region, self.cap);
+            let profile = super::gen2_profile::select(
+                self.device.id.device,
+                io.read(super::regs::CSR_HW_REV),
+                io.read(0x9c),
+            )
+            .map_err(|_| "unsupported discovered MVM PCI/MAC/RF identity")?;
+            state.gen2 = Some(profile);
+            return Ok((
+                alloc::vec![alloc::format!(
+                    "iwlwifi/{}-{}.ucode",
+                    profile.prefix,
+                    super::gen2_profile::API
+                )],
+                None,
+            ));
+        }
         if self.chip.mac != super::MacFamily::ScA0 {
             return Ok((super::firmware_filename_ladder(&self.chip), None));
         }
@@ -132,8 +163,11 @@ impl Owner {
         candidates: &[String],
         identity: Option<super::firmware_identity::Sc>,
     ) -> Result<(), &'static str> {
-        let format =
-            CompletionFormat::for_mac(self.chip.mac).ok_or("Gen2 native station remains gated")?;
+        if self.chip.generation == super::Generation::Gen2 {
+            return self.start_mvm(state, authority, candidates).await;
+        }
+        let format = CompletionFormat::for_mac(self.chip.mac)
+            .ok_or("unsupported native completion profile")?;
         let input = resolve(authority, candidates)?;
         let mut parsed =
             super::parse_ucode(&input.firmware.bytes).map_err(|_| "invalid Intel firmware")?;
@@ -173,6 +207,56 @@ impl Owner {
         state.interface = Some(interface.clone());
         interface.start_pumps()?;
         narf_wireless::registry::register(interface);
+        self.phase
+            .store(ProvisionState::Ready as u8, Ordering::Release);
+        Ok(())
+    }
+    async fn start_mvm(
+        &self,
+        state: &mut State,
+        authority: &Cap<FirmwareRegistry, Read>,
+        candidates: &[String],
+    ) -> Result<(), &'static str> {
+        let region = state.discovery.ok_or("MVM discovered mapping absent")?;
+        let profile = state.gen2.ok_or("MVM discovered identity absent")?;
+        let expected = alloc::format!("iwlwifi/{}-77.ucode", profile.prefix);
+        if candidates != [expected.clone()] {
+            return Err("MVM executable source differs from discovered profile");
+        }
+        let firmware = crate::firmware_asset::load(authority, &expected, 16 * 1024 * 1024, false)
+            .map_err(|_| "MVM exact API77 firmware unavailable")?;
+        let parsed =
+            super::parse_ucode(&firmware.bytes).map_err(|_| "invalid exact MVM firmware")?;
+        if super::gen2_profile::firmware_api(&parsed) != 77 || !firmware.current() {
+            return Err("MVM selected API/source incompatible");
+        }
+        use super::transport::IwlMmio;
+        let mut io = super::IwlMmioImpl::new(region, self.cap);
+        if super::gen2_profile::select(
+            self.device.id.device,
+            io.read(super::regs::CSR_HW_REV),
+            io.read(0x9c),
+        )
+        .ok()
+            != Some(profile)
+        {
+            return Err("MVM discovered identity changed");
+        }
+        self.phase
+            .store(ProvisionState::Starting as u8, Ordering::Release);
+        let _attempt = Attempt(self);
+        let hardware = super::runtime::Hardware::new(
+            self.device,
+            self.cap,
+            region,
+            &parsed,
+            CompletionFormat::Qu,
+            None,
+        )?;
+        let interface = super::mvm_device::Device::initialize(hardware, firmware).await?;
+        state.mvm = Some(interface.clone());
+        state.interface = Some(interface.clone());
+        interface.start_pumps()?;
         self.phase
             .store(ProvisionState::Ready as u8, Ordering::Release);
         Ok(())
@@ -289,6 +373,40 @@ pub async fn provision() -> Result<(), &'static str> {
 }
 pub fn provision_state() -> Option<ProvisionState> {
     Some(NATIVE.lock().as_ref()?.phase())
+}
+/// Current physical/firmware/SMBIOS binding for an externally measured signed
+/// input. This metadata supplies no calibration, transmit or station grant.
+pub async fn gen2_transmit_power_request() -> Result<super::Gen2TransmitPowerRequest, &'static str>
+{
+    let startup = NATIVE.lock().clone().ok_or("Intel native binding absent")?;
+    if startup.phase() != ProvisionState::Ready {
+        return Err("MVM native firmware not configured");
+    }
+    let device = startup
+        .state
+        .lock()
+        .await
+        .mvm
+        .clone()
+        .ok_or("native Intel binding is not Gen2")?;
+    device.power_request().await
+}
+/// Metadata for the distinct legacy-management + WMM/HT20/SISO emitting
+/// program. The returned binding and filename do not supply measured limits.
+pub async fn gen2_ht20_transmit_power_request(
+) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+    let startup = NATIVE.lock().clone().ok_or("Intel native binding absent")?;
+    if startup.phase() != ProvisionState::Ready {
+        return Err("MVM native firmware not configured");
+    }
+    let device = startup
+        .state
+        .lock()
+        .await
+        .mvm
+        .clone()
+        .ok_or("native Intel binding is not Gen2")?;
+    device.ht20_power_request().await
 }
 
 #[cfg(feature = "kernel-test")]

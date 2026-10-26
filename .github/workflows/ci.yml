@@ -642,10 +642,12 @@ jobs:
         # The image still links the kernel; execution uses the affected
         # subsystem filter on both architectures.
         arch: ${{ fromJSON(needs.changes.outputs.clippy_arches) }}
-    # The full in-kernel smoke suite (~5100 tests) runs in one QEMU boot
-    # under TCG (no KVM on GHA), plus the primary invocation's production
-    # boot + btrfs postflight. Secondary hardware/feature shards use
-    # --kernel-tests-only so they do not repeat that same postflight.
+    # The full in-kernel smoke suite runs under TCG (no KVM on GHA).
+    # The primary invocation uses `cargo xtask test --split`: one QEMU
+    # boot per subsystem group, each capped separately (see the primary
+    # step), plus the production boot + btrfs postflight once at the end.
+    # Secondary hardware/feature shards use --kernel-tests-only so they
+    # do not repeat that same postflight.
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -701,9 +703,21 @@ jobs:
       # The hardware tests that need capabilities GHA's old TCG qemu64
       # CPU lacks — x2APIC (the TLB-shootdown / IPI smokes) and the
       # cache-topology CPUID leaf — detect their absence and Skip.
+      #
+      # `--split` contains hangs: the in-kernel harness runs tests as
+      # direct synchronous calls, so one hung smoke in a single boot
+      # burns the phase's whole 2400 s cap and every later test's result
+      # is lost with it. Split mode boots once per subsystem group (the
+      # affected list, or a fixed partition of the suite on full runs),
+      # each boot capped by XTASK_QEMU_GROUP_TIMEOUT_SECS: a hang costs
+      # its group one named timeout failure and the run continues.
+      # 900 s is ≈2.25× the slowest group's measured guest time (the
+      # btrfs subtree, ≈400 s on x86_64 TCG; slowest single test 307 s);
+      # see `kernel_test_group_timeout_secs` in build/xtask.
       - name: cargo xtask test --features cgroup-all,container
         env:
           XTASK_QEMU_TIMEOUT_SECS: "2400"
+          XTASK_QEMU_GROUP_TIMEOUT_SECS: "900"
           XTASK_BOOT_SMOKE_TIMEOUT_SECS: "1200"
         run: |
           # `container` matches run_ci_locally.sh, which has carried it (and
@@ -715,9 +729,9 @@ jobs:
           SUBS="${{ needs.changes.outputs.subsystems }}"
           if [ -n "$SUBS" ]; then
             echo "kernel-test: affected-subsystem filter = $SUBS"
-            cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all,container --subsystem "$SUBS" --exclude-subsystem drivers/gpu
+            cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all,container --split --subsystem "$SUBS" --exclude-subsystem drivers/gpu
           else
-            cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all,container --exclude-subsystem drivers/gpu
+            cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all,container --split --exclude-subsystem drivers/gpu
           fi
 
       # QEMU's `virt` machine carries virtio-mmio transports in its DTB but

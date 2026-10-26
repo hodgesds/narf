@@ -18,6 +18,10 @@ pub(super) fn make_factory(rfe: u8, base: u8) -> Factory {
     raw[0xd0..0xd2].copy_from_slice(&[25, 26]);
     raw[0x10] = base;
     raw[0x10 + 42] = base.saturating_add(1);
+    for at in [0x10, 0x10 + 42] {
+        raw[at + 6] = 40;
+        raw[at + 11] = 0;
+    }
     Factory::for_test_with_trims(raw, [1; 19]).unwrap()
 }
 pub(super) fn domain() -> narf_wireless::reg::RegulatoryDomain {

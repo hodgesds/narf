@@ -11,6 +11,7 @@ pub(super) struct Peer {
     exchange_stage: u8,
     pub(super) associated: Option<StationAssociated>,
     pub(super) wmm: Option<narf_wireless::wmm::Parameters>,
+    pub(super) ht: Option<ht::Profile>,
 }
 impl Peer {
     pub(super) fn owns(&self, id: u16) -> bool {
@@ -58,6 +59,7 @@ impl Peer {
                     // AP negotiation after its last firmware owner vanished.
                     self.associated = None;
                     self.wmm = None;
+                    self.ht = None;
                 }
                 Ok(matched)
             }
@@ -70,6 +72,9 @@ impl Peer {
 mod disconnect;
 pub use disconnect::Disconnected;
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
+    pub(in crate::ath10k) fn ht_capabilities(&self) -> Option<[u8; 26]> {
+        self.htt.wmi.caps.as_ref().and_then(ht::capability)
+    }
     async fn send_station_command(
         &mut self,
         command: &[u8],
@@ -152,6 +157,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         };
         let own = self.ready.ok_or(Error::Failed)?.mac;
         let offered_wmm = wmm::offer(&bss.information_elements, sme_ies)?;
+        let offered_ht = self.peer.as_ref().ok_or(Error::Failed)?.ht;
         let mut plan = JoinPlan::prepare(&bss, own, ssid, security).map_err(plan_error)?;
         plan.append_sme_ies(sme_ies).map_err(plan_error)?;
         let auth = wire::owned(plan.start_authentication().map_err(plan_error)?)?;
@@ -177,6 +183,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 .map_err(|_| Error::NoMemory)?;
             assoc.extend_from_slice(information);
         }
+        if let Some(ht) = offered_ht {
+            assoc.extend_from_slice(&ht.information());
+        }
         self.failed = false;
         let response =
             checked_policy(self.exchange_initial_management(domain, &assoc), validate).await?;
@@ -187,18 +196,25 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .ok_or(Error::Malformed)?;
         let capability = u16::from_le_bytes([response[24], response[25]]);
         let wmm = wmm::response(offered_wmm, &response[30..])?;
+        let ht = offered_ht
+            .map(|ht| ht.response(&response[30..], bss.channel))
+            .transpose()?;
+        if ht.is_some() && wmm.is_none() {
+            return Err(Error::Unsupported);
+        }
         let associated = StationAssociated {
             bssid: peer.bssid,
             frequency: peer.frequency,
             aid,
             protected: security.is_wpa2(),
         };
-        let command = mlme::peer_on(
+        let command = mlme::peer_phy(
             self.wire.dialect,
             associated,
             capability,
             plan.legacy_rates().0,
             wmm.is_some(),
+            ht,
         )?;
         let up = mlme::up(self.wire.dialect, peer.bssid, aid)?;
         let contention = wmm
@@ -226,6 +242,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 htt::Event::Idle => {
                     self.peer.as_mut().ok_or(Error::Failed)?.associated = Some(associated);
                     self.peer.as_mut().ok_or(Error::Failed)?.wmm = wmm;
+                    self.peer.as_mut().ok_or(Error::Failed)?.ht = ht;
                     self.failed = false;
                     return Ok(associated);
                 }
@@ -296,11 +313,25 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             domain,
             frequency,
         )?;
+        let ht = ht::Profile::offer(
+            self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?,
+            &bss.information_elements,
+            narf_wireless::association::channel::from_frequency(u32::from(frequency))
+                .ok_or(Error::Unsupported)?,
+        )?;
         let rd = self.wire.domain(permission)?;
         let power = self.wire.power(permission)?;
-        let start = self
+        let mut start = self
             .wire
             .start_station(permission, bss.beacon_interval, dtim)?;
+        if let Some(ht) = ht {
+            let channel = if self.wire.dialect == Dialect::Tlv {
+                84
+            } else {
+                4
+            };
+            wire::put(&mut start, channel + 12, ht.mode(frequency) | (1 << 11));
+        }
         let create = self.wire.peer(bssid)?;
         self.peer = Some(Peer {
             permission,
@@ -309,6 +340,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             exchange_stage: 0,
             associated: None,
             wmm: None,
+            ht,
         });
         // Even an unsent/ambiguous START cannot be retried under this owner.
         // The nested native mission transport retains all published DMA.

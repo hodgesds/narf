@@ -17,6 +17,7 @@ pub enum Error {
     Length,
     Exhausted,
     Crypto(CcmpError),
+    Aggregate(crate::amsdu::Error),
 }
 /// Pairwise and group keys have different station address/packet ownership.
 /// GTK KeyID zero is legal and must never be confused with a transmit PTK.
@@ -190,6 +191,66 @@ impl Key {
         self.receive[shape.index] = candidate;
         Ok(plaintext)
     }
+    /// Opt-in RAW HT aggregate receive. Authenticate the original protected
+    /// QoS MPDU, validate every bounded subframe and allocate the complete
+    /// Ethernet result before committing this key/TID's one replay update.
+    /// The caller's ciphertext is immutable even on successful admission.
+    /// Existing `unprotect` keeps rejecting A-MSDU headers.
+    pub fn unprotect_amsdu(&mut self, header: &[u8], wire: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+        let priority = aggregate_header(header)?;
+        if header[10..16] != self.peer
+            || !unicast(header[16..22].try_into().unwrap())
+            || match self.role {
+                Role::Pairwise => header[4..10] != self.local,
+                Role::Group => header[4] & 1 == 0,
+            }
+        {
+            return Err(Error::Key);
+        }
+        if !(16 + 22..=16 + crate::amsdu::MAX_BYTES).contains(&wire.len()) {
+            return Err(Error::Length);
+        }
+        if wire[2] != 0 || wire[3] & 0x3f != 0x20 || wire[3] >> 6 != self.key_id {
+            return Err(Error::Key);
+        }
+        let mut scratch = Zeroizing::new(Vec::new());
+        scratch
+            .try_reserve_exact(wire.len())
+            .map_err(|_| Error::Aggregate(crate::amsdu::Error::Allocation))?;
+        scratch.extend_from_slice(wire);
+        let mut candidate = self.receive[usize::from(priority)];
+        let plaintext = Zeroizing::new(
+            ccmp::unprotect(
+                &Ccm,
+                header,
+                &self.tk,
+                priority,
+                false,
+                &mut candidate,
+                &mut scratch,
+            )
+            .map_err(Error::Crypto)?,
+        );
+        let frames =
+            crate::amsdu::decode(&plaintext, self.local, header[4..10].try_into().unwrap())
+                .map_err(Error::Aggregate)?;
+        self.receive[usize::from(priority)] = candidate;
+        Ok(frames)
+    }
+}
+pub(crate) fn aggregate_header(header: &[u8]) -> Result<u8, Error> {
+    // FromDS, protected QoS DATA, no fragments/Address4/HT control/EOSP or
+    // alternate ACK policy. This is the original26-byte station header.
+    if header.len() != 26
+        || header[0] != 0x88
+        || header[1] & 0xc7 != 0x42
+        || header[22] & 15 != 0
+        || header[24] & 0xf0 != 0x80
+        || header[25] != 0
+    {
+        return Err(Error::Header);
+    }
+    Ok(header[24] & 15)
 }
 fn unicast(mac: [u8; 6]) -> bool {
     mac != [0; 6] && mac[0] & 1 == 0
@@ -230,6 +291,9 @@ fn shape(header: &[u8]) -> Result<Shape, Error> {
         })
     }
 }
+#[cfg(feature = "kernel-test")]
+#[path = "packet_key_amsdu_tests.rs"]
+mod amsdu_tests;
 #[cfg(feature = "kernel-test")]
 #[path = "packet_key_tests.rs"]
 mod tests;

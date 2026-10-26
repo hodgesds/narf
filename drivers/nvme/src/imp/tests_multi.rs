@@ -961,6 +961,23 @@ fn smoke_nvme_detach_event_removes_controller_qemu() -> TestResult {
     if super::controller_count() < 2 {
         return TestResult::Skip("needs two NVMe controllers");
     }
+    // The dispatch below resolves the binding record and remove hook
+    // that boot's register + probe_all installed — but the shared
+    // boot's bus tables are not hermetic: dozens of suites call
+    // `driver_match::__reset_for_test`, which wipes both tables, and
+    // suite order is link order, so which suites ran first differs
+    // per arch. On x86_64 the x86-only params smoke happens to
+    // rebuild the tables just before this one; on aarch64 nothing
+    // did, and the dispatch silently found no binding (#985).
+    // Re-establish the precondition the way the boot path (and the
+    // params smoke) does: registration is idempotent, and NVMe's
+    // probe is idempotent per function, so the re-probe only
+    // re-records bindings.
+    super::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if narf_bus::probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci failed while restoring bus bindings");
+    }
     if let Err(e) = reinstall(1) {
         return TestResult::Fail(e);
     }
@@ -970,7 +987,9 @@ fn smoke_nvme_detach_event_removes_controller_qemu() -> TestResult {
     let narf_bus::BusAddr::Pcie(bdf) = dev.addr else {
         return TestResult::Fail("nvme1 is not PCIe");
     };
-    // The boot sequence installs the default dispatcher; installing
+    // No production path installs the default dispatcher yet (the
+    // hot-plug IRQ source lands later); install it here so the event
+    // routes through the production DefaultDispatcher. Installing
     // again only stacks a duplicate listener, and detach is
     // idempotent, so the outcome is the same either way.
     let _ = narf_bus::hotplug::install_default_dispatcher();

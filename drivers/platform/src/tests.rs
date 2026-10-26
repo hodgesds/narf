@@ -915,7 +915,7 @@ fn smoke_tpm_crb_probe_firmware_shaped_control_area() -> TestResult {
     // firmware-published and returned NoCommandBuffer on exactly
     // this shape, so CRB probe could never succeed on real fTPM
     // hardware.
-    regs.set32(tpm::REG_INTERFACE_ID, 0x1);
+    regs.set32(tpm::REG_INTERFACE_ID, 0x10);
     match tpm::identify(&regs) {
         Ok(tpm::TpmKind::Crb) => {}
         _ => return TestResult::Fail("firmware-shaped CRB area not identified as CRB"),
@@ -1027,7 +1027,9 @@ kernel_test_in!(
 fn smoke_tpm_crb_probe_locality_never_granted() -> TestResult {
     use crate::tpm;
     let regs = FakeCrbRegs::new();
-    regs.set32(tpm::REG_INTERFACE_ID, 0x1);
+    // Same firmware-shaped INTF_ID as the firmware fixture:
+    // type 0 (CRB), version 1 → 0x10.
+    regs.set32(tpm::REG_INTERFACE_ID, 0x10);
     regs.grant_locality.set(false);
     // Short deadline: this fixture pins the bounded-failure shape,
     // not production's 750 ms TIMEOUT_A budget.

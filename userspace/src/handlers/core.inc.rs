@@ -14839,17 +14839,8 @@ fn release_task_tables(tid: u64) {
         m.remove(&(PKEY_NO_MM | tid));
     }
 
-    // /proc mirrors.
-    if let Some(m) = PROC_ARGV.lock().as_mut() {
-        m.remove(&tid);
-    }
-    if let Some(m) = PROC_COMM.lock().as_mut() {
-        m.remove(&tid);
-    }
-    if let Some(m) = PROC_EXE.lock().as_mut() {
-        m.remove(&tid);
-    }
-    task_map_remove(&PROC_IMAGE_MAPPINGS, tid);
+    // Task-owned /proc snapshots; release shared bytes after the owner lock.
+    crate::proc_identity::clear(tid);
     if let Some(m) = TASK_START_NS.lock().as_mut() {
         m.remove(&tid);
     }
@@ -14867,12 +14858,6 @@ fn release_task_tables(tid: u64) {
             }
         }
         crate::fd::locks::drop_waiter_owner(tid);
-    }
-    if let Some(m) = PROC_ENVIRON.lock().as_mut() {
-        m.remove(&tid);
-    }
-    if let Some(m) = PROC_AUXV.lock().as_mut() {
-        m.remove(&tid);
     }
     if let Some(m) = PROC_OOM_ADJ.lock().as_mut() {
         m.remove(&tid);
@@ -15240,17 +15225,11 @@ pub fn __test_task_table_residue(tid: u64) -> u32 {
     );
     r |= has(futex_has_task_waiter(tid), 1 << 5);
     r |= has(
-        PROC_ARGV
-            .lock()
-            .as_ref()
-            .is_some_and(|m| m.contains_key(&tid)),
+        crate::proc_identity::read(tid, |state| state.argv.is_some()).unwrap_or(false),
         1 << 6,
     );
     r |= has(
-        PROC_COMM
-            .lock()
-            .as_ref()
-            .is_some_and(|m| m.contains_key(&tid)),
+        crate::proc_identity::read(tid, |state| state.comm.is_some()).unwrap_or(false),
         1 << 7,
     );
     r |= has(
@@ -20657,3 +20636,46 @@ pub(crate) fn shm_ipc_namespace_drop(ipc_ns: u64) {
 /// (`sys_sleep`'s busy-wait + the FB drain pump registration)
 /// continue to use `narf_userspace::handlers::sleep_pumps`.
 pub use narf_scheduler::sleep_pumps;
+
+/// Regression coverage for the shutdown sync wiring: `wait_init` — the
+/// userspace init a real boot runs once — must install the production
+/// pre-shutdown filesystem sync into `narf_power::system`, so every
+/// reboot / power-off / halt syncs filesystems before the device
+/// shutdown hooks (NVMe Flush + CC.SHN) run.
+///
+/// The assertion lives here, not in the `power/shutdown` ordering smoke:
+/// the installer is this crate's boot init, and in a kernel-test boot it
+/// runs only when a userspace test establishes it. The power smoke used
+/// to assert the installed hook itself and passed only in boots where a
+/// userspace test had already run — under the split kernel-test runner
+/// its boot contains no userspace test, and the assertion failed on a
+/// precondition this layer owns. Assert identity, not mere presence:
+/// the installed hook must be exactly `pre_shutdown_sync`.
+#[cfg(feature = "kernel-test")]
+mod pre_shutdown_sync_install_tests {
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_userspace_wait_init_installs_pre_shutdown_sync() -> TestResult {
+        super::wait_init();
+        let installed = narf_power::system::__swap_pre_shutdown_sync_for_test(None);
+        // Restore before asserting: a failure must not leave the slot
+        // empty for later tests in the boot.
+        if let Some(hook) = installed {
+            narf_power::system::install_pre_shutdown_sync(hook);
+        }
+        // Compare in the slot's own representation — the hook stored as a
+        // code address (`install_pre_shutdown_sync` stores `hook as usize`);
+        // a fn-pointer `==` is not a meaningful comparison.
+        let expected: narf_power::system::PreShutdownSync = super::pre_shutdown_sync;
+        if installed.map(|hook| hook as usize) != Some(expected as usize) {
+            return TestResult::Fail(
+                "wait_init did not install the production pre-shutdown sync: reboot would skip the fs sync",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace",
+        smoke_userspace_wait_init_installs_pre_shutdown_sync
+    );
+}

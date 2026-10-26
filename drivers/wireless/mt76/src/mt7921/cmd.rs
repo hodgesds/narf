@@ -37,8 +37,7 @@
 //!   — `BSS_INFO_BASIC` TLV.
 //! - `mt76_connac_mcu.c::mt76_connac_mcu_sta_basic_tlv` (~L1670)
 //!   — `STA_REC_BASIC` TLV.
-//! - `mt76_connac_mcu.c::mt7921_mcu_set_channel_domain` /
-//!   `mt76_connac_mcu_set_chan_info` — channel switch body.
+//! - `mt7921/mcu.c::mt7921_mcu_set_chan_info` — channel switch body.
 
 #![allow(dead_code)]
 
@@ -296,10 +295,10 @@ pub fn encode_sta_rec_basic_tlv(
 
 // ── CHANNEL_SWITCH ───────────────────────────────────────────────
 
-/// `MCU_EXT_CMD_CHANNEL_SWITCH` body — 32 bytes.
+/// `MCU_EXT_CMD_CHANNEL_SWITCH` body — 76 bytes.
 ///
 /// Full packed request from Linux `mt7921_mcu_set_chan_info`:
-/// control/center/BW/TX-NSS/RX-mask/reason/band-index/center2 (8 bytes),
+/// control/center/BW/TX-NSS/RX-count/reason/band-index/center2 (8 bytes),
 /// CAC case (u16), channel band (u8), reserved (u8), outband frequency
 /// (u32), TX power drop/AP width/AP center (3 bytes), reserved (57 bytes).
 /// Reserved fields must be transmitted, not omitted from a shorter request.
@@ -318,6 +317,8 @@ pub const CH_BAND_24G: u8 = 0;
 pub const CH_BAND_5G: u8 = 1;
 pub const CH_BAND_6G: u8 = 2;
 
+/// `rx_streams` is the caller's checked antenna mask; the wire carries its
+/// population count. This encoder is exclusively for CHANNEL_SWITCH.
 pub fn encode_channel_switch(
     control_chan: u8,
     center_chan: u8,
@@ -343,7 +344,9 @@ pub fn encode_channel_switch(
     out[1] = center_chan;
     out[2] = bw;
     out[3] = tx_streams;
-    out[4] = rx_streams; // An antenna mask, not a stream count.
+    // mt7921_mcu_set_chan_info converts the checked antenna mask only for
+    // CHANNEL_SWITCH; SET_RX_PATH and unified RLM retain their mask fields.
+    out[4] = rx_streams.count_ones() as u8;
     out[10] = band;
     Some(())
 }

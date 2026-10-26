@@ -8,6 +8,7 @@ pub struct PhyCapabilities {
     pub ht: bool,
     pub vht: bool,
     pub he: bool,
+    /// Opaque firmware PHY-TLV byte. It is not a decoded CMD_CBW enum.
     pub max_bandwidth: u8,
     pub spatial_streams: u8,
     pub bands: u8,
@@ -62,7 +63,11 @@ impl NicCapabilities {
                     if value.len() < 12 || phy.is_some() {
                         return Err(Error::MalformedEvent);
                     }
-                    if !(1..=2).contains(&value[4]) || value[10] & 3 == 0 {
+                    if value[0] > 1
+                        || value[1] > 1
+                        || !(1..=2).contains(&value[4])
+                        || value[10] & 3 == 0
+                    {
                         return Err(Error::InvalidIdentity);
                     }
                     phy = Some(PhyCapabilities {

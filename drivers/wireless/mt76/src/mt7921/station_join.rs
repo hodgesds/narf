@@ -30,6 +30,9 @@ impl core::fmt::Debug for StationSecurity {
 }
 
 impl StationSecurity {
+    pub(super) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
     pub(super) fn new(
         bss: &ScanBss,
         plan: &JoinPlan,
@@ -343,9 +346,10 @@ impl<B: Backend> Session<B> {
     pub(super) fn keys_pending(&self) -> bool {
         !self.peer_lost
             && matches!(self.state, State::Associated { .. })
-            && self.data_pending.is_none()
+            && self.data_pending.is_empty()
             && (!self.control_pending.is_empty()
                 || self.rx_ba.pending(self.backend.now_ns())
+                || self.tx_ba.pending(self.backend.now_ns())
                 || self
                     .security
                     .as_ref()
@@ -371,7 +375,7 @@ impl<B: Backend> Session<B> {
         let State::Associated { info, peer, .. } = associated else {
             return Ok(());
         };
-        if self.data_pending.is_some() {
+        if !self.data_pending.is_empty() {
             return Ok(());
         }
         if self
@@ -390,6 +394,7 @@ impl<B: Backend> Session<B> {
         };
         self.boot_started = Some(self.backend.now_ns());
         let result = async {
+            self.retire_transmit_ba(true).await?;
             self.retire_receive_ba(peer).await?;
             for _ in 0..4 {
                 let Some((pdu, protected)) = security.pending.pop_front() else {
@@ -435,7 +440,10 @@ impl<B: Backend> Session<B> {
             self.station_permission = None;
             self.ht20_rx = None;
             self.ht20_profile = None;
+            self.vht_profile = None;
+            self.ap_phy = None;
             self.rx_ba.fence();
+            self.tx_ba.fence();
             self.state = State::Failed {
                 stage: Stage::EapolHandshake,
                 error,
@@ -453,6 +461,7 @@ impl<B: Backend> Session<B> {
     pub(super) fn receive_ethernet(&mut self) -> Result<Option<Vec<u8>>, Error> {
         if self.peer_lost {
             self.rx_ba.fence();
+            self.tx_ba.fence();
             self.clear_aggregate_receive();
             return Err(Error::DeviceGone);
         }
@@ -488,6 +497,62 @@ impl<B: Backend> Session<B> {
                 self.clear_aggregate_receive();
                 continue;
             }
+            if let Some(profile) = self.vht_profile {
+                if native.frame.len() > 3895 || !profile.receive_allowed(native.phy) {
+                    self.clear_aggregate_receive();
+                    continue;
+                }
+                let f = native.frame;
+                if native.ccmp.is_none()
+                    && f.len() >= 26
+                    && f[1] & 0xc7 == 0
+                    && f[22] & 15 == 0
+                    && f[10..16] == peer
+                    && f[16..22] == peer
+                    && (f[4..10] == own || f[4..10] == [255; 6])
+                    && (matches!(f[0], 0x50 | 0x80)
+                        && f.get(36..).is_some_and(|ies| !profile.matches(ies))
+                        || f[0] == 0xd0 && (f[24..26] == [21, 2] || f[24..26] == [7, 0]))
+                {
+                    self.peer_lost = true;
+                    self.rx_ba.fence();
+                    self.tx_ba.fence();
+                    self.clear_aggregate_receive();
+                    return Err(Error::DeviceGone);
+                }
+            }
+            if let Some(ap) = self.ap_phy {
+                if self.vht_profile.is_none()
+                    && !crate::mt7921::vht::receive_allowed(
+                        u8::from(
+                            self.ht20_profile
+                                .is_some_and(|p| p.negotiated_secondary().is_some()),
+                        ),
+                        native.phy,
+                        false,
+                    )
+                {
+                    self.clear_aggregate_receive();
+                    continue;
+                }
+                let f = native.frame;
+                if native.ccmp.is_none()
+                    && f.len() >= 36
+                    && matches!(f[0], 0x50 | 0x80)
+                    && f[1] & 0xc7 == 0
+                    && f[22] & 15 == 0
+                    && f[10..16] == peer
+                    && f[16..22] == peer
+                    && (f[4..10] == own || f[4..10] == [255; 6])
+                    && narf_wireless::association::phy::ApElements::parse(&f[36..]) != Ok(ap)
+                {
+                    self.peer_lost = true;
+                    self.rx_ba.fence();
+                    self.tx_ba.fence();
+                    self.clear_aggregate_receive();
+                    return Err(Error::DeviceGone);
+                }
+            }
             if native.ampdu && native.amsdu != 0 {
                 // Recipient BA explicitly leaves nested A-MSDU unnegotiated.
                 self.clear_aggregate_receive();
@@ -512,7 +577,7 @@ impl<B: Backend> Session<B> {
             let Some(header) = frame.get(..24) else {
                 continue;
             };
-            if let Some(profile) = self.ht20_profile {
+            if let Some(profile) = self.ht20_profile.filter(|_| self.ap_phy.is_none()) {
                 if matches!(header[0], 0x80 | 0x50)
                     && header[1] & 0xc7 == 0
                     && header[10..16] == peer
@@ -526,6 +591,7 @@ impl<B: Backend> Session<B> {
                 {
                     self.peer_lost = true;
                     self.rx_ba.fence();
+                    self.tx_ba.fence();
                     self.clear_aggregate_receive();
                     return Err(Error::DeviceGone);
                 }
@@ -548,6 +614,7 @@ impl<B: Backend> Session<B> {
                     // parameter set closes the port until a fresh join.
                     self.peer_lost = true;
                     self.rx_ba.fence();
+                    self.tx_ba.fence();
                     self.clear_aggregate_receive();
                     return Err(Error::DeviceGone);
                 }
@@ -563,6 +630,7 @@ impl<B: Backend> Session<B> {
             {
                 self.peer_lost = true;
                 self.rx_ba.fence();
+                self.tx_ba.fence();
                 self.clear_aggregate_receive();
                 return Err(Error::DeviceGone);
             }
@@ -723,21 +791,66 @@ impl<B: Backend> Session<B> {
         &mut self,
         frame: &[u8],
     ) -> Result<packet_tx::Completion, Error> {
+        if !self.data_pending.is_empty() {
+            return Err(Error::Busy);
+        }
         self.start_ethernet(frame)?;
-        self.wait(TIMEOUT_MS, |backend| backend.management_complete())
-            .await
-            .and_then(|completion| {
-                self.data_pending = None;
+        let result = self
+            .wait(TIMEOUT_MS, |backend| backend.management_complete())
+            .await;
+        match result {
+            Ok(completion) => {
+                self.data_pending.pop_front();
                 if completion.status == 0 {
                     Ok(completion)
                 } else {
-                    Err(Error::Rejected(completion.status))
+                    Err(self.fail_data(Error::Rejected(completion.status)))
                 }
-            })
+            }
+            Err(error) => Err(self.fail_data(error)),
+        }
     }
 
-    /// Publish at most one frame; completion is advanced by the common
-    /// bounded step, including from synchronous network waiters.
+    pub(super) fn fail_data(&mut self, error: Error) -> Error {
+        self.security = None;
+        self.station_permission = None;
+        self.wmm = None;
+        self.ht20_rx = None;
+        self.ht20_profile = None;
+        self.vht_profile = None;
+        self.ap_phy = None;
+        self.rx_ba.fence();
+        self.tx_ba.fence();
+        self.clear_aggregate_receive();
+        self.state = State::Failed {
+            stage: Stage::StaRecord,
+            error,
+        };
+        error
+    }
+
+    fn data_capacity(&self) -> usize {
+        if self.tx_ba.active() {
+            return self.tx_ba.capacity();
+        }
+        if self.ht20_profile.is_some() && self.wmm.is_some() {
+            packet_tx::PIPELINE
+        } else {
+            1
+        }
+    }
+    pub(super) fn data_controls_pending(&self) -> bool {
+        !self.control_pending.is_empty()
+            || self.rx_ba.pending(self.backend.now_ns())
+            || self.tx_ba.pending(self.backend.now_ns())
+            || self
+                .security
+                .as_ref()
+                .is_some_and(|s| !s.pending.is_empty())
+    }
+
+    /// Publish one frame into this profile's bounded native ownership queue;
+    /// synchronous network waiters advance the same completion proofs.
     pub(super) fn start_ethernet(&mut self, frame: &[u8]) -> Result<(), Error> {
         if self.peer_lost {
             return Err(Error::DeviceGone);
@@ -752,38 +865,58 @@ impl<B: Backend> Session<B> {
         {
             return Err(Error::Bounds);
         }
-        if self.data_pending.is_some() {
+        if self.data_pending.len() >= self.data_capacity() || self.data_controls_pending() {
             return Err(Error::Busy);
         }
         self.check_station_tx()?;
-        self.backend
-            .submit_data(frame, self.security.is_some(), self.wmm.is_some())?;
-        self.data_pending = Some(self.backend.now_ns());
+        let result = if self.tx_ba.active() {
+            self.backend
+                .submit_data_aggregated(frame, self.security.is_some())
+        } else if self.data_capacity() > 1 {
+            self.backend
+                .submit_data_pipelined(frame, self.security.is_some(), true)
+        } else {
+            self.backend
+                .submit_data(frame, self.security.is_some(), self.wmm.is_some())
+        };
+        match result {
+            Ok(()) => {}
+            Err(Error::Busy) => return Err(Error::Busy),
+            Err(error) => return Err(self.fail_data(error)),
+        }
+        self.data_pending.push_back(self.backend.now_ns());
+        if self.wmm.is_some() {
+            self.tid0_used = true;
+        }
+        self.tx_ba.touch(self.backend.now_ns());
         Ok(())
     }
 
     pub(super) fn poll_data_tx(&mut self) -> Result<bool, Error> {
-        let Some(started) = self.data_pending else {
-            return Ok(true);
-        };
-        self.backend.check()?;
-        if let Some(completion) = self.backend.management_complete()? {
-            self.data_pending = None;
-            if completion.status != 0 {
-                return Err(Error::Rejected(completion.status));
-            }
-            return Ok(true);
-        }
-        if self.backend.now_ns().saturating_sub(started) >= TIMEOUT_MS * 1_000_000 {
-            let error = Error::Timeout;
-            self.security = None;
-            self.state = State::Failed {
-                stage: Stage::StaRecord,
-                error,
+        for _ in 0..packet_tx::PIPELINE {
+            let Some(&started) = self.data_pending.front() else {
+                return Ok(!self.data_controls_pending());
             };
-            return Err(error);
+            if let Err(error) = self.backend.check() {
+                return Err(self.fail_data(error));
+            }
+            let completion = match self.backend.management_complete() {
+                Ok(value) => value,
+                Err(error) => return Err(self.fail_data(error)),
+            };
+            if let Some(completion) = completion {
+                self.data_pending.pop_front();
+                if completion.status != 0 {
+                    return Err(self.fail_data(Error::Rejected(completion.status)));
+                }
+                continue;
+            }
+            if self.backend.now_ns().saturating_sub(started) >= TIMEOUT_MS * 1_000_000 {
+                return Err(self.fail_data(Error::Timeout));
+            }
+            break;
         }
-        Ok(false)
+        Ok(self.data_pending.len() < self.data_capacity() && !self.data_controls_pending())
     }
 
     pub(super) fn step_network(&mut self, tx: Option<&[u8]>) -> Result<super::PacketStep, Error> {
@@ -832,25 +965,21 @@ impl<B: Backend> Session<B> {
             return Err(Error::InvalidIdentity);
         }
         let own = info.capabilities.mac;
-        let mut plan = JoinPlan::prepare(bss, own, ssid, security).map_err(|e| match e {
-            crate::mt7921::association::Error::InvalidBss => Error::Bounds,
-            crate::mt7921::association::Error::UnsupportedRates => Error::UnsupportedFirmware,
-            crate::mt7921::association::Error::UnsupportedSecurity => Error::Bounds,
-            crate::mt7921::association::Error::Busy => Error::Busy,
-            _ => Error::Bounds,
-        })?;
+        let mut plan = JoinPlan::prepare_native(bss, own, ssid, security, info, permission)?;
         plan.append_sme_ies(extra_ies).map_err(|_| Error::Bounds)?;
-        plan.offer_ht20(info, bss, permission)?;
         self.backend.check_tx_permission(permission)?;
-        if !self.rx_ba.begin_connection() {
+        if !self.rx_ba.begin_connection() || !self.tx_ba.begin_connection() {
             return Err(Error::Busy);
         }
+        self.tid0_used = false;
 
         self.management_rate = plan.management_rate();
         // Discard idle receive preparation. Any HT activation below must be
         // rebuilt from the bound AP response and completed native receipts.
         self.ht20_rx = None;
         self.ht20_profile = None;
+        self.vht_profile = None;
+        self.ap_phy = None;
         self.control_pending.clear();
         self.received_msdu.clear();
         self.boot_started = Some(self.backend.now_ns());
@@ -869,9 +998,7 @@ impl<B: Backend> Session<B> {
             let mut domain = vec![0u8; 12 + 8 * channels.len()];
             domain[..2].copy_from_slice(&permission.country);
             domain[4..7].fill(1); // 20 MHz
-            if permission.secondary_channel().is_some() {
-                domain[3 + usize::from(band.scan_tag())] = 0;
-            } // Native BW20/40 enum.
+            domain[3 + usize::from(band.scan_tag())] = permission.domain_width();
             domain[7 + usize::from(band.scan_tag())] = channels.len() as u8;
             for (index, channel) in channels.into_iter().enumerate() {
                 domain[12 + index * 8..14 + index * 8]
@@ -889,6 +1016,7 @@ impl<B: Backend> Session<B> {
 
             // The host policy's power ceiling is programmed before any
             // authentication/EAPOL/data frame can reach a TX descriptor.
+            self.check_station_tx()?;
             self.notify(
                 Command::Ce {
                     id: 0x5d,
@@ -981,6 +1109,14 @@ impl<B: Backend> Session<B> {
                 .await?;
 
             self.management_rate = plan.management_rate();
+            if let Some((width, center)) = plan.phy_channel() {
+                let narrower = permission.narrow(width, center).ok_or(Error::Bounds)?;
+                if width != permission.native_width() || center != permission.center_channel() {
+                    self.station_permission = Some(narrower);
+                    self.reconfigure_station_channel(info, bss.channel, narrower)
+                        .await?;
+                }
+            }
             if let Some(profile) = plan.ht20() {
                 let mut response_bss = bss.clone();
                 response_bss.information_elements = profile.received_ies();
@@ -1002,15 +1138,27 @@ impl<B: Backend> Session<B> {
                 self.confirm_command_progress().await?;
                 self.check_station_tx()?;
             }
-            let bss_record = crate::mt7921::association::bss_record_ht20(
+            let mut bss_record = crate::mt7921::association::bss_record_ht20(
                 bss,
                 plan.wmm().is_some(),
                 plan.ht20().is_some(),
             )
             .map_err(|_| Error::Bounds)?;
+            if plan.vht().is_some() {
+                bss_record[29] |= 1 << 5;
+            } // PHY_MODE_AC.
             self.exchange_station(Command::Unified { id: 2 }, &bss_record)
                 .await?;
-            if let Some(profile) = plan.ht20() {
+            if let Some(profile) = plan.vht() {
+                self.exchange_station(
+                    Command::Unified { id: 2 },
+                    &profile.rlm(
+                        bss.channel,
+                        (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
+                    ),
+                )
+                .await?;
+            } else if let Some(profile) = plan.ht20() {
                 self.exchange_station(
                     Command::Unified { id: 2 },
                     &profile.rlm(
@@ -1117,6 +1265,8 @@ impl<B: Backend> Session<B> {
                 self.station_bss = Some(bss.clone());
                 self.wmm = plan.wmm();
                 self.ht20_profile = plan.ht20();
+                self.vht_profile = plan.vht();
+                self.ap_phy = plan.ap_phy();
                 if let Some(receiver) = &mut self.ht20_rx {
                     receiver.active = true;
                 }
@@ -1134,6 +1284,8 @@ impl<B: Backend> Session<B> {
                 self.station_permission = None;
                 self.ht20_rx = None;
                 self.ht20_profile = None;
+                self.vht_profile = None;
+                self.ap_phy = None;
                 plan.cancel();
                 let stage = match self.state {
                     State::Running(stage) | State::Failed { stage, .. } => stage,
@@ -1159,18 +1311,22 @@ impl<B: Backend> Session<B> {
         // reusable station permission in the retained running owner.
         let closing_permission = self.station_permission.take();
         self.rx_ba.fence();
+        self.tx_ba.fence();
         self.ht20_rx = None;
         self.ht20_profile = None;
+        self.vht_profile = None;
+        self.ap_phy = None;
         self.control_pending.clear();
         self.received_msdu.clear();
         let peer_lost = self.peer_lost;
         self.stage(Stage::StaRecord);
         let result = async {
-            if self.data_pending.is_some() {
+            while !self.data_pending.is_empty() {
                 self.wait(TIMEOUT_MS, |backend| backend.management_complete())
                     .await?;
-                self.data_pending = None;
+                self.data_pending.pop_front();
             }
+            self.retire_transmit_ba(false).await?;
             self.retire_receive_ba(peer).await?;
             if !peer_lost {
                 let mut deauth = vec![0u8; 26];
@@ -1248,7 +1404,10 @@ impl<B: Backend> Session<B> {
             self.security = None;
             self.ht20_rx = None;
             self.ht20_profile = None;
+            self.vht_profile = None;
+            self.ap_phy = None;
             self.rx_ba.fence();
+            self.tx_ba.fence();
             self.control_pending.clear();
             self.clear_aggregate_receive();
             let stage = match self.state {
@@ -1260,11 +1419,74 @@ impl<B: Backend> Session<B> {
         result
     }
 
+    /// Complete response-bound occupied-channel shrink before native peer,
+    /// keys or controlled-port publication. The old broader grant can only
+    /// lose constituents; each command earns the current narrower grant.
+    async fn reconfigure_station_channel(
+        &mut self,
+        info: super::RadioInfo,
+        channel: u8,
+        permission: crate::mt7921::association::TxPermission,
+    ) -> Result<(), Error> {
+        let band = crate::mt7921::channel::band(channel).ok_or(Error::Bounds)?;
+        let channels = permission.channels();
+        let mut domain = vec![0; 12 + 8 * channels.len()];
+        domain[..2].copy_from_slice(&permission.country);
+        domain[4..7].fill(1);
+        domain[3 + usize::from(band.scan_tag())] = permission.domain_width();
+        domain[7 + usize::from(band.scan_tag())] = channels.len() as u8;
+        for (index, ch) in channels.into_iter().enumerate() {
+            domain[12 + index * 8..14 + index * 8].copy_from_slice(&u16::from(ch).to_le_bytes());
+        }
+        self.check_station_tx()?;
+        self.notify(
+            Command::Ce {
+                id: 0x0f,
+                query: false,
+            },
+            &domain,
+        )
+        .await?;
+        self.check_station_tx()?;
+        self.notify(
+            Command::Ce {
+                id: 0x5d,
+                query: false,
+            },
+            &permission.rate_limits(),
+        )
+        .await?;
+        self.confirm_command_progress().await?;
+        self.check_station_tx()?;
+        let mut switch = [0; cmd::CHANNEL_SWITCH_SIZE];
+        cmd::encode_channel_switch(
+            channel,
+            permission.center_channel(),
+            permission.native_width(),
+            1,
+            (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
+            band.switch_tag(),
+            &mut switch,
+        )
+        .ok_or(Error::Bounds)?;
+        self.exchange_station(
+            Command::Extended {
+                id: crate::mt7921::regs::MCU_EXT_CMD_CHANNEL_SWITCH,
+                query: false,
+            },
+            &switch,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Advance recipient BA and declined requests under the retained control
     /// owner. Dropping this future cannot restore an associated producer.
     async fn service_control(&mut self) -> Result<(), Error> {
-        if self.control_pending.is_empty() && !self.rx_ba.pending(self.backend.now_ns())
-            || self.data_pending.is_some()
+        if self.control_pending.is_empty()
+            && !self.rx_ba.pending(self.backend.now_ns())
+            && !self.tx_ba.pending(self.backend.now_ns())
+            || !self.data_pending.is_empty()
         {
             return Ok(());
         }
@@ -1278,6 +1500,7 @@ impl<B: Backend> Session<B> {
         self.stage(Stage::StaRecord);
         self.boot_started = Some(self.backend.now_ns());
         let result = async {
+            self.service_transmit_ba().await?;
             self.service_receive_ba(info.capabilities.mac, peer).await?;
             for _ in 0..4 {
                 let Some(frame) = self.control_pending.pop_front() else {
@@ -1294,8 +1517,11 @@ impl<B: Backend> Session<B> {
             self.wmm = None;
             self.station_permission = None;
             self.ht20_profile = None;
+            self.vht_profile = None;
+            self.ap_phy = None;
             self.ht20_rx = None;
             self.rx_ba.fence();
+            self.tx_ba.fence();
             self.control_pending.clear();
             self.received_msdu.clear();
             self.state = State::Failed {

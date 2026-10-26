@@ -1790,3 +1790,91 @@ fn smoke_abi_perf_pmuv3_frequency_record() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("syscall_abi", smoke_abi_perf_pmuv3_frequency_record);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_abi_perf_pmuv3_frequency_adaptation_gate() -> TestResult {
+    with_setup(|| {
+        // #987: the frequency-adaptation decision for cycle-counter
+        // events, exercised through the same pure composition
+        // adjust_frequency_period applies. Reference rate shaped like
+        // QEMU virt's CNTFRQ; target 1000 Hz, so the architectural
+        // anchor period is 62_500 ticks and the backend floor 10_000.
+        const REF_HZ: u64 = 62_500_000;
+        const FREQ: u64 = 1_000;
+        const MINIMUM: u64 = 10_000;
+        const ANCHOR: u64 = REF_HZ / FREQ;
+        let gated = |current: u64, loaded: u64, elapsed: u64| {
+            crate::perf_event::frequency_next_period(
+                current, loaded, FREQ, elapsed, REF_HZ, MINIMUM,
+            )
+        };
+        // The pre-fix composition: raw ratio + floor, no consistency
+        // gate. Included so the fixture proves its distorted inputs
+        // really are the livelock inputs.
+        let ungated = |current: u64, elapsed: u64| {
+            crate::perf_event::frequency_period(current, FREQ, elapsed).max(MINIMUM)
+        };
+
+        // Consistency predicate: implied rate exactly at reference / 4
+        // is still consistent; one ns past it is not. A pair with no
+        // recorded period carries no evidence.
+        if !crate::perf_event::frequency_elapsed_consistent(ANCHOR, 4_000_000, REF_HZ)
+            || crate::perf_event::frequency_elapsed_consistent(ANCHOR, 4_000_001, REF_HZ)
+            || crate::perf_event::frequency_elapsed_consistent(0, 1_000_000, REF_HZ)
+        {
+            return Err("perf frequency consistency bound is wrong");
+        }
+
+        // Clocks agree: steady state, a legitimate shrink from a grown
+        // period back to the anchor, a growth step, and a shrink at the
+        // consistency boundary all reproduce the pre-fix values exactly.
+        if gated(ANCHOR, ANCHOR, 1_000_000) != ungated(ANCHOR, 1_000_000)
+            || gated(250_000, 250_000, 4_000_000) != ungated(250_000, 4_000_000)
+            || gated(ANCHOR, ANCHOR, 250_000) != ungated(ANCHOR, 250_000)
+            || gated(ANCHOR, ANCHOR, 4_000_000) != ungated(ANCHOR, 4_000_000)
+            || gated(ANCHOR, ANCHOR, 1_000_000) != ANCHOR
+            || gated(250_000, 250_000, 4_000_000) != ANCHOR
+        {
+            return Err("perf frequency gate changed matched-clock adaptation");
+        }
+
+        // Mismatched clocks: the pair claims the counter needed 8 ms to
+        // advance one anchor period (implied rate REF_HZ / 8). The raw
+        // composition shrinks a full 4x step on it; the gate holds.
+        if ungated(ANCHOR, 8_000_000) != ANCHOR / 4 || gated(ANCHOR, ANCHOR, 8_000_000) != ANCHOR {
+            return Err("perf frequency gate did not refuse a distorted shrink");
+        }
+
+        // A persistent distortion collapses the ungated composition to
+        // the 10_000 floor within a few samples — the #987 livelock
+        // state — while the gated composition never moves.
+        let mut raw = ANCHOR;
+        let mut held = ANCHOR;
+        for _ in 0..100 {
+            raw = ungated(raw, 8_000_000);
+            held = gated(held, held, 8_000_000);
+        }
+        if raw != MINIMUM || held != ANCHOR {
+            return Err("perf frequency gate did not stop the walk to the floor");
+        }
+
+        // The floor binds even when a consistent pair demands less
+        // (100 kHz target against a 62.5 MHz counter anchors at 625),
+        // and an uncalibrated reference (0 Hz) fails open to the
+        // pre-fix composition rather than wedging adaptation.
+        if crate::perf_event::frequency_next_period(
+            MINIMUM, MINIMUM, 100_000, 160_000, REF_HZ, MINIMUM,
+        ) != MINIMUM
+            || crate::perf_event::frequency_next_period(ANCHOR, ANCHOR, FREQ, 8_000_000, 0, MINIMUM)
+                != ungated(ANCHOR, 8_000_000)
+        {
+            return Err("perf frequency floor or uncalibrated-reference path is wrong");
+        }
+        Ok(())
+    })
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_perf_pmuv3_frequency_adaptation_gate
+);

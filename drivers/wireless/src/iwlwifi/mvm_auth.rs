@@ -49,7 +49,10 @@ impl Owner {
         }
         // For legacy SISO, rates-v2 and v3 share modulation/index/antenna
         // bits. Select the lowest actual AP basic bitrate, one NVM antenna.
-        Ok(Rates::parse(ies, channel)?.management_rate(chains & chains.wrapping_neg()))
+        Ok(
+            Rates::parse_for_phy(ies, channel, u8::from(self.power.phy.offered.is_some()))?
+                .management_rate(chains & chains.wrapping_neg()),
+        )
     }
 
     /// Exchange algorithm0/transaction1 with the observed AP. The peer is
