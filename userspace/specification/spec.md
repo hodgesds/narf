@@ -179,6 +179,18 @@ the owner does; procfs consults owner rows before the exec image table. The
 eager private-file copy (`MAP_POPULATE`/`MAP_LOCKED` without `MAP_NONBLOCK`)
 registers no owner and still renders as unknown backing (`LINUX-GAP`).
 
+Procfs identity is retained by each refcounted task. Fork and clone inherit
+immutable argv, environment, auxiliary-vector, executable-path and loader-map
+buffers by shared ownership in constant time with respect to their byte and
+mapping counts. Replacing a field publishes a new buffer for that task;
+retained readers and children continue to own their prior snapshot. Thread
+names remain independently writable. Early loader and kernel-task publications
+use a sharded binding directory; registering a user task retains that same
+binding before publication. Exit clears the task's image references, and reap
+retires its directory binding without invalidating already retained snapshots.
+The OOM name-copy accessor allocates nothing and returns an unknown name on
+lock contention; timer diagnostics likewise use nonblocking identity access.
+
 ELF `PT_LOAD` construction follows Linux's BSS split: file-image pages are
 materialized, the unused tail of the final file page is zero-filled, and every
 following full page through `p_memsz` is private anonymous demand-zero memory.
