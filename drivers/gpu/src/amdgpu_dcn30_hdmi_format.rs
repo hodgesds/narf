@@ -41,6 +41,9 @@ const FMT_CLAMP_CNTL: u64 = 0x1845;
 const FMT_MAP420_MEMORY_CONTROL: u64 = 0x1847;
 // linux: mmFMT0_FMT_422_CONTROL
 const FMT_422_CONTROL: u64 = 0x1849;
+// linux: mmOPPBUF0_OPPBUF_CONTROL; mmOPPBUF0_OPPBUF_3D_PARAMETERS_0
+const OPPBUF_CONTROL: u64 = 0x1884;
+const OPPBUF_3D_PARAMETERS_0: u64 = 0x1885;
 /// `opp2_dpg_set_blank_color`'s order: B/Cb, G/Y, R/Cr.
 // linux: mmDPG0_DPG_COLOUR_B_CB
 const DPG_COLOUR_B_CB: u64 = 0x1859;
@@ -56,6 +59,9 @@ const ODM_OPTC_DATA_FORMAT_CONTROL: u64 = 0x1acc;
 const ODM_STRIDE: u64 = 0x10;
 // linux: mmOTG0_OTG_H_TIMING_CNTL
 const OTG_H_TIMING_CNTL: u64 = 0x1b2e;
+// linux: mmOTG0_OTG_STEREO_CONTROL; mmOTG0_OTG_3D_STRUCTURE_CONTROL
+const OTG_STEREO_CONTROL: u64 = 0x1b54;
+const OTG_3D_STRUCTURE_CONTROL: u64 = 0x1b83;
 // linux: mmOTG1_OTG_H_TIMING_CNTL - mmOTG0_OTG_H_TIMING_CNTL
 const OTG_STRIDE: u64 = 0x80;
 // linux-ctx: hdr=dcn seg=3
@@ -74,7 +80,7 @@ const MPC_OUT_CSC_C11_C12_A: u64 = 0x059a;
 const MPC_OUT_STRIDE: u64 = 0xd;
 // linux-ctx: reset
 // linux: mmOTG5_OTG_H_TIMING_CNTL
-const LAST_2: u32 = (OTG_H_TIMING_CNTL + 5 * OTG_STRIDE) as u32;
+const LAST_2: u32 = (OTG_3D_STRUCTURE_CONTROL + 5 * OTG_STRIDE) as u32;
 // linux: mmMPC_OUT5_CSC_C33_C34_A
 const LAST_3: u32 = (MPC_OUT_CSC_C11_C12_A + 5 + 5 * MPC_OUT_STRIDE) as u32;
 
@@ -342,6 +348,15 @@ impl<I: Io> Engine<I> {
     /// OPTC_DATA_FORMAT (0 RGB, 2 4:2:0) and the horizontal divide-by-2.
     /// After the timing is programmed, before the OTG starts.
     pub(crate) fn program_otg(&mut self, format: Format) -> Result<(), Error> {
+        // dcn10_setup_stereo -> optc1_disable_stereo. The admitted stream
+        // is progressive 2D; retire firmware frame packing explicitly.
+        self.write(Bank::Two, self.at(OTG_STEREO_CONTROL, OTG_STRIDE), 0)?;
+        self.write(Bank::Two, self.at(OTG_3D_STRUCTURE_CONTROL, OTG_STRIDE), 0)?;
+        // opp1_program_stereo(false): no stereosync override.
+        self.fmt(FMT_CONTROL, 1, 0)?; // linux-lit: 1=FMT0_FMT_CONTROL__FMT_STEREOSYNC_OVERRIDE_MASK
+        self.fmt(OPPBUF_CONTROL, 0x3fff, 0)?; // linux-lit: 0x3fff=OPPBUF0_OPPBUF_CONTROL__OPPBUF_ACTIVE_WIDTH_MASK
+                                              // linux-lit: 0xfffff=OPPBUF0_OPPBUF_3D_PARAMETERS_0__OPPBUF_3D_VACT_SPACE1_SIZE_MASK | OPPBUF0_OPPBUF_3D_PARAMETERS_0__OPPBUF_3D_VACT_SPACE2_SIZE_MASK
+        self.fmt(OPPBUF_3D_PARAMETERS_0, 0x000f_ffff, 0)?;
         let two = u32::from(format.ycbcr420);
         self.update(
             Bank::Two,

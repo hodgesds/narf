@@ -85,6 +85,41 @@ underflow verification window, labelled `phase=transmitter` and
 `phase=settled`. Missing/negative diagnostic reads do not tear down a stream;
 the early sample is not treated as a settled-lock assertion.
 
+DCN3.0 passthrough planes bypass both the MPC gamut matrix and output gamma,
+and detach remap units whose status names the owned MPCC. Shared RMU mux
+updates are serialized without awaiting under the lock. Physical resource
+counts are 3/2/1 for DCN3.0/3.0.2/3.0.3; muxes serving another MPCC and absent
+units are preserved. HDMI 2D timing also retires inherited OTG stereo/frame
+packing and OPP stereo-buffer dimensions before starting the OTG.
+
+`amdgpu_dcn30_hdmi::InfoPackets` describes AVI, HDMI Forum VSIF, gamut,
+vendor VSIF, SPD, HDR static metadata and VTEM packets. `Hdmi::set_info_packets`
+checks every supplied type and InfoFrame version, length and checksum before
+any register write, then programs the seven slots in Linux order. Gamut/VTEM
+are data packets, whose payload admission belongs to the producer. Omitted
+producers and spare slot 7 are disabled. Normal desktop enable sends valid
+NARF SPD identification with AVI and any required vendor frame. This packet
+surface does not itself expose unsupported HDR/VRR DRM properties or select
+their output color transforms.
+
+Successful SCDC TMDS-configuration writes are followed by an async 1-ms
+settling interval before transmitter enable. `link_health` distinguishes
+unmonitored/non-SCDC sinks, unavailable status, acquisition, receiver lock,
+and lost configuration. Lock requires matching clock-ratio/scrambling
+configuration, detected clock, all three channel locks, and scrambler status
+when scrambling is enabled. Legacy SCDC links also read reception flags.
+
+The display monitor checks running single-stream and multi-stream HDMI
+outputs at most once per second, with no IRQ lock held across DDC awaits.
+`LinkMonitor` requests one ordinary withdrawal/relight after three consecutive
+observed failures per connection. Further sustained failures report a fault
+and suspend automatic recovery while retaining the context, so other working
+outputs are not repeatedly reset. Unknown or missing status is not a failure.
+Connector changes and explicit GPU recovery replenish the automatic budget.
+`ColdBoot::check_display_hdmi_link` and `check_group_hdmi_links(due_mask)`
+lend the retained display/DDC owners for those reads; stopped streams do not
+perform SCDC I/O. These checks establish receiver status, not visible pixels.
+
 `DRM_IOCTL_MODE_ADDFB` uses Linux's 28-byte `drm_mode_fb_cmd` request
 (`0xc01c64ae`). It converts the legacy bpp/depth pair to a DRM fourcc and
 supplies one handle/pitch, zero offsets and no modifiers to the existing

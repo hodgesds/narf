@@ -23,11 +23,11 @@ in `amdgpu_navi22_multi.rs` and share the block owners.
 | Clock and bandwidth admission | `dcn30_prepare_bandwidth` → `dcn20_prepare_bandwidth`; `clk_mgr/dcn30/dcn30_clk_mgr.c` | Board-derived DPM/DML admission, clocks before watermarks, bounded acknowledgements. Earlier HPET calibration and physical fabric geometry fixes are retained. |
 | OPTC clocks | `optc/dcn10/dcn10_optc.c::optc1_enable_optc_clock` | Input clock then OTG clock, with acknowledgements, before programming the pixel clock. |
 | TMDS pixel clock | `dce/dce_clock_source.c::dcn3_program_pix_clk` → `dce112_program_pix_clk`; `bios/command_table2.c::set_pixel_clock_v7` | SetPixelClock uses the selected combo-PHY PLL and physical encoder, 100-Hz units, XTALIN reference, and deep-color resync. DCN3's path leaves the firmware deep-color ratio zero; it differs from the newer DCN3.1 implementation. `SUPPORT_YCBCR420` is assigned by the older DCE110 resource path, not the selected DCN3 path. No flag change is justified by reading the callee alone. |
-| Timing and VTG | `optc/dcn10/dcn10_optc.c::optc1_program_timing`, `optc1_set_vtg_params` | **Gap:** VTG was enabled without programming `VCOUNT_INIT` or `FP2`. Program `v_init = v_total - v_front_porch`, `blank_end = v_init - v_active`, `fp2 = max(0, vstartup - blank_end - 1)`. Also clear inherited interlace for this progressive-only path. Test both DCN3.0 and DCN3.1.4 layouts and the pre-VSYNC boundary. |
-| MPC output policy | `hwss/dcn20/dcn20_hwseq.c::dcn20_enable_stream_timing` → `mpc/dcn30/dcn30_mpc.c::mpc3_set_out_rate_control` | **Gap:** only multi-stream enable performed the stream-time update. Takeover's `mpc3_mpc_init_single_inst` clears the count, but not rate bit 9. Single-stream now shares the existing update: disable=1, rate=0 before enabling the OPP. |
+| Timing and VTG | `optc/dcn10/dcn10_optc.c::optc1_program_timing`, `optc1_set_vtg_params` | **Fixed:** VTG initialization now programs `v_init = v_total - v_front_porch`, `blank_end = v_init - v_active`, `fp2 = max(0, vstartup - blank_end - 1)`, and clears inherited interlace. Tests cover both DCN3.0 and DCN3.1.4 layouts and the pre-VSYNC boundary. |
+| MPC output policy | `hwss/dcn20/dcn20_hwseq.c::dcn20_enable_stream_timing` → `mpc/dcn30/dcn30_mpc.c::mpc3_set_out_rate_control` | **Fixed:** single-stream now shares the multi-stream update: disable=1, rate=0 before enabling the OPP. Takeover's `mpc3_mpc_init_single_inst` alone clears the count, but not rate bit 9. |
 | OPP/FMT/OCSC and blanking | `dcn20_blank_pixel_data`; `opp2_program_fmt`; `dcn20_program_output_csc` | Owned OPP clock, native dimensions, format/depth/clamp, OCSC, and DPG black. HDMI format is applied before OTG enable. DPG is disabled under the OTG lock when the primary plane starts. |
 | OTG enable | `optc/dcn20/dcn20_optc.c::optc2_enable_crtc` | Segment selection, VTG before OTG master enable, disable point 3, one frame before link setup. |
-| Physical output destination | `link/link_dpms.c::link_set_dpms_on` → `optc/dcn30/dcn30_optc.c::optc3_set_out_mux` | **Gap:** `OTG_OUT_MUX` was inherited. DCN3.0 owners now explicitly select DIO before encoder attributes. The saved OTG0 snapshot already had this bit clear, so this gap alone does not explain that black-screen boot. |
+| Physical output destination | `link/link_dpms.c::link_set_dpms_on` → `optc/dcn30/dcn30_optc.c::optc3_set_out_mux` | **Fixed:** DCN3.0 owners explicitly select DIO before encoder attributes. The saved OTG0 snapshot already had this bit clear, so this omission alone does not explain that black-screen boot. |
 | FE→OTG and link mode | `enc1_dig_connect_to_otg`; `dcn10_link_encoder_setup`; `setup_dio_stream_attribute` | Route-specific FE source, HDMI DIG mode, stereo synchronization, then STREAM_SETUP and HDMI stream attributes. |
 | HDMI stream attributes | `dio/dcn30/dcn30_dio_stream_encoder.c::enc3_stream_encoder_hdmi_set_stream_attribute` | Packet-generation version, keepout, depth, null/GC packets, scrambler, quarter-rate clock above 340 MHz, AVMUTE. NARF uses the firmware STREAM_SETUP path. Linux's fallback FIFO reset belongs to `avoid_vbios_exec_table`, not an additional step after successful firmware setup. |
 | InfoFrames | `enc3_stream_encoder_update_hdmi_info_packets`; `dcn30/dcn30_vpg.c::vpg3_update_generic_info_packet` | Packet RAM, conflict handling, immediate update, send/continuous controls and line selection. DCN3.0 VPG has no `vpg_poweron` callback. |
@@ -65,6 +65,49 @@ are 1. Linux `include/drm/display/drm_scdc.h` defines bit 0 as clock detection
 and bits 1–3 as channel locks. This sample therefore reports a detected clock
 and scrambling, without channel locks. It narrows the link investigation;
 it does not establish a visible image or prove the greeter is the blocker.
+
+The later `guest-XtexVHKX/serial.log` reports scrambler status 1 and status
+flags 15 after unblank: clock detection and all three channel locks. The
+earlier zero-channel sample was not a persistent-link-failure proof. Neither
+sample establishes that the intended framebuffer pixels reach the monitor.
+
+## Implementation follow-up
+
+The remaining native TMDS lifecycle work adds:
+
+- Linux's `dcn30_program_gamut_remap` bypass and
+  `dcn30_set_mpc_shaper_3dlut(NULL)` RMU release for encoded RGB scanout.
+  Output-gamma bypass alone left these independent stages inherited.
+  Release is scoped to the MPCC and the physical RMU count; shared mux updates
+  are serialized. It does not program unused denorm callbacks as though they
+  were required initialization steps.
+- Explicit retirement of OTG stereo/frame-packing and OPP stereo-buffer
+  dimensions for the admitted progressive 2D modes.
+- A complete seven-slot packet programming surface, validated before any
+  writes, including optional HDMI Forum, gamut, SPD, HDR and VTEM packets.
+  Standard InfoFrames validate version, length and checksum; data-packet
+  payload admission remains with the producer. Desktop enable sends NARF SPD,
+  AVI and any required vendor packet, and disables absent producers.
+- The 1-ms TMDS configuration settling interval specified by the primary
+  Linux DRM SCDC helper (`drivers/gpu/drm/display/drm_scdc_helper.c`).
+- Reception classification for scrambled and legacy SCDC links, and bounded
+  maintenance on both single-stream and multi-stream contexts. Three observed
+  bad samples, spaced at least one second apart, permit one normal relight
+  per connection. Persistent subsequent failure is reported without an endless
+  reset loop or retiring otherwise healthy outputs. An unavailable read is
+  unknown, not failed reception.
+
+The existing path still owns EDID/depth/rate admission, 8/10/12-bpc RGB and
+8-bpc YCbCr 4:2:0 selection, PLL/PHY firmware commands, HDMI/DIG/FMT/OCSC,
+audio setup, hotplug, pinned scanout, and normal teardown. New tests start
+with inherited color/stereo state, exercise all packet slots and rejected
+updates, model sink configuration loss, and enforce the recovery budget and
+poll cadence. Evidence is in `target/host-narf/hdmi-complete-20261026/`.
+
+This work targets the selected Navi22/DCN3.0 TMDS path. It does not claim
+HDMI certification, FRL, HDCP, CEC, exposed Navi22 HDR/VRR controls, or native
+Mesa 3D acceptance from register-model success. Physical visible-output
+acceptance remains separate.
 
 Board-specific external HDMI retimer/redriver programming is conditional in
 Linux's `enable_link_hdmi`. `link_factory.c` gets those `chip_caps` only from

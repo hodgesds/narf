@@ -38,6 +38,12 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 #[path = "amdgpu_dcn30_hdmi_format.rs"]
 mod format;
 pub use format::Formatter;
+#[path = "amdgpu_dcn30_hdmi_link.rs"]
+mod link;
+pub use link::{link_health, LinkAction, LinkHealth, LinkMonitor};
+#[path = "amdgpu_dcn30_hdmi_packets.rs"]
+mod packets;
+pub use packets::{InfoPackets, DESKTOP_SPD};
 
 // linux-ctx: hdr=dcn seg=2
 // linux: mmDIG1_DIG_FE_CNTL - mmDIG0_DIG_FE_CNTL
@@ -141,14 +147,6 @@ pub const TMDS_MIN_KHZ: u32 = 25_000; // linux: TMDS_MIN_PIXEL_CLOCK
 /// character clock of 300 MHz and up.
 // linux: n/a (adjusted_pix_clk_100hz >= 3000000, literal in dcn10_link_encoder.c:dcn10_link_encoder_validate_hdmi_output)
 pub const TMDS_NO_6G_KHZ: u32 = 300_000;
-/// `enc3_stream_encoder_update_hdmi_info_packets`' packets in its order:
-/// AVI (0), HF-VSIF (5), gamut (2), vendor (1), SPD (3), HDR (4), VTEM (6).
-const PACKET_ORDER: [u32; 7] = [0, 5, 2, 1, 3, 4, 6];
-// linux: n/a (packet_index 0, literal in dcn30_dio_stream_encoder.c:enc3_stream_encoder_update_hdmi_info_packets)
-const PACKET_AVI: u32 = 0;
-// linux: n/a (packet_index 1, literal in dcn30_dio_stream_encoder.c:enc3_stream_encoder_update_hdmi_info_packets)
-const PACKET_VENDOR: u32 = 1;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Unsupported,
@@ -176,6 +174,8 @@ pub mod scdc {
     pub const TMDS_CONFIG: u8 = 0x20; // linux: SCDC_TMDS_CONFIG
     pub const SCRAMBLER_STATUS: u8 = 0x21; // linux: SCDC_SCRAMBLER_STATUS
     pub const STATUS_FLAGS: u8 = 0x40; // linux: SCDC_STATUS_FLAGS_0
+    /// Clock_Detected and all three channel locks; drm_scdc.h.
+    pub const RECEPTION_LOCK: u8 = 0x0f; // linux: SCDC_CLOCK_DETECT | SCDC_CH_LOCK_MASK
     /// TMDS_Config: Scrambling_Enable and TMDS_Bit_Clock_Ratio (1/40).
     pub const SCRAMBLING_ENABLE: u8 = 1 << 0; // linux: SCDC_SCRAMBLING_ENABLE
     pub const BIT_CLOCK_RATIO_40: u8 = 1 << 1; // linux: SCDC_TMDS_BIT_CLOCK_RATIO_BY_40
@@ -462,6 +462,11 @@ pub async fn write_scdc_data<A: Aux>(ddc: &mut A, stream: &Stream) -> Result<(),
         let _ = ddc.scdc_write(scdc::SOURCE_VERSION, 1).await;
     }
     let result: Result<(), LinkError> = ddc.scdc_write(scdc::TMDS_CONFIG, config).await;
+    if result.is_ok() {
+        // HDMI 2.0: wait 1..100 ms after selecting the clock ratio before
+        // sending the TMDS clock (drm_scdc_set_high_tmds_clock_ratio).
+        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
+    }
     match result {
         Err(_) if config != 0 => Err(Error::Scdc),
         _ => Ok(()),
@@ -486,12 +491,13 @@ pub async fn write_scdc_legacy<A: Aux>(ddc: &mut A, scdc_present: bool) {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScdcStatus {
     pub tmds_config: u8,
-    /// Scrambling_Status (bit 0) and the status flags (clock detected,
-    /// channel locks), read only when TMDS_Config says scrambling.
+    /// Scrambling_Status (bit 0), read when TMDS_Config says scrambling.
     pub scrambler_status: Option<u8>,
+    /// Clock detection and three channel locks, including legacy TMDS.
     pub status_flags: Option<u8>,
 }
-/// `read_scdc_data` after `enable_tmds_link_output`: diagnostics only.
+/// Observe reception after transmitter enable or during link maintenance.
+/// A failed read remains unavailable status; classification is separate.
 pub async fn read_scdc_data<A: Aux>(ddc: &mut A, stream: &Stream) -> Option<ScdcStatus> {
     if !stream.scdc {
         return None;
@@ -503,8 +509,9 @@ pub async fn read_scdc_data<A: Aux>(ddc: &mut A, stream: &Stream) -> Option<Scdc
     };
     if tmds_config & scdc::SCRAMBLING_ENABLE != 0 {
         status.scrambler_status = ddc.scdc_read(scdc::SCRAMBLER_STATUS).await.ok();
-        status.status_flags = ddc.scdc_read(scdc::STATUS_FLAGS).await.ok();
     }
+    // Clock/channel status is useful for both scrambled and legacy TMDS.
+    status.status_flags = ddc.scdc_read(scdc::STATUS_FLAGS).await.ok();
     Some(status)
 }
 
@@ -780,22 +787,23 @@ impl<I: Io> Engine<I> {
         avi: &[u8; 36],
         vendor: Option<&[u8; 36]>,
     ) -> Result<(), Error> {
-        if avi[0] != 0x82 || vendor.is_some_and(|v| v[0] != 0x81) {
-            return Err(Error::Invalid);
-        }
+        self.program_info_packets(&InfoPackets::new(avi, vendor))
+            .await
+    }
+    pub(crate) async fn program_info_packets(
+        &mut self,
+        packets: &InfoPackets<'_>,
+    ) -> Result<(), Error> {
+        packets.validate()?;
         self.update(self.fe(HDMI_DB_CONTROL), HDMI_DB_DISABLE, HDMI_DB_DISABLE)?;
         self.update(self.fe(AFMT_CNTL), AFMT_AUDIO_CLOCK_EN, AFMT_AUDIO_CLOCK_EN)?;
-        for index in PACKET_ORDER {
-            let packet = match index {
-                PACKET_AVI => Some(avi),
-                PACKET_VENDOR => vendor,
-                _ => None,
-            };
+        for (index, packet) in packets.ordered() {
             if let Some(packet) = packet {
                 self.vpg_packet(index, packet).await?;
             }
             self.packet_control(index, packet.is_some())?;
         }
+        self.packet_control(7, false)?;
         Ok(())
     }
     /// `enc3_stream_encoder_stop_hdmi_info_packets` for packets 0..7.
@@ -884,10 +892,17 @@ impl Hdmi {
     pub async fn info_packets(&mut self, avi: &[u8; 36]) -> Result<(), Error> {
         self.0.info_packets(avi).await
     }
-    /// The AVI and (when present) HDMI vendor InfoFrames of `stream`.
+    /// Desktop AVI/SPD and the HDMI vendor InfoFrame when required.
     pub async fn hdmi_info_packets(&mut self, stream: &Stream) -> Result<(), Error> {
         let avi = stream.avi.as_ref().ok_or(Error::Invalid)?;
-        self.0.hdmi_info_packets(avi, stream.vendor.as_ref()).await
+        self.0
+            .program_info_packets(&InfoPackets::desktop(avi, stream.vendor.as_ref()))
+            .await
+    }
+    /// Validate the complete set before programming packet producers. The
+    /// caller owns color/timing admission for optional HDR/VTEM metadata.
+    pub async fn set_info_packets(&mut self, packets: &InfoPackets<'_>) -> Result<(), Error> {
+        self.0.program_info_packets(packets).await
     }
     pub fn stop_info_packets(&mut self) -> Result<(), Error> {
         self.0.stop_info_packets()

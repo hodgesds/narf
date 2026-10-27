@@ -924,6 +924,8 @@ static LONG_PULSES: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8:
 /// Each board connector's debounced HPD at the last detection or pass.
 static SENSES: narf_lib::sync::IrqSafeSpinLock<[Option<bool>; 6]> =
     narf_lib::sync::IrqSafeSpinLock::new([None; 6]);
+static HDMI_LINKS: narf_lib::sync::IrqSafeSpinLock<[crate::amdgpu_dcn30_hdmi::LinkMonitor; 6]> =
+    narf_lib::sync::IrqSafeSpinLock::new([crate::amdgpu_dcn30_hdmi::LinkMonitor::new(); 6]);
 /// The route and sink the lit pipe was lit for, for the long-pulse
 /// `same_edid` check.
 static LIT_SINK: narf_lib::sync::IrqSafeSpinLock<
@@ -956,6 +958,9 @@ fn note_hpd_pulse(hpd: crate::amdgpu_ih_navi22::Hpd) {
 /// What a monitor pass did, for its console line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MonitorStep {
+    /// One automatic relight per connection; subsequent sustained failures
+    /// are reported without resetting healthy streams in the same context.
+    HdmiLinkLoss(usize, crate::amdgpu_dcn30_hdmi::LinkAction),
     /// The lit sink's HPD fell: withdrawn and torn down without AUX/DDC.
     Unplugged(usize),
     /// A connector's sink appeared, left or was replaced: detected again.
@@ -992,6 +997,7 @@ async unsafe fn monitor_hotplug(
     //    connector disconnected (its EDID and modes gone).
     if let Some((route, _)) = running {
         if senses.get(route) == Some(&Some(false)) {
+            HDMI_LINKS.lock()[route] = crate::amdgpu_dcn30_hdmi::LinkMonitor::new();
             withdraw(boot).await;
             // SAFETY: withdrawn and drained; serialized by OWNER.
             let result = unsafe { boot.stop_unplugged_display() }.await;
@@ -1048,6 +1054,7 @@ async unsafe fn monitor_hotplug(
     }
     if let Some(&first) = changed.first() {
         for &i in &changed {
+            HDMI_LINKS.lock()[i] = crate::amdgpu_dcn30_hdmi::LinkMonitor::new();
             boot.forget_display_link(i);
         }
         if running.is_some_and(|(route, _)| changed.contains(&route)) {
@@ -1076,6 +1083,28 @@ async unsafe fn monitor_hotplug(
     }
     // 3. The lit DP link (HPD-RX or the periodic poll): link loss retrains.
     let (route, _) = running?;
+    if ports.get(route).map(|c| c.signal) == Some(Signal::Hdmi) {
+        use crate::amdgpu_dcn30_hdmi::LinkAction;
+        let now = narf_time::wall::monotonic_ns() / 1_000_000;
+        if !HDMI_LINKS.lock().get_mut(route)?.poll_due(now) {
+            return None;
+        }
+        let health = boot.check_display_hdmi_link().await.ok()?;
+        let action = HDMI_LINKS.lock().get_mut(route)?.observe(health);
+        if action == LinkAction::None {
+            return None;
+        }
+        if action == LinkAction::Faulted {
+            return Some(Ok(MonitorStep::HdmiLinkLoss(route, action)));
+        }
+        // SAFETY: same withdrawal and CPU-view retirement as other relights.
+        let result = unsafe { unlight(boot) }.await;
+        if action == LinkAction::Relight && result.is_ok() {
+            KMS.lock().attempted = None;
+            crate::amdgpu_navi22_kms::wake();
+        }
+        return Some(result.map(|()| MonitorStep::HdmiLinkLoss(route, action)));
+    }
     if ports.get(route).map(|c| c.signal) != Some(Signal::DisplayPort) {
         return None;
     }
@@ -1125,6 +1154,9 @@ async unsafe fn monitor_pass() {
         let mut kms = KMS.lock();
         kms.crtc.shown = None;
         kms.attempted = None;
+        HDMI_LINKS
+            .lock()
+            .fill(crate::amdgpu_dcn30_hdmi::LinkMonitor::new());
     }
     let running = boot.display_output().and_then(|o| {
         boot.display_scanout_ref()?;
@@ -1201,6 +1233,40 @@ async unsafe fn converge_group(
     use crate::amdgpu_navi22_kms::{GroupAction, KMS};
     use core::fmt::Write;
     let running = group_running(boot);
+    if running.is_some() {
+        use crate::amdgpu_dcn30_hdmi::LinkAction;
+        let now = narf_time::wall::monotonic_ns() / 1_000_000;
+        let due = HDMI_LINKS
+            .lock()
+            .iter_mut()
+            .enumerate()
+            .fold(0u8, |mask, (i, m)| mask | (u8::from(m.poll_due(now)) << i));
+        for (route, health) in boot.check_group_hdmi_links(due).await.unwrap_or_default() {
+            let action = HDMI_LINKS
+                .lock()
+                .get_mut(route)
+                .map_or(LinkAction::None, |m| m.observe(health));
+            if action == LinkAction::None {
+                continue;
+            }
+            if action == LinkAction::Faulted {
+                let _ = writeln!(narf_console::Writer, "amdgpu: navi22 HDMI {route} {health:?} {action:?}; automatic recovery exhausted");
+                continue;
+            }
+            // SAFETY: OWNER excludes presentation; all group CPU views are
+            // retired by the same normal group-withdraw path before teardown.
+            let result = unsafe { unlight_group(boot) }.await;
+            if action == LinkAction::Relight && result.is_ok() {
+                KMS.lock().attempted_group = None;
+                crate::amdgpu_navi22_kms::wake();
+            }
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 HDMI {route} {health:?} {action:?}: {result:?}"
+            );
+            return true;
+        }
+    }
     let action = {
         let mut kms = KMS.lock();
         kms.assign_route();

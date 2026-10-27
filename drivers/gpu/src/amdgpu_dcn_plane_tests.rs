@@ -32,7 +32,7 @@ fn block(instance: u8, size: u32) -> Block<Fake> {
     }
 }
 fn plane_navi22_routes_sixth_dpp_and_opp() -> TestResult {
-    let mut mpc = block(5, 0x0594);
+    let mut mpc = block(5, 0x0680);
     mpc.profile = Profile::Navi22;
     mpc.mpc_mux_plane(5, 5).unwrap();
     if mpc.io.values[0xa0] & 0xf != 5
@@ -144,6 +144,50 @@ fn plane_dpp_normalizes_inherited_conversion_and_color() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn-plane",
     plane_dpp_normalizes_inherited_conversion_and_color
+);
+
+fn plane_navi22_bypasses_inherited_gamut_and_rmus() -> TestResult {
+    let mut mpc = block(2, 0x680);
+    mpc.profile = Profile::Navi22;
+    mpc.io.values[0x24b] = 0x8000_0002;
+    // RMUs 0 and 2 were attached to our MPCC; RMU 1 belongs to MPCC 3.
+    // Each byte contains a requested mux and its read-only status nibble.
+    let inherited = 0x8000_0000 | 0x22 | (0x33 << 8) | (0x22 << 16);
+    mpc.io.values[0x680] = inherited;
+    if mpc.mpc_mux_plane(2, 2).is_err() {
+        return TestResult::Fail("MPC passthrough initialization");
+    }
+    if mpc.io.values[0x24b] != 0x8000_0000 {
+        return TestResult::Fail("inherited MPC gamut matrix survived");
+    }
+    let writable = 0x000f_000f;
+    if mpc.io.values[0x680] != (inherited & !writable) | writable {
+        return TestResult::Fail("owned remap units retained, or another stream's remap changed");
+    }
+    TestResult::Pass
+}
+fn plane_rmu_release_respects_each_rdna2_physical_capacity() -> TestResult {
+    for (profile, mask) in [
+        (Profile::Navi22, 0x000f_0f0f),
+        (Profile::Dcn302, 0x0000_0f0f),
+        (Profile::Dcn303, 0x0000_000f),
+    ] {
+        let mut mpc = block(0, 0x680);
+        mpc.profile = profile;
+        mpc.io.values[0x680] = 0x8000_0000;
+        if mpc.mpc_mux_plane(0, 0).is_err() || mpc.io.values[0x680] != 0x8000_0000 | mask {
+            return TestResult::Fail("absent remap mux was programmed");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-plane",
+    plane_rmu_release_respects_each_rdna2_physical_capacity
+);
+kernel_test_in!(
+    "drivers/gpu/dcn-plane",
+    plane_navi22_bypasses_inherited_gamut_and_rmus
 );
 
 fn plane_mpc_binds_one_pipe_with_nothing_beneath_it() -> TestResult {

@@ -136,6 +136,7 @@ fn dcn30_hdmi_sends_avi_and_vendor_infoframes_and_stops() -> TestResult {
     let mut avi = [0u8; 36];
     avi[..4].copy_from_slice(&[0x82, 2, 13, 0]);
     avi[8] = 16;
+    avi[4] = 0x5f; // checksum of AVI header + VIC 16.
     if run(e.info_packets(&avi)).is_err() {
         return TestResult::Fail("AVI packet");
     }
@@ -155,6 +156,7 @@ fn dcn30_hdmi_sends_avi_and_vendor_infoframes_and_stops() -> TestResult {
     // The HDMI vendor InfoFrame rides generic packet 1 (data index 9).
     let mut vendor = [0u8; 36];
     vendor[..3].copy_from_slice(&[0x81, 1, 5]);
+    vendor[4] = 0x79;
     e.io.data.clear();
     if run(e.hdmi_info_packets(&avi, Some(&vendor))).is_err()
         || e.io.data.len() != 18
@@ -518,6 +520,141 @@ impl Aux for Scdc {
         Ok(())
     }
 }
+
+fn dcn30_hdmi_all_packet_slots_validate_before_programming() -> TestResult {
+    fn packet(kind: u8, version: u8, len: u8) -> [u8; 36] {
+        let mut p = [0; 36];
+        p[..3].copy_from_slice(&[kind, version, len]);
+        p[4] = 0u8.wrapping_sub(kind.wrapping_add(version).wrapping_add(len));
+        p
+    }
+    let avi = packet(0x82, 2, 13);
+    let vendor = packet(0x81, 1, 5);
+    let gamut = packet(0x0a, 0, 0);
+    let hdr = packet(0x87, 1, 26);
+    let vtem = packet(0x7f, 0, 0);
+    let p = InfoPackets {
+        hf_vsif: Some(&vendor),
+        gamut: Some(&gamut),
+        hdr: Some(&hdr),
+        vtem: Some(&vtem),
+        ..InfoPackets::desktop(&avi, Some(&vendor))
+    };
+    let mut e = engine(2, 0);
+    let reg = (HDMI_GENERIC_PACKET_CONTROL0 + 2 * STRIDE) as usize;
+    // The unowned spare packet 7 must not survive the update.
+    e.io.regs[reg] = 0x3000_0000;
+    if run(e.program_info_packets(&p)).is_err()
+        || e.io.data.len() != 63
+        || e.io.regs[reg] != 0x0333_3333
+    {
+        return TestResult::Fail("complete HDMI packet set");
+    }
+    for (i, expected) in [0x82, 0x81, 0x0a, 0x81, 0x83, 0x87, 0x7f]
+        .iter()
+        .enumerate()
+    {
+        if e.io.data[9 * i] as u8 != *expected {
+            return TestResult::Fail("packet order / slot association");
+        }
+    }
+    let before = e.io.regs.clone();
+    for (byte, value) in [(0, 0x82), (1, 2), (2, 255), (4, hdr[4] ^ 1)] {
+        let mut corrupt = hdr;
+        corrupt[byte] = value;
+        if run(e.program_info_packets(&InfoPackets {
+            hdr: Some(&corrupt),
+            ..p
+        })) != Err(Error::Invalid)
+            || e.io.regs != before
+            || e.io.data.len() != 63
+        {
+            return TestResult::Fail("malformed optional packet modified running stream");
+        }
+    }
+    if run(e.program_info_packets(&InfoPackets::new(&avi, None))).is_err() || e.io.regs[reg] != 3 {
+        return TestResult::Fail("retired metadata packets kept transmitting");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi",
+    dcn30_hdmi_all_packet_slots_validate_before_programming
+);
+
+fn dcn30_hdmi_link_health_checks_configuration_and_all_channels() -> TestResult {
+    let e = edid(DTD_2160P60, &[vsdb(0, 68), hf_vsdb(120, 0x80)]);
+    let s = stream(&e, 8, false, Limits::DEFAULT).unwrap();
+    let locked = ScdcStatus {
+        tmds_config: 3,
+        scrambler_status: Some(1),
+        status_flags: Some(15),
+    };
+    if link_health(&s, Some(locked)) != LinkHealth::Locked
+        || link_health(&s, None) != LinkHealth::Unknown
+        || link_health(
+            &s,
+            Some(ScdcStatus {
+                tmds_config: 0,
+                ..locked
+            }),
+        ) != LinkHealth::ConfigurationLost
+        || link_health(
+            &s,
+            Some(ScdcStatus {
+                scrambler_status: None,
+                ..locked
+            }),
+        ) != LinkHealth::Unknown
+        || link_health(
+            &s,
+            Some(ScdcStatus {
+                scrambler_status: Some(0),
+                ..locked
+            }),
+        ) != LinkHealth::Acquiring
+    {
+        return TestResult::Fail("scrambled HDMI readiness");
+    }
+    for flags in [1, 7, 11, 13, 14] {
+        if link_health(
+            &s,
+            Some(ScdcStatus {
+                status_flags: Some(flags),
+                ..locked
+            }),
+        ) != LinkHealth::Acquiring
+        {
+            return TestResult::Fail("missing clock or channel accepted as locked");
+        }
+    }
+    let legacy = Stream {
+        scramble: Scramble::Off,
+        ..s
+    };
+    let mut ddc = Scdc::new(1);
+    ddc.regs[0x40] = 15;
+    let status = run(read_scdc_data(&mut ddc, &legacy));
+    if link_health(&legacy, status) != LinkHealth::Locked || !ddc.log.iter().any(|e| e.1 == 0x40) {
+        return TestResult::Fail("legacy HDMI reception was not checked");
+    }
+    let absent = Stream {
+        scdc: false,
+        ..legacy
+    };
+    ddc.log.clear();
+    if run(read_scdc_data(&mut ddc, &absent)).is_some()
+        || !ddc.log.is_empty()
+        || link_health(&absent, None) != LinkHealth::Unmonitored
+    {
+        return TestResult::Fail("non-SCDC sink was monitored");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi/link",
+    dcn30_hdmi_link_health_checks_configuration_and_all_channels
+);
 
 fn dcn30_hdmi_scdc_protocol_matches_link_ddc() -> TestResult {
     let hdmi20 = edid(

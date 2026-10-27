@@ -53,7 +53,10 @@ const MPCC_OPP_ID: u64 = 0x0002; // linux: mmMPCC0_MPCC_OPP_ID
 const MPCC_CONTROL: u64 = 0x0003; // linux: mmMPCC0_MPCC_CONTROL
 const MPCC_STRIDE: u64 = 0x20; // linux: mmMPCC1_MPCC_TOP_SEL - mmMPCC0_MPCC_TOP_SEL
 const MPCC_OGAM_CONTROL: u64 = 0x0100; // linux: mmMPCC_OGAM0_MPCC_OGAM_CONTROL
+const MPCC_GAMUT_REMAP_MODE: u64 = 0x014b; // linux: mmMPCC_OGAM0_MPCC_GAMUT_REMAP_MODE
 const OGAM_STRIDE: u64 = 0x80; // linux: mmMPCC_OGAM1_MPCC_OGAM_CONTROL - mmMPCC_OGAM0_MPCC_OGAM_CONTROL
+const MPC_RMU_CONTROL: u64 = 0x0680; // linux: mmMPC_RMU_CONTROL
+static RMU_MUX_LOCK: narf_lib::sync::IrqSafeSpinLock<()> = narf_lib::sync::IrqSafeSpinLock::new(());
 const MPC_OUT_MUX: u64 = 0x0580; // linux: mmMPC_OUT0_MUX
 const MPC_OUT_STRIDE: u64 = 4; // linux: mmMPC_OUT1_MUX - mmMPC_OUT0_MUX
                                // linux-ctx: hdr=dcn
@@ -316,6 +319,37 @@ impl<I: Io> Block<I> {
         if dpp >= self.profile.pipes() || opp >= self.profile.pipes() {
             return Err(Error::Invalid);
         }
+        if self.profile.is_dcn30() {
+            // dcn30_program_gamut_remap: an encoded RGB desktop has no
+            // stream gamut matrix. OGAM bypass alone does not bypass this.
+            let reg = MPCC_GAMUT_REMAP_MODE + u64::from(self.instance) * OGAM_STRIDE;
+            self.update(reg, 3, 0)?; // linux-lit: 3=MPCC_OGAM0_MPCC_GAMUT_REMAP_MODE__MPCC_GAMUT_REMAP_MODE_MASK
+                                     // dcn30_set_mpc_shaper_3dlut(NULL) -> release_rmu. Only detach
+                                     // muxes belonging to this MPCC; other streams retain their LUTs.
+                                     // DCN3 has three RMUs, with MUX/STATUS nibble pairs per byte.
+            {
+                // Different MPCC owners share this register. Serialize the
+                // masked updates, with no await or hardware wait under lock.
+                let _mux = RMU_MUX_LOCK.lock();
+                let rmu = self.access(|io| io.read(MPC_RMU_CONTROL))?;
+                if rmu == u32::MAX {
+                    return Err(Error::DeviceGone);
+                }
+                // Resource caps: DCN3.0 has 3, 3.0.2 has 2, 3.0.3 has 1.
+                let units = match self.profile {
+                    Profile::Navi22 => 3,
+                    Profile::Dcn302 => 2,
+                    Profile::Dcn303 => 1,
+                    Profile::Dcn314 => 0,
+                };
+                for unit in 0..units {
+                    let shift = 8 * unit;
+                    if (rmu >> (shift + 4)) & 0xf == u32::from(self.instance) {
+                        self.update(MPC_RMU_CONTROL, 0xf << shift, 0xf << shift)?;
+                    }
+                }
+            }
+        }
         // mpc3_program_ogam(NULL): this passthrough path owns no output
         // gamma LUT. A firmware LUT may still be selected after mpc_init.
         let reg = MPCC_OGAM_CONTROL + u64::from(self.instance) * OGAM_STRIDE;
@@ -460,7 +494,11 @@ impl Mpc {
                 base: profile.bank(
                     gpu,
                     3, // linux-lit: 3=mmMPCC0_MPCC_TOP_SEL_BASE_IDX
-                    (MPC_OUT_MUX + u64::from(profile.pipes() - 1) * MPC_OUT_STRIDE) as u32,
+                    if profile.is_dcn30() {
+                        MPC_RMU_CONTROL as u32
+                    } else {
+                        (MPC_OUT_MUX + u64::from(profile.pipes() - 1) * MPC_OUT_STRIDE) as u32
+                    },
                 )?,
             },
             authority,

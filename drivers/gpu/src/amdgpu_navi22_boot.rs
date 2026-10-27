@@ -2351,6 +2351,40 @@ impl ColdBoot {
             .await
             .map_err(Error::Modeset)
     }
+    /// HDMI SCDC reception state for the running single stream.
+    pub async fn check_display_hdmi_link(
+        &mut self,
+    ) -> Result<crate::amdgpu_dcn30_hdmi::LinkHealth, Error> {
+        let (pipeline, mut aux, _, _) = self.lit_display()?;
+        Ok(pipeline.hdmi_link_health(&mut aux).await)
+    }
+    /// HDMI reception for each connector in a running multi-stream context.
+    /// Device ownership is retained across the await; no IRQ lock is held.
+    pub async fn check_group_hdmi_links(
+        &mut self,
+        due: u8,
+    ) -> Result<alloc::vec::Vec<(usize, crate::amdgpu_dcn30_hdmi::LinkHealth)>, Error> {
+        let h = &mut self.sequence.backend;
+        let group = h.group.as_mut().ok_or(Error::Invalid)?;
+        let display = h.display.as_mut().ok_or(Error::Invalid)?;
+        let mut result = alloc::vec::Vec::new();
+        for pipeline in group.members_mut() {
+            let connector = pipeline.connector();
+            if connector.signal != crate::amdgpu_navi22_display::Signal::Hdmi {
+                continue;
+            }
+            let Some(index) = display.connectors().iter().position(|c| *c == connector) else {
+                continue;
+            };
+            if index >= 6 || due & (1 << index) == 0 {
+                continue;
+            }
+            let mut aux = crate::amdgpu_navi22_display::DisplayAux { display, index };
+            let health = pipeline.hdmi_link_health(&mut aux).await;
+            result.push((index, health));
+        }
+        Ok(result)
+    }
     /// `dp_handle_link_loss` on the lit DP stream: the link stopped and
     /// trained again at the same setting while scanout continues. On
     /// failure the link is down and the caller stops the display

@@ -73,8 +73,17 @@ struct Lit {
 }
 /// Light `edid` on HDMI transmitter 3 at `max_bpc`.
 fn light(edid: Vec<u8>, max_bpc: u8, vram: &Vram) -> Result<Lit, &'static str> {
+    light_with(edid, max_bpc, vram, |_| {})
+}
+fn light_with(
+    edid: Vec<u8>,
+    max_bpc: u8,
+    vram: &Vram,
+    prepare: impl FnOnce(&Bench),
+) -> Result<Lit, &'static str> {
     let bench = Bench::new();
     bench.set(m::MP1 + 0x274, 1);
+    prepare(&bench);
     let image = m::vbios(7);
     let connector = m::connector(Signal::Hdmi, 3, 3);
     let route = Resources::new().acquire(&connector).map_err(|_| "route")?;
@@ -128,6 +137,67 @@ fn stop(lit: &mut Lit) -> Result<(), &'static str> {
     let tables = Tables::new(&lit.image).map_err(|_| "tables")?;
     run(lit.pipeline.disable(&tables, &mut lit.sink)).map_err(|_| "disable")
 }
+
+fn dcn30_hdmi_progressive_output_retires_stereo_state() -> TestResult {
+    let vram = Vram::new(2 << 20);
+    let e = edid(DTD_640X480, &[vsdb(0, 68)]);
+    let mut lit = match light_with(e, 8, &vram, |b| {
+        b.set(d2(0x1840), 1);
+        b.set(d2(0x1b54), 1 << 24);
+        b.set(d2(0x1b83), 0x1001);
+        b.set(d2(0x1884), 0x8000_3fff);
+        b.set(d2(0x1885), 0x800f_ffff);
+    }) {
+        Ok(lit) => lit,
+        Err(why) => return TestResult::Fail(why),
+    };
+    let clean = lit.bench.get(d2(0x1840)) & 1 == 0
+        && lit.bench.get(d2(0x1b54)) == 0
+        && lit.bench.get(d2(0x1b83)) == 0
+        && lit.bench.get(d2(0x1884)) == 0x8000_0000
+        && lit.bench.get(d2(0x1885)) == 0x8000_0000;
+    if let Err(why) = stop(&mut lit) {
+        return TestResult::Fail(why);
+    }
+    if !clean {
+        return TestResult::Fail("HDMI inherited stereo/frame-packing state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi",
+    dcn30_hdmi_progressive_output_retires_stereo_state
+);
+
+fn dcn30_hdmi_running_link_observes_lock_and_lost_configuration() -> TestResult {
+    let vram = Vram::new(2 << 20);
+    let e = edid(DTD_640X480, &[vsdb(0, 68), hf_vsdb(120, 0x88)]);
+    let mut lit = match light(e, 8, &vram) {
+        Ok(lit) => lit,
+        Err(why) => return TestResult::Fail(why),
+    };
+    lit.sink.regs[0x40] = 15;
+    lit.sink.regs[0x21] = 1;
+    if run(lit.pipeline.hdmi_link_health(&mut lit.sink)) != super::LinkHealth::Locked {
+        return TestResult::Fail("running HDMI did not observe reception");
+    }
+    // The sink went through a power cycle without dropping HPD.
+    lit.sink.regs[0x20] = 0;
+    if run(lit.pipeline.hdmi_link_health(&mut lit.sink)) != super::LinkHealth::ConfigurationLost {
+        return TestResult::Fail("lost TMDS configuration was hidden");
+    }
+    if let Err(why) = stop(&mut lit) {
+        return TestResult::Fail(why);
+    }
+    if run(lit.pipeline.hdmi_link_health(&mut lit.sink)) != super::LinkHealth::Unmonitored {
+        return TestResult::Fail("stopped HDMI stream kept monitoring DDC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi/link",
+    dcn30_hdmi_running_link_observes_lock_and_lost_configuration
+);
 
 fn dcn30_hdmi_modeset_deep_colour_scrambled_with_scdc_in_linux_order() -> TestResult {
     // 640x480 on an HDMI 2.0 sink with DC_36 and LTE_340Mcsc_scramble, at

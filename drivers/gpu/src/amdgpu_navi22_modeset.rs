@@ -1524,6 +1524,17 @@ impl Pipeline {
     pub fn hdmi_output(&self) -> Option<hdmi::Stream> {
         self.hdmi
     }
+    /// Observe the running TMDS link. Reading SCDC never changes the PHY,
+    /// and an unavailable DDC status is not evidence of a failed stream.
+    pub async fn hdmi_link_health<A: Aux + Send>(&mut self, aux: &mut A) -> hdmi::LinkHealth {
+        if self.connector.signal != Signal::Hdmi || self.state != State::At(Step::Running) {
+            return hdmi::LinkHealth::Unmonitored;
+        }
+        let Some(stream) = self.hdmi else {
+            return hdmi::LinkHealth::Unmonitored;
+        };
+        hdmi::link_health(&stream, hdmi::read_scdc_data(aux, &stream).await)
+    }
     /// `link_set_dpms_on` for DisplayPort SST at the least link the
     /// verified one has that carries the stream (`decide_dp_link_settings`).
     async fn link_dp<A: Aux + Send>(
