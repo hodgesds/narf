@@ -275,24 +275,24 @@ rtlwifi	vht	VHT operation on RTL8821AE	feature	drivers/wireless/specification/rt
 rtlwifi	vlan_offload_applicability	VLAN offload hardware applicability is not established	unknown	drivers/wireless/specification/rtlwifi.md	338
 rtlwifi	wmm_all_access_categories	Packet routing across all WMM access categories	feature	drivers/wireless/specification/rtlwifi.md	615
 rtw88	active_scanning	Active scanning	feature	drivers/wireless/specification/rtw88.md	1449
-rtw88	additional_ht_widths	Additional HT widths are not individually enumerated	unknown	drivers/wireless/specification/rtw88.md	1448
 rtw88	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw88.md	1449
 rtw88	beamforming	Beamforming	feature	drivers/wireless/specification/rtw88.md	264
-rtw88	broader_ba_variants	Additional TX aggregation/recipient-negotiation variants are not enumerated	unknown	drivers/wireless/specification/rtw88.md	1449
-rtw88	checksum_offload_applicability	Checksum offload hardware applicability is not established	unknown	drivers/wireless/specification/rtw88.md	506
-rtw88	cts_to_self	CTS-to-self protection	feature	drivers/wireless/specification/rtw88.md	1346
+rtw88	cck_pd_tracking	Periodic CCK packet-detection threshold tracking on RTL8821C/RTL8822C	feature	drivers/wireless/specification/rtw88.md	1546
+rtw88	cfo_tracking	Carrier-frequency offset tracking on RTL8822C	feature	drivers/wireless/specification/rtw88.md	1546
 rtw88	device_removal	Device removal	feature	drivers/wireless/specification/rtw88.md	1443
+rtw88	dig_tracking	Periodic dynamic initial gain (DIG) tracking	feature	drivers/wireless/specification/rtw88.md	1546
 rtw88	dma_reclamation	Published DMA/map reclamation	feature	drivers/wireless/specification/rtw88.md	1443
-rtw88	dynamic_phy_thermal_scope	Remaining dynamic PHY/thermal algorithms are not enumerated	unknown	drivers/wireless/specification/rtw88.md	264
+rtw88	dpk_tracking	DPK thermal tracking on RTL8822C	feature	drivers/wireless/specification/rtw88.md	1546
+rtw88	edcca_adaptivity	EDCCA adaptivity on RTL8822B/RTL8822C	feature	drivers/wireless/specification/rtw88.md	1546
 rtw88	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specification/rtw88.md	1446
-rtw88	greenfield_applicability	HT greenfield applicability is not established by the backlog	unknown	drivers/wireless/specification/rtw88.md	934
-rtw88	ht_control_scope	HT-control header variants/applicability are not established by the backlog	unknown	drivers/wireless/specification/rtw88.md	934
-rtw88	ht_protection_modes	Additional AP-negotiated HT protection modes	feature	drivers/wireless/specification/rtw88.md	1346
-rtw88	ldpc_applicability	LDPC direction and per-chip applicability are not established by the backlog	unknown	drivers/wireless/specification/rtw88.md	934
+rtw88	ht40	HT40 operation (40MHz width, DSSS/CCK40, SGI40)	feature	drivers/wireless/specification/rtw88.md	1544
+rtw88	ht_protection_modes	Admit APs advertising nonzero HT protection modes	feature	drivers/wireless/specification/rtw88.md	1553
+rtw88	ldpc	HT/VHT LDPC RX advertisement and peer-gated TX on RTL8822B/RTL8822C	feature	drivers/wireless/specification/rtw88.md	1547
 rtw88	multi_device	Multiple live device lifetimes	feature	drivers/wireless/specification/rtw88.md	1443
 rtw88	multi_stream_ht	Multi-stream HT on RTL8822B/RTL8822C	feature	drivers/wireless/specification/rtw88.md	1448
 rtw88	operating_reset	Reset of an operating retained owner	feature	drivers/wireless/specification/rtw88.md	1443
 rtw88	qos_all_tid_routing	QoS packet scheduling across all supported TIDs	feature	drivers/wireless/specification/rtw88.md	1449
+rtw88	ra_tracking	Periodic firmware RA info and RRSR tracking	feature	drivers/wireless/specification/rtw88.md	1546
 rtw88	radio_coexistence	Complete radio coexistence state machine	feature	drivers/wireless/specification/rtw88.md	1450
 rtw88	randomized_scan_mac	Randomized scan MAC addresses	feature	drivers/wireless/specification/rtw88.md	500
 rtw88	rate_fallback	DATA rate fallback	feature	drivers/wireless/specification/rtw88.md	949
@@ -301,14 +301,15 @@ rtw88	rtl8822be	RTL8822BE retained firmware/radio/packet/station runtime	chip	dr
 rtw88	runtime_sleep	Runtime sleep	feature	drivers/wireless/specification/rtw88.md	1450
 rtw88	safe_rejoin	Safe reassociation/rejoin	feature	drivers/wireless/specification/rtw88.md	1450
 rtw88	scan_probe_extra_ies	Driver-admitted extra probe-request IEs	feature	drivers/wireless/specification/rtw88.md	500
-rtw88	smps_scope	SMPS modes/applicability are not established by the backlog	unknown	drivers/wireless/specification/rtw88.md	933
-rtw88	stbc_applicability	STBC direction and per-chip applicability are not established by the backlog	unknown	drivers/wireless/specification/rtw88.md	934
+rtw88	smps_txrx_1ss	Coexistence-driven static SMPS on RTL8822C	feature	drivers/wireless/specification/rtw88.md	1549
+rtw88	stbc	One-stream RX STBC on all chips and TX STBC on multi-path chips	feature	drivers/wireless/specification/rtw88.md	1548
 rtw88	system_suspend	System suspend	feature	drivers/wireless/specification/rtw88.md	1443
-rtw88	tso_offload_applicability	TSO offload hardware applicability is not established	unknown	drivers/wireless/specification/rtw88.md	506
+rtw88	tx_amsdu_5ghz	TX A-MSDU and A-MSDU-in-A-MPDU outside 2.4GHz	feature	drivers/wireless/specification/rtw88.md	1545
+rtw88	tx_ba_all_tids	Originator TX Block Ack on every non-VO TID	feature	drivers/wireless/specification/rtw88.md	1545
+rtw88	tx_path_diversity	TX path diversity on RTL8822C	feature	drivers/wireless/specification/rtw88.md	1546
 rtw88	vht	VHT operation	feature	drivers/wireless/specification/rtw88.md	1448
-rtw88	vlan_offload_applicability	VLAN offload hardware applicability is not established	unknown	drivers/wireless/specification/rtw88.md	506
 rtw88	wmm_all_access_categories	Packet scheduling across all WMM access categories	feature	drivers/wireless/specification/rtw88.md	1449
-rtw88	wow	Wake on Wireless	feature	drivers/wireless/specification/rtw88.md	1450
+rtw88	wow	Wake on Wireless on RTL8822CE	feature	drivers/wireless/specification/rtw88.md	1551
 rtw89	adaptive_rate_fallback	Adaptive rate fallback	feature	drivers/wireless/specification/rtw89.md	957
 rtw89	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw89.md	1006
 rtw89	additional_phy_widths	Additional HT/HE/EHT widths and GI variants are not individually enumerated	unknown	drivers/wireless/specification/rtw89.md	1014

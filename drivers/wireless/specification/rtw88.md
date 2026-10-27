@@ -1519,3 +1519,37 @@ calibration epoch between descriptor write and doorbell, remove current power
 policy and serialize disconnect against synchronous workers. Administrative
 IFF_UP remains independent of physical carrier. These are software/model
 results; no fixture creates deployable board measurements or physical evidence.
+
+### Upstream applicability triage (2026-10-27)
+
+This subsection resolves the former `unknown` inventory rows against Linux
+v6.12 `rtw88/{main.c,mac80211.c,tx.c,phy.c,rtw8821c.c,rtw8822b.c,rtw8822c.c}`.
+It records applicability only; nothing below is implemented by this change.
+
+Inapplicable on upstream rtw88 (rows removed):
+
+| Former row | Evidence |
+|---|---|
+| `checksum_offload_applicability` | `main.c::rtw_register_hw` assigns no `hw->netdev_features`; `tx.c::rtw_tx_fill_tx_desc` has no checksum descriptor field. Host checksums remain authoritative. |
+| `tso_offload_applicability` | Same: no `NETIF_F_TSO*` and no segmentation descriptor; mac80211 delivers single MSDUs/A-MSDUs. |
+| `vlan_offload_applicability` | Same: no VLAN insertion/stripping field or netdev feature. |
+| `greenfield_applicability` | `main.c::rtw_init_ht_cap` never sets `IEEE80211_HT_CAP_GRN_FLD` on any chip. |
+| `ht_control_scope` (HT +HTC) | `rtw_init_ht_cap` advertises no HT-control capability. VHT +HTC (`IEEE80211_VHT_CAP_HTC_VHT` in `rtw_init_vht_cap`) belongs to the `vht` row. |
+| `cts_to_self` | `tx.c` maps only `info->control.use_rts` or `len > rts_threshold` to `W3_USE_RTS`/RTS24M; neither `tx.c` nor `mac80211.c` reads `use_cts_prot` or programs a CTS-to-self descriptor bit. The implemented RTS threshold is the complete upstream protection mechanism. |
+
+Resolved into named feature rows (applicability proven, work remains):
+
+| Former row | Named rows and evidence |
+|---|---|
+| `additional_ht_widths` | `ht40`: `rtw_init_ht_cap` adds `SUP_WIDTH_20_40`, `DSSSCCK40` and `SGI_40` when EFUSE `hw_cap.bw` has 40MHz (all three chips). VHT80 stays in `vht`. |
+| `broader_ba_variants` | `tx_ba_all_tids`: `tx.c::rtw_txq_check_agg` requests originator BA for every non-VO TID (never EAPOL). `tx_amsdu_5ghz`: `TX_AMSDU`/`SUPPORTS_AMSDU_IN_AMPDU` with `rtw_ops_can_aggregate_in_amsdu` declining only on 2.4GHz. Recipient negotiation is mac80211-owned (`RX_START`/`RX_STOP` are driver no-ops) and already covered by the R contract. |
+| `dynamic_phy_thermal_scope` | `phy.c::rtw_phy_dynamic_mechanism` runs statistics, `dig_tracking` (all chips), `cck_pd_tracking` (C21/C22C `cck_pd_set`, 2.4GHz only), `ra_tracking` (firmware RA info and RRSR update), `tx_path_diversity` (C22C `path_div_supported`), `cfo_tracking` and `dpk_tracking` (C22C only), `rf_power_tracking` (all chips, existing row) and `edcca_adaptivity` (C22B/C22C `adaptivity`, or firmware `FW_FEATURE_ADAPTIVITY`). |
+| `ldpc_applicability` | `ldpc`: `rx_ldpc = true` on 8822B/8822C (false on 8821C) gates HT `LDPC_CODING` and VHT `RXLDPC`; TX sets `W5_DATA_LDPC` from the peer's `si->ldpc_en`. |
+| `stbc_applicability` | `stbc`: one-stream RX STBC is advertised on every chip (HT `RX_STBC`=1, VHT `RXSTBC_1`); HT TX STBC only with `tx_stbc` (8822C) and VHT `TXSTBC` when `rf_path_num > 1`; `W5_DATA_STBC` is forced off while `hal.txrx_1ss`. |
+| `smps_scope` | `smps_txrx_1ss`: only 8822C has `config_txrx_mode`; `main.c::rtw_vif_smps_iter` requests static SMPS while coexistence forces 1SS and SMPS off otherwise. No `NL80211_FEATURE_{STATIC,DYNAMIC}_SMPS` is set, so user-driven local SMPS is inapplicable. |
+
+Refined feature rows: `wow` applies to RTL8822CE only (`wow_fw_name`/
+`wowlan_stub` exist only in `rtw8822c.c`; 8821C/8822B declare neither).
+`ht_protection_modes`: upstream reads no `ht_operation_mode` and takes no
+protection action, so the remaining work is admitting APs that advertise
+nonzero HT protection in the shared HT JoinPlan instead of refusing them.
