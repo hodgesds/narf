@@ -4,6 +4,14 @@
 //! Stage-1 implementation — discovery + MMIO mapping + LPSS ungate +
 //! DW I2C programming + PIO transactions.
 //!
+//! Bus speed: when any device on the bus declares a
+//! `ConnectionSpeed` in its `_CRS` `I2cSerialBus` descriptor, the
+//! composed speed (#772, `crate::dw_speed`) is programmed at
+//! `enable()` — but only on HIDs whose DW input clock is grounded
+//! (see [`ic_clk_khz_for_hid`]); the counts are never derived from
+//! a guessed clock. With no declaration, or an ungrounded clock,
+//! the fixed constants below are programmed, as before #772.
+//!
 //! What "LPSS" means here
 //! ----------------------
 //! Intel's "Low-Power Sub-System" wraps the same DesignWare APB I2C IP
@@ -123,6 +131,37 @@ pub struct LpssI2c<R = MmioDwRegs> {
     bus: AsyncMutex<()>,
     enabled: AtomicBool,
     last_target: AtomicU8,
+    /// DW core input clock in kHz for this controller's HID, when
+    /// grounded ([`ic_clk_khz_for_hid`]). `None` = not grounded;
+    /// speed-derived programming is then disabled (#772).
+    ic_clk_khz: Option<u32>,
+    /// Composed `_CRS` bus speed for this controller's bus
+    /// (#772), set by probe via [`crate::dw_speed::bus_speed_hz`]
+    /// before `enable()`. `None` = nothing on the bus declares a
+    /// speed; `enable()` keeps the fixed default constants.
+    bus_speed_hz: Option<u32>,
+}
+
+/// DW input clock (kHz) per ACPI HID, grounded in Linux
+/// `drivers/mfd/intel-lpss-acpi.c`'s `intel_lpss_platform_info`
+/// table (`clk_rate` of the matching `*_i2c_info`):
+/// - `INT3446` / `INT3447` (Sunrise Point I2C) → `spt_i2c_info`,
+///   120 MHz.
+/// - `INT34B7` (Cannon Lake-lineage I2C, incl. Tiger Lake) →
+///   `cnl_i2c_info`, 216 MHz.
+///
+/// Every other HID in [`LPSS_I2C_HIDS`] returns `None` here: the
+/// sources above do not pin a rate for them (several are
+/// PCI-mode or predate the table), so #772 speed programming
+/// stays off for those controllers rather than deriving counts
+/// from a guessed clock. Extend the table only with a cited
+/// rate, per HID.
+pub fn ic_clk_khz_for_hid(hid: &str) -> Option<u32> {
+    match hid {
+        "INT3446" | "INT3447" => Some(120_000),
+        "INT34B7" => Some(216_000),
+        _ => None,
+    }
 }
 
 impl<R> core::fmt::Debug for LpssI2c<R> {
@@ -172,7 +211,29 @@ impl<R: DwRegs> LpssI2c<R> {
             bus: AsyncMutex::new(()),
             enabled: AtomicBool::new(false),
             last_target: AtomicU8::new(0xff),
+            ic_clk_khz: None,
+            bus_speed_hz: None,
         }
+    }
+
+    /// Record the DW input clock for this controller (#772), in
+    /// kHz — see [`ic_clk_khz_for_hid`]. Probe calls this before
+    /// `enable()`.
+    pub fn set_ic_clk_khz(&mut self, ic_clk_khz: Option<u32>) {
+        self.ic_clk_khz = ic_clk_khz;
+    }
+
+    /// Record the composed `_CRS` bus speed for this controller's
+    /// bus (#772). Probe calls this before `enable()`; `None`
+    /// (the default) keeps the fixed-constant programming.
+    pub fn set_bus_speed_hz(&mut self, speed_hz: Option<u32>) {
+        self.bus_speed_hz = speed_hz;
+    }
+
+    /// The bus speed recorded by [`Self::set_bus_speed_hz`], for
+    /// probe logging.
+    pub fn bus_speed_hz(&self) -> Option<u32> {
+        self.bus_speed_hz
     }
 
     /// # Safety
@@ -236,8 +297,31 @@ impl<R: DwRegs> LpssI2c<R> {
         }
     }
 
-    /// Program the controller to a known-good 400 kHz master config.
+    /// Program the controller as a 7-bit master with restart
+    /// enabled.
+    ///
+    /// Timing: when probe recorded both a composed `_CRS` bus
+    /// speed ([`Self::set_bus_speed_hz`], #772) and a grounded
+    /// input clock ([`Self::set_ic_clk_khz`]), the SCL counts are
+    /// derived via [`crate::dw_speed::timings_for`] and
+    /// `IC_CON.SPEED` selects the composed mode; otherwise the
+    /// fixed 400 kHz constants are programmed, byte-for-byte the
+    /// pre-#772 behaviour.
     pub fn enable(&self) -> Result<(), I2cError> {
+        let (speed_bits, ss_hcnt, ss_lcnt, fs_hcnt, fs_lcnt) =
+            match (self.bus_speed_hz, self.ic_clk_khz) {
+                (Some(hz), Some(ic_clk_khz)) => {
+                    let t = crate::dw_speed::timings_for(ic_clk_khz, hz);
+                    (
+                        t.mode.ic_con_speed_bits(),
+                        t.ss_hcnt,
+                        t.ss_lcnt,
+                        t.fs_hcnt,
+                        t.fs_lcnt,
+                    )
+                }
+                _ => (IC_CON_SPEED_FAST, SS_HCNT, SS_LCNT, FS_HCNT, FS_LCNT),
+            };
         // SAFETY: bus mutex held externally or run serially during probe.
         unsafe {
             self.write32(IC_ENABLE, 0);
@@ -248,15 +332,12 @@ impl<R: DwRegs> LpssI2c<R> {
             }
             self.write32(
                 IC_CON,
-                IC_CON_MASTER_MODE
-                    | IC_CON_SPEED_FAST
-                    | IC_CON_IC_SLAVE_DISABLE
-                    | IC_CON_RESTART_EN,
+                IC_CON_MASTER_MODE | speed_bits | IC_CON_IC_SLAVE_DISABLE | IC_CON_RESTART_EN,
             );
-            self.write32(IC_SS_SCL_HCNT, SS_HCNT);
-            self.write32(IC_SS_SCL_LCNT, SS_LCNT);
-            self.write32(IC_FS_SCL_HCNT, FS_HCNT);
-            self.write32(IC_FS_SCL_LCNT, FS_LCNT);
+            self.write32(IC_SS_SCL_HCNT, ss_hcnt);
+            self.write32(IC_SS_SCL_LCNT, ss_lcnt);
+            self.write32(IC_FS_SCL_HCNT, fs_hcnt);
+            self.write32(IC_FS_SCL_LCNT, fs_lcnt);
             self.write32(IC_RX_TL, 0);
             self.write32(IC_TX_TL, 0);
             self.write32(IC_INTR_MASK, 0);
@@ -527,7 +608,7 @@ pub fn probe_all() -> usize {
     let mut count = 0usize;
     for &hid in LPSS_I2C_HIDS {
         for node in narf_aml::find_all_devices_by_hid(hid) {
-            if probe_one(&node.path).is_some() {
+            if probe_one(hid, &node.path).is_some() {
                 count += 1;
             }
         }
@@ -535,19 +616,28 @@ pub fn probe_all() -> usize {
     count
 }
 
-fn probe_one(path: &str) -> Option<()> {
+fn probe_one(hid: &str, path: &str) -> Option<()> {
     use core::fmt::Write;
 
     let res = decode_ctrl_crs(path)?;
 
     let irq_vec = res.gsi.and_then(|gsi| try_route_irq(gsi, res.irq_flags));
 
-    let driver = Arc::new(LpssI2c::new(
+    let mut driver = LpssI2c::new(
         path.to_string(),
         PhysAddr::new(res.mmio_base),
         res.mmio_len,
         irq_vec,
-    ));
+    );
+    // #772: record the grounded input clock for this HID and the
+    // composed _CRS bus speed (slowest declared wins, Linux
+    // i2c_acpi_find_bus_speed semantics). enable() derives the
+    // SCL counts only when both are known.
+    let ic_clk_khz = ic_clk_khz_for_hid(hid);
+    driver.set_ic_clk_khz(ic_clk_khz);
+    driver.set_bus_speed_hz(crate::dw_speed::bus_speed_hz(path));
+    let bus_speed = driver.bus_speed_hz();
+    let driver = Arc::new(driver);
 
     if let Err(e) = driver.probe_component_type() {
         let _ = writeln!(
@@ -572,7 +662,7 @@ fn probe_one(path: &str) -> Option<()> {
     let registered = crate::registry::register_unique(driver.clone());
     let _ = writeln!(
         narf_console::Writer,
-        "  lpss-i2c: detected at MMIO={:#x}+{:#x} {} irq=GSI{}->v{}",
+        "  lpss-i2c: detected at MMIO={:#x}+{:#x} {} irq=GSI{}->v{} bus-speed={}",
         res.mmio_base,
         res.mmio_len,
         path,
@@ -582,6 +672,13 @@ fn probe_one(path: &str) -> Option<()> {
         irq_vec
             .map(|v| format!("{}", v))
             .unwrap_or_else(|| "polled".into()),
+        match (bus_speed, ic_clk_khz) {
+            (Some(hz), Some(_)) => format!("{}Hz (_CRS)", hz),
+            // Declared but not programmable: this HID's input
+            // clock is ungrounded, so enable() kept the defaults.
+            (Some(hz), None) => format!("{}Hz declared, clock ungrounded", hz),
+            (None, _) => "default".to_string(),
+        },
     );
     let _ = registered;
     Some(())
