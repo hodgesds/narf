@@ -134,6 +134,19 @@ pub const MTL_7D55: u16 = 0x7D55;
 pub const MTL_7D60: u16 = 0x7D60;
 pub const MTL_7DD5: u16 = 0x7DD5;
 
+// Arrow Lake (Xe-LPG silicon under a new product name — see the
+// DEVICE_TABLE note). Linux `include/drm/intel/pciids.h`
+// INTEL_ARL_*_IDS: H = 7D51/7DD1, U = 7D41, S = 7D67/B640.
+// pci.ids lists the same five as Arrow Lake (it labels B640
+// Arrow Lake-H; i915 files B640 under its ARL-S macro — the
+// segment letter differs between the two sources, the Arrow
+// Lake attribution and the MTL binding agree).
+pub const ARL_7D41: u16 = 0x7D41;
+pub const ARL_7D51: u16 = 0x7D51;
+pub const ARL_7D67: u16 = 0x7D67;
+pub const ARL_7DD1: u16 = 0x7DD1;
+pub const ARL_B640: u16 = 0xB640;
+
 // Panther Lake (Xe3-LPG / "Xe3", Core Ultra Series 3 mobile).
 pub const PTL_B080: u16 = 0xB080;
 pub const PTL_B081: u16 = 0xB081;
@@ -161,6 +174,13 @@ pub enum Generation {
     /// Alder Lake / Raptor Lake — Gen12 Xe-LP carry-forward.
     AlderLake,
     /// Meteor Lake — Xe-LPG (re-architected DDI + display power).
+    /// Arrow Lake classifies here too: its GT is Xe-LPG and its
+    /// display is Xe-LPD, and both Linux drivers bind the ARL IDs
+    /// to the Meteor Lake device info / display descriptor
+    /// (i915 `INTEL_ARL_IDS(..., &mtl_info)`, xe `&mtl_desc`),
+    /// distinguishing Arrow Lake only as a subplatform. The
+    /// table follows the silicon, as it already does for Raptor
+    /// Lake under `AlderLake`; `asic` carries the product name.
     MeteorLake,
     /// Panther Lake — Xe3-LPG. Display is Xe3_LPD: the DDI block
     /// moved again relative to Xe-LPG and the C10/C20 PHYs replace
@@ -182,8 +202,8 @@ impl Generation {
 
     /// Whether this lane programs the display engine for the
     /// generation. Only Gen12 (TGL/ADL/RPL) has a validated
-    /// register sequence; MTL/PTL identify and announce but skip
-    /// modeset until #1016 lands their display engines.
+    /// register sequence; MTL/ARL/PTL identify and announce but
+    /// skip modeset until #1016 lands their display engines.
     pub const fn display_supported(self) -> bool {
         matches!(self, Generation::TigerLake | Generation::AlderLake)
     }
@@ -604,6 +624,40 @@ pub const DEVICE_TABLE: &[DeviceEntry] = &[
         did: MTL_7DD5,
         generation: Generation::MeteorLake,
         asic: "meteorlake",
+    },
+    // Arrow Lake (Xe-LPG) — classified Generation::MeteorLake
+    // (the silicon and both Linux drivers' binding), announced
+    // under its own name. Identify + announce only, exactly
+    // like the Meteor Lake rows above.
+    DeviceEntry {
+        name: "intel-gpu-arl-7D41",
+        did: ARL_7D41,
+        generation: Generation::MeteorLake,
+        asic: "arrowlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-arl-7D51",
+        did: ARL_7D51,
+        generation: Generation::MeteorLake,
+        asic: "arrowlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-arl-7D67",
+        did: ARL_7D67,
+        generation: Generation::MeteorLake,
+        asic: "arrowlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-arl-7DD1",
+        did: ARL_7DD1,
+        generation: Generation::MeteorLake,
+        asic: "arrowlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-arl-B640",
+        did: ARL_B640,
+        generation: Generation::MeteorLake,
+        asic: "arrowlake",
     },
     // Panther Lake (Xe3-LPG) — identify + announce only in this lane.
     DeviceEntry {
@@ -1288,6 +1342,11 @@ pub mod tests {
             (0x7D55, "meteorlake"),
             (0x7D60, "meteorlake"),
             (0x7DD5, "meteorlake"),
+            (0x7D41, "arrowlake"),
+            (0x7D51, "arrowlake"),
+            (0x7D67, "arrowlake"),
+            (0x7DD1, "arrowlake"),
+            (0xB640, "arrowlake"),
             (0xB080, "pantherlake"),
             (0xB081, "pantherlake"),
             (0xB082, "pantherlake"),
@@ -1397,4 +1456,52 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu", smoke_display_gate_is_gen12_only);
+
+    /// Arrow Lake classification (#1023): the product name says
+    /// "new generation", the silicon says Xe-LPG. Linux binds
+    /// every ARL ID to the Meteor Lake device info / display
+    /// descriptor (i915 `INTEL_ARL_IDS(..., &mtl_info)`, xe and
+    /// display `&mtl_desc`), so the rows classify
+    /// `Generation::MeteorLake` under `asic: "arrowlake"` — the
+    /// Raptor-Lake-under-AlderLake pattern. This fixture pins
+    /// the whole set (including B640, which the pci.ids v2.2
+    /// extract lane 1 worked from did not carry, though the
+    /// i915 ID macros and current pci.ids do) so a future
+    /// "helpful" reclassification to a distinct generation — or
+    /// worse, to Gen12, which would arm the Gen12 modeset
+    /// against Xe-LPG silicon — fails here first.
+    fn smoke_arrowlake_classification() -> TestResult {
+        const ARL_DIDS: &[u16] = &[ARL_7D41, ARL_7D51, ARL_7D67, ARL_7DD1, ARL_B640];
+        for did in ARL_DIDS {
+            let info = match chip_info_for_pci_id(INTEL_VENDOR, *did) {
+                Some(i) => i,
+                None => return TestResult::Fail("Arrow Lake DID does not classify"),
+            };
+            if info.asic != "arrowlake" {
+                return TestResult::Fail("Arrow Lake DID classifies to the wrong ASIC");
+            }
+            if info.generation != Generation::MeteorLake {
+                return TestResult::Fail("Arrow Lake must classify as MeteorLake (Xe-LPG)");
+            }
+            // Current disposition: identify + announce only —
+            // no display programming, no Stage-0 region map,
+            // exactly like the Meteor Lake rows.
+            if info.generation.display_supported() {
+                return TestResult::Fail("Arrow Lake must not arm display programming");
+            }
+            if info.generation.region_generation().is_some() {
+                return TestResult::Fail("Arrow Lake must not claim a Stage-0 region map");
+            }
+        }
+        // No bleed across the shared 0x7Dxx space: the sibling
+        // Meteor Lake IDs keep their own ASIC name.
+        for did in [MTL_7D40, MTL_7D45, MTL_7D55, MTL_7D60, MTL_7DD5] {
+            match chip_info_for_pci_id(INTEL_VENDOR, did) {
+                Some(i) if i.asic == "meteorlake" && i.generation == Generation::MeteorLake => {}
+                _ => return TestResult::Fail("Meteor Lake DID misclassified next to Arrow Lake"),
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu", smoke_arrowlake_classification);
 }
