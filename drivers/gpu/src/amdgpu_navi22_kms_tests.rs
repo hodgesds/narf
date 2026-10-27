@@ -207,10 +207,32 @@ fn navi22_kms_publication_excludes_rdna4_only_planes_and_modifiers() -> TestResu
     if word(8) != 2 || word(16) != 1 || blob[modifiers + 16..modifiers + 24] != [0u8; 8] {
         return TestResult::Fail("DCN30 format blob advertises a tiled layout");
     }
-    // Re-publishing must not reintroduce the shared helper's capabilities.
+    let native = card
+        .native
+        .iter_mut()
+        .find(|n| n.connector == crate::amdgpu_navi48_kms::connector_id(3))
+        .unwrap();
+    if native.colorspace != Some(0)
+        || native.hdr_output_metadata != Some(0)
+        || native.max_bpc.is_none()
+        || native.color_format != Some(crate::amdgpu_hdr::ColorFormat::Auto)
+    {
+        return TestResult::Fail("HDMI output controls absent");
+    }
+    native.max_bpc = Some(10);
+    native.colorspace = Some(crate::amdgpu_hdr::DRM_MODE_COLORIMETRY_BT2020_RGB);
+    native.color_format = Some(crate::amdgpu_hdr::ColorFormat::Ycbcr422);
+    // Re-publishing keeps committed controls and excludes DCN401's planes.
     apply_card(&mut card, &crtcs, &connectors);
-    if card.gfx12_modifiers || !card.native_planes.is_empty() {
-        return TestResult::Fail("republication changed the DCN30 plane ABI");
+    if card.gfx12_modifiers
+        || !card.native_planes.is_empty()
+        || card.native[0].max_bpc != Some(10)
+        || card.native[0].colorspace != Some(crate::amdgpu_hdr::DRM_MODE_COLORIMETRY_BT2020_RGB)
+        || card.native[0].color_format != Some(crate::amdgpu_hdr::ColorFormat::Ycbcr422)
+    {
+        return TestResult::Fail(
+            "republication changed the DCN30 plane ABI or committed output state",
+        );
     }
     TestResult::Pass
 }
@@ -531,4 +553,116 @@ fn navi22_kms_secondary_crtcs_light_as_one_context() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     navi22_kms_secondary_crtcs_light_as_one_context
+);
+
+fn navi22_kms_connector_color_requests_converge_and_survive_reprobe() -> TestResult {
+    use crate::amdgpu_hdr::{ColorFormat, DRM_MODE_COLORIMETRY_BT2020_RGB};
+    use crate::amdgpu_native_kms::ConnectorColorRequest;
+    let mut k = Kms::new();
+    let r = reports(true, 1);
+    k.reconcile(&r, admitted);
+    k.assign_route();
+    let connector = crate::amdgpu_navi48_kms::connector_id(3);
+    let mut color = ConnectorColorRequest {
+        connector,
+        color_format: ColorFormat::Rgb,
+        colorspace: DRM_MODE_COLORIMETRY_BT2020_RGB,
+        hdr_output_metadata: Some(vec![0; 32]),
+    };
+    if !k.set_max_bpc(connector, 10)
+        || !k.set_color(&color)
+        || k.next(Some((3, hd()))) != Action::Unlight
+    {
+        return TestResult::Fail("color request never reached convergence");
+    }
+    k.connectors[3].shown_output = k.connectors[3].output;
+    if k.next(Some((3, hd()))) != Action::Nothing {
+        return TestResult::Fail("applied state keeps relighting");
+    }
+    color.hdr_output_metadata.as_mut().unwrap()[26] = 1;
+    if !k.set_color(&color)
+        || k.next(Some((3, hd()))) != Action::Nothing
+        || k.connectors[3].shown_output == k.connectors[3].output
+    {
+        return TestResult::Fail("metadata-only update causes a modeset or loses pending state");
+    }
+    let old = k.connectors[3].output;
+    k.reconcile(&r, admitted);
+    if k.connectors[3].output != old || k.connectors[3].shown_output == old {
+        return TestResult::Fail("reprobe erased requested or applied state");
+    }
+    color.hdr_output_metadata = None;
+    if !k.set_color(&color) || k.next(Some((3, hd()))) != Action::Unlight {
+        return TestResult::Fail("HDR exit did not relight");
+    }
+    let before = k.connectors[3].output;
+    color.hdr_output_metadata = Some(vec![0; 31]);
+    if k.set_color(&color) || k.set_max_bpc(connector, 7) || k.connectors[3].output != before {
+        return TestResult::Fail("invalid state mutated connector");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_kms_connector_color_requests_converge_and_survive_reprobe
+);
+
+fn navi22_kms_hdmi_format_check_is_exact_and_side_effect_free() -> TestResult {
+    use crate::amdgpu_dcn30_hdmi::tests::{edid, vsdb, DTD_1080P};
+    use crate::amdgpu_hdr::ColorFormat;
+    use crate::amdgpu_native_kms::{OutputFormatRequest, OutputRoute};
+    let mut r = reports(true, 1);
+    let Detection::Connected(sink) = &mut r[3].detection else {
+        return TestResult::Fail("fixture");
+    };
+    sink.edid = edid(DTD_1080P, &[vsdb(0, 68)]);
+    crate::amdgpu_dcn30_hdmi::tests::cta_byte(&mut sink.edid, 131, 0x10);
+    let mut k = Kms::new();
+    k.reconcile(&r, admitted);
+    k.assign_route();
+    let connector = crate::amdgpu_navi48_kms::connector_id(3);
+    let request = OutputFormatRequest {
+        display: 0,
+        connector,
+        color_format: ColorFormat::Ycbcr422,
+        mode: Some(crate::amdgpu_navi48_kms::timing_wire(&hd())),
+        max_bpc: Some(12),
+        planes: None,
+    };
+    let route = OutputRoute {
+        display: 0,
+        connector,
+        mode: request.mode,
+        planes: None,
+    };
+    let before = k.connectors[3].clone();
+    if !k.formats_supported(&[request], &[route]) || k.connectors[3] != before {
+        return TestResult::Fail("valid TEST_ONLY changed state or failed");
+    }
+    if k.formats_supported(
+        &[OutputFormatRequest {
+            color_format: ColorFormat::Ycbcr444,
+            ..request
+        }],
+        &[route],
+    ) || k.formats_supported(&[request], &[route, route])
+        || k.formats_supported(
+            &[OutputFormatRequest {
+                max_bpc: Some(7),
+                ..request
+            }],
+            &[route],
+        )
+    {
+        return TestResult::Fail("invalid explicit format/routing/depth admitted");
+    }
+    k.connectors[3].hdmi_limits.max_phy_khz = 100_000;
+    if k.formats_supported(&[request], &[route]) {
+        return TestResult::Fail("immutable board PHY bound ignored");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_kms_hdmi_format_check_is_exact_and_side_effect_free
 );

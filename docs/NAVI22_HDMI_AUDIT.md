@@ -98,14 +98,14 @@ The remaining native TMDS lifecycle work adds:
   unknown, not failed reception.
 
 The existing path still owns EDID/depth/rate admission, 8/10/12-bpc RGB and
-8-bpc YCbCr 4:2:0 selection, PLL/PHY firmware commands, HDMI/DIG/FMT/OCSC,
+YCbCr 4:2:0 selection, PLL/PHY firmware commands, HDMI/DIG/FMT/OCSC,
 audio setup, hotplug, pinned scanout, and normal teardown. New tests start
 with inherited color/stereo state, exercise all packet slots and rejected
 updates, model sink configuration loss, and enforce the recovery budget and
 poll cadence. Evidence is in `target/host-narf/hdmi-complete-20261026/`.
 
 This work targets the selected Navi22/DCN3.0 TMDS path. It does not claim
-HDMI certification, FRL, HDCP, CEC, exposed Navi22 HDR/VRR controls, or native
+HDMI certification, FRL, HDCP, CEC, exposed Navi22 VRR controls, or native
 Mesa 3D acceptance from register-model success. Physical visible-output
 acceptance remains separate.
 
@@ -122,3 +122,33 @@ The QEMU 40-bit clamp is a bring-up workaround. A BAR at 14 TiB in a 48-bit
 guest is valid MMIO and does not imply that much RAM. Correcting QEMU's
 effective width is separately tested; it is not a proven HDMI fix or a
 permanent NARF memory-size limit.
+
+## Native output controls
+
+The native connector path now carries explicit color format, Colorspace,
+max bpc and decoded HDR_OUTPUT_METADATA through both single and group
+admission. The old Navi22 dispatch ignored these controls. DRM now publishes
+only the implemented HDMI connector properties; the shared bookkeeping does
+not import DCN401 CRTC color management or plane capabilities.
+
+The comparison against `enc1_stream_encoder_set_stream_attribute_helper`,
+`enc3_stream_encoder_hdmi_set_stream_attribute`, `opp1_set_pixel_encoding`,
+`dcn3_get_pix_clk_dividers` and `find_color_matrix` adds the encoding-specific
+TMDS/packing, FMT, OCSC and AVI handling for 4:4:4 and 4:2:2 and independent
+4:2:0 deep-color capabilities. Inherited RGB random dithering is disabled
+for every YCbCr encoding. Output CSC updates preserve the other pipes'
+coefficient-format bits. Multi-stream PLL sharing now includes the output
+format and actual TMDS target; equal timing dimensions alone are insufficient.
+
+Metadata-only changes retain the live timing and transmitter. The pipeline
+updates AVI/SPD/vendor/HDR together, and records the captured snapshot after
+success. Enable/disable of HDR and format/depth/color-space changes use
+normal safe convergence. Both requested and applied state survive detection;
+new requests during hardware awaits remain pending. Native TEST_ONLY uses
+cached immutable EDID/board/PHY limits, performs no DDC/register writes and
+refuses unsupported explicit encodings rather than changing them silently.
+
+These controls signal output metadata; they do not perform tone mapping or
+add high-precision framebuffer input to the current 8888 copy presenter.
+Physical HDMI acceptance and native 3D remain unverified. VRR, FRL, HDCP and
+CEC are separate remaining features, not implied by InfoFrame publication.

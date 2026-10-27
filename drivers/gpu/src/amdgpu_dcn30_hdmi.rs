@@ -28,6 +28,7 @@
 //! (8 bpc, BT.709) for modes the sink takes only that way or that fit no RGB
 //! depth. The pixel-path half (FMT, OTG, MPC OCSC, DPG black) is
 //! [`Formatter`].
+use crate::amdgpu_hdr::{ColorFormat, DcColorSpace, HdrOutputMetadata, PixelEncoding};
 use crate::{
     amdgpu::AmdGpu, amdgpu_dcn30_dp::Aux, amdgpu_dcn_profile::Profile, amdgpu_dml::Timing,
     amdgpu_navi22_modeset::Error as LinkError,
@@ -224,18 +225,44 @@ impl Depth {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Format {
     pub depth: Depth,
-    /// YCbCr 4:2:0 (BT.709, `COLOR_SPACE_YCBCR709`), else RGB.
-    pub ycbcr420: bool,
-    /// RGB limited range (`COLOR_SPACE_SRGB_LIMITED`, "Broadcast RGB"
-    /// Limited); never set with 4:2:0.
-    pub limited: bool,
+    pub encoding: PixelEncoding,
+    pub colorspace: DcColorSpace,
 }
 impl Format {
     pub const RGB8: Self = Self {
         depth: Depth::Bpc8,
-        ycbcr420: false,
-        limited: false,
+        encoding: PixelEncoding::Rgb,
+        colorspace: DcColorSpace::Srgb,
     };
+}
+
+/// Committed connector state, copied before an asynchronous modeset. Pixel
+/// values are already in the requested output transfer/gamut, as on Linux;
+/// the output CSC performs RGB range/YCbCr conversion, not tone mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputSettings {
+    pub color_format: ColorFormat,
+    pub colorspace: u32,
+    pub max_bpc: u8,
+    pub hdr: Option<HdrOutputMetadata>,
+}
+impl OutputSettings {
+    pub fn needs_modeset(self, shown: Self) -> bool {
+        self.color_format != shown.color_format
+            || self.colorspace != shown.colorspace
+            || self.max_bpc != shown.max_bpc
+            || self.hdr.is_some() != shown.hdr.is_some()
+    }
+}
+impl Default for OutputSettings {
+    fn default() -> Self {
+        Self {
+            color_format: ColorFormat::Auto,
+            colorspace: 0,
+            max_bpc: crate::amdgpu_navi48_boot::max_bpc(),
+            hdr: None,
+        }
+    }
 }
 
 /// The board's ceilings on an HDMI character clock.
@@ -301,6 +328,8 @@ pub struct Stream {
     pub avi: Option<[u8; 36]>,
     /// The HDMI 1.4b vendor InfoFrame for a 4K HDMI VIC.
     pub vendor: Option<[u8; 36]>,
+    /// Static HDR metadata in the same admitted packet set as AVI.
+    pub hdr: Option<[u8; 36]>,
 }
 
 /// HF-VSDB/HF-SCDB LTE_340Mcsc_scramble, as DRM's
@@ -330,25 +359,6 @@ fn low_rate_scrambling(edid: &[u8]) -> bool {
 }
 
 /// `t` as DRM's mode matchers take it.
-fn edid_mode(t: &Timing) -> narf_edid::modes::FixedMode {
-    let field = |active: u32, front: u32, sync: u32, total: u32| {
-        let at = |x: u32| u16::try_from(x).unwrap_or(u16::MAX);
-        [
-            at(active),
-            at(active + front),
-            at(active + front + sync),
-            at(total),
-        ]
-    };
-    narf_edid::modes::progressive(
-        t.pixel_clock_khz,
-        field(t.h_active, t.h_front_porch, t.h_sync_width, t.h_total),
-        field(t.v_active, t.v_front_porch, t.v_sync_width, t.v_total),
-        t.h_sync_positive,
-        t.v_sync_positive,
-    )
-}
-
 type Caps = crate::amdgpu_navi48_boot::HdmiCaps;
 
 /// Whether the sink and this board carry a TMDS character clock: the
@@ -375,27 +385,38 @@ fn fits(caps: &Caps, khz: u32, limits: Limits) -> bool {
 /// the deepest declared depth up to `max_bpc` that fits, stepping down by 2
 /// bpc; failing that 4:2:0 where the sink also takes it
 /// (`drm_mode_is_420_also`). 4:2:0 is 8 bpc. A DVI sink gets 8-bpc RGB.
-fn choose(caps: &Caps, t: &Timing, max_bpc: u8, limits: Limits) -> Option<(Depth, bool)> {
-    let vic = narf_edid::modes::match_cea_mode(edid_mode(t));
-    let listed = |map: [u64; 4]| vic != 0 && map[usize::from(vic / 64)] & 1 << (vic % 64) != 0;
-    let fits_420 = || caps.hdmi && fits(caps, t.pixel_clock_khz / 2, limits);
-    if caps.hdmi && listed(caps.y420_only) {
-        return fits_420().then_some((Depth::Bpc8, true));
+fn choose(
+    caps: &Caps,
+    t: &Timing,
+    settings: OutputSettings,
+    limits: Limits,
+) -> Option<(Depth, PixelEncoding)> {
+    use crate::amdgpu_dcn401_otg::ColorDepth;
+    for encoding in crate::amdgpu_navi48_boot::hdmi_encodings(*caps, t, settings.color_format) {
+        if !caps.hdmi && encoding != PixelEncoding::Rgb {
+            continue;
+        }
+        for (_, depth) in
+            crate::amdgpu_navi48_boot::hdmi_depths(*caps, encoding, settings.max_bpc.max(8))
+        {
+            let depth = match depth {
+                ColorDepth::Bpc8 => Depth::Bpc8,
+                ColorDepth::Bpc10 if caps.hdmi => Depth::Bpc10,
+                ColorDepth::Bpc12 if caps.hdmi => Depth::Bpc12,
+                _ => continue,
+            };
+            let pixel_khz = t.pixel_clock_khz >> u32::from(encoding.is_420());
+            let character_khz = if encoding.is_422() {
+                pixel_khz
+            } else {
+                depth.character_khz(pixel_khz)
+            };
+            if fits(caps, character_khz, limits) {
+                return Some((depth, encoding));
+            }
+        }
     }
-    let rgb = [
-        (Depth::Bpc12, caps.hdmi && caps.dc36),
-        (Depth::Bpc10, caps.hdmi && caps.dc30),
-        (Depth::Bpc8, true),
-    ];
-    let deepest = rgb.into_iter().find(|&(depth, declared)| {
-        declared
-            && depth.bpc() <= max_bpc.max(8)
-            && fits(caps, depth.character_khz(t.pixel_clock_khz), limits)
-    });
-    if let Some((depth, _)) = deepest {
-        return Some((depth, false));
-    }
-    (listed(caps.y420_also) && fits_420()).then_some((Depth::Bpc8, true))
+    None
 }
 
 /// The stream amdgpu_dm and DC would build for `t` on the sink whose whole
@@ -409,11 +430,41 @@ pub fn stream_for(
     limited: bool,
     limits: Limits,
 ) -> Option<Stream> {
+    stream_with_settings(
+        edid,
+        t,
+        OutputSettings {
+            max_bpc,
+            ..OutputSettings::default()
+        },
+        limited,
+        limits,
+    )
+}
+
+/// Admit explicit HDMI connector settings against EDID, the PHY and TMDS
+/// ceilings. Unsupported requests fail; an explicit encoding never falls
+/// back to another encoding. No state or registers change during checking.
+pub fn stream_with_settings(
+    edid: &[u8],
+    t: &Timing,
+    settings: OutputSettings,
+    limited: bool,
+    limits: Limits,
+) -> Option<Stream> {
     use crate::amdgpu_navi48_boot as navi48;
+    if !crate::amdgpu_hdr::colorspace_valid(u64::from(settings.colorspace)) {
+        return None;
+    }
     let caps = navi48::hdmi_caps(edid);
-    let (depth, ycbcr420) = choose(&caps, t, max_bpc, limits)?;
-    let pixel_khz = t.pixel_clock_khz >> u32::from(ycbcr420);
-    let character_100hz = u32::try_from(depth.character_100hz(pixel_khz)).ok()?;
+    let (depth, encoding) = choose(&caps, t, settings, limits)?;
+    let pixel_khz = t.pixel_clock_khz >> u32::from(encoding.is_420());
+    let character_100hz = u32::try_from(if encoding.is_422() {
+        u64::from(pixel_khz) * 10
+    } else {
+        depth.character_100hz(pixel_khz)
+    })
+    .ok()?;
     let character_khz = character_100hz / 10;
     let scramble = if character_khz > TMDS_SCRAMBLE_KHZ {
         Scramble::Above340
@@ -422,13 +473,22 @@ pub fn stream_for(
     } else {
         Scramble::Off
     };
-    let limited = limited && !ycbcr420 && caps.hdmi;
+    if !caps.hdmi && (settings.colorspace != 0 || settings.hdr.is_some()) {
+        return None;
+    }
+    let colorspace = crate::amdgpu_hdr::output_color_space(
+        settings.colorspace,
+        encoding == PixelEncoding::Rgb,
+        false,
+        t.pixel_clock_khz.checked_mul(10)?,
+        limited && caps.hdmi,
+    );
     let avi = navi48::hdmi_avi(caps, t);
     Some(Stream {
         format: Format {
             depth,
-            ycbcr420,
-            limited,
+            encoding,
+            colorspace,
         },
         pixel_khz,
         character_100hz,
@@ -437,7 +497,11 @@ pub fn stream_for(
         scdc: caps.hdmi && caps.scdc,
         avi: caps
             .hdmi
-            .then(|| crate::amdgpu_dcn401_otg::avi_infoframe(t, avi, limited, ycbcr420)),
+            .then(|| crate::amdgpu_dcn401_otg::avi_infoframe_in(t, avi, colorspace, encoding)),
+        hdr: settings.hdr.as_ref().map(|h| {
+            crate::amdgpu_hdr::hdr_info_packet(Some(h), crate::amdgpu_hdr::HdrConnector::Hdmi)
+                .bytes()
+        }),
         vendor: caps
             .hdmi
             .then(|| crate::amdgpu_dcn401_otg::vendor_infoframe(t, avi))
@@ -673,7 +737,11 @@ impl<I: Io> Engine<I> {
         {
             return Err(Error::Unsupported);
         }
-        self.update(self.fe(DIG_FE_CNTL), TMDS_PIXEL_ENCODING, 0)?;
+        self.update(
+            self.fe(DIG_FE_CNTL),
+            TMDS_PIXEL_ENCODING,
+            u32::from(format.encoding.is_422()) << 28,
+        )?;
         self.update(self.fe(DIG_FE_CNTL), TMDS_COLOR_FORMAT, 0)?;
         self.update(
             self.fe(HDMI_CONTROL),
@@ -686,7 +754,11 @@ impl<I: Io> Engine<I> {
             HDMI_PACKET_GEN_VERSION | HDMI_KEEPOUT_MODE | HDMI_NO_EXTRA_NULL_PACKET_FILLED,
         )?;
         let code = format.depth.code();
-        let enable = if code != 0 { HDMI_DEEP_COLOR_ENABLE } else { 0 };
+        let enable = if code != 0 && !format.encoding.is_422() {
+            HDMI_DEEP_COLOR_ENABLE
+        } else {
+            0
+        };
         self.update(
             self.fe(HDMI_CONTROL),
             HDMI_DEEP_COLOR_DEPTH | HDMI_DEEP_COLOR_ENABLE,
@@ -895,9 +967,9 @@ impl Hdmi {
     /// Desktop AVI/SPD and the HDMI vendor InfoFrame when required.
     pub async fn hdmi_info_packets(&mut self, stream: &Stream) -> Result<(), Error> {
         let avi = stream.avi.as_ref().ok_or(Error::Invalid)?;
-        self.0
-            .program_info_packets(&InfoPackets::desktop(avi, stream.vendor.as_ref()))
-            .await
+        let mut packets = InfoPackets::desktop(avi, stream.vendor.as_ref());
+        packets.hdr = stream.hdr.as_ref();
+        self.0.program_info_packets(&packets).await
     }
     /// Validate the complete set before programming packet producers. The
     /// caller owns color/timing admission for optional HDR/VTEM metadata.
@@ -911,4 +983,4 @@ impl Hdmi {
 
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_dcn30_hdmi_tests.rs"]
-mod tests;
+pub(crate) mod tests;

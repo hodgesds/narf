@@ -209,7 +209,7 @@ pub(super) const DTD_640X480: [u8; 18] = [
 pub(super) const DTD_720P: [u8; 18] = [
     0x01, 0x1d, 0x00, 0x72, 0x51, 0xd0, 0x1e, 0x20, 0x6e, 0x28, 0x55, 0x00, 0, 0, 0, 0, 0, 0x1e,
 ];
-const DTD_1080P: [u8; 18] = [
+pub(crate) const DTD_1080P: [u8; 18] = [
     0x02, 0x3a, 0x80, 0x18, 0x71, 0x38, 0x2d, 0x40, 0x58, 0x2c, 0x45, 0x00, 0, 0, 0, 0, 0, 0x1e,
 ];
 const DTD_2160P30: [u8; 18] = [
@@ -219,7 +219,7 @@ const DTD_2160P60: [u8; 18] = [
     0x08, 0xe8, 0x00, 0x30, 0xf2, 0x70, 0x5a, 0x80, 0xb0, 0x58, 0x8a, 0x00, 0, 0, 0, 0, 0, 0x1e,
 ];
 /// HDMI VSDB: DC_36/DC_30 flags and Max_TMDS_Clock (5 MHz units).
-pub(super) fn vsdb(flags: u8, max_5mhz: u8) -> Vec<u8> {
+pub(crate) fn vsdb(flags: u8, max_5mhz: u8) -> Vec<u8> {
     vec![0x67, 0x03, 0x0c, 0x00, 0x10, 0x00, flags, max_5mhz]
 }
 /// HF-VSDB: version 1, Max_TMDS_Character_Rate, SCDC_Present/LTE flags.
@@ -228,7 +228,7 @@ pub(super) fn hf_vsdb(rate_5mhz: u8, flags: u8) -> Vec<u8> {
 }
 /// A base block whose preferred mode is `dtd`, and one CTA extension
 /// carrying `blocks`.
-pub(super) fn edid(dtd: [u8; 18], blocks: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn edid(dtd: [u8; 18], blocks: &[Vec<u8>]) -> Vec<u8> {
     let mut e = vec![0u8; 256];
     e[..8].copy_from_slice(&[0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0]);
     e[18] = 1;
@@ -249,6 +249,14 @@ pub(super) fn edid(dtd: [u8; 18], blocks: &[Vec<u8>]) -> Vec<u8> {
         block[127] = 0u8.wrapping_sub(sum);
     }
     e
+}
+pub(crate) fn cta_byte(edid: &mut [u8], offset: usize, value: u8) {
+    edid[offset] = value;
+    edid[255] = 0u8.wrapping_sub(
+        edid[128..255]
+            .iter()
+            .fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+    );
 }
 fn first(edid: &[u8]) -> Timing {
     crate::amdgpu_navi48_boot::edid_timings(edid)[0]
@@ -376,9 +384,9 @@ fn dcn30_hdmi_ycbcr420_for_420_only_and_420_also_modes() -> TestResult {
     let Some(s) = stream(&only, 12, true, Limits::DEFAULT) else {
         return TestResult::Fail("4:2:0-only mode");
     };
-    if !s.format.ycbcr420
+    if !s.format.encoding.is_420()
         || s.format.depth != Depth::Bpc8
-        || s.format.limited
+        || (s.format.colorspace == DcColorSpace::SrgbLimited)
         || s.pixel_khz != 297_000
         || s.character_khz != 297_000
         || s.scramble != Scramble::Off
@@ -395,7 +403,7 @@ fn dcn30_hdmi_ycbcr420_for_420_only_and_420_also_modes() -> TestResult {
     // Y420CMDB covering every SVD on an HDMI 1.4-rate sink: RGB does not
     // fit 594 MHz, so 4:2:0 at 297 MHz.
     let also = edid(DTD_2160P60, &[vsdb(0, 68), vec![0x41, 97], vec![0xe1, 15]]);
-    if stream(&also, 8, false, Limits::DEFAULT).map(|s| (s.format.ycbcr420, s.pixel_khz))
+    if stream(&also, 8, false, Limits::DEFAULT).map(|s| (s.format.encoding.is_420(), s.pixel_khz))
         != Some((true, 297_000))
     {
         return TestResult::Fail("4:2:0-also fallback");
@@ -405,12 +413,12 @@ fn dcn30_hdmi_ycbcr420_for_420_only_and_420_also_modes() -> TestResult {
         hdmi6g: false,
         ..Limits::DEFAULT
     };
-    if stream(&also, 8, false, no6g).is_none_or(|s| !s.format.ycbcr420) {
+    if stream(&also, 8, false, no6g).is_none_or(|s| !s.format.encoding.is_420()) {
         return TestResult::Fail("4:2:0 without 6G");
     }
     // An RGB-capable mode never subsamples.
     let rgb = edid(DTD_1080P, &[vsdb(0, 68), vec![0x41, 16], vec![0xe1, 15]]);
-    if stream(&rgb, 8, false, Limits::DEFAULT).is_none_or(|s| s.format.ycbcr420) {
+    if stream(&rgb, 8, false, Limits::DEFAULT).is_none_or(|s| s.format.encoding.is_420()) {
         return TestResult::Fail("4:2:0 where RGB fits");
     }
     TestResult::Pass
@@ -433,8 +441,8 @@ fn dcn30_hdmi_broadcast_rgb_vic_and_vendor_infoframe() -> TestResult {
         return TestResult::Fail("1080p");
     };
     let q = |s: &Stream| s.avi.map(|a| (a[7] >> 2) & 3);
-    if full.format.limited
-        || !limited.format.limited
+    if (full.format.colorspace == DcColorSpace::SrgbLimited)
+        || !(limited.format.colorspace == DcColorSpace::SrgbLimited)
         || q(&full) != Some(2)
         || q(&limited) != Some(1)
         || limited.avi.map(|a| a[8]) != Some(16)
@@ -810,7 +818,8 @@ fn dcn30_hdmi_fmt_dither_clamp_and_420() -> TestResult {
     // no RGB random.
     f.io.0.insert((format::Bank::Two, 0x18a1), 0x3);
     let yuv = Format {
-        ycbcr420: true,
+        encoding: PixelEncoding::Ycbcr420,
+        colorspace: DcColorSpace::Ycbcr709,
         ..Format::RGB8
     };
     if f.program_fmt(yuv).is_err()
@@ -838,7 +847,8 @@ kernel_test_in!(
 fn dcn30_hdmi_ocsc_and_blank_black_per_colour_space() -> TestResult {
     let mut f = formatter(1);
     let yuv = Format {
-        ycbcr420: true,
+        encoding: PixelEncoding::Ycbcr420,
+        colorspace: DcColorSpace::Ycbcr709,
         ..Format::RGB8
     };
     // MPC_OUT1_CSC_MODE 0x5a6, MPC_OUT1_CSC_C11_C12_A 0x5a7..0x5ac,
@@ -853,7 +863,7 @@ fn dcn30_hdmi_ocsc_and_blank_black_per_colour_space() -> TestResult {
         return TestResult::Fail("YCbCr709 OCSC");
     }
     let limited = Format {
-        limited: true,
+        colorspace: DcColorSpace::SrgbLimited,
         ..Format::RGB8
     };
     if run(f.program_ocsc(limited)).is_err()
@@ -897,3 +907,168 @@ kernel_test_in!(
 
 #[path = "amdgpu_dcn30_hdmi_modeset_tests.rs"]
 mod modeset_tests;
+
+fn dcn30_hdmi_explicit_encodings_and_deep_color_admission() -> TestResult {
+    let mut e = edid(
+        DTD_2160P60,
+        &[
+            vsdb(0x38, 120),
+            hf_vsdb(120, 0x80),
+            vec![0x41, 97],
+            vec![0xe1, 15],
+        ],
+    );
+    cta_byte(&mut e, 131, 0x30); // CTA 4:4:4 and 4:2:2 support.
+    let settings = |color_format| OutputSettings {
+        color_format,
+        max_bpc: 12,
+        ..Default::default()
+    };
+    let get = |e: &[u8], format| {
+        stream_with_settings(e, &first(e), settings(format), false, Limits::DEFAULT)
+    };
+    let Some(rgb) = get(&e, ColorFormat::Rgb) else {
+        return TestResult::Fail("RGB admission");
+    };
+    let Some(y444) = get(&e, ColorFormat::Ycbcr444) else {
+        return TestResult::Fail("444 admission");
+    };
+    let Some(y422) = get(&e, ColorFormat::Ycbcr422) else {
+        return TestResult::Fail("422 admission");
+    };
+    if rgb.format.depth != Depth::Bpc8
+        || y444.format.depth != Depth::Bpc8
+        || y422.format.depth != Depth::Bpc12
+        || y422.character_khz != 594_000
+        || y422.character_100hz != 5_940_000
+        || y422.avi.is_none_or(|p| p[5] >> 5 & 3 != 1)
+        || y444.avi.is_none_or(|p| p[5] >> 5 & 3 != 2)
+    {
+        return TestResult::Fail("encoding-specific clock/depth/AVI");
+    }
+    cta_byte(&mut e, 131, 0);
+    if get(&e, ColorFormat::Ycbcr444).is_some() || get(&e, ColorFormat::Ycbcr422).is_some() {
+        return TestResult::Fail("undeclared explicit encoding accepted");
+    }
+    let e = edid(
+        DTD_2160P60,
+        &[vsdb(0x30, 120), hf_vsdb(120, 0x80), vec![0xe2, 14, 97]],
+    );
+    if get(&e, ColorFormat::Rgb).is_some()
+        || get(&e, ColorFormat::Ycbcr422).is_some()
+        || get(&e, ColorFormat::Ycbcr420).is_none_or(|s| s.format.depth != Depth::Bpc8)
+    {
+        return TestResult::Fail("420-only mode/depth admission");
+    }
+    // HF deep-color flags are independent of RGB VSDB flags.
+    let mut hf = hf_vsdb(120, 0x80);
+    hf[7] = 3;
+    let e = edid(DTD_2160P60, &[vsdb(0, 120), hf, vec![0xe2, 14, 97]]);
+    if get(&e, ColorFormat::Ycbcr420)
+        .is_none_or(|s| s.format.depth != Depth::Bpc12 || s.character_khz != 445_500)
+    {
+        return TestResult::Fail("HF 420 deep color ignored");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi",
+    dcn30_hdmi_explicit_encodings_and_deep_color_admission
+);
+
+fn dcn30_hdmi_y444_deep_color_requires_dc_y444_and_y422_packing_is_not_deep_color() -> TestResult {
+    let mut e = edid(DTD_1080P, &[vsdb(0x30, 68)]);
+    cta_byte(&mut e, 131, 0x20);
+    let settings = OutputSettings {
+        color_format: ColorFormat::Ycbcr444,
+        max_bpc: 12,
+        ..Default::default()
+    };
+    let get = |e: &[u8]| stream_with_settings(e, &first(e), settings, false, Limits::DEFAULT);
+    if get(&e).is_none_or(|s| s.format.depth != Depth::Bpc8) {
+        return TestResult::Fail("missing DC_Y444 accepted");
+    }
+    let dc = e[138] | 8;
+    cta_byte(&mut e, 138, dc); // VSDB's deep-color byte (block starts at CTA offset 4).
+    if get(&e).is_none_or(|s| s.format.depth != Depth::Bpc12 || s.character_khz != 222_750) {
+        return TestResult::Fail("444 deep-color capability ignored");
+    }
+    let mut hw = engine(0, 0);
+    let format = Format {
+        depth: Depth::Bpc12,
+        encoding: PixelEncoding::Ycbcr422,
+        colorspace: DcColorSpace::Ycbcr709,
+    };
+    if hw
+        .hdmi_stream_attribute(format, 148_500, Scramble::Off)
+        .is_err()
+        || hw.io.regs[0x208b] & (1 << 28) == 0
+        || hw.io.regs[0x2093] & HDMI_DEEP_COLOR_ENABLE != 0
+        || hw.io.regs[0x2093] & HDMI_DEEP_COLOR_DEPTH != 2 << 28
+    {
+        return TestResult::Fail("422 packing incorrectly enables deep-color multiplier");
+    }
+    if hw
+        .hdmi_stream_attribute(Format::RGB8, 148_500, Scramble::Off)
+        .is_err()
+        || hw.io.regs[0x208b] & (1 << 28) != 0
+    {
+        return TestResult::Fail("RGB inherited 422 packing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi",
+    dcn30_hdmi_y444_deep_color_requires_dc_y444_and_y422_packing_is_not_deep_color
+);
+
+fn dcn30_hdmi_hdr_metadata_and_avi_colorimetry_agree() -> TestResult {
+    use crate::amdgpu_hdr::{HdrMetadataInfoframe, DRM_MODE_COLORIMETRY_BT2020_RGB};
+    let e = edid(DTD_1080P, &[vsdb(0x30, 68)]);
+    let hdr = HdrOutputMetadata {
+        hdmi_metadata_type1: HdrMetadataInfoframe {
+            eotf: 2,
+            max_cll: 1000,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let settings = OutputSettings {
+        max_bpc: 10,
+        colorspace: DRM_MODE_COLORIMETRY_BT2020_RGB,
+        hdr: Some(hdr),
+        ..Default::default()
+    };
+    let Some(s) = stream_with_settings(&e, &first(&e), settings, false, Limits::DEFAULT) else {
+        return TestResult::Fail("HDR stream");
+    };
+    let Some(avi) = s.avi else {
+        return TestResult::Fail("HDR AVI missing");
+    };
+    let Some(packet) = s.hdr else {
+        return TestResult::Fail("HDR packet missing");
+    };
+    if s.format.colorspace != DcColorSpace::Rgb2020Full
+        || avi[6] >> 6 != 3
+        || avi[7] >> 4 & 7 != 6
+        || packet[..3] != [0x87, 1, 26]
+        || packet[5] != 2
+        || packet[27..29] != 1000u16.to_le_bytes()
+    {
+        return TestResult::Fail("HDR colorimetry/metadata mismatch");
+    }
+    let mut packets = InfoPackets::desktop(&avi, None);
+    packets.hdr = Some(&packet);
+    if packets.validate().is_err() {
+        return TestResult::Fail("native producer emitted invalid packet set");
+    }
+    let dvi = edid(DTD_1080P, &[]);
+    if stream_with_settings(&dvi, &first(&dvi), settings, false, Limits::DEFAULT).is_some() {
+        return TestResult::Fail("DVI accepted HDR data islands");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi",
+    dcn30_hdmi_hdr_metadata_and_avi_colorimetry_agree
+);

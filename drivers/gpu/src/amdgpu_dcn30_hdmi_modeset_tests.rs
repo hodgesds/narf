@@ -81,6 +81,22 @@ fn light_with(
     vram: &Vram,
     prepare: impl FnOnce(&Bench),
 ) -> Result<Lit, &'static str> {
+    light_config(
+        edid,
+        crate::amdgpu_dcn30_hdmi::OutputSettings {
+            max_bpc,
+            ..Default::default()
+        },
+        vram,
+        prepare,
+    )
+}
+fn light_config(
+    edid: Vec<u8>,
+    settings: crate::amdgpu_dcn30_hdmi::OutputSettings,
+    vram: &Vram,
+    prepare: impl FnOnce(&Bench),
+) -> Result<Lit, &'static str> {
     let bench = Bench::new();
     bench.set(m::MP1 + 0x274, 1);
     prepare(&bench);
@@ -101,8 +117,7 @@ fn light_with(
         hdmi: true,
         dpcd: None,
     };
-    let before = crate::amdgpu_navi48_boot::max_bpc();
-    crate::amdgpu_navi48_boot::set_max_bpc(max_bpc);
+    pipeline.set_hdmi_settings(settings);
     let result = {
         let tables = Tables::new(&image).map_err(|_| "tables")?;
         let links = [connector];
@@ -120,7 +135,6 @@ fn light_with(
             )
         })
     };
-    crate::amdgpu_navi48_boot::set_max_bpc(before);
     result.map_err(|_| "enable")?;
     let enabled = bench.writes();
     Ok(Lit {
@@ -444,4 +458,77 @@ fn dcn30_hdmi_unplug_teardown_sends_legacy_scdc_only_to_scdc_sinks() -> TestResu
 kernel_test_in!(
     "drivers/gpu/dcn30-hdmi",
     dcn30_hdmi_unplug_teardown_sends_legacy_scdc_only_to_scdc_sinks
+);
+
+fn dcn30_hdmi_modeset_y422_hdr_and_live_metadata_update() -> TestResult {
+    use crate::amdgpu_dcn30_hdmi::OutputSettings;
+    use crate::amdgpu_hdr::{
+        ColorFormat, HdrMetadataInfoframe, HdrOutputMetadata, DRM_MODE_COLORIMETRY_BT2020_YCC,
+    };
+    let vram = Vram::new(8 << 20);
+    let mut e = edid(DTD_720P, &[vsdb(0, 68), hf_vsdb(120, 0x80)]);
+    super::cta_byte(&mut e, 131, 0x10);
+    let settings = OutputSettings {
+        max_bpc: 12,
+        color_format: ColorFormat::Ycbcr422,
+        colorspace: DRM_MODE_COLORIMETRY_BT2020_YCC,
+        hdr: Some(HdrOutputMetadata {
+            hdmi_metadata_type1: HdrMetadataInfoframe {
+                eotf: 2,
+                max_cll: 1000,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+    };
+    let mut lit = match light_config(e, settings, &vram, |_| {}) {
+        Ok(l) => l,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if lit.bench.get(d2(0x1840 + lit.pipe * 0x5a)) & 0x2f_0000 != 0x9_0000
+        || lit.bench.get(d2(0x208b + lit.fe * 0x100)) & (1 << 28) == 0
+        || lit.bench.get(d2(0x2093 + lit.fe * 0x100)) & 0x3100_0000 != 0x2000_0000
+        || lit.bench.get(d3(0x59a + lit.pipe * 0xd)) != 0xf149_1000
+    {
+        return TestResult::Fail("422/HDR format stages");
+    }
+    let before = lit.bench.writes();
+    let mut next = settings;
+    next.hdr.as_mut().unwrap().hdmi_metadata_type1.max_cll = 2000;
+    if run(lit.pipeline.update_hdmi_metadata(next)).is_err()
+        || lit
+            .pipeline
+            .hdmi_output()
+            .and_then(|s| s.hdr)
+            .is_none_or(|p| p[27..29] != 2000u16.to_le_bytes())
+    {
+        return TestResult::Fail("live HDR metadata update");
+    }
+    let log = lit.bench.log();
+    if log[before..]
+        .iter()
+        .any(|w| w.dword & 0xf000_0000 != 0 || w.dword == d2(0x1b41 + lit.pipe * 0x80))
+        || !log[before..]
+            .iter()
+            .any(|w| w.dword == d2(0x2069 + lit.fe * 0x100) && w.value == 0x001a_0187)
+    {
+        return TestResult::Fail("metadata-only update retrained or missed HDR packet RAM");
+    }
+    let before = lit.bench.writes();
+    if run(lit
+        .pipeline
+        .update_hdmi_metadata(OutputSettings { hdr: None, ..next }))
+    .is_ok()
+        || before != lit.bench.writes()
+    {
+        return TestResult::Fail("HDR disable bypassed modeset");
+    }
+    if let Err(why) = stop(&mut lit) {
+        return TestResult::Fail(why);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi",
+    dcn30_hdmi_modeset_y422_hdr_and_live_metadata_update
 );

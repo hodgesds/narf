@@ -99,8 +99,31 @@ any register write, then programs the seven slots in Linux order. Gamut/VTEM
 are data packets, whose payload admission belongs to the producer. Omitted
 producers and spare slot 7 are disabled. Normal desktop enable sends valid
 NARF SPD identification with AVI and any required vendor frame. This packet
-surface does not itself expose unsupported HDR/VRR DRM properties or select
-their output color transforms.
+surface is used by the native connector state below; packet admission
+alone does not establish physical reception or userspace HDR rendering.
+
+`hdmi::OutputSettings { color_format, colorspace, max_bpc, hdr }` is a
+copied connector snapshot. `stream_with_settings` checks the same EDID and
+board TMDS limits used at enable. Explicit RGB/YCbCr 4:4:4/4:2:2/4:2:0
+requests never silently select another encoding. 4:4:4 deep color requires
+DC_Y444 plus the depth bit; 4:2:0 uses its independent HF depth bits; 4:2:2
+uses the pixel-rate TMDS clock and disables deep-color packing. `Format`
+carries a typed pixel encoding and DC color space through FMT, OCSC, black
+color and AVI. BT.601/709/2020 YCbCr and RGB range conversion use the selected
+Linux output matrices. PLL sharing requires equal timing, format and
+100-Hz TMDS target, including multi-stream contexts.
+
+Navi22 HDMI connectors publish Colorspace, HDR_OUTPUT_METADATA, color format
+and max bpc. Color/format/depth and HDR entry/exit converge through normal
+safe teardown and admission. Metadata-only changes update the complete
+packet set on the retained running stream without blanking or retraining.
+A request arriving during an await remains pending; only its captured
+snapshot is marked applied. Packet failure requests a normal relight rather
+than silently reporting the new metadata applied. Connector settings and
+committed DRM values survive republication. TEST_ONLY is side-effect-free
+and checks the explicit mode, encoding, depth and cached board/PHY limits.
+The presenter continues to accept linear XRGB8888/ARGB8888 input; exposing
+HDMI output metadata does not add 10-bit framebuffer or tone-mapping support.
 
 Successful SCDC TMDS-configuration writes are followed by an async 1-ms
 settling interval before transmitter enable. `link_health` distinguishes
@@ -7526,13 +7549,13 @@ marshals v1.6/v1.7 (SETUP_VSEMPH via `Tables::transmitter_lane`, HPO 0).
 
 HDMI 2.0 on DCN3.0 (m5hdmi): `hdmi::stream_for(edid, &timing, max_bpc,
 limited, Limits { hdmi6g, max_phy_khz }) -> Option<Stream>` chooses amdgpu_dm's
-format (4:2:0-only modes as 4:2:0; else RGB at the deepest declared depth up to
+default format (4:2:0-only modes as 4:2:0; else RGB at the deepest declared depth up to
 `amdgpu.max_bpc`, 2-bpc step-down; else 4:2:0-also) against
 `dcn10_link_encoder_validate_hdmi_output` (600 MHz, HDMI_6GB_EN from
 `amdgpu_dcn_inventory::encoder_caps`) and DML30's `min(600, PHYCLK)`.
-`Stream { format: Format { depth, ycbcr420, limited }, pixel_khz,
+`Stream { format: Format { depth, encoding, colorspace }, pixel_khz,
 character_100hz, character_khz, scramble: Scramble::{Off, LowRate, Above340},
-scdc, avi, vendor }` carries the halved TMDS pixel clock, `phy_pix_clk`, the
+scdc, avi, vendor, hdr }` carries the halved TMDS pixel clock, `phy_pix_clk`, the
 scrambling decision (> 340 MHz, or LTE_340Mcsc) and the AVI/HDMI-VIC vendor
 InfoFrames. `write_scdc_data(ddc, &stream)` (Sink/Source_Version, TMDS_Config
 0/1/3; fails only a scrambled stream), `read_scdc_data` and
@@ -7543,9 +7566,9 @@ over `dp::Aux::scdc_read/scdc_write` (default: unsupported;
 `hdmi_info_packets(&stream)` sends AVI (packet 0) and vendor (packet 1) in
 Linux's order; a VPG conflict that never clears is logged, not fatal.
 `unsafe hdmi::Formatter::new(gpu, cap, pipe)` owns the pipe's FMT (dynamic
-expansion, SPATIAL8/10 dither, full-range clamp, 4:2:0 subsampling), OTG 4:2:0
-container (OPTC_DATA_FORMAT, H_TIMING_DIV_MODE), MPC OCSC (sRGB / sRGB limited /
-YCbCr709, coefficient set A) and DPG black. `Pipeline::hdmi_output()` exposes
+expansion, SPATIAL8/10 dither, full-range clamp, 4:2:2/4:2:0 subsampling), OTG 4:2:0
+container (OPTC_DATA_FORMAT, H_TIMING_DIV_MODE), MPC OCSC (RGB range and
+BT.601/709/2020 YCbCr, coefficient set A) and DPG black. `Pipeline::hdmi_output()` exposes
 the admitted stream to the unplug path.
 
 `amdgpu_navi22_modeset::Resources::acquire(&connector)` is the DCN3.0 pool:

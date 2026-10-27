@@ -191,6 +191,7 @@ pub(crate) fn vendor_infoframe(t: &crate::amdgpu_dml::Timing, avi: Avi) -> Optio
 /// The AVI InfoFrame Linux's set_avi_info_frame builds for an sRGB or
 /// sRGB-limited RGB stream or a BT.709 YCbCr 4:2:0 one: `avi_colorimetry`
 /// of the plain color space `limited` and `ycbcr420` name.
+#[cfg(feature = "kernel-test")]
 pub(crate) fn avi_infoframe(
     t: &crate::amdgpu_dml::Timing,
     avi: Avi,

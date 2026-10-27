@@ -209,6 +209,7 @@ fn request(link: usize, connector: Connector, sink: Sink) -> Request {
         connector,
         sink,
         want: None,
+        hdmi_settings: Default::default(),
         mst: None,
     }
 }
@@ -617,6 +618,7 @@ fn navi22_multi_mst_two_streams_share_one_8b10b_link() -> TestResult {
         connector: dp,
         sink: m::sink(Signal::DisplayPort, Some(m::dpcd(0x12))),
         want: None,
+        hdmi_settings: Default::default(),
         mst: Some(dp_mst_mgr::Sink { branch, port }),
     };
     let requests = [device(0, 1), device(1, 1)];
@@ -685,4 +687,52 @@ fn navi22_multi_mst_two_streams_share_one_8b10b_link() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi22-multi",
     navi22_multi_mst_two_streams_share_one_8b10b_link
+);
+
+fn navi22_multi_pll_sharing_includes_tmds_encoding_depth_and_target() -> TestResult {
+    use crate::amdgpu_dcn30_hdmi::tests::{edid, vsdb, DTD_1080P};
+    use crate::amdgpu_dcn30_hdmi::{stream_for, Depth as HdmiDepth, Limits};
+    let e = edid(DTD_1080P, &[vsdb(0x30, 68)]);
+    let t = crate::amdgpu_navi48_boot::edid_timings(&e)[0];
+    let a = stream_for(&e, &t, 8, false, Limits::DEFAULT).unwrap();
+    let b = stream_for(&e, &t, 12, false, Limits::DEFAULT).unwrap();
+    let c = crate::amdgpu_dcn30_hdmi::Stream {
+        format: crate::amdgpu_dcn30_hdmi::Format {
+            depth: HdmiDepth::Bpc12,
+            encoding: crate::amdgpu_hdr::PixelEncoding::Ycbcr422,
+            ..a.format
+        },
+        ..a
+    };
+    let mut resources = Resources::new();
+    let connectors = [
+        m::connector(Signal::Hdmi, 0, 0),
+        m::connector(Signal::Hdmi, 1, 1),
+        m::connector(Signal::Hdmi, 2, 2),
+        m::connector(Signal::Hdmi, 3, 3),
+    ];
+    let mut clocks = Vec::new();
+    for (connector, stream) in connectors.iter().zip([a, b, c, a]) {
+        match resources.acquire_stream_format(connector, &t, Odm::None, false, Some(&stream)) {
+            Ok(lease) => clocks.push(lease.route.clock),
+            Err(_) => return TestResult::Fail("format-specific PLL allocation"),
+        }
+    }
+    if clocks
+        != [
+            ClockSource::Pll(0),
+            ClockSource::Pll(1),
+            ClockSource::Pll(2),
+            ClockSource::Pll(0),
+        ]
+    {
+        return TestResult::Fail(
+            "incompatible TMDS streams shared PLL or equal streams did not share",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-multi",
+    navi22_multi_pll_sharing_includes_tmds_encoding_depth_and_target
 );

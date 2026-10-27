@@ -21,6 +21,7 @@
 //! halved TMDS pixel clock is the SetPixelClock target, and MPC output rate
 //! control stays disabled (`mpc3_set_out_rate_control`).
 use super::{Depth, Error, Format};
+use crate::amdgpu_hdr::{DcColorSpace as C, PixelEncoding as E};
 use crate::{amdgpu::AmdGpu, amdgpu_dcn_profile::Profile};
 use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
@@ -149,23 +150,28 @@ const CSC_YCBCR709: [u16; 12] = [
     0xe04, 0xf345, 0xfeb7, 0x1004, 0x5d3, 0x1399, 0x1fa, 0x201, 0xfcca, 0xf533, 0xe04, 0x1004,
 ];
 
+const CSC_YCBCR601: [u16; 12] = [
+    0xe04, 0xf444, 0xfdb9, 0x1004, 0x831, 0x1016, 0x320, 0x201, 0xfb45, 0xf6b7, 0xe04, 0x1004,
+];
+const CSC_YCBCR2020: [u16; 12] = [
+    0x1000, 0xf149, 0xfeb7, 0x1004, 0x868, 0x15b2, 0x1e6, 0x201, 0xfb88, 0xf478, 0x1000, 0x1004,
+];
+
 /// `color_space_to_black_color`'s (R/Cr, G/Y, B/Cb), 10-bit.
 fn black(format: Format) -> [u32; 3] {
-    if format.ycbcr420 {
-        [0x1f4, 0x40, 0x1f4] // BLACK_COLOR_FORMAT_YUV_CV
-    } else if format.limited {
-        [0x40, 0x40, 0x40]
-    } else {
-        [0, 0, 0]
+    match format.colorspace {
+        C::Ycbcr601 | C::Ycbcr709 | C::Ycbcr2020Limited => [0x1f4, 0x40, 0x1f4],
+        C::SrgbLimited | C::Rgb2020Limited => [0x40, 0x40, 0x40],
+        _ => [0, 0, 0],
     }
 }
 fn csc(format: Format) -> &'static [u16; 12] {
-    if format.ycbcr420 {
-        &CSC_YCBCR709
-    } else if format.limited {
-        &CSC_SRGB_LIMITED
-    } else {
-        &CSC_SRGB
+    match format.colorspace {
+        C::Ycbcr601 => &CSC_YCBCR601,
+        C::Ycbcr709 => &CSC_YCBCR709,
+        C::Ycbcr2020Limited => &CSC_YCBCR2020,
+        C::SrgbLimited | C::Rgb2020Limited => &CSC_SRGB_LIMITED,
+        _ => &CSC_SRGB,
     }
 }
 
@@ -272,7 +278,7 @@ impl<I: Io> Engine<I> {
             FMT_DYNAMIC_EXP_EN | FMT_DYNAMIC_EXP_MODE,
             FMT_DYNAMIC_EXP_EN | mode,
         )?;
-        if format.ycbcr420 {
+        if format.encoding.is_420() {
             self.fmt(FMT_MAP420_MEMORY_CONTROL, FMT_MAP420MEM_PWR_FORCE, 0)?;
         }
         // resource_build_bit_depth_reduction_params, DITHER_OPTION_DEFAULT:
@@ -309,11 +315,7 @@ impl<I: Io> Engine<I> {
 // linux-lit: 11=FMT0_FMT_BIT_DEPTH_CONTROL__FMT_SPATIAL_DITHER_DEPTH__SHIFT
                     | depth << 11
                     | FMT_HIGHPASS_RANDOM_ENABLE
-                    | if format.ycbcr420 {
-                        0
-                    } else {
-                        FMT_RGB_RANDOM_ENABLE
-                    }
+                    | if format.encoding == E::Rgb { FMT_RGB_RANDOM_ENABLE } else { 0 }
             }
             None => 0,
         };
@@ -330,11 +332,11 @@ impl<I: Io> Engine<I> {
             FMT_CLAMP_DATA_EN,
         )?;
         // opp1_set_pixel_encoding.
-        let encoding = if format.ycbcr420 {
+        let encoding = match format.encoding {
             // linux-lit: 16=FMT0_FMT_CONTROL__FMT_PIXEL_ENCODING__SHIFT; 18=FMT0_FMT_CONTROL__FMT_SUBSAMPLING_MODE__SHIFT
-            2 << 16 | 2 << 18 | FMT_CBCR_BIT_REDUCTION_BYPASS
-        } else {
-            0
+            E::Ycbcr422 => 1 << 16 | 2 << 18,
+            E::Ycbcr420 => 2 << 16 | 2 << 18 | FMT_CBCR_BIT_REDUCTION_BYPASS,
+            E::Rgb | E::Ycbcr444 => 0,
         };
         self.fmt(
             FMT_CONTROL,
@@ -357,7 +359,7 @@ impl<I: Io> Engine<I> {
         self.fmt(OPPBUF_CONTROL, 0x3fff, 0)?; // linux-lit: 0x3fff=OPPBUF0_OPPBUF_CONTROL__OPPBUF_ACTIVE_WIDTH_MASK
                                               // linux-lit: 0xfffff=OPPBUF0_OPPBUF_3D_PARAMETERS_0__OPPBUF_3D_VACT_SPACE1_SIZE_MASK | OPPBUF0_OPPBUF_3D_PARAMETERS_0__OPPBUF_3D_VACT_SPACE2_SIZE_MASK
         self.fmt(OPPBUF_3D_PARAMETERS_0, 0x000f_ffff, 0)?;
-        let two = u32::from(format.ycbcr420);
+        let two = u32::from(format.encoding.is_420());
         self.update(
             Bank::Two,
             self.at(ODM_OPTC_DATA_FORMAT_CONTROL, ODM_STRIDE),
@@ -399,7 +401,7 @@ impl<I: Io> Engine<I> {
                 self.pipe
             );
         }
-        self.write(Bank::Three, MPC_OUT_CSC_COEF_FORMAT, 0)?;
+        self.update(Bank::Three, MPC_OUT_CSC_COEF_FORMAT, 1 << self.pipe, 0)?;
         self.write(
             Bank::Three,
             self.at(MPC_OUT_CSC_MODE, MPC_OUT_STRIDE),

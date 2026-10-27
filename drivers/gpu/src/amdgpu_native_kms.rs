@@ -187,22 +187,30 @@ pub fn request_crtc_color(display: u8, request: CrtcColorRequest) {
         crate::amdgpu_navi48_platform::request_crtc_color(display, request)
     }
 }
-/// Connector Colorspace / HDR_OUTPUT_METADATA. Only Navi48 attaches them.
+/// Connector Colorspace / HDR_OUTPUT_METADATA on native HDMI outputs.
 pub fn request_connector_color(request: ConnectorColorRequest) {
-    if !navi22() {
+    if navi22() {
+        crate::amdgpu_navi22_kms::request_connector_color(request)
+    } else {
         crate::amdgpu_navi48_platform::request_connector_color(request)
     }
 }
-/// Connector "max bpc" (max_requested_bpc). Only Navi48 attaches it.
+/// Connector "max bpc" (max_requested_bpc).
 pub fn request_connector_max_bpc(connector: u32, bpc: u8) {
-    if !navi22() {
+    if navi22() {
+        crate::amdgpu_navi22_kms::request_connector_max_bpc(connector, bpc)
+    } else {
         crate::amdgpu_navi48_platform::request_connector_max_bpc(connector, bpc)
     }
 }
 /// Whether connector `connector`'s stream can signal `colorspace` and, with
-/// `hdr`, HDR metadata (Navi48; Navi22 attaches neither property).
+/// `hdr`, HDR metadata (including Navi22's native HDMI connectors).
 pub fn connector_color_supported(connector: u32, colorspace: u32, hdr: bool) -> bool {
-    navi22() || crate::amdgpu_navi48_platform::connector_color_supported(connector, colorspace, hdr)
+    if navi22() {
+        crate::amdgpu_navi22_kms::connector_color_supported(connector, colorspace, hdr)
+    } else {
+        crate::amdgpu_navi48_platform::connector_color_supported(connector, colorspace, hdr)
+    }
 }
 /// One prospective native HDMI output in an atomic check. The plane
 /// setup and exact mode are carried by value; checking never stages state.
@@ -226,8 +234,14 @@ pub struct OutputRoute {
     pub planes: Option<(u32, crate::amdgpu_navi48_boot::PlaneSetup)>,
 }
 pub fn output_formats_supported(requests: &[OutputFormatRequest], routes: &[OutputRoute]) -> bool {
-    requests.is_empty()
-        || !navi22() && crate::amdgpu_navi48_platform::output_formats_supported(requests, routes)
+    if requests.is_empty() {
+        return true;
+    }
+    if navi22() {
+        crate::amdgpu_navi22_kms::output_formats_supported(requests, routes)
+    } else {
+        crate::amdgpu_navi48_platform::output_formats_supported(requests, routes)
+    }
 }
 /// Whether an HDR_OUTPUT_METADATA blob builds an HDR infoframe
 /// (amdgpu_dm_fill_hdr_info_packet succeeds).

@@ -2337,7 +2337,7 @@ pub fn hdmi_format(caps: HdmiCaps, t: &Timing, max_bpc: u8) -> Option<(otg::Colo
 
 /// A requested output must be declared for this mode. A 4:2:0-only
 /// mode never becomes RGB/444/422 under an explicit override.
-fn hdmi_encodings(
+pub(crate) fn hdmi_encodings(
     caps: HdmiCaps,
     t: &Timing,
     requested: crate::amdgpu_hdr::ColorFormat,
@@ -2361,7 +2361,7 @@ fn hdmi_encodings(
                 }
         })
 }
-fn hdmi_depths(
+pub(crate) fn hdmi_depths(
     caps: HdmiCaps,
     e: crate::amdgpu_hdr::PixelEncoding,
     max_bpc: u8,

@@ -1488,8 +1488,14 @@ impl ColdBoot {
         let sink = sink.clone();
         // SAFETY: forwarded unchanged.
         unsafe {
-            self.modeset_display(connector, &sink, None, modeset::test_pattern)
-                .await
+            self.modeset_display(
+                connector,
+                &sink,
+                None,
+                Default::default(),
+                modeset::test_pattern,
+            )
+            .await
         }
     }
     /// HDP flush for CPU writes to the native scanout.
@@ -1962,6 +1968,7 @@ impl ColdBoot {
         connector: crate::amdgpu_navi22_display::Connector,
         sink: &crate::amdgpu_navi22_display::Sink,
         want: Option<crate::amdgpu_dml::Timing>,
+        hdmi_settings: crate::amdgpu_dcn30_hdmi::OutputSettings,
         draw: impl Fn(u32, &mut [u32]),
     ) -> Result<crate::amdgpu_navi22_modeset::Output, Error> {
         use crate::amdgpu_navi22_modeset::{self as modeset, State as M, Step};
@@ -1999,6 +2006,7 @@ impl ColdBoot {
         let mut pipeline = unsafe { modeset::Pipeline::new(&h.gpu, h.authority, connector, route) }
             .map_err(Error::Modeset)?;
         pipeline.request(want);
+        pipeline.set_hdmi_settings(hdmi_settings);
         pipeline.set_lttpr_policy(crate::amdgpu_dcn30_dp_link::VbiosLttpr::from_vbios(vbios));
         pipeline.assume_link_cap(display.verified_link(index, sink.dpcd));
         let mut aux = crate::amdgpu_navi22_display::DisplayAux { display, index };
@@ -2233,6 +2241,51 @@ impl ColdBoot {
         self.sequence.backend.scanout.as_ref()
     }
     /// The DCN30 admission of the lit (or last attempted) sink.
+    /// Packet-only update on a running stream (group member or single).
+    pub async fn update_hdmi_metadata(
+        &mut self,
+        group_stream: Option<usize>,
+        settings: crate::amdgpu_dcn30_hdmi::OutputSettings,
+    ) -> Result<(), Error> {
+        let h = &mut self.sequence.backend;
+        match group_stream {
+            Some(k) => {
+                h.group
+                    .as_mut()
+                    .ok_or(Error::Invalid)?
+                    .update_hdmi_metadata(k, settings)
+                    .await
+            }
+            None => {
+                h.modeset
+                    .as_mut()
+                    .ok_or(Error::Invalid)?
+                    .update_hdmi_metadata(settings)
+                    .await
+            }
+        }
+        .map_err(Error::Modeset)
+    }
+    /// Immutable board/PHY ceilings for DRM's side-effect-free checks.
+    pub fn display_hdmi_limits(
+        &self,
+        connector: &crate::amdgpu_navi22_display::Connector,
+    ) -> crate::amdgpu_dcn30_hdmi::Limits {
+        use crate::amdgpu_dcn_inventory::{encoder_caps, ENCODER_CAP_HDMI6GBPS_EN};
+        let h = &self.sequence.backend;
+        let caps = h
+            .display_bios
+            .as_ref()
+            .map(|(vbios, _)| encoder_caps(vbios, connector.path.transmitter));
+        crate::amdgpu_dcn30_hdmi::Limits {
+            hdmi6g: !matches!(caps, Some(Ok(Some(c))) if c & ENCODER_CAP_HDMI6GBPS_EN == 0),
+            max_phy_khz: self
+                .display_admitted()
+                .map_or(crate::amdgpu_dcn30_hdmi::TMDS_MAX_KHZ, |a| {
+                    a.soc.max_phyclk_khz
+                }),
+        }
+    }
     pub fn display_admitted(&self) -> Option<&crate::amdgpu_navi22_modeset::Admitted> {
         self.sequence.backend.modeset.as_ref()?.admitted()
     }

@@ -803,6 +803,12 @@ fn reconcile_displays(boot: &mut boot::ColdBoot, reports: &[crate::amdgpu_navi22
             let i = reports.iter().position(|r| r.connector == *port)?;
             soc.map(|(soc, vco)| offered_on(sink, &soc, vco, links[i]))
         });
+    {
+        let mut kms = crate::amdgpu_navi22_kms::KMS.lock();
+        for connector in &mut kms.connectors {
+            connector.hdmi_limits = boot.display_hdmi_limits(&connector.port);
+        }
+    }
     // What the sinks' HPD looked like at this detection.
     let senses = boot.display_hpd_senses();
     let mut last = SENSES.lock();
@@ -844,8 +850,10 @@ async unsafe fn light(
         Some((c, Detection::Connected(sink))) => (*c, sink.clone()),
         _ => return Err(boot::Error::Modeset(M::NoSink)),
     };
+    let output_settings = KMS.lock().connectors[route].output;
     // SAFETY: the caller's obligations.
-    let result = unsafe { boot.modeset_display(connector, &sink, want, draw) }.await;
+    let result =
+        unsafe { boot.modeset_display(connector, &sink, want, output_settings, draw) }.await;
     // Admission inputs (and a DP sink's verified link) exist now, lit or
     // not: offer what they admit.
     reconcile_displays(boot, &reports);
@@ -854,6 +862,8 @@ async unsafe fn light(
         kms.crtc.shown = None;
         *LIT_SINK.lock() = result.is_ok().then(|| (route, sink.clone()));
         if let Ok(output) = result.as_ref() {
+            kms.connectors[route].shown_output = output_settings;
+            kms.connectors[route].color_relight = false;
             let edid = sink
                 .edid
                 .get(..128)
@@ -972,6 +982,46 @@ pub enum MonitorStep {
     RetrainFailed,
     /// The sink asked for an automated test (acknowledged, not run).
     AutomatedTest,
+}
+
+/// Metadata updates are serialized with the display owner. A newer request
+/// arriving during the await remains pending: mark only the captured state
+/// applied. A failed packet update requests the usual bounded relight.
+async fn update_hdmi_metadata(boot: &mut boot::ColdBoot) {
+    use crate::amdgpu_navi22_kms::{KMS, MAX_CRTCS};
+    let updates: alloc::vec::Vec<_> = {
+        let kms = KMS.lock();
+        (0..MAX_CRTCS)
+            .filter_map(|d| {
+                let crtc = kms.crtc_at(d)?;
+                crtc.shown.as_ref()?;
+                let n = crtc.route?;
+                let c = kms.connectors.get(n)?;
+                (c.port.signal == crate::amdgpu_navi22_display::Signal::Hdmi
+                    && !c.color_relight
+                    && c.output != c.shown_output
+                    && !c.output.needs_modeset(c.shown_output))
+                .then_some((d, n, c.port, c.output))
+            })
+            .collect()
+    };
+    for (d, n, port, settings) in updates {
+        let group_stream = GROUP_CRTCS.lock().iter().position(|&crtc| crtc == d);
+        if group_stream.is_none() && d != 0 {
+            continue;
+        }
+        let result = boot.update_hdmi_metadata(group_stream, settings).await;
+        let mut kms = KMS.lock();
+        if let Some(c) = kms.connectors.get_mut(n).filter(|c| c.port == port) {
+            if result.is_ok() {
+                c.shown_output = settings;
+            } else {
+                c.color_relight = true;
+                kms.attempted = None;
+                kms.attempted_group = None;
+            }
+        }
+    }
 }
 
 /// Linux's long-pulse path (`handle_hpd_irq` → `dc_link_detect` → a
@@ -1169,6 +1219,7 @@ async unsafe fn monitor_pass() {
         let _ = writeln!(narf_console::Writer, "amdgpu: navi22 display {step:?}");
         return;
     }
+    update_hdmi_metadata(boot).await;
     // SAFETY: as below; a lit or wanted multi-stream context owns the pass.
     if unsafe { converge_group(boot, running) }.await {
         return;
@@ -1322,6 +1373,7 @@ async unsafe fn converge_group(
             sink: sink.clone(),
             want,
             mst: None,
+            hdmi_settings: KMS.lock().connectors[n].output,
         });
     }
     KMS.lock().attempted_group = Some(targets.iter().map(|t| (t.1, t.2)).collect());
@@ -1358,6 +1410,8 @@ async unsafe fn converge_group(
                 .get(n)
                 .map(|c| c.modes.clone())
                 .unwrap_or_default();
+            kms.connectors[n].shown_output = r.hdmi_settings;
+            kms.connectors[n].color_relight = false;
             if let Some(c) = kms.crtc_at_mut(d) {
                 c.shown = edid.map(|e| (e, o.timing, offered));
             }

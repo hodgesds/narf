@@ -69,6 +69,7 @@ impl Resources {
             return true;
         }
         self.pll_timing[p] = None;
+        self.pll_format[p] = None;
         false
     }
     /// `resource_map_pool_resources` + `resource_map_clock_resources` for
@@ -86,6 +87,21 @@ impl Resources {
         odm: Odm,
         dsc: bool,
     ) -> Result<Lease, Error> {
+        self.acquire_stream_format(connector, timing, odm, dsc, None)
+    }
+    /// A PHY PLL is shareable only at the same TMDS target, encoding and
+    /// depth. Equal timing geometry alone does not imply equal PLL state.
+    pub fn acquire_stream_format(
+        &mut self,
+        connector: &Connector,
+        timing: &Timing,
+        odm: Odm,
+        dsc: bool,
+        hdmi: Option<&hdmi::Stream>,
+    ) -> Result<Lease, Error> {
+        let key = hdmi.map_or((hdmi::Format::RGB8, timing.pixel_clock_khz * 10), |s| {
+            (s.format, s.character_100hz)
+        });
         let mut next = *self;
         let pipe = first_free(next.pipes, next.capacity).ok_or(Error::Busy)?;
         let preferred = connector.path.transmitter;
@@ -105,6 +121,7 @@ impl Resources {
             Signal::Hdmi => {
                 let shared = (0..next.capacity).find(|&p| {
                     next.plls & 1 << p != 0
+                        && next.pll_format[usize::from(p)] == Some(key)
                         && next.pll_timing[usize::from(p)]
                             .is_some_and(|t| synchronizable(&t, timing))
                 });
@@ -118,6 +135,7 @@ impl Resources {
                         next.plls |= 1 << p;
                         next.pll_sharers[usize::from(p)] = 0;
                         next.pll_timing[usize::from(p)] = Some(*timing);
+                        next.pll_format[usize::from(p)] = Some(key);
                         ClockSource::Pll(p)
                     }
                 }
@@ -318,6 +336,7 @@ pub struct Request {
     /// DRM's timing; None: the sink's preferred.
     pub want: Option<Timing>,
     pub mst: Option<dp_mst_mgr::Sink>,
+    pub hdmi_settings: hdmi::OutputSettings,
 }
 
 /// One admitted stream: its timing and what carries it.
@@ -378,7 +397,8 @@ fn candidate(
 ) -> Result<(StreamPlan, dml30::Stream), Error> {
     if r.connector.signal == Signal::Hdmi {
         let limits = extra.hdmi.unwrap_or(hdmi::Limits::DEFAULT);
-        let (timing, stream, _) = select_hdmi(&r.sink, soc, vco_khz, r.want, limits)?;
+        let (timing, stream, _) =
+            select_hdmi_with(&r.sink, soc, vco_khz, r.want, limits, r.hdmi_settings)?;
         if stream.avi.is_none() {
             return Err(Error::NoSink);
         }
@@ -686,6 +706,18 @@ impl core::fmt::Debug for Group {
 }
 
 impl Group {
+    /// Update one stream's HDMI metadata without retiring the context.
+    pub async fn update_hdmi_metadata(
+        &mut self,
+        stream: usize,
+        settings: hdmi::OutputSettings,
+    ) -> Result<(), Error> {
+        self.members
+            .get_mut(stream)
+            .ok_or(Error::Invalid)?
+            .update_hdmi_metadata(settings)
+            .await
+    }
     /// # Safety
     /// As [`Pipeline::new`], for the whole display engine; `requests` name
     /// distinct sinks on the board's connectors.
@@ -906,11 +938,12 @@ impl Group {
             .try_reserve_exact(plans.len())
             .map_err(|_| Error::Allocation)?;
         for ((r, p), plane) in self.requests.iter().zip(&plans).zip(&joint.planes) {
-            leases.push(resources.acquire_stream(
+            leases.push(resources.acquire_stream_format(
                 &r.connector,
                 &p.timing,
                 plane.odm,
                 p.dsc.is_some(),
+                p.hdmi.as_ref(),
             )?);
         }
         for (m, lease) in self.members.iter_mut().zip(&leases) {
@@ -919,8 +952,9 @@ impl Group {
             }
             m.route = lease.route;
         }
-        for (m, p) in self.members.iter_mut().zip(&plans) {
+        for ((m, p), r) in self.members.iter_mut().zip(&plans).zip(&self.requests) {
             m.hdmi = p.hdmi;
+            m.hdmi_settings = r.hdmi_settings;
         }
         self.slices.clear();
         for lease in &leases {

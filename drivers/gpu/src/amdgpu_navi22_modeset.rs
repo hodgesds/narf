@@ -283,6 +283,7 @@ pub struct Resources {
     /// PLL runs, and the DSC engines in use.
     pll_sharers: [u8; PLLS as usize],
     pll_timing: [Option<Timing>; PLLS as usize],
+    pll_format: [Option<(hdmi::Format, u32)>; PLLS as usize],
     dscs: u8,
 }
 fn first_free(used: u8, count: u8) -> Option<u8> {
@@ -297,6 +298,7 @@ impl Resources {
             plls: 0,
             pll_sharers: [0; PLLS as usize],
             pll_timing: [None; PLLS as usize],
+            pll_format: [None; PLLS as usize],
             dscs: 0,
         }
     }
@@ -485,21 +487,31 @@ pub(crate) fn hdmi_stream(
     soc: &dml30::Soc,
     limits: hdmi::Limits,
 ) -> Option<hdmi::Stream> {
+    hdmi_stream_with(sink, timing, soc, limits, hdmi::OutputSettings::default())
+}
+fn hdmi_stream_with(
+    sink: &Sink,
+    timing: &Timing,
+    soc: &dml30::Soc,
+    limits: hdmi::Limits,
+    settings: hdmi::OutputSettings,
+) -> Option<hdmi::Stream> {
     use crate::amdgpu_navi48_boot as navi48;
     let limits = hdmi::Limits {
         max_phy_khz: limits.max_phy_khz.min(soc.max_phyclk_khz),
         ..limits
     };
-    hdmi::stream_for(
+    hdmi::stream_with_settings(
         &sink.edid,
         timing,
-        navi48::max_bpc(),
+        settings,
         navi48::limited_range(navi48::broadcast_rgb()),
         limits,
     )
 }
 /// [`select`] with the whole stream, or exactly `want` when DRM asked for a
 /// timing the same checks admit.
+#[cfg(feature = "kernel-test")]
 pub(crate) fn select_hdmi(
     sink: &Sink,
     soc: &dml30::Soc,
@@ -507,16 +519,33 @@ pub(crate) fn select_hdmi(
     want: Option<Timing>,
     limits: hdmi::Limits,
 ) -> Result<(Timing, hdmi::Stream, dml30::Plan), Error> {
+    select_hdmi_with(
+        sink,
+        soc,
+        vco_khz,
+        want,
+        limits,
+        hdmi::OutputSettings::default(),
+    )
+}
+pub(crate) fn select_hdmi_with(
+    sink: &Sink,
+    soc: &dml30::Soc,
+    vco_khz: u32,
+    want: Option<Timing>,
+    limits: hdmi::Limits,
+    settings: hdmi::OutputSettings,
+) -> Result<(Timing, hdmi::Stream, dml30::Plan), Error> {
     if let Some(want) = want {
-        if !offered(sink, soc, vco_khz).contains(&want) {
+        if !crate::amdgpu_navi48_boot::edid_timings(&sink.edid).contains(&want) {
             return Err(Error::NoMode);
         }
-        let stream = hdmi_stream(sink, &want, soc, limits).ok_or(Error::NoMode)?;
+        let stream = hdmi_stream_with(sink, &want, soc, limits, settings).ok_or(Error::NoMode)?;
         let plan = dml30::plan(&config(&want, vco_khz), soc).map_err(Error::Mode)?;
         return Ok((want, stream, plan));
     }
     for timing in crate::amdgpu_navi48_boot::edid_timings(&sink.edid) {
-        let Some(stream) = hdmi_stream(sink, &timing, soc, limits) else {
+        let Some(stream) = hdmi_stream_with(sink, &timing, soc, limits, settings) else {
             continue;
         };
         let Ok(plan) = dml30::plan(&config(&timing, vco_khz), soc) else {
@@ -586,16 +615,8 @@ pub struct Admitted {
     pub offered: Vec<Timing>,
 }
 
-/// Every distinct EDID timing `select_hdmi`/`select_dp_on` could choose: a
-/// stream the DCN3.0 TMDS encoder carries (HDMI) or inside the sink's link at
-/// 8 bpc (a sink with DPCD, i.e. DisplayPort: its receiver-caps ceiling until
-/// verified), and admitted by the DCN30 mode math. This is what KMS offers;
-/// a DRM TEST_ONLY or SETCRTC is checked against it.
-pub(crate) fn offered(sink: &Sink, soc: &dml30::Soc, vco_khz: u32) -> Vec<Timing> {
-    offered_on(sink, soc, vco_khz, None)
-}
-/// `offered` for a DP sink whose link was verified at `verified`
-/// (`dp_validate_mode_timing` against `verified_link_cap`).
+/// Every distinct EDID timing the HDMI selector or DP admission can choose,
+/// bounded by board mode math and (for DP) the observed verified link.
 pub(crate) fn offered_on(
     sink: &Sink,
     soc: &dml30::Soc,
@@ -754,6 +775,7 @@ pub struct Pipeline {
     /// black), and the admitted HDMI stream (format, clocks, scrambling).
     format: hdmi::Formatter,
     hdmi: Option<hdmi::Stream>,
+    hdmi_settings: hdmi::OutputSettings,
 }
 impl core::fmt::Debug for Pipeline {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -856,6 +878,7 @@ impl Pipeline {
                 dp: DpState::default(),
                 format: hdmi::Formatter::new(gpu, authority, pipe)?,
                 hdmi: None,
+                hdmi_settings: hdmi::OutputSettings::default(),
             })
         }
     }
@@ -1256,7 +1279,14 @@ impl Pipeline {
         let (timing, avi, plan) = match signal {
             Signal::Hdmi => {
                 let limits = self.hdmi_limits(tables);
-                let (t, stream, plan) = select_hdmi(sink, &soc, levels.vco_khz, self.want, limits)?;
+                let (t, stream, plan) = select_hdmi_with(
+                    sink,
+                    &soc,
+                    levels.vco_khz,
+                    self.want,
+                    limits,
+                    self.hdmi_settings,
+                )?;
                 self.hdmi = Some(stream);
                 (t, stream.avi, plan)
             }
@@ -1400,7 +1430,7 @@ impl Pipeline {
         match self.connector.signal {
             Signal::Hdmi => {
                 let mut audio_timing = *timing;
-                if self.hdmi.is_some_and(|s| s.format.ycbcr420) {
+                if self.hdmi.is_some_and(|s| s.format.encoding.is_420()) {
                     audio_timing.pixel_clock_khz /= 2;
                 }
                 AudioStream::hdmi(otg, dig, audio_timing)
@@ -1485,7 +1515,7 @@ impl Pipeline {
                 "amdgpu: navi22 HDMI {} kHz {} bpc{} SCDC TMDS_Config {:#x} scrambler {:?} flags {:?} phase={phase}",
                 stream.character_khz,
                 stream.format.depth.bpc(),
-                if stream.format.ycbcr420 { " 4:2:0" } else { "" },
+                if stream.format.encoding.is_420() { " 4:2:0" } else { "" },
                 status.tmds_config,
                 status.scrambler_status,
                 status.status_flags,
@@ -2036,6 +2066,32 @@ impl Aux for NoAux {
 /// KMS hooks (amdgpu_navi22_kms / amdgpu_navi22_scanout).
 impl Pipeline {
     /// Ask `enable` for exactly this timing (None: the sink's preferred).
+    /// Metadata-only updates do not blank or retrain TMDS. Format/depth and
+    /// HDR enable/disable transitions still go through normal modesetting.
+    pub async fn update_hdmi_metadata(
+        &mut self,
+        settings: hdmi::OutputSettings,
+    ) -> Result<(), Error> {
+        if !matches!(self.state, State::At(Step::Running))
+            || settings.needs_modeset(self.hdmi_settings)
+        {
+            return Err(Error::Invalid);
+        }
+        let mut stream = self.hdmi.ok_or(Error::Invalid)?;
+        stream.hdr = settings.hdr.as_ref().map(|h| {
+            crate::amdgpu_hdr::hdr_info_packet(Some(h), crate::amdgpu_hdr::HdrConnector::Hdmi)
+                .bytes()
+        });
+        self.dig.hdmi_info_packets(&stream).await?;
+        self.hdmi = Some(stream);
+        self.hdmi_settings = settings;
+        Ok(())
+    }
+    /// Connector state captured before enable; requests during enable are
+    /// left pending for the monitor's next convergence pass.
+    pub fn set_hdmi_settings(&mut self, settings: hdmi::OutputSettings) {
+        self.hdmi_settings = settings;
+    }
     pub fn request(&mut self, timing: Option<Timing>) {
         self.want = timing;
     }
