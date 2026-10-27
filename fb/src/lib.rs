@@ -581,7 +581,8 @@ fn clear_generic() {
 pub(crate) fn adopted_external_scanout() -> bool {
     let phys = GENERIC_PHYS.load(core::sync::atomic::Ordering::Acquire);
     #[cfg(feature = "amdgpu")]
-    let amd = narf_drivers_gpu::amdgpu_dcn_display::active_scanout().is_some_and(|p| phys == p.addr);
+    let amd =
+        narf_drivers_gpu::amdgpu_dcn_display::active_scanout().is_some_and(|p| phys == p.addr);
     #[cfg(not(feature = "amdgpu"))]
     let amd = false;
     #[cfg(feature = "intel")]
