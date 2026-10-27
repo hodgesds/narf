@@ -269,6 +269,15 @@ pub struct PolledBlkReader<T: EarlyTransport> {
     used_seen: Cell<u16>,
 }
 
+impl<T: EarlyTransport> core::fmt::Debug for PolledBlkReader<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PolledBlkReader")
+            .field("queue_size", &self.queue_size)
+            .field("capacity_sectors", &self.capacity_sectors)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T: EarlyTransport> PolledBlkReader<T> {
     /// Stand the device up: identify it, reset it, run the §2.1
     /// feature handshake accepting only `VIRTIO_F_VERSION_1`,
