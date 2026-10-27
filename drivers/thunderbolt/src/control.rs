@@ -16,6 +16,13 @@ pub(crate) struct Control {
     pub ring: Ring,
     sequence: u8,
     pub events: Vec<Event>,
+    /// Unsolicited XDomain frames (kinds 6/7) buffered for the
+    /// XDomain engine's next pass. XDomain requests can arrive at
+    /// any time, including mid-transaction; dropping one would lose
+    /// a peer's login, so they are stashed rather than handled
+    /// inline. Bounded like the event queue — a peer that floods
+    /// the channel loses its newest frames and can retry.
+    xdomain: Vec<(u8, Vec<u32>)>,
     failed: bool,
 }
 impl Control {
@@ -24,12 +31,21 @@ impl Control {
             ring,
             sequence: 0,
             events: Vec::new(),
+            xdomain: Vec::new(),
             failed: false,
         }
     }
     fn event(&mut self, packet: &Packet) -> Result<bool, Error> {
         if packet.words.len() < 2 {
             return Err(Error::Invalid);
+        }
+        if packet.kind == super::xdomain::PKG_XDOMAIN_REQ
+            || packet.kind == super::xdomain::PKG_XDOMAIN_RESP
+        {
+            if self.xdomain.len() < 32 {
+                self.xdomain.push((packet.kind, packet.words.clone()));
+            }
+            return Ok(true);
         }
         let header = Header::decode([packet.words[0], packet.words[1]]);
         let h = Header {
@@ -214,6 +230,68 @@ impl Config for Control {
         .map(|_| ())
     }
 }
+/// The XDomain engine's channel over ring 0. Responses are matched
+/// the reference CM's way (`tb_xdomain_match`): same protocol UUID,
+/// routes equal with the reply bit (bit 63) masked on both sides —
+/// sequence numbers are deliberately not part of the match.
+impl super::xdomain::XdChannel for Control {
+    async fn exchange(&mut self, kind: u8, words: &[u32]) -> Result<Vec<u32>, Error> {
+        use super::xdomain::{decode_xd_head, ROUTE_REPLY_BIT};
+        let Some(head) = decode_xd_head(words) else {
+            return Err(Error::Invalid);
+        };
+        if words.len() < 7 {
+            return Err(Error::Invalid);
+        }
+        let want_route = head.route & !ROUTE_REPLY_BIT;
+        let want_uuid: Vec<u32> = words[3..7].to_vec();
+        self.ring.send(kind, words)?;
+        let deadline = narf_time::Deadline::after_ms(super::xdomain::XDP_TIMEOUT_MS);
+        loop {
+            for _ in 0..32 {
+                match self.ring.receive() {
+                    Ok(Some(packet)) => {
+                        if packet.kind == super::xdomain::PKG_XDOMAIN_RESP
+                            && packet.words.len() >= 7
+                            && decode_xd_head(&packet.words)
+                                .is_some_and(|h| h.route & !ROUTE_REPLY_BIT == want_route)
+                            && packet.words[3..7] == want_uuid[..]
+                        {
+                            return Ok(packet.words);
+                        }
+                        if self.event(&packet)? {
+                            continue;
+                        }
+                        if packet.kind == 3
+                            && packet.words.len() == 3
+                            && Header::decode([packet.words[0], packet.words[1]]).route
+                                & !ROUTE_REPLY_BIT
+                                == want_route
+                        {
+                            return Err(Error::Remote((packet.words[2] & 255) as u8));
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(Error::Invalid) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            self.ring.wait(1).await;
+        }
+    }
+
+    async fn send(&mut self, kind: u8, words: &[u32]) -> Result<(), Error> {
+        self.ring.send(kind, words)
+    }
+
+    fn drain(&mut self) -> Vec<(u8, Vec<u32>)> {
+        core::mem::take(&mut self.xdomain)
+    }
+}
+
 fn match_reply(
     packet: &Packet,
     route: u64,

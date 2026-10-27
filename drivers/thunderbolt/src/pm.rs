@@ -45,6 +45,17 @@
 //!   (`tunnel::replay_failures()` non-empty): `Busy`. A tunnel
 //!   could not be restored on the last wake; suspending again
 //!   would strand it further.
+//! - **Live XDomain links** (`xdomain::live_link_count() > 0`):
+//!   `Busy`, checked before any tunnel quiesce is latched (tunnels
+//!   are not drained for a suspend the link will refuse anyway). A
+//!   host-to-host link with a completed ThunderboltIP login holds
+//!   fabric state; powering down would silently drop the peer's
+//!   network link. An XDomain session's replay record is a
+//!   re-login — after resume the engine re-reads the peer's
+//!   properties (its generation rule treats the re-read as a fresh
+//!   fetch) and logs in again, mirroring the reference CM's XDomain
+//!   restore flow, so no extra journal state is needed beyond the
+//!   peer registry this count reads.
 //!
 //! Resume contract:
 //!
@@ -77,6 +88,9 @@ pub(crate) fn register() {
 }
 
 fn suspend() -> Result<(), DeviceSuspendError> {
+    if super::xdomain::live_link_count() > 0 {
+        return Err(DeviceSuspendError::Busy);
+    }
     super::tunnel::pm_on_suspend()
 }
 

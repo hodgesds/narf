@@ -71,7 +71,7 @@ pub(crate) fn start() -> narf_init::InitResult {
     // missing tunnels.
     let _ = writeln!(
         narf_console::Writer,
-        "usb4: firmware granted native control: USB3 {}, DisplayPort {}, PCIe {}",
+        "usb4: firmware granted native control: USB3 {}, DisplayPort {}, PCIe {}, XDomain {}",
         if control & super::firmware::CONTROL_USB3 != 0 {
             "yes"
         } else {
@@ -83,6 +83,11 @@ pub(crate) fn start() -> narf_init::InitResult {
             "no"
         },
         if control & super::firmware::CONTROL_PCIE != 0 {
+            "yes"
+        } else {
+            "no"
+        },
+        if control & super::firmware::CONTROL_XDOMAIN != 0 {
             "yes"
         } else {
             "no"

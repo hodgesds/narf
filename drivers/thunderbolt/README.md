@@ -42,12 +42,15 @@ submission and rolled back in reverse on failure, and existing
 firmware-enabled tunnels are preserved rather than claimed. Reporting a
 tunnel is not a claim that a monitor has trained or that scanout is live.
 
-Out of scope: XDomain tunneling and the legacy ICM protocol itself
+Out of scope: the legacy ICM protocol itself
 (firmware-CM hosts are detected and stood aside from, never driven).
 Tunnel suspend/replay is implemented: system suspend
 latches a quiesce, the CM drains live paths and records them, and
 resume replays the records against the re-scanned topology.
-Detach removes the affected
+Host-to-host XDomain service discovery and Thunderbolt networking are
+implemented (property-block discovery, mutual ThunderboltIP login, a
+registered netdev); the NHI data-ring binding for the netdev is the
+named remainder in the spec. Detach removes the affected
 router subtree before rediscovery. Discovery registers at Device-stage
 init and the per-controller CM task starts at Late-stage init. The crate
 is `no_std`.

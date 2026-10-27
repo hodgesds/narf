@@ -250,6 +250,8 @@ pub(crate) async fn run(id: u32, controls: u32, ctl: &mut Control) -> Result<(),
         routers: Vec::new(),
     };
     let mut tunnels = Vec::new();
+    let mut xd = super::xdomain::Engine::new(id, controls);
+    let mut xd_identified = false;
     let result = async {
         loop {
             // Tunnel suspend/replay service (#1035): the device-PM
@@ -333,6 +335,19 @@ pub(crate) async fn run(id: u32, controls: u32, ctl: &mut Control) -> Result<(),
             let changed = next != current;
             current = next;
             super::tunnel::reconcile(ctl, &current, &mut tunnels, controls).await?;
+            // XDomain rides the same pass: the engine derives this
+            // host's identity from the first scan's host router,
+            // then probes depth-1 routers for a peer host and drives
+            // discovery, property fetch and ThunderboltIP sessions.
+            // It absorbs peer-level errors itself, so a dead or
+            // hostile peer cannot fail the CM loop.
+            if !xd_identified {
+                if let Some((uuid, root)) = super::xdomain::local_identity(&current) {
+                    xd.set_identity(uuid, root);
+                    xd_identified = true;
+                }
+            }
+            xd.service(ctl, &current).await;
             if changed {
                 let _ = writeln!(
                     narf_console::Writer,
@@ -365,6 +380,7 @@ pub(crate) async fn run(id: u32, controls: u32, ctl: &mut Control) -> Result<(),
     super::tunnel::note_orphaned_paths(id, tunnels.iter().any(|t| t.has_unrolled_writes()));
     DOMAINS.lock().retain(|d| d.id != id);
     super::tunnel::forget_domain(id);
+    super::xdomain::forget_domain(id);
     result
 }
 
