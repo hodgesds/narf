@@ -22,6 +22,7 @@ use alloc::rc::Rc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::Cell;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use narf_block::{BlockDeviceSync, BlockIoError};
 use narf_crypto::aead::{chacha20_poly1305_open, chacha20_poly1305_seal};
@@ -97,12 +98,18 @@ fn hkdf32(ikm: &[u8], info: &[u8]) -> [u8; 32] {
 
 /// Fixture custody anchor: published secret, honest presence gate.
 /// See the module docs before trusting it with anything (don't).
+/// Atomics, not `Cell`: `KeyCustodyAnchor` is `Send + Sync`
+/// (`anchor.rs:104`), and a `Cell` field makes the whole fixture
+/// anchor `!Sync` (CI E0277 at the impl site and at both `unwrap`
+/// call sites). The atomics keep the same single-threaded
+/// observable behaviour — presence starts refused, each wrap takes
+/// a fresh counter — while satisfying the production trait bound.
 #[derive(Debug)]
 struct TestAnchor {
     id: &'static str,
     secret: [u8; 32],
-    presence: Cell<bool>,
-    wraps: Cell<u64>,
+    presence: AtomicBool,
+    wraps: AtomicU64,
 }
 
 impl TestAnchor {
@@ -110,13 +117,13 @@ impl TestAnchor {
         Self {
             id,
             secret: hkdf32(b"narf-suspend/test-anchor-published-secret", id.as_bytes()),
-            presence: Cell::new(false),
-            wraps: Cell::new(0),
+            presence: AtomicBool::new(false),
+            wraps: AtomicU64::new(0),
         }
     }
 
     fn grant_presence(&self) {
-        self.presence.set(true);
+        self.presence.store(true, Ordering::SeqCst);
     }
 
     fn kek(&self, epoch: u64, counter: u64) -> [u8; 32] {
@@ -134,8 +141,7 @@ impl KeyCustodyAnchor for TestAnchor {
     }
 
     fn wrap(&self, ctx: &WrapCtx, secret: &Secret32) -> Result<WrappedSlot, AnchorError> {
-        let counter = self.wraps.get();
-        self.wraps.set(counter + 1);
+        let counter = self.wraps.fetch_add(1, Ordering::SeqCst);
         let kek = self.kek(ctx.sms_epoch, counter);
         let mut nonce_info = Vec::with_capacity(16);
         nonce_info.extend_from_slice(b"nonce");
@@ -162,7 +168,7 @@ impl KeyCustodyAnchor for TestAnchor {
     }
 
     fn unwrap(&self, ctx: &UnwrapCtx, slot: &WrappedSlot) -> Result<Secret32, AnchorError> {
-        if !self.presence.get() {
+        if !self.presence.load(Ordering::SeqCst) {
             return Err(AnchorError::Refused);
         }
         if slot.params.len() != 8 + self.id.len() || slot.blob.len() != 12 + 32 + 16 {
@@ -190,30 +196,42 @@ impl KeyCustodyAnchor for TestAnchor {
 // ── Fixture store ────────────────────────────────────────────────────
 
 /// In-memory image store with tamper helpers for the negatives.
+///
+/// Interior mutability is required, not a style choice:
+/// `ImageStore::write_all` takes `&self` (the production
+/// `BlockStore` writes through an `Arc<dyn BlockDeviceSync>` the
+/// same way), so a plain `Vec` field cannot be written through the
+/// trait (CI E0596 at the `write_all` body). The bytes sit behind
+/// the same `IrqSafeSpinLock` the `RamBlockDevice` fixture below
+/// uses for exactly this `&self`-write contract.
 #[derive(Debug)]
 struct MemImageStore {
-    data: Vec<u8>,
+    data: IrqSafeSpinLock<Vec<u8>>,
 }
 
 impl MemImageStore {
     fn new(len: usize) -> Self {
         Self {
-            data: alloc::vec![0u8; len],
+            data: IrqSafeSpinLock::new(alloc::vec![0u8; len]),
         }
     }
 
     fn flip_byte(&mut self, offset: u64) {
-        self.data[offset as usize] ^= 0xff;
+        self.data.lock()[offset as usize] ^= 0xff;
+    }
+
+    fn set_byte(&mut self, offset: u64, value: u8) {
+        self.data.lock()[offset as usize] = value;
     }
 
     fn truncate(&mut self, len: usize) {
-        self.data.truncate(len);
+        self.data.lock().truncate(len);
     }
 }
 
 impl ImageStore for MemImageStore {
     fn len_bytes(&self) -> u64 {
-        self.data.len() as u64
+        self.data.lock().len() as u64
     }
 
     fn read_exact(&self, offset: u64, out: &mut [u8]) -> Result<(), ServiceError> {
@@ -221,20 +239,22 @@ impl ImageStore for MemImageStore {
         let end = start
             .checked_add(out.len())
             .ok_or(ServiceError::Truncated)?;
-        if end > self.data.len() {
+        let data = self.data.lock();
+        if end > data.len() {
             return Err(ServiceError::Truncated);
         }
-        out.copy_from_slice(&self.data[start..end]);
+        out.copy_from_slice(&data[start..end]);
         Ok(())
     }
 
     fn write_all(&self, offset: u64, data: &[u8]) -> Result<(), ServiceError> {
         let start = offset as usize;
         let end = start.checked_add(data.len()).ok_or(ServiceError::Store)?;
-        if end > self.data.len() {
+        let mut store = self.data.lock();
+        if end > store.len() {
             return Err(ServiceError::Store);
         }
-        self.data[start..end].copy_from_slice(data);
+        store[start..end].copy_from_slice(data);
         Ok(())
     }
 
@@ -577,7 +597,7 @@ fn smoke_power_suspend_tamper_policy_byte() -> TestResult {
     if svc.seal_image(&mut store, token_policy(), &image).is_err() {
         return TestResult::Fail("seal failed (variant 2)");
     }
-    store.data[POLICY_BYTE_OFFSET as usize] = 0;
+    store.set_byte(POLICY_BYTE_OFFSET, 0);
     match svc.open_with_anchor(&store, &anchor) {
         Err(ServiceError::PolicyMismatch) => {}
         _ => return TestResult::Fail("policy rewritten to OFF was not refused"),
@@ -592,7 +612,7 @@ fn smoke_power_suspend_tamper_policy_byte() -> TestResult {
     if svc.seal_image(&mut store, token_policy(), &image).is_err() {
         return TestResult::Fail("seal failed (variant 3)");
     }
-    store.data[POLICY_BYTE_OFFSET as usize] = 3;
+    store.set_byte(POLICY_BYTE_OFFSET, 3);
     match svc.open_with_anchor(&store, &anchor) {
         Err(ServiceError::AuthenticationFailed) => {}
         _ => return TestResult::Fail("policy byte tamper was not caught by AEAD (variant 3)"),
