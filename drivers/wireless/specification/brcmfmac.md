@@ -550,6 +550,14 @@ brcmfmac randomizes only PNO `pfn_macaddr`; see [CYW §3](cyw43439.md)
 msgbuf smoke `drivers/wireless/brcmfmac/scan_ies` checks literal add/del
 records before each changed escan.
 
+Negotiated `wme_ac_sta` WMM state and all-priority data are common FullMAC
+work ([CYW §3](cyw43439.md) "Negotiated WMM state and all-priority data").
+On msgbuf the station keeps one flow per `brcmf_flowring_prio2fifo` FIFO,
+created with the first frame's priority as TID, and
+`Runtime::send_with_priority` posts each frame's own priority in the TX
+descriptor flags (`BRCMF_MSGBUF_PKT_FLAGS_PRIO_SHIFT`); a priority from a
+different FIFO is a protocol error. Smoke: `drivers/wireless/brcmfmac/wmm`.
+
 Additional software outside that retained profile remains: nonzero descriptor
 prefixes/shared 7, other CPU/RAM/chip/OTP selectors (including 160 MHz-capable
 chips), HE/EHT profiles, native802.11

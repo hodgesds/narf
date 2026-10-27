@@ -30,6 +30,8 @@ mod power_save_tests;
 mod scan_ies_tests;
 #[path = "vht_tests.rs"]
 mod vht_tests;
+#[path = "wmm_tests.rs"]
+mod wmm_tests;
 
 type ModelDevice = Device<TestAdapter>;
 static ACTIVE_TEST: IrqSafeSpinLock<Option<Arc<ModelDevice>>> = IrqSafeSpinLock::new(None);

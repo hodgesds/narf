@@ -1006,6 +1006,25 @@ impl<B: Bus> Runtime<B> {
         Ok(())
     }
     pub fn send(&mut self, token: FlowToken, frame: &[u8]) -> Result<u32, Error> {
+        self.send_prioritized(token, frame, None)
+    }
+    /// Post a frame on its FIFO flow with its own 802.1D priority in the TX
+    /// descriptor flags, as Linux msgbuf uses `skb->priority` per packet.
+    /// The priority must belong to the flow's `brcmf_flowring_prio2fifo` FIFO.
+    pub fn send_with_priority(
+        &mut self,
+        token: FlowToken,
+        frame: &[u8],
+        priority: u8,
+    ) -> Result<u32, Error> {
+        self.send_prioritized(token, frame, Some(priority))
+    }
+    fn send_prioritized(
+        &mut self,
+        token: FlowToken,
+        frame: &[u8],
+        packet_priority: Option<u8>,
+    ) -> Result<u32, Error> {
         if self.failed {
             return Err(Error::Failed);
         }
@@ -1034,7 +1053,12 @@ impl<B: Bus> Runtime<B> {
         if frame[..6] != flow.destination || frame[6..12] != flow.source {
             return Err(Error::Protocol);
         }
-        let priority = flow.priority;
+        let fifo = crate::cyw43439::station::wmm::fifo;
+        let priority = match packet_priority {
+            None => flow.priority,
+            Some(p) if p <= 7 && fifo(p) == fifo(flow.priority) => p,
+            Some(_) => return Err(Error::Protocol),
+        };
         let id = self.next_id()?;
         let mut memory = allocate(&mut self.bus, frame.len() - 14)?;
         memory.write(0, &frame[14..])?;

@@ -52,6 +52,8 @@ pub struct Runtime<T: PacketTransport> {
     tx_sequence: u8,
     tx_max: u8,
     flow_control: u8,
+    /// Current 802.1D-to-AC rank map from negotiated firmware WMM state.
+    ac_priority: [u8; 8],
     previous_rx: Option<u8>,
     transaction: u16,
     pending: Option<Pending>,
@@ -79,6 +81,7 @@ impl<T: PacketTransport> Runtime<T> {
             tx_sequence: 0,
             tx_max: 0,
             flow_control: 0,
+            ac_priority: super::station::wmm::DEFAULT_AC_PRIORITY,
             previous_rx: None,
             transaction: 0,
             pending: None,
@@ -95,6 +98,12 @@ impl<T: PacketTransport> Runtime<T> {
 
     pub fn fail(&mut self) {
         self.failed = true;
+    }
+
+    /// Install the station's negotiated AC rank map. SDPCM `fc_mask` bits
+    /// name host precedences (`brcmf_map_prio_to_prec`), not 802.1D values.
+    pub fn set_ac_priority(&mut self, ac_priority: [u8; 8]) {
+        self.ac_priority = ac_priority;
     }
 
     pub fn pop_event(&mut self) -> Option<Event> {
@@ -360,7 +369,8 @@ impl<T: PacketTransport> Runtime<T> {
             return Err(Error::Malformed);
         }
         // Reserve two credits for control traffic, as Linux SDPCM does.
-        if self.credits() <= 2 || self.flow_control & (1 << priority) != 0 {
+        let precedence = super::station::wmm::precedence(&self.ac_priority, priority);
+        if self.credits() <= 2 || self.flow_control & (1 << precedence) != 0 {
             return Err(Error::Busy);
         }
         let length = 16 + ethernet.len();

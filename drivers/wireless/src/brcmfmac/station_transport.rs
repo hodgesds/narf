@@ -8,6 +8,7 @@ use crate::{
         fullmac::{Family, Fullmac},
         ioctl::Direction,
         runtime::{Error, Event},
+        station::wmm,
     },
 };
 use alloc::{collections::VecDeque, vec::Vec};
@@ -204,40 +205,46 @@ where
         }
         let source = frame[6..12].try_into().unwrap();
         let destination = frame[..6].try_into().unwrap();
-        let token =
-            if let Some(flow) = self.flows.iter().find(|f| {
-                f.source == source && f.destination == destination && f.priority == priority
-            }) {
-                flow.token
-            } else {
-                let token = match self.inner.open_flow(source, destination, priority) {
-                    Ok(token) => token,
-                    Err(runtime::Error::Exhausted) => {
-                        // A bounded cache may evict an idle destination, but
-                        // never recycle its firmware slot before delete ACK.
-                        for flow in &self.flows {
-                            if self.inner.flow_state(flow.token).map_err(map)? != FlowState::Open {
-                                continue;
-                            }
-                            match self.inner.close_flow(flow.token) {
-                                Ok(()) => return Err(Error::Busy),
-                                Err(runtime::Error::Busy) => continue,
-                                Err(error) => return Err(map(error)),
-                            }
+        let token = if let Some(flow) = self.flows.iter().find(|f| {
+            // Linux brcmf_flowring_lookup: a station keeps one flow per
+            // FIFO; its firmware TID is the priority that created it.
+            f.source == source
+                && f.destination == destination
+                && wmm::fifo(f.priority) == wmm::fifo(priority)
+        }) {
+            flow.token
+        } else {
+            let token = match self.inner.open_flow(source, destination, priority) {
+                Ok(token) => token,
+                Err(runtime::Error::Exhausted) => {
+                    // A bounded cache may evict an idle destination, but
+                    // never recycle its firmware slot before delete ACK.
+                    for flow in &self.flows {
+                        if self.inner.flow_state(flow.token).map_err(map)? != FlowState::Open {
+                            continue;
                         }
-                        return Err(Error::Busy);
+                        match self.inner.close_flow(flow.token) {
+                            Ok(()) => return Err(Error::Busy),
+                            Err(runtime::Error::Busy) => continue,
+                            Err(error) => return Err(map(error)),
+                        }
                     }
-                    Err(error) => return Err(map(error)),
-                };
-                self.flows.push(Flow {
-                    source,
-                    destination,
-                    priority,
-                    token,
-                });
-                return Err(Error::Busy);
+                    return Err(Error::Busy);
+                }
+                Err(error) => return Err(map(error)),
             };
-        let id = self.inner.send(token, frame).map_err(map)?;
+            self.flows.push(Flow {
+                source,
+                destination,
+                priority,
+                token,
+            });
+            return Err(Error::Busy);
+        };
+        let id = self
+            .inner
+            .send_with_priority(token, frame, priority)
+            .map_err(map)?;
         self.tx.push(Tx {
             id,
             deadline: narf_time::Deadline::after_ms(2000),

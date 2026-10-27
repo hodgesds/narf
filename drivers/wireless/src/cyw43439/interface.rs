@@ -81,7 +81,9 @@ impl<R: Fullmac> State<R> {
         let result = if pending.deadline.expired() {
             Err(Error::Timeout)
         } else {
-            self.station.send_data(pending.frame.payload(), 0)
+            // Linux brcmf_netdev_start_xmit: cfg80211_classify8021d.
+            let priority = crate::ath11k::tx_hdr::classify8021d(pending.frame.payload());
+            self.station.send_data(pending.frame.payload(), priority)
         };
         match result {
             Ok(()) => self.pending = None,

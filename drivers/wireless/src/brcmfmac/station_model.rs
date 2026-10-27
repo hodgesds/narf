@@ -79,6 +79,9 @@ pub(super) struct Firmware {
     server: DhcpServer,
     uplink: Vec<Vec<u8>>,
     creates: usize,
+    tids: Vec<u8>,
+    tx_priorities: Vec<(u16, u8)>,
+    wme_ac_sta: [u8; 16],
     deletes: usize,
     statuses: usize,
 }
@@ -126,6 +129,9 @@ impl Firmware {
             server: DhcpServer::new(network_plan()),
             uplink: Vec::new(),
             creates: 0,
+            tids: Vec::new(),
+            tx_priorities: Vec::new(),
+            wme_ac_sta: [0; 16],
             deletes: 0,
             statuses: 0,
         }
@@ -153,6 +159,7 @@ impl Firmware {
                 },
             );
             self.creates += 1;
+            self.tids.push(descriptor[20]);
         } else {
             let id = u16::from_le_bytes(descriptor[8..10].try_into().unwrap());
             assert!(self.flows.remove(&id).is_some());
@@ -301,6 +308,8 @@ impl Firmware {
                             .unwrap_or(0)
                             .to_le_bytes(),
                     );
+                } else if input.starts_with(b"wme_ac_sta\0") {
+                    out[..16].copy_from_slice(&self.wme_ac_sta);
                 } else if input.starts_with(b"chanspecs\0") {
                     let list = self.vht.as_ref().map(|v| v.list()).unwrap_or_else(|| {
                         self.wide
@@ -674,6 +683,7 @@ impl Firmware {
                 let mut ethernet = tx[8..22].to_vec();
                 ethernet.extend_from_slice(&state.dma[&body][..length]);
                 self.uplink.push(ethernet.clone());
+                self.tx_priorities.push((id, tx[22] >> 5));
                 if let Some(reply) = self.server.receive(&ethernet) {
                     self.downlink.push_back(reply);
                 }
@@ -781,6 +791,9 @@ impl Handle {
         let mut state = self.0.lock();
         operation(state.firmware.as_mut().unwrap().station.as_mut().unwrap());
         firmware_step(&mut state);
+    }
+    pub(crate) fn wme_ac_sta(&self, rows: [u8; 16]) {
+        self.change(|f| f.wme_ac_sta = rows);
     }
     pub(crate) fn keys_first(&self, value: bool) {
         self.change(|f| f.keys_first = value);
@@ -928,6 +941,12 @@ impl Handle {
             state.dma_enable,
             state.unsafe_free,
         )
+    }
+    /// Flow-create TIDs and per-packet (flow id, descriptor priority).
+    pub(crate) fn flow_priorities(&self) -> (Vec<u8>, Vec<(u16, u8)>) {
+        let state = self.0.lock();
+        let firmware = state.firmware.as_ref().unwrap().station.as_ref().unwrap();
+        (firmware.tids.clone(), firmware.tx_priorities.clone())
     }
     pub(crate) fn last_tx_alive(&self) -> bool {
         let state = self.0.lock();

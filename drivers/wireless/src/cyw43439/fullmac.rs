@@ -42,6 +42,9 @@ pub trait Fullmac: Send {
     /// Only a station's correlated link/key lifecycle calls this method.
     /// Transport completion alone must never call it or open a controlled port.
     fn set_link(&mut self, peer: Option<[u8; 6]>);
+    /// Current negotiated 802.1D-to-AC rank map (`brcmf_get_assoc_ies`).
+    /// Transports whose queueing does not consume it ignore the update.
+    fn set_ac_priority(&mut self, _ac_priority: [u8; 8]) {}
 }
 impl<T: PacketTransport> Fullmac for Runtime<T> {
     const FAMILY: Family = Family::Sdio;
@@ -79,4 +82,7 @@ impl<T: PacketTransport> Fullmac for Runtime<T> {
         Runtime::send_data(self, frame, priority)
     }
     fn set_link(&mut self, _: Option<[u8; 6]>) {}
+    fn set_ac_priority(&mut self, ac_priority: [u8; 8]) {
+        Runtime::set_ac_priority(self, ac_priority)
+    }
 }

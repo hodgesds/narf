@@ -39,6 +39,8 @@ pub struct Station<R: Fullmac> {
     operation: bool,
     /// Probe Request vendor elements currently installed in firmware.
     probe_ies: Vec<u8>,
+    /// Negotiated firmware WMM rank map for the authorized peer.
+    ac_priority: [u8; 8],
 }
 impl<R: Fullmac> core::fmt::Debug for Station<R> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -175,7 +177,19 @@ impl<R: Fullmac> Station<R> {
             power_save: false,
             operation: false,
             probe_ies: Vec::new(),
+            ac_priority: wmm::DEFAULT_AC_PRIORITY,
         })
+    }
+
+    /// Current negotiated firmware WMM rank map (`wme_ac_sta`) for the
+    /// authorized peer; absent without a connection.
+    pub fn ac_priority(&self) -> Option<[u8; 8]> {
+        self.bssid.map(|_| self.ac_priority)
+    }
+
+    fn reset_wmm(&mut self) {
+        self.ac_priority = wmm::DEFAULT_AC_PRIORITY;
+        self.runtime.set_ac_priority(self.ac_priority);
     }
 
     /// Last firmware-acknowledged ordinary station power-save policy.
@@ -583,6 +597,7 @@ impl<R: Fullmac> Station<R> {
             let deadline = narf_time::Deadline::after_ms(15000);
             let (mut associated, mut keys) = (false, !secure);
             let mut protection_verified = false;
+            let mut wmm_verified = false;
             let mut drain_batches = 0;
             loop {
                 self.check_grants(core::slice::from_ref(&grant))?;
@@ -646,8 +661,22 @@ impl<R: Fullmac> Station<R> {
                         // genuine idle fence before publishing the host port.
                         continue;
                     }
+                    if !wmm_verified {
+                        // Linux brcmf_get_assoc_ies ranks the current firmware
+                        // EDCA rows; a refused query keeps the default map.
+                        self.ac_priority =
+                            match self.tx_query(grant, "wme_ac_sta", wmm::ACPARAM_LEN).await {
+                                Ok(rows) => wmm::prioritize(&rows)?,
+                                Err(Error::Firmware(_)) => wmm::DEFAULT_AC_PRIORITY,
+                                Err(error) => return Err(error),
+                            };
+                        wmm_verified = true;
+                        // Another genuine idle fence follows this query.
+                        continue;
+                    }
                     self.check_grants(core::slice::from_ref(&grant))?;
                     self.connection = Some(grant);
+                    self.runtime.set_ac_priority(self.ac_priority);
                     self.runtime.set_link(Some(request.bssid));
                     self.bssid = Some(request.bssid);
                     return Ok(());
@@ -670,6 +699,7 @@ impl<R: Fullmac> Station<R> {
             self.mfp_verified = false;
             self.ht_verified = false;
             self.vht_verified = false;
+            self.reset_wmm();
             self.bssid = None;
             self.connection = None;
             self.runtime.set_link(None);
@@ -703,6 +733,7 @@ impl<R: Fullmac> Station<R> {
         self.mfp_verified = false;
         self.ht_verified = false;
         self.vht_verified = false;
+        self.reset_wmm();
         self.runtime.set_link(None);
         if let Some(grant) = grant {
             self.tx_command(grant, 52, &[]).await?;
@@ -794,6 +825,8 @@ mod mfp;
 mod phy;
 #[path = "station_probe_ies.rs"]
 mod probe_ies;
+#[path = "station_wmm.rs"]
+pub mod wmm;
 
 const MAX_REPLY: usize = 1502;
 

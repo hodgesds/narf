@@ -36,6 +36,8 @@ mod mfp_tests;
 mod optional_mfp_tests;
 #[path = "probe_ies_tests.rs"]
 mod probe_ies_tests;
+#[path = "wmm_tests.rs"]
+mod wmm_tests;
 
 const OWN: [u8; 6] = [2, 6, 7, 8, 9, 10];
 const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];

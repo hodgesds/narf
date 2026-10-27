@@ -74,7 +74,6 @@ ath9k	sgi40	SGI40	feature	drivers/wireless/specification/ath9k.md	577
 ath9k	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/ath9k.md	577
 ath9k	unexpanded_power_transitions	Power transitions lack individually enumerated states or operations	unknown	drivers/wireless/specification/ath9k.md	578
 brcmfmac	additional_chip_profiles	Additional CPU/RAM/chip/OTP profiles (incl. 160 MHz-capable chips; retained BCM43602 is 80 MHz)	chip	drivers/wireless/specification/brcmfmac.md	515
-brcmfmac	all_priority_queues	All-priority packet queues	feature	drivers/wireless/specification/cyw43439.md	502
 brcmfmac	ap_mode	Access Point mode	feature	drivers/wireless/specification/cyw43439.md	499
 brcmfmac	confirmed_stop_quiescence	Confirmed transport/device stop and quiescence	feature	drivers/wireless/specification/cyw43439.md	500
 brcmfmac	dma_reclamation	Safe reclamation of published native DMA	feature	drivers/wireless/specification/brcmfmac.md	518
@@ -87,7 +86,6 @@ brcmfmac	larger_flow_budget	Larger native flow budgets	feature	drivers/wireless/
 brcmfmac	monitor_mode	Monitor mode	feature	drivers/wireless/specification/cyw43439.md	499
 brcmfmac	native_80211_rx	Native 802.11 receive	feature	drivers/wireless/specification/brcmfmac.md	516
 brcmfmac	native_rx_metadata	Native receive metadata	feature	drivers/wireless/specification/brcmfmac.md	517
-brcmfmac	negotiated_wmm_reporting	Current negotiated firmware WMM-state reporting	feature	drivers/wireless/specification/cyw43439.md	502
 brcmfmac	nonzero_descriptor_prefix	Nonzero native descriptor-prefix geometry	feature	drivers/wireless/specification/brcmfmac.md	514
 brcmfmac	optional_pmf	Optional PMF with MFPC AP omitting response RSNE: native negotiated-state proof missing	feature	drivers/wireless/specification/brcmfmac.md	308
 brcmfmac	p2p_mode	P2P mode	feature	drivers/wireless/specification/cyw43439.md	499
@@ -104,14 +102,12 @@ brcmfmac	virtual_interfaces	Additional virtual interfaces	feature	drivers/wirele
 brcmfmac	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/cyw43439.md	500
 brcmfmac	wpa3_sae_offload	WPA3-Personal / SAE firmware offload	feature	drivers/wireless/specification/cyw43439.md	498
 cyw43439	additional_host_ports	Additional SDIO/gSPI platform or host ports	chip	drivers/wireless/specification/cyw43439.md	555
-cyw43439	all_priority_queues	All-priority packet queues	feature	drivers/wireless/specification/cyw43439.md	502
 cyw43439	ap_mode	Access Point mode	feature	drivers/wireless/specification/cyw43439.md	499
 cyw43439	confirmed_stop_quiescence	Confirmed transport/device stop and quiescence	feature	drivers/wireless/specification/cyw43439.md	500
 cyw43439	fast_bss_transition	Fast BSS Transition (FT)	feature	drivers/wireless/specification/cyw43439.md	501
 cyw43439	gtk_rekey_offload	GTK rekey offload with host-owned key/event lifecycle	feature	drivers/wireless/specification/cyw43439.md	501
 cyw43439	host_bus_runtime_pm	Host-bus runtime power management	feature	drivers/wireless/specification/cyw43439.md	272
 cyw43439	monitor_mode	Monitor mode	feature	drivers/wireless/specification/cyw43439.md	499
-cyw43439	negotiated_wmm_reporting	Current negotiated firmware WMM-state reporting	feature	drivers/wireless/specification/cyw43439.md	502
 cyw43439	optional_pmf	Optional PMF with MFPC AP omitting response RSNE: native negotiated-state proof missing	feature	drivers/wireless/specification/cyw43439.md	503
 cyw43439	p2p_mode	P2P mode	feature	drivers/wireless/specification/cyw43439.md	499
 cyw43439	pmksa_pmkid_cache	PMKSA / PMKID caching	feature	drivers/wireless/specification/cyw43439.md	501
