@@ -1,10 +1,11 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.7** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.8** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
-> bounds/flush discipline landed — see §9).
+> bounds/flush discipline landed — see §9; forcewake domains
+> landed — see §10).
 >
 > Clean-room driver for Intel integrated graphics from Tiger Lake
 > through Meteor Lake. **No GPL Linux `i915` / `xe` source
@@ -357,3 +358,76 @@ table entry, `phys | PRESENT`) and PDP0–PDP2 stay zero — the
 encoding `attach_ppgtt` writes (§8). It is a single patch
 site in `intel_gpu_rcs` if bring-up shows otherwise.
 
+
+## 10. Forcewake domains (Stage 5 — `intel_gpu_forcewake`, #1013)
+
+Register access under GT power gating. Compiled only under
+the gpu crate's `intel` feature. Forcewake is the driver's
+lever on the per-block power gates that sit in front of most
+GT registers; it is distinct from the display power wells
+(§7's PG1/PG2 machinery), which power the display block and
+take no forcewake. Sources: the i915 uncore layer
+(`intel_uncore.c`, `i915_reg.h`) — the authoritative
+restatement of the PRM Vol. 12 forcewake registers.
+
+Register map (Gen9-named, used for the Gen11/Gen12 domain
+table): request registers `FORCEWAKE_BLITTER` = 0xA188 (the
+legacy FORCEWAKE_MT register), `FORCEWAKE_MEDIA` = 0xA270,
+`FORCEWAKE_RENDER` = 0xA278; ack registers render 0x0D84,
+media 0x0D88, blitter 0x130044. The request bit is
+`FORCEWAKE_KERNEL` = BIT(0); BIT(1) is another requestor's
+(`FORCEWAKE_USER`). Writes are masked (value in the low
+half, per-bit write mask in the high half), so one requestor
+never disturbs another's bits.
+
+Public interface:
+
+- `Forcewake::new()` — per-domain hold counts (render,
+  blitter, media), no window owned; every operation takes
+  the caller's `&M: MmioWindow`, so the manager composes
+  with any register path (engine window, production
+  `BarWindow`, fixture).
+- `acquire(regs, domain)` / `release(regs, domain)` —
+  refcounted holds. Only the 0→1 transition programs the
+  request (masked-enable + ack wait); only the 1→0
+  transition programs the clear (masked-disable + ack-clear
+  wait). `with_domain(regs, domain, f)` is the scoped form.
+- `sanitize(regs)` — probe-time reset mirroring i915's
+  `fw_domain_reset`: masked-clear of all request bits in
+  every domain, counts zeroed, no ack waits (a domain's
+  well may not exist on fused-off parts).
+
+Invariants:
+
+- A domain is never dropped under another holder: nested
+  acquires generate exactly one hardware request, and the
+  clear is programmed only at the last release.
+- No leaked hold on timeout: if the ack never sets — after
+  the one clear→set re-kick i915 documents for the
+  lost-ack quirk (the driver's request colliding with the
+  hardware's own wake requests) — acquire rolls the
+  request back off and errors with the count still zero.
+- An ack-clear timeout on release is reported, but the
+  hold is dropped: the request is off and the hardware is
+  merely slow to gate (the safe direction).
+- Ack waits are poll-counted (`ACK_POLL_BUDGET` = 100 000
+  polls ≫ i915's `FORCEWAKE_ACK_TIMEOUT_MS` = 50 at
+  silicon MMIO-read cost), never wall-clock deadlines, so
+  fixtures that model ack latency in polls are
+  deterministic under TCG.
+
+Composition: the RCS production glue
+(`intel_gpu_rcs::submit_dwords`) carries a `Forcewake` in
+the default engine's state, sanitized at attach, and runs
+each submission inside a render-domain hold — the RCS0
+register conversation is the GT access the PRM gates.
+`poll_default_completions` takes no hold (the CSB lives in
+host memory, not a gated register); probe's presence reads
+are always-on-block reads and stay unwrapped. Deliberate
+divergence from i915: the clear is programmed immediately
+at the last release rather than deferred ~1 ms by timer —
+a host-OS batching optimisation, not hardware protocol.
+
+Out of scope here: the per-engine media sub-domains
+(VDBOX/VEBOX) belong to the media-engines work (#1022);
+RC6 residency policy builds on these holds (#1014).
