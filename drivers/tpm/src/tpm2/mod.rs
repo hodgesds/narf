@@ -74,6 +74,10 @@ pub const TPM_CC_POLICY_PCR: u32 = 0x0000_019F;
 // provisioning probe composed in drivers/platform.
 pub const TPM_CC_QUOTE: u32 = 0x0000_0158;
 pub const TPM_CC_READ_PUBLIC: u32 = 0x0000_0169;
+// Sealing-minimum completion (#1002): the two command codes the
+// suspend anchor's conversation still had no constants for.
+pub const TPM_CC_NV_INCREMENT: u32 = 0x0000_0134;
+pub const TPM_CC_POLICY_GET_DIGEST: u32 = 0x0000_0189;
 
 // ── TPM_SU values — Part 2 §6.9 ─────────────────────────────────────
 
@@ -117,9 +121,27 @@ pub const TPM_RC_SUCCESS: u32 = 0x0000_0000;
 pub const TPM_RC_BAD_TAG: u32 = 0x0000_001E;
 pub const TPM_RC_INITIALIZE: u32 = 0x0000_0100;
 pub const TPM_RC_FAILURE: u32 = 0x0000_0101;
+/// Value check on a command parameter failed (Part 2 §6.6,
+/// format-one base; a parameter number may be OR-ed in).
+pub const TPM_RC_VALUE: u32 = 0x0000_0184;
+/// A handle references no loaded object / session / NV index
+/// (Part 2 §6.6, format-one base; a handle number may be OR-ed
+/// in).
+pub const TPM_RC_HANDLE: u32 = 0x0000_028B;
+pub const TPM_RC_COMMAND_CODE: u32 = 0x0000_0143;
 pub const TPM_RC_DISABLED: u32 = 0x0000_0120;
 pub const TPM_RC_LOCKOUT: u32 = 0x0000_0921;
 pub const TPM_RC_RETRY: u32 = 0x0000_0922;
+/// Authorization by policy session failed: the session's
+/// policyDigest does not match the object's `authPolicy`
+/// (Part 2 §6.6, warning class). The unseal refusal the suspend
+/// design's PCR binding stands on (design §8.3).
+pub const TPM_RC_POLICY_FAIL: u32 = 0x0000_099D;
+/// NV index is defined but has never been written / incremented:
+/// `TPMA_NV_WRITTEN` is CLEAR (Part 2 §6.6; Part 3 §31.13).
+pub const TPM_RC_NV_UNINITIALIZED: u32 = 0x0000_014A;
+/// NV index is already defined (Part 2 §6.6).
+pub const TPM_RC_NV_DEFINED: u32 = 0x0000_014B;
 
 // ── Well-known handles ───────────────────────────────────────────────
 
