@@ -15,6 +15,7 @@ pub mod ccmp;
 pub mod eapol;
 pub mod iface;
 pub mod mfp;
+pub mod mgmt_defrag;
 pub mod mlme;
 pub mod nl80211;
 pub mod packet_key;

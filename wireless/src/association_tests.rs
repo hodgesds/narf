@@ -279,7 +279,7 @@ fn smoke_shared_join_spp_amsdu_opt_in_patches_request_rsne_before_tx() -> TestRe
         return TestResult::Fail("WPA2 plan refused the SPP A-MSDU opt-in");
     }
     let mut expected = before.clone();
-    let at = expected.len() - 2;
+    let at = expected.len() - 1;
     expected[at] |= 0x04; // bit10 lives in the second capability octet.
     if plan.rsn_body() != Some(body.clone())
         || plan.assoc != expected
