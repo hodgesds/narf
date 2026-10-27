@@ -176,8 +176,11 @@ fn configuration(profile: Profile) -> Configuration {
         } else {
             0
         }) | match profile.ltr_delay_us {
+            // fw/api/system.h SOC_FLAGS_LTR_APPLY_DELAY_{200,2500,1820}
+            // in bits 2..3 (fw/init.c::iwl_set_soc_latency).
             200 => 4,
             2500 => 8,
+            1820 => 12,
             _ => 0,
         }
     };

@@ -2,7 +2,7 @@
 //!
 //! Targets:
 //!   - AX200  (8086:2723)  — Cyclone Peak, Qu/QuZ MAC + HR RF
-//!   - AX201  (8086:02f0/43f0/a0f0/7df0) — same as AX200, different SKU
+//!   - AX201  (8086:02f0/06f0/34f0/3df0/4df0/43f0/a0f0/7df0) — same as AX200, different SKU
 //!   - AX210  (8086:2725)  — Typhoon Peak, Ty MAC + GF RF (gen3)
 //!   - AX211  (8086:51f0/54f0/7e40) — So/Ma MAC + GF/GF4 RF (gen3)
 //!   - BE200  (8086:272b)  — Bz MAC + GF/GF4/FM RF (gen3, Wi-Fi 7)
@@ -937,8 +937,9 @@ pub fn chip_config_for_pci_id(vid: u16, did: u16) -> Option<ChipConfig> {
             api_min: 100,
             api_prefix: "",
         },
-        // AX201 family — same MAC/RF as AX200, multiple SKUs.
-        0x02f0 | 0x43f0 | 0xa0f0 | 0x7df0 => ChipConfig {
+        // AX201 family — same MAC/RF as AX200, multiple SKUs. Linux
+        // pcie/drv.c "Qu devices" plus the identification-only 0x7df0.
+        0x02f0 | 0x06f0 | 0x34f0 | 0x3df0 | 0x4df0 | 0x43f0 | 0xa0f0 | 0x7df0 => ChipConfig {
             vid,
             did,
             display_name: "AX201",
@@ -1525,6 +1526,10 @@ pub fn register() {
 const PCI_DIDS: &[(u16, &str)] = &[
     (0x2723, "iwlwifi-2723"),
     (0x02f0, "iwlwifi-02f0"),
+    (0x06f0, "iwlwifi-06f0"),
+    (0x34f0, "iwlwifi-34f0"),
+    (0x3df0, "iwlwifi-3df0"),
+    (0x4df0, "iwlwifi-4df0"),
     (0x43f0, "iwlwifi-43f0"),
     (0xa0f0, "iwlwifi-a0f0"),
     (0x7df0, "iwlwifi-7df0"),
