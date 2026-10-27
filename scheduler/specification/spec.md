@@ -274,7 +274,14 @@ third task is restored to its ordinary validated path and also declines. That
 same fixed root may begin another exact handoff, but the batch is capped at 64
 target-to-root returns; its next yield then must reach the executor. This
 amortizes executor re-entry while retaining a finite fairness and RCU-
-quiescence progress bound. The off-queue root is pinned by its in-flight
+quiescence progress bound. An exiting direct target may use the same exact-root
+return, with the same runnable, hint and uniform-metadata checks. It poisons its
+saved context before publishing completion and saves its abandoned exit only
+into per-CPU dead scratch storage. After the final switch the return consumer
+destroys the abandoned poll's owning waker before releasing the target claim.
+The completed resident slot remains queued for ordinary executor retirement
+and RCU reclamation. A declined terminal return follows the original executor
+continuation. The off-queue root is pinned by its in-flight
 executor poll, the exact root pointer plus `WakeCell` identity substitutes for
 a queue lookup, and its borrow-only wake-cell pointer is published only after the
 task-owned `Arc`, cleared before current-task unpublication, and remains backed

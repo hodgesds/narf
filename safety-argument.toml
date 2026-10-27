@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-6"
-prompt_hash = "91ad3c7c8ccb1e77e9c0d7b694c4bc5ede48792cd01bf2e98790a342fec1b5af"
+prompt_hash = "4f90e67227e60f894dcadd05ef88dac4aaeed36d563318d94c7de3a6a113f381"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -1985,3 +1985,13 @@ argument = "TPM attestation (#945) touches the TCB in exactly one place: the mea
 ref = "security-model/specification/spec.md#L42"
 agent = "Anthropic Muse Wonder"
 argument = "The dcache folds ASCII case in its bucket hash and name comparisons only for directories that declare case-insensitive names through the new DirOps hook dcache_case_insensitive (default false, byte-exact as before). Folding is a pure function of the directory identity and the name, applied identically by lookup_token, cache publication, mutation invalidation, and fast-path matching, so the per-chain generation/active-count protocol from the existing mutation argument is unchanged: every alias the filesystem itself equates now shares one chain, and a guard taken under any spelling unhashes all of them before the backing namespace changes, restoring the guard's documented contract for FAT and the lookup aliasing behaviour for exfat. Case-sensitive directories observe no change in hash, comparison, or invalidation behaviour. No new allocation, unsafe operation, lock, filesystem callback, capability, or mapping authority is introduced; filesystem/ and drivers/ are outside the TCB. A deterministic regression stages a negative cached under one case spelling, creates under another, and unlinks under the first, asserting the stale negative and the stale positive are both torn down."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+agent = "OpenAI Codex GPT-6"
+argument = "Terminal direct handoff stays inside the existing scheduler TCB and reuses the ordinary exact-root return checks: a live pinned root, its own runnable flag, no competing urgent task, homogeneous metadata and the 64-return fairness bound. Exit poisons the target context before publishing completion, and the final switch writes only dead per-CPU scratch. The completed continuation is never resumed. Declines retain the original executor return; ordinary slot retirement and RCU reclamation remain authoritative."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "OpenAI Codex GPT-6"
+argument = "The exact root return retains the existing address-space, TLS, kernel-stack, FPU and architecture domain restoration before the root resumes. After the final switch, the return consumer still holds the target's exclusive direct claim and Arc-backed wake cell while it destroys the abandoned poll waker exactly once. Only then is the resident completed target released for ordinary reaping. No task stack or address-space owner is freed on the abandoned target stack, and no callback or context switch occurs with an urgent-hint lock held."

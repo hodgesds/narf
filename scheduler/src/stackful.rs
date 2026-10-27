@@ -1407,7 +1407,15 @@ fn complete_direct_return(cpu: usize) {
     } else {
         // SAFETY: the cell's stackful pointer remains live until adapter drop;
         // the direct claim is still held at this point.
-        unsafe { (&*task).completed.load(Ordering::Acquire) }
+        let task = unsafe { &*task };
+        let completed = task.completed.load(Ordering::Acquire);
+        if completed {
+            // A terminal direct return abandons the inner poll's Context.
+            // The final switch has completed, so its owning waker can now be
+            // destroyed before the resident slot is released for reaping.
+            task.drop_active_poll_waker();
+        }
+        completed
     };
     crate::release_direct_handoff_target(&cell, completed);
 }
@@ -4081,6 +4089,13 @@ pub unsafe fn exit_current_stackful() -> ! {
                 let scratch = EXIT_SCRATCH_CTX.inner[cpu].get();
                 if direct_handoff_active(cpu) {
                     narf_lib::sync::without_interrupts(|| {
+                        // A completed target has no continuation to resume.
+                        // Reuse the ordinary bounded root-return checks, but
+                        // save only into dead scratch storage so ctx remains
+                        // poisoned. Success never returns to this exit frame.
+                        if try_direct_return_to_root(cpu, p, scratch) {
+                            panic!("completed direct target resumed from exit scratch");
+                        }
                         // SAFETY: p is the completed live direct target.
                         finish_direct_handoff(cpu, p, false);
                         // SAFETY: exec_ctx non-null; root executor populated it.
@@ -7924,6 +7939,180 @@ pub mod tests {
         }
         TestResult::Pass
     }
+
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    enum DirectExitCase {
+        RunnableRoot,
+        ParkedRoot,
+        ThirdTaskHint,
+        HigherClass,
+    }
+
+    fn direct_exit_fixture(case: DirectExitCase) -> TestResult {
+        use alloc::sync::Arc;
+        use core::sync::atomic::AtomicBool;
+        use narf_capabilities::{Cap, Grant};
+        use narf_lib::sync::IrqSafeSpinLock;
+
+        struct State {
+            target_waker: IrqSafeSpinLock<Option<Waker>>,
+            root_waker: IrqSafeSpinLock<Option<Waker>>,
+            target: AtomicPtr<KernelTask>,
+            observer_ran: AtomicBool,
+            checked: AtomicBool,
+            failed: AtomicBool,
+        }
+        crate::__reset_queues_for_test();
+        let cap: Cap<crate::SchedPolicy, Grant> = Cap::bootstrap();
+        if crate::install_scheduler(&cap, crate::ClassScheduler).is_err() {
+            return TestResult::Fail("install_scheduler(Class) failed");
+        }
+        let state = Arc::new(State {
+            target_waker: IrqSafeSpinLock::new(None),
+            root_waker: IrqSafeSpinLock::new(None),
+            target: AtomicPtr::new(core::ptr::null_mut()),
+            observer_ran: AtomicBool::new(false),
+            checked: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+        });
+        let options = crate::StackfulOptions {
+            no_preempt: true,
+            ..Default::default()
+        };
+        let child = state.clone();
+        let target = crate::spawn_stackful_with_options(
+            core::future::poll_fn(move |cx| {
+                // Real plain kernel continuations model eligible user tasks;
+                // only their cached direct-eligibility opt-in is test-specific.
+                let cell = crate::scheduler_wake_cell(cx.waker()).expect("target wake cell");
+                cell.direct_eligible.store(true, Ordering::Release);
+                if child.target.load(Ordering::Acquire).is_null() {
+                    child.target.store(
+                        CURRENT_STACKFUL_TASK.inner[this_cpu()].load(Ordering::Acquire),
+                        Ordering::Release,
+                    );
+                    *child.target_waker.lock() = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+                let observer = child.clone();
+                let observer_id = crate::spawn_with_spec(
+                    async move {
+                        observer.observer_ran.store(true, Ordering::Release);
+                        if case != DirectExitCase::RunnableRoot {
+                            let wake = observer.root_waker.lock().take();
+                            if let Some(wake) = wake {
+                                wake.wake();
+                            }
+                        }
+                    },
+                    crate::TaskSpec {
+                        class: if case == DirectExitCase::HigherClass {
+                            crate::SchedClass::Interactive
+                        } else {
+                            crate::SchedClass::Default
+                        },
+                        ..crate::TaskSpec::unthrottled()
+                    },
+                );
+                if case == DirectExitCase::ThirdTaskHint {
+                    crate::hint_urgent_next(observer_id.raw());
+                }
+                // SAFETY: this is the current own-stack task. Its inner poll
+                // owns an active waker, and exit must abandon that continuation.
+                unsafe { exit_current_stackful() }
+            }),
+            options,
+        );
+        let parent = state.clone();
+        crate::spawn_stackful_with_options(
+            core::future::poll_fn(move |cx| {
+                let cell = crate::scheduler_wake_cell(cx.waker()).expect("root wake cell");
+                cell.direct_eligible.store(true, Ordering::Release);
+                *parent.root_waker.lock() = Some(cx.waker().clone());
+                let wake = parent.target_waker.lock().take().expect("target armed");
+                crate::wake_preempt_task(wake, target.raw());
+                if case == DirectExitCase::ParkedRoot {
+                    // Deliberately leave the root's runnable flag clear.
+                    // SAFETY: this is the current task on its own stack, with
+                    // its executor continuation pinned across the switch.
+                    unsafe { yield_current_stackful() };
+                } else if !cooperative_yield() {
+                    parent.failed.store(true, Ordering::Release);
+                }
+                let observer_ran = parent.observer_ran.load(Ordering::Acquire);
+                if observer_ran == (case == DirectExitCase::RunnableRoot) {
+                    parent.failed.store(true, Ordering::Release);
+                }
+                if case == DirectExitCase::RunnableRoot {
+                    let target = parent.target.load(Ordering::Acquire);
+                    // SAFETY: the completed target remains resident on this
+                    // CPU's pinned queue; no executor can reap it during the
+                    // immediately resumed root's uninterrupted continuation.
+                    let target = unsafe { &*target };
+                    #[cfg(target_arch = "x86_64")]
+                    let poisoned = target.ctx.rip == 0;
+                    #[cfg(target_arch = "aarch64")]
+                    let poisoned = target.ctx.pc == 0;
+                    if !target.completed.load(Ordering::Acquire)
+                        || target.active_poll_waker_live.load(Ordering::Acquire)
+                        || !poisoned
+                    {
+                        parent.failed.store(true, Ordering::Release);
+                    }
+                }
+                parent.checked.store(true, Ordering::Release);
+                Poll::Ready(())
+            }),
+            options,
+        );
+        let saved = USE_OWN_STACK.swap(true, Ordering::AcqRel);
+        let entries = direct_handoff_count();
+        let returns = direct_return_count();
+        crate::run_until_empty();
+        USE_OWN_STACK.store(saved, Ordering::Release);
+        let entered = direct_handoff_count() > entries;
+        let returned = direct_return_count() > returns;
+        let failed = state.failed.load(Ordering::Acquire);
+        let checked = state.checked.load(Ordering::Acquire);
+        let observer_ran = state.observer_ran.load(Ordering::Acquire);
+        crate::__reset_queues_for_test();
+        if !entered || !checked || !observer_ran {
+            TestResult::Fail("direct-exit fixture did not complete its handoff and observer")
+        } else if failed || returned != (case == DirectExitCase::RunnableRoot) {
+            TestResult::Fail("terminal handoff violated root eligibility, poison, or waker cleanup")
+        } else {
+            TestResult::Pass
+        }
+    }
+
+    fn smoke_direct_exit_returns_to_runnable_root() -> TestResult {
+        direct_exit_fixture(DirectExitCase::RunnableRoot)
+    }
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_direct_exit_returns_to_runnable_root
+    );
+
+    fn smoke_direct_exit_keeps_root_parked() -> TestResult {
+        direct_exit_fixture(DirectExitCase::ParkedRoot)
+    }
+    kernel_test_in!("scheduler/stackful", smoke_direct_exit_keeps_root_parked);
+
+    fn smoke_direct_exit_preserves_third_task_hint() -> TestResult {
+        direct_exit_fixture(DirectExitCase::ThirdTaskHint)
+    }
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_direct_exit_preserves_third_task_hint
+    );
+
+    fn smoke_direct_exit_defers_to_higher_class() -> TestResult {
+        direct_exit_fixture(DirectExitCase::HigherClass)
+    }
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_direct_exit_defers_to_higher_class
+    );
 
     fn smoke_direct_return_defers_to_new_higher_class() -> TestResult {
         use alloc::sync::Arc;
