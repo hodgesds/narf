@@ -100,7 +100,7 @@ impl SealMode {
     }
 
     fn from_code(code: u8) -> Option<Self> {
-        match self {
+        match code {
             0 => Some(SealMode::Image),
             1 => Some(SealMode::Anchor),
             _ => None,
@@ -220,6 +220,20 @@ pub struct SealCtx<'a> {
     sealed_anchor: bool,
 }
 
+/// Manual and redacting on purpose: this context holds the SMK and
+/// SMS by reference. Only the hook's name and which modes it has
+/// sealed are printable — never key material, the image id, or the
+/// sealed sink.
+impl fmt::Debug for SealCtx<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SealCtx")
+            .field("name", &self.name)
+            .field("sealed_image", &self.sealed_image)
+            .field("sealed_anchor", &self.sealed_anchor)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> SealCtx<'a> {
     pub(crate) fn new(
         name: &'a str,
@@ -310,6 +324,19 @@ pub enum BlobOutcome {
     Invalid,
 }
 
+/// Manual and redacting on purpose: `Restored` carries verified
+/// plaintext state, so only its byte length is printable — never
+/// the bytes.
+impl fmt::Debug for BlobOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Restored(bytes) => write!(f, "Restored(<{} bytes>)", bytes.len()),
+            Self::Missing => f.write_str("Missing"),
+            Self::Invalid => f.write_str("Invalid"),
+        }
+    }
+}
+
 /// Service-owned unsealing context, one per hook per unseal fan-out.
 /// Outcomes are staged (already AEAD-verified, or already known to
 /// have failed) before the fan-out runs any callback — see the
@@ -317,6 +344,17 @@ pub enum BlobOutcome {
 pub struct UnsealCtx {
     image: Option<BlobOutcome>,
     anchor: Option<BlobOutcome>,
+}
+
+/// Delegates to [`BlobOutcome`]'s redacting `Debug`, so no restored
+/// plaintext can print through this context either.
+impl fmt::Debug for UnsealCtx {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnsealCtx")
+            .field("image", &self.image)
+            .field("anchor", &self.anchor)
+            .finish()
+    }
 }
 
 impl UnsealCtx {

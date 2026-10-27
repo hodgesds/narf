@@ -27,6 +27,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -310,9 +311,18 @@ fn blob_store_offset(store: &MemImageStore, region_len: usize, name: &str) -> u6
 // ── Consumer fixtures (the design's named first customers) ───────────
 
 /// Ordered event log shared by the hooks of one test.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct EventLog {
     events: IrqSafeSpinLock<Vec<String>>,
+}
+
+// Manual: `IrqSafeSpinLock` has no `Default` impl.
+impl Default for EventLog {
+    fn default() -> Self {
+        Self {
+            events: IrqSafeSpinLock::new(Vec::new()),
+        }
+    }
 }
 
 impl EventLog {
@@ -456,10 +466,10 @@ struct FixtureHook {
 
 #[derive(Debug)]
 enum Behaviour {
-    SealImage(Vec<u8>),
-    SealNothing,
-    SealFail,
-    SealOversize,
+    Image(Vec<u8>),
+    Nothing,
+    Fail,
+    Oversize,
 }
 
 impl SuspendStateHook for FixtureHook {
@@ -474,13 +484,13 @@ impl SuspendStateHook for FixtureHook {
     fn seal(&self, ctx: &mut SealCtx) -> Result<(), SealError> {
         self.log.push(&alloc::format!("seal:{}", self.name));
         match &self.behaviour {
-            Behaviour::SealImage(bytes) => {
+            Behaviour::Image(bytes) => {
                 ctx.seal_image(bytes)?;
                 Ok(())
             }
-            Behaviour::SealNothing => Ok(()),
-            Behaviour::SealFail => Err(SealError::Refused("fixture seal failure")),
-            Behaviour::SealOversize => {
+            Behaviour::Nothing => Ok(()),
+            Behaviour::Fail => Err(SealError::Refused("fixture seal failure")),
+            Behaviour::Oversize => {
                 let big = alloc::vec![0xABu8; MAX_HOOK_STATE_LEN + 1];
                 ctx.seal_image(&big)?;
                 Ok(())
@@ -522,8 +532,9 @@ fn fixture_hook(
 fn smoke_hook_registry_replaces_by_name() -> TestResult {
     __reset_hooks_for_test();
     let log = Arc::new(EventLog::default());
-    let first = fixture_hook("dup", false, Behaviour::SealNothing, log.clone());
-    let second = fixture_hook("dup", false, Behaviour::SealNothing, log.clone());
+    let first = fixture_hook("dup", false, Behaviour::Nothing, log.clone());
+    let second: Arc<dyn SuspendStateHook> =
+        fixture_hook("dup", false, Behaviour::Nothing, log.clone());
     register_suspend_state_hook(first.clone());
     register_suspend_state_hook(second.clone());
     if suspend_state_hook_count() != 1 {
@@ -731,10 +742,10 @@ fn smoke_hook_seal_failure_aborts_suspend() -> TestResult {
     let good = fixture_hook(
         "good",
         false,
-        Behaviour::SealImage(alloc::vec![7, 7, 7]),
+        Behaviour::Image(alloc::vec![7, 7, 7]),
         log.clone(),
     );
-    let bad = fixture_hook("bad", false, Behaviour::SealFail, log.clone());
+    let bad = fixture_hook("bad", false, Behaviour::Fail, log.clone());
     let hooks: Vec<Arc<dyn SuspendStateHook>> = vec![good, bad];
     let image = pattern_image(1024);
     let mut store = MemImageStore::new(STORE_LEN);
@@ -757,7 +768,7 @@ kernel_test_in!("power", smoke_hook_seal_failure_aborts_suspend);
 fn smoke_hook_oversize_state_refused() -> TestResult {
     let (mut svc, _anchor) = enrolled_service();
     let log = Arc::new(EventLog::default());
-    let big = fixture_hook("big", false, Behaviour::SealOversize, log.clone());
+    let big = fixture_hook("big", false, Behaviour::Oversize, log.clone());
     let hooks: Vec<Arc<dyn SuspendStateHook>> = vec![big];
     let image = pattern_image(64);
     let mut store = MemImageStore::new(STORE_LEN);
@@ -783,10 +794,10 @@ fn smoke_hook_missing_blob_is_first_class() -> TestResult {
     let present = fixture_hook(
         "present",
         false,
-        Behaviour::SealImage(alloc::vec![1, 2]),
+        Behaviour::Image(alloc::vec![1, 2]),
         log.clone(),
     );
-    let late = fixture_hook("late", false, Behaviour::SealNothing, log.clone());
+    let late = fixture_hook("late", false, Behaviour::Nothing, log.clone());
     let image = pattern_image(1024);
     let mut store = MemImageStore::new(STORE_LEN);
     let seal_hooks: Vec<Arc<dyn SuspendStateHook>> = vec![present.clone()];
