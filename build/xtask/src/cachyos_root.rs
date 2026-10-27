@@ -53,6 +53,11 @@ pub struct Args {
     #[command(flatten)]
     pub build: super::BuildArgs,
 
+    /// Boot this prebuilt kernel instead of rebuilding the shared target
+    /// artifact. Firmware is still packed from the selected build options.
+    #[arg(long, value_name = "ELF")]
+    pub prebuilt: Option<PathBuf>,
+
     /// Boot `narf.disks=root-rw` (the real root is mounted writable, no
     /// tmpfs overlay) on a fresh scratch copy of the image.
     #[arg(long)]
@@ -316,8 +321,36 @@ fn boot_and_login(args: &Args) -> Result<()> {
     super::configure_systemd_pid1_build(&mut build, false);
     super::add_passthrough_firmware(&mut build);
     let root = super::workspace_root()?;
-    let out_dir = super::cargo_build(&build, &root)?;
-    let kernel = out_dir.join(&build.package);
+    let (kernel, out_dir) = match &args.prebuilt {
+        Some(path) => {
+            let kernel = path
+                .canonicalize()
+                .with_context(|| format!("open prebuilt kernel {}", path.display()))?;
+            if !kernel.is_file() {
+                bail!(
+                    "prebuilt kernel is not a regular file: {}",
+                    kernel.display()
+                );
+            }
+            let out_dir = kernel
+                .parent()
+                .context("prebuilt kernel has no parent")?
+                .to_path_buf();
+            (kernel, out_dir)
+        }
+        None => {
+            let out_dir = super::cargo_build(&build, &root)?;
+            (out_dir.join(&build.package), out_dir)
+        }
+    };
+    let digest: String = sha256_file(&kernel)?
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    println!(
+        "xtask cachyos-root-smoke: kernel {} SHA-256 {digest}",
+        kernel.display()
+    );
     // Firmware the display needs before the root mounts (a passed-through
     // GPU) arrives as the initramfs.
     let firmware = super::initramfs_firmware_entries(&build, &root)?;

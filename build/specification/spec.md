@@ -70,6 +70,10 @@ and CI compiler-cache integration.
 - `cargo xtask run --arch=x86_64 [--release]` — build + QEMU boot. Optimized
   builds strip debug-only ELF sections by default while retaining ordinary
   symbols; `--debug` retains full debuginfo for GDB and crash diagnosis.
+- `cargo xtask cachyos-root-smoke --prebuilt ELF ...` boots an explicitly
+  selected regular kernel file without rebuilding the shared target artifact.
+  It reports the selected path and SHA-256. Firmware initramfs construction
+  still uses the build options; the caller must supply a compatible kernel.
 - `XTASK_STAGE_BIN=/host/path[:guest/path] cargo xtask run-interactive ...`
   adds one executable host file to the generated initramfs. With no guest path
   it is installed as `/usr/bin/<basename>`, and the boot shell searches
