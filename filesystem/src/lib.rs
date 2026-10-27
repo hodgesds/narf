@@ -2268,6 +2268,27 @@ pub trait DirOps: Send + Sync {
         false
     }
 
+    /// Whether this directory's names are case-insensitive: two names
+    /// that differ only in letter case denote the same entry, as on FAT
+    /// and exfat.
+    ///
+    /// The dcache keys and compares names byte-exactly by default. A
+    /// directory whose lookups equate case variants MUST return `true`
+    /// when it also returns `true` from [`DirOps::rcu_walkable`], so the
+    /// dcache folds ASCII case in its bucket hash and name comparisons:
+    /// every case spelling of a name then shares one bucket and one
+    /// dentry, and a [`PathMutationGuard`] taken under any spelling
+    /// unhashes every alias, as the guard's contract requires. Folding
+    /// is ASCII-only, matching FAT's `eq_ignore_ascii_case` comparison;
+    /// a filesystem with a wider equivalence (exfat's upcase table)
+    /// still folds safely, because ASCII case equality implies equality
+    /// under its own comparison, while wider aliases simply miss the
+    /// cache and take the reference walk. This method must be wait-free
+    /// and side-effect-free, like [`DirOps::rcu_walkable`].
+    fn dcache_case_insensitive(&self) -> bool {
+        false
+    }
+
     /// Resolve a single name component. Returns `None` if absent.
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>>;
 

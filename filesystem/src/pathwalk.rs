@@ -195,17 +195,33 @@ fn directory_key(directory: &dyn DirOps) -> (usize, u64, u64) {
     directory.dcache_identity()
 }
 
-fn hash(directory: (usize, u64, u64), name: &str) -> usize {
+fn hash(directory: (usize, u64, u64), name: &str, fold_case: bool) -> usize {
     let mut value = (directory.0 as u64) ^ 0xcbf2_9ce4_8422_2325;
     value ^= directory.1;
     value = value.wrapping_mul(0x100_0000_01b3);
     value ^= directory.2;
     value = value.wrapping_mul(0x100_0000_01b3);
     for byte in name.bytes() {
+        let byte = if fold_case {
+            byte.to_ascii_lowercase()
+        } else {
+            byte
+        };
         value ^= u64::from(byte);
         value = value.wrapping_mul(0x100_0000_01b3);
     }
     value as usize % DENTRY_BUCKET_COUNT
+}
+
+/// Name comparison for dcache keys: byte-exact, unless the directory
+/// declares case-insensitive names, in which case ASCII case folds —
+/// mirroring the equivalence the filesystem's own lookup applies.
+fn names_equal(fold_case: bool, cached: &str, name: &str) -> bool {
+    if fold_case {
+        cached.eq_ignore_ascii_case(name)
+    } else {
+        cached == name
+    }
 }
 
 /// Begin changing `names` in an RCU-walkable directory.
@@ -215,6 +231,7 @@ fn hash(directory: (usize, u64, u64), name: &str) -> usize {
 /// directory. Unrelated hash chains remain available to RCU readers.
 pub fn begin_path_mutation(parent: &dyn DirOps, names: &[&str]) -> PathMutationGuard {
     let parent_key = directory_key(parent);
+    let fold_case = parent.dcache_case_insensitive();
     let mut buckets = if names.is_empty() {
         Bitmap::new_full()
     } else {
@@ -222,7 +239,7 @@ pub fn begin_path_mutation(parent: &dyn DirOps, names: &[&str]) -> PathMutationG
     };
     if !names.is_empty() {
         for name in names {
-            buckets.set(hash(parent_key, name));
+            buckets.set(hash(parent_key, name, fold_case));
         }
     }
 
@@ -235,7 +252,7 @@ pub fn begin_path_mutation(parent: &dyn DirOps, names: &[&str]) -> PathMutationG
         }
     } else {
         for name in names {
-            invalidate_bucket(parent, Some(name), hash(parent_key, name));
+            invalidate_bucket(parent, Some(name), hash(parent_key, name, fold_case));
         }
     }
     PathMutationGuard { buckets }
@@ -262,7 +279,11 @@ pub(crate) struct LookupToken {
 pub(crate) fn lookup_token(parent: &Dentry, name: &str) -> Option<LookupToken> {
     let parent_sequence = parent.read_sequence()?;
     let directory = parent.directory_ref()?;
-    let bucket = hash(directory_key(directory), name);
+    let bucket = hash(
+        directory_key(directory),
+        name,
+        directory.dcache_case_insensitive(),
+    );
     let before = MUTATION_GENERATIONS[bucket].load(Ordering::Acquire);
     if ACTIVE_MUTATIONS[bucket].load(Ordering::Acquire) != 0 {
         return None;
@@ -294,6 +315,7 @@ fn dentry_parent_directory_is(dentry: &Dentry, directory: &dyn DirOps) -> bool {
 }
 
 fn invalidate_bucket(parent: &dyn DirOps, name: Option<&str>, bucket_index: usize) {
+    let fold_case = parent.dcache_case_insensitive();
     loop {
         // Build the replacement snapshot before taking the IRQ-safe writer
         // lock. Linux likewise allocates dentries outside d_lock and keeps the
@@ -308,7 +330,7 @@ fn invalidate_bucket(parent: &dyn DirOps, name: Option<&str>, bucket_index: usiz
         let mut changed = false;
         let mut next = Vec::with_capacity(bucket.entries.len());
         for dentry in &bucket.entries {
-            let matches = name.is_none_or(|name| dentry.name == name)
+            let matches = name.is_none_or(|name| names_equal(fold_case, &dentry.name, name))
                 && dentry_parent_directory_is(dentry, parent);
             if matches {
                 changed = true;
@@ -336,7 +358,7 @@ fn invalidate_bucket(parent: &dyn DirOps, name: Option<&str>, bucket_index: usiz
             continue;
         }
         for dentry in &bucket.entries {
-            let matches = name.is_none_or(|name| dentry.name == name)
+            let matches = name.is_none_or(|name| names_equal(fold_case, &dentry.name, name))
                 && dentry_parent_directory_is(dentry, parent);
             if matches {
                 dentry.unhash();
@@ -350,7 +372,10 @@ fn invalidate_bucket(parent: &dyn DirOps, name: Option<&str>, bucket_index: usiz
 }
 
 fn dentry_matches(dentry: &Dentry, parent: &Dentry, name: &str) -> bool {
-    dentry.name == name
+    let fold_case = parent
+        .directory_ref()
+        .is_some_and(|directory| directory.dcache_case_insensitive());
+    names_equal(fold_case, &dentry.name, name)
         && dentry
             .parent
             .as_ref()
@@ -435,7 +460,11 @@ fn cache(
     if !directory.rcu_walkable() || !token_valid(parent, token) {
         return None;
     }
-    let bucket_index = hash(directory_key(directory), name);
+    let bucket_index = hash(
+        directory_key(directory),
+        name,
+        directory.dcache_case_insensitive(),
+    );
     if token.bucket != bucket_index {
         return None;
     }
@@ -700,7 +729,7 @@ mod tests {
     fn high_bucket_name(parent: &dyn DirOps) -> String {
         (0..4096)
             .map(|n| alloc::format!("mutation-high-{n}"))
-            .find(|name| hash(directory_key(parent), name) >= u64::BITS as usize)
+            .find(|name| hash(directory_key(parent), name, false) >= u64::BITS as usize)
             .expect("test name must exercise a bucket beyond one bitmap word")
     }
 
@@ -769,7 +798,7 @@ mod tests {
         let dir = crate::FsInstance::root(&fs);
         let root = Dentry::root(Arc::clone(&dir));
         let name = high_bucket_name(dir.as_ref());
-        let bucket = hash(directory_key(dir.as_ref()), &name);
+        let bucket = hash(directory_key(dir.as_ref()), &name, false);
         let before = ACTIVE_MUTATIONS[bucket].load(Ordering::Acquire);
         let outer = begin_path_mutation(dir.as_ref(), &[&name, &name]);
         let outer_count = ACTIVE_MUTATIONS[bucket].load(Ordering::Acquire) == before + 1;
@@ -850,6 +879,10 @@ mod tests {
         }
 
         fn rcu_walkable(&self) -> bool {
+            true
+        }
+
+        fn dcache_case_insensitive(&self) -> bool {
             true
         }
 
