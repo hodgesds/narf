@@ -139,6 +139,7 @@ mod abi_coherence_minix_tests;
 mod abi_creds_tests;
 mod abi_device_mmap_tests;
 mod abi_drm_prime_tests;
+mod abi_execve_paths_tests;
 mod abi_fault_write_tests;
 mod abi_faultaround_tests;
 mod abi_fdio2_tests;

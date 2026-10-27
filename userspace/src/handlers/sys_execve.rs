@@ -27,5 +27,12 @@ pub(crate) fn sys_execve(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // getname() rejects an empty name before cwd/chroot normalization.
+    // Otherwise "" becomes the installed root (e.g. /mnt/) and the
+    // file-only resolver reports InvalidPath instead of ENOENT.
+    if path_owned.is_empty() {
+        ctx.set_return(errno_ret(ENOENT));
+        return;
+    }
     do_execve_resolved(ctx, path_owned, argv_uptr, envp_uptr, None);
 }

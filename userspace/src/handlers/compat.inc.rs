@@ -2465,9 +2465,18 @@ fn do_execve_resolved(
     // errnos come ahead of an argv/envp EFAULT.
     if image_override.is_none() && !path_owned.starts_with(HOST_ANCHORED) {
         let task = current_task_id();
-        if let Err(errno) = literal_walk_check(task, &path_owned) {
-            ctx.set_return(errno_ret(errno));
-            return;
+        match literal_walk_check(task, &path_owned) {
+            Err(errno) => {
+                ctx.set_return(errno_ret(errno));
+                return;
+            }
+            // A named final slash/dot/dotdot was walked as a directory.
+            // Do not normalize that proof away and reopen it as a file.
+            Ok(Some(_)) => {
+                ctx.set_return(errno_ret(EACCES));
+                return;
+            }
+            Ok(None) => {}
         }
         if !path_owned.starts_with('/') {
             path_owned = resolve_cwd_path_user(task, &path_owned);
@@ -2602,8 +2611,18 @@ fn do_execve_resolved(
             poll_io_to_completion(narf_filesystem::resolve_async_dentry(root, rel))
         }) {
             Some(Some(Ok(o))) => o,
-            // Not found (or no mount) → ENOENT so execvp keeps searching PATH.
-            None | Some(Some(Err(narf_filesystem::FsError::NotFound))) => return Err(-ENOENT),
+            None => return Err(-ENOENT),
+            Some(Some(Err(narf_filesystem::FsError::NotFound | narf_filesystem::FsError::InvalidPath))) => {
+                // This resolver opens files only: a directory (including a
+                // mount root) is InvalidPath, not a storage failure. Linux's
+                // do_open_execat/may_open rejects non-regular files as EACCES.
+                if stat_path_dir_aware(&ep)
+                    .is_some_and(|st| st.mode.file_type == narf_filesystem::FileType::Dir)
+                {
+                    return Err(-EACCES);
+                }
+                return Err(-path_lookup_errno(&ep));
+            }
             // Genuinely-wedged device (2G-poll backstop exhausted) → EIO.
             // Loud: a silent EIO here cost a full debugging session (bash
             // reports only "Input/output error").
@@ -2612,17 +2631,24 @@ fn do_execve_resolved(
                 let _ = writeln!(narf_console::Writer, "EXECVE-EIO resolve overrun path={ep}");
                 return Err(-EIO);
             }
-            // A real FS error → EIO.
+            // Preserve filesystem errors; only actual I/O failures are EIO.
             Some(Some(Err(e))) => {
-                use core::fmt::Write as _;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "EXECVE-EIO resolve err={e:?} path={ep}"
-                );
-                return Err(-EIO);
+                let errno = copy_fs_errno(e);
+                if errno == EIO {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "EXECVE-EIO resolve err={e:?} path={ep}"
+                    );
+                }
+                return Err(-errno);
             }
         };
-        let file_size = ops.stat().size as usize;
+        let stat = ops.stat();
+        if stat.mode.file_type != narf_filesystem::FileType::File {
+            return Err(-EACCES);
+        }
+        let file_size = stat.size as usize;
         if file_size == 0 {
             return Err(-ENOEXEC); // ENOEXEC — empty file is not an executable
         }

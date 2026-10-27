@@ -950,7 +950,7 @@ descriptor close; a peer parked in an infinite poll/epoll wait wakes to
 Connected unnamed AF_UNIX peers, including `socketpair(2)` endpoints, report a
 minimal `sockaddr_un` containing only `sa_family` from `getpeername(2)`;
 truncated output still reports the full address length.
-`open(2)`/`openat(2)` reject an empty pathname with `ENOENT` before cwd
+`open(2)`/`openat(2)`/`execve(2)` reject an empty pathname with `ENOENT` before cwd
 normalization; an empty path never aliases the current directory. Linux path
 and descriptor failures return their specific errno rather than a bare `-1`:
 in particular `openat(2)` reports `EFAULT`, `EMFILE`, and mapped filesystem
@@ -958,6 +958,11 @@ errors. Descriptor allocation precedes path lookup and creation, so `EMFILE`
 publishes neither a file descriptor nor an `O_CREAT` inode. `newfstatat(2)`
 distinguishes `EFAULT`, `ENOENT`, `EBADF`,
 `ENOTDIR`, and invalid flag `EINVAL`.
+`execve(2)`/`execveat(2)` reject directory images (including the installed-root
+mount itself) and other non-regular images with `EACCES`. Executable lookup
+preserves `ENOENT`, `ENOTDIR`, `ELOOP` and mapped filesystem errors; a directory
+reported as `InvalidPath` by the file-only resolver must not become `EIO`.
+`execveat(2)` retains its explicit `AT_EMPTY_PATH` descriptor semantics.
 The chmod/chown syscall families resolve relative `*at` paths through a real
 directory fd, reject invalid flags and dirfd shapes with Linux errnos, and
 follow the final symlink unless `AT_SYMLINK_NOFOLLOW` selects the link inode.
