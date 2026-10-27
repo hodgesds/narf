@@ -4,8 +4,10 @@
 //! Firmware `_OSC` must grant USB3/DisplayPort ownership before ring zero is
 //! started; PCIe tunnelling is additionally programmed only when the `_OSC`
 //! grant includes the PCIe bit. One actor owns each NHI's DMA rings, config
-//! transactions, topology, and tunnels. XDomain tunneling and legacy ICM are
-//! not implemented.
+//! transactions, topology, and tunnels. XDomain tunneling is not implemented.
+//! Legacy ICM (firmware-CM) hosts are detected from NHI firmware status
+//! before ring 0 starts and the native CM stands down for those controllers
+//! (see `icm`); the ICM protocol itself is deliberately not implemented.
 //!
 //! Reference: `/usr/src/linux/drivers/thunderbolt/{pci,nhi,ctl,usb4,path,tunnel}.c`.
 //!
@@ -31,6 +33,8 @@ pub mod cm;
 mod control;
 #[cfg(feature = "builtin")]
 mod firmware;
+#[cfg(feature = "builtin")]
+pub mod icm;
 #[cfg(feature = "builtin")]
 pub mod nhi;
 #[cfg(feature = "builtin")]
