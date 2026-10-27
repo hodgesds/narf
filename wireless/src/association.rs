@@ -106,6 +106,21 @@ pub struct JoinPlan {
     spp_amsdu: bool,
     /// SAE authentication state and the negotiated AKM/PWE.
     sae: Option<SaeJoin>,
+    /// EPD-mandatory BSS joined with the EPD opt-in.
+    epd: bool,
+}
+
+/// Capability Information EPD subfield (bit13, IEEE802.11-2020 9.4.1.4).
+const CAP_EPD: u16 = 0x2000;
+
+/// Native framing opt-ins for `JoinPlan::prepare_with_options`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JoinOptions {
+    /// The owner's data path implements EtherType Protocol Discrimination
+    /// (`station_security::Security::with_epd`). The request then sets the
+    /// Capability EPD subfield and an EPD-mandatory BSS (selector 124) is
+    /// admitted.
+    pub epd: bool,
 }
 
 /// BSS membership selectors (IEEE802.11-2020 Table 9-80 as amended;
@@ -422,7 +437,7 @@ impl JoinPlan {
         ssid: &[u8],
         security: SecurityMode,
     ) -> Result<Self, Error> {
-        Self::prepare_inner(bss, own, ssid, security, None)
+        Self::prepare_inner(bss, own, ssid, security, None, JoinOptions::default())
     }
     /// Prepare using an implementation profile derived by the native owner.
     /// AP facts are reparsed and bound here, never accepted as an external grant.
@@ -433,7 +448,14 @@ impl JoinPlan {
         security: SecurityMode,
         local: phy::LocalPhy,
     ) -> Result<Self, Error> {
-        Self::prepare_inner(bss, own, ssid, security, Some(local))
+        Self::prepare_inner(
+            bss,
+            own,
+            ssid,
+            security,
+            Some(local),
+            JoinOptions::default(),
+        )
     }
     pub fn offered_phy(&self) -> Option<&phy::Offer> {
         self.offered_phy.as_ref()
@@ -441,12 +463,33 @@ impl JoinPlan {
     pub fn negotiated_phy(&self) -> Option<&phy::Negotiated> {
         self.negotiated_phy.as_ref()
     }
+    /// Prepare with optional PHY and the explicit native framing opt-ins of
+    /// `JoinOptions`. `prepare`/`prepare_with_phy` use the defaults.
+    pub fn prepare_with_options(
+        bss: &Bss,
+        own: [u8; 6],
+        ssid: &[u8],
+        security: SecurityMode,
+        local: Option<phy::LocalPhy>,
+        options: JoinOptions,
+    ) -> Result<Self, Error> {
+        Self::prepare_inner(bss, own, ssid, security, local, options)
+    }
+    /// True when this BSS mandates EtherType Protocol Discrimination (EPD
+    /// membership selector 124) and both the AP and this station advertise
+    /// the Capability Information EPD subfield: every MSDU of the
+    /// association, including EAPOL, uses EPD framing
+    /// (`station_security::Security::with_epd`).
+    pub fn epd(&self) -> bool {
+        self.epd
+    }
     fn prepare_inner(
         bss: &Bss,
         own: [u8; 6],
         ssid: &[u8],
         security: SecurityMode,
         local: Option<phy::LocalPhy>,
+        options: JoinOptions,
     ) -> Result<Self, Error> {
         if !unicast(own)
             || !unicast(bss.bssid)
@@ -462,7 +505,8 @@ impl JoinPlan {
         }
         let mut rate_elements = RateElements {
             allowed: if local.is_some() { SEL_PHY } else { 0 }
-                | if security.is_sae() { SEL_SAE_H2E } else { 0 },
+                | if security.is_sae() { SEL_SAE_H2E } else { 0 }
+                | if options.epd { SEL_EPD } else { 0 },
             ..Default::default()
         };
         let mut rsn = None;
@@ -517,6 +561,12 @@ impl JoinPlan {
             )?,
             None => None,
         };
+        // IEEE802.11-2020 9.4.1.4: an EPD-mandatory BSS advertises the EPD
+        // capability subfield (bit13); an inconsistent beacon is malformed.
+        let epd = rate_elements.selectors & SEL_EPD != 0;
+        if epd && bss.capability & CAP_EPD == 0 {
+            return Err(Error::InvalidBss);
+        }
         let mut sae = None;
         let negotiated = match security {
             SecurityMode::Open => {
@@ -563,7 +613,10 @@ impl JoinPlan {
         } else {
             0x0420
         };
-        let capability = 1 | (bss.capability & optional) | if security.is_rsn() { 0x10 } else { 0 };
+        let capability = 1
+            | (bss.capability & optional)
+            | if security.is_rsn() { 0x10 } else { 0 }
+            | if options.epd { CAP_EPD } else { 0 };
         assoc.extend_from_slice(&capability.to_le_bytes());
         assoc.extend_from_slice(&5u16.to_le_bytes());
         assoc.extend_from_slice(&[0, ssid.len() as u8]);
@@ -609,6 +662,7 @@ impl JoinPlan {
             negotiated_phy: None,
             spp_amsdu: false,
             sae,
+            epd,
         })
     }
     pub fn start_authentication(&mut self) -> Result<&[u8], Error> {
@@ -673,7 +727,10 @@ impl JoinPlan {
             return Err(Error::Rejected(status));
         }
         let capability = u16::from_le_bytes([bytes[24], bytes[25]]);
-        if capability & 3 != 1 || (capability & 0x10 != 0) != self.security.is_rsn() {
+        if capability & 3 != 1
+            || (capability & 0x10 != 0) != self.security.is_rsn()
+            || self.epd && capability & CAP_EPD == 0
+        {
             self.phase = Phase::Failed;
             return Err(Error::Protocol);
         }
@@ -688,7 +745,11 @@ impl JoinPlan {
                 SEL_PHY
             } else {
                 0
-            },
+            } | if self.sae.as_ref().is_some_and(SaeJoin::h2e) {
+                SEL_SAE_H2E
+            } else {
+                0
+            } | if self.epd { SEL_EPD } else { 0 },
             ..Default::default()
         };
         if let Err(error) = ies(&bytes[30..], |id, body| response.observe(id, body)) {
@@ -779,3 +840,7 @@ mod tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "association/observe_tests.rs"]
 mod observe_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "association/epd_tests.rs"]
+mod epd_tests;

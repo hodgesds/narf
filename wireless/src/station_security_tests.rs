@@ -1,6 +1,8 @@
 use super::*;
 #[path = "station_security_amsdu_tests.rs"]
 mod amsdu_tests;
+#[path = "station_security_epd_tests.rs"]
+mod epd_tests;
 #[path = "station_security_sae_tests.rs"]
 mod sae_tests;
 use crate::eapol::{self, KeyFrame, KeyMgmt, Ptk};

@@ -89,6 +89,8 @@ pub struct Security {
     /// PMF negotiated (SAE): IGTK required, robust management protected.
     pmf: bool,
     igtk: crate::mfp::MfpKeyStore,
+    /// EtherType Protocol Discrimination framing (`JoinPlan::epd()`).
+    epd: bool,
 }
 impl core::fmt::Debug for Security {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -281,7 +283,63 @@ impl Security {
                 != 0,
             pmf,
             igtk: crate::mfp::MfpKeyStore::new(),
+            epd: false,
         })
+    }
+    /// Frame MSDUs with EtherType Protocol Discrimination (IEEE802.11-2020
+    /// 5.1.4: the MSDU starts with a two-octet EtherType instead of the
+    /// RFC1042 LLC/SNAP header) for a BSS whose plan reports
+    /// `JoinPlan::epd()`. Must be chosen before the first EAPOL frame;
+    /// A-MSDU transmit/receive (RFC1042 subframes) is refused in EPD mode.
+    pub fn with_epd(mut self, enabled: bool) -> Self {
+        self.epd = enabled;
+        self
+    }
+    pub fn epd(&self) -> bool {
+        self.epd
+    }
+    /// The MSDU header for `ethertype` in the negotiated discrimination.
+    fn msdu_header(&self, ethertype: u16) -> Vec<u8> {
+        let mut out = if self.epd {
+            Vec::with_capacity(2)
+        } else {
+            vec![0xaa, 0xaa, 3, 0, 0, 0]
+        };
+        out.extend_from_slice(&ethertype.to_be_bytes());
+        out
+    }
+    /// Convert one `Rx::Data` frame (a normalized FromDS 802.11 DATA frame)
+    /// into Ethernet-II (DA = Address1, SA = Address3) using this owner's
+    /// LPD or EPD discrimination. Drivers of an EPD BSS must use this
+    /// instead of an RFC1042-only conversion.
+    pub fn ethernet(&self, frame: &[u8]) -> Option<Vec<u8>> {
+        let offset = match frame.first()? {
+            8 => 24,
+            0x88 => 26,
+            _ => return None,
+        };
+        if frame.len() < offset || frame[1] & 3 != 2 {
+            return None;
+        }
+        let (ethertype, header) = self.msdu_type(&frame[offset..])?;
+        let mut out = Vec::with_capacity(frame.len());
+        out.extend_from_slice(&frame[4..10]);
+        out.extend_from_slice(&frame[16..22]);
+        out.extend_from_slice(&ethertype.to_be_bytes());
+        out.extend_from_slice(&frame[offset + header..]);
+        Some(out)
+    }
+    /// The EtherType and payload offset of an MSDU body.
+    fn msdu_type(&self, body: &[u8]) -> Option<(u16, usize)> {
+        if self.epd {
+            let t = u16::from_be_bytes([*body.first()?, *body.get(1)?]);
+            // An EPD MSDU carries an EtherType, never a length.
+            (t >= 0x600).then_some((t, 2))
+        } else {
+            let snap = body.get(..8)?;
+            (snap[..6] == [0xaa, 0xaa, 3, 0, 0, 0])
+                .then(|| (u16::from_be_bytes([snap[6], snap[7]]), 8))
+        }
     }
     /// True when both the retained station and AP RSNEs advertised SPP
     /// A-MSDU Capable, so pairwise CCMP authenticates A-MSDU Present.
@@ -396,6 +454,9 @@ impl Security {
         if !self.port_open() {
             return Err(Error::State);
         }
+        if self.epd {
+            return Ok(None);
+        }
         let bytes = mpdu.bytes();
         if !mpdu.unmodified()
             || !(26 + 16 + 22..=26 + 16 + admission.limit().bytes()).contains(&bytes.len())
@@ -448,13 +509,10 @@ impl Security {
             return Ok(Rx::Ignored);
         };
         let offset = if frame[0] == 0x88 { 26 } else { 24 };
-        let Some(snap) = frame.get(offset..offset + 8) else {
+        let Some((ethertype, header)) = self.msdu_type(&frame[offset..]) else {
             return Ok(Rx::Ignored);
         };
-        if snap[..6] != [0xaa, 0xaa, 3, 0, 0, 0] {
-            return Ok(Rx::Ignored);
-        }
-        if snap[6..] != [0x88, 0x8e] {
+        if ethertype != 0x888e {
             return if self.port_open() && protected {
                 Ok(Rx::Data(frame))
             } else {
@@ -466,7 +524,7 @@ impl Security {
         if frame[4..10] != self.own || frame[16..22] != self.peer {
             return Ok(Rx::Ignored);
         }
-        let pdu = &frame[offset + 8..];
+        let pdu = &frame[offset + header..];
         if pdu.len() < 4
             || !(1..=3).contains(&pdu[0])
             || pdu[1] != 3
@@ -584,7 +642,7 @@ impl Security {
         header.extend_from_slice(&self.peer);
         header.extend_from_slice(&(self.sequence << 4).to_le_bytes());
         self.sequence = (self.sequence + 1) & 4095;
-        let mut body = vec![0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e];
+        let mut body = self.msdu_header(0x888e);
         body.extend_from_slice(&reply);
         // During a PTK rekey, M2/M4 use the still-installed old packet key.
         // The shared supplicant's newly verified PTK is committed below only
@@ -632,7 +690,7 @@ impl Security {
         if !self.port_open() {
             return Err(Error::State);
         }
-        if tid > 15 {
+        if tid > 15 || self.epd {
             return Err(Error::Profile);
         }
         let body = crate::amsdu::encode(frames, self.own, limit).map_err(|_| Error::Profile)?;
@@ -706,8 +764,8 @@ impl Security {
         } else {
             self.sequence = (sequence + 1) & 4095;
         }
-        let mut body = vec![0xaa, 0xaa, 3, 0, 0, 0];
-        body.extend_from_slice(&ethernet[12..]);
+        let mut body = self.msdu_header(protocol);
+        body.extend_from_slice(&ethernet[14..]);
         let result = self
             .pair
             .as_mut()
