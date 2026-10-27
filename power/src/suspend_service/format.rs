@@ -290,16 +290,21 @@ impl ImageStore for BlockStore {
 
     fn read_exact(&self, offset: u64, out: &mut [u8]) -> Result<(), ServiceError> {
         let lba_size = self.lba_size();
-        if lba_size == 0 || offset % lba_size != 0 {
+        if lba_size == 0 {
             return Err(ServiceError::Store);
         }
+        // Reads are offset-general: the sealed header body sits at
+        // the end of the header page, which is not LBA-aligned on a
+        // 512-byte-LBA device, so an unaligned head is bounced
+        // through a scratch block just like an unaligned tail.
+        // BlockDeviceSync only ever sees whole LBAs.
         let mut done = 0usize;
         while done < out.len() {
             let at = offset + done as u64;
             let remaining = out.len() - done;
-            let full_blocks = remaining / lba_size as usize;
-            if full_blocks > 0 {
-                let n = full_blocks.min(u16::MAX as usize);
+            let within = (at % lba_size) as usize;
+            if within == 0 && remaining >= lba_size as usize {
+                let n = (remaining / lba_size as usize).min(u16::MAX as usize);
                 self.dev
                     .read(
                         at / lba_size,
@@ -309,20 +314,23 @@ impl ImageStore for BlockStore {
                     .map_err(store_err)?;
                 done += n * lba_size as usize;
             } else {
-                // Partial tail block: bounce through a scratch block
-                // so BlockDeviceSync sees only whole LBAs.
                 let mut scratch = alloc::vec![0u8; lba_size as usize];
                 self.dev
                     .read(at / lba_size, 1, &mut scratch)
                     .map_err(store_err)?;
-                out[done..].copy_from_slice(&scratch[..remaining]);
-                done = out.len();
+                let take = core::cmp::min(lba_size as usize - within, remaining);
+                out[done..done + take].copy_from_slice(&scratch[within..within + take]);
+                done += take;
             }
         }
         Ok(())
     }
 
     fn write_all(&self, offset: u64, data: &[u8]) -> Result<(), ServiceError> {
+        // Writes require an LBA-aligned offset (an unaligned write
+        // would need read-modify-write of the neighbour bytes).
+        // Every format offset is page-aligned, so the writer never
+        // asks for anything else.
         let lba_size = self.lba_size();
         if lba_size == 0 || offset % lba_size != 0 {
             return Err(ServiceError::Store);

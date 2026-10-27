@@ -19,17 +19,20 @@
 extern crate alloc;
 
 use alloc::rc::Rc;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::Cell;
 
+use narf_block::{BlockDeviceSync, BlockIoError};
 use narf_crypto::aead::{chacha20_poly1305_open, chacha20_poly1305_seal};
 use narf_crypto::hkdf::{hkdf_expand, hkdf_extract};
 use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::suspend_service::{
-    parse_claims, AnchorError, AnchorKind, ImageStore, KeyCustodyAnchor, KeyEntropy, PolicyLevel,
-    RecordedPolicy, Secret32, ServiceError, SlotArea, SuspendService, UnwrapCtx, WrapCtx,
-    WrappedSlot,
+    parse_claims, AnchorError, AnchorKind, BlockStore, ImageStore, KeyCustodyAnchor, KeyEntropy,
+    PolicyLevel, RecordedPolicy, Secret32, ServiceError, SlotArea, SuspendService, UnwrapCtx,
+    WrapCtx, WrappedSlot,
 };
 
 // ── Scripted entropy seam ────────────────────────────────────────────
@@ -236,6 +239,67 @@ impl ImageStore for MemImageStore {
     }
 
     fn flush(&self) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+/// RAM-backed `BlockDeviceSync` with a configurable LBA size, so
+/// the service's block-layer store (`BlockStore`) is exercised
+/// through the real trait surface — whole-LBA transfers only —
+/// instead of the offset-general `MemImageStore` above. The two
+/// stores have different contracts, and a fixture that only models
+/// the permissive one cannot see alignment failures in the other.
+#[derive(Debug)]
+struct RamBlockDevice {
+    lba_size: u32,
+    data: IrqSafeSpinLock<Vec<u8>>,
+}
+
+impl RamBlockDevice {
+    fn new(lba_size: u32, bytes: usize) -> Self {
+        Self {
+            lba_size,
+            data: IrqSafeSpinLock::new(alloc::vec![0u8; bytes]),
+        }
+    }
+}
+
+impl BlockDeviceSync for RamBlockDevice {
+    fn lba_size(&self) -> u32 {
+        self.lba_size
+    }
+
+    fn capacity(&self) -> u64 {
+        self.data.lock().len() as u64 / u64::from(self.lba_size)
+    }
+
+    fn read(&self, lba: u64, n_blocks: u16, out: &mut [u8]) -> Result<(), BlockIoError> {
+        let start = (lba * u64::from(self.lba_size)) as usize;
+        let len = n_blocks as usize * self.lba_size as usize;
+        if out.len() < len {
+            return Err(BlockIoError::BufferTooSmall);
+        }
+        let data = self.data.lock();
+        let end = start.checked_add(len).ok_or(BlockIoError::OutOfRange)?;
+        if end > data.len() {
+            return Err(BlockIoError::OutOfRange);
+        }
+        out[..len].copy_from_slice(&data[start..end]);
+        Ok(())
+    }
+
+    fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError> {
+        let start = (lba * u64::from(self.lba_size)) as usize;
+        let len = n_blocks as usize * self.lba_size as usize;
+        if data.len() < len {
+            return Err(BlockIoError::BufferTooSmall);
+        }
+        let mut store = self.data.lock();
+        let end = start.checked_add(len).ok_or(BlockIoError::OutOfRange)?;
+        if end > store.len() {
+            return Err(BlockIoError::OutOfRange);
+        }
+        store[start..end].copy_from_slice(&data[..len]);
         Ok(())
     }
 }
@@ -834,3 +898,35 @@ fn smoke_power_suspend_slot_area_codec() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("power", smoke_power_suspend_slot_area_codec);
+
+// ── Block-layer store ────────────────────────────────────────────────
+
+fn smoke_power_suspend_block_store_round_trip() -> TestResult {
+    let (mut svc, anchor) = enrolled_service();
+    anchor.grant_presence();
+    // 512-byte LBAs: the sealed header body sits at header-page
+    // offset 4024, which is not LBA-aligned at this geometry, so
+    // the open path exercises BlockStore's bounced unaligned reads.
+    // (MemImageStore is offset-general and cannot see that class of
+    // failure; that is why this fixture goes through the block
+    // trait instead.)
+    let dev = Arc::new(RamBlockDevice::new(512, STORE_LEN));
+    let mut store = BlockStore::new(dev);
+    let image = pattern_image(5000);
+    if svc.seal_image(&mut store, token_policy(), &image).is_err() {
+        return TestResult::Fail("seal through BlockStore failed");
+    }
+    let opened = match svc.open_with_anchor(&store, &anchor) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("open through BlockStore failed"),
+    };
+    let trusted = match opened.verify_all(&store) {
+        Ok(t) => t,
+        Err(_) => return TestResult::Fail("verify_all through BlockStore failed"),
+    };
+    match trusted.read_all(&store) {
+        Ok(all) if all == image => TestResult::Pass,
+        _ => TestResult::Fail("BlockStore round-trip content differs"),
+    }
+}
+kernel_test_in!("power", smoke_power_suspend_block_store_round_trip);
