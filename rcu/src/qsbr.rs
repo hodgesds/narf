@@ -231,26 +231,80 @@ pub fn report_idle() {
 // re-took the GPU request gate its caller held and the CPU spun forever.
 //
 // With a wake hook installed, the implicit drains (`report_quiescent`,
-// `report_idle`) splice grace-period-expired nodes onto one global pending
-// list and call the hook, which runs `run_offloaded_reclaim` from a plain
-// task. `OFFLOAD_KICKED` coalesces: the hook fires only on the clear→set
-// transition, so one worker run covers any number of nodes. Without a hook
+// `report_idle`) splice grace-period-expired nodes onto a worker's pending
+// list and call the hook. Each worker owns a separate queue so callbacks from
+// every CPU need not serialize behind one BSP task. Wakeups coalesce within
+// each queue. Without a hook
 // (early boot, kernel tests) drains stay inline. The explicit grace-period
 // waits (`sync_until`, `SyncFuture`) keep their "dropped on return" contract by
 // also running the pending list.
 
-/// Wake hook (`fn()`), or 0 when none is installed.
+/// Wake hook (`fn(usize)`), or 0 when none is installed.
 static OFFLOAD_WAKE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-/// Grace-period-expired nodes awaiting the worker (intrusive, via `next`).
-static OFFLOADED: core::sync::atomic::AtomicPtr<DeferHdr> =
-    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
-/// Set when the worker has been woken and has not yet taken the list.
-static OFFLOAD_KICKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static OFFLOAD_WORKERS: AtomicUsize = AtomicUsize::new(1);
+
+#[repr(align(64))]
+pub(super) struct OffloadQueue {
+    head: core::sync::atomic::AtomicPtr<DeferHdr>,
+    kicked: core::sync::atomic::AtomicBool,
+}
+
+impl OffloadQueue {
+    pub(super) const fn new() -> Self {
+        Self {
+            head: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            kicked: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Publish an exclusively owned, grace-period-expired chain. Return true
+    /// when its worker needs a wake. The producer never dereferences a shared
+    /// head: a consumer can detach and destroy it concurrently.
+    ///
+    /// # Safety
+    /// `ready` must be nonempty and exclusively owned, and every node's grace
+    /// period must have elapsed. Ownership transfers to this queue.
+    pub(super) unsafe fn push(&self, ready: *mut DeferHdr) -> bool {
+        // SAFETY: the caller owns this nonempty chain until the publishing CAS.
+        unsafe {
+            let mut tail = ready;
+            while !(*tail).next.is_null() {
+                tail = (*tail).next;
+            }
+            let mut head = self.head.load(Ordering::Relaxed);
+            loop {
+                (*tail).next = head;
+                match self.head.compare_exchange_weak(
+                    head,
+                    ready,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => head = current,
+                }
+            }
+        }
+        !self.kicked.swap(true, Ordering::AcqRel)
+    }
+
+    pub(super) fn take(&self) -> *mut DeferHdr {
+        // Clear BEFORE detaching: a later publication must wake another run,
+        // including when this consumer is still executing its private batch.
+        self.kicked.store(false, Ordering::Release);
+        self.head.swap(core::ptr::null_mut(), Ordering::AcqRel)
+    }
+}
+
+static OFFLOADED: [OffloadQueue; MAX_CPUS] = [const { OffloadQueue::new() }; MAX_CPUS];
 
 /// Install the reclaim worker's wake hook. The hook must be cheap and must not
 /// run destructors itself: it is called from the drain, i.e. from whatever
-/// frame reported quiescence.
-pub fn set_reclaim_offload(wake: fn()) {
+/// frame reported quiescence. Install once at boot, after all `workers`
+/// workers exist. Reconfiguration requires producers and workers to be stopped.
+pub fn set_reclaim_offload(workers: usize, wake: fn(usize)) {
+    assert!((1..=MAX_CPUS).contains(&workers));
+    OFFLOAD_WORKERS.store(workers, Ordering::Relaxed);
     OFFLOAD_WAKE.store(wake as usize, Ordering::Release);
 }
 
@@ -260,13 +314,15 @@ pub fn clear_reclaim_offload() {
     OFFLOAD_WAKE.store(0, Ordering::Release);
 }
 
-/// Run every offloaded destructor; returns how many ran. Called by the worker
-/// the hook woke, and by the explicit grace-period waits.
+/// Drain all worker queues, including queues left over after clearing the hook.
+/// Used by the explicit grace-period waits.
 pub fn run_offloaded_reclaim() -> usize {
-    // Clear the kick BEFORE taking the list: a push that lands after the take
-    // sees the flag clear and wakes a fresh run, so no node is stranded.
-    OFFLOAD_KICKED.store(false, Ordering::Release);
-    let list = OFFLOADED.swap(core::ptr::null_mut(), Ordering::AcqRel);
+    (0..MAX_CPUS).map(run_offloaded_reclaim_for).sum()
+}
+
+/// Run the ready callbacks assigned to one worker; returns how many ran.
+pub fn run_offloaded_reclaim_for(worker: usize) -> usize {
+    let list = OFFLOADED[worker].take();
     // SAFETY: every node on the list was spliced on by `offload_or_run` after
     // its grace period elapsed, and the swap above made this call its sole
     // owner.
@@ -278,7 +334,7 @@ pub fn run_offloaded_reclaim() -> usize {
 /// # Safety
 /// `list` is a chain of nodes whose grace period has elapsed and which the
 /// caller exclusively owns.
-unsafe fn run_droppers(mut list: *mut DeferHdr) -> usize {
+pub(super) unsafe fn run_droppers(mut list: *mut DeferHdr) -> usize {
     let mut ran = 0usize;
     while !list.is_null() {
         // SAFETY: per the contract — an owned, reclaimable node. `dropper`
@@ -307,28 +363,17 @@ pub(super) fn offload_or_run(ready: *mut DeferHdr) {
         unsafe { run_droppers(ready) };
         return;
     }
-    // SAFETY: the chain is exclusively owned; walking and relinking it races
-    // nothing until the publishing CAS below.
-    unsafe {
-        let mut tail = ready;
-        while !(*tail).next.is_null() {
-            tail = (*tail).next;
-        }
-        let mut head = OFFLOADED.load(Ordering::Relaxed);
-        loop {
-            (*tail).next = head;
-            match OFFLOADED.compare_exchange_weak(head, ready, Ordering::Release, Ordering::Relaxed)
-            {
-                Ok(_) => break,
-                Err(current) => head = current,
-            }
-        }
-    }
-    if !OFFLOAD_KICKED.swap(true, Ordering::AcqRel) {
+    // Queue identity is independent of the worker's current CPU. Workers may
+    // migrate on CPU hot-unplug; CPUs brought online later still select an
+    // existing worker. The hook's acquire publishes the boot-time worker count.
+    let worker =
+        narf_arch::current_cpu_id().raw() as usize % OFFLOAD_WORKERS.load(Ordering::Relaxed);
+    // SAFETY: the caller owns a nonempty chain whose grace period elapsed.
+    if unsafe { OFFLOADED[worker].push(ready) } {
         // SAFETY: only `set_reclaim_offload` stores this cell, always with a
-        // `fn()` cast to usize.
-        let wake: fn() = unsafe { core::mem::transmute::<usize, fn()>(hook) };
-        wake();
+        // `fn(usize)` cast to usize.
+        let wake: fn(usize) = unsafe { core::mem::transmute::<usize, fn(usize)>(hook) };
+        wake(worker);
     }
 }
 

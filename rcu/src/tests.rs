@@ -203,13 +203,13 @@ fn smoke_rcu_ready_destructors_offload_to_worker() -> TestResult {
             DROPS.fetch_add(1, Ordering::Relaxed);
         }
     }
-    fn wake() {
+    fn wake(_worker: usize) {
         WAKES.fetch_add(1, Ordering::Relaxed);
     }
 
     DROPS.store(0, Ordering::Relaxed);
     WAKES.store(0, Ordering::Relaxed);
-    crate::set_reclaim_offload(wake);
+    crate::set_reclaim_offload(1, wake);
     // `alloc_node` creates an owned, live `DeferNode`; passing it directly to
     // the handoff models exactly the node list `drain_local_bucket` owns once
     // it has proved the grace period elapsed.
@@ -248,6 +248,63 @@ fn smoke_rcu_ready_destructors_offload_to_worker() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("rcu", smoke_rcu_ready_destructors_offload_to_worker);
+
+/// Force a producer to publish while the consumer owns a detached batch.
+/// The later batch must request a new wake, and another worker's callbacks
+/// must remain independent. Local queues exclude unrelated SMP retirements.
+fn smoke_rcu_offload_queues_detach_and_rearm_independently() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Canary(Arc<AtomicUsize>, usize);
+    impl Drop for Canary {
+        fn drop(&mut self) {
+            self.0.fetch_add(self.1, Ordering::Relaxed);
+        }
+    }
+    let drops = Arc::new(AtomicUsize::new(0));
+    let node = |weight| crate::alloc_node(Canary(drops.clone(), weight)).cast();
+    let first = crate::qsbr::OffloadQueue::new();
+    let second = crate::qsbr::OffloadQueue::new();
+
+    // SAFETY: each newly allocated node is exclusively owned and models a
+    // callback for which the caller has already proved a grace period.
+    let (wake_first, coalesced, wake_second) = unsafe {
+        (
+            first.push(node(1)),
+            !first.push(node(2)),
+            second.push(node(4)),
+        )
+    };
+    let detached = first.take();
+    // Publish before destroying `detached`, as a producer racing a worker can.
+    // SAFETY: same owned, already-ready node invariant as above.
+    let rearmed = unsafe { first.push(node(8)) };
+    // SAFETY: take transfers exclusive ownership of ready callbacks.
+    let ran_first = unsafe { crate::qsbr::run_droppers(detached) };
+    let after_first = drops.load(Ordering::Relaxed);
+    // SAFETY: each take transfers a separate owned chain.
+    let ran_second = unsafe { crate::qsbr::run_droppers(second.take()) };
+    let after_second = drops.load(Ordering::Relaxed);
+    // SAFETY: this is the new batch, independent of the detached old batch.
+    let ran_next = unsafe { crate::qsbr::run_droppers(first.take()) };
+    let after_next = drops.load(Ordering::Relaxed);
+    if !(wake_first && coalesced && wake_second && rearmed) {
+        return TestResult::Fail("worker wake was lost, uncoalesced, or shared across queues");
+    }
+    if (ran_first, ran_second, ran_next) != (2, 1, 1)
+        || (after_first, after_second, after_next) != (3, 7, 15)
+        || !first.take().is_null()
+        || !second.take().is_null()
+    {
+        return TestResult::Fail("worker batches were mixed, lost, or reclaimed twice");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "rcu",
+    smoke_rcu_offload_queues_detach_and_rearm_independently
+);
 
 /// Retiring far more objects than the old fixed bucket held must reclaim
 /// EVERY one of them.

@@ -97,17 +97,31 @@ fn kswapd_wake(node: usize) {
     feature = "boot-smoke",
     feature = "idt-selftest"
 )))]
-static RCU_RECLAIM_WORK: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+#[repr(align(64))]
+struct RcuReclaimWorker {
+    work: core::sync::atomic::AtomicBool,
+    waker: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>>,
+}
 
-/// Waker installed whenever the persistent RCU reclaim kthread parks.
 #[cfg(not(any(
     feature = "kernel-test",
     feature = "boot-smoke",
     feature = "idt-selftest"
 )))]
-static RCU_RECLAIM_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+impl RcuReclaimWorker {
+    const NEW: Self = Self {
+        work: core::sync::atomic::AtomicBool::new(false),
+        waker: narf_lib::sync::IrqSafeSpinLock::new(None),
+    };
+}
+
+#[cfg(not(any(
+    feature = "kernel-test",
+    feature = "boot-smoke",
+    feature = "idt-selftest"
+)))]
+static RCU_RECLAIM_WORKERS: [RcuReclaimWorker; narf_lib::percpu::MAX_CPUS] =
+    [const { RcuReclaimWorker::NEW }; narf_lib::percpu::MAX_CPUS];
 
 /// RCU reclaim offload hook (`narf_rcu::set_reclaim_offload`). Called by the
 /// QSBR drain when it hands grace-period-expired destructors off, at most once
@@ -122,10 +136,11 @@ static RCU_RECLAIM_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Wak
     feature = "boot-smoke",
     feature = "idt-selftest"
 )))]
-fn rcu_reclaim_kick() {
+fn rcu_reclaim_kick(worker: usize) {
     use core::sync::atomic::Ordering;
-    RCU_RECLAIM_WORK.store(true, Ordering::Release);
-    let waker = RCU_RECLAIM_WAKER.lock().clone();
+    let state = &RCU_RECLAIM_WORKERS[worker];
+    state.work.store(true, Ordering::Release);
+    let waker = state.waker.lock().clone();
     if let Some(w) = waker {
         w.wake();
     }
@@ -133,21 +148,22 @@ fn rcu_reclaim_kick() {
 
 /// Persistent RCU callback worker. Its register-then-recheck park protocol
 /// closes both sides of the wake race: a kick before waker installation leaves
-/// `RCU_RECLAIM_WORK` set, and a kick after installation wakes the task.
+/// the worker's work bit set, and a kick after installation wakes the task.
 #[cfg(not(any(
     feature = "kernel-test",
     feature = "boot-smoke",
     feature = "idt-selftest"
 )))]
-async fn rcu_reclaim_kthread() {
+async fn rcu_reclaim_kthread(worker: usize) {
     use core::sync::atomic::Ordering;
+    let state = &RCU_RECLAIM_WORKERS[worker];
     loop {
         core::future::poll_fn(|cx| {
-            if RCU_RECLAIM_WORK.swap(false, Ordering::AcqRel) {
+            if state.work.swap(false, Ordering::AcqRel) {
                 return core::task::Poll::Ready(());
             }
-            *RCU_RECLAIM_WAKER.lock() = Some(cx.waker().clone());
-            if RCU_RECLAIM_WORK.swap(false, Ordering::AcqRel) {
+            *state.waker.lock() = Some(cx.waker().clone());
+            if state.work.swap(false, Ordering::AcqRel) {
                 core::task::Poll::Ready(())
             } else {
                 core::task::Poll::Pending
@@ -155,10 +171,14 @@ async fn rcu_reclaim_kthread() {
         })
         .await;
 
-        // `run_offloaded_reclaim` clears narf_rcu's coalescing bit before it
+        // `run_offloaded_reclaim_for` clears this queue's coalescing bit before it
         // takes the list. A concurrent publisher therefore invokes the hook
         // again, leaving this worker's work bit set for the next loop.
-        let _ = narf_rcu::run_offloaded_reclaim();
+        let _ = narf_rcu::run_offloaded_reclaim_for(worker);
+        // Under sustained publication the work bit can stay set indefinitely.
+        // Finish this poll so the CPU can report a real QSBR boundary between
+        // batches, rather than relying on timer preemption (not quiescent).
+        narf_scheduler::yield_now().await;
     }
 }
 
@@ -5146,17 +5166,31 @@ fn run_async_demo() -> ! {
         "  scheduler: ready queues already live (no re-init)"
     );
 
-    // RCU reclaim offload: allocate one persistent worker and its stack while
+    // RCU reclaim offload: allocate one persistent worker per online CPU while
     // boot still has memory headroom, then install the allocation-free wake
-    // hook. From here on, grace-period-expired destructors run in that worker,
+    // hook. From here on, grace-period-expired destructors run in those workers,
     // never inline at the quiescent point that found them (which may sit inside
     // a driver wait holding its gate). Before this point — early boot, before
     // the ready queues — drains stay inline. Spawning before hook installation
     // is safe even though the worker has not polled yet: an early kick leaves
     // its work bit set for the worker's first poll.
-    let rcu_tid = narf_scheduler::spawn_stackful(rcu_reclaim_kthread());
-    narf_userspace::handlers::set_proc_comm(rcu_tid.raw(), "rcuo0");
-    narf_rcu::set_reclaim_offload(rcu_reclaim_kick);
+    let mut rcu_cpus = narf_scheduler::online_cpu_set().bits().max(1);
+    let rcu_workers = rcu_cpus.count_ones() as usize;
+    for worker in 0..rcu_workers {
+        let cpu = rcu_cpus.trailing_zeros().min(63);
+        rcu_cpus &= rcu_cpus.wrapping_sub(1);
+        // Prefer separate CPUs without pinning callback progress to a CPU
+        // that may later go offline. Queue identity belongs to the worker.
+        let mut spec = narf_scheduler::TaskSpec::kernel_any();
+        spec.affinity.preferred = Some(narf_scheduler::affinity::CpuId(cpu));
+        let tid = narf_scheduler::spawn_stackful_with_spec(
+            rcu_reclaim_kthread(worker),
+            spec,
+            narf_scheduler::StackfulOptions::default(),
+        );
+        narf_userspace::handlers::set_proc_comm(tid.raw(), &alloc::format!("rcuo{worker}"));
+    }
+    narf_rcu::set_reclaim_offload(rcu_workers, rcu_reclaim_kick);
 
     // The OOM reaper is likewise persistent and boot-preallocated. Enqueue and
     // final address-space task detach only set a bit and wake this task; they

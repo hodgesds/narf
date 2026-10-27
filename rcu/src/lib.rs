@@ -455,8 +455,8 @@ pub fn report_quiescent() {
 /// inline at the quiescent point that found them (see
 /// [`qsbr::set_reclaim_offload`]).
 #[inline]
-pub fn set_reclaim_offload(wake: fn()) {
-    qsbr::set_reclaim_offload(wake);
+pub fn set_reclaim_offload(workers: usize, wake: fn(usize)) {
+    qsbr::set_reclaim_offload(workers, wake);
 }
 
 /// Undo [`set_reclaim_offload`]: implicit drains run destructors inline.
@@ -469,6 +469,13 @@ pub fn clear_reclaim_offload() {
 #[inline]
 pub fn run_offloaded_reclaim() -> usize {
     qsbr::run_offloaded_reclaim()
+}
+
+/// Run ready callbacks assigned to `worker` (less than the installed worker
+/// count). Queue ownership follows the worker even when it migrates CPUs.
+#[inline]
+pub fn run_offloaded_reclaim_for(worker: usize) -> usize {
+    qsbr::run_offloaded_reclaim_for(worker)
 }
 
 /// Lock-free watchdog snapshot of active CPUs that have not crossed a QSBR
