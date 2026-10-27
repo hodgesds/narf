@@ -1544,16 +1544,21 @@ pub mod tests {
         }
     }
 
+    /// Shared fake GGTT object store (GGTT offset -> backing
+    /// bytes), shared between the fake arena and the fake
+    /// hardware so both observe the same objects.
+    type FakeObjectRegistry = Rc<RefCell<BTreeMap<u32, Rc<RefCell<Vec<u8>>>>>>;
+
     struct FakeArena {
         free_list: Vec<(u32, u32)>,
         next: u32,
         live: usize,
         live_pages: u32,
-        registry: Rc<RefCell<BTreeMap<u32, Rc<RefCell<Vec<u8>>>>>>,
+        registry: FakeObjectRegistry,
     }
 
     impl FakeArena {
-        fn new(registry: Rc<RefCell<BTreeMap<u32, Rc<RefCell<Vec<u8>>>>>>) -> Self {
+        fn new(registry: FakeObjectRegistry) -> Self {
             Self {
                 free_list: Vec::new(),
                 next: GGTT_ARENA_BASE,
@@ -1632,18 +1637,14 @@ pub mod tests {
 
     struct FakeHw {
         regs: FakeRegs,
-        registry: Rc<RefCell<BTreeMap<u32, Rc<RefCell<Vec<u8>>>>>>,
+        registry: FakeObjectRegistry,
         status_ggtt: u32,
         write_ptr: u8,
         consumed_elsp: usize,
     }
 
     impl FakeHw {
-        fn new(
-            regs: FakeRegs,
-            registry: Rc<RefCell<BTreeMap<u32, Rc<RefCell<Vec<u8>>>>>>,
-            status_ggtt: u32,
-        ) -> Self {
+        fn new(regs: FakeRegs, registry: FakeObjectRegistry, status_ggtt: u32) -> Self {
             Self {
                 regs,
                 registry,
