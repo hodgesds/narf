@@ -35,25 +35,13 @@ ath10k	vht80	VHT 80 MHz operation	feature	drivers/wireless/specification/ath10k.
 ath10k	vht80p80	VHT 80+80 on QCA9984/QCA9888	feature	drivers/wireless/specification/ath10k.md	961
 ath10k	wake_offload	Wake offload	feature	drivers/wireless/specification/ath10k.md	947
 ath10k	wpa3	WPA3	feature	drivers/wireless/specification/ath10k.md	946
-ath11k	aarch64_composition	Native aarch64 startup/PCI/IRQ/board-discovery composition gap; not a proven missing PHY feature	unknown	drivers/wireless/specification/ath11k.md	1824
-ath11k	dt_board_variant	Device-tree board-variant discovery	feature	drivers/wireless/specification/ath11k.md	1824
-ath11k	host_multicast_pn	Host multicast PN checking absent; firmware-versus-host responsibility needs proof	unknown	drivers/wireless/specification/ath11k.md	1975
-ath11k	ipq5018_enablement	IPQ5018 native SoC/AHB profile enablement	chip	drivers/wireless/specification/ath11k.md	1827
-ath11k	ipq6018_enablement	IPQ6018 native SoC/AHB profile enablement	chip	drivers/wireless/specification/ath11k.md	1827
-ath11k	ipq8074_enablement	IPQ8074 native SoC/AHB profile enablement	chip	drivers/wireless/specification/ath11k.md	1827
-ath11k	mhi_bandwidth_scaling	MHI bandwidth scaling; admitted-device applicability unproven	unknown	drivers/wireless/specification/ath11k.md	113
-ath11k	mhi_client_rings	MHI client-managed rings; admitted-device applicability unproven	unknown	drivers/wireless/specification/ath11k.md	113
-ath11k	mhi_edl	MHI EDL mode; admitted-device applicability unproven	unknown	drivers/wireless/specification/ath11k.md	113
-ath11k	mhi_offload_rings	MHI offload rings; admitted-device applicability unproven	unknown	drivers/wireless/specification/ath11k.md	113
-ath11k	mhi_rsc_rings	MHI RSC rings; admitted-device applicability unproven	unknown	drivers/wireless/specification/ath11k.md	113
-ath11k	noncontiguous_ratemask	Non-contiguous RATEMASK firmware programming	feature	drivers/wireless/specification/ath11k.md	1824
-ath11k	other_qmi_platform_contracts	Unreached fixed-memory/DEVICE_INFO/fixed-BDF platform contracts	unknown	drivers/wireless/specification/ath11k.md	1890
-ath11k	qcn9074_enablement	QCN9074 native HAL/core/DP/runtime enablement	chip	drivers/wireless/specification/ath11k.md	1826
-ath11k	qmi_factory_test	QMI FTM factory-test mode; unreached on WCN6855 PCIe	unknown	drivers/wireless/specification/ath11k.md	1890
-ath11k	radar_diagnostics	Radar-detector diagnostics	feature	drivers/wireless/specification/ath11k.md	1824
-ath11k	spectral_diagnostics	Spectral diagnostics	feature	drivers/wireless/specification/ath11k.md	1824
-ath11k	twt_dialogs	Per-dialog TWT control	feature	drivers/wireless/specification/ath11k.md	1824
-ath11k	wcn6750_enablement	WCN6750 native platform profile enablement	chip	drivers/wireless/specification/ath11k.md	1827
+ath11k	aarch64_composition	Native aarch64 composed startup/PCI/IRQ/board-discovery fixtures; integration fixtures are x86-only and aarch64 lacks DTB/PCI-node plumbing	unknown	drivers/wireless/specification/ath11k.md	1891
+ath11k	dt_board_variant	Device-tree board-variant discovery (and DT memory-region fixed-memory path); needs a kernel boot-DTB accessor and PCI-device-to-DT-node association	feature	drivers/wireless/specification/ath11k.md	1952
+ath11k	ipq5018_enablement	IPQ5018 native SoC/AHB profile enablement	chip	drivers/wireless/specification/ath11k.md	1894
+ath11k	ipq6018_enablement	IPQ6018 native SoC/AHB profile enablement	chip	drivers/wireless/specification/ath11k.md	1894
+ath11k	ipq8074_enablement	IPQ8074 native SoC/AHB profile enablement	chip	drivers/wireless/specification/ath11k.md	1894
+ath11k	qcn9074_enablement	QCN9074 native HAL/core/DP/runtime enablement	chip	drivers/wireless/specification/ath11k.md	1893
+ath11k	wcn6750_enablement	WCN6750 native platform profile enablement	chip	drivers/wireless/specification/ath11k.md	1894
 ath9k	additional_ac_scheduling	Additional AC scheduling	feature	drivers/wireless/specification/ath9k.md	589
 ath9k	additional_channels	Live operation on additional channels	feature	drivers/wireless/specification/ath9k.md	587
 ath9k	additional_tid_scheduling	Additional TID scheduling	feature	drivers/wireless/specification/ath9k.md	589
