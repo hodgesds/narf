@@ -692,6 +692,8 @@ pub mod intel_gpu_aux;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_ddi;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_dmc;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_dp_bridge;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_forcewake;
@@ -707,6 +709,8 @@ pub mod intel_gpu_pipes;
 pub mod intel_gpu_pll;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_ppgtt;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_rc6;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_rcs;
 #[cfg(feature = "intel")]
