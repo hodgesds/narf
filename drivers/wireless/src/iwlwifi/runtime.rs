@@ -1291,6 +1291,47 @@ impl Hardware {
     /// Reinitialize after a cancelled control operation or firmware
     /// failure. Old allocations are freed only after DMA stop and BME
     /// disable, exactly as on final teardown.
+    /// System-suspend transport stop, following Linux
+    /// `pcie/gen1_2/trans-gen2.c::_iwl_trans_pcie_gen2_stop_device`:
+    /// mask interrupts, stop the bus master and wait for its acknowledgement
+    /// (`iwl_pcie_apm_stop_master`), software-reset the NIC
+    /// (`iwl_trans_pcie_sw_reset`) and clear PCI bus mastering. Allocations
+    /// are retained (DMA is provably stopped) until the resume restart
+    /// replaces them, or final teardown frees them.
+    pub async fn stop_for_suspend(&mut self) -> Result<(), &'static str> {
+        self.fail();
+        if let Some(interrupts) = &mut self.interrupts {
+            interrupts.mask();
+        }
+        self.mmio.write(super::regs::CSR_INT_MASK, 0);
+        let bz = self.format == rx_rfh::CompletionFormat::Bz;
+        if self.armed {
+            let (register, request, done) = if bz {
+                (super::regs::CSR_GP_CNTRL, 1 << 29, 1 << 28)
+            } else {
+                (super::regs::CSR_RESET, 1 << 9, 1 << 8)
+            };
+            let value = self.mmio.read(register);
+            self.mmio.write(register, value | request);
+            self.poll_register(register, done, done, 100).await?;
+        }
+        // CSR_GP_CNTRL_REG_FLAG_SW_RESET (bit 31) on Bz+, else
+        // CSR_RESET_REG_FLAG_SW_RESET (bit 7).
+        let (register, reset) = if bz {
+            (super::regs::CSR_GP_CNTRL, 1 << 31)
+        } else {
+            (super::regs::CSR_RESET, 1 << 7)
+        };
+        let value = self.mmio.read(register);
+        self.mmio.write(register, value | reset);
+        super::mmio::set_master(&self.device, &self.cap, false)?;
+        self.armed = false;
+        self.notifications.clear();
+        self.responses.clear();
+        self.tx_completed.clear();
+        Ok(())
+    }
+
     pub async fn restart(&mut self, parsed: &ParsedUcode<'_>) -> Result<[u8; 6], &'static str> {
         self.fail();
         if let Some(interrupts) = &mut self.interrupts {

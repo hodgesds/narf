@@ -155,6 +155,9 @@ fn smoke_mvm_gen2_recovery_waiter_drop_keeps_retained_restart() -> TestResult {
         for _ in 0..256 {
             h.actor.lock().serve()?;
             let _ = progress::poll_work(&h.device.control, &mut Context::from_waker(Waker::noop()));
+            narf_scheduler::block_on_spin(narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(
+                2_000_000,
+            )));
             if !h.device.terminal.load(Ordering::Acquire) {
                 break;
             }
@@ -169,4 +172,81 @@ fn smoke_mvm_gen2_recovery_waiter_drop_keeps_retained_restart() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2/recovery",
     smoke_mvm_gen2_recovery_waiter_drop_keeps_retained_restart
+);
+
+fn smoke_mvm_gen2_system_suspend_leaves_bss_stops_and_resume_rejoins() -> TestResult {
+    check(|| {
+        let h = Harness::new(false)?;
+        // Resume without a suspend is a no-op on a live station.
+        run(h.device.system_resume())??;
+        h.join()?;
+        let start = {
+            let mut actor = h.actor.lock();
+            actor.closing = true;
+            actor.commands.len()
+        };
+        run(h.device.system_suspend())??;
+        leaving_deauthentication_preceded_teardown(&h, start)?;
+        if h.device.link_up()
+            || h.retained() != (0, 0, 0)
+            || !h.device.suspended.load(Ordering::Acquire)
+            || !h.device.terminal.load(Ordering::Acquire)
+            || phase(&h) != Phase::Failed
+        {
+            return Err("suspend did not leave the BSS, retire receipts and stop");
+        }
+        // Suspended: no control and a repeated suspend is idempotent.
+        if run(h.device.associate(h.request()))?.is_ok() {
+            return Err("suspended owner accepted association");
+        }
+        run(h.device.system_suspend())??;
+        restart_ap(&h)?;
+        let before = nvm_commands(&h);
+        run(h.device.system_resume())??;
+        if h.device.suspended.load(Ordering::Acquire)
+            || h.device.terminal.load(Ordering::Acquire)
+            || phase(&h) != Phase::Configured
+            || nvm_commands(&h) != before + 1
+        {
+            return Err("resume did not restart the configured owner");
+        }
+        h.join()?;
+        let lease = narf_net::dhcp::dhcp_acquire(h.device.name(), 0)
+            .map_err(|_| "resumed native kernel DHCP")?;
+        if !NETWORK.matches_lease(&lease) {
+            return Err("resumed native DHCP leased wrong address");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/recovery",
+    smoke_mvm_gen2_system_suspend_leaves_bss_stops_and_resume_rejoins
+);
+
+fn smoke_mvm_gen2_system_suspend_idle_and_failed_resume_stays_suspended() -> TestResult {
+    check(|| {
+        let h = Harness::new(false)?;
+        run(h.device.system_suspend())??;
+        if !h.device.suspended.load(Ordering::Acquire) || phase(&h) != Phase::Failed {
+            return Err("idle suspend did not stop the configured owner");
+        }
+        // The resumed device reports a different identity: stay suspended
+        // and terminal, then a correct resume succeeds.
+        h.actor.lock().ht = true;
+        if run(h.device.system_resume())?.is_ok()
+            || !h.device.suspended.load(Ordering::Acquire)
+            || !h.device.terminal.load(Ordering::Acquire)
+        {
+            return Err("resume adopted a changed NVM identity");
+        }
+        h.actor.lock().ht = false;
+        run(h.device.system_resume())??;
+        h.scan()?;
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/recovery",
+    smoke_mvm_gen2_system_suspend_idle_and_failed_resume_stays_suspended
 );

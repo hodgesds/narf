@@ -112,16 +112,16 @@ impl Owner {
             return Err("MVM recovery requires a failed owner");
         }
         let mac = self.mac.ok_or("MVM recovery before first configuration")?;
-        let (channels, chains, phy) = {
-            let nvm = self.nvm.as_ref().ok_or("MVM recovery before NVM")?;
-            (nvm.channels.clone(), nvm.tx_chains, nvm.phy)
-        };
+        // The pre-failure identity stays the reference for every attempt; a
+        // rejected restart never replaces it with what it reported.
+        let original = self.nvm.take().ok_or("MVM recovery before NVM")?;
         self.power.phy.ba.clear_packets();
-        self.retire_security_after_reset()?;
-        let result = self.recover_inner(mac, &channels, chains, phy).await;
+        let result = self.recover_inner(mac, &original).await;
         if result.is_err() {
             self.hardware.fail();
             self.phase = Phase::Failed;
+            self.mac = Some(mac);
+            self.nvm = Some(original);
         }
         result
     }
@@ -129,11 +129,11 @@ impl Owner {
     async fn recover_inner(
         &mut self,
         mac: [u8; 6],
-        channels: &[u8],
-        chains: u32,
-        phy: super::super::ht_vht::Local,
+        original: &super::super::station_api::Nvm,
     ) -> Result<(), &'static str> {
         self.restart_hardware(mac).await?;
+        // DMA stop is acknowledged: retire installed keys into PN history.
+        self.retire_security_after_reset()?;
         let parsed = super::super::parse_ucode(&self.firmware)
             .map_err(|_| "invalid retained MVM firmware")?;
         // Every per-association owner named firmware objects or DMA of the
@@ -149,10 +149,38 @@ impl Owner {
         self.phase = Phase::Starting;
         self.configure(mac).await?;
         let nvm = self.nvm.as_ref().ok_or("MVM recovery lost NVM")?;
-        if nvm.channels != channels || nvm.tx_chains != chains || nvm.phy != phy {
+        if nvm.channels != original.channels
+            || nvm.tx_chains != original.tx_chains
+            || nvm.rx_chains != original.rx_chains
+            || nvm.phy != original.phy
+        {
             return Err("MVM recovery changed NVM identity");
         }
         Ok(())
+    }
+
+    /// System-suspend stop of an owner without a station (Linux
+    /// `iwl_mvm_suspend` without WoWLAN: mac80211 has already quiesced and
+    /// disconnected the interface, then `iwl_mvm_mac_stop` ->
+    /// `iwl_mvm_stop_device` -> `iwl_trans_stop_device`). The owner is left
+    /// failed; [`Self::recover`] performs the resume-time `iwl_mvm_up`.
+    pub(in crate::iwlwifi) async fn suspend_transport(&mut self) -> Result<(), &'static str> {
+        if self.phase != Phase::Configured && !self.station_failed() {
+            return Err("MVM suspend with an active station owner");
+        }
+        self.power.phy.ba.clear_packets();
+        self.phase = Phase::Failed;
+        #[cfg(any(test, feature = "kernel-test"))]
+        let model = super::super::runtime::model::is_model(&self.hardware);
+        #[cfg(not(any(test, feature = "kernel-test")))]
+        let model = false;
+        if model {
+            self.hardware.fail();
+        } else {
+            self.hardware.stop_for_suspend().await?;
+        }
+        // DMA stop is acknowledged: no installed key can be used again.
+        self.retire_security_after_reset()
     }
 
     async fn restart_hardware(&mut self, mac: [u8; 6]) -> Result<(), &'static str> {

@@ -28,6 +28,8 @@ pub struct Device {
     source: super::runtime::source::Fence,
     generation: Arc<AtomicU64>,
     quarantined: AtomicBool,
+    /// A completed system-suspend stop awaiting its resume restart.
+    suspended: AtomicBool,
     admission: IrqSafeSpinLock<()>,
     mac: [u8; 6],
     irq_vector: Option<u8>,
@@ -204,6 +206,7 @@ impl Device {
             source,
             generation: Arc::new(AtomicU64::new(0)),
             quarantined: AtomicBool::new(false),
+            suspended: AtomicBool::new(false),
             admission: IrqSafeSpinLock::new(()),
             mac,
             irq_vector,
@@ -259,14 +262,25 @@ impl Device {
         state.connection = None;
         state.clear_transmit();
         state.eapol.clear();
-        let mut parsed =
-            super::parse_ucode(&self.firmware).map_err(|_| WirelessError::HardwareError)?;
-        parsed.api.pnvm = self.pnvm.as_deref();
-        let mac = state
-            .hardware
-            .restart(&parsed)
-            .await
-            .map_err(|_| WirelessError::HardwareError)?;
+        #[cfg(any(test, feature = "kernel-test"))]
+        let model = super::runtime::model::is_model(&state.hardware);
+        #[cfg(not(any(test, feature = "kernel-test")))]
+        let model = false;
+        let mac = if model {
+            // RAM fixture: no PCI function or embedded CPU to restart.
+            super::runtime::model::restart(&mut state.hardware)
+                .map_err(|_| WirelessError::HardwareError)?;
+            self.mac
+        } else {
+            let mut parsed =
+                super::parse_ucode(&self.firmware).map_err(|_| WirelessError::HardwareError)?;
+            parsed.api.pnvm = self.pnvm.as_deref();
+            state
+                .hardware
+                .restart(&parsed)
+                .await
+                .map_err(|_| WirelessError::HardwareError)?
+        };
         if mac != self.mac {
             state.hardware.fail();
             return Err(WirelessError::HardwareError);
@@ -361,10 +375,61 @@ impl Device {
             narf_net::iface::install_rx_drain(drain_network);
             Ok(())
         })?;
+        narf_power::system_pm::register_async_system_pm(
+            "iwlwifi-mld",
+            Arc::new(SystemPm(self.clone())),
+        );
         let device = self.clone();
         narf_scheduler::spawn(async move {
             device.pump().await;
         });
+        Ok(())
+    }
+
+    /// Linux non-WoWLAN system suspend (`iwl_mld_suspend` without WoWLAN):
+    /// mac80211 quiesces the station with a deauthentication (the ordinary
+    /// disconnect), then `iwl_mld_mac80211_stop` stops the transport.
+    pub(super) async fn system_suspend(&self) -> Result<(), WirelessError> {
+        if self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        WirelessNetIface::disassociate(self).await?;
+        let mut state = self.state.lock().await;
+        if state.connection.is_some() {
+            return Err(WirelessError::Busy);
+        }
+        state.needs_reset = true;
+        state.clear_transmit();
+        state.eapol.clear();
+        state.beacons.clear();
+        #[cfg(any(test, feature = "kernel-test"))]
+        let model = super::runtime::model::is_model(&state.hardware);
+        #[cfg(not(any(test, feature = "kernel-test")))]
+        let model = false;
+        if model {
+            state.hardware.fail();
+        } else {
+            state
+                .hardware
+                .stop_for_suspend()
+                .await
+                .map_err(|_| WirelessError::HardwareError)?;
+        }
+        self.set_link(false);
+        self.suspended.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Resume: `iwl_mld_mac80211_start` -> firmware restart and runtime
+    /// configuration replay through the existing recovery owner. The
+    /// station starts unassociated.
+    pub(super) async fn system_resume(&self) -> Result<(), WirelessError> {
+        if !self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut state = self.state.lock().await;
+        self.recover(&mut state).await?;
+        self.suspended.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -1355,6 +1420,26 @@ fn drain_network() -> bool {
     };
     let frames = device.step(None);
     device.dispatch(frames)
+}
+
+/// Interrupt-driven half of Linux `iwl_pci_suspend`/`iwl_pci_resume`; it
+/// needs the scheduler and device interrupts, so it runs in the
+/// asynchronous system-PM phase.
+struct SystemPm(Arc<Device>);
+fn pm_error(error: WirelessError) -> narf_power::device_pm::DevicePmError {
+    if error == WirelessError::Busy {
+        narf_power::device_pm::DevicePmError::Busy
+    } else {
+        narf_power::device_pm::DevicePmError::DriverError
+    }
+}
+impl narf_power::system_pm::AsyncSystemPm for SystemPm {
+    fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        Box::pin(async move { self.0.system_suspend().await.map_err(pm_error) })
+    }
+    fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        Box::pin(async move { self.0.system_resume().await.map_err(pm_error) })
+    }
 }
 
 struct RegisteredDevice(Arc<Device>);

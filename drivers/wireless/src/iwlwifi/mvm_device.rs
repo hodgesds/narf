@@ -87,6 +87,8 @@ enum Operation {
     Close,
     /// Firmware/transport restart of a failed owner (`Owner::recover`).
     Recover,
+    /// System-suspend transport stop (`Owner::suspend_transport`).
+    Suspend,
 }
 struct Join {
     bssid: [u8; 6],
@@ -119,6 +121,8 @@ pub(super) struct Device {
     irq: Option<u8>,
     publication: AtomicBool,
     terminal: AtomicBool,
+    /// Set by a completed system-suspend stop until resume restarts it.
+    suspended: AtomicBool,
     stopping: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
     up: AtomicBool,
@@ -240,6 +244,7 @@ impl Device {
             irq,
             publication: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
+            suspended: AtomicBool::new(false),
             stopping,
             generation: Arc::new(AtomicU64::new(0)),
             up: AtomicBool::new(false),
@@ -330,12 +335,13 @@ impl Device {
             return Err("MVM native interface is not published");
         }
         let recovering = matches!(operation, Operation::Recover);
-        if self.terminal.load(Ordering::Acquire) != recovering {
-            return Err(if recovering {
-                "MVM recovery requires a terminal station"
-            } else {
-                "MVM station is terminal"
-            });
+        let suspending = matches!(operation, Operation::Suspend);
+        let terminal = self.terminal.load(Ordering::Acquire);
+        if recovering && !terminal {
+            return Err("MVM recovery requires a terminal station");
+        }
+        if terminal && !recovering && !suspending {
+            return Err("MVM station is terminal");
         }
         if self.stopping.load(Ordering::Acquire) && !matches!(operation, Operation::Close) {
             return Err("MVM station is closing");
@@ -357,6 +363,7 @@ impl Device {
                 || (matches!(operation, Operation::Maintain | Operation::Transmit)
                     && phase != Phase::DataPrepared)
                 || (recovering && !owner.station_failed())
+                || (suspending && phase != Phase::Configured && !owner.station_failed())
             {
                 return Err("MVM control busy");
             }
@@ -395,7 +402,7 @@ impl Device {
                         };
                     }
                     match device.source.invoke(|| {
-                        if closing {
+                        if closing || suspending {
                             return Ok(future.as_mut().poll(cx));
                         }
                         let domain = (device.environment.policy)()?;
@@ -456,6 +463,12 @@ impl Device {
             } else if closing {
                 let _publication = device.admission.lock();
                 device.stopping.store(false, Ordering::Release);
+            } else if suspending {
+                owner.station_fail();
+                device.down(true);
+                state.pending = None;
+                state.scan_time = None;
+                device.suspended.store(true, Ordering::Release);
             } else if restart.is_some() {
                 // The restarted owner is Configured with no port; reopen
                 // control only while the publication itself stays current.
@@ -495,6 +508,39 @@ impl Device {
             return Err("MVM recovery did not reopen the station");
         }
         Ok(())
+    }
+    /// Linux non-WoWLAN system suspend: mac80211 `ieee80211_mgd_quiesce`
+    /// leaves the BSS with a deauthentication (the ordinary close owner),
+    /// then `iwl_mvm_mac_stop` stops the transport. Idempotent while
+    /// suspended.
+    pub(super) async fn system_suspend(&self) -> Result<(), &'static str> {
+        if self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if !self.terminal.load(Ordering::Acquire) {
+            WirelessNetIface::disassociate(self)
+                .await
+                .map_err(|_| "MVM suspend could not leave the BSS")?;
+        }
+        let reply = self.begin(Operation::Suspend)?;
+        self.wait(reply).await?;
+        if !self.suspended.load(Ordering::Acquire) {
+            return Err("MVM suspend did not stop the transport");
+        }
+        Ok(())
+    }
+    /// Resume: `ieee80211_reconfig` -> `iwl_mvm_up` on the stopped device,
+    /// through the same retained restart as firmware recovery. The station
+    /// starts unassociated; the SME rejoins after a new scan.
+    pub(super) async fn system_resume(&self) -> Result<(), &'static str> {
+        if !self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let result = self.recover_failed().await;
+        if result.is_ok() {
+            self.suspended.store(false, Ordering::Release);
+        }
+        result
     }
     async fn wait(&self, reply: Reply) -> Result<Outcome, &'static str> {
         poll_fn(|cx| {
@@ -647,6 +693,19 @@ impl Device {
                     }
                 }
                 owner.recover().await?;
+                Ok(Outcome::Done)
+            }
+            Operation::Suspend => {
+                *pending = None;
+                *scan_time = None;
+                if let Some(tx) = transmit.as_mut() {
+                    for _ in 0..TX_RING_N {
+                        if !matches!(tx.try_recv(), Ok(Some(_))) {
+                            break;
+                        }
+                    }
+                }
+                owner.suspend_transport().await?;
                 Ok(Outcome::Done)
             }
         }
@@ -897,6 +956,10 @@ impl Device {
             Ok(())
         })?;
         if worker {
+            narf_power::system_pm::register_async_system_pm(
+                "iwlwifi-mvm",
+                Arc::new(SystemPm(self.clone())),
+            );
             let device = self.clone();
             narf_scheduler::spawn(async move {
                 device.pump().await;
@@ -1129,6 +1192,26 @@ impl WirelessNetIface for Device {
     }
 }
 struct Registered(Arc<Device>);
+/// Interrupt-driven half of Linux `iwl_pci_suspend`/`iwl_pci_resume`
+/// (`mvm/d3.c` without WoWLAN): it needs the scheduler and device
+/// interrupts, so it runs in the asynchronous system-PM phase rather than
+/// the interrupt-gated `DevicePmOps` fan-out.
+struct SystemPm(Arc<Device>);
+fn pm_error(error: &'static str) -> narf_power::device_pm::DevicePmError {
+    if error == "MVM control busy" || error == "MVM station is closing" {
+        narf_power::device_pm::DevicePmError::Busy
+    } else {
+        narf_power::device_pm::DevicePmError::DriverError
+    }
+}
+impl narf_power::system_pm::AsyncSystemPm for SystemPm {
+    fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        Box::pin(async move { self.0.system_suspend().await.map_err(pm_error) })
+    }
+    fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        Box::pin(async move { self.0.system_resume().await.map_err(pm_error) })
+    }
+}
 fn admitted(bytes: &[u8], mac: [u8; 6], meta: narf_net::TxMeta) -> bool {
     (14..=1514).contains(&bytes.len())
         && bytes[6..12] == mac
