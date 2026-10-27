@@ -34,10 +34,10 @@
 //!
 //! Seams left for the follow-on lanes, deliberately minimal: P8
 //! (#1006) gets the authenticated [`RecordedPolicy`] record to
-//! enforce. Real anchors are later lanes too: FIDO token P3 (#999),
-//! TPM P6 (#1002), Argon2id passphrase P7 (#1004); the token resume
-//! ceremony that drives them from the resume environment is P5
-//! (#1001).
+//! enforce. Real anchors land per lane: the FIDO token anchor and
+//! its resume ceremony are here ([`token_anchor`], P3 #999 + P5
+//! #1001); TPM sealing is P6 (#1002) and the Argon2id passphrase
+//! floor is P7 (#1004).
 //!
 //! The state-hook registry (design §5) lives in [`hooks`]: drivers
 //! register [`SuspendStateHook`]s, the seal fan-out runs inside
@@ -60,6 +60,7 @@ mod hooks;
 mod image;
 mod resume;
 mod slots;
+mod token_anchor;
 
 pub use anchor::{AnchorError, AnchorKind, KeyCustodyAnchor, UnwrapCtx, WrapCtx, WrappedSlot};
 pub use custody::Secret32;
@@ -78,6 +79,10 @@ pub use image::{
 };
 pub use resume::{attempt_resume, ConsolePrompt, ResumePrompt, ResumeRefusal, VerifiedResume};
 pub use slots::{EpochSlots, SlotArea, SlotRecord};
+pub use token_anchor::{
+    resume_with_token, suspend_client_data_hash, ConsoleTokenUi, TokenAnchor, TokenAnchorConfig,
+    TokenPinMode, TokenUserInterface, SUSPEND_RP_ID, SUSPEND_USER_NAME,
+};
 
 /// Crate-visible writer surface for fixtures (the resume-env
 /// smokes craft hook-region images the service itself does not

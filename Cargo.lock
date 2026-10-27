@@ -3009,6 +3009,7 @@ dependencies = [
  "narf-capabilities",
  "narf-console",
  "narf-crypto",
+ "narf-ctap2",
  "narf-event-bus",
  "narf-filesystem",
  "narf-init",
