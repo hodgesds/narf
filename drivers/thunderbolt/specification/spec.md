@@ -18,6 +18,13 @@ A controller needs an accessible BAR0 and coherent DMA.
 PCI class `0x0c0340` identifies a USB4 NHI, including AMD Pink Sardine. The
 number of NHI functions does not determine the number of physical USB-C ports.
 
+A controller whose NHI firmware status (`REG_FW_STS`, bit 0 `ICM_EN`) reports
+the legacy firmware connection manager (ICM) enabled is not a native-CM
+target: the firmware owns that fabric. Detection samples the status until it
+settles (two consecutive equal reads) and any state that will not settle, or
+cannot be read, is treated as firmware-owned. The native CM stands down for
+such controllers; it never starts, resets, or speaks to the ICM firmware.
+
 ## 3. Public interface
 
 - `nhi::matches_controller(vendor, device, class)` accepts the USB4 class and
@@ -45,9 +52,18 @@ number of NHI functions does not determine the number of physical USB-C ports.
   CM exited with tunnel writes unrolled-back. Together they are the
   state the CM's device-PM handler gates system suspend on (§4).
 - `register_initcalls()` registers PCI discovery at Device and starts one
-  task per controller at Late. MSI-X wakes the task, with bounded timed
+  task per natively managed controller at Late. MSI-X wakes the task, with bounded timed
   polling when MSI-X is unavailable. No config transaction holds a spinlock
   across an await.
+- `icm::domain_statuses() -> Vec<DomainStatus>` snapshots the per-controller
+  firmware-CM detection verdict recorded at CM start: `Native`,
+  `FirmwareManaged`, `Unsettled`, or `Unreadable`, with the settled
+  `REG_FW_STS` value when one was observed; `icm::firmware_managed_count()`
+  reports how many controllers the firmware manages. Detection
+  (`icm::classify` over sampled `REG_FW_STS` reads) gates CM start per
+  controller, before ring 0 and — when no controller is native — before the
+  `_OSC` request is made at all. Stood-down controllers get no ring, no
+  config traffic, and no device-PM registration.
 
 The implementation supports USB4 routers with buffer-allocation parameters,
 USB3 tunneling between parent/child routers, PCIe tunnelling between an
@@ -93,6 +109,14 @@ sleep. Transport failure clears public snapshots and attempts owned-path
 teardown; a poisoned channel can prevent that teardown, and the orphaned
 domain's refusal persists until a CM for it tears the paths down.
 
+The native CM never touches a firmware-managed controller. ICM detection
+reads `REG_FW_STS` and nothing else: the register's host-writable ICM
+control bits and the ICM mailbox registers are never written, ring 0 is
+never started for a stood-down controller, and a controller whose firmware
+status will not settle or cannot be read is stood down from rather than
+fought over. Detection is per controller — one firmware-managed controller
+neither blocks nor is endangered by a native CM on another.
+
 ## 5. Architecture notes
 
 The transport is shared across x86_64 and aarch64 and uses the bus/DMA/IRQ
@@ -116,7 +140,10 @@ it does not emulate an AMD USB4 dock or prove physical monitor output.
 Hardware validation; full DP bandwidth allocation and multiple DP tunnels;
 firmware tunnel adoption; tunnel suspend/replay (live tunnels still veto
 system suspend); controller reset recovery after resume;
-legacy Thunderbolt/ICM, XDomain tunnels, link bonding and retimer policy.
+XDomain tunnels, link bonding and retimer policy.
+Legacy ICM is closed by detect-and-defer (§3): firmware-managed hosts are
+stood aside from, and implementing the ICM protocol itself — or adopting
+the firmware's tunnels — is out of scope by design, not pending work.
 PCIe remainders: a pre-activation wait for the PCIe adapters' LTSSM
 Detect state, and a runtime PCI rescan of the NHI's companion bridge so
 tunnelled devices enumerate without a reboot (the CM publishes tunnels;
