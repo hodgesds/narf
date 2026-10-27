@@ -1,6 +1,6 @@
 //! Measured Boot Support — hardware-anchored TCB integrity.
 //!
-//! Spec: `frame/specification/spec.md` §3.7. Anchors the NARF security
+//! Spec: `security-model/specification/spec.md` §9. Anchors the NARF security
 //! model by measuring the boot chain into the TPM's PCRs (Platform
 //! Configuration Registers).
 //!
@@ -501,7 +501,7 @@ fn record_owned(
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use async_trait::async_trait;
-use core::sync::atomic::{AtomicBool, AtomicU32};
+use core::sync::atomic::AtomicU32;
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_tpm::{TpmDevice, TpmInfo};
 

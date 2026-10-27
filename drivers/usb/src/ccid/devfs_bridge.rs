@@ -1011,7 +1011,7 @@ mod tests {
         reset();
         let fake = FakeTransport::new(true);
         let idx = register_ccid_transport(fake.clone());
-        if slot_present(idx, 0) != None {
+        if slot_present(idx, 0).is_some() {
             return TestResult::Fail("presence should start unobserved");
         }
         match narf_scheduler::block_on(refresh_slot_presence(idx, 0)) {
