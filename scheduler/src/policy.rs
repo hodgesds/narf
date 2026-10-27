@@ -1344,8 +1344,9 @@ pub(crate) fn pick_next_slot(
     // awake exact-id match can be proven top-tier without walking every parked
     // slot first. Search from the back because a waiter that just parked was
     // requeued there. ClassScheduler also checks the conservative per-CPU
-    // possible-class summary, so a higher class forces the full scan. Leave
-    // RUNNABLE_PEER conservative: a later full scan can refine its stale true
+    // possible-class and uniform-metadata summaries, so higher classes and
+    // mixed priorities force the full scan. Leave RUNNABLE_PEER conservative:
+    // a later full scan can refine its stale true
     // without risking a false store racing another wake.
     //
     // External schedulers still receive their normal pick callback and use the
@@ -1361,7 +1362,8 @@ pub(crate) fn pick_next_slot(
             builtin_class
                 && crate::has_higher_possible_class(cpu.0 as usize, q[pos].spec.class.rank())
         });
-        if let Some(pos) = urgent_pos.filter(|_| !higher_class_awake) {
+        let mixed_class_queue = builtin_class && !crate::class_fifo_uniform(cpu.0 as usize);
+        if let Some(pos) = urgent_pos.filter(|_| !higher_class_awake && !mixed_class_queue) {
             let slot = q
                 .remove(pos)
                 .expect("urgent next-buddy position disappeared under queue lock");
@@ -1542,7 +1544,8 @@ pub(crate) fn pick_next_slot(
     }
     // Pick priority, each honored ONLY at the top eligibility tier so none can
     // bypass a strict throttle (mirrors Linux `pick_next_entity` taking
-    // `cfs_rq->next` only `&& entity_eligible`):
+    // `cfs_rq->next` only `&& entity_eligible`). Class-policy buddies must also
+    // match the winning class, priority and realtime deadline:
     //   1. the wake-next buddy — a just-woken task jumps ahead of the tasks
     //      queued in front of it (latency, not fairness — the buddy is cleared
     //      above so it is a single boost),
@@ -1550,7 +1553,12 @@ pub(crate) fn pick_next_slot(
     //   3. the earliest top-tier slot (the default FIFO order).
     let wake_next_class_ok = |wake_pos: usize| {
         !builtin_class
-            || class_pick.is_some_and(|(_, _, class, _, _)| q[wake_pos].spec.class == class)
+            || class_pick.is_some_and(|(_, _, class, priority, deadline)| {
+                let wake = &q[wake_pos].spec;
+                wake.class == class
+                    && wake.priority == priority
+                    && (class != SchedClass::Realtime || wake.budget.deadline_cycles == deadline)
+            })
     };
     let pos = match wake_next_hit {
         Some((wake_pos, wake_tier)) if wake_tier == best_tier && wake_next_class_ok(wake_pos) => {

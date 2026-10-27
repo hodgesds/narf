@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-6"
-prompt_hash = "130cc32d0f83a14b149f88320e1aed2687678d6aa037923a6161e81d1615f298"
+prompt_hash = "91ad3c7c8ccb1e77e9c0d7b694c4bc5ede48792cd01bf2e98790a342fec1b5af"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -1967,3 +1967,11 @@ argument = "RCU callback reclamation is sharded across boot-preallocated, migrat
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "Parallel RCU workers use the existing scheduler-owned kernel-task domain context and Send-bound deferred values. Sharding changes only which ordinary kernel worker destroys an already-unreachable object after its existing grace-period proof. No early stack reuse, user-memory unmap, ownership bypass, added domain rights, or capability grant is introduced. Wake callbacks allocate nothing; worker stacks and signal slots exist before the hook is published. Explicit synchronization continues to drain all pending worker queues."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Futex wake-to-run optimization stays inside the existing userspace/scheduler boundary. An owned Waker and validated static vtable prove the WakeCell lifetime and identity before publication; the urgent hint retains its own Arc. Durable SeqCst wake publication and activation staging precede hint publication. The local hint preserves the indexed parked owner, but only the existing authoritative queue claim may execute it after checking policy, affinity, budgets, completion, execution kind and exclusive direct_claimed state. Remote wakes retain the existing placement and IPI path, and no synchronous-affinity migration is added. Self and mismatched identities cannot nominate an exact target. Direct entry, yield claims and root return require the conservative homogeneous-queue guard; any exceptional class, priority, budget or capability metadata defers to normal policy. Class-policy buddy selection also preserves the winning priority and realtime deadline. Direct handoff restores the existing AS/TLS/FPU/domain context and retains the 64-return fairness and QSBR bound."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Each CPU's urgent task id and optional exact WakeCell owner are now one IRQ-safe-lock-serialized state. Readers use only an acquire pending-id check before acquiring the lock; they never dereference an unowned pointer. Scalar publication preserves a same-task exact owner and removes a different-task owner; consumption cannot erase or pair a newer id with another allocation. Replaced Arc owners drop only after unlocking, and no hint lock spans a callback, poll, yield or context switch. A scalar-only third-task publication also declines a direct root return while remaining pending for normal dispatch. Hints convey scheduling preference rather than authority; existing capability gates, task metadata, ownership and domain restoration remain authoritative."

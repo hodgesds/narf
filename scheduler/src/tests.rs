@@ -4121,6 +4121,323 @@ kernel_test_in!(
     smoke_scheduler_sync_wake_activates_locally_without_inbox
 );
 
+fn smoke_scheduler_local_preempt_wake_keeps_indexed_owner() -> TestResult {
+    use core::sync::atomic::Ordering;
+    use narf_capabilities::{Cap, Grant};
+
+    crate::__reset_queues_for_test();
+    let cap: Cap<crate::SchedPolicy, Grant> = Cap::bootstrap();
+    if crate::install_scheduler(&cap, crate::ClassScheduler).is_err() {
+        return TestResult::Fail("install_scheduler(Class) failed");
+    }
+    let cpu = narf_lib::percpu::current_cpu();
+    let task = crate::spawn_stackful(core::future::pending::<()>());
+    let _ = crate::poll_one_round();
+    let cell = crate::PARKED[cpu]
+        .lock()
+        .as_ref()
+        .and_then(|slots| slots.get(&task))
+        .map(|entry| entry.slot.awake.clone());
+    let Some(cell) = cell else {
+        return TestResult::Fail("stackful waiter did not park");
+    };
+    // Kernel-thread spawns conservatively leave this cache off. This fixture
+    // has the same plain unthrottled metadata as an eligible user waiter, and
+    // owns a real initialized KernelTask continuation.
+    cell.direct_eligible.store(true, Ordering::Release);
+    let location = cell.parked_location.load(Ordering::Acquire);
+    crate::wake_preempt_task(crate::make_waker(cell.clone()), task.raw());
+    let hint = crate::take_urgent_wake_cell(cpu);
+    let exact = hint
+        .as_ref()
+        .is_some_and(|hint| alloc::sync::Arc::ptr_eq(hint, &cell));
+    let indexed =
+        location != crate::NOT_PARKED && cell.parked_location.load(Ordering::Acquire) == location;
+    let claim = hint
+        .as_ref()
+        .and_then(|hint| crate::claim_direct_handoff_target(cpu, hint));
+    let claimed = claim.as_ref().is_some_and(|target| target.id == task.raw());
+    if let Some(target) = claim {
+        crate::release_direct_handoff_target(&target.cell, false);
+    }
+    // The original activation may still be pending. A second wake must not
+    // create another owner, whether the direct path was used or declined.
+    crate::wake_preempt_task(crate::make_waker(cell), task.raw());
+    crate::drain_wake_list(cpu);
+    let unique = crate::READY[cpu]
+        .lock()
+        .as_ref()
+        .is_some_and(|queue| queue.iter().filter(|slot| slot.id == task).count() == 1);
+    crate::__reset_queues_for_test();
+    if !exact {
+        TestResult::Fail("local futex wake did not publish its exact handle")
+    } else if !indexed {
+        TestResult::Fail("local futex wake lost its indexed parked owner")
+    } else if !claimed {
+        TestResult::Fail("local futex wake could not claim its indexed owner")
+    } else if !unique {
+        TestResult::Fail("local futex wake duplicated activation")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!(
+    "scheduler/wake",
+    smoke_scheduler_local_preempt_wake_keeps_indexed_owner
+);
+
+fn smoke_scheduler_urgent_scalar_replaces_exact_hint() -> TestResult {
+    use alloc::sync::Arc;
+    crate::__reset_queues_for_test();
+    let cpu = narf_lib::percpu::current_cpu();
+    let cell = crate::new_wake_cell(crate::TaskId(71001), cpu as u32, true);
+    crate::hint_urgent_next_on(cpu as u32, cell.task, Arc::as_ptr(&cell));
+    crate::hint_urgent_next(cell.task);
+    let same = crate::take_urgent_wake_cell(cpu);
+    let same_preserved = same.as_ref().is_some_and(|hint| Arc::ptr_eq(hint, &cell));
+    drop(same);
+    crate::hint_urgent_next_on(cpu as u32, cell.task, Arc::as_ptr(&cell));
+    crate::hint_urgent_next(71002);
+    let stale = crate::take_urgent_wake_cell(cpu);
+    let stale_was_some = stale.is_some();
+    let latest = crate::take_urgent_next(cpu as u32);
+    drop(stale);
+    let retained = Arc::strong_count(&cell);
+    crate::__reset_queues_for_test();
+    if !same_preserved || stale_was_some || latest != 71002 || retained != 1 {
+        TestResult::Fail("id-only publication retained another task's exact wake handle")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!(
+    "scheduler/wake",
+    smoke_scheduler_urgent_scalar_replaces_exact_hint
+);
+
+fn smoke_scheduler_preempt_wake_validates_owned_and_foreign_wakers() -> TestResult {
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    struct Count(Arc<AtomicUsize>);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    crate::__reset_queues_for_test();
+    let cpu = narf_lib::percpu::current_cpu();
+    let cell = crate::new_wake_cell(crate::TaskId(72001), cpu as u32, true);
+    cell.flag.store(false, Ordering::Release);
+    crate::wake_preempt_task(crate::make_waker(cell.clone()), 72002);
+    let mismatch_woke = cell.flag.load(Ordering::Acquire);
+    let mismatch_hint = crate::take_urgent_wake_cell(cpu);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let foreign = core::task::Waker::from(Arc::new(Count(calls.clone())));
+    crate::wake_preempt_task(foreign, 72003);
+    let foreign_hint = crate::take_urgent_wake_cell(cpu);
+    let foreign_calls = calls.load(Ordering::Relaxed);
+    crate::__reset_queues_for_test();
+    if !mismatch_woke || mismatch_hint.is_some() || foreign_hint.is_some() || foreign_calls != 1 {
+        TestResult::Fail("foreign or mismatched wake created a false exact handoff")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!(
+    "scheduler/wake",
+    smoke_scheduler_preempt_wake_validates_owned_and_foreign_wakers
+);
+
+fn smoke_scheduler_preempt_self_wake_keeps_existing_hint() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::task::Poll;
+    crate::__reset_queues_for_test();
+    let cpu = narf_lib::percpu::current_cpu();
+    let passed = Arc::new(AtomicBool::new(false));
+    let observed = passed.clone();
+    let other = crate::new_wake_cell(crate::TaskId(73001), cpu as u32, true);
+    let target = other.clone();
+    crate::spawn_stackful(core::future::poll_fn(move |cx| {
+        let id = crate::current_task_id().raw();
+        // Exercise self-exclusion with an otherwise eligible kernel fixture.
+        if let Some(cell) = crate::scheduler_wake_cell(cx.waker()) {
+            cell.direct_eligible.store(true, Ordering::Release);
+        }
+        crate::hint_urgent_next_on(cpu as u32, target.task, Arc::as_ptr(&target));
+        crate::wake_preempt_task(cx.waker().clone(), id);
+        let hint = crate::take_urgent_wake_cell(cpu);
+        observed.store(
+            id != 0 && hint.as_ref().is_some_and(|hint| Arc::ptr_eq(hint, &target)),
+            Ordering::Release,
+        );
+        Poll::Ready(())
+    }));
+    let _ = crate::poll_one_round();
+    let okay = passed.load(Ordering::Acquire);
+    crate::__reset_queues_for_test();
+    if okay {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("self-wake replaced another waiter's exact handoff hint")
+    }
+}
+kernel_test_in!(
+    "scheduler/wake",
+    smoke_scheduler_preempt_self_wake_keeps_existing_hint
+);
+
+fn smoke_scheduler_scalar_third_task_blocks_direct_root_return() -> TestResult {
+    crate::__reset_queues_for_test();
+    let cpu = narf_lib::percpu::current_cpu();
+    crate::hint_urgent_next(74002);
+    let declined = crate::take_urgent_for_root(cpu, 74001).is_err();
+    let preserved = crate::take_urgent_next(cpu as u32) == 74002;
+    crate::hint_urgent_next(74001);
+    let accepted = matches!(crate::take_urgent_for_root(cpu, 74001), Ok(None));
+    let consumed = crate::take_urgent_next(cpu as u32) == 0;
+    crate::__reset_queues_for_test();
+    if declined && preserved && accepted && consumed {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("direct root return ignored or consumed a third task's scalar hint")
+    }
+}
+kernel_test_in!(
+    "scheduler/wake",
+    smoke_scheduler_scalar_third_task_blocks_direct_root_return
+);
+
+fn smoke_scheduler_direct_claim_defers_on_mixed_priority_queue() -> TestResult {
+    use core::sync::atomic::Ordering;
+    use narf_capabilities::{Cap, Grant};
+    crate::__reset_queues_for_test();
+    let cap: Cap<crate::SchedPolicy, Grant> = Cap::bootstrap();
+    if crate::install_scheduler(&cap, crate::ClassScheduler).is_err() {
+        return TestResult::Fail("install_scheduler(Class) failed");
+    }
+    let cpu = narf_lib::percpu::current_cpu();
+    let task = crate::spawn_stackful(core::future::pending::<()>());
+    let _ = crate::poll_one_round();
+    let cell = crate::PARKED[cpu]
+        .lock()
+        .as_ref()
+        .and_then(|slots| slots.get(&task))
+        .map(|entry| entry.slot.awake.clone());
+    let Some(cell) = cell else {
+        return TestResult::Fail("waiter did not park");
+    };
+    cell.direct_eligible.store(true, Ordering::Release);
+    crate::spawn_with_spec(
+        core::future::pending::<()>(),
+        crate::TaskSpec {
+            priority: crate::Priority::HIGH,
+            ..crate::TaskSpec::unthrottled()
+        },
+    );
+    crate::wake_preempt_task(crate::make_waker(cell.clone()), task.raw());
+    let claim = crate::claim_direct_handoff_target(cpu, &cell);
+    let declined = claim.is_none();
+    if let Some(target) = claim {
+        crate::release_direct_handoff_target(&target.cell, false);
+    }
+    crate::__reset_queues_for_test();
+    if declined {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("direct claim bypassed a mixed-priority queue")
+    }
+}
+kernel_test_in!(
+    "scheduler/wake",
+    smoke_scheduler_direct_claim_defers_on_mixed_priority_queue
+);
+
+fn smoke_scheduler_urgent_buddy_respects_same_class_priority() -> TestResult {
+    let low = crate::TaskSpec::unthrottled();
+    let high = crate::TaskSpec {
+        priority: crate::Priority::HIGH,
+        ..low
+    };
+    if urgent_class_buddy_order(low, high) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("urgent buddy bypassed a higher-priority peer in the same class")
+    }
+}
+kernel_test_in!(
+    "scheduler/wake",
+    smoke_scheduler_urgent_buddy_respects_same_class_priority
+);
+
+fn smoke_scheduler_urgent_buddy_respects_realtime_deadline() -> TestResult {
+    use narf_capabilities::{Cap, Spend};
+    crate::__reset_queues_for_test();
+    let authority: Cap<crate::CpuBudget, Spend> = Cap::bootstrap();
+    let deadline = narf_time::now_cycles().saturating_add(10_000_000);
+    let later = crate::TaskSpec::realtime_periodic(1, 1_000, deadline.saturating_add(10_000));
+    let earlier = crate::TaskSpec::realtime_periodic(1, 1_000, deadline);
+    let (Ok(later), Ok(earlier)) = (
+        crate::spawn_realtime(async {}, later, &authority),
+        crate::spawn_realtime(async {}, earlier, &authority),
+    ) else {
+        crate::__reset_queues_for_test();
+        return TestResult::Fail("realtime deadline fixture admission failed");
+    };
+    crate::hint_urgent_next(later.raw());
+    let cpu = crate::CpuId(narf_lib::percpu::current_cpu() as u32);
+    let picked = {
+        let mut ready = crate::READY[cpu.0 as usize].lock();
+        ready.as_mut().and_then(|queue| {
+            crate::policy::pick_next_slot(Some(&crate::ClassScheduler), cpu, queue)
+        })
+    };
+    let correct = picked.is_some_and(|(handle, _)| handle.task_id() == earlier);
+    crate::__reset_queues_for_test();
+    if correct {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("urgent buddy bypassed an earlier equal-priority realtime deadline")
+    }
+}
+kernel_test_in!(
+    "scheduler/wake",
+    smoke_scheduler_urgent_buddy_respects_realtime_deadline
+);
+
+fn urgent_class_buddy_order(low: crate::TaskSpec, high: crate::TaskSpec) -> bool {
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use narf_capabilities::{Cap, Grant};
+    use narf_lib::sync::IrqSafeSpinLock;
+    crate::__reset_queues_for_test();
+    let cap: Cap<crate::SchedPolicy, Grant> = Cap::bootstrap();
+    if crate::install_scheduler(&cap, crate::ClassScheduler).is_err() {
+        return false;
+    }
+    let order = Arc::new(IrqSafeSpinLock::new(Vec::new()));
+    let low_order = order.clone();
+    let low = crate::spawn_with_spec(
+        async move {
+            low_order.lock().push(1u8);
+        },
+        low,
+    );
+    let high_order = order.clone();
+    crate::spawn_with_spec(
+        async move {
+            high_order.lock().push(2u8);
+        },
+        high,
+    );
+    crate::hint_urgent_next(low.raw());
+    let _ = crate::poll_one_round();
+    let correct = order.lock().as_slice() == [2, 1];
+    crate::__reset_queues_for_test();
+    correct
+}
+
 fn smoke_scheduler_pending_local_wake_precedes_idle() -> TestResult {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicBool, Ordering};

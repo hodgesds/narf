@@ -1312,27 +1312,24 @@ unsafe fn try_direct_return_to_root(
     current: *mut KernelTask,
     current_ctx: *mut KernelContext,
 ) -> bool {
-    if !direct_handoff_active(cpu) {
+    if !direct_handoff_active(cpu) || !crate::class_fifo_uniform(cpu) {
         return false;
     }
     narf_lib::sync::without_interrupts(|| {
         let direct_state = &DIRECT_HANDOFF[cpu];
-        let urgent = crate::take_urgent_wake_cell(cpu);
         let root = direct_state.root.load(Ordering::Acquire);
         if root.is_null() {
-            if let Some(cell) = urgent.as_ref() {
-                crate::fallback_urgent_wake(cell);
-            }
             return false;
         }
         // SAFETY: an active handoff pins the off-queue root until either this
         // return or the ordinary executor-return path completes.
         let root_ref = unsafe { &*root };
         let Some(root_cell) = task_wake_cell(root_ref) else {
-            if let Some(cell) = urgent.as_ref() {
-                crate::fallback_urgent_wake(cell);
-            }
             return false;
+        };
+        let urgent = match crate::take_urgent_for_root(cpu, root_cell.task) {
+            Ok(urgent) => urgent,
+            Err(()) => return false,
         };
         if let Some(cell) = urgent {
             if !core::ptr::eq(Arc::as_ptr(&cell), root_cell) {
@@ -3852,6 +3849,17 @@ pub fn note_wake_preempt(woken: u64) {
 /// authoritative CPU and follow ordinary executor dispatch.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn note_urgent_wake_preempt(woken: u64) {
+    request_urgent_wake_preempt(woken, false);
+}
+
+/// The caller has published an exact, awake, local direct-eligible WakeCell.
+/// This is a scheduling hint only: the direct claim still validates the owning
+/// queue and policy. Avoid re-discovering that handle through a task-id scan.
+pub(crate) fn note_local_urgent_wake_preempt(woken: u64) {
+    request_urgent_wake_preempt(woken, true);
+}
+
+fn request_urgent_wake_preempt(woken: u64, local_handle: bool) {
     if !USE_OWN_STACK.load(Ordering::Acquire) {
         return;
     }
@@ -3865,13 +3873,15 @@ pub fn note_urgent_wake_preempt(woken: u64) {
     if crate::current_task_id().raw() == woken {
         return;
     }
-    if !crate::task_runnable_on_current_cpu(woken) {
+    if !local_handle && !crate::task_runnable_on_current_cpu(woken) {
         return;
     }
     URGENT_WAKE_PREEMPT.inner[cpu]
         .value
         .store(true, Ordering::Release);
-    crate::hint_urgent_next(woken);
+    if !local_handle {
+        crate::hint_urgent_next(woken);
+    }
 }
 
 /// Divisor of a task's time slice at which it becomes eligible for an EARLY
@@ -7914,6 +7924,102 @@ pub mod tests {
         }
         TestResult::Pass
     }
+
+    fn smoke_direct_return_defers_to_new_higher_class() -> TestResult {
+        use alloc::sync::Arc;
+        use core::sync::atomic::AtomicBool;
+        use narf_capabilities::{Cap, Grant};
+        use narf_lib::sync::IrqSafeSpinLock;
+
+        struct State {
+            wake: IrqSafeSpinLock<Option<Waker>>,
+            phase: AtomicU32,
+            high_ran: AtomicBool,
+            failed: AtomicBool,
+        }
+        crate::__reset_queues_for_test();
+        let cap: Cap<crate::SchedPolicy, Grant> = Cap::bootstrap();
+        if crate::install_scheduler(&cap, crate::ClassScheduler).is_err() {
+            return TestResult::Fail("install_scheduler(Class) failed");
+        }
+        let state = Arc::new(State {
+            wake: IrqSafeSpinLock::new(None),
+            phase: AtomicU32::new(0),
+            high_ran: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+        });
+        let target_state = state.clone();
+        let options = crate::StackfulOptions {
+            no_preempt: true,
+            ..Default::default()
+        };
+        let target = crate::spawn_stackful_with_options(
+            core::future::poll_fn(move |cx| {
+                // Both fixtures own real kernel continuations with plain normal
+                // metadata; opt them into the cache normally enabled for users.
+                let cell = crate::scheduler_wake_cell(cx.waker()).expect("target wake cell");
+                cell.direct_eligible.store(true, Ordering::Release);
+                if target_state.phase.load(Ordering::Acquire) == 0 {
+                    *target_state.wake.lock() = Some(cx.waker().clone());
+                    target_state.phase.store(1, Ordering::Release);
+                    return Poll::Pending;
+                }
+                let high = target_state.clone();
+                crate::spawn_with_spec(
+                    async move {
+                        high.high_ran.store(true, Ordering::Release);
+                    },
+                    crate::TaskSpec {
+                        class: crate::SchedClass::Interactive,
+                        ..crate::TaskSpec::unthrottled()
+                    },
+                );
+                target_state.phase.store(3, Ordering::Release);
+                if !cooperative_yield() || !target_state.high_ran.load(Ordering::Acquire) {
+                    target_state.failed.store(true, Ordering::Release);
+                }
+                Poll::Ready(())
+            }),
+            options,
+        );
+        let root = state.clone();
+        crate::spawn_stackful_with_options(
+            core::future::poll_fn(move |cx| {
+                let cell = crate::scheduler_wake_cell(cx.waker()).expect("root wake cell");
+                cell.direct_eligible.store(true, Ordering::Release);
+                if root.phase.load(Ordering::Acquire) != 1 {
+                    root.failed.store(true, Ordering::Release);
+                }
+                let wake = root.wake.lock().take().expect("target armed");
+                root.phase.store(2, Ordering::Release);
+                crate::wake_preempt_task(wake, target.raw());
+                if !cooperative_yield() || !root.high_ran.load(Ordering::Acquire) {
+                    root.failed.store(true, Ordering::Release);
+                }
+                Poll::Ready(())
+            }),
+            options,
+        );
+        let saved = USE_OWN_STACK.swap(true, Ordering::AcqRel);
+        let before = direct_handoff_count();
+        crate::run_until_empty();
+        USE_OWN_STACK.store(saved, Ordering::Release);
+        let entered = direct_handoff_count() > before;
+        let failed = state.failed.load(Ordering::Acquire);
+        let high_ran = state.high_ran.load(Ordering::Acquire);
+        crate::__reset_queues_for_test();
+        if !entered {
+            TestResult::Fail("priority fixture never entered direct handoff")
+        } else if failed || !high_ran {
+            TestResult::Fail("direct return bypassed newly runnable higher-class work")
+        } else {
+            TestResult::Pass
+        }
+    }
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_direct_return_defers_to_new_higher_class
+    );
 
     /// A synchronous wake followed by a source park must enter the exact
     /// resident wakee without first returning through the executor. If that

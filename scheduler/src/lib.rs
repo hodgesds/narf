@@ -652,18 +652,88 @@ static WAKE_NEXT: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
 /// published only after a real waiter was removed from its wait queue and was
 /// observed runnable on this CPU.
 #[repr(align(64))]
-struct PerCpuTaskHint(AtomicU64);
-static URGENT_WAKE_NEXT: [PerCpuTaskHint; narf_lib::percpu::MAX_CPUS] =
-    [const { PerCpuTaskHint(AtomicU64::new(0)) }; narf_lib::percpu::MAX_CPUS];
+struct UrgentWakeHint {
+    /// Read-only empty check on ordinary dispatch. Every writer holds `cell`.
+    task: AtomicU64,
+    cell: IrqSafeSpinLock<Option<Arc<WakeCell>>>,
+}
 
-/// Owning reference for the exact synchronous wake target. The raw pointer is
-/// one `Arc<WakeCell>` strong reference; consumers reconstruct and own it.
-/// Keeping the cell, rather than only its task id, lets a running stackful task
-/// claim the wakee without a global task lookup while preserving lifetime.
-#[repr(align(64))]
-struct PerCpuUrgentWake(AtomicPtr<WakeCell>);
-static URGENT_WAKE_CELL: [PerCpuUrgentWake; narf_lib::percpu::MAX_CPUS] =
-    [const { PerCpuUrgentWake(AtomicPtr::new(core::ptr::null_mut())) }; narf_lib::percpu::MAX_CPUS];
+impl UrgentWakeHint {
+    const NEW: Self = Self {
+        task: AtomicU64::new(0),
+        cell: IrqSafeSpinLock::new(None),
+    };
+
+    fn publish_id(&self, task: u64) {
+        let replaced = {
+            let mut cell = self.cell.lock();
+            let old = if cell.as_ref().is_some_and(|cell| cell.task == task) {
+                None
+            } else {
+                cell.take()
+            };
+            self.task.store(task, Ordering::Release);
+            old
+        };
+        drop(replaced);
+    }
+
+    fn publish_cell(&self, task: u64, owned: Option<Arc<WakeCell>>) {
+        let replaced = {
+            let mut cell = self.cell.lock();
+            let old = core::mem::replace(&mut *cell, owned);
+            self.task.store(task, Ordering::Release);
+            old
+        };
+        drop(replaced);
+    }
+
+    fn take_cell(&self) -> Option<Arc<WakeCell>> {
+        if self.task.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let mut cell = self.cell.lock();
+        let owned = cell.take();
+        if owned.is_some() {
+            self.task.store(0, Ordering::Release);
+        }
+        owned
+    }
+
+    fn take_task(&self) -> u64 {
+        if self.task.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
+        let (task, owned) = {
+            let mut cell = self.cell.lock();
+            let owned = cell.take();
+            let task = self.task.load(Ordering::Relaxed);
+            self.task.store(0, Ordering::Release);
+            (task, owned)
+        };
+        drop(owned);
+        task
+    }
+
+    /// A third task's scalar-only hint also prevents a direct root return.
+    /// Leave that hint intact for ordinary executor dispatch.
+    fn take_for_root(&self, root: u64) -> Result<Option<Arc<WakeCell>>, ()> {
+        if self.task.load(Ordering::Acquire) == 0 {
+            return Ok(None);
+        }
+        let mut cell = self.cell.lock();
+        let task = self.task.load(Ordering::Relaxed);
+        if task != 0 && task != root {
+            return Err(());
+        }
+        let owned = cell.take();
+        self.task.store(0, Ordering::Release);
+        Ok(owned)
+    }
+}
+
+static URGENT_WAKE: [UrgentWakeHint; narf_lib::percpu::MAX_CPUS] =
+    [const { UrgentWakeHint::NEW }; narf_lib::percpu::MAX_CPUS];
 
 const NO_SYNC_REQUEUE_CPU: u32 = u32::MAX;
 
@@ -716,8 +786,8 @@ pub(crate) fn hint_urgent_next(task: u64) {
         return;
     }
     let cpu = narf_lib::percpu::current_cpu();
-    if cpu < URGENT_WAKE_NEXT.len() {
-        URGENT_WAKE_NEXT[cpu].0.store(task, Ordering::Release);
+    if let Some(hint) = URGENT_WAKE.get(cpu) {
+        hint.publish_id(task);
     }
 }
 
@@ -725,27 +795,21 @@ pub(crate) fn hint_urgent_next(task: u64) {
 /// The caller must have obtained `home` from that task's live [`WakeCell`].
 #[inline]
 fn hint_urgent_next_on(home: u32, task: u64, cell: *const WakeCell) {
-    if task != 0 && (home as usize) < URGENT_WAKE_NEXT.len() {
-        URGENT_WAKE_NEXT[home as usize]
-            .0
-            .store(task, Ordering::Release);
+    if task != 0 && (home as usize) < URGENT_WAKE.len() {
         let direct = !cell.is_null()
             // SAFETY: the raw-waker caller holds a live Arc for `cell`.
             && unsafe { (*cell).direct_eligible.load(Ordering::Acquire) };
-        if direct {
+        let owned = if direct {
             // SAFETY: the raw-waker caller holds a live Arc for `cell`.
-            // Increment before publication; the atomic slot owns that new
+            // Increment before publication; the locked hint owns that new
             // reference until replacement or one-shot consumption.
             unsafe { Arc::increment_strong_count(cell) };
-            let old = URGENT_WAKE_CELL[home as usize]
-                .0
-                .swap(cell.cast_mut(), Ordering::AcqRel);
-            if !old.is_null() {
-                // SAFETY: every non-null pointer in the slot is exactly one
-                // `Arc::into_raw`-equivalent strong reference.
-                unsafe { drop(Arc::from_raw(old)) };
-            }
-        }
+            // SAFETY: the increment above transfers one owned reference.
+            Some(unsafe { Arc::from_raw(cell) })
+        } else {
+            None
+        };
+        URGENT_WAKE[home as usize].publish_cell(task, owned);
     }
 }
 
@@ -753,15 +817,11 @@ fn hint_urgent_next_on(home: u32, task: u64, cell: *const WakeCell) {
 /// stackful task attempting a direct handoff; if that path declines, it
 /// republishes the scalar id for the ordinary executor next-buddy path.
 pub(crate) fn take_urgent_wake_cell(cpu: usize) -> Option<Arc<WakeCell>> {
-    let slot = URGENT_WAKE_CELL.get(cpu)?;
-    let ptr = slot.0.swap(core::ptr::null_mut(), Ordering::AcqRel);
-    if ptr.is_null() {
-        return None;
-    }
-    URGENT_WAKE_NEXT[cpu].0.store(0, Ordering::Release);
-    // SAFETY: the atomic slot owned one strong reference, transferred here by
-    // the successful swap-to-null above.
-    Some(unsafe { Arc::from_raw(ptr) })
+    URGENT_WAKE.get(cpu)?.take_cell()
+}
+
+pub(crate) fn take_urgent_for_root(cpu: usize, root: u64) -> Result<Option<Arc<WakeCell>>, ()> {
+    URGENT_WAKE.get(cpu).ok_or(())?.take_for_root(root)
 }
 
 /// Wake-preemption (boot flag `wake_preempt`, debugfs `sched/wake_preempt`).
@@ -833,20 +893,9 @@ fn record_wake_next(cpu: u32, task: u64) {
 /// full queue scan, while an external policy still consumes it through the
 /// ordinary core validation pass.
 pub(crate) fn take_urgent_next(cpu: u32) -> u64 {
-    if (cpu as usize) >= WAKE_NEXT.len() {
-        return 0;
-    }
-    // A successful synchronous wake is Linux's set-next-buddy case and is not
-    // an experimental every-wake policy. Avoid an unconditional atomic RMW on
-    // ordinary picks: the common empty slot costs one read only.
-    if let Some(cell) = take_urgent_wake_cell(cpu as usize) {
-        return cell.task;
-    }
-    let urgent = URGENT_WAKE_NEXT[cpu as usize].0.load(Ordering::Acquire);
-    if urgent != 0 {
-        return URGENT_WAKE_NEXT[cpu as usize].0.swap(0, Ordering::AcqRel);
-    }
-    0
+    URGENT_WAKE
+        .get(cpu as usize)
+        .map_or(0, UrgentWakeHint::take_task)
 }
 
 /// Read-and-clear `cpu`'s opt-in generic next-buddy hint (0 = none).
@@ -1224,6 +1273,7 @@ fn claim_direct_handoff_slot(cpu: usize, slot: &TaskSlot) -> Option<DirectHandof
 pub(crate) fn claim_direct_yield_target(cpu: usize, current: u64) -> Option<DirectHandoffTarget> {
     if cpu >= READY.len()
         || current == TaskId::NONE.raw()
+        || !class_fifo_uniform(cpu)
         || !policy::direct_handoff_allowed(CpuId(cpu as u32))
     {
         return None;
@@ -1250,6 +1300,7 @@ pub(crate) fn claim_direct_handoff_target(
     cell: &Arc<WakeCell>,
 ) -> Option<DirectHandoffTarget> {
     if cpu >= READY.len()
+        || !class_fifo_uniform(cpu)
         || !cell.direct_eligible.load(Ordering::Acquire)
         || cell.direct_claimed.load(Ordering::Acquire)
         || !policy::direct_handoff_allowed(CpuId(cpu as u32))
@@ -2716,14 +2767,7 @@ pub fn init() {
         RUNNABLE_STATE[cpu]
             .class_fifo_uniform
             .store(true, Ordering::Release);
-        URGENT_WAKE_NEXT[cpu].0.store(0, Ordering::Release);
-        let urgent = URGENT_WAKE_CELL[cpu]
-            .0
-            .swap(core::ptr::null_mut(), Ordering::AcqRel);
-        if !urgent.is_null() {
-            // SAFETY: the atomic slot owns one Arc strong reference.
-            unsafe { drop(Arc::from_raw(urgent)) };
-        }
+        let _ = URGENT_WAKE[cpu].take_task();
     }
     // Wire the default `ClassScheduler` into the policy slot
     // before any `run_until_empty` call dispatches. Idempotent — if a
@@ -2761,14 +2805,7 @@ pub fn __reset_queues_for_test() {
         RUNNABLE_STATE[cpu]
             .class_fifo_uniform
             .store(true, Ordering::Release);
-        URGENT_WAKE_NEXT[cpu].0.store(0, Ordering::Release);
-        let urgent = URGENT_WAKE_CELL[cpu]
-            .0
-            .swap(core::ptr::null_mut(), Ordering::AcqRel);
-        if !urgent.is_null() {
-            // SAFETY: the atomic slot owns one Arc strong reference.
-            unsafe { drop(Arc::from_raw(urgent)) };
-        }
+        let _ = URGENT_WAKE[cpu].take_task();
     }
     // Clear any tasks left staged on the per-CPU wake inboxes so they don't
     // carry over between tests. Dropping the `TaskSlot`s runs their normal Drop.
@@ -5019,22 +5056,30 @@ unsafe fn clone_raw(data: *const ()) -> RawWaker {
 // needed: the awake bit IS the runnable bit, and the scan reads it
 // directly.
 
-unsafe fn wake_raw(data: *const ()) {
-    // wake-by-value: consume the Arc.
-    // SAFETY: same as clone_raw; we own the refcount handed to us.
-    let arc = unsafe { Arc::<WakeCell>::from_raw(data as *const WakeCell) };
-    let prev_awake = arc.flag.swap(true, Ordering::SeqCst);
+/// Publish a consuming wake, leaving parked activation to the executor. An
+/// exact local handoff can claim the indexed parked owner before that drain.
+#[inline]
+fn publish_owned_wake(cell: &WakeCell) -> u32 {
+    let prev_awake = cell.flag.swap(true, Ordering::SeqCst);
     if !prev_awake {
-        parked_wake_push(&arc);
+        parked_wake_push(cell);
     }
     // Kick the owner's CPU if it's idle on another core (else the awake
     // bit waits until that CPU's next timer tick — the cross-core wake
     // tail). `resched_remote` no-ops for same-CPU / running targets.
-    let home = arc.cpu.load(Ordering::Acquire);
+    let home = cell.cpu.load(Ordering::Acquire);
     if !prev_awake {
-        wake_race_stamp(&arc, home);
-        note_runnable_peer(home, arc.task);
+        wake_race_stamp(cell, home);
+        note_runnable_peer(home, cell.task);
     }
+    home
+}
+
+unsafe fn wake_raw(data: *const ()) {
+    // wake-by-value: consume the Arc.
+    // SAFETY: same as clone_raw; we own the refcount handed to us.
+    let arc = unsafe { Arc::<WakeCell>::from_raw(data as *const WakeCell) };
+    let home = publish_owned_wake(&arc);
     // Name this task its home CPU's next-buddy so the dispatch picks it ahead
     // of the tasks already queued in front of it (Linux `set_next_buddy`).
     record_wake_next(home, arc.task);
@@ -5132,6 +5177,46 @@ pub fn wake_urgent_task(waker: &Waker, expected_task: u64) {
     } else {
         waker.wake_by_ref();
     }
+}
+
+/// Wake an exact waiter and request prompt local execution without synchronous
+/// wake-affinity migration. The consumed waker pins its handle through hint
+/// publication. Only local, direct-eligible tasks publish an exact handle;
+/// remote wakes retain ordinary placement and noneligible/foreign wakers retain
+/// the existing validated task-id preemption fallback.
+pub fn wake_preempt_task(waker: Waker, expected_task: u64) {
+    if expected_task != 0 && core::ptr::eq(waker.vtable(), &TASK_VTABLE) {
+        let ptr = waker.data().cast::<WakeCell>();
+        // SAFETY: vtable identity proves the consumed Waker owns a live
+        // WakeCell Arc. It remains live until this function returns.
+        let cell = unsafe { &*ptr };
+        if cell.task == expected_task {
+            let home = publish_owned_wake(cell);
+            let cpu = narf_lib::percpu::current_cpu();
+            if home as usize == cpu
+                && expected_task != current_task_id().raw()
+                && cell.direct_eligible.load(Ordering::Acquire)
+            {
+                // Keep the sleeping owner indexed in PARKED. The existing
+                // claim revalidates ownership, policy, affinity and budgets;
+                // its atomic claim also excludes the pending inbox activation.
+                hint_urgent_next_on(home, expected_task, ptr);
+                stackful::note_local_urgent_wake_preempt(expected_task);
+            } else {
+                record_wake_next(home, cell.task);
+                wake_place_and_kick(ptr, home, cell.task);
+                if cell.cpu.load(Ordering::Acquire) as usize == cpu {
+                    stackful::note_urgent_wake_preempt(expected_task);
+                }
+            }
+            return;
+        }
+        // A mismatched id cannot nominate an unrelated handoff target.
+        waker.wake();
+        return;
+    }
+    waker.wake();
+    stackful::note_urgent_wake_preempt(expected_task);
 }
 
 /// Non-blocking core migrate: move the wakee identified by `cell` from `home`'s

@@ -384,7 +384,6 @@ fn wake_one_inner(task_id: u64, w: core::task::Waker, urgent_handoff: bool) {
     crate::user_task::with_user_task_ctx(task_id, |uctx| {
         uctx.sleep_deadline_ns.store(0, Ordering::Release);
     });
-    w.wake();
     // Wake-preemption (Linux `wakeup_preempt`): this readiness/futex/IPC wake
     // just made `task_id` runnable, so ask the running task to cede at its next
     // syscall exit and let the wakee run promptly instead of after a fair
@@ -392,10 +391,13 @@ fn wake_one_inner(task_id: u64, w: core::task::Waker, urgent_handoff: bool) {
     // a no-op (one gated atomic load) when the feature is off.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if urgent_handoff {
-        narf_scheduler::stackful::note_urgent_wake_preempt(task_id);
+        narf_scheduler::wake_preempt_task(w, task_id);
     } else {
+        w.wake();
         narf_scheduler::stackful::note_wake_preempt(task_id);
     }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    w.wake();
 }
 
 pub(crate) fn wake_one(task_id: u64, w: core::task::Waker) {
