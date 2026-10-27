@@ -34,6 +34,8 @@ mod lifetime_tests;
 mod mfp_tests;
 #[path = "optional_mfp_tests.rs"]
 mod optional_mfp_tests;
+#[path = "probe_ies_tests.rs"]
+mod probe_ies_tests;
 
 const OWN: [u8; 6] = [2, 6, 7, 8, 9, 10];
 const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];

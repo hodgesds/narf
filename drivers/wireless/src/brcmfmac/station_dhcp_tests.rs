@@ -26,6 +26,8 @@ mod mfp_tests;
 mod optional_mfp_tests;
 #[path = "power_save_tests.rs"]
 mod power_save_tests;
+#[path = "scan_ies_tests.rs"]
+mod scan_ies_tests;
 #[path = "vht_tests.rs"]
 mod vht_tests;
 

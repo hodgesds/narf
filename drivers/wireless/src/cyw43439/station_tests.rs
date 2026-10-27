@@ -39,6 +39,7 @@ pub(in crate::cyw43439) struct Bus {
     current_chanspec: u16,
     wide_started: bool,
     bandwidth: u32,
+    refuse_vndr_ie: bool,
 }
 impl Bus {
     pub(in crate::cyw43439) fn new() -> Self {
@@ -71,6 +72,7 @@ impl Bus {
             current_chanspec: 0x1006,
             wide_started: false,
             bandwidth: 1,
+            refuse_vndr_ie: false,
         }
     }
     pub(in crate::cyw43439) fn set_secured(&mut self, secured: bool) {
@@ -169,6 +171,21 @@ impl Bus {
                     || body.starts_with(b"chanspec")
                     || body.starts_with(b"wpaie\0"))
                 .then(|| (command, body.to_vec()))
+            })
+            .collect()
+    }
+    pub(in crate::cyw43439) fn refuse_vndr_ie(&mut self, refuse: bool) {
+        self.refuse_vndr_ie = refuse;
+    }
+    /// Bodies of every `WLC_SET_VAR` control request, in transmit order.
+    pub(in crate::cyw43439) fn set_vars(&self) -> Vec<Vec<u8>> {
+        self.tx
+            .iter()
+            .filter(|bytes| bytes[5] & 15 == 0)
+            .filter_map(|bytes| {
+                let size = usize::from(HwHeader::decode(bytes).unwrap().length);
+                (BcdcHeader::decode(&bytes[12..]).unwrap().cmd == 263)
+                    .then(|| bytes[28..size].to_vec())
             })
             .collect()
     }
@@ -569,6 +586,10 @@ impl PacketTransport for Bus {
         {
             header.flags |= bcdc_flag::ERROR;
             header.status = 1;
+        }
+        if request.cmd == 263 && body.starts_with(b"vndr_ie\0") && self.refuse_vndr_ie {
+            header.flags |= bcdc_flag::ERROR;
+            header.status = (-23i32) as u32;
         }
         if request.cmd == 262 && body.starts_with(b"mfp\0") && !self.mfp_supported {
             header.flags |= bcdc_flag::ERROR;

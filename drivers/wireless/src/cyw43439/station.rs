@@ -37,6 +37,8 @@ pub struct Station<R: Fullmac> {
     vht_verified: bool,
     power_save: bool,
     operation: bool,
+    /// Probe Request vendor elements currently installed in firmware.
+    probe_ies: Vec<u8>,
 }
 impl<R: Fullmac> core::fmt::Debug for Station<R> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -172,6 +174,7 @@ impl<R: Fullmac> Station<R> {
             vht_verified: false,
             power_save: false,
             operation: false,
+            probe_ies: Vec::new(),
         })
     }
 
@@ -280,10 +283,10 @@ impl<R: Fullmac> Station<R> {
             || request.colocated_6ghz
             || request.duration_tu.is_some()
             || request.duration_mandatory
-            || !request.extra_ies.is_empty()
         {
             return Err(Error::Unsupported);
         }
+        let probe_ies = probe_ies::parse(&request.extra_ies)?;
         let mut channels = Vec::new();
         for channel in if !request.frequencies_mhz.is_empty() {
             let mut selected = Vec::new();
@@ -340,6 +343,21 @@ impl<R: Fullmac> Station<R> {
         }
         self.check_receive_policy(&channels)?;
         self.check_grants(&grants)?;
+        if let Some(update) = probe_ies::update(&self.probe_ies, &probe_ies) {
+            // Firmware applies the del/add records in order; a refused or
+            // cancelled update leaves the installed set unknown, so no later
+            // Probe Request may be claimed to carry exactly a caller's IEs.
+            if let Err(error) = self
+                .checked_var(&grants, &channels, "vndr_ie", &update)
+                .await
+            {
+                self.runtime.fail();
+                return Err(error);
+            }
+            self.probe_ies = probe_ies;
+            self.check_receive_policy(&channels)?;
+            self.check_grants(&grants)?;
+        }
         self.cache.clear();
         self.checked_var(&grants, &channels, "escan", &command)
             .await?;
@@ -774,6 +792,8 @@ pub use policy::{GlobalPolicy, PolicySource};
 mod mfp;
 #[path = "station_phy.rs"]
 mod phy;
+#[path = "station_probe_ies.rs"]
+mod probe_ies;
 
 const MAX_REPLY: usize = 1502;
 

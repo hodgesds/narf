@@ -511,6 +511,14 @@ duplicate policy, authorized-peer preservation and firmware refusal at either
 step; Open/WPA2 DHCP/IP conversations run while PS is enabled. This implements
 firmware station PS only; host-bus PM, suspend/WoW and reset replay remain open.
 
+The common FullMAC scan also installs caller Probe Request vendor IEs with
+the native `vndr_ie` iovar before escan (Linux `brcmf_vif_set_mgmt_ie`,
+`BRCMF_VNDR_IE_PRBREQ_FLAG`), and refuses triggered random-MAC scans because
+brcmfmac randomizes only PNO `pfn_macaddr`; see [CYW §3](cyw43439.md)
+"Caller Probe Request IEs" and "Random scan source address". The shared5/6
+msgbuf smoke `drivers/wireless/brcmfmac/scan_ies` checks literal add/del
+records before each changed escan.
+
 Additional software outside that retained profile remains: nonzero descriptor
 prefixes/shared 7, other CPU/RAM/chip/OTP selectors,160/80+80 and optional VHT
 coding/beamforming/HE/EHT profiles, native802.11
