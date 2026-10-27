@@ -62,6 +62,7 @@ pub use bootstrap::{provision, provision_state, ProvisionState};
 pub use mvm_boot::PowerRequest as Gen2TransmitPowerRequest;
 pub mod connection;
 mod context_v1;
+pub mod csum;
 pub mod data_queue;
 pub mod device;
 pub mod firmware_api;
@@ -962,8 +963,10 @@ pub fn chip_config_for_pci_id(vid: u16, did: u16) -> Option<ChipConfig> {
             api_min: 89,
             api_prefix: "",
         },
-        // AX211 family.
-        0x51f0 => ChipConfig {
+        // AX211 family. Linux 7.3 `pcie/drv.c` "So devices" binds 0x51F0
+        // and 0x7AF0/0x7F70 (`iwl_so_mac_cfg`), 0x51F1/0x7A70
+        // (`iwl_so_long_latency_imr_mac_cfg`) to the same So MAC.
+        0x51f0 | 0x51f1 | 0x7a70 | 0x7af0 | 0x7f70 => ChipConfig {
             vid,
             did,
             display_name: "AX211 (so-a0)",
@@ -985,7 +988,8 @@ pub fn chip_config_for_pci_id(vid: u16, did: u16) -> Option<ChipConfig> {
             api_min: 100,
             api_prefix: "",
         },
-        0x7e40 => ChipConfig {
+        // "Ma devices": 0x2729 and 0x7E40 bind `iwl_ma_mac_cfg`.
+        0x2729 | 0x7e40 => ChipConfig {
             vid,
             did,
             display_name: "AX211 (ma-b0)",
@@ -996,11 +1000,13 @@ pub fn chip_config_for_pci_id(vid: u16, did: u16) -> Option<ChipConfig> {
             api_min: 100,
             api_prefix: "",
         },
-        // BE200 — Wi-Fi 7 Bz MAC + GF / GF4 / FM RF.
-        0x272b => ChipConfig {
+        // BE200 — Wi-Fi 7 Bz MAC + GF / GF4 / FM RF. "Bz devices" also
+        // binds integrated 0x7740/0x4D40 (any subsystem) and 0xA840 only
+        // for the subsystem IDs in [`BZ_A840_SUBSYSTEMS`].
+        0x272b | 0x7740 | 0x4d40 | 0xa840 => ChipConfig {
             vid,
             did,
-            display_name: "BE200",
+            display_name: if did == 0x272b { "BE200" } else { "BE20x (bz)" },
             generation: Generation::Gen3,
             mac: MacFamily::BzA0,
             rf_candidates: RF_GF_FAMILY,
@@ -1431,10 +1437,24 @@ pub fn parse_ucode(bytes: &[u8]) -> Result<ParsedUcode<'_>, ParseError> {
 /// Exact Gen2/API77 and supported Gen3 profiles use distinct retained owners.
 static OWNED: IrqSafeSpinLock<Option<narf_bus::BusAddr>> = IrqSafeSpinLock::new(None);
 
+/// Linux 7.3 `pcie/drv.c` claims PCI 0xA840 only with these subsystem
+/// device IDs (`IWL_PCI_DEVICE(0xA840, <subdev>, iwl_bz_mac_cfg)`).
+pub const BZ_A840_SUBSYSTEMS: &[u16] = &[
+    0x0000, 0x0090, 0x0094, 0x0098, 0x009c, 0x00c0, 0x00c4, 0x00e0, 0x00e4, 0x00e8, 0x00ec, 0x0100,
+    0x0110, 0x0114, 0x0118, 0x011c, 0x0310, 0x0314, 0x0510, 0x0a10, 0x1671, 0x1672, 0x1771, 0x1772,
+    0x1791, 0x1792, 0x4090, 0x40c4, 0x40e0, 0x4110, 0x4314,
+];
+
+/// Subsystem qualification on top of the vendor/device match. Every claimed
+/// ID except 0xA840 matches `PCI_ANY_ID`.
+pub fn pci_subsystem_claimed(device: u16, subsystem_id: u16) -> bool {
+    device != 0xa840 || BZ_A840_SUBSYSTEMS.contains(&subsystem_id)
+}
+
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     let chip = match chip_config_for_pci_id(device.id.vendor, device.id.device) {
-        Some(c) => c,
-        None => return Err(narf_bus::ProbeError::NotForThisDriver),
+        Some(c) if pci_subsystem_claimed(device.id.device, device.id.subsystem_id) => c,
+        _ => return Err(narf_bus::ProbeError::NotForThisDriver),
     };
 
     let extra = {
@@ -1535,9 +1555,17 @@ const PCI_DIDS: &[(u16, &str)] = &[
     (0x7df0, "iwlwifi-7df0"),
     (0x2725, "iwlwifi-2725"),
     (0x51f0, "iwlwifi-51f0"),
+    (0x51f1, "iwlwifi-51f1"),
+    (0x7a70, "iwlwifi-7a70"),
+    (0x7af0, "iwlwifi-7af0"),
+    (0x7f70, "iwlwifi-7f70"),
     (0x54f0, "iwlwifi-54f0"),
+    (0x2729, "iwlwifi-2729"),
     (0x7e40, "iwlwifi-7e40"),
     (0x272b, "iwlwifi-272b"),
+    (0x7740, "iwlwifi-7740"),
+    (0x4d40, "iwlwifi-4d40"),
+    (0xa840, "iwlwifi-a840"),
     (0x6e70, "iwlwifi-6e70"),
     (0x9327, "iwlwifi-9327"),
     (0xd240, "iwlwifi-d240"),
@@ -1695,9 +1723,48 @@ pub mod tests {
         TestResult::Pass
     }
 
+    /// Linux 7.3 `pcie/drv.c` So/Ma/Bz IDs are claimed with their
+    /// sibling MAC configuration; 0xA840 only for the listed subsystems.
+    fn smoke_iwlwifi_gen3_linux_pci_ids_are_claimed() -> TestResult {
+        for (did, mac) in [
+            (0x7a70, MacFamily::SoA0),
+            (0x7af0, MacFamily::SoA0),
+            (0x51f1, MacFamily::SoA0),
+            (0x7f70, MacFamily::SoA0),
+            (0x2729, MacFamily::MaB0),
+            (0xa840, MacFamily::BzA0),
+            (0x7740, MacFamily::BzA0),
+            (0x4d40, MacFamily::BzA0),
+        ] {
+            let Some(chip) = chip_config_for_pci_id(INTEL_VENDOR, did) else {
+                return TestResult::Fail("Linux-claimed Gen3 PCI ID has no chip config");
+            };
+            if chip.mac != mac
+                || chip.generation != Generation::Gen3
+                || rx_rfh::CompletionFormat::for_mac(chip.mac).is_none()
+                || !PCI_DIDS.iter().any(|(d, _)| *d == did)
+            {
+                return TestResult::Fail("Linux-claimed Gen3 PCI ID has wrong MAC/registration");
+            }
+        }
+        if !pci_subsystem_claimed(0xa840, 0x0114)
+            || !pci_subsystem_claimed(0xa840, 0x0000)
+            || !pci_subsystem_claimed(0xa840, 0x4314)
+            || pci_subsystem_claimed(0xa840, 0x0124)
+            || !pci_subsystem_claimed(0x7740, 0x1234)
+        {
+            return TestResult::Fail("0xA840 subsystem qualification differs from Linux");
+        }
+        TestResult::Pass
+    }
+
     kernel_test_in!(
         "drivers/wireless/iwlwifi",
         smoke_iwlwifi_chip_table_is_complete
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi",
+        smoke_iwlwifi_gen3_linux_pci_ids_are_claimed
     );
     kernel_test_in!(
         "drivers/wireless/iwlwifi",

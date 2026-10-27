@@ -1549,10 +1549,10 @@ each feature; a Linux chip name or helper structure does not grant a capability.
 
 | Profile | Implemented reachable software | Remaining software gates |
 |---|---|---|
-| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles (Linux Qu PCI IDs 0x02f0/0x06f0/0x34f0/0x3df0/0x4df0/0x43f0/0xa0f0, §3.26) | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO (with §3.28 RX LDPC/STBC1), signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement preceded by §3.25 over-air leaving deauthentication. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced same-peer/index reconnect restoration. Authored, execution pending: §3.24 tag4 negotiated unicast-local nested recipient A-MSDU-in-A-MPDU with complete bundles before sequence/PN ownership. | Active probes (scan firmware's emitter/power binding needs source proof); alternate ML BAID; group-addressed nested RX; other QoS AC/TID TX queues and TX A-MSDU; HT40/NSS2/VHT/HE/TX LDPC/TX STBC; PMF/WPA3; persistent/cross-owner key history, PTK reuse and cross-peer/index GTK restore; recovery and runtime/system PM. AP/P2P, WoW (with its D3 ARP/NS/GTK offloads), the §3.27 TX/RX checksum and scheduled-scan offloads and multiple RX/RSS remain unimplemented even where hardware supports them. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
+| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles (Linux Qu PCI IDs 0x02f0/0x06f0/0x34f0/0x3df0/0x4df0/0x43f0/0xa0f0, §3.26) | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO (with §3.28 RX LDPC/STBC1), signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement preceded by §3.25 over-air leaving deauthentication. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced same-peer/index reconnect restoration. Authored, execution pending: §3.24 tag4 negotiated unicast-local nested recipient A-MSDU-in-A-MPDU with complete bundles before sequence/PN ownership. | Active probes (scan firmware's emitter/power binding needs source proof); alternate ML BAID; group-addressed nested RX; other QoS AC/TID TX queues and TX A-MSDU; HT40/NSS2/VHT/HE/TX LDPC/TX STBC; PMF/WPA3; persistent/cross-owner key history, PTK reuse and cross-peer/index GTK restore; recovery and runtime/system PM. AP/P2P, WoW (with its D3 ARP/NS/GTK offloads), the §3.27 scheduled-scan offload and multiple RX/RSS remain unimplemented even where hardware supports them. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
 | AX210/AX211/AX411 and Bz/BE200 Gen3 transports | Context-v2, generation-selected completion layouts, firmware/PNVM/native boot and MLD helpers. Software-validated continuation: source-selected command-ID header0/explicit RLC2, receipt-fenced TVQM/BAID retirement, retained actual executable/PNVM/PCI authority and immutable DMA-copy receive/publication epochs. | Station admission remains dependent on the exact negotiated MAC/link/STA/TLC/key payload profile; no new payload profile is enabled by the header/source audit. Sc conversation tests do not establish another family's ABI, platform power/SAR program or hardware. Current live regulatory/power ownership and broader key-history/recovery/PM profiles remain separate. |
-| Sc c103/BE211 MLD station profile | Deferred retained native publication, actual station/management/data/Open-WPA2-SAE conversations, legacy/HT/VHT to80MHz, key/BA/reorder and userspace SME/port ownership in the existing profile. §§3.21–3.22 header/TVQM, positive BA response/RX-marker retirement, retained executable/PNVM/current-PCI publication and copy-time key epochs passed coordinated native tests on both architectures. | These source/epoch fences do not establish underlying RF quiescence or current live-regulatory/platform-power qualification. HE/EHT/6GHz and MLO,160/320MHz, AP/P2P, the §3.27 TX/RX checksum and scheduled-scan offloads, broader key-history and runtime/system PM remain separate implementations and must not be inferred from single-link Sc fixtures. |
-| Other advertised PCI/firmware combinations | Identification/firmware selection where defined; 0x7df0 is identification-only (Linux 7.3 `pcie/drv.c` claims no 0x7DF0) and exact admission rejects it | Linux-claimed So 0x7A70/0x7AF0/0x51F1/0x7F70, Ma 0x2729 and Bz 0xA840/0x7740/0x4D40 are absent from the match table (§3.26). No fallback admits an unknown command table, calibration profile, topology or PHY width. They need their exact source-backed authority/command/receipt/lifetime path. |
+| Sc c103/BE211 MLD station profile | Deferred retained native publication, actual station/management/data/Open-WPA2-SAE conversations, legacy/HT/VHT to80MHz, key/BA/reorder and userspace SME/port ownership in the existing profile. §§3.21–3.22 header/TVQM, positive BA response/RX-marker retirement, retained executable/PNVM/current-PCI publication and copy-time key epochs passed coordinated native tests on both architectures. | These source/epoch fences do not establish underlying RF quiescence or current live-regulatory/platform-power qualification. HE/EHT/6GHz and MLO,160/320MHz, AP/P2P, the §3.27 scheduled-scan offload, broader key-history and runtime/system PM remain separate implementations and must not be inferred from single-link Sc fixtures. |
+| Other advertised PCI/firmware combinations | Identification/firmware selection where defined, including the Linux So/Ma/Bz IDs added in §3.26; 0x7df0 is identification-only (Linux 7.3 `pcie/drv.c` claims no 0x7DF0) and exact admission rejects it | No fallback admits an unknown command table, calibration profile, topology or PHY width. They need their exact source-backed authority/command/receipt/lifetime path. |
 
 MLO/EHT/320MHz is hardware-inapplicable to Wi-Fi6/6E AX2xx devices, while
 Wi-Fi7 Bz/Sc support is missing software in this station profile. Six-GHz is
@@ -1705,25 +1705,59 @@ new IDs reuse the same exact Qu/QuZ JF/HR API77 images. Smokes in
 the class table, the emitted SoC bytes and exact discovery for the new IDs.
 
 0x7df0 remains identification-only: Linux 7.3 claims no 0x7DF0 and exact
-admission rejects it. Linux also claims So 0x7A70/0x7AF0/0x51F1/0x7F70, Ma
-0x2729 and Bz 0xA840 (subsystem-qualified)/0x7740/0x4D40, which this match
-table does not; they belong with the Gen3 station enablement rows. Linux
+admission rejects it. The Linux "So devices" 0x7A70/0x7AF0/0x51F1/0x7F70,
+"Ma devices" 0x2729 and "Bz devices" 0x7740/0x4D40 and subsystem-qualified
+0xA840 are now in the match table/`PCI_DIDS` with their sibling MAC
+configuration (So -> so-a0, Ma -> ma-b0, Bz -> bz-a0 firmware ladders and
+completion formats). 0xA840 is claimed only for the 31 subsystem IDs in
+`BZ_A840_SUBSYSTEMS` (`pci_subsystem_claimed` in `probe`).
+`smoke_iwlwifi_gen3_linux_pci_ids_are_claimed` covers the table. Like the
+existing AX211/BE200 IDs they reach identification, firmware selection and
+Gen3 transport only; station admission remains with the AX211/BE200
+enablement rows. Linux
 8000/9000-series IDs are outside this driver's AX2xx/BE2xx scope.
 
-### 3.27 Offload inventory
+### 3.27 Offload inventory and checksum offload
 
-Linux enumerates the following offloads for these families; none is
-implemented here, and none is advertised by the NARF netdev:
+Linux enumerates the following offloads for these families:
 
-- **TX checksum offload**: every 22000/AX210/Bz/Sc `mac_cfg` base sets
-  `IWL_TX_CSUM_NETIF_FLAGS` (`iwl-config.h`); `mld/tx.c::
-  iwl_mld_get_offload_assist` (and `mvm/tx.c`) program `TX_CMD`
-  `offload_assist` L4 (and A-MSDU L3) enables.
-- **RX checksum offload**: the same bases set `NETIF_F_RXCSUM`;
-  `mvm/rxmq.c::iwl_mvm_rx_csum` maps the MQ descriptor's `l3l4_flags`
-  (`TCP_UDP_CSUM_OK` plus `IP_HDR_CSUM_OK` or IPv6) to
-  `CHECKSUM_UNNECESSARY`. The NARF RX path has no verified-checksum
-  metadata channel to the stack yet.
+- **TX checksum offload (implemented)**: every 22000/AX210/Bz/Sc `mac_cfg`
+  base sets `IWL_TX_CSUM_NETIF_FLAGS` (`iwl-config.h`). `csum.rs::prepare_tx`
+  follows `mvm/tx.c::iwl_mvm_tx_csum` / `mld/tx.c::iwl_mld_get_offload_assist`
+  for the non-A-MSDU case: L4 checksum field reset to zero, `offload_assist`
+  `L4_EN` (bit 6) and IP-header offset 4 words (the RFC 1042 SNAP header);
+  `L3_EN` is requested only for A-MSDU, which no NARF profile builds.
+  `DataQueue::send_assisted` adds the MAC-header size (bits 8..12) and pad
+  (bit 13) for every frame and rejects any other assist bit; the pre-AX210
+  16-bit and AX210+ 32-bit TX_CMD layouts are both filled. NARF's frame-ring
+  contract requires validation instead of Linux's WARN/`skb_checksum_help`
+  fallback: only an unfragmented IPv4 or extension-header-free IPv6 TCP/UDP
+  packet of the requested kind is admitted (`csum::tx_admissible` at netdev
+  enqueue); TSO and VLAN requests remain refused. The Gen2 worker
+  (`mvm_device.rs`, single and BA-pipeline batches) and the Gen3/Sc queue
+  owner (`device.rs::progress_transmit` -> `Connection::try_enqueue_assisted`)
+  carry the assist bits to the real data queue. Checksum offload does not
+  change the emitted PPDU, so no emitting-program qualification changes.
+- **RX checksum offload (implemented)**: pre-AX210 (Gen2) uses the MQ
+  descriptor `l3l4_flags` (offset 10) exactly as `mvm/rxmq.c::iwl_mvm_rx_csum`:
+  `TCP_UDP_CSUM_OK` plus `IP_HDR_CSUM_OK` for IPv4, or an IPv6/IPv6-frag L3
+  type. The firmware L3 classification must agree with the delivered
+  EtherType and L4 must be a whole TCP/UDP packet. AX210+ uses
+  `FH_RSCSR_RPA_EN` and the v3 `raw_xsum` (`mld/rx.c::iwl_mld_rx_csum`,
+  `CHECKSUM_COMPLETE`); pre-Bz hardware's sum excludes the SNAP header and
+  Bz+ includes it (`iwl_mvm_create_skb`). `csum::rx_meta_complete` turns the
+  complete sum into a verdict like `__skb_checksum_validate_complete`
+  (remove SNAP/IP header contributions, add the pseudo header, require
+  `0xffff`), so a sum with different coverage fails closed. Verdicts are
+  reported only for a directly delivered non-A-MSDU MPDU (A-MSDU subframes,
+  deferred and reordered copies carry no verdict) through
+  `narf_net::RxMeta` on the RX frame ring (`LegacyReceive::Checked`, Gen3
+  `Connection::receive_packet_checked`). Both netdevs advertise
+  `csum::OFFLOADS` via `Interface::offloads` and `iface::set_offloads`.
+  `drivers/wireless/iwlwifi/csum` smokes cover assist bits/field reset,
+  refusal of mismatched kind/fragments/truncation/TSO, the l3l4 verdict
+  table and fail-closed complete-sum verdicts. Hardware checksum results
+  on silicon remain unmeasured.
 - **Scheduled-scan offload** (PNO/net-detect): `mld/mac80211.c` advertises
   `max_sched_scan_*` and `iwl_mld_sched_scan_start`.
 - **TSO** is not a firmware offload: `mld/tx.c::iwl_mld_tx_tso_segment`

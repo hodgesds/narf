@@ -1764,3 +1764,5 @@ mod ba_tests;
 mod ht_tests;
 #[path = "mvm_reconnect_tests.rs"]
 mod reconnect_tests;
+#[path = "mvm_recovery_tests.rs"]
+mod recovery_tests;

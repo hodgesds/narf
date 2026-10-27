@@ -85,6 +85,8 @@ enum Operation {
     Maintain,
     Transmit,
     Close,
+    /// Firmware/transport restart of a failed owner (`Owner::recover`).
+    Recover,
 }
 struct Join {
     bssid: [u8; 6],
@@ -327,31 +329,41 @@ impl Device {
         if !self.publication.load(Ordering::Acquire) {
             return Err("MVM native interface is not published");
         }
-        if self.terminal.load(Ordering::Acquire) {
-            return Err("MVM station is terminal");
+        let recovering = matches!(operation, Operation::Recover);
+        if self.terminal.load(Ordering::Acquire) != recovering {
+            return Err(if recovering {
+                "MVM recovery requires a terminal station"
+            } else {
+                "MVM station is terminal"
+            });
         }
         if self.stopping.load(Ordering::Acquire) && !matches!(operation, Operation::Close) {
             return Err("MVM station is closing");
+        }
+        // Generation exhaustion is terminal for the publication itself.
+        if recovering && self.generation.load(Ordering::Acquire) == u64::MAX {
+            return Err("MVM publication generation exhausted");
         }
         let mut slot = self.control.try_lock().ok_or("MVM control busy")?;
         if slot.is_some() {
             return Err("MVM control busy");
         }
-        {
+        let restart = {
             let state = self.state.try_lock().ok_or("MVM control busy")?;
-            let phase = state
-                .owner
-                .as_ref()
-                .ok_or("MVM native owner absent")?
-                .phase();
+            let owner = state.owner.as_ref().ok_or("MVM native owner absent")?;
+            let phase = owner.phase();
             if (matches!(operation, Operation::Scan(..) | Operation::Join(_))
                 && phase != Phase::Configured)
                 || (matches!(operation, Operation::Maintain | Operation::Transmit)
                     && phase != Phase::DataPrepared)
+                || (recovering && !owner.station_failed())
             {
                 return Err("MVM control busy");
             }
-        }
+            // The restart clears bus mastering before ALIVE re-enables it,
+            // so it is polled under the boot (non-master) authority.
+            recovering.then(|| owner.station_source(self.source.firmware, false))
+        };
         let device = self.me.upgrade().ok_or("MVM native owner disappeared")?;
         let reply = Arc::new(IrqSafeSpinLock::new(Completion {
             result: None,
@@ -376,6 +388,12 @@ impl Device {
             let result = {
                 let mut future = pin!(device.execute(&mut state, operation));
                 poll_fn(|cx| {
+                    if let Some(boot) = restart.as_ref() {
+                        return match boot.invoke(|| Ok(future.as_mut().poll(cx))) {
+                            Ok(result) => result,
+                            Err(error) => Poll::Ready(Err(error)),
+                        };
+                    }
                     match device.source.invoke(|| {
                         if closing {
                             return Ok(future.as_mut().poll(cx));
@@ -438,6 +456,19 @@ impl Device {
             } else if closing {
                 let _publication = device.admission.lock();
                 device.stopping.store(false, Ordering::Release);
+            } else if restart.is_some() {
+                // The restarted owner is Configured with no port; reopen
+                // control only while the publication itself stays current.
+                let _publication = device.admission.lock();
+                if owner.phase() == Phase::Configured
+                    && !owner.station_failed()
+                    && device.source.invoke(|| Ok(())).is_ok()
+                    && !device.stopping.load(Ordering::Acquire)
+                {
+                    state.pending = None;
+                    state.scan_time = None;
+                    device.terminal.store(false, Ordering::Release);
+                }
             }
             let wake = {
                 let mut completion = result_slot.lock();
@@ -449,6 +480,21 @@ impl Device {
             }
         }));
         Ok(reply)
+    }
+    /// A terminal station whose native owner failed is restarted before the
+    /// next scan (Linux restarts from the error path; NARF defers it to the
+    /// next control request so the retained worker owns it). The restart
+    /// runs as retained control work: dropping this waiter cannot cancel it.
+    async fn recover_failed(&self) -> Result<(), &'static str> {
+        if !self.terminal.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let reply = self.begin(Operation::Recover)?;
+        self.wait(reply).await?;
+        if self.terminal.load(Ordering::Acquire) {
+            return Err("MVM recovery did not reopen the station");
+        }
+        Ok(())
     }
     async fn wait(&self, reply: Reply) -> Result<Outcome, &'static str> {
         poll_fn(|cx| {
@@ -546,8 +592,13 @@ impl Device {
                 if self.stopping.load(Ordering::Acquire) {
                     return Err("MVM data stopped before native publication");
                 }
+                let prepare = |frame: &Frame| {
+                    let mut bytes = frame.payload().to_vec();
+                    super::csum::prepare_tx(&mut bytes, frame.tx_meta().csum_l4)
+                        .map(|assist| (bytes, assist))
+                };
                 if owner.station_can_pipeline() {
-                    let mut packets = alloc::vec![frame.payload().to_vec()];
+                    let mut packets = alloc::vec![prepare(&frame)?];
                     if let Some(tx) = transmit.as_mut() {
                         for _ in 1..8 {
                             let Some(next) =
@@ -556,7 +607,7 @@ impl Device {
                                 break;
                             };
                             if admitted(next.payload(), self.mac, next.tx_meta()) {
-                                packets.push(next.payload().to_vec());
+                                packets.push(prepare(&next)?);
                             }
                         }
                     }
@@ -564,8 +615,9 @@ impl Device {
                         .transmit_data_batch_using(&packets, || (self.environment.policy)())
                         .await?;
                 } else {
+                    let (bytes, assist) = prepare(&frame)?;
                     owner
-                        .station_send(frame.payload(), || (self.environment.policy)())
+                        .station_send(&bytes, assist, || (self.environment.policy)())
                         .await?;
                 }
                 Ok(Outcome::Done)
@@ -580,6 +632,21 @@ impl Device {
                     }
                 }
                 owner.station_close(|| (self.environment.policy)()).await?;
+                Ok(Outcome::Done)
+            }
+            Operation::Recover => {
+                // Host frames queued for the failed station never reach the
+                // restarted instance (mac80211 drops them on restart).
+                *pending = None;
+                *scan_time = None;
+                if let Some(tx) = transmit.as_mut() {
+                    for _ in 0..TX_RING_N {
+                        if !matches!(tx.try_recv(), Ok(Some(_))) {
+                            break;
+                        }
+                    }
+                }
+                owner.recover().await?;
                 Ok(Outcome::Done)
             }
         }
@@ -617,7 +684,10 @@ impl Device {
             let mut output = Vec::new();
             for _ in 0..64 {
                 match owner.station_receive(|| (self.environment.policy)())? {
-                    Some(LegacyReceive::Ethernet(frame)) => output.push(frame),
+                    Some(LegacyReceive::Ethernet(frame)) => {
+                        output.push((frame, narf_net::RxMeta::default()))
+                    }
+                    Some(LegacyReceive::Checked(frame, meta)) => output.push((frame, meta)),
                     Some(LegacyReceive::Eapol(_)) => {
                         return Err("MVM secured station lost its native RSNA owner")
                     }
@@ -625,7 +695,7 @@ impl Device {
                 }
             }
             if owner.station_needs_security() {
-                for frame in output.into_iter().rev() {
+                for (frame, _) in output.into_iter().rev() {
                     owner.station_defer_packet(frame);
                 }
                 let _publication = self.admission.lock();
@@ -643,12 +713,13 @@ impl Device {
                     self.generation.load(Ordering::Acquire),
                 ),
             };
-            for bytes in &output {
+            for (bytes, meta) in &output {
                 if let (Some(rx), Ok(memory)) =
                     (&mut state.receive, super::runtime::dma_alloc(bytes.len()))
                 {
                     let mut frame = Frame::new(memory, bytes.len() as u32);
                     frame.payload_mut().copy_from_slice(bytes);
+                    frame.set_rx_meta(*meta);
                     let _publication = self.admission.lock();
                     authority.invoke(&(self.environment.policy)()?, || {
                         if !self.port.load(Ordering::Acquire)
@@ -680,7 +751,7 @@ impl Device {
             Ok((
                 output
                     .into_iter()
-                    .map(|frame| (frame, authority.clone()))
+                    .map(|(frame, _)| (frame, authority.clone()))
                     .collect(),
                 false,
                 send,
@@ -814,6 +885,7 @@ impl Device {
             drop(active);
             narf_net::iface::register(self.name(), self.mac, send_frame);
             narf_net::iface::set_link_metadata(self.name(), false, None, None);
+            narf_net::iface::set_offloads(self.name(), super::csum::OFFLOADS);
             narf_net::iface::set_driver_info(
                 self.name(),
                 "iwlwifi-mvm",
@@ -980,6 +1052,7 @@ impl WirelessNetIface for Device {
             }
             channels
         };
+        self.recover_failed().await.map_err(error)?;
         let reply = self
             .begin(Operation::Scan(channels, request.ssids))
             .map_err(error)?;
@@ -1064,9 +1137,7 @@ fn admitted(bytes: &[u8], mac: [u8; 6], meta: narf_net::TxMeta) -> bool {
             u16::from_be_bytes([bytes[12], bytes[13]]),
             0x888e | 0x80f3 | 0x8137
         )
-        && meta.csum_l4.is_none()
-        && meta.tso_mss.is_none()
-        && meta.vlan_tag.is_none()
+        && super::csum::tx_admissible(bytes, meta)
 }
 fn channel_frequency(channel: u8) -> u32 {
     if channel == 14 {
@@ -1080,6 +1151,9 @@ fn channel_frequency(channel: u8) -> u32 {
 impl Interface for Registered {
     fn name(&self) -> &str {
         self.0.name()
+    }
+    fn offloads(&self) -> narf_net::OffloadCapabilities {
+        super::csum::OFFLOADS
     }
     fn mac(&self) -> [u8; 6] {
         self.0.mac()

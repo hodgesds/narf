@@ -93,6 +93,81 @@ impl Owner {
         self.hardware.fail();
         self.phase = Phase::Failed;
     }
+    /// Firmware/transport restart of a failed owner, following Linux
+    /// `mvm/ops.c::iwl_mvm_nic_restart` -> `iwl_mvm_restart_cleanup` ->
+    /// `ieee80211_restart_hw` -> `iwl_mvm_up`: stop the device (DMA stop
+    /// acknowledged, bus mastering cleared, every queue/command allocation
+    /// replaced), reload the retained executable, rerun unified NVM and the
+    /// awake-runtime defaults, then rebuild station state from scratch.
+    ///
+    /// Unlike mac80211's in-place reconfiguration, no association is
+    /// replayed: firmware objects of the stopped instance (MAC, link, peer,
+    /// queues, keys, BA sessions, PHY context) are discarded and the host
+    /// station starts from `Configured`, so a new scan/join and RSNA must
+    /// follow. Committed key PN floors survive in the retained history. The
+    /// restarted device must report the same MAC address and NVM
+    /// channels/chains/PHY; any change or failure leaves the owner failed.
+    pub(in crate::iwlwifi) async fn recover(&mut self) -> Result<(), &'static str> {
+        if !self.station_failed() {
+            return Err("MVM recovery requires a failed owner");
+        }
+        let mac = self.mac.ok_or("MVM recovery before first configuration")?;
+        let (channels, chains, phy) = {
+            let nvm = self.nvm.as_ref().ok_or("MVM recovery before NVM")?;
+            (nvm.channels.clone(), nvm.tx_chains, nvm.phy)
+        };
+        self.power.phy.ba.clear_packets();
+        self.retire_security_after_reset()?;
+        let result = self.recover_inner(mac, &channels, chains, phy).await;
+        if result.is_err() {
+            self.hardware.fail();
+            self.phase = Phase::Failed;
+        }
+        result
+    }
+
+    async fn recover_inner(
+        &mut self,
+        mac: [u8; 6],
+        channels: &[u8],
+        chains: u32,
+        phy: super::super::ht_vht::Local,
+    ) -> Result<(), &'static str> {
+        self.restart_hardware(mac).await?;
+        let parsed = super::super::parse_ucode(&self.firmware)
+            .map_err(|_| "invalid retained MVM firmware")?;
+        // Every per-association owner named firmware objects or DMA of the
+        // stopped instance; the restart already released that DMA.
+        self.beacons.clear();
+        self.scan = super::scan::ScanContext::new(&parsed.api);
+        self.channel = super::channel::ChannelContext::new(&parsed.api);
+        self.peer = None;
+        self.management_queue = None;
+        self.power = super::power::Context::new(&parsed.api);
+        self.mac = None;
+        self.nvm = None;
+        self.phase = Phase::Starting;
+        self.configure(mac).await?;
+        let nvm = self.nvm.as_ref().ok_or("MVM recovery lost NVM")?;
+        if nvm.channels != channels || nvm.tx_chains != chains || nvm.phy != phy {
+            return Err("MVM recovery changed NVM identity");
+        }
+        Ok(())
+    }
+
+    async fn restart_hardware(&mut self, mac: [u8; 6]) -> Result<(), &'static str> {
+        #[cfg(any(test, feature = "kernel-test"))]
+        if super::super::runtime::model::is_model(&self.hardware) {
+            return super::super::runtime::model::restart(&mut self.hardware);
+        }
+        let parsed = super::super::parse_ucode(&self.firmware)
+            .map_err(|_| "invalid retained MVM firmware")?;
+        if self.hardware.restart(&parsed).await? != mac {
+            return Err("MVM recovery changed hardware MAC");
+        }
+        Ok(())
+    }
+
     pub(in crate::iwlwifi) fn station_failed(&self) -> bool {
         self.hardware.is_failed() || self.phase == Phase::Failed
     }
@@ -164,9 +239,10 @@ impl Owner {
     pub(in crate::iwlwifi) async fn station_send(
         &mut self,
         bytes: &[u8],
+        assist: u32,
         policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(), &'static str> {
-        self.transmit_data_using(bytes, policy).await
+        self.transmit_data_assisted(bytes, assist, policy).await
     }
     pub(in crate::iwlwifi) fn station_can_pipeline(&self) -> bool {
         self.ba_qualified()
@@ -181,17 +257,18 @@ impl Owner {
         self.service_phy_actions(&mut policy).await?;
         if let Some(frame) = self.receive_data_inner(&mut policy)? {
             match frame {
-                super::LegacyReceive::Ethernet(frame) => self
-                    .power
-                    .prepared
-                    .as_mut()
-                    .unwrap()
-                    .mlme
-                    .data
-                    .as_mut()
-                    .unwrap()
-                    .aggregate
-                    .defer_validated(frame),
+                super::LegacyReceive::Ethernet(frame) | super::LegacyReceive::Checked(frame, _) => {
+                    self.power
+                        .prepared
+                        .as_mut()
+                        .unwrap()
+                        .mlme
+                        .data
+                        .as_mut()
+                        .unwrap()
+                        .aggregate
+                        .defer_validated(frame)
+                }
                 super::LegacyReceive::Eapol(_) => {
                     return self.data_failed("MVM control lost native RSNA owner")
                 }

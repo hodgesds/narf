@@ -718,6 +718,18 @@ impl Connection {
         ethernet: &[u8],
         ac: Option<usize>,
     ) -> Result<bool, &'static str> {
+        self.try_enqueue_assisted(hw, ethernet, ac, 0)
+    }
+
+    /// `assist` is the checksum `offload_assist` from `csum::prepare_tx`
+    /// for this already-prepared Ethernet frame.
+    pub(super) fn try_enqueue_assisted(
+        &mut self,
+        hw: &mut Hardware,
+        ethernet: &[u8],
+        ac: Option<usize>,
+        assist: u32,
+    ) -> Result<bool, &'static str> {
         if !self.authorized {
             return Err("controlled port closed");
         }
@@ -725,7 +737,7 @@ impl Connection {
         if !hw.transmit_space(queue)? {
             return Ok(false);
         }
-        hw.enqueue_transmit(queue, &frame, header, None)?;
+        hw.enqueue_transmit_assisted(queue, &frame, header, None, assist)?;
         self.sequence = self.sequence.wrapping_add(1);
         Ok(true)
     }
@@ -829,6 +841,21 @@ impl Connection {
         &mut self,
         packet: &super::runtime::Packet,
     ) -> Result<Vec<Vec<u8>>, &'static str> {
+        Ok(self
+            .receive_packet_checked(packet, None)?
+            .into_iter()
+            .map(|(frame, _)| frame)
+            .collect())
+    }
+
+    /// As [`Self::receive_packet`], also reporting the hardware checksum
+    /// verdict for a directly delivered (unreordered, non-A-MSDU) MPDU.
+    /// `includes_snap` is `Hardware::rx_checksum_includes_snap`.
+    pub fn receive_packet_checked(
+        &mut self,
+        packet: &super::runtime::Packet,
+        includes_snap: Option<bool>,
+    ) -> Result<Vec<(Vec<u8>, narf_net::RxMeta)>, &'static str> {
         let mut output = Vec::new();
         if packet.header.group_id != 0 {
             return Ok(output);
@@ -895,7 +922,23 @@ impl Connection {
                     }
                 }
                 if let Some(frame) = self.receive_frame(&mpdu)? {
-                    output.push(frame);
+                    // FH_RSCSR_RPA_EN: v3 descriptor `raw_xsum` (big-endian,
+                    // offset 32) is valid (`iwl_mld_rx_csum`).
+                    let meta = match includes_snap {
+                        Some(snap)
+                            if packet.header.len_n_flags & super::csum::RSCSR_RPA_EN != 0
+                                && !mpdu.amsdu
+                                && packet.payload.len() >= 34 =>
+                        {
+                            super::csum::rx_meta_complete(
+                                u16::from_be_bytes([packet.payload[32], packet.payload[33]]),
+                                snap,
+                                &frame,
+                            )
+                        }
+                        _ => narf_net::RxMeta::default(),
+                    };
+                    output.push((frame, meta));
                 }
             }
             0xc3 if packet.payload.len() == 4 => {
@@ -930,12 +973,13 @@ impl Connection {
     fn deliver_reordered(
         &mut self,
         packets: Vec<Vec<u8>>,
-        output: &mut Vec<Vec<u8>>,
+        output: &mut Vec<(Vec<u8>, narf_net::RxMeta)>,
     ) -> Result<(), &'static str> {
         for packet in packets {
             if let Some(mpdu) = scan_api::mpdu(&packet) {
                 if let Some(frame) = self.receive_frame(&mpdu)? {
-                    output.push(frame);
+                    // Reordered copies no longer carry len_n_flags.
+                    output.push((frame, narf_net::RxMeta::default()));
                 }
             }
         }
@@ -951,7 +995,7 @@ impl Connection {
                 self.deliver_reordered(packets, &mut output)?;
             }
         }
-        Ok(output)
+        Ok(output.into_iter().map(|(frame, _)| frame).collect())
     }
 
     pub async fn service_aggregation(&mut self, hw: &mut Hardware) -> Result<(), &'static str> {

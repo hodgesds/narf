@@ -775,6 +775,39 @@ impl Owner {
         Ok(())
     }
 
+    /// Firmware restart retirement. The transport has acknowledged its DMA
+    /// stop and cleared bus mastering, so the device can no longer use or
+    /// report any installed key: this is stronger than native key REMOVE plus
+    /// the ordered RX marker. Committed PN floors move into the retained
+    /// history first, so a later reinstall of the same key cannot lower its
+    /// replay window (Linux `iwl_mvm_restart_cleanup` plus mac80211's key
+    /// reconfiguration with the current PN).
+    pub(super) fn retire_security_after_reset(&mut self) -> Result<(), &'static str> {
+        if self.security.active.is_none() {
+            return Ok(());
+        }
+        let mut retired = Vec::new();
+        for index in 0..5 {
+            if self.security.active.as_ref().unwrap().keys[index].is_some() {
+                if self
+                    .power
+                    .prepared
+                    .as_ref()
+                    .and_then(|p| p.mlme.data.as_ref())
+                    .is_none()
+                {
+                    return Err("MVM restart retired keys without their replay owner");
+                }
+                retired.push(self.snapshot_key_history(index)?);
+            }
+        }
+        for index in retired {
+            self.security.history[index].retired = true;
+        }
+        self.security.active = None;
+        Ok(())
+    }
+
     pub(super) async fn sync_security_rx(
         &mut self,
         policy: Option<&mut impl FnMut() -> Result<RegulatoryDomain, &'static str>>,

@@ -33,6 +33,9 @@ pub struct LegacyDataStatus {
 #[derive(Debug, Eq, PartialEq)]
 pub enum LegacyReceive {
     Ethernet(Vec<u8>),
+    /// An Ethernet packet whose L3/L4 checksums the firmware verified
+    /// (`csum::rx_meta_l3l4`); only non-empty verdicts use this variant.
+    Checked(Vec<u8>, narf_net::RxMeta),
     /// A bounded, original plaintext EAPOL packet observed before the native
     /// RSNA owner starts. It is never delivered to the ordinary Ethernet port.
     Eapol(Vec<u8>),
@@ -392,6 +395,17 @@ impl Owner {
     pub(super) async fn transmit_data_using(
         &mut self,
         ethernet: &[u8],
+        policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<(), &'static str> {
+        self.transmit_data_assisted(ethernet, 0, policy).await
+    }
+
+    /// `assist` is the checksum `offload_assist` returned by
+    /// `csum::prepare_tx` for this already-prepared Ethernet frame.
+    pub(super) async fn transmit_data_assisted(
+        &mut self,
+        ethernet: &[u8],
+        assist: u32,
         mut policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(), &'static str> {
         let status = match policy().and_then(|p| self.data_ready(&p)) {
@@ -442,11 +456,12 @@ impl Owner {
             self.fresh_data_policy(&mut policy).await?;
             {
                 let power = self.power.prepared.as_ref().unwrap();
-                let mut tx = pin!(self.hardware.transmit(
+                let mut tx = pin!(self.hardware.transmit_assisted(
                     status.queue,
                     &frame,
                     if qos { 26 } else { 24 },
-                    None
+                    None,
+                    assist,
                 ));
                 poll_fn(|cx| {
                     if let Err(error) = policy().and_then(|p| power.check_applied(&p)) {
@@ -476,12 +491,13 @@ impl Owner {
     /// the separate management owner and cannot enter this producer.
     pub(in crate::iwlwifi) async fn transmit_data_batch_using(
         &mut self,
-        packets: &[Vec<u8>],
+        packets: &[(Vec<u8>, u32)],
         mut policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(), &'static str> {
         if !self.ba_qualified() {
-            for frame in packets {
-                self.transmit_data_using(frame, &mut policy).await?;
+            for (frame, assist) in packets {
+                self.transmit_data_assisted(frame, *assist, &mut policy)
+                    .await?;
             }
             return Ok(());
         }
@@ -503,7 +519,7 @@ impl Owner {
             .as_mut()
             .unwrap();
         let mut frames = Vec::with_capacity(packets.len());
-        for packet in packets {
+        for (packet, assist) in packets {
             if packet.get(12..14) == Some(&[0x88, 0x8e]) {
                 return Err("MVM batch cannot carry EAPOL");
             }
@@ -517,7 +533,7 @@ impl Owner {
             )
             .ok_or("MVM invalid BE batch Ethernet")?;
             data.sequence = data.sequence.wrapping_add(1) & 4095;
-            frames.push(frame);
+            frames.push((frame, *assist));
         }
         self.phase = Phase::TransmittingData;
         let result = async {
@@ -732,6 +748,13 @@ impl Owner {
                 .data
                 .as_mut()
                 .unwrap();
+            // Only a single (non-A-MSDU) MPDU's descriptor describes the
+            // delivered packet; Linux likewise sets ip_summed on that skb.
+            let l3l4 = if mpdu.amsdu {
+                0
+            } else {
+                u16::from_le_bytes([payload[10], payload[11]])
+            };
             let Some(ethernet) = data.aggregate.observe(
                 &mpdu,
                 local,
@@ -786,7 +809,12 @@ impl Owner {
                     .as_mut()
                     .unwrap()
                     .last_peer = narf_time::now_cycles();
-                return Ok(Some(LegacyReceive::Ethernet(ethernet)));
+                let meta = super::super::csum::rx_meta_l3l4(l3l4, &ethernet);
+                return Ok(Some(if meta == narf_net::RxMeta::default() {
+                    LegacyReceive::Ethernet(ethernet)
+                } else {
+                    LegacyReceive::Checked(ethernet, meta)
+                }));
             }
         }
         self.check_link_power(&policy()?)?;

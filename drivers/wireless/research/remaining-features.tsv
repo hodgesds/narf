@@ -132,7 +132,6 @@ iwlwifi	gen2_pmf	Gen2 PMF	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	gen2_recovery	Gen2 recovery	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	gen2_vht	Gen2 VHT	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	gen2_wpa3	Gen2 WPA3	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	gen3_unlisted_pci_ids	Linux-claimed So 0x7A70/0x7AF0/0x51F1/0x7F70, Ma 0x2729 and Bz 0xA840/0x7740/0x4D40 PCI IDs absent from the match table	chip	drivers/wireless/specification/iwlwifi.md	1555
 iwlwifi	group_nested_rx	Group-addressed nested A-MSDU-in-A-MPDU RX	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	he	HE	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	ht40	HT40	feature	drivers/wireless/specification/iwlwifi.md	1552
@@ -150,14 +149,12 @@ iwlwifi	platform_power_owner	Gen3 and Sc live platform TX-power enforcement owne
 iwlwifi	ptk_reuse	Safe PTK reuse	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	rss	Receive-side scaling	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	runtime_pm	Runtime power management	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	rx_checksum_offload	RX checksum offload (MQ descriptor l3l4_flags)	feature	drivers/wireless/specification/iwlwifi.md	1554
 iwlwifi	sched_scan_offload	Scheduled-scan (PNO/net-detect) firmware offload	feature	drivers/wireless/specification/iwlwifi.md	1554
 iwlwifi	six_ghz	6GHz operation on applicable 6E/7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
 iwlwifi	stbc	TX STBC (two TX chains + TLC_MNG_CFG_FLAGS_STBC; RX STBC1 implemented in §3.28)	feature	drivers/wireless/specification/iwlwifi.md	1734
 iwlwifi	system_resume	System resume	feature	drivers/wireless/specification/iwlwifi.md	84
 iwlwifi	system_suspend	System suspend	feature	drivers/wireless/specification/iwlwifi.md	84
 iwlwifi	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	tx_checksum_offload	TX L3/L4 checksum offload (TX_CMD offload_assist)	feature	drivers/wireless/specification/iwlwifi.md	1554
 iwlwifi	width_160	160MHz operation on applicable profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
 iwlwifi	width_320	320MHz operation on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
 iwlwifi	wow	Wake on WLAN	feature	drivers/wireless/specification/iwlwifi.md	1552

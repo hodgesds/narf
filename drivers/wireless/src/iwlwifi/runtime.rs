@@ -1171,7 +1171,7 @@ impl Hardware {
     pub(super) async fn transmit_gen2_batch(
         &mut self,
         id: u16,
-        frames: &[Vec<u8>],
+        frames: &[(Vec<u8>, u32)],
     ) -> Result<(), &'static str> {
         if frames.is_empty()
             || frames.len() > 8
@@ -1185,7 +1185,7 @@ impl Hardware {
             return Err("invalid Gen2 aggregate batch owner");
         }
         self.tx_completed.retain(|entry| entry.0 != id);
-        for frame in frames {
+        for (frame, assist) in frames {
             if self
                 .station_stop
                 .as_ref()
@@ -1193,7 +1193,7 @@ impl Hardware {
             {
                 return Err("MVM batch closed before native publication");
             }
-            self.enqueue_transmit(id, frame, 26, None)?;
+            self.enqueue_transmit_assisted(id, frame, 26, None, *assist)?;
         }
         let deadline = narf_time::Deadline::after_ms(2000);
         loop {
@@ -1268,6 +1268,16 @@ impl Hardware {
         }
         self.resources.data.remove(index);
         Ok(())
+    }
+
+    /// Bz and later hardware include the SNAP header in the RX
+    /// `CHECKSUM_COMPLETE` raw sum (`iwl_mvm_create_skb`); AX210 does not.
+    pub(super) fn rx_checksum_includes_snap(&self) -> Option<bool> {
+        match self.format {
+            rx_rfh::CompletionFormat::Qu => None,
+            rx_rfh::CompletionFormat::Ax210 => Some(false),
+            rx_rfh::CompletionFormat::Bz => Some(true),
+        }
     }
 
     pub fn fail(&mut self) {
@@ -1388,6 +1398,17 @@ impl Hardware {
         header_len: usize,
         rate: Option<u32>,
     ) -> Result<(), &'static str> {
+        self.enqueue_transmit_assisted(id, frame, header_len, rate, 0)
+    }
+
+    pub fn enqueue_transmit_assisted(
+        &mut self,
+        id: u16,
+        frame: &[u8],
+        header_len: usize,
+        rate: Option<u32>,
+        assist: u32,
+    ) -> Result<(), &'static str> {
         if self.failed {
             return Err("Wi-Fi transport failed");
         }
@@ -1398,7 +1419,7 @@ impl Hardware {
             .iter_mut()
             .find(|q| q.id() == Some(id))
             .ok_or("unknown TX queue")?;
-        sources.invoke(|| queue.send(&mut self.mmio, frame, header_len, rate))?;
+        sources.invoke(|| queue.send_assisted(&mut self.mmio, frame, header_len, rate, assist))?;
         Ok(())
     }
 
@@ -1451,7 +1472,21 @@ impl Hardware {
         header_len: usize,
         rate: Option<u32>,
     ) -> Result<(), &'static str> {
-        self.transmit_owned(id, frame, header_len, rate, false)
+        self.transmit_owned(id, frame, header_len, rate, false, 0)
+            .await
+    }
+
+    /// Data transmission with checksum `offload_assist` bits prepared by
+    /// [`super::csum::prepare_tx`].
+    pub async fn transmit_assisted(
+        &mut self,
+        id: u16,
+        frame: &[u8],
+        header_len: usize,
+        rate: Option<u32>,
+        assist: u32,
+    ) -> Result<(), &'static str> {
+        self.transmit_owned(id, frame, header_len, rate, false, assist)
             .await
     }
 
@@ -1465,7 +1500,8 @@ impl Hardware {
         header_len: usize,
         rate: Option<u32>,
     ) -> Result<(), &'static str> {
-        self.transmit_owned(id, frame, header_len, rate, true).await
+        self.transmit_owned(id, frame, header_len, rate, true, 0)
+            .await
     }
 
     async fn transmit_owned(
@@ -1475,6 +1511,7 @@ impl Hardware {
         header_len: usize,
         rate: Option<u32>,
         closing: bool,
+        assist: u32,
     ) -> Result<(), &'static str> {
         self.wait_tx_space(id).await?;
         if !closing
@@ -1492,7 +1529,8 @@ impl Hardware {
             .iter_mut()
             .find(|q| q.id() == Some(id))
             .ok_or("unknown TX queue")?;
-        let ssn = sources.invoke(|| queue.send(&mut self.mmio, frame, header_len, rate))?;
+        let ssn = sources
+            .invoke(|| queue.send_assisted(&mut self.mmio, frame, header_len, rate, assist))?;
         let deadline = narf_time::Deadline::after_ms(2000);
         loop {
             let activity = self.activity();

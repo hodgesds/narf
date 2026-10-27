@@ -134,10 +134,13 @@ impl State {
             }
             if let Some(pending) = &self.pending[category] {
                 match pending.progress(|frame| {
-                    connection.try_enqueue_for_ac(
+                    let mut bytes = frame.payload().to_vec();
+                    let assist = super::csum::prepare_tx(&mut bytes, frame.tx_meta().csum_l4)?;
+                    connection.try_enqueue_assisted(
                         &mut self.hardware,
-                        frame.payload(),
+                        &bytes,
                         Some(category),
+                        assist,
                     )
                 })? {
                     Transmit::Sent => {
@@ -353,6 +356,7 @@ impl Device {
             }
             narf_net::iface::register(self.name(), self.mac, send_frame);
             narf_net::iface::set_link_metadata(self.name(), false, None, None);
+            narf_net::iface::set_offloads(self.name(), super::csum::OFFLOADS);
             narf_net::iface::set_link_state(self.name(), false);
             narf_net::iface::install_rx_drain(drain_network);
             Ok(())
@@ -538,10 +542,12 @@ impl Device {
                 let Some(packet) = hardware.notifications.pop_front() else {
                     break;
                 };
-                match connection.receive_packet(&packet) {
+                match connection
+                    .receive_packet_checked(&packet, hardware.rx_checksum_includes_snap())
+                {
                     Ok(frames) => {
-                        for bytes in frames {
-                            queue_ethernet(bytes, connection.authorized, eapol, &mut output);
+                        for (bytes, meta) in frames {
+                            queue_ethernet(bytes, meta, connection.authorized, eapol, &mut output);
                         }
                     }
                     Err(_) => {
@@ -553,7 +559,13 @@ impl Device {
             match connection.reorder_tick() {
                 Ok(frames) => {
                     for bytes in frames {
-                        queue_ethernet(bytes, connection.authorized, eapol, &mut output);
+                        queue_ethernet(
+                            bytes,
+                            narf_net::RxMeta::default(),
+                            connection.authorized,
+                            eapol,
+                            &mut output,
+                        );
                     }
                 }
                 Err(_) => {
@@ -592,7 +604,7 @@ impl Device {
         }
         let mut deliveries = Vec::new();
         let receive = state.hardware.receive_publication();
-        for bytes in output {
+        for (bytes, meta) in output {
             let Some(receive) = receive.clone() else {
                 break;
             };
@@ -618,6 +630,7 @@ impl Device {
                     ) {
                         let mut frame = Frame::new(buffer, delivery.bytes.len() as u32);
                         frame.payload_mut().copy_from_slice(&delivery.bytes);
+                        frame.set_rx_meta(meta);
                         let _ = producer.try_send(frame);
                     }
                     Ok(())
@@ -773,16 +786,17 @@ impl Device {
 
 fn queue_ethernet(
     bytes: Vec<u8>,
+    meta: narf_net::RxMeta,
     authorized: bool,
     eapol: &mut VecDeque<Vec<u8>>,
-    output: &mut Vec<Vec<u8>>,
+    output: &mut Vec<(Vec<u8>, narf_net::RxMeta)>,
 ) {
     if bytes[12..14] == [0x88, 0x8e] {
         if eapol.len() < 16 {
             eapol.push_back(bytes);
         }
     } else if authorized {
-        output.push(bytes);
+        output.push((bytes, meta));
     }
 }
 
@@ -1283,12 +1297,17 @@ impl WirelessNetIface for Device {
 // owner alive; the PCI function remains bound until kernel shutdown.
 static ACTIVE: IrqSafeSpinLock<Option<Arc<Device>>> = IrqSafeSpinLock::new(None);
 
-fn send_frame(bytes: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+fn send_frame(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     let device = ACTIVE.lock().clone().ok_or(())?;
-    device.enqueue(bytes)
+    device.enqueue(bytes, meta)
 }
 impl Device {
-    fn enqueue(&self, bytes: &[u8]) -> Result<(), ()> {
+    fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+        // Refuse offload requests this frame cannot satisfy before queueing;
+        // it is never sent with a partial checksum.
+        if !super::csum::tx_admissible(bytes, meta) {
+            return Err(());
+        }
         let epoch = self.generation.load(Ordering::Acquire);
         let result = self.source.invoke(|| {
             let _admission = self.admission.lock();
@@ -1306,6 +1325,10 @@ impl Device {
             };
             let mut frame = Frame::new(buffer, bytes.len() as u32);
             frame.payload_mut().copy_from_slice(bytes);
+            frame.set_tx_meta(narf_net::TxMeta {
+                more: false,
+                ..meta
+            });
             let category = super::qos::Parameters::default().classify(bytes).ok_or(());
             let Ok(category) = category else {
                 return Ok(Err(()));
@@ -1338,6 +1361,9 @@ struct RegisteredDevice(Arc<Device>);
 impl Interface for RegisteredDevice {
     fn name(&self) -> &str {
         self.0.name()
+    }
+    fn offloads(&self) -> narf_net::OffloadCapabilities {
+        super::csum::OFFLOADS
     }
     fn mac(&self) -> [u8; 6] {
         self.0.mac()
