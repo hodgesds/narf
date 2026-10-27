@@ -1,6 +1,6 @@
 [package]
 name         = "narf-drivers-wwan"
-description  = "WWAN subsystem scaffold: WwanPort trait, MBIM/QMI message types, IOSM PCI device table. Stage-0/1 only — SIM management, RIL, and actual modem firmware are deferred."
+description  = "WWAN subsystem: WwanPort registry, MBIM control plane + USB CDC-MBIM binding, raw-IP bearer netdev handoff, QMI codec, IOSM PCI device table. SIM management, RIL, and modem firmware loading are deferred; IOSM/PCIe bring-up is a follow-on."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -14,6 +14,11 @@ path = "src/lib.rs"
 [dependencies]
 narf-lib          = { path = "../../lib" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
+narf-init         = { path = "../../init" }
+narf-scheduler    = { path = "../../scheduler" }
+narf-console      = { path = "../../console" }
+narf-net          = { path = "../../net" }
+narf-drivers-usb  = { path = "../usb" }
 
 [features]
 kernel-test = []

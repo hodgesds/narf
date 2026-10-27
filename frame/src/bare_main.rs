@@ -3194,6 +3194,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_drivers_video::register_initcalls();
             narf_drivers_media::register_initcalls();
             narf_drivers_thunderbolt::register_initcalls();
+            narf_drivers_wwan::register_initcalls();
             narf_drivers_fingerprint::register_initcalls();
             narf_drivers_fs_ext2::register_initcalls();
             narf_drivers_fs_ext4::register_initcalls();

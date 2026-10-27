@@ -42,6 +42,7 @@ narf-drivers-usb     = { path = "../drivers/usb" }
 narf-drivers-video   = { path = "../drivers/video" }
 narf-drivers-media = { path = "../drivers/media" }
 narf-drivers-thunderbolt = { path = "../drivers/thunderbolt" }
+narf-drivers-wwan    = { path = "../drivers/wwan" }
 narf-drivers-fingerprint = { path = "../drivers/fingerprint" }
 narf-drivers-platform = { path = "../drivers/platform" }
 # Hardware monitoring (k10temp & friends): the crate registers its
@@ -283,6 +284,7 @@ kernel-test  = [
     "narf-pinctrl/kernel-test",
     "narf-usbpd/kernel-test",
     "narf-drivers-usb/kernel-test",
+    "narf-drivers-wwan/kernel-test",
     "narf-drivers-storage/kernel-test",
     "narf-drivers-video/kernel-test",
     "narf-drivers-usbpd/kernel-test",
