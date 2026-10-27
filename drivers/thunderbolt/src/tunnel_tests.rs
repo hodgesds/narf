@@ -566,7 +566,18 @@ fn fabric_diff(a: &BTreeMap<Key, u32>, b: &BTreeMap<Key, u32>) -> Vec<Key> {
     let mut keys: Vec<Key> = a.keys().chain(b.keys()).copied().collect();
     keys.sort_unstable();
     keys.dedup();
-    keys.into_iter().filter(|k| a.get(k) != b.get(k)).collect()
+    // Compare register VALUES, not map membership. The model's map
+    // records every word ever written, so a word teardown restored
+    // to 0 stays present in the map while a never-written word is
+    // absent — yet both read as 0 on the device, and the register
+    // value is the fabric state this comparison means. Comparing
+    // `Option<&u32>` instead made every restored-to-zero word (each
+    // journaled hop and adapter word, the USB3 handshake words) a
+    // spurious difference, so the drained fabric could never equal
+    // the pre-activation fabric even with a perfect rollback.
+    keys.into_iter()
+        .filter(|k| a.get(k).copied().unwrap_or(0) != b.get(k).copied().unwrap_or(0))
+        .collect()
 }
 
 fn usb4_tunnel_suspend_replay_cycle() -> TestResult {
