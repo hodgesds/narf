@@ -554,6 +554,10 @@ impl<B: BlockDevice + 'static> DirOps for ExfatNode<B> {
         true
     }
 
+    fn dcache_case_insensitive(&self) -> bool {
+        true
+    }
+
     fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
         // Disk-backed; sync API is unsupported. The VFS prefers
         // `lookup_async` automatically.

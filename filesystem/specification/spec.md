@@ -240,6 +240,7 @@ pub fn with_mount_root(
 pub trait DirOps {
     fn dcache_identity(&self) -> (usize, u64, u64); // superblock, inode namespace, inode
     fn rcu_walkable(&self) -> bool;
+    fn dcache_case_insensitive(&self) -> bool;
 }
 
 pub fn begin_path_mutation(
@@ -313,6 +314,14 @@ pub fn begin_path_mutation(
   inode identity)` triple instead, so mutation through any wrapper unhashes
   every cached alias. The namespace is zero for ordinary filesystems and
   distinguishes inode-number domains such as btrfs subvolumes.
+- `dcache_case_insensitive` declares that a directory's names are
+  case-insensitive: names differing only in letter case denote one entry.
+  It defaults to `false` (byte-exact dcache keys) and must be wait-free.
+  A case-insensitive directory that is also `rcu_walkable` must return
+  `true`, so the dcache folds ASCII case in its bucket hash and name
+  comparisons; every case spelling of a name then shares one bucket and
+  one dentry, and a mutation guard taken under any spelling unhashes
+  every alias before the backing namespace changes.
 
 ### 3.3 File operations (async)
 
