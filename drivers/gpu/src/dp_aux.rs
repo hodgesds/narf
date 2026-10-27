@@ -182,10 +182,20 @@ pub trait AuxChannel {
         if n == 0 || n > 16 {
             return Err(AuxError::TooLong);
         }
+        // For reads, `AuxRequest.data` is a *length placeholder*:
+        // transports derive both the wire LEN field
+        // (`data.len() - 1`, DP 1.4a §2.7.4) and the expected
+        // reply payload length from it; its contents are never
+        // put on the wire. Passing an empty slice here — as this
+        // code did before #1092 — encoded LEN = 0 (a 1-byte
+        // request) while the caller waited for `n` bytes, so
+        // every multi-byte DPCD read over a real transport
+        // failed reply-length decode. The per-address test stubs
+        // that ignored `data` entirely masked it.
         let req = AuxRequest {
             cmd: AuxCommand::NativeRead,
             address: addr,
-            data: &[],
+            data: &*buf,
         };
         // Reply buffer = 1 status + n data bytes.
         let mut reply = [0u8; 17];

@@ -465,6 +465,43 @@ pub mod tests {
         smoke_aux_ctl_composition_and_success
     );
 
+    fn smoke_dpcd_read_requests_full_length() -> TestResult {
+        // Regression pin for the #1092 found defect: `dpcd_read`
+        // built its request with an empty data slice, so the
+        // wire LEN field encoded 0 (a 1-byte request) and the
+        // transport expected a 0-byte payload — every multi-byte
+        // DPCD read over this transport failed decode. The
+        // request must carry the caller's buffer as the length
+        // placeholder: a 2-byte read at 0x202 must put
+        // LEN = 1 in the frame's fourth byte.
+        use crate::dp_aux::AuxChannel as _;
+        let mmio = MockMmio::default();
+        // Reply: DONE, MSGSIZE = 3 (status + 2 payload bytes);
+        // DATA0 carries status 0x00 then payload AB CD.
+        mmio.set_read(ctl_off(), AUX_CTL_DONE | (3 << AUX_CTL_MSGSIZE_SHIFT));
+        mmio.set_read(Ddi::A.base() + DDI_AUX_DATA_OFFSET, 0x00AB_CD00);
+        let mut aux = IntelAux::new(&mmio, Ddi::A);
+        let mut buf = [0u8; 2];
+        match aux.dpcd_read(0x202, &mut buf) {
+            Ok(()) => {}
+            Err(_) => return TestResult::Fail("2-byte dpcd_read must succeed over the transport"),
+        }
+        if buf != [0xAB, 0xCD] {
+            return TestResult::Fail("dpcd_read payload must land in the caller buffer");
+        }
+        // The frame written to AUX_DATA[0]: cmd 0x9, addr
+        // 0x000202, LEN 0x01 — big-endian packed.
+        let d0 = mmio.writes_to(Ddi::A.base() + DDI_AUX_DATA_OFFSET);
+        if d0 != alloc::vec![0x9002_0201] {
+            return TestResult::Fail("wire frame must encode the requested length (LEN = n-1)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_aux",
+        smoke_dpcd_read_requests_full_length
+    );
+
     fn smoke_aux_timeout_retries_exactly_three_times() -> TestResult {
         let mmio = MockMmio::default();
         // Every completion read reports TIMEOUT_ERROR (SEND_BUSY clear).

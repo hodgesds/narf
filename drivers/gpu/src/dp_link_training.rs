@@ -691,3 +691,239 @@ pub fn train_link<A: AuxChannel>(
         }
     }
 }
+
+// ── Shared link-training core: capabilities + negotiation ──────────
+//
+// SEAM — SHARED LINK-TRAINING CORE (named for its consumers).
+//
+// This section is the vendor-neutral front half of DP link
+// bring-up: read the sink's DPCD receiver-capability field,
+// negotiate (rate, lanes) against the source's capabilities and
+// the stream's bandwidth demand, then run the training state
+// machine above at the negotiated configuration. It is written
+// purely against [`AuxChannel`], so any AUX transport can drive
+// it:
+//
+//   - the Intel lane (#1092) drives it over `IntelAux` (native
+//     AUX on a DDI port);
+//   - **Thunderbolt lane 3 (#1095) consumes this exact seam**
+//     over a tunnelled-AUX `AuxChannel` implementation — it must
+//     not grow a second caps/negotiation implementation;
+//   - the AMD DCN DP path can adopt it the same way.
+//
+// Everything below the seam (CR/EQ state machine, fallback
+// ladder) already lived in this module; the caps/negotiation
+// layer is what #1092 added — before it, callers hardcoded a
+// start configuration (the Intel modeset started at HBR2 × 4
+// regardless of what the sink advertised).
+
+// DPCD receiver-capability field addresses (DPCD §2.7, receiver
+// capability field 0x0000–0x000F).
+const DPCD_DPCD_REV: u32 = 0x0_0000;
+const DPCD_MAX_LINK_RATE: u32 = 0x0_0001;
+const DPCD_MAX_LANE_COUNT: u32 = 0x0_0002;
+const DPCD_TRAINING_AUX_RD_INTERVAL: u32 = 0x0_000E;
+
+/// Size of the receiver-capability field read in one burst.
+const DPCD_CAPS_LEN: usize = 16;
+
+impl LinkRate {
+    /// Raw per-lane link rate in kbps (the symbol rate × 10 for
+    /// 8b/10b coding): RBR 1.62 Gbps, HBR 2.7, HBR2 5.4,
+    /// HBR3 8.1.
+    pub fn rate_kbps(self) -> u32 {
+        match self {
+            LinkRate::Rbr => 1_620_000,
+            LinkRate::Hbr => 2_700_000,
+            LinkRate::Hbr2 => 5_400_000,
+            LinkRate::Hbr3 => 8_100_000,
+        }
+    }
+
+    /// Usable payload bandwidth of a link at this rate with
+    /// `lanes` lanes, in kbps: 8b/10b coding carries 8 payload
+    /// bits per 10-bit symbol.
+    pub fn payload_kbps(self, lanes: u8) -> u64 {
+        (self.rate_kbps() as u64 * lanes as u64 * 8) / 10
+    }
+
+    /// The lower of two rates on the fallback ladder ordering.
+    fn min_of(a: Self, b: Self) -> Self {
+        if a.rate_kbps() <= b.rate_kbps() {
+            a
+        } else {
+            b
+        }
+    }
+}
+
+/// The sink's DPCD receiver capabilities, decoded from the
+/// 16-byte capability field (DPCD 0x0000–0x000F).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DpcdCaps {
+    /// Raw `DPCD_REV` byte (0x10 = DP 1.0/1.1, 0x11 = 1.1,
+    /// 0x12 = 1.2, 0x13 = 1.3, 0x14 = 1.4).
+    pub dpcd_rev: u8,
+    /// Highest link rate the sink advertises (`MAX_LINK_RATE`,
+    /// same encoding as `LINK_BW_SET`). An unrecognised byte
+    /// decodes to the mandatory RBR floor rather than failing:
+    /// every DP sink must train at RBR.
+    pub max_rate: LinkRate,
+    /// `MAX_LANE_COUNT` bits[4:0], clamped to the 4-lane DP
+    /// maximum and floored at 1.
+    pub max_lanes: u8,
+    /// `MAX_LANE_COUNT` bit 6 — TPS3 supported (DP 1.2+).
+    pub tps3_supported: bool,
+    /// `MAX_LANE_COUNT` bit 7 — enhanced framing supported.
+    pub enhanced_framing: bool,
+    /// Raw `TRAINING_AUX_RD_INTERVAL` byte (DPCD 0x000E); see
+    /// [`DpcdCaps::aux_rd_interval_us`].
+    pub training_aux_rd_interval: u8,
+}
+
+impl DpcdCaps {
+    /// Decode a raw 16-byte capability field.
+    pub fn decode(raw: &[u8; DPCD_CAPS_LEN]) -> Self {
+        let lane_byte = raw[(DPCD_MAX_LANE_COUNT - DPCD_DPCD_REV) as usize];
+        let lanes = (lane_byte & 0x1F).clamp(1, 4);
+        Self {
+            dpcd_rev: raw[0],
+            max_rate: LinkRate::from_dpcd_byte(raw[(DPCD_MAX_LINK_RATE - DPCD_DPCD_REV) as usize])
+                .unwrap_or(LinkRate::Rbr),
+            max_lanes: lanes,
+            tps3_supported: lane_byte & 0x40 != 0,
+            enhanced_framing: lane_byte & 0x80 != 0,
+            training_aux_rd_interval: raw[(DPCD_TRAINING_AUX_RD_INTERVAL - DPCD_DPCD_REV) as usize],
+        }
+    }
+
+    /// The sink's post-write training poll interval in µs, per
+    /// the `TRAINING_AUX_RD_INTERVAL` encoding (DP 1.4a Table
+    /// 2-146): 0 → 100 µs; 1–4 → 4/8/12/16 ms; reserved values
+    /// fall back to the 100 µs floor.
+    pub fn aux_rd_interval_us(&self) -> u32 {
+        match self.training_aux_rd_interval {
+            0 => 100,
+            1 => 4_000,
+            2 => 8_000,
+            3 => 12_000,
+            4 => 16_000,
+            _ => 100,
+        }
+    }
+}
+
+/// Read the sink's receiver-capability field in one 16-byte
+/// burst read at DPCD 0x0000.
+pub fn read_caps<A: AuxChannel>(aux: &mut A) -> Result<DpcdCaps, LinkError> {
+    let mut raw = [0u8; DPCD_CAPS_LEN];
+    aux.dpcd_read(DPCD_DPCD_REV, &mut raw)?;
+    Ok(DpcdCaps::decode(&raw))
+}
+
+/// What the *source* (this driver / PHY) can drive. The Intel
+/// Gen12 source in #1092 is HBR3 × 4; a tunnelled source
+/// (Thunderbolt, #1095) reports the tunnel's envelope instead.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SourceCaps {
+    pub max_rate: LinkRate,
+    pub max_lanes: u8,
+}
+
+/// The outcome of (rate, lanes) negotiation: the configuration
+/// training starts from, plus the bandwidth accounting that
+/// produced it so callers can log and fixture it exactly.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct NegotiatedLink {
+    /// Negotiated link rate (never above either side's maximum).
+    pub rate: LinkRate,
+    /// Negotiated lane count (1, 2, or 4).
+    pub lanes: u8,
+    /// Stream bandwidth demand the negotiation was run against,
+    /// in kbps.
+    pub demand_kbps: u64,
+    /// Payload bandwidth of `(rate, lanes)`, in kbps.
+    pub payload_kbps: u64,
+    /// `true` when even the fastest mutually-supported
+    /// configuration cannot carry the stream — the link still
+    /// trains at the ceiling (the caller decides whether the
+    /// mode is viable), but the shortfall is reported, never
+    /// silently absorbed.
+    pub over_budget: bool,
+}
+
+/// Bandwidth demand of an uncompressed stream, in kbps:
+/// pixel clock (kHz) × bits per pixel.
+pub fn stream_demand_kbps(pixel_clock_khz: u32, bits_per_pixel: u32) -> u64 {
+    pixel_clock_khz as u64 * bits_per_pixel as u64
+}
+
+/// Negotiate the link configuration for a stream.
+///
+/// Policy (deterministic, fixture-pinned):
+/// 1. Lane count = the largest of {4, 2, 1} not exceeding
+///    either side's maximum — bandwidth scales with lanes, so
+///    lanes are spent before rate.
+/// 2. Rate = the *lowest* rate at that lane count whose
+///    payload covers the demand, capped by both sides'
+///    maximum rate. The lowest sufficient rate is the
+///    lowest-power, highest-margin configuration that carries
+///    the stream.
+/// 3. If no mutually-supported rate covers the demand at that
+///    lane count, settle on the mutual ceiling and report
+///    `over_budget`.
+pub fn negotiate(source: &SourceCaps, sink: &DpcdCaps, demand_kbps: u64) -> NegotiatedLink {
+    let lane_cap = source.max_lanes.min(sink.max_lanes).min(4);
+    let lanes = if lane_cap >= 4 {
+        4
+    } else if lane_cap >= 2 {
+        2
+    } else {
+        1
+    };
+    let ceiling = LinkRate::min_of(source.max_rate, sink.max_rate);
+    // Walk the ladder from the floor up; the first rate that
+    // covers the demand (without exceeding the ceiling) wins.
+    let mut rate = LinkRate::Rbr;
+    loop {
+        if rate.payload_kbps(lanes) >= demand_kbps || rate == ceiling {
+            break;
+        }
+        match rate.next_higher() {
+            Some(higher) => rate = higher,
+            None => break,
+        }
+    }
+    let payload_kbps = rate.payload_kbps(lanes);
+    NegotiatedLink {
+        rate,
+        lanes,
+        demand_kbps,
+        payload_kbps,
+        over_budget: payload_kbps < demand_kbps,
+    }
+}
+
+impl LinkRate {
+    /// One step higher on the rate ladder; `None` at HBR3.
+    pub fn next_higher(self) -> Option<Self> {
+        match self {
+            LinkRate::Rbr => Some(LinkRate::Hbr),
+            LinkRate::Hbr => Some(LinkRate::Hbr2),
+            LinkRate::Hbr2 => Some(LinkRate::Hbr3),
+            LinkRate::Hbr3 => None,
+        }
+    }
+}
+
+/// Train at a previously negotiated configuration. Thin
+/// composition of [`negotiate`]'s output with [`train_link`]'s
+/// fallback ladder: if the negotiated point fails, the ladder
+/// still walks down from it.
+pub fn train_negotiated<A: AuxChannel>(
+    aux: &mut A,
+    negotiated: &NegotiatedLink,
+    delay_us: impl Fn(u32) + Copy,
+) -> Result<TrainedLink, LinkError> {
+    train_link(aux, negotiated.rate, negotiated.lanes, delay_us)
+}
