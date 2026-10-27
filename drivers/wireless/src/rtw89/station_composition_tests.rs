@@ -1236,8 +1236,8 @@ fn smoke_rtw8852b_live_ap_edca_change_reprograms_without_reassociation() -> Test
     if edca_rows(&h).len() != before + 4 {
         return TestResult::Fail("applied EDCA set reprogrammed again");
     }
-    // An inadmissible set (BE AIFSN 2) still closes the station.
-    let bad = edca_beacon(&h, 0x83, 0x02);
+    // An inadmissible set (ACM on BE) still closes the station.
+    let bad = edca_beacon(&h, 0x83, 0x13);
     h.model(|io| io.packets.inject(&bad)).ok();
     h.pump();
     if !h.closed() {

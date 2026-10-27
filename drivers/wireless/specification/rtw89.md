@@ -971,7 +971,7 @@ DONE_ACK receipts as initial setup (`rtw89_ops_conf_tx` ->
 valid during the update, as in Linux; a failed or cancelled update
 invalidates it and closes the station. Loss of WMM, a U-APSD change, a
 change before the link is open, or a set that fails the existing EDCA
-admission (e.g. BE AIFSN<3) still closes the station. Smoke:
+admission (e.g. ACM on BE) still closes the station. Smoke:
 `smoke_rtw8852b_live_ap_edca_change_reprograms_without_reassociation`.
 
 ### Interrupt-driven runtime service (AX v0)
