@@ -381,6 +381,29 @@ also consult upstream Linux GPL sources.
   `CcidReader::get_slot_status`. The bridge depends on the narrow
   `CcidTransport` seam (production: the bound reader over xHCI);
   fixtures drive the published surface against a modelled card.
+- FIDO2 authenticators (CTAP2 over USB HID, issue #999) bind via
+  `ctap::try_bind_ctap_already_addressed`, late in the attach
+  cascade after CCID. Discrimination is the fetched HID report
+  descriptor, not the interface class: a token is an interface
+  whose report descriptor declares the FIDO Alliance usage page
+  (0xF1D0, usage 0x01) with 64-byte Input and Output fields and
+  no report IDs (`ctap::descriptor_is_fido`); every HID
+  interface on a composite device is scanned. The binder
+  requires a 64-byte interrupt IN/OUT endpoint pair
+  (`ctap::find_fido_endpoints`), issues SET_CONFIGURATION,
+  configures both endpoints, arms the first interrupt-IN TRB,
+  and registers the token in `ctap::CTAP_TOKENS` (append-only,
+  mirroring `CCID_READERS`; detach removal is the #748
+  follow-up, the slot itself is reclaimed by `detach_slot`).
+  `ctap::open_client(token)` builds a `narf_ctap2::Client` over
+  `ctap::XhciHidPipe` with `ctap::CryptoRandom` (narf-crypto's
+  HW-entropy-gated fill) for the suspend service. Interrupt-OUT
+  transfers are `Xhci::arm_interrupt_out` /
+  `Xhci::poll_interrupt_out`, the mirror of the interrupt-IN
+  pair: one Normal TRB carries one 64-byte report from the
+  endpoint's DMA page; polling reports bytes consumed or a
+  controller error; the pipe bounds its poll loop and surfaces
+  exhaustion as a CTAP Timeout rather than blocking.
 
 ## Scope
 
