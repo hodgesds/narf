@@ -927,6 +927,18 @@ counted again as wholly missing TX aggregation. Unsupported role, width, stream,
 or security capability remains closed; this ledger makes no per-chip RF or
 board-power claim from a model or PCI ID.
 
+Wider VHT geometry is enumerated from Linux `mac.c::ath10k_mac_get_phymode_vht`
+and `ath10k_create_vht_cap`; each width depends on the base VHT row (VHT20/40
+with actual SERVICE_READY `vht_cap_info`/`vht_supp_mcs`):
+`vht80` is MODE_11AC_VHT80 (with `WMI_PEER_80MHZ`) on every reached 5-GHz VHT
+image; `vht160` (MODE_11AC_VHT160, `WMI_PEER_160MHZ`) and `vht80p80`
+(MODE_11AC_VHT80_80) require `vht_cap_info` SUPP_CHAN_WIDTH 160 or
+160/80+80 and the `peer_bw_rxnss_override` NSS map bounded by the per-chip
+`vht160_mcs_{rx,tx}_highest` in `core.c::ath10k_hw_params_list`, nonzero only
+for QCA9984 (1560) and QCA9888 (780). Other reached tuples cannot claim 160 or
+80+80 from a PCI ID. 80+80 additionally needs a second, discontiguous 80-MHz
+occupied-power receipt and center2 in VDEV_START.
+
 Physical acceptance still must validate exact PCI/BMI identity, trusted firmware
 and board calibration, ROM/OTP/PLL/code-swap, native CE/HTC/WMI/HTT progress,
 scan, Open/WPA2 and actual DHCP/IP with a real AP, idle/beacon liveness, link loss,

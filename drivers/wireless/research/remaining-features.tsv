@@ -30,8 +30,10 @@ ath10k	tx_ba	Native TX Block Ack	feature	drivers/wireless/specification/ath10k.m
 ath10k	tx_pipeline	Independent multi-packet native TX pipeline	feature	drivers/wireless/specification/ath10k.md	919
 ath10k	tx_stbc	TX STBC	feature	drivers/wireless/specification/ath10k.md	917
 ath10k	uapsd	U-APSD	feature	drivers/wireless/specification/ath10k.md	920
-ath10k	unexpanded_wider_geometry	Wider-channel geometry is not enumerated into individual widths	unknown	drivers/wireless/specification/ath10k.md	919
 ath10k	vht	VHT	feature	drivers/wireless/specification/ath10k.md	919
+ath10k	vht160	VHT 160 MHz on QCA9984/QCA9888	feature	drivers/wireless/specification/ath10k.md	934
+ath10k	vht80	VHT 80 MHz operation	feature	drivers/wireless/specification/ath10k.md	933
+ath10k	vht80p80	VHT 80+80 on QCA9984/QCA9888	feature	drivers/wireless/specification/ath10k.md	935
 ath10k	wake_offload	Wake offload	feature	drivers/wireless/specification/ath10k.md	922
 ath10k	wpa3	WPA3	feature	drivers/wireless/specification/ath10k.md	921
 ath11k	aarch64_composition	Native aarch64 startup/PCI/IRQ/board-discovery composition gap; not a proven missing PHY feature	unknown	drivers/wireless/specification/ath11k.md	1824
