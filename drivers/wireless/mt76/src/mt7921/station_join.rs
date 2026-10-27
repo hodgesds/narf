@@ -210,7 +210,32 @@ pub(crate) fn wrap_eapol_frame(own: [u8; 6], peer: [u8; 6], eapol: &[u8]) -> Vec
     frame
 }
 
-/// Convert an unfragmented native station RX frame with RFC1042 LLC/SNAP.
+/// RFC1042 LLC/SNAP header (`rfc1042_header`, IEEE 802.1H selective translation).
+const RFC1042: [u8; 6] = [0xaa, 0xaa, 3, 0, 0, 0];
+/// IEEE 802.1H bridge-tunnel LLC/SNAP header (`bridge_tunnel_header`).
+const BRIDGE_TUNNEL: [u8; 6] = [0xaa, 0xaa, 3, 0, 0, 0xf8];
+/// Largest 802.3 length-framed MSDU (`ETH_DATA_LEN`). Values 1501..1535 are
+/// neither lengths nor EtherTypes, so a longer LLC body cannot be framed.
+const MAX_LLC_BODY: usize = 1500;
+
+/// Linux `ieee80211_get_8023_tunnel_proto`: RFC1042 (except AARP/IPX, which
+/// 802.1H keeps LLC-encapsulated) or bridge-tunnel SNAP yields its EtherType.
+fn tunnel_protocol(body: &[u8]) -> Option<[u8; 2]> {
+    let snap = body.get(..8)?;
+    let protocol = [snap[6], snap[7]];
+    let rfc1042 = snap[..6] == RFC1042 && !matches!(u16::from_be_bytes(protocol), 0x80f3 | 0x8137);
+    // A tunnelled value below 0x0600 would be an 802.3 length, not an
+    // EtherType; keep such bodies LLC-encapsulated rather than misframing.
+    (rfc1042 || snap[..6] == BRIDGE_TUNNEL)
+        .then_some(protocol)
+        .filter(|protocol| u16::from_be_bytes(*protocol) >= 0x0600)
+}
+
+/// Convert an unfragmented native station RX frame to an Ethernet/802.3 frame,
+/// following Linux `ieee80211_data_to_8023_exthdr` for a non-A-MSDU, non-mesh
+/// station: RFC1042/bridge-tunnel SNAP is replaced by its EtherType, while any
+/// other LLC body (AARP/IPX SNAP, STP/NetBIOS LLC, other OUIs) is delivered as an
+/// 802.3 length-framed MSDU with its LLC header intact.
 /// The retained transport disables RX header translation. Rejected native
 /// frames must never be reinterpreted as an already translated Ethernet frame.
 pub fn to_ethernet(frame: &[u8]) -> Option<Vec<u8>> {
@@ -222,7 +247,7 @@ pub fn to_ethernet(frame: &[u8]) -> Option<Vec<u8>> {
     {
         return None;
     }
-    let snap_offset = if fc & 0x80 != 0 {
+    let body_offset = if fc & 0x80 != 0 {
         let qos = frame.get(24..26)?;
         if qos[0] & 0x80 != 0 {
             return None; // A-MSDU needs its own bounded deaggregation path.
@@ -231,24 +256,20 @@ pub fn to_ethernet(frame: &[u8]) -> Option<Vec<u8>> {
     } else {
         24
     };
-    let snap = frame.get(snap_offset..snap_offset + 8)?;
-    let protocol = u16::from_be_bytes([snap[6], snap[7]]);
-    if snap[..6] != [0xaa, 0xaa, 3, 0, 0, 0]
-        || protocol < 0x0600
-        || matches!(protocol, 0x80f3 | 0x8137)
-    {
-        // Linux's ieee80211_get_8023_tunnel_proto preserves LLC for AARP/IPX;
-        // that length-framed LLC path is not implemented by this profile.
-        return None;
-    }
-    let payload = &frame[snap_offset + 8..];
-    if payload.len() > 1500 {
+    let body = &frame[body_offset..];
+    let (type_or_length, payload) = match tunnel_protocol(body) {
+        Some(protocol) => (protocol, &body[8..]),
+        // An 802.3 MSDU carries at least the 802.2 DSAP/SSAP/control header.
+        None if body.len() >= 3 => (u16::try_from(body.len()).ok()?.to_be_bytes(), body),
+        None => return None,
+    };
+    if payload.len() > MAX_LLC_BODY {
         return None;
     }
     let mut eth = Vec::with_capacity(14 + payload.len());
     eth.extend_from_slice(&header[4..10]);
     eth.extend_from_slice(&header[16..22]);
-    eth.extend_from_slice(&snap[6..8]);
+    eth.extend_from_slice(&type_or_length);
     eth.extend_from_slice(payload);
     Some(eth)
 }

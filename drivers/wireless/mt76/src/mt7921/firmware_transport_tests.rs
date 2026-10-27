@@ -2198,16 +2198,20 @@ fn mt76_native_ethernet_conversion_rejects_unsupported_frame_layouts() -> TestRe
         (1, 0x82),  // HT control changes header length.
         (22, 1),    // Nonzero fragment number.
         (24, 0x80), // A-MSDU requires deaggregation.
-        (26, 0),    // Missing SNAP header.
-        (32, 0),    // A length field is not an EtherType.
     ] {
         let mut bad = frame.to_vec();
         bad[offset] = value;
         invalid.push(bad);
     }
-    for len in 0..34 {
+    // Header truncation, and a QoS body shorter than an 802.2 LLC header.
+    for len in 0..29 {
         invalid.push(frame[..len].to_vec());
     }
+    // An LLC body longer than ETH_DATA_LEN cannot be length-framed.
+    let mut oversized = frame[..26].to_vec();
+    oversized.extend_from_slice(&[0x42, 0x42, 0x03]);
+    oversized.resize(26 + 1501, 0);
+    invalid.push(oversized);
     for bad in invalid {
         if to_ethernet(&bad).is_some() {
             return TestResult::Fail("unsupported native frame became Ethernet");
@@ -2218,6 +2222,76 @@ fn mt76_native_ethernet_conversion_rejects_unsupported_frame_layouts() -> TestRe
 kernel_test_in!(
     "drivers/wireless/mt7921/transport",
     mt76_native_ethernet_conversion_rejects_unsupported_frame_layouts
+);
+
+/// Linux `ieee80211_data_to_8023_exthdr` / `ieee80211_get_8023_tunnel_proto`:
+/// only RFC1042 (minus AARP/IPX) and bridge-tunnel SNAP are translated to an
+/// EtherType; every other LLC body is delivered as an 802.3 length frame.
+fn mt76_native_rx_delivers_non_rfc1042_llc_as_8023() -> TestResult {
+    let packet = native_data_packet(true);
+    let header = &packet[24..50];
+    let convert = |body: &[u8]| {
+        let mut frame = header.to_vec();
+        frame.extend_from_slice(body);
+        to_ethernet(&frame)
+    };
+    let addresses = [2, 0x11, 0x22, 0x33, 0x44, 0x55, 2, 6, 7, 8, 9, 10];
+    // Bridge-tunnel SNAP strips like RFC1042.
+    let Some(tunnel) = convert(&[0xaa, 0xaa, 3, 0, 0, 0xf8, 0x80, 0x9b, 7, 8]) else {
+        return TestResult::Fail("bridge-tunnel SNAP rejected");
+    };
+    if tunnel[..12] != addresses || tunnel[12..] != [0x80, 0x9b, 7, 8] {
+        return TestResult::Fail("bridge-tunnel conversion");
+    }
+    // AARP/IPX under RFC1042, a foreign OUI, plain 802.2 (STP) and an
+    // RFC1042 header carrying a length value all keep their LLC header.
+    for body in [
+        &[0xaa, 0xaa, 3, 0, 0, 0, 0x80, 0xf3, 1, 2][..],
+        &[0xaa, 0xaa, 3, 0, 0, 0, 0x81, 0x37, 1][..],
+        &[0xaa, 0xaa, 3, 0, 0x0c, 0x07, 0x20, 0x00, 1, 2, 3][..],
+        &[0x42, 0x42, 3, 0, 0, 0, 0, 0][..],
+        &[0xaa, 0xaa, 3, 0, 0, 0, 0x00, 0x20][..],
+        &[0xf0, 0xf0, 3][..],
+    ] {
+        let Some(eth) = convert(body) else {
+            return TestResult::Fail("non-RFC1042 LLC body rejected");
+        };
+        if eth[..12] != addresses
+            || eth[12..14] != (body.len() as u16).to_be_bytes()
+            || eth[14..] != *body
+        {
+            return TestResult::Fail("802.3 length framing");
+        }
+    }
+    // A maximal 1500-byte LLC body is representable; RFC1042 keeps its
+    // existing 1500-byte payload bound after the eight-byte strip.
+    let mut max = vec![0x42, 0x42, 3];
+    max.resize(1500, 0);
+    if convert(&max).map(|eth| eth.len()) != Some(1514) {
+        return TestResult::Fail("maximal LLC body");
+    }
+    let mut snap = vec![0xaa, 0xaa, 3, 0, 0, 0, 0x08, 0x00];
+    snap.resize(1508, 0);
+    if convert(&snap).map(|eth| eth.len()) != Some(1514) {
+        return TestResult::Fail("maximal RFC1042 payload");
+    }
+    snap.push(0);
+    if convert(&snap).is_some() {
+        return TestResult::Fail("oversized RFC1042 payload");
+    }
+    // A length frame can never alias the EAPOL EtherType the station
+    // reserves for its controlled port.
+    let mut eapol_like = vec![0xaa, 0xaa, 3, 0, 0, 0x01, 0x88, 0x8e];
+    eapol_like.extend_from_slice(&[1, 3, 0, 0]);
+    match convert(&eapol_like) {
+        Some(eth) if eth[12..14] == [0, 12] => {}
+        _ => return TestResult::Fail("foreign-OUI EAPOL must stay length-framed"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/transport",
+    mt76_native_rx_delivers_non_rfc1042_llc_as_8023
 );
 
 fn mt76_receive_discards_bad_descriptors_and_other_station_frames() -> TestResult {
@@ -2457,7 +2531,11 @@ fn mt76_protected_rx_checks_decrypt_metadata_and_per_key_tid_replay() -> TestRes
         return TestResult::Fail("group key, plaintext or packet replay admission");
     }
     let mut malformed = ccmp_packet(100, 0, false);
-    malformed[66] = 0; // Invalid SNAP: must not advance PN.
+    // A body shorter than an 802.2 LLC header is not an MSDU: must not
+    // advance PN. (Other LLC bodies are now valid 802.3 length frames.)
+    malformed.truncate(40 + 26 + 2);
+    let length = malformed.len() as u32;
+    malformed[..4].copy_from_slice(&((2u32 << 27) | length).to_le_bytes());
     session.backend.packets.push_back(malformed);
     session.backend.packets.push_back(ccmp_packet(2, 0, false));
     if !matches!(session.receive_ethernet(), Ok(Some(_))) {
