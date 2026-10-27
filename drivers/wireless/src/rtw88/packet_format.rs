@@ -179,6 +179,11 @@ fn classify_profile(frame: &[u8], own: [u8; 6], profile: DataProfile) -> Result<
         // Management stays legacy. The separate qualified branch below may
         // admit only BE/TID0 QoS, without aggregation or fragmentation.
         0x00 | 0xb0 | 0xa0 | 0xc0 if frame[1] & (3 | 64) == 0 => Ok(Queue::Management),
+        // mac80211 software-scan Probe Request: broadcast DA (W0 BMC) and
+        // wildcard BSSID only; the caller requests no CCX report.
+        0x40 if frame[1] == 0 && frame[4..10] == [255; 6] && frame[16..22] == [255; 6] => {
+            Ok(Queue::Management)
+        }
         0xd0 if profile.mcs != 0
             && frame.len() == 33
             && frame[1] == 0

@@ -101,6 +101,8 @@ pub(in crate::rtw88) struct Peer {
     pub(in crate::rtw88) m2_data: Option<Vec<u8>>,
     pub(in crate::rtw88) m2_original: Option<Vec<u8>>,
     pub(in crate::rtw88) hold_data: bool,
+    /// Actual software-scan Probe Request DMA bytes, in publication order.
+    pub(in crate::rtw88) probes: Vec<Vec<u8>>,
 }
 impl Peer {
     pub(in crate::rtw88) fn new(protected: bool) -> Self {
@@ -149,6 +151,7 @@ impl Peer {
             m2_data: None,
             m2_original: None,
             hold_data: false,
+            probes: Vec::new(),
         }
     }
     pub(in crate::rtw88) fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
@@ -188,6 +191,24 @@ impl Peer {
         &mut self,
         frame: &[u8],
     ) -> Result<(Vec<Vec<u8>>, bool), &'static str> {
+        if frame.first() == Some(&0x40) {
+            // An AP answers a wildcard or matching-SSID probe with its
+            // beacon body as a unicast Probe Response to the probe SA.
+            self.probes.push(frame.to_vec());
+            if frame.len() < 26 || frame[24] != 0 || frame[4..10] != [255; 6] {
+                return Err("native probe request header/SSID element");
+            }
+            let ssid = frame
+                .get(26..26 + usize::from(frame[25]))
+                .ok_or("native probe SSID extent")?;
+            if !ssid.is_empty() && ssid != SSID {
+                return Ok((Vec::new(), false));
+            }
+            let mut response = self.ap.beacon();
+            response[0] = 0x50;
+            response[4..10].copy_from_slice(&frame[10..16]);
+            return Ok((vec![response], false));
+        }
         if frame.len() == 20 && frame[..2] == [0x84, 0] {
             let ssn = u16::from_le_bytes([frame[18], frame[19]]);
             if frame[4..10] != AP
@@ -917,4 +938,141 @@ fn smoke_rtw8822ce_native_disconnect_reservation_and_cancel_preserve_cleanup() -
 kernel_test_in!(
     "drivers/wireless/rtw88/station",
     smoke_rtw8822ce_native_disconnect_reservation_and_cancel_preserve_cleanup
+);
+
+fn active_request(ssids: Vec<Vec<u8>>, extra_ies: Vec<u8>) -> ScanRequest {
+    ScanRequest {
+        ssids,
+        frequencies_mhz: vec![2412],
+        channels: vec![1],
+        active: true,
+        random_mac: None,
+        colocated_6ghz: false,
+        duration_tu: Some(2),
+        duration_mandatory: false,
+        extra_ies,
+    }
+}
+/// Expected mac80211 software-scan preq for this station, sequence masked.
+fn expected_probe(ssid: &[u8], extra: &[u8]) -> Vec<u8> {
+    let mut f = vec![0x40, 0, 0, 0];
+    f.extend_from_slice(&[255; 6]);
+    f.extend_from_slice(&OWN);
+    f.extend_from_slice(&[255; 6]);
+    f.extend_from_slice(&[0, 0, 0, ssid.len() as u8]);
+    f.extend_from_slice(ssid);
+    f.extend_from_slice(&[1, 8, 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24]);
+    f.extend_from_slice(&[50, 4, 0x30, 0x48, 0x60, 0x6c, 3, 1, 1]);
+    f.extend_from_slice(extra);
+    f
+}
+fn smoke_rtw8822ce_native_active_scan_probe_response_joins() -> TestResult {
+    let h = Harness::new(false);
+    // Consume the harness's initial beacon, then age it out (10s lifetime).
+    h.scan();
+    h.env.clock.fetch_add(20_000, Ordering::AcqRel);
+    let passive = complete(h.device.scan(ScanRequest {
+        active: false,
+        ..active_request(vec![SSID.to_vec()], Vec::new())
+    }));
+    if !passive.is_ok_and(|seen| seen.is_empty()) || !h.peer.lock().probes.is_empty() {
+        return TestResult::Fail("RTL8822CE passive scan transmitted or kept stale BSS");
+    }
+    let vendor = [221, 4, 0x00, 0x10, 0x18, 0x02];
+    let before = h.model(|io| io.packets.descriptors.len());
+    let seen = match complete(h.device.scan(active_request(
+        vec![b"other".to_vec(), SSID.to_vec()],
+        vendor.to_vec(),
+    ))) {
+        Ok(seen) => seen,
+        Err(_) => return TestResult::Fail("RTL8822CE active channel1 scan failed"),
+    };
+    if seen.len() != 1 || seen[0].bssid != AP || seen[0].ssid != SSID {
+        return TestResult::Fail("RTL8822CE active scan missed the probe response");
+    }
+    let probes = h.peer.lock().probes.clone();
+    if probes.len() != 2 {
+        return TestResult::Fail("RTL8822CE active scan probe count differs");
+    }
+    for (probe, ssid) in probes.iter().zip([&b"other"[..], SSID]) {
+        let mut masked = probe.clone();
+        masked[22..24].fill(0);
+        if masked != expected_probe(ssid, &vendor) || probe[22] & 15 != 0 {
+            return TestResult::Fail("RTL8822CE native probe request bytes differ");
+        }
+    }
+    if probes[0][22..24] == probes[1][22..24] {
+        return TestResult::Fail("RTL8822CE probes reused a management sequence number");
+    }
+    let descriptors = h.model(|io| io.packets.descriptors[before..].to_vec());
+    if descriptors.len() != 2
+        || descriptors.iter().any(|d| {
+            let word = |i: usize| u32::from_le_bytes([d[i], d[i + 1], d[i + 2], d[i + 3]]);
+            word(0) & (1 << 24) == 0 || (word(4) >> 8) & 31 != 18 || word(8) & (1 << 19) != 0
+        })
+    {
+        return TestResult::Fail("RTL8822CE probe descriptor lacks BMC/MGMT or requested CCX");
+    }
+    if complete(h.device.associate(h.request())).is_err()
+        || !h.device.link_up()
+        || h.device.connected_bssid() != Some(AP)
+    {
+        return TestResult::Fail("RTL8822CE could not join a probe-response BSS");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/station",
+    smoke_rtw8822ce_native_active_scan_probe_response_joins
+);
+
+fn smoke_rtw8822ce_native_active_scan_refuses_policy_and_unsupported_requests() -> TestResult {
+    let h = Harness::new(false);
+    for request in [
+        ScanRequest {
+            random_mac: Some(narf_wireless::scan::ScanRandomMac {
+                addr: [2, 0, 0, 0, 0, 0],
+                mask: [0xff, 0, 0, 0, 0, 0],
+            }),
+            ..active_request(Vec::new(), Vec::new())
+        },
+        active_request(vec![Vec::new(); 5], Vec::new()),
+        ScanRequest {
+            channels: vec![6],
+            frequencies_mhz: vec![2437],
+            ..active_request(Vec::new(), Vec::new())
+        },
+        ScanRequest {
+            active: false,
+            ..active_request(Vec::new(), vec![221, 3, 0, 0x10, 0x18])
+        },
+        active_request(Vec::new(), vec![0, 2, b'x', b'y']),
+        active_request(Vec::new(), vec![221, 9, 0]),
+    ] {
+        if complete(h.device.scan(request)).is_ok() || !h.peer.lock().probes.is_empty() {
+            return TestResult::Fail("RTL8822CE admitted an unsupported active scan request");
+        }
+    }
+    // Rejected requests are refused before the owner is touched; the
+    // station still completes a later active scan.
+    if complete(h.device.scan(active_request(Vec::new(), Vec::new())))
+        .map_or(true, |seen| seen.len() != 1)
+        || h.peer.lock().probes.len() != 1
+    {
+        return TestResult::Fail("RTL8822CE request validation disturbed the station");
+    }
+    // Current regulatory policy is rechecked before the next probe DMA.
+    h.model(|io| io.policy.lock().rules[0].flags = narf_wireless::reg::RegFlags::NO_IR);
+    let before = h.model(|io| io.packets.tx_publications);
+    if complete(h.device.scan(active_request(Vec::new(), Vec::new()))).is_ok()
+        || h.model(|io| io.packets.tx_publications) != before
+        || h.peer.lock().probes.len() != 1
+    {
+        return TestResult::Fail("RTL8822CE probed on a NO_IR policy");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/station",
+    smoke_rtw8822ce_native_active_scan_refuses_policy_and_unsupported_requests
 );

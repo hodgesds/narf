@@ -593,12 +593,13 @@ impl<I: Io> Owner<I> {
     pub(super) async fn station_scan(
         &mut self,
         dwell_ms: u64,
+        probes: &[alloc::vec::Vec<u8>],
     ) -> Result<alloc::vec::Vec<narf_wireless::association::ObservedBss>, super::station::Error>
     {
         self.station
             .as_mut()
             .ok_or(super::station::Error::State)?
-            .scan_for(&mut self.io, dwell_ms)
+            .scan_for(&mut self.io, dwell_ms, probes)
             .await
     }
     pub(super) async fn station_associate(

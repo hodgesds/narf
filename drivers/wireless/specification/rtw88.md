@@ -496,8 +496,27 @@ exactly once; C2H bytes are never treated as Wi-Fi payload. Current PCI authorit
 the retained signed calibration cap and fresh authenticated policy are checked
 before every native packet publication and progress step.
 
-Passive scan admits channel1/2412 MHz only, bounded dwell and SSID filters.
-Active/random-MAC/6 GHz scanning and probe extra IEs are refused. The shared
+Scan admits channel1/2412 MHz only, bounded dwell and SSID filters.
+Active scanning and driver-admitted extra probe IEs are implemented on that
+channel (`src/rtw88/scan.rs`, `station.rs::scan_for`) as Linux's software
+scan: this profile has no `FW_FEATURE_SCAN_OFFLOAD`, so `rtw_ops_hw_scan`
+returns 1 and mac80211 sends one broadcast-DA/wildcard-BSSID Probe Request
+per SSID (empty list = one wildcard; at most `RTW_SCAN_MAX_SSIDS`=4) with
+SSID, all twelve legacy rates (Supported/Extended, no basic flags), DS
+Parameter Set channel1, then the caller's IEs. `max_scan_ie_len` is
+`IEEE80211_MAX_DATA_LEN` less those driver elements (2227 bytes), so every
+probe fits the retained2304-byte TX MPDU. Caller IEs must be well formed and
+may not repeat SSID/rates/DS; extra IEs on a passive scan are refused. Each
+probe uses the ordinary management queue (QSEL18, W0 BMC, rate ID8/CCK1,
+no CCX report) under the same current PCI/calibration/regulatory checks as
+authentication, so a NO_IR or otherwise disallowed policy prevents the first
+probe DMA. Probes are published one at a time and retired on DMA consumption
+before the dwell; unicast Probe Responses feed the same shared observer as
+beacons. Random-MAC and 6 GHz scanning stay refused. HT capability elements
+are not added to probes. Native smokes: `scan_tests.rs` (exact preq bytes,
+SSID/IE budget, malformed/unsupported requests, BMC/MGMT/no-report
+descriptor) and `station_composition_tests.rs` (actual DMA probes, probe-
+response-only BSS joined, NO_IR refusal without TX publication). The shared
 association parser validates actual beacons, authentication and association
 responses, including mandatory supported rates. Open and WPA2-PSK use that same
 retained peer transition. WPA2 uses shared host RSNA and packet-key owners for
@@ -1437,7 +1456,7 @@ Remaining software ledger:
 | C21/C22 originator TX BA | Distinct exact-H or R-over-H N21T/N22T contract; bound on-air request/response/current SSN, genuine CCX/RX-idle/MAC-FIFO proof, four independent native DMA originals, source AGGEN/density/MAXAGG and per-MPDU status, current-SSN BAR20/DELBA/key drains implemented; native tests passed the coordinated x86_64/aarch64 software suites. Measured assets/real MAC aggregation and over-air behavior remain external |
 | C21/C22 RTS threshold | Separate N21X/N22X over exact current H/R/T; native24Mbps RTS descriptor/control program, actual response-rate admission, drained current-authority setting, CCX/immutable-DMA/FIFO completion and EAPOL exclusion implemented. Twelve native cases pass on both architectures; real measured X assets/RTS-CTS/physical acceptance remain external |
 | Port0 peer/AID/media/RA/default-port control | Implemented bounded source mailbox, long-slot initial MLME, same-owner station integration and close/cancel behavior |
-| Passive scan, authentication/association, WPA2 controlled port | Retained channel1 shared MLME/RSNA/CCMP through actual native DMA and CCX, including held/altered/cancelled M4 and queued peer-loss closure |
+| Passive/active channel1 scan with probe IEs, authentication/association, WPA2 controlled port | Retained channel1 shared MLME/RSNA/CCMP through actual native DMA and CCX, including held/altered/cancelled M4 and queued peer-loss closure |
 | Native management/data TX, RX, completion and ring ownership | Implemented original rings, source descriptors, exact DMA plus CCX security receipt and current-authority publication |
 | Device/frame/kernel IP integration | One shell before activation, same Arc lifecycle, bounded synchronous progress; Open/WPA2 real kernel DHCP and exact bidirectional IP pass composed model tests |
 | Reset/suspend/removal, retained-map reclamation and multi-device lifetime | Outside the one-shot awake profile; published mappings remain retained |
@@ -1446,7 +1465,7 @@ Per-chip hardware backlog follows original `rtw8821c.c`, `rtw8822b.c` and
 `rtw8822c.c` chip-info/ops. C21 is1SS and C22B/C22C are2SS; all declare2.4/5GHz,
 HT and VHT. A separately qualified HT20/1SS/SGI20/A-MSDU station subset now has
 a complete software path on C21/C22C. Broader HT streams and widths, VHT,
-Broader TX aggregation and recipient negotiation, full WMM AC/TID scheduling, noninitial channels/active scan,
+Broader TX aggregation and recipient negotiation, full WMM AC/TID scheduling, noninitial channels (channel1 active scan is implemented),
 RF tracking, coexistence, sleep/WoW and controller-proven reset/rejoin. C22B needs
 retained firmware, MAC/PHY/RF/power and packet composition. C21/C22C supply
 separate qualified legacy station chains. None of these initial-profile exclusions are hardware

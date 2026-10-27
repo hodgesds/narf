@@ -83,6 +83,9 @@ mod publication;
 mod radio;
 mod radio8821c;
 mod reserved_page;
+mod scan;
+#[cfg(feature = "kernel-test")]
+mod scan_tests;
 mod sibling;
 mod station;
 pub(super) mod station_control;

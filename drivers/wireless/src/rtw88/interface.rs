@@ -551,6 +551,12 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
     fn supports_scan_dwell(&self) -> bool {
         true
     }
+    fn max_scan_ssids(&self) -> u8 {
+        super::scan::MAX_SSIDS
+    }
+    fn max_scan_ie_len(&self) -> u16 {
+        super::scan::MAX_EXTRA_IES
+    }
     fn connected_bssid(&self) -> Option<[u8; 6]> {
         if !self.link_up() {
             return None;
@@ -596,7 +602,7 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         })
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        let dwell = scan_dwell(&request)?;
+        let plan = super::scan::plan(&request, self.local)?;
         self.control_ready()?;
         let mut attempt = Attempt {
             device: self,
@@ -609,7 +615,7 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             attempt.armed = false;
             return Err(WirelessError::Busy);
         }
-        let result = owner.station_scan(dwell).await;
+        let result = owner.station_scan(plan.dwell_ms, &plan.probes).await;
         attempt.armed = false;
         if result.is_err() {
             self.close();
@@ -732,25 +738,6 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             }
         }
         result.map_err(error)
-    }
-}
-fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
-    if request.active
-        || request.random_mac.is_some()
-        || request.colocated_6ghz
-        || !request.extra_ies.is_empty()
-        || request.frequencies_mhz.iter().any(|f| *f != 2412)
-        || request.channels.iter().any(|ch| *ch != 1)
-        || request.ssids.len() > 32
-        || request.ssids.iter().any(|s| s.len() > 32)
-    {
-        return Err(WirelessError::NotSupported);
-    }
-    match request.duration_tu {
-        Some(n @ 1..=1000) => Ok((u64::from(n) * 1024).div_ceil(1000)),
-        Some(_) => Err(WirelessError::InvalidArgs),
-        None if request.duration_mandatory => Err(WirelessError::InvalidArgs),
-        None => Ok(200),
     }
 }
 pub(super) type Native = Device<super::pci_firmware::Transport>;

@@ -90,6 +90,8 @@ enum Kind {
     Decline,
     Ba,
     TxBa,
+    /// Broadcast software-scan Probe Request: no ACK, so no CCX report.
+    Probe,
 }
 struct Pending {
     id: u64,
@@ -351,7 +353,7 @@ impl State {
             bytes[22..24].copy_from_slice(&(self.sequence << 4).to_le_bytes());
             self.sequence = (self.sequence + 1) & 4095;
         }
-        let id = io.packet_submit(&bytes, kind != Kind::Data)?;
+        let id = io.packet_submit(&bytes, !matches!(kind, Kind::Data | Kind::Probe))?;
         if kind == Kind::Ba {
             self.rx_ba.submitted(&bytes)?;
         }
@@ -435,7 +437,7 @@ impl State {
         if pending.id != delivery.id || pending.bytes != delivery.bytes {
             return Err(Error::State);
         }
-        if !delivery.radio_acknowledged && !matches!(pending.kind, Kind::Data) {
+        if !delivery.radio_acknowledged && !matches!(pending.kind, Kind::Data | Kind::Probe) {
             return Err(Error::State);
         }
         if pending.kind == Kind::Security {
@@ -971,16 +973,40 @@ impl State {
             Ok(Vec::new())
         }
     }
+    /// mac80211 software scan on the retained channel: each Probe Request
+    /// is published and retired (DMA consumption, no ACK) before the next,
+    /// then the dwell runs from the last retirement. Empty `probes` is the
+    /// original passive scan.
     pub(super) async fn scan_for(
         &mut self,
         io: &mut impl Io,
         dwell_ms: u64,
+        probes: &[Vec<u8>],
     ) -> Result<Vec<ObservedBss>, Error> {
-        if !(1..=1024).contains(&dwell_ms) {
+        if !(1..=1024).contains(&dwell_ms) || probes.len() > 4 {
             return Err(Error::Profile);
         }
         if self.phase() != Phase::Passive {
             return Err(Error::State);
+        }
+        for probe in probes {
+            if probe.len() < 24
+                || probe[..4] != [0x40, 0, 0, 0]
+                || probe[4..10] != [255; 6]
+                || probe[10..16] != self.own
+                || probe[16..22] != [255; 6]
+            {
+                return Err(Error::Profile);
+            }
+            let admission = self.admission.clone();
+            admission.run(|| Ok(self.transmit(io, probe.clone(), Kind::Probe)))??;
+            while self.pending.is_some() {
+                self.poll(io)?;
+                if self.pending.is_none() {
+                    break;
+                }
+                self.environment.pause().await;
+            }
         }
         let until = self.now()?.saturating_add(dwell_ms);
         loop {
