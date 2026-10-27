@@ -78,6 +78,7 @@ mod suspend_service_tests;
 mod tests;
 #[cfg(feature = "kernel-test")]
 mod token_resume_tests;
+mod tpm_anchor_tests;
 
 pub use suspend::{SuspendError, SuspendPhase};
 pub use thermal::{

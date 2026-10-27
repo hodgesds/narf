@@ -37,7 +37,8 @@
 //! enforce. Real anchors land per lane: the FIDO token anchor and
 //! its resume ceremony are here ([`token_anchor`], P3 #999 + P5
 //! #1001); the Argon2id passphrase anchor is P7 (#1004,
-//! `passphrase`); TPM sealing is P6 (#1002).
+//! `passphrase`); TPM sealing is P6 (#1002 — [`TpmAnchor`], in
+//! `tpm_anchor`).
 //!
 //! The state-hook registry (design §5) lives in [`hooks`]: drivers
 //! register [`SuspendStateHook`]s, the seal fan-out runs inside
@@ -62,6 +63,7 @@ mod passphrase;
 mod resume;
 mod slots;
 mod token_anchor;
+mod tpm_anchor;
 
 pub use anchor::{AnchorError, AnchorKind, KeyCustodyAnchor, UnwrapCtx, WrapCtx, WrappedSlot};
 pub use custody::Secret32;
@@ -90,6 +92,7 @@ pub use token_anchor::{
     resume_with_token, suspend_client_data_hash, ConsoleTokenUi, TokenAnchor, TokenAnchorConfig,
     TokenPinMode, TokenUserInterface, SUSPEND_RP_ID, SUSPEND_USER_NAME,
 };
+pub use tpm_anchor::TpmAnchor;
 
 /// Crate-visible writer surface for fixtures (the resume-env
 /// smokes craft hook-region images the service itself does not
