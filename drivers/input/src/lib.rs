@@ -18,6 +18,7 @@ pub mod hid_mt_features;
 pub mod hid_multitouch;
 pub mod hid_rmi;
 pub mod hid_sensor;
+pub mod hid_sensor_pub;
 pub mod i2c_hid;
 pub mod i2c_hid_bind;
 pub mod i2c_hid_keyboard;

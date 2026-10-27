@@ -56,7 +56,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use narf_aml::resource::ResourceItem;
 use narf_drivers_gpio::{GpioIrqConfig, GpioPull};
@@ -384,6 +384,59 @@ impl I2cHidIdentity {
     }
 }
 
+/// One probed sensor collection on an I2C-HID device: its decode
+/// profile plus the descriptor unit exponent its reports carry.
+struct SensorRoute {
+    profile: crate::hid_sensor::HidSensorProfile,
+    unit_exp: i32,
+}
+
+/// Per-device publication key source. Each bound PNP0C50 device
+/// takes a unique key so its sensors never alias another hub's in
+/// the `hid_sensor_pub` registry.
+static NEXT_SENSOR_DEVICE_KEY: AtomicU32 = AtomicU32::new(0);
+
+/// Route one raw input report to a sensor collection, if it carries
+/// one of the routes' report IDs. On a successful decode the reading
+/// is unit-rescaled and published through `hid_sensor_pub`; returns
+/// `true` when the report was consumed as a sensor report.
+///
+/// A report whose ID matches a route but fails to decode is dropped
+/// (`false`, no fall-through aliasing onto another class). Reports
+/// on a no-report-ID descriptor are tried against each route in
+/// order until one decodes.
+pub(crate) fn route_sensor_report(
+    routes: &[SensorRoute],
+    device_key: u32,
+    payload: &[u8],
+    timestamp_ns: u64,
+) -> bool {
+    for route in routes {
+        let rid = route.profile.input_report_id;
+        if rid != 0 && payload.first() != Some(&rid) {
+            continue;
+        }
+        match crate::hid_sensor::decode_report(&route.profile, payload, timestamp_ns) {
+            Ok(ev) => {
+                let ev = crate::hid_sensor::rescale_event(ev, route.unit_exp);
+                crate::hid_sensor_pub::publish(
+                    crate::hid_sensor_pub::SensorSource::I2cHid,
+                    device_key,
+                    route.profile.kind,
+                    ev,
+                );
+                return true;
+            }
+            Err(_) => {
+                if rid != 0 {
+                    return false;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Per-device pump future. Owns the driver. Loops forever — exits
 /// only if the bus returns a fatal error.
 async fn pump_task(
@@ -449,6 +502,32 @@ async fn pump_task(
     let ptp = narf_hid::ptp::detect(&parsed);
     let touchscreen = narf_hid::touchscreen::detect(&parsed);
     let pen = narf_hid::pen::detect(&parsed);
+    // Sensor collections (HID Usage Page 0x20). A generic I2C-HID
+    // sensor hub's collections were previously never probed at all
+    // (issue #773): enumerate them here, register each with the
+    // publication layer, and let the report loop route their
+    // reports through `route_sensor_report`.
+    let sensor_device_key = NEXT_SENSOR_DEVICE_KEY.fetch_add(1, Ordering::Relaxed);
+    let sensor_routes: Vec<SensorRoute> = crate::hid_sensor::enumerate_sensors(&parsed)
+        .into_iter()
+        .map(|profile| {
+            crate::hid_sensor_pub::register_sensor(
+                crate::hid_sensor_pub::SensorSource::I2cHid,
+                sensor_device_key,
+                profile.kind,
+            );
+            let unit_exp = profile.fields.first().map(|f| f.unit_exp).unwrap_or(0);
+            SensorRoute { profile, unit_exp }
+        })
+        .collect();
+    if !sensor_routes.is_empty() {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  i2c-hid-pump: {}: {} sensor collection(s) published via hid_sensor_pub",
+            path,
+            sensor_routes.len()
+        );
+    }
     // Keyboard + Fn/media collections. A laptop's built-in keyboard
     // attaches over this same i2c-HID transport; a 2-in-1 device may
     // present BOTH a keyboard and a touch collection on one PNP0C50
@@ -666,6 +745,19 @@ async fn pump_task(
                 }
             }
         }
+        // Sensor collections last: their report IDs are distinct
+        // from every class above in a well-formed descriptor, and an
+        // unrouted report simply falls off the end of the loop.
+        if !sensor_routes.is_empty()
+            && route_sensor_report(
+                &sensor_routes,
+                sensor_device_key,
+                payload,
+                narf_time::monotonic_ns(),
+            )
+        {
+            continue;
+        }
     }
 }
 
@@ -853,4 +945,125 @@ pub fn __push_ptp_pointer_for_test(
     last_button: &mut bool,
 ) {
     push_ptp_pointer(decoded, last_x, last_y, last_button);
+}
+
+// ── Tests ────────────────────────────────────────────────────────
+
+pub mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    // Publication round trip for the I2C-HID sensor path (issue
+    // #773), exercising exactly the pump's sequence — parse →
+    // enumerate → register → route — minus the I2C read. The
+    // descriptor is built from the HID Sensor Usages shapes (accel
+    // collection, report ID 1, usages 0x0453..=0x0455; ALS
+    // collection, report ID 2, usage 0x04D1) via the decode layer's
+    // spec-shaped builder, concatenated as one two-collection hub
+    // descriptor. No unit exponent is declared, so the rescale is
+    // the exponent-0 case of the unit contract:
+    //   accel milli-g = raw × 10^6 / 9807 (truncating)
+    //     raw  10 → 1019, raw −20 → −2039, raw 30 → 3059
+    //   ALS lux passes through whole.
+    fn smoke_i2c_hid_sensor_publication_round_trip() -> TestResult {
+        crate::hid_sensor_pub::__reset_for_test();
+        narf_filesystem::sysfs::__reset_for_test();
+        crate::hid_sensor::init_sensor_ring();
+        crate::hid_sensor::__reset_sensor_ring_for_test();
+
+        let mut desc = crate::hid_sensor::build_test_descriptor(
+            0x0073, // ACCEL_3D
+            &[0x0453, 0x0454, 0x0455],
+            1,
+            true,
+        );
+        desc.extend_from_slice(&crate::hid_sensor::build_test_descriptor(
+            0x0041, // ALS
+            &[0x04D1],
+            2,
+            false,
+        ));
+        let parsed = match narf_hid::parse(&desc) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("hub descriptor did not parse"),
+        };
+        // Mirror the pump: register every enumerated collection and
+        // build the route table under one device key.
+        let device_key = 4242;
+        let routes: Vec<SensorRoute> = crate::hid_sensor::enumerate_sensors(&parsed)
+            .into_iter()
+            .map(|profile| {
+                crate::hid_sensor_pub::register_sensor(
+                    crate::hid_sensor_pub::SensorSource::I2cHid,
+                    device_key,
+                    profile.kind,
+                );
+                let unit_exp = profile.fields.first().map(|f| f.unit_exp).unwrap_or(0);
+                SensorRoute { profile, unit_exp }
+            })
+            .collect();
+        if routes.len() != 2 {
+            return TestResult::Fail("hub descriptor did not yield two sensor routes");
+        }
+        let infos = crate::hid_sensor_pub::sensors();
+        let find = |kind: crate::hid_sensor::HidSensorKind| {
+            infos.iter().find(|i| i.kind == kind).map(|i| i.id)
+        };
+        let (Some(accel), Some(als)) = (
+            find(crate::hid_sensor::HidSensorKind::Accelerometer3D),
+            find(crate::hid_sensor::HidSensorKind::AmbientLight),
+        ) else {
+            return TestResult::Fail("routes were not registered");
+        };
+        let show = |id: crate::hid_sensor_pub::SensorId, attr: &str| {
+            narf_filesystem::sysfs::class_register("iio")
+                .get_child(&alloc::format!("iio:device{}", id.0))
+                .and_then(|k| k.attr_show(attr))
+        };
+
+        // Accel report: [rid=1][x=10][y=−20][z=30] as i16 LE.
+        let mut accel_report = alloc::vec![1u8];
+        for v in [10i16, -20, 30] {
+            accel_report.extend_from_slice(&v.to_le_bytes());
+        }
+        if !route_sensor_report(&routes, device_key, &accel_report, 99) {
+            return TestResult::Fail("accel report not routed");
+        }
+        if crate::hid_sensor_pub::latest(accel)
+            != Some(crate::hid_sensor::SensorEvent::Accel3d {
+                x_milli_g: 1019,
+                y_milli_g: -2039,
+                z_milli_g: 3059,
+                timestamp_ns: 99,
+            })
+        {
+            return TestResult::Fail("accel reading wrong after route + rescale");
+        }
+        if show(accel, "in_accel_z_raw").as_deref() != Some("3059\n") {
+            return TestResult::Fail("accel reading not on the sysfs surface");
+        }
+        // ALS report: [rid=2][250 u16 LE] → 250 lux, accel untouched.
+        if !route_sensor_report(&routes, device_key, &[2, 250, 0], 100) {
+            return TestResult::Fail("ALS report not routed");
+        }
+        if show(als, "in_illuminance_raw").as_deref() != Some("250\n") {
+            return TestResult::Fail("ALS reading not on the sysfs surface");
+        }
+        if show(accel, "in_accel_z_raw").as_deref() != Some("3059\n") {
+            return TestResult::Fail("ALS publish aliased onto the accel device");
+        }
+        // Unknown report ID: not consumed, nothing changes.
+        if route_sensor_report(&routes, device_key, &[9, 1, 2, 3], 101) {
+            return TestResult::Fail("unknown report ID was consumed as a sensor report");
+        }
+        // Truncated report for a known ID: dropped, not published.
+        if route_sensor_report(&routes, device_key, &[1, 5], 102) {
+            return TestResult::Fail("truncated report was consumed");
+        }
+        if show(accel, "in_accel_x_raw").as_deref() != Some("1019\n") {
+            return TestResult::Fail("truncated report disturbed the published reading");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input", smoke_i2c_hid_sensor_publication_round_trip);
 }

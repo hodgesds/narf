@@ -123,10 +123,11 @@
 //!
 //! Unlike SFH (whose descriptors the transport itself
 //! synthesises), ISH descriptors come from the firmware and
-//! declare each data field's unit exponent. The transport owns
-//! the conversion into the decode layer's conventions, driven by
-//! the profile's first data field exponent `e` (raw × 10^e is the
-//! value in the HID Sensor Usages base unit):
+//! declare each data field's unit exponent. The conversion into
+//! the decode layer's conventions is the shared
+//! `hid_sensor::rescale_event`, driven by the profile's first data
+//! field exponent `e` (raw × 10^e is the value in the HID Sensor
+//! Usages base unit):
 //!
 //! - accel: base unit m/s² → milli-g: `raw × 10^(e+3) × 1000 / 9807`
 //! - gyro: base unit deg/s → milli-deg/s: `raw × 10^(e+3)`
@@ -1328,12 +1329,18 @@ impl<B: IshBus> IshHub<B> {
     }
 
     /// Decode one published input report for `device_id` and
-    /// push the event onto the shared sensor ring.
+    /// publish the event through the shared publication path
+    /// (`hid_sensor_pub` — sysfs/IIO surface + legacy sensor ring).
     fn handle_publish(&mut self, device_id: u8, report: &[u8], now_ns: u64) {
-        let Some(ev) = self.decode_for_device(device_id, report, now_ns) else {
+        let Some((kind, ev)) = self.decode_for_device(device_id, report, now_ns) else {
             return;
         };
-        hid_sensor::push_sensor_event(ev);
+        crate::hid_sensor_pub::publish(
+            crate::hid_sensor_pub::SensorSource::IntelIsh,
+            device_id as u32,
+            kind,
+            ev,
+        );
     }
 
     /// Decode an aggregated publish list: {total_size u16,
@@ -1363,8 +1370,14 @@ impl<B: IshBus> IshHub<B> {
     }
 
     /// Match a report to a profile on the named device and
-    /// decode + rescale it.
-    fn decode_for_device(&self, device_id: u8, report: &[u8], now_ns: u64) -> Option<SensorEvent> {
+    /// decode + rescale it. Returns the matched profile's kind
+    /// alongside the event so publishers can attribute the reading.
+    fn decode_for_device(
+        &self,
+        device_id: u8,
+        report: &[u8],
+        now_ns: u64,
+    ) -> Option<(HidSensorKind, SensorEvent)> {
         if report.is_empty() {
             return None;
         }
@@ -1377,7 +1390,10 @@ impl<B: IshBus> IshHub<B> {
             .iter()
             .find(|s| s.profile.input_report_id == report[0])?;
         let ev = hid_sensor::decode_report(&slot.profile, report, now_ns).ok()?;
-        Some(rescale_event(ev, slot.unit_exp))
+        Some((
+            slot.profile.kind,
+            hid_sensor::rescale_event(ev, slot.unit_exp),
+        ))
     }
 
     /// Send a HID request and wait (bounded) for its response.
@@ -1444,6 +1460,16 @@ impl<B: IshBus> IshHub<B> {
                             info.pid
                         );
                     } else {
+                        // Publish every sensor collection on this
+                        // device through the shared surface
+                        // (idempotent across session rebuilds).
+                        for slot in &dev.profiles {
+                            crate::hid_sensor_pub::register_sensor(
+                                crate::hid_sensor_pub::SensorSource::IntelIsh,
+                                dev_id as u32,
+                                slot.profile.kind,
+                            );
+                        }
                         self.devices.push(dev);
                     }
                 }
@@ -1501,6 +1527,7 @@ impl<B: IshBus> IshHub<B> {
             .dev_id as u8;
         let payload = self.hid_request(hostif::GET_INPUT_REPORT, dev_id, &[report_id])?;
         self.decode_for_device(dev_id, &payload, now_ns)
+            .map(|(_, ev)| ev)
             .ok_or(IshError::BadPayload)
     }
 
@@ -1628,121 +1655,6 @@ impl<B: IshBus> IshHub<B> {
             self.sysstate_notify(0)?;
         }
         Ok(())
-    }
-}
-
-// ── Unit contract ────────────────────────────────────────────────
-
-/// 10^n as i64 for n in 0..=9 (saturating beyond).
-fn pow10_i64(n: u32) -> i64 {
-    match n {
-        0 => 1,
-        1 => 10,
-        2 => 100,
-        3 => 1_000,
-        4 => 10_000,
-        5 => 100_000,
-        6 => 1_000_000,
-        7 => 10_000_000,
-        8 => 100_000_000,
-        _ => 1_000_000_000,
-    }
-}
-
-/// raw × 10^(exp+3): the value in milli-(base unit).
-fn to_milli_base(raw: i32, exp: i32) -> i64 {
-    let shift = exp.saturating_add(3);
-    let v = raw as i64;
-    if shift >= 0 {
-        v.saturating_mul(pow10_i64(shift as u32))
-    } else {
-        v / pow10_i64((-shift) as u32)
-    }
-}
-
-/// raw × 10^exp (whole base units, for lux).
-fn to_whole_base(raw: i32, exp: i32) -> i64 {
-    let v = raw as i64;
-    if exp >= 0 {
-        v.saturating_mul(pow10_i64(exp as u32))
-    } else {
-        v / pow10_i64((-exp) as u32)
-    }
-}
-
-fn clamp_i32(v: i64) -> i32 {
-    v.clamp(i32::MIN as i64, i32::MAX as i64) as i32
-}
-
-/// Apply the transport's unit contract to a decoded event, using
-/// the descriptor exponent `exp` of the profile it came from.
-fn rescale_event(ev: SensorEvent, exp: i32) -> SensorEvent {
-    match ev {
-        SensorEvent::Accel3d {
-            x_milli_g,
-            y_milli_g,
-            z_milli_g,
-            timestamp_ns,
-        } => {
-            // milli-m/s² → milli-g: × 1000 / 9807 (9.80665 m/s²).
-            let conv = |raw: i32| clamp_i32(to_milli_base(raw, exp) * 1000 / 9807);
-            SensorEvent::Accel3d {
-                x_milli_g: conv(x_milli_g),
-                y_milli_g: conv(y_milli_g),
-                z_milli_g: conv(z_milli_g),
-                timestamp_ns,
-            }
-        }
-        SensorEvent::Gyro3d {
-            x_milli_dps,
-            y_milli_dps,
-            z_milli_dps,
-            timestamp_ns,
-        } => {
-            let conv = |raw: i32| clamp_i32(to_milli_base(raw, exp));
-            SensorEvent::Gyro3d {
-                x_milli_dps: conv(x_milli_dps),
-                y_milli_dps: conv(y_milli_dps),
-                z_milli_dps: conv(z_milli_dps),
-                timestamp_ns,
-            }
-        }
-        SensorEvent::Magneto3d {
-            x_micro_t,
-            y_micro_t,
-            z_micro_t,
-            timestamp_ns,
-        } => {
-            // milli-milligauss → µT: 1 mG = 0.1 µT, so ÷ 10_000.
-            let conv = |raw: i32| clamp_i32(to_milli_base(raw, exp) / 10_000);
-            SensorEvent::Magneto3d {
-                x_micro_t: conv(x_micro_t),
-                y_micro_t: conv(y_micro_t),
-                z_micro_t: conv(z_micro_t),
-                timestamp_ns,
-            }
-        }
-        SensorEvent::Lux { lux, timestamp_ns } => SensorEvent::Lux {
-            lux: clamp_i32(to_whole_base(lux as i32, exp)).max(0) as u32,
-            timestamp_ns,
-        },
-        SensorEvent::Inclination {
-            x_milli_deg,
-            y_milli_deg,
-            z_milli_deg,
-            timestamp_ns,
-        } => {
-            let conv = |raw: i32| clamp_i32(to_milli_base(raw, exp));
-            SensorEvent::Inclination {
-                x_milli_deg: conv(x_milli_deg),
-                y_milli_deg: conv(y_milli_deg),
-                z_milli_deg: conv(z_milli_deg),
-                timestamp_ns,
-            }
-        }
-        // Proximity (distance mm / presence) and FusedOrientation
-        // pass through untouched.
-        other => other,
     }
 }
 
@@ -2761,6 +2673,86 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/input", smoke_ish_publish_accel_gyro);
+
+    // Publication round trip (issue #773): bring-up registers the
+    // hub's sensors, firmware-published reports land on the
+    // IIO sysfs surface with the decode layer's values. The accel
+    // pin is byte-exact at both ends: report z = 9810 milli-m/s²
+    // (0x2652 LE in `accel_report`) → 1000 milli-g published, and
+    // 1000 × in_accel_scale (0.00980665) = 9.80665 m/s² ≈ the
+    // 9.810 m/s² the firmware sent (integer rescale rounds at the
+    // milli-g step, as the unit contract documents).
+    fn smoke_ish_publication_round_trip() -> TestResult {
+        reset_ring();
+        crate::hid_sensor_pub::__reset_for_test();
+        narf_filesystem::sysfs::__reset_for_test();
+        let (mut hub, fw) = make_hub();
+        if hub.bring_up().is_err() {
+            return TestResult::Fail("bring_up failed");
+        }
+        let infos = crate::hid_sensor_pub::sensors();
+        let find = |kind: hid_sensor::HidSensorKind| {
+            infos
+                .iter()
+                .find(|i| {
+                    i.kind == kind && i.source == crate::hid_sensor_pub::SensorSource::IntelIsh
+                })
+                .map(|i| i.id)
+        };
+        let (Some(accel), Some(gyro), Some(als)) = (
+            find(hid_sensor::HidSensorKind::Accelerometer3D),
+            find(hid_sensor::HidSensorKind::Gyrometer3D),
+            find(hid_sensor::HidSensorKind::AmbientLight),
+        ) else {
+            return TestResult::Fail("bring_up did not register all ISH sensors");
+        };
+        let show = |id: crate::hid_sensor_pub::SensorId, attr: &str| {
+            narf_filesystem::sysfs::class_register("iio")
+                .get_child(&alloc::format!("iio:device{}", id.0))
+                .and_then(|k| k.attr_show(attr))
+        };
+        if show(accel, "name").as_deref() != Some("accel_3d\n")
+            || show(accel, "in_accel_scale").as_deref() != Some("0.00980665\n")
+        {
+            return TestResult::Fail("accel IIO identity/scale wrong");
+        }
+        fw.borrow_mut().publish(1, &accel_report(0, 0, 9810));
+        hub.service(123);
+        if show(accel, "in_accel_z_raw").as_deref() != Some("1000\n") {
+            return TestResult::Fail("accel reading not published to sysfs");
+        }
+        if crate::hid_sensor_pub::latest(accel)
+            != Some(SensorEvent::Accel3d {
+                x_milli_g: 0,
+                y_milli_g: 0,
+                z_milli_g: 1000,
+                timestamp_ns: 123,
+            })
+        {
+            return TestResult::Fail("accel reading not in the published store");
+        }
+        // Gyro on the SAME hub device must not disturb the accel
+        // device (masking-defeating).
+        fw.borrow_mut().publish(1, &gyro_report(0, 0, 45_000));
+        hub.service(124);
+        if show(gyro, "in_anglvel_z_raw").as_deref() != Some("45000\n") {
+            return TestResult::Fail("gyro reading not published to sysfs");
+        }
+        if show(accel, "in_accel_z_raw").as_deref() != Some("1000\n") {
+            return TestResult::Fail("gyro publish aliased onto the accel device");
+        }
+        // ALS lives on hub device 2; report [1, 0xE8, 0x03] = 1000 lux.
+        fw.borrow_mut().publish(2, &[1, 0xE8, 0x03]);
+        hub.service(125);
+        if show(als, "in_illuminance_raw").as_deref() != Some("1000\n") {
+            return TestResult::Fail("ALS reading not published to sysfs");
+        }
+        if show(accel, "in_illuminance_raw").is_some() {
+            return TestResult::Fail("ALS channel leaked onto the accel device");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input", smoke_ish_publication_round_trip);
 
     fn smoke_ish_publish_list() -> TestResult {
         reset_ring();
