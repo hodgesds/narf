@@ -1455,6 +1455,7 @@ dependencies = [
  "narf-driver-runtime",
  "narf-drivers",
  "narf-drivers-backlight",
+ "narf-drivers-sound",
  "narf-drivers-usbpd",
  "narf-drivers-virtio",
  "narf-edid",
