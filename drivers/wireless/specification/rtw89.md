@@ -1023,3 +1023,24 @@ References: Linux `rtw89/efuse.c`, `rtw8852a.h`, `rtw8852b_common.h`,
 `rtw8852c.h`, `rtw8851b.h`, `core.c::rtw89_core_get_ch_dma`,
 `pci.c::{rtw89_pci_txwd_submit,rtw89_pci_release_txwd_skb,rtw89_pci_fill_txaddr_info,rtw89_pci_fill_txaddr_info_v1}`,
 and per-chip PCI configuration.
+
+### Upstream applicability triage (2026-10-27)
+
+This subsection resolves the former `unknown` inventory rows against Linux
+v6.12 `rtw89/{core.c,mac80211.c,rtw8852b.c,rtw8852c.c,rtw8922a.c}`. It
+records applicability only; nothing below is implemented by this change.
+
+| Former row | Resolution and evidence |
+|---|---|
+| `additional_phy_widths` | `wide_channels`: per-chip `support_bandwidths` is 20/40/80MHz on 8852B and adds 160MHz on 8852C and 8922A; `core.c::rtw89_init_ht_cap` adds `SUP_WIDTH_20_40`/`DSSSCCK40`/`SGI_40`. `he_gi_ltf`: HE/EHT 0.8/1.6/3.2us GI and LTF variants from `rtw89_init_he_cap`. Both remain feature work. |
+| `aggregation_directions` | Removed; directions are now named on existing rows. `mac80211.c::rtw89_ops_ampdu_action` starts TX BA immediately and programs `rtw89_chip_h2c_ampdu_cmac_tbl` on `TX_OPERATIONAL`/`TX_STOP_*` (`block_ack` originator), and programs firmware BA-CAM through `rtw89_chip_h2c_ba_cam` on `RX_START`/`RX_STOP` (`block_ack` recipient). `TX_AMSDU`/`SUPPORTS_AMSDU_IN_AMPDU`/`AMPDU_AGGREGATION` define `aggregation`; host reorder remains `rx_reordering`. |
+| `broader_scan_policy` | `rtw89_core_register_hw` declares firmware scan offload (`rtw89_ops_hw_scan`, `SCAN_OFFLOAD` firmware feature), `NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR`, `NL80211_EXT_FEATURE_SCAN_RANDOM_SN`, `NL80211_EXT_FEATURE_SET_SCAN_DWELL` and `max_scan_ie_len = RTW89_SCANOFLD_MAX_IE_LEN`. Named rows: `active_scanning`, `randomized_scan_mac` (MAC and sequence number), `scan_dwell_control`, `scan_probe_extra_ies`; 6GHz split scan stays in `six_ghz_operation`. |
+| `fragmentation_scope` | `fragmentation`: rtw89 sets no `SUPPORTS_TX_FRAG`, so upstream fragments and defragments in mac80211 software and the driver transmits/receives individual fragment MPDUs. The remaining work is host fragmentation/defragmentation plus native TXWD/RX admission of nonzero fragment numbers and More-Fragments. |
+| `monitor_diagnostics_scope` | `monitor_mode`: `WANT_MONITOR_VIF`, and `IEEE80211_CONF_MONITOR` branches in `rtw89_core_parse_phy_status_ie01`/`rtw89_core_update_rx_status_by_ppdu`, make monitor a real radio mode with PHY-status RX metadata. Noise-histogram/CLM/FAHM measurements run from `rtw89_track_work` via `rtw89_phy_env_monitor_track` and stay in `nhm_diagnostics`. |
+| `optional_header_scope` | `he_htc`: `IEEE80211_HE_MAC_CAP0_HTC_HE` is advertised and `__rtw89_core_tx_adjust_he_qos_htc`/`rtw89_core_get_no_ul_ofdma_htc` insert HE +HTC into QoS DATA. Four-address headers are inapplicable to the upstream station: `interface_modes` is STATION/AP/P2P only and `wiphy->flags` lacks `WIPHY_FLAG_4ADDR_STATION`, so cfg80211 refuses `use_4addr`. |
+| `protected_management_scope` | `pmf`: `MFP_CAPABLE` is declared; `rtw89_core_tx_update_mgmt_info` hardware-encrypts unicast robust management when `hw_mgmt_tx_encrypt` (true on 8852C/8922A, false on 8852B, where host CCMP/BIP applies). |
+
+Refined feature rows: `wow` is declared by at least 8852B and 8852C
+(`wowlan_stub` under `CONFIG_PM`). `tspec` has no rtw89 driver hook
+(`mac80211.c` has no TSPEC path); WMM admission control is mac80211-owned
+host MLME work on top of `wmm_all_access_categories`.
