@@ -256,6 +256,19 @@ pub struct PanelPowerSequencer<'a, M: MmioWindow + ?Sized> {
     status_poll_budget: u32,
 }
 
+impl<M: MmioWindow + ?Sized> core::fmt::Debug for PanelPowerSequencer<'_, M> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PanelPowerSequencer")
+            .field("delays", &self.delays)
+            .field("powered_on", &self.powered_on)
+            .field("backlight_on", &self.backlight_on)
+            .field("last_power_on_cycles", &self.last_power_on_cycles)
+            .field("last_power_off_cycles", &self.last_power_off_cycles)
+            .field("status_poll_budget", &self.status_poll_budget)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a, M: MmioWindow + ?Sized> PanelPowerSequencer<'a, M> {
     /// Adopt the sequencer: decode delays from the firmware's
     /// register programming (merged with spec defaults) and note
@@ -1240,6 +1253,12 @@ pub fn on_scanout_published() {
 /// PPS/PSR paths and the publish hook use one implementation.
 pub struct BarWindow<'a>(pub &'a narf_bus::bar::MmioRegion);
 
+impl core::fmt::Debug for BarWindow<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BarWindow").finish_non_exhaustive()
+    }
+}
+
 impl MmioWindow for BarWindow<'_> {
     fn read32(&self, off: u64) -> u32 {
         // SAFETY: `self.0` is the GPU's MMADR BAR window mapped
@@ -1308,7 +1327,6 @@ pub fn enable_psr_for_panel(gpu: &crate::intel_gpu::IntelGpu, mode: &Mode) {
 /// composition), then the PPS backlight gate and power target.
 /// For suspend/remove paths; probe never calls it.
 pub fn panel_power_off(gpu: &crate::intel_gpu::IntelGpu) -> Result<(), PpsError> {
-    use narf_drivers_backlight::BacklightDevice as _;
     if let Some(owner) = narf_drivers_backlight::panel_owner() {
         owner.set_brightness(0);
     }

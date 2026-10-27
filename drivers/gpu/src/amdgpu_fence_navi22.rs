@@ -200,12 +200,12 @@ pub(crate) async fn wait<T, E>(
     engine: Engine,
     deadline: narf_time::Deadline,
     timeout: E,
-    poll_limit: Option<u32>,
+    _poll_limit: Option<u32>,
     mut sample: impl FnMut() -> Result<Option<T>, E>,
 ) -> Result<T, E> {
     let generation = GENERATION.load(Ordering::Acquire);
     #[cfg(feature = "kernel-test")]
-    let mut polls = poll_limit;
+    let mut polls = _poll_limit;
     loop {
         let expired = deadline.expired();
         if let Some(value) = sample()? {

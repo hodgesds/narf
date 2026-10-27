@@ -1992,9 +1992,7 @@ pub mod tests {
                     // I2C read: stream from the EEPROM pointer.
                     let edid = edid_1080p60();
                     let ptr = *self.edid_ptr.borrow();
-                    for i in 0..len {
-                        reply[1 + i] = edid[ptr + i];
-                    }
+                    reply[1..1 + len].copy_from_slice(&edid[ptr..ptr + len]);
                     *self.edid_ptr.borrow_mut() = ptr + len;
                     1 + len
                 }

@@ -124,7 +124,7 @@ impl MbimFunctionalDescriptor {
 }
 
 /// Everything the binding needs from a configuration blob.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct MbimFunction {
     /// Interface number of the CDC-Comm (control) interface.
     pub comm_iface: u8,
@@ -142,6 +142,27 @@ pub struct MbimFunction {
     /// Bulk-OUT endpoint of the data interface's active alt setting.
     pub bulk_out_ep: EndpointConfig,
 }
+
+impl PartialEq for MbimFunction {
+    fn eq(&self, other: &Self) -> bool {
+        fn same_endpoint(a: &EndpointConfig, b: &EndpointConfig) -> bool {
+            a.ep_addr == b.ep_addr
+                && a.max_packet == b.max_packet
+                && a.kind == b.kind
+                && a.interval == b.interval
+        }
+
+        self.comm_iface == other.comm_iface
+            && self.descriptor == other.descriptor
+            && self.data_iface == other.data_iface
+            && self.data_alt == other.data_alt
+            && same_endpoint(&self.notify_ep, &other.notify_ep)
+            && same_endpoint(&self.bulk_in_ep, &other.bulk_in_ep)
+            && same_endpoint(&self.bulk_out_ep, &other.bulk_out_ep)
+    }
+}
+
+impl Eq for MbimFunction {}
 
 /// Raw endpoint facts collected during the descriptor walk.
 #[derive(Clone, Copy)]
@@ -234,14 +255,16 @@ pub fn find_mbim_function(cfg: &[u8]) -> Option<MbimFunction> {
     let mut current: Option<(u8, u8)> = None; // (interface, alt)
     let mut alt_in: Option<RawEp> = None;
     let mut alt_out: Option<RawEp> = None;
-    let mut flush_alt = |data_iface: &mut Option<u8>,
-                         data_alt: &mut Option<u8>,
-                         bulk_in: &mut Option<RawEp>,
-                         bulk_out: &mut Option<RawEp>,
-                         current: &Option<(u8, u8)>,
-                         alt_in: &Option<RawEp>,
-                         alt_out: &Option<RawEp>| {
-        if let (Some((number, alt)), Some(bi), Some(bo)) = (current, alt_in, alt_out) {
+    let flush_alt = |data_iface: &mut Option<u8>,
+                     data_alt: &mut Option<u8>,
+                     bulk_in: &mut Option<RawEp>,
+                     bulk_out: &mut Option<RawEp>,
+                     current: &Option<(u8, u8)>,
+                     alt_in: &Option<RawEp>,
+                     alt_out: &Option<RawEp>| {
+        if let (Some(&(number, alt)), Some(&bi), Some(&bo)) =
+            (current.as_ref(), alt_in.as_ref(), alt_out.as_ref())
+        {
             let wanted = union_data_iface.map(|u| u == number).unwrap_or(true);
             if wanted && data_alt.is_none() {
                 *data_iface = Some(number);
@@ -328,6 +351,16 @@ pub struct UsbMbimTransport {
     comm_iface: u8,
     bulk_in_dci: u8,
     bulk_out_dci: u8,
+}
+
+impl core::fmt::Debug for UsbMbimTransport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("UsbMbimTransport")
+            .field("comm_iface", &self.comm_iface)
+            .field("bulk_in_dci", &self.bulk_in_dci)
+            .field("bulk_out_dci", &self.bulk_out_dci)
+            .finish_non_exhaustive()
+    }
 }
 
 impl UsbMbimTransport {
@@ -552,7 +585,7 @@ async fn bring_up(device: Arc<USBDevice>) -> Result<(), WwanError> {
         return Err(WwanError::MalformedFrame);
     }
     let total_len = u16::from_le_bytes([head[2], head[3]]) as usize;
-    if total_len < 9 || total_len > 4096 {
+    if !(9..=4096).contains(&total_len) {
         return Err(WwanError::MalformedFrame);
     }
     let mut cfg = alloc::vec![0u8; total_len];

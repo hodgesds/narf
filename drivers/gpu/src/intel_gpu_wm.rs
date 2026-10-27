@@ -138,11 +138,11 @@ pub fn adjust_latencies(raw: &[u16; 8]) -> [u16; NUM_WM_LEVELS] {
     // 3. WaWmMemoryReadLatency (Gen12: +3 µs).
     if wm[0] == 0 {
         wm[0] += 3;
-        for level in 1..NUM_WM_LEVELS {
-            if wm[level] == 0 {
+        for slot in wm.iter_mut().skip(1) {
+            if *slot == 0 {
                 break;
             }
-            wm[level] += 3;
+            *slot += 3;
         }
     }
     wm
@@ -223,7 +223,7 @@ struct RawLevel {
 const FX_ONE: u64 = 1 << 16;
 
 fn fx_ceil(fx: u64) -> u64 {
-    (fx + FX_ONE - 1) / FX_ONE
+    fx.div_ceil(FX_ONE)
 }
 
 /// `skl_compute_plane_wm`, Gen12 + linear surface. `prev` is
@@ -544,8 +544,8 @@ pub mod tests {
             0x8000_8021,
             0x8000_C031,
         ];
-        for i in 0..NUM_WM_LEVELS {
-            if encode_wm_level(&wm.levels[i]) != want_words[i] {
+        for (level, &want_word) in wm.levels.iter().zip(&want_words) {
+            if encode_wm_level(level) != want_word {
                 return TestResult::Fail("PLANE_WM register word mismatch");
             }
         }

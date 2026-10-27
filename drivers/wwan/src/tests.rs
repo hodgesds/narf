@@ -419,16 +419,15 @@ fn fake_caps_info() -> Vec<u8> {
 }
 
 fn fake_ready_info() -> Vec<u8> {
-    // MBIM_SUBSCRIBER_READY_INFO (§10.5.2): 36-byte fixed part + ICCID.
+    // MBIM_SUBSCRIBER_READY_INFO: 28-byte fixed header + ICCID.
     let mut v = Vec::new();
     fw32(&mut v, 1); // ReadyState: initialized
-    fw32(&mut v, 0); // Flags
-    fw32(&mut v, 0);
     fw32(&mut v, 0); // SubscriberId OL: empty
-    fw32(&mut v, 36);
-    fw32(&mut v, 38); // SimIccid OL
     fw32(&mut v, 0);
-    fw32(&mut v, 0); // TelephoneNumbers list head
+    fw32(&mut v, 28); // SimIccid OL
+    fw32(&mut v, 38);
+    fw32(&mut v, 0); // ReadyInfo
+    fw32(&mut v, 0); // TelephoneNumbersCount
     fstr16(&mut v, "8901260421234567890");
     v
 }
@@ -536,9 +535,6 @@ impl FakeModem {
     fn sent_data(&self) -> Vec<Vec<u8>> {
         self.st.lock().sent_data.clone()
     }
-    fn inject_data(&self, ntb: Vec<u8>) {
-        self.st.lock().recv_data.push_back(ntb);
-    }
     fn set_refuse_connect_status(&self, status: u32) {
         self.st.lock().refuse_connect_status = Some(status);
     }
@@ -633,7 +629,11 @@ impl FakeModem {
                     }
                     mbim::CID_PACKET_SERVICE => {
                         if cmd_type == 1 && info.len() >= 4 {
-                            st.pkt_state = if frd32(info, 0) == 1 { 2 } else { 0 };
+                            st.pkt_state = if frd32(info, 0) == mbim::PACKET_SERVICE_ATTACH {
+                                mbim::PACKET_SERVICE_ATTACHED
+                            } else {
+                                mbim::PACKET_SERVICE_DETACHED
+                            };
                         }
                         let mut pi = Vec::new();
                         fw32(&mut pi, 0); // nw error
@@ -1026,7 +1026,11 @@ fn smoke_mbim_end_to_end_two_sessions() -> TestResult {
             .subscriber_ready()
             .await
             .map_err(|_| "subscriber ready failed")?;
-        if ready.ready_state != 1 || ready.sim_iccid != "8901260421234567890" {
+        if ready.ready_state != 1
+            || !ready.subscriber_id.is_empty()
+            || ready.sim_iccid != "8901260421234567890"
+            || ready.ready_info != 0
+        {
             return Err("subscriber fields wrong");
         }
         let radio = modem
@@ -1375,6 +1379,9 @@ fn smoke_mbim_port_registry() -> TestResult {
         }
         fn send(&self, _payload: &[u8]) -> Result<(), WwanError> {
             Ok(())
+        }
+        fn recv(&self, _buf: &mut [u8]) -> Result<usize, WwanError> {
+            Ok(0)
         }
     }
     let before = crate::port_count();

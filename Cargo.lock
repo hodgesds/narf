@@ -2025,6 +2025,7 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-console",
+ "narf-crypto",
  "narf-drivers",
  "narf-drivers-tpm",
  "narf-filesystem",
@@ -2355,6 +2356,7 @@ dependencies = [
  "narf-filesystem",
  "narf-kernel-test",
  "narf-lib",
+ "narf-tpm",
 ]
 
 [[package]]
@@ -2518,8 +2520,13 @@ dependencies = [
 name = "narf-drivers-wwan"
 version = "0.0.0"
 dependencies = [
+ "narf-console",
+ "narf-drivers-usb",
+ "narf-init",
  "narf-kernel-test",
  "narf-lib",
+ "narf-net",
+ "narf-scheduler",
 ]
 
 [[package]]
@@ -2701,6 +2708,7 @@ dependencies = [
  "narf-drivers-video",
  "narf-drivers-virtio",
  "narf-drivers-wireless",
+ "narf-drivers-wwan",
  "narf-edid",
  "narf-efi",
  "narf-event-bus",
@@ -2995,9 +3003,11 @@ dependencies = [
  "narf-acpi",
  "narf-aml",
  "narf-arch",
+ "narf-block",
  "narf-bus",
  "narf-capabilities",
  "narf-console",
+ "narf-crypto",
  "narf-event-bus",
  "narf-filesystem",
  "narf-init",
@@ -3008,6 +3018,7 @@ dependencies = [
  "narf-memory",
  "narf-scheduler",
  "narf-time",
+ "zeroize",
 ]
 
 [[package]]

@@ -38,9 +38,10 @@
 //!   per-mode `tHIGH` / `tLOW` from `i2c_dw_set_timings_master()`
 //!   (`i2c-designware-master.c`), which are the I2C-bus
 //!   specification's (UM10204) mode minima:
-//!     Standard 100 kHz: tHIGH 4000 ns, tLOW 4700 ns
-//!     Fast     400 kHz: tHIGH  600 ns, tLOW 1300 ns
-//!     Fast+      1 MHz: tHIGH  260 ns, tLOW  500 ns
+//!   - Standard 100 kHz: tHIGH 4000 ns, tLOW 4700 ns
+//!   - Fast     400 kHz: tHIGH  600 ns, tLOW 1300 ns
+//!   - Fast+      1 MHz: tHIGH  260 ns, tLOW  500 ns
+//!
 //!   Fall time `tf` is Linux's default 300 ns for both edges
 //!   (its `sda_fall_ns ?: 300` / `scl_fall_ns ?: 300` when the
 //!   firmware supplies no measured values). The mode is the

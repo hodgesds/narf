@@ -405,11 +405,6 @@ impl FixtureTransport {
         }
     }
 
-    /// Insert a card into the modelled slot.
-    pub fn insert_card(&self, card: FixtureCard) {
-        self.state.lock().card = Some(card);
-    }
-
     /// Remove the card from the modelled slot.
     pub fn remove_card(&self) {
         self.state.lock().card = None;

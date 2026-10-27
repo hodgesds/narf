@@ -11,6 +11,10 @@ layers that ride on top of it.
 At its center is a port abstraction that classifies a channel by the
 protocol it carries — AT commands, MBIM, QMI, or raw data — and
 offers a simple send/receive surface over the underlying transport.
+Registered `WwanPort` implementations are `Send + Sync`: the global
+registry is shared across CPUs, and callers may invoke a port through
+multiple references concurrently. Implementations must synchronize
+their own mutable transport state.
 Two control protocols are modeled: MBIM (USB-IF Mobile Broadband
 Interface Model, MBIM 1.0) and QMI (Qualcomm's Modem Interface)
 control-message framing and service IDs. A third module describes

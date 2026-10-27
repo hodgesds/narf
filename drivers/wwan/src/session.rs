@@ -53,6 +53,9 @@ const MAX_EMPTY_POLLS: usize = 1000;
 /// driver polls with a bounded budget rather than blocking forever;
 /// transports whose receive is a blocking hardware transfer simply
 /// never return 0.
+// The trait is generic (not dyn-dispatched); each production `spawn`
+// site checks the concrete async future's `Send` bound at compile time.
+#[allow(async_fn_in_trait)]
 pub trait MbimTransport: Send + Sync {
     /// Send one MBIM control message (SEND_ENCAPSULATED_COMMAND on USB).
     async fn control_send(&self, msg: &[u8]) -> Result<(), WwanError>;
@@ -81,6 +84,18 @@ pub struct MbimModem<T: MbimTransport> {
     /// Last known activation state per session id, from connect /
     /// disconnect responses and unsolicited events.
     session_states: Vec<(u32, u32)>,
+}
+
+impl<T: MbimTransport> core::fmt::Debug for MbimModem<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MbimModem")
+            .field("next_txn", &self.next_txn)
+            .field("opened", &self.opened)
+            .field("max_control_transfer", &self.max_control_transfer)
+            .field("pending_connect_event", &self.pending_connect_event)
+            .field("session_states", &self.session_states)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<T: MbimTransport> MbimModem<T> {
