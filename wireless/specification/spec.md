@@ -152,10 +152,14 @@ The FullMAC owner must retain and check those independent native facts.
 
 The opt-in path admits mandatory HT127/VHT126 membership selectors only with
 the corresponding complete compatible PHY, while preserving actual legacy
-basic rates for management frames. HE (122) is admitted only with negotiated
-HE and SAE-H2E (123) only for an H2E `SecurityMode::Wpa3Sae` plan (see the
-HE and SAE paragraphs below); the remaining selectors and unknown mandatory
-values fail closed as described there. Optional unflagged values grant no
+basic rates for management frames. HE (122), EHT (121) and UHR (120) are
+admitted only with that PHY negotiated, SAE-H2E (123) only for an H2E
+`SecurityMode::Wpa3Sae` plan and EPD (124) only with the `JoinOptions::epd`
+opt-in (see the HE, EHT, UHR, SAE and EPD paragraphs below). GLK (125) and
+unknown mandatory values fail closed: Linux mac80211 also never adds GLK
+("We do not support EPD or GLK", mlme.c), and the IEEE802.11-2020 General
+Link (802.11ak) bridged-link operation has no open reference implementation
+in this tree; the remaining row records that blocker. Optional unflagged values grant no
 membership. Present malformed or orphan PHY elements fail instead of becoming
 legacy fallback. Missing optional PHY can retain legacy operation. Generated
 local capability IEs are protocol-owned; caller HT/VHT capabilities and, on
@@ -200,6 +204,68 @@ an HE offer requires HE in the response and vice versa, and a response can
 neither widen the HE width nor enable a TX map entry or directional feature
 the scan offer did not allow. Drivers still program HE peer records, BSS
 color, PPE/OFDMA/TWT state and regulatory/power authority themselves.
+
+**EHT admission (`association::eht`, IEEE Std 802.11be-2024).**
+`LocalEht::new(mac_cap: [u8; 2], phy_cap: [u8; 9], le80: [u8; 3])`,
+`LocalEht::twenty_only(mac, phy, [u8; 4])`, `with_160mhz([u8; 3])` and
+`with_ppe_thresholds(&[u8])` describe the station's EHT Capabilities
+(9.4.2.323; each MCS/NSS octet is RX max NSS | TX max NSS << 4, single-stream
+MCS0-7 required, 6GHz 320MHz and reserved B0 refused).
+`LocalPhy::with_eht(LocalEht)` requires `with_he` and the set form
+`ieee80211_eht_mcs_nss_size` derives from the local HE Channel Width Set.
+`EhtCapability::parse(body, he_phy0, from_ap)` / `EhtOperation::parse`
+(extension 108/106; `ApElements::eht_capability()/eht_operation()`) use the
+exact Linux extents, refuse PPE fields above `IEEE80211_EHT_PPE_THRES_MAX_LEN`,
+and an EHT element without HE, or a capability without operation, is
+malformed. EHT is negotiated only on top of HE (mac80211
+`ieee80211_determine_ap_chan`) when the Basic EHT-MCS/NSS set fits the local
+<=80 and (with HE160) 160MHz sets (`ieee80211_verify_sta_eht_mcs_support`);
+otherwise HE is kept. EHT Operation Information must equal the HT/VHT-selected
+channel (CCFS0 = channel or primary80 centre, CCFS1 = 160 centre) without
+punctured subchannels: wider, punctured or 80+80 EHT operation, which this
+2.4/5GHz plan cannot represent, also falls back to HE.
+`Offer/Negotiated::eht() -> Option<&EhtNegotiation>` reports `width()` (the HE
+width), `tx_max_nss()`/`rx_max_nss()` per MCS0-7/8-9/10-11/12-13 range (local
+TX limited by AP RX, eht.c `ieee80211_eht_cap_ie_to_sta_eht_cap`),
+`su_beamformee()/su_beamformer()`, `peer_capability()`, `operation()` and
+`local_capability()`. The request carries EHT Capabilities only when EHT
+was negotiated; responses must keep EHT and cannot raise TX NSS or roles.
+Multi-link (MLO) association is not part of `JoinPlan`.
+
+**UHR admission (`association::uhr`, IEEE P802.11bn D1.3 draft).**
+`UhrCapability::parse(body, from_ap)` / `UhrOperation::parse` implement the
+draft UHR Capabilities/Operation (extension 152/151) layouts exactly as Linux
+`ieee80211_uhr_capa_size_ok` / `ieee80211_uhr_oper_size_ok` (DBE capability
+maps for APs only; DPS, NPCA (+bitmap), P-EDCA, DBE (+bitmap) operation
+fields); `ApElements::basic_multi_link()` records a Basic Multi-Link element.
+`LocalUhr::new(mac_cap: [u8; 6], phy_cap: u32)` and
+`LocalPhy::with_uhr(LocalUhr)` (needs EHT) describe the station.
+Admission mirrors mac80211 `check_uhr`: EHT negotiated, UHR Operation plus a
+Basic Multi-Link element, the AP UHR Capabilities outside beacons, NPCA only
+when the AP supports it on an80/160MHz channel with the NPCA primary in the
+opposite half and unpunctured (`cfg80211_chandef_add_npca` /
+`cfg80211_chandef_npca_valid`), and DBE operation consistent with the DBE
+bandwidth field and the AP's DBE capability (DBE widening is not applied).
+Because UHR operation is an MLD association, `JoinPlan` (single-link) never
+negotiates UHR and its UHR selector stays fail-closed; a native owner whose
+firmware associates as a non-AP MLD asserts
+`LocalUhr::for_mld_association()` and uses `Offer::from_elements`, whose
+`Offer/Negotiated::uhr() -> Option<&UhrNegotiation>` reports the peer
+capability, operation and the usable `npca_channel()` (only when the local
+STA supports NPCA). A response must keep or omit UHR consistently.
+
+**EPD (`association::JoinOptions`).** `JoinPlan::prepare_with_options(bss,
+own, ssid, security, Option<LocalPhy>, JoinOptions { epd })` is the
+additive entry point for native framing opt-ins. With `epd` the request sets
+the Capability Information EPD subfield (bit13, IEEE802.11-2020 9.4.1.4) and
+an EPD-mandatory BSS (selector 124, which must also advertise bit13) is
+admitted; the response must keep bit13. `JoinPlan::epd()` is true only for
+such a BSS, and the owner then builds `station_security::Security` with
+`with_epd(true)`: every MSDU, EAPOL included, carries a bare two-octet
+EtherType (5.1.4 EtherType Protocol Discrimination) instead of RFC1042,
+length values and RFC1042 MSDUs are ignored, RFC1042 A-MSDU transmit/receive
+is refused, and `Security::ethernet(frame)` converts admitted data in either
+discrimination. A BSS that does not mandate EPD keeps LPD framing.
 
 **WPA3-SAE JoinPlan (`association::{SaePwe, SaeJoin, SaeStep}`).**
 `SecurityMode::Wpa3Sae { pwe: SaePwe }` (`HuntAndPeck` / `HashToElement` /

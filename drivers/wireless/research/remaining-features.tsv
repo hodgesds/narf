@@ -330,7 +330,5 @@ rtw89	uapsd	U-APSD	feature	drivers/wireless/specification/rtw89.md	933
 rtw89	wide_channels	HT40/80MHz widths on all AX chips and 160MHz on RTL8852C/RTL8922A	feature	drivers/wireless/specification/rtw89.md	1035
 rtw89	wmm_all_access_categories	Packet scheduling across all WMM access categories	feature	drivers/wireless/specification/rtw89.md	1015
 rtw89	wow	Wake on Wireless	feature	drivers/wireless/specification/rtw89.md	1043
-shared	eht_phy_admission	EHT PHY and mandatory membership admission; needs shared EHT capability/operation parsing and negotiation	feature	wireless/specification/spec.md	155
-shared	epd_membership_selector	EPD mandatory membership-selector admission; needs 802.11ak EPD MSDU framing	feature	wireless/specification/spec.md	155
-shared	glk_membership_selector	GLK mandatory membership-selector admission; needs 802.11ak General Link operation	feature	wireless/specification/spec.md	155
-shared	uhr_membership_selector	UHR mandatory membership-selector admission; needs shared UHR PHY negotiation	feature	wireless/specification/spec.md	155
+shared	glk_membership_selector	GLK mandatory membership-selector admission; needs IEEE802.11-2020 General Link (802.11ak) bridged-link operation, which has no open reference implementation (mac80211 also refuses it)	feature	wireless/specification/spec.md	158
+shared	mlo_station_association	Single-link MLD (Basic Multi-Link) station association in JoinPlan with MLD addressing and MLO key delivery; required before JoinPlan can negotiate UHR (P802.11bn)	feature	wireless/specification/spec.md	249
