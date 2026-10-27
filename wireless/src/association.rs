@@ -10,6 +10,9 @@ pub mod channel;
 pub mod he;
 #[path = "association/phy.rs"]
 pub mod phy;
+#[path = "association/sae_join.rs"]
+mod sae_join;
+pub use sae_join::{SaeJoin, SaePwe, SaeStep};
 
 /// One validated beacon/probe response, retaining original IEs for the SME.
 #[derive(Clone, Debug)]
@@ -39,11 +42,27 @@ const RATES: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
 pub enum SecurityMode {
     Open,
     Wpa2Psk,
+    /// WPA3-Personal: SAE authentication (AKM 8, or AKM 24 under H2E),
+    /// CCMP-128 and PMF required. `pwe` is wpa_supplicant's `sae_pwe`
+    /// policy; the plan resolves the actual PWE method and AKM from the
+    /// AP's RSNE/RSNXE and SAE-H2E membership selector.
+    Wpa3Sae {
+        pwe: SaePwe,
+    },
 }
 
 impl SecurityMode {
+    /// WPA2-Personal (PSK) only.
     pub fn is_wpa2(self) -> bool {
         matches!(self, Self::Wpa2Psk)
+    }
+    /// SAE (WPA3-Personal).
+    pub fn is_sae(self) -> bool {
+        matches!(self, Self::Wpa3Sae { .. })
+    }
+    /// Any RSN-protected mode (Privacy bit, RSNE in the request).
+    pub fn is_rsn(self) -> bool {
+        !matches!(self, Self::Open)
     }
 }
 
@@ -81,6 +100,8 @@ pub struct JoinPlan {
     offered_phy: Option<phy::Offer>,
     negotiated_phy: Option<phy::Negotiated>,
     spp_amsdu: bool,
+    /// SAE authentication state and the negotiated AKM/PWE.
+    sae: Option<SaeJoin>,
 }
 
 /// BSS membership selectors (IEEE802.11-2020 Table 9-80 as amended;
@@ -436,10 +457,12 @@ impl JoinPlan {
             return Err(Error::InvalidBss);
         }
         let mut rate_elements = RateElements {
-            allowed: if local.is_some() { SEL_PHY } else { 0 },
+            allowed: if local.is_some() { SEL_PHY } else { 0 }
+                | if security.is_sae() { SEL_SAE_H2E } else { 0 },
             ..Default::default()
         };
         let mut rsn = None;
+        let mut rsnxe: Option<Vec<u8>> = None;
         let mut wpa = false;
         let mut seen_ssid = false;
         ies(&bss.information_elements, |id, body| {
@@ -458,6 +481,12 @@ impl JoinPlan {
                         return Err(Error::InvalidBss);
                     }
                     rsn = Some(RsnIe::decode_body(body).ok_or(Error::InvalidBss)?);
+                }
+                244 => {
+                    if rsnxe.is_some() || body.is_empty() {
+                        return Err(Error::InvalidBss);
+                    }
+                    rsnxe = Some(body.to_vec());
                 }
                 221 => wpa |= body.starts_with(&[0, 0x50, 0xf2, 1]),
                 _ => {}
@@ -484,6 +513,7 @@ impl JoinPlan {
             )?,
             None => None,
         };
+        let mut sae = None;
         let negotiated = match security {
             SecurityMode::Open => {
                 if bss.capability & 0x10 != 0 || rsn.is_some() || wpa {
@@ -506,6 +536,19 @@ impl JoinPlan {
                 }
                 Some(RsnIe::wpa2_psk_ccmp().encode_body())
             }
+            SecurityMode::Wpa3Sae { pwe } => {
+                let rsn = rsn.as_ref().ok_or(Error::UnsupportedSecurity)?;
+                let join = SaeJoin::negotiate(
+                    pwe,
+                    bss.capability,
+                    rsn,
+                    rsnxe.as_deref(),
+                    rate_elements.selectors & SEL_SAE_H2E != 0,
+                )?;
+                let body = join.station_rsne(None);
+                sae = Some(join);
+                Some(body)
+            }
         };
         let mut auth = management(0xb0, own, bss.bssid);
         auth.extend_from_slice(&[0, 0, 1, 0, 0, 0]);
@@ -516,8 +559,7 @@ impl JoinPlan {
         } else {
             0x0420
         };
-        let capability =
-            1 | (bss.capability & optional) | if security.is_wpa2() { 0x10 } else { 0 };
+        let capability = 1 | (bss.capability & optional) | if security.is_rsn() { 0x10 } else { 0 };
         assoc.extend_from_slice(&capability.to_le_bytes());
         assoc.extend_from_slice(&5u16.to_le_bytes());
         assoc.extend_from_slice(&[0, ssid.len() as u8]);
@@ -541,6 +583,10 @@ impl JoinPlan {
             assoc.extend_from_slice(&[48, rsn.len() as u8]);
             assoc.extend_from_slice(&rsn);
         }
+        if let Some(rsnxe) = sae.as_ref().and_then(SaeJoin::station_rsnxe) {
+            assoc.extend_from_slice(&[244, rsnxe.len() as u8]);
+            assoc.extend_from_slice(&rsnxe);
+        }
         if let Some(offer) = offered_phy.as_ref() {
             offer.append_capabilities(&mut assoc);
         }
@@ -548,11 +594,7 @@ impl JoinPlan {
             own,
             peer: bss.bssid,
             channel: bss.channel,
-            security: if security.is_wpa2() {
-                SecurityMode::Wpa2Psk
-            } else {
-                SecurityMode::Open
-            },
+            security,
             rates,
             basic,
             auth,
@@ -562,9 +604,14 @@ impl JoinPlan {
             offered_phy,
             negotiated_phy: None,
             spp_amsdu: false,
+            sae,
         })
     }
     pub fn start_authentication(&mut self) -> Result<&[u8], Error> {
+        if self.sae.is_some() {
+            // SAE uses `start_sae_authentication`; open auth is refused.
+            return Err(Error::UnsupportedSecurity);
+        }
         if self.phase != Phase::Prepared {
             return Err(Error::Busy);
         }
@@ -582,7 +629,7 @@ impl JoinPlan {
     }
     /// Ignore other peers/subtypes; a matching rejection is terminal.
     pub fn authentication_response(&mut self, bytes: &[u8]) -> Result<Option<&[u8]>, Error> {
-        if self.phase != Phase::AwaitAuthentication {
+        if self.phase != Phase::AwaitAuthentication || self.sae.is_some() {
             return Err(Error::Busy);
         }
         if !self.response(bytes, 0xb0) {
@@ -622,7 +669,7 @@ impl JoinPlan {
             return Err(Error::Rejected(status));
         }
         let capability = u16::from_le_bytes([bytes[24], bytes[25]]);
-        if capability & 3 != 1 || (capability & 0x10 != 0) != self.security.is_wpa2() {
+        if capability & 3 != 1 || (capability & 0x10 != 0) != self.security.is_rsn() {
             self.phase = Phase::Failed;
             return Err(Error::Protocol);
         }
@@ -661,10 +708,7 @@ impl JoinPlan {
                 let mut rsn_seen = false;
                 ies(&bytes[30..], |id, body| {
                     if id == 48 {
-                        if rsn_seen
-                            || !self.security.is_wpa2()
-                            || RsnIe::decode_body(body) != Some(RsnIe::wpa2_psk_ccmp())
-                        {
+                        if rsn_seen || !self.response_rsne_matches(body) {
                             return Err(Error::UnsupportedSecurity);
                         }
                         rsn_seen = true;
@@ -696,6 +740,9 @@ impl JoinPlan {
     pub fn cancel(&mut self) {
         self.phase = Phase::Failed;
         self.negotiated_phy = None;
+        if let Some(sae) = self.sae.as_mut() {
+            sae.cancel();
+        }
     }
 
     /// Before association: the validated request offer. After association:
@@ -706,6 +753,9 @@ impl JoinPlan {
         (self.rates, self.basic)
     }
     pub fn rsn_body(&self) -> Option<Vec<u8>> {
+        if let Some(sae) = self.sae.as_ref() {
+            return Some(sae.station_rsne(sae.pmkid()));
+        }
         if self.security.is_wpa2() {
             let mut rsne = RsnIe::wpa2_psk_ccmp();
             if self.spp_amsdu {

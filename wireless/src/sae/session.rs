@@ -238,6 +238,16 @@ impl SaeSession {
         Ok(self)
     }
 
+    /// Our AKM Suite Selector binding, if any.
+    pub fn akm_suite_selector(&self) -> Option<[u8; 4]> {
+        self.own_akm_suite
+    }
+
+    /// The `(own, peer)` MAC pair the PWE and transcript are bound to.
+    pub fn addresses(&self) -> ([u8; 6], [u8; 6]) {
+        (self.own_mac, self.peer_mac)
+    }
+
     /// The peer Commit's AKM Suite Selector, once processed.
     pub fn peer_akm_suite_selector(&self) -> Option<[u8; 4]> {
         self.peer_akm_suite

@@ -84,6 +84,11 @@ pub const AKM_AP_PEERKEY: u8 = 0x0A;
 pub const AKM_DOT1X_SUITE_B: u8 = 0x0B;
 pub const AKM_DOT1X_SUITE_B_192: u8 = 0x0C;
 pub const AKM_OWE: u8 = 0x12;
+/// SAE using a group-dependent hash (`RSN_AUTH_KEY_MGMT_SAE_EXT_KEY`).
+pub const AKM_SAE_EXT_KEY: u8 = 0x18;
+/// RSNXE Extended RSN Capabilities bit5: SAE hash-to-element
+/// (IEEE802.11-2020 9.4.2.241, Linux `WLAN_RSNX_CAPA_SAE_H2E`).
+pub const RSNX_CAP_SAE_H2E: u8 = 1 << 5;
 
 // ── RSN Capabilities bits (§9.4.2.24.4) ──────────────────────────
 pub const RSN_CAP_PREAUTH: u16 = 1 << 0;
