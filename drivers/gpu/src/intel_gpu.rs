@@ -953,9 +953,32 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         );
     }
 
+    let mut panel_mode: Option<crate::intel_gpu_modeset::Mode> = None;
     if dev.chip.generation.display_supported() {
-        // Activate backlight PWM (Gen12 BXT-style registers).
-        narf_drivers_backlight::intel_bl::install(dev.gtt_mmadr);
+        // eDP panel power sequencing (#1020): the panel must be
+        // sequenced on before any AUX traffic (the EDID read
+        // inside takeover), modeset, or backlight enable. A
+        // panel that fails its sequence is left powered-down:
+        // no backlight install, no takeover, no scanout move.
+        let window = crate::intel_gpu_edp::BarWindow(&dev.gtt_mmadr);
+        let mut pps = crate::intel_gpu_edp::PanelPowerSequencer::new(&window);
+        pps.init_registers();
+        crate::intel_gpu_edp::runtime_install_panel(
+            pps.delays(),
+            crate::intel_gpu_edp::PsrLayout::from_generation(dev.chip.generation),
+        );
+        let panel_on = match pps.power_on() {
+            Ok(()) => true,
+            Err(e) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "intel-gpu: eDP panel power sequence failed: {:?} — panel left powered down, display skipped",
+                    e,
+                );
+                false
+            }
+        };
 
         // Take over the firmware display. The takeover modeset
         // programs the plane at the GOP surface; probe then moves
@@ -964,15 +987,36 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // leave `active_scanout` naming a buffer the plane is
         // not scanning), but it no longer panics and it logs
         // each failing step instead of collapsing to silence.
-        let mode_opt = crate::intel_gpu_modeset::takeover_display(&dev);
+        let mode_opt = if panel_on {
+            // Activate backlight PWM (Gen12 BXT-style registers).
+            narf_drivers_backlight::intel_bl::install(dev.gtt_mmadr);
+            let mode = crate::intel_gpu_modeset::takeover_display(&dev);
+            if mode.is_some() {
+                // The PPS backlight gate opens only with live
+                // video; T8 runs from the power-on stamp inside
+                // the sequencer.
+                let _ = pps.backlight_on();
+            }
+            mode
+        } else {
+            None
+        };
+        panel_mode = mode_opt;
 
         let width = mode_opt.as_ref().map(|m| m.h_active as u32).unwrap_or(1024);
         let height = mode_opt.as_ref().map(|m| m.v_active as u32).unwrap_or(768);
         let stride_bytes = padded_stride_bytes(width);
         let size_bytes = scanout_size_bytes(width, height);
 
-        match crate::intel_gpu_gtt::alloc_contiguous_scanout(&dev.gtt_mmadr, size_bytes) {
-            Ok(alloc) => {
+        match if panel_on {
+            Some(crate::intel_gpu_gtt::alloc_contiguous_scanout(
+                &dev.gtt_mmadr,
+                size_bytes,
+            ))
+        } else {
+            None
+        } {
+            Some(Ok(alloc)) => {
                 let phys_base = alloc.phys_base();
                 dev.scanout = Some(ScanoutAllocation {
                     gtt_offset: alloc.gtt_offset,
@@ -1035,7 +1079,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                     }
                 }
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 use core::fmt::Write as _;
                 let _ = writeln!(
                     narf_console::Writer,
@@ -1043,6 +1087,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                     e, width, height, stride_bytes, size_bytes,
                 );
             }
+            None => {}
         }
     } else {
         // MTL / PTL: identification is real, the Gen12 display
@@ -1051,6 +1096,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             "display programming skipped — Xe-LPG/Xe3 display engine is tracked separately (#1016)",
             &device,
         );
+    }
+
+    // PSR bring-up (#1020): only for an eDP panel that powered
+    // on and produced a real mode. Every failure path inside
+    // leaves the panel running plain eDP.
+    if let Some(mode) = panel_mode {
+        crate::intel_gpu_edp::enable_psr_for_panel(&dev, &mode);
     }
 
     let scanout_mode = dev.current_mode();
@@ -1201,6 +1253,13 @@ fn publish_scanout(scanout: Option<narf_graphics_driver::generic::GenericFb>) {
     let observer = *SCANOUT_OBSERVER.lock();
     if let Some(observer) = observer {
         observer(scanout);
+    }
+    // #1020: a scanout publish is a full-frame update, which is
+    // what exits PSR — notify the eDP runtime. No-op when no
+    // PSR session is active; called with no locks held, like
+    // the observer above.
+    if scanout.is_some() {
+        crate::intel_gpu_edp::on_scanout_published();
     }
 }
 

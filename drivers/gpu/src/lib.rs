@@ -694,6 +694,8 @@ pub mod intel_gpu_ddi;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_dp_bridge;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_edp;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_gmbus;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gtt;
