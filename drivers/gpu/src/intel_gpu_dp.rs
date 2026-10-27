@@ -448,7 +448,8 @@ pub mod tests {
     // ── The sink ────────────────────────────────────────────────
 
     /// Rate codes on the wire (LINK_BW_SET values, DP §2.7).
-    const BW_RBR: u8 = 0x06;
+    /// (RBR's 0x06 appears in the wire log assertions via the
+    /// negotiation matrix's decode path, not as a sink cap.)
     const BW_HBR: u8 = 0x0A;
     const BW_HBR2: u8 = 0x14;
     const BW_HBR3: u8 = 0x1E;
@@ -810,7 +811,10 @@ pub mod tests {
     // ── EDID fixtures ───────────────────────────────────────────
 
     /// Encode one detailed-timing descriptor per E-EDID §3.10
-    /// (the layout the production parser decodes).
+    /// (the layout the production parser decodes). The
+    /// parameter-per-field shape is deliberate: it mirrors the
+    /// descriptor's field list so a transcription slip is visible.
+    #[allow(clippy::too_many_arguments)]
     fn detailed_timing(
         out: &mut [u8],
         pclk_khz: u32,
@@ -834,7 +838,7 @@ pub mod tests {
         out[7] = (((v_active >> 8) as u8 & 0xF) << 4) | ((v_blank >> 8) as u8 & 0xF);
         out[8] = h_sync_off as u8;
         out[9] = h_sync_w as u8;
-        out[10] = (((v_sync_off as u8 & 0xF) << 4) | (v_sync_w as u8 & 0xF));
+        out[10] = ((v_sync_off as u8 & 0xF) << 4) | (v_sync_w as u8 & 0xF);
         out[11] = (((h_sync_off >> 8) as u8 & 0x3) << 6)
             | (((h_sync_w >> 8) as u8 & 0x3) << 4)
             | (((v_sync_off >> 4) as u8 & 0x3) << 2)
@@ -879,8 +883,8 @@ pub mod tests {
         let n = name.len().min(12);
         e[desc + 5..desc + 5 + n].copy_from_slice(&name[..n]);
         e[desc + 5 + n] = 0x0A;
-        for i in desc + 5 + n + 1..desc + 18 {
-            e[i] = 0x20;
+        for b in &mut e[desc + 5 + n + 1..desc + 18] {
+            *b = 0x20;
         }
         // CTA-861 extension: LPCM + AC-3 SADs, speaker block.
         let cta = 128usize;
@@ -1100,10 +1104,11 @@ pub mod tests {
         }
         for (i, (cmd, mot)) in sink.i2c_read_log.iter().enumerate() {
             let last_in_block = i % 8 == 7;
-            if last_in_block && !(*mot && *cmd == 0x5) {
-                return TestResult::Fail("final burst of a block must be I2C_READ_MOT");
-            }
-            if !last_in_block && !(!*mot && *cmd == 0x1) {
+            if last_in_block {
+                if !(*mot && *cmd == 0x5) {
+                    return TestResult::Fail("final burst of a block must be I2C_READ_MOT");
+                }
+            } else if *mot || *cmd != 0x1 {
                 return TestResult::Fail("non-final bursts must be I2C_READ (MOT clear)");
             }
         }
@@ -1195,9 +1200,9 @@ pub mod tests {
         // pclk x 24 bpp.
         let cases: [(u8, u8, u32, LinkRate, u8, bool); 6] = [
             (BW_HBR2, 4, 148_500, LinkRate::Rbr, 4, false), // 3.56 Gbps fits RBR x4
-            (BW_HBR3, 4, 65_000, LinkRate::Rbr, 4, false), // small mode, big sink → floor rate
+            (BW_HBR3, 4, 65_000, LinkRate::Rbr, 4, false),  // small mode, big sink → floor rate
             (BW_HBR3, 2, 148_500, LinkRate::Hbr, 2, false), // lane-capped: HBR x2 = 4.32
-            (BW_HBR, 4, 148_500, LinkRate::Rbr, 4, false), // rate-capped sink still fits at RBR
+            (BW_HBR, 4, 148_500, LinkRate::Rbr, 4, false),  // rate-capped sink still fits at RBR
             (BW_HBR3, 4, 950_000, LinkRate::Hbr3, 4, false), // 22.8 Gbps needs HBR3 x4
             (BW_HBR3, 4, 1_400_000, LinkRate::Hbr3, 4, true), // beyond HBR3 x4 payload
         ];
@@ -1252,10 +1257,10 @@ pub mod tests {
         }
         let strm: u64 = 148_500;
         let n: u64 = 0x80_0000;
-        let link_m = ((strm * n) + ls - 1) / ls;
+        let link_m = (strm * n).div_ceil(ls);
         // Data M/N uses bytes per pixel (3 for 24 bpp), per the
         // PRM formula the pipes module implements.
-        let data_m = ((strm * 3 * n) + (ls * 4) - 1) / (ls * 4);
+        let data_m = (strm * 3 * n).div_ceil(ls * 4);
         use crate::intel_gpu_pipes::{
             PIPE_DATA_M1_OFFSET, PIPE_DATA_N1_OFFSET, PIPE_LINK_M1_OFFSET, PIPE_LINK_N1_OFFSET,
         };
