@@ -87,6 +87,23 @@ such controllers; it never starts, resets, or speaks to the ICM firmware.
   controller, before ring 0 and — when no controller is native — before the
   `_OSC` request is made at all. Stood-down controllers get no ring, no
   config traffic, and no device-PM registration.
+- `retimer::scan_link(ctl, route, port)` enumerates the USB4 retimers on a
+  trained link over the sideband channel: a Broadcast RT Transaction
+  (`ENUMERATE_RE-TIMERS`, USB4 v2.0 §8.3.2.3.2) assigns one-based indices,
+  then each index's Vendor/Product/Firmware identity, last/cable status,
+  authentication status and Link Configuration register are read back
+  through the USB4 Port Capability (`PORT_CS_1`/`PORT_CS_2`, Table 8-13).
+  Topology scan runs it for every link-up lane-0 port and publishes the
+  chain as `Port::retimers`; an enumeration or agreement fault is
+  published as the typed `Port::retimer_fault`, never folded into the
+  empty-chain state. `retimer::sb_read`/`sb_write`/`port_op` are the raw
+  sideband and Port Operation primitives underneath.
+- `retimer::nvm_sector_size`, `nvm_write`, `nvm_read` and
+  `nvm_authenticate` are the retimer firmware-update surface (64-byte
+  Data-register blocks, offset staged in Metadata, authenticate restarts
+  the retimer and unassigns its index; the outcome is read with
+  `retimer::auth_status` after re-enumeration). Writes and
+  authentication are refused for cable retimers.
 
 The implementation supports USB4 routers with buffer-allocation parameters,
 USB3 tunneling between parent/child routers, PCIe tunnelling between an
@@ -206,6 +223,27 @@ status will not settle or cannot be read is stood down from rather than
 fought over. Detection is per controller — one firmware-managed controller
 neither blocks nor is endangered by a native CM on another.
 
+Retimer sideband access is bounded at every layer: one `PORT_CS_1`
+transaction waits at most 500 ms for Pending to clear, a Port Operation
+at most 500 ms (1000 ms for an NVM block write) to complete, and at most
+six retimers are probed per link. A retimer conversation that fails —
+no response mid-chain, a refused or structurally wrong reply, an
+operation completing `ERR `/`!CMD`/garbage — is a typed
+`retimer::Error` in the published snapshot, not a hang, a panic or a
+silent empty chain. Lane bonding is verified, not assumed: every
+retimer's Phase 3 Link Configuration decision nibble must equal the
+router port's own, and a non-empty chain must end in a retimer that
+reports itself last; a disagreement is
+`Error::BondingDisagreement`/`ChainNotTerminated`, never a silent
+downgrade to a single-lane assumption. The first `SET_INBOUND_SBTX` to
+a retimer is allowed exactly one No Response retry (the Re-Timer
+Specification does not require an RT response to it); all other No
+Response outcomes are terminal. NVM writes stage the full 64-byte Data
+register per block with zero padding — a block write programs the whole
+register — and `NVM_AUTH_WRITE` is issued as a raw opcode write with no
+completion poll, because authentication restarts the retimer and
+unassigns its index.
+
 ## 5. Architecture notes
 
 The transport is shared across x86_64 and aarch64 and uses the bus/DMA/IRQ
@@ -217,7 +255,13 @@ W1C for the TX/RX ring-zero bits. Physical AMD hardware remains unvalidated.
 `bus`, `io`, `interrupts`, `capabilities`, `aml`, `scheduler`, `time`, `power`.
 Register fields and protocol behavior were checked against local Linux
 `/usr/src/linux/drivers/thunderbolt/{pci,nhi,ctl,usb4,path,tunnel,switch,cap}.c`,
-`nhi_regs.h`, `tb_regs.h`, `tb_msgs.h`, and `drivers/acpi/bus.c`.
+`nhi_regs.h`, `tb_regs.h`, `tb_msgs.h`, and `drivers/acpi/bus.c`. Retimer
+sideband registers, `PORT_CS_1` fields and Port Operation FourCCs follow
+the USB4 Specification v2.0 (June 2023) Table 4-18, Table 8-13 and
+Table 8-64 (§4.1.1.2, §4.1.1.3, §8.3.2), cross-checked against Linux
+`sb_regs.h`, `usb4.c` and `retimer.c`; retimer-specific operations
+(`SET_INBOUND_SBTX`, the NVM operations) are defined by the USB4
+Re-Timer Specification.
 
 ## 7. Stage assignment
 
@@ -248,6 +292,13 @@ DP remainders: UHBR (128b/132b) tunnel envelopes, Gen 4 asymmetric link
 transitions, and renegotiating the programmed REMOTE_CAP envelope itself
 in response to allocation changes (today the source re-trains within the
 granted envelope).
+Retimer remainders: no caller yet supplies a firmware image to the NVM
+surface (image provenance and update policy are unbuilt); enumeration
+covers trained links only, so the link-down path (router offline mode
+plus `SET_INBOUND_SBTX` orchestration before training) is engine-only;
+lane margining Port Operations are not implemented; and `reconcile`
+does not yet hard-gate tunnel programming on a port's `retimer_fault` —
+the fault is published typed state that consumers must check.
 PCIe remainders: a pre-activation wait for the PCIe adapters' LTSSM
 Detect state, and a runtime PCI rescan of the NHI's companion bridge so
 tunnelled devices enumerate without a reboot (the CM publishes tunnels;

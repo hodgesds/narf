@@ -143,6 +143,8 @@ pub(crate) fn model() -> (Domain, Model) {
             max_out_hop: 15,
             total_credits: 64,
             secondary: false,
+            retimers: Vec::new(),
+            retimer_fault: None,
         });
     }
     let host = Router {
@@ -308,6 +310,8 @@ fn pcie_port(number: u8, kind: u32, adapter_cap: u16) -> Port {
         max_out_hop: 15,
         total_credits: 64,
         secondary: false,
+        retimers: Vec::new(),
+        retimer_fault: None,
     }
 }
 
