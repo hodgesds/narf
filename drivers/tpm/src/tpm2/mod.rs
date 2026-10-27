@@ -72,6 +72,12 @@ pub const TPM_CC_POLICY_PCR: u32 = 0x0000_019F;
 // suspend anchor's conversation still had no constants for.
 pub const TPM_CC_NV_INCREMENT: u32 = 0x0000_0134;
 pub const TPM_CC_POLICY_GET_DIGEST: u32 = 0x0000_0189;
+// TPM lifecycle completion (#1003): the dictionary-attack
+// commands — the suspend lifecycle's lockout accounting and
+// recovery surface (Part 3, Dictionary Attack commands; the DA
+// logic itself is Part 1 §19).
+pub const TPM_CC_DICTIONARY_ATTACK_LOCK_RESET: u32 = 0x0000_0139;
+pub const TPM_CC_DICTIONARY_ATTACK_PARAMETERS: u32 = 0x0000_013A;
 
 // ── TPM_SU values — Part 2 §6.9 ─────────────────────────────────────
 
@@ -107,6 +113,29 @@ pub const TPM_CAP_PCRS: u32 = 0x0000_0005;
 pub const TPM_CAP_TPM_PROPERTIES: u32 = 0x0000_0006;
 pub const TPM_CAP_PCR_PROPERTIES: u32 = 0x0000_0007;
 
+// ── Tagged property IDs (TPM_PT) — Part 2 §6.13 ──────────────────
+//
+// Fixed properties are TPM_PT_FIXED (0x100) + index; variable
+// properties are TPM_PT_VAR (0x200) + index. The variable group
+// carries the dictionary-attack accounting the suspend
+// lifecycle reads (Part 1 §19): how many authorization failures
+// the TPM has counted, the threshold it locks at, and the two
+// recovery intervals (all seconds where applicable).
+
+/// `TPM_PT_MANUFACTURER` — the vendor ID (fixed property 0x05).
+pub const TPM_PT_MANUFACTURER: u32 = 0x0000_0105;
+/// `TPM_PT_LOCKOUT_COUNTER` — the current value of the DA
+/// `failedTries` counter.
+pub const TPM_PT_LOCKOUT_COUNTER: u32 = 0x0000_020E;
+/// `TPM_PT_MAX_AUTH_FAIL` — the `maxTries` lockout threshold.
+pub const TPM_PT_MAX_AUTH_FAIL: u32 = 0x0000_020F;
+/// `TPM_PT_LOCKOUT_INTERVAL` — seconds between decrements of
+/// `failedTries` while the TPM is powered.
+pub const TPM_PT_LOCKOUT_INTERVAL: u32 = 0x0000_0210;
+/// `TPM_PT_LOCKOUT_RECOVERY` — seconds after a lockoutAuth
+/// failure before lockoutAuth may be presented again.
+pub const TPM_PT_LOCKOUT_RECOVERY: u32 = 0x0000_0211;
+
 // ── Response codes (TPM_RC) — Part 2 §6.6 ───────────────────────────
 
 pub const TPM_RC_SUCCESS: u32 = 0x0000_0000;
@@ -122,6 +151,17 @@ pub const TPM_RC_VALUE: u32 = 0x0000_0184;
 pub const TPM_RC_HANDLE: u32 = 0x0000_028B;
 pub const TPM_RC_COMMAND_CODE: u32 = 0x0000_0143;
 pub const TPM_RC_DISABLED: u32 = 0x0000_0120;
+/// Authorization value check failed for a DA-protected entity,
+/// as returned for a first-session failure (Part 2 §6.6,
+/// format-one base 0x0E, session-marked): the failure is
+/// counted in the TPM's `failedTries` and moves the TPM toward
+/// dictionary-attack lockout (Part 1 §19).
+pub const TPM_RC_AUTH_FAIL: u32 = 0x0000_098E;
+/// Authorization value check failed *without* DA implications
+/// (Part 2 §6.6, format-one base 0x22, session-marked): the
+/// entity is not DA-protected (e.g. an NV index with
+/// `TPMA_NV_NO_DA`), so the failure is not counted.
+pub const TPM_RC_BAD_AUTH: u32 = 0x0000_09A2;
 pub const TPM_RC_LOCKOUT: u32 = 0x0000_0921;
 pub const TPM_RC_RETRY: u32 = 0x0000_0922;
 /// Authorization by policy session failed: the session's
