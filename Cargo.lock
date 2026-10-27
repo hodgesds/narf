@@ -1150,6 +1150,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-ctap2"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "narf-crypto",
+ "narf-kernel-test",
+]
+
+[[package]]
 name = "narf-driver-macros"
 version = "0.0.0"
 
@@ -2360,6 +2369,8 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-console",
+ "narf-crypto",
+ "narf-ctap2",
  "narf-drivers",
  "narf-drivers-sound",
  "narf-drivers-video",

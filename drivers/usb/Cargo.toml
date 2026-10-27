@@ -37,9 +37,11 @@ narf-drivers-sound = { path = "../sound" }
 narf-power        = { path = "../../power" }
 narf-filesystem   = { path = "../../filesystem" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
+narf-ctap2        = { path = "../../ctap2" }
+narf-crypto       = { path = "../../crypto" }
 
 [features]
-kernel-test = []
+kernel-test = ["narf-ctap2/kernel-test"]
 
 [lints]
 workspace = true

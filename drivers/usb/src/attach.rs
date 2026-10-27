@@ -106,6 +106,12 @@ pub enum AttachOutcome {
     /// subclass 0x00 / protocol 0x00). Slot stays alive; entry in
     /// `ccid::CCID_READERS`. PC/SC daemon attaches via /dev/ccid0.
     CcidReader,
+    /// Device bound as a FIDO2 authenticator (CTAP2 over USB HID;
+    /// the report descriptor carries the FIDO Alliance usage page
+    /// 0xF1D0 with 64-byte in/out reports). Slot stays alive;
+    /// entry in `ctap::CTAP_TOKENS`. The suspend service opens a
+    /// `narf_ctap2::Client` over the token via `ctap::open_client`.
+    CtapToken,
     /// Device claimed by a driver registered in the USB class-driver
     /// registry (e.g. rtl8xxxu USB-WiFi). Slot stays alive; the
     /// registered driver owns the device.
@@ -876,6 +882,18 @@ async fn dispatch_after_address(
             .is_ok()
         {
             return AttachOutcome::CcidReader;
+        }
+        // FIDO2 authenticator — CTAP2 over USB HID (issue #999).
+        // Runs late in the cascade on purpose: the binder's own
+        // discrimination is the report descriptor's FIDO usage
+        // page (0xF1D0), fetched per HID interface, so dedicated
+        // HID classes above keep their devices and only genuine
+        // tokens (which nothing above claims) land here.
+        if crate::ctap::try_bind_ctap_already_addressed(xhci_dev, slot_id, &cfg_blob)
+            .await
+            .is_ok()
+        {
+            return AttachOutcome::CtapToken;
         }
         // WBDI fingerprint reader — Microsoft Biometric Device
         // Interface, identified by an MS OS 2.0 Compatible-ID

@@ -5038,6 +5038,83 @@ impl Xhci {
         Ok(Some(xferred))
     }
 
+    /// Stage one Normal TRB on an interrupt-OUT endpoint carrying
+    /// `data` and ring the doorbell, without waiting for
+    /// completion. The mirror of [`Xhci::arm_interrupt_in`] for the
+    /// host-to-device direction: HID class drivers with an output
+    /// channel (FIDO/CTAPHID) stage one report per call and learn
+    /// of completion through [`Xhci::poll_interrupt_out`]. The
+    /// payload is copied into the endpoint's DMA page before the
+    /// TRB is published, ordered by the same DMA barrier the rest
+    /// of the layer uses.
+    pub fn arm_interrupt_out(&self, slot_id: u8, dci: u8, data: &[u8]) -> Result<(), XhciError> {
+        if data.is_empty() || data.len() > 4096 {
+            return Err(XhciError::CmdFailed(0xF9));
+        }
+        let phys = self.ep_dma_phys(slot_id, dci, EndpointKind::InterruptOut)?;
+        for (i, b) in data.iter().enumerate() {
+            // SAFETY: `phys` is this endpoint's identity-mapped DMA
+            // page; `i < data.len() ≤ 4096` keeps the write inside
+            // that page, aligned for a `u8`.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
+            unsafe {
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
+                    *b,
+                );
+            }
+        }
+        device_dma_barrier();
+        self.ep_enqueue_normal(slot_id, dci, phys, data.len() as u32)?;
+        self.ring_slot_doorbell(slot_id, dci as u32);
+        Ok(())
+    }
+
+    /// Non-blocking interrupt-OUT completion poll: drains one
+    /// matching Transfer Event and reports how many of the
+    /// `len` staged bytes the device consumed.
+    ///
+    /// Returns:
+    /// - `Ok(Some(n))` — the staged TRB completed; `n` bytes sent
+    /// - `Ok(None)`    — no completion event pending yet
+    /// - `Err(e)`      — controller/device-side error (the TRB is
+    ///   consumed either way; there is nothing to re-arm)
+    pub fn poll_interrupt_out(
+        &self,
+        slot_id: u8,
+        dci: u8,
+        len: u32,
+    ) -> Result<Option<usize>, XhciError> {
+        if len == 0 || len > 4096 {
+            return Err(XhciError::CmdFailed(0xF9));
+        }
+        let xfer = TRB_TYPE_TRANSFER_EVENT << TRB_TYPE_SHIFT;
+        let want_slot = (slot_id as u32) << 24;
+        let want_ep = (dci as u32) << 16;
+        while self.demux_one_event().is_some() {}
+        let ev = {
+            let mut g = self.transfer_events.lock();
+            let pos = g.iter().position(|t| {
+                (t[3] & TRB_TYPE_MASK) == xfer
+                    && (t[3] & 0xFF00_0000) == want_slot
+                    && (t[3] & 0x001F_0000) == want_ep
+            });
+            match pos {
+                Some(p) => match g.remove(p) {
+                    Some(e) => e,
+                    None => return Ok(None),
+                },
+                None => return Ok(None),
+            }
+        };
+        let ccode = ((ev[2] >> 24) & 0xFF) as u8;
+        if ccode != 1 && ccode != 13 {
+            return Err(XhciError::CmdFailed(ccode));
+        }
+        let residue = ev[2] & 0x00FF_FFFF;
+        Ok(Some((len).saturating_sub(residue) as usize))
+    }
+
     /// Resolve the persistent DMA buffer phys for an endpoint.
     fn ep_dma_phys(&self, slot_id: u8, dci: u8, kind: EndpointKind) -> Result<u64, XhciError> {
         let g = self.devices.lock();
