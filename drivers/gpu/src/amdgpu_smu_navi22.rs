@@ -307,6 +307,12 @@ impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for Op<F> {
 trait Io {
     fn read(&mut self, register: u32) -> u32;
     fn write(&mut self, register: u32, value: u32);
+    /// Read-driven register models can use a bounded number of cooperative
+    /// polls instead of a wall-clock deadline. Real MMIO always uses time.
+    #[cfg(feature = "kernel-test")]
+    fn wait_poll_limit(&self) -> Option<u32> {
+        None
+    }
     /// Stage the PPTable into the transfer buffer; returns the PSP runtime
     /// DB SCPM status (0: disabled).
     fn stage_power(
@@ -571,6 +577,8 @@ impl<I: Io> Engine<I> {
             Ok(())
         })??;
         let deadline = narf_time::Deadline::after_ms(MESSAGE_TIMEOUT_MS);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             let response = self.access(|io| io.read(RESPONSE))?;
             match response {
@@ -578,6 +586,15 @@ impl<I: Io> Engine<I> {
                 1 => return self.access(|io| io.read(ARGUMENT)), // linux-lit: 1=PPSMC_Result_OK
                 0 => {}
                 status => return Err(Error::Rejected(status)),
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::Timeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 return Err(Error::Timeout);
@@ -589,11 +606,22 @@ impl<I: Io> Engine<I> {
     /// the first PPSMC message ("SMC is not ready" otherwise).
     async fn wait_firmware(&mut self) -> Result<(), Error> {
         let deadline = narf_time::Deadline::after_ms(FIRMWARE_READY_TIMEOUT_MS);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             match self.access(|io| io.firmware_flags())?? {
                 u32::MAX => return Err(Error::DeviceGone),
                 flags if flags & FIRMWARE_FLAGS_INTERRUPTS_ENABLED != 0 => return Ok(()),
                 _ => {}
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::Timeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 return Err(Error::Timeout);

@@ -173,6 +173,12 @@ trait Io {
     fn write(&mut self, address: u64, value: u32);
     fn upload(&mut self, map: MmioRegion, offset: u64, value: u32);
     fn download(&mut self, map: MmioRegion, offset: u64) -> u32;
+    /// Read-driven register models can use a bounded number of cooperative
+    /// polls instead of a wall-clock deadline. Real MMIO always uses time.
+    #[cfg(feature = "kernel-test")]
+    fn wait_poll_limit(&self) -> Option<u32> {
+        None
+    }
 }
 #[derive(Debug)]
 struct Mmio(MmioRegion);
@@ -316,6 +322,8 @@ impl<I: Io> Engine<I> {
             })?;
             let running = control & ENABLE != 0;
             let deadline = narf_time::Deadline::after_ms(100);
+            #[cfg(feature = "kernel-test")]
+            let mut polls = self.io.wait_poll_limit();
             while !self.access(|io| {
                 Ok(read(io, base, GPINT)? == STOP & !(1 << 28)
                     // linux-lit: 0x1ea=mmDMCUB_SCRATCH7
@@ -324,6 +332,20 @@ impl<I: Io> Engine<I> {
             })? {
                 if !running {
                     break;
+                }
+                #[cfg(feature = "kernel-test")]
+                if let Some(left) = &mut polls {
+                    if *left == 0 {
+                        use core::fmt::Write;
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "amdgpu: navi22 DMCUB STOP_FW not acknowledged; forcing reset"
+                        );
+                        break;
+                    }
+                    *left -= 1;
+                    narf_scheduler::yield_now().await;
+                    continue;
                 }
                 if deadline.expired() {
                     use core::fmt::Write;
@@ -525,6 +547,8 @@ impl<I: Io> Engine<I> {
             Ok(())
         })?;
         let deadline = narf_time::Deadline::after_ms(1000);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             let status = self.access(|io| {
                 let status = read(io, l.dcn, STATUS)?;
@@ -540,6 +564,15 @@ impl<I: Io> Engine<I> {
                     outbox: placement.outbox(),
                     capabilities: None,
                 });
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::BootTimeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 return Err(Error::BootTimeout);

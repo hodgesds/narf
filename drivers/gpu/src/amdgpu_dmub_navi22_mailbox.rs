@@ -176,6 +176,8 @@ impl<I: Io> Engine<I> {
             Ok(())
         })?;
         let deadline = narf_time::Deadline::after_ms(100);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             let version = self.access(|io| {
                 alive(io, l)?;
@@ -199,6 +201,15 @@ impl<I: Io> Engine<I> {
                     );
                 }
                 break;
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::CommandTimeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 return Err(Error::CommandTimeout);
@@ -283,9 +294,20 @@ impl<I: Io> Engine<I> {
     pub(super) async fn command(&mut self, request: [u8; 64]) -> Result<[u8; 64], Error> {
         let posted = self.post(&request)?;
         let deadline = narf_time::Deadline::after_ms(200);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             if let Some(reply) = self.consumed(&request, posted)? {
                 return Ok(reply);
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::CommandTimeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 return Err(Error::CommandTimeout);
@@ -420,6 +442,8 @@ impl<I: Io> Engine<I> {
         }
         self.command(request).await?;
         let deadline = narf_time::Deadline::after_ms(200);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             // Bounded work per poll even if firmware keeps publishing events.
             for _ in 0..16 {
@@ -441,6 +465,15 @@ impl<I: Io> Engine<I> {
                     }
                     _ => Error::Protocol,
                 });
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::CommandTimeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 return Err(Error::CommandTimeout);

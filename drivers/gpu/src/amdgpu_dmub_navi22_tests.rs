@@ -110,6 +110,17 @@ impl Fake {
     }
 }
 impl Io for Fake {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        // The model completes every wait synchronously in write(): the
+        // STOP_FW and GET_FW_VERSION GPINT replies, the boot status
+        // bits and the mailbox reply slot are all final before the
+        // wait's first poll. A wait still incomplete after sixteen
+        // polls is a designed non-completion (stop/boot/commands
+        // withheld) whose outcome is that wait's timeout — reached by
+        // count instead of burning the wall-clock deadline under the
+        // spin executor (#879).
+        Some(16)
+    }
     fn read(&mut self, address: u64) -> u32 {
         *self.regs.get(&address).unwrap_or(&0)
     }

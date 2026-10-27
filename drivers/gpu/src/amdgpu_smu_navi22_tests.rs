@@ -196,6 +196,17 @@ impl Io for Fake {
         self.staged.extend_from_slice(bytes);
         Ok(self.scpm)
     }
+    fn wait_poll_limit(&self) -> Option<u32> {
+        // The model answers every message synchronously in write(), and
+        // reports firmware ready after at most fw_not_ready withheld
+        // flag reads (fixtures use at most 3, so the fourth poll
+        // completes). A wait still incomplete after sixteen polls is a
+        // designed non-completion (stall, or firmware never ready)
+        // whose outcome is the timeout — reached by count instead of
+        // burning the wall-clock deadline under the spin executor
+        // (#879).
+        Some(16)
+    }
     fn read(&mut self, register: u32) -> u32 {
         self.reads += 1;
         match register {

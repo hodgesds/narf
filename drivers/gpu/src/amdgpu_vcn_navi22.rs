@@ -470,6 +470,12 @@ pub(crate) trait Io {
     }
     /// 32-bit store to BAR2 dword `index` (`WDOORBELL32`).
     fn doorbell(&mut self, index: u32, value: u32);
+    /// Read-driven register models can use a bounded number of cooperative
+    /// polls instead of a wall-clock deadline. Real MMIO always uses time.
+    #[cfg(feature = "kernel-test")]
+    fn wait_poll_limit(&self) -> Option<u32> {
+        None
+    }
 }
 #[derive(Debug)]
 pub(crate) struct Mmio {
@@ -586,7 +592,11 @@ impl<I: Io> Hw<I> {
         mut f: impl FnMut(&mut I, Layout) -> Result<Option<T>, Error>,
     ) -> Result<T, Error> {
         let deadline = narf_time::Deadline::after_ms(timeout_ms);
-        fence::wait(engine, deadline, Error::Timeout, || {
+        #[cfg(feature = "kernel-test")]
+        let poll_limit = self.io.wait_poll_limit();
+        #[cfg(not(feature = "kernel-test"))]
+        let poll_limit = None;
+        fence::wait(engine, deadline, Error::Timeout, poll_limit, || {
             self.access(|io, l| f(io, l))
         })
         .await

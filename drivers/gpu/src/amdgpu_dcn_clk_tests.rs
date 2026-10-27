@@ -63,6 +63,16 @@ fn table_words() -> [u32; (TABLE_SIZE / 4) as usize] {
     words
 }
 impl Io for Fake {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        // The model answers every message synchronously in write():
+        // RESPONSE leaves BUSY before settled()'s first read, exactly
+        // like the dcn401/dcn30 clk models capped by #905. A wait
+        // still BUSY after sixteen polls is a stuck mailbox whose
+        // outcome is the timeout — reached by count instead of
+        // burning the wall-clock deadline under the spin executor
+        // (#879).
+        Some(16)
+    }
     fn read(&mut self, reg: u64) -> u32 {
         if self.gone {
             return u32::MAX;

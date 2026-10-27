@@ -50,6 +50,15 @@ struct Fake {
     metrics: Vec<u8>,
 }
 impl Io for Fake {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        // The model answers every message synchronously in write(): the
+        // response is final before the wait's first read. A wait still
+        // unanswered after sixteen polls is a designed non-response
+        // (stall) whose outcome is the timeout — reached by count
+        // instead of burning the wall-clock deadline under the spin
+        // executor (#879).
+        Some(16)
+    }
     fn read(&mut self, reg: u32) -> u32 {
         self.regs[reg as usize]
     }

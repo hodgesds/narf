@@ -604,6 +604,16 @@ impl Model {
     }
 }
 impl Io for Model {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        // The model executes submitted packets synchronously at the
+        // doorbell/commit write, so a fence or register wait samples its
+        // completion on the first poll after submission. A wait still
+        // incomplete after sixteen samples is a designed non-completion
+        // (a stalled engine, dropped fences) whose outcome is the
+        // timeout — reached by count instead of burning the wall-clock
+        // deadline under the spin executor (#879).
+        Some(16)
+    }
     fn read(&mut self, address: u64) -> u32 {
         let address = self.key(self.cam_target(address));
         *self.regs.get(&address).unwrap_or(&0)

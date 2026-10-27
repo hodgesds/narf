@@ -195,6 +195,14 @@ trait Io {
     fn write(&mut self, address: u64, value: u32);
     fn upload(&mut self, map: MmioRegion, offset: u64, value: u32);
     fn download(&mut self, map: MmioRegion, offset: u64) -> u32;
+    /// Read-driven register models can use a bounded number of cooperative
+    /// polls instead of a wall-clock deadline. Real MMIO always uses time.
+    /// (Required by the shared navi22 mailbox instantiation; no navi48
+    /// fixture sets a limit, so navi48 waits stay deadline-bound.)
+    #[cfg(feature = "kernel-test")]
+    fn wait_poll_limit(&self) -> Option<u32> {
+        None
+    }
 }
 #[derive(Debug)]
 struct Mmio(MmioRegion);

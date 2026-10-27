@@ -189,13 +189,23 @@ impl Future for Tick {
 /// Sample until `sample` yields a value, it errors, or `deadline` passes.
 /// The sample runs once more after expiry so a completion racing the deadline
 /// is never misreported as a timeout.
+///
+/// `poll_limit` is the kernel-test poll budget threaded from the caller's
+/// register model (its `Io::wait_poll_limit`): when armed, a wait that has
+/// sampled `poll_limit` times without completing returns `timeout` by count
+/// instead of burning the wall-clock deadline under the spin executor
+/// (#879). Production callers pass `None` and always wait on time; the
+/// parameter is ignored outside kernel-test builds.
 pub(crate) async fn wait<T, E>(
     engine: Engine,
     deadline: narf_time::Deadline,
     timeout: E,
+    poll_limit: Option<u32>,
     mut sample: impl FnMut() -> Result<Option<T>, E>,
 ) -> Result<T, E> {
     let generation = GENERATION.load(Ordering::Acquire);
+    #[cfg(feature = "kernel-test")]
+    let mut polls = poll_limit;
     loop {
         let expired = deadline.expired();
         if let Some(value) = sample()? {
@@ -204,6 +214,13 @@ pub(crate) async fn wait<T, E>(
         // Abandoned by a reset/device loss: complete now, with the error.
         if expired || GENERATION.load(Ordering::Acquire) != generation {
             return Err(timeout);
+        }
+        #[cfg(feature = "kernel-test")]
+        if let Some(left) = &mut polls {
+            if *left == 0 {
+                return Err(timeout);
+            }
+            *left -= 1;
         }
         Tick {
             engine,
@@ -228,6 +245,7 @@ mod tests {
             Engine::Sdma1,
             narf_time::Deadline::after_ms(5),
             "timeout",
+            None,
             || {
                 calls.set(calls.get() + 1);
                 Ok::<Option<()>, _>(None)
@@ -241,6 +259,7 @@ mod tests {
             Engine::Gfx,
             narf_time::Deadline::after_ms(1000),
             0,
+            None,
             || {
                 seen.set(seen.get() + 1);
                 if seen.get() == 3 {
@@ -262,6 +281,7 @@ mod tests {
             Engine::Compute,
             narf_time::Deadline::after_ms(1000),
             1,
+            None,
             || Err::<Option<()>, _>(9),
         ));
         if failed != Err(9) {
@@ -273,6 +293,7 @@ mod tests {
             Engine::Sdma0,
             narf_time::Deadline::after_ms(60_000),
             "abandoned",
+            None,
             || {
                 polls.set(polls.get() + 1);
                 if polls.get() == 2 {
@@ -283,6 +304,23 @@ mod tests {
         ));
         if abandoned != Err("abandoned") || polls.get() != 2 {
             return TestResult::Fail("reset did not complete abandoned work");
+        }
+        // An armed poll limit bounds the sample count itself: with a 60 s
+        // deadline a never-signalling wait returns by count after the
+        // initial sample plus the budgeted polls (#879).
+        let capped = Cell::new(0);
+        let result = narf_scheduler::block_on_spin(wait(
+            Engine::Sdma1,
+            narf_time::Deadline::after_ms(60_000),
+            "timeout",
+            Some(3),
+            || {
+                capped.set(capped.get() + 1);
+                Ok::<Option<()>, _>(None)
+            },
+        ));
+        if result != Err("timeout") || capped.get() != 4 {
+            return TestResult::Fail("fence poll limit did not bound samples");
         }
         TestResult::Pass
     }
