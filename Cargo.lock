@@ -1446,6 +1446,7 @@ dependencies = [
  "narf-driver-runtime",
  "narf-drivers",
  "narf-drivers-backlight",
+ "narf-drivers-sound",
  "narf-drivers-usbpd",
  "narf-drivers-virtio",
  "narf-edid",
@@ -2984,9 +2985,11 @@ dependencies = [
  "narf-acpi",
  "narf-aml",
  "narf-arch",
+ "narf-block",
  "narf-bus",
  "narf-capabilities",
  "narf-console",
+ "narf-crypto",
  "narf-event-bus",
  "narf-filesystem",
  "narf-init",
@@ -2997,6 +3000,7 @@ dependencies = [
  "narf-memory",
  "narf-scheduler",
  "narf-time",
+ "zeroize",
 ]
 
 [[package]]
