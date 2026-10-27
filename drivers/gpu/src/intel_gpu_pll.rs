@@ -236,6 +236,77 @@ pub fn combo_coeffs(rate: LinkRate) -> Option<DpllCoeffs> {
     })
 }
 
+// ── 24 MHz reference family ─────────────────────────────────────
+//
+// The PRM table carries a second reference family: with a 24 MHz
+// reference the same 8100 MHz DCO is int 0x151 / frac 0x4000
+// (337.5 × 24 MHz), and the P/K/Q divider fields are identical
+// to the 19.2/38.4 MHz family above (cross-checked against
+// i915's `icl_dp_combo_pll_24mhz_values[]`, which encodes the
+// same PRM Vol. 11 table). #1092 verified both families row by
+// row; the rows are carried as data so the table is complete.
+//
+// Reference-family *selection* (reading the DSSM register to
+// learn which reference the platform straps) remains #1024's
+// scope — `combo_coeffs` keeps resolving the 19.2/38.4 family,
+// and nothing in the modeset path consults the 24 MHz rows yet.
+
+/// Combo-PHY coefficients, 24 MHz reference: RBR.
+pub const COMBO24_RBR: DpllCoeffs = DpllCoeffs {
+    dco_integer: 0x0151,
+    dco_fraction: 0x4000,
+    cfgcr1: CFGCR1_KDIV_2 | CFGCR1_PDIV_5 | CFGCR1_CFREQ_8_4_GHZ,
+};
+
+/// Combo-PHY coefficients, 24 MHz reference: HBR.
+pub const COMBO24_HBR: DpllCoeffs = DpllCoeffs {
+    dco_integer: 0x0151,
+    dco_fraction: 0x4000,
+    cfgcr1: CFGCR1_KDIV_2 | CFGCR1_PDIV_3 | CFGCR1_CFREQ_8_4_GHZ,
+};
+
+/// Combo-PHY coefficients, 24 MHz reference: HBR2.
+pub const COMBO24_HBR2: DpllCoeffs = DpllCoeffs {
+    dco_integer: 0x0151,
+    dco_fraction: 0x4000,
+    cfgcr1: CFGCR1_KDIV_1 | CFGCR1_PDIV_3 | CFGCR1_CFREQ_8_4_GHZ,
+};
+
+/// Combo-PHY coefficients, 24 MHz reference: HBR3.
+pub const COMBO24_HBR3: DpllCoeffs = DpllCoeffs {
+    dco_integer: 0x0151,
+    dco_fraction: 0x4000,
+    cfgcr1: CFGCR1_KDIV_1 | CFGCR1_PDIV_2 | CFGCR1_CFREQ_8_4_GHZ,
+};
+
+/// Which reference-clock family a Combo-PHY DPLL row belongs
+/// to. Selection between families at runtime is via DSSM
+/// (#1024); this type exists so the table can be carried and
+/// fixture-pinned completely in the meantime.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ReferenceFamily {
+    /// 19.2 / 38.4 MHz reference (DCO int 0x1A5, frac 0x7000).
+    Ref19_2Or38_4,
+    /// 24 MHz reference (DCO int 0x151, frac 0x4000).
+    Ref24,
+}
+
+/// Resolve Combo-PHY coefficients for `rate` within an explicit
+/// reference family. `combo_coeffs` is this function at
+/// [`ReferenceFamily::Ref19_2Or38_4`].
+pub fn combo_coeffs_for_ref(rate: LinkRate, family: ReferenceFamily) -> Option<DpllCoeffs> {
+    match family {
+        ReferenceFamily::Ref19_2Or38_4 => combo_coeffs(rate),
+        ReferenceFamily::Ref24 => Some(match rate {
+            LinkRate::DpRbr => COMBO24_RBR,
+            LinkRate::DpHbr => COMBO24_HBR,
+            LinkRate::DpHbr2 => COMBO24_HBR2,
+            LinkRate::DpHbr3 => COMBO24_HBR3,
+            LinkRate::Hdmi297 | LinkRate::Hdmi594 => return None,
+        }),
+    }
+}
+
 /// Encode the full `DPLL_CFGCR0` word from coefficients.
 pub fn encode_cfgcr0(c: &DpllCoeffs) -> u32 {
     cfgcr0_dco_integer(c.dco_integer) | cfgcr0_dco_fraction(c.dco_fraction)
@@ -336,5 +407,45 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_pll",
         smoke_combo_coeffs_match_prm_table
+    );
+
+    /// Pin the 24 MHz reference family (#1092): same 8100 MHz
+    /// DCO expressed as int 0x151 / frac 0x4000 (337.5 × 24 MHz),
+    /// divider fields identical to the 19.2/38.4 family rate for
+    /// rate, and HBR2 ≠ HBR3 here too. Values transcribed from
+    /// the PRM Vol. 11 DP combo-PHY table (cross-checked against
+    /// i915's `icl_dp_combo_pll_24mhz_values[]`).
+    fn smoke_combo_coeffs_24mhz_family_match_prm_table() -> TestResult {
+        let rows24 = [COMBO24_RBR, COMBO24_HBR, COMBO24_HBR2, COMBO24_HBR3];
+        let rows19 = [COMBO_RBR, COMBO_HBR, COMBO_HBR2, COMBO_HBR3];
+        for (r24, r19) in rows24.iter().zip(rows19.iter()) {
+            if r24.dco_integer != 0x151 || r24.dco_fraction != 0x4000 {
+                return TestResult::Fail("24 MHz DCO must be 8100 MHz (0x151 + 0x4000/2^15)");
+            }
+            if r24.cfgcr1 != r19.cfgcr1 {
+                return TestResult::Fail("divider fields must match across reference families");
+            }
+        }
+        if COMBO24_HBR2.cfgcr1 == COMBO24_HBR3.cfgcr1 {
+            return TestResult::Fail("24 MHz HBR2 and HBR3 rows must differ");
+        }
+        // Resolver: the default stays the 19.2/38.4 family; the
+        // 24 MHz family resolves only when asked for explicitly.
+        if combo_coeffs_for_ref(LinkRate::DpHbr3, ReferenceFamily::Ref24) != Some(COMBO24_HBR3) {
+            return TestResult::Fail("Ref24 resolver must return the 24 MHz HBR3 row");
+        }
+        if combo_coeffs_for_ref(LinkRate::DpHbr3, ReferenceFamily::Ref19_2Or38_4)
+            != Some(COMBO_HBR3)
+        {
+            return TestResult::Fail("Ref19_2Or38_4 resolver must return the 19.2 MHz HBR3 row");
+        }
+        if combo_coeffs_for_ref(LinkRate::Hdmi594, ReferenceFamily::Ref24).is_some() {
+            return TestResult::Fail("HDMI must not resolve in either family");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_pll",
+        smoke_combo_coeffs_24mhz_family_match_prm_table
     );
 }
