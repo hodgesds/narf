@@ -106,6 +106,8 @@ struct LinkState {
     ptk: Option<Ptk>,
     wmm: Option<Vec<u8>>,
     rates: Option<Vec<u8>>,
+    /// (bulk-out DCI, QoS TID, TXDESC queue) per published DATA frame.
+    data: Vec<(u8, u8, u8)>,
 }
 #[derive(Clone)]
 struct Link {
@@ -191,7 +193,7 @@ impl Io for Link {
     }
     fn begin_send(&self, dci: u8, bytes: &[u8]) -> Result<u64, UsbError> {
         let mut m = self.state.lock();
-        if m.tx.is_some() || dci != 4 && dci != 8 || bytes.len() < 56 {
+        if m.tx.is_some() || !matches!(dci, 4 | 6 | 8) || bytes.len() < 56 {
             return Err(UsbError::Stall);
         }
         let f = &bytes[32..];
@@ -223,14 +225,15 @@ impl Io for Link {
                     }
                 }
                 8 | 0x88 => {
-                    let header = if f[0] == 0x88 {
-                        if f.get(24..26) != Some(&[0, 0]) {
-                            return Err(UsbError::Stall);
+                    let (header, tid) = if f[0] == 0x88 {
+                        match f.get(24..26) {
+                            Some(&[tid, 0]) if tid < 8 => (26, tid),
+                            _ => return Err(UsbError::Stall),
                         }
-                        26
                     } else {
-                        24
+                        (24, 0)
                     };
+                    m.data.push((dci, tid, bytes[5] & 31));
                     let body = if f[1] & 0x40 != 0 {
                         let mut w = narf_wireless::ccmp::ReplayWindow { last_seen_pn: 0 };
                         let mut b = f[header..].to_vec();
@@ -238,7 +241,7 @@ impl Io for Link {
                             &Ccm,
                             &f[..header],
                             m.ptk.as_ref().unwrap().tk.as_slice().try_into().unwrap(),
-                            0,
+                            tid,
                             false,
                             &mut w,
                             &mut b,
@@ -392,6 +395,9 @@ fn wmm_prepared(protected: bool) -> WmmFixture {
     wmm_rates(protected, None)
 }
 fn wmm_rates(protected: bool, rates: Option<&[u8]>) -> WmmFixture {
+    wmm_profile(protected, rates, &WMM)
+}
+fn wmm_profile(protected: bool, rates: Option<&[u8]>, parameters: &[u8]) -> WmmFixture {
     let (control, link, mut rx, permission) = raw(protected);
     let cap = narf_capabilities::Cap::bootstrap();
     let domain = Arc::new(IrqSafeSpinLock::new(super::domain(17)));
@@ -401,14 +407,14 @@ fn wmm_rates(protected: bool, rates: Option<&[u8]>) -> WmmFixture {
         cap,
         domain.clone(),
     ));
-    link.state.lock().wmm = Some(WMM.to_vec());
+    link.state.lock().wmm = Some(parameters.to_vec());
     let mut b = beacon(protected);
     if let Some(rates) = rates {
         link.state.lock().rates = Some(rates.to_vec());
         b.bytes.extend_from_slice(&[50, rates.len() as u8]);
         b.bytes.extend_from_slice(rates);
     }
-    b.bytes.extend_from_slice(&WMM);
+    b.bytes.extend_from_slice(parameters);
     let candidate = Candidate::from_receive(&b, 1, link.own).unwrap();
     let station = Station::new(
         rx,
@@ -551,6 +557,110 @@ fn smoke_rtl8188eu_wmm_real_ep0_bulk_edca_qos_and_current_authority() -> TestRes
 kernel_test_in!(
     "drivers/wireless/rtl8xxxu/wmm",
     smoke_rtl8188eu_wmm_real_ep0_bulk_edca_qos_and_current_authority
+);
+fn smoke_rtl8188eu_wmm_classifies_dscp_to_all_tids_queues_and_bulk_pipes() -> TestResult {
+    use super::super::super::packet_codec::{access_category, data_endpoint};
+    // rtl8xxxu_init_queue_priority pipe indices for VO/VI/BE/BK classes.
+    for (count, pipes) in [(1u8, [0usize, 0, 0]), (2, [0, 0, 1]), (3, [1, 1, 2])] {
+        for class in 0..3u8 {
+            if data_endpoint(class, count) != pipes[usize::from(class)] {
+                return TestResult::Fail("EU source queue-priority pipe table differs");
+            }
+        }
+    }
+    // (ACM bits VO1/VI2, TOS, TID, TXDESC queue, bulk DCI on this 3-out [2,3,4] fixture)
+    const CASES: [(u8, u8, u8, u8, u8); 8] = [
+        (0, 0x00, 0, 0, 8), // DF -> BE, out_ep[2]
+        (0, 0x20, 1, 2, 8), // CS1 -> BK, out_ep[2]
+        (0, 0x50, 3, 0, 8), // AF22 -> 3 (BE)
+        (0, 0x88, 4, 5, 6), // AF41 -> VI, out_ep[1]
+        (0, 0xb8, 6, 7, 6), // EF -> VO, out_ep[1] (vop = viq ^ 3)
+        (0, 0xc0, 7, 7, 6), // CS6 -> VO
+        (1, 0xb8, 5, 5, 6), // VO ACM: EF downgraded to VI
+        (3, 0xb8, 3, 0, 8), // VO+VI ACM: EF downgraded to BE
+    ];
+    for protected in [false, true] {
+        for (acm, tos, tid, queue, dci) in CASES {
+            if access_category(tid).0 != queue {
+                return TestResult::Fail("EU TXDESC queue table differs");
+            }
+            let mut parameters = WMM;
+            if acm & 1 != 0 {
+                parameters[10] |= 16;
+            }
+            if acm & 2 != 0 {
+                parameters[18] |= 16;
+            }
+            let (control, link, mut s, _, _) = wmm_profile(protected, None, &parameters);
+            if narf_scheduler::block_on(s.begin(0)).is_err() {
+                return TestResult::Fail("EU classified WMM native begin");
+            }
+            for now in 1..20 {
+                if narf_scheduler::block_on(s.step(now, SN)).is_err() {
+                    return TestResult::Fail("EU classified WMM association/RSNA");
+                }
+                if s.controlled_port_open() {
+                    break;
+                }
+            }
+            // rtl8xxxu_conf_tx mirrors each AC's ACM into REG_ACM_HW_CTRL.
+            let expected_acm = (acm & 1) * 8 + (acm & 2) * 2;
+            if !s.controlled_port_open() || control.0.lock().regs[0x5c0] & 15 != expected_acm {
+                return TestResult::Fail("EU REG_ACM_HW_CTRL differs from AP ACM rows");
+            }
+            let mut eth = AP.to_vec();
+            eth.extend_from_slice(&link.own);
+            eth.extend_from_slice(&[8, 0, 0x45, tos, 0, 20]);
+            // Open starts each TID at SN0; shared Security seeds every TID
+            // from the supplicant SN. Either way only this TID advances.
+            let mut first: Option<u16> = None;
+            for round in 0..2u16 {
+                if s.send_ethernet(&eth, 20 + u64::from(round) * 10).is_err() {
+                    return TestResult::Fail("EU classified QoS publication");
+                }
+                let sent = link.state.lock().sent.last().unwrap().clone();
+                let data = link.state.lock().data.last().copied();
+                let sequence = u16::from_le_bytes([sent[54], sent[55]]) >> 4;
+                let expected = match (first, protected) {
+                    (Some(first), _) => (first + 1) & 4095,
+                    (None, false) => 0,
+                    (None, true) => sequence,
+                };
+                first = Some(sequence);
+                if data != Some((dci, tid, queue))
+                    || sent[56..58] != [tid, 0]
+                    || sequence != expected
+                    || u32::from_le_bytes(sent[16..20].try_into().unwrap()) & 64 == 0
+                    || sent[..32]
+                        .chunks_exact(2)
+                        .fold(0u16, |a, b| a ^ u16::from_le_bytes([b[0], b[1]]))
+                        != 0
+                {
+                    return TestResult::Fail("EU TID/queue/pipe/per-TID SN/checksum differs");
+                }
+                if round == 1 {
+                    // The fixture AP's echo reuses PN1; one roundtrip suffices.
+                    break;
+                }
+                for now in 21..25 {
+                    if s.poll_network(now, SN).is_err() {
+                        return TestResult::Fail("EU classified QoS native roundtrip");
+                    }
+                }
+                let mut expected = link.own.to_vec();
+                expected.extend_from_slice(&AP);
+                expected.extend_from_slice(&eth[12..]);
+                if s.pop_received() != Some(expected) {
+                    return TestResult::Fail("EU classified QoS CCMP/normalization");
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/wmm",
+    smoke_rtl8188eu_wmm_classifies_dscp_to_all_tids_queues_and_bulk_pipes
 );
 fn smoke_rtl8188eu_wmm_response_rejection_and_pending_ep0_cancellation_retain_owner() -> TestResult
 {

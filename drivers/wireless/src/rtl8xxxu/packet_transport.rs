@@ -211,7 +211,10 @@ impl<I: Io> Owner<I> {
         let packet = packet_codec::transmit_rate(frame, kind, rate).map_err(Error::Packet)?;
         let index = match kind {
             Kind::Management => 0,
-            Kind::Data => usize::from(self.endpoints.output_count - 1),
+            Kind::Data => packet_codec::data_endpoint(
+                packet_codec::access_category(packet_codec::data_tid(frame)).1,
+                self.endpoints.output_count,
+            ),
         };
         let dci = self.endpoints.output[index] * 2;
         match self.io.begin_send(dci, &packet) {

@@ -203,7 +203,8 @@ pub(super) fn transmit_rate(frame: &[u8], kind: Kind, rate: u8) -> Result<Vec<u8
         Kind::Data
             if !matches!(frame[0], 0x08 | 0x88)
                 || frame[1] & 3 != 1
-                || frame[0] == 0x88 && frame.get(24..26) != Some(&[0, 0]) =>
+                || frame[0] == 0x88
+                    && !matches!(frame.get(24..26), Some(&[tid, 0]) if tid & 0xf8 == 0) =>
         {
             return Err(Error::Header)
         }
@@ -219,7 +220,13 @@ pub(super) fn transmit_rate(frame: &[u8], kind: Kind, rate: u8) -> Result<Vec<u8
         frame[4]
     };
     out[3] = 0x8c | destination & 1;
-    out[4..8].copy_from_slice(&(if management { 0x12u32 << 8 } else { 0 }).to_le_bytes());
+    // rtl8xxxu_queue_select: MGNT0x12, else the AC's TXDESC_QUEUE_*.
+    let queue = if management {
+        0x12
+    } else {
+        access_category(data_tid(frame)).0
+    };
+    out[4..8].copy_from_slice(&(u32::from(queue) << 8).to_le_bytes());
     out[8..12].copy_from_slice(&(1u32 << 16 | 1 << 24 | 1 << 25).to_le_bytes());
     out[12..16].copy_from_slice(
         &(u32::from(u16::from_le_bytes([frame[22], frame[23]]) >> 4) << 16).to_le_bytes(),
@@ -245,4 +252,38 @@ pub(super) fn transmit_rate(frame: &[u8], kind: Kind, rate: u8) -> Result<Vec<u8
     out[28..30].copy_from_slice(&checksum.to_le_bytes());
     out[TX_DESC..].copy_from_slice(frame);
     Ok(out)
+}
+
+/// QoS TID of a DATA frame; non-QoS DATA uses mac80211's BE priority0.
+pub(super) fn data_tid(frame: &[u8]) -> u8 {
+    if frame.first() == Some(&0x88) {
+        frame.get(24).map_or(0, |q| q & 7)
+    } else {
+        0
+    }
+}
+/// Linux `ieee802_1d_to_ac` then `rtl8xxxu_80211_to_rtl_queue`: the
+/// TXDESC_QUEUE_{BK2,BE0,VI5,VO7} selector and the
+/// `rtl8xxxu_init_queue_priority` pipe class (0 VO, 1 VI, 2 BE/BK).
+pub(super) const fn access_category(tid: u8) -> (u8, u8) {
+    match tid & 7 {
+        1 | 2 => (2, 2),
+        4 | 5 => (5, 1),
+        6 | 7 => (7, 0),
+        _ => (0, 2),
+    }
+}
+/// `rtl8xxxu_init_queue_priority` bulk-out index for a DATA pipe class and
+/// `ep_tx_count`. One endpoint carries everything; two put VO/VI on
+/// out_ep[0] and BE/BK on out_ep[1]; three put BE/BK on out_ep[2] and VI on
+/// out_ep[1]. Upstream derives three-endpoint `vop` from `viq ^ 3`, so VO
+/// shares VI's out_ep[1] even though TRXDMA_CTRL maps VOQ to HIGH.
+pub(super) const fn data_endpoint(class: u8, count: u8) -> usize {
+    match (count, class) {
+        (2, 0 | 1) => 0,
+        (2, _) => 1,
+        (3, 0 | 1) => 1,
+        (3, _) => 2,
+        _ => 0,
+    }
 }

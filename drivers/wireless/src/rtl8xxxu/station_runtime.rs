@@ -82,6 +82,8 @@ pub struct Station<C: ControlIo, B: packet_transport::Io> {
     last_now: u64,
     last_peer: u64,
     sequence: u16,
+    /// Open-path per-TID QoS SN space; CCMP keeps its own in `Security`.
+    qos_sequence: [u16; 8],
 }
 impl<C: ControlIo, B: packet_transport::Io> core::fmt::Debug for Station<C, B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -133,6 +135,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             last_now: 0,
             last_peer: 0,
             sequence: 2,
+            qos_sequence: [0; 8],
         })
     }
     pub fn append_sme_ies(&mut self, bytes: &[u8]) -> Result<(), Error> {
@@ -767,9 +770,15 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         if !self.transmit_ready() {
             return Err(Error::State);
         }
+        // mac80211 classification/ACM downgrade picks the TID; the codec maps
+        // its AC to the source TXDESC queue and bulk-out pipe.
+        let tid = self
+            .plan
+            .wmm()
+            .map(|p| crate::rtlwifi::wmm::priority(frame, &p));
         let native = if let Some(security) = &mut self.security {
-            match if self.plan.wmm().is_some() {
-                security.transmit_ethernet_qos(frame, 0)
+            match if let Some(tid) = tid {
+                security.transmit_ethernet_qos(frame, tid)
             } else {
                 security.transmit_ethernet(frame)
             } {
@@ -790,14 +799,18 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             if proto < 0x600 || matches!(proto, 0x888e | 0x80f3 | 0x8137) {
                 return Err(Error::Profile);
             }
-            let mut h = vec![if self.plan.wmm().is_some() { 0x88 } else { 8 }, 1, 0, 0];
+            let mut h = vec![if tid.is_some() { 0x88 } else { 8 }, 1, 0, 0];
             h.extend_from_slice(&self.plan.candidate().bssid());
             h.extend_from_slice(&own);
             h.extend_from_slice(&frame[..6]);
-            h.extend_from_slice(&(self.sequence << 4).to_le_bytes());
-            self.sequence = (self.sequence + 1) & 4095;
-            if self.plan.wmm().is_some() {
-                h.extend_from_slice(&[0, 0]);
+            let counter = match tid {
+                Some(tid) => &mut self.qos_sequence[usize::from(tid)],
+                None => &mut self.sequence,
+            };
+            h.extend_from_slice(&(*counter << 4).to_le_bytes());
+            *counter = (*counter + 1) & 4095;
+            if let Some(tid) = tid {
+                h.extend_from_slice(&[tid, 0]);
             }
             h.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
             h.extend_from_slice(&frame[12..]);

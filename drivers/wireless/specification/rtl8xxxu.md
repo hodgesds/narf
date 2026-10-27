@@ -291,7 +291,7 @@ Explicit registration, operator up/down and autoconnect remain administrative
 events. Disconnect/failure clears carrier and peer identity while preserving an
 operator-UP interface; a later physical carrier sample cannot undo operator DOWN.
 
-### Negotiated RTL8188EU WMM BE/TID0
+### Negotiated RTL8188EU WMM (all ACs/TIDs)
 
 A valid AP WMM Parameter element selects an optional legacy QoS station.
 The driver appends its own Information IE requesting no U-APSD and requires
@@ -303,11 +303,34 @@ hardware8-bit AIFS field before any EDCA write.
 
 Linux `rtl8xxxu_conf_tx` plus `rtl8xxxu_set_aifs` supply BE/BK/VI/VO registers
 0x508/50c/504/500, ECW/TXOP fields and SIFS10 plus AIFSN times9/20us slot.
-Every EP0 write has an exact readback. The only selected queue is conservative
-BE (AIFSN>=3, ECWmin>=5, ECWmax>=10, TXOP0); source ACM queue bits are cleared.
-Only then may the retained bulk owner admit a QoS DATA header with TID0 and
-TXDESC32_QOS. This legacy WMM grant keeps other priorities, HT/BA, U-APSD,
+Every EP0 write has an exact readback. BE stays conservative (AIFSN>=3,
+ECWmin>=5, ECWmax>=10, TXOP0); BK/VI/VO use the AP rows. As in
+`rtl8xxxu_conf_tx`, REG_ACM_HW_CTRL BK0/BE1/VI2/VO3 mirror each AC's ACM
+(`wmm_runtime::acm_bits`; BE ACM is refused). Only then may the retained bulk
+owner admit QoS DATA with TXDESC32_QOS. This WMM grant keeps HT/BA, U-APSD,
 TSPEC and QoS Null closed; the distinct HT grant below cannot be inferred from it.
+
+#### Traffic classification and all-AC/TID routing (implemented)
+
+`station_runtime.rs::send_ethernet` classifies each Ethernet frame with
+`cfg80211_classify8021d` (DSCP/RFC 8325, MPLS TC, 802.21) and mac80211
+`ieee80211_downgrade_queue` over the AP ACM rows (shared
+`rtlwifi::wmm::priority`), writes that TID into the QoS control before
+software CCMP (also the CCMP nonce priority) and keeps per-TID SN spaces
+(Open: `qos_sequence`; CCMP: shared `Security`). `packet_codec.rs` accepts QoS
+DATA TID0..7 with normal ACK and sets TXDESC queue per
+`rtl8xxxu_queue_select`/`rtl8xxxu_80211_to_rtl_queue`: BK2, BE0, VI5, VO7,
+MGNT0x12 (the TID itself is not a descriptor field upstream).
+`packet_transport.rs` selects the bulk-out pipe from
+`rtl8xxxu_init_queue_priority`: one endpoint carries all; two put VO/VI on
+out_ep[0] and BE/BK on out_ep[1]; three put BE/BK on out_ep[2] and VI on
+out_ep[1], and VO also on out_ep[1] because upstream derives `vop` from
+`viq ^ 3`. This matches the TRXDMA_CTRL/RQPN mapping already programmed by
+`device_init::pre_firmware`. Smoke
+`smoke_rtl8188eu_wmm_classifies_dscp_to_all_tids_queues_and_bulk_pipes`
+(Open and WPA2) checks the pipe table for1/2/3 endpoints, each AC's
+queue/DCI, per-TID SN, CCMP priority at the fixture AP, REG_ACM_HW_CTRL and
+the VO->VI and VO+VI->BE downgrades.
 Open frames and host CCMP use the26-byte header; CCMP protection occurs before
 USB staging, and the shared key owner retains per-key/TID replay state.
 
@@ -319,7 +342,10 @@ association invokes that cap and rechecks the current installed country/power
 permission; active work never bootstraps a cleared policy. Packet publication
 and completion also require this retained proof. Missing/changed/revoked proof
 is terminal and cannot publish QoS, reuse pending USB storage or revive carrier.
-Bound AP parameter changes require a fresh lifecycle.
+Bound AP parameter changes still require a fresh lifecycle: upstream
+mac80211 re-runs `rtl8xxxu_conf_tx` when a beacon's WMM Parameter Set Count
+changes, but the Open-phase network path here is synchronous and cannot yet
+issue the async EP0 EDCA writes (remaining `live_edca_updates`).
 
 Two native Rust smokes compose actual EP0/bulk owners through Open/WPA2,
 literal EDCA/TXD values, exact QoS/CCMP data, actual cap loss, malformed response,
@@ -393,7 +419,7 @@ default3839-byte A-MSDU. Complete selected response HT Cap45/Operation61 must
 bind the original peer/primary1 offer,20MHz, supported protection mode and WMM.
 No mandatory membership selector is stripped. DATA chooses the highest actual
 response-bound MCS; source TXDESC32/v3 uses rate12..19, USE_DRIVER_RATE,
-DISABLE_DATA_FB, raw26-byte QoS/TID0 and software CCMP, with SGI/BW40/AGG/RTS
+DISABLE_DATA_FB, raw26-byte QoS with the classified TID and software CCMP, with SGI/BW40/AGG/RTS
 disabled. Management and EAPOL keep legacy1Mbps. EU rate selection is host-owned;
 no C21/C22 H2C rate-mask callback or invented firmware-applied ACK is added.
 
@@ -437,8 +463,8 @@ policy loss and reentrant key/ordinary-credit publication. These cases pass
 both-architecture native QEMU and coordinated build/Clippy gates. Physical
 USB/RF/HT interoperability and exact-device measured qualification remain external.
 SGI20, HT40, RX A-MPDU, TX A-MPDU, TX A-MSDU, recipient/originator BA and RX
-reordering, all AC/TIDs, adaptive rates, broader scans/channels, coexistence,
-PM and reset/rejoin remain software work.
+reordering, adaptive rates, broader scans/channels, coexistence,
+live EDCA and reset/rejoin remain software work.
 
 ## 4. Invariants
 
@@ -499,9 +525,21 @@ channels/rates, reset/rejoin and PM still need software implementation.
 Chip inventory is source-specific: Linux `rtl8xxxu/8188e.c` identifies1TX/1RX;
 `8192e.c` identifies actual1/2TX and2RX; `8723b.c` identifies1TX/1RX and optional
 BT/S0S1. EU's separately qualified HT20/LGI continuation is software-validated above;
-SGI20/HT40, RX A-MPDU, TX A-MPDU/TX A-MSDU, recipient/originator BA, RX reorder, full WMM
-AC/TID routing, adaptive rates, broader active/passive scanning, runtime PM and
-reset/rejoin remain software work. 8192EU/8723BU first need their own retained power/firmware/radio/
+SGI20/HT40, RX A-MPDU, TX A-MPDU/TX A-MSDU, recipient/originator BA, RX reorder,
+adaptive rates, broader active/passive scanning, runtime PM and
+reset/rejoin remain software work. Full WMM AC/TID routing is implemented.
+
+Power-management inventory (upstream `rtl8xxxu/core.c`): `rtl8xxxu_probe`
+sets only SIGNAL_DBM, HAS_RATE_CONTROL, SUPPORT_FAST_XMIT, AMPDU_AGGREGATION
+and MFP_CAPABLE (no SUPPORTS_PS/DYNAMIC_PS), `rtl8xxxu_ops` has no
+`.suspend`/`.resume`/WoWLAN, and `rtl8xxxu_driver` has no
+`.suspend`/`.resume`/`.reset_resume`/`.supports_autosuspend` but sets
+`.disable_hub_initiated_lpm = 1`. The only power transitions are
+`fops->enable_rf` in `rtl8xxxu_start`, `fops->disable_rf` in `rtl8xxxu_stop`
+and `fops->power_off` at disconnect. There are no PM submodes beyond that
+interface start/stop radio power path (the remaining
+`runtime_power_management` row); LPS/IPS/WoWLAN/USB autosuspend/LPM are
+inapplicable to this family. 8192EU/8723BU first need their own retained power/firmware/radio/
 packet/station compositions, including2-chain or coexistence dependencies.
 The repository's matched8821CU/8822BU profiles need the actual upstream
 `rtw88/rtw8821cu.c`/`rtw8822bu.c` USB transport and C21/C22B radio semantics;

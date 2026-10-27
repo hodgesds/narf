@@ -266,7 +266,11 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
                             return Err(Error::State);
                         }
                     }
-                    let acm = self.firmware.read8(0x5c0).await.map_err(Error::Control)? & !0x0e;
+                    // rtl8xxxu_conf_tx: REG_ACM_HW_CTRL BK0/BE1/VI2/VO3
+                    // follow each AC's ACM. BE ACM was refused above, and
+                    // host classification already downgrades ACM traffic.
+                    let acm = (self.firmware.read8(0x5c0).await.map_err(Error::Control)? & !0x0f)
+                        | super::wmm_runtime::acm_bits(p);
                     self.firmware
                         .write8(0x5c0, acm)
                         .await
