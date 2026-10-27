@@ -58,7 +58,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use narf_drivers_tpm::devfs_bridge::{self, TpmTransport};
 use narf_drivers_tpm::tpm2::{
@@ -90,6 +90,14 @@ const POLICY_MASK: [u8; 3] = [0xFF, 0x06, 0x00];
 pub struct TpmAnchor {
     transport: Arc<dyn TpmTransport>,
     nonces: AtomicU64,
+    /// The response code of the most recent TPM answer this
+    /// anchor classified (`u32::MAX` until the first). Recorded
+    /// verbatim — including successes — so the lifecycle
+    /// accounting (#1003) can attribute a failed operation to
+    /// its cause (policy vs dictionary-attack lockout vs auth)
+    /// without the anchor's own no-oracle error surface growing
+    /// distinctions its callers could iterate against.
+    last_rc: AtomicU32,
 }
 
 impl fmt::Debug for TpmAnchor {
@@ -105,6 +113,23 @@ impl TpmAnchor {
         Self {
             transport,
             nonces: AtomicU64::new(0),
+            last_rc: AtomicU32::new(u32::MAX),
+        }
+    }
+
+    /// The response code of the most recent TPM answer this
+    /// anchor received, or `None` before the first command (and
+    /// after a transport-level failure, which produces no code
+    /// and leaves the previous value standing). The lifecycle
+    /// surface (#1003, [`super::tpm_lifecycle`]) classifies this
+    /// after an [`AnchorError::Refused`] to account the refusal
+    /// — policy failure and DA lockout are both `Refused` here,
+    /// deliberately, but they demand different operator
+    /// responses, and the accounting needs to tell them apart.
+    pub fn last_response_code(&self) -> Option<u32> {
+        match self.last_rc.load(Ordering::Relaxed) {
+            u32::MAX => None,
+            rc => Some(rc),
         }
     }
 
@@ -127,6 +152,9 @@ impl TpmAnchor {
             .transport
             .submit(cmd)
             .map_err(|()| AnchorError::Unavailable)?;
+        if let Some(rc) = cmds::response_rc(&raw) {
+            self.last_rc.store(rc, Ordering::Relaxed);
+        }
         match cmds::response_rc(&raw) {
             Some(TPM_RC_SUCCESS) => Ok(raw),
             // Exact codes (Part 2 §6.6): TPM returns

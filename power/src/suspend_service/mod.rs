@@ -33,7 +33,10 @@
 //! [`RecordedPolicy`] record to enforce. Real anchors land as
 //! their own lanes: FIDO token P3 (#999), the TPM sealing anchor
 //! P6 (#1002 — [`TpmAnchor`], in `tpm_anchor`), Argon2id
-//! passphrase P7 (#1004).
+//! passphrase P7 (#1004). The TPM anchor's lifecycle surface —
+//! suspend/resume power sequencing, Clear invalidation, DA
+//! lockout accounting — is P6b (#1003, [`TpmLifecycle`], in
+//! `tpm_lifecycle`).
 
 use alloc::vec::Vec;
 use core::fmt;
@@ -45,6 +48,7 @@ mod format;
 mod image;
 mod slots;
 mod tpm_anchor;
+mod tpm_lifecycle;
 
 pub use anchor::{AnchorError, AnchorKind, KeyCustodyAnchor, UnwrapCtx, WrapCtx, WrappedSlot};
 pub use custody::Secret32;
@@ -55,6 +59,10 @@ pub use image::{
 };
 pub use slots::{EpochSlots, SlotArea, SlotRecord};
 pub use tpm_anchor::TpmAnchor;
+pub use tpm_lifecycle::{
+    classify_refusal, EpochState, LockoutState, ShutdownOutcome, StartupOutcome, TpmLifecycle,
+    TpmLifecycleError, TpmRefusal,
+};
 
 use anchor::AnchorKind as Kind;
 use slots::{EpochCustody, SlotStore};
