@@ -125,6 +125,17 @@ pub(crate) struct WriteRequest<'a> {
     pub image_id: [u8; 16],
     pub smk_wrap_nonce: [u8; 12],
     pub image: &'a [u8],
+    /// Hook-region bytes (design §5): the hook blob directory +
+    /// blobs, framed and sealed by the hook registry (P2, #998)
+    /// under the per-hook keys. The writer only places the region
+    /// and seals its length into the header; the region's *contents*
+    /// are authenticated per blob by their consumers at unseal
+    /// time, never by the image pipeline. Empty for every image the
+    /// service writes today. Callers writing through
+    /// [`super::format::BlockStore`] should keep the length a
+    /// multiple of the format page so chunk writes stay LBA-aligned
+    /// (the reader is offset-general; the block writer is not).
+    pub hook_region: &'a [u8],
 }
 
 /// Seal `image` into `store` per the format. Chunks and manifest are
@@ -138,7 +149,8 @@ pub(crate) fn write_image(
     if image_len == 0 {
         return Err(ServiceError::EmptyImage);
     }
-    if format::image_total_len(image_len, 0) > store.len_bytes() {
+    let hook_len = req.hook_region.len() as u64;
+    if format::image_total_len(image_len, hook_len) > store.len_bytes() {
         return Err(ServiceError::ImageTooLarge);
     }
     let chunk_count = image_len.div_ceil(CHUNK_LEN);
@@ -157,8 +169,16 @@ pub(crate) fn write_image(
             &format::chunk_aad(&req.image_id, index),
             &mut buf,
         );
-        store.write_all(format::chunk_offset(chunk_count, 0, index), &buf)?;
+        store.write_all(format::chunk_offset(chunk_count, hook_len, index), &buf)?;
         tags.push(tag);
+    }
+
+    // Hook region: placed verbatim between the manifest and the
+    // chunks. Only its length is authenticated (in the sealed body
+    // below); the contents are per-blob AEAD under the hook keys,
+    // verified by the blobs' consumers (design §5.2 rule 4).
+    if hook_len > 0 {
+        store.write_all(format::hook_offset(chunk_count), req.hook_region)?;
     }
 
     // Manifest: the tags, page-padded.
@@ -199,7 +219,7 @@ pub(crate) fn write_image(
     let mut body = [0u8; SEALED_BODY_LEN];
     body[0..8].copy_from_slice(&chunk_count.to_le_bytes());
     body[8..16].copy_from_slice(&image_len.to_le_bytes());
-    body[16..24].copy_from_slice(&0u64.to_le_bytes());
+    body[16..24].copy_from_slice(&hook_len.to_le_bytes());
     body[24..56].copy_from_slice(&root);
     let body_tag = chacha20_poly1305_seal(
         &man_key,

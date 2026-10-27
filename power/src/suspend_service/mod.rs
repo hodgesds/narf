@@ -319,6 +319,7 @@ impl<E: KeyEntropy> SuspendService<E> {
                         image_id,
                         smk_wrap_nonce,
                         image,
+                        hook_region: &[],
                     },
                 )?;
             }
@@ -339,6 +340,7 @@ impl<E: KeyEntropy> SuspendService<E> {
                         image_id,
                         smk_wrap_nonce,
                         image,
+                        hook_region: &[],
                     },
                 )?;
                 self.store
