@@ -1077,6 +1077,9 @@ fn wiphy_security_attrs(attrs: &mut Vec<u8>, iface: &dyn crate::WirelessNetIface
     let mut bits: Vec<u32> = Vec::new();
     if iface.supports_handshake_offload() && !sme {
         bits.push(15); // 4WAY_HANDSHAKE_STA_PSK
+        if iface.supports_wpa2_mfp_offload() && iface.supports_optional_mfp() {
+            bits.push(21); // MFP_OPTIONAL, explicit native policy contract.
+        }
     }
     if iface.supports_sae_offload() && !sme {
         bits.push(38); // SAE_OFFLOAD

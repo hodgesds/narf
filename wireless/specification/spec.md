@@ -107,6 +107,12 @@ receive data stream, exposed by negotiated `rx_stbc()`. It defaults off,
 does not enable transmit STBC and does not imply two data-stream reception.
 The native decoder must validate space-time stream metadata and the actual
 data-MCS/width limits before replay or packet publication.
+`LocalHt::with_greenfield(rx, tx)` explicitly opts into the HT greenfield
+decoder/transmitter, defaulting off for existing local constructors. Bit4
+advertises the local RX promise; `tx_greenfield()` additionally requires the
+bound AP's RX bit in both original offer and response. `rx_greenfield()`
+retains the independent local decoder promise. Native HT mode3 admission,
+rate/space-time-stream/coding bounds and peer programming belong to the driver.
 `with_tx_selection` checks a nonempty subset of actual TX support for rate
 selection without changing capability IEs or granting transmit authority.
 These factual values are not capabilities and
@@ -550,9 +556,10 @@ HT/VHT capability + mask, `CONTROL_PORT`, `CONTROL_PORT_ETHERTYPE` = ETH_P_PAE,
 `CONTROL_PORT_NO_ENCRYPT`, `SOCKET_OWNER`, `EXTERNAL_AUTH_SUPPORT`, `SAE_PWE`,
 `MLO_SUPPORT`, `CONTROL_PORT_OVER_NL80211`, `CONTROL_PORT_NO_PREAUTH`) with
 `nl80211_connect` / `nl80211_crypto_settings`' checks; hints and overrides
-steer nothing. `USE_MFP` is `enum nl80211_mfp` (REQUIRED = 1; OPTIONAL = 2
-needs `NL80211_EXT_FEATURE_MFP_OPTIONAL`, which no NARF wiphy — like
-mac80211 — has: -EOPNOTSUPP). A PMK needs `4WAY_HANDSHAKE_STA_PSK` and a SAE
+steer nothing. `USE_MFP` is `enum nl80211_mfp` (REQUIRED = 1; OPTIONAL = 2).
+OPTIONAL requires explicit default-false `supports_optional_mfp()` plus PSK
+and required-PMF offload; a complete native owner advertises extended bit21.
+A PMK needs `4WAY_HANDSHAKE_STA_PSK` and a SAE
 password `SAE_OFFLOAD` (-EINVAL otherwise); pairwise / group ciphers must be
 wiphy cipher suites (-EINVAL). CONNECT accepts up to five pairwise selectors,
 while direct ASSOCIATE accepts one, as `nl80211_crypto_settings` does.
@@ -567,8 +574,15 @@ caller security promises such as OCV, no PMKIDs, and BIP-CMAC-128 (explicit
 or the IEEE default when omitted). Its fixed PSK/CCMP body accepts only
 20/22/26-byte extents, with no partial/trailing fields, and the complete IE
 stream is bounded at 2048 bytes. Missing capability, missing/contradictory
-RSNE or unsupported suite remains closed; OPTIONAL remains unsupported.
-Other offload drivers preserve their no-required-PMF default. Every element
+RSNE or unsupported suite remains closed. OPTIONAL additionally requires
+`USE_MFP=2` and one canonical MFPC-only RSNE with the same bounded BIP formats,
+no PMKIDs/OCV and no MFPR. Missing/NO-MFP policy cannot carry that optional
+promise. It is admitted only to the firmware PSK path, keeping SAE, Open,
+external-supplicant and direct ASSOCIATE policies unchanged. The complete
+original RSNE survives into `AssociateRequest::ie`; it supplies requested
+policy, not a negotiated-PMF proof. Native response/handshake evidence remains
+the opted-in driver's obligation, including any explicit interoperability limits.
+Other offload drivers retain their no-required/optional-PMF defaults. Every element
 is carried in `AssociateRequest::ie`, and an
 offloading driver replaces RSNE / RSNXE with its own and forwards the rest
 (`ieee80211_mgd_assoc`). A successful offloaded

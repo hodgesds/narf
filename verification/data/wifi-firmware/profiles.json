@@ -1057,6 +1057,7 @@
       ],
       "requirements": [
         "Signed measured board-power artifact rtl8xxxu/rtl8188eu-cal-v1-<factory MAC lowercase hex>.bin is mandatory and must match factory identity; unsigned developer mode does not qualify it.",
+        "Optional RTL8188EU HT20/LGI MCS0-7 requires a separate signed measured rtl8xxxu/rtl8188eu-ht20-lgi-v1-<factory MAC lowercase hex>.bin N8HT record bound to the exact N8PC legacy qualification, USB/factory identity, actual uploaded executable and EU-specific program. Legacy records cannot qualify HT. Dynamic per-device records are external requirements, not fixed payloads checked by this catalog.",
         "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
       ]
     },

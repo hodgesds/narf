@@ -255,8 +255,8 @@ capability, so userspace can select required-PMF APs without inventing support.
 It separately exposes default-closed `supports_wpa2_mfp_offload()` from those
 native probes. Shared nl80211 PMK CONNECT requires it plus `USE_MFP=1` and a
 strict MFPC|MFPR PSK/CCMP RSNE with explicit/default BIP-CMAC-128. Unsupported
-caller security promises such as OCV are rejected before native join writes;
-OPTIONAL remains unsupported.
+caller security promises such as OCV are rejected before native join writes.
+The separate bounded Optional-PMF contract below opts in explicitly.
 
 IGTK installation, BIP replay/integrity and protected robust-management/SA Query
 processing remain inside the firmware offload. The host manufactures no IGTK,
@@ -271,6 +271,44 @@ peer denials, teardown and cancelled verification with all posted DMA retained.
 Raw CONNECT attributes additionally exercise the real shared parser/execution
 path through shared5/6 native MFP/association verification and port publication;
 missing native MFP capability is rejected without a device command.
+
+### Bounded optional-PMF CONNECT
+
+The actual BCM43602 MFP/supplicant probes additionally gate
+`supports_optional_mfp()` and its separate nl80211
+`NL80211_EXT_FEATURE_MFP_OPTIONAL`. Shared PSK/CCMP `CONNECT USE_MFP=2` retains
+an MFPC-only/MFPR-clear caller RSNE; native CAPABLE1 is set/read back after
+WSEC. Explicit required policy remains native2; Open remains0. The driver
+derives policy from the original RSNE, never a caller authorization flag.
+The full common negotiation/matrix contract is in [CYW §3](cyw43439.md).
+
+Native1 configuration does not establish negotiated PMF. After peer-bound
+association and FWSUP_COMPLETED, the current original msgbuf owner checks
+native BSSID/mode and complete bounded actual association request/response
+RSN snapshots under its current source and full occupied-power grant. An
+exact-consumption local check rejects partial/trailing RSN fields before any
+BIP default normalization; valid legacy18/default20/22/explicit26 extents remain.
+An MFPC AP requires matching actual response MFPC/MFPR and PSK/CCMP/BIP-CMAC128
+facts; missing, malformed or changed proof closes that submitted lifecycle.
+An AP without MFPC can complete unprotected, including an absent response
+RSNE, without falsely setting protected metadata. Another real native ring
+idle precedes port publication. Current policy, cancellation, host close and
+receive epochs retain the same strong owner/publication fences. No uncertain
+command/packet DMA is released by an apparent policy or cryptographic flag.
+
+Eight `drivers/wireless/brcmfmac/optional_pmf` smokes pass on both architectures for shared5/6:
+the complete policy/AP/capability matrix, actual RSN/default-BIP/absence and
+downgrade/duplicate/malformed evidence, mode/peer/length/OCV failures, foreign
+and genuine native key events, held mode/request/response cancellation,
+current policy loss at the actual response wait, raw Optional CONNECT and
+real Open/WPA2 protected/unprotected DHCP/IP, including occupied VHT80.
+Existing required-PMF coverage remains. These additions pass coordinated
+software gates and do not establish firmware-internal BIP or physical PMF.
+
+Broad optional-PMF interoperability remains open: MFPC APs omitting response
+RSNE require a source-proven native negotiated-MFP indication. The local
+Linux ABI supplies no such `sta_info` flag. Configured1 or IOCTL success
+cannot replace that proof. This residual is not closed by the bounded profile.
 
 ### Firmware-qualified HT20/HT40 and short GI admission
 

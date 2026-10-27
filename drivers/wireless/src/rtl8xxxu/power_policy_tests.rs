@@ -443,3 +443,6 @@ mod station_tests;
 
 #[path = "dhcp_composition_tests.rs"]
 mod dhcp_composition_tests;
+
+#[path = "ht_tests.rs"]
+mod ht_tests;

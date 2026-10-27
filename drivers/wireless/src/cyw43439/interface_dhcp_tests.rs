@@ -32,6 +32,8 @@ mod ht_tests;
 mod lifetime_tests;
 #[path = "mfp_tests.rs"]
 mod mfp_tests;
+#[path = "optional_mfp_tests.rs"]
+mod optional_mfp_tests;
 
 const OWN: [u8; 6] = [2, 6, 7, 8, 9, 10];
 const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];
@@ -168,6 +170,7 @@ struct Harness {
     device: Arc<ModelDevice>,
     bus: Bus,
     name: String,
+    association_ies: Vec<u8>,
 }
 
 impl Harness {
@@ -279,13 +282,19 @@ impl Harness {
                                                       // stack initialization or registering another netfilter/timer hook.
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
         narf_net::iface::install_rx_drain(drain);
-        Ok(Self { device, bus, name })
+        Ok(Self {
+            device,
+            bus,
+            name,
+            association_ies: Vec::new(),
+        })
     }
 
     fn scan_and_associate(&self, secured: bool) -> Result<(), &'static str> {
         self.scan()?;
-        ready(self.device.associate(Self::request(secured)))?
-            .map_err(|_| "CYW composition association")?;
+        let mut request = Self::request(secured);
+        request.ie = self.association_ies.clone();
+        ready(self.device.associate(request))?.map_err(|_| "CYW composition association")?;
         if !self.device.link_up()
             || self.device.connected_bssid() != Some(AP)
             || narf_net::iface::lookup(&self.name)

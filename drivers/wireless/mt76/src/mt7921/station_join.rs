@@ -642,10 +642,13 @@ impl<B: Backend> Session<B> {
                         ),
                         native.phy,
                         false,
-                        self.ht20_profile.map_or(1, |p| p.receive_streams()),
-                        self.ht20_profile.is_some_and(|p| p.receive_ldpc()),
-                        self.ht20_profile.is_some_and(|p| p.receive_stbc()),
-                        channel <= 14,
+                        crate::mt7921::vht::RxLimits {
+                            streams: self.ht20_profile.map_or(1, |p| p.receive_streams()),
+                            ldpc: self.ht20_profile.is_some_and(|p| p.receive_ldpc()),
+                            stbc: self.ht20_profile.is_some_and(|p| p.receive_stbc()),
+                            greenfield: self.ht20_profile.is_some_and(|p| p.receive_greenfield()),
+                            cck: channel <= 14,
+                        },
                     )
                 {
                     self.clear_aggregate_receive();

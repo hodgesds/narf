@@ -578,6 +578,9 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
     fn supports_wpa2_mfp_offload(&self) -> bool {
         self.mfp_supported
     }
+    fn supports_optional_mfp(&self) -> bool {
+        self.mfp_supported
+    }
     fn reports_disconnect_events(&self) -> bool {
         true
     }
@@ -927,3 +930,7 @@ mod dhcp_composition_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "../brcmfmac/station_dhcp_tests.rs"]
 mod pcie_dhcp_composition_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "optional_mfp_common.rs"]
+mod optional_mfp_common;

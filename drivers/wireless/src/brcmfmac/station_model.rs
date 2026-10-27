@@ -50,6 +50,7 @@ pub(super) struct Firmware {
     mfp_mode: u32,
     mfp_fault: u8,
     mfp_missing: bool,
+    mfp_conversation: Option<crate::cyw43439::mfp_fixture::Conversation>,
     phy_profile: Option<(u32, u8)>,
     wide: Option<crate::cyw43439::phy_fixture::Wide>,
     vht: Option<crate::cyw43439::phy_fixture::Vht80>,
@@ -96,6 +97,7 @@ impl Firmware {
             mfp_mode: 0,
             mfp_fault: 0,
             mfp_missing: false,
+            mfp_conversation: None,
             phy_profile: None,
             wide: None,
             vht: None,
@@ -159,7 +161,11 @@ impl Firmware {
         }
     }
     fn request_ies(&self) -> Vec<u8> {
-        let mut ies = self.wpa_ie.clone().unwrap_or_default();
+        let mut ies = self
+            .mfp_conversation
+            .as_ref()
+            .and_then(|p| p.request.clone())
+            .unwrap_or_else(|| self.wpa_ie.clone().unwrap_or_default());
         if let Some(vht) = &self.vht {
             ies.extend_from_slice(&vht.request(
                 self.phy_profile.map_or(0, |p| p.0),
@@ -188,10 +194,15 @@ impl Firmware {
         ies
     }
     fn response_ies(&self) -> Vec<u8> {
+        let mut ies = self
+            .mfp_conversation
+            .as_ref()
+            .map_or(Vec::new(), |p| p.response());
         if let Some(vht) = &self.vht {
-            return vht.response(self.channel, self.phy_profile.map_or(0, |p| p.0));
+            ies.extend_from_slice(&vht.response(self.channel, self.phy_profile.map_or(0, |p| p.0)));
+            return ies;
         }
-        self.phy_profile.map_or(Vec::new(), |(chains, fault)| {
+        ies.extend_from_slice(&self.phy_profile.map_or(Vec::new(), |(chains, fault)| {
             if fault == 4 {
                 vec![0, 0]
             } else {
@@ -200,7 +211,8 @@ impl Firmware {
                     |wide| wide.response(self.channel, chains),
                 )
             }
-        })
+        }));
+        ies
     }
     pub(super) fn command(&mut self, command: u32, input: &[u8], maximum: u16) -> Vec<u8> {
         if self
@@ -304,7 +316,7 @@ impl Firmware {
                     };
                     out[..4].copy_from_slice(&channel.to_le_bytes());
                 } else if input.starts_with(b"mfp\0") {
-                    let mode = if self.mfp_fault == 1 && self.mfp_mode == 2 {
+                    let mode = if self.mfp_fault == 1 && self.mfp_mode != 0 {
                         0
                     } else {
                         self.mfp_mode
@@ -314,7 +326,7 @@ impl Firmware {
                     out[..4].copy_from_slice(
                         &(if self.mfp_fault == 4 {
                             1503
-                        } else if self.phy_profile.is_some() {
+                        } else if self.phy_profile.is_some() || self.mfp_conversation.is_some() {
                             self.request_ies().len() as u32
                         } else {
                             28u32
@@ -323,7 +335,7 @@ impl Firmware {
                     );
                     out[4..8].copy_from_slice(&(self.response_ies().len() as u32).to_le_bytes());
                 } else if input.starts_with(b"assoc_req_ies\0") {
-                    let ies = if self.phy_profile.is_some() {
+                    let ies = if self.phy_profile.is_some() || self.mfp_conversation.is_some() {
                         self.request_ies()
                     } else {
                         pmf_ie()
@@ -419,7 +431,10 @@ impl Firmware {
                         id,
                         self.secured,
                         self.channel,
-                        self.pmf_required,
+                        (
+                            self.pmf_required,
+                            self.mfp_conversation.as_ref().map(|p| p.ap.as_slice()),
+                        ),
                         self.phy_profile,
                         self.wide.as_ref(),
                         self.vht.as_ref(),
@@ -493,18 +508,32 @@ impl Firmware {
                 } else {
                     &[]
                 };
+                let expected_conversation = self
+                    .mfp_conversation
+                    .as_ref()
+                    .map(|p| p.expected_request(self.secured));
+                let expected = expected_conversation.as_deref().unwrap_or(expected);
                 assert_eq!(self.wpa_ie.as_deref(), Some(expected));
-                assert!(!self.pmf_required || self.mfp_supported && self.mfp_mode == 2);
+                assert!(self
+                    .mfp_conversation
+                    .as_ref()
+                    .is_none_or(|p| p.mode == self.mfp_mode));
+                assert!(
+                    self.mfp_conversation.is_some()
+                        || !self.pmf_required
+                        || self.mfp_supported && self.mfp_mode == 2
+                );
                 assert!(self.roam_off && (!self.secured || self.psk));
                 assert_eq!(self.wpa_auth, Some(if self.secured { 128 } else { 0 }));
                 assert_eq!(self.cipher, Some(if self.secured { 4 } else { 0 }));
                 assert_eq!(self.supplicant, Some(u32::from(self.secured)));
                 self.event(16, 0, 1, &[]);
-                if self.secured && self.keys_first && !self.hold_keys {
+                let keys = self.mfp_conversation.as_ref().is_none_or(|p| p.keys);
+                if self.secured && self.keys_first && !self.hold_keys && keys {
                     self.event(46, 6, 0, &[]);
                 }
                 self.event(0, 0, 0, &[]);
-                if self.secured && !self.keys_first && !self.hold_keys {
+                if self.secured && !self.keys_first && !self.hold_keys && keys {
                     self.event(46, 6, 0, &[]);
                 }
                 Vec::new()
@@ -528,6 +557,19 @@ impl Firmware {
         }
     }
     pub(super) fn hold_mfp_reply(&self, command: u32, input: &[u8]) -> bool {
+        if let Some(p) = &self.mfp_conversation {
+            use crate::cyw43439::mfp_fixture::Hold;
+            if command == 262
+                && match p.hold {
+                    Hold::None => false,
+                    Hold::Mode => input.starts_with(b"mfp\0"),
+                    Hold::Request => input.starts_with(b"assoc_req_ies\0"),
+                    Hold::Response => input.starts_with(b"assoc_resp_ies\0"),
+                }
+            {
+                return true;
+            }
+        }
         if let Some(vht) = &self.vht {
             use crate::cyw43439::phy_fixture::VhtFault;
             if command == 263
@@ -667,14 +709,16 @@ fn scan_result(
     id: u16,
     secured: bool,
     channel: u8,
-    mfp: bool,
+    mfp: (bool, Option<&[u8]>),
     phy: Option<(u32, u8)>,
     wide: Option<&crate::cyw43439::phy_fixture::Wide>,
     vht: Option<&crate::cyw43439::phy_fixture::Vht80>,
 ) -> Vec<u8> {
     let mut ies = vec![0, 4, b't', b'e', b's', b't'];
     if secured {
-        if mfp {
+        if let Some(ap) = mfp.1 {
+            ies.extend_from_slice(ap);
+        } else if mfp.0 {
             ies.extend_from_slice(&pmf_ie());
         } else {
             ies.extend_from_slice(&[
@@ -730,6 +774,20 @@ impl Handle {
             f.mfp_supported = supported;
             f.pmf_required = required;
             f.mfp_fault = fault;
+        });
+    }
+    pub(crate) fn mfp_conversation(
+        &self,
+        conversation: crate::cyw43439::mfp_fixture::Conversation,
+    ) {
+        self.change(|f| f.mfp_conversation = Some(conversation));
+    }
+    pub(crate) fn key_receipt(&self, foreign: bool) {
+        self.change(|f| {
+            f.event(46, 6, 0, &[]);
+            if foreign {
+                f.events.back_mut().unwrap()[48..54].copy_from_slice(&[2, 9, 8, 7, 6, 5]);
+            }
         });
     }
     pub(crate) fn phy_profile(&self, chains: u32, fault: u8) {

@@ -1467,3 +1467,50 @@ smoke!(
     smoke_phy_native_response_cannot_add_vht_width_tx_nss_or_gi,
     native_response_cannot_expand_offer
 );
+
+fn greenfield_directional_bounds() -> Result<(), &'static str> {
+    check!(
+        LocalHt::siso20(true, true).capability_body()[0] & 16 == 0,
+        "legacy constructor silently acquired greenfield"
+    );
+    for rx in [false, true] {
+        for tx in [false, true] {
+            for scan in [false, true] {
+                for reply in [false, true] {
+                    let local = LocalPhy::ht20(LocalHt::siso20(true, true).with_greenfield(rx, tx))
+                        .unwrap();
+                    let original = ap(false, false, None);
+                    let facts = bodies(&original);
+                    let mut cap = facts.ht_cap.unwrap();
+                    cap[0] = (cap[0] & !16) | (u8::from(scan) << 4);
+                    let bss = bss(cap, facts.ht_op.unwrap(), None, None);
+                    let mut plan = ready(&bss, local);
+                    check!(
+                        plan.offered_phy().unwrap().ht().rx_greenfield() == rx,
+                        "AP receive facts narrowed local greenfield decoder"
+                    );
+                    cap[0] = (cap[0] & !16) | (u8::from(reply) << 4);
+                    let response_bss = self::bss(cap, facts.ht_op.unwrap(), None, None);
+                    check!(
+                        plan.association_response(&response(&response_bss)) == Ok(Some(7)),
+                        "greenfield response did not retain HT geometry/security"
+                    );
+                    let ht = plan.negotiated_phy().unwrap().ht();
+                    check!(
+                        ht.rx_greenfield() == rx && ht.tx_greenfield() == (tx && scan && reply),
+                        "greenfield TX escaped local/scan/response intersection"
+                    );
+                    check!(
+                        (ht.local_capability()[0] & 16 != 0) == rx,
+                        "TX/AP greenfield changed local advertised receive promise"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+smoke!(
+    smoke_phy_greenfield_directional_local_offer_and_response_bounds,
+    greenfield_directional_bounds
+);

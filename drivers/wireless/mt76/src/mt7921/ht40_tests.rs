@@ -171,7 +171,7 @@ fn mt76_ht40_native_domain_channel_rlm_peer_and_response_geometry() -> TestResul
             let peer = frames
                 .iter()
                 .find(|(_, f)| f.len() >= 196 && f[34..36] == [3, 0] && f[43] == 7 && f[65] == 1);
-            if peer.is_none_or(|(_, f)| f[188..196] != [9, 0, 8, 0, 103, 0, 0, 0] || f[184] != 1) {
+            if peer.is_none_or(|(_, f)| f[188..196] != [9, 0, 8, 0, 119, 0, 0, 0] || f[184] != 1) {
                 return TestResult::Fail("HT40/SGI40 native peer or independent SMPS");
             }
             let domain = frames.iter().find(|(_, f)| f.len() == 92 && f[36] == 15);

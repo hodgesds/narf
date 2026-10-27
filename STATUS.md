@@ -393,6 +393,25 @@ and all four btrfs postflights pass. Tokei15 measures6,859 net additional
 Rust code lines, including tests, across `drivers/wireless`, `wireless` and
 `verification/wifi-fixtures`:368,862 to375,721. No binary assets were added.
 
+The same-branch continuation adds independently gated ath10k SGI40, separately
+signed RTL8188EU HT20/LGI MCS0–7 with whole RX A-MSDU, directional MediaTek HT
+greenfield/native mode3, and bounded CYW43439/BCM43602 optional-PMF CONNECT.
+Native request/response, actual executable/factory/program authority, occupied
+power, key/replay and final receive-publication checks remain mandatory.
+Optional PMF with an MFPC AP omitting response RSNE remains open until a genuine
+native negotiated-state proof exists. Wider software features and physical
+qualification remain open.
+
+All45 new native/shared smokes pass on each architecture. ARM's complete selected
+scope passes1994/0 fail/3 skip. X86 has2464 distinct passing cases and9 skips
+across the complete scope and affected-family reruns: three fixture failures
+were corrected without weakening production gates, including actual old-key
+CCMP and proposed-key MIC verification during USB rekey. Both production boots,
+all four btrfs postflights, both-architecture debug/release builds, strict
+production/test and CI-context Clippy, formatting and metadata diagnostics pass.
+Tokei15 measures4,427 net additional Rust code lines including tests in the same
+scope:375,721 to380,148 across855 Rust files. No binary assets were added.
+
 The preceding station power-save continuation added ordinary firmware station power save to the
 common CYW43439/BCM43602 owner. PM_FAST/PM_OFF and the default sleep-retention
 commands are serialized with station control; partial failure or cancellation

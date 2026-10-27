@@ -564,6 +564,7 @@ impl<R: Fullmac> Station<R> {
             self.tx_command(grant, 26, &join).await?;
             let deadline = narf_time::Deadline::after_ms(15000);
             let (mut associated, mut keys) = (false, !secure);
+            let mut protection_verified = false;
             let mut drain_batches = 0;
             loop {
                 self.check_grants(core::slice::from_ref(&grant))?;
@@ -618,10 +619,11 @@ impl<R: Fullmac> Station<R> {
                         // Re-observe a current FIFO/ring idle sample first.
                         continue;
                     }
-                    if protection.required() && !self.mfp_verified {
-                        self.verify_management_protection(grant, request.bssid, protection)
+                    if protection.verify() && !protection_verified {
+                        self.mfp_verified = self
+                            .verify_management_protection(grant, request.bssid, protection)
                             .await?;
-                        self.mfp_verified = true;
+                        protection_verified = true;
                         // Queries can drain new events/data. Require another
                         // genuine idle fence before publishing the host port.
                         continue;

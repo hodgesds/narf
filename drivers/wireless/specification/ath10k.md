@@ -10,8 +10,10 @@
 > Raw-capable non-PFC images can publish a retained legacy/HT20
 > station interface with Open/WPA2, bounded native packet progress and terminal
 > disconnect. This checkpoint adds conditional non-DFS SISO HT40 with LGI40,
-> retained executable/BDF authority and native RTS/CTS intent. The new cases
+> retained executable/BDF authority and native RTS/CTS intent. Those preceding cases
 > pass both-architecture native suites; matched IDs confer no board qualification.
+> The separately gated SGI40 extension passes nine native cases on both
+> architectures; physical qualification remains open.
 
 ## 1. Purpose & scope
 
@@ -171,7 +173,8 @@ remain separate profiles.
   RF-chain facts with the shared typed `JoinPlan::prepare_with_phy` offer and
   response. Linux `mac.c::ath10k_get_ht_cap` makes 20/40 support available with
   `WMI_HT_CAP_ENABLED`; the independent HT40-SGI capability is not inferred from
-  SGI20. This profile advertises MCS0..7, LGI40 and optional qualified SGI20,
+  SGI20. This profile advertises MCS0..7, LGI40, optional qualified SGI20 and
+  separately gated SGI40 as described below,
   without GF, LDPC, STBC or an extra spatial stream. Only the pairs
   5180/5200, 5220/5240, 5745/5765 and 5785/5805 MHz, in either primary order,
   are selected. The actual board/OTP calibration path, immutable EEPROM
@@ -187,13 +190,50 @@ remain separate profiles.
   pair or HT40 protection mode fails; no unproved VDEV restart or header rewrite
   relabels that owner. AP HT capability/operation changes after association close
   it. Native RX accepts 20-MHz PPDUs within a selected40 profile, admits40 only
-  there, and rejects SGI40, GF and unsupported MCS before replay/PN commitment.
+  there, and rejects an unadvertised GI, GF and unsupported MCS before replay/PN commitment.
   `SCAN_CHAN_LIST` programs the two qualified constituents with ALLOW_HT and
   HT40_PLUS only on its lower channel row. `VDEV_START` separately carries the
   actual primary, mean center1, center2=0, 11NA-HT40 mode6 and ALLOW_HT; it does
   not misuse the inventory's HT40_PLUS bit. PEER_ASSOC carries BW40/RC-CW40 and
   the response-bound rates on all six dialects. PPDU HT-SIG width and GI retain
   their native meanings through RX BA/reorder and software CCMP.
+- SGI40 is independently enabled only by actual SERVICE_READY
+  `WMI_HT_CAP_HT40_SGI` (0x0800), alongside HT enablement and the checked chain
+  count. `WMI_HT_CAP_HT20_SGI` (0x0002), HT40 width, the PCI tuple and a peer's
+  capabilities cannot substitute for it. The per-band local HT body carries
+  IEEE SGI40 bit0x0040 only in the bounded 5-GHz HT40 profile; the 2.4-GHz/HT20
+  body never inherits it. Both GI directions follow the real firmware fact.
+  The original scan and actual association response additionally bound TX GI;
+  a response cannot restore a GI absent from the scan offer. Local RX uses the
+  exact promise sent in our association request and is not narrowed by an AP's
+  independent RX-GI field. A genuine20 fallback rebuilds the local capability,
+  clears width40 and SGI40 in the actual request/native peer record, and does
+  not invent SGI20 for SGI40-only firmware.
+  Linux `mac.c::ath10k_get_ht_cap`, `ath10k_peer_assoc_h_ht`,
+  `wmi.h::WMI_HT_CAP_HT40_SGI` and
+  `net/mac80211/ht.c::ieee80211_ht_cap_ie_to_sta_ht_cap` define the source
+  contract: PEER_ASSOC's width/GI capabilities are limited by local and peer
+  facts before firmware rate control. The retained original AP bodies remain
+  unchanged for response/beacon binding. All six dialects program the negotiated
+  native `peer_ht_caps`, RC-CW40=0x02 and RC-SGI=0x04. The single RC-SGI flag
+  permits any admitted GI, including qualified SGI20 fallback inside a40-MHz
+  profile; individual native capability bits prevent that flag from enabling
+  SGI40 or SGI20 without their distinct bounds. Other PHY/coding/stream limits
+  are unchanged.
+  Actual HT/HT-TXBF PPDU metadata selects independent advertised RX-SGI20 and
+  RX-SGI40 bounds using the HT-SIG width and GI bits, before BA sequence or
+  CCMP replay admission. The existing FIRST/MIDDLE/LAST owner carries a proven
+  SGI40 PPDU through reorder; LAST or a rejected next FIRST cannot lend its
+  PHY fact to an orphan. Invalid GI/width/MCS consumes no packet PN. Source,
+  whole occupied40 power, generation, key, terminal receipt and final separate
+  IPC/stack boundaries remain those of the existing retained owner.
+  No synthetic firmware ACK, per-GI measurement, calibration or authority input
+  is introduced. The actual retained vendor BDF/OTP calibration, firmware's
+  explicit SGI40 capability, immutable factory limits and full occupied-channel
+  host ceiling remain mandatory. Linux uses that same calibration/power owner
+  when exposing SGI40; ath10k has no Intel-style legacy-only measured-emitter
+  record to relabel. These source-backed gates grant no physical RF or board
+  interoperability claim.
 - `wmi_runtime::StationProtection { rts_threshold: Option<u16>,
   cts_protection: bool }` and `pci::set_station_protection` submit native VDEV
   protection intent. None encodes the disabled threshold `u32::MAX`; finite
@@ -787,8 +827,8 @@ concurrent closure and preference replacement. `NO_PS` images reject requests
 before I/O. These checks establish submitted control intent; physical DTIM,
 buffering, wake latency and energy behavior remain hardware acceptance work.
 
-This checkpoint authors 22 additional native smokes, pending coordinated software
-execution: nine under `drivers/wireless/ath10k/ht40`, eight under
+The preceding checkpoint added 22 native smokes: nine under
+`drivers/wireless/ath10k/ht40`, eight under
 `drivers/wireless/ath10k/source` and five under
 `drivers/wireless/ath10k/protection`. HT40 cases compose all six dialects with
 Open/WPA2, the actual kernel DHCP/IP path, PS and terminal retirement; they also
@@ -803,10 +843,25 @@ following RX, each command's cancellation/current-source/current-policy fence
 and threshold 0/2347/disabled bounds. All22 new cases pass the coordinated
 both-architecture software suites; no physical or performance result is claimed.
 
+The SGI40 extension passes nine more native smokes on both architectures under
+`drivers/wireless/ath10k/sgi40`. Actual
+per-dialect SERVICE_READY packets feed the production capability parser before
+Device capability capture, including SGI40-only and HT-disabled cases. Literal
+per-band/request HT bodies, peer capability/RC fields, native RX HT-SIG and
+independent CCMP packets check directional scan/response narrowing and truthful
+local20 fallback. Composed Open/WPA2 tests run the real kernel DHCP/IP path,
+initial PS and terminal retirement across both primary orders and all six WMI
+dialects. Other cases exercise malformed GI/MCS before same-PN retry, native BA
+FIRST proof/reordering/LAST retirement, seven native cancellation points,
+held WMM/M4 source and occupied-power revocation, and final allocation/callback
+boundaries with prior-authorized IPC distinguished from later revocation.
+Reinstalling source or restoring policy cannot reopen the failed owner.
+
 The per-profile ledger below distinguishes actual reachability from a codec or
 ID. `R` denotes the shared retained legacy/HT20 Open/WPA2/RAW/non-PFC station
-backend; `H` denotes this checkpoint's conditional 5-GHz LGI40/SISO extension,
-validated in native software suites. Both depend on actual image capability/service
+backend; `H` denotes the conditional 5-GHz HT40/SISO extension whose LGI40 path
+is validated in native software suites. Its separately gated SGI40 addition
+also passes both-architecture native cases. Both depend on actual image capability/service
 facts, matching board/OTP data, current PCI/source/host authority and successful
 native receipts; neither asserts that every vendor image for that tuple is
 usable. The six WMI dialects are selected from the image's real API facts,
@@ -833,7 +888,7 @@ not inferred from this PCI table. `profile::PROFILES`, `hw::HwRev::from_pci_id`,
 | AR9462,168c:0034 | none | Explicit pre-MMIO rejection; ath9k ownership, not a missing ath10k station implementation. |
 
 Across the reached rows, concrete remaining software packages are 2.4-GHz HT40
-coexistence/occupied-power ownership; separately advertised/native SGI40;
+coexistence/occupied-power ownership;
 additional streams and directional LDPC/STBC where actual hardware/firmware
 supports them; response-bound VHT and wider geometry; native TX BA, independent
 multi-packet DMA/completion and aggregate retries; PFC fetch/queue ownership;

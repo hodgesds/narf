@@ -121,6 +121,10 @@ pub fn parse_image(chip: ChipFamily, blob: &[u8]) -> Result<(FirmwareInfo, &[u8]
 /// index=0. The trait requires exact-count checking at the owner boundary.
 #[async_trait::async_trait]
 pub trait ControlIo: Send + Sync {
+    #[cfg(any(test, feature = "kernel-test"))]
+    fn inert_source_fixture(&self) -> bool {
+        false
+    }
     fn identity(&self) -> Option<(u16, u16)> {
         None
     }
@@ -181,6 +185,70 @@ pub struct Owner<I: ControlIo> {
     calibration: IrqSafeSpinLock<Option<CalibrationInfo>>,
     endpoints: IrqSafeSpinLock<Option<super::device_init::Endpoints>>,
     runtime_taken: AtomicBool,
+    executable: IrqSafeSpinLock<Option<Executable>>,
+}
+
+/// Identity of the exact immutable image uploaded by this retained owner.
+/// The cap is retained after loading; a filename or digest alone is not current authority.
+#[derive(Clone, Copy)]
+pub(super) struct Executable {
+    pub(super) digest: [u8; 32],
+    source: Option<narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>>,
+    inert_fixture: bool,
+}
+impl Executable {
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn source_cap(
+        &self,
+    ) -> Option<narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>> {
+        self.source
+    }
+    fn new(
+        bytes: &[u8],
+        source: Option<
+            narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+        >,
+        inert_fixture: bool,
+    ) -> Self {
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        hash.update(bytes);
+        Self {
+            digest: hash.finalize(),
+            source,
+            inert_fixture,
+        }
+    }
+    pub(super) fn invoke<T>(&self, operation: impl FnOnce() -> T) -> Result<T, Error> {
+        use narf_capabilities::{Cap, CapError, CapOp, Read};
+        struct Current<F>(F);
+        impl<T, F: FnOnce() -> T> CapOp<narf_firmware::FirmwareBlob, Read> for Current<F> {
+            type Output = T;
+            fn execute(self, _: &Cap<narf_firmware::FirmwareBlob, Read>) -> Result<T, CapError> {
+                Ok((self.0)())
+            }
+        }
+        if let Some(cap) = self.source {
+            return cap
+                .invoke(Current(operation))
+                .map_err(|_| Error::Firmware(FirmwareError::AuthorityRevoked));
+        }
+        #[cfg(any(test, feature = "kernel-test"))]
+        if self.inert_fixture {
+            return Ok(operation());
+        }
+        Err(Error::Firmware(FirmwareError::AuthorityRevoked))
+    }
+    pub(super) async fn fence<T>(
+        &self,
+        future: impl core::future::Future<Output = Result<T, Error>>,
+    ) -> Result<T, Error> {
+        let mut future = core::pin::pin!(future);
+        core::future::poll_fn(|cx| {
+            self.invoke(|| future.as_mut().poll(cx))
+                .unwrap_or_else(|e| core::task::Poll::Ready(Err(e)))
+        })
+        .await
+    }
 }
 
 impl<I: ControlIo> core::fmt::Debug for Owner<I> {
@@ -219,6 +287,7 @@ impl<I: ControlIo> Owner<I> {
             calibration: IrqSafeSpinLock::new(None),
             endpoints: IrqSafeSpinLock::new(None),
             runtime_taken: AtomicBool::new(false),
+            executable: IrqSafeSpinLock::new(None),
             status: IrqSafeSpinLock::new(Status {
                 stage: Stage::Detected,
                 error: None,
@@ -309,8 +378,10 @@ impl<I: ControlIo> Owner<I> {
             .map_err(Error::Firmware)?;
         let _ = parse_image(self.chip, &asset.bytes)?;
         let _attempt = self.begin()?;
-        let result = self
-            .run_device_before(&asset.bytes, narf_time::Deadline::after_ms(30_000))
+        let executable = Executable::new(&asset.bytes, Some(asset.cap), false);
+        *self.executable.lock() = Some(executable);
+        let result = executable
+            .fence(self.run_device_before(&asset.bytes, narf_time::Deadline::after_ms(30_000)))
             .await;
         self.finish(result)
     }
@@ -350,6 +421,27 @@ impl<I: ControlIo> Owner<I> {
         *self.factory.lock()
     }
 
+    pub(super) fn executable(&self) -> Option<Executable> {
+        *self.executable.lock()
+    }
+    /// Resolve the exact optional measurement request without modifying the
+    /// parked radio or inventing an envelope. This is not an HT grant.
+    pub fn ht20_request(&self) -> Result<super::Ht20Request, Error> {
+        let executable = self.executable().ok_or(Error::RuntimeState)?;
+        executable.invoke(|| ())?;
+        let factory = self.factory().ok_or(Error::RuntimeState)?;
+        let (vid, pid) = self.usb_identity().ok_or(Error::RuntimeState)?;
+        let calibration = super::power_policy::Calibration::load_registered(factory, vid, pid)
+            .map_err(|_| Error::RuntimeState)?;
+        let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::RuntimeState)?;
+        let permission = calibration
+            .permission(&domain, 1)
+            .map_err(|_| Error::RuntimeState)?;
+        let base = super::wmm_runtime::Proof::registered(factory, vid, pid, permission)
+            .map_err(|_| Error::RuntimeState)?;
+        Ok(super::ht_runtime::request(&base, executable))
+    }
+
     pub fn calibration(&self) -> Option<CalibrationInfo> {
         *self.calibration.lock()
     }
@@ -387,6 +479,13 @@ impl<I: ControlIo> Owner<I> {
         deadline: narf_time::Deadline,
     ) -> Result<FirmwareInfo, Error> {
         let (info, payload) = parse_image(self.chip, blob)?;
+        if self.executable.lock().is_none() {
+            #[cfg(any(test, feature = "kernel-test"))]
+            let inert = self.io.inert_source_fixture();
+            #[cfg(not(any(test, feature = "kernel-test")))]
+            let inert = false;
+            *self.executable.lock() = Some(Executable::new(blob, None, inert));
+        }
         self.stage(Stage::Validated);
         narf_time::timeout(deadline, async {
             let mut config = alloc::vec![0; 4096];
@@ -454,7 +553,13 @@ impl<I: ControlIo> Owner<I> {
 
     async fn read<const N: usize>(&self, addr: u16) -> Result<[u8; N], Error> {
         let mut bytes = [0; N];
-        let count = self.io.read(addr, &mut bytes).await.map_err(Error::Usb)?;
+        let executable = self.executable();
+        let read = async { self.io.read(addr, &mut bytes).await.map_err(Error::Usb) };
+        let count = if let Some(executable) = executable {
+            executable.fence(read).await?
+        } else {
+            read.await?
+        };
         if count != N {
             return Err(Error::ShortTransfer);
         }
@@ -470,7 +575,14 @@ impl<I: ControlIo> Owner<I> {
         Ok(u32::from_le_bytes(self.read(addr).await?))
     }
     async fn write(&self, addr: u16, bytes: &[u8]) -> Result<(), Error> {
-        if self.io.write(addr, bytes).await.map_err(Error::Usb)? != bytes.len() {
+        let executable = self.executable();
+        let write = async { self.io.write(addr, bytes).await.map_err(Error::Usb) };
+        let count = if let Some(executable) = executable {
+            executable.fence(write).await?
+        } else {
+            write.await?
+        };
+        if count != bytes.len() {
             return Err(Error::ShortTransfer);
         }
         Ok(())

@@ -4,7 +4,7 @@ use crate::mt7921::association::Security;
 
 pub(super) fn elements(channel: u8) -> Vec<u8> {
     let mut ht = [0; 26];
-    ht[0] = 0x77; // AP SGI20, dynamic SMPS, LDPC and40; greenfield is not local.
+    ht[0] = 0x77; // AP SGI20, dynamic SMPS, LDPC, greenfield and40.
     ht[2] = 30; // AP RX factor2/density7, not an active BA agreement.
     ht[3] = 0xff;
     ht[4] = 0xff; // Actual two-stream AP; native NIC facts bound the local offer.
@@ -77,7 +77,7 @@ fn mt76_ht20_native_peer_rlm_rates_and_bound_association() -> TestResult {
                     && frame.get(10..16) == Some(super::amsdu_rx_tests::OWN.as_slice())
             });
             let mut expected = [0; 26];
-            expected[0] = 45;
+            expected[0] = 61;
             expected[1] = 1;
             expected[2] = 28;
             expected[3] = 255;
@@ -108,7 +108,7 @@ fn mt76_ht20_native_peer_rlm_rates_and_bound_association() -> TestResult {
                 || peer[118..124] != [72, 0, 1, 1, 5, 0]
                 || peer[168..180] != [2, 0, 12, 0, 1, 1, 2, 7, 0, 0, 0, 0]
                 || peer[180..188] != [13, 0, 8, 0, 1, 0, 0, 0]
-                || peer[188..196] != [9, 0, 8, 0, 37, 0, 0, 0]
+                || peer[188..196] != [9, 0, 8, 0, 53, 0, 0, 0]
             {
                 return TestResult::Fail(
                     "HT/PHY/RA/WTBL/SMPS native fields or stream intersection",
@@ -190,7 +190,7 @@ fn mt76_ht20_sgi_intersects_bound_response_without_changing_width_or_smps() -> T
                             0,
                             8,
                             0,
-                            if scan_sgi && response_sgi { 37 } else { 5 },
+                            if scan_sgi && response_sgi { 53 } else { 21 },
                             0,
                             0,
                             0,

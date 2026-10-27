@@ -13,6 +13,8 @@ pub(crate) struct Profile {
     rx_ldpc: bool,
     rx_stbc: bool,
     tx_ldpc: bool,
+    rx_greenfield: bool,
+    tx_greenfield: bool,
 }
 
 /// One RX/TX stream, HT20 with optional short GI, no LDPC/STBC/greenfield, 3839-byte
@@ -39,6 +41,7 @@ impl Profile {
         let mut capability = [0; 26];
         let cap = (n.peer_capability() & 12)
             | u16::from(n.tx_ldpc())
+            | (u16::from(n.tx_greenfield()) << 4)
             | (u16::from(n.tx_sgi20()) << 5)
             | if width != 0 {
                 2 | (u16::from(n.tx_sgi40()) << 6)
@@ -70,6 +73,8 @@ impl Profile {
             rx_ldpc: n.rx_ldpc(),
             rx_stbc: n.rx_stbc(),
             tx_ldpc: n.tx_ldpc(),
+            rx_greenfield: n.rx_greenfield(),
+            tx_greenfield: n.tx_greenfield(),
         }
     }
     pub(crate) fn prepare(info: RadioInfo, bss: &ScanBss) -> Result<Self, Error> {
@@ -129,6 +134,8 @@ impl Profile {
             rx_ldpc: false,
             rx_stbc: false,
             tx_ldpc: false,
+            rx_greenfield: false,
+            tx_greenfield: false,
         })
     }
     pub(crate) fn transmit_mcs_mask(self) -> [u8; 10] {
@@ -152,6 +159,9 @@ impl Profile {
     pub(crate) fn transmit_ldpc(self) -> bool {
         self.tx_ldpc
     }
+    pub(crate) fn receive_greenfield(self) -> bool {
+        self.rx_greenfield
+    }
     pub(crate) fn ampdu(self) -> u8 {
         self.capability[2] & 31
     }
@@ -162,6 +172,7 @@ impl Profile {
         let cap = u16::from_le_bytes(self.capability[..2].try_into().unwrap());
         (cap & (12 | 32))
             | u16::from(self.tx_ldpc)
+            | (u16::from(self.tx_greenfield) << 4)
             | if self.secondary.is_some() {
                 2 | (u16::from(self.short_gi()) << 6)
             } else {

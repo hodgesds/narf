@@ -41,8 +41,8 @@ pub(super) fn enable(h: &Harness) -> Result<(), &'static str> {
         f.ht_offer = Some(ies.clone());
         f.ht_response = Some(ies);
         f.ht_secondary = Some(s);
-        f.ht_capabilities = 0x006e;
-        f.ht_sgi = false; // LGI40, independent of advertised RX SGI20.
+        f.ht_capabilities = 0x002e; // Local has no SGI40; raw AP body remains006e.
+        f.ht_sgi = true; // RC permits qualified SGI20 fallback; native bit40 stays clear.
         f.rx_phy = Some((8, 0x87, 0));
     });
     Ok(())
@@ -180,6 +180,7 @@ fn smoke_ath10k_ht40_denied_secondary_selects_real_ht20_before_any_width_publica
             h.model(|m| {
                 let f = m.data.as_mut().unwrap();
                 f.ht_secondary = None;
+                f.ht_capabilities = 0x002c;
                 f.ht_sgi = true;
                 f.rx_phy = Some((8, 7, 0x80));
             });

@@ -3,14 +3,18 @@ use super::*;
 use crate::mt7921::association::{Security, TxPermission};
 
 #[derive(Clone, Copy)]
-enum Mode {
+pub(super) enum Mode {
     Ht20,
     Ht40,
     Vht(u8),
 }
 const OWN: [u8; 6] = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
 const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];
-fn prepared(mode: Mode, nss: u8, secure: bool) -> (Session<Model>, ScanBss, TxPermission) {
+pub(super) fn prepared(
+    mode: Mode,
+    nss: u8,
+    secure: bool,
+) -> (Session<Model>, ScanBss, TxPermission) {
     let chip = if matches!(mode, Mode::Vht(3)) {
         0x7922
     } else {
@@ -63,7 +67,12 @@ fn prepared(mode: Mode, nss: u8, secure: bool) -> (Session<Model>, ScanBss, TxPe
     let p = TxPermission::from_ap(&domain, info, &b).unwrap();
     (s, b, p)
 }
-fn join(s: &mut Session<Model>, b: &ScanBss, p: TxPermission, secure: bool) -> Result<u16, Error> {
+pub(super) fn join(
+    s: &mut Session<Model>,
+    b: &ScanBss,
+    p: TxPermission,
+    secure: bool,
+) -> Result<u16, Error> {
     run(s.associate_station(
         b,
         b"narf",
@@ -82,7 +91,7 @@ fn switch(f: &[u8]) -> bool {
 fn command(f: &[u8], id: u8) -> bool {
     f.len() >= 64 && f[36] == id && f[37] == 0xa0
 }
-fn associated(s: &Session<Model>) -> &[u8] {
+pub(super) fn associated(s: &Session<Model>) -> &[u8] {
     &s.backend
         .frames
         .iter()

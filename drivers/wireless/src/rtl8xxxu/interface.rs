@@ -39,6 +39,13 @@ struct State<C: ControlIo, B: PacketIo, E: Environment> {
     rx: Producer<Frame, RX_RING_N>,
     tx: Consumer<Frame, TX_RING_N>,
     pending: Option<Frame>,
+    epoch: u64,
+}
+struct Delivery {
+    frames: Vec<Vec<u8>>,
+    epoch: Arc<AtomicU64>,
+    generation: u64,
+    authority: super::receive_runtime::Authority,
 }
 impl<C: ControlIo, B: PacketIo, E: Environment> State<C, B, E> {
     fn clear_transmit(&mut self) {
@@ -91,7 +98,10 @@ pub struct Device<C: ControlIo, B: PacketIo, E: Environment> {
     mac: [u8; 6],
     up: AtomicBool,
     bssid: AtomicU64,
-    rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    closed: AtomicBool,
+    failed: Arc<AtomicBool>,
+    ht: bool,
+    rx: Arc<IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>>,
     tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 impl<C: ControlIo, B: PacketIo, E: Environment> core::fmt::Debug for Device<C, B, E> {
@@ -103,26 +113,40 @@ impl<C: ControlIo, B: PacketIo, E: Environment> core::fmt::Debug for Device<C, B
     }
 }
 impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
-    pub(super) fn new(name: &str, service: Service<C, B, E>) -> Self {
+    pub(super) fn new(name: &str, mut service: Service<C, B, E>) -> Self {
         let mac = service.local();
         let (rx, rx_consumer) = narf_ipc::channel();
         let (tx_producer, tx) = narf_ipc::channel();
+        let rx_consumer = Arc::new(IrqSafeSpinLock::new(Some(rx_consumer)));
+        let retire = rx_consumer.clone();
+        service.set_retirement(Arc::new(move || {
+            *retire.lock() = None;
+        }));
+        let failed = service.close_flag();
+        let ht = service.ht_enabled();
         Self {
             state: Mutex::new(State {
                 service,
                 rx,
                 tx,
                 pending: None,
+                epoch: 0,
             }),
             name: name.into(),
             mac,
             up: AtomicBool::new(false),
             bssid: AtomicU64::new(0),
-            rx: IrqSafeSpinLock::new(Some(rx_consumer)),
+            closed: AtomicBool::new(false),
+            failed,
+            ht,
+            rx: rx_consumer,
             tx: IrqSafeSpinLock::new(Some(tx_producer)),
         }
     }
     fn link(&self, peer: Option<[u8; 6]>) {
+        let peer = peer.filter(|_| {
+            !self.closed.load(Ordering::Acquire) && !self.failed.load(Ordering::Acquire)
+        });
         let mut packed = [0; 8];
         if let Some(peer) = peer {
             packed[..6].copy_from_slice(&peer);
@@ -142,51 +166,171 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
     /// Locks are released before stack dispatch: ARP/ND may immediately call
     /// the same device's transmit callback from this synchronous drain.
     pub(super) fn progress(&self) -> Vec<Vec<u8>> {
-        let Some(mut state) = self.state.try_lock() else {
-            return Vec::new();
-        };
+        self.progress_batch()
+            .map(|batch| batch.frames)
+            .unwrap_or_default()
+    }
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.failed.store(true, Ordering::Release);
+        *self.rx.lock() = None;
+        self.link(None);
+    }
+    fn refresh_receive(&self, state: &mut State<C, B, E>) {
+        if let Some((_, generation)) = state.service.receive_epoch() {
+            if state.epoch != generation {
+                let (producer, consumer) = narf_ipc::channel();
+                state.rx = producer;
+                *self.rx.lock() = Some(consumer);
+                state.epoch = generation;
+            }
+        }
+    }
+    fn progress_batch(&self) -> Option<Delivery> {
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut state = self.state.try_lock()?;
         let frames = match state.progress() {
             Ok(frames) => frames,
             Err(_) => {
-                self.link(None);
-                return Vec::new();
+                self.close();
+                return None;
             }
         };
-        self.link(state.service.connected_peer());
+        let authority = match state.service.current() {
+            Ok(p) => p,
+            Err(_) => {
+                self.close();
+                return None;
+            }
+        };
+        if authority
+            .invoke(|| self.link(state.service.connected_peer()))
+            .is_err()
+        {
+            self.close();
+            return None;
+        }
+        let (epoch, generation) = state.service.receive_epoch()?;
+        self.refresh_receive(&mut state);
+        if !state.service.receive_open() {
+            return None;
+        }
         for bytes in &frames {
             if let Ok(buffer) =
                 narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
             {
                 let mut frame = Frame::new(buffer, bytes.len() as u32);
                 frame.payload_mut().copy_from_slice(bytes);
-                let _ = state.rx.try_send(frame);
+                if authority
+                    .invoke(|| {
+                        if !self.closed.load(Ordering::Acquire)
+                            && !self.failed.load(Ordering::Acquire)
+                            && epoch.load(Ordering::Acquire) == generation
+                        {
+                            let _ = state.rx.try_send(frame);
+                        }
+                    })
+                    .is_err()
+                {
+                    self.close();
+                    return None;
+                }
             }
         }
-        frames
+        Some(Delivery {
+            frames,
+            epoch,
+            generation,
+            authority,
+        })
     }
     pub(super) fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
         if !self.up.load(Ordering::Acquire)
+            || self.closed.load(Ordering::Acquire)
+            || self.failed.load(Ordering::Acquire)
             || !transmit_admitted(bytes, self.mac)
             || !offloads_admitted(meta)
         {
             return Err(());
         }
+        let (authority, epoch, generation) = {
+            let state = self.state.try_lock().ok_or(())?;
+            if !state.service.receive_open() {
+                return Err(());
+            }
+            let authority = state.service.current().map_err(|_| self.close())?;
+            let (epoch, generation) = state.service.receive_epoch().ok_or(())?;
+            (authority, epoch, generation)
+        };
         let buffer = narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
             .map_err(|_| ())?;
         let mut frame = Frame::new(buffer, bytes.len() as u32);
         frame.payload_mut().copy_from_slice(bytes);
-        self.tx
-            .lock()
-            .as_mut()
-            .ok_or(())?
-            .try_send(frame)
-            .map_err(|_| ())
+        frame.set_tx_meta(meta);
+        authority
+            .invoke(|| {
+                if self.closed.load(Ordering::Acquire)
+                    || self.failed.load(Ordering::Acquire)
+                    || epoch.load(Ordering::Acquire) != generation
+                {
+                    return Err(());
+                }
+                self.tx
+                    .lock()
+                    .as_mut()
+                    .ok_or(())?
+                    .try_send(frame)
+                    .map_err(|_| ())
+            })
+            .map_err(|_| self.close())?
     }
     pub(super) fn drain(&self) -> bool {
-        let frames = self.progress();
-        let progress = !frames.is_empty();
-        for mut frame in frames {
-            narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
+        self.dispatch_with(|frame| narf_net::iface::on_rx_frame_from(&self.name, frame))
+    }
+    pub(super) fn dispatch_with(&self, mut callback: impl FnMut(&mut [u8])) -> bool {
+        let Some(batch) = self.progress_batch() else {
+            return false;
+        };
+        let mut progress = false;
+        for mut frame in batch.frames {
+            let Some(state) = self.state.try_lock() else {
+                break;
+            };
+            let current = state
+                .service
+                .receive_epoch()
+                .is_some_and(|(epoch, generation)| {
+                    Arc::ptr_eq(&epoch, &batch.epoch) && generation == batch.generation
+                })
+                && state.service.receive_open();
+            if !current {
+                break;
+            }
+            if state.service.current().is_err() {
+                self.close();
+                break;
+            }
+            drop(state);
+            // No owner/ring/admission lock survives into a reentrant stack callback.
+            let result = batch.authority.invoke(|| {
+                if self.closed.load(Ordering::Acquire)
+                    || self.failed.load(Ordering::Acquire)
+                    || batch.epoch.load(Ordering::Acquire) != batch.generation
+                {
+                    return false;
+                }
+                callback(&mut frame);
+                true
+            });
+            match result {
+                Ok(delivered) => progress |= delivered,
+                Err(_) => {
+                    self.close();
+                    break;
+                }
+            }
         }
         progress
     }
@@ -311,13 +455,19 @@ pub async fn attach(
         .permission(&domain, 1)
         .map_err(|_| service_runtime::Error::Profile)?;
     let receive = ReceivePermission::from_domain(&domain).map_err(service_runtime::Error::Radio)?;
+    let profile = Receiver::<UsbControl, UsbIo>::resolve_profile(&firmware, power)
+        .map_err(service_runtime::Error::Radio)?;
     // Reserve the singleton before claiming firmware or posting persistent RX.
     // A failed/cancelled claim is terminal; a new software object cannot retry.
     CLAIMED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|_| service_runtime::Error::State)?;
-    let receiver =
+    let mut receiver =
         Receiver::new(firmware, UsbIo::new(usb), receive).map_err(service_runtime::Error::Radio)?;
+    receiver
+        .prepare_profile(profile)
+        .await
+        .map_err(service_runtime::Error::Radio)?;
     let service = Service::start(receiver, power, NativeEnvironment).await?;
     let name = narf_net::iface::reserve_name("wlan%d");
     let device = Arc::new(Device::new(name, service));
@@ -400,12 +550,21 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
             }],
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
-                ht_supported: false,
+                ht_supported: self.ht && !self.closed.load(Ordering::Acquire),
                 vht_supported: false,
                 he_supported: false,
                 eht_supported: false,
             },
         }
+    }
+    fn phy_capabilities(&self, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
+        (band == 2400 && self.ht && !self.closed.load(Ordering::Acquire)).then(|| {
+            narf_wireless::iface::PhyCapabilities {
+                ht: narf_wireless::association::phy::LocalHt::siso20(false, false)
+                    .capability_body(),
+                vht: None,
+            }
+        })
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
         let dwell = validate_scan(&request)?;
@@ -438,6 +597,9 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
             .collect())
     }
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(WirelessError::HardwareError);
+        }
         if request.frequency_mhz != 2412 || request.channel != 1 {
             return Err(WirelessError::NotSupported);
         }
@@ -455,10 +617,27 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
             .service
             .connect(request.bssid, &request.ssid, mode, pmk, &request.ie)
             .await;
-        self.link(state.service.connected_peer());
+        if result.is_ok() {
+            self.refresh_receive(&mut state);
+            match state.service.current().and_then(|authority| {
+                authority
+                    .invoke(|| self.link(state.service.connected_peer()))
+                    .map_err(service_runtime::Error::Radio)
+            }) {
+                Ok(()) => (),
+                Err(_) => {
+                    self.close();
+                    return Err(WirelessError::HardwareError);
+                }
+            }
+        } else {
+            self.close();
+        }
         result.map_err(wireless_error)
     }
     async fn disassociate(&self) -> Result<(), WirelessError> {
+        self.closed.store(true, Ordering::Release);
+        *self.rx.lock() = None;
         self.link(None);
         let mut state = self.state.lock().await;
         // A previous association/progress owner may have published up while
@@ -507,8 +686,8 @@ pub(super) mod publication_test {
         }
         // The same publication as progress(), still under its state guard.
         device.link(state.service.connected_peer());
-        if !device.link_up() || device.connected_bssid() != Some(peer) {
-            return Err("EU previous publisher did not recreate the interleaving");
+        if device.link_up() || device.connected_bssid().is_some() {
+            return Err("EU terminal publication fence admitted the old publisher");
         }
         drop(state);
         disconnect

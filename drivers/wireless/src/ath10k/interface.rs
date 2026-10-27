@@ -265,6 +265,26 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         }
         self.enqueue(bytes, meta)
     }
+    pub(super) fn phy_capabilities(
+        &self,
+        band: u32,
+    ) -> Option<narf_wireless::iface::PhyCapabilities> {
+        if !self
+            .frequencies
+            .iter()
+            .any(|frequency| band == 2400 && *frequency < 3000 || band == 5000 && *frequency > 3000)
+        {
+            return None;
+        }
+        Some(narf_wireless::iface::PhyCapabilities {
+            ht: if band == 5000 {
+                self.ht40_capabilities?
+            } else {
+                self.ht_capabilities?
+            },
+            vht: None,
+        })
+    }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn generation_for_test(&self) -> u64 {
         self.generation
@@ -1022,21 +1042,7 @@ pub(super) async fn wait_publish(
 #[async_trait::async_trait]
 impl WirelessNetIface for Native {
     fn phy_capabilities(&self, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
-        if !self
-            .frequencies
-            .iter()
-            .any(|frequency| band == 2400 && *frequency < 3000 || band == 5000 && *frequency > 3000)
-        {
-            return None;
-        }
-        Some(narf_wireless::iface::PhyCapabilities {
-            ht: if band == 5000 {
-                self.ht40_capabilities?
-            } else {
-                self.ht_capabilities?
-            },
-            vht: None,
-        })
+        Device::phy_capabilities(self, band)
     }
     fn power_save_default(&self) -> Option<bool> {
         self.ps_supported.then_some(false)

@@ -22,6 +22,8 @@ mod ht40_tests;
 mod ht_tests;
 #[path = "mfp_tests.rs"]
 mod mfp_tests;
+#[path = "optional_mfp_tests.rs"]
+mod optional_mfp_tests;
 #[path = "power_save_tests.rs"]
 mod power_save_tests;
 #[path = "vht_tests.rs"]
@@ -59,6 +61,7 @@ struct Harness {
     bus: Handle,
     name: String,
     channel: u8,
+    association_ies: Vec<u8>,
 }
 impl Harness {
     fn new(version: u32, secured: bool, keys_first: bool) -> Result<Self, &'static str> {
@@ -304,6 +307,7 @@ impl Harness {
             bus,
             name,
             channel,
+            association_ies: Vec::new(),
         })
     }
     fn scan(&self) -> Result<(), &'static str> {
@@ -350,6 +354,7 @@ impl Harness {
         let mut request = Self::request(secured);
         request.channel = u32::from(self.channel);
         request.frequency_mhz = self.frequency();
+        request.ie = self.association_ies.clone();
         ready(self.device.associate(request))?.map_err(|_| "PCIe native offloaded association")?;
         if self.device.connected_bssid() != Some(AP)
             || !self.device.link_up()

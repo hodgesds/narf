@@ -68,6 +68,7 @@ fn local_ht(info: RadioInfo) -> LocalHt {
     .expect("fixed implemented HT companion profile")
     .with_ldpc(info.capabilities.phy.rx_ldpc, info.capabilities.phy.tx_ldpc)
     .with_rx_stbc(info.capabilities.phy.rx_stbc)
+    .with_greenfield(true, true)
 }
 pub(crate) fn ht_capability(info: RadioInfo) -> [u8; 26] {
     local_ht(info).capability_body()
@@ -100,6 +101,7 @@ pub(crate) fn ht_fallback(info: RadioInfo, wide: bool) -> Result<LocalPhy, Error
         .map_err(|_| Error::UnsupportedFirmware)?
         .with_ldpc(info.capabilities.phy.rx_ldpc, info.capabilities.phy.tx_ldpc)
         .with_rx_stbc(info.capabilities.phy.rx_stbc);
+        let ht = ht.with_greenfield(true, true);
         LocalPhy::ht20(ht).map_err(|_| Error::UnsupportedFirmware)
     }
 }
@@ -192,6 +194,7 @@ pub(crate) struct Profile {
     tx_streams: u8,
     rx_ldpc: bool,
     rx_stbc: bool,
+    rx_greenfield: bool,
 }
 impl Profile {
     pub(crate) fn negotiated(
@@ -254,6 +257,7 @@ impl Profile {
                 .max(super::ht20::Profile::from_shared(n.ht(), width).transmit_streams()),
             rx_ldpc: vht.rx_ldpc(),
             rx_stbc: vht.rx_stbc(),
+            rx_greenfield: n.ht().rx_greenfield(),
         })
     }
     pub(crate) fn width(self) -> u8 {
@@ -326,21 +330,29 @@ impl Profile {
             self.width,
             phy,
             true,
-            self.rx_streams,
-            self.rx_ldpc,
-            self.rx_stbc,
-            false,
+            RxLimits {
+                streams: self.rx_streams,
+                ldpc: self.rx_ldpc,
+                stbc: self.rx_stbc,
+                greenfield: self.rx_greenfield,
+                cck: false,
+            },
         )
     }
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RxLimits {
+    pub streams: u8,
+    pub ldpc: bool,
+    pub stbc: bool,
+    pub greenfield: bool,
+    pub cck: bool,
 }
 pub(crate) fn receive_allowed(
     selected_width: u8,
     phy: Option<u32>,
     vht: bool,
-    rx_streams: u8,
-    rx_ldpc: bool,
-    rx_stbc: bool,
-    cck: bool,
+    limits: RxLimits,
 ) -> bool {
     let Some(v) = phy else {
         return true;
@@ -350,7 +362,7 @@ pub(crate) fn receive_allowed(
     let rate = v & 127;
     let nsts = ((v >> 7) & 7) + 1;
     let stbc = (v >> 22) & 3;
-    if v & (1 << 11) != 0 && !rx_ldpc || width > u32::from(selected_width) {
+    if v & (1 << 11) != 0 && !limits.ldpc || width > u32::from(selected_width) {
         return false;
     }
     // RXSTBC1 promises one data stream encoded into exactly two space-time
@@ -358,7 +370,7 @@ pub(crate) fn receive_allowed(
     // distinct local promise and decoder; no TX capability is inferred.
     let nss = if stbc == 0 {
         nsts
-    } else if rx_stbc && stbc == 1 && nsts == 2 {
+    } else if limits.stbc && stbc == 1 && nsts == 2 {
         1
     } else {
         return false;
@@ -368,7 +380,8 @@ pub(crate) fn receive_allowed(
         // This legacy mode remains valid for a typed HT peer on2.4GHz;
         // neither a5GHz station nor VHT can acquire it through PHY fallback.
         0 => {
-            cck && !vht
+            limits.cck
+                && !vht
                 && rate < 8
                 && nsts == 1
                 && width == 0
@@ -384,18 +397,19 @@ pub(crate) fn receive_allowed(
                 && stbc == 0
         }
         // Native OFDM hardware codes8..15; basic6Mbps is11.
-        2 => {
-            nss <= u32::from(rx_streams)
+        2 | 3 => {
+            (mode != 3 || limits.greenfield)
+                && nss <= u32::from(limits.streams)
                 && nss == rate / 8 + 1
-                && rate < u32::from(rx_streams) * 8
+                && rate < u32::from(limits.streams) * 8
                 && width <= 1
                 && (v >> 15) & 3 <= 1
         }
         4 => {
-            vht && nss <= u32::from(rx_streams)
+            vht && nss <= u32::from(limits.streams)
                 && rate <= (if width == 0 { 8 } else { 9 })
                 && (v >> 15) & 3 <= 1
         }
-        _ => false, // no greenfield/HE or unimplemented optional mode.
+        _ => false, // no HE or unimplemented optional mode.
     }
 }

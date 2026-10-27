@@ -41,6 +41,8 @@ pub struct LocalHt {
     rx_ldpc: bool,
     tx_ldpc: bool,
     rx_stbc: bool,
+    rx_greenfield: bool,
+    tx_greenfield: bool,
 }
 impl LocalHt {
     pub fn new(
@@ -71,6 +73,8 @@ impl LocalHt {
             rx_ldpc: false,
             tx_ldpc: false,
             rx_stbc: false,
+            rx_greenfield: false,
+            tx_greenfield: false,
         })
     }
     pub fn siso20(rx_sgi20: bool, tx_sgi20: bool) -> Self {
@@ -90,6 +94,8 @@ impl LocalHt {
             rx_ldpc: false,
             tx_ldpc: false,
             rx_stbc: false,
+            rx_greenfield: false,
+            tx_greenfield: false,
         }
     }
     /// Advertised LDPC is a local RX promise. TX coding additionally needs
@@ -102,6 +108,13 @@ impl LocalHt {
     /// Promise reception of one STBC data stream; TX STBC stays absent.
     pub fn with_rx_stbc(mut self, enabled: bool) -> Self {
         self.rx_stbc = enabled;
+        self
+    }
+    /// HT greenfield RX is a local decoder promise. TX also requires the
+    /// original offer and bound peer's greenfield receive capability.
+    pub fn with_greenfield(mut self, rx: bool, tx: bool) -> Self {
+        self.rx_greenfield = rx;
+        self.tx_greenfield = tx;
         self
     }
     /// Bound TX rate selection to a subset of actual implemented TX support.
@@ -123,6 +136,7 @@ impl LocalHt {
         let mut body = [0; 26];
         let cap: u16 = 0x000c // SMPS disabled; optional features are explicit below.
             | u16::from(self.rx_ldpc)
+            | (u16::from(self.rx_greenfield) << 4)
             | (u16::from(self.rx_stbc) << 8)
             | if self.width == HtWidth::TwentyForty { 2 } else { 0 }
             | if self.gi.rx20 { 0x20 } else { 0 }
@@ -393,6 +407,12 @@ pub struct HtNegotiation {
     basic: [u8; 10],
 }
 impl HtNegotiation {
+    pub fn rx_greenfield(&self) -> bool {
+        self.local.rx_greenfield
+    }
+    pub fn tx_greenfield(&self) -> bool {
+        self.local.tx_greenfield && self.peer_capability() & 16 != 0
+    }
     pub fn rx_stbc(&self) -> bool {
         self.local.rx_stbc
     }
@@ -598,6 +618,7 @@ impl Offer {
         next.ht.local.gi.tx20 &= self.0.ht.tx_sgi20();
         next.ht.local.gi.tx40 &= self.0.ht.tx_sgi40();
         next.ht.local.tx_ldpc &= self.0.ht.tx_ldpc();
+        next.ht.local.tx_greenfield &= self.0.ht.tx_greenfield();
         if let (Some(old), Some(new)) = (self.0.vht, next.vht.as_mut()) {
             new.tx = intersect_maps(new.tx, old.tx);
             new.local.tx_sgi &= old.tx_sgi80();

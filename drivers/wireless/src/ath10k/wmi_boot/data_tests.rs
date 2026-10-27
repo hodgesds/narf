@@ -95,6 +95,7 @@ pub(super) struct Fixture {
     ht_mcs: u8,
     ht_sgi: bool,
     ht_request_sgi: bool,
+    ht_request_sgi40: bool,
     ht_ampdu: u8,
     ht_capabilities: u16,
     rx_phy: Option<(u8, u32, u32)>,
@@ -147,6 +148,7 @@ impl Fixture {
             ht_mcs: 0xff,
             ht_sgi: true,
             ht_request_sgi: true,
+            ht_request_sgi40: false,
             ht_ampdu: 0x1b,
             ht_capabilities: 0x002c,
             rx_phy: None,
@@ -406,6 +408,12 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
                     0x0c
                 }) | if m.data.as_ref().unwrap().ht_secondary.is_some() {
                     2
+                } else {
+                    0
+                } | if m.data.as_ref().unwrap().ht_secondary.is_some()
+                    && m.data.as_ref().unwrap().ht_request_sgi40
+                {
+                    0x40
                 } else {
                     0
                 },

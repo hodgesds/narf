@@ -460,6 +460,16 @@ fn radio_boot_country(
     major: u8,
     factory: u32,
 ) -> radio::Radio<RadioModel> {
+    radio_boot_country_ht(version, dialect, features, major, factory, None)
+}
+fn radio_boot_country_ht(
+    version: u32,
+    dialect: Dialect,
+    features: u64,
+    major: u8,
+    factory: u32,
+    ht: Option<u32>,
+) -> radio::Radio<RadioModel> {
     let hardware = if dialect == Dialect::Tlv {
         HwRev::Qca6174
     } else if dialect == Dialect::TenFour {
@@ -477,6 +487,7 @@ fn radio_boot_country(
     let c = htt::Config::new(hardware, version, htt_version, 0).unwrap();
     let mut inner = HttModel::new(dialect, c, hardware);
     inner.inner.factory = factory;
+    inner.inner.ht = ht;
     let raw = features & (1 << 10) != 0;
     inner.raw = raw;
     if raw {

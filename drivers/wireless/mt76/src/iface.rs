@@ -1070,7 +1070,7 @@ mod tests {
             || !info.hw_caps.ht_supported
             || iface
                 .phy_capabilities(2400)
-                .is_none_or(|caps| caps.ht[..5] != [111, 1, 28, 255, 255] || caps.vht.is_some())
+                .is_none_or(|caps| caps.ht[..5] != [127, 1, 28, 255, 255] || caps.vht.is_some())
             || iface.phy_capabilities(6000).is_some()
             || !info.hw_caps.vht_supported
             || iface
