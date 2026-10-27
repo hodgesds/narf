@@ -970,7 +970,7 @@ impl FixtureTpm {
             }
         };
         // Part 3 §12.2 response layout — outPublic, creationData,
-        // creationHash, ticket; NO outPrivate.
+        // creationHash, ticket, name; NO outPrivate.
         let mut params = Vec::new();
         params.extend_from_slice(&tpm2b(&in_public));
         params.extend_from_slice(&tpm2b(&[])); // creationData
@@ -978,6 +978,12 @@ impl FixtureTpm {
         params.extend_from_slice(&0x8021u16.to_be_bytes()); // TPM_ST_CREATION
         params.extend_from_slice(&hierarchy.to_be_bytes());
         params.extend_from_slice(&tpm2b(&[])); // ticket digest
+
+        // Name: nameAlg ‖ H(outPublic) (Part 1 §16).
+        let mut name = Vec::new();
+        name.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+        name.extend_from_slice(&sha256(&in_public));
+        params.extend_from_slice(&tpm2b(&name));
         ok_handle(tag, handle, &params)
     }
 
