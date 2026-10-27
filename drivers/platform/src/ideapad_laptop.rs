@@ -74,13 +74,21 @@ fn vpc_path() -> alloc::string::String {
 /// Read a VPC register by index using the `VMCCMD` AML method.
 ///
 /// Reference: `ideapad-laptop.c::ideapad_read_method()` line ~235 —
-/// evaluates `<vpc>._VPC(index, 0)` or `VMCCMD` and reads the result.
+/// evaluates `<vpc>.VMCCMD(index)` and reads the result.
+///
+/// Name-encoding note: AML NameSegs are four characters, so the
+/// six-character method name is encoded in the DSDT as a
+/// multi-segment name `VMCC` + `MD__`, which this tree's AML
+/// parser registers as the path `VMCC.MD` (segments joined with
+/// `.`, trailing underscores stripped). The path built here must
+/// use that segmented form — the literal `VMCCMD` segment can
+/// never exist in the namespace.
 pub fn vpc_read(index: u8) -> Option<u32> {
     let path_base = vpc_path();
     if path_base.is_empty() {
         return None;
     }
-    let method = alloc::format!("{}.VMCCMD", path_base);
+    let method = alloc::format!("{}.VMCC.MD", path_base);
     let result =
         narf_aml::eval::evaluate_method(&method, &[narf_aml::Value::Integer(index as u64)]);
     match result {
@@ -90,16 +98,17 @@ pub fn vpc_read(index: u8) -> Option<u32> {
     }
 }
 
-/// Write a VPC register by index using the `VMCSET` AML method.
+/// Write a VPC register by index using the `VMCSET` AML method
+/// (segmented path `VMCS.ET` — see the note on [`vpc_read`]).
 ///
 /// Reference: `ideapad-laptop.c::ideapad_write_method()` line ~242 —
-/// evaluates `<vpc>._VPC(index, value)` or `VMCSET`.
+/// evaluates `<vpc>.VMCSET(index, value)`.
 pub fn vpc_write(index: u8, value: u32) -> bool {
     let path_base = vpc_path();
     if path_base.is_empty() {
         return false;
     }
-    let method = alloc::format!("{}.VMCSET", path_base);
+    let method = alloc::format!("{}.VMCS.ET", path_base);
     narf_aml::eval::evaluate_method(
         &method,
         &[
@@ -173,7 +182,7 @@ pub enum PerfMode {
 
 static PERF_MODE: AtomicU32 = AtomicU32::new(1);
 
-/// Get the current performance mode.
+/// Get the current performance mode (last-set cache).
 pub fn perf_mode() -> PerfMode {
     match PERF_MODE.load(Ordering::Relaxed) {
         0 => PerfMode::Quiet,
@@ -182,11 +191,63 @@ pub fn perf_mode() -> PerfMode {
     }
 }
 
-/// Set the performance mode via VPC index 0x3B.
-/// Reference: `ideapad-laptop.c::ideapad_acpi_platform_profile_store()`.
-pub fn set_perf_mode(mode: PerfMode) {
+/// Read the performance mode back from firmware via VPC index
+/// 0x3B (`VMCCMD`), updating the cache. This is the read the
+/// platform-profile surface needs — the previous code only ever
+/// wrote the register, so the active profile was unknowable.
+/// Reference: `ideapad-laptop.c::ideapad_acpi_platform_profile_show`
+/// reads the same VPC index.
+pub fn read_perf_mode() -> Option<PerfMode> {
+    let v = vpc_read(VPC_IDX_PERF_MODE)?;
+    let mode = match v {
+        0 => PerfMode::Quiet,
+        2 => PerfMode::Performance,
+        _ => PerfMode::Balanced,
+    };
     PERF_MODE.store(mode as u32, Ordering::Release);
-    let _ = vpc_write(VPC_IDX_PERF_MODE, mode as u32);
+    Some(mode)
+}
+
+/// Set the performance mode via VPC index 0x3B. Returns the VPC
+/// write result.
+/// Reference: `ideapad-laptop.c::ideapad_acpi_platform_profile_store()`.
+pub fn set_perf_mode(mode: PerfMode) -> bool {
+    PERF_MODE.store(mode as u32, Ordering::Release);
+    vpc_write(VPC_IDX_PERF_MODE, mode as u32)
+}
+
+fn profile_get() -> Option<crate::platform_profile::PlatformProfile> {
+    use crate::platform_profile::PlatformProfile as P;
+    match read_perf_mode()? {
+        PerfMode::Quiet => Some(P::Quiet),
+        PerfMode::Balanced => Some(P::Balanced),
+        PerfMode::Performance => Some(P::Performance),
+    }
+}
+
+fn profile_set(p: crate::platform_profile::PlatformProfile) -> bool {
+    use crate::platform_profile::PlatformProfile as P;
+    let mode = match p {
+        P::Quiet => PerfMode::Quiet,
+        P::Balanced => PerfMode::Balanced,
+        P::Performance => PerfMode::Performance,
+        _ => return false,
+    };
+    set_perf_mode(mode)
+}
+
+/// Register the `ideapad-laptop` platform-profile backend
+/// (choices: quiet / balanced / performance — the
+/// `platform_profile` choices `ideapad-laptop.c` registers).
+pub fn register_platform_profile() {
+    use crate::platform_profile::PlatformProfile as P;
+    const CHOICES: &[P] = &[P::Quiet, P::Balanced, P::Performance];
+    crate::platform_profile::register_backend(crate::platform_profile::ProfileBackend {
+        name: "ideapad-laptop",
+        choices: CHOICES,
+        get: profile_get,
+        set: profile_set,
+    });
 }
 
 // ── Yoga mode ─────────────────────────────────────────────────────────
@@ -286,6 +347,9 @@ pub fn init() {
     let devices = narf_aml::find_all_devices_by_hid(VPC_HID);
     if let Some(dev) = devices.first() {
         *VPC_PATH.lock() = dev.path.clone();
+        // The VPC device is the probe: the profile backend's get
+        // path reads through it.
+        register_platform_profile();
     }
 
     // Register Lenovo IdeaPad WMI hotkey handler.

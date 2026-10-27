@@ -65,6 +65,11 @@ fn on_query(idx: u8) {
         UNMAPPED.fetch_add(1, Ordering::Release);
         KeyCode::Unknown
     });
+    if code == KeyCode::RfKill {
+        // The airplane-mode key also drives the rfkill core so it
+        // changes actual radio state, not just the key ring.
+        crate::rfkill::toggle_all();
+    }
     // Hotkeys are momentary — synthesize press + release. The input
     // ring is FIFO; consumers see both transitions in order.
     let _ = push_key(code, true);

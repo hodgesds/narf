@@ -77,6 +77,22 @@ pub mod wmi_vendors;
 /// Shared WMI MOF/GUID helpers used by vendor platform drivers.
 pub mod wmi_core;
 
+/// Vendor-neutral rfkill state surface: radios as state (soft /
+/// hard block) published at `/sys/class/rfkill/`, with the
+/// airplane-mode key wired to actual radio state.
+#[cfg(target_arch = "x86_64")]
+pub mod rfkill;
+
+/// Vendor-neutral platform-profile surface:
+/// `/sys/firmware/acpi/platform_profile{,_choices}` with one
+/// active vendor backend (HP / IdeaPad / ASUS).
+#[cfg(target_arch = "x86_64")]
+pub mod platform_profile;
+
+/// Lenovo Think-LMI BIOS-settings protocol (ThinkPad).
+#[cfg(target_arch = "x86_64")]
+pub mod think_lmi;
+
 /// Platform driver registry — vendor probe + per-driver init dispatch.
 /// Identifies OEM via SMBIOS Type-1 manufacturer and routes to the
 /// appropriate per-vendor driver at Stage::Subsys.
@@ -245,6 +261,24 @@ pub fn register_initcalls() {
     #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "laptop-vendor-drivers", || {
         let _ = registry::probe_and_register();
+        InitResult::Ok
+    });
+    // Think-LMI probe: best-effort presence check for the Lenovo
+    // BIOS-setting WMI class. After wmi-vendors (GUID registry is
+    // populated by then); harmless everywhere else.
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Subsys, "think-lmi", || {
+        let _ = think_lmi::init();
+        InitResult::Ok
+    });
+    // Userspace surfaces for the vendor laptop drivers: publish
+    // /sys/class/rfkill/* and /sys/firmware/acpi/platform_profile
+    // once every Stage::Subsys vendor driver has registered its
+    // radios / profile backend.
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Late, "wmi-userspace-surfaces", || {
+        rfkill::publish_sysfs();
+        platform_profile::publish_sysfs();
         InitResult::Ok
     });
 }

@@ -28,12 +28,25 @@
 //!           (ymc.c) reports u32 code 0x01 = laptop, 0x02–0x04 = tablet.
 //!           The task-spec GUID "21494638-…" is used for IdeaPad hotkeys.
 //!
-//! ## Deferred
+//! ## Deferred — status after the #1086 completion pass
 //!
-//! - Full think-lmi BIOS-setting protocol (thinkpad_acpi BIOS GUID).
-//! - Dell SMM-via-WMI class 17/select 3 application registration.
-//! - HP-WMI thermal profile set/get (OMEN/Victus specific WMI GM cmd).
-//! - Lenovo battery conservation mode (ideapad-laptop WMI method).
+//! - Full think-lmi BIOS-setting protocol: implemented in
+//!   `crate::think_lmi` (string protocol verified against Lenovo's
+//!   deployment guides). Its WMI GUID literals are cited from
+//!   `think-lmi.c` but flagged there as not re-verified against
+//!   source — see that module's header before enabling on hardware.
+//! - Dell SMM-via-WMI class 17/select 3 application registration:
+//!   implemented in `crate::dell_laptop::wmi_events_set_enabled`
+//!   over the real `calling_interface_buffer` layout.
+//! - HP-WMI thermal profile set/get (OMEN/Victus GM commands):
+//!   implemented in `crate::hp_wmi` (`perform_query`,
+//!   `get/set_thermal_profile`, `set_omen_performance_mode`).
+//! - Lenovo battery conservation mode: already implemented via
+//!   the IdeaPad VPC2004 path (`ideapad_laptop` VPC index 0x28,
+//!   `VPCCMD_W_BAT_CON`). No separate ideapad-laptop *WMI method*
+//!   variant exists in `ideapad-laptop.c` — VPC is the only
+//!   conservation transport that driver uses, so there is nothing
+//!   further to port for this item.
 
 extern crate alloc;
 
@@ -271,7 +284,7 @@ fn on_dell_event(ev: &WmiEvent) {
             // a platform-event bus in a future LaptopModeEvent ring.
             None
         }
-        DellEvent::MicMute => Some(KeyCode::Mute), // closest available
+        DellEvent::MicMute => Some(KeyCode::MicMute),
         DellEvent::Unknown { .. } => None,
     };
 
@@ -287,8 +300,8 @@ fn on_dell_event(ev: &WmiEvent) {
 fn decode_dell_keycode(id: u16) -> Option<KeyCode> {
     // Reference: dell-wmi-base.c keymap arrays (GPL-2.0-or-later).
     match id {
-        0x0109 => Some(KeyCode::Mute), // audio mute
-        0x0150 => Some(KeyCode::Mute), // mic mute (re-used)
+        0x0109 => Some(KeyCode::Mute),    // audio mute
+        0x0150 => Some(KeyCode::MicMute), // mic mute (KEY_MICMUTE)
         0xe005 => Some(KeyCode::BrightnessDown),
         0xe006 => Some(KeyCode::BrightnessUp),
         0xe011 => Some(KeyCode::WLan), // Wifi Catcher
@@ -418,11 +431,11 @@ fn decode_hp_bezel_keycode(code: u32) -> Option<KeyCode> {
     match code {
         0x02 => Some(KeyCode::BrightnessUp),
         0x03 => Some(KeyCode::BrightnessDown),
-        0x270 => Some(KeyCode::Mute), // KEY_MICMUTE
-        0x20e6 => None,               // KEY_PROG1
-        0x20e8 => None,               // KEY_MEDIA
-        0x21a4 => None,               // Win Lock On (ignore)
-        0x21a7 => None,               // KEY_FN_ESC
+        0x270 => Some(KeyCode::MicMute), // KEY_MICMUTE
+        0x20e6 => None,                  // KEY_PROG1
+        0x20e8 => None,                  // KEY_MEDIA
+        0x21a4 => None,                  // Win Lock On (ignore)
+        0x21a7 => None,                  // KEY_FN_ESC
         0x21a9 => Some(KeyCode::TouchpadToggle),
         0x121a9 => Some(KeyCode::TouchpadToggle),
         _ => None,
@@ -446,7 +459,10 @@ fn on_hp_event(ev: &WmiEvent) {
     let code: Option<KeyCode> = match hp_ev {
         HpEvent::BezelButton { key_code } => decode_hp_bezel_keycode(key_code),
         HpEvent::WlanToggle => Some(KeyCode::WLan),
-        HpEvent::FnPHotkey => None, // would trigger platform-profile cycle
+        HpEvent::FnPHotkey => None, // profile cycle lives in hp_wmi's
+        // handler (it owns the backend); cycling here too would
+        // advance the profile twice per keypress, since both
+        // handlers subscribe to the HP event GUID.
         HpEvent::OmenKey { key_code } => decode_hp_bezel_keycode(key_code),
         HpEvent::CameraToggle { open: _ } => None, // no camera key in KeyCode yet
         HpEvent::LidSwitch | HpEvent::ScreenRotation => None,

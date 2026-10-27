@@ -214,7 +214,8 @@ pub fn hkey_to_keycode(hkey: u32) -> Option<KeyCode> {
         0x1011 => Some(KeyCode::VolumeUp),
         0x1012 => Some(KeyCode::VolumeDown),
         0x1013 => Some(KeyCode::Mute),
-        0x100B => Some(KeyCode::Mute), // mic-mute, closest available
+        0x100B => Some(KeyCode::MicMute), // KEY_MICMUTE — distinct
+        // from speaker mute (was conflated with KeyCode::Mute).
         0x1015 => Some(KeyCode::WLan),
         0x101B => Some(KeyCode::KbdIlluminationToggle),
         0x1016 => Some(KeyCode::KbdIlluminationDown),
