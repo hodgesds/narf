@@ -4,6 +4,11 @@
 use super::{
     cm::{route_depth, CfgSpace},
     control::Config,
+    dp_bw::{
+        self, DpAdapterCaps, DpRate, DpTunnelInfo, Granularity, ADP_DP_CS_2, ADP_DP_CS_8, CS2_CA,
+        CS2_CMMS, CS2_CM_ID_SHIFT, CS2_ESTIMATED_BW_SHIFT, CS2_GROUP_ID_SHIFT, CS8_DR,
+        CS8_REQUESTED_BW_MASK, DP_LOCAL_CAP, DP_REMOTE_CAP, DP_STATUS, STATUS_ALLOCATED_BW_SHIFT,
+    },
     ring::Error,
     topology::{router_operation, Domain, Port, Router},
 };
@@ -35,6 +40,18 @@ pub struct TunnelInfo {
     pub output: Endpoint,
     pub protocol: Protocol,
     pub dprx_done: bool,
+    /// DP state (negotiated envelope + live allocation) for
+    /// DisplayPort tunnels; `None` for other protocols. Recorded
+    /// at activation so suspend/resume replay rebuilds the tunnel
+    /// at its recorded rate (see `dp_bw::DpTunnelInfo`).
+    pub dp: Option<DpTunnelInfo>,
+    /// Fabric bandwidth this tunnel currently consumes, in Mb/s:
+    /// the DP grant for DisplayPort, the USB3 handshake's up+down
+    /// allocation (converted with the crate's USB3 unit
+    /// definition) for USB3, zero for PCIe. DP bandwidth-group
+    /// accounting charges every live tunnel sharing a first link
+    /// against that link's budget.
+    pub consumed_mbps: u32,
 }
 static DISPLAYS: IrqSafeSpinLock<Vec<TunnelInfo>> = IrqSafeSpinLock::new(Vec::new());
 pub(crate) fn forget_domain(id: u32) {
@@ -464,10 +481,13 @@ struct Undo {
 #[derive(Debug)]
 pub(crate) struct Tunnel {
     pub display: TunnelInfo,
-    writes: Vec<Undo>,
-    resource: bool,
-    hpd_owned: bool,
-    bandwidth: Option<(u16, u32)>,
+    // Crate-visible so sibling fixture modules (dp_bw::tests) can
+    // construct a tunnel directly, e.g. a suspend/resume replay
+    // rebuilt from its recorded TunnelInfo.
+    pub(crate) writes: Vec<Undo>,
+    pub(crate) resource: bool,
+    pub(crate) hpd_owned: bool,
+    pub(crate) bandwidth: Option<(u16, u32)>,
 }
 
 fn router(domain: &Domain, route: u64) -> Result<&Router, Error> {
@@ -803,7 +823,11 @@ impl Tunnel {
         }
         Ok(())
     }
-    async fn activate(&mut self, ctl: &mut impl Config, domain: &Domain) -> Result<(), Error> {
+    pub(crate) async fn activate(
+        &mut self,
+        ctl: &mut impl Config,
+        domain: &Domain,
+    ) -> Result<(), Error> {
         if self.display.protocol == Protocol::Usb3 {
             return self.activate_usb3(ctl, domain).await;
         }
@@ -824,6 +848,19 @@ impl Tunnel {
             {
                 return Err(Error::Full);
             }
+        }
+        // Query the router's DP resource before allocating it
+        // (USB4 router operations: QUERY_DP_RESOURCE 0x10,
+        // ALLOC_DP_RESOURCE 0x11, DEALLOC_DP_RESOURCE 0x12). A
+        // router that reports the resource unavailable refuses
+        // the tunnel before anything is programmed; a router
+        // without the query operation falls through to the
+        // allocation attempt, as before.
+        match router_operation(ctl, input.route, 0x10, input.port as u32).await {
+            Ok((0, _)) => {}
+            Ok(_) => return Err(Error::Full),
+            Err(Error::Remote(0xff)) => {}
+            Err(e) => return Err(e),
         }
         match router_operation(ctl, input.route, 0x11, input.port as u32).await {
             Ok((0, _)) => self.resource = true,
@@ -871,42 +908,145 @@ impl Tunnel {
             }
             narf_time::SleepUntil::new(narf_time::Deadline::after_ms(10).as_instant()).await;
         }
-        let in_cap = ctl
+        let in_local = ctl
             .read(
                 input.route,
                 input.port,
                 CfgSpace::Port,
-                source.adapter_cap + 4,
+                source.adapter_cap + DP_LOCAL_CAP,
                 1,
             )
             .await?[0];
-        let out_cap = ctl
+        let out_local = ctl
             .read(
                 output.route,
                 output.port,
                 CfgSpace::Port,
-                sink.adapter_cap + 4,
+                sink.adapter_cap + DP_LOCAL_CAP,
                 1,
             )
             .await?[0];
-        // Start with legacy DP bandwidth mode. Advertise RBR, bounded by the
-        // smallest lane count, to fit even a single Gen2 USB4 lane alongside
-        // control and USB traffic. Higher rates require bandwidth allocation.
-        let lanes = ((in_cap >> 12) & 7).min((out_cap >> 12) & 7);
-        if lanes > 2 {
-            return Err(Error::Invalid);
-        }
-        let cap = (out_cap & !((15 << 8) | (7 << 12) | (7 << 17) | (1 << 28))) | (lanes << 12);
+        let in_caps = DpAdapterCaps::decode(in_local)?;
+        let out_caps = DpAdapterCaps::decode(out_local)?;
+        // The tunnel envelope, in the shared negotiation
+        // vocabulary (see dp_bw): the mutual ceiling of the two
+        // adapters. A tunnel replayed from its suspend record
+        // demands its recorded envelope, capped by what the
+        // adapters still advertise — replay at the recorded rate,
+        // renegotiated down only if the hardware shrank.
+        let ceiling = (
+            DpRate::min(in_caps.max_rate, out_caps.max_rate),
+            in_caps.max_lanes.min(out_caps.max_lanes),
+        );
+        let demand = match self.display.dp {
+            Some(recorded) => (
+                DpRate::min(recorded.rate, ceiling.0),
+                recorded.lanes.min(ceiling.1),
+            ),
+            None => ceiling,
+        };
+        // Bandwidth-allocation mode is an IN-adapter property: its
+        // LOCAL_CAP must advertise BW_MODE and its granularity
+        // must decode. Anything else is programmed in legacy mode
+        // (a fixed envelope, no runtime requests).
+        let in_cs2 = ctl
+            .read(
+                input.route,
+                input.port,
+                CfgSpace::Port,
+                source.adapter_cap + ADP_DP_CS_2,
+                1,
+            )
+            .await?[0];
+        let granularity = Granularity::decode(in_cs2);
+        let bw_mode = in_caps.bw_mode && granularity.is_some();
+        let (group, budget, others_mbps) = self.dp_group_accounting(ctl, domain).await?;
+        let available = budget.saturating_sub(others_mbps);
+        // Fit the envelope under what the group has free, walking
+        // the shared fallback ladder — never overcommit the link.
+        // Even RBR x1 not fitting refuses the tunnel cleanly,
+        // before any path is programmed.
+        let Some((rate, lanes)) = dp_bw::fit_link(demand.0, demand.1, available) else {
+            return Err(Error::Full);
+        };
+        let payload = rate.payload_mbps(lanes);
+        // Program the negotiated envelope into both REMOTE_CAPs:
+        // each adapter learns the link the tunnel will run, at
+        // the full negotiated rate — HBR/HBR2/HBR3 as the adapters
+        // and the fabric budget support, no longer floored at RBR.
         self.change(
             ctl,
             output,
             CfgSpace::Port,
-            sink.adapter_cap + 5,
-            &[in_cap & !(1 << 28)],
+            sink.adapter_cap + DP_REMOTE_CAP,
+            &[dp_bw::remote_cap_word(in_local, rate, lanes, bw_mode)],
         )
         .await?;
-        self.change(ctl, input, CfgSpace::Port, source.adapter_cap + 5, &[cap])
+        self.change(
+            ctl,
+            input,
+            CfgSpace::Port,
+            source.adapter_cap + DP_REMOTE_CAP,
+            &[dp_bw::remote_cap_word(out_local, rate, lanes, bw_mode)],
+        )
+        .await?;
+        let allocated_mbps = if bw_mode {
+            let gr = granularity.unwrap();
+            // Publish the group estimate (budget less the other
+            // consumers; this tunnel's own headroom included), the
+            // group and CM identity, then grant the tunnel its own
+            // payload as the initial allocation. All journaled, so
+            // teardown restores the pre-tunnel adapter state.
+            let estimated = budget.saturating_sub(others_mbps);
+            let cs2 = (in_cs2
+                & !((0x7 << CS2_GROUP_ID_SHIFT)
+                    | (0xf << CS2_CM_ID_SHIFT)
+                    | (0xff << CS2_ESTIMATED_BW_SHIFT)
+                    | CS2_CA))
+                | CS2_CMMS
+                | ((group as u32) << CS2_GROUP_ID_SHIFT)
+                | ((domain.id & 0xf) << CS2_CM_ID_SHIFT)
+                | (gr.units_floor(estimated) << CS2_ESTIMATED_BW_SHIFT);
+            self.change(
+                ctl,
+                input,
+                CfgSpace::Port,
+                source.adapter_cap + ADP_DP_CS_2,
+                &[cs2],
+            )
             .await?;
+            let status = ctl
+                .read(
+                    input.route,
+                    input.port,
+                    CfgSpace::Port,
+                    source.adapter_cap + DP_STATUS,
+                    1,
+                )
+                .await?[0];
+            let granted = gr.units_floor(payload);
+            self.change(
+                ctl,
+                input,
+                CfgSpace::Port,
+                source.adapter_cap + DP_STATUS,
+                &[((status & !(0xff << STATUS_ALLOCATED_BW_SHIFT))
+                    | (granted << STATUS_ALLOCATED_BW_SHIFT))],
+            )
+            .await?;
+            gr.to_mbps(granted)
+        } else {
+            payload
+        };
+        self.display.dp = Some(DpTunnelInfo {
+            rate,
+            lanes,
+            allocated_mbps,
+            bw_mode,
+            group,
+            budget_mbps: budget,
+        });
+        self.display.consumed_mbps = allocated_mbps;
         let forward = chain(domain, input, output)?;
         self.path(ctl, forward.clone(), true).await?;
         self.path(ctl, forward.clone(), false).await?;
@@ -924,7 +1064,260 @@ impl Tunnel {
             .await?;
         self.modify(ctl, output, sink.adapter_cap, 0, 3 << 30)
             .await?;
+        // Publish immediately: group accounting for tunnels
+        // activated later in the same reconcile pass (and replay,
+        // which bypasses reconcile) reads the live set.
+        // reconcile's final rebuild replaces this entry with the
+        // same snapshot; teardown removes it.
+        DISPLAYS.lock().push(self.display.clone());
         Ok(())
+    }
+
+    /// Account this DP tunnel's first-link bandwidth group: read
+    /// the link budget from the child router's upstream lane
+    /// adapter (raw speed × bonded width, less the guard band;
+    /// the Gen 2 floor when the negotiated speed cannot be read),
+    /// then charge the published live tunnels sharing the link.
+    /// Returns (group id, budget Mb/s, Mb/s consumed by *other*
+    /// tunnels in the group). The published set is snapshotted
+    /// after the config reads — no lock is held across an await.
+    async fn dp_group_accounting(
+        &self,
+        ctl: &mut impl Config,
+        domain: &Domain,
+    ) -> Result<(u8, u32, u32), Error> {
+        let input = self.display.input;
+        let output = self.display.output;
+        let key = dp_bw::first_link_key(input, output);
+        let mut budget = dp_bw::link_budget_mbps(dp_bw::GEN2_MBPS_PER_LANE, 1);
+        if let Ok(child) = router(domain, key.0) {
+            let width = 1 + child
+                .ports
+                .iter()
+                .filter(|p| p.kind == 1 && p.secondary)
+                .count() as u8;
+            if let Some(up) = child
+                .ports
+                .iter()
+                .find(|p| p.kind == 1 && p.number == child.upstream && p.adapter_cap != 0)
+            {
+                let cs1 = ctl
+                    .read(
+                        key.0,
+                        up.number,
+                        CfgSpace::Port,
+                        up.adapter_cap + dp_bw::LANE_CS_1,
+                        1,
+                    )
+                    .await?[0];
+                if let Some(speed) =
+                    dp_bw::lane_speed_mbps((cs1 >> dp_bw::LANE_CURRENT_SPEED_SHIFT) & 0xf)
+                {
+                    budget = dp_bw::link_budget_mbps(speed, width);
+                }
+            }
+        }
+        let published = DISPLAYS.lock().clone();
+        let mut keys: Vec<(u64, u8)> = Vec::new();
+        let mut others_mbps = 0u32;
+        for t in &published {
+            if t.domain != domain.id {
+                continue;
+            }
+            let tkey = dp_bw::first_link_key(t.input, t.output);
+            if !keys.contains(&tkey) {
+                keys.push(tkey);
+            }
+            if tkey == key && !(t.input == input && t.output == output) {
+                others_mbps = others_mbps.saturating_add(t.consumed_mbps);
+                if let Some(dp) = t.dp {
+                    // A member that accounted against a smaller
+                    // budget (the link renegotiated slower) keeps
+                    // the group at the smaller figure.
+                    budget = budget.min(dp.budget_mbps);
+                }
+            }
+        }
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+        keys.sort_unstable();
+        let index = keys.iter().position(|k| *k == key).unwrap_or(0);
+        let group = 1 + (index as u8 % dp_bw::MAX_GROUP_ID);
+        Ok((group, budget, others_mbps))
+    }
+
+    /// Service one pending bandwidth-allocation request on this
+    /// tunnel's DP IN adapter (USB4 DP bandwidth-allocation mode).
+    /// The adapter raises DR in `ADP_DP_CS_8` with the source's
+    /// requested bandwidth; the CM grants at most what the group
+    /// has free — the tunnel's own current grant counts towards
+    /// what it may hold — writes `ALLOCATED_BW`, and runs the CM
+    /// Acknowledge handshake until the adapter clears DR. A grant
+    /// below the request is the renegotiation signal: the source
+    /// re-trains within the granted envelope. The request is never
+    /// silently dropped and the group is never overcommitted.
+    /// Returns true when a request was serviced.
+    pub(crate) async fn service_dp_bw_request(
+        &mut self,
+        ctl: &mut impl Config,
+        domain: &Domain,
+    ) -> Result<bool, Error> {
+        let Some(dp) = self.display.dp else {
+            return Ok(false);
+        };
+        if !dp.bw_mode {
+            return Ok(false);
+        }
+        let input = self.display.input;
+        let source = port(domain, input)?;
+        let cs8 = ctl
+            .read(
+                input.route,
+                input.port,
+                CfgSpace::Port,
+                source.adapter_cap + ADP_DP_CS_8,
+                1,
+            )
+            .await?[0];
+        if cs8 & CS8_DR == 0 {
+            return Ok(false);
+        }
+        let cs2 = ctl
+            .read(
+                input.route,
+                input.port,
+                CfgSpace::Port,
+                source.adapter_cap + ADP_DP_CS_2,
+                1,
+            )
+            .await?[0];
+        let Some(gr) = Granularity::decode(cs2) else {
+            // The granularity stopped decoding after activation:
+            // leave the request pending rather than guess the unit
+            // every exchanged value is denominated in.
+            return Ok(false);
+        };
+        let requested = gr.to_mbps(cs8 & CS8_REQUESTED_BW_MASK);
+        let (_, budget, others_mbps) = self.dp_group_accounting(ctl, domain).await?;
+        let grant = requested.min(budget.saturating_sub(others_mbps));
+        let units = gr.units_floor(grant);
+        let status = ctl
+            .read(
+                input.route,
+                input.port,
+                CfgSpace::Port,
+                source.adapter_cap + DP_STATUS,
+                1,
+            )
+            .await?[0];
+        self.change(
+            ctl,
+            input,
+            CfgSpace::Port,
+            source.adapter_cap + DP_STATUS,
+            &[((status & !(0xff << STATUS_ALLOCATED_BW_SHIFT))
+                | (units << STATUS_ALLOCATED_BW_SHIFT))],
+        )
+        .await?;
+        // CM Acknowledge handshake (Linux
+        // usb4_dp_port_allocate_bandwidth): set CA, clear CA,
+        // wait for the adapter to clear DR, leave CA clear.
+        self.change(
+            ctl,
+            input,
+            CfgSpace::Port,
+            source.adapter_cap + ADP_DP_CS_2,
+            &[cs2 | CS2_CA],
+        )
+        .await?;
+        self.change(
+            ctl,
+            input,
+            CfgSpace::Port,
+            source.adapter_cap + ADP_DP_CS_2,
+            &[cs2 & !CS2_CA],
+        )
+        .await?;
+        let deadline = narf_time::Deadline::after_ms(500);
+        loop {
+            if ctl
+                .read(
+                    input.route,
+                    input.port,
+                    CfgSpace::Port,
+                    source.adapter_cap + ADP_DP_CS_8,
+                    1,
+                )
+                .await?[0]
+                & CS8_DR
+                == 0
+            {
+                break;
+            }
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            narf_time::SleepUntil::new(narf_time::Deadline::after_ms(10).as_instant()).await;
+        }
+        let granted_mbps = gr.to_mbps(units);
+        if let Some(dp) = self.display.dp.as_mut() {
+            dp.allocated_mbps = granted_mbps;
+        }
+        self.display.consumed_mbps = granted_mbps;
+        // Republish so group accounting later in this same pass
+        // charges the new grant, not the stale one.
+        let mut published = DISPLAYS.lock();
+        if let Some(slot) = published.iter_mut().find(|t| {
+            t.domain == self.display.domain && t.input == input && t.output == self.display.output
+        }) {
+            *slot = self.display.clone();
+        }
+        Ok(true)
+    }
+
+    /// Republish this tunnel's group estimate (`ESTIMATED_BW`)
+    /// after group membership or grants changed: budget less the
+    /// other group members' consumption, this tunnel's own grant
+    /// included in what it may use. Writes only on change.
+    pub(crate) async fn refresh_dp_estimate(
+        &mut self,
+        ctl: &mut impl Config,
+        domain: &Domain,
+    ) -> Result<(), Error> {
+        let Some(dp) = self.display.dp else {
+            return Ok(());
+        };
+        if !dp.bw_mode {
+            return Ok(());
+        }
+        let input = self.display.input;
+        let source = port(domain, input)?;
+        let cs2 = ctl
+            .read(
+                input.route,
+                input.port,
+                CfgSpace::Port,
+                source.adapter_cap + ADP_DP_CS_2,
+                1,
+            )
+            .await?[0];
+        let Some(gr) = Granularity::decode(cs2) else {
+            return Ok(());
+        };
+        let (_, budget, others_mbps) = self.dp_group_accounting(ctl, domain).await?;
+        let estimated = gr.units_floor(budget.saturating_sub(others_mbps));
+        if estimated == (cs2 >> CS2_ESTIMATED_BW_SHIFT) & 0xff {
+            return Ok(());
+        }
+        self.change(
+            ctl,
+            input,
+            CfgSpace::Port,
+            source.adapter_cap + ADP_DP_CS_2,
+            &[((cs2 & !(0xff << CS2_ESTIMATED_BW_SHIFT)) | (estimated << CS2_ESTIMATED_BW_SHIFT))],
+        )
+        .await
     }
 
     async fn activate_usb3(&mut self, ctl: &mut impl Config, domain: &Domain) -> Result<(), Error> {
@@ -957,7 +1350,21 @@ impl Tunnel {
                 return Err(Error::Full);
             }
             self.bandwidth = Some((source.adapter_cap, old & 0x00ff_ffff));
-            usb3_bandwidth(ctl, input, source.adapter_cap, None).await?;
+            let allocation = usb3_bandwidth(ctl, input, source.adapter_cap, None).await?;
+            // Charge the handshake's allocation to the DP group
+            // ledger: USB3 and DP tunnels sharing a first link
+            // draw on the same budget (see dp_bw).
+            let scale = ctl
+                .read(
+                    input.route,
+                    input.port,
+                    CfgSpace::Port,
+                    source.adapter_cap + 3,
+                    1,
+                )
+                .await?[0]
+                & 63;
+            self.display.consumed_mbps = usb3_units_to_mbps(allocation, scale);
         }
         let forward = chain(domain, input, output)?;
         self.path(ctl, forward.clone(), false).await?;
@@ -1028,6 +1435,17 @@ impl Tunnel {
         Ok(())
     }
 }
+/// Convert a packed USB3 allocation (up [11:0] | down [23:12],
+/// in units of 512 * 2^scale b/s — the unit definition
+/// `bandwidth_units` already uses) into Mb/s for the DP group
+/// ledger. Saturating: accounting must never under-count a
+/// consumer.
+fn usb3_units_to_mbps(packed: u32, scale: u32) -> u32 {
+    let units = (packed & 4095) + ((packed >> 12) & 4095);
+    let unit_bps = 512u64.checked_shl(scale).unwrap_or(u64::MAX);
+    let mbps = (units as u64).saturating_mul(unit_bps) / 1_000_000;
+    mbps.min(u32::MAX as u64) as u32
+}
 fn bandwidth_units(scale: u32, consumed: u32) -> Result<u32, Error> {
     let unit = 512u64
         .checked_mul(1u64.checked_shl(scale).ok_or(Error::Invalid)?)
@@ -1045,7 +1463,7 @@ async fn usb3_bandwidth(
     e: Endpoint,
     cap: u16,
     restore: Option<u32>,
-) -> Result<(), Error> {
+) -> Result<u32, Error> {
     let old = ctl
         .read(e.route, e.port, CfgSpace::Port, cap + 2, 1)
         .await?[0];
@@ -1082,7 +1500,8 @@ async fn usb3_bandwidth(
             cap + 2,
             &[(old & !0x00ff_ffff) | (1 << 31) | allocation],
         )
-        .await
+        .await?;
+        Ok(allocation)
     }
     .await;
     // Always release CMR, including invalid scale/timeout/error paths.
@@ -1154,6 +1573,18 @@ pub(crate) async fn reconcile(
             index += 1;
         }
     }
+    // Bandwidth-allocation servicing for live DP tunnels: answer
+    // pending allocation requests first (a source is waiting on
+    // its grant), then republish group estimates, so a reconcile
+    // pass leaves every adapter with a current view. Runs for
+    // every live DP tunnel regardless of the creation controls
+    // this pass carries.
+    for t in tunnels.iter_mut() {
+        t.service_dp_bw_request(ctl, domain).await?;
+    }
+    for t in tunnels.iter_mut() {
+        t.refresh_dp_estimate(ctl, domain).await?;
+    }
     if controls & 1 != 0 {
         for child in domain.routers.iter().filter(|r| r.route != 0) {
             let depth = route_depth(child.route);
@@ -1204,6 +1635,8 @@ pub(crate) async fn reconcile(
                     output,
                     protocol: Protocol::Usb3,
                     dprx_done: false,
+                    dp: None,
+                    consumed_mbps: 0,
                 },
                 writes: Vec::new(),
                 resource: false,
@@ -1224,46 +1657,62 @@ pub(crate) async fn reconcile(
             }
         }
     }
-    if controls & 2 != 0
-        && !tunnels
-            .iter()
-            .any(|t| t.display.protocol == Protocol::DisplayPort)
-    {
+    if controls & 2 != 0 {
         let host = router(domain, 0)?;
-        'outputs: for r in domain.routers.iter().filter(|r| r.route != 0) {
-            for sink in r
+        // Multiple DP tunnels per domain: each hot-plugged sink
+        // with no live tunnel gets its own tunnel on a free DP IN
+        // adapter, and the bandwidth-group ledger (see dp_bw)
+        // decides whether the fabric can carry it — the guard
+        // that used to cap the domain at one DP tunnel is gone
+        // because allocation is real now.
+        for r in domain.routers.iter().filter(|r| r.route != 0) {
+            'sinks: for sink in r
                 .ports
                 .iter()
                 .filter(|p| p.kind == 0x0e0102 && p.adapter_cap != 0)
             {
+                let output = Endpoint {
+                    route: r.route,
+                    port: sink.number,
+                };
+                if tunnels.iter().any(|t| {
+                    t.display.protocol == Protocol::DisplayPort && t.display.output == output
+                }) {
+                    continue;
+                }
                 if ctl
                     .read(
                         r.route,
                         sink.number,
                         CfgSpace::Port,
-                        sink.adapter_cap + 2,
+                        sink.adapter_cap + ADP_DP_CS_2,
                         1,
                     )
                     .await?[0]
-                    & (1 << 6)
+                    & dp_bw::CS2_HPD
                     == 0
                 {
                     continue;
                 }
                 for source in host.ports.iter().filter(|p| p.kind == 0x0e0101) {
+                    let input = Endpoint {
+                        route: 0,
+                        port: source.number,
+                    };
+                    if tunnels.iter().any(|t| {
+                        t.display.protocol == Protocol::DisplayPort && t.display.input == input
+                    }) {
+                        continue;
+                    }
                     let mut tunnel = Tunnel {
                         display: TunnelInfo {
                             domain: domain.id,
-                            input: Endpoint {
-                                route: 0,
-                                port: source.number,
-                            },
-                            output: Endpoint {
-                                route: r.route,
-                                port: sink.number,
-                            },
+                            input,
+                            output,
                             protocol: Protocol::DisplayPort,
                             dprx_done: false,
+                            dp: None,
+                            consumed_mbps: 0,
                         },
                         writes: Vec::new(),
                         resource: false,
@@ -1273,7 +1722,7 @@ pub(crate) async fn reconcile(
                     match tunnel.activate(ctl, domain).await {
                         Ok(()) => {
                             tunnels.push(tunnel);
-                            break 'outputs;
+                            continue 'sinks;
                         }
                         Err(e) => {
                             if let Err(cleanup) = tunnel.teardown(ctl, domain).await {
@@ -1347,6 +1796,8 @@ pub(crate) async fn reconcile(
                     output,
                     protocol: Protocol::Pcie,
                     dprx_done: false,
+                    dp: None,
+                    consumed_mbps: 0,
                 },
                 writes: Vec::new(),
                 resource: false,

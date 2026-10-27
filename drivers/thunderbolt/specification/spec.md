@@ -80,9 +80,22 @@ The implementation supports USB4 routers with buffer-allocation parameters,
 USB3 tunneling between parent/child routers, PCIe tunnelling between an
 ancestor router's PCIe downstream adapter and a device router's PCIe
 upstream adapter (path hops in both directions, adapters enabled last via
-ADP_PCIE_CS_0 PE), and one host-to-device DP tunnel per domain. DP
-capabilities are limited to RBR and the common lane count;
-higher-rate bandwidth allocation is not implemented. Existing enabled
+ADP_PCIE_CS_0 PE), and multiple host-to-device DP tunnels per domain. DP
+tunnels run at the negotiated envelope — RBR through HBR3 at the adapters'
+common lane count — programmed into both adapters' DP_REMOTE_CAP. A DP IN
+adapter advertising bandwidth-allocation mode with a decodable granularity
+(250/500/1000 Mb/s) is allocated against: the CM publishes its bandwidth
+group — tunnels sharing a first fabric link, charged together with the
+USB3 tunnels over that link against the link's raw bandwidth less a 10%
+guard band — as GROUP_ID/CM_ID/ESTIMATED_BW in ADP_DP_CS_2, grants the
+tunnel its payload in DP_STATUS ALLOCATED_BW, and services later
+allocation requests (ADP_DP_CS_8 DR/REQUESTED_BW) through the CM
+Acknowledge handshake, granting at most what the group has free. Adapters
+without allocation mode are programmed in legacy mode at the full
+negotiated envelope. `TunnelInfo` publishes each DP tunnel's negotiated
+envelope and live grant (`dp`) and every tunnel's fabric consumption in
+Mb/s (`consumed_mbps`), so suspend/resume replay rebuilds a DP tunnel at
+its recorded rate. Existing enabled
 firmware tunnels are preserved and are not represented as newly owned paths.
 
 ## 4. Invariants
@@ -103,6 +116,23 @@ submission, rolled back in reverse order, and never replace enabled paths.
 Hop pending is read from DWORD 1 and must clear before credits are released.
 USB3 bandwidth ownership uses the CMR/HCA handshake in both directions.
 Protocol adapters retain vendor-defined ingress credit/flow-control fields.
+
+DP bandwidth groups are never overcommitted: a tunnel's envelope is fitted
+under its group's free budget — the first link's budget less every live
+tunnel charged to the group, USB3 tunnels included — by stepping the rate
+down, then halving the lanes and restarting the rate ladder, before any
+path is programmed, and a tunnel that cannot fit even at RBR x1 is refused
+unprogrammed. Allocation requests are granted at most the group's free
+remainder and never silently dropped; a grant below the request is the
+renegotiation signal to the source. DP allocation writes (DP_REMOTE_CAP,
+the ADP_DP_CS_2 group/estimate fields, the DP_STATUS grant) are journaled
+like every other tunnel write and roll back with the tunnel. A reduced
+grant does not reprogram the programmed envelope: the source re-trains
+within the granted envelope, conveyed by ALLOCATED_BW and ESTIMATED_BW.
+The published tunnel set is the allocation ledger — a tunnel is published
+when its activation completes and removed when its teardown completes, so
+accounting never charges a half-programmed tunnel and never misses a live
+one.
 
 The CM does not request XDomain control. PCIe tunnelling is gated on the
 PCIe bit of the `_OSC` grant at both layers: without it, router
@@ -158,14 +188,17 @@ it does not emulate an AMD USB4 dock or prove physical monitor output.
 
 ## 8. Open work
 
-Hardware validation; full DP bandwidth allocation and multiple DP tunnels;
-firmware tunnel adoption; controller reset recovery after resume
+Hardware validation; firmware tunnel adoption; controller reset recovery after resume
 (tunnel replay assumes the control channel survives the sleep or is
 re-established by that recovery);
 XDomain tunnels, link bonding and retimer policy.
 Legacy ICM is closed by detect-and-defer (§3): firmware-managed hosts are
 stood aside from, and implementing the ICM protocol itself — or adopting
 the firmware's tunnels — is out of scope by design, not pending work.
+DP remainders: UHBR (128b/132b) tunnel envelopes, Gen 4 asymmetric link
+transitions, and renegotiating the programmed REMOTE_CAP envelope itself
+in response to allocation changes (today the source re-trains within the
+granted envelope).
 PCIe remainders: a pre-activation wait for the PCIe adapters' LTSSM
 Detect state, and a runtime PCI rescan of the NHI's companion bridge so
 tunnelled devices enumerate without a reboot (the CM publishes tunnels;
