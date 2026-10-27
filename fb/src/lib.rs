@@ -581,7 +581,8 @@ fn clear_generic() {
 pub(crate) fn adopted_external_scanout() -> bool {
     let phys = GENERIC_PHYS.load(core::sync::atomic::Ordering::Acquire);
     #[cfg(feature = "amdgpu")]
-    let amd = narf_drivers_gpu::amdgpu_dcn_display::active_scanout().is_some_and(|p| phys == p.addr);
+    let amd =
+        narf_drivers_gpu::amdgpu_dcn_display::active_scanout().is_some_and(|p| phys == p.addr);
     #[cfg(not(feature = "amdgpu"))]
     let amd = false;
     #[cfg(feature = "intel")]
@@ -604,7 +605,7 @@ fn external_scanout_geom() -> Option<narf_drivers_gpu::drm_fb_hook::ScanoutGeom>
     let intel = narf_drivers_gpu::intel_gpu::active_scanout_generic();
     #[cfg(not(feature = "intel"))]
     let intel: Option<narf_graphics_driver::generic::GenericFb> = None;
-    let published = amd.or_else(|| intel)?;
+    let published = amd.or(intel)?;
     // Compare with this publication, not a second ACTIVE sample that could
     // already name the next front. The caller leases GENERIC_FB under the
     // replacement gate, so its mapping cannot change during this query.
