@@ -14,6 +14,8 @@ pub mod he;
 pub mod phy;
 #[path = "association/sae_join.rs"]
 mod sae_join;
+#[path = "association/uhr.rs"]
+pub mod uhr;
 pub use sae_join::{SaeJoin, SaePwe, SaeStep};
 
 /// One validated beacon/probe response, retaining original IEs for the SME.

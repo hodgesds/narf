@@ -4,6 +4,7 @@
 //! Wire definitions: Linux include/linux/ieee80211-{ht,vht}.h, mac80211/{ht,vht}.c.
 use super::eht::{self, EhtCapability, EhtNegotiation, EhtOperation, LocalEht};
 use super::he::{self, HeCapability, HeNegotiation, HeOperation, LocalHe};
+use super::uhr::{self, LocalUhr, UhrCapability, UhrNegotiation, UhrOperation};
 use super::{channel, ies, Error};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,6 +336,7 @@ pub struct LocalPhy {
     vht: Option<LocalVht>,
     he: Option<LocalHe>,
     eht: Option<LocalEht>,
+    uhr: Option<LocalUhr>,
 }
 impl LocalPhy {
     pub fn ht20(local: LocalHt) -> Result<Self, Error> {
@@ -346,6 +348,7 @@ impl LocalPhy {
             vht: None,
             he: None,
             eht: None,
+            uhr: None,
         })
     }
     pub fn ht40(local: LocalHt) -> Result<Self, Error> {
@@ -357,6 +360,7 @@ impl LocalPhy {
             vht: None,
             he: None,
             eht: None,
+            uhr: None,
         })
     }
     pub fn vht80(ht: LocalHt, vht: LocalVht) -> Result<Self, Error> {
@@ -368,6 +372,7 @@ impl LocalPhy {
             vht: Some(vht),
             he: None,
             eht: None,
+            uhr: None,
         })
     }
     pub fn vht160(ht: LocalHt, vht: LocalVht) -> Result<Self, Error> {
@@ -379,6 +384,7 @@ impl LocalPhy {
             vht: Some(vht),
             he: None,
             eht: None,
+            uhr: None,
         })
     }
     /// Opt into HE (IEEE802.11ax) on top of this HT/VHT profile. On 5GHz
@@ -410,6 +416,19 @@ impl LocalPhy {
     pub fn eht(&self) -> Option<&LocalEht> {
         self.eht.as_ref()
     }
+    /// Opt into UHR (IEEE P802.11bn D1.3) on top of `with_eht`. UHR is only
+    /// admitted for `LocalUhr::for_mld_association` on the
+    /// `Offer::from_elements` path (see `association::uhr`).
+    pub fn with_uhr(mut self, uhr: LocalUhr) -> Result<Self, Error> {
+        if self.eht.is_none() {
+            return Err(Error::UnsupportedRates);
+        }
+        self.uhr = Some(uhr);
+        Ok(self)
+    }
+    pub fn uhr(&self) -> Option<&LocalUhr> {
+        self.uhr.as_ref()
+    }
 }
 
 /// Fixed-size copies of the complete original element stream's PHY bodies.
@@ -423,6 +442,9 @@ pub struct ApElements {
     he_op: Option<HeOperation>,
     eht_cap: Option<EhtCapability>,
     eht_op: Option<EhtOperation>,
+    uhr_cap: Option<UhrCapability>,
+    uhr_op: Option<UhrOperation>,
+    ml_basic: bool,
 }
 impl ApElements {
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
@@ -467,6 +489,26 @@ impl ApElements {
                         }
                         value.eht_op = Some(EhtOperation::parse(rest)?);
                     }
+                    Some((&uhr::EXT_UHR_CAPABILITIES, rest)) => {
+                        if value.uhr_cap.is_some() {
+                            return Err(Error::InvalidBss);
+                        }
+                        value.uhr_cap = Some(UhrCapability::parse(rest, true)?);
+                    }
+                    Some((&uhr::EXT_UHR_OPERATION, rest)) => {
+                        if value.uhr_op.is_some() {
+                            return Err(Error::InvalidBss);
+                        }
+                        value.uhr_op = Some(UhrOperation::parse(rest)?);
+                    }
+                    Some((&uhr::EXT_MULTI_LINK, rest)) => {
+                        if uhr::basic_multi_link(rest)? {
+                            if value.ml_basic {
+                                return Err(Error::InvalidBss);
+                            }
+                            value.ml_basic = true;
+                        }
+                    }
                     _ => {}
                 },
                 1 | 50 => {
@@ -487,6 +529,7 @@ impl ApElements {
             || value.he_cap.is_some() && value.ht_cap.is_none()
             || eht_cap.is_some() != value.eht_op.is_some()
             || eht_cap.is_some() && value.he_cap.is_none()
+            || (value.uhr_cap.is_some() || value.uhr_op.is_some()) && eht_cap.is_none()
         {
             return Err(Error::InvalidBss);
         }
@@ -545,6 +588,16 @@ impl ApElements {
     }
     pub fn eht_operation(&self) -> Option<&EhtOperation> {
         self.eht_op.as_ref()
+    }
+    pub fn uhr_capability(&self) -> Option<&UhrCapability> {
+        self.uhr_cap.as_ref()
+    }
+    pub fn uhr_operation(&self) -> Option<&UhrOperation> {
+        self.uhr_op.as_ref()
+    }
+    /// A Basic Multi-Link element is present.
+    pub fn basic_multi_link(&self) -> bool {
+        self.ml_basic
     }
 }
 fn singleton<const N: usize>(slot: &mut Option<[u8; N]>, body: &[u8]) -> Result<(), Error> {
@@ -778,6 +831,9 @@ struct Selection {
     vht: Option<VhtNegotiation>,
     he: Option<HeNegotiation>,
     eht: Option<EhtNegotiation>,
+    uhr: Option<UhrNegotiation>,
+    /// Built from a native owner's element snapshot (`from_elements`).
+    native: bool,
     width: Width,
     center: u8,
     channels: [u8; 8],
@@ -804,6 +860,10 @@ macro_rules! selection_accessors {
         /// Non-MLO EHT facts when negotiated on top of HE.
         pub fn eht(&self) -> Option<&EhtNegotiation> {
             self.0.eht.as_ref()
+        }
+        /// UHR facts for a native MLD association (never for `JoinPlan`).
+        pub fn uhr(&self) -> Option<&UhrNegotiation> {
+            self.0.uhr.as_ref()
         }
         pub fn width(&self) -> Width {
             self.0.width
@@ -837,7 +897,13 @@ impl Offer {
         bytes: &[u8],
         primary: u8,
     ) -> Result<Option<Self>, Error> {
-        Self::prepare(local, bytes, primary, element_selectors(bytes, primary)?)
+        Self::prepare_from(
+            local,
+            bytes,
+            primary,
+            element_selectors(bytes, primary)?,
+            true,
+        )
     }
     /// Intersect a native association-response IE snapshot with this offer.
     /// The caller must already prove the actual response's peer/status and
@@ -854,6 +920,15 @@ impl Offer {
         primary: u8,
         selectors: u8,
     ) -> Result<Option<Self>, Error> {
+        Self::prepare_from(local, bytes, primary, selectors, false)
+    }
+    fn prepare_from(
+        local: LocalPhy,
+        bytes: &[u8],
+        primary: u8,
+        selectors: u8,
+        native: bool,
+    ) -> Result<Option<Self>, Error> {
         let ap = ApElements::parse(bytes)?;
         if ap.ht_cap.is_none() {
             if selectors & super::SEL_PHY != 0 {
@@ -861,7 +936,7 @@ impl Offer {
             }
             return Ok(None);
         }
-        let selected = select(local, ap, primary)?;
+        let selected = select(local, ap, primary, native)?;
         check_selectors(selectors, &selected)?;
         Ok(Some(Self(selected)))
     }
@@ -870,7 +945,11 @@ impl Offer {
             self.0.local,
             ApElements::parse(bytes)?,
             self.0.ht.operation.primary(),
+            self.0.native,
         )?;
+        if self.0.uhr.is_some() != next.uhr.is_some() {
+            return Err(Error::UnsupportedRates);
+        }
         check_selectors(selectors, &next)?;
         // An HE offer requires HE in the response and vice versa (mac80211
         // ieee80211_assoc_config_link: "HE AP is missing HE capability/operation").
@@ -1012,12 +1091,15 @@ fn check_selectors(selectors: u8, selection: &Selection) -> Result<(), Error> {
     if selection.eht.is_some() {
         supported |= super::SEL_EHT;
     }
+    if selection.uhr.is_some() {
+        supported |= super::SEL_UHR;
+    }
     if selectors & super::SEL_PHY & !supported != 0 {
         return Err(Error::UnsupportedRates);
     }
     Ok(())
 }
-fn select(local: LocalPhy, ap: ApElements, primary: u8) -> Result<Selection, Error> {
+fn select(local: LocalPhy, ap: ApElements, primary: u8, native: bool) -> Result<Selection, Error> {
     let cap = ap.ht_cap.ok_or(Error::UnsupportedRates)?;
     let op = HtOperation::parse(ap.ht_op.ok_or(Error::UnsupportedRates)?, primary)?;
     if op.secondary.is_some() && le16(&cap[..2]) & 2 == 0 {
@@ -1047,6 +1129,8 @@ fn select(local: LocalPhy, ap: ApElements, primary: u8) -> Result<Selection, Err
         vht: None,
         he: None,
         eht: None,
+        uhr: None,
+        native,
         width: Width::Twenty,
         center: primary,
         channels: [primary, 0, 0, 0, 0, 0, 0, 0],
@@ -1236,6 +1320,18 @@ fn select(local: LocalPhy, ap: ApElements, primary: u8) -> Result<Selection, Err
         primary80,
         selected.center2 != 0,
     )?;
+    selected.uhr = uhr::negotiate(
+        local.uhr.filter(|_| native),
+        ap.uhr_cap,
+        ap.uhr_op,
+        ap.ml_basic,
+        selected.eht.as_ref(),
+        selected.width,
+        selected.center2 != 0,
+        primary,
+        &selected.channels[..selected.count],
+        false,
+    );
     Ok(selected)
 }
 /// Primary80 constituents of a canonical80 center and the primary's index.
