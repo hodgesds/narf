@@ -681,6 +681,117 @@ fn extract_one(field: &Field, body: &[u8]) -> Result<i32, SensorDecodeError> {
         .ok_or(SensorDecodeError::FieldExtract)
 }
 
+// -- Unit-exponent rescale ---------------------------------------------------
+//
+// `decode_report` returns raw field counts. A HID sensor's fields are
+// denominated in the descriptor's declared SI unit scaled by the
+// field's unit exponent (HID Sensor Usages §6: `physical = raw ×
+// 10^unit_exp`), while `SensorEvent`'s contract is the canonical
+// milli-scale units documented on the enum. `rescale_event` is the
+// single conversion between the two, shared by every descriptor-driven
+// transport (Intel ISH, I2C-HID sensor hubs) so the unit contract
+// cannot drift per transport. (AMD SFH does not use it: its firmware
+// reports already-decoded floats, converted in `amd_sfh` itself.)
+
+/// raw × 10^(exp+3): the value in milli-(base unit).
+fn to_milli_base(raw: i32, exp: i32) -> i64 {
+    let shift = exp.saturating_add(3);
+    let v = raw as i64;
+    if shift >= 0 {
+        v.saturating_mul(pow10_i64(shift.clamp(0, u8::MAX as i32) as u8))
+    } else {
+        v / pow10_i64((-shift).clamp(0, u8::MAX as i32) as u8)
+    }
+}
+
+/// raw × 10^exp (whole base units, for lux).
+fn to_whole_base(raw: i32, exp: i32) -> i64 {
+    let v = raw as i64;
+    if exp >= 0 {
+        v.saturating_mul(pow10_i64(exp.clamp(0, u8::MAX as i32) as u8))
+    } else {
+        v / pow10_i64((-exp).clamp(0, u8::MAX as i32) as u8)
+    }
+}
+
+fn clamp_i32(v: i64) -> i32 {
+    v.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+/// Apply the HID unit contract to a decoded event, using the
+/// descriptor unit exponent `exp` of the profile it came from
+/// (`HidSensorProfile::fields[0].unit_exp` by convention).
+pub fn rescale_event(ev: SensorEvent, exp: i32) -> SensorEvent {
+    match ev {
+        SensorEvent::Accel3d {
+            x_milli_g,
+            y_milli_g,
+            z_milli_g,
+            timestamp_ns,
+        } => {
+            // Descriptor accel unit is m/s²; milli-m/s² → milli-g:
+            // × 1000 / 9807 (9.80665 m/s² per g, integer form).
+            let conv = |raw: i32| clamp_i32(to_milli_base(raw, exp) * 1000 / 9807);
+            SensorEvent::Accel3d {
+                x_milli_g: conv(x_milli_g),
+                y_milli_g: conv(y_milli_g),
+                z_milli_g: conv(z_milli_g),
+                timestamp_ns,
+            }
+        }
+        SensorEvent::Gyro3d {
+            x_milli_dps,
+            y_milli_dps,
+            z_milli_dps,
+            timestamp_ns,
+        } => {
+            let conv = |raw: i32| clamp_i32(to_milli_base(raw, exp));
+            SensorEvent::Gyro3d {
+                x_milli_dps: conv(x_milli_dps),
+                y_milli_dps: conv(y_milli_dps),
+                z_milli_dps: conv(z_milli_dps),
+                timestamp_ns,
+            }
+        }
+        SensorEvent::Magneto3d {
+            x_micro_t,
+            y_micro_t,
+            z_micro_t,
+            timestamp_ns,
+        } => {
+            // milli-milligauss → µT: 1 mG = 0.1 µT, so ÷ 10_000.
+            let conv = |raw: i32| clamp_i32(to_milli_base(raw, exp) / 10_000);
+            SensorEvent::Magneto3d {
+                x_micro_t: conv(x_micro_t),
+                y_micro_t: conv(y_micro_t),
+                z_micro_t: conv(z_micro_t),
+                timestamp_ns,
+            }
+        }
+        SensorEvent::Lux { lux, timestamp_ns } => SensorEvent::Lux {
+            lux: clamp_i32(to_whole_base(lux as i32, exp)).max(0) as u32,
+            timestamp_ns,
+        },
+        SensorEvent::Inclination {
+            x_milli_deg,
+            y_milli_deg,
+            z_milli_deg,
+            timestamp_ns,
+        } => {
+            let conv = |raw: i32| clamp_i32(to_milli_base(raw, exp));
+            SensorEvent::Inclination {
+                x_milli_deg: conv(x_milli_deg),
+                y_milli_deg: conv(y_milli_deg),
+                z_milli_deg: conv(z_milli_deg),
+                timestamp_ns,
+            }
+        }
+        // Proximity (distance mm / presence) and FusedOrientation
+        // pass through untouched.
+        other => other,
+    }
+}
+
 // -- Feature-report: sample-rate ---------------------------------------------
 
 /// Error type for feature-report encode / decode.

@@ -913,7 +913,15 @@ impl<B: Mp2Bus, W: SharedWindow, P: ReportBuffers> SfhHub<B, W, P> {
                     .find(|p| p.kind == def.kind && p.input_report_id == def.report_id)
                     .ok_or(SfhError::Descriptor)?;
                 slot.report_len = report_len_for(&profile);
+                let kind = profile.kind;
                 slot.profile = Some(profile);
+                // Publish the collection through the shared surface
+                // (idempotent across rediscovery).
+                crate::hid_sensor_pub::register_sensor(
+                    crate::hid_sensor_pub::SensorSource::AmdSfh,
+                    sid as u32,
+                    kind,
+                );
             }
             self.slots[self.slot_count] = slot;
             self.slot_count += 1;
@@ -1180,8 +1188,9 @@ impl<B: Mp2Bus, W: SharedWindow, P: ReportBuffers> SfhHub<B, W, P> {
     // -- report path ------------------------------------------------
 
     /// Poll every enabled sensor once; decode any new report and
-    /// push the resulting event onto the shared sensor ring.
-    /// Returns how many events were pushed.
+    /// publish the resulting event through the shared publication
+    /// path (`hid_sensor_pub` — sysfs/IIO surface + legacy sensor
+    /// ring). Returns how many events reached the ring.
     pub fn poll_all(&mut self, timestamp_ns: u64) -> usize {
         let mut pushed = 0;
         for i in 0..self.slot_count {
@@ -1192,7 +1201,18 @@ impl<B: Mp2Bus, W: SharedWindow, P: ReportBuffers> SfhHub<B, W, P> {
                 continue;
             }
             if let Some(ev) = self.poll_sensor(i, timestamp_ns) {
-                if hid_sensor::push_sensor_event(ev) {
+                let slot = &self.slots[i];
+                let kind = slot.profile.as_ref().map(|p| p.kind);
+                let reached_ring = match kind {
+                    Some(kind) => crate::hid_sensor_pub::publish(
+                        crate::hid_sensor_pub::SensorSource::AmdSfh,
+                        slot.sensor_id as u32,
+                        kind,
+                        ev,
+                    ),
+                    None => hid_sensor::push_sensor_event(ev),
+                };
+                if reached_ring {
                     pushed += 1;
                 }
             }
@@ -2088,6 +2108,79 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/input", smoke_sfh11_report_end_to_end);
+
+    // Publication round trip (issue #773): discovery registers the
+    // hub's sensors, and one poll publishes BOTH the accelerometer
+    // and the ALS reading to their own IIO sysfs devices — the two
+    // kinds concurrently live on one hub must not alias. Values are
+    // the firmware encodings the report-path fixture above pins:
+    // accel z = 9.81f m/s² → 1000 milli-g; ALS = 250.0f → 250 lux.
+    fn smoke_sfh_publication_round_trip() -> TestResult {
+        reset_ring();
+        crate::hid_sensor_pub::__reset_for_test();
+        narf_filesystem::sysfs::__reset_for_test();
+        let sensors = (1 << SID_1_1_ACCEL) | (1 << SID_1_1_ALS);
+        let (mut hub, _fw, mem) = hub11(sensors, 0x0001_0000);
+        if hub.discover().is_err() || hub.enable_all() != 2 {
+            return TestResult::Fail("setup failed");
+        }
+        let infos = crate::hid_sensor_pub::sensors();
+        let find = |kind: hid_sensor::HidSensorKind| {
+            infos
+                .iter()
+                .find(|i| i.kind == kind && i.source == crate::hid_sensor_pub::SensorSource::AmdSfh)
+                .map(|i| i.id)
+        };
+        let (Some(accel), Some(als)) = (
+            find(hid_sensor::HidSensorKind::Accelerometer3D),
+            find(hid_sensor::HidSensorKind::AmbientLight),
+        ) else {
+            return TestResult::Fail("discover did not register the SFH sensors");
+        };
+        let show = |id: crate::hid_sensor_pub::SensorId, attr: &str| {
+            narf_filesystem::sysfs::class_register("iio")
+                .get_child(&alloc::format!("iio:device{}", id.0))
+                .and_then(|k| k.attr_show(attr))
+        };
+        // Registered at discovery, before any reading: identity is
+        // live, raw is empty (no fabricated sample).
+        if show(als, "name").as_deref() != Some("als\n")
+            || show(als, "in_illuminance_raw").as_deref() != Some("")
+        {
+            return TestResult::Fail("ALS device wrong before first reading");
+        }
+        win_put_u32(&mem, 1024 + data_1_1::INTR_CNT, 1);
+        win_put_u32(&mem, 1024 + data_1_1::PAYLOAD, 0x0000_0000);
+        win_put_u32(&mem, 1024 + data_1_1::PAYLOAD + 4, 0x0000_0000);
+        win_put_u32(&mem, 1024 + data_1_1::PAYLOAD + 8, 0x411C_F5C3); // 9.81f
+        win_put_u32(&mem, 2048 + data_1_1::INTR_CNT, 1);
+        win_put_u32(&mem, 2048 + data_1_1::PAYLOAD, 0x437A_0000); // 250.0f
+        if hub.poll_all(777) != 2 {
+            return TestResult::Fail("poll pushed wrong count");
+        }
+        if show(accel, "in_accel_z_raw").as_deref() != Some("1000\n") {
+            return TestResult::Fail("accel reading not published to sysfs");
+        }
+        if show(als, "in_illuminance_raw").as_deref() != Some("250\n") {
+            return TestResult::Fail("ALS reading not published to sysfs");
+        }
+        if show(accel, "in_illuminance_raw").is_some() || show(als, "in_accel_z_raw").is_some() {
+            return TestResult::Fail("channels leaked across kinds");
+        }
+        if crate::hid_sensor_pub::latest_of_kind(hid_sensor::HidSensorKind::AmbientLight)
+            != Some((
+                als,
+                SensorEvent::Lux {
+                    lux: 250,
+                    timestamp_ns: 777,
+                },
+            ))
+        {
+            return TestResult::Fail("ALS reading not in the published store");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input", smoke_sfh_publication_round_trip);
 
     fn smoke_sfh11_hpd_presence() -> TestResult {
         reset_ring();

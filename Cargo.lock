@@ -2850,6 +2850,7 @@ dependencies = [
  "narf-drivers-i2c",
  "narf-drivers-virtio",
  "narf-fb",
+ "narf-filesystem",
  "narf-hid",
  "narf-init",
  "narf-input",
