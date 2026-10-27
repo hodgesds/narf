@@ -266,6 +266,74 @@ fn hdmi_enable_order(log: &[m::Write], r: Route, tx: u8) -> Result<usize, &'stat
         ],
     )
 }
+/// Firmware/reset residue must not select a different physical output or
+/// leave the DCN3 output rate policy dependent on its previous owner.
+fn inherited_hdmi_output_state(dword: u32, poison: u32, mask: u32, expected: u32) -> TestResult {
+    let bench = Bench::new();
+    bench.set(m::MP1 + 0x274, 1);
+    // Bit 24 is unrelated state which both Linux REG_UPDATEs preserve.
+    bench.set(dword, poison | (1 << 24));
+    let vram = Vram::new(VRAM_BYTES);
+    let image = m::vbios(7);
+    let tables = Tables::new(&image).unwrap();
+    let connector = m::connector(Signal::Hdmi, 3, 3);
+    let r = Resources::new().acquire(&connector).unwrap();
+    let mut p = pipeline(&bench, connector, r);
+    let sink = m::sink_audio(Signal::Hdmi, None, false);
+    if run(enable_with(&mut p, &vram, &tables, &sink, &mut NoAux)).is_err() {
+        return TestResult::Fail("poisoned HDMI output failed enable");
+    }
+    let value = bench.get(dword);
+    let log = bench.log();
+    let order = in_order(
+        &log,
+        0,
+        &[
+            (
+                "pixel clock before output initialization",
+                &table(m::SLOT_PIXEL_CLOCK, None, None),
+            ),
+            ("initialize inherited output state", &|w: &m::Write| {
+                w.dword == dword && w.value & mask == expected
+            }),
+            (
+                "output initialized before encoder attributes",
+                &table(m::SLOT_STREAM_SETUP, None, None),
+            ),
+        ],
+    );
+    let stopped = run(p.disable(&tables, &mut NoAux)).is_ok();
+    if value & mask != expected || value & (1 << 24) == 0 {
+        return TestResult::Fail("inherited HDMI output state was not normalized");
+    }
+    if let Err(name) = order {
+        return TestResult::Fail(name);
+    }
+    if !stopped {
+        return TestResult::Fail("poisoned HDMI output teardown");
+    }
+    TestResult::Pass
+}
+
+fn navi22_hdmi_routes_otg_to_dio_before_stream_attributes() -> TestResult {
+    // OTG_CONTROL.OTG_OUT_MUX: optc3_set_out_mux(OUT_MUX_DIO = 0).
+    inherited_hdmi_output_state(d2(0x1b41), 1 << 20, 1 << 20, 0)
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_hdmi_routes_otg_to_dio_before_stream_attributes
+);
+
+fn navi22_hdmi_disables_mpc_rate_control_before_stream_attributes() -> TestResult {
+    // MPC_OUT0_MUX: mpc3_set_out_rate_control always sets disable=1,
+    // rate=0. mpc3_mpc_init_single_inst alone does not clear rate bit 9.
+    inherited_hdmi_output_state(d3(0x580), 1 << 9, (1 << 8) | (1 << 9), 1 << 8)
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_hdmi_disables_mpc_rate_control_before_stream_attributes
+);
+
 fn hdmi_disable_order(
     log: &[m::Write],
     from: usize,

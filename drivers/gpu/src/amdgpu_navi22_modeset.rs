@@ -1336,6 +1336,10 @@ impl Pipeline {
             Signal::Hdmi => self.otg.program_tmds_timing(&timing, &sync)?,
             Signal::DisplayPort => self.otg.program_timing(&timing, &sync)?,
         }
+        // dcn20_enable_stream_timing -> mpc3_set_out_rate_control.
+        // mpc3_mpc_init_single_inst only clears FLOW_CONTROL_COUNT;
+        // the stream step also clears a previously selected rate mode.
+        self.mpc_rate_control_off(pipe)?;
         self.opp
             .program(Encoding::Rgb, timing.h_active, timing.v_active)?;
         self.opp.set_blank(true)?;
@@ -1375,6 +1379,7 @@ impl Pipeline {
         if let Some(underflow) = self.read_underflow()? {
             return Err(self.quarantine(underflow));
         }
+        self.report_hdmi_status(aux, "settled").await;
         Ok(Output {
             connector: self.connector,
             route: self.route,
@@ -1455,11 +1460,29 @@ impl Pipeline {
                 symbol_khz: stream.character_khz,
             },
         )?;
+        self.report_hdmi_status(aux, "transmitter").await;
+        // The second setup Linux issues after transmitter control.
+        self.dig.setup(DigMode::Hdmi)?;
+        // dcn20_enable_stream: setup_dio_stream_encoder, update_info_frame.
+        self.dig.connect_be_to_fe(true)?;
+        self.dig.hdmi_info_packets(&stream).await?;
+        self.dig.set_avmute(false)?;
+        Ok(())
+    }
+    /// Diagnostic only: the early Linux sample precedes final plane unblank.
+    /// A second sample after the verify frames observes the enabled stream.
+    async fn report_hdmi_status<A: Aux + Send>(&self, aux: &mut A, phase: &str) {
+        if self.connector.signal != Signal::Hdmi {
+            return;
+        }
+        let Some(stream) = self.hdmi else {
+            return;
+        };
         if let Some(status) = hdmi::read_scdc_data(aux, &stream).await {
             use core::fmt::Write as _;
             let _ = writeln!(
                 narf_console::Writer,
-                "amdgpu: navi22 HDMI {} kHz {} bpc{} SCDC TMDS_Config {:#x} scrambler {:?} flags {:?}",
+                "amdgpu: navi22 HDMI {} kHz {} bpc{} SCDC TMDS_Config {:#x} scrambler {:?} flags {:?} phase={phase}",
                 stream.character_khz,
                 stream.format.depth.bpc(),
                 if stream.format.ycbcr420 { " 4:2:0" } else { "" },
@@ -1468,13 +1491,6 @@ impl Pipeline {
                 status.status_flags,
             );
         }
-        // The second setup Linux issues after transmitter control.
-        self.dig.setup(DigMode::Hdmi)?;
-        // dcn20_enable_stream: setup_dio_stream_encoder, update_info_frame.
-        self.dig.connect_be_to_fe(true)?;
-        self.dig.hdmi_info_packets(&stream).await?;
-        self.dig.set_avmute(false)?;
-        Ok(())
     }
     /// m5hdmi: the board's HDMI ceilings, from the VBIOS encoder caps of
     /// this connector's transmitter (`dcn30_link_encoder_construct`: no

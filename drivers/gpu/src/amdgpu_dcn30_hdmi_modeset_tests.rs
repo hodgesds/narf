@@ -192,6 +192,18 @@ fn dcn30_hdmi_modeset_deep_colour_scrambled_with_scdc_in_linux_order() -> TestRe
     if status.is_none() {
         return TestResult::Fail("SCDC before the transmitter");
     }
+    // The first sample precedes pixels. A second sample must observe the
+    // final unblank/unlock, rather than treating early zero lock bits as
+    // evidence that the running HDMI link failed.
+    let unlock = status.and_then(|a| {
+        pos(&log, a, |w| {
+            w.dword == d2(0x1b8b + p * 0x80) && w.value == 0
+        })
+    });
+    let settled = unlock.and_then(|a| pos(&log, a, |w| w.dword == SCDC_READ | 0x40));
+    if settled.is_none() {
+        return TestResult::Fail("no settled HDMI sink status after final unlock");
+    }
     // Teardown: AVMUTE, legacy TMDS_Config 0, then the transmitter DISABLE.
     if let Err(why) = stop(&mut lit) {
         return TestResult::Fail(why);

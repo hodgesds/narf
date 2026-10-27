@@ -229,7 +229,7 @@ impl Pipeline {
     }
     /// `mpc3_set_out_rate_control`: DCN3.0 always turns the MPC's output
     /// rate and flow control off, for every OPP of the stream.
-    fn mpc_rate_control_off(&mut self, opp: u8) -> Result<(), Error> {
+    pub(super) fn mpc_rate_control_off(&mut self, opp: u8) -> Result<(), Error> {
         let reg = self.dcn3 + (MPC_OUT0_MUX + u64::from(opp) * MPC_OUT_STRIDE) * 4;
         self.regs.update(
             reg,
@@ -1093,6 +1093,15 @@ impl Group {
         }
         if let Some(e) = first_underflow {
             return Err(e);
+        }
+        for k in 0..n {
+            let mut port = On {
+                links: aux,
+                link: self.requests[k].link,
+            };
+            self.members[k]
+                .report_hdmi_status(&mut port, "settled")
+                .await;
         }
         let mut outputs = Vec::new();
         outputs

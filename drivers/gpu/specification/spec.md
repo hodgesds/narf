@@ -65,6 +65,26 @@ datapath ABI yet, so the feature gate is the selection mechanism.
 
 ### Legacy framebuffers and native mode timing
 
+DCN3.0 DIO scanout explicitly selects `OTG_OUT_MUX = OUT_MUX_DIO` before
+encoder stream attributes are programmed. Single-stream and multi-stream
+timing enable both apply `mpc3_set_out_rate_control`'s output policy
+(`MPC_OUT_RATE_CONTROL_DISABLE = 1`, `MPC_OUT_RATE_CONTROL = 0`) before
+enabling the OPP. Neither operation depends on inherited firmware defaults;
+masked updates preserve unrelated register fields. These initialization
+guarantees do not by themselves establish physical HDMI sink lock.
+For progressive modes, both DCN3.0 and DCN3.1.4 timing programming clear
+`OTG_INTERLACE_ENABLE` and initialize the selected VTG's `VCOUNT_INIT` to
+`v_total - v_front_porch`. `FP2` is
+`max(0, vstartup - (v_total - v_front_porch - v_active) - 1)`.
+These fields are written while the VTG is disabled, before OTG enable;
+enabling the VTG preserves them. The register update preserves unrelated
+bits and uses the profile's VTG instance layout.
+For SCDC-capable HDMI sinks, diagnostic status is sampled both immediately
+after transmitter enable and after final unblank plus the two-frame
+underflow verification window, labelled `phase=transmitter` and
+`phase=settled`. Missing/negative diagnostic reads do not tear down a stream;
+the early sample is not treated as a settled-lock assertion.
+
 `DRM_IOCTL_MODE_ADDFB` uses Linux's 28-byte `drm_mode_fb_cmd` request
 (`0xc01c64ae`). It converts the legacy bpp/depth pair to a DRM fourcc and
 supplies one handle/pitch, zero offsets and no modifiers to the existing

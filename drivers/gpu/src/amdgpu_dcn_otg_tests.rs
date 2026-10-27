@@ -88,7 +88,7 @@ fn otg_navi22_uses_dcn30_sync_fields_and_disable_point() -> TestResult {
         }
     }
     otg.enable().unwrap();
-    if otg.io.values[0x052d] != 1 << 31 || otg.io.values[0x1dc1] & 0x301 != 0x301 {
+    if otg.io.values[0x052d] != (1121 << 16) | (1 << 31) || otg.io.values[0x1dc1] & 0x301 != 0x301 {
         return TestResult::Fail("DCN30 VTG or disable point");
     }
     run(otg.disable()).unwrap();
@@ -315,4 +315,61 @@ fn otg_tmds_timing_counts_from_start_point_zero() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn-otg",
     otg_tmds_timing_counts_from_start_point_zero
+);
+
+fn otg_vtg_parameters_follow_blank_and_prefetch_start() -> TestResult {
+    for profile in [Profile::Navi22, Profile::Dcn314] {
+        for instance in [0, 5] {
+            // 1080p: v_init = 1125 - 4 = 1121; blank_end = 41.
+            // FP2 = max(0, vstartup - blank_end - 1), including the
+            // zero boundary and a prefetch start before VSYNC.
+            for (startup, fp2) in [(9, 0), (42, 0), (59, 17)] {
+                let mut otg = engine(0);
+                otg.profile = profile;
+                otg.instance = instance;
+                otg.io.values.resize(0x1e0a, 0);
+                let vtg = otg.otg_vtg() as usize;
+                // Poison both fields; bit 15 is outside the Linux update.
+                otg.io.values[vtg] = 0x7fff_ffff;
+                let mut sync = sync();
+                sync.v_startup_lines = startup;
+                if otg.program_tmds_timing(&timing(), &sync).is_err() {
+                    return TestResult::Fail("VTG timing rejected");
+                }
+                let expected = (1121 << 16) | fp2 | (1 << 15);
+                if otg.io.values[vtg] != expected {
+                    return TestResult::Fail(
+                        "VTG VCOUNT_INIT / FP2 inherited instead of programmed",
+                    );
+                }
+                if otg.enable().is_err() || otg.io.values[vtg] != expected | (1 << 31) {
+                    return TestResult::Fail("VTG parameters lost when enabling");
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-otg",
+    otg_vtg_parameters_follow_blank_and_prefetch_start
+);
+
+fn otg_progressive_timing_clears_inherited_interlace() -> TestResult {
+    for profile in [Profile::Navi22, Profile::Dcn314] {
+        let mut otg = engine(0);
+        otg.profile = profile;
+        // OTG0_OTG_INTERLACE_CONTROL, common offset on both profiles.
+        otg.io.values[0x1b44] = 0x0003_0001;
+        if otg.program_tmds_timing(&timing(), &sync()).is_err()
+            || otg.io.values[0x1b44] != 0x0003_0000
+        {
+            return TestResult::Fail("progressive timing inherited interlace enable");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-otg",
+    otg_progressive_timing_clears_inherited_interlace
 );

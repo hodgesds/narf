@@ -338,6 +338,11 @@ nothing.
 
 ### Entry-path audit, 2026-10-23
 
+The follow-up [DCN3.0 HDMI audit](NAVI22_HDMI_AUDIT.md) records the selected
+Linux callbacks, missing VTG and progressive-timing initialization, explicit
+DIO routing, and the single-stream MPC output-rate gap. It distinguishes
+register-model evidence from physical sink lock and visible output.
+
 The CachyOS audit follows `fb/src/amdgpu_boot.rs` through the retained RDNA2
 platform, display monitor and first DRM client operations. Linux references
 are the local checkout at `ecd997b0189a`; register fields were compared with
