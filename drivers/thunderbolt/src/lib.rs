@@ -2,8 +2,10 @@
 //!
 //! PCI discovery includes AMD Pink Sardine and Intel USB4 class controllers.
 //! Firmware `_OSC` must grant USB3/DisplayPort ownership before ring zero is
-//! started. One actor owns each NHI's DMA rings, config transactions, topology,
-//! and tunnels. PCIe/XDomain tunneling and legacy ICM are not implemented.
+//! started; PCIe tunnelling is additionally programmed only when the `_OSC`
+//! grant includes the PCIe bit. One actor owns each NHI's DMA rings, config
+//! transactions, topology, and tunnels. XDomain tunneling and legacy ICM are
+//! not implemented.
 //!
 //! Reference: `/usr/src/linux/drivers/thunderbolt/{pci,nhi,ctl,usb4,path,tunnel}.c`.
 //!

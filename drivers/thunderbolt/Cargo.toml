@@ -1,6 +1,6 @@
 [package]
 name         = "narf-drivers-thunderbolt"
-description  = "USB4 NHI, native connection manager, USB3 and DisplayPort tunnels."
+description  = "USB4 NHI, native connection manager, USB3, DisplayPort and PCIe tunnels."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

@@ -112,6 +112,7 @@ async fn router(
     upstream: u8,
     controls: u32,
     configure: bool,
+    parent_pcie_down: bool,
 ) -> Result<Router, Error> {
     let mut h = ctl.read(route, 0, CfgSpace::Switch, 0, 5).await?;
     let version = h[4] >> 29;
@@ -147,6 +148,16 @@ async fn router(
             config |= 1 << 23; // This CM only implements USB4, not TBT3.
             if controls & 1 != 0 {
                 config |= 1 << 25;
+            }
+            // ROUTER_CS_5 PTO (bit 24): PCIe tunnelling on this
+            // router is enabled only when firmware granted PCIe
+            // control in `_OSC` AND the parent router carries a
+            // PCIe downstream adapter a tunnel could originate
+            // from — the same two conditions the USB4 router-setup
+            // sequence specifies. Without the grant the bit stays
+            // clear and no PCIe path is ever programmed.
+            if controls & super::firmware::CONTROL_PCIE != 0 && parent_pcie_down {
+                config |= 1 << 24;
             }
             ctl.write(route, 0, CfgSpace::Switch, 5, &[config]).await?;
             wait_bit(ctl, route, 6, 1 << 24, true).await?;
@@ -199,13 +210,16 @@ async fn scan(
         id,
         routers: Vec::new(),
     };
-    let mut queue = alloc::vec![(0, 0)];
+    // Queue entries carry whether the parent router carries a PCIe
+    // downstream adapter, which the child router's tunnelling
+    // configuration (ROUTER_CS_5 PTO) is conditioned on.
+    let mut queue = alloc::vec![(0, 0, false)];
     let mut index = 0;
     while index < queue.len() {
-        let (route, upstream) = queue[index];
+        let (route, upstream, parent_pcie_down) = queue[index];
         index += 1;
         let known = previous.routers.iter().any(|r| r.route == route);
-        let router = match router(ctl, route, upstream, controls, !known).await {
+        let router = match router(ctl, route, upstream, controls, !known, parent_pcie_down).await {
             Ok(r) => r,
             Err(Error::Remote(0 | 1 | 4)) if route != 0 => continue,
             Err(e) => return Err(e),
@@ -221,7 +235,8 @@ async fn scan(
                 if matches!((state >> 26) & 15, 2..=6) && queue.len() < 64 {
                     let child = compose_downstream(route, route_depth(route), p.number)
                         .ok_or(Error::Invalid)?;
-                    queue.push((child, 0));
+                    let pcie_down = router.ports.iter().any(|p| p.kind == 0x100101);
+                    queue.push((child, 0, pcie_down));
                 }
             }
         }
@@ -391,5 +406,69 @@ mod tests {
     kernel_test_in!(
         "drivers/thunderbolt/topology",
         usb4_live_enumeration_unlocks_and_bounds_capabilities
+    );
+
+    fn usb4_router_config_pcie_bit_follows_grant() -> TestResult {
+        // The host router carries a PCIe downstream adapter; the
+        // child router's ROUTER_CS_5 PTO bit (24) must be set
+        // exactly when the _OSC grant includes PCIe control
+        // (controls bit 2), with configuration-valid (bit 31) set
+        // in both cases.
+        for (controls, pto) in [(7u32, true), (3, false)] {
+            let mut m = Model::default();
+            for (route, count, upstream) in [(0u64, 2u32, 0u32), (1, 2, 1)] {
+                m.put(route, 0, CfgSpace::Switch, 0, 0x1234_1022);
+                m.put(
+                    route,
+                    0,
+                    CfgSpace::Switch,
+                    1,
+                    (count << 14) | (upstream << 8),
+                );
+                m.put(route, 0, CfgSpace::Switch, 4, 1 << 29);
+                m.put(route, 0, CfgSpace::Switch, 6, (1 << 24) | (1 << 25));
+                for number in 1..=count as u8 {
+                    let kind = if number == 2 {
+                        if route == 0 {
+                            0x100101
+                        } else {
+                            0x100102
+                        }
+                    } else {
+                        1
+                    };
+                    m.put(route, number, CfgSpace::Port, 1, 8);
+                    m.put(route, number, CfgSpace::Port, 2, kind);
+                    m.put(route, number, CfgSpace::Port, 4, (64 << 20) | (1 << 31));
+                    m.put(
+                        route,
+                        number,
+                        CfgSpace::Port,
+                        5,
+                        15 | (15 << 11) | (1 << 31),
+                    );
+                    m.put(route, number, CfgSpace::Port, 8, 1 << 8);
+                    m.put(route, number, CfgSpace::Port, 9, 2 << 26);
+                }
+            }
+            let previous = Domain {
+                id: 99,
+                routers: Vec::new(),
+            };
+            let scanned = narf_scheduler::block_on_spin(scan(&mut m, 99, controls, &previous));
+            let found = match scanned {
+                Ok(d) => d,
+                Err(_) => return TestResult::Fail("PCIe-bit scan failed"),
+            };
+            let cs5 = m.get(1, 0, CfgSpace::Switch, 5);
+            if found.routers.len() != 2 || (cs5 & (1 << 24) != 0) != pto || cs5 & (1 << 31) == 0 {
+                return TestResult::Fail("ROUTER_CS_5 PTO does not follow the _OSC PCIe grant");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/thunderbolt/topology",
+        usb4_router_config_pcie_bit_follows_grant
     );
 }

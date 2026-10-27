@@ -2,6 +2,22 @@
 use alloc::vec::Vec;
 use narf_aml::Value;
 
+/// USB4 `_OSC` control bits, in capabilities DWORD 2 of the USB4
+/// `_OSC` handshake (ACPI specification, USB4 `_OSC`): bit 0 is USB3
+/// tunnelling, bit 1 DisplayPort tunnelling, bit 2 PCIe tunnelling,
+/// bit 3 XDomain connections. The CM proceeds per-protocol on the
+/// bits firmware actually grants; a protocol whose bit comes back
+/// clear is never programmed, and the shortfall stays visible in the
+/// returned mask rather than being assumed away.
+pub(crate) const CONTROL_USB3: u32 = 1 << 0;
+pub(crate) const CONTROL_DP: u32 = 1 << 1;
+pub(crate) const CONTROL_PCIE: u32 = 1 << 2;
+
+/// What this CM requests from firmware: USB3, DisplayPort and PCIe
+/// tunnelling. XDomain (bit 3) is a separate programme lane and is
+/// deliberately not requested here.
+pub(crate) const CONTROL_REQUEST: u32 = CONTROL_USB3 | CONTROL_DP | CONTROL_PCIE;
+
 fn handshake(uuid: [u8; 16], caps: &[u32]) -> Option<Vec<u32>> {
     let mut input = caps.to_vec();
     for query in [true, false] {
@@ -47,13 +63,17 @@ pub(crate) fn native_control() -> Option<u32> {
     if platform[1] & (1 << 18) == 0 {
         return None;
     }
-    // This CM manages display and USB3; it does not request PCIe or XDomain.
+    // This CM manages display, USB3 and PCIe tunnelling; it does
+    // not request XDomain. The handshake ANDs the request with the
+    // firmware reply, so the returned mask is exactly the granted
+    // subset of CONTROL_REQUEST — callers gate each protocol on its
+    // own bit.
     let usb = handshake(
         [
             0x3a, 0xd1, 0xa0, 0x23, 0xab, 0x26, 0x6c, 0x48, 0x9c, 0x5f, 0x0f, 0xfa, 0x52, 0x5a,
             0x57, 0x5a,
         ],
-        &[0, 0, 3],
+        &[0, 0, CONTROL_REQUEST],
     )?;
     (usb[2] != 0).then_some(usb[2])
 }

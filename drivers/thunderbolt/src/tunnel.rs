@@ -19,6 +19,14 @@ pub struct Endpoint {
 pub enum Protocol {
     DisplayPort,
     Usb3,
+    /// PCIe tunnelling between a PCIe downstream adapter on an
+    /// ancestor router and a PCIe upstream adapter on a device
+    /// router. Programmed only when firmware granted the PCIe bit
+    /// of the USB4 `_OSC` control mask (see
+    /// `firmware::CONTROL_PCIE`); without the grant the CM never
+    /// writes a PCIe path and the router's PCIe-tunnelling
+    /// configuration bit stays clear.
+    Pcie,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TunnelInfo {
@@ -48,11 +56,38 @@ pub fn usb3_tunnels() -> Vec<TunnelInfo> {
         .cloned()
         .collect()
 }
+pub fn pcie_tunnels() -> Vec<TunnelInfo> {
+    DISPLAYS
+        .lock()
+        .iter()
+        .filter(|t| t.protocol == Protocol::Pcie)
+        .cloned()
+        .collect()
+}
+
+/// The USB4 `_OSC` control mask most recently handed to
+/// `reconcile` — exactly the protocol bits firmware granted
+/// (see `firmware`). This is the CM's explicit record of what it
+/// may program: a caller distinguishing "no PCIe devices present"
+/// from "firmware did not grant PCIe control" reads it here
+/// instead of inferring from an empty tunnel list.
+static GRANTED_CONTROLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+pub fn granted_controls() -> u32 {
+    GRANTED_CONTROLS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// True while firmware's `_OSC` grant includes PCIe tunnelling.
+/// PCIe paths are programmed only in this state.
+pub fn pcie_tunnelling_granted() -> bool {
+    granted_controls() & super::firmware::CONTROL_PCIE != 0
+}
 
 /// Number of live tunnels across all domains, as published by
 /// `reconcile` and drained by teardown / [`forget_domain`]. Every
-/// entry is a DisplayPort or USB3 path the CM currently owns in the
-/// routers; this is the count the device-PM handler gates on.
+/// entry is a DisplayPort, USB3 or PCIe path the CM currently owns
+/// in the routers; this is the count the device-PM handler gates
+/// on.
 pub fn live_tunnel_count() -> usize {
     DISPLAYS.lock().len()
 }
@@ -451,6 +486,9 @@ impl Tunnel {
         if self.display.protocol == Protocol::Usb3 {
             return self.activate_usb3(ctl, domain).await;
         }
+        if self.display.protocol == Protocol::Pcie {
+            return self.activate_pcie(ctl, domain).await;
+        }
         let input = self.display.input;
         let output = self.display.output;
         let source = port(domain, input)?;
@@ -620,6 +658,54 @@ impl Tunnel {
         self.writes.last_mut().unwrap().words[0] |= 1 << 30;
         Ok(())
     }
+
+    /// Program one PCIe tunnel: a downstream path from the PCIe
+    /// downstream adapter on an ancestor router to the PCIe
+    /// upstream adapter on the device router, and the matching
+    /// upstream path back. Both paths go through the same journaled
+    /// hop programming as USB3/DisplayPort; the PCIe adapters
+    /// themselves are enabled last, once the fabric paths exist, by
+    /// setting ADP_PCIE_CS_0 PE (bit 31 of the adapter capability
+    /// DWORD 0, USB4 PCIe adapter configuration space). An adapter
+    /// that is already enabled belongs to firmware or another
+    /// tunnel and is never overwritten.
+    async fn activate_pcie(&mut self, ctl: &mut impl Config, domain: &Domain) -> Result<(), Error> {
+        let input = self.display.input;
+        let output = self.display.output;
+        let source = port(domain, input)?;
+        let sink = port(domain, output)?;
+        for (e, p) in [(input, source), (output, sink)] {
+            if p.adapter_cap == 0
+                || ctl
+                    .read(e.route, e.port, CfgSpace::Port, p.adapter_cap, 1)
+                    .await?[0]
+                    & (1 << 31)
+                    != 0
+            {
+                return Err(Error::Full);
+            }
+        }
+        let forward = chain(domain, input, output)?;
+        self.path(ctl, forward.clone(), false).await?;
+        let reverse = forward
+            .into_iter()
+            .rev()
+            .map(|h| Hop {
+                input: h.output,
+                output: h.input,
+                ..h
+            })
+            .collect();
+        self.path(ctl, reverse, false).await?;
+        // Enable both PCIe adapters only with the paths live; the
+        // writes are journaled, so teardown restores the exact
+        // pre-enable adapter DWORD (PE clear) in reverse order.
+        self.change(ctl, input, CfgSpace::Port, source.adapter_cap, &[1 << 31])
+            .await?;
+        self.change(ctl, output, CfgSpace::Port, sink.adapter_cap, &[1 << 31])
+            .await?;
+        Ok(())
+    }
 }
 fn bandwidth_units(scale: u32, consumed: u32) -> Result<u32, Error> {
     let unit = 512u64
@@ -711,25 +797,27 @@ pub(crate) async fn reconcile(
     tunnels: &mut Vec<Tunnel>,
     controls: u32,
 ) -> Result<(), Error> {
+    GRANTED_CONTROLS.store(controls, core::sync::atomic::Ordering::Relaxed);
     let mut index = 0;
     while index < tunnels.len() {
         let t = &mut tunnels[index];
-        let present = if t.display.protocol == Protocol::Usb3 {
-            port(domain, t.display.output).is_ok() && port(domain, t.display.input).is_ok()
-        } else if let Ok(p) = port(domain, t.display.output) {
-            ctl.read(
-                t.display.output.route,
-                p.number,
-                CfgSpace::Port,
-                p.adapter_cap + 2,
-                1,
-            )
-            .await?[0]
-                & (1 << 6)
-                != 0
-        } else {
-            false
-        };
+        let present =
+            if t.display.protocol == Protocol::Usb3 || t.display.protocol == Protocol::Pcie {
+                port(domain, t.display.output).is_ok() && port(domain, t.display.input).is_ok()
+            } else if let Ok(p) = port(domain, t.display.output) {
+                ctl.read(
+                    t.display.output.route,
+                    p.number,
+                    CfgSpace::Port,
+                    p.adapter_cap + 2,
+                    1,
+                )
+                .await?[0]
+                    & (1 << 6)
+                    != 0
+            } else {
+                false
+            };
         if !present {
             tunnels[index].teardown(ctl, domain).await?;
             tunnels.remove(index);
@@ -875,6 +963,84 @@ pub(crate) async fn reconcile(
                                 return Err(e);
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+    if controls & super::firmware::CONTROL_PCIE != 0 {
+        for child in domain.routers.iter().filter(|r| r.route != 0) {
+            let Some(sink) = child.ports.iter().find(|p| p.kind == 0x100102) else {
+                continue;
+            };
+            let output = Endpoint {
+                route: child.route,
+                port: sink.number,
+            };
+            if tunnels
+                .iter()
+                .any(|t| t.display.protocol == Protocol::Pcie && t.display.output == output)
+            {
+                continue;
+            }
+            // The tunnel originates at the nearest ancestor router
+            // carrying a PCIe downstream adapter: a farther
+            // ancestor's adapter belongs to a different PCIe switch
+            // segment and cannot serve this router. An adapter a
+            // live PCIe tunnel already claims serves that tunnel
+            // only, so this router goes without rather than
+            // double-programming the adapter.
+            let depth = route_depth(child.route);
+            let mut input = None;
+            for level in (0..depth).rev() {
+                let ancestor_route = if level == 0 {
+                    0
+                } else {
+                    child.route & ((1u64 << (level * 8)) - 1)
+                };
+                let Ok(ancestor) = router(domain, ancestor_route) else {
+                    continue;
+                };
+                let Some(source) = ancestor.ports.iter().find(|p| p.kind == 0x100101) else {
+                    continue;
+                };
+                let candidate = Endpoint {
+                    route: ancestor_route,
+                    port: source.number,
+                };
+                if !tunnels
+                    .iter()
+                    .any(|t| t.display.protocol == Protocol::Pcie && t.display.input == candidate)
+                {
+                    input = Some(candidate);
+                }
+                break;
+            }
+            let Some(input) = input else {
+                continue;
+            };
+            let mut t = Tunnel {
+                display: TunnelInfo {
+                    domain: domain.id,
+                    input,
+                    output,
+                    protocol: Protocol::Pcie,
+                    dprx_done: false,
+                },
+                writes: Vec::new(),
+                resource: false,
+                hpd_owned: false,
+                bandwidth: None,
+            };
+            match t.activate(ctl, domain).await {
+                Ok(()) => tunnels.push(t),
+                Err(e) => {
+                    if let Err(cleanup) = t.teardown(ctl, domain).await {
+                        tunnels.push(t);
+                        return Err(cleanup);
+                    }
+                    if !matches!(e, Error::Full | Error::Remote(_)) {
+                        return Err(e);
                     }
                 }
             }

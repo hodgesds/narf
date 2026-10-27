@@ -17,7 +17,7 @@
 //!   interrupts it.
 //! - **Live tunnels** (`tunnel::live_tunnel_count() > 0`): `Busy`.
 //!   Tunnel suspend/replay is not implemented, so powering down
-//!   would silently drop live DisplayPort/USB3 paths. Once the
+//!   would silently drop live DisplayPort/USB3/PCIe paths. Once the
 //!   tunnels are gone (hot-unplug, teardown) suspend can proceed —
 //!   that retry-later state is exactly what `Busy` means. The veto
 //!   is attributed to `"usb4-native-cm"` in the fan-out report.
