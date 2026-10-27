@@ -174,8 +174,11 @@ impl KeyCustodyAnchor for TestAnchor {
         if slot.params.len() != 8 + self.id.len() || slot.blob.len() != 12 + 32 + 16 {
             return Err(AnchorError::Failed);
         }
+        // Params are counter ‖ anchor id (see `wrap`); only the
+        // counter prefix feeds the KEK. Copying the whole composite
+        // buffer into this 8-byte array panics for any non-empty id.
         let mut counter_b = [0u8; 8];
-        counter_b.copy_from_slice(&slot.params);
+        counter_b.copy_from_slice(&slot.params[..8]);
         let kek = self.kek(ctx.sms_epoch, u64::from_le_bytes(counter_b));
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(&slot.blob[..12]);
@@ -434,6 +437,94 @@ fn smoke_power_suspend_seal_requires_epoch_and_slots() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("power", smoke_power_suspend_seal_requires_epoch_and_slots);
+
+// ── Fixture anchor round-trip (direct) ───────────────────────────────
+//
+// The service-level round-trips reach `TestAnchor::unwrap` only
+// through the slot machinery; this smoke pins the anchor's own
+// contract with a non-empty id: params are counter ‖ anchor id, and
+// unwrap recovers exactly the wrapped secret. (Regression: unwrap
+// once copied the whole composite params buffer into the 8-byte
+// counter array, which panics for every non-empty id — CI run
+// 40498900643, kernel-test on both arches.)
+
+fn smoke_power_suspend_test_anchor_round_trip() -> TestResult {
+    let anchor = TestAnchor::new("primary");
+    let secret = Secret32::mint([0x5a; 32]);
+    let slot = match anchor.wrap(&WrapCtx { sms_epoch: 1 }, &secret) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("test anchor wrap failed"),
+    };
+    // The params really are the composite shape unwrap's length
+    // guard validates: 8-byte counter prefix ‖ anchor id.
+    if slot.params.len() != 8 + anchor.id.len() || &slot.params[8..] != anchor.id.as_bytes() {
+        return TestResult::Fail("wrapped params are not counter ‖ anchor id");
+    }
+    if slot.blob.len() != 12 + 32 + 16 {
+        return TestResult::Fail("wrapped blob is not nonce ‖ ciphertext ‖ tag");
+    }
+    // Presence not granted: refuse, don't unwrap.
+    match anchor.unwrap(&UnwrapCtx { sms_epoch: 1 }, &slot) {
+        Err(AnchorError::Refused) => {}
+        _ => return TestResult::Fail("unwrap without presence was not refused"),
+    }
+    anchor.grant_presence();
+    let recovered = match anchor.unwrap(&UnwrapCtx { sms_epoch: 1 }, &slot) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("unwrap of a well-formed slot failed"),
+    };
+    let mut secret_b = [0u8; 32];
+    secret.with_bytes(|s| secret_b.copy_from_slice(s));
+    let mut recovered_b = [0u8; 32];
+    recovered.with_bytes(|s| recovered_b.copy_from_slice(s));
+    if recovered_b != secret_b {
+        return TestResult::Fail("unwrapped secret differs from the wrapped secret");
+    }
+    // A second wrap takes the next counter: the params differ, and
+    // that slot round-trips too.
+    let slot2 = match anchor.wrap(&WrapCtx { sms_epoch: 1 }, &secret) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("second test anchor wrap failed"),
+    };
+    if slot2.params == slot.params {
+        return TestResult::Fail("successive wraps share one params identity");
+    }
+    match anchor.unwrap(&UnwrapCtx { sms_epoch: 1 }, &slot2) {
+        Ok(s) => {
+            let mut b = [0u8; 32];
+            s.with_bytes(|x| b.copy_from_slice(x));
+            if b != secret_b {
+                return TestResult::Fail("second slot unwrapped to a different secret");
+            }
+        }
+        Err(_) => return TestResult::Fail("second slot did not unwrap"),
+    }
+    // The KEK binds the epoch: the same slot under another epoch's
+    // context fails the AEAD, indistinguishably from tampering.
+    match anchor.unwrap(&UnwrapCtx { sms_epoch: 2 }, &slot) {
+        Err(AnchorError::Failed) => {}
+        _ => return TestResult::Fail("slot unwrapped under the wrong epoch"),
+    }
+    // Malformed shapes fail closed — Failed, never a panic: params
+    // missing the id, params with a trailing byte, a flipped counter
+    // byte (wrong KEK), and a truncated blob.
+    let mut no_id = slot.clone();
+    no_id.params.truncate(8);
+    let mut trailing = slot.clone();
+    trailing.params.push(0);
+    let mut wrong_counter = slot.clone();
+    wrong_counter.params[0] ^= 0xff;
+    let mut short_blob = slot.clone();
+    short_blob.blob.truncate(12 + 32);
+    for bad in [no_id, trailing, wrong_counter, short_blob] {
+        match anchor.unwrap(&UnwrapCtx { sms_epoch: 1 }, &bad) {
+            Err(AnchorError::Failed) => {}
+            _ => return TestResult::Fail("malformed slot did not fail closed"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power", smoke_power_suspend_test_anchor_round_trip);
 
 // ── (d) Full round-trip ──────────────────────────────────────────────
 
