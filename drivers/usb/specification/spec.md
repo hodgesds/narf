@@ -365,6 +365,29 @@ also consult upstream Linux GPL sources.
   `register_tty_usb`: it removes the port from the ttyUSB node table and
   withdraws the `/sys/class/tty/ttyUSB<N>` kobject. Indices are not
   recycled; a replugged adapter republishes under a fresh index.
+- `serial::port` is the bind + transfer layer for vendor USB-serial
+  adapters (FTDI, Silicon Labs CP210x, Prolific PL2303, WCH CH341 —
+  dispatched by exact VID/PID via `serial::identify`, which no other
+  driver claims). `try_bind_serial_already_addressed` is the attach
+  cascade step: it selects the first vendor-class (0xFF) interface with
+  a bulk pair from the configuration blob, configures the endpoints,
+  issues `SET_CONFIGURATION`, executes the family's open plan, arms the
+  bulk-IN endpoint, and publishes the port via `register_tty_usb`. A
+  family's open/configure plan is a pure `ControlXfer` list built from
+  the family codec encoders per the vendor programming guides (FTDI
+  AN120/AN232B divisor + line encodings — BM/R divisor against the
+  3 MHz effective base, H against 12 MHz; Silicon Labs AN571 request
+  set with the baud rate as a data stage; PL2303 CDC line coding;
+  CH341 register writes). `pump_all` (supervisor cycle) moves bulk-IN
+  bytes into the tty RX ring — FTDI packets have their 2-byte status
+  prefix stripped into the modem cache first, other families are raw —
+  and submits tty TX ring bytes as bulk-OUT, removing them from the
+  ring only on transfer completion. `set_line_settings` replays the
+  configure plan on the live device; settings a family cannot express
+  (e.g. CP210x `SET_FLOW`) fail with a typed `PortError::Unsupported`
+  rather than a silent no-op. `detach_serial` / `clear_serial` are the
+  per-slot and controller-recovery teardowns. One port per device in
+  this layer: multi-port chips bind their first interface.
 - `ccid::devfs_bridge` publishes each bound CCID reader as `/dev/ccid<N>`
   (provider hooks installed by the `usb-ccid-devfs` Stage::Subsys
   initcall; node index = `CCID_READERS` index, assigned at bind). The

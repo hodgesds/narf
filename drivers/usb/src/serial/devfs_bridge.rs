@@ -104,6 +104,27 @@ impl SerialRing {
         n
     }
 
+    /// Copy up to `buf.len()` bytes from the head WITHOUT
+    /// consuming them; returns number copied. The supervisor
+    /// pump's TX path uses peek/skip so bytes leave the ring
+    /// only once the controller reports the bulk-OUT transfer
+    /// complete — an unfinished chunk is retried, not dropped.
+    pub fn peek(&self, buf: &mut [u8]) -> usize {
+        let n = buf.len().min(self.count);
+        for i in 0..n {
+            buf[i] = self.buf[(self.head + i) % self.buf.len()];
+        }
+        n
+    }
+
+    /// Drop up to `n` bytes from the head (the consume half of
+    /// peek/skip).
+    pub fn skip(&mut self, n: usize) {
+        let n = n.min(self.count);
+        self.head = (self.head + n) % self.buf.len();
+        self.count -= n;
+    }
+
     /// Pop up to `buf.len()` bytes; returns number returned.
     pub fn pop(&mut self, buf: &mut [u8]) -> usize {
         let n = buf.len().min(self.count);

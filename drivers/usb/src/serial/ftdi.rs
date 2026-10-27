@@ -160,24 +160,31 @@ static DIVFRAC: [u8; 8] = [0, 3, 2, 4, 1, 5, 6, 7];
 
 /// Compute the packed 32-bit divisor for FT232BM / FT232R / FTX.
 ///
-/// Base clock = 48 MHz.
+/// Input clock = 48 MHz, but the BM/R baud generator prescales it
+/// by 16: the effective divisor base is 3 MHz (FTDI AN120:
+/// "the baud rate is calculated as 3000000 / divisor"). The
+/// divisor is carried ×8 (`divisor3`) so the three fractional
+/// bits ride along.
 ///
 /// Linux: `ftdi_sio.c` `ftdi_232bm_baud_base_to_divisor` (l.1148)
-/// and `ftdi_232bm_baud_to_divisor` (l.1162).
+/// and `ftdi_232bm_baud_to_divisor` (l.1162), which compute
+/// `divisor3 = DIV_ROUND_CLOSEST(base, 2 * baud)` with
+/// `base = 48 MHz` — i.e. 48 MHz / (2·baud) = 8 × 3 MHz / baud.
 ///
 /// Returns a `u32` where:
 /// - bits 13:0 = integer divisor
 /// - bits 17:14 = fractional divisor (from `DIVFRAC`)
 ///
-/// Special cases: divisor==1 → packed 0 (rate = 48M/2),
-/// divisor==0x4001 → packed 1 (rate = 48M/3).
+/// Special cases (AN120): packed 0 encodes divisor 1 (3 Mbaud);
+/// packed 1 encodes the 2 Mbaud rate whose raw divisor3 would
+/// otherwise collide with the fractional encoding.
 pub fn calc_divisor_bm(baud: u32) -> u32 {
     baud_base_to_divisor_bm(baud, 48_000_000)
 }
 
 fn baud_base_to_divisor_bm(baud: u32, base: u32) -> u32 {
-    // divisor shifted 3 bits left
-    let divisor3 = ((base as u64 * 2 + baud as u64 / 2) / baud as u64) as u32;
+    // divisor3 = DIV_ROUND_CLOSEST(base, 2 * baud)
+    let divisor3 = ((base as u64 + baud as u64) / (2 * baud as u64)) as u32;
     let mut packed = divisor3 >> 3;
     packed |= (DIVFRAC[(divisor3 & 0x7) as usize] as u32) << 14;
     if packed == 1 {
@@ -413,15 +420,27 @@ pub mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     fn smoke_ftdi_baud_divisor_bm_115200() -> TestResult {
-        // FT232R @ 48 MHz, 115200 baud.
-        // Expected: Linux ftdi_232bm_baud_to_divisor(115200) = 0x001A
-        // divisor3 = round(48M * 2 / 115200) ≈ round(833.3) = 833
-        // packed_int = 833 >> 3 = 104 = 0x68
-        // frac idx = 833 & 7 = 1 → DIVFRAC[1] = 3
-        // packed = 0x68 | (3 << 14) = 0x68 | 0xC000 = 0xC068
+        // FT232R @ 115200 baud, pinned byte-for-byte against
+        // AN120: the effective divisor base is 3 MHz (48 MHz ÷ 16
+        // prescaler), so divisor = 3000000/115200 = 26.04 →
+        // divisor3 = round(48M / (2 × 115200)) = 208
+        // packed_int = 208 >> 3 = 26 = 0x1A
+        // frac idx = 208 & 7 = 0 → DIVFRAC[0] = 0
+        // packed = 0x001A — the value Linux
+        // ftdi_232bm_baud_to_divisor(115200) returns. (An earlier
+        // in-tree formula computed against the unprescaled clock
+        // and produced 0xC068, which programs ≈4× the requested
+        // rate on real hardware; this assertion now pins the
+        // document value exactly.)
         let d = calc_divisor_bm(115200);
-        if d == 0 {
-            return TestResult::Fail("115200 BM divisor should be non-zero");
+        if d != 0x001A {
+            return TestResult::Fail("115200 BM divisor must be exactly 0x001A (AN120)");
+        }
+        // 9600 baud exercises a fractional code: 3000000/9600 =
+        // 312.5 → divisor3 = 2500 → int 312, DIVFRAC[4] = 1.
+        let d9 = calc_divisor_bm(9600);
+        if d9 != 0x4138 {
+            return TestResult::Fail("9600 BM divisor must be 0x4138 (312 + 1/8 frac)");
         }
         TestResult::Pass
     }

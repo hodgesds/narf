@@ -65,6 +65,12 @@ pub enum AttachOutcome {
     /// dongle, Arduino-style virtual COM port). Slot stays alive;
     /// entry was added to `cdc_acm::ACM_DEVICES`.
     SerialAcm,
+    /// Device bound as a vendor USB-serial adapter (FTDI /
+    /// CP210x / PL2303 / CH341, VID/PID-matched by
+    /// `serial::identify`). Slot stays alive; entry was added to
+    /// `serial::port::SERIAL_PORTS` and a `/dev/ttyUSB<N>` node
+    /// published via `serial::devfs_bridge`.
+    SerialVendor,
     /// Device bound as a USB Mass Storage (BBB BOT) device. Slot
     /// stays alive; entry was added to `msc::MSC_DEVICES` and the
     /// block-layer registration / partition scan runs from the
@@ -524,6 +530,7 @@ pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
     hid::consumer::detach_consumer(slot_id);
     hid::generic::unregister_generic_evdev(slot_id);
     crate::cdc_acm::detach_acm(slot_id);
+    crate::serial::port::detach_serial(slot_id);
     crate::xpad::detach_xpad(slot_id);
     crate::class_registry::dispatch_unbind(slot_id);
 
@@ -583,6 +590,7 @@ pub fn detach_all_bindings() {
     hid::consumer::clear_consumers();
     hid::generic::unregister_all_generic();
     crate::cdc_acm::clear_acm();
+    crate::serial::port::clear_serial();
     crate::xpad::clear_xpad();
     crate::msc::unbind_all_msc();
     HUBS.lock().clear();
@@ -894,6 +902,22 @@ async fn dispatch_after_address(
             .is_ok()
         {
             return AttachOutcome::CtapToken;
+        }
+        // Vendor USB-serial adapter (FTDI / Silicon Labs CP210x /
+        // Prolific PL2303 / WCH CH341) — exact VID/PID match via
+        // `serial::identify`; the binder programs the default line
+        // format from the family's vendor programming guide and
+        // publishes /dev/ttyUSB<N>. Placed after the class-based
+        // probes (a CDC-ACM device with a serial VID must still
+        // bind as ACM above) and before the WBDI sniff.
+        if crate::serial::identify(dev_vid, dev_pid).is_some()
+            && crate::serial::port::try_bind_serial_already_addressed(
+                xhci_dev, slot_id, dev_vid, dev_pid, &cfg_blob,
+            )
+            .await
+            .is_ok()
+        {
+            return AttachOutcome::SerialVendor;
         }
         // WBDI fingerprint reader — Microsoft Biometric Device
         // Interface, identified by an MS OS 2.0 Compatible-ID
