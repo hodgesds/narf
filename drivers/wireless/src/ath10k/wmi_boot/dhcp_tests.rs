@@ -6,6 +6,8 @@ use alloc::{string::String, sync::Arc};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::Interface;
 use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessError};
+#[path = "coding_conversation_tests.rs"]
+mod coding_conversation_tests;
 #[path = "ht40_conversation_tests.rs"]
 mod ht40_conversation_tests;
 #[path = "ht_conversation_tests.rs"]

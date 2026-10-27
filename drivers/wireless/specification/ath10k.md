@@ -127,7 +127,8 @@ remain separate profiles.
   observed primary channel. SGI20 transmit requires the actual firmware capability
   and both beacon/response support; receive follows the local advertised promise.
   A driver-owned HT IE advertises the selected width, one
-  stream, SMPS disabled and no GF/STBC/LDPC; caller SME IEs cannot supply it.
+  stream, SMPS disabled, no GF and only the firmware-backed LDPC/RX-STBC
+  coding described below; caller SME IEs cannot supply it.
   VDEV_START programs native 11NG/11NA HT20 plus ALLOW_HT, retaining the same
   20 MHz factory/host power receipt. The actual association response intersects
   MCS/SGI before native PEER_ASSOC carries HT/QoS, peer HT capabilities,
@@ -175,7 +176,8 @@ remain separate profiles.
   `WMI_HT_CAP_ENABLED`; the independent HT40-SGI capability is not inferred from
   SGI20. This profile advertises MCS0..7, LGI40, optional qualified SGI20 and
   separately gated SGI40 as described below,
-  without GF, LDPC, STBC or an extra spatial stream. Only the pairs
+  without GF, TX STBC or an extra spatial stream (LDPC/RX STBC follow the
+  coding bullet below). Only the pairs
   5180/5200, 5220/5240, 5745/5765 and 5785/5805 MHz, in either primary order,
   are selected. The actual board/OTP calibration path, immutable EEPROM
   pair/CTL, fixed-country factory/host match, firmware band limits and current
@@ -234,6 +236,29 @@ remain separate profiles.
   when exposing SGI40; ath10k has no Intel-style legacy-only measured-emitter
   record to relabel. These source-backed gates grant no physical RF or board
   interoperability claim.
+- HT LDPC and one-stream RX STBC (`wmi_runtime::ht::{ldpc,rx_stbc,Profile}`)
+  follow Linux `mac.c::ath10k_get_ht_cap`: IEEE LDPC_CODING (0x0001) is
+  advertised only for SERVICE_READY `WMI_HT_CAP_LDPC` (0x0040) or the pair
+  `WMI_HT_CAP_RX_LDPC|WMI_HT_CAP_TX_LDPC` (0x1000|0x2000); a lone directional
+  bit is not. A nonzero `WMI_HT_CAP_RX_STBC` field (0x0030) advertises one RX
+  STBC stream (IEEE 0x0100), bounded by this one-stream profile. Both reach the
+  per-band capability body, the driver-owned request IE and the HT20/HT40
+  `LocalPhy` through the shared `LocalHt::{with_ldpc,with_rx_stbc}` builder.
+  PEER_ASSOC `peer_ht_caps` applies `mac80211/ht.c::ieee80211_ht_cap_ie_to_sta_ht_cap`
+  masking: peer LDPC survives only with local LDPC, the peer's RX STBC field
+  (0x0300) is cleared because no local TX STBC exists, and the peer's TX STBC
+  (0x0080) survives only with our RX STBC promise. `ath10k_peer_assoc_h_ht`
+  then sets `WMI_PEER_LDPC` (0x10000), `WMI_PEER_STBC` (0x8000) and
+  `WMI_RC_TX_STBC_FLAG` (0x20); these values are identical in all six dialect
+  peer-flag maps. The firmware owns LDPC encoding toward a capable peer and
+  STBC/LDPC decoding. Native RX additionally rejects, before BA sequence or
+  CCMP replay commitment, an HT-SIG2 FEC-coding bit (bit6) without our LDPC
+  promise, a one-stream STBC field (bits4..5 = 1) without our RX STBC promise
+  and any larger/reserved STBC value. TX STBC stays absent: Linux requires
+  `cfg_tx_chainmask > 1`, and this SISO profile never selects a second TX
+  chain. Native smokes `drivers/wireless/ath10k/coding` cover the service-bit
+  advertisement, masked peer record/flags on all six dialects with DHCP-backed
+  CCMP traffic and pre-replay PPDU coding checks. No RF coding gain is claimed.
 - `wmi_runtime::StationProtection { rts_threshold: Option<u16>,
   cts_protection: bool }` and `pci::set_station_protection` submit native VDEV
   protection intent. None encodes the disabled threshold `u32::MAX`; finite
@@ -889,8 +914,9 @@ not inferred from this PCI table. `profile::PROFILES`, `hw::HwRev::from_pci_id`,
 
 Across the reached rows, concrete remaining software packages are 2.4-GHz HT40
 coexistence/occupied-power ownership;
-additional streams and directional LDPC/STBC where actual hardware/firmware
-supports them; response-bound VHT and wider geometry; native TX BA, independent
+additional streams and TX STBC (which needs a second selected TX chain;
+LDPC and one-stream RX STBC are implemented above);
+response-bound VHT and wider geometry; native TX BA, independent
 multi-packet DMA/completion and aggregate retries; PFC fetch/queue ownership;
 dynamic WMM/protection updates and non-BE TX/TSPEC/U-APSD; DFS/indoor/beacon-hint
 qualification; associated/off-channel scanning; hardware key/PMF/WPA3 profiles;

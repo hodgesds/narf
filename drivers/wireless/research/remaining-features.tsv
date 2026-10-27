@@ -1,42 +1,39 @@
 family	feature_id	capability	kind	evidence_path	evidence_line
-ath10k	aggregate_retries	Aggregate retransmission	feature	drivers/wireless/specification/ath10k.md	894
-ath10k	alternate_calibration_loading	Alternative calibration-source loading	feature	drivers/wireless/specification/ath10k.md	898
-ath10k	ap	AP role	feature	drivers/wireless/specification/ath10k.md	897
-ath10k	associated_scan	Associated scanning	feature	drivers/wireless/specification/ath10k.md	896
-ath10k	automatic_credential_replay	Automatic credential replay after recovery	feature	drivers/wireless/specification/ath10k.md	898
-ath10k	automatic_protection	Automatic AP protection-mode updates	feature	drivers/wireless/specification/ath10k.md	895
-ath10k	automatic_recovery	Automatic firmware recovery	feature	drivers/wireless/specification/ath10k.md	407
-ath10k	beacon_hints	Beacon-hint regulatory updates	feature	drivers/wireless/specification/ath10k.md	896
-ath10k	dfs	DFS	feature	drivers/wireless/specification/ath10k.md	895
-ath10k	dma_reclamation	DMA reclamation after terminal/reset ownership	feature	drivers/wireless/specification/ath10k.md	405
-ath10k	dynamic_wmm	Dynamic WMM/EDCA updates	feature	drivers/wireless/specification/ath10k.md	895
-ath10k	hardware_keys	Hardware key and crypto offload	feature	drivers/wireless/specification/ath10k.md	896
-ath10k	host_bus_pm	Host-bus power management	feature	drivers/wireless/specification/ath10k.md	897
-ath10k	ht2040_coexistence	HT20/40 coexistence control	feature	drivers/wireless/specification/ath10k.md	891
-ath10k	ht40_2ghz	2.4GHz HT40	feature	drivers/wireless/specification/ath10k.md	890
-ath10k	indoor_regulatory	Indoor-only channel admission	feature	drivers/wireless/specification/ath10k.md	896
-ath10k	interrupt_service	Interrupt-driven packet service	feature	drivers/wireless/specification/ath10k.md	897
-ath10k	multiple_spatial_streams	Additional spatial streams	feature	drivers/wireless/specification/ath10k.md	892
-ath10k	non_be_tx	Non-BE TX classification and scheduling	feature	drivers/wireless/specification/ath10k.md	895
-ath10k	offchannel_scan	Off-channel scanning	feature	drivers/wireless/specification/ath10k.md	896
-ath10k	p2p	P2P role	feature	drivers/wireless/specification/ath10k.md	897
-ath10k	pfc	PFC fetch and queue protocol ownership	feature	drivers/wireless/specification/ath10k.md	894
-ath10k	pmf	PMF	feature	drivers/wireless/specification/ath10k.md	896
-ath10k	qca9887_enablement	QCA9887 native PCI and station enablement	chip	drivers/wireless/specification/ath10k.md	887
-ath10k	rx_ldpc	RX LDPC	feature	drivers/wireless/specification/ath10k.md	892
-ath10k	rx_stbc	RX STBC	feature	drivers/wireless/specification/ath10k.md	892
-ath10k	stable_interface_recovery	Stable-interface recovery	feature	drivers/wireless/specification/ath10k.md	898
-ath10k	system_suspend	System suspend	feature	drivers/wireless/specification/ath10k.md	897
-ath10k	tspec	TSPEC	feature	drivers/wireless/specification/ath10k.md	895
-ath10k	tx_ba	Native TX Block Ack	feature	drivers/wireless/specification/ath10k.md	893
-ath10k	tx_ldpc	TX LDPC	feature	drivers/wireless/specification/ath10k.md	892
-ath10k	tx_pipeline	Independent multi-packet native TX pipeline	feature	drivers/wireless/specification/ath10k.md	894
-ath10k	tx_stbc	TX STBC	feature	drivers/wireless/specification/ath10k.md	892
-ath10k	uapsd	U-APSD	feature	drivers/wireless/specification/ath10k.md	895
-ath10k	unexpanded_wider_geometry	Wider-channel geometry is not enumerated into individual widths	unknown	drivers/wireless/specification/ath10k.md	893
-ath10k	vht	VHT	feature	drivers/wireless/specification/ath10k.md	893
-ath10k	wake_offload	Wake offload	feature	drivers/wireless/specification/ath10k.md	897
-ath10k	wpa3	WPA3	feature	drivers/wireless/specification/ath10k.md	896
+ath10k	aggregate_retries	Aggregate retransmission	feature	drivers/wireless/specification/ath10k.md	919
+ath10k	alternate_calibration_loading	Alternative calibration-source loading	feature	drivers/wireless/specification/ath10k.md	923
+ath10k	ap	AP role	feature	drivers/wireless/specification/ath10k.md	922
+ath10k	associated_scan	Associated scanning	feature	drivers/wireless/specification/ath10k.md	921
+ath10k	automatic_credential_replay	Automatic credential replay after recovery	feature	drivers/wireless/specification/ath10k.md	923
+ath10k	automatic_protection	Automatic AP protection-mode updates	feature	drivers/wireless/specification/ath10k.md	920
+ath10k	automatic_recovery	Automatic firmware recovery	feature	drivers/wireless/specification/ath10k.md	432
+ath10k	beacon_hints	Beacon-hint regulatory updates	feature	drivers/wireless/specification/ath10k.md	921
+ath10k	dfs	DFS	feature	drivers/wireless/specification/ath10k.md	920
+ath10k	dma_reclamation	DMA reclamation after terminal/reset ownership	feature	drivers/wireless/specification/ath10k.md	430
+ath10k	dynamic_wmm	Dynamic WMM/EDCA updates	feature	drivers/wireless/specification/ath10k.md	920
+ath10k	hardware_keys	Hardware key and crypto offload	feature	drivers/wireless/specification/ath10k.md	921
+ath10k	host_bus_pm	Host-bus power management	feature	drivers/wireless/specification/ath10k.md	922
+ath10k	ht2040_coexistence	HT20/40 coexistence control	feature	drivers/wireless/specification/ath10k.md	916
+ath10k	ht40_2ghz	2.4GHz HT40	feature	drivers/wireless/specification/ath10k.md	915
+ath10k	indoor_regulatory	Indoor-only channel admission	feature	drivers/wireless/specification/ath10k.md	921
+ath10k	interrupt_service	Interrupt-driven packet service	feature	drivers/wireless/specification/ath10k.md	922
+ath10k	multiple_spatial_streams	Additional spatial streams	feature	drivers/wireless/specification/ath10k.md	917
+ath10k	non_be_tx	Non-BE TX classification and scheduling	feature	drivers/wireless/specification/ath10k.md	920
+ath10k	offchannel_scan	Off-channel scanning	feature	drivers/wireless/specification/ath10k.md	921
+ath10k	p2p	P2P role	feature	drivers/wireless/specification/ath10k.md	922
+ath10k	pfc	PFC fetch and queue protocol ownership	feature	drivers/wireless/specification/ath10k.md	919
+ath10k	pmf	PMF	feature	drivers/wireless/specification/ath10k.md	921
+ath10k	qca9887_enablement	QCA9887 native PCI and station enablement	chip	drivers/wireless/specification/ath10k.md	912
+ath10k	stable_interface_recovery	Stable-interface recovery	feature	drivers/wireless/specification/ath10k.md	923
+ath10k	system_suspend	System suspend	feature	drivers/wireless/specification/ath10k.md	922
+ath10k	tspec	TSPEC	feature	drivers/wireless/specification/ath10k.md	920
+ath10k	tx_ba	Native TX Block Ack	feature	drivers/wireless/specification/ath10k.md	919
+ath10k	tx_pipeline	Independent multi-packet native TX pipeline	feature	drivers/wireless/specification/ath10k.md	919
+ath10k	tx_stbc	TX STBC	feature	drivers/wireless/specification/ath10k.md	917
+ath10k	uapsd	U-APSD	feature	drivers/wireless/specification/ath10k.md	920
+ath10k	unexpanded_wider_geometry	Wider-channel geometry is not enumerated into individual widths	unknown	drivers/wireless/specification/ath10k.md	919
+ath10k	vht	VHT	feature	drivers/wireless/specification/ath10k.md	919
+ath10k	wake_offload	Wake offload	feature	drivers/wireless/specification/ath10k.md	922
+ath10k	wpa3	WPA3	feature	drivers/wireless/specification/ath10k.md	921
 ath11k	aarch64_composition	Native aarch64 startup/PCI/IRQ/board-discovery composition gap; not a proven missing PHY feature	unknown	drivers/wireless/specification/ath11k.md	1824
 ath11k	dt_board_variant	Device-tree board-variant discovery	feature	drivers/wireless/specification/ath11k.md	1824
 ath11k	host_multicast_pn	Host multicast PN checking absent; firmware-versus-host responsibility needs proof	unknown	drivers/wireless/specification/ath11k.md	1975

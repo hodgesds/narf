@@ -17,6 +17,13 @@ pub(super) struct Profile {
     pub(super) short_gi: bool,
     receive_sgi20: bool,
     receive_sgi40: bool,
+    receive_ldpc: bool,
+    receive_stbc: bool,
+    /// Native PEER_ASSOC `WMI_PEER_LDPC`: the bound AP receives LDPC and the
+    /// local firmware capability permits encoding it.
+    pub(super) transmit_ldpc: bool,
+    /// The bound AP transmits one-stream STBC that our advertised RX accepts.
+    pub(super) peer_tx_stbc: bool,
     pub(super) center: u16,
     pub(super) secondary: Option<u16>,
     local: LocalPhy,
@@ -25,9 +32,23 @@ pub(super) struct Profile {
 pub(super) fn supported(caps: &Capabilities) -> bool {
     caps.ht & 1 != 0 && (1..=4).contains(&caps.rf_chains)
 }
-fn local(caps: &Capabilities, forty: bool) -> Result<LocalPhy, Error> {
+/// Linux `mac.c::ath10k_get_ht_cap` coding facts from SERVICE_READY
+/// `ht_cap_info`: IEEE LDPC_CODING follows `WMI_HT_CAP_LDPC` (0x0040) or the
+/// pair `WMI_HT_CAP_RX_LDPC` (0x1000) and `WMI_HT_CAP_TX_LDPC` (0x2000); a
+/// lone directional bit is not advertised. RX STBC follows the nonzero
+/// `WMI_HT_CAP_RX_STBC` field (0x0030); this one-stream profile promises only
+/// one STBC stream. TX STBC needs `cfg_tx_chainmask > 1`, which this SISO
+/// profile never selects, so it stays absent.
+pub(super) fn ldpc(caps: &Capabilities) -> bool {
+    caps.ht & 0x40 != 0 || caps.ht & 0x3000 == 0x3000
+}
+pub(super) fn rx_stbc(caps: &Capabilities) -> bool {
+    caps.ht & 0x30 != 0
+}
+fn local_ht(caps: &Capabilities, forty: bool) -> Result<LocalHt, association::Error> {
     let mask = [255, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    let ht = LocalHt::new(
+    let coding = ldpc(caps);
+    Ok(LocalHt::new(
         mask,
         mask,
         if forty {
@@ -43,8 +64,14 @@ fn local(caps: &Capabilities, forty: bool) -> Result<LocalPhy, Error> {
         },
         0,
         6,
-    )
-    .map_err(plan_error)?;
+    )?
+    // One native LDPC capability bit: firmware decodes LDPC (our RX
+    // promise) and may encode it toward a peer that advertises LDPC.
+    .with_ldpc(coding, coding)
+    .with_rx_stbc(rx_stbc(caps)))
+}
+fn local(caps: &Capabilities, forty: bool) -> Result<LocalPhy, Error> {
+    let ht = local_ht(caps, forty).map_err(plan_error)?;
     if forty {
         LocalPhy::ht40(ht)
     } else {
@@ -56,26 +83,7 @@ pub(super) fn capability(caps: &Capabilities, forty: bool) -> Option<[u8; 26]> {
     if !supported(caps) {
         return None;
     }
-    let mask = [255, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    LocalHt::new(
-        mask,
-        mask,
-        if forty {
-            HtWidth::TwentyForty
-        } else {
-            HtWidth::Twenty
-        },
-        HtGi {
-            rx20: caps.ht & 2 != 0,
-            tx20: caps.ht & 2 != 0,
-            rx40: forty && caps.ht & 0x800 != 0,
-            tx40: forty && caps.ht & 0x800 != 0,
-        },
-        0,
-        6,
-    )
-    .ok()
-    .map(|p| p.capability_body())
+    local_ht(caps, forty).ok().map(|p| p.capability_body())
 }
 pub(super) fn bss(cached: &ScanBss) -> Result<Bss, Error> {
     Ok(Bss {
@@ -139,6 +147,10 @@ impl Profile {
             short_gi: h.tx_sgi20() || offered.width() == Width::Forty && h.tx_sgi40(),
             receive_sgi20: h.rx_sgi20(),
             receive_sgi40: offered.width() == Width::Forty && h.rx_sgi40(),
+            receive_ldpc: h.rx_ldpc(),
+            receive_stbc: h.rx_stbc(),
+            transmit_ldpc: h.tx_ldpc(),
+            peer_tx_stbc: peer_tx_stbc(h),
             center,
             secondary,
             local,
@@ -169,7 +181,25 @@ impl Profile {
         self.short_gi = n.ht().tx_sgi20() || n.width() == Width::Forty && n.ht().tx_sgi40();
         self.receive_sgi20 = n.ht().rx_sgi20();
         self.receive_sgi40 = n.width() == Width::Forty && n.ht().rx_sgi40();
+        self.receive_ldpc = n.ht().rx_ldpc();
+        self.receive_stbc = n.ht().rx_stbc();
+        self.transmit_ldpc = n.ht().tx_ldpc();
+        self.peer_tx_stbc = peer_tx_stbc(n.ht());
         Ok(self)
+    }
+    /// Linux `ath10k_peer_assoc_h_ht` peer flags beyond HT/BW40: LDPC
+    /// (0x10000) from the masked peer LDPC bit and STBC (0x8000) whenever a
+    /// masked STBC direction remains. Identical in all six dialect maps.
+    pub(super) fn peer_flags(self) -> u32 {
+        (if self.transmit_ldpc { 0x1_0000 } else { 0 }) | if self.peer_tx_stbc { 0x8000 } else { 0 }
+    }
+    /// Native RC flags: HT (0x08), CW40 (0x02), SGI (0x04) and
+    /// `WMI_RC_TX_STBC_FLAG` (0x20) for a peer transmitting STBC. Peer RX
+    /// STBC (`WMI_RC_RX_STBC_FLAG`, 0xc0) needs our absent TX STBC.
+    pub(super) fn rate_caps(self) -> u32 {
+        8 | if self.short_gi { 4 } else { 0 }
+            | if self.secondary.is_some() { 2 } else { 0 }
+            | if self.peer_tx_stbc { 0x20 } else { 0 }
     }
     pub(super) fn mode(self, frequency: u16) -> u32 {
         if self.secondary.is_some() {
@@ -202,7 +232,14 @@ impl Profile {
             4 => true,
             8 | 9 => {
                 let sig = word(108);
+                // HT-SIG2 bits4..5 carry STBC (N_STS - N_SS) and bit6 the
+                // FEC (LDPC) coding. Each needs our advertised RX promise;
+                // only one STBC stream is ever promised.
+                let sig2 = word(112);
+                let stbc = sig2 >> 4 & 3;
                 descriptor[103] & 1 == 0
+                    && (stbc == 0 || stbc == 1 && self.receive_stbc)
+                    && (sig2 & 0x40 == 0 || self.receive_ldpc)
                     && sig & 0x7f < 8
                     && (sig & 0x80 == 0 || self.secondary.is_some())
                     && (word(112) & 0x80 == 0
@@ -217,6 +254,10 @@ impl Profile {
     }
 }
 
+fn peer_tx_stbc(h: &association::phy::HtNegotiation) -> bool {
+    h.rx_stbc() && h.peer_capability() & 0x80 != 0
+}
+
 fn native_capabilities(h: &association::phy::HtNegotiation, width: Width) -> u16 {
     // mac80211/ht.c::ieee80211_ht_cap_ie_to_sta_ht_cap masks peer width/GI
     // by our capability before ath10k_peer_assoc_h_ht programs peer_ht_caps.
@@ -224,7 +265,12 @@ fn native_capabilities(h: &association::phy::HtNegotiation, width: Width) -> u16
     // bits must retain original-offer/response/local TX bounds, including
     // SGI40-only hardware falling back to20MHz. Original AP facts remain
     // unmodified in `offered`; local RX GI promises are separate above.
-    (h.peer_capability() & !0x62)
+    // LDPC is masked by our capability like width/GI. STBC is asymmetric:
+    // without local TX STBC the peer's RX STBC field (0x0300) is cleared, and
+    // the peer's TX STBC (0x0080) survives only with our RX STBC promise.
+    (h.peer_capability() & !0x3e3)
+        | if h.tx_ldpc() { 1 } else { 0 }
+        | if peer_tx_stbc(h) { 0x80 } else { 0 }
         | if width == Width::Forty { 2 } else { 0 }
         | if h.tx_sgi20() { 0x20 } else { 0 }
         | if width == Width::Forty && h.tx_sgi40() {

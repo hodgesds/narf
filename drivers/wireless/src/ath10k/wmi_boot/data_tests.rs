@@ -98,6 +98,12 @@ pub(super) struct Fixture {
     ht_request_sgi40: bool,
     ht_ampdu: u8,
     ht_capabilities: u16,
+    // Source-cited coding bits beyond the base request IE: IEEE LDPC 0x0001
+    // and one-stream RX STBC 0x0100; native PEER_LDPC/PEER_STBC flags and
+    // WMI_RC_TX_STBC_FLAG expected in PEER_ASSOC.
+    pub(super) ht_request_coding: u16,
+    pub(super) ht_peer_flags: u32,
+    pub(super) ht_rate_caps: u32,
     rx_phy: Option<(u8, u32, u32)>,
     // Authored native descriptors per actual DMA frame, including invalid
     // stale middle PHY words that the host must never reinterpret.
@@ -151,6 +157,9 @@ impl Fixture {
             ht_request_sgi40: false,
             ht_ampdu: 0x1b,
             ht_capabilities: 0x002c,
+            ht_request_coding: 0,
+            ht_peer_flags: 0,
+            ht_rate_caps: 0,
             rx_phy: None,
             rx_descriptors: VecDeque::new(),
             wmm_words: WMM_WORDS,
@@ -416,8 +425,8 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
                     0x40
                 } else {
                     0
-                },
-                0,
+                } | m.data.as_ref().unwrap().ht_request_coding as u8,
+                (m.data.as_ref().unwrap().ht_request_coding >> 8) as u8,
                 24,
                 0xff,
             ];
@@ -478,7 +487,8 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
                 != ((if secured { 5 } else { 1 })
                     | if qos { 2 } else { 0 }
                     | if ht { 0x1000 } else { 0 }
-                    | if f.ht_secondary.is_some() { 0x2000 } else { 0 })
+                    | if f.ht_secondary.is_some() { 0x2000 } else { 0 }
+                    | if ht { f.ht_peer_flags } else { 0 })
             || word(at + 24) != (if secured { 0x11 } else { 1 })
         {
             return Err(BmiError::BadResponse);
@@ -516,7 +526,8 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
                 || word(at + 40) != density
                 || word(at + 44)
                     != (if f.ht_sgi { 12 } else { 8 }
-                        | if f.ht_secondary.is_some() { 2 } else { 0 })
+                        | if f.ht_secondary.is_some() { 2 } else { 0 }
+                        | f.ht_rate_caps)
                 || word(ht_count) != ht_rates.len() as u32
                 || command.get(ht_at..ht_at + ht_rates.len()) != Some(&ht_rates)
             {
