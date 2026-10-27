@@ -47,6 +47,7 @@ pub mod s2idle;
 pub mod service;
 pub mod sleep_request;
 pub mod suspend;
+pub mod suspend_service;
 pub mod syscall;
 pub mod sysfs_bridge;
 pub mod system;
@@ -70,6 +71,7 @@ pub mod pstate;
 pub mod rapl;
 
 mod runtime_pm_tests;
+mod suspend_service_tests;
 mod tests;
 
 pub use suspend::{SuspendError, SuspendPhase};

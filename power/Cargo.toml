@@ -28,7 +28,10 @@ narf-interrupts   = { path = "../interrupts" }
 narf-event-bus    = { path = "../event_bus" }
 narf-filesystem   = { path = "../filesystem" }
 narf-input        = { path = "../input" }
+narf-crypto       = { path = "../crypto" }
+narf-block        = { path = "../block" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
+zeroize           = { version = "1", default-features = false, features = ["alloc"] }
 
 [features]
 kernel-test = []
