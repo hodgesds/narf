@@ -24,6 +24,10 @@ narf-tpm          = { path = "../../tpm" }
 
 [features]
 kernel-test = []
+# Exposes the spec-shaped FixtureTpm command core (#1002) to a
+# consumer crate's fixture suite (narf-power's TPM anchor tests
+# forward it from their own kernel-test feature).
+fixture-tpm = []
 
 [lints]
 workspace = true

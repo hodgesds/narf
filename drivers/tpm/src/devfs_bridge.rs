@@ -95,6 +95,17 @@ pub fn unregister_transport() {
     *TPM_TRANSPORT.lock() = None;
 }
 
+/// The installed transport behind the trait object, if any
+/// (#1002). The suspend TPM custody anchor's production binding
+/// reads the same injection point the bridges serve, so the
+/// anchor and the /dev/tpm0 face can never disagree about
+/// whether a TPM exists. `None` is the TPM-less machine's
+/// state: an anchor that needs the transport must report its
+/// factor unavailable, never fail the resume as a whole.
+pub fn installed_transport() -> Option<Arc<dyn TpmTransport>> {
+    get_transport()
+}
+
 fn get_transport() -> Option<Arc<dyn TpmTransport>> {
     TPM_TRANSPORT.lock().clone()
 }

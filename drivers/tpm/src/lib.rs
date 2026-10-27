@@ -8,9 +8,11 @@
 //! canonical wire codec) plus the production CRB/TIS transport in
 //! `drivers/platform`, which probes hardware, submits the frames
 //! `narf-tpm` builds, and registers the device for
-//! `frame::measure`. This crate is linked by nothing in the boot
-//! path and must not grow a second trait, registry, transport, or
-//! PCR_Extend encoding.
+//! `frame::measure`. This crate must not grow a second trait,
+//! registry, transport, or PCR_Extend encoding; its one linked
+//! production consumer is narf-power's TPM custody anchor
+//! (#1002), which composes onto the same codec + transport seam
+//! from outside the boot path.
 //!
 //! What remains here is staged, fixture-tested surface for the
 //! follow-on lanes that will compose it onto the canonical stack:
@@ -70,6 +72,17 @@ pub mod crb;
 pub mod devfs_bridge;
 #[cfg(feature = "kernel-test")]
 pub mod e2e_tests;
+/// Spec-shaped fixture TPM (#1002): a stateful command core
+/// behind the [`devfs_bridge::TpmTransport`] seam — real
+/// policyDigest chaining, real PCR/NV semantics — for the
+/// suspend anchor's fixture suite and codec conversation tests.
+/// Test surface only: compiled under `cfg(test)`, the
+/// `kernel-test` harness, or the explicit `fixture-tpm`
+/// feature a consumer's test suite forwards.
+#[cfg(any(test, feature = "kernel-test", feature = "fixture-tpm"))]
+pub mod fixture_tpm;
+#[cfg(feature = "kernel-test")]
+pub mod fixture_tpm_tests;
 pub mod probe;
 pub mod sysfs_bridge;
 pub mod tests;
