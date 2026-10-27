@@ -1950,6 +1950,10 @@ impl crate::drm_registry::DrmCard for IntelGpuCard {
         None
     }
     fn power_state(&self) -> &str {
-        "D0"
+        // The tracked D-state from the PM module (Q9, #1015):
+        // refreshed from PMCSR at registration and updated on
+        // every transition the module performs — no longer a
+        // hardcoded "D0".
+        crate::intel_gpu_pm::power_state_str()
     }
 }
