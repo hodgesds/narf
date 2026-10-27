@@ -2487,3 +2487,596 @@ kernel_test_in!(
     "drivers/platform/power-service",
     smoke_power_state_freeze_end_to_end
 );
+
+// ── Intel HID events (filter + virtual buttons) ──────────────────
+//
+// Fixtures drive the full firmware conversation through the
+// driver's MethodBus seam: a scripted bus answers the AML methods
+// with spec-shaped values and records the call order, and the
+// published side is read back from the real global input ring.
+
+use crate::intel_hid::{
+    bind_filter, bind_vbtn, button_array_dmi_matches, tablet_policy, DmiInfo, MethodBus,
+    TabletPolicy,
+};
+use alloc::collections::VecDeque;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+use narf_input::{sw, InputEvent, KeyCode, KeyEvent, Modifiers, SwitchEvent};
+
+/// Scripted `MethodBus`: per-method queues of integer results,
+/// per-method exec outcomes, and a full call log. Unscripted
+/// evaluations fail (`None`), unscripted execs fail (`false`) —
+/// the failure shapes real firmware presents.
+#[derive(Default)]
+struct ScriptedBus {
+    mask: u64,
+    evals: Vec<(&'static str, VecDeque<Option<u64>>)>,
+    execs: Vec<(&'static str, bool)>,
+    log: Vec<String>,
+}
+
+impl ScriptedBus {
+    fn script_eval(&mut self, name: &'static str, results: &[Option<u64>]) {
+        self.evals.push((name, results.iter().copied().collect()));
+    }
+    fn script_exec(&mut self, name: &'static str, ok: bool) {
+        self.execs.push((name, ok));
+    }
+    fn eval_result(&mut self, name: &str) -> Option<u64> {
+        for (n, q) in &mut self.evals {
+            if *n == name {
+                return q.pop_front().unwrap_or(None);
+            }
+        }
+        None
+    }
+    fn log_index(&self, entry: &str) -> Option<usize> {
+        self.log.iter().position(|e| e == entry)
+    }
+    fn log_count(&self, entry: &str) -> usize {
+        self.log.iter().filter(|e| *e == entry).count()
+    }
+}
+
+impl MethodBus for ScriptedBus {
+    fn dsm_fn_mask(&mut self, _path: &str) -> u64 {
+        self.log.push(String::from("dsm-mask"));
+        self.mask
+    }
+    fn eval_fn(&mut self, _path: &str, _mask: u64, _dsm_fn: u8, name: &str) -> Option<u64> {
+        self.log.push(format!("eval-fn:{name}"));
+        self.eval_result(name)
+    }
+    fn exec_fn(&mut self, _path: &str, _mask: u64, _dsm_fn: u8, name: &str, arg: u64) -> bool {
+        self.log.push(format!("exec-fn:{name}({arg})"));
+        self.execs
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, ok)| *ok)
+            .unwrap_or(false)
+    }
+    fn eval_named(&mut self, _path: &str, name: &str) -> Option<u64> {
+        self.log.push(format!("eval:{name}"));
+        self.eval_result(name)
+    }
+    fn call_named(&mut self, _path: &str, name: &str) -> bool {
+        self.log.push(format!("call:{name}"));
+        true
+    }
+}
+
+fn ih_reset() {
+    narf_input::init_global_ring(64);
+    narf_input::__reset_global_ring_for_test();
+    crate::intel_hid::__reset_switch_state_for_test();
+}
+
+fn ih_drain() -> Vec<InputEvent> {
+    let mut out = Vec::new();
+    while let Some(ev) = narf_input::pop_global() {
+        out.push(ev);
+    }
+    out
+}
+
+fn ih_key(code: KeyCode, pressed: bool) -> InputEvent {
+    InputEvent::Key(KeyEvent {
+        code,
+        pressed,
+        modifiers: Modifiers::EMPTY,
+    })
+}
+
+fn ih_pulse(code: KeyCode) -> Vec<InputEvent> {
+    alloc::vec![ih_key(code, true), ih_key(code, false)]
+}
+
+fn ih_switch(code: u16, on: bool) -> InputEvent {
+    InputEvent::Switch(SwitchEvent { code, on })
+}
+
+fn ih_dmi(vendor: &str, product: &str, chassis_type: u8) -> DmiInfo {
+    DmiInfo {
+        manufacturer: String::from(vendor),
+        product_name: String::from(product),
+        chassis_type,
+    }
+}
+
+/// A complete, healthy bind conversation for a filter device
+/// with the array advertised via HEBC v2 and no switch policy.
+fn ih_bind_plain_filter(bus: &mut ScriptedBus) -> Option<crate::intel_hid::Device> {
+    bus.script_eval("HDMM", &[Some(0)]);
+    bus.script_eval("HEBC", &[Some(0x6_0000)]);
+    bus.script_eval("BTNC", &[Some(0x25)]);
+    bus.script_eval("BTNL", &[Some(0)]);
+    bus.script_exec("HDSM", true);
+    bus.script_exec("BTNE", true);
+    bind_filter(bus, "\\_SB.HIDF", &ih_dmi("Dell Inc.", "XPS 13 9300", 9))
+}
+
+fn smoke_intel_hid_filter_bind_conversation() -> TestResult {
+    ih_reset();
+    let mut bus = ScriptedBus {
+        mask: 0x3FE,
+        ..Default::default()
+    };
+    let dev = match ih_bind_plain_filter(&mut bus) {
+        Some(d) => d,
+        None => return TestResult::Fail("healthy filter conversation refused the bind"),
+    };
+    if dev.kind != crate::intel_hid::DeviceKind::Filter {
+        return TestResult::Fail("bound device is not the filter kind");
+    }
+    if !dev.array_present {
+        return TestResult::Fail("HEBC v2 0x60000 did not mark the array present");
+    }
+    if dev.mask != 0x3FE {
+        return TestResult::Fail("device did not retain the _DSM function mask");
+    }
+    // HEBC v2 hit must short-circuit: exactly one HEBC evaluation.
+    if bus.log_count("eval-fn:HEBC") != 1 {
+        return TestResult::Fail("HEBC evaluated again after a v2 hit");
+    }
+    // The conversation runs in protocol order:
+    // mask -> HDMM -> HEBC -> HDSM -> BTNC -> BTNE -> BTNL.
+    let order = [
+        "dsm-mask",
+        "eval-fn:HDMM",
+        "eval-fn:HEBC",
+        "exec-fn:HDSM(1)",
+        "eval:BTNC",
+        "exec-fn:BTNE(37)",
+        "eval-fn:BTNL",
+    ];
+    let mut prev: Option<usize> = None;
+    for entry in order {
+        let idx = match bus.log_index(entry) {
+            Some(i) => i,
+            None => return TestResult::Fail("bind conversation missed a protocol step"),
+        };
+        if let Some(p) = prev {
+            if idx <= p {
+                return TestResult::Fail("bind conversation steps out of order");
+            }
+        }
+        prev = Some(idx);
+    }
+    // BTNE(37) above also pins that BTNC's capability (0x25 = 37)
+    // is what gets handed back. No switch policy -> nothing
+    // published at bind, no VGBS read.
+    if bus.log_index("eval-fn:VGBS").is_some() {
+        return TestResult::Fail("VGBS read despite the switch policy being off");
+    }
+    if !ih_drain().is_empty() {
+        return TestResult::Fail("bind published input events");
+    }
+    if crate::intel_hid::tablet_mode().is_some() {
+        return TestResult::Fail("tablet state published by a policy-off device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/intel-hid-bind",
+    smoke_intel_hid_filter_bind_conversation
+);
+
+fn smoke_intel_hid_bind_rejections() -> TestResult {
+    ih_reset();
+    // Non-simple HDMM mode -> refused.
+    let mut bus = ScriptedBus::default();
+    bus.script_eval("HDMM", &[Some(1)]);
+    if bind_filter(
+        &mut bus,
+        "\\_SB.HIDF",
+        &ih_dmi("Dell Inc.", "XPS 13 9300", 9),
+    )
+    .is_some()
+    {
+        return TestResult::Fail("bind accepted a non-simple HDMM mode");
+    }
+    // HDMM missing entirely -> refused.
+    let mut bus = ScriptedBus::default();
+    if bind_filter(
+        &mut bus,
+        "\\_SB.HIDF",
+        &ih_dmi("Dell Inc.", "XPS 13 9300", 9),
+    )
+    .is_some()
+    {
+        return TestResult::Fail("bind accepted a device with no HDMM");
+    }
+    // HDSM enable failure -> refused (probe failure in the
+    // reference), and the array arming must not run afterwards.
+    let mut bus = ScriptedBus::default();
+    bus.script_eval("HDMM", &[Some(0)]);
+    bus.script_eval("HEBC", &[Some(0x6_0000)]);
+    bus.script_exec("HDSM", false);
+    if bind_filter(
+        &mut bus,
+        "\\_SB.HIDF",
+        &ih_dmi("Dell Inc.", "XPS 13 9300", 9),
+    )
+    .is_some()
+    {
+        return TestResult::Fail("bind accepted a failed HDSM enable");
+    }
+    if bus.log_index("eval:BTNC").is_some() {
+        return TestResult::Fail("array arming ran after the HDSM failure");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/intel-hid-bind-reject",
+    smoke_intel_hid_bind_rejections
+);
+
+fn smoke_intel_hid_hdem_hotkeys() -> TestResult {
+    ih_reset();
+    // Array-less filter: hotkeys arrive only via Notify(0xC0) +
+    // HDEM indices.
+    let mut bus = ScriptedBus::default();
+    bus.script_eval("HDMM", &[Some(0)]);
+    bus.script_eval("HEBC", &[None, None]);
+    bus.script_eval("BTNL", &[Some(0)]);
+    bus.script_exec("HDSM", true);
+    bus.script_eval(
+        "HDEM",
+        &[
+            Some(17),
+            Some(20),
+            Some(16),
+            Some(8),
+            Some(9),
+            Some(1),
+            None,
+        ],
+    );
+    let mut dev = match bind_filter(
+        &mut bus,
+        "\\_SB.HIDF",
+        &ih_dmi("Dell Inc.", "XPS 13 9300", 9),
+    ) {
+        Some(d) => d,
+        None => return TestResult::Fail("array-less filter bind refused"),
+    };
+    if dev.array_present {
+        return TestResult::Fail("array marked present without HEBC or DMI support");
+    }
+    // The scripted HDEM queue above is consumed in order:
+    // 17/20/16/8/9 map to keys, 1 (LSuper) is deliberately
+    // unmapped in the reference keymap, and the final evaluation
+    // failure must be tolerated silently.
+    let expect: [Vec<InputEvent>; 7] = [
+        ih_pulse(KeyCode::VolumeUp),
+        ih_pulse(KeyCode::BrightnessDown),
+        ih_pulse(KeyCode::Mute),
+        ih_pulse(KeyCode::RfKill),
+        ih_pulse(KeyCode::Power),
+        Vec::new(),
+        Vec::new(),
+    ];
+    for want in expect {
+        dev.notify(&mut bus, 0xC0);
+        if ih_drain() != want {
+            return TestResult::Fail("HDEM index published the wrong events");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/intel-hid-hdem",
+    smoke_intel_hid_hdem_hotkeys
+);
+
+fn smoke_intel_hid_array_buttons() -> TestResult {
+    ih_reset();
+    let mut bus = ScriptedBus::default();
+    let mut dev = match ih_bind_plain_filter(&mut bus) {
+        Some(d) => d,
+        None => return TestResult::Fail("array filter bind refused"),
+    };
+    // Press codes pulse; the odd release codes are KE_IGNORE.
+    let steps: [(u64, Vec<InputEvent>); 8] = [
+        (0xC4, ih_pulse(KeyCode::VolumeUp)),
+        (0xC5, Vec::new()),
+        (0xC2, ih_pulse(KeyCode::LeftMeta)),
+        (0xC8, ih_pulse(KeyCode::RotateLockToggle)),
+        (0xC9, Vec::new()),
+        (0xCE, ih_pulse(KeyCode::Power)),
+        (0xCF, Vec::new()),
+        (0xC1, Vec::new()), // not an array code: logged, nothing published
+    ];
+    for (code, want) in steps {
+        dev.notify(&mut bus, code);
+        if ih_drain() != want {
+            return TestResult::Fail("array notify published the wrong events");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/intel-hid-array",
+    smoke_intel_hid_array_buttons
+);
+
+fn smoke_intel_hid_no_array_power_pair() -> TestResult {
+    ih_reset();
+    let mut bus = ScriptedBus::default();
+    bus.script_eval("HDMM", &[Some(0)]);
+    bus.script_eval("HEBC", &[None, None]);
+    bus.script_eval("BTNL", &[Some(0)]);
+    bus.script_exec("HDSM", true);
+    let mut dev = match bind_filter(
+        &mut bus,
+        "\\_SB.HIDF",
+        &ih_dmi("Dell Inc.", "XPS 13 9300", 9),
+    ) {
+        Some(d) => d,
+        None => return TestResult::Fail("array-less filter bind refused"),
+    };
+    // Without the array, 0xCE/0xCF are a real press/release pair —
+    // NOT a pulse.
+    dev.notify(&mut bus, 0xCE);
+    if ih_drain().as_slice() != [ih_key(KeyCode::Power, true)] {
+        return TestResult::Fail("no-array power press was not a bare press");
+    }
+    dev.notify(&mut bus, 0xCF);
+    if ih_drain().as_slice() != [ih_key(KeyCode::Power, false)] {
+        return TestResult::Fail("no-array power release was not a bare release");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/intel-hid-power-pair",
+    smoke_intel_hid_no_array_power_pair
+);
+
+fn smoke_intel_hid_tablet_at_probe() -> TestResult {
+    ih_reset();
+    // Subscriber surface records through a plain fn pointer.
+    static SEEN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    fn record(on: bool) {
+        SEEN.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::SeqCst);
+    }
+    crate::intel_hid::subscribe_tablet_mode(record);
+
+    let mut bus = ScriptedBus::default();
+    bus.script_eval("HDMM", &[Some(0)]);
+    bus.script_eval("HEBC", &[None, None]);
+    bus.script_eval("VGBS", &[Some(0x40)]); // bit 6 set: NOT tablet mode
+    bus.script_eval("BTNL", &[Some(0)]);
+    bus.script_exec("HDSM", true);
+    let dmi = ih_dmi("HP", "HP Spectre x360 Convertible 15-df0xxx", 31);
+    let mut dev = match bind_filter(&mut bus, "\\_SB.HIDF", &dmi) {
+        Some(d) => d,
+        None => return TestResult::Fail("allow-listed filter bind refused"),
+    };
+    if dev.policy != TabletPolicy::AtProbe || !dev.switches_live {
+        return TestResult::Fail("allow-listed model did not arm switches at probe");
+    }
+    // The initial VGBS state is published at bind.
+    if ih_drain().as_slice() != [ih_switch(sw::SW_TABLET_MODE, false)] {
+        return TestResult::Fail("bind did not publish the initial VGBS tablet state");
+    }
+    if crate::intel_hid::tablet_mode() != Some(false) {
+        return TestResult::Fail("cached tablet state disagrees with VGBS at bind");
+    }
+    if SEEN.load(core::sync::atomic::Ordering::SeqCst) != 1 {
+        return TestResult::Fail("tablet subscriber not fired at bind");
+    }
+    // Notify edges move the switch; a repeat of the same state is
+    // not re-published.
+    dev.notify(&mut bus, 0xCC);
+    if ih_drain().as_slice() != [ih_switch(sw::SW_TABLET_MODE, true)] {
+        return TestResult::Fail("0xCC did not publish tablet-on");
+    }
+    if SEEN.load(core::sync::atomic::Ordering::SeqCst) != 2 {
+        return TestResult::Fail("tablet subscriber not fired on 0xCC");
+    }
+    dev.notify(&mut bus, 0xCC);
+    if !ih_drain().is_empty() {
+        return TestResult::Fail("duplicate tablet-on state was re-published");
+    }
+    dev.notify(&mut bus, 0xCD);
+    if ih_drain().as_slice() != [ih_switch(sw::SW_TABLET_MODE, false)] {
+        return TestResult::Fail("0xCD did not publish tablet-off");
+    }
+    if crate::intel_hid::tablet_mode() != Some(false) {
+        return TestResult::Fail("cached tablet state wrong after 0xCD");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/intel-hid-tablet",
+    smoke_intel_hid_tablet_at_probe
+);
+
+fn smoke_intel_hid_tablet_at_event() -> TestResult {
+    ih_reset();
+    let mut bus = ScriptedBus::default();
+    bus.script_eval("HDMM", &[Some(0)]);
+    bus.script_eval("HEBC", &[None, None]);
+    bus.script_eval("BTNL", &[Some(0)]);
+    bus.script_exec("HDSM", true);
+    // Generic vendor, convertible chassis: at-event policy.
+    let dmi = ih_dmi("Generic OEM", "Convertible X", 31);
+    let mut dev = match bind_filter(&mut bus, "\\_SB.HIDF", &dmi) {
+        Some(d) => d,
+        None => return TestResult::Fail("convertible filter bind refused"),
+    };
+    if dev.policy != TabletPolicy::AtEvent || dev.switches_live {
+        return TestResult::Fail("convertible did not take the at-event policy");
+    }
+    if bus.log_index("eval-fn:VGBS").is_some() {
+        return TestResult::Fail("at-event policy read VGBS at bind");
+    }
+    if crate::intel_hid::tablet_mode().is_some() || !ih_drain().is_empty() {
+        return TestResult::Fail("at-event device published before its first event");
+    }
+    // First switch event arms the surface and publishes.
+    dev.notify(&mut bus, 0xCC);
+    if !dev.switches_live {
+        return TestResult::Fail("first switch event did not arm the surface");
+    }
+    if ih_drain().as_slice() != [ih_switch(sw::SW_TABLET_MODE, true)] {
+        return TestResult::Fail("first switch event did not publish tablet-on");
+    }
+
+    // A policy-off device never publishes switch state.
+    ih_reset();
+    let mut bus2 = ScriptedBus::default();
+    let mut dev2 = match ih_bind_plain_filter(&mut bus2) {
+        Some(d) => d,
+        None => return TestResult::Fail("policy-off filter bind refused"),
+    };
+    dev2.notify(&mut bus2, 0xCC);
+    if !ih_drain().is_empty() || crate::intel_hid::tablet_mode().is_some() {
+        return TestResult::Fail("policy-off device published a tablet event");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/intel-hid-tablet-at-event",
+    smoke_intel_hid_tablet_at_event
+);
+
+fn smoke_intel_hid_vbtn_conversation() -> TestResult {
+    ih_reset();
+    let mut bus = ScriptedBus::default();
+    bus.script_eval("VGBS", &[Some(0x00)]); // bit 6 clear: tablet mode
+    let mut dev = bind_vbtn(&mut bus, "\\_SB.VBTN");
+    // Bind order: VBDL load first, then the VGBS state read; the
+    // initial tablet state publishes at bind.
+    match (bus.log_index("call:VBDL"), bus.log_index("eval:VGBS")) {
+        (Some(vb), Some(vg)) if vb < vg => {}
+        _ => return TestResult::Fail("vbtn bind did not run VBDL before the VGBS read"),
+    }
+    if !dev.switches_live {
+        return TestResult::Fail("vbtn switches not live despite VGBS evaluating");
+    }
+    if ih_drain().as_slice() != [ih_switch(sw::SW_TABLET_MODE, true)] {
+        return TestResult::Fail("vbtn bind did not publish the VGBS tablet state");
+    }
+    // Buttons pulse; every notify is followed by a VBDL reload.
+    dev.notify(&mut bus, 0xC4);
+    if ih_drain() != ih_pulse(KeyCode::VolumeUp) {
+        return TestResult::Fail("vbtn volume-up notify did not pulse");
+    }
+    if bus.log_count("call:VBDL") != 2 {
+        return TestResult::Fail("VBDL not re-run after a vbtn notify");
+    }
+    // Dock + tablet switch pair.
+    dev.notify(&mut bus, 0xCA);
+    if ih_drain().as_slice() != [ih_switch(sw::SW_DOCK, true)] {
+        return TestResult::Fail("0xCA did not publish dock-on");
+    }
+    if crate::intel_hid::docked() != Some(true) {
+        return TestResult::Fail("cached dock state wrong after 0xCA");
+    }
+    dev.notify(&mut bus, 0xCB);
+    if ih_drain().as_slice() != [ih_switch(sw::SW_DOCK, false)] {
+        return TestResult::Fail("0xCB did not publish dock-off");
+    }
+    dev.notify(&mut bus, 0xCD);
+    if ih_drain().as_slice() != [ih_switch(sw::SW_TABLET_MODE, false)] {
+        return TestResult::Fail("vbtn 0xCD did not publish tablet-off");
+    }
+    dev.notify(&mut bus, 0xC1);
+    if !ih_drain().is_empty() {
+        return TestResult::Fail("unknown vbtn event published input");
+    }
+
+    // A vbtn whose VGBS does not evaluate keeps its switches
+    // dark but its buttons live.
+    ih_reset();
+    let mut bus2 = ScriptedBus::default();
+    let mut dev2 = bind_vbtn(&mut bus2, "\\_SB.VBTN");
+    if dev2.switches_live {
+        return TestResult::Fail("vbtn switches live without a VGBS method");
+    }
+    dev2.notify(&mut bus2, 0xCC);
+    if !ih_drain().is_empty() || crate::intel_hid::tablet_mode().is_some() {
+        return TestResult::Fail("switch-less vbtn published a tablet event");
+    }
+    dev2.notify(&mut bus2, 0xCE);
+    if ih_drain() != ih_pulse(KeyCode::Power) {
+        return TestResult::Fail("switch-less vbtn lost its power button");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/intel-hid-vbtn",
+    smoke_intel_hid_vbtn_conversation
+);
+
+fn smoke_intel_hid_dmi_policy_tables() -> TestResult {
+    // VGBS allow-list -> at-probe, regardless of chassis.
+    if tablet_policy(&ih_dmi("HP", "HP Spectre x360 Convertible 15-df0xxx", 9))
+        != TabletPolicy::AtProbe
+    {
+        return TestResult::Fail("allow-listed HP did not take at-probe");
+    }
+    if tablet_policy(&ih_dmi("Microsoft Corporation", "Surface Go", 32)) != TabletPolicy::AtProbe {
+        return TestResult::Fail("allow-listed Surface Go did not take at-probe");
+    }
+    if tablet_policy(&ih_dmi("Dell Inc.", "Dell 16 Plus 2-in-1 DB06250", 9))
+        != TabletPolicy::AtProbe
+    {
+        return TestResult::Fail("allow-listed Dell did not take at-probe");
+    }
+    // Convertible / detachable chassis -> at-event.
+    if tablet_policy(&ih_dmi("Generic OEM", "Convertible X", 31)) != TabletPolicy::AtEvent {
+        return TestResult::Fail("chassis 31 did not take at-event");
+    }
+    if tablet_policy(&ih_dmi("Generic OEM", "Detachable Y", 32)) != TabletPolicy::AtEvent {
+        return TestResult::Fail("chassis 32 did not take at-event");
+    }
+    // Plain laptop chassis -> off.
+    if tablet_policy(&ih_dmi("Generic OEM", "Laptop Z", 9)) != TabletPolicy::Off {
+        return TestResult::Fail("chassis 9 did not take off");
+    }
+    // Button-array DMI table.
+    if !button_array_dmi_matches(&ih_dmi("Microsoft Corporation", "Surface Go 4", 32)) {
+        return TestResult::Fail("Surface Go 4 missing from the array table");
+    }
+    if !button_array_dmi_matches(&ih_dmi("HP", "HP ProBook x360 440 G1", 31)) {
+        return TestResult::Fail("ProBook x360 missing from the array table");
+    }
+    if !button_array_dmi_matches(&ih_dmi("Wacom Co.,Ltd", "Wacom MobileStudio Pro 13", 32)) {
+        return TestResult::Fail("MobileStudio Pro missing from the array table");
+    }
+    if !button_array_dmi_matches(&ih_dmi("LENOVO", "ThinkPad X1 Tablet Gen 2", 32)) {
+        return TestResult::Fail("X1 Tablet Gen 2 missing from the array table");
+    }
+    if button_array_dmi_matches(&ih_dmi("Dell Inc.", "XPS 13 9300", 9)) {
+        return TestResult::Fail("unlisted model matched the array table");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/intel-hid-dmi",
+    smoke_intel_hid_dmi_policy_tables
+);
