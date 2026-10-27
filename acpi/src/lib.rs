@@ -4986,6 +4986,22 @@ pub fn __test_parse_tpm2_body(body: &[u8]) {
     TPM2_PARSED.store(true, Ordering::Release);
 }
 
+/// Test-only: clear the parsed TPM2 state, restoring the
+/// no-table state a TPM2-less boot observes. Fixtures that feed
+/// synthetic TPM2 tables through `parse_tpm2` / the body seam
+/// must call this on exit so later fixtures (and the platform
+/// TPM probe's discovery decision) never see a synthetic
+/// control-area address whose backing memory is gone.
+#[doc(hidden)]
+pub fn __reset_tpm2_for_test() {
+    *TPM2_DATA.lock() = Tpm2Info {
+        platform_class: 0,
+        control_area_addr: 0,
+        start_method: 0,
+    };
+    TPM2_PARSED.store(false, Ordering::Release);
+}
+
 // ───────────────────────────────────────────────────────────────────
 // BGRT — Boot Graphics Resource Table.
 // Spec: `acpi/specification/tables-ras-tpm-debug.md` §4.

@@ -17,10 +17,12 @@
 **Does NOT own:**
 - Raw MMIO drivers (e.g., TIS/CRB) — these live in `drivers/platform/tpm`.
 - Crypto primitives (HMAC, SHA-256) — consumed from `crypto/`.
-- The extended command set (Create/Load/Unseal, NV, object models) and
-  the `/dev/tpm*` + `/sys/class/tpm` bridges — staged, fixture-tested,
-  and not production in `drivers/tpm` (see §3.4); they compose onto
-  this crate's trait/registry when their lanes (#940/#941/#944) land.
+- The extended command set (Create/Load/Unseal, NV, object models) —
+  staged, fixture-tested, and not production in `drivers/tpm` (see
+  §3.4); it composes onto this crate's trait/registry when its
+  lanes (#941/#944) land. The `/dev/tpm*` + `/sys/class/tpm`
+  bridges, also in `drivers/tpm`, ARE production-composed onto the
+  trait/registry since #940 (see §3.4).
 - TPM2 ACPI table parsing — owned by `acpi/` (`tpm2_info()` /
   `parse_tpm2`); no TPM crate carries a second parser.
 
@@ -40,10 +42,50 @@ pub trait TpmDevice: Send + Sync {
     /// Submit a raw TPM2 command.
     async fn submit_raw(&self, cmd: &[u8]) -> Result<Vec<u8>, TpmError>;
 
+    /// Lifecycle: submit TPM2_Startup (provided; see below).
+    async fn startup(&self, startup_type: StartupType) -> Result<(), TpmError>;
+
+    /// Identity: query TPM2_GetCapability live (provided; §3.1).
+    async fn query_info(&self) -> Result<TpmInfo, TpmError>;
+
     /// High-level GetRandom.
     async fn get_random(&self, bytes: u16) -> Result<Vec<u8>, TpmError>;
 }
 ```
+
+**Lifecycle (`startup`).** A powered-on TPM rejects every command
+except `TPM2_Startup` with `TPM_RC_INITIALIZE` until one lands; the
+trait owns the lifecycle edge so no conversation — production or
+fixture — can begin without it. `startup` is a provided method:
+it builds the frame with the canonical codec and submits through
+`submit_raw`, so transports inherit it unchanged. `StartupType` is
+the `TPM_SU` operand (`Clear` / `State`, Part 2 §6.9). The response
+policy is Part 3 §9.3's: `TPM_RC_VALUE` from Startup means the
+startup type did not match the TPM's state — the device was
+already started, or a `State` startup found no saved state. The
+trait folds both into the caller's goal state (`Clear` +
+`TPM_RC_VALUE` ⇒ success; `State` + `TPM_RC_VALUE` ⇒ one retry as
+`Clear`); every other response code propagates. The
+Shutdown(STATE) → Startup(STATE) suspend/resume sequencing that
+consumes the `State` form is owned by the power-suspend program
+(#1003), not by this interface.
+
+**Identity (`query_info`, #941).** `get_info` is the synchronous
+cached read; `query_info` is the live query behind it. It is a
+provided method: it builds `TPM2_GetCapability(TPM_CAP_TPM_PROPERTIES,
+TPM_PT_FAMILY_INDICATOR, 64)` with the canonical codec, submits
+through `submit_raw`, and parses the TPML_TAGGED_TPM_PROPERTY page
+with the canonical parser (`ResponseParser::parse_get_capability_properties`;
+the PCRS sibling parses TPML_PCR_SELECTION). The mapping is:
+manufacturer ← `TPM_PT_MANUFACTURER` (required — its absence is a
+`BadResponse`), version ← `TPM_PT_FIRMWARE_VERSION_1`, spec_level ←
+`TPM_PT_REVISION` (both default 0 when unreported). The production
+probe calls `query_info` once after Startup and caches the result;
+on query failure the device still registers and `get_info` keeps
+its unqueried defaults — identity is diagnostic, not a liveness
+gate. Property tags live with the codec (`tpm2::TPM_PT_*`); note
+`TPM_PT_PERMANENT` is in the variable group (0x200), while 0x10E in
+the fixed group is `TPM_PT_HR_TRANSIENT_MIN`.
 
 ### 3.2 TPM Capabilities
 
@@ -68,8 +110,10 @@ pub type Cap<TpmDevice, R> = ...;
 consumers:
 
 - `register(device: Arc<dyn TpmDevice>)` — called by the owning
-  transport exactly once, at probe success. The production transport
-  is the platform probe (`drivers/platform` TPM driver, Stage::Subsys
+  transport exactly once, at probe success, after `TPM2_Startup`
+  (§3.1) has been submitted on the probed device: a registered
+  device is a *started* device. The production transport is the
+  platform probe (`drivers/platform` TPM driver, Stage::Subsys
   initcall); the registry itself never probes hardware.
 - `list() -> Vec<Arc<dyn TpmDevice>>` — snapshot of the registered
   devices. `frame::measure` dispatches hardware PCR extends to the
@@ -96,17 +140,50 @@ contract:
 - **Production transport — `drivers/platform`.** The CRB/TIS MMIO
   driver there is the only code that probes hardware, owns the
   probed-device singleton, and submits frames; on probe success it
-  registers the device into this crate's registry (the §3.3
-  registry contract) for `frame::measure` to dispatch through.
+  submits `TPM2_Startup(CLEAR)` (§3.1) and only then registers the
+  device into this crate's registry (the §3.3 registry contract)
+  for `frame::measure` to dispatch through — probe and Startup run
+  at Stage::Subsys, measured boot at Stage::Late, so the first
+  production extend always reaches a started TPM. A device that
+  probed but would not start is not registered (its every command
+  would fail with `TPM_RC_INITIALIZE`, and an unregistered device
+  keeps the no-hardware-anchoring report honest).
   Its probe/discovery semantics (PTP register map, host-programmed
   CRB buffers, TPM2-table discovery via `narf_acpi::tpm2_info()`)
   are #939's.
-- **`drivers/tpm` is not a stack.** It is a staged extension
-  surface (extended command set, devfs/sysfs bridges, register
-  models) with zero production dependents. It must not grow a
-  second `TpmDevice` trait, registry, transport, TPM2-table
-  parser, or PCR_Extend encoding; its follow-on lanes compose its
+- **`drivers/tpm` is not a stack.** It is an extension surface
+  (extended command set, devfs/sysfs bridges, register models). It
+  must not grow a second `TpmDevice` trait, registry, transport,
+  TPM2-table parser, or PCR_Extend encoding; its lanes compose its
   modules onto the two owners above.
+- **Userspace publication (#940).** On the same success path that
+  registers the device (probe → `TPM2_Startup` → registry), the
+  platform probe installs a synchronous `TpmTransport` over the
+  registered device into `drivers/tpm`'s bridges and registers
+  their surfaces: `/dev/tpm0` + `/dev/tpmrm0` (via
+  `filesystem::register_tpm`) and `/sys/class/tpm/tpm0`. The
+  transport is the bridges' only production implementation; it
+  bridges sync→async with `block_on_spin` over `submit_raw` (the
+  submit futures are self-waking register polls). The bridges keep
+  no registry of their own — devfs writes and sysfs attribute reads
+  alike submit through the installed transport, i.e. through the
+  §3.3 registry device. Per-fd state (response slot; the RM node's
+  transient-handle set, flushed with `TPM2_FlushContext` at close)
+  rides the VFS clone-on-open hook (`FileOps::open_instance`): the
+  registered nodes are prototypes, each `open(2)` gets a fresh
+  instance, and the devfs proxies forward the hook to the
+  installed delegate. Sysfs attributes that need capability data
+  query per read through the transport. The command set they
+  depend on (GetCapability) landed with #941: the canonical codec
+  carries the builder and the property/PCR-selection parsers
+  (§3.1), the keystone model serves the capability, and the
+  attributes read live values against any device whose transport
+  implements the command — including the model, whose identity
+  (manufacturer "NARF", firmware 1.0, spec revision 159) the
+  publication fixture now asserts live. The platform transport's
+  `get_info` likewise answers from the probe-time `query_info`
+  (§3.1) instead of the pre-#941 stub values, which remain only as
+  the unqueried default.
 
 ## 4. Operation: PCR Extension
 
@@ -172,4 +249,13 @@ silent success.
 - Specific commands: `startup`, `shutdown`, `get_random`,
   `get_capability`, `pcr_read`.
 - `parse_get_random_response` for the 2-byte BE length + bytes form.
-- TPM_ST / TPM_CC / TPM_SU / TPM_ALG_ID / TPM_CAP / TPM_RC constants.
+- `ResponseParser::parse_get_capability_properties` /
+  `parse_get_capability_pcr_selections` (#941) for the
+  TPML_TAGGED_TPM_PROPERTY and TPML_PCR_SELECTION pages behind
+  `query_info` (§3.1).
+- `ResponseParser::parse_pcr_read` / `parse_pcr_read_full` (#1065)
+  for TPM2_PCR_Read responses: the structural Part 3 §22.6 walk
+  (UINT32 `pcrUpdateCounter`, TPML_PCR_SELECTION, TPML_DIGEST of
+  TPM2B_DIGEST entries), returning the first digest or the full
+  `PcrReadResponse`. No tail-read form exists.
+- TPM_ST / TPM_CC / TPM_SU / TPM_ALG_ID / TPM_CAP / TPM_PT / TPM_RC constants.

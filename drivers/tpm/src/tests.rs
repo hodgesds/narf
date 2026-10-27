@@ -307,6 +307,271 @@ mod smokes {
     }
     kernel_test_in!("drivers/tpm/tpm2", smoke_tpm2_get_capability_encode);
 
+    // ── #941: Create template + new builders + structured parsers ─────
+
+    fn smoke_tpm2_create_template_uses_objects_encoder() -> TestResult {
+        use crate::tpm2::commands::create_rsa2048_under_owner;
+        use crate::tpm2::objects::{
+            rsa2048_template, OBJ_DECRYPT, OBJ_FIXED_PARENT, OBJ_FIXED_TPM,
+            OBJ_SENSITIVE_DATA_ORIGIN, OBJ_ST_CLEAR, OBJ_USER_WITH_AUTH,
+        };
+        let cmd = create_rsa2048_under_owner(&[]);
+        let template = rsa2048_template(
+            OBJ_FIXED_TPM
+                | OBJ_ST_CLEAR
+                | OBJ_FIXED_PARENT
+                | OBJ_SENSITIVE_DATA_ORIGIN
+                | OBJ_USER_WITH_AUTH
+                | OBJ_DECRYPT,
+        );
+        // The frame must carry the objects.rs template verbatim…
+        if !cmd
+            .windows(template.len())
+            .any(|w| w == template.as_slice())
+        {
+            return TestResult::Fail("Create inPublic != objects::rsa2048_template");
+        }
+        // …and none of the pre-#941 malformed encoding: the old
+        // inline template wrote the symmetric field as
+        // TPM_ALG_SHA256 (0x000B) followed by a stray 0x0080
+        // "keyBits" word and exponent 1.
+        let malformed: [u8; 6] = [0x00, 0x0B, 0x00, 0x80, 0x00, 0x10];
+        if cmd.windows(malformed.len()).any(|w| w == malformed) {
+            return TestResult::Fail("Create still carries the malformed template bytes");
+        }
+        let bad_exponent: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+        // The template's exponent field is 0 (→ 65537); the only
+        // 00 00 00 01 in a correct frame is the TPM_CC / count
+        // fields — check the template region itself instead: the
+        // four bytes before the unique-size field.
+        let t = &template;
+        if t[t.len() - 6..t.len() - 2] == bad_exponent {
+            return TestResult::Fail("template exponent must be 0, not 1");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/tpm/tpm2",
+        smoke_tpm2_create_template_uses_objects_encoder
+    );
+
+    fn smoke_tpm2_hierarchy_session_builders_encode() -> TestResult {
+        use crate::tpm2::commands as cmds;
+        use crate::tpm2::*;
+        let cc = |cmd: &[u8]| u32::from_be_bytes([cmd[6], cmd[7], cmd[8], cmd[9]]);
+        let tag = |cmd: &[u8]| u16::from_be_bytes([cmd[0], cmd[1]]);
+        let size_ok =
+            |cmd: &[u8]| u32::from_be_bytes([cmd[2], cmd[3], cmd[4], cmd[5]]) as usize == cmd.len();
+
+        // Clear: SESSIONS, platform handle, PW area only.
+        let cmd = cmds::clear();
+        if tag(&cmd) != TPM_ST_SESSIONS || cc(&cmd) != TPM_CC_CLEAR || !size_ok(&cmd) {
+            return TestResult::Fail("Clear header wrong");
+        }
+        if cmd.len() != 23
+            || u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]) != TPM_RH_PLATFORM
+        {
+            return TestResult::Fail("Clear frame shape wrong");
+        }
+        // ClearControl(true): one trailing TPMI_YES_NO byte.
+        let cmd = cmds::clear_control(true);
+        if cc(&cmd) != TPM_CC_CLEAR_CONTROL || cmd.len() != 24 || cmd[23] != 1 {
+            return TestResult::Fail("ClearControl frame wrong");
+        }
+        // FlushContext: NO_SESSIONS + handle, 14 bytes.
+        let cmd = cmds::flush_context(0x8000_0001);
+        if tag(&cmd) != TPM_ST_NO_SESSIONS
+            || cc(&cmd) != TPM_CC_FLUSH_CONTEXT
+            || cmd.len() != 14
+            || u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]) != 0x8000_0001
+        {
+            return TestResult::Fail("FlushContext frame wrong");
+        }
+        // EvictControl: two handles, PW area, persistent handle.
+        let cmd = cmds::evict_control(TPM_RH_OWNER, 0x8000_0100, 0x8100_0000);
+        if cc(&cmd) != TPM_CC_EVICT_CONTROL || cmd.len() != 35 {
+            return TestResult::Fail("EvictControl frame wrong");
+        }
+        if u32::from_be_bytes([cmd[31], cmd[32], cmd[33], cmd[34]]) != 0x8100_0000 {
+            return TestResult::Fail("EvictControl persistent handle misplaced");
+        }
+        // StartAuthSession: NO_SESSIONS, two handles, TPM_SE_POLICY,
+        // NULL symmetric, SHA-256 authHash.
+        let cmd = cmds::start_auth_session(
+            TPM_RH_NULL,
+            TPM_RH_NULL,
+            &[],
+            &[],
+            TPM_SE_POLICY,
+            TPM_ALG_SHA256,
+        );
+        if cc(&cmd) != TPM_CC_START_AUTH_SESSION || cmd.len() != 27 || !size_ok(&cmd) {
+            return TestResult::Fail("StartAuthSession frame wrong");
+        }
+        if cmd[22] != TPM_SE_POLICY
+            || u16::from_be_bytes([cmd[23], cmd[24]]) != TPM_ALG_NULL
+            || u16::from_be_bytes([cmd[25], cmd[26]]) != TPM_ALG_SHA256
+        {
+            return TestResult::Fail("StartAuthSession parameters wrong");
+        }
+        // PolicyPCR: SESSIONS; the auth area is the session itself
+        // with continueSession (0x01) at offset 24.
+        let mut mask = [0u8; 3];
+        mask[0] = 1 << 7;
+        let cmd = cmds::policy_pcr(0x0200_0001, &[], &[(TPM_ALG_SHA256, &mask)]);
+        if tag(&cmd) != TPM_ST_SESSIONS || cc(&cmd) != TPM_CC_POLICY_PCR || !size_ok(&cmd) {
+            return TestResult::Fail("PolicyPCR header wrong");
+        }
+        if u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]) != 0x0200_0001
+            || u32::from_be_bytes([cmd[18], cmd[19], cmd[20], cmd[21]]) != 0x0200_0001
+            || cmd[24] != 0x01
+        {
+            return TestResult::Fail("PolicyPCR auth area != the session with continueSession");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/tpm/tpm2",
+        smoke_tpm2_hierarchy_session_builders_encode
+    );
+
+    fn smoke_tpm2_structured_response_parsers() -> TestResult {
+        use crate::tpm2::commands as cmds;
+        // Frame helper: SESSIONS success response with the given
+        // handle area + parameter bytes + a 5-byte auth area.
+        fn sessions_frame(handle: Option<u32>, params: &[u8]) -> alloc::vec::Vec<u8> {
+            let mut r = alloc::vec::Vec::new();
+            r.extend_from_slice(&0x8002u16.to_be_bytes());
+            r.extend_from_slice(&0u32.to_be_bytes()); // size, patched below
+            r.extend_from_slice(&0u32.to_be_bytes()); // rc = SUCCESS
+            if let Some(h) = handle {
+                r.extend_from_slice(&h.to_be_bytes());
+            }
+            r.extend_from_slice(&(params.len() as u32).to_be_bytes());
+            r.extend_from_slice(params);
+            r.extend_from_slice(&[0u8; 5]); // auth area
+            let n = r.len() as u32;
+            r[2..6].copy_from_slice(&n.to_be_bytes());
+            r
+        }
+        fn tpm2b(data: &[u8]) -> alloc::vec::Vec<u8> {
+            let mut v = alloc::vec::Vec::new();
+            v.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            v.extend_from_slice(data);
+            v
+        }
+
+        // Create: outPrivate/outPublic/creationData/creationHash +
+        // ticket(tag, hierarchy, digest).
+        let mut params = alloc::vec::Vec::new();
+        params.extend_from_slice(&tpm2b(&[0xAA; 4]));
+        params.extend_from_slice(&tpm2b(&[0xBB; 6]));
+        params.extend_from_slice(&tpm2b(&[]));
+        params.extend_from_slice(&tpm2b(&[0xCC; 4]));
+        params.extend_from_slice(&0x8021u16.to_be_bytes());
+        params.extend_from_slice(&0x4000_0001u32.to_be_bytes());
+        params.extend_from_slice(&tpm2b(&[0xDD; 2]));
+        let frame = sessions_frame(None, &params);
+        match cmds::parse_create_response(&frame) {
+            Ok(o)
+                if o.out_private == alloc::vec![0xAA; 4]
+                    && o.out_public == alloc::vec![0xBB; 6]
+                    && o.creation_hash == alloc::vec![0xCC; 4]
+                    && o.ticket_tag == 0x8021
+                    && o.ticket_hierarchy == 0x4000_0001
+                    && o.ticket_digest == alloc::vec![0xDD; 2] => {}
+            _ => return TestResult::Fail("Create response parsed incorrectly"),
+        }
+        // CreatePrimary: same params behind a handle.
+        let frame = sessions_frame(Some(0x8000_0100), &params);
+        match cmds::parse_create_primary_response(&frame) {
+            Ok((0x8000_0100, o)) if o.out_public == alloc::vec![0xBB; 6] => {}
+            _ => return TestResult::Fail("CreatePrimary response parsed incorrectly"),
+        }
+        // Load: handle + name TPM2B.
+        let frame = sessions_frame(Some(0x8000_0200), &tpm2b(&[1, 2, 3]));
+        match cmds::parse_load_response(&frame) {
+            Ok((0x8000_0200, name)) if name == alloc::vec![1, 2, 3] => {}
+            _ => return TestResult::Fail("Load response parsed incorrectly"),
+        }
+        // Unseal / NV_Read: a single TPM2B parameter.
+        let frame = sessions_frame(None, &tpm2b(b"secret"));
+        match cmds::parse_unseal_response(&frame) {
+            Ok(v) if v == b"secret" => {}
+            _ => return TestResult::Fail("Unseal response parsed incorrectly"),
+        }
+        match cmds::parse_nv_read_response(&frame) {
+            Ok(v) if v == b"secret" => {}
+            _ => return TestResult::Fail("NV_Read response parsed incorrectly"),
+        }
+        // GetTestResult: NO_SESSIONS, TPM2B + u32.
+        let mut r = alloc::vec::Vec::new();
+        r.extend_from_slice(&0x8001u16.to_be_bytes());
+        r.extend_from_slice(&0u32.to_be_bytes());
+        r.extend_from_slice(&0u32.to_be_bytes());
+        r.extend_from_slice(&tpm2b(&[9, 9]));
+        r.extend_from_slice(&0x0000_0000u32.to_be_bytes());
+        let n = r.len() as u32;
+        r[2..6].copy_from_slice(&n.to_be_bytes());
+        match cmds::parse_get_test_result_response(&r) {
+            Ok((data, 0)) if data == alloc::vec![9, 9] => {}
+            _ => return TestResult::Fail("GetTestResult response parsed incorrectly"),
+        }
+        // StartAuthSession: handle + nonce TPM2B, NO_SESSIONS.
+        let mut r = alloc::vec::Vec::new();
+        r.extend_from_slice(&0x8001u16.to_be_bytes());
+        r.extend_from_slice(&0u32.to_be_bytes());
+        r.extend_from_slice(&0u32.to_be_bytes());
+        r.extend_from_slice(&0x0200_0001u32.to_be_bytes());
+        r.extend_from_slice(&tpm2b(&[7; 16]));
+        let n = r.len() as u32;
+        r[2..6].copy_from_slice(&n.to_be_bytes());
+        match cmds::parse_start_auth_session_response(&r) {
+            Ok((0x0200_0001, nonce)) if nonce == alloc::vec![7; 16] => {}
+            _ => return TestResult::Fail("StartAuthSession response parsed incorrectly"),
+        }
+        // GetCapability envelope + property data.
+        let mut r = alloc::vec::Vec::new();
+        r.extend_from_slice(&0x8001u16.to_be_bytes());
+        r.extend_from_slice(&0u32.to_be_bytes());
+        r.extend_from_slice(&0u32.to_be_bytes());
+        r.push(0u8); // moreData = NO
+        r.extend_from_slice(&6u32.to_be_bytes()); // TPM_CAP_TPM_PROPERTIES
+        r.extend_from_slice(&1u32.to_be_bytes()); // count
+        r.extend_from_slice(&0x105u32.to_be_bytes()); // PT_MANUFACTURER
+        r.extend_from_slice(&0x4E41_5246u32.to_be_bytes()); // "NARF"
+        let n = r.len() as u32;
+        r[2..6].copy_from_slice(&n.to_be_bytes());
+        match cmds::parse_get_capability_response(&r) {
+            Ok(p) if !p.more_data && p.capability == 6 => {
+                match cmds::parse_tagged_properties(&p.data) {
+                    Ok(entries) if entries == alloc::vec![(0x105, 0x4E41_5246)] => {}
+                    _ => return TestResult::Fail("tagged properties parsed incorrectly"),
+                }
+            }
+            _ => return TestResult::Fail("GetCapability response parsed incorrectly"),
+        }
+        // Negatives: truncated parameters, parameterSize overrun,
+        // and a non-zero RC must all be errors, never panics.
+        let frame = sessions_frame(None, &params[..4]);
+        if cmds::parse_create_response(&frame).is_ok() {
+            return TestResult::Fail("truncated Create response accepted");
+        }
+        let mut frame = sessions_frame(None, &params);
+        let bogus = (params.len() + 64) as u32;
+        frame[10..14].copy_from_slice(&bogus.to_be_bytes());
+        if cmds::parse_create_response(&frame).is_ok() {
+            return TestResult::Fail("parameterSize overrun accepted");
+        }
+        let mut frame = sessions_frame(None, &params);
+        frame[9] = 0x43; // rc low byte → TPM_RC_COMMAND_CODE-ish
+        if cmds::parse_create_response(&frame).is_ok() {
+            return TestResult::Fail("non-zero RC accepted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/tpm/tpm2", smoke_tpm2_structured_response_parsers);
+
     // ── TPM2_GetRandom encode + decode 32-byte response ───────────────
 
     fn smoke_tpm2_get_random_encode() -> TestResult {
@@ -1115,4 +1380,203 @@ mod smokes {
         TestResult::Pass
     }
     kernel_test_in!("drivers/tpm/sysfs", smoke_sysfs_manufacturer_ascii);
+
+    /// GetCapability transport for the `owned` fixture: answers
+    /// `TPM_PT_PERMANENT` with a value the fixture controls, so
+    /// each TPMA_PERMANENT bit can be exercised in isolation.
+    static PERMANENT_VALUE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+    struct PermanentTransport;
+    impl crate::devfs_bridge::TpmTransport for PermanentTransport {
+        fn submit(&self, cmd: &[u8]) -> Result<alloc::vec::Vec<u8>, ()> {
+            if cmd.len() < 10 {
+                return Err(());
+            }
+            let cc = u32::from_be_bytes([cmd[6], cmd[7], cmd[8], cmd[9]]);
+            if cc != crate::tpm2::TPM_CC_GET_CAPABILITY {
+                return Err(());
+            }
+            // Response layout (mirrors MfrTransport's): header(10) +
+            // moreData(1) + capability(4) + count(4) + tag(4) +
+            // value(4); read_property extracts tag at body[9..13]
+            // and value at body[13..17].
+            let total = 10 + 1 + 4 + 4 + 4 + 4;
+            let mut r = alloc::vec![0u8; total];
+            r[0] = 0x80;
+            r[1] = 0x01;
+            r[2..6].copy_from_slice(&(total as u32).to_be_bytes());
+            // capability = TPM_CAP_TPM_PROPERTIES (6)
+            r[14] = 6;
+            // count = 1
+            r[18] = 1;
+            // property tag = PT_PERMANENT (0x0000_0200, variable
+            // group — corrected from 0x10E in #941)
+            r[21] = 0x02;
+            r[22] = 0x00;
+            // value = the fixture-controlled TPMA_PERMANENT
+            let v = PERMANENT_VALUE.load(core::sync::atomic::Ordering::SeqCst);
+            r[23..27].copy_from_slice(&v.to_be_bytes());
+            Ok(r)
+        }
+    }
+
+    fn smoke_sysfs_owned_reflects_owner_auth_bit() -> TestResult {
+        use crate::devfs_bridge::TpmTransport;
+        use alloc::sync::Arc;
+        use core::sync::atomic::Ordering;
+
+        let t = Arc::new(PermanentTransport) as Arc<dyn TpmTransport>;
+        crate::sysfs_bridge::register_sysfs_tpm0(t);
+
+        let class_tpm = narf_filesystem::class_register("tpm");
+        let tpm0 = narf_filesystem::class_device_register(class_tpm, "tpm0");
+
+        // TPMA_PERMANENT (Part 2 §10.11): ownerAuthSet is bit 0,
+        // endorsementAuthSet bit 1, lockoutAuthSet bit 2. `owned`
+        // must track bit 0 only. The pre-#940 code tested bit 1
+        // under a comment claiming bit 2, so it reported the
+        // endorsement hierarchy's auth state — the 0b010 case is
+        // the one that catches it.
+        let cases: [(u32, &str); 5] = [
+            (0b000, "0\n"),
+            (0b001, "1\n"),
+            (0b010, "0\n"),
+            (0b100, "0\n"),
+            (0b111, "1\n"),
+        ];
+        for (value, want) in cases {
+            PERMANENT_VALUE.store(value, Ordering::SeqCst);
+            match tpm0.attr_show("owned") {
+                Some(s) if s == want => {}
+                _ => {
+                    return TestResult::Fail(
+                        "owned does not reflect TPMA_PERMANENT bit 0 (ownerAuthSet)",
+                    );
+                }
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/tpm/sysfs",
+        smoke_sysfs_owned_reflects_owner_auth_bit
+    );
+
+    // ── Per-open state fixtures (#940) ─────────────────────────────
+    //
+    // The registered nodes are prototypes; `sys_open` clones them
+    // per fd through `FileOps::open_instance`. These fixtures pin
+    // the two contracts that follow: response state is per-fd, and
+    // the RM node's FlushContext-on-close fires at the owning fd's
+    // close only.
+
+    fn smoke_tpm0_open_instance_state_isolation() -> TestResult {
+        use crate::devfs_bridge::{DevTpm0, TpmTransport};
+        use alloc::sync::Arc;
+        use narf_filesystem::FileOps;
+
+        crate::devfs_bridge::register_transport(Arc::new(GetRandomMock) as Arc<dyn TpmTransport>);
+
+        let proto = DevTpm0::new();
+        let (fd_a, fd_b) = match (proto.open_instance(), proto.open_instance()) {
+            (Some(a), Some(b)) => (a, b),
+            _ => {
+                crate::devfs_bridge::unregister_transport();
+                return TestResult::Fail("DevTpm0::open_instance returned None");
+            }
+        };
+        if Arc::ptr_eq(&fd_a, &fd_b) {
+            crate::devfs_bridge::unregister_transport();
+            return TestResult::Fail("open_instance returned the same instance twice");
+        }
+
+        // GetRandom command, as in smoke_tpm0_write_read_roundtrip.
+        let mut cmd = alloc::vec![0u8; 12];
+        cmd[0] = 0x80;
+        cmd[1] = 0x01; // tag TPM_ST_NO_SESSIONS
+        cmd[5] = 12; // size
+        cmd[8] = 0x01;
+        cmd[9] = 0x7B; // CC GetRandom
+        cmd[11] = 8; // bytesRequested = 8
+
+        let n = poll_once_sync(fd_a.write(0, &cmd)).and_then(|r| r.ok());
+        if n != Some(12) {
+            crate::devfs_bridge::unregister_transport();
+            return TestResult::Fail("write on fd A did not return 12");
+        }
+        // fd B must not observe fd A's pending response: with no
+        // response of its own, its read is EOF (0), exactly as a
+        // fresh Linux tpm fd behaves before any write.
+        let mut buf_b = [0u8; 32];
+        let nb = poll_once_sync(fd_b.read(0, &mut buf_b)).and_then(|r| r.ok());
+        if nb != Some(0) {
+            crate::devfs_bridge::unregister_transport();
+            return TestResult::Fail("fd B observed fd A's pending response");
+        }
+        // fd A reads its own response back.
+        let mut buf_a = [0u8; 32];
+        let na = poll_once_sync(fd_a.read(0, &mut buf_a)).and_then(|r| r.ok());
+        crate::devfs_bridge::unregister_transport();
+        if na != Some(20) {
+            return TestResult::Fail("fd A did not read its 20-byte response");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/tpm/devfs",
+        smoke_tpm0_open_instance_state_isolation
+    );
+
+    fn smoke_tpmrm0_open_instance_flushes_only_own_handles() -> TestResult {
+        use crate::devfs_bridge::{DevTpmRm0, TpmTransport};
+        use alloc::sync::Arc;
+        use narf_filesystem::FileOps;
+
+        FLUSH_CALLS.lock().clear();
+        crate::devfs_bridge::register_transport(
+            Arc::new(TrackingTransport) as Arc<dyn TpmTransport>
+        );
+
+        let proto = DevTpmRm0::new();
+        let (fd_a, fd_b) = match (proto.open_instance(), proto.open_instance()) {
+            (Some(a), Some(b)) => (a, b),
+            _ => {
+                crate::devfs_bridge::unregister_transport();
+                return TestResult::Fail("DevTpmRm0::open_instance returned None");
+            }
+        };
+
+        // TPM2_Load on fd A — TrackingTransport answers with
+        // transient handle 0x8000_0001 (as in
+        // smoke_tpmrm0_flush_on_drop), which fd A now tracks.
+        let mut cmd = alloc::vec![0u8; 10];
+        cmd[0] = 0x80;
+        cmd[1] = 0x01;
+        cmd[5] = 10;
+        cmd[8] = 0x01;
+        cmd[9] = 0x57; // CC = TPM_CC_LOAD
+        let _ = poll_once_sync(fd_a.write(0, &cmd));
+
+        // Closing fd B (which allocated nothing) must not flush
+        // fd A's handle — under the pre-#940 shared-node model the
+        // single instance's Drop was the only flush point, so this
+        // distinction did not exist.
+        drop(fd_b);
+        if FLUSH_CALLS.lock().contains(&0x8000_0001) {
+            crate::devfs_bridge::unregister_transport();
+            return TestResult::Fail("closing fd B flushed fd A's transient handle");
+        }
+        // Closing fd A flushes exactly its own handle.
+        drop(fd_a);
+        let calls = FLUSH_CALLS.lock().clone();
+        crate::devfs_bridge::unregister_transport();
+        if !calls.contains(&0x8000_0001) {
+            return TestResult::Fail("closing fd A did not flush its transient handle");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/tpm/devfs",
+        smoke_tpmrm0_open_instance_flushes_only_own_handles
+    );
 }

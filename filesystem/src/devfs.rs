@@ -1101,6 +1101,18 @@ impl FileOps for DevTpm0Proxy {
         })
     }
 
+    fn open_instance(&self) -> Option<Arc<dyn FileOps>> {
+        // Forward the per-open clone to the installed delegate
+        // (#940): the TPM nodes carry per-fd state (response slot;
+        // the RM node's transient-handle set, flushed at close), so
+        // an open must not share the registered prototype instance.
+        // The delegate Arc is cloned out of the slot first — no lock
+        // is held across the delegate call. A delegate without
+        // per-open state falls back to itself.
+        let node = TPM0_NODE.lock().clone()?;
+        Some(node.open_instance().unwrap_or(node))
+    }
+
     fn stat(&self) -> Stat {
         TPM0_NODE
             .lock()
@@ -1158,6 +1170,13 @@ impl FileOps for DevTpmRm0Proxy {
                 None => Err(FsError::Io(narf_block::BlockError::IOError)),
             }
         })
+    }
+
+    fn open_instance(&self) -> Option<Arc<dyn FileOps>> {
+        // Forward the per-open clone to the installed delegate
+        // (#940) — see `DevTpm0Proxy::open_instance`.
+        let node = TPMRM0_NODE.lock().clone()?;
+        Some(node.open_instance().unwrap_or(node))
     }
 
     fn stat(&self) -> Stat {
@@ -2906,6 +2925,85 @@ fn smoke_devfs_reports_devtmpfs_name() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/devfs", smoke_devfs_reports_devtmpfs_name);
+
+/// Stub TPM delegate for the proxy per-open fixture (#940): carries
+/// no state; its `open_instance` hands out a pre-made distinct
+/// instance so the test can tell forwarding apart from fallback.
+struct TpmProxyStub {
+    opened: Option<Arc<dyn FileOps>>,
+}
+
+impl FileOps for TpmProxyStub {
+    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Ok(0) })
+    }
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Ok(0) })
+    }
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: 0o600,
+            },
+            mtime_cycles: 0,
+        }
+    }
+    fn open_instance(&self) -> Option<Arc<dyn FileOps>> {
+        self.opened.clone()
+    }
+}
+
+/// Smoke (#940): the /dev/tpm0 + /dev/tpmrm0 proxies forward
+/// `open_instance` to the installed delegate, so `sys_open`'s
+/// per-open clone reaches the bridge's per-fd state instead of
+/// sharing the registered prototype. A delegate whose
+/// `open_instance` returns None falls back to the delegate itself
+/// (the pre-#940 behaviour for stateless delegates).
+fn smoke_dev_tpm_proxy_forwards_open_instance() -> TestResult {
+    // tpm0 delegate WITH per-open state; tpmrm0 delegate WITHOUT
+    // (the fallback case).
+    let opened0: Arc<dyn FileOps> = Arc::new(TpmProxyStub { opened: None });
+    let proto0: Arc<dyn FileOps> = Arc::new(TpmProxyStub {
+        opened: Some(opened0.clone()),
+    });
+    let proto_rm: Arc<dyn FileOps> = Arc::new(TpmProxyStub { opened: None });
+    register_tpm(proto0, proto_rm.clone());
+
+    let dir = DevDir;
+    let result = (|| -> Result<(), &'static str> {
+        let node = dir.lookup("tpm0").ok_or("tpm0 lookup failed")?;
+        let fd = node
+            .open_instance_checked(false)
+            .map_err(|_| "tpm0 open_instance_checked errored")?
+            .ok_or("tpm0 proxy did not forward open_instance")?;
+        if !Arc::ptr_eq(&fd, &opened0) {
+            return Err("tpm0 fd is not the delegate's per-open instance");
+        }
+        let rm = dir.lookup("tpmrm0").ok_or("tpmrm0 lookup failed")?;
+        // Mirror sys_open: Ok(None) installs the looked-up node.
+        let fd_rm = match rm.open_instance_checked(false) {
+            Ok(Some(i)) => i,
+            Ok(None) => rm.clone(),
+            Err(_) => return Err("tpmrm0 open_instance_checked errored"),
+        };
+        if !Arc::ptr_eq(&fd_rm, &proto_rm) {
+            return Err("tpmrm0 fd did not fall back to the delegate");
+        }
+        Ok(())
+    })();
+    unregister_tpm();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(msg) => TestResult::Fail(msg),
+    }
+}
+kernel_test_in!(
+    "filesystem/devfs",
+    smoke_dev_tpm_proxy_forwards_open_instance
+);
 
 /// Smoke: /dev/stdin resolves to /proc/self/fd/0.
 fn smoke_dev_stdin_target() -> TestResult {
