@@ -958,6 +958,33 @@ current PCI loss and unchanged flags3 behavior. HT/HE, adaptive fallback/MRR
 and full WMM AC/TIDs remain software work with additional source and signed
 qualification dependencies.
 
+### Interrupt-driven runtime service (AX v0)
+
+`irq.rs` implements Linux `pci.c::{rtw89_pci_config_intr_mask,
+rtw89_pci_enable_intr,rtw89_pci_disable_intr,rtw89_pci_recognize_intrs}`
+for the AX v0 layout (RTL8852A/B, and RTL8851B with
+`B_AX_HS0ISR_IND_INT_EN_WKARND`). RTL8852C (`_v1`) and RTL8922A (`_v2`)
+are rejected by `Mask::config` until their chip rows land. After the
+retained station starts, `Bootstrap` calls `Device::arm_interrupts`, which
+binds one MSI vector to the exact owned function (`rtw89_pci_request_irq`)
+and enables HIMR0/PCIE_HIMR00/PCIE_HIMR10 (`rtw89_pci_ops_start`). The hard
+handler only records the delivery on the shell's `irq::Line` and wakes the
+drain worker; the BAR stays with the async owner. Each worker pass runs
+the Linux handler/threadfn/NAPI order on that owner: disable HIMR,
+recognize and write-1-clear only enabled HISR bits, drain RPQ/RXQ through
+the station, then re-enable. AX MSI fires on a new masked HISR assertion,
+so deferring the mask cannot lose an event. `HALT_C2H` and `WDT_TIMEOUT`
+(`rtw89_ser_notify`) close the station with `station::Error::Halted`; an
+in-place SER L1 recovery belongs to `operating_reset`. TX enqueue kicks the
+same line. The worker falls back to a 10ms period with MSI (host station
+timers) and keeps the 1ms polled period if MSI is unavailable. `Native::fail`
+turns HIMR and MSI off before BME clears and returns the vector; if MSI
+disable cannot be proven, the vector is quarantined (reserved and masked).
+Smokes: `drivers/wireless/rtw89/irq` (literal Linux masks, W1C ownership,
+ordering, error propagation, lost-wake freedom, vector release/quarantine)
+and `smoke_rtw8852b_irq_driven_worker_services_rearms_and_halts` (armed
+association, RX service/rearm, TX kick, halt teardown).
+
 ## 4. Invariants
 
 Physical reads write the address and wait for the hardware ready flag before
@@ -1000,7 +1027,7 @@ or physical hardware acceptance.
 | AX DDV factory identity and cleanup | Implemented; shared-path regressions |
 | Initial B power/PCIe initialization | Retained actual cold/firmware/MAC/RX/full-radio/ordinary BE/MGMT startup and probe integration implemented; selective source PCI setup is bounded to this awake polled profile |
 | Firmware container/profile selection, CH12 DMA, WCPU handshakes | Checked AX selection, native fuse reads, coupled secure plans, native CH12 ownership and retained WCPU loading implemented; owned cold-to-CH12/WCPU composition and TX-only BME activation implemented; initial B packet/RF startup is implemented; A/51 secure-policy loading remains outside the initial profile |
-| Initial B reset, rings and ownership | Actual temporal FLR or explicit trusted platform reset contract; retained BDRAM/CH12/RX/RPQ plus fresh BE/MGMT rings and terminal storage ownership implemented. IRQ delivery, recovery and reclamation remain separate |
+| Initial B reset, rings and ownership | Actual temporal FLR or explicit trusted platform reset contract; retained BDRAM/CH12/RX/RPQ plus fresh BE/MGMT rings and terminal storage ownership implemented. AX v0 MSI delivery implemented; recovery and reclamation remain separate |
 | Initial B native TX and bounded completion | Exact source TXWD/BD/WP/address-info and joint TXBD/RPQ retirement are activated by the same retained station owner;512 nonreused identities per queue |
 | RPQ release handling, RX assembly/validation and frame delivery | B retained native RXQ/RPQ publication/polling, checked segmented RX/FCS, RPQ records and bounded C2H/ACK decoding implemented; same-owner packet completion dispatch, raw station frame delivery and kernel DHCP/IP are implemented |
 | RF/BB calibration, regulatory channel/power and coexistence | Initial B actual factory + firmware PHY_CAP, static PHY operating/XTAL, WLAN-only coexistence, NCTL/basic RFK, channel MAC/BB/RF/scheduler/ADC, actual trims/RXAB, IQK/TSSI/DPK and real source power-table composition implemented. Separate signed measured v2 binds all calibration/packet/autonomous-response peaks and actual source recipes; native publication uses current signed/device invocations. Broader AX/BE profiles, host periodic RF tracking/retuning and physical measured qualification remain outside this initial profile |

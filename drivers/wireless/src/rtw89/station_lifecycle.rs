@@ -73,13 +73,34 @@ impl<I: Io> Owner<I> {
     ) -> Option<alloc::vec::Vec<u8>> {
         self.station.as_ref()?.information_elements(peer)
     }
+    /// One worker pass: recognize interrupts (when armed), drain RPQ/RXQ
+    /// through the station, then re-enable the mask (`rtw89_pci_napi_poll`).
     pub(super) fn station_poll(
         &mut self,
     ) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, super::station::Error> {
-        self.station
-            .as_mut()
-            .ok_or(super::station::Error::State)?
-            .poll(&mut self.io)
+        let station = self.station.as_mut().ok_or(super::station::Error::State)?;
+        let events = self
+            .io
+            .irq_service()
+            .map_err(super::station::Error::Native)?;
+        if events.fatal() {
+            return Err(super::station::Error::Halted);
+        }
+        let frames = station.poll(&mut self.io)?;
+        self.io.irq_rearm().map_err(super::station::Error::Native)?;
+        Ok(frames)
+    }
+    /// Arm interrupt delivery for the started station.
+    pub(super) fn station_irq(
+        &mut self,
+        line: &Arc<super::irq::Line>,
+    ) -> Result<u8, super::station::Error> {
+        if !self.active || self.station.is_none() {
+            return Err(super::station::Error::State);
+        }
+        self.io
+            .irq_start(line)
+            .map_err(super::station::Error::Native)
     }
     pub(super) fn station_send(&mut self, frame: &[u8]) -> Result<(), super::station::Error> {
         self.station

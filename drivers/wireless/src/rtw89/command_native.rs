@@ -94,6 +94,7 @@ pub struct Native {
     ordinary: Option<OrdinaryGrant>,
     full_qualification: Option<alloc::sync::Arc<super::radio_policy::Qualification>>,
     operating: Option<super::phy_operating::Operating>,
+    irq: Option<super::irq::Binding>,
 }
 fn barrier() {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -223,6 +224,7 @@ impl Native {
             ordinary: None,
             full_qualification: None,
             operating: Some(super::phy_operating::Operating::default()),
+            irq: None,
         })
     }
     pub(super) fn identity(&self) -> Option<super::factory::Identity> {
@@ -691,6 +693,8 @@ impl Native {
     /// register stop/BME-off alone does not prove posted transactions drained.
     pub(super) fn fail(&mut self) {
         self.state = State::Terminal;
+        // rtw89_pci_ops_stop + free_irq: HIMR and MSI off before BME clears.
+        self.irq_release();
         self.receive.fail();
         // Autonomous ACK/CTS does not depend on a packet DMA doorbell.
         if let Ok(value) = self.io.read32(0xc000) {

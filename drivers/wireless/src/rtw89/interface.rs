@@ -48,7 +48,16 @@ pub(super) struct Device<I: Io> {
     metadata: IrqSafeSpinLock<()>,
     rx: IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
+    /// MSI deliveries and TX kicks wake the drain worker through this line.
+    line: Arc<super::irq::Line>,
+    interrupts: AtomicBool,
 }
+/// Polled-mode worker period (no MSI binding).
+const POLL_MS: u64 = 1;
+/// Interrupt-mode safety period. Station timers (authentication/association
+/// retries, EAPOL timeouts) are millisecond-granular host state; RX/RPQ
+/// progress itself is interrupt-driven.
+const IRQ_FALLBACK_MS: u64 = 10;
 impl<I: Io> core::fmt::Debug for Device<I> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Rtw8852bDevice")
@@ -107,7 +116,41 @@ impl<I: Io + 'static> Device<I> {
             metadata: IrqSafeSpinLock::new(()),
             rx: IrqSafeSpinLock::new(Some(consumer)),
             tx: IrqSafeSpinLock::new(Some(producer)),
+            line: super::irq::Line::new(),
+            interrupts: AtomicBool::new(false),
         }
+    }
+    /// Bind MSI delivery to this shell's worker after the station started.
+    /// On failure the worker keeps its polled period.
+    pub(super) async fn arm_interrupts(&self) -> Result<u8, Error> {
+        let mut storage = self.lifecycle.retained.lock().await;
+        if self.closed() {
+            return Err(Error::State);
+        }
+        let owner = storage.as_mut().ok_or(Error::State)?;
+        let vector = owner.station_irq(&self.line)?;
+        self.interrupts.store(true, Ordering::Release);
+        self.line.raise();
+        Ok(vector)
+    }
+    pub(super) fn interrupts(&self) -> bool {
+        self.interrupts.load(Ordering::Acquire) && !self.closed()
+    }
+    pub(super) fn line(&self) -> &Arc<super::irq::Line> {
+        &self.line
+    }
+    /// One worker period: drain, then sleep until an MSI/TX kick or the
+    /// mode's fallback period.
+    pub(super) async fn service_once(&self) {
+        let seen = self.line.raised();
+        self.drain();
+        let period = if self.interrupts() {
+            IRQ_FALLBACK_MS
+        } else {
+            POLL_MS
+        };
+        let _ =
+            narf_time::timeout(narf_time::Deadline::after_ms(period), self.line.wait(seen)).await;
     }
     pub(super) fn closed(&self) -> bool {
         self.admission.closed()
@@ -207,6 +250,9 @@ impl<I: Io + 'static> Device<I> {
                 .try_send(frame)
                 .map_err(|_| super::power::Error::Terminal)
         });
+        if result.is_ok() {
+            self.line.raise();
+        }
         if result == Err(super::power::Error::Access) {
             self.close();
             if !self.admission.teardown_pending() {
@@ -226,6 +272,7 @@ impl<I: Io + 'static> Device<I> {
             return Vec::new();
         };
         if self.closed() {
+            self.interrupts.store(false, Ordering::Release);
             rings.clear();
             self.link(None, false);
             if !self.admission.teardown_pending() {
@@ -583,8 +630,7 @@ pub(super) fn publish<I: Io + 'static>(device: Arc<Device<I>>) -> Result<(), Err
     device.published.store(true, Ordering::Release);
     narf_scheduler::spawn(async move {
         loop {
-            device.drain();
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+            device.service_once().await;
         }
     });
     Ok(())

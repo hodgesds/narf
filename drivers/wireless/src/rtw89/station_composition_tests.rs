@@ -244,6 +244,36 @@ struct DriverModel {
     stopped: bool,
     packet_error: Option<crate::rtw89::packet_core::Error>,
     wmm: bool,
+    irq: Option<IrqModel>,
+}
+/// AX v0 interrupt registers with write-1-clear status, behind the same
+/// `irq::Mask` programs the native binding runs.
+#[derive(Default)]
+struct IrqModel {
+    regs: alloc::collections::BTreeMap<u32, u32>,
+    mask: crate::rtw89::irq::Mask,
+    services: u32,
+    rearms: u32,
+}
+impl IrqModel {
+    fn get(&self, address: u32) -> u32 {
+        *self.regs.get(&address).unwrap_or(&0)
+    }
+}
+impl crate::rtw89::irq::Regs for IrqModel {
+    fn read32(&mut self, address: u32) -> Result<u32, crate::rtw89::power::Error> {
+        Ok(self.get(address))
+    }
+    fn write32(&mut self, address: u32, value: u32) -> Result<(), crate::rtw89::power::Error> {
+        use crate::rtw89::irq::{R_AX_HISR0, R_AX_PCIE_HISR00, R_AX_PCIE_HISR10};
+        let entry = self.regs.entry(address).or_insert(0);
+        if matches!(address, R_AX_HISR0 | R_AX_PCIE_HISR00 | R_AX_PCIE_HISR10) {
+            *entry &= !value;
+        } else {
+            *entry = value;
+        }
+        Ok(())
+    }
 }
 impl DriverModel {
     fn new() -> Self {
@@ -257,6 +287,7 @@ impl DriverModel {
             stopped: false,
             packet_error: None,
             wmm: false,
+            irq: None,
         }
     }
     fn packet<T>(
@@ -402,7 +433,44 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
     ) -> Result<crate::rtw89::packet_core::Step, crate::rtw89::packet_core::Error> {
         self.packet(|c, p| c.poll(p))
     }
+    fn irq_start(
+        &mut self,
+        _line: &Arc<crate::rtw89::irq::Line>,
+    ) -> Result<u8, crate::rtw89::power::Error> {
+        if self.stopped || self.irq.is_some() || !self.packet_ready() {
+            return Err(crate::rtw89::power::Error::Terminal);
+        }
+        let mut model = IrqModel {
+            mask: crate::rtw89::irq::Mask::config(crate::rtw89::mac::ChipId::Rtl8852B, false)
+                .ok_or(crate::rtw89::power::Error::Unsupported)?,
+            ..IrqModel::default()
+        };
+        let mask = model.mask;
+        mask.enable(&mut model)?;
+        self.irq = Some(model);
+        Ok(0x40)
+    }
+    fn irq_service(&mut self) -> Result<crate::rtw89::irq::Events, crate::rtw89::power::Error> {
+        let Some(model) = self.irq.as_mut() else {
+            return Ok(crate::rtw89::irq::Events::default());
+        };
+        model.services += 1;
+        let mask = model.mask;
+        crate::rtw89::irq::Mask::disable(model)?;
+        Ok(mask.recognize(model)?.events())
+    }
+    fn irq_rearm(&mut self) -> Result<(), crate::rtw89::power::Error> {
+        let Some(model) = self.irq.as_mut() else {
+            return Ok(());
+        };
+        model.rearms += 1;
+        let mask = model.mask;
+        mask.enable(model)
+    }
     fn packet_stop(&mut self) -> Result<(), crate::rtw89::packet_core::Error> {
+        if let Some(model) = self.irq.as_mut() {
+            let _ = crate::rtw89::irq::Mask::disable(model);
+        }
         self.controller.invalidate();
         self.stopped = true;
         if self.core.is_some() {
@@ -1003,4 +1071,92 @@ fn smoke_rtw8852b_native_disconnect_reservation_and_cancel_preserve_cleanup() ->
 kernel_test_in!(
     "drivers/wireless/rtw89/station",
     smoke_rtw8852b_native_disconnect_reservation_and_cancel_preserve_cleanup
+);
+
+fn smoke_rtw8852b_irq_driven_worker_services_rearms_and_halts() -> TestResult {
+    use crate::rtw89::irq::*;
+    let h = Harness::new(false);
+    if h.join().is_err() {
+        return TestResult::Fail("RTL8852B IRQ fixture association failed");
+    }
+    if complete(h.device.arm_interrupts()) != Ok(0x40) || !h.device.interrupts() {
+        return TestResult::Fail("RTL8852B MSI binding not armed after station start");
+    }
+    if complete(h.device.arm_interrupts()).is_ok() {
+        return TestResult::Fail("RTL8852B MSI bound twice");
+    }
+    if h.model(|io| io.irq.as_ref().map(|m| m.get(R_AX_PCIE_HIMR00))) != Some(0x011e_0007) {
+        return TestResult::Fail("RTL8852B start did not enable the Linux mask");
+    }
+    // Downlink frame arrives with RXDMA status and an MSI.
+    let downlink = udp_ipv4(
+        OWN,
+        AP,
+        h.plan.server_ip,
+        [10, 0, 0, 9],
+        7,
+        9,
+        b"rtw8852b-irq",
+    );
+    let Ok(wire) = h.peer.lock().downlink(&downlink) else {
+        return TestResult::Fail("fixture downlink failed");
+    };
+    let injected = h.model(|io| {
+        if let Some(m) = io.irq.as_mut() {
+            m.regs
+                .insert(R_AX_PCIE_HISR00, B_AX_RXDMA_INT_EN | (1 << 9));
+        }
+        io.packets.inject(&wire).is_ok()
+    });
+    if !injected {
+        return TestResult::Fail("fixture injection failed");
+    }
+    let before = h.device.line().raised();
+    h.device.line().raise();
+    if h.device.line().raised() == before {
+        return TestResult::Fail("line did not record the MSI");
+    }
+    h.device.drain();
+    let (services, rearms, hisr, himr) = h.model(|io| {
+        io.irq.as_ref().map_or((0, 0, 0, 0), |m| {
+            (
+                m.services,
+                m.rearms,
+                m.get(R_AX_PCIE_HISR00),
+                m.get(R_AX_PCIE_HIMR00),
+            )
+        })
+    });
+    if services != 1 || rearms != 1 {
+        return TestResult::Fail("worker pass did not service then rearm exactly once");
+    }
+    if hisr != 1 << 9 || himr != 0x011e_0007 {
+        return TestResult::Fail("worker acknowledged foreign status or left the mask off");
+    }
+    // A TX enqueue kicks the worker line instead of waiting for a poll tick.
+    let uplink = udp_ipv4(AP, OWN, [10, 0, 0, 9], h.plan.server_ip, 9, 7, b"kick");
+    let kicked = h.device.line().raised();
+    if h.device.enqueue(&uplink, TxMeta::default()).is_err() || h.device.line().raised() == kicked {
+        return TestResult::Fail("TX enqueue did not kick the IRQ worker");
+    }
+    h.pump();
+    // Firmware halt (SER) is fatal: the owner closes and stops packets.
+    h.model(|io| {
+        if let Some(m) = io.irq.as_mut() {
+            m.regs.insert(R_AX_HISR0, B_AX_HALT_C2H_INT_EN);
+        }
+    });
+    h.device.line().raise();
+    h.device.drain();
+    if !h.closed() || !h.model(|io| io.stopped) || h.device.interrupts() {
+        return TestResult::Fail("RTL8852B halt interrupt did not terminate the station");
+    }
+    if h.model(|io| io.irq.as_ref().map(|m| m.get(R_AX_PCIE_HIMR00))) != Some(0) {
+        return TestResult::Fail("RTL8852B stop left the interrupt mask enabled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_irq_driven_worker_services_rearms_and_halts
 );

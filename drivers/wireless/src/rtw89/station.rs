@@ -77,6 +77,19 @@ pub(super) unsafe trait Io: Send {
     }
     fn packet_poll(&mut self) -> Result<packet::Step, packet::Error>;
     fn packet_stop(&mut self) -> Result<(), packet::Error>;
+    /// Bind interrupt delivery to `line` once packets are started. Owners
+    /// without an MSI path stay in polled mode.
+    fn irq_start(&mut self, _line: &Arc<super::irq::Line>) -> Result<u8, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    /// Mask, recognize and acknowledge pending interrupt sources.
+    fn irq_service(&mut self) -> Result<super::irq::Events, power::Error> {
+        Ok(super::irq::Events::default())
+    }
+    /// Re-enable the interrupt mask after the rings were drained.
+    fn irq_rearm(&mut self) -> Result<(), power::Error> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +104,8 @@ pub(super) enum Error {
     Native(power::Error),
     Management(association::Error),
     Security(station_security::Error),
+    /// Firmware halt (SER) or watchdog interrupt from the device.
+    Halted,
 }
 impl From<packet::Error> for Error {
     fn from(error: packet::Error) -> Self {

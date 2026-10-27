@@ -302,7 +302,6 @@ rtw89	he	HE station operation	feature	drivers/wireless/specification/rtw89.md	10
 rtw89	he_gi_ltf	HE/EHT 0.8/1.6/3.2us GI and LTF variants	feature	drivers/wireless/specification/rtw89.md	1035
 rtw89	he_htc	HE +HTC insertion in QoS DATA	feature	drivers/wireless/specification/rtw89.md	1040
 rtw89	ht	HT station operation	feature	drivers/wireless/specification/rtw89.md	1014
-rtw89	irq_delivery	Interrupt-driven runtime service	feature	drivers/wireless/specification/rtw89.md	1003
 rtw89	monitor_mode	Monitor radio mode with PHY-status RX metadata	feature	drivers/wireless/specification/rtw89.md	1039
 rtw89	multi_rate_retry	Multi-rate retry	feature	drivers/wireless/specification/rtw89.md	957
 rtw89	multiple_live_functions	Multiple live PCI functions	feature	drivers/wireless/specification/rtw89.md	1009

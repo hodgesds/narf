@@ -201,6 +201,18 @@ unsafe impl Io for Startup {
     fn packet_poll(&mut self) -> Result<packet::Step, packet::Error> {
         self.station_native()?.poll_packets()
     }
+    fn irq_start(
+        &mut self,
+        line: &alloc::sync::Arc<crate::rtw89::irq::Line>,
+    ) -> Result<u8, power::Error> {
+        self.station_native()?.irq_start(line)
+    }
+    fn irq_service(&mut self) -> Result<crate::rtw89::irq::Events, power::Error> {
+        self.station_native()?.irq_service()
+    }
+    fn irq_rearm(&mut self) -> Result<(), power::Error> {
+        self.station_native()?.irq_rearm()
+    }
     fn packet_stop(&mut self) -> Result<(), packet::Error> {
         if let Some(controller) = self.station_controller.as_mut() {
             controller.invalidate();

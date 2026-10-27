@@ -139,6 +139,67 @@ impl Native {
         }
         self.packet_operation(|core, port| core.submit_rate(port, bytes, report, rate))
     }
+    /// `rtw89_pci_request_irq` + `rtw89_pci_ops_start`: bind one MSI vector
+    /// to `line` and enable the AX interrupt mask once the packet runtime is
+    /// started. Returns the CPU vector.
+    pub(in crate::rtw89) fn irq_start(
+        &mut self,
+        line: &alloc::sync::Arc<crate::rtw89::irq::Line>,
+    ) -> Result<u8, power::Error> {
+        if self.irq.is_some() || self.state != State::Active || !self.station_runtime.started {
+            return Err(power::Error::Terminal);
+        }
+        let binding =
+            crate::rtw89::irq::Binding::bind(self.chip, &self.device, &self.authority, line)
+                .map_err(|error| match error {
+                    crate::rtw89::irq::Error::Unsupported => power::Error::Unsupported,
+                    _ => power::Error::Access,
+                })?;
+        if binding.start(&mut self.io).is_err() {
+            binding.release(&mut self.io, &self.authority);
+            return Err(power::Error::Access);
+        }
+        let vector = binding.vector();
+        self.irq = Some(binding);
+        Ok(vector)
+    }
+    pub(in crate::rtw89) fn irq_armed(&self) -> bool {
+        self.irq.is_some()
+    }
+    /// Worker half of the Linux hard/threaded handlers: mask, then
+    /// recognize and acknowledge enabled sources. Without a binding the
+    /// worker is in polled mode and nothing is reported.
+    pub(in crate::rtw89) fn irq_service(
+        &mut self,
+    ) -> Result<crate::rtw89::irq::Events, power::Error> {
+        let Some(binding) = self.irq.as_ref() else {
+            return Ok(crate::rtw89::irq::Events::default());
+        };
+        let result = binding.service(&mut self.io).map(|isrs| isrs.events());
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+    /// NAPI-completion re-enable after RPQ/RXQ were drained.
+    pub(in crate::rtw89) fn irq_rearm(&mut self) -> Result<(), power::Error> {
+        let Some(binding) = self.irq.as_ref() else {
+            return Ok(());
+        };
+        if self.state != State::Active {
+            return Err(power::Error::Terminal);
+        }
+        let result = binding.rearm(&mut self.io);
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+    pub(super) fn irq_release(&mut self) {
+        if let Some(binding) = self.irq.take() {
+            binding.release(&mut self.io, &self.authority);
+        }
+    }
     pub(in crate::rtw89) fn poll_packets(&mut self) -> Result<packet::Step, packet::Error> {
         self.packet_operation(|core, port| core.poll(port))
     }

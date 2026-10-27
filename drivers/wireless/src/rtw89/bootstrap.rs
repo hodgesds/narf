@@ -217,6 +217,11 @@ impl Bootstrap {
             }
         }
         shell.activate().await.map_err(Error::Station)?;
+        // rtw89_pci_ops_start: the packet runtime is live, enable MSI.
+        match shell.arm_interrupts().await {
+            Ok(vector) => narf_console::klog!("rtw8852b: MSI delivery on vector {}\n", vector),
+            Err(error) => narf_console::klog!("rtw8852b: polled delivery ({:?})\n", error),
+        }
         self.set_stage(Stage::Station);
         *self.error.lock() = None;
         // Device's independent bounded drain worker handles stack progress.

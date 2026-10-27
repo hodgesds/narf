@@ -79,6 +79,7 @@ pub mod fwdl;
 pub mod h2c;
 mod interface;
 mod iqk;
+mod irq;
 pub mod mac;
 pub mod mac_init;
 mod mac_runtime;
