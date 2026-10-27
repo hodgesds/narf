@@ -73,6 +73,8 @@ pub mod rapl;
 mod runtime_pm_tests;
 mod suspend_service_tests;
 mod tests;
+#[cfg(feature = "kernel-test")]
+mod tpm_anchor_tests;
 
 pub use suspend::{SuspendError, SuspendPhase};
 pub use thermal::{

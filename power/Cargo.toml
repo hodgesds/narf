@@ -30,11 +30,12 @@ narf-filesystem   = { path = "../filesystem" }
 narf-input        = { path = "../input" }
 narf-crypto       = { path = "../crypto" }
 narf-block        = { path = "../block" }
+narf-drivers-tpm  = { path = "../drivers/tpm" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 zeroize           = { version = "1", default-features = false, features = ["alloc"] }
 
 [features]
-kernel-test = []
+kernel-test = ["narf-drivers-tpm/fixture-tpm"]
 
 [lints]
 workspace = true

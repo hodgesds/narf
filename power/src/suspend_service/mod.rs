@@ -30,8 +30,9 @@
 //! [`derive_hook_anchor_key`]) and the header's hook-region length
 //! field; P4 (#1000) gets the claims/opened/verified reader pipeline
 //! as its entry surface; P8 (#1006) gets the authenticated
-//! [`RecordedPolicy`] record to enforce. Real anchors are later
-//! lanes too: FIDO token P3 (#999), TPM P6 (#1002), Argon2id
+//! [`RecordedPolicy`] record to enforce. Real anchors land as
+//! their own lanes: FIDO token P3 (#999), the TPM sealing anchor
+//! P6 (#1002 — [`TpmAnchor`], in `tpm_anchor`), Argon2id
 //! passphrase P7 (#1004).
 
 use alloc::vec::Vec;
@@ -43,6 +44,7 @@ mod entropy;
 mod format;
 mod image;
 mod slots;
+mod tpm_anchor;
 
 pub use anchor::{AnchorError, AnchorKind, KeyCustodyAnchor, UnwrapCtx, WrapCtx, WrappedSlot};
 pub use custody::Secret32;
@@ -52,6 +54,7 @@ pub use image::{
     derive_hook_anchor_key, derive_hook_key, open_with_sms, parse_claims, OpenedImage, TrustedImage,
 };
 pub use slots::{EpochSlots, SlotArea, SlotRecord};
+pub use tpm_anchor::TpmAnchor;
 
 use anchor::AnchorKind as Kind;
 use slots::{EpochCustody, SlotStore};
