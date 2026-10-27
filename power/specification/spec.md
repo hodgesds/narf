@@ -344,6 +344,34 @@ area (`SlotArea`, design §10.2) — the secret-free mirror the
 resume environment finds slots through; its codec is strict and
 total (caps before allocation, trailing garbage refused).
 
+**TPM custody anchor (design §8.3, #1002).** `TpmAnchor`
+implements `KeyCustodyAnchor` over the TPM extension surface's
+transport seam (`narf-drivers-tpm::devfs_bridge::TpmTransport`;
+production construction reads the platform's registered
+transport, and no registered transport means the anchor does not
+exist — a TPM-less machine's other factors are unaffected, and
+the anchor's failures are `AnchorError::Unavailable`, never a
+service-wide refusal or a silent policy fallback). *Wrap* seals
+the SMS as caller-supplied data in a KEYEDHASH object
+(`sensitiveDataOrigin` CLEAR) under a regenerated owner storage
+primary; the object's `authPolicy` is a PolicyPCR digest over
+PCRs `[0,1,2,3,4,5,6,7,9,10]` in the SHA-256 bank, computed
+through a trial session from the TPM's own PCR_Read composite
+(TPM 2.0 Library Part 3 §23.7). *Unwrap* regenerates the primary,
+loads the object, and satisfies the policy in a fresh policy
+session whose Unseal carries `continueSession = 0`; PCR drift
+since sealing is the TPM's `TPM_RC_POLICY_FAIL`, surfaced as
+`AnchorError::Refused`, and every other failure — tampered blob
+parts, malformed params, wrong-epoch context — is the single
+no-oracle `AnchorError::Failed`. The slot `params` record the
+selection and the wrap-time SMS epoch; the anchor's monotonic
+epoch source is the NV counter index `0x0150_0003`, advanced
+only by `TPM2_NV_Increment`. Under a token+TPM policy the two
+factors' slots compose through the recorded slot set — each
+factor alone unwraps only its own wrapping of the SMS — and the
+TPM anchor is an alternative anchor under a TPM-only policy,
+never a requirement.
+
 **Seams, deliberately minimal.** The hook key derivations and the
 header's hook-region length are the state-hook registry's entry
 surface; `parse_claims` / `OpenedImage` are the resume
