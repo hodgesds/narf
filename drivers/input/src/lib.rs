@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+pub mod amd_sfh;
 pub mod goodix;
 pub mod hid_elan;
 pub mod hid_mt_features;
@@ -79,6 +80,10 @@ pub fn register_initcalls() {
     // matches; the IDs only exist on Intel x86 SoCs, so this is a
     // no-op on other platforms in practice.
     intel_ish::register_initcalls();
+    // AMD SFH/MP2 sensor-hub transport — registers its PCI
+    // matches; the IDs only exist on AMD x86 SoCs, so this is a
+    // no-op on other platforms in practice.
+    amd_sfh::register_initcalls();
 
     #[cfg(target_arch = "x86_64")]
     register_i8042_initcalls();

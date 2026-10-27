@@ -32,6 +32,7 @@ narf-kernel-test    = { path = "../../verification/kernel-test" }
 narf-bus            = { path = "../../bus" }
 narf-driver-runtime = { path = "../runtime" }
 narf-power          = { path = "../../power" }
+narf-memory         = { path = "../../memory" }
 async-trait         = "0.1"
 
 [lints]

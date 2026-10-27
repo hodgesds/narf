@@ -2836,6 +2836,7 @@ dependencies = [
  "narf-interrupts",
  "narf-kernel-test",
  "narf-lib",
+ "narf-memory",
  "narf-power",
  "narf-scheduler",
  "narf-time",
