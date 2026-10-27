@@ -81,6 +81,25 @@ pub fn capture() {
 // entries below are corrected to the CI-habitat recording, and any
 // future regeneration must pass the CI feature set (see the module
 // header). Every other stage matched CI exactly as recorded.
+//
+// CORRECTION (2026-10-27, CI run 40423105253 on this branch's
+// rebased head 7b89969d1): the baseline predates two merges that
+// landed on main after the capture, so three registrations were
+// missing from the table — Subsys recorded 151 where the snapshot
+// composes 152, and Late recorded 63 where the snapshot composes
+// 65. Each delta name is accounted for by a named, already-merged
+// PR, verified against the registration sites on main: PR #1075
+// (CCID devfs bridge) added `usb-ccid-devfs` at Subsys (between
+// `usb-serial-devfs` and `usb-uac`, its registration order in
+// `narf-drivers-usb`) and `usb-ccid-supervisor` at Late (directly
+// after `usb-hid-supervisor`); PR #1040 (hwmon thresholds/pwm)
+// added `hwmon-cooling` at Late (directly after
+// `hwmon-sysfs-bridge`, its registration order in
+// `narf-drivers-hwmon`). No other stage diverged, and no delta name
+// is unaccounted for — the composition did not leak, the recorded
+// baseline was stale by exactly those merges. The entries below
+// are updated to the verified set; the fixture still asserts
+// exact-set, exact-order equality.
 // The recording is reality, not an ideal: on x86_64 the `arch` stage
 // is empty and `ipmi`, `itco_wdt`, and `usb-r8152` each register
 // twice at Subsys (pre-existing duplicate registrations; the census
@@ -161,6 +180,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "sdhci",
         "rtsx",
         "usb-serial-devfs",
+        "usb-ccid-devfs",
         "usb-uac",
         "usb-uvc",
         "usb-r8152",
@@ -252,7 +272,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "itco_wdt",
         "pl011",
         "psmouse",
-    ], // subsys: 151
+    ], // subsys: 152
     &[
         "modules-sysfs",
         "devfs-mount",
@@ -290,11 +310,13 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "usbpd-ucsi-acpi",
         "usbpd-tcpc-probe",
         "usb-hid-supervisor",
+        "usb-ccid-supervisor",
         "usb4-native-cm",
         "fat-bootlog",
         "btrfs-crash-check",
         "power-service-wiring",
         "hwmon-sysfs-bridge",
+        "hwmon-cooling",
         "intel-gpu-dp-bridge",
         "amdgpu-usbc",
         "virtio-gpu-drm-card",
@@ -347,7 +369,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "virtio-gpu-splash",
         "mt76-firmware",
         "amdgpu-discrete-firmware",
-    ], // late: 63
+    ], // late: 65
 ];
 
 /// The recorded baseline for the running arch, if one has been
