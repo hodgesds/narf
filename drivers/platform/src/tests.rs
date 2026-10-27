@@ -3126,6 +3126,7 @@ fn smoke_intel_hid_dmi_policy_tables() -> TestResult {
 kernel_test_in!(
     "drivers/platform/intel-hid-dmi",
     smoke_intel_hid_dmi_policy_tables
+);
 // ── #1086: vendor WMI completion fixtures ────────────────────────
 //
 // Simulated-firmware conversations for the method-invocation paths
@@ -3378,7 +3379,8 @@ fn smoke_hp_wmi_method_conversations() -> TestResult {
     if devs[0].radio_type != 0 || devs[0].vendor_id != 0x8086 || devs[0].product_id != 0x2723 {
         return TestResult::Fail("rfkill2 device 0 fields wrong");
     }
-    if !devs[0].power_state().unblocked() {
+    let wifi_power = devs[0].power_state();
+    if wifi_power.sw_blocked || wifi_power.hw_blocked {
         return TestResult::Fail("rfkill2 wifi (0x0F) should be unblocked");
     }
     if !devs[1].power_state().sw_blocked || devs[1].power_state().hw_blocked {
@@ -3833,14 +3835,14 @@ fn smoke_think_lmi_enumeration() -> TestResult {
     inside.extend_from_slice(&fx_name_buffer(b"S1__", b"Camera,Enable,Disable"));
     let mut body = Vec::new();
     // If (LEqual(Arg0, 1)) { Return(\LMI3.S1__) }
-    let mut if_stmt = Vec::new();
-    if_stmt.push(0xA0); // IfOp
-    if_stmt.push(16); // PkgLength: itself + predicate(4) + return(11)
-    if_stmt.push(0x93); // LEqualOp
-    if_stmt.push(0x68); // Arg0
-    if_stmt.push(0x0A); // BytePrefix
-    if_stmt.push(0x01);
-    if_stmt.push(0xA4); // ReturnOp
+    let mut if_stmt = alloc::vec![
+        0xA0, // IfOp
+        16,   // PkgLength: itself + predicate(4) + return(11)
+        0x93, // LEqualOp
+        0x68, // Arg0
+        0x0A, // BytePrefix
+        0x01, 0xA4, // ReturnOp
+    ];
     if_stmt.extend_from_slice(&fx_ref2(b"LMI3", b"S1__"));
     body.extend_from_slice(&if_stmt);
     body.push(0xA4); // ReturnOp
