@@ -147,8 +147,8 @@ impl<I: CfiIo> CfiFlash<I> {
         // (block size / 256) LE16. v1 uses the first region's
         // block size; the module docs name the uniform-region
         // assumption.
-        let units = (dev.io.read16(woff(REGION_TABLE_WORD + 2)) & 0xFF)
-            | ((dev.io.read16(woff(REGION_TABLE_WORD + 3)) & 0xFF) << 8);
+        let units = u32::from(dev.io.read16(woff(REGION_TABLE_WORD + 2)) & 0xFF)
+            | (u32::from(dev.io.read16(woff(REGION_TABLE_WORD + 3)) & 0xFF) << 8);
         let block_size = units * 256;
         dev.reset_to_read_array();
         if block_size == 0 || block_size as u64 > size {
