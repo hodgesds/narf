@@ -694,6 +694,7 @@ pub(crate) fn map_fast_file(result: FastFile) -> Option<Result<Arc<dyn FileOps>,
 
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     fn high_bucket_name(parent: &dyn DirOps) -> String {
@@ -793,5 +794,153 @@ mod tests {
     kernel_test_in!(
         "filesystem/dcache",
         smoke_dcache_mutation_duplicate_names_and_overlapping_writers
+    );
+
+    /// Synchronous-only future poll, copied from the FAT smoke tests:
+    /// the in-memory operations driven here complete on the first poll.
+    fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+        use core::pin::Pin;
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn raw_waker() -> RawWaker {
+            unsafe fn no_clone(_: *const ()) -> RawWaker {
+                raw_waker()
+            }
+            unsafe fn no_op(_: *const ()) {}
+            const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+            RawWaker::new(core::ptr::null(), &VTAB)
+        }
+        // SAFETY: the vtable functions are no-ops that never dereference
+        // the null data pointer, so the `Waker::from_raw` contract holds.
+        let waker = unsafe { Waker::from_raw(raw_waker()) };
+        let mut cx = Context::from_waker(&waker);
+        // SAFETY: `fut` is a local owned by this function and is only
+        // polled through `pinned`, satisfying the pin guarantee.
+        let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+        match pinned.poll(&mut cx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending => None,
+        }
+    }
+
+    /// A case-insensitive directory composed the way FAT is: lookups match
+    /// with `eq_ignore_ascii_case`, and every mutator takes a
+    /// [`PathMutationGuard`] naming the caller's spelling for the whole
+    /// backing change. The backing store is a case-sensitive MemFs root;
+    /// this wrapper resolves the canonical (stored) spelling itself,
+    /// exactly like FAT's directory scanner does. The wrapper keeps the
+    /// trait-default `dcache_identity` (its own address), so the inner
+    /// MemDir's own mutation guards key a different bucket space and
+    /// cannot mask what this wrapper's guards do or fail to do.
+    struct CaseInsensitiveDir {
+        inner: Arc<dyn DirOps>,
+    }
+
+    impl CaseInsensitiveDir {
+        fn canonical_name(&self, name: &str) -> Option<String> {
+            self.inner
+                .iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case(name))
+                .map(|entry| entry.name.into_owned())
+        }
+    }
+
+    impl DirOps for CaseInsensitiveDir {
+        fn ino(&self) -> u64 {
+            self.inner.ino()
+        }
+
+        fn rcu_walkable(&self) -> bool {
+            true
+        }
+
+        fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+            let canonical = self.canonical_name(name)?;
+            self.inner.lookup(&canonical)
+        }
+
+        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = crate::DirEntry> + 'a> {
+            self.inner.iter()
+        }
+
+        fn create<'a>(&'a self, name: &'a str) -> crate::FsFuture<'a, Arc<dyn FileOps>> {
+            Box::pin(async move {
+                let _path_mutation = begin_path_mutation(self, &[name]);
+                self.inner.create(name).await
+            })
+        }
+
+        fn unlink<'a>(&'a self, name: &'a str) -> crate::FsFuture<'a, ()> {
+            Box::pin(async move {
+                let _path_mutation = begin_path_mutation(self, &[name]);
+                let canonical = self.canonical_name(name).ok_or(FsError::NotFound)?;
+                self.inner.unlink(&canonical).await
+            })
+        }
+    }
+
+    fn smoke_dcache_mutation_invalidates_case_variant_aliases() -> TestResult {
+        let fs = crate::MemFs::new("dcache-case-alias");
+        let dir: Arc<dyn DirOps> = Arc::new(CaseInsensitiveDir {
+            inner: crate::FsInstance::root(&fs),
+        });
+        let root = Dentry::root(Arc::clone(&dir));
+
+        // A lookup under one spelling publishes a negative dentry.
+        let token = lookup_token(&root, "MAKEFILE").unwrap();
+        cache_negative(&root, "MAKEFILE", token);
+        if !matches!(
+            map_fast_file(resolve_file(Arc::clone(&root), "MAKEFILE")),
+            Some(Err(FsError::NotFound))
+        ) {
+            return TestResult::Fail("negative dentry fixture did not warm");
+        }
+
+        // Create under a different case spelling, through the directory's
+        // own guarded mutator. The create's teardown must unhash the
+        // negative cached under the first spelling: both spellings name
+        // the same entry to this filesystem.
+        if !matches!(poll_once(dir.create("Makefile")), Some(Ok(_))) {
+            return TestResult::Fail("create under an alias spelling failed");
+        }
+        if matches!(
+            map_fast_file(resolve_file(Arc::clone(&root), "MAKEFILE")),
+            Some(Err(FsError::NotFound))
+        ) {
+            return TestResult::Fail(
+                "negative cached under one case spelling survived create under another",
+            );
+        }
+        if dir.lookup("MAKEFILE").is_none() || dir.lookup("Makefile").is_none() {
+            return TestResult::Fail("backing lookup lost the created file");
+        }
+
+        // Warm a positive under the create spelling, then unlink under
+        // the first spelling. The positive must be torn down too, or
+        // resolves keep returning a ghost for a deleted file.
+        let token = lookup_token(&root, "Makefile").unwrap();
+        let file = dir.lookup("Makefile").unwrap();
+        cache_file(&root, "Makefile", token, file, crate::FileType::File);
+        if !matches!(
+            map_fast_file(resolve_file(Arc::clone(&root), "Makefile")),
+            Some(Ok(_))
+        ) {
+            return TestResult::Fail("positive dentry fixture did not warm");
+        }
+        if !matches!(poll_once(dir.unlink("MAKEFILE")), Some(Ok(()))) {
+            return TestResult::Fail("unlink under an alias spelling failed");
+        }
+        if matches!(
+            map_fast_file(resolve_file(Arc::clone(&root), "Makefile")),
+            Some(Ok(_))
+        ) {
+            return TestResult::Fail(
+                "positive cached under one case spelling survived unlink under another",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "filesystem/dcache",
+        smoke_dcache_mutation_invalidates_case_variant_aliases
     );
 }
