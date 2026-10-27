@@ -110,8 +110,37 @@ implement the WCN6855 M3 WoW transport transition; ordinary system suspend
 uses `power_down_for_system_suspend` then the existing QMI/DP reconstruction
 after resume. The generic no-RDDM MHI-core SYS_ERR recovery
 (`mhi_pm_sys_error_transition`) is not used for WCN6855, whose allocated
-RDDM image takes the ath11k reset path. Still not ported: BW scaling,
-RSC/offload/client-managed rings, EDL.
+RDDM image takes the ath11k reset path.
+
+MHI scope proven inapplicable to every admitted profile (QCA6390 HW2.0,
+WCN6855 HW2.0/2.1, QCA2066 HW2.1, QCA6698AQ HW2.1), from Linux
+`ath11k/mhi.c` and `drivers/bus/mhi/host`:
+- *Client-managed, offload and hardware event rings*: `ath11k_mhi_register`
+  selects `ath11k_mhi_config_qca6390` for all five revisions; its two event
+  rings set `.client_managed = false`, `.offload_channel = false`,
+  `.hardware_event = false`, and its only channels (20/21 "IPCR") set
+  `.offload_channel = false`. No ath11k configuration (QCN9074 included)
+  declares such a ring, so `mhi_init_dev_ctxt`'s client/offload branches are
+  never taken. NARF's `mhi::config_for` selects `ATH11K_MHI_CONFIG_QCA6390`
+  for the same five revisions and mirrors those values (`mhi_tests.rs`
+  "no client-managed / offload / hardware MHI rings") and `mhi_host` keeps the corresponding
+  `offload_ev` / `hw_ring` skips only as the faithful MHI-core shape.
+- *RSC (coalesced) rings*: RSC is an MHI channel `xfer_type` of
+  `DMA_TYPE_RSC` that only a channel config can request (pci_generic's
+  modem IP_HW channels); ath11k's IPCR channels are plain `MHI_BUF_RAW`
+  transfer rings, so no RSC TRE is ever posted or completed.
+- *Bandwidth scaling*: upstream `struct mhi_controller` has no host
+  bandwidth-scaling callback; a device `MHI_PKT_TYPE_BW_REQ_EVENT` only
+  records `mhi_link_info` and calls `status_cb(MHI_CB_BW_REQ)`, which
+  `ath11k_mhi_op_status_cb` ignores (`default: break`). NARF decodes the
+  event, delivers `MhiNotify::BwReq` and ignores it the same way
+  (`mhi_tests.rs` "MHI_CB_BW_REQ for each").
+- *EDL*: ath11k sets no `edl_image` and no `edl_trigger`
+  (`mhi_controller` fields left NULL); a device found in `MHI_EE_EDL` is
+  handled as `MHI_CB_FATAL_ERROR` + `mhi_pm_sys_err_handler`, and
+  `mhi_fw_load_handler` with a NULL EDL image fails the load. NARF
+  rejects the same EE (`MhiEe::EDL` in `in_pbl`, no EDL image) instead
+  of emulating a flash-programmer download ath11k never performs.
 
 ## 3. Public interface
 
@@ -782,8 +811,18 @@ ath11k: target firmware cannot transmit More-Fragments frames.
 `NL80211_CMD_SET_TX_BITRATE_MASK` is retained per WCN6855 vdev, not per
 physical radio. The generic nl80211 layer preserves each active-band legacy,
 HT, VHT and HE MCS mask plus GI/LTF choices. ath11k rejects FORCE_LGI and
-the same non-contiguous multi-MCS VHT/HE masks Linux rejects until a
-RATEMASK WMI implementation exists. It limits every WMI peer-association
+the same non-contiguous multi-MCS VHT/HE masks Linux rejects
+(`mac_peer::validate_tx_bitrate_band` with `vht_mcs_range_present` /
+`he_mcs_range_present`, the ports of `ath11k_mac_{vht,he}_mcs_range_present`:
+VHT 0-7/0-8/0-9, HE 0-7/0-9/0-11 only; an earlier NARF HE predicate that
+also accepted 0-8/0-10 — which `he_limit` would have widened to 0-9/0-11 —
+is fixed). Non-contiguous RATEMASK programming is inapplicable rather than
+missing: upstream `ath11k_mac_op_set_bitrate_mask` returns `-EINVAL`
+("setting %d mcs values in bitrate mask not supported", "TODO: Handle
+multiple VHT MCS values setting using RATEMASK CMD"), and neither ath11k nor
+ath12k defines a `WMI_TAG_VDEV_CONFIG_RATEMASK` payload or ever sends
+`WMI_VDEV_RATEMASK_CMDID`; there is no firmware layout to port
+(`mac_tests.rs::smoke_ath11k_mac_bitrate_mask_ranges`). It limits every WMI peer-association
 rate set by the requested mask, programs VDEV NSS/LDPC/SGI and HE fixed or
 autorate GI/LTF parameters, then sends a peer-association update with
 `is_assoc = false` for every already-associated station or AP client. A
@@ -791,6 +830,34 @@ single compatible VHT, HE or HT MCS becomes `WMI_PEER_PARAM_FIXED_RATE`; an
 unrestricted/multi-rate policy clears that override. The policy is retained
 by `Ath11kNetdev` across `Mac::new` during reset and is installed before
 future STA/AP peer association, matching `ath11k_vif::bitrate_mask`.
+Debugfs-class firmware diagnostics (`mac/diag.rs`). Linux ath11k exposes
+these only through debugfs, never nl80211, so NARF provides them as driver
+APIs: `Mac::twt_add_dialog` / `twt_del_dialog` / `twt_pause_dialog` /
+`twt_resume_dialog` port `ath11k_write_twt_*_dialog` (refuse with
+`-EOPNOTSUPP` while `ar->twt_enabled` is off; for a station vif the add
+re-arms the pdev engine with `sta_cong_timer_ms = 0` — disable + enable —
+and the delete or a failed add restores the defaults; `vdev_id` is always
+the vif's) over the byte-exact `wmi::twt_{add,del,pause,resume}_dialog_cmd`
+(`struct wmi_twt_*_dialog_params_cmd`; flag bits 8–11 above the u8 TWT setup
+command). `WMI_TWT_ADD_DIALOG_EVENTID` is decoded
+(`decode_twt_add_dialog_event`, routed to its vdev), a nonzero status is
+logged with `ath11k_wmi_twt_add_dialog_event_status`'s strings and kept for
+`Mac::take_twt_add_dialog_events` (bounded 16). Linux parses no DEL / PAUSE /
+RESUME completion event (they fall to "Unknown eventid"); NARF likewise
+leaves them `WmiEvent::Unhandled`. Radar-detector diagnostics: the runtime
+records every `WMI_PDEV_DFS_RADAR_DETECTION_EVENTID` once, before any vdev
+sees it, in a radio-wide `RadarDiagnostics` (latest detector report — mode,
+frequency, width, detector/segment id, timestamp, chirp, frequency offset,
+sidx —, acted-on / ignored / invalid-pdev counts) read with
+`Shared::radar_diagnostics`; `Shared::set_dfs_block_radar_events` is
+`dfs_block_radar_events` (reports recorded, `DataPort::radar_events_blocked`
+keeps `ieee80211_radar_detected` from running), and `Mac::simulate_radar`
+is `ath11k_wmi_simulate_radar` (`WMI_UNIT_TEST_CMDID`, DFS module 0x2b,
+token 0xAA, args `{0, pdev_id, 0}`; `-EINVAL` without a started AP vdev,
+offered only on a 5 GHz radio). Tests:
+`mac_tests.rs::smoke_ath11k_mac_twt_dialog_control`,
+`smoke_ath11k_mac_radar_diagnostics`. Userspace reachability needs a
+driver-diagnostics surface in the shared `narf_wireless` crate.
 `Ath11kNetdev::tx_power_dbm` returns the latest complete physical-pdev firmware
 power sample, falling back to the active vdev's retained `bss_conf.txpower`
 equivalent when no sample is current. `GET_INTERFACE` publishes that dBm value
@@ -1821,15 +1888,16 @@ from physical RF, board, firmware and userspace interoperability acceptance.
 
 | Profile | Implemented reachable software | Remaining or inapplicable scope |
 |---|---|---|
-| WCN6855 HW2.0/HW2.1 | Native dynamic-window PCI/MHI/QMI/CE/HTC/WMI/DP; advertised-band legacy/HT/VHT/HE station/AP/P2P, security/keys/PMF, four-vdev/two-channel ownership, scan/ROC, recovery and PS/WoW/cold suspend; firmware power readback and retained recovery channel reservations | Native composed hardware fixtures remain x86-only; real aarch64 startup/PCI/IRQ/board discovery has no equivalent composed configuration. Per-dialog TWT control, non-contiguous RATEMASK firmware programming, DT board-variant discovery and spectral/radar detector diagnostics are not complete exposed software paths. Their absence is not a blanket assertion that firmware cannot support them. |
+| WCN6855 HW2.0/HW2.1 | Native dynamic-window PCI/MHI/QMI/CE/HTC/WMI/DP; advertised-band legacy/HT/VHT/HE station/AP/P2P, security/keys/PMF, four-vdev/two-channel ownership, scan/ROC, recovery and PS/WoW/cold suspend; firmware power readback and retained recovery channel reservations | Native composed hardware fixtures remain x86-only; real aarch64 startup/PCI/IRQ/board discovery has no equivalent composed configuration. DT board-variant discovery remains missing (no kernel DTB accessor or PCI-device-to-DT-node association for drivers). Per-dialog TWT control and radar-detector diagnostics are implemented as the Linux debugfs-equivalent `Mac`/`Shared` APIs (`mac/diag.rs`; no nl80211 surface exists in Linux either). Non-contiguous RATEMASK programming and spectral diagnostics are inapplicable: Linux refuses the former with `-EINVAL` and initialises spectral only when `hw_params.spectral.fft_sz != 0`, which is false for every admitted profile (`hw::HwRev::spectral`, `hw::spectral_supported`; `group_pn_tests.rs::smoke_ath11k_spectral_inapplicable_on_admitted_pci`). |
 | QCA6390 HW2.0 | Independent IPQ8074 RX descriptor/DP profile and core dispatch, shared supported MAC/runtime capabilities, native normal/error/coalescing/fragment ownership and composed station/recovery path | The same explicit optional/control and architecture gaps above apply only when target services advertise them. Six-GHz/HE160/80+80/extended security are admitted only from actual band, peer and firmware capabilities, not inferred from WCN6855. |
 | QCN9074 | PCI identity/configuration definitions only; rejected with BME disabled before MMIO/MSI/firmware activation | Missing native static BAR windows, QCN9074 HAL register/operation tables, non-shadow rings, independent core/per-pdev/HTT peer-map-v2 configuration, QCN RX/REO/DP runtime and composed ownership tests. This is missing software for a recognized profile. WCN6855/QCA6390 tests cannot establish it. |
 | Other Linux ath11k SoC/AHB profiles | No native NARF admission | IPQ8074/IPQ6018/IPQ5018/WCN6750 platform IRQ, reset, reserved-memory/board and HAL profiles require their own bus/firmware lifetime contracts. Their helper constants/layouts do not provide an admitted runtime. |
 
 802.11be/MLO/EHT is not an ath11k Wi-Fi6/6E contract; it belongs to newer
 hardware/driver families. Firmware-owned HT/HE BA, OFDMA/TWT behavior is distinct
-from a NARF user control API. The existing firmware requester engine does not
-claim a separate host TWT-dialog manager. Native fragmentation-threshold TX is
+from a NARF user control API. The per-dialog controls are Linux's debugfs
+commands sent to that firmware engine (`mac/diag.rs`), not a host TWT
+negotiation state machine. Native fragmentation-threshold TX is
 inapplicable to the Linux ath11k firmware contract, which cannot transmit
 More-Fragments frames; it remains explicitly unsupported. SAR/board values and
 RF acceptance must come from real platform inputs, never this inventory.
@@ -1881,14 +1949,39 @@ RF acceptance must come from real platform inputs, never this inventory.
   printable ASCII, `strscpy` into 32 bytes (an over-long suffix is kept
   truncated to 31, as Linux leaves it), first structure that sets a
   non-empty `bdf_ext` wins. No 0xF8 / none valid = no variant (QEMU).
-  DT variant (`ath11k_core_check_dt`) is not ported (x86 only).
+  DT variant (`ath11k_core_check_dt`) is not ported. It is applicable to
+  aarch64 DT platforms carrying a WCN6855 PCIe node (e.g. a
+  `qcom,ath11k-calibration-variant` under the root-port node; Linux runs it
+  after SMBIOS in `ath11k_qmi_request_target_cap`, so a DT value replaces
+  an SMBIOS one), but needs two kernel facilities NARF drivers do not yet
+  have: a boot DTB accessor (the aarch64 `BootInfo::dtb_phys` is consumed
+  only by `boot`/`bus`) and `pci_set_of_node`'s association of a PCI
+  function with its DT child (`of_pci_find_child_device` by devfn under the
+  bridge's node). The same association gates PCI `memory-region`
+  (`ATH11K_FLAG_FIXED_MEM_RGN`) below.
 - NARF-only bounds: Linux waits forever for the WLFW server and for
   REQUEST_MEM / FW_MEM_READY / FW_READY and for QRTR RESUME_TX, and
   silently stalls when the memory-request callback cannot allocate;
   here each wait is bounded (30 s, the 10 s transaction budget for
   flow control) and fails with its own step.
-- Not ported (unreached on WCN6855 PCIe): fixed memory regions,
-  DEVICE_INFO, `fixed_bdf_addr`, FTM. During the first bring-up a
+- QMI platform contracts proven unreached on the admitted PCI profiles
+  (Linux `core.c::ath11k_hw_params`, `qmi.c`, `pci.c`):
+  `ath11k_qmi_request_device_info` returns 0 unless
+  `hw_params.hybrid_bus_type` (WCN6750 only); `fixed_bdf_addr` and
+  `fixed_mem_region` are true only for the IPQ8074/IPQ6018/IPQ5018 AHB
+  SoCs (`qmi_wlfw::QmiHwParams` mirrors both false for QCA6390/WCN6855).
+  The one PCI route to fixed memory is `ATH11K_FLAG_FIXED_MEM_RGN`, set by
+  `ath11k_pci_probe` only when the device's DT node has `memory-region`; it
+  shares the DT-association prerequisite of the DT board variant above and
+  is unreachable on ACPI/x86 and on DT systems without that property.
+  FTM (`ATH11K_FIRMWARE_MODE_FTM`) is selected only by the `ftm_mode=1`
+  module parameter; it then skips mac80211 registration and exposes
+  `NL80211_CMD_TESTMODE` passthrough of opaque, vendor-defined WMI FTM
+  segments (`testmode.c`) for factory calibration tools. It is not part of
+  the station/AP contract, and NARF deliberately boots only
+  `ATH11K_FIRMWARE_MODE_NORMAL` (as `ath11k_pci_probe` does by default);
+  a factory-test port would need an nl80211 TESTMODE surface in the shared
+  wireless crate first. During the first bring-up a
   SERVER_EXIT still ends the handshake (Linux waits for the server).
 - Late QMI events (decided): after REGISTERED, FW_READY takes the restart
   path like FW_INIT_DONE (Linux re-runs `ath11k_core_qmi_firmware_ready`
@@ -1972,8 +2065,23 @@ A SYS_ERR during bring-up still fails the bring-up (Linux's `reset_work`
   TKIP-MIC or decrypt errors are dropped in the DP; each locally detected
   TKIP-MIC error retains its peer/key identity and is multicast as
   NL80211_CMD_MICHAEL_MIC_FAILURE, as mac80211 reports it to userspace
-  (KEY_SEQ is absent when WCN6855 stripped the IV). Multicast PN is not
-  checked by the host (Linux leaves it to mac80211); the defrag
+  (KEY_SEQ is absent when WCN6855 stripped the IV). Multicast PN is checked by
+  the host as mac80211 does it (`dp_group_pn`): Linux REO PN offload is
+  unicast-only (`ath11k_dp_peer_rx_pn_replay_config` returns early for a
+  group key) and `ath11k_dp_rx_h_mpdu` sets no `RX_FLAG_PN_VALIDATED` for a
+  decrypted group-addressed first MSDU, so `ieee80211_rx_h_decrypt` owns
+  it. `DpRing::h_mpdu` reads the IV from `hdr_status` (the bytes Linux's
+  `ath11k_dp_rx_h_undecap_{nwifi,eth}` copy into the rebuilt header),
+  selects the GTK by Key ID and drops a PN/TSC not above the key's per-TID
+  counter (`rx_group_replay`; CCMP/GCMP `memcmp <= 0`, TKIP's zero-RSC
+  first-frame exception; IEEE 802.11-2020 12.5.3.4.4). Group-key install /
+  disable (`rx_pn_replay_config`, pairwise = false) allocates / frees the
+  counters, and `DataPort::group_rx_seq` seeds them from the GTK KDE RSC or
+  `NL80211_ATTR_KEY_SEQ` (`ieee80211_key_alloc(seq)`); tests
+  `group_pn_tests.rs` and `dp_tests.rs::smoke_ath11k_dp_rx_decrypted_mcbc_peer`.
+  Deviation: the
+  counters live in the DP, so a firmware recovery restarts them at the
+  reinstalled key's zero RSC instead of mac80211's retained values; the defrag
   reinjection allocates its buffer id from 1 (Linux `idr_alloc(.., 0,
   ..)` returns id 0, which `ath11k_dp_process_rx` skips as invalid: the
   first reassembled MPDU would be lost); a pairwise TKIP fragment set is
