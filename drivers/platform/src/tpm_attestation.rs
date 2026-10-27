@@ -58,6 +58,7 @@ pub const AK_PERSISTENT_HANDLE: u32 = 0x8101_0002;
 /// attestation bytes and signature (as produced), their parsed
 /// form, and the AK's public area + names (as ReadPublic reports
 /// them — the values a verifier pins at enrollment).
+#[derive(Debug)]
 pub struct QuoteBundle {
     pub attest_bytes: Vec<u8>,
     pub info: narf_tpm::attest::AttestInfo,

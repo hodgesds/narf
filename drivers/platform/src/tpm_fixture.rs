@@ -369,8 +369,6 @@ struct ModelObject {
     /// re-created; a persistent object still resolves through its
     /// persistent handle (the TPM loads it from NV on use).
     loaded: bool,
-    /// The hierarchy the primary was created in.
-    hierarchy: u32,
     /// TPMT_PUBLIC bytes (unique filled with the derived point).
     public: Vec<u8>,
     /// Part 1 §16 name / qualified name.
@@ -1038,7 +1036,6 @@ impl FakeTpmDevice {
             handle,
             persistent: None,
             loaded: true,
-            hierarchy,
             public: out_public.clone(),
             name: name.clone(),
             qualified_name,
