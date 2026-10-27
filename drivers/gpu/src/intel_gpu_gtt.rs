@@ -39,8 +39,70 @@
 //!
 //! ## Scope
 //!
-//! Codec only. The GGTT / PPGTT walker (and the actual page-table
-//! installation) lives in the Stage-4 driver core.
+//! The PTE codec, plus the GGTT installation discipline the
+//! Stage-4 driver core applies on top of it: every GGTT mapping
+//! is bounds-checked against the GGTT size derived from the
+//! actual GTTMMADR BAR length (never assumed), and every PTE
+//! write burst is followed by a readback flush so the writes are
+//! posted before the mapping is handed to hardware. The PPGTT
+//! walker lives in [`crate::intel_gpu_ppgtt`]; it shares this
+//! entry format through [`encode_table_entry`].
+
+// ── GGTT window layout (TGL PRM Vol. 5 §"GTTMMADR") ────────────
+
+/// Byte offset of the GGTT PTE array inside BAR0 (`GTTMMADR`):
+/// the low 8 MiB of the BAR are the register file, the array
+/// occupies the rest of the BAR.
+pub const GGTT_ARRAY_BASE: u64 = 0x80_0000;
+
+/// GGTT virtual-address size in bytes, derived from the length
+/// of the GTTMMADR BAR mapping: one 8-byte PTE per 4 KiB page
+/// over the array half of the BAR. A 16 MiB BAR therefore yields
+/// a 4 GiB GGTT; a BAR no longer than the register half yields
+/// zero. Deriving the size from the mapping the probe actually
+/// made is what keeps the bounds checks below honest on parts
+/// whose BAR differs.
+pub fn ggtt_va_size(bar_len: u64) -> u64 {
+    if bar_len <= GGTT_ARRAY_BASE {
+        return 0;
+    }
+    (bar_len - GGTT_ARRAY_BASE) / 8 * GTT_PAGE_SIZE
+}
+
+/// Refuse a GGTT mapping whose `[gtt_offset, gtt_offset +
+/// size_bytes)` range escapes the GGTT window `bar_len` implies.
+/// `gtt_offset` must be page-aligned.
+pub fn check_ggtt_range(bar_len: u64, gtt_offset: u64, size_bytes: u64) -> Result<(), GttError> {
+    if gtt_offset % GTT_PAGE_SIZE != 0 {
+        return Err(GttError::OutOfBounds);
+    }
+    let end = gtt_offset
+        .checked_add(size_bytes)
+        .ok_or(GttError::OutOfBounds)?;
+    if end > ggtt_va_size(bar_len) {
+        return Err(GttError::OutOfBounds);
+    }
+    Ok(())
+}
+
+/// Posting flush for a burst of GGTT PTE writes: a compiler
+/// fence plus a readback of the last PTE slot written. MMIO
+/// writes to the GGTT array are posted; without the readback a
+/// caller could hand the mapping to an engine (or a plane)
+/// before the final PTEs are visible to it.
+pub fn flush_ggtt_writes(gtt_mmadr: &narf_bus::bar::MmioRegion, last_pte_index: u64) {
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    let pte_offset = GGTT_ARRAY_BASE + last_pte_index * 8;
+    // SAFETY: `gtt_mmadr` is the caller-mapped BAR0 (`GTTMMADR`)
+    // region and `pte_offset` is the slot this module just wrote
+    // (callers pass the index of their final write, which the
+    // bounds check has proven in-range), so the read lands on an
+    // 8-byte-aligned slot inside the GGTT PTE array.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    unsafe {
+        let _ = gtt_mmadr.read32(pte_offset);
+    }
+}
 
 // ── PTE bit definitions (TGL PRM Vol. 5 §"GFX PTE Definition") ──
 
@@ -117,6 +179,9 @@ pub enum GttError {
     PhysOutOfRange,
     /// Physical allocation failed.
     OutOfMemory,
+    /// The requested GGTT range escapes the GGTT window implied
+    /// by the actual GTTMMADR BAR length.
+    OutOfBounds,
 }
 
 /// Build a present, read-only PTE for a scanout page.
@@ -151,6 +216,22 @@ pub fn encode_engine_pte(phys: u64, pat: PatSlot, executable: bool) -> Result<u6
     Ok(v)
 }
 
+/// Build a page-*table* entry pointing at the next-level table
+/// at `next_level_phys`: the same 64-bit GFX PTE layout as a leaf
+/// entry with only `PRESENT` set. Intermediate PPGTT entries
+/// (PML4E / PDPTE / PDE) and GGTT entries share this encoding —
+/// TGL PRM Vol. 5 §"GFX PTE Definition" defines one entry format
+/// for every level of both walks.
+pub fn encode_table_entry(next_level_phys: u64) -> Result<u64, GttError> {
+    if next_level_phys & 0xFFF != 0 {
+        return Err(GttError::UnalignedPhys);
+    }
+    if next_level_phys & !PTE_PHYS_MASK != 0 {
+        return Err(GttError::PhysOutOfRange);
+    }
+    Ok(PTE_PRESENT | (next_level_phys & PTE_PHYS_MASK))
+}
+
 /// Decode the phys-address portion of an existing PTE.
 pub fn pte_phys(pte: u64) -> u64 {
     pte & PTE_PHYS_MASK
@@ -169,24 +250,25 @@ pub fn map_contiguous_scanout(
     start_phys: u64,
     size_bytes: u64,
 ) -> Result<u32, GttError> {
-    // The GGTT array lives at offset 8 MiB in BAR0 (GTTMMADR).
-    const GGTT_BASE: u64 = 0x80_0000;
     // We arbitrarily pick a GTT offset of 16 MiB (0x1000000) for our scanout
     // to avoid colliding with whatever the UEFI GOP mapped lower down (often at 0).
     const SCANOUT_GTT_OFFSET: u64 = 0x100_0000;
 
     let pages = size_bytes.div_ceil(GTT_PAGE_SIZE);
+    check_ggtt_range(gtt_mmadr.len, SCANOUT_GTT_OFFSET, pages * GTT_PAGE_SIZE)?;
     for i in 0..pages {
         let phys = start_phys + i * GTT_PAGE_SIZE;
         let pte = encode_scanout_pte(phys, PatSlot::Slot2)?;
 
         let pte_index = (SCANOUT_GTT_OFFSET / GTT_PAGE_SIZE) + i;
-        let pte_offset = GGTT_BASE + pte_index * 8;
+        let pte_offset = GGTT_ARRAY_BASE + pte_index * 8;
 
         // Write 64-bit PTE (as two 32-bit writes)
         // SAFETY: `gtt_mmadr` is the caller-mapped BAR0 (`GTTMMADR`) region.
-        // `pte_offset` is `GGTT_BASE` (8 MiB into the BAR) plus `pte_index * 8`,
-        // landing on an 8-byte-aligned slot inside the GGTT PTE array, so both
+        // `pte_offset` is `GGTT_ARRAY_BASE` (8 MiB into the BAR) plus
+        // `pte_index * 8`, landing on an 8-byte-aligned slot inside the
+        // GGTT PTE array — the bounds check above has proven the whole
+        // range fits the GGTT window this BAR implies — so both
         // `pte_offset` and `pte_offset + 4` are in-range, naturally-aligned
         // 32-bit GGTT register writes.
         // SAFETY: Valid MMIO bounds or trusted driver environment
@@ -194,6 +276,9 @@ pub fn map_contiguous_scanout(
             gtt_mmadr.write32(pte_offset, (pte & 0xFFFF_FFFF) as u32);
             gtt_mmadr.write32(pte_offset + 4, (pte >> 32) as u32);
         }
+    }
+    if pages > 0 {
+        flush_ggtt_writes(gtt_mmadr, SCANOUT_GTT_OFFSET / GTT_PAGE_SIZE + pages - 1);
     }
 
     Ok(SCANOUT_GTT_OFFSET as u32)
@@ -206,10 +291,10 @@ pub fn alloc_coherent_scanout(
     gtt_mmadr: &narf_bus::bar::MmioRegion,
     size_bytes: u64,
 ) -> Result<(u32, alloc::vec::Vec<narf_memory::frame::PhysFrame>), GttError> {
-    const GGTT_BASE: u64 = 0x80_0000;
     const SCANOUT_GTT_OFFSET: u64 = 0x100_0000;
 
     let pages = size_bytes.div_ceil(GTT_PAGE_SIZE);
+    check_ggtt_range(gtt_mmadr.len, SCANOUT_GTT_OFFSET, pages * GTT_PAGE_SIZE)?;
     let mut frames = alloc::vec::Vec::with_capacity(pages as usize);
 
     for i in 0..pages {
@@ -221,12 +306,14 @@ pub fn alloc_coherent_scanout(
         let pte = encode_scanout_pte(phys, PatSlot::Slot2)?;
 
         let pte_index = (SCANOUT_GTT_OFFSET / GTT_PAGE_SIZE) + i;
-        let pte_offset = GGTT_BASE + pte_index * 8;
+        let pte_offset = GGTT_ARRAY_BASE + pte_index * 8;
 
         // Write 64-bit PTE (as two 32-bit writes)
         // SAFETY: `gtt_mmadr` is the caller-mapped BAR0 (`GTTMMADR`) region.
-        // `pte_offset` is `GGTT_BASE` (8 MiB into the BAR) plus `pte_index * 8`,
-        // landing on an 8-byte-aligned slot inside the GGTT PTE array, so both
+        // `pte_offset` is `GGTT_ARRAY_BASE` (8 MiB into the BAR) plus
+        // `pte_index * 8`, landing on an 8-byte-aligned slot inside the
+        // GGTT PTE array — the bounds check above has proven the whole
+        // range fits the GGTT window this BAR implies — so both
         // `pte_offset` and `pte_offset + 4` are in-range, naturally-aligned
         // 32-bit GGTT register writes.
         // SAFETY: Valid MMIO bounds or trusted driver environment
@@ -234,6 +321,9 @@ pub fn alloc_coherent_scanout(
             gtt_mmadr.write32(pte_offset, (pte & 0xFFFF_FFFF) as u32);
             gtt_mmadr.write32(pte_offset + 4, (pte >> 32) as u32);
         }
+    }
+    if pages > 0 {
+        flush_ggtt_writes(gtt_mmadr, SCANOUT_GTT_OFFSET / GTT_PAGE_SIZE + pages - 1);
     }
 
     Ok((SCANOUT_GTT_OFFSET as u32, frames))
@@ -292,13 +382,13 @@ pub fn alloc_contiguous_scanout(
     gtt_mmadr: &narf_bus::bar::MmioRegion,
     size_bytes: u64,
 ) -> Result<ContiguousScanout, GttError> {
-    const GGTT_BASE: u64 = 0x80_0000;
     const SCANOUT_GTT_OFFSET: u64 = 0x100_0000;
 
     let order = scanout_order_for(size_bytes).ok_or(GttError::OutOfMemory)?;
+    let pages = size_bytes.div_ceil(GTT_PAGE_SIZE);
+    check_ggtt_range(gtt_mmadr.len, SCANOUT_GTT_OFFSET, pages * GTT_PAGE_SIZE)?;
     let head = narf_memory::frame::alloc_pages_on(0, order).map_err(|_| GttError::OutOfMemory)?;
     let base = head.start_address().raw();
-    let pages = size_bytes.div_ceil(GTT_PAGE_SIZE);
     for i in 0..pages {
         let phys = base + i * GTT_PAGE_SIZE;
         let pte = match encode_scanout_pte(phys, PatSlot::Slot2) {
@@ -309,10 +399,12 @@ pub fn alloc_contiguous_scanout(
             }
         };
         let pte_index = (SCANOUT_GTT_OFFSET / GTT_PAGE_SIZE) + i;
-        let pte_offset = GGTT_BASE + pte_index * 8;
+        let pte_offset = GGTT_ARRAY_BASE + pte_index * 8;
         // SAFETY: `gtt_mmadr` is the caller-mapped BAR0 (`GTTMMADR`) region.
-        // `pte_offset` is `GGTT_BASE` (8 MiB into the BAR) plus `pte_index * 8`,
-        // landing on an 8-byte-aligned slot inside the GGTT PTE array, so both
+        // `pte_offset` is `GGTT_ARRAY_BASE` (8 MiB into the BAR) plus
+        // `pte_index * 8`, landing on an 8-byte-aligned slot inside the
+        // GGTT PTE array — the bounds check above has proven the whole
+        // range fits the GGTT window this BAR implies — so both
         // `pte_offset` and `pte_offset + 4` are in-range, naturally-aligned
         // 32-bit GGTT register writes.
         // SAFETY: Valid MMIO bounds or trusted driver environment
@@ -320,6 +412,9 @@ pub fn alloc_contiguous_scanout(
             gtt_mmadr.write32(pte_offset, (pte & 0xFFFF_FFFF) as u32);
             gtt_mmadr.write32(pte_offset + 4, (pte >> 32) as u32);
         }
+    }
+    if pages > 0 {
+        flush_ggtt_writes(gtt_mmadr, SCANOUT_GTT_OFFSET / GTT_PAGE_SIZE + pages - 1);
     }
     Ok(ContiguousScanout {
         gtt_offset: SCANOUT_GTT_OFFSET as u32,
@@ -434,5 +529,133 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gtt",
         smoke_pte_rejects_out_of_range_phys
+    );
+
+    fn smoke_table_entry_encoding() -> TestResult {
+        // Byte-for-byte pin: a table entry is PRESENT | phys, in
+        // the same GFX PTE layout as a leaf (PRM Vol. 5).
+        match encode_table_entry(0x0000_0001_2345_6000) {
+            Ok(0x0000_0001_2345_6001) => {}
+            _ => return TestResult::Fail("table entry must be phys | PRESENT"),
+        }
+        match encode_table_entry(0x1234) {
+            Err(GttError::UnalignedPhys) => {}
+            _ => return TestResult::Fail("unaligned table phys must be rejected"),
+        }
+        match encode_table_entry(1u64 << 39) {
+            Err(GttError::PhysOutOfRange) => {}
+            _ => return TestResult::Fail(">39-bit table phys must be rejected"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_gtt", smoke_table_entry_encoding);
+
+    fn smoke_ggtt_va_size_from_bar_len() -> TestResult {
+        // The canonical Gen12 GTTMMADR BAR is 16 MiB: 8 MiB of
+        // PTE array = 1M entries = a 4 GiB GGTT.
+        if ggtt_va_size(0x100_0000) != 0x1_0000_0000 {
+            return TestResult::Fail("16 MiB BAR must imply a 4 GiB GGTT");
+        }
+        if ggtt_va_size(0x80_0000) != 0 {
+            return TestResult::Fail("register-half-only BAR must imply no GGTT");
+        }
+        if ggtt_va_size(0x40_0000) != 0 {
+            return TestResult::Fail("short BAR must imply no GGTT");
+        }
+        // 12 MiB BAR: 4 MiB of array = 512K entries = 2 GiB.
+        if ggtt_va_size(0xC0_0000) != 0x8000_0000 {
+            return TestResult::Fail("12 MiB BAR must imply a 2 GiB GGTT");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_gtt", smoke_ggtt_va_size_from_bar_len);
+
+    fn smoke_ggtt_range_check_bounds() -> TestResult {
+        let bar = 0x100_0000u64; // 4 GiB GGTT
+        if check_ggtt_range(bar, 0x100_0000, 0x80_0000).is_err() {
+            return TestResult::Fail("scanout range inside the GGTT refused");
+        }
+        // Last page of the GGTT exactly fits; one page past it not.
+        if check_ggtt_range(bar, 0xFFFF_F000, 0x1000).is_err() {
+            return TestResult::Fail("final GGTT page refused");
+        }
+        match check_ggtt_range(bar, 0xFFFF_F000, 0x2000) {
+            Err(GttError::OutOfBounds) => {}
+            _ => return TestResult::Fail("range past the GGTT end must be refused"),
+        }
+        // The fixed 16 MiB scanout offset against a BAR whose
+        // GGTT is smaller than the offset: refused, where the old
+        // unchecked code wrote blindly.
+        match check_ggtt_range(0x80_8000, 0x100_0000, 0x1000) {
+            Err(GttError::OutOfBounds) => {}
+            _ => return TestResult::Fail("scanout offset past a small GGTT must be refused"),
+        }
+        match check_ggtt_range(bar, 0x100_0800, 0x1000) {
+            Err(GttError::OutOfBounds) => {}
+            _ => return TestResult::Fail("unaligned GGTT offset must be refused"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_gtt", smoke_ggtt_range_check_bounds);
+
+    fn smoke_ggtt_scanout_map_bounds_and_readback() -> TestResult {
+        // A fake 16 MiB GTTMMADR BAR over plain memory: the PTE
+        // writes and the flush readback land in the backing store
+        // exactly where the PRM layout puts them.
+        let mut backing = alloc::vec![0u8; 0x100_0000];
+        let region = narf_bus::bar::MmioRegion {
+            phys: narf_memory::PhysAddr::new(0),
+            virt: backing.as_mut_ptr() as u64,
+            len: backing.len() as u64,
+            kind: narf_bus::bar::BarKind::Mmio64 {
+                prefetchable: false,
+            },
+        };
+        let phys = 0x0000_0000_2345_6000u64;
+        if map_contiguous_scanout(&region, phys, 2 * GTT_PAGE_SIZE).is_err() {
+            return TestResult::Fail("in-bounds scanout map refused");
+        }
+        let expect = match encode_scanout_pte(phys, PatSlot::Slot2) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("pte encode"),
+        };
+        let slot = (GGTT_ARRAY_BASE + (0x100_0000 / GTT_PAGE_SIZE) * 8) as usize;
+        let got = u64::from_le_bytes(backing[slot..slot + 8].try_into().unwrap());
+        if got != expect {
+            return TestResult::Fail("first scanout PTE not at the PRM slot");
+        }
+        let slot2 = slot + 8;
+        let got2 = u64::from_le_bytes(backing[slot2..slot2 + 8].try_into().unwrap());
+        let expect2 = match encode_scanout_pte(phys + GTT_PAGE_SIZE, PatSlot::Slot2) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("pte encode 2"),
+        };
+        if got2 != expect2 {
+            return TestResult::Fail("second scanout PTE not contiguous");
+        }
+        // A BAR too small for the fixed scanout offset: refused
+        // before any write (backing stays zero at the slot the
+        // unchecked code would have hit).
+        let mut small = alloc::vec![0u8; 0x80_8000];
+        let small_region = narf_bus::bar::MmioRegion {
+            phys: narf_memory::PhysAddr::new(0),
+            virt: small.as_mut_ptr() as u64,
+            len: small.len() as u64,
+            kind: narf_bus::bar::BarKind::Mmio64 {
+                prefetchable: false,
+            },
+        };
+        match map_contiguous_scanout(&small_region, phys, GTT_PAGE_SIZE) {
+            Err(GttError::OutOfBounds) => {}
+            _ => return TestResult::Fail("small-BAR scanout map must be refused"),
+        }
+        if small.iter().any(|b| *b != 0) {
+            return TestResult::Fail("refused map must not write any PTE");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gtt",
+        smoke_ggtt_scanout_map_bounds_and_readback
     );
 }
