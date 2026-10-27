@@ -560,10 +560,18 @@ different FIFO is a protocol error. Smoke: `drivers/wireless/brcmfmac/wmm`.
 
 Additional software outside that retained profile remains: nonzero descriptor
 prefixes/shared 7, other CPU/RAM/chip/OTP selectors (including 160 MHz-capable
-chips), HE/EHT profiles, native802.11
-RX/metadata, larger flow budgets, host-supplicant fallback, WPA3/AP, replayed
+chips), HE/EHT profiles, monitor mode (which owns native802.11 RX and its
+metadata), larger flow budgets, host-supplicant fallback, WPA3/AP, replayed
 recovery/system PM, confirmed stop/IOMMU quiescence and DMA reclamation, and IRQ delivery.
 These do not expand the initial polling/retained-failure acceptance claim.
+
+Native802.11 receive is not a separate station feature: Linux
+`msgbuf.c::brcmf_msgbuf_process_rx_complete` hands a completion flagged
+`BRCMF_MSGBUF_PKT_FLAGS_FRAME_802_11` only to `brcmf_netif_mon_rx`
+(`core.c`), which strips or converts its metadata according to
+`BRCMF_FEAT_MONITOR_FMT_RADIOTAP`/`_HW_RX_HDR` after `BRCMF_C_SET_MONITOR`.
+Station firmware delivers802.3 frames. Native802.11 RX and RX metadata are
+therefore tracked under the monitor-mode feature.
 
 ## 7. Stage assignment
 
