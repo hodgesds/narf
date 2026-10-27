@@ -415,6 +415,61 @@ layer is part of what a resume restores. Its surface:
   (partition discovery, early window mapping, calling
   `attempt_resume` from the boot path).
 
+#### Suspend service — token resume ceremony (S4 token, issue #1001)
+
+Landed by P5: the FIDO token anchor and the ceremony the resume
+environment drives for token-factor policies,
+`suspend_service::token_anchor`.
+
+- `TokenAnchor<P: HidPipe, R: RandomSource, U: TokenUserInterface>`
+  is the production `KeyCustodyAnchor` of kind token (code 1),
+  built on P3's `narf-ctap2` `Client`. `HidPipe` is the
+  transport seam: production binds it to the resume
+  environment's polled HID path; fixtures bind it to P3's
+  fixture authenticator. `TokenUserInterface` is the ceremony's
+  user seam — progress lines out, PIN in (as zeroizing bytes);
+  `ConsoleTokenUi` is the production binding (polled console,
+  masked echo, empty entry = abandon).
+- Slot record framing (params, version 1): version byte, then
+  credential id length (u16 LE) and id, then a fresh 32-byte
+  salt1 for the hmac-secret derivation. The blob is
+  nonce(12) ‖ ciphertext(32) ‖ tag(16): the epoch SMS
+  AEAD-wrapped (ChaCha20-Poly1305) under
+  HKDF-SHA256(slot output, `"narf-suspend/token-slot"` ‖ epoch
+  LE), with the epoch and credential id as AAD. The hmac-secret
+  output is never stored or logged; the SMS is reachable only
+  through a completed ceremony.
+- Ceremony (unwrap): derive the slot output through P3's
+  `derive_slot_output` (PIN protocol ONE; `uv` required exactly
+  when a PIN is in play), then open the blob. The failure
+  mapping is part of the contract: `CTAP2_ERR_PIN_INVALID`
+  re-asks, announcing the authenticator's own remaining-retry
+  count (read back via `getPinRetries`) — PIN retry state is
+  the token's, never replicated locally; `PIN_BLOCKED` /
+  `PIN_AUTH_BLOCKED` refuse; `NO_CREDENTIALS` /
+  `INVALID_CREDENTIAL` refuse so the resume driver tries the
+  next enrolled slot (backup tokens — any enrolled credential
+  resumes, not just the primary); transport timeouts are
+  `Unavailable`; everything else, including AEAD-open failure,
+  is `Failed`, with no per-cause oracle.
+- Policy posture (decided 2026-10-26): touch+PIN is the
+  default for token-only policies (`TokenPinMode::TouchAndPin`);
+  touch-only is the explicit enrollment-time choice. Abandoning
+  the PIN prompt refuses the slot — the ceremony never
+  downgrades to a weaker factor.
+- `resume_with_token(store, pipe, rng, ui, config, prompt)` is
+  the presence-aware driver: a successful connect runs
+  `attempt_resume` with the connected anchor; a failed connect
+  runs it with none, so a token-policy image with no
+  authenticator present refuses as `FactorUnavailable` — never
+  the OFF path.
+- Enrollment: an anchor built by `TokenAnchor::from_client`
+  carrying an enrolled credential id wraps the epoch SMS when
+  `SuspendService::enroll` calls it (credential creation and
+  the ≥2-distinct-credential rule are P3's `enroll_token` path,
+  unchanged). Resume-side anchors are unwrap-only: `wrap`
+  without an enrolled credential fails.
+
 ### 3.4 Thermal
 
 Two layers, one registration path.
