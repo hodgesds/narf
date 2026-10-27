@@ -9,9 +9,12 @@ pub(crate) struct Profile {
     operation: [u8; 22],
     secondary: Option<u8>,
     rx_streams: u8,
+    tx_streams: u8,
     rx_ldpc: bool,
     rx_stbc: bool,
     tx_ldpc: bool,
+    rx_greenfield: bool,
+    tx_greenfield: bool,
 }
 
 /// One RX/TX stream, HT20 with optional short GI, no LDPC/STBC/greenfield, 3839-byte
@@ -38,6 +41,7 @@ impl Profile {
         let mut capability = [0; 26];
         let cap = (n.peer_capability() & 12)
             | u16::from(n.tx_ldpc())
+            | (u16::from(n.tx_greenfield()) << 4)
             | (u16::from(n.tx_sgi20()) << 5)
             | if width != 0 {
                 2 | (u16::from(n.tx_sgi40()) << 6)
@@ -47,6 +51,14 @@ impl Profile {
         capability[..2].copy_from_slice(&cap.to_le_bytes());
         capability[2] = n.peer_ampdu_factor() | (n.peer_mpdu_density() << 2);
         capability[3..13].copy_from_slice(&n.tx_mcs());
+        // Static SMPS permits one transmit data stream. Dynamic SMPS is
+        // represented separately in the native WTBL and handled by firmware.
+        let tx_streams = if matches!(n.peer_capability() & 12, 4 | 12) && capability[4] != 0 {
+            2
+        } else {
+            capability[4..13].fill(0);
+            1
+        };
         capability[15] = n.peer_tx_params();
         Self {
             capability,
@@ -57,9 +69,12 @@ impl Profile {
                 None
             },
             rx_streams: if n.local_capability()[4] != 0 { 2 } else { 1 },
+            tx_streams,
             rx_ldpc: n.rx_ldpc(),
             rx_stbc: n.rx_stbc(),
             tx_ldpc: n.tx_ldpc(),
+            rx_greenfield: n.rx_greenfield(),
+            tx_greenfield: n.tx_greenfield(),
         }
     }
     pub(crate) fn prepare(info: RadioInfo, bss: &ScanBss) -> Result<Self, Error> {
@@ -115,13 +130,22 @@ impl Profile {
             operation,
             secondary: None,
             rx_streams: 1,
+            tx_streams: 1,
             rx_ldpc: false,
             rx_stbc: false,
             tx_ldpc: false,
+            rx_greenfield: false,
+            tx_greenfield: false,
         })
     }
-    pub(crate) fn transmit_mcs(self) -> u8 {
-        self.capability[3]
+    pub(crate) fn transmit_mcs_mask(self) -> [u8; 10] {
+        let mut mask = [0; 10];
+        mask[..usize::from(self.tx_streams)]
+            .copy_from_slice(&self.capability[3..3 + usize::from(self.tx_streams)]);
+        mask
+    }
+    pub(crate) fn transmit_streams(self) -> u8 {
+        self.tx_streams
     }
     pub(crate) fn receive_streams(self) -> u8 {
         self.rx_streams
@@ -135,6 +159,9 @@ impl Profile {
     pub(crate) fn transmit_ldpc(self) -> bool {
         self.tx_ldpc
     }
+    pub(crate) fn receive_greenfield(self) -> bool {
+        self.rx_greenfield
+    }
     pub(crate) fn ampdu(self) -> u8 {
         self.capability[2] & 31
     }
@@ -145,6 +172,7 @@ impl Profile {
         let cap = u16::from_le_bytes(self.capability[..2].try_into().unwrap());
         (cap & (12 | 32))
             | u16::from(self.tx_ldpc)
+            | (u16::from(self.tx_greenfield) << 4)
             | if self.secondary.is_some() {
                 2 | (u16::from(self.short_gi()) << 6)
             } else {
@@ -199,7 +227,7 @@ impl Profile {
         bytes[4..8].copy_from_slice(&[2, 0, 16, 0]); // UNI_BSS_INFO_RLM.
         bytes[8] = channel;
         bytes[9] = channel;
-        bytes[12] = 1; // One calibrated transmit chain, BW20 enum zero.
+        bytes[12] = self.tx_streams; // Actual selected transmit-chain count.
         bytes[13] = receive_chains;
         bytes[14] = 1; // Source RLM.short_st, not an HT short-GI capability.
         bytes[17] = u8::from(channel > 14);

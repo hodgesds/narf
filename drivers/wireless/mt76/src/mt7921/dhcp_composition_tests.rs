@@ -99,6 +99,7 @@ struct Harness {
     ba_rx: bool,
     channel: u8,
     vht_width: Option<u8>,
+    ht_width: Option<u8>,
     next_sequence: u16,
     server: DhcpServer,
     received: Vec<Vec<u8>>,
@@ -280,12 +281,15 @@ impl Harness {
         }
     }
     fn vht_metadata(&self, mut packet: Vec<u8>) -> Vec<u8> {
-        if let Some(width) = self.vht_width {
+        let profile = self
+            .vht_width
+            .map(|width| (4u32, width, if width == 0 { 8 } else { 9 }))
+            .or_else(|| self.ht_width.map(|width| (3, width, 15)));
+        if let Some((mode, width, rate)) = profile {
             let r1 = u32::from_le_bytes(packet[4..8].try_into().unwrap()) | (1 << 13);
             packet[4..8].copy_from_slice(&r1.to_le_bytes());
             let offset = if self.protected_link { 40 } else { 24 };
-            let rate = if width == 0 { 8 } else { 9 };
-            let rxv = (4u32 << 24) | (1 << 7) | (u32::from(width) << 12) | (1 << 15) | rate;
+            let rxv = (mode << 24) | (1 << 7) | (u32::from(width) << 12) | (1 << 15) | rate;
             let mut group = [0; 8];
             group[..4].copy_from_slice(&rxv.to_le_bytes());
             packet.splice(offset..offset, group);
@@ -447,6 +451,7 @@ fn composition_native(
         ba_rx,
         channel,
         vht_width: vht,
+        ht_width: ht20.then_some(u8::from(ht40)),
         next_sequence: 0,
         server: DhcpServer::new(NETWORK),
         received: Vec::new(),
@@ -585,6 +590,31 @@ fn composition_body(
     {
         put_session(session);
         return TestResult::Fail("associated state/aid mismatch");
+    }
+    if ht20 {
+        // The lease traverses the actual post-response two-path owner, not
+        // only a local capability IE or an isolated rate-map constructor.
+        let native = &session.backend.frames;
+        if session.ht20_profile.unwrap().transmit_streams() != 2
+            || !session.ht20_profile.unwrap().receive_greenfield()
+            || !native
+                .iter()
+                .any(|(_, f)| f.len() >= 140 && f[36] == 0xed && f[41] == 8 && f[67..69] == [2, 2])
+            || !native.iter().any(|(_, f)| {
+                f.len() == 68
+                    && f[34..36] == [2, 0]
+                    && f[52..56] == [2, 0, 16, 0]
+                    && f[60..62] == [2, 3]
+            })
+            || !native.iter().any(|(_, f)| {
+                super::vht_tests::record(f, 1)
+                    .is_some_and(|ra| ra[6..16] == [255, 255, 0, 0, 0, 0, 0, 0, 0, 0])
+                    && super::vht_tests::record(f, 9).is_some_and(|ht| ht[4] & 16 != 0)
+            })
+        {
+            put_session(session);
+            return TestResult::Fail("DHCP did not traverse native two-path RF/RLM/HT MCS setup");
+        }
     }
     if aggregate_rx && !ht20 {
         super::amsdu_rx_tests::activate_receive(&mut session);

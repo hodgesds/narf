@@ -91,6 +91,68 @@ pub struct Owner<I: Io> {
     started: AtomicBool,
     native_claimed: AtomicBool,
     status: IrqSafeSpinLock<Status>,
+    identity: IrqSafeSpinLock<Option<Identity>>,
+}
+/// Exact image of the successful retained CPU owner; not an upload receipt.
+#[derive(Clone, Copy)]
+pub(crate) struct Identity {
+    pub(super) digest: [u8; 32],
+    source: Option<narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>>,
+}
+impl Identity {
+    fn from_bytes(
+        bytes: &[u8],
+        source: Option<
+            narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+        >,
+    ) -> Self {
+        let mut h = narf_crypto::sha256::Sha256::new();
+        h.update(bytes);
+        Self {
+            digest: h.finalize(),
+            source,
+        }
+    }
+    pub(super) fn invoke<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, super::prepare::Error>,
+    ) -> Result<T, super::prepare::Error> {
+        use narf_capabilities::{Cap, CapError, CapOp, Read};
+        struct Current<F>(F);
+        impl<T, F: FnOnce() -> Result<T, super::prepare::Error>>
+            CapOp<narf_firmware::FirmwareBlob, Read> for Current<F>
+        {
+            type Output = Result<T, super::prepare::Error>;
+            fn execute(
+                self,
+                _: &Cap<narf_firmware::FirmwareBlob, Read>,
+            ) -> Result<Self::Output, CapError> {
+                Ok((self.0)())
+            }
+        }
+        if let Some(cap) = &self.source {
+            return cap.invoke(Current(operation)).map_err(|_| {
+                super::prepare::Error::Access(Error::Firmware(FirmwareError::AuthorityRevoked))
+            })?;
+        }
+        #[cfg(any(test, feature = "kernel-test"))]
+        return operation(); // Supplied-image fixture owners cannot construct real PCI I/O.
+        #[cfg(not(any(test, feature = "kernel-test")))]
+        Err(super::prepare::Error::Access(Error::Firmware(
+            FirmwareError::AuthorityRevoked,
+        )))
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn model() -> Self {
+        Self::from_bytes(b"inert EE unit identity", None)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn revoke_source(self) -> bool {
+        self.source.is_some_and(|cap| {
+            cap.revoke();
+            true
+        })
+    }
 }
 impl<I: Io> core::fmt::Debug for Owner<I> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -166,10 +228,17 @@ impl<I: Io> Owner<I> {
                 stage: Stage::Detected,
                 error: None,
             }),
+            identity: IrqSafeSpinLock::new(None),
         }
     }
     pub fn status(&self) -> Status {
         *self.status.lock()
+    }
+    pub(crate) fn identity(&self) -> Option<Identity> {
+        if self.status().stage != Stage::Ready {
+            return None;
+        }
+        *self.identity.lock()
     }
     /// Claim at most one LLT/descriptor continuation after successful boot.
     /// Failed allocation, cancellation, or Drop never reopens this claim.
@@ -228,6 +297,7 @@ impl<I: Io> Owner<I> {
             .map_err(Error::Firmware)?;
         parse(self.did, &asset.bytes)?;
         let _attempt = self.begin()?;
+        *self.identity.lock() = Some(Identity::from_bytes(&asset.bytes, Some(asset.cap)));
         let result = self.run(&asset.bytes).await;
         self.finish(result)
     }
@@ -235,7 +305,12 @@ impl<I: Io> Owner<I> {
     /// Caller already owns authenticated image bytes; probe uses registry.
     pub async fn initialize(&self, bytes: &[u8]) -> Result<Info, Error> {
         let _attempt = self.begin()?;
-        let result = self.run(bytes).await;
+        let result = async {
+            parse(self.did, bytes)?;
+            *self.identity.lock() = Some(Identity::from_bytes(bytes, None));
+            self.run(bytes).await
+        }
+        .await;
         self.finish(result)
     }
     async fn read8(&self, reg: u16) -> Result<u8, Error> {

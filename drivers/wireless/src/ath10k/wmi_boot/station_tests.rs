@@ -23,6 +23,70 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
     let fixture = m.station.as_ref().unwrap();
     let phase = fixture.phase;
     let dialect = m.inner.inner.dialect;
+    if phase == 2 && m.data.as_ref().is_some_and(|d| d.ht_secondary.is_some()) {
+        let command = &bytes[8..];
+        let word = |at| u32::from_le_bytes(command[at..at + 4].try_into().unwrap());
+        let channels = match dialect {
+            Dialect::Main | Dialect::Tlv => 0x3003,
+            _ => 0x9002,
+        };
+        if word(0) == channels {
+            let secondary = m.data.as_ref().unwrap().ht_secondary.unwrap();
+            let tlv = dialect == Dialect::Tlv;
+            let count = if tlv { 8 } else { 4 };
+            if command.len() != if tlv { 72 } else { 56 }
+                || word(count) != 2
+                || tlv && (word(4) != (79 << 16 | 4) || word(12) != (18 << 16 | 56))
+            {
+                return Err(BmiError::BadResponse);
+            }
+            for (i, f) in [m.frequency, secondary].into_iter().enumerate() {
+                let at = if tlv { 20 + i * 28 } else { 8 + i * 24 };
+                if tlv && word(at - 4) != (80 << 16 | 24)
+                    || word(at) != u32::from(f)
+                    || word(at + 4) != u32::from(f)
+                    || word(at + 8) != 0
+                    || word(at + 12)
+                        != (0x800
+                            | if f < (m.frequency + secondary) / 2 {
+                                0x40
+                            } else {
+                                0
+                            })
+                    || command[at + 16..at + 24] != [0, 54, 54, 0, 0, 54, 0, 0]
+                {
+                    return Err(BmiError::BadResponse);
+                }
+            }
+            m.data.as_mut().unwrap().ht_inventory += 1;
+            m.sent.push(bytes.to_vec());
+            m.inner.inner.rx.push_back((
+                2,
+                vec![
+                    2,
+                    2,
+                    8,
+                    0,
+                    8,
+                    0,
+                    0,
+                    0,
+                    1,
+                    4,
+                    0,
+                    0,
+                    2,
+                    bytes.len().div_ceil(256) as u8,
+                    0,
+                    0,
+                ],
+            ));
+            if m.data.as_ref().unwrap().ht_inventory_hold {
+                core::future::pending::<()>().await;
+            }
+            return Ok(());
+        }
+    }
     let mut expected = match (phase, dialect) {
         (0, Dialect::Main) => RD_MAIN,
         (0, Dialect::Tlv) => RD_TLV,
@@ -76,8 +140,20 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
         u32at(
             &mut expected,
             channel + 12,
-            if m.frequency < 3000 { 0x805 } else { 0x804 },
+            if m.data.as_ref().unwrap().ht_secondary.is_some() {
+                0x806
+            } else if m.frequency < 3000 {
+                0x805
+            } else {
+                0x804
+            },
         );
+        if let Some(s) = m.data.as_ref().unwrap().ht_secondary {
+            u32at(&mut expected, channel + 4, u32::from((m.frequency + s) / 2));
+            if m.data.as_ref().unwrap().ht_inventory != 1 {
+                return Err(BmiError::BadResponse);
+            }
+        }
     }
     if bytes[8..] != expected {
         return Err(BmiError::BadResponse);
@@ -199,6 +275,8 @@ fn smoke_ath10k_scan_policy_vdev_ack_peer_map_composed_all_dialects() -> TestRes
         let expected = radio::PeerPrepared {
             bssid: [2, 8, 9, 10, 11, 12],
             frequency: 2412,
+            center_frequency: 2412,
+            bandwidth_mhz: 20,
             peer_id: 1800,
             maximum_power_dbm: 17,
         };

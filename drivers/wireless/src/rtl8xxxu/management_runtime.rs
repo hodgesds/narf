@@ -56,6 +56,14 @@ pub struct Candidate {
 }
 impl Candidate {
     pub fn from_receive(frame: &Mpdu, channel: u8, local: [u8; 6]) -> Result<Self, Error> {
+        Self::from_receive_with_phy(frame, channel, local, None)
+    }
+    pub(super) fn from_receive_with_phy(
+        frame: &Mpdu,
+        channel: u8,
+        local: [u8; 6],
+        phy: Option<&association::phy::LocalPhy>,
+    ) -> Result<Self, Error> {
         if channel != 1 || !unicast(&local) || !native(frame) {
             return Err(Error::Profile);
         }
@@ -124,6 +132,12 @@ impl Candidate {
         if !supported || !basic_one {
             return Err(Error::Profile);
         }
+        let observed = if let Some(phy) = phy {
+            association::observe_with_phy(frame, channel, local, None, phy)
+        } else {
+            association::observe(frame, channel, local, None)
+        }
+        .map_err(Error::Protocol)?;
         Ok(Self {
             bss: Bss {
                 bssid: bytes[10..16].try_into().unwrap(),
@@ -132,7 +146,7 @@ impl Candidate {
                 signal_dbm: None,
                 capability,
                 beacon_interval,
-                information_elements: bytes[36..].to_vec(),
+                information_elements: observed.bss.information_elements,
             },
             ap_rsne: rsne,
             ap_rsnxe: rsnxe,
@@ -183,13 +197,29 @@ impl Join {
         ssid: &[u8],
         security: SecurityMode,
     ) -> Result<Self, Error> {
-        let plan =
-            JoinPlan::prepare(&candidate.bss, local, ssid, security).map_err(Error::Protocol)?;
+        Self::prepare_with_phy(candidate, local, ssid, security, None)
+    }
+    pub(super) fn prepare_with_phy(
+        candidate: Candidate,
+        local: [u8; 6],
+        ssid: &[u8],
+        security: SecurityMode,
+        phy: Option<association::phy::LocalPhy>,
+    ) -> Result<Self, Error> {
+        let plan = if let Some(phy) = phy {
+            JoinPlan::prepare_with_phy(&candidate.bss, local, ssid, security, phy)
+        } else {
+            JoinPlan::prepare(&candidate.bss, local, ssid, security)
+        }
+        .map_err(Error::Protocol)?;
         let wmm = narf_wireless::wmm::Parameters::parse(candidate.information_elements())
             .map_err(|_| Error::Profile)?;
         if let Some(p) = wmm {
             super::wmm_runtime::words(p, candidate.capability() & 0x400 != 0)
                 .map_err(|_| Error::Profile)?;
+        }
+        if plan.offered_phy().is_some() && wmm.is_none() {
+            return Err(Error::Profile);
         }
         Ok(Self {
             plan,
@@ -209,6 +239,20 @@ impl Join {
         if !matches!(self.phase(), Phase::Associated { .. }) {
             return Err(Error::Profile);
         }
+        if let Some(phy) = self.plan.negotiated_phy() {
+            let ht = phy.ht();
+            if phy.width() != association::phy::Width::Twenty
+                || phy.center_channel() != 1
+                || ht.operation().protection() != 0
+            {
+                return Err(Error::Profile);
+            }
+            return (0..8)
+                .rev()
+                .find(|i| ht.tx_mcs()[0] & (1 << i) != 0)
+                .map(|i| 12 + i)
+                .ok_or(Error::Profile);
+        }
         let rates = self.plan.legacy_rates().0;
         [11, 10, 9, 8, 7, 6, 3, 5, 4, 2, 1, 0]
             .into_iter()
@@ -217,6 +261,12 @@ impl Join {
     }
     pub fn candidate(&self) -> &Candidate {
         &self.candidate
+    }
+    pub(super) fn ht_selected(&self) -> bool {
+        self.plan.negotiated_phy().is_some()
+    }
+    pub(super) fn ht_offered(&self) -> bool {
+        self.plan.offered_phy().is_some()
     }
     pub fn rsn_body(&self) -> Option<Vec<u8>> {
         self.plan.rsn_body()
@@ -292,6 +342,13 @@ impl Join {
                     .plan
                     .association_response(bytes)
                     .map_err(Error::Protocol)?;
+                if aid.is_some()
+                    && self.plan.negotiated_phy().is_some()
+                    && self.data_rate().is_err()
+                {
+                    self.cancel();
+                    return Err(Error::Profile);
+                }
                 if aid.is_some() && self.wmm.is_some() {
                     let profile = (|| {
                         let p = narf_wireless::wmm::Parameters::parse(

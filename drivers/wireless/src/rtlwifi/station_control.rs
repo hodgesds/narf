@@ -224,6 +224,13 @@ pub(super) fn associated(io: &impl Io, aid: u16) -> Result<(), Error> {
     byte(io, 0x550, io.read8(0x550)? & !16)?;
     Ok(())
 }
+/// rtl88ee_update_channel_access_setting + HW_VAR_SIFS, HT14us.
+pub(super) fn ht_timing(io: &impl Io) -> Result<(), Error> {
+    for reg in [0x515, 0x517, 0x429, 0x63b] {
+        byte(io, reg, 14)?;
+    }
+    word(io, 0x63e, 0x0e0e)
+}
 pub(super) fn disconnected(io: &impl Io) -> Result<(), Error> {
     byte(io, 0x102, io.read8(0x102)? & !3)?;
     for reg in 0x618..0x61e {

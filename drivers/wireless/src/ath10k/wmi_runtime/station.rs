@@ -72,8 +72,25 @@ impl Peer {
 mod disconnect;
 pub use disconnect::Disconnected;
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
+    pub(in crate::ath10k) fn retained_station_permission(&self) -> Result<Permission, Error> {
+        self.peer
+            .as_ref()
+            .map(|p| p.permission)
+            .ok_or(Error::Failed)
+    }
     pub(in crate::ath10k) fn ht_capabilities(&self) -> Option<[u8; 26]> {
-        self.htt.wmi.caps.as_ref().and_then(ht::capability)
+        self.htt
+            .wmi
+            .caps
+            .as_ref()
+            .and_then(|c| ht::capability(c, false))
+    }
+    pub(in crate::ath10k) fn ht40_capabilities(&self) -> Option<[u8; 26]> {
+        self.htt
+            .wmi
+            .caps
+            .as_ref()
+            .and_then(|c| ht::capability(c, true))
     }
     async fn send_station_command(
         &mut self,
@@ -97,13 +114,49 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) fn station_permission(
         &self,
         domain: &narf_wireless::reg::RegulatoryDomain,
+        bssid: [u8; 6],
         frequency: u16,
     ) -> Result<Permission, Error> {
-        Permission::from_domain(
-            self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?,
-            domain,
-            frequency,
-        )
+        self.station_profile(domain, bssid, frequency).map(|p| p.0)
+    }
+    fn station_profile(
+        &self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        bssid: [u8; 6],
+        frequency: u16,
+    ) -> Result<(Permission, Option<ht::Profile>), Error> {
+        let caps = self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?;
+        let own = self.ready.ok_or(Error::Failed)?.mac;
+        let cached = self
+            .scan_cache
+            .iter()
+            .find(|b| b.bssid == bssid && b.frequency == frequency)
+            .ok_or(Error::Unsupported)?;
+        let ht = ht::Profile::offer(
+            caps,
+            cached,
+            own,
+            matches!(
+                frequency,
+                5180 | 5200 | 5220 | 5240 | 5745 | 5765 | 5785 | 5805
+            ),
+        )?;
+        if let Some(h) = ht.filter(|h| h.secondary.is_some()) {
+            if let Ok(permission) = Permission::occupied(caps, domain, frequency, h.secondary) {
+                if permission.center != h.center {
+                    return Err(Error::Unsupported);
+                }
+                return Ok((permission, Some(h)));
+            }
+        }
+        // A denied secondary OR an AP's20-only offer must select a genuine
+        // local20 request before publication. Keeping a LocalPhy::ht40 merely
+        // because its negotiated offer narrowed to20 would still advertise40
+        // without the occupied40 permission whose native owner it promises.
+        Ok((
+            Permission::from_domain(caps, domain, frequency)?,
+            ht::Profile::offer(caps, cached, own, false)?,
+        ))
     }
     pub fn associated_station(&self) -> Option<StationAssociated> {
         if self.failed {
@@ -135,6 +188,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         validate: &impl Fn() -> Result<(), Error>,
     ) -> Result<StationAssociated, Error> {
         validate()?;
+        self.htt
+            .wmi
+            .htc
+            .transport
+            .check_current()
+            .map_err(crate::ath10k::control::Error::from)
+            .map_err(htt::Error::from)?;
         use narf_wireless::association::{channel, Bss, JoinPlan};
         let peer = self.prepared_peer().ok_or(Error::Failed)?;
         if self.peer.as_ref().ok_or(Error::Failed)?.exchange_stage != 0 {
@@ -158,7 +218,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let own = self.ready.ok_or(Error::Failed)?.mac;
         let offered_wmm = wmm::offer(&bss.information_elements, sme_ies)?;
         let offered_ht = self.peer.as_ref().ok_or(Error::Failed)?.ht;
-        let mut plan = JoinPlan::prepare(&bss, own, ssid, security).map_err(plan_error)?;
+        let mut plan = if let Some(ht) = offered_ht {
+            JoinPlan::prepare_with_phy(&bss, own, ssid, security, ht.local())
+        } else {
+            JoinPlan::prepare(&bss, own, ssid, security)
+        }
+        .map_err(plan_error)?;
         plan.append_sme_ies(sme_ies).map_err(plan_error)?;
         let auth = wire::owned(plan.start_authentication().map_err(plan_error)?)?;
         let response =
@@ -183,9 +248,6 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 .map_err(|_| Error::NoMemory)?;
             assoc.extend_from_slice(information);
         }
-        if let Some(ht) = offered_ht {
-            assoc.extend_from_slice(&ht.information());
-        }
         self.failed = false;
         let response =
             checked_policy(self.exchange_initial_management(domain, &assoc), validate).await?;
@@ -196,9 +258,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .ok_or(Error::Malformed)?;
         let capability = u16::from_le_bytes([response[24], response[25]]);
         let wmm = wmm::response(offered_wmm, &response[30..])?;
-        let ht = offered_ht
-            .map(|ht| ht.response(&response[30..], bss.channel))
-            .transpose()?;
+        let ht = offered_ht.map(|ht| ht.response(&plan)).transpose()?;
         if ht.is_some() && wmm.is_none() {
             return Err(Error::Unsupported);
         }
@@ -261,6 +321,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         Some(PeerPrepared {
             bssid: peer.bssid,
             frequency: peer.permission.frequency,
+            center_frequency: peer.permission.center,
+            bandwidth_mhz: if peer.permission.secondary.is_some() {
+                40
+            } else {
+                20
+            },
             peer_id: peer.mapped()?,
             maximum_power_dbm: peer.permission.half_dbm / 2,
         })
@@ -308,17 +374,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             ies = &ies[2 + n..];
         }
-        let permission = Permission::from_domain(
-            self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?,
-            domain,
-            frequency,
-        )?;
-        let ht = ht::Profile::offer(
-            self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?,
-            &bss.information_elements,
-            narf_wireless::association::channel::from_frequency(u32::from(frequency))
-                .ok_or(Error::Unsupported)?,
-        )?;
+        let (permission, ht) = self.station_profile(domain, bssid, frequency)?;
         let rd = self.wire.domain(permission)?;
         let power = self.wire.power(permission)?;
         let mut start = self
@@ -332,6 +388,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             };
             wire::put(&mut start, channel + 12, ht.mode(frequency) | (1 << 11));
         }
+        let inventory = if permission.secondary.is_some() {
+            Some(self.wire.station_ht40_channels(permission)?)
+        } else {
+            None
+        };
         let create = self.wire.peer(bssid)?;
         self.peer = Some(Peer {
             permission,
@@ -345,7 +406,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         // Even an unsent/ambiguous START cannot be retried under this owner.
         // The nested native mission transport retains all published DMA.
         self.failed = true;
-        for command in [&rd, &power, &start] {
+        for command in [&rd, &power]
+            .into_iter()
+            .chain(inventory.iter())
+            .chain([&start])
+        {
             self.send_station_command(command, validate).await?;
         }
         let deadline = narf_time::Deadline::after_ms(5_000);
@@ -390,6 +455,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         return Ok(PeerPrepared {
                             bssid,
                             frequency,
+                            center_frequency: permission.center,
+                            bandwidth_mhz: if permission.secondary.is_some() {
+                                40
+                            } else {
+                                20
+                            },
                             peer_id: id,
                             maximum_power_dbm: permission.half_dbm / 2,
                         });
@@ -413,14 +484,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             return Err(Error::Failed);
         }
         let peer = self.peer.as_ref().ok_or(Error::Failed)?;
-        let permission = Permission::from_domain(
-            self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?,
-            domain,
-            peer.permission.frequency,
-        )?;
-        if permission != peer.permission {
-            return Err(Error::Unsupported);
-        }
+        let permission = peer.permission;
+        permission.check(domain)?;
         management::validate(frame, self.ready.ok_or(Error::Failed)?.mac, peer.bssid)?;
         if frame[0] == 0 {
             let bss = self
@@ -616,7 +681,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
 }
 
-fn plan_error(error: narf_wireless::association::Error) -> Error {
+pub(super) fn plan_error(error: narf_wireless::association::Error) -> Error {
     use narf_wireless::association::Error as PlanError;
     match error {
         PlanError::Rejected(status) => Error::Firmware(u32::from(status)),

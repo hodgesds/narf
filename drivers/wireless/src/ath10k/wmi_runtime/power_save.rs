@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Ordinary firmware station PS; no host-bus/system sleep or U-APSD claim.
 use super::*;
-use crate::ath10k::regulatory::Permission;
 use narf_wireless::reg::RegulatoryDomain;
 
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
@@ -24,13 +23,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             return Err(Error::Failed);
         }
         let previous = self.peer.as_ref().ok_or(Error::Failed)?.permission;
-        let caps = self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?.clone();
-        let validate = || {
-            if Permission::from_domain(&caps, &current()?, previous.frequency)? != previous {
-                return Err(Error::Unsupported);
-            }
-            Ok(())
-        };
+        let validate = || previous.check(&current()?);
         validate()?;
         let mut commands = Vec::new();
         commands.try_reserve_exact(6).map_err(|_| Error::NoMemory)?;

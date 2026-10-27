@@ -249,6 +249,7 @@ fn firmware_step(state: &mut State) {
                         }
                         262 if input.starts_with(b"sup_wpa\0") => vec![0; usize::from(output_len)],
                         262 if input.starts_with(b"nmode\0") => vec![0; usize::from(output_len)],
+                        262 if input.starts_with(b"vhtmode\0") => 0u32.to_le_bytes().to_vec(),
                         262 if input.starts_with(b"mfp\0") => vec![0; usize::from(output_len)],
                         262 if input.starts_with(b"bw_cap\0") => {
                             let mut bytes = vec![0; usize::from(output_len)];
@@ -1251,6 +1252,8 @@ fn smoke_fullmac_station_initializes_over_actual_msgbuf() -> TestResult {
         || station.channels != [1, 6, 11]
         || station.bssid.is_some()
         || !station.supplicant
+        || station.vht_capabilities() != [None, None]
+        || station.vht_connection()
     {
         return TestResult::Fail(
             "firmware-derived station identity/channel/security state differs",
@@ -1264,9 +1267,14 @@ fn smoke_fullmac_station_initializes_over_actual_msgbuf() -> TestResult {
         || !commands
             .iter()
             .any(|(cmd, input, _)| *cmd == 263 && input == b"roam_off\0\x01\0\0\0")
-        || commands
+        || !commands
             .iter()
-            .any(|(_, input, _)| input.starts_with(b"bus:") || input.starts_with(b"clmload"))
+            .any(|(cmd, input, _)| *cmd == 262 && input.starts_with(b"vhtmode\0"))
+        || commands.iter().any(|(_, input, _)| {
+            input.starts_with(b"bus:")
+                || input.starts_with(b"clmload")
+                || input.starts_with(b"txstreams\0")
+        })
     {
         return TestResult::Fail(
             "PCIe initialization sent SDIO glom/CLM or omitted station policy",

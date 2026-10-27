@@ -79,8 +79,18 @@ struct Tx {
     bytes: usize,
     m4: bool,
     data: bool,
+    control: bool,
 }
 struct Peer {
+    ht: bool,
+    response_ht: Option<Vec<u8>>,
+    response_wmm: bool,
+    declines: usize,
+    native_tx: Vec<Vec<u8>>,
+    raw_queue: VecDeque<Vec<u8>>,
+    rekey: Option<u8>,
+    rekey_ptk: Option<Ptk>,
+    hold_control: bool,
     ap: FakeAp,
     network: NetworkPlan,
     server: DhcpServer,
@@ -112,6 +122,15 @@ impl Peer {
         .with_basic_1mbps()
         .unwrap();
         Self {
+            ht: false,
+            response_ht: None,
+            response_wmm: true,
+            declines: 0,
+            native_tx: Vec::new(),
+            raw_queue: VecDeque::new(),
+            rekey: None,
+            rekey_ptk: None,
+            hold_control: false,
             ap,
             network,
             server: DhcpServer::new(network),
@@ -138,11 +157,19 @@ impl Peer {
             ethernet.len() >= 14 && ethernet[..6] == self.network.station,
             "AP downlink identity"
         );
-        let mut frame = vec![8, if self.ap.protected() { 0x42 } else { 2 }, 0, 0];
+        let mut frame = vec![
+            if self.ht { 0x88 } else { 8 },
+            if self.ap.protected() { 0x42 } else { 2 },
+            0,
+            0,
+        ];
         frame.extend_from_slice(&ethernet[..6]);
         frame.extend_from_slice(&AP);
         frame.extend_from_slice(&ethernet[6..12]);
         frame.extend_from_slice(&[0, 0]);
+        if self.ht {
+            frame.extend_from_slice(&[0, 0]);
+        }
         let mut body = vec![0xaa, 0xaa, 3, 0, 0, 0];
         body.extend_from_slice(&ethernet[12..]);
         if self.ap.protected() {
@@ -177,12 +204,119 @@ impl Peer {
             frame.len() >= 24 && frame[4..10] == AP && frame[10..16] == self.network.station,
             "USB frame peer/direction"
         );
+        if frame[0] == 0xd0 {
+            ensure!(
+                self.ht && frame.len() == 33 && frame[24..26] == [3, 1] && frame[27..29] == [37, 0],
+                "EU wrong native ADDBA refusal"
+            );
+            self.declines += 1;
+            return Ok((false, false));
+        }
+        if let Some(stage) = self.rekey {
+            // Retained shared Security encrypts rekey replies with the OLD
+            // installed packet key. The proposed EAPOL PTK is separate until
+            // the actual M4 reaches this native peer; never read ciphertext
+            // as plaintext SNAP or install proposed material after M2.
+            let body = if frame[0] == 8 {
+                ensure!(
+                    frame[1] & 0xc7 == 0x41,
+                    "EU rekey reply skipped old-key CCMP"
+                );
+                let mut wire = frame[24..].to_vec();
+                narf_wireless::ccmp::unprotect(
+                    &Ccm,
+                    &frame[..24],
+                    self.ptk
+                        .as_ref()
+                        .ok_or("EU missing old rekey TK")?
+                        .tk
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| "EU old rekey TK extent")?,
+                    0,
+                    false,
+                    &mut self.replay,
+                    &mut wire,
+                )
+                .map_err(|_| "EU rekey reply old-key CCMP/PN")?
+            } else {
+                Vec::new()
+            };
+            if body.get(..8) == Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]) {
+                let key = KeyFrame::decode(body.get(12..).ok_or("EU rekey key extent")?, 16)
+                    .ok_or("EU rekey key")?;
+                ensure!(
+                    key.replay_counter == if stage == 1 { 3 } else { 4 },
+                    "EU rekey replay mismatch"
+                );
+                if stage == 1 {
+                    // Established-PTK M2 carries SECURE as well as descriptor
+                    // version2, PAIRWISE and MIC (the initial M2 is0x010a).
+                    ensure!(key.key_information == 0x30a, "EU rekey M2 flags");
+                    self.rekey_ptk = Some(narf_wireless::eapol::wpa_pmk_to_ptk(
+                        KeyMgmt::Psk,
+                        &PMK,
+                        &AP,
+                        &self.network.station,
+                        &[0xab; 32],
+                        &key.key_nonce,
+                        16,
+                    ));
+                } else {
+                    ensure!(key.key_information == 0x30a, "EU rekey M4 flags");
+                }
+                let mut authenticated = body[8..].to_vec();
+                let mic = authenticated[81..97].to_vec();
+                authenticated[81..97].fill(0);
+                let ptk = self.rekey_ptk.as_ref().ok_or("EU proposed rekey PTK")?;
+                ensure!(
+                    narf_crypto::pbkdf2_sha1::hmac_sha1(&ptk.kck, &authenticated)[..16] == mic,
+                    "EU rekey reply MIC"
+                );
+                if stage == 1 {
+                    let reply = rekey_message(self.network.station, 0x13ca, 4, Some(ptk))?;
+                    self.queue.push_back(reply);
+                    self.rekey = Some(2);
+                } else {
+                    ensure!(
+                        self.ptk.as_ref().is_some_and(|old| old.tk != ptk.tk),
+                        "EU rekey fixture did not produce genuinely new packet material"
+                    );
+                    self.ptk = self.rekey_ptk.take();
+                    self.rekey = None;
+                    self.next_pn = 1;
+                    self.replay.last_seen_pn = 0; // A genuinely new installed peer TK.
+                }
+                return Ok((true, false));
+            }
+        }
         if self.ap.phase() != ApPhase::Authorized || matches!(frame[0], 0 | 0xb0) {
             let before = self.ap.phase();
-            let replies = self
+            if self.ht && frame[0] == 0 {
+                ensure!(
+                    frame.windows(4).any(|x| x == [45, 26, 12, 0])
+                        && frame
+                            .windows(9)
+                            .any(|x| x == narf_wireless::wmm::INFORMATION),
+                    "EU missing driver-owned HT/WMM request"
+                );
+            }
+            let mut replies = self
                 .ap
                 .receive(frame)
                 .map_err(|_| "shared AP rejected real management/EAPOL")?;
+            if self.ht {
+                for reply in &mut replies {
+                    if reply.first() == Some(&0x10) {
+                        if self.response_wmm {
+                            reply.extend_from_slice(&super::ht_tests::WMM);
+                        }
+                        if let Some(ht) = &self.response_ht {
+                            reply.extend_from_slice(ht);
+                        }
+                    }
+                }
+            }
             if before == ApPhase::Message2 {
                 let key =
                     KeyFrame::decode(frame.get(36..).ok_or("M2 extent")?, 16).ok_or("M2 key")?;
@@ -200,7 +334,7 @@ impl Peer {
             return Ok((before == ApPhase::Message4, false));
         }
         ensure!(
-            frame[0] == 8 && frame[1] & 3 == 1,
+            frame[0] == if self.ht { 0x88 } else { 8 } && frame[1] & 3 == 1,
             "USB data is not native ToDS"
         );
         let protected = frame[1] & 0x40 != 0;
@@ -208,7 +342,16 @@ impl Peer {
             protected == self.ap.protected(),
             "data crossed controlled port with wrong protection"
         );
-        let mut body = frame[24..].to_vec();
+        let header = if frame[0] == 0x88 {
+            ensure!(
+                frame.get(24..26) == Some(&[0, 0]),
+                "EU native QoS TID0 changed"
+            );
+            26
+        } else {
+            24
+        };
+        let mut body = frame[header..].to_vec();
         if protected {
             let tk: &[u8; 16] = self
                 .ptk
@@ -220,7 +363,7 @@ impl Peer {
                 .map_err(|_| "AP uplink TK extent")?;
             body = narf_wireless::ccmp::unprotect(
                 &Ccm,
-                &frame[..24],
+                &frame[..header],
                 tk,
                 0,
                 false,
@@ -264,18 +407,44 @@ impl Io for Link {
         if p.rx != Some(*receipt) {
             return Err(UsbError::Stall);
         }
+        if let Some(raw) = p.raw_queue.pop_front() {
+            if raw.len() > out.len() {
+                return Err(UsbError::Stall);
+            }
+            out[..raw.len()].copy_from_slice(&raw);
+            p.rx = None;
+            return Ok(Some(raw.len()));
+        }
         let Some(frame) = p.queue.pop_front() else {
             return Ok(None);
         };
-        let length = 24 + frame.len();
+        let ht = p.ht && frame.first() == Some(&0x88);
+        let length = 24 + if ht { 32 } else { 0 } + frame.len();
         if length > out.len() {
             return Err(UsbError::Stall);
         }
         out[..length].fill(0);
-        let d0 = frame.len() as u32 | (1 << 27) | (1 << 28) | (1 << 29);
+        let d0 = frame.len() as u32
+            | (1 << 27)
+            | (1 << 28)
+            | (1 << 29)
+            | if frame.first() == Some(&0x88) {
+                1 << 23
+            } else {
+                0
+            }
+            | if ht { (4 << 16) | (1 << 26) } else { 0 };
         out[..4].copy_from_slice(&d0.to_le_bytes());
         out[8..12].copy_from_slice(&(1u32 << 16).to_le_bytes());
-        out[24..length].copy_from_slice(&frame);
+        if frame.first() == Some(&0x88) {
+            let d1 =
+                u32::from(frame[24] & 15) << 5 | if frame[24] & 0x80 != 0 { 1 << 13 } else { 0 };
+            out[4..8].copy_from_slice(&d1.to_le_bytes());
+        }
+        if ht {
+            out[12..16].copy_from_slice(&(19u32 | (1 << 6)).to_le_bytes());
+        }
+        out[if ht { 56 } else { 24 }..length].copy_from_slice(&frame);
         p.rx = None;
         Ok(Some(length))
     }
@@ -293,6 +462,7 @@ impl Io for Link {
         {
             return Err(UsbError::Stall);
         }
+        p.native_tx.push(bytes.to_vec());
         let (m4, data) = match p.react(&bytes[TX_DESC..]) {
             Ok(result) => result,
             Err(error) => {
@@ -307,6 +477,7 @@ impl Io for Link {
             bytes: bytes.len(),
             m4,
             data,
+            control: bytes.get(TX_DESC) == Some(&0xd0),
         });
         p.sent += 1;
         Ok(id)
@@ -317,7 +488,7 @@ impl Io for Link {
         if tx.id != *receipt {
             return Err(UsbError::Stall);
         }
-        if tx.m4 && p.hold_m4 || tx.data && p.hold_data {
+        if tx.m4 && p.hold_m4 || tx.data && p.hold_data || tx.control && p.hold_control {
             return Ok(None);
         }
         let bytes = tx.bytes;
@@ -390,15 +561,29 @@ struct Harness {
     link: Link,
     env: Env,
     name: String,
+    control: Fake,
+    qualification: Option<super::ht_tests::Qualification>,
 }
 impl Harness {
     fn new(protected: bool) -> Result<Self, &'static str> {
-        let (_, firmware) = initialized_firmware();
+        Self::new_profile(protected, false)
+    }
+    fn new_profile(protected: bool, ht: bool) -> Result<Self, &'static str> {
+        let (control, firmware) = if ht {
+            super::super::super::firmware_transport_tests::initialized_registered_firmware()
+        } else {
+            initialized_firmware()
+        };
         let factory = firmware.factory().ok_or("EU fixture factory identity")?;
         let network = plan(factory.mac);
         let link = Link(Arc::new(IrqSafeSpinLock::new(Peer::new(
             network, protected,
         ))));
+        if ht {
+            let mut p = link.0.lock();
+            p.ht = true;
+            p.response_ht = Some(super::ht_tests::elements(255));
+        }
         let domain = narf_wireless::reg::RegulatoryDomain {
             country_code: *b"US",
             rules: vec![narf_wireless::reg::RegRule {
@@ -409,12 +594,21 @@ impl Harness {
                 flags: narf_wireless::reg::RegFlags::empty(),
             }],
         };
-        let receive = Receiver::new(
-            firmware,
+        let mut receive = Receiver::new(
+            firmware.clone(),
             link.clone(),
             ReceivePermission::from_domain(&domain).map_err(|_| "EU fixture RX policy")?,
         )
         .map_err(|_| "EU fixture retained RX owner")?;
+        let qualification = if ht {
+            let q = super::ht_tests::qualify(&firmware)?;
+            receive.install_wmm_model(q.proof.clone());
+            complete(receive.install_ht(q.grant.clone()))?
+                .map_err(|_| "EU same-owner parked HT program")?;
+            Some(q)
+        } else {
+            None
+        };
         let env = Env::default();
         let service = complete(Service::start(
             receive,
@@ -433,6 +627,8 @@ impl Harness {
             link,
             env,
             name,
+            control,
+            qualification,
         })
     }
     fn request(&self) -> AssociateRequest {
@@ -450,7 +646,11 @@ impl Harness {
         }
     }
     fn scan(&self) -> Result<(), &'static str> {
-        let beacon = self.link.0.lock().ap.beacon();
+        let mut beacon = self.link.0.lock().ap.beacon();
+        if self.link.0.lock().ht {
+            beacon.extend_from_slice(&super::ht_tests::WMM);
+            beacon.extend_from_slice(&super::ht_tests::elements(255));
+        }
         self.link.0.lock().queue.push_back(beacon);
         let result = narf_scheduler::block_on(self.device.scan(ScanRequest {
             ssids: vec![SSID.to_vec()],
@@ -525,7 +725,10 @@ impl Drop for Harness {
 }
 
 fn composition(protected: bool) -> Result<(), &'static str> {
-    let h = Harness::new(protected)?;
+    composition_profile(protected, false)
+}
+fn composition_profile(protected: bool, ht: bool) -> Result<(), &'static str> {
+    let h = Harness::new_profile(protected, ht)?;
     let network = h.link.0.lock().network;
     ensure!(
         !h.device.link_up() && narf_net::dhcp::acquire(&h.name, 400).is_err(),
@@ -834,7 +1037,7 @@ fn disconnect_overrides_waiting_old_publisher() -> Result<(), &'static str> {
         !h.device.link_up()
             && h.device.connected_bssid().is_none()
             && narf_net::iface::lookup(&h.name).is_some_and(|i| {
-                i.link_up && !i.carrier && i.carrier_up_count == 2 && i.carrier_down_count == 2
+                i.link_up && !i.carrier && i.carrier_up_count == 1 && i.carrier_down_count == 1
             })
             && narf_net::iface::send_on(&h.name, &probe).is_err(),
         "EU old publisher reopened carrier/BSSID after completed disconnect"
@@ -855,4 +1058,725 @@ fn smoke_rtl8188eu_disconnect_overrides_waiting_old_link_publication() -> TestRe
 kernel_test_in!(
     "drivers/wireless/rtl8xxxu/dhcp",
     smoke_rtl8188eu_disconnect_overrides_waiting_old_link_publication
+);
+
+fn rekey_message(
+    own: [u8; 6],
+    information: u16,
+    replay: u64,
+    ptk: Option<&Ptk>,
+) -> Result<Vec<u8>, &'static str> {
+    let mut key = KeyFrame::empty(16);
+    key.key_information = information;
+    key.key_length = 16;
+    key.replay_counter = replay;
+    key.key_nonce = [0xab; 32];
+    if information & 0x1000 != 0 {
+        // Literal WPA2-PSK/CCMP AP RSNE and fresh GTK, bound by real AES-KW/MIC.
+        let mut kde = vec![
+            48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
+        ];
+        kde.extend_from_slice(&[0xdd, 22, 0, 0x0f, 0xac, 1, 2, 0]);
+        kde.extend_from_slice(&[0x7d; 16]);
+        kde.push(0xdd);
+        while kde.len() % 8 != 0 {
+            kde.push(0);
+        }
+        key.key_data = narf_crypto::aes_kw::aes_wrap(
+            ptk.ok_or("EU rekey missing KEK")?
+                .kek
+                .as_slice()
+                .try_into()
+                .map_err(|_| "EU KEK")?,
+            &kde,
+        )
+        .ok_or("EU rekey AES-KW")?;
+    }
+    let mut pdu = key.into_eapol();
+    pdu[0] = 2;
+    if information & 0x100 != 0 {
+        let mic =
+            narf_crypto::pbkdf2_sha1::hmac_sha1(&ptk.ok_or("EU rekey missing KCK")?.kck, &pdu);
+        pdu[81..97].copy_from_slice(&mic[..16]);
+    }
+    let mut native = vec![8, 2, 0, 0];
+    native.extend_from_slice(&own);
+    native.extend_from_slice(&AP);
+    native.extend_from_slice(&AP);
+    native.extend_from_slice(&[0, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+    native.extend_from_slice(&pdu);
+    Ok(native)
+}
+fn aggregate(
+    h: &Harness,
+    sizes: &[usize],
+    pn: u64,
+    tid: u8,
+) -> Result<(Vec<u8>, Vec<Vec<u8>>), &'static str> {
+    let p = h.link.0.lock();
+    let own = p.network.station;
+    let mut header = vec![0x88, if p.ap.protected() { 0x42 } else { 2 }, 0, 0];
+    header.extend_from_slice(&own);
+    header.extend_from_slice(&AP);
+    header.extend_from_slice(&AP);
+    header.extend_from_slice(&[0, 0, 0x80 | tid, 0]);
+    let mut body = Vec::new();
+    let mut expected = Vec::new();
+    for (i, size) in sizes.iter().copied().enumerate() {
+        if i != 0 {
+            while body.len() % 4 != 0 {
+                body.push(0xcc);
+            }
+        }
+        body.extend_from_slice(&own);
+        body.extend_from_slice(&AP);
+        body.extend_from_slice(&((size + 8) as u16).to_be_bytes());
+        body.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 8, 0]);
+        body.resize(body.len() + size, 0x30 + i as u8);
+        let mut ethernet = own.to_vec();
+        ethernet.extend_from_slice(&AP);
+        ethernet.extend_from_slice(&[8, 0]);
+        ethernet.resize(ethernet.len() + size, 0x30 + i as u8);
+        expected.push(ethernet);
+    }
+    if p.ap.protected() {
+        body = narf_wireless::ccmp::protect(
+            &Ccm,
+            &header,
+            p.ptk
+                .as_ref()
+                .ok_or("EU aggregate TK")?
+                .tk
+                .as_slice()
+                .try_into()
+                .map_err(|_| "EU aggregate TK extent")?,
+            pn,
+            0,
+            tid,
+            false,
+            &mut body,
+        )
+        .map_err(|_| "EU aggregate CCMP")?;
+    }
+    header.extend_from_slice(&body);
+    Ok((header, expected))
+}
+fn ht_record(frame: &[u8], phy_bytes: usize) -> Vec<u8> {
+    let mut wire = vec![0; 24 + phy_bytes + frame.len()];
+    let d0 = frame.len() as u32
+        | (1 << 27)
+        | (1 << 28)
+        | (1 << 29)
+        | (1 << 23)
+        | if phy_bytes != 0 {
+            (phy_bytes as u32 / 8) << 16 | 1 << 26
+        } else {
+            0
+        };
+    let d1 = u32::from(frame[24] & 15) << 5 | if frame[24] & 0x80 != 0 { 1 << 13 } else { 0 };
+    wire[..4].copy_from_slice(&d0.to_le_bytes());
+    wire[4..8].copy_from_slice(&d1.to_le_bytes());
+    wire[8..12].copy_from_slice(&(1u32 << 16).to_le_bytes());
+    wire[12..16].copy_from_slice(&(19u32 | 1 << 6).to_le_bytes());
+    wire[24 + phy_bytes..].copy_from_slice(frame);
+    wire
+}
+fn ht_result(result: Result<(), &'static str>) -> TestResult {
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+fn smoke_rtl8188eu_ht20_open_native_usb_kernel_dhcp_ip() -> TestResult {
+    ht_result(composition_profile(false, true))
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/ht20",
+    smoke_rtl8188eu_ht20_open_native_usb_kernel_dhcp_ip
+);
+fn smoke_rtl8188eu_ht20_wpa2_native_usb_kernel_dhcp_ip() -> TestResult {
+    ht_result(composition_profile(true, true))
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/ht20",
+    smoke_rtl8188eu_ht20_wpa2_native_usb_kernel_dhcp_ip
+);
+fn ht_aggregate() -> Result<(), &'static str> {
+    for protected in [false, true] {
+        let h = Harness::new_profile(protected, true)?;
+        h.scan()?;
+        h.join()?;
+        let (frame, expected) = aggregate(&h, &[1500, 1500, 769], 1, 15)?;
+        ensure!(
+            frame.len() == 26 + 3839 + if protected { 16 } else { 0 },
+            "EU test did not reach default3839"
+        );
+        h.link.0.lock().raw_queue.push_back(ht_record(&frame, 32));
+        ensure!(
+            h.device.progress() == expected,
+            "EU full3839 A-MSDU did not publish atomically"
+        );
+        let mut ring = h
+            .device
+            .rx_ring()
+            .lock()
+            .take()
+            .ok_or("EU HT ring absent")?;
+        for exact in expected {
+            ensure!(
+                ring.try_recv()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|f| f.payload() == exact),
+                "EU aggregate native RX ring changed subframe"
+            );
+        }
+        if protected {
+            h.link.0.lock().raw_queue.push_back(ht_record(&frame, 32));
+            ensure!(
+                h.device.progress().is_empty(),
+                "EU aggregate replay reopened PN"
+            );
+        }
+    }
+    Ok(())
+}
+fn smoke_rtl8188eu_ht20_whole3839_amsdu_open_and_real_ccmp() -> TestResult {
+    ht_result(ht_aggregate())
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/ht20",
+    smoke_rtl8188eu_ht20_whole3839_amsdu_open_and_real_ccmp
+);
+fn ht_phy() -> Result<(), &'static str> {
+    let h = Harness::new_profile(true, true)?;
+    h.scan()?;
+    h.join()?;
+    for case in 0..13 {
+        let (frame, expected) = aggregate(&h, &[7, 9], 1 + case, 0)?;
+        let mut raw = ht_record(
+            &frame,
+            if case == 10 {
+                24
+            } else if case == 11 {
+                64
+            } else {
+                32
+            },
+        );
+        let field = |raw: &mut Vec<u8>, at: usize, mask: u32| {
+            let value = u32::from_le_bytes(raw[at..at + 4].try_into().unwrap()) ^ mask;
+            raw[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        match case {
+            0 => field(&mut raw, 12, 1 << 9),
+            1 => field(&mut raw, 12, 1 << 7),
+            2 => field(&mut raw, 12, 1 << 8),
+            3 => field(&mut raw, 12, 1 << 10),
+            4 => field(&mut raw, 4, 1 << 14),
+            5 => field(&mut raw, 4, 1 << 13),
+            6 => field(&mut raw, 4, 1 << 5),
+            7 => field(&mut raw, 8, 1 << 12),
+            8 => raw[24 + 27] |= 2,
+            9 => raw[24 + 27] |= 12,
+            10 | 11 => (),
+            12 => {
+                raw = ht_record(&frame, 0);
+                field(&mut raw, 0, 1 << 26);
+            }
+            _ => unreachable!(),
+        }
+        h.link.0.lock().raw_queue.push_back(raw);
+        ensure!(
+            h.device.progress().is_empty() && h.device.link_up(),
+            "EU foreign PHY/aggregate metadata reached PN or closed valid owner"
+        );
+        h.link
+            .0
+            .lock()
+            .raw_queue
+            .push_back(ht_record(&frame, if case == 12 { 0 } else { 32 }));
+        ensure!(
+            h.device.progress() == expected,
+            "EU bad PHY consumed aggregate PN or changed retry"
+        );
+    }
+    // Legacy CCK/OFDM MPDUs inside the same HT station retain native QoS/TID
+    // admission before the legacy-rate return, including protected A-MSDUs.
+    let mut pn = 100;
+    for aggregate_frame in [false, true] {
+        for rate in [0u32, 3, 4, 11] {
+            for mismatch_tid in [false, true] {
+                let (frame, expected) = if aggregate_frame {
+                    aggregate(&h, &[7, 9], pn, 0)?
+                } else {
+                    let ethernet = udp_ipv4(
+                        h.device.mac(),
+                        AP,
+                        [10, 88, 0, 1],
+                        [10, 88, 0, 42],
+                        7,
+                        8,
+                        b"EU legacy PHY current original",
+                    );
+                    let frame = {
+                        let mut p = h.link.0.lock();
+                        p.next_pn = pn;
+                        p.downlink(&ethernet)?;
+                        p.queue.pop_back().ok_or("EU legacy PHY frame")?
+                    };
+                    (frame, vec![ethernet])
+                };
+                pn += 1;
+                let mut valid = ht_record(&frame, 0);
+                valid[12..16].copy_from_slice(&rate.to_le_bytes());
+                let mut wrong = valid.clone();
+                let at = if mismatch_tid { 4 } else { 0 };
+                let value = u32::from_le_bytes(wrong[at..at + 4].try_into().unwrap())
+                    ^ if mismatch_tid { 1 << 5 } else { 1 << 23 };
+                wrong[at..at + 4].copy_from_slice(&value.to_le_bytes());
+                h.link.0.lock().raw_queue.push_back(wrong);
+                ensure!(
+                    h.device.progress().is_empty() && h.device.link_up(),
+                    "EU legacy native QoS/TID mismatch reached crypto"
+                );
+                h.link.0.lock().raw_queue.push_back(valid);
+                ensure!(
+                    h.device.progress() == expected,
+                    "EU legacy metadata mismatch consumed ordinary/aggregate PN"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+fn smoke_rtl8188eu_ht20_native_phy_rejects_before_same_pn_retry() -> TestResult {
+    ht_result(ht_phy())
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/ht20",
+    smoke_rtl8188eu_ht20_native_phy_rejects_before_same_pn_retry
+);
+fn ht_response() -> Result<(), &'static str> {
+    for case in 0..5 {
+        let h = Harness::new_profile(true, true)?;
+        h.scan()?;
+        {
+            let mut p = h.link.0.lock();
+            match case {
+                0 => p.response_ht = None,
+                1 => p.response_wmm = false,
+                2 => p.response_ht.as_mut().unwrap()[30] = 6,
+                3 => p.response_ht.as_mut().unwrap()[32] = 1,
+                4 => p
+                    .response_ht
+                    .as_mut()
+                    .unwrap()
+                    .extend_from_slice(&super::ht_tests::elements(255)),
+                _ => unreachable!(),
+            }
+        }
+        ensure!(
+            complete(h.device.associate(h.request()))?.is_err(),
+            "EU malformed/downgraded/foreign HT response opened"
+        );
+        ensure!(
+            !h.device.link_up()
+                && h.link.0.lock().rx.is_some()
+                && h.link.0.lock().uplink.is_empty(),
+            "EU denied HT response released RX or data"
+        );
+    }
+    Ok(())
+}
+fn smoke_rtl8188eu_ht20_bound_response_denial_retains_usb() -> TestResult {
+    ht_result(ht_response())
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/ht20",
+    smoke_rtl8188eu_ht20_bound_response_denial_retains_usb
+);
+fn ht_sources() -> Result<(), &'static str> {
+    for case in 0..4 {
+        let h = Harness::new_profile(true, true)?;
+        h.scan()?;
+        h.join()?;
+        let q = h.qualification.as_ref().ok_or("EU missing qualifier")?;
+        let before = h.link.0.lock().sent;
+        match case {
+            0 => q.cap.revoke(),
+            1 => q.legacy.revoke(),
+            2 => q.source.revoke(),
+            3 => q.domain.lock().rules.clear(),
+            _ => unreachable!(),
+        }
+        let frame = udp_ipv4(
+            AP,
+            h.device.mac(),
+            [10, 88, 0, 42],
+            [10, 88, 0, 1],
+            7,
+            8,
+            b"EU denied",
+        );
+        ensure!(
+            h.device.enqueue(&frame, Default::default()).is_err(),
+            "EU revoked source enqueued DATA"
+        );
+        h.device.progress();
+        ensure!(
+            !h.device.link_up() && h.link.0.lock().sent == before && h.link.0.lock().rx.is_some(),
+            "EU revoked HT owner reopened/reclaimed USB"
+        );
+    }
+    Ok(())
+}
+fn smoke_rtl8188eu_ht20_all_signed_sources_and_current_policy_terminal() -> TestResult {
+    ht_result(ht_sources())
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/ht20",
+    smoke_rtl8188eu_ht20_all_signed_sources_and_current_policy_terminal
+);
+fn ht_decline() -> Result<(), &'static str> {
+    for protected in [false, true] {
+        let h = Harness::new_profile(protected, true)?;
+        h.scan()?;
+        h.join()?;
+        let mut request = vec![0xd0, 0, 0, 0];
+        request.extend_from_slice(&h.device.mac());
+        request.extend_from_slice(&AP);
+        request.extend_from_slice(&AP);
+        request.extend_from_slice(&[0, 0, 3, 0, 19]);
+        request.extend_from_slice(&(2u16 | (7 << 2) | (32 << 6)).to_le_bytes());
+        request.extend_from_slice(&[0, 0, 0x30, 0x12]);
+        {
+            let mut p = h.link.0.lock();
+            p.hold_control = true;
+            p.queue.push_back(request);
+        }
+        h.pump();
+        {
+            let p = h.link.0.lock();
+            ensure!(
+                p.declines == 1 && p.tx.as_ref().is_some_and(|t| t.control) && p.rx.is_some(),
+                "EU ADDBA decline lacked actual held native receipt"
+            );
+        }
+        h.link.0.lock().hold_control = false;
+        h.pump();
+        let p = h.link.0.lock();
+        let response = p
+            .native_tx
+            .iter()
+            .find(|x| x.get(32) == Some(&0xd0))
+            .ok_or("EU missing native decline bytes")?;
+        ensure!(
+            response[32 + 26..32 + 29] == [19, 37, 0]
+                && response[20] & 63 == 0
+                && p.tx.is_none()
+                && h.device.link_up(),
+            "EU ADDBA native refusal changed policy/rate/receipt"
+        );
+    }
+    Ok(())
+}
+fn smoke_rtl8188eu_ht20_addba_decline_owns_native_terminal_receipt() -> TestResult {
+    ht_result(ht_decline())
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/ht20",
+    smoke_rtl8188eu_ht20_addba_decline_owns_native_terminal_receipt
+);
+fn ht_m4() -> Result<(), &'static str> {
+    for cancelled in [false, true] {
+        let h = Harness::new_profile(true, true)?;
+        h.scan()?;
+        h.link.0.lock().hold_m4 = true;
+        let mut join = alloc::boxed::Box::pin(h.device.associate(h.request()));
+        let mut context = Context::from_waker(Waker::noop());
+        for _ in 0..200 {
+            ensure!(
+                join.as_mut().poll(&mut context).is_pending(),
+                "EU held M4 completed"
+            );
+            if h.link.0.lock().tx.as_ref().is_some_and(|tx| tx.m4) {
+                break;
+            }
+        }
+        ensure!(
+            h.link.0.lock().tx.as_ref().is_some_and(|tx| tx.m4),
+            "EU native M4 not reached"
+        );
+        let (frame, expected) = aggregate(&h, &[11, 13], 1, 0)?;
+        h.link.0.lock().raw_queue.push_back(ht_record(&frame, 32));
+        for _ in 0..4 {
+            ensure!(
+                join.as_mut().poll(&mut context).is_pending(),
+                "EU held M4 opened port"
+            );
+        }
+        if cancelled {
+            drop(join);
+            h.device.progress();
+            ensure!(
+                !h.device.link_up() && h.link.0.lock().rx.is_some() && h.link.0.lock().tx.is_some(),
+                "EU cancelled M4 released receipt/reopened"
+            );
+        } else {
+            h.link.0.lock().hold_m4 = false;
+            complete(join)?.map_err(|_| "EU native M4 release")?;
+            ensure!(
+                h.device.progress().is_empty(),
+                "EU pre-M4 capture retrospectively admitted"
+            );
+            h.link.0.lock().raw_queue.push_back(ht_record(&frame, 32));
+            ensure!(
+                h.device.progress() == expected,
+                "EU closed capture consumed PN"
+            );
+        }
+    }
+    Ok(())
+}
+fn smoke_rtl8188eu_ht20_held_m4_capture_and_cancel_keep_usb() -> TestResult {
+    ht_result(ht_m4())
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/ht20",
+    smoke_rtl8188eu_ht20_held_m4_capture_and_cancel_keep_usb
+);
+fn ht_reentrant() -> Result<(), &'static str> {
+    for case in 0..3 {
+        let h = Harness::new_profile(true, true)?;
+        h.scan()?;
+        h.join()?;
+        let (frame, expected) = aggregate(&h, &[11, 13], 1, 0)?;
+        h.link.0.lock().raw_queue.push_back(ht_record(&frame, 32));
+        let mut delivered = Vec::new();
+        let mut callback_error = None;
+        h.device.dispatch_with(|frame| {
+            delivered.push(frame.to_vec());
+            if delivered.len() != 1 {
+                return;
+            }
+            if case == 2 {
+                let tx = udp_ipv4(
+                    AP,
+                    h.device.mac(),
+                    [10, 88, 0, 42],
+                    [10, 88, 0, 1],
+                    7,
+                    8,
+                    b"EU reentrant ordinary",
+                );
+                h.link.0.lock().hold_data = true;
+                if h.device.enqueue(&tx, Default::default()).is_err() {
+                    callback_error = Some("EU ordinary callback TX");
+                }
+                h.device.drain();
+            } else {
+                let message = match rekey_message(h.device.mac(), 0x8a, 3, None) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        callback_error = Some(e);
+                        return;
+                    }
+                };
+                {
+                    let mut p = h.link.0.lock();
+                    p.rekey = Some(1);
+                    p.hold_m4 = case == 0;
+                    p.queue.push_back(message);
+                }
+                for _ in 0..12 {
+                    h.device.drain();
+                }
+            }
+        });
+        if let Some(error) = callback_error {
+            return Err(error);
+        }
+        if !h.device.link_up() {
+            return Err(h.link.0.lock().error.unwrap_or(match case {
+                0 => "EU reentrant held-key reply caused false disconnect",
+                1 => "EU reentrant completed-key reply caused false disconnect",
+                _ => "EU reentrant ordinary TX credit caused false disconnect",
+            }));
+        }
+        if case == 1 {
+            ensure!(
+                h.link.0.lock().rekey.is_none(),
+                "EU reentrant replacement key never completed"
+            );
+        }
+        if case == 2 {
+            ensure!(
+                delivered == expected,
+                "EU ordinary TX credit retired receive epoch"
+            );
+        } else {
+            ensure!(
+                delivered == expected[..1],
+                "EU old aggregate crossed a held/reopened key epoch"
+            );
+            ensure!(
+                h.device
+                    .rx_ring()
+                    .lock()
+                    .as_mut()
+                    .is_none_or(|ring| !matches!(ring.try_recv(), Ok(Some(_)))),
+                "EU old IPC aggregate survived key retirement"
+            );
+        }
+    }
+    Ok(())
+}
+fn smoke_rtl8188eu_ht20_reentrant_key_epochs_and_ordinary_credit() -> TestResult {
+    ht_result(ht_reentrant())
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/ht20",
+    smoke_rtl8188eu_ht20_reentrant_key_epochs_and_ordinary_credit
+);
+fn ht_rates() -> Result<(), &'static str> {
+    for mcs in 0..8 {
+        let h = Harness::new_profile(true, true)?;
+        h.scan()?;
+        h.link.0.lock().response_ht = Some(super::ht_tests::elements(1 << mcs));
+        h.join()?;
+        let frame = udp_ipv4(
+            AP,
+            h.device.mac(),
+            [10, 88, 0, 42],
+            [10, 88, 0, 1],
+            7,
+            8,
+            b"EU exact MCS",
+        );
+        h.device
+            .enqueue(&frame, Default::default())
+            .map_err(|_| "EU MCS enqueue")?;
+        h.pump();
+        let p = h.link.0.lock();
+        let tx = p
+            .native_tx
+            .iter()
+            .rev()
+            .find(|x| x.get(32) == Some(&0x88))
+            .ok_or("EU MCS native TX")?;
+        let word = |at| u32::from_le_bytes(tx[at..at + 4].try_into().unwrap());
+        ensure!(
+            word(20) & 0x7f == 12 + mcs
+                && word(16) & 0x7c0 == 0x540
+                && word(8) & (1 << 12) == 0
+                && tx[56..58] == [0, 0],
+            "EU native TXDESC32 rate/LGI/DISFB/AGG/TID changed"
+        );
+        ensure!(
+            p.uplink
+                .iter()
+                .any(|(f, encrypted)| *f == frame && *encrypted),
+            "EU source-native MCS did not carry real CCMP"
+        );
+        let c = h.control.0.lock();
+        let read = |at| u32::from_le_bytes(c.regs[at..at + 4].try_into().unwrap());
+        ensure!(
+            read(0xe10) == 0x1e1e1e1e
+                && read(0xe14) == 0x1e1e1e1e
+                && c.regs[0x429] == 16
+                && read(0x508) & 255 == 76,
+            "EU source gains/SIFS/HT EDCA readback changed"
+        );
+    }
+    Ok(())
+}
+fn smoke_rtl8188eu_ht20_all_mcs_response_bound_native_descriptor_ccmp() -> TestResult {
+    ht_result(ht_rates())
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/ht20",
+    smoke_rtl8188eu_ht20_all_mcs_response_bound_native_descriptor_ccmp
+);
+fn ht_aggregate_atomic_failure() -> Result<(), &'static str> {
+    let h = Harness::new_profile(true, true)?;
+    h.scan()?;
+    h.join()?;
+    let (good, expected) = aggregate(&h, &[11, 13], 1, 0)?;
+    let mut mic = good.clone();
+    *mic.last_mut().ok_or("EU aggregate MIC")? ^= 1;
+    h.link.0.lock().raw_queue.push_back(ht_record(&mic, 32));
+    ensure!(
+        h.device.progress().is_empty(),
+        "EU forged aggregate published prefix"
+    );
+    let mut wire = good[26..].to_vec();
+    let mut window = narf_wireless::ccmp::ReplayWindow { last_seen_pn: 0 };
+    let key: [u8; 16] = h
+        .link
+        .0
+        .lock()
+        .ptk
+        .as_ref()
+        .ok_or("EU aggregate PTK")?
+        .tk
+        .as_slice()
+        .try_into()
+        .map_err(|_| "EU aggregate TK")?;
+    let mut body =
+        narf_wireless::ccmp::unprotect(&Ccm, &good[..26], &key, 0, false, &mut window, &mut wire)
+            .map_err(|_| "EU fixture aggregate decrypt")?;
+    body[42..48].copy_from_slice(&h.device.mac()); // Second SA is local: reject whole authenticated aggregate.
+    let encrypted =
+        narf_wireless::ccmp::protect(&Ccm, &good[..26], &key, 1, 0, 0, false, &mut body)
+            .map_err(|_| "EU malformed aggregate CCMP")?;
+    let mut malformed = good[..26].to_vec();
+    malformed.extend_from_slice(&encrypted);
+    h.link
+        .0
+        .lock()
+        .raw_queue
+        .push_back(ht_record(&malformed, 32));
+    ensure!(
+        h.device.progress().is_empty(),
+        "EU bad final subframe published authenticated prefix"
+    );
+    h.link.0.lock().raw_queue.push_back(ht_record(&good, 32));
+    ensure!(
+        h.device.progress() == expected,
+        "EU bad MIC/subframe consumed PN"
+    );
+    Ok(())
+}
+fn smoke_rtl8188eu_ht20_amsdu_bad_mic_and_tail_preserve_whole_pn() -> TestResult {
+    ht_result(ht_aggregate_atomic_failure())
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/ht20",
+    smoke_rtl8188eu_ht20_amsdu_bad_mic_and_tail_preserve_whole_pn
+);
+fn ht_truncated() -> Result<(), &'static str> {
+    let h = Harness::new_profile(true, true)?;
+    h.scan()?;
+    h.join()?;
+    let (frame, _) = aggregate(&h, &[11, 13], 1, 0)?;
+    let mut raw = ht_record(&frame, 32);
+    raw.pop();
+    h.link.0.lock().raw_queue.push_back(raw);
+    ensure!(
+        h.device.progress().is_empty() && !h.device.link_up(),
+        "EU truncated native HT bulk record was accepted"
+    );
+    ensure!(
+        h.link.0.lock().stops == 0,
+        "EU malformed transfer fabricated USB stop proof"
+    );
+    Ok(())
+}
+fn smoke_rtl8188eu_ht20_truncated_usb_record_is_terminal() -> TestResult {
+    ht_result(ht_truncated())
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/ht20",
+    smoke_rtl8188eu_ht20_truncated_usb_record_is_terminal
 );

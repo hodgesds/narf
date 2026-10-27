@@ -108,7 +108,7 @@ impl Receiver {
         let ht = ht.ok_or(Error::UnsupportedFirmware)?;
         let operation = operation.ok_or(Error::UnsupportedFirmware)?;
         // Rate/NSS do not change the native MSDU layout. The typed5GHz
-        // VHT companion can promise RX2/TX1 after actual NIC qualification.
+        // HT/VHT companion can promise RX2 after actual NIC qualification.
         // Take that bound from the completed typed profile: received_ies()
         // is intentionally a sanitized HT pair, not the original VHT offer.
         // Older standalone preparation retains its first-stream bound.

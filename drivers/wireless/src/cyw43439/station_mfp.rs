@@ -1,11 +1,61 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Required-PMF WPA2 offload admission. Native BRCMF_MFP modes and association
+//! Native WPA2 PMF-policy admission. Configuration is not negotiated proof.
+//! BRCMF_MFP modes and association
 //! receipts follow Linux brcmfmac/{feature,cfg80211}.c, fwil_types.h.
 use super::{policy::TxGrant, Error, Fullmac, Station, MAX_REPLY};
 use narf_wireless::rsn::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct Profile(bool);
+pub(super) struct Profile {
+    mode: u32,
+    ap_mfp: u16,
+}
+
+/// Shared decoding intentionally accepts optional RSN fields. This native
+/// security boundary additionally requires exact consumption, before a missing
+/// group-management suite can acquire its IEEE default meaning.
+fn exact_body(body: &[u8]) -> Result<RsnIe, Error> {
+    let mut at = 6usize; // version and group cipher, checked by the decoder.
+    for _ in 0..2 {
+        let end = at.checked_add(2).ok_or(Error::Malformed)?;
+        let count = u16::from_le_bytes(
+            body.get(at..end)
+                .ok_or(Error::Malformed)?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        at = end
+            .checked_add(count.checked_mul(4).ok_or(Error::Malformed)?)
+            .ok_or(Error::Malformed)?;
+        if at > body.len() {
+            return Err(Error::Malformed);
+        }
+    }
+    if at < body.len() {
+        // Capabilities may be absent for a valid legacy18-byte body, but
+        // never partial. The same applies to the subsequent PMKID count.
+        at = at
+            .checked_add(2)
+            .filter(|end| *end <= body.len())
+            .ok_or(Error::Malformed)?;
+        if at < body.len() {
+            let end = at.checked_add(2).ok_or(Error::Malformed)?;
+            let count = u16::from_le_bytes(
+                body.get(at..end)
+                    .ok_or(Error::Malformed)?
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            at = end
+                .checked_add(count.checked_mul(16).ok_or(Error::Malformed)?)
+                .ok_or(Error::Malformed)?;
+            if at > body.len() || !matches!(body.len() - at, 0 | 4) {
+                return Err(Error::Malformed);
+            }
+        }
+    }
+    RsnIe::decode_body(body).ok_or(Error::Malformed)
+}
 
 fn rsn(mut ies: &[u8]) -> Result<Option<RsnIe>, Error> {
     // Apply the existing association IE bound before traversing a public
@@ -22,7 +72,7 @@ fn rsn(mut ies: &[u8]) -> Result<Option<RsnIe>, Error> {
             if result.is_some() {
                 return Err(Error::Malformed);
             }
-            result = Some(RsnIe::decode_body(body).ok_or(Error::Malformed)?);
+            result = Some(exact_body(body)?);
         }
         ies = &ies[end..];
     }
@@ -40,7 +90,7 @@ impl Profile {
         let sme = rsn(sme)?;
         if !secure {
             return if ap.is_none() && sme.is_none() {
-                Ok(Self(false))
+                Ok(Self { mode: 0, ap_mfp: 0 })
             } else {
                 Err(Error::Unsupported)
             };
@@ -52,44 +102,54 @@ impl Profile {
                 return Err(Error::Unsupported);
             }
         }
-        let required = ap.rsn_capabilities & RSN_CAP_MFP_REQUIRED != 0
-            || sme
-                .as_ref()
-                .is_some_and(|ie| ie.rsn_capabilities & RSN_CAP_MFP_REQUIRED != 0);
-        if required
-            && (!supported
-                || ap.rsn_capabilities & RSN_CAP_MFP_CAPABLE == 0
-                || sme
-                    .as_ref()
-                    // The canonical firmware request must not silently
-                    // discard a caller's additional security promises (OCV,
-                    // preauthentication, replay-counter modes, etc.).
-                    .is_some_and(|ie| {
-                        ie.rsn_capabilities != RSN_CAP_MFP_REQUIRED | RSN_CAP_MFP_CAPABLE
-                    })
-                || core::iter::once(&ap).chain(sme.iter()).any(|ie| {
+        let flags = RSN_CAP_MFP_REQUIRED | RSN_CAP_MFP_CAPABLE;
+        let ap_mfp = ap.rsn_capabilities & flags;
+        // The caller's original RSNE encodes its explicit policy. An empty
+        // typed request preserves automatic required-PMF admission; it never
+        // silently enables optional PMF on an ordinary optional-capable AP.
+        let mode = match sme.as_ref().map(|ie| ie.rsn_capabilities & flags) {
+            Some(bits) if bits & RSN_CAP_MFP_REQUIRED != 0 => 2,
+            Some(RSN_CAP_MFP_CAPABLE) => 1,
+            None if ap_mfp & RSN_CAP_MFP_REQUIRED != 0 => 2,
+            _ => 0,
+        };
+        if sme
+            .as_ref()
+            .is_some_and(|ie| mode != 0 && ie.rsn_capabilities & !flags != 0)
+            || ap_mfp & RSN_CAP_MFP_REQUIRED != 0 && mode == 0
+            || mode != 0 && !supported
+            || mode == 2 && ap_mfp & RSN_CAP_MFP_CAPABLE == 0
+            || mode != 0
+                && core::iter::once(&ap).chain(sme.iter()).any(|ie| {
                     ie.group_management_cipher
                         .is_some_and(|cipher| cipher != Suite::standard(CIPHER_BIP_CMAC_128))
-                }))
+                })
         {
             return Err(Error::Unsupported);
         }
-        Ok(Self(required))
+        Ok(Self { mode, ap_mfp })
     }
     pub(super) fn required(self) -> bool {
-        self.0
+        self.mode == 2
+    }
+    pub(super) fn verify(self) -> bool {
+        self.mode != 0
+    }
+    fn protected(self) -> bool {
+        self.mode != 0 && self.ap_mfp & RSN_CAP_MFP_CAPABLE != 0
     }
     pub(super) fn mode(self) -> u32 {
-        if self.0 {
-            2
-        } else {
-            0
-        }
+        self.mode
     }
     pub(super) fn rsn(self) -> RsnIe {
         let mut ie = RsnIe::wpa2_psk_ccmp();
-        if self.0 {
-            ie.rsn_capabilities = RSN_CAP_MFP_REQUIRED | RSN_CAP_MFP_CAPABLE;
+        if self.mode != 0 {
+            ie.rsn_capabilities = RSN_CAP_MFP_CAPABLE
+                | if self.required() {
+                    RSN_CAP_MFP_REQUIRED
+                } else {
+                    0
+                };
             ie.group_management_cipher = Some(Suite::standard(CIPHER_BIP_CMAC_128));
         }
         ie
@@ -102,12 +162,12 @@ impl<R: Fullmac> Station<R> {
         grant: TxGrant,
         peer: [u8; 6],
         profile: Profile,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         // FWSUP_COMPLETED already confirmed the firmware-owned handshake.
         // IGTK/BIP keys remain inside that offload, never fabricated or read
         // back into host memory. Verify actual firmware configuration and
         // the RSNE it transmitted, rather than the caller's desired flags.
-        if self.tx_query(grant, "mfp", 4).await?.as_slice() != [2, 0, 0, 0] {
+        if self.tx_query(grant, "mfp", 4).await?.as_slice() != profile.mode().to_le_bytes() {
             return Err(Error::Unsupported);
         }
         let bssid = self.tx_get(grant, 23, &[], 6).await?;
@@ -124,9 +184,44 @@ impl<R: Fullmac> Station<R> {
             return Err(Error::Malformed);
         }
         let ies = self.tx_query(grant, "assoc_req_ies", length).await?;
-        if ies.len() != length || rsn(&ies)? != Some(profile.rsn()) {
+        let mut request = rsn(&ies)?.ok_or(Error::Unsupported)?;
+        // IEEE default group-management suite is BIP-CMAC128 when omitted.
+        // Normalize only that semantic default, never a different promise.
+        if request.group_management_cipher.is_none() {
+            request.group_management_cipher = Some(Suite::standard(CIPHER_BIP_CMAC_128));
+        }
+        if ies.len() != length || request != profile.rsn() {
             return Err(Error::Unsupported);
         }
-        Ok(())
+        // CAPABLE1 is policy, not an assertion that PMF was negotiated. For
+        // an optional protected association require original AP response RSN
+        // evidence as well as the firmware-owned completed key exchange.
+        let actual = if response == 0 {
+            None
+        } else {
+            let ies = self.tx_query(grant, "assoc_resp_ies", response).await?;
+            if ies.len() != response {
+                return Err(Error::Malformed);
+            }
+            rsn(&ies)?
+        };
+        if let Some(actual) = actual {
+            let ccmp = Suite::standard(CIPHER_CCMP_128);
+            if actual.group_cipher != ccmp
+                || !actual.pairwise_ciphers.contains(&ccmp)
+                || !actual.akms.contains(&Suite::standard(AKM_PSK))
+                || !actual.pmkids.is_empty()
+                || actual.rsn_capabilities & (RSN_CAP_MFP_REQUIRED | RSN_CAP_MFP_CAPABLE)
+                    != profile.ap_mfp
+                || actual
+                    .group_management_cipher
+                    .is_some_and(|cipher| cipher != Suite::standard(CIPHER_BIP_CMAC_128))
+            {
+                return Err(Error::Unsupported);
+            }
+        } else if profile.mode() == 1 && profile.protected() {
+            return Err(Error::Unsupported);
+        }
+        Ok(profile.protected())
     }
 }

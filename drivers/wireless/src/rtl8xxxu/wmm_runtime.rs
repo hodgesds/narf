@@ -13,6 +13,9 @@ use narf_wireless::reg::RegulatoryDomain;
 use narf_wireless::wmm::Parameters;
 
 pub(super) fn words(p: Parameters, short: bool) -> Result<[u32; 4], Error> {
+    words_profile(p, short, false)
+}
+pub(super) fn words_profile(p: Parameters, short: bool, ht: bool) -> Result<[u32; 4], Error> {
     if p.ac[0].admission_control
         || p.ac.iter().any(|a| {
             a.ecw_min == 0
@@ -29,7 +32,7 @@ pub(super) fn words(p: Parameters, short: bool) -> Result<[u32; 4], Error> {
     for (i, a) in p.ac.iter().enumerate() {
         let aifs = u32::from(if i == 0 { a.aifsn.max(3) } else { a.aifsn })
             * if short { 9 } else { 20 }
-            + 10;
+            + if ht { 16 } else { 10 };
         if aifs > 255 {
             return Err(Error::State);
         }
@@ -49,6 +52,19 @@ pub(super) struct Proof {
     model: Option<Arc<narf_lib::sync::IrqSafeSpinLock<RegulatoryDomain>>>,
 }
 impl Proof {
+    pub(super) fn calibration(&self) -> &Calibration {
+        &self.calibration
+    }
+    pub(super) fn permission(&self) -> Permission {
+        self.permission
+    }
+    pub(super) fn domain(&self) -> Result<narf_wireless::reg::RegulatoryDomain, Error> {
+        #[cfg(any(test, feature = "kernel-test"))]
+        if let Some(model) = &self.model {
+            return Ok(model.lock().clone());
+        }
+        narf_wireless::reg::db::get_domain().ok_or(Error::Policy)
+    }
     pub(super) fn registered(
         factory: Factory,
         vid: u16,

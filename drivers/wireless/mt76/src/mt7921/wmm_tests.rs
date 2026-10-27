@@ -26,8 +26,17 @@ pub(super) fn prepared(wmm: bool, wpa2: bool) -> (Session<Model>, ScanBss) {
     prepared_with_chip(wmm, wpa2, 0)
 }
 pub(super) fn prepared_with_chip(wmm: bool, wpa2: bool, chip_id: u16) -> (Session<Model>, ScanBss) {
+    prepared_with_phy(wmm, wpa2, chip_id, None)
+}
+pub(super) fn prepared_with_phy(
+    wmm: bool,
+    wpa2: bool,
+    chip_id: u16,
+    phy: Option<[u8; 12]>,
+) -> (Session<Model>, ScanBss) {
     let mut model = Model::new();
     model.chip_id = chip_id;
+    model.phy_capability = phy;
     let ap = if wpa2 {
         FakeAp::wpa2(NETWORK, b"narf", 6, 42, [0x55; 32], [0xaa; 32])
     } else {

@@ -500,6 +500,13 @@ pub trait WirelessNetIface: Interface {
         false
     }
 
+    /// The firmware PSK owner accepts an explicit optional-PMF policy and
+    /// verifies the admitted native request/response before opening its port.
+    /// This does not follow from cipher or required-PMF support alone.
+    fn supports_optional_mfp(&self) -> bool {
+        false
+    }
+
     /// The driver performs the WPA3-Personal SAE exchange and key setup from a
     /// supplied password (NL80211_EXT_FEATURE_SAE_OFFLOAD). Distinct from
     /// [`supports_handshake_offload`](Self::supports_handshake_offload): a

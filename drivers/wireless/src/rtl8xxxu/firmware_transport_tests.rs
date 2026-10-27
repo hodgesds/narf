@@ -88,7 +88,7 @@ pub(super) struct Model {
     config: Vec<u8>,
     llt: Vec<(u8, u8)>,
     llt_stalled: bool,
-    fail_write: Option<u16>,
+    pub(super) fail_write: Option<u16>,
     cam_stalled: bool,
     iq_failure: bool,
     rf_read: u8,
@@ -141,6 +141,9 @@ impl Fake {
 
 #[async_trait::async_trait]
 impl ControlIo for Fake {
+    fn inert_source_fixture(&self) -> bool {
+        true
+    }
     fn identity(&self) -> Option<(u16, u16)> {
         Some((0x0bda, 0x8179))
     }
@@ -1097,7 +1100,7 @@ pub(super) struct Bulk {
     pub(super) state: Arc<IrqSafeSpinLock<BulkState>>,
 }
 impl Bulk {
-    fn new(control: Fake) -> Self {
+    pub(super) fn new(control: Fake) -> Self {
         Self {
             control,
             state: Arc::new(IrqSafeSpinLock::new(BulkState::default())),
@@ -1334,6 +1337,22 @@ pub(super) fn initialized_firmware() -> (Fake, Arc<Owner<Fake>>) {
     let control = Fake::new();
     let owner = Arc::new(Owner::new(control.clone(), ChipFamily::Rtl8188eu));
     narf_scheduler::block_on(owner.initialize_device(&image(123))).unwrap();
+    (control, owner)
+}
+pub(super) fn initialized_registered_firmware() -> (Fake, Arc<Owner<Fake>>) {
+    static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+    let name = Box::leak(
+        alloc::format!(
+            "narf-test/rtl8xxxu/retained-ht-{}.bin",
+            NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        )
+        .into_boxed_str(),
+    );
+    let (write, read) = narf_firmware::bootstrap_authority();
+    crate::firmware_asset::tests::install(&write, name, &image(123), true).unwrap();
+    let control = Fake::new();
+    let owner = Arc::new(Owner::new(control.clone(), ChipFamily::Rtl8188eu));
+    narf_scheduler::block_on(owner.initialize_registered_from(&read, name)).unwrap();
     (control, owner)
 }
 

@@ -435,7 +435,7 @@ pub async fn scan_active_with_ies(
     result
 }
 
-/// Prepare the first legacy20 MHz station hardware context for a BSS from
+/// Prepare the selected legacy/HT20/qualified HT40 context for a BSS from
 /// a completed native scan, constrained by the installed authenticated host
 /// regulatory policy and immutable EEPROM CTL. This sends no MLME/data frame,
 /// installs no keys and publishes no interface or carrier. Ambiguous firmware
@@ -448,8 +448,16 @@ pub async fn prepare_station(
         .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
     let owner = live_radio(&mut session)?;
+    let quarantine = owner.quarantine.clone();
     let mut radio = owner.radio.lock().await;
-    let result = radio.prepare_station(&domain, bssid, frequency).await;
+    let permission = radio.station_permission(&domain, bssid, frequency)?;
+    let validate = || current_station(permission, &quarantine);
+    let result = radio
+        .prepare_station_checked(&domain, bssid, frequency, &validate)
+        .await;
+    if result.is_err() {
+        radio.fail_station_data();
+    }
     if let Some(controller) = CONTROLLER.lock().as_mut() {
         controller.station_prepared = radio.prepared_peer();
         if let Err(error) = &result {
@@ -472,8 +480,18 @@ pub async fn exchange_initial_management(
         .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
     let owner = live_radio(&mut session)?;
+    let quarantine = owner.quarantine.clone();
     let mut radio = owner.radio.lock().await;
-    let result = radio.exchange_initial_management(&domain, frame).await;
+    let permission = radio.retained_station_permission()?;
+    let validate = || current_station(permission, &quarantine);
+    let result = super::wmi_runtime::checked_policy(
+        radio.exchange_initial_management(&domain, frame),
+        &validate,
+    )
+    .await;
+    if result.is_err() {
+        radio.fail_station_data();
+    }
     if let Some(controller) = CONTROLLER.lock().as_mut() {
         controller.station_prepared = radio.prepared_peer();
         if let Err(error) = &result {
@@ -494,10 +512,16 @@ pub async fn associate_station(
         .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
     let owner = live_radio(&mut session)?;
+    let quarantine = owner.quarantine.clone();
     let mut radio = owner.radio.lock().await;
+    let permission = radio.retained_station_permission()?;
+    let validate = || current_station(permission, &quarantine);
     let result = radio
-        .associate_station(&domain, ssid, security, sme_ies)
+        .associate_station_checked(&domain, ssid, security, sme_ies, &validate)
         .await;
+    if result.is_err() {
+        radio.fail_station_data();
+    }
     if let Some(controller) = CONTROLLER.lock().as_mut() {
         controller.station_prepared = radio.prepared_peer();
         if let Err(error) = &result {
@@ -535,7 +559,42 @@ pub async fn start_station_data(
     let mut session = SESSION.lock().await;
     let owner = live_radio(&mut session)?;
     let mut radio = owner.radio.lock().await;
-    radio.start_station_data(&domain, pmk).await
+    let permission = radio.retained_station_permission()?;
+    let quarantine = owner.quarantine.clone();
+    let validate = || current_station(permission, &quarantine);
+    radio
+        .start_data_with_nonce_checked(
+            &domain,
+            pmk,
+            || {
+                let mut bytes = [0; 32];
+                narf_crypto::try_fill_random_bytes(&mut bytes)
+                    .ok()
+                    .map(|()| bytes)
+            },
+            &validate,
+        )
+        .await
+}
+
+/// Submit native RTS/CTS intent only after draining the actual current packet
+/// owner. Success is CE submission/current-prefix proof, not a firmware/RF ACK.
+pub async fn set_station_protection(
+    request: super::wmi_runtime::StationProtection,
+) -> Result<super::wmi_runtime::StationProtection, super::wmi_runtime::Error> {
+    let mut session = SESSION.lock().await;
+    let owner = live_radio(&mut session)?;
+    let quarantine = owner.quarantine.clone();
+    let mut radio = owner.radio.lock().await;
+    radio
+        .set_station_protection(request, || {
+            if quarantine.load(core::sync::atomic::Ordering::Acquire) {
+                return Err(super::wmi_runtime::Error::Failed);
+            }
+            narf_wireless::reg::db::ensure_domain()
+                .map_err(|_| super::wmi_runtime::Error::Unsupported)
+        })
+        .await
 }
 
 /// Submit Ethernet through the same retained RAW-mode data owner. The ID is
@@ -545,8 +604,17 @@ pub async fn transmit_ethernet(bytes: &[u8]) -> Result<u16, super::wmi_runtime::
         .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
     let owner = live_radio(&mut session)?;
+    let quarantine = owner.quarantine.clone();
     let mut radio = owner.radio.lock().await;
-    radio.transmit_ethernet(&domain, bytes).await
+    let permission = radio.retained_station_permission()?;
+    let validate = || current_station(permission, &quarantine);
+    let result =
+        super::wmi_runtime::checked_policy(radio.transmit_ethernet(&domain, bytes), &validate)
+            .await;
+    if result.is_err() {
+        radio.fail_station_data();
+    }
+    result
 }
 
 /// Drive actual peer/completion/RAW RX and return admitted Ethernet only after
@@ -557,8 +625,27 @@ pub async fn poll_ethernet(
         .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
     let owner = live_radio(&mut session)?;
+    let quarantine = owner.quarantine.clone();
     let mut radio = owner.radio.lock().await;
-    radio.poll_ethernet(&domain).await
+    let permission = radio.retained_station_permission()?;
+    let validate = || current_station(permission, &quarantine);
+    let result = super::wmi_runtime::checked_policy(radio.poll_ethernet(&domain), &validate).await;
+    if result.is_err() {
+        radio.fail_station_data();
+    }
+    result
+}
+
+fn current_station(
+    permission: super::regulatory::Permission,
+    quarantine: &core::sync::atomic::AtomicBool,
+) -> Result<(), super::wmi_runtime::Error> {
+    if quarantine.load(core::sync::atomic::Ordering::Acquire) {
+        return Err(super::wmi_runtime::Error::Failed);
+    }
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
+    permission.check(&domain)
 }
 
 /// Human-readable driver name keyed on the matched `(vendor, device)`.
@@ -795,6 +882,7 @@ async fn boot_task(
                 let profile = super::profile::Profile::select(device.id.device, info.version)
                     .ok_or(super::firmware::Error::Unsupported)?;
                 let mut files = super::firmware::RegistryFiles::wait_authority().await?;
+                bmi.transport.bind_sources(files.source());
                 let image = super::firmware::Image::wait_load(&mut files, profile).await?;
                 let identity = super::firmware::Identity {
                     vendor: device.id.vendor,
@@ -807,6 +895,7 @@ async fn boot_task(
                     .map_err(|_| super::firmware::Error::Unsupported)?;
                 super::firmware::prepare(&mut bmi, &mut files, profile, identity, variant, &image)
                     .await?;
+                files.seal()?;
                 let status = FirmwarePrepared {
                     directory: profile.directory,
                     api: image.api,

@@ -21,13 +21,15 @@ pub use crate::qualcomm_regulatory::{Factory, FactoryError};
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;
 
-/// Bound, additional host power ceiling for the initial legacy 20 MHz
+/// Bound, additional host power ceiling for the occupied station channel.
 /// station profile. Factory CTL and calibration stay active in firmware.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Permission {
     pub factory: Factory,
     pub country: [u8; 2],
     pub frequency: u16,
+    pub center: u16,
+    pub secondary: Option<u16>,
     pub half_dbm: u8,
 }
 impl Permission {
@@ -43,6 +45,14 @@ impl Permission {
         domain: &narf_wireless::reg::RegulatoryDomain,
         frequency: u16,
     ) -> Result<Self, Error> {
+        Self::occupied(caps, domain, frequency, None)
+    }
+    pub fn occupied(
+        caps: &super::wmi_boot::Capabilities,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        frequency: u16,
+        secondary: Option<u16>,
+    ) -> Result<Self, Error> {
         // Linux's strict initial custom world domain admits 1..11 to
         // initiate radiation; channels requiring beacon-hint/DFS state
         // are not promoted by this first station profile.
@@ -57,16 +67,19 @@ impl Permission {
         } else {
             (caps.low_5ghz, caps.high_5ghz)
         };
-        if !(low_band..=high_band).contains(&u32::from(frequency)) {
+        if !(low_band..=high_band).contains(&u32::from(frequency))
+            || secondary.is_some_and(|s| !(low_band..=high_band).contains(&u32::from(s)))
+        {
             return Err(Error::Unsupported);
         }
         let factory = Factory::from_eeprom(caps.eeprom_domain).map_err(|_| Error::Unsupported)?;
-        Self::from_factory(factory, domain, frequency)
+        Self::from_factory(factory, domain, frequency, secondary)
     }
     fn from_factory(
         factory: Factory,
         domain: &narf_wireless::reg::RegulatoryDomain,
         frequency: u16,
+        secondary: Option<u16>,
     ) -> Result<Self, Error> {
         let two_ghz = frequency < 3000;
         use narf_wireless::reg::RegFlags;
@@ -80,9 +93,18 @@ impl Permission {
         if !two_ghz && (factory.country == 0 || factory.alpha2 != domain.country_code) {
             return Err(Error::Unsupported);
         }
-        let center = u32::from(frequency);
-        let low = center - 10;
-        let high = center + 10;
+        if secondary.is_some_and(|s| {
+            !matches!(
+                (frequency.min(s), frequency.max(s)),
+                (5180, 5200) | (5220, 5240) | (5745, 5765) | (5785, 5805)
+            )
+        }) {
+            return Err(Error::Unsupported);
+        }
+        let center = secondary.map_or(frequency, |s| (frequency + s) / 2);
+        let width = if secondary.is_some() { 40 } else { 20 };
+        let low = u32::from(center) - width / 2;
+        let high = u32::from(center) + width / 2;
         let mut covering = false;
         let mut ceiling = None;
         for r in &domain.rules {
@@ -92,7 +114,7 @@ impl Permission {
             // Any stricter overlapping rule remains restrictive. A second
             // permissive rule cannot erase DFS, narrow bandwidth or power.
             if r.freq_start_mhz >= r.freq_end_mhz
-                || r.max_bandwidth_mhz < 20
+                || r.max_bandwidth_mhz < width
                 // This STA profile has no DFS/indoor qualification. NO_P2P
                 // does not restrict STA; unknown future restrictions are not
                 // silently promoted by a second permissive overlapping row.
@@ -117,13 +139,15 @@ impl Permission {
             factory,
             country: domain.country_code,
             frequency,
+            center,
+            secondary,
             half_dbm,
         })
     }
     /// Recheck the chosen immutable factory/frequency receipt against the
     /// current host policy without querying or inventing hardware facts.
     pub fn check(self, domain: &narf_wireless::reg::RegulatoryDomain) -> Result<(), Error> {
-        if Self::from_factory(self.factory, domain, self.frequency)? != self {
+        if Self::from_factory(self.factory, domain, self.frequency, self.secondary)? != self {
             return Err(Error::Unsupported);
         }
         Ok(())

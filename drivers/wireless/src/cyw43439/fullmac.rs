@@ -19,6 +19,9 @@ pub trait Fullmac: Send {
     /// Exact attached chip profile supports the firmware's 5 GHz channel set.
     /// The SDIO CYW43439 profile remains 2.4 GHz only.
     const BAND_5GHZ: bool = false;
+    /// Exact attached native family can qualify VHT80 from its firmware.
+    /// CYW43439 has no such PHY, regardless of malformed capability replies.
+    const VHT80: bool = false;
     fn command<'a>(
         &'a mut self,
         direction: Direction,

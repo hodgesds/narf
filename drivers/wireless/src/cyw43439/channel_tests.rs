@@ -2,6 +2,77 @@
 use super::*;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+fn smoke_fullmac_occupied_vht80_literal_sidebands_and_exact_span() -> TestResult {
+    for (primary, center, spec, low, high) in [
+        (36, 42, 0xe02a, 5170, 5250),
+        (40, 42, 0xe12a, 5170, 5250),
+        (44, 42, 0xe22a, 5170, 5250),
+        (48, 42, 0xe32a, 5170, 5250),
+        (149, 155, 0xe09b, 5735, 5815),
+        (153, 155, 0xe19b, 5735, 5815),
+        (157, 155, 0xe29b, 5735, 5815),
+        (161, 155, 0xe39b, 5735, 5815),
+    ] {
+        let Some(value) = Operating::eighty(primary, center) else {
+            return TestResult::Fail("literal native80MHz sideband rejected");
+        };
+        if value.width() != 80
+            || value.chanspec() != spec
+            || value.span() != (low, high)
+            || value.constituents()
+                != [
+                    Some(center - 6),
+                    Some(center - 2),
+                    Some(center + 2),
+                    Some(center + 6),
+                ]
+            || Operating::decode80(spec) != Some(value)
+        {
+            return TestResult::Fail("native80MHz center/sideband lost full four-quarter geometry");
+        }
+    }
+    for (primary, center) in [
+        (6, 42),
+        (36, 38),
+        (36, 50),
+        (165, 171),
+        (169, 171),
+        (165, 155),
+        (48, 58),
+    ] {
+        if Operating::eighty(primary, center).is_some() {
+            return TestResult::Fail("unsupported80MHz constituent/center promoted");
+        }
+    }
+    let mut count = 0;
+    for spec in 0..=u16::MAX {
+        if let Some(value) = Operating::decode80(spec) {
+            count += 1;
+            if value.chanspec() != spec
+                || value.span().1 - value.span().0 != 80
+                || primary(spec, 0) != Some(value.primary)
+                || value
+                    .constituents()
+                    .into_iter()
+                    .flatten()
+                    .any(|ch| frequency(ch).is_none())
+            {
+                return TestResult::Fail(
+                    "bounded80MHz native decoder violated exact roundtrip/span",
+                );
+            }
+        }
+    }
+    if count != 24 {
+        return TestResult::Fail("qualified80MHz center inventory changed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/channel",
+    smoke_fullmac_occupied_vht80_literal_sidebands_and_exact_span
+);
+
 fn smoke_fullmac_occupied_ht40_literal_spans_and_exact_chanspec_roundtrips() -> TestResult {
     // IEEE20MHz constituent spacing and Linux D11AC center/sideband values.
     for (primary, secondary, spec, low, high) in [

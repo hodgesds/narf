@@ -4,10 +4,10 @@ use crate::mt7921::association::Security;
 
 pub(super) fn elements(channel: u8) -> Vec<u8> {
     let mut ht = [0; 26];
-    ht[0] = 0x77; // AP: SGI20/dynamic SMPS retained; LDPC/40/greenfield intersected away.
+    ht[0] = 0x77; // AP SGI20, dynamic SMPS, LDPC, greenfield and40.
     ht[2] = 30; // AP RX factor2/density7, not an active BA agreement.
     ht[3] = 0xff;
-    ht[4] = 0xff; // AP has two streams; local retained profile offers one.
+    ht[4] = 0xff; // Actual two-stream AP; native NIC facts bound the local offer.
     let mut operation = [0; 22];
     operation[0] = channel;
     operation[1] = 5; // AP permits40MHz; station still selects primary20MHz.
@@ -77,9 +77,11 @@ fn mt76_ht20_native_peer_rlm_rates_and_bound_association() -> TestResult {
                     && frame.get(10..16) == Some(super::amsdu_rx_tests::OWN.as_slice())
             });
             let mut expected = [0; 26];
-            expected[0] = 32;
+            expected[0] = 61;
+            expected[1] = 1;
             expected[2] = 28;
             expected[3] = 255;
+            expected[4] = 255;
             expected[15] = 1;
             if request.is_none_or(|(_, frame)| {
                 !frame
@@ -102,11 +104,11 @@ fn mt76_ht20_native_peer_rlm_rates_and_bound_association() -> TestResult {
             };
             if peer[82] != if channel <= 14 { 19 } else { 24 }
                 || peer[83] != 30
-                || peer[94..104] != [255, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                || peer[94..104] != [255, 255, 0, 0, 0, 0, 0, 0, 0, 0]
                 || peer[118..124] != [72, 0, 1, 1, 5, 0]
-                || peer[168..180] != [2, 0, 12, 0, 1, 0, 2, 7, 0, 0, 0, 0]
+                || peer[168..180] != [2, 0, 12, 0, 1, 1, 2, 7, 0, 0, 0, 0]
                 || peer[180..188] != [13, 0, 8, 0, 1, 0, 0, 0]
-                || peer[188..196] != [9, 0, 8, 0, 36, 0, 0, 0]
+                || peer[188..196] != [9, 0, 8, 0, 53, 0, 0, 0]
             {
                 return TestResult::Fail(
                     "HT/PHY/RA/WTBL/SMPS native fields or stream intersection",
@@ -125,7 +127,7 @@ fn mt76_ht20_native_peer_rlm_rates_and_bound_association() -> TestResult {
                         channel,
                         0,
                         0,
-                        1,
+                        2,
                         3,
                         1,
                         0,
@@ -172,7 +174,7 @@ fn mt76_ht20_sgi_intersects_bound_response_without_changing_width_or_smps() -> T
                 if join(&mut session, &bss, true) != Ok(42)
                     || session
                         .ht20_profile
-                        .is_none_or(|p| p.short_gi() != response_sgi)
+                        .is_none_or(|p| p.short_gi() != (scan_sgi && response_sgi))
                 {
                     return TestResult::Fail(
                         "SGI20 used a stale scan capability instead of the bound AP response",
@@ -182,7 +184,17 @@ fn mt76_ht20_sgi_intersects_bound_response_without_changing_width_or_smps() -> T
                     p.len() >= 196 && p[34..36] == [3, 0] && p[43] == 7 && p[65] == 1
                 });
                 if peer.is_none_or(|(_, p)| {
-                    p[188..196] != [9, 0, 8, 0, if response_sgi { 36 } else { 4 }, 0, 0, 0]
+                    p[188..196]
+                        != [
+                            9,
+                            0,
+                            8,
+                            0,
+                            if scan_sgi && response_sgi { 53 } else { 21 },
+                            0,
+                            0,
+                            0,
+                        ]
                         || p[180..188] != [13, 0, 8, 0, 1, 0, 0, 0]
                         || p[122] != 5
                 }) {
@@ -252,7 +264,7 @@ fn mt76_ht20_ap_downgrade_and_unsupported_mcs_fail_before_peer_activation() -> T
             0 => session.backend.ht_reply = None,
             1 => session.backend.ht_reply.as_mut().unwrap()[3] |= 8, // reserved AP SMPS2/3 mutation below
             2 => {
-                let index = bss.information_elements.len() - 22 + 7;
+                let index = bss.information_elements.len() - 22 + 8;
                 bss.information_elements[index] = 1;
             }
             _ => {

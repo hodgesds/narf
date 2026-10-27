@@ -78,6 +78,7 @@ struct Model {
     wait: bool,
     kicks: Vec<u16>,
     observed: Vec<Vec<u8>>,
+    descriptors: Vec<Vec<u8>>,
     slots: [usize; 7],
     commands: Vec<(u8, Vec<u8>)>,
     reserved: Vec<Vec<u8>>,
@@ -108,6 +109,7 @@ impl PacketPort {
                 wait: false,
                 kicks: Vec::new(),
                 observed: Vec::new(),
+                descriptors: Vec::new(),
                 slots: [0; 7],
                 commands: Vec::new(),
                 reserved: Vec::new(),
@@ -122,6 +124,15 @@ impl PacketPort {
         }
     }
     fn emit(&self, bytes: &[u8]) -> Result<(), Error> {
+        self.emit_native(bytes, 0, 0, None)
+    }
+    fn emit_native(
+        &self,
+        bytes: &[u8],
+        report: u32,
+        extra: u32,
+        phy: Option<&[u8]>,
+    ) -> Result<(), Error> {
         let slot = {
             let mut model = self.model.lock();
             let slot = model.rx_next;
@@ -134,7 +145,20 @@ impl PacketPort {
         }
         let mut wire = bytes.to_vec();
         wire.extend_from_slice(&[0; 4]);
-        self.inject(slot, &wire, 1 << 27, 0, 0);
+        let buffer = self.inject(slot, &wire, 1 << 27, report, extra);
+        if let Some(phy) = phy {
+            // Literal native shift2/driver-info32. No encoder produces the
+            // expected PHY fields or the independently injected packet body.
+            buffer.bytes.lock()[2..2 + phy.len()].copy_from_slice(phy);
+            buffer.bytes.lock()[34..34 + wire.len()].copy_from_slice(&wire);
+            let mut descriptor = ring.bytes.lock();
+            let status = word(&descriptor, slot * 32);
+            put(
+                &mut descriptor,
+                slot * 32,
+                (status & !(15 << 16)) | (4 << 16) | (1 << 26),
+            );
+        }
         Ok(())
     }
     fn release_held(&self) {
@@ -211,7 +235,17 @@ impl PacketPort {
         put(
             &mut descriptor,
             slot * 32,
-            bytes.len() as u32 | eor | (3 << 28) | (2 << 16) | (2 << 24) | status_extra,
+            bytes.len() as u32
+                | eor
+                | (3 << 28)
+                | (2 << 16)
+                | (2 << 24)
+                | status_extra
+                | if bytes.first().is_some_and(|f| f & 0x8c == 0x88) {
+                    1 << 23
+                } else {
+                    0
+                },
         );
         put(&mut descriptor, slot * 32 + 4, extra);
         put(&mut descriptor, slot * 32 + 8, 0);
@@ -309,6 +343,12 @@ impl Io for PacketPort {
     }
 }
 impl Port for PacketPort {
+    fn publication(&self) -> Result<Publication, Error> {
+        let io = self.clone();
+        Ok(Publication::model(Arc::new(move || {
+            io.authority(true, || Ok(()))
+        })))
+    }
     type Buffer = Block;
     fn authority<T>(
         &self,
@@ -401,6 +441,7 @@ impl Port for PacketPort {
             return Ok(());
         }
         self.model.lock().observed.push(bytes.clone());
+        self.model.lock().descriptors.push(descriptor.clone());
         let peer = { self.model.lock().peer.clone() };
         let mut held = false;
         if let Some(peer) = peer {

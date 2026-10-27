@@ -20,6 +20,8 @@ mod data;
 mod ht;
 mod mlme;
 mod power_save;
+mod protection;
+pub use protection::Request as StationProtection;
 mod wmm;
 pub use data::Link as StationLink;
 pub use mlme::Associated as StationAssociated;
@@ -96,6 +98,7 @@ pub(super) struct Radio<T> {
     pending: VecDeque<htt::Event>,
     failed: bool,
     power_save: Option<bool>,
+    protection: Option<StationProtection>,
 }
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) fn configured_channels(&self) -> &[u16] {
@@ -122,6 +125,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             pending: VecDeque::new(),
             failed: false,
             power_save: None,
+            protection: None,
         }
     }
     /// No country policy is inferred here: these are receive-only IEEE
@@ -444,6 +448,8 @@ mod station;
 pub struct PeerPrepared {
     pub bssid: [u8; 6],
     pub frequency: u16,
+    pub center_frequency: u16,
+    pub bandwidth_mhz: u8,
     /// Sparse firmware ID, not an index bounded by resource peer count.
     pub peer_id: u16,
     pub maximum_power_dbm: u8,

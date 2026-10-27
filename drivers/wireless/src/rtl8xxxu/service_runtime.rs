@@ -62,6 +62,7 @@ pub struct Service<C: ControlIo, B: packet_transport::Io, E: Environment> {
     initial_nonce: Option<[u8; 32]>,
     own: [u8; 6],
     last_now: u64,
+    retire: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 impl<C: ControlIo, B: packet_transport::Io, E: Environment> core::fmt::Debug for Service<C, B, E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -80,7 +81,11 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
             return Err(Error::Profile);
         }
         let own = radio.local().ok_or(Error::State)?;
-        radio.start().await.map_err(Error::Radio)?;
+        radio
+            .authority()
+            .fence(radio.start(), core::convert::identity)
+            .await
+            .map_err(Error::Radio)?;
         let now = environment.now_ms();
         Ok(Self {
             radio: Some(radio),
@@ -92,6 +97,7 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
             initial_nonce: None,
             own,
             last_now: now,
+            retire: None,
         })
     }
     pub fn phase(&self) -> Phase {
@@ -113,6 +119,38 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
     }
     pub fn local(&self) -> [u8; 6] {
         self.own
+    }
+    pub(super) fn ht_enabled(&self) -> bool {
+        self.radio.as_ref().is_some_and(Receiver::ht_enabled)
+            || self.station.as_ref().is_some_and(Station::ht_enabled)
+    }
+    pub(super) fn close_flag(&self) -> Arc<AtomicBool> {
+        self.failed.clone()
+    }
+    pub(super) fn set_retirement(&mut self, retire: Arc<dyn Fn() + Send + Sync>) {
+        self.retire = Some(retire);
+    }
+    pub(super) fn current(&self) -> Result<receive_runtime::Authority, Error> {
+        if self.failed.load(Ordering::Acquire) {
+            return Err(Error::State);
+        }
+        let authority = if let Some(station) = &self.station {
+            station.authority()
+        } else {
+            self.radio.as_ref().ok_or(Error::State)?.authority()
+        };
+        authority.invoke(|| ()).map_err(Error::Radio)?;
+        Ok(authority)
+    }
+    pub(super) fn receive_open(&self) -> bool {
+        !self.failed.load(Ordering::Acquire)
+            && self
+                .station
+                .as_ref()
+                .is_some_and(Station::controlled_port_open)
+    }
+    pub(super) fn receive_epoch(&self) -> Option<(Arc<core::sync::atomic::AtomicU64>, u64)> {
+        self.station.as_ref().map(Station::receive_epoch)
     }
     pub fn connected_peer(&self) -> Option<[u8; 6]> {
         self.station
@@ -163,9 +201,12 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
                 let radio = self.radio.as_mut().ok_or(Error::State)?;
                 if let Some(frames) = radio.poll().map_err(Error::Radio)? {
                     for frame in frames {
-                        let Ok(candidate) =
-                            Candidate::from_receive(&frame, radio.channel(), self.own)
-                        else {
+                        let Ok(candidate) = Candidate::from_receive_with_phy(
+                            &frame,
+                            radio.channel(),
+                            self.own,
+                            radio.ht_local().as_ref(),
+                        ) else {
                             continue;
                         };
                         if let Some(entry) = self
@@ -240,8 +281,14 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
             .into_iter()
             .find(|b| b.bssid() == bssid && b.ssid() == ssid)
             .ok_or(Error::Profile)?;
-        let mut plan =
-            Join::prepare(candidate.clone(), self.own, ssid, mode).map_err(Error::Management)?;
+        let mut plan = Join::prepare_with_phy(
+            candidate.clone(),
+            self.own,
+            ssid,
+            mode,
+            self.radio.as_ref().and_then(Receiver::ht_local),
+        )
+        .map_err(Error::Management)?;
         plan.append_sme_ies(ies).map_err(Error::Management)?;
         if mode.is_wpa2() != pmk.is_some() {
             return Err(Error::Profile);
@@ -256,6 +303,7 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
         let radio = self.radio.take().ok_or(Error::State)?;
         let mut station = Station::new(radio, candidate, ssid, mode, pmk, self.permission)
             .map_err(Error::Station)?;
+        station.set_retirement(self.retire.clone());
         station.append_sme_ies(ies).map_err(Error::Station)?;
         self.initial_nonce = initial_nonce;
         self.station = Some(station);

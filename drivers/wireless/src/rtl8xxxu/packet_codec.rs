@@ -28,13 +28,68 @@ pub struct Mpdu {
     pub tid: u8,
     pub decrypted: bool,
     pub timestamp: u32,
+    pub(super) native: Option<[u32; 4]>,
+}
+impl Mpdu {
+    /// Native rxdesc16 is authoritative for encoding/width. Its old PHY block
+    /// contains SGI/RXSC, not a C21/C22 page or an independently reported channel.
+    pub(super) fn admitted(&self, ht_profile: bool) -> bool {
+        if self.decrypted || self.bandwidth40 {
+            return false;
+        }
+        if let Some([d0, d1, d2, d3]) = self.native {
+            if d1 & ((1 << 14) | (1 << 15) | (1 << 27)) != 0 || d2 & 0xf000 != 0 {
+                return false;
+            }
+            let qos = self.bytes.first() == Some(&0x88);
+            if qos != (d0 & (1 << 23) != 0) || d3 & ((1 << 10) | (1 << 11)) != 0 {
+                return false;
+            }
+            if qos {
+                let Some(q) = self.bytes.get(24..26) else {
+                    return false;
+                };
+                if q[0] & 15 != self.tid
+                    || q[0] & 0x70 != 0
+                    || q[1] != 0
+                    || (q[0] & 0x80 != 0) != (d1 & (1 << 13) != 0)
+                {
+                    return false;
+                }
+            } else if d1 & (1 << 13) != 0 {
+                return false;
+            }
+        }
+        if !self.ht {
+            return self.rate <= 11;
+        }
+        if !ht_profile || !(12..=19).contains(&self.rate) {
+            return false;
+        }
+        let Some([d0, d1, d2, d3]) = self.native else {
+            return false;
+        };
+        if d3 & 0xf80 != 0 || d1 & ((1 << 14) | (1 << 15) | (1 << 27)) != 0 || d2 & 0xf000 != 0 {
+            return false;
+        }
+        if (d0 & (1 << 26) != 0) == self.phy.is_empty()
+            || !self.phy.is_empty() && (self.phy.len() != 32 || self.phy[27] & 0x0e != 0)
+        {
+            return false;
+        }
+        let b = &self.bytes;
+        if b.len() < 24 || b[22] & 15 != 0 || b[1] & 4 != 0 {
+            return false;
+        }
+        true
+    }
 }
 impl narf_wireless::station_security::RawFrame for Mpdu {
     fn bytes(&self) -> &[u8] {
         &self.bytes
     }
     fn unmodified(&self) -> bool {
-        !self.decrypted && !self.ht && !self.bandwidth40 && self.rate <= 11
+        self.admitted(true)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,10 +146,7 @@ pub fn receive(bytes: &[u8]) -> Result<Vec<Record>, Error> {
             });
         } else if d0 & ((1 << 14) | (1 << 15)) == 0 {
             // No multi-descriptor reassembly is enabled in this profile.
-            if d0 & ((1 << 28) | (1 << 29)) != ((1 << 28) | (1 << 29))
-                || length < 10
-                || d1 & (1 << 13) != 0
-            {
+            if d0 & ((1 << 28) | (1 << 29)) != ((1 << 28) | (1 << 29)) || length < 10 {
                 return Err(Error::Descriptor);
             }
             records.push(Record::Frame(Mpdu {
@@ -110,6 +162,7 @@ pub fn receive(bytes: &[u8]) -> Result<Vec<Record>, Error> {
                 tid: ((d1 >> 5) & 15) as u8,
                 decrypted: d0 & (1 << 27) == 0 && d0 & (7 << 20) != 0,
                 timestamp: word(desc, 20),
+                native: Some([d0, d1, word(desc, 8), d3]),
             }));
         }
         if index + 1 < count {
@@ -128,7 +181,7 @@ pub fn transmit(frame: &[u8], kind: Kind) -> Result<Vec<u8>, Error> {
     transmit_rate(frame, kind, 0)
 }
 pub(super) fn transmit_rate(frame: &[u8], kind: Kind, rate: u8) -> Result<Vec<u8>, Error> {
-    if rate > 11 || kind == Kind::Management && rate != 0 {
+    if rate > 19 || kind == Kind::Management && rate != 0 {
         return Err(Error::Header);
     }
     if frame.len() < 24 || frame.len() > MAX_TRANSFER - TX_DESC {
@@ -143,7 +196,7 @@ pub(super) fn transmit_rate(frame: &[u8], kind: Kind, rate: u8) -> Result<Vec<u8
         Kind::Management
             if !management
                 || fc & 0x0300 != 0
-                || !matches!(frame[0], 0x00 | 0x20 | 0xa0 | 0xb0 | 0xc0) =>
+                || !matches!(frame[0], 0x00 | 0x20 | 0xa0 | 0xb0 | 0xc0 | 0xd0) =>
         {
             return Err(Error::Header)
         }
@@ -171,8 +224,12 @@ pub(super) fn transmit_rate(frame: &[u8], kind: Kind, rate: u8) -> Result<Vec<u8
     out[12..16].copy_from_slice(
         &(u32::from(u16::from_le_bytes([frame[22], frame[23]]) >> 4) << 16).to_le_bytes(),
     );
-    out[16..20]
-        .copy_from_slice(&((1u32 << 8) | if frame[0] == 0x88 { 1 << 6 } else { 0 }).to_le_bytes()); // USE_DRIVER_RATE/QOS
+    out[16..20].copy_from_slice(
+        &((1u32 << 8)
+            | if rate >= 12 { 1 << 10 } else { 0 }
+            | if frame[0] == 0x88 { 1 << 6 } else { 0 })
+        .to_le_bytes(),
+    ); // USE_DRIVER_RATE/DISABLE_DATA_FB/QOS
     out[20..24].copy_from_slice(
         &(if management {
             6u32 << 18 | 1 << 17

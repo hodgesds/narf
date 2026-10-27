@@ -6,8 +6,16 @@ use alloc::{string::String, sync::Arc};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::Interface;
 use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessError};
+#[path = "ht40_conversation_tests.rs"]
+mod ht40_conversation_tests;
 #[path = "ht_conversation_tests.rs"]
 mod ht_conversation_tests;
+#[path = "protection_conversation_tests.rs"]
+mod protection_conversation_tests;
+#[path = "sgi40_conversation_tests.rs"]
+mod sgi40_conversation_tests;
+#[path = "source_conversation_tests.rs"]
+mod source_conversation_tests;
 #[path = "wmm_conversation_tests.rs"]
 mod wmm_conversation_tests;
 fn five_ghz_policy() -> narf_wireless::reg::RegulatoryDomain {
@@ -56,12 +64,32 @@ impl Harness {
         frequency: u16,
         factory: u32,
     ) -> Self {
-        let mut radio = radio_boot_country(
+        Self::new_on_ht(
+            version,
+            dialect,
+            secured,
+            active_scan,
+            frequency,
+            factory,
+            None,
+        )
+    }
+    fn new_on_ht(
+        version: u32,
+        dialect: Dialect,
+        secured: bool,
+        active_scan: bool,
+        frequency: u16,
+        factory: u32,
+        ht: Option<u32>,
+    ) -> Self {
+        let mut radio = radio_boot_country_ht(
             version,
             dialect,
             (1 << 10) | (1 << 2) | if dialect == Dialect::Tlv { 1 << 18 } else { 0 },
             3,
             factory,
+            ht,
         );
         radio.htt.wmi.htc.transport.frequency = frequency;
         if active_scan {
@@ -885,6 +913,8 @@ enum TestPhy {
     Legacy,
     Wmm,
     Ht,
+    Ht40,
+    Sgi40,
 }
 fn composition_radio(
     version: u32,
@@ -896,13 +926,14 @@ fn composition_radio(
     phy: TestPhy,
 ) -> Result<(), &'static str> {
     let qos = phy != TestPhy::Legacy;
-    let h = Harness::new_on(
+    let h = Harness::new_on_ht(
         version,
         dialect,
         secured,
         active_scan,
         frequency,
         if frequency < 3000 { 0x64 } else { 0x8348 },
+        (phy == TestPhy::Sgi40).then_some(0x803),
     );
     if qos {
         h.model(|model| {
@@ -914,6 +945,12 @@ fn composition_radio(
     if phy == TestPhy::Ht {
         ht_conversation_tests::enable(&h);
         h.model(|m| m.data.as_mut().unwrap().rx_phy = Some((8, 7, 0x80)));
+    }
+    if phy == TestPhy::Ht40 {
+        ht40_conversation_tests::enable(&h)?;
+    }
+    if phy == TestPhy::Sgi40 {
+        sgi40_conversation_tests::enable(&h)?;
     }
     if power_save {
         h.model(|model| {

@@ -85,6 +85,7 @@ mod clock;
 pub mod control;
 pub mod dma;
 pub mod firmware;
+mod firmware_source;
 pub mod htc;
 pub mod htt;
 pub mod htt_runtime;

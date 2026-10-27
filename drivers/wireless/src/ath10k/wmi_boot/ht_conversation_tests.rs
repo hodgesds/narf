@@ -280,6 +280,10 @@ fn smoke_ath10k_ht_firmware_wmm_gates_keep_genuine_legacy_fallback() -> TestResu
             if case == 2 {
                 f.ht_request_sgi = false;
                 f.ht_sgi = false;
+                // The AP's original002c body remains unchanged. Native
+                // peer_ht_caps must mask SGI20 by actual local support,
+                // exactly as mac80211 does before PEER_ASSOC.
+                f.ht_capabilities = 0x000c;
             }
             if case == 3 {
                 f.wmm_offer = None;

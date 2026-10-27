@@ -138,6 +138,7 @@ where
     // authenticated host policy before station publication.
     const EXTERNAL_CLM: bool = false;
     const BAND_5GHZ: bool = true;
+    const VHT80: bool = true;
     async fn command<'a>(
         &'a mut self,
         direction: Direction,

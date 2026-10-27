@@ -56,6 +56,23 @@ pub struct RtlwifiDevice {
 static IFNAME: IrqSafeSpinLock<&'static str> = IrqSafeSpinLock::new("");
 
 impl RtlwifiDevice {
+    /// Provisioning metadata only; no measured gain or transmit permission.
+    pub fn ht20_request(&self) -> Result<super::Ht20Request, super::channel_power::Error> {
+        let factory = self
+            .factory
+            .as_ref()
+            .ok_or(super::channel_power::Error::Identity)?;
+        let base = super::channel_power::Calibration::load_registered(factory)?;
+        let firmware = self
+            .firmware
+            .as_ref()
+            .and_then(|f| f.identity())
+            .ok_or(super::channel_power::Error::Identity)?;
+        firmware
+            .invoke(|| Ok(()))
+            .map_err(|_| super::channel_power::Error::Authority)?;
+        Ok(super::ht::request(&base, firmware))
+    }
     /// Firmware-ready is diagnostic CPU readiness, never station readiness.
     pub fn firmware_status(&self) -> Option<super::firmware_transport::Status> {
         self.firmware.as_ref().map(|owner| owner.status())
