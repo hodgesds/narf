@@ -1160,6 +1160,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     }
 
     let scanout_mode = dev.current_mode();
+    // Power management (Q9, #1015) covers the Gen12 register
+    // map — the same predicate the RCS attach uses. Xe-LPG
+    // parts are identified but get no PM until #1016's engine.
+    let pm_supported = dev.chip.generation.region_generation().is_some();
     *CONTROLLER.lock() = Some(dev);
 
     // Register with drm_registry. With a live scanout the card
@@ -1237,7 +1241,92 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Graphics.default_domain(),
     });
+
+    // Power management (Q9, #1015): retain the PCI authority,
+    // note the takeover mode for resume re-light, and register
+    // the device-PM + suspend-hook pair. Last, so a failed
+    // probe never leaves a registration behind.
+    if pm_supported {
+        crate::intel_gpu_pm::register_pm(device, cap, panel_mode);
+    }
     Ok(())
+}
+
+/// Re-establish the display after a D3 excursion (Q9, #1015):
+/// allocate a fresh scanout at `mode`'s dimensions and run
+/// the real modeset at it. The GGTT PTEs behind the
+/// pre-suspend surface do not survive D3, so — exactly as
+/// probe does — the surface is re-allocated and the plane
+/// reprogrammed, never restored in place. On success the
+/// controller's scanout state and the fb-console publication
+/// follow the new surface. Returns the new active scanout.
+pub fn relight_display(mode: &crate::intel_gpu_modeset::Mode) -> Option<ActiveScanout> {
+    use crate::intel_gpu_aux::MmioWindow;
+    use narf_bus::bar::MmioRegion;
+
+    struct BarWindow<'a>(&'a MmioRegion);
+
+    impl MmioWindow for BarWindow<'_> {
+        fn read32(&self, off: u64) -> u32 {
+            // SAFETY: BAR0 is mapped for the lifetime of the
+            // probed controller; `off` is a display register
+            // offset from the modeset code, and a 32-bit
+            // register read has no unwanted side effect.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
+            unsafe { self.0.read32(off) }
+        }
+        fn write32(&self, off: u64, val: u32) {
+            // SAFETY: same BAR ownership as `read32`; `off`
+            // is a programmable display register.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
+            unsafe { self.0.write32(off, val) }
+        }
+    }
+
+    let mut guard = CONTROLLER.lock();
+    let dev = guard.as_mut()?;
+    if !dev.chip.generation.display_supported() {
+        return None;
+    }
+    let width = u32::from(mode.h_active);
+    let height = u32::from(mode.v_active);
+    let stride_bytes = padded_stride_bytes(width);
+    let size_bytes = scanout_size_bytes(width, height);
+    let alloc = crate::intel_gpu_gtt::alloc_contiguous_scanout(&dev.gtt_mmadr, size_bytes).ok()?;
+    let fb = crate::intel_gpu_modeset::Framebuffer {
+        phys_addr: u64::from(alloc.gtt_offset),
+        stride_bytes,
+        format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
+    };
+    let window = BarWindow(&dev.gtt_mmadr);
+    let applied = crate::intel_gpu_modeset::Modeset::new(&window, crate::intel_gpu_ddi::Ddi::A)
+        .modeset(&fb, Some(mode))
+        .ok()?;
+    let scanout = ActiveScanout {
+        width: u32::from(applied.h_active),
+        height: u32::from(applied.v_active),
+        stride_bytes,
+        gtt_offset: alloc.gtt_offset,
+        phys_base: alloc.phys_base(),
+    };
+    dev.scanout = Some(ScanoutAllocation {
+        gtt_offset: alloc.gtt_offset,
+        phys_base: alloc.phys_base(),
+        order: alloc.order,
+        size_bytes: alloc.size_bytes,
+    });
+    *dev.active_scanout.lock() = Some(scanout.clone());
+    let phys_base = scanout.phys_base;
+    let (w, h) = (scanout.width, scanout.height);
+    drop(guard);
+    publish_scanout(Some(narf_graphics_driver::generic::GenericFb::new(
+        phys_base,
+        w,
+        h,
+        stride_bytes,
+        32,
+    )));
+    Some(scanout)
 }
 
 /// Register one exact-match PCI driver per row of the canonical

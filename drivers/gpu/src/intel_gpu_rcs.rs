@@ -77,6 +77,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use crate::intel_gpu_aux::MmioWindow;
+use crate::intel_gpu_forcewake::{Forcewake, FwDomain};
 use crate::intel_gpu_gtt::{
     encode_engine_pte, encode_table_entry, ggtt_va_size, PatSlot, GGTT_ARRAY_BASE, GTT_PAGE_SIZE,
 };
@@ -499,6 +500,16 @@ pub enum SubmitError {
     /// (unaligned, or outside the 39-bit GFX space) at
     /// [`RcsEngine::attach_ppgtt`].
     InvalidPpgttRoot,
+    /// Production glue only: the render forcewake domain
+    /// could not be acquired for a submission (ack timeout) —
+    /// nothing was programmed. See
+    /// [`crate::intel_gpu_forcewake`].
+    Forcewake,
+    /// Production glue only: submissions are gated off by
+    /// power management (suspend in progress or device
+    /// suspended) — nothing was programmed. See
+    /// [`crate::intel_gpu_pm`].
+    Suspended,
 }
 
 // ── GPU-memory backing seam ─────────────────────────────────────
@@ -1368,6 +1379,18 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// allocations. Returns the completions in CSB order. Also
     /// pumps the ports afterwards, so a caller that only polls
     /// keeps the engine fed.
+    /// Whether the engine has no work anywhere: nothing
+    /// queued, nothing in flight, and no context in the
+    /// pending or active execlists ports. Callers that need a
+    /// quiesced engine (power management, #1015) drain via
+    /// [`Self::poll_completions`] until this holds.
+    pub fn is_idle(&self) -> bool {
+        self.queue.is_empty()
+            && self.inflight.is_empty()
+            && self.pending.iter().all(|p| p.is_none())
+            && self.active.iter().all(|a| a.is_none())
+    }
+
     pub fn poll_completions(&mut self) -> Vec<CompletedRequest> {
         let mut done = Vec::new();
         let tail = ((self.status.read32(CSB_WRITE_BYTE) & 0xFF) as u8) % CSB_ENTRIES;
@@ -1551,18 +1574,65 @@ impl MmioWindow for BarWindow {
 
 type ProductionEngine = RcsEngine<BarWindow, GgttArena>;
 
-static RCS_STATE: narf_lib::sync::IrqSafeSpinLock<Option<(ProductionEngine, Option<ContextId>)>> =
+/// The default engine's production state: the engine
+/// itself, its lazily created default context, the
+/// forcewake manager submissions run under, and the
+/// forcewake register window (a second `BarWindow` over the
+/// same BAR0 the engine's window maps).
+type RcsState = Option<(ProductionEngine, Option<ContextId>, Forcewake, BarWindow)>;
+
+static RCS_STATE: narf_lib::sync::IrqSafeSpinLock<RcsState> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
+/// Power-management submission gate (Q9, #1015). While closed,
+/// [`submit_dwords`] refuses with [`SubmitError::Suspended`]
+/// before it can attach the engine or program a register, so
+/// a suspending device never takes new work. The PM suspend
+/// path closes the gate, drains completions until
+/// [`production_idle`] holds, and only then touches power
+/// state — which is also what makes the drain meaningful:
+/// forcewake holds are scoped to a single submission, so a
+/// closed gate plus a drained engine means zero holds exist.
+static SUBMISSIONS_GATED: narf_lib::sync::IrqSafeSpinLock<bool> =
+    narf_lib::sync::IrqSafeSpinLock::new(false);
+
+/// Close or open the PM submission gate. Idempotent.
+pub fn set_submission_gate(closed: bool) {
+    *SUBMISSIONS_GATED.lock() = closed;
+}
+
+/// Whether the PM submission gate is currently closed.
+pub fn submissions_gated() -> bool {
+    *SUBMISSIONS_GATED.lock()
+}
+
+/// Whether the production engine has no work in flight. An
+/// unattached engine is idle by definition (nothing was ever
+/// submitted). Callers drain with
+/// [`poll_default_completions`] until this holds.
+pub fn production_idle() -> bool {
+    let mut guard = RCS_STATE.lock();
+    match guard.as_mut() {
+        Some((engine, _, _, _)) => engine.is_idle(),
+        None => true,
+    }
+}
+
 fn attach_default() -> Result<(), SubmitError> {
-    let engine = crate::intel_gpu::with_controller(|gpu| {
+    let (engine, fw_window) = crate::intel_gpu::with_controller(|gpu| {
         gpu.chip_info().generation.region_generation()?;
         let arena = GgttArena::new(gpu.gtt_mmadr);
-        RcsEngine::new(BarWindow { bar: gpu.gtt_mmadr }, arena).ok()
+        let engine = RcsEngine::new(BarWindow { bar: gpu.gtt_mmadr }, arena).ok()?;
+        Some((engine, BarWindow { bar: gpu.gtt_mmadr }))
     })
     .flatten()
     .ok_or(SubmitError::NoEngine)?;
-    *RCS_STATE.lock() = Some((engine, None));
+    // Mirror i915's probe-time fw_domain_reset: clear any
+    // forcewake request state firmware left behind before the
+    // first submission takes a hold.
+    let mut fw = Forcewake::new();
+    fw.sanitize(&fw_window);
+    *RCS_STATE.lock() = Some((engine, None, fw, fw_window));
     Ok(())
 }
 
@@ -1571,26 +1641,48 @@ fn attach_default() -> Result<(), SubmitError> {
 /// use. Returns the engine-wide request id; completion is
 /// observed through [`poll_default_completions`].
 pub fn submit_dwords(dwords: &[u32]) -> Result<u64, SubmitError> {
+    // PM gate first: a gated submission must not attach the
+    // engine or touch hardware on its way to refusal.
+    if submissions_gated() {
+        return Err(SubmitError::Suspended);
+    }
     let mut guard = RCS_STATE.lock();
     if guard.is_none() {
         drop(guard);
         attach_default()?;
         guard = RCS_STATE.lock();
     }
-    let (engine, default_ctx) = guard.as_mut().expect("attached above");
-    if default_ctx.is_none() {
-        *default_ctx = Some(engine.create_context()?);
-    }
-    let ctx = default_ctx.expect("created above");
-    let batch = engine.write_batch(dwords)?;
-    engine.submit(ctx, batch)
+    let (engine, default_ctx, fw, fw_window) = guard.as_mut().expect("attached above");
+    // The submission conversation programs RCS0 registers
+    // (ELSP, ring registers) — render-domain registers gated
+    // on forcewake. Take the hold for exactly the
+    // conversation; an acquire failure means nothing was
+    // programmed.
+    fw.acquire(fw_window, FwDomain::Render)
+        .map_err(|_| SubmitError::Forcewake)?;
+    let result: Result<u64, SubmitError> = (|| {
+        if default_ctx.is_none() {
+            *default_ctx = Some(engine.create_context()?);
+        }
+        let ctx = default_ctx.expect("created above");
+        let batch = engine.write_batch(dwords)?;
+        engine.submit(ctx, batch)
+    })();
+    // A release failure (ack slow to clear) still drops the
+    // hold in state and leaves the hardware awake — the safe
+    // direction — so the submission's own result stands.
+    let _ = fw.release(fw_window, FwDomain::Render);
+    result
 }
 
 /// Drain completions from the default engine, if attached.
+/// Takes no forcewake hold: completions are read from the
+/// CSB in the status page, which is host memory (a
+/// `GpuBacking`), not a gated register.
 pub fn poll_default_completions() -> Vec<CompletedRequest> {
     let mut guard = RCS_STATE.lock();
     match guard.as_mut() {
-        Some((engine, _)) => engine.poll_completions(),
+        Some((engine, _, _, _)) => engine.poll_completions(),
         None => Vec::new(),
     }
 }
