@@ -13,6 +13,7 @@
 //! | `description`       | human-readable vendor string                   |
 //! | `caps`              | family/level/revision + vendor strings         |
 //! | `pcrs`              | one line per PCR per bank (SHA-1 and SHA-256)  |
+//! | `binary_bios_measurements` (binary) | the TCG event log, via `narf_tpm::attest`'s measurement hook (#945) |
 //!
 //! All attribute values are generated lazily on each read. `pcrs` is
 //! expensive (one `TPM2_PCR_Read` per bank) but is acceptable for a
@@ -55,7 +56,9 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr};
+use narf_filesystem::sysfs::{
+    class_device_register, class_register, kobject_add_attr, kobject_add_bin_attr,
+};
 
 use crate::devfs_bridge::TpmTransport;
 use crate::tpm2::commands::{get_capability, pcr_read};
@@ -449,4 +452,38 @@ pub fn register_sysfs_tpm0(transport: Arc<dyn TpmTransport>) {
         let t = transport.clone();
         kobject_add_attr(&tpm0, "pcrs", make_pcrs_show(t));
     }
+
+    // ── Attestation: the TCG event log (#945) ─────────────────────
+    //
+    // `binary_bios_measurements` serves the raw TCG_PCR_EVENT2
+    // encoding of the boot's measurement log — the bytes a remote
+    // verifier replays against a quote's PCR digest. Linux serves
+    // the same bytes at
+    // `/sys/kernel/security/tpm0/binary_bios_measurements`;
+    // in-tree, securityfs mounts an empty directory with no
+    // content registry, so the node lives on the class device —
+    // where this tree publishes TPM state — under the same name.
+    //
+    // The log is not TPM state, so it does not come through the
+    // transport: it is `frame::measure`'s, reached through the
+    // measurement hook frame installs into `narf_tpm::attest` at
+    // measured boot. Before that install (or on a TPM-less boot
+    // that still registers the class device) the hook serves an
+    // empty log and reads return EOF — no fabricated measurements.
+    // Each read takes a fresh snapshot; a measurement landing
+    // mid-read can tear across reads, the same property the Linux
+    // node has before the final-events log is fixed.
+    kobject_add_bin_attr(
+        &tpm0,
+        "binary_bios_measurements",
+        Arc::new(|offset: usize, buf: &mut [u8]| -> usize {
+            let log = narf_tpm::attest::event_log_bytes();
+            if offset >= log.len() {
+                return 0;
+            }
+            let n = core::cmp::min(buf.len(), log.len() - offset);
+            buf[..n].copy_from_slice(&log[offset..offset + n]);
+            n
+        }),
+    );
 }

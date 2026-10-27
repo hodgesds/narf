@@ -15,6 +15,7 @@ pub enum CommandCode {
     GetRandom = 0x0000_017B,
     PcrRead = 0x0000_017E,
     PcrExtend = 0x0000_0182,
+    Quote = 0x0000_0158,
 }
 
 pub struct CommandBuilder {
@@ -116,6 +117,55 @@ impl CommandBuilder {
     pub fn get_random(bytes: u16) -> Vec<u8> {
         let mut cb = Self::new(CommandCode::GetRandom);
         cb.push_u16(bytes);
+        cb.finish()
+    }
+
+    /// Build a TPM2_Quote command (Part 3 §18, attestation
+    /// commands) over `selections` — `(hashAlg, pcrSelect)` pairs —
+    /// signed by the key at `sign_handle`.
+    ///
+    /// The signing handle is an authorization handle, so the frame
+    /// uses the `TPM_ST_SESSIONS` tag with the empty password
+    /// session (`TPM_RS_PW`), the same encoding as `pcr_extend`:
+    /// the in-tree AK carries an empty auth value, authorized
+    /// through the hierarchy-independent password session.
+    /// `scheme` is the requested `TPMT_SIG_SCHEME` as `(algorithm,
+    /// hash)` — for the AK, `(TPM_ALG_ECDSA, TPM_ALG_SHA256)`;
+    /// `TPM_ALG_NULL` as the algorithm encodes the scheme as the
+    /// single algorithm word (the TPM then uses the key's own
+    /// scheme). `qualifying_data` is the verifier's nonce, bound
+    /// into the attestation as `extraData`.
+    pub fn quote(
+        sign_handle: u32,
+        qualifying_data: &[u8],
+        scheme: (u16, u16),
+        selections: &[(u16, &[u8])],
+    ) -> Vec<u8> {
+        let mut cb = Self::new_with_sessions(CommandCode::Quote);
+        cb.push_u32(sign_handle); // signHandle
+                                  // authorization area (empty password session)
+        cb.push_u32(9); // size of authorizationArea
+        cb.push_u32(0x40000009); // TPM_RS_PW
+        cb.push_u16(0); // nonceSize
+        cb.push_u8(0); // sessionAttributes
+        cb.push_u16(0); // hmacSize
+
+        // qualifyingData (TPM2B_DATA)
+        cb.push_u16(qualifying_data.len() as u16);
+        cb.push_slice(qualifying_data);
+        // inScheme (TPMT_SIG_SCHEME): TPM_ALG_NULL is a lone word;
+        // a signing scheme is algorithm + hash.
+        cb.push_u16(scheme.0);
+        if scheme.0 != crate::tpm2::TPM_ALG_NULL {
+            cb.push_u16(scheme.1);
+        }
+        // PCRselect (TPML_PCR_SELECTION)
+        cb.push_u32(selections.len() as u32);
+        for (alg, mask) in selections {
+            cb.push_u16(*alg);
+            cb.push_u8(mask.len() as u8);
+            cb.push_slice(mask);
+        }
         cb.finish()
     }
 }
@@ -298,6 +348,55 @@ impl<'a> ResponseParser<'a> {
             off += 3 + size;
         }
         Ok((more_data, selections))
+    }
+
+    /// Parse a TPM2_Quote response (Part 3 §18): a sessions-tagged
+    /// frame whose parameter area — bounded by `parameterSize` —
+    /// carries `quoted` (TPM2B_ATTEST) then `signature`
+    /// (TPMT_SIGNATURE), followed by the authorization area.
+    ///
+    /// Both structures are walked structurally (see
+    /// [`crate::attest`]): the attestation must parse and consume
+    /// its TPM2B exactly, and the signature must consume the rest
+    /// of the parameter area exactly. Truncation, an overrun
+    /// `parameterSize`, a missing authorization area, or trailing
+    /// parameter bytes are `BadResponse`.
+    pub fn parse_quote_response(&self) -> Result<crate::attest::QuoteResponse, TpmError> {
+        if self.buf.len() < 2 || u16::from_be_bytes([self.buf[0], self.buf[1]]) != TPM_ST_SESSIONS {
+            return Err(TpmError::BadResponse);
+        }
+        let body = self.body();
+        if body.len() < 4 {
+            return Err(TpmError::BadResponse);
+        }
+        let psize = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
+        if body.len() < 4 + psize {
+            return Err(TpmError::BadResponse);
+        }
+        let params = &body[4..4 + psize];
+        // The authorization area follows the parameters; a
+        // password session's response area is at least nonce
+        // TPM2B(2) + sessionAttributes(1) + hmac TPM2B(2) = 5
+        // bytes. Require its presence; its contents authorize
+        // nothing at this layer.
+        if body.len() - (4 + psize) < 5 {
+            return Err(TpmError::BadResponse);
+        }
+        if params.len() < 2 {
+            return Err(TpmError::BadResponse);
+        }
+        let attest_len = u16::from_be_bytes([params[0], params[1]]) as usize;
+        if params.len() < 2 + attest_len {
+            return Err(TpmError::BadResponse);
+        }
+        let attest_bytes = params[2..2 + attest_len].to_vec();
+        let info = crate::attest::AttestInfo::parse(&attest_bytes)?;
+        let signature = crate::attest::Signature::parse(&params[2 + attest_len..])?;
+        Ok(crate::attest::QuoteResponse {
+            attest_bytes,
+            info,
+            signature,
+        })
     }
 
     /// Parse TPM2_GetRandom response.

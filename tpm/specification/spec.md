@@ -48,6 +48,16 @@ pub trait TpmDevice: Send + Sync {
     /// Identity: query TPM2_GetCapability live (provided; §3.1).
     async fn query_info(&self) -> Result<TpmInfo, TpmError>;
 
+    /// Attestation: submit TPM2_Quote over the selected PCRs
+    /// (provided; §3.1).
+    async fn quote(
+        &self,
+        sign_handle: u32,
+        qualifying_data: &[u8],
+        scheme: (u16, u16),
+        selections: &[(u16, &[u8])],
+    ) -> Result<attest::QuoteResponse, TpmError>;
+
     /// High-level GetRandom.
     async fn get_random(&self, bytes: u16) -> Result<Vec<u8>, TpmError>;
 }
@@ -86,6 +96,28 @@ its unqueried defaults — identity is diagnostic, not a liveness
 gate. Property tags live with the codec (`tpm2::TPM_PT_*`); note
 `TPM_PT_PERMANENT` is in the variable group (0x200), while 0x10E in
 the fixed group is `TPM_PT_HR_TRANSIENT_MIN`.
+
+**Attestation (`quote`, #945).** `quote` is a provided method: it
+builds `TPM2_Quote` with the canonical codec
+(`commands::CommandBuilder::quote` — `TPM_ST_SESSIONS` +
+`TPM_RS_PW`, so the signing key carries an empty auth value) and
+parses the response structurally
+(`ResponseParser::parse_quote_response` →
+`attest::QuoteResponse`: the raw TPMS_ATTEST bytes, their parsed
+form, and the TPMT_SIGNATURE). The attestation structures and the
+remote-party verifier live in the `attest` module:
+`attest::verify_quote` re-checks a quote the way a relying party
+does — structure and TPM_GENERATED magic, quote type, the
+qualifying data against the verifier's own nonce, the signer
+qualified name against the AK's (pinned from a trusted
+ReadPublic at enrollment), the composite PCR digest recomputed
+from verifier-read PCR values, and the ECDSA signature over the
+attestation with the AK public area. Only ECC P-256 AKs are
+verifiable in-tree (the curve `narf-crypto` implements); RSASSA /
+RSAPSS signatures parse but do not verify. The trait method is
+the raw device operation and carries no policy: AK provisioning
+and the refusal to quote an untouched PCR set live in the
+composition (§3.4).
 
 ### 3.2 TPM Capabilities
 
@@ -184,6 +216,57 @@ contract:
   `get_info` likewise answers from the probe-time `query_info`
   (§3.1) instead of the pre-#941 stub values, which remain only as
   the unqueried default.
+- **Attestation composition (#945).** AK provisioning and quote
+  production are composed in `drivers/platform`
+  (`tpm_attestation`) over this crate's trait and the
+  `drivers/tpm` extended builders. `ensure_ak` probes the
+  persistent AK handle (`0x81010002`) with `TPM2_ReadPublic`;
+  absent, it submits `TPM2_CreatePrimary` in the endorsement
+  hierarchy with the TCG EK Credential Profile AK template
+  (ECC P-256, restricted signing, ECDSA/SHA-256, `userWithAuth` —
+  the tree's session story is password-first; the profile's
+  `adminWithPolicy` / PolicySecret form is the fleet variant),
+  cross-checks the reported name against the created public area,
+  and persists the key with `TPM2_EvictControl` under owner
+  authority. `try_init_default` provisions on its success path,
+  log-only on failure: attestation is additive, and a TPM that
+  cannot provision still registers and anchors measured boot.
+  `attestation_quote` refuses with `TpmError::Denied` unless the
+  measurement hooks report an extend observed — the
+  EXTEND_OBSERVED guard `frame::measure` maintains so a quote
+  over an untouched PCR set cannot present an empty history as a
+  measured boot. The hooks are the seam that keeps the dependency
+  direction acyclic (frame → this crate → composition): frame
+  installs two pure probes (its TCG event-log encoder and the
+  extend flag) into `attest` from the measured-boot initcall;
+  uninstalled hooks fail closed. The event log is published as
+  the binary sysfs attribute `binary_bios_measurements` on the
+  `tpm0` class device, served per read from the installed hook.
+  Linux puts the same bytes under `securityfs`
+  (`/sys/kernel/security/tpm0/binary_bios_measurements`); in-tree
+  securityfs mounts an empty directory with no content registry,
+  so the class device — where this tree publishes TPM state —
+  carries the node under the same name.
+- **Firmware event-log ingestion (design answer, #945).** A quote
+  is only as strong as the measurement chain behind the PCRs,
+  and on UEFI laptops the chain's first links are firmware's:
+  the SRTM extends PCRs 0–7 before NARF runs. NARF today neither
+  ingests the firmware TCG log nor reads the hardware PCRs back,
+  so its shadow starts at zero and a quote over PCRs 0–7 cannot
+  account for the firmware extends. The designed path: the boot
+  handoff surfaces the EFI TCG2 log (the `TCG_PCR_EVENT2` stream
+  plus the final-events table) to `frame::measure` before its
+  first extend; measure replays the firmware events into the
+  shadow with the hardware extend formula, records them at the
+  head of its own log (so the published log is the full chain),
+  and cross-checks the replayed shadow against a hardware
+  `TPM2_PCR_Read` of PCRs 0–7 on first quote — a mismatch means
+  the firmware's log and its extends disagree, and quotes over
+  those PCRs must say so rather than paper over it. That
+  implementation touches `boot/` and `frame/` (TCB) and lands as
+  its own lane (tracked as #1071); until it does, quotes over the
+  boot PCRs attest NARF's extends only, and this paragraph is the
+  standing caveat every verifier of a NARF quote must apply.
 
 ## 4. Operation: PCR Extension
 

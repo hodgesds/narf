@@ -58,10 +58,27 @@
 //!   identity: manufacturer "NARF", vendor string "NARF fixture
 //!   TPM", firmware 1.0, spec revision 159, TPMA_PERMANENT = 0 —
 //!   no hierarchy auth is set), PCRS (the SHA-256 bank), ALGS
-//!   (SHA-256 only), COMMANDS (the six implemented command
-//!   codes), HANDLES (always empty: the model holds no loaded
-//!   objects). Any other capability is answered `TPM_RC_VALUE`,
-//!   as a TPM without it would.
+//!   (SHA-256 + ECDSA + ECC), ECC_CURVES (NIST P-256), COMMANDS
+//!   (the implemented command codes), HANDLES (the loaded /
+//!   persistent object handles, filtered by the property's
+//!   handle-type byte). Any other capability is answered
+//!   `TPM_RC_VALUE`, as a TPM without it would.
+//! - Attestation (#945): the command core holds an object store
+//!   — CreatePrimary derives an ECC P-256 primary
+//!   deterministically from (hierarchy, template), EvictControl
+//!   persists it, ReadPublic reports its public area + names,
+//!   FlushContext unloads it, and Quote builds a real TPMS_ATTEST
+//!   over the model's PCR bank and signs it with the object's
+//!   key, so the production attestation composition and the
+//!   canonical verifier converse with the model end to end.
+//!   Documented narrowings: ECC P-256 primaries only (RSA /
+//!   P-384 templates draw `TPM_RC_VALUE`), primary derivation is
+//!   a single SHA-256 over a domain string + hierarchy + template
+//!   rather than Part 1 Annex B's KDFa over the hierarchy proof
+//!   (the property fixtures rely on — same template, same key —
+//!   is preserved), the creation ticket's digest is a stand-in
+//!   (TPM2_VerifyCreation is not modelled), and the model clock
+//!   advances a fixed 1 s per executed command.
 //! - `CTRL_STS.error` is never set for ordinary command RCs (it
 //!   signals a fatal device state on silicon, not a rejection).
 
@@ -105,6 +122,12 @@ const RC_COMMAND_CODE: u32 = 0x0000_0143;
 const RC_AUTH_MISSING: u32 = 0x0000_012A;
 const RC_VALUE: u32 = 0x0000_0184;
 const RC_SIZE: u32 = 0x0000_0195;
+// FMT1 handle/attribute/session errors (Part 1 §39.4): base code
+// with the format bit (0x80), the parameter/handle/session marker,
+// and the offending slot's number in bits 8..11.
+const RC_HANDLE_1: u32 = 0x0000_018B; // TPM_RC_HANDLE, handle 1
+const RC_ATTRIBUTES_1: u32 = 0x0000_0182; // TPM_RC_ATTRIBUTES, handle 1
+const RC_AUTH_FAIL_1: u32 = 0x0000_098E; // TPM_RC_AUTH_FAIL, session 1
 
 const TPM_RS_PW: u32 = 0x4000_0009;
 
@@ -216,7 +239,150 @@ fn pcr_extend_value(old: &[u8; 32], digest: &[u8; 32]) -> [u8; 32] {
     sha256(&input)
 }
 
+// ── Command parsing helpers (object commands, #945) ────────────────
+
+/// Bounds-checked big-endian cursor over a command's handle +
+/// parameter area. A `None` read maps to `TPM_RC_SIZE` at the call
+/// sites — the model's answer to any structurally short frame.
+struct CmdReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> CmdReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        if self.pos + n > self.buf.len() {
+            return None;
+        }
+        let out = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        Some(out)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        let b = self.take(2)?;
+        Some(u16::from_be_bytes([b[0], b[1]]))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        let b = self.take(4)?;
+        Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// Read a TPM2B (u16 size + bytes), returning the inner bytes.
+    fn tpm2b(&mut self) -> Option<&'a [u8]> {
+        let n = self.u16()? as usize;
+        self.take(n)
+    }
+
+    fn at_end(&self) -> bool {
+        self.pos == self.buf.len()
+    }
+}
+
+/// The pieces of an ECC `TPMT_PUBLIC` template CreatePrimary
+/// needs: its attributes, its signing scheme, and the offset at
+/// which `unique` begins (so the derived point can be spliced in).
+struct EccTemplate {
+    attributes: u32,
+    scheme: (u16, u16),
+    unique_offset: usize,
+}
+
+/// Walk a `TPMT_PUBLIC` template for an ECC key. Only the model's
+/// implemented shape parses: SHA-256 nameAlg, NIST P-256, a NULL
+/// or AES symmetric definition, a NULL or signing scheme, a NULL
+/// or MGF1 KDF — anything else (RSA templates, P-384, keyed-hash
+/// objects) is a model narrowing answered `TPM_RC_VALUE` by the
+/// caller, never a silently mis-derived key.
+fn parse_ecc_template(public: &[u8]) -> Option<EccTemplate> {
+    let mut r = CmdReader::new(public);
+    if r.u16()? != narf_tpm::tpm2::TPM_ALG_ECC {
+        return None;
+    }
+    if r.u16()? != narf_tpm::tpm2::TPM_ALG_SHA256 {
+        return None;
+    }
+    let attributes = r.u32()?;
+    let _auth_policy = r.tpm2b()?;
+    // TPMT_SYM_DEF_OBJECT: NULL, or AES + keyBits + mode.
+    match r.u16()? {
+        x if x == narf_tpm::tpm2::TPM_ALG_NULL => {}
+        x if x == narf_tpm::tpm2::TPM_ALG_AES => {
+            r.u16()?;
+            r.u16()?;
+        }
+        _ => return None,
+    }
+    // TPMT_ECC_SCHEME: NULL, or a signing scheme + its hash.
+    let scheme = match r.u16()? {
+        x if x == narf_tpm::tpm2::TPM_ALG_NULL => (x, x),
+        x if matches!(x, 0x0014 | 0x0016 | 0x0018 | 0x001A | 0x001B | 0x001C) => (x, r.u16()?),
+        _ => return None,
+    };
+    if r.u16()? != narf_tpm::tpm2::TPM_ECC_NIST_P256 {
+        return None;
+    }
+    // TPMT_KDF_SCHEME: NULL, or MGF1 (0x0007) + hash.
+    match r.u16()? {
+        x if x == narf_tpm::tpm2::TPM_ALG_NULL => {}
+        0x0007 => {
+            r.u16()?;
+        }
+        _ => return None,
+    }
+    let unique_offset = r.pos;
+    let _x = r.tpm2b()?;
+    let _y = r.tpm2b()?;
+    if !r.at_end() {
+        return None;
+    }
+    Some(EccTemplate {
+        attributes,
+        scheme,
+        unique_offset,
+    })
+}
+
 // ── The device model ───────────────────────────────────────────────
+
+/// One object in the model's store (#945): a primary created by
+/// TPM2_CreatePrimary, optionally persisted by TPM2_EvictControl.
+/// The model derives ECC P-256 primaries only, so the sensitive
+/// area is the scalar itself; `public` is the full TPMT_PUBLIC
+/// with the derived point in `unique`, and the names are computed
+/// over it per Part 1 §16 at creation time.
+struct ModelObject {
+    /// The transient handle CreatePrimary returned.
+    handle: u32,
+    /// The persistent handle, once EvictControl binds one.
+    persistent: Option<u32>,
+    /// False after FlushContext / Startup until the object is
+    /// re-created; a persistent object still resolves through its
+    /// persistent handle (the TPM loads it from NV on use).
+    loaded: bool,
+    /// TPMT_PUBLIC bytes (unique filled with the derived point).
+    public: Vec<u8>,
+    /// Part 1 §16 name / qualified name.
+    name: Vec<u8>,
+    qualified_name: Vec<u8>,
+    /// The ECC scalar (the model's sensitive area).
+    scalar: [u8; 32],
+    /// The auth value from CreatePrimary's inSensitive.
+    auth_value: Vec<u8>,
+    /// Object attributes from the template (Quote requires SIGN).
+    attributes: u32,
+    /// The template's signing scheme `(algorithm, hash)`.
+    scheme: (u16, u16),
+}
 
 struct DeviceState {
     /// The register file: one locality-0 window, byte-addressed.
@@ -229,6 +395,14 @@ struct DeviceState {
     /// width (it once kept a u64 and emitted all 8 bytes — #1065).
     update_counter: u32,
     rng: u64,
+    // Attestation state (#945).
+    objects: Vec<ModelObject>,
+    next_transient: u32,
+    /// TPMS_CLOCK_INFO state: the model clock (advances a fixed
+    /// 1 s per executed command), reset and restart counters.
+    clock_ms: u64,
+    reset_count: u32,
+    restart_count: u32,
     // Observations for fixture assertions.
     cancel_seen: bool,
     cmd_ready_seen: bool,
@@ -295,6 +469,11 @@ impl FakeTpmDevice {
             started: false,
             update_counter: 0,
             rng: 0x9E37_79B9_7F4A_7C15,
+            objects: Vec::new(),
+            next_transient: 0x8000_0000,
+            clock_ms: 0,
+            reset_count: 0,
+            restart_count: 0,
             cancel_seen: false,
             cmd_ready_seen: false,
             go_count: 0,
@@ -374,6 +553,11 @@ impl FakeTpmDevice {
     fn pcr(&self, idx: u32) -> [u8; 32] {
         self.state.lock().pcrs[idx as usize]
     }
+    /// Number of objects in the model's store (#945: provisioning
+    /// fixtures assert re-entry creates no second AK).
+    fn object_count(&self) -> usize {
+        self.state.lock().objects.len()
+    }
     fn is_started(&self) -> bool {
         self.state.lock().started
     }
@@ -425,11 +609,22 @@ impl FakeTpmDevice {
             // simplification: all-zero, DRTM PCRs included).
             st.pcrs = [[0; 32]; 24];
             st.update_counter = 0;
+            // Transient objects are flushed across a startup;
+            // persistent objects survive in NV and still resolve
+            // through their persistent handles (#945).
+            for obj in st.objects.iter_mut() {
+                obj.loaded = false;
+            }
+            st.objects.retain(|o| o.persistent.is_some());
+            st.reset_count += 1;
             return ok(&[]);
         }
         if !self.state.lock().started {
             return err(RC_INITIALIZE);
         }
+        // The model clock advances a fixed 1 s per executed
+        // command — deterministic TPMS_CLOCK_INFO for Quote.
+        self.state.lock().clock_ms += 1_000;
 
         match cc {
             x if x == narf_tpm::tpm2::TPM_CC_SHUTDOWN => {
@@ -441,6 +636,11 @@ impl FakeTpmDevice {
             }
             x if x == narf_tpm::tpm2::TPM_CC_PCR_EXTEND => self.exec_pcr_extend(tag, cmd),
             x if x == narf_tpm::tpm2::TPM_CC_PCR_READ => self.exec_pcr_read(cmd),
+            x if x == narf_tpm::tpm2::TPM_CC_CREATE_PRIMARY => self.exec_create_primary(tag, cmd),
+            x if x == narf_tpm::tpm2::TPM_CC_EVICT_CONTROL => self.exec_evict_control(tag, cmd),
+            x if x == narf_tpm::tpm2::TPM_CC_READ_PUBLIC => self.exec_read_public(tag, cmd),
+            x if x == narf_tpm::tpm2::TPM_CC_FLUSH_CONTEXT => self.exec_flush_context(tag, cmd),
+            x if x == narf_tpm::tpm2::TPM_CC_QUOTE => self.exec_quote(tag, cmd),
             x if x == narf_tpm::tpm2::TPM_CC_GET_CAPABILITY => self.exec_get_capability(tag, cmd),
             x if x == narf_tpm::tpm2::TPM_CC_GET_RANDOM => {
                 if cmd.len() != 12 {
@@ -639,6 +839,500 @@ impl FakeTpmDevice {
         out
     }
 
+    // ── Attestation command core (#945) ─────────────────────────
+
+    /// A sessions success response: header + (optional response
+    /// handle) + parameterSize + parameters + the 5-byte
+    /// password-session response area (empty nonce, attributes 0,
+    /// empty HMAC). Unlike the PCR_Extend arm — whose parameter
+    /// area is empty — the parameterSize here is the true
+    /// parameter byte count the structured parsers bound by.
+    fn sessions_ok(handle: Option<u32>, params: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&narf_tpm::tpm2::TPM_ST_SESSIONS.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes()); // size, patched below
+        out.extend_from_slice(&0u32.to_be_bytes()); // rc = SUCCESS
+        if let Some(h) = handle {
+            out.extend_from_slice(&h.to_be_bytes());
+        }
+        out.extend_from_slice(&(params.len() as u32).to_be_bytes());
+        out.extend_from_slice(params);
+        out.extend_from_slice(&[0u8; 5]);
+        let n = out.len() as u32;
+        out[2..6].copy_from_slice(&n.to_be_bytes());
+        out
+    }
+
+    /// Parse the password-session authorization area at the
+    /// reader's position: authorizationSize + TPM_RS_PW session
+    /// (nonce TPM2B, attributes, auth TPM2B — for TPM_RS_PW the
+    /// "hmac" field carries the presented auth value). Returns the
+    /// presented auth value. The model's hierarchy and object auth
+    /// values are compared against it by the callers.
+    fn parse_pw_auth(r: &mut CmdReader<'_>) -> Option<Vec<u8>> {
+        let auth_size = r.u32()? as usize;
+        let area = r.take(auth_size)?;
+        let mut ar = CmdReader::new(area);
+        if ar.u32()? != TPM_RS_PW {
+            return None;
+        }
+        let _nonce = ar.tpm2b()?;
+        let _attrs = ar.u8()?;
+        let auth = ar.tpm2b()?.to_vec();
+        if !ar.at_end() {
+            return None;
+        }
+        Some(auth)
+    }
+
+    /// Resolve a handle to an object index: a loaded transient
+    /// handle, or a persistent handle (persistent objects resolve
+    /// whether or not the transient copy is loaded).
+    fn find_object(st: &DeviceState, handle: u32) -> Option<usize> {
+        st.objects
+            .iter()
+            .position(|o| (o.loaded && o.handle == handle) || o.persistent == Some(handle))
+    }
+
+    /// TPM2_CreatePrimary (Part 3 §12.2) for ECC P-256 templates:
+    /// derive the primary deterministically from (hierarchy,
+    /// template), fill the template's `unique` with the derived
+    /// point, and answer with the §12.2 parameter layout.
+    fn exec_create_primary(&self, tag: u16, cmd: &[u8]) -> Vec<u8> {
+        let err = |rc: u32| -> Vec<u8> {
+            let mut out = alloc::vec![0u8; 10];
+            out[0..2].copy_from_slice(&narf_tpm::tpm2::TPM_ST_NO_SESSIONS.to_be_bytes());
+            out[2..6].copy_from_slice(&10u32.to_be_bytes());
+            out[6..10].copy_from_slice(&rc.to_be_bytes());
+            out
+        };
+        if tag != narf_tpm::tpm2::TPM_ST_SESSIONS {
+            return err(RC_AUTH_MISSING);
+        }
+        let mut r = CmdReader::new(&cmd[10..]);
+        let Some(hierarchy) = r.u32() else {
+            return err(RC_SIZE);
+        };
+        if !matches!(
+            hierarchy,
+            0x4000_0001 | 0x4000_000B | 0x4000_000C // OWNER | ENDORSEMENT | PLATFORM
+        ) {
+            return err(RC_HANDLE_1);
+        }
+        // The model's hierarchy auth values are all empty.
+        match Self::parse_pw_auth(&mut r) {
+            Some(auth) if auth.is_empty() => {}
+            Some(_) => return err(RC_AUTH_FAIL_1),
+            None => return err(RC_SIZE),
+        }
+        let Some(in_sensitive) = r.tpm2b() else {
+            return err(RC_SIZE);
+        };
+        let Some(in_public) = r.tpm2b() else {
+            return err(RC_SIZE);
+        };
+        let Some(_outside_info) = r.tpm2b() else {
+            return err(RC_SIZE);
+        };
+        // creationPCR: a TPML_PCR_SELECTION, bounds-walked only.
+        let Some(count) = r.u32() else {
+            return err(RC_SIZE);
+        };
+        for _ in 0..count {
+            if r.u16().is_none() {
+                return err(RC_SIZE);
+            }
+            let Some(size) = r.u8() else {
+                return err(RC_SIZE);
+            };
+            if r.take(size as usize).is_none() {
+                return err(RC_SIZE);
+            }
+        }
+        if !r.at_end() {
+            return err(RC_SIZE);
+        }
+        // inSensitive: userAuth TPM2B + data TPM2B — the userAuth
+        // becomes the object's auth value.
+        let mut sr = CmdReader::new(in_sensitive);
+        let (Some(user_auth), Some(_data)) = (sr.tpm2b(), sr.tpm2b()) else {
+            return err(RC_SIZE);
+        };
+        if !sr.at_end() {
+            return err(RC_SIZE);
+        }
+        let auth_value = user_auth.to_vec();
+        // The template: ECC P-256 only (module doc narrowing).
+        let Some(template) = parse_ecc_template(in_public) else {
+            return err(RC_VALUE);
+        };
+        // Deterministic primary derivation (module doc): same
+        // (hierarchy, template) → same key, as on silicon.
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(b"narf-tpm-model primary derivation v1");
+        preimage.extend_from_slice(&hierarchy.to_be_bytes());
+        preimage.extend_from_slice(in_public);
+        let mut counter = 0u8;
+        let scalar = loop {
+            let mut pre = preimage.clone();
+            if counter > 0 {
+                pre.push(counter);
+            }
+            let s = narf_crypto::p256::Scalar::from_bytes_be_reduce(&sha256(&pre));
+            if !s.is_zero() {
+                break s;
+            }
+            counter += 1;
+        };
+        let scalar_bytes = scalar.to_bytes_be();
+        let point = narf_crypto::p256::point::scalar_mul_base(&scalar);
+        let Some(encoded) = point.to_encoded() else {
+            return err(RC_FAILURE);
+        };
+        let mut out_public = in_public[..template.unique_offset].to_vec();
+        out_public.extend_from_slice(&32u16.to_be_bytes());
+        out_public.extend_from_slice(&encoded[..32]);
+        out_public.extend_from_slice(&32u16.to_be_bytes());
+        out_public.extend_from_slice(&encoded[32..]);
+        // Names per Part 1 §16, computed by the canonical helpers;
+        // the attestation fixture recomputes them independently.
+        let Some(name) = narf_tpm::attest::object_name(&out_public) else {
+            return err(RC_FAILURE);
+        };
+        let Some(qualified_name) = narf_tpm::attest::primary_qualified_name(hierarchy, &name)
+        else {
+            return err(RC_FAILURE);
+        };
+        // TPMS_CREATION_DATA: empty pcrSelect, empty pcrDigest,
+        // locality 0, the hierarchy as parent (its name is its
+        // handle value), empty outsideInfo.
+        let mut creation_data = Vec::new();
+        creation_data.extend_from_slice(&0u32.to_be_bytes());
+        creation_data.extend_from_slice(&0u16.to_be_bytes());
+        creation_data.push(0u8);
+        creation_data.extend_from_slice(&narf_tpm::tpm2::TPM_ALG_SHA256.to_be_bytes());
+        creation_data.extend_from_slice(&4u16.to_be_bytes());
+        creation_data.extend_from_slice(&hierarchy.to_be_bytes());
+        creation_data.extend_from_slice(&4u16.to_be_bytes());
+        creation_data.extend_from_slice(&hierarchy.to_be_bytes());
+        creation_data.extend_from_slice(&0u16.to_be_bytes());
+        let creation_hash = sha256(&creation_data);
+        // TPMT_TK_CREATION — the digest is a model stand-in
+        // (VerifyCreation is not modelled; module doc).
+        let mut ticket = Vec::new();
+        ticket.extend_from_slice(&0x8021u16.to_be_bytes()); // TPM_ST_CREATION
+        ticket.extend_from_slice(&hierarchy.to_be_bytes());
+        let mut ticket_pre = Vec::new();
+        ticket_pre.extend_from_slice(b"narf-tpm-model creation ticket");
+        ticket_pre.extend_from_slice(&creation_hash);
+        let ticket_digest = sha256(&ticket_pre);
+        ticket.extend_from_slice(&(ticket_digest.len() as u16).to_be_bytes());
+        ticket.extend_from_slice(&ticket_digest);
+
+        let mut st = self.state.lock();
+        let handle = st.next_transient;
+        st.next_transient += 1;
+        st.objects.push(ModelObject {
+            handle,
+            persistent: None,
+            loaded: true,
+            public: out_public.clone(),
+            name: name.clone(),
+            qualified_name,
+            scalar: scalar_bytes,
+            auth_value,
+            attributes: template.attributes,
+            scheme: template.scheme,
+        });
+        drop(st);
+
+        let mut params = Vec::new();
+        params.extend_from_slice(&(out_public.len() as u16).to_be_bytes());
+        params.extend_from_slice(&out_public);
+        params.extend_from_slice(&(creation_data.len() as u16).to_be_bytes());
+        params.extend_from_slice(&creation_data);
+        params.extend_from_slice(&(creation_hash.len() as u16).to_be_bytes());
+        params.extend_from_slice(&creation_hash);
+        params.extend_from_slice(&ticket);
+        params.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        params.extend_from_slice(&name);
+        Self::sessions_ok(Some(handle), &params)
+    }
+
+    /// TPM2_EvictControl (Part 3 §27.2): bind a persistent handle
+    /// to a loaded object, or — when `objectHandle` names an
+    /// existing persistent handle and `persistentHandle` repeats
+    /// it — remove the persistence.
+    fn exec_evict_control(&self, tag: u16, cmd: &[u8]) -> Vec<u8> {
+        let err = |rc: u32| -> Vec<u8> {
+            let mut out = alloc::vec![0u8; 10];
+            out[0..2].copy_from_slice(&narf_tpm::tpm2::TPM_ST_NO_SESSIONS.to_be_bytes());
+            out[2..6].copy_from_slice(&10u32.to_be_bytes());
+            out[6..10].copy_from_slice(&rc.to_be_bytes());
+            out
+        };
+        if tag != narf_tpm::tpm2::TPM_ST_SESSIONS {
+            return err(RC_AUTH_MISSING);
+        }
+        let mut r = CmdReader::new(&cmd[10..]);
+        let (Some(auth_handle), Some(object_handle)) = (r.u32(), r.u32()) else {
+            return err(RC_SIZE);
+        };
+        if !matches!(auth_handle, 0x4000_0001 | 0x4000_000C) {
+            // OWNER | PLATFORM are the EvictControl authorities.
+            return err(RC_HANDLE_1);
+        }
+        match Self::parse_pw_auth(&mut r) {
+            Some(auth) if auth.is_empty() => {}
+            Some(_) => return err(RC_AUTH_FAIL_1),
+            None => return err(RC_SIZE),
+        }
+        let Some(persistent_handle) = r.u32() else {
+            return err(RC_SIZE);
+        };
+        if !r.at_end() {
+            return err(RC_SIZE);
+        }
+        let mut st = self.state.lock();
+        // Evict form: objectHandle is a persistent handle and
+        // persistentHandle repeats it.
+        if persistent_handle == object_handle {
+            if let Some(obj) = st
+                .objects
+                .iter_mut()
+                .find(|o| o.persistent == Some(object_handle))
+            {
+                obj.persistent = None;
+                return Self::sessions_ok(None, &[]);
+            }
+        }
+        let Some(idx) = Self::find_object(&st, object_handle) else {
+            return err(RC_HANDLE_1);
+        };
+        if st
+            .objects
+            .iter()
+            .enumerate()
+            .any(|(i, o)| i != idx && o.persistent == Some(persistent_handle))
+        {
+            return err(RC_HANDLE_1);
+        }
+        st.objects[idx].persistent = Some(persistent_handle);
+        Self::sessions_ok(None, &[])
+    }
+
+    /// TPM2_ReadPublic (Part 3 §23): the object's public area and
+    /// both name forms, no authorization.
+    fn exec_read_public(&self, tag: u16, cmd: &[u8]) -> Vec<u8> {
+        let err = |rc: u32| -> Vec<u8> {
+            let mut out = alloc::vec![0u8; 10];
+            out[0..2].copy_from_slice(&narf_tpm::tpm2::TPM_ST_NO_SESSIONS.to_be_bytes());
+            out[2..6].copy_from_slice(&10u32.to_be_bytes());
+            out[6..10].copy_from_slice(&rc.to_be_bytes());
+            out
+        };
+        if tag != narf_tpm::tpm2::TPM_ST_NO_SESSIONS || cmd.len() != 14 {
+            return err(RC_SIZE);
+        }
+        let handle = u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]);
+        let st = self.state.lock();
+        let Some(idx) = Self::find_object(&st, handle) else {
+            return err(RC_HANDLE_1);
+        };
+        let obj = &st.objects[idx];
+        let mut body = Vec::new();
+        body.extend_from_slice(&(obj.public.len() as u16).to_be_bytes());
+        body.extend_from_slice(&obj.public);
+        body.extend_from_slice(&(obj.name.len() as u16).to_be_bytes());
+        body.extend_from_slice(&obj.name);
+        body.extend_from_slice(&(obj.qualified_name.len() as u16).to_be_bytes());
+        body.extend_from_slice(&obj.qualified_name);
+        drop(st);
+        let mut out = alloc::vec![0u8; 10 + body.len()];
+        out[0..2].copy_from_slice(&narf_tpm::tpm2::TPM_ST_NO_SESSIONS.to_be_bytes());
+        out[2..6].copy_from_slice(&((10 + body.len()) as u32).to_be_bytes());
+        out[10..].copy_from_slice(&body);
+        out
+    }
+
+    /// TPM2_FlushContext (Part 3 §11.4): unload a transient
+    /// object. A persistent object survives (it resolves through
+    /// its persistent handle afterwards); a non-persistent one is
+    /// gone entirely.
+    fn exec_flush_context(&self, tag: u16, cmd: &[u8]) -> Vec<u8> {
+        let err = |rc: u32| -> Vec<u8> {
+            let mut out = alloc::vec![0u8; 10];
+            out[0..2].copy_from_slice(&narf_tpm::tpm2::TPM_ST_NO_SESSIONS.to_be_bytes());
+            out[2..6].copy_from_slice(&10u32.to_be_bytes());
+            out[6..10].copy_from_slice(&rc.to_be_bytes());
+            out
+        };
+        if tag != narf_tpm::tpm2::TPM_ST_NO_SESSIONS || cmd.len() != 14 {
+            return err(RC_SIZE);
+        }
+        let handle = u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]);
+        let mut st = self.state.lock();
+        let Some(pos) = st
+            .objects
+            .iter()
+            .position(|o| o.loaded && o.handle == handle)
+        else {
+            return err(RC_HANDLE_1);
+        };
+        if st.objects[pos].persistent.is_some() {
+            st.objects[pos].loaded = false;
+        } else {
+            st.objects.remove(pos);
+        }
+        let mut out = alloc::vec![0u8; 10];
+        out[0..2].copy_from_slice(&narf_tpm::tpm2::TPM_ST_NO_SESSIONS.to_be_bytes());
+        out[2..6].copy_from_slice(&10u32.to_be_bytes());
+        out
+    }
+
+    /// TPM2_Quote (Part 3 §18): build the TPMS_ATTEST over the
+    /// selected PCRs of the SHA-256 bank and sign it with the
+    /// signing object's key (ECDSA, RFC 6979 via narf-crypto).
+    fn exec_quote(&self, tag: u16, cmd: &[u8]) -> Vec<u8> {
+        let err = |rc: u32| -> Vec<u8> {
+            let mut out = alloc::vec![0u8; 10];
+            out[0..2].copy_from_slice(&narf_tpm::tpm2::TPM_ST_NO_SESSIONS.to_be_bytes());
+            out[2..6].copy_from_slice(&10u32.to_be_bytes());
+            out[6..10].copy_from_slice(&rc.to_be_bytes());
+            out
+        };
+        if tag != narf_tpm::tpm2::TPM_ST_SESSIONS {
+            return err(RC_AUTH_MISSING);
+        }
+        let mut r = CmdReader::new(&cmd[10..]);
+        let Some(sign_handle) = r.u32() else {
+            return err(RC_SIZE);
+        };
+        let Some(presented_auth) = Self::parse_pw_auth(&mut r) else {
+            return err(RC_SIZE);
+        };
+        let Some(qualifying) = r.tpm2b() else {
+            return err(RC_SIZE);
+        };
+        if qualifying.len() > 32 {
+            return err(RC_SIZE);
+        }
+        // inScheme: TPM_ALG_NULL is a lone word; a signing scheme
+        // adds its hash.
+        let Some(scheme_alg) = r.u16() else {
+            return err(RC_SIZE);
+        };
+        let scheme_hash = if scheme_alg == narf_tpm::tpm2::TPM_ALG_NULL {
+            narf_tpm::tpm2::TPM_ALG_NULL
+        } else {
+            let Some(h) = r.u16() else {
+                return err(RC_SIZE);
+            };
+            h
+        };
+        let Some(count) = r.u32() else {
+            return err(RC_SIZE);
+        };
+        let mut selections: Vec<(u16, Vec<u8>)> = Vec::new();
+        for _ in 0..count {
+            let Some(alg) = r.u16() else {
+                return err(RC_SIZE);
+            };
+            let Some(size) = r.u8() else {
+                return err(RC_SIZE);
+            };
+            if size > 3 {
+                return err(RC_SIZE);
+            }
+            let Some(mask) = r.take(size as usize) else {
+                return err(RC_SIZE);
+            };
+            if alg != narf_tpm::tpm2::TPM_ALG_SHA256 {
+                return err(RC_VALUE);
+            }
+            selections.push((alg, mask.to_vec()));
+        }
+        if !r.at_end() {
+            return err(RC_SIZE);
+        }
+
+        let st = self.state.lock();
+        let Some(idx) = Self::find_object(&st, sign_handle) else {
+            return err(RC_HANDLE_1);
+        };
+        let obj = &st.objects[idx];
+        if obj.attributes & (1 << 18) == 0 {
+            // OBJ_SIGN — Quote requires a signing key.
+            return err(RC_ATTRIBUTES_1);
+        }
+        if presented_auth != obj.auth_value {
+            return err(RC_AUTH_FAIL_1);
+        }
+        let effective = if scheme_alg == narf_tpm::tpm2::TPM_ALG_NULL {
+            obj.scheme
+        } else {
+            (scheme_alg, scheme_hash)
+        };
+        if effective != obj.scheme || effective.0 != narf_tpm::tpm2::TPM_ALG_ECDSA {
+            return err(RC_VALUE);
+        }
+        // pcrDigest: H of the selected PCR values concatenated in
+        // selection order (Part 3, TPM2_Quote).
+        let mut concat = Vec::new();
+        for (_, mask) in &selections {
+            for (byte_idx, byte) in mask.iter().enumerate() {
+                for bit in 0..8 {
+                    if byte & (1 << bit) != 0 {
+                        concat.extend_from_slice(&st.pcrs[byte_idx * 8 + bit]);
+                    }
+                }
+            }
+        }
+        let pcr_digest = sha256(&concat);
+        // TPMS_ATTEST (Part 2 §10.12.8).
+        let mut attest = Vec::new();
+        attest.extend_from_slice(&narf_tpm::tpm2::TPM_GENERATED_VALUE.to_be_bytes());
+        attest.extend_from_slice(&narf_tpm::tpm2::TPM_ST_ATTEST_QUOTE.to_be_bytes());
+        attest.extend_from_slice(&(obj.qualified_name.len() as u16).to_be_bytes());
+        attest.extend_from_slice(&obj.qualified_name);
+        attest.extend_from_slice(&(qualifying.len() as u16).to_be_bytes());
+        attest.extend_from_slice(qualifying);
+        attest.extend_from_slice(&st.clock_ms.to_be_bytes());
+        attest.extend_from_slice(&st.reset_count.to_be_bytes());
+        attest.extend_from_slice(&st.restart_count.to_be_bytes());
+        attest.push(1u8); // clockInfo.safe = TPM_YES
+        let firmware_version: u64 = 0x0001_0000u64 << 32; // PT_FIRMWARE_VERSION_1
+        attest.extend_from_slice(&firmware_version.to_be_bytes());
+        attest.extend_from_slice(&(selections.len() as u32).to_be_bytes());
+        for (alg, mask) in &selections {
+            attest.extend_from_slice(&alg.to_be_bytes());
+            attest.push(mask.len() as u8);
+            attest.extend_from_slice(mask);
+        }
+        attest.extend_from_slice(&(pcr_digest.len() as u16).to_be_bytes());
+        attest.extend_from_slice(&pcr_digest);
+        let scalar = obj.scalar;
+        drop(st);
+
+        let digest = sha256(&attest);
+        let Some((sig_r, sig_s)) = narf_crypto::p256::ecdsa::sign_p256(&scalar, &digest) else {
+            return err(RC_FAILURE);
+        };
+        // TPMT_SIGNATURE: ECDSA + hash + r/s TPM2B_ECC_PARAMETERs.
+        let mut signature = Vec::new();
+        signature.extend_from_slice(&narf_tpm::tpm2::TPM_ALG_ECDSA.to_be_bytes());
+        signature.extend_from_slice(&narf_tpm::tpm2::TPM_ALG_SHA256.to_be_bytes());
+        signature.extend_from_slice(&(sig_r.len() as u16).to_be_bytes());
+        signature.extend_from_slice(&sig_r);
+        signature.extend_from_slice(&(sig_s.len() as u16).to_be_bytes());
+        signature.extend_from_slice(&sig_s);
+        let mut params = Vec::new();
+        params.extend_from_slice(&(attest.len() as u16).to_be_bytes());
+        params.extend_from_slice(&attest);
+        params.extend_from_slice(&signature);
+        Self::sessions_ok(None, &params)
+    }
+
     /// The model's TPM_PT property table (Part 2 §6.12–§6.15),
     /// ascending by tag: the fixed group first, then
     /// TPM_PT_PERMANENT from the variable group. The identity is
@@ -715,25 +1409,47 @@ impl FakeTpmDevice {
                 0
             }
             x if x == narf_tpm::tpm2::TPM_CAP_ALGS => {
-                // TPML_ALG_PROPERTY: SHA-256, TPMA_ALGORITHM.hash
-                // (bit 2) — the only algorithm the command core
-                // implements.
+                // TPML_ALG_PROPERTY with TPMA_ALGORITHM words
+                // (Part 2 §10.1: asymmetric = bit 0, hash = bit 2,
+                // object = bit 3, signing = bit 8): SHA-256 (the
+                // hash), ECDSA (the signing scheme), ECC (the
+                // object algorithm) — the set the command core
+                // implements after #945.
+                const MODEL_ALGS: [(u16, u32); 3] = [
+                    (narf_tpm::tpm2::TPM_ALG_SHA256, 0x0000_0004),
+                    (narf_tpm::tpm2::TPM_ALG_ECDSA, 0x0000_0101),
+                    (narf_tpm::tpm2::TPM_ALG_ECC, 0x0000_0009),
+                ];
+                data.extend_from_slice(&(MODEL_ALGS.len() as u32).to_be_bytes());
+                for (alg, tpma) in MODEL_ALGS {
+                    data.extend_from_slice(&alg.to_be_bytes());
+                    data.extend_from_slice(&tpma.to_be_bytes());
+                }
+                0
+            }
+            x if x == narf_tpm::tpm2::TPM_CAP_ECC_CURVES => {
+                // TPML_ECC_CURVE: NIST P-256, the one curve the
+                // object core derives and signs with.
                 data.extend_from_slice(&1u32.to_be_bytes());
-                data.extend_from_slice(&narf_tpm::tpm2::TPM_ALG_SHA256.to_be_bytes());
-                data.extend_from_slice(&0x0000_0004u32.to_be_bytes());
+                data.extend_from_slice(&narf_tpm::tpm2::TPM_ECC_NIST_P256.to_be_bytes());
                 0
             }
             x if x == narf_tpm::tpm2::TPM_CAP_COMMANDS => {
                 // TPML_CCA: one attribute word per 32 command
                 // codes, indexed from TPM_CC_FIRST (0x11F). Four
                 // words cover every code the core implements.
-                const MODEL_COMMANDS: [u32; 6] = [
+                const MODEL_COMMANDS: [u32; 11] = [
                     narf_tpm::tpm2::TPM_CC_STARTUP,
                     narf_tpm::tpm2::TPM_CC_SHUTDOWN,
                     narf_tpm::tpm2::TPM_CC_GET_CAPABILITY,
                     narf_tpm::tpm2::TPM_CC_GET_RANDOM,
                     narf_tpm::tpm2::TPM_CC_PCR_READ,
                     narf_tpm::tpm2::TPM_CC_PCR_EXTEND,
+                    narf_tpm::tpm2::TPM_CC_CREATE_PRIMARY,
+                    narf_tpm::tpm2::TPM_CC_EVICT_CONTROL,
+                    narf_tpm::tpm2::TPM_CC_READ_PUBLIC,
+                    narf_tpm::tpm2::TPM_CC_FLUSH_CONTEXT,
+                    narf_tpm::tpm2::TPM_CC_QUOTE,
                 ];
                 let mut words = [0u32; 4];
                 for cc in MODEL_COMMANDS {
@@ -747,9 +1463,38 @@ impl FakeTpmDevice {
                 0
             }
             x if x == narf_tpm::tpm2::TPM_CAP_HANDLES => {
-                // TPML_HANDLE: the model holds no loaded,
-                // persistent, or session handles.
-                data.extend_from_slice(&0u32.to_be_bytes());
+                // TPML_HANDLE filtered by the property's
+                // handle-type byte (Part 3 §30.2: the property is
+                // the handle value to start from; handles of the
+                // named type at or after it are reported): loaded
+                // transient handles and persistent handles from
+                // the object store (#945). A fresh model — and any
+                // property naming a type the model never holds,
+                // like the audit fixture's property 0 — reports
+                // the empty list.
+                let st = self.state.lock();
+                let mut handles: Vec<u32> = Vec::new();
+                for obj in &st.objects {
+                    if obj.loaded {
+                        handles.push(obj.handle);
+                    }
+                    if let Some(p) = obj.persistent {
+                        handles.push(p);
+                    }
+                }
+                handles.sort_unstable();
+                let type_byte = property & 0xFF00_0000;
+                let mut selected: Vec<u32> = handles
+                    .into_iter()
+                    .filter(|h| h & 0xFF00_0000 == type_byte && *h >= property)
+                    .collect();
+                if count > 0 && selected.len() > count {
+                    selected.truncate(count);
+                }
+                data.extend_from_slice(&(selected.len() as u32).to_be_bytes());
+                for h in selected {
+                    data.extend_from_slice(&h.to_be_bytes());
+                }
                 0
             }
             _ => return err(RC_VALUE),
@@ -1863,17 +2608,23 @@ fn smoke_tpm_getcapability_conversation() -> TestResult {
         Ok(p) => p.body().to_vec(),
         Err(_) => return TestResult::Fail("GetCapability(ALGS) response not a success frame"),
     };
-    // moreData(1) + cap(4) + count(4) + alg(2) + properties(4)
-    if body.len() != 15
+    // moreData(1) + cap(4) + count(4) + 3 × (alg(2) + properties(4)):
+    // SHA-256 (hash), ECDSA (asymmetric|signing), ECC
+    // (asymmetric|object) — the #945 alg set.
+    if body.len() != 27
         || body[0] != 0
-        || u32::from_be_bytes([body[5], body[6], body[7], body[8]]) != 1
+        || u32::from_be_bytes([body[5], body[6], body[7], body[8]]) != 3
         || u16::from_be_bytes([body[9], body[10]]) != narf_tpm::tpm2::TPM_ALG_SHA256
         || u32::from_be_bytes([body[11], body[12], body[13], body[14]]) != 0x0000_0004
+        || u16::from_be_bytes([body[15], body[16]]) != narf_tpm::tpm2::TPM_ALG_ECDSA
+        || u32::from_be_bytes([body[17], body[18], body[19], body[20]]) != 0x0000_0101
+        || u16::from_be_bytes([body[21], body[22]]) != narf_tpm::tpm2::TPM_ALG_ECC
+        || u32::from_be_bytes([body[23], body[24], body[25], body[26]]) != 0x0000_0009
     {
-        return TestResult::Fail("ALGS page != SHA-256 with the hash attribute");
+        return TestResult::Fail("ALGS page != SHA-256/ECDSA/ECC with their TPMA words");
     }
 
-    // (5) COMMANDS: the TPML_CCA bitmap names exactly the six
+    // (5) COMMANDS: the TPML_CCA bitmap names exactly the eleven
     // commands the model's core implements.
     let req = narf_tpm::tpm2::get_capability(narf_tpm::tpm2::TPM_CAP_COMMANDS, 0, 0);
     let resp = match submit(&req) {
@@ -1908,17 +2659,44 @@ fn smoke_tpm_getcapability_conversation() -> TestResult {
         narf_tpm::tpm2::TPM_CC_GET_RANDOM,
         narf_tpm::tpm2::TPM_CC_PCR_READ,
         narf_tpm::tpm2::TPM_CC_PCR_EXTEND,
+        narf_tpm::tpm2::TPM_CC_CREATE_PRIMARY,
+        narf_tpm::tpm2::TPM_CC_EVICT_CONTROL,
+        narf_tpm::tpm2::TPM_CC_READ_PUBLIC,
+        narf_tpm::tpm2::TPM_CC_FLUSH_CONTEXT,
+        narf_tpm::tpm2::TPM_CC_QUOTE,
     ] {
         if !has(cc) {
             return TestResult::Fail("COMMANDS bitmap missing an implemented command");
         }
     }
-    if has(0x0000_0153) {
-        // TPM_CC_Create — the model does not implement it.
-        return TestResult::Fail("COMMANDS bitmap claims TPM_CC_Create");
+    if has(0x0000_0153) || has(0x0000_0157) {
+        // TPM_CC_Create / TPM_CC_Load — the model does not
+        // implement them (the AK path is CreatePrimary-only).
+        return TestResult::Fail("COMMANDS bitmap claims Create/Load");
     }
 
-    // (6) HANDLES: the model holds none.
+    // (6) ECC_CURVES: the one curve the object core implements.
+    let req = narf_tpm::tpm2::get_capability(narf_tpm::tpm2::TPM_CAP_ECC_CURVES, 0, 0);
+    let resp = match submit(&req) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("GetCapability(ECC_CURVES) submit failed at transport"),
+    };
+    let body = match ResponseParser::new(&resp) {
+        Ok(p) => p.body().to_vec(),
+        Err(_) => {
+            return TestResult::Fail("GetCapability(ECC_CURVES) response not a success frame")
+        }
+    };
+    // moreData(1) + cap(4) + count(4) + curve(2)
+    if body.len() != 11
+        || body[0] != 0
+        || u32::from_be_bytes([body[5], body[6], body[7], body[8]]) != 1
+        || u16::from_be_bytes([body[9], body[10]]) != narf_tpm::tpm2::TPM_ECC_NIST_P256
+    {
+        return TestResult::Fail("ECC_CURVES page != NIST P-256 only");
+    }
+
+    // (7) HANDLES: a fresh model holds none.
     let req = narf_tpm::tpm2::get_capability(narf_tpm::tpm2::TPM_CAP_HANDLES, 0, 0);
     let resp = match submit(&req) {
         Ok(r) => r,
@@ -1932,7 +2710,7 @@ fn smoke_tpm_getcapability_conversation() -> TestResult {
         return TestResult::Fail("HANDLES page not empty");
     }
 
-    // (7) Property paging: a two-entry page from the first tag
+    // (8) Property paging: a two-entry page from the first tag
     // reports moreData; continuing from the next tag drains the
     // table (ending at TPM_PT_PERMANENT in the variable group).
     let req = narf_tpm::tpm2::get_capability(
@@ -1967,7 +2745,7 @@ fn smoke_tpm_getcapability_conversation() -> TestResult {
         _ => return TestResult::Fail("second property page does not drain at TPM_PT_PERMANENT"),
     }
 
-    // (8) An unknown capability is TPM_RC_VALUE, not a framed lie.
+    // (9) An unknown capability is TPM_RC_VALUE, not a framed lie.
     let req = narf_tpm::tpm2::get_capability(0xFFFF_FFFF, 0, 1);
     let resp = match submit(&req) {
         Ok(r) => r,
@@ -1984,6 +2762,526 @@ fn smoke_tpm_getcapability_conversation() -> TestResult {
 kernel_test_in!(
     "drivers/platform/tpm-getcapability",
     smoke_tpm_getcapability_conversation
+);
+
+// ── Attestation (#945): provision → quote → verify, and the ────
+// ── event log leaving the kernel ───────────────────────────────
+
+/// Stub measurement hooks for the attestation fixtures: the
+/// composition consults `narf_tpm::attest`, and these stand in for
+/// the probes `frame::measure` installs in production.
+fn attest_hook_log() -> Vec<u8> {
+    // One TCG_PCR_EVENT2 record in `frame::measure`'s encoder
+    // layout (pcrIndex LE, eventType LE, digestCount, SHA-256
+    // algId, digest, eventSize, label bytes) — the publication
+    // fixture asserts byte-identity, so the exact record content
+    // matters less than that it is this encoding's shape.
+    let label = b"attestation-log-fixture";
+    let mut v = Vec::new();
+    v.extend_from_slice(&4u32.to_le_bytes()); // pcrIndex
+    v.extend_from_slice(&0x0000_0007u32.to_le_bytes()); // eventType
+    v.extend_from_slice(&1u32.to_le_bytes()); // digestCount
+    v.extend_from_slice(&0x000Bu16.to_le_bytes()); // algId = SHA-256
+    v.extend_from_slice(&[0x77u8; 32]); // digest
+    v.extend_from_slice(&(label.len() as u32).to_le_bytes()); // eventSize
+    v.extend_from_slice(label);
+    v
+}
+fn attest_hook_extends() -> bool {
+    true
+}
+fn attest_hook_no_extends() -> bool {
+    false
+}
+
+fn smoke_tpm_attestation_conversation() -> TestResult {
+    use narf_tpm::attest::AttestError;
+    use narf_tpm::types::TpmRc;
+
+    narf_tpm::attest::__reset_measurement_hooks_for_test();
+    let mut dev = FakeTpmDevice::crb();
+    let mut cmd_mem = alloc::vec![0u8; 4096];
+    let mut rsp_mem = alloc::vec![0u8; 4096];
+    let cmd_ptr = cmd_mem.as_mut_ptr();
+    let rsp_ptr = rsp_mem.as_mut_ptr();
+    dev.attach_buffers(cmd_ptr, 4096, rsp_ptr, 4096);
+    let dev = Arc::new(dev);
+    if tpm::crb_acquire_and_program(
+        dev.as_ref(),
+        cmd_ptr as u64,
+        4096,
+        rsp_ptr as u64,
+        4096,
+        narf_time::Deadline::after_ms(750),
+    )
+    .is_err()
+    {
+        return TestResult::Fail("CRB bring-up failed against the model");
+    }
+    let adapter: Arc<dyn TpmDevice> = Arc::new(ModelDevice {
+        dev: dev.clone(),
+        cmd_ptr,
+        rsp_ptr,
+        tis: false,
+    });
+    let ak = crate::tpm_attestation::AK_PERSISTENT_HANDLE;
+    let nonce: &[u8] = b"attestation-fixture-nonce";
+    let mask: [u8; 3] = [0x10, 0x00, 0x00]; // PCR 4
+    let selections: [(u16, &[u8]); 1] = [(narf_tpm::tpm2::TPM_ALG_SHA256, &mask)];
+    let handles_of = |property: u32| -> Option<Vec<u32>> {
+        let req = narf_tpm::tpm2::get_capability(narf_tpm::tpm2::TPM_CAP_HANDLES, property, 0);
+        let resp = narf_scheduler::block_on_spin(adapter.submit_raw(&req)).ok()?;
+        let parser = narf_tpm::commands::ResponseParser::new(&resp).ok()?;
+        let body = parser.body();
+        if body.len() < 9 {
+            return None;
+        }
+        let count = u32::from_be_bytes([body[5], body[6], body[7], body[8]]) as usize;
+        if body.len() != 9 + count * 4 {
+            return None;
+        }
+        let mut out = Vec::new();
+        for i in 0..count {
+            let o = 9 + i * 4;
+            out.push(u32::from_be_bytes([
+                body[o],
+                body[o + 1],
+                body[o + 2],
+                body[o + 3],
+            ]));
+        }
+        Some(out)
+    };
+
+    // (1) Before Startup, the object/attestation commands draw
+    // TPM_RC_INITIALIZE like every other command.
+    let raw_quote = narf_tpm::commands::CommandBuilder::quote(
+        ak,
+        nonce,
+        (
+            narf_tpm::tpm2::TPM_ALG_ECDSA,
+            narf_tpm::tpm2::TPM_ALG_SHA256,
+        ),
+        &selections,
+    );
+    match narf_scheduler::block_on_spin(adapter.submit_raw(&raw_quote)) {
+        Ok(resp)
+            if matches!(
+                narf_tpm::commands::ResponseParser::new(&resp),
+                Err(HighLevelTpmError::Rc(TpmRc::Initialize))
+            ) => {}
+        _ => return TestResult::Fail("Quote before Startup not RC_INITIALIZE"),
+    }
+    let raw_create = narf_drivers_tpm::tpm2::commands::create_primary(
+        narf_drivers_tpm::tpm2::TPM_RH_ENDORSEMENT,
+        &[],
+        &narf_drivers_tpm::tpm2::objects::ecc_ak_template(),
+    );
+    match narf_scheduler::block_on_spin(adapter.submit_raw(&raw_create)) {
+        Ok(resp)
+            if matches!(
+                narf_tpm::commands::ResponseParser::new(&resp),
+                Err(HighLevelTpmError::Rc(TpmRc::Initialize))
+            ) => {}
+        _ => return TestResult::Fail("CreatePrimary before Startup not RC_INITIALIZE"),
+    }
+
+    // (2) Startup.
+    if narf_scheduler::block_on_spin(adapter.startup(narf_tpm::StartupType::Clear)).is_err() {
+        return TestResult::Fail("Startup(CLEAR) failed against the model");
+    }
+
+    // (3) The guard: with no hooks installed (fail closed) and
+    // with hooks reporting no extends, the composition refuses.
+    match narf_scheduler::block_on_spin(crate::tpm_attestation::attestation_quote(
+        adapter.as_ref(),
+        nonce,
+        &selections,
+    )) {
+        Err(HighLevelTpmError::Denied) => {}
+        _ => return TestResult::Fail("quote not refused with uninstalled hooks"),
+    }
+    narf_tpm::attest::install_measurement_hooks(narf_tpm::attest::MeasurementHooks {
+        event_log: attest_hook_log,
+        extends_observed: attest_hook_no_extends,
+    });
+    match narf_scheduler::block_on_spin(crate::tpm_attestation::attestation_quote(
+        adapter.as_ref(),
+        nonce,
+        &selections,
+    )) {
+        Err(HighLevelTpmError::Denied) => {}
+        _ => return TestResult::Fail("quote not refused against an untouched PCR set"),
+    }
+    narf_tpm::attest::install_measurement_hooks(narf_tpm::attest::MeasurementHooks {
+        event_log: attest_hook_log,
+        extends_observed: attest_hook_extends,
+    });
+
+    // (4) Provisioning: creates exactly one object; re-entry is a
+    // ReadPublic probe, not a second creation; the transient copy
+    // was flushed and the persistent handle is the only handle.
+    match narf_scheduler::block_on_spin(crate::tpm_attestation::ensure_ak(adapter.as_ref())) {
+        Ok(h) if h == ak => {}
+        _ => return TestResult::Fail("ensure_ak did not return the AK handle"),
+    }
+    if dev.object_count() != 1 {
+        return TestResult::Fail("provisioning created != 1 object");
+    }
+    match narf_scheduler::block_on_spin(crate::tpm_attestation::ensure_ak(adapter.as_ref())) {
+        Ok(h) if h == ak => {}
+        _ => return TestResult::Fail("ensure_ak re-entry failed"),
+    }
+    if dev.object_count() != 1 {
+        return TestResult::Fail("ensure_ak re-entry created a second object");
+    }
+    match handles_of(0x8100_0000) {
+        Some(hs) if hs == alloc::vec![ak] => {}
+        _ => return TestResult::Fail("HANDLES(persistent) != [AK] after provisioning"),
+    }
+    match handles_of(0x8000_0000) {
+        Some(hs) if hs.is_empty() => {}
+        _ => return TestResult::Fail("HANDLES(transient) not empty after the provisioning flush"),
+    }
+
+    // (5) ReadPublic cross-checks, computed independently of the
+    // model's own helpers: the name/qname via narf-crypto's
+    // SHA-256 (the model used its in-file copy), and the unique
+    // point via the documented derivation preimage.
+    let public = match narf_scheduler::block_on_spin(crate::tpm_attestation::read_public(
+        adapter.as_ref(),
+        ak,
+    )) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("ReadPublic(AK) failed after provisioning"),
+    };
+    if public.out_public.len() < 8
+        || u32::from_be_bytes([
+            public.out_public[4],
+            public.out_public[5],
+            public.out_public[6],
+            public.out_public[7],
+        ]) != narf_drivers_tpm::tpm2::objects::OBJ_ATTR_AK
+    {
+        return TestResult::Fail("AK public attributes != OBJ_ATTR_AK");
+    }
+    let mut h = narf_crypto::sha256::Sha256::new();
+    h.update(&public.out_public);
+    let mut want_name = alloc::vec![0x00, 0x0B];
+    want_name.extend_from_slice(&h.finalize());
+    if public.name != want_name {
+        return TestResult::Fail("AK name != nameAlg || H(public) (independent hash)");
+    }
+    let mut qn_input = Vec::new();
+    qn_input.extend_from_slice(&narf_drivers_tpm::tpm2::TPM_RH_ENDORSEMENT.to_be_bytes());
+    qn_input.extend_from_slice(&want_name);
+    let mut h = narf_crypto::sha256::Sha256::new();
+    h.update(&qn_input);
+    let mut want_qname = alloc::vec![0x00, 0x0B];
+    want_qname.extend_from_slice(&h.finalize());
+    if public.qualified_name != want_qname {
+        return TestResult::Fail("AK qualified name != nameAlg || H(hierarchy || name)");
+    }
+    // The template's fixed layout: header fields occupy 20 bytes,
+    // then x TPM2B, y TPM2B.
+    if public.out_public.len() != 88
+        || u16::from_be_bytes([public.out_public[20], public.out_public[21]]) != 32
+        || u16::from_be_bytes([public.out_public[54], public.out_public[55]]) != 32
+    {
+        return TestResult::Fail("AK public unique is not a P-256 point at the template offsets");
+    }
+    let template = narf_drivers_tpm::tpm2::objects::ecc_ak_template();
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(b"narf-tpm-model primary derivation v1");
+    preimage.extend_from_slice(&narf_drivers_tpm::tpm2::TPM_RH_ENDORSEMENT.to_be_bytes());
+    preimage.extend_from_slice(&template);
+    let mut h = narf_crypto::sha256::Sha256::new();
+    h.update(&preimage);
+    let seed = h.finalize();
+    let scalar = narf_crypto::p256::Scalar::from_bytes_be_reduce(&seed);
+    let point = narf_crypto::p256::point::scalar_mul_base(&scalar);
+    match point.to_encoded() {
+        Some(enc)
+            if enc[..32] == public.out_public[22..54] && enc[32..] == public.out_public[56..88] => {
+        }
+        _ => return TestResult::Fail("AK point != the documented derivation's point"),
+    }
+
+    // (6) Extend PCR 4; the read-back must equal the device-side
+    // chain (and the model's own extend formula).
+    let digest1 = [0x5Au8; 32];
+    if narf_scheduler::block_on_spin(adapter.extend_pcr(4, &digest1)).is_err() {
+        return TestResult::Fail("extend_pcr(4) failed");
+    }
+    let value1 = pcr_extend_value(&[0u8; 32], &digest1);
+    match narf_scheduler::block_on_spin(adapter.read_pcr(4)) {
+        Ok(v) if v == value1.to_vec() && dev.pcr(4) == value1 => {}
+        _ => return TestResult::Fail("PCR 4 read-back != the extend chain"),
+    }
+
+    // (7) Quote + the remote-party verification, end to end.
+    let bundle1 = match narf_scheduler::block_on_spin(crate::tpm_attestation::attestation_quote(
+        adapter.as_ref(),
+        nonce,
+        &selections,
+    )) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("attestation_quote failed"),
+    };
+    if bundle1.ak_qualified_name != public.qualified_name || bundle1.ak_public != public.out_public
+    {
+        return TestResult::Fail("quote bundle's AK identity != ReadPublic's");
+    }
+    let verified = match narf_tpm::attest::verify_quote(
+        &bundle1.attest_bytes,
+        &bundle1.signature,
+        &bundle1.ak_public,
+        &bundle1.ak_qualified_name,
+        nonce,
+        &[(4, value1)],
+    ) {
+        Ok(info) => info,
+        Err(e) => {
+            return TestResult::Fail(match e {
+                AttestError::BadStructure => "verifier: BadStructure",
+                AttestError::BadMagic => "verifier: BadMagic",
+                AttestError::NotAQuote => "verifier: NotAQuote",
+                AttestError::ExtraDataMismatch => "verifier: ExtraDataMismatch",
+                AttestError::SignerMismatch => "verifier: SignerMismatch",
+                AttestError::PcrDigestMismatch => "verifier: PcrDigestMismatch",
+                AttestError::BadSignature => "verifier: BadSignature",
+                AttestError::Unsupported => "verifier: Unsupported",
+            })
+        }
+    };
+    if verified.extra_data.as_slice() != nonce || verified.clock_info.reset_count != 1 {
+        return TestResult::Fail("verified attestation fields wrong (extraData / resetCount)");
+    }
+
+    // (8) Tamper negatives. State first: a second extend moves
+    // PCR 4, and the first quote must now fail the digest check —
+    // while a fresh quote over the new state verifies.
+    let digest2 = [0xA5u8; 32];
+    if narf_scheduler::block_on_spin(adapter.extend_pcr(4, &digest2)).is_err() {
+        return TestResult::Fail("second extend_pcr(4) failed");
+    }
+    let value2 = pcr_extend_value(&value1, &digest2);
+    match narf_tpm::attest::verify_quote(
+        &bundle1.attest_bytes,
+        &bundle1.signature,
+        &bundle1.ak_public,
+        &bundle1.ak_qualified_name,
+        nonce,
+        &[(4, value2)],
+    ) {
+        Err(AttestError::PcrDigestMismatch) => {}
+        _ => return TestResult::Fail("stale quote not rejected after the PCR moved"),
+    }
+    let bundle2 = match narf_scheduler::block_on_spin(crate::tpm_attestation::attestation_quote(
+        adapter.as_ref(),
+        nonce,
+        &selections,
+    )) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("second attestation_quote failed"),
+    };
+    if narf_tpm::attest::verify_quote(
+        &bundle2.attest_bytes,
+        &bundle2.signature,
+        &bundle2.ak_public,
+        &bundle2.ak_qualified_name,
+        nonce,
+        &[(4, value2)],
+    )
+    .is_err()
+    {
+        return TestResult::Fail("fresh quote over the moved PCR state did not verify");
+    }
+    // A flipped byte in clockInfo — covered by no check but the
+    // signature — must fail as BadSignature.
+    let mut tampered = bundle1.attest_bytes.clone();
+    let clock_off = 4 + 2 + (2 + bundle1.ak_qualified_name.len()) + (2 + nonce.len());
+    tampered[clock_off] ^= 0x01;
+    match narf_tpm::attest::verify_quote(
+        &tampered,
+        &bundle1.signature,
+        &bundle1.ak_public,
+        &bundle1.ak_qualified_name,
+        nonce,
+        &[(4, value1)],
+    ) {
+        Err(AttestError::BadSignature) => {}
+        _ => return TestResult::Fail("tampered attestation not BadSignature"),
+    }
+    // Wrong challenge, wrong signer.
+    match narf_tpm::attest::verify_quote(
+        &bundle1.attest_bytes,
+        &bundle1.signature,
+        &bundle1.ak_public,
+        &bundle1.ak_qualified_name,
+        b"a-different-nonce",
+        &[(4, value1)],
+    ) {
+        Err(AttestError::ExtraDataMismatch) => {}
+        _ => return TestResult::Fail("wrong nonce not ExtraDataMismatch"),
+    }
+    let mut wrong_qname = bundle1.ak_qualified_name.clone();
+    wrong_qname[33] ^= 0x01;
+    match narf_tpm::attest::verify_quote(
+        &bundle1.attest_bytes,
+        &bundle1.signature,
+        &bundle1.ak_public,
+        &wrong_qname,
+        nonce,
+        &[(4, value1)],
+    ) {
+        Err(AttestError::SignerMismatch) => {}
+        _ => return TestResult::Fail("wrong signer not SignerMismatch"),
+    }
+
+    // (9) Restart persistence: Shutdown + Startup(CLEAR) resets
+    // the PCRs and flushes transients; the persistent AK survives
+    // and re-provisioning creates nothing.
+    let shutdown = narf_tpm::tpm2::shutdown(narf_tpm::tpm2::TPM_SU_CLEAR);
+    if narf_scheduler::block_on_spin(adapter.submit_raw(&shutdown)).is_err()
+        || narf_scheduler::block_on_spin(adapter.startup(narf_tpm::StartupType::Clear)).is_err()
+    {
+        return TestResult::Fail("shutdown/startup cycle failed");
+    }
+    match handles_of(0x8100_0000) {
+        Some(hs) if hs == alloc::vec![ak] => {}
+        _ => return TestResult::Fail("AK persistent handle lost across the restart"),
+    }
+    match narf_scheduler::block_on_spin(crate::tpm_attestation::ensure_ak(adapter.as_ref())) {
+        Ok(h) if h == ak => {}
+        _ => return TestResult::Fail("ensure_ak after restart failed"),
+    }
+    if dev.object_count() != 1 {
+        return TestResult::Fail("restart re-provisioned a second object");
+    }
+    // The restarted boot's PCR 4 is its reset value; a quote over
+    // it verifies against that state.
+    let bundle3 = match narf_scheduler::block_on_spin(crate::tpm_attestation::attestation_quote(
+        adapter.as_ref(),
+        nonce,
+        &selections,
+    )) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("attestation_quote after restart failed"),
+    };
+    if narf_tpm::attest::verify_quote(
+        &bundle3.attest_bytes,
+        &bundle3.signature,
+        &bundle3.ak_public,
+        &bundle3.ak_qualified_name,
+        nonce,
+        &[(4, [0u8; 32])],
+    )
+    .is_err()
+    {
+        return TestResult::Fail("post-restart quote did not verify against the reset PCR state");
+    }
+
+    narf_tpm::attest::__reset_measurement_hooks_for_test();
+    let _ = (cmd_mem, rsp_mem);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/tpm-attestation",
+    smoke_tpm_attestation_conversation
+);
+
+fn smoke_tpm_attestation_event_log_publication() -> TestResult {
+    // Same global-state hygiene as the publication fixture: the
+    // registry, the bridge slots, and now the measurement hooks.
+    let teardown = || {
+        narf_drivers_tpm::devfs_bridge::unregister_dev_nodes();
+        narf_drivers_tpm::devfs_bridge::unregister_transport();
+        narf_drivers_tpm::sysfs_bridge::register_sysfs_tpm0(
+            Arc::new(DeadTransport) as Arc<dyn narf_drivers_tpm::devfs_bridge::TpmTransport>
+        );
+        narf_tpm::registry::__reset_for_test();
+        narf_tpm::attest::__reset_measurement_hooks_for_test();
+    };
+    teardown();
+    narf_tpm::attest::install_measurement_hooks(narf_tpm::attest::MeasurementHooks {
+        event_log: attest_hook_log,
+        extends_observed: attest_hook_extends,
+    });
+
+    let mut dev = FakeTpmDevice::crb();
+    let mut cmd_mem = alloc::vec![0u8; 4096];
+    let mut rsp_mem = alloc::vec![0u8; 4096];
+    let cmd_ptr = cmd_mem.as_mut_ptr();
+    let rsp_ptr = rsp_mem.as_mut_ptr();
+    dev.attach_buffers(cmd_ptr, 4096, rsp_ptr, 4096);
+    let dev = Arc::new(dev);
+    let run = || -> Result<(), &'static str> {
+        if tpm::crb_acquire_and_program(
+            dev.as_ref(),
+            cmd_ptr as u64,
+            4096,
+            rsp_ptr as u64,
+            4096,
+            narf_time::Deadline::after_ms(750),
+        )
+        .is_err()
+        {
+            return Err("CRB bring-up failed against the model");
+        }
+        let adapter: Arc<dyn TpmDevice> = Arc::new(ModelDevice {
+            dev: dev.clone(),
+            cmd_ptr,
+            rsp_ptr,
+            tis: false,
+        });
+        if narf_scheduler::block_on_spin(adapter.startup(narf_tpm::StartupType::Clear)).is_err() {
+            return Err("Startup(CLEAR) failed against the model");
+        }
+        narf_tpm::registry::register(adapter.clone());
+        tpm::publish_userspace_surface(adapter.clone());
+
+        let sysfs = narf_filesystem::sysfs::sysfs_root();
+        let tpm0 = sysfs
+            .get_child("class")
+            .and_then(|c| c.get_child("tpm"))
+            .and_then(|c| c.get_child("tpm0"))
+            .ok_or("tpm0 class device missing")?;
+        if !tpm0.bin_attr_names().contains(&"binary_bios_measurements") {
+            return Err("binary_bios_measurements not registered on tpm0");
+        }
+        // The published bytes are the hook's bytes, exactly; the
+        // paged read serves offsets and EOF the way a userspace
+        // verifier's pread loop expects.
+        let want = attest_hook_log();
+        let mut buf = [0u8; 128];
+        match tpm0.bin_attr_read("binary_bios_measurements", 0, &mut buf) {
+            Some(n) if n == want.len() && buf[..n] == want[..] => {}
+            _ => return Err("event log read != the installed hook's bytes"),
+        }
+        let tail = want.len() - 3;
+        let mut buf2 = [0u8; 8];
+        match tpm0.bin_attr_read("binary_bios_measurements", tail, &mut buf2) {
+            Some(3) if buf2[..3] == want[tail..] => {}
+            _ => return Err("event log offset read wrong"),
+        }
+        match tpm0.bin_attr_read("binary_bios_measurements", want.len(), &mut buf2) {
+            Some(0) => {}
+            _ => return Err("event log read at EOF != 0"),
+        }
+        Ok(())
+    };
+    let result = run();
+    teardown();
+    let _ = (cmd_mem, rsp_mem);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers/platform/tpm-attestation",
+    smoke_tpm_attestation_event_log_publication
 );
 
 // ── PCR_Read framing (#1065): the model speaks Part 3 §22.6 ─────

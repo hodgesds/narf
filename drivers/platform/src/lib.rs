@@ -65,6 +65,9 @@ pub mod proc_thermal;
 pub mod smbus;
 pub mod thermal;
 pub mod tpm;
+/// Attestation composition (#945): AK provisioning + guarded
+/// quote production over the registered TPM device.
+pub mod tpm_attestation;
 /// Vendor WMI hotkey dispatch — Dell, HP, and Lenovo laptop Fn-key
 /// events delivered through ACPI WMI event GUIDs.
 /// Must init after `narf-aml` WMI GUID enumeration (Stage::Subsys,

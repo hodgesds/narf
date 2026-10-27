@@ -34,6 +34,14 @@ narf-scheduler    = { path = "../../scheduler" }
 narf-time         = { path = "../../time" }
 narf-kernel-test     = { path = "../../verification/kernel-test" }
 narf-firmware-smbios = { path = "../../firmware/smbios" }
+# Used only by the TPM device model (tpm_fixture): the model's AK
+# derivation and Quote signing need real P-256 math, and a third
+# hand-copied ECC implementation in fixture code is exactly the
+# transcription risk the model's copied SHA-256 (100 lines, FIPS-
+# pinned) does not pose at ECC's size. Production code in this
+# crate does not import narf-crypto. `ecdsa-sign` enables the
+# RFC 6979 deterministic signer (the verifier side is ungated).
+narf-crypto       = { path = "../../crypto", features = ["ecdsa-sign"] }
 async-trait       = "0.1"
 
 [features]
