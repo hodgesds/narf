@@ -505,6 +505,11 @@ pub enum SubmitError {
     /// nothing was programmed. See
     /// [`crate::intel_gpu_forcewake`].
     Forcewake,
+    /// Production glue only: submissions are gated off by
+    /// power management (suspend in progress or device
+    /// suspended) — nothing was programmed. See
+    /// [`crate::intel_gpu_pm`].
+    Suspended,
 }
 
 // ── GPU-memory backing seam ─────────────────────────────────────
@@ -1374,6 +1379,18 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// allocations. Returns the completions in CSB order. Also
     /// pumps the ports afterwards, so a caller that only polls
     /// keeps the engine fed.
+    /// Whether the engine has no work anywhere: nothing
+    /// queued, nothing in flight, and no context in the
+    /// pending or active execlists ports. Callers that need a
+    /// quiesced engine (power management, #1015) drain via
+    /// [`Self::poll_completions`] until this holds.
+    pub fn is_idle(&self) -> bool {
+        self.queue.is_empty()
+            && self.inflight.is_empty()
+            && self.pending.iter().all(|p| p.is_none())
+            && self.active.iter().all(|a| a.is_none())
+    }
+
     pub fn poll_completions(&mut self) -> Vec<CompletedRequest> {
         let mut done = Vec::new();
         let tail = ((self.status.read32(CSB_WRITE_BYTE) & 0xFF) as u8) % CSB_ENTRIES;
@@ -1567,6 +1584,40 @@ type RcsState = Option<(ProductionEngine, Option<ContextId>, Forcewake, BarWindo
 static RCS_STATE: narf_lib::sync::IrqSafeSpinLock<RcsState> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
+/// Power-management submission gate (Q9, #1015). While closed,
+/// [`submit_dwords`] refuses with [`SubmitError::Suspended`]
+/// before it can attach the engine or program a register, so
+/// a suspending device never takes new work. The PM suspend
+/// path closes the gate, drains completions until
+/// [`production_idle`] holds, and only then touches power
+/// state — which is also what makes the drain meaningful:
+/// forcewake holds are scoped to a single submission, so a
+/// closed gate plus a drained engine means zero holds exist.
+static SUBMISSIONS_GATED: narf_lib::sync::IrqSafeSpinLock<bool> =
+    narf_lib::sync::IrqSafeSpinLock::new(false);
+
+/// Close or open the PM submission gate. Idempotent.
+pub fn set_submission_gate(closed: bool) {
+    *SUBMISSIONS_GATED.lock() = closed;
+}
+
+/// Whether the PM submission gate is currently closed.
+pub fn submissions_gated() -> bool {
+    *SUBMISSIONS_GATED.lock()
+}
+
+/// Whether the production engine has no work in flight. An
+/// unattached engine is idle by definition (nothing was ever
+/// submitted). Callers drain with
+/// [`poll_default_completions`] until this holds.
+pub fn production_idle() -> bool {
+    let mut guard = RCS_STATE.lock();
+    match guard.as_mut() {
+        Some((engine, _, _, _)) => engine.is_idle(),
+        None => true,
+    }
+}
+
 fn attach_default() -> Result<(), SubmitError> {
     let (engine, fw_window) = crate::intel_gpu::with_controller(|gpu| {
         gpu.chip_info().generation.region_generation()?;
@@ -1590,6 +1641,11 @@ fn attach_default() -> Result<(), SubmitError> {
 /// use. Returns the engine-wide request id; completion is
 /// observed through [`poll_default_completions`].
 pub fn submit_dwords(dwords: &[u32]) -> Result<u64, SubmitError> {
+    // PM gate first: a gated submission must not attach the
+    // engine or touch hardware on its way to refusal.
+    if submissions_gated() {
+        return Err(SubmitError::Suspended);
+    }
     let mut guard = RCS_STATE.lock();
     if guard.is_none() {
         drop(guard);
