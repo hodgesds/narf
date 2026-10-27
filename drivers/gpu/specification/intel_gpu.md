@@ -1223,3 +1223,97 @@ trusted.
   preloaded DDI_BUF_TRANS table).
 - §5's device table is unchanged by this lane: the MTL DIDs
   were already in the census; only their display gate moved.
+## 14. Media engines — VCS / VECS (`intel_gpu_media`, #1022)
+
+The Gen12 media engines brought to the §8 (RCS0) standard.
+The execlists machinery of §8 is shared, not forked:
+`intel_gpu_rcs` is generalised over an `EngineSpec` (register
+base, descriptor engine class + instance, context-image
+allocation bound, render-group presence), and each media
+engine is an `RcsEngine` instantiated over its spec. Compiled
+only under the gpu crate's `intel` feature; no new initcalls
+(the engines attach lazily like RCS). Sources: TGL PRM
+Vol. 2c (engine register blocks), cross-checked against
+i915's `intel_gt_regs.h` (Gen11 media ring bases),
+`intel_engine_cs.c` (engine table, per-class context sizes),
+`intel_lrc.c` (descriptor upper-dword construction; the
+Gen12 XCS register-state offset table), and `i915_reg.h`
+(Gen11 media forcewake sub-domain registers).
+
+Public interface:
+
+- Engine table — `VCS0_SPEC` (base `0x1c0000`, video-decode
+  class 1, instance 0), `VCS1_SPEC` (base `0x1c4000`, class
+  1, instance 1), `VECS0_SPEC` (base `0x1c8000`,
+  video-enhance class 2, instance 0);
+  `GEN12_MEDIA_ENGINES` and `media_engines_for(gen)` are the
+  inventory. The probe path announces exactly this set for a
+  probed Gen12 part; no engine-query UAPI exists in the tree
+  yet, and none is claimed here.
+- Descriptor — `context_descriptor_for(spec, lrca, sw_id)`
+  in `intel_gpu_rcs`: SW id at bits 37:47, engine instance
+  at bits 48:53, engine class at bits 61:63 with the
+  Gen12-era i915 class numbering (render 0, video decode 1,
+  video enhance 2, copy 3, other 4). The RCS descriptor is
+  the class-0/instance-0 special case and is byte-identical
+  to its pre-generalisation form.
+- Register state — `build_reg_state_for(spec, …)`: the
+  shared PRM ENGINE CONTEXT layout at the engine's own base.
+  The one structural delta from RCS: group 2
+  (`R_PWR_CLK_STATE`) is render-only (i915's Gen12 XCS
+  offset table has no third group), so media templates
+  leave those dwords zero. Media image allocation bound is
+  4 pages over the 2-page non-render hardware image
+  (`GEN8_LR_CONTEXT_OTHER_SIZE`).
+- VA batches — `RcsEngine::submit_ppgtt` (§8's engine, any
+  spec): the batch-start carries the PPGTT address-space
+  indicator, the batch is addressed at the VA equal to its
+  GGTT offset (identity placement over the GGTT arena), and
+  submission refuses with `PpgttNotAttached` when the
+  context carries no root from §9's `attach_ppgtt`. This is
+  the VA-batch step §8/§9 deferred to this lane.
+- Forcewake — `MediaForcewake`: refcounted holds over the
+  Gen11 media sub-domains (`VdBox(n)` request `0xa540 + 4n`,
+  ack `0x0d50 + 4n`; `VeBox(n)` request `0xa560 + 4n`, ack
+  `0x0d70 + 4n`), masked-write protocol with the
+  aggregate-domain discipline (poll-counted ack budget,
+  one clear→set re-kick, rollback on timeout). Production
+  submissions and engine bring-up run inside the engine's
+  sub-domain hold; completion polling takes none (the CSB
+  is host memory). Composition with the aggregate MEDIA
+  domain of #1013 is at the marked seam in
+  `submit_media_dwords` — the sub-domain hold nests inside
+  it once that lane lands.
+- Production glue — `submit_media_dwords(engine, dwords)` /
+  `poll_media_completions(engine)` over `MediaEngineId`,
+  mirroring §8's glue. Every production engine on the
+  controller allocates from the one arena
+  (`intel_gpu_rcs::production_arena`), so objects never
+  alias across engines.
+
+Invariants:
+
+- One engine's contexts, rings, status page and doorbell
+  never alias another's: the fixtures run all three engines
+  concurrently over one arena and one register file and
+  assert per-engine descriptors, completions and
+  breadcrumbs; a wedged engine (hardware never posts CSB)
+  does not block a peer's submissions or completions.
+- A failed forcewake acquire holds nothing; a media
+  submission's doorbell is always inside a held sub-domain
+  (fixture-pinned write order).
+- The generalised §8 paths are regression-pinned: the RCS
+  descriptor and RCS register-state template are asserted
+  byte-identical to their pre-generalisation forms, and the
+  existing §8 fixtures pass unchanged.
+
+Flagged for first-silicon verification: the per-SKU media
+engine set (a part with an engine fused off is still listed
+— the media fuse readout that trims the table is not
+modelled); the 4-page media image bound; and the descriptor
+class numbering's era (later i915 trees renumbered their
+internal class enum — the Gen12 execlists construction
+governs here). BCS0 (copy, base `0x22000`) is one more
+`EngineSpec` away and deliberately out of this lane's
+scope; MTL media belongs to the Xe-LPG GT generation and is
+not claimed.

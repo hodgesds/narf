@@ -1184,6 +1184,24 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         crate::intel_gpu_edp::enable_psr_for_panel(&dev, &mode);
     }
 
+    // Media-engine inventory (#1022): announce exactly the
+    // execlists media engines the submission path can drive
+    // on this part — the same list `intel_gpu_media` attaches
+    // lazily on first submit.
+    if let Some(rg) = dev.chip_info().generation.region_generation() {
+        let engines = crate::intel_gpu_media::media_engines_for(rg);
+        if !engines.is_empty() {
+            let mut names = alloc::string::String::new();
+            for (i, spec) in engines.iter().enumerate() {
+                if i > 0 {
+                    names.push(' ');
+                }
+                names.push_str(spec.name);
+            }
+            log_probe(&alloc::format!("media engines present: {}", names), &device);
+        }
+    }
+
     let scanout_mode = dev.current_mode();
     // Power management (Q9, #1015) covers the Gen12 register
     // map only. Xe-LPG now has a region map and a display
