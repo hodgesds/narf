@@ -364,3 +364,113 @@ table entry, `phys | PRESENT`) and PDP0–PDP2 stay zero — the
 encoding `attach_ppgtt` writes (§8). It is a single patch
 site in `intel_gpu_rcs` if bring-up shows otherwise.
 
+
+## 10. eDP panel power sequencing + PSR (Stage 5 — `intel_gpu_edp`, #1020)
+
+The internal-panel counterpart of the external-DP path
+(§7 + Q4's session work): the eDP panel on DDI A is powered
+by the PPS block and kept in Panel Self Refresh between
+updates. Compiled only under the gpu crate's `intel`
+feature. Sources: eDP 1.4b (DPCD field map, via
+`drm_dp.h`), TGL PRM Vol. 2c + Vol. 12 displays volumes
+(PPS/PSR register map and field encodings), with
+`intel_pps.c` / `intel_psr.c` (+ their `*_regs.h`) from
+Linux i915 read as cross-checks of the flows, not as the
+source of the constants.
+
+Public interface:
+
+- `PanelPowerSequencer` — the PPS conversation over an
+  `MmioWindow`. `new` adopts firmware-programmed delay
+  fields verbatim; only zero fields (and the T8/T9 fields,
+  which are forced to 1 because the waits run in software)
+  fall back to the eDP spec's upper-limit defaults
+  (`PanelDelays::SPEC_DEFAULTS`: T1+T3 210 ms, T8/T9 50 ms,
+  T10 500 ms, T11+T12 610 ms). `init_registers` programs the
+  delay registers and the PP_CONTROL cycle-delay field
+  (100 ms granularity on CNP+ PCH — there is no PP_DIVISOR).
+  `power_on` enforces the power cycle (status-side
+  IDLE_CYCLE poll plus the software remainder of T11+T12
+  from the recorded power-off stamp) before setting
+  PANEL_POWER_ON, then waits for the on-idle state;
+  `vdd_on`/`vdd_off` are the TCON/VDD discipline;
+  `backlight_on`/`backlight_off` gate EDP_BLC_ENABLE with
+  T8/T9 observed in software. A panel that misses its
+  on-idle budget is left powered-down (power target and
+  VDD-force cleared) with a typed `PpsError`; the backlight
+  gate never opens for an unpowered panel.
+- `PsrCaps::probe` — one burst read of DPCD 0x070..0x074
+  plus the sync-latency byte at 0x2009. Support 0 or a
+  reserved value (>4) declines as `Ok(None)` — plain eDP,
+  zero PSR traffic. A claiming panel with a reserved
+  setup-time code (7) is refused with a typed error.
+  Granularity bytes are honoured only when the sink
+  requires programmed granularity; zero fields fall back
+  to 4×4 rather than propagating a divide-by-zero.
+- `psr_enable` / `psr_disable` — the enable conversation:
+  entry-setup validity is checked against the mode's
+  vertical blanking before any write; PSR2 programs the
+  sink (ALPM_CONFIG, then PSR_EN_CFG, then SET_POWER D0),
+  writes PSR1's CTL disabled, then PSR2_CTL + MAN_TRK in
+  continuous full frame. PSR2 falls back to PSR1 when the
+  mode's scanlines make the BSpec wake times (42/45 µs)
+  exceed 12 lines. PSR1 programs EN_CFG 0x07
+  (ENABLE|MAIN_LINK_ACTIVE|CRC) + SET_POWER D0, then the
+  source CTL. TP intervals use the conservative 2500 µs
+  bucket (no VBT in this driver); idle frames follow
+  i915's formula `max(6, sink_sync_latency + 1)`, frames
+  before SU `max(sink_sync_latency + 1, 2)` (+1 past the
+  entry-setup count). Disable runs source-first, then
+  clears the sink byte.
+- The runtime seam — `runtime_install_panel`,
+  `runtime_install_psr`, `set_flip_pending`,
+  `notify_scanout_dirty`, `on_scanout_published` — is how
+  the framebuffer publish path drives PSR: a scanout
+  publish notifies a full-frame update (which is what
+  exits PSR), a region notify drives PSR2 selective
+  update, and nothing polls. A notify while a flip is
+  pending is refused before any register write. Probe
+  wiring: PPS runs first inside the display block of
+  `intel_gpu::probe` (a failed sequence skips backlight
+  install, takeover, and the scanout move entirely), PSR
+  is attempted once a real mode exists, and
+  `publish_scanout` calls `on_scanout_published` with no
+  locks held. `panel_power_off` composes the shutdown:
+  registered backlight brightness to zero
+  (`narf_drivers_backlight::panel_owner`, the #1037
+  composition seam), PSR disable, then the PPS T9 → T10
+  sequence.
+
+Invariants:
+
+- The MAN_TRK value for a partial update encodes exactly
+  the granularity-aligned dirtied region (outward-aligned
+  to the sink's SU granularity, TGL additionally to
+  4 lines) — never the full frame. The fixture suite
+  asserts both platform encodings byte-for-value.
+- No PSR register or DPCD byte is written for a panel that
+  did not claim PSR, and no PPS step is skipped: cycle
+  delay before power-on, T8 before the backlight gate,
+  backlight gate closed (and T9 observed) before power
+  drops.
+- Lock order is CONTROLLER → EDP_RUNTIME; the runtime
+  lock is never held across an AUX transaction or a
+  console write, and the MMIO window passed to
+  `notify_scanout_dirty` is caller-built from the BAR
+  (same discipline as takeover's adapter).
+
+Composition points and named omissions:
+
+- PSR2 selective fetch's plane registers
+  (PLANE_SEL_FETCH_*) belong to lane 1's plane-programming
+  surface; MAN_TRK is the SU discipline implemented here,
+  and sel-fetch composition lands with the plane lane.
+- ADL-P stepping workaround Wa_22012278275 (scrambled
+  early-transport map) is not applied: this driver has no
+  stepping readout yet.
+- Sink sync latency is read from the last-actual field of
+  DP_SYNCHRONIZATION_LATENCY_IN_SINK (bits [7:4]); i915's
+  max-latency field (bits [3:0]) is the alternative —
+  flagged for first-silicon verification, as is the
+  PCH PPS base (0xC7200) on the south-display SKUs this
+  queue covers.
