@@ -795,8 +795,10 @@ and RC6/DMC conversations composed here.
 ### 13.1 Registration and census
 
 At probe success (Gen12-class parts only — the predicate
-is `region_generation().is_some()`, the same one the RCS
-attach uses; Xe-LPG is excluded until #1016), probe
+is `region_generation() == Some(RegionGeneration::Gen12)`;
+Xe-LPG has a region map and display engine since #1016 but
+no modelled forcewake/RC6/DMC programming, so it stays
+excluded), probe
 retains its `(BusDevice, Cap)` in the PM module and
 registers, both under the name `"intel-gpu"`: a
 `device_pm` ops pair (S3 fan-out) and a `SuspendStateHook`
@@ -1126,3 +1128,98 @@ no infoframes/SCDC — a follow-up, not filed here), YCbCr
 4:2:0 and deep colour (character rate ≠ pixel clock —
 the rate rule's premise is 8 bpc RGB), HDCP (separate
 programme), HDMI 2.1 FRL, Type-C HDMI alt mode.
+
+## 17. Xe-LPG display — Meteor Lake (lane Q10, #1016)
+
+Meteor Lake's display engine is Xe-LPG, a different IP block
+from Gen12's Xe-LP. Before this lane, probe identified MTL SKUs
+but the takeover path ran the Gen12 sequence at them; lane 1
+gated MTL/PTL to identify-and-skip, and this lane implements
+the real Xe-LPG path. Sources are the Meteor Lake display PRM
+(§2) as implemented by i915 — `intel_cx0_phy_regs.h`,
+`intel_cx0_phy.c`, `intel_cdclk.c`, `intel_ddi.c`,
+`intel_display_power_map.c` — never the Gen12 code being
+diverged from.
+
+Structure: dispatch is by generation at the single takeover
+entry (`intel_gpu_modeset::takeover_display`). Gen12 silicon
+runs the Gen12 orchestrator byte-identically; Meteor Lake runs
+`intel_gpu_modeset_xelpg::XeLpgModeset`. The pipe / transcoder /
+plane register block did not move, so both orchestrators build
+those programs from the shared `intel_gpu_pipes` codecs.
+
+### 10.1 Port / PHY map
+
+| Port | BAR0 block | PHY | TRANS_CLK_SEL idx | TRANS_DDI_FUNC_CTL idx | AUX well (AUX2) |
+| ---- | ---------- | --- | ----------------- | ---------------------- | --------------- |
+| DDI A | 0x64000 | C10 | 0 | 0 | AUX_A (0) |
+| DDI B | 0x64100 | C10 | 1 | 1 | AUX_B (1) |
+| TC1 | 0x16F200 | C20 | 2 | 9 | AUX_USBC1 (3) |
+| TC2 | 0x16F400 | C20 | 3 | 10 | AUX_USBC2 (4) |
+
+Port register offsets are per-port absolutes, not a uniform
+stride (e.g. the message-bus timer sits at +0xD8 on DDI A/B but
++0x58 on the TC ports). `DDI_CLK_VALFREQ` exists only on the
+C10 ports; C20 carries its rate in the PHY's serdes-rate VDR.
+
+### 10.2 PHY programming (C10 / C20)
+
+The port PLLs live inside the PHYs and are programmed over a
+per-lane message bus (`M2P_MSGBUS_CTL` / `P2M_MSGBUS_STATUS`):
+write transactions are committed or uncommitted, every
+transaction is followed by a bus reset, and an ACK whose
+command type doesn't match the transaction — or any answer
+with the error bit set — fails the modeset with
+`ModesetError::PhyBusFailure` rather than programming through
+a wrong-generation PHY. C10 state is a 20-byte PLL table plus
+CMN/TX bytes; C20 state lives in SRAM contexts (the program
+writes the context the serdes toggle bit does not select,
+then flips the bit). TX signal levels are VDR override
+registers (SNPS preset tables), staged before training and
+re-applied with the trained levels after. PLL enable order:
+port clock control (MAXPCLK select, SSC PLLB for the MPLLB
+tables) → lane reset + powerdown staging (P2 reset, then P0
+active) → PLL state → per-TX single-TX disables →
+`DDI_CLK_VALFREQ` (C10 only) → PCLK PLL request/ACK. Every MTL
+port also traverses the die-to-die (D2D) link, enabled
+unconditionally in the retrain preamble.
+
+### 10.3 Power wells and CDCLK
+
+Xe-LPD well topology (`PWR_WELL_CTL2` = 0x45404,
+`PWR_WELL_CTL_AUX2` = 0x45444, HSW request/state encoding):
+PW_1 (idx 0, transcoder A + DDI A/B) → PW_A (idx 5, pipe A) →
+the port's AUX well. CDCLK runs on the fixed 38.4 MHz MTL
+reference: six rungs (172.8–652.8 MHz), the two lowest reached
+by squash waveforms programmed in `CDCLK_SQUASH_CTL`; the
+modeset raises CDCLK to the `pixel_clock ≤ 2 × CDCLK` floor
+and never lowers a faster firmware setting. The current-CDCLK
+readback decodes ratio + divider + squash popcount — under
+squash the CDCLK_CTL decimal field is nominal and is not
+trusted.
+
+### 10.4 Gates and named remainders
+
+- `display_supported()`: Gen12 + Meteor Lake. **Panther Lake
+  stays off** — Xe3-LPD is a different display IP generation
+  (widened clock-select fields, different PLL tables and DDI
+  arrangement); the MTL sequence must not claim it.
+- `backlight_supported()`: Gen12 only. MTL's PWM path belongs
+  to the backlight composition lane (PR #1037); the modeset
+  shipping first must not claim a backlight it cannot drive.
+- Region enumeration: `RegionGeneration::XeLpg` — display at
+  0x40000/0x40000 plus the TC block at 0x16F000/0x1000, and
+  **no DPLL region** (Xe-LPG has no DPLL block; Gen12's DPLL
+  range is the TC block here).
+- Not programmed by this lane: watermark / DBUF allocation
+  (i915 computes MTL allocations from pcode latency tables;
+  firmware's allocation is retained), HDMI PLL states, DP 2.0
+  UHBR rates (the DP stack tops out at HBR3), MST / multi-pipe,
+  DVFS/pcode notifications around CDCLK changes, and
+  per-iteration TX-level updates inside the DPCD training loop
+  (would need a source-side callback in the shared
+  `dp_link_training`; levels are staged before training and
+  re-applied after, the same simplification class as Gen12's
+  preloaded DDI_BUF_TRANS table).
+- §5's device table is unchanged by this lane: the MTL DIDs
+  were already in the census; only their display gate moved.

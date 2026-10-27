@@ -255,6 +255,11 @@ pub enum ModesetError {
     /// (HDMI path, #1019): no divider lands the Combo-PHY DCO
     /// inside its window for this clock.
     HdmiClockUnsupported,
+    /// Xe-LPG PHY message-bus failure (#1016): the C10/C20 PHY
+    /// answered with its error bit set, or with an ACK that does
+    /// not match the transaction (e.g. a wrong-generation PHY
+    /// behind the port). The Gen12 path never produces this.
+    PhyBusFailure,
     /// Caller-supplied framebuffer doesn't satisfy Gen12 plane
     /// alignment (stride must be a multiple of 64 for linear
     /// surfaces).
@@ -2510,6 +2515,19 @@ pub mod tests {
 /// Attempt to take over the display from UEFI GOP without disrupting
 /// the existing framebuffer mapping.
 pub fn takeover_display(gpu: &crate::intel_gpu::IntelGpu) -> Option<Mode> {
+    // Generation dispatch (#1016): Meteor Lake's display engine
+    // is Xe-LPG, not Gen12 — running this module's sequence on it
+    // was the defect lane Q10 closes. The dispatch lives at the
+    // single takeover entry so the Gen12 body below stays
+    // byte-identical for Gen12 silicon. Panther Lake (Xe3-LPD)
+    // remains gated off in `display_supported` and never reaches
+    // here.
+    if matches!(
+        gpu.chip.generation,
+        crate::intel_gpu::Generation::MeteorLake
+    ) {
+        return crate::intel_gpu_modeset_xelpg::takeover_display(gpu);
+    }
     use crate::intel_gpu_aux::MmioWindow;
     use crate::intel_gpu_ddi::Ddi;
     use crate::intel_gpu_pipes::{

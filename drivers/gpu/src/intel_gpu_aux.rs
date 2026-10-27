@@ -122,6 +122,12 @@ const HW_RETRIES: u32 = 3;
 pub struct IntelAux<'a, M: MmioWindow + ?Sized> {
     mmio: &'a M,
     ddi: Ddi,
+    /// Absolute BAR0 offset of this port's AUX register block
+    /// (the CTL register sits at `base + DDI_AUX_CTL_OFFSET`).
+    /// On Gen12 this is `ddi.base()`; Xe-LPG ports have their
+    /// own AUX bases (#1016) and construct via
+    /// [`IntelAux::with_base`].
+    base: u64,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for IntelAux<'a, M> {
@@ -145,17 +151,38 @@ pub trait MmioWindow {
 impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
     /// Create a transport for `ddi` over the BAR0 window `mmio`.
     pub fn new(mmio: &'a M, ddi: Ddi) -> Self {
-        Self { mmio, ddi }
+        Self {
+            base: ddi.base(),
+            mmio,
+            ddi,
+        }
+    }
+
+    /// Create a transport over an explicit AUX register base.
+    ///
+    /// Xe-LPG (MTL) ports do not share the Gen12 DDI register
+    /// stride: their AUX blocks sit at per-port absolute offsets
+    /// (see `intel_gpu_xelpg::XeLpgPort::aux_base`). The AUX
+    /// transaction protocol itself — CTL/DATA fields, message
+    /// packing, timeout/poll discipline — is unchanged from
+    /// Gen12, so only the base differs. `ddi` is retained for
+    /// diagnostics only.
+    pub fn with_base(mmio: &'a M, base: u64) -> Self {
+        Self {
+            mmio,
+            ddi: Ddi::A,
+            base,
+        }
     }
 
     /// Absolute MMIO offset of this port's `DDI_AUX_CTL`.
     fn aux_ctl_off(&self) -> u64 {
-        self.ddi.base() + DDI_AUX_CTL_OFFSET
+        self.base + DDI_AUX_CTL_OFFSET
     }
 
     /// Absolute MMIO offset of `DDI_AUX_DATA[n]` for this port.
     fn aux_data_off(&self, n: usize) -> u64 {
-        self.ddi.base() + DDI_AUX_DATA_OFFSET + (n as u64) * 4
+        self.base + DDI_AUX_DATA_OFFSET + (n as u64) * 4
     }
 
     /// Pack a wire-format AUX request into the AUX_DATA dwords.
