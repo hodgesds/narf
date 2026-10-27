@@ -1,0 +1,22 @@
+[package]
+name = "narf-ctap2"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.narf]
+release-managed = true
+
+[dependencies]
+## ecdsa-sign: the fixture authenticator signs assertions with
+## narf-crypto's RFC 6979 P-256 signer (feature-gated upstream).
+narf-crypto = { path = "../crypto", features = ["ecdsa-sign"] }
+aes = { version = "0.8", default-features = false }
+narf-kernel-test = { path = "../verification/kernel-test" }
+
+[features]
+default = []
+kernel-test = []
+## Exposes the fixture authenticator (`fixture_token`) to
+## downstream test harnesses (e.g. drivers/usb kernel-test
+## smokes). Never enable in production builds.
+fixture-token = []

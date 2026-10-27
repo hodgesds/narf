@@ -50,6 +50,7 @@ members = [
     "wireless",
     "accel",
     "tpm",
+    "ctap2",
     "spdm",
     "pmbus",
     "i3c",
