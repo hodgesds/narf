@@ -712,6 +712,8 @@ pub mod intel_gpu_pipes;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_pll;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_pm;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_ppgtt;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_rc6;
