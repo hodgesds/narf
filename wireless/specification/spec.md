@@ -114,9 +114,21 @@ grant no channel, power, key, BA, controlled-port or publication authority.
 `ApElements::parse` validates an entire IE stream of at most2048 bytes with
 exact singleton HT Capabilities/Operation and VHT Capabilities/Operation pairs.
 `observe_with_phy` and `JoinPlan::prepare_with_phy` opt into this admission;
-the latter reparses the actual BSS and retains a private `Offer` bound to its
+the latter reparses the actual BSS and retains its own `Offer` bound to its
 addresses, primary channel and original mode/rate offer. Legacy entry points
 retain their existing membership-selector rejection.
+
+`Offer::from_elements(local, ies, primary)` supplies the same pure PHY selection
+for a native FullMAC AP IE snapshot. It bounds the complete stream to2048 bytes,
+derives HT/VHT membership selectors internally with the existing rate parser,
+requires one nonempty Supported Rates IE and known nonzero basic/legacy rates,
+and rejects duplicate/malformed rate elements, unsupported mandatory selectors
+and5GHz CCK basic rates. `offer.response_elements(ies)` derives response selectors
+and intersects the original offer, including occupied channels, basic MCS,
+directional TX maps/GI/LDPC and width limits. These APIs do not synthesize a
+BSS or response and do not prove peer/status, SSID, security, legacy-rate
+agreement, native channel, firmware completion, power, key or port authority.
+The FullMAC owner must retain and check those independent native facts.
 
 The opt-in path admits mandatory HT127/VHT126 membership selectors only with
 the corresponding complete compatible PHY, while preserving actual legacy

@@ -6,8 +6,14 @@ use alloc::{string::String, sync::Arc};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::Interface;
 use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessError};
+#[path = "ht40_conversation_tests.rs"]
+mod ht40_conversation_tests;
 #[path = "ht_conversation_tests.rs"]
 mod ht_conversation_tests;
+#[path = "protection_conversation_tests.rs"]
+mod protection_conversation_tests;
+#[path = "source_conversation_tests.rs"]
+mod source_conversation_tests;
 #[path = "wmm_conversation_tests.rs"]
 mod wmm_conversation_tests;
 fn five_ghz_policy() -> narf_wireless::reg::RegulatoryDomain {
@@ -885,6 +891,7 @@ enum TestPhy {
     Legacy,
     Wmm,
     Ht,
+    Ht40,
 }
 fn composition_radio(
     version: u32,
@@ -914,6 +921,9 @@ fn composition_radio(
     if phy == TestPhy::Ht {
         ht_conversation_tests::enable(&h);
         h.model(|m| m.data.as_mut().unwrap().rx_phy = Some((8, 7, 0x80)));
+    }
+    if phy == TestPhy::Ht40 {
+        ht40_conversation_tests::enable(&h)?;
     }
     if power_save {
         h.model(|model| {

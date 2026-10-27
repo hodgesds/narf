@@ -1074,6 +1074,7 @@
       ],
       "requirements": [
         "The retained RTL8188EE channel1/basic1Mbps Open/WPA2 station requires signed measured rtlwifi/rtl8188ee-cal-v1-<factory MAC lowercase hex>.bin matching the factory identity and current power envelope; physical qualification remains required. Other rtlwifi chips remain gated.",
+        "Optional RTL8188EE HT20/LGI MCS0-7 requires a separate signed measured rtlwifi/rtl8188ee-ht20-lgi-v1-<factory MAC lowercase hex>.bin NEHT record, bound to the exact preceding NEPC file, full factory identity, uploaded rtlwifi/rtl8188efw.bin digest and native recipe supplied by ht20_request(). Stage it while parked before the first packet owner starts; no legacy qualification grants HT. These dynamic per-device records are external requirements, not fixed payloads checked by this catalog.",
         "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
       ]
     },

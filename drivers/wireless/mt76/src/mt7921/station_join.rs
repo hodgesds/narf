@@ -645,6 +645,7 @@ impl<B: Backend> Session<B> {
                         self.ht20_profile.map_or(1, |p| p.receive_streams()),
                         self.ht20_profile.is_some_and(|p| p.receive_ldpc()),
                         self.ht20_profile.is_some_and(|p| p.receive_stbc()),
+                        channel <= 14,
                     )
                 {
                     self.clear_aggregate_receive();
@@ -1093,6 +1094,9 @@ impl<B: Backend> Session<B> {
         if info.capabilities.phy.bands & band.capability() == 0 {
             return Err(Error::InvalidIdentity);
         }
+        let initial_limits = permission
+            .rate_limits_for_paths(info.capabilities.phy.spatial_streams)
+            .ok_or(Error::Bounds)?;
         let own = info.capabilities.mac;
         let mut plan = JoinPlan::prepare_native(bss, own, ssid, security, info, permission)?;
         plan.append_sme_ies(extra_ies).map_err(|_| Error::Bounds)?;
@@ -1153,7 +1157,7 @@ impl<B: Backend> Session<B> {
                     id: 0x5d,
                     query: false,
                 },
-                &permission.rate_limits(),
+                &initial_limits,
             )
             .await?;
             self.confirm_command_progress().await?;
@@ -1242,10 +1246,18 @@ impl<B: Backend> Session<B> {
             self.management_rate = plan.management_rate();
             if let Some((width, center)) = plan.phy_channel() {
                 let narrower = permission.narrow(width, center).ok_or(Error::Bounds)?;
-                if width != permission.native_width() || center != permission.center_channel() {
+                if width != permission.native_width()
+                    || center != permission.center_channel()
+                    || plan.transmit_streams() > 1
+                {
                     self.station_permission = Some(narrower);
-                    self.reconfigure_station_channel(info, bss.channel, narrower)
-                        .await?;
+                    self.reconfigure_station_channel(
+                        info,
+                        bss.channel,
+                        narrower,
+                        plan.transmit_streams(),
+                    )
+                    .await?;
                 }
             }
             if let Some(profile) = plan.ht20() {
@@ -1570,7 +1582,14 @@ impl<B: Backend> Session<B> {
         info: super::RadioInfo,
         channel: u8,
         permission: crate::mt7921::association::TxPermission,
+        tx_streams: u8,
     ) -> Result<(), Error> {
+        if !(1..=info.capabilities.phy.spatial_streams).contains(&tx_streams) {
+            return Err(Error::Bounds);
+        }
+        let limits = permission
+            .rate_limits_for_paths(info.capabilities.phy.spatial_streams)
+            .ok_or(Error::Bounds)?;
         let band = crate::mt7921::channel::band(channel).ok_or(Error::Bounds)?;
         let channels = permission.channels();
         let mut domain = vec![0; 12 + 8 * channels.len()];
@@ -1596,7 +1615,7 @@ impl<B: Backend> Session<B> {
                 id: 0x5d,
                 query: false,
             },
-            &permission.rate_limits(),
+            &limits,
         )
         .await?;
         self.confirm_command_progress().await?;
@@ -1606,7 +1625,7 @@ impl<B: Backend> Session<B> {
             channel,
             permission.center_channel(),
             permission.native_width(),
-            1,
+            tx_streams,
             (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
             band.switch_tag(),
             &mut switch,

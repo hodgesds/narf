@@ -41,7 +41,14 @@ Production provisioning uses the existing externally signed `pack-firmware`
 command and build-time trusted public keys. RTL8188EU, RTL8188EE and RTL8822CE
 additionally require signed, measured per-factory-MAC board-power artifacts;
 neither these fixtures nor unsigned developer firmware can satisfy that
-requirement. EE uses `rtlwifi/rtl8188ee-cal-v1-<12 lowercase MAC hex digits>.bin`;
+requirement. EE uses `rtlwifi/rtl8188ee-cal-v1-<12 lowercase MAC hex digits>.bin`.
+optional HT20/LGI additionally needs the signed measured1184-byte NEHT record
+`rtlwifi/rtl8188ee-ht20-lgi-v1-<12 lowercase MAC hex digits>.bin`. Its request
+binds the exact earlier NEPC file, full factory identity, uploaded executable
+digest and native recipe. Each MCS0–7 row needs an actual measured selectable
+gain; unknown entries supply no permission. Stage it while parked before the
+first packet owner starts. The catalog reports this dynamic requirement but
+does not generate measurements or count its filename as a fixed payload.
 8822CE uses `rtw88/rtw8822ce-cal-v2-<12 lowercase MAC hex digits>.bin`. Its v2
 qualification binds both calibration emission and the complete reachable
 autonomous response-rate envelope; a fixed1Mbps host data rate does not narrow

@@ -536,6 +536,26 @@ macro_rules! selection_accessors {
 }
 impl Offer {
     selection_accessors!();
+    /// Select factual PHY limits from a complete native AP IE snapshot.
+    /// Rate element validation and mandatory HT/VHT selectors are derived
+    /// internally. The caller retains peer, SSID, security and native channel
+    /// ownership; this parser grants no association or transmit authority.
+    pub fn from_elements(
+        local: LocalPhy,
+        bytes: &[u8],
+        primary: u8,
+    ) -> Result<Option<Self>, Error> {
+        Self::prepare(local, bytes, primary, element_selectors(bytes, primary)?)
+    }
+    /// Intersect a native association-response IE snapshot with this offer.
+    /// The caller must already prove the actual response's peer/status and
+    /// native completion. This does not build or authenticate a response.
+    pub fn response_elements(&self, bytes: &[u8]) -> Result<Negotiated, Error> {
+        self.response(
+            bytes,
+            element_selectors(bytes, self.0.ht.operation.primary())?,
+        )
+    }
     pub(super) fn prepare(
         local: LocalPhy,
         bytes: &[u8],
@@ -560,7 +580,7 @@ impl Offer {
             self.0.ht.operation.primary(),
         )?;
         check_selectors(selectors, next.vht.is_some())?;
-        if self.0.vht.is_some() && next.vht.is_none()
+        if self.0.vht.is_some() != next.vht.is_some()
             || next.channels[..next.count]
                 .iter()
                 .any(|ch| !self.occupied_channels().contains(ch))
@@ -603,6 +623,26 @@ impl Offer {
 }
 impl Negotiated {
     selection_accessors!();
+}
+
+fn element_selectors(bytes: &[u8], primary: u8) -> Result<u8, Error> {
+    let band = channel::band(primary).ok_or(Error::InvalidBss)?;
+    if bytes.len() > 2048 {
+        return Err(Error::InvalidBss);
+    }
+    let mut rates = super::RateElements {
+        phy: true,
+        ..Default::default()
+    };
+    super::ies(bytes, |id, body| rates.observe(id, body))?;
+    if !rates.supported
+        || rates.rates == 0
+        || rates.basic == 0
+        || band == channel::Band::Ghz5 && rates.basic & 15 != 0
+    {
+        return Err(Error::UnsupportedRates);
+    }
+    Ok(rates.selectors)
 }
 
 pub(super) fn check_selectors(selectors: u8, vht: bool) -> Result<(), Error> {

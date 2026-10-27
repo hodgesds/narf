@@ -1307,3 +1307,163 @@ smoke!(
     smoke_phy_disjoint_mcs_and_malformed_optional_fail_closed,
     disjoint_and_no_malformed_fallback
 );
+
+fn native_element_snapshots() -> Result<(), &'static str> {
+    let scan = ap160(36, 50, true);
+    let offer = Offer::from_elements(local_vht160(), &scan.information_elements, 36)
+        .map_err(|_| "native snapshot original160")?
+        .ok_or("native snapshot missing HT")?;
+    let plan = prepare(&scan, local_vht160()).map_err(|_| "native snapshot host plan")?;
+    check!(
+        Some(&offer) == plan.offered_phy()
+            && offer.width() == Width::OneSixty
+            && offer.occupied_channels() == [36, 40, 44, 48, 52, 56, 60, 64],
+        "pure snapshot invented different native PHY facts"
+    );
+    let reply = ap(true, true, Some(0xfe));
+    let negotiated = offer
+        .response_elements(&reply.information_elements)
+        .map_err(|_| "native snapshot valid primary80 response")?;
+    check!(
+        negotiated.width() == Width::Eighty
+            && negotiated.center_channel() == 42
+            && negotiated.occupied_channels() == [36, 40, 44, 48],
+        "native response did not retain its real narrower geometry"
+    );
+    check!(
+        Offer::from_elements(local_vht(), &[1, 1, 0x8c], 36) == Ok(None),
+        "optional missing PHY could not retain legacy facts"
+    );
+    Ok(())
+}
+smoke!(
+    smoke_phy_native_element_snapshots_share_exact_offer_and_response_geometry,
+    native_element_snapshots
+);
+
+fn native_element_validation() -> Result<(), &'static str> {
+    let scan = ap(true, true, Some(0xfe));
+    let offer = Offer::from_elements(local_vht(), &scan.information_elements, 36)
+        .unwrap()
+        .unwrap();
+    for bytes in [
+        vec![],
+        vec![1, 0],
+        vec![1, 1, 0x8c, 1, 1, 0x98],
+        vec![1, 1, 0x8c, 50, 1, 0xff, 50, 1, 0xfe],
+        vec![1, 1, 0x82],              // CCK basic on5GHz.
+        vec![1, 1, 0x7f],              // Unflagged selector is not a basic legacy rate.
+        vec![1, 1, 0x8c, 50, 1, 0xfd], // Unsupported mandatory HE selector.
+        vec![1, 9, 0x8c],
+        vec![0; 2049],
+    ] {
+        check!(
+            Offer::from_elements(local_vht(), &bytes, 36).is_err()
+                && offer.response_elements(&bytes).is_err(),
+            "native snapshot malformed rates or unsupported selector admitted"
+        );
+    }
+    for selector in [0xff, 0xfe] {
+        check!(
+            Offer::from_elements(local_vht(), &[1, 1, 0x8c, 50, 1, selector], 36)
+                == Err(Error::UnsupportedRates),
+            "mandatory PHY selector admitted without that PHY"
+        );
+    }
+    check!(
+        Offer::from_elements(local_vht(), &scan.information_elements, 0).is_err(),
+        "native snapshot accepted an invalid primary"
+    );
+    Ok(())
+}
+smoke!(
+    smoke_phy_native_element_snapshots_derive_selectors_and_reject_malformed_rates,
+    native_element_validation
+);
+
+fn native_response_cannot_expand_offer() -> Result<(), &'static str> {
+    let mut mcs = [0; 10];
+    mcs[..2].fill(255);
+    let local = LocalPhy::vht80(
+        LocalHt::new(
+            mcs,
+            mcs,
+            HtWidth::TwentyForty,
+            HtGi {
+                rx20: true,
+                tx20: true,
+                rx40: true,
+                tx40: true,
+            },
+            0,
+            0,
+        )
+        .unwrap(),
+        LocalVht::new(0xfffa, 0xfffa, true, true, 0).unwrap(),
+    )
+    .unwrap();
+    let original = ap(true, true, Some(0xfe));
+    let facts = bodies(&original);
+    let mut ht = facts.ht_cap.unwrap();
+    ht[0] &= !0x60;
+    let mut vht = facts.vht_cap.unwrap();
+    vht[0] &= !0x20;
+    let scan = bss(
+        ht,
+        facts.ht_op.unwrap(),
+        Some((vht, facts.vht_op.unwrap())),
+        Some(0xfe),
+    );
+    let offer = Offer::from_elements(local, &scan.information_elements, 36)
+        .unwrap()
+        .unwrap();
+    ht[..2].copy_from_slice(&facts.ht_cap.unwrap()[..2]);
+    ht[4] = 255;
+    vht[..4].copy_from_slice(&facts.vht_cap.unwrap()[..4]);
+    vht[4..6].copy_from_slice(&0xfffau16.to_le_bytes());
+    let reply = bss(
+        ht,
+        facts.ht_op.unwrap(),
+        Some((vht, facts.vht_op.unwrap())),
+        Some(0xfe),
+    );
+    let n = offer
+        .response_elements(&reply.information_elements)
+        .map_err(|_| "native bounded response")?;
+    check!(
+        n.ht().tx_mcs()[1] == 0
+            && n.vht().unwrap().tx_mcs_map() == 0xfffc
+            && !n.ht().tx_sgi20()
+            && !n.ht().tx_sgi40()
+            && !n.vht().unwrap().tx_sgi80(),
+        "native response enabled TX NSS/GI omitted from original offer"
+    );
+    let ht_scan = ap(false, false, None);
+    let ht_offer = Offer::from_elements(local, &ht_scan.information_elements, 36)
+        .unwrap()
+        .unwrap();
+    let ht_facts = bodies(&ht_scan);
+    let unsolicited = bss(
+        ht_facts.ht_cap.unwrap(),
+        ht_facts.ht_op.unwrap(),
+        Some((facts.vht_cap.unwrap(), [0, 0, 0, 0xfc, 0xff])),
+        None,
+    );
+    check!(
+        ht_offer
+            .response_elements(&unsolicited.information_elements)
+            .is_err(),
+        "native response enabled VHT absent from original association offer"
+    );
+    check!(
+        ht_offer
+            .response_elements(&original.information_elements)
+            .is_err(),
+        "native response widened an original20MHz occupied offer"
+    );
+    Ok(())
+}
+smoke!(
+    smoke_phy_native_response_cannot_add_vht_width_tx_nss_or_gi,
+    native_response_cannot_expand_offer
+);

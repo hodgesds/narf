@@ -54,6 +54,7 @@ impl Ath10kMmio for RawMmio {
 struct Mmio<I = RawMmio> {
     cap: Cap<BusDeviceCap, Write>,
     io: I,
+    sources: Option<super::firmware_source::Source>,
 }
 struct RegisterOp<'a, I> {
     io: &'a mut I,
@@ -75,22 +76,37 @@ impl<I: Ath10kMmio> CapOp<BusDeviceCap, Write> for RegisterOp<'_, I> {
 impl<I: Ath10kMmio> Ath10kMmio for Mmio<I> {
     fn authorized(&self) -> bool {
         self.cap.invoke(NoopOp).is_ok()
+            && self
+                .sources
+                .as_ref()
+                .is_none_or(|s| s.invoke_boot(|| ()).is_ok())
     }
     fn read32(&mut self, offset: u64) -> u32 {
-        self.cap
-            .invoke(RegisterOp {
-                io: &mut self.io,
-                offset,
-                value: None,
-            })
-            .unwrap_or(u32::MAX)
+        let operation = RegisterOp {
+            io: &mut self.io,
+            offset,
+            value: None,
+        };
+        match &self.sources {
+            Some(s) => s
+                .invoke_boot(|| self.cap.invoke(operation))
+                .ok()
+                .and_then(Result::ok),
+            None => self.cap.invoke(operation).ok(),
+        }
+        .unwrap_or(u32::MAX)
     }
     fn write32(&mut self, offset: u64, value: u32) {
-        let _ = self.cap.invoke(RegisterOp {
+        let operation = RegisterOp {
             io: &mut self.io,
             offset,
             value: Some(value),
-        });
+        };
+        if let Some(s) = &self.sources {
+            let _ = s.invoke_boot(|| self.cap.invoke(operation));
+        } else {
+            let _ = self.cap.invoke(operation);
+        }
     }
 }
 
@@ -144,6 +160,31 @@ pub(super) struct PciBoot {
 }
 
 impl PciBoot {
+    pub(super) fn bind_sources(&mut self, source: super::firmware_source::Source) {
+        // Set once after ROM identity and before the first executable copy.
+        if self.mmio.sources.is_some() || source.bind_pci(self.mmio.cap).is_err() {
+            self.poisoned = true;
+            return;
+        }
+        self.mmio.sources = Some(source);
+    }
+    pub(super) fn current_sources(&self) -> Option<super::firmware_source::Source> {
+        self.mmio.sources.clone()
+    }
+    pub(super) fn check_sources(&self) -> Result<(), BmiError> {
+        if self.retired
+            || self.poisoned
+            || !self.mmio.authorized()
+            || self
+                .mmio
+                .sources
+                .as_ref()
+                .is_none_or(|s| s.check().is_err())
+        {
+            return Err(BmiError::DeviceGone);
+        }
+        Ok(())
+    }
     /// Probe must already have disabled inherited PCI bus mastering.
     pub fn new(
         device: BusDevice,
@@ -161,6 +202,7 @@ impl PciBoot {
             mmio: Mmio {
                 cap,
                 io: RawMmio(mmio),
+                sources: None,
             },
             hardware,
             registers,

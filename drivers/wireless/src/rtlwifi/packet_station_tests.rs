@@ -91,6 +91,9 @@ pub(super) struct Peer {
     hold_m4: bool,
     hold_data: bool,
     wmm: Option<Vec<u8>>,
+    ht: Option<Vec<u8>>,
+    controls: Vec<Vec<u8>>,
+    hold_control: bool,
 }
 impl Peer {
     fn new(protected: bool) -> Self {
@@ -121,6 +124,9 @@ impl Peer {
             hold_m4: false,
             hold_data: false,
             wmm: None,
+            ht: None,
+            controls: Vec::new(),
+            hold_control: false,
         }
     }
     fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
@@ -159,6 +165,17 @@ impl Peer {
         if frame.len() < 24 || frame[4..10] != PEER || frame[10..16] != self.plan.station {
             return Err("native AP peer identity");
         }
+        if frame[0] == 0xd0 && self.ht.is_some() {
+            if frame.len() != 33
+                || frame[24..26] != [3, 1]
+                || frame[27..29] != [37, 0]
+                || frame[29] & 1 != 0
+            {
+                return Err("AP native ADDBA refusal identity/status");
+            }
+            self.controls.push(frame.to_vec());
+            return Ok((Vec::new(), self.hold_control));
+        }
         if self.ap.phase() != ApPhase::Authorized || matches!(frame[0], 0 | 0xb0) {
             let before = self.ap.phase();
             let mut replies = self
@@ -169,6 +186,10 @@ impl Peer {
                 if reply.first() == Some(&0x10) {
                     if let Some(parameters) = &self.wmm {
                         reply.extend_from_slice(parameters);
+                    }
+                    if let Some(ht) = &self.ht {
+                        reply[25] |= 4;
+                        reply.extend_from_slice(ht);
                     }
                 }
             }
@@ -187,13 +208,13 @@ impl Peer {
             }
             return Ok((replies, before == ApPhase::Message4 && self.hold_m4));
         }
-        if frame[0] != if self.wmm.is_some() { 0x88 } else { 8 }
+        if !matches!(frame[0], 8 | 0x88)
             || frame[1] & 3 != 1
             || (frame[1] & 0x40 != 0) != self.ap.protected()
         {
             return Err("native AP data protection/direction");
         }
-        let header = if self.wmm.is_some() {
+        let header = if frame[0] == 0x88 {
             if frame.get(24..26) != Some(&[0, 0]) {
                 return Err("AP BE/TID0 QoS control");
             }
@@ -229,6 +250,12 @@ impl Peer {
         ethernet.extend_from_slice(&frame[10..16]);
         ethernet.extend_from_slice(&body[6..]);
         self.uplink.push(ethernet.clone());
+        if ethernet[12..14] == [0x88, 0x8e] && frame[0] == 8 {
+            return Ok((Vec::new(), self.hold_data));
+        }
+        if frame[0] != if self.wmm.is_some() { 0x88 } else { 8 } {
+            return Err("native AP ordinary DATA QoS shape");
+        }
         let replies = match self.server.receive(&ethernet) {
             Some(reply) => vec![self.downlink(&reply)?],
             None => Vec::new(),

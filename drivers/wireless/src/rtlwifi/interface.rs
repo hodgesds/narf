@@ -23,6 +23,11 @@ struct EndpointState {
     rx: narf_ipc::Producer<Frame, RX_RING_N>,
     tx: narf_ipc::Consumer<Frame, TX_RING_N>,
     pending: Option<Frame>,
+    epoch: u64,
+}
+struct Received {
+    bytes: Vec<u8>,
+    publication: Arc<station::Publication>,
 }
 impl EndpointState {
     fn clear(&mut self) {
@@ -44,7 +49,8 @@ pub(crate) struct Device<I: Port<Buffer = M>, M: Memory, E: Environment> {
     admission: Arc<station::Admission>,
     up: AtomicBool,
     bssid: AtomicU64,
-    rx: IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>,
+    ht: AtomicBool,
+    rx: Arc<IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
 }
 impl<I: Port<Buffer = M>, M: Memory, E: Environment> core::fmt::Debug for Device<I, M, E> {
@@ -88,6 +94,8 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
 impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'static> Device<I, M, E> {
     fn commit_close(&self, _publication: narf_lib::sync::IrqSafeSpinLockGuard<'_, ()>) {
         self.admission.closed.store(true, Ordering::Release);
+        self.ht.store(false, Ordering::Release);
+        *self.rx.lock() = None;
         self.update_link(None);
     }
     pub(super) fn new(
@@ -108,6 +116,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 rx,
                 tx,
                 pending: None,
+                epoch: 0,
             }),
             factory,
             environment,
@@ -116,7 +125,8 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             admission,
             up: AtomicBool::new(false),
             bssid: AtomicU64::new(0),
-            rx: IrqSafeSpinLock::new(Some(consumer)),
+            ht: AtomicBool::new(false),
+            rx: Arc::new(IrqSafeSpinLock::new(Some(consumer))),
             tx: IrqSafeSpinLock::new(Some(producer)),
         }
     }
@@ -166,6 +176,19 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             owner.stage_station_calibration(calibration, &self.environment.domain()?)?;
         }
         if owner.station_phase() == station::Phase::Dormant {
+            let rx = self.rx.clone();
+            owner.station_receive_retirement(Arc::new(move || {
+                *rx.lock() = None;
+            }));
+            if let Err(e) = owner.prepare_station_ht(&self.environment) {
+                if owner.phase() == Phase::Failed || owner.station_ht_capability().is_some() {
+                    owner.abort_station();
+                    self.close();
+                }
+                return Err(e);
+            }
+            self.ht
+                .store(owner.station_ht_capability().is_some(), Ordering::Release);
             owner.start_station_service(&self.environment).await?;
         }
         if owner.station_phase() == station::Phase::Failed {
@@ -181,19 +204,43 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         {
             return Err(());
         }
+        let publication = {
+            let owner = self.prepared.try_lock().ok_or(())?;
+            let owner = owner.as_ref().ok_or(())?;
+            if owner.station_peer().is_none() {
+                return Err(());
+            }
+            owner
+                .station_publication_token(&self.environment)
+                .map_err(|_| {
+                    self.request_abort();
+                })?
+        };
         let buffer = narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
             .map_err(|_| ())?;
         let mut frame = Frame::new(buffer, bytes.len() as u32);
         frame.payload_mut().copy_from_slice(bytes);
         frame.set_tx_meta(meta);
-        self.tx
-            .lock()
-            .as_mut()
-            .ok_or(())?
-            .try_send(frame)
-            .map_err(|_| ())
+        let result = self.environment.domain().and_then(|domain| {
+            publication.invoke(&domain, || {
+                Ok(self
+                    .tx
+                    .lock()
+                    .as_mut()
+                    .ok_or(())
+                    .and_then(|tx| tx.try_send(frame).map_err(|_| ())))
+            })
+        });
+        match result {
+            Ok(Some(result)) => result,
+            Ok(None) => Err(()),
+            Err(_) => {
+                self.request_abort();
+                Err(())
+            }
+        }
     }
-    fn progress(&self) -> Vec<Vec<u8>> {
+    fn progress(&self) -> Vec<Received> {
         let Some(mut storage) = self.prepared.try_lock() else {
             return Vec::new();
         };
@@ -218,16 +265,26 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         ) {
             return Vec::new();
         }
-        let result: Result<Vec<Vec<u8>>, Error> = (|| {
+        let result: Result<Vec<Received>, Error> = (|| {
             let frames = owner.progress_station(&self.environment)?;
-            self.link(owner.station_peer());
+            owner.station_publication(&self.environment, || {
+                self.link(owner.station_peer());
+                Ok(())
+            })?;
+            let (_, epoch) = owner.station_receive_epoch();
+            if state.epoch != epoch {
+                let (producer, consumer) = narf_ipc::channel();
+                state.rx = producer;
+                *self.rx.lock() = Some(consumer);
+                state.epoch = epoch;
+            }
             if self.admission.closed.load(Ordering::Acquire) {
                 state.clear();
                 return Ok(Vec::new());
             }
             if owner.station_peer().is_none() {
                 state.clear();
-                return Ok(frames);
+                return Ok(Vec::new());
             }
             if state.pending.is_none() {
                 for _ in 0..16 {
@@ -249,16 +306,29 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 state.clear();
                 return Ok(Vec::new());
             }
+            let publication = Arc::new(owner.station_publication_token(&self.environment)?);
+            if !owner.station_receive_open() {
+                return Ok(Vec::new());
+            }
             for bytes in &frames {
                 if let Ok(buffer) =
                     narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
                 {
                     let mut frame = Frame::new(buffer, bytes.len() as u32);
                     frame.payload_mut().copy_from_slice(bytes);
-                    let _ = state.rx.try_send(frame);
+                    publication.invoke(&self.environment.domain()?, || {
+                        let _ = state.rx.try_send(frame);
+                        Ok(())
+                    })?;
                 }
             }
-            Ok(frames)
+            Ok(frames
+                .into_iter()
+                .map(|bytes| Received {
+                    bytes,
+                    publication: publication.clone(),
+                })
+                .collect())
         })();
         match result {
             Ok(frames) => frames,
@@ -275,9 +345,35 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         // can synchronously re-enter this device's enqueue callback.
         let frames = self.progress();
         let progressed = !frames.is_empty();
-        if !self.admission.closed.load(Ordering::Acquire) {
-            for mut frame in frames {
-                narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
+        for frame in frames {
+            if self.admission.closed.load(Ordering::Acquire) || !frame.publication.current() {
+                break;
+            }
+            // The retained owner proves the current controlled port; only an
+            // owned epoch/source/PCI token survives into the unlocked callback.
+            let allowed = {
+                let Some(storage) = self.prepared.try_lock() else {
+                    break;
+                };
+                storage.as_ref().is_some_and(|owner| {
+                    owner.station_receive_open() && frame.publication.current()
+                })
+            };
+            if !allowed {
+                break;
+            }
+            let mut bytes = frame.bytes;
+            let result = self.environment.domain().and_then(|domain| {
+                frame.publication.invoke(&domain, || {
+                    if !self.admission.closed.load(Ordering::Acquire) {
+                        narf_net::iface::on_rx_frame_from(&self.name, &mut bytes);
+                    }
+                    Ok(())
+                })
+            });
+            if result.is_err() {
+                self.request_abort();
+                break;
             }
         }
         progressed
@@ -371,12 +467,21 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             }],
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
-                ht_supported: false,
+                ht_supported: self.ht.load(Ordering::Acquire),
                 vht_supported: false,
                 he_supported: false,
                 eht_supported: false,
             },
         }
+    }
+    fn phy_capabilities(&self, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
+        (band == 2400 && self.ht.load(Ordering::Acquire)).then(|| {
+            narf_wireless::iface::PhyCapabilities {
+                ht: narf_wireless::association::phy::LocalHt::siso20(false, false)
+                    .capability_body(),
+                vht: None,
+            }
+        })
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
         let dwell = scan_dwell(&request)?;
@@ -490,7 +595,18 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         if result.is_err() && owner.station_phase() == station::Phase::Failed {
             self.close();
         }
-        self.link(owner.station_peer());
+        if result.is_ok() {
+            if let Err(e) = owner.station_publication(&self.environment, || {
+                self.link(owner.station_peer());
+                Ok(())
+            }) {
+                owner.abort_station();
+                self.close();
+                return Err(error(e));
+            }
+        } else {
+            self.link(owner.station_peer());
+        }
         result.map_err(error)
     }
     async fn disassociate(&self) -> Result<(), WirelessError> {
@@ -654,6 +770,13 @@ impl NativeEnvironment {
     }
 }
 impl Environment for NativeEnvironment {
+    fn ht20(
+        &self,
+        base: Arc<super::channel_power::Calibration>,
+    ) -> Result<Option<Arc<super::ht::Grant>>, Error> {
+        super::ht::Grant::registered(base, self.firmware.identity().ok_or(Error::State)?)
+            .map_err(Error::Radio)
+    }
     fn admission(&self) -> Option<&Arc<station::Admission>> {
         Some(&self.admission)
     }

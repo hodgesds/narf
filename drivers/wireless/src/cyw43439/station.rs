@@ -34,6 +34,7 @@ pub struct Station<R: Fullmac> {
     mfp_verified: bool,
     phy: Option<phy::Capabilities>,
     ht_verified: bool,
+    vht_verified: bool,
     power_save: bool,
     operation: bool,
 }
@@ -109,7 +110,7 @@ impl<R: Fullmac> Station<R> {
             return Err(Error::Malformed);
         }
         let mut mask = [0; 16];
-        for event in [0, 3, 5, 6, 7, 11, 12, 16, 46, 69] {
+        for event in [0, 3, 5, 6, 7, 11, 12, 16, 46, 63, 69] {
             mask[event / 8] |= 1 << (event % 8);
         }
         set_var(&mut runtime, "event_msgs", &mask).await?;
@@ -168,6 +169,7 @@ impl<R: Fullmac> Station<R> {
             mfp_verified: false,
             phy,
             ht_verified: false,
+            vht_verified: false,
             power_save: false,
             operation: false,
         })
@@ -202,7 +204,19 @@ impl<R: Fullmac> Station<R> {
     pub fn ht_connection(&self) -> bool {
         self.ht_verified && self.bssid.is_some() && self.connection.is_some()
     }
-    /// Last native-verified occupied width of this connected peer. Metadata
+    /// Firmware-probed VHT metadata is restricted to the exact5GHz family.
+    pub fn vht_capabilities(&self) -> [Option<[u8; 12]>; 2] {
+        [
+            None,
+            self.phy
+                .as_ref()
+                .and_then(|p| p.vht_body(R::VHT80 && R::BAND_5GHZ)),
+        ]
+    }
+    pub fn vht_connection(&self) -> bool {
+        self.vht_verified && self.bssid.is_some() && self.connection.is_some()
+    }
+    /// Last native-verified20/40/80MHz occupied width. Metadata
     /// grants no TX authority; the current policy fence still guards service.
     pub fn channel_width_mhz(&self) -> Option<u32> {
         self.bssid.and(self.connection).map(policy::TxGrant::width)
@@ -475,11 +489,15 @@ impl<R: Fullmac> Station<R> {
             .map(|phy| phy.prepare(&bss.ies, bss.info.channel as u8, &self.channels))
             .transpose()?
             .flatten();
-        if ht.is_some_and(|profile| {
-            profile.channel.secondary.is_some()
-                && occupied_power(&self.domain, profile.channel).is_none()
-        }) {
-            ht = ht.map(phy::Profile::narrow);
+        for _ in 0..2 {
+            if ht.is_some_and(|profile| {
+                profile.channel.width() > 20
+                    && occupied_power(&self.domain, profile.channel).is_none()
+            }) {
+                ht = ht.map(phy::Profile::narrow);
+            } else {
+                break;
+            }
         }
         let occupied = ht.map_or_else(
             || channel::Operating::twenty(bss.info.channel as u8).ok_or(Error::Unsupported),
@@ -489,6 +507,7 @@ impl<R: Fullmac> Station<R> {
         let grant = self.grant_occupied(occupied, power)?;
         self.mfp_verified = false;
         self.ht_verified = false;
+        self.vht_verified = false;
         self.tx_var(grant, "qtxpower", &(u32::from(power) * 4).to_le_bytes())
             .await?;
         self.runtime.poll()?;
@@ -551,6 +570,9 @@ impl<R: Fullmac> Station<R> {
                 let consumed = self.runtime.poll()?;
                 self.check_grants(core::slice::from_ref(&grant))?;
                 while let Some(event) = self.runtime.pop_event() {
+                    if event.header.event_type == 63 && self.ht_verified {
+                        return Err(Error::Unsupported);
+                    }
                     if event.header.source_mac != request.bssid {
                         continue;
                     }
@@ -591,6 +613,7 @@ impl<R: Fullmac> Station<R> {
                         self.verify_phy(grant, request.bssid, bss.info.channel as u8, profile)
                             .await?;
                         self.ht_verified = true;
+                        self.vht_verified = profile.vht();
                         // Native queries can consume later peer loss/data.
                         // Re-observe a current FIFO/ring idle sample first.
                         continue;
@@ -626,6 +649,7 @@ impl<R: Fullmac> Station<R> {
         if result.is_err() {
             self.mfp_verified = false;
             self.ht_verified = false;
+            self.vht_verified = false;
             self.bssid = None;
             self.connection = None;
             self.runtime.set_link(None);
@@ -658,6 +682,7 @@ impl<R: Fullmac> Station<R> {
         let peer = self.bssid.take();
         self.mfp_verified = false;
         self.ht_verified = false;
+        self.vht_verified = false;
         self.runtime.set_link(None);
         if let Some(grant) = grant {
             self.tx_command(grant, 52, &[]).await?;
@@ -711,6 +736,18 @@ impl<R: Fullmac> Station<R> {
         self.check_connection_policy()?;
         while let Some(event) = self.runtime.pop_event() {
             if let Some(peer) = self.bssid {
+                // CHANNEL_ADOPTED is a firmware radio transition, not a new
+                // occupied grant. Source MAC can be absent for radio events.
+                // Retuning/rejoin needs its own lifecycle; close this port.
+                if event.header.event_type == 63 {
+                    self.bssid = None;
+                    self.connection = None;
+                    self.ht_verified = false;
+                    self.vht_verified = false;
+                    self.runtime.fail();
+                    self.runtime.set_link(None);
+                    return Err(Error::Unsupported);
+                }
                 if event.header.source_mac == peer
                     && (matches!(event.header.event_type, 5 | 6 | 11 | 12)
                         || event.header.event_type == 16 && event.header.flags & 1 == 0
@@ -770,7 +807,10 @@ fn validate_association_ies(mut ies: &[u8], secure: bool, mfp: bool) -> Result<(
                 return Err(Error::Unsupported);
             }
             seen_rsn = true;
-        } else if header[0] == 244 && !secure {
+        } else if matches!(header[0], 45 | 61 | 191 | 192)
+            || header[0] == 221 && body.starts_with(&[0, 80, 242, 2])
+            || header[0] == 244 && !secure
+        {
             return Err(Error::Unsupported);
         }
         ies = &ies[end..];

@@ -432,11 +432,7 @@ impl WirelessNetIface for Mt76Iface {
         };
         (self.radio.capabilities.phy.ht && self.radio.capabilities.phy.bands & band != 0).then_some(
             narf_wireless::iface::PhyCapabilities {
-                ht: if band == 2 && crate::mt7921::vht::qualified(self.radio) {
-                    crate::mt7921::vht::ht_capability(self.radio)
-                } else {
-                    crate::mt7921::ht20::capability40()
-                },
+                ht: crate::mt7921::vht::ht_capability(self.radio),
                 vht: (band == 2)
                     .then(|| crate::mt7921::vht::capability(self.radio))
                     .flatten(),
@@ -1074,12 +1070,12 @@ mod tests {
             || !info.hw_caps.ht_supported
             || iface
                 .phy_capabilities(2400)
-                .is_none_or(|caps| caps.ht[..4] != [98, 0, 28, 255] || caps.vht.is_some())
+                .is_none_or(|caps| caps.ht[..5] != [111, 1, 28, 255, 255] || caps.vht.is_some())
             || iface.phy_capabilities(6000).is_some()
             || !info.hw_caps.vht_supported
             || iface
                 .phy_capabilities(5000)
-                .is_none_or(|caps| caps.vht != Some([48, 1, 0, 0, 250, 255, 0, 0, 254, 255, 0, 0]))
+                .is_none_or(|caps| caps.vht != Some([48, 1, 0, 0, 250, 255, 0, 0, 250, 255, 0, 0]))
             || info.hw_caps.he_supported
             || info.hw_caps.eht_supported
             || !iface.supports_handshake_offload()

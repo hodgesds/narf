@@ -3,12 +3,14 @@
 > Status: retained RTL8188EE firmware, factory-qualified MAC/BB/RF/IQ/LC,
 > signed channel/power, native polled station/packet/stop and Open/WPA2 device
 > integration are implemented. Composed DHCP/IP and lifecycle regressions are
-> pending combined checks; board qualification and physical validation remain.
+> retained. A separate RTL8188EE HT20/LGI continuation and15 new native tests
+> pass native software suites and build gates. Board qualification and
+> physical validation remain separate for every emitting profile.
 
 ## 1. Purpose & scope
 
-Owns diagnostic detection of RTL8188EE, RTL8192CE/DE/EE, RTL8723AE/BE,
-and RTL8821AE. RTL8822BE belongs to rtw88 and is no longer matched here.
+Owns the retained RTL8188EE station and diagnostic detection of RTL8192CE/DE/EE,
+RTL8723AE/BE and RTL8821AE. RTL8822BE belongs to rtw88 and is no longer matched here.
 
 ## 2. Assumptions
 
@@ -107,7 +109,8 @@ guard across await, and never invokes block_on in a spawned task. Cancellation,
 timeout or write/checksum/start failure prevents retry and performs no cleanup
 I/O. Ready means a running firmware CPU, with packet DMA/IRQ/station admission
 still closed. The one-shot native continuation below admits only its exact EE
-mailbox and legacy station profile; it does not advertise HT/VHT support.
+mailbox and the separately admitted station profiles below; firmware readiness
+does not advertise HT/VHT support.
 Firmware CPU readiness alone leaves the interface down.
 
 `prepare::Prepared<I, M>` is the RTL8188EE-only inactive descriptor/LLT owner.
@@ -252,8 +255,10 @@ contracts; the native device model reacts to actual published descriptors/body, 
 wrap. It does not complete from a saved encoder/source byte vector.
 
 RX reads OWN-cleared32-byte descriptors, checks retained DW6 address/high-word,
-EOR, complete length/driver-info/shift extents and current fixed channel. It
-rejects CRC/ICV, fragments, aggregates, HT/40MHz and non-normal report types.
+EOR, complete length/driver-info/shift extents and current fixed channel.
+The baseline legacy profile rejects CRC/ICV, fragments, aggregates, HT/40MHz
+and non-normal report types; the separately admitted HT profile below extends
+only its checked HT20/LGI and whole-original A-MSDU cases.
 Protected MPDUs require the native SWDEC bit; open frames may legitimately
 have it clear. It retains original MPDU bytes for shared station security,
 removes the four appended FCS bytes and reposts the same owned buffer only
@@ -277,8 +282,9 @@ controller, wireless registry and real Ethernet stack. It retains the same async
 `Prepared` storage installed before the probe worker publishes any ring address;
 it never takes/reconstructs the firmware or packet owner. Current net authority
 is required before production publication admits station DMA. Only
-channel1/2412MHz, legacy20/1T, mandatory basic1Mbps, continuously awake software
-crypto and one association per firmware claim are admitted. IRQs stay masked
+channel1/2412MHz, legacy20/1T or the separately qualified HT20/LGI profile below,
+mandatory basic1Mbps, continuously awake software crypto and one association
+per firmware claim are admitted. IRQs stay masked
 and a bounded synchronous drain serves the real stack even while a synchronous
 DHCP caller prevents other executor tasks from running. Both native-owner and
 endpoint-state mutexes are released before stack dispatch/reentrant ARP/ND TX.
@@ -295,7 +301,8 @@ beacons/probe responses come only from actual consumed native RX descriptors.
 Shared `association::observe` checks raw admission, addresses, ESS/interval,
 singleton IEs, rates and DS/current-channel agreement; EE additionally requires
 channel1/basic1Mbps. Signal is unknown instead of invented RSSI. Active/randomized
-scans, other channels and HT/VHT/HE/EHT modes remain unsupported.
+scans and other channels remain unsupported. Without the distinct HT record,
+HT/VHT/HE/EHT remain unselected; VHT/HE/EHT are never admitted by this EE path.
 
 `prepare::station` retains the immutable observed BSS, shared `JoinPlan`, PMK,
 shared `station_security::Security`, exact pending TX ID/bytes, monotonic
@@ -369,7 +376,8 @@ The common management plan must first bind the actual association response;
 that response must then contain valid WMM parameters. Missing, duplicate,
 malformed or BE admission-controlled parameters fail the attempt before QoS
 admission. An AP cannot upgrade a legacy request through an unsolicited IE.
-No HT, BA, U-APSD, TSPEC or priority classification is enabled.
+This legacy WMM continuation enables no HT, BA, U-APSD, TSPEC or priority
+classification. The distinct HT continuation below reuses its actual BE owner.
 
 Source `rtl_get_hal_edca_param` programs BE/BK/VI/VO at0x508/50c/504/500 with
 TXOP in32us units, ECW exponents and SIFS10 plus AIFSN times the actual negotiated
@@ -396,11 +404,11 @@ Open/WPA2 DMA and exact bidirectional data, malformed/downgraded responses,
 ignored register writes, actual signed/device epoch loss, isolated installed-policy
 clear/reinstall, retained mappings and cancelled M4. Physical WMM/RF acceptance
 remains unrecorded; other ACs,
-dynamic EDCA, HT, power management and reset/rejoin remain separate work.
+dynamic EDCA, broader HT, power management and reset/rejoin remain separate work.
 
 ### Response-bound legacy data rates
 
-Ordinary DATA selects the fastest physically ordered rate in the actual
+Within the legacy profile, ordinary DATA selects the fastest physically ordered rate in the actual
 association response/request intersection:54,48,36,24,18,12,11,9,6,5.5,2,1Mbps.
 IEEE bit order is not throughput order: CCK11Mbps outranks OFDM9/6Mbps. The
 retained EE submit path programs actual TXD5 rate0..11 with USE_RATE and
@@ -416,6 +424,153 @@ One composed native smoke exercises every literal descriptor rate in Open
 and WPA2, AP response narrowing, the all12-rate offer, actual QoS/CCMP bytes,
 current signed/PCI loss and retained mappings. The existing actual held-M4
 cancellation test now negotiates this richer offer before terminal closure.
+
+### Separately qualified RTL8188EE HT20/LGI station
+
+`RtlwifiDevice::ht20_request()` returns the optional program's filename and
+binding after resolving the current exact legacy NEPC record and the actual
+ready executable identity. It supplies no
+measured gain or radio permission. This continuation applies only to
+`10ec:8179`, channel1/2412MHz, one TX/RX stream, mandatory MCS0–7, long GI,
+response-bound WMM BE/TID0 and Open or WPA2-PSK/software CCMP. It adds no SGI,
+HT40, LDPC/STBC, RTS/CTS protection, BA agreement, TX aggregation, extra AC,
+antenna tracking, PM or restart. Other matched chips cannot enter it.
+
+The optional signed file is
+`rtlwifi/rtl8188ee-ht20-lgi-v1-<factory-MAC-as-12-hex-digits>.bin`.
+`ht::Grant` retains both the actual new firmware capability and the same
+`Arc<Calibration>` as the native station. Its binding includes the full
+factory identity, SHA256 of the exact preceding NEPC bytes and the digest of
+the actual uploaded `rtl8188efw.bin` image, plus the
+reviewed HT gain/register/timing/descriptor/control/receive program. Neither
+another NEPC record for the same MAC nor the old legacy record authorizes it.
+The same firmware owner retains the exact registry source capability after
+upload; every actual HT operation and publication invokes that source as well
+as both calibration authorities again. Supplied-image/current-cap-free inputs
+remain private inert fixture coverage and cannot grant production HT. The new signed
+qualification must cover the full static antenna/IQK/LCK, supply and raw
+thermal0–63 operating envelope without gain tracking, all preceding legacy
+emissions, automatic MAC responses, declined ADDBA controls and the eight
+MCS conducted upper envelopes. No measured curve, thermal sample, calibration
+completion or silicon acceptance is supplied by the implementation.
+
+The NEHT record is1184 bytes, little endian except byte arrays:
+
+| Offset | Field |
+|---|---|
+|0 | magic `NEHT` |
+|4 | version:u16=1, header-size:u16=160 |
+|8 | total-size:u32=1184 |
+|12 | VID:u16=10ec, DID:u16=8179 |
+|16 | exact program/request binding[32] |
+|48 | full factory identity[32] |
+|80 | exact preceding NEPC digest[32] |
+|112 | factory MAC[6] |
+|118 | channel1, width20, NSS1, LGI0, reserved[2]=0 |
+|124 | antenna upper bound:i16 in quarter-dBi, at least the preceding bound |
+|126 | EIRP ceiling:i16 in quarter-dBm, no higher than20dBm |
+|128 | reserved[32]=0 |
+|160 | eight MCS rows, each64 signed quarter-dBm conducted upper bounds |
+
+INT16_MAX marks an unknown bound. Every selected index requires an actual
+known bound; erased factory inputs and negative/out-of-range signed gain
+arithmetic are refused. Each final MCS gain is the highest index no larger
+than its exact factory/PG maximum whose conducted bound plus antenna fits
+the signed program, preceding NEPC, factory20dBm and all current host limits.
+The same combined ceiling also checks every already-programmed CCK/OFDM gain;
+a narrower HT record cannot ignore earlier emissions or silently retune them.
+
+The genuine parked lifecycle is explicit. After legacy channel/MAC preparation
+and calibration staging, `Device::ready` resolves the optional HT source while
+the same owner is still `MacConfigured`/`Dormant`, before awake/start opens
+packet gates. Only an absent optional record retains legacy operation.
+Malformed, unsigned, mismatched, unknown-curve or revoked inputs are rejected
+before HT writes and leave the parked owner retryable. Programming installs
+terminal failure before its first register write and commits only after exact
+readbacks. A running legacy owner cannot reload this profile or call the parked
+channel configurator; reset/rejoin remains unimplemented.
+
+Linux `rtl8188ee/hw.c::read_power_value_fromprom` selects the signed high nibble
+of EFUSE0x1b for HT20; `phy.c::handle_path_a` adds it to the BW40 base.
+`rf.c::_rtl88e_get_txpower_writeval_by_regulatory` and the retained PG triples
+bound the exact pathA/ch1 per-rate result. `ht.rs` programs/readbacks
+MCS0–3 at0xe10 and MCS4–7 at0xe14, with unused2SS registers0xe18/0xe1c still0.
+The existing RF18, BB800/900 and BW60320MHz owner is preserved. Native HT
+response SIFS registers use14µs, as in `rtl88ee_update_channel_access_setting`;
+the distinct `rtl_get_hal_edca_param(N_24G)` AIFS formula is16+9*AIFSN.
+All EDCA rows are validated before writing; TXOP exceeds no native11-bit bound,
+and the same conservative BE clamp/no-TXOP policy is retained.
+
+Scan and join use shared typed `LocalHt::siso20(false,false)`,
+`observe_with_phy` and `JoinPlan::prepare_with_phy`. The driver owns the HT
+Capability and WMM Information IEs. The complete actual response must remain
+bound to the original offer, current primary and selected20MHz geometry;
+unsupported protection modes and malformed/missing/duplicate selected elements
+cannot open the native profile. An unsolicited response cannot upgrade an
+unqualified legacy request. Only the ready optional profile supplies public
+HT capability metadata; its hardware promise includes RX/TX MCS0–7 and the
+mandatory default3839-byte A-MSDU capability.
+
+Actual DATA TX chooses a negotiated MCS using native TXD5 rates0x0c–0x13,
+with LGI, BW0, subcarrier0, USE_RATE/DISFB and the existing BE/TID0 QoS header
+formed before software CCMP. AGG remains0. Management, EAPOL and declined BA
+controls retain the exact legacy1Mbps path and terminal OWN/body receipt;
+no AP ACK or new C2H receipt is fabricated. The source's ambiguous MCS0 SGI
+special case is not copied into this long-GI profile. Awake, CAM and reserved
+page/JOIN futures recheck the current exact signed sources and policy on
+every poll, including a resumed native mailbox wait.
+
+Native RX checks the actual EE RXD HT/rate/GF/short/BW and QoS/header facts
+before security. Unsupported MCS, SGI,40MHz, non-normal reports, fragments,
+PAGGR/FAGGR and mismatched native shapes are consumed without PN admission.
+PHYST, when present, must contain the actual28-byte `rx_fwinfo_88e` within
+the promised driver-info extent; source `sgi_en` cannot contradict LGI.
+This is not rtw88 page1. EE has no independent channel byte here: channel comes
+from the retained programmed permission, as in Linux `rtl88ee_rx_query_desc`.
+Absent PHYST retains only the checked RXD facts and invents no signal/channel
+observation. Protected originals still require native SWDEC and retain their
+complete CCMP header/ciphertext/MIC. The4096-byte native buffers admit one
+whole original default3839 aggregate plus its actual header/status/FCS extents.
+
+Standalone A-MSDUs use shared authenticated whole-original receive, or bounded
+Open decoding, before any Ethernet publication. Every suffix and inner
+address/control/VLAN check succeeds before complete delivery and protected PN
+commit. No prefix, deaggregated firmware fragment or nested/BA packet is admitted.
+An actual current-peer ADDBA request instead queues a bounded native status37
+response with matching token/TID and A-MSDU permission clear. The control owns
+the actual linked management descriptor/body until its terminal receipt;
+key work/close retires unsent controls and uncertain published DMA stays owned.
+Linux's recipient start/stop is host state only; this slice invents no BA CAM
+command or firmware acknowledgement and claims no successful agreement.
+
+RX originals capture controlled-port admission and a receive generation while
+the actual descriptor is copied. A terminal EAPOL TX receipt must additionally
+reach genuine RX-idle before shared key/port completion, so queued pre-M4 DATA
+cannot gain retrospective authority. Complete private plaintext own/AP-bound
+EAPOL alone may cross the M2 receipt generation into the actual supplicant;
+it never receives ordinary DATA admission. Reply publication, terminal receipt,
+key replacement, cancellation and close retire old queued output. The actual
+RX IPC consumer is retired immediately and refreshed for the successor epoch.
+
+Final carrier, IPC enqueue/receive and stack publication retain exact source,
+host policy and native PCI MEM/BME/INTX invocation. Each unlocked stack callback
+resamples the actual owner/controlled port and an owned generation token;
+callbacks hold no native-owner, endpoint, admission or ring locks. Reentrant
+rekey cannot publish the remainder of an old aggregate, even after full reopen.
+Ordinary TX-credit waits leave the receive epoch open. Software TX queuing
+through temporary rekey backpressure remains supported; actual descriptors
+still require the current native key/source/policy owner.
+
+Fifteen new native Rust smokes under `drivers/wireless/rtlwifi/ht20` pass on both
+architectures. They cover literal factory/PG/measurement cases, exact source identity
+and negative assets, pre-write retry versus dirty-owner refusal, Open/WPA2 real
+kernel DHCP/IP, all negotiated MCS descriptors, whole3839 A-MSDU and atomic PN,
+native PHY/QoS/aggregation refusal before PN, actual ADDBA control receipts,
+held/cancelled M4, per-poll mailbox source loss, current signed/PCI/installed
+policy denial, ignored gain/SIFS writes, and held/reopened reentrant key epochs
+versus ordinary TX credit. They use inert native register/DMA/firmware/AP inputs;
+build/test gates pass; exact-board RF/firmware/external interoperability acceptance
+remains outstanding. This initial EE feature does not complete rtlwifi.
 
 ## 4. Invariants
 
@@ -438,7 +593,7 @@ The scheduler's responsive wait supplies bounded EFUSE completion/settling.
 Factory identity, RTL8188EE CPU firmware, inactive LLT/linked-ring preparation
 and retained factory-qualified table/IQK/LCK continuation are software covered.
 Native legacy station/Device and composed DHCP/IP/lifecycle regressions are
-implemented, awaiting combined gates. Physical board qualification remains.
+implemented and software-validated. Physical board qualification remains.
 
 ## 8. Open questions / remaining software
 
@@ -449,16 +604,16 @@ implemented, awaiting combined gates. Physical board qualification remains.
 | Authenticated image/header selection and runtime firmware loading | RTL8188EE retained probe owner implemented; other profiles missing |
 | DMA allocation/publication/quiesce, IRQ ownership, H2C/C2H | RTL8188EE retained DMA32 rings/LLT, one-shot polled service, terminal host delivery, demonstrated awake/keepalive/reserved-page/JOIN mailbox and terminal close/retention implemented. Reclamation/reset/recovery and optional IRQ/C2H expansion remain outside the initial profile |
 | RF/BB tables, calibration, channel/power and rate control | RTL8188EE tables/retained1T IQK/LCK, static factory antenna, signed board/factory/regulatory legacy20 power, operational MAC and negotiated legacy peer/rate/filter integration implemented. Measured board envelope and silicon qualification remain; optional gain tracking is excluded by measured profile |
-| Scan, management RX/TX, authentication/association and WPA2 | Retained EE channel1 passive scan, Open MLME, shared WPA2/CCMP and exact M4 receipt implemented; new Device/composition regressions await combined gates. Other matched chips remain missing |
-| Ethernet packet path and terminal TX completion ownership | EE same-owner native Device/Narf-Ring/stack and Open/WPA2 real-kernel DHCP/exact bidirectional IP fixtures implemented; combined gates and actual board testing remain |
+| Scan, management RX/TX, authentication/association and WPA2 | Retained EE channel1 passive scan, Open MLME, shared WPA2/CCMP and exact M4 receipt implemented; Device/composition regressions pass native suites. Other matched chips remain missing |
+| Ethernet packet path and terminal TX completion ownership | EE same-owner native Device/Narf-Ring/stack and Open/WPA2 real-kernel DHCP/exact bidirectional IP fixtures pass software gates; actual board testing remains |
 | Multi-radio, removal, suspend/reset/recovery | Missing |
 
 Per-chip remaining inventory uses Linux per-chip `sw.c` and radio/PCI ops:
 
 | Chip | Source hardware scope | Remaining native software |
 |---|---|---|
-| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |HT20/40, BA/reorder/aggregation, all WMM AC/TIDs, adaptive rates, broader scan/channels, runtime tracking/PM and reset/rejoin |
-| RTL8192CE/EE |2.4GHz2T2R HT |Retained chip firmware/MAC/PHY/RF/calibration/power/packet/station chain, then full HT/QoS/lifecycle |
+| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, ADDBA refusal and capture/publication epochs above. Remaining software: SGI20, HT40, successful RX/TX BA/reorder/aggregation, all WMM AC/TIDs, adaptive rates, dynamic EDCA, broader scan/channels, tracking/PM and reset/rejoin. Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
+| RTL8192CE family aliases / RTL8192EE |2.4GHz HT; CE aliases need exact RF-type qualification, including the8176/8188CE variant; EE is2T2R |Retained chip firmware/MAC/PHY/RF/calibration/power/packet/station chain, then full HT/QoS/lifecycle. The8179/8188EE HT path does not admit these IDs. |
 | RTL8192DE |Dual-band dual-MAC HT |Exact per-function reset/power/firmware/DMA/radio ownership and station chains, then bands/HT/QoS/lifecycle |
 | RTL8723AE/BE |2.4GHz1T1R HT with BT |Chip-specific retained chain, antenna/BT coexistence and HT/QoS/lifecycle |
 | RTL8821AE |Dual-band VHT, source `RTL_SPEC_SUPPORT_VHT` |Exact retained firmware/MAC/PHY/RF/power/station chain, VHT/QoS and lifecycle |

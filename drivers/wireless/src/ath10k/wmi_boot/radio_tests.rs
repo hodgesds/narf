@@ -18,6 +18,7 @@ fn drive<F: Future>(future: F) -> Poll<F::Output> {
 
 #[derive(Debug)]
 struct RadioModel {
+    sources: Option<crate::ath10k::firmware_source::Source>,
     inner: HttModel,
     phase: u8,
     sequence: u8,
@@ -205,6 +206,9 @@ fn management_frame(model: &mut RadioModel, frame: Vec<u8>) {
     add_event(model, id, &body);
 }
 impl Hif for RadioModel {
+    fn current_sources(&self) -> Option<crate::ath10k::firmware_source::Source> {
+        self.sources.clone()
+    }
     fn source_ready(&mut self, pipe: u8) -> Result<bool, BmiError> {
         match &mut self.ce {
             Some(ce) => ce.source_ready(pipe),
@@ -288,6 +292,9 @@ impl Hif for RadioModel {
             return Err(BmiError::BadResponse);
         }
         self.sequence = self.sequence.wrapping_add(1);
+        if data_tests::protection_handles(self.inner.inner.dialect, &bytes[8..]) {
+            return data_tests::protection_send(self, bytes).await;
+        }
         if power_save_tests::handles(self.inner.inner.dialect, &bytes[8..]) {
             return power_save_tests::send(self, bytes).await;
         }
@@ -483,6 +490,7 @@ fn radio_boot_country(
     }
     inner.version = major;
     let model = RadioModel {
+        sources: None,
         inner,
         phase: 0,
         sequence: 1,

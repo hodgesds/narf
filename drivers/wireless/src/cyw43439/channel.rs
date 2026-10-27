@@ -40,6 +40,7 @@ pub(super) fn encode20(channel: u8) -> Option<u16> {
 pub(super) struct Operating {
     pub(super) primary: u8,
     pub(super) secondary: Option<u8>,
+    center80: Option<u8>,
 }
 impl Operating {
     pub(super) fn twenty(primary: u8) -> Option<Self> {
@@ -47,6 +48,7 @@ impl Operating {
         Some(Self {
             primary,
             secondary: None,
+            center80: None,
         })
     }
     pub(super) fn forty(primary: u8, secondary: u8) -> Option<Self> {
@@ -62,16 +64,46 @@ impl Operating {
         Some(Self {
             primary,
             secondary: Some(secondary),
+            center80: None,
         })
     }
+    pub(super) fn eighty(primary: u8, center: u8) -> Option<Self> {
+        if ![42, 58, 106, 122, 138, 155, 171].contains(&center) {
+            return None;
+        }
+        let channels = [center - 6, center - 2, center + 2, center + 6];
+        if channels
+            .iter()
+            .any(|ch| *ch <= 14 || frequency(*ch).is_none())
+        {
+            return None;
+        }
+        let index = channels.iter().position(|ch| *ch == primary)?;
+        let mut value = Self::forty(primary, channels[index ^ 1])?;
+        value.center80 = Some(center);
+        Some(value)
+    }
+    pub(super) fn constituents(self) -> [Option<u8>; 4] {
+        if let Some(c) = self.center80 {
+            [Some(c - 6), Some(c - 2), Some(c + 2), Some(c + 6)]
+        } else {
+            [Some(self.primary), self.secondary, None, None]
+        }
+    }
     pub(super) fn width(self) -> u32 {
-        if self.secondary.is_some() {
+        if self.center80.is_some() {
+            80
+        } else if self.secondary.is_some() {
             40
         } else {
             20
         }
     }
     pub(super) fn chanspec(self) -> u16 {
+        if let Some(center) = self.center80 {
+            let side = (u16::from(self.primary) + 6 - u16::from(center)) / 4;
+            return 0xe000 | (side << 8) | u16::from(center);
+        }
         if let Some(secondary) = self.secondary {
             let center = (u16::from(self.primary) + u16::from(secondary)) / 2;
             let side = if self.primary > secondary { 0x100 } else { 0 };
@@ -81,6 +113,10 @@ impl Operating {
         }
     }
     pub(super) fn span(self) -> (u32, u32) {
+        if let Some(center) = self.center80 {
+            let center = 5000 + u32::from(center) * 5;
+            return (center - 40, center + 40);
+        }
         let a = frequency(self.primary).expect("validated primary channel");
         let b = self
             .secondary
@@ -98,6 +134,13 @@ impl Operating {
             primary.checked_sub(4)?
         };
         let value = Self::forty(primary, secondary)?;
+        (value.chanspec() == chanspec).then_some(value)
+    }
+    pub(super) fn decode80(chanspec: u16) -> Option<Self> {
+        if chanspec & 0xf800 != 0xe000 {
+            return None;
+        }
+        let value = Self::eighty(primary(chanspec, 0)?, (chanspec & 255) as u8)?;
         (value.chanspec() == chanspec).then_some(value)
     }
 }

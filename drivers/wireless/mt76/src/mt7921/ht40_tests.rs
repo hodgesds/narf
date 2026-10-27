@@ -156,7 +156,7 @@ fn mt76_ht40_native_domain_channel_rlm_peer_and_response_geometry() -> TestResul
                         center,
                         0,
                         1,
-                        1,
+                        2,
                         3,
                         1,
                         4,
@@ -171,7 +171,7 @@ fn mt76_ht40_native_domain_channel_rlm_peer_and_response_geometry() -> TestResul
             let peer = frames
                 .iter()
                 .find(|(_, f)| f.len() >= 196 && f[34..36] == [3, 0] && f[43] == 7 && f[65] == 1);
-            if peer.is_none_or(|(_, f)| f[188..196] != [9, 0, 8, 0, 102, 0, 0, 0] || f[184] != 1) {
+            if peer.is_none_or(|(_, f)| f[188..196] != [9, 0, 8, 0, 103, 0, 0, 0] || f[184] != 1) {
                 return TestResult::Fail("HT40/SGI40 native peer or independent SMPS");
             }
             let domain = frames.iter().find(|(_, f)| f.len() == 92 && f[36] == 15);
@@ -192,7 +192,7 @@ kernel_test_in!(
     mt76_ht40_native_domain_channel_rlm_peer_and_response_geometry
 );
 
-fn mt76_ht40_downgrade_current_authority_and_cancel_never_activate_rx() -> TestResult {
+fn mt76_ht40_response_narrows_native_geometry_and_failed_receipts_keep_rx_closed() -> TestResult {
     let (mut baseline, bss) = prepared(6, 10, false);
     if run(baseline.associate_station(&bss, b"narf", Security::Open, permission40(6, 10), &[]))
         .is_err()
@@ -215,11 +215,26 @@ fn mt76_ht40_downgrade_current_authority_and_cancel_never_activate_rx() -> TestR
                 Security::Open,
                 permission40(6, 10),
                 &[],
-            ))
-            .is_ok()
+            )) != Ok(42)
+                || session
+                    .ht20_profile
+                    .is_none_or(|p| p.negotiated_secondary().is_some())
+                || !session.backend.frames.iter().any(|(_, f)| {
+                    f.len() >= 140 && f[36] == 0xed && f[41] == 8 && f[64..69] == [6, 6, 0, 2, 2]
+                })
+                || !session.backend.frames.iter().any(|(_, f)| {
+                    f.len() == 68
+                        && f[34..36] == [2, 0]
+                        && f[52..56] == [2, 0, 16, 0]
+                        && f[56..62] == [6, 6, 0, 0, 2, 3]
+                })
             {
                 return TestResult::Fail("AP20MHz downgrade inherited40MHz state");
             }
+            if run(session.disassociate_station()).is_err() {
+                return TestResult::Fail("actual response20 native teardown");
+            }
+            continue;
         } else if case == 1 {
             session.backend.deny_tx_after = Some(rlm + 1);
             if run(session.associate_station(
@@ -261,5 +276,5 @@ fn mt76_ht40_downgrade_current_authority_and_cancel_never_activate_rx() -> TestR
 }
 kernel_test_in!(
     "drivers/wireless/mt7921/ht40",
-    mt76_ht40_downgrade_current_authority_and_cancel_never_activate_rx
+    mt76_ht40_response_narrows_native_geometry_and_failed_receipts_keep_rx_closed
 );

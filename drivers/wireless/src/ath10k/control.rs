@@ -4,6 +4,24 @@
 //! on cancellation or malformed replies.
 use super::{bmi::BmiError, hw::HwRev};
 use alloc::{collections::VecDeque, vec::Vec};
+use core::{
+    future::{poll_fn, Future},
+    pin::pin,
+    task::Poll,
+};
+async fn source_wait<T>(
+    source: Option<super::firmware_source::Source>,
+    operation: impl Future<Output = Result<T, BmiError>>,
+) -> Result<T, BmiError> {
+    let mut operation = pin!(operation);
+    poll_fn(|cx| match &source {
+        Some(s) => s
+            .invoke(|| operation.as_mut().poll(cx))
+            .unwrap_or(Poll::Ready(Err(BmiError::DeviceGone))),
+        None => operation.as_mut().poll(cx),
+    })
+    .await
+}
 pub(super) type ReceiveProgress = (bool, Option<(u8, Vec<u8>)>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +40,24 @@ impl From<BmiError> for Error {
     }
 }
 pub(super) trait Hif {
+    fn current_sources(&self) -> Option<super::firmware_source::Source> {
+        None
+    }
+    fn check_current(&self) -> Result<(), BmiError> {
+        if let Some(s) = self.current_sources() {
+            s.check().map_err(|_| BmiError::DeviceGone)
+        } else {
+            // Only private protocol models can lack executable/BDF inputs.
+            #[cfg(any(test, feature = "kernel-test"))]
+            {
+                Ok(())
+            }
+            #[cfg(not(any(test, feature = "kernel-test")))]
+            {
+                Err(BmiError::Unsupported)
+            }
+        }
+    }
     fn source_ready(&mut self, _pipe: u8) -> Result<bool, BmiError> {
         Err(BmiError::Unsupported)
     }
@@ -40,6 +76,12 @@ pub(super) trait Hif {
     }
 }
 impl Hif for super::boot::PciBoot {
+    fn current_sources(&self) -> Option<super::firmware_source::Source> {
+        super::boot::PciBoot::current_sources(self)
+    }
+    fn check_current(&self) -> Result<(), BmiError> {
+        self.check_sources()
+    }
     fn source_ready(&mut self, pipe: u8) -> Result<bool, BmiError> {
         self.hif_source_ready(pipe)
     }
@@ -209,6 +251,7 @@ impl<T: Hif> Session<T> {
         }
     }
     async fn send_control(&mut self, body: &[u8]) -> Result<(), Error> {
+        self.transport.check_current()?;
         if body.len() > 248 {
             return Err(Error::Malformed);
         }
@@ -220,7 +263,11 @@ impl<T: Hif> Session<T> {
         frame[5] = self.sequence;
         self.sequence = self.sequence.wrapping_add(1);
         frame.extend_from_slice(body);
-        self.transport.send(0, &frame).await?;
+        source_wait(
+            self.transport.current_sources(),
+            self.transport.send(0, &frame),
+        )
+        .await?;
         Ok(())
     }
     async fn control(&mut self, expected: u16) -> Result<Packet, Error> {
@@ -229,7 +276,12 @@ impl<T: Hif> Session<T> {
             if deadline.expired() {
                 return Err(Error::Transport(BmiError::Timeout));
             }
-            let (pipe, bytes) = self.transport.receive(1000).await?;
+            self.transport.check_current()?;
+            let (pipe, bytes) = source_wait(
+                self.transport.current_sources(),
+                self.transport.receive(1000),
+            )
+            .await?;
             if pipe != 1 && pipe != 2 && pipe != self.rx_htt_pipe {
                 return Err(Error::Malformed);
             }
@@ -338,13 +390,21 @@ impl<T: Hif> Session<T> {
         Ok(())
     }
     async fn progress(&mut self) -> Result<(), Error> {
+        self.transport.check_current()?;
         let (pipe, bytes) = match self.pending_wire.pop_front() {
             Some(packet) => packet,
-            None => self.transport.receive(1000).await?,
+            None => {
+                source_wait(
+                    self.transport.current_sources(),
+                    self.transport.receive(1000),
+                )
+                .await?
+            }
         };
         self.accept(pipe, &bytes)
     }
     pub async fn send_wmi(&mut self, payload: &[u8]) -> Result<(), Error> {
+        self.transport.check_current()?;
         if !self.started || self.failed {
             return Err(Error::Failed);
         }
@@ -374,17 +434,26 @@ impl<T: Hif> Session<T> {
         frame[5] = endpoint.sequence;
         endpoint.sequence = endpoint.sequence.wrapping_add(1);
         frame.extend_from_slice(payload);
-        self.transport.send(endpoint.pipe, &frame).await?;
+        source_wait(
+            self.transport.current_sources(),
+            self.transport.send(endpoint.pipe, &frame),
+        )
+        .await?;
         self.failed = false;
         Ok(())
     }
     pub async fn send_htt(&mut self, payload: &[u8]) -> Result<(), Error> {
+        self.transport.check_current()?;
         if !self.started || self.failed {
             return Err(Error::Failed);
         }
         let frame = self.htt_frame(payload)?;
         self.failed = true;
-        self.transport.send(4, &frame).await?;
+        source_wait(
+            self.transport.current_sources(),
+            self.transport.send(4, &frame),
+        )
+        .await?;
         self.failed = false;
         Ok(())
     }
@@ -409,22 +478,32 @@ impl<T: Hif> Session<T> {
         Ok(frame)
     }
     pub fn htt_source_ready(&mut self) -> Result<bool, Error> {
+        self.transport.check_current()?;
         if !self.started || self.failed {
             return Err(Error::Failed);
         }
-        self.transport.source_ready(4).map_err(Error::from)
+        super::firmware_source::invoke(self.transport.current_sources().as_ref(), || {
+            self.transport.source_ready(4)
+        })
+        .map_err(|_| Error::Transport(BmiError::DeviceGone))?
+        .map_err(Error::from)
     }
     pub fn begin_htt(&mut self, payload: &[u8]) -> Result<(), Error> {
+        self.transport.check_current()?;
         if !self.htt_source_ready()? {
             return Err(Error::Transport(BmiError::Dma(super::dma::DmaError::Busy)));
         }
         let frame = self.htt_frame(payload)?;
         self.failed = true;
-        self.transport.begin_send(4, &frame)?;
+        super::firmware_source::invoke(self.transport.current_sources().as_ref(), || {
+            self.transport.begin_send(4, &frame)
+        })
+        .map_err(|_| Error::Transport(BmiError::DeviceGone))??;
         self.failed = false;
         Ok(())
     }
     pub fn poll_now(&mut self) -> Result<ReceiveProgress, Error> {
+        self.transport.check_current()?;
         if !self.started || self.failed {
             return Err(Error::Failed);
         }
@@ -435,7 +514,12 @@ impl<T: Hif> Session<T> {
         }
         let wire = match self.pending_wire.pop_front() {
             Some(wire) => Some(wire),
-            None => self.transport.poll_now()?,
+            None => {
+                super::firmware_source::invoke(self.transport.current_sources().as_ref(), || {
+                    self.transport.poll_now()
+                })
+                .map_err(|_| Error::Transport(BmiError::DeviceGone))??
+            }
         };
         let progressed = wire.is_some();
         if let Some((pipe, bytes)) = wire {
@@ -451,6 +535,7 @@ impl<T: Hif> Session<T> {
     /// Credit-only input is progress, even though it carries no payload.
     /// Only an empty nonblocking HIF poll establishes receive quiescence.
     pub async fn poll_with_progress(&mut self) -> Result<ReceiveProgress, Error> {
+        self.transport.check_current()?;
         if !self.started || self.failed {
             return Err(Error::Failed);
         }
@@ -462,7 +547,7 @@ impl<T: Hif> Session<T> {
         let wire = if let Some(wire) = self.pending_wire.pop_front() {
             Some(wire)
         } else {
-            self.transport.poll(0).await?
+            source_wait(self.transport.current_sources(), self.transport.poll(0)).await?
         };
         let progressed = wire.is_some();
         if let Some((pipe, bytes)) = wire {

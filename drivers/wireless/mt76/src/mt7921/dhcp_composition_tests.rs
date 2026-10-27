@@ -586,6 +586,29 @@ fn composition_body(
         put_session(session);
         return TestResult::Fail("associated state/aid mismatch");
     }
+    if ht20 {
+        // The lease traverses the actual post-response two-path owner, not
+        // only a local capability IE or an isolated rate-map constructor.
+        let native = &session.backend.frames;
+        if session.ht20_profile.unwrap().transmit_streams() != 2
+            || !native
+                .iter()
+                .any(|(_, f)| f.len() >= 140 && f[36] == 0xed && f[41] == 8 && f[67..69] == [2, 2])
+            || !native.iter().any(|(_, f)| {
+                f.len() == 68
+                    && f[34..36] == [2, 0]
+                    && f[52..56] == [2, 0, 16, 0]
+                    && f[60..62] == [2, 3]
+            })
+            || !native.iter().any(|(_, f)| {
+                super::vht_tests::record(f, 1)
+                    .is_some_and(|ra| ra[6..16] == [255, 255, 0, 0, 0, 0, 0, 0, 0, 0])
+            })
+        {
+            put_session(session);
+            return TestResult::Fail("DHCP did not traverse native two-path RF/RLM/HT MCS setup");
+        }
+    }
     if aggregate_rx && !ht20 {
         super::amsdu_rx_tests::activate_receive(&mut session);
     }

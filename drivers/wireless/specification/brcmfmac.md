@@ -1,6 +1,6 @@
 # Broadcom FullMAC PCIe — software bring-up
 
-> Status: v0.8. Signed exact board provisioning, BCM43602 CR4 firmware, retained
+> Status: v0.9. Signed exact board provisioning, BCM43602 CR4 firmware, retained
 > PCIe control/flow/data rings and a constrained FullMAC station path are implemented. Recovery remains
 > software work; physical validation is pending.
 
@@ -306,6 +306,84 @@ capability/inventory/policy fallback and secondary-power reduction, native
 restriction/width/request/response denials, current secondary revocation across
 data and held native waits, and cancellation with posted DMA retained.
 
+### Firmware-qualified BCM43602 VHT80
+
+Only the retained, discovered BCM43602 PCIe adapter opts into
+`Fullmac::VHT80`; the common CYW43439 SDIO implementation keeps this false.
+No chip alias, board name, firmware filename or AP IE grants VHT. Exact signed
+board selection, original executable/NVRAM capabilities, embedded CLM and
+current PCI/backplane authority remain prerequisites. Linux
+`brcmf_setup_wiphybands`/`brcmf_update_vht_cap` supply the capability contract:
+native nonzero `nmode`/`vhtmode`, valid `rxchain`, the original5GHz `bw_cap`
+20/40/80 bits and an actual bounded D11AC80 `chanspecs` entry. This profile
+additionally requires native `txstreams` in1..3; absent VHT/stream capability
+preserves qualified HT, while malformed replies fail closed. RX and TX
+MCS0..9 capability maps use their independently reported stream counts.
+Only SGI80 is offered;160/80+80, optional LDPC/STBC/beamforming/extended NSS
+remain unqualified. Initial WLC_UP/scan operation remains20MHz.
+
+The actual selected BSS's complete original HT/VHT/WMM/rate IEs pass shared
+`Offer::from_elements`; complete known basic/legacy rates, membership
+selectors, mandatory HT/VHT MCS and exact primary/center geometry must fit
+the local native capability. This parser supplies no radio/key/port rights.
+The native80MHz plan needs all four20MHz constituents in the current native
+channel list and its exact primary-sideband chanspec in firmware inventory.
+Only pre-join capability/inventory/policy narrowing can select80→40→20.
+This preserves the AP's original VHT IEs and truthful physical VHT capability;
+the configured/read-back `bw_cap=7/3/1` and exact join/current chanspec bound
+actual operation. There is no fabricated HT-only request or rewritten AP
+response. At20MHz the real request may retain source HT40 capability or
+advertise its bounded HT20 subset;40/80 requires the qualified HT40 shape.
+Unqualified source capabilities cannot be added by an unsolicited request.
+
+All four80MHz constituents must return valid, unrestricted native
+`per_chan_info`. The retained grant covers center frequency±40MHz, every
+overlapping restriction/maximum bandwidth and the minimum power ceiling,
+including quarters outside the primary's20/40MHz. `qtxpower` precedes native
+bandwidth programming. Current exact BSSID/chanspec, bounded `assoc_info`,
+the real firmware `assoc_req_ies` and AP `assoc_resp_ies` must preserve the
+source capability maps, SGI/width bounds, valid WMM/basic rates and complete
+AP operation. Shared response negotiation must cover every actually occupied
+constituent and retain the offered VHT presence. Another actual native idle
+observation precedes key/controlled-port publication. Post-submit mismatch,
+failed width readback, restrictions or cancelled receipts terminate that
+owner, with all uncertain native DMA retained. `CHANNEL_ADOPTED` after PHY
+verification/connection closes the old grant; autonomous retuning needs a
+separate qualified lifecycle.
+
+`Station::vht_capabilities` and the facade expose native capability on5GHz
+only. `vht_connection` requires the current verified peer/grant;
+`channel_width_mhz` reports actual20/40/80 operation. These facts grant no TX
+authority. Firmware owns CCMP, BA/reorder, deaggregation and rate control.
+An MCS0..9 map is a capability bound, not permission to transmit each MCS in
+every width/NSS combination: Linux `minstrel_get_valid_vht_rates` excludes
+20MHz MCS9 at NSS1/2 and80MHz MCS6 at NSS3. This FullMAC path programs no raw
+host rate or invented per-rate native receipt.
+
+The common final-publication owner carries a nonwrapping association epoch
+with each captured native Ethernet batch. It rechecks current full occupied
+policy and invokes native source/bus/event progress after frame allocation,
+before IPC publication and before each unlocked stack callback. Host close
+immediately changes the epoch, closes carrier/queue admission and drains old
+RX IPC; a same-peer rejoin cannot authorize an old batch. State→publication→ring
+is the lock order, with no state/publication/ring guard across a stack callback
+or publication guard across an await. Close can serialize against an actual
+native TX post without pretending to reclaim firmware-owned descriptors.
+Late key/link/control/PS receipts cannot reopen a closed or replaced lifetime.
+
+Eight new `drivers/wireless/brcmfmac/vht80` smokes pass for both shared5/6:
+all eight literal sidebands, independent RX3/TX1..3 capability maps, exact native
+cap/chanspec/four-quarter queries, signed selected-board Open/WPA2/required-PMF
+real DHCP/bidirectional IP,80→40→20 fallback and remote-quarter power,
+malformed current/request/response/inventory and caller PHY/WMM injection,
+live remote-quarter revocation during queued data/held replies, cancellation,
+autonomous channel adoption, final IPC/callback policy loss and actual
+reentrant stack close/same-peer receive epochs. A bounded exhaustive80MHz
+codec smoke and two common CYW native publication/no-VHT smokes accompany
+them. These additions pass the coordinated both-architecture software gates;
+no hardware EEPROM/calibration/RF/AP/DMA acceptance or throughput result is
+claimed.
+
 The exact BCM43602 `Fullmac::BAND_5GHZ` profile admits firmware-reported valid
 channels from Linux's 2.4/5 GHz tables, intersected with the retained host-policy
 snapshot. It first sets and reads back `bw_cap=20 MHz` on both firmware bands
@@ -314,7 +392,7 @@ failed or wider readback prevents interface/station publication. CYW43439's
 SDIO profile leaves this capability false and never gains 5 GHz from an
 unexpected valid-channel reply.
 
-Scan uses20MHz D11AC encodings; join uses its fully qualified20/40MHz encoding.
+Scan uses20MHz D11AC encodings; join uses its fully qualified20/40/80MHz encoding.
 Wider AP BSS records decode their primary from center/sideband and require any
 reported ctl_ch to agree; 6 GHz/4.9 GHz numeric aliases, malformed widths and
 band mismatches fail. The facade splits genuine allowed channels into separate
@@ -396,7 +474,8 @@ step; Open/WPA2 DHCP/IP conversations run while PS is enabled. This implements
 firmware station PS only; host-bus PM, suspend/WoW and reset replay remain open.
 
 Additional software outside that retained profile remains: nonzero descriptor
-prefixes/shared 7, other CPU/RAM/chip/OTP selectors, PHY beyond qualified HT40, native802.11
+prefixes/shared 7, other CPU/RAM/chip/OTP selectors,160/80+80 and optional VHT
+coding/beamforming/HE/EHT profiles, native802.11
 RX/metadata, larger flow budgets, host-supplicant fallback, WPA3/AP, replayed
 recovery/system PM, confirmed stop/IOMMU quiescence and DMA reclamation, and IRQ delivery.
 These do not expand the initial polling/retained-failure acceptance claim.

@@ -82,7 +82,7 @@ fn native() -> Result<(), &'static str> {
                 }) {
                     return Err("literal160 channel switch/count namespace");
                 }
-                let expected = [10, 0, 16, 0, 100, 0, 0, 1, 254, 255, 250, 255, 0, 0, 0, 0];
+                let expected = [10, 0, 16, 0, 100, 0, 0, 1, 250, 255, 250, 255, 0, 0, 0, 0];
                 if frames
                     .iter()
                     .find_map(|(_, frame)| super::vht_tests::record(frame, 10))
@@ -97,7 +97,7 @@ fn native() -> Result<(), &'static str> {
                 if !request
                     .1
                     .windows(14)
-                    .any(|ie| ie == [191, 12, 116, 1, 0, 0, 250, 255, 0, 0, 254, 255, 0, 0])
+                    .any(|ie| ie == [191, 12, 116, 1, 0, 0, 250, 255, 0, 0, 250, 255, 0, 0])
                 {
                     return Err("local actual-chip160 capability encoding");
                 }
@@ -109,7 +109,7 @@ fn native() -> Result<(), &'static str> {
                     if sku.1[108 + index * 162] != channel
                         || sku.1[109 + index * 162..108 + (index + 1) * 162]
                             .iter()
-                            .any(|&value| value != 34)
+                            .any(|&value| value != 28)
                     {
                         return Err("160 occupied-channel power row/ceiling");
                     }

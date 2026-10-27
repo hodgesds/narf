@@ -94,6 +94,10 @@ unsafe impl Memory for Coherent {
 pub(super) type NativePrepared = Prepared<PacketIo<PciIo>, Coherent>;
 
 impl super::prepare::packet::Port for PacketIo<PciIo> {
+    fn publication(&self) -> Result<super::prepare::packet::Publication, Error> {
+        self.with_io(|io| Ok(io.publication()))
+            .map_err(Error::Access)
+    }
     type Buffer = Coherent;
     fn authority<T>(
         &self,

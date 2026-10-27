@@ -18,6 +18,34 @@ pub(super) struct Wire {
     pub management_event: u32,
 }
 impl Wire {
+    pub fn protection(self, request: super::StationProtection) -> Result<[Vec<u8>; 3], Error> {
+        let (id, cts, enable) = match self.dialect {
+            Dialect::Main | Dialect::Tlv => (0x5008, 26, 44),
+            Dialect::TenOne => (0x901a, 24, 43),
+            Dialect::TenTwo | Dialect::TenTwoFour => (0x9019, 24, 43),
+            Dialect::TenFour => (0x901c, 26, 45),
+        };
+        let make = |parameter, value| {
+            let tlv = self.dialect == Dialect::Tlv;
+            let mut out = packet(id, if tlv { 16 } else { 12 })?;
+            let at = if tlv {
+                header(&mut out, 95, 12);
+                8
+            } else {
+                4
+            };
+            put(&mut out, at + 4, parameter);
+            put(&mut out, at + 8, value);
+            Ok::<_, Error>(out)
+        };
+        // WMI_RTSCTS_ENABLED1 + ACROSS_SW_RETRIES2<<4, then native
+        // use_cts_prot boolean, then the actual threshold. No guessed ACK.
+        Ok([
+            make(enable, 0x21)?,
+            make(cts, u32::from(request.cts_protection))?,
+            make(1, request.rts_threshold.map_or(u32::MAX, u32::from))?,
+        ])
+    }
     fn ps_ids(self) -> (u32, u32) {
         // Linux wmi.h MAIN/10X/10.2/10.4 and wmi-tlv.h command enums.
         match self.dialect {
@@ -125,6 +153,38 @@ impl Wire {
             // PASSIVE, zero TX power and no IBSS/HT/VHT permission. 11G/11A.
             put(&mut out, at + 12, 0x80 | u32::from(*frequency < 3000));
             at += 24;
+        }
+        Ok(out)
+    }
+    /// Qualified station inventory, distinct from receive-only discovery.
+    /// Linux mac.c::ath10k_update_channel_list sets HT40_PLUS here (not
+    /// VDEV_START): each row is a real20MHz primary with its supported side.
+    /// Only the exact fully granted pair replaces the passive inventory;
+    /// associated/offchannel scanning remains forbidden by the retained owner.
+    pub fn station_ht40_channels(
+        &self,
+        permission: crate::ath10k::regulatory::Permission,
+    ) -> Result<Vec<u8>, Error> {
+        let secondary = permission.secondary.ok_or(Error::Unsupported)?;
+        let mut out = self.channels(&[permission.frequency, secondary])?;
+        let tlv = self.dialect == Dialect::Tlv;
+        for (i, frequency) in [permission.frequency, secondary].into_iter().enumerate() {
+            let at = if tlv { 20 + i * 28 } else { 8 + i * 24 };
+            // Legacy11A inventory row, ALLOW_HT; only the lower primary
+            // admits a positive secondary. No VHT/IBSS/DFS permission.
+            put(
+                &mut out,
+                at + 12,
+                (1 << 11)
+                    | if frequency < permission.center {
+                        1 << 6
+                    } else {
+                        0
+                    },
+            );
+            out[at + 17] = permission.half_dbm;
+            out[at + 18] = permission.half_dbm;
+            out[at + 21] = permission.half_dbm;
         }
         Ok(out)
     }

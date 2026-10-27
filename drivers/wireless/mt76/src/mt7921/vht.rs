@@ -1,4 +1,4 @@
-//! Bounded5-GHz CONNAC2 VHT RX1/2, TX1 profile and native records.
+//! Bounded5-GHz CONNAC2 VHT RX/TX1/2 profile and native records.
 //! Linux mt7921_init_work/mt76_init_sband register <=80-MHz VHT, with
 //! contiguous160 only for actual MT7922. NIC TLVs must still report
 //! HT/VHT/5GHz/NSS. max_bw stays an opaque byte.
@@ -37,7 +37,7 @@ pub(crate) fn wide160(info: RadioInfo) -> bool {
     qualified(info) && info.chip_id == 0x7922
 }
 fn local_vht(info: RadioInfo, allow160: bool) -> Result<LocalVht, Error> {
-    let mut vht = LocalVht::new(rx_map(info), 0xfffe, true, true, 0)
+    let mut vht = LocalVht::new(rx_map(info), rx_map(info), true, true, 0)
         .map_err(|_| Error::UnsupportedFirmware)?
         .with_ldpc(info.capabilities.phy.rx_ldpc, info.capabilities.phy.tx_ldpc)
         .with_rx_stbc(info.capabilities.phy.rx_stbc);
@@ -47,11 +47,11 @@ fn local_vht(info: RadioInfo, allow160: bool) -> Result<LocalVht, Error> {
     Ok(vht)
 }
 fn local_ht(info: RadioInfo) -> LocalHt {
-    let tx = [255, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    let mut rx = tx;
+    let mut tx = [255, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     if info.capabilities.phy.spatial_streams == 2 {
-        rx[1] = 255;
+        tx[1] = 255;
     }
+    let rx = tx;
     LocalHt::new(
         rx,
         tx,
@@ -79,11 +79,11 @@ pub(crate) fn ht_fallback(info: RadioInfo, wide: bool) -> Result<LocalPhy, Error
     if wide {
         LocalPhy::ht40(local_ht(info)).map_err(|_| Error::UnsupportedFirmware)
     } else {
-        let tx = [255, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let mut rx = tx;
+        let mut tx = [255, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         if info.capabilities.phy.spatial_streams == 2 {
-            rx[1] = 255;
+            tx[1] = 255;
         }
+        let rx = tx;
         let ht = LocalHt::new(
             rx,
             tx,
@@ -136,11 +136,30 @@ fn supports_basic(map: u16, basic: u16) -> bool {
         need == 3 || have != 3 && have >= need
     })
 }
+fn streams(map: u16) -> u8 {
+    if map >> 2 & 3 != 3 {
+        2
+    } else {
+        1
+    }
+}
+fn transmit_map(width: phy::Width, map: u16, ht_capability: u16) -> u16 {
+    let nss = if matches!(ht_capability & 12, 4 | 12) {
+        streams(map)
+    } else {
+        1
+    };
+    phy::intersect_maps(map, width_map(width, nss))
+}
 fn check_basic(width: phy::Width, tx: u16, rx: u16, operation: [u8; 5]) -> Result<(), Error> {
     let basic = u16::from_le_bytes([operation[3], operation[4]]);
-    if !supports_basic(phy::intersect_maps(tx, width_map(width, 1)), basic)
-        || !supports_basic(phy::intersect_maps(rx, width_map(width, 2)), basic)
-    {
+    if !supports_basic(
+        phy::intersect_maps(tx, width_map(width, streams(tx))),
+        basic,
+    ) || !supports_basic(
+        phy::intersect_maps(rx, width_map(width, streams(rx))),
+        basic,
+    ) {
         return Err(Error::UnsupportedFirmware);
     }
     Ok(())
@@ -149,7 +168,11 @@ pub(crate) fn check_offer(offer: &phy::Offer) -> Result<(), Error> {
     if let Some(vht) = offer.vht() {
         check_basic(
             offer.width(),
-            vht.tx_mcs_map(),
+            transmit_map(
+                offer.width(),
+                vht.tx_mcs_map(),
+                offer.ht().peer_capability(),
+            ),
             vht.rx_mcs_map(),
             vht.operation_body(),
         )?;
@@ -166,6 +189,7 @@ pub(crate) struct Profile {
     width: u8,
     center: u8,
     rx_streams: u8,
+    tx_streams: u8,
     rx_ldpc: bool,
     rx_stbc: bool,
 }
@@ -185,18 +209,14 @@ impl Profile {
             phy::Width::Eighty => 2,
             phy::Width::OneSixty => 3,
         };
+        let peer_rx = transmit_map(n.width(), vht.tx_mcs_map(), n.ht().peer_capability());
         // A narrowed response must still meet both original and response
         // basic requirements at the actual width. Never silently strip a
         // required MCS9 while capping a20MHz native rate-control map.
+        check_basic(n.width(), peer_rx, vht.rx_mcs_map(), vht.operation_body())?;
         check_basic(
             n.width(),
-            vht.tx_mcs_map(),
-            vht.rx_mcs_map(),
-            vht.operation_body(),
-        )?;
-        check_basic(
-            n.width(),
-            vht.tx_mcs_map(),
+            peer_rx,
             vht.rx_mcs_map(),
             offer
                 .vht()
@@ -204,7 +224,6 @@ impl Profile {
                 .operation_body(),
         )?;
         let rx_streams = if vht.rx_mcs_map() >> 2 & 3 != 3 { 2 } else { 1 };
-        let tx_valid = width_map(n.width(), 1);
         let rx_valid = width_map(n.width(), rx_streams);
         let offered = offer.vht().ok_or(Error::UnsupportedFirmware)?;
         Ok(Self {
@@ -220,7 +239,7 @@ impl Profile {
                 } else {
                     0
                 },
-            peer_rx: phy::intersect_maps(vht.tx_mcs_map(), tx_valid),
+            peer_rx,
             peer_tx: phy::intersect_maps(
                 phy::intersect_maps(
                     phy::intersect_maps(vht.rx_mcs_map(), vht.peer_tx_mcs_map()),
@@ -231,6 +250,8 @@ impl Profile {
             width,
             center: n.center_channel(),
             rx_streams,
+            tx_streams: streams(peer_rx)
+                .max(super::ht20::Profile::from_shared(n.ht(), width).transmit_streams()),
             rx_ldpc: vht.rx_ldpc(),
             rx_stbc: vht.rx_stbc(),
         })
@@ -248,8 +269,11 @@ impl Profile {
         ApElements::parse(ies).is_ok_and(|ap| ap == self.ap)
     }
     pub(crate) fn state(self) -> u8 {
-        self.width
-    } // Peer receive NSS for our TX stays1 -> high nibble0.
+        self.width | ((self.tx_streams - 1) << 4)
+    }
+    pub(crate) fn transmit_streams(self) -> u8 {
+        self.tx_streams
+    }
     pub(crate) fn sta(self) -> Vec<u8> {
         let mut bytes = vec![10, 0, 16, 0]; // CONNAC2 retains the four-byte tail.
         bytes.extend_from_slice(&self.capability.to_le_bytes());
@@ -280,7 +304,7 @@ impl Profile {
         bytes[8] = primary;
         bytes[9] = self.center;
         bytes[11] = self.width;
-        bytes[12] = 1;
+        bytes[12] = self.tx_streams;
         bytes[13] = chains;
         bytes[14] = 1;
         bytes[15] = if self.width != 0 { 4 } else { 0 };
@@ -305,6 +329,7 @@ impl Profile {
             self.rx_streams,
             self.rx_ldpc,
             self.rx_stbc,
+            false,
         )
     }
 }
@@ -315,6 +340,7 @@ pub(crate) fn receive_allowed(
     rx_streams: u8,
     rx_ldpc: bool,
     rx_stbc: bool,
+    cck: bool,
 ) -> bool {
     let Some(v) = phy else {
         return true;
@@ -338,6 +364,18 @@ pub(crate) fn receive_allowed(
         return false;
     };
     match mode {
+        // mt76_get_rate removes bit2 (short preamble) from CCK codes0..7.
+        // This legacy mode remains valid for a typed HT peer on2.4GHz;
+        // neither a5GHz station nor VHT can acquire it through PHY fallback.
+        0 => {
+            cck && !vht
+                && rate < 8
+                && nsts == 1
+                && width == 0
+                && (v >> 15) & 3 == 0
+                && v & (1 << 11) == 0
+                && stbc == 0
+        }
         1 => {
             width == 0
                 && (8..=15).contains(&rate)
@@ -358,6 +396,6 @@ pub(crate) fn receive_allowed(
                 && rate <= (if width == 0 { 8 } else { 9 })
                 && (v >> 15) & 3 <= 1
         }
-        _ => false, // no CCK/greenfield/HE or unimplemented optional mode.
+        _ => false, // no greenfield/HE or unimplemented optional mode.
     }
 }

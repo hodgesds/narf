@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Firmware-owned HT20/40 admission. Linux brcmfmac/cfg80211.c
+//! Firmware-owned HT20/40 and native-qualified VHT80 admission. Linux brcmfmac/cfg80211.c
 //! brcmf_setup_wiphybands, brcmf_update_ht_cap and brcmf_get_assoc_ies.
 use super::{channel, get_var, policy::TxGrant, set_var, Error, Fullmac, Station, MAX_REPLY};
+use narf_wireless::association::phy::{HtGi, HtWidth, LocalHt, LocalPhy, LocalVht, Offer, Width};
 
 #[derive(Clone, Debug)]
 pub(super) struct Capabilities {
     ht: [u8; 26],
     wide: [bool; 2],
     chanspecs: alloc::vec::Vec<u16>,
+    vht: Option<([u8; 12], LocalPhy)>,
 }
 impl Capabilities {
+    pub(super) fn vht_body(&self, five: bool) -> Option<[u8; 12]> {
+        five.then_some(self.vht).flatten().map(|v| v.0)
+    }
     pub(super) fn body(&self, five: bool) -> [u8; 26] {
         let mut ht = self.ht;
         if self.wide[usize::from(five)] {
@@ -23,13 +28,25 @@ impl Capabilities {
         channel: u8,
         valid: &[u8],
     ) -> Result<Option<Profile>, Error> {
-        let Elements { ht, operation } = elements(ies)?;
+        let Elements {
+            ht,
+            operation,
+            vht,
+            vht_operation,
+        } = elements(ies)?;
         if ht.is_none() && operation.is_none() {
+            if vht.is_some() || vht_operation.is_some() {
+                return Err(Error::Malformed);
+            }
             return Ok(None);
         }
         let mut profile = Profile {
             ht: self.ht,
             channel: channel::Operating::twenty(channel).ok_or(Error::Unsupported)?,
+            vht: None,
+            offer: None,
+            fallback: None,
+            basic: 0,
         };
         profile.ap(ies)?;
         let ht = ht.ok_or(Error::Unsupported)?;
@@ -51,6 +68,35 @@ impl Capabilities {
                 if self.chanspecs.contains(&occupied.chanspec()) {
                     profile.channel = occupied;
                     profile.ht = self.body(channel > 14);
+                    profile.fallback = Some(occupied);
+                }
+            }
+        }
+        if channel > 14 {
+            if let Some((vht, local)) = self.vht {
+                let offer = Offer::from_elements(local, ies, channel)
+                    .map_err(|_| Error::Unsupported)?
+                    .ok_or(Error::Unsupported)?;
+                if offer.vht().is_some() {
+                    profile.vht = Some(vht);
+                    profile.offer = Some(offer);
+                    profile.ht = self.body(true);
+                    profile.basic = legacy_rates(ies)?.1;
+                    if offer.width() == Width::Eighty {
+                        if let Some(occupied) =
+                            channel::Operating::eighty(channel, offer.center_channel())
+                        {
+                            if occupied
+                                .constituents()
+                                .into_iter()
+                                .flatten()
+                                .all(|ch| valid.contains(&ch))
+                                && self.chanspecs.contains(&occupied.chanspec())
+                            {
+                                profile.channel = occupied;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -62,15 +108,30 @@ impl Capabilities {
 pub(super) struct Profile {
     ht: [u8; 26],
     pub(super) channel: channel::Operating,
+    vht: Option<[u8; 12]>,
+    offer: Option<Offer>,
+    fallback: Option<channel::Operating>,
+    basic: u16,
 }
 impl Profile {
     pub(super) fn narrow(mut self) -> Self {
-        self.ht[0] &= !(2 | 64);
-        self.channel = channel::Operating::twenty(self.channel.primary).expect("validated primary");
+        self.channel = if self.channel.width() == 80 {
+            self.fallback.unwrap_or_else(|| {
+                channel::Operating::twenty(self.channel.primary).expect("validated primary")
+            })
+        } else {
+            channel::Operating::twenty(self.channel.primary).expect("validated primary")
+        };
+        if self.vht.is_none() && self.channel.width() == 20 {
+            self.ht[0] &= !(2 | 64);
+        }
         self
     }
+    pub(super) fn vht(self) -> bool {
+        self.vht.is_some()
+    }
     fn ap(self, ies: &[u8]) -> Result<(), Error> {
-        let Elements { ht, operation } = elements(ies)?;
+        let Elements { ht, operation, .. } = elements(ies)?;
         let ht = ht.ok_or(Error::Unsupported)?;
         let operation = operation.ok_or(Error::Unsupported)?;
         if operation[0] != self.channel.primary
@@ -100,21 +161,66 @@ impl Profile {
                 return Err(Error::Unsupported);
             }
         }
+        if let Some(offer) = self.offer {
+            let selected = offer
+                .response_elements(ies)
+                .map_err(|_| Error::Unsupported)?;
+            if selected.vht().is_none()
+                || selected.ht().operation().primary() != self.channel.primary
+                || self
+                    .channel
+                    .constituents()
+                    .into_iter()
+                    .flatten()
+                    .any(|ch| !selected.occupied_channels().contains(&ch))
+            {
+                return Err(Error::Unsupported);
+            }
+        }
         Ok(())
     }
     fn request(self, ies: &[u8]) -> Result<(), Error> {
-        let Elements { ht, operation } = elements(ies)?;
+        let Elements {
+            ht,
+            operation,
+            vht,
+            vht_operation,
+        } = elements(ies)?;
         let ht = ht.ok_or(Error::Unsupported)?;
-        // The source profile is bounded to its configured width, short GI
-        // and actual RX chains.
-        // Firmware may select SMPS; it cannot advertise unqualified wider PHY.
+        // Firmware can retain its physical HT40 capability in a constrained
+        // VHT20 request or narrow that HT width to20. Both are source-bounded;
+        // the exact native bw_cap/current chanspec proves actual operation.
+        // At40/80, a20-only request cannot authorize the selected geometry.
+        let mut narrow_ht = self.ht;
+        narrow_ht[0] &= !(2 | 64);
+        let first = ht[0] & !12;
+        let width_admitted = first == self.ht[0]
+            || self.vht.is_some() && self.channel.width() == 20 && first == narrow_ht[0];
+        // Firmware may select SMPS; it cannot invent chains or optional PHY.
         if operation.is_some()
-            || ht[0] & !12 != self.ht[0]
+            || !width_admitted
             || ht[0] & 12 == 8
             || ht[1..] != self.ht[1..]
             || narf_wireless::wmm::Parameters::parse(ies).is_err()
         {
             return Err(Error::Unsupported);
+        }
+        match (self.vht, vht) {
+            (Some(expected), Some(actual)) => {
+                if vht_operation.is_some()
+                    || actual[..6] != expected[..6]
+                    || actual[8..10] != expected[8..10]
+                    || u16::from_le_bytes(actual[6..8].try_into().unwrap()) & 0xe000 != 0
+                    || u16::from_le_bytes(actual[10..12].try_into().unwrap()) & 0xe000 != 0
+                {
+                    return Err(Error::Unsupported);
+                }
+                if legacy_rates(ies)?.0 & self.basic != self.basic {
+                    return Err(Error::Unsupported);
+                }
+            }
+            (None, None) => {}
+            _ => return Err(Error::Unsupported),
         }
         let mut rest = ies;
         while !rest.is_empty() {
@@ -128,15 +234,54 @@ impl Profile {
     }
 }
 
+fn legacy_rates(mut ies: &[u8]) -> Result<(u16, u16), Error> {
+    let (mut supported, mut basic, mut first, mut extended) = (0u16, 0u16, false, false);
+    while !ies.is_empty() {
+        let id = *ies.first().ok_or(Error::Malformed)?;
+        let end = 2 + usize::from(*ies.get(1).ok_or(Error::Malformed)?);
+        let body = ies.get(2..end).ok_or(Error::Malformed)?;
+        if matches!(id, 1 | 50) {
+            if body.is_empty() || id == 1 && (first || body.len() > 8) || id == 50 && extended {
+                return Err(Error::Malformed);
+            }
+            if id == 1 {
+                first = true;
+            } else {
+                extended = true;
+            }
+            for rate in body {
+                if matches!(*rate, 254 | 255) {
+                    continue;
+                }
+                let index = [12, 18, 24, 36, 48, 72, 96, 108]
+                    .iter()
+                    .position(|r| *r == rate & 127)
+                    .ok_or(Error::Unsupported)?;
+                supported |= 1 << index;
+                if rate & 128 != 0 {
+                    basic |= 1 << index;
+                }
+            }
+        }
+        ies = &ies[end..];
+    }
+    if !first || supported == 0 {
+        return Err(Error::Unsupported);
+    }
+    Ok((supported, basic))
+}
+
 struct Elements<'a> {
     ht: Option<&'a [u8]>,
     operation: Option<&'a [u8]>,
+    vht: Option<&'a [u8]>,
+    vht_operation: Option<&'a [u8]>,
 }
 fn elements(mut ies: &[u8]) -> Result<Elements<'_>, Error> {
     if ies.len() > 2048 {
         return Err(Error::Malformed);
     }
-    let (mut ht, mut operation) = (None, None);
+    let (mut ht, mut operation, mut vht, mut vht_operation) = (None, None, None, None);
     while !ies.is_empty() {
         let header = ies.get(..2).ok_or(Error::Malformed)?;
         let end = 2 + usize::from(header[1]);
@@ -144,12 +289,19 @@ fn elements(mut ies: &[u8]) -> Result<Elements<'_>, Error> {
         match header[0] {
             45 if body.len() == 26 && ht.is_none() => ht = Some(body),
             61 if body.len() == 22 && operation.is_none() => operation = Some(body),
-            45 | 61 => return Err(Error::Malformed),
+            191 if body.len() == 12 && vht.is_none() => vht = Some(body),
+            192 if body.len() == 5 && vht_operation.is_none() => vht_operation = Some(body),
+            45 | 61 | 191 | 192 => return Err(Error::Malformed),
             _ => {}
         }
         ies = &ies[end..];
     }
-    Ok(Elements { ht, operation })
+    Ok(Elements {
+        ht,
+        operation,
+        vht,
+        vht_operation,
+    })
 }
 
 pub(super) async fn probe<R: Fullmac>(runtime: &mut R) -> Result<Option<Capabilities>, Error> {
@@ -164,6 +316,11 @@ pub(super) async fn probe<R: Fullmac>(runtime: &mut R) -> Result<Option<Capabili
         }
     }
     let mode = optional(runtime, "nmode").await?.unwrap_or(0);
+    let vhtmode = if R::VHT80 && R::BAND_5GHZ {
+        optional(runtime, "vhtmode").await?.unwrap_or(0)
+    } else {
+        0
+    };
     let mut available = [0u32; 2];
     // Discover before narrowing; a configured20MHz cap is not the original
     // firmware capability. Linux brcmf_get_bwcap queries each explicit band.
@@ -208,7 +365,11 @@ pub(super) async fn probe<R: Fullmac>(runtime: &mut R) -> Result<Option<Capabili
                 for row in reply[4..end].chunks_exact(4) {
                     let value = u32::from_le_bytes(row.try_into().unwrap());
                     let value = u16::try_from(value).map_err(|_| Error::Malformed)?;
-                    if let Some(occupied) = channel::Operating::decode40(value) {
+                    if let Some(occupied) = channel::Operating::decode40(value).or_else(|| {
+                        (R::VHT80 && vhtmode != 0)
+                            .then(|| channel::Operating::decode80(value))
+                            .flatten()
+                    }) {
                         if (occupied.primary <= 14 || R::BAND_5GHZ) && !chanspecs.contains(&value) {
                             chanspecs.push(value);
                         }
@@ -262,12 +423,60 @@ pub(super) async fn probe<R: Fullmac>(runtime: &mut R) -> Result<Option<Capabili
     ht[15] = 1; // TX MCS defined/equal RX, as brcmf_update_ht_cap.
     let wide = [false, true].map(|five| {
         available[usize::from(five)] & 2 != 0
-            && chanspecs.iter().any(|value| (*value & 0xc000 != 0) == five)
+            && chanspecs.iter().any(|value| {
+                (*value & 0xc000 != 0) == five && channel::Operating::decode40(*value).is_some()
+            })
     });
+    let vht = if R::VHT80
+        && R::BAND_5GHZ
+        && vhtmode != 0
+        && wide[1]
+        && available[1] & 7 == 7
+        && chanspecs
+            .iter()
+            .any(|c| channel::Operating::decode80(*c).is_some())
+    {
+        match optional(runtime, "txstreams").await? {
+            Some(tx) if (1..=3).contains(&tx) => {
+                let map = |count: u32| {
+                    (0..count).fold(0xffffu16, |m, i| (m & !(3 << (i * 2))) | (2 << (i * 2)))
+                };
+                let mut rx = [0; 10];
+                rx[..chains.count_ones() as usize].fill(255);
+                let mut tx_mcs = [0; 10];
+                tx_mcs[..tx as usize].fill(255);
+                let local_ht = LocalHt::new(
+                    rx,
+                    tx_mcs,
+                    HtWidth::TwentyForty,
+                    HtGi {
+                        rx20: true,
+                        tx20: true,
+                        rx40: true,
+                        tx40: true,
+                    },
+                    3,
+                    7,
+                )
+                .map_err(|_| Error::Unsupported)?;
+                let local_vht = LocalVht::new(map(chains.count_ones()), map(tx), true, true, 0)
+                    .map_err(|_| Error::Unsupported)?;
+                Some((
+                    local_vht.capability_body(),
+                    LocalPhy::vht80(local_ht, local_vht).map_err(|_| Error::Unsupported)?,
+                ))
+            }
+            None => None,
+            Some(_) => return Err(Error::Unsupported),
+        }
+    } else {
+        None
+    };
     Ok(Some(Capabilities {
         ht,
         wide,
         chanspecs,
+        vht,
     }))
 }
 
@@ -304,6 +513,11 @@ impl<R: Fullmac> Station<R> {
         if response_ies.len() != response {
             return Err(Error::Malformed);
         }
+        if profile.vht.is_some()
+            && legacy_rates(&response_ies)?.1 & !legacy_rates(&request_ies)?.0 != 0
+        {
+            return Err(Error::Unsupported);
+        }
         if profile.channel.primary != channel {
             return Err(Error::Malformed);
         }
@@ -315,11 +529,11 @@ impl<R: Fullmac> Station<R> {
         grant: TxGrant,
         occupied: channel::Operating,
     ) -> Result<(), Error> {
-        if let Some(secondary) = occupied.secondary {
+        if occupied.width() > 20 {
             // cfg80211::brcmf_construct_chaninfo queries per_chan_info on
             // each20MHz constituent. Index0 uses the plain iovar (fwil.c).
             // Never discard a firmware-only passive/radar/invalid restriction.
-            for channel in [occupied.primary, secondary] {
+            for channel in occupied.constituents().into_iter().flatten() {
                 let mut query = b"per_chan_info\0".to_vec();
                 query.extend_from_slice(
                     &u32::from(channel::encode20(channel).ok_or(Error::Unsupported)?).to_le_bytes(),
@@ -333,10 +547,10 @@ impl<R: Fullmac> Station<R> {
             }
         }
         let band = if occupied.primary <= 14 { 2u32 } else { 1u32 };
-        let width = if occupied.secondary.is_some() {
-            3u32
-        } else {
-            1u32
+        let width = match occupied.width() {
+            80 => 7u32,
+            40 => 3,
+            _ => 1,
         };
         let mut cap = [0; 8];
         cap[..4].copy_from_slice(&band.to_le_bytes());

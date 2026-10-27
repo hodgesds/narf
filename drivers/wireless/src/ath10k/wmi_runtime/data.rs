@@ -63,6 +63,26 @@ pub(super) struct State {
     last_peer: narf_time::Deadline,
 }
 impl State {
+    pub(super) fn protection_allowed(&self) -> bool {
+        self.open()
+            && self.pending.as_ref().is_none_or(|p| !p.reply)
+            && self.security.as_ref().is_none_or(|s| !s.handshake_active())
+    }
+    pub(super) fn protection_idle(&self) -> bool {
+        self.pending.is_none()
+    }
+    pub(super) fn protection_receipt(&mut self, receipt: htt::TxReceipt) -> Result<(), Error> {
+        if self.pending.as_ref().is_some_and(|p| p.id == receipt.id) {
+            if self.pending.as_ref().unwrap().reply {
+                return Err(Error::Failed);
+            }
+            if receipt.status != 0 {
+                return Err(Error::Firmware(u32::from(receipt.status)));
+            }
+            self.pending = None;
+        }
+        Ok(())
+    }
     pub(super) fn fail(&mut self) {
         self.failed = true;
         self.incoming.clear();
@@ -227,6 +247,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.htt.data_profile()
     }
     pub fn station_publishable(&self) -> Result<[u8; 6], Error> {
+        self.htt
+            .wmi
+            .htc
+            .transport
+            .check_current()
+            .map_err(crate::ath10k::control::Error::from)
+            .map_err(htt::Error::from)?;
         if !self.data_supported() {
             return Err(Error::Unsupported);
         }
@@ -269,16 +296,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         &self,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<(), Error> {
+        self.htt
+            .wmi
+            .htc
+            .transport
+            .check_current()
+            .map_err(crate::ath10k::control::Error::from)
+            .map_err(htt::Error::from)?;
         let peer = self.peer.as_ref().ok_or(Error::Failed)?;
-        let permission = Permission::from_domain(
-            self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?,
-            domain,
-            peer.permission.frequency,
-        )?;
-        if permission != peer.permission {
-            return Err(Error::Unsupported);
-        }
-        Ok(())
+        peer.permission.check(domain)
     }
     /// Start the packet owner only after native association. Software CCMP is
     /// selected at WMI INIT, never retrofitted onto a native-WiFi/decapped RX
@@ -321,6 +347,18 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             return Err(Error::Unsupported);
         }
         self.check_data_policy(domain)?;
+        if self
+            .peer
+            .as_ref()
+            .and_then(|p| p.ht)
+            .is_some_and(|h| h.secondary.is_some())
+        {
+            self.set_station_protection(super::protection::Request::HT40, || {
+                validate()?;
+                Ok(domain.clone())
+            })
+            .await?;
+        }
         let own = self.ready.ok_or(Error::Failed)?.mac;
         let cached = self
             .scan_cache
@@ -687,7 +725,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         event: htt::Event,
         nonce: &mut impl FnMut() -> Option<[u8; 32]>,
     ) -> Result<(bool, Option<Vec<u8>>), Error> {
-        let result = self.data_event_inner(event, nonce);
+        let source = self.htt.wmi.htc.transport.current_sources();
+        let result = crate::ath10k::firmware_source::invoke(source.as_ref(), || {
+            self.data_event_inner(event, nonce)
+        })
+        .map_err(|_| Error::Failed)
+        .and_then(core::convert::identity);
         if result.is_err() {
             if let Some(data) = &mut self.data {
                 data.fail();
@@ -775,6 +818,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                             .iter()
                             .any(|b| b.bssid == bssid && b.ssid == beacon.ssid)
                     {
+                        if peer
+                            .ht
+                            .is_some_and(|h| !h.matches_beacon(&beacon.information_elements))
+                        {
+                            return Err(Error::Unsupported);
+                        }
                         data.last_peer = narf_time::Deadline::after_ms(5000);
                     }
                 }

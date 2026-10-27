@@ -52,6 +52,7 @@ pub(super) struct Firmware {
     mfp_missing: bool,
     phy_profile: Option<(u32, u8)>,
     wide: Option<crate::cyw43439::phy_fixture::Wide>,
+    vht: Option<crate::cyw43439::phy_fixture::Vht80>,
     current_chanspec: u16,
     wide_started: bool,
     hold_tx: bool,
@@ -97,6 +98,7 @@ impl Firmware {
             mfp_missing: false,
             phy_profile: None,
             wide: None,
+            vht: None,
             current_chanspec: 0x1006,
             wide_started: false,
             hold_tx: false,
@@ -158,6 +160,17 @@ impl Firmware {
     }
     fn request_ies(&self) -> Vec<u8> {
         let mut ies = self.wpa_ie.clone().unwrap_or_default();
+        if let Some(vht) = &self.vht {
+            ies.extend_from_slice(&vht.request(
+                self.phy_profile.map_or(0, |p| p.0),
+                match self.bandwidth[0] {
+                    7 => 80,
+                    3 => 40,
+                    _ => 20,
+                },
+            ));
+            return ies;
+        }
         if let Some((chains, fault)) = self.phy_profile {
             if fault != 3 {
                 ies.extend_from_slice(&self.wide.as_ref().map_or_else(
@@ -175,6 +188,9 @@ impl Firmware {
         ies
     }
     fn response_ies(&self) -> Vec<u8> {
+        if let Some(vht) = &self.vht {
+            return vht.response(self.channel, self.phy_profile.map_or(0, |p| p.0));
+        }
         self.phy_profile.map_or(Vec::new(), |(chains, fault)| {
             if fault == 4 {
                 vec![0, 0]
@@ -196,7 +212,12 @@ impl Firmware {
         }
         self.last_power_save_error = command == self.power_save_error
             && (command == 86 || input.starts_with(b"pm2_sleep_ret\0"));
-        self.mfp_missing = command == 262 && input.starts_with(b"mfp\0") && !self.mfp_supported;
+        self.mfp_missing = command == 262
+            && (input.starts_with(b"mfp\0") && !self.mfp_supported
+                || input.starts_with(b"vhtmode\0")
+                    && self.vht.as_ref().is_some_and(|p| p.mode.is_none())
+                || input.starts_with(b"txstreams\0")
+                    && self.vht.as_ref().is_some_and(|p| p.txstreams.is_none()));
         match command {
             1 => 2u32.to_le_bytes().to_vec(),
             23 => {
@@ -207,7 +228,12 @@ impl Firmware {
                 }
             }
             217 => {
-                let channels: &[u32] = if self.wide.is_some() && self.channel > 14 {
+                let channels: &[u32] = if self.vht.is_some() {
+                    &[
+                        6, 36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128,
+                        132, 136, 140, 144, 149, 153, 157, 161, 165,
+                    ]
+                } else if self.wide.is_some() && self.channel > 14 {
                     &[6, 10, 36, 40, 52, 149, 153, 165, 255]
                 } else if self.wide.is_some() {
                     &[1, 2, 6, 10, 11]
@@ -229,15 +255,42 @@ impl Firmware {
                     out[..4].copy_from_slice(&u32::from(self.phy_profile.is_some()).to_le_bytes());
                 } else if input.starts_with(b"rxchain\0") {
                     out[..4].copy_from_slice(&self.phy_profile.map_or(0, |p| p.0).to_le_bytes());
+                } else if input.starts_with(b"vhtmode\0") {
+                    out[..4].copy_from_slice(
+                        &self
+                            .vht
+                            .as_ref()
+                            .and_then(|p| p.mode)
+                            .unwrap_or(0)
+                            .to_le_bytes(),
+                    );
+                } else if input.starts_with(b"txstreams\0") {
+                    out[..4].copy_from_slice(
+                        &self
+                            .vht
+                            .as_ref()
+                            .and_then(|p| p.txstreams)
+                            .unwrap_or(0)
+                            .to_le_bytes(),
+                    );
                 } else if input.starts_with(b"chanspecs\0") {
-                    let list = self
-                        .wide
-                        .as_ref()
-                        .map_or_else(|| vec![0; 4], |wide| wide.list());
+                    let list = self.vht.as_ref().map(|v| v.list()).unwrap_or_else(|| {
+                        self.wide
+                            .as_ref()
+                            .map_or_else(|| vec![0; 4], |wide| wide.list())
+                    });
                     out[..list.len()].copy_from_slice(&list);
                 } else if input.starts_with(b"chanspec\0") {
                     let channel = if self.phy_profile.is_some_and(|p| p.1 == 2) {
                         0x1808u32
+                    } else if self.vht.is_some() {
+                        if self.vht.as_ref().is_some_and(|v| {
+                            v.fault == crate::cyw43439::phy_fixture::VhtFault::CurrentWidth
+                        }) {
+                            0xd000 | u32::from(self.channel)
+                        } else {
+                            u32::from(self.current_chanspec)
+                        }
                     } else if self.wide.is_some()
                         && !self.wide.as_ref().is_some_and(|w| {
                             w.fault == crate::cyw43439::phy_fixture::WideFault::CurrentWidth
@@ -284,6 +337,27 @@ impl Firmware {
                     out[..ies.len()].copy_from_slice(&ies);
                 } else if input.starts_with(b"per_chan_info\0") {
                     let ch = u32::from_le_bytes(input[14..18].try_into().unwrap());
+                    if let Some(vht) = &self.vht {
+                        assert_eq!(ch & !255, 0xd000);
+                        let channels = [
+                            vht.center - 6,
+                            vht.center - 2,
+                            vht.center + 2,
+                            vht.center + 6,
+                        ];
+                        assert!(channels.contains(&((ch & 255) as u8)));
+                        let flags = 7u32
+                            | if ch & 255 == u32::from(vht.center + 6)
+                                && vht.fault
+                                    == crate::cyw43439::phy_fixture::VhtFault::ChannelRestricted
+                            {
+                                32
+                            } else {
+                                0
+                            };
+                        out[..4].copy_from_slice(&flags.to_le_bytes());
+                        return out;
+                    }
                     let wide = self.wide.as_ref().expect("wide channel query profile");
                     assert!(
                         ch & 255 == u32::from(self.channel)
@@ -304,8 +378,13 @@ impl Firmware {
                 } else if input.starts_with(b"bw_cap\0") {
                     let band = u32::from_le_bytes(input[7..11].try_into().unwrap());
                     assert!(matches!(band, 1 | 2));
-                    let cap = if self.bandwidth_stuck || self.phy_profile.is_some_and(|p| p.1 == 1)
+                    let cap = if self.vht.as_ref().is_some_and(|v| {
+                        v.fault == crate::cyw43439::phy_fixture::VhtFault::CapReadback
+                    }) && self.wide_started
+                        && self.bandwidth[(band - 1) as usize] == 7
                     {
+                        3
+                    } else if self.bandwidth_stuck || self.phy_profile.is_some_and(|p| p.1 == 1) {
                         7
                     } else if self.wide_started
                         && self.bandwidth[(band - 1) as usize] == 3
@@ -327,7 +406,7 @@ impl Firmware {
                 assert!(matches!(band, 1 | 2));
                 self.bandwidth[(band - 1) as usize] =
                     u32::from_le_bytes(input[11..15].try_into().unwrap());
-                self.wide_started |= self.bandwidth[(band - 1) as usize] == 3;
+                self.wide_started |= self.bandwidth[(band - 1) as usize] > 1;
                 Vec::new()
             }
             263 if input.starts_with(b"escan\0") => {
@@ -343,6 +422,7 @@ impl Firmware {
                         self.pmf_required,
                         self.phy_profile,
                         self.wide.as_ref(),
+                        self.vht.as_ref(),
                     ),
                 );
                 self.event(69, 0, 0, &[]);
@@ -387,7 +467,16 @@ impl Firmware {
                 } else {
                     0xd000u16
                 } | u16::from(self.channel);
-                let chanspec = if self.bandwidth[usize::from(self.channel <= 14)] == 3 {
+                let chanspec = if let Some(vht) = &self.vht {
+                    vht.channel(
+                        self.channel,
+                        match self.bandwidth[0] {
+                            7 => 80,
+                            3 => 40,
+                            _ => 20,
+                        },
+                    )
+                } else if self.bandwidth[usize::from(self.channel <= 14)] == 3 {
                     self.wide.as_ref().expect("wide native profile").operating
                 } else {
                     chanspec
@@ -439,6 +528,19 @@ impl Firmware {
         }
     }
     pub(super) fn hold_mfp_reply(&self, command: u32, input: &[u8]) -> bool {
+        if let Some(vht) = &self.vht {
+            use crate::cyw43439::phy_fixture::VhtFault;
+            if command == 263
+                && input.starts_with(b"bw_cap\0")
+                && input[11..15] == [7, 0, 0, 0]
+                && vht.fault == VhtFault::HoldCap
+                || command == 262
+                    && input.starts_with(b"assoc_resp_ies\0")
+                    && vht.fault == VhtFault::HoldResponse
+            {
+                return true;
+            }
+        }
         (command == 263
             && input.starts_with(b"bw_cap\0")
             && input[11..15] == [3, 0, 0, 0]
@@ -568,6 +670,7 @@ fn scan_result(
     mfp: bool,
     phy: Option<(u32, u8)>,
     wide: Option<&crate::cyw43439::phy_fixture::Wide>,
+    vht: Option<&crate::cyw43439::phy_fixture::Vht80>,
 ) -> Vec<u8> {
     let mut ies = vec![0, 4, b't', b'e', b's', b't'];
     if secured {
@@ -580,10 +683,12 @@ fn scan_result(
         }
     }
     if let Some((chains, fault)) = phy {
-        let extra = wide.map_or_else(
-            || crate::cyw43439::phy_fixture::response(channel, chains),
-            |w| w.beacon(channel, chains),
-        );
+        let extra = vht.map(|v| v.beacon(channel, chains)).unwrap_or_else(|| {
+            wide.map_or_else(
+                || crate::cyw43439::phy_fixture::response(channel, chains),
+                |w| w.beacon(channel, chains),
+            )
+        });
         ies.extend_from_slice(if fault == 9 { &extra[..52] } else { &extra });
     }
     let mut out = vec![0; 12 + 128 + ies.len()];
@@ -635,6 +740,22 @@ impl Handle {
             f.bandwidth = [wide.caps[1], wide.caps[0]];
             f.wide = Some(wide);
         });
+    }
+    pub(crate) fn vht_profile(&self, vht: crate::cyw43439::phy_fixture::Vht80) {
+        self.change(|f| {
+            f.bandwidth = [vht.caps[1], vht.caps[0]];
+            f.vht = Some(vht);
+        });
+    }
+    pub(crate) fn release_vht(&self) {
+        self.change(|f| {
+            if let Some(vht) = &mut f.vht {
+                vht.fault = crate::cyw43439::phy_fixture::VhtFault::None;
+            }
+        });
+    }
+    pub(crate) fn channel_adopted(&self) {
+        self.change(|f| f.event(63, 0, 0, &[]));
     }
     pub(crate) fn release_wide(&self) {
         self.change(|f| {

@@ -80,6 +80,17 @@ pub(super) struct Fixture {
     wmm_response: Option<Vec<u8>>,
     ht_offer: Option<Vec<u8>>,
     pub(super) ht_expected: bool,
+    pub(super) ht_secondary: Option<u16>,
+    pub(super) ht_inventory: usize,
+    pub(super) ht_inventory_hold: bool,
+    protection_trace: Vec<(u32, u32)>,
+    protection_request: Option<radio::StationProtection>,
+    protection_hold: Option<usize>,
+    protection_change_at: usize,
+    protection_revoke:
+        Option<narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>>,
+    protection_policy: Option<TestPolicy>,
+    protection_delay: u8,
     ht_response: Option<Vec<u8>>,
     ht_mcs: u8,
     ht_sgi: bool,
@@ -122,6 +133,16 @@ impl Fixture {
             wmm_response: None,
             ht_offer: None,
             ht_expected: false,
+            ht_secondary: None,
+            ht_inventory: 0,
+            ht_inventory_hold: false,
+            protection_trace: Vec::new(),
+            protection_request: None,
+            protection_hold: None,
+            protection_change_at: 0,
+            protection_revoke: None,
+            protection_policy: None,
+            protection_delay: 0,
             ht_response: None,
             ht_mcs: 0xff,
             ht_sgi: true,
@@ -379,10 +400,14 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
             let mut expected = vec![
                 45,
                 26,
-                if m.data.as_ref().unwrap().ht_request_sgi {
+                (if m.data.as_ref().unwrap().ht_request_sgi {
                     0x2c
                 } else {
                     0x0c
+                }) | if m.data.as_ref().unwrap().ht_secondary.is_some() {
+                    2
+                } else {
+                    0
                 },
                 0,
                 24,
@@ -444,7 +469,8 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
             || word(at + 20)
                 != ((if secured { 5 } else { 1 })
                     | if qos { 2 } else { 0 }
-                    | if ht { 0x1000 } else { 0 })
+                    | if ht { 0x1000 } else { 0 }
+                    | if f.ht_secondary.is_some() { 0x2000 } else { 0 })
             || word(at + 24) != (if secured { 0x11 } else { 1 })
         {
             return Err(BmiError::BadResponse);
@@ -456,7 +482,9 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
             || command[rates..rates + 3] != [12, 24, 48]
             || word(phy)
                 != if ht {
-                    if m.frequency < 3000 {
+                    if f.ht_secondary.is_some() {
+                        6
+                    } else if m.frequency < 3000 {
                         5
                     } else {
                         4
@@ -478,7 +506,9 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
             if word(at + 32) != u32::from(f.ht_capabilities)
                 || word(at + 36) != (1 << (13 + (f.ht_ampdu & 3))) - 1
                 || word(at + 40) != density
-                || word(at + 44) != if f.ht_sgi { 12 } else { 8 }
+                || word(at + 44)
+                    != (if f.ht_sgi { 12 } else { 8 }
+                        | if f.ht_secondary.is_some() { 2 } else { 0 })
                 || word(ht_count) != ht_rates.len() as u32
                 || command.get(ht_at..ht_at + ht_rates.len()) != Some(&ht_rates)
             {
@@ -632,6 +662,16 @@ pub(super) fn send_now(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError>
     Ok(())
 }
 pub(super) fn poll(m: &mut RadioModel) -> Result<(), BmiError> {
+    if let Some(f) = &mut m.data {
+        if f.protection_delay != 0 {
+            f.protection_delay -= 1;
+            if f.protection_delay == 0 {
+                if let Some(id) = f.held.pop_front() {
+                    complete(m, id, 0);
+                }
+            }
+        }
+    }
     let Some(fixture) = m.data.as_mut() else {
         return Ok(());
     };
@@ -963,3 +1003,86 @@ kernel_test_in!(
 
 #[path = "dhcp_tests.rs"]
 mod dhcp_tests;
+
+pub(super) fn protection_handles(d: Dialect, b: &[u8]) -> bool {
+    b.get(..4).is_some_and(|id| {
+        id == match d {
+            Dialect::Main | Dialect::Tlv => 0x5008u32,
+            Dialect::TenOne => 0x901a,
+            Dialect::TenTwo | Dialect::TenTwoFour => 0x9019,
+            Dialect::TenFour => 0x901c,
+        }
+        .to_le_bytes()
+    })
+}
+pub(super) async fn protection_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> {
+    let d = m.inner.inner.dialect;
+    let b = &bytes[8..];
+    let tlv = d == Dialect::Tlv;
+    let at = if tlv { 8 } else { 4 };
+    if b.len() != at + 12
+        || tlv && b[4..8] != ((95u32 << 16) | 12).to_le_bytes()
+        || b[at..at + 4] != [0; 4]
+    {
+        return Err(BmiError::BadResponse);
+    }
+    let f = m.data.as_ref().ok_or(BmiError::BadResponse)?;
+    let step = f.protection_trace.len() % 3;
+    let (cts, enable) = match d {
+        Dialect::Main | Dialect::Tlv => (26u32, 44u32),
+        Dialect::TenOne | Dialect::TenTwo | Dialect::TenTwoFour => (24, 43),
+        Dialect::TenFour => (26, 45),
+    };
+    let request = f.protection_request.unwrap_or(radio::StationProtection {
+        rts_threshold: Some(0),
+        cts_protection: false,
+    });
+    let (p, value) = match step {
+        0 => (enable, 0x21),
+        1 => (cts, u32::from(request.cts_protection)),
+        _ => (1, request.rts_threshold.map_or(u32::MAX, u32::from)),
+    };
+    if b[at + 4..at + 8] != p.to_le_bytes()
+        || b[at + 8..at + 12] != value.to_le_bytes()
+        || !f.held.is_empty()
+        || m.inner.storage.as_ref().unwrap().tx.pending() != 0
+    {
+        return Err(BmiError::BadResponse);
+    }
+    m.sent.push(bytes.to_vec());
+    let f = m.data.as_mut().unwrap();
+    f.protection_trace.push((p, value));
+    if step == f.protection_change_at {
+        if let Some(cap) = f.protection_revoke.take() {
+            cap.revoke();
+        }
+        if let Some(policy) = f.protection_policy.take() {
+            policy.lock().take();
+        }
+    }
+    m.inner.inner.rx.push_back((
+        2,
+        vec![
+            2,
+            2,
+            8,
+            0,
+            8,
+            0,
+            0,
+            0,
+            1,
+            4,
+            0,
+            0,
+            2,
+            bytes.len().div_ceil(256) as u8,
+            0,
+            0,
+        ],
+    ));
+    if m.data.as_ref().unwrap().protection_hold == Some(step) {
+        core::future::pending::<()>().await;
+    }
+    Ok(())
+}

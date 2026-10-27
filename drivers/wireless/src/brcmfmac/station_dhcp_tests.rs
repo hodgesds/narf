@@ -24,6 +24,8 @@ mod ht_tests;
 mod mfp_tests;
 #[path = "power_save_tests.rs"]
 mod power_save_tests;
+#[path = "vht_tests.rs"]
+mod vht_tests;
 
 type ModelDevice = Device<TestAdapter>;
 static ACTIVE_TEST: IrqSafeSpinLock<Option<Arc<ModelDevice>>> = IrqSafeSpinLock::new(None);
@@ -50,6 +52,7 @@ struct Configuration {
     mfp: Option<(bool, bool, u8)>,
     phy: Option<(u32, u8)>,
     wide: Option<crate::cyw43439::phy_fixture::Wide>,
+    vht: Option<crate::cyw43439::phy_fixture::Vht80>,
 }
 struct Harness {
     device: Arc<ModelDevice>,
@@ -129,6 +132,7 @@ impl Harness {
                 mfp: features.0,
                 phy: features.1,
                 wide: None,
+                vht: None,
             },
         )
     }
@@ -151,6 +155,31 @@ impl Harness {
                 mfp: mfp.then_some((true, true, 0)),
                 phy: Some((7, 0)),
                 wide: Some(wide),
+                vht: None,
+            },
+        )
+    }
+    fn new_vht(
+        version: u32,
+        secured: bool,
+        channel: u8,
+        database: Option<Arc<narf_wireless::reg::db::Database>>,
+        mfp: bool,
+        chains: u32,
+        vht: crate::cyw43439::phy_fixture::Vht80,
+    ) -> Result<Self, &'static str> {
+        Self::new_details(
+            version,
+            secured,
+            secured,
+            false,
+            channel,
+            database,
+            Configuration {
+                mfp: mfp.then_some((true, true, 0)),
+                phy: Some((chains, 0)),
+                wide: None,
+                vht: Some(vht),
             },
         )
     }
@@ -181,10 +210,20 @@ impl Harness {
             bus.phy_profile(chains, fault);
         }
         let mut domain = firmware::domain();
-        let wide = features.wide.is_some();
+        let wide = features.wide.is_some() || features.vht.is_some();
+        let width = if features.vht.is_some() {
+            80
+        } else if wide {
+            40
+        } else {
+            20
+        };
         if let Some(profile) = features.wide {
             bus.wide_profile(profile);
             domain.rules[0].max_bandwidth_mhz = 40;
+        }
+        if let Some(profile) = features.vht {
+            bus.vht_profile(profile);
         }
         if channel > 14 {
             use narf_wireless::reg::{RegFlags, RegRule};
@@ -196,7 +235,7 @@ impl Harness {
                 domain.rules.push(RegRule {
                     freq_start_mhz: start,
                     freq_end_mhz: end,
-                    max_bandwidth_mhz: if wide { 40 } else { 20 },
+                    max_bandwidth_mhz: width,
                     max_power_dbm: 17,
                     flags,
                 });
@@ -228,6 +267,7 @@ impl Harness {
         let supplicant = station.supplicant;
         let mfp_supported = station.supports_management_protection();
         let ht_capabilities = station.ht_capabilities();
+        let vht_capabilities = station.vht_capabilities();
         let (rx, consumer) = narf_ipc::channel();
         let (producer, tx) = narf_ipc::channel();
         let name = narf_net::iface::register("wlan%d", OWN, send);
@@ -244,9 +284,14 @@ impl Harness {
             supplicant,
             mfp_supported,
             ht_capabilities,
+            vht_capabilities,
             up: AtomicBool::new(false),
             power_save: AtomicU8::new(0),
             bssid: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
+            closing: AtomicBool::new(false),
+            publication: IrqSafeSpinLock::new(()),
+            receive_hook: IrqSafeSpinLock::new(None),
             rx: IrqSafeSpinLock::new(Some(consumer)),
             tx: IrqSafeSpinLock::new(Some(producer)),
         });

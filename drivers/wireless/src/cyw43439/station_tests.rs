@@ -139,6 +139,8 @@ impl Bus {
                     || body.starts_with(b"mfp\0")
                     || body.starts_with(b"assoc_")
                     || body.starts_with(b"bw_cap\0")
+                    || body.starts_with(b"vhtmode\0")
+                    || body.starts_with(b"txstreams\0")
                     || body.starts_with(b"chanspec")
                     || body.starts_with(b"wpaie\0"))
                 .then(|| (command, body.to_vec()))

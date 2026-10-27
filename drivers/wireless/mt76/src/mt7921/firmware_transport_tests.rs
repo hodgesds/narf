@@ -27,6 +27,8 @@ mod receive_epoch_tests;
 mod rx_ba_tests;
 #[path = "tx_ba_tests.rs"]
 mod tx_ba_tests;
+#[path = "tx_nss_tests.rs"]
+mod tx_nss_tests;
 #[path = "tx_pipeline_station_tests.rs"]
 mod tx_pipeline_station_tests;
 #[path = "vht160_tests.rs"]
@@ -165,6 +167,7 @@ fn event(cmd: u8, seq: u8, status: u8) -> Vec<u8> {
 #[derive(Debug)]
 struct Model {
     chip_id: u16,
+    phy_capability: Option<[u8; 12]>,
     receive_epoch: u64,
     receive_open: bool,
     captured_packets: VecDeque<CapturedData>,
@@ -230,6 +233,7 @@ impl Model {
         let resources = Arc::new(AtomicUsize::new(1));
         Self {
             chip_id: 0,
+            phy_capability: None,
             receive_epoch: 0,
             receive_open: false,
             captured_packets: VecDeque::new(),
@@ -441,6 +445,9 @@ impl Backend for Model {
                     reply = runtime_event(0x0d, 0, 0, &done);
                 } else if cmd == 0x8a {
                     let mut caps = capabilities();
+                    if let Some(phy) = self.phy_capability {
+                        caps[26..38].copy_from_slice(&phy);
+                    }
                     if self.clc_result {
                         caps[55] |= 1;
                     }

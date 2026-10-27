@@ -33,6 +33,9 @@ impl core::fmt::Debug for PciIo {
     }
 }
 impl PciIo {
+    pub(super) fn publication(&self) -> super::prepare::packet::Publication {
+        super::prepare::packet::Publication::native(self.device, self.cap)
+    }
     /// Caller owns the exact live BAR2 control region exclusively. No other
     /// firmware/register path may run concurrently with the retained owner.
     pub(super) unsafe fn new(

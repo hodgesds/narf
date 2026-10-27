@@ -377,6 +377,22 @@ remain open. Tokei15 measures4,767 net additional Rust code lines, including
 tests, across `drivers/wireless`, `wireless` and `verification/wifi-fixtures`;
 the total rises from364,095 to368,862. These counts are not a completion fraction.
 
+The new `codex/wifi-feature-completion` branch continues from merged PR#1090
+(`267146076`). Its validated software checkpoint adds ath10k HT40 with retained
+firmware/BDF authority and native protection, separately qualified RTL8188EE
+HT20, BCM43602 VHT80 with final receive-publication fences, and MT76 actual
+NIC/AP-qualified TX2 with full native rate maps, RF/RLM setup and conservative
+power headroom. Shared native PHY snapshots preserve original offer/response
+limits. Native Rust cases and existing Open/WPA2 DHCP/IP compositions pass:
+x86_64 2419/0 fail/9 skip; aarch64 1949/0 fail/3 skip, adding59 smokes per arch.
+All-family feature completion and physical acceptance remain open.
+
+Debug/release builds, strict production/test and exact CI feature-context
+Clippy, workspace formatting, metadata diagnostics, both production boots
+and all four btrfs postflights pass. Tokei15 measures6,859 net additional
+Rust code lines, including tests, across `drivers/wireless`, `wireless` and
+`verification/wifi-fixtures`:368,862 to375,721. No binary assets were added.
+
 The preceding station power-save continuation added ordinary firmware station power save to the
 common CYW43439/BCM43602 owner. PM_FAST/PM_OFF and the default sleep-retention
 commands are serialized with station control; partial failure or cancellation

@@ -37,6 +37,7 @@ pub struct Calibration {
     qualified: i16,
     curves: Vec<Curve>,
     authority: Option<Cap<FirmwareBlob, Read>>,
+    pub(super) digest: [u8; 32],
 }
 impl core::fmt::Debug for Calibration {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -200,6 +201,11 @@ impl Calibration {
             qualified,
             curves,
             authority: None,
+            digest: {
+                let mut h = narf_crypto::sha256::Sha256::new();
+                h.update(bytes);
+                h.finalize()
+            },
         })
     }
     pub fn permission(
@@ -263,6 +269,34 @@ impl Calibration {
             ofdm,
             eirp,
         })
+    }
+    pub(super) fn factory(&self) -> &Factory {
+        &self.factory
+    }
+    pub(super) fn antenna(&self) -> i16 {
+        self.antenna
+    }
+    /// Check the actual preceding programmed legacy gains under a narrower
+    /// extension ceiling. A new measurement never silently changes that owner.
+    pub(super) fn within(&self, p: Permission, limit: i16, antenna: i16) -> bool {
+        p.identity == self.identity
+            && self
+                .curves
+                .iter()
+                .find(|c| c.channel == p.channel)
+                .is_some_and(|c| {
+                    p.cck.iter().all(|i| {
+                        c.cck[usize::from(*i)] != UNKNOWN
+                            && i32::from(c.cck[usize::from(*i)])
+                                + i32::from(antenna.max(self.antenna))
+                                <= i32::from(limit)
+                    }) && p.ofdm.iter().all(|i| {
+                        c.ofdm[usize::from(*i)] != UNKNOWN
+                            && i32::from(c.ofdm[usize::from(*i)])
+                                + i32::from(antenna.max(self.antenna))
+                                <= i32::from(limit)
+                    })
+                })
     }
 }
 
