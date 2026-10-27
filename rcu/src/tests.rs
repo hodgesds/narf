@@ -333,8 +333,12 @@ fn smoke_rcu_retire_far_past_old_bucket_cap_reclaims_all() -> TestResult {
         }
     }
 
+    // Earlier scheduler smokes retire stacks into this same CPU's bucket.
+    // A single quiescent report need not finish their SMP grace period.
+    // Drain them before asserting this fixture's exact queue cardinality.
+    crate::sync();
     DROPS.store(0, Ordering::Relaxed);
-    crate::report_quiescent();
+    let reader = crate::pin();
     for _ in 0..N {
         crate::retire_box(Box::new(Canary));
     }
@@ -345,6 +349,7 @@ fn smoke_rcu_retire_far_past_old_bucket_cap_reclaims_all() -> TestResult {
     if crate::qsbr::deferred_len_this_cpu() != N {
         return TestResult::Fail("the queue did not accept every retired object");
     }
+    drop(reader);
     crate::sync();
     let dropped = DROPS.load(Ordering::Relaxed);
     if dropped != N {
