@@ -78,6 +78,7 @@ pub struct JoinPlan {
     phy_enabled: bool,
     offered_phy: Option<phy::Offer>,
     negotiated_phy: Option<phy::Negotiated>,
+    spp_amsdu: bool,
 }
 
 #[derive(Default)]
@@ -298,6 +299,38 @@ impl JoinPlan {
 
     /// Append validated optional SME elements before the first transmission.
     /// Its RSNE is checked above and replaced by the driver's negotiated one.
+    /// Advertise SPP A-MSDU Capable (RSN Capabilities bit10, IEEE802.11-2020
+    /// 9.4.2.24.4) in the WPA2 association-request RSNE before first
+    /// transmission. Only a native owner whose CCMP path keeps A-MSDU Present
+    /// in the AAD (`station_security::Security` with this `rsn_body()`) may
+    /// opt in; SPP is in force only if the AP RSNE also sets the bit.
+    pub fn enable_spp_amsdu(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Prepared {
+            return Err(Error::Busy);
+        }
+        if !self.security.is_wpa2() {
+            return Err(Error::UnsupportedSecurity);
+        }
+        // Fixed fields: 24-byte header, Capability and Listen Interval.
+        let mut at = 28;
+        while at + 2 <= self.assoc.len() {
+            let len = usize::from(self.assoc[at + 1]);
+            if self.assoc[at] == 48 {
+                let body = self
+                    .assoc
+                    .get_mut(at + 2..at + 2 + len)
+                    .ok_or(Error::Protocol)?;
+                let caps = body.len().checked_sub(2).ok_or(Error::Protocol)?;
+                let value = u16::from_le_bytes([body[caps], body[caps + 1]])
+                    | rsn::RSN_CAP_SPP_AMSDU_CAPABLE;
+                body[caps..].copy_from_slice(&value.to_le_bytes());
+                self.spp_amsdu = true;
+                return Ok(());
+            }
+            at += 2 + len;
+        }
+        Err(Error::Protocol)
+    }
     pub fn append_sme_ies(&mut self, bytes: &[u8]) -> Result<(), Error> {
         if self.phase != Phase::Prepared {
             return Err(Error::Busy);
@@ -493,6 +526,7 @@ impl JoinPlan {
             phy_enabled: local.is_some(),
             offered_phy,
             negotiated_phy: None,
+            spp_amsdu: false,
         })
     }
     pub fn start_authentication(&mut self) -> Result<&[u8], Error> {
@@ -634,7 +668,11 @@ impl JoinPlan {
     }
     pub fn rsn_body(&self) -> Option<Vec<u8>> {
         if self.security.is_wpa2() {
-            Some(RsnIe::wpa2_psk_ccmp().encode_body())
+            let mut rsne = RsnIe::wpa2_psk_ccmp();
+            if self.spp_amsdu {
+                rsne.rsn_capabilities |= rsn::RSN_CAP_SPP_AMSDU_CAPABLE;
+            }
+            Some(rsne.encode_body())
         } else {
             None
         }

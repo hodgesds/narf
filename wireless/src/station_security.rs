@@ -66,6 +66,7 @@ pub struct Security {
     failed: bool,
     sequence: u16,
     qos_sequence: [u16; 16],
+    spp_amsdu: bool,
 }
 impl core::fmt::Debug for Security {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -105,9 +106,16 @@ impl Security {
             || !unicast(peer)
             || own == peer
             || sequence > 4095
-            || crate::rsn::RsnIe::decode_body(station_rsne)
-                != Some(crate::rsn::RsnIe::wpa2_psk_ccmp())
         {
+            return Err(Error::Profile);
+        }
+        // The station RSNE is the canonical WPA2-PSK/CCMP body, optionally
+        // advertising SPP A-MSDU Capable (RSN Capabilities bit10).
+        let station = crate::rsn::RsnIe::decode_body(station_rsne).ok_or(Error::Profile)?;
+        let mut canonical = crate::rsn::RsnIe::wpa2_psk_ccmp();
+        canonical.rsn_capabilities =
+            station.rsn_capabilities & crate::rsn::RSN_CAP_SPP_AMSDU_CAPABLE;
+        if station != canonical {
             return Err(Error::Profile);
         }
         let ap = crate::rsn::RsnIe::decode_body(ap_rsne).ok_or(Error::Profile)?;
@@ -144,7 +152,18 @@ impl Security {
             failed: false,
             sequence,
             qos_sequence: [sequence; 16],
+            // IEEE802.11-2020 12.5.3.3.3: SPP A-MSDU applies only when both
+            // STAs advertise SPP A-MSDU Capable.
+            spp_amsdu: station.rsn_capabilities
+                & ap.rsn_capabilities
+                & rsn::RSN_CAP_SPP_AMSDU_CAPABLE
+                != 0,
         })
+    }
+    /// True when both the retained station and AP RSNEs advertised SPP
+    /// A-MSDU Capable, so pairwise CCMP authenticates A-MSDU Present.
+    pub fn spp_amsdu(&self) -> bool {
+        self.spp_amsdu
     }
     pub fn port_open(&self) -> bool {
         !self.failed
@@ -227,7 +246,9 @@ impl Security {
     /// complete authenticated subframes are returned as Ethernet-II frames.
     /// A-MSDU cannot supply EAPOL or drive the retained supplicant/rekey.
     pub fn receive_amsdu(&mut self, mpdu: &impl RawFrame) -> Result<Option<Vec<Vec<u8>>>, Error> {
-        self.receive_amsdu_inner(mpdu, false)
+        Ok(self
+            .receive_amsdu_with(mpdu, packet_key::AmsduAdmission::new())?
+            .map(|r| r.frames))
     }
     /// Admit normal/BlockAck-policy original A-MSDUs only after the driver
     /// proves a live BA agreement and releases this MPDU in native SN order.
@@ -236,29 +257,30 @@ impl Security {
         &mut self,
         mpdu: &impl RawFrame,
     ) -> Result<Option<Vec<Vec<u8>>>, Error> {
-        self.receive_amsdu_inner(mpdu, true)
+        Ok(self
+            .receive_amsdu_with(mpdu, packet_key::AmsduAdmission::new().with_block_ack(true))?
+            .map(|r| r.frames))
     }
-    fn receive_amsdu_inner(
+    /// Receive an original protected A-MSDU under the explicit ack-policy,
+    /// EOSP and size opt-ins the driver's native receive path has proved.
+    /// The same port/peer/key/replay rules as `receive_amsdu` apply, and the
+    /// result carries the original TID, Ack Policy and EOSP facts.
+    pub fn receive_amsdu_with(
         &mut self,
         mpdu: &impl RawFrame,
-        block_ack: bool,
-    ) -> Result<Option<Vec<Vec<u8>>>, Error> {
+        admission: packet_key::AmsduAdmission,
+    ) -> Result<Option<packet_key::AmsduReceive>, Error> {
         if !self.port_open() {
             return Err(Error::State);
         }
         let bytes = mpdu.bytes();
         if !mpdu.unmodified()
-            || !(26 + 16 + 22..=26 + 16 + crate::amsdu::MAX_BYTES).contains(&bytes.len())
+            || !(26 + 16 + 22..=26 + 16 + admission.limit().bytes()).contains(&bytes.len())
         {
             return Ok(None);
         }
         let header = &bytes[..26];
-        let admitted = if block_ack {
-            packet_key::aggregate_header_block_ack(header)
-        } else {
-            packet_key::aggregate_header(header)
-        };
-        if admitted.is_err()
+        if packet_key::aggregate_header_with(header, admission).is_err()
             || header[10..16] != self.peer
             || !unicast(header[16..22].try_into().unwrap())
             || header[4..10] != self.own && header[4] & 1 == 0
@@ -277,11 +299,7 @@ impl Security {
         let Some(slot) = slot else {
             return Ok(None);
         };
-        Ok(if block_ack {
-            slot.key.unprotect_amsdu_block_ack(header, wire).ok()
-        } else {
-            slot.key.unprotect_amsdu(header, wire).ok()
-        })
+        Ok(slot.key.unprotect_amsdu_with(header, wire, admission).ok())
     }
     pub fn receive_with_nonce(
         &mut self,
@@ -447,6 +465,51 @@ impl Security {
         }
         self.transmit_ethernet_inner(ethernet, Some(tid))
     }
+    /// Aggregate station-originated Ethernet-II frames into one protected
+    /// QoS A-MSDU MPDU for `tid` (IEEE802.11-2020 9.3.2.2.2). Every frame
+    /// must carry this station's SA and an ordinary Ethernet-II protocol; the
+    /// control port, tunnels and VLAN-encapsulated control ports are rejected,
+    /// so EAPOL is never aggregated. The outer Address3 is the BSSID per Table
+    /// 9-30, Normal Ack is used and one QoS SN plus one PN are consumed. The
+    /// caller must hold a peer-advertised `limit` and its own negotiated
+    /// PHY/aggregation/queue admission; this grants none of them.
+    pub fn transmit_amsdu_qos(
+        &mut self,
+        frames: &[&[u8]],
+        tid: u8,
+        limit: crate::amsdu::Limit,
+    ) -> Result<Vec<u8>, Error> {
+        if !self.port_open() {
+            return Err(Error::State);
+        }
+        if tid > 15 {
+            return Err(Error::Profile);
+        }
+        let body = crate::amsdu::encode(frames, self.own, limit).map_err(|_| Error::Profile)?;
+        let mut header = vec![0x88, 0x41, 0, 0];
+        header.extend_from_slice(&self.peer);
+        header.extend_from_slice(&self.own);
+        header.extend_from_slice(&self.peer);
+        let sequence = self.qos_sequence[usize::from(tid)];
+        header.extend_from_slice(&(sequence << 4).to_le_bytes());
+        header.extend_from_slice(&[0x80 | tid, 0]);
+        let result = self
+            .pair
+            .as_mut()
+            .ok_or(Error::State)?
+            .key
+            .protect_amsdu(&header, &body, limit);
+        let wire = match result {
+            Ok(wire) => wire,
+            Err(error) => {
+                self.fail();
+                return Err(Error::Crypto(error));
+            }
+        };
+        self.qos_sequence[usize::from(tid)] = (sequence + 1) & 4095;
+        header.extend_from_slice(&wire);
+        Ok(header)
+    }
     /// Sample the next exact QoS SN without consuming it or a key PN.
     /// Native BA callers must freeze their producer and drain all preceding
     /// packets before using it as an ADDBA SSN; this value grants no BA or
@@ -566,12 +629,14 @@ impl Security {
                     old.key.reinstall(&material, 0).map_err(Error::Crypto)?;
                 } else {
                     let key = Key::new(&material, 0, Role::Pairwise, self.own, self.peer, 0)
+                        .and_then(|key| key.with_spp_amsdu(self.spp_amsdu))
                         .map_err(Error::Crypto)?;
                     self.history.push(Zeroizing::new(*material));
                     self.pair = Some(Slot { material, key });
                 }
             } else {
                 let key = Key::new(&material, 0, Role::Pairwise, self.own, self.peer, 0)
+                    .and_then(|key| key.with_spp_amsdu(self.spp_amsdu))
                     .map_err(Error::Crypto)?;
                 self.history.push(Zeroizing::new(*material));
                 self.pair = Some(Slot { material, key });
