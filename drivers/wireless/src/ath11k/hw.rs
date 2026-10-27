@@ -71,6 +71,54 @@ impl HwRev {
             HwRev::Unknown => return None,
         })
     }
+
+    /// `hw_params.spectral` from Linux `core.c::ath11k_hw_params`. Every
+    /// PCI WLAN profile NARF admits (QCA6390, WCN6855, QCA2066, QCA6698AQ)
+    /// has an all-zero block; only QCN9074 among the PCI parts (and the
+    /// IPQ8074/IPQ6018/IPQ5018 AHB SoCs NARF does not admit) defines an FFT
+    /// report format.
+    pub const fn spectral(self) -> SpectralParams {
+        match self {
+            HwRev::Qcn9074Hw10 => SpectralParams {
+                fft_sz: 2,
+                fft_pad_sz: 0,
+                summary_pad_sz: 16,
+                fft_hdr_len: 24,
+                max_fft_bins: 1024,
+                fragment_160mhz: false,
+            },
+            _ => SpectralParams {
+                fft_sz: 0,
+                fft_pad_sz: 0,
+                summary_pad_sz: 0,
+                fft_hdr_len: 0,
+                max_fft_bins: 0,
+                fragment_160mhz: false,
+            },
+        }
+    }
+}
+
+/// `struct ath11k_hw_params::spectral`: the direct-buffer FFT report
+/// geometry `spectral.c` parses.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SpectralParams {
+    pub fft_sz: u32,
+    pub fft_pad_sz: u32,
+    pub summary_pad_sz: u32,
+    pub fft_hdr_len: u32,
+    pub max_fft_bins: u32,
+    pub fragment_160mhz: bool,
+}
+
+/// The two gates at the top of Linux `ath11k_spectral_init`: the target
+/// must advertise `WMI_TLV_SERVICE_FREQINFO_IN_METADATA` and the hardware
+/// profile must define an FFT sample size. When either is absent Linux
+/// returns 0 without allocating the spectral DBRing, registering the relay
+/// channel or creating the debugfs controls, so no spectral WMI
+/// (`WMI_VDEV_SPECTRAL_SCAN_{CONFIGURE,ENABLE}_CMDID`) is ever sent.
+pub const fn spectral_supported(rev: HwRev, freqinfo_in_metadata: bool) -> bool {
+    freqinfo_in_metadata && rev.spectral().fft_sz != 0
 }
 
 /// Per-PCI-ID descriptor — display name + default `HwRev` (used

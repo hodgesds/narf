@@ -1064,6 +1064,9 @@ pub struct Rt<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     /// currently waiting on vdev 0.
     events: Vec<VecDeque<Vec<u8>>>,
     tx_power_stats: Arc<IrqSafeSpinLock<super::fw_stats::State>>,
+    /// Radio-wide radar-detector record (shared with [`Shared`] so it and
+    /// its `dfs_block_radar_events` switch survive recovery).
+    radar: Arc<IrqSafeSpinLock<super::mac::diag::RadarDiagnostics>>,
 }
 
 /// A synchronous port call, applied at the next locked step.
@@ -1169,6 +1172,9 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
             reset: ResetState::default(),
             events,
             tx_power_stats: Arc::new(IrqSafeSpinLock::new(super::fw_stats::State::default())),
+            radar: Arc::new(IrqSafeSpinLock::new(
+                super::mac::diag::RadarDiagnostics::default(),
+            )),
         }
     }
 
@@ -2348,7 +2354,14 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
                 }
                 continue;
             }
-            let target = match wmi::decode_event(&frame) {
+            let decoded = wmi::decode_event(&frame);
+            if let Ok(wmi::WmiEvent::DfsRadarDetected(ev)) = &decoded {
+                // `ath11k_wmi_pdev_dfs_radar_detected_event` runs once per
+                // report, before mac80211 sees it on any vdev.
+                let pdev_id = device_caps(&self.core).ok().map(|caps| caps.pdev_id);
+                self.radar.lock().record(ev, pdev_id);
+            }
+            let target = match decoded {
                 Ok(wmi::WmiEvent::VdevStartResp(event)) => Some(event.vdev_id),
                 Ok(wmi::WmiEvent::VdevStopped(vdev_id)) => Some(vdev_id),
                 Ok(wmi::WmiEvent::VdevDeleteResp(vdev_id)) => Some(vdev_id),
@@ -2359,6 +2372,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
                 Ok(wmi::WmiEvent::WowWakeup(event)) => Some(event.vdev_id),
                 Ok(wmi::WmiEvent::Scan(event)) => Some(event.vdev_id),
                 Ok(wmi::WmiEvent::Roam(event)) => Some(event.vdev_id),
+                Ok(wmi::WmiEvent::TwtAddDialog(event)) => Some(event.vdev_id),
                 Ok(wmi::WmiEvent::MgmtTxCompl(event)) => self
                     .mgmt
                     .bufs
@@ -2559,6 +2573,7 @@ pub struct Shared<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     bss_survey_requested: AtomicBool,
     tx_power_requested: AtomicBool,
     tx_power_stats: Arc<IrqSafeSpinLock<super::fw_stats::State>>,
+    radar: Arc<IrqSafeSpinLock<super::mac::diag::RadarDiagnostics>>,
     /// Desired pdev chain masks selected through `NL80211_CMD_SET_WIPHY`.
     /// They outlive WMI restart so every freshly-created MAC derives the
     /// same HT/VHT/HE NSS policy before it adds a vdev.
@@ -2613,6 +2628,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         let max_msg_len = rt.core.wmi_ep.map_or(0, |e| e.max_msg_len);
         let wmi_send_ms = rt.core.cfg.wmi_send_ms;
         let tx_power_stats = rt.tx_power_stats.clone();
+        let radar = rt.radar.clone();
         Arc::new(Shared {
             rt: Mutex::new(Some(rt)),
             irq,
@@ -2637,6 +2653,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
             bss_survey_requested: AtomicBool::new(false),
             tx_power_requested: AtomicBool::new(false),
             tx_power_stats,
+            radar,
             antenna_config: IrqSafeSpinLock::new(None),
             antenna_programmed_generation: AtomicU32::new(0),
             rts_config: IrqSafeSpinLock::new((RTS_THRESHOLD_OFF, 0)),
@@ -3147,6 +3164,18 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         }
     }
 
+    /// The radio's radar-detector diagnostics (latest report, counts, and
+    /// the `dfs_block_radar_events` switch).
+    pub fn radar_diagnostics(&self) -> super::mac::diag::RadarDiagnostics {
+        *self.radar.lock()
+    }
+
+    /// ath11k debugfs `dfs_block_radar_events`: keep recording radar
+    /// reports but stop handing them to the DFS state machine.
+    pub fn set_dfs_block_radar_events(&self, block: bool) {
+        self.radar.lock().block_radar_events = block;
+    }
+
     /// Take the latest RDDM-backed device coredump. The dump is independent
     /// of firmware lifetime and is therefore still valid after recovery;
     /// taking it transfers ownership to the diagnostic/export consumer.
@@ -3334,6 +3363,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         // statistics transactions; reuse the physical cache identity.
         self.tx_power_stats.lock().reset();
         rt.tx_power_stats = self.tx_power_stats.clone();
+        rt.radar = self.radar.clone();
         // mac80211's queues (still stopped for the driver) and the
         // statuses not yet reported survive the restart.  Keep that state
         // per vdev so a restart cannot deliver vdev 1's requested-TX
@@ -3896,6 +3926,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> DataPort for Port<Io, Irq, Q> {
         self.0.record_dfs_nop(def, deadline);
     }
 
+    fn radar_events_blocked(&self) -> bool {
+        self.0.radar.lock().block_radar_events
+    }
+
     fn ap_station_added(&self, vdev_id: u32, addr: [u8; 6], wme: bool) {
         self.0
             .push_op(SyncOp::ApStationAdded { vdev_id, addr, wme });
@@ -4074,6 +4108,11 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> DataPort for Port<Io, Irq, Q> {
                 g.dp.set_peer_sec_type(p.peer_id, u, m);
             }
             g.dp.set_peer_key_index(p.peer_id, pairwise, install.then_some(key_idx));
+            if !pairwise {
+                // mac80211 owns a GTK's replay counters (ath11k's REO PN
+                // offload is unicast-only); the DP holds them here.
+                g.dp.group_rx_key_config(p.peer_id, key_idx, cipher == wmi::cipher::TKIP, install);
+            }
         }
         if pairwise {
             if let Some(vdev) = g.vdev_mut(vdev_id) {
@@ -4088,6 +4127,18 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> DataPort for Port<Io, Irq, Q> {
             }
         }
         Ok(())
+    }
+
+    async fn group_rx_seq(&self, vdev_id: u32, addr: [u8; 6], key_idx: u8, seq: u64) {
+        let mut g = self.0.lock().await;
+        if let Some(peer_id) =
+            g.dp.peers
+                .iter()
+                .find(|p| p.vdev_id as u32 == vdev_id && p.addr == addr)
+                .map(|p| p.peer_id)
+        {
+            g.dp.group_rx_key_seq(peer_id, key_idx, seq);
+        }
     }
 
     async fn tkip_rx_mic_config(

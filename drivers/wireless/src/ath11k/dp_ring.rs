@@ -797,6 +797,9 @@ pub struct DpStats {
     pub rx_fcs_err: u32,
     pub rx_mic_err: u32,
     pub rx_decrypt_err: u32,
+    /// Group-addressed MPDUs refused by the host PN/TSC check (replay,
+    /// unknown Key ID or malformed IV; `dp_group_pn`).
+    pub rx_group_replay: u32,
     pub rx_delivered: u32,
     pub rx_buf_alloc_fail: u32,
     /// Fragments refused by `ath11k_dp_rx_frag_h_mpdu` (freed, link
@@ -1066,6 +1069,9 @@ pub struct Dp {
     rx_ppdu_stats: VecDeque<RxPpduStats>,
     /// Michael MIC failures awaiting route to a vdev's cfg80211 notifier.
     mic_failures: VecDeque<MichaelMicFailure>,
+    /// Receive replay counters of the installed group keys (mac80211's
+    /// per-key state; ath11k leaves group PN checking to the host).
+    group_rx_keys: Vec<super::dp_group_pn::GroupRxKey>,
     /// `ATH11K_FLAG_CRASH_FLUSH`.
     pub crash_flush: bool,
     pub stats: DpStats,
@@ -1444,6 +1450,8 @@ pub enum RxDrop {
     Fcs,
     Mic,
     Decrypt,
+    /// mac80211's group-key `RX_DROP_U_REPLAY` / no-key drop.
+    GroupReplay,
 }
 
 /// `ath11k_dp_rx_h_attn_mpdu_err`.
@@ -1757,6 +1765,7 @@ impl Dp {
             ppdu_stats_completed: VecDeque::new(),
             rx_ppdu_stats: VecDeque::new(),
             mic_failures: VecDeque::new(),
+            group_rx_keys: Vec::new(),
             crash_flush: false,
             stats: DpStats::default(),
             peer_rx: super::dp_peer::DpPeerRx::default(),
@@ -2235,6 +2244,7 @@ impl Dp {
                 match self.peers.iter().position(|p| p.peer_id == *peer_id) {
                     Some(i) => {
                         self.peers.remove(i);
+                        self.group_rx_keys.retain(|key| key.peer_id != *peer_id);
                         self.peer_rx.peer_unmapped(*peer_id);
                     }
                     None => self.stats.htt_peer_unmap_unknown += 1,
@@ -2283,6 +2293,67 @@ impl Dp {
             peer.mcast_key_idx = key_idx;
         }
         true
+    }
+
+    /// A group key was installed (`install`) or disabled for `peer_id` at
+    /// `key_idx`: mac80211 allocates fresh replay counters at zero
+    /// (`ieee80211_key_alloc` without a sequence) or frees them with the key.
+    pub fn group_rx_key_config(&mut self, peer_id: u16, key_idx: u8, tkip: bool, install: bool) {
+        self.group_rx_keys
+            .retain(|key| !(key.peer_id == peer_id && key.key_idx == key_idx));
+        if install {
+            self.group_rx_keys.push(super::dp_group_pn::GroupRxKey::new(
+                peer_id, key_idx, tkip, 0,
+            ));
+        }
+    }
+
+    /// Seed an installed group key's counters with the supplicant's RSC
+    /// (`NL80211_ATTR_KEY_SEQ` → `ieee80211_key_alloc(seq)`). `false` when
+    /// no such key is installed.
+    pub fn group_rx_key_seq(&mut self, peer_id: u16, key_idx: u8, seq: u64) -> bool {
+        match self
+            .group_rx_keys
+            .iter_mut()
+            .find(|key| key.peer_id == peer_id && key.key_idx == key_idx)
+        {
+            Some(key) => {
+                *key = super::dp_group_pn::GroupRxKey::new(peer_id, key_idx, key.tkip, seq);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The installed group key's replay counter for `queue`.
+    pub fn group_rx_counter(&self, peer_id: u16, key_idx: u8, queue: usize) -> Option<u64> {
+        self.group_rx_keys
+            .iter()
+            .find(|key| key.peer_id == peer_id && key.key_idx == key_idx)
+            .and_then(|key| key.counter(queue))
+    }
+
+    /// mac80211 `ieee80211_rx_h_decrypt`'s group-key half for a decrypted
+    /// group-addressed MPDU: select the key by the IV's Key ID and apply the
+    /// PN/TSC replay rule (`dp_group_pn`).
+    fn group_rx_check(
+        &mut self,
+        peer: Option<DpPeer>,
+        rxd: &RxDescriptor,
+        enctype: u32,
+    ) -> Result<(), RxDrop> {
+        use super::dp_group_pn as gpn;
+        if !gpn::has_replay_counter(enctype) {
+            return Ok(());
+        }
+        let peer = peer.ok_or(RxDrop::GroupReplay)?;
+        let pn = gpn::parse(rxd.hdr_status(), enctype).map_err(|_| RxDrop::GroupReplay)?;
+        let key = self
+            .group_rx_keys
+            .iter_mut()
+            .find(|key| key.peer_id == peer.peer_id && key.key_idx == pn.key_idx)
+            .ok_or(RxDrop::GroupReplay)?;
+        key.check(pn.pn, pn.queue).map_err(|_| RxDrop::GroupReplay)
     }
 
     /// Drain locally detected TKIP Michael MIC failures after the service
@@ -2858,6 +2929,7 @@ impl Dp {
             RxDrop::Fcs => s.rx_fcs_err += 1,
             RxDrop::Mic => s.rx_mic_err += 1,
             RxDrop::Decrypt => s.rx_decrypt_err += 1,
+            RxDrop::GroupReplay => s.rx_group_replay += 1,
         }
     }
 
@@ -3016,6 +3088,13 @@ impl Dp {
         }
         if err_bitmap & DP_RX_MPDU_ERR_DECRYPT != 0 {
             return Err(RxDrop::Decrypt);
+        }
+        // Linux leaves a group-addressed MPDU's PN to mac80211 (no
+        // `RX_FLAG_PN_VALIDATED`); NARF has no later mac80211 stage. A raw
+        // group MPDU keeps its IV and is refused by `undecap_raw` below
+        // without consuming a PN.
+        if is_mcbc && decrypted && rxd.decap_type() != decap::RAW {
+            self.group_rx_check(peer, rxd, enctype)?;
         }
 
         // ath11k_dp_rx_h_csum_offload

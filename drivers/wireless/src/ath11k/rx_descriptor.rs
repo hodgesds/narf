@@ -62,6 +62,14 @@ impl RxDescriptor {
             Self::Ipq8074(d) => d.mpdu_start.addr2,
         }
     }
+    /// `ath11k_dp_rx_h_80211_hdr`: the received 802.11 header (and, for a
+    /// protected frame, its IV/Key ID) the RXDMA copied into `hdr_status`.
+    pub fn hdr_status(&self) -> &[u8] {
+        match self {
+            Self::Wcn6855(d) => &d.hdr_status,
+            Self::Ipq8074(d) => &d.hdr_status,
+        }
+    }
     pub fn rate_info(&self) -> u32 {
         match self {
             Self::Wcn6855(d) => d.msdu_start.info3,

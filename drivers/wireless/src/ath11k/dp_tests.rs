@@ -308,6 +308,8 @@ pub(super) struct Rxd {
     pub(super) seq: u32,
     pub(super) sw_peer_id: u16,
     pub(super) addr2: Option<[u8; 6]>,
+    /// `hdr_status` @ 272: the received 802.11 header + IV.
+    pub(super) hdr_status: Vec<u8>,
 }
 
 fn put32(b: &mut [u8], off: usize, v: u32) {
@@ -349,7 +351,22 @@ pub(super) fn rx_desc_bytes(d: &Rxd) -> Vec<u8> {
     if let Some(a) = d.addr2 {
         b[210..216].copy_from_slice(&a);
     }
+    b[272..272 + d.hdr_status.len()].copy_from_slice(&d.hdr_status);
     b
+}
+
+/// The on-air header of a protected group data frame from the AP
+/// (FromDS, Protected, addr1 = broadcast) followed by its CCMP header for
+/// `pn` and Key ID `key_id` (IEEE 802.11-2020 Figure 12-17).
+fn group_ccmp_hdr(pn: u64, key_id: u8) -> Vec<u8> {
+    let mut h = vec![0x08, 0x42, 0, 0]; // data | FromDS | Protected
+    h.extend_from_slice(&[0xff; 6]);
+    h.extend_from_slice(&BSSID);
+    h.extend_from_slice(&SRC);
+    h.extend_from_slice(&[0x10, 0x00]);
+    let p = pn.to_le_bytes();
+    h.extend_from_slice(&[p[0], p[1], 0, 0x20 | key_id << 6, p[2], p[3], p[4], p[5]]);
+    h
 }
 
 const STA: [u8; 6] = [0x02, 0, 0, 0, 0, 0x01];
@@ -1167,6 +1184,17 @@ fn smoke_ath11k_dp_rx_decrypted_mcbc_peer() -> TestResult {
     d.attn1 = 1 << 2; // MCAST_BCAST
     d.sw_peer_id = 3;
     d.seq = 0x123;
+    // No GTK at Key ID 1 yet: mac80211 has no `rx->key` and drops it.
+    d.hdr_status = group_ccmp_hdr(0x0102_0304_0506, 1);
+    deliver(&r.io, &mut refill, &mut reo, &d, &msdu);
+    let (_, rx) = r.dp.process_rx(&mut r.hal, &r.io, 0, 64);
+    check!(
+        rx.is_empty() && r.dp.stats.rx_group_replay == 1,
+        "group frame without its GTK refused"
+    );
+    // GTK at Key ID 1 with the RSC from the GTK KDE (0x0102_0304_0505).
+    r.dp.group_rx_key_config(3, 1, false, true);
+    check!(r.dp.group_rx_key_seq(3, 1, 0x0102_0304_0505), "RSC seeded");
     deliver(&r.io, &mut refill, &mut reo, &d, &msdu);
     let (_, rx) = r.dp.process_rx(&mut r.hal, &r.io, 0, 64);
     check!(rx.len() == 1, "delivered");
@@ -1174,6 +1202,25 @@ fn smoke_ath11k_dp_rx_decrypted_mcbc_peer() -> TestResult {
         rx[0].is_mcbc && rx[0].decrypted && rx[0].peer_id == 3 && rx[0].seq_no == 0x123,
         "mcbc: peer / seq from mpdu_start, group cipher, decrypt status OK"
     );
+    check!(
+        r.dp.group_rx_counter(3, 1, 0) == Some(0x0102_0304_0506),
+        "rx_pn[0] advanced to the accepted PN"
+    );
+    // The same PN again is a replay (`RX_DROP_U_REPLAY`); so is a lower one.
+    deliver(&r.io, &mut refill, &mut reo, &d, &msdu);
+    d.hdr_status = group_ccmp_hdr(0x0102_0304_0500, 1);
+    deliver(&r.io, &mut refill, &mut reo, &d, &msdu);
+    let (_, rx) = r.dp.process_rx(&mut r.hal, &r.io, 0, 64);
+    check!(
+        rx.is_empty() && r.dp.stats.rx_group_replay == 3,
+        "equal and older group PNs dropped"
+    );
+    // A unicast decrypted frame is REO-checked: no host group state used.
+    let mut u = good_rxd(msdu.len(), 1);
+    u.sw_peer_id = 3;
+    deliver(&r.io, &mut refill, &mut reo, &u, &msdu);
+    let (_, rx) = r.dp.process_rx(&mut r.hal, &r.io, 0, 64);
+    check!(rx.len() == 1 && !rx[0].is_mcbc, "unicast unaffected");
     // Unmap; an unknown unmap is counted.
     let u: Vec<u8> = [0x0003_0004u32]
         .iter()

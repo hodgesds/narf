@@ -1494,6 +1494,207 @@ pub fn twt_disable_cmd(pdev_id: u32) -> WmiCmd {
     w.finish(WMI_TWT_DISABLE_CMDID, WMI_TWT_DISABLE_PARAMS_CMD_SIZE)
 }
 
+/// `sizeof(struct wmi_twt_add_dialog_params_cmd)`.
+pub const WMI_TWT_ADD_DIALOG_PARAMS_CMD_SIZE: usize = 40;
+/// `sizeof(struct wmi_twt_{del,pause}_dialog_params_cmd)`.
+pub const WMI_TWT_DEL_DIALOG_PARAMS_CMD_SIZE: usize = 20;
+/// `sizeof(struct wmi_twt_resume_dialog_params_cmd)`.
+pub const WMI_TWT_RESUME_DIALOG_PARAMS_CMD_SIZE: usize = 28;
+/// `WMI_TWT_ADD_DIALOG_FLAG_{BCAST,TRIGGER,FLOW_TYPE,PROTECTION}`; the
+/// low byte of `flags` carries `enum WMI_HOST_TWT_COMMAND`.
+pub mod twt_flag {
+    pub const BCAST: u32 = 1 << 8;
+    pub const TRIGGER: u32 = 1 << 9;
+    pub const FLOW_TYPE: u32 = 1 << 10;
+    pub const PROTECTION: u32 = 1 << 11;
+}
+/// `enum WMI_HOST_TWT_COMMAND` (the 802.11ax TWT Setup Command values,
+/// IEEE 802.11-2020 Table 9-297 / 802.11ax-2021 Table 9-296b).
+pub const WMI_HOST_TWT_COMMAND_REJECT_TWT: u8 = 7;
+
+/// `struct wmi_twt_add_dialog_params` (debugfs `twt/add_dialog`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TwtAddDialogParams {
+    pub vdev_id: u32,
+    pub peer_macaddr: [u8; 6],
+    pub dialog_id: u32,
+    pub wake_intvl_us: u32,
+    pub wake_intvl_mantis: u32,
+    pub wake_dura_us: u32,
+    pub sp_offset_us: u32,
+    /// `enum WMI_HOST_TWT_COMMAND` (u8 in Linux).
+    pub twt_cmd: u8,
+    pub flag_bcast: bool,
+    pub flag_trigger: bool,
+    pub flag_flow_type: bool,
+    pub flag_protection: bool,
+}
+
+/// `ath11k_wmi_send_twt_add_dialog_cmd` → `WMI_TWT_ADD_DIALOG_CMDID`.
+/// Linux ORs the flag bits over the u8 `twt_cmd`.
+pub fn twt_add_dialog_cmd(p: &TwtAddDialogParams) -> WmiCmd {
+    let len = WMI_TWT_ADD_DIALOG_PARAMS_CMD_SIZE;
+    let mut w = W::new(len);
+    w.tlv(WMI_TAG_TWT_ADD_DIALOG_CMD, len - TLV_HDR_SIZE);
+    w.u32(p.vdev_id);
+    w.mac(&p.peer_macaddr);
+    w.u32(p.dialog_id);
+    w.u32(p.wake_intvl_us);
+    w.u32(p.wake_intvl_mantis);
+    w.u32(p.wake_dura_us);
+    w.u32(p.sp_offset_us);
+    let mut flags = p.twt_cmd as u32;
+    for (on, bit) in [
+        (p.flag_bcast, twt_flag::BCAST),
+        (p.flag_trigger, twt_flag::TRIGGER),
+        (p.flag_flow_type, twt_flag::FLOW_TYPE),
+        (p.flag_protection, twt_flag::PROTECTION),
+    ] {
+        if on {
+            flags |= bit;
+        }
+    }
+    w.u32(flags);
+    w.finish(WMI_TWT_ADD_DIALOG_CMDID, len)
+}
+
+fn twt_dialog_cmd(cmd_id: u32, tag: u16, vdev_id: u32, peer: &[u8; 6], dialog_id: u32) -> WmiCmd {
+    let len = WMI_TWT_DEL_DIALOG_PARAMS_CMD_SIZE;
+    let mut w = W::new(len);
+    w.tlv(tag, len - TLV_HDR_SIZE);
+    w.u32(vdev_id);
+    w.mac(peer);
+    w.u32(dialog_id);
+    w.finish(cmd_id, len)
+}
+
+/// `ath11k_wmi_send_twt_del_dialog_cmd` → `WMI_TWT_DEL_DIALOG_CMDID`.
+pub fn twt_del_dialog_cmd(vdev_id: u32, peer: &[u8; 6], dialog_id: u32) -> WmiCmd {
+    twt_dialog_cmd(
+        WMI_TWT_DEL_DIALOG_CMDID,
+        WMI_TAG_TWT_DEL_DIALOG_CMD,
+        vdev_id,
+        peer,
+        dialog_id,
+    )
+}
+
+/// `ath11k_wmi_send_twt_pause_dialog_cmd` → `WMI_TWT_PAUSE_DIALOG_CMDID`.
+pub fn twt_pause_dialog_cmd(vdev_id: u32, peer: &[u8; 6], dialog_id: u32) -> WmiCmd {
+    twt_dialog_cmd(
+        WMI_TWT_PAUSE_DIALOG_CMDID,
+        WMI_TAG_TWT_PAUSE_DIALOG_CMD,
+        vdev_id,
+        peer,
+        dialog_id,
+    )
+}
+
+/// `ath11k_wmi_send_twt_resume_dialog_cmd` → `WMI_TWT_RESUME_DIALOG_CMDID`.
+pub fn twt_resume_dialog_cmd(
+    vdev_id: u32,
+    peer: &[u8; 6],
+    dialog_id: u32,
+    sp_offset_us: u32,
+    next_twt_size: u32,
+) -> WmiCmd {
+    let len = WMI_TWT_RESUME_DIALOG_PARAMS_CMD_SIZE;
+    let mut w = W::new(len);
+    w.tlv(WMI_TAG_TWT_RESUME_DIALOG_CMD, len - TLV_HDR_SIZE);
+    w.u32(vdev_id);
+    w.mac(peer);
+    w.u32(dialog_id);
+    w.u32(sp_offset_us);
+    w.u32(next_twt_size);
+    w.finish(WMI_TWT_RESUME_DIALOG_CMDID, len)
+}
+
+/// `struct wmi_twt_add_dialog_event` (`WMI_TWT_ADD_DIALOG_EVENTID`).
+/// `status` is `enum wmi_twt_add_dialog_status`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TwtAddDialogEvent {
+    pub vdev_id: u32,
+    pub peer_macaddr: [u8; 6],
+    pub dialog_id: u32,
+    pub status: u32,
+}
+
+/// `enum wmi_twt_add_dialog_status`.
+pub mod twt_add_status {
+    pub const OK: u32 = 0;
+    pub const TWT_NOT_ENABLED: u32 = 1;
+    pub const USED_DIALOG_ID: u32 = 2;
+    pub const INVALID_PARAM: u32 = 3;
+    pub const NOT_READY: u32 = 4;
+    pub const NO_RESOURCE: u32 = 5;
+    pub const NO_ACK: u32 = 6;
+    pub const NO_RESPONSE: u32 = 7;
+    pub const DENIED: u32 = 8;
+    pub const UNKNOWN_ERROR: u32 = 9;
+}
+
+/// `ath11k_wmi_twt_add_dialog_event_status`.
+pub const fn twt_add_dialog_status_str(status: u32) -> &'static str {
+    match status {
+        twt_add_status::OK => "ok",
+        twt_add_status::TWT_NOT_ENABLED => "twt disabled",
+        twt_add_status::USED_DIALOG_ID => "dialog id in use",
+        twt_add_status::INVALID_PARAM => "invalid parameters",
+        twt_add_status::NOT_READY => "not ready",
+        twt_add_status::NO_RESOURCE => "resource unavailable",
+        twt_add_status::NO_ACK => "no ack",
+        twt_add_status::NO_RESPONSE => "no response",
+        twt_add_status::DENIED => "denied",
+        _ => "unknown error",
+    }
+}
+
+/// `ath11k_wmi_twt_add_dialog_event`: the policy table admits a 20-byte
+/// `WMI_TAG_TWT_ADD_DIALOG_COMPLETE_EVENT`; its absence is an error.
+pub fn decode_twt_add_dialog_event(payload: &[u8]) -> Result<TwtAddDialogEvent, WmiError> {
+    let tb = TlvTable::parse(payload)?;
+    let v = tb.need(WMI_TAG_TWT_ADD_DIALOG_COMPLETE_EVENT)?.value;
+    need_len(v, 20, "twt add dialog: short TLV")?;
+    Ok(TwtAddDialogEvent {
+        vdev_id: rd32(v, 0),
+        peer_macaddr: mac_at(v, 4),
+        dialog_id: rd32(v, 12),
+        status: rd32(v, 16),
+    })
+}
+
+/// `struct wmi_unit_test_cmd` (tlv_header, vdev_id, module_id, num_args,
+/// diag_token) followed by a `WMI_TAG_ARRAY_UINT32` of the arguments.
+pub const WMI_UNIT_TEST_CMD_SIZE: usize = 20;
+/// `DFS_UNIT_TEST_MODULE` / `DFS_UNIT_TEST_TOKEN` / `DFS_MAX_TEST_ARGS`.
+pub const DFS_UNIT_TEST_MODULE: u32 = 0x2b;
+pub const DFS_UNIT_TEST_TOKEN: u32 = 0xAA;
+pub const DFS_MAX_TEST_ARGS: usize = 3;
+
+/// `ath11k_wmi_send_unit_test_cmd` → `WMI_UNIT_TEST_CMDID`.
+pub fn unit_test_cmd(vdev_id: u32, module_id: u32, diag_token: u32, args: &[u32]) -> WmiCmd {
+    let len = WMI_UNIT_TEST_CMD_SIZE + TLV_HDR_SIZE + 4 * args.len();
+    let mut w = W::new(len);
+    w.tlv(WMI_TAG_UNIT_TEST_CMD, WMI_UNIT_TEST_CMD_SIZE - TLV_HDR_SIZE);
+    w.u32(vdev_id);
+    w.u32(module_id);
+    w.u32(args.len() as u32);
+    w.u32(diag_token);
+    w.tlv(WMI_TAG_ARRAY_UINT32, 4 * args.len());
+    for &a in args {
+        w.u32(a);
+    }
+    w.finish(WMI_UNIT_TEST_CMDID, len)
+}
+
+/// `ath11k_wmi_simulate_radar`'s unit-test arguments: `DFS_TEST_CMDID` 0,
+/// `DFS_TEST_PDEV_ID`, and `DFS_TEST_RADAR_PARAM` 0 (segment 0, no chirp,
+/// no frequency offset — "valid for simulation purpose").
+pub fn dfs_simulate_radar_cmd(vdev_id: u32, pdev_id: u32) -> WmiCmd {
+    let args: [u32; DFS_MAX_TEST_ARGS] = [0, pdev_id, 0];
+    unit_test_cmd(vdev_id, DFS_UNIT_TEST_MODULE, DFS_UNIT_TEST_TOKEN, &args)
+}
+
 /// `struct wmi_channel_arg` — the channel half of
 /// `wmi_vdev_start_req_arg`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -5077,6 +5278,7 @@ pub enum WmiEvent<'a> {
     PdevBssChanInfo(PdevBssChanInfo),
     DfsRadarDetected(DfsRadarDetected),
     ObssColorCollision(ObssColorCollisionEvent),
+    TwtAddDialog(TwtAddDialogEvent),
     /// Any other id — Linux logs and drops.
     Unhandled(u32),
 }
@@ -5117,6 +5319,7 @@ pub fn decode_event(frame: &[u8]) -> Result<WmiEvent<'_>, WmiError> {
         WMI_OBSS_COLOR_COLLISION_DETECTION_EVENTID => {
             WmiEvent::ObssColorCollision(decode_obss_color_collision_event(p)?)
         }
+        WMI_TWT_ADD_DIALOG_EVENTID => WmiEvent::TwtAddDialog(decode_twt_add_dialog_event(p)?),
         other => WmiEvent::Unhandled(other),
     })
 }
