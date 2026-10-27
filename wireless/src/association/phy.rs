@@ -41,6 +41,8 @@ pub struct LocalHt {
     rx_ldpc: bool,
     tx_ldpc: bool,
     rx_stbc: bool,
+    rx_greenfield: bool,
+    tx_greenfield: bool,
 }
 impl LocalHt {
     pub fn new(
@@ -71,6 +73,8 @@ impl LocalHt {
             rx_ldpc: false,
             tx_ldpc: false,
             rx_stbc: false,
+            rx_greenfield: false,
+            tx_greenfield: false,
         })
     }
     pub fn siso20(rx_sgi20: bool, tx_sgi20: bool) -> Self {
@@ -90,6 +94,8 @@ impl LocalHt {
             rx_ldpc: false,
             tx_ldpc: false,
             rx_stbc: false,
+            rx_greenfield: false,
+            tx_greenfield: false,
         }
     }
     /// Advertised LDPC is a local RX promise. TX coding additionally needs
@@ -102,6 +108,13 @@ impl LocalHt {
     /// Promise reception of one STBC data stream; TX STBC stays absent.
     pub fn with_rx_stbc(mut self, enabled: bool) -> Self {
         self.rx_stbc = enabled;
+        self
+    }
+    /// HT greenfield RX is a local decoder promise. TX also requires the
+    /// original offer and bound peer's greenfield receive capability.
+    pub fn with_greenfield(mut self, rx: bool, tx: bool) -> Self {
+        self.rx_greenfield = rx;
+        self.tx_greenfield = tx;
         self
     }
     /// Bound TX rate selection to a subset of actual implemented TX support.
@@ -123,6 +136,7 @@ impl LocalHt {
         let mut body = [0; 26];
         let cap: u16 = 0x000c // SMPS disabled; optional features are explicit below.
             | u16::from(self.rx_ldpc)
+            | (u16::from(self.rx_greenfield) << 4)
             | (u16::from(self.rx_stbc) << 8)
             | if self.width == HtWidth::TwentyForty { 2 } else { 0 }
             | if self.gi.rx20 { 0x20 } else { 0 }
@@ -393,6 +407,12 @@ pub struct HtNegotiation {
     basic: [u8; 10],
 }
 impl HtNegotiation {
+    pub fn rx_greenfield(&self) -> bool {
+        self.local.rx_greenfield
+    }
+    pub fn tx_greenfield(&self) -> bool {
+        self.local.tx_greenfield && self.peer_capability() & 16 != 0
+    }
     pub fn rx_stbc(&self) -> bool {
         self.local.rx_stbc
     }
@@ -536,6 +556,26 @@ macro_rules! selection_accessors {
 }
 impl Offer {
     selection_accessors!();
+    /// Select factual PHY limits from a complete native AP IE snapshot.
+    /// Rate element validation and mandatory HT/VHT selectors are derived
+    /// internally. The caller retains peer, SSID, security and native channel
+    /// ownership; this parser grants no association or transmit authority.
+    pub fn from_elements(
+        local: LocalPhy,
+        bytes: &[u8],
+        primary: u8,
+    ) -> Result<Option<Self>, Error> {
+        Self::prepare(local, bytes, primary, element_selectors(bytes, primary)?)
+    }
+    /// Intersect a native association-response IE snapshot with this offer.
+    /// The caller must already prove the actual response's peer/status and
+    /// native completion. This does not build or authenticate a response.
+    pub fn response_elements(&self, bytes: &[u8]) -> Result<Negotiated, Error> {
+        self.response(
+            bytes,
+            element_selectors(bytes, self.0.ht.operation.primary())?,
+        )
+    }
     pub(super) fn prepare(
         local: LocalPhy,
         bytes: &[u8],
@@ -560,7 +600,7 @@ impl Offer {
             self.0.ht.operation.primary(),
         )?;
         check_selectors(selectors, next.vht.is_some())?;
-        if self.0.vht.is_some() && next.vht.is_none()
+        if self.0.vht.is_some() != next.vht.is_some()
             || next.channels[..next.count]
                 .iter()
                 .any(|ch| !self.occupied_channels().contains(ch))
@@ -578,6 +618,7 @@ impl Offer {
         next.ht.local.gi.tx20 &= self.0.ht.tx_sgi20();
         next.ht.local.gi.tx40 &= self.0.ht.tx_sgi40();
         next.ht.local.tx_ldpc &= self.0.ht.tx_ldpc();
+        next.ht.local.tx_greenfield &= self.0.ht.tx_greenfield();
         if let (Some(old), Some(new)) = (self.0.vht, next.vht.as_mut()) {
             new.tx = intersect_maps(new.tx, old.tx);
             new.local.tx_sgi &= old.tx_sgi80();
@@ -603,6 +644,26 @@ impl Offer {
 }
 impl Negotiated {
     selection_accessors!();
+}
+
+fn element_selectors(bytes: &[u8], primary: u8) -> Result<u8, Error> {
+    let band = channel::band(primary).ok_or(Error::InvalidBss)?;
+    if bytes.len() > 2048 {
+        return Err(Error::InvalidBss);
+    }
+    let mut rates = super::RateElements {
+        phy: true,
+        ..Default::default()
+    };
+    super::ies(bytes, |id, body| rates.observe(id, body))?;
+    if !rates.supported
+        || rates.rates == 0
+        || rates.basic == 0
+        || band == channel::Band::Ghz5 && rates.basic & 15 != 0
+    {
+        return Err(Error::UnsupportedRates);
+    }
+    Ok(rates.selectors)
 }
 
 pub(super) fn check_selectors(selectors: u8, vht: bool) -> Result<(), Error> {

@@ -117,6 +117,7 @@ fn smoke_ath10k_recovery_real_cap_revocation_before_and_after_master_disable() -
         let mut mmio = Mmio {
             cap,
             io: ready(0x34400, 8),
+            sources: None,
         };
         let mut revoke = Some(revoke);
         if !during {
@@ -175,6 +176,7 @@ fn smoke_ath10k_recovery_retired_physical_drop_preserves_successor_and_pins_dma(
     let mut owner = PciBoot {
         mmio: Mmio {
             cap: Cap::bootstrap(),
+            sources: None,
             io: RawMmio(MmioRegion {
                 phys: base,
                 virt: words.as_mut_ptr() as u64,

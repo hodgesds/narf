@@ -19,6 +19,64 @@ pub trait Port: Io {
     fn allocate_packet(&self, bytes: usize) -> Result<Self::Buffer, Error>;
     fn master(&self, enabled: bool) -> Result<(), Error>;
     fn kick(&self, queue_bit: u16) -> Result<(), Error>;
+    fn publication(&self) -> Result<Publication, Error> {
+        Err(Error::State)
+    }
+}
+/// Owned current PCI invocation, without a borrowed native owner or lock.
+#[derive(Clone)]
+pub struct Publication(PublicationSource);
+impl core::fmt::Debug for Publication {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Rtl8188eeCurrentPublication")
+    }
+}
+#[derive(Clone)]
+enum PublicationSource {
+    Native(
+        narf_bus::BusDevice,
+        narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+    ),
+    #[cfg(any(test, feature = "kernel-test"))]
+    Model(alloc::sync::Arc<dyn Fn() -> Result<(), Error> + Send + Sync>),
+}
+impl Publication {
+    pub(crate) fn native(
+        device: narf_bus::BusDevice,
+        cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+    ) -> Self {
+        Self(PublicationSource::Native(device, cap))
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn model(
+        check: alloc::sync::Arc<dyn Fn() -> Result<(), Error> + Send + Sync>,
+    ) -> Self {
+        Self(PublicationSource::Model(check))
+    }
+    pub(crate) fn invoke<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        match &self.0 {
+            PublicationSource::Native(device, cap) => crate::rtw88::pci_park::invoke(cap, || {
+                let cmd = narf_bus::pci::read_command(cap, device)
+                    .map_err(|_| Error::Access(super::AccessError::Access))?;
+                let bits = narf_bus::pci::cmd::MEM_SPACE
+                    | narf_bus::pci::cmd::BUS_MASTER
+                    | narf_bus::pci::cmd::INTX_DISABLE;
+                if cmd == u16::MAX || cmd & bits != bits {
+                    return Err(Error::State);
+                }
+                operation()
+            })
+            .map_err(|_| Error::Access(super::AccessError::Access))?,
+            #[cfg(any(test, feature = "kernel-test"))]
+            PublicationSource::Model(check) => {
+                check()?;
+                operation()
+            }
+        }
+    }
 }
 
 pub(super) struct State<M: Memory> {
@@ -30,6 +88,7 @@ pub(super) struct State<M: Memory> {
     mailbox: super::super::station_control::Mailbox,
     reserved: Option<M>,
     pub(super) qos: bool,
+    pub(super) ht: bool,
 }
 impl<M: Memory> State<M> {
     pub(super) fn new() -> Self {
@@ -42,6 +101,7 @@ impl<M: Memory> State<M> {
             mailbox: super::super::station_control::Mailbox::default(),
             reserved: None,
             qos: false,
+            ht: false,
         }
     }
     pub(super) fn retain(&mut self) {
@@ -69,6 +129,7 @@ pub struct Delivery {
 pub struct Mpdu {
     bytes: Vec<u8>,
     channel: u8,
+    ht: bool,
 }
 /// Consuming a rejected packet/report is progress, never a receive-idle
 /// proof. Station output waits for a genuine OWN-owned next descriptor.
@@ -82,6 +143,9 @@ impl Mpdu {
     }
     pub fn channel(&self) -> u8 {
         self.channel
+    }
+    pub(super) fn ht(&self) -> bool {
+        self.ht
     }
 }
 impl narf_wireless::station_security::RawFrame for Mpdu {
@@ -105,7 +169,14 @@ fn queue(frame: &[u8], local: [u8; 6], qos: bool) -> Result<(usize, u16, u8), Er
         return Err(Error::Packet); // version, fragments, order, PM.
     }
     match (fc >> 2) & 3 {
-        0 if fc & 0x4300 == 0 && matches!((fc >> 4) & 15, 0 | 4 | 10 | 11 | 12) => {
+        0 if fc & 0x4300 == 0
+            && (matches!((fc >> 4) & 15, 0 | 4 | 10 | 11 | 12)
+                || qos
+                    && (fc >> 4) & 15 == 13
+                    && frame.len() == 33
+                    && frame[24..26] == [3, 1]
+                    && frame[27..29] == [37, 0]) =>
+        {
             // MGMT vector1, Linux MGNT_QUEUE6, QSLT_MGNT0x12.
             Ok((1, 1 << 6, 0x12))
         }
@@ -389,7 +460,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.phase != Phase::Running || self.packet.pending.is_some() {
             return Err(Error::State);
         }
-        if rate > 11 {
+        if rate > 11
+            && !(self.packet.ht && (12..=19).contains(&rate) && frame.first() == Some(&0x88))
+        {
             return Err(Error::Packet);
         }
         let (queue, poll, selector) = queue(
@@ -425,7 +498,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         prefix[1] = u32::from(selector) << 8; // MACID0, rateID0, security0.
         prefix[3] = u32::from(u16::from_le_bytes([frame[22], frame[23]]) >> 4) << 16;
-        prefix[4] = (1 << 8) | (1 << 10); // forced legacy rate, no fallback.
+        prefix[4] = (1 << 8) | (1 << 10); // forced checked rate, no fallback/BW/SGI/AGG.
         if frame[0] == 0x88 {
             prefix[4] |= 1 << 6;
         } // EE TXD.QOS; host SSN retained.
@@ -574,16 +647,47 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 return Err(Error::Descriptor);
             }
             let mut packet = None;
+            let ht = report & (1 << 6) != 0;
+            let ht_profile = self.packet.ht
+                && ht
+                && (12..=19).contains(&(report & 63))
+                && report & ((1 << 7) | (1 << 8) | (1 << 9)) == 0;
+            let legacy_profile = !ht && report & (1 << 9) == 0 && report & 63 <= 11;
             if ordinary
                 && status & 0xc000 == 0
                 && status & 0x3000_0000 == 0x3000_0000
                 && extra & ((3 << 14) | (1 << 27)) == 0
                 && sequence & 0xf000 == 0
-                && report & ((1 << 6) | (1 << 9)) == 0
-                && report & 63 <= 11
-                && (28..=MAX_MPDU + 4).contains(&length)
+                && (legacy_profile || ht_profile)
+                && (28..=if self.packet.ht {
+                    26 + 16 + narf_wireless::amsdu::MAX_BYTES + 4
+                } else {
+                    MAX_MPDU + 4
+                })
+                    .contains(&length)
             {
                 buffer.sync();
+                // EE's PHY info is its own28-byte structure inside drvinfo,
+                // not rtw88 page1. RXD owns rate/BW; no channel field exists.
+                if status & (1 << 26) != 0 {
+                    let info = (((status >> 16) & 15) * 8) as usize;
+                    if info < 28 {
+                        return Err(Error::Descriptor);
+                    }
+                    let mut phy = [0; 28];
+                    buffer.read_bytes(((status >> 24) & 3) as usize, &mut phy)?;
+                    if ht && phy[27] & 2 != 0 {
+                        // sgi_en: LGI-only receive profile.
+                        for word in 0..6 {
+                            ring.write32(offset + word * 4, 0)?;
+                        }
+                        buffer.sync();
+                        ring.sync();
+                        ring.write32(offset, RX_BUFFER as u32 | end | OWN)?;
+                        ring.sync();
+                        return Ok((true, None));
+                    }
+                }
                 let mut bytes = Vec::new();
                 bytes
                     .try_reserve_exact(length - 4)
@@ -595,9 +699,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 // Protected frames must retain their IV/CCMP ciphertext/MIC.
                 if fc & 0x400 == 0
                     && bytes[22] & 15 == 0
+                    && (status & (1 << 23) != 0) == (fc & 0x8c == 0x88)
                     && (fc & 0x4000 == 0 || status & (1 << 27) != 0)
                 {
-                    packet = Some(Mpdu { bytes, channel });
+                    packet = Some(Mpdu { bytes, channel, ht });
                 }
             }
             for word in 0..6 {

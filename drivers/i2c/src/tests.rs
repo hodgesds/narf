@@ -1049,3 +1049,416 @@ fn smoke_lpss_dw_hid_descriptor_conversation() -> TestResult {
     }
 }
 kernel_test_in!("drivers-i2c", smoke_lpss_dw_hid_descriptor_conversation);
+
+// ── _CRS bus-speed fixtures (#772) ───────────────────────────────
+//
+// The pinned counts below are computed from the DW databook
+// formulas as Linux implements them (`i2c_dw_scl_hcnt` /
+// `i2c_dw_scl_lcnt`, tf = 300 ns, DIV_ROUND_CLOSEST at 1 MHz
+// units) — hcnt = round(ic_clk_khz * (tHIGH + 300)) - 3,
+// lcnt = round(ic_clk_khz * (tLOW + 300)) - 1, with
+// (tHIGH, tLOW) = (4000, 4700) SS / (600, 1300) FS /
+// (260, 500) FP — and were derived independently of the code in
+// `crate::dw_speed` (hand/spreadsheet arithmetic on the Linux
+// formulas), so a formula error on either side fails here.
+//
+// FCH input clock 133_000 kHz (AMD PPR):
+//   SS 569/664, FS 117/212, FP 71/105.
+// LPSS Cannon Lake input clock 216_000 kHz (intel-lpss-acpi.c
+// cnl_i2c_info): SS 926/1079, FS 191/345, FP 118/172.
+// LPSS Sunrise Point input clock 120_000 kHz (spt_i2c_info):
+//   SS 513/599, FS 105/191.
+
+use crate::dw_speed::{compose_bus_speed, timings_for, DwSpeedMode};
+use crate::lpss::ic_clk_khz_for_hid;
+
+// DW register byte offsets (same map both wrappers use).
+const REG_IC_CON: u64 = 0x00;
+const REG_IC_SS_SCL_HCNT: u64 = 0x14;
+const REG_IC_SS_SCL_LCNT: u64 = 0x18;
+const REG_IC_FS_SCL_HCNT: u64 = 0x1c;
+const REG_IC_FS_SCL_LCNT: u64 = 0x20;
+const REG_IC_ENABLE: u64 = 0x6c;
+// IC_CON base: MASTER_MODE | IC_SLAVE_DISABLE | RESTART_EN.
+const CON_BASE: u32 = (1 << 0) | (1 << 6) | (1 << 5);
+const CON_STD: u32 = CON_BASE | (0b01 << 1);
+const CON_FAST: u32 = CON_BASE | (0b10 << 1);
+// Pre-#772 fixed defaults both wrappers must keep when no speed
+// is declared (or none can be derived).
+const LEGACY_SS_HCNT: u32 = 0x01b0;
+const LEGACY_SS_LCNT: u32 = 0x01fb;
+const LEGACY_FS_HCNT: u32 = 0x002f;
+const LEGACY_FS_LCNT: u32 = 0x006a;
+
+fn smoke_dw_speed_compose_slowest_wins() -> TestResult {
+    // Masking-defeating case: two devices on one bus declaring
+    // different speeds — the slowest declaration must compose
+    // the bus, not the first, not the fastest.
+    if compose_bus_speed(&[400_000, 100_000]) != Some(100_000) {
+        return TestResult::Fail("two-device compose didn't pick the slowest (100k)");
+    }
+    if compose_bus_speed(&[1_000_000, 400_000, 350_000]) != Some(350_000) {
+        return TestResult::Fail("three-device compose didn't pick the slowest (350k)");
+    }
+    if compose_bus_speed(&[400_000]) != Some(400_000) {
+        return TestResult::Fail("single declaration didn't compose to itself");
+    }
+    // A 0 declaration means "not declared" (ACPI speed field
+    // left zero) — it must not drag the bus to 0 Hz.
+    if compose_bus_speed(&[0, 400_000]) != Some(400_000) {
+        return TestResult::Fail("zero declaration poisoned the composition");
+    }
+    if compose_bus_speed(&[0, 0]).is_some() || compose_bus_speed(&[]).is_some() {
+        return TestResult::Fail("no declarations should compose to None (defaults)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-i2c", smoke_dw_speed_compose_slowest_wins);
+
+fn smoke_dw_speed_mode_rounding() -> TestResult {
+    // Declared speeds round UP to the enclosing standard mode
+    // (Linux i2c_dw_acpi_round_bus_speed), capped at Fast+.
+    let cases: [(u32, DwSpeedMode); 7] = [
+        (1, DwSpeedMode::Standard),
+        (100_000, DwSpeedMode::Standard),
+        (100_001, DwSpeedMode::Fast),
+        (400_000, DwSpeedMode::Fast),
+        (400_001, DwSpeedMode::FastPlus),
+        (1_000_000, DwSpeedMode::FastPlus),
+        // High-speed declarations clamp into Fast+ — these
+        // wrappers do not program the DW HS count registers.
+        (3_400_000, DwSpeedMode::FastPlus),
+    ];
+    for (hz, want) in cases {
+        if DwSpeedMode::from_declared_hz(hz) != want {
+            return TestResult::Fail("mode rounding picked the wrong mode");
+        }
+    }
+    if DwSpeedMode::Standard.ic_con_speed_bits() != (0b01 << 1)
+        || DwSpeedMode::Fast.ic_con_speed_bits() != (0b10 << 1)
+        || DwSpeedMode::FastPlus.ic_con_speed_bits() != (0b10 << 1)
+    {
+        return TestResult::Fail("IC_CON speed field bits wrong for a mode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-i2c", smoke_dw_speed_mode_rounding);
+
+fn smoke_dw_speed_timings_pinned() -> TestResult {
+    // (ic_clk_khz, declared Hz) -> (mode, ss_h, ss_l, fs_h, fs_l).
+    let cases: [(u32, u32, DwSpeedMode, u32, u32, u32, u32); 6] = [
+        (133_000, 100_000, DwSpeedMode::Standard, 569, 664, 117, 212),
+        (133_000, 400_000, DwSpeedMode::Fast, 569, 664, 117, 212),
+        (133_000, 1_000_000, DwSpeedMode::FastPlus, 569, 664, 71, 105),
+        (216_000, 100_000, DwSpeedMode::Standard, 926, 1079, 191, 345),
+        (
+            216_000,
+            1_000_000,
+            DwSpeedMode::FastPlus,
+            926,
+            1079,
+            118,
+            172,
+        ),
+        (120_000, 400_000, DwSpeedMode::Fast, 513, 599, 105, 191),
+    ];
+    for (ic_clk, hz, mode, ss_h, ss_l, fs_h, fs_l) in cases {
+        let t = timings_for(ic_clk, hz);
+        if t.mode != mode
+            || t.ss_hcnt != ss_h
+            || t.ss_lcnt != ss_l
+            || t.fs_hcnt != fs_h
+            || t.fs_lcnt != fs_l
+        {
+            return TestResult::Fail("derived timings disagree with the pinned counts");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-i2c", smoke_dw_speed_timings_pinned);
+
+fn smoke_lpss_ic_clk_table_grounded() -> TestResult {
+    // Pinned from Linux intel-lpss-acpi.c (see the function's
+    // doc): SPT I2C = 120 MHz, CNL I2C = 216 MHz; HIDs without a
+    // cited rate stay ungrounded so no counts are derived.
+    if ic_clk_khz_for_hid("INT3446") != Some(120_000)
+        || ic_clk_khz_for_hid("INT3447") != Some(120_000)
+    {
+        return TestResult::Fail("SPT I2C clock not grounded at 120 MHz");
+    }
+    if ic_clk_khz_for_hid("INT34B7") != Some(216_000) {
+        return TestResult::Fail("CNL I2C clock not grounded at 216 MHz");
+    }
+    for ungrounded in ["INT34C5", "INT34BA", "808622C1", "AMDI0019", ""] {
+        if ic_clk_khz_for_hid(ungrounded).is_some() {
+            return TestResult::Fail("ungrounded HID acquired a clock rate");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-i2c", smoke_lpss_ic_clk_table_grounded);
+
+/// Assert the four SCL count registers + IC_CON + IC_ENABLE a
+/// speed-aware `enable()` left in the model.
+fn assert_dw_timing_regs(
+    model: &DwModel,
+    ss_h: u32,
+    ss_l: u32,
+    fs_h: u32,
+    fs_l: u32,
+    con: u32,
+) -> Result<(), &'static str> {
+    if model.stored_reg(REG_IC_SS_SCL_HCNT) != ss_h {
+        return Err("IC_SS_SCL_HCNT mismatch");
+    }
+    if model.stored_reg(REG_IC_SS_SCL_LCNT) != ss_l {
+        return Err("IC_SS_SCL_LCNT mismatch");
+    }
+    if model.stored_reg(REG_IC_FS_SCL_HCNT) != fs_h {
+        return Err("IC_FS_SCL_HCNT mismatch");
+    }
+    if model.stored_reg(REG_IC_FS_SCL_LCNT) != fs_l {
+        return Err("IC_FS_SCL_LCNT mismatch");
+    }
+    if model.stored_reg(REG_IC_CON) != con {
+        return Err("IC_CON mismatch");
+    }
+    if model.stored_reg(REG_IC_ENABLE) != 1 {
+        return Err("IC_ENABLE not set after enable()");
+    }
+    Ok(())
+}
+
+/// Build a probed + enabled FCH controller over the model with
+/// a recorded bus speed (production probe order).
+fn fch_model_bus_with_speed(
+    model: &DwModel,
+    speed: Option<u32>,
+) -> Result<AmdFchI2c<DwModel>, &'static str> {
+    let mut drv = AmdFchI2c::with_regs(
+        "smoke-dw-fch-speed".to_string(),
+        PhysAddr::new(0),
+        1024,
+        None,
+        model.clone(),
+    );
+    drv.set_bus_speed_hz(speed);
+    if drv.probe_component_type().is_err() {
+        return Err("FCH probe_component_type failed against the DW model");
+    }
+    if drv.enable().is_err() {
+        return Err("FCH enable failed against the DW model");
+    }
+    Ok(drv)
+}
+
+fn smoke_amd_fch_dw_speed_100k_programs_ss_counts() -> TestResult {
+    let model = DwModel::new();
+    let _drv = match fch_model_bus_with_speed(&model, Some(100_000)) {
+        Ok(d) => d,
+        Err(m) => return TestResult::Fail(m),
+    };
+    // 100 kHz declared: SS counts derived at 133 MHz, IC_CON
+    // selects Standard; the FS pair still carries the derived
+    // Fast counts (Linux derives both pairs).
+    match assert_dw_timing_regs(&model, 569, 664, 117, 212, CON_STD) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers-i2c",
+    smoke_amd_fch_dw_speed_100k_programs_ss_counts
+);
+
+fn smoke_amd_fch_dw_speed_400k_programs_fs_counts() -> TestResult {
+    let model = DwModel::new();
+    let _drv = match fch_model_bus_with_speed(&model, Some(400_000)) {
+        Ok(d) => d,
+        Err(m) => return TestResult::Fail(m),
+    };
+    // Same counts as the 100 kHz case, different IC_CON speed
+    // field — together the pair proves the mode follows the
+    // declared speed, not just the count derivation.
+    match assert_dw_timing_regs(&model, 569, 664, 117, 212, CON_FAST) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers-i2c",
+    smoke_amd_fch_dw_speed_400k_programs_fs_counts
+);
+
+fn smoke_amd_fch_dw_speed_1m_programs_fp_counts() -> TestResult {
+    let model = DwModel::new();
+    let _drv = match fch_model_bus_with_speed(&model, Some(1_000_000)) {
+        Ok(d) => d,
+        Err(m) => return TestResult::Fail(m),
+    };
+    // Fast-mode Plus: FP counts in the FS registers, IC_CON
+    // still FAST (no HS programming).
+    match assert_dw_timing_regs(&model, 569, 664, 71, 105, CON_FAST) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_amd_fch_dw_speed_1m_programs_fp_counts);
+
+fn smoke_amd_fch_dw_speed_undeclared_keeps_defaults() -> TestResult {
+    let model = DwModel::new();
+    let _drv = match fch_model_bus_with_speed(&model, None) {
+        Ok(d) => d,
+        Err(m) => return TestResult::Fail(m),
+    };
+    // No _CRS speed on the bus: the pre-#772 fixed constants and
+    // FAST selection must survive byte-for-byte.
+    match assert_dw_timing_regs(
+        &model,
+        LEGACY_SS_HCNT,
+        LEGACY_SS_LCNT,
+        LEGACY_FS_HCNT,
+        LEGACY_FS_LCNT,
+        CON_FAST,
+    ) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers-i2c",
+    smoke_amd_fch_dw_speed_undeclared_keeps_defaults
+);
+
+fn smoke_amd_fch_dw_speed_100k_transfer_still_works() -> TestResult {
+    // End-to-end at a composed 100 kHz: the speed programming
+    // must not disturb the transfer state machine.
+    let model = DwModel::new();
+    model.attach(VirtualTarget::new(DW_ADDR, 1));
+    let drv = match fch_model_bus_with_speed(&model, Some(100_000)) {
+        Ok(d) => d,
+        Err(m) => return TestResult::Fail(m),
+    };
+    match scenario_write_end_to_end(Arc::new(drv), &model) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers-i2c",
+    smoke_amd_fch_dw_speed_100k_transfer_still_works
+);
+
+/// Build a probed + enabled LPSS controller over the model with
+/// a recorded input clock + bus speed (production probe order).
+fn lpss_model_bus_with_speed(
+    model: &DwModel,
+    ic_clk_khz: Option<u32>,
+    speed: Option<u32>,
+) -> Result<LpssI2c<DwModel>, &'static str> {
+    let mut drv = LpssI2c::with_regs(
+        "smoke-dw-lpss-speed".to_string(),
+        PhysAddr::new(0),
+        1024,
+        None,
+        model.clone(),
+    );
+    drv.set_ic_clk_khz(ic_clk_khz);
+    drv.set_bus_speed_hz(speed);
+    if drv.probe_component_type().is_err() {
+        return Err("LPSS probe_component_type failed against the DW model");
+    }
+    if drv.enable().is_err() {
+        return Err("LPSS enable failed against the DW model");
+    }
+    Ok(drv)
+}
+
+fn smoke_lpss_dw_speed_100k_programs_ss_counts() -> TestResult {
+    let model = DwModel::new();
+    // Tiger Lake-class controller (INT34B7, CNL info): 216 MHz.
+    let _drv = match lpss_model_bus_with_speed(&model, Some(216_000), Some(100_000)) {
+        Ok(d) => d,
+        Err(m) => return TestResult::Fail(m),
+    };
+    match assert_dw_timing_regs(&model, 926, 1079, 191, 345, CON_STD) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_lpss_dw_speed_100k_programs_ss_counts);
+
+fn smoke_lpss_dw_speed_1m_programs_fp_counts() -> TestResult {
+    let model = DwModel::new();
+    let _drv = match lpss_model_bus_with_speed(&model, Some(216_000), Some(1_000_000)) {
+        Ok(d) => d,
+        Err(m) => return TestResult::Fail(m),
+    };
+    match assert_dw_timing_regs(&model, 926, 1079, 118, 172, CON_FAST) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_lpss_dw_speed_1m_programs_fp_counts);
+
+fn smoke_lpss_dw_speed_spt_clock_400k() -> TestResult {
+    let model = DwModel::new();
+    // Sunrise Point-class controller (INT3446/47): 120 MHz — a
+    // second grounded clock, proving the clock is an input to
+    // the derivation, not a baked-in constant.
+    let _drv = match lpss_model_bus_with_speed(&model, Some(120_000), Some(400_000)) {
+        Ok(d) => d,
+        Err(m) => return TestResult::Fail(m),
+    };
+    match assert_dw_timing_regs(&model, 513, 599, 105, 191, CON_FAST) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_lpss_dw_speed_spt_clock_400k);
+
+fn smoke_lpss_dw_speed_ungrounded_clock_keeps_defaults() -> TestResult {
+    let model = DwModel::new();
+    // A speed is declared but this HID's input clock is not
+    // grounded: counts must NOT be derived from a guessed clock —
+    // the fixed defaults stay.
+    let _drv = match lpss_model_bus_with_speed(&model, None, Some(100_000)) {
+        Ok(d) => d,
+        Err(m) => return TestResult::Fail(m),
+    };
+    match assert_dw_timing_regs(
+        &model,
+        LEGACY_SS_HCNT,
+        LEGACY_SS_LCNT,
+        LEGACY_FS_HCNT,
+        LEGACY_FS_LCNT,
+        CON_FAST,
+    ) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers-i2c",
+    smoke_lpss_dw_speed_ungrounded_clock_keeps_defaults
+);
+
+fn smoke_lpss_dw_speed_undeclared_keeps_defaults() -> TestResult {
+    let model = DwModel::new();
+    let _drv = match lpss_model_bus_with_speed(&model, Some(216_000), None) {
+        Ok(d) => d,
+        Err(m) => return TestResult::Fail(m),
+    };
+    match assert_dw_timing_regs(
+        &model,
+        LEGACY_SS_HCNT,
+        LEGACY_SS_LCNT,
+        LEGACY_FS_HCNT,
+        LEGACY_FS_LCNT,
+        CON_FAST,
+    ) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_lpss_dw_speed_undeclared_keeps_defaults);

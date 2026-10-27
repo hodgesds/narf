@@ -2,7 +2,9 @@
 
 > Status: runtime RTL8188EU factory/FIFO/firmware/MAC/BB/RF + LC/IQK implemented;
 > retained channel1 Open/WPA2 station service implemented; broader software
-> profiles, reset/rejoin and physical acceptance remain incomplete.
+> profiles, reset/rejoin and physical acceptance remain incomplete. A separately
+> qualified RTL8188EU HT20/LGI SISO continuation passes14 native regressions
+> on both architectures; exact-device qualification remains external.
 
 ## 1. Purpose & scope
 
@@ -143,11 +145,13 @@ policy-admitted transmitter; `Associated` does not open the controlled port.
 runtime. `ccmp_runtime` and `security_runtime` retain their public paths as
 reexports of shared `narf_wireless::{packet_key, station_security}` owners.
 `packet_codec::Mpdu` supplies the shared raw-frame admission contract while
-preserving the exact RTL8188EU legacy/20-MHz, rate, and no-hardware-decryption
-checks. `Role::Pairwise` admits KeyID0; `Role::Group` admits IDs0–3 but is
+preserving the exact RTL8188EU legacy/20-MHz or separately qualified HT20/LGI,
+rate, and no-hardware-decryption checks. `Role::Pairwise` admits KeyID0; `Role::Group` admits IDs0–3 but is
 receive-only. TX requires ToDS, peer RA/local TA; RX requires FromDS, peer TA,
 a unicast source and local RA for PTK or multicast RA for GTK. Only Data/QoS
-Data with exact native header extents is admitted; fragments/A-MSDU fail.
+Data with exact native header extents is admitted by the ordinary key API;
+fragments/A-MSDU fail there. The distinct whole-aggregate receive path below
+uses the shared transactional A-MSDU API.
 CCMP reserved bits, ExtIV, key ID and the 4096-byte body bound are checked
 before crypto. Each key owns 16 QoS plus a separate non-QoS replay tracker;
 MIC failure leaves ciphertext and all trackers unchanged. TX consumes a
@@ -169,9 +173,10 @@ radio reserves one station service; cancellation cannot silently replace it.
 No physical board qualification data is included in the repository.
 
 The admitted service publishes `WirelessNetIface` and Ethernet Narf-Rings
-with channel1/20MHz/basic1Mbps, Open or WPA2-PSK/CCMP and PMF disabled. HT,
-VHT, HE, EHT, external EAPOL, packet offloads, live retune and power overrides
-are not advertised. Passive scans poll the same persistent native RX owner,
+with channel1/20MHz/basic1Mbps, Open or WPA2-PSK/CCMP and PMF disabled. The
+distinct optional HT20/LGI program below supplies factual HT capability only
+after its parked native programming succeeds. VHT, HE, EHT, external EAPOL,
+packet offloads, live retune and power overrides are not advertised. Passive scans poll the same persistent native RX owner,
 cache at most32 peer-bound candidates for10s and honor bounded passive dwell;
 unknown RSSI is represented by `i8::MIN`, never a fabricated measurement.
 Optional SME elements are validated and forwarded through the shared join
@@ -261,7 +266,8 @@ the native USB transport dependency. RX uses the physically 24-byte
 alignment. Reports remain separate raw post-descriptor records; CRC/ICV-bad
 MPDUs are dropped. No translated-Ethernet fallback exists. TX uses the Linux
 32-byte descriptor, native DA multicast bit, software sequence, XOR checksum
-and a fixed legacy 1Mbps rate. The admitted station profile requires a
+and a fixed legacy1Mbps default, with distinct qualified MCS selection below.
+The admitted station profile requires a
 2.4GHz/20MHz AP supporting that basic rate; no HT/VHT mode is implied.
 
 The packet owner posts one persistent 4096-byte RX receipt, keeps it over
@@ -300,7 +306,8 @@ Linux `rtl8xxxu_conf_tx` plus `rtl8xxxu_set_aifs` supply BE/BK/VI/VO registers
 Every EP0 write has an exact readback. The only selected queue is conservative
 BE (AIFSN>=3, ECWmin>=5, ECWmax>=10, TXOP0); source ACM queue bits are cleared.
 Only then may the retained bulk owner admit a QoS DATA header with TID0 and
-TXDESC32_QOS. Other priorities, HT/BA, U-APSD, TSPEC and QoS Null stay closed.
+TXDESC32_QOS. This legacy WMM grant keeps other priorities, HT/BA, U-APSD,
+TSPEC and QoS Null closed; the distinct HT grant below cannot be inferred from it.
 Open frames and host CCMP use the26-byte header; CCMP protection occurs before
 USB staging, and the shared key owner retains per-key/TID replay state.
 
@@ -334,6 +341,104 @@ The retained current source/policy fence still encloses admission and native
 USB publication. One composed native smoke exercises all12 literal rates,
 response narrowing, Open/WPA2 native data/CCMP, exact checksum and source
 revocation with no extra publication and retained posted RX ownership.
+
+### Separately qualified RTL8188EU HT20/LGI
+
+`firmware_transport::Owner::ht20_request()` resolves the optional measurement
+filename and exact source/program binding without writing registers or granting
+HT permission. The retained successful registry loader now keeps the actual
+uploaded image's SHA256 and firmware capability. Every resumed EP0 operation,
+HT continuation and packet/publication admission checks that current source;
+a matching filename or retained digest alone cannot replace it. An unauthenticated
+supplied-image owner cannot authorize this production continuation.
+
+The optional signed record is
+`rtl8xxxu/rtl8188eu-ht20-lgi-v1-<factory-MAC-as-12-hex-digits>.bin`.
+It has magic `N8HT`, version1 and length1184: a160-byte header followed by eight
+64-entry signed-i16 conducted-peak upper-envelope curves, one per MCS and raw
+gain index. `i16::MAX` means unknown, never zero power. Header bytes12..16 bind
+USB VID/PID;16..48 bind the source/program SHA256;48..77 bind the exact29-byte
+legacy factory identity;77..80 are zero;80..112 bind the exact preceding N8PC
+digest;112..118 repeat the MAC;118..124 are `[1,20,1,0,0,0]` for channel/width/
+streams/LGI/no aggregation/no tracking;124..128 hold antenna gain and qualified
+EIRP ceiling;128..160 are zero. The program binding additionally includes the
+actual uploaded executable digest and the complete native HT/control/receive
+recipe. Old N8PC records cannot grant MCS transmission by supplying extra IEs.
+
+Qualification must bound the whole unchanged static antenna/LC/IQK/legacy/
+automatic-response program, supply and thermal0..63 envelope, all new MCS
+conducted peaks and native decline traffic. No real measured artifact is
+provided. Antenna gain cannot be lower than the legacy bound; selected peaks
+plus antenna must satisfy the signed HT ceiling, current deployment ceiling
+and the unchanged legacy operating envelope. Missing optional HT data preserves
+the legacy station. Invalid, unsigned, foreign or unqualified present data fails
+pure preflight before the singleton/receive claim or USB publication.
+
+This is the EU source path, not an EE gain-table clone. Linux
+`8188e.c::rtl8188eu_parse_efuse` copies CCK and HT40 bases but does not populate
+the FU/EE HT20 difference. The selected `8188f.c::rtl8188f_set_tx_power` therefore
+uses the EU's zero-initialized difference and channel1 `ht40_base[0]` as its
+factory MCS ceiling. No signed EE nibble, PG offset or inferred dBm conversion
+is imported. The native owner programs and reads back MCS0..3/4..7 at0xe10/e14
+with MAC TX/RX parked, before posting its first persistent RX TD. A running
+legacy station cannot call this operation or upgrade in place. Unused2SS gain
+lanes retain the source's factory state and grant no2SS descriptor admission.
+Source OFDM SIFS remains16us (`REG_SPEC_SIFS`), preserving CCK10; negotiated
+HT EDCA uses16 plus the actual9/20us slot times AIFSN, with the existing BE
+clamp. This is distinct from RTL8188EE's14us SIFS recipe.
+
+Scan and join use shared typed `observe_with_phy`/`JoinPlan::prepare_with_phy`
+and owned HT/WMM IEs. Local RX/TX supports mandatory MCS0..7, HT20/LGI and
+default3839-byte A-MSDU. Complete selected response HT Cap45/Operation61 must
+bind the original peer/primary1 offer,20MHz, supported protection mode and WMM.
+No mandatory membership selector is stripped. DATA chooses the highest actual
+response-bound MCS; source TXDESC32/v3 uses rate12..19, USE_DRIVER_RATE,
+DISABLE_DATA_FB, raw26-byte QoS/TID0 and software CCMP, with SGI/BW40/AGG/RTS
+disabled. Management and EAPOL keep legacy1Mbps. EU rate selection is host-owned;
+no C21/C22 H2C rate-mask callback or invented firmware-applied ACK is added.
+
+Native `rxdesc16` rate/HT/BW, fragment, aggregate, QoS/TID and A-MSDU facts are
+checked before crypto. HT MCS0..7 requires BW20/LGI and no greenfield/HT-control/
+EOSP/A-MPDU metadata. With PHYST present, the bounded32-byte padded
+`rtl8723au_phy_stats` block must agree with LGI and the selected full20MHz RXSC
+profile. This old block has no independent channel or C21/C22 page number;
+the source-owned fixed channel and descriptor supply those facts. PHYST absent
+retains checked descriptor admission and supplies no invented PHY measurement.
+Unexpected hardware plaintext, partial/deaggregated pieces and descriptor/header
+A-MSDU/TID disagreement are discarded. Only complete original standalone
+3839-byte A-MSDUs enter shared whole-aggregate authentication/deaggregation;
+bad MIC or a bad later subframe publishes no prefix and consumes no PN.
+
+The retained station owns valid bound immediate ADDBA requests for TIDs0..7
+and sends the actual33-byte status37 decline through the native management
+descriptor/USB endpoint. Ordinary DATA waits for that exact terminal receipt;
+a USB completion is host delivery, not a fabricated radio ACK. No BA agreement,
+reorder window or TX aggregation is enabled. Cancellation, source loss or an
+uncertain transfer retains outstanding USB resources and cannot reopen them.
+
+RX copies record controlled-port admission and a receive/key generation before
+processing. Native terminal M2/M4/Group2 plus actual receive-idle precede shared
+reply delivery; key replies retire queued output, controls and the published RX
+consumer. A complete original plaintext, peer-bound private EAPOL-Key may cross
+the reply epoch into the actual Supplicant phase/MIC/replay checks, always with
+DATA admission false. Ordinary/aggregate closed or old captures cannot inherit
+a later port. Carrier, Ethernet enqueue, RX-ring writes and every unlocked stack
+callback recheck current source/policy and the relevant controlled-port/generation
+proof. Reentrant held or fully completed rekey retires the rest of an old
+aggregate; ordinary TX-credit backpressure does not retire receive authorization.
+Observed authority loss is terminal, including after explicit policy reinstall.
+
+Fourteen passing native Rust smokes cover actual registered executable
+retention, measurement identity/unknown bounds, parked EP0 error/cancellation,
+all8 source descriptor rates and real CCMP, Open/WPA2 kernel DHCP/exact IP,
+whole3839 aggregates, bad native PHY/MIC/tail with same-PN retry, malformed bound
+responses, actual held ADDBA/M4 receipts, closed captures, each current source,
+policy loss and reentrant key/ordinary-credit publication. These cases pass
+both-architecture native QEMU and coordinated build/Clippy gates. Physical
+USB/RF/HT interoperability and exact-device measured qualification remain external.
+SGI20, HT40, RX A-MPDU, TX A-MPDU, TX A-MSDU, recipient/originator BA and RX
+reordering, all AC/TIDs, adaptive rates, broader scans/channels, coexistence,
+PM and reset/rejoin remain software work.
 
 ## 4. Invariants
 
@@ -385,7 +490,7 @@ channels/rates, reset/rejoin and PM still need software implementation.
 | Production passive scan/MLME service and policy-admitted management TX | Implemented narrow channel1/basic1Mbps profile, signed board/deployment admission required |
 | Software AES-CCM + strict CCMP/key/TID ownership | Implemented dependency; independent ciphertext/forgery/role/PN regressions |
 | WPA2 key installation/controlled port and Ethernet transport | Implemented retained shared RSNA/software CCMP, exact native delivery, Narf-Rings and synchronous stack progress |
-| Broader channel/rate profiles and coexistence | Native optional WMM DATA uses negotiated12-rate legacy TX; management/basic1Mbps and channel1 remain required. Retune, broader bands/HT/adaptation and coexistence remain missing |
+| Broader channel/rate profiles and coexistence | Native optional WMM DATA uses negotiated12-rate legacy TX. Separate N8HT HT20/LGI MCS0..7/whole A-MSDU/decline/capture-publication continuation passes native software gates above. Management/basic1Mbps and channel1 remain required. SGI/HT40, retune, broader bands/adaptation and coexistence remain missing |
 | USB transfer ownership / stale handles | EP0 + bulk claims, retained command DMA and generation rejection implemented; slot reuse stays gated |
 | Non-stream bulk stop/drain | Implemented in USB; exact commands/context/event-prefix proof |
 | Disconnect/peer-loss callbacks and normal bulk stop | Implemented; one association per firmware claim |
@@ -393,9 +498,10 @@ channels/rates, reset/rejoin and PM still need software implementation.
 
 Chip inventory is source-specific: Linux `rtl8xxxu/8188e.c` identifies1TX/1RX;
 `8192e.c` identifies actual1/2TX and2RX; `8723b.c` identifies1TX/1RX and optional
-BT/S0S1. EU therefore still needs HT20/40, aggregation/BA/reorder, full WMM
+BT/S0S1. EU's separately qualified HT20/LGI continuation is software-validated above;
+SGI20/HT40, RX A-MPDU, TX A-MPDU/TX A-MSDU, recipient/originator BA, RX reorder, full WMM
 AC/TID routing, adaptive rates, broader active/passive scanning, runtime PM and
-reset/rejoin. 8192EU/8723BU first need their own retained power/firmware/radio/
+reset/rejoin remain software work. 8192EU/8723BU first need their own retained power/firmware/radio/
 packet/station compositions, including2-chain or coexistence dependencies.
 The repository's matched8821CU/8822BU profiles need the actual upstream
 `rtw88/rtw8821cu.c`/`rtw8822bu.c` USB transport and C21/C22B radio semantics;

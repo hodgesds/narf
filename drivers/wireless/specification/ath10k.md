@@ -1,6 +1,7 @@
 # ath10k — Specification
 
-> Status: **Retained legacy/HT20 RAW station implemented; physical acceptance pending.**
+> Status: **Retained RAW station; bounded 5-GHz HT40/source/protection extension
+> validated in native software suites; physical acceptance pending.**
 > The live PCI task obtains BMI identity, selects trusted firmware/BDF,
 > runs OTP calibration and downloads the image. It retains runtime CE DMA
 > before BMI_DONE, negotiates HTC endpoints, handles firmware host-memory
@@ -8,7 +9,11 @@
 > scan vdev follow, with policy-authorized directed/wildcard active discovery.
 > Raw-capable non-PFC images can publish a retained legacy/HT20
 > station interface with Open/WPA2, bounded native packet progress and terminal
-> disconnect. Hardware-validation readiness is scoped to this exact profile.
+> disconnect. This checkpoint adds conditional non-DFS SISO HT40 with LGI40,
+> retained executable/BDF authority and native RTS/CTS intent. Those preceding cases
+> pass both-architecture native suites; matched IDs confer no board qualification.
+> The separately gated SGI40 extension passes nine native cases on both
+> architectures; physical qualification remains open.
 
 ## 1. Purpose & scope
 
@@ -119,8 +124,9 @@ remain separate profiles.
   SERVICE_READY reports HT and a valid RF-chain count, and the actual AP offer
   contains valid HT Capability/Operation and usable WMM. It retains MCS0..7,
   requires every basic MCS to fit that profile and binds HT Operation to the
-  observed primary channel. SGI20 requires the actual firmware capability and
-  both beacon/response support. A driver-owned HT IE advertises 20 MHz, one
+  observed primary channel. SGI20 transmit requires the actual firmware capability
+  and both beacon/response support; receive follows the local advertised promise.
+  A driver-owned HT IE advertises the selected width, one
   stream, SMPS disabled and no GF/STBC/LDPC; caller SME IEs cannot supply it.
   VDEV_START programs native 11NG/11NA HT20 plus ALLOW_HT, retaining the same
   20 MHz factory/host power receipt. The actual association response intersects
@@ -130,7 +136,7 @@ remain separate profiles.
   Missing/incompatible HT response cannot open the peer or controlled port.
   Without firmware HT or usable AP WMM, the existing legacy path remains.
   Native RX admits HT/HT-TXBF preambles only for this confirmed profile and
-  checks 20 MHz, supported MCS, non-greenfield and negotiated guard interval
+  checks the selected width, supported MCS, non-greenfield and guard interval
   before CCMP replay commitment. RX bounds use the local capability actually
   advertised; peer receive MCS/SGI separately constrain firmware transmit RC.
   Capability reporting exposes exact per-band HT bodies from actual startup
@@ -146,7 +152,7 @@ remain separate profiles.
   is discarded before later receipts can authorize it. Native RAW transmit
   aggregation is explicitly capped at one MPDU/one MSDU; firmware offload is
   not inferred to be disabled by absence of host ADDBA. TX A-MPDU/A-MSDU,
-  wider channels, more streams and VHT remain separate work.
+  widths beyond the selected bounded HT40 profile, more streams and VHT remain separate work.
   Complete first/last native RAW receive MPDUs can carry a default-size A-MSDU
   up to 3839 bytes. The shared opt-in receiver authenticates the original
   QoS header and complete ciphertext before validating every subframe and
@@ -157,9 +163,101 @@ remain separate profiles.
   Ethernet frames. The current port and refreshed regulatory permission gate
   final IPC publication after allocation and each stack callback after driver
   locks are dropped; buffered data cannot escape a later same-drain rekey.
+  IPC and stack callbacks are separate publication boundaries: a later callback
+  revocation suppresses that callback and subsequent publications, while an
+  IPC copy already authorized before that revocation remains a prior transaction.
   Native tests compose actual CE/WMI/HTT and referenced DMA with Open/WPA2,
   DHCP/IP on both bands/all dialects, response narrowing, absent/malformed
   capabilities, invalid RX geometry before PN, cancellation and policy loss.
+- The bounded 5-GHz HT40 extension uses actual SERVICE_READY HT enablement and
+  RF-chain facts with the shared typed `JoinPlan::prepare_with_phy` offer and
+  response. Linux `mac.c::ath10k_get_ht_cap` makes 20/40 support available with
+  `WMI_HT_CAP_ENABLED`; the independent HT40-SGI capability is not inferred from
+  SGI20. This profile advertises MCS0..7, LGI40, optional qualified SGI20 and
+  separately gated SGI40 as described below,
+  without GF, LDPC, STBC or an extra spatial stream. Only the pairs
+  5180/5200, 5220/5240, 5745/5765 and 5785/5805 MHz, in either primary order,
+  are selected. The actual board/OTP calibration path, immutable EEPROM
+  pair/CTL, fixed-country factory/host match, firmware band limits and current
+  host rules must admit the entire occupied40 MHz interval. Every overlapping
+  bandwidth, power or restrictive rule applies, including a narrow secondary
+  overlap. The minimum host ceiling and geometry remain one retained receipt.
+  These bounds add restrictions to vendor calibration; they are not fabricated
+  measured emissions or a replacement board qualification.
+  A denied secondary/width or an AP's20-only offer rebuilds a real HT20 local
+  capability before native publication; a narrowed negotiated width cannot leave
+  an unqualified40-MHz local advertisement. A response changing an already-programmed width, center, occupied
+  pair or HT40 protection mode fails; no unproved VDEV restart or header rewrite
+  relabels that owner. AP HT capability/operation changes after association close
+  it. Native RX accepts 20-MHz PPDUs within a selected40 profile, admits40 only
+  there, and rejects an unadvertised GI, GF and unsupported MCS before replay/PN commitment.
+  `SCAN_CHAN_LIST` programs the two qualified constituents with ALLOW_HT and
+  HT40_PLUS only on its lower channel row. `VDEV_START` separately carries the
+  actual primary, mean center1, center2=0, 11NA-HT40 mode6 and ALLOW_HT; it does
+  not misuse the inventory's HT40_PLUS bit. PEER_ASSOC carries BW40/RC-CW40 and
+  the response-bound rates on all six dialects. PPDU HT-SIG width and GI retain
+  their native meanings through RX BA/reorder and software CCMP.
+- SGI40 is independently enabled only by actual SERVICE_READY
+  `WMI_HT_CAP_HT40_SGI` (0x0800), alongside HT enablement and the checked chain
+  count. `WMI_HT_CAP_HT20_SGI` (0x0002), HT40 width, the PCI tuple and a peer's
+  capabilities cannot substitute for it. The per-band local HT body carries
+  IEEE SGI40 bit0x0040 only in the bounded 5-GHz HT40 profile; the 2.4-GHz/HT20
+  body never inherits it. Both GI directions follow the real firmware fact.
+  The original scan and actual association response additionally bound TX GI;
+  a response cannot restore a GI absent from the scan offer. Local RX uses the
+  exact promise sent in our association request and is not narrowed by an AP's
+  independent RX-GI field. A genuine20 fallback rebuilds the local capability,
+  clears width40 and SGI40 in the actual request/native peer record, and does
+  not invent SGI20 for SGI40-only firmware.
+  Linux `mac.c::ath10k_get_ht_cap`, `ath10k_peer_assoc_h_ht`,
+  `wmi.h::WMI_HT_CAP_HT40_SGI` and
+  `net/mac80211/ht.c::ieee80211_ht_cap_ie_to_sta_ht_cap` define the source
+  contract: PEER_ASSOC's width/GI capabilities are limited by local and peer
+  facts before firmware rate control. The retained original AP bodies remain
+  unchanged for response/beacon binding. All six dialects program the negotiated
+  native `peer_ht_caps`, RC-CW40=0x02 and RC-SGI=0x04. The single RC-SGI flag
+  permits any admitted GI, including qualified SGI20 fallback inside a40-MHz
+  profile; individual native capability bits prevent that flag from enabling
+  SGI40 or SGI20 without their distinct bounds. Other PHY/coding/stream limits
+  are unchanged.
+  Actual HT/HT-TXBF PPDU metadata selects independent advertised RX-SGI20 and
+  RX-SGI40 bounds using the HT-SIG width and GI bits, before BA sequence or
+  CCMP replay admission. The existing FIRST/MIDDLE/LAST owner carries a proven
+  SGI40 PPDU through reorder; LAST or a rejected next FIRST cannot lend its
+  PHY fact to an orphan. Invalid GI/width/MCS consumes no packet PN. Source,
+  whole occupied40 power, generation, key, terminal receipt and final separate
+  IPC/stack boundaries remain those of the existing retained owner.
+  No synthetic firmware ACK, per-GI measurement, calibration or authority input
+  is introduced. The actual retained vendor BDF/OTP calibration, firmware's
+  explicit SGI40 capability, immutable factory limits and full occupied-channel
+  host ceiling remain mandatory. Linux uses that same calibration/power owner
+  when exposing SGI40; ath10k has no Intel-style legacy-only measured-emitter
+  record to relabel. These source-backed gates grant no physical RF or board
+  interoperability claim.
+- `wmi_runtime::StationProtection { rts_threshold: Option<u16>,
+  cts_protection: bool }` and `pci::set_station_protection` submit native VDEV
+  protection intent. None encodes the disabled threshold `u32::MAX`; finite
+  values are 0..2347, with 0 forcing RTS. The CTS field is Linux's `use_cts_prot`
+  boolean, not the HT Operation protection enum. Every selected HT40 station
+  first submits forced RTS before creating its data/security owner. A nonzero
+  bound HT40 protection mode cannot relax that RTS floor. The serialized program
+  uses ENABLE_RTSCTS=0x21 (enabled, across software retries), PROTECTION_MODE
+  boolean and RTS_THRESHOLD, with actual MAIN/10.1/10.2/10.2.4/10.4/TLV command
+  IDs/parameter maps and TLV tag95. This follows Linux
+  `ath10k_recalc_rtscts_prot`, `ath10k_mac_set_cts_prot` and `ath10k_set_rts_threshold`.
+  Reconfiguration refuses an active key reply, reserves the radio before its
+  first wait, consumes the real outstanding ordinary HTT terminal receipt and
+  requires CE4 source-ready before issuing controls. It retains original RX and
+  peer/control events for the packet owner rather than discarding following
+  traffic. Current complete occupied-channel permission, immutable sources and
+  generation quarantine are checked during native waits and final publication.
+  `submitted_station_protection()` reports completed host submission intent;
+  CE completion/current receive-prefix progress is not a firmware parameter ACK,
+  MAC/FIFO retirement proof or observed RTS/CTS exchange. Failure/cancellation
+  closes admission and preserves uncertain DMA; reinstall or late credits do not
+  reopen it. The retained radio mutex serializes this direct control with packet
+  progress. Autonomous protection changes after AP operation changes, dynamic
+  CTS policy and protection interoperability still need further acceptance.
 - The single-vdev RAW station can negotiate WMM from an actual AP Parameter IE.
   It appends its own Information IE with U-APSD disabled; caller-supplied WMM
   cannot duplicate or replace that negotiation. The bound successful association
@@ -212,7 +310,8 @@ remain separate profiles.
   It programs immutable factory pair/CTL and additional half-dBm power limits,
   waits for a successful correlated VDEV_START_RESPONSE, creates the BSS
   peer and waits for native HTT peer-map confirmation. `PeerPrepared` reports
-  the bound BSSID/frequency, sparse firmware peer ID and host power ceiling;
+  the bound BSSID/primary frequency, center_frequency, bandwidth_mhz (20/40),
+  sparse firmware peer ID and host power ceiling;
   `Ath10kDevice::station_prepared`/`station_error` retain this diagnostic
   result. These APIs transmit no MLME/data frame and do not imply association,
   key installation, carrier or a registered NIC. A prepared context cannot
@@ -330,7 +429,7 @@ remain separate profiles.
   stays closed. `pci::poll_ethernet()` drives the same HTC/HTT owner and returns
   Ethernet only after receive quiescence with a still-owned peer. Native v1
   descriptors and indications must agree on sparse peer, TID, DS, sequence,
-  length, RAW decap and an unfragmented legacy/qualified HT20 MPDU. CRC errors,
+  length, RAW decap and an unfragmented legacy/qualified HT20/HT40 MPDU. CRC errors,
   foreign identities, hardware-decrypted RX, PADDR offload/fragments and
   unowned A-MPDU/reorder profiles are excluded. Complete original RAW A-MSDUs
   use the bounded opt-in shared receiver described above. RAW FCS is stripped before CCMP verification;
@@ -340,7 +439,7 @@ remain separate profiles.
   closes security before awaiting firmware retirement. Their async diagnostic
   surface and the nonblocking network drain share the same packet parsing,
   peer events, terminal receipts and security state.
-- `interface::Device` implements the registered legacy/HT20 station profile after
+- `interface::Device` implements the registered legacy/HT20/qualified HT40 profile after
   calibrated boot, WMI/HTT/scan setup, RAW/non-PFC firmware admission, signed
   regulatory bootstrap and current network-registry capability admission.
   `boot_task` publishes the retained `SESSION` and `scan_ready` immediately after
@@ -352,7 +451,7 @@ remain separate profiles.
   and board profile; native PCI APIs and the Device share this single owner.
   The Device exposes passive/active scan and Open/WPA2-PSK/CCMP on configured
   channels1–11 and the admitted fixed-country non-DFS 5-GHz centres above,
-  legacy/HT20 only. Unsupported scan options, PHY modes, external EAPOL and
+  legacy/HT20 or the bounded HT40 pairs above. Unsupported scan options, PHY modes, external EAPOL and
   checksum/TSO/VLAN requests are rejected, including direct frame-ring clients.
   Native control and each bounded packet-progress pass sample the current
   trusted regulatory database rather than an attachment-time clone. Passive
@@ -421,6 +520,30 @@ remain separate profiles.
   retain the registry/build policy. Actual signed-registry tests exercise both
   board roles, developer executable behavior and registry epoch revocation before
   source access; no test profile installs calibration for deployment.
+- `firmware_source::Source` retains the exact immutable executable/OTP-container
+  and board records actually selected by that loader: owned original bytes,
+  their blob capabilities, signer facts and registry digest, plus the exact
+  registry and physical PCI capabilities. The historical registry `sha256` field
+  stores BLAKE3; the source owner preserves that fact rather than renaming or
+  recalculating a different identity. The bounded eight-record log seals only
+  after image and board preparation, before mission startup; sealed assets/PCI
+  authority cannot be replaced. BMI preparation invokes the current records as
+  they become available. Mission startup requires the sealed owner. The real
+  PciBoot path has no missing-source fallback, including kernel-test builds;
+  only private protocol models can omit external firmware inputs.
+  Native MMIO read/write closures, every HIF send/receive/progress future poll,
+  RSNA processing and terminal key-reply commitment, netdev registration,
+  carrier, receive IPC and final stack publication use these retained current
+  capabilities. Source invocation snapshots a fixed array of immutable record
+  references and drops the loader lock before invoking the operation; no owner,
+  ring, loader or publication lock is held through a stack callback that may
+  reenter ARP/ND transmit. Revocation fails the old owner; reopening the same
+  canonical registry names cannot relabel it. It retains ambiguous DMA rather
+  than inventing cancellation/stop proof. Direct PCI station prepare, management,
+  association, data and protection operations also resample the actual current
+  occupied-power policy and session quarantine around native waits. These are
+  current host authority checks, not physical RF shutdown or firmware-internal
+  code/key erasure claims.
 - `hw::HwRev::registers()` returns the correct per-family windows;
   `Registers::ce_base(pipe)` rejects an out-of-range CE index. The RTC
   chip-ID helper now returns the complete BAR-relative address.
@@ -559,8 +682,9 @@ array, and validate the whole ID batch before freeing any payload. Descriptor
 IDs increase across slot reuse, so a late duplicate cannot free a new packet.
 Current authority is rechecked before preparation, publication and retirement;
 revocation/cancellation preserve the existing stop-protected DMA lifetime.
-Full local Linux C management generators produce command goldens, including
-padding and the 64-byte reference prefix. Composed runtime fixtures traverse
+Fixed source-cited Rust management vectors include padding and the 64-byte
+reference prefix. No compiler wrapper or source harvesting runs in validation.
+Composed runtime fixtures traverse
 scan/policy/START/MAP, all management dispatch choices, command credit receipts,
 terminal completion and native auth/association responses. They cover wrong
 recipients, changed policy, partial/duplicate terminal batches, invalid IDs,
@@ -573,12 +697,12 @@ permits release.
 
 The checked association path uses the shared secret-free JoinPlan for
 Open/WPA2-PSK legacy management and translates only validated rates, AID and
-capabilities into each native PEER_ASSOC/VDEV_UP layout. Full unmodified Linux
-C serializers generate 45 literal management/association fixtures, including
+capabilities into each native PEER_ASSOC/VDEV_UP layout. Forty-five retained
+source-cited literal management/association fixtures include
 single-rate 11B/11G, an eleven-rate response downgrade and TLV padding. The
-accompanying generator records native
-source SHA-256 provenance and runs independently of Rust encoders. Retained
-composition fixtures exercise actual CE3 source descriptor publication and
+historical provenance records native source SHA-256; it is not an active
+source-equivalence proof. Native Rust expectations are independently reviewed.
+Retained composition fixtures exercise actual CE3 source descriptor publication and
 completion, CE2/CE1/CE5 destination completion/copy/repost, HTC framing and
 credits, WMI commands and terminal referenced-management retirement. They
 cover cancellation after native PEER_ASSOC/VDEV_UP descriptor publication,
@@ -630,6 +754,12 @@ operator-UP interface; a later physical carrier sample cannot undo operator DOWN
   out. Rounded writes and LZ tail chunks are zero-padded.
 - Identity or bootloader success never enables carrier, transmit or a
   purported association.
+- Selected occupied20/40 geometry, programmed host ceiling, immutable
+  executable/board records and exact PCI/session generation remain current
+  through native waits and final packet publication. Source or policy replacement
+  cannot relabel a live owner. A protection request is submitted intent, not an
+  inferred firmware/RF acknowledgement; dropping it after publication keeps the
+  radio closed and uncertain DMA retained.
 
 ## 5. Architecture notes
 
@@ -697,6 +827,80 @@ concurrent closure and preference replacement. `NO_PS` images reject requests
 before I/O. These checks establish submitted control intent; physical DTIM,
 buffering, wake latency and energy behavior remain hardware acceptance work.
 
+The preceding checkpoint added 22 native smokes: nine under
+`drivers/wireless/ath10k/ht40`, eight under
+`drivers/wireless/ath10k/source` and five under
+`drivers/wireless/ath10k/protection`. HT40 cases compose all six dialects with
+Open/WPA2, the actual kernel DHCP/IP path, PS and terminal retirement; they also
+exercise every eligible pair, truthful HT20 fallback, literal inventory/start/
+peer geometry, response narrowing failures, PPDU/GI/MCS before replay,
+cancellation, live secondary restrictions and final allocation/callback fences.
+Source cases use an isolated real signed registry with inert fixture bytes,
+actual capability revocation/reinstall, native BMI/MMIO and held M4/CE/HTT
+storage. They prove no deployable board permissions. Protection cases check
+all dialects and bound HT modes, real old-packet terminal drain, preserved
+following RX, each command's cancellation/current-source/current-policy fence
+and threshold 0/2347/disabled bounds. All22 new cases pass the coordinated
+both-architecture software suites; no physical or performance result is claimed.
+
+The SGI40 extension passes nine more native smokes on both architectures under
+`drivers/wireless/ath10k/sgi40`. Actual
+per-dialect SERVICE_READY packets feed the production capability parser before
+Device capability capture, including SGI40-only and HT-disabled cases. Literal
+per-band/request HT bodies, peer capability/RC fields, native RX HT-SIG and
+independent CCMP packets check directional scan/response narrowing and truthful
+local20 fallback. Composed Open/WPA2 tests run the real kernel DHCP/IP path,
+initial PS and terminal retirement across both primary orders and all six WMI
+dialects. Other cases exercise malformed GI/MCS before same-PN retry, native BA
+FIRST proof/reordering/LAST retirement, seven native cancellation points,
+held WMM/M4 source and occupied-power revocation, and final allocation/callback
+boundaries with prior-authorized IPC distinguished from later revocation.
+Reinstalling source or restoring policy cannot reopen the failed owner.
+
+The per-profile ledger below distinguishes actual reachability from a codec or
+ID. `R` denotes the shared retained legacy/HT20 Open/WPA2/RAW/non-PFC station
+backend; `H` denotes the conditional 5-GHz HT40/SISO extension whose LGI40 path
+is validated in native software suites. Its separately gated SGI40 addition
+also passes both-architecture native cases. Both depend on actual image capability/service
+facts, matching board/OTP data, current PCI/source/host authority and successful
+native receipts; neither asserts that every vendor image for that tuple is
+usable. The six WMI dialects are selected from the image's real API facts,
+not inferred from this PCI table. `profile::PROFILES`, `hw::HwRev::from_pci_id`,
+`pci::boot_task`, `firmware::prepare`, `wmi_runtime::ht::Profile::offer` and
+`regulatory::Permission::occupied` are the production selection chain. Linux
+`ath10k/core.c`'s hardware table, `hw.h`, `mac.c::ath10k_get_ht_cap` and
+`wmi.c::ath10k_wmi_event_service_ready` are the corresponding primary facts.
+
+| Chip / PCI tuple | Exact BMI target / firmware directory | Native reachability and remaining profile-specific qualification |
+|---|---|---|
+| QCA988X,168c:003c |4100016c / QCA988X/hw2.0 | R; H conditional. Real vendor calibration, factory country, RAW/non-PFC and firmware capability acceptance remain external. |
+| QCA988X UBNT,0777:11ac |4100016c / QCA988X/hw2.0 | R; H conditional. Distinct PCI identity is retained; rebadge is not generic board permission. |
+| QCA6164,168c:0041 |05010000 / QCA6174/hw2.1 | R; H conditional. Exact subsystem BDF and reported chain/band facts required; shared directory does not imply identical silicon capability. |
+| QCA6174,168c:003e |05010000 / QCA6174/hw2.1 | R; H conditional; native CE1 HTT route and actual board/image required. |
+| QCA6174,168c:003e |05020000 / QCA6174/hw3.0 | R; H conditional; actual revision/OTP/image selection retained. |
+| QCA6174,168c:003e |05030000 / QCA6174/hw3.0 | R; H conditional; existing chip-specific PLL sequence precedes native mission startup. |
+| QCA99X0,168c:0040 |01000000 / QCA99X0/hw2.0 | R; H conditional; 12-pipe hardware/firmware host-memory profile remains exact, additional chains/VHT are not enabled. |
+| QCA9984,168c:0046 |01000000 / QCA9984/hw1.0 | R; H conditional; 2048-byte extended board data and selected OTP remain required. Wider VHT/extra chains are not implemented here. |
+| QCA9888,168c:0056 |01000000 / QCA9888/hw2.0 | R; H conditional; distinct board/OTP identity is required despite shared CE family. |
+| QCA9377,168c:0042 |05020000 / QCA9377/hw1.0 | R; H conditional; actual RAW/non-PFC image and CE1 routing required. |
+| QCA9377,168c:0042 |05020001 / QCA9377/hw1.0 | R; H conditional; existing revision-specific PLL path and exact board data retained. |
+| QCA9887,168c:0050 |4100016d / QCA9887/hw1.0 | Profile table/parser entry only. No PCI match/HwRev route, therefore no automatic boot or station support; cannot count this row as R/H. |
+| AR9462,168c:0034 | none | Explicit pre-MMIO rejection; ath9k ownership, not a missing ath10k station implementation. |
+
+Across the reached rows, concrete remaining software packages are 2.4-GHz HT40
+coexistence/occupied-power ownership;
+additional streams and directional LDPC/STBC where actual hardware/firmware
+supports them; response-bound VHT and wider geometry; native TX BA, independent
+multi-packet DMA/completion and aggregate retries; PFC fetch/queue ownership;
+dynamic WMM/protection updates and non-BE TX/TSPEC/U-APSD; DFS/indoor/beacon-hint
+qualification; associated/off-channel scanning; hardware key/PMF/WPA3 profiles;
+AP/P2P roles; interrupt-driven throughput; host-bus/system PM and wake offload;
+broader calibration sources and automatic credential/stable-interface recovery.
+The existing bounded RX BA/reorder and complete RAW A-MSDU receiver must not be
+counted again as wholly missing TX aggregation. Unsupported role, width, stream,
+or security capability remains closed; this ledger makes no per-chip RF or
+board-power claim from a model or PCI ID.
+
 Physical acceptance still must validate exact PCI/BMI identity, trusted firmware
 and board calibration, ROM/OTP/PLL/code-swap, native CE/HTC/WMI/HTT progress,
 scan, Open/WPA2 and actual DHCP/IP with a real AP, idle/beacon liveness, link loss,
@@ -704,8 +908,5 @@ revocation and terminal teardown without DMA reuse. No such run is recorded.
 An image lacking RAW support, or requiring PFC, remains a diagnostic scan owner
 and must not be counted as a usable station under this profile.
 
-Broader bands/widths, HT40/multiple streams/VHT/BA aggregation, PFC fetch/queue ownership, alternate
-calibration sources, interrupt throughput, associated/off-channel scanning,
-automatic/stable-interface recovery and host-bus/system power management remain
-explicit later profiles. They
-are not prerequisites for validating the bounded station profile above.
+The table and packages above remain open beyond the bounded R/H profiles. The
+family is not feature-complete or physically qualified after this checkpoint.

@@ -555,3 +555,38 @@ pub fn __reset_for_test() {
     LEGACY_HANDLERS.lock().clear();
     WMI_GUIDS.lock().clear();
 }
+
+/// Install a synthetic GUID into the registry for fixture tests.
+///
+/// `enumerate_guids()` only finds GUIDs on devices whose `_WDG`
+/// evaluates, which a fixture namespace cannot cheaply fake (the
+/// PNP0C14 walk keys off `_HID`). Fixture tests that drive the
+/// *method-invocation* side of a vendor driver (profile set/get,
+/// rfkill refresh, SMBIOS calls) instead pair this with a fixture
+/// AML device at `device_path` carrying the `WMxx` method, so the
+/// full `invoke_method` → AML → fixture conversation runs exactly
+/// as on real firmware. Test-only; production code must use
+/// `enumerate_guids()`.
+#[doc(hidden)]
+pub fn __test_install_guid(guid: [u8; 16], device_path: &str, object_id: [u8; 2]) {
+    __test_install_guid_multi(guid, device_path, object_id, 1);
+}
+
+/// Like [`__test_install_guid`] but with an explicit instance
+/// count, for fixtures modelling multi-instance data blocks
+/// (e.g. `Lenovo_BiosSetting` enumeration).
+#[doc(hidden)]
+pub fn __test_install_guid_multi(
+    guid: [u8; 16],
+    device_path: &str,
+    object_id: [u8; 2],
+    instance_count: u8,
+) {
+    WMI_GUIDS.lock().push(WmiGuid {
+        guid,
+        device_path: String::from(device_path),
+        object_id,
+        instance_count,
+        flags: WDG_FLAG_METHOD,
+    });
+}

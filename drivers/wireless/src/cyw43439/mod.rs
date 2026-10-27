@@ -234,4 +234,6 @@ pub mod tests {
     );
 }
 #[cfg(any(test, feature = "kernel-test"))]
+pub(crate) mod mfp_fixture;
+#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod phy_fixture;

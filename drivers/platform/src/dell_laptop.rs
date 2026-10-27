@@ -6,8 +6,13 @@
 //!
 //! ## Features
 //!
-//! - Dell SMBIOS SMI command encoding (class / select / in0..in3)
-//! - WMI event decode (9DBB GUID) → KEY_* via input layer
+//! - Dell SMBIOS calling-interface buffer (class / select / in0..in3,
+//!   out0..out3) in the real `dell-smbios.h` layout, transported over
+//!   the SMBIOS WMI GUID (`dell-smbios-wmi.c`)
+//! - WMI application registration (class 17 / select 3) at init, per
+//!   the Dell SMBIOS documentation, so WMI events are enabled
+//! - WMI event decode (9DBB GUID) → KEY_* via input layer; the
+//!   mic-mute key (0x0150) reports the distinct `KEY_MICMUTE`
 //! - Keyboard backlight level control via Dell token 0x02C6
 //! - Battery charge limit (BIOS token 0x044F)
 //! - Touchpad LED control
@@ -21,70 +26,140 @@
 //!   - `dell_laptop_kbd_led_set()` — LED level dispatcher.
 //! - `drivers/platform/x86/dell/dell-wmi-base.c`
 //!   - `dell_wmi_notify()` — event GUID 9DBB5994 handler.
-//! - `drivers/platform/x86/dell/dell-smbios.c`
-//!   - `dell_smbios_call()` — low-level SMI call (line ~200).
+//!   - `dell_wmi_events_set_enabled()` — class 17 / select 3
+//!     application registration ("According to Dell SMBIOS
+//!     documentation: 17 3 Application Program Registration").
+//! - `drivers/platform/x86/dell/dell-smbios.c` + `dell-smbios.h`
+//!   - `struct calling_interface_buffer` — u16 class, u16 select,
+//!     u32 input[4], u32 output[4].
+//! - `drivers/platform/x86/dell/dell-smbios-wmi.c`
+//!   - `run_smbios_call()` — WMI transport of the buffer.
 
 extern crate alloc;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use narf_input::{push_key, KeyCode};
 
-// ── Dell SMBIOS SMI call structure ────────────────────────────────────
+// ── Dell SMBIOS calling-interface buffer ──────────────────────────────
 
-/// Dell SMBIOS command header. Passed as four 32-bit words to the
-/// firmware SMI handler via port I/O or via WMI WBEM method call.
+/// Dell SMBIOS WMI GUID — the WMI transport for SMBIOS calls.
+/// Reference: `dell-smbios-wmi.c` — `DELL_WMI_SMBIOS_GUID`.
+pub const DELL_WMI_SMBIOS_GUID: &str = "A80593CE-A997-11DA-B012-B622A1EF5492";
+
+/// SMBIOS class for firmware information / application services.
+/// Reference: `dell-smbios.h` — `CLASS_INFO = 17`.
+pub const CLASS_INFO: u16 = 17;
+/// Select for application-program registration under CLASS_INFO.
+/// Reference: `dell-wmi-base.c` — `SELECT_APP_REGISTRATION = 3`
+/// ("According to Dell SMBIOS documentation: 17 3 Application
+/// Program Registration").
+pub const SELECT_APP_REGISTRATION: u16 = 3;
+
+/// A Dell SMBIOS command in the real `calling_interface_buffer`
+/// layout: u16 class, u16 select, four u32 inputs, four u32
+/// outputs (36 bytes packed).
 ///
-/// Reference: `dell-smbios.c::struct dell_smbios_call_in` (line ~55).
-/// The four words map to `in0` / `in1` / `in2` / `in3`. The first word
-/// encodes `(class << 8) | select`.
+/// Reference: `dell-smbios.h::struct calling_interface_buffer`.
+///
+/// Correction note: this struct previously modelled the buffer as
+/// four u32 words with `(class << 8) | select` packed into the
+/// first word — a shape no Dell firmware implements (class and
+/// select are separate u16 fields, and the buffer carries four
+/// inputs *and* four outputs). The layout below is the documented
+/// one; the encode smoke in `tests.rs` pins it byte-for-byte.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct DellSmbiosCmd {
-    /// `(class << 8) | select`. Class and select are per-API category.
-    /// Reference: dell-smbios.c class/select constants.
-    pub header: u32,
-    /// in1 argument (purpose depends on class/select).
-    pub in1: u32,
-    /// in2 argument.
-    pub in2: u32,
-    /// in3 argument.
-    pub in3: u32,
+    /// Command class (per-API category).
+    pub class: u16,
+    /// Command select within the class.
+    pub select: u16,
+    /// Input words in0..in3 (purpose depends on class/select).
+    pub input: [u32; 4],
 }
 
 impl DellSmbiosCmd {
-    /// Construct a new SMBIOS command from class, select, and optional args.
+    /// Construct a new SMBIOS command from class and select, with
+    /// zeroed inputs.
     ///
-    /// Reference: `dell-smbios.c::dell_fill_request()` — builds the
-    /// class/select header and zeroes remaining args.
-    pub fn new(class: u8, select: u8) -> Self {
+    /// Reference: `dell-smbios.c::dell_fill_request()`.
+    pub fn new(class: u16, select: u16) -> Self {
         Self {
-            header: ((class as u32) << 8) | (select as u32),
-            ..Default::default()
+            class,
+            select,
+            input: [0; 4],
         }
     }
 
-    /// Encode to the raw 16-byte buffer (four little-endian u32s)
-    /// sent to the WMI `WBEM` method or SMI handler.
-    ///
-    /// Reference: `dell-smbios.c::dell_smbios_call()` line ~200 —
-    /// stores the four in-words into a packed buffer before calling SMI.
-    pub fn encode(&self) -> [u8; 16] {
-        let mut buf = [0u8; 16];
-        buf[0..4].copy_from_slice(&self.header.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.in1.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.in2.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.in3.to_le_bytes());
+    /// Encode to the raw 36-byte calling-interface buffer sent to
+    /// firmware (via the WMI method or the SMI handler): class,
+    /// select, the four input words, and a zeroed output area the
+    /// firmware fills in.
+    pub fn encode(&self) -> [u8; 36] {
+        let mut buf = [0u8; 36];
+        buf[0..2].copy_from_slice(&self.class.to_le_bytes());
+        buf[2..4].copy_from_slice(&self.select.to_le_bytes());
+        for (i, w) in self.input.iter().enumerate() {
+            buf[4 + i * 4..8 + i * 4].copy_from_slice(&w.to_le_bytes());
+        }
         buf
     }
 
-    /// Decode a 16-byte response buffer into out-words.
-    /// Returns `(out0, out1, out2, out3)`.
-    pub fn decode_response(buf: &[u8; 16]) -> (u32, u32, u32, u32) {
-        (
-            u32::from_le_bytes(buf[0..4].try_into().unwrap()),
-            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
-            u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            u32::from_le_bytes(buf[12..16].try_into().unwrap()),
-        )
+    /// Decode the output words (out0..out3 at byte offset 20) of a
+    /// response buffer.
+    pub fn decode_response(buf: &[u8; 36]) -> (u32, u32, u32, u32) {
+        let word = |i: usize| -> u32 {
+            u32::from_le_bytes(buf[20 + i * 4..24 + i * 4].try_into().unwrap())
+        };
+        (word(0), word(1), word(2), word(3))
+    }
+}
+
+/// Issue one SMBIOS call over the WMI transport and return the
+/// output words. Returns `None` when the SMBIOS WMI GUID is not
+/// present, the method fails, or the reply is malformed.
+///
+/// Reference: `dell-smbios-wmi.c::run_smbios_call` — the
+/// calling-interface buffer is the method's buffer argument; the
+/// firmware returns the same buffer with the output area filled.
+pub fn smbios_wmi_call(cmd: &DellSmbiosCmd) -> Option<(u32, u32, u32, u32)> {
+    let want = crate::wmi_vendors::guid_str_to_bytes(DELL_WMI_SMBIOS_GUID)?;
+    let guid = narf_aml::wmi::list_guids()
+        .into_iter()
+        .find(|g| g.guid == want)?;
+    let reply =
+        narf_aml::wmi::invoke_method(&guid, 1, &[narf_aml::Value::Buffer(cmd.encode().to_vec())])
+            .ok()?;
+    match reply {
+        narf_aml::Value::Buffer(b) if b.len() >= 36 => {
+            let arr: &[u8; 36] = b[..36].try_into().ok()?;
+            Some(DellSmbiosCmd::decode_response(arr))
+        }
+        _ => None,
+    }
+}
+
+/// Enable or disable Dell WMI event delivery through the SMBIOS
+/// application-registration call: class 17 (`CLASS_INFO`), select
+/// 3 (`SELECT_APP_REGISTRATION`), with inputs
+/// `[0x10000, 0x51534554, 0, enable]`.
+///
+/// Reference: `dell-wmi-base.c::dell_wmi_events_set_enabled()` —
+/// input[1] `0x51534554` is the registration magic ("TESQ" in LE
+/// byte order); the call result is `output[0]` run through
+/// `dell_smbios_error`, where 0 is success. We return the raw
+/// output[0] as the error when nonzero rather than reproducing
+/// the errno table.
+///
+/// Returns `Err(None)` when the WMI transport is unavailable.
+pub fn wmi_events_set_enabled(enable: bool) -> Result<(), Option<u32>> {
+    let mut cmd = DellSmbiosCmd::new(CLASS_INFO, SELECT_APP_REGISTRATION);
+    cmd.input[0] = 0x10000;
+    cmd.input[1] = 0x51534554;
+    cmd.input[3] = enable as u32;
+    match smbios_wmi_call(&cmd) {
+        Some((0, _, _, _)) => Ok(()),
+        Some((err, _, _, _)) => Err(Some(err)),
+        None => Err(None),
     }
 }
 
@@ -203,14 +278,15 @@ pub fn kbd_backlight_level() -> KbdBacklight {
 /// `dell_send_request(class=4, select=0, in1=token, in2=value)`.
 pub fn set_kbd_backlight(level: KbdBacklight) {
     KBD_BACKLIGHT.store(level as u32, Ordering::Release);
-    // In live kernel: issue SMBIOS class=4 select=0 token=0x02C6 value=level.
-    let cmd = DellSmbiosCmd {
-        header: 4u32 << 8, // class=4 (bits 15:8), select=0 (bits 7:0)
-        in1: 0x02C6,
-        in2: level as u32,
-        in3: 0,
-    };
-    let _ = cmd.encode(); // encode is side-effect-free; real HW write via SMI
+    // Issue SMBIOS class=4 select=0 token=0x02C6 value=level over
+    // the WMI transport when the SMBIOS GUID is present. (The
+    // previous body encoded the command and dropped it.) When the
+    // GUID is absent the value stays cache-only — the SMI port
+    // transport `dell-laptop.c` uses by default is not modelled.
+    let mut cmd = DellSmbiosCmd::new(4, 0);
+    cmd.input[0] = 0x02C6;
+    cmd.input[1] = level as u32;
+    let _ = smbios_wmi_call(&cmd);
 }
 
 // ── Battery charge limit ──────────────────────────────────────────────
@@ -229,14 +305,13 @@ pub fn charge_limit() -> u32 {
 /// token 0x044F (AC adapter charge percentage threshold).
 pub fn set_charge_limit(pct: u32) {
     CHARGE_LIMIT.store(pct, Ordering::Release);
-    // SMBIOS class=17 select=3: token 0x044F, value=pct.
-    let cmd = DellSmbiosCmd {
-        header: (17u32 << 8) | 3,
-        in1: 0x044F,
-        in2: pct,
-        in3: 0,
-    };
-    let _ = cmd.encode();
+    // SMBIOS class=17 select=3: token 0x044F, value=pct — now
+    // actually issued over the WMI transport when present (the
+    // previous body encoded and dropped it); cache-only otherwise.
+    let mut cmd = DellSmbiosCmd::new(17, 3);
+    cmd.input[0] = 0x044F;
+    cmd.input[1] = pct;
+    let _ = smbios_wmi_call(&cmd);
 }
 
 // ── Statistics ────────────────────────────────────────────────────────
@@ -264,7 +339,7 @@ fn on_dell_event(ev: &narf_aml::wmi::WmiEvent) {
         DellWmiEvent::FnKey { code } => dell_wmi_keycode(code),
         DellWmiEvent::KbdIllumUp => Some(KeyCode::KbdIlluminationUp),
         DellWmiEvent::KbdIllumDown => Some(KeyCode::KbdIlluminationDown),
-        DellWmiEvent::MicMute => Some(KeyCode::Mute),
+        DellWmiEvent::MicMute => Some(KeyCode::MicMute),
         DellWmiEvent::TabletMode { .. } => None,
         DellWmiEvent::Unknown { .. } => None,
     };
@@ -293,6 +368,12 @@ pub fn init() {
             }
         }
     }
+    // Application registration: on models where the SMBIOS WMI
+    // GUID is present, firmware only delivers WMI events after the
+    // class 17 / select 3 registration call (Dell SMBIOS
+    // documentation, via dell-wmi-base.c). Best-effort — absence
+    // of the GUID just means the legacy SMI path owns events.
+    let _ = wmi_events_set_enabled(true);
 }
 
 // ── Test helpers ──────────────────────────────────────────────────────

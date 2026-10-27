@@ -423,7 +423,7 @@ fn native_order(channels: &[u8]) -> Result<(), &'static str> {
         return Err("active scan bypassed VIF/power/PSE/domain/start/close sequencing");
     }
     for (row, (index, power, channel, last)) in
-        [(5, 34, 6, 0), (7, 28, 36, 1)].into_iter().enumerate()
+        [(5, 28, 6, 0), (7, 22, 36, 1)].into_iter().enumerate()
     {
         let limits = &frames[index].1[64..];
         if limits.len() != 206

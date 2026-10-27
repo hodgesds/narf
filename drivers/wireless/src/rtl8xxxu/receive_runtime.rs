@@ -55,6 +55,48 @@ pub struct Receiver<C: ControlIo, B: PacketIo> {
     mailbox: u8,
     peer: Option<[u8; 6]>,
     wmm: Option<Arc<super::wmm_runtime::Proof>>,
+    ht: Option<Arc<super::ht_runtime::Grant>>,
+    ht_gains: Option<[u8; 8]>,
+}
+#[derive(Clone)]
+pub(super) struct Authority {
+    executable: Option<super::firmware_transport::Executable>,
+    base: Option<Arc<super::wmm_runtime::Proof>>,
+    ht: Option<Arc<super::ht_runtime::Grant>>,
+}
+pub(super) struct Profile {
+    base: Arc<super::wmm_runtime::Proof>,
+    ht: Option<Arc<super::ht_runtime::Grant>>,
+}
+impl Authority {
+    pub(super) fn invoke<T>(&self, operation: impl FnOnce() -> T) -> Result<T, Error> {
+        let operation = || {
+            if let Some(ht) = &self.ht {
+                ht.invoke(operation)
+            } else if let Some(base) = &self.base {
+                base.invoke(operation)
+            } else {
+                Ok(operation())
+            }
+        };
+        if let Some(executable) = self.executable {
+            executable.invoke(operation).map_err(Error::Control)?
+        } else {
+            operation()
+        }
+    }
+    pub(super) async fn fence<T, E, F: core::future::Future<Output = Result<T, E>>>(
+        &self,
+        future: F,
+        map: fn(Error) -> E,
+    ) -> Result<T, E> {
+        let mut future = core::pin::pin!(future);
+        core::future::poll_fn(|cx| {
+            self.invoke(|| future.as_mut().poll(cx))
+                .unwrap_or_else(|e| core::task::Poll::Ready(Err(map(e))))
+        })
+        .await
+    }
 }
 impl<C: ControlIo, B: PacketIo> core::fmt::Debug for Receiver<C, B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -90,6 +132,8 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
             mailbox: 0,
             peer: None,
             wmm: None,
+            ht: None,
+            ht_gains: None,
         })
     }
     pub fn phase(&self) -> Phase {
@@ -99,8 +143,70 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
             self.phase
         }
     }
-    pub(super) fn wmm_proof(&self) -> Option<Arc<super::wmm_runtime::Proof>> {
-        self.wmm.clone()
+    pub(super) fn wmm_proof(&self) -> Option<Authority> {
+        Some(self.authority())
+    }
+    pub(super) fn authority(&self) -> Authority {
+        Authority {
+            executable: self.firmware.executable(),
+            base: self.wmm.clone(),
+            ht: self.ht.clone(),
+        }
+    }
+    pub(super) fn ht_enabled(&self) -> bool {
+        self.ht.is_some()
+    }
+    pub(super) fn ht_local(&self) -> Option<narf_wireless::association::phy::LocalPhy> {
+        self.ht.as_ref().map(|_| super::ht_runtime::local())
+    }
+    /// Optional profile resolution and programming occurs before the first RX
+    /// TD or packet gate. A running legacy station can never be upgraded here.
+    pub(super) fn resolve_profile(
+        firmware: &Firmware<C>,
+        permission: super::power_policy::Permission,
+    ) -> Result<Profile, Error> {
+        let factory = firmware.factory().ok_or(Error::State)?;
+        let (vid, pid) = firmware.usb_identity().ok_or(Error::State)?;
+        let executable = firmware.executable().ok_or(Error::State)?;
+        executable.invoke(|| ()).map_err(Error::Control)?;
+        let base = super::wmm_runtime::Proof::registered(factory, vid, pid, permission)?;
+        let ht =
+            super::ht_runtime::Grant::registered(base.clone(), executable, factory.ht40_power[0])?;
+        Ok(Profile { base, ht })
+    }
+    pub(super) async fn prepare_profile(&mut self, profile: Profile) -> Result<(), Error> {
+        if self.phase() != Phase::Prepared || self.ht.is_some() {
+            return Err(Error::State);
+        }
+        self.wmm = Some(profile.base);
+        if let Some(grant) = profile.ht {
+            self.install_ht(grant).await?;
+        }
+        Ok(())
+    }
+    pub(super) async fn install_ht(
+        &mut self,
+        grant: Arc<super::ht_runtime::Grant>,
+    ) -> Result<(), Error> {
+        if self.phase() != Phase::Prepared {
+            return Err(Error::State);
+        }
+        let gains = grant.gains()?;
+        self.phase = Phase::Configuring;
+        let mut attempt = Attempt {
+            firmware: self.firmware.clone(),
+            armed: true,
+        };
+        let result = grant.program(&self.firmware, gains).await;
+        attempt.armed = false;
+        if result.is_err() {
+            self.fail();
+            return result;
+        }
+        self.ht = Some(grant);
+        self.ht_gains = Some(gains);
+        self.phase = Phase::Prepared;
+        Ok(())
     }
     pub(super) fn qualify_wmm(
         &mut self,
@@ -116,10 +222,7 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         self.current_wmm()
     }
     pub(super) fn current_wmm(&self) -> Result<(), Error> {
-        if let Some(proof) = &self.wmm {
-            proof.invoke(|| ())?;
-        }
-        Ok(())
+        self.authority().invoke(|| ())
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn install_wmm_model(&mut self, proof: Arc<super::wmm_runtime::Proof>) {
@@ -130,11 +233,22 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         p: narf_wireless::wmm::Parameters,
         short: bool,
     ) -> Result<(), Error> {
-        let values = super::wmm_runtime::words(p, short)?;
+        self.configure_wmm_phy(p, short, false).await
+    }
+    pub(super) async fn configure_wmm_phy(
+        &mut self,
+        p: narf_wireless::wmm::Parameters,
+        short: bool,
+        ht: bool,
+    ) -> Result<(), Error> {
+        let values = super::wmm_runtime::words_profile(p, short, ht)?;
+        if ht && !self.ht_enabled() {
+            return Err(Error::State);
+        }
         if self.phase() != Phase::Active || self.wmm.is_none() {
             return Err(Error::State);
         }
-        let proof = self.wmm.clone().ok_or(Error::State)?;
+        let proof = self.authority();
         self.phase = Phase::Configuring;
         let mut attempt = Attempt {
             firmware: self.firmware.clone(),
@@ -168,6 +282,7 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         attempt.armed = false;
         if result.is_ok() {
             self.packets.qos = true;
+            self.packets.ht = ht;
             self.phase = Phase::Active;
         } else {
             self.fail();
@@ -246,10 +361,11 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         }
     }
     pub fn poll(&mut self) -> Result<Option<Vec<Mpdu>>, Error> {
+        self.current_wmm()?;
         if !matches!(self.phase(), Phase::Receiving | Phase::Active) {
             return Err(Error::State);
         }
-        match self.packets.poll_receive() {
+        match self.authority().invoke(|| self.packets.poll_receive())? {
             Ok(None) => Ok(None),
             Ok(Some(records)) => Ok(Some(
                 records
@@ -257,7 +373,7 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
                     .filter_map(|r| match r {
                         // Hardware decryption is disabled. Never adopt unexpected
                         // plaintext metadata as a software-authenticated MPDU.
-                        Record::Frame(f) if !f.decrypted => Some(f),
+                        Record::Frame(f) if f.admitted(self.ht_enabled()) => Some(f),
                         _ => None,
                     })
                     .collect(),
@@ -347,6 +463,10 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
             if cr & 0xc0 != 0x80 {
                 return Err(Error::State);
             }
+            if let Some(ht) = &self.ht {
+                ht.readback(&self.firmware, self.ht_gains.ok_or(Error::State)?)
+                    .await?;
+            }
             // The CCK/OFDM register lanes follow Linux rtl8188f_set_tx_power.
             // Other lanes and controls survive; no unqualified MCS mode is
             // enabled by this legacy-only owner.
@@ -435,9 +555,10 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         {
             return Err(Error::State);
         }
-        let result = self
-            .packets
-            .submit(super::packet_codec::Kind::Management, frame);
+        let result = self.authority().invoke(|| {
+            self.packets
+                .submit(super::packet_codec::Kind::Management, frame)
+        })?;
         if self.packets.is_failed() {
             self.fail();
         }
@@ -450,7 +571,7 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         if self.phase() != Phase::Active {
             return Err(Error::State);
         }
-        match self.packets.poll_transmit() {
+        match self.authority().invoke(|| self.packets.poll_transmit())? {
             Ok(result) => Ok(result),
             Err(error) => {
                 self.fail();
@@ -487,16 +608,15 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         {
             return Err(Error::State);
         }
-        let proof = self.wmm.clone();
-        let mut submit = || {
+        if rate >= 12 && (!self.ht_enabled() || !(12..=19).contains(&rate)) {
+            return Err(Error::State);
+        }
+        let proof = self.authority();
+        let submit = || {
             self.packets
                 .submit_rate(super::packet_codec::Kind::Data, frame, rate)
         };
-        let result = if let Some(proof) = proof {
-            proof.invoke(submit)?
-        } else {
-            submit()
-        };
+        let result = proof.invoke(submit)?;
         if self.packets.is_failed() {
             self.fail();
         }

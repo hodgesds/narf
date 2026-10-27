@@ -10,7 +10,7 @@ use super::{
     security_runtime::{self, Security},
 };
 use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use zeroize::Zeroizing;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -40,6 +40,12 @@ enum Tx {
     Association,
     Eapol,
     Data,
+    Decline,
+}
+struct Captured {
+    frame: Mpdu,
+    admitted: bool,
+    epoch: u64,
 }
 struct Pending {
     kind: Tx,
@@ -66,8 +72,12 @@ pub struct Station<C: ControlIo, B: packet_transport::Io> {
     security: Option<Security>,
     failed: Arc<AtomicBool>,
     pending: Option<Pending>,
-    batch: Option<alloc::vec::IntoIter<Mpdu>>,
+    batch: VecDeque<Captured>,
     received: VecDeque<Vec<u8>>,
+    controls: VecDeque<Vec<u8>>,
+    delivered_reply: Option<usize>,
+    epoch: Arc<AtomicU64>,
+    retire: Option<Arc<dyn Fn() + Send + Sync>>,
     deadline: u64,
     last_now: u64,
     last_peer: u64,
@@ -98,7 +108,8 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             return Err(Error::Profile);
         }
         let own = radio.local().ok_or(Error::State)?;
-        let plan = Join::prepare(candidate, own, ssid, mode).map_err(Error::Management)?;
+        let plan = Join::prepare_with_phy(candidate, own, ssid, mode, radio.ht_local())
+            .map_err(Error::Management)?;
         if plan.wmm().is_some() {
             radio.qualify_wmm(permission).map_err(Error::Radio)?;
         }
@@ -112,8 +123,12 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             security: None,
             failed: Arc::new(AtomicBool::new(false)),
             pending: None,
-            batch: None,
+            batch: VecDeque::new(),
             received: VecDeque::new(),
+            controls: VecDeque::new(),
+            delivered_reply: None,
+            epoch: Arc::new(AtomicU64::new(1)),
+            retire: None,
             deadline: 0,
             last_now: 0,
             last_peer: 0,
@@ -130,7 +145,10 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         self.plan.candidate().bssid()
     }
     pub fn transmit_ready(&self) -> bool {
-        self.controlled_port_open() && self.pending.is_none()
+        self.controlled_port_open()
+            && self.pending.is_none()
+            && self.controls.is_empty()
+            && self.batch.is_empty()
     }
     pub fn phase(&self) -> Phase {
         if self.failed.load(Ordering::Acquire)
@@ -145,7 +163,35 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         self.phase() == Phase::Open
     }
     pub fn controlled_port_open(&self) -> bool {
-        self.carrier_up() && self.security.as_ref().is_none_or(Security::port_open)
+        self.carrier_up()
+            && self.delivered_reply.is_none()
+            && self.security.as_ref().is_none_or(Security::port_open)
+    }
+    pub(super) fn authority(&self) -> receive_runtime::Authority {
+        self.radio.authority()
+    }
+    pub(super) fn ht_enabled(&self) -> bool {
+        self.radio.ht_enabled()
+    }
+    pub(super) fn receive_epoch(&self) -> (Arc<AtomicU64>, u64) {
+        (self.epoch.clone(), self.epoch.load(Ordering::Acquire))
+    }
+    pub(super) fn set_retirement(&mut self, retire: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.retire = retire;
+    }
+    fn retire_receive(&mut self) {
+        self.received.clear();
+        self.controls.clear();
+        if self
+            .epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+            .is_err()
+        {
+            self.failed.store(true, Ordering::Release);
+        }
+        if let Some(retire) = &self.retire {
+            retire();
+        }
     }
     fn attempt(&self) -> Attempt {
         Attempt {
@@ -158,6 +204,8 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         self.received.clear();
     }
     fn fail(&mut self) {
+        self.retire_receive();
+        self.batch.clear();
         self.plan.cancel();
         self.failed.store(true, Ordering::Release);
         self.phase = Phase::Failed;
@@ -259,8 +307,11 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             return Ok(());
         }
         for _ in 0..16 {
-            let Some(frame) = self.batch.as_mut().and_then(Iterator::next) else {
+            let Some(captured) = self.batch.pop_front() else {
                 break;
+            };
+            let Some((frame, admitted)) = self.admit_capture(captured) else {
+                continue;
             };
             if let Ok(beacon) = Candidate::from_receive(
                 &frame,
@@ -304,7 +355,11 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                     Action::Associated { aid } => {
                         if let Some(p) = self.plan.wmm() {
                             self.radio
-                                .configure_wmm(p, self.plan.candidate().capability() & 0x400 != 0)
+                                .configure_wmm_phy(
+                                    p,
+                                    self.plan.candidate().capability() & 0x400 != 0,
+                                    self.plan.ht_selected(),
+                                )
                                 .await
                                 .map_err(Error::Radio)?;
                         }
@@ -341,7 +396,10 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             if !matches!(self.phase, Phase::FourWay | Phase::Open) {
                 continue;
             }
-            if self.data_frame(&frame, now, &mut *nonce)? {
+            if self.control_frame(&frame, admitted)? {
+                continue;
+            }
+            if self.data_frame(&frame, admitted, now, &mut *nonce)? {
                 return Ok(());
             }
         }
@@ -360,45 +418,173 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             return Err(Error::PeerLost);
         }
         if let Some(pending) = &self.pending {
-            let Some(delivered) = self.radio.poll_delivery().map_err(Error::Radio)? else {
-                if now >= pending.deadline {
-                    return Err(Error::Timeout);
+            if let Some(delivered) = self.radio.poll_delivery().map_err(Error::Radio)? {
+                if matches!(pending.kind, Tx::Eapol) {
+                    self.delivered_reply = Some(delivered.native_bytes);
                 }
-                return Ok(false);
+                self.pending = None;
+            } else if now >= pending.deadline {
+                return Err(Error::Timeout);
+            }
+        }
+        let mut idle = false;
+        for _ in 0..4 {
+            let Some(frames) = self.radio.poll().map_err(Error::Radio)? else {
+                idle = true;
+                break;
             };
-            if matches!(pending.kind, Tx::Eapol) {
+            let admitted = self.controlled_port_open();
+            let epoch = self.epoch.load(Ordering::Acquire);
+            for frame in frames {
+                if self.batch.len() == 256 {
+                    return Err(Error::State);
+                }
+                self.batch.push_back(Captured {
+                    frame,
+                    admitted,
+                    epoch,
+                });
+            }
+        }
+        if idle {
+            if let Some(bytes) = self.delivered_reply.take() {
                 self.security
                     .as_mut()
                     .ok_or(Error::State)?
-                    .reply_delivered(delivered.native_bytes)
+                    .reply_delivered(bytes)
                     .map_err(Error::Security)?;
-                if self.phase == Phase::FourWay && self.security.as_ref().unwrap().port_open() {
+                self.retire_receive();
+                if self.phase == Phase::FourWay
+                    && self.security.as_ref().is_some_and(Security::port_open)
+                {
                     self.phase = Phase::Open;
                     self.last_peer = now;
                 }
             }
-            self.pending = None;
         }
-        if self.batch.as_ref().is_none_or(|batch| batch.len() == 0) {
-            self.batch = self.radio.poll().map_err(Error::Radio)?.map(Vec::into_iter);
+        if self.pending.is_none() && self.delivered_reply.is_none() && self.controlled_port_open() {
+            if let Some(mut frame) = self.controls.pop_front() {
+                frame[22..24].copy_from_slice(&(self.sequence << 4).to_le_bytes());
+                self.sequence = (self.sequence + 1) & 4095;
+                self.radio.submit_management(&frame).map_err(Error::Radio)?;
+                self.pending = Some(Pending {
+                    kind: Tx::Decline,
+                    deadline: now.saturating_add(1000),
+                });
+            }
         }
+        Ok(self.pending.is_none() && self.delivered_reply.is_none())
+    }
+    fn admit_capture(&self, captured: Captured) -> Option<(Mpdu, bool)> {
+        let mut admitted = captured.admitted;
+        if captured.epoch != self.epoch.load(Ordering::Acquire) {
+            if !private_eapol(&captured.frame.bytes, self.radio.local()?, self.peer()) {
+                return None;
+            }
+            admitted = false;
+        }
+        Some((captured.frame, admitted))
+    }
+    fn control_frame(&mut self, frame: &Mpdu, admitted: bool) -> Result<bool, Error> {
+        self.radio.current_wmm().map_err(Error::Radio)?;
+        let b = &frame.bytes;
+        if b.first() != Some(&0xd0) {
+            return Ok(false);
+        }
+        if !admitted
+            || !self.controlled_port_open()
+            || !self.plan.ht_selected()
+            || !frame.admitted(false)
+            || b.len() != 33
+            || b[1] & 0xc7 != 0
+            || b[4..10] != self.radio.local().ok_or(Error::State)?
+            || b[10..16] != self.peer()
+            || b[16..22] != self.peer()
+            || b[22] & 15 != 0
+            || b[24..26] != [3, 0]
+        {
+            return Ok(true);
+        }
+        let p = u16::from_le_bytes([b[27], b[28]]);
+        if p & 2 == 0 || (p >> 2) & 15 >= 8 || p >> 6 == 0 || b[31] & 15 != 0 {
+            return Ok(true);
+        }
+        if self.controls.len() == 8 {
+            return Err(Error::State);
+        }
+        let mut response = vec![0xd0, 0, 0, 0];
+        response.extend_from_slice(&self.peer());
+        response.extend_from_slice(&self.radio.local().ok_or(Error::State)?);
+        response.extend_from_slice(&self.peer());
+        response.extend_from_slice(&[0, 0, 3, 1, b[26], 37, 0]);
+        response.extend_from_slice(&(p & !1).to_le_bytes());
+        response.extend_from_slice(&b[29..31]);
+        self.controls.push_back(response);
         Ok(true)
     }
     fn data_frame(
         &mut self,
         frame: &Mpdu,
+        admitted: bool,
         now: u64,
         nonce: impl FnMut() -> Option<[u8; 32]>,
     ) -> Result<bool, Error> {
+        self.radio.current_wmm().map_err(Error::Radio)?;
+        let authority = self.radio.authority();
+        if !frame.admitted(self.plan.ht_selected()) {
+            return Ok(false);
+        }
+        let b = &frame.bytes;
+        let own = self.radio.local().ok_or(Error::State)?;
+        let aggregate = b.first() == Some(&0x88) && b.get(24).is_some_and(|q| q & 0x80 != 0);
+        if aggregate {
+            if !admitted
+                || !self.controlled_port_open()
+                || !self.plan.ht_selected()
+                || self.received.len() + narf_wireless::amsdu::MAX_SUBFRAMES > 256
+            {
+                return Ok(false);
+            }
+            let frames = if let Some(security) = &mut self.security {
+                authority
+                    .invoke(|| security.receive_amsdu(frame))
+                    .map_err(Error::Radio)?
+                    .map_err(Error::Security)?
+            } else if b.len() >= 26
+                && b[1] & 0xc7 == 2
+                && b[4..10] == own
+                && b[10..16] == self.peer()
+                && b[16] & 1 == 0
+                && b[16..22] != [0; 6]
+                && b[22] & 15 == 0
+                && b[24] & 0x70 == 0
+                && b[25] == 0
+            {
+                narf_wireless::amsdu::decode(&b[26..], own, b[4..10].try_into().unwrap()).ok()
+            } else {
+                None
+            };
+            if let Some(frames) = frames {
+                self.received.extend(frames);
+                self.last_peer = now;
+            }
+            return Ok(false);
+        }
+        if !admitted && !private_eapol(b, own, self.peer()) {
+            return Ok(false);
+        }
         if let Some(security) = &mut self.security {
-            match security
-                .receive_with_nonce(frame, nonce)
+            match authority
+                .invoke(|| security.receive_with_nonce(frame, nonce))
+                .map_err(Error::Radio)?
                 .map_err(Error::Security)?
             {
                 security_runtime::Rx::Ignored => (),
                 security_runtime::Rx::ReplyReady => {
+                    let reply = security.pending_frame().ok_or(Error::State)?.to_vec();
+                    self.retire_receive();
                     self.radio
-                        .submit_native_data(security.pending_frame().ok_or(Error::State)?)
+                        .submit_native_data(&reply)
                         .map_err(Error::Radio)?;
                     self.pending = Some(Pending {
                         kind: Tx::Eapol,
@@ -408,6 +594,9 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                     return Ok(true);
                 }
                 security_runtime::Rx::Data(frame) => {
+                    if !admitted {
+                        return Ok(false);
+                    }
                     self.last_peer = now;
                     if let Some(ethernet) = ethernet(&frame) {
                         if self.received.len() < 32 {
@@ -453,8 +642,11 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             return Ok(());
         }
         for _ in 0..16 {
-            let Some(frame) = self.batch.as_mut().and_then(Iterator::next) else {
+            let Some(captured) = self.batch.pop_front() else {
                 break;
+            };
+            let Some((frame, admitted)) = self.admit_capture(captured) else {
+                continue;
             };
             if let Ok(beacon) = Candidate::from_receive(
                 &frame,
@@ -485,7 +677,10 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             {
                 return Err(Error::State);
             }
-            if self.data_frame(&frame, now, &mut *nonce)? {
+            if self.control_frame(&frame, admitted)? {
+                continue;
+            }
+            if self.data_frame(&frame, admitted, now, &mut *nonce)? {
                 return Ok(());
             }
         }
@@ -495,9 +690,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         let b = &frame.bytes;
         let own = self.radio.local()?;
         if frame.decrypted
-            || frame.ht
-            || frame.bandwidth40
-            || frame.rate > 11
+            || !frame.admitted(self.plan.ht_selected())
             || b.len() < 24
             || b[10..16] != self.plan.candidate().bssid()
             || b[4..10] != own && b[4] & 1 == 0
@@ -531,13 +724,15 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             return Err(Error::State);
         }
         self.phase = Phase::Stopping;
+        self.retire_receive();
         self.received.clear();
         self.pmk = None;
         if let Some(security) = &mut self.security {
             security.fail();
         }
         let mut attempt = self.attempt();
-        let result = async {
+        let proof = self.radio.authority();
+        let operation = async {
             // The media command reports local station state. It does not
             // reuse/cancel the independent native bulk receipt.
             self.radio
@@ -545,13 +740,13 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                 .await
                 .map_err(Error::Radio)?;
             self.radio.stop().await.map_err(Error::Radio)
-        }
-        .await;
+        };
+        let result = proof.fence(operation, Error::Radio).await;
         attempt.armed = false;
         match result {
             Ok(()) => {
                 self.pending = None;
-                self.batch = None;
+                self.batch.clear();
                 self.plan.cancel();
                 self.phase = Phase::Stopped;
                 Ok(())
@@ -569,7 +764,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             self.fail();
             return Err(Error::Radio(error));
         }
-        if !self.controlled_port_open() || self.pending.is_some() {
+        if !self.transmit_ready() {
             return Err(Error::State);
         }
         let native = if let Some(security) = &mut self.security {
@@ -623,6 +818,39 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         });
         Ok(())
     }
+}
+/// A complete private authenticator EAPOL-Key original may cross only the
+/// M2/terminal-reply receive epoch. It never inherits captured DATA admission.
+fn private_eapol(b: &[u8], own: [u8; 6], peer: [u8; 6]) -> bool {
+    if b.len() < 24
+        || !matches!(b[0], 8 | 0x88)
+        || b[1] & 0xc7 != 2
+        || b[22] & 15 != 0
+        || b[4..10] != own
+        || b[10..16] != peer
+        || b[16..22] != peer
+    {
+        return false;
+    }
+    let offset = if b[0] == 0x88 {
+        if b.get(24..26).is_none_or(|q| q[0] & 0xf0 != 0 || q[1] != 0) {
+            return false;
+        }
+        26
+    } else {
+        24
+    };
+    let Some(payload) = b.get(offset..) else {
+        return false;
+    };
+    if payload.len() < 12
+        || payload[..8] != [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]
+        || !(1..=3).contains(&payload[8])
+        || payload[9] != 3
+    {
+        return false;
+    }
+    usize::from(u16::from_be_bytes([payload[10], payload[11]])) + 12 == payload.len()
 }
 fn ethernet(frame: &[u8]) -> Option<Vec<u8>> {
     if frame.len() < 24

@@ -25,6 +25,7 @@ extern crate alloc;
 
 pub mod amd_fch;
 pub mod dw;
+pub mod dw_speed;
 pub mod gsb;
 pub mod i801;
 pub mod lpss;

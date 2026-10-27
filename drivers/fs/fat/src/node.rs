@@ -1200,6 +1200,10 @@ impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
         true
     }
 
+    fn dcache_case_insensitive(&self) -> bool {
+        true
+    }
+
     fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
         // FAT lookups are inherently async (sector reads). The
         // sync API is unsupported here — the VFS prefers

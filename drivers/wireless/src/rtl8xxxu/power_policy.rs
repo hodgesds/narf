@@ -95,7 +95,7 @@ fn le16(bytes: &[u8], at: usize) -> u16 {
 fn signed(bytes: &[u8], at: usize) -> i16 {
     i16::from_le_bytes([bytes[at], bytes[at + 1]])
 }
-fn factory_bytes(factory: Factory, vid: u16, pid: u16) -> [u8; 29] {
+pub(super) fn factory_bytes(factory: Factory, vid: u16, pid: u16) -> [u8; 29] {
     let mut bytes = [0; 29];
     bytes[..2].copy_from_slice(&vid.to_le_bytes());
     bytes[2..4].copy_from_slice(&pid.to_le_bytes());
@@ -114,6 +114,26 @@ fn factory_bytes(factory: Factory, vid: u16, pid: u16) -> [u8; 29] {
     bytes
 }
 impl Calibration {
+    pub(super) fn binding(&self) -> ([u8; 29], [u8; 32], i16) {
+        (
+            factory_bytes(self.factory, self.vid, self.pid),
+            self.digest,
+            self.antenna_qdbi,
+        )
+    }
+    pub(super) fn within(&self, p: Permission, ceiling: i16, antenna: i16) -> bool {
+        self.curves
+            .iter()
+            .find(|c| c.channel == p.channel)
+            .is_some_and(|c| {
+                [c.cck[usize::from(p.cck)], c.ofdm[usize::from(p.ofdm)]]
+                    .into_iter()
+                    .all(|peak| {
+                        peak != UNKNOWN
+                            && i32::from(peak) + i32::from(antenna) <= i32::from(ceiling)
+                    })
+            })
+    }
     pub(super) fn authority(&self) -> Option<Cap<FirmwareBlob, Read>> {
         self.authority
     }

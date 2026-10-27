@@ -63,6 +63,9 @@ impl Io for BootPort {
     }
 }
 impl Port for PacketIo<BootPort> {
+    fn publication(&self) -> Result<Publication, Error> {
+        self.with_io(|io| Ok(io.packet.publication()))?
+    }
     type Buffer = Block;
     fn authority<T>(
         &self,
@@ -81,13 +84,38 @@ impl Port for PacketIo<BootPort> {
         self.with_io(|io| Ok(io.packet.kick(bit)))?
     }
 }
+type HtFixtureSource = (
+    Arc<IrqSafeSpinLock<Vec<u8>>>,
+    narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+    super::super::super::super::super::firmware_transport::Identity,
+);
 struct DeviceEnvironment {
     admission: Arc<Admission>,
     base: Arc<Env>,
     packet: PacketPort,
     beacon: AtomicBool,
+    ht: Option<HtFixtureSource>,
 }
 impl Environment for DeviceEnvironment {
+    fn ht20(
+        &self,
+        base: Arc<super::super::super::super::super::channel_power::Calibration>,
+    ) -> Result<Option<Arc<super::super::super::super::super::ht::Grant>>, StationError> {
+        self.ht
+            .as_ref()
+            .map(|(b, cap, firmware)| {
+                super::super::super::super::super::ht::Grant::parse(
+                    base,
+                    *firmware,
+                    &b.lock(),
+                    Some([0x77; 32]),
+                    *cap,
+                )
+                .map(Arc::new)
+                .map_err(StationError::Radio)
+            })
+            .transpose()
+    }
     fn admission(&self) -> Option<&Arc<Admission>> {
         Some(&self.admission)
     }
@@ -106,7 +134,18 @@ impl Environment for DeviceEnvironment {
         let active = { self.packet.model.lock().master };
         if active && !self.beacon.swap(true, Ordering::AcqRel) {
             let peer = self.packet.model.lock().peer.clone().unwrap();
-            let beacon = { peer.lock().ap.beacon() };
+            let beacon = {
+                let p = peer.lock();
+                let mut b = p.ap.beacon();
+                if let Some(w) = &p.wmm {
+                    b.extend_from_slice(w);
+                }
+                if let Some(ht) = &p.ht {
+                    b[35] |= 4; // Source HT peer uses the standard short-slot capability.
+                    b.extend_from_slice(ht);
+                }
+                b
+            };
             self.packet.emit(&beacon).unwrap();
         }
         self.base.pause().await;
@@ -128,9 +167,21 @@ struct Harness {
     peer: Arc<IrqSafeSpinLock<Peer>>,
     env: Arc<Env>,
     firmware: Arc<Firmware<BootPort>>,
+    base_cap: Option<narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>>,
+    ht_source: Option<HtFixtureSource>,
 }
 impl Harness {
     fn new(protected: bool) -> Self {
+        Self::new_profile(protected, false)
+    }
+    fn new_profile(protected: bool, ht: bool) -> Self {
+        Self::with_policy(protected, ht, None)
+    }
+    fn with_policy(
+        protected: bool,
+        ht: bool,
+        policy: Option<Arc<narf_wireless::reg::db::Database>>,
+    ) -> Self {
         assert!(ACTIVE_TEST.lock().is_none());
         let packet = PacketPort::new();
         let factory = Arc::new(power::factory());
@@ -154,7 +205,21 @@ impl Harness {
         for (index, byte) in image[32..].iter_mut().enumerate() {
             *byte = (index % 251) as u8;
         }
-        complete(firmware.initialize(&image)).unwrap();
+        if ht {
+            static NEXT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+            let name: &'static str = Box::leak(
+                alloc::format!(
+                    "narf-test/rtlwifi/ht20-fw-{}.bin",
+                    NEXT.fetch_add(1, Ordering::AcqRel)
+                )
+                .into_boxed_str(),
+            ); // The registered fixture retains this name for the kernel lifetime.
+            let (write, read) = narf_firmware::bootstrap_authority();
+            crate::firmware_asset::tests::install(&write, name, &image, true).unwrap();
+            complete(firmware.initialize_registered_from(&read, name)).unwrap();
+        } else {
+            complete(firmware.initialize(&image)).unwrap();
+        }
         assert_eq!(firmware.status().stage, Stage::Ready);
         assert_eq!(pages.lock()[0], image[32..4128]);
         assert_eq!(pages.lock()[1], [image[4128..].to_vec(), vec![0]].concat());
@@ -163,15 +228,40 @@ impl Harness {
         let mut owner = Prepared::allocate(io, 4, |bytes| Ok(packet.allocate(bytes))).unwrap();
         complete(owner.prepare()).unwrap();
         complete(owner.configure_radio(radio::Profile::from_factory(&factory).unwrap())).unwrap();
-        let calibration = power::calibration(&factory);
+        let base_cap = ht.then(narf_capabilities::Cap::bootstrap);
+        let calibration = base_cap.map_or_else(
+            || power::calibration(&factory),
+            |cap| power::calibration_with_cap(&factory, cap),
+        );
+        let ht_source = ht.then(|| {
+            (
+                Arc::new(IrqSafeSpinLock::new(
+                    super::super::super::super::super::ht::tests::artifact(
+                        &calibration,
+                        firmware.identity().unwrap(),
+                    ),
+                )),
+                narf_capabilities::Cap::bootstrap(),
+                firmware.identity().unwrap(),
+            )
+        });
         let domain = power::domain(17);
         complete(owner.configure_channel(calibration.permission(&domain, 1).unwrap())).unwrap();
         owner.configure_mac(&factory).unwrap();
         owner
             .stage_station_calibration(calibration, &domain)
             .unwrap();
-        let env = Arc::new(Env::new());
+        let mut environment = Env::new();
+        environment.policy = policy;
+        let env = Arc::new(environment);
         let peer = Arc::new(IrqSafeSpinLock::new(Peer::new(protected)));
+        if ht {
+            let mut p = peer.lock();
+            p.wmm = Some(WMM.to_vec());
+            p.ht = Some(super::super::super::super::super::ht::tests::ap_elements(
+                255,
+            ));
+        }
         packet.model.lock().peer = Some(peer.clone());
         let name = narf_net::iface::reserve_name("ee-native%d");
         let device = Arc::new(Device::new(
@@ -183,6 +273,7 @@ impl Harness {
                 base: env.clone(),
                 packet: packet.clone(),
                 beacon: AtomicBool::new(false),
+                ht: ht_source.clone(),
             },
         ));
         device.admit_for_test();
@@ -198,6 +289,8 @@ impl Harness {
             peer,
             env,
             firmware,
+            base_cap,
+            ht_source,
         }
     }
     fn request(&self) -> AssociateRequest {
@@ -257,7 +350,9 @@ impl Harness {
     fn received(&self) -> Vec<Vec<u8>> {
         let mut bytes = Vec::new();
         let mut slot = self.device.rx_ring().lock();
-        let ring = slot.as_mut().unwrap();
+        let Some(ring) = slot.as_mut() else {
+            return bytes;
+        };
         while let Ok(Some(frame)) = ring.try_recv() {
             bytes.push(frame.payload().to_vec());
         }
@@ -270,6 +365,8 @@ impl Harness {
             .map_or(0, |iface| iface.rx_packets)
     }
 }
+#[path = "ht_composition_tests.rs"]
+mod ht_tests;
 impl Drop for Harness {
     fn drop(&mut self) {
         *ACTIVE_TEST.lock() = None;

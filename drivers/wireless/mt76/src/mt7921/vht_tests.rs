@@ -82,7 +82,7 @@ fn ht_rx2_basic(ies: &mut [u8], mandatory: bool) {
     let mut offset = 0;
     while offset < ies.len() {
         match ies[offset] {
-            45 => ies[offset + 6] = 255, // AP RX MCS8..15, independently of our TX1.
+            45 => ies[offset + 6] = 255, // AP RX MCS8..15; actual NIC facts bound our TX.
             61 => ies[offset + 9] = u8::from(mandatory), // HT Basic MCS8.
             _ => {}
         }
@@ -273,7 +273,7 @@ fn native() -> Result<(), &'static str> {
                 return Err("literal source16-byte STA_REC_VHT missing");
             };
             if record(peer, 0x15).is_none_or(|r| r[6] != 56)
-                || record(peer, 7).is_none_or(|r| r[9] != width)
+                || record(peer, 7).is_none_or(|r| r[9] != width | 16)
                 || !peer
                     .windows(12)
                     .any(|r| r == [3, 0, 12, 0, 0, 0, 1, 0, 0, 0, 0, 0])
@@ -290,7 +290,7 @@ fn native() -> Result<(), &'static str> {
                         p.center_channel(),
                         0,
                         width,
-                        1,
+                        2,
                         3,
                         1,
                         if width != 0 { 4 } else { 0 },
@@ -307,9 +307,9 @@ fn native() -> Result<(), &'static str> {
                 f.windows(14).filter(|ie| ie[..2] == [191, 12]).count() != 1
                     || !f
                         .windows(14)
-                        .any(|ie| ie == [191, 12, 48, 1, 0, 0, 250, 255, 0, 0, 254, 255, 0, 0])
+                        .any(|ie| ie == [191, 12, 48, 1, 0, 0, 250, 255, 0, 0, 250, 255, 0, 0])
             }) {
-                return Err("actual local1SS VHT request encoding");
+                return Err("actual local2SS VHT request encoding");
             }
             s.backend.packets.push_back(data(secure, width, 7, 1, 9));
             if s.receive_ethernet().ok().flatten().is_none() {
@@ -583,7 +583,7 @@ fn receive_nss() -> Result<(), &'static str> {
                 ht_rx2_basic(&mut b.information_elements, streams == 2);
                 ht_rx2_basic(s.backend.ht_reply.as_mut().unwrap(), streams == 2);
                 if join(&mut s, &b, p, secure) != Ok(42) {
-                    return Err("RX2/TX1 native association");
+                    return Err("actual native NSS association");
                 }
                 let rx = match (selected, streams) {
                     (0, 1) => 0xfffdu16,
@@ -591,19 +591,19 @@ fn receive_nss() -> Result<(), &'static str> {
                     (_, 1) => 0xfffe,
                     _ => 0xfffa,
                 };
-                let tx_map = if selected == 0 { 0xfffdu16 } else { 0xfffe };
+                let tx_map = rx;
                 let peer = s
                     .backend
                     .frames
                     .iter()
                     .find_map(|(_, f)| record(f, 10))
-                    .ok_or("RX2/TX1 peer")?;
+                    .ok_or("native directional NSS peer")?;
                 if peer[8..10] != tx_map.to_le_bytes()
                     || peer[10..12] != rx.to_le_bytes()
                     || s.vht_profile
-                        .is_none_or(|profile| profile.state() != selected)
+                        .is_none_or(|profile| profile.state() != selected | ((streams - 1) << 4))
                 {
-                    return Err("actual RX NSS promoted TX NSS or lost directional map");
+                    return Err("native NSS qualification or directional map lost");
                 }
                 let request = s
                     .backend
@@ -616,11 +616,9 @@ fn receive_nss() -> Result<(), &'static str> {
                     .windows(28)
                     .find(|ie| ie[..2] == [45, 26])
                     .ok_or("RX2 actual local HT companion")?;
-                if body[5] != 255
-                    || body[6] != if streams == 2 { 255 } else { 0 }
-                    || body[17] != if streams == 2 { 3 } else { 1 }
+                if body[5] != 255 || body[6] != if streams == 2 { 255 } else { 0 } || body[17] != 1
                 {
-                    return Err("HT RX0..15 / TX0..7 asymmetry not encoded");
+                    return Err("qualified HT RX/TX MCS set not encoded");
                 }
                 let mut pn = 9;
                 for width in 0..=selected {
@@ -650,7 +648,7 @@ fn receive_nss() -> Result<(), &'static str> {
                 if s.receive_ethernet().ok().flatten().is_none() {
                     return Err("native HT companion MCS0..15 receive bounds");
                 }
-                run(s.send_ethernet(&tx())).map_err(|_| "RX2 retained one-transmitter path")?;
+                run(s.send_ethernet(&tx())).map_err(|_| "qualified native NSS transmit path")?;
                 run(s.disassociate_station()).map_err(|_| "RX2 native teardown")?;
             }
         }
@@ -669,13 +667,12 @@ fn receive_nss() -> Result<(), &'static str> {
     }
     Ok(())
 }
-fn mt76_vht_actual_two_stream_receive_preserves_one_stream_transmit_and_ht_companion() -> TestResult
-{
+fn mt76_vht_actual_nic_streams_bound_directional_maps_and_ht_companion() -> TestResult {
     receive_nss().map_or_else(TestResult::Fail, |()| TestResult::Pass)
 }
 kernel_test_in!(
     "drivers/wireless/mt7921/vht",
-    mt76_vht_actual_two_stream_receive_preserves_one_stream_transmit_and_ht_companion
+    mt76_vht_actual_nic_streams_bound_directional_maps_and_ht_companion
 );
 
 fn invalid_receive_nss() -> Result<(), &'static str> {

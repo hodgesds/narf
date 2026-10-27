@@ -108,7 +108,12 @@ pub(super) fn peer_phy(
         at + 20,
         1 | if protected { 4 } else { 0 }
             | if qos { 2 } else { 0 }
-            | if ht.is_some() { 0x1000 } else { 0 },
+            | if ht.is_some() { 0x1000 } else { 0 }
+            | if ht.is_some_and(|h| h.secondary.is_some()) {
+                0x2000
+            } else {
+                0
+            },
     );
     wire::put(&mut out, at + 24, u32::from(capabilities));
     wire::put(&mut out, at + 28, 1); // Linux STA listen-interval workaround.
@@ -116,7 +121,11 @@ pub(super) fn peer_phy(
         wire::put(&mut out, at + 32, u32::from(ht.capabilities));
         wire::put(&mut out, at + 36, (1 << (13 + (ht.ampdu & 3))) - 1);
         wire::put(&mut out, at + 40, ht.density());
-        wire::put(&mut out, at + 44, 8 | if ht.short_gi { 4 } else { 0 });
+        wire::put(
+            &mut out,
+            at + 44,
+            8 | if ht.short_gi { 4 } else { 0 } | if ht.secondary.is_some() { 2 } else { 0 },
+        );
     }
     let mode = if let Some(ht) = ht {
         ht.mode(frequency)

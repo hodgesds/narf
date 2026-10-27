@@ -20,6 +20,44 @@ pub(crate) fn start() -> narf_init::InitResult {
     if pending.is_empty() {
         return narf_init::InitResult::NotPresent;
     }
+    // Legacy ICM gate (see `super::icm`): on firmware-CM hosts the
+    // fabric already has a connection manager, and starting ring 0
+    // would fight it for the routers. Classify every controller
+    // from its firmware status before any native-CM act — including
+    // the `_OSC` request below, which is not made at all when no
+    // controller is native. Standing down is a first-class
+    // outcome, logged and recorded per domain, not an error.
+    let mut native = Vec::new();
+    for (domain, pending) in pending.into_iter().enumerate() {
+        let verdict = super::icm::detect(&pending.cap, &pending.nhi);
+        super::icm::record(domain as u32, verdict);
+        match verdict.mode {
+            super::icm::CmMode::Native => native.push((domain, pending)),
+            super::icm::CmMode::FirmwareManaged => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "usb4: domain {domain} is firmware-managed (legacy ICM, FW_STS={:#010x}); \
+                     native CM standing down",
+                    verdict.fw_sts.unwrap_or(0),
+                );
+            }
+            mode => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "usb4: domain {domain} firmware state {mode:?} (FW_STS={:#010x}); \
+                     native CM standing down",
+                    verdict.fw_sts.unwrap_or(0),
+                );
+            }
+        }
+    }
+    if native.is_empty() {
+        let _ = writeln!(
+            narf_console::Writer,
+            "usb4: no natively managed controllers; native CM not started"
+        );
+        return narf_init::InitResult::NotPresent;
+    }
     let Some(control) = super::firmware::native_control() else {
         let _ = writeln!(
             narf_console::Writer,
@@ -55,7 +93,7 @@ pub(crate) fn start() -> narf_init::InitResult {
     // or a fault left path writes unrolled-back — an idle or stopped
     // CM never vetoes suspend (#1028).
     super::pm::register();
-    for (domain, pending) in pending.into_iter().enumerate() {
+    for (domain, pending) in native {
         narf_scheduler::spawn(async move {
             let Pending { device, cap, nhi } = pending;
             // SAFETY: probe owns this PCI function; platform granted native CM.

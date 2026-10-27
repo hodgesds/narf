@@ -301,6 +301,70 @@ pub struct RecordedPolicy { pub level: PolicyLevel, pub policy_epoch: u64 }
 pub enum PolicyLevel { Off, Passphrase, Token, TokenTpm, Tpm }
 ```
 
+```rust
+// suspend_service::hooks: the state-hook contract (design §5).
+// Hooks hand plaintext in and get plaintext back, inside the call;
+// no key material ever crosses this API — the service derives
+// per-hook keys from the SMK (image mode) / SMS (anchor mode)
+// with the hook's name as the HKDF info label.
+pub trait SuspendStateHook: Send + Sync {
+    fn name(&self) -> &str;                    // also the HKDF label
+    fn critical(&self) -> bool;                // default false
+    fn seal(&self, ctx: &mut SealCtx) -> Result<(), SealError>;
+    fn unseal(&self, ctx: &mut UnsealCtx) -> Result<(), SealError>;
+}
+impl SealCtx<'_> {
+    pub fn seal_image(&mut self, plaintext: &[u8]) -> Result<BlobRef, SealError>;
+    pub fn seal_anchor(&mut self, plaintext: &[u8]) -> Result<BlobRef, SealError>;
+}
+impl UnsealCtx {
+    pub fn take_image(&mut self) -> BlobOutcome;   // Restored | Missing | Invalid
+    pub fn take_anchor(&mut self) -> BlobOutcome;
+}
+
+pub fn register_suspend_state_hook(hook: Arc<dyn SuspendStateHook>);  // replace-by-name
+impl<E: KeyEntropy> SuspendService<E> {
+    pub fn seal_image_with_hooks(&mut self, store: &mut dyn ImageStore,
+        policy: RecordedPolicy, image: &[u8],
+        hooks: &[Arc<dyn SuspendStateHook>])
+        -> Result<([u8; 16], SealFanoutReport), ServiceError>;
+    pub fn seal_image_registered(&mut self, store: &mut dyn ImageStore,
+        policy: RecordedPolicy, image: &[u8])
+        -> Result<([u8; 16], SealFanoutReport), ServiceError>;
+}
+pub fn run_unseal_fanout(trusted: &TrustedImage, store: &dyn ImageStore,
+    sms: &Secret32, hooks: &[Arc<dyn SuspendStateHook>],
+    device_resumed: &dyn Fn(&str) -> bool)
+    -> Result<UnsealFanoutReport, UnsealFanoutError>;
+```
+
+**State-hook contract (design §5).** Drivers and core libraries
+whose state does not live in the bulk image (device-internal
+state, NVRAM/TPM-resident state, key custody that refuses to ride
+on the bulk key alone) register a `SuspendStateHook`. The seal
+fan-out runs in reverse registration order after device quiesce,
+inside `seal_image_with_hooks`; any seal error aborts the suspend
+(`ServiceError::HookSealAborted`) before the writer runs, so an
+aborted seal commits no image. State is capped at 64 KiB per hook
+per mode (`MAX_HOOK_STATE_LEN`). Hook blobs live in the image's
+hook region: a `u32` count, then per blob `u16 name_len ‖ name ‖
+u8 mode ‖ u32 sealed_len ‖ ciphertext ‖ tag`, each blob
+ChaCha20-Poly1305-sealed under its per-hook key with nonce
+`image_id[..12]` and AAD `image_id ‖ mode ‖ name` — a blob copied
+to another image, renamed, or re-moded fails verification. The
+unseal fan-out runs in forward order from a `TrustedImage`, after
+the device resume fan-out: **every blob is AEAD-opened into
+staging before any hook's `unseal` runs**, so a tampered blob for
+a `critical` hook aborts the fan-out before a single callback,
+and a tampered blob for a non-critical hook reaches it only as
+`BlobOutcome::Invalid` (no bytes — the hook must refuse and
+re-establish). A hook whose device did not resume (the
+coordinator's `device_resumed` predicate over the `device_pm`
+resume report) is skipped, not failed. Anchor-mode blobs are
+bound to the SMS epoch: after a rotation they no longer open and
+surface as `Invalid`, which anchor hooks treat as the
+re-establish signal (design §5.2 rule 2).
+
 **Key hierarchy (design §3.1).** A per-epoch *slot master secret*
 (SMS, 32B) is wrapped once per enrolled factor into a slot record;
 each image draws a fresh per-image key (SMK, 32B) wrapped under
@@ -321,8 +385,9 @@ exists. Sealing draws the same way for every policy, OFF included.
 partition, byte ranges via `ImageStore` (production: `BlockStore`
 over a registered partition device behind `narf-block`'s
 `BlockDeviceSync`): a 4 KiB header page, then the tag manifest
-(page-padded), the hook region (length 0 until the hook registry
-lands), then the image in 1 MiB AEAD chunks. The header page's
+(page-padded), the hook region (the state-hook registry's sealed
+blobs; length 0 for a hookless seal), then the image in 1 MiB
+AEAD chunks. The header page's
 *preamble* is plaintext claims — magic `NARFSUS1`, format version,
 image id, SMS epoch, recorded-policy level code, policy epoch,
 the epoch's slot records, the SMK wrap nonce and wrapped SMK, in
@@ -344,14 +409,14 @@ area (`SlotArea`, design §10.2) — the secret-free mirror the
 resume environment finds slots through; its codec is strict and
 total (caps before allocation, trailing garbage refused).
 
-**Seams, deliberately minimal.** The hook key derivations and the
-header's hook-region length are the state-hook registry's entry
-surface; `parse_claims` / `OpenedImage` are the resume
-environment's; `RecordedPolicy` is what the policy engine
-administers. Policy levels and floors, the hook registry, and the
-resume environment itself are separate lanes (design §12); this
-section specifies the service, the format, and the custody
-contract only.
+**Seams, deliberately minimal.** `parse_claims` / `OpenedImage`
+are the resume environment's entry surface (it also consumes
+`decode_hook_region` + `TrustedImage::read_hook_region` to stage
+hook blobs); `RecordedPolicy` is what the policy engine
+administers. Policy levels and floors and the resume environment
+itself are separate lanes (design §12); this section specifies
+the service, the format, the custody contract, and the state-hook
+contract.
 
 ### 3.4 Thermal
 

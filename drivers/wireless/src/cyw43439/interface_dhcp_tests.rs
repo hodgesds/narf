@@ -28,8 +28,12 @@ mod power_save_tests;
 mod ht40_tests;
 #[path = "ht_tests.rs"]
 mod ht_tests;
+#[path = "interface_lifetime_tests.rs"]
+mod lifetime_tests;
 #[path = "mfp_tests.rs"]
 mod mfp_tests;
+#[path = "optional_mfp_tests.rs"]
+mod optional_mfp_tests;
 
 const OWN: [u8; 6] = [2, 6, 7, 8, 9, 10];
 const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];
@@ -166,6 +170,7 @@ struct Harness {
     device: Arc<ModelDevice>,
     bus: Bus,
     name: String,
+    association_ies: Vec<u8>,
 }
 
 impl Harness {
@@ -243,6 +248,7 @@ impl Harness {
         let supplicant = station.supplicant;
         let mfp_supported = station.supports_management_protection();
         let ht_capabilities = station.ht_capabilities();
+        let vht_capabilities = station.vht_capabilities();
         let (rx, rx_consumer) = narf_ipc::channel();
         let (tx_producer, tx) = narf_ipc::channel();
         let name = narf_net::iface::register("wlan%d", OWN, send);
@@ -259,9 +265,14 @@ impl Harness {
             supplicant,
             mfp_supported,
             ht_capabilities,
+            vht_capabilities,
             up: AtomicBool::new(false),
             power_save: AtomicU8::new(0),
             bssid: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
+            closing: AtomicBool::new(false),
+            publication: IrqSafeSpinLock::new(()),
+            receive_hook: IrqSafeSpinLock::new(None),
             rx: IrqSafeSpinLock::new(Some(rx_consumer)),
             tx: IrqSafeSpinLock::new(Some(tx_producer)),
         });
@@ -271,13 +282,19 @@ impl Harness {
                                                       // stack initialization or registering another netfilter/timer hook.
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
         narf_net::iface::install_rx_drain(drain);
-        Ok(Self { device, bus, name })
+        Ok(Self {
+            device,
+            bus,
+            name,
+            association_ies: Vec::new(),
+        })
     }
 
     fn scan_and_associate(&self, secured: bool) -> Result<(), &'static str> {
         self.scan()?;
-        ready(self.device.associate(Self::request(secured)))?
-            .map_err(|_| "CYW composition association")?;
+        let mut request = Self::request(secured);
+        request.ie = self.association_ies.clone();
+        ready(self.device.associate(request))?.map_err(|_| "CYW composition association")?;
         if !self.device.link_up()
             || self.device.connected_bssid() != Some(AP)
             || narf_net::iface::lookup(&self.name)
@@ -566,13 +583,18 @@ fn disconnect_overrides_waiting_old_publisher() -> Result<(), &'static str> {
     {
         return Err("CYW disconnect did not close before waiting for state");
     }
-    // An earlier step()/associate() still owns state and publishes its peer.
+    // An earlier step()/associate() still owns state and attempts to publish
+    // its original peer. Host close must already suppress that stale grant,
+    // even before the native disconnect can acquire state and complete.
     if state.station.bssid != Some(AP) {
         return Err("CYW fixture lacks the previous authorized publisher");
     }
     h.device.link(state.station.bssid);
-    if !h.device.link_up() || h.device.connected_bssid() != Some(AP) {
-        return Err("CYW previous publisher did not recreate the interleaving");
+    if h.device.link_up()
+        || h.device.connected_bssid().is_some()
+        || h.device.enqueue(&probe).is_ok()
+    {
+        return Err("CYW previous publisher bypassed the pending host-close fence");
     }
     drop(state);
     ready(disconnect)?.map_err(|_| "CYW interleaved firmware disconnect")?;
@@ -582,7 +604,7 @@ fn disconnect_overrides_waiting_old_publisher() -> Result<(), &'static str> {
         || h.device.enqueue(&probe).is_ok()
         || narf_net::iface::send_on(&h.name, &probe).is_ok()
         || narf_net::iface::lookup(&h.name).is_none_or(|i| {
-            !i.link_up || i.carrier || i.carrier_up_count != 2 || i.carrier_down_count != 2
+            !i.link_up || i.carrier || i.carrier_up_count != 1 || i.carrier_down_count != 1
         })
         || !h.bus.ap.lock().uplink.is_empty()
     {

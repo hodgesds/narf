@@ -34,6 +34,15 @@ enumerated the WMI GUIDs. Registration is uniformly best-effort: on
 hardware that lacks a given device the initcall simply reports the
 device absent and the kernel continues.
 
+The vendor laptop drivers publish their state through two
+vendor-neutral userspace surfaces at the late stage: an rfkill
+registry (`/sys/class/rfkill/`) that turns the airplane-mode key
+and the HP rfkill2 firmware table into radio state, and a
+platform-profile registry (`/sys/firmware/acpi/platform_profile`)
+backed by whichever vendor driver — HP, IdeaPad, or ASUS — owns
+the machine's profile. A Think-LMI module implements Lenovo's
+BIOS-settings WMI protocol for ThinkPads.
+
 Much of the crate is inherently x86-specific. The embedded
 controller reaches its registers through x86 I/O ports, the Intel
 management-engine and chipset features only appear on Intel PCHs, and

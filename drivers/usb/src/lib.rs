@@ -18,6 +18,7 @@ pub mod cdc_acm;
 pub mod cdc_ncm;
 pub mod class_registry;
 pub mod control;
+pub mod ctap;
 pub mod device;
 pub mod dfu;
 pub mod ehci;
@@ -536,6 +537,7 @@ fn spawn_supervisor_task() {
                     | AttachOutcome::WbdiFingerprint
                     | AttachOutcome::Fingerprint
                     | AttachOutcome::CcidReader
+                    | AttachOutcome::CtapToken
                     | AttachOutcome::UsbClassDriver
                     | AttachOutcome::Hub => {
                         claimed_root |= bit;
@@ -652,6 +654,7 @@ fn spawn_supervisor_task() {
                         | AttachOutcome::WbdiFingerprint
                         | AttachOutcome::Fingerprint
                         | AttachOutcome::CcidReader
+                        | AttachOutcome::CtapToken
                         | AttachOutcome::UsbClassDriver
                         | AttachOutcome::Hub => {
                             new_bound_bits |= dpb;

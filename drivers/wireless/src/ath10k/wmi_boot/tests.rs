@@ -132,6 +132,7 @@ struct Model {
     expected: Vec<u8>,
     stall_init: bool,
     factory: u32,
+    ht: Option<u32>,
 }
 impl Model {
     fn new(dialect: Dialect) -> Self {
@@ -150,6 +151,7 @@ impl Model {
             expected: expected.to_vec(),
             stall_init: false,
             factory: 0x64,
+            ht: None,
         }
     }
 }
@@ -183,10 +185,18 @@ impl Hif for Model {
             if bytes == [0, 0, 8, 0, 0, 0, 0, 0, 2, 0, 0, 3, 8, 0, 0, 0] {
                 self.rx.push_back((1, header(0, &[3, 0, 0, 3, 0, 1, 0, 1])));
             } else if bytes == [0, 0, 8, 0, 0, 1, 0, 0, 2, 0, 0, 1, 0, 32, 0, 0] {
-                self.rx.push_back((
-                    2,
-                    header(2, &event_factory(self.dialect, false, self.factory)),
-                ));
+                let mut service = event_factory(self.dialect, false, self.factory);
+                if let Some(ht) = self.ht {
+                    // Literal SERVICE_READY WMI header + native fixed/TLV
+                    // event offsets; exercise the production parser.
+                    let at = match self.dialect {
+                        Dialect::Main | Dialect::TenFour => 4 + 88,
+                        Dialect::Tlv => 4 + 4 + 40,
+                        _ => 4 + 84,
+                    };
+                    u32at(&mut service, at, ht);
+                }
+                self.rx.push_back((2, header(2, &service)));
                 self.rx.push_back((1, header(0, &[3, 0, 0, 1, 0, 2, 0, 8])));
             } else if bytes != [0, 0, 12, 0, 0, 2, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] {
                 return Err(BmiError::BadResponse);

@@ -203,6 +203,15 @@ impl JoinPlan {
                     .map_err(|_| NativeError::UnsupportedFirmware)?
                 }
             }
+        } else if info.capabilities.phy.ht && wmm.is_some() && ap.ht_capability().is_some() {
+            ManagementPlan::prepare_with_phy(
+                bss,
+                own,
+                ssid,
+                mode,
+                super::vht::ht_fallback(info, permission.native_width() != 0)?,
+            )
+            .map_err(|_| NativeError::UnsupportedFirmware)?
         } else {
             ManagementPlan::prepare(bss, own, ssid, mode)
                 .map_err(|_| NativeError::UnsupportedFirmware)?
@@ -277,6 +286,12 @@ impl JoinPlan {
     }
     pub(crate) fn ht20(&self) -> Option<super::ht20::Profile> {
         self.ht20
+    }
+    pub(crate) fn transmit_streams(&self) -> u8 {
+        self.vht.map_or_else(
+            || self.ht20.map_or(1, super::ht20::Profile::transmit_streams),
+            super::vht::Profile::transmit_streams,
+        )
     }
     pub fn start_authentication(&mut self) -> Result<&[u8], Error> {
         self.common.start_authentication()
@@ -452,7 +467,7 @@ impl JoinPlan {
         if let Some(profile) = self.ht20.filter(|_| associated) {
             out[phy + 6] |= 1 << 4; // PHY_TYPE_BIT_HT, without VHT/HE.
             out[phy + 7] = profile.ampdu();
-            out[ra + 6] = profile.transmit_mcs();
+            out[ra + 6..ra + 16].copy_from_slice(&profile.transmit_mcs_mask());
             let ht = tlv(&mut out, 2, 12); // nested WTBL_HT.
             out[ht + 4] = 1;
             out[ht + 5] = u8::from(profile.transmit_ldpc());
@@ -804,8 +819,8 @@ impl TxPermission {
             .filter(overlaps)
             .map(|rule| rule.max_power_dbm)
             .min()?;
-        // Signed half-dBm table entries must be representable. This profile
-        // transmits on one chain, so no multi-stream EIRP addition is needed.
+        // The original single-path signed half-dBm ceiling must fit. Native
+        // two-path publication additionally reserves its headroom below.
         if !(-64..=63).contains(&power_dbm) {
             return None;
         }
@@ -857,6 +872,24 @@ impl TxPermission {
                 .fill(self.power_dbm.saturating_mul(2) as u8);
         }
         bytes
+    }
+    /// Additional conservative host headroom for the actual NIC's maximum
+    /// transmit-path count. mt76_tx_power_path_delta(2) is six half-dBm units.
+    /// Keep it across single-stream peers, rejoin and scan so an earlier native
+    /// two-path configuration can never observe a temporarily raised ceiling.
+    /// This is not a measured gain or a replacement for EFUSE/firmware CLC.
+    pub(crate) fn rate_limits_for_paths(self, paths: u8) -> Option<Vec<u8>> {
+        let delta = match paths {
+            1 => 0,
+            2 => 6,
+            _ => return None,
+        };
+        let limit = i8::try_from(i16::from(self.power_dbm) * 2 - delta).ok()?;
+        let mut bytes = self.rate_limits();
+        for row in bytes[44..].chunks_exact_mut(162) {
+            row[1..].fill(limit as u8);
+        }
+        Some(bytes)
     }
     pub(crate) fn secondary_channel(self) -> Option<u8> {
         self.secondary

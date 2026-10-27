@@ -84,6 +84,7 @@ pub struct Owner<I: Io> {
     channel: u8,
     failed: bool,
     pub(super) qos: bool,
+    pub(super) ht: bool,
     receive: Option<I::Receipt>,
     transmit: Option<Transmit<I::Receipt>>,
     scratch: Vec<u8>,
@@ -116,6 +117,7 @@ impl<I: Io> Owner<I> {
             channel,
             failed: false,
             qos: false,
+            ht: false,
             receive: None,
             transmit: None,
             scratch: alloc::vec![0;MAX_TRANSFER],
@@ -194,6 +196,9 @@ impl<I: Io> Owner<I> {
     }
     pub(super) fn submit_rate(&mut self, kind: Kind, frame: &[u8], rate: u8) -> Result<(), Error> {
         self.check()?;
+        if rate >= 12 && (!self.ht || kind != Kind::Data || frame.first() != Some(&0x88)) {
+            return Err(Error::Packet(packet_codec::Error::Header));
+        }
         if kind == Kind::Data && frame.first() == Some(&0x88) && !self.qos {
             return Err(Error::Packet(packet_codec::Error::Header));
         }

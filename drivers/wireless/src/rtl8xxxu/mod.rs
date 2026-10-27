@@ -42,6 +42,7 @@ pub mod device_init;
 pub mod efuse;
 pub mod firmware_transport;
 pub mod fw;
+mod ht_runtime;
 pub mod interface;
 pub mod intr;
 pub mod mac;
@@ -67,6 +68,7 @@ pub mod station_runtime;
 pub mod usb;
 mod wmm_runtime;
 
+pub use ht_runtime::Request as Ht20Request;
 pub use regs::{ChipFamily, RTL8XXXU_VENDOR};
 
 // ── MLME scaffold ───────────────────────────────────────────────────

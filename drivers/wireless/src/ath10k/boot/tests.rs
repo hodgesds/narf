@@ -208,7 +208,11 @@ kernel_test_in!(
 fn smoke_ath10k_revoked_cap_blocks_mmio_and_dma_publication() -> TestResult {
     let cap = Cap::<BusDeviceCap, Write>::bootstrap();
     let (mut resources, io) = rig(false);
-    let mut mmio = Mmio { cap, io };
+    let mut mmio = Mmio {
+        cap,
+        io,
+        sources: None,
+    };
     let mut poisoned = false;
     let mut response = [0; 4];
     if once(resources.bmi_exchange(&mut mmio, &mut poisoned, &[8, 0, 0, 0], &mut response))
@@ -253,6 +257,54 @@ fn smoke_ath10k_revoked_cap_blocks_mmio_and_dma_publication() -> TestResult {
     }
     TestResult::Pass
 }
+
+#[cfg(feature = "kernel-test")]
+fn smoke_ath10k_revoked_executable_or_board_blocks_real_bmi_mmio_and_pins_pending_dma() -> TestResult
+{
+    for index in 0..2 {
+        let (source, caps) = match crate::ath10k::firmware_source::fixture() {
+            Ok(v) => v,
+            Err(e) => return TestResult::Fail(e),
+        };
+        let (mut resources, io) = rig(false);
+        let mut mmio = Mmio {
+            cap: Cap::<BusDeviceCap, Write>::bootstrap(),
+            io,
+            sources: Some(source),
+        };
+        let mut poisoned = false;
+        let mut response = [0; 4];
+        if once(resources.bmi_exchange(&mut mmio, &mut poisoned, &[8, 0, 0, 0], &mut response))
+            != Poll::Pending
+        {
+            return TestResult::Fail("signed source fixture did not publish actual BMI DMA");
+        }
+        let bytes = resources.request.bytes.clone();
+        let reads = mmio.io.reads;
+        let writes = mmio.io.writes.len();
+        caps[index].revoke();
+        mmio.write32(0x34400, 0xdeadbeef);
+        if mmio.authorized()
+            || mmio.read32(0x34400) != u32::MAX
+            || once(resources.bmi_exchange(&mut mmio, &mut poisoned, &[1, 2, 3, 4], &mut response))
+                != Poll::Ready(Err(BmiError::Pci))
+            || resources.request.bytes != bytes
+            || !poisoned
+            || mmio.io.reads != reads
+            || mmio.io.writes.len() != writes
+        {
+            return TestResult::Fail(
+                "revoked native source touched registers/reused pending BMI owner",
+            );
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "drivers/wireless/ath10k/source",
+    smoke_ath10k_revoked_executable_or_board_blocks_real_bmi_mmio_and_pins_pending_dma
+);
 kernel_test_in!(
     "drivers/wireless/ath10k/boot",
     smoke_ath10k_revoked_cap_blocks_mmio_and_dma_publication

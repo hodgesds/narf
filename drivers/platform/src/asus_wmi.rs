@@ -196,8 +196,11 @@ pub fn asus_keycode(code: u32) -> Option<KeyCode> {
         0x30 => Some(KeyCode::VolumeUp),
         0x31 => Some(KeyCode::VolumeDown),
         0x32 => Some(KeyCode::Mute),
-        // 0x33: mic-mute (KEY_F20 on Linux)
-        0x33 => Some(KeyCode::Mute),
+        // 0x33: mic-mute. Linux maps this to KEY_F20, which
+        // userspace binds to mic-mute; NARF has no F20 key, so the
+        // distinct KEY_MICMUTE is the faithful code (previously
+        // conflated with speaker mute).
+        0x33 => Some(KeyCode::MicMute),
         0x34 => Some(KeyCode::BrightnessUp),
         0x35 => Some(KeyCode::BrightnessDown),
         // 0x36: display toggle
@@ -236,6 +239,12 @@ fn on_asus_event(ev: &narf_aml::wmi::WmiEvent) {
         _ => return,
     };
 
+    if code == 0x5c {
+        // Airplane-mode key: in addition to the keycode, drive the
+        // rfkill core so the key changes actual radio state.
+        crate::rfkill::toggle_all();
+    }
+
     if let Some(kc) = asus_keycode(code) {
         let _ = push_key(kc, true);
         let _ = push_key(kc, false);
@@ -243,6 +252,46 @@ fn on_asus_event(ev: &narf_aml::wmi::WmiEvent) {
 }
 
 // ── Init ──────────────────────────────────────────────────────────────
+
+/// Radio switch for the rfkill core: WLAN via `DEVID_WLAN`,
+/// Bluetooth via `DEVID_BLUETOOTH`. ASUS WMI has no hard-block
+/// read for these DEVIDs in `asus-wmi.c`'s rfkill poll, so state
+/// starts unblocked and tracks software writes.
+/// Reference: `asus-wmi.c::asus_wmi_rfkill_ops` / set_devstate.
+fn rfkill_set_wlan(blocked: bool) -> bool {
+    set_devstate(DEVID_WLAN, if blocked { 0 } else { 1 });
+    true
+}
+
+fn rfkill_set_bluetooth(blocked: bool) -> bool {
+    set_devstate(DEVID_BLUETOOTH, if blocked { 0 } else { 1 });
+    true
+}
+
+fn profile_get() -> Option<crate::platform_profile::PlatformProfile> {
+    use crate::platform_profile::PlatformProfile as P;
+    // DEVID_THERMAL_CTRL is write-only in asus-wmi.c (no get
+    // devstate is ever issued for the throttle policy), so the
+    // get returns the last-set policy, as documented for
+    // write-only backends in `crate::platform_profile`.
+    Some(match throttle_policy() {
+        ThrottlePolicy::Quiet => P::Quiet,
+        ThrottlePolicy::Balanced => P::Balanced,
+        ThrottlePolicy::Turbo => P::Performance,
+    })
+}
+
+fn profile_set(p: crate::platform_profile::PlatformProfile) -> bool {
+    use crate::platform_profile::PlatformProfile as P;
+    let policy = match p {
+        P::Quiet => ThrottlePolicy::Quiet,
+        P::Balanced => ThrottlePolicy::Balanced,
+        P::Performance => ThrottlePolicy::Turbo,
+        _ => return false,
+    };
+    set_throttle_policy(policy);
+    true
+}
 
 /// Initialise the ASUS WMI platform driver.
 /// Reference: `asus-wmi.c::asus_wmi_probe()` — registers the WMI
@@ -254,6 +303,29 @@ pub fn init() {
         for g in &guids {
             if g.guid == gb {
                 narf_aml::wmi::subscribe_event(g, on_asus_event);
+                // The GUID's presence is the probe: register the
+                // rfkill radios and the throttle-policy profile
+                // backend (asus-wmi.c registers both from probe).
+                crate::rfkill::register_radio(
+                    "asus-wlan",
+                    crate::rfkill::RadioType::Wlan,
+                    Some(rfkill_set_wlan),
+                );
+                crate::rfkill::register_radio(
+                    "asus-bluetooth",
+                    crate::rfkill::RadioType::Bluetooth,
+                    Some(rfkill_set_bluetooth),
+                );
+                use crate::platform_profile::PlatformProfile as P;
+                const CHOICES: &[P] = &[P::Quiet, P::Balanced, P::Performance];
+                crate::platform_profile::register_backend(
+                    crate::platform_profile::ProfileBackend {
+                        name: "asus-wmi",
+                        choices: CHOICES,
+                        get: profile_get,
+                        set: profile_set,
+                    },
+                );
             }
         }
     }

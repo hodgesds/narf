@@ -2,6 +2,9 @@
 use super::{firmware_transport::Io, prepare::Error};
 use narf_wireless::wmm::Parameters;
 pub(super) fn admit(p: Parameters, short: bool) -> Result<[u32; 4], Error> {
+    admit_profile(p, short, false)
+}
+fn admit_profile(p: Parameters, short: bool, ht: bool) -> Result<[u32; 4], Error> {
     if p.ac[0].admission_control
         || p.ac.iter().any(|a| {
             a.ecw_min == 0
@@ -10,6 +13,7 @@ pub(super) fn admit(p: Parameters, short: bool) -> Result<[u32; 4], Error> {
                 || a.ecw_min > a.ecw_max
                 || a.aifsn < 2
                 || a.aifsn > 15
+                || a.txop > 0x7ff
         })
     {
         return Err(Error::Packet);
@@ -27,7 +31,9 @@ pub(super) fn admit(p: Parameters, short: bool) -> Result<[u32; 4], Error> {
             a.ecw_max
         };
         let aifsn = if index == 0 { a.aifsn.max(3) } else { a.aifsn };
-        let aifs = u32::from(aifsn) * if short { 9 } else { 20 } + 10;
+        // base.c::rtl_get_hal_edca_param(N_24G) uses16/9 even though
+        // the chip's separate HW_VAR_SIFS response registers use14us.
+        let aifs = u32::from(aifsn) * if ht || short { 9 } else { 20 } + if ht { 16 } else { 10 };
         if aifs > 255 {
             return Err(Error::Packet);
         }
@@ -37,7 +43,13 @@ pub(super) fn admit(p: Parameters, short: bool) -> Result<[u32; 4], Error> {
     Ok(words)
 }
 pub(super) fn program(io: &impl Io, p: Parameters, short: bool) -> Result<(), Error> {
-    let words = admit(p, short)?; // Reject every row before the first write.
+    program_profile(io, p, short, false)
+}
+pub(super) fn program_ht(io: &impl Io, p: Parameters) -> Result<(), Error> {
+    program_profile(io, p, true, true)
+}
+fn program_profile(io: &impl Io, p: Parameters, short: bool, ht: bool) -> Result<(), Error> {
+    let words = admit_profile(p, short, ht)?; // Reject every row before the first write.
     for (reg, value) in [0x508, 0x50c, 0x504, 0x500].into_iter().zip(words) {
         io.write32(reg, value)?;
         if io.read32(reg)? != value {

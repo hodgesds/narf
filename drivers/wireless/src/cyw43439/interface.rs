@@ -29,6 +29,19 @@ struct PendingTx {
     frame: Frame,
     deadline: narf_time::Deadline,
 }
+struct Received {
+    epoch: u64,
+    peer: [u8; 6],
+    bytes: Vec<u8>,
+}
+#[cfg(any(test, feature = "kernel-test"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReceivePoint {
+    AfterFrameAllocation,
+    BeforeCallback,
+}
+#[cfg(any(test, feature = "kernel-test"))]
+type ReceiveHook = Arc<dyn Fn(ReceivePoint) + Send + Sync>;
 impl<R: Fullmac> State<R> {
     fn clear_transmit(&mut self) {
         self.pending = None;
@@ -91,11 +104,17 @@ pub struct Device<R: Fullmac> {
     supplicant: bool,
     mfp_supported: bool,
     ht_capabilities: [Option<[u8; 26]>; 2],
+    vht_capabilities: [Option<[u8; 12]>; 2],
     up: AtomicBool,
     // Requested PS policy: 0=awake, 1=PM_FAST, 2=terminal failure. The
     // retained worker serializes firmware commands with scan/join/packets.
     power_save: AtomicU8,
     bssid: AtomicU64,
+    epoch: AtomicU64,
+    closing: AtomicBool,
+    publication: IrqSafeSpinLock<()>,
+    #[cfg(any(test, feature = "kernel-test"))]
+    receive_hook: IrqSafeSpinLock<Option<ReceiveHook>>,
     rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
@@ -167,6 +186,7 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
         supplicant: station.supplicant,
         mfp_supported: station.supports_management_protection(),
         ht_capabilities: station.ht_capabilities(),
+        vht_capabilities: station.vht_capabilities(),
         state: Mutex::new(State {
             station,
             rx: rx_producer,
@@ -176,6 +196,11 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
         up: AtomicBool::new(false),
         power_save: AtomicU8::new(0),
         bssid: AtomicU64::new(0),
+        epoch: AtomicU64::new(0),
+        closing: AtomicBool::new(false),
+        publication: IrqSafeSpinLock::new(()),
+        #[cfg(any(test, feature = "kernel-test"))]
+        receive_hook: IrqSafeSpinLock::new(None),
         rx: IrqSafeSpinLock::new(Some(rx_consumer)),
         tx: IrqSafeSpinLock::new(Some(tx_producer)),
     });
@@ -218,33 +243,96 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
 
 impl<R: Fullmac + 'static> Device<R> {
     fn link(&self, peer: Option<[u8; 6]>) {
+        let _publication = self.publication.lock();
+        self.publish_link(peer);
+    }
+    fn clear_rx(&self) {
+        if let Some(rx) = self.rx.lock().as_mut() {
+            for _ in 0..RX_RING_N {
+                if !matches!(rx.try_recv(), Ok(Some(_))) {
+                    break;
+                }
+            }
+        }
+    }
+    fn advance_epoch(&self) -> bool {
+        self.epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |e| e.checked_add(1))
+            .is_ok()
+    }
+    fn close_host(&self) -> u64 {
+        let _publication = self.publication.lock();
+        self.closing.store(true, Ordering::Release);
+        self.advance_epoch();
+        self.publish_link(None);
+        self.clear_rx();
+        self.epoch.load(Ordering::Acquire)
+    }
+    fn publish_link(&self, peer: Option<[u8; 6]>) {
+        let peer = peer.filter(|_| {
+            !self.closing.load(Ordering::Acquire) && self.epoch.load(Ordering::Acquire) != u64::MAX
+        });
         let mut packed = [0; 8];
         if let Some(peer) = peer {
             packed[..6].copy_from_slice(&peer);
             packed[7] = 1;
         }
-        self.bssid
-            .store(u64::from_le_bytes(packed), Ordering::Release);
-        let up = peer.is_some();
+        if self
+            .bssid
+            .swap(u64::from_le_bytes(packed), Ordering::AcqRel)
+            != u64::from_le_bytes(packed)
+            && !self.advance_epoch()
+        {
+            self.closing.store(true, Ordering::Release);
+            self.bssid.store(0, Ordering::Release);
+        }
+        let up = peer.is_some() && !self.closing.load(Ordering::Acquire);
         let was_up = self.up.swap(up, Ordering::AcqRel);
         // Physical carrier preserves operator-controlled IFF_UP and never
         // invokes an administrative open/stop hook under retained locks.
         narf_net::iface::set_link_metadata(&self.name, up, None, None);
         if was_up && !up {
+            self.clear_rx();
             narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
         }
     }
 
-    fn step(&self) -> Vec<Vec<u8>> {
+    fn step(&self) -> Vec<Received> {
         let Some(mut state) = self.state.try_lock() else {
             return Vec::new();
         };
-        if state.progress().is_err() {
+        if self.closing.load(Ordering::Acquire) {
+            if state.station.poll().is_err() {
+                self.power_save.store(2, Ordering::Release);
+            }
+            state.clear_transmit();
+            for _ in 0..32 {
+                if state.station.runtime.pop_data().is_none() {
+                    break;
+                }
+            }
+            self.link(None);
+            return Vec::new();
+        }
+        let result = {
+            let _publication = self.publication.lock();
+            if self.closing.load(Ordering::Acquire) {
+                state.clear_transmit();
+                state.station.poll()
+            } else {
+                state.progress()
+            }
+        };
+        if result.is_err() {
             self.power_save.store(2, Ordering::Release);
             self.link(None);
             return Vec::new();
         }
         self.link(state.station.bssid);
+        let Some(peer) = state.station.bssid else {
+            return Vec::new();
+        };
+        let epoch = self.epoch.load(Ordering::Acquire);
         let mut output = Vec::new();
         for _ in 0..32 {
             if state.station.check_connection_policy().is_err() {
@@ -259,16 +347,81 @@ impl<R: Fullmac + 'static> Device<R> {
             if !self.up.load(Ordering::Acquire) || !receive_admitted(&bytes, self.mac) {
                 continue;
             }
-            if let Ok(buffer) =
-                narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
-            {
-                let mut frame = Frame::new(buffer, bytes.len() as u32);
-                frame.payload_mut().copy_from_slice(&bytes);
-                let _ = state.rx.try_send(frame);
-            }
-            output.push(bytes);
+            output.push(Received { epoch, peer, bytes });
         }
         output
+    }
+    fn current_receive(&self, state: &mut State<R>, received: &Received) -> bool {
+        if self.closing.load(Ordering::Acquire)
+            || !self.up.load(Ordering::Acquire)
+            || self.epoch.load(Ordering::Acquire) != received.epoch
+            || state.station.bssid != Some(received.peer)
+        {
+            return false;
+        }
+        // Reinvoke the retained native source/bus owner and consume current
+        // bounded link/key events after allocation and again before callback.
+        // A cached policy/peer alone cannot authorize a later publication.
+        if state.station.poll().is_err()
+            || state.station.bssid != Some(received.peer)
+            || state.station.check_connection_policy().is_err()
+            || state.station.channel_width_mhz().is_none()
+        {
+            state.clear_transmit();
+            self.power_save.store(2, Ordering::Release);
+            self.publish_link(None);
+            return false;
+        }
+        true
+    }
+    fn publish_received(&self, received: &Received) -> bool {
+        let frame = narf_io::alloc_coherent(received.bytes.len(), narf_lib::id::DomainId::DRIVER_0)
+            .ok()
+            .map(|buffer| {
+                let mut frame = Frame::new(buffer, received.bytes.len() as u32);
+                frame.payload_mut().copy_from_slice(&received.bytes);
+                frame
+            });
+        #[cfg(any(test, feature = "kernel-test"))]
+        self.receive_hook(ReceivePoint::AfterFrameAllocation);
+        {
+            let Some(mut state) = self.state.try_lock() else {
+                return false;
+            };
+            let _publication = self.publication.lock();
+            if !self.current_receive(&mut state, received) {
+                return false;
+            }
+            if let Some(frame) = frame {
+                let _ = state.rx.try_send(frame);
+            }
+        }
+        #[cfg(any(test, feature = "kernel-test"))]
+        self.receive_hook(ReceivePoint::BeforeCallback);
+        let Some(mut state) = self.state.try_lock() else {
+            return false;
+        };
+        let _publication = self.publication.lock();
+        self.current_receive(&mut state, received)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    fn receive_hook(&self, point: ReceivePoint) {
+        let hook = self.receive_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook(point);
+        }
+    }
+    fn deliver_received(&self, frames: Vec<Received>) -> bool {
+        let mut progress = false;
+        for mut frame in frames {
+            if !self.publish_received(&frame) {
+                break;
+            }
+            // No state/publication/ring guard survives the final admission.
+            narf_net::iface::on_rx_frame_from(&self.name, &mut frame.bytes);
+            progress = true;
+        }
+        progress
     }
 
     async fn apply_power_save(&self) {
@@ -301,9 +454,7 @@ impl<R: Fullmac + 'static> Device<R> {
 
     async fn receive_worker(self: Arc<Self>) {
         loop {
-            for mut frame in self.step() {
-                narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
-            }
+            self.deliver_received(self.step());
             self.apply_power_save().await;
             narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
         }
@@ -314,10 +465,18 @@ impl<R: Fullmac + 'static> Endpoint for Device<R> {
         if !self.up.load(Ordering::Acquire) || !transmit_admitted(bytes, self.mac) {
             return Err(());
         }
+        let epoch = self.epoch.load(Ordering::Acquire);
         let buffer = narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
             .map_err(|_| ())?;
         let mut frame = Frame::new(buffer, bytes.len() as u32);
         frame.payload_mut().copy_from_slice(bytes);
+        let _publication = self.publication.lock();
+        if self.closing.load(Ordering::Acquire)
+            || !self.up.load(Ordering::Acquire)
+            || self.epoch.load(Ordering::Acquire) != epoch
+        {
+            return Err(());
+        }
         self.tx
             .lock()
             .as_mut()
@@ -326,12 +485,7 @@ impl<R: Fullmac + 'static> Endpoint for Device<R> {
             .map_err(|_| ())
     }
     fn drain(&self) -> bool {
-        let frames = self.step();
-        let progress = !frames.is_empty();
-        for mut frame in frames {
-            narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
-        }
-        progress
+        self.deliver_received(self.step())
     }
 }
 fn send_sdio(bytes: &[u8], _: narf_net::TxMeta) -> Result<(), ()> {
@@ -383,7 +537,7 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
         }
         Some(narf_wireless::iface::PhyCapabilities {
             ht: self.ht_capabilities[usize::from(band == 5000)]?,
-            vht: None,
+            vht: self.vht_capabilities[usize::from(band == 5000)],
         })
     }
     fn cipher_suites(&self) -> &'static [u32] {
@@ -424,6 +578,9 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
     fn supports_wpa2_mfp_offload(&self) -> bool {
         self.mfp_supported
     }
+    fn supports_optional_mfp(&self) -> bool {
+        self.mfp_supported
+    }
     fn reports_disconnect_events(&self) -> bool {
         true
     }
@@ -461,7 +618,7 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
                 ht_supported: self.ht_capabilities.iter().any(Option::is_some),
-                vht_supported: false,
+                vht_supported: self.vht_capabilities.iter().any(Option::is_some),
                 he_supported: false,
                 eht_supported: false,
             },
@@ -478,16 +635,40 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
     }
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
         let mut state = self.state.lock().await;
+        if state.station.bssid.is_some() {
+            return Err(WirelessError::Busy);
+        }
+        let ticket = self.close_host();
+        state.clear_transmit();
+        if ticket == u64::MAX {
+            return Err(WirelessError::HardwareError);
+        }
         let result = state.station.associate(request).await;
-        self.link(state.station.bssid);
+        {
+            let _publication = self.publication.lock();
+            if self.epoch.load(Ordering::Acquire) != ticket {
+                state.station.runtime.fail();
+                state.station.bssid = None;
+                self.publish_link(None);
+                return Err(WirelessError::Denied);
+            }
+            if result.is_ok() {
+                if let Err(error) = state.station.check_connection_policy() {
+                    self.publish_link(None);
+                    return Err(wireless_error(error));
+                }
+                self.closing.store(false, Ordering::Release);
+            }
+            self.publish_link(state.station.bssid);
+        }
         result.map_err(wireless_error)
     }
     async fn disassociate(&self) -> Result<(), WirelessError> {
-        self.link(None);
+        self.close_host();
         let mut state = self.state.lock().await;
         // Close again under the same lock as association/progress publication:
         // an earlier owner may have published up while disconnect waited.
-        self.link(None);
+        self.close_host();
         state.clear_transmit();
         state.station.disconnect().await.map_err(wireless_error)
     }
@@ -749,3 +930,7 @@ mod dhcp_composition_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "../brcmfmac/station_dhcp_tests.rs"]
 mod pcie_dhcp_composition_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "optional_mfp_common.rs"]
+mod optional_mfp_common;

@@ -532,6 +532,13 @@ impl<B: Backend> Session<B> {
         }) {
             return Err(Error::InvalidIdentity);
         }
+        if let Some(active) = &active {
+            for (_, permission) in &active.permissions {
+                permission
+                    .rate_limits_for_paths(info.capabilities.phy.spatial_streams)
+                    .ok_or(Error::Bounds)?;
+            }
+        }
         if let Some(random) = options.random_mac {
             self.backend.check()?;
             let mut address = [0; 6];
@@ -560,7 +567,9 @@ impl<B: Backend> Session<B> {
                 }
                 for (index, (_, permission)) in active.permissions.iter().enumerate() {
                     active.current(&policy()?, channels)?;
-                    let mut limits = permission.rate_limits();
+                    let mut limits = permission
+                        .rate_limits_for_paths(info.capabilities.phy.spatial_streams)
+                        .ok_or(Error::Bounds)?;
                     limits[6] = u8::from(index + 1 == active.permissions.len());
                     self.notify(
                         Command::Ce {

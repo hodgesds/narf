@@ -577,21 +577,17 @@ fn crypto_suites(attrs: &[(u16, &[u8])], suites: &[u32], cipher_limit: usize) ->
 /// The information elements wpa_supplicant puts in a WPA2-PSK CONNECT's
 /// NL80211_ATTR_IE: the RSN element it will advertise plus extended
 /// capabilities, RSNXE and vendor elements. The offloading driver builds
-/// its own RSN element (CCMP, PSK, optionally required PMF), so the requested
+/// its own RSN element (CCMP, PSK, explicitly optional/required PMF), so the requested
 /// RSN element must describe that admitted suite. Required PMF needs an
 /// explicit complete RSNE; it is never inferred from a cipher advertisement.
-fn psk_association_ies(ie: &[u8], required_mfp: bool) -> Result<(), i32> {
+fn psk_association_ies(ie: &[u8], mfp: u32) -> Result<(), i32> {
     if ie.len() > 2048 {
         return Err(EINVAL);
     }
     let ies = elements(ie)?;
     let mut rsn = ies.iter().filter(|(id, _)| *id == 48);
     let Some((_, body)) = rsn.next() else {
-        return if required_mfp {
-            Err(EOPNOTSUPP)
-        } else {
-            Ok(())
-        };
+        return if mfp != 0 { Err(EOPNOTSUPP) } else { Ok(()) };
     };
     if rsn.next().is_some() {
         return Err(EOPNOTSUPP);
@@ -601,15 +597,23 @@ fn psk_association_ies(ie: &[u8], required_mfp: bool) -> Result<(), i32> {
     if rsn.group_cipher != ccmp
         || rsn.pairwise_ciphers != [ccmp]
         || rsn.akms != [crate::rsn::Suite::standard(crate::rsn::AKM_PSK)]
-        || !required_mfp && rsn.rsn_capabilities & crate::rsn::RSN_CAP_MFP_REQUIRED != 0
+        || mfp == 0
+            && rsn.rsn_capabilities
+                & (crate::rsn::RSN_CAP_MFP_REQUIRED | crate::rsn::RSN_CAP_MFP_CAPABLE)
+                != 0
     {
         return Err(EOPNOTSUPP);
     }
     // Exactly one pairwise/AKM above leaves a twenty-byte fixed prefix.
     // A default BIP suite may omit the PMKID-count/suite tail, or include
     // its zero count alone. No partial or trailing RSN fields are valid.
-    let mfp_bits = crate::rsn::RSN_CAP_MFP_REQUIRED | crate::rsn::RSN_CAP_MFP_CAPABLE;
-    if required_mfp
+    let mfp_bits = crate::rsn::RSN_CAP_MFP_CAPABLE
+        | if mfp == 1 {
+            crate::rsn::RSN_CAP_MFP_REQUIRED
+        } else {
+            0
+        };
+    if mfp != 0
         && (!matches!(body.len(), 20 | 22 | 26)
             || rsn.rsn_capabilities != mfp_bits
             || !rsn.pmkids.is_empty()
@@ -698,6 +702,7 @@ fn scan_random_mac(
 struct ConnectCaps {
     psk_offload: bool,
     psk_mfp_offload: bool,
+    optional_mfp: bool,
     sae_offload: bool,
     external: bool,
     cipher_suites: &'static [u32],
@@ -712,6 +717,7 @@ impl ConnectCaps {
         ConnectCaps {
             psk_offload: iface.supports_handshake_offload(),
             psk_mfp_offload: iface.supports_wpa2_mfp_offload(),
+            optional_mfp: iface.supports_optional_mfp() && !iface.supports_userspace_mlme(),
             sae_offload: iface.supports_sae_offload(),
             external: iface.supports_external_supplicant(),
             cipher_suites: iface.cipher_suites(),
@@ -736,6 +742,7 @@ fn parse_operation(
         ConnectCaps {
             psk_offload,
             psk_mfp_offload: false,
+            optional_mfp: false,
             sae_offload,
             external: false,
             cipher_suites: &[],
@@ -845,14 +852,19 @@ fn parse_operation_caps(
             }
             // 53 = NL80211_ATTR_AUTH_TYPE (0 = OPEN_SYSTEM, 4 = SAE),
             // 66 = NL80211_ATTR_USE_MFP (enum nl80211_mfp: NO 0, REQUIRED 1,
-            // OPTIONAL 2). OPTIONAL needs NL80211_EXT_FEATURE_MFP_OPTIONAL,
-            // which no NARF wiphy has (mac80211 does not set it either).
+            // OPTIONAL 2). Only an explicitly opted-in firmware PSK owner
+            // supplies NL80211_EXT_FEATURE_MFP_OPTIONAL.
             let auth = u32_attr(attrs, 53)?.unwrap_or(0);
             let mfp = u32_attr(attrs, 66)?.unwrap_or(0);
             if mfp > 2 {
                 return Err(ERANGE);
             }
-            if mfp == 2 {
+            if mfp == 2
+                && (!caps.optional_mfp
+                    || !caps.psk_mfp_offload
+                    || !psk_offload
+                    || attr(attrs, 254).is_none())
+            {
                 return Err(EOPNOTSUPP);
             }
             let suites: &[u32] = if caps.external {
@@ -907,7 +919,7 @@ fn parse_operation_caps(
                 {
                     return Err(EOPNOTSUPP);
                 }
-                psk_association_ies(attr(attrs, 42).unwrap_or(&[]), mfp == 1)?;
+                psk_association_ies(attr(attrs, 42).unwrap_or(&[]), mfp)?;
                 Credential::Psk(Zeroizing::new(pmk.try_into().map_err(|_| EINVAL)?))
             } else if caps.external
                 && (attr(attrs, 70).is_some()

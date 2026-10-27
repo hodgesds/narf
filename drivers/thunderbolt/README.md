@@ -17,7 +17,9 @@ the controller's DMA ring can be started, ACPI `_SB._OSC` must confirm
 native USB4 support and hand the OS the USB3/DisplayPort control bits;
 PCIe tunnelling is requested in the same handshake and programmed only
 when firmware grants its bit. The crate honors that firmware handshake —
-per protocol, on the bits actually granted. One actor task per NHI owns
+per protocol, on the bits actually granted. Controllers whose firmware runs
+the legacy ICM connection manager are detected from NHI firmware status
+before the ring starts and are left entirely to that firmware. One actor task per NHI owns
 that controller's DMA rings, its control/configuration transaction
 channel, its topology view, and its tunnels, so there is a single
 serialization point per domain and no configuration transaction holds a
@@ -40,8 +42,8 @@ submission and rolled back in reverse on failure, and existing
 firmware-enabled tunnels are preserved rather than claimed. Reporting a
 tunnel is not a claim that a monitor has trained or that scanout is live.
 
-Out of scope: XDomain tunneling, legacy ICM (firmware CM)
-operation, and tunnel suspend/replay — consequently system suspend is
+Out of scope: XDomain tunneling, the legacy ICM protocol itself
+(firmware-CM hosts are detected and stood aside from, never driven), and tunnel suspend/replay — consequently system suspend is
 refused while a native CM is running. Detach removes the affected
 router subtree before rediscovery. Discovery registers at Device-stage
 init and the per-controller CM task starts at Late-stage init. The crate

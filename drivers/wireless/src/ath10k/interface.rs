@@ -39,6 +39,7 @@ struct State {
 }
 struct ReceiveBatch {
     permission: super::regulatory::Permission,
+    source: Option<super::firmware_source::Source>,
     frames: Vec<Vec<u8>>,
 }
 #[cfg(any(test, feature = "kernel-test"))]
@@ -53,12 +54,14 @@ type ReceiveHook = Arc<dyn Fn(ReceivePoint) + Send + Sync>;
 pub(super) struct RadioFeatures {
     power_save: bool,
     ht: Option<[u8; 26]>,
+    ht40: Option<[u8; 26]>,
 }
 impl RadioFeatures {
     fn observed<T: Hif + HostMemory + HttMemory>(radio: &Radio<T>) -> Self {
         Self {
             power_save: radio.power_save_supported(),
             ht: radio.ht_capabilities(),
+            ht40: radio.ht40_capabilities(),
         }
     }
 }
@@ -79,6 +82,7 @@ pub(super) struct Device<T: Hif + HostMemory + HttMemory> {
     generation: u64,
     ps_supported: bool,
     ht_capabilities: Option<[u8; 26]>,
+    ht40_capabilities: Option<[u8; 26]>,
     ps_request: AtomicU8,
     frequencies: Vec<u16>,
     mac: [u8; 6],
@@ -146,6 +150,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             .unwrap_or(RadioFeatures {
                 power_save: false,
                 ht: None,
+                ht40: None,
             });
         let frequencies = radio
             .try_lock()
@@ -180,6 +185,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             name: name.into(),
             ps_supported: features.power_save,
             ht_capabilities: features.ht,
+            ht40_capabilities: features.ht40,
             frequencies,
             // Submit the advertised awake default before first carrier.
             ps_request: AtomicU8::new(u8::from(features.power_save)),
@@ -258,6 +264,26 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             return Err(());
         }
         self.enqueue(bytes, meta)
+    }
+    pub(super) fn phy_capabilities(
+        &self,
+        band: u32,
+    ) -> Option<narf_wireless::iface::PhyCapabilities> {
+        if !self
+            .frequencies
+            .iter()
+            .any(|frequency| band == 2400 && *frequency < 3000 || band == 5000 && *frequency > 3000)
+        {
+            return None;
+        }
+        Some(narf_wireless::iface::PhyCapabilities {
+            ht: if band == 5000 {
+                self.ht40_capabilities?
+            } else {
+                self.ht_capabilities?
+            },
+            vht: None,
+        })
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn generation_for_test(&self) -> u64 {
@@ -376,7 +402,11 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                     // authorization is published only by associate's receipt.
                     return Ok(None);
                 };
-                self.publish_link(radio.station_link().map(|link| link.bssid));
+                let source = radio.htt.wmi.htc.transport.current_sources();
+                super::firmware_source::invoke(source.as_ref(), || {
+                    self.publish_link(radio.station_link().map(|link| link.bssid))
+                })
+                .map_err(|_| Error::Failed)?;
                 if state.pending.is_none() {
                     for _ in 0..16 {
                         let Ok(Some(frame)) = state.tx.try_recv() else {
@@ -411,10 +441,17 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                         if radio.data_permission() != Some(permission) {
                             return Ok(None);
                         }
-                        let _ = state.rx.try_send(frame);
+                        super::firmware_source::invoke(source.as_ref(), || {
+                            let _ = state.rx.try_send(frame);
+                        })
+                        .map_err(|_| Error::Failed)?;
                     }
                 }
-                Ok(Some(ReceiveBatch { permission, frames }))
+                Ok(Some(ReceiveBatch {
+                    permission,
+                    source,
+                    frames,
+                }))
             })()
         };
         match result {
@@ -464,7 +501,18 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                     break;
                 }
             }
-            narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
+            let published = super::firmware_source::invoke(batch.source.as_ref(), || {
+                batch.permission.check(&self.policy.current()?)?;
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(Error::Failed);
+                }
+                narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
+                Ok::<_, Error>(())
+            });
+            if !matches!(published, Ok(Ok(()))) {
+                self.close();
+                break;
+            }
         }
         progressed
     }
@@ -653,7 +701,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         }
         let domain = self.policy.current().map_err(error)?;
         let permission = radio
-            .station_permission(&domain, request.frequency_mhz as u16)
+            .station_permission(&domain, request.bssid, request.frequency_mhz as u16)
             .map_err(error)?;
         let validate = || {
             if self.closed.load(Ordering::Acquire) {
@@ -705,7 +753,12 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             radio.fail_station_data();
             return Err(WirelessError::HardwareError);
         }
-        self.link(Some(link.bssid));
+        radio
+            .check_data_policy(&self.policy.current().map_err(error)?)
+            .map_err(error)?;
+        let source = radio.htt.wmi.htc.transport.current_sources();
+        super::firmware_source::invoke(source.as_ref(), || self.link(Some(link.bssid)))
+            .map_err(|_| WirelessError::HardwareError)?;
         attempt.armed = false;
         Ok(())
     }
@@ -927,17 +980,21 @@ pub(super) fn publish(
 ) -> Result<Arc<Native>, Error> {
     let r = radio.try_lock().ok_or(Error::Failed)?;
     let mac = r.station_publishable()?;
-    let result = publish_with_mac(
-        radio.clone(),
-        mac,
-        &quarantine,
-        RadioFeatures::observed(&r),
-        r.configured_channels()
-            .iter()
-            .copied()
-            .filter(|f| super::regulatory::Permission::profile_frequency(*f))
-            .collect(),
-    );
+    let source = r.htt.wmi.htc.transport.current_sources();
+    let result = super::firmware_source::invoke(source.as_ref(), || {
+        publish_with_mac(
+            radio.clone(),
+            mac,
+            &quarantine,
+            RadioFeatures::observed(&r),
+            r.configured_channels()
+                .iter()
+                .copied()
+                .filter(|f| super::regulatory::Permission::profile_frequency(*f))
+                .collect(),
+        )
+    })
+    .map_err(|_| Error::Failed)?;
     drop(r);
     result
 }
@@ -960,17 +1017,21 @@ pub(super) async fn wait_publish(
             Admission::Ready => {
                 let r = radio.lock().await;
                 let mac = r.station_publishable()?;
-                let result = publish_with_mac(
-                    radio.clone(),
-                    mac,
-                    &quarantine,
-                    RadioFeatures::observed(&r),
-                    r.configured_channels()
-                        .iter()
-                        .copied()
-                        .filter(|f| super::regulatory::Permission::profile_frequency(*f))
-                        .collect(),
-                );
+                let source = r.htt.wmi.htc.transport.current_sources();
+                let result = super::firmware_source::invoke(source.as_ref(), || {
+                    publish_with_mac(
+                        radio.clone(),
+                        mac,
+                        &quarantine,
+                        RadioFeatures::observed(&r),
+                        r.configured_channels()
+                            .iter()
+                            .copied()
+                            .filter(|f| super::regulatory::Permission::profile_frequency(*f))
+                            .collect(),
+                    )
+                })
+                .map_err(|_| Error::Failed)?;
                 drop(r);
                 return result;
             }
@@ -981,17 +1042,7 @@ pub(super) async fn wait_publish(
 #[async_trait::async_trait]
 impl WirelessNetIface for Native {
     fn phy_capabilities(&self, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
-        if !self
-            .frequencies
-            .iter()
-            .any(|frequency| band == 2400 && *frequency < 3000 || band == 5000 && *frequency > 3000)
-        {
-            return None;
-        }
-        Some(narf_wireless::iface::PhyCapabilities {
-            ht: self.ht_capabilities?,
-            vht: None,
-        })
+        Device::phy_capabilities(self, band)
     }
     fn power_save_default(&self) -> Option<bool> {
         self.ps_supported.then_some(false)

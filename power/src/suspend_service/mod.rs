@@ -25,15 +25,22 @@
 //!   `narf-crypto`'s seed-grade key-material surface (issue #996) and
 //!   refuses — typed error, no fallback — when it is unavailable.
 //!
-//! Seams left for the follow-on lanes, deliberately minimal: P2
-//! (#998) gets the hook key derivations ([`derive_hook_key`],
-//! [`derive_hook_anchor_key`]) and the header's hook-region length
-//! field; P4 (#1000) gets the claims/opened/verified reader pipeline
-//! as its entry surface; P8 (#1006) gets the authenticated
+//! Seams left for the follow-on lanes, deliberately minimal: P4
+//! (#1000) gets the claims/opened/verified reader pipeline as its
+//! entry surface; P8 (#1006) gets the authenticated
 //! [`RecordedPolicy`] record to enforce. Real anchors are later
 //! lanes too: FIDO token P3 (#999), TPM P6 (#1002), Argon2id
 //! passphrase P7 (#1004).
+//!
+//! The state-hook registry (design §5) lives in [`hooks`]: drivers
+//! register [`SuspendStateHook`]s, the seal fan-out runs inside
+//! [`SuspendService::seal_image_with_hooks`], and the unseal fan-out
+//! ([`run_unseal_fanout`]) runs from a verified image after the
+//! device resume fan-out. Hooks never see key material — the
+//! derivations ([`derive_hook_key`], [`derive_hook_anchor_key`])
+//! stay inside the service.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -41,6 +48,7 @@ mod anchor;
 mod custody;
 mod entropy;
 mod format;
+mod hooks;
 mod image;
 mod slots;
 
@@ -48,6 +56,13 @@ pub use anchor::{AnchorError, AnchorKind, KeyCustodyAnchor, UnwrapCtx, WrapCtx, 
 pub use custody::Secret32;
 pub use entropy::{HwKeyEntropy, KeyEntropy};
 pub use format::{BlockStore, ImageClaims, ImageStore, PolicyLevel, RecordedPolicy};
+pub use hooks::{
+    decode_hook_region, encode_hook_region, register_suspend_state_hook, registered_hooks,
+    run_unseal_fanout, suspend_state_hook_count, unseal_registered, BlobOutcome, BlobRef, HookBlob,
+    SealCtx, SealError, SealFanoutFailure, SealFanoutReport, SealMode, SealedHook,
+    SuspendStateHook, UnsealCtx, UnsealEntry, UnsealFanoutError, UnsealFanoutReport, UnsealOutcome,
+    __reset_hooks_for_test, MAX_HOOK_STATE_LEN,
+};
 pub use image::{
     derive_hook_anchor_key, derive_hook_key, open_with_sms, parse_claims, OpenedImage, TrustedImage,
 };
@@ -99,6 +114,12 @@ pub enum ServiceError {
     ImageTooLarge,
     /// A zero-length image is not a suspend image.
     EmptyImage,
+    /// A state hook's seal failed; the suspend is aborted and no
+    /// image was committed (design §5.2 rule 5). The failing hook
+    /// and its error are in the fan-out failure the seal call
+    /// reports through its own channel; at this layer the abort is
+    /// deliberately coarse, like the other security boundaries.
+    HookSealAborted,
 }
 
 impl From<AnchorError> for ServiceError {
@@ -302,12 +323,54 @@ impl<E: KeyEntropy> SuspendService<E> {
         policy: RecordedPolicy,
         image: &[u8],
     ) -> Result<[u8; 16], ServiceError> {
+        let (image_id, _report) = self.seal_image_hooked(store, policy, image, &[])?;
+        Ok(image_id)
+    }
+
+    /// Seal with the state-hook seal fan-out (design §5, P2): the
+    /// hooks in `hooks` run in reverse order after device quiesce
+    /// and before the image write; their sealed blobs land in the
+    /// image's hook region. Any hook failure aborts the seal with
+    /// [`ServiceError::HookSealAborted`] *before* the writer runs,
+    /// so an aborted suspend commits no image at all. Returns the
+    /// image id and the fan-out report.
+    pub fn seal_image_with_hooks(
+        &mut self,
+        store: &mut dyn ImageStore,
+        policy: RecordedPolicy,
+        image: &[u8],
+        hooks: &[Arc<dyn SuspendStateHook>],
+    ) -> Result<([u8; 16], SealFanoutReport), ServiceError> {
+        self.seal_image_hooked(store, policy, image, hooks)
+    }
+
+    /// [`Self::seal_image_with_hooks`] over the global hook
+    /// registry's snapshot — the production entry the suspend
+    /// coordinator calls once devices have quiesced.
+    pub fn seal_image_registered(
+        &mut self,
+        store: &mut dyn ImageStore,
+        policy: RecordedPolicy,
+        image: &[u8],
+    ) -> Result<([u8; 16], SealFanoutReport), ServiceError> {
+        let hooks = registered_hooks();
+        self.seal_image_hooked(store, policy, image, &hooks)
+    }
+
+    fn seal_image_hooked(
+        &mut self,
+        store: &mut dyn ImageStore,
+        policy: RecordedPolicy,
+        image: &[u8],
+        hooks: &[Arc<dyn SuspendStateHook>],
+    ) -> Result<([u8; 16], SealFanoutReport), ServiceError> {
         let smk = Secret32::mint(self.draw::<32>()?);
         let image_id = self.draw::<16>()?;
         let smk_wrap_nonce = self.draw::<12>()?;
         match policy.level {
             format::PolicyLevel::Off => {
                 let sms = off_policy_sms();
+                let (region, report) = run_hooks(hooks, &smk, &sms, &image_id)?;
                 image::write_image(
                     store,
                     &image::WriteRequest {
@@ -319,8 +382,10 @@ impl<E: KeyEntropy> SuspendService<E> {
                         image_id,
                         smk_wrap_nonce,
                         image,
+                        hook_region: &region,
                     },
                 )?;
+                Ok((image_id, report))
             }
             _ => {
                 let epoch = self.store.current_epoch().ok_or(ServiceError::NoEpoch)?;
@@ -328,6 +393,8 @@ impl<E: KeyEntropy> SuspendService<E> {
                 if custody.slots.is_empty() {
                     return Err(ServiceError::NoSlotsEnrolled);
                 }
+                let (region, report) = run_hooks(hooks, &smk, &custody.sms, &image_id)?;
+                let custody = self.store.get(epoch).ok_or(ServiceError::UnknownEpoch)?;
                 image::write_image(
                     store,
                     &image::WriteRequest {
@@ -339,6 +406,7 @@ impl<E: KeyEntropy> SuspendService<E> {
                         image_id,
                         smk_wrap_nonce,
                         image,
+                        hook_region: &region,
                     },
                 )?;
                 self.store
@@ -346,9 +414,9 @@ impl<E: KeyEntropy> SuspendService<E> {
                     .ok_or(ServiceError::UnknownEpoch)?
                     .images_outstanding
                     .push(image_id);
+                Ok((image_id, report))
             }
         }
-        Ok(image_id)
     }
 
     /// Record that the image with this id has been consumed (resumed
@@ -402,6 +470,26 @@ impl<E: KeyEntropy> SuspendService<E> {
         }
         image::open_with_sms(store, claims, &off_policy_sms())
     }
+}
+
+/// The seal fan-out, shared by every policy arm: run the hooks,
+/// encode their blobs into hook-region bytes. A hook failure is
+/// the suspend's failure (design §5.2 rule 5) — mapped to the
+/// coarse [`ServiceError::HookSealAborted`] at this layer, with the
+/// failing hook's identity available to callers that run the
+/// fan-out through [`hooks::run_seal_fanout`]'s own channel.
+fn run_hooks(
+    hooks: &[Arc<dyn SuspendStateHook>],
+    smk: &Secret32,
+    sms: &Secret32,
+    image_id: &[u8; 16],
+) -> Result<(Vec<u8>, SealFanoutReport), ServiceError> {
+    if hooks.is_empty() {
+        return Ok((Vec::new(), SealFanoutReport::default()));
+    }
+    let (blobs, report) = hooks::run_seal_fanout(hooks, smk, sms, image_id)
+        .map_err(|_| ServiceError::HookSealAborted)?;
+    Ok((hooks::encode_hook_region(&blobs), report))
 }
 
 impl<E: KeyEntropy> fmt::Debug for SuspendService<E> {

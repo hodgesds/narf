@@ -33,6 +33,7 @@ pub(in crate::cyw43439) struct Bus {
     mfp_mode: u32,
     mfp_fault: u8,
     mfp_held: bool,
+    mfp_conversation: Option<super::super::mfp_fixture::Conversation>,
     phy_profile: Option<(u32, u8)>,
     wide: Option<super::super::phy_fixture::Wide>,
     current_chanspec: u16,
@@ -64,6 +65,7 @@ impl Bus {
             mfp_mode: 0,
             mfp_fault: 0,
             mfp_held: false,
+            mfp_conversation: None,
             phy_profile: None,
             wide: None,
             current_chanspec: 0x1006,
@@ -82,6 +84,20 @@ impl Bus {
             self.mfp_held = false;
         }
     }
+    pub(in crate::cyw43439) fn mfp_conversation(
+        &mut self,
+        conversation: super::super::mfp_fixture::Conversation,
+    ) {
+        self.mfp_conversation = Some(conversation);
+        self.mfp_held = false;
+    }
+    pub(in crate::cyw43439) fn key_receipt(&mut self, foreign: bool) {
+        let maximum = self.credit_window(8);
+        self.event(46, 6, 0, &[], maximum);
+        if foreign {
+            self.rx.back_mut().unwrap()[64..70].copy_from_slice(&[2, 9, 8, 7, 6, 5]);
+        }
+    }
     pub(in crate::cyw43439) fn phy_profile(&mut self, chains: u32, fault: u8) {
         self.phy_profile = Some((chains, fault));
         self.mfp_held = false;
@@ -98,7 +114,11 @@ impl Bus {
         self.mfp_held = false;
     }
     fn request_ies(&self) -> Vec<u8> {
-        let mut ies = self.wpa_ie.clone().unwrap_or_default();
+        let mut ies = self
+            .mfp_conversation
+            .as_ref()
+            .and_then(|p| p.request.clone())
+            .unwrap_or_else(|| self.wpa_ie.clone().unwrap_or_default());
         if let Some((chains, fault)) = self.phy_profile {
             if fault != 3 {
                 ies.extend_from_slice(&self.wide.as_ref().map_or_else(
@@ -114,7 +134,11 @@ impl Bus {
         ies
     }
     fn response_ies(&self) -> Vec<u8> {
-        self.phy_profile.map_or(Vec::new(), |(chains, fault)| {
+        let mut ies = self
+            .mfp_conversation
+            .as_ref()
+            .map_or(Vec::new(), |p| p.response());
+        ies.extend_from_slice(&self.phy_profile.map_or(Vec::new(), |(chains, fault)| {
             if fault == 4 {
                 vec![0, 0]
             } else {
@@ -123,7 +147,8 @@ impl Bus {
                     |wide| wide.response(6, chains),
                 )
             }
-        })
+        }));
+        ies
     }
     pub(in crate::cyw43439) fn mfp_commands(&self) -> Vec<(u32, Vec<u8>)> {
         self.tx
@@ -139,6 +164,8 @@ impl Bus {
                     || body.starts_with(b"mfp\0")
                     || body.starts_with(b"assoc_")
                     || body.starts_with(b"bw_cap\0")
+                    || body.starts_with(b"vhtmode\0")
+                    || body.starts_with(b"txstreams\0")
                     || body.starts_with(b"chanspec")
                     || body.starts_with(b"wpaie\0"))
                 .then(|| (command, body.to_vec()))
@@ -367,18 +394,25 @@ impl PacketTransport for Bus {
                     );
                 } else if body.starts_with(b"mfp\0") {
                     response.extend_from_slice(
-                        &(if self.mfp_fault == 1 && self.mfp_mode == 2 {
+                        &(if self.mfp_fault == 1 && self.mfp_mode != 0 {
                             0
                         } else {
                             self.mfp_mode
                         })
                         .to_le_bytes(),
                     );
+                    if self
+                        .mfp_conversation
+                        .as_ref()
+                        .is_some_and(|p| p.hold == super::super::mfp_fixture::Hold::Mode)
+                    {
+                        self.mfp_held = true;
+                    }
                 } else if body.starts_with(b"assoc_info\0") {
                     response.extend_from_slice(
                         &(if self.mfp_fault == 4 {
                             1503
-                        } else if self.phy_profile.is_some() {
+                        } else if self.phy_profile.is_some() || self.mfp_conversation.is_some() {
                             self.request_ies().len() as u32
                         } else {
                             28u32
@@ -387,7 +421,9 @@ impl PacketTransport for Bus {
                     );
                     response.extend_from_slice(&(self.response_ies().len() as u32).to_le_bytes());
                 } else if body.starts_with(b"assoc_req_ies\0") {
-                    response.extend_from_slice(&if self.phy_profile.is_some() {
+                    response.extend_from_slice(&if self.phy_profile.is_some()
+                        || self.mfp_conversation.is_some()
+                    {
                         self.request_ies()
                     } else {
                         pmf_ie()
@@ -395,12 +431,21 @@ impl PacketTransport for Bus {
                     if self.mfp_fault == 2 {
                         response[20] = 0;
                     }
-                    if self.mfp_fault == 5 {
+                    if self.mfp_fault == 5
+                        || self
+                            .mfp_conversation
+                            .as_ref()
+                            .is_some_and(|p| p.hold == super::super::mfp_fixture::Hold::Request)
+                    {
                         self.mfp_held = true;
                     }
                 } else if body.starts_with(b"assoc_resp_ies\0") {
                     response.extend_from_slice(&self.response_ies());
-                    if self.phy_profile.is_some_and(|p| p.1 == 5)
+                    if self
+                        .mfp_conversation
+                        .as_ref()
+                        .is_some_and(|p| p.hold == super::super::mfp_fixture::Hold::Response)
+                        || self.phy_profile.is_some_and(|p| p.1 == 5)
                         || self.wide.as_ref().is_some_and(|w| {
                             w.fault == super::super::phy_fixture::WideFault::HoldResponse
                         })
@@ -429,6 +474,7 @@ impl PacketTransport for Bus {
                         self.pmf_required,
                         self.phy_profile,
                         self.wide.as_ref(),
+                        self.mfp_conversation.as_ref().map(|p| p.ap.as_slice()),
                     ),
                     maximum,
                 );
@@ -475,14 +521,26 @@ impl PacketTransport for Bus {
                 } else {
                     &[]
                 };
+                let expected_conversation = self
+                    .mfp_conversation
+                    .as_ref()
+                    .map(|p| p.expected_request(self.secured));
+                let expected = expected_conversation.as_deref().unwrap_or(expected);
                 if self.wpa_ie.as_deref() != Some(expected) || !self.roam_off {
                     return Err(TransportError::NotReady);
                 }
-                if self.pmf_required && (!self.mfp_supported || self.mfp_mode != 2) {
+                if self
+                    .mfp_conversation
+                    .as_ref()
+                    .is_some_and(|p| p.mode != self.mfp_mode)
+                    || self.mfp_conversation.is_none()
+                        && self.pmf_required
+                        && (!self.mfp_supported || self.mfp_mode != 2)
+                {
                     return Err(TransportError::NotReady);
                 }
                 self.event(16, 0, 1, &[], maximum);
-                if self.secured {
+                if self.secured && self.mfp_conversation.as_ref().is_none_or(|p| p.keys) {
                     self.event(46, 6, 0, &[], maximum);
                 }
                 if self.assoc_event {
@@ -609,7 +667,7 @@ fn ready<F: Future>(future: F) -> Option<F::Output> {
     }
 }
 fn scan_result(id: u16, secured: bool) -> Vec<u8> {
-    scan_result_profile(id, secured, false, None, None)
+    scan_result_profile(id, secured, false, None, None, None)
 }
 fn pmf_ie() -> Vec<u8> {
     vec![
@@ -623,10 +681,13 @@ fn scan_result_profile(
     mfp: bool,
     phy: Option<(u32, u8)>,
     wide: Option<&super::super::phy_fixture::Wide>,
+    ap_rsn: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut ies = vec![0, 4, b't', b'e', b's', b't'];
     if secured {
-        if mfp {
+        if let Some(ap) = ap_rsn {
+            ies.extend_from_slice(ap);
+        } else if mfp {
             ies.extend_from_slice(&pmf_ie());
         } else {
             let rsn = narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body();

@@ -46,14 +46,32 @@ pub(super) async fn staging_pause() {
 
 pub(super) struct RegistryFiles {
     authority: narf_capabilities::Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
+    source: super::firmware_source::Source,
 }
 impl RegistryFiles {
+    #[cfg(feature = "kernel-test")]
+    pub(super) fn with_authority(
+        authority: narf_capabilities::Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
+    ) -> Self {
+        Self {
+            authority,
+            source: super::firmware_source::Source::new(authority),
+        }
+    }
     pub fn new() -> Result<Self, Error> {
+        let authority = narf_firmware::trusted_loader_authority()
+            .and_then(|authority| authority.derive().ok())
+            .ok_or(Error::Authority)?;
         Ok(Self {
-            authority: narf_firmware::trusted_loader_authority()
-                .and_then(|authority| authority.derive().ok())
-                .ok_or(Error::Authority)?,
+            authority,
+            source: super::firmware_source::Source::new(authority),
         })
+    }
+    pub fn source(&self) -> super::firmware_source::Source {
+        self.source.clone()
+    }
+    pub fn seal(&self) -> Result<(), Error> {
+        self.source.seal().map_err(|_| Error::Authority)
     }
     /// Probe may precede installation of the trusted loader. No registry cap
     /// has been acquired yet, so waiting here cannot replace a revoked cap.
@@ -71,9 +89,20 @@ impl RegistryFiles {
 }
 impl Files for RegistryFiles {
     fn load(&mut self, name: &str) -> Result<Vec<u8>, Error> {
+        self.source
+            .invoke_boot(|| ())
+            .map_err(|_| Error::Authority)?;
         let board = matches!(name.rsplit('/').next(), Some("board.bin" | "board-2.bin"));
         crate::firmware_asset::load(&self.authority, name, 16 * 1024 * 1024, board)
-            .map(|asset| asset.bytes)
+            .and_then(|asset| {
+                let bytes = asset.bytes.clone();
+                let image = name
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|n| n.starts_with("firmware-") && n.ends_with(".bin"));
+                self.source.retain(asset, image, board)?;
+                Ok(bytes)
+            })
             .map_err(|error| match error {
                 narf_firmware::FirmwareError::NotFound => Error::Missing,
                 narf_firmware::FirmwareError::OutOfMemory => Error::NoMemory,
@@ -81,7 +110,13 @@ impl Files for RegistryFiles {
             })
     }
     async fn wait_missing(&mut self) -> Result<(), Error> {
+        self.source
+            .invoke_boot(|| ())
+            .map_err(|_| Error::Authority)?;
         staging_pause().await;
+        self.source
+            .invoke_boot(|| ())
+            .map_err(|_| Error::Authority)?;
         Ok(())
     }
 }
@@ -468,7 +503,7 @@ mod asset_authority_tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
     fn smoke_ath10k_board_data_requires_signer_and_current_registry_invocation() -> TestResult {
         let (write, read) = narf_firmware::bootstrap_authority();
-        let mut files = RegistryFiles { authority: read };
+        let mut files = RegistryFiles::with_authority(read);
         for name in ["ath10k/narf-test/board-2.bin", "ath10k/narf-test/board.bin"] {
             match install(&write, name, b"inert-board", false) {
                 Ok(()) => {

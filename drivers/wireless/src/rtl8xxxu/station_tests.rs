@@ -34,6 +34,7 @@ fn mgmt(subtype: u8, own: [u8; 6]) -> Vec<u8> {
 }
 fn mpdu(bytes: Vec<u8>) -> Mpdu {
     Mpdu {
+        native: None,
         bytes,
         phy: Vec::new(),
         rate: 0,
@@ -167,8 +168,22 @@ impl Io for Link {
             return Err(UsbError::Stall);
         }
         out[..len].fill(0);
-        let d0 = frame.len() as u32 | (1 << 27) | (1 << 28) | (1 << 29);
+        let d0 = frame.len() as u32
+            | (1 << 27)
+            | (1 << 28)
+            | (1 << 29)
+            | if frame.first() == Some(&0x88) {
+                1 << 23
+            } else {
+                0
+            };
         out[..4].copy_from_slice(&d0.to_le_bytes());
+        if frame.first() == Some(&0x88) {
+            out[4..8].copy_from_slice(
+                &(u32::from(frame[24] & 15) << 5 | if frame[24] & 0x80 != 0 { 1 << 13 } else { 0 })
+                    .to_le_bytes(),
+            );
+        }
         out[8..12].copy_from_slice(&(1u32 << 16).to_le_bytes());
         out[24..len].copy_from_slice(&frame);
         m.rx = None;
@@ -1014,7 +1029,7 @@ fn smoke_rtl8188eu_interface_uses_controlled_port_rings_and_synchronous_usb_prog
     service.poll().unwrap();
     let device = Device::new("rtl8188eu-test", service);
     let mut producer = device.tx_ring().lock().take().unwrap();
-    let mut consumer = device.rx_ring().lock().take().unwrap();
+    let mut old_consumer = device.rx_ring().lock().take().unwrap();
     if device.link_up() || device.connected_bssid().is_some() {
         return TestResult::Fail("unassociated native interface published carrier");
     }
@@ -1033,6 +1048,10 @@ fn smoke_rtl8188eu_interface_uses_controlled_port_rings_and_synchronous_usb_prog
     if !device.link_up() || device.connected_bssid() != Some(AP) {
         return TestResult::Fail("actual M4 delivery did not publish interface carrier");
     }
+    if matches!(old_consumer.try_recv(), Ok(Some(_))) {
+        return TestResult::Fail("pre-key receive consumer inherited successor data");
+    }
+    let mut consumer = device.rx_ring().lock().take().unwrap();
     let mut ethernet = AP.to_vec();
     ethernet.extend_from_slice(&link.own);
     ethernet.extend_from_slice(&[8, 0, 0x45, 0, 0, 20]);

@@ -8,7 +8,7 @@ use super::{
 use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 use core::{
     future::Future,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use narf_wireless::{
     association::{self, Bss, JoinPlan, SecurityMode},
@@ -60,6 +60,12 @@ pub(crate) trait Environment: Send + Sync {
     fn admission(&self) -> Option<&Arc<Admission>> {
         None
     }
+    fn ht20(
+        &self,
+        _base: Arc<super::super::channel_power::Calibration>,
+    ) -> Result<Option<Arc<super::super::ht::Grant>>, Error> {
+        Ok(None)
+    }
 }
 /// Shared public closure and bounded publication gate. No guard crosses an
 /// await; an already-entered native publication completes before close returns.
@@ -96,11 +102,16 @@ pub(crate) struct Candidate {
     pub rsnxe: Option<Vec<u8>>,
 }
 impl Candidate {
-    fn receive(frame: &Mpdu, local: [u8; 6]) -> Result<Self, Error> {
+    fn receive(frame: &Mpdu, local: [u8; 6], ht: bool) -> Result<Self, Error> {
         if frame.channel() != 1 {
             return Err(Error::Profile);
         }
-        let observed = association::observe(frame, 1, local, None).map_err(Error::Management)?;
+        let observed = if ht {
+            association::observe_with_phy(frame, 1, local, None, &super::super::ht::local())
+        } else {
+            association::observe(frame, 1, local, None)
+        }
+        .map_err(Error::Management)?;
         if observed.basic_rates & 1 == 0 {
             return Err(Error::Profile);
         }
@@ -121,12 +132,65 @@ enum Kind {
     Association,
     Eapol,
     Data,
+    Control,
 }
 struct Pending {
     id: u64,
     kind: Kind,
     bytes: Vec<u8>,
     deadline: u64,
+}
+struct Captured {
+    frame: Mpdu,
+    admitted: bool,
+    epoch: u64,
+}
+pub(crate) struct Publication {
+    pci: super::packet::Publication,
+    base: Arc<super::super::channel_power::Calibration>,
+    ht: Option<Arc<super::super::ht::Grant>>,
+    permission: super::super::channel_power::Permission,
+    indices: [u8; 8],
+    epoch: Arc<AtomicU64>,
+    expected: u64,
+    failed: Arc<AtomicBool>,
+}
+impl Publication {
+    pub(crate) fn current(&self) -> bool {
+        !self.failed.load(Ordering::Acquire) && self.epoch.load(Ordering::Acquire) == self.expected
+    }
+    pub(crate) fn invoke<T>(
+        &self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        operation: impl FnOnce() -> Result<T, RadioError>,
+    ) -> Result<Option<T>, Error> {
+        if !self.current() {
+            return Ok(None);
+        }
+        let op = || {
+            if self.base.permission(domain, 1).map_err(RadioError::Power)? != self.permission {
+                return Err(RadioError::State);
+            }
+            if let Some(ht) = &self.ht {
+                if ht.gains(domain, self.permission)? != self.indices {
+                    return Err(RadioError::State);
+                }
+            }
+            self.pci.invoke(|| {
+                if self.current() {
+                    operation().map(Some)
+                } else {
+                    Ok(None)
+                }
+            })
+        };
+        (if let Some(ht) = &self.ht {
+            ht.invoke(op)
+        } else {
+            self.base.with_current(op)
+        })
+        .map_err(Error::Radio)
+    }
 }
 pub(super) struct State {
     phase: Phase,
@@ -138,7 +202,7 @@ pub(super) struct State {
     pmk: Option<Zeroizing<[u8; 32]>>,
     security: Option<Security>,
     pending: Option<Pending>,
-    incoming: VecDeque<Mpdu>,
+    incoming: VecDeque<Captured>,
     received: VecDeque<Vec<u8>>,
     aid: Option<u16>,
     native_associated: bool,
@@ -149,6 +213,13 @@ pub(super) struct State {
     last_peer: u64,
     capability: u16,
     wmm: Option<narf_wireless::wmm::Parameters>,
+    ht: Option<Arc<super::super::ht::Grant>>,
+    ht_indices: [u8; 8],
+    ht_profile: Option<association::phy::HtNegotiation>,
+    controls: VecDeque<Vec<u8>>,
+    delivered_reply: Option<Pending>,
+    epoch: Arc<AtomicU64>,
+    retire: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 impl State {
     pub(super) fn new() -> Self {
@@ -173,6 +244,13 @@ impl State {
             last_peer: 0,
             capability: 0,
             wmm: None,
+            ht: None,
+            ht_indices: [0; 8],
+            ht_profile: None,
+            controls: VecDeque::new(),
+            delivered_reply: None,
+            epoch: Arc::new(AtomicU64::new(1)),
+            retire: None,
         }
     }
     fn fail(&mut self) {
@@ -183,12 +261,36 @@ impl State {
         self.received.clear();
         self.pmk = None;
         self.wmm = None;
+        self.retire_receive();
+        self.controls.clear();
         if let Some(plan) = &mut self.plan {
             plan.cancel();
         }
         if let Some(security) = &mut self.security {
             security.fail();
         }
+    }
+    fn retire_receive(&mut self) {
+        self.received.clear();
+        // Exhaustion is terminal and never wraps back to a captured token.
+        if self
+            .epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+            .is_err()
+        {
+            self.failed.store(true, Ordering::Release);
+        }
+        if let Some(retire) = &self.retire {
+            retire();
+        }
+    }
+    fn receive_open(&self) -> bool {
+        self.phase == Phase::Open
+            && self.native_associated
+            && self.admitted
+            && self.delivered_reply.is_none()
+            && self.security.as_ref().is_none_or(Security::port_open)
+            && !self.failed.load(Ordering::Acquire)
     }
 }
 struct Attempt {
@@ -258,7 +360,35 @@ fn eapol(frame: &[u8], own: [u8; 6], peer: [u8; 6]) -> bool {
         && frame[22] & 15 == 0
         && frame[offset..offset + 8] == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]
 }
+fn private_eapol(b: &[u8], own: [u8; 6], peer: [u8; 6]) -> bool {
+    if !eapol(b, own, peer) || b[1] & 0x40 != 0 {
+        return false;
+    }
+    let at = if b[0] == 0x88 { 34 } else { 32 };
+    b.get(at..).is_some_and(|e| {
+        e.len() >= 4
+            && matches!(e[0], 1..=3)
+            && e[1] == 3
+            && usize::from(u16::from_be_bytes([e[2], e[3]])) == e.len() - 4
+    })
+}
 impl<I: Io, M: Memory> Prepared<I, M> {
+    pub(crate) fn station_receive_retirement(&mut self, retire: Arc<dyn Fn() + Send + Sync>) {
+        self.station.retire = Some(retire);
+    }
+    pub(crate) fn station_ht_capability(&self) -> Option<[u8; 26]> {
+        self.station.ht.as_ref()?;
+        Some(association::phy::LocalHt::siso20(false, false).capability_body())
+    }
+    pub(crate) fn station_receive_epoch(&self) -> (Arc<AtomicU64>, u64) {
+        (
+            self.station.epoch.clone(),
+            self.station.epoch.load(Ordering::Acquire),
+        )
+    }
+    pub(crate) fn station_receive_open(&self) -> bool {
+        self.station_phase() == Phase::Open && self.station.receive_open()
+    }
     pub(crate) fn station_calibration_present(&self) -> bool {
         self.station.calibration.is_some()
     }
@@ -328,10 +458,86 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         if Some(permission) != self.permission {
             return Err(Error::Profile);
         }
+        if let Some(ht) = &self.station.ht {
+            if ht.gains(&domain, permission).map_err(Error::Radio)? != self.station.ht_indices {
+                return Err(Error::Profile);
+            }
+            ht.readback(&self.io, self.station.ht_indices, self.packet.ht)
+                .map_err(Error::Radio)?;
+        }
         Ok(())
     }
 }
 impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
+    pub(crate) fn station_publication<T>(
+        &self,
+        environment: &impl Environment,
+        operation: impl FnOnce() -> Result<T, RadioError>,
+    ) -> Result<T, Error> {
+        let calibration = self.station.calibration.as_ref().ok_or(Error::State)?;
+        let operation = || {
+            self.check_station_policy(environment)
+                .map_err(|_| RadioError::State)?;
+            self.io.authority(true, operation)
+        };
+        let result = if let Some(ht) = &self.station.ht {
+            ht.invoke(operation)
+        } else {
+            calibration.with_current(operation)
+        };
+        result.map_err(Error::Radio)
+    }
+    pub(crate) fn station_publication_token(
+        &self,
+        environment: &impl Environment,
+    ) -> Result<Publication, Error> {
+        self.check_station_policy(environment)?;
+        Ok(Publication {
+            pci: self.io.publication()?,
+            base: self
+                .station
+                .calibration
+                .as_ref()
+                .ok_or(Error::State)?
+                .clone(),
+            ht: self.station.ht.clone(),
+            permission: self.permission.ok_or(Error::State)?,
+            indices: self.station.ht_indices,
+            epoch: self.station.epoch.clone(),
+            expected: self.station.epoch.load(Ordering::Acquire),
+            failed: self.station.failed.clone(),
+        })
+    }
+    pub(crate) fn prepare_station_ht(
+        &mut self,
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        if self.phase != Hardware::MacConfigured || self.station.phase != Phase::Dormant {
+            return Err(Error::State);
+        }
+        if self.station.ht.is_some() {
+            return self.check_station_policy(environment);
+        }
+        let base = self
+            .station
+            .calibration
+            .as_ref()
+            .ok_or(Error::Profile)?
+            .clone();
+        let Some(grant) = environment.ht20(base.clone())? else {
+            return Ok(());
+        };
+        if !grant.matches(&base) {
+            return Err(Error::Profile);
+        }
+        let indices = grant.gains(&environment.domain()?, self.permission.ok_or(Error::State)?)?;
+        self.phase = Hardware::Failed;
+        grant.program(&self.io, indices)?;
+        self.station.ht_indices = indices;
+        self.station.ht = Some(grant);
+        self.phase = Hardware::MacConfigured;
+        Ok(())
+    }
     pub(crate) fn abort_station(&mut self) {
         self.station.fail();
         if self.phase != Hardware::Stopped {
@@ -352,11 +558,42 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.station.phase = Phase::Starting;
         let result = async {
             self.check_station_policy(environment)?;
-            self.awake_station().await?;
+            super::super::ht::wait(
+                self.station
+                    .calibration
+                    .as_ref()
+                    .ok_or(Error::State)?
+                    .clone(),
+                self.station.ht.clone(),
+                self.permission.ok_or(Error::State)?,
+                environment,
+                self.awake_station(),
+            )
+            .await?;
+            let base = self
+                .station
+                .calibration
+                .as_ref()
+                .ok_or(Error::State)?
+                .clone();
+            let ht = self.station.ht.clone();
+            let start = || {
+                self.check_station_policy(environment)
+                    .map_err(|_| RadioError::Power(super::super::channel_power::Error::Policy))?;
+                self.start_packets()
+            };
+            let publish = || {
+                (if let Some(ht) = &ht {
+                    ht.invoke(start)
+                } else {
+                    base.with_current(start)
+                })
+                .map_err(Error::Radio)
+            };
             if let Some(admission) = environment.admission() {
-                admission.publish(Error::State, || self.start_packets().map_err(Error::Radio))?;
+                admission.publish(Error::State, publish)?;
             } else {
-                self.start_packets()?;
+                publish()?;
             }
             let now = environment.now_ms();
             self.station.last_now = now;
@@ -424,10 +661,18 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 .ok_or(Error::State)?
                 .legacy_rates()
                 .0;
-            [11, 10, 9, 8, 7, 6, 3, 5, 4, 2, 1, 0]
-                .into_iter()
-                .find(|rate| rates & (1 << rate) != 0)
-                .ok_or(Error::Profile)?
+            if let Some(profile) = self.station.ht_profile {
+                (0u8..8)
+                    .rev()
+                    .find(|m| profile.tx_mcs()[0] & (1 << m) != 0)
+                    .map(|m| m + 12)
+                    .ok_or(Error::Profile)?
+            } else {
+                [11, 10, 9, 8, 7, 6, 3, 5, 4, 2, 1, 0]
+                    .into_iter()
+                    .find(|rate| rates & (1 << rate) != 0)
+                    .ok_or(Error::Profile)?
+            }
         } else {
             0
         };
@@ -437,15 +682,19 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .as_ref()
             .ok_or(Error::Profile)?
             .clone();
+        let ht = self.station.ht.clone();
         let mut publish = || {
-            calibration
-                .with_current(|| {
-                    self.check_station_policy(environment).map_err(|_| {
-                        RadioError::Power(super::super::channel_power::Error::Policy)
-                    })?;
-                    self.submit(&bytes, rate)
-                })
-                .map_err(Error::Radio)
+            let op = || {
+                self.check_station_policy(environment)
+                    .map_err(|_| RadioError::Power(super::super::channel_power::Error::Policy))?;
+                self.submit(&bytes, rate)
+            };
+            if let Some(ht) = &ht {
+                ht.invoke(op)
+            } else {
+                calibration.with_current(op)
+            }
+            .map_err(Error::Radio)
         };
         let id = if let Some(admission) = environment.admission() {
             admission.publish(Error::State, publish)?
@@ -482,12 +731,25 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .into_iter()
             .find(|candidate| candidate.bss.bssid == bssid)
             .ok_or(Error::Profile)?;
-        let mut plan = JoinPlan::prepare(
-            &candidate.bss,
-            self.local().ok_or(Error::State)?,
-            ssid,
-            mode,
-        )
+        let has_wmm = narf_wireless::wmm::Parameters::parse(&candidate.bss.information_elements)
+            .map_err(|_| Error::Profile)?
+            .is_some();
+        let mut plan = if self.station.ht.is_some() && has_wmm {
+            JoinPlan::prepare_with_phy(
+                &candidate.bss,
+                self.local().ok_or(Error::State)?,
+                ssid,
+                mode,
+                super::super::ht::local(),
+            )
+        } else {
+            JoinPlan::prepare(
+                &candidate.bss,
+                self.local().ok_or(Error::State)?,
+                ssid,
+                mode,
+            )
+        }
         .map_err(Error::Management)?;
         plan.append_sme_ies(ies).map_err(Error::Management)?;
         let (rates, basic) = plan.legacy_rates();
@@ -511,8 +773,18 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             armed: true,
         };
         let result = async {
-            self.prepare_station_peer(bssid, rates, basic, capability)
-                .await?;
+            super::super::ht::wait(
+                self.station
+                    .calibration
+                    .as_ref()
+                    .ok_or(Error::State)?
+                    .clone(),
+                self.station.ht.clone(),
+                self.permission.ok_or(Error::State)?,
+                environment,
+                self.prepare_station_peer(bssid, rates, basic, capability),
+            )
+            .await?;
             let auth = self
                 .station
                 .plan
@@ -535,34 +807,71 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         .as_ref()
                         .ok_or(Error::State)?
                         .legacy_rates();
-                    super::super::station_control::configure_rates(
-                        &self.io,
-                        rates,
-                        basic,
-                        self.station.capability,
-                    )?;
+                    self.station_publication(environment, || {
+                        super::super::station_control::configure_rates(
+                            &self.io,
+                            rates,
+                            basic,
+                            self.station.capability,
+                        )
+                    })?;
                     if let Some(p) = self.station.wmm {
                         let calibration =
                             self.station.calibration.as_ref().ok_or(Error::Profile)?;
-                        calibration.with_current(|| {
+                        let program = || {
+                            if self.station.ht_profile.is_some() {
+                                return super::super::wmm::program_ht(&self.io, p);
+                            }
                             super::super::wmm::program(
                                 &self.io,
                                 p,
                                 self.station.capability & 0x400 != 0,
                             )
-                        })?;
+                        };
+                        if let Some(ht) = &self.station.ht {
+                            ht.invoke(program)?;
+                        } else {
+                            calibration.with_current(program)?;
+                        }
                         self.check_station_policy(environment)?;
                         self.packet.qos = true;
                     }
-                    self.complete_station_peer_admitted(
-                        bssid,
-                        self.station.aid.ok_or(Error::State)?,
-                        environment.admission().map(Arc::as_ref),
-                        |owner| {
-                            owner.check_station_policy(environment).map_err(|_| {
-                                RadioError::Power(super::super::channel_power::Error::Policy)
-                            })
-                        },
+                    if let Some(profile) = self.station.ht_profile {
+                        if self.station.wmm.is_none()
+                            || profile.operation().protection() != 0
+                            || profile.tx_sgi20()
+                            || profile.rx_sgi20()
+                        {
+                            return Err(Error::Profile);
+                        }
+                        let ht = self.station.ht.as_ref().ok_or(Error::Profile)?;
+                        ht.invoke(|| super::super::station_control::ht_timing(&self.io))?;
+                        ht.readback(&self.io, self.station.ht_indices, true)?;
+                        self.packet.ht = true;
+                    }
+                    let base = self
+                        .station
+                        .calibration
+                        .as_ref()
+                        .ok_or(Error::State)?
+                        .clone();
+                    let ht = self.station.ht.clone();
+                    let permission = self.permission.ok_or(Error::State)?;
+                    super::super::ht::wait(
+                        base,
+                        ht,
+                        permission,
+                        environment,
+                        self.complete_station_peer_admitted(
+                            bssid,
+                            self.station.aid.ok_or(Error::State)?,
+                            environment.admission().map(Arc::as_ref),
+                            |owner| {
+                                owner.check_station_policy(environment).map_err(|_| {
+                                    RadioError::Power(super::super::channel_power::Error::Policy)
+                                })
+                            },
+                        ),
                     )
                     .await?;
                     self.check_station_policy(environment)?;
@@ -689,16 +998,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     return Err(Error::Profile);
                 }
                 if matches!(pending.kind, Kind::Eapol) {
-                    let security = self.station.security.as_mut().ok_or(Error::State)?;
+                    let security = self.station.security.as_ref().ok_or(Error::State)?;
                     if security.pending_frame() != Some(delivery.bytes.as_slice()) {
                         return Err(Error::Profile);
                     }
-                    security
-                        .reply_delivered(delivery.bytes.len())
-                        .map_err(Error::Security)?;
-                    if security.port_open() {
-                        self.station.phase = Phase::Open;
-                    }
+                    // A real host receipt is necessary but queued DMA must be
+                    // copied under the still-closed capture generation first.
+                    self.station.delivered_reply = Some(pending);
                 }
             }
         }
@@ -718,7 +1024,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             let Some(frame) = step.packet else {
                 continue;
             };
-            if let Ok(candidate) = Candidate::receive(&frame, own) {
+            if let Ok(candidate) = Candidate::receive(&frame, own, self.station.ht.is_some()) {
                 if self.station.phase == Phase::Passive {
                     self.cache_candidate(candidate, now);
                 } else if Some(candidate.bss.bssid) == peer {
@@ -726,6 +1032,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     if candidate.bss.ssid != old.bss.ssid
                         || candidate.rsne != old.rsne
                         || candidate.rsnxe != old.rsnxe
+                        || self.station.ht_profile.is_some()
+                            && association::phy::ApElements::parse(
+                                &candidate.bss.information_elements,
+                            ) != association::phy::ApElements::parse(
+                                &old.bss.information_elements,
+                            )
                         || self.station.native_associated
                             && self.station.wmm.is_some()
                             && narf_wireless::wmm::Parameters::parse(
@@ -754,6 +1066,32 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 }
                 return Err(Error::PeerLost);
             }
+            if bytes[0] == 0xd0
+                && self.station.ht_profile.is_some()
+                && self.station.receive_open()
+                && bytes.len() == 33
+                && bytes[1] & 0xc7 == 0
+                && bytes[4..10] == own
+                && bytes[16..22] == bytes[10..16]
+                && bytes[22] & 15 == 0
+                && bytes[24..26] == [3, 0]
+            {
+                let p = u16::from_le_bytes([bytes[27], bytes[28]]);
+                if p & 2 != 0 && (p >> 2) & 15 < 8 && bytes[31] & 15 == 0 && (p >> 6) != 0 {
+                    if self.station.controls.len() == 8 {
+                        return Err(Error::Allocation);
+                    }
+                    let mut response = vec![0xd0, 0, 0, 0];
+                    response.extend_from_slice(&bytes[10..16]);
+                    response.extend_from_slice(&own);
+                    response.extend_from_slice(&bytes[10..16]);
+                    response.extend_from_slice(&[0, 0, 3, 1, bytes[26], 37, 0]);
+                    response.extend_from_slice(&(p & !1).to_le_bytes());
+                    response.extend_from_slice(&bytes[29..31]);
+                    self.station.controls.push_back(response);
+                }
+                continue;
+            }
             let management = matches!(
                 self.station.phase,
                 Phase::Authentication | Phase::Association
@@ -765,14 +1103,44 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 if self.station.incoming.len() == 64 {
                     return Err(Error::Allocation);
                 }
-                self.station.incoming.push_back(frame);
+                self.station.incoming.push_back(Captured {
+                    admitted: self.station.receive_open(),
+                    epoch: self.station.epoch.load(Ordering::Acquire),
+                    frame,
+                });
             }
         }
-        while self.station.pending.is_none() {
-            let Some(frame) = self.station.incoming.pop_front() else {
+        if idle {
+            if let Some(reply) = self.station.delivered_reply.take() {
+                let security = self.station.security.as_mut().ok_or(Error::State)?;
+                security
+                    .reply_delivered(reply.bytes.len())
+                    .map_err(Error::Security)?;
+                let open = security.port_open();
+                self.station.retire_receive();
+                if open {
+                    self.station.phase = Phase::Open;
+                }
+            }
+        }
+        while self.station.pending.is_none() && self.station.delivered_reply.is_none() {
+            let Some(Captured {
+                frame,
+                mut admitted,
+                epoch,
+            }) = self.station.incoming.pop_front()
+            else {
                 break;
             };
             let bytes = frame.bytes();
+            let key = eapol(bytes, own, peer.ok_or(Error::State)?);
+            let private = private_eapol(bytes, own, peer.ok_or(Error::State)?);
+            if epoch != self.station.epoch.load(Ordering::Acquire) {
+                if !private {
+                    continue;
+                }
+                admitted = false; // private complete plaintext EAPOL alone may cross M2 receipt.
+            }
             match self.station.phase {
                 Phase::Authentication => {
                     if let Some(assoc) = self
@@ -815,12 +1183,60 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             self.station.wmm = Some(p);
                         }
                         self.station.capability &= capability;
+                        self.station.ht_profile = self
+                            .station
+                            .plan
+                            .as_ref()
+                            .and_then(|p| p.negotiated_phy())
+                            .map(|p| *p.ht());
+                        if self.station.ht_profile.is_some_and(|p| {
+                            p.operation().primary() != 1 || p.operation().protection() != 0
+                        }) {
+                            return Err(Error::Profile);
+                        }
                         self.station.aid = Some(aid);
                         self.station.phase = Phase::Configuring;
                         return Ok(false);
                     }
                 }
                 Phase::FourWay | Phase::Open => {
+                    let aggregate =
+                        bytes[0] == 0x88 && bytes.get(24).is_some_and(|q| q & 0x80 != 0);
+                    if !key && (!admitted || !self.station.receive_open()) {
+                        continue;
+                    }
+                    if aggregate {
+                        if self.station.ht_profile.is_none()
+                            || bytes[22] & 15 != 0
+                            || bytes
+                                .get(24..26)
+                                .is_none_or(|q| q[0] & 0xf0 != 0x80 || q[1] != 0)
+                        {
+                            continue;
+                        }
+                        let frames = if let Some(security) = &mut self.station.security {
+                            security.receive_amsdu(&frame).map_err(Error::Security)?
+                        } else {
+                            if bytes[1] & 0xc7 != 2 || bytes[16..22] == [0; 6] || bytes[16] & 1 != 0
+                            {
+                                continue;
+                            }
+                            narf_wireless::amsdu::decode(
+                                &bytes[26..],
+                                own,
+                                bytes[4..10].try_into().unwrap(),
+                            )
+                            .ok()
+                        };
+                        if let Some(frames) = frames {
+                            if self.station.received.len() + frames.len() > 256 {
+                                return Err(Error::Allocation);
+                            }
+                            self.station.received.extend(frames);
+                            self.station.last_peer = now;
+                        }
+                        continue;
+                    }
                     if let Some(security) = &mut self.station.security {
                         let handshake_active = security.handshake_active();
                         match security
@@ -833,6 +1249,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                                 if self.station.admitted && !handshake_active {
                                     self.station.deadline = now.saturating_add(5000);
                                 }
+                                self.station.retire_receive();
+                                self.station.controls.clear();
                                 self.queue_station(reply, Kind::Eapol, now, false, environment)?;
                                 self.station.last_peer = now;
                             }
@@ -859,11 +1277,21 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 _ => {}
             }
         }
+        if self.station.pending.is_none()
+            && self.station.delivered_reply.is_none()
+            && self.station.receive_open()
+        {
+            if let Some(frame) = self.station.controls.pop_front() {
+                self.queue_station(frame, Kind::Control, now, true, environment)?;
+            }
+        }
         Ok(idle)
     }
     pub(crate) fn station_transmit_ready(&self) -> bool {
         self.station_peer().is_some()
             && self.station.pending.is_none()
+            && self.station.delivered_reply.is_none()
+            && self.station.controls.is_empty()
             && self.transmit_ready()
             && self
                 .station
@@ -927,6 +1355,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         self.station.phase = Phase::Stopping;
         self.station.received.clear();
+        self.station.retire_receive();
+        self.station.controls.clear();
         self.station.incoming.clear();
         self.station.pmk = None;
         if let Some(security) = &mut self.station.security {
