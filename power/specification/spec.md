@@ -722,6 +722,25 @@ is_running_low_on_battery()` when policy enables it. The §3.3
 production-S3 arm/validated gates are unchanged: the service
 requests suspend, the core still decides.
 
+The platform battery provider behind `StateProviders.battery`
+is itself multi-source. The composition root
+(`drivers/platform` power-service wiring) evaluates the ACPI
+control-method battery (`PNP0C0A`, `_BIF`/`_BST`) first; on
+machines whose battery subsystem is an ACPI Smart Battery
+Subsystem (`ACPI0002`, ACPI §10.1) — which has no control-method
+battery at all — it falls back to the SBS driver
+(`drivers/platform` `sbs`), which speaks the Smart Battery Data
+Specification command set over the SMBus host (battery at 0x0B,
+selector / system manager at 0x0A, charger at 0x09) and maps the
+result into the same `(BatteryInfo, BatteryState)` pair,
+including the `CAPACITY_MODE` 10 mW scaling and the selector
+routing for multi-battery subsystems. Consumers of `snapshot()`
+see one battery abstraction regardless of which transport
+produced it. An SBS battery that fails validation (NAK,
+implausible values, a nonzero status error code, a malformed
+block string) is reported absent by the provider — never
+published with fabricated values.
+
 ## 4. Invariants & safety properties
 
 - Suspend never returns without either `WokeUp` or `Aborted`;

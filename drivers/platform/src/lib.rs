@@ -62,6 +62,12 @@ pub mod power_service;
 /// Intel DTT — Dynamic Tuning Technology processor thermal device.
 #[cfg(target_arch = "x86_64")]
 pub mod proc_thermal;
+/// ACPI Smart Battery Subsystem (ACPI0002): SBS battery /
+/// selector / charger over the SMBus host. x86_64 only — the
+/// in-tree SMBus host is the ICH PIO controller and the power
+/// service it feeds is x86_64-gated too.
+#[cfg(target_arch = "x86_64")]
+pub mod sbs;
 pub mod smbus;
 pub mod thermal;
 pub mod tpm;
@@ -187,6 +193,16 @@ pub fn register_initcalls() {
     #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "acpi-buttons", || {
         buttons::init();
+        InitResult::Ok
+    });
+    // SBS smart battery (ACPI0002): discovery needs the probed
+    // SMBus host controller (PCI probes run at Stage::Device,
+    // between Subsys and Late), and the power-service battery
+    // provider falls back to the SBS snapshot — so this runs at
+    // Stage::Late, registered ahead of power-service-wiring.
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Late, "acpi-sbs", || {
+        sbs::init();
         InitResult::Ok
     });
     // Power-service wiring: subscribe the lid/button event sources
