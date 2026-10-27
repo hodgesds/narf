@@ -695,11 +695,16 @@ mod smokes {
                     st.next_handle += 1;
                     st.primaries.push(handle);
 
-                    // Parameters: outPrivate(2+0) + outPublic(echo) +
-                    // creationData(2+0) + creationHash(2+0) +
-                    // ticket: TPM_ST_CREATION(2) + hierarchy(4) + digest(2+0).
+                    // Spec layout (Part 3 §12.2 — CreatePrimary
+                    // has NO outPrivate; #1002: this fake
+                    // previously emitted one and the parser read
+                    // it back, a pair that agreed with each other
+                    // and not with silicon):
+                    // outPublic(echo) + creationData(2+0) +
+                    // creationHash(2+0) + ticket:
+                    // TPM_ST_CREATION(2) + hierarchy(4) +
+                    // digest(2+0).
                     let mut body: Vec<u8> = Vec::new();
-                    body.extend_from_slice(&0u16.to_be_bytes()); // outPrivate
                     body.extend_from_slice(&(in_public.len() as u16).to_be_bytes());
                     body.extend_from_slice(&in_public);
                     body.extend_from_slice(&0u16.to_be_bytes()); // creationData

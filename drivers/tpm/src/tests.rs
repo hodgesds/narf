@@ -482,11 +482,43 @@ mod smokes {
                     && o.ticket_digest == alloc::vec![0xDD; 2] => {}
             _ => return TestResult::Fail("Create response parsed incorrectly"),
         }
-        // CreatePrimary: same params behind a handle.
+        // CreatePrimary: NOT the Create layout — Part 3 §12.2
+        // returns outPublic first, with no outPrivate at all
+        // (#1002: this fixture previously fed the Create params
+        // to the CreatePrimary parser and both agreed on a frame
+        // silicon never sends; the two layouts are now pinned
+        // apart — the Create params above, fed here, must NOT
+        // parse as a CreatePrimary response with the same
+        // outPublic).
+        let mut cp_params = alloc::vec::Vec::new();
+        cp_params.extend_from_slice(&tpm2b(&[0xBB; 6])); // outPublic
+        cp_params.extend_from_slice(&tpm2b(&[])); // creationData
+        cp_params.extend_from_slice(&tpm2b(&[0xCC; 4])); // creationHash
+        cp_params.extend_from_slice(&0x8021u16.to_be_bytes());
+        cp_params.extend_from_slice(&0x4000_0001u32.to_be_bytes());
+        cp_params.extend_from_slice(&tpm2b(&[0xDD; 2]));
+        let frame = sessions_frame(Some(0x8000_0100), &cp_params);
+        match cmds::parse_create_primary_response(&frame) {
+            Ok((0x8000_0100, o))
+                if o.out_public == alloc::vec![0xBB; 6]
+                    && o.creation_hash == alloc::vec![0xCC; 4]
+                    && o.ticket_tag == 0x8021
+                    && o.ticket_digest == alloc::vec![0xDD; 2] => {}
+            _ => return TestResult::Fail("CreatePrimary response parsed incorrectly"),
+        }
+        // The Create-shaped frame (outPrivate first) must not be
+        // silently accepted as CreatePrimary: its first TPM2B is
+        // 4 bytes, so a correct §12.2 walk reads outPublic as
+        // [0xAA; 4] — anything else means the layouts are still
+        // conflated.
         let frame = sessions_frame(Some(0x8000_0100), &params);
         match cmds::parse_create_primary_response(&frame) {
-            Ok((0x8000_0100, o)) if o.out_public == alloc::vec![0xBB; 6] => {}
-            _ => return TestResult::Fail("CreatePrimary response parsed incorrectly"),
+            Ok((_, o)) if o.out_public == alloc::vec![0xAA; 4] => {}
+            _ => {
+                return TestResult::Fail(
+                    "Create-layout frame must walk as §12.2 (outPublic = first TPM2B)",
+                )
+            }
         }
         // Load: handle + name TPM2B.
         let frame = sessions_frame(Some(0x8000_0200), &tpm2b(&[1, 2, 3]));

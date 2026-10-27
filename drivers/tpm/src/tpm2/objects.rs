@@ -57,6 +57,18 @@ pub const OBJ_ATTR_SEAL: u32 = OBJ_FIXED_TPM
     | OBJ_SENSITIVE_DATA_ORIGIN
     | OBJ_USER_WITH_AUTH;
 
+/// Attribute set for a sealed data object whose contents the
+/// *caller* supplies in `inSensitive` (the suspend anchor's SMS
+/// wrap): identical to [`OBJ_ATTR_SEAL`] except
+/// `sensitiveDataOrigin` is CLEAR. Part 1's creation rule is
+/// strict here — with the bit SET the TPM generates the data
+/// itself and `inSensitive.data` must be empty; with it CLEAR
+/// the data comes from the caller. An anchor that seals caller
+/// bytes under the SET form would get a TPM-generated blob and
+/// silently lose the secret it was asked to wrap.
+pub const OBJ_ATTR_SEALED_DATA: u32 =
+    OBJ_FIXED_TPM | OBJ_ST_CLEAR | OBJ_FIXED_PARENT | OBJ_USER_WITH_AUTH;
+
 // ── Key type selector ─────────────────────────────────────────────────
 
 /// The set of key algorithms NARF supports natively.
@@ -198,6 +210,28 @@ pub fn rsa2048_template(attributes: u32) -> Vec<u8> {
     v.extend_from_slice(&2048u16.to_be_bytes()); // keyBits = 2048
     v.extend_from_slice(&0u32.to_be_bytes()); // exponent = 0 (→ 65537)
                                               // unique (TPM2B_PUBLIC_KEY_RSA): size = 0 (new key)
+    v.extend_from_slice(&0u16.to_be_bytes());
+    v
+}
+
+/// Encode a `TPMT_PUBLIC` template for a sealed data object
+/// (Part 2 §12.2.4): type `TPM_ALG_KEYEDHASH`, scheme
+/// `TPM_ALG_NULL` (a data blob — no signing or encryption scheme
+/// is meaningful for it), attributes [`OBJ_ATTR_SEALED_DATA`],
+/// and the given `authPolicy` — for the suspend anchor, the
+/// PolicyPCR digest computed through a trial session (design
+/// §8.3). This is the inner bytes of `TPM2B_PUBLIC`.
+pub fn keyedhash_seal_template(auth_policy: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(16 + auth_policy.len());
+    v.extend_from_slice(&super::TPM_ALG_KEYEDHASH.to_be_bytes()); // type
+    v.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes()); // nameAlg
+    v.extend_from_slice(&OBJ_ATTR_SEALED_DATA.to_be_bytes()); // objectAttributes
+    v.extend_from_slice(&(auth_policy.len() as u16).to_be_bytes()); // authPolicy
+    v.extend_from_slice(auth_policy);
+    // TPMS_KEYEDHASH_PARMS: scheme (TPMT_KEYEDHASH_SCHEME) =
+    // TPM_ALG_NULL — the union carries no detail bytes for NULL.
+    v.extend_from_slice(&TPM_ALG_NULL.to_be_bytes());
+    // unique (TPM2B_DIGEST): size = 0 (new object)
     v.extend_from_slice(&0u16.to_be_bytes());
     v
 }
