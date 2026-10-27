@@ -28,7 +28,11 @@
 //!   routes the GSI through the IOAPIC honouring ACPI flags.
 //! - Programs the standard DW init sequence (disable, set timing
 //!   constants for 100 kHz / 400 kHz, master 7-bit, restart enable,
-//!   enable) on `start`.
+//!   enable) on `start`. When any device on the bus declares a
+//!   `ConnectionSpeed` in its `_CRS` `I2cSerialBus` descriptor,
+//!   the counts are instead derived from the composed bus speed
+//!   (#772, `crate::dw_speed`); with no declaration the fixed
+//!   constants below remain, byte-for-byte.
 //! - `transfer()` issues a sequence of I2cOp::Write / I2cOp::Read
 //!   ops as one atomic bus transaction, terminating with STOP. Async
 //!   wait-for-IRQ on TX_EMPTY / RX_FULL / TX_ABRT.
@@ -137,6 +141,12 @@ const SS_LCNT: u32 = 0x01fb;
 const FS_HCNT: u32 = 0x002f;
 const FS_LCNT: u32 = 0x006a;
 
+/// DW core input clock on the FCH, in kHz: 133 MHz per the AMD
+/// PPR cited in the module header. Only used to derive SCL
+/// counts when a bus speed is declared via `_CRS` (#772); the
+/// fixed constants above remain the no-declaration default.
+const FCH_IC_CLK_KHZ: u32 = 133_000;
+
 // ── Bus mutex timeout ──────────────────────────────────────────────
 //
 // Per-byte budget: a single 9-bit I2C frame at 100 kHz is ~90 µs;
@@ -180,6 +190,12 @@ pub struct AmdFchI2c<R = MmioDwRegs> {
     /// requires the controller to be disabled to update IC_TAR, so
     /// avoiding the write is meaningful for short HID reads.
     last_target: AtomicU8,
+    /// Composed `_CRS` bus speed for this controller's bus
+    /// (#772), set by probe via [`crate::dw_speed::bus_speed_hz`]
+    /// before `enable()`. `None` = nothing on the bus declares a
+    /// speed; `enable()` then programs the fixed default
+    /// constants, exactly as before #772.
+    bus_speed_hz: Option<u32>,
 }
 
 impl<R> core::fmt::Debug for AmdFchI2c<R> {
@@ -232,7 +248,21 @@ impl<R: DwRegs> AmdFchI2c<R> {
             bus: AsyncMutex::new(()),
             enabled: AtomicBool::new(false),
             last_target: AtomicU8::new(0xff), // 0xff = sentinel "no cached target"
+            bus_speed_hz: None,
         }
+    }
+
+    /// Record the composed `_CRS` bus speed for this controller's
+    /// bus (#772). Probe calls this before `enable()`; `None`
+    /// (the default) keeps the fixed-constant programming.
+    pub fn set_bus_speed_hz(&mut self, speed_hz: Option<u32>) {
+        self.bus_speed_hz = speed_hz;
+    }
+
+    /// The bus speed recorded by [`Self::set_bus_speed_hz`], for
+    /// probe logging.
+    pub fn bus_speed_hz(&self) -> Option<u32> {
+        self.bus_speed_hz
     }
 
     #[inline]
@@ -267,10 +297,30 @@ impl<R: DwRegs> AmdFchI2c<R> {
         }
     }
 
-    /// Program the controller to a known-good 400 kHz master config.
-    /// Must be called once before the first `transfer`. Idempotent —
-    /// repeated calls reprogram the same constants.
+    /// Program the controller as a 7-bit master with restart
+    /// enabled. Must be called once before the first `transfer`.
+    /// Idempotent — repeated calls reprogram the same values.
+    ///
+    /// Timing: when probe recorded a composed `_CRS` bus speed
+    /// ([`Self::set_bus_speed_hz`], #772), the SCL counts are
+    /// derived from it at the FCH input clock via
+    /// [`crate::dw_speed::timings_for`] and `IC_CON.SPEED` selects
+    /// the composed mode; otherwise the fixed 400 kHz constants
+    /// are programmed, byte-for-byte the pre-#772 behaviour.
     pub fn enable(&self) -> Result<(), I2cError> {
+        let (speed_bits, ss_hcnt, ss_lcnt, fs_hcnt, fs_lcnt) = match self.bus_speed_hz {
+            Some(hz) => {
+                let t = crate::dw_speed::timings_for(FCH_IC_CLK_KHZ, hz);
+                (
+                    t.mode.ic_con_speed_bits(),
+                    t.ss_hcnt,
+                    t.ss_lcnt,
+                    t.fs_hcnt,
+                    t.fs_lcnt,
+                )
+            }
+            None => (IC_CON_SPEED_FAST, SS_HCNT, SS_LCNT, FS_HCNT, FS_LCNT),
+        };
         // Disable first — IC_CON / IC_TAR / IC_*CNT are write-locked
         // while ENABLE=1.
         // SAFETY: bus mutex held externally during start; here the
@@ -287,15 +337,12 @@ impl<R: DwRegs> AmdFchI2c<R> {
             }
             self.write32(
                 IC_CON,
-                IC_CON_MASTER_MODE
-                    | IC_CON_SPEED_FAST
-                    | IC_CON_IC_SLAVE_DISABLE
-                    | IC_CON_RESTART_EN,
+                IC_CON_MASTER_MODE | speed_bits | IC_CON_IC_SLAVE_DISABLE | IC_CON_RESTART_EN,
             );
-            self.write32(IC_SS_SCL_HCNT, SS_HCNT);
-            self.write32(IC_SS_SCL_LCNT, SS_LCNT);
-            self.write32(IC_FS_SCL_HCNT, FS_HCNT);
-            self.write32(IC_FS_SCL_LCNT, FS_LCNT);
+            self.write32(IC_SS_SCL_HCNT, ss_hcnt);
+            self.write32(IC_SS_SCL_LCNT, ss_lcnt);
+            self.write32(IC_FS_SCL_HCNT, fs_hcnt);
+            self.write32(IC_FS_SCL_LCNT, fs_lcnt);
             self.write32(IC_RX_TL, 0); // wake on first byte
             self.write32(IC_TX_TL, 0); // wake when FIFO drains
             self.write32(IC_INTR_MASK, 0); // mask all — driver polls/clears
@@ -646,12 +693,19 @@ fn probe_one(path: &str) -> Option<()> {
     // the driver falls back to polling.
     let irq_vec = res.gsi.and_then(|gsi| try_route_irq(gsi, res.irq_flags));
 
-    let driver = Arc::new(AmdFchI2c::new(
+    let mut driver = AmdFchI2c::new(
         path.to_string(),
         PhysAddr::new(res.mmio_base),
         res.mmio_len,
         irq_vec,
-    ));
+    );
+    // #772: compose the bus speed from the _CRS ConnectionSpeed
+    // of every device attached to this controller (slowest wins,
+    // Linux i2c_acpi_find_bus_speed semantics). None = nothing
+    // declares a speed; enable() keeps its fixed defaults.
+    driver.set_bus_speed_hz(crate::dw_speed::bus_speed_hz(path));
+    let bus_speed = driver.bus_speed_hz();
+    let driver = Arc::new(driver);
 
     if let Err(e) = driver.probe_component_type() {
         let _ = writeln!(
@@ -676,7 +730,7 @@ fn probe_one(path: &str) -> Option<()> {
     let registered = crate::registry::register_unique(driver.clone());
     let _ = writeln!(
         narf_console::Writer,
-        "  amd-fch-i2c: {} mmio={:#x}+{:#x} irq=GSI{}->v{}",
+        "  amd-fch-i2c: {} mmio={:#x}+{:#x} irq=GSI{}->v{} bus-speed={}",
         path,
         res.mmio_base,
         res.mmio_len,
@@ -686,6 +740,9 @@ fn probe_one(path: &str) -> Option<()> {
         irq_vec
             .map(|v| format!("{}", v))
             .unwrap_or_else(|| "polled".into()),
+        bus_speed
+            .map(|hz| format!("{}Hz (_CRS)", hz))
+            .unwrap_or_else(|| "default".to_string()),
     );
     let _ = registered; // returned for the unique-merge case; we don't need it here
     Some(())
