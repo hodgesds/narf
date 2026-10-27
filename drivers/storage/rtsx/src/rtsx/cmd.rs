@@ -1,8 +1,9 @@
 //! Realtek RTSX host-command-buffer engine.
 //!
 //! The RTSX command engine is a simple FIFO of 4-byte entries that are
-//! written to a DMA-coherent page and dispatched by writing the entry
-//! count to HCBCTLR.  Each 32-bit entry is:
+//! written to a DMA-coherent page and dispatched by writing
+//! `HCBCTLR = TRIGGER | HW_AUTO_RSP | (len_bytes & 0x00FF_FFFF)`.
+//! Each 32-bit entry is:
 //!
 //! ```text
 //!  [31:30] type  — 0=READ, 1=WRITE, 2=CHECK
@@ -11,9 +12,13 @@
 //!  [7:0]   data  — data byte
 //! ```
 //!
-//! Reference: Linux `include/linux/rtsx_pci.h` `rtsx_pci_add_cmd`
-//! inline, and `drivers/misc/cardreader/rtsx_pcr.c`
-//! `rtsx_pci_send_cmd`.
+//! After the batch completes (BIPR.TRANS_OK), the results of the
+//! READ_REG and CHECK_REG entries occupy the start of the command
+//! buffer page, in entry order ("hardware auto response").
+//!
+//! Reference: Linux `include/linux/mfd/rtsx_pci.h` `rtsx_pci_add_cmd`
+//! inline, and `drivers/mfd/rtsx_pcr.c` `rtsx_pci_send_cmd` /
+//! `rtsx_pci_send_cmd_no_wait`.
 
 use super::regs::{CHECK_REG_CMD, READ_REG_CMD, WRITE_REG_CMD};
 
@@ -153,15 +158,18 @@ impl CmdBuf {
     }
 }
 
-/// Build the 6-byte SD command frame written into SD_CMD0..SD_CMD5.
+/// Build the 48-bit SD command frame for `cmd_index` / `arg`.
 ///
 /// SD Physical Layer Simplified Spec v8.00 §7.3.1: the command frame
-/// is 48 bits = start(1) | direction(1) | command_index(6) |
-/// argument(32) | CRC7(7) | end(1).  The RTSX engine fills CRC7; the
-/// host provides the 6 bytes as:
-///   CMD0[5:0] = command_index (without start/direction bits)
-///   CMD1..CMD4 = argument[31:0] big-endian
-///   CMD5 = CRC7 (hardware fills this; set to 0)
+/// is 48 bits = start(0) | direction(1) | command_index(6) |
+/// argument(32) | CRC7(7) | end(1).
+///
+/// The RTSX controller generates CRC7 itself (SD_CFG2 defaults to
+/// calculate + check), so the host writes only bytes 0..4 (header +
+/// argument) into SD_CMD0..SD_CMD4 — exactly what Linux
+/// `sd_send_cmd_get_rsp` in `rtsx_pci_sdmmc.c` programs. Byte 5 of the
+/// returned array is the CRC7 slot, kept so the full wire frame is
+/// visible (and pinned by tests); it is never written to SD_CMD5.
 #[inline]
 pub fn build_sd_cmd_frame(cmd_index: u8, arg: u32) -> [u8; 6] {
     [
