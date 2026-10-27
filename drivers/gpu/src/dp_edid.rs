@@ -31,6 +31,12 @@ const EDID_I2C_ADDR_SHIFTED: u32 = 0x50 << 1;
 /// AUX caps each read at 16 bytes (DP §2.7.4).
 const AUX_CHUNK: usize = 16;
 
+/// Zero-filled read-length placeholder for EDID chunk reads.
+/// Per the `AuxRequest` read convention (see
+/// `dp_aux::AuxChannel::dpcd_read`), a read's `data` length is
+/// the requested byte count; the contents never reach the wire.
+const ZERO_CHUNK: [u8; AUX_CHUNK] = [0; AUX_CHUNK];
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum EdidReadError {
     /// The downstream AUX transport returned an error.
@@ -76,7 +82,10 @@ pub fn read_panel_edid<'a, A: AuxChannel>(
         let req = AuxRequest {
             cmd: AuxCommand::I2cReadMot,
             address: EDID_I2C_ADDR_SHIFTED | 1, // read flag
-            data: &[],
+            // Length placeholder: `chunk_len` bytes requested.
+            // `&[]` here encoded LEN = 0 and the real transport
+            // rejected every chunk reply as a short reply.
+            data: &ZERO_CHUNK[..chunk_len],
         };
         let mut reply = [0u8; AUX_CHUNK + 1];
         let resp = aux.transact(&req, &mut reply[..1 + chunk_len])?;

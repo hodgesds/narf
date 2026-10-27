@@ -212,12 +212,12 @@ DDI A / eDP, single pipe):
 - **CDCLK floor** — CDCLK is raised (never lowered) to the
   smallest ladder frequency satisfying the PRM rule
   `pixel rate <= 2 * CDCLK` (CD2X divider 1, pipe A).
-- **Watermarks / DBUF allocation** — the PRM's "Display Buffer
-  Allocation and Watermark Programming Prior to OS Boot" basic
-  programming: 160 DBUF blocks to Pipe A's primary plane,
-  level-0 watermark 160 blocks / 2 lines, higher levels off.
-  The full latency-based algorithm (pcode mailbox latencies)
-  and DBUF_CTL power-request sequencing remain follow-on work.
+- **Watermarks / DBUF allocation** — lane 1 programmed the
+  PRM's "Display Buffer Allocation and Watermark Programming
+  Prior to OS Boot" basics (160 DBUF blocks, one level). Lane
+  Q6 (#1024) replaced that with the full latency-based
+  algorithm — see the Q6 note below; the pre-boot programming
+  remains as the fallback when the pcode latency read fails.
 - **DDI_BUF_TRANS** — the modeset loads the swing table for
   the training start rate before link training and reloads if
   training settles elsewhere. RBR/HBR resolve to the HBR2 table
@@ -227,7 +227,8 @@ DDI A / eDP, single pipe):
   "DisplayPort Mode PLL Values" for the 19.2/38.4 MHz reference
   family (DCO 8100 MHz for all rates; P/K per rate). The 24 MHz
   family shares the dividers with int 0x151 / frac 0x4000;
-  DSSM reference-frequency selection is not yet implemented.
+  lane Q6 (#1024) implemented the DSSM reference-frequency
+  selection between the families — see the Q6 note below.
 - **PLANE_CTL format pinned** — source-format discriminants
   corrected to the ICL+ 5-bit field values (XRGB_8888 =
   0b01000); fixture-pinned against PRM Vol. 14.
@@ -236,6 +237,54 @@ DDI A / eDP, single pipe):
   protocol the AMD display pipeline uses, and the DRM card
   carries real KMS mode state (CRTC 1, encoder 2 TMDS,
   connector 3 eDP) instead of the identity stub.
+
+### Lane Q6 (#1024) — display follow-ons
+
+- **DBUF_CTL power sequencing** — the modeset requests power
+  for both DBUF slices (`DBUF_CTL` S1 0x45008 / S2 0x44FE8,
+  POWER_REQUEST bit 31 → POWER_STATE bit 30, addresses and
+  fields from the display register volume / i915
+  `skl_watermark_regs.h`; they are not in PRM Vol. 12) before
+  programming watermarks, and fails the modeset with
+  `DbufPowerTimeout` if a slice never grants. The
+  tracker-state-service fields are left at firmware values;
+  their programming belongs to the MDCLK/CDCLK-ratio and
+  joined-MBUS machinery (multi-pipe, #1017).
+- **Latency-based watermarks** (`intel_gpu_wm`) — the Gen12
+  algorithm: pcode memory latencies (`intel_gpu_pcode`,
+  GEN9_PCODE_READ_MEM_LATENCY) sanitised / made monotonic /
+  WaWmMemoryReadLatency-adjusted, method1/method2 selection,
+  per-level blocks/lines with monotonic clamping,
+  min_ddb_alloc validation against the plane's allocation,
+  transition watermarks (wm0 + 14), and the SAGV watermark at
+  (GEN12_PCODE_READ_SAGV_BLOCK_TIME_US + level-0 latency) in
+  the dedicated SAGV registers (Gen12 has 6 regular levels).
+  Scope: linear surfaces, one pipe, one plane — the plane
+  receives the whole 2048-block DBUF (the degenerate
+  single-consumer allocation); per-pipe slice arbitration is
+  #1017. If the pcode latency read fails or level 0 is
+  unusable, the modeset falls back to lane 1's pre-boot
+  programming. SAGV *control* (pcode 0x21) stays with the
+  bandwidth manager; this lane only consumes the block time.
+- **DSSM reference-clock selection** — `program_dpll` reads
+  DSSM (0x51004) bits [31:29] (0 → 24 MHz, 1 → 19.2 MHz,
+  2 → 38.4 MHz; reserved encodings fall through to 24 MHz,
+  mirroring i915 `icl_readout_refclk`) and picks the matching
+  combo-PLL row family: the 24 MHz rows (DCO int 0x151 /
+  frac 0x4000) alongside lane 1's 19.2/38.4 MHz rows, with
+  identical P/K/Q dividers. The PRM table's intermediate
+  rates (2.16 / 4.32 / 6.48 Gbps) use distinct DCO rows and
+  are not in the link-training ladder; they remain unencoded.
+- **Scripted-DPCD full-modeset fixture** — the modeset tests
+  carry a stateful sink model (register file with computed
+  status bits, a pcode endpoint, and an AUX engine driving a
+  DP training state machine + EDID EEPROM) over which
+  `Modeset::modeset()` runs end-to-end: EDID mode returned,
+  family-correct CFGCR0, hand-computed watermark words, and
+  the TPS1 → TPS3 → off pattern history with the
+  sink-requested swing applied. Q4's branch (#1114) grows a
+  sibling sink model at the DP-codec layer; the two should be
+  unified once both are on main.
 
 ## 8. Command submission (Stage 5 — `intel_gpu_rcs`)
 

@@ -52,7 +52,7 @@ use crate::dp_aux::AuxError;
 use crate::intel_gpu_aux::{IntelAux, MmioWindow};
 use crate::intel_gpu_ddi::Ddi;
 use crate::intel_gpu_pipes::Pipe;
-use crate::intel_gpu_pll::{combo_coeffs, encode_cfgcr0, LinkRate};
+use crate::intel_gpu_pll::{combo_coeffs, decode_refclk_family, encode_cfgcr0, LinkRate, DSSM};
 
 // ── Power Well control register block (Tiger Lake PRM Vol. 11
 // §"Power Wells"; Linux i915 `intel_display_regs.h`) ─────────────
@@ -246,6 +246,10 @@ pub enum ModesetError {
     LinkTrainingEq,
     /// Power well failed to enable within its grant window.
     PowerWellTimeout,
+    /// A DBUF slice never granted power after its
+    /// `DBUF_CTL.POWER_REQUEST` — the watermark / DDB
+    /// programming would point at unpowered SRAM.
+    DbufPowerTimeout,
     /// Caller-supplied framebuffer doesn't satisfy Gen12 plane
     /// alignment (stride must be a multiple of 64 for linear
     /// surfaces).
@@ -353,11 +357,12 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // written before lane 1 — routing was firmware leftover.
         self.program_trans_ddi_func_ctl();
 
-        // Step 7d (lane 1): single-pipe watermarks + DBUF
-        // allocation (PRM pre-OS-boot basic programming) before
-        // the plane is armed; the PLANE_SURF write in step 8
-        // latches them.
-        self.program_watermarks();
+        // Step 7d (lane 1; extended by Q6 #1024): power the
+        // DBUF slices, then program the latency-based
+        // watermarks + DBUF allocation before the plane is
+        // armed; the PLANE_SURF write in step 8 latches them.
+        self.enable_dbuf_slices()?;
+        self.program_watermarks(&mode, primary_fb);
 
         // Step 8: program primary plane — framebuffer pointer,
         // stride, format.
@@ -553,7 +558,11 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// (`icl_pll_power_enable`, `icl_pll_enable`).
     fn program_dpll(&mut self, mode: &Mode) -> Result<(), ModesetError> {
         let rate = link_rate_for_pixel_clock(mode.pixel_clock_khz);
-        let coeffs = match combo_coeffs(rate) {
+        // Reference-clock family from the DSSM strap (Q6,
+        // #1024): a 24 MHz-strapped part programmed with the
+        // 19.2 MHz rows gets a DCO 26% off target.
+        let family = decode_refclk_family(self.mmio.read32(DSSM));
+        let coeffs = match combo_coeffs(rate, family) {
             Some(c) => c,
             None => return Err(ModesetError::PllLockTimeout),
         };
@@ -819,22 +828,96 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         compiler_fence(Ordering::SeqCst);
     }
 
-    /// Single-pipe watermarks + DBUF allocation, using the
-    /// PRM's "Display Buffer Allocation and Watermark
-    /// Programming Prior to OS Boot" basic programming (TGL PRM
-    /// Vol. 12): 160 DBUF blocks for Pipe A's primary plane
-    /// (PLANE_BUF_CFG = END 159 / START 0), level-0 watermark
-    /// 160 blocks / 2 lines (0x800080A0), all higher levels,
-    /// SAGV and transition watermarks disabled. The PRM scopes
-    /// this programming to any resolution, linear surfaces,
-    /// <=32 bpp, one universal plane per pipe — exactly this
-    /// driver's shape. The full latency-based watermark
-    /// algorithm needs pcode-mailbox memory latencies and is
-    /// follow-on work; the DBUF_CTL power-request sequencing
-    /// likewise remains (its register detail is not in Vol. 12;
-    /// firmware leaves DBUF_S1 enabled, which this allocation
-    /// sub-divides).
-    fn program_watermarks(&mut self) {
+    /// Power both DBUF slices via `DBUF_CTL` POWER_REQUEST →
+    /// POWER_STATE sequencing (Q6, #1024). Runs before any
+    /// watermark programming: the DDB blocks the watermarks
+    /// reference live in the slices' SRAM.
+    fn enable_dbuf_slices(&mut self) -> Result<(), ModesetError> {
+        crate::intel_gpu_wm::request_dbuf_slices(self.mmio)
+            .map_err(|_| ModesetError::DbufPowerTimeout)
+    }
+
+    /// Latency-based watermarks + DBUF allocation (Q6,
+    /// #1024): read the memory latencies and SAGV block time
+    /// from the pcode mailbox, run the Gen12 algorithm in
+    /// `intel_gpu_wm`, validate against this driver's DDB
+    /// allocation (the whole DBUF to Pipe A's primary plane),
+    /// and program PLANE_WM levels 0..5, the SAGV and
+    /// transition watermarks, and PLANE_BUF_CFG.
+    ///
+    /// Fallback: if the pcode latency read fails, or the
+    /// computed set has no usable level 0, program lane 1's
+    /// PRM pre-OS-boot basics instead — a conservative fixed
+    /// programming the PRM scopes to exactly this driver's
+    /// shape — rather than leaving firmware watermarks of
+    /// unknown provenance in place.
+    fn program_watermarks(&mut self, mode: &Mode, fb: &Framebuffer) {
+        use crate::intel_gpu_wm::{
+            adjust_latencies, compute_plane_watermarks, encode_plane_buf_cfg, encode_wm_level,
+            validate_watermarks, WmParams, PRIMARY_DDB_END, PRIMARY_DDB_START,
+        };
+        let mmio = self.mmio;
+        let computed = (|| {
+            let raw = crate::intel_gpu_pcode::read_mem_latencies(mmio).ok()?;
+            let latencies = adjust_latencies(&raw);
+            // A failed SAGV read disables the SAGV watermarks
+            // (block time 0) but not the latency levels — the
+            // same degradation the reference driver takes.
+            let block_time = crate::intel_gpu_pcode::read_sagv_block_time_us(mmio).unwrap_or(0);
+            let params = WmParams {
+                pixel_rate_khz: mode.pixel_clock_khz,
+                htotal: mode.h_total as u32,
+                width_px: mode.h_active as u32,
+                cpp: fb.format.bits_per_pixel() / 8,
+            };
+            let mut wm = compute_plane_watermarks(&params, &latencies, block_time);
+            if !wm.levels[0].enable {
+                return None;
+            }
+            validate_watermarks(&mut wm, PRIMARY_DDB_END - PRIMARY_DDB_START);
+            if !wm.levels[0].enable {
+                return None;
+            }
+            Some(wm)
+        })();
+        let wm = match computed {
+            Some(wm) => wm,
+            None => {
+                self.program_watermarks_preboot();
+                return;
+            }
+        };
+        let wm_base = Pipe::A.base() + PLANE_WM_BASE_OFFSET;
+        for (level, wm_level) in wm.levels.iter().enumerate() {
+            self.mmio
+                .write32(wm_base + level as u64 * 4, encode_wm_level(wm_level));
+        }
+        self.mmio
+            .write32(wm_base + PLANE_WM_SAGV_OFFSET, encode_wm_level(&wm.sagv));
+        self.mmio.write32(
+            wm_base + PLANE_WM_SAGV_TRANS_OFFSET,
+            encode_wm_level(&wm.sagv_trans),
+        );
+        self.mmio
+            .write32(wm_base + PLANE_WM_TRANS_OFFSET, encode_wm_level(&wm.trans));
+        self.mmio.write32(
+            Pipe::A.base() + PLANE_BUF_CFG_OFFSET,
+            encode_plane_buf_cfg(PRIMARY_DDB_START, PRIMARY_DDB_END),
+        );
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// Lane 1's basic programming, kept as the fallback when
+    /// the latency-based algorithm cannot run: the PRM's
+    /// "Display Buffer Allocation and Watermark Programming
+    /// Prior to OS Boot" values (TGL PRM Vol. 12) — 160 DBUF
+    /// blocks for Pipe A's primary plane (PLANE_BUF_CFG =
+    /// END 159 / START 0), level-0 watermark 160 blocks /
+    /// 2 lines (0x800080A0), all higher levels, SAGV and
+    /// transition watermarks disabled. The PRM scopes this
+    /// programming to any resolution, linear surfaces,
+    /// <=32 bpp, one universal plane per pipe.
+    fn program_watermarks_preboot(&mut self) {
         let wm_base = Pipe::A.base() + PLANE_WM_BASE_OFFSET;
         self.mmio.write32(wm_base, PLANE_WM0_PREBOOT);
         for level in 1..6u64 {
@@ -1491,18 +1574,32 @@ pub mod tests {
         if writes != alloc::vec![want] {
             return TestResult::Fail("TRANS_DDI_FUNC_CTL value wrong");
         }
-        ms.program_watermarks();
+        // FakeMmio answers every pcode read with 0: latencies
+        // all zero → WaWmMemoryReadLatency raises level 0 to
+        // 3 µs, the rest stay disabled. For 1024×768@65 MHz the
+        // algorithm yields level 0 = 9 blocks / 1 line and a
+        // transition watermark of 9 + 14 = 23 blocks, with the
+        // full-DBUF allocation — not the pre-boot values.
+        let fb = Framebuffer {
+            phys_addr: 0x100_0000,
+            stride_bytes: 1024 * 4,
+            format: PixelFormat::Xrgb8888,
+        };
+        ms.program_watermarks(&Mode::VESA_1024X768_60, &fb);
         let wm_base = PipeIdx::A.base() + super::PLANE_WM_BASE_OFFSET;
-        if mmio.writes_to(wm_base) != alloc::vec![super::PLANE_WM0_PREBOOT] {
-            return TestResult::Fail("PLANE_WM level 0 must be the PRM pre-boot value");
+        if mmio.writes_to(wm_base) != alloc::vec![0x8000_4009] {
+            return TestResult::Fail("PLANE_WM level 0 must be the computed 9-block value");
         }
         if mmio.writes_to(wm_base + 4) != alloc::vec![0] {
             return TestResult::Fail("PLANE_WM level 1 must be disabled");
         }
+        if mmio.writes_to(wm_base + super::PLANE_WM_TRANS_OFFSET) != alloc::vec![0x8000_0017] {
+            return TestResult::Fail("transition watermark must be wm0 blocks + 14");
+        }
         if mmio.writes_to(PipeIdx::A.base() + super::PLANE_BUF_CFG_OFFSET)
-            != alloc::vec![super::PLANE_BUF_CFG_PREBOOT_A]
+            != alloc::vec![0x07FF_0000]
         {
-            return TestResult::Fail("PLANE_BUF_CFG must be the PRM pre-boot allocation");
+            return TestResult::Fail("PLANE_BUF_CFG must be the full-DBUF allocation");
         }
         // DPCLKA routing: two writes, first with clock-off set
         // (select phase), second with it clear (clock on).
@@ -1632,6 +1729,545 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_disable_pipeline_writes_disables_in_order
+    );
+
+    // ── Scripted sink model (Q6, #1024 item 4) ───────────────
+    //
+    // Unlike FakeMmio's canned reads, this model *computes*
+    // its answers from state the modeset itself establishes:
+    // power-well STATE follows REQUEST, PLL LOCK follows
+    // ENABLE, DBUF STATE follows REQUEST, the pcode endpoint
+    // answers latency queries from its scripted table keyed by
+    // the DATA0 set selector, and the DP sink runs a real
+    // training state machine — CR only locks after the source
+    // applies the swing the sink's ADJUST_REQUEST asks for, EQ
+    // only completes under TPS3. A modeset step that programs
+    // the wrong thing gets a wrong answer and fails, which is
+    // what makes the full-run fixture below a test of the
+    // modeset rather than of the fake. Q4's branch (#1114)
+    // grows a sibling sink model for the DP-codec layer
+    // (`DpSink`); when both are on main the two should be
+    // unified into one shared sink model.
+
+    /// The scripted panel's EDID: VESA DMT 1920×1080@60
+    /// (148.5 MHz; h 1920/2200, sync +88/+44; v 1080/1125,
+    /// sync +4/+5; both syncs positive), valid header and
+    /// checksum, detailed timing in the first descriptor slot.
+    fn edid_1080p60() -> [u8; 128] {
+        let mut e = [0u8; 128];
+        e[..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+        e[18] = 1; // EDID 1.4
+        e[19] = 4;
+        e[20] = 0x80; // digital input
+        e[21] = 53; // 53 cm wide
+        e[22] = 30; // 30 cm high
+        let d = 0x36; // first detailed-timing descriptor
+        e[d] = 0x1A; // pixel clock 14850 × 10 kHz, LE
+        e[d + 1] = 0x3A;
+        e[d + 2] = 0x80; // h active low (1920)
+        e[d + 3] = 0x18; // h blanking low (280)
+        e[d + 4] = 0x71; // h active/blanking high nibbles
+        e[d + 5] = 0x38; // v active low (1080)
+        e[d + 6] = 0x2D; // v blanking low (45)
+        e[d + 7] = 0x40; // v active/blanking high nibbles
+        e[d + 8] = 88; // h sync offset
+        e[d + 9] = 44; // h sync width
+        e[d + 10] = 0x45; // v sync offset (high nibble) / width
+        e[d + 11] = 0; // all sync high bits zero
+        e[d + 17] = 0x1E; // digital separate, +VSync, +HSync
+        let sum: u8 = e[..127].iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        e[127] = 0u8.wrapping_sub(sum);
+        e
+    }
+
+    #[derive(Debug, Default)]
+    struct SinkState {
+        power: u8,
+        pattern: u8,
+        pattern_history: Vec<u8>,
+        tunes: [u8; 4],
+    }
+
+    impl SinkState {
+        fn lane_swing(&self, lane: usize) -> u8 {
+            self.tunes[lane] & 0x3
+        }
+        /// Per-lane status nibble, computed from the training
+        /// state the source has actually established.
+        fn lane_nibble(&self, lane: usize) -> u8 {
+            match self.pattern {
+                // TPS1 (CR): locks once the sink's requested
+                // swing (1) has been applied.
+                1 => {
+                    if self.lane_swing(lane) >= 1 {
+                        0x1 // CR_DONE
+                    } else {
+                        0
+                    }
+                }
+                // TPS3 (EQ at HBR2): CR held + EQ done +
+                // symbol locked once CR's swing is in place.
+                3 => {
+                    if self.lane_swing(lane) >= 1 {
+                        0x7
+                    } else {
+                        0
+                    }
+                }
+                _ => 0,
+            }
+        }
+        fn status_byte(&self, pair: usize) -> u8 {
+            self.lane_nibble(pair * 2) | (self.lane_nibble(pair * 2 + 1) << 4)
+        }
+        fn adjust_byte(&self, pair: usize) -> u8 {
+            // Under TPS1, ask for swing 1 on any lane still at
+            // swing 0; pre-emphasis stays 0.
+            let req = |lane: usize| -> u8 {
+                if self.pattern == 1 && self.lane_swing(lane) == 0 {
+                    1
+                } else {
+                    0
+                }
+            };
+            req(pair * 2) | (req(pair * 2 + 1) << 4)
+        }
+        fn align_byte(&self) -> u8 {
+            if self.pattern == 3 && (0..4).all(|l| self.lane_swing(l) >= 1) {
+                1 // INTERLANE_ALIGN_DONE
+            } else {
+                0
+            }
+        }
+        fn write(&mut self, addr: u32, data: &[u8]) {
+            for (i, &b) in data.iter().enumerate() {
+                match addr + i as u32 {
+                    0x600 => self.power = b & 0x3,
+                    0x102 => {
+                        self.pattern = b;
+                        self.pattern_history.push(b);
+                    }
+                    a @ 0x103..=0x106 => self.tunes[(a - 0x103) as usize] = b,
+                    _ => {}
+                }
+            }
+        }
+        fn read(&self, addr: u32) -> u8 {
+            match addr {
+                0x202 => self.status_byte(0),
+                0x203 => self.status_byte(1),
+                0x204 => self.align_byte(),
+                0x206 => self.adjust_byte(0),
+                0x207 => self.adjust_byte(1),
+                _ => 0,
+            }
+        }
+    }
+
+    /// Full scripted machine: display register file with
+    /// computed status bits, pcode endpoint, and the AUX
+    /// engine + DP sink above.
+    #[derive(Debug)]
+    pub struct ScriptedSinkMmio {
+        pub writes: RefCell<Vec<(u64, u32)>>,
+        regs: RefCell<Vec<(u64, u32)>>,
+        /// Raw DSSM value served on reads (reference strap).
+        pub dssm: u32,
+        /// Latency table the pcode endpoint serves.
+        pub latencies: [u16; 8],
+        /// SAGV block time the pcode endpoint serves.
+        pub sagv_block_time: u32,
+        /// When nonzero, every pcode command completes with
+        /// this status (the modeset must fall back).
+        pub pcode_status: u8,
+        /// When false, DBUF slices never grant power.
+        pub dbuf_grant: bool,
+        pcode_data: RefCell<[u32; 2]>,
+        pcode_mailbox: RefCell<u32>,
+        sink: RefCell<SinkState>,
+        edid_ptr: RefCell<usize>,
+    }
+
+    impl ScriptedSinkMmio {
+        pub fn new(dssm: u32) -> Self {
+            Self {
+                writes: RefCell::new(Vec::new()),
+                regs: RefCell::new(Vec::new()),
+                dssm,
+                latencies: [6, 9, 13, 18, 24, 31, 40, 52],
+                sagv_block_time: 20,
+                pcode_status: 0,
+                dbuf_grant: true,
+                pcode_data: RefCell::new([0; 2]),
+                pcode_mailbox: RefCell::new(0),
+                sink: RefCell::new(SinkState::default()),
+                edid_ptr: RefCell::new(0),
+            }
+        }
+        fn get(&self, off: u64) -> u32 {
+            let mut v = 0;
+            for (o, val) in self.regs.borrow().iter() {
+                if *o == off {
+                    v = *val;
+                }
+            }
+            v
+        }
+        fn set(&self, off: u64, val: u32) {
+            self.regs.borrow_mut().push((off, val));
+        }
+        pub fn writes_to(&self, off: u64) -> Vec<u32> {
+            self.writes
+                .borrow()
+                .iter()
+                .filter(|(o, _)| *o == off)
+                .map(|(_, v)| *v)
+                .collect()
+        }
+
+        fn pcode_execute(&self, cmd_word: u32) {
+            use crate::intel_gpu_pcode::{
+                PCODE_CMD_READ_MEM_LATENCY, PCODE_CMD_READ_SAGV_BLOCK_TIME_US,
+            };
+            if self.pcode_status != 0 {
+                *self.pcode_mailbox.borrow_mut() = self.pcode_status as u32;
+                return;
+            }
+            match cmd_word & 0xFF {
+                PCODE_CMD_READ_MEM_LATENCY => {
+                    let set = (self.pcode_data.borrow()[0] & 1) as usize;
+                    let mut packed = 0u32;
+                    for level in 0..4usize {
+                        packed |= (self.latencies[set * 4 + level] as u32) << (8 * level);
+                    }
+                    self.pcode_data.borrow_mut()[0] = packed;
+                    *self.pcode_mailbox.borrow_mut() = 0;
+                }
+                PCODE_CMD_READ_SAGV_BLOCK_TIME_US => {
+                    self.pcode_data.borrow_mut()[0] = self.sagv_block_time;
+                    *self.pcode_mailbox.borrow_mut() = 0;
+                }
+                _ => *self.pcode_mailbox.borrow_mut() = 0x1, // ILLEGAL_CMD
+            }
+        }
+
+        /// Run one AUX transaction against the sink model:
+        /// unpack the wire frame from the AUX DATA registers,
+        /// dispatch it, and leave the reply in the DATA
+        /// registers. Returns the reply length in bytes.
+        fn aux_engine(&self) -> usize {
+            use crate::intel_gpu_aux::{DDI_AUX_DATA_DWORDS, DDI_AUX_DATA_OFFSET};
+            let base = Ddi::A.base() + DDI_AUX_DATA_OFFSET;
+            let mut wire = [0u8; 20];
+            for i in 0..DDI_AUX_DATA_DWORDS {
+                wire[i * 4..i * 4 + 4]
+                    .copy_from_slice(&self.get(base + (i as u64) * 4).to_be_bytes());
+            }
+            let cmd = wire[0] >> 4;
+            let addr = (((wire[0] & 0xF) as u32) << 16) | ((wire[1] as u32) << 8) | wire[2] as u32;
+            let len = (wire[3] as usize) + 1;
+            let mut reply = [0u8; 17]; // status byte + payload
+            let reply_len = match cmd {
+                0x8 => {
+                    // Native write.
+                    self.sink.borrow_mut().write(addr, &wire[4..4 + len]);
+                    1
+                }
+                0x9 => {
+                    // Native read.
+                    for i in 0..len {
+                        reply[1 + i] = self.sink.borrow().read(addr + i as u32);
+                    }
+                    1 + len
+                }
+                0x0 | 0x4 => {
+                    // I2C write: the EDID EEPROM latches its
+                    // byte pointer from the payload.
+                    if addr == 0x50 << 1 {
+                        *self.edid_ptr.borrow_mut() = wire[4] as usize;
+                    }
+                    1
+                }
+                0x1 | 0x5 => {
+                    // I2C read: stream from the EEPROM pointer.
+                    let edid = edid_1080p60();
+                    let ptr = *self.edid_ptr.borrow();
+                    for i in 0..len {
+                        reply[1 + i] = edid[ptr + i];
+                    }
+                    *self.edid_ptr.borrow_mut() = ptr + len;
+                    1 + len
+                }
+                _ => 1,
+            };
+            for i in 0..DDI_AUX_DATA_DWORDS {
+                let mut v = 0u32;
+                for b in 0..4 {
+                    let idx = i * 4 + b;
+                    if idx < reply_len {
+                        v |= (reply[idx] as u32) << (24 - 8 * b);
+                    }
+                }
+                self.set(base + (i as u64) * 4, v);
+            }
+            reply_len
+        }
+    }
+
+    impl MmioWindow for ScriptedSinkMmio {
+        fn read32(&self, off: u64) -> u32 {
+            use crate::intel_gpu_aux::{DDI_AUX_CTL_OFFSET, DDI_AUX_DATA_OFFSET};
+            use crate::intel_gpu_ddi::DDI_BUF_CTL_OFFSET;
+            use crate::intel_gpu_pcode::{PCODE_DATA0, PCODE_DATA1, PCODE_MAILBOX};
+            use crate::intel_gpu_pipes::{PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE};
+            use crate::intel_gpu_wm::{
+                DBUF_CTL_S1, DBUF_CTL_S2, DBUF_POWER_REQUEST, DBUF_POWER_STATE,
+            };
+            match off {
+                o if o == DSSM => self.dssm,
+                o if o == PCODE_MAILBOX => *self.pcode_mailbox.borrow(),
+                o if o == PCODE_DATA0 => self.pcode_data.borrow()[0],
+                o if o == PCODE_DATA1 => self.pcode_data.borrow()[1],
+                o if o == super::PWR_WELL_CTL2 => {
+                    // STATE follows REQUEST per well index.
+                    let stored = self.get(off);
+                    let mut v = stored;
+                    for idx in 0..5u32 {
+                        if stored & super::pwr_well_req(idx) != 0 {
+                            v |= super::pwr_well_state(idx);
+                        } else {
+                            v &= !super::pwr_well_state(idx);
+                        }
+                    }
+                    v
+                }
+                o if o == super::DPLL0_ENABLE => {
+                    let stored = self.get(off);
+                    let mut v = stored;
+                    if stored & super::PLL_POWER_ENABLE != 0 {
+                        v |= super::PLL_POWER_STATE;
+                    }
+                    if stored & super::PLL_ENABLE != 0 {
+                        v |= super::PLL_LOCK;
+                    }
+                    v
+                }
+                o if o == Pipe::A.base() + PIPECONF_OFFSET => {
+                    let stored = self.get(off);
+                    if stored & PIPECONF_ENABLE != 0 {
+                        stored | PIPECONF_STATE
+                    } else {
+                        stored & !PIPECONF_STATE
+                    }
+                }
+                o if o == Ddi::A.base() + DDI_BUF_CTL_OFFSET => {
+                    use crate::intel_gpu_ddi::{DDI_BUF_CTL_ENABLE, DDI_BUF_CTL_IDLE_STATUS};
+                    let stored = self.get(off);
+                    if stored & DDI_BUF_CTL_ENABLE != 0 {
+                        stored & !DDI_BUF_CTL_IDLE_STATUS
+                    } else {
+                        stored | DDI_BUF_CTL_IDLE_STATUS
+                    }
+                }
+                o if o == DBUF_CTL_S1 || o == DBUF_CTL_S2 => {
+                    let stored = self.get(off);
+                    if self.dbuf_grant && stored & DBUF_POWER_REQUEST != 0 {
+                        stored | DBUF_POWER_STATE
+                    } else {
+                        stored & !DBUF_POWER_STATE
+                    }
+                }
+                o if o == Ddi::A.base() + DDI_AUX_CTL_OFFSET => self.get(off),
+                o if (Ddi::A.base() + DDI_AUX_DATA_OFFSET
+                    ..Ddi::A.base() + DDI_AUX_DATA_OFFSET + 20)
+                    .contains(&o) =>
+                {
+                    self.get(off)
+                }
+                _ => self.get(off),
+            }
+        }
+        fn write32(&self, off: u64, val: u32) {
+            use crate::intel_gpu_aux::{
+                AUX_CTL_MSGSIZE_MASK, AUX_CTL_MSGSIZE_SHIFT, AUX_CTL_SEND_BUSY, DDI_AUX_CTL_OFFSET,
+            };
+            use crate::intel_gpu_pcode::{PCODE_DATA0, PCODE_DATA1, PCODE_MAILBOX, PCODE_READY};
+            self.writes.borrow_mut().push((off, val));
+            match off {
+                o if o == PCODE_DATA0 => self.pcode_data.borrow_mut()[0] = val,
+                o if o == PCODE_DATA1 => self.pcode_data.borrow_mut()[1] = val,
+                o if o == PCODE_MAILBOX => {
+                    if val & PCODE_READY != 0 {
+                        self.pcode_execute(val);
+                    } else {
+                        *self.pcode_mailbox.borrow_mut() = val;
+                    }
+                }
+                o if o == Ddi::A.base() + DDI_AUX_CTL_OFFSET => {
+                    if val & AUX_CTL_SEND_BUSY != 0 {
+                        let reply_len = self.aux_engine();
+                        let ctl = (val & !AUX_CTL_SEND_BUSY & !AUX_CTL_MSGSIZE_MASK)
+                            | ((reply_len as u32) << AUX_CTL_MSGSIZE_SHIFT)
+                            | crate::intel_gpu_aux::AUX_CTL_DONE;
+                        self.set(off, ctl);
+                    } else {
+                        self.set(off, val);
+                    }
+                }
+                _ => self.set(off, val),
+            }
+        }
+    }
+
+    fn fb_1080p() -> Framebuffer {
+        Framebuffer {
+            phys_addr: 0x100_0000,
+            stride_bytes: 1920 * 4,
+            format: PixelFormat::Xrgb8888,
+        }
+    }
+
+    fn smoke_modeset_full_run_scripted_sink() -> TestResult {
+        // DSSM strap: 19.2 MHz (field 1).
+        let mmio = ScriptedSinkMmio::new(1 << 29);
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        let mode = match ms.modeset(&fb_1080p(), None) {
+            Ok(m) => m,
+            Err(_) => return TestResult::Fail("full modeset over scripted sink must succeed"),
+        };
+        // The mode came from the sink's EDID, not a fallback.
+        if mode.pixel_clock_khz != 148_500
+            || mode.h_active != 1920
+            || mode.h_total != 2200
+            || mode.h_sync_start != 2008
+            || mode.h_sync_end != 2052
+            || mode.v_active != 1080
+            || mode.v_total != 1125
+            || mode.v_sync_start != 1084
+            || mode.v_sync_end != 1089
+            || !mode.h_sync_positive
+            || !mode.v_sync_positive
+        {
+            return TestResult::Fail("modeset must return the EDID preferred mode");
+        }
+        // DPLL: RBR row of the 19.2 MHz family.
+        let cfgcr0 = mmio.writes_to(crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0);
+        if cfgcr0 != alloc::vec![0x01C0_01A5] {
+            return TestResult::Fail("CFGCR0 must be the 19.2-family RBR row");
+        }
+        // Watermarks: the values hand-computed from the
+        // algorithm for this mode + the sink's latency table.
+        let wm_base = Pipe::A.base() + super::PLANE_WM_BASE_OFFSET;
+        let want = [
+            0x8000_4010u32,
+            0x8000_4010,
+            0x8000_8012,
+            0x8000_8021,
+            0x8000_8021,
+            0x8000_C031,
+        ];
+        for (level, w) in want.iter().enumerate() {
+            if mmio.writes_to(wm_base + level as u64 * 4) != alloc::vec![*w] {
+                return TestResult::Fail("PLANE_WM level value mismatch in full run");
+            }
+        }
+        if mmio.writes_to(wm_base + super::PLANE_WM_SAGV_OFFSET) != alloc::vec![0x8000_8021] {
+            return TestResult::Fail("SAGV watermark mismatch in full run");
+        }
+        if mmio.writes_to(wm_base + super::PLANE_WM_TRANS_OFFSET) != alloc::vec![0x8000_001E] {
+            return TestResult::Fail("transition watermark mismatch in full run");
+        }
+        if mmio.writes_to(Pipe::A.base() + super::PLANE_BUF_CFG_OFFSET) != alloc::vec![0x07FF_0000]
+        {
+            return TestResult::Fail("BUF_CFG must be the full-DBUF allocation");
+        }
+        // DBUF slices were power-requested.
+        use crate::intel_gpu_wm::{DBUF_CTL_S1, DBUF_CTL_S2, DBUF_POWER_REQUEST};
+        for off in [DBUF_CTL_S1, DBUF_CTL_S2] {
+            if !mmio
+                .writes_to(off)
+                .iter()
+                .any(|v| v & DBUF_POWER_REQUEST != 0)
+            {
+                return TestResult::Fail("DBUF slice never power-requested");
+            }
+        }
+        // Training really happened: SET_POWER D0, TPS1 → TPS3
+        // → off, and the sink's requested swing was applied.
+        let sink = mmio.sink.borrow();
+        if sink.power != 1 {
+            return TestResult::Fail("sink never powered to D0");
+        }
+        if sink.pattern_history != alloc::vec![1u8, 3, 0] {
+            return TestResult::Fail("training pattern sequence must be TPS1, TPS3, off");
+        }
+        if sink.pattern != 0 {
+            return TestResult::Fail("training must end with pattern off");
+        }
+        if sink.tunes.iter().any(|t| t & 0x3 != 1) {
+            return TestResult::Fail("sink-requested swing 1 must be applied on all lanes");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_modeset_full_run_scripted_sink
+    );
+
+    fn smoke_modeset_full_run_ref24_pll_row() -> TestResult {
+        // Same run on a 24 MHz-strapped part: only the DPLL
+        // row changes.
+        let mmio = ScriptedSinkMmio::new(0);
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        if ms.modeset(&fb_1080p(), None).is_err() {
+            return TestResult::Fail("full modeset must succeed on the 24 MHz strap");
+        }
+        let cfgcr0 = mmio.writes_to(crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0);
+        if cfgcr0 != alloc::vec![0x0100_0151] {
+            return TestResult::Fail("CFGCR0 must be the 24-family RBR row");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_modeset_full_run_ref24_pll_row
+    );
+
+    fn smoke_modeset_dbuf_power_timeout() -> TestResult {
+        let mut mmio = ScriptedSinkMmio::new(1 << 29);
+        mmio.dbuf_grant = false;
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        match ms.modeset(&fb_1080p(), None) {
+            Err(ModesetError::DbufPowerTimeout) => TestResult::Pass,
+            _ => TestResult::Fail("ungranted DBUF slices must surface DbufPowerTimeout"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_modeset_dbuf_power_timeout
+    );
+
+    fn smoke_modeset_pcode_failure_falls_back_to_preboot() -> TestResult {
+        let mut mmio = ScriptedSinkMmio::new(1 << 29);
+        mmio.pcode_status = 0x1; // ILLEGAL_CMD on every command
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        if ms.modeset(&fb_1080p(), None).is_err() {
+            return TestResult::Fail("pcode failure must degrade, not fail the modeset");
+        }
+        let wm_base = Pipe::A.base() + super::PLANE_WM_BASE_OFFSET;
+        if mmio.writes_to(wm_base) != alloc::vec![super::PLANE_WM0_PREBOOT] {
+            return TestResult::Fail("fallback must program the pre-boot level 0");
+        }
+        if mmio.writes_to(Pipe::A.base() + super::PLANE_BUF_CFG_OFFSET)
+            != alloc::vec![super::PLANE_BUF_CFG_PREBOOT_A]
+        {
+            return TestResult::Fail("fallback must program the pre-boot BUF_CFG");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_modeset_pcode_failure_falls_back_to_preboot
     );
 }
 
