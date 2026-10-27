@@ -1,5 +1,8 @@
-//! Retained WPA2-PSK/CCMP owner. Shared Supplicant owns EAPOL authentication;
-//! this unit binds native peers, packet keys and exact reply-delivery commits.
+//! Retained WPA2-PSK or WPA3-SAE/CCMP owner. Shared Supplicant owns EAPOL
+//! authentication; this unit binds native peers, packet keys and exact
+//! reply-delivery commits. A SAE association (AKM 8/24) negotiates PMF:
+//! the M3/group IGTK is retained for BIP and unicast robust management
+//! frames are CCMP-protected (IEEE802.11-2020 11.13, 12.5.3, 12.5.4).
 use crate::eapol::{EapolRx, EapolRxError, Gtk, KeyMgmt, RsnaParams, Supplicant};
 use crate::packet_key::{self, Key, Role};
 use alloc::{vec, vec::Vec};
@@ -27,6 +30,16 @@ pub enum Error {
     KeyReuse,
     Crypto(packet_key::Error),
 }
+/// A received management frame after PMF admission.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MgmtRx {
+    /// Dropped: unprotected robust frame under PMF, failed CCMP/BIP, a
+    /// replay, or another peer.
+    Ignored,
+    /// The admitted frame with Protected cleared and CCMP header/MIC or
+    /// MMIE removed (non-robust frames are returned unchanged).
+    Frame(Vec<u8>),
+}
 #[derive(Debug, PartialEq, Eq)]
 pub enum Rx {
     Ignored,
@@ -42,9 +55,15 @@ struct Group {
     material: Zeroizing<[u8; 16]>,
     rsc: u64,
 }
+struct IgtkChange {
+    id: u16,
+    material: Zeroizing<[u8; 16]>,
+    ipn: u64,
+}
 struct Change {
     pair: Option<Zeroizing<[u8; 16]>>,
     group: Option<Group>,
+    igtk: Option<IgtkChange>,
     opens: bool,
 }
 struct Pending {
@@ -67,6 +86,9 @@ pub struct Security {
     sequence: u16,
     qos_sequence: [u16; 16],
     spp_amsdu: bool,
+    /// PMF negotiated (SAE): IGTK required, robust management protected.
+    pmf: bool,
+    igtk: crate::mfp::MfpKeyStore,
 }
 impl core::fmt::Debug for Security {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -99,6 +121,69 @@ impl Security {
         ap_rsnxe: Option<&[u8]>,
         sequence: u16,
     ) -> Result<Self, Error> {
+        let owner = Self::new_inner(
+            own,
+            peer,
+            pmk,
+            station_rsne,
+            None,
+            ap_rsne,
+            ap_rsnxe,
+            sequence,
+        )?;
+        if owner.pmf {
+            // SAE needs its RSNXE and the PMF owner: use `new_sae`.
+            return Err(Error::Profile);
+        }
+        Ok(owner)
+    }
+    /// A WPA3-SAE owner: `pmk` is the accepted `SaeSession` PMK, the
+    /// station RSNE/RSNXE are `JoinPlan::rsn_body()` and the plan's
+    /// `SaeJoin::station_rsnxe()` (both repeated in message 2/4).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_sae(
+        own: [u8; 6],
+        peer: [u8; 6],
+        pmk: &[u8; 32],
+        station_rsne: &[u8],
+        station_rsnxe: Option<&[u8]>,
+        ap_rsne: &[u8],
+        ap_rsnxe: Option<&[u8]>,
+        sequence: u16,
+    ) -> Result<Self, Error> {
+        let owner = Self::new_inner(
+            own,
+            peer,
+            pmk,
+            station_rsne,
+            station_rsnxe,
+            ap_rsne,
+            ap_rsnxe,
+            sequence,
+        )?;
+        if !owner.pmf {
+            return Err(Error::Profile);
+        }
+        Ok(owner)
+    }
+    /// True for a PMF (SAE) association.
+    pub fn pmf(&self) -> bool {
+        self.pmf
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        own: [u8; 6],
+        peer: [u8; 6],
+        pmk: &[u8; 32],
+        station_rsne: &[u8],
+        station_rsnxe: Option<&[u8]>,
+        ap_rsne: &[u8],
+        ap_rsnxe: Option<&[u8]>,
+        sequence: u16,
+    ) -> Result<Self, Error> {
+        if station_rsnxe.is_some_and(|b| b.is_empty() || usize::from(b[0] & 15) + 1 != b.len()) {
+            return Err(Error::Profile);
+        }
         if station_rsne.len() > 255
             || ap_rsne.len() > 255
             || ap_rsnxe.is_some_and(|b| b.len() > 255)
@@ -110,22 +195,52 @@ impl Security {
             return Err(Error::Profile);
         }
         // The station RSNE is the canonical WPA2-PSK/CCMP body, optionally
-        // advertising SPP A-MSDU Capable (RSN Capabilities bit10).
+        // advertising SPP A-MSDU Capable (RSN Capabilities bit10), or the
+        // JoinPlan SAE body: CCMP-128, AKM 8 or 24, MFPC|MFPR, at most the
+        // one SAE PMKID and the default BIP-CMAC-128.
+        use crate::rsn::{self, Suite};
         let station = crate::rsn::RsnIe::decode_body(station_rsne).ok_or(Error::Profile)?;
-        let mut canonical = crate::rsn::RsnIe::wpa2_psk_ccmp();
-        canonical.rsn_capabilities =
-            station.rsn_capabilities & crate::rsn::RSN_CAP_SPP_AMSDU_CAPABLE;
-        if station != canonical {
-            return Err(Error::Profile);
+        let ccmp = Suite::standard(rsn::CIPHER_CCMP_128);
+        let mfp = rsn::RSN_CAP_MFP_REQUIRED | rsn::RSN_CAP_MFP_CAPABLE;
+        let key_mgmt = match station.akms.as_slice() {
+            [akm] if *akm == Suite::standard(rsn::AKM_SAE) => KeyMgmt::Sae,
+            [akm] if *akm == Suite::standard(rsn::AKM_SAE_EXT_KEY) => KeyMgmt::SaeExtKey,
+            _ => KeyMgmt::Psk,
+        };
+        let pmf = key_mgmt.sae();
+        if pmf {
+            if station.group_cipher != ccmp
+                || station.pairwise_ciphers != [ccmp]
+                || station.rsn_capabilities != mfp
+                || station.pmkids.len() > 1
+                || station
+                    .group_management_cipher
+                    .is_some_and(|c| c != Suite::standard(rsn::CIPHER_BIP_CMAC_128))
+            {
+                return Err(Error::Profile);
+            }
+        } else {
+            let mut canonical = crate::rsn::RsnIe::wpa2_psk_ccmp();
+            canonical.rsn_capabilities =
+                station.rsn_capabilities & crate::rsn::RSN_CAP_SPP_AMSDU_CAPABLE;
+            if station != canonical {
+                return Err(Error::Profile);
+            }
         }
         let ap = crate::rsn::RsnIe::decode_body(ap_rsne).ok_or(Error::Profile)?;
-        use crate::rsn::{self, Suite};
-        if ap.group_cipher != Suite::standard(rsn::CIPHER_CCMP_128)
-            || !ap
-                .pairwise_ciphers
-                .contains(&Suite::standard(rsn::CIPHER_CCMP_128))
-            || !ap.akms.contains(&Suite::standard(rsn::AKM_PSK))
-            || ap.rsn_capabilities & (rsn::RSN_CAP_MFP_REQUIRED | rsn::RSN_CAP_NO_PAIRWISE) != 0
+        let ap_mfp_ok = if pmf {
+            ap.rsn_capabilities & rsn::RSN_CAP_MFP_CAPABLE != 0
+                && ap
+                    .group_management_cipher
+                    .is_none_or(|c| c == Suite::standard(rsn::CIPHER_BIP_CMAC_128))
+        } else {
+            ap.rsn_capabilities & rsn::RSN_CAP_MFP_REQUIRED == 0
+        };
+        if ap.group_cipher != ccmp
+            || !ap.pairwise_ciphers.contains(&ccmp)
+            || !ap.akms.contains(&Suite::standard(key_mgmt.suite_type()))
+            || ap.rsn_capabilities & rsn::RSN_CAP_NO_PAIRWISE != 0
+            || !ap_mfp_ok
             || ap_rsnxe.is_some_and(|b| b.is_empty() || usize::from(b[0] & 15) + 1 != b.len())
         {
             return Err(Error::Profile);
@@ -134,15 +249,21 @@ impl Security {
             own,
             peer,
             supplicant: Supplicant::new(peer, own, [0; 32]).with_rsna(RsnaParams {
-                key_mgmt: KeyMgmt::Psk,
+                key_mgmt,
                 pmk: pmk.to_vec(),
-                assoc_ie: ie(48, station_rsne)?,
+                assoc_ie: {
+                    let mut assoc = ie(48, station_rsne)?;
+                    if let Some(rsnxe) = station_rsnxe {
+                        assoc.extend_from_slice(&ie(244, rsnxe)?);
+                    }
+                    assoc
+                },
                 ap_rsn_ie: ie(48, ap_rsne)?,
                 ap_rsnxe: ap_rsnxe.map(|b| ie(244, b)).transpose()?,
                 pairwise_key_len: 16,
                 group_key_len: 16,
-                mgmt_group_key_len: None,
-                pmf: false,
+                mgmt_group_key_len: pmf.then_some(16),
+                pmf,
             }),
             pair: None,
             group: core::array::from_fn(|_| None),
@@ -158,6 +279,8 @@ impl Security {
                 & ap.rsn_capabilities
                 & rsn::RSN_CAP_SPP_AMSDU_CAPABLE
                 != 0,
+            pmf,
+            igtk: crate::mfp::MfpKeyStore::new(),
         })
     }
     /// True when both the retained station and AP RSNEs advertised SPP
@@ -363,10 +486,14 @@ impl Security {
                 return Err(Error::Protocol);
             }
         };
-        let (reply, pair, gtk, opens) = match processed {
-            EapolRx::Pairwise1(m1) => (m1.reply, None, None, false),
+        let pmf = self.pmf;
+        let first = self.pair.is_none();
+        let (reply, pair, gtk, igtk, opens) = match processed {
+            EapolRx::Pairwise1(m1) => (m1.reply, None, None, None, false),
             EapolRx::Pairwise3(mut m3) => {
-                if !m3.secure || m3.igtk.is_some() {
+                // Without PMF an IGTK is a protocol error; with PMF the
+                // first M3 must deliver it (IEEE802.11-2020 12.7.6.4).
+                if !m3.secure || m3.igtk.is_some() && !pmf || pmf && first && m3.igtk.is_none() {
                     if let Some(t) = &mut m3.tk {
                         t.zeroize();
                     }
@@ -379,10 +506,11 @@ impl Security {
                     self.fail();
                     return Err(Error::Protocol);
                 }
-                (m3.reply, m3.tk, m3.gtk, true)
+                (m3.reply, m3.tk, m3.gtk, m3.igtk, true)
             }
             EapolRx::Group1(mut g) => {
-                if !self.established || g.igtk.is_some() {
+                if !self.established || g.igtk.is_some() && !pmf || matches!(g.igtk, Some(Err(())))
+                {
                     if let Some(gtk) = &mut g.gtk {
                         gtk.key.zeroize();
                     }
@@ -392,9 +520,30 @@ impl Security {
                     self.fail();
                     return Err(Error::Protocol);
                 }
-                (g.reply, None, g.gtk, false)
+                let igtk = match g.igtk {
+                    Some(Ok(igtk)) => igtk,
+                    _ => None,
+                };
+                (g.reply, None, g.gtk, igtk, false)
             }
         };
+        let igtk = igtk
+            .map(|mut k: crate::eapol::Igtk| {
+                let result = if !(4..=5).contains(&k.key_id) || k.key.len() != 16 {
+                    Err(Error::Protocol)
+                } else {
+                    let mut ipn = [0; 8];
+                    ipn[..6].copy_from_slice(&k.ipn);
+                    Ok(IgtkChange {
+                        id: k.key_id,
+                        material: Zeroizing::new(k.key.as_slice().try_into().unwrap()),
+                        ipn: u64::from_le_bytes(ipn),
+                    })
+                };
+                k.key.zeroize();
+                result
+            })
+            .transpose()?;
         let pair = pair.map(Zeroizing::new);
         let gtk = gtk
             .map(|mut g: Gtk| {
@@ -422,6 +571,7 @@ impl Security {
         let change = Change {
             pair,
             group: gtk,
+            igtk,
             opens,
         };
         if let Err(error) = self.validate_change(&change) {
@@ -601,7 +751,25 @@ impl Security {
                 fresh += 1;
             }
         }
+        if let Some(igtk) = &c.igtk {
+            if self
+                .igtk
+                .find_by_key_id(igtk.id)
+                .is_none_or(|old| old.key != *igtk.material)
+            {
+                if self.history.iter().any(|old| **old == *igtk.material)
+                    || c.pair.as_ref().is_some_and(|p| **p == *igtk.material)
+                    || c.group
+                        .as_ref()
+                        .is_some_and(|g| *g.material == *igtk.material)
+                {
+                    return Err(Error::KeyReuse);
+                }
+                fresh += 1;
+            }
+        }
         if c.opens && c.pair.is_none() && self.pair.is_none()
+            || c.opens && self.pmf && c.igtk.is_none() && self.igtk.active.is_none()
             || self.history.len() + fresh > HISTORY
         {
             return Err(Error::Protocol);
@@ -668,8 +836,137 @@ impl Security {
             self.supplicant
                 .group_keys_installed(Some(material.as_slice()), None);
         }
+        if let Some(igtk) = pending.change.igtk {
+            if self
+                .igtk
+                .find_by_key_id(igtk.id)
+                .is_none_or(|old| old.key != *igtk.material)
+            {
+                self.igtk
+                    .install_active(*igtk.material, igtk.id)
+                    .map_err(|_| Error::Protocol)?;
+                if let Some(active) = self.igtk.active.as_mut() {
+                    // The KDE IPN is the last IPN the AP used; mac80211
+                    // seeds rx_pn with it and requires a strictly larger IPN.
+                    active.rx_pn = igtk.ipn;
+                }
+                self.history.push(Zeroizing::new(*igtk.material));
+            }
+            self.supplicant
+                .group_keys_installed(None, Some(igtk.material.as_slice()));
+        }
         self.established |= pending.change.opens;
         Ok(())
+    }
+    /// Robust management frames per Linux `_ieee80211_is_robust_mgmt_frame`.
+    fn robust(frame: &[u8]) -> bool {
+        match frame[0] {
+            0xa0 | 0xc0 => true,
+            0xd0 => {
+                frame[1] & 0x40 != 0
+                    || frame
+                        .get(24)
+                        .is_some_and(|c| !matches!(*c, 4 | 7 | 11 | 15 | 20 | 21 | 22 | 127))
+            }
+            _ => false,
+        }
+    }
+    /// Admit one received management MPDU from the AP under the negotiated
+    /// PMF policy (mac80211 `ieee80211_drop_unencrypted_mgmt`,
+    /// `ieee80211_crypto_ccmp_decrypt`, `ieee80211_crypto_aes_cmac_decrypt`):
+    /// once the PTK is installed, unicast robust frames must be
+    /// CCMP-protected with it and group robust frames must carry a valid
+    /// BIP MMIE under the installed IGTK. Before keys, or without PMF,
+    /// unprotected frames pass unchanged; deauthentication and SA Query
+    /// policy remains the MLME owner's.
+    pub fn receive_management(&mut self, mpdu: &impl RawFrame) -> Result<MgmtRx, Error> {
+        if self.failed {
+            return Err(Error::State);
+        }
+        let b = mpdu.bytes();
+        if !mpdu.unmodified()
+            || !(24..=4096).contains(&b.len())
+            || b[0] & 0x0c != 0
+            || b[1] & 0x07 != 0
+            || b[22] & 15 != 0
+            || b[10..16] != self.peer
+            || b[16..22] != self.peer
+            || b[4..10] != self.own && b[4] & 1 == 0
+        {
+            return Ok(MgmtRx::Ignored);
+        }
+        let protected = b[1] & 0x40 != 0;
+        if !self.pmf || self.pair.is_none() || !Self::robust(b) {
+            return Ok(if protected {
+                MgmtRx::Ignored
+            } else {
+                MgmtRx::Frame(b.to_vec())
+            });
+        }
+        if b[4] & 1 != 0 {
+            // Group-addressed robust frame: unprotected with a BIP MMIE.
+            if protected {
+                return Ok(MgmtRx::Ignored);
+            }
+            return Ok(
+                match crate::mfp::verify_inbound(&mut self.igtk, &b[..24], &b[24..]) {
+                    Ok(body) => {
+                        let mut out = b[..24].to_vec();
+                        out.extend_from_slice(body);
+                        MgmtRx::Frame(out)
+                    }
+                    Err(_) => MgmtRx::Ignored,
+                },
+            );
+        }
+        if !protected {
+            return Ok(MgmtRx::Ignored);
+        }
+        let Some(pair) = self.pair.as_mut() else {
+            return Ok(MgmtRx::Ignored);
+        };
+        let mut wire = b[24..].to_vec();
+        match pair.key.unprotect_management(&b[..24], &mut wire) {
+            Ok(plain) => {
+                let mut out = b[..24].to_vec();
+                out[1] &= !0x40;
+                out.extend_from_slice(&plain);
+                Ok(MgmtRx::Frame(out))
+            }
+            Err(_) => Ok(MgmtRx::Ignored),
+        }
+    }
+    /// CCMP-protect one unicast robust management frame (Deauthentication,
+    /// Disassociation or a robust Action) to the AP after the controlled
+    /// port opened under PMF. `frame` is the unprotected MPDU with the
+    /// caller's sequence number; the PN is consumed even if the transport
+    /// later drops the frame.
+    pub fn protect_management(&mut self, frame: &[u8]) -> Result<Vec<u8>, Error> {
+        if !self.pmf || !self.port_open() {
+            return Err(Error::State);
+        }
+        if !(25..=4096).contains(&frame.len())
+            || frame[0] & 0x0c != 0
+            || frame[1] & 0x47 != 0
+            || frame[22] & 15 != 0
+            || !Self::robust(frame)
+            || frame[4..10] != self.peer
+            || frame[10..16] != self.own
+            || frame[16..22] != self.peer
+        {
+            return Err(Error::Profile);
+        }
+        let mut header = frame[..24].to_vec();
+        header[1] |= 0x40;
+        let wire = self
+            .pair
+            .as_mut()
+            .ok_or(Error::State)?
+            .key
+            .protect_management(&header, &frame[24..])
+            .map_err(Error::Crypto)?;
+        header.extend_from_slice(&wire);
+        Ok(header)
     }
 }
 impl Drop for Security {
@@ -692,6 +989,12 @@ impl Drop for Security {
             key.zeroize();
         }
         self.supplicant.snonce.zeroize();
+        for igtk in [&mut self.igtk.active, &mut self.igtk.next]
+            .into_iter()
+            .flatten()
+        {
+            igtk.key.zeroize();
+        }
     }
 }
 

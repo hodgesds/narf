@@ -9,6 +9,9 @@ use zeroize::{Zeroize, Zeroizing};
 pub const MAX_PN: u64 = (1u64 << 48) - 1;
 const MAX_BODY: usize = 4096;
 const NON_QOS: usize = 16;
+/// Robust management frames keep their own replay counter (IEEE802.11-2020
+/// 12.5.3.4.4; mac80211 uses `IEEE80211_NUM_TIDS` for management).
+const MGMT: usize = 17;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -157,7 +160,7 @@ pub struct Key {
     local: [u8; 6],
     peer: [u8; 6],
     tx_pn: u64,
-    receive: [ReplayWindow; 17],
+    receive: [ReplayWindow; 18],
     spp_amsdu: bool,
 }
 impl core::fmt::Debug for Key {
@@ -193,7 +196,7 @@ impl Key {
             local,
             peer,
             tx_pn: 0,
-            receive: [ReplayWindow { last_seen_pn: rsc }; 17],
+            receive: [ReplayWindow { last_seen_pn: rsc }; 18],
             spp_amsdu: false,
         })
     }
@@ -225,7 +228,7 @@ impl Key {
         self.tk.zeroize();
         self.tk.copy_from_slice(tk);
         self.tx_pn = 0;
-        self.receive = [ReplayWindow { last_seen_pn: rsc }; 17];
+        self.receive = [ReplayWindow { last_seen_pn: rsc }; 18];
         Ok(true)
     }
     /// Protect a validated native data header/body. Increment before handing
@@ -259,6 +262,65 @@ impl Key {
             &mut ciphertext,
         )
         .map_err(Error::Crypto)
+    }
+    /// Protect one unicast robust management frame (IEEE802.11-2020 12.5.3,
+    /// 11.13) to the bound peer: a 24-octet management header with the
+    /// Protected bit and no fragmentation, the management nonce flag and
+    /// the unmasked management subtype in the AAD (mac80211 wpa.c
+    /// `ccmp_special_blocks`). It shares the pairwise TX PN space.
+    pub fn protect_management(&mut self, header: &[u8], body: &[u8]) -> Result<Vec<u8>, Error> {
+        if !management_header(header)
+            || self.role != Role::Pairwise
+            || header[4..10] != self.peer
+            || header[10..16] != self.local
+        {
+            return Err(Error::Key);
+        }
+        if body.len() > MAX_BODY {
+            return Err(Error::Length);
+        }
+        if self.tx_pn == MAX_PN {
+            return Err(Error::Exhausted);
+        }
+        self.tx_pn += 1;
+        let mut ciphertext = Zeroizing::new(body.to_vec());
+        ccmp::protect(
+            &Ccm,
+            header,
+            &self.tk,
+            self.tx_pn,
+            self.key_id,
+            0,
+            true,
+            &mut ciphertext,
+        )
+        .map_err(Error::Crypto)
+    }
+    /// Authenticate one unicast robust management frame from the peer
+    /// against the separate management replay counter.
+    pub fn unprotect_management(
+        &mut self,
+        header: &[u8],
+        wire: &mut [u8],
+    ) -> Result<Vec<u8>, Error> {
+        if !management_header(header)
+            || self.role != Role::Pairwise
+            || header[4..10] != self.local
+            || header[10..16] != self.peer
+        {
+            return Err(Error::Key);
+        }
+        if !(16..=MAX_BODY + 16).contains(&wire.len()) {
+            return Err(Error::Length);
+        }
+        if wire[2] != 0 || wire[3] & 0x3f != 0x20 || wire[3] >> 6 != self.key_id {
+            return Err(Error::Key);
+        }
+        let mut candidate = self.receive[MGMT];
+        let plaintext = ccmp::unprotect(&Ccm, header, &self.tk, 0, true, &mut candidate, wire)
+            .map_err(Error::Crypto)?;
+        self.receive[MGMT] = candidate;
+        Ok(plaintext)
     }
     /// Authenticate before committing this key/TID's replay tracker. All
     /// admission/MIC/replay failures leave the entire wire buffer unchanged.
@@ -479,6 +541,14 @@ pub(crate) fn aggregate_header_with(header: &[u8], admission: AmsduAdmission) ->
 }
 fn unicast(mac: [u8; 6]) -> bool {
     mac != [0; 6] && mac[0] & 1 == 0
+}
+/// A protected, unfragmented 24-octet management header (no DS bits).
+fn management_header(header: &[u8]) -> bool {
+    header.len() == 24
+        && header[0] & 0x0c == 0
+        && header[1] & 0x40 != 0
+        && header[1] & 0x07 == 0
+        && header[22] & 15 == 0
 }
 struct Shape {
     index: usize,
