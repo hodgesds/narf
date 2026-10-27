@@ -286,6 +286,25 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
             })
             .map_err(|_| self.close())?
     }
+    /// Worker-only async maintenance. The owner is taken without waiting so
+    /// a synchronous network drain is never blocked behind this task; the
+    /// guard is held across the EP0 writes so no publication interleaves.
+    pub(super) async fn maintain(&self) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(mut state) = self.state.try_lock() else {
+            return;
+        };
+        if !state.service.maintenance_pending() {
+            return;
+        }
+        if state.service.maintain().await.is_err() {
+            state.clear_transmit();
+            drop(state);
+            self.close();
+        }
+    }
     pub(super) fn drain(&self) -> bool {
         self.dispatch_with(|frame| narf_net::iface::on_rx_frame_from(&self.name, frame))
     }
@@ -483,6 +502,7 @@ pub async fn attach(
     narf_scheduler::spawn(async move {
         loop {
             worker.drain();
+            worker.maintain().await;
             narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
         }
     });

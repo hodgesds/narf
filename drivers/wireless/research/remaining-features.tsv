@@ -199,33 +199,32 @@ mt76	uapsd	U-APSD	feature	drivers/wireless/specification/mt7921.md	1016
 mt76	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/mt7921.md	1072
 mt76	wmm_all_ac_priority	All WMM access categories and priority selection	feature	drivers/wireless/specification/mt7921.md	1015
 mt76	wpa3_sae	WPA3-Personal / SAE authentication	feature	drivers/wireless/specification/mt7921.md	1073
-rtl8xxxu	adaptive_rate_selection	Adaptive DATA rate selection	feature	drivers/wireless/specification/rtl8xxxu.md	529
-rtl8xxxu	additional_operating_channels	Noninitial operating channels and safe FIFO retuning	feature	drivers/wireless/specification/rtl8xxxu.md	523
-rtl8xxxu	bt_coexistence	Bluetooth coexistence on RTL8723BU	feature	drivers/wireless/specification/rtl8xxxu.md	526
-rtl8xxxu	endpoint_reset	Controller-proven EP0/Halted endpoint reset	feature	drivers/wireless/specification/rtl8xxxu.md	523
-rtl8xxxu	expanded_active_scanning	Active scanning beyond the initial profile	feature	drivers/wireless/specification/rtl8xxxu.md	529
-rtl8xxxu	expanded_passive_scanning	Passive scanning beyond the initial channel	feature	drivers/wireless/specification/rtl8xxxu.md	529
-rtl8xxxu	five_ghz_operation	Broader band operation including VHT-profile 5GHz	feature	drivers/wireless/specification/rtl8xxxu.md	519
-rtl8xxxu	ht40	HT40	feature	drivers/wireless/specification/rtl8xxxu.md	527
-rtl8xxxu	live_edca_updates	Live EDCA reprogramming on beacon WMM Parameter Set Count change (async EP0 from Open phase)	feature	drivers/wireless/specification/rtl8xxxu.md	348
+rtl8xxxu	adaptive_rate_selection	Adaptive DATA rate selection	feature	drivers/wireless/specification/rtl8xxxu.md	547
+rtl8xxxu	additional_operating_channels	Noninitial operating channels and safe FIFO retuning	feature	drivers/wireless/specification/rtl8xxxu.md	541
+rtl8xxxu	bt_coexistence	Bluetooth coexistence on RTL8723BU	feature	drivers/wireless/specification/rtl8xxxu.md	544
+rtl8xxxu	endpoint_reset	Controller-proven EP0/Halted endpoint reset	feature	drivers/wireless/specification/rtl8xxxu.md	541
+rtl8xxxu	expanded_active_scanning	Active scanning beyond the initial profile	feature	drivers/wireless/specification/rtl8xxxu.md	547
+rtl8xxxu	expanded_passive_scanning	Passive scanning beyond the initial channel	feature	drivers/wireless/specification/rtl8xxxu.md	547
+rtl8xxxu	five_ghz_operation	Broader band operation including VHT-profile 5GHz	feature	drivers/wireless/specification/rtl8xxxu.md	537
+rtl8xxxu	ht40	HT40	feature	drivers/wireless/specification/rtl8xxxu.md	545
 rtl8xxxu	qos_null	QoS Null frames	feature	drivers/wireless/specification/rtl8xxxu.md	310
-rtl8xxxu	rate_fallback	DATA rate fallback	feature	drivers/wireless/specification/rtl8xxxu.md	362
-rtl8xxxu	rtl8192eu	RTL8192EU retained runtime	chip	drivers/wireless/specification/rtl8xxxu.md	507
-rtl8xxxu	rtl8723bu	RTL8723BU retained runtime	chip	drivers/wireless/specification/rtl8xxxu.md	507
-rtl8xxxu	rtl8821cu	RTL8821CU retained runtime using its actual upstream transport	chip	drivers/wireless/specification/rtl8xxxu.md	544
-rtl8xxxu	rtl8822bu	RTL8822BU retained runtime using its actual upstream transport	chip	drivers/wireless/specification/rtl8xxxu.md	544
-rtl8xxxu	runtime_power_management	Runtime power management	feature	drivers/wireless/specification/rtl8xxxu.md	541
-rtl8xxxu	rx_ampdu	RX A-MPDU	feature	drivers/wireless/specification/rtl8xxxu.md	465
-rtl8xxxu	rx_block_ack	Recipient RX Block Ack agreements	feature	drivers/wireless/specification/rtl8xxxu.md	465
-rtl8xxxu	rx_reordering	RX sequence reordering	feature	drivers/wireless/specification/rtl8xxxu.md	465
-rtl8xxxu	safe_rejoin	Safe reassociation/rejoin	feature	drivers/wireless/specification/rtl8xxxu.md	523
+rtl8xxxu	rate_fallback	DATA rate fallback	feature	drivers/wireless/specification/rtl8xxxu.md	380
+rtl8xxxu	rtl8192eu	RTL8192EU retained runtime	chip	drivers/wireless/specification/rtl8xxxu.md	525
+rtl8xxxu	rtl8723bu	RTL8723BU retained runtime	chip	drivers/wireless/specification/rtl8xxxu.md	525
+rtl8xxxu	rtl8821cu	RTL8821CU retained runtime using its actual upstream transport	chip	drivers/wireless/specification/rtl8xxxu.md	562
+rtl8xxxu	rtl8822bu	RTL8822BU retained runtime using its actual upstream transport	chip	drivers/wireless/specification/rtl8xxxu.md	562
+rtl8xxxu	runtime_power_management	Runtime power management	feature	drivers/wireless/specification/rtl8xxxu.md	559
+rtl8xxxu	rx_ampdu	RX A-MPDU	feature	drivers/wireless/specification/rtl8xxxu.md	483
+rtl8xxxu	rx_block_ack	Recipient RX Block Ack agreements	feature	drivers/wireless/specification/rtl8xxxu.md	483
+rtl8xxxu	rx_reordering	RX sequence reordering	feature	drivers/wireless/specification/rtl8xxxu.md	483
+rtl8xxxu	safe_rejoin	Safe reassociation/rejoin	feature	drivers/wireless/specification/rtl8xxxu.md	541
 rtl8xxxu	tspec	TSPEC admission	feature	drivers/wireless/specification/rtl8xxxu.md	310
-rtl8xxxu	tx_ampdu	TX A-MPDU	feature	drivers/wireless/specification/rtl8xxxu.md	465
-rtl8xxxu	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/rtl8xxxu.md	465
-rtl8xxxu	tx_block_ack	Originator TX Block Ack agreements	feature	drivers/wireless/specification/rtl8xxxu.md	465
+rtl8xxxu	tx_ampdu	TX A-MPDU	feature	drivers/wireless/specification/rtl8xxxu.md	483
+rtl8xxxu	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/rtl8xxxu.md	483
+rtl8xxxu	tx_block_ack	Originator TX Block Ack agreements	feature	drivers/wireless/specification/rtl8xxxu.md	483
 rtl8xxxu	uapsd	U-APSD	feature	drivers/wireless/specification/rtl8xxxu.md	310
-rtl8xxxu	usb_transfer_slot_reuse	Safe USB transfer-slot reclamation/reuse	feature	drivers/wireless/specification/rtl8xxxu.md	520
-rtl8xxxu	vht	VHT operation on RTL8821CU/RTL8822BU	feature	drivers/wireless/specification/rtl8xxxu.md	546
+rtl8xxxu	usb_transfer_slot_reuse	Safe USB transfer-slot reclamation/reuse	feature	drivers/wireless/specification/rtl8xxxu.md	538
+rtl8xxxu	vht	VHT operation on RTL8821CU/RTL8822BU	feature	drivers/wireless/specification/rtl8xxxu.md	564
 rtlwifi	active_scanning	Active scanning	feature	drivers/wireless/specification/rtlwifi.md	303
 rtlwifi	adaptive_rate_selection	Adaptive DATA rate selection	feature	drivers/wireless/specification/rtlwifi.md	654
 rtlwifi	adaptive_retry_control	Adaptive retry control	feature	drivers/wireless/specification/rtlwifi.md	458

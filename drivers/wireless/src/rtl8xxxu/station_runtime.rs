@@ -84,6 +84,10 @@ pub struct Station<C: ControlIo, B: packet_transport::Io> {
     sequence: u16,
     /// Open-path per-TID QoS SN space; CCMP keeps its own in `Security`.
     qos_sequence: [u16; 8],
+    /// EDCA rows currently programmed by native EP0 (`rtl8xxxu_conf_tx`).
+    edca: Option<narf_wireless::wmm::Parameters>,
+    /// A newer bound-beacon WMM Parameter Set awaiting async EP0 writes.
+    edca_pending: Option<narf_wireless::wmm::Parameters>,
 }
 impl<C: ControlIo, B: packet_transport::Io> core::fmt::Debug for Station<C, B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -136,6 +140,8 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             last_peer: 0,
             sequence: 2,
             qos_sequence: [0; 8],
+            edca: None,
+            edca_pending: None,
         })
     }
     pub fn append_sme_ies(&mut self, bytes: &[u8]) -> Result<(), Error> {
@@ -303,6 +309,9 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         now: u64,
         nonce: &mut (impl FnMut() -> Option<[u8; 32]> + Send),
     ) -> Result<(), Error> {
+        if matches!(self.phase, Phase::FourWay | Phase::Open) {
+            self.apply_edca().await?;
+        }
         if self.phase == Phase::Open {
             return self.network_inner(now, nonce);
         }
@@ -328,15 +337,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                         self.plan.phase(),
                         management_runtime::Phase::Associated { .. }
                     ) {
-                        if let Some(p) = self.plan.wmm() {
-                            if narf_wireless::wmm::Parameters::parse(beacon.information_elements())
-                                .ok()
-                                .flatten()
-                                != Some(p)
-                            {
-                                return Err(Error::PeerLost);
-                            }
-                        }
+                        self.observe_wmm(beacon.information_elements())?;
                     }
                     self.last_peer = now;
                 }
@@ -365,6 +366,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                                 )
                                 .await
                                 .map_err(Error::Radio)?;
+                            self.edca = Some(p);
                         }
                         self.radio
                             .association(aid, true)
@@ -407,6 +409,82 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             }
         }
         Ok(())
+    }
+    /// Parameters used for classification/ACM downgrade: the rows last
+    /// written by native EP0, or the response-bound rows before association.
+    fn installed_wmm(&self) -> Option<narf_wireless::wmm::Parameters> {
+        self.edca.or_else(|| self.plan.wmm())
+    }
+    pub(super) fn edca_pending(&self) -> bool {
+        self.edca_pending.is_some()
+    }
+    /// mac80211 `ieee80211_sta_wmm_params`: only a bound-AP beacon whose WMM
+    /// Parameter Set Count differs from the last accepted one carries new
+    /// rows; an unchanged count is ignored exactly as upstream (even when
+    /// the element bytes differ). Losing WMM after a WMM association, or a
+    /// row this profile cannot program (BE ACM, ECW/AIFSN geometry, 8-bit
+    /// AIFS), is terminal before any EP0 write. The synchronous network path
+    /// only records the update; `maintain`/`step` perform the async writes.
+    fn observe_wmm(&mut self, information_elements: &[u8]) -> Result<(), Error> {
+        let Some(current) = self.edca_pending.or_else(|| self.installed_wmm()) else {
+            return Ok(());
+        };
+        let fresh = narf_wireless::wmm::Parameters::parse(information_elements)
+            .ok()
+            .flatten()
+            .ok_or(Error::PeerLost)?;
+        if fresh.parameter_set_count == current.parameter_set_count {
+            return Ok(());
+        }
+        super::wmm_runtime::words_profile(
+            fresh,
+            self.plan.candidate().capability() & 0x400 != 0,
+            self.plan.ht_selected(),
+        )
+        .map_err(Error::Radio)?;
+        self.edca_pending = Some(fresh);
+        Ok(())
+    }
+    /// `drv_conf_tx` -> `rtl8xxxu_conf_tx` for every AC: the same checked
+    /// EDCA/ACM EP0 writes and readbacks as the initial WMM admission.
+    async fn apply_edca(&mut self) -> Result<(), Error> {
+        let Some(p) = self.edca_pending else {
+            return Ok(());
+        };
+        if self.edca.is_none() {
+            return Err(Error::State);
+        }
+        self.radio
+            .configure_wmm_phy(
+                p,
+                self.plan.candidate().capability() & 0x400 != 0,
+                self.plan.ht_selected(),
+            )
+            .await
+            .map_err(Error::Radio)?;
+        self.edca = Some(p);
+        self.edca_pending = None;
+        Ok(())
+    }
+    /// Async maintenance for an associated station: applies a pending live
+    /// EDCA update under the retained current signed/policy authority.
+    /// Cancellation or any EP0 failure is terminal (the radio cannot prove
+    /// which rows reached the device).
+    pub async fn maintain(&mut self) -> Result<(), Error> {
+        if !matches!(self.phase(), Phase::FourWay | Phase::Open) {
+            return Err(Error::State);
+        }
+        if self.edca_pending.is_none() {
+            return Ok(());
+        }
+        let mut attempt = self.attempt();
+        let proof = self.radio.authority();
+        let result = proof.fence(self.apply_edca(), Error::Radio).await;
+        attempt.armed = false;
+        if result.is_err() {
+            self.fail();
+        }
+        result
     }
     fn progress(&mut self, now: u64) -> Result<bool, Error> {
         self.radio.current_wmm().map_err(Error::Radio)?;
@@ -659,15 +737,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                 if beacon.bssid() == self.plan.candidate().bssid()
                     && beacon.ssid() == self.plan.candidate().ssid()
                 {
-                    if let Some(p) = self.plan.wmm() {
-                        if narf_wireless::wmm::Parameters::parse(beacon.information_elements())
-                            .ok()
-                            .flatten()
-                            != Some(p)
-                        {
-                            return Err(Error::PeerLost);
-                        }
-                    }
+                    self.observe_wmm(beacon.information_elements())?;
                     self.last_peer = now;
                 }
                 continue;
@@ -773,8 +843,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         // mac80211 classification/ACM downgrade picks the TID; the codec maps
         // its AC to the source TXDESC queue and bulk-out pipe.
         let tid = self
-            .plan
-            .wmm()
+            .installed_wmm()
             .map(|p| crate::rtlwifi::wmm::priority(frame, &p));
         let native = if let Some(security) = &mut self.security {
             match if let Some(tid) = tid {

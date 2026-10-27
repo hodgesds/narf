@@ -728,6 +728,168 @@ kernel_test_in!(
     "drivers/wireless/rtl8xxxu/wmm",
     smoke_rtl8188eu_wmm_response_rejection_and_pending_ep0_cancellation_retain_owner
 );
+/// Bound-AP beacon carrying `parameters` after the base fixture elements.
+fn wmm_beacon(protected: bool, parameters: &[u8]) -> Vec<u8> {
+    let mut b = beacon(protected).bytes;
+    b.extend_from_slice(parameters);
+    b
+}
+/// Parameter Set Count 2: VI AIFSN2->3, VO TXOP47->30 with ACM set.
+const WMM_COUNT2: [u8; 26] = [
+    221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0x82, 0, 0x72, 0x32, 30, 0, 3, 0xa4, 0, 0, 0x43, 0x43, 94, 0,
+    0x27, 0xa4, 0, 0,
+];
+fn edca_rows(control: &Fake) -> [u32; 4] {
+    let regs = control.0.lock().regs.clone();
+    [0x508, 0x50c, 0x504, 0x500].map(|r| u32::from_le_bytes(regs[r..r + 4].try_into().unwrap()))
+}
+fn smoke_rtl8188eu_wmm_beacon_parameter_set_count_updates_live_edca() -> TestResult {
+    const INITIAL: [u32; 4] = [0xa546, 0xa496, 0x005e4332, 0x002f3232];
+    // rtl8xxxu_set_aifs/conf_tx: AIFS = SIFS10 + AIFSN*20 (long slot).
+    const UPDATED: [u32; 4] = [0xa546, 0xa496, 0x005e4346, 0x001e3232];
+    for protected in [false, true] {
+        let (control, link, mut s, _, _) = wmm_prepared(protected);
+        if narf_scheduler::block_on(s.begin(0)).is_err() {
+            return TestResult::Fail("EU live EDCA begin");
+        }
+        for now in 1..20 {
+            if narf_scheduler::block_on(s.step(now, SN)).is_err() {
+                return TestResult::Fail("EU live EDCA association/RSNA");
+            }
+            if s.controlled_port_open() {
+                break;
+            }
+        }
+        if !s.controlled_port_open() || edca_rows(&control) != INITIAL {
+            return TestResult::Fail("EU live EDCA initial rows");
+        }
+        // Same count: mac80211 ignores the beacon; no EP0 work is queued.
+        link.state
+            .lock()
+            .queue
+            .push_back(wmm_beacon(protected, &WMM));
+        let ops = control.0.lock().ops.len();
+        if s.poll_network(20, SN).is_err()
+            || narf_scheduler::block_on(s.maintain()).is_err()
+            || control.0.lock().ops.len() != ops
+        {
+            return TestResult::Fail("EU same-count beacon reprogrammed EDCA");
+        }
+        // New count: the synchronous path records it without any EP0 await.
+        link.state
+            .lock()
+            .queue
+            .push_back(wmm_beacon(protected, &WMM_COUNT2));
+        if s.poll_network(21, SN).is_err()
+            || control.0.lock().ops.len() != ops
+            || edca_rows(&control) != INITIAL
+        {
+            return TestResult::Fail("EU synchronous network path issued EP0 EDCA writes");
+        }
+        if narf_scheduler::block_on(s.maintain()).is_err()
+            || edca_rows(&control) != UPDATED
+            || control.0.lock().regs[0x5c0] & 15 != 8
+            || !s.controlled_port_open()
+        {
+            return TestResult::Fail("EU live EDCA/ACM rows not programmed after count change");
+        }
+        // Classification now downgrades VO (DSCP46) under the new VO ACM.
+        let mut eth = AP.to_vec();
+        eth.extend_from_slice(&link.own);
+        eth.extend_from_slice(&[8, 0, 0x45, 46 << 2, 0, 20]);
+        if s.send_ethernet(&eth, 22).is_err() {
+            return TestResult::Fail("EU data after live EDCA update");
+        }
+        if link.state.lock().data.last().map(|d| d.2) != Some(5) {
+            return TestResult::Fail("EU classification ignored updated ACM rows");
+        }
+        for now in 23..26 {
+            if s.poll_network(now, SN).is_err() {
+                return TestResult::Fail("EU roundtrip after live EDCA");
+            }
+        }
+        // Same new count, different bytes: still ignored.
+        let mut alt = WMM_COUNT2;
+        alt[12] = 10;
+        link.state
+            .lock()
+            .queue
+            .push_back(wmm_beacon(protected, &alt));
+        if s.poll_network(26, SN).is_err()
+            || narf_scheduler::block_on(s.maintain()).is_err()
+            || edca_rows(&control) != UPDATED
+        {
+            return TestResult::Fail("EU unchanged-count element bytes reprogrammed EDCA");
+        }
+        // Cancelled live update is terminal and leaves posted RX owned.
+        let mut count3 = WMM_COUNT2;
+        count3[8] = 0x83;
+        link.state
+            .lock()
+            .queue
+            .push_back(wmm_beacon(protected, &count3));
+        if s.poll_network(27, SN).is_err() {
+            return TestResult::Fail("EU count3 beacon");
+        }
+        control.0.lock().pending_write = Some(0x508);
+        {
+            let mut operation = Box::pin(s.maintain());
+            if operation
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+            {
+                return TestResult::Fail("EU held live EDCA EP0 completed");
+            }
+        }
+        if s.phase() != Phase::Failed
+            || s.controlled_port_open()
+            || s.send_ethernet(&eth, 28).is_ok()
+            || link.state.lock().rx.is_none()
+        {
+            return TestResult::Fail("EU cancelled live EDCA reopened station or released RX");
+        }
+    }
+    // An inadmissible new set (BE ACM) is terminal before any EP0 write;
+    // losing WMM entirely is peer loss.
+    for case in 0..2 {
+        let (control, link, mut s, _, _) = wmm_prepared(false);
+        narf_scheduler::block_on(s.begin(0)).unwrap();
+        for now in 1..20 {
+            narf_scheduler::block_on(s.step(now, SN)).unwrap();
+            if s.controlled_port_open() {
+                break;
+            }
+        }
+        let mut bad = WMM_COUNT2;
+        bad[14] |= 0x10;
+        let frame = if case == 0 {
+            wmm_beacon(false, &bad)
+        } else {
+            beacon(false).bytes
+        };
+        link.state.lock().queue.push_back(frame);
+        let ops = control.0.lock().ops.len();
+        let result = s.poll_network(20, SN);
+        let expected = if case == 0 {
+            Error::Radio(super::super::super::receive_runtime::Error::State)
+        } else {
+            Error::PeerLost
+        };
+        if result != Err(expected)
+            || s.phase() != Phase::Failed
+            || control.0.lock().ops.len() != ops
+            || edca_rows(&control) != INITIAL
+        {
+            return TestResult::Fail("EU inadmissible/lost WMM beacon was not terminal pre-write");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/wmm",
+    smoke_rtl8188eu_wmm_beacon_parameter_set_count_updates_live_edca
+);
 fn smoke_rtl8188eu_real_station_auth_assoc_fw_rsna_and_packet_roundtrip() -> TestResult {
     for protected in [false, true] {
         let (control, link, mut s) = prepared(protected);

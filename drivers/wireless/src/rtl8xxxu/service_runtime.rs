@@ -349,6 +349,34 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
         }
         result
     }
+    /// True when a connected station holds a live EDCA update that only the
+    /// async `maintain` path may program over EP0.
+    pub fn maintenance_pending(&self) -> bool {
+        self.phase() == Phase::Connected && self.station.as_ref().is_some_and(Station::edca_pending)
+    }
+    /// Async counterpart of `poll` for EP0 work the synchronous network path
+    /// must not await (live `rtl8xxxu_conf_tx`). Failure is terminal.
+    pub async fn maintain(&mut self) -> Result<(), Error> {
+        if !self.maintenance_pending() {
+            return Ok(());
+        }
+        let mut attempt = Attempt {
+            failed: self.failed.clone(),
+            armed: true,
+        };
+        let result = self
+            .station
+            .as_mut()
+            .ok_or(Error::State)?
+            .maintain()
+            .await
+            .map_err(Error::Station);
+        attempt.armed = false;
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
     pub fn transmit_ready(&self) -> bool {
         self.phase() == Phase::Connected
             && self.station.as_ref().is_some_and(Station::transmit_ready)

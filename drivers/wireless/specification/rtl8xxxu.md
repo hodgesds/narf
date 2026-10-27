@@ -342,10 +342,28 @@ association invokes that cap and rechecks the current installed country/power
 permission; active work never bootstraps a cleared policy. Packet publication
 and completion also require this retained proof. Missing/changed/revoked proof
 is terminal and cannot publish QoS, reuse pending USB storage or revive carrier.
-Bound AP parameter changes still require a fresh lifecycle: upstream
-mac80211 re-runs `rtl8xxxu_conf_tx` when a beacon's WMM Parameter Set Count
-changes, but the Open-phase network path here is synchronous and cannot yet
-issue the async EP0 EDCA writes (remaining `live_edca_updates`).
+#### Live EDCA updates (implemented)
+
+mac80211 `ieee80211_sta_wmm_params` re-applies EDCA only when a beacon from
+the bound AP carries a different WMM Parameter Set Count; `drv_conf_tx` then
+reaches `rtl8xxxu_conf_tx` for each AC. `station_runtime.rs::observe_wmm`
+follows that on both the async join path and the synchronous Open network
+path: an unchanged count is ignored (even if element bytes differ), a new
+count is checked by `wmm_runtime::words_profile` (BE ACM, ECW/AIFSN geometry,
+8-bit AIFS) before any EP0 access and recorded as pending; losing WMM after
+a WMM association is peer loss. The synchronous path never awaits EP0.
+`Station::maintain` (driven by `Service::maintain` and the interface worker
+via `Device::maintain`, which takes the owner without waiting so a
+synchronous network drain is never blocked) and `step` apply the pending
+rows through the same checked `configure_wmm_phy` EDCA/REG_ACM_HW_CTRL
+writes and readbacks inside the retained signed/policy fence, then switch
+host classification/ACM downgrade to the new rows. Cancellation or EP0
+failure is terminal and retains posted USB ownership. Smoke
+`smoke_rtl8188eu_wmm_beacon_parameter_set_count_updates_live_edca` (Open and
+WPA2) covers the ignored same-count beacon, no EP0 from the sync path, the
+literal updated rows and VO ACM bit, VO->VI downgrade after the update,
+ignored same-count byte changes, held-EP0 cancellation, and terminal
+pre-write refusal of BE-ACM and WMM loss.
 
 Two native Rust smokes compose actual EP0/bulk owners through Open/WPA2,
 literal EDCA/TXD values, exact QoS/CCMP data, actual cap loss, malformed response,
@@ -463,8 +481,8 @@ policy loss and reentrant key/ordinary-credit publication. These cases pass
 both-architecture native QEMU and coordinated build/Clippy gates. Physical
 USB/RF/HT interoperability and exact-device measured qualification remain external.
 SGI20, HT40, RX A-MPDU, TX A-MPDU, TX A-MSDU, recipient/originator BA and RX
-reordering, adaptive rates, broader scans/channels, coexistence,
-live EDCA and reset/rejoin remain software work.
+reordering, adaptive rates, broader scans/channels, coexistence
+and reset/rejoin remain software work.
 
 ## 4. Invariants
 
