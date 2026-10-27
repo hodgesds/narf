@@ -280,8 +280,8 @@ impl MethodBus for AmlBus {
     }
 
     fn exec_fn(&mut self, path: &str, mask: u64, dsm_fn: u8, name: &str, arg: u64) -> bool {
-        if mask & (1u64 << dsm_fn) != 0 {
-            if narf_aml::eval::evaluate_dsm(
+        if mask & (1u64 << dsm_fn) != 0
+            && narf_aml::eval::evaluate_dsm(
                 path,
                 DSM_UUID,
                 DSM_REVISION,
@@ -289,9 +289,8 @@ impl MethodBus for AmlBus {
                 Value::Package(alloc::vec![Value::Integer(arg)]),
             )
             .is_ok()
-            {
-                return true;
-            }
+        {
+            return true;
         }
         narf_aml::eval::evaluate_method(&method_path(path, name), &[Value::Integer(arg)]).is_ok()
     }
