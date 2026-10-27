@@ -312,6 +312,134 @@ pub fn encode_cfgcr0(c: &DpllCoeffs) -> u32 {
     cfgcr0_dco_integer(c.dco_integer) | cfgcr0_dco_fraction(c.dco_fraction)
 }
 
+// ── HDMI WRPLL (computed coefficients) ──────────────────────────
+//
+// Unlike DP — whose four rates have fixed PRM table rows — HDMI
+// takes an arbitrary TMDS character clock from the sink's EDID,
+// so the Combo-PHY coefficients are *computed* with the WRPLL
+// divider search. The algorithm below is the one the PRM's
+// Combo-PHY PLL programming sequence describes and i915
+// implements as `cnl_ddi_calculate_wrpll` +
+// `cnl_wrpll_get_multipliers` + `cnl_wrpll_params_populate`
+// (used for HDMI on CNL and on ICL+ alike; `icl_calc_dpll_state`
+// routes HDMI/DSI through it and composes CFGCR1 with
+// `DPLL_CFGCR1_CENTRAL_FREQ_8400`, the same central-frequency
+// field every row in this module carries):
+//
+//   afe_clock = tmds_clock * 5     (the PLL output is 5x the
+//                                   TMDS character rate)
+//   for each candidate total divider d (fixed list, below):
+//       dco = afe_clock * d
+//       keep d if 7_998_000 <= dco <= 10_000_000 kHz and dco is
+//       closest to the window centre 8_999_000 kHz (first wins
+//       ties — the list order is part of the algorithm)
+//   decompose d into (pdiv, qdiv, kdiv) with the multiplier
+//   table in [`wrpll_multipliers`]
+//   dco_integer / dco_fraction = dco / ref_clock in 1/2^15 units
+//
+// Reference clock: as in `cnl_hdmi_pll_ref_clock`, a 38.4 MHz
+// reference is used as 19.2 MHz (the DPLL divides it by two
+// internally), so [`ReferenceFamily::Ref19_2Or38_4`] divides by
+// 19_200 kHz here exactly as its fixed rows presume.
+//
+// Q-field encoding follows `cnl_wrpll_params_populate`
+// verbatim: the ratio field carries the divider value itself
+// and the QDIV_MODE bit is set iff qdiv != 1. (The fixed DP
+// rows above carry ratio 0 for Q = 1; the field is consulted
+// only when QDIV_MODE engages the divider, and the HDMI path's
+// encoding is the shipping driver's.)
+
+/// Candidate total dividers, in the search's order.
+const WRPLL_DIVIDERS: &[u32] = &[
+    2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 24, 28, 30, 32, 36, 40, 42, 44, 48, 50, 52, 54, 56, 60, 64,
+    66, 68, 70, 72, 76, 78, 80, 84, 88, 90, 92, 96, 98, 100, 102, 3, 5, 7, 9, 15, 21,
+];
+
+/// DCO window for the Combo-PHY WRPLL search (kHz).
+const WRPLL_DCO_MIN_KHZ: u64 = 7_998_000;
+const WRPLL_DCO_MAX_KHZ: u64 = 10_000_000;
+const WRPLL_DCO_MID_KHZ: u64 = (WRPLL_DCO_MIN_KHZ + WRPLL_DCO_MAX_KHZ) / 2;
+
+/// Decompose a total divider into (pdiv, qdiv, kdiv) —
+/// `cnl_wrpll_get_multipliers` transcribed: even dividers
+/// factor through P = 2/3/5/7 with K = 2 (except 2 itself,
+/// which is P2/Q1/K1); the odd tail {3, 5, 7} is P-only and
+/// {9, 15, 21} is P/3 with K = 3.
+fn wrpll_multipliers(best_div: u32) -> (u32, u32, u32) {
+    if best_div % 2 == 0 {
+        if best_div == 2 {
+            (2, 1, 1)
+        } else if best_div % 4 == 0 {
+            (2, best_div / 4, 2)
+        } else if best_div % 6 == 0 {
+            (3, best_div / 6, 2)
+        } else if best_div % 5 == 0 {
+            (5, best_div / 10, 2)
+        } else {
+            // Remaining even list members are 14 | 98 (x14).
+            (7, best_div / 14, 2)
+        }
+    } else if matches!(best_div, 3 | 5 | 7) {
+        (best_div, 1, 1)
+    } else {
+        // 9, 15, 21.
+        (best_div / 3, 1, 3)
+    }
+}
+
+/// Compute the Combo-PHY DPLL coefficients for an HDMI TMDS
+/// character clock (`tmds_clock_khz`, = the mode's pixel clock
+/// at 8 bpc) under reference family `family`, via the WRPLL
+/// search above. `None` when no candidate divider lands the
+/// DCO inside its window (clock beyond the HDMI 2.0 envelope
+/// this PHY generation synthesises).
+pub fn hdmi_wrpll_coeffs(tmds_clock_khz: u32, family: ReferenceFamily) -> Option<DpllCoeffs> {
+    let ref_khz: u64 = match family {
+        ReferenceFamily::Ref24 => 24_000,
+        ReferenceFamily::Ref19_2Or38_4 => 19_200,
+    };
+    let afe_clock = (tmds_clock_khz as u64) * 5;
+    let mut best: Option<(u32, u64)> = None; // (divider, dco_khz)
+    let mut best_centrality = u64::MAX;
+    for &d in WRPLL_DIVIDERS {
+        let dco = afe_clock * (d as u64);
+        if (WRPLL_DCO_MIN_KHZ..=WRPLL_DCO_MAX_KHZ).contains(&dco) {
+            let centrality = dco.abs_diff(WRPLL_DCO_MID_KHZ);
+            if centrality < best_centrality {
+                best_centrality = centrality;
+                best = Some((d, dco));
+            }
+        }
+    }
+    let (best_div, best_dco) = best?;
+    let (pdiv, qdiv, kdiv) = wrpll_multipliers(best_div);
+    // dco in 1/2^15 units of the reference, split int/frac —
+    // `cnl_wrpll_params_populate`'s `(dco << 15) / ref`.
+    let scaled = (best_dco << 15) / ref_khz;
+    let dco_integer = (scaled >> 15) as u16;
+    let dco_fraction = (scaled & 0x7FFF) as u16;
+    let pdiv_bits = match pdiv {
+        2 => CFGCR1_PDIV_2,
+        3 => CFGCR1_PDIV_3,
+        5 => CFGCR1_PDIV_5,
+        _ => CFGCR1_PDIV_7,
+    };
+    let kdiv_bits = match kdiv {
+        1 => CFGCR1_KDIV_1,
+        2 => CFGCR1_KDIV_2,
+        _ => CFGCR1_KDIV_3,
+    };
+    let mut cfgcr1 = cfgcr1_qdiv_ratio(qdiv as u8) | kdiv_bits | pdiv_bits | CFGCR1_CFREQ_8_4_GHZ;
+    if qdiv != 1 {
+        cfgcr1 |= CFGCR1_QDIV_MODE_DIV2;
+    }
+    Some(DpllCoeffs {
+        dco_integer,
+        dco_fraction,
+        cfgcr1,
+    })
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
     use super::*;
@@ -448,4 +576,84 @@ pub mod tests {
         "drivers/gpu/intel_gpu_pll",
         smoke_combo_coeffs_24mhz_family_match_prm_table
     );
+
+    /// Pin the HDMI WRPLL search (#1019) against hand-worked
+    /// runs of the algorithm in `cnl_ddi_calculate_wrpll`:
+    /// AFE = 5 x TMDS clock; the winning divider is the one
+    /// whose DCO lands in [7_998_000, 10_000_000] kHz closest
+    /// to the 8_999_000 centre; (p, q, k) from the multiplier
+    /// decomposition. Expected (int, frac) are the exact
+    /// rationals DCO/ref in 1/2^15 units, worked independently
+    /// of the implementation:
+    ///
+    ///   594_000 (4K60):  div 3  -> DCO 8_910_000, (3,1,1)
+    ///   297_000 (4K30):  div 6  -> DCO 8_910_000, (3,1,2)
+    ///   148_500 (1080p): div 12 -> DCO 8_910_000, (2,3,2)
+    ///    74_250 (720p):  div 24 -> DCO 8_910_000, (2,6,2)
+    ///    25_200 (480p):  div 72 -> DCO 9_072_000, (2,18,2)
+    fn smoke_hdmi_wrpll_rows() -> TestResult {
+        // (tmds_khz, int@24MHz, frac@24, int@19.2MHz, frac@19.2, cfgcr1)
+        let rows: [(u32, u16, u16, u16, u16, u32); 5] = [
+            (594_000, 0x173, 0x2000, 0x1D0, 0x0800, 0x44B),
+            (297_000, 0x173, 0x2000, 0x1D0, 0x0800, 0x48B),
+            (148_500, 0x173, 0x2000, 0x1D0, 0x0800, 0xE87),
+            (74_250, 0x173, 0x2000, 0x1D0, 0x0800, 0x1A87),
+            (25_200, 0x17A, 0x0000, 0x1D8, 0x4000, 0x4A87),
+        ];
+        for (tmds, i24, f24, i19, f19, cfgcr1) in rows {
+            let c24 = match hdmi_wrpll_coeffs(tmds, ReferenceFamily::Ref24) {
+                Some(c) => c,
+                None => return TestResult::Fail("WRPLL must resolve standard TMDS clocks"),
+            };
+            if c24.dco_integer != i24 || c24.dco_fraction != f24 || c24.cfgcr1 != cfgcr1 {
+                return TestResult::Fail("24 MHz WRPLL row mismatch");
+            }
+            let c19 = match hdmi_wrpll_coeffs(tmds, ReferenceFamily::Ref19_2Or38_4) {
+                Some(c) => c,
+                None => return TestResult::Fail("WRPLL must resolve in the 19.2 MHz family"),
+            };
+            if c19.dco_integer != i19 || c19.dco_fraction != f19 || c19.cfgcr1 != cfgcr1 {
+                return TestResult::Fail("19.2 MHz WRPLL row mismatch");
+            }
+            // Independent decode: the register fields must
+            // synthesise exactly 5 x the TMDS clock — DCO from
+            // (int + frac/2^15) x ref, out = DCO / (P*Q*K) with
+            // the dividers decoded back out of CFGCR1.
+            for (c, ref_khz) in [(c24, 24_000u64), (c19, 19_200u64)] {
+                let dco_num = ref_khz * ((c.dco_integer as u64) * 32_768 + c.dco_fraction as u64);
+                if dco_num % 32_768 != 0 {
+                    return TestResult::Fail("DCO must be an exact kHz value");
+                }
+                let dco = dco_num / 32_768;
+                let p: u64 = match (c.cfgcr1 >> 2) & 0xF {
+                    1 => 2,
+                    2 => 3,
+                    4 => 5,
+                    8 => 7,
+                    _ => return TestResult::Fail("P field must decode"),
+                };
+                let k: u64 = match (c.cfgcr1 >> 6) & 0x7 {
+                    1 => 1,
+                    2 => 2,
+                    4 => 3,
+                    _ => return TestResult::Fail("K field must decode"),
+                };
+                let q: u64 = if c.cfgcr1 & CFGCR1_QDIV_MODE_DIV2 != 0 {
+                    ((c.cfgcr1 >> 10) & 0xFF) as u64
+                } else {
+                    1
+                };
+                if dco % (p * q * k) != 0 || dco / (p * q * k) != (tmds as u64) * 5 {
+                    return TestResult::Fail("decoded PLL output must be 5x the TMDS clock");
+                }
+            }
+        }
+        // Beyond the envelope: 1.2 GHz TMDS has no divider
+        // (smallest product already overshoots the DCO window).
+        if hdmi_wrpll_coeffs(1_200_000, ReferenceFamily::Ref24).is_some() {
+            return TestResult::Fail("out-of-window clock must not resolve");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_pll", smoke_hdmi_wrpll_rows);
 }

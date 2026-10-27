@@ -458,3 +458,139 @@ Xe-LPG display (#1016), Type-C HPD via the GEN11 DE HPD block
 (the Alt-Mode bridge's DDIs), DSC/FEC, and the HPD IRQ
 handler itself (interrupt enables are programmed; the
 session is poll-driven until an IRQ consumer lands).
+
+## 11. External HDMI, full (lane Q5 — `intel_gpu_hdmi`, #1019)
+
+The external-HDMI path for combo DDIs, Gen12. Compiled
+only under the gpu crate's `intel` feature. Sources: HDMI
+1.4 §5.3.5 and CTA-861 infoframe packing (as implemented
+by Linux `drivers/video/hdmi.c`), HDMI 2.0 §10 (SCDC; the
+register map as carried by `drm_scdc_helper.h`), TGL PRM
+Vol. 2c (TRANS_DDI_FUNC_CTL HDMI bits), Vol. 11 (WRPLL —
+the `cnl_ddi_calculate_wrpll` search i915 uses for HDMI on
+CNL and ICL+), Vol. 12 (DIP banks, AUD_CONFIG), CEA-861-D
+§7.5 (ELD, via the §10 sink).
+
+Public interface:
+
+- `probe_sink(mmio, ddi) -> HdmiSinkProbe` — the complete
+  EDID over DDC, the preferred mode, the HDMI Forum VSDB
+  capabilities, and whether the mode's character rate
+  demands scrambling. No display registers are touched.
+- `activate(mmio, probe, fb) -> HdmiConnection` — SCDC
+  configuration where required, the WRPLL modeset
+  (`Modeset::modeset_hdmi`), the AVI infoframe, then
+  display-audio publication. `connect` composes the two.
+- `disconnect(mmio, conn)` — audio disable + sink clear,
+  DIP disable, pipeline teardown.
+
+DDC runs over the **GMBUS codec** (`intel_gpu_gmbus`): the
+base EDID block uses the codec's own read program verbatim;
+indexed and segment-pointer reads, and the SCDC writes,
+compose the codec's field helpers — no second DDC
+transport. The session drives the codec's documented
+caller sequence (program GMBUS0/GMBUS1, poll GMBUS2 via
+`GmbusStatus`, drain/fill GMBUS3, restore GMBUS0 = 0)
+directly, because Q3 (#1018) has not landed a transport
+yet; when it does, the engine functions in
+`intel_gpu_hdmi` are the swap-out point. The GMBUS_BASE
+correction (0xC510 → 0xC5100) and the duplicated GMBUS2
+HW_DONE bit are #1018's and are not duplicated here — the
+session and its fixtures key off the codec's constants,
+never a private copy of the base.
+
+Character-rate rule (HDMI 2.0 §10.4): at 8 bpc the TMDS
+character rate of a mode is its pixel clock. Above
+340 Mcsc the stream requires SCDC scrambling and the 1/40
+TMDS bit-clock ratio, plus both TRANS_DDI_FUNC_CTL HDMI
+bits (Scrambling Enabled bit 0, High TMDS Char Rate
+bit 4); the PLL still runs at 5× the character rate (the
+1/40 ratio divides the bit clock, not the character-rate
+clock). At or below 340 Mcsc the sink is not touched over
+SCDC at all. A >340 Mcsc mode against a sink whose HF-VSDB
+does not declare SCDC is refused with
+`ScramblingUnsupported`, never silently degraded.
+
+SCDC sequence (`configure_scdc`): refuse unless the
+HF-VSDB declares SCDC_Present; read-modify-write
+TMDS_CONFIG (0x20) setting SCRAMBLING_ENABLE | ratio 1/40;
+wait out the specification's 1 ms minimum settle
+(poll-counted, per the #879 poll-budget discipline); read
+SCRAMBLER_STATUS (0x21) and require the scrambling bit,
+else `ScramblingVerifyFailed`. Configuration runs before
+the modeset binds the transcoder.
+
+Clocking: HDMI rates do not come from the fixed DP PLL
+rows — `intel_gpu_pll::hdmi_wrpll_coeffs` runs the WRPLL
+search (AFE = 5× TMDS clock; DCO window 7 998–10 000 MHz;
+the divider list and P/Q/K decomposition transcribed from
+`cnl_ddi_calculate_wrpll` / `cnl_wrpll_get_multipliers`;
+38.4 MHz reference treated as 19.2 per
+`cnl_hdmi_pll_ref_clock`). Rows are fixture-pinned with an
+independent decode check (DCO / (P·Q·K) must reproduce
+exactly 5× the TMDS clock). `Modeset::modeset_hdmi` omits
+the DP-only steps: no M/N, no BUF_TRANS load, no link
+training; the DDI buffer enables at the HDMI-fixed 4-lane
+width.
+
+Infoframes: AVI (type 0x82, v2, 13 data bytes) and audio
+(type 0x84, v1, 10 data bytes) packed per HDMI 1.4 §5.3.5
+with the checksum byte making the whole frame sum to
+0 mod 256; both pinned byte-for-byte in fixtures. The VIC
+comes from the mode's geometry (a small table; exact
+timings still govern the modeset — 720×480 pins the 4:3
+VIC 2 because the mode shape carries no pixel aspect).
+The AVI frame is written through the HSW+ video DIP:
+CTL enable bit cleared, the 32-byte DIP image written to
+the AVI data bank (the frame's checksum slot is a 1-byte
+hardware ECC hole at buffer position 3), enable set,
+posting read. The audio infoframe is *not* DIP-programmed
+— this hardware has no audio DIP bank; the HDA codec
+synthesises it from the published ELD, and the packed
+frame rides the connection for that consumer.
+
+Audio consumes the §10 **shared display-audio sink** as
+second publisher (`DisplayConnector::Hdmi`; same sink id
+per physical connector — DDI index + 1 — because a
+connector is either DP or HDMI at a time). The codec side
+is the HDMI branch of `intel_gpu_audio`: AUD_CONFIG
+carries the PRM pixel-clock code for the TMDS clock and
+latches with N_PROG_ENABLE only (no DP timestamp mode, no
+N_VALUE_INDEX — the disable path conditions that bit on
+the old configuration being DP, so the HDMI disable omits
+it too). Publication order matches §10: ELD into the sink
+first, codec enable, then ELD_VALID. The cross-vendor
+display-audio story is tracked in #778 (AMD), referenced
+not closed by this lane.
+
+HPD is the §10 GEN8 DE Port block, shared: HDMI sinks
+answer DDC, DP sinks answer AUX, so the glue
+(`intel_gpu::handle_dp_hpd_event`) tries the DP connect
+first and falls back to HDMI; a fall tears down whichever
+session owns the DDI. Short pulses remain DP-only.
+
+Invariants:
+
+- A ≤340 Mcsc connect produces zero SCDC-slave traffic
+  (fixture-asserted over the recorded GMBUS programs).
+- SCDC writes precede the first TRANS_DDI_FUNC_CTL write
+  (fixture-asserted over the recorded write log).
+- The modeset's CFGCR0/CFGCR1 writes for a mode equal the
+  WRPLL fixture rows for that TMDS clock.
+- Disconnect clears the ELD publication before the
+  pipeline comes down, and clears the DDI buffer last.
+
+Fixtures: a GMBUS sink model (EDID store + SCDC register
+file decoding the GMBUS1 program fields itself) exercising
+1080p connect with no SCDC traffic, 4K60 connect with the
+SCDC RMW + verify + func-ctl bit pins, 4K60 refused
+without SCDC, scrambling-verify failure, sink NACK,
+4-block EDID over the E-DDC segment pointer, HF-VSDB
+parsing past a decoy HDMI Licensing VSDB, infoframe
+byte pins, and disconnect teardown order.
+
+Deliberate remainders: DVI signalling (same TMDS path,
+no infoframes/SCDC — a follow-up, not filed here), YCbCr
+4:2:0 and deep colour (character rate ≠ pixel clock —
+the rate rule's premise is 8 bpc RGB), HDCP (separate
+programme), HDMI 2.1 FRL, Type-C HDMI alt mode.

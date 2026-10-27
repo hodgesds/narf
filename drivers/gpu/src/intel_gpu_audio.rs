@@ -155,6 +155,112 @@ pub fn audio_codec_disable<M: MmioWindow + ?Sized>(mmio: &M, trans: Transcoder) 
     compiler_fence(Ordering::SeqCst);
 }
 
+// ── HDMI audio (#1019) ─────────────────────────────────────────
+//
+// The HDMI branch of `hsw_audio_codec_enable` differs from DP
+// in the AUD_CONFIG programming: instead of N_VALUE_INDEX
+// (hardware timestamps from the DP link clock), the config
+// carries the TMDS pixel-clock encoding in bits[19:16] so the
+// hardware derives Maud/Naud from the TMDS clock, the N fields
+// are cleared, and `N_PROG_ENABLE` latches the result. The
+// pixel-clock field encodings are the AUD_CONFIG field table
+// (PRM Vol. 12 §"AUD_CONFIG"; i915 `intel_audio_regs.h`
+// AUD_CONFIG_PIXEL_CLOCK_HDMI_*): the standard TMDS clocks of
+// the CEA mode set, in ascending order.
+
+/// (TMDS clock kHz, AUD_CONFIG pixel-clock field value) — the
+/// documented HDMI pixel-clock encodings.
+const AUD_CONFIG_PIXEL_CLOCK_HDMI_TABLE: &[(u32, u32)] = &[
+    (25_175, 0),
+    (25_200, 1),
+    (27_000, 2),
+    (27_027, 3),
+    (54_000, 4),
+    (54_054, 5),
+    (74_176, 6),
+    (74_250, 7),
+    (148_352, 8),
+    (148_500, 9),
+    (296_703, 10),
+    (297_000, 11),
+    (593_407, 12),
+    (594_000, 13),
+];
+
+/// The `AUD_CONFIG` pixel-clock field bits for a TMDS clock,
+/// or `None` when the clock has no documented encoding (the
+/// caller then latches the config with the field cleared —
+/// the sink keeps the stream muted rather than running with a
+/// guessed clock code).
+pub fn aud_config_pixel_clock_hdmi(tmds_khz: u32) -> Option<u32> {
+    AUD_CONFIG_PIXEL_CLOCK_HDMI_TABLE
+        .iter()
+        .find(|(khz, _)| *khz == tmds_khz)
+        .map(|(_, field)| field << 16)
+}
+
+/// HDMI audio config update: clear the N-value fields, the
+/// pixel-clock field and both program/index bits, then set
+/// the TMDS pixel-clock encoding and `N_PROG_ENABLE` to latch
+/// it (the HDMI counterpart of [`dp_audio_config_update`]).
+pub fn hdmi_audio_config_update<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    trans: Transcoder,
+    tmds_khz: u32,
+) {
+    let off = aud_cfg_off(trans);
+    let cur = mmio.read32(off);
+    let cleared = cur
+        & !(AUD_CONFIG_N_VALUE_INDEX
+            | AUD_CONFIG_PIXEL_CLOCK_MASK
+            | AUD_CONFIG_UPPER_N_MASK
+            | AUD_CONFIG_LOWER_N_MASK
+            | AUD_CONFIG_N_PROG_ENABLE);
+    let pixel_clock = aud_config_pixel_clock_hdmi(tmds_khz).unwrap_or(0);
+    mmio.write32(off, cleared | pixel_clock | AUD_CONFIG_N_PROG_ENABLE);
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Enable the audio codec path for an HDMI stream on `trans`:
+/// same PIN_ELD shape as [`audio_codec_enable`] (OUTPUT_ENABLE
+/// raised, ELD_VALID held down until the caller publishes the
+/// ELD), with the HDMI config update for `tmds_khz`.
+pub fn hdmi_audio_codec_enable<M: MmioWindow + ?Sized>(mmio: &M, trans: Transcoder, tmds_khz: u32) {
+    let cur = mmio.read32(HSW_AUD_PIN_ELD_CP_VLD);
+    mmio.write32(
+        HSW_AUD_PIN_ELD_CP_VLD,
+        (cur | aud_output_enable(trans)) & !aud_eld_valid(trans),
+    );
+    compiler_fence(Ordering::SeqCst);
+    hdmi_audio_config_update(mmio, trans, tmds_khz);
+}
+
+/// Disable the audio codec path for an HDMI stream: latch the
+/// cleared-N config with `N_PROG_ENABLE` only —
+/// `N_VALUE_INDEX` is *not* set, because unlike
+/// [`audio_codec_disable`] the configuration being torn down
+/// was not a DP one (`hsw_audio_codec_disable` conditions that
+/// bit on the old configuration being DP). Then drop
+/// ELD_VALID and OUTPUT_ENABLE.
+pub fn hdmi_audio_codec_disable<M: MmioWindow + ?Sized>(mmio: &M, trans: Transcoder) {
+    let off = aud_cfg_off(trans);
+    let cur = mmio.read32(off);
+    let cleared = cur
+        & !(AUD_CONFIG_UPPER_N_MASK
+            | AUD_CONFIG_PIXEL_CLOCK_MASK
+            | AUD_CONFIG_LOWER_N_MASK
+            | AUD_CONFIG_N_VALUE_INDEX
+            | AUD_CONFIG_N_PROG_ENABLE);
+    mmio.write32(off, cleared | AUD_CONFIG_N_PROG_ENABLE);
+    compiler_fence(Ordering::SeqCst);
+    let cur = mmio.read32(HSW_AUD_PIN_ELD_CP_VLD);
+    mmio.write32(
+        HSW_AUD_PIN_ELD_CP_VLD,
+        cur & !aud_eld_valid(trans) & !aud_output_enable(trans),
+    );
+    compiler_fence(Ordering::SeqCst);
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
     use super::*;
@@ -218,5 +324,45 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_audio",
         smoke_audio_enable_disable_pin_eld_fields
+    );
+
+    fn smoke_hdmi_audio_config_update_encoding() -> TestResult {
+        // Pixel-clock field encodings (AUD_CONFIG table):
+        // 297_000 -> 11, 594_000 -> 13, unlisted -> None.
+        if aud_config_pixel_clock_hdmi(297_000) != Some(11 << 16) {
+            return TestResult::Fail("297 MHz TMDS must encode pixel-clock field 11");
+        }
+        if aud_config_pixel_clock_hdmi(594_000) != Some(13 << 16) {
+            return TestResult::Fail("594 MHz TMDS must encode pixel-clock field 13");
+        }
+        if aud_config_pixel_clock_hdmi(123_456).is_some() {
+            return TestResult::Fail("unlisted TMDS clock must not encode");
+        }
+        let mmio = MockMmio::default();
+        mmio.set_read(
+            aud_cfg_off(Transcoder::A),
+            AUD_CONFIG_N_VALUE_INDEX | AUD_CONFIG_UPPER_N_MASK | AUD_CONFIG_LOWER_N_MASK | 0x3, // unrelated low bits must survive
+        );
+        hdmi_audio_codec_enable(&mmio, Transcoder::A, 297_000);
+        let writes = mmio.writes_to(aud_cfg_off(Transcoder::A));
+        let want = (11 << 16) | AUD_CONFIG_N_PROG_ENABLE | 0x3;
+        if writes != alloc::vec![want] {
+            return TestResult::Fail(
+                "HDMI config update must clear N fields, set pixel clock + PROG_ENABLE",
+            );
+        }
+        // Disable: the latch carries PROG_ENABLE without
+        // VALUE_INDEX (the old configuration was not DP).
+        hdmi_audio_codec_disable(&mmio, Transcoder::A);
+        let writes = mmio.writes_to(aud_cfg_off(Transcoder::A));
+        let last = writes[writes.len() - 1];
+        if last & AUD_CONFIG_N_PROG_ENABLE == 0 || last & AUD_CONFIG_N_VALUE_INDEX != 0 {
+            return TestResult::Fail("HDMI disable must latch with PROG_ENABLE only");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_audio",
+        smoke_hdmi_audio_config_update_encoding
     );
 }

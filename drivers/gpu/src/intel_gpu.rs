@@ -1266,6 +1266,18 @@ struct DpSessionState {
 
 static DP_SESSION: IrqSafeSpinLock<Option<DpSessionState>> = IrqSafeSpinLock::new(None);
 
+/// Live external-HDMI session state; same shape and
+/// discipline as [`DpSessionState`]. A connector is either
+/// DP or HDMI at a time — whichever probe answers owns the
+/// DDI's session slot.
+struct HdmiSessionState {
+    conn: crate::intel_gpu_hdmi::HdmiConnection,
+    fb: crate::intel_gpu_modeset::Framebuffer,
+    alloc: ScanoutAllocation,
+}
+
+static HDMI_SESSION: IrqSafeSpinLock<Option<HdmiSessionState>> = IrqSafeSpinLock::new(None);
+
 /// Drain pending combo-DDI hotplug events and act on them.
 /// Called once at the end of probe (a sink already attached at
 /// boot is picked up there); a future periodic-polled caller
@@ -1304,6 +1316,23 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
                         32,
                     )));
                 }
+            } else if let Some(conn) = hdmi_connect(ddi) {
+                // The DP probe did not answer; the HDMI one
+                // did. Publish from the HDMI session state the
+                // same way.
+                let stored = {
+                    let session = HDMI_SESSION.lock();
+                    session.as_ref().map(|s| (s.alloc, s.fb))
+                };
+                if let Some((alloc, fb)) = stored {
+                    publish_scanout(Some(narf_graphics_driver::generic::GenericFb::new(
+                        alloc.phys_base,
+                        conn.mode.h_active as u32,
+                        conn.mode.v_active as u32,
+                        fb.stride_bytes,
+                        32,
+                    )));
+                }
             }
         }
         HpdEvent::Disconnected(ddi) => {
@@ -1315,8 +1344,20 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
                         crate::intel_gpu_dp::disconnect(&window, &state.conn);
                     });
                     publish_scanout(None);
+                    return;
+                }
+                *DP_SESSION.lock() = Some(state);
+            }
+            let session = HDMI_SESSION.lock().take();
+            if let Some(state) = session {
+                if state.conn.ddi == ddi {
+                    with_controller(|gpu| {
+                        let window = DpBarWindow(&gpu.gtt_mmadr);
+                        crate::intel_gpu_hdmi::disconnect(&window, &state.conn);
+                    });
+                    publish_scanout(None);
                 } else {
-                    *DP_SESSION.lock() = Some(state);
+                    *HDMI_SESSION.lock() = Some(state);
                 }
             }
         }
@@ -1380,6 +1421,46 @@ fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpC
         };
         let conn = crate::intel_gpu_dp::activate(&window, &probe, &fb).ok()?;
         *DP_SESSION.lock() = Some(DpSessionState {
+            conn: conn.clone(),
+            fb,
+            alloc,
+        });
+        Some(conn)
+    })
+    .flatten()
+}
+
+/// HDMI twin of [`dp_connect`]: DDC probe over GMBUS,
+/// scanout allocation, HDMI activate (SCDC where the rate
+/// demands it, WRPLL modeset, AVI DIP, ELD publication).
+/// The HPD handler tries this only after the DP probe did
+/// not answer — an HDMI sink never answers AUX.
+fn hdmi_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_hdmi::HdmiConnection> {
+    with_controller(|gpu| {
+        if !gpu.chip.generation.display_supported() {
+            return None;
+        }
+        let window = DpBarWindow(&gpu.gtt_mmadr);
+        let probe = crate::intel_gpu_hdmi::probe_sink(&window, ddi).ok()?;
+        let width = probe.mode.h_active as u32;
+        let height = probe.mode.v_active as u32;
+        let stride_bytes = padded_stride_bytes(width);
+        let size_bytes = scanout_size_bytes(width, height);
+        let alloc =
+            crate::intel_gpu_gtt::alloc_contiguous_scanout(&gpu.gtt_mmadr, size_bytes).ok()?;
+        let alloc = ScanoutAllocation {
+            gtt_offset: alloc.gtt_offset,
+            phys_base: alloc.phys_base(),
+            order: alloc.order,
+            size_bytes: alloc.size_bytes,
+        };
+        let fb = crate::intel_gpu_modeset::Framebuffer {
+            phys_addr: alloc.gtt_offset as u64,
+            stride_bytes,
+            format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
+        };
+        let conn = crate::intel_gpu_hdmi::activate(&window, &probe, &fb).ok()?;
+        *HDMI_SESSION.lock() = Some(HdmiSessionState {
             conn: conn.clone(),
             fb,
             alloc,
