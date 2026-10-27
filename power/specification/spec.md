@@ -413,10 +413,70 @@ total (caps before allocation, trailing garbage refused).
 are the resume environment's entry surface (it also consumes
 `decode_hook_region` + `TrustedImage::read_hook_region` to stage
 hook blobs); `RecordedPolicy` is what the policy engine
-administers. Policy levels and floors and the resume environment
-itself are separate lanes (design §12); this section specifies
-the service, the format, the custody contract, and the state-hook
-contract.
+administers. Policy levels and floors are a separate lane (design
+§12); this section specifies the service, the format, the custody
+contract, and the state-hook contract. The resume environment
+that consumes the reader pipeline is specified next.
+
+#### Resume environment (S4 resume)
+
+The early context of design §6 (`power/src/suspend_service/resume.rs`
++ `early_blk.rs`). It stands up before any restored state is
+trusted, and its whole interface is one function:
+
+- `attempt_resume(store, anchors, prompt) -> Result<VerifiedResume, ResumeRefusal>`
+  drives the normative trust order of design §6.2: parse the
+  header claims (`parse_claims`); announce the attempt under the
+  *claimed* policy through the `ResumePrompt` seam (production:
+  `ConsolePrompt` over the early console) — claims are announced
+  as attempts, never as facts; satisfy the recorded policy
+  through the `KeyCustodyAnchor` seam (OFF via the published
+  derivation; a wrapped image via the first anchor whose kind
+  matches an enrolled slot and whose unwrap succeeds — the first
+  successful unwrap decides, and there is no fallback between
+  policy paths); verify the whole image (`verify_all`); only
+  then mint the handoff value.
+- `VerifiedResume` is the only output restored state may be built
+  from. It wraps the pipeline's `TrustedImage`, so chunk delivery
+  re-verifies against the manifest at read time, and exposes the
+  authenticated policy record, image/chunk extents, the
+  authenticated hook-region length, and the per-hook key
+  derivation the state-hook registry consumes at unseal.
+- `ResumeRefusal` classes exist for boot routing: `NoImage`
+  (header magic mismatch — the ordinary cold-boot case),
+  `UnsupportedVersion`, `FactorUnavailable` (no provided anchor
+  implements a kind the recorded policy needs; never a cue to
+  try a weaker policy), `FactorRefused` (matching anchors all
+  refused or failed), `AuthenticationFailed` (one class for SMK
+  unwrap, header seal, manifest, and chunk failures — the resume
+  path is not an oracle for which check failed), and `Service`
+  (structural/store failures, carried verbatim). On every
+  refusal, no part of the image has been delivered to anyone.
+
+The image is read through the **early block reader**
+(`early_blk.rs`, design §6.3): a polled, read-only virtio-blk
+reader for the pre-scheduler context — one device, one queue,
+one request in flight, no interrupts — because the running block
+layer is part of what a resume restores. Its surface:
+
+- `EarlyTransport`, the hardware seam: 32-bit register accesses
+  over the virtio-mmio window (VirtIO 1.2 §4.2.2) plus DMA byte
+  copies into the queue window. All queue memory crosses this
+  seam as little-endian byte accesses.
+- `PolledBlkReader::open(transport, dma_base, dma_len)` performs
+  the §2.1 handshake accepting only `VIRTIO_F_VERSION_1`, programs
+  queue 0 in the DMA window, and reads the §5.2.4 capacity.
+  Legacy-version devices, non-block devices, refused features,
+  unusable queues, and zero capacity are typed `EarlyBlkError`
+  refusals; completion and reset polls are bounded, so a wedged
+  device is a `Timeout` refusal, never a hang. The reader
+  implements `ImageStore` offset-generally and refuses writes:
+  the resume side only ever reads ciphertext.
+- Transport scope: virtio-mmio. A PCI common-config front end
+  slots behind `EarlyTransport` without touching the
+  queue/request core; it is a named follow-on, as is boot wiring
+  (partition discovery, early window mapping, calling
+  `attempt_resume` from the boot path).
 
 ### 3.4 Thermal
 
