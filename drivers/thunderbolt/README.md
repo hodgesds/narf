@@ -15,7 +15,9 @@ Controllers are found by PCI discovery, matching the USB4 NHI class and
 known Intel NHI device IDs and covering AMD's Pink Sardine NHI. Before
 the controller's DMA ring can be started, ACPI `_SB._OSC` must confirm
 native USB4 support and hand the OS the USB3/DisplayPort control bits;
-the crate honors that firmware handshake. One actor task per NHI owns
+PCIe tunnelling is requested in the same handshake and programmed only
+when firmware grants its bit. The crate honors that firmware handshake —
+per protocol, on the bits actually granted. One actor task per NHI owns
 that controller's DMA rings, its control/configuration transaction
 channel, its topology view, and its tunnels, so there is a single
 serialization point per domain and no configuration transaction holds a
@@ -29,13 +31,16 @@ sequence matching, and channel poisoning on malformed or late replies),
 up through switch/router and adapter modelling, a live topology
 snapshot, and a tunnel manager. The tunnel manager supports USB3
 tunneling between parent and child routers using the bandwidth-ownership
-handshake in both directions, and a host-to-device DisplayPort tunnel
+handshake in both directions, PCIe tunnelling between a PCIe
+downstream adapter on an ancestor router and the PCIe upstream
+adapter on a device router (journaled path programming in both
+directions, adapters enabled last), and a host-to-device DisplayPort tunnel
 per domain at base link rate. Tunnel writes are journaled before
 submission and rolled back in reverse on failure, and existing
 firmware-enabled tunnels are preserved rather than claimed. Reporting a
 tunnel is not a claim that a monitor has trained or that scanout is live.
 
-Out of scope: PCIe and XDomain tunneling, legacy ICM (firmware CM)
+Out of scope: XDomain tunneling, legacy ICM (firmware CM)
 operation, and tunnel suspend/replay — consequently system suspend is
 refused while a native CM is running. Detach removes the affected
 router subtree before rediscovery. Discovery registers at Device-stage

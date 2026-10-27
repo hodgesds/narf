@@ -3,13 +3,18 @@
 ## 1. Purpose & scope
 
 Discover Intel and AMD USB4 NHIs, run a native connection manager, enumerate
-USB4 routers and establish USB3 and DisplayPort tunnels. The legacy pure
+USB4 routers and establish USB3, DisplayPort and PCIe tunnels. The legacy pure
 configuration/topology helpers remain available for callers and tests.
 
 ## 2. Assumptions
 
 ACPI `_SB._OSC` must confirm native USB4 support and grant the corresponding
-USB3/DP control bits. A controller needs an accessible BAR0 and coherent DMA.
+control bits (USB4 `_OSC` capabilities DWORD 2: bit 0 USB3 tunnelling,
+bit 1 DisplayPort tunnelling, bit 2 PCIe tunnelling, bit 3 XDomain). The CM
+requests USB3, DisplayPort and PCIe and proceeds per protocol on the bits
+actually granted: a platform that grants USB3/DP but not PCIe still gets
+USB3/DP tunnels, and PCIe paths are never programmed without the PCIe grant.
+A controller needs an accessible BAR0 and coherent DMA.
 PCI class `0x0c0340` identifies a USB4 NHI, including AMD Pink Sardine. The
 number of NHI functions does not determine the number of physical USB-C ports.
 
@@ -19,10 +24,22 @@ number of NHI functions does not determine the number of physical USB-C ports.
   known Intel NHI IDs; xHCI and PCIe tunnel bridges are separate drivers.
 - `topology::domains() -> Vec<Domain>` snapshots live per-NHI router/adapter
   state. Router route strings are meaningful only within their domain.
-- `tunnel::displays()` and `tunnel::usb3_tunnels()` return `TunnelInfo` snapshots
-  with domain, protocol and input/output `(route, port)` endpoints. A DP
-  `dprx_done` flag is reported separately from tunnel creation. Neither is
-  proof that the GPU has trained an external monitor or enabled scanout.
+- `tunnel::displays()`, `tunnel::usb3_tunnels()` and `tunnel::pcie_tunnels()`
+  return `TunnelInfo` snapshots with domain, protocol and input/output
+  `(route, port)` endpoints. A DP `dprx_done` flag is reported separately from
+  tunnel creation. Neither is proof that the GPU has trained an external
+  monitor or enabled scanout. A PCIe `TunnelInfo`'s input is the PCIe
+  downstream adapter on the nearest ancestor router carrying one; its
+  output is the device router's PCIe upstream adapter. Publication of a
+  PCIe tunnel is the handoff surface for the tunnelled hierarchy: devices
+  behind the device router's PCIe switch enumerate under the NHI's
+  companion PCIe bridge through the normal PCI driver path once the bus
+  subsystem scans that bridge (runtime rescan of the companion bridge is
+  bus-subsystem work, §8).
+- `tunnel::granted_controls()` returns the `_OSC` control mask the CM is
+  operating under and `tunnel::pcie_tunnelling_granted()` its PCIe bit, so
+  "firmware did not grant PCIe control" is observable state, never inferred
+  from an empty tunnel list.
 - `tunnel::live_tunnel_count()` reports the published live-tunnel count
   across domains, and `tunnel::orphaned_path_domains()` the domains whose
   CM exited with tunnel writes unrolled-back. Together they are the
@@ -33,8 +50,11 @@ number of NHI functions does not determine the number of physical USB-C ports.
   across an await.
 
 The implementation supports USB4 routers with buffer-allocation parameters,
-USB3 tunneling between parent/child routers, and one host-to-device DP tunnel
-per domain. DP capabilities are limited to RBR and the common lane count;
+USB3 tunneling between parent/child routers, PCIe tunnelling between an
+ancestor router's PCIe downstream adapter and a device router's PCIe
+upstream adapter (path hops in both directions, adapters enabled last via
+ADP_PCIE_CS_0 PE), and one host-to-device DP tunnel per domain. DP
+capabilities are limited to RBR and the common lane count;
 higher-rate bandwidth allocation is not implemented. Existing enabled
 firmware tunnels are preserved and are not represented as newly owned paths.
 
@@ -57,7 +77,13 @@ Hop pending is read from DWORD 1 and must clear before credits are released.
 USB3 bandwidth ownership uses the CMR/HCA handshake in both directions.
 Protocol adapters retain vendor-defined ingress credit/flow-control fields.
 
-The CM does not request PCIe or XDomain control. The native CM joins the
+The CM does not request XDomain control. PCIe tunnelling is gated on the
+PCIe bit of the `_OSC` grant at both layers: without it, router
+configuration never sets ROUTER_CS_5 PTO and `reconcile` never programs a
+PCIe path; with it, a device router's PTO is set only when its parent
+router carries a PCIe downstream adapter. A PCIe downstream adapter
+serves at most one live PCIe tunnel, and a tunnel's origin is the
+nearest ancestor router carrying one. The native CM joins the
 device-PM fan-out with a state-checked handler: system suspend is refused
 (`Busy`) only while tunnels are live, or while a domain's CM has exited
 with tunnel writes unrolled-back. With no live paths the handler reports
@@ -90,5 +116,9 @@ it does not emulate an AMD USB4 dock or prove physical monitor output.
 Hardware validation; full DP bandwidth allocation and multiple DP tunnels;
 firmware tunnel adoption; tunnel suspend/replay (live tunnels still veto
 system suspend); controller reset recovery after resume;
-legacy Thunderbolt/ICM, PCIe/XDomain tunnels, link bonding and retimer policy.
+legacy Thunderbolt/ICM, XDomain tunnels, link bonding and retimer policy.
+PCIe remainders: a pre-activation wait for the PCIe adapters' LTSSM
+Detect state, and a runtime PCI rescan of the NHI's companion bridge so
+tunnelled devices enumerate without a reboot (the CM publishes tunnels;
+registering newly appeared PCI devices is a bus-subsystem surface).
 AMD source encoder setup, firmware loading and link training belong to GPU.

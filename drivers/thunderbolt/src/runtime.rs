@@ -27,6 +27,29 @@ pub(crate) fn start() -> narf_init::InitResult {
         );
         return narf_init::InitResult::NotPresent;
     };
+    // Name the per-protocol grant explicitly: a protocol firmware
+    // did not grant is never programmed, and the boot log is where
+    // that state is visible instead of being inferred later from
+    // missing tunnels.
+    let _ = writeln!(
+        narf_console::Writer,
+        "usb4: firmware granted native control: USB3 {}, DisplayPort {}, PCIe {}",
+        if control & super::firmware::CONTROL_USB3 != 0 {
+            "yes"
+        } else {
+            "no"
+        },
+        if control & super::firmware::CONTROL_DP != 0 {
+            "yes"
+        } else {
+            "no"
+        },
+        if control & super::firmware::CONTROL_PCIE != 0 {
+            "yes"
+        } else {
+            "no"
+        },
+    );
     // Join the device-PM fan-out with the state-checked handlers in
     // `pm.rs`: system sleep is refused only while tunnels are live
     // or a fault left path writes unrolled-back — an idle or stopped
