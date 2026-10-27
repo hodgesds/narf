@@ -348,6 +348,4 @@ rtw89	wow	Wake on Wireless	feature	drivers/wireless/specification/rtw89.md	1043
 shared	eht_phy_admission	EHT PHY and mandatory membership admission; needs shared EHT capability/operation parsing and negotiation	feature	wireless/specification/spec.md	155
 shared	epd_membership_selector	EPD mandatory membership-selector admission; needs 802.11ak EPD MSDU framing	feature	wireless/specification/spec.md	155
 shared	glk_membership_selector	GLK mandatory membership-selector admission; needs 802.11ak General Link operation	feature	wireless/specification/spec.md	155
-shared	he_phy_admission	HE PHY and mandatory membership admission; needs shared HE capability/operation parsing and negotiation	feature	wireless/specification/spec.md	155
-shared	sae_h2e_membership_selector	SAE-H2E mandatory membership-selector admission; needs a SAE JoinPlan SecurityMode	feature	wireless/specification/spec.md	155
 shared	uhr_membership_selector	UHR mandatory membership-selector admission; needs shared UHR PHY negotiation	feature	wireless/specification/spec.md	155

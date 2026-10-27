@@ -152,16 +152,89 @@ The FullMAC owner must retain and check those independent native facts.
 
 The opt-in path admits mandatory HT127/VHT126 membership selectors only with
 the corresponding complete compatible PHY, while preserving actual legacy
-basic rates for management frames. GLK/EPD/SAE-H2E/HE/EHT/UHR and unknown
-mandatory selectors remain unsupported and fail closed: SAE-H2E needs a SAE
-`SecurityMode` (JoinPlan offers only Open/WPA2-PSK), HE/EHT/UHR need shared
-HE/EHT/UHR capability/operation parsing and negotiation, and GLK/EPD need
-IEEE802.11ak General Link/EtherType Protocol Discrimination framing, which
-the shared RFC1042 data path does not implement. Optional unflagged values grant no
+basic rates for management frames. HE (122) is admitted only with negotiated
+HE and SAE-H2E (123) only for an H2E `SecurityMode::Wpa3Sae` plan (see the
+HE and SAE paragraphs below); the remaining selectors and unknown mandatory
+values fail closed as described there. Optional unflagged values grant no
 membership. Present malformed or orphan PHY elements fail instead of becoming
 legacy fallback. Missing optional PHY can retain legacy operation. Generated
 local capability IEs are protocol-owned; caller HT/VHT capabilities and, on
 this path, HT/VHT Operation IEs are rejected before first transmission.
+
+**HE admission (`association::he`).** `LocalHe::new(mac_cap: [u8; 6],
+phy_cap: [u8; 11], rx80: u16, tx80: u16) -> Result<LocalHe, Error>` takes a
+driver's station-iftype HE Capabilities (IEEE802.11ax-2021 9.4.2.248; the
+same octets mt76/rtw89/iwlwifi/ath11k already keep per band). Maps use the
+VHT 2-bit encoding and must include single-stream HE-MCS0..7. PHY B0/B7
+(reserved), B3/B4 (owned by `with_160mhz(rx, tx)` / `with_80p80(rx, tx)`,
+which add the matching MCS/NSS maps) and B55 (owned by
+`with_ppe_thresholds(&[u8])`, length checked with
+`ieee80211_he_ppe_size`) must be clear, as must the non-AP-reserved MU
+Beamformer bit. `LocalPhy::with_he(LocalHe) -> Result<LocalPhy, Error>` opts
+any existing HT/VHT profile into HE (HE160 needs the VHT160 opt-in);
+`LocalPhy::he()` returns it. `HeCapability::parse` / `HeOperation::parse`
+(element-ID-extension 35/36, exposed through `ApElements::he_capability()`
+and `he_operation()`) apply the exact `ieee80211_he_mcs_nss_size`,
+`ieee80211_he_ppe_size` and `ieee80211_he_oper_size` extents; trailing or
+missing octets, duplicates, an HE capability without HE operation or HT, and
+six-GHz Operation Information (this plan admits only 2.4/5GHz) are malformed.
+Reserved Operation bits are ignored on reception (IEEE802.11-2020 9.2.2).
+Negotiation mirrors mac80211: HE is skipped (VHT/HT retained) when the AP
+lacks HE, a 5GHz BSS has no negotiated VHT, the AP's own maps lack HE-MCS0..7
+or its Basic HE-MCS/NSS set (`ieee80211_verify_peer_he_mcs_support`), or no
+local RX/TX map pair covers that set (`ieee80211_verify_sta_he_mcs_support`,
+STRICT, so the iPhone all-zero quirk is not accepted). Embedded VHT Operation
+Information must agree with the VHT Operation element and is refused on
+2.4GHz. `Offer/Negotiated::he() -> Option<&HeNegotiation>` reports
+`width()` (the HT/VHT selection narrowed to both Channel Width Sets: B1 for
+2.4GHz40, B2/B3/B4 for 5GHz40-80/160/80+80), `discontiguous()`,
+`tx_mcs_map()` (local TX ∩ AP RX at that width,
+`ieee80211_he_mcs_intersection`), `rx_mcs_map()`, `peer_mcs_maps()`,
+`peer_capability()`, `operation()` (BSS color/partial/disabled, default PE
+duration, TWT required, TXOP RTS threshold, ER SU disable, basic set,
+co-hosted indicator), `local_capability()` and directional
+`tx_ldpc/rx_ldpc/tx_stbc/rx_stbc/su_beamformee/su_beamformer/mu_beamformee/
+htc_he/twt_requester`. The association request carries the local HE
+Capabilities element only when HE was negotiated (`ieee80211_add_he_ie`);
+an HE offer requires HE in the response and vice versa, and a response can
+neither widen the HE width nor enable a TX map entry or directional feature
+the scan offer did not allow. Drivers still program HE peer records, BSS
+color, PPE/OFDMA/TWT state and regulatory/power authority themselves.
+
+**WPA3-SAE JoinPlan (`association::{SaePwe, SaeJoin, SaeStep}`).**
+`SecurityMode::Wpa3Sae { pwe: SaePwe }` (`HuntAndPeck` / `HashToElement` /
+`Both` = wpa_supplicant `sae_pwe` 0/1/2; `is_sae()`, `is_rsn()`; `is_wpa2()`
+stays PSK-only) admits APs as wpa_supplicant with `ieee80211w=2`: Privacy,
+CCMP-128 group/pairwise, no No-Pairwise, AP MFPC, default or BIP-CMAC-128
+group management cipher, and AKM 24 (SAE-EXT-KEY) preferred under H2E, else
+AKM 8. The AP RSNXE (one checked element) supplies SAE H2E; the SAE-H2E
+membership selector requires it and an H2E PWE (`UnsupportedRates`
+otherwise, like mac80211's selector subset check). `JoinPlan::sae() ->
+Option<&SaeJoin>` exposes `akm()`, `h2e()`, `akm_suite_selector()`,
+`pmkid()`, `station_rsne(pmkid)` and `station_rsnxe()` (H2E for sae_pwe 1/2,
+`wpa_gen_rsnxe`). The driver builds the `SaeSession` (H2E or
+hunting-and-pecking per `h2e()`, `with_akm_suite_selector` for AKM 24) and
+its Commit from its own entropy, then calls
+`start_sae_authentication(&SaeSession) -> Result<&[u8], Error>` (binds the
+MAC pair, PWE method and AKM selector; SAE-PK sessions are refused because
+KeyAuth verification needs the caller's password) and feeds frames to
+`sae_authentication_response(&[u8], &mut SaeSession) ->
+Result<SaeStep, Error>`: `Transmit` (Confirm, or a Commit carrying an
+anti-clogging token, at most `MAX_ANTI_CLOGGING` = 3 rounds, group 19 only),
+`Ignored` (other peers, a reflected Commit, a retransmitted peer Commit) or
+`Associate` (the association request with the SAE PMKID spliced into its
+RSNE). Status codes other than 0/126/76 are terminal `Rejected`; a Commit
+status that disagrees with the PWE method or a Confirm before the peer
+Commit is `Protocol`. `sae_pending_frame()` supplies retransmissions;
+`start_authentication`/`authentication_response` refuse SAE plans. The PMK
+never enters the plan. `rsn_body()` returns the PMKID-bearing RSNE for the
+supplicant; an association-response RSNE must repeat it.
+`station_security::Security::new_sae(own, peer, pmk, station_rsne,
+station_rsnxe, ap_rsne, ap_rsnxe, sequence)` is the matching PMF owner (see
+3.4.2). AKM 24 uses `eapol::KeyMgmt::SaeExtKey` (group 19: KCK/KEK/MIC 16,
+HMAC-SHA-256-128 version-0 MIC, hostap `wpa_eapol_key_mic`), and
+`SaeSession::with_akm_suite_selector([u8; 4])` adds/validates the AKM Suite
+Selector element (hostap `sae_write_commit` / `sae_parse_commit`; H2E only).
 
 `offered_phy()` and `negotiated_phy()` expose read-only directional HT/VHT
 facts, the selected width/center and complete occupied20MHz channel set.
@@ -1027,8 +1100,8 @@ a separate non-QoS tracker). These helpers do not grant controlled-port access.
 ### 3.4.2 Retained native station security
 
 `packet_key::{Key, Role}` owns a software CCMP key's immutable peer/KeyID
-binding, non-wrapping 48-bit transmit PN and seventeen receive replay trackers
-(sixteen QoS TIDs plus non-QoS). Pairwise keys transmit only local ToDS data;
+binding, non-wrapping 48-bit transmit PN and eighteen receive replay trackers
+(sixteen QoS TIDs, non-QoS and robust management). Pairwise keys transmit only local ToDS data;
 group keys are receive-only. Full header, fragment, A-MSDU and CCMP extents
 are checked before crypto; identical-key reinstall preserves counters, and
 authentication failure changes neither replay state nor ciphertext.
@@ -1067,6 +1140,28 @@ station RSNE and reports `spp_amsdu()`, and its pairwise `Key::with_spp_amsdu`
 keeps A-MSDU Present in the CCMP AAD (12.5.3.3.3; mac80211 wpa.c
 ccmp_gcmp_aad with `spp_amsdu`, `ccmp::build_aad_spp_amsdu`). Group keys keep
 the ordinary AAD. A flipped A-MSDU Present bit then fails the MIC.
+WPA3-SAE/PMF: `Security::new_sae(own, peer, pmk, station_rsne,
+station_rsnxe, ap_rsne, ap_rsnxe, sequence)` accepts exactly the JoinPlan SAE
+station RSNE (CCMP-128, AKM 8 or 24, MFPC|MFPR, at most one PMKID, default
+BIP-CMAC-128) against an AP RSNE offering that AKM with MFPC, and runs the
+shared supplicant with `pmf`, a16-octet IGTK and the station RSNXE repeated in
+M2 (`Security::new` refuses SAE profiles; `new_sae` refuses PSK). The first
+M3 must carry an IGTK KDE (IEEE802.11-2020 12.7.6.4); Group Key messages may
+rotate it. IGTKs pass the same key-reuse history and are installed into an
+`mfp::MfpKeyStore` with `rx_pn` = KDE IPN only after exact reply delivery.
+`pmf()` reports the mode. `receive_management(&impl RawFrame) ->
+Result<MgmtRx, Error>` applies mac80211 `ieee80211_drop_unencrypted_mgmt`
+once the PTK is installed: unicast robust frames (Deauthentication,
+Disassociation, Action except the Linux `_ieee80211_is_robust_mgmt_frame`
+non-robust categories) must be CCMP-protected with the pairwise key and pass
+a dedicated management replay counter (`Key::protect_management` /
+`unprotect_management`: management nonce flag and unmasked subtype AAD);
+group robust frames must carry a valid BIP-CMAC-128 MMIE with an IPN above the
+installed one. Failures and unprotected robust frames are `Ignored`;
+non-robust and pre-key frames pass unchanged. `protect_management(&[u8])`
+CCMP-protects a station Deauthentication/Disassociation/robust Action to the
+AP after the PMF port opens. SA Query and deauthentication policy remain the
+MLME owner's.
 The original `protect`/`unprotect` continue rejecting A-MSDU headers.
 `amsdu::Limit` names the HT3839/HT7935 A-MSDU and VHT3895/7991/11454 MPDU
 sizes (body bound = MPDU minus the46-byte protected QoS/CCMP/FCS overhead);
