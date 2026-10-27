@@ -180,44 +180,44 @@ iwlwifi	unspecified_advanced_offloads	Advanced offloads are not individually enu
 iwlwifi	width_160	160MHz operation on applicable profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
 iwlwifi	width_320	320MHz operation on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
 iwlwifi	wow	Wake on WLAN	feature	drivers/wireless/specification/iwlwifi.md	1552
-mt76	additional_roles	Additional interface roles: ledger does not identify individual roles	unknown	drivers/wireless/specification/mt7921.md	963
-mt76	all_tid_data_security	All-TID data and security support	feature	drivers/wireless/specification/mt7921.md	959
-mt76	associated_active_scan	Active scanning while associated	feature	drivers/wireless/specification/mt7921.md	940
-mt76	beamforming	Beamforming with source-advertised beamformee support	feature	drivers/wireless/specification/mt7921.md	400
+mt76	all_tid_data_security	All-TID data and security support	feature	drivers/wireless/specification/mt7921.md	1022
+mt76	ap_mode	Access Point mode (mt792x_init_wiphy NL80211_IFTYPE_AP)	feature	drivers/wireless/specification/mt7921.md	1003
+mt76	associated_active_scan	Active scanning while associated	feature	drivers/wireless/specification/mt7921.md	961
+mt76	beamforming	Beamforming with source-advertised beamformee support	feature	drivers/wireless/specification/mt7921.md	403
 mt76	colocated_6ghz_scan	Colocated 6 GHz scanning	feature	drivers/wireless/specification/mt7921.md	132
-mt76	country_wmm_constraints	Country-specific WMM constraints	feature	drivers/wireless/specification/mt7921.md	948
-mt76	extended_nss_bw	Extended NSS/BW operation: native applicability unproven	unknown	drivers/wireless/specification/mt7921.md	960
-mt76	fragmentation	802.11 fragmentation support	feature	drivers/wireless/specification/mt7921.md	950
-mt76	he_phy	HE PHY operation	feature	drivers/wireless/specification/mt7921.md	941
-mt76	ht_protection_modes	HT operation protection modes beyond protection0	feature	drivers/wireless/specification/mt7921.md	418
-mt76	loadable_packet_abi	Loadable wireless packet ABI	feature	drivers/wireless/specification/mt7921.md	944
-mt76	midstream_tx_ba_restart	Midstream transmit BA restart	feature	drivers/wireless/specification/mt7921.md	949
-mt76	native_key_pipeline_retirement	Native old-key firmware/MAC/FIFO pipeline retirement	feature	drivers/wireless/specification/mt7921.md	964
-mt76	noncoherent_dma	Non-coherent platform DMA support	feature	drivers/wireless/specification/mt7921.md	943
-mt76	off_channel_active_scan	Off-channel active scanning	feature	drivers/wireless/specification/mt7921.md	940
-mt76	other_tx_ba_tids	Transmit BA on TIDs beyond retained TID0	feature	drivers/wireless/specification/mt7921.md	949
-mt76	pci_removal	PCI removal lifecycle	feature	drivers/wireless/specification/mt7921.md	942
-mt76	pci_reprobe_generation	PCI reprobe with generation isolation	feature	drivers/wireless/specification/mt7921.md	942
-mt76	per_domain_iommu	Per-domain IOMMU mappings	feature	drivers/wireless/specification/mt7921.md	942
-mt76	pmf	Protected management frames (PMF)	feature	drivers/wireless/specification/mt7921.md	941
-mt76	rx_ba_tids_8_15	Recipient BA TIDs beyond 8-bit bitmap: native ABI applicability unproven	unknown	drivers/wireless/specification/mt7921.md	957
-mt76	rx_ba_windows_above_64	Recipient BA windows above 64	feature	drivers/wireless/specification/mt7921.md	957
-mt76	rx_delayed_ba	Recipient delayed BA agreements	feature	drivers/wireless/specification/mt7921.md	957
-mt76	rx_multi_tid_ba	Recipient multi-TID BA agreements	feature	drivers/wireless/specification/mt7921.md	957
-mt76	scan_dwell_control	Requested scan dwell control: CONNAC2 nonzero timing contract unproven	unknown	drivers/wireless/specification/mt7921.md	135
-mt76	six_ghz_operation	6 GHz radio operation	feature	drivers/wireless/specification/mt7921.md	941
-mt76	system_resume	System resume	feature	drivers/wireless/specification/mt7921.md	942
-mt76	system_suspend	System suspend	feature	drivers/wireless/specification/mt7921.md	942
-mt76	tspec	TSPEC admission	feature	drivers/wireless/specification/mt7921.md	948
-mt76	tx_amsdu	Transmit A-MSDU	feature	drivers/wireless/specification/mt7921.md	958
-mt76	tx_delayed_ba	Originator delayed BA agreements	feature	drivers/wireless/specification/mt7921.md	958
-mt76	tx_multi_tid_ba	Originator multi-TID BA agreements	feature	drivers/wireless/specification/mt7921.md	958
-mt76	tx_stbc	Transmit STBC	feature	drivers/wireless/specification/mt7921.md	961
-mt76	uapsd	U-APSD	feature	drivers/wireless/specification/mt7921.md	948
-mt76	vht_80p80	VHT 80+80 operation: native hardware applicability unproven	unknown	drivers/wireless/specification/mt7921.md	960
-mt76	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/mt7921.md	962
-mt76	wmm_all_ac_priority	All WMM access categories and priority selection	feature	drivers/wireless/specification/mt7921.md	947
-mt76	wpa3_sae	WPA3-Personal / SAE authentication	feature	drivers/wireless/specification/mt7921.md	963
+mt76	country_wmm_constraints	Country-specific WMM constraints	feature	drivers/wireless/specification/mt7921.md	969
+mt76	extended_nss_bw	VHT extended NSS/BW capability and HT-Operation CCFS2 160-MHz chandef (needs shared extended_nss_bw admission)	feature	drivers/wireless/specification/mt7921.md	996
+mt76	fragmentation	802.11 fragmentation support	feature	drivers/wireless/specification/mt7921.md	971
+mt76	he_phy	HE PHY operation	feature	drivers/wireless/specification/mt7921.md	962
+mt76	ht_protection_modes	HT operation protection modes beyond protection0	feature	drivers/wireless/specification/mt7921.md	422
+mt76	loadable_packet_abi	Loadable wireless packet ABI	feature	drivers/wireless/specification/mt7921.md	965
+mt76	midstream_tx_ba_restart	Midstream transmit BA restart	feature	drivers/wireless/specification/mt7921.md	970
+mt76	monitor_mode	Monitor mode (mac80211 MONITOR + WANT_MONITOR_VIF)	feature	drivers/wireless/specification/mt7921.md	1003
+mt76	nan_mode	NAN / NAN_DATA roles (firmware CNM+NAN capability gated)	feature	drivers/wireless/specification/mt7921.md	1003
+mt76	native_key_pipeline_retirement	Native old-key firmware/MAC/FIFO pipeline retirement	feature	drivers/wireless/specification/mt7921.md	1027
+mt76	noncoherent_dma	Non-coherent platform DMA support	feature	drivers/wireless/specification/mt7921.md	964
+mt76	off_channel_active_scan	Off-channel active scanning	feature	drivers/wireless/specification/mt7921.md	961
+mt76	other_tx_ba_tids	Transmit BA on TIDs beyond retained TID0	feature	drivers/wireless/specification/mt7921.md	970
+mt76	p2p_mode	P2P client / GO / device roles	feature	drivers/wireless/specification/mt7921.md	1003
+mt76	pci_removal	PCI removal lifecycle	feature	drivers/wireless/specification/mt7921.md	963
+mt76	pci_reprobe_generation	PCI reprobe with generation isolation	feature	drivers/wireless/specification/mt7921.md	963
+mt76	per_domain_iommu	Per-domain IOMMU mappings	feature	drivers/wireless/specification/mt7921.md	963
+mt76	pmf	Protected management frames (PMF)	feature	drivers/wireless/specification/mt7921.md	962
+mt76	rx_ba_windows_above_64	Recipient BA windows above 64 (HE-peer only; mac80211 caps non-HE at 64)	feature	drivers/wireless/specification/mt7921.md	1010
+mt76	rx_delayed_ba	Recipient delayed BA agreements	feature	drivers/wireless/specification/mt7921.md	1020
+mt76	rx_multi_tid_ba	Recipient multi-TID BA agreements	feature	drivers/wireless/specification/mt7921.md	1020
+mt76	six_ghz_operation	6 GHz radio operation	feature	drivers/wireless/specification/mt7921.md	962
+mt76	system_resume	System resume	feature	drivers/wireless/specification/mt7921.md	963
+mt76	system_suspend	System suspend	feature	drivers/wireless/specification/mt7921.md	963
+mt76	tspec	TSPEC admission	feature	drivers/wireless/specification/mt7921.md	969
+mt76	tx_amsdu	Transmit A-MSDU	feature	drivers/wireless/specification/mt7921.md	1021
+mt76	tx_delayed_ba	Originator delayed BA agreements	feature	drivers/wireless/specification/mt7921.md	1021
+mt76	tx_multi_tid_ba	Originator multi-TID BA agreements	feature	drivers/wireless/specification/mt7921.md	1021
+mt76	tx_stbc	Transmit STBC	feature	drivers/wireless/specification/mt7921.md	1024
+mt76	uapsd	U-APSD	feature	drivers/wireless/specification/mt7921.md	969
+mt76	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/mt7921.md	1025
+mt76	wmm_all_ac_priority	All WMM access categories and priority selection	feature	drivers/wireless/specification/mt7921.md	968
+mt76	wpa3_sae	WPA3-Personal / SAE authentication	feature	drivers/wireless/specification/mt7921.md	1026
 rtl8xxxu	adaptive_rate_selection	Adaptive DATA rate selection	feature	drivers/wireless/specification/rtl8xxxu.md	503
 rtl8xxxu	additional_operating_channels	Noninitial operating channels and safe FIFO retuning	feature	drivers/wireless/specification/rtl8xxxu.md	497
 rtl8xxxu	additional_pm_modes	PM submodes beyond runtime PM are not enumerated	unknown	drivers/wireless/specification/rtl8xxxu.md	503
