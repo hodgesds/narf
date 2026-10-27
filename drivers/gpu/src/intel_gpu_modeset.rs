@@ -256,6 +256,32 @@ pub enum ModesetError {
     InvalidFramebuffer,
 }
 
+/// A negotiated link configuration handed to
+/// [`Modeset::modeset_with_plan`]: the (rate, lanes) the shared
+/// link-training core's negotiation picked for the stream
+/// (`dp_link_training::NegotiatedLink`, #1092). The rate is the
+/// training core's vendor-neutral `LinkRate`; conversion to the
+/// PLL module's rate type happens inside the orchestrator.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LinkPlan {
+    /// Negotiated starting rate for training.
+    pub rate: crate::dp_link_training::LinkRate,
+    /// Negotiated lane count (1, 2, or 4).
+    pub lanes: u8,
+}
+
+/// Convert a training-core link rate to the PLL module's rate
+/// type (the two enums encode the same four DP rates).
+pub fn to_pll_rate(rate: crate::dp_link_training::LinkRate) -> LinkRate {
+    use crate::dp_link_training::LinkRate as TrainRate;
+    match rate {
+        TrainRate::Rbr => LinkRate::DpRbr,
+        TrainRate::Hbr => LinkRate::DpHbr,
+        TrainRate::Hbr2 => LinkRate::DpHbr2,
+        TrainRate::Hbr3 => LinkRate::DpHbr3,
+    }
+}
+
 /// Modeset orchestrator for one CRTC (= pipe + transcoder + DDI).
 /// Stateless — every call walks the full sequence on the assumption
 /// the caller has already serialized concurrent modesets at a
@@ -291,17 +317,76 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         primary_fb: &Framebuffer,
         fallback_mode: Option<&Mode>,
     ) -> Result<Mode, ModesetError> {
+        self.modeset_impl(primary_fb, fallback_mode, None)
+            .map(|(mode, _)| mode)
+    }
+
+    /// Run the modeset for an external DP sink whose link was
+    /// negotiated ahead of time through the shared link-training
+    /// core (`dp_link_training::negotiate`, #1092).
+    ///
+    /// Differences from the legacy eDP-shaped `modeset`:
+    /// - the mode comes from the caller (`fallback_mode` is
+    ///   required and used directly — the session layer owns
+    ///   EDID on this path, including the extension blocks the
+    ///   base-block read here cannot see);
+    /// - the DPLL is programmed at the negotiated link rate, not
+    ///   the pixel-clock floor;
+    /// - M/N, `TRANS_DDI_FUNC_CTL` port width, the DDI buffer
+    ///   lane field and link training all start from the plan;
+    /// - if training settles somewhere else (the fallback
+    ///   ladder walked), the DPLL, M/N, port width and
+    ///   BUF_TRANS are reprogrammed to the *trained*
+    ///   configuration before the DDI buffer enables, so what
+    ///   the pipe streams at always matches the trained link.
+    ///
+    /// Returns the mode plus the link as actually trained.
+    pub fn modeset_with_plan(
+        &mut self,
+        primary_fb: &Framebuffer,
+        mode: &Mode,
+        plan: LinkPlan,
+    ) -> Result<(Mode, crate::dp_link_training::TrainedLink), ModesetError> {
+        match self.modeset_impl(primary_fb, Some(mode), Some(plan))? {
+            (mode, Some(trained)) => Ok((mode, trained)),
+            (_, None) => unreachable!("plan path always trains"),
+        }
+    }
+
+    /// Tear the pipeline down in the PRM's safe order (plane →
+    /// pipe → transcoder → DDI buffer). Used on DP disconnect
+    /// (#1092); the disable sequence itself is step 3 of every
+    /// modeset.
+    pub fn teardown(&mut self) {
+        self.disable_pipeline();
+    }
+
+    fn modeset_impl(
+        &mut self,
+        primary_fb: &Framebuffer,
+        fallback_mode: Option<&Mode>,
+        plan: Option<LinkPlan>,
+    ) -> Result<(Mode, Option<crate::dp_link_training::TrainedLink>), ModesetError> {
         // Step 0: validate inputs that don't require touching HW.
         validate_framebuffer(primary_fb)?;
 
-        // Step 1: pick the mode. EDID readback over AUX, falling
-        // back to caller's fallback mode.
-        let mode = match self.read_preferred_mode_via_edid() {
-            Ok(m) => m,
-            Err(_) => match fallback_mode {
+        // Step 1: pick the mode. On the plan path the session
+        // layer owns EDID and hands the mode in; on the legacy
+        // path, EDID readback over AUX, falling back to the
+        // caller's fallback mode.
+        let mode = if plan.is_some() {
+            match fallback_mode {
                 Some(m) => *m,
                 None => return Err(ModesetError::EdidUnavailable),
-            },
+            }
+        } else {
+            match self.read_preferred_mode_via_edid() {
+                Ok(m) => m,
+                Err(_) => match fallback_mode {
+                    Some(m) => *m,
+                    None => return Err(ModesetError::EdidUnavailable),
+                },
+            }
         };
 
         // Step 2: enable PG1 (the always-required power well).
@@ -319,8 +404,14 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // Gen12 Combo PHY DPLL programming — DPLL_CFGCR0 has the
         // DCO integer + fraction; DPLL_CFGCR1 has the dividers.
         // intel_gpu_pll exposes `build_cfgcr0/1` for the encoding;
-        // Stage 1 wires the actual MMIO writes here.
-        self.program_dpll(&mode)?;
+        // Stage 1 wires the actual MMIO writes here. The DPLL
+        // synthesises the *link* clock: on the plan path that is
+        // the negotiated rate; the legacy path derives the lowest
+        // sufficient rate from the pixel clock.
+        match plan {
+            Some(p) => self.program_dpll_with_rate(&mode, to_pll_rate(p.rate))?,
+            None => self.program_dpll(&mode)?,
+        }
 
         // Step 4b (lane 1, #1010): raise CDCLK to the floor this
         // pixel clock needs — PRM: "Pipe maximum pixel rate =
@@ -348,14 +439,21 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.program_pipe(&mode);
 
         // Step 7b (lane 1): DP data/link M/N for the stream
-        // (24 bpp, uncompressed SST, 4 lanes). LINK_N is written
+        // (24 bpp, uncompressed SST). LINK_N is written
         // last — it triggers the hardware update of all four.
-        self.program_mn(&mode);
+        // Pre-training this carries the planned (or legacy
+        // derived) link configuration; the plan path reprograms
+        // it with the trained values after training (step 9b).
+        match plan {
+            Some(p) => self.program_mn_link(&mode, p.rate, p.lanes),
+            None => self.program_mn(&mode),
+        }
 
         // Step 7c (lane 1): bind the transcoder to the DDI port
-        // (TRANS_DDI_FUNC_CTL, DP-SST, 8 bpc, 4 lanes). Never
-        // written before lane 1 — routing was firmware leftover.
-        self.program_trans_ddi_func_ctl();
+        // (TRANS_DDI_FUNC_CTL, DP-SST, 8 bpc, planned lanes).
+        // Never written before lane 1 — routing was firmware
+        // leftover.
+        self.program_trans_ddi_func_ctl(plan.map(|p| p.lanes).unwrap_or(4));
 
         // Step 7d (lane 1; extended by Q6 #1024): power the
         // DBUF slices, then program the latency-based
@@ -368,23 +466,42 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // stride, format.
         self.program_plane(primary_fb, &mode);
 
-        // Step 9: DP link training (eDP path). HDMI skips this.
-        // For Stage 1 we expect AUX is available (the panel is
-        // alive enough to ACK DPCD reads). Failure surfaces as
+        // Step 9: DP link training. HDMI skips this. We expect
+        // AUX is available (the sink is alive enough to ACK DPCD
+        // reads). Failure surfaces as
         // ModesetError::LinkTrainingCr/Eq; the panel stays dark.
         //
         // Lane 1: load the DDI_BUF_TRANS swing table for the
-        // rate training starts at (HBR2) before training — the
-        // source PHY needs its coefficients while training runs.
-        // If training settles on a different rate, reload.
-        self.load_buf_trans(LinkRate::DpHbr2);
-        let trained = self.train_dp_link()?;
-        if trained != LinkRate::DpHbr2 {
-            self.load_buf_trans(trained);
+        // rate training starts at before training — the source
+        // PHY needs its coefficients while training runs. If
+        // training settles on a different rate, reload.
+        let start_rate = plan
+            .map(|p| to_pll_rate(p.rate))
+            .unwrap_or(LinkRate::DpHbr2);
+        self.load_buf_trans(start_rate);
+        let (trained_pll, trained_link) = self.train_dp_link(plan)?;
+        if trained_pll != start_rate {
+            self.load_buf_trans(trained_pll);
+        }
+
+        // Step 9b (plan path, #1092): if the fallback ladder
+        // settled somewhere other than the plan, reprogram the
+        // blocks that were written from the plan — DPLL, M/N and
+        // the TRANS_DDI_FUNC_CTL port width — to the trained
+        // configuration, before anything is enabled. The legacy
+        // path keeps its historical behaviour exactly.
+        if let (Some(p), Some(t)) = (plan, trained_link) {
+            if t.rate != p.rate {
+                self.program_dpll_with_rate(&mode, trained_pll)?;
+            }
+            if t.rate != p.rate || t.lanes != p.lanes {
+                self.program_mn_link(&mode, t.rate, t.lanes);
+                self.program_trans_ddi_func_ctl(t.lanes);
+            }
         }
 
         // Step 10: enable DDI buffer — physical output drivers on.
-        self.enable_ddi_buffer();
+        self.enable_ddi_buffer(trained_link.map(|t| t.lanes).unwrap_or(4));
 
         // Step 11: enable transcoder, then pipe, then plane.
         // Sequence matters: transcoder pulls timing from PLL, pipe
@@ -393,7 +510,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.enable_pipe();
         self.enable_plane();
 
-        Ok(mode)
+        Ok((mode, trained_link))
     }
 
     /// Read the panel's EDID via DP AUX I²C-over-AUX, parse, and
@@ -558,9 +675,17 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// (`icl_pll_power_enable`, `icl_pll_enable`).
     fn program_dpll(&mut self, mode: &Mode) -> Result<(), ModesetError> {
         let rate = link_rate_for_pixel_clock(mode.pixel_clock_khz);
+        self.program_dpll_with_rate(mode, rate)
+    }
+
+    /// Program the Combo PHY DPLL for an explicit link `rate`
+    /// (the negotiated rate on the plan path, #1092) instead of
+    /// the pixel-clock-derived floor `program_dpll` picks.
+    fn program_dpll_with_rate(&mut self, mode: &Mode, rate: LinkRate) -> Result<(), ModesetError> {
         // Reference-clock family from the DSSM strap (Q6,
         // #1024): a 24 MHz-strapped part programmed with the
         // 19.2 MHz rows gets a DCO 26% off target.
+        let _ = mode; // rate is explicit; the mode drove its choice
         let family = decode_refclk_family(self.mmio.read32(DSSM));
         let coeffs = match combo_coeffs(rate, family) {
             Some(c) => c,
@@ -713,22 +838,29 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     ///
     /// Reference: Linux drivers/gpu/drm/i915/display/
     /// intel_dp_link_training.c (`intel_dp_link_training`).
-    fn train_dp_link(&mut self) -> Result<LinkRate, ModesetError> {
+    fn train_dp_link(
+        &mut self,
+        plan: Option<LinkPlan>,
+    ) -> Result<(LinkRate, Option<crate::dp_link_training::TrainedLink>), ModesetError> {
         use crate::dp_link_training::{train_link, LinkError, LinkRate as TrainRate};
         let mut aux = IntelAux::new(self.mmio, self.ddi);
-        // Stage-2 starts at HBR2/4-lane and falls back via
-        // `train_link`'s policy. That's the broadest envelope a
-        // modern eDP panel will accept; lower-bandwidth links
-        // converge on the rate ladder.
-        let initial_rate = TrainRate::Hbr2;
-        let lanes = 4;
+        // The legacy path starts at HBR2/4-lane and falls back
+        // via `train_link`'s policy — the broadest envelope a
+        // modern eDP panel will accept. The plan path starts at
+        // the negotiated configuration (#1092).
+        let (initial_rate, lanes) = match plan {
+            Some(p) => (p.rate, p.lanes),
+            None => (TrainRate::Hbr2, 4),
+        };
         match train_link(&mut aux, initial_rate, lanes, |_us| core::hint::spin_loop()) {
-            Ok(trained) => Ok(match trained.rate {
-                TrainRate::Rbr => LinkRate::DpRbr,
-                TrainRate::Hbr => LinkRate::DpHbr,
-                TrainRate::Hbr2 => LinkRate::DpHbr2,
-                TrainRate::Hbr3 => LinkRate::DpHbr3,
-            }),
+            Ok(trained) => {
+                let pll = to_pll_rate(trained.rate);
+                // The legacy path historically discarded the
+                // trained configuration; keep that behaviour
+                // byte-identical there. The plan path consumes it.
+                let out = if plan.is_some() { Some(trained) } else { None };
+                Ok((pll, out))
+            }
             Err(LinkError::CrFailed(_)) => Err(ModesetError::LinkTrainingCr),
             Err(LinkError::EqFailed(_)) => Err(ModesetError::LinkTrainingEq),
             Err(LinkError::Aborted) => Err(ModesetError::LinkTrainingCr),
@@ -801,13 +933,24 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
 
     /// Program the DP data/link M/N registers for Transcoder A.
     fn program_mn(&mut self, mode: &Mode) {
+        let rate = link_rate_for_pixel_clock(mode.pixel_clock_khz);
+        let ls_khz = rate.megabits_per_sec() * 100;
+        self.program_mn_values(mode, ls_khz, 4);
+    }
+
+    /// Program M/N for an explicit trained/negotiated link:
+    /// `rate` is the training-core rate (its symbol clock is
+    /// `rate_kbps / 10` in kHz), `lanes` the lane count.
+    fn program_mn_link(&mut self, mode: &Mode, rate: crate::dp_link_training::LinkRate, lanes: u8) {
+        self.program_mn_values(mode, rate.rate_kbps() / 10, lanes);
+    }
+
+    fn program_mn_values(&mut self, mode: &Mode, ls_khz: u32, lanes: u8) {
         use crate::intel_gpu_pipes::{
             dp_mn, Transcoder, PIPE_DATA_M1_OFFSET, PIPE_DATA_N1_OFFSET, PIPE_LINK_M1_OFFSET,
             PIPE_LINK_N1_OFFSET,
         };
-        let rate = link_rate_for_pixel_clock(mode.pixel_clock_khz);
-        let ls_khz = rate.megabits_per_sec() * 100;
-        let (dm, dn, lm, ln) = dp_mn(mode.pixel_clock_khz, ls_khz, 4, 3);
+        let (dm, dn, lm, ln) = dp_mn(mode.pixel_clock_khz, ls_khz, lanes as u32, 3);
         let base = Transcoder::A.base();
         self.mmio.write32(base + PIPE_DATA_M1_OFFSET, dm);
         self.mmio.write32(base + PIPE_DATA_N1_OFFSET, dn);
@@ -817,12 +960,14 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         compiler_fence(Ordering::SeqCst);
     }
 
-    /// Bind Transcoder A to this DDI (DP-SST, 8 bpc, 4 lanes).
-    fn program_trans_ddi_func_ctl(&mut self) {
+    /// Bind Transcoder A to this DDI (DP-SST, 8 bpc, `lanes`
+    /// lanes — 4 on the legacy path, the negotiated count on
+    /// the plan path).
+    fn program_trans_ddi_func_ctl(&mut self, lanes: u8) {
         use crate::intel_gpu_pipes::{
             build_trans_ddi_func_ctl, Transcoder, TRANS_DDI_FUNC_CTL_OFFSET, TRANS_DDI_MODE_DP_SST,
         };
-        let val = build_trans_ddi_func_ctl(self.ddi as u8, TRANS_DDI_MODE_DP_SST, 4);
+        let val = build_trans_ddi_func_ctl(self.ddi as u8, TRANS_DDI_MODE_DP_SST, lanes);
         self.mmio
             .write32(Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET, val);
         compiler_fence(Ordering::SeqCst);
@@ -942,13 +1087,18 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     ///
     /// Reference: Linux drivers/gpu/drm/i915/display/intel_ddi.c
     /// (`intel_ddi_pre_enable_dp` + `intel_ddi_buf_enable`).
-    fn enable_ddi_buffer(&mut self) {
+    fn enable_ddi_buffer(&mut self, lanes: u8) {
         use crate::intel_gpu_ddi::{
             build_ddi_buf_ctl, LaneCount, DDI_BUF_CTL_IDLE_STATUS, DDI_BUF_CTL_OFFSET,
         };
+        let lane_count = match lanes {
+            1 => LaneCount::X1,
+            2 => LaneCount::X2,
+            _ => LaneCount::X4,
+        };
         let off = self.ddi.base() + DDI_BUF_CTL_OFFSET;
         let cur = self.mmio.read32(off);
-        let val = cur | build_ddi_buf_ctl(LaneCount::X4);
+        let val = cur | build_ddi_buf_ctl(lane_count);
         self.mmio.write32(off, val);
         compiler_fence(Ordering::SeqCst);
         // Wait for IDLE_STATUS to clear — buffer is now driving.
@@ -1492,7 +1642,7 @@ pub mod tests {
         mmio.state_offset = 0;
         mmio.state_value = 0;
         let mut ms = Modeset::new(&mmio, Ddi::A);
-        ms.enable_ddi_buffer();
+        ms.enable_ddi_buffer(4);
         let off = Ddi::A.base() + DDI_BUF_CTL_OFFSET;
         let writes = mmio.writes_to(off);
         if !writes.iter().any(|w| w & DDI_BUF_CTL_ENABLE != 0) {
@@ -1568,7 +1718,7 @@ pub mod tests {
         use crate::intel_gpu_pipes::{Pipe as PipeIdx, Transcoder, TRANS_DDI_FUNC_CTL_OFFSET};
         let mmio = FakeMmio::new();
         let mut ms = Modeset::new(&mmio, Ddi::A);
-        ms.program_trans_ddi_func_ctl();
+        ms.program_trans_ddi_func_ctl(4);
         let want = (1u32 << 31) | (1 << 27) | (2 << 24) | (3 << 1);
         let writes = mmio.writes_to(Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET);
         if writes != alloc::vec![want] {

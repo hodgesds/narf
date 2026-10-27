@@ -1,12 +1,13 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.9** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.10** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
 > bounds/flush discipline landed — see §9; forcewake domains
 > landed — see §11; RC6 + DMC landed — see §12; suspend/resume
-> + D-state transitions landed — see §13).
+> + D-state transitions landed — see §13; external DisplayPort
+> full single-stream landed — see §14).
 >
 > Clean-room driver for Intel integrated graphics from Tiger Lake
 > through Meteor Lake. **No GPL Linux `i915` / `xe` source
@@ -60,8 +61,8 @@ The volume layout is stable across Gen12 (TGL / ADL / RPL):
 | 2a  | Command Reference: Instructions      | `intel_gpu_rcs` (MI command codecs) |
 | 2c  | Command Reference: Engines           | `intel_gpu_rcs` (execlists / LRC model) |
 | 5   | Memory Views                         | `intel_gpu_gtt`, `intel_gpu_rcs` |
-| 11  | Display Engine Registers             | `intel_gpu_pll`       |
-| 12  | Display DDIs / Plane Programming     | `intel_gpu_ddi`, `intel_gpu_gmbus` |
+| 11  | Display Engine Registers             | `intel_gpu_pll`, `intel_gpu_dp` (HPD) |
+| 12  | Display DDIs / Plane Programming     | `intel_gpu_ddi`, `intel_gpu_gmbus`, `intel_gpu_audio` |
 | 14  | Display Engine                       | `intel_gpu_pipes`     |
 | 16  | Workarounds                          | (consult per-bug)     |
 
@@ -889,3 +890,101 @@ snapshot's RC6 bit is currently always off. D3cold is not
 used (the bus layer supports D3hot only; the link stays
 up and config survives). PSR/DC-state runtime policy and
 S0ix are out of scope.
+
+## 14. External DisplayPort, full single-stream (lane Q4 — `intel_gpu_dp`, #1092)
+
+The external-DP path for combo DDIs A/B/C, Gen12. Compiled
+only under the gpu crate's `intel` feature. Sources: VESA
+DisplayPort 1.4a (§2.7 AUX, §2.7.6 I²C-over-AUX, §3.5 link
+training, DPCD receiver-capability field), TGL PRM Vol. 11
+(PLL table, HPD block) and Vol. 12 (DDI, audio), CEA-861-D
+§7.5 (ELD).
+
+Public interface:
+
+- `probe_sink(mmio, ddi) -> DpSinkProbe` — the AUX
+  conversation: DPCD capabilities, the *complete* EDID (base +
+  extension blocks), and link negotiation for the preferred
+  mode. No display registers are touched beyond AUX.
+- `activate(mmio, probe, fb) -> DpConnection` — modeset at
+  the negotiated plan (`Modeset::modeset_with_plan`), then
+  display-audio publication. `connect` composes the two.
+- `disconnect(mmio, conn)` — audio disable + sink clear, then
+  pipeline teardown. `retrain(mmio, conn, fb)` answers an
+  IRQ_HPD short pulse: the connection stands if every trained
+  lane still reports CR_DONE, else a fresh connect runs.
+- `HpdMonitor` / `poll_hpd_event` — GEN8 DE Port block
+  (ISR 0x44440, IMR 0x44444, IIR 0x44448, IER 0x4444C; combo
+  hotplug bits at `1 << (3 + ddi_index)`). Level rise/fall is
+  Connect/Disconnect; a latched IIR bit on a steady high level
+  is the DP short pulse → `RetrainRequired`. Production glue
+  in `intel_gpu::poll_dp_hpd_events` drains events, allocates
+  the scanout (probe's allocator/lifetime), and publishes
+  through the §7 ACTIVE + observer protocol.
+
+Two seams are defined here for named consumers:
+
+- **Shared link-training core** —
+  `dp_link_training::{read_caps, negotiate, train_negotiated}`
+  (with `DpcdCaps`, `SourceCaps`, `NegotiatedLink`): the
+  vendor-neutral caps + negotiation + training composition
+  over `dp_aux::AuxChannel`. Negotiation policy: lanes first
+  (largest mutually supported of 4/2/1), then the lowest rate
+  whose 8b/10b payload covers the stream demand, capped by
+  both sides; an uncoverable demand settles at the mutual
+  ceiling with `over_budget` reported. **Thunderbolt lane 3
+  (#1095) consumes this seam** over tunnelled AUX and must not
+  re-implement it.
+- **Shared display-audio sink** —
+  `narf_drivers_sound::display_audio`: `build_eld` turns a
+  complete EDID into the CEA-861 ELD publication (layout
+  field-checked against the HDA codec's own ELD parser);
+  `publish_display_audio` / `clear_display_audio` /
+  `current_display_audio` are the registry. **HDMI-full
+  (#1019) consumes this seam** as second publisher (same sink
+  id per physical connector: DDI index + 1). The Intel codec
+  side (`intel_gpu_audio`: AUD_CONFIG DP timestamp update,
+  AUD_PIN_ELD_CP_VLD output-enable / ELD-valid sequencing per
+  `hsw_audio_codec_enable/disable`) raises ELD_VALID only
+  after the ELD is published in the sink.
+
+Modeset plan path (`Modeset::modeset_with_plan`): the DPLL
+is programmed at the negotiated rate, M/N and the
+`TRANS_DDI_FUNC_CTL` port width carry the planned rate/lanes,
+and if the fallback ladder settles elsewhere the DPLL, M/N,
+port width and BUF_TRANS are reprogrammed to the trained
+configuration before the DDI buffer enables. The legacy eDP
+path (`Modeset::modeset`) is byte-for-byte unchanged.
+
+Invariants:
+
+- Every DPCD read on the wire requests exactly the byte count
+  its caller waits for. (Found defect, fixed in this lane:
+  `dp_aux::AuxChannel::dpcd_read` and the `dp_edid` chunk
+  reads passed an empty length placeholder, so over the Intel
+  MMIO transport every multi-byte read failed reply-length
+  decode and EDID readback silently fell back to the
+  hardcoded mode. The per-address test stubs that ignored the
+  request length masked it; the composed transport+sink
+  fixtures here are the regression pin.)
+- EDID-over-AUX is one I²C read transaction per 128-byte
+  block: offset write, then 16-byte bursts with MOT clear on
+  all but the final burst (MOT set = STOP). Extension blocks
+  are fetched per the base block's byte 126; blocks past the
+  first 256-byte segment would need the I²C 0x30 segment
+  pointer, which is not driven (the CTA block is extension 1).
+- The plan path programs the DPLL at the negotiated rate
+  under the DSSM-selected reference family (lane Q6, #1024 —
+  `decode_refclk_family` + `combo_coeffs(rate, family)`), the
+  same resolver the legacy path uses; both PRM families
+  (19.2/38.4 MHz and 24 MHz) are fixture-pinned there.
+- Audio is published only when the sink's CTA extension
+  carries at least one SAD; a sink without audio gets video
+  only, and disconnect always clears the publication before
+  the pipeline comes down.
+
+Deliberate remainders: DP MST and multi-pipe (#1017),
+Xe-LPG display (#1016), Type-C HPD via the GEN11 DE HPD block
+(the Alt-Mode bridge's DDIs), DSC/FEC, and the HPD IRQ
+handler itself (interrupt enables are programmed; the
+session is poll-driven until an IRQ consumer lands).
