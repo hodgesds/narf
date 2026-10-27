@@ -37,12 +37,12 @@ native Rust model coverage; that does not qualify every deployed image.
 | QCA9377 HW1.0 |168c:0042|05020000; `QCA9377/hw1.0`|L|Same shared WIP|
 | QCA9377 HW1.1 |168c:0042|05020001; same directory, PLL continuation|L; separate target tuple|Same shared WIP|
 | AR9462 |168c:0034|Registered by ath10k as an explicit wrong-driver rejection|No station. It belongs to ath9k; NARF ath9k currently matches only AR9285 silicon (002b/002c)|None; a genuine AR9003/9462 backend is separate work|
-| QCA9887 HW1.0 |168c:0050|4100016d; `QCA9887/hw1.0`|Firmware catalog/parser tuple only: **not registered by the PCI dispatcher**|None; not counted as an active matched-chip port|
+| QCA9887 HW1.0 |168c:0050|4100016d; `QCA9887/hw1.0`|L via the QCA988X-family register/reset route; SI EEPROM calibration with board-file/OTP fallback|None|
 
-Thus ath10k registers9 tuples:8 candidate ath10k tuples spanning7 chip
+Thus ath10k registers10 tuples:9 candidate ath10k tuples spanning8 chip
 families and1 explicit AR9462 rejection. Its12 firmware-selection entries
-include the unreachable9887 tuple. None of these counts is a driver count
-or completion percentage. Together with ath9k (AR9285 and AR2427) there are11 registered tuples.
+are all reachable. None of these counts is a driver count
+or completion percentage. Together with ath9k (AR9285 and AR2427) there are12 registered tuples.
 
 NARF evidence: `ath9k.rs::{register,probe}`, `ath9k/identity.rs`,
 `ath9k/calibration.rs`, `ath9k/packet.rs`, `ath9k/station.rs`,
@@ -114,6 +114,6 @@ still WIP and has not passed the combined gate; no physical RF claim follows.
 | Q10 admitted chip/target/calibration deltas, counted once across aliases |
 | Q10 telemetry/radio/optional controls |
 
-QCA9887 is catalog-only and excluded from the registered match scope. Native
+QCA9887 is now registered on the QCA988X-family route with its EEPROM source. Native
 Q10 work is shared across genuine aliases/dialects. Exact source capabilities,
 firmware/board facts and physical acceptance remain outstanding.

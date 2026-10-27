@@ -47,6 +47,14 @@ pub(super) trait Transport {
     fn prepare_codeswap(&mut self, _bytes: &[u8]) -> Result<(u32, [u8; 208]), BmiError> {
         Err(BmiError::Unsupported)
     }
+    /// Linux `hif_fetch_cal_eeprom`: only the QCA9887 physical transport has
+    /// an SI EEPROM. `Ok(None)` is the EOPNOTSUPP/invalid-data fallback.
+    async fn calibration_eeprom(
+        &mut self,
+        _length: usize,
+    ) -> Result<Option<alloc::vec::Vec<u8>>, BmiError> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug)]
@@ -76,6 +84,17 @@ impl<T: Transport> Bmi<T> {
             return Err(BmiError::AfterDone);
         }
         self.transport.exchange(request, response).await
+    }
+
+    /// Alternate calibration source read while the target is still in BMI.
+    pub async fn calibration_eeprom(
+        &mut self,
+        length: usize,
+    ) -> Result<Option<alloc::vec::Vec<u8>>, BmiError> {
+        if self.done {
+            return Err(BmiError::AfterDone);
+        }
+        self.transport.calibration_eeprom(length).await
     }
 
     pub async fn target_info(&mut self) -> Result<TargetInfo, BmiError> {

@@ -84,6 +84,7 @@ pub mod ce;
 mod clock;
 pub mod control;
 pub mod dma;
+mod eeprom;
 pub mod firmware;
 mod firmware_source;
 pub mod htc;

@@ -655,6 +655,7 @@ pub const fn name_for(vendor: u16, device: u16) -> &'static str {
     match (vendor, device) {
         (ATHEROS_VENDOR, QCA988X_DEVICE_ID) => "ath10k-qca988x",
         (UBNT_VENDOR, QCA988X_UBNT_DEVICE_ID) => "ath10k-qca988x-ubnt",
+        (ATHEROS_VENDOR, QCA9887_DEVICE_ID) => "ath10k-qca9887",
         (ATHEROS_VENDOR, QCA6174_DEVICE_ID) => "ath10k-qca6174",
         (ATHEROS_VENDOR, QCA6164_DEVICE_ID) => "ath10k-qca6164",
         (ATHEROS_VENDOR, QCA99X0_DEVICE_ID) => "ath10k-qca99x0",

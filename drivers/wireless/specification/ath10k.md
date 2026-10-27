@@ -17,8 +17,8 @@
 
 ## 1. Purpose & scope
 
-PCIe Qualcomm/Atheros QCA988X, QCA6174/6164, QCA9377, QCA99X0, QCA9888
-and QCA9984. AR9462 belongs to ath9k and is rejected before MMIO.
+PCIe Qualcomm/Atheros QCA988X, QCA9887, QCA6174/6164, QCA9377, QCA99X0,
+QCA9888 and QCA9984. AR9462 belongs to ath9k and is rejected before MMIO.
 Linux `drivers/net/wireless/ath/ath10k/` is the reference implementation.
 
 ## 2. Assumptions
@@ -527,8 +527,33 @@ remain separate profiles.
 - `profile::Profile::select(device, version)` binds the PCI device ID and
   exact BMI target version to Linux's PCI firmware directory, board sizes,
   OTP parameters and clock operation. The Ubiquiti ID and QCA6164 have
-  separate exact entries; SDIO tuples are excluded. A QCA9887 tuple does
-  not add a PCI match or runtime support for that part.
+  separate exact entries; SDIO tuples are excluded. QCA9887
+  (`168c:0050`, BMI `4100016d`, `QCA9887/hw1.0`, 7168-byte board, 2116-byte
+  calibration) is routed by `hw::HwRev::Qca9887`: Linux `pci.c::ath10k_pci_probe`
+  gives `ATH10K_HW_QCA9887` the QCA988X register map, warm soft reset and
+  target-address translation, and `core.c::ath10k_core_create` the
+  `qca988x_regs`/`qcax_ce_regs`/`qca988x_values` family, so every QCA988X boot,
+  CE, HTC/WMI/HTT and station path applies unchanged.
+- QCA9887 alternate calibration (`eeprom::fetch`, `bmi::Transport::calibration_eeprom`)
+  follows `core.c::ath10k_download_cal_data` → `ath10k_download_cal_eeprom` and
+  `pci.c::{ath10k_pci_enable_eeprom,ath10k_pci_read_eeprom,ath10k_pci_validate_cal}`.
+  After the board-ID OTP run and signed board lookup, the physical QCA9887
+  transport (only, while still in BMI and under the current PCI capability)
+  enables the SI clock (RTC SoC +0x28), muxes GPIO5/17 as I2C SDA/clock with
+  pull-up, sets SI_CONFIG `0x000d00b8` and reads 2116 bytes one at a time
+  (`0xa10000a0` select with address bytes, SI_CS `0x114`, DONE_INT poll bounded
+  to 1 s with 20 us sleeps, write-one clear, DONE_ERR check, RX_DATA0 low byte).
+  Only a complete image whose 16-bit LE XOR is 0xffff is downloaded to
+  `hi_board_data` with `hi_board_data_initialized`, and the OTP calibration
+  execution is then skipped (Linux's `done` path). A nonzero `hi_board_ext_data`
+  (Linux `ath10k_push_board_ext_data` rejects the 2116-byte length), SI
+  timeout/DONE_ERR or a bad checksum fall back to the board file plus OTP.
+  An absent device or revoked authority fails the boot. Smokes
+  `drivers/wireless/ath10k/eeprom` and
+  `smoke_ath10k_qca9887_eeprom_calibration_replaces_board_data_and_skips_otp`
+  cover the register sequence, fallbacks and non-QCA9887 isolation. Pre-cal/cal
+  files and DT/NVMEM sources remain unimplemented. The EEPROM bytes are factory
+  calibration only; regulatory and transmit-power authority are unchanged.
 - `firmware::Image::{parse, load}` own the API 2–6 container and expose
   bounded image/OTP/code-swap slices, feature bits and WMI/HTT operation
   versions. `Files` supplies owned immutable bytes and `Files::wait_missing`
@@ -909,7 +934,7 @@ not inferred from this PCI table. `profile::PROFILES`, `hw::HwRev::from_pci_id`,
 | QCA9888,168c:0056 |01000000 / QCA9888/hw2.0 | R; H conditional; distinct board/OTP identity is required despite shared CE family. |
 | QCA9377,168c:0042 |05020000 / QCA9377/hw1.0 | R; H conditional; actual RAW/non-PFC image and CE1 routing required. |
 | QCA9377,168c:0042 |05020001 / QCA9377/hw1.0 | R; H conditional; existing revision-specific PLL path and exact board data retained. |
-| QCA9887,168c:0050 |4100016d / QCA9887/hw1.0 | Profile table/parser entry only. No PCI match/HwRev route, therefore no automatic boot or station support; cannot count this row as R/H. |
+| QCA9887,168c:0050 |4100016d / QCA9887/hw1.0 | R; H conditional. QCA988X-family register/reset route plus SI EEPROM calibration with board-file/OTP fallback; single-chain board facts and actual RAW/non-PFC image required. |
 | AR9462,168c:0034 | none | Explicit pre-MMIO rejection; ath9k ownership, not a missing ath10k station implementation. |
 
 Across the reached rows, concrete remaining software packages are 2.4-GHz HT40
@@ -921,7 +946,8 @@ multi-packet DMA/completion and aggregate retries; PFC fetch/queue ownership;
 dynamic WMM/protection updates and non-BE TX/TSPEC/U-APSD; DFS/indoor/beacon-hint
 qualification; associated/off-channel scanning; hardware key/PMF/WPA3 profiles;
 AP/P2P roles; interrupt-driven throughput; host-bus/system PM and wake offload;
-broader calibration sources and automatic credential/stable-interface recovery.
+pre-cal/cal-file and DT/NVMEM calibration sources (QCA9887 EEPROM is implemented)
+and automatic credential/stable-interface recovery.
 The existing bounded RX BA/reorder and complete RAW A-MSDU receiver must not be
 counted again as wholly missing TX aggregation. Unsupported role, width, stream,
 or security capability remains closed; this ledger makes no per-chip RF or

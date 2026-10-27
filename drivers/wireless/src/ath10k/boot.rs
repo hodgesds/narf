@@ -357,7 +357,8 @@ impl PciBoot {
         match self.hardware {
             // Prefer the safe warm reset on QCA988X. Do not automatically
             // cold-reset boards Linux documents can lock up on that path.
-            HwRev::Qca988x => self.warm_reset().await?,
+            // Linux `pci.c` gives QCA9887 the same warm soft reset.
+            HwRev::Qca988x | HwRev::Qca9887 => self.warm_reset().await?,
             HwRev::Qca6174 | HwRev::Qca9377 => {
                 self.cold_reset().await?;
                 self.warm_reset().await?;
@@ -494,6 +495,19 @@ impl Transport for PciBoot {
         self.resources
             .bmi_exchange(&mut self.mmio, &mut self.poisoned, request, response)
             .await
+    }
+
+    async fn calibration_eeprom(
+        &mut self,
+        length: usize,
+    ) -> Result<Option<alloc::vec::Vec<u8>>, BmiError> {
+        if self.hardware != HwRev::Qca9887 {
+            return Ok(None);
+        }
+        if self.retired || self.poisoned || self.hif_live || !self.power_ready {
+            return Err(BmiError::BadResponse);
+        }
+        super::eeprom::fetch(&mut self.mmio, self.registers, length).await
     }
 
     fn prepare_codeswap(&mut self, bytes: &[u8]) -> Result<(u32, [u8; 208]), BmiError> {

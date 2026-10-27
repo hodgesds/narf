@@ -63,6 +63,26 @@ fn smoke_ath10k_pci_match_table() -> TestResult {
 }
 kernel_test_in!("drivers/wireless/ath10k", smoke_ath10k_pci_match_table);
 
+fn smoke_ath10k_qca9887_pci_route_uses_qca988x_register_family() -> TestResult {
+    // Linux pci.c: QCA9887_1_0_DEVICE_ID -> ATH10K_HW_QCA9887 with the
+    // QCA988X register map, warm soft reset and target-address translation.
+    if HwRev::from_pci_id(ATHEROS_VENDOR, 0x0050) != Some(HwRev::Qca9887)
+        || HwRev::Qca9887.registers() != HwRev::Qca988x.registers()
+        || HwRev::Qca9887.short_name() != "QCA9887"
+        || name_for(ATHEROS_VENDOR, 0x0050) != "ath10k-qca9887"
+        || !ALL_PCI_MATCHES.contains(&(ATHEROS_VENDOR, 0x0050))
+        || crate::ath10k::profile::Profile::select(0x50, 0x4100016d)
+            .is_none_or(|p| p.directory != "ath10k/QCA9887/hw1.0")
+    {
+        return TestResult::Fail("QCA9887 PCI/HwRev/register/profile route");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k",
+    smoke_ath10k_qca9887_pci_route_uses_qca988x_register_family
+);
+
 fn smoke_ath10k_name_for_known_ids() -> TestResult {
     if name_for(ATHEROS_VENDOR, QCA988X_DEVICE_ID) != "ath10k-qca988x" {
         return TestResult::Fail("qca988x name mismatch");
