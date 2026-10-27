@@ -660,6 +660,35 @@ Per-chip remaining inventory uses Linux per-chip `sw.c` and radio/PCI ops:
 The source2.4GHz bandset rules out5GHz work on EE/CE/8192EE/8723;
 initial-profile restrictions do not rule out their HT/QoS hardware features.
 
+C2H event inventory (resolves the former `additional_c2h_events` unknown;
+Linux v6.12 `rtlwifi/wifi.h` `rtl_c2h_evt_v1/v2`, `base.c`
+`rtl_c2h_content_parsing`, `pci.c` RX/IRQ dispatch and per-chip `trx.c`/`sw.c`):
+
+| Route | Events/consumer | Chips |
+|---|---|---|
+| RX-ring `C2H_PACKET` (`get_rx_status_desc_rpt_sel` DW BIT(28)) -> `rtl_c2hcmd_enqueue` | C2H_DBG/C2H_TXBF (log only), C2H_TX_REPORT (`rtl_tx_report_handler`, solicited by `rtl_set_tx_report` SPE_RPT), C2H_RA_RPT (`c2h_ra_report_handler`), C2H_BT_INFO/C2H_BT_MP (`btc_ops`) | 8192EE (RA_RPT), 8723BE (TX_REPORT, BT), 8821AE (TX_REPORT, RA_RPT, BT) |
+| `IMR_C2HCMD` -> `fwevt_wq` -> `c2h_command_handle` (`REG_C2HEVT_MSG_NORMAL`) | firmware event mailbox | 8723AE only (`pci.c` gates on `HARDWARE_TYPE_RTL8723AE`) |
+| RTL8188EE | none: its RPT_SEL is the 2-bit DW3[15:14] field (`rtl8188ee/trx.h`), which cannot encode `C2H_PACKET`=4; its IMR_C2HCMD is never dispatched; TX_REPORT2 `macid_valid_entry` is written but never consumed anywhere in rtlwifi | retained EE profile |
+
+The retained EE packet core consumes non-NORMAL report descriptors without
+admission, which is the complete upstream EE behaviour. The other routes are
+part of the per-chip retained runtimes (`rtl8192ee`, `rtl8723ae`,
+`rtl8723be`, `rtl8821ae`), adaptive rate rows and `bt_coexistence`.
+
+Per-chip HT/QoS variant inventory (resolves the former
+`other_chip_phy_variants` unknown; `base.c::_rtl_init_hw_ht_capab`): every
+rtlwifi chip advertises the same HT set - SUP_WIDTH_20_40, SGI_20, SGI_40,
+DSSSCCK40, MAX_AMSDU (7935 bytes), A-MPDU factor 64K and density 16 (8us) -
+and only `get_rf_type` varies the RX MCS mask (1T1R: MCS0-7; 1T2R/2T2R:
+MCS0-15, part of the RTL8192CE/8192DE/8192EE chip rows). SGI40 and
+DSSS/CCK-in-40 belong to `ht40`; aggregation and BA to the named BA rows.
+`MAX_AMSDU` is cleared only for RTL8192DE dual-MAC (`disable_amsdu_8k`,
+4096-byte RX buffers); every other chip uses `pci.c` `rxbuffersize = 9100`
+and advertises 7935-byte A-MSDU reception, which the retained EE profile
+(3839 within 4096-byte buffers) lacks: named row `rx_amsdu_7935`. QoS/EDCA
+programming is per-chip `set_hw_reg(HW_VAR_AC_PARAM)` with the shared
+`rtl_get_hal_edca_param`, carried by each chip row.
+
 Source-proven inapplicability (rows removed from the remaining inventory):
 
 - **Checksum, TSO and VLAN offload.** `rtlwifi/base.c::_rtl_init_mac80211`
