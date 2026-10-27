@@ -377,7 +377,7 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
                     .filter_map(|r| match r {
                         // Hardware decryption is disabled. Never adopt unexpected
                         // plaintext metadata as a software-authenticated MPDU.
-                        Record::Frame(f) if f.admitted(self.ht_enabled()) => Some(f),
+                        Record::Frame(f) if f.admitted_or_aggregate(self.ht_enabled()) => Some(f),
                         _ => None,
                     })
                     .collect(),

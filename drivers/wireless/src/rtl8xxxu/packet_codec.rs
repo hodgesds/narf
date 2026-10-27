@@ -39,10 +39,19 @@ impl Mpdu {
     /// Native rxdesc16 is authoritative for encoding/width. Its old PHY block
     /// contains SGI/RXSC, not a C21/C22 page or an independently reported channel.
     pub(super) fn admitted(&self, ht_profile: bool) -> bool {
+        self.admitted_with(ht_profile, self.ba)
+    }
+    /// Radio-level admission: also passes an HT QoS MPDU that would be valid
+    /// inside a recipient BA session. The station's BA gate alone marks the
+    /// MPDU `ba`; without a session it fails `admitted` there and is dropped.
+    pub(super) fn admitted_or_aggregate(&self, ht_profile: bool) -> bool {
+        self.admitted_with(ht_profile, self.ba) || ht_profile && self.admitted_with(true, true)
+    }
+    fn admitted_with(&self, ht_profile: bool, ba: bool) -> bool {
         if self.decrypted || self.bandwidth40 {
             return false;
         }
-        let aggregation = self.aggregation_mask();
+        let aggregation = self.aggregation_mask(ba);
         if let Some([d0, d1, d2, d3]) = self.native {
             if d1 & aggregation != 0 || d2 & 0xf000 != 0 {
                 return false;
@@ -94,14 +103,11 @@ impl Mpdu {
     /// rxdesc16 DW1 bits that must be clear: MF always; PAGGR/FAGGR unless
     /// this HT QoS MPDU was admitted by an active recipient BA session and
     /// carries no A-MSDU (A-MSDU-in-A-MPDU is never granted).
-    fn aggregation_mask(&self) -> u32 {
+    fn aggregation_mask(&self, ba: bool) -> u32 {
         let base = (1 << 14) | (1 << 15) | (1 << 27);
         match self.native {
             Some([_, d1, _, _])
-                if self.ba
-                    && self.ht
-                    && d1 & (1 << 13) == 0
-                    && self.bytes.first() == Some(&0x88) =>
+                if ba && self.ht && d1 & (1 << 13) == 0 && self.bytes.first() == Some(&0x88) =>
             {
                 1 << 27
             }

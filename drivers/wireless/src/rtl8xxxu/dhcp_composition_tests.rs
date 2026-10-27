@@ -1609,8 +1609,10 @@ fn ht_rx_ba() -> Result<(), &'static str> {
             h.device.progress().is_empty() && h.device.link_up(),
             "EU A-MSDU in A-MPDU reached PN/delivery"
         );
+        // The refused record is discarded at native admission and never
+        // occupies its sequence slot, so the next MPDU may reuse SN105.
         let (mut amsdu, expected) = aggregate(&h, &[7, 9], 106, 5)?;
-        amsdu[22..24].copy_from_slice(&(106u16 << 4).to_le_bytes());
+        amsdu[22..24].copy_from_slice(&(105u16 << 4).to_le_bytes());
         h.link.0.lock().raw_queue.push_back(ht_record(&amsdu, 32));
         ensure!(
             h.device.progress() == expected,
