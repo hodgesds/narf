@@ -102,10 +102,13 @@ pub enum WwanError {
 ///
 /// A physical modem typically exposes several ports simultaneously
 /// (AT + MBIM + data), each implementing this trait separately.
+/// Registered ports are shared by the global multi-CPU registry, so
+/// implementations must be `Send + Sync` and synchronize mutable
+/// transport state across concurrent calls.
 ///
 /// Trait is intentionally synchronous at Stage-0/1; the async wrapper lands
 /// when the scheduler's waker integration is complete.
-pub trait WwanPort {
+pub trait WwanPort: Send + Sync {
     /// Human-readable port name, e.g. `"wwan0mbim"` or `"wwan0at"`.
     fn name(&self) -> &str;
 
@@ -158,7 +161,11 @@ pub fn port_count() -> usize {
 
 /// Look up a port by its name (e.g. "wwan0mbim").
 pub fn port_by_name(name: &str) -> Option<Arc<dyn WwanPort>> {
-    WWAN_PORTS.lock().iter().find(|p| p.name() == name).cloned()
+    let count = WWAN_PORTS.lock().len();
+    (0..count).find_map(|index| {
+        let port = WWAN_PORTS.lock().get(index).cloned();
+        port.filter(|port| port.name() == name)
+    })
 }
 
 // ─── initcall registration ───────────────────────────────────────────────────

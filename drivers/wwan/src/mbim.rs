@@ -356,7 +356,7 @@ fn wr_u32(buf: &mut [u8], off: usize, v: u32) {
 /// buffer it indexes. Offsets are relative to the start of the containing
 /// structure (the information buffer itself, for the structures here).
 /// A (0, 0) pair resolves to an empty slice.
-fn ol_slice<'a>(info: &'a [u8], pair_at: usize) -> Result<&'a [u8], MbimError> {
+fn ol_slice(info: &[u8], pair_at: usize) -> Result<&[u8], MbimError> {
     if pair_at + 8 > info.len() {
         return Err(MbimError::OutOfBounds);
     }
@@ -466,7 +466,7 @@ pub struct CommandHead {
 /// For fragment 0 this yields the service, CID and (for COMMAND_DONE)
 /// status; the information-buffer chunk is `msg[head.info_offset ..
 /// header.message_length]`. For continuation fragments (CurrentFragment
-/// > 0) the message carries only header + fragment header + the next
+/// `> 0`) the message carries only header + fragment header + the next
 /// information chunk: `service`/`cid` are zeroed, `status` is `None`,
 /// and callers must already know them from fragment 0 (MBIM 1.0
 /// §10.3.1 fragmentation rules; libmbim reassembles the same way).
@@ -603,13 +603,13 @@ impl DeviceCapsInfo {
 /// MBIM_SUBSCRIBER_READY_STATE_INITIALIZED — the SIM is ready.
 pub const SUBSCRIBER_READY_INITIALIZED: u32 = 1;
 
-/// Decoded subset of MBIM_SUBSCRIBER_READY_INFO (fixed part 36 bytes).
+/// Decoded subset of MBIM_SUBSCRIBER_READY_INFO (28-byte fixed header).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscriberReadyInfo {
     /// MBIM_SUBSCRIBER_READY_STATE.
     pub ready_state: u32,
-    /// MBIM_SUBSCRIBER_READY_FLAGS.
-    pub flags: u32,
+    /// MBIM_SUBSCRIBER_READY_INFO.ReadyInfo.
+    pub ready_info: u32,
     /// Subscriber identifier string (may be empty).
     pub subscriber_id: alloc::string::String,
     /// SIM ICC identifier string (may be empty).
@@ -617,8 +617,8 @@ pub struct SubscriberReadyInfo {
 }
 
 impl SubscriberReadyInfo {
-    /// Size of the fixed part of MBIM_SUBSCRIBER_READY_INFO.
-    pub const FIXED_LEN: usize = 36;
+    /// Size of the fixed header before the variable telephone-number array.
+    pub const FIXED_LEN: usize = 28;
 
     /// Parse from a CID_SUBSCRIBER_READY_STATUS response buffer.
     pub fn parse(info: &[u8]) -> Result<Self, MbimError> {
@@ -627,9 +627,9 @@ impl SubscriberReadyInfo {
         }
         Ok(Self {
             ready_state: rd_u32(info, 0),
-            flags: rd_u32(info, 4),
-            subscriber_id: ol_string(info, 8)?,
-            sim_iccid: ol_string(info, 16)?,
+            subscriber_id: ol_string(info, 4)?,
+            sim_iccid: ol_string(info, 12)?,
+            ready_info: rd_u32(info, 20),
         })
     }
 }
