@@ -1,6 +1,6 @@
 //! Measured Boot Support — hardware-anchored TCB integrity.
 //!
-//! Spec: `frame/specification/spec.md` §3.7. Anchors the NARF security
+//! Spec: `security-model/specification/spec.md` §9. Anchors the NARF security
 //! model by measuring the boot chain into the TPM's PCRs (Platform
 //! Configuration Registers).
 //!
