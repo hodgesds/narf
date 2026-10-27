@@ -206,9 +206,17 @@ impl HidPipe for NullPipe {
 
 /// The ceremony's scripted user: a queue of PINs to type, and a
 /// recording of everything the ceremony said and asked.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct ScriptedUi {
     inner: Arc<IrqSafeSpinLock<UiScript>>,
+}
+
+impl Default for ScriptedUi {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(IrqSafeSpinLock::new(UiScript::default())),
+        }
+    }
 }
 
 #[derive(Default)]
