@@ -236,6 +236,43 @@ impl MsixTable {
         // SAFETY: Valid memory or trusted environment
         let region = unsafe { map_bar_control(&self.device, self.bir)? };
 
+        // VMD remap interposition (issue #933 item 4): a child
+        // behind a VMD bridge is programmed with the bridge-entry
+        // message from `vmd_irq`, not a LAPIC / ITS message of its
+        // own — the bridge intercepts the message and re-issues it
+        // through its own MSI-X table. Assigning here also records
+        // the (child vector → bridge entry) mapping the bridge demux
+        // dispatches on, and deliberately skips the ITS MAPD/MAPTI
+        // below: translations belong to the bridge's entries, which
+        // were set up when the bridge itself was programmed.
+        if let Some(domain) = crate::vmd_domain::domain_for_device(&self.device) {
+            let entry = crate::vmd_irq::assign_child_vector(
+                domain.segment,
+                self.device.id.class,
+                self.device.addr,
+                vector_idx,
+                irq_vector,
+            )
+            .ok_or(MsixError::Unsupported)?;
+            let words = crate::vmd_irq::remap_entry_words(entry);
+            let entry_off = self.table_offset as u64 + (vector_idx as u64) * 16;
+            // SAFETY: entry_off bounds as per the native path below;
+            // the caller owns the table BAR for the call.
+            // SAFETY: Valid memory or trusted environment
+            unsafe {
+                region.write32(entry_off, words[0]);
+                region.write32(entry_off + 4, words[1]);
+                region.write32(entry_off + 8, words[2]);
+                region.write32(entry_off + 12, words[3]);
+            }
+            let (addr, data) = crate::vmd_irq::remap_message(entry);
+            return Ok(MsixVector {
+                vector: vector_idx,
+                address: addr,
+                data,
+            });
+        }
+
         // aarch64-only: register the (DeviceID, EventID) → LPI
         // translation in the GIC ITS before the device fires its
         // first MSI. Without this, a write to GITS_TRANSLATER has

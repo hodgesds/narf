@@ -54,6 +54,8 @@ pub mod pcie_aer;
 pub mod pcie_dpc;
 pub mod pcie_recovery;
 pub mod registry;
+pub mod vmd_domain;
+pub mod vmd_irq;
 
 pub use acpi_notify::{AcpiNotify, NotifyEvent, NotifyKind};
 
@@ -87,6 +89,18 @@ pub use msix::{enable_msix, MsixError, MsixTable, MsixVector};
 pub use registry::{
     append_devices, bootstrap_registry_authority, claim_device, claim_device_cap, devices, init,
     snapshot, BusDeviceCap, BusDeviceHandle, BusRegistryCap, ClaimError,
+};
+pub use vmd_domain::{
+    allocate_domain_mmio as allocate_vmd_mmio, domain_for_device as vmd_domain_for_device,
+    domain_info as vmd_domain_info, membar_window_of, register_domain as register_vmd_domain,
+    unregister_domain as unregister_vmd_domain, MembarWindow, VmdDomainError, VmdDomainInfo,
+};
+pub use vmd_irq::{
+    assign_child_vector as vmd_assign_child_vector, bridge_vector as vmd_bridge_vector,
+    entry_for_child as vmd_entry_for_child, register_bridge_domain as register_vmd_irq_domain,
+    release_device as vmd_release_device, remap_entry_words as vmd_remap_entry_words,
+    remap_message as vmd_remap_message, unregister_bridge_domain as unregister_vmd_irq_domain,
+    VmdIrqError,
 };
 
 /// IOMMU group id for a given device. Stage-3 stub: QEMU's default

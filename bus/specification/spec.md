@@ -320,6 +320,63 @@ deadline-bounded polling primitive rather than module-local spin loops.
 Network TX crosses a permanent in-tree trampoline and the TX call gate; RX is
 a synchronous bounded copy into the named interface's stack ingress path.
 
+### 3.7 VMD domains: MEMBAR apertures and MSI remapping
+
+An Intel VMD bridge hides its children behind two apertures — the
+bridge's BAR2 (`MEMBAR1`) and BAR4 (`MEMBAR2`) — and intercepts
+their interrupts. The bus crate models each bridge as a *VMD
+domain* (`vmd_domain`, `vmd_irq`), registered by the VMD driver at
+probe time, before the children are installed into the registry:
+
+```rust
+pub struct MembarWindow { pub base: u64, pub size: u64, pub reserve_head: u64 }
+pub struct VmdDomainInfo {
+    pub segment: u16, pub bridge: BusAddr,
+    pub membar1: Option<MembarWindow>, pub membar2: Option<MembarWindow>,
+    pub msix_entries: u16, pub first_vec: u16,
+}
+pub fn register_vmd_domain(info: VmdDomainInfo) -> Result<(), VmdDomainError>;
+pub fn unregister_vmd_domain(segment: u16) -> Option<VmdDomainInfo>;
+pub fn membar_window_of(segment: u16, phys: u64, len: u64) -> Option<u8>;
+pub fn allocate_vmd_mmio(segment: u16, size: u64, align: u64) -> Option<u64>;
+```
+
+MEMBAR semantics (issue #933 item 3). Programmed child BAR values
+are already host addresses — there is no translation on the path —
+so the domain's content is containment and allocation:
+
+- `assign_unprogrammed_bars` draws a VMD child's assignments from
+  its bridge's aperture (first-fit over unoccupied gaps, MEMBAR1
+  before MEMBAR2), never from the host MMIO pool, and treats a BAR
+  holding an address outside the aperture as unprogrammed.
+- `map_bar` / `map_bar_control` refuse a VMD child's BAR that does
+  not decode inside the aperture.
+- MEMBAR2's head (`0x2000`, or `0x2010` on MEMBAR-shadow parts) is
+  reserved for the bridge's own MSI-X table and is never allocated
+  to a child. Programmed BARs are noted as occupied when observed
+  (assignment and mapping both note), so allocations route around
+  ranges firmware or an earlier probe already claimed.
+
+MSI remapping (issue #933 item 4). The VMD driver programs the
+bridge's own MSI-X table with one host vector per entry, clears
+VMCONFIG's `MSI_RMP_DIS` bit, and registers the entries with
+`vmd_irq::register_bridge_domain`, which installs a demux handler
+on each bridge vector. Child drivers see no API change:
+`MsixTable::program_vector` and `program_msi` check whether the
+device lives on a registered VMD segment and, if so, substitute
+the remap message — the standard MSI address base carrying the
+*bridge entry index* in the destination field, data zero (the
+Linux `vmd_compose_msi_msg` shape) — and record the
+(child vector → bridge entry) mapping. Entry policy follows Linux
+`vmd_next_irq`: NVMe-class children (`class >> 8 == 0x0108`) get
+the least-loaded entry at or above `first_vec + 1`; all other
+classes share the `first_vec` entry (`1` on client parts, where
+entry 0 stays free; `0` elsewhere). When a bridge vector fires,
+the demux re-dispatches each recorded child vector through
+`interrupts::dispatch::on_irq`; an entry with no children reports
+spurious. Legacy MSI collapses onto one entry, as the remap
+ignores message data — MSI's only per-vector signal.
+
 ## 4. Invariants & safety properties
 
 - The device registry is read-mostly and uses RCU for lookups.
@@ -584,6 +641,19 @@ registry authority. Ordering invariant for future enumeration
 work: a device must be detached *before* its record leaves the
 registry — `detach` mints the hook's cap through the registry,
 so a device removed first would silently skip its teardown.
+
+### 9.7 VMD remap cleanup on detach
+
+`detach` also releases the device's VMD remap mappings
+(`vmd_irq::release_device`, §3.7) whenever a binding is dropped:
+a detached child's vectors must never be dispatched to again, and
+the bridge entries' load accounting must not keep counting a gone
+device. The release runs before the remove hook, so a hook that
+re-programs the device cannot resurrect a stale mapping. Detaching
+the *bridge* (its own remove hook) unregisters the whole domain —
+resource windows and IRQ domain together; child bindings are
+unaffected, but their remap mappings are dead from that point and
+are dropped with the IRQ domain.
 
 ## 10. `Cap<BusDevice, _>` mint protocol
 
