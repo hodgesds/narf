@@ -34,6 +34,8 @@ struct Fake {
     corrupt: Option<(usize, u8)>,
     aux_corrupt: Option<(usize, u8)>,
     complete_pointer: Option<u32>,
+    edid_caps: Option<crate::amdgpu_freesync::AmdVsdb>,
+    edid_chunks: Vec<(u16, [u8; 8])>,
 }
 impl Fake {
     fn slot(&self, offset: usize) -> [u8; 64] {
@@ -67,6 +69,27 @@ impl Fake {
                 request[4] = 1;
                 request[5] = 0x21;
                 request[16] = 1;
+            }
+            79 if self.edid_caps.is_some() => {
+                assert_eq!(&request[..4], &[79, 0, 0, 16]);
+                assert_eq!(request[6], 8);
+                assert_eq!(&request[7..9], &128u16.to_le_bytes());
+                let offset = u16::from_le_bytes(request[4..6].try_into().unwrap());
+                self.edid_chunks
+                    .push((offset, request[9..17].try_into().unwrap()));
+                request[4..].fill(0);
+                if offset == 120 {
+                    let caps = self.edid_caps.unwrap();
+                    request[4..7].copy_from_slice(&[1, 1, 1]);
+                    request[7..9].copy_from_slice(&caps.version.to_le_bytes());
+                    request[9..11].copy_from_slice(&caps.min_hz.to_le_bytes());
+                    request[11..13].copy_from_slice(&caps.max_hz.to_le_bytes());
+                    request[13] = caps.vcp_code;
+                } else {
+                    request[4] = 2;
+                    request[5..7].copy_from_slice(&offset.to_le_bytes());
+                    request[7] = 1;
+                }
             }
             82 => {
                 assert_eq!(request[3], 12);
@@ -231,6 +254,8 @@ fn fixture() -> (Pool, Engine<Fake>) {
             corrupt: None,
             aux_corrupt: None,
             complete_pointer: None,
+            edid_caps: None,
+            edid_chunks: Vec::new(),
         },
         authority: Cap::bootstrap(),
         layout: Layout {

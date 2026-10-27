@@ -42,17 +42,20 @@ pub enum LinkAction {
     None,
     Relight,
     Faulted,
+    Recovered,
 }
 
 /// Three consecutive observed failures trigger one relight per connection.
 /// A second sustained loss reports a fault and stops automatic recovery;
 /// healthy outputs in the same context keep running. Unreadable status
-/// never causes a reset loop. Polling is limited to once per second.
+/// never causes a reset loop. Faulted links remain observable, at one
+/// sample per five seconds, so a later lock can be reported without spending
+/// another reset. Other polling is limited to once per second.
 #[derive(Clone, Copy, Debug)]
 pub struct LinkMonitor {
     failures: u8,
     relit: bool,
-    stopped: bool,
+    faulted: bool,
     next_sample_ms: u64,
 }
 impl LinkMonitor {
@@ -60,19 +63,24 @@ impl LinkMonitor {
         Self {
             failures: 0,
             relit: false,
-            stopped: false,
+            faulted: false,
             next_sample_ms: 0,
         }
     }
     pub fn poll_due(&mut self, now_ms: u64) -> bool {
-        if self.stopped || now_ms < self.next_sample_ms {
+        if now_ms < self.next_sample_ms {
             return false;
         }
-        self.next_sample_ms = now_ms.saturating_add(1000);
+        self.next_sample_ms = now_ms.saturating_add(if self.faulted { 5000 } else { 1000 });
         true
     }
     pub fn observe(&mut self, health: LinkHealth) -> LinkAction {
-        if self.stopped {
+        if health == LinkHealth::Locked {
+            self.failures = 0;
+            if self.faulted {
+                self.faulted = false;
+                return LinkAction::Recovered;
+            }
             return LinkAction::None;
         }
         if !matches!(
@@ -82,13 +90,16 @@ impl LinkMonitor {
             self.failures = 0;
             return LinkAction::None;
         }
+        if self.faulted {
+            return LinkAction::None;
+        }
         self.failures += 1;
         if self.failures < 3 {
             return LinkAction::None;
         }
         self.failures = 0;
         if self.relit {
-            self.stopped = true;
+            self.faulted = true;
             LinkAction::Faulted
         } else {
             self.relit = true;
@@ -173,5 +184,42 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/dcn30-hdmi/link",
         hdmi_poll_is_rate_limited_even_when_modesets_wake_the_monitor
+    );
+    fn hdmi_fault_keeps_observing_recovery_without_replenishing_relight() -> TestResult {
+        let mut m = LinkMonitor::new();
+        for _ in 0..3 {
+            m.observe(LinkHealth::Acquiring);
+        }
+        for _ in 0..2 {
+            m.observe(LinkHealth::Acquiring);
+        }
+        if m.observe(LinkHealth::Acquiring) != LinkAction::Faulted
+            || !m.poll_due(10_000)
+            || m.poll_due(14_999)
+        {
+            return TestResult::Fail(
+                "faulted link lost observation or exceeded diagnostic cadence",
+            );
+        }
+        if !m.poll_due(15_000)
+            || m.observe(LinkHealth::Unknown) != LinkAction::None
+            || m.observe(LinkHealth::Locked) != LinkAction::Recovered
+            || m.observe(LinkHealth::Locked) != LinkAction::None
+        {
+            return TestResult::Fail("late receiver lock was hidden or reported twice");
+        }
+        for _ in 0..2 {
+            if m.observe(LinkHealth::Acquiring) != LinkAction::None {
+                return TestResult::Fail("loss threshold after recovery");
+            }
+        }
+        if m.observe(LinkHealth::Acquiring) != LinkAction::Faulted {
+            return TestResult::Fail("late lock replenished the automatic relight budget");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/dcn30-hdmi/link",
+        hdmi_fault_keeps_observing_recovery_without_replenishing_relight
     );
 }

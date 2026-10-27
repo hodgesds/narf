@@ -135,6 +135,9 @@ struct Engine<I: Io> {
     instance: u8,
     state: State,
     profile: Profile,
+    timing: Option<Timing>,
+    drr: Option<drr::Applied>,
+    drr_dirty: bool,
 }
 impl<I: Io> Engine<I> {
     fn otg(&self, reg: u64) -> u64 {
@@ -283,6 +286,8 @@ impl<I: Io> Engine<I> {
             0x1fff, // linux: ODM0_OPTC_WIDTH_CONTROL__OPTC_SEGMENT_WIDTH_MASK
             fits(timing.h_active, SEGMENT_WIDTH_BITS)?,
         )?;
+        self.reset_dcn30_drr()?;
+        self.timing = Some(*timing);
         self.state = State::Programmed;
         Ok(())
     }
@@ -428,6 +433,9 @@ impl Otg {
             instance,
             state: State::Idle,
             profile,
+            timing: None,
+            drr: None,
+            drr_dirty: false,
         }))
     }
     pub fn state(&self) -> State {
@@ -459,3 +467,6 @@ impl Otg {
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_dcn_otg_tests.rs"]
 mod tests;
+
+#[path = "amdgpu_dcn_otg_drr.rs"]
+mod drr;

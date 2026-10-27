@@ -7555,7 +7555,7 @@ default format (4:2:0-only modes as 4:2:0; else RGB at the deepest declared dept
 `amdgpu_dcn_inventory::encoder_caps`) and DML30's `min(600, PHYCLK)`.
 `Stream { format: Format { depth, encoding, colorspace }, pixel_khz,
 character_100hz, character_khz, scramble: Scramble::{Off, LowRate, Above340},
-scdc, avi, vendor, hdr }` carries the halved TMDS pixel clock, `phy_pix_clk`, the
+scdc, avi, vendor, hdr, spd }` carries the halved TMDS pixel clock, `phy_pix_clk`, the
 scrambling decision (> 340 MHz, or LTE_340Mcsc) and the AVI/HDMI-VIC vendor
 InfoFrames. `write_scdc_data(ddc, &stream)` (Sink/Source_Version, TMDS_Config
 0/1/3; fails only a scrambled stream), `read_scdc_data` and
@@ -7565,11 +7565,44 @@ over `dp::Aux::scdc_read/scdc_write` (default: unsupported;
 `Hdmi::hdmi_stream_attribute(&stream)` programs depth/scrambler/1/4 clock rate,
 `hdmi_info_packets(&stream)` sends AVI (packet 0) and vendor (packet 1) in
 Linux's order; a VPG conflict that never clears is logged, not fatal.
+`retire_reset_clock_pattern()` checks the DIG clock pattern after firmware
+stream setup and transmitter enable: only reset/constant patterns (0x63/0)
+are replaced with enc3's 0x1f pattern; other configured values are preserved.
+The settled SCDC diagnostic also reports that pattern. `LinkMonitor` allows
+one relight after three observed bad samples at least one second apart per
+connection. After a second sustained loss it reports `Faulted` without tearing
+down the stream. Observation continues at five-second intervals; a later
+receiver lock reports `Recovered` without replenishing the relight budget.
 `unsafe hdmi::Formatter::new(gpu, cap, pipe)` owns the pipe's FMT (dynamic
 expansion, SPATIAL8/10 dither, full-range clamp, 4:2:2/4:2:0 subsampling), OTG 4:2:0
 container (OPTC_DATA_FORMAT, H_TIMING_DIV_MODE), MPC OCSC (RGB range and
 BT.601/709/2020 YCbCr, coefficient set A) and DPG black. `Pipeline::hdmi_output()` exposes
 the admitted stream to the unplug path.
+
+`ColdBoot::hdmi_vrr_caps(connector)` caches optional firmware-decoded AMD
+FreeSync capabilities against the exact HDMI EDID. A checksum-valid first
+CTA extension containing AMD's OUI is sent through the serialized DMUB
+`HdmiEdidCea` command (79), sixteen eight-byte chunks with acknowledged
+offsets. Ordinary sinks generate no such mailbox traffic. An absent reply,
+unknown packet version, invalid range or required MCCS negotiation leaves
+fixed refresh. `Pipeline::configure_hdmi_vrr(caps, enabled)` and the group
+equivalent update the complete packet set with AMD SPD v1/v2/v3 support and
+active flags, preserving HDR metadata. v3 carries ten-bit refresh endpoints;
+v1/v2 refuse endpoints above 255 Hz.
+
+`Otg::configure_dcn30_drr(Option<Drr>)` changes an owned running DCN3.0
+generator's MIN/MAX totals (minus one), retires inherited MID state, selects
+TRIGA and manual trigger source 21, and saves/restores static-screen control.
+Totals must be ordered, at least nominal, and no greater than 32767. A partial
+write failure requires teardown. Fixed-mode startup also clears inherited DRR
+and static-screen event state. This backend refuses DCN3.1.4.
+Navi22 publishes `vrr_capable`/`VRR_ENABLED` only for admitted routed sinks;
+the monitor applies committed state outside the KMS lock. The single-stream
+scanout uses completed DRR totals sampled within a stable frame counter,
+strobes the DCN3.0 manual trigger after a flip, and bounds the timeout by the
+longest admitted frame. Its VRR vblank clock never extrapolates nominal-rate
+frames while hardware sampling is unavailable. These controls do not add
+low-framerate compensation or dynamic secondary-CRTC presentation.
 
 `amdgpu_navi22_modeset::Resources::acquire(&connector)` is the DCN3.0 pool:
 first free pipe, the preferred DIG FE (= transmitter) or else the last free

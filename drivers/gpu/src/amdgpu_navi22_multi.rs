@@ -706,6 +706,18 @@ impl core::fmt::Debug for Group {
 }
 
 impl Group {
+    pub async fn configure_hdmi_vrr(
+        &mut self,
+        stream: usize,
+        caps: Option<crate::amdgpu_freesync::AmdVsdb>,
+        enabled: bool,
+    ) -> Result<Option<crate::amdgpu_freesync::Drr>, Error> {
+        self.members
+            .get_mut(stream)
+            .ok_or(Error::Invalid)?
+            .configure_hdmi_vrr(caps, enabled)
+            .await
+    }
     /// Update one stream's HDMI metadata without retiring the context.
     pub async fn update_hdmi_metadata(
         &mut self,

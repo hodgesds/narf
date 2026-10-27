@@ -1072,3 +1072,80 @@ kernel_test_in!(
     "drivers/gpu/dcn30-hdmi",
     dcn30_hdmi_hdr_metadata_and_avi_colorimetry_agree
 );
+
+fn dcn30_hdmi_freesync_spd_admission_checks_version_oui_and_checksum() -> TestResult {
+    use crate::amdgpu_freesync::{self as fs, HdmiState, VrrRange};
+    let e = edid(DTD_720P, &[vsdb(0, 68)]);
+    let t = first(&e);
+    let avi = stream(&e, 8, false, Limits::DEFAULT).unwrap().avi.unwrap();
+    for version in [1, 2, 3] {
+        let packet = fs::hdmi_info_packet(
+            &t,
+            VrrRange {
+                min_hz: 40,
+                max_hz: 75,
+            },
+            version,
+            HdmiState::Variable,
+        )
+        .unwrap()
+        .bytes();
+        let mut packets = InfoPackets::desktop(&avi, None);
+        packets.spd = Some(&packet);
+        if packets.validate().is_err() {
+            return TestResult::Fail("native FreeSync SPD rejected");
+        }
+        let mut bad = packet;
+        bad[5] ^= 1;
+        let n = usize::from(bad[2]);
+        bad[4] = 0u8.wrapping_sub(
+            bad[..3]
+                .iter()
+                .chain(&bad[5..5 + n])
+                .fold(0u8, |sum, b| sum.wrapping_add(*b)),
+        );
+        packets.spd = Some(&bad);
+        if packets.validate() != Err(Error::Invalid) {
+            return TestResult::Fail("non-AMD short SPD accepted");
+        }
+        let mut hw = engine(0, 0);
+        if run(hw.program_info_packets(&packets)) != Err(Error::Invalid)
+            || !hw.io.data.is_empty()
+            || hw.io.regs.iter().any(|r| *r != 0)
+        {
+            return TestResult::Fail("bad FreeSync packet touched hardware");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi",
+    dcn30_hdmi_freesync_spd_admission_checks_version_oui_and_checksum
+);
+
+fn dcn30_hdmi_retires_reset_clock_pattern_without_replacing_configured_patterns() -> TestResult {
+    let mut hw = engine(1, 0);
+    let at = (DIG_CLOCK_PATTERN + STRIDE) as usize;
+    for old in [0, 0x63] {
+        hw.io.regs[at] = 0x8000_0000 | old;
+        if hw.retire_reset_clock_pattern() != Ok(Some(old)) || hw.io.regs[at] != 0x8000_001f {
+            return TestResult::Fail("constant/reset TMDS clock pattern was retained");
+        }
+        if hw.retire_reset_clock_pattern() != Ok(None) {
+            return TestResult::Fail("good pattern reprogrammed");
+        }
+    }
+    hw.io.regs[at] = 0x8000_0155;
+    if hw.retire_reset_clock_pattern() != Ok(None) || hw.io.regs[at] != 0x8000_0155 {
+        return TestResult::Fail("configured pattern replaced");
+    }
+    hw.io.regs[at] = u32::MAX;
+    if hw.retire_reset_clock_pattern() != Err(Error::DeviceGone) {
+        return TestResult::Fail("absent encoder accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi",
+    dcn30_hdmi_retires_reset_clock_pattern_without_replacing_configured_patterns
+);

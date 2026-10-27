@@ -776,6 +776,7 @@ pub struct Pipeline {
     format: hdmi::Formatter,
     hdmi: Option<hdmi::Stream>,
     hdmi_settings: hdmi::OutputSettings,
+    hdmi_vrr: Option<(Option<crate::amdgpu_freesync::AmdVsdb>, bool)>,
 }
 impl core::fmt::Debug for Pipeline {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -879,6 +880,7 @@ impl Pipeline {
                 format: hdmi::Formatter::new(gpu, authority, pipe)?,
                 hdmi: None,
                 hdmi_settings: hdmi::OutputSettings::default(),
+                hdmi_vrr: None,
             })
         }
     }
@@ -1471,6 +1473,7 @@ impl Pipeline {
         self.dig.setup_stereo_sync(self.route.pipe)?;
         tables.hdmi_stream_setup(self.bus(), self.route.stream, stream.character_khz)?;
         self.dig.hdmi_stream_attribute(&stream)?;
+        self.dig.retire_reset_clock_pattern()?;
         self.dig.hdmi_info_packets(&stream).await?;
         // enable_link_hdmi: write_scdc_data, then setup_dio_stream_encoder
         // (the backend takes the frontend first, so a 1/4-rate clock channel
@@ -1490,6 +1493,7 @@ impl Pipeline {
                 symbol_khz: stream.character_khz,
             },
         )?;
+        self.dig.retire_reset_clock_pattern()?;
         self.report_hdmi_status(aux, "transmitter").await;
         // The second setup Linux issues after transmitter control.
         self.dig.setup(DigMode::Hdmi)?;
@@ -1501,7 +1505,7 @@ impl Pipeline {
     }
     /// Diagnostic only: the early Linux sample precedes final plane unblank.
     /// A second sample after the verify frames observes the enabled stream.
-    async fn report_hdmi_status<A: Aux + Send>(&self, aux: &mut A, phase: &str) {
+    async fn report_hdmi_status<A: Aux + Send>(&mut self, aux: &mut A, phase: &str) {
         if self.connector.signal != Signal::Hdmi {
             return;
         }
@@ -1509,10 +1513,11 @@ impl Pipeline {
             return;
         };
         if let Some(status) = hdmi::read_scdc_data(aux, &stream).await {
+            let pattern = self.dig.tmds_clock_pattern().ok();
             use core::fmt::Write as _;
             let _ = writeln!(
                 narf_console::Writer,
-                "amdgpu: navi22 HDMI {} kHz {} bpc{} SCDC TMDS_Config {:#x} scrambler {:?} flags {:?} phase={phase}",
+                "amdgpu: navi22 HDMI {} kHz {} bpc{} SCDC TMDS_Config {:#x} scrambler {:?} flags {:?} clock_pattern={pattern:x?} phase={phase}",
                 stream.character_khz,
                 stream.format.depth.bpc(),
                 if stream.format.encoding.is_420() { " 4:2:0" } else { "" },
@@ -2066,6 +2071,51 @@ impl Aux for NoAux {
 /// KMS hooks (amdgpu_navi22_kms / amdgpu_navi22_scanout).
 impl Pipeline {
     /// Ask `enable` for exactly this timing (None: the sink's preferred).
+    /// The fixed/variable timing and AMD SPD are committed together by the
+    /// retained stream owner; this never reinitializes a working PHY.
+    pub async fn configure_hdmi_vrr(
+        &mut self,
+        caps: Option<crate::amdgpu_freesync::AmdVsdb>,
+        enabled: bool,
+    ) -> Result<Option<crate::amdgpu_freesync::Drr>, Error> {
+        use crate::amdgpu_freesync::{self as fs, HdmiState};
+        if self.state != State::At(Step::Running) || self.connector.signal != Signal::Hdmi {
+            return Err(Error::Invalid);
+        }
+        let timing = self.output.ok_or(Error::Invalid)?.timing;
+        let usable = caps.filter(|c| {
+            c.range().is_some_and(|r| {
+                fs::hdmi_info_packet(&timing, r, c.version, HdmiState::Disabled).is_some()
+            })
+        });
+        let range = usable.and_then(|c| c.range());
+        let bounds = range.filter(|_| enabled).and_then(|r| fs::drr(&timing, r));
+        if self.hdmi_vrr == Some((usable, enabled)) {
+            return Ok(bounds);
+        }
+        let mut stream = self.hdmi.ok_or(Error::Invalid)?;
+        stream.spd = usable
+            .and_then(|c| {
+                fs::hdmi_info_packet(
+                    &timing,
+                    c.range()?,
+                    c.version,
+                    if enabled {
+                        HdmiState::Variable
+                    } else {
+                        HdmiState::Disabled
+                    },
+                )
+            })
+            .map(|p| p.bytes());
+        self.otg.configure_dcn30_drr(bounds)?;
+        if usable.is_some() || self.hdmi_vrr.is_some_and(|(c, _)| c.is_some()) {
+            self.dig.hdmi_info_packets(&stream).await?;
+        }
+        self.hdmi = Some(stream);
+        self.hdmi_vrr = Some((usable, enabled));
+        Ok(bounds)
+    }
     /// Metadata-only updates do not blank or retrain TMDS. Format/depth and
     /// HDR enable/disable transitions still go through normal modesetting.
     pub async fn update_hdmi_metadata(

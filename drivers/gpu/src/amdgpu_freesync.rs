@@ -46,6 +46,26 @@ impl AmdVsdb {
     }
 }
 
+/// The first declared CTA extension, validated before an optional firmware
+/// query. An ordinary HDMI sink without AMD's VSDB needs no mailbox traffic.
+/// This only recognizes the candidate OUI; firmware still authenticates and
+/// decodes the FreeSync capabilities (amdgpu_dm's parse_hdmi_amd_vsdb).
+pub(crate) fn hdmi_amd_vsdb_cea(edid: &[u8]) -> Option<&[u8]> {
+    use narf_edid::cta861::{CtaExtension, DataBlock};
+    let base = edid.get(..128)?;
+    let cta = edid
+        .chunks_exact(128)
+        .skip(1)
+        .take(usize::from(base[126]))
+        .find(|b| b[0] == 2)?;
+    let parsed = CtaExtension::parse(cta).ok()?;
+    parsed
+        .data_blocks
+        .iter()
+        .any(|b| matches!(b, DataBlock::Vendor(v) if v.oui == [0x1a, 0, 0]))
+        .then_some(cta)
+}
+
 /// amdgpu_dm's DisplayID dynamic-video-timing-range fallback. Linux
 /// searches the first declared DisplayID extension; use only bounds that
 /// fit inside that actual block and accept revision0/1, length9 as it does.
@@ -335,6 +355,65 @@ pub fn info_packet(
         .hb
         .iter()
         .chain(&packet.sb[1..=payload])
+        .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+    packet.sb[0] = 0u8.wrapping_sub(sum);
+    Some(packet)
+}
+
+/// FreeSync state as signaled by the AMD SPD (the ordinary desktop path
+/// does not assert FreeSync2 native-color or application-transfer flags).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HdmiState {
+    Disabled,
+    Inactive,
+    Variable,
+}
+
+/// Versioned AMD HDMI SPD. V1/V2 have eight-bit rates; V3 carries rates up
+/// to 1023 Hz. Never silently truncate a rate the selected packet cannot
+/// represent. See freesync.c build_vrr_infopacket_{header,data}_v1/v2/v3.
+pub fn hdmi_info_packet(
+    t: &Timing,
+    range: VrrRange,
+    version: u16,
+    state: HdmiState,
+) -> Option<crate::amdgpu_hdr::InfoPacket> {
+    let (min_uhz, max_uhz) = effective_range(t, range)?;
+    let (min, max) = (
+        (min_uhz + 500_000) / 1_000_000,
+        (max_uhz + 500_000) / 1_000_000,
+    );
+    let (version, length, rate_limit) = match version {
+        1 => (1, 8, 255),
+        2 => (2, 9, 255),
+        3 => (3, 16, 1023),
+        _ => return None,
+    };
+    if max > rate_limit || min > rate_limit {
+        return None;
+    }
+    let mut packet = info_packet(t, range, true, state == HdmiState::Variable)?;
+    packet.hb = [0x83, version, length, 0];
+    packet.sb[6] = match state {
+        HdmiState::Disabled => 1,
+        HdmiState::Inactive => 3,
+        HdmiState::Variable => 7,
+    };
+    let min = if state == HdmiState::Variable || version == 3 && state == HdmiState::Inactive {
+        min
+    } else {
+        max
+    };
+    packet.sb[7] = min as u8;
+    packet.sb[8] = max as u8;
+    if version == 3 {
+        packet.sb[11] = (min >> 8) as u8 & 3;
+        packet.sb[12] = (max >> 8) as u8 & 3;
+    }
+    let sum = packet
+        .hb
+        .iter()
+        .chain(&packet.sb[1..=usize::from(length)])
         .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
     packet.sb[0] = 0u8.wrapping_sub(sum);
     Some(packet)

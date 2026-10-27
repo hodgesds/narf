@@ -11,7 +11,7 @@ struct Fake {
 impl Fake {
     fn new() -> Self {
         Self {
-            values: vec![0; LAST_REG as usize + 1],
+            values: vec![0; (LAST_REG as usize + 1).max(0x39ee)],
             writes: Vec::new(),
             busy: false,
             gone: false,
@@ -40,6 +40,9 @@ fn engine(instance: u8) -> Engine<Fake> {
         instance,
         state: State::Idle,
         profile: Profile::Dcn314,
+        timing: None,
+        drr: None,
+        drr_dirty: false,
     }
 }
 fn timing() -> Timing {
@@ -372,4 +375,99 @@ fn otg_progressive_timing_clears_inherited_interlace() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn-otg",
     otg_progressive_timing_clears_inherited_interlace
+);
+
+fn dcn30_otg_new_fixed_timing_retires_inherited_drr_triggers() -> TestResult {
+    let mut e = engine(0);
+    e.profile = Profile::Navi22;
+    // Firmware can leave min/max/MID event selection and manual-trigger
+    // routing live even though this new owner initially wants fixed refresh.
+    e.io.values[0x1b33] = 0xffff_ffbf;
+    e.io.values[0x1b32] = 0x1234;
+    e.io.values[0x1b39] = 0x1234;
+    e.io.values[0x1b82] = 0x0002_0800;
+    if e.program_timing(&timing(), &sync()).is_err()
+        || e.io.values[0x1b33] & 0xffff_ff9f != 0
+        || e.io.values[0x1b32] != 0
+        || e.io.values[0x1b39] != 0
+        || e.io.values[0x1b82] & 0x800 != 0
+    {
+        return TestResult::Fail("fixed timing inherited DRR event, MID or TRIGA state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-otg",
+    dcn30_otg_new_fixed_timing_retires_inherited_drr_triggers
+);
+
+fn dcn30_otg_drr_bounds_manual_trigger_and_fixed_restore() -> TestResult {
+    use crate::amdgpu_freesync::Drr;
+    let mut e = engine(1);
+    e.profile = Profile::Navi22;
+    if e.program_timing(&timing(), &sync()).is_err() {
+        return TestResult::Fail("DRR timing setup");
+    }
+    e.state = State::Running;
+    let base = OTG_STRIDE as usize;
+    e.io.values[base + 0x1b82] = 0x0100_0400;
+    let bounds = Drr {
+        v_total_min: 1125,
+        v_total_max: 1688,
+    };
+    let start = e.io.writes.len();
+    if e.configure_dcn30_drr(Some(bounds)) != Ok(Some(bounds))
+        || e.io.values[base + 0x1b31] != 1687
+        || e.io.values[base + 0x1b30] != 1124
+        || e.io.values[base + 0x1b33] & 0xffff_ff9f != 0x0002_0003
+        || e.io.values[base + 0x1b39] != 0x8001_0035
+        || e.io.values[base + 0x1b82] & 0xd1ff_ffff != 0x0002_0800
+        || e.io.writes[start].0 != 0x1bb1
+        || e.io.writes[start + 1].0 != 0x1bb0
+    {
+        return TestResult::Fail(
+            "DRR totals, TRIGA routing, static-screen state or register order",
+        );
+    }
+    let writes = e.io.writes.len();
+    if e.configure_dcn30_drr(Some(bounds)).is_err() || e.io.writes.len() != writes {
+        return TestResult::Fail("unchanged DRR reprogrammed");
+    }
+    for bad in [
+        Drr {
+            v_total_min: 1124,
+            ..bounds
+        },
+        Drr {
+            v_total_min: 1689,
+            ..bounds
+        },
+        Drr {
+            v_total_max: 32768,
+            ..bounds
+        },
+    ] {
+        if e.configure_dcn30_drr(Some(bad)) != Err(Error::Invalid) || e.io.writes.len() != writes {
+            return TestResult::Fail("invalid DRR wrote hardware");
+        }
+    }
+    if e.configure_dcn30_drr(None) != Ok(None)
+        || e.io.values[base + 0x1b31] != 1124
+        || e.io.values[base + 0x1b33] & 0xffff_ff9f != 0
+        || e.io.values[base + 0x1b39] != 0
+        || e.io.values[base + 0x1b82] & 0xd1ff_ffff != 0x0100_0400
+    {
+        return TestResult::Fail("fixed refresh did not restore totals and static-screen state");
+    }
+    e.profile = Profile::Dcn314;
+    let writes = e.io.writes.len();
+    if e.configure_dcn30_drr(Some(bounds)) != Err(Error::Unsupported) || e.io.writes.len() != writes
+    {
+        return TestResult::Fail("DRR used an unverified register layout");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-otg",
+    dcn30_otg_drr_bounds_manual_trigger_and_fixed_restore
 );

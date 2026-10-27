@@ -532,3 +532,89 @@ kernel_test_in!(
     "drivers/gpu/dcn30-hdmi",
     dcn30_hdmi_modeset_y422_hdr_and_live_metadata_update
 );
+
+fn dcn30_hdmi_freesync_timing_packet_and_metadata_share_one_live_stream() -> TestResult {
+    use crate::amdgpu_dcn30_hdmi::OutputSettings;
+    use crate::amdgpu_freesync::AmdVsdb;
+    use crate::amdgpu_hdr::{HdrMetadataInfoframe, HdrOutputMetadata};
+    let vram = Vram::new(8 << 20);
+    let settings = OutputSettings {
+        max_bpc: 8,
+        hdr: Some(HdrOutputMetadata {
+            hdmi_metadata_type1: HdrMetadataInfoframe {
+                eotf: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let e = edid(DTD_720P, &[vsdb(0, 68)]);
+    let mut lit = match light_config(e, settings, &vram, |_| {}) {
+        Ok(l) => l,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let caps = AmdVsdb {
+        version: 1,
+        min_hz: 40,
+        max_hz: 75,
+        vcp_code: 0,
+    };
+    let bounds = match run(lit.pipeline.configure_hdmi_vrr(Some(caps), true)) {
+        Ok(Some(bounds)) => bounds,
+        _ => return TestResult::Fail("FreeSync enable"),
+    };
+    if bounds.v_total_min != 750
+        || bounds.v_total_max != 1125
+        || lit.bench.get(d2(0x1b31 + lit.pipe * 0x80)) != 1124
+        || lit.bench.get(d2(0x1b33 + lit.pipe * 0x80)) & 0xffff_ff9f != 0x0002_0003
+        || lit
+            .pipeline
+            .hdmi_output()
+            .and_then(|s| s.spd)
+            .is_none_or(|p| p[10] != 7 || p[11] != 40 || p[12] != 60)
+    {
+        return TestResult::Fail("FreeSync timing/packet range disagreement");
+    }
+    let mut metadata = settings;
+    metadata.hdr.as_mut().unwrap().hdmi_metadata_type1.max_cll = 1000;
+    if run(lit.pipeline.update_hdmi_metadata(metadata)).is_err()
+        || lit
+            .pipeline
+            .hdmi_output()
+            .and_then(|s| s.spd)
+            .is_none_or(|p| p[10] != 7)
+    {
+        return TestResult::Fail("HDR update retired active FreeSync SPD");
+    }
+    if run(lit.pipeline.configure_hdmi_vrr(Some(caps), false)) != Ok(None)
+        || lit.bench.get(d2(0x1b31 + lit.pipe * 0x80)) != 749
+        || lit.bench.get(d2(0x1b33 + lit.pipe * 0x80)) & 0xffff_ff9f != 0
+        || lit
+            .pipeline
+            .hdmi_output()
+            .and_then(|s| s.spd)
+            .is_none_or(|p| p[10] != 1 || p[11] != 60)
+    {
+        return TestResult::Fail("FreeSync disable left variable timing or enabled packet flags");
+    }
+    let writes = lit.bench.writes();
+    if run(lit.pipeline.configure_hdmi_vrr(Some(caps), false)).is_err()
+        || lit.bench.writes() != writes
+    {
+        return TestResult::Fail("unchanged FreeSync state reprogrammed hardware");
+    }
+    if run(lit.pipeline.configure_hdmi_vrr(None, false)).is_err()
+        || lit.pipeline.hdmi_output().and_then(|s| s.spd).is_some()
+    {
+        return TestResult::Fail("departed FreeSync capability kept vendor SPD");
+    }
+    if let Err(why) = stop(&mut lit) {
+        return TestResult::Fail(why);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi",
+    dcn30_hdmi_freesync_timing_packet_and_metadata_share_one_live_stream
+);

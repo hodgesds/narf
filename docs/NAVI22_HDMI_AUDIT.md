@@ -105,7 +105,7 @@ updates, model sink configuration loss, and enforce the recovery budget and
 poll cadence. Evidence is in `target/host-narf/hdmi-complete-20261026/`.
 
 This work targets the selected Navi22/DCN3.0 TMDS path. It does not claim
-HDMI certification, FRL, HDCP, CEC, exposed Navi22 VRR controls, or native
+HDMI certification, FRL, HDCP, CEC, or native
 Mesa 3D acceptance from register-model success. Physical visible-output
 acceptance remains separate.
 
@@ -150,5 +150,50 @@ refuses unsupported explicit encodings rather than changing them silently.
 
 These controls signal output metadata; they do not perform tone mapping or
 add high-precision framebuffer input to the current 8888 copy presenter.
-Physical HDMI acceptance and native 3D remain unverified. VRR, FRL, HDCP and
-CEC are separate remaining features, not implied by InfoFrame publication.
+Physical HDMI acceptance and native 3D remain unverified. FRL, HDCP and
+CEC remain unsupported.
+
+## FreeSync and link-loss follow-up — 2026-10-27
+
+The native HDMI path now queries firmware's AMD vendor-block decoder only
+for a valid first CTA extension containing AMD's OUI. The serialized DMUB
+command, reply offsets, cancellation and missing optional support are covered
+by Rust models. Capabilities are cached by full EDID; firmware-owned fields
+are not inferred from an unauthenticated software range parser.
+
+The comparison against `optc1_set_drr`, `optc2_setup_manual_trigger`,
+`optc1_set_static_screen_control`, `mod_freesync_build_vrr_infopacket` and
+`dm_edid_parser_send_cea` connects the native VRR controls to DCN3.0 totals,
+TRIGA/static-screen control, flip-trigger strobes and versioned AMD SPD.
+HDR-only updates preserve the FreeSync packet. Fixed-mode startup clears
+inherited DRR selectors and MID state. Variable-refresh position sampling
+includes the completed total inside its frame-counter consistency check;
+vblank reporting does not invent nominal frames when hardware is busy.
+LFC and dynamic multi-stream rendering remain outside this implementation.
+
+The physical `guest-TFRvPJOz` run reached backed 4K SETCRTC, but both settled
+SCDC samples showed scrambler 1 and flags 1: a detected clock without channel
+locks. The monitor spent its one automatic relight and reported `Faulted`.
+It now continues low-rate observation after that report, and distinguishes a
+later `Recovered` lock without authorizing more resets. Reports include the
+actual health classification.
+
+Linux enc3's software stream-setup fallback replaces the reset clock-channel
+pattern 0x63 with 0x1f. NARF now checks that postcondition around firmware
+setup and transmitter enable, repairing only 0x63 or constant zero while
+preserving other patterns. This is a source-derived guard, not a measured
+cause of the failed boot: the VM had exited before its registers could be
+captured. The next bench run captures settled and post-SETCRTC registers
+automatically, including frame counters, clock patterns, DRR and MPC state,
+and saves available working-Linux display state before VFIO takeover.
+
+## Kernel-log feedback
+
+Userspace tty output previously entered the kernel log. Printing `dmesg`
+therefore appended each record back to the source, with an additional
+timestamp on every pass. The shared tty write path now only drives its output
+device. A bounded regression reads a kernel record, prints it to both VT and
+serial ttys, and requires the log to remain drained; it failed on the original
+code. Explicit `/dev/kmsg` injection is retained. This defect can flood logs
+and keep a log consumer running, but does not establish the HDMI failure's
+cause.

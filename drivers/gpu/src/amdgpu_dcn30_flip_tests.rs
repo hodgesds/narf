@@ -245,3 +245,49 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     dcn30_position_samples_a_stable_frame_count
 );
+
+fn dcn30_flip_drr_trigger_follows_surface_address_publication() -> TestResult {
+    let mut e = engine(2);
+    if e.program_flip(0x1_2345_6700).is_err() || e.manual_trigger().is_err() {
+        return TestResult::Fail("DRR flip arm/trigger");
+    }
+    let last = e.io.writes.last().copied();
+    if last != Some((0x1c3a, 1))
+        || e.io
+            .writes
+            .iter()
+            .position(|w| w.0 == PRIMARY_SURFACE_ADDRESS + 2 * HUBP_STRIDE)
+            .is_none_or(|i| i + 1 != e.io.writes.len() - 1)
+    {
+        return TestResult::Fail("manual trigger preceded address or used another pipe");
+    }
+    let writes = e.io.writes.len();
+    e.authority.revoke();
+    if e.manual_trigger() != Err(Error::Revoked) || e.io.writes.len() != writes {
+        return TestResult::Fail("revoked authority triggered DRR");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    dcn30_flip_drr_trigger_follows_surface_address_publication
+);
+
+fn dcn30_flip_samples_last_drr_total_with_position() -> TestResult {
+    let mut e = engine(1);
+    let base = OTG_STRIDE;
+    e.io.values[(base + OTG_STATUS_FRAME_COUNT) as usize] = 7;
+    e.io.values[(base + OTG_STATUS_POSITION) as usize] = 1400;
+    e.io.values[(base + OTG_V_BLANK_START_END) as usize] = 1084 | 41 << 16;
+    e.io.values[(base + 0x1b9b) as usize] = 1687 << 16;
+    if e.position_drr().map_or(true, |(p, total)| {
+        p.vpos != 1400 || p.frame != 7 || total != 1688
+    }) {
+        return TestResult::Fail("stretched-frame sample lost hardware total");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    dcn30_flip_samples_last_drr_total_with_position
+);

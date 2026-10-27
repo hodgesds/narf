@@ -55,9 +55,11 @@ pub fn request_display_mode(display: u8, mode: Option<&DrmModeModeInfo>) -> bool
         crate::amdgpu_navi48_platform::request_display_mode(display, mode)
     }
 }
-/// CRTC "VRR_ENABLED". Only Navi48 attaches the property; Navi22 ignores it.
+/// CRTC "VRR_ENABLED" on native AMD display owners.
 pub fn request_vrr_enabled(display: u8, enabled: bool) {
-    if !navi22() {
+    if navi22() {
+        crate::amdgpu_navi22_kms::request_vrr_enabled(display, enabled)
+    } else {
         crate::amdgpu_navi48_platform::request_vrr_enabled(display, enabled)
     }
 }

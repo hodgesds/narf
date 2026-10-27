@@ -805,8 +805,9 @@ fn reconcile_displays(boot: &mut boot::ColdBoot, reports: &[crate::amdgpu_navi22
         });
     {
         let mut kms = crate::amdgpu_navi22_kms::KMS.lock();
-        for connector in &mut kms.connectors {
+        for (index, connector) in kms.connectors.iter_mut().enumerate() {
             connector.hdmi_limits = boot.display_hdmi_limits(&connector.port);
+            connector.vrr = boot.hdmi_vrr_caps(index);
         }
     }
     // What the sinks' HPD looked like at this detection.
@@ -970,7 +971,11 @@ fn note_hpd_pulse(hpd: crate::amdgpu_ih_navi22::Hpd) {
 pub enum MonitorStep {
     /// One automatic relight per connection; subsequent sustained failures
     /// are reported without resetting healthy streams in the same context.
-    HdmiLinkLoss(usize, crate::amdgpu_dcn30_hdmi::LinkAction),
+    HdmiLinkState(
+        usize,
+        crate::amdgpu_dcn30_hdmi::LinkAction,
+        crate::amdgpu_dcn30_hdmi::LinkHealth,
+    ),
     /// The lit sink's HPD fell: withdrawn and torn down without AUX/DDC.
     Unplugged(usize),
     /// A connector's sink appeared, left or was replaced: detected again.
@@ -982,6 +987,50 @@ pub enum MonitorStep {
     RetrainFailed,
     /// The sink asked for an automated test (acknowledged, not run).
     AutomatedTest,
+}
+
+/// Apply live VRR controls under the same owner used for flips. No KMS
+/// guard survives an await. Failure takes the existing safe relight path.
+async fn converge_hdmi_vrr(boot: &mut boot::ColdBoot) {
+    use crate::amdgpu_navi22_kms::{KMS, MAX_CRTCS};
+    let updates: alloc::vec::Vec<_> = {
+        let kms = KMS.lock();
+        (0..MAX_CRTCS)
+            .filter_map(|d| {
+                let crtc = kms.crtc_at(d)?;
+                let shown = crtc.shown.as_ref()?;
+                let n = crtc.route?;
+                let c = kms.connectors.get(n)?;
+                (crtc.active
+                    && crtc.requested.is_none_or(|t| t == shown.1)
+                    && c.port.signal == crate::amdgpu_navi22_display::Signal::Hdmi
+                    && !c.color_relight
+                    && !c.output.needs_modeset(c.shown_output))
+                .then_some((d, n, c.port, c.vrr, crtc.vrr_enabled))
+            })
+            .collect()
+    };
+    for (d, n, port, caps, enabled) in updates {
+        let group = GROUP_CRTCS.lock().iter().position(|&crtc| crtc == d);
+        if group.is_none() && d != 0 {
+            continue;
+        }
+        if boot.configure_hdmi_vrr(group, caps, enabled).await.is_err() {
+            let mut kms = KMS.lock();
+            if let Some(c) = kms.connectors.get_mut(n).filter(|c| c.port == port) {
+                c.color_relight = true;
+                kms.attempted = None;
+                kms.attempted_group = None;
+            }
+        }
+    }
+    let variable = boot.display_scanout_ref().is_some_and(|s| s.vrr_active());
+    if let Some(clock) = VBLANK.lock().as_mut() {
+        if clock.variable != variable {
+            clock.raw = None;
+            clock.variable = variable;
+        }
+    }
 }
 
 /// Metadata updates are serialized with the display owner. A newer request
@@ -1144,8 +1193,8 @@ async unsafe fn monitor_hotplug(
         if action == LinkAction::None {
             return None;
         }
-        if action == LinkAction::Faulted {
-            return Some(Ok(MonitorStep::HdmiLinkLoss(route, action)));
+        if action != LinkAction::Relight {
+            return Some(Ok(MonitorStep::HdmiLinkState(route, action, health)));
         }
         // SAFETY: same withdrawal and CPU-view retirement as other relights.
         let result = unsafe { unlight(boot) }.await;
@@ -1153,7 +1202,7 @@ async unsafe fn monitor_hotplug(
             KMS.lock().attempted = None;
             crate::amdgpu_navi22_kms::wake();
         }
-        return Some(result.map(|()| MonitorStep::HdmiLinkLoss(route, action)));
+        return Some(result.map(|()| MonitorStep::HdmiLinkState(route, action, health)));
     }
     if ports.get(route).map(|c| c.signal) != Some(Signal::DisplayPort) {
         return None;
@@ -1220,6 +1269,7 @@ async unsafe fn monitor_pass() {
         return;
     }
     update_hdmi_metadata(boot).await;
+    converge_hdmi_vrr(boot).await;
     // SAFETY: as below; a lit or wanted multi-stream context owns the pass.
     if unsafe { converge_group(boot, running) }.await {
         return;
@@ -1300,8 +1350,11 @@ async unsafe fn converge_group(
             if action == LinkAction::None {
                 continue;
             }
-            if action == LinkAction::Faulted {
-                let _ = writeln!(narf_console::Writer, "amdgpu: navi22 HDMI {route} {health:?} {action:?}; automatic recovery exhausted");
+            if action != LinkAction::Relight {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi22 HDMI {route} {health:?} {action:?}; link context retained"
+                );
                 continue;
             }
             // SAFETY: OWNER excludes presentation; all group CPU views are
@@ -1585,6 +1638,7 @@ struct VblankClock {
     raw: Option<u32>,
     time: crate::drm::card::VblankTime,
     read_ns: u64,
+    variable: bool,
 }
 static VBLANK: narf_lib::sync::IrqSafeSpinLock<Option<VblankClock>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
@@ -1619,11 +1673,17 @@ fn extend_vblank(
             period_ns: phase.period_ns,
         },
         read_ns,
+        variable: false,
     }
 }
 /// A recent reading carried forward whole periods while the owner is busy.
 fn extrapolate_vblank(clock: VblankClock, now: u64) -> Option<crate::drm::card::VblankTime> {
     let t = clock.time;
+    // Variable refresh has no predictable next period. Carry the last real
+    // counter, including while the owner is busy; never invent vblanks.
+    if clock.variable {
+        return Some(t);
+    }
     if now.saturating_sub(clock.read_ns) > 1_000_000_000 || t.period_ns == 0 {
         return None;
     }
@@ -1637,12 +1697,12 @@ fn extrapolate_vblank(clock: VblankClock, now: u64) -> Option<crate::drm::card::
 }
 fn read_vblank(boot: &mut boot::ColdBoot) -> Option<crate::drm::card::VblankTime> {
     let scanout = boot.display_scanout().ok()?;
-    let timing = scanout.timing();
-    let position = scanout.position().ok()?;
+    let phase = scanout.vblank_phase().ok()?;
+    let variable = scanout.vrr_active();
     let read_ns = narf_time::wall::monotonic_ns();
-    let phase = crate::amdgpu_navi22_scanout::vblank_phase(position, &timing)?;
     let mut clock = VBLANK.lock();
-    let next = extend_vblank(*clock, phase, read_ns);
+    let mut next = extend_vblank(*clock, phase, read_ns);
+    next.variable = variable;
     *clock = Some(next);
     Some(next.time)
 }
@@ -2145,5 +2205,31 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi22",
         navi22_long_pulse_same_edid_keeps_the_stream
+    );
+    fn navi22_variable_refresh_never_extrapolates_hardware_vblanks() -> TestResult {
+        let phase = crate::amdgpu_dcn401_otg::VblankPhase {
+            count: 7,
+            start_ns: -2_000_000,
+            end_ns: 0,
+            period_ns: 16_666_666,
+        };
+        let mut clock = extend_vblank(None, phase, 100_000_000);
+        clock.variable = true;
+        if extrapolate_vblank(clock, 150_000_000) != Some(clock.time)
+            || extrapolate_vblank(clock, 2_000_000_000) != Some(clock.time)
+        {
+            return TestResult::Fail(
+                "variable refresh invented unobserved vblanks while owner busy",
+            );
+        }
+        clock.variable = false;
+        if extrapolate_vblank(clock, 150_000_000).is_none_or(|t| t.count <= clock.time.count) {
+            return TestResult::Fail("fixed-rate fallback stopped extrapolating");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi22",
+        navi22_variable_refresh_never_extrapolates_hardware_vblanks
     );
 }

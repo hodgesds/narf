@@ -234,6 +234,15 @@ fn navi22_kms_publication_excludes_rdna4_only_planes_and_modifiers() -> TestResu
             "republication changed the DCN30 plane ABI or committed output state",
         );
     }
+    apply_card_vrr(&mut card, &crtcs, &connectors, Some(&[true]));
+    if card.native[0].vrr_capable != Some(true) || card.vrr_enabled != [(1, false)] {
+        return TestResult::Fail("VRR properties absent");
+    }
+    card.vrr_enabled[0].1 = true;
+    apply_card_vrr(&mut card, &crtcs, &connectors, Some(&[false]));
+    if card.native[0].vrr_capable != Some(false) || card.vrr_enabled != [(1, true)] {
+        return TestResult::Fail("VRR republication lost committed CRTC request");
+    }
     TestResult::Pass
 }
 kernel_test_in!(

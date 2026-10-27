@@ -68,7 +68,11 @@ impl<'a> InfoPackets<'a> {
                 // AVI versions emitted by the admitted TMDS producers.
                 0 => len == 13 && (2..=3).contains(&p[1]),
                 1 | 5 => (3..=27).contains(&len) && p[1] == 1,
-                3 => len == 25 && p[1] == 1,
+                3 => {
+                    (len == 25 && p[1] == 1)
+                        || (p[5..8] == [0x1a, 0, 0]
+                            && matches!((p[1], len), (1, 8) | (2, 9) | (3, 16)))
+                }
                 4 => len == 26 && p[1] == 1,
                 _ => false,
             };

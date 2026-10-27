@@ -356,6 +356,11 @@ impl<B: Backend> Sequence<B> {
     }
 }
 #[derive(Debug)]
+struct HdmiVrrCache {
+    edid: alloc::vec::Vec<u8>,
+    caps: Option<crate::amdgpu_freesync::AmdVsdb>,
+}
+#[derive(Debug)]
 struct Hardware {
     // Private immutable register/identity snapshot; physical authority still
     // belongs exclusively to ColdBoot. No controller guard spans an await.
@@ -380,6 +385,7 @@ struct Hardware {
     /// DCN3.0 Linux never routes AUX/HPD through DMUB; only an explicit
     /// opt-in plus a firmware capability reply re-enables that transport.
     dmub_aux: bool,
+    hdmi_vrr: alloc::vec::Vec<Option<HdmiVrrCache>>,
     /// VBIOS copy and crystal for the native modeset, and its retained owner.
     display_bios: Option<(alloc::vec::Vec<u8>, u32)>,
     modeset: Option<crate::amdgpu_navi22_modeset::Pipeline>,
@@ -1121,6 +1127,7 @@ impl ColdBoot {
                     dmub: None,
                     display: None,
                     dmub_aux: false,
+                    hdmi_vrr: alloc::vec::Vec::new(),
                     display_bios: None,
                     modeset: None,
                     scanout: None,
@@ -1185,6 +1192,7 @@ impl ColdBoot {
                     dmub: None,
                     display: None,
                     dmub_aux: false,
+                    hdmi_vrr: alloc::vec::Vec::new(),
                     display_bios: None,
                     modeset: None,
                     scanout: None,
@@ -1437,10 +1445,15 @@ impl ColdBoot {
     pub async fn detect_displays(
         &mut self,
     ) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_display::Report>, Error> {
-        self.display_mut()?
+        let reports = self
+            .display_mut()?
             .detect_all()
             .await
-            .map_err(Error::Display)
+            .map_err(Error::Display)?;
+        for (index, report) in reports.iter().enumerate() {
+            self.refresh_hdmi_vrr(index, &report.detection).await;
+        }
+        Ok(reports)
     }
     /// Detect one board connector (the sink read of `dc_link_detect`).
     /// Reads the sink only; no stream or scanout is changed.
@@ -1448,10 +1461,60 @@ impl ColdBoot {
         &mut self,
         index: usize,
     ) -> Result<crate::amdgpu_navi22_display::Detection, Error> {
-        self.display_mut()?
+        let detection = self
+            .display_mut()?
             .detect(index)
             .await
-            .map_err(Error::Display)
+            .map_err(Error::Display)?;
+        self.refresh_hdmi_vrr(index, &detection).await;
+        Ok(detection)
+    }
+    /// Query at most once for an unchanged HDMI EDID. Capabilities remain
+    /// unavailable if optional firmware parsing is absent or fails; ordinary
+    /// sinks without an AMD VSDB cause no extra mailbox traffic.
+    async fn refresh_hdmi_vrr(
+        &mut self,
+        index: usize,
+        detection: &crate::amdgpu_navi22_display::Detection,
+    ) {
+        use crate::amdgpu_navi22_display::{Detection, Signal};
+        let h = &mut self.sequence.backend;
+        let hdmi = h
+            .display
+            .as_ref()
+            .and_then(|d| d.connectors().get(index))
+            .is_some_and(|c| c.signal == Signal::Hdmi);
+        if index >= 6 {
+            return;
+        }
+        if h.hdmi_vrr.len() <= index {
+            h.hdmi_vrr.resize_with(index + 1, || None);
+        }
+        let Detection::Connected(sink) = detection else {
+            h.hdmi_vrr[index] = None;
+            return;
+        };
+        if !hdmi {
+            h.hdmi_vrr[index] = None;
+            return;
+        }
+        if h.hdmi_vrr[index]
+            .as_ref()
+            .is_some_and(|c| c.edid == sink.edid)
+        {
+            return;
+        }
+        let caps = match h.dmub.as_mut().filter(|d| d.vbios_ready()) {
+            Some(dmub) => dmub.hdmi_freesync_caps(&sink.edid).await.ok().flatten(),
+            None => None,
+        };
+        h.hdmi_vrr[index] = Some(HdmiVrrCache {
+            edid: sink.edid.clone(),
+            caps,
+        });
+    }
+    pub fn hdmi_vrr_caps(&self, index: usize) -> Option<crate::amdgpu_freesync::AmdVsdb> {
+        self.sequence.backend.hdmi_vrr.get(index)?.as_ref()?.caps
     }
     fn display_mut(&mut self) -> Result<&mut crate::amdgpu_navi22_display::Display, Error> {
         if !matches!(self.sequence.state, State::FirmwareReady(_)) {
@@ -2240,7 +2303,41 @@ impl ColdBoot {
     pub fn display_scanout_ref(&self) -> Option<&crate::amdgpu_navi22_scanout::Scanout> {
         self.sequence.backend.scanout.as_ref()
     }
-    /// The DCN30 admission of the lit (or last attempted) sink.
+    /// Configure FreeSync on an owned running HDMI stream and its flip
+    /// service. Both are serialized by the platform owner over this await.
+    pub async fn configure_hdmi_vrr(
+        &mut self,
+        group_stream: Option<usize>,
+        caps: Option<crate::amdgpu_freesync::AmdVsdb>,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        let h = &mut self.sequence.backend;
+        match group_stream {
+            Some(k) => {
+                h.group
+                    .as_mut()
+                    .ok_or(Error::Invalid)?
+                    .configure_hdmi_vrr(k, caps, enabled)
+                    .await
+                    .map_err(Error::Modeset)?;
+            }
+            None => {
+                let bounds = h
+                    .modeset
+                    .as_mut()
+                    .ok_or(Error::Invalid)?
+                    .configure_hdmi_vrr(caps, enabled)
+                    .await
+                    .map_err(Error::Modeset)?;
+                h.scanout
+                    .as_mut()
+                    .ok_or(Error::Invalid)?
+                    .configure_vrr(bounds)
+                    .map_err(|e| Error::Modeset(crate::amdgpu_navi22_modeset::Error::Block(e)))?;
+            }
+        }
+        Ok(())
+    }
     /// Packet-only update on a running stream (group member or single).
     pub async fn update_hdmi_metadata(
         &mut self,

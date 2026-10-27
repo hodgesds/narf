@@ -61,6 +61,8 @@ const VPG_GENERIC_STATUS: u64 = 0x206c;
 // DIG frontend.
 // linux: mmDIG0_DIG_FE_CNTL
 const DIG_FE_CNTL: u64 = 0x208b;
+// linux: mmDIG0_DIG_CLOCK_PATTERN
+const DIG_CLOCK_PATTERN: u64 = 0x208e;
 // linux: mmDIG0_HDMI_CONTROL
 const HDMI_CONTROL: u64 = 0x2093;
 // linux: mmDIG0_HDMI_VBI_PACKET_CONTROL
@@ -330,6 +332,8 @@ pub struct Stream {
     pub vendor: Option<[u8; 36]>,
     /// Static HDR metadata in the same admitted packet set as AVI.
     pub hdr: Option<[u8; 36]>,
+    /// AMD FreeSync SPD, replacing desktop identification while supported.
+    pub spd: Option<[u8; 36]>,
 }
 
 /// HF-VSDB/HF-SCDB LTE_340Mcsc_scramble, as DRM's
@@ -498,6 +502,7 @@ pub fn stream_with_settings(
         avi: caps
             .hdmi
             .then(|| crate::amdgpu_dcn401_otg::avi_infoframe_in(t, avi, colorspace, encoding)),
+        spd: None,
         hdr: settings.hdr.as_ref().map(|h| {
             crate::amdgpu_hdr::hdr_info_packet(Some(h), crate::amdgpu_hdr::HdrConnector::Hdmi)
                 .bytes()
@@ -784,6 +789,21 @@ impl<I: Io> Engine<I> {
         self.update(self.fe(HDMI_VBI_PACKET_CONTROL), HDMI_ACP_SEND, 0)?;
         self.update(self.fe(HDMI_GC), HDMI_GC_AVMUTE, 0)
     }
+    pub(crate) fn tmds_clock_pattern(&mut self) -> Result<u32, Error> {
+        // linux: DIG0_DIG_CLOCK_PATTERN__DIG_CLOCK_PATTERN_MASK
+        self.read(self.fe(DIG_CLOCK_PATTERN)).map(|v| v & 0x3ff)
+    }
+    /// enc3's software setup explicitly replaces reset pattern 0x63 with
+    /// 0x1f. Check the same postcondition around firmware setup: preserve a
+    /// configured non-reset pattern, but never send reset/constant clocks.
+    pub(crate) fn retire_reset_clock_pattern(&mut self) -> Result<Option<u32>, Error> {
+        let old = self.tmds_clock_pattern()?;
+        if old != 0 && old != 0x63 {
+            return Ok(None);
+        }
+        self.update(self.fe(DIG_CLOCK_PATTERN), 0x3ff, 0x1f)?;
+        Ok(Some(old))
+    }
     /// `vpg3_update_generic_info_packet(index, packet, immediate)`.
     async fn vpg_packet(&mut self, index: u32, packet: &[u8; 36]) -> Result<(), Error> {
         let status = self.fe(VPG_GENERIC_STATUS);
@@ -961,6 +981,20 @@ impl Hdmi {
         self.0
             .hdmi_stream_attribute(stream.format, stream.character_khz, stream.scramble)
     }
+    pub fn tmds_clock_pattern(&mut self) -> Result<u32, Error> {
+        self.0.tmds_clock_pattern()
+    }
+    pub fn retire_reset_clock_pattern(&mut self) -> Result<(), Error> {
+        if let Some(old) = self.0.retire_reset_clock_pattern()? {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 DIG {} TMDS clock pattern {old:#x} -> 0x1f",
+                self.0.dig
+            );
+        }
+        Ok(())
+    }
     pub async fn info_packets(&mut self, avi: &[u8; 36]) -> Result<(), Error> {
         self.0.info_packets(avi).await
     }
@@ -969,6 +1003,9 @@ impl Hdmi {
         let avi = stream.avi.as_ref().ok_or(Error::Invalid)?;
         let mut packets = InfoPackets::desktop(avi, stream.vendor.as_ref());
         packets.hdr = stream.hdr.as_ref();
+        if let Some(spd) = stream.spd.as_ref() {
+            packets.spd = Some(spd);
+        }
         self.0.program_info_packets(&packets).await
     }
     /// Validate the complete set before programming packet producers. The

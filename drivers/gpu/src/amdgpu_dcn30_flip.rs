@@ -47,7 +47,7 @@ pub(crate) const OTG_GLOBAL_SYNC_STATUS: u64 = 0x1b8a; // linux: mmOTG0_OTG_GLOB
 pub(crate) const OTG_STRIDE: u64 = 0x80; // linux: mmOTG1_OTG_CONTROL - mmOTG0_OTG_CONTROL
 #[cfg(feature = "kernel-test")]
 // linux: n/a (NARF test bound)
-pub(crate) const LAST_REG: u64 = OTG_GLOBAL_SYNC_STATUS + 5 * OTG_STRIDE;
+pub(crate) const LAST_REG: u64 = 0x1b9b + 5 * OTG_STRIDE;
 // linux-ctx: reset
 
 const VMID_MASK: u32 = 0xf; // linux: HUBPREQ0_VMID_SETTINGS_0__VMID_MASK
@@ -182,6 +182,13 @@ impl<I: Io> Engine<I> {
         self.requested = Some(address);
         Ok(())
     }
+    /// optc2_program_manual_trigger, after the new address is armed. This
+    /// write strobe is never read back; the active DRR owner routes TRIGA.
+    pub(crate) fn manual_trigger(&mut self) -> Result<(), Error> {
+        // linux-lit: 0x1b3a=mmOTG0_OTG_TRIGA_MANUAL_TRIG
+        let reg = self.otg(0x1b3a);
+        self.access(|io| io.write(reg, 1))
+    }
     /// `hubp2_is_flip_pending` against the last requested surface.
     pub(crate) fn pending(&mut self) -> Result<bool, Error> {
         let requested = self.requested.ok_or(Error::Invalid)?;
@@ -243,21 +250,38 @@ impl<I: Io> Engine<I> {
     /// One position sample whose frame count did not change across the
     /// position read (at most four tries, as a line wrap cannot repeat).
     pub(crate) fn position(&mut self) -> Result<Position, Error> {
+        self.position_sample(false).map(|(position, _)| position)
+    }
+    pub(crate) fn position_drr(&mut self) -> Result<(Position, u32), Error> {
+        self.position_sample(true)
+    }
+    fn position_sample(&mut self, drr: bool) -> Result<(Position, u32), Error> {
         let blank = self.read(self.otg(OTG_V_BLANK_START_END))?;
         for _ in 0..4 {
             let before = self.read(self.otg(OTG_STATUS_FRAME_COUNT))? & FRAME_MASK;
             let position = self.read(self.otg(OTG_STATUS_POSITION))?;
+            // Sample the completed DRR total inside the frame-count check.
+            // linux-lit: 0x1b9b=mmOTG0_OTG_DRR_CONTROL
+            // linux-lit: 0x7fff0000=OTG0_OTG_DRR_CONTROL__OTG_V_TOTAL_LAST_USED_BY_DRR_MASK
+            let total = if drr {
+                (self.read(self.otg(0x1b9b))? >> 16 & 0x7fff) + 1
+            } else {
+                0
+            };
             let after = self.read(self.otg(OTG_STATUS_FRAME_COUNT))? & FRAME_MASK;
             if before == after {
-                return Ok(Position {
-                    frame: after,
-                    vpos: position & COUNT_MASK,
-                    // linux-lit: 16=OTG0_OTG_STATUS_POSITION__OTG_HORZ_COUNT__SHIFT
-                    hpos: position >> 16 & COUNT_MASK,
-                    vblank_start: blank & COUNT_MASK,
-                    // linux-lit: 16=OTG0_OTG_V_BLANK_START_END__OTG_V_BLANK_END__SHIFT
-                    vblank_end: blank >> 16 & COUNT_MASK,
-                });
+                return Ok((
+                    Position {
+                        frame: after,
+                        vpos: position & COUNT_MASK,
+                        // linux-lit: 16=OTG0_OTG_STATUS_POSITION__OTG_HORZ_COUNT__SHIFT
+                        hpos: position >> 16 & COUNT_MASK,
+                        vblank_start: blank & COUNT_MASK,
+                        // linux-lit: 16=OTG0_OTG_V_BLANK_START_END__OTG_V_BLANK_END__SHIFT
+                        vblank_end: blank >> 16 & COUNT_MASK,
+                    },
+                    total,
+                ));
             }
         }
         Err(Error::Busy)
@@ -323,7 +347,7 @@ impl Flip {
         if !profile.is_dcn30() || pipe >= profile.pipes() {
             return Err(Error::Unsupported);
         }
-        let last = OTG_GLOBAL_SYNC_STATUS + u64::from(profile.pipes() - 1) * OTG_STRIDE;
+        let last = 0x1b9b + u64::from(profile.pipes() - 1) * OTG_STRIDE; // linux-lit: 0x1b9b=mmOTG0_OTG_DRR_CONTROL
         let base = profile.bank(gpu, 2, last as u32)?;
         Ok(Self(Engine {
             io: Mmio {
@@ -337,6 +361,15 @@ impl Flip {
     }
     pub fn pipe(&self) -> u8 {
         self.0.pipe
+    }
+    /// Position and last completed DRR total sampled in the same frame.
+    pub fn position_drr(&mut self) -> Result<(Position, u32), Error> {
+        self.0.position_drr()
+    }
+    /// End a stretched blank after publishing a new surface. Only the
+    /// display owner's VRR-enabled flip service calls this strobe.
+    pub fn manual_trigger(&mut self) -> Result<(), Error> {
+        self.0.manual_trigger()
     }
     /// The surface the activation programmed; flips compare against it.
     pub fn adopt(&mut self, address: u64) {

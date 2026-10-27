@@ -57,6 +57,7 @@ pub struct ConnectorState {
     pub shown_output: OutputSettings,
     pub hdmi_limits: Limits,
     pub color_relight: bool,
+    pub vrr: Option<crate::amdgpu_freesync::AmdVsdb>,
 }
 impl ConnectorState {
     /// Whether the single-pipe owner can drive this connector (HDMI, or
@@ -79,6 +80,7 @@ pub struct CrtcState {
     pub route: Option<usize>,
     /// DRM chose the route; automatic routing leaves it.
     pub explicit: bool,
+    pub vrr_enabled: bool,
 }
 impl CrtcState {
     pub const fn new() -> Self {
@@ -88,6 +90,7 @@ impl CrtcState {
             shown: None,
             route: None,
             explicit: false,
+            vrr_enabled: false,
         }
     }
 }
@@ -201,6 +204,7 @@ impl Kms {
                     .iter()
                     .find(|o| o.port == report.connector && o.edid == edid)
                     .map_or_else(OutputSettings::default, |o| o.shown_output),
+                vrr: None,
                 color_relight: old
                     .iter()
                     .find(|o| o.port == report.connector && o.edid == edid)
@@ -532,8 +536,27 @@ pub fn publish() {
             possible_crtcs: (1 << MAX_CRTCS) - 1,
         })
         .collect();
+    let vrr: Vec<bool> = inventory
+        .iter()
+        .map(|c| {
+            c.present
+                && c.vrr.is_some_and(|caps| {
+                    caps.range().is_some_and(|range| {
+                        c.modes.iter().any(|t| {
+                            crate::amdgpu_freesync::hdmi_info_packet(
+                                t,
+                                range,
+                                caps.version,
+                                crate::amdgpu_freesync::HdmiState::Disabled,
+                            )
+                            .is_some()
+                        })
+                    })
+                })
+        })
+        .collect();
     with_card(|card| {
-        apply_card(card, &crtcs, &connectors);
+        apply_card_vrr(card, &crtcs, &connectors, Some(&vrr));
         for &d in &off {
             crate::amdgpu_navi48_kms::set_crtc_active(card, d, false);
         }
@@ -541,15 +564,24 @@ pub fn publish() {
     ACTIVE.store(true, Ordering::Release);
 }
 
+#[cfg(feature = "kernel-test")]
 fn apply_card(
     card: &mut Card,
     crtcs: &[Option<crate::amdgpu_navi48_kms::Sink<'_>>],
     connectors: &[crate::amdgpu_navi48_kms::RoutedConnector<'_>],
 ) {
+    apply_card_vrr(card, crtcs, connectors, None)
+}
+fn apply_card_vrr(
+    card: &mut Card,
+    crtcs: &[Option<crate::amdgpu_navi48_kms::Sink<'_>>],
+    connectors: &[crate::amdgpu_navi48_kms::RoutedConnector<'_>],
+    vrr: Option<&[bool]>,
+) {
     // Preserve committed blob ids through hotplug/republication. Attaching
     // connector controls must not import DCN401 CRTC/plane capabilities.
     let previous = card.native.clone();
-    crate::amdgpu_navi48_kms::apply_routed(card, crtcs, connectors);
+    crate::amdgpu_navi48_kms::apply_routed_vrr(card, crtcs, connectors, vrr);
     for (native, connector) in card.native.iter_mut().zip(connectors) {
         if connector.kind != ConnectorType::HdmiA {
             continue;
@@ -780,3 +812,17 @@ pub use output::{
     connector_color_supported, output_formats_supported, request_connector_color,
     request_connector_max_bpc,
 };
+
+/// Retain the CRTC's VRR request; unsupported modes/sinks stay fixed-rate.
+pub fn request_vrr_enabled(display: u8, enabled: bool) {
+    requested(|kms| {
+        let Some(c) = kms.crtc_at_mut(usize::from(display)) else {
+            return false;
+        };
+        if c.vrr_enabled == enabled {
+            return false;
+        }
+        c.vrr_enabled = enabled;
+        true
+    });
+}
