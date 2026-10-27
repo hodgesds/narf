@@ -38,7 +38,10 @@
 //! its resume ceremony are here ([`token_anchor`], P3 #999 + P5
 //! #1001); the Argon2id passphrase anchor is P7 (#1004,
 //! `passphrase`); TPM sealing is P6 (#1002 — [`TpmAnchor`], in
-//! `tpm_anchor`).
+//! `tpm_anchor`). The TPM anchor's lifecycle surface —
+//! suspend/resume power sequencing, Clear invalidation, DA
+//! lockout accounting — is P6b (#1003, [`TpmLifecycle`], in
+//! `tpm_lifecycle`).
 //!
 //! The state-hook registry (design §5) lives in [`hooks`]: drivers
 //! register [`SuspendStateHook`]s, the seal fan-out runs inside
@@ -64,6 +67,7 @@ mod resume;
 mod slots;
 mod token_anchor;
 mod tpm_anchor;
+mod tpm_lifecycle;
 
 pub use anchor::{AnchorError, AnchorKind, KeyCustodyAnchor, UnwrapCtx, WrapCtx, WrappedSlot};
 pub use custody::Secret32;
@@ -93,6 +97,10 @@ pub use token_anchor::{
     TokenPinMode, TokenUserInterface, SUSPEND_RP_ID, SUSPEND_USER_NAME,
 };
 pub use tpm_anchor::TpmAnchor;
+pub use tpm_lifecycle::{
+    classify_refusal, EpochState, LockoutState, ShutdownOutcome, StartupOutcome, TpmLifecycle,
+    TpmLifecycleError, TpmRefusal,
+};
 
 /// Crate-visible writer surface for fixtures (the resume-env
 /// smokes craft hook-region images the service itself does not
