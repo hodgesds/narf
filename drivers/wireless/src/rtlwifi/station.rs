@@ -208,6 +208,9 @@ pub(super) struct State {
     native_associated: bool,
     admitted: bool,
     sequence: u16,
+    /// Open-path per-TID QoS SN space; software CCMP keeps its own
+    /// per-TID counters inside shared `Security`.
+    qos_sequence: [u16; 8],
     deadline: u64,
     last_now: u64,
     last_peer: u64,
@@ -239,6 +242,7 @@ impl State {
             native_associated: false,
             admitted: false,
             sequence: 0,
+            qos_sequence: [0; 8],
             deadline: 0,
             last_now: 0,
             last_peer: 0,
@@ -466,6 +470,49 @@ impl<I: Io, M: Memory> Prepared<I, M> {
                 .map_err(Error::Radio)?;
         }
         Ok(())
+    }
+    /// Program all four EDCA rows inside the retained calibration (or HT
+    /// grant) invocation. Every row is admitted before the first write and
+    /// every write is read back, both at association and for a live update.
+    fn program_station_edca(&self, p: narf_wireless::wmm::Parameters) -> Result<(), Error> {
+        let calibration = self.station.calibration.as_ref().ok_or(Error::Profile)?;
+        let program = || {
+            if self.station.ht_profile.is_some() {
+                return super::super::wmm::program_ht(&self.io, p);
+            }
+            super::super::wmm::program(&self.io, p, self.station.capability & 0x400 != 0)
+        };
+        if let Some(ht) = &self.station.ht {
+            ht.invoke(program)?;
+        } else {
+            calibration.with_current(program)?;
+        }
+        Ok(())
+    }
+    /// mac80211 `ieee80211_sta_wmm_params`: a beacon from the bound AP whose
+    /// WMM Parameter Set Count differs from the installed one carries new
+    /// EDCA rows, which `drv_conf_tx` -> rtl88ee `set_qos` writes live. An
+    /// unchanged count is ignored exactly as upstream does. Losing WMM or a
+    /// row this profile cannot admit (BE ACM, bad geometry) stays terminal.
+    fn update_station_edca(
+        &mut self,
+        information_elements: &[u8],
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        let Some(current) = self.station.wmm else {
+            return Ok(());
+        };
+        let fresh = narf_wireless::wmm::Parameters::parse(information_elements)
+            .ok()
+            .flatten()
+            .ok_or(Error::Profile)?;
+        if fresh.parameter_set_count == current.parameter_set_count {
+            return Ok(());
+        }
+        self.check_station_policy(environment)?;
+        self.program_station_edca(fresh)?;
+        self.station.wmm = Some(fresh);
+        self.check_station_policy(environment)
     }
 }
 impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
@@ -816,23 +863,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         )
                     })?;
                     if let Some(p) = self.station.wmm {
-                        let calibration =
-                            self.station.calibration.as_ref().ok_or(Error::Profile)?;
-                        let program = || {
-                            if self.station.ht_profile.is_some() {
-                                return super::super::wmm::program_ht(&self.io, p);
-                            }
-                            super::super::wmm::program(
-                                &self.io,
-                                p,
-                                self.station.capability & 0x400 != 0,
-                            )
-                        };
-                        if let Some(ht) = &self.station.ht {
-                            ht.invoke(program)?;
-                        } else {
-                            calibration.with_current(program)?;
-                        }
+                        self.program_station_edca(p)?;
                         self.check_station_policy(environment)?;
                         self.packet.qos = true;
                     }
@@ -1038,16 +1069,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             ) != association::phy::ApElements::parse(
                                 &old.bss.information_elements,
                             )
-                        || self.station.native_associated
-                            && self.station.wmm.is_some()
-                            && narf_wireless::wmm::Parameters::parse(
-                                &candidate.bss.information_elements,
-                            )
-                            .ok()
-                            .flatten()
-                                != self.station.wmm
                     {
                         return Err(Error::Profile);
+                    }
+                    if self.station.native_associated {
+                        self.update_station_edca(&candidate.bss.information_elements, environment)?;
                     }
                     self.station.last_peer = now;
                 }
@@ -1311,9 +1337,16 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             self.check_station_policy(environment)?;
             let own = self.local().ok_or(Error::State)?;
             let peer = self.station_peer().ok_or(Error::State)?;
+            // Classify before forming the header: the TID selects the AC
+            // ring/QSEL and is authenticated by CCMP's nonce priority.
+            let tid = self
+                .station
+                .wmm
+                .as_ref()
+                .map(|p| super::super::wmm::priority(bytes, p));
             let frame = if let Some(security) = &mut self.station.security {
-                if self.station.wmm.is_some() {
-                    security.transmit_ethernet_qos(bytes, 0)
+                if let Some(tid) = tid {
+                    security.transmit_ethernet_qos(bytes, tid)
                 } else {
                     security.transmit_ethernet(bytes)
                 }
@@ -1329,14 +1362,18 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 if protocol < 0x600 || matches!(protocol, 0x888e | 0x80f3 | 0x8137) {
                     return Err(Error::Profile);
                 }
-                let mut frame = vec![if self.station.wmm.is_some() { 0x88 } else { 8 }, 1, 0, 0];
+                let mut frame = vec![if tid.is_some() { 0x88 } else { 8 }, 1, 0, 0];
                 frame.extend_from_slice(&peer);
                 frame.extend_from_slice(&own);
                 frame.extend_from_slice(&bytes[..6]);
-                frame.extend_from_slice(&(self.station.sequence << 4).to_le_bytes());
-                self.station.sequence = (self.station.sequence + 1) & 4095;
-                if self.station.wmm.is_some() {
-                    frame.extend_from_slice(&[0, 0]);
+                let counter = match tid {
+                    Some(tid) => &mut self.station.qos_sequence[usize::from(tid)],
+                    None => &mut self.station.sequence,
+                };
+                frame.extend_from_slice(&(*counter << 4).to_le_bytes());
+                *counter = (*counter + 1) & 4095;
+                if let Some(tid) = tid {
+                    frame.extend_from_slice(&[tid, 0]);
                 }
                 frame.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
                 frame.extend_from_slice(&bytes[12..]);

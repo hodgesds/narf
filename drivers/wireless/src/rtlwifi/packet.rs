@@ -180,13 +180,32 @@ fn queue(frame: &[u8], local: [u8; 6], qos: bool) -> Result<(usize, u16, u8), Er
             // MGMT vector1, Linux MGNT_QUEUE6, QSLT_MGNT0x12.
             Ok((1, 1 << 6, 0x12))
         }
-        2 if fc & 0x03f0 == 0x0100
-            || qos && fc & 0x03f0 == 0x0180 && frame.get(24..26) == Some(&[0, 0]) =>
-        {
-            // BE vector4, Linux BE_QUEUE1, firmware priority/TID0.
-            Ok((4, 1 << 1, 0))
-        }
+        // Non-QoS DATA: mac80211 skb->priority0 on BE.
+        2 if fc & 0x03f0 == 0x0100 => Ok((4, 1 << 1, 0)),
+        // QoS DATA TID0..7 with normal ACK, no EOSP/A-MSDU/TXOP/queue size.
+        // rtl_pci_tx queues `ieee802_1d_to_ac[priority]` on its own linked
+        // ring and rtl88ee `_rtl88ee_map_hwqueue_to_fwqueue` sets TXD1
+        // QSEL to skb->priority (the TID). Vectors follow TX_BASES; doorbells
+        // are REG_PCIE_CTRL BIT(hw_queue): BK0, BE1, VI2, VO3.
+        2 if qos && fc & 0x03f0 == 0x0180 => match frame.get(24..26) {
+            Some(&[tid, 0]) if tid & 0xf8 == 0 => {
+                let (vector, doorbell) = access_category_queue(tid);
+                Ok((vector, doorbell, tid))
+            }
+            _ => Err(Error::Packet),
+        },
         _ => Err(Error::Packet),
+    }
+}
+
+/// Linux `ieee802_1d_to_ac` followed by `_rtl_mac_to_hwqueue`: the EE
+/// linked-ring vector (TX_BASES order) and its REG_PCIE_CTRL doorbell.
+pub(super) const fn access_category_queue(tid: u8) -> (usize, u16) {
+    match tid & 7 {
+        1 | 2 => (5, 1 << 0), // BK_QUEUE0 at REG_BKQ_DESA.
+        4 | 5 => (3, 1 << 2), // VI_QUEUE2 at REG_VIQ_DESA.
+        6 | 7 => (2, 1 << 3), // VO_QUEUE3 at REG_VOQ_DESA.
+        _ => (4, 1 << 1),     // BE_QUEUE1 at REG_BEQ_DESA.
     }
 }
 
@@ -454,7 +473,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         Ok(())
     }
-    /// One outstanding native frame is retained across both active queues.
+    /// One outstanding native frame is retained across all active queues.
     /// A free descriptor alone cannot substitute a different pending payload.
     pub(crate) fn submit(&mut self, frame: &[u8], rate: u8) -> Result<u64, Error> {
         if self.phase != Phase::Running || self.packet.pending.is_some() {
@@ -488,7 +507,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let slot = self.packet.next[queue];
         let mut prefix = [0; 10];
         prefix[0] = frame.len() as u32 | (32 << 16) | (1 << 26) | (1 << 27);
-        let destination = if queue == 4 {
+        let destination = if (2..=5).contains(&queue) {
             &frame[16..22]
         } else {
             &frame[4..10]

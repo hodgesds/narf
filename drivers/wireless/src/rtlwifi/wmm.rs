@@ -63,3 +63,32 @@ fn program_profile(io: &impl Io, p: Parameters, short: bool, ht: bool) -> Result
     }
     Ok(())
 }
+/// Host 802.1D priority (TID) for one Ethernet frame on a WMM station.
+///
+/// `cfg80211_classify8021d(skb, NULL)` derives the user priority from the
+/// IPv4/IPv6 DSCP (RFC 8325), MPLS TC or 802.21; mac80211's
+/// `ieee80211_downgrade_queue` then walks VO->VI->BE->BK while the AP's
+/// `wmm_acm` bitmap (`ieee80211_sta_wmm_params`) marks the AC as admission
+/// controlled. NARF never holds a TSPEC, so no ACM AC is ever admitted;
+/// BK is the terminal fallback exactly as in mac80211. BE ACM is already
+/// refused by [`admit`] before association.
+pub(crate) fn priority(ethernet: &[u8], p: &Parameters) -> u8 {
+    let mut tid = crate::ath11k::tx_hdr::classify8021d(ethernet) & 7;
+    // Parameters use canonical ACI order BE0, BK1, VI2, VO3.
+    while p.ac[match tid {
+        1 | 2 => 1,
+        4 | 5 => 2,
+        6 | 7 => 3,
+        _ => 0,
+    }]
+    .admission_control
+    {
+        tid = match tid {
+            6 | 7 => 5,
+            4 | 5 => 3,
+            0 | 3 => 2,
+            _ => break,
+        };
+    }
+    tid
+}

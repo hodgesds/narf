@@ -381,7 +381,10 @@ impl Port for PacketPort {
         let (base, queue) = match bit {
             16 => (LINUX_TX_BASES[0], 0),
             64 => (LINUX_TX_BASES[1], 1),
+            1 => (LINUX_TX_BASES[5], 5),
             2 => (LINUX_TX_BASES[4], 4),
+            4 => (LINUX_TX_BASES[3], 3),
+            8 => (LINUX_TX_BASES[2], 2),
             _ => return Err(Error::Descriptor),
         };
         let (slot, complete) = {
@@ -399,12 +402,10 @@ impl Port for PacketPort {
         if control & 0x8c000000 != 0x8c000000
             || (control >> 16) & 255 != 32
             || word(&descriptor, 28) & 0xffff != length as u32
-            || (word(&descriptor, 4) >> 8) & 31
-                != match bit {
-                    64 => 0x12,
-                    16 => 0x10,
-                    _ => 0,
-                }
+            || !matches!(
+                ((word(&descriptor, 4) >> 8) & 31, bit),
+                (0x12, 64) | (0x10, 16) | (1 | 2, 1) | (0 | 3, 2) | (4 | 5, 4) | (6 | 7, 8)
+            )
             || word(&descriptor, 36) != 0
             || word(&descriptor, 40) != ring.address as u32 + (((slot + 1) % 4) * 64) as u32
         {
@@ -439,6 +440,15 @@ impl Port for PacketPort {
             // The command-beacon OWN bit may stay set even on completed
             // SRAM upload. Ordinary TX retirement must never consume it.
             return Ok(());
+        }
+        // Data QSEL is the exact QoS TID (non-QoS DATA uses0).
+        let tid = if bytes.first() == Some(&0x88) {
+            bytes.get(24).map_or(u32::MAX, |&q| u32::from(q))
+        } else {
+            0
+        };
+        if bit & 15 != 0 && (word(&descriptor, 4) >> 8) & 31 != tid {
+            return Err(Error::Descriptor);
         }
         self.model.lock().observed.push(bytes.clone());
         self.model.lock().descriptors.push(descriptor.clone());

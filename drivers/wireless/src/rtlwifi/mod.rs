@@ -78,7 +78,7 @@ pub mod rx;
 mod station_control;
 pub mod tx;
 pub mod vht;
-mod wmm;
+pub(crate) mod wmm;
 
 pub mod rtl8188ee;
 pub mod rtl8192ce;

@@ -138,13 +138,14 @@ impl PciIo {
         .map_err(|_| Error::Access)?
     }
     pub(super) fn packet_kick(&self, queue_bit: u16) -> Result<(), Error> {
-        if !matches!(queue_bit, 2 | 16 | 64) {
+        // BK0/BE1/VI2/VO3 WMM rings, BEACON4 reserved page and MGNT6.
+        if !matches!(queue_bit, 1 | 2 | 4 | 8 | 16 | 64) {
             return Err(Error::Gate);
         }
         self.packet_authority(true, || {
             self.check(0x300, 2)?;
             // SAFETY: aligned complete MMIO word, inside current invocation;
-            // bit mapping is Linux MGNT_QUEUE6/BE_QUEUE1, not vector indices.
+            // bit mapping is Linux hw_queue BIT(n), not vector indices.
             unsafe { self.registers.write16(0x300, queue_bit) };
             // Flush the posted control write; this read is not TX completion.
             // SAFETY: the same current capability invocation and complete

@@ -243,9 +243,9 @@ IRQs stay masked. The retained station service below drives this bounded
 polling transport; transport readiness alone leaves carrier down.
 
 Management and legacy data use distinct retained rings. Negotiated WMM adds
-only BE/TID0 QoS data to the same retained BE ring. Linux queue
-IDs MGNT6/BE1 supply doorbell bits64/2; allocation-vector indices1/4 never
-substitute those IDs. One pending native payload is retained before OWN
+QoS data TID0..7 on the BK/BE/VI/VO rings selected by `ieee802_1d_to_ac`.
+Linux queue IDs BK0/BE1/VI2/VO3/MGNT6 supply doorbell bits1/2/4/8/64;
+allocation-vector indices5/4/3/2/1 never substitute those IDs. One pending native payload is retained before OWN
 publication, along with its exact queue, slot, serial, length and address.
 The host copies through the actual retained DMA mapping and preserves DW10's
 linked-next pointer. Terminal OWN clear is checked against stable descriptor
@@ -334,8 +334,8 @@ controlled port and carrier open. AP authorization or different same-length
 DMA bytes are insufficient. Established carrier survives a temporary rekey
 reply gate; new data waits for the native reply. No extra AP/on-air ACK is
 required beyond the demonstrated vendor terminal host receipt. Narf-Ring
-clients cannot inject EAPOL, spoof factory source or request unsupported
-checksum/TSO/VLAN offloads.
+clients cannot inject EAPOL, spoof factory source or request
+checksum/TSO/VLAN offloads, which no rtlwifi chip provides (see section 8).
 
 RX security uses original native MPDUs and actual descriptor software-decrypt
 metadata; exact authenticated Ethernet reaches both the real RX Narf-Ring and
@@ -368,7 +368,7 @@ Explicit registration, operator up/down and autoconnect remain administrative
 events. Disconnect/failure clears carrier and peer identity while preserving an
 operator-UP interface; a later physical carrier sample cannot undo operator DOWN.
 
-### Negotiated RTL8188EE WMM BE/TID0
+### Negotiated RTL8188EE WMM (all ACs/TIDs)
 
 The retained EE station automatically offers its own WMM Information IE when
 the scanned AP has one valid shared `narf_wireless::wmm` Parameter element.
@@ -376,15 +376,16 @@ The common management plan must first bind the actual association response;
 that response must then contain valid WMM parameters. Missing, duplicate,
 malformed or BE admission-controlled parameters fail the attempt before QoS
 admission. An AP cannot upgrade a legacy request through an unsolicited IE.
-This legacy WMM continuation enables no HT, BA, U-APSD, TSPEC or priority
-classification. The distinct HT continuation below reuses its actual BE owner.
+This WMM continuation enables no HT, BA, U-APSD or TSPEC. Host priority
+classification and all-AC routing are described below; the distinct HT
+continuation reuses the same AC owner.
 
 Source `rtl_get_hal_edca_param` programs BE/BK/VI/VO at0x508/50c/504/500 with
 TXOP in32us units, ECW exponents and SIFS10 plus AIFSN times the actual negotiated
 9/20us slot. All rows are checked before writes, including the8-bit AIFS bound;
 every write is read back. BE uses AIFSN>=3, ECWmin>=5, ECWmax>=10 and TXOP0;
-only BE/TID0 can be submitted. Source ACM queue bits are cleared for the
-unselected/admission-free host profile. The signed NEPC gain/response envelope
+BK/VI/VO use the AP rows unchanged. REG_ACMHWCTRL AC bits stay clear: source
+`HW_VAR_ACM_CTRL` reads only `mac->ac[0]` (BE) ACM, which this profile refuses. The signed NEPC gain/response envelope
 still constrains the same1T legacy PHY/rates; WMM changes no gain, channel,
 antenna, response-rate or RF calibration authority. Calibration now retains
 the exact authenticated source cap, rechecks it when deriving permission and
@@ -395,16 +396,54 @@ installation closes TX and the station. Explicit reinstall cannot revive
 an attempt that already observed the absence.
 
 Only successful response binding and native EDCA readbacks admit the packet
-owner's QoS bit. TXD4.QOS and a26-byte MPDU header carry TID0 on BE; software
-CCMP authenticates that header before publication. EAPOL keeps its existing
-driver-owned non-QoS TX path; RX admits checked ordinary QoS headers and shared
-per-key/TID replay. Changed bound AP WMM parameters close the station until a
-fresh lifecycle. Four native Rust smokes cover literal EDCA/TXD fields, real
+owner's QoS bit. TXD4.QOS and a26-byte MPDU header carry the classified TID;
+software CCMP authenticates that header (and nonce priority) before publication.
+EAPOL keeps its existing driver-owned non-QoS TX path; RX admits checked
+ordinary QoS headers and shared per-key/TID replay. Live AP parameter changes
+follow the dynamic-EDCA rules below. Four native Rust smokes cover literal EDCA/TXD fields, real
 Open/WPA2 DMA and exact bidirectional data, malformed/downgraded responses,
 ignored register writes, actual signed/device epoch loss, isolated installed-policy
 clear/reinstall, retained mappings and cancelled M4. Physical WMM/RF acceptance
-remains unrecorded; other ACs,
-dynamic EDCA, broader HT, power management and reset/rejoin remain separate work.
+remains unrecorded; broader HT, power management and reset/rejoin remain
+separate work.
+
+#### Traffic classification and all-AC/TID routing (implemented)
+
+`station.rs::send_station_ethernet` classifies each Ethernet frame with the
+upstream `cfg80211_classify8021d(skb, NULL)` rules (IPv4/IPv6 DSCP via RFC 8325
+section 4 exceptions, MPLS TC, 802.21 = 7; reused from
+`ath11k::tx_hdr::classify8021d`) and then applies mac80211
+`ieee80211_downgrade_queue`: while the AP's ACM bit covers the TID's AC the
+priority walks VO->VI->BE->BK, BK being terminal (`wmm.rs::priority`). NARF
+holds no TSPEC, so no ACM AC is ever admitted. The TID is placed in the QoS
+control before software CCMP, so it is also the CCMP nonce priority. Open
+frames use a per-TID SN space (`qos_sequence`); CCMP frames use shared
+`Security`'s per-TID counters.
+
+`packet.rs::queue` accepts QoS DATA TID0..7 with normal ACK and no
+EOSP/A-MSDU/TXOP bits, maps `ieee802_1d_to_ac` onto the EE linked rings
+(`access_category_queue`: BK REG_BKQ_DESA, BE REG_BEQ_DESA, VI REG_VIQ_DESA, VO
+REG_VOQ_DESA) and rings REG_PCIE_CTRL BIT(hw_queue) for BK0/BE1/VI2/VO3 as
+`rtl88ee_tx_polling` does. TXD1 QSEL is `skb->priority` (the TID), matching
+`_rtl88ee_map_hwqueue_to_fwqueue`; non-QoS DATA uses BE/QSEL0.
+`firmware_native.rs::packet_kick` admits exactly those doorbells plus BEACON4
+and MGNT6. The single-outstanding-frame receipt rule spans all rings.
+Smoke `smoke_rtl8188ee_wmm_classifies_dscp_to_all_tids_and_access_category_rings`
+(Open and WPA2) checks every AC ring, QSEL, doorbell, per-TID SN, CCMP priority
+at the fixture AP and ACM downgrade VO->VI and VO+VI->BE.
+
+#### Dynamic EDCA (implemented)
+
+mac80211 `ieee80211_sta_wmm_params` re-applies EDCA only when a beacon from
+the bound AP carries a different WMM Parameter Set Count; `drv_conf_tx` then
+reaches rtl88ee `set_qos`. `station.rs::update_station_edca` follows that: an
+unchanged count is ignored, a new count re-admits all four rows before the
+first write, programs/reads back 0x508/50c/504/500 inside the same retained
+calibration (or HT grant) invocation and installs the new parameters for
+later classification. Missing WMM or an inadmissible set (e.g. BE ACM) is
+terminal before any EDCA write. Smoke
+`smoke_rtl8188ee_wmm_beacon_parameter_set_count_updates_live_edca` covers the
+ignored same-count beacon, a live update, data after it and terminal refusal.
 
 ### Response-bound legacy data rates
 
@@ -432,7 +471,7 @@ binding after resolving the current exact legacy NEPC record and the actual
 ready executable identity. It supplies no
 measured gain or radio permission. This continuation applies only to
 `10ec:8179`, channel1/2412MHz, one TX/RX stream, mandatory MCS0–7, long GI,
-response-bound WMM BE/TID0 and Open or WPA2-PSK/software CCMP. It adds no SGI,
+response-bound WMM (classified TID0..7 on its AC ring) and Open or WPA2-PSK/software CCMP. It adds no SGI,
 HT40, LDPC/STBC, RTS/CTS protection, BA agreement, TX aggregation, extra AC,
 antenna tracking, PM or restart. Other matched chips cannot enter it.
 
@@ -512,7 +551,7 @@ HT capability metadata; its hardware promise includes RX/TX MCS0–7 and the
 mandatory default3839-byte A-MSDU capability.
 
 Actual DATA TX chooses a negotiated MCS using native TXD5 rates0x0c–0x13,
-with LGI, BW0, subcarrier0, USE_RATE/DISFB and the existing BE/TID0 QoS header
+with LGI, BW0, subcarrier0, USE_RATE/DISFB and the classified-TID QoS header
 formed before software CCMP. AGG remains0. Management, EAPOL and declined BA
 controls retain the exact legacy1Mbps path and terminal OWN/body receipt;
 no AP ACK or new C2H receipt is fabricated. The source's ambiguous MCS0 SGI
@@ -612,7 +651,7 @@ Per-chip remaining inventory uses Linux per-chip `sw.c` and radio/PCI ops:
 
 | Chip | Source hardware scope | Remaining native software |
 |---|---|---|
-| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, ADDBA refusal and capture/publication epochs above. Remaining software: SGI20, HT40, successful RX/TX BA/reorder/aggregation, all WMM AC/TIDs, adaptive rates, dynamic EDCA, broader scan/channels, tracking/PM and reset/rejoin. Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
+| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, ADDBA refusal and capture/publication epochs above. Remaining software: SGI20, HT40, successful RX/TX BA/reorder/aggregation, adaptive rates, broader scan/channels, tracking/PM and reset/rejoin. Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
 | RTL8192CE family aliases / RTL8192EE |2.4GHz HT; CE aliases need exact RF-type qualification, including the8176/8188CE variant; EE is2T2R |Retained chip firmware/MAC/PHY/RF/calibration/power/packet/station chain, then full HT/QoS/lifecycle. The8179/8188EE HT path does not admit these IDs. |
 | RTL8192DE |Dual-band dual-MAC HT |Exact per-function reset/power/firmware/DMA/radio ownership and station chains, then bands/HT/QoS/lifecycle |
 | RTL8723AE/BE |2.4GHz1T1R HT with BT |Chip-specific retained chain, antenna/BT coexistence and HT/QoS/lifecycle |
@@ -620,6 +659,34 @@ Per-chip remaining inventory uses Linux per-chip `sw.c` and radio/PCI ops:
 
 The source2.4GHz bandset rules out5GHz work on EE/CE/8192EE/8723;
 initial-profile restrictions do not rule out their HT/QoS hardware features.
+
+Source-proven inapplicability (rows removed from the remaining inventory):
+
+- **Checksum, TSO and VLAN offload.** `rtlwifi/base.c::_rtl_init_mac80211`
+  never assigns `hw->netdev_features` and the file has no `NETIF_F_*`,
+  `ip_summed`, checksum, TSO or VLAN reference; the per-chip `trx.c` TX/RX
+  descriptor fill/query paths (checked: `rtl8821ae`, `rtl8192ee`) carry no
+  checksum, LSO or VLAN-tag field. No rtlwifi chip offers these offloads, so
+  the Narf-Ring refusal of offload requests is the complete behaviour.
+- **LDPC.** `_rtl_init_hw_ht_capab` sets only SUP_WIDTH_20_40, SGI_40,
+  SGI_20, DSSSCCK40 and MAX_AMSDU (never `IEEE80211_HT_CAP_LDPC_CODING`), and
+  `_rtl_init_hw_vht_capab` for RTL8821AE/8812AE never sets
+  `IEEE80211_VHT_CAP_RXLDPC`. LDPC is inapplicable to every rtlwifi chip.
+- **HT STBC.** No HT STBC bit is advertised for any chip, so STBC is
+  inapplicable to the EE slice and all HT-only chips. STBC exists only in the
+  RTL8821AE VHT capability (`IEEE80211_VHT_CAP_TXSTBC | RXSTBC_1`) and is part
+  of the remaining `vht` work.
+
+Power management beyond named suspend, enumerated from per-chip `sw.c`
+module parameters (`rtl88ee_mod_params`, `rtl8821ae_mod_params`) and
+`base.c` hw flags: inactive power save (`inactiveps = true` on both),
+leisure power save (`fwctrl_lps`/`swctrl_lps`: off by default on 88EE,
+firmware LPS `reg_fwctrl_lps = 2` MAX mode on by default on 8821AE, enabling
+`SUPPORTS_PS`/`SUPPORTS_DYNAMIC_PS`), PCIe ASPM (`aspm_support = 1`,
+`const_pci_aspm = 3`) and WoWLAN on RTL8821AE/8812AE (`wo_wlan_mode =
+WAKE_ON_MAGIC_PACKET | WAKE_ON_PATTERN_MATCH` with
+`rtlwifi/rtl8821aefw_wowlan.bin`). RTL8188EE has no WoWLAN. Each is now a
+named remaining feature row.
 
 References: Linux `rtlwifi/efuse.c`, per-chip `sw.c`/`reg.h`,
 `rtl8192d/hw_common.c` dual-MAC selection, and per-chip firmware/HW code.
