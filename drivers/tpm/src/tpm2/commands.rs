@@ -81,13 +81,14 @@ extern crate alloc;
 
 use super::{
     begin_command, finalise, TPM_ALG_NULL, TPM_ALG_SHA256, TPM_CC_CLEAR, TPM_CC_CLEAR_CONTROL,
-    TPM_CC_CREATE, TPM_CC_CREATE_PRIMARY, TPM_CC_EVICT_CONTROL, TPM_CC_FLUSH_CONTEXT,
+    TPM_CC_CREATE, TPM_CC_CREATE_PRIMARY, TPM_CC_DICTIONARY_ATTACK_LOCK_RESET,
+    TPM_CC_DICTIONARY_ATTACK_PARAMETERS, TPM_CC_EVICT_CONTROL, TPM_CC_FLUSH_CONTEXT,
     TPM_CC_GET_CAPABILITY, TPM_CC_GET_RANDOM, TPM_CC_GET_TEST_RESULT, TPM_CC_LOAD,
     TPM_CC_NV_DEFINE_SPACE, TPM_CC_NV_INCREMENT, TPM_CC_NV_READ, TPM_CC_NV_UNDEFINE_SPACE,
     TPM_CC_NV_WRITE, TPM_CC_PCR_EXTEND, TPM_CC_PCR_READ, TPM_CC_POLICY_GET_DIGEST,
     TPM_CC_POLICY_PCR, TPM_CC_READ_PUBLIC, TPM_CC_SELF_TEST, TPM_CC_SHUTDOWN, TPM_CC_STARTUP,
-    TPM_CC_START_AUTH_SESSION, TPM_CC_STIR_RANDOM, TPM_CC_UNSEAL, TPM_RH_OWNER, TPM_RH_PLATFORM,
-    TPM_RS_PW, TPM_ST_NO_SESSIONS, TPM_ST_SESSIONS, TPM_SU_CLEAR,
+    TPM_CC_START_AUTH_SESSION, TPM_CC_STIR_RANDOM, TPM_CC_UNSEAL, TPM_RH_LOCKOUT, TPM_RH_OWNER,
+    TPM_RH_PLATFORM, TPM_RS_PW, TPM_ST_NO_SESSIONS, TPM_ST_SESSIONS, TPM_SU_CLEAR,
 };
 use alloc::vec::Vec;
 
@@ -516,6 +517,51 @@ pub fn clear_control(disable_clear: bool) -> Vec<u8> {
     buf.extend_from_slice(&TPM_RH_PLATFORM.to_be_bytes());
     push_password_session(&mut buf);
     buf.push(u8::from(disable_clear)); // TPMI_YES_NO
+    finalise(&mut buf);
+    buf
+}
+
+/// Build `TPM2_DictionaryAttackLockReset()` — Part 3,
+/// Dictionary Attack commands (#1003).
+///
+/// Authorized by the lockout hierarchy (`TPM_RH_LOCKOUT`, empty
+/// password session — the lockout auth this platform model
+/// carries). A properly authorized reset sets the DA
+/// `failedTries` counter to zero and cancels any active DA
+/// lockout; it is the recovery act the suspend lifecycle
+/// exposes, and the only one — there is no path that clears the
+/// counter without the lockout authorization.
+pub fn dictionary_attack_lock_reset() -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_DICTIONARY_ATTACK_LOCK_RESET);
+    buf.extend_from_slice(&TPM_RH_LOCKOUT.to_be_bytes());
+    push_password_session(&mut buf);
+    finalise(&mut buf);
+    buf
+}
+
+/// Build `TPM2_DictionaryAttackParameters(newMaxTries,
+/// newRecoveryTime, lockoutRecovery)` — Part 3, Dictionary
+/// Attack commands (#1003).
+///
+/// Lockout-hierarchy authorized (empty password session).
+/// Sets the DA parameters only: per the Part 3 errata the
+/// command leaves `failedTries` unchanged, so lowering
+/// `newMaxTries` to or below the current failure count puts the
+/// TPM into lockout rather than rescuing it — the lifecycle
+/// reads the accounting through `TPM_PT_*` properties instead
+/// of tuning it, and this builder exists so fixtures can stage
+/// a threshold.
+pub fn dictionary_attack_parameters(
+    new_max_tries: u32,
+    new_recovery_time: u32,
+    lockout_recovery: u32,
+) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_DICTIONARY_ATTACK_PARAMETERS);
+    buf.extend_from_slice(&TPM_RH_LOCKOUT.to_be_bytes());
+    push_password_session(&mut buf);
+    buf.extend_from_slice(&new_max_tries.to_be_bytes());
+    buf.extend_from_slice(&new_recovery_time.to_be_bytes());
+    buf.extend_from_slice(&lockout_recovery.to_be_bytes());
     finalise(&mut buf);
     buf
 }
