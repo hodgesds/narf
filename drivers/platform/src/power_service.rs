@@ -122,9 +122,23 @@ fn eval_package(path: &str) -> Option<Vec<Value>> {
     }
 }
 
+/// Battery provider for the power service: one battery
+/// abstraction over two transports. The ACPI control-method
+/// battery (`PNP0C0A`) wins where one exists; machines whose
+/// battery subsystem is an ACPI Smart Battery Subsystem
+/// (`ACPI0002`) have no control-method battery at all, so the
+/// provider falls back to the SBS driver's snapshot, which
+/// returns the same `(BatteryInfo, BatteryState)` pair.
+fn battery_snapshot() -> Option<(BatteryInfo, BatteryState)> {
+    match control_method_battery_snapshot() {
+        Some(pair) => Some(pair),
+        None => crate::sbs::snapshot_first(),
+    }
+}
+
 /// First control-method battery's fused info + state, via the same
 /// `_BIF` / `_BST` evaluations the battery driver performs.
-fn battery_snapshot() -> Option<(BatteryInfo, BatteryState)> {
+fn control_method_battery_snapshot() -> Option<(BatteryInfo, BatteryState)> {
     let dev = find_all_devices_by_hid("PNP0C0A").into_iter().next()?;
     let bif = eval_package(&alloc::format!("{}._BIF", dev.path))?;
     if bif.len() < 13 {

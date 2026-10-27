@@ -61,6 +61,7 @@ const SMB_HST_CMD: u16 = 0x03;
 const SMB_XMIT_SLVA: u16 = 0x04;
 const SMB_HST_D0: u16 = 0x05;
 const SMB_HST_D1: u16 = 0x06;
+const SMB_HOST_BLOCK_DB: u16 = 0x07;
 
 // HST_STS bits.
 const STS_HOST_BUSY: u8 = 1 << 0;
@@ -74,6 +75,7 @@ const STS_ALL_ERRS: u8 = STS_DEV_ERR | STS_BUS_ERR | STS_FAILED;
 const CNT_START: u8 = 1 << 6;
 const CNT_PROTO_BYTE_DATA: u8 = 0b010 << 2;
 const CNT_PROTO_WORD_DATA: u8 = 0b011 << 2;
+const CNT_PROTO_BLOCK: u8 = 0b101 << 2;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SmbusError {
@@ -212,6 +214,56 @@ impl Smbus {
         // SAFETY: same.
         let hi = unsafe { pio_in8(self.io_base + SMB_HST_D1) };
         Ok(u16::from_le_bytes([lo, hi]))
+    }
+
+    /// Write a 16-bit word `value` at `cmd` on device `addr`.
+    ///
+    /// SMBus protocol "Write Word Data": START, addr + W, cmd,
+    /// data-low, data-high, STOP (low byte first on the wire).
+    pub fn write_word_data(&self, addr: u8, cmd: u8, value: u16) -> Result<(), SmbusError> {
+        self.wait_idle()?;
+        let [lo, hi] = value.to_le_bytes();
+        // SAFETY: x86_64 PIO.
+        unsafe {
+            pio_out8(self.io_base + SMB_XMIT_SLVA, addr << 1);
+            pio_out8(self.io_base + SMB_HST_CMD, cmd);
+            pio_out8(self.io_base + SMB_HST_D0, lo);
+            pio_out8(self.io_base + SMB_HST_D1, hi);
+            pio_out8(self.io_base + SMB_HST_CNT, CNT_START | CNT_PROTO_WORD_DATA);
+        }
+        self.wait_complete()?;
+        Ok(())
+    }
+
+    /// Read a block at `cmd` from device `addr` into `buf`,
+    /// returning the number of payload bytes read.
+    ///
+    /// SMBus protocol "Block Read": the slave leads with a byte
+    /// count; on the ICH host the count lands in HST_D0 and the
+    /// payload bytes are popped one at a time from HOST_BLOCK_DB.
+    /// A count of zero, or one above the SMBus 32-byte block
+    /// maximum / the caller's buffer, is a framing error
+    /// ([`SmbusError::Failed`]) — the caller never sees a partial
+    /// or over-long block.
+    pub fn read_block_data(&self, addr: u8, cmd: u8, buf: &mut [u8]) -> Result<usize, SmbusError> {
+        self.wait_idle()?;
+        // SAFETY: x86_64 PIO.
+        unsafe {
+            pio_out8(self.io_base + SMB_XMIT_SLVA, (addr << 1) | 1);
+            pio_out8(self.io_base + SMB_HST_CMD, cmd);
+            pio_out8(self.io_base + SMB_HST_CNT, CNT_START | CNT_PROTO_BLOCK);
+        }
+        self.wait_complete()?;
+        // SAFETY: same.
+        let count = unsafe { pio_in8(self.io_base + SMB_HST_D0) } as usize;
+        if count == 0 || count > 32 || count > buf.len() {
+            return Err(SmbusError::Failed);
+        }
+        for slot in buf.iter_mut().take(count) {
+            // SAFETY: same.
+            *slot = unsafe { pio_in8(self.io_base + SMB_HOST_BLOCK_DB) };
+        }
+        Ok(count)
     }
 }
 
