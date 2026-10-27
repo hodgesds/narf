@@ -579,7 +579,7 @@ impl Device {
                         }
                     }
                 }
-                owner.station_close().await?;
+                owner.station_close(|| (self.environment.policy)()).await?;
                 Ok(Outcome::Done)
             }
         }
@@ -892,7 +892,7 @@ impl WirelessNetIface for Device {
     fn phy_capabilities(&self, band_mhz: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
         (self.ht20 && matches!(band_mhz, 2400 | 5000)).then(|| {
             narf_wireless::iface::PhyCapabilities {
-                ht: narf_wireless::association::phy::LocalHt::siso20(true, true).capability_body(),
+                ht: super::mvm_boot::local_ht().capability_body(),
                 vht: None,
             }
         })

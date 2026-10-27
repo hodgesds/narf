@@ -207,6 +207,7 @@ mod amsdu;
 mod ba;
 #[path = "mvm_phy.rs"]
 mod phy;
+pub(super) use phy::local_ht;
 #[path = "mvm_power.rs"]
 mod power;
 pub type PowerRequest = power::PowerRequest;

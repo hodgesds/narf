@@ -549,6 +549,10 @@ impl super::gen2_prepare::Io for Gen2PrepareIo<'_> {
     }
 }
 
+/// A validated terminal TX_CMD response without acknowledgement. The frame
+/// and its DMA are already retired; only the peer's receipt is absent.
+pub const TX_FAILED: &str = "frame transmission failed";
+
 pub struct Hardware {
     mmio: super::IwlMmioImpl,
     resources: core::mem::ManuallyDrop<Resources>,
@@ -1447,11 +1451,37 @@ impl Hardware {
         header_len: usize,
         rate: Option<u32>,
     ) -> Result<(), &'static str> {
+        self.transmit_owned(id, frame, header_len, rate, false)
+            .await
+    }
+
+    /// The close owner's own final management frame (Linux mac80211
+    /// `ieee80211_set_disassoc(tx=true)`). Host stop forbids every other
+    /// publication; it cannot forbid the frame which implements that stop.
+    pub async fn transmit_closing(
+        &mut self,
+        id: u16,
+        frame: &[u8],
+        header_len: usize,
+        rate: Option<u32>,
+    ) -> Result<(), &'static str> {
+        self.transmit_owned(id, frame, header_len, rate, true).await
+    }
+
+    async fn transmit_owned(
+        &mut self,
+        id: u16,
+        frame: &[u8],
+        header_len: usize,
+        rate: Option<u32>,
+        closing: bool,
+    ) -> Result<(), &'static str> {
         self.wait_tx_space(id).await?;
-        if self
-            .station_stop
-            .as_ref()
-            .is_some_and(|stop| stop.load(Ordering::Acquire))
+        if !closing
+            && self
+                .station_stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(Ordering::Acquire))
         {
             return Err("MVM station closed before native packet publication");
         }
@@ -1475,7 +1505,7 @@ impl Hardware {
                 return if self.tx_completed.remove(index).unwrap().2 {
                     Ok(())
                 } else {
-                    Err("frame transmission failed")
+                    Err(TX_FAILED)
                 };
             }
             // A compressed BA cumulatively retires successful frames. A

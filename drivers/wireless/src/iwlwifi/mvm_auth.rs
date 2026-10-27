@@ -189,6 +189,30 @@ impl Owner {
         .await
     }
 
+    /// As [`Self::qualified_management_transmit`], for the close owner's own
+    /// final frame after host stop. Emission authority is still continuous.
+    pub(super) async fn qualified_closing_transmit(
+        &mut self,
+        queue: u16,
+        frame: &[u8],
+        rate: u32,
+        policy: &mut impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<(), &'static str> {
+        let power = self
+            .power
+            .prepared
+            .as_ref()
+            .ok_or("missing management qualification")?;
+        let mut tx = pin!(self.hardware.transmit_closing(queue, frame, 24, Some(rate)));
+        poll_fn(|cx| {
+            if let Err(error) = policy().and_then(|domain| power.check_applied(&domain)) {
+                return Poll::Ready(Err(error));
+            }
+            tx.as_mut().poll(cx)
+        })
+        .await
+    }
+
     async fn authentication_response(
         &mut self,
         local: [u8; 6],

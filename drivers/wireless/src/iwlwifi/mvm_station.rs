@@ -281,8 +281,15 @@ impl Owner {
 
     /// Every transition consumes the preceding native terminal receipt. A
     /// partially pending/failed owner is quarantined, never reconstructed.
-    pub(in crate::iwlwifi) async fn station_close(&mut self) -> Result<(), &'static str> {
+    /// A completed association first tells its AP (§3.25 over-air
+    /// deauthentication) when current emission authority still exists.
+    pub(in crate::iwlwifi) async fn station_close(
+        &mut self,
+        mut policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<(), &'static str> {
         if self.phase == Phase::DataPrepared {
+            self.deauthenticate_using(super::assoc::DEAUTH_LEAVING, &mut policy)
+                .await?;
             self.release_legacy_data().await?;
         }
         if self.phase == Phase::Associated {

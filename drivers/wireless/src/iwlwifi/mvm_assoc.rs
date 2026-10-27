@@ -12,6 +12,12 @@ use narf_wireless::{
     reg::RegulatoryDomain,
 };
 
+/// IEEE 802.11 management subtype 12 (Deauthentication), FC byte0.
+pub(super) const DEAUTHENTICATION: u8 = 0xc0;
+/// IEEE 802.11-2020 Table 9-49 reason 3, Linux `WLAN_REASON_DEAUTH_LEAVING`,
+/// the reason cfg80211/wpa_supplicant use for a local disconnect.
+pub(super) const DEAUTH_LEAVING: u16 = 3;
+
 pub(super) struct Authenticated {
     pub status: AuthenticationStatus,
     pub response: Vec<u8>,
@@ -361,6 +367,81 @@ impl Owner {
             activity.await;
         }
     }
+    /// Linux net/mac80211/mlme.c::ieee80211_set_disassoc(tx=true), reached
+    /// from a local cfg80211 disconnect: pending host frames are dropped
+    /// first (the close owner drains the TX ring), then one Deauthentication
+    /// goes to the current AP while the association, peer, management queue
+    /// and keys are still installed, and its terminal TX receipt is awaited
+    /// before any station teardown. The frame is unprotected: this profile
+    /// negotiates no MFP, so IEEE 802.11-2020 11.13 does not protect it.
+    ///
+    /// Without current platform/host emission authority the close stays
+    /// local (Linux `tx=false`). A terminal TX_CMD without ACK is a complete
+    /// receipt; only a revoked or uncertain in-flight frame fails the owner.
+    /// Returns whether the AP acknowledged the frame.
+    pub(super) async fn deauthenticate_using(
+        &mut self,
+        reason: u16,
+        policy: &mut impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<bool, &'static str> {
+        if self.phase != Phase::DataPrepared || self.hardware.is_failed() {
+            return Err("no associated MVM owner to deauthenticate");
+        }
+        let queue = self
+            .management_queue
+            .as_ref()
+            .and_then(|q| q.id)
+            .ok_or("MVM deauthentication management queue absent")?;
+        let local = self.mac.ok_or("missing deauthentication MAC")?;
+        if policy()
+            .and_then(|domain| self.check_link_power(&domain))
+            .is_err()
+        {
+            return Ok(false);
+        }
+        let chains = self
+            .nvm
+            .as_ref()
+            .ok_or("missing deauthentication NVM")?
+            .tx_chains;
+        let data = self
+            .power
+            .prepared
+            .as_mut()
+            .and_then(|p| p.mlme.data.as_mut())
+            .ok_or("MVM deauthentication data owner absent")?;
+        data.port_open = false;
+        let frame = super::super::frame_api::management(
+            DEAUTHENTICATION,
+            local,
+            data.status.bssid,
+            data.sequence,
+            &reason.to_le_bytes(),
+        );
+        data.sequence = data.sequence.wrapping_add(1) & 4095;
+        let rate = super::super::rates::Rates {
+            supported: data.status.supported_rates,
+            basic: data.status.basic_rates,
+        }
+        .management_rate(chains & chains.wrapping_neg());
+        // Reserved before publication; a cancelled close cannot reissue it.
+        self.phase = Phase::TransmittingData;
+        match self
+            .qualified_closing_transmit(queue, &frame, rate, policy)
+            .await
+        {
+            Ok(()) => {
+                self.phase = Phase::DataPrepared;
+                Ok(true)
+            }
+            Err(error) if error == super::super::runtime::TX_FAILED => {
+                self.phase = Phase::DataPrepared;
+                Ok(false)
+            }
+            Err(error) => self.data_failed(error),
+        }
+    }
+
     /// Local association close, without claiming an over-air deauthentication.
     /// Exact firmware receipts precede returning the still-active disabled peer.
     pub async fn clear_association(&mut self) -> Result<(), &'static str> {

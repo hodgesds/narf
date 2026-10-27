@@ -124,7 +124,12 @@ fn smoke_mvm_ht20_native_edca_peer_tlc_and_generated_offer_are_literal() -> Test
             return Err("proved native HT capability not exposed");
         }
         let cap = h.device.phy_capabilities(2400).ok_or("HT profile absent")?;
-        if cap.ht[0] != 0x2c || cap.ht[3] != 255 || cap.ht[4..13] != [0; 9] || cap.vht.is_some() {
+        if cap.ht[0] != 0x2d
+            || cap.ht[1] & 3 != 1
+            || cap.ht[3] != 255
+            || cap.ht[4..13] != [0; 9]
+            || cap.vht.is_some()
+        {
             return Err("HT20/SISO capability broadened to wider/NSS2/VHT");
         }
         Ok(())
@@ -253,6 +258,54 @@ fn smoke_mvm_ht20_response_narrows_tx_without_narrowing_local_qos_receive() -> T
 kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2/interface",
     smoke_mvm_ht20_response_narrows_tx_without_narrowing_local_qos_receive
+);
+
+/// Linux rf-hr/rf-jf `ht_params.{ldpc,stbc}`: the HT20 offer promises LDPC
+/// and one-stream STBC reception, never TX STBC; the native RX owner admits
+/// exactly those rates-v2 coding bits and keeps TX TLC coding unchanged.
+fn smoke_mvm_ht20_rx_ldpc_and_stbc_are_advertised_and_admitted() -> TestResult {
+    check(|| {
+        let h = Harness::profile(true, true)?;
+        let cap = h.device.phy_capabilities(2400).ok_or("HT profile absent")?;
+        if cap.ht[0] & 1 == 0 || cap.ht[0] & 0x80 != 0 || cap.ht[1] & 3 != 1 {
+            return Err("HT20 offer RX LDPC/STBC1 promise or TX STBC absence");
+        }
+        h.join()?;
+        {
+            let actor = h.actor.lock();
+            let tlc = actor
+                .commands
+                .iter()
+                .find(|(g, c, _)| *g == 5 && *c == 15)
+                .ok_or("HT TLC absent")?;
+            // TLC v3 `flags` (bytes 8..10): no TLC_MNG_CFG_FLAGS_{STBC,LDPC}.
+            if tlc.2[8..10] != [0; 2] {
+                return Err("RX coding promise enabled native TX TLC coding flags");
+            }
+        }
+        let rate = |p: &mut Vec<u8>, extra: u32| {
+            p[28..32].copy_from_slice(&(0x00100207u32 | extra).to_le_bytes());
+        };
+        for (pn, coding) in [(40, 1 << 16), (41, 1 << 17), (42, 3 << 16)] {
+            let mut p = encrypted(&h, pn, 0)?;
+            rate(&mut p, coding);
+            if packet(&h, p) != [ethernet(0)] {
+                return Err("advertised LDPC/STBC receive coding rejected");
+            }
+        }
+        for (pn, coding) in [(43, 1 << 18), (44, 1 << 19)] {
+            let mut p = encrypted(&h, pn, 0)?;
+            rate(&mut p, coding);
+            if !packet(&h, p).is_empty() {
+                return Err("HE DCM or unadvertised beamformed HT rate admitted");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/interface",
+    smoke_mvm_ht20_rx_ldpc_and_stbc_are_advertised_and_admitted
 );
 
 fn smoke_mvm_ht20_native_amsdu_complete_stages_all_frames_and_one_pn() -> TestResult {

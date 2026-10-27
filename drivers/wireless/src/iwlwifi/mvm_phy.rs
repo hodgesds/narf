@@ -41,6 +41,8 @@ impl Context {
             tx_mcs: 0,
             tx_sgi: false,
             rx_sgi: false,
+            rx_ldpc: false,
+            rx_stbc: false,
             protection: 0,
             dynamic_smps: false,
             ampdu_exp: 0,
@@ -56,6 +58,8 @@ impl Context {
             profile.tx_mcs = ht.tx_mcs()[0];
             profile.tx_sgi = ht.tx_sgi20();
             profile.rx_sgi = ht.rx_sgi20();
+            profile.rx_ldpc = ht.rx_ldpc();
+            profile.rx_stbc = ht.rx_stbc();
             profile.dynamic_smps = (ht.peer_capability() >> 2) & 3 == 1;
             profile.ampdu_exp = ht.peer_ampdu_factor();
             profile.density = ht.peer_mpdu_density();
@@ -77,11 +81,24 @@ pub(super) struct Profile {
     pub tx_mcs: u8,
     pub tx_sgi: bool,
     pub rx_sgi: bool,
+    /// Local HT receive-coding promises from [`local_ht`].
+    pub rx_ldpc: bool,
+    pub rx_stbc: bool,
     pub protection: u32,
     pub dynamic_smps: bool,
     pub ampdu_exp: u8,
     pub density: u8,
     pub operation: [u8; 22],
+}
+/// The native Gen2 HT20/SISO capability: SGI20, RX LDPC and one RX STBC
+/// stream (Linux iwl-nvm-utils.c::iwl_init_ht_hw_capab with rf-hr/rf-jf
+/// `ht_params = { .stbc = true, .ldpc = true }`). These are receive
+/// promises only: TX STBC needs a second TX chain and TX LDPC the TLC
+/// LDPC flag; this single-stream emitting profile uses neither.
+pub(in crate::iwlwifi) fn local_ht() -> LocalHt {
+    LocalHt::siso20(true, true)
+        .with_ldpc(true, false)
+        .with_rx_stbc(true)
 }
 pub(super) fn parameters(ies: &[u8]) -> Result<Option<Parameters>, &'static str> {
     let parsed = Parameters::parse(ies).map_err(|_| "MVM malformed WMM parameters")?;
@@ -178,9 +195,12 @@ impl Profile {
             return false;
         };
         let r = u32::from_le_bytes(raw.try_into().unwrap());
+        // rates-v2 (fw/api/rs.h RATE_MCS_LDPC_POS 16, RATE_MCS_STBC_POS 17):
+        // accepted only as the receive coding this station advertised.
+        let coding = (u32::from(self.rx_ldpc) << 16) | (u32::from(self.rx_stbc) << 17);
         self.ht
             && (r >> 8) & 7 == 2
-            && r & (0xf8 | (7 << 11) | (15 << 16) | (3 << 23)) == 0
+            && r & (0xf8 | (7 << 11) | ((15 << 16) & !coding) | (3 << 23)) == 0
             && ((r >> 20) & 7 == 0 || self.rx_sgi && (r >> 20) & 7 == 1)
     }
 }
@@ -290,7 +310,7 @@ impl super::Owner {
         if !self.supports_native_ht20() {
             return Err("MVM native HT20 contract unavailable");
         }
-        LocalPhy::ht20(LocalHt::siso20(true, true)).map_err(|_| "MVM local HT20 profile invalid")
+        LocalPhy::ht20(local_ht()).map_err(|_| "MVM local HT20 profile invalid")
     }
     pub(super) fn station_plan(
         &self,
