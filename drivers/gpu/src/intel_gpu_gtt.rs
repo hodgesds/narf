@@ -375,6 +375,11 @@ pub fn scanout_order_for(size_bytes: u64) -> Option<u8> {
     Some(order)
 }
 
+/// The GGTT offset of the historical single-scanout window
+/// (Pipe A's window in the multi-pipe assignment,
+/// `intel_gpu_multipipe::scanout_gtt_offset`).
+pub const SCANOUT_GTT_OFFSET_PIPE_A: u64 = 0x100_0000;
+
 /// Allocate one physically contiguous block of frames and map it
 /// into the GGTT at the scanout offset. On any failure after the
 /// block is allocated, the block is freed before returning.
@@ -382,11 +387,24 @@ pub fn alloc_contiguous_scanout(
     gtt_mmadr: &narf_bus::bar::MmioRegion,
     size_bytes: u64,
 ) -> Result<ContiguousScanout, GttError> {
-    const SCANOUT_GTT_OFFSET: u64 = 0x100_0000;
+    alloc_contiguous_scanout_at(gtt_mmadr, SCANOUT_GTT_OFFSET_PIPE_A, size_bytes)
+}
 
+/// [`alloc_contiguous_scanout`] at a caller-chosen GGTT offset.
+///
+/// The single-offset original could only ever host one live
+/// scanout: a second call remapped the same GGTT window onto new
+/// frames, silently stealing the first surface. Multi-pipe
+/// display (#1017) gives each pipe its own window (32 MiB apart,
+/// the maximum scanout block) and allocates through here.
+pub fn alloc_contiguous_scanout_at(
+    gtt_mmadr: &narf_bus::bar::MmioRegion,
+    gtt_offset: u64,
+    size_bytes: u64,
+) -> Result<ContiguousScanout, GttError> {
     let order = scanout_order_for(size_bytes).ok_or(GttError::OutOfMemory)?;
     let pages = size_bytes.div_ceil(GTT_PAGE_SIZE);
-    check_ggtt_range(gtt_mmadr.len, SCANOUT_GTT_OFFSET, pages * GTT_PAGE_SIZE)?;
+    check_ggtt_range(gtt_mmadr.len, gtt_offset, pages * GTT_PAGE_SIZE)?;
     let head = narf_memory::frame::alloc_pages_on(0, order).map_err(|_| GttError::OutOfMemory)?;
     let base = head.start_address().raw();
     for i in 0..pages {
@@ -398,7 +416,7 @@ pub fn alloc_contiguous_scanout(
                 return Err(e);
             }
         };
-        let pte_index = (SCANOUT_GTT_OFFSET / GTT_PAGE_SIZE) + i;
+        let pte_index = (gtt_offset / GTT_PAGE_SIZE) + i;
         let pte_offset = GGTT_ARRAY_BASE + pte_index * 8;
         // SAFETY: `gtt_mmadr` is the caller-mapped BAR0 (`GTTMMADR`) region.
         // `pte_offset` is `GGTT_ARRAY_BASE` (8 MiB into the BAR) plus
@@ -414,10 +432,10 @@ pub fn alloc_contiguous_scanout(
         }
     }
     if pages > 0 {
-        flush_ggtt_writes(gtt_mmadr, SCANOUT_GTT_OFFSET / GTT_PAGE_SIZE + pages - 1);
+        flush_ggtt_writes(gtt_mmadr, gtt_offset / GTT_PAGE_SIZE + pages - 1);
     }
     Ok(ContiguousScanout {
-        gtt_offset: SCANOUT_GTT_OFFSET as u32,
+        gtt_offset: gtt_offset as u32,
         head,
         order,
         size_bytes,

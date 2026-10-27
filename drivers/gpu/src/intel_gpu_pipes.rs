@@ -106,6 +106,21 @@ impl Pipe {
     pub const fn trans_base(self) -> u64 {
         TRANS_TIMING_BASE + (self as u64) * Self::STRIDE
     }
+
+    /// The transcoder bound to this pipe. On Gen12 each pipe
+    /// drives the same-index transcoder (Pipe B ↔ Transcoder B);
+    /// the dedicated EDP transcoder is a pre-Gen12 shape this
+    /// driver never binds. Added for the multi-pipe orchestrator
+    /// (#1017): before it, every consumer hardcoded
+    /// `Transcoder::A`.
+    pub const fn transcoder(self) -> Transcoder {
+        match self {
+            Pipe::A => Transcoder::A,
+            Pipe::B => Transcoder::B,
+            Pipe::C => Transcoder::C,
+            Pipe::D => Transcoder::D,
+        }
+    }
 }
 
 impl Transcoder {
