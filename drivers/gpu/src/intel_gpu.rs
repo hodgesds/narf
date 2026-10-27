@@ -1287,14 +1287,23 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
     use crate::intel_gpu_dp::HpdEvent;
     match event {
         HpdEvent::Connected(ddi) => {
-            if let Some((conn, fb, alloc)) = dp_connect(ddi) {
-                publish_scanout(Some(narf_graphics_driver::generic::GenericFb::new(
-                    alloc.phys_base,
-                    conn.mode.h_active as u32,
-                    conn.mode.v_active as u32,
-                    fb.stride_bytes,
-                    32,
-                )));
+            if let Some(conn) = dp_connect(ddi) {
+                // Publish from the stored session state (the
+                // retained allocation + framebuffer the session
+                // actually scans out).
+                let stored = {
+                    let session = DP_SESSION.lock();
+                    session.as_ref().map(|s| (s.alloc, s.fb))
+                };
+                if let Some((alloc, fb)) = stored {
+                    publish_scanout(Some(narf_graphics_driver::generic::GenericFb::new(
+                        alloc.phys_base,
+                        conn.mode.h_active as u32,
+                        conn.mode.v_active as u32,
+                        fb.stride_bytes,
+                        32,
+                    )));
+                }
             }
         }
         HpdEvent::Disconnected(ddi) => {
@@ -1345,13 +1354,7 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
 /// probe the sink over AUX, allocate its scanout, activate.
 /// On success the session state is stored for disconnect /
 /// retrain handling.
-fn dp_connect(
-    ddi: crate::intel_gpu_ddi::Ddi,
-) -> Option<(
-    crate::intel_gpu_dp::DpConnection,
-    crate::intel_gpu_modeset::Framebuffer,
-    ScanoutAllocation,
-)> {
+fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpConnection> {
     with_controller(|gpu| {
         if !gpu.chip.generation.display_supported() {
             return None;
@@ -1381,7 +1384,7 @@ fn dp_connect(
             fb,
             alloc,
         });
-        Some((conn, fb, alloc))
+        Some(conn)
     })
     .flatten()
 }

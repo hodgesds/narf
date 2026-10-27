@@ -361,8 +361,8 @@ pub mod tests {
         let name = b"TEST DP MON";
         e[54 + 5..54 + 5 + name.len()].copy_from_slice(name);
         e[54 + 5 + name.len()] = 0x0A;
-        for i in 54 + 5 + name.len() + 1..54 + 18 {
-            e[i] = 0x20;
+        for b in &mut e[54 + 5 + name.len() + 1..54 + 18] {
+            *b = 0x20;
         }
         // CTA extension at 128: tag 0x02, rev 3, DTD offset,
         // basic-audio flag (byte 3 bit 6).
