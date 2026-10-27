@@ -185,10 +185,10 @@ pub struct UserTaskCtx {
     /// identity, so CLONE_VM threads match while unrelated processes using
     /// the same virtual address cannot consume each other's wakes.
     pub futex_namespace: AtomicU64,
-    /// Snapshot of the per-uaddr `FUTEX_WAKE` counter taken by `sys_futex`
+    /// Snapshot of the bucket `FUTEX_WAKE` counter taken by `sys_futex`
     /// just before it parks. The poll routine re-reads the live counter after
-    /// registering the waker; if it advanced, a wake landed in the
-    /// check→register window (lost-wakeup race) and the task self-wakes to
+    /// registering the waker; if it advanced, a wake may have landed in the
+    /// check→register window (including a colliding key) and the task self-wakes to
     /// re-enter user mode instead of sleeping. Mirrors `epoll_park_gen`.
     pub futex_park_gen: AtomicU64,
     /// The futex word value this task's `FUTEX_WAIT` parked on. The park

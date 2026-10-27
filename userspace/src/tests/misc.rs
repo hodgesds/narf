@@ -1525,7 +1525,7 @@ fn smoke_userspace_futex_wait_and_wake_no_op() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_userspace_futex_wait_and_wake_no_op);
 
-/// FUTEX_WAIT is a seqlock read: the per-uaddr wake generation MUST be sampled
+/// FUTEX_WAIT is a seqlock read: the bucket wake generation MUST be sampled
 /// BEFORE the futex word is read, so that a FUTEX_WAKE racing between the word
 /// read and the waiter's park is caught by the park guard (`futex_gen(uaddr)
 /// != park_gen`). Regression for the intermittent SMP lost-wakeup: sampling
@@ -1544,7 +1544,7 @@ fn smoke_userspace_futex_wait_seqlock_gen_before_value() -> TestResult {
     use crate::handlers::{__test_futex_bump_counter, futex_gen, futex_wait_seqlock_read};
 
     // A uaddr no other test touches. Reason about deltas, not absolutes: the
-    // per-uaddr counter is process-global and never reset.
+    // bucket counter is process-global and never reset.
     const U: u64 = 0x5EC0_1000;
     let base = futex_gen(U);
 
@@ -1610,6 +1610,126 @@ fn smoke_userspace_futex_wait_seqlock_no_false_wake() -> TestResult {
 kernel_test_in!(
     "userspace",
     smoke_userspace_futex_wait_seqlock_no_false_wake
+);
+
+/// Wake-only addresses must not accumulate heap-backed generation history.
+/// The old per-key BTreeMap retained thousands of kmalloc-1024 nodes here.
+fn smoke_futex_generation_history_is_bounded() -> TestResult {
+    narf_lib::sync::without_interrupts(|| {
+        let before = narf_memory::slab::stats().classes[6].in_use;
+        for i in 0..16_384 {
+            crate::handlers::futex_wake_waiters_for_test(0x6F70_0000 + i * 4, 1);
+        }
+        let after = narf_memory::slab::stats().classes[6].in_use;
+        // Leave room for unrelated boot bookkeeping, not per-address history.
+        if after.saturating_sub(before) > 8 {
+            return TestResult::Fail("wake-only futex addresses retained heap objects");
+        }
+        TestResult::Pass
+    })
+}
+kernel_test_in!(
+    "userspace/futex_generation/history",
+    smoke_futex_generation_history_is_bounded
+);
+
+struct FutexGenerationWake(core::sync::atomic::AtomicU32);
+
+impl alloc::task::Wake for FutexGenerationWake {
+    fn wake(self: alloc::sync::Arc<Self>) {
+        self.0.fetch_add(1, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// A shared generation hint must never count as a wake of another key.
+/// Exercise the handler-driven queue's exact dequeued/not-dequeued result.
+fn smoke_futex_generation_address_collision_keeps_exact_waiters() -> TestResult {
+    use crate::handlers::{
+        __test_futex_bucket_index, __test_futex_q_new, __test_futex_q_queue,
+        __test_futex_q_unqueue, futex_gen, futex_wake_waiters_for_test,
+    };
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    const A: u64 = 0x6F80_0000;
+    let Some(b) = (1..4096)
+        .map(|i| A + i * 4)
+        .find(|&b| __test_futex_bucket_index(0, b) == __test_futex_bucket_index(0, A))
+    else {
+        return TestResult::Fail("no colliding futex address found");
+    };
+    let a_count = Arc::new(FutexGenerationWake(AtomicU32::new(0)));
+    let b_count = Arc::new(FutexGenerationWake(AtomicU32::new(0)));
+    let a_q = __test_futex_q_new(&[A]);
+    let b_q = __test_futex_q_new(&[b]);
+    __test_futex_q_queue(&a_q, 0, 0xF670_0001, a_count.clone().into());
+    __test_futex_q_queue(&b_q, 0, 0xF670_0002, b_count.clone().into());
+    let before = futex_gen(A);
+    let woken = futex_wake_waiters_for_test(b, 1);
+    let hint_changed = futex_gen(A) != before;
+    // Always unqueue both test entries, including on the assertion paths.
+    let a_woken = __test_futex_q_unqueue(&a_q, 1, 0xF670_0001);
+    let b_woken = __test_futex_q_unqueue(&b_q, 1, 0xF670_0002);
+    if !hint_changed {
+        return TestResult::Fail("colliding keys did not share the generation hint");
+    }
+    if woken != 1
+        || a_woken.is_some()
+        || b_woken != Some(0)
+        || a_count.0.load(Ordering::Acquire) != 0
+        || b_count.0.load(Ordering::Acquire) != 1
+    {
+        return TestResult::Fail("generation collision woke or dequeued an unrelated address");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/futex_generation/collision",
+    smoke_futex_generation_address_collision_keeps_exact_waiters
+);
+
+fn smoke_futex_generation_namespace_collision_keeps_exact_waiters() -> TestResult {
+    use crate::handlers::{
+        __test_futex_bucket_index, __test_futex_register_waiter_scoped,
+        __test_futex_wake_counter_scoped, __test_futex_wake_scoped,
+    };
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    const ADDR: u64 = 0x6F90_0000;
+    let Some(namespace) = (1..4096)
+        .map(|i| i << 3)
+        .find(|&ns| __test_futex_bucket_index(ns, ADDR) == __test_futex_bucket_index(0, ADDR))
+    else {
+        return TestResult::Fail("no colliding futex namespace found");
+    };
+    let a_count = Arc::new(FutexGenerationWake(AtomicU32::new(0)));
+    let b_count = Arc::new(FutexGenerationWake(AtomicU32::new(0)));
+    __test_futex_register_waiter_scoped(0, ADDR, 0xF670_0003, a_count.clone().into());
+    __test_futex_register_waiter_scoped(namespace, ADDR, 0xF670_0004, b_count.clone().into());
+    let before = __test_futex_wake_counter_scoped(0, ADDR);
+    let woken = __test_futex_wake_scoped(namespace, ADDR, 1);
+    let hint_changed = __test_futex_wake_counter_scoped(0, ADDR) != before;
+    let a_before_wake = a_count.0.load(Ordering::Acquire);
+    let a_woken = __test_futex_wake_scoped(0, ADDR, u32::MAX);
+    let b_remaining = __test_futex_wake_scoped(namespace, ADDR, u32::MAX);
+    if !hint_changed {
+        return TestResult::Fail("colliding namespaces did not share the generation hint");
+    }
+    if woken != 1
+        || a_before_wake != 0
+        || a_woken != 1
+        || b_remaining != 0
+        || a_count.0.load(Ordering::Acquire) != 1
+        || b_count.0.load(Ordering::Acquire) != 1
+    {
+        return TestResult::Fail("generation collision consumed another namespace's wake");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/futex_generation/collision",
+    smoke_futex_generation_namespace_collision_keeps_exact_waiters
 );
 
 /// `FUTEX_REQUEUE` core semantics: wake up to `nr_wake` waiters on the

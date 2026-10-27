@@ -10108,33 +10108,39 @@ fn futex_bucket_index(key: FutexKey) -> usize {
 
 #[repr(align(64))]
 struct FutexCounterBucket {
-    values: narf_lib::sync::IrqSafeSpinLock<alloc::collections::BTreeMap<FutexKey, u64>>,
+    generation: AtomicU64,
 }
 
 impl FutexCounterBucket {
     const fn new() -> Self {
         Self {
-            values: narf_lib::sync::IrqSafeSpinLock::new(alloc::collections::BTreeMap::new()),
+            generation: AtomicU64::new(0),
         }
     }
 }
 
+// Wake history must be fixed-size, including wakes with no queued waiter.
+// A per-key map leaked one entry for every short-lived pthread's clear-tid
+// address. Permanent bucket stamps also avoid retiring a key while a waiter
+// is between its word read and queue registration.
+const _: () = assert!(core::mem::size_of::<FutexCounterBucket>() == 64);
 static FUTEX_WAKE_COUNTERS: [FutexCounterBucket; FUTEX_BUCKET_COUNT] =
     [const { FutexCounterBucket::new() }; FUTEX_BUCKET_COUNT];
 
 fn futex_wake_counter_key(key: FutexKey) -> u64 {
     FUTEX_WAKE_COUNTERS[futex_bucket_index(key)]
-        .values
-        .lock()
-        .get(&key)
-        .copied()
-        .unwrap_or(0)
+        .generation
+        .load(Ordering::Acquire)
 }
 
 pub(crate) fn futex_bump_counter_key(key: FutexKey) {
-    let mut values = FUTEX_WAKE_COUNTERS[futex_bucket_index(key)].values.lock();
-    let slot = values.entry(key).or_insert(0);
-    *slot = slot.wrapping_add(1);
+    // Publish the userspace word store before attempting the queue lock.
+    // If dequeue finishes before a waiter's queue insertion, that bucket's
+    // unlock/acquire pair makes this increment happen-before its post-queue
+    // generation load. If dequeue is later, it finds the registered waiter.
+    FUTEX_WAKE_COUNTERS[futex_bucket_index(key)]
+        .generation
+        .fetch_add(1, Ordering::Release);
 }
 
 fn futex_wake_counter(uaddr: u64) -> u64 {
@@ -10145,10 +10151,11 @@ fn futex_bump_counter(uaddr: u64) {
     futex_bump_counter_key(futex_key(0, uaddr));
 }
 
-/// Live per-uaddr `FUTEX_WAKE` generation. The user-task poll routine
+/// Advisory hash-bucket `FUTEX_WAKE` generation. The user-task poll routine
 /// snapshots this (`futex_park_gen`) before parking and re-reads it after
-/// registering the waker — a change means a wake raced the registration
-/// (lost-wakeup guard). Public mirror of `futex_wake_counter`.
+/// registering the waker. A change requires rechecking the word; it does not
+/// prove this exact key was woken. Queue removal always matches the full key.
+/// Public mirror of `futex_wake_counter`.
 pub fn futex_gen(uaddr: u64) -> u64 {
     futex_wake_counter(uaddr)
 }
@@ -10158,7 +10165,7 @@ pub(crate) fn futex_gen_key(key: FutexKey) -> u64 {
     futex_wake_counter_key(key)
 }
 
-/// `FUTEX_WAIT` seqlock read: sample the per-uaddr wake generation FIRST,
+/// `FUTEX_WAIT` seqlock read: sample the bucket wake generation FIRST,
 /// then read the futex word. This ORDER is load-bearing. The generation is a
 /// seqlock the waiter reads as "sample gen → read value → (at park) recheck
 /// gen": a `FUTEX_WAKE` that races between the word read and the park
@@ -10171,6 +10178,8 @@ pub(crate) fn futex_gen_key(key: FutexKey) -> u64 {
 /// between the read and the park). Returns `(gen, *uaddr)`, or `None` if
 /// `read_word` reports a fault. `read_word` is a closure so the exact
 /// user-memory read (or, in tests, an injected racing bump) is the caller's.
+/// Hash collisions conservatively cause an extra word read in `futex_block`;
+/// that wait succeeds only when its exact queue entry was actually dequeued.
 pub(crate) fn futex_wait_seqlock_read(
     uaddr: u64,
     read_word: impl FnOnce() -> Option<u32>,
@@ -10741,7 +10750,7 @@ pub(crate) fn futex_park_register_and_check(
 
 /// Decide whether a parked `FUTEX_WAIT` should STAY parked on its next
 /// park-loop re-check (the ~10 ms wheel-backstop re-poll): only while BOTH
-/// no `FUTEX_WAKE` generation has landed on the word (`gen_now ==
+/// no `FUTEX_WAKE` generation has landed on the bucket (`gen_now ==
 /// park_gen`) AND the futex word itself still holds the value the waiter
 /// parked on (`word_now == Some(expected)`).
 ///
@@ -10862,7 +10871,7 @@ pub fn dbg_futex_waiter_registered(namespace: u64, uaddr: u64, tid: u64) -> bool
         .unwrap_or(false)
 }
 
-/// Fatal-path futex snapshot: `(live_generation, registered_waiters)`.
+/// Fatal-path futex snapshot: `(bucket_generation_hint, registered_waiters)`.
 ///
 /// Exact for mm-scoped keys only. A shared op on a `MAP_SHARED` object is
 /// keyed by `(object, offset)` (see `futex_park_key`), which `(namespace,
@@ -11034,7 +11043,7 @@ fn futex_unqueue_multiple(q: &FutexQ, n: usize, tid: u64) -> Option<usize> {
 ///
 /// Lost wakes. Linux makes `futex_wait_setup`'s read-and-queue atomic with
 /// the hash-bucket lock. Here the read cannot be under a spinlock (a user
-/// read may fault), so the per-key wake generation stands in for it:
+/// read may fault), so the bucket wake generation stands in for it:
 ///
 ///   waiter: g = gen(K); v = *uaddr; v == val ⇒ queue(K); gen(K) != g ⇒
 ///           re-read *uaddr, and a moved word is a setup failure.
@@ -11046,7 +11055,9 @@ fn futex_unqueue_multiple(q: &FutexQ, n: usize, tid: u64) -> Option<usize> {
 /// so our post-queue generation read (which follows our queue, which follows
 /// its dequeue) sees the bump — and its word store, which preceded the bump,
 /// is visible to the re-read: a changed word fails the setup, an unchanged
-/// one means the wake simply preceded our wait. `sleep_deadline_ns` is
+/// one means it is still safe to wait. A colliding key's wake can also advance
+/// the hint: it triggers only this re-read, never a successful wait or an
+/// unrelated dequeue. `sleep_deadline_ns` is
 /// stored before the first queue, so the waker's clear always lands after it
 /// and a wake that beats the park makes the park loop return at once; one
 /// that lands after the park fires the parked task's own waker.

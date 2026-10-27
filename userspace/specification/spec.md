@@ -1084,6 +1084,15 @@ Private futex wait queues are keyed by `(address-space identity, user address)`;
 virtual address cannot consume one another's `FUTEX_WAKE_PRIVATE` events.
 Classic `FUTEX_WAIT` returns `EAGAIN` when the user word no longer equals the
 expected value; a stale wait is never reported as a successful wake.
+The read-to-queue lost-wakeup guard uses one permanent atomic generation per
+hash bucket, occupying a fixed 4 KiB across all 64 buckets. Sampling and
+bumping a generation are O(1), allocation-free operations; no per-address
+wake history survives thread or mapping teardown. Waiters acquire-sample the
+generation before reading the word and recheck after locked queue insertion;
+wakers release-increment it before locked dequeue. Collisions can require an
+extra word validation but never consume another key's wake. Handler-driven
+waits succeed only when an exact-key queue entry was dequeued; PI retries and
+the legacy park retain their existing spurious-recheck behavior.
 
 Linux NUMA compatibility reports live topology rather than a structural
 single-node stub: `getcpu(2)` returns the current logical CPU and its

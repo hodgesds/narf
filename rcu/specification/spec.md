@@ -277,24 +277,35 @@ code that happened to pass a quiescent state; NARF does the same:
 
 ```rust
 // Installed once at boot, after the scheduler's ready queues exist.
-rcu::set_reclaim_offload(wake: fn());
+rcu::set_reclaim_offload(workers: usize, wake: fn(worker: usize));
 // Remove the hook (tests): implicit drains run destructors inline again.
 rcu::clear_reclaim_offload();
 // Run every handed-off destructor; returns how many ran.
 rcu::run_offloaded_reclaim() -> usize;
+// Run the handed-off callbacks assigned to one worker.
+rcu::run_offloaded_reclaim_for(worker: usize) -> usize;
 ```
 
 - With a hook installed, `report_quiescent` / `report_idle` splice
-  expired entries onto one global pending list and call `wake` on
-  the list's empty→pending transition only (coalesced). The boot
-  hook spawns a stackful task that calls `run_offloaded_reclaim`, so
+  expired entries onto cache-line-separated intrusive worker queues and call
+  `wake(worker)` once until that queue is detached (coalesced). Install the
+  hook once, after creating `1..=MAX_CPUS` workers; reconfiguration requires
+  producers and workers to be stopped. The producing CPU modulo the fixed
+  worker count selects a queue in O(1), without allocation or a shared lock.
+  A consumer clears the queue's wake flag before atomically detaching it;
+  publication racing the detached batch therefore wakes another run.
+  The boot hook creates one persistent stackful task per initially online CPU.
+  Each calls `run_offloaded_reclaim_for` on its own queue, so
   a destructor runs with interrupts enabled, holding nothing of its
   caller's, and can `cooperative_yield` on a busy device gate.
+  Workers prefer separate CPUs but remain migratable: CPU hot-unplug cannot
+  strand a queue, and newly online CPUs route to existing workers. Each worker
+  yields after a batch to let the executor report a real quiescent boundary.
 - Without a hook (early boot, kernel tests) drains run destructors
   inline, as before.
 - The explicit grace-period waits (`sync`, `sync_until`,
   `SyncFuture`) keep their contract: they drain their own bucket and
-  run the pending list before returning, so everything retired before
+  drain all worker queues before returning, so everything retired before
   the wait has been dropped.
 
 Reclamation runs *inside the domain that owned the allocation* so
