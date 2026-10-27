@@ -1093,6 +1093,12 @@ wakers release-increment it before locked dequeue. Collisions can require an
 extra word validation but never consume another key's wake. Handler-driven
 waits succeed only when an exact-key queue entry was dequeued; PI retries and
 the legacy park retain their existing spurious-recheck behavior.
+After dequeuing one real waiter, a futex wake passes its owned scheduler waker
+to `wake_preempt_task`. A local eligible waiter may use the scheduler's bounded
+direct-handoff path without losing its exact parked owner; remote wakes retain
+ordinary placement. The helper does not change futex-key matching, successful
+wait completion, or generation ordering. Multi-wakes and exit-path spread
+wakes keep their ordinary fan-out behavior.
 
 Linux NUMA compatibility reports live topology rather than a structural
 single-node stub: `getcpu(2)` returns the current logical CPU and its

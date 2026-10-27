@@ -93,6 +93,8 @@ pub fn note_forward_progress();          // bounded completion heartbeat
 pub fn forward_progress_count() -> u64;  // fatal-watchdog snapshot
 /// Mark a dequeued synchronous waiter for an immediate local handoff.
 pub fn note_urgent_wake_preempt(woken: u64);
+/// Consume one exact waiter's waker; preserve ordinary remote placement.
+pub fn wake_preempt_task(waker: core::task::Waker, expected_task: u64);
 pub fn dbg_cpu_stall(cpu: usize) -> (usize, usize, bool, bool);
 pub fn dbg_slot_state(task: u64)
     -> Option<(bool, u32, usize, u64, u32, bool)>;
@@ -240,6 +242,28 @@ wakes do not publish the generic idle-sibling placement hint; allowing an idle
 thief to pull the just-woken endpoint would undo co-location and the local
 urgent-buddy handoff. Once the pair is co-located, the existing bounded local
 direct path may handle later exchanges.
+`wake_preempt_task` preserves an exact local futex wake's scheduler-owned
+`WakeCell` instead of rediscovering it through a task-id queue scan. The wake
+still publishes the durable runnable bit and activation inbox entry first.
+A local direct-eligible waiter retains its indexed parked owner, allowing the
+existing validated direct claim to use that owner in O(1). A deferred inbox
+activation cannot duplicate or dispatch a directly claimed continuation.
+Remote waiters retain ordinary placement and receive their normal kick; this
+API does not request synchronous affinity migration. Foreign wakers and
+noneligible local tasks keep their validated fallback. Self-wakes and a
+mismatched expected identity cannot publish an exact handoff.
+The urgent id and optional owning handle are one cache-line-isolated per-CPU
+hint. A short IRQ-safe lock serializes publication and consumption of the pair;
+an acquire-read of the pending id keeps the empty dispatch path free of writes.
+An id-only publication preserves a handle for that same task and removes any
+other task's handle. Replaced owners are dropped after releasing the hint lock.
+The hint never authorizes execution: the existing queue claim still validates
+ownership, policy, affinity, budget, completion and execution kind.
+Direct entry and direct return additionally require the conservative per-CPU
+uniform-queue guard. Once mixed class, priority, budget or capability metadata
+has been published, these shortcuts defer to ordinary policy selection. A
+higher-class enqueue during a handoff therefore prevents its direct root
+return, so pending higher-tier work runs through the executor first.
 The target normally returns to the source's root executor continuation. It may
 instead switch directly to the root's saved task continuation when that exact
 off-queue root is still runnable: either an urgent publication names the same
@@ -442,17 +466,18 @@ slot and every external policy retain the full validation scan.
 
 The other pre-scan executor selection is an exact synchronous-handoff hint for
 an awake task with no periodic budget: that state proves the highest
-eligibility tier without budget accounting, and wake-next already precedes
-class ordering within that tier. Before returning through the executor, an
-eligible bounded direct transfer may instead claim that same resident slot
+eligibility tier without budget accounting. Before returning through the
+executor, an eligible bounded direct transfer may instead claim that same resident slot
 under its home queue lock; external policies, periodic/capped/donated targets,
 and non-default task classes always retain the full callback and validation
 scan. Under `ClassScheduler`, a monotone per-CPU mask of classes admitted or
 migrated there conservatively forces the full scan once a higher class could be
-present; a buddy is honored only within the winning class, as Linux applies CFS
-buddies only after core class selection. Stale class bits can only disable the
-shortcut. The homogeneous FIFO path refreshes the runnable-peer hint from
-queue cardinality before removal (one runnable slot has no peer; additional
+present. Mixed priority or budget metadata also disables the shortcut. A buddy
+is honored only within the winning class and priority, and must match the
+winning deadline for equal-priority realtime work. This preserves the class
+policy's ordering before applying the buddy preference. Stale summary bits can
+only disable the shortcut. The homogeneous FIFO path refreshes the
+runnable-peer hint from queue cardinality before removal (one runnable slot has no peer; additional
 slots are peers), using the same store-before-wake ordering as the full scan.
 The exact-handoff path leaves the hint conservatively set until a later full
 scan. Neither can erase a later concurrent wake.
