@@ -501,7 +501,7 @@ fn record_owned(
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use async_trait::async_trait;
-use core::sync::atomic::{AtomicBool, AtomicU32};
+use core::sync::atomic::AtomicU32;
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_tpm::{TpmDevice, TpmInfo};
 
