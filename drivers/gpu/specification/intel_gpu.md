@@ -1,11 +1,12 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.8** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.9** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
 > bounds/flush discipline landed — see §9; forcewake domains
-> landed — see §10).
+> landed — see §10; RC6 + DMC landed — see §11; suspend/resume
+> + D-state transitions landed — see §12).
 >
 > Clean-room driver for Intel integrated graphics from Tiger Lake
 > through Meteor Lake. **No GPL Linux `i915` / `xe` source
@@ -577,3 +578,120 @@ event-handler reconfiguration (PSR/DCB routing belongs
 to the display pipeline); DC3CO/DC9 targets; ADL-P
 (display 13) pipe-DMC ranges; wiring park/unpark to GT
 activity (the runtime-PM lane consumes this interface).
+
+## 12. Suspend/resume + D-states (Stage 5 — `intel_gpu_pm`, #1015)
+
+System power for the GPU: the device-PM quiesce/D3/restore
+conversation, honest PCI D-state reporting (the DRM card's
+`power_state()` was a hardcoded `"D0"`), and the S4 state
+hook that carries the configuration through the suspend
+service's sealed image. Compiled only under the gpu crate's
+`intel` feature. Sources: PCI Bus Power Management
+Interface Specification rev 1.2 §3.2.4 (PMCSR) and §5.4
+(10 ms D3 settle), as implemented by `narf_bus::pci`
+(`power_state` / `set_power_state`, Linux
+`pci_raw_set_power_state` semantics: preserve all PMCSR
+fields but PowerState, write 0 to the RW1C PME_Status
+bit); the power-suspend design (`SuspendStateHook`
+contract, §5.2 rule 1–5) from `power/specification/
+spec.md` §3.3; §§10–11 of this document for the forcewake
+and RC6/DMC conversations composed here.
+
+### 12.1 Registration and census
+
+At probe success (Gen12-class parts only — the predicate
+is `region_generation().is_some()`, the same one the RCS
+attach uses; Xe-LPG is excluded until #1016), probe
+retains its `(BusDevice, Cap)` in the PM module and
+registers, both under the name `"intel-gpu"`: a
+`device_pm` ops pair (S3 fan-out) and a `SuspendStateHook`
+(S4 seal/unseal). Registration is a probe-time call, not
+an initcall: **no new initcalls, census unchanged.**
+Runtime modesets (future lanes) must call
+`note_active_mode` when they change the active mode, or
+resume re-lights the stale one.
+
+### 12.2 Snapshot format (`PmSnapshot::to_bytes`)
+
+Header (18 bytes): magic `"NARFIPM1"`, version u16 = 1,
+total length u32, payload length u32. Payload: seq u64;
+flags u8 (bit0 has-mode, bit1 has-scanout, bit2
+RC6-enabled, bit3 DMC-present); DC target field bits u8;
+pre-suspend D-state bits u8; DMC program mask u8 (bit i =
+`DmcId::ALL[i]` present); RC6 residency raw counter u32;
+then, if has-mode, the `Mode` (pixel clock u32, eight
+timing u16s in struct order, sync-polarity u8); then, if
+has-scanout, width/height/stride/gtt_offset u32s and
+phys_base u64. Trailer: CRC-32/ISO-HDLC (check value
+0xCBF43926 for `"123456789"`) over all preceding bytes.
+Parsing is fail-closed: magic, version, exact length
+agreement, CRC, field sanity (DC bits ≤ 2, D-state bits
+≤ 3, nonzero mode geometry with totals ≥ actives), and no
+trailing payload — any failure refuses the whole snapshot
+and nothing from it is applied. The S4 copy is additionally
+AEAD-sealed by the suspend service; the CRC guards the
+in-RAM S3 copy and the framing, not an attacker.
+
+### 12.3 Sequences and failure discipline
+
+Suspend: close the RCS submission gate (new submissions
+refuse with `SubmitError::Suspended`) → drain completions
+until the engine is idle (budget: 100 000 polls — a count,
+not a deadline) → snapshot → forcewake sanitize → park
+RC6 if enabled (the drain proved zero submission-scoped
+holds exist, so park's `DomainsHeld` refusal cannot fire)
+→ PMCSR D3hot + 10 ms settle. A drain that never converges
+refuses with `Busy` before any power register is touched:
+gate reopened, no snapshot, device fully live. Any later
+failure before the D3 write rolls back the same way (a
+failed D3 write additionally unparks).
+
+Resume: PMCSR D0 + settle → **readback must report D0**,
+else the device is named `Degraded(HardwareRestore)` and
+the gate stays closed (a retry from that phase is legal)
+→ forcewake sanitize → DMC reload + `verify_loaded` + DC
+target restore → RC6 re-enable if the snapshot had it →
+display re-light: `relight_display` allocates a *fresh*
+scanout and re-runs the real modeset at the snapshot mode
+(GGTT PTEs do not survive D3; the pre-suspend surface is
+never restored in place). The modeset's EDID readback may
+apply the panel's preferred mode instead of the saved
+fallback — the same behaviour as probe takeover; the
+returned scanout follows the applied mode. Each subsystem
+restore is attempted even if an earlier one degrades, and
+the phase names the first missing piece:
+`Degraded(SnapshotInvalid | UnverifiedRestore |
+HardwareRestore | DisplayRelight | DmcRestore)`. With no
+trusted snapshot, resume re-establishes from driver-owned
+state (and reconciles the software RC6 flag via the
+disable conversation — D3 reset the hardware underneath
+it).
+
+The hook is **not critical**: `seal` serializes the
+snapshot from the device suspend (the service runs the
+seal fan-out after device quiesce); `unseal` records
+Verified/Missing/Invalid; `reconcile_after_unseal` then
+acts — a verified blob replaces the restore source
+pre-resume or re-applies its display state post-resume, a
+missing/invalid blob revokes the RAM snapshot's trust
+(pre-resume) or forces re-establishment from driver state
+(post-resume, named `Degraded(UnverifiedRestore)`). All
+GPU state is reconstructible, so a failed blob must never
+abort a resume (design §5.2 rule 4 reserves criticality
+for irreconstructible state).
+
+### 12.4 Named remainders
+
+DMC firmware sourcing: `register_dmc_firmware` is the
+seam (parse-validated at registration, wildcard stepping
+selection — probe's `ChipInfo` carries no stepping
+readout in this tree); no production caller fetches a
+blob yet, so the reload path is fixture-proven and inert
+until the probe-time fetch lands. RC6 enable-at-probe is
+likewise a wiring step: the PM core owns the `Rc6`
+lifecycle (snapshotted posture, park, re-enable), and
+today nothing enables RC6 at probe, so in production the
+snapshot's RC6 bit is currently always off. D3cold is not
+used (the bus layer supports D3hot only; the link stays
+up and config survives). PSR/DC-state runtime policy and
+S0ix are out of scope.
