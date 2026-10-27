@@ -625,3 +625,149 @@ a host-OS batching optimisation, not hardware protocol.
 Out of scope here: the per-engine media sub-domains
 (VDBOX/VEBOX) belong to the media-engines work (#1022);
 RC6 residency policy builds on these holds (#1014).
+
+## 12. RC6 + DMC (Stage 5 — `intel_gpu_rc6`, `intel_gpu_dmc`, #1014)
+
+Idle power for the GT and the display: RC6 (the GT's deep
+idle state, host-programmed thresholds + park/unpark
+discipline) and the DMC firmware machinery (container
+parse/validate, program load, and the DC5/DC6 handoff the
+loaded program enables). Compiled only under the gpu
+crate's `intel` feature. Sources: i915's
+`gt/intel_rc6.c`, `gt/intel_gt_regs.h`,
+`gt/intel_engine_regs.h`, `display/intel_dmc.c`,
+`display/intel_dmc_regs.h` and
+`display/intel_display_regs.h` — the authoritative
+restatement of the PRM power registers and the DMC
+firmware format (torvalds/linux master, 2026-10-27).
+
+RC6 register map: `GEN6_RC_CONTROL` = 0xA090,
+`GEN6_RC_STATE` = 0xA094, wake-rate limits 0xA09C /
+0xA0A0, evaluation interval 0xA0A8, idle hysteresis
+0xA0AC, `GEN6_RC_SLEEP` = 0xA0B0, `GEN6_RC6_THRESHOLD` =
+0xA0B8, PG idle hysteresis 0xA0C4 / 0xA0C8,
+`GEN9_PG_ENABLE` = 0xA210, residency counter
+`GEN6_GT_GFX_RC6` = 0x138108 (32-bit, 1.28 µs units on
+Gen11/12). The enable sequence is `gen11_rc6_enable`'s:
+wake-rate limits (54≪16|85, media 150), evaluation
+interval 125000, hysteresis 25, `RING_MAX_IDLE` = 10 per
+present engine, RC sleep 0, threshold 50000, media/render
+PG hysteresis 60, then `GEN9_PG_ENABLE` = render + media
++ media-sampler coarse gating plus per-VCS VDN HCP/MFX
+bits — all under FORCEWAKE_ALL. NARF has no GuC, so the
+host owns RC6: the control value is
+`HW_ENABLE | RC6_ENABLE | EI_MODE(1)` = 0x8804_0000
+(i915's host-owned form). The one omitted write from
+i915's sequence is `GUC_MAX_IDLE_COUNT` — it programs
+the GuC's idle policy, there is no GuC to consume it, and
+its offset could not be grounded from the sources
+consulted; the omission is deliberate, not an oversight.
+Park writes `RC6_ENABLE` alone plus target state 4
+(normal RC6) in `RC_STATE` [18:16]; unpark restores the
+full control value; disable/sanitize zero PG_ENABLE,
+RC_CONTROL and RC_STATE (the `__intel_rc6_disable`
+conversation).
+
+DMC format: CSS header (128 bytes; `module_type` 0x09,
+`header_ver` 0x10000, firmware version at dword 22),
+package header (version 1 ≤ 20 / version 2 ≤ 32 FW-info
+entries; the table always occupies the max count;
+`num_entries` clamps), FW-info stepping match with `'*'`
+wildcards, first match per id wins. Program headers:
+signature 0x40403E3E; versions 1 (128-byte header,
+`header_len` in *bytes*, ≤ 8 MMIO pairs, payload loads
+at 0x80000) and 3 (256-byte header, `header_len` in
+dwords, ≤ 20 pairs, explicit start address). Gen12
+payload ceiling 0x6000 bytes. MMIO init addresses and v3
+load windows are sanity-ranged per id (main program
+0x80000–0x86FFF; pipe A 0x90000–0x96FFF; pipe B
+0x98000–0x9EFFF). Event handlers: 8 per DMC on Gen12,
+EVT_HTP at reg-base +0x004 / EVT_CTL at +0x034 (main
+0x8F000; pipes 0x92000 + 0x400·(id−1)); the disabled
+EVT_CTL encoding is TYPE=EDGE_0_1 | EVENT=FALSE =
+0x0003_0100, and `evt_ctl_disable` preserves only the
+sticky ENABLE bit. Load (`dmc_load_program`): handler
+sweep → payload dword stream → MMIO table, per program,
+then the DC_STATE_DEBUG mask bits (CORES | MEMORY_UP)
+plus a posting read. Load-time transforms: pipe event
+entries always written disabled; on the main DMC the
+CLK_MSEC and VBLANK_DELAYED_A handlers written disabled;
+at *parse* time the TGL fixup rewrites a main-DMC
+VBLANK_A handler pair to VBLANK_DELAYED_A (shipped
+firmware erratum). DC handoff: `DC_STATE_EN` = 0x45504,
+target field [1:0] (1 = DC5, 2 = DC6); TGL DC5/DC6 entry
+counters at 0x101084 / 0x101088.
+
+Public interface:
+
+- `Rc6::{sanitize, enable, disable}` — the conversations
+  above, bracketed by FORCEWAKE_ALL holds on the caller's
+  `Forcewake` (acquire render→blitter→media, release in
+  reverse; a failed acquire rolls back and changes no
+  state). `enable` takes the present engines' register
+  bases plus the VCS count — production is `&[RCS_BASE]`,
+  0 today.
+- `Rc6::{park, unpark}` — the activity discipline.
+  `unpark`'s control write runs inside a render hold.
+  `park` is refused (`DomainsHeld`) while *any* domain is
+  held and (`NotEnabled`) before enable; a refused park
+  writes nothing.
+- `Rc6Residency::{update, sample}` — wrap-safe delta
+  accumulation (×1280 ns) of the hardware counter; the
+  first sample primes. `sample` reads under a render
+  hold.
+- `parse_dmc_firmware(blob, stepping, substepping,
+  max_fw_size)` — pure validation → `DmcFirmware`
+  (payloads borrowed from the blob; per-slot programs;
+  `skipped_mask`). No MMIO: refusal means nothing was
+  written anywhere.
+- `load_program` / `disable_program` / `verify_loaded` —
+  the load conversation over the caller's window;
+  verification is i915's `assert_dmc_loaded` as an error
+  return (program-RAM first dword + every MMIO entry,
+  post-transform).
+- `set_dc_target(fw, DcTarget)` — RMW of `DC_STATE_EN`'s
+  field; DC5/DC6 refused (`NoMainProgram`) with no main
+  program loaded.
+
+Invariants:
+
+- RC6 is never armed under a forcewake hold: the park
+  refusal reads the live hold counts, so a submission
+  inside its render hold cannot be gated away mid-flight,
+  and park succeeds again the moment holders drain.
+- The DMC parser never partially succeeds into hardware:
+  it is pure, and every refusal (truncation, bad
+  signature/module type/version, MMIO or load-address
+  range escape, oversize or empty payload) precedes any
+  register write. Pipe-program defects degrade to an
+  empty slot (i915's tolerance); main-program defects are
+  hard errors.
+- Where this implementation is stricter than i915 it
+  says so in the code: the DMC signature and CSS
+  module-type/version are enforced (i915's current parser
+  does not check them; the format documents both as
+  constants), and PIPEC/PIPED programs are skipped rather
+  than range-checked against an ungrounded Gen12 window
+  (their skip is recorded in `skipped_mask`).
+- Residency totals are monotonic across counter wrap by
+  construction (wrapping-sub deltas); no clock is
+  consulted anywhere in this section's paths, so fixtures
+  are deterministic under TCG.
+
+Composition: both modules own no window and compose over
+the caller's `&M: MmioWindow` + `Forcewake` — the seam
+§11 designed for. No new initcalls and no change to the
+registered-initcall census: these are library state
+machines the controller (and the future runtime-PM lane)
+compose next to the RCS engine's forcewake state. The
+firmware blob arrives as a byte slice; sourcing blobs
+from storage is the platform's business, not this
+module's.
+
+Out of scope here: GuC-owned RC and `GUC_MAX_IDLE_COUNT`
+(no GuC in NARF); RC6p/RC6pp (absent on Gen12); runtime
+event-handler reconfiguration (PSR/DCB routing belongs
+to the display pipeline); DC3CO/DC9 targets; ADL-P
+(display 13) pipe-DMC ranges; wiring park/unpark to GT
+activity (the runtime-PM lane consumes this interface).
