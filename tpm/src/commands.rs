@@ -120,6 +120,12 @@ impl CommandBuilder {
     }
 }
 
+/// One `TPMS_PCR_SELECTION` in parser output: a `(TPM_ALG_ID,
+/// pcrSelect bytes)` pair. The element type of
+/// `PcrReadResponse::selections` and of the `TPM_CAP_PCRS` page
+/// `ResponseParser::parse_get_capability_pcr_selections` returns.
+pub type PcrSelectionEntry = (u16, Vec<u8>);
+
 /// A parsed TPM2_PCR_Read response (Part 3 §22.6): the PCR update
 /// counter, the echoed selection list, and the digest values in
 /// selection order.
@@ -127,7 +133,7 @@ pub struct PcrReadResponse {
     /// `pcrUpdateCounter` — a UINT32 on the wire.
     pub update_counter: u32,
     /// `pcrSelectionOut` as `(TPM_ALG_ID, pcrSelect bytes)` pairs.
-    pub selections: Vec<(u16, Vec<u8>)>,
+    pub selections: Vec<PcrSelectionEntry>,
     /// `pcrValues` — one entry per selected PCR, in selection order.
     pub digests: Vec<Vec<u8>>,
 }
@@ -264,7 +270,7 @@ impl<'a> ResponseParser<'a> {
     /// `(TPM_ALG_ID, pcrSelect bytes)` pair (TPML_PCR_SELECTION).
     pub fn parse_get_capability_pcr_selections(
         &self,
-    ) -> Result<(bool, Vec<(u16, Vec<u8>)>), TpmError> {
+    ) -> Result<(bool, Vec<PcrSelectionEntry>), TpmError> {
         let body = self.body();
         // moreData(1) + capability(4) + count(4) + count × TPMS_PCR_SELECTION
         if body.len() < 9 {

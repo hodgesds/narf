@@ -450,9 +450,9 @@ impl Tpm {
         };
         submit_crb_over(
             &self.regs(),
-            cmd_buf.cpu_mut_ptr::<u8>(),
+            SendBufPtr::new(cmd_buf.cpu_mut_ptr::<u8>()),
             cmd_buf.len(),
-            rsp_buf.cpu_mut_ptr::<u8>(),
+            SendBufPtr::new(rsp_buf.cpu_mut_ptr::<u8>()),
             rsp_buf.len(),
             cmd,
         )
@@ -476,7 +476,24 @@ impl Tpm {
 /// memory (kernel tests); neither is tied to a particular
 /// thread, so moving an in-flight submit between executor
 /// threads is sound.
-struct SendBufPtr(*mut u8);
+///
+/// Callers wrap the pointer with [`SendBufPtr::new`] *before*
+/// the call: an unwrapped `*mut u8` parameter would itself be
+/// captured by the seam's future, poisoning it the same way —
+/// wrapping inside the callee comes too late.
+pub(crate) struct SendBufPtr(*mut u8);
+
+impl SendBufPtr {
+    /// Wrap a caller-owned buffer pointer for the submit seam.
+    /// The wrap is the caller's assertion of the contract
+    /// [`submit_crb_over`] documents for the pointee:
+    /// exclusively owned for the call's duration, backed by
+    /// memory the device side may read/write, and not
+    /// thread-affine.
+    pub(crate) fn new(ptr: *mut u8) -> Self {
+        Self(ptr)
+    }
+}
 
 // SAFETY: see the type doc — the pointee buffer is exclusively
 // owned for the call's duration and is not thread-affine.
@@ -492,22 +509,20 @@ unsafe impl Send for SendBufPtr {}
 /// thin wrapper passing the device's probe-time DMA buffers.
 ///
 /// # Safety
-/// `cmd_buf` / `rsp_buf` must each point at `*_len` bytes of
-/// memory the caller owns exclusively for the call's duration
-/// and that the device side may read/write (production passes
-/// its coherent DMA buffers).
+/// The pointers inside `cmd_buf` / `rsp_buf` must each point
+/// at `*_len` bytes of memory the caller owns exclusively for
+/// the call's duration and that the device side may read/write
+/// (production passes its coherent DMA buffers). Wrapping a
+/// pointer in [`SendBufPtr`] is the caller's assertion of
+/// exactly this contract.
 pub(crate) async fn submit_crb_over<R: CrbRegs>(
     regs: &R,
-    cmd_buf: *mut u8,
+    cmd_buf: SendBufPtr,
     cmd_buf_len: usize,
-    rsp_buf: *mut u8,
+    rsp_buf: SendBufPtr,
     rsp_buf_len: usize,
     cmd: &[u8],
 ) -> Result<Vec<u8>, TpmError> {
-    // Wrap the raw buffer pointers so this future stays `Send`
-    // across the poll awaits below (see `SendBufPtr`).
-    let cmd_buf = SendBufPtr(cmd_buf);
-    let rsp_buf = SendBufPtr(rsp_buf);
     if cmd.is_empty() || cmd.len() > cmd_buf_len {
         return Err(TpmError::BadResponse);
     }

@@ -282,6 +282,9 @@ struct FakeTpmDevice {
 // atomic; the buffer pointers are set once by `attach_buffers`
 // before the device is shared, and only read afterwards.
 unsafe impl Send for FakeTpmDevice {}
+// SAFETY: the same argument as the `Send` impl above — shared
+// references only ever reach the lock/atomic-guarded state and
+// the set-once buffer pointers.
 unsafe impl Sync for FakeTpmDevice {}
 
 impl FakeTpmDevice {
@@ -600,9 +603,9 @@ impl FakeTpmDevice {
             let mut mask = [0u8; 3];
             mask[..size_of_select].copy_from_slice(&cmd[pos..pos + size_of_select]);
             pos += size_of_select;
-            for byte in 0..3 {
+            for (byte, &mask_byte) in mask.iter().enumerate() {
                 for bit in 0..8 {
-                    if mask[byte] & (1 << bit) != 0 {
+                    if mask_byte & (1 << bit) != 0 {
                         digests.push(st.pcrs[byte * 8 + bit]);
                     }
                 }
@@ -1053,7 +1056,14 @@ fn submit_crb_sync(
     rsp_ptr: *mut u8,
     cmd: &[u8],
 ) -> Result<Vec<u8>, tpm::TpmError> {
-    narf_scheduler::block_on_spin(tpm::submit_crb_over(dev, cmd_ptr, 4096, rsp_ptr, 4096, cmd))
+    narf_scheduler::block_on_spin(tpm::submit_crb_over(
+        dev,
+        tpm::SendBufPtr::new(cmd_ptr),
+        4096,
+        tpm::SendBufPtr::new(rsp_ptr),
+        4096,
+        cmd,
+    ))
 }
 
 fn smoke_tpm_crb_submit_conversation() -> TestResult {
@@ -1317,6 +1327,9 @@ struct ModelDevice {
 // SAFETY: `FakeTpmDevice` is Send + Sync; the buffer pointers
 // address fixture-owned memory that outlives the adapter.
 unsafe impl Send for ModelDevice {}
+// SAFETY: the same argument as the `Send` impl above — the
+// adapter's shared state is the `Arc<FakeTpmDevice>` and the
+// two set-once buffer pointers.
 unsafe impl Sync for ModelDevice {}
 
 fn map_transport_err(e: tpm::TpmError) -> HighLevelTpmError {
@@ -1353,9 +1366,9 @@ impl TpmDevice for ModelDevice {
         }
         tpm::submit_crb_over(
             self.dev.as_ref(),
-            self.cmd_ptr,
+            tpm::SendBufPtr::new(self.cmd_ptr),
             4096,
-            self.rsp_ptr,
+            tpm::SendBufPtr::new(self.rsp_ptr),
             4096,
             cmd,
         )
@@ -2160,7 +2173,7 @@ impl narf_drivers_tpm::devfs_bridge::TpmTransport for DeadTransport {
 }
 
 fn smoke_tpm_userspace_publication_conversation() -> TestResult {
-    use narf_filesystem::{DirOps, FileOps, FsInstance};
+    use narf_filesystem::{FileOps, FsInstance};
 
     // Hygiene in AND out: the registry, the bridge transport slot
     // and the devfs delegates are globals. The sysfs class is

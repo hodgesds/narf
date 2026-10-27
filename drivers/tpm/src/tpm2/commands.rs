@@ -660,10 +660,7 @@ impl<'a> Reader<'a> {
 /// response, reads the response handle (when `has_handle`) and
 /// bounds the parameters by `parameterSize`. For a no-sessions
 /// response the whole body is the parameter area.
-fn response_params<'a>(
-    raw: &'a [u8],
-    has_handle: bool,
-) -> Result<(Option<u32>, &'a [u8]), &'static str> {
+fn response_params(raw: &[u8], has_handle: bool) -> Result<(Option<u32>, &[u8]), &'static str> {
     let body = parse_response(raw)?;
     let tag = u16::from_be_bytes([raw[0], raw[1]]);
     if tag == TPM_ST_NO_SESSIONS {
