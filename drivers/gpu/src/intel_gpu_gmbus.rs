@@ -955,12 +955,13 @@ pub mod tests {
     enum Phase {
         Idle,
         Data,
-        WaitPhase,
+        Wait,
         Nak,
         Wedged,
         Stalled,
     }
 
+    #[derive(Debug)]
     struct FakeState {
         gmbus0: u32,
         gmbus5: u32,
@@ -1016,7 +1017,7 @@ pub mod tests {
                 // post-write wait on it (the reference driver's
                 // per-chunk wait) must observe it before the
                 // wait-phase wait begins.
-                Phase::WaitPhase => GMBUS2_ACTIVE | GMBUS2_HW_WAIT_PHASE | GMBUS2_HW_RDY,
+                Phase::Wait => GMBUS2_ACTIVE | GMBUS2_HW_WAIT_PHASE | GMBUS2_HW_RDY,
                 Phase::Nak => {
                     // The aborted transfer quiesces over a few
                     // polls; SATOER itself stays latched until
@@ -1052,7 +1053,7 @@ pub mod tests {
             }
             self.sink.clear();
             self.sink_expected = 0;
-            self.phase = Phase::WaitPhase;
+            self.phase = Phase::Wait;
         }
 
         fn on_gmbus1(&mut self, val: u32) {
@@ -1069,7 +1070,7 @@ pub mod tests {
             let cycle = val & (0b111 << 25);
             let count = ((val >> 16) & 0x1FF) as usize;
             if cycle == GMBUS1_CYCLE_STOP && count == 0 {
-                if self.phase == Phase::WaitPhase {
+                if self.phase == Phase::Wait {
                     self.phase = Phase::Idle;
                 }
                 return;
@@ -1105,7 +1106,8 @@ pub mod tests {
                 let start = match addr {
                     DDC_SLAVE_EDID => {
                         if self.gmbus5 & GMBUS5_2BYTE_INDEX_EN != 0 {
-                            ((self.gmbus5 >> 8) & 0xFF) * 256 + (self.gmbus5 & 0xFF) as usize
+                            (((self.gmbus5 >> 8) & 0xFF) as usize) * 256
+                                + (self.gmbus5 & 0xFF) as usize
                         } else if cycle == GMBUS1_CYCLE_INDEX {
                             self.segment * 256 + index_byte
                         } else {
@@ -1163,7 +1165,7 @@ pub mod tests {
             }
             self.serve_pos += 4;
             if self.serve_pos >= self.serve.len() && self.phase == Phase::Data {
-                self.phase = Phase::WaitPhase;
+                self.phase = Phase::Wait;
             }
             dword
         }
@@ -1204,6 +1206,7 @@ pub mod tests {
 
     /// The fake controller + slaves behind the shared
     /// `MmioWindow` interface.
+    #[derive(Debug)]
     pub struct FakeGmbus {
         state: RefCell<FakeState>,
     }
@@ -1283,8 +1286,8 @@ pub mod tests {
         img[22] = 30; // 52 cm × 30 cm
         img[23] = 0x78; // gamma 2.20
         img[24] = 0x0A; // feature support
-        for i in 25..126 {
-            img[i] = (i as u8) ^ 0xA5;
+        for (off, byte) in img[25..126].iter_mut().enumerate() {
+            *byte = ((25 + off) as u8) ^ 0xA5;
         }
         img[126] = 1; // one extension follows
         fix_checksum(&mut img[0..128]);
@@ -1293,13 +1296,13 @@ pub mod tests {
         img[129] = 0x03; // revision 3
         img[130] = 0x04; // first DTD offset (no DTDs)
         img[131] = 0x00; // underscan / audio flags
-        for i in 132..255 {
-            img[i] = (i as u8) ^ 0x3C;
+        for (off, byte) in img[132..255].iter_mut().enumerate() {
+            *byte = ((132 + off) as u8) ^ 0x3C;
         }
         fix_checksum(&mut img[128..256]);
         // Blocks 2–3: raw device space with distinct bytes.
-        for i in 256..512 {
-            img[i] = (i as u8) ^ 0x5A;
+        for (off, byte) in img[256..512].iter_mut().enumerate() {
+            *byte = ((256 + off) as u8) ^ 0x5A;
         }
         img
     }
