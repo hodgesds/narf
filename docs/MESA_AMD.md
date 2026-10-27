@@ -364,6 +364,15 @@ be included in the same production image. Complete software checks and
 package/boot-chain verification precede another hardware attempt; add live
 tracing only where the code audit and models leave a specific question.
 
+The 2026-10-26 VFIO run exposed an additional launcher defect: QEMU's KVM
+`host-phys-bits` passthrough overrode `phys-bits=40`. QMP reported 48 effective
+bits and the RX 6750 XT VRAM BAR near 14 TiB. The launcher now also supplies
+`host-phys-bits-limit=40` (or the caller's explicit width). A disposable KVM
+fixture with 12 GiB RAM and a 16 GiB PCI BAR reproduced the old 48-bit/14-TiB
+layout; the corrected options report 40 bits and place that BAR at 768 GiB.
+This verifies address placement, not visible HDMI. Restart the physical-GPU
+VM to apply the corrected layout; a running VM retains its original options.
+
 Device-info replies report VBIOS memory type/bus width and timestamp frequency,
 common GPU/slot PCIe capabilities, Linux's per-ASIC Infinity Cache sizes, and
 SMU memory-clock limits (boot MCLK while UCLK DPM is disabled). Missing board

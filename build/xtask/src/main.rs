@@ -1468,13 +1468,24 @@ mod gpu_backend_tests {
 
     #[test]
     fn host_cpu_keeps_q35_bars_inside_narf_mappings() {
-        for cpu in ["max", "host", "host,-x2apic"] {
+        for cpu in ["max", "host", "host,-x2apic", "host,host-phys-bits=on"] {
             assert_eq!(
                 Arch::clamp_cpu_phys_bits(cpu.to_string()),
-                format!("{cpu},phys-bits=40")
+                format!("{cpu},phys-bits=40,host-phys-bits-limit=40")
             );
         }
-        for cpu in ["host,phys-bits=39", "max,phys-bits=40", "EPYC-Rome"] {
+        for (cpu, bits) in [("host,phys-bits=39", 39), ("max,phys-bits=40", 40)] {
+            assert_eq!(
+                Arch::clamp_cpu_phys_bits(cpu.to_string()),
+                format!("{cpu},host-phys-bits-limit={bits}")
+            );
+        }
+        for cpu in [
+            "host,host-phys-bits-limit=42",
+            "host,phys-bits=39,host-phys-bits-limit=39",
+            "max,phys-bits=40,host-phys-bits-limit=40",
+            "EPYC-Rome",
+        ] {
             assert_eq!(Arch::clamp_cpu_phys_bits(cpu.to_string()), cpu);
         }
     }
@@ -1668,24 +1679,26 @@ impl Arch {
         }
     }
 
-    /// Clamp a `max` or `host` QEMU CPU model's advertised physical-address
-    /// width to 40 bits (1 TiB) unless the caller already pinned
-    /// `phys-bits`. `-cpu max` otherwise reports the host's width (often
-    /// 46-52 bits), which makes QEMU park the q35 64-bit PCI hole — and
-    /// every 64-bit device BAR (NVMe, virtio) — up near the top of that
-    /// space (~14 TiB observed at -m 8192). NARF maps MMIO through the
-    /// identity window, whose high-MMIO range only covers phys
-    /// [512 GiB, 1 TiB), so a BAR above 1 TiB #PFs on first register
-    /// access once RAM is large enough to push the hole up. Capping to
-    /// 40 bits keeps the hole inside [~992 GiB, 1 TiB) — within the
-    /// mapped window — and mirrors real laptops, whose firmware already
-    /// parks BARs at 512 GiB-1016 GiB. Other explicit models
-    /// (EPYC-Rome/Genoa) are left untouched.
+    /// Keep q35's automatic high-MMIO placement within the intended 1 TiB
+    /// window for `max` and `host`. KVM's host physical-width passthrough can
+    /// override `phys-bits`, so it needs the matching host limit as well.
+    /// Without it, a live `host,phys-bits=40` VM reported 48 effective bits
+    /// and placed the GPU BAR near 14 TiB. Explicit `phys-bits` receives its
+    /// matching limit; an explicit host limit or named model stays unchanged.
     fn clamp_cpu_phys_bits(cpu: String) -> String {
-        if matches!(cpu.split(',').next(), Some("max" | "host")) && !cpu.contains("phys-bits") {
-            format!("{cpu},phys-bits=40")
-        } else {
-            cpu
+        if !matches!(cpu.split(',').next(), Some("max" | "host"))
+            || cpu
+                .split(',')
+                .any(|option| option.starts_with("host-phys-bits-limit="))
+        {
+            return cpu;
+        }
+        match cpu
+            .split(',')
+            .find_map(|option| option.strip_prefix("phys-bits="))
+        {
+            Some(bits) => format!("{cpu},host-phys-bits-limit={bits}"),
+            None => format!("{cpu},phys-bits=40,host-phys-bits-limit=40"),
         }
     }
 
@@ -15680,8 +15693,8 @@ fn passthrough_cmd(args: &PassthroughArgs) -> Result<()> {
         );
     }
 
-    // `phys-bits=40` is already applied to `-cpu max` and `-cpu host` by
-    // `Arch::clamp_cpu_phys_bits`, and it is what keeps the q35 64-bit PCI
+    // `phys-bits=40,host-phys-bits-limit=40` is applied to `max` and `host`
+    // by `Arch::clamp_cpu_phys_bits`. Both keep the q35 64-bit PCI
     // hole — and so the card's BARs — inside the window NARF maps. Do not
     // override `NARF_QEMU_CPU` with a wider width here.
     let cli_devices = args
@@ -15696,7 +15709,7 @@ fn passthrough_cmd(args: &PassthroughArgs) -> Result<()> {
         qemu_fragment(&args.devices)
     );
     println!(
-        "The default `max` and KVM `host` CPU models are clamped to phys-bits=40,\n\
+        "The default `max` and KVM `host` CPU models use phys-bits=40,host-phys-bits-limit=40,\n\
          which parks the q35 64-bit PCI hole inside the phys range NARF maps.\n"
     );
     Ok(())
