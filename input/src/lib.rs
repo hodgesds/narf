@@ -204,6 +204,12 @@ pub enum KeyCode {
     WakeUp = 143,
     WLan = 238,
     RfKill = 247,
+    /// Microphone mute toggle — distinct from `Mute` (speaker mute).
+    /// Laptop mic-mute keys (Dell 0x0150, HP bezel 0x270, ThinkPad
+    /// HKEY 0x100B, ASUS 0x33 via KEY_F20 binding) all report this
+    /// code on Linux; conflating it with `KEY_MUTE` loses the
+    /// mic-mute LED / OSD semantics userspace keys off it.
+    MicMute = 248,
     TouchpadToggle = 530,
     RotateLockToggle = 560,
     Unknown = 0xFFFF,
@@ -363,6 +369,7 @@ impl KeyCode {
             143 => KeyCode::WakeUp,
             238 => KeyCode::WLan,
             247 => KeyCode::RfKill,
+            248 => KeyCode::MicMute,
             530 => KeyCode::TouchpadToggle,
             560 => KeyCode::RotateLockToggle,
             _ => KeyCode::Unknown,

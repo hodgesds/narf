@@ -1694,16 +1694,43 @@ kernel_test_in!(
 fn smoke_dell_smbios_cmd_encode() -> TestResult {
     use crate::dell_laptop::DellSmbiosCmd;
 
+    // The buffer is the real `calling_interface_buffer` layout
+    // (dell-smbios.h): u16 class, u16 select, u32 input[4],
+    // u32 output[4] — 36 bytes. The previous version of this smoke
+    // pinned a 16-byte `(class << 8) | select` packed shape that
+    // no Dell firmware implements; see the correction note on
+    // DellSmbiosCmd.
     let cmd = DellSmbiosCmd::new(17, 3);
     let buf = cmd.encode();
-    // header = (17 << 8) | 3 = 0x1103 LE.
-    let header = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-    if header != (17u32 << 8) | 3 {
-        return TestResult::Fail("DellSmbiosCmd header encoding mismatch");
+    if buf.len() != 36 {
+        return TestResult::Fail("DellSmbiosCmd should encode to 36 bytes");
     }
-    // in1..in3 should be zero for a default command.
-    if buf[4..16].iter().any(|&b| b != 0) {
-        return TestResult::Fail("DellSmbiosCmd default in1/in2/in3 should be zero");
+    if u16::from_le_bytes(buf[0..2].try_into().unwrap()) != 17 {
+        return TestResult::Fail("DellSmbiosCmd class field mismatch");
+    }
+    if u16::from_le_bytes(buf[2..4].try_into().unwrap()) != 3 {
+        return TestResult::Fail("DellSmbiosCmd select field mismatch");
+    }
+    // Inputs and the output area should be zero for a default command.
+    if buf[4..36].iter().any(|&b| b != 0) {
+        return TestResult::Fail("DellSmbiosCmd default inputs/outputs should be zero");
+    }
+    // Input words land at byte offset 4, in order.
+    let mut cmd2 = DellSmbiosCmd::new(4, 0);
+    cmd2.input = [0x02C6, 2, 0, 0];
+    let buf2 = cmd2.encode();
+    if u32::from_le_bytes(buf2[4..8].try_into().unwrap()) != 0x02C6
+        || u32::from_le_bytes(buf2[8..12].try_into().unwrap()) != 2
+    {
+        return TestResult::Fail("DellSmbiosCmd input word offsets wrong");
+    }
+    // decode_response reads the output words at offset 20.
+    let mut resp = [0u8; 36];
+    resp[20..24].copy_from_slice(&7u32.to_le_bytes());
+    resp[32..36].copy_from_slice(&9u32.to_le_bytes());
+    let (o0, _, _, o3) = DellSmbiosCmd::decode_response(&resp);
+    if o0 != 7 || o3 != 9 {
+        return TestResult::Fail("DellSmbiosCmd decode_response offsets wrong");
     }
     TestResult::Pass
 }
@@ -1731,12 +1758,18 @@ kernel_test_in!(
 
 // ── hp_wmi ─────────────────────────────────────────────────────────────
 
-/// HP WMI command type 0x07 (wireless) — verify type constant.
+/// HP WMI wireless command type — verify type constant against
+/// `hp-wmi.c::enum hp_wmi_commandtype`: the wireless query is
+/// 0x05. (0x07, the value this smoke previously pinned, is the
+/// *battery* query in hp-wmi.c.)
 fn smoke_hp_wmi_command_wireless_type() -> TestResult {
     use crate::hp_wmi::HpWmiCommand;
 
-    if HpWmiCommand::Wireless as u32 != 0x07 {
-        return TestResult::Fail("HpWmiCommand::Wireless should have value 0x07");
+    if HpWmiCommand::Wireless as u32 != 0x05 {
+        return TestResult::Fail("HpWmiCommand::Wireless should have value 0x05");
+    }
+    if HpWmiCommand::Battery as u32 != 0x07 {
+        return TestResult::Fail("HpWmiCommand::Battery should have value 0x07");
     }
     TestResult::Pass
 }
@@ -1749,20 +1782,34 @@ kernel_test_in!(
 fn smoke_hp_wmi_wireless_state_decode() -> TestResult {
     use crate::hp_wmi::decode_wireless_state;
 
-    // flags = 0x03 → wifi=true, bluetooth=true, wwan=false.
+    // The wireless word is four per-radio bytes (hp-wmi.c
+    // hp_wmi_get_sw_state masks 0x200 << (radio * 8)); "powered"
+    // is bit 0 of each radio's byte. Word 0x00000003: wifi byte
+    // 0x03 → powered; bluetooth / wwan bytes are 0 → unpowered.
+    // (The previous expectation — bits 0/1/2 of the word — read
+    // wifi's POWER_SOFT bit as "bluetooth".)
     let buf = [0x03u8, 0x00, 0x00, 0x00, 0, 0, 0, 0];
     let state = match decode_wireless_state(&buf) {
         Some(s) => s,
         None => return TestResult::Fail("decode_wireless_state returned None"),
     };
     if !state.wifi {
-        return TestResult::Fail("wifi should be true (bit 0)");
+        return TestResult::Fail("wifi should be true (byte 0 POWER_STATE)");
     }
-    if !state.bluetooth {
-        return TestResult::Fail("bluetooth should be true (bit 1)");
+    if state.bluetooth {
+        return TestResult::Fail("bluetooth should be false (byte 1 is 0)");
     }
     if state.wwan {
-        return TestResult::Fail("wwan should be false (bit 2 clear)");
+        return TestResult::Fail("wwan should be false (byte 2 is 0)");
+    }
+    // All three radios powered: each byte has POWER_STATE set.
+    let buf_all = [0x01u8, 0x01, 0x01, 0x00, 0, 0, 0, 0];
+    let state_all = match decode_wireless_state(&buf_all) {
+        Some(s) => s,
+        None => return TestResult::Fail("decode_wireless_state returned None (all)"),
+    };
+    if !state_all.wifi || !state_all.bluetooth || !state_all.wwan {
+        return TestResult::Fail("all radios should be powered when each byte has bit 0 set");
     }
     TestResult::Pass
 }
@@ -3079,4 +3126,926 @@ fn smoke_intel_hid_dmi_policy_tables() -> TestResult {
 kernel_test_in!(
     "drivers/platform/intel-hid-dmi",
     smoke_intel_hid_dmi_policy_tables
+);
+// ── #1086: vendor WMI completion fixtures ────────────────────────
+//
+// Simulated-firmware conversations for the method-invocation paths
+// the decode-only smokes never reached. Each fixture is a hand-
+// encoded AML device whose WMxx method records its argument into a
+// Name (read back through the namespace) and returns a canned
+// reply, so the full driver → narf_aml::wmi::invoke_method → AML →
+// fixture → reply-decode conversation runs exactly as on real
+// firmware. The expected wire bytes are pinned against the vendor
+// protocol sources (hp-wmi.c, dell-smbios.h, Lenovo's deployment
+// guide), never against what the driver happens to send — the
+// request buffers are asserted as literals.
+
+/// PkgLength bytes for a package whose post-PkgLength content is
+/// `rest` bytes (single-byte form below 64, two-byte above).
+fn fx_pkglen(rest: usize) -> alloc::vec::Vec<u8> {
+    let v1 = rest + 1;
+    if v1 < 64 {
+        alloc::vec![v1 as u8]
+    } else {
+        let v = rest + 2;
+        alloc::vec![0x40 | (v as u8 & 0x0F), (v >> 4) as u8]
+    }
+}
+
+/// A Buffer term (`BufferOp`, BytePrefix size, data).
+fn fx_buffer_term(data: &[u8]) -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let mut v = Vec::new();
+    v.push(0x11); // BufferOp
+    v.extend_from_slice(&fx_pkglen(2 + data.len()));
+    v.push(0x0A); // BytePrefix
+    v.push(data.len() as u8);
+    v.extend_from_slice(data);
+    v
+}
+
+/// Name(seg, Buffer(data)).
+fn fx_name_buffer(seg: &[u8; 4], data: &[u8]) -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let mut v = Vec::new();
+    v.push(0x08); // NameOp
+    v.extend_from_slice(seg);
+    v.extend_from_slice(&fx_buffer_term(data));
+    v
+}
+
+/// Name(seg, "str").
+fn fx_name_string(seg: &[u8; 4], s: &str) -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let mut v = Vec::new();
+    v.push(0x08); // NameOp
+    v.extend_from_slice(seg);
+    v.push(0x0D); // StringPrefix
+    v.extend_from_slice(s.as_bytes());
+    v.push(0x00);
+    v
+}
+
+/// Method body: `Store(Arg2, \DEV.LAST); Return(\DEV.REPL)`.
+fn fx_wmi_method_body(dev: &[u8; 4]) -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let mut body = Vec::new();
+    body.push(0x70); // StoreOp
+    body.push(0x6A); // Arg2
+    body.extend_from_slice(&fx_ref2(dev, b"LAST"));
+    body.push(0xA4); // ReturnOp
+    body.extend_from_slice(&fx_ref2(dev, b"REPL"));
+    body
+}
+
+/// A fixture WMI device: `LAST` (zeroed buffer of `last_len`),
+/// `REPL` (the canned reply buffer), and `WMAA` (3-arg method)
+/// recording Arg2 and returning REPL.
+fn fx_wmi_device(dev: &[u8; 4], last_len: usize, repl: &[u8]) -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let mut inside = Vec::new();
+    inside.extend_from_slice(&fx_name_buffer(b"LAST", &alloc::vec![0u8; last_len]));
+    inside.extend_from_slice(&fx_name_buffer(b"REPL", repl));
+    inside.extend_from_slice(&fx_method(b"WMAA", 3, &fx_wmi_method_body(dev)));
+    fx_wrap(0x82, dev, &inside) // DeviceOp
+}
+
+/// Read a Buffer Name back out of the namespace.
+fn fx_name_buf(path: &str) -> Option<alloc::vec::Vec<u8>> {
+    match narf_aml::find_node(path).and_then(|n| n.value) {
+        Some(narf_aml::NameValue::Buffer(b)) => Some(b),
+        _ => None,
+    }
+}
+
+/// Read a String Name back out of the namespace.
+fn fx_name_str(path: &str) -> Option<alloc::string::String> {
+    match narf_aml::find_node(path).and_then(|n| n.value) {
+        Some(narf_aml::NameValue::String(s)) => Some(s),
+        _ => None,
+    }
+}
+
+// ── Mic-mute identity ─────────────────────────────────────────────
+
+/// The mic-mute key keeps its own identity on every vendor path
+/// (previously Dell/HP/ASUS/ThinkPad all reported speaker Mute).
+fn smoke_micmute_key_identity() -> TestResult {
+    use narf_input::KeyCode;
+
+    if KeyCode::from_evdev(248) != KeyCode::MicMute {
+        return TestResult::Fail("evdev 248 should decode as MicMute (KEY_MICMUTE)");
+    }
+    if KeyCode::MicMute == KeyCode::Mute {
+        return TestResult::Fail("MicMute must be distinct from Mute");
+    }
+    // HP bezel 0x270 (hp-wmi.c keymap: KEY_MICMUTE).
+    if crate::hp_wmi::hp_keycode(0x270) != Some(KeyCode::MicMute) {
+        return TestResult::Fail("HP bezel 0x270 should be MicMute");
+    }
+    // ASUS 0x33 (asus-nb-wmi.c: KEY_F20, the mic-mute binding).
+    if crate::asus_wmi::asus_keycode(0x33) != Some(KeyCode::MicMute) {
+        return TestResult::Fail("ASUS 0x33 should be MicMute");
+    }
+    // ThinkPad HKEY 0x100B (thinkpad_acpi.c: KEY_MICMUTE).
+    if crate::thinkpad_acpi::hkey_to_keycode(0x100B) != Some(KeyCode::MicMute) {
+        return TestResult::Fail("ThinkPad HKEY 0x100B should be MicMute");
+    }
+    // Dell: the decoder yields the dedicated MicMute variant for
+    // code 0x0150 (both the wmi_vendors and dell_laptop decoders),
+    // and the handlers map that variant to KeyCode::MicMute.
+    let payload: [u8; 6] = [2, 0, 0x10, 0x00, 0x50, 0x01];
+    match crate::wmi_vendors::decode_dell_event(&payload) {
+        Some(crate::wmi_vendors::DellEvent::MicMute) => {}
+        _ => return TestResult::Fail("Dell 0x0150 should decode as DellEvent::MicMute"),
+    }
+    match crate::dell_laptop::decode_dell_wmi_event(&payload) {
+        Some(crate::dell_laptop::DellWmiEvent::MicMute) => {}
+        _ => return TestResult::Fail("Dell 0x0150 should decode as DellWmiEvent::MicMute"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/platform/wmi1086", smoke_micmute_key_identity);
+
+// ── HP BIOS query conversation ────────────────────────────────────
+
+/// `bios_args` layout + `encode_outsize_for_pvsz` table, pinned
+/// against hp-wmi.c (pure — no fixture namespace needed).
+fn smoke_hp_bios_args_layout() -> TestResult {
+    use crate::hp_wmi::{build_bios_args, encode_outsize_for_pvsz, HpWmiCommand, HpWmiVerb};
+
+    // encode_outsize_for_pvsz: 0→1, 1..=4→2, 5..=128→3,
+    // 129..=1024→4, 1025..=4096→5, >4096 invalid.
+    let table = [
+        (0usize, Some(1u32)),
+        (4, Some(2)),
+        (5, Some(3)),
+        (128, Some(3)),
+        (129, Some(4)),
+        (1024, Some(4)),
+        (1025, Some(5)),
+        (4096, Some(5)),
+        (4097, None),
+    ];
+    for (size, want) in table {
+        if encode_outsize_for_pvsz(size) != want {
+            return TestResult::Fail("encode_outsize_for_pvsz table mismatch");
+        }
+    }
+    // bios_args for a WRITE of value 1 to the thermal-profile
+    // commandtype: signature "SECU" 0x55434553, command=2,
+    // commandtype=0x1C, datasize=4, data=1.
+    let args = match build_bios_args(
+        HpWmiVerb::Write,
+        HpWmiCommand::ThermalProfile,
+        &[1, 0, 0, 0],
+    ) {
+        Some(a) => a,
+        None => return TestResult::Fail("build_bios_args rejected a 4-byte input"),
+    };
+    let want: [u8; 20] = [
+        0x53, 0x45, 0x43, 0x55, // 0x55434553 LE
+        0x02, 0x00, 0x00, 0x00, // command = WRITE
+        0x1C, 0x00, 0x00, 0x00, // commandtype = THERMAL_PROFILE
+        0x04, 0x00, 0x00, 0x00, // datasize
+        0x01, 0x00, 0x00, 0x00, // data
+    ];
+    if args != want {
+        return TestResult::Fail("bios_args byte layout mismatch");
+    }
+    if build_bios_args(HpWmiVerb::Read, HpWmiCommand::Wireless, &[0; 5]).is_some() {
+        return TestResult::Fail("build_bios_args should reject >4-byte inputs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/platform/wmi1086", smoke_hp_bios_args_layout);
+
+/// The canned rfkill2 state block the HP fixture firmware returns:
+/// three devices (masking-defeating — a one-device table would let
+/// an offset bug pass). Bytes [0..4] double as the thermal read
+/// payload in the shared reply: 2 = Performance.
+fn fx_rfkill2_payload() -> [u8; 128] {
+    let mut p = [0u8; 128];
+    p[0] = 0x02; // thermal payload word low byte (rest zero)
+    p[4] = 0xAA; // unknown bytes — the decoder must skip these
+    p[5] = 0xBB;
+    p[6] = 0xCC;
+    p[7] = 3; // device count
+              // Device 0 @16: wifi, power 0x0F → powered, unblocked.
+    p[16] = 0;
+    p[17] = 1;
+    p[18..20].copy_from_slice(&0x8086u16.to_le_bytes());
+    p[20..22].copy_from_slice(&0x2723u16.to_le_bytes());
+    p[22..24].copy_from_slice(&0x8086u16.to_le_bytes());
+    p[24..26].copy_from_slice(&0x0084u16.to_le_bytes());
+    p[26] = 0; // rfkill_id
+    p[27] = 0x0F; // power
+                  // Device 1 @32: bluetooth, power 0x0C → soft-blocked.
+    p[32] = 1;
+    p[33] = 1;
+    p[34..36].copy_from_slice(&0x8087u16.to_le_bytes());
+    p[36..38].copy_from_slice(&0x0029u16.to_le_bytes());
+    p[42] = 1;
+    p[43] = 0x0C;
+    // Device 2 @48: wwan, power 0x05 → hard-blocked.
+    p[48] = 2;
+    p[49] = 2;
+    p[50..52].copy_from_slice(&0x413Cu16.to_le_bytes());
+    p[52..54].copy_from_slice(&0x81D7u16.to_le_bytes());
+    p[58] = 2;
+    p[59] = 0x05;
+    p
+}
+
+/// HP profile set/get + rfkill2 refresh, end-to-end through the
+/// fixture firmware at \HPF1.
+fn smoke_hp_wmi_method_conversations() -> TestResult {
+    use crate::hp_wmi::{decode_rfkill2_state, ThermalProfile};
+
+    crate::wmi_vendors::__test_reset();
+    crate::hp_wmi::__test_reset();
+    crate::rfkill::__test_reset();
+    crate::platform_profile::__test_reset();
+
+    // Pure decode of the rfkill2 block (layout from hp-wmi.c).
+    let payload = fx_rfkill2_payload();
+    let devs = match decode_rfkill2_state(&payload) {
+        Some(d) => d,
+        None => return TestResult::Fail("rfkill2 decode returned None"),
+    };
+    if devs.len() != 3 {
+        return TestResult::Fail("rfkill2 decode should yield 3 devices");
+    }
+    if devs[0].radio_type != 0 || devs[0].vendor_id != 0x8086 || devs[0].product_id != 0x2723 {
+        return TestResult::Fail("rfkill2 device 0 fields wrong");
+    }
+    let wifi_power = devs[0].power_state();
+    if wifi_power.sw_blocked || wifi_power.hw_blocked {
+        return TestResult::Fail("rfkill2 wifi (0x0F) should be unblocked");
+    }
+    if !devs[1].power_state().sw_blocked || devs[1].power_state().hw_blocked {
+        return TestResult::Fail("rfkill2 bluetooth (0x0C) should be soft-blocked only");
+    }
+    if !devs[2].power_state().hw_blocked {
+        return TestResult::Fail("rfkill2 wwan (0x05) should be hard-blocked");
+    }
+
+    // Fixture firmware: \HPF1.WMAA records Arg2, returns
+    // bios_return{0,0} + the rfkill2 block.
+    let mut repl = alloc::vec![0u8; 8];
+    repl.extend_from_slice(&payload);
+    let blob = fx_wmi_device(b"HPF1", 20, &repl);
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("HP fixture device parse failed");
+    }
+    let bios_bytes = match crate::wmi_vendors::guid_str_to_bytes(crate::hp_wmi::HP_WMI_BIOS_GUID) {
+        Some(b) => b,
+        None => return TestResult::Fail("HP BIOS GUID parse failed"),
+    };
+    narf_aml::wmi::__test_install_guid(bios_bytes, "\\HPF1", *b"AA");
+
+    // (1) Thermal SET: the request buffer the firmware received
+    // must be the exact bios_args for WRITE/THERMAL_PROFILE/1.
+    if !crate::hp_wmi::set_thermal_profile(ThermalProfile::CoolSense) {
+        return TestResult::Fail("set_thermal_profile failed against fixture");
+    }
+    let want_set: [u8; 20] = [
+        0x53, 0x45, 0x43, 0x55, 0x02, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00,
+        0x00, 0x01, 0x00, 0x00, 0x00,
+    ];
+    match fx_name_buf("\\HPF1.LAST") {
+        Some(b) if b == want_set => {}
+        _ => return TestResult::Fail("firmware did not receive the pinned bios_args for SET"),
+    }
+
+    // (2) Thermal GET: a real firmware read — the reply payload
+    // word is 2, so the profile must come back Performance and
+    // refresh the cache (the old code had no GET at all).
+    match crate::hp_wmi::get_thermal_profile() {
+        Ok(ThermalProfile::Performance) => {}
+        _ => return TestResult::Fail("get_thermal_profile should read Performance from fixture"),
+    }
+    if crate::hp_wmi::thermal_profile() != ThermalProfile::Performance {
+        return TestResult::Fail("thermal cache not refreshed by GET");
+    }
+
+    // (3) rfkill2 refresh: request is READ/WIRELESS2 with
+    // datasize 1; all three devices land in the rfkill core with
+    // the right Linux state values (1 unblocked, 0 soft, 2 hard).
+    match crate::hp_wmi::refresh_rfkill2() {
+        Ok(3) => {}
+        _ => return TestResult::Fail("refresh_rfkill2 should publish 3 devices"),
+    }
+    let want_rfkill2: [u8; 20] = [
+        0x53, 0x45, 0x43, 0x55, 0x01, 0x00, 0x00, 0x00, 0x1B, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    match fx_name_buf("\\HPF1.LAST") {
+        Some(b) if b == want_rfkill2 => {}
+        _ => return TestResult::Fail("firmware did not receive the pinned bios_args for RFKILL2"),
+    }
+    let mut seen = alloc::vec::Vec::new();
+    for i in 0..crate::rfkill::radio_count() {
+        if let (Some(name), Some(state)) =
+            (crate::rfkill::radio_name(i), crate::rfkill::radio_state(i))
+        {
+            seen.push((name, state.state_value()));
+        }
+    }
+    let expect = [("hp-wifi", 1u32), ("hp-bluetooth", 0u32), ("hp-wwan", 2u32)];
+    for (name, want) in expect {
+        match seen.iter().find(|(n, _)| n.as_str() == name) {
+            Some((_, got)) if *got == want => {}
+            _ => return TestResult::Fail("rfkill core state wrong after rfkill2 refresh"),
+        }
+    }
+
+    crate::wmi_vendors::__test_reset();
+    crate::hp_wmi::__test_reset();
+    crate::rfkill::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/wmi1086",
+    smoke_hp_wmi_method_conversations
+);
+
+/// HP firmware error replies must surface as errors, not data:
+/// a nonzero `bios_return.return_code`, and a truncated reply.
+fn smoke_hp_wmi_error_replies() -> TestResult {
+    crate::wmi_vendors::__test_reset();
+    crate::hp_wmi::__test_reset();
+
+    let bios_bytes = match crate::wmi_vendors::guid_str_to_bytes(crate::hp_wmi::HP_WMI_BIOS_GUID) {
+        Some(b) => b,
+        None => return TestResult::Fail("HP BIOS GUID parse failed"),
+    };
+
+    // return_code = 5 (HPWMI_RET_INVALID_PARAMETERS).
+    let mut repl = alloc::vec![0u8; 12];
+    repl[4..8].copy_from_slice(&5u32.to_le_bytes());
+    let blob = fx_wmi_device(b"HPF2", 20, &repl);
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("HP error fixture parse failed");
+    }
+    narf_aml::wmi::__test_install_guid(bios_bytes, "\\HPF2", *b"AA");
+    match crate::hp_wmi::get_thermal_profile() {
+        Err(crate::hp_wmi::HpWmiError::Firmware(5)) => {}
+        _ => return TestResult::Fail("nonzero return_code should surface as Firmware(5)"),
+    }
+
+    // Truncated reply (shorter than the bios_return header).
+    narf_aml::wmi::__reset_for_test();
+    let blob3 = fx_wmi_device(b"HPF3", 20, &[0u8; 4]);
+    if narf_aml::__parse_body_for_test(&blob3, "\\").is_err() {
+        return TestResult::Fail("HP truncated fixture parse failed");
+    }
+    narf_aml::wmi::__test_install_guid(bios_bytes, "\\HPF3", *b"AA");
+    match crate::hp_wmi::get_thermal_profile() {
+        Err(crate::hp_wmi::HpWmiError::BadReply) => {}
+        _ => return TestResult::Fail("truncated reply should surface as BadReply"),
+    }
+
+    crate::wmi_vendors::__test_reset();
+    crate::hp_wmi::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/platform/wmi1086", smoke_hp_wmi_error_replies);
+
+// ── Dell SMBIOS-via-WMI ───────────────────────────────────────────
+
+/// Dell application registration (class 17 / select 3) end-to-end:
+/// the firmware at \DLF1 must receive the exact
+/// calling-interface buffer Dell documents.
+fn smoke_dell_wmi_registration() -> TestResult {
+    crate::wmi_vendors::__test_reset();
+    crate::dell_laptop::__test_reset();
+
+    // No SMBIOS GUID installed → transport unavailable.
+    match crate::dell_laptop::wmi_events_set_enabled(true) {
+        Err(None) => {}
+        _ => return TestResult::Fail("registration without GUID should be Err(None)"),
+    }
+
+    let blob = fx_wmi_device(b"DLF1", 36, &[0u8; 36]);
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("Dell fixture device parse failed");
+    }
+    let smbios_bytes =
+        match crate::wmi_vendors::guid_str_to_bytes(crate::dell_laptop::DELL_WMI_SMBIOS_GUID) {
+            Some(b) => b,
+            None => return TestResult::Fail("Dell SMBIOS GUID parse failed"),
+        };
+    narf_aml::wmi::__test_install_guid(smbios_bytes, "\\DLF1", *b"AA");
+
+    match crate::dell_laptop::wmi_events_set_enabled(true) {
+        Ok(()) => {}
+        _ => return TestResult::Fail("registration should succeed against fixture (out0=0)"),
+    }
+    // The exact 36 bytes: class 17, select 3, inputs
+    // [0x10000, 0x51534554, 0, 1], zeroed output area.
+    let mut want = [0u8; 36];
+    want[0] = 17;
+    want[2] = 3;
+    want[4..8].copy_from_slice(&0x10000u32.to_le_bytes());
+    want[8..12].copy_from_slice(&0x51534554u32.to_le_bytes());
+    want[16..20].copy_from_slice(&1u32.to_le_bytes());
+    match fx_name_buf("\\DLF1.LAST") {
+        Some(b) if b == want => {}
+        _ => return TestResult::Fail("firmware did not receive the pinned registration buffer"),
+    }
+
+    crate::wmi_vendors::__test_reset();
+    crate::dell_laptop::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/platform/wmi1086", smoke_dell_wmi_registration);
+
+/// Dell registration failure: firmware answers with output[0] != 0.
+fn smoke_dell_wmi_registration_error() -> TestResult {
+    crate::wmi_vendors::__test_reset();
+    crate::dell_laptop::__test_reset();
+
+    let mut repl = [0u8; 36];
+    repl[20..24].copy_from_slice(&5u32.to_le_bytes()); // output[0] = 5
+    let blob = fx_wmi_device(b"DLF2", 36, &repl);
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("Dell error fixture parse failed");
+    }
+    let smbios_bytes =
+        match crate::wmi_vendors::guid_str_to_bytes(crate::dell_laptop::DELL_WMI_SMBIOS_GUID) {
+            Some(b) => b,
+            None => return TestResult::Fail("Dell SMBIOS GUID parse failed"),
+        };
+    narf_aml::wmi::__test_install_guid(smbios_bytes, "\\DLF2", *b"AA");
+
+    match crate::dell_laptop::wmi_events_set_enabled(true) {
+        Err(Some(5)) => {}
+        _ => return TestResult::Fail("registration should surface firmware output[0]=5"),
+    }
+
+    crate::wmi_vendors::__test_reset();
+    crate::dell_laptop::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/wmi1086",
+    smoke_dell_wmi_registration_error
+);
+
+// ── IdeaPad VPC profile conversation ──────────────────────────────
+
+/// MethodOp with a pre-encoded NameString (for multi-segment
+/// names like VMCCMD = `VMCC` + `MD__`).
+fn fx_method2(name: &[u8], flags: u8, body: &[u8]) -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let value = 1 + name.len() + 1 + body.len(); // PkgLength counts itself
+    let mut v = Vec::new();
+    v.push(0x14); // MethodOp
+    v.push(value as u8);
+    v.extend_from_slice(name);
+    v.push(flags);
+    v.extend_from_slice(body);
+    v
+}
+
+/// Multi-segment NameString for `VMCCMD` / `VMCSET`:
+/// MultiNamePrefix, count=2, two padded NameSegs.
+fn fx_multiname(a: &[u8; 4], b: &[u8; 4]) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec![0x2F, 0x02];
+    v.extend_from_slice(a);
+    v.extend_from_slice(b);
+    v
+}
+
+/// IdeaPad VPC2004 fixture at \VPC9: `_HID = "VPC2004"`, a PERF
+/// register Name, `VMCCMD(1) → PERF`, `VMCSET(2) { PERF = Arg1 }`.
+/// The methods ignore the register index (only PERF is modelled —
+/// the profile register, VPC 0x3B, is the conversation under test).
+fn fx_vpc9() -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let mut inside = Vec::new();
+    inside.extend_from_slice(&fx_name_string(b"_HID", "VPC2004"));
+    inside.extend_from_slice(&fx_name_byte(b"PERF", 1)); // Balanced
+                                                         // Method(VMCCMD, 1) { Return(\VPC9.PERF) }
+    let mut rd = Vec::new();
+    rd.push(0xA4);
+    rd.extend_from_slice(&fx_ref2(b"VPC9", b"PERF"));
+    inside.extend_from_slice(&fx_method2(&fx_multiname(b"VMCC", b"MD__"), 1, &rd));
+    // Method(VMCSET, 2) { Store(Arg1, \VPC9.PERF) }
+    let mut wr = Vec::new();
+    wr.push(0x70); // StoreOp
+    wr.push(0x69); // Arg1
+    wr.extend_from_slice(&fx_ref2(b"VPC9", b"PERF"));
+    inside.extend_from_slice(&fx_method2(&fx_multiname(b"VMCS", b"ET__"), 2, &wr));
+    fx_wrap(0x82, b"VPC9", &inside)
+}
+
+/// IdeaPad platform-profile get/set through the VPC fixture: the
+/// GET is a real firmware read (the old code never read PERF back),
+/// and the profile surface rides the same conversation.
+fn smoke_ideapad_vpc_profile_conversation() -> TestResult {
+    use crate::ideapad_laptop::PerfMode;
+    use crate::platform_profile::PlatformProfile as P;
+
+    crate::ideapad_laptop::__test_reset();
+    crate::platform_profile::__test_reset();
+
+    let blob = fx_vpc9();
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("VPC fixture parse failed");
+    }
+    crate::ideapad_laptop::init();
+
+    // Firmware read: PERF starts at 1 (Balanced).
+    match crate::ideapad_laptop::read_perf_mode() {
+        Some(PerfMode::Balanced) => {}
+        _ => return TestResult::Fail("read_perf_mode should read Balanced from the fixture"),
+    }
+    // The profile surface reads through the same firmware path.
+    match crate::platform_profile::current() {
+        Some(P::Balanced) => {}
+        _ => return TestResult::Fail("platform_profile::current should be Balanced"),
+    }
+    // Set Performance through the surface → PERF register is 2.
+    if !crate::platform_profile::set(P::Performance) {
+        return TestResult::Fail("platform_profile::set(Performance) failed");
+    }
+    if fx_name_int("\\VPC9.PERF") != Some(2) {
+        return TestResult::Fail("VMCSET did not land Performance (2) in the fixture register");
+    }
+    match crate::ideapad_laptop::read_perf_mode() {
+        Some(PerfMode::Performance) => {}
+        _ => return TestResult::Fail("read_perf_mode should read Performance back"),
+    }
+    // A profile outside the backend's choices is refused before
+    // any firmware call.
+    if crate::platform_profile::set(P::LowPower) {
+        return TestResult::Fail("set(LowPower) should be refused (not in choices)");
+    }
+    if fx_name_int("\\VPC9.PERF") != Some(2) {
+        return TestResult::Fail("refused set should not touch the fixture register");
+    }
+
+    crate::ideapad_laptop::__test_reset();
+    crate::platform_profile::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/wmi1086",
+    smoke_ideapad_vpc_profile_conversation
+);
+
+// ── Think-LMI protocol ────────────────────────────────────────────
+
+/// Fixture think-lmi method device: `LAST` string Name + `WMAA`
+/// recording Arg2 and returning the canned status string.
+fn fx_lmi_device(dev: &[u8; 4], status: &str) -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let mut inside = Vec::new();
+    inside.extend_from_slice(&fx_name_string(b"LAST", ""));
+    let mut body = Vec::new();
+    body.push(0x70); // StoreOp
+    body.push(0x6A); // Arg2
+    body.extend_from_slice(&fx_ref2(dev, b"LAST"));
+    body.push(0xA4); // ReturnOp
+    body.push(0x0D); // StringPrefix
+    body.extend_from_slice(status.as_bytes());
+    body.push(0x00);
+    inside.extend_from_slice(&fx_method(b"WMAA", 3, &body));
+    fx_wrap(0x82, dev, &inside)
+}
+
+/// Think-LMI string composition + the set conversation, pinned
+/// against Lenovo's deployment guide forms.
+fn smoke_think_lmi_set_conversation() -> TestResult {
+    use crate::think_lmi::{compose_opcode_password_arg, compose_password_arg, TlmiAuth};
+
+    crate::wmi_vendors::__test_reset();
+
+    // Pure composition pins (Lenovo deployment guide).
+    if crate::think_lmi::compose_set_arg("WakeOnLAN", "Disable", None) != "WakeOnLAN,Disable;" {
+        return TestResult::Fail("no-password set string wrong");
+    }
+    let auth = TlmiAuth::new("pswd");
+    if crate::think_lmi::compose_set_arg("WakeOnLAN", "Disable", Some(&auth))
+        != "WakeOnLAN,Disable,pswd,ascii,us;"
+    {
+        return TestResult::Fail("legacy-password set string wrong");
+    }
+    if compose_opcode_password_arg("pw!") != "WmiOpcodePasswordAdmin:pw!;" {
+        return TestResult::Fail("opcode password string wrong");
+    }
+    if compose_password_arg("pop", "oldpop", "newpop", &auth) != "pop,oldpop,newpop,ascii,us;" {
+        return TestResult::Fail("set-password string wrong");
+    }
+    // Return-string mapping (think-lmi.c tlmi_errs).
+    if crate::think_lmi::map_return_status("Success") != Ok(()) {
+        return TestResult::Fail("Success should map to Ok");
+    }
+    if crate::think_lmi::map_return_status("Access Denied")
+        != Err(crate::think_lmi::TlmiError::AccessDenied)
+    {
+        return TestResult::Fail("Access Denied mapping wrong");
+    }
+
+    // The conversation: install the SET class at \LMI1, stage a
+    // change, and read back exactly what the firmware received.
+    let blob = fx_lmi_device(b"LMI1", "Success");
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("think-lmi fixture parse failed");
+    }
+    let set_bytes = match crate::wmi_vendors::guid_str_to_bytes(
+        crate::think_lmi::LENOVO_SET_BIOS_SETTINGS_GUID,
+    ) {
+        Some(b) => b,
+        None => return TestResult::Fail("SET GUID parse failed"),
+    };
+    narf_aml::wmi::__test_install_guid(set_bytes, "\\LMI1", *b"AA");
+    let class = match narf_aml::wmi::list_guids()
+        .into_iter()
+        .find(|g| g.device_path == "\\LMI1")
+    {
+        Some(c) => c,
+        None => return TestResult::Fail("installed SET class not found"),
+    };
+    match crate::think_lmi::__test_set_with_class(&class, "WakeOnLAN", "Disable", None) {
+        Ok(()) => {}
+        _ => return TestResult::Fail("set against fixture should succeed"),
+    }
+    match fx_name_str("\\LMI1.LAST") {
+        Some(s) if s == "WakeOnLAN,Disable;" => {}
+        _ => return TestResult::Fail("firmware did not receive the pinned set string"),
+    }
+    match crate::think_lmi::__test_set_with_class(&class, "WakeOnLAN", "Enable", Some(&auth)) {
+        Ok(()) => {}
+        _ => return TestResult::Fail("authenticated set against fixture should succeed"),
+    }
+    match fx_name_str("\\LMI1.LAST") {
+        Some(s) if s == "WakeOnLAN,Enable,pswd,ascii,us;" => {}
+        _ => return TestResult::Fail("firmware did not receive the pinned authenticated string"),
+    }
+
+    // Error surface: firmware answers "Access Denied".
+    let blob2 = fx_lmi_device(b"LMI2", "Access Denied");
+    if narf_aml::__parse_body_for_test(&blob2, "\\").is_err() {
+        return TestResult::Fail("think-lmi error fixture parse failed");
+    }
+    narf_aml::wmi::__test_install_guid(set_bytes, "\\LMI2", *b"AA");
+    let class2 = match narf_aml::wmi::list_guids()
+        .into_iter()
+        .find(|g| g.device_path == "\\LMI2")
+    {
+        Some(c) => c,
+        None => return TestResult::Fail("installed error class not found"),
+    };
+    match crate::think_lmi::__test_set_with_class(&class2, "WakeOnLAN", "Disable", None) {
+        Err(crate::think_lmi::TlmiError::AccessDenied) => {}
+        _ => return TestResult::Fail("Access Denied reply should map to TlmiError::AccessDenied"),
+    }
+
+    crate::wmi_vendors::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/platform/wmi1086", smoke_think_lmi_set_conversation);
+
+/// Think-LMI enumeration over two `Lenovo_BiosSetting` instances
+/// (multi-instance — a single-instance fixture would let an
+/// instance-indexing bug pass).
+fn smoke_think_lmi_enumeration() -> TestResult {
+    use alloc::vec::Vec;
+
+    crate::wmi_vendors::__test_reset();
+
+    // Pure parse pins first.
+    match crate::think_lmi::parse_setting("WakeOnLAN,Enable,Disable") {
+        Some(s)
+            if s.name == "WakeOnLAN"
+                && s.current_value == "Enable"
+                && s.possible_values.len() == 1 => {}
+        _ => return TestResult::Fail("parse_setting wrong for WakeOnLAN record"),
+    }
+    if crate::think_lmi::parse_setting("").is_some() {
+        return TestResult::Fail("parse_setting should reject an empty record");
+    }
+
+    // \LMI3 with WQAA(1): instance 0 → S0, instance 1 → S1.
+    let mut inside = Vec::new();
+    inside.extend_from_slice(&fx_name_buffer(b"S0__", b"WakeOnLAN,Enable,Disable"));
+    inside.extend_from_slice(&fx_name_buffer(b"S1__", b"Camera,Enable,Disable"));
+    let mut body = Vec::new();
+    // If (LEqual(Arg0, 1)) { Return(\LMI3.S1__) }
+    let mut if_stmt = alloc::vec![
+        0xA0, // IfOp
+        16,   // PkgLength: itself + predicate(4) + return(11)
+        0x93, // LEqualOp
+        0x68, // Arg0
+        0x0A, // BytePrefix
+        0x01, 0xA4, // ReturnOp
+    ];
+    if_stmt.extend_from_slice(&fx_ref2(b"LMI3", b"S1__"));
+    body.extend_from_slice(&if_stmt);
+    body.push(0xA4); // ReturnOp
+    body.extend_from_slice(&fx_ref2(b"LMI3", b"S0__"));
+    inside.extend_from_slice(&fx_method(b"WQAA", 1, &body));
+    let blob = fx_wrap(0x82, b"LMI3", &inside);
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("think-lmi enumeration fixture parse failed");
+    }
+    let setting_bytes =
+        match crate::wmi_vendors::guid_str_to_bytes(crate::think_lmi::LENOVO_BIOS_SETTING_GUID) {
+            Some(b) => b,
+            None => return TestResult::Fail("BIOS_SETTING GUID parse failed"),
+        };
+    narf_aml::wmi::__test_install_guid_multi(setting_bytes, "\\LMI3", *b"AA", 2);
+
+    let settings = match crate::think_lmi::enumerate_settings() {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("enumerate_settings failed against fixture"),
+    };
+    if settings.len() != 2 {
+        return TestResult::Fail("enumerate_settings should yield both instances");
+    }
+    if settings[0].name != "WakeOnLAN" || settings[0].current_value != "Enable" {
+        return TestResult::Fail("instance 0 setting wrong");
+    }
+    if settings[1].name != "Camera" || settings[1].current_value != "Enable" {
+        return TestResult::Fail("instance 1 setting wrong (instance indexing?)");
+    }
+    if settings[0].possible_values != alloc::vec![alloc::string::String::from("Disable")] {
+        return TestResult::Fail("possible_values parse wrong");
+    }
+
+    crate::wmi_vendors::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/platform/wmi1086", smoke_think_lmi_enumeration);
+
+// ── Userspace surfaces (sysfs) ────────────────────────────────────
+
+static FX_RFKILL_BLOCKED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+fn fx_rfkill_set_block(blocked: bool) -> bool {
+    FX_RFKILL_BLOCKED.store(blocked, core::sync::atomic::Ordering::Release);
+    true
+}
+
+/// rfkill sysfs: /sys/class/rfkill/rfkill0/{name,type,state,soft,hard}
+/// read + store round-trips, and the airplane toggle.
+fn smoke_rfkill_sysfs_surface() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    crate::rfkill::__test_reset();
+    narf_filesystem::sysfs::__reset_for_test();
+    FX_RFKILL_BLOCKED.store(false, Ordering::Release);
+
+    let idx = crate::rfkill::register_radio(
+        "fx-wlan",
+        crate::rfkill::RadioType::Wlan,
+        Some(fx_rfkill_set_block),
+    );
+    crate::rfkill::publish_sysfs();
+
+    let root = narf_filesystem::sysfs::sysfs_root();
+    let kobj = root
+        .get_child("class")
+        .and_then(|c| c.get_child("rfkill"))
+        .and_then(|c| c.get_child("rfkill0"));
+    let kobj = match kobj {
+        Some(k) => k,
+        None => return TestResult::Fail("rfkill0 kobject missing"),
+    };
+    let show = |attr: &str| kobj.attr_show(attr).unwrap_or_default();
+    if show("name").trim() != "fx-wlan" {
+        return TestResult::Fail("rfkill name attr wrong");
+    }
+    if show("type").trim() != "wlan" {
+        return TestResult::Fail("rfkill type attr wrong");
+    }
+    if show("state").trim() != "1" || show("soft").trim() != "0" || show("hard").trim() != "0" {
+        return TestResult::Fail("rfkill initial state should be unblocked (1/0/0)");
+    }
+    // Store soft=1 → the vendor switch runs and state flips to 0.
+    match kobj.attr_store("soft", b"1") {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("rfkill soft store(1) failed"),
+    }
+    if !FX_RFKILL_BLOCKED.load(Ordering::Acquire) {
+        return TestResult::Fail("rfkill soft store did not drive the vendor switch");
+    }
+    if show("state").trim() != "0" {
+        return TestResult::Fail("rfkill state should be 0 (soft-blocked) after store");
+    }
+    // The airplane toggle: all radios blocked → toggle unblocks.
+    crate::rfkill::toggle_all();
+    if FX_RFKILL_BLOCKED.load(Ordering::Acquire) {
+        return TestResult::Fail("toggle_all should have unblocked the radio");
+    }
+    match crate::rfkill::radio_state(idx) {
+        Some(s) if s.state_value() == 1 => {}
+        _ => return TestResult::Fail("radio state should be unblocked after toggle"),
+    }
+    // Malformed store is refused.
+    match kobj.attr_store("soft", b"bogus") {
+        Some(Err(_)) => {}
+        _ => return TestResult::Fail("rfkill soft store should reject non-0/1 input"),
+    }
+
+    crate::rfkill::__test_reset();
+    narf_filesystem::sysfs::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/platform/wmi1086", smoke_rfkill_sysfs_surface);
+
+static FX_PROFILE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+fn fx_profile_get() -> Option<crate::platform_profile::PlatformProfile> {
+    use crate::platform_profile::PlatformProfile as P;
+    Some(
+        match FX_PROFILE.load(core::sync::atomic::Ordering::Acquire) {
+            0 => P::Quiet,
+            2 => P::Performance,
+            _ => P::Balanced,
+        },
+    )
+}
+
+fn fx_profile_set(p: crate::platform_profile::PlatformProfile) -> bool {
+    use crate::platform_profile::PlatformProfile as P;
+    FX_PROFILE.store(
+        match p {
+            P::Quiet => 0,
+            P::Performance => 2,
+            _ => 1,
+        },
+        core::sync::atomic::Ordering::Release,
+    );
+    true
+}
+
+/// Platform-profile sysfs: /sys/firmware/acpi/platform_profile{,_choices}
+/// read + store round-trips and the Fn-P cycle wrap.
+fn smoke_platform_profile_sysfs_surface() -> TestResult {
+    use crate::platform_profile::PlatformProfile as P;
+    use core::sync::atomic::Ordering;
+
+    crate::platform_profile::__test_reset();
+    narf_filesystem::sysfs::__reset_for_test();
+    FX_PROFILE.store(1, Ordering::Release);
+
+    const CHOICES: &[P] = &[P::Quiet, P::Balanced, P::Performance];
+    if !crate::platform_profile::register_backend(crate::platform_profile::ProfileBackend {
+        name: "fx-test",
+        choices: CHOICES,
+        get: fx_profile_get,
+        set: fx_profile_set,
+    }) {
+        return TestResult::Fail("fx backend registration failed");
+    }
+    crate::platform_profile::publish_sysfs();
+
+    let root = narf_filesystem::sysfs::sysfs_root();
+    let acpi = root.get_child("firmware").and_then(|f| f.get_child("acpi"));
+    let acpi = match acpi {
+        Some(a) => a,
+        None => return TestResult::Fail("/sys/firmware/acpi kobject missing"),
+    };
+    let show = |attr: &str| acpi.attr_show(attr).unwrap_or_default();
+    if show("platform_profile_choices").trim() != "quiet balanced performance" {
+        return TestResult::Fail("platform_profile_choices wrong");
+    }
+    if show("platform_profile").trim() != "balanced" {
+        return TestResult::Fail("platform_profile should read balanced");
+    }
+    match acpi.attr_store("platform_profile", b"performance\n") {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("platform_profile store(performance) failed"),
+    }
+    if FX_PROFILE.load(Ordering::Acquire) != 2 {
+        return TestResult::Fail("backend did not receive the performance set");
+    }
+    // Cycle from Performance wraps to the first choice (Quiet) —
+    // the Fn-P behaviour.
+    match crate::platform_profile::cycle() {
+        Some(P::Quiet) => {}
+        _ => return TestResult::Fail("cycle should wrap Performance → Quiet"),
+    }
+    // Unknown names and out-of-choices names are refused.
+    match acpi.attr_store("platform_profile", b"bogus\n") {
+        Some(Err(_)) => {}
+        _ => return TestResult::Fail("platform_profile store should reject unknown names"),
+    }
+    match acpi.attr_store("platform_profile", b"low-power\n") {
+        Some(Err(_)) => {}
+        _ => return TestResult::Fail("platform_profile store should reject out-of-choices names"),
+    }
+
+    crate::platform_profile::__test_reset();
+    narf_filesystem::sysfs::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/wmi1086",
+    smoke_platform_profile_sysfs_surface
 );
