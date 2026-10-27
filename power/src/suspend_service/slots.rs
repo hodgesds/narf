@@ -53,10 +53,6 @@ impl SlotRecord {
         }
     }
 
-    fn serialized_len(&self) -> usize {
-        1 + 8 + 4 + self.params.len() + 4 + self.blob.len()
-    }
-
     fn write_into(&self, out: &mut Vec<u8>) {
         out.push(self.kind.code());
         out.extend_from_slice(&self.epoch.to_le_bytes());
@@ -166,17 +162,6 @@ pub(crate) fn read_records_from(cur: &mut Cursor<'_>) -> Result<Vec<SlotRecord>,
     Ok(records)
 }
 
-/// Parse a count-prefixed record list produced by `write_records`.
-/// The whole input must be consumed.
-pub(crate) fn read_records(bytes: &[u8]) -> Result<Vec<SlotRecord>, ServiceError> {
-    let mut cur = Cursor::new(bytes);
-    let records = read_records_from(&mut cur)?;
-    if !cur.is_done() {
-        return Err(ServiceError::Malformed);
-    }
-    Ok(records)
-}
-
 /// The suspend partition's slot area: every retained epoch's slot
 /// records, without any plaintext secret (design §10.2 — the
 /// non-secret mirror the resume environment finds slots through).
@@ -223,17 +208,14 @@ impl SlotArea {
         let mut epochs = Vec::with_capacity(epoch_count);
         for _ in 0..epoch_count {
             let epoch = cur.u64()?;
-            // read_records consumes a count-prefixed list from a
-            // slice; re-slice the remainder and advance by what it
-            // used. The record codec is self-delimiting, so compute
-            // the consumed length from the parsed records.
-            let rest = &bytes[cur.pos..];
-            let records = read_records(rest)?;
-            let used: usize = 4 + records
-                .iter()
-                .map(SlotRecord::serialized_len)
-                .sum::<usize>();
-            cur.pos += used;
+            // Parse the count-prefixed list from the area's own
+            // cursor: the record codec is self-delimiting, so the
+            // cursor lands exactly on the next epoch group. (An
+            // earlier draft re-sliced the remainder and demanded a
+            // whole-input parse of it — which rejected every area
+            // with more than one epoch group, since the remainder
+            // includes the later groups.)
+            let records = read_records_from(&mut cur)?;
             epochs.push(EpochSlots { epoch, records });
         }
         if !cur.is_done() {
