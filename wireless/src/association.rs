@@ -6,6 +6,8 @@ use crate::rsn::{self, RsnIe, Suite};
 use alloc::{vec, vec::Vec};
 #[path = "association/channel.rs"]
 pub mod channel;
+#[path = "association/he.rs"]
+pub mod he;
 #[path = "association/phy.rs"]
 pub mod phy;
 
@@ -81,13 +83,43 @@ pub struct JoinPlan {
     spp_amsdu: bool,
 }
 
+/// BSS membership selectors (IEEE802.11-2020 Table 9-80 as amended;
+/// Linux include/linux/ieee80211.h `BSS_MEMBERSHIP_SELECTOR_*`), recorded
+/// as bits of `RateElements::selectors`.
+pub(crate) const SEL_HT: u8 = 1; // 127
+pub(crate) const SEL_VHT: u8 = 2; // 126
+pub(crate) const SEL_SAE_H2E: u8 = 4; // 123
+pub(crate) const SEL_HE: u8 = 8; // 122
+pub(crate) const SEL_EHT: u8 = 16; // 121
+pub(crate) const SEL_UHR: u8 = 32; // 120
+pub(crate) const SEL_GLK: u8 = 64; // 125
+pub(crate) const SEL_EPD: u8 = 128; // 124
+/// PHY selectors recognized by the opt-in PHY path; each is admitted only
+/// when the corresponding PHY is actually negotiated.
+pub(crate) const SEL_PHY: u8 = SEL_HT | SEL_VHT | SEL_HE | SEL_EHT | SEL_UHR;
+fn selector_bit(value: u8) -> u8 {
+    match value {
+        127 => SEL_HT,
+        126 => SEL_VHT,
+        125 => SEL_GLK,
+        124 => SEL_EPD,
+        123 => SEL_SAE_H2E,
+        122 => SEL_HE,
+        121 => SEL_EHT,
+        120 => SEL_UHR,
+        _ => 0,
+    }
+}
+
 #[derive(Default)]
 struct RateElements {
     supported: bool,
     extended: bool,
     rates: u16,
     basic: u16,
-    phy: bool,
+    /// Membership selectors this context can evaluate; others fail closed
+    /// while the element is parsed.
+    allowed: u8,
     selectors: u8,
 }
 impl RateElements {
@@ -108,11 +140,12 @@ impl RateElements {
                 if rate & 128 != 0 {
                     self.basic |= 1 << index;
                 }
-            } else if self.phy && matches!(*rate, 0xff | 0xfe) {
-                self.selectors |= if *rate == 0xff { 1 } else { 2 };
+            } else if rate & 128 != 0 && self.allowed & selector_bit(rate & 127) != 0 {
+                self.selectors |= selector_bit(rate & 127);
             } else if rate & 128 != 0 {
-                // This legacy profile has no HT/VHT/HE membership-selector
-                // negotiation. Unknown optional rates do not become offers.
+                // Unknown basic rates and selectors this context cannot
+                // negotiate fail closed. Unknown optional rates do not
+                // become offers.
                 return Err(Error::UnsupportedRates);
             }
         }
@@ -188,8 +221,10 @@ fn observe_inner(
     }
     let (mut ssid, mut ap_rsne, mut ap_rsnxe) = (None, None, None);
     let mut ds_seen = false;
+    // A scan observation also records an SAE-H2E-only BSS; JoinPlan admits
+    // it only for an SAE H2E security mode.
     let mut rates = RateElements {
-        phy: local.is_some(),
+        allowed: if local.is_some() { SEL_PHY } else { 0 } | SEL_SAE_H2E,
         ..Default::default()
     };
     ies(&bytes[36..], |id, body| {
@@ -401,7 +436,7 @@ impl JoinPlan {
             return Err(Error::InvalidBss);
         }
         let mut rate_elements = RateElements {
-            phy: local.is_some(),
+            allowed: if local.is_some() { SEL_PHY } else { 0 },
             ..Default::default()
         };
         let mut rsn = None;
@@ -598,7 +633,11 @@ impl JoinPlan {
             return Err(Error::Protocol);
         }
         let mut response = RateElements {
-            phy: self.offered_phy.is_some(),
+            allowed: if self.offered_phy.is_some() {
+                SEL_PHY
+            } else {
+                0
+            },
             ..Default::default()
         };
         if let Err(error) = ies(&bytes[30..], |id, body| response.observe(id, body)) {

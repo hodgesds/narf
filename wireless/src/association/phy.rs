@@ -2,6 +2,7 @@
 //! Bounded HT/VHT facts and directional station negotiation. These profiles
 //! describe implementation limits; they grant no radio, key, BA or port rights.
 //! Wire definitions: Linux include/linux/ieee80211-{ht,vht}.h, mac80211/{ht,vht}.c.
+use super::he::{self, HeCapability, HeNegotiation, HeOperation, LocalHe};
 use super::{channel, ies, Error};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -331,6 +332,7 @@ impl LocalVht {
 pub struct LocalPhy {
     ht: LocalHt,
     vht: Option<LocalVht>,
+    he: Option<LocalHe>,
 }
 impl LocalPhy {
     pub fn ht20(local: LocalHt) -> Result<Self, Error> {
@@ -340,6 +342,7 @@ impl LocalPhy {
         Ok(Self {
             ht: local,
             vht: None,
+            he: None,
         })
     }
     pub fn ht40(local: LocalHt) -> Result<Self, Error> {
@@ -349,19 +352,43 @@ impl LocalPhy {
         Ok(Self {
             ht: local,
             vht: None,
+            he: None,
         })
     }
     pub fn vht80(ht: LocalHt, vht: LocalVht) -> Result<Self, Error> {
         if ht.width != HtWidth::TwentyForty || vht.width160 {
             return Err(Error::UnsupportedRates);
         }
-        Ok(Self { ht, vht: Some(vht) })
+        Ok(Self {
+            ht,
+            vht: Some(vht),
+            he: None,
+        })
     }
     pub fn vht160(ht: LocalHt, vht: LocalVht) -> Result<Self, Error> {
         if ht.width != HtWidth::TwentyForty || !vht.width160 {
             return Err(Error::UnsupportedRates);
         }
-        Ok(Self { ht, vht: Some(vht) })
+        Ok(Self {
+            ht,
+            vht: Some(vht),
+            he: None,
+        })
+    }
+    /// Opt into HE (IEEE802.11ax) on top of this HT/VHT profile. On 5GHz
+    /// HE is negotiated only together with VHT (an HE STA in 5GHz is a VHT
+    /// STA, IEEE802.11ax-2021 26.17.1; mac80211 ieee80211_determine_ap_chan).
+    /// An HE160 promise needs the VHT160 opt-in, since the HE width never
+    /// exceeds the HT/VHT-selected channel.
+    pub fn with_he(mut self, he: LocalHe) -> Result<Self, Error> {
+        if he.width160() && !self.vht.is_some_and(|v| v.width160) {
+            return Err(Error::UnsupportedRates);
+        }
+        self.he = Some(he);
+        Ok(self)
+    }
+    pub fn he(&self) -> Option<&LocalHe> {
+        self.he.as_ref()
     }
 }
 
@@ -372,6 +399,8 @@ pub struct ApElements {
     ht_op: Option<[u8; 22]>,
     vht_cap: Option<[u8; 12]>,
     vht_op: Option<[u8; 5]>,
+    he_cap: Option<HeCapability>,
+    he_op: Option<HeOperation>,
 }
 impl ApElements {
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
@@ -386,6 +415,22 @@ impl ApElements {
                 61 => singleton(&mut value.ht_op, body)?,
                 191 => singleton(&mut value.vht_cap, body)?,
                 192 => singleton(&mut value.vht_op, body)?,
+                255 => match body.split_first() {
+                    None => return Err(Error::InvalidBss),
+                    Some((&he::EXT_HE_CAPABILITIES, rest)) => {
+                        if value.he_cap.is_some() {
+                            return Err(Error::InvalidBss);
+                        }
+                        value.he_cap = Some(HeCapability::parse(rest)?);
+                    }
+                    Some((&he::EXT_HE_OPERATION, rest)) => {
+                        if value.he_op.is_some() {
+                            return Err(Error::InvalidBss);
+                        }
+                        value.he_op = Some(HeOperation::parse(rest)?);
+                    }
+                    _ => {}
+                },
                 1 | 50 => {
                     let index = usize::from(id == 50);
                     if rates[index] || body.is_empty() || id == 1 && body.len() > 8 {
@@ -400,6 +445,8 @@ impl ApElements {
         if value.ht_cap.is_some() != value.ht_op.is_some()
             || value.vht_cap.is_some() != value.vht_op.is_some()
             || value.vht_cap.is_some() && value.ht_cap.is_none()
+            || value.he_cap.is_some() != value.he_op.is_some()
+            || value.he_cap.is_some() && value.ht_cap.is_none()
         {
             return Err(Error::InvalidBss);
         }
@@ -439,6 +486,12 @@ impl ApElements {
     }
     pub fn vht_operation(&self) -> Option<[u8; 5]> {
         self.vht_op
+    }
+    pub fn he_capability(&self) -> Option<&HeCapability> {
+        self.he_cap.as_ref()
+    }
+    pub fn he_operation(&self) -> Option<&HeOperation> {
+        self.he_op.as_ref()
     }
 }
 fn singleton<const N: usize>(slot: &mut Option<[u8; N]>, body: &[u8]) -> Result<(), Error> {
@@ -670,6 +723,7 @@ struct Selection {
     local: LocalPhy,
     ht: HtNegotiation,
     vht: Option<VhtNegotiation>,
+    he: Option<HeNegotiation>,
     width: Width,
     center: u8,
     channels: [u8; 8],
@@ -688,6 +742,10 @@ macro_rules! selection_accessors {
         }
         pub fn vht(&self) -> Option<&VhtNegotiation> {
             self.0.vht.as_ref()
+        }
+        /// HE facts when both sides negotiated HE on this channel.
+        pub fn he(&self) -> Option<&HeNegotiation> {
+            self.0.he.as_ref()
         }
         pub fn width(&self) -> Width {
             self.0.width
@@ -740,13 +798,13 @@ impl Offer {
     ) -> Result<Option<Self>, Error> {
         let ap = ApElements::parse(bytes)?;
         if ap.ht_cap.is_none() {
-            if selectors != 0 {
+            if selectors & super::SEL_PHY != 0 {
                 return Err(Error::UnsupportedRates);
             }
             return Ok(None);
         }
         let selected = select(local, ap, primary)?;
-        check_selectors(selectors, selected.vht.is_some())?;
+        check_selectors(selectors, &selected)?;
         Ok(Some(Self(selected)))
     }
     pub(super) fn response(&self, bytes: &[u8], selectors: u8) -> Result<Negotiated, Error> {
@@ -755,7 +813,14 @@ impl Offer {
             ApElements::parse(bytes)?,
             self.0.ht.operation.primary(),
         )?;
-        check_selectors(selectors, next.vht.is_some())?;
+        check_selectors(selectors, &next)?;
+        // An HE offer requires HE in the response and vice versa (mac80211
+        // ieee80211_assoc_config_link: "HE AP is missing HE capability/operation").
+        match (self.0.he.as_ref(), next.he.as_mut()) {
+            (Some(old), Some(new)) => new.narrow_to(old)?,
+            (None, None) => {}
+            _ => return Err(Error::UnsupportedRates),
+        }
         if self.0.vht.is_some() != next.vht.is_some()
             || next.channels[..next.count]
                 .iter()
@@ -806,6 +871,12 @@ impl Offer {
             bytes.extend_from_slice(&[191, 12]);
             bytes.extend_from_slice(&self.advertised_vht_capability());
         }
+        if let (Some(_), Some(local)) = (self.0.he, self.0.local.he) {
+            // mac80211 ieee80211_add_he_ie: only when HE was negotiated.
+            let body = local.capability_body();
+            bytes.extend_from_slice(&[255, body.len() as u8]);
+            bytes.extend_from_slice(&body);
+        }
     }
 }
 impl Offer {
@@ -844,7 +915,7 @@ fn element_selectors(bytes: &[u8], primary: u8) -> Result<u8, Error> {
         return Err(Error::InvalidBss);
     }
     let mut rates = super::RateElements {
-        phy: true,
+        allowed: super::SEL_PHY,
         ..Default::default()
     };
     super::ies(bytes, |id, body| rates.observe(id, body))?;
@@ -858,8 +929,18 @@ fn element_selectors(bytes: &[u8], primary: u8) -> Result<u8, Error> {
     Ok(rates.selectors)
 }
 
-pub(super) fn check_selectors(selectors: u8, vht: bool) -> Result<(), Error> {
-    if selectors & 2 != 0 && !vht {
+/// Every mandatory PHY membership selector needs that PHY negotiated
+/// (mac80211 ieee80211_determine_chan_mode `sta_selectors` subset check).
+/// HT is implied by any selection; EHT/UHR stay unsupported here.
+fn check_selectors(selectors: u8, selection: &Selection) -> Result<(), Error> {
+    let mut supported = super::SEL_HT;
+    if selection.vht.is_some() {
+        supported |= super::SEL_VHT;
+    }
+    if selection.he.is_some() {
+        supported |= super::SEL_HE;
+    }
+    if selectors & super::SEL_PHY & !supported != 0 {
         return Err(Error::UnsupportedRates);
     }
     Ok(())
@@ -892,6 +973,7 @@ fn select(local: LocalPhy, ap: ApElements, primary: u8) -> Result<Selection, Err
             basic,
         },
         vht: None,
+        he: None,
         width: Width::Twenty,
         center: primary,
         channels: [primary, 0, 0, 0, 0, 0, 0, 0],
@@ -1052,6 +1134,16 @@ fn select(local: LocalPhy, ap: ApElements, primary: u8) -> Result<Selection, Err
             basic,
         });
     }
+    selected.he = he::negotiate(
+        local.he,
+        ap.he_cap,
+        ap.he_op,
+        primary,
+        ap.vht_op,
+        selected.vht.is_some(),
+        selected.width,
+        selected.center2 != 0,
+    )?;
     Ok(selected)
 }
 /// Primary80 constituents of a canonical80 center and the primary's index.
