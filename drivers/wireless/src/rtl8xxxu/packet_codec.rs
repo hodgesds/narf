@@ -29,6 +29,11 @@ pub struct Mpdu {
     pub decrypted: bool,
     pub timestamp: u32,
     pub(super) native: Option<[u32; 4]>,
+    /// Set only by the station's recipient BA gate for a QoS MPDU on a TID
+    /// with an accepted ADDBA session; then (and only for HT MPDUs without
+    /// the A-MSDU bit, since the ADDBA response clears A-MSDU permission)
+    /// rxdesc16 PAGGR/FAGGR are admissible.
+    pub(super) ba: bool,
 }
 impl Mpdu {
     /// Native rxdesc16 is authoritative for encoding/width. Its old PHY block
@@ -37,8 +42,9 @@ impl Mpdu {
         if self.decrypted || self.bandwidth40 {
             return false;
         }
+        let aggregation = self.aggregation_mask();
         if let Some([d0, d1, d2, d3]) = self.native {
-            if d1 & ((1 << 14) | (1 << 15) | (1 << 27)) != 0 || d2 & 0xf000 != 0 {
+            if d1 & aggregation != 0 || d2 & 0xf000 != 0 {
                 return false;
             }
             let qos = self.bytes.first() == Some(&0x88);
@@ -69,7 +75,7 @@ impl Mpdu {
         let Some([d0, d1, d2, d3]) = self.native else {
             return false;
         };
-        if d3 & 0xf80 != 0 || d1 & ((1 << 14) | (1 << 15) | (1 << 27)) != 0 || d2 & 0xf000 != 0 {
+        if d3 & 0xf80 != 0 || d1 & aggregation != 0 || d2 & 0xf000 != 0 {
             return false;
         }
         if (d0 & (1 << 26) != 0) == self.phy.is_empty()
@@ -82,6 +88,25 @@ impl Mpdu {
             return false;
         }
         true
+    }
+}
+impl Mpdu {
+    /// rxdesc16 DW1 bits that must be clear: MF always; PAGGR/FAGGR unless
+    /// this HT QoS MPDU was admitted by an active recipient BA session and
+    /// carries no A-MSDU (A-MSDU-in-A-MPDU is never granted).
+    fn aggregation_mask(&self) -> u32 {
+        let base = (1 << 14) | (1 << 15) | (1 << 27);
+        match self.native {
+            Some([_, d1, _, _])
+                if self.ba
+                    && self.ht
+                    && d1 & (1 << 13) == 0
+                    && self.bytes.first() == Some(&0x88) =>
+            {
+                1 << 27
+            }
+            _ => base,
+        }
     }
 }
 impl narf_wireless::station_security::RawFrame for Mpdu {
@@ -163,6 +188,7 @@ pub fn receive(bytes: &[u8]) -> Result<Vec<Record>, Error> {
                 decrypted: d0 & (1 << 27) == 0 && d0 & (7 << 20) != 0,
                 timestamp: word(desc, 20),
                 native: Some([d0, d1, word(desc, 8), d3]),
+                ba: false,
             }));
         }
         if index + 1 < count {

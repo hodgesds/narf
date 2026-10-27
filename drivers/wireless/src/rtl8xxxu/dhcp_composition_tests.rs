@@ -86,6 +86,7 @@ struct Peer {
     response_ht: Option<Vec<u8>>,
     response_wmm: bool,
     declines: usize,
+    actions: Vec<Vec<u8>>,
     native_tx: Vec<Vec<u8>>,
     raw_queue: VecDeque<Vec<u8>>,
     rekey: Option<u8>,
@@ -126,6 +127,7 @@ impl Peer {
             response_ht: None,
             response_wmm: true,
             declines: 0,
+            actions: Vec::new(),
             native_tx: Vec::new(),
             raw_queue: VecDeque::new(),
             rekey: None,
@@ -205,11 +207,15 @@ impl Peer {
             "USB frame peer/direction"
         );
         if frame[0] == 0xd0 {
+            // Driver-owned BA actions: ADDBA Response (33) or DELBA (30).
             ensure!(
-                self.ht && frame.len() == 33 && frame[24..26] == [3, 1] && frame[27..29] == [37, 0],
-                "EU wrong native ADDBA refusal"
+                self.ht
+                    && (frame.len() == 33 && frame[24..26] == [3, 1]
+                        || frame.len() == 30 && frame[24..26] == [3, 2]),
+                "EU wrong native BA action"
             );
             self.declines += 1;
+            self.actions.push(frame.to_vec());
             return Ok((false, false));
         }
         if let Some(stage) = self.rekey {
@@ -1438,55 +1444,269 @@ kernel_test_in!(
     "drivers/wireless/rtl8xxxu/ht20",
     smoke_rtl8188eu_ht20_all_signed_sources_and_current_policy_terminal
 );
-fn ht_decline() -> Result<(), &'static str> {
+fn addba_request(h: &Harness, token: u8, params: u16, timeout: u16, ssn: u16) -> Vec<u8> {
+    let mut request = vec![0xd0, 0, 0, 0];
+    request.extend_from_slice(&h.device.mac());
+    request.extend_from_slice(&AP);
+    request.extend_from_slice(&AP);
+    request.extend_from_slice(&[0, 0, 3, 0, token]);
+    request.extend_from_slice(&params.to_le_bytes());
+    request.extend_from_slice(&timeout.to_le_bytes());
+    request.extend_from_slice(&(ssn << 4).to_le_bytes());
+    request
+}
+fn delba(h: &Harness, tid: u16, initiator: bool) -> Vec<u8> {
+    let mut frame = vec![0xd0, 0, 0, 0];
+    frame.extend_from_slice(&h.device.mac());
+    frame.extend_from_slice(&AP);
+    frame.extend_from_slice(&AP);
+    frame.extend_from_slice(&[0, 0, 3, 2]);
+    frame.extend_from_slice(&(tid << 12 | u16::from(initiator) << 11).to_le_bytes());
+    frame.extend_from_slice(&1u16.to_le_bytes());
+    frame
+}
+/// One non-A-MSDU QoS DATA MPDU on `tid` with sequence `seq` and CCMP PN `pn`.
+fn qos_mpdu(
+    h: &Harness,
+    seq: u16,
+    tid: u8,
+    pn: u64,
+    fill: u8,
+) -> Result<(Vec<u8>, Vec<u8>), &'static str> {
+    let p = h.link.0.lock();
+    let own = p.network.station;
+    let mut header = vec![0x88, if p.ap.protected() { 0x42 } else { 2 }, 0, 0];
+    header.extend_from_slice(&own);
+    header.extend_from_slice(&AP);
+    header.extend_from_slice(&AP);
+    header.extend_from_slice(&(seq << 4).to_le_bytes());
+    header.extend_from_slice(&[tid, 0]);
+    let mut body = vec![0xaa, 0xaa, 3, 0, 0, 0, 8, 0];
+    body.resize(body.len() + 64, fill);
+    let mut ethernet = own.to_vec();
+    ethernet.extend_from_slice(&AP);
+    ethernet.extend_from_slice(&[8, 0]);
+    ethernet.resize(ethernet.len() + 64, fill);
+    if p.ap.protected() {
+        body = narf_wireless::ccmp::protect(
+            &Ccm,
+            &header,
+            p.ptk
+                .as_ref()
+                .ok_or("EU BA TK")?
+                .tk
+                .as_slice()
+                .try_into()
+                .map_err(|_| "EU BA TK extent")?,
+            pn,
+            0,
+            tid,
+            false,
+            &mut body,
+        )
+        .map_err(|_| "EU BA CCMP")?;
+    }
+    header.extend_from_slice(&body);
+    Ok((header, ethernet))
+}
+/// Native rxdesc16 for an MPDU inside an A-MPDU: PAGGR, plus FAGGR on the first.
+fn ba_record(frame: &[u8], first: bool) -> Vec<u8> {
+    let mut raw = ht_record(frame, 32);
+    let d1 = u32::from_le_bytes(raw[4..8].try_into().unwrap())
+        | 1 << 14
+        | if first { 1 << 15 } else { 0 };
+    raw[4..8].copy_from_slice(&d1.to_le_bytes());
+    raw
+}
+fn ht_rx_ba() -> Result<(), &'static str> {
     for protected in [false, true] {
         let h = Harness::new_profile(protected, true)?;
         h.scan()?;
         h.join()?;
-        let mut request = vec![0xd0, 0, 0, 0];
-        request.extend_from_slice(&h.device.mac());
-        request.extend_from_slice(&AP);
-        request.extend_from_slice(&AP);
-        request.extend_from_slice(&[0, 0, 3, 0, 19]);
-        request.extend_from_slice(&(2u16 | (7 << 2) | (32 << 6)).to_le_bytes());
-        request.extend_from_slice(&[0, 0, 0x30, 0x12]);
+        // ADDBA Request TID5, immediate, window32, no timeout, SSN100. The
+        // response is accepted, held as an actual native control receipt.
+        let params = 2u16 | 5 << 2 | 32 << 6;
         {
             let mut p = h.link.0.lock();
             p.hold_control = true;
-            p.queue.push_back(request);
+            p.queue.push_back(addba_request(&h, 7, params, 0, 100));
         }
         h.pump();
         {
             let p = h.link.0.lock();
             ensure!(
                 p.declines == 1 && p.tx.as_ref().is_some_and(|t| t.control) && p.rx.is_some(),
-                "EU ADDBA decline lacked actual held native receipt"
+                "EU ADDBA response lacked actual held native receipt"
             );
         }
         h.link.0.lock().hold_control = false;
         h.pump();
-        let p = h.link.0.lock();
-        let response = p
-            .native_tx
-            .iter()
-            .find(|x| x.get(32) == Some(&0xd0))
-            .ok_or("EU missing native decline bytes")?;
+        {
+            let p = h.link.0.lock();
+            let response = p.actions.last().ok_or("EU missing ADDBA response")?;
+            let native = p
+                .native_tx
+                .iter()
+                .rev()
+                .find(|x| x.get(32) == Some(&0xd0))
+                .ok_or("EU missing native ADDBA bytes")?;
+            ensure!(
+                response[26] == 7
+                    && response[27..29] == [0, 0]
+                    && response[29..31] == params.to_le_bytes()
+                    && response[31..33] == [0, 0]
+                    && native[20] & 63 == 0
+                    && p.tx.is_none()
+                    && h.device.link_up(),
+                "EU ADDBA acceptance status/params/A-MSDU/policy/rate"
+            );
+        }
+        // Out-of-order A-MPDU MPDUs are released in sequence before PN.
+        let (f100, e100) = qos_mpdu(&h, 100, 5, 100, 0x41)?;
+        let (f101, e101) = qos_mpdu(&h, 101, 5, 101, 0x42)?;
+        let (f102, e102) = qos_mpdu(&h, 102, 5, 102, 0x43)?;
+        h.link.0.lock().raw_queue.push_back(ba_record(&f100, true));
         ensure!(
-            response[32 + 26..32 + 29] == [19, 37, 0]
-                && response[20] & 63 == 0
-                && p.tx.is_none()
-                && h.device.link_up(),
-            "EU ADDBA native refusal changed policy/rate/receipt"
+            h.device.progress() == vec![e100],
+            "EU BA head MPDU not delivered"
+        );
+        h.link.0.lock().raw_queue.push_back(ba_record(&f102, false));
+        ensure!(
+            h.device.progress().is_empty(),
+            "EU BA delivered past a sequence hole"
+        );
+        h.link.0.lock().raw_queue.push_back(ba_record(&f101, false));
+        ensure!(
+            h.device.progress() == vec![e101, e102],
+            "EU BA hole fill did not release in sequence order"
+        );
+        h.link.0.lock().raw_queue.push_back(ba_record(&f101, false));
+        ensure!(
+            h.device.progress().is_empty(),
+            "EU BA duplicate/old sequence delivered"
+        );
+        // A hole releases buffered MPDUs after the 100ms reorder timeout.
+        let (f104, e104) = qos_mpdu(&h, 104, 5, 104, 0x44)?;
+        h.link.0.lock().raw_queue.push_back(ba_record(&f104, false));
+        ensure!(
+            h.device.progress().is_empty(),
+            "EU BA delivered before reorder timeout"
+        );
+        h.env.0.fetch_add(101, Ordering::AcqRel);
+        ensure!(
+            h.device.progress() == vec![e104],
+            "EU BA reorder timeout did not release the held MPDU"
+        );
+        // A-MSDU inside an A-MPDU is never granted (response A-MSDU bit 0).
+        let (mut amsdu, _) = aggregate(&h, &[7, 9], 105, 5)?;
+        amsdu[22..24].copy_from_slice(&(105u16 << 4).to_le_bytes());
+        h.link
+            .0
+            .lock()
+            .raw_queue
+            .push_back(ba_record(&amsdu, false));
+        ensure!(
+            h.device.progress().is_empty() && h.device.link_up(),
+            "EU A-MSDU in A-MPDU reached PN/delivery"
+        );
+        let (mut amsdu, expected) = aggregate(&h, &[7, 9], 106, 5)?;
+        amsdu[22..24].copy_from_slice(&(106u16 << 4).to_le_bytes());
+        h.link.0.lock().raw_queue.push_back(ht_record(&amsdu, 32));
+        ensure!(
+            h.device.progress() == expected,
+            "EU standalone A-MSDU on a BA TID was not ordered/delivered"
+        );
+        // Originator DELBA ends the session: PAGGR is native-rejected again
+        // and ordinary QoS MPDUs on the TID bypass reordering.
+        h.link.0.lock().queue.push_back(delba(&h, 5, true));
+        h.pump();
+        let (f107, _) = qos_mpdu(&h, 107, 5, 107, 0x45)?;
+        h.link.0.lock().raw_queue.push_back(ba_record(&f107, false));
+        ensure!(
+            h.device.progress().is_empty() && h.device.link_up(),
+            "EU A-MPDU accepted after originator DELBA"
+        );
+        let (f109, e109) = qos_mpdu(&h, 109, 5, 109, 0x46)?;
+        h.link.0.lock().raw_queue.push_back(ht_record(&f109, 32));
+        ensure!(
+            h.device.progress() == vec![e109],
+            "EU post-DELBA ordinary QoS MPDU"
         );
     }
     Ok(())
 }
-fn smoke_rtl8188eu_ht20_addba_decline_owns_native_terminal_receipt() -> TestResult {
-    ht_result(ht_decline())
+fn smoke_rtl8188eu_ht20_rx_ba_reorders_ampdu_before_pn() -> TestResult {
+    ht_result(ht_rx_ba())
 }
 kernel_test_in!(
     "drivers/wireless/rtl8xxxu/ht20",
-    smoke_rtl8188eu_ht20_addba_decline_owns_native_terminal_receipt
+    smoke_rtl8188eu_ht20_rx_ba_reorders_ampdu_before_pn
+);
+fn ht_rx_ba_policy() -> Result<(), &'static str> {
+    let h = Harness::new_profile(false, true)?;
+    h.scan()?;
+    h.join()?;
+    let status = |h: &Harness, request: Vec<u8>| -> Result<[u8; 4], &'static str> {
+        let before = h.link.0.lock().actions.len();
+        h.link.0.lock().queue.push_back(request);
+        h.pump();
+        let p = h.link.0.lock();
+        ensure!(p.actions.len() == before + 1, "EU ADDBA response missing");
+        let r = p.actions.last().unwrap();
+        Ok([r[27], r[28], r[29], r[30]])
+    };
+    // TSPEC TID: declined; delayed policy / window65: invalid QoS param.
+    let tid9 = status(&h, addba_request(&h, 1, 2 | 9 << 2 | 8 << 6, 0, 0))?;
+    let delayed = status(&h, addba_request(&h, 2, 3 << 2 | 8 << 6, 0, 0))?;
+    let wide = status(&h, addba_request(&h, 3, 2 | 3 << 2 | 65 << 6, 0, 0))?;
+    // Window0 selects the HT maximum64.
+    let zero = status(&h, addba_request(&h, 4, 2 | 3 << 2, 100, 0))?;
+    ensure!(
+        tid9[..2] == [37, 0]
+            && delayed[..2] == [38, 0]
+            && wide[..2] == [38, 0]
+            && zero == [0, 0, 0x0e, 0x10],
+        "EU ADDBA status/window selection differs from mac80211"
+    );
+    // Same token: unchanged timeout succeeds, a changed timeout is declined
+    // and keeps the existing session.
+    let same = status(&h, addba_request(&h, 4, 2 | 3 << 2, 100, 0))?;
+    let changed = status(&h, addba_request(&h, 4, 2 | 3 << 2, 200, 0))?;
+    ensure!(
+        same[..2] == [0, 0] && changed[..2] == [37, 0],
+        "EU ADDBA same-token update policy"
+    );
+    // Session inactivity of100TU (102ms) sends recipient DELBA QSTA_TIMEOUT.
+    let before = h.link.0.lock().actions.len();
+    h.env.0.fetch_add(103, Ordering::AcqRel);
+    h.pump();
+    {
+        let p = h.link.0.lock();
+        let d = p.actions.last().ok_or("EU missing DELBA")?;
+        ensure!(
+            p.actions.len() == before + 1
+                && d.len() == 30
+                && d[24..26] == [3, 2]
+                && d[26..28] == (3u16 << 12).to_le_bytes()
+                && d[28..30] == [39, 0]
+                && h.device.link_up(),
+            "EU BA inactivity timeout DELBA"
+        );
+    }
+    let (f, _) = qos_mpdu(&h, 0, 3, 1, 0x50)?;
+    h.link.0.lock().raw_queue.push_back(ba_record(&f, true));
+    ensure!(
+        h.device.progress().is_empty() && h.device.link_up(),
+        "EU timed-out BA session still admitted A-MPDU"
+    );
+    Ok(())
+}
+fn smoke_rtl8188eu_ht20_rx_ba_policy_and_inactivity_delba() -> TestResult {
+    ht_result(ht_rx_ba_policy())
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/ht20",
+    smoke_rtl8188eu_ht20_rx_ba_policy_and_inactivity_delba
 );
 fn ht_m4() -> Result<(), &'static str> {
     for cancelled in [false, true] {

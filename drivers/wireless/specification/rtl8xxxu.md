@@ -443,7 +443,7 @@ no C21/C22 H2C rate-mask callback or invented firmware-applied ACK is added.
 
 Native `rxdesc16` rate/HT/BW, fragment, aggregate, QoS/TID and A-MSDU facts are
 checked before crypto. HT MCS0..7 requires BW20/LGI and no greenfield/HT-control/
-EOSP/A-MPDU metadata. With PHYST present, the bounded32-byte padded
+EOSP metadata; A-MPDU metadata only under the recipient BA rules below. With PHYST present, the bounded32-byte padded
 `rtl8723au_phy_stats` block must agree with LGI and the selected full20MHz RXSC
 profile. This old block has no independent channel or C21/C22 page number;
 the source-owned fixed channel and descriptor supply those facts. PHYST absent
@@ -453,12 +453,40 @@ A-MSDU/TID disagreement are discarded. Only complete original standalone
 3839-byte A-MSDUs enter shared whole-aggregate authentication/deaggregation;
 bad MIC or a bad later subframe publishes no prefix and consumes no PN.
 
-The retained station owns valid bound immediate ADDBA requests for TIDs0..7
-and sends the actual33-byte status37 decline through the native management
-descriptor/USB endpoint. Ordinary DATA waits for that exact terminal receipt;
-a USB completion is host delivery, not a fabricated radio ACK. No BA agreement,
-reorder window or TX aggregation is enabled. Cancellation, source loss or an
-uncertain transfer retains outstanding USB resources and cannot reopen them.
+#### Recipient Block Ack, RX A-MPDU and reordering (implemented)
+
+`rtl8xxxu_ampdu_action` RX_START/RX_STOP program no register: the RTL8188EU
+MAC acknowledges A-MPDUs autonomously and mac80211 owns the session and the
+reorder buffer. `station_runtime.rs` follows mac80211 `agg-rx.c`
+`__ieee80211_start_rx_ba_session` for every peer-bound ADDBA Request on the
+HT profile: TID>=8 (TSPEC) answers status37; delayed policy (no
+`IEEE80211_HT_CAP_DELAY_BA`) or a window above `IEEE80211_MAX_AMPDU_BUF_HT`
+answers38; window0 selects64; a repeated dialog token succeeds only with an
+unchanged timeout (else37, session kept); a new token replaces the session
+without DELBA. The33-byte response echoes token/timeout, sets immediate policy
+and clears A-MSDU permission (rtl8xxxu lacks `SUPPORTS_AMSDU_IN_AMPDU`) and is
+sent through the native management descriptor/USB endpoint as before; ordinary
+DATA still waits for that exact terminal receipt.
+
+The session head starts at the request SSN. Unicast QoS DATA from the bound
+peer on a session TID passes through the shared `narf_wireless::reorder`
+buffer (`ieee80211_rx_reorder_ampdu`) before CCMP/PN, A-MSDU deaggregation or
+delivery; released original captures re-enter the batch in sequence order and
+keep their capture-time port/epoch admission. Only such MPDUs may carry rxdesc16
+PAGGR/FAGGR, and only without the A-MSDU bit. Holes release after mac80211's
+100ms `HT_RX_REORDER_BUF_TIMEOUT`; old/duplicate sequences are dropped. The
+EU RX filter passes no BlockAckReq (REG_RXFLTMAP1 PS-Poll only, no
+RCR_ACCEPT_CTRL_FRAME, as `rtl8xxxu_configure_filter` in station mode), so
+BAR-driven advance does not occur. A nonzero session timeout without traffic
+(`sta_rx_agg_session_timer_expired`) purges the buffer and queues a30-byte
+recipient DELBA with `WLAN_REASON_QSTA_TIMEOUT`; an originator DELBA purges
+the session. Failure/disconnect purge every session. Smokes
+`smoke_rtl8188eu_ht20_rx_ba_reorders_ampdu_before_pn` (Open/WPA2: held native
+response receipt, literal response, out-of-order release, duplicate, timeout
+release, A-MSDU-in-A-MPDU refusal, standalone A-MSDU on a BA TID, DELBA) and
+`smoke_rtl8188eu_ht20_rx_ba_policy_and_inactivity_delba` cover the paths.
+TX aggregation stays disabled. Cancellation, source loss or an uncertain
+transfer retains outstanding USB resources and cannot reopen them.
 
 RX copies record controlled-port admission and a receive/key generation before
 processing. Native terminal M2/M4/Group2 plus actual receive-idle precede shared
@@ -480,8 +508,7 @@ responses, actual held ADDBA/M4 receipts, closed captures, each current source,
 policy loss and reentrant key/ordinary-credit publication. These cases pass
 both-architecture native QEMU and coordinated build/Clippy gates. Physical
 USB/RF/HT interoperability and exact-device measured qualification remain external.
-SGI20, HT40, RX A-MPDU, TX A-MPDU, TX A-MSDU, recipient/originator BA and RX
-reordering, adaptive rates, broader scans/channels, coexistence
+SGI20, HT40, TX A-MPDU, TX A-MSDU, originator BA, adaptive rates, broader scans/channels, coexistence
 and reset/rejoin remain software work.
 
 ## 4. Invariants
@@ -543,7 +570,7 @@ channels/rates, reset/rejoin and PM still need software implementation.
 Chip inventory is source-specific: Linux `rtl8xxxu/8188e.c` identifies1TX/1RX;
 `8192e.c` identifies actual1/2TX and2RX; `8723b.c` identifies1TX/1RX and optional
 BT/S0S1. EU's separately qualified HT20/LGI continuation is software-validated above;
-SGI20/HT40, RX A-MPDU, TX A-MPDU/TX A-MSDU, recipient/originator BA, RX reorder,
+SGI20/HT40, TX A-MPDU/TX A-MSDU, originator BA,
 adaptive rates, broader active/passive scanning, runtime PM and
 reset/rejoin remain software work. Full WMM AC/TID routing is implemented.
 

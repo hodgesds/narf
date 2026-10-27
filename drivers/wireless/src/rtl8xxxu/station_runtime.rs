@@ -40,12 +40,34 @@ enum Tx {
     Association,
     Eapol,
     Data,
-    Decline,
+    /// Driver-owned BA action (ADDBA response, DELBA).
+    Control,
 }
 struct Captured {
     frame: Mpdu,
     admitted: bool,
     epoch: u64,
+    /// Already released by a recipient BA reorder buffer.
+    ordered: bool,
+}
+/// mac80211 `IEEE80211_MAX_AMPDU_BUF_HT` (rtl8xxxu keeps the default
+/// `max_rx_aggregation_subframes`).
+const BA_MAX_WINDOW: u16 = 64;
+/// mac80211 `HT_RX_REORDER_BUF_TIMEOUT` (HZ / 10).
+const REORDER_TIMEOUT_NS: u64 = 100_000_000;
+/// `WLAN_STATUS_REQUEST_DECLINED` / `WLAN_STATUS_INVALID_QOS_PARAM`.
+const STATUS_DECLINED: u16 = 37;
+const STATUS_INVALID_QOS: u16 = 38;
+/// `WLAN_REASON_QSTA_TIMEOUT`.
+const REASON_TIMEOUT: u16 = 39;
+/// One accepted recipient BA session (mac80211 `tid_ampdu_rx`). The RTL8188EU
+/// MAC acknowledges A-MPDUs autonomously; `rtl8xxxu_ampdu_action` RX_START/
+/// RX_STOP program nothing, so the session is host state only.
+struct RxBa {
+    reorder: narf_wireless::reorder::Reorder<Captured>,
+    token: u8,
+    timeout_tu: u16,
+    last_rx: u64,
 }
 struct Pending {
     kind: Tx,
@@ -88,6 +110,8 @@ pub struct Station<C: ControlIo, B: packet_transport::Io> {
     edca: Option<narf_wireless::wmm::Parameters>,
     /// A newer bound-beacon WMM Parameter Set awaiting async EP0 writes.
     edca_pending: Option<narf_wireless::wmm::Parameters>,
+    /// Recipient BA sessions by TID.
+    rx_ba: [Option<RxBa>; 8],
 }
 impl<C: ControlIo, B: packet_transport::Io> core::fmt::Debug for Station<C, B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -142,6 +166,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             qos_sequence: [0; 8],
             edca: None,
             edca_pending: None,
+            rx_ba: Default::default(),
         })
     }
     pub fn append_sme_ies(&mut self, bytes: &[u8]) -> Result<(), Error> {
@@ -215,6 +240,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
     fn fail(&mut self) {
         self.retire_receive();
         self.batch.clear();
+        self.retire_ba();
         self.plan.cancel();
         self.failed.store(true, Ordering::Release);
         self.phase = Phase::Failed;
@@ -318,9 +344,13 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         if !self.progress(now)? {
             return Ok(());
         }
+        self.service_ba(now)?;
         for _ in 0..16 {
             let Some(captured) = self.batch.pop_front() else {
                 break;
+            };
+            let Some(captured) = self.reorder_gate(captured, now) else {
+                continue;
             };
             let Some((frame, admitted)) = self.admit_capture(captured) else {
                 continue;
@@ -401,7 +431,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             if !matches!(self.phase, Phase::FourWay | Phase::Open) {
                 continue;
             }
-            if self.control_frame(&frame, admitted)? {
+            if self.control_frame(&frame, admitted, now)? {
                 continue;
             }
             if self.data_frame(&frame, admitted, now, &mut *nonce)? {
@@ -517,13 +547,14 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             let admitted = self.controlled_port_open();
             let epoch = self.epoch.load(Ordering::Acquire);
             for frame in frames {
-                if self.batch.len() == 256 {
+                if self.batch.len() >= 256 {
                     return Err(Error::State);
                 }
                 self.batch.push_back(Captured {
                     frame,
                     admitted,
                     epoch,
+                    ordered: false,
                 });
             }
         }
@@ -549,7 +580,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                 self.sequence = (self.sequence + 1) & 4095;
                 self.radio.submit_management(&frame).map_err(Error::Radio)?;
                 self.pending = Some(Pending {
-                    kind: Tx::Decline,
+                    kind: Tx::Control,
                     deadline: now.saturating_add(1000),
                 });
             }
@@ -566,7 +597,10 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         }
         Some((captured.frame, admitted))
     }
-    fn control_frame(&mut self, frame: &Mpdu, admitted: bool) -> Result<bool, Error> {
+    /// Peer-bound BA action frames. ADDBA Request follows mac80211
+    /// `__ieee80211_start_rx_ba_session`; DELBA from the originator follows
+    /// `ieee80211_process_delba`. Other action frames are consumed unchanged.
+    fn control_frame(&mut self, frame: &Mpdu, admitted: bool, now: u64) -> Result<bool, Error> {
         self.radio.current_wmm().map_err(Error::Radio)?;
         let b = &frame.bytes;
         if b.first() != Some(&0xd0) {
@@ -576,32 +610,194 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             || !self.controlled_port_open()
             || !self.plan.ht_selected()
             || !frame.admitted(false)
-            || b.len() != 33
+            || b.len() < 26
             || b[1] & 0xc7 != 0
             || b[4..10] != self.radio.local().ok_or(Error::State)?
             || b[10..16] != self.peer()
             || b[16..22] != self.peer()
             || b[22] & 15 != 0
-            || b[24..26] != [3, 0]
+            || b[24] != 3
         {
             return Ok(true);
         }
-        let p = u16::from_le_bytes([b[27], b[28]]);
-        if p & 2 == 0 || (p >> 2) & 15 >= 8 || p >> 6 == 0 || b[31] & 15 != 0 {
-            return Ok(true);
+        match b[25] {
+            0 if b.len() >= 33 => {
+                let token = b[26];
+                let p = u16::from_le_bytes([b[27], b[28]]);
+                let timeout = u16::from_le_bytes([b[29], b[30]]);
+                let ssn = u16::from_le_bytes([b[31], b[32]]) >> 4;
+                if self.controls.len() == 8 {
+                    return Err(Error::State);
+                }
+                let (status, tid, buf) = self.addba_request(token, p, timeout, ssn, now);
+                // ieee80211_send_addba_resp: A-MSDU bit from
+                // SUPPORTS_AMSDU_IN_AMPDU (unset by rtl8xxxu), immediate policy.
+                let params = (buf << 6) | (u16::from(tid) << 2) | 2;
+                let mut response = self.action_header()?;
+                response.extend_from_slice(&[3, 1, token]);
+                response.extend_from_slice(&status.to_le_bytes());
+                response.extend_from_slice(&params.to_le_bytes());
+                response.extend_from_slice(&timeout.to_le_bytes());
+                self.controls.push_back(response);
+            }
+            2 if b.len() >= 30 => {
+                let p = u16::from_le_bytes([b[26], b[27]]);
+                // Initiator bit set: the AP originator tears down our
+                // recipient session; buffered MPDUs are purged.
+                if p & (1 << 11) != 0 {
+                    if let Some(session) = self.rx_ba[usize::from(p >> 12) & 7].take() {
+                        session.reorder.retire();
+                    }
+                }
+            }
+            _ => (),
         }
-        if self.controls.len() == 8 {
-            return Err(Error::State);
-        }
-        let mut response = vec![0xd0, 0, 0, 0];
-        response.extend_from_slice(&self.peer());
-        response.extend_from_slice(&self.radio.local().ok_or(Error::State)?);
-        response.extend_from_slice(&self.peer());
-        response.extend_from_slice(&[0, 0, 3, 1, b[26], 37, 0]);
-        response.extend_from_slice(&(p & !1).to_le_bytes());
-        response.extend_from_slice(&b[29..31]);
-        self.controls.push_back(response);
         Ok(true)
+    }
+    fn action_header(&self) -> Result<Vec<u8>, Error> {
+        let mut header = vec![0xd0, 0, 0, 0];
+        header.extend_from_slice(&self.peer());
+        header.extend_from_slice(&self.radio.local().ok_or(Error::State)?);
+        header.extend_from_slice(&self.peer());
+        header.extend_from_slice(&[0, 0]);
+        Ok(header)
+    }
+    /// Returns (status, TID, buffer size) for the ADDBA response.
+    fn addba_request(
+        &mut self,
+        token: u8,
+        p: u16,
+        timeout: u16,
+        ssn: u16,
+        now: u64,
+    ) -> (u16, u8, u16) {
+        let policy = (p >> 1) & 1;
+        let tid = ((p >> 2) & 15) as u8;
+        let mut buf = p >> 6;
+        // IEEE80211_FIRST_TSPEC_TSID: TSPEC TIDs are declined.
+        if tid >= 8 {
+            return (STATUS_DECLINED, tid, buf);
+        }
+        // No IEEE80211_HT_CAP_DELAY_BA: delayed policy or an oversized
+        // window is an invalid QoS parameter.
+        if policy != 1 || buf > BA_MAX_WINDOW {
+            return (STATUS_INVALID_QOS, tid, buf);
+        }
+        if buf == 0 {
+            buf = BA_MAX_WINDOW;
+        }
+        let slot = &mut self.rx_ba[usize::from(tid)];
+        if let Some(session) = slot {
+            // Same dialog token: an update, accepted only without a changed
+            // timeout. A new token replaces the session without DELBA.
+            if session.token == token {
+                let status = if session.timeout_tu == timeout {
+                    0
+                } else {
+                    STATUS_DECLINED
+                };
+                return (status, tid, buf);
+            }
+            if let Some(old) = slot.take() {
+                old.reorder.retire();
+            }
+        }
+        let Ok(mut reorder) = narf_wireless::reorder::Reorder::new(buf as u8, REORDER_TIMEOUT_NS)
+        else {
+            return (STATUS_DECLINED, tid, buf);
+        };
+        // head_seq_num = start_seq_num.
+        if reorder.advance(ssn, now.saturating_mul(1_000_000)).is_err() {
+            return (STATUS_DECLINED, tid, buf);
+        }
+        *slot = Some(RxBa {
+            reorder,
+            token,
+            timeout_tu: timeout,
+            last_rx: now,
+        });
+        (0, tid, buf)
+    }
+    /// mac80211 `ieee80211_rx_reorder_ampdu`: unicast QoS DATA from the bound
+    /// peer on a TID with a session is ordered before CCMP/PN and delivery.
+    /// The released original captures re-enter the batch head in sequence
+    /// order and are then admitted exactly as ordinary captures.
+    fn reorder_gate(&mut self, mut captured: Captured, now: u64) -> Option<Captured> {
+        if captured.ordered || !self.plan.ht_selected() {
+            return Some(captured);
+        }
+        let b = &captured.frame.bytes;
+        let own = self.radio.local()?;
+        if b.len() < 26
+            || b[0] != 0x88
+            || b[1] & 3 != 2
+            || b[4..10] != own
+            || b[10..16] != self.peer()
+            || b[22] & 15 != 0
+        {
+            return Some(captured);
+        }
+        let tid = usize::from(b[24] & 15);
+        let sequence = u16::from_le_bytes([b[22], b[23]]) >> 4;
+        let Some(session) = self.rx_ba.get_mut(tid).and_then(Option::as_mut) else {
+            return Some(captured);
+        };
+        session.last_rx = now;
+        captured.frame.ba = true;
+        captured.ordered = true;
+        // Allocation failure drops only this MPDU, as the shared owner does.
+        let released = session
+            .reorder
+            .push(sequence, now.saturating_mul(1_000_000), captured)
+            .unwrap_or_default();
+        for item in released.into_iter().rev() {
+            self.batch.push_front(item);
+        }
+        None
+    }
+    /// Session inactivity (`sta_rx_agg_session_timer_expired`: DELBA as
+    /// recipient with QSTA_TIMEOUT) and reorder-hole expiry
+    /// (`sta_rx_agg_reorder_timer_expired`). The RTL8188EU RX filter does not
+    /// pass BlockAckReq control frames (REG_RXFLTMAP1 PS-Poll only, no
+    /// RCR_ACCEPT_CTRL_FRAME), so holes advance only by window or timeout.
+    fn service_ba(&mut self, now: u64) -> Result<(), Error> {
+        for tid in 0..8u16 {
+            let Some(session) = self.rx_ba[usize::from(tid)].as_mut() else {
+                continue;
+            };
+            if session.timeout_tu != 0
+                && now.saturating_sub(session.last_rx)
+                    >= u64::from(session.timeout_tu) * 1024 / 1000
+            {
+                if let Some(session) = self.rx_ba[usize::from(tid)].take() {
+                    session.reorder.retire();
+                }
+                if self.controls.len() == 8 {
+                    return Err(Error::State);
+                }
+                let mut delba = self.action_header()?;
+                delba.extend_from_slice(&[3, 2]);
+                delba.extend_from_slice(&(tid << 12).to_le_bytes());
+                delba.extend_from_slice(&REASON_TIMEOUT.to_le_bytes());
+                self.controls.push_back(delba);
+                continue;
+            }
+            let released = session
+                .reorder
+                .expire(now.saturating_mul(1_000_000))
+                .unwrap_or_default();
+            for item in released.into_iter().rev() {
+                self.batch.push_front(item);
+            }
+        }
+        Ok(())
+    }
+    fn retire_ba(&mut self) {
+        for slot in &mut self.rx_ba {
+            if let Some(session) = slot.take() {
+                session.reorder.retire();
+            }
+        }
     }
     fn data_frame(
         &mut self,
@@ -722,9 +918,13 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         if !self.progress(now)? {
             return Ok(());
         }
+        self.service_ba(now)?;
         for _ in 0..16 {
             let Some(captured) = self.batch.pop_front() else {
                 break;
+            };
+            let Some(captured) = self.reorder_gate(captured, now) else {
+                continue;
             };
             let Some((frame, admitted)) = self.admit_capture(captured) else {
                 continue;
@@ -750,7 +950,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             {
                 return Err(Error::State);
             }
-            if self.control_frame(&frame, admitted)? {
+            if self.control_frame(&frame, admitted, now)? {
                 continue;
             }
             if self.data_frame(&frame, admitted, now, &mut *nonce)? {
@@ -820,6 +1020,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             Ok(()) => {
                 self.pending = None;
                 self.batch.clear();
+                self.retire_ba();
                 self.plan.cancel();
                 self.phase = Phase::Stopped;
                 Ok(())
