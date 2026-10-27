@@ -54,7 +54,6 @@ ath9k	ar9485_enablement	AR9485/AR1111 (168c:0032/0037) native enablement	chip	dr
 ath9k	ar9565_enablement	AR9565 (168c:0036) native enablement	chip	drivers/wireless/specification/ath9k.md	636
 ath9k	ar9580_enablement	AR9580 (168c:0033) native enablement	chip	drivers/wireless/specification/ath9k.md	633
 ath9k	channel_retuning	Channel retuning	feature	drivers/wireless/specification/ath9k.md	587
-ath9k	dma_reclamation	DMA reclamation	feature	drivers/wireless/specification/ath9k.md	615
 ath9k	factory_profile_selection	Additional factory-profile selection	feature	drivers/wireless/specification/ath9k.md	587
 ath9k	host_bus_pm	PCIe ASPM host-bus power management	feature	drivers/wireless/specification/ath9k.md	607
 ath9k	ht40	HT40	feature	drivers/wireless/specification/ath9k.md	588

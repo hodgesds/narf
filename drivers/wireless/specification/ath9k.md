@@ -494,8 +494,19 @@ current capability invocation, including the actual configuration accesses.
   programming before BME activation. TX status is terminal only after descriptor
   completion and queue idle; RX completion is acquired before status/payload.
   A null-terminated RX list retains its last consumed descriptor until a
-  successor completes. Stop parks all queues, MAC RX and BME but does not
-  prove memory reclaimable; published mappings remain retained on drop.
+  successor completes. Stop follows Linux `recv.c::ath_stoprecv` and
+  `mac.c::{ath9k_hw_stopdmarecv,ath9k_hw_abort_tx_dma}` with bus mastering
+  still on: DIAG RX abort/disable, RX filter clear, MACMISC observation bus,
+  AR_CR_RXD with 1000 x 10 us RXE polls and the pre-AR9300 DMADBG_7 `0x1c0`
+  hang signature, then AR_Q_TXD for all ten QCUs with forced quiet collision,
+  idle-high channel and ignored backoff while each QCU's pending count and
+  TXE bit are polled up to 1000 times 5 us apart. IER is cleared and BME is
+  disabled with readback. Only if every step succeeded and post-BME-off BAR
+  reads (which order behind earlier device-posted DMA writes) still show RXE,
+  TXE and pending counts clear, RX parked and IER off, are the rings and
+  buffers released (`Packet::reclaimed`). Any timeout, hang signature or
+  access failure keeps every mapping pinned for the rest of the boot. The
+  terminal owner leaves AR_Q_TXD set rather than Linux's final re-enable.
 - Hardware key-cache entries remain invalid. Protected KeyMiss frames with no
   other errors may lack FrameOK and reach software CCMP authentication;
   unprotected frames require FrameOK. Neither path bypasses MIC/replay checks.
@@ -613,9 +624,12 @@ requires PCI `driver_data` `ATH9K_PCI_WOW`, which `pci.c` sets only for
 `0x0034` (AR9462) subsystems, and the hardware programming lives in
 `ar9003_wow.c` (AR9003 family only). It belongs to AR9462 enablement.
 
-Reset/rejoin, removal and DMA reclamation need
-an independently proved generation/reset owner; the initial profile retains
-storage and requires a fresh lifecycle after terminal closure.
+DMA reclamation is implemented by the terminal stop described in §4 and
+covered by `smoke_ar9285_packet_dma_stop_proof_reclaims_storage` (held TX
+abort, never-started owner, wedged DCU and RX DMA with exact Linux poll
+budgets, DMADBG_7 hang and revoked authority), and by the ownership smoke,
+whose model device faults on any access to a released mapping. Reset/rejoin
+and removal still need an independently proved generation/reset owner.
 
 Other ath9k devices need their own EEPROM maps, reset/PHY tables and
 descriptor/runtime variants before they can be claimed supported. The Linux

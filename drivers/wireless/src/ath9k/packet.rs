@@ -30,6 +30,25 @@ const QTXD: u64 = 0x880;
 const QSTS: u64 = 0xa00;
 const DIAG: u64 = 0x8048;
 const RX_PARK: u32 = 0x0200_0020;
+/// `reg.h::AR_RX_FILTER`; `ath_stoprecv` clears it before RX DMA stop.
+const RX_FILTER: u64 = 0x803c;
+/// `reg.h::AR_PCU_MISC` with `AR_PCU_FORCE_QUIET_COLL | AR_PCU_CLEAR_VMF`.
+const PCU_MISC: u64 = 0x8120;
+const PCU_QUIET: u32 = 0x0004_0000 | 0x0100_0000;
+/// `reg.h::AR_DIAG_FORCE_CH_IDLE_HIGH`.
+const DIAG_IDLE_HIGH: u32 = 0x0100_0000;
+/// `reg.h::AR_D_GBL_IFS_MISC` / `AR_D_GBL_IFS_MISC_IGNORE_BACKOFF`.
+const IFS_MISC: u64 = 0x10f0;
+const IGNORE_BACKOFF: u32 = 0x1000_0000;
+/// `ATH9K_NUM_TX_QUEUES`; `AR_Q_TXD_M` covers all ten DCUs.
+const QUEUES: u64 = 10;
+/// `hw.h::AH_RX_STOP_DMA_TIMEOUT / AH_TIME_QUANTUM` polls of 10 us.
+const RX_STOP_POLLS: u32 = 1000;
+/// `mac.c::ath9k_hw_abort_tx_dma` per-QCU `maxdelay` polls (full-rate channel).
+const TX_ABORT_POLLS: u32 = 1000;
+/// `reg.h::AR_MACMISC` / `AR_DMADBG_7` (RX DMA hang observation).
+const MACMISC: u64 = 0x0058;
+const DMADBG_7: u64 = 0x00fc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Error {
@@ -75,6 +94,15 @@ pub(super) trait Port {
     fn allocate(&self, bytes: usize) -> Result<DmaBuffer, Error>;
     fn master(&self, enabled: bool) -> Result<(), Error>;
     fn now_us(&self) -> u64;
+    /// Linux `udelay` between DMA-stop polls.
+    fn delay_us(&self, us: u64) {
+        narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_us(us));
+    }
+    /// Receive every packet allocation after a quiescence proof. The native
+    /// port frees them; a model may retain them to observe late device access.
+    fn release(&self, buffers: Vec<DmaBuffer>) {
+        drop(buffers);
+    }
 }
 struct Memory(DmaBuffer);
 impl Memory {
@@ -251,6 +279,7 @@ pub(super) struct Packet<P: Port> {
     edca: Option<u32>,
     ba: bool,
     tx_ba: bool,
+    reclaimed: bool,
 }
 impl<P: Port> core::fmt::Debug for Packet<P> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -326,10 +355,16 @@ impl<P: Port> Packet<P> {
             edca: None,
             ba: false,
             tx_ba: false,
+            reclaimed: false,
         })
     }
     pub(super) fn phase(&self) -> Phase {
         self.phase
+    }
+    /// True only after the terminal stop proved every RX/TX DMA engine idle
+    /// with bus mastering off and released the packet allocations.
+    pub(super) fn reclaimed(&self) -> bool {
+        self.reclaimed
     }
     pub(super) fn check_transmit(&self) -> Result<(), Error> {
         self.port.transmit_allowed()?;
@@ -924,21 +959,127 @@ impl<P: Port> Packet<P> {
         self.phase = Phase::Running;
         Ok(ReceiveStep { consumed, frame })
     }
+    /// `recv.c::ath_stoprecv`: PCU abort, RX filter clear, then
+    /// `mac.c::ath9k_hw_stopdmarecv` (AR_CR_RXD and an RXE poll).
+    fn stop_receive(&self) -> Result<(), Error> {
+        let diag = self.port.read(DIAG)?;
+        self.port.write(DIAG, diag | RX_PARK)?;
+        self.port.write(RX_FILTER, 0)?;
+        // DMA observation line 8 / misc observation bus 1 for DMADBG_7.
+        self.port.write(MACMISC, (8 << 5) | (1 << 15))?;
+        self.port.write(CR, 0x20)?;
+        let mut last = 0;
+        for _ in 0..RX_STOP_POLLS {
+            if self.port.read(CR)? & 4 == 0 {
+                return Ok(());
+            }
+            // Pre-AR9300 MAC hang signature: two consecutive 0x1c0 states.
+            // Linux reports `reset` and `ath_stoprecv` returns false.
+            let status = self.port.read(DMADBG_7)? & 0x7f0;
+            if status == 0x1c0 && status == last {
+                return Err(Error::Timeout);
+            }
+            last = status;
+            self.port.delay_us(10);
+        }
+        Err(Error::Timeout)
+    }
+    /// `mac.c::ath9k_hw_numtxpending(q) == 0`.
+    fn tx_idle(&self, queue: u64) -> Result<bool, Error> {
+        Ok(self.port.read(QSTS + queue * 4)? & 3 == 0 && self.port.read(QTXE)? & (1 << queue) == 0)
+    }
+    /// `mac.c::ath9k_hw_abort_tx_dma`: disable every DCU, force quiet
+    /// collision/idle channel and ignore backoff, then poll each QCU up to
+    /// `maxdelay` times with 5 us between polls. The terminal owner keeps
+    /// AR_Q_TXD set instead of Linux's final re-enable write.
+    fn abort_transmit(&self) -> Result<(), Error> {
+        self.port.write(QTXD, 0x3ff)?;
+        let misc = self.port.read(PCU_MISC)?;
+        self.port.write(PCU_MISC, misc | PCU_QUIET)?;
+        let diag = self.port.read(DIAG)?;
+        self.port.write(DIAG, diag | DIAG_IDLE_HIGH)?;
+        let ifs = self.port.read(IFS_MISC)?;
+        self.port.write(IFS_MISC, ifs | IGNORE_BACKOFF)?;
+        let mut idle = true;
+        for queue in 0..QUEUES {
+            let mut drained = false;
+            for poll in 0..TX_ABORT_POLLS {
+                if poll != 0 {
+                    self.port.delay_us(5);
+                }
+                if self.tx_idle(queue)? {
+                    drained = true;
+                    break;
+                }
+            }
+            idle &= drained;
+        }
+        let misc = self.port.read(PCU_MISC)?;
+        self.port.write(PCU_MISC, misc & !PCU_QUIET)?;
+        let diag = self.port.read(DIAG)?;
+        self.port.write(DIAG, diag & !DIAG_IDLE_HIGH)?;
+        let ifs = self.port.read(IFS_MISC)?;
+        self.port.write(IFS_MISC, ifs & !IGNORE_BACKOFF)?;
+        if idle {
+            Ok(())
+        } else {
+            Err(Error::Timeout)
+        }
+    }
+    /// After verified BME-off, these non-posted BAR reads order behind any
+    /// earlier device-originated posted DMA write (PCIe completions never pass
+    /// posted requests), so idle engines here prove no outstanding access.
+    fn quiescent(&self) -> Result<bool, Error> {
+        if self.port.read(CR)? & 4 != 0 || self.port.read(DIAG)? & RX_PARK != RX_PARK {
+            return Ok(false);
+        }
+        for queue in 0..QUEUES {
+            if !self.tx_idle(queue)? {
+                return Ok(false);
+            }
+        }
+        Ok(self.port.read(0x24)? & 1 == 0)
+    }
     /// Close every independent packet gate, trying the PCI gate even if BAR
-    /// access failed. This terminal park never claims a reclamation proof.
+    /// access failed. Engines are stopped with bus mastering still on, as in
+    /// Linux `ath_stoprecv`/`ath_drain_all_txq`, so in-flight descriptors can
+    /// finish. Only a complete stop plus post-BME-off idle proof releases the
+    /// rings and buffers; otherwise they stay pinned for the rest of the boot.
     pub(super) fn stop(&mut self) -> Result<(), Error> {
         if self.phase == Phase::Stopped {
             return Err(Error::State);
         }
         self.phase = Phase::Stopped;
-        let diag = self
-            .port
-            .read(DIAG)
-            .and_then(|value| self.port.write(DIAG, value | RX_PARK));
-        let rx = self.port.write(CR, 0x20);
-        let tx = self.port.write(QTXD, 0x3ff);
+        let rx = self.stop_receive();
+        let tx = self.abort_transmit();
         let irq = self.port.write(0x24, 0);
         let master = self.port.master(false);
-        diag.and(rx).and(tx).and(irq).and(master)
+        rx.and(tx).and(irq).and(master)?;
+        if !self.quiescent()? {
+            return Err(Error::Timeout);
+        }
+        self.reclaim();
+        Ok(())
+    }
+    fn reclaim(&mut self) {
+        self.pending = None;
+        self.pair = None;
+        self.held = None;
+        if let Some(storage) = self.storage.take() {
+            let mut buffers = Vec::new();
+            let Storage {
+                tx,
+                rx,
+                tx_bytes,
+                rx_bytes,
+            } = storage;
+            buffers.push(tx.0);
+            buffers.push(rx.0);
+            buffers.extend(tx_bytes.into_iter().map(|m| m.0));
+            buffers.extend(rx_bytes.into_iter().map(|m| m.0));
+            self.port.release(buffers);
+        }
+        self.published = false;
+        self.reclaimed = true;
     }
 }

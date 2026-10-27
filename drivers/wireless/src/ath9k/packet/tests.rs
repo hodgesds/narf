@@ -78,6 +78,13 @@ pub(in crate::ath9k) struct Model {
     pub(in crate::ath9k) ht_rate: Cell<u8>,
     pub(in crate::ath9k) rx_aggr: Cell<u32>,
     pub(in crate::ath9k) dma_transmitted: RefCell<Vec<Vec<u8>>>,
+    /// Keep AR_Q_TXE/QSTS pending despite AR_Q_TXD (wedged DCU).
+    pub(in crate::ath9k) stuck_tx: Cell<bool>,
+    /// Keep AR_CR_RXE set despite AR_CR_RXD (wedged RX DMA).
+    pub(in crate::ath9k) stuck_rx: Cell<bool>,
+    /// Allocations the owner released after its quiescence proof. The
+    /// model keeps them alive; any later device access is an error.
+    pub(in crate::ath9k) released: RefCell<Vec<DmaBuffer>>,
 }
 pub(in crate::ath9k) type Reaction =
     dyn Fn(&[u8]) -> Result<(Vec<Vec<u8>>, bool), Error> + Send + Sync;
@@ -123,6 +130,9 @@ impl Model {
             ht_rate: Cell::new(0x80),
             rx_aggr: Cell::new(0),
             dma_transmitted: RefCell::new(Vec::new()),
+            stuck_tx: Cell::new(false),
+            stuck_rx: Cell::new(false),
+            released: RefCell::new(Vec::new()),
         })
     }
     fn access(&self) -> Result<(), Error> {
@@ -136,6 +146,14 @@ impl Model {
     }
     fn pointer(&self, address: u32, length: usize) -> Result<*mut u8, Error> {
         let address = u64::from(address);
+        if self
+            .released
+            .borrow()
+            .iter()
+            .any(|b| address >= b.dma_addr().raw() && address < b.dma_addr().raw() + b.len() as u64)
+        {
+            return Err(Error::Access);
+        }
         let regions = self.regions.borrow();
         let region = regions
             .iter()
@@ -453,10 +471,26 @@ impl Port for Arc<Model> {
                 self.complete(ack)?;
             }
         }
-        if reg == CR && value == 0x20 {
+        if reg == CR && value == 0x20 && !self.stuck_rx.get() {
             self.registers.borrow_mut().insert(CR, 0);
         }
+        if reg == CR && value == 4 && self.stuck_rx.get() {
+            self.registers.borrow_mut().insert(CR, 4);
+        }
+        if reg == QTXD && value & 1 != 0 && !self.stuck_tx.get() {
+            // Disabled DCU: the in-flight descriptor is abandoned unsent.
+            self.registers.borrow_mut().insert(QTXE, 0);
+            self.registers.borrow_mut().insert(QSTS, 0);
+            self.tx.set(None);
+            self.pair_tail.set(None);
+        }
         Ok(())
+    }
+    fn delay_us(&self, us: u64) {
+        self.now.set(self.now.get() + us);
+    }
+    fn release(&self, buffers: Vec<DmaBuffer>) {
+        self.released.borrow_mut().extend(buffers);
     }
     fn allocate(&self, bytes: usize) -> Result<DmaBuffer, Error> {
         self.as_ref().access()?;
@@ -561,7 +595,6 @@ fn check_ownership() -> Result<(), &'static str> {
         return Err("rejected RX became idle or delivery");
     }
     let address = model.regions.borrow()[0].bus as u32;
-    let before = model.word(address).map_err(|_| "published mapping")?;
     packet.stop().map_err(|_| "stop")?;
     if model.master.get()
         || packet.phase() != Phase::Stopped
@@ -569,12 +602,125 @@ fn check_ownership() -> Result<(), &'static str> {
     {
         return Err("terminal park reopened");
     }
+    check_reclaimed(&model, &packet)?;
     drop(packet);
-    if model.word(address).map_err(|_| "retained mapping")? != before {
-        return Err("published mapping freed/changed after stop");
+    if model.word(address) != Err(Error::Access) {
+        return Err("released mapping still reachable by the model device");
     }
     Ok(())
 }
+pub(in crate::ath9k) fn check_reclaimed(
+    model: &Model,
+    packet: &Packet<Arc<Model>>,
+) -> Result<(), &'static str> {
+    let registers = model.registers.borrow();
+    let reg = |r| *registers.get(&r).unwrap_or(&0);
+    if !packet.reclaimed()
+        || model.released.borrow().len() != 2 + TX_DEPTH + RX_DEPTH
+        || model.released.borrow().len() != model.regions.borrow().len()
+        || reg(QTXD) != 0x3ff
+        || reg(RX_FILTER) != 0
+        || reg(DIAG) & RX_PARK != RX_PARK
+        || reg(DIAG) & DIAG_IDLE_HIGH != 0
+        || reg(PCU_MISC) & PCU_QUIET != 0
+        || reg(IFS_MISC) & IGNORE_BACKOFF != 0
+        || reg(0x24) != 0
+    {
+        return Err("DMA stop/abort did not reclaim the exact packet storage");
+    }
+    Ok(())
+}
+/// Linux `ath_drain_all_txq`/`ath_stoprecv` abort a held descriptor with
+/// bus mastering still enabled; only a proved stop releases the storage.
+fn check_reclamation() -> Result<(), &'static str> {
+    // Held TX in flight is aborted, then the storage is released.
+    let model = Model::new();
+    let mut packet = owner(model.clone()).map_err(|_| "prepare")?;
+    packet.start().map_err(|_| "start")?;
+    packet.submit(&outbound(), 0).map_err(|_| "submit")?;
+    if model.tx.get().is_none() || model.registers.borrow().get(&QTXE) != Some(&1) {
+        return Err("model did not hold the TX descriptor");
+    }
+    packet.stop().map_err(|_| "abort stop")?;
+    check_reclaimed(&model, &packet)?;
+    if packet.delivery() != Err(Error::State) || packet.stop() != Err(Error::State) {
+        return Err("reclaimed owner reopened delivery or replayed stop");
+    }
+    // Never-started owner: engines already parked, storage still reclaimed.
+    let model = Model::new();
+    let mut packet = owner(model.clone()).map_err(|_| "prepare idle")?;
+    packet.stop().map_err(|_| "idle stop")?;
+    check_reclaimed(&model, &packet)?;
+    // A wedged DCU or RX DMA keeps every allocation pinned and readable.
+    for wedged_tx in [true, false] {
+        let model = Model::new();
+        let mut packet = owner(model.clone()).map_err(|_| "prepare wedged")?;
+        packet.start().map_err(|_| "start wedged")?;
+        packet.submit(&outbound(), 0).map_err(|_| "submit wedged")?;
+        if wedged_tx {
+            model.stuck_tx.set(true);
+        } else {
+            model.complete(true).map_err(|_| "complete wedged")?;
+            model.stuck_rx.set(true);
+            model.registers.borrow_mut().insert(CR, 4);
+        }
+        let before = model.now.get();
+        if packet.stop() != Err(Error::Timeout) {
+            return Err("wedged DMA stop claimed success");
+        }
+        let waited = model.now.get() - before;
+        let budget = if wedged_tx {
+            u64::from(TX_ABORT_POLLS - 1) * 5
+        } else {
+            u64::from(RX_STOP_POLLS) * 10
+        };
+        if waited != budget {
+            return Err("DMA stop poll budget differs from Linux");
+        }
+        if packet.reclaimed() || !model.released.borrow().is_empty() || model.master.get() {
+            return Err("unproved DMA stop released storage or kept BME");
+        }
+        let address = model.regions.borrow()[0].bus as u32;
+        drop(packet);
+        if model.word(address).is_err() {
+            return Err("unproved storage was freed on drop");
+        }
+    }
+    // Pre-AR9300 DMADBG_7 hang signature ends the RX stop after two samples.
+    let model = Model::new();
+    let mut packet = owner(model.clone()).map_err(|_| "prepare hang")?;
+    packet.start().map_err(|_| "start hang")?;
+    model.stuck_rx.set(true);
+    model.registers.borrow_mut().insert(CR, 4);
+    model.registers.borrow_mut().insert(DMADBG_7, 0x1c0);
+    let before = model.now.get();
+    if packet.stop() != Err(Error::Timeout)
+        || model.now.get() - before != 10
+        || model.registers.borrow().get(&MACMISC) != Some(&((8 << 5) | (1 << 15)))
+        || packet.reclaimed()
+    {
+        return Err("RX DMA hang signature not honoured");
+    }
+    // A BAR fault during stop never claims reclamation.
+    let model = Model::new();
+    let mut packet = owner(model.clone()).map_err(|_| "prepare fault")?;
+    packet.start().map_err(|_| "start fault")?;
+    model.authority.set(false);
+    if packet.stop().is_ok() || packet.reclaimed() || !model.released.borrow().is_empty() {
+        return Err("revoked stop reclaimed storage");
+    }
+    Ok(())
+}
+fn smoke_ar9285_packet_dma_stop_proof_reclaims_storage() -> TestResult {
+    match check_reclamation() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/packet",
+    smoke_ar9285_packet_dma_stop_proof_reclaims_storage
+);
 fn check_deadlines_and_authority() -> Result<(), &'static str> {
     for done in [false, true] {
         let model = Model::new();
