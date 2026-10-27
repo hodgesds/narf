@@ -6,6 +6,8 @@ use crate::rsn::{self, RsnIe, Suite};
 use alloc::{vec, vec::Vec};
 #[path = "association/channel.rs"]
 pub mod channel;
+#[path = "association/eht.rs"]
+pub mod eht;
 #[path = "association/he.rs"]
 pub mod he;
 #[path = "association/phy.rs"]

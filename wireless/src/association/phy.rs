@@ -2,6 +2,7 @@
 //! Bounded HT/VHT facts and directional station negotiation. These profiles
 //! describe implementation limits; they grant no radio, key, BA or port rights.
 //! Wire definitions: Linux include/linux/ieee80211-{ht,vht}.h, mac80211/{ht,vht}.c.
+use super::eht::{self, EhtCapability, EhtNegotiation, EhtOperation, LocalEht};
 use super::he::{self, HeCapability, HeNegotiation, HeOperation, LocalHe};
 use super::{channel, ies, Error};
 
@@ -333,6 +334,7 @@ pub struct LocalPhy {
     ht: LocalHt,
     vht: Option<LocalVht>,
     he: Option<LocalHe>,
+    eht: Option<LocalEht>,
 }
 impl LocalPhy {
     pub fn ht20(local: LocalHt) -> Result<Self, Error> {
@@ -343,6 +345,7 @@ impl LocalPhy {
             ht: local,
             vht: None,
             he: None,
+            eht: None,
         })
     }
     pub fn ht40(local: LocalHt) -> Result<Self, Error> {
@@ -353,6 +356,7 @@ impl LocalPhy {
             ht: local,
             vht: None,
             he: None,
+            eht: None,
         })
     }
     pub fn vht80(ht: LocalHt, vht: LocalVht) -> Result<Self, Error> {
@@ -363,6 +367,7 @@ impl LocalPhy {
             ht,
             vht: Some(vht),
             he: None,
+            eht: None,
         })
     }
     pub fn vht160(ht: LocalHt, vht: LocalVht) -> Result<Self, Error> {
@@ -373,6 +378,7 @@ impl LocalPhy {
             ht,
             vht: Some(vht),
             he: None,
+            eht: None,
         })
     }
     /// Opt into HE (IEEE802.11ax) on top of this HT/VHT profile. On 5GHz
@@ -390,6 +396,20 @@ impl LocalPhy {
     pub fn he(&self) -> Option<&LocalHe> {
         self.he.as_ref()
     }
+    /// Opt into non-MLO EHT (IEEE802.11be-2024) on top of `with_he`. The
+    /// EHT-MCS/NSS set form must match the local HE Channel Width Set
+    /// (`ieee80211_eht_mcs_nss_size`), and a160MHz set requires HE160.
+    pub fn with_eht(mut self, eht: LocalEht) -> Result<Self, Error> {
+        let he = self.he.ok_or(Error::UnsupportedRates)?;
+        if !eht.matches_he(he.capability().phy_capability()[0]) {
+            return Err(Error::UnsupportedRates);
+        }
+        self.eht = Some(eht);
+        Ok(self)
+    }
+    pub fn eht(&self) -> Option<&LocalEht> {
+        self.eht.as_ref()
+    }
 }
 
 /// Fixed-size copies of the complete original element stream's PHY bodies.
@@ -401,6 +421,8 @@ pub struct ApElements {
     vht_op: Option<[u8; 5]>,
     he_cap: Option<HeCapability>,
     he_op: Option<HeOperation>,
+    eht_cap: Option<EhtCapability>,
+    eht_op: Option<EhtOperation>,
 }
 impl ApElements {
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
@@ -409,6 +431,8 @@ impl ApElements {
         }
         let mut value = Self::default();
         let mut rates = [false; 2];
+        // The EHT Capabilities extent depends on the HE Capabilities.
+        let mut eht_cap: Option<([u8; 64], usize)> = None;
         ies(bytes, |id, body| {
             match id {
                 45 => singleton(&mut value.ht_cap, body)?,
@@ -429,6 +453,20 @@ impl ApElements {
                         }
                         value.he_op = Some(HeOperation::parse(rest)?);
                     }
+                    Some((&eht::EXT_EHT_CAPABILITIES, rest)) => {
+                        if eht_cap.is_some() || rest.len() > 64 {
+                            return Err(Error::InvalidBss);
+                        }
+                        let mut copy = [0; 64];
+                        copy[..rest.len()].copy_from_slice(rest);
+                        eht_cap = Some((copy, rest.len()));
+                    }
+                    Some((&eht::EXT_EHT_OPERATION, rest)) => {
+                        if value.eht_op.is_some() {
+                            return Err(Error::InvalidBss);
+                        }
+                        value.eht_op = Some(EhtOperation::parse(rest)?);
+                    }
                     _ => {}
                 },
                 1 | 50 => {
@@ -447,8 +485,17 @@ impl ApElements {
             || value.vht_cap.is_some() && value.ht_cap.is_none()
             || value.he_cap.is_some() != value.he_op.is_some()
             || value.he_cap.is_some() && value.ht_cap.is_none()
+            || eht_cap.is_some() != value.eht_op.is_some()
+            || eht_cap.is_some() && value.he_cap.is_none()
         {
             return Err(Error::InvalidBss);
+        }
+        if let (Some((body, len)), Some(he)) = (eht_cap, value.he_cap) {
+            value.eht_cap = Some(EhtCapability::parse(
+                &body[..len],
+                he.phy_capability()[0],
+                true,
+            )?);
         }
         if let Some(cap) = value.ht_cap {
             if le16(&cap[..2]) & 0x2000 != 0
@@ -492,6 +539,12 @@ impl ApElements {
     }
     pub fn he_operation(&self) -> Option<&HeOperation> {
         self.he_op.as_ref()
+    }
+    pub fn eht_capability(&self) -> Option<&EhtCapability> {
+        self.eht_cap.as_ref()
+    }
+    pub fn eht_operation(&self) -> Option<&EhtOperation> {
+        self.eht_op.as_ref()
     }
 }
 fn singleton<const N: usize>(slot: &mut Option<[u8; N]>, body: &[u8]) -> Result<(), Error> {
@@ -724,6 +777,7 @@ struct Selection {
     ht: HtNegotiation,
     vht: Option<VhtNegotiation>,
     he: Option<HeNegotiation>,
+    eht: Option<EhtNegotiation>,
     width: Width,
     center: u8,
     channels: [u8; 8],
@@ -746,6 +800,10 @@ macro_rules! selection_accessors {
         /// HE facts when both sides negotiated HE on this channel.
         pub fn he(&self) -> Option<&HeNegotiation> {
             self.0.he.as_ref()
+        }
+        /// Non-MLO EHT facts when negotiated on top of HE.
+        pub fn eht(&self) -> Option<&EhtNegotiation> {
+            self.0.eht.as_ref()
         }
         pub fn width(&self) -> Width {
             self.0.width
@@ -821,6 +879,11 @@ impl Offer {
             (None, None) => {}
             _ => return Err(Error::UnsupportedRates),
         }
+        match (self.0.eht.as_ref(), next.eht.as_mut()) {
+            (Some(old), Some(new)) => new.narrow_to(old)?,
+            (None, None) => {}
+            _ => return Err(Error::UnsupportedRates),
+        }
         if self.0.vht.is_some() != next.vht.is_some()
             || next.channels[..next.count]
                 .iter()
@@ -873,6 +936,12 @@ impl Offer {
         }
         if let (Some(_), Some(local)) = (self.0.he, self.0.local.he) {
             // mac80211 ieee80211_add_he_ie: only when HE was negotiated.
+            let body = local.capability_body();
+            bytes.extend_from_slice(&[255, body.len() as u8]);
+            bytes.extend_from_slice(&body);
+        }
+        if let (Some(_), Some(local)) = (self.0.eht, self.0.local.eht) {
+            // mac80211 ieee80211_put_eht_cap: only when EHT was negotiated.
             let body = local.capability_body();
             bytes.extend_from_slice(&[255, body.len() as u8]);
             bytes.extend_from_slice(&body);
@@ -940,6 +1009,9 @@ fn check_selectors(selectors: u8, selection: &Selection) -> Result<(), Error> {
     if selection.he.is_some() {
         supported |= super::SEL_HE;
     }
+    if selection.eht.is_some() {
+        supported |= super::SEL_EHT;
+    }
     if selectors & super::SEL_PHY & !supported != 0 {
         return Err(Error::UnsupportedRates);
     }
@@ -974,6 +1046,7 @@ fn select(local: LocalPhy, ap: ApElements, primary: u8) -> Result<Selection, Err
         },
         vht: None,
         he: None,
+        eht: None,
         width: Width::Twenty,
         center: primary,
         channels: [primary, 0, 0, 0, 0, 0, 0, 0],
@@ -1142,6 +1215,25 @@ fn select(local: LocalPhy, ap: ApElements, primary: u8) -> Result<Selection, Err
         ap.vht_op,
         selected.vht.is_some(),
         selected.width,
+        selected.center2 != 0,
+    )?;
+    let primary80 = if selected.width == Width::OneSixty && selected.center2 == 0 {
+        if primary < selected.center {
+            selected.center - 8
+        } else {
+            selected.center + 8
+        }
+    } else {
+        selected.center
+    };
+    selected.eht = eht::negotiate(
+        local.eht,
+        ap.eht_cap,
+        ap.eht_op,
+        selected.he.as_ref(),
+        selected.width,
+        selected.center,
+        primary80,
         selected.center2 != 0,
     )?;
     Ok(selected)
