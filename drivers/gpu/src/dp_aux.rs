@@ -182,10 +182,18 @@ pub trait AuxChannel {
         if n == 0 || n > 16 {
             return Err(AuxError::TooLong);
         }
+        // For reads, `data` is a length placeholder: its length
+        // is the requested byte count (it becomes the LEN field
+        // in `encode_request` and the expected reply payload in
+        // the transport); the contents never reach the wire.
+        // Passing `&[]` here encodes LEN = 0 and makes the real
+        // MMIO transport reject every non-empty reply as a
+        // short reply — per-address test stubs that ignore
+        // `data` masked that for a long time.
         let req = AuxRequest {
             cmd: AuxCommand::NativeRead,
             address: addr,
-            data: &[],
+            data: &*buf,
         };
         // Reply buffer = 1 status + n data bytes.
         let mut reply = [0u8; 17];

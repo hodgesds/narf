@@ -180,11 +180,11 @@ pub struct DpllCoeffs {
     pub cfgcr1: u32,
 }
 
-// Canonical rows: TGL PRM Vol. 12, "DisplayPort Mode PLL Values"
-// for the 19.2/38.4 MHz reference family. Both reference families
-// share DCO = 8100 MHz (24 MHz ref: int 0x151, frac 0x4000;
-// 19.2/38.4 MHz ref: int 0x1A5, frac 0x7000 — 421.875 x 19.2 =
-// 8100). The P/K/Q dividers are identical across families:
+// Canonical rows: TGL PRM Vol. 12, "DisplayPort Mode PLL Values".
+// Both reference families share DCO = 8100 MHz (24 MHz ref:
+// int 0x151, frac 0x4000 — 337.5 x 24 = 8100; 19.2/38.4 MHz ref:
+// int 0x1A5, frac 0x7000 — 421.875 x 19.2 = 8100). The P/K/Q
+// dividers are identical across families:
 //   RBR  (1.62 Gbps): P/5, K/2, Q=1 -> 8100/10 = 810 MHz out
 //   HBR  (2.7  Gbps): P/3, K/2, Q=1 -> 8100/6  = 1350
 //   HBR2 (5.4  Gbps): P/3, K/1, Q=1 -> 8100/3  = 2700
@@ -193,9 +193,18 @@ pub struct DpllCoeffs {
 // the bit rate. Before lane 1 the HBR2 and HBR3 rows were
 // byte-identical (both P/2 K/1) and every fraction was 0 — HBR,
 // HBR2 and RBR were all programmed with wrong dividers.
-// Reference-clock family selection via the DSSM register is not
-// yet implemented; the rows below are the 19.2/38.4 family the
-// pre-existing DCO integer already presumed.
+//
+// The rows cover the four standard DP rates in
+// `dp_link_training`'s ladder. The PRM table's intermediate
+// rates (2.16 / 4.32 / 6.48 Gbps, used by some eDP panels) use
+// *different* DCO integers and a Q-divide-by-2 row; they are
+// not in the training ladder and are not encoded here.
+//
+// Reference-clock family selection (lane Q6, #1024): the DSSM
+// register's CDCLK PLL reference field picks the family — see
+// `decode_refclk_family` below. Lane 1 always programmed the
+// 19.2/38.4 family, which on a 24 MHz-strapped part yields a
+// DCO 26% off target and a PLL that never locks on-spec.
 
 /// Combo-PHY coefficients for HBR2 (5.4 Gbps).
 pub const COMBO_HBR2: DpllCoeffs = DpllCoeffs {
@@ -225,14 +234,97 @@ pub const COMBO_HBR3: DpllCoeffs = DpllCoeffs {
     cfgcr1: CFGCR1_KDIV_1 | CFGCR1_PDIV_2 | CFGCR1_CFREQ_8_4_GHZ,
 };
 
-/// Resolve the published Combo-PHY coefficients for `rate`.
-pub fn combo_coeffs(rate: LinkRate) -> Option<DpllCoeffs> {
-    Some(match rate {
-        LinkRate::DpRbr => COMBO_RBR,
-        LinkRate::DpHbr => COMBO_HBR,
-        LinkRate::DpHbr2 => COMBO_HBR2,
-        LinkRate::DpHbr3 => COMBO_HBR3,
-        LinkRate::Hdmi297 | LinkRate::Hdmi594 => return None,
+// ── Reference-clock family (DSSM) ────────────────────────────
+//
+// `SKL_DSSM` at 0x51004 carries the CDCLK PLL reference-clock
+// strap in bits [31:29] (`ICL_DSSM_CDCLK_PLL_REFCLK_*` in
+// i915's intel_display_regs.h): 0 → 24 MHz, 1 → 19.2 MHz,
+// 2 → 38.4 MHz. The combo DPLLs share that reference. i915's
+// `icl_readout_refclk` decodes exactly this field, and its
+// default arm (reserved encodings) falls through to 24 MHz;
+// `decode_refclk_family` mirrors that.
+
+/// `SKL_DSSM` — display strapping register.
+pub const DSSM: u64 = 0x0005_1004;
+
+/// DSSM CDCLK PLL reference field: bits [31:29].
+pub const DSSM_REFCLK_SHIFT: u32 = 29;
+
+/// Reference-clock family for the combo-PLL coefficient rows.
+/// The PRM publishes two DP row families: 24 MHz, and
+/// 19.2/38.4 MHz (the two share rows because the DCO target
+/// and divider set are identical for both straps).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RefclkFamily {
+    /// 24 MHz strap → DCO int 0x151 / frac 0x4000 rows.
+    Ref24Mhz,
+    /// 19.2 or 38.4 MHz strap → DCO int 0x1A5 / frac 0x7000 rows.
+    Ref19_2Or38_4Mhz,
+}
+
+/// Decode the reference-clock family from a raw DSSM value.
+/// Reserved field encodings (3..=7) resolve to the 24 MHz
+/// family, matching i915's fallthrough in `icl_readout_refclk`.
+pub const fn decode_refclk_family(dssm: u32) -> RefclkFamily {
+    match (dssm >> DSSM_REFCLK_SHIFT) & 0x7 {
+        1 | 2 => RefclkFamily::Ref19_2Or38_4Mhz,
+        _ => RefclkFamily::Ref24Mhz,
+    }
+}
+
+/// Reference frequency in kHz for a family member strap —
+/// informational; the coefficient rows only depend on the
+/// family. `dssm` selects between 19.2 and 38.4 within the
+/// shared family.
+pub const fn refclk_khz(dssm: u32) -> u32 {
+    match (dssm >> DSSM_REFCLK_SHIFT) & 0x7 {
+        1 => 19_200,
+        2 => 38_400,
+        _ => 24_000,
+    }
+}
+
+/// Combo-PHY coefficients for HBR2 (5.4 Gbps), 24 MHz family.
+pub const COMBO_HBR2_REF24: DpllCoeffs = DpllCoeffs {
+    dco_integer: 0x0151,
+    dco_fraction: 0x4000,
+    cfgcr1: CFGCR1_KDIV_1 | CFGCR1_PDIV_3 | CFGCR1_CFREQ_8_4_GHZ,
+};
+
+/// Combo-PHY coefficients for HBR (2.7 Gbps), 24 MHz family.
+pub const COMBO_HBR_REF24: DpllCoeffs = DpllCoeffs {
+    dco_integer: 0x0151,
+    dco_fraction: 0x4000,
+    cfgcr1: CFGCR1_KDIV_2 | CFGCR1_PDIV_3 | CFGCR1_CFREQ_8_4_GHZ,
+};
+
+/// Combo-PHY coefficients for RBR (1.62 Gbps), 24 MHz family.
+pub const COMBO_RBR_REF24: DpllCoeffs = DpllCoeffs {
+    dco_integer: 0x0151,
+    dco_fraction: 0x4000,
+    cfgcr1: CFGCR1_KDIV_2 | CFGCR1_PDIV_5 | CFGCR1_CFREQ_8_4_GHZ,
+};
+
+/// Combo-PHY coefficients for HBR3 (8.1 Gbps), 24 MHz family.
+pub const COMBO_HBR3_REF24: DpllCoeffs = DpllCoeffs {
+    dco_integer: 0x0151,
+    dco_fraction: 0x4000,
+    cfgcr1: CFGCR1_KDIV_1 | CFGCR1_PDIV_2 | CFGCR1_CFREQ_8_4_GHZ,
+};
+
+/// Resolve the published Combo-PHY coefficients for `rate`
+/// under reference-clock `family`.
+pub fn combo_coeffs(rate: LinkRate, family: RefclkFamily) -> Option<DpllCoeffs> {
+    Some(match (rate, family) {
+        (LinkRate::DpRbr, RefclkFamily::Ref19_2Or38_4Mhz) => COMBO_RBR,
+        (LinkRate::DpHbr, RefclkFamily::Ref19_2Or38_4Mhz) => COMBO_HBR,
+        (LinkRate::DpHbr2, RefclkFamily::Ref19_2Or38_4Mhz) => COMBO_HBR2,
+        (LinkRate::DpHbr3, RefclkFamily::Ref19_2Or38_4Mhz) => COMBO_HBR3,
+        (LinkRate::DpRbr, RefclkFamily::Ref24Mhz) => COMBO_RBR_REF24,
+        (LinkRate::DpHbr, RefclkFamily::Ref24Mhz) => COMBO_HBR_REF24,
+        (LinkRate::DpHbr2, RefclkFamily::Ref24Mhz) => COMBO_HBR2_REF24,
+        (LinkRate::DpHbr3, RefclkFamily::Ref24Mhz) => COMBO_HBR3_REF24,
+        (LinkRate::Hdmi297 | LinkRate::Hdmi594, _) => return None,
     })
 }
 
@@ -272,10 +364,10 @@ pub mod tests {
     kernel_test_in!("drivers/gpu/intel_gpu_pll", smoke_dpcd_link_bw_set);
 
     fn smoke_combo_coeffs_resolution() -> TestResult {
-        if combo_coeffs(LinkRate::DpHbr2) != Some(COMBO_HBR2) {
+        if combo_coeffs(LinkRate::DpHbr2, RefclkFamily::Ref19_2Or38_4Mhz) != Some(COMBO_HBR2) {
             return TestResult::Fail("HBR2 coeffs not resolved");
         }
-        if combo_coeffs(LinkRate::Hdmi594).is_some() {
+        if combo_coeffs(LinkRate::Hdmi594, RefclkFamily::Ref24Mhz).is_some() {
             return TestResult::Fail("HDMI must not resolve to combo coeffs");
         }
         TestResult::Pass
@@ -337,4 +429,70 @@ pub mod tests {
         "drivers/gpu/intel_gpu_pll",
         smoke_combo_coeffs_match_prm_table
     );
+
+    /// DSSM reference-field decode: the three documented straps
+    /// plus the reserved-encoding fallthrough to 24 MHz.
+    fn smoke_dssm_refclk_family_decode() -> TestResult {
+        if DSSM != 0x5_1004 {
+            return TestResult::Fail("DSSM must be at 0x51004");
+        }
+        if decode_refclk_family(0) != RefclkFamily::Ref24Mhz {
+            return TestResult::Fail("DSSM field 0 must be the 24 MHz family");
+        }
+        if decode_refclk_family(1 << 29) != RefclkFamily::Ref19_2Or38_4Mhz {
+            return TestResult::Fail("DSSM field 1 (19.2 MHz) must be the shared family");
+        }
+        if decode_refclk_family(2 << 29) != RefclkFamily::Ref19_2Or38_4Mhz {
+            return TestResult::Fail("DSSM field 2 (38.4 MHz) must be the shared family");
+        }
+        if decode_refclk_family(5 << 29) != RefclkFamily::Ref24Mhz {
+            return TestResult::Fail("reserved DSSM encodings fall through to 24 MHz");
+        }
+        // Low bits of DSSM must not leak into the decode.
+        if decode_refclk_family(0x1FFF_FFFF) != RefclkFamily::Ref24Mhz {
+            return TestResult::Fail("DSSM decode must mask to bits [31:29]");
+        }
+        if refclk_khz(1 << 29) != 19_200 || refclk_khz(2 << 29) != 38_400 {
+            return TestResult::Fail("refclk_khz strap values wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_pll", smoke_dssm_refclk_family_decode);
+
+    /// The 24 MHz family: same P/K/Q dividers as the
+    /// 19.2/38.4 family, DCO int 0x151 / frac 0x4000
+    /// (337.5 × 24 MHz = 8100 MHz), and CFGCR0 words that pin
+    /// both fields byte-for-byte.
+    fn smoke_combo_coeffs_ref24_family() -> TestResult {
+        let rows24 = [
+            COMBO_RBR_REF24,
+            COMBO_HBR_REF24,
+            COMBO_HBR2_REF24,
+            COMBO_HBR3_REF24,
+        ];
+        let rows19 = [COMBO_RBR, COMBO_HBR, COMBO_HBR2, COMBO_HBR3];
+        for (r24, r19) in rows24.iter().zip(rows19.iter()) {
+            if r24.dco_integer != 0x151 || r24.dco_fraction != 0x4000 {
+                return TestResult::Fail("24 MHz rows must be int 0x151 / frac 0x4000");
+            }
+            if r24.cfgcr1 != r19.cfgcr1 {
+                return TestResult::Fail("P/K/Q dividers must be identical across families");
+            }
+        }
+        // CFGCR0 pins: HBR2 in both families. int at [9:0],
+        // frac at [24:10]: 0x4000 << 10 = 0x100_0000,
+        // 0x7000 << 10 = 0x1C00_000.
+        if encode_cfgcr0(&COMBO_HBR2_REF24) != 0x0100_0151 {
+            return TestResult::Fail("24 MHz HBR2 CFGCR0 pin wrong");
+        }
+        if encode_cfgcr0(&COMBO_HBR2) != 0x01C0_01A5 {
+            return TestResult::Fail("19.2 MHz HBR2 CFGCR0 pin wrong");
+        }
+        // Family selection resolves per rate.
+        if combo_coeffs(LinkRate::DpRbr, RefclkFamily::Ref24Mhz) != Some(COMBO_RBR_REF24) {
+            return TestResult::Fail("RBR must resolve to the 24 MHz row");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_pll", smoke_combo_coeffs_ref24_family);
 }
