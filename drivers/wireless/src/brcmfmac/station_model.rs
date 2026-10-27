@@ -229,7 +229,11 @@ impl Firmware {
                 || input.starts_with(b"vhtmode\0")
                     && self.vht.as_ref().is_some_and(|p| p.mode.is_none())
                 || input.starts_with(b"txstreams\0")
-                    && self.vht.as_ref().is_some_and(|p| p.txstreams.is_none()));
+                    && self.vht.as_ref().is_some_and(|p| p.txstreams.is_none())
+                || input.starts_with(b"txbf_bfe_cap\0")
+                    && self.vht.as_ref().is_some_and(|p| p.txbf[0].is_none())
+                || input.starts_with(b"txbf_bfr_cap\0")
+                    && self.vht.as_ref().is_some_and(|p| p.txbf[1].is_none()));
         match command {
             1 => 2u32.to_le_bytes().to_vec(),
             23 => {
@@ -282,6 +286,18 @@ impl Firmware {
                             .vht
                             .as_ref()
                             .and_then(|p| p.txstreams)
+                            .unwrap_or(0)
+                            .to_le_bytes(),
+                    );
+                } else if let Some(index) = [&b"txbf_bfe_cap\0"[..], b"txbf_bfr_cap\0"]
+                    .iter()
+                    .position(|name| input.starts_with(name))
+                {
+                    out[..4].copy_from_slice(
+                        &self
+                            .vht
+                            .as_ref()
+                            .and_then(|p| p.txbf[index])
                             .unwrap_or(0)
                             .to_le_bytes(),
                     );

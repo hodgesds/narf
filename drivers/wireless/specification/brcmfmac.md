@@ -357,8 +357,39 @@ native nonzero `nmode`/`vhtmode`, valid `rxchain`, the original5GHz `bw_cap`
 additionally requires native `txstreams` in1..3; absent VHT/stream capability
 preserves qualified HT, while malformed replies fail closed. RX and TX
 MCS0..9 capability maps use their independently reported stream counts.
-Only SGI80 is offered;160/80+80, optional LDPC/STBC/beamforming/extended NSS
-remain unqualified. Initial WLC_UP/scan operation remains20MHz.
+Only SGI80 is offered. Initial WLC_UP/scan operation remains20MHz.
+
+VHT beamforming capability (implemented): under nonzero `vhtmode`, after
+`txstreams`, the probe queries native `txbf_bfe_cap` and `txbf_bfr_cap` as
+Linux `brcmf_setup_wiphybands` does (an unsupported query is zero) and adds
+`brcmf_update_vht_cap`'s bits: SU/MU beamformee from `BRCMF_TXBF_{SU,MU}_BFE_CAP`
+(bits0/1), SU/MU beamformer from `..._BFR_CAP`, and, when either is nonzero
+with more than one TX stream, beamformee STS2, sounding dimensions
+`txstreams-1` and VHT MRQ/MFB link adaptation. Bits outside SU/MU are
+ignored. Code: `drivers/wireless/src/cyw43439/station_phy.rs::beamforming_capability`.
+Firmware owns sounding, steering and its own association request; the host
+reports the capability on5GHz and the existing actual `assoc_req_ies` check
+now requires those same bits, so a request lacking them is a changed request
+and terminates that owner. Smoke `drivers/wireless/brcmfmac/vht80`
+`..._native_beamforming_capability_and_request` (shared5/6) checks five
+literal capability words including unsupported/unknown-bit replies and the
+mismatched-request refusal. CYW43439 never reaches this VHT probe.
+
+Remaining VHT options are not host features of this FullMAC family:
+
+- LDPC, STBC and extended NSS/BW: Linux brcmfmac (`brcmf_update_ht_cap`,
+  `brcmf_update_vht_cap`) neither advertises nor programs them, and the
+  firmware ABI exposes no host control; firmware builds its own association
+  capability. A host-reported bit would be fabricated. Open question: the
+  exact actual-request comparison (first six VHT capability bytes) would
+  refuse firmware that sets its own RX LDPC/STBC bits; physical BCM43602
+  firmware requests must be checked before deployment.
+- 80+80: Linux brcmfmac never advertises `SUPP_CHAN_WIDTH_160_80PLUS80`; it
+  only decodes `BRCMU_CHAN_BW_80P80` chanspecs in reports.
+- 160 MHz: Linux advertises it only from a firmware `bw_cap` 160 bit. The
+  retained BCM43602 is an 802.11ac Wave-1 3x3 80 MHz part, so this profile
+  ignores that bit; 160 MHz belongs to enabling a 160-capable chip under the
+  remaining additional-chip-profile work.
 
 The actual selected BSS's complete original HT/VHT/WMM/rate IEs pass shared
 `Offer::from_elements`; complete known basic/legacy rates, membership
@@ -520,8 +551,8 @@ msgbuf smoke `drivers/wireless/brcmfmac/scan_ies` checks literal add/del
 records before each changed escan.
 
 Additional software outside that retained profile remains: nonzero descriptor
-prefixes/shared 7, other CPU/RAM/chip/OTP selectors,160/80+80 and optional VHT
-coding/beamforming/HE/EHT profiles, native802.11
+prefixes/shared 7, other CPU/RAM/chip/OTP selectors (including 160 MHz-capable
+chips), HE/EHT profiles, native802.11
 RX/metadata, larger flow budgets, host-supplicant fallback, WPA3/AP, replayed
 recovery/system PM, confirmed stop/IOMMU quiescence and DMA reclamation, and IRQ delivery.
 These do not expand the initial polling/retained-failure acceptance claim.

@@ -114,6 +114,11 @@ pub(crate) struct Vht80 {
     pub caps: [u32; 2],
     pub mode: Option<u32>,
     pub txstreams: Option<u32>,
+    /// Native `txbf_bfe_cap`/`txbf_bfr_cap` replies; `None` is unsupported.
+    pub txbf: [Option<u32>; 2],
+    /// Literal VHT Capabilities Information bits firmware adds to its own
+    /// association request for `txbf` (independent of the driver encoder).
+    pub txbf_request: u32,
     pub inventory: Vec<u32>,
     pub center: u8,
     pub fault: VhtFault,
@@ -173,6 +178,8 @@ impl Vht80 {
         ies.extend_from_slice(&[1, 8, 0x8c, 18, 0x98, 36, 0xb0, 72, 96, 108]);
         if qualified && self.fault != VhtFault::RequestMissing {
             let mut cap = self.capability(chains);
+            let info = u32::from_le_bytes(cap[..4].try_into().unwrap()) | self.txbf_request;
+            cap[..4].copy_from_slice(&info.to_le_bytes());
             if self.fault == VhtFault::RequestMcs {
                 cap[4..6].copy_from_slice(&0xffaau16.to_le_bytes());
             }
