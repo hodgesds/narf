@@ -1,9 +1,10 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.6** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.7** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
-> command submission landed — see §8).
+> command submission landed — see §8; PPGTT walker + GGTT
+> bounds/flush discipline landed — see §9).
 >
 > Clean-room driver for Intel integrated graphics from Tiger Lake
 > through Meteor Lake. **No GPL Linux `i915` / `xe` source
@@ -116,9 +117,10 @@ Stage-3 driver core consumes these codecs through the
 - Take over scanout from UEFI GOP without re-training the link
   (modeset to firmware-supplied mode).
 
-### Stage 4 (future) — Frame buffer + KMS
+### Stage 4 (partially landed) — Frame buffer + KMS
 - GTT entry table population from the Stage-2 codec.
-- PPGTT page-table walks per the PRM memory model.
+- PPGTT page-table walks per the PRM memory model — **landed**
+  (§9).
 - Single-rectangle scanout from a CPU-mapped buffer.
 
 ### Stage 5+ (partially landed) — 3D / compute (TGL only)
@@ -261,15 +263,24 @@ gpu crate's `intel` feature. Public interface:
   wrapper. Production glue: `submit_dwords` /
   `poll_default_completions` attach lazily to the probed
   controller on a default context.
+- `attach_ppgtt(ctx, root_phys)` / `detach_ppgtt(ctx)` /
+  `ppgtt_root(ctx)` — program a PPGTT root (§9) into the
+  context image's PDP3 pair. Idle-context discipline, like
+  every image patch here: a loaded or covered context refuses
+  with `ContextBusy`; an unaligned or >39-bit root is
+  `InvalidPpgttRoot`.
 
 Invariants:
 
 - ELSP writes are always full pairs in hardware order
   (port 1 high/low, port 0 high/low, posting read); a zero
   descriptor marks an empty port.
-- Contexts address via GGTT only: descriptor mode
-  Legacy-64B, PDP image fields zero, batch ASI = GGTT. PPGTT
-  is a separate lane and is not absorbed here.
+- Contexts address via GGTT by default: descriptor mode
+  Legacy-64B, PDP image fields zero, batch ASI = GGTT. With
+  a PPGTT root attached (§9) the PDP3 pair carries the root
+  and the hardware walk runs under the context; batch
+  allocations remain GGTT-backed and batch ASI stays GGTT
+  until a VA-batch consumer lands.
 - A context's requests retire strictly in submission order;
   a preempted context's covered requests return to the queue
   front and are resubmitted, never retired early.
@@ -282,4 +293,67 @@ constants in `intel_gpu_rcs`): `CSB_ENTRIES` = 8 (Gen11+
 CSB depth), `RCS_IMAGE_PAGES` = 48 (allocation bound above
 the hardware image size), and the descriptor Legacy-64B
 mode choice.
+
+## 9. PPGTT + GGTT discipline (Stage 4/5 — `intel_gpu_ppgtt`, #1012)
+
+The per-process page-table walker for Gen12, plus the GGTT
+installation discipline the issue names. Compiled only under
+the gpu crate's `intel` feature. Sources: TGL PRM Vol. 5
+§"Memory Views" (walk levels, entry format) and §"GTTMMADR"
+(GGTT window layout).
+
+Public interface:
+
+- `Ppgtt::new(mem)` — an empty address space owning one
+  allocated PML4 root page. `root_phys()` is the value a
+  context programs as its PPGTT root (§8's
+  `RcsEngine::attach_ppgtt`).
+- `map(mem, va, phys, pat, executable)` / `unmap(mem, va)` —
+  4 KiB leaf mappings over the 48-bit VA space (levels
+  PML4 → PDPT → PD → PT, 512 entries per table). Double
+  mapping is `AlreadyMapped`; unmapping an absent VA is
+  `NotMapped`. Intermediate tables are created on first use
+  and freed when an unmap leaves them empty.
+- `translate(mem, va) -> WalkOutcome` — the hardware walk,
+  CPU-side: `Mapped(phys)`, `NotMapped { level }`, or
+  `Corrupt { level }`. Present-but-malformed entries
+  (reserved bits outside the level's documented encoding, or
+  a zero physical address) are never followed.
+- `teardown(mem)` — frees every owned table page; leaf
+  frames are the caller's and are never freed by the walker.
+- `PtMemory` — the table-page seam, addressed physically
+  exactly as the hardware walk is. Production is
+  `FramePtMemory` (host frames, direct-map CPU access);
+  fixtures model system RAM and cross-check translations
+  against an independent reference walk written from the PRM
+  level definition.
+- GGTT discipline in `intel_gpu_gtt`: `ggtt_va_size(bar_len)`
+  derives the GGTT size from the actual GTTMMADR BAR length
+  (16 MiB BAR → 4 GiB GGTT); every scanout mapping is
+  bounds-checked against it (`GttError::OutOfBounds`) before
+  any write, and every PTE write burst ends with
+  `flush_ggtt_writes` (fence + readback of the last slot).
+
+Invariants:
+
+- A `Ppgtt` owns exactly the tables it allocated —
+  `table_pages()` and the allocator's `live_tables()` agree
+  at every public boundary, including after a map that fails
+  partway (`OutOfMemory` leaves a well-formed partial chain).
+- The walker never writes a leaf or intermediate entry it did
+  not encode itself from validated inputs; foreign entries it
+  cannot validate stop the walk as `Corrupt`, on both the
+  translate and map paths.
+- Context integration is one-directional: the RCS engine
+  programs a root the walker produced; the walker knows
+  nothing of contexts. Batch submission through a PPGTT (VA
+  batches) is not claimed here — batches remain GGTT-backed
+  (§8); the media lane (#1022) is the named consumer that
+  builds on per-context PPGTT.
+
+Flagged for first-silicon verification: in 4-level mode the
+execlists context's PDP3 pair carries the PML4 root (as a
+table entry, `phys | PRESENT`) and PDP0–PDP2 stay zero — the
+encoding `attach_ppgtt` writes (§8). It is a single patch
+site in `intel_gpu_rcs` if bring-up shows otherwise.
 

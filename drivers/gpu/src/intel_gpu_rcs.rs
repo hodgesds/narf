@@ -27,15 +27,20 @@
 //!
 //! ## Addressing scope
 //!
-//! Contexts address through the **GGTT only**: the descriptor
-//! mode is Legacy-64B, the PDP fields of the register-state image
-//! are written zero, and batches are submitted with the GGTT
-//! address-space indicator. The PPGTT walker is a separate lane
-//! (#1012) and is deliberately not absorbed here. The GGTT
-//! machinery of [`crate::intel_gpu_gtt`] is used as-is; this
-//! module adds the missing GGTT *allocator* (a first-fit arena
-//! above the scanout reservation) to own ring / image / batch
-//! placements.
+//! Contexts address through the **GGTT by default**: the
+//! descriptor mode is Legacy-64B, the PDP fields of the
+//! register-state image are written zero, and batches are
+//! submitted with the GGTT address-space indicator. A context
+//! can additionally carry a PPGTT root from the walker in
+//! [`crate::intel_gpu_ppgtt`] (#1012): [`RcsEngine::attach_ppgtt`]
+//! programs the root into the image's PDP3 pair (the 4-level
+//! root slot) so the hardware walk runs under the context.
+//! Batch *allocations* stay GGTT-backed even then — submitting
+//! VA batches is the media lane's step, not this one's. The
+//! GGTT machinery of [`crate::intel_gpu_gtt`] is used as-is;
+//! this module adds the missing GGTT *allocator* (a first-fit
+//! arena above the scanout reservation) to own ring / image /
+//! batch placements.
 //!
 //! ## References
 //!
@@ -72,7 +77,9 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use crate::intel_gpu_aux::MmioWindow;
-use crate::intel_gpu_gtt::{encode_engine_pte, PatSlot, GTT_PAGE_SIZE};
+use crate::intel_gpu_gtt::{
+    encode_engine_pte, encode_table_entry, ggtt_va_size, PatSlot, GGTT_ARRAY_BASE, GTT_PAGE_SIZE,
+};
 
 // ── RCS0 engine register map (TGL PRM Vol. 2c; engine base 0x2000) ──
 
@@ -151,6 +158,21 @@ pub fn mi_batch_buffer_start_ggtt(ggtt_addr: u64) -> [u32; 3] {
         (0x31 << 23) | 1,
         (ggtt_addr & 0xFFFF_FFFF) as u32,
         (ggtt_addr >> 32) as u32,
+    ]
+}
+
+/// Encode a first-level `MI_BATCH_BUFFER_START` against the
+/// context's PPGTT: identical framing to the GGTT form with
+/// the address-space indicator set, and the address is a
+/// virtual address in the attached PPGTT (see
+/// [`RcsEngine::attach_ppgtt`]). The engine does not emit this
+/// yet — batches are GGTT-backed — but the codec is pinned
+/// here so the first VA-batch consumer does not re-derive it.
+pub fn mi_batch_buffer_start_ppgtt(ppgtt_va: u64) -> [u32; 3] {
+    [
+        (0x31 << 23) | 1 | BB_START_ASI_PPGTT,
+        (ppgtt_va & 0xFFFF_FFFF) as u32,
+        (ppgtt_va >> 32) as u32,
     ]
 }
 
@@ -473,6 +495,10 @@ pub enum SubmitError {
     /// Production glue only: no Intel controller has been
     /// probed, or it is not a Gen12 part.
     NoEngine,
+    /// A PPGTT root physical address failed validation
+    /// (unaligned, or outside the 39-bit GFX space) at
+    /// [`RcsEngine::attach_ppgtt`].
+    InvalidPpgttRoot,
 }
 
 // ── GPU-memory backing seam ─────────────────────────────────────
@@ -601,6 +627,10 @@ pub struct GgttArena {
     free_list: Vec<(u32, u32)>,
     live: usize,
     live_pages: u32,
+    /// GGTT virtual size implied by the BAR length (0 = the
+    /// BAR length is unknown to this handle, checks skipped —
+    /// production always constructs over the probed BAR).
+    ggtt_va_size: u64,
 }
 
 impl core::fmt::Debug for GgttArena {
@@ -617,25 +647,51 @@ impl GgttArena {
     /// Create an arena covering [`GGTT_ARENA_BASE`] for
     /// [`GGTT_ARENA_PAGES`] pages over the BAR0 window `bar`.
     pub fn new(bar: narf_bus::bar::MmioRegion) -> Self {
+        let ggtt_va_size = ggtt_va_size(bar.len);
+        // The arena window is a fixed reservation inside the
+        // GGTT; on any real Gen12 BAR (16 MiB -> 4 GiB GGTT) it
+        // fits with room to spare. If a part ever shows a BAR
+        // too small for it, `alloc` refuses rather than writing
+        // PTEs past the window the BAR implies.
+        debug_assert!(
+            ggtt_va_size == 0
+                || GGTT_ARENA_BASE as u64 + GGTT_ARENA_PAGES as u64 * GTT_PAGE_SIZE <= ggtt_va_size
+        );
         Self {
             bar,
             free_list: alloc::vec![(GGTT_ARENA_BASE, GGTT_ARENA_PAGES)],
             live: 0,
             live_pages: 0,
+            ggtt_va_size,
         }
     }
 
     /// Write one GGTT PTE (or zero to invalidate) at `ggtt_off`.
     fn write_pte(&self, ggtt_off: u32, pte: u64) {
-        const GGTT_ARRAY_BASE: u64 = 0x80_0000;
         let pte_byte = GGTT_ARRAY_BASE + (ggtt_off as u64 / GTT_PAGE_SIZE) * 8;
         // SAFETY: `self.bar` is the probe-mapped BAR0 owned by
         // this driver; `pte_byte` is an 8-byte-aligned slot inside
-        // the GGTT array half of BAR0 for any in-arena offset.
+        // the GGTT array half of BAR0 for any in-arena offset —
+        // `alloc` has bounds-checked the arena against the GGTT
+        // size this BAR implies before any PTE is written.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.bar.write32(pte_byte, (pte & 0xFFFF_FFFF) as u32);
             self.bar.write32(pte_byte + 4, (pte >> 32) as u32);
+        }
+    }
+
+    /// Posting flush for a burst of arena PTE writes: fence,
+    /// then read back the slot at `last_ggtt_off` so the writes
+    /// are visible before the backing is handed to an engine.
+    fn flush_pte_writes(&self, last_ggtt_off: u32) {
+        compiler_fence(Ordering::SeqCst);
+        let pte_byte = GGTT_ARRAY_BASE + (last_ggtt_off as u64 / GTT_PAGE_SIZE) * 8;
+        // SAFETY: same BAR ownership and in-arena argument as
+        // `write_pte`; a GGTT array read has no side effect.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        unsafe {
+            let _ = self.bar.read32(pte_byte);
         }
     }
 }
@@ -647,6 +703,11 @@ impl GpuAllocator for GgttArena {
         if pages == 0 {
             return Err(SubmitError::OutOfMemory);
         }
+        // Bounds discipline (the GgttArena form of
+        // intel_gpu_gtt::check_ggtt_range): never hand out —
+        // and therefore never write PTEs for — a range past the
+        // GGTT window the BAR length implies. Applied per
+        // allocation below, once the slot is known.
         // First-fit over the free list.
         let mut slot = None;
         for (i, &(off, len)) in self.free_list.iter().enumerate() {
@@ -656,6 +717,9 @@ impl GpuAllocator for GgttArena {
             }
         }
         let (i, off, len) = slot.ok_or(SubmitError::OutOfMemory)?;
+        if self.ggtt_va_size != 0 && off as u64 + pages as u64 * GTT_PAGE_SIZE > self.ggtt_va_size {
+            return Err(SubmitError::OutOfMemory);
+        }
         // Secure the frames before carving the block, so a frame
         // failure leaves the arena untouched.
         let mut frames = Vec::with_capacity(pages as usize);
@@ -685,6 +749,9 @@ impl GpuAllocator for GgttArena {
                 .map_err(|_| SubmitError::OutOfMemory)?;
             self.write_pte(off + (p as u32) * GTT_PAGE_SIZE as u32, pte);
         }
+        if pages > 0 {
+            self.flush_pte_writes(off + (pages - 1) * GTT_PAGE_SIZE as u32);
+        }
         backing.zero_fill();
         self.live += 1;
         self.live_pages += pages;
@@ -694,6 +761,9 @@ impl GpuAllocator for GgttArena {
     fn free(&mut self, backing: FrameBacking) {
         for p in 0..backing.pages {
             self.write_pte(backing.ggtt + p * GTT_PAGE_SIZE as u32, 0);
+        }
+        if backing.pages > 0 {
+            self.flush_pte_writes(backing.ggtt + (backing.pages - 1) * GTT_PAGE_SIZE as u32);
         }
         for f in backing.frames {
             narf_memory::frame::free_frame(f);
@@ -857,6 +927,12 @@ struct RcsContext<A: GpuAllocator> {
     ring: RingState,
     next_seqno: u32,
     last_completed_seqno: u32,
+    /// PPGTT root programmed into the image's PDP3 pair, when
+    /// one is attached (see [`RcsEngine::attach_ppgtt`]). The
+    /// tables themselves are owned by the
+    /// [`crate::intel_gpu_ppgtt::Ppgtt`] that produced the
+    /// root; the engine only carries the address.
+    ppgtt_root: Option<u64>,
 }
 
 impl<A: GpuAllocator> core::fmt::Debug for RcsContext<A> {
@@ -1024,6 +1100,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             ring: RingState { head: 0, tail: 0 },
             next_seqno: 1,
             last_completed_seqno: 0,
+            ppgtt_root: None,
         });
         Ok(ContextId::pack(slot as u32, generation))
     }
@@ -1165,6 +1242,72 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     pub fn hw_seqno(&self, id: ContextId) -> Result<u32, SubmitError> {
         let ctx = self.context(id)?;
         Ok(ctx.hwsp.read32(HWSP_SEQNO_BYTE))
+    }
+
+    /// The PPGTT root attached to a context, if any.
+    pub fn ppgtt_root(&self, id: ContextId) -> Result<Option<u64>, SubmitError> {
+        Ok(self.context(id)?.ppgtt_root)
+    }
+
+    /// Attach a PPGTT root (the PML4 physical address from
+    /// [`crate::intel_gpu_ppgtt::Ppgtt::root_phys`]) to an idle
+    /// context: the register-state image's PDP3 pair is patched
+    /// to the root encoded as a table entry (`phys | PRESENT`),
+    /// and PDP0–PDP2 are zeroed. In the 4-level walk the PDP3
+    /// pair is the root slot — the single patch site flagged in
+    /// spec §9 for first-silicon verification.
+    ///
+    /// Like every image patch in this engine, attaching refuses
+    /// ([`SubmitError::ContextBusy`]) while the context is
+    /// loaded or has work in flight: the hardware may be
+    /// restoring or saving the image. Re-attaching a different
+    /// root to an idle context replaces the old one; the tables
+    /// behind either root stay owned by their `Ppgtt`.
+    pub fn attach_ppgtt(&mut self, id: ContextId, root_phys: u64) -> Result<(), SubmitError> {
+        let entry = encode_table_entry(root_phys).map_err(|_| SubmitError::InvalidPpgttRoot)?;
+        let slot = self.context(id)?.slot;
+        if self.ctx_covered(slot) {
+            return Err(SubmitError::ContextBusy);
+        }
+        let ctx = self.context_mut(id)?;
+        Self::patch_pdp_values(&ctx.image, Some(entry));
+        ctx.ppgtt_root = Some(root_phys);
+        Ok(())
+    }
+
+    /// Detach a context's PPGTT root: all four PDP pairs in the
+    /// image return to zero and the context addresses through
+    /// the GGTT alone again. Same idle discipline as
+    /// [`Self::attach_ppgtt`].
+    pub fn detach_ppgtt(&mut self, id: ContextId) -> Result<(), SubmitError> {
+        let slot = self.context(id)?.slot;
+        if self.ctx_covered(slot) {
+            return Err(SubmitError::ContextBusy);
+        }
+        let ctx = self.context_mut(id)?;
+        Self::patch_pdp_values(&ctx.image, None);
+        ctx.ppgtt_root = None;
+        Ok(())
+    }
+
+    /// Write the PDP values into a context image's
+    /// register-state page. Template layout (group 1): the four
+    /// PDP pairs run PDP3, PDP2, PDP1, PDP0 at a 4-dword stride
+    /// from [`CTX_PDP3_UDW`], each pair holding its UDW value at
+    /// +1 and its LDW value at +3. `root` is the encoded PML4
+    /// table entry for PDP3; the other pairs are always zero in
+    /// the 4-level model.
+    fn patch_pdp_values<B: GpuBacking>(image: &B, root: Option<u64>) {
+        for pair in 0..4u64 {
+            let udw_val = CTX_PDP3_UDW as u64 + pair * 4 + 1;
+            let ldw_val = udw_val + 2;
+            let (hi, lo) = match (pair, root) {
+                (0, Some(entry)) => ((entry >> 32) as u32, entry as u32),
+                _ => (0, 0),
+            };
+            image.write32(REG_STATE_PAGE_BYTE + udw_val * 4, hi);
+            image.write32(REG_STATE_PAGE_BYTE + ldw_val * 4, lo);
+        }
     }
 
     /// Move queued work into the execlist ports when they are
@@ -2328,4 +2471,134 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_rcs", smoke_spurious_csb);
+
+    fn smoke_ppgtt_batch_start_encoding() -> TestResult {
+        // The PPGTT form differs from the GGTT form by exactly
+        // the ASI bit; both carry a 64-bit address in dwords
+        // 1..2. Hand-computed header: (0x31 << 23) | 1 | (1 << 8)
+        // = 0x1880_0101.
+        let enc = mi_batch_buffer_start_ppgtt(0x0000_0001_2345_6000);
+        if enc != [0x1880_0101, 0x2345_6000, 0x0000_0001] {
+            return TestResult::Fail("PPGTT batch-start encoding wrong");
+        }
+        let ggtt = mi_batch_buffer_start_ggtt(0x0000_0001_2345_6000);
+        if enc[0] ^ ggtt[0] != BB_START_ASI_PPGTT {
+            return TestResult::Fail("PPGTT/GGTT forms must differ only in the ASI bit");
+        }
+        if enc[1..] != ggtt[1..] {
+            return TestResult::Fail("address dwords must match the GGTT form");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_ppgtt_batch_start_encoding
+    );
+
+    fn smoke_attach_ppgtt_programs_pdp3() -> TestResult {
+        let (mut engine, hw) = match make_engine() {
+            Ok(p) => p,
+            Err(f) => return f,
+        };
+        let ctx = engine.create_context().expect("ctx");
+        // The image lives in the fake GGTT registry under its
+        // LRCA; read the register-state page through it.
+        let lrca = {
+            let c = engine.contexts[ctx.slot() as usize]
+                .as_ref()
+                .expect("live ctx");
+            descriptor_lrca(c.descriptor)
+        };
+        let image = hw.mem(lrca);
+        let pdp_val = |pair: u64, high: bool| {
+            let idx = CTX_PDP3_UDW as u64 + pair * 4 + if high { 1 } else { 3 };
+            mem_rd(&image, REG_STATE_PAGE_BYTE + idx * 4)
+        };
+        // Fresh context: every PDP value is zero (GGTT only).
+        for pair in 0..4 {
+            if pdp_val(pair, true) != 0 || pdp_val(pair, false) != 0 {
+                return TestResult::Fail("fresh context must have zero PDPs");
+            }
+        }
+        if engine.ppgtt_root(ctx) != Ok(None) {
+            return TestResult::Fail("fresh context must report no PPGTT root");
+        }
+        // Invalid roots are refused before any patch.
+        match engine.attach_ppgtt(ctx, 0x1234) {
+            Err(SubmitError::InvalidPpgttRoot) => {}
+            _ => return TestResult::Fail("unaligned root must be refused"),
+        }
+        match engine.attach_ppgtt(ctx, 1u64 << 39) {
+            Err(SubmitError::InvalidPpgttRoot) => {}
+            _ => return TestResult::Fail(">39-bit root must be refused"),
+        }
+        // Attach: PDP3 carries the root as a table entry
+        // (phys | PRESENT = 0x4000_0001 here); PDP0-2 stay zero.
+        engine.attach_ppgtt(ctx, 0x4000_0000).expect("attach");
+        if engine.ppgtt_root(ctx) != Ok(Some(0x4000_0000)) {
+            return TestResult::Fail("attached root not reported");
+        }
+        if pdp_val(0, false) != 0x4000_0001 || pdp_val(0, true) != 0 {
+            return TestResult::Fail("PDP3 must carry root phys | PRESENT");
+        }
+        for pair in 1..4 {
+            if pdp_val(pair, true) != 0 || pdp_val(pair, false) != 0 {
+                return TestResult::Fail("PDP0-2 must stay zero in 4-level mode");
+            }
+        }
+        // A loaded context refuses re-attach: submit covers the
+        // context (pending port), and the root must not change
+        // under the hardware.
+        let batch = engine
+            .write_batch(&[MI_NOOP, MI_BATCH_BUFFER_END])
+            .expect("batch");
+        engine.submit(ctx, batch).expect("submit");
+        match engine.attach_ppgtt(ctx, 0x5000_0000) {
+            Err(SubmitError::ContextBusy) => {}
+            _ => return TestResult::Fail("attach on a covered context must be ContextBusy"),
+        }
+        if engine.ppgtt_root(ctx) != Ok(Some(0x4000_0000)) {
+            return TestResult::Fail("refused attach must not replace the root");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_attach_ppgtt_programs_pdp3
+    );
+
+    fn smoke_detach_ppgtt_zeroes_pdps() -> TestResult {
+        let (mut engine, hw) = match make_engine() {
+            Ok(p) => p,
+            Err(f) => return f,
+        };
+        let ctx = engine.create_context().expect("ctx");
+        engine.attach_ppgtt(ctx, 0x4000_0000).expect("attach");
+        engine.detach_ppgtt(ctx).expect("detach");
+        if engine.ppgtt_root(ctx) != Ok(None) {
+            return TestResult::Fail("detached context must report no root");
+        }
+        let lrca = {
+            let c = engine.contexts[ctx.slot() as usize]
+                .as_ref()
+                .expect("live ctx");
+            descriptor_lrca(c.descriptor)
+        };
+        let image = hw.mem(lrca);
+        for pair in 0..4u64 {
+            for slot in [1u64, 3] {
+                let idx = CTX_PDP3_UDW as u64 + pair * 4 + slot;
+                if mem_rd(&image, REG_STATE_PAGE_BYTE + idx * 4) != 0 {
+                    return TestResult::Fail("detach must zero every PDP value");
+                }
+            }
+        }
+        // Re-attach after detach works and lands the new root.
+        engine.attach_ppgtt(ctx, 0x6000_0000).expect("re-attach");
+        if engine.ppgtt_root(ctx) != Ok(Some(0x6000_0000)) {
+            return TestResult::Fail("re-attached root not reported");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_rcs", smoke_detach_ppgtt_zeroes_pdps);
 }
