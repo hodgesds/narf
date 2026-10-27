@@ -2017,6 +2017,7 @@ dependencies = [
  "narf-capabilities",
  "narf-console",
  "narf-drivers",
+ "narf-drivers-tpm",
  "narf-filesystem",
  "narf-firmware-smbios",
  "narf-init",
