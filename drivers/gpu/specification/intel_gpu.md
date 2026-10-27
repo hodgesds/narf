@@ -83,9 +83,14 @@ the canonical bit definition without re-deriving it.
 
 ### Stage 2 (landed) — Codec layer
 - **`intel_gpu_gmbus`** — GMBUS register file (MMIO 0xC5100..),
-  CMD/STATUS bit layout, pin-pair encoding (DDI A..F), 256-byte
-  E-EDID read transaction encoder. Source: TGL PRM Vol. 12
-  "GMBUS Programming".
+  CMD/STATUS bit layout, pin-pair encoding (DDI A..F), E-EDID
+  read transaction encoder, and the MMIO transport (`GmbusBus`):
+  poll-counted HW_RDY / wait-phase waits, STOP-cycle +
+  wait-idle teardown, SATOER NAK recovery, CYCLE_INDEX /
+  GMBUS5 indexed transfers. Register map corrected against
+  PRM Vol. 12 + i915 `intel_gmbus_regs.h` in #1018 (base
+  0xC5100, GMBUS5 at +0x20, HW_WAIT_PHASE at GMBUS2[14]).
+  Source: TGL PRM Vol. 12 "GMBUS Programming".
 - **`intel_gpu_pll`** — DPLL register layout for Gen12 Combo PHY +
   TC PHY: `DPLL_CTRL{1,2,3}`, `DPLL_CFGCR0`, `DPLL_CFGCR1`,
   `DPCLKA_CFGCR0`, `MGPLL_*` divider fields. Source: TGL PRM
@@ -112,6 +117,8 @@ Stage-3 driver core consumes these codecs through the
 ### Stage 3 (future) — Display-only driver core
 - Wire GMBUS to `narf-graphics::edid::Edid::parse` for EDID
   read-out on whatever DDI the firmware left active.
+  (The GMBUS transport itself landed in #1018; the session
+  wiring into the driver core is the remaining step.)
 - Compute pipe / transcoder timing from EDID detailed-timing
   block; program PIPE / TRANS / PLANE through the Stage-2 codec.
 - Take over scanout from UEFI GOP without re-training the link
