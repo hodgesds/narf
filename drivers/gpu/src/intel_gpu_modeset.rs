@@ -17,9 +17,10 @@
 //!   the PRM's listed power-well-to-pipe mapping has silicon-
 //!   specific corrections (see i915 `display/intel_dmc.c`).
 //! - **eDP-only modeset** — laptop panels. External DP is the
-//!   same path with a few additional hotplug detection steps;
-//!   HDMI needs a different DPLL link-rate select and skips DP
-//!   link training. Stage 2 adds those branches.
+//!   same path with a few additional hotplug detection steps.
+//!   HDMI has its own entry point ([`Modeset::modeset_hdmi`],
+//!   #1019): a WRPLL DPLL select for the TMDS character clock
+//!   and no DP link training.
 //! - **EDID readback over AUX** — uses [`dp_edid::read_edid`]
 //!   with our [`intel_gpu_aux::IntelAux`] transport. Falls back
 //!   to a hardcoded 1024×768@60 mode when EDID isn't reachable
@@ -250,6 +251,10 @@ pub enum ModesetError {
     /// `DBUF_CTL.POWER_REQUEST` — the watermark / DDB
     /// programming would point at unpowered SRAM.
     DbufPowerTimeout,
+    /// The mode's TMDS character clock has no WRPLL solution
+    /// (HDMI path, #1019): no divider lands the Combo-PHY DCO
+    /// inside its window for this clock.
+    HdmiClockUnsupported,
     /// Caller-supplied framebuffer doesn't satisfy Gen12 plane
     /// alignment (stride must be a multiple of 64 for linear
     /// surfaces).
@@ -359,6 +364,78 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// modeset.
     pub fn teardown(&mut self) {
         self.disable_pipeline();
+    }
+
+    /// Run the modeset for an HDMI sink (#1019). The HDMI
+    /// session layer owns EDID/DDC and hands the mode in, like
+    /// the DP plan path; the sequence diverges from
+    /// `modeset_impl` exactly where HDMI does:
+    ///
+    /// - the DPLL is programmed for the mode's TMDS character
+    ///   clock with WRPLL-computed coefficients
+    ///   (`intel_gpu_pll::hdmi_wrpll_coeffs`), not a DP link
+    ///   rate;
+    /// - there is no M/N (TMDS carries the pixel clock on the
+    ///   wire), no BUF_TRANS load and no link training;
+    /// - `TRANS_DDI_FUNC_CTL` binds in HDMI mode with the
+    ///   scrambling / high-TMDS-character-rate bits the caller
+    ///   resolved from the character rate (the SCDC side of
+    ///   scrambling is the session's, programmed before this
+    ///   runs — the register bits must not change while the
+    ///   port is enabled).
+    ///
+    /// `scrambling` / `high_tmds_char_rate` are both set iff
+    /// the character rate exceeds 340 Mcsc.
+    pub fn modeset_hdmi(
+        &mut self,
+        primary_fb: &Framebuffer,
+        mode: &Mode,
+        scrambling: bool,
+        high_tmds_char_rate: bool,
+    ) -> Result<Mode, ModesetError> {
+        validate_framebuffer(primary_fb)?;
+        let coeffs = match crate::intel_gpu_pll::hdmi_wrpll_coeffs(
+            mode.pixel_clock_khz,
+            // Same DSSM-strap family selection as the DP path
+            // (Q6, #1024).
+            decode_refclk_family(self.mmio.read32(DSSM)),
+        ) {
+            Some(c) => c,
+            None => return Err(ModesetError::HdmiClockUnsupported),
+        };
+
+        self.enable_pg1()?;
+        self.disable_pipeline();
+        self.program_dpll_coeffs(&coeffs)?;
+        self.program_cdclk_floor(mode);
+        self.program_dpclka_routing();
+        self.enable_pipe_power_well(Pipe::A)?;
+        self.program_transcoder(mode);
+        self.program_pipe(mode);
+        // No step 7b: HDMI has no M/N.
+        self.program_trans_ddi_func_ctl_hdmi(scrambling, high_tmds_char_rate);
+        self.enable_dbuf_slices()?;
+        self.program_watermarks(mode, primary_fb);
+        self.program_plane(primary_fb, mode);
+        // No step 9: no BUF_TRANS table load, no link training
+        // on a TMDS link.
+        self.enable_ddi_buffer(4);
+        self.enable_transcoder();
+        self.enable_pipe();
+        self.enable_plane();
+        Ok(*mode)
+    }
+
+    /// Bind Transcoder A to this DDI in HDMI mode (8 bpc, the
+    /// fixed 4-lane width, scrambling bits per the plan).
+    fn program_trans_ddi_func_ctl_hdmi(&mut self, scrambling: bool, high_tmds_char_rate: bool) {
+        use crate::intel_gpu_pipes::{
+            build_trans_ddi_func_ctl_hdmi, Transcoder, TRANS_DDI_FUNC_CTL_OFFSET,
+        };
+        let val = build_trans_ddi_func_ctl_hdmi(self.ddi as u8, scrambling, high_tmds_char_rate);
+        self.mmio
+            .write32(Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET, val);
+        compiler_fence(Ordering::SeqCst);
     }
 
     fn modeset_impl(
@@ -691,6 +768,17 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             Some(c) => c,
             None => return Err(ModesetError::PllLockTimeout),
         };
+        self.program_dpll_coeffs(&coeffs)
+    }
+
+    /// Bring DPLL0 up with explicit coefficients: power, write
+    /// CFGCR0/CFGCR1, enable, wait for lock. Shared by the DP
+    /// rate path (fixed PRM rows) and the HDMI path (WRPLL-
+    /// computed rows, #1019).
+    fn program_dpll_coeffs(
+        &mut self,
+        coeffs: &crate::intel_gpu_pll::DpllCoeffs,
+    ) -> Result<(), ModesetError> {
         // DDI A → DPLL 0 (default Combo-PHY mapping). Stage-2 only
         // exercises this; multi-DDI port arbitration via DPCLKA_CFGCR0
         // lands when Pipe B+ comes online.
@@ -706,7 +794,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         }
 
         // Step 2 — CFGCR0 / CFGCR1.
-        let cfgcr0 = encode_cfgcr0(&coeffs);
+        let cfgcr0 = encode_cfgcr0(coeffs);
         let cfgcr0_off = crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0;
         let cfgcr1_off = crate::intel_gpu_pll::dpll_cfgcr1(cfgcr0_off);
         self.mmio.write32(cfgcr0_off, cfgcr0);

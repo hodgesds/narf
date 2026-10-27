@@ -708,6 +708,8 @@ pub mod intel_gpu_gmbus;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gtt;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_hdmi;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_modeset;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_pcode;
