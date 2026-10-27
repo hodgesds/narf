@@ -879,6 +879,38 @@ unsafe impl Registers for Native {
             .ok_or(Error::State)?;
         Ok(super::tx_ba_power::Source::Registered.load(base).ok())
     }
+    fn station_protection_extension(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<super::protection::Grant>>, Error> {
+        self.station_allowed()?;
+        let base = self
+            .packet_gate
+            .as_ref()
+            .and_then(super::power_policy::Gate::protection_base)
+            .ok_or(Error::State)?;
+        Ok(super::protection::Source::Registered.load(base).ok())
+    }
+    fn station_bind_protection(
+        &mut self,
+        g: alloc::sync::Arc<super::protection::Grant>,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        self.packet_gate = Some(
+            self.packet_gate
+                .as_ref()
+                .ok_or(Error::State)?
+                .with_protection(g)?,
+        );
+        Ok(())
+    }
+    fn station_rts_request(&mut self) -> Result<super::RtsRequest, Error> {
+        self.station_allowed()?;
+        let gate = self.packet_gate.as_ref().ok_or(Error::State)?;
+        if let Some(g) = gate.protection_grant() {
+            return Ok(g.request());
+        }
+        super::protection::request(&super::protection::registered_base(gate)?)
+    }
     fn station_bind_tx_ba(
         &mut self,
         g: alloc::sync::Arc<super::tx_ba_power::Grant>,

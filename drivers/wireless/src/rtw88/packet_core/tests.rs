@@ -25,6 +25,7 @@ struct Submission {
     length: usize,
     address: u64,
     next: u16,
+    rts: bool,
 }
 pub(in crate::rtw88) struct Controls {
     pub(in crate::rtw88) held: AtomicBool,
@@ -32,6 +33,7 @@ pub(in crate::rtw88) struct Controls {
     pub(in crate::rtw88) corrupt_receipt: AtomicBool,
     pub(in crate::rtw88) fifo_stuck: AtomicBool,
     pub(in crate::rtw88) fifo_invalid: AtomicBool,
+    pub(in crate::rtw88) rts_failure: AtomicBool,
     pub(in crate::rtw88) incoming: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
     pub(in crate::rtw88) incoming_profiles: IrqSafeSpinLock<VecDeque<(Vec<u8>, u8, u8)>>,
 }
@@ -43,12 +45,14 @@ impl Default for Controls {
             corrupt_receipt: AtomicBool::new(false),
             fifo_stuck: AtomicBool::new(false),
             fifo_invalid: AtomicBool::new(false),
+            rts_failure: AtomicBool::new(false),
             incoming: IrqSafeSpinLock::new(VecDeque::new()),
             incoming_profiles: IrqSafeSpinLock::new(VecDeque::new()),
         }
     }
 }
 pub(in crate::rtw88) struct Model {
+    pub(in crate::rtw88) protection: Option<Arc<crate::rtw88::protection::Grant>>,
     pub(in crate::rtw88) originator_ba: bool,
     pub(in crate::rtw88) recipient_ba: bool,
     pub(in crate::rtw88) receive_chip: crate::rtw88::packet_phy::Chip,
@@ -83,6 +87,7 @@ impl Model {
     }
     pub(in crate::rtw88) fn new() -> Self {
         Self {
+            protection: None,
             recipient_ba: false,
             originator_ba: false,
             receive_chip: crate::rtw88::packet_phy::Chip::C22,
@@ -269,6 +274,9 @@ impl Model {
 // SAFETY: inert single-threaded model owns unique real coherent allocations;
 // simulated bus addresses only match complete owned maps, never become CPU pointers.
 unsafe impl Port for Model {
+    fn rts_threshold(&self) -> Option<u32> {
+        self.protection.as_ref().map(|g| g.threshold())
+    }
     fn originator_ba_allowed(&self) -> bool {
         self.originator_ba
     }
@@ -335,6 +343,12 @@ unsafe impl Port for Model {
             while let Some(position) = self.submissions.iter().position(|s| s.queue.index() == reg)
             {
                 let submission = self.submissions.remove(position).ok_or(Error::State)?;
+                if submission.rts && self.controls.rts_failure.load(Ordering::Acquire) {
+                    let i = queue_slot(submission.queue);
+                    self.indices[i] = self.indices[i] & 0xffff | u32::from(submission.next) << 16;
+                    self.report(submission.report.ok_or(Error::Packet)?, false);
+                    continue;
+                }
                 // The simulated device consumes current DMA bytes at the
                 // doorbell, independently of the earlier descriptor write.
                 let body = self.actual_body(submission)?;
@@ -387,6 +401,13 @@ unsafe impl Port for Model {
         self.descriptors
             .push(descriptor.try_into().map_err(|_| Error::Packet)?);
         let status = u32::from_le_bytes(descriptor[8..12].try_into().unwrap());
+        let rts = u32::from_le_bytes(descriptor[12..16].try_into().unwrap()) & (1 << 12) != 0;
+        if rts
+            && (u32::from_le_bytes(descriptor[16..20].try_into().unwrap()) >> 24 & 31 != 8
+                || u32::from_le_bytes(descriptor[20..24].try_into().unwrap()) & (1 << 12) == 0)
+        {
+            return Err(Error::Packet);
+        }
         let sequence = descriptor[24] & 0xfc;
         self.submissions.push_back(Submission {
             queue,
@@ -394,6 +415,7 @@ unsafe impl Port for Model {
             length,
             address,
             next: ((slot + 1) % queue.depth()) as u16,
+            rts,
         });
         if let Some(callback) = self.after_descriptor.clone() {
             callback();

@@ -149,6 +149,20 @@ pub(super) unsafe trait Registers: Send {
     ) -> Result<Option<alloc::sync::Arc<super::tx_ba_power::Grant>>, Error> {
         Ok(None)
     }
+    fn station_protection_extension(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<super::protection::Grant>>, Error> {
+        Ok(None)
+    }
+    fn station_bind_protection(
+        &mut self,
+        _: alloc::sync::Arc<super::protection::Grant>,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_rts_request(&mut self) -> Result<super::RtsRequest, Error> {
+        Err(Error::Unsupported)
+    }
     fn station_bind_tx_ba(
         &mut self,
         _: alloc::sync::Arc<super::tx_ba_power::Grant>,
@@ -354,6 +368,20 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
         &mut self,
     ) -> Result<Option<alloc::sync::Arc<super::tx_ba_power::Grant>>, Error> {
         self.io.station_tx_ba_extension()
+    }
+    fn station_protection_extension(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<super::protection::Grant>>, Error> {
+        self.io.station_protection_extension()
+    }
+    fn station_bind_protection(
+        &mut self,
+        g: alloc::sync::Arc<super::protection::Grant>,
+    ) -> Result<(), Error> {
+        self.io.station_bind_protection(g)
+    }
+    fn station_rts_request(&mut self) -> Result<super::RtsRequest, Error> {
+        self.io.station_rts_request()
     }
     fn station_bind_tx_ba(
         &mut self,

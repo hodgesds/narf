@@ -75,6 +75,10 @@ mod phy;
 mod phy8821c;
 mod power_policy;
 mod probe_guard;
+mod protection;
+#[cfg(feature = "kernel-test")]
+mod protection_tests;
+pub use protection::Request as RtsRequest;
 mod publication;
 mod radio;
 mod radio8821c;

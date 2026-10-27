@@ -130,6 +130,7 @@ fn ht_ies() -> Vec<u8> {
 struct Actor {
     ht: bool,
     ba: bool,
+    nested_downlink: bool,
     rx_ba: [Option<(u8, u16, u16)>; 8],
     retiring_baid: Option<u8>,
     tx_ba_enabled: bool,
@@ -208,6 +209,32 @@ impl Actor {
     }
     fn downlink(&mut self, ethernet: &[u8]) -> Result<(), &'static str> {
         self.ap_pn += 1;
+        if self.nested_downlink {
+            let (id, sn, window) = self.rx_ba[0].ok_or("AP nested BA session absent")?;
+            let mut packets = if self.protected {
+                self.security
+                    .encrypted_amsdu(&[ethernet.to_vec()], self.ap_pn, 0)?
+            } else {
+                let mut frame = from_ap(ethernet, sn);
+                frame[0] = 0x88;
+                frame.splice(24..24, [0x80, 0]);
+                let mut p = envelope(&frame);
+                p[3] |= 0x40;
+                p[4] = 0x80;
+                vec![p]
+            };
+            for p in &mut packets {
+                p[48 + 22..48 + 24].copy_from_slice(&(sn << 4).to_le_bytes());
+                p[16..20].copy_from_slice(
+                    &((u32::from(id) << 24) | (u32::from(sn) << 12) | u32::from((sn + 1) & 4095))
+                        .to_le_bytes(),
+                );
+                p[28..32].copy_from_slice(&self.rx_rate.to_le_bytes());
+                self.inject(0xc1, 0, 0x8000, p);
+            }
+            self.rx_ba[0] = Some((id, (sn + 1) & 4095, window));
+            return Ok(());
+        }
         let mut packet = if self.protected {
             self.security
                 .encrypted_rx_profile(ethernet, self.ap_pn, false, self.ht.then_some(0))?
@@ -776,6 +803,7 @@ impl Harness {
         let mut actor = Actor {
             ht,
             ba,
+            nested_downlink: false,
             rx_ba: [None; 8],
             retiring_baid: None,
             tx_ba_enabled: false,
@@ -853,19 +881,20 @@ impl Harness {
                     + u8::try_from(nonce.fetch_add(1, Ordering::Relaxed))
                         .map_err(|_| "fixture nonce exhausted")?; 32])
             }),
-            power: Arc::new(move |_| {
+            power: Arc::new(move |owner| {
                 if !staged.load(Ordering::Acquire) {
                     return Err("fixture measured power asset not staged");
                 }
-                Ok((
-                    Asset {
-                        bytes: bytes.clone(),
-                        cap,
-                        signer,
-                        digest,
-                    },
-                    BINDING,
-                ))
+                let asset = Asset {
+                    bytes: bytes.clone(),
+                    cap,
+                    signer,
+                    digest,
+                };
+                if emission == 4 {
+                    owner.select_nested_power(&asset, BINDING)?;
+                }
+                Ok((asset, BINDING))
             }),
         };
         let device = Device::configured(owner, source, environment)?;

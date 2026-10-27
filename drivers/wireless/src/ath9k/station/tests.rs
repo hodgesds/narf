@@ -71,6 +71,7 @@ pub(in crate::ath9k) struct Peer {
     pub(in crate::ath9k) server: DhcpServer,
     pub(in crate::ath9k) ptk: Option<Ptk>,
     pub(in crate::ath9k) replay: narf_wireless::ccmp::ReplayWindow,
+    qos_replay: [narf_wireless::ccmp::ReplayWindow; 16],
     pub(in crate::ath9k) pn: u64,
     pub(in crate::ath9k) uplink: Vec<Vec<u8>>,
     pub(in crate::ath9k) hold_m4: bool,
@@ -88,6 +89,16 @@ pub(in crate::ath9k) struct Peer {
     pub(in crate::ath9k) hold_delba: bool,
     pairwise_proposal: Option<([u8; 32], u64)>,
     pub(in crate::ath9k) pairwise_replies: usize,
+    pub(in crate::ath9k) tx_ba_requests: Vec<Vec<u8>>,
+    pub(in crate::ath9k) tx_ba_respond: bool,
+    pub(in crate::ath9k) tx_ba_status: u16,
+    pub(in crate::ath9k) tx_ba_window: u16,
+    pub(in crate::ath9k) tx_ba_timeout: u16,
+    pub(in crate::ath9k) hold_tx_request: bool,
+    pub(in crate::ath9k) hold_bar: bool,
+    pub(in crate::ath9k) bars: Vec<Vec<u8>>,
+    pub(in crate::ath9k) sender_delbas: Vec<Vec<u8>>,
+    sender_reorder: Option<narf_wireless::reorder::Reorder<Vec<u8>>>,
     rx_sequence: u16,
 }
 impl Peer {
@@ -117,6 +128,9 @@ impl Peer {
             server: DhcpServer::new(plan),
             ptk: None,
             replay: narf_wireless::ccmp::ReplayWindow { last_seen_pn: 0 },
+            qos_replay: core::array::from_fn(|_| narf_wireless::ccmp::ReplayWindow {
+                last_seen_pn: 0,
+            }),
             pn: 1,
             uplink: Vec::new(),
             hold_m4: false,
@@ -134,6 +148,16 @@ impl Peer {
             hold_delba: false,
             pairwise_proposal: None,
             pairwise_replies: 0,
+            tx_ba_requests: Vec::new(),
+            tx_ba_respond: true,
+            tx_ba_status: 0,
+            tx_ba_window: 64,
+            tx_ba_timeout: 0,
+            hold_tx_request: false,
+            hold_bar: false,
+            bars: Vec::new(),
+            sender_delbas: Vec::new(),
+            sender_reorder: None,
             rx_sequence: 0,
         }
     }
@@ -182,6 +206,37 @@ impl Peer {
         &mut self,
         frame: &[u8],
     ) -> Result<(Vec<Vec<u8>>, bool), &'static str> {
+        if frame.first() == Some(&0x84) {
+            if frame.len() != 20
+                || frame[..2] != [0x84, 0]
+                || frame[4..10] != AP
+                || frame[10..16] != self.plan.station
+                || frame[16..18] != [4, 0]
+                || frame[18] & 15 != 0
+            {
+                return Err("native sender BAR identity/format");
+            }
+            let head = u16::from_le_bytes([frame[18], frame[19]]) >> 4;
+            let released = self
+                .sender_reorder
+                .as_mut()
+                .ok_or("BAR lacks actual air ADDBA")?
+                .advance(head, 0)
+                .map_err(|_| "AP BAR reorder")?;
+            let mut responses = Vec::new();
+            for original in released {
+                responses.extend(self.receive_data(&original)?.0);
+            }
+            self.bars.push(frame.to_vec());
+            let mut ba = vec![0x94, 0, 0, 0];
+            ba.extend_from_slice(&self.plan.station);
+            ba.extend_from_slice(&AP);
+            ba.extend_from_slice(&[4, 0]);
+            ba.extend_from_slice(&(head << 4).to_le_bytes());
+            ba.extend_from_slice(&[0; 8]);
+            responses.push(ba);
+            return Ok((responses, self.hold_bar));
+        }
         if frame.first() == Some(&0x40) {
             let length = usize::from(*frame.get(25).ok_or("probe extent")?);
             let name = frame.get(26..26 + length).ok_or("probe SSID")?;
@@ -214,6 +269,51 @@ impl Peer {
             return Err("native AP peer identity");
         }
         if frame[0] == 0xd0 {
+            if frame.len() == 33 && frame[24..26] == [3, 0] {
+                let parameter = u16::from_le_bytes([frame[27], frame[28]]);
+                let requested = parameter >> 6;
+                if !self.ht_active
+                    || parameter & 0x3f != 2
+                    || !(4..=64).contains(&requested)
+                    || frame[26] == 0
+                    || frame[29..31] != [0, 0]
+                    || frame[31] & 15 != 0
+                {
+                    return Err("native sender ADDBA request");
+                }
+                self.tx_ba_requests.push(frame.to_vec());
+                if !self.tx_ba_respond {
+                    return Ok((Vec::new(), self.hold_tx_request));
+                }
+                let window = self.tx_ba_window.min(requested);
+                if self.tx_ba_status == 0 && (1..=64).contains(&window) {
+                    let mut reorder =
+                        narf_wireless::reorder::Reorder::new(window as u8, 100_000_000)
+                            .map_err(|_| "AP BA window allocation")?;
+                    reorder
+                        .advance(u16::from_le_bytes([frame[31], frame[32]]) >> 4, 0)
+                        .map_err(|_| "AP explicit native SSN")?;
+                    self.sender_reorder = Some(reorder);
+                }
+                let mut response = vec![0xd0, 0, 0, 0];
+                response.extend_from_slice(&self.plan.station);
+                response.extend_from_slice(&AP);
+                response.extend_from_slice(&AP);
+                response.extend_from_slice(&[0, 0, 3, 1, frame[26]]);
+                response.extend_from_slice(&self.tx_ba_status.to_le_bytes());
+                response.extend_from_slice(&(2 | (window << 6)).to_le_bytes());
+                response.extend_from_slice(&self.tx_ba_timeout.to_le_bytes());
+                return Ok((vec![response], self.hold_tx_request));
+            }
+            if frame.len() == 30
+                && frame[24..26] == [3, 2]
+                && frame[26..28] == [0, 8]
+                && matches!(u16::from_le_bytes([frame[28], frame[29]]), 37 | 39)
+            {
+                self.sender_delbas.push(frame.to_vec());
+                self.sender_reorder = None;
+                return Ok((Vec::new(), false));
+            }
             if frame.len() == 30 && frame[24..26] == [3, 2] {
                 if !self.ht_active
                     || u16::from_le_bytes([frame[26], frame[27]]) & 0xfff != 0
@@ -293,6 +393,26 @@ impl Peer {
             }
             return Ok((replies, before == ApPhase::Message4 && self.hold_m4));
         }
+        if frame[0] == 0x88 && self.sender_reorder.is_some() {
+            let seq = u16::from_le_bytes([frame[22], frame[23]]) >> 4;
+            let released = self
+                .sender_reorder
+                .as_mut()
+                .unwrap()
+                .push(seq, 0, frame.to_vec())
+                .map_err(|_| "AP BA original order")?;
+            let mut responses = Vec::new();
+            let mut held = self.hold_data;
+            for original in released {
+                let (replies, hold) = self.receive_data(&original)?;
+                responses.extend(replies);
+                held |= hold;
+            }
+            return Ok((responses, held));
+        }
+        self.receive_data(frame)
+    }
+    fn receive_data(&mut self, frame: &[u8]) -> Result<(Vec<Vec<u8>>, bool), &'static str> {
         if !matches!(frame[0], 8 | 0x88)
             || frame[1] & 3 != 1
             || (frame[1] & 0x40 != 0) != self.ap.protected()
@@ -319,7 +439,11 @@ impl Peer {
                 key,
                 0,
                 false,
-                &mut self.replay,
+                if h == 26 {
+                    &mut self.qos_replay[usize::from(frame[24] & 15)]
+                } else {
+                    &mut self.replay
+                },
                 &mut body,
             )
             .map_err(|_| "AP uplink CCMP/MIC/replay")?;
@@ -457,6 +581,10 @@ pub(in crate::ath9k) struct Fixture {
     pub peer: Arc<IrqSafeSpinLock<Peer>>,
     pub env: Arc<Env>,
     pub plan: NetworkPlan,
+}
+pub(in crate::ath9k) fn open_qos_start(f: &mut Fixture, sequence: u16) {
+    assert!(!f.peer.lock().ap.protected() && sequence < 4096 && f.radio.phase() == Phase::Passive);
+    f.radio.qos_sequence[0] = sequence;
 }
 pub(in crate::ath9k) fn fixture(protected: bool) -> Result<Fixture, &'static str> {
     fixture_rates(protected, None)

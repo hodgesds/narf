@@ -76,6 +76,11 @@ impl Core {
             let word3 = u32::from_le_bytes(descriptor[12..16].try_into().unwrap()) | 3 << 17;
             descriptor[8..12].copy_from_slice(&word2.to_le_bytes());
             descriptor[12..16].copy_from_slice(&word3.to_le_bytes());
+            super::super::protection::descriptor(
+                &mut descriptor,
+                frame.len(),
+                port.rts_threshold(),
+            );
             let memory = self.batch_buffers.get(slot).ok_or(Error::State)?;
             let bd = format::buffer_descriptor(memory.dma_addr().raw(), frame.len())?;
             let id = self.next_id.checked_add(slot as u64).ok_or(Error::State)?;

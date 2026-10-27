@@ -56,6 +56,7 @@ pub mod boot_context;
 mod bootstrap;
 pub use bootstrap::gen2_ba_transmit_power_request;
 pub use bootstrap::gen2_ht20_transmit_power_request;
+pub use bootstrap::gen2_nested_ba_transmit_power_request;
 pub use bootstrap::gen2_transmit_power_request;
 pub use bootstrap::{provision, provision_state, ProvisionState};
 pub use mvm_boot::PowerRequest as Gen2TransmitPowerRequest;

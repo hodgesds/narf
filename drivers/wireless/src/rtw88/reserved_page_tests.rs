@@ -89,6 +89,7 @@ struct Model {
     ht: Option<Arc<crate::rtw88::ht::Grant>>,
     rx_ba: Option<Arc<crate::rtw88::rx_ba_power::Grant>>,
     tx_ba: Option<Arc<crate::rtw88::tx_ba_power::Grant>>,
+    protection: Option<Arc<crate::rtw88::protection::Grant>>,
     before_publication: Option<Arc<dyn Fn() + Send + Sync>>,
     edca_writes: usize,
     packet_model: crate::rtw88::packet_core::tests::Model,
@@ -112,6 +113,24 @@ impl Port {
     }
     fn tx_ba_request(&self) -> Result<crate::rtw88::TxBaRequest, Error> {
         crate::rtw88::tx_ba_power::request(&self.tx_base()?)
+    }
+    fn protection_base(&self) -> Result<crate::rtw88::protection::Base, Error> {
+        let m = self.0.lock();
+        Ok(if let Some(t) = &m.tx_ba {
+            crate::rtw88::protection::Base::T(t.clone())
+        } else if let Some(r) = &m.rx_ba {
+            crate::rtw88::protection::Base::R(r.clone())
+        } else {
+            crate::rtw88::protection::Base::H(m.ht.as_ref().ok_or(Error::State)?.clone())
+        })
+    }
+    fn rts_request(&self) -> Result<crate::rtw88::RtsRequest, Error> {
+        crate::rtw88::protection::request(&self.protection_base()?)
+    }
+    fn qualify_protection(&self, s: crate::rtw88::protection::Source) -> Result<(), Error> {
+        let g = s.load(self.protection_base()?)?;
+        self.0.lock().protection = Some(g);
+        Ok(())
     }
     fn qualify_tx_ba(&self, s: crate::rtw88::tx_ba_power::Source) -> Result<(), Error> {
         let g = s.load(self.tx_base()?)?;
@@ -189,6 +208,35 @@ impl Port {
 // SAFETY: no physical PCI/DMA. The simulator holds all synthetic device
 // mappings, observes OWN before claiming, and only reads published storage.
 unsafe impl Registers for Port {
+    fn station_rts_request(&mut self) -> Result<crate::rtw88::RtsRequest, Error> {
+        self.station_allowed()?;
+        self.rts_request()
+    }
+    fn station_protection_extension(
+        &mut self,
+    ) -> Result<Option<Arc<crate::rtw88::protection::Grant>>, Error> {
+        self.station_allowed()?;
+        Ok(self.0.lock().protection.clone())
+    }
+    fn station_bind_protection(
+        &mut self,
+        g: Arc<crate::rtw88::protection::Grant>,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        let gate = self
+            .0
+            .lock()
+            .station_gate
+            .as_ref()
+            .ok_or(Error::State)?
+            .with_protection(g.clone())?;
+        let current = gate.clone();
+        let mut m = self.0.lock();
+        m.packet_model.authority = Some(Arc::new(move || current.current().is_ok()));
+        m.packet_model.protection = Some(g);
+        m.station_gate = Some(gate);
+        Ok(())
+    }
     fn station_tx_ba_extension(
         &mut self,
     ) -> Result<Option<Arc<crate::rtw88::tx_ba_power::Grant>>, Error> {
@@ -318,7 +366,7 @@ unsafe impl Registers for Port {
             && model
                 .station_gate
                 .as_ref()
-                .is_some_and(crate::rtw88::power_policy::Gate::allows_tx_ba)
+                .is_some_and(|g| g.allows_tx_ba() || g.protection_grant().is_some())
         {
             if model
                 .packet_model
@@ -870,6 +918,7 @@ fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
         ht: None,
         rx_ba: None,
         tx_ba: None,
+        protection: None,
         before_publication: None,
         edca_writes: 0,
         packet_model: crate::rtw88::packet_core::tests::Model::new(),

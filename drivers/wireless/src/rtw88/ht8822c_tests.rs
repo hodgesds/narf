@@ -6,6 +6,48 @@ struct Case {
     e: Extended,
     cap: Cap<FirmwareBlob, Read>,
 }
+fn smoke_rtw8822ce_rts_open_native_dhcp_ip_and_h_r_t() -> TestResult {
+    result(|| crate::rtw88::protection_tests::composition::<Case>(false))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rts/rtl8822c",
+    smoke_rtw8822ce_rts_open_native_dhcp_ip_and_h_r_t
+);
+fn smoke_rtw8822ce_rts_wpa2_native_dhcp_ip_and_h_r_t() -> TestResult {
+    result(|| crate::rtw88::protection_tests::composition::<Case>(true))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rts/rtl8822c",
+    smoke_rtw8822ce_rts_wpa2_native_dhcp_ip_and_h_r_t
+);
+fn smoke_rtw8822ce_rts_distinct_assets_old_profiles_and_bounds() -> TestResult {
+    result(crate::rtw88::protection_tests::assets_and_old_profiles::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rts/rtl8822c",
+    smoke_rtw8822ce_rts_distinct_assets_old_profiles_and_bounds
+);
+fn smoke_rtw8822ce_rts_held_ccx_native_key_and_threshold() -> TestResult {
+    result(crate::rtw88::protection_tests::held_ccx_key_and_setting::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rts/rtl8822c",
+    smoke_rtw8822ce_rts_held_ccx_native_key_and_threshold
+);
+fn smoke_rtw8822ce_rts_native_failures_sources_policy_and_dma() -> TestResult {
+    result(crate::rtw88::protection_tests::failures_and_current_sources::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rts/rtl8822c",
+    smoke_rtw8822ce_rts_native_failures_sources_policy_and_dma
+);
+fn smoke_rtw8822ce_rts_partial_bd_cancel_and_mac_fifo_setting() -> TestResult {
+    result(crate::rtw88::protection_tests::partial_publication_and_fifo_setting::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rts/rtl8822c",
+    smoke_rtw8822ce_rts_partial_bd_cancel_and_mac_fifo_setting
+);
 fn smoke_rtw8822ce_native_early_m3_and_closed_data_before_m2_ccx() -> TestResult {
     result(cases::early_m3_control::<Case>)
 }
@@ -71,6 +113,23 @@ kernel_test_in!(
 );
 impl cases::Fixture for Case {
     type Io = RadioIo;
+    fn rts_request(&self) -> Result<crate::rtw88::RtsRequest, Error> {
+        self.e.h.model(|io| io.rts_request())
+    }
+    fn stage_rts(
+        &self,
+        bytes: Vec<u8>,
+        cap: Cap<FirmwareBlob, Read>,
+        signed: bool,
+    ) -> Result<(), Error> {
+        self.e.h.model(|io| {
+            io.qualify_protection(crate::rtw88::protection::Source::Verified {
+                bytes,
+                cap,
+                signer: signed.then_some([17; 32]),
+            })
+        })
+    }
     fn tx_request(&self) -> Result<crate::rtw88::TxBaRequest, Error> {
         self.e.h.model(|io| io.tx_ba_request())
     }

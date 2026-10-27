@@ -315,6 +315,20 @@ pub(super) unsafe trait Io: Send {
     ) -> Result<Option<alloc::sync::Arc<super::tx_ba_power::Grant>>, Error> {
         Ok(None)
     }
+    fn station_protection_extension(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<super::protection::Grant>>, Error> {
+        Ok(None)
+    }
+    fn station_bind_protection(
+        &mut self,
+        _: alloc::sync::Arc<super::protection::Grant>,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_rts_request(&mut self) -> Result<super::RtsRequest, Error> {
+        Err(Error::Unsupported)
+    }
     fn station_bind_tx_ba(
         &mut self,
         _: alloc::sync::Arc<super::tx_ba_power::Grant>,
@@ -866,6 +880,23 @@ impl<I: Io> Owner<I> {
     }
     pub(super) fn tx_ba_request(&mut self) -> Result<super::TxBaRequest, Error> {
         self.io.station_tx_ba_request()
+    }
+    pub(super) fn rts_request(&mut self) -> Result<super::RtsRequest, Error> {
+        self.io.station_rts_request()
+    }
+    pub(super) fn station_rts_threshold(&self) -> Option<u32> {
+        self.station
+            .as_ref()
+            .and_then(super::station::State::rts_threshold)
+    }
+    pub(super) fn station_set_rts_threshold(
+        &mut self,
+        value: u32,
+    ) -> Result<(), super::station::Error> {
+        self.station
+            .as_mut()
+            .ok_or(super::station::Error::State)?
+            .set_rts_threshold(&mut self.io, value)
     }
     pub(super) fn operating_info8821c(&self) -> Option<super::operating8821c::Info> {
         matches!(

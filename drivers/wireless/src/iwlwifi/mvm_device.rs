@@ -47,10 +47,24 @@ impl Environment {
             }),
             nonce: Arc::new(super::security::fresh_nonce),
             power: Arc::new(|owner| {
-                let request = owner.station_power_request()?;
                 let authority = narf_firmware::trusted_loader_authority()
                     .and_then(|c| c.derive().ok())
                     .ok_or("MVM power loader authority unavailable")?;
+                if owner.nested_ba_offer() {
+                    let request = owner
+                        .transmit_power_request_for(super::mvm_boot::PowerEmission::Ht20NestedBa)?;
+                    match crate::firmware_asset::load(&authority, &request.name, 64, true) {
+                        Ok(source) => {
+                            owner.select_nested_power(&source, request.binding)?;
+                            return Ok((source, request.binding));
+                        }
+                        // Only an absent optional program retains tag3. A bad,
+                        // unsigned or revoked tag4 cannot silently downgrade.
+                        Err(narf_firmware::FirmwareError::NotFound) => {}
+                        Err(_) => return Err("MVM signed nested BA power source invalid"),
+                    }
+                }
+                let request = owner.station_power_request()?;
                 let source = crate::firmware_asset::load(&authority, &request.name, 64, true)
                     .map_err(|_| "MVM signed platform power source unavailable")?;
                 Ok((source, request.binding))
@@ -158,6 +172,18 @@ impl Device {
                 return Err("MVM native BA contract unavailable");
             }
             owner.transmit_power_request_for(super::mvm_boot::PowerEmission::Ht20Ba)
+        })
+    }
+    pub(super) async fn nested_ba_power_request(
+        &self,
+    ) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+        let mut state = self.state.lock().await;
+        self.source.invoke(|| {
+            let owner = state.owner.as_mut().ok_or("MVM native owner absent")?;
+            if !owner.supports_native_ba() {
+                return Err("MVM native nested BA contract unavailable");
+            }
+            owner.transmit_power_request_for(super::mvm_boot::PowerEmission::Ht20NestedBa)
         })
     }
     pub(super) async fn initialize(

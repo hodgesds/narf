@@ -15,6 +15,8 @@ mod active_scan_tests;
 #[path = "amsdu_rx_tests.rs"]
 mod amsdu_rx_tests;
 
+#[path = "dynamic_wmm_tests.rs"]
+mod dynamic_wmm_tests;
 #[path = "ht20_tests.rs"]
 mod ht20_tests;
 #[path = "ht40_tests.rs"]

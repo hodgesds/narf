@@ -548,6 +548,50 @@ kernel_test_in!(
     smoke_iwl_mvm_power_requires_signed_exact_platform_and_host_no_ir_intersection
 );
 
+fn smoke_mvm_nested_power_tag4_is_distinct_signed_and_identity_bound() -> TestResult {
+    (|| {
+        let requested = request(BINDING, [2; 6], Emission::Ht20NestedBa);
+        if requested.name != "iwlwifi/mvm-api77-ht20-siso-wmm-nested-ba-power-v4-020202020202.bin"
+            || requested.name == request(BINDING, [2; 6], Emission::Ht20Ba).name
+        {
+            return Err("nested qualification did not request a distinct program");
+        }
+        let mut bytes = record();
+        bytes[46] = 4;
+        let signed = source(&bytes, true)?;
+        if parse_for(copy(&signed), BINDING, [2; 6], 1, Emission::Ht20NestedBa).is_err()
+            || parse_for(copy(&signed), BINDING, [2; 6], 1, Emission::Ht20Ba).is_ok()
+            || parse_for(copy(&signed), [0; 32], [2; 6], 1, Emission::Ht20NestedBa).is_ok()
+        {
+            return Err("nested program tag/identity binding weakened");
+        }
+        bytes[46] = 3;
+        if parse_for(
+            source(&bytes, true)?,
+            BINDING,
+            [2; 6],
+            1,
+            Emission::Ht20NestedBa,
+        )
+        .is_ok()
+        {
+            return Err("tag3 measurement authorized nested program");
+        }
+        bytes[46] = 4;
+        let revoked = source(&bytes, true)?;
+        revoked.cap.revoke();
+        if parse_for(revoked, BINDING, [2; 6], 1, Emission::Ht20NestedBa).is_ok() {
+            return Err("revoked nested measurement authorized program");
+        }
+        Ok(())
+    })()
+    .map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/nested",
+    smoke_mvm_nested_power_tag4_is_distinct_signed_and_identity_bound
+);
+
 fn firmware_policy() -> Result<(), &'static str> {
     let source = source(&record(), true)?;
     for lar in [false, true] {

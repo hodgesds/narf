@@ -563,7 +563,7 @@ fn composition_body(
                 .ok()
                 .map(|aid| (bss, aid))
         });
-    let Some((_, aid)) = joined else {
+    let Some((bss, aid)) = joined else {
         put_session(session);
         return TestResult::Fail("scan/association did not complete");
     };
@@ -613,6 +613,27 @@ fn composition_body(
     {
         put_session(session);
         return TestResult::Fail("composed DHCP originator transaction did not complete");
+    }
+    if wmm {
+        // Exercise a real bound AP contention update with the negotiated
+        // PHY and BA owners still live, before the production DHCP exchange.
+        // Reuse the complete scan IE stream so a WMM-only change cannot hide
+        // a conflicting HT/VHT announcement.
+        let parameters = super::dynamic_wmm_tests::updated(2);
+        let beacon = super::dynamic_wmm_tests::beacon(&session, &bss, &parameters);
+        session.backend.packets.push_back(beacon);
+        let epoch = session.receive_epoch;
+        if session.receive_ethernet() != Ok(None)
+            || !session.data_controls_pending()
+            || run(session.service_keys()).is_err()
+            || session.wmm_pending.is_some()
+            || session.receive_current(epoch) != Ok(true)
+            || session.tx_ba.active() != ba_tx
+            || session.rx_ba.active(0) != ba_rx
+        {
+            put_session(session);
+            return TestResult::Fail("AP EDCA update lost the composed PHY/BA/controlled port");
+        }
     }
     put_session(session);
 

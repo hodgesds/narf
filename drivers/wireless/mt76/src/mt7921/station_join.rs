@@ -435,7 +435,8 @@ impl<B: Backend> Session<B> {
         !self.peer_lost
             && matches!(self.state, State::Associated { .. })
             && self.data_pending.is_empty()
-            && (!self.control_pending.is_empty()
+            && (self.wmm_pending.is_some()
+                || !self.control_pending.is_empty()
                 || self.rx_ba.pending(self.backend.now_ns())
                 || self.tx_ba.pending(self.backend.now_ns())
                 || self
@@ -527,6 +528,7 @@ impl<B: Backend> Session<B> {
         self.boot_started = None;
         if let Err(error) = result {
             self.wmm = None;
+            self.wmm_pending = None;
             self.station_permission = None;
             self.ht20_rx = None;
             self.ht20_profile = None;
@@ -704,7 +706,7 @@ impl<B: Backend> Session<B> {
                     return Err(Error::DeviceGone);
                 }
             }
-            if let Some(parameters) = self.wmm {
+            if let Some(parameters) = self.wmm_pending.or(self.wmm) {
                 if native.ccmp.is_none()
                     && matches!(header[0], 0x80 | 0x50)
                     && header[1] & 0xc7 == 0
@@ -712,19 +714,30 @@ impl<B: Backend> Session<B> {
                     && (header[4..10] == own || header[4..10] == [0xff; 6])
                     && header[10..16] == peer
                     && header[16..22] == peer
-                    && frame.get(36..).is_some_and(|ies| {
-                        crate::mt7921::association::wmm::Parameters::parse(ies)
-                            != Ok(Some(parameters))
-                    })
                 {
-                    // No asynchronous beacon-driven EDCA reconfiguration
-                    // owner exists yet. A changed/missing/malformed bound AP
-                    // parameter set closes the port until a fresh join.
-                    self.peer_lost = true;
-                    self.rx_ba.fence();
-                    self.tx_ba.fence();
-                    self.clear_aggregate_receive();
-                    return Err(Error::DeviceGone);
+                    match frame.get(36..).and_then(|ies| {
+                        crate::mt7921::association::wmm::Parameters::parse(ies)
+                            .ok()
+                            .flatten()
+                    }) {
+                        Some(updated) if updated == parameters => {}
+                        Some(updated) if !updated.same_set(parameters) => {
+                            // Copy the complete checked set, not an IE view.
+                            // This blocks new DATA immediately; existing native
+                            // tokens retain their original ownership until drain.
+                            self.wmm_pending = Some(updated);
+                        }
+                        _ => {
+                            // Missing/malformed parameters or changed rows with
+                            // an unchanged change counter cannot authorize TX.
+                            self.peer_lost = true;
+                            self.wmm_pending = None;
+                            self.rx_ba.fence();
+                            self.tx_ba.fence();
+                            self.clear_aggregate_receive();
+                            return Err(Error::DeviceGone);
+                        }
+                    }
                 }
             }
             if native.ccmp.is_none()
@@ -925,6 +938,7 @@ impl<B: Backend> Session<B> {
         self.security = None;
         self.station_permission = None;
         self.wmm = None;
+        self.wmm_pending = None;
         self.ht20_rx = None;
         self.ht20_profile = None;
         self.vht_profile = None;
@@ -950,7 +964,8 @@ impl<B: Backend> Session<B> {
         }
     }
     pub(super) fn data_controls_pending(&self) -> bool {
-        !self.control_pending.is_empty()
+        self.wmm_pending.is_some()
+            || !self.control_pending.is_empty()
             || self.rx_ba.pending(self.backend.now_ns())
             || self.tx_ba.pending(self.backend.now_ns())
             || self.security.as_ref().is_some_and(|s| !s.port_open())
@@ -1100,6 +1115,7 @@ impl<B: Backend> Session<B> {
         self.boot_started = Some(self.backend.now_ns());
         self.security = None;
         self.wmm = None;
+        self.wmm_pending = None;
         self.station_permission = Some(permission);
         let result = async {
             if setup {
@@ -1404,6 +1420,7 @@ impl<B: Backend> Session<B> {
             Err(error) => {
                 self.security = None;
                 self.wmm = None;
+                self.wmm_pending = None;
                 self.station_permission = None;
                 self.ht20_rx = None;
                 self.ht20_profile = None;
@@ -1430,6 +1447,7 @@ impl<B: Backend> Session<B> {
         self.boot_started = Some(self.backend.now_ns());
         let secure = self.security.take().is_some();
         let had_wmm = self.wmm.take().is_some();
+        self.wmm_pending = None;
         // Retire the host grant before the first wait. This local copy can
         // authorize only the closing deauth; a dropped waiter cannot leave a
         // reusable station permission in the retained running owner.
@@ -1525,6 +1543,7 @@ impl<B: Backend> Session<B> {
         if let Err(error) = result {
             self.station_permission = None;
             self.wmm = None;
+            self.wmm_pending = None;
             self.security = None;
             self.ht20_rx = None;
             self.ht20_profile = None;
@@ -1607,7 +1626,8 @@ impl<B: Backend> Session<B> {
     /// Advance recipient BA and declined requests under the retained control
     /// owner. Dropping this future cannot restore an associated producer.
     async fn service_control(&mut self) -> Result<(), Error> {
-        if self.control_pending.is_empty()
+        if self.wmm_pending.is_none()
+            && self.control_pending.is_empty()
             && !self.rx_ba.pending(self.backend.now_ns())
             && !self.tx_ba.pending(self.backend.now_ns())
             || !self.data_pending.is_empty()
@@ -1629,6 +1649,7 @@ impl<B: Backend> Session<B> {
         self.stage(Stage::StaRecord);
         self.boot_started = Some(self.backend.now_ns());
         let result = async {
+            self.service_wmm_update().await?;
             self.service_transmit_ba().await?;
             self.service_receive_ba(info.capabilities.mac, peer).await?;
             for _ in 0..4 {
@@ -1644,6 +1665,7 @@ impl<B: Backend> Session<B> {
         if let Err(error) = result {
             self.security = None;
             self.wmm = None;
+            self.wmm_pending = None;
             self.station_permission = None;
             self.ht20_profile = None;
             self.vht_profile = None;
@@ -1660,6 +1682,31 @@ impl<B: Backend> Session<B> {
             return Err(error);
         }
         self.state = associated;
+        Ok(())
+    }
+
+    /// Native SET_EDCA_PARMS is a no-reply command. Order it with Linux's
+    /// matching PSE read, preserving the current grant around both waits.
+    /// The caller already drained all native DATA tokens and moved the owner
+    /// out of Associated before its first await; cancellation leaves it closed.
+    async fn service_wmm_update(&mut self) -> Result<(), Error> {
+        let Some(parameters) = self.wmm_pending else {
+            return Ok(());
+        };
+        self.check_station_tx()?;
+        self.notify(
+            Command::Ce {
+                id: 0x1d,
+                query: false,
+            },
+            &parameters.edca(),
+        )
+        .await?;
+        self.check_station_tx()?;
+        self.confirm_command_progress().await?;
+        self.check_station_tx()?;
+        self.wmm = Some(parameters);
+        self.wmm_pending = None;
         Ok(())
     }
 

@@ -29,6 +29,9 @@ impl From<format::Error> for Error {
 /// cache maintenance and outer-shareable acquire order before buffer reads.
 /// Every possibly published mapping survives failure, cancellation and drop.
 pub(super) unsafe trait Port {
+    fn rts_threshold(&self) -> Option<u32> {
+        None
+    }
     fn originator_ba_allowed(&self) -> bool {
         false
     }
@@ -289,8 +292,11 @@ impl Core {
         if format::originator_control(frame) && !port.originator_ba_allowed() {
             return Err(Error::Access);
         }
-        let (descriptor, queue) =
+        let (mut descriptor, queue) =
             format::transmit_profile(frame, self.own, self.mac_id, sequence, self.data_profile)?;
+        if queue == Queue::Data && (!radio_report || frame[0] == 0x88) {
+            super::protection::descriptor(&mut descriptor, frame.len(), port.rts_threshold());
+        }
         let memory = self.frame.as_ref().ok_or(Error::State)?;
         let bd = format::buffer_descriptor(memory.dma_addr().raw(), frame.len())?;
         let id = self.next_id;

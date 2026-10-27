@@ -7,6 +7,7 @@
       "assets": [],
       "requirements": [
         "No external executable firmware: validate the actual device EEPROM/calibration, supported silicon and regulatory policy.",
+        "Optional AR9285 rev2 HT20 requires a signed, measured ath9k/ar9285-ht20-v1-<factory MAC lowercase hex>.bin N85H record. Recipient BA additionally requires ar9285-rxba-v1-<MAC>.bin N85B; sender BA requires ar9285-txba-v1-<MAC>.bin N85T bound to the exact H recipe. These dynamic per-device names are external qualification requirements, not fixed executable payloads checked by this catalog.",
         "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
       ]
     },
@@ -1089,7 +1090,7 @@
         }
       ],
       "requirements": [
-        "RTL8821CE retains its distinct factory identity, exact 0x8821 firmware and native inactive MAC/FIFO lifecycle. PHY/RF tables, calibration, board-power qualification and station admission remain software prerequisites; RTL8822CE tables and measured artifacts cannot substitute for this chip.",
+        "RTL8821CE's retained native station requires its own signed per-device IQK, operating-power and N21S station qualifications. Optional legacy-WMM, HT20, recipient BA, sender BA and RTS profiles require their distinct N21L/N21H/N21R/N21T/N21X measured records under rtw88/rtw8821ce-<profile>-v1-<factory MAC lowercase hex>.bin; request APIs supply the exact names and current recipe identities. RTL8822CE artifacts cannot substitute for this chip.",
         "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
       ]
     },
@@ -1107,6 +1108,7 @@
       ],
       "requirements": [
         "The retained RTL8822CE channel1/basic1Mbps Open/WPA2 station requires signed measured rtw88/rtw8822ce-cal-v2-<factory MAC lowercase hex>.bin covering calibration and autonomous response power; v1 does not qualify this profile. Physical qualification and other rtw88 chips remain open.",
+        "Optional legacy-WMM, HT20, recipient BA, sender BA and RTS additionally require distinct N22L/N22H/N22R/N22T/N22X measured records. The RTS request names rtw88/rtw8822ce-rts-v1-<factory MAC lowercase hex>.bin and binds the exact H, R or T program. Old profile records grant no broader RTS/BA authority; request APIs and the family specification define the complete source chain.",
         "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
       ]
     },

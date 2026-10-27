@@ -54,6 +54,9 @@ pub(super) enum Phase {
     Stopped,
 }
 pub(super) trait Port {
+    fn tx_ba_grant(&self) -> Option<alloc::sync::Arc<super::tx_ba::Grant>> {
+        None
+    }
     fn ht_grant(&self) -> Option<alloc::sync::Arc<super::ht::Grant>> {
         None
     }
@@ -202,6 +205,21 @@ struct Pending {
     original: Vec<u8>,
     dma: Vec<u8>,
 }
+struct PairPending {
+    slots: [usize; 2],
+    id: u64,
+    words: [[u32; WORDS]; 2],
+    originals: [Vec<u8>; 2],
+    dma: [Vec<u8>; 2],
+    seq: [u16; 2],
+    deadline: u64,
+}
+pub(super) struct PairDelivery {
+    pub id: u64,
+    pub originals: [Vec<u8>; 2],
+    pub acked: [bool; 2],
+    pub feedback: super::rates::Feedback,
+}
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Delivery {
     pub id: u64,
@@ -223,6 +241,7 @@ pub(super) struct Packet<P: Port> {
     serial: u64,
     next_tx: usize,
     pending: Option<Pending>,
+    pair: Option<PairPending>,
     head: usize,
     tail: usize,
     held: Option<usize>,
@@ -231,6 +250,7 @@ pub(super) struct Packet<P: Port> {
     slot_us: u32,
     edca: Option<u32>,
     ba: bool,
+    tx_ba: bool,
 }
 impl<P: Port> core::fmt::Debug for Packet<P> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -296,6 +316,7 @@ impl<P: Port> Packet<P> {
             serial: 0,
             next_tx: 0,
             pending: None,
+            pair: None,
             head: 0,
             tail: RX_DEPTH - 1,
             held: None,
@@ -304,6 +325,7 @@ impl<P: Port> Packet<P> {
             slot_us: 20,
             edca: None,
             ba: false,
+            tx_ba: false,
         })
     }
     pub(super) fn phase(&self) -> Phase {
@@ -330,6 +352,17 @@ impl<P: Port> Packet<P> {
                 .ok_or(Error::Access)?
                 .readback(&self.port)?;
         }
+        if self.tx_ba {
+            self.port
+                .tx_ba_grant()
+                .ok_or(Error::Access)?
+                .readback(&self.port)?;
+        }
+        if (self.ba || self.tx_ba)
+            && self.port.read(0x803c)? != 0x17 | if self.ba { 0x400 } else { 0 }
+        {
+            return Err(Error::Descriptor);
+        }
         self.port.access(self.phase != Phase::Prepared, || Ok(()))
     }
     pub(super) fn ht_grant(&self) -> Option<alloc::sync::Arc<super::ht::Grant>> {
@@ -337,6 +370,37 @@ impl<P: Port> Packet<P> {
     }
     pub(super) fn rx_ba_grant(&self) -> Option<alloc::sync::Arc<super::rx_ba::Grant>> {
         self.port.rx_ba_grant()
+    }
+    pub(super) fn tx_ba_grant(&self) -> Option<alloc::sync::Arc<super::tx_ba::Grant>> {
+        self.port.tx_ba_grant()
+    }
+    pub(super) fn enable_tx_ba(
+        &mut self,
+        grant: &alloc::sync::Arc<super::tx_ba::Grant>,
+    ) -> Result<(), Error> {
+        if self.phase != Phase::Running
+            || self.ht.is_none()
+            || self.pending.is_some()
+            || self.pair.is_some()
+            || self.tx_ba
+            || self
+                .port
+                .tx_ba_grant()
+                .is_none_or(|g| !alloc::sync::Arc::ptr_eq(&g, grant))
+        {
+            return Err(Error::State);
+        }
+        grant.check()?;
+        self.phase = Phase::Failed;
+        self.port.transmit_allowed()?;
+        let old = 0x17 | if self.ba { 0x400 } else { 0 };
+        if self.port.read(0x803c)? != old {
+            return Err(Error::Descriptor);
+        }
+        grant.readback(&self.port)?;
+        self.tx_ba = true;
+        self.phase = Phase::Running;
+        Ok(())
     }
     pub(super) fn enable_rx_ba(
         &mut self,
@@ -346,6 +410,7 @@ impl<P: Port> Packet<P> {
             || self.ht.is_none()
             || self.ba
             || self.pending.is_some()
+            || self.pair.is_some()
             || self
                 .port
                 .rx_ba_grant()
@@ -356,10 +421,11 @@ impl<P: Port> Packet<P> {
         grant.check()?;
         self.phase = Phase::Failed;
         self.port.transmit_allowed()?;
-        if self.port.read(0x803c)? != 0x17 {
+        let old = 0x17;
+        if self.port.read(0x803c)? != old {
             return Err(Error::Descriptor);
         }
-        self.port.write(0x803c, 0x417)?;
+        self.port.write(0x803c, old | 0x400)?;
         grant.readback(&self.port)?;
         self.ba = true;
         self.phase = Phase::Running;
@@ -509,6 +575,157 @@ impl<P: Port> Packet<P> {
             descriptor::transmit_ht(frame, local, address, mcs, basic, profile)
         })
     }
+    pub(super) fn submit_sender_action(
+        &mut self,
+        frame: &[u8],
+        basic: usize,
+    ) -> Result<u64, Error> {
+        if !self.tx_ba {
+            return Err(Error::State);
+        }
+        let local = self.local;
+        self.submit_inner(frame, |address| {
+            super::descriptor::transmit_sender_action(frame, local, address, basic)
+        })
+    }
+    pub(super) fn submit_bar(&mut self, frame: &[u8], basic: usize) -> Result<u64, Error> {
+        if !self.tx_ba {
+            return Err(Error::State);
+        }
+        let local = self.local;
+        self.submit_inner(frame, |address| {
+            super::descriptor::transmit_bar(frame, local, address, basic)
+        })
+    }
+    pub(super) fn submit_pair(
+        &mut self,
+        frames: &[Vec<u8>; 2],
+        mcs: u8,
+        basic: usize,
+        permit: super::tx_ba::PairPermit,
+    ) -> Result<u64, Error> {
+        if self.phase != Phase::Running || !self.tx_ba {
+            return Err(Error::State);
+        }
+        if self.pending.is_some() || self.pair.is_some() {
+            return Err(Error::Busy);
+        }
+        let storage = self.storage.as_ref().ok_or(Error::State)?;
+        let slots = [self.next_tx, (self.next_tx + 1) % TX_DEPTH];
+        let words = descriptor::transmit_pair(
+            [&frames[0], &frames[1]],
+            self.local,
+            descriptor::PairAddresses {
+                payloads: slots.map(|s| u64::from(storage.tx_bytes[s].address())),
+                tail: u64::from(storage.tx.address()) + (slots[1] * STRIDE) as u64,
+            },
+            mcs,
+            basic,
+            self.ht.ok_or(Error::State)?,
+            permit,
+        )
+        .map_err(|_| Error::Packet)?;
+        let dma = [
+            descriptor::dma_bytes(&frames[0]).map_err(|_| Error::Packet)?,
+            descriptor::dma_bytes(&frames[1]).map_err(|_| Error::Packet)?,
+        ];
+        let originals = frames.clone();
+        let id = self.serial.checked_add(1).ok_or(Error::State)?;
+        let deadline = self
+            .port
+            .now_us()
+            .checked_add(1_000_000)
+            .ok_or(Error::Timeout)?;
+        self.phase = Phase::Failed;
+        self.check_transmit()?;
+        if self.port.read(QTXE)? & 1 != 0 || self.port.read(QSTS)? & 3 != 0 {
+            return Err(Error::Descriptor);
+        }
+        self.port.access(true, || {
+            for i in 0..2 {
+                storage.tx_bytes[slots[i]].write_bytes(&dma[i])?;
+                storage.tx_bytes[slots[i]].sync();
+                storage.tx.put_words(slots[i], &words[i])?;
+            }
+            storage.tx.sync();
+            Ok(())
+        })?;
+        self.serial = id;
+        self.pair = Some(PairPending {
+            slots,
+            id,
+            words,
+            originals,
+            dma,
+            seq: permit.seq,
+            deadline,
+        });
+        let address = storage.tx.address() + (slots[0] * STRIDE) as u32;
+        self.port.write(QTXDP, address)?;
+        if self.port.read(QTXDP)? != address {
+            return Err(Error::Descriptor);
+        }
+        self.port.transmit_allowed()?;
+        self.port.write(QTXE, 1)?;
+        self.phase = Phase::Running;
+        Ok(id)
+    }
+    pub(super) fn pair_delivery(&mut self) -> Result<Option<PairDelivery>, Error> {
+        if self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        let Some(p) = self.pair.as_ref() else {
+            return Ok(None);
+        };
+        let storage = self.storage.as_ref().ok_or(Error::State)?;
+        self.phase = Phase::Failed;
+        self.check_transmit()?;
+        let result = self.port.access(true, || {
+            storage.tx.sync();
+            if storage
+                .tx
+                .word(p.slots[1] * STRIDE + descriptor::TX_DONE * 4)?
+                & 1
+                == 0
+            {
+                if self.port.now_us() >= p.deadline {
+                    return Err(Error::Timeout);
+                }
+                return Ok(None);
+            }
+            storage.tx.sync();
+            let words = [storage.tx.words(p.slots[0])?, storage.tx.words(p.slots[1])?];
+            for (i, w) in words.iter().enumerate() {
+                if w[..14] != p.words[i][..14] {
+                    return Err(Error::Descriptor);
+                }
+                storage.tx_bytes[p.slots[i]].sync();
+                if storage.tx_bytes[p.slots[i]].bytes(p.dma[i].len())? != p.dma[i] {
+                    return Err(Error::Descriptor);
+                }
+            }
+            if self.port.read(QTXE)? & 1 != 0 || self.port.read(QSTS)? & 3 != 0 {
+                if self.port.now_us() >= p.deadline {
+                    return Err(Error::Timeout);
+                }
+                return Ok(None);
+            }
+            let (acked, feedback) = descriptor::pair_status(&words[0], &words[1], p.seq)
+                .map_err(|_| Error::Descriptor)?;
+            Ok(Some(PairDelivery {
+                id: p.id,
+                originals: p.originals.clone(),
+                acked,
+                feedback,
+            }))
+        })?;
+        if result.is_some() {
+            self.pair = None;
+            self.next_tx = (self.next_tx + 2) % TX_DEPTH;
+        }
+        self.phase = Phase::Running;
+        Ok(result)
+    }
     fn submit_inner(
         &mut self,
         frame: &[u8],
@@ -517,7 +734,7 @@ impl<P: Port> Packet<P> {
         if self.phase != Phase::Running {
             return Err(Error::State);
         }
-        if self.pending.is_some() {
+        if self.pending.is_some() || self.pair.is_some() {
             return Err(Error::Busy);
         }
         let slot = self.next_tx;
@@ -595,8 +812,12 @@ impl<P: Port> Packet<P> {
             if words[..14] != pending.words[..14] {
                 return Err(Error::Descriptor);
             }
-            let result = descriptor::transmit_status(&words, pending.group)
-                .map_err(|_| Error::Descriptor)?;
+            let result = if pending.original.first() == Some(&0x84) {
+                descriptor::bar_status(&words, &pending.original)
+            } else {
+                descriptor::transmit_status(&words, pending.group)
+            }
+            .map_err(|_| Error::Descriptor)?;
             if result == TxStatus::Pending {
                 if self.port.now_us() >= pending.deadline {
                     return Err(Error::Timeout);

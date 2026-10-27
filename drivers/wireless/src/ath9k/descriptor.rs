@@ -168,7 +168,8 @@ pub(super) fn transmit_ht(
     profile: super::ht::Profile,
 ) -> Result<[u32; WORDS], Error> {
     if !(26..=MAX_MPDU).contains(&frame.len())
-        || frame[..2] != [0x88, if frame[1] & 0x40 != 0 { 0x41 } else { 1 }]
+        || frame[0] != 0x88
+        || frame[1] & !8 != if frame[1] & 0x40 != 0 { 0x41 } else { 1 }
         || frame[10..16] != local
         || local[0] & 1 != 0
         || local == [0; 6]
@@ -201,6 +202,146 @@ pub(super) fn transmit_ht(
     }
     Ok(words)
 }
+pub(super) fn transmit_sender_action(
+    frame: &[u8],
+    local: [u8; 6],
+    address: u64,
+    rate: usize,
+) -> Result<[u32; WORDS], Error> {
+    if !(30..=33).contains(&frame.len())
+        || frame[..2] != [0xd0, 0]
+        || frame[4] & 1 != 0
+        || frame[10..16] != local
+        || local[0] & 1 != 0
+        || local == [0; 6]
+        || frame[22] & 15 != 0
+        || !(frame.len() == 33
+            && frame[24..26] == [3, 0]
+            && frame[26] != 0
+            && u16::from_le_bytes([frame[27], frame[28]]) & 0x3f == 2
+            && (4..=64).contains(&(u16::from_le_bytes([frame[27], frame[28]]) >> 6))
+            && frame[29..31] == [0, 0]
+            && frame[31] & 15 == 0
+            || frame.len() == 30
+                && frame[24..26] == [3, 2]
+                && frame[26..28] == [0, 8]
+                && matches!(u16::from_le_bytes([frame[28], frame[29]]), 37 | 39))
+    {
+        return Err(Error::Profile);
+    }
+    encode_series(
+        frame.len(),
+        address,
+        Series::single(rate, false).ok_or(Error::Profile)?,
+        false,
+        false,
+    )
+}
+pub(super) fn transmit_bar(
+    frame: &[u8],
+    local: [u8; 6],
+    address: u64,
+    rate: usize,
+) -> Result<[u32; WORDS], Error> {
+    if frame.len() != 20
+        || frame[..2] != [0x84, 0]
+        || frame[4] & 1 != 0
+        || frame[10..16] != local
+        || local[0] & 1 != 0
+        || local == [0; 6]
+        || frame[16..18] != [4, 0]
+        || frame[18] & 15 != 0
+    {
+        return Err(Error::Profile);
+    }
+    encode_series(
+        20,
+        address,
+        Series::single(rate, false).ok_or(Error::Profile)?,
+        false,
+        false,
+    )
+}
+pub(super) struct PairAddresses {
+    pub payloads: [u64; 2],
+    pub tail: u64,
+}
+pub(super) fn transmit_pair(
+    frames: [&[u8]; 2],
+    local: [u8; 6],
+    addresses: PairAddresses,
+    mcs: u8,
+    basic: usize,
+    profile: super::ht::Profile,
+    permit: super::tx_ba::PairPermit,
+) -> Result<[[u32; WORDS]; 2], Error> {
+    if addresses.tail == 0 || addresses.tail & 3 != 0 || addresses.tail > u64::from(u32::MAX) {
+        return Err(Error::Address);
+    }
+    let mut first = transmit_ht(frames[0], local, addresses.payloads[0], mcs, basic, profile)?;
+    let encoded_last = transmit_ht(frames[1], local, addresses.payloads[1], mcs, basic, profile)?;
+    if frames
+        .iter()
+        .enumerate()
+        .any(|(i, f)| u16::from_le_bytes([f[22], f[23]]) >> 4 != permit.seq[i])
+    {
+        return Err(Error::Profile);
+    }
+    first[0] = addresses.tail as u32;
+    first[3] |= 0x6000_0000;
+    first[8] = permit.air as u32 | (u32::from(permit.delims) << 18);
+    first[6] = (36
+        + 4 * (8 * permit.air as u32 + 22)
+            .div_ceil([26, 52, 78, 104, 156, 208, 234, 260][usize::from(mcs)]))
+        | if profile.rts() { 0x8000 } else { 0 };
+    let mut last = [0; WORDS];
+    last[1] = encoded_last[1];
+    last[2] = encoded_last[2];
+    last[3] = encoded_last[3] | 0x4000_0000;
+    Ok([first, last])
+}
+pub(super) fn pair_status(
+    first: &[u32; WORDS],
+    tail: &[u32; WORDS],
+    seq: [u16; 2],
+) -> Result<([bool; 2], Feedback), Error> {
+    let mut status = *first;
+    status[14..].copy_from_slice(&tail[14..]);
+    let feedback = transmit_feedback(&status)?;
+    if tail[TX_DONE] & 1 == 0 {
+        return Err(Error::Status);
+    }
+    let txok = transmit_status(&status, false)? == TxStatus::Delivered;
+    let ba = tail[14] & (1 << 30) != 0;
+    if txok && !ba {
+        return Err(Error::Status);
+    } // Source STA deaf/mute/reset case.
+    if !txok || tail[TX_DONE] >> 28 != 0 {
+        return Ok(([false; 2], feedback));
+    }
+    let start = ((tail[TX_DONE] >> 1) & 4095) as u16;
+    let bitmap = u64::from(tail[17]) | (u64::from(tail[18]) << 32);
+    Ok((
+        seq.map(|s| {
+            let i = s.wrapping_sub(start) & 4095;
+            i < 64 && bitmap & (1u64 << i) != 0
+        }),
+        feedback,
+    ))
+}
+pub(super) fn bar_status(words: &[u32; WORDS], frame: &[u8]) -> Result<TxStatus, Error> {
+    let status = transmit_status(words, false)?;
+    if status == TxStatus::Delivered
+        && (frame.len() != 20
+            || words[14] & (1 << 30) == 0
+            || words[TX_DONE] >> 28 != 0
+            || ((words[TX_DONE] >> 1) & 4095)
+                != u32::from(u16::from_le_bytes([frame[18], frame[19]]) >> 4))
+    {
+        return Err(Error::Status);
+    }
+    Ok(status)
+}
 /// Native pad is transport-only: authenticate original bytes before this call.
 pub(super) fn dma_bytes(frame: &[u8]) -> Result<Vec<u8>, Error> {
     let qos = frame.first().is_some_and(|b| *b == 0x88);
@@ -226,7 +367,7 @@ fn encode_series(
     group: bool,
     ht: bool,
 ) -> Result<[u32; WORDS], Error> {
-    if !(24..=MAX_MPDU).contains(&length) {
+    if !(20..=MAX_MPDU).contains(&length) {
         return Err(Error::Length);
     }
     if address == 0
@@ -459,7 +600,8 @@ fn receive_inner(
         && aggregation == Aggregation::default()
     {
         let mut copy = Vec::new();
-        copy.try_reserve_exact(20).map_err(|_| Error::Length)?;
+        copy.try_reserve_exact(bytes.len())
+            .map_err(|_| Error::Length)?;
         copy.extend_from_slice(bytes);
         return Ok(Some(Mpdu {
             bytes: copy,

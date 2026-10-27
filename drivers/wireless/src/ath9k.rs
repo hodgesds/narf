@@ -22,11 +22,13 @@ mod phy;
 mod rates;
 mod rx_ba;
 mod station;
+mod tx_ba;
 pub use calibration::{Report as RadioCalibration, State as RadioState};
 pub use ht::Request as Ht20QualificationRequest;
 pub use identity::{BringUpError, Identity, EEPROM_4K_BYTES};
 pub use phy::Prepared as BasebandPrepared;
 pub use rx_ba::Request as RxBaQualificationRequest;
+pub use tx_ba::Request as TxBaQualificationRequest;
 
 const ATHEROS_PCI_VENDOR: u16 = 0x168c;
 const ATHEROS_AR9285_DEVICE: u16 = 0x002b;
@@ -46,6 +48,14 @@ pub struct Ath9k {
 }
 
 impl Ath9k {
+    /// Factual sender-BA qualification request; no emission or agreement grant.
+    pub fn tx_ba_qualification_request(&self) -> Result<TxBaQualificationRequest, BringUpError> {
+        self.station
+            .as_ref()
+            .and_then(|r| r.try_lock())
+            .and_then(|r| r.tx_ba_request())
+            .ok_or(BringUpError::BadState)
+    }
     /// Optional recipient-BA request from the same current HT source/owner.
     pub fn rx_ba_qualification_request(&self) -> Result<RxBaQualificationRequest, BringUpError> {
         self.station

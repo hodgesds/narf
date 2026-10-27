@@ -100,6 +100,7 @@ pub(super) enum Source {
 pub(super) struct Grant {
     base: Base,
     request: Request,
+    digest: [u8; 32],
     cap: Cap<FirmwareBlob, Read>,
     antenna: i16,
     ceiling: i16,
@@ -186,6 +187,11 @@ impl Grant {
         let g = Self {
             base,
             request,
+            digest: {
+                let mut hash = narf_crypto::sha256::Sha256::new();
+                hash.update(b);
+                hash.finalize()
+            },
             cap,
             antenna: signed(56),
             ceiling: signed(58),
@@ -217,6 +223,22 @@ impl Grant {
     }
     pub(super) fn limits(&self) -> (u16, u16) {
         (self.bytes, self.airtime)
+    }
+    pub(super) fn protection_identity(&self) -> ([u8; 32], [u8; 32]) {
+        (self.request.identity, self.digest)
+    }
+    pub(super) fn ht(&self) -> Arc<ht::Grant> {
+        self.base.ht()
+    }
+    pub(super) fn limit(&self) -> Result<i16, Error> {
+        Ok(self.base.limit()?.min(self.ceiling))
+    }
+    pub(super) fn within(&self, limit: i16) -> bool {
+        self.base.within(limit)
+            && self
+                .peaks
+                .iter()
+                .all(|&p| i32::from(p) + i32::from(self.antenna) <= i32::from(limit))
     }
     pub(super) fn invoke<T>(&self, op: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
         struct Live<'a, F>(&'a Grant, F);

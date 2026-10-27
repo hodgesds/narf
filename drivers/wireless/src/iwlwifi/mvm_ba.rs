@@ -2,8 +2,13 @@
 //! recipient agreements are host-owned ADD_STA48 BAIDs (Linux mvm/sta.c).
 use super::super::{boot_context::put16, scan_api};
 use super::{Owner, Phase};
-use alloc::{collections::VecDeque, vec::Vec};
+use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use core::sync::atomic::AtomicUsize;
 use narf_wireless::{reg::RegulatoryDomain, reorder::Reorder};
+
+#[path = "mvm_ba_bundle.rs"]
+mod bundle;
+use bundle::{Bundle, Partial, Raw};
 
 const TIDS: usize = 8;
 const WINDOW: u16 = 32;
@@ -17,12 +22,14 @@ struct Request {
     ssn: u16,
     timeout: u16,
     original_parameters: u16,
+    nested: bool,
 }
 struct Session {
     request: Request,
     baid: Option<u8>,
     active: bool,
-    reorder: Reorder<Vec<u8>>,
+    reorder: Reorder<Bundle>,
+    partial: Option<Partial>,
     last_rx: u64,
 }
 #[derive(Clone, Copy)]
@@ -34,10 +41,13 @@ enum Work {
 #[derive(Default)]
 pub(super) struct Context {
     pub selected: bool,
+    pub nested_selected: bool,
     pub tx_enabled: bool,
     sessions: Vec<Session>,
     work: VecDeque<Work>,
-    ready: VecDeque<Vec<u8>>,
+    ready: VecDeque<Bundle>,
+    draining: Option<Bundle>,
+    raw_bytes: Arc<AtomicUsize>,
 }
 fn now() -> u64 {
     narf_time::wall::cycles_to_ns(narf_time::now_cycles())
@@ -65,6 +75,21 @@ fn permission(enabled: bool) -> [u8; 48] {
     put16(&mut b, 2, if enabled { 0xfffe } else { 0xffff });
     b
 }
+fn response(request: Request, status: u16) -> [u8; 9] {
+    let mut body = super::super::aggregation::add_response(
+        request.token,
+        request.tid,
+        request.window,
+        request.timeout,
+        status,
+    );
+    // mac80211/agg-rx.c::ieee80211_send_addba_resp. Tag4 further
+    // restricts this local ability to an explicitly requesting originator.
+    if status == 0 && request.nested {
+        body[5] |= 1;
+    }
+    body
+}
 fn status(b: &[u8]) -> Result<u32, &'static str> {
     if b.len() != 4 {
         return Err("MVM BA station receipt extent");
@@ -81,22 +106,33 @@ impl Context {
     }
     pub fn clear_packets(&mut self) {
         self.ready.clear();
+        self.draining = None;
         for s in &mut self.sessions {
             s.reorder.clear();
+            s.partial = None;
             s.active = false;
         }
     }
+    pub fn cancel_incomplete(&mut self) {
+        for s in &mut self.sessions {
+            s.partial = None;
+        }
+    }
     pub fn pop(&mut self) -> Option<Vec<u8>> {
-        while let Some(bytes) = self.ready.pop_front() {
-            if scan_api::mpdu_gen2(&bytes).is_some_and(|m| {
+        loop {
+            if self.draining.as_ref().is_none_or(|b| b.0.is_empty()) {
+                self.draining = self.ready.pop_front();
+            }
+            let bundle = self.draining.as_mut()?;
+            let raw = bundle.0.pop_front()?;
+            if scan_api::mpdu_gen2(raw.bytes()).is_some_and(|m| {
                 self.sessions
                     .iter()
                     .any(|s| s.active && s.baid == Some(((m.reorder >> 24) & 127) as u8))
             }) {
-                return Some(bytes);
+                return Some(raw.into_bytes());
             }
         }
-        None
     }
     pub fn qos_policy(&self, qos: u8, reorder: u32) -> bool {
         qos & 15 < 8
@@ -110,7 +146,7 @@ impl Context {
                 _ => false,
             }
     }
-    fn append(&mut self, frames: Vec<Vec<u8>>) -> Result<(), &'static str> {
+    fn append(&mut self, frames: Vec<Bundle>) -> Result<(), &'static str> {
         if self.ready.len() + frames.len() > TIDS * usize::from(WINDOW) {
             return Err("MVM BA released packet bound");
         }
@@ -119,6 +155,7 @@ impl Context {
     }
     pub fn observe(&mut self, bytes: &[u8], local: [u8; 6]) -> Result<(), &'static str> {
         let Some(m) = scan_api::mpdu_gen2(bytes) else {
+            self.cancel_incomplete();
             return Ok(());
         };
         let baid = ((m.reorder >> 24) & 127) as u8;
@@ -136,23 +173,36 @@ impl Context {
             || f[4] & 1 != 0
             || f[4..10] != local
             || f[24] & 15 != s.request.tid
-            || f[24] & 0x90 != 0
+            || f[24] & 0x10 != 0
             || !matches!(f[24] & 0x60, 0 | 0x60)
             || f[25] != 0
-            || m.amsdu
+            || (f[24] & 0x80 != 0) != m.amsdu
+            || m.amsdu && !s.request.nested
             || m.reorder >> 31 != 0
             || f[22] & 15 != 0
         {
+            s.partial = None;
             return Ok(());
         }
         let sn = u16::from_le_bytes([f[22], f[23]]) >> 4;
         if sn != ((m.reorder >> 12) & 4095) as u16 {
+            s.partial = None;
             return Ok(());
         }
         let clock = now();
+        let raw = Raw::new(bytes, &self.raw_bytes)?;
+        let complete = if m.amsdu {
+            let Some(complete) = bundle::capture(&mut s.partial, &m, raw, clock) else {
+                return Ok(());
+            };
+            complete
+        } else {
+            s.partial = None;
+            Bundle::one(raw)
+        };
         let mut frames = s
             .reorder
-            .push(sn, clock, bytes.to_vec())
+            .push(sn, clock, complete)
             .map_err(|_| "MVM BA reorder insertion")?;
         frames.extend(
             s.reorder
@@ -160,6 +210,12 @@ impl Context {
                 .map_err(|_| "MVM BA NSSN")?,
         );
         s.last_rx = clock;
+        if s.partial
+            .as_ref()
+            .is_some_and(|p| p.passed(s.reorder.head().unwrap()))
+        {
+            s.partial = None;
+        }
         self.append(frames)
     }
     pub fn release(&mut self, command: u8, bytes: &[u8]) -> Result<(), &'static str> {
@@ -194,6 +250,12 @@ impl Context {
             .reorder
             .advance(nssn, now())
             .map_err(|_| "MVM BA release ordering")?;
+        if s.partial
+            .as_ref()
+            .is_some_and(|p| s.reorder.head().is_some_and(|head| p.passed(head)))
+        {
+            s.partial = None;
+        }
         self.append(frames)
     }
     pub fn tick(&mut self) -> Result<(), &'static str> {
@@ -203,7 +265,16 @@ impl Context {
             if !s.active {
                 continue;
             }
+            if s.partial.as_ref().is_some_and(|p| p.expired(clock)) {
+                s.partial = None;
+            }
             let frames = s.reorder.expire(clock).map_err(|_| "MVM BA hole expiry")?;
+            if s.partial
+                .as_ref()
+                .is_some_and(|p| p.passed(s.reorder.head().unwrap()))
+            {
+                s.partial = None;
+            }
             let expired = s.request.timeout != 0
                 && clock.saturating_sub(s.last_rx) >= u64::from(s.request.timeout) * 1_024_000;
             if expired {
@@ -216,6 +287,14 @@ impl Context {
     }
 }
 impl Owner {
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(in crate::iwlwifi) fn model_expire_ba_partials(&mut self) {
+        for s in &mut self.power.phy.ba.sessions {
+            if let Some(p) = &mut s.partial {
+                p.model_expire();
+            }
+        }
+    }
     pub(in crate::iwlwifi) fn supports_native_ba(&self) -> bool {
         self.supports_native_ht20()
             && self
@@ -229,11 +308,12 @@ impl Owner {
     pub(super) fn ba_qualified(&self) -> bool {
         self.power.phy.ba.selected
             && self.power.phy.negotiated.is_some_and(|p| p.ht)
-            && self
-                .power
-                .prepared
-                .as_ref()
-                .is_some_and(|p| p.emission == super::power::Emission::Ht20Ba)
+            && self.power.prepared.as_ref().is_some_and(|p| {
+                matches!(
+                    p.emission,
+                    super::power::Emission::Ht20Ba | super::power::Emission::Ht20NestedBa
+                )
+            })
     }
     pub(super) fn capture_ba_action(&mut self, body: &[u8]) -> bool {
         if !self.ba_qualified()
@@ -270,6 +350,7 @@ impl Owner {
                     ssn,
                     timeout,
                     original_parameters: u16::from_le_bytes([body[3], body[4]]),
+                    nested: ba.nested_selected && body[3] & 1 != 0,
                 };
                 if let Some(s) = ba.sessions.iter().find(|s| s.request.tid == tid) {
                     // Exact retransmission may reuse its response. A changed
@@ -291,6 +372,7 @@ impl Owner {
                         baid: None,
                         active: false,
                         reorder,
+                        partial: None,
                         last_rx: now(),
                     });
                     ba.work.push_back(Work::Add(request));
@@ -424,17 +506,7 @@ impl Owner {
                             if reply.len() == 4
                                 && u32::from_le_bytes(reply[..].try_into().unwrap()) & 255 == 4
                             {
-                                self.ba_management(
-                                    &super::super::aggregation::add_response(
-                                        request.token,
-                                        request.tid,
-                                        request.window,
-                                        request.timeout,
-                                        37,
-                                    ),
-                                    policy,
-                                )
-                                .await?;
+                                self.ba_management(&response(request, 37), policy).await?;
                                 self.power.phy.ba.sessions.remove(index);
                                 self.power.phy.ba.work.pop_front();
                                 continue;
@@ -455,17 +527,7 @@ impl Owner {
                             }
                             self.power.phy.ba.sessions[index].baid = Some(id);
                         }
-                        self.ba_management(
-                            &super::super::aggregation::add_response(
-                                request.token,
-                                request.tid,
-                                request.window,
-                                request.timeout,
-                                0,
-                            ),
-                            policy,
-                        )
-                        .await?;
+                        self.ba_management(&response(request, 0), policy).await?;
                         self.check_link_power(&policy()?)?;
                         self.power.phy.ba.sessions[index].active = true;
                     }
@@ -511,6 +573,8 @@ impl Owner {
             return Ok(());
         };
         self.power.phy.ba.sessions[index].active = false;
+        self.power.phy.ba.sessions[index].partial = None;
+        self.power.phy.ba.sessions[index].reorder.clear();
         if self.power.phy.ba.sessions[index].baid.is_some() {
             let reply = if let Some(p) = policy.as_deref_mut() {
                 self.qualified_link_command(1, 0x18, &remove(tid), p)
@@ -528,6 +592,7 @@ impl Owner {
         }
         self.power.phy.ba.sessions.remove(index);
         self.power.phy.ba.ready.clear();
+        self.power.phy.ba.draining = None;
         Ok(())
     }
     pub(super) async fn retire_ba(
@@ -564,6 +629,7 @@ impl Owner {
         }
         self.power.phy.ba.work.clear();
         self.power.phy.ba.ready.clear();
+        self.power.phy.ba.draining = None;
         Ok(())
     }
     pub(super) async fn enable_ba_tx(

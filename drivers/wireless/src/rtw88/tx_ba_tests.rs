@@ -12,7 +12,7 @@ use narf_firmware::FirmwareBlob;
 use narf_net::{Interface, TxMeta};
 use narf_wireless::WirelessNetIface;
 
-fn record<F: Fixture>(f: &F) -> Result<Vec<u8>, &'static str> {
+pub(super) fn record<F: Fixture>(f: &F) -> Result<Vec<u8>, &'static str> {
     let request = f.tx_request().map_err(|_| "T exact current H/R identity")?;
     let mut b = vec![0; 192];
     b[..4].copy_from_slice(if F::c21() { b"N21T" } else { b"N22T" });

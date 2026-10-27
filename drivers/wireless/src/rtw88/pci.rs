@@ -56,6 +56,19 @@ pub struct Rtw88Device {
 static IFNAME: IrqSafeSpinLock<&'static str> = IrqSafeSpinLock::new("");
 
 impl Rtw88Device {
+    /// Exact H/R/T native RTS emission-program measurement metadata. No grant.
+    pub async fn rts_request(&self) -> Result<super::RtsRequest, super::FirmwareError> {
+        if let Some(s) = &self.sibling {
+            s.lifecycle().rts_request().await
+        } else {
+            self.firmware
+                .as_ref()
+                .ok_or(super::FirmwareError::Unsupported)?
+                .lifecycle()
+                .rts_request()
+                .await
+        }
+    }
     /// Exact-H/optional-R originator BA emission measurement metadata. No grant.
     pub async fn tx_ba_request(&self) -> Result<super::TxBaRequest, super::FirmwareError> {
         if let Some(s) = &self.sibling {

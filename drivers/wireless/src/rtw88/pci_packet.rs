@@ -159,6 +159,11 @@ impl Native {
 // qualification. CPU and register accesses invoke its actual current cap;
 // original rings and every published payload stay retained on every exit.
 unsafe impl Port for Native {
+    fn rts_threshold(&self) -> Option<u32> {
+        self.packet_gate
+            .as_ref()
+            .and_then(crate::rtw88::power_policy::Gate::rts_threshold)
+    }
     fn originator_ba_allowed(&self) -> bool {
         self.packet_gate
             .as_ref()

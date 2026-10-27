@@ -429,6 +429,24 @@ pub async fn gen2_ba_transmit_power_request(
     device.ba_power_request().await
 }
 
+/// Metadata only for tag4 nested recipient A-MSDU-in-A-MPDU/control power.
+/// The optional record must be externally signed/measured for this identity.
+pub async fn gen2_nested_ba_transmit_power_request(
+) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+    let startup = NATIVE.lock().clone().ok_or("Intel native binding absent")?;
+    if startup.phase() != ProvisionState::Ready {
+        return Err("MVM native firmware not configured");
+    }
+    let device = startup
+        .state
+        .lock()
+        .await
+        .mvm
+        .clone()
+        .ok_or("native Intel binding is not Gen2")?;
+    device.nested_ba_power_request().await
+}
+
 #[cfg(feature = "kernel-test")]
 #[path = "bootstrap_tests.rs"]
 mod tests;

@@ -55,6 +55,13 @@ pub(super) trait Fixture: Sized {
         cap: Cap<FirmwareBlob, Read>,
     ) -> Result<(), firmware_transport::Error>;
     fn descriptors(&self) -> Vec<[u8; 48]>;
+    fn rts_request(&self) -> Result<super::RtsRequest, firmware_transport::Error>;
+    fn stage_rts(
+        &self,
+        bytes: Vec<u8>,
+        cap: Cap<FirmwareBlob, Read>,
+        signed: bool,
+    ) -> Result<(), firmware_transport::Error>;
 }
 pub(super) fn elements(sgi: bool) -> Vec<u8> {
     let mut b = vec![45, 26];

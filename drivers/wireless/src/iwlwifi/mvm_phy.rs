@@ -18,7 +18,9 @@ pub(super) struct Context {
 }
 impl Context {
     pub fn emission(&self) -> Emission {
-        if self.ba.selected {
+        if self.ba.nested_selected {
+            Emission::Ht20NestedBa
+        } else if self.ba.selected {
             Emission::Ht20Ba
         } else if self.offered.is_some() {
             Emission::Ht20
@@ -362,6 +364,32 @@ impl super::Owner {
         &mut self,
     ) -> Result<super::PowerRequest, &'static str> {
         self.transmit_power_request_for(self.power.phy.emission())
+    }
+    pub(in crate::iwlwifi) fn nested_ba_offer(&self) -> bool {
+        self.power.phy.ba.selected && self.supports_native_ba()
+    }
+    /// Selection requires the actual signed tag4 asset, not a caller feature
+    /// flag. Native BA/API4/TLC43 capability and the selected HT offer remain
+    /// prerequisites; station_join parses the same retained asset again.
+    pub(in crate::iwlwifi) fn select_nested_power(
+        &mut self,
+        source: &crate::firmware_asset::Asset,
+        binding: [u8; 32],
+    ) -> Result<(), &'static str> {
+        if self.phase != super::Phase::Configured
+            || !self.power.phy.ba.selected
+            || !self.supports_native_ba()
+        {
+            return Err("MVM nested BA requires selected native HT/BA profile");
+        }
+        super::power::validate_record(
+            source,
+            binding,
+            self.mac.ok_or("MVM nested BA MAC absent")?,
+            Emission::Ht20NestedBa,
+        )?;
+        self.power.phy.ba.nested_selected = true;
+        Ok(())
     }
     pub(in crate::iwlwifi) fn supports_native_ht20(&self) -> bool {
         self.nvm

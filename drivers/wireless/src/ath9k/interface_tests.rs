@@ -187,7 +187,7 @@ fn composition_inner(
     rates: Option<&[u8]>,
     ht: Option<u8>,
 ) -> TestResult {
-    composition_profile(protected, active, rates, ht, None, None)
+    composition_profile(protected, active, rates, ht, None, None, false)
 }
 fn composition_profile(
     protected: bool,
@@ -196,6 +196,7 @@ fn composition_profile(
     ht: Option<u8>,
     ba: Option<u8>,
     protection: Option<(u8, bool)>,
+    sender: bool,
 ) -> TestResult {
     let h = if let Some(mask) = ht {
         Harness::new_ht(protected, mask)
@@ -204,6 +205,9 @@ fn composition_profile(
     };
     if let Some(window) = ba {
         crate::ath9k::rx_ba::tests::qualify(&h.model, window);
+    }
+    if sender {
+        crate::ath9k::tx_ba::tests::qualify(&h.model, 64);
     }
     if let Some((mode, erp)) = protection {
         h.peer.lock().ht = Some(crate::ath9k::ht::tests::protection_elements(mode, erp));
@@ -307,6 +311,51 @@ fn composition_profile(
             || h.model.word(d + 36).unwrap() >> 20 & 255 != 0x1b
         {
             return TestResult::Fail("real DHCP/IP lost native RTS/CTS protection/control rate");
+        }
+    }
+    if sender {
+        let first = udp_ipv4(
+            AP,
+            h.plan.station,
+            h.plan.lease_ip,
+            h.plan.server_ip,
+            49201,
+            7,
+            b"native-first-burst-original",
+        );
+        let second = udp_ipv4(
+            AP,
+            h.plan.station,
+            h.plan.lease_ip,
+            h.plan.server_ip,
+            49202,
+            7,
+            b"native-second-burst-original",
+        );
+        if narf_net::iface::send_on(h.device.name(), &first).is_err()
+            || narf_net::iface::send_on(h.device.name(), &second).is_err()
+        {
+            return TestResult::Fail("real sender IPC burst admission");
+        }
+        h.pump();
+        let peer = h.peer.lock();
+        if peer.uplink.get(peer.uplink.len().saturating_sub(2)..) != Some(&[first, second][..])
+            || peer.tx_ba_requests.len() != 1
+        {
+            return TestResult::Fail(
+                "two original DMA packets missed real AP/DHCP/IP sender continuation",
+            );
+        }
+        drop(peer);
+        let Some((head, tail)) = h.model.last_pair.get() else {
+            return TestResult::Fail("kernel IP burst did not use actual two-descriptor aggregate");
+        };
+        if h.model.word(head) != Ok(tail)
+            || h.model.word(tail + 56).unwrap() & (1 << 30) == 0
+            || h.model.word(tail + 92).unwrap() & 1 == 0
+            || h.model.tx.get().is_some()
+        {
+            return TestResult::Fail("real kernel burst lacks tail BA/idle receipt");
         }
     }
     if tests::complete(h.device.disassociate()).is_err() || !h.closed() || h.model.master.get() {
@@ -1016,7 +1065,7 @@ fn smoke_ar9285_rx_ba_native_open_wpa2_kernel_dhcp_and_bidirectional_ip() -> Tes
     let _policy = crate::ath9k::ht::tests::Policy::install();
     for protected in [false, true] {
         if let failure @ TestResult::Fail(_) =
-            composition_profile(protected, false, None, Some(255), Some(64), None)
+            composition_profile(protected, false, None, Some(255), Some(64), None, false)
         {
             return failure;
         }
@@ -1031,9 +1080,15 @@ fn smoke_ar9285_ht20_native_mixed_bss_protection_kernel_dhcp_and_bidirectional_i
     let _policy = crate::ath9k::ht::tests::Policy::install();
     for protected in [false, true] {
         for ba in [None, Some(64)] {
-            if let failure @ TestResult::Fail(_) =
-                composition_profile(protected, false, None, Some(255), ba, Some((3, true)))
-            {
+            if let failure @ TestResult::Fail(_) = composition_profile(
+                protected,
+                false,
+                None,
+                Some(255),
+                ba,
+                Some((3, true)),
+                false,
+            ) {
                 return failure;
             }
         }
@@ -1043,6 +1098,24 @@ fn smoke_ar9285_ht20_native_mixed_bss_protection_kernel_dhcp_and_bidirectional_i
 kernel_test_in!(
     "drivers/wireless/ath9k/ht",
     smoke_ar9285_ht20_native_mixed_bss_protection_kernel_dhcp_and_bidirectional_ip
+);
+fn smoke_ar9285_tx_ba_native_open_wpa2_kernel_dhcp_ip_two_originals_and_recipient_coexistence(
+) -> TestResult {
+    let _policy = crate::ath9k::ht::tests::Policy::install();
+    for protected in [false, true] {
+        for recipient in [None, Some(64)] {
+            if let failure @ TestResult::Fail(_) =
+                composition_profile(protected, false, None, Some(255), recipient, None, true)
+            {
+                return failure;
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/tx-ba",
+    smoke_ar9285_tx_ba_native_open_wpa2_kernel_dhcp_ip_two_originals_and_recipient_coexistence
 );
 fn smoke_ar9285_native_ht_rx_ba_receive_runs_during_held_data_then_waits_for_rekey_receipt(
 ) -> TestResult {

@@ -38,6 +38,7 @@ pub(super) struct RadioIo {
     ht: Option<Arc<crate::rtw88::ht::Grant>>,
     rx_ba: Option<Arc<crate::rtw88::rx_ba_power::Grant>>,
     tx_ba: Option<Arc<crate::rtw88::tx_ba_power::Grant>>,
+    protection: Option<Arc<crate::rtw88::protection::Grant>>,
     pub(super) edca_writes: Arc<AtomicUsize>,
     pub(super) before_publication: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) clock: Arc<AtomicU64>,
@@ -76,6 +77,7 @@ impl RadioIo {
             ht: None,
             rx_ba: None,
             tx_ba: None,
+            protection: None,
             edca_writes: Arc::new(AtomicUsize::new(0)),
             before_publication: None,
             clock: Arc::new(AtomicU64::new(0)),
@@ -150,6 +152,25 @@ impl RadioIo {
     pub(super) fn tx_ba_request(&self) -> Result<crate::rtw88::TxBaRequest, Error> {
         crate::rtw88::tx_ba_power::request(&self.tx_base()?)
     }
+    pub(super) fn protection_base(&self) -> Result<crate::rtw88::protection::Base, Error> {
+        Ok(if let Some(t) = &self.tx_ba {
+            crate::rtw88::protection::Base::T(t.clone())
+        } else if let Some(r) = &self.rx_ba {
+            crate::rtw88::protection::Base::R(r.clone())
+        } else {
+            crate::rtw88::protection::Base::H(self.ht.as_ref().ok_or(Error::State)?.clone())
+        })
+    }
+    pub(super) fn rts_request(&self) -> Result<crate::rtw88::RtsRequest, Error> {
+        crate::rtw88::protection::request(&self.protection_base()?)
+    }
+    pub(super) fn qualify_protection(
+        &mut self,
+        s: crate::rtw88::protection::Source,
+    ) -> Result<(), Error> {
+        self.protection = Some(s.load(self.protection_base()?)?);
+        Ok(())
+    }
     pub(super) fn qualify_tx_ba(
         &mut self,
         s: crate::rtw88::tx_ba_power::Source,
@@ -188,6 +209,32 @@ impl RadioIo {
 // SAFETY: isolated same-owner register/receipt model. It never accesses a
 // physical device; every firmware/MAC stage uses the actual retained owner.
 unsafe impl Io for RadioIo {
+    fn station_rts_request(&mut self) -> Result<crate::rtw88::RtsRequest, Error> {
+        self.station_allowed()?;
+        self.rts_request()
+    }
+    fn station_protection_extension(
+        &mut self,
+    ) -> Result<Option<Arc<crate::rtw88::protection::Grant>>, Error> {
+        self.station_allowed()?;
+        Ok(self.protection.clone())
+    }
+    fn station_bind_protection(
+        &mut self,
+        g: Arc<crate::rtw88::protection::Grant>,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        let gate = self
+            .gate
+            .as_ref()
+            .ok_or(Error::State)?
+            .with_protection(g.clone())?;
+        let current = gate.clone();
+        self.packets.authority = Some(Arc::new(move || current.current().is_ok()));
+        self.packets.protection = Some(g);
+        self.gate = Some(gate);
+        Ok(())
+    }
     fn station_tx_ba_extension(
         &mut self,
     ) -> Result<Option<Arc<crate::rtw88::tx_ba_power::Grant>>, Error> {
@@ -297,7 +344,7 @@ unsafe impl Io for RadioIo {
             && self
                 .gate
                 .as_ref()
-                .is_some_and(crate::rtw88::power_policy::Gate::allows_tx_ba)
+                .is_some_and(|g| g.allows_tx_ba() || g.protection_grant().is_some())
         {
             if self.packets.controls.fifo_invalid.load(Ordering::Acquire) {
                 return Ok(u16::MAX);

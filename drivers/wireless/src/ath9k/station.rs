@@ -83,11 +83,20 @@ enum Kind {
     Decline,
     BaResponse(Option<u64>),
     Delba(u64),
+    TxRequest(u64),
+    TxRetry(u64, usize),
+    TxBar(u64),
+    TxDelba(u64),
 }
 struct Pending {
     id: u64,
     bytes: Vec<u8>,
     kind: Kind,
+    epoch: u64,
+}
+struct PairPending {
+    id: u64,
+    originals: [Vec<u8>; 2],
 }
 struct Entry {
     candidate: ObservedBss,
@@ -130,6 +139,10 @@ pub(super) struct Radio<P: Port, E: Environment> {
     delivered_reply: Option<Pending>,
     delivered_ba: Option<Pending>,
     ba: Option<super::rx_ba::Owner<Incoming>>,
+    tx_ba: Option<super::tx_ba::Owner>,
+    tx_ba_checked: bool,
+    pair_pending: Option<PairPending>,
+    tx_sequence: Option<u16>,
     initial_nonce: Option<[u8; 32]>,
     sequence: u16,
     qos_sequence: [u16; 16],
@@ -169,6 +182,10 @@ impl<P: Port, E: Environment> Radio<P, E> {
             delivered_reply: None,
             delivered_ba: None,
             ba: None,
+            tx_ba: None,
+            tx_ba_checked: false,
+            pair_pending: None,
+            tx_sequence: None,
             initial_nonce: None,
             sequence: 1,
             qos_sequence: [1; 16],
@@ -206,6 +223,8 @@ impl<P: Port, E: Environment> Radio<P, E> {
     }
     pub(super) fn ready(&self) -> bool {
         self.receive_open()
+            && self.pair_pending.is_none()
+            && self.tx_ba.as_ref().is_none_or(super::tx_ba::Owner::ready)
             && self.pending.is_none()
             && self.delivered_reply.is_none()
             && self.delivered_ba.is_none()
@@ -220,6 +239,12 @@ impl<P: Port, E: Environment> Radio<P, E> {
     pub(super) fn rx_ba_request(&self) -> Option<super::rx_ba::Request> {
         self.packet.ht_grant().map(|g| super::rx_ba::request(&g))
     }
+    pub(super) fn tx_ba_request(&self) -> Option<super::tx_ba::Request> {
+        self.packet.ht_grant().map(|g| super::tx_ba::request(&g))
+    }
+    pub(super) fn can_aggregate(&self) -> bool {
+        self.ready() && self.tx_ba.as_ref().is_some_and(super::tx_ba::Owner::paired)
+    }
     pub(super) fn current_receive(&self, epoch: u64) -> Result<bool, Error> {
         self.packet.check_transmit()?;
         Ok(self.epoch == epoch && self.receive_open())
@@ -232,6 +257,9 @@ impl<P: Port, E: Environment> Radio<P, E> {
         self.incoming.retain(|i| plaintext_eapol(i.frame.bytes()));
         if let Some(ba) = &mut self.ba {
             ba.key_epoch(self.last_now.saturating_mul(1_000_000))?;
+        }
+        if let (Some(ba), Some(next)) = (&mut self.tx_ba, self.tx_sequence) {
+            ba.key_epoch(next, self.last_now.saturating_mul(1_000_000))?;
         }
         Ok(())
     }
@@ -259,6 +287,9 @@ impl<P: Port, E: Environment> Radio<P, E> {
         self.incoming.clear();
         self.received.clear();
         if let Some(ba) = &mut self.ba {
+            ba.retire();
+        }
+        if let Some(ba) = &mut self.tx_ba {
             ba.retire();
         }
         self.epoch = self.epoch.saturating_add(1);
@@ -301,14 +332,21 @@ impl<P: Port, E: Environment> Radio<P, E> {
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::State);
         }
-        if self.pending.is_some() || self.delivered_reply.is_some() || self.delivered_ba.is_some() {
+        if self.pending.is_some()
+            || self.pair_pending.is_some()
+            || self.delivered_reply.is_some()
+            || self.delivered_ba.is_some()
+        {
             return Err(Error::Busy);
         }
-        if !matches!(kind, Kind::Security | Kind::Data) {
+        if !matches!(
+            kind,
+            Kind::Security | Kind::Data | Kind::TxRetry(..) | Kind::TxBar(_)
+        ) {
             bytes[22..24].copy_from_slice(&(self.sequence << 4).to_le_bytes());
             self.sequence = (self.sequence + 1) & 4095;
         }
-        let id = if kind == Kind::Data {
+        let id = if matches!(kind, Kind::Data | Kind::TxRetry(..)) {
             let control = self.rates.ok_or(Error::State)?;
             if let Some(mask) = self.ht {
                 self.packet
@@ -316,6 +354,12 @@ impl<P: Port, E: Environment> Radio<P, E> {
             } else {
                 self.packet.submit_rates(&bytes, control.series())?
             }
+        } else if matches!(kind, Kind::TxRequest(_) | Kind::TxDelba(_)) {
+            self.packet
+                .submit_sender_action(&bytes, self.rates.ok_or(Error::State)?.basic())?
+        } else if matches!(kind, Kind::TxBar(_)) {
+            self.packet
+                .submit_bar(&bytes, self.rates.ok_or(Error::State)?.basic())?
         } else if matches!(kind, Kind::Delba(_)) {
             self.packet
                 .submit_delba(&bytes, self.rates.ok_or(Error::State)?.basic())?
@@ -330,7 +374,12 @@ impl<P: Port, E: Environment> Radio<P, E> {
             };
             self.packet.submit(&bytes, rate)?
         };
-        self.pending = Some(Pending { id, bytes, kind });
+        self.pending = Some(Pending {
+            id,
+            bytes,
+            kind,
+            epoch: self.epoch,
+        });
         Ok(())
     }
     fn cache(&mut self, frame: &Mpdu, now: u64) -> Result<(), Error> {
@@ -427,6 +476,25 @@ impl<P: Port, E: Environment> Radio<P, E> {
             && (bytes[4..10] == self.own || bytes[4..10] == [255; 6])
     }
     fn delivery(&mut self) -> Result<(), Error> {
+        if let Some(p) = &self.pair_pending {
+            let Some(d) = self.packet.pair_delivery()? else {
+                return Ok(());
+            };
+            if d.id != p.id
+                || d.originals != p.originals
+                || !(12..20).contains(&d.feedback.rate)
+                || self
+                    .ht
+                    .is_none_or(|m| m & (1 << (d.feedback.rate - 12)) == 0)
+            {
+                return Err(Error::State);
+            }
+            if let Some(ba) = &mut self.tx_ba {
+                ba.pair_delivered(d.acked, self.last_now.saturating_mul(1_000_000), self.epoch)?;
+            }
+            self.pair_pending = None;
+            return Ok(());
+        }
         let Some(delivery) = self.packet.delivery()? else {
             return Ok(());
         };
@@ -434,10 +502,10 @@ impl<P: Port, E: Environment> Radio<P, E> {
         if pending.id != delivery.id || pending.bytes != delivery.bytes {
             return Err(Error::State);
         }
-        if !delivery.delivered && !matches!(pending.kind, Kind::Data) {
+        if !delivery.delivered && !matches!(pending.kind, Kind::Data | Kind::TxRetry(..)) {
             return Err(Error::State);
         }
-        if pending.kind == Kind::Data && self.ht.is_some() {
+        if matches!(pending.kind, Kind::Data | Kind::TxRetry(..)) && self.ht.is_some() {
             if delivery.feedback.rate < 12
                 || delivery.feedback.rate >= 20
                 || self
@@ -455,9 +523,35 @@ impl<P: Port, E: Environment> Radio<P, E> {
         {
             return Err(Error::State);
         }
+        if let Some(ba) = &mut self.tx_ba {
+            if let Kind::TxRetry(ticket, index) = pending.kind {
+                ba.retry_delivered(
+                    ticket,
+                    index,
+                    delivery.delivered,
+                    self.last_now.saturating_mul(1_000_000),
+                    self.epoch,
+                )?;
+            } else if pending.kind == Kind::Data {
+                ba.single_delivered(
+                    u16::from_le_bytes([pending.bytes[22], pending.bytes[23]]) >> 4,
+                    delivery.delivered,
+                    self.last_now.saturating_mul(1_000_000),
+                    self.epoch,
+                    pending.epoch,
+                )?;
+            }
+        }
         if pending.kind == Kind::Security {
             self.delivered_reply = Some(pending);
-        } else if matches!(pending.kind, Kind::BaResponse(_) | Kind::Delba(_)) {
+        } else if matches!(
+            pending.kind,
+            Kind::BaResponse(_)
+                | Kind::Delba(_)
+                | Kind::TxRequest(_)
+                | Kind::TxBar(_)
+                | Kind::TxDelba(_)
+        ) {
             self.delivered_ba = Some(pending);
         }
         Ok(())
@@ -495,6 +589,13 @@ impl<P: Port, E: Environment> Radio<P, E> {
                 }
                 self.cache(&frame, now)?;
                 let peer = self.peer.as_ref().map(|p| p.bss.bssid);
+                if let Some(peer) = peer {
+                    if let Some(ba) = &mut self.tx_ba {
+                        if ba.peer_delba(frame.bytes(), self.own, peer) {
+                            continue;
+                        }
+                    }
+                }
                 if let (Some(peer), Some(ba)) = (peer, &mut self.ba) {
                     if ba.delba(frame.bytes(), self.own, peer) {
                         continue;
@@ -608,6 +709,13 @@ impl<P: Port, E: Environment> Radio<P, E> {
                         .as_mut()
                         .ok_or(Error::State)?
                         .teardown_delivered(ticket)?;
+                } else if let Some(ba) = &mut self.tx_ba {
+                    match receipt.kind {
+                        Kind::TxRequest(t) => ba.request_delivered(t)?,
+                        Kind::TxBar(t) => ba.bar_delivered(t, self.epoch)?,
+                        Kind::TxDelba(t) => ba.delba_delivered(t),
+                        _ => {}
+                    }
                 }
             }
             if let Some(receipt) = self.delivered_reply.take() {
@@ -621,6 +729,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
         }
         if self.established
             && self.pending.is_none()
+            && self.pair_pending.is_none()
             && self.delivered_reply.is_none()
             && self.delivered_ba.is_none()
             && self
@@ -638,7 +747,10 @@ impl<P: Port, E: Environment> Radio<P, E> {
         }
         let receive_budget = self.incoming.len().min(64);
         for _ in 0..receive_budget {
-            if self.pending.as_ref().is_some_and(|p| p.kind != Kind::Data)
+            if self
+                .pending
+                .as_ref()
+                .is_some_and(|p| !matches!(p.kind, Kind::Data | Kind::TxRetry(..)))
                 || self.delivered_reply.is_some()
                 || self.delivered_ba.is_some()
                 || self
@@ -657,7 +769,11 @@ impl<P: Port, E: Environment> Radio<P, E> {
             else {
                 break;
             };
-            if self.pending.as_ref().is_some_and(|p| p.kind == Kind::Data)
+            if (self.pair_pending.is_some()
+                || self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|p| matches!(p.kind, Kind::Data | Kind::TxRetry(..))))
                 && frame.bytes().first() == Some(&0xd0)
             {
                 self.incoming.push_back(Incoming {
@@ -734,6 +850,17 @@ impl<P: Port, E: Environment> Radio<P, E> {
                         }
                     }
                     if self.ht.is_some() && admitted && self.receive_open() {
+                        if let Some(ba) = &mut self.tx_ba {
+                            if ba.response(
+                                frame.bytes(),
+                                self.own,
+                                self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
+                                now.saturating_mul(1_000_000),
+                                self.epoch,
+                            )? {
+                                continue;
+                            }
+                        }
                         if let Some(reply) = super::ht::decline(
                             frame.bytes(),
                             self.own,
@@ -876,7 +1003,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
                 _ => {}
             }
         }
-        if self.pending.is_none() && self.delivered_reply.is_none() {
+        if self.pending.is_none() && self.pair_pending.is_none() && self.delivered_reply.is_none() {
             if let Some(reply) = self
                 .security
                 .as_ref()
@@ -896,6 +1023,52 @@ impl<P: Port, E: Environment> Radio<P, E> {
             self.established = true;
             self.phase = Phase::Open;
             self.last_peer = now;
+        }
+        if self.receive_open()
+            && self.pending.is_none()
+            && self.pair_pending.is_none()
+            && self.delivered_reply.is_none()
+            && self.delivered_ba.is_none()
+        {
+            if !self.tx_ba_checked && self.ht.is_some() {
+                self.tx_ba_checked = true;
+                if let Some(grant) = self.packet.tx_ba_grant() {
+                    let plan = self.plan.as_ref().ok_or(Error::State)?;
+                    let owner = super::tx_ba::Owner::new(
+                        grant.clone(),
+                        plan.offered_phy().ok_or(Error::State)?,
+                        plan.negotiated_phy().ok_or(Error::State)?,
+                    )?;
+                    self.packet.enable_tx_ba(&grant)?;
+                    self.tx_ba = Some(owner);
+                }
+            }
+            if self.tx_ba.is_some() {
+                let next = if let Some(s) = &self.security {
+                    s.next_qos_sequence(0)?
+                } else {
+                    self.qos_sequence[0]
+                };
+                self.tx_sequence = Some(next);
+                let ba = self.tx_ba.as_mut().unwrap();
+                ba.progress_bar(now.saturating_mul(1_000_000))?;
+                if let Some(action) = ba.next(
+                    self.own,
+                    self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
+                    next,
+                    now.saturating_mul(1_000_000),
+                    self.epoch,
+                )? {
+                    use super::tx_ba::Action;
+                    let (bytes, kind) = match action {
+                        Action::Request(t, b) => (b, Kind::TxRequest(t)),
+                        Action::Retry(t, i, b) => (b, Kind::TxRetry(t, i)),
+                        Action::Bar(t, b) => (b, Kind::TxBar(t)),
+                        Action::Delba(t, b) => (b, Kind::TxDelba(t)),
+                    };
+                    self.transmit(bytes, kind)?;
+                }
+            }
         }
         if self.phase != Phase::Passive {
             let expired = if self.established {
@@ -1118,6 +1291,10 @@ impl<P: Port, E: Environment> Radio<P, E> {
             return Err(Error::Busy);
         }
         self.packet.check_transmit()?;
+        let native = self.native_data(frame)?;
+        self.transmit(native, Kind::Data)
+    }
+    fn native_data(&mut self, frame: &[u8]) -> Result<Vec<u8>, Error> {
         let peer = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
         let native = if let Some(security) = &mut self.security {
             if self.ht.is_some() {
@@ -1151,7 +1328,50 @@ impl<P: Port, E: Environment> Radio<P, E> {
             bytes.extend_from_slice(&frame[12..]);
             bytes
         };
-        self.transmit(native, Kind::Data)
+        if self.ht.is_some() {
+            self.tx_sequence =
+                Some(((u16::from_le_bytes([native[22], native[23]]) >> 4) + 1) & 4095);
+        }
+        Ok(native)
+    }
+    pub(super) fn send_pair(&mut self, a: &[u8], b: &[u8]) -> Result<(), Error> {
+        let result = {
+            let publication = self.publication.clone();
+            let _publication = publication.lock();
+            (|| {
+                if !self.can_aggregate() {
+                    return Err(Error::Busy);
+                }
+                self.packet.check_transmit()?;
+                if !admitted(a, self.own) || !admitted(b, self.own) {
+                    return Err(Error::Profile);
+                }
+                let frames = [self.native_data(a)?, self.native_data(b)?];
+                let mcs = 7 - self.ht.ok_or(Error::State)?.leading_zeros() as u8;
+                let peer = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                let ba = self.tx_ba.as_mut().ok_or(Error::State)?;
+                let permit = ba.permit([&frames[0], &frames[1]], self.own, peer, mcs)?;
+                ba.begin_pair(permit, frames.clone(), self.epoch)?;
+                let id = self.packet.submit_pair(
+                    &frames,
+                    mcs,
+                    self.rates.ok_or(Error::State)?.basic(),
+                    permit,
+                )?;
+                self.pair_pending = Some(PairPending {
+                    id,
+                    originals: frames,
+                });
+                Ok(())
+            })()
+        };
+        if result
+            .as_ref()
+            .is_err_and(|e| !matches!(e, Error::Busy | Error::Profile))
+        {
+            self.fail();
+        }
+        result
     }
 }
 pub(super) fn admitted(frame: &[u8], own: [u8; 6]) -> bool {

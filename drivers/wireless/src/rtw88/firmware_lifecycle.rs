@@ -116,6 +116,14 @@ impl<I: Io> Lifecycle<I> {
             .ok_or(Error::State)?
             .tx_ba_request()
     }
+    pub(super) async fn rts_request(&self) -> Result<super::RtsRequest, Error> {
+        self.retained
+            .lock()
+            .await
+            .as_mut()
+            .ok_or(Error::State)?
+            .rts_request()
+    }
     pub(super) async fn legacy_wmm_request(
         &self,
     ) -> Result<super::station_profile::Request, Error> {

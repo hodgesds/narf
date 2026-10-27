@@ -358,6 +358,25 @@ chip, source, qualification and remaining-feature contracts.
 These changes do not close the all-family feature
 ledger or establish physical acceptance.
 
+The following same-branch continuation passed the coordinated Wi-Fi suites:
+x86_64 2360 pass,0 fail,9 skip; aarch64 1890 pass,0 fail,3 skip, adding43 native
+smokes per architecture over `3fbdfa9c2`. Debug/release builds, strict
+production/test and exact CI feature-context Clippy, workspace formatting,
+provisioning diagnostics, both production boots and all four btrfs postflights
+passed. Intel Gen2 adds separately qualified nested RX A-MSDU-in-A-MPDU with
+whole-original bundle reorder before PN admission. C21/C22 add separately
+qualified native RTS threshold control with CCX/FIFO ownership and EAPOL
+exclusion. AR9285 adds qualified two-MPDU sender BA, exact native tail bitmap
+receipts, original ciphertext retries and BAR recovery through actual native
+TX status. MT76 retains valid AP WMM contention updates, pauses new DATA until
+old native tokens drain, and orders EDCA through its checked PSE read before
+resuming the existing peer/key/BA owners. Open/WPA2 DHCP/IP, cancellation,
+current authority and key transitions pass native Rust cases. Real measured
+qualification records, physical acceptance and the broader feature ledger
+remain open. Tokei15 measures4,767 net additional Rust code lines, including
+tests, across `drivers/wireless`, `wireless` and `verification/wifi-fixtures`;
+the total rises from364,095 to368,862. These counts are not a completion fraction.
+
 The preceding station power-save continuation added ordinary firmware station power save to the
 common CYW43439/BCM43602 owner. PM_FAST/PM_OFF and the default sleep-retention
 commands are serialized with station control; partial failure or cancellation

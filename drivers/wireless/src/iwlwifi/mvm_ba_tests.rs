@@ -1,6 +1,8 @@
 //! Actual retained Gen2 worker + TFH/RFH BA conversations; no caller receipt
 //! or decrypted flag substitutes for native DMA and the independent CCM/AP.
 use super::*;
+#[path = "mvm_nested_tests.rs"]
+mod nested_tests;
 fn fixture(protected: bool) -> Result<Harness, &'static str> {
     Harness::build_profile(protected, true, 3, 3, true)
 }

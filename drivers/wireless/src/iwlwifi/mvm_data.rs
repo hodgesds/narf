@@ -841,6 +841,7 @@ impl Owner {
         }
     }
     pub(super) fn clear_data_aggregate(&mut self) {
+        self.power.phy.ba.cancel_incomplete();
         if let Some(data) = self
             .power
             .prepared
@@ -851,6 +852,7 @@ impl Owner {
         }
     }
     pub(super) fn cancel_data_partial(&mut self) {
+        self.power.phy.ba.cancel_incomplete();
         if let Some(data) = self
             .power
             .prepared

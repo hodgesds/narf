@@ -17,6 +17,7 @@ pub(super) struct Native {
     ht: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::ht::Grant>>>,
     ht_facts: Option<super::ht::Facts>,
     ba: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::rx_ba::Grant>>>,
+    tx_ba: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::tx_ba::Grant>>>,
 }
 impl Native {
     /// # Safety
@@ -57,6 +58,7 @@ impl Native {
             ht: narf_lib::sync::IrqSafeSpinLock::new(None),
             ht_facts: None,
             ba: narf_lib::sync::IrqSafeSpinLock::new(None),
+            tx_ba: narf_lib::sync::IrqSafeSpinLock::new(None),
         })
     }
     pub(super) fn qualify_ht(&mut self, facts: super::ht::Facts) {
@@ -157,6 +159,16 @@ narf_kernel_test::kernel_test_in!(
     smoke_ar9285_native_packet_revocation_precedes_config_dma_and_mmio
 );
 impl Port for Native {
+    fn tx_ba_grant(&self) -> Option<alloc::sync::Arc<super::tx_ba::Grant>> {
+        if let Some(g) = self.tx_ba.lock().clone() {
+            return Some(g);
+        }
+        let grant = super::tx_ba::Source::Registered
+            .load(self.ht_grant()?)
+            .ok()?;
+        let mut retained = self.tx_ba.lock();
+        Some(retained.get_or_insert(grant).clone())
+    }
     fn rx_ba_grant(&self) -> Option<alloc::sync::Arc<super::rx_ba::Grant>> {
         if let Some(grant) = self.ba.lock().clone() {
             return Some(grant);
@@ -226,10 +238,16 @@ impl Port for Native {
             }
             let grant = { self.ht.lock().clone() };
             let ba = { self.ba.lock().clone() };
-            match (ba, grant) {
-                (Some(grant), _) => grant.invoke(operation),
-                (None, Some(grant)) => grant.invoke(operation),
+            let tx = { self.tx_ba.lock().clone() };
+            let operation = || match (ba, grant) {
+                (Some(g), _) => g.invoke(operation),
+                (None, Some(g)) => g.invoke(operation),
                 (None, None) => operation(),
+            };
+            if let Some(g) = tx {
+                g.invoke(operation)
+            } else {
+                operation()
             }
         })
     }

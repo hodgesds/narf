@@ -252,7 +252,25 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
             }
             if radio.ready() {
                 if let Some(frame) = state.pending.take() {
-                    radio.send(frame.payload())?;
+                    let mut second = None;
+                    if radio.can_aggregate() {
+                        for _ in 0..16 {
+                            let Ok(Some(next)) = state.tx.try_recv() else {
+                                break;
+                            };
+                            if station::admitted(next.payload(), self.own)
+                                && offloads(next.tx_meta())
+                            {
+                                second = Some(next);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(second) = second {
+                        radio.send_pair(frame.payload(), second.payload())?;
+                    } else {
+                        radio.send(frame.payload())?;
+                    }
                 }
             }
             if self.closed.load(Ordering::Acquire) {

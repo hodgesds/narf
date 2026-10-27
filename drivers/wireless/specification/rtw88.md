@@ -1,6 +1,6 @@
 # rtw88 — Specification
 
-> Status: **v1.5** (RTL8821CE retained firmware/MAC/PHY, separately signed IQK/parked-power/awake-station, legacy12/WMM, exact-chip HT20/SGI and separately qualified RX/TX Block Ack continuations; RTL8822CE retained firmware, MAC/PHY, bounded radio calibration,
+> Status: **v1.6** (RTL8821CE retained firmware/MAC/PHY, separately signed IQK/parked-power/awake-station, legacy12/WMM, exact-chip HT20/SGI, separately qualified RX/TX Block Ack and native RTS-threshold continuations; RTL8822CE retained firmware, MAC/PHY, bounded radio calibration,
 > signed operating-power qualification, native packets and channel1 station
 > integration; composed software gates and physical acceptance remain distinct).
 >
@@ -1253,6 +1253,102 @@ these software results establishes silicon or RF acceptance.
 Full AC/TID scheduling, TX A-MSDU, larger/native IRQ pipelines,
 wider PHY/channels, reset/rejoin and power management remain software work.
 
+### C21/C22 separately qualified native RTS threshold
+
+`Rtw88Device::rts_request().await -> Result<RtsRequest, FirmwareError>`
+returns exact current H/R/T source-program identity, factory MAC and the
+expected `rtw88/rtw882{1,2}ce-rts-v1-<mac>.bin` registry name. It grants no
+power or transmission permission. The optional X extension retains a concrete
+acyclic H, R-over-H or T-over-exact-H/R owner; the request binds every
+preceding recipe and full signed record digest, including the actual T
+retry/burst limits. H/R/T assets cannot themselves grant RTS.
+
+The real registry loader requires a signed128-byte N21X/N22X record. Missing,
+unsigned, malformed or restricted optional input before binding preserves
+the preceding non-RTS station. Actual attached-source or policy loss closes
+the owner and cannot be repaired by a later asset/policy reinstall. The
+minimum of current policy, X and every earlier grant bounds every emission;
+previous H data, R automatic-response and T retry/burst peaks must fit that
+same limit, with each record's own antenna bound. No measured real-board X
+asset is supplied.
+
+|Bytes|X record field|
+|---|---|
+|0..4|exact native chip `N21X` or `N22X`|
+|4..12|version1, header128, total128 (little endian)|
+|12..16|VID10ec, exact DIDc821/c822|
+|16..48|current H/R/T program request identity|
+|48..56|factory MAC, channel1, width20|
+|56..60|antenna upper bound and maximum EIRP:i16 quarter-dB units|
+|60..68|whole transition, native RTS, automatic-response and complete retry/control/burst conducted peaks:i16 quarter-dBm|
+|68..70|full static thermal range0..63|
+|70..72|smallest measured/admitted finite RTS threshold0..2347:u16|
+|72..128|reserved zero|
+
+The measurement contract covers actual RTS/CTS/retry/control/data transitions,
+burst duty, supply, antenna, coexistence and all static raw thermal values.
+It does not infer those quantities from HT gains or a single-MPDU measurement.
+T's existing DATA-PPDU byte/symbol/density limits remain in force when T is
+attached; the extra RTS/control emission envelope requires X independently.
+
+The existing `WirelessNetIface::{rts_threshold,set_rts_threshold}` API is
+implemented for this single live retained HT20 station only after actual
+X admission and negotiated support for source24Mbps RTS. The initial setting
+is disabled (`u32::MAX`), which does not change the original H/R/T emitting
+program. Finite settings must lie between the signed minimum and2347;
+`u32::MAX` disables. Invalid values return EINVAL, unqualified/unsupported
+requests return EOPNOTSUPP, and an occupied native/key/control owner or
+nonempty MAC FIFO returns EBUSY without changing the setting. Configuration
+never waits for another executor while holding an IRQ-safe lock. No additional
+vdev or reset/recovery continuation is implemented by this API.
+
+Before publishing a setting, the exact retained owner must have an open real
+controlled port, no pending DATA/security/BA operation, current H gains/crypto
+readbacks and source native BE/management FIFO emptiness. Its actual X/base
+capabilities enclose the atomic setting change. The value survives a genuine
+same-owner key replacement; it creates no key, peer or controlled-port right.
+The public cached value reports configuration, not transmission authority.
+
+Source `mac80211.c::rtw_ops_set_rts_threshold` and `tx.c` select RTS for eligible
+ordinary DATA only when the original MPDU length is strictly greater than the
+threshold. The native packet Core adds exact source W3 USE_RTS bit12,
+W4 RTSRATE[28:24]=8 (`DESC_RATE24M`) and W5 DATA_RTS_SHORT bit12 to that
+original's descriptor. It requires the bound response's actual24Mbps rate;
+mandatory HT capability alone is not substituted for that negotiated fact.
+The QoS header, sequence, plaintext/ciphertext and CCMP nonce/MIC are never
+rewritten. Management, BA controls and raw24 private M2/M4/group-key replies
+stay on their existing non-RTS source descriptors and legacy rate.
+
+Single RTS DATA requests genuine native CCX and requires its exact retained
+DMA bytes plus consumed PCI ownership and positive radio status. It then
+requires the actual source MAC FIFO drain before another DATA/control/key
+publication or threshold change. T's four-buffer path keeps each MPDU's
+same independent CCX/consumed-prefix/FIFO proofs and R's exact source BAR
+mode. A negative/duplicate/corrupt/missing receipt, invalid FIFO, bounded1s
+drain timeout, cancellation or current-source loss closes admission while
+retaining every possibly published native allocation. There is no fabricated
+RTS firmware acknowledgement or inferred returned BA bitmap.
+
+Twelve new native smokes are authored, six per chip: Open/WPA2 kernel DHCP/IP
+over X-on-H/R/T, literal descriptor flags and strict threshold boundaries,
+disable/old assets/unsigned and malformed input/retry, exact source identity
+and prior-peak intersections, absent24Mbps response support, held CCX and
+genuine group-key reply with RTS absent, native FIFO/corrupt/negative/cancel
+failures, every preceding/X source and current policy loss, and revocation
+between actual batch BDs with retained DMA. All twelve additive RTS cases passed
+on both architectures in the coordinated scoped Wi-Fi suites: x86_64
+2360 pass,0 fail,9 skip; aarch64 1890 pass,0 fail,3 skip. Production boots and
+all btrfs postflights were clean. Earlier RX/TX BA totals describe the preceding
+validated checkpoint. Native RTS/CTS execution and physical
+RF/interoperability acceptance still require real firmware/silicon and the
+external measured X asset.
+
+No CTS-to-self or new AP HT-protection mode is inferred from the source RTS
+path. Current width/stream/channel restrictions remain unchanged. Source
+`rtw_ops_can_aggregate_in_amsdu` explicitly declines TX A-MSDU on2.4GHz;
+this channel1 owner therefore does not add a TX A-MSDU producer. That source
+policy is not a claim that the silicon lacks broader-band A-MSDU capability.
+
 
 ## 4. Invariants
 
@@ -1339,6 +1435,7 @@ Remaining software ledger:
 | C21/C22 HT20/one stream/SGI20 | Distinct N21H/N22H static measured contracts/current source gates; source-native absolute/reference-difference MCS gains, typed original offer/request/response, actual RA/TXD/RXD, authenticated whole3839-byte A-MSDU, native ADDBA-decline/CCX and Open/WPA2 DHCP/IP. Real assets/physical acceptance remain external; richer PHY remains work |
 | C21/C22 recipient RX BA | Distinct exact-H N21R/N22R contract; actual bound ADDBA success/CCX/idle, explicit SSN, TIDs0..7/window<=64 with A-MSDU permission, source RAW/PHY admission, opaque originals before CCMP/PN, BAR20/DELBA/hole/TU timers and key/publication epochs implemented; native tests passed the coordinated x86_64/aarch64 software suites. Real measured assets/automatic BA/over-air acceptance remain external |
 | C21/C22 originator TX BA | Distinct exact-H or R-over-H N21T/N22T contract; bound on-air request/response/current SSN, genuine CCX/RX-idle/MAC-FIFO proof, four independent native DMA originals, source AGGEN/density/MAXAGG and per-MPDU status, current-SSN BAR20/DELBA/key drains implemented; native tests passed the coordinated x86_64/aarch64 software suites. Measured assets/real MAC aggregation and over-air behavior remain external |
+| C21/C22 RTS threshold | Separate N21X/N22X over exact current H/R/T; native24Mbps RTS descriptor/control program, actual response-rate admission, drained current-authority setting, CCX/immutable-DMA/FIFO completion and EAPOL exclusion implemented. Twelve native cases pass on both architectures; real measured X assets/RTS-CTS/physical acceptance remain external |
 | Port0 peer/AID/media/RA/default-port control | Implemented bounded source mailbox, long-slot initial MLME, same-owner station integration and close/cancel behavior |
 | Passive scan, authentication/association, WPA2 controlled port | Retained channel1 shared MLME/RSNA/CCMP through actual native DMA and CCX, including held/altered/cancelled M4 and queued peer-loss closure |
 | Native management/data TX, RX, completion and ring ownership | Implemented original rings, source descriptors, exact DMA plus CCX security receipt and current-authority publication |

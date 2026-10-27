@@ -1274,8 +1274,9 @@ admission and retain uncertain DMA instead of authorizing slot reuse.
 
 Recipient sessions cover TIDs0–7, up to32 MPDUs per TID, one RFH queue. A
 bound original ADDBA request supplies dialog, immediate policy, original SSN,
-window and timeout; the response clamps the window to32 and clears nested
-A-MSDU support. The owner reserves before native publication. ADD_STA48 uses
+window and timeout; the tag3 response clamps the window to32 and clears nested
+A-MSDU support. The separate tag4 continuation is defined in §3.24. The owner
+reserves before native publication. ADD_STA48 uses
 only ADD_BA_TID, TID@28, SSN@30 and window@44. Its exact status dword must
 report success, BAID_VALID and a unique allocated BAID<32. Explicit native
 BA-resource refusal earns a real negative response; malformed/uncertain
@@ -1296,13 +1297,13 @@ handle non-power-of-two sizes and4095→0. Native C3 and C2 station/TID/BAID/NSS
 receipts advance only the matching session; raw forwarded BAR is not applied
 again. A valid compressed BAR without an agreement earns actual reason38
 REQUIRE_SETUP DELBA. A100ms hole bound prevents indefinite buffering; negotiated
-idle timeout schedules genuine native removal and reason39 DELBA. Nested
-A-MSDU-in-A-MPDU remains unnegotiated/rejected without consuming PN. Standalone
+idle timeout schedules genuine native removal and reason39 DELBA. Under tag3,
+nested A-MSDU-in-A-MPDU remains unnegotiated/rejected without consuming PN. Standalone
 §3.18 A-MSDU keeps its separate complete-only deaggregation owner.
 
 Original QoS Ack Policy may be normal0, or BlockAck0x60 only for the exact
-active native BAID/TID agreement. EOSP, A-MSDU and other unsupported policies
-remain rejected. The downstream crypto/data parser checks the same original
+active native BAID/TID agreement. EOSP and other unsupported policies remain
+rejected; tag3 also rejects nested A-MSDU. The downstream crypto/data parser checks the same original
 header without rewriting it; a new native protected BlockAck-policy vector
 checks both successful delivery and foreign/unallocated-policy PN isolation.
 
@@ -1548,7 +1549,7 @@ each feature; a Linux chip name or helper structure does not grant a capability.
 
 | Profile | Implemented reachable software | Remaining software gates |
 |---|---|---|
-| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO, signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced same-peer/index reconnect restoration. | Active probes (scan firmware's emitter/power binding needs source proof); alternate ML BAID; nested RX A-MSDU-in-A-MPDU; other QoS AC/TID TX queues and TX A-MSDU; HT40/NSS2/VHT/HE/LDPC/STBC; PMF/WPA3; over-air deauthentication; persistent/cross-owner key history, PTK reuse and cross-peer/index GTK restore; recovery and runtime/system PM. AP/P2P, WoW/offloads and multiple RX/RSS remain unimplemented even where hardware supports them. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
+| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO, signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced same-peer/index reconnect restoration. Authored, execution pending: §3.24 tag4 negotiated unicast-local nested recipient A-MSDU-in-A-MPDU with complete bundles before sequence/PN ownership. | Active probes (scan firmware's emitter/power binding needs source proof); alternate ML BAID; group-addressed nested RX; other QoS AC/TID TX queues and TX A-MSDU; HT40/NSS2/VHT/HE/LDPC/STBC; PMF/WPA3; over-air deauthentication; persistent/cross-owner key history, PTK reuse and cross-peer/index GTK restore; recovery and runtime/system PM. AP/P2P, WoW/offloads and multiple RX/RSS remain unimplemented even where hardware supports them. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
 | AX210/AX211/AX411 and Bz/BE200 Gen3 transports | Context-v2, generation-selected completion layouts, firmware/PNVM/native boot and MLD helpers. Software-validated continuation: source-selected command-ID header0/explicit RLC2, receipt-fenced TVQM/BAID retirement, retained actual executable/PNVM/PCI authority and immutable DMA-copy receive/publication epochs. | Station admission remains dependent on the exact negotiated MAC/link/STA/TLC/key payload profile; no new payload profile is enabled by the header/source audit. Sc conversation tests do not establish another family's ABI, platform power/SAR program or hardware. Current live regulatory/power ownership and broader key-history/recovery/PM profiles remain separate. |
 | Sc c103/BE211 MLD station profile | Deferred retained native publication, actual station/management/data/Open-WPA2-SAE conversations, legacy/HT/VHT to80MHz, key/BA/reorder and userspace SME/port ownership in the existing profile. §§3.21–3.22 header/TVQM, positive BA response/RX-marker retirement, retained executable/PNVM/current-PCI publication and copy-time key epochs passed coordinated native tests on both architectures. | These source/epoch fences do not establish underlying RF quiescence or current live-regulatory/platform-power qualification. HE/EHT/6GHz and MLO,160/320MHz, AP/P2P, advanced offloads, broader key-history and runtime/system PM remain separate implementations and must not be inferred from single-link Sc fixtures. |
 | Other advertised PCI/firmware combinations | Identification/firmware selection where defined | No fallback admits an unknown command table, calibration profile, topology or PHY width. They need their exact source-backed authority/command/receipt/lifetime path. |
@@ -1559,6 +1560,93 @@ hardware-inapplicable to AX200/AX201; supported 6E/7 parts still require real
 band-qualified HE/security/power admission. Platform SAR/antenna measurements,
 firmware/board identity and silicon/RF acceptance are external inputs; they
 cannot be filled by software defaults or counted as completed code.
+
+### 3.24 Negotiated native Gen2 nested recipient aggregation
+
+This continuation is authored in Rust with15 registered native tests; execution
+and coordinated build gates are pending. It applies only to §3.19's exact
+API77 HT20/SISO/TLC_OFFLOAD43/Qu48 RX API4 profile with the legacy ADD_STA
+BAID path (BAID_ML_SUPPORT63 absent). It adds recipient A-MSDU-in-A-MPDU for
+TIDs0–7/window32, retaining the existing BE/TID0 firmware-managed TX pipeline.
+It enables no host-built TX A-MSDU, extra TX queue, wider PHY, additional NSS,
+alternate BAID layout or additional RFH queue.
+
+`gen2_nested_ba_transmit_power_request().await` returns provisioning metadata
+for `iwlwifi/mvm-api77-ht20-siso-wmm-nested-ba-power-v4-<MAC>.bin`, without
+measured limits. NIPW remains64 bytes/wire version1; byte46 must be emitting
+program tag4. Its exact new binding domain is
+`NARF Intel MVM API77 qualified HT20 SISO MCS0-7 SGI20 WMM-BE TID0 TX-BA pipeline8 RX-BA32 nested-AMSDU3839 control power v4`.
+All existing actual PCI/NVM/executable/SMBIOS inputs remain included. External
+qualification must cover the complete tag3 program plus the negotiated nested
+recipient/control behavior. Tag3 never authorizes it. The native loader first
+tries this distinct signed asset for a compatible HT/BA offer; only an actual
+NotFound retains the existing tag3 program. Unsigned, malformed, mismatched or
+revoked tag4 fails before native PHY/queue publication. No board measurement,
+SAR fallback or autonomous-emitter allowance is invented.
+
+The retained original ADDBA request must set the A-MSDU-permitted bit. The
+driver sets the corresponding positive response bit only under current tag4
+qualification, the checked API4/TLC43 profile and the actual peer request.
+The existing exact ADD_STA48 status/unique BAID receipt and actual terminal
+management-response TX receipt precede activation. Native resource refusal
+sends a negative response with that bit clear. Exact repeated requests retain
+the same permission and BAID; changed live agreements cannot replace them.
+Linux `mvm/mac80211.c` advertises SUPPORTS_AMSDU_IN_AMPDU and
+`net/mac80211/agg-rx.c::ieee80211_send_addba_resp` defines this response bit.
+The existing native recipient ADD_STA request is unchanged. TLC's `amsdu`
+field concerns TX A-MSDU and remains disabled; it is not an invented RX enable.
+
+`mvm_ba_bundle.rs` retains original API4 packets in a complete raw bundle per
+native TID/BAID before insertion into sequence reorder. A bundle requires an
+explicit index0 prefix, consecutive low7 indices through LAST, matching
+original SN/TID/FC/QoS/CCMP IV, at most128 subframes, at most3839 reconstructed
+A-MSDU bytes including original subheader/padding accounting, and a100ms
+partial deadline. Native recipient MPDUs remain FromDS/unicast to the local
+station, with source station/AP/channel/key/MIC/PHY/header facts checked before
+storage and again on release. Group-addressed nested subframes remain closed;
+this bounded profile supplies no inferred outer-unicast/PTK identity for them.
+
+Linux `mvm/rxmq.c::iwl_mvm_reorder` explicitly forbids trusting a non-LAST
+subframe's NSSN, which can already point past its not-yet-delivered suffix.
+Only a complete bundle enters the shared reorder owner seeded by the actual
+peer SSN; only LAST's NSSN can advance it. Other TIDs retain independent
+incomplete bundles. Native C2/C3 advances and hole expiry discard a partial
+whose SN has been passed. Missing/foreign/malformed suffixes, an invalid native
+MPDU envelope, index gaps, changed identities, expiry or excess extent never
+publish a prefix or commit its PN. Ordinary native packets use one-item bundles
+and retain the same response-bound BA/header semantics. A station-wide512KiB
+raw-copy budget covers incomplete, reordered and released bundles; duplicate,
+old, retirement and clear paths release accounting with the exact owned copy.
+An exceeded bound closes admission and retains uncertain native DMA.
+
+Released complete bundles feed the existing §3.18 complete-only deaggregation
+owner before host replay publication. It validates every original inner
+Ethernet/control/VLAN/source bound against a cloned replay state and commits
+only a fully valid aggregate, with no header normalization. Thus sequence
+reordering precedes deaggregation and PN admission, and every subframe of one
+authenticated MPDU can share exactly its PN without granting ordinary replay.
+Normal or live-session BlockAck QoS policies remain checked on original bytes.
+
+DELBA, key replacement, local close and terminal failure retain the existing
+queue/TX-permission/BAID removal/RX-marker order and current source/power/PCI/
+generation/key-epoch fences. Incomplete and reordered host copies cannot cross
+retirement or reopen IPC/stack admission. Cancelled or uncertain positive
+response/retirement waits stay with the retained native worker and DMA owner.
+No command ACK alone establishes RF quiescence or MAC/FIFO/key-retirement proof.
+
+The new `drivers/wireless/iwlwifi/gen2/nested` cases cover retained Open/WPA2
+DHCP/IP with the real native TX pipeline and close, all recipient TIDs and
+4095→0, non-LAST NSSN, independent interleaving, malformed native middle and
+suffix/inner-control rejection without PN consumption, tag3/peer-consent
+isolation,3839/3840-byte and128-subframe boundaries, timeout, rekey/DELBA/close,
+held positive-response ownership, current firmware/power/policy revocation,
+original BlockAck policy/duplicate dialogs, signed tag4 identity, and raw-budget
+release on reorder duplicate/drop. Expected packets and the independent AP's
+CCMP authentication remain native Rust. Physical firmware deaggregation,
+qualification, RF and external interoperability acceptance remain outstanding.
+All fifteen added native cases passed on both architectures in the coordinated
+Wi-Fi suites: x86_64 2360 pass,0 fail,9 skip; aarch64 1890 pass,0 fail,3 skip.
+Production boots and all btrfs postflights were clean; these are software totals.
 
 ## 4. References
 

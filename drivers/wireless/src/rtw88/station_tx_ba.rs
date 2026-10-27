@@ -2,6 +2,49 @@
 //! Same retained station's source BA/SSN/FIFO and native batch continuation.
 use super::*;
 impl State {
+    pub(in crate::rtw88) fn rts_threshold(&self) -> Option<u32> {
+        self.protection
+            .as_ref()
+            .filter(|_| self.data_profile.rates & (1 << 8) != 0)
+            .map(|g| g.threshold())
+    }
+    pub(in crate::rtw88) fn set_rts_threshold(
+        &mut self,
+        io: &mut impl Io,
+        value: u32,
+    ) -> Result<(), Error> {
+        let admission = self.admission.clone();
+        let result = admission
+            .run(|| {
+                io.station_allowed()?;
+                Ok((|| {
+                    let g = self.protection.as_ref().ok_or(Error::Profile)?;
+                    if !self.ready() || !io.packet_ready() {
+                        return Err(Error::Busy);
+                    }
+                    let c21 = self.ht.as_ref().ok_or(Error::State)?.rx_ba_identity().2 == 0xc821;
+                    if !super::super::tx_ba::fifo_empty(io, c21)? {
+                        return Err(Error::Busy);
+                    }
+                    io.station_profile_readback()?;
+                    g.set(value, self.data_profile.rates)?;
+                    Ok(())
+                })())
+            })
+            .map_err(Error::Native)
+            .and_then(|r| r);
+        if result.as_ref().is_err_and(|e| {
+            !matches!(
+                e,
+                Error::Busy
+                    | Error::Profile
+                    | Error::Native(firmware_transport::Error::Unsupported)
+            )
+        }) {
+            self.fail(io);
+        }
+        result
+    }
     fn next_qos(&self) -> Result<u16, Error> {
         if !self.receive_open() {
             return Err(Error::State);
@@ -17,13 +60,21 @@ impl State {
         now: u64,
         idle: bool,
     ) -> Result<(), Error> {
-        let Some(g) = self.tx_ba_grant.clone() else {
+        let grant = self.tx_ba_grant.clone();
+        if grant.is_none() && self.data_drain.is_none() {
             return Ok(());
-        };
+        }
         let ap = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
         let c21 = self.ht.as_ref().ok_or(Error::State)?.rx_ba_identity().2 == 0xc821;
-        self.tx_ba.tick(now, self.own, ap);
-        let quiet = self.data_pending.is_empty() && super::super::tx_ba::fifo_empty(io, c21)?;
+        if grant.is_some() {
+            self.tx_ba.tick(now, self.own, ap);
+        }
+        // Single RTS DATA has the same actual CCX plus MAC drain contract as
+        // a T burst. A pending native control/data slot is never quiet.
+        let quiet = self.pending.is_none()
+            && self.delivered_reply.is_none()
+            && self.data_pending.is_empty()
+            && super::super::tx_ba::fifo_empty(io, c21)?;
         if let Some(start) = self.data_drain {
             if quiet {
                 self.data_drain = None;
@@ -35,6 +86,9 @@ impl State {
                 return Err(Error::Timeout);
             }
         }
+        let Some(g) = grant else {
+            return Ok(());
+        };
         if self.pending.is_some() || !quiet || self.data_drain.is_some() {
             return Ok(());
         }

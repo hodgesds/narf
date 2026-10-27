@@ -49,8 +49,26 @@ hardware ACK/CTS power. The older v1 artifact cannot grant this station profile.
 The family specifications describe the exact factory, firmware and profile binding.
 
 RTL8821CE additionally has its own `rtw88/rtw8821c_fw.bin` provisioning entry.
-Its retained factory/firmware/inactive-MAC continuation does not authorize RF
-or station operation; those require its own PHY/calibration/board-power path.
+Its implemented station path requires the exact C21 IQK, operating-power and
+N21S station qualifications; C22 firmware/tables/measurements cannot substitute.
+C21/C22 optional legacy-WMM, HT20, recipient BA and sender BA retain separate
+L/H/R/T records. Configurable RTS adds a distinct signed X record, requested as
+`rtw88/rtw8821ce-rts-v1-<mac>.bin` or
+`rtw88/rtw8822ce-rts-v1-<mac>.bin`, bound to the exact H, R or T source program.
+Older measured records cannot enable the extension. The current request APIs
+and family specification define the names and recipe identities.
+
+AR9285 uses on-device EEPROM rather than external executable firmware. Its
+optional HT20, recipient BA and sender BA profiles nevertheless require
+separate signed measured N85H/N85B/N85T records named
+`ath9k/ar9285-ht20-v1-<mac>.bin`, `ath9k/ar9285-rxba-v1-<mac>.bin` and
+`ath9k/ar9285-txba-v1-<mac>.bin`. The sender record binds the exact H recipe.
+Intel's optional API77 Gen2 nested recipient aggregation similarly requests
+`iwlwifi/mvm-api77-ht20-siso-wmm-nested-ba-power-v4-<mac>.bin`; emission tags1–3
+do not qualify tag4's changed program. All `<mac>` names use the actual factory
+MAC as twelve lowercase hex digits. These device-specific assets are external
+measurement/signing inputs; the fixed-name payload audit cannot establish
+their presence or qualification, and the repository supplies no such binaries.
 
 RTL8852B's initial2T2R profile requires both the current basic
 `rtw89/rtw8852b-cal-v1-<12 lowercase MAC hex digits>.bin` and full

@@ -86,6 +86,7 @@ enum Kind {
     Association,
     Security,
     Data,
+    RtsData,
     Decline,
     Ba,
     TxBa,
@@ -121,6 +122,7 @@ pub(super) struct State {
     rx_ba_grant: Option<Arc<super::rx_ba_power::Grant>>,
     rx_ba: super::rx_ba::Table,
     tx_ba_grant: Option<Arc<super::tx_ba_power::Grant>>,
+    protection: Option<Arc<super::protection::Grant>>,
     tx_ba: super::tx_ba::Originator,
     tx_config: Option<super::packet_format::Aggregation>,
     data_pending: VecDeque<Pending>,
@@ -173,6 +175,7 @@ impl State {
             rx_ba_grant: None,
             rx_ba: super::rx_ba::Table::new(),
             tx_ba_grant: None,
+            protection: None,
             tx_ba: super::tx_ba::Originator::new(),
             tx_config: None,
             data_pending: VecDeque::new(),
@@ -344,7 +347,7 @@ impl State {
         {
             return Err(Error::Busy);
         }
-        if !matches!(kind, Kind::Security | Kind::Data) && bytes.len() != 20 {
+        if !matches!(kind, Kind::Security | Kind::Data | Kind::RtsData) && bytes.len() != 20 {
             bytes[22..24].copy_from_slice(&(self.sequence << 4).to_le_bytes());
             self.sequence = (self.sequence + 1) & 4095;
         }
@@ -1098,6 +1101,11 @@ impl State {
                 super::tx_ba::program(io)?;
                 self.tx_ba_grant = Some(g);
             }
+            if let Some(g) = io.station_protection_extension()? {
+                self.admission
+                    .run(|| io.station_bind_protection(g.clone()))?;
+                self.protection = Some(g);
+            }
             self.ht = Some(h);
         }
         station_control::prepare_peer(io, bssid, &self.admission).await?;
@@ -1194,7 +1202,15 @@ impl State {
             bytes.extend_from_slice(&frame[12..]);
             bytes
         };
-        self.transmit(io, native, Kind::Data)
+        let rts = self
+            .protection
+            .as_ref()
+            .is_some_and(|g| native.len() as u64 > u64::from(g.threshold()));
+        self.transmit(io, native, if rts { Kind::RtsData } else { Kind::Data })?;
+        if rts {
+            self.data_drain = Some(self.now()?);
+        }
+        Ok(())
     }
 }
 #[path = "station_tx_ba.rs"]
