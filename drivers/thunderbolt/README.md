@@ -42,9 +42,12 @@ submission and rolled back in reverse on failure, and existing
 firmware-enabled tunnels are preserved rather than claimed. Reporting a
 tunnel is not a claim that a monitor has trained or that scanout is live.
 
-Out of scope: XDomain tunneling, the legacy ICM protocol itself
-(firmware-CM hosts are detected and stood aside from, never driven), and tunnel suspend/replay — consequently system suspend is
-refused while a native CM is running. Detach removes the affected
+Out of scope: XDomain tunneling and the legacy ICM protocol itself
+(firmware-CM hosts are detected and stood aside from, never driven).
+Tunnel suspend/replay is implemented: system suspend
+latches a quiesce, the CM drains live paths and records them, and
+resume replays the records against the re-scanned topology.
+Detach removes the affected
 router subtree before rediscovery. Discovery registers at Device-stage
 init and the per-controller CM task starts at Late-stage init. The crate
 is `no_std`.

@@ -35,6 +35,7 @@ fn usb4_cm_pm_state_checked_fanout() -> TestResult {
     // of this fixture the device-PM registry holds only the CM.
     narf_power::device_pm::__reset_for_test();
     tunnel::__reset_orphaned_for_test();
+    tunnel::__reset_pm_for_test();
     tunnel::forget_domain(u32::MAX);
 
     // Production registration, as `runtime::start` performs it.
@@ -52,9 +53,13 @@ fn usb4_cm_pm_state_checked_fanout() -> TestResult {
     }
 
     // Phase 2 — live tunnels, activated and published through the
-    // production reconcile path (USB3 + DisplayPort): the fan-out
-    // is refused, attributed to the CM as Busy, and the
-    // orchestrator's resume rollback still observes a clean resume.
+    // production reconcile path (USB3 + DisplayPort): the first
+    // fan-out latches a quiesce request and is refused, attributed
+    // to the CM as Busy (#1035). The CM service pass — driven here
+    // exactly as `topology::run` drives it — drains the paths
+    // through the journaled teardown and records them for replay;
+    // the retried fan-out then proceeds, and resume replays the
+    // paths back to live.
     let (domain, mut model) = tunnel::tests::model();
     let mut tunnels = Vec::new();
     if narf_scheduler::block_on_spin(tunnel::reconcile(&mut model, &domain, &mut tunnels, 3))
@@ -68,10 +73,40 @@ fn usb4_cm_pm_state_checked_fanout() -> TestResult {
     }
     let report = suspend_all_devices();
     if report.ok() || cm_outcome(&report) != Some(Err(DeviceSuspendError::Busy)) {
-        return TestResult::Fail("live tunnels did not veto suspend as Busy");
+        return TestResult::Fail("live tunnels did not latch a quiesce as Busy");
+    }
+    if tunnel::live_tunnel_count() != 2 || !tunnel::suspended_tunnels().is_empty() {
+        return TestResult::Fail("quiesce ran before the CM service pass");
+    }
+    if narf_scheduler::block_on_spin(tunnel::service_pm_suspend(
+        &mut model,
+        &domain,
+        &mut tunnels,
+    ))
+    .is_err()
+        || !tunnels.is_empty()
+        || tunnel::live_tunnel_count() != 0
+        || tunnel::suspended_tunnels().len() != 2
+    {
+        return TestResult::Fail("CM quiesce did not drain and record live tunnels");
+    }
+    let report = suspend_all_devices();
+    if !report.ok() || cm_outcome(&report) != Some(Ok(())) {
+        return TestResult::Fail("quiesced CM still vetoed suspend");
     }
     if !resume_all_devices().ok() {
-        return TestResult::Fail("resume rollback failed with live tunnels");
+        return TestResult::Fail("resume fan-out failed with quiesced tunnels");
+    }
+    if narf_scheduler::block_on_spin(tunnel::service_pm_resume(&mut model, &domain, &mut tunnels))
+        .is_err()
+        || tunnels.len() != 2
+        || tunnel::live_tunnel_count() != 2
+        || !tunnel::suspended_tunnels().is_empty()
+    {
+        return TestResult::Fail("resume did not replay quiesced tunnels");
+    }
+    if !resume_all_devices().ok() {
+        return TestResult::Fail("resume fan-out failed after replay");
     }
 
     // Phase 3 — tunnels torn down (an unmanaged reconcile pass
@@ -134,6 +169,7 @@ fn usb4_cm_pm_state_checked_fanout() -> TestResult {
     // Hygiene: leave every registry as the fixture found it.
     tunnel::forget_domain(u32::MAX);
     tunnel::__reset_orphaned_for_test();
+    tunnel::__reset_pm_for_test();
     narf_power::device_pm::__reset_for_test();
     TestResult::Pass
 }

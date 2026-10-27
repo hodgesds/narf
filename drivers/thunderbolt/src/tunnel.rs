@@ -125,6 +125,327 @@ pub fn __reset_orphaned_for_test() {
     ORPHANED_PATH_DOMAINS.lock().clear();
 }
 
+// ── Tunnel suspend / resume replay (#1035) ──────────────────────
+//
+// The device-PM handlers (`pm.rs`) run on the boot CPU with
+// interrupts gated and may not schedule, sleep, or await a config
+// transaction — but quiescing a tunnel *is* config transactions,
+// and the tunnels are owned by the per-domain CM task. The two
+// sides therefore meet in the latch below:
+//
+// - The suspend handler calls [`pm_on_suspend`]. While any domain
+//   still has live, unquiesced tunnels it latches that domain
+//   `SuspendRequested` and returns `Busy` — the documented
+//   retry-later verdict. The CM task services the latch from its
+//   own loop (`topology::run`), draining each tunnel through the
+//   journaled teardown (hop drain before credit release, exactly
+//   teardown's order) and recording the tunnel's identity in
+//   `records`. Once every domain is quiesced the handler returns
+//   `Ok` and the suspend attempt proceeds.
+// - The resume handler calls [`pm_on_resume`], which latches
+//   `ResumeRequested`. The CM re-scans the topology first, then
+//   replays each record through the same `Tunnel::activate` path
+//   that programmed it originally — replay, not rediscovery: the
+//   recorded endpoints are matched against the re-scanned domain,
+//   and a peer that vanished across the sleep is dropped (its
+//   paths were drained at quiesce), never replayed.
+// - A replay that fails is rolled back through the failed
+//   activation's own journal, so no path is left half-programmed,
+//   and the tunnel is named in `failures`. Outstanding failures
+//   make the suspend handler keep returning `Busy` and the resume
+//   handler return `DriverError`; a resume call also re-queues
+//   failed tunnels for one retry. Nothing about a failed replay is
+//   silent: it is logged by the CM, held in
+//   [`replay_failures`], and reflected in both handlers' verdicts.
+
+/// Replay phase of one domain, driven by the PM latch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PmPhase {
+    /// Tunnels live (or none recorded); normal reconcile runs.
+    Active,
+    /// The suspend handler latched a quiesce request; the CM task
+    /// drains the domain's tunnels into the replay records.
+    SuspendRequested,
+    /// All of the domain's tunnels are quiesced and recorded; the
+    /// suspend handler now returns `Ok` for the domain.
+    Quiesced,
+    /// The resume handler latched a replay request; the CM task
+    /// replays the records against the re-scanned topology.
+    ResumeRequested,
+}
+
+#[derive(Debug)]
+struct PmDomain {
+    domain: u32,
+    phase: PmPhase,
+    /// Tunnels quiesced for suspend, in quiesce order (reverse of
+    /// activation order — replay pops from the end, restoring the
+    /// original activation order). A record is the tunnel's
+    /// published identity; replay rebuilds the path from it.
+    records: Vec<TunnelInfo>,
+    /// Tunnels whose replay failed and rolled back, held until a
+    /// resume call re-queues them for a retry.
+    failures: Vec<TunnelInfo>,
+}
+
+static PM_DOMAINS: IrqSafeSpinLock<Vec<PmDomain>> = IrqSafeSpinLock::new(Vec::new());
+
+fn pm_domain_mut(domains: &mut Vec<PmDomain>, domain: u32) -> &mut PmDomain {
+    let index = match domains.iter().position(|d| d.domain == domain) {
+        Some(i) => i,
+        None => {
+            domains.push(PmDomain {
+                domain,
+                phase: PmPhase::Active,
+                records: Vec::new(),
+                failures: Vec::new(),
+            });
+            domains.len() - 1
+        }
+    };
+    &mut domains[index]
+}
+
+/// The domain's current replay phase (`Active` when the domain
+/// has no PM state). The CM loop gates scan/reconcile on it: while
+/// a domain is quiescing or quiesced, rediscovery must not
+/// reprogram the paths suspend drained.
+pub(crate) fn pm_phase(domain: u32) -> PmPhase {
+    PM_DOMAINS
+        .lock()
+        .iter()
+        .find(|d| d.domain == domain)
+        .map_or(PmPhase::Active, |d| d.phase)
+}
+
+/// Tunnels currently quiesced for system suspend, recorded by
+/// identity and awaiting replay on resume.
+pub fn suspended_tunnels() -> Vec<TunnelInfo> {
+    PM_DOMAINS
+        .lock()
+        .iter()
+        .flat_map(|d| d.records.iter().cloned())
+        .collect()
+}
+
+/// Tunnels whose resume replay failed and rolled back. Non-empty
+/// is a named, persistent fault state: the suspend handler keeps
+/// refusing (`Busy`) and the resume handler reports
+/// `DriverError` while it lasts; a resume call re-queues the
+/// recorded tunnels for one retry.
+pub fn replay_failures() -> Vec<TunnelInfo> {
+    PM_DOMAINS
+        .lock()
+        .iter()
+        .flat_map(|d| d.failures.iter().cloned())
+        .collect()
+}
+
+#[doc(hidden)]
+pub fn __reset_pm_for_test() {
+    PM_DOMAINS.lock().clear();
+}
+
+/// The CM's device-PM suspend verdict, with the latch side
+/// effects described above. Called only from `pm.rs`.
+pub(crate) fn pm_on_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    use narf_power::device_pm::DeviceSuspendError;
+    if !orphaned_path_domains().is_empty() || !replay_failures().is_empty() {
+        return Err(DeviceSuspendError::Busy);
+    }
+    let mut ready = true;
+    let mut domains = PM_DOMAINS.lock();
+    for state in domains.iter_mut() {
+        match state.phase {
+            PmPhase::Active | PmPhase::Quiesced => {}
+            PmPhase::SuspendRequested => ready = false,
+            PmPhase::ResumeRequested => {
+                // A suspend attempt supersedes a pending replay:
+                // the recorded tunnels are still quiesced, so the
+                // CM only has to confirm the quiesced state.
+                state.phase = PmPhase::SuspendRequested;
+                ready = false;
+            }
+        }
+    }
+    // Latch a quiesce request for every domain with live tunnels.
+    // Lock order is PM_DOMAINS → DISPLAYS; no other path nests
+    // them (teardown and reconcile take DISPLAYS alone, the
+    // service functions take PM_DOMAINS only between awaits).
+    let live_domains: Vec<u32> = DISPLAYS.lock().iter().map(|t| t.domain).collect();
+    for domain in live_domains {
+        let state = pm_domain_mut(&mut domains, domain);
+        if state.phase != PmPhase::Quiesced {
+            state.phase = PmPhase::SuspendRequested;
+        }
+        ready = false;
+    }
+    if ready {
+        Ok(())
+    } else {
+        Err(DeviceSuspendError::Busy)
+    }
+}
+
+/// The CM's device-PM resume verdict: latch replay for every
+/// domain holding quiesced tunnels, cancel suspend requests that
+/// never reached a quiesce, and re-queue failed replays for one
+/// retry. Returns `DriverError` when replay failures are
+/// outstanding at call time, so a failed replay is surfaced in
+/// the fan-out report even though the retry is queued.
+pub(crate) fn pm_on_resume() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    use narf_power::device_pm::DeviceSuspendError;
+    let failed = !replay_failures().is_empty();
+    let mut domains = PM_DOMAINS.lock();
+    for state in domains.iter_mut() {
+        if state.phase == PmPhase::Active && !state.failures.is_empty() {
+            let retry = core::mem::take(&mut state.failures);
+            state.records.extend(retry);
+            state.phase = PmPhase::ResumeRequested;
+        } else if state.records.is_empty()
+            && matches!(state.phase, PmPhase::Quiesced | PmPhase::SuspendRequested)
+        {
+            // Nothing recorded to replay (the suspend attempt was
+            // aborted before the CM quiesced, or the domain had
+            // already drained): the domain is simply active again.
+            state.phase = PmPhase::Active;
+        } else if !state.records.is_empty()
+            && matches!(state.phase, PmPhase::Quiesced | PmPhase::SuspendRequested)
+        {
+            state.phase = PmPhase::ResumeRequested;
+        }
+    }
+    if failed {
+        Err(DeviceSuspendError::DriverError)
+    } else {
+        Ok(())
+    }
+}
+
+/// Service one domain's latched suspend request: quiesce each of
+/// its tunnels through the journaled teardown (hop drain before
+/// credit release), recording each tunnel's identity for replay,
+/// in reverse activation order — the same order CM exit uses.
+/// Called from the CM task (`topology::run`), never from the PM
+/// handler. A teardown failure leaves the remaining tunnels live
+/// and the request latched, so the handler keeps returning
+/// `Busy` and the next service pass retries the quiesce.
+pub(crate) async fn service_pm_suspend(
+    ctl: &mut impl Config,
+    domain: &Domain,
+    tunnels: &mut Vec<Tunnel>,
+) -> Result<(), Error> {
+    if pm_phase(domain.id) != PmPhase::SuspendRequested {
+        return Ok(());
+    }
+    let mut index = tunnels.len();
+    while index > 0 {
+        index -= 1;
+        if tunnels[index].display.domain != domain.id {
+            continue;
+        }
+        let mut tunnel = tunnels.remove(index);
+        match tunnel.teardown(ctl, domain).await {
+            Ok(()) => {
+                let mut domains = PM_DOMAINS.lock();
+                pm_domain_mut(&mut domains, domain.id)
+                    .records
+                    .push(tunnel.display.clone());
+            }
+            Err(e) => {
+                tunnels.insert(index, tunnel);
+                return Err(e);
+            }
+        }
+    }
+    let mut domains = PM_DOMAINS.lock();
+    pm_domain_mut(&mut domains, domain.id).phase = PmPhase::Quiesced;
+    Ok(())
+}
+
+/// Service one domain's latched resume request: replay each
+/// recorded tunnel against the re-scanned `domain`, in the
+/// original activation order, through the same activation path
+/// that programmed it before the sleep. Records whose endpoints
+/// vanished across the sleep are dropped — torn down, not
+/// replayed. A failed activation is rolled back through its own
+/// journal (never left half-programmed) and the tunnel is named
+/// in [`replay_failures`]; if even the rollback fails, the CM
+/// keeps the tunnel and its journal so the exit-orphan machinery
+/// still accounts for its writes.
+pub(crate) async fn service_pm_resume(
+    ctl: &mut impl Config,
+    domain: &Domain,
+    tunnels: &mut Vec<Tunnel>,
+) -> Result<(), Error> {
+    use core::fmt::Write as _;
+    let mut records = {
+        let mut domains = PM_DOMAINS.lock();
+        match domains.iter_mut().find(|d| d.domain == domain.id) {
+            Some(state) if state.phase == PmPhase::ResumeRequested => {
+                core::mem::take(&mut state.records)
+            }
+            _ => return Ok(()),
+        }
+    };
+    while let Some(info) = records.pop() {
+        if port(domain, info.input).is_err() || port(domain, info.output).is_err() {
+            let _ = writeln!(
+                narf_console::Writer,
+                "usb4: domain {}: {:?} tunnel (route {:#x} port {} -> route {:#x} port {}) \
+                 vanished across suspend; torn down, not replayed",
+                domain.id,
+                info.protocol,
+                info.input.route,
+                info.input.port,
+                info.output.route,
+                info.output.port,
+            );
+            continue;
+        }
+        let mut tunnel = Tunnel {
+            display: info.clone(),
+            writes: Vec::new(),
+            resource: false,
+            hpd_owned: false,
+            bandwidth: None,
+        };
+        match tunnel.activate(ctl, domain).await {
+            Ok(()) => tunnels.push(tunnel),
+            Err(e) => {
+                let _ =
+                    writeln!(
+                    narf_console::Writer,
+                    "usb4: domain {}: replay of {:?} tunnel (route {:#x} port {} -> route {:#x} \
+                     port {}) failed: {e:?}; rolled back, recorded as a replay failure",
+                    domain.id, info.protocol, info.input.route, info.input.port, info.output.route,
+                    info.output.port,
+                );
+                if tunnel.teardown(ctl, domain).await.is_err() {
+                    tunnels.push(tunnel);
+                }
+                let mut domains = PM_DOMAINS.lock();
+                pm_domain_mut(&mut domains, domain.id).failures.push(info);
+            }
+        }
+    }
+    // Republish this domain's live set: replay bypassed reconcile,
+    // which is what normally rebuilds the published snapshots.
+    {
+        let mut displays = DISPLAYS.lock();
+        displays.retain(|d| d.domain != domain.id);
+        displays.extend(
+            tunnels
+                .iter()
+                .filter(|t| t.display.domain == domain.id)
+                .map(|t| t.display.clone()),
+        );
+    }
+    let mut domains = PM_DOMAINS.lock();
+    pm_domain_mut(&mut domains, domain.id).phase = PmPhase::Active;
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct Hop {
     route: u64,

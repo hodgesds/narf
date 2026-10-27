@@ -541,6 +541,303 @@ fn pcie_chain_model(mid_pcie: bool) -> (Domain, Model) {
     )
 }
 
+// ── Tunnel suspend / resume replay (#1035) ────────────────────
+//
+// The PM handler verdicts are exercised through `pm_on_suspend` /
+// `pm_on_resume` — the exact functions `pm.rs`'s registered
+// handlers delegate to — and the quiesce/replay work through the
+// service functions `topology::run` calls. The fan-out wiring of
+// those verdicts is covered by the pm fixtures.
+
+use narf_power::device_pm::DeviceSuspendError;
+
+/// The fabric state the paths own: every Hops word plus every
+/// Port word, as a register map. Switch-space words are mailbox
+/// registers (router operations), not path state, and are excluded.
+fn fabric(m: &Model) -> BTreeMap<Key, u32> {
+    m.words
+        .iter()
+        .filter(|(k, _)| k.2 != CfgSpace::Switch as u8)
+        .map(|(k, v)| (*k, *v))
+        .collect()
+}
+
+fn fabric_diff(a: &BTreeMap<Key, u32>, b: &BTreeMap<Key, u32>) -> Vec<Key> {
+    let mut keys: Vec<Key> = a.keys().chain(b.keys()).copied().collect();
+    keys.sort_unstable();
+    keys.dedup();
+    // Compare register VALUES, not map membership. The model's map
+    // records every word ever written, so a word teardown restored
+    // to 0 stays present in the map while a never-written word is
+    // absent — yet both read as 0 on the device, and the register
+    // value is the fabric state this comparison means. Comparing
+    // `Option<&u32>` instead made every restored-to-zero word (each
+    // journaled hop and adapter word, the USB3 handshake words) a
+    // spurious difference, so the drained fabric could never equal
+    // the pre-activation fabric even with a perfect rollback.
+    keys.into_iter()
+        .filter(|k| a.get(k).copied().unwrap_or(0) != b.get(k).copied().unwrap_or(0))
+        .collect()
+}
+
+fn usb4_tunnel_suspend_replay_cycle() -> TestResult {
+    forget_domain(u32::MAX);
+    __reset_pm_for_test();
+    let (d, mut m) = model();
+    let pre = fabric(&m);
+    let mut tunnels = Vec::new();
+    if narf_scheduler::block_on_spin(reconcile(&mut m, &d, &mut tunnels, 3)).is_err()
+        || tunnels.len() != 2
+    {
+        return TestResult::Fail("model did not activate USB3 + DP tunnels");
+    }
+    let active = fabric(&m);
+    if active == pre {
+        return TestResult::Fail("activation programmed no path state");
+    }
+    // First suspend attempt: the handler latches the quiesce and
+    // refuses; nothing has drained yet.
+    if pm_on_suspend() != Err(DeviceSuspendError::Busy)
+        || live_tunnel_count() != 2
+        || !suspended_tunnels().is_empty()
+    {
+        return TestResult::Fail("first suspend did not latch a quiesce as Busy");
+    }
+    // The CM service pass drains both paths and records them.
+    if narf_scheduler::block_on_spin(service_pm_suspend(&mut m, &d, &mut tunnels)).is_err()
+        || !tunnels.is_empty()
+        || live_tunnel_count() != 0
+        || suspended_tunnels().len() != 2
+    {
+        return TestResult::Fail("quiesce did not drain and record the tunnels");
+    }
+    // Drained fabric: every path word is back at its pre-activation
+    // value. The tolerated differences are words teardown
+    // deliberately does not restore to the power-on value: the
+    // DP-in HPD deassert (0,5,Port,35) and the CMHS handshake word
+    // (1,5,Port,38) — one-way notifications, not path
+    // configuration — and the USB3 adapters' resting value
+    // (Port,32) = 1<<30 at both ends, the teardown contract the
+    // USB3 bandwidth fixture already pins.
+    let drained = fabric(&m);
+    let diff = fabric_diff(&drained, &pre);
+    let tolerated = [
+        (0, 5, CfgSpace::Port as u8, 35),
+        (1, 5, CfgSpace::Port as u8, 38),
+        (0, 3, CfgSpace::Port as u8, 32),
+        (1, 3, CfgSpace::Port as u8, 32),
+    ];
+    if diff.iter().any(|k| !tolerated.contains(k)) {
+        return TestResult::Fail("quiesce did not restore the pre-activation fabric");
+    }
+    if pm_on_suspend() != Ok(()) {
+        return TestResult::Fail("quiesced domain still vetoes suspend");
+    }
+    // Resume: latch, then replay against the same topology. The
+    // replayed fabric must equal the originally programmed fabric
+    // word-for-word — hop-for-hop — apart from the HPD deassert
+    // word, which replay does not rewrite (the sink's HPD never
+    // dropped in the model, so there is nothing to re-assert).
+    if pm_on_resume() != Ok(()) {
+        return TestResult::Fail("resume latch failed with quiesced tunnels");
+    }
+    if narf_scheduler::block_on_spin(service_pm_resume(&mut m, &d, &mut tunnels)).is_err()
+        || tunnels.len() != 2
+        || live_tunnel_count() != 2
+        || !suspended_tunnels().is_empty()
+    {
+        return TestResult::Fail("replay did not restore the tunnels");
+    }
+    let replayed = fabric(&m);
+    let diff = fabric_diff(&replayed, &active);
+    if diff.iter().any(|k| *k != (0, 5, CfgSpace::Port as u8, 35)) {
+        return TestResult::Fail("replayed fabric differs from the original programming");
+    }
+    // Traffic-shaping state is restored, not merely reconnected:
+    // the USB3 allocation word carries the handshake allocation
+    // again, and both DP adapters are enabled.
+    if m.get(0, 3, CfgSpace::Port, 34) & 0x00ff_ffff == 0
+        || m.get(0, 5, CfgSpace::Port, 32) & (3 << 30) != 3 << 30
+        || m.get(1, 5, CfgSpace::Port, 32) & (3 << 30) != 3 << 30
+    {
+        return TestResult::Fail("replay did not restore credits/bandwidth and enables");
+    }
+    // Vanished peer: quiesce again, then resume against a topology
+    // whose child router is gone. The records are torn down, not
+    // replayed — nothing programmed, nothing stranded, no failure.
+    if pm_on_suspend() != Err(DeviceSuspendError::Busy)
+        || narf_scheduler::block_on_spin(service_pm_suspend(&mut m, &d, &mut tunnels)).is_err()
+        || pm_on_suspend() != Ok(())
+        || pm_on_resume() != Ok(())
+    {
+        return TestResult::Fail("second quiesce cycle did not latch cleanly");
+    }
+    let host_only = Domain {
+        id: u32::MAX,
+        routers: alloc::vec![d.routers[0].clone()],
+    };
+    if narf_scheduler::block_on_spin(service_pm_resume(&mut m, &host_only, &mut tunnels)).is_err()
+        || !tunnels.is_empty()
+        || live_tunnel_count() != 0
+        || !suspended_tunnels().is_empty()
+        || !replay_failures().is_empty()
+        || pm_on_suspend() != Ok(())
+    {
+        return TestResult::Fail("vanished peer was replayed or stranded state");
+    }
+    forget_domain(u32::MAX);
+    __reset_pm_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/thunderbolt/tunnel",
+    usb4_tunnel_suspend_replay_cycle
+);
+
+fn usb4_pcie_tunnel_suspend_replay() -> TestResult {
+    forget_domain(u32::MAX);
+    __reset_pm_for_test();
+    let (d, mut m) = pcie_model();
+    let mut tunnels = Vec::new();
+    if narf_scheduler::block_on_spin(reconcile(&mut m, &d, &mut tunnels, 7)).is_err()
+        || tunnels.len() != 1
+    {
+        return TestResult::Fail("PCIe tunnel not established");
+    }
+    if pm_on_suspend() != Err(DeviceSuspendError::Busy)
+        || narf_scheduler::block_on_spin(service_pm_suspend(&mut m, &d, &mut tunnels)).is_err()
+        || !tunnels.is_empty()
+        || live_tunnel_count() != 0
+        || suspended_tunnels().len() != 1
+        || hop8(&m, 0, 7) != [0, 0]
+        || hop8(&m, 1, 1) != [0, 0]
+        || hop8(&m, 1, 7) != [0, 0]
+        || hop8(&m, 0, 1) != [0, 0]
+        || m.get(0, 7, CfgSpace::Port, 32) != 0
+        || m.get(1, 7, CfgSpace::Port, 32) != 0
+        || pm_on_suspend() != Ok(())
+    {
+        return TestResult::Fail("PCIe quiesce did not drain paths and adapters");
+    }
+    if pm_on_resume() != Ok(())
+        || narf_scheduler::block_on_spin(service_pm_resume(&mut m, &d, &mut tunnels)).is_err()
+        || tunnels.len() != 1
+        || pcie_tunnels().len() != 1
+        || hop8(&m, 0, 7) != [0x8000_0808, 0x0200_0201]
+        || hop8(&m, 1, 1) != [0x8004_3808, 0x0100_0201]
+        || hop8(&m, 1, 7) != [0x8000_0808, 0x0200_0201]
+        || hop8(&m, 0, 1) != [0x8004_3808, 0x0100_0201]
+        || m.get(0, 7, CfgSpace::Port, 32) != 1 << 31
+        || m.get(1, 7, CfgSpace::Port, 32) != 1 << 31
+    {
+        return TestResult::Fail("PCIe replay did not restore the pinned hop programming");
+    }
+    forget_domain(u32::MAX);
+    __reset_pm_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/thunderbolt/tunnel",
+    usb4_pcie_tunnel_suspend_replay
+);
+
+fn usb4_tunnel_replay_failure_surfaces_and_retries() -> TestResult {
+    forget_domain(u32::MAX);
+    __reset_pm_for_test();
+    let (d, mut m) = model();
+    let mut tunnels = Vec::new();
+    if narf_scheduler::block_on_spin(reconcile(&mut m, &d, &mut tunnels, 2)).is_err()
+        || tunnels.len() != 1
+        || pm_on_suspend() != Err(DeviceSuspendError::Busy)
+        || narf_scheduler::block_on_spin(service_pm_suspend(&mut m, &d, &mut tunnels)).is_err()
+        || pm_on_suspend() != Ok(())
+    {
+        return TestResult::Fail("DP tunnel did not quiesce");
+    }
+    // The device router consumes the replay's adapter-enable write
+    // and reports a transient error: the replay must roll back
+    // (never half-up), and the tunnel must be named as a failure.
+    m.fail_enable = true;
+    if pm_on_resume() != Ok(())
+        || narf_scheduler::block_on_spin(service_pm_resume(&mut m, &d, &mut tunnels)).is_err()
+        || !tunnels.is_empty()
+        || live_tunnel_count() != 0
+        || !suspended_tunnels().is_empty()
+        || replay_failures().len() != 1
+        || m.get(1, 5, CfgSpace::Port, 32) & (3 << 30) != 0
+    {
+        return TestResult::Fail("failed replay was left half-up or not recorded");
+    }
+    // The failure is explicit in both handlers' verdicts: suspend
+    // stays refused, and the resume fan-out reports DriverError —
+    // while re-queueing the failed tunnel for one retry.
+    if pm_on_suspend() != Err(DeviceSuspendError::Busy)
+        || pm_on_resume() != Err(DeviceSuspendError::DriverError)
+        || suspended_tunnels().len() != 1
+        || !replay_failures().is_empty()
+    {
+        return TestResult::Fail("replay failure not surfaced or not re-queued");
+    }
+    if narf_scheduler::block_on_spin(service_pm_resume(&mut m, &d, &mut tunnels)).is_err()
+        || tunnels.len() != 1
+        || live_tunnel_count() != 1
+        || !replay_failures().is_empty()
+        || pm_on_resume() != Ok(())
+    {
+        return TestResult::Fail("retried replay did not restore the tunnel");
+    }
+    forget_domain(u32::MAX);
+    __reset_pm_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/thunderbolt/tunnel",
+    usb4_tunnel_replay_failure_surfaces_and_retries
+);
+
+fn usb4_tunnel_quiesce_failure_stays_busy() -> TestResult {
+    forget_domain(u32::MAX);
+    __reset_pm_for_test();
+    let (d, mut m) = model();
+    let mut tunnels = Vec::new();
+    if narf_scheduler::block_on_spin(reconcile(&mut m, &d, &mut tunnels, 2)).is_err()
+        || tunnels.len() != 1
+    {
+        return TestResult::Fail("DP tunnel not established");
+    }
+    // The transport dies during the quiesce teardown's rollback:
+    // the journal is retained, the request stays latched, and the
+    // handler's verdict stays a scoped Busy — never an Ok over
+    // live paths.
+    m.set_fail_disable();
+    if pm_on_suspend() != Err(DeviceSuspendError::Busy)
+        || narf_scheduler::block_on_spin(service_pm_suspend(&mut m, &d, &mut tunnels)).is_ok()
+        || tunnels.len() != 1
+        || !tunnels[0].has_unrolled_writes()
+        || !suspended_tunnels().is_empty()
+        || pm_on_suspend() != Err(DeviceSuspendError::Busy)
+    {
+        return TestResult::Fail("failed quiesce was reported as suspended");
+    }
+    // The one-shot fault is consumed; the retried quiesce completes
+    // and the cycle closes cleanly.
+    if narf_scheduler::block_on_spin(service_pm_suspend(&mut m, &d, &mut tunnels)).is_err()
+        || pm_on_suspend() != Ok(())
+        || pm_on_resume() != Ok(())
+        || narf_scheduler::block_on_spin(service_pm_resume(&mut m, &d, &mut tunnels)).is_err()
+        || live_tunnel_count() != 1
+    {
+        return TestResult::Fail("retried quiesce/replay did not complete the cycle");
+    }
+    forget_domain(u32::MAX);
+    __reset_pm_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/thunderbolt/tunnel",
+    usb4_tunnel_quiesce_failure_stays_busy
+);
+
 fn usb4_pcie_nearest_ancestor_pairing() -> TestResult {
     forget_domain(u32::MAX);
     // Mid carries its own PCIe adapters: the leaf's tunnel
