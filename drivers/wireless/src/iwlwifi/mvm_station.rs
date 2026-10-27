@@ -89,6 +89,7 @@ impl Owner {
         }
     }
     pub(in crate::iwlwifi) fn station_fail(&mut self) {
+        self.power.phy.ba.clear_packets();
         self.hardware.fail();
         self.phase = Phase::Failed;
     }
@@ -131,7 +132,9 @@ impl Owner {
             .fence()
     }
     pub(in crate::iwlwifi) fn station_needs_security(&self) -> bool {
-        self.security.needs_service() || !self.power.phy.actions.is_empty()
+        self.security.needs_service()
+            || !self.power.phy.actions.is_empty()
+            || self.power.phy.ba.needs_work()
     }
     pub(in crate::iwlwifi) fn station_defer_packet(&mut self, frame: Vec<u8>) {
         self.power
@@ -165,12 +168,16 @@ impl Owner {
     ) -> Result<(), &'static str> {
         self.transmit_data_using(bytes, policy).await
     }
+    pub(in crate::iwlwifi) fn station_can_pipeline(&self) -> bool {
+        self.ba_qualified()
+    }
     pub(in crate::iwlwifi) async fn station_security(
         &mut self,
         nonce: impl FnMut() -> Result<[u8; 32], &'static str>,
         policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(), &'static str> {
         let mut policy = policy;
+        self.service_ba(&mut policy).await?;
         self.service_phy_actions(&mut policy).await?;
         if let Some(frame) = self.receive_data_inner(&mut policy)? {
             match frame {

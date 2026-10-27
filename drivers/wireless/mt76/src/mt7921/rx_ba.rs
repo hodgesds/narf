@@ -4,7 +4,11 @@
 use alloc::{collections::VecDeque, vec, vec::Vec};
 
 pub(super) const TIDS: usize = 8; // Native STA_REC_BA.ba_en is one octet.
-const MAX_WINDOW: u16 = 32;
+
+// CONNAC2 WTBL/STA_REC_BA carry the actual16-bit window, without CONNAC1's
+// discrete range index. Retain an HT-sized64 MPDU host bound; wider HE/EHT
+// agreements require separate negotiated profiles.
+const MAX_WINDOW: u16 = 64;
 const MAX_READY: usize = TIDS * MAX_WINDOW as usize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,6 +18,7 @@ pub(super) struct Request {
     pub ssn: u16,
     pub window: u16,
     pub timeout: u16,
+    pub amsdu: bool,
 }
 impl Request {
     pub fn parse(frame: &[u8]) -> Option<Self> {
@@ -24,26 +29,32 @@ impl Request {
         let tid = ((parameters >> 2) & 15) as u8;
         let requested = parameters >> 6;
         let sequence = u16::from_le_bytes([frame[31], frame[32]]);
-        if parameters & 2 == 0 || usize::from(tid) >= TIDS || requested == 0 || sequence & 15 != 0 {
+        if parameters & 2 == 0 || usize::from(tid) >= TIDS || sequence & 15 != 0 {
             return None;
         }
-        let capped = requested.min(MAX_WINDOW);
-        // A power-of-two window also divides the12-bit sequence modulus.
-        let window = 1u16 << (15 - capped.leading_zeros());
+        let window = if requested == 0 {
+            MAX_WINDOW
+        } else {
+            requested.min(MAX_WINDOW)
+        };
         Some(Self {
             dialog: frame[26],
             tid,
             ssn: sequence >> 4,
             window,
             timeout: u16::from_le_bytes([frame[29], frame[30]]),
+            amsdu: parameters & 1 != 0,
         })
     }
     pub fn response(self, own: [u8; 6], peer: [u8; 6]) -> Vec<u8> {
         let mut frame = action(own, peer, 33);
         frame[24..29].copy_from_slice(&[3, 1, self.dialog, 0, 0]);
-        // Immediate compressed BA; A-MSDU-in-A-MPDU remains unnegotiated.
-        frame[29..31]
-            .copy_from_slice(&(2 | u16::from(self.tid) << 2 | self.window << 6).to_le_bytes());
+        // Permit nested A-MSDU only when the actual request offers it; the
+        // host still assembles/checks a whole MPDU before reorder/PN commit.
+        frame[29..31].copy_from_slice(
+            &(2 | u16::from(self.amsdu) | u16::from(self.tid) << 2 | self.window << 6)
+                .to_le_bytes(),
+        );
         frame[31..33].copy_from_slice(&self.timeout.to_le_bytes());
         frame
     }
@@ -67,6 +78,7 @@ impl Request {
         body[8..12].copy_from_slice(&[6, 0, 12, 0]); // STA_REC_BA.
         body[12] = self.tid;
         body[13] = 2;
+        body[14] = u8::from(self.amsdu); // Source STA_REC_BA.amsdu, independently of enable.
         body[15] = if enable { 1 << self.tid } else { 0 };
         body[16..18].copy_from_slice(&self.ssn.to_le_bytes());
         body[18..20].copy_from_slice(&self.window.to_le_bytes());
@@ -162,7 +174,6 @@ impl Owner {
         if usize::from(request.tid) >= TIDS
             || request.window == 0
             || request.window > MAX_WINDOW
-            || !request.window.is_power_of_two()
             || request.ssn >= 4096
             || self.epoch == u64::MAX
         {
@@ -256,6 +267,12 @@ impl Owner {
             .get(usize::from(tid))
             .is_some_and(Option::is_some)
     }
+    pub fn amsdu(&self, tid: u8) -> bool {
+        self.active(tid)
+            && self.agreements[usize::from(tid)]
+                .as_ref()
+                .is_some_and(|agreement| agreement.request.amsdu)
+    }
     pub fn stop(&mut self, tid: u8, notify: bool) {
         let Some(a) = self
             .agreements
@@ -311,8 +328,11 @@ impl Owner {
         sequence.wrapping_sub(head) & 4095
     }
     fn release(a: &mut Agreement, ready: &mut VecDeque<Ready>) {
-        let index = usize::from(a.head % a.request.window);
-        if let Some(packet) = a.slots[index].take() {
+        let index = a.slots.iter().position(|slot| {
+            slot.as_ref()
+                .is_some_and(|packet| packet.sequence == a.head)
+        });
+        if let Some(packet) = index.and_then(|index| a.slots[index].take()) {
             if ready.len() < MAX_READY {
                 ready.push_back(Ready {
                     tid: a.request.tid,
@@ -335,7 +355,12 @@ impl Owner {
     }
     fn contiguous(a: &mut Agreement, ready: &mut VecDeque<Ready>) {
         for _ in 0..a.request.window {
-            if a.slots[usize::from(a.head % a.request.window)].is_none() {
+            if !a
+                .slots
+                .iter()
+                .flatten()
+                .any(|packet| packet.sequence == a.head)
+            {
                 break;
             }
             Self::release(a, ready);
@@ -351,7 +376,7 @@ impl Owner {
             || a.slots
                 .iter()
                 .flatten()
-                .any(|p| packet.pn.is_some() && p.pn == packet.pn)
+                .any(|p| p.sequence == packet.sequence || packet.pn.is_some() && p.pn == packet.pn)
             || self
                 .ready
                 .iter()
@@ -370,13 +395,15 @@ impl Owner {
                     & 4095,
             );
         }
-        let index = usize::from(packet.sequence % a.request.window);
-        if a.slots[index].is_some() {
+        // Sequence modulo window aliases different live SNs when an
+        // arbitrary negotiated window crosses4095->0. Store the exact SN
+        // in one of at most64 independent slots instead.
+        let Some(slot) = a.slots.iter_mut().find(|slot| slot.is_none()) else {
             return;
-        }
+        };
         packet.at = now;
         a.activity = now;
-        a.slots[index] = Some(packet);
+        *slot = Some(packet);
         Self::contiguous(a, &mut self.ready);
     }
     pub fn bar(&mut self, tid: u8, ssn: u16) {
@@ -406,10 +433,9 @@ impl Owner {
             let mut target = None;
             for offset in 0..a.request.window {
                 let sequence = (a.head + offset) & 4095;
-                if a.slots[usize::from(sequence % a.request.window)]
-                    .as_ref()
-                    .is_some_and(|p| now.saturating_sub(p.at) >= timeout)
-                {
+                if a.slots.iter().flatten().any(|packet| {
+                    packet.sequence == sequence && now.saturating_sub(packet.at) >= timeout
+                }) {
                     target = Some((sequence + 1) & 4095);
                 }
             }

@@ -2,6 +2,7 @@
 // Copyright(c) 2018-2019 Realtek Corporation
 //! RTL8822CE PCI legacy packet formats, from Linux rtw88/{pci,tx,rx,fw}.
 //! Parsing supplies no DMA, channel, peer, key or controlled-port authority.
+use alloc::vec::Vec;
 use core::ops::Range;
 
 pub(super) const TX_DESC: usize = 48;
@@ -11,6 +12,56 @@ pub(super) const RX_BD: usize = 8;
 pub(super) const MAX_MPDU: usize = 2304;
 pub(super) const MAX_HT_RX: usize = 26 + 16 + narf_wireless::amsdu::MAX_BYTES;
 pub(super) const RX_BYTES: usize = 11454 + RX_DESC;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Aggregation {
+    pub density: u8,
+    pub count: u8,
+    pub bytes: u16,
+    pub airtime: u16,
+}
+impl Aggregation {
+    pub(super) fn valid(self) -> bool {
+        self.density <= 7
+            && (1..=4).contains(&self.count)
+            && (1560..=8191).contains(&self.bytes)
+            && (2500..=4000).contains(&self.airtime)
+    }
+    /// Conservative complete HT20/1SS BCC PPDU bound. Include delimiter,
+    /// hardware FCS, pad-to4, mixed preamble and density allowance. LGI bounds
+    /// either negotiated GI; no firmware aggregate length or ACK is inferred.
+    pub(super) fn admits(self, profile: DataProfile, frames: &[Vec<u8>]) -> bool {
+        self.admits_lengths(profile, frames.iter().map(Vec::len))
+    }
+    pub(super) fn admits_lengths(
+        self,
+        profile: DataProfile,
+        frames: impl ExactSizeIterator<Item = usize>,
+    ) -> bool {
+        const NDBPS: [usize; 8] = [26, 52, 78, 104, 156, 208, 234, 260];
+        if !self.valid()
+            || !profile.valid()
+            || profile.mcs == 0
+            || frames.len() == 0
+            || frames.len() > usize::from(self.count)
+        {
+            return false;
+        }
+        let count = frames.len();
+        let bytes = frames.into_iter().try_fold(0usize, |sum, length| {
+            let aligned = length.checked_add(7)? & !3;
+            sum.checked_add(4)?.checked_add(aligned)
+        });
+        let Some(bytes) = bytes else {
+            return false;
+        };
+        if bytes > usize::from(self.bytes) {
+            return false;
+        }
+        let symbols = (16 + bytes * 8 + 6).div_ceil(NDBPS[usize::from(profile.rate() - 12)]);
+        bytes <= usize::from(self.bytes)
+            && 36 + symbols * 4 + count * 16 <= usize::from(self.airtime)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Error {
@@ -112,6 +163,9 @@ fn classify_profile(frame: &[u8], own: [u8; 6], profile: DataProfile) -> Result<
     if !profile.valid() {
         return Err(Error::Metadata);
     }
+    if profile.mcs != 0 && native_bar(frame) && frame[10..16] == own && frame[17] >> 4 == 0 {
+        return Ok(Queue::Management);
+    }
     if !(24..=MAX_MPDU).contains(&frame.len())
         || !unicast(&own)
         || frame[10..16] != own
@@ -133,6 +187,8 @@ fn classify_profile(frame: &[u8], own: [u8; 6], profile: DataProfile) -> Result<
         {
             Ok(Queue::Management)
         }
+        0xd0 if profile.mcs != 0 && recipient_control(frame) => Ok(Queue::Management),
+        0xd0 if profile.mcs != 0 && originator_control(frame) => Ok(Queue::Management),
         0x08 if frame[1] & 3 == 1 && unicast(&frame[4..10]) => Ok(Queue::Data),
         0x88 if profile.qos
             && frame.len() >= 26
@@ -144,6 +200,49 @@ fn classify_profile(frame: &[u8], own: [u8; 6], profile: DataProfile) -> Result<
         }
         _ => Err(Error::Frame),
     }
+}
+pub(super) fn originator_control(b: &[u8]) -> bool {
+    if native_bar(b) {
+        return b[17] >> 4 == 0;
+    }
+    if b.len() < 30 || b[..2] != [0xd0, 0] || b[24] != 3 {
+        return false;
+    }
+    match (b.len(), b[25]) {
+        (33, 0) => {
+            let p = u16::from_le_bytes([b[27], b[28]]);
+            p & 0x3f == 2 && (1..=64).contains(&(p >> 6)) && b[31] & 15 == 0
+        }
+        (30, 2) => b[26..30] == [0, 8, 39, 0],
+        _ => false,
+    }
+}
+/// Newly emitting recipient control is separately qualified by the retained
+/// native Port, beyond the H data profile that only permits status37 decline.
+pub(super) fn recipient_control(b: &[u8]) -> bool {
+    if b.len() < 30 || b[..2] != [0xd0, 0] || b[24] != 3 {
+        return false;
+    }
+    match (b.len(), b[25]) {
+        (33, 1) => {
+            let p = u16::from_le_bytes([b[29], b[30]]);
+            b[27..29] == [0, 0] && p & 3 == 3 && (p >> 2) & 15 < 8 && (1..=64).contains(&(p >> 6))
+        }
+        (30, 2) => {
+            let p = u16::from_le_bytes([b[26], b[27]]);
+            p & 0xfff == 0 && p >> 12 < 8 && b[28..30] == [39, 0]
+        }
+        _ => false,
+    }
+}
+pub(super) fn native_bar(b: &[u8]) -> bool {
+    b.len() == 20
+        && b[..2] == [0x84, 0]
+        && unicast(&b[4..10])
+        && unicast(&b[10..16])
+        && u16::from_le_bytes([b[16], b[17]]) & 0xfff == 4
+        && b[17] >> 4 < 8
+        && b[18] & 15 == 0
 }
 /// Source PCI descriptors have no host checksum callback. Both PCI BD
 /// segments refer to this one retained contiguous descriptor/body allocation.
@@ -180,7 +279,7 @@ pub(super) fn transmit_profile(
         Queue::Management => 18,
         Queue::Data => 0,
     };
-    let ordinary = queue == Queue::Data && report.is_none();
+    let ordinary = queue == Queue::Data && (report.is_none() || frame[0] == 0x88);
     if frame[0] == 0x88 && !ordinary {
         return Err(Error::Frame);
     }
@@ -207,13 +306,17 @@ pub(super) fn transmit_profile(
     if ordinary && profile.mcs != 0 {
         put(&mut bytes, 20, u32::from(profile.sgi) << 4);
     }
-    let sequence = u16::from_le_bytes([frame[22], frame[23]]) >> 4;
+    let sequence = if frame.len() == 20 {
+        0
+    } else {
+        u16::from_le_bytes([frame[22], frame[23]]) >> 4
+    };
     put(&mut bytes, 36, u32::from(sequence) << 12);
     Ok((bytes, queue))
 }
 pub(super) fn buffer_descriptor(address: u64, length: usize) -> Result<[u8; TX_BD], Error> {
     let extent = TX_DESC.checked_add(length).ok_or(Error::Address)?;
-    if !(24..=MAX_MPDU).contains(&length)
+    if (!(24..=MAX_MPDU).contains(&length) && length != 20)
         || address == 0
         || address & 3 != 0
         || address
@@ -274,7 +377,8 @@ pub(super) fn receive_profile(descriptor: &[u8; RX_DESC], ht: bool) -> Result<Re
     } else {
         let encryption = (first >> 20) & 7;
         let software = first & (1 << 27) != 0;
-        if !(28..=if ht { MAX_HT_RX + 4 } else { MAX_MPDU + 4 }).contains(&length)
+        if !(if ht { 24 } else { 28 }..=if ht { MAX_HT_RX + 4 } else { MAX_MPDU + 4 })
+            .contains(&length)
             || rate >= if ht { 20 } else { 12 }
             || word(descriptor, 16) & 0x30 != 0
             || encryption != 0 && !(encryption == 4 && software)

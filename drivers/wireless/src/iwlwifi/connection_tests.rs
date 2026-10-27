@@ -29,6 +29,7 @@ fn connection() -> Connection {
             Vec::new(),
         )),
         replay: frame_api::Replay::default(),
+        receive_epoch: 0,
         authorized: true,
         last_beacon: 0,
         group_keys: [None; 4],
@@ -56,6 +57,7 @@ fn mgmt_mpdu_payload(frame: &[u8]) -> Vec<u8> {
     let mut p = alloc::vec![0u8; 64 + frame.len()];
     put16(&mut p, 0, frame.len() as u16);
     put32(&mut p, 12, 3); // status: CRC/overrun OK
+    p[42] = 36;
     p[64..].copy_from_slice(frame);
     p
 }
@@ -69,6 +71,7 @@ fn notification(cmd: u8, payload: Vec<u8>) -> Packet {
             sequence: 0x8000,
         },
         payload,
+        receive_epoch: Some(0),
     }
 }
 
@@ -77,6 +80,7 @@ fn data(sn: u16, nssn: u16, pn: u8) -> Packet {
     put16(&mut p, 0, 44);
     put32(&mut p, 12, 0x243);
     put32(&mut p, 16, (3 << 24) | ((sn as u32) << 12) | nssn as u32);
+    p[42] = 36;
     let f = &mut p[64..];
     f[..2].copy_from_slice(&[0x88, 0x42]);
     f[4..10].copy_from_slice(&[2; 6]);
@@ -88,6 +92,31 @@ fn data(sn: u16, nssn: u16, pn: u8) -> Packet {
     f[34..].copy_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 8, 0, sn as u8, 0]);
     notification(0xc1, p)
 }
+
+fn smoke_connection_original_closed_or_old_epoch_never_advances_reorder_or_pn() -> TestResult {
+    let mut c = connection();
+    for epoch in [None, Some(1)] {
+        let mut original = data(100, 101, 10);
+        original.receive_epoch = epoch;
+        if !c.receive_packet(&original).unwrap().is_empty() || c.replay.pairwise[0] != 0 {
+            return TestResult::Fail("closed/foreign capture altered current reorder/PN");
+        }
+    }
+    if c.receive_packet(&data(100, 101, 10)).unwrap().len() != 1 || c.replay.pairwise[0] != 10 {
+        return TestResult::Fail("old native capture consumed valid successor sequence/PN");
+    }
+    let old = data(102, 102, 12);
+    c.receive_epoch = 2;
+    c.discard_reorder();
+    if !c.receive_packet(&old).unwrap().is_empty() || c.replay.pairwise[0] != 10 {
+        return TestResult::Fail("saved original MPDU inherited a later key epoch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/aggregation",
+    smoke_connection_original_closed_or_old_epoch_never_advances_reorder_or_pn
+);
 
 fn smoke_connection_reorders_only_authenticated_owned_frames() -> TestResult {
     let mut c = connection();
@@ -136,6 +165,7 @@ fn smoke_connection_block_ack_actions_require_associated_ap() -> TestResult {
     let mut bytes = alloc::vec![0; 64];
     put16(&mut bytes, 0, frame.len() as u16);
     put32(&mut bytes, 12, 3);
+    bytes[42] = 36;
     bytes.extend_from_slice(&frame);
     let request = notification(0xc1, bytes);
     c.authorized = false;
@@ -182,6 +212,7 @@ fn smoke_connection_stops_tx_when_ap_changes_ht_operation() -> TestResult {
     let mut bytes = alloc::vec![0; 64];
     put16(&mut bytes, 0, frame.len() as u16);
     put32(&mut bytes, 12, 3);
+    bytes[42] = 36;
     bytes.extend_from_slice(&frame);
     let mut beacon = notification(0xc1, bytes);
     if c.receive_packet(&beacon).is_err() || !c.authorized {
@@ -336,4 +367,235 @@ fn smoke_connection_protect_group_mgmt_roundtrips() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/iwlwifi/security",
     smoke_connection_protect_group_mgmt_roundtrips
+);
+
+struct NativeBa {
+    hardware: Option<super::super::runtime::Hardware>,
+    firmware: super::super::runtime::model::Firmware,
+    trace: super::super::runtime::model::TxTrace,
+}
+impl Drop for NativeBa {
+    fn drop(&mut self) {
+        if let Some(hw) = self.hardware.take() {
+            // SAFETY: private RAM-only DMA endpoints; all test futures have ended,
+            // and no physical PCI device or independent device actor is present.
+            unsafe { super::super::runtime::model::destroy(hw) };
+        }
+    }
+}
+fn native_poll<T>(
+    f: core::pin::Pin<&mut impl core::future::Future<Output = T>>,
+) -> core::task::Poll<T> {
+    let result = f.poll(&mut core::task::Context::from_waker(
+        core::task::Waker::noop(),
+    ));
+    if result.is_pending() {
+        narf_scheduler::block_on_spin(narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(
+            2_000_000,
+        )));
+    }
+    result
+}
+impl NativeBa {
+    fn new() -> Self {
+        let (mut hardware, firmware, trace) =
+            super::super::runtime::model::station_model_for_format(
+                super::super::rx_rfh::CompletionFormat::Bz,
+            );
+        super::super::runtime::model::versions(
+            &mut hardware,
+            &[0x17, 5, 3, 0, 0x16, 5, 2, 0, 2, 5, 1, 0],
+        );
+        Self {
+            hardware: Some(hardware),
+            firmware,
+            trace,
+        }
+    }
+    fn management_queue(&mut self) -> Result<(), &'static str> {
+        let mut f = core::pin::pin!(self.hardware.as_mut().unwrap().allocate_tx(0, 15));
+        if !native_poll(f.as_mut()).is_pending() {
+            return Err("native BA management ADD missing");
+        }
+        self.trace.take().ok_or("management ADD trace absent")?;
+        self.firmware.inject(0x17, 5, 0, &[1, 0, 0, 0, 0, 0, 0, 0]);
+        if !matches!(native_poll(f.as_mut()), core::task::Poll::Ready(Ok(1))) {
+            return Err("management ADD native receipt failed");
+        }
+        Ok(())
+    }
+}
+fn ba_marker(cookie: u32) -> Vec<u8> {
+    let mut b = alloc::vec![12, 0, 0, 0, 1, 0, 0, 0];
+    b.extend_from_slice(&cookie.to_le_bytes());
+    b.extend_from_slice(&3u32.to_le_bytes());
+    b
+}
+fn smoke_connection_native_baid_remove_waits_for_marker_and_preserves_peer_loss() -> TestResult {
+    let test = || -> Result<(), &'static str> {
+        for (loss, foreign) in [(false, false), (true, false), (false, true)] {
+            let mut t = NativeBa::new();
+            let mut c = connection();
+            assert!(c.receive_packet(&data(101, 100, 11))?.is_empty());
+            {
+                let mut remove = core::pin::pin!(c.stop_rx_ba(t.hardware.as_mut().unwrap(), 0));
+                if !native_poll(remove.as_mut()).is_pending() {
+                    return Err("native BAID removal skipped receipt");
+                }
+                let p = t.trace.take().ok_or("BAID remove trace absent")?;
+                if p.bytes[7] != 0
+                    || p.bytes[8..] != [2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                {
+                    return Err("ML BAID v2 removal payload/header");
+                }
+                t.firmware.inject(0x16, 5, 0, &[255, 255, 255, 255]); // ADD-only returned ID ignored.
+                if !native_poll(remove.as_mut()).is_pending() {
+                    return Err("BAID REMOVE ACK freed host window before marker");
+                }
+                let p = t.trace.take().ok_or("BAID marker command absent")?;
+                if p.bytes[8..]
+                    != [
+                        0, 0, 0, 0, 1, 0, 0, 0, 12, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0,
+                    ]
+                {
+                    return Err("MLD BAID marker bytes");
+                }
+                if loss || foreign {
+                    let mut frame =
+                        frame_api::management(0xc0, [4; 6], [2; 6], 0, &3u16.to_le_bytes());
+                    frame[16..22].copy_from_slice(&[4; 6]);
+                    let mut payload = mgmt_mpdu_payload(&frame);
+                    if foreign {
+                        payload[42] = 40;
+                    }
+                    t.firmware.inject(0xc1, 0, 0x8000, &payload);
+                }
+                t.firmware.inject(2, 5, 1, &[]);
+                if !native_poll(remove.as_mut()).is_pending() {
+                    return Err("RX marker command ACK retired native session");
+                }
+                t.firmware.inject(0xff, 5, 0x8000, &ba_marker(1));
+                let result = native_poll(remove.as_mut());
+                if loss {
+                    if !matches!(result, core::task::Poll::Ready(Err("AP disconnected"))) {
+                        return Err("retirement swallowed current AP disconnect");
+                    }
+                } else if !matches!(result, core::task::Poll::Ready(Ok(()))) {
+                    return Err("exact BAID/RX marker failed to retire host session");
+                }
+            }
+            if c.replay.pairwise[0] != 0 || loss && c.authorized || !loss && c.rx_ba[0].is_some() {
+                return Err("retired reorder prefix leaked PN/session or peer-loss authorization");
+            }
+        }
+        Ok(())
+    };
+    test().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/connection",
+    smoke_connection_native_baid_remove_waits_for_marker_and_preserves_peer_loss
+);
+fn smoke_connection_native_baid_cancelled_remove_cannot_replay_or_deliver_prefix() -> TestResult {
+    let test = || -> Result<(), &'static str> {
+        let mut t = NativeBa::new();
+        let mut c = connection();
+        assert!(c.receive_packet(&data(101, 100, 11))?.is_empty());
+        {
+            let mut f = core::pin::pin!(c.stop_rx_ba(t.hardware.as_mut().unwrap(), 0));
+            if !native_poll(f.as_mut()).is_pending() {
+                return Err("cancelled BAID removal was not published");
+            }
+        }
+        t.trace.take().ok_or("cancelled BAID command absent")?;
+        if !c.receive_packet(&data(100, 102, 10))?.is_empty() || c.replay.pairwise[0] != 0 {
+            return Err("cancelled native removal released reorder/PN prefix");
+        }
+        {
+            let mut f = core::pin::pin!(c.stop_rx_ba(t.hardware.as_mut().unwrap(), 0));
+            if !matches!(native_poll(f.as_mut()), core::task::Poll::Ready(Err(_))) {
+                return Err("cancelled native BAID removal replayed");
+            }
+        }
+        if t.trace.take().is_some() {
+            return Err("second native BAID removal producer");
+        }
+        Ok(())
+    };
+    test().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/connection",
+    smoke_connection_native_baid_cancelled_remove_cannot_replay_or_deliver_prefix
+);
+fn smoke_connection_native_addba_response_completion_precedes_reorder_admission() -> TestResult {
+    let test = || -> Result<(), &'static str> {
+        for complete in [false, true] {
+            let mut t = NativeBa::new();
+            t.management_queue()?;
+            let mut c = connection();
+            let mut frame =
+                frame_api::management(0xd0, [4; 6], [2; 6], 0, &[3, 0, 9, 0xc6, 0, 0, 0, 0x40, 6]);
+            frame[16..22].copy_from_slice(&[4; 6]);
+            c.receive_packet(&notification(0xc1, mgmt_mpdu_payload(&frame)))?;
+            let response_pointer;
+            {
+                let mut f = core::pin::pin!(c.service_aggregation(t.hardware.as_mut().unwrap()));
+                if !native_poll(f.as_mut()).is_pending() {
+                    return Err("ADDBA skipped native BAID allocation");
+                }
+                let p = t.trace.take().ok_or("ADDBA allocation absent")?;
+                if p.bytes[8..] != [0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 100, 0, 3, 0] {
+                    return Err("native ADD BAID did not bind requested TID/SSN/window");
+                }
+                t.firmware.inject(0x16, 5, 1, &[7, 0, 0, 0]);
+                if !native_poll(f.as_mut()).is_pending() {
+                    return Err("positive ADDBA did not wait actual packet completion");
+                }
+                let p = t
+                    .trace
+                    .take()
+                    .ok_or("positive native ADDBA response absent")?;
+                if p.bytes.get(56..) != Some(&[3, 1, 9, 0, 0, 0xc6, 0, 0, 0]) {
+                    return Err("native ADDBA positive dialog/SSN/window binding");
+                }
+                response_pointer = p.pointer;
+                if complete {
+                    t.firmware.tx_complete(1, p.pointer);
+                    if !matches!(native_poll(f.as_mut()), core::task::Poll::Ready(Ok(()))) {
+                        return Err("positive native response failed activation");
+                    }
+                }
+            }
+            let mut packet = data(100, 101, 10);
+            packet.payload[88] = 1;
+            put32(&mut packet.payload, 16, 7 << 24 | 100 << 12 | 101);
+            let frames = c.receive_packet(&packet)?;
+            if complete {
+                if frames.len() != 1 || c.replay.pairwise[1] != 10 {
+                    return Err("terminal ADDBA did not activate correct native BAID/TID");
+                }
+            } else {
+                if !frames.is_empty() || c.replay.pairwise[1] != 0 {
+                    return Err("cancelled response prematurely activated receive/replay");
+                }
+                t.firmware.tx_complete(1, response_pointer);
+                t.hardware.as_mut().unwrap().poll()?;
+                if !c.receive_packet(&packet)?.is_empty() || c.replay.pairwise[1] != 0 {
+                    return Err("late positive TX receipt reconstructed a lost BA response owner");
+                }
+                c.receive_packet(&notification(0xc1, mgmt_mpdu_payload(&frame)))?;
+                let mut f = core::pin::pin!(c.service_aggregation(t.hardware.as_mut().unwrap()));
+                if !matches!(native_poll(f.as_mut()), core::task::Poll::Ready(Err(_))) {
+                    return Err("late duplicate dialog reconstructed unproved positive response");
+                }
+            }
+        }
+        Ok(())
+    };
+    test().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/connection",
+    smoke_connection_native_addba_response_completion_precedes_reorder_admission
 );

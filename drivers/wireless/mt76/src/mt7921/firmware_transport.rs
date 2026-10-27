@@ -10,7 +10,10 @@ mod station;
 pub use station::{NicCapabilities, PhyCapabilities, RadioInfo};
 #[path = "passive_scan.rs"]
 mod scan;
-pub use scan::{rx_frame, ScanBss, ScanReport};
+pub use scan::{
+    rx_frame, validate_scan_options, validate_scan_probe_ies, ScanBss, ScanOptions, ScanReport,
+    MAX_SCAN_IE_LEN,
+};
 #[path = "amsdu_rx.rs"]
 mod amsdu;
 #[path = "rx_ba.rs"]
@@ -186,19 +189,39 @@ pub fn boot_status() -> BootStatus {
 /// Run a receive-only hardware diagnostic using the retained boot owner.
 /// May be awaited from the executor; no sync bridge or IRQ lock is held.
 pub async fn scan_boot_passive(channels: &[u8]) -> Result<ScanReport, Error> {
-    finish_boot_keys().await?;
-    let Some(mut owner) = BOOT_OWNER.try_lock() else {
-        return Err(Error::Busy);
-    };
-    owner
-        .as_mut()
-        .ok_or(Error::DeviceGone)?
-        .scan_passive(channels)
-        .await
+    scan_boot_with_options(channels, &[], ScanOptions::default()).await
 }
 
 /// Policy-authorized active scan through the same retained radio owner.
 pub async fn scan_boot_active(channels: &[u8], ssids: &[Vec<u8>]) -> Result<ScanReport, Error> {
+    scan_boot_active_with_ies(channels, ssids, &[]).await
+}
+/// Active probes with a validated, owned600-byte native IE field.
+pub async fn scan_boot_active_with_ies(
+    channels: &[u8],
+    ssids: &[Vec<u8>],
+    extra_ies: &[u8],
+) -> Result<ScanReport, Error> {
+    if ssids.is_empty() {
+        return Err(Error::Bounds);
+    }
+    scan_boot_with_options(
+        channels,
+        ssids,
+        ScanOptions {
+            extra_ies,
+            random_mac: None,
+        },
+    )
+    .await
+}
+/// Retained active/passive scan with source-defined per-request options.
+pub async fn scan_boot_with_options(
+    channels: &[u8],
+    ssids: &[Vec<u8>],
+    options: ScanOptions<'_>,
+) -> Result<ScanReport, Error> {
+    validate_scan_options(options)?;
     finish_boot_keys().await?;
     let Some(mut owner) = BOOT_OWNER.try_lock() else {
         return Err(Error::Busy);
@@ -206,7 +229,7 @@ pub async fn scan_boot_active(channels: &[u8], ssids: &[Vec<u8>]) -> Result<Scan
     owner
         .as_mut()
         .ok_or(Error::DeviceGone)?
-        .scan_active(channels, ssids)
+        .scan_with_options(channels, ssids, options)
         .await
 }
 
@@ -257,18 +280,30 @@ pub async fn transmit_boot_frame(frame: &[u8]) -> Result<(), Error> {
 /// Receive a data frame from the data queue using the retained boot owner.
 pub async fn receive_boot_data() -> Result<Option<Vec<u8>>, Error> {
     finish_boot_keys().await?;
-    let frame = {
+    let (frame, epoch) = {
         let Some(mut owner) = BOOT_OWNER.try_lock() else {
             return Err(Error::Busy);
         };
-        owner
-            .as_mut()
-            .ok_or(Error::DeviceGone)?
-            .receive_data_frame()
-            .await?
+        let owner = owner.as_mut().ok_or(Error::DeviceGone)?;
+        let epoch = owner.current_receive_epoch()?;
+        (owner.receive_data_frame().await?, epoch)
     };
-    service_boot_keys().await?;
-    Ok(frame)
+    finish_received_data(frame, epoch, service_boot_keys(), boot_receive_current).await
+}
+
+/// The direct async API has the same final-owner check as packet batches.
+/// Key service can replace its receive epoch after extraction releases BOOT_OWNER.
+async fn finish_received_data(
+    frame: Option<Vec<u8>>,
+    epoch: Option<u64>,
+    service: impl core::future::Future<Output = Result<(), Error>>,
+    current: impl FnOnce(u64) -> Result<bool, Error>,
+) -> Result<Option<Vec<u8>>, Error> {
+    service.await?;
+    match (frame, epoch) {
+        (Some(frame), Some(epoch)) if current(epoch)? => Ok(Some(frame)),
+        _ => Ok(None),
+    }
 }
 
 /// One bounded packet-service step. No executor task or IRQ wake is needed
@@ -277,6 +312,41 @@ pub async fn receive_boot_data() -> Result<Option<Vec<u8>>, Error> {
 pub struct PacketStep {
     pub transmitted: bool,
     pub received: Vec<Vec<u8>>,
+    /// Identifies the actual station/key receive owner that produced the batch.
+    pub receive_epoch: u64,
+}
+
+/// Recheck before every unlocked kernel callback and IPC publication. A
+/// retained key future temporarily removes BOOT_OWNER, closing publication.
+/// False drops only this stale batch and must not tear down a newer owner.
+pub fn boot_receive_current(epoch: u64) -> Result<bool, Error> {
+    let Some(owner) = BOOT_OWNER.try_lock() else {
+        return Ok(false);
+    };
+    owner
+        .as_ref()
+        .map_or(Ok(false), |owner| owner.receive_current(epoch))
+}
+pub(crate) fn boot_refresh_receive_epoch(refresh: impl FnOnce(Option<u64>)) -> Result<(), Error> {
+    let Some(owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    let epoch = owner
+        .as_ref()
+        .map_or(Ok(None), |owner| owner.current_receive_epoch())?;
+    refresh(epoch);
+    Ok(())
+}
+/// Non-reentrant IPC publication only: no callback or await may occur while
+/// the native owner serializes this final epoch check with key replacement.
+pub(crate) fn boot_receive_publish(epoch: u64, publish: impl FnOnce()) -> Result<bool, Error> {
+    let Some(owner) = BOOT_OWNER.try_lock() else {
+        return Ok(false);
+    };
+    let Some(owner) = owner.as_ref() else {
+        return Ok(false);
+    };
+    owner.publish_receive(epoch, publish)
 }
 
 pub fn step_boot_network(tx: Option<&[u8]>) -> Result<PacketStep, Error> {
@@ -478,6 +548,7 @@ const MAX_FRAME: usize = 4096;
 const TIMEOUT_MS: u64 = 3000;
 const MAX_EVENTS: usize = 32;
 const MAX_IMAGE: usize = 16 * 1024 * 1024;
+static NEXT_RECEIVE_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 // Shared by the physical backend and cancellation models. A published owner
 // cannot infer device quiescence from Rust future/owner lifetime alone.
@@ -734,7 +805,21 @@ fn command_frame(command: u8, seq: u8, payload: &[u8]) -> Result<Vec<u8>, Error>
     Ok(frame)
 }
 
+/// Immutable admission facts at the native DMA-to-owned-copy boundary.
+/// A later port opening cannot authorize a copy made while the port was shut.
+#[derive(Debug, PartialEq, Eq)]
+struct CapturedData {
+    bytes: Vec<u8>,
+    epoch: u64,
+    port_open: bool,
+}
+
 trait Backend {
+    /// Actual hardware chip ID; zero means no identity proof in a pure model.
+    /// Wider chip-specific profiles must not infer this from firmware max_bw.
+    fn chip_id(&self) -> Result<u16, Error> {
+        Ok(0)
+    }
     /// Protocol nonce entropy is fallible; deterministic fixtures override this
     /// boundary, while the native backend always requires the architectural RNG.
     fn random_bytes(&mut self, out: &mut [u8]) -> Result<(), Error> {
@@ -757,8 +842,16 @@ trait Backend {
     fn tx_complete(&mut self, scatter: bool) -> Result<bool, Error>;
     fn receive(&mut self) -> Result<Option<Vec<u8>>, Error>;
     fn receive_data(&mut self) -> Result<Option<Vec<u8>>, Error>;
-    /// A current native RX-ring/FIFO idle observation, including host-queued
+    fn receive_data_captured(&mut self) -> Result<Option<CapturedData>, Error>;
+    /// Infallibly close host admission before any key/owner transition can wait.
+    fn close_receive_capture(&mut self, epoch: u64);
+    /// Preserve closed copies and drain the already-completed native prefix
+    /// before changing the copy-time admission state. This is not a firmware
+    /// key-retirement or MAC/FIFO quiescence proof.
+    fn open_receive_capture(&mut self, epoch: u64) -> Result<(), Error>;
+    /// A current native completed-RX-ring observation, including host-queued
     /// normal/forwarded frames. An empty decoded-frame result is insufficient.
+    /// This does not prove MAC/FIFO or in-flight firmware quiescence.
     fn receive_idle(&self) -> Result<bool, Error>;
     fn release(&mut self) -> Result<(), Error>;
     fn park_bus_master(&mut self) -> Result<(), Error>;
@@ -836,6 +929,7 @@ struct Session<B: Backend> {
     control_pending: VecDeque<Vec<u8>>,
     rx_ba: ba::Owner,
     received_msdu: VecDeque<Vec<u8>>,
+    receive_epoch: u64,
 }
 impl<B: Backend> Session<B> {
     fn new(backend: B, firmware: Firmware) -> Self {
@@ -864,6 +958,7 @@ impl<B: Backend> Session<B> {
             control_pending: VecDeque::new(),
             rx_ba: ba::Owner::default(),
             received_msdu: VecDeque::new(),
+            receive_epoch: 0,
         }
     }
     fn stage(&mut self, stage: Stage) {

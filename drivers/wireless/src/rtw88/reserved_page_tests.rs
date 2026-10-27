@@ -87,6 +87,8 @@ struct Model {
     station_gate: Option<crate::rtw88::power_policy::Gate>,
     extension: Option<Arc<crate::rtw88::station_profile::Grant>>,
     ht: Option<Arc<crate::rtw88::ht::Grant>>,
+    rx_ba: Option<Arc<crate::rtw88::rx_ba_power::Grant>>,
+    tx_ba: Option<Arc<crate::rtw88::tx_ba_power::Grant>>,
     before_publication: Option<Arc<dyn Fn() + Send + Sync>>,
     edca_writes: usize,
     packet_model: crate::rtw88::packet_core::tests::Model,
@@ -101,6 +103,30 @@ struct Model {
 #[derive(Clone)]
 struct Port(Arc<IrqSafeSpinLock<Model>>);
 impl Port {
+    fn tx_base(&self) -> Result<crate::rtw88::tx_ba_power::Base, Error> {
+        let m = self.0.lock();
+        Ok(match &m.rx_ba {
+            Some(r) => crate::rtw88::tx_ba_power::Base::R(r.clone()),
+            None => crate::rtw88::tx_ba_power::Base::H(m.ht.as_ref().ok_or(Error::State)?.clone()),
+        })
+    }
+    fn tx_ba_request(&self) -> Result<crate::rtw88::TxBaRequest, Error> {
+        crate::rtw88::tx_ba_power::request(&self.tx_base()?)
+    }
+    fn qualify_tx_ba(&self, s: crate::rtw88::tx_ba_power::Source) -> Result<(), Error> {
+        let g = s.load(self.tx_base()?)?;
+        self.0.lock().tx_ba = Some(g);
+        Ok(())
+    }
+    fn rx_ba_request(&self) -> Result<crate::rtw88::RxBaRequest, Error> {
+        crate::rtw88::rx_ba_power::request(self.0.lock().ht.as_ref().ok_or(Error::State)?)
+    }
+    fn qualify_rx_ba(&self, s: crate::rtw88::rx_ba_power::Source) -> Result<(), Error> {
+        let h = self.0.lock().ht.as_ref().ok_or(Error::State)?.clone();
+        let grant = s.load(h)?;
+        self.0.lock().rx_ba = Some(grant);
+        Ok(())
+    }
     fn qualify_ht(&self, s: crate::rtw88::ht::Source) -> Result<(), Error> {
         let b = self
             .0
@@ -163,6 +189,85 @@ impl Port {
 // SAFETY: no physical PCI/DMA. The simulator holds all synthetic device
 // mappings, observes OWN before claiming, and only reads published storage.
 unsafe impl Registers for Port {
+    fn station_tx_ba_extension(
+        &mut self,
+    ) -> Result<Option<Arc<crate::rtw88::tx_ba_power::Grant>>, Error> {
+        self.station_allowed()?;
+        Ok(self.0.lock().tx_ba.clone())
+    }
+    fn station_bind_tx_ba(
+        &mut self,
+        g: Arc<crate::rtw88::tx_ba_power::Grant>,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        let gate = self
+            .0
+            .lock()
+            .station_gate
+            .as_ref()
+            .ok_or(Error::State)?
+            .with_tx_ba(g)?;
+        let current = gate.clone();
+        let mut m = self.0.lock();
+        m.packet_model.authority = Some(Arc::new(move || current.current().is_ok()));
+        m.packet_model.originator_ba = true;
+        m.station_gate = Some(gate);
+        Ok(())
+    }
+    fn packet_aggregation(
+        &mut self,
+        cfg: Option<crate::rtw88::packet_format::Aggregation>,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        let mut m = self.0.lock();
+        if cfg.is_some_and(|c| {
+            m.station_gate
+                .as_ref()
+                .and_then(crate::rtw88::power_policy::Gate::tx_grant)
+                .is_none_or(|g| !g.allows(c))
+        }) {
+            return Err(Error::Prerequisite);
+        }
+        m.packet_core
+            .as_mut()
+            .ok_or(Error::State)?
+            .aggregation(cfg)
+            .map_err(|_| Error::State)
+    }
+    fn packet_submit_batch(
+        &mut self,
+        b: &[Vec<u8>],
+    ) -> Result<Vec<u64>, crate::rtw88::packet_core::Error> {
+        self.station_allowed()
+            .map_err(|_| crate::rtw88::packet_core::Error::Access)?;
+        self.packet_with(|core, port| core.submit_batch(port, b))
+    }
+    fn station_rx_ba_extension(
+        &mut self,
+        _: Arc<crate::rtw88::ht::Grant>,
+    ) -> Result<Option<Arc<crate::rtw88::rx_ba_power::Grant>>, Error> {
+        self.station_allowed()?;
+        Ok(self.0.lock().rx_ba.clone())
+    }
+    fn station_bind_rx_ba(
+        &mut self,
+        g: Arc<crate::rtw88::rx_ba_power::Grant>,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        let gate = self
+            .0
+            .lock()
+            .station_gate
+            .as_ref()
+            .ok_or(Error::State)?
+            .with_rx_ba(g)?;
+        let current = gate.clone();
+        let mut m = self.0.lock();
+        m.packet_model.authority = Some(Arc::new(move || current.current().is_ok()));
+        m.packet_model.recipient_ba = true;
+        m.station_gate = Some(gate);
+        Ok(())
+    }
     fn station_ht_facts(&self) -> Option<crate::rtw88::ht::Facts> {
         self.0.lock().station_gate.as_ref()?.ht_facts()
     }
@@ -208,6 +313,30 @@ unsafe impl Registers for Port {
         let mut value = u16::from_le_bytes(model.bytes[at..at + 2].try_into().unwrap());
         if reg == 0x204 && model.stale_valid {
             value |= 1 << 15;
+        }
+        if matches!(reg, 0x232 | 0x236 | 0x23a | 0x23e)
+            && model
+                .station_gate
+                .as_ref()
+                .is_some_and(crate::rtw88::power_policy::Gate::allows_tx_ba)
+        {
+            if model
+                .packet_model
+                .controls
+                .fifo_invalid
+                .load(Ordering::Acquire)
+            {
+                return Ok(u16::MAX);
+            }
+            if model
+                .packet_model
+                .controls
+                .fifo_stuck
+                .load(Ordering::Acquire)
+            {
+                return Ok(0);
+            }
+            return Ok(if reg == 0x23e { 14 } else { 16 });
         }
         Ok(value)
     }
@@ -739,6 +868,8 @@ fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
         station_gate: None,
         extension: None,
         ht: None,
+        rx_ba: None,
+        tx_ba: None,
         before_publication: None,
         edca_writes: 0,
         packet_model: crate::rtw88::packet_core::tests::Model::new(),

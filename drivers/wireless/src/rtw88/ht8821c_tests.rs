@@ -1,12 +1,110 @@
 //! C21 actual retained reserved firmware DMA → Q/P/S/L/H → HT station adapter.
 use super::*;
+use crate::rtw88::firmware_transport::Error;
 use crate::rtw88::{ht, ht_tests as cases};
 struct Case {
     e: Extended,
     cap: Cap<FirmwareBlob, Read>,
 }
+fn smoke_rtw8821ce_native_early_m3_and_closed_data_before_m2_ccx() -> TestResult {
+    check(cases::early_m3_control::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rx_ba/rtl8821c",
+    smoke_rtw8821ce_native_early_m3_and_closed_data_before_m2_ccx
+);
+fn smoke_rtw8821ce_tx_ba_open_dhcp_ip_and_recipient_coexistence() -> TestResult {
+    check(|| crate::rtw88::tx_ba_tests::composition::<Case>(false))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba/rtl8821c",
+    smoke_rtw8821ce_tx_ba_open_dhcp_ip_and_recipient_coexistence
+);
+fn smoke_rtw8821ce_tx_ba_wpa2_dhcp_ip_and_recipient_coexistence() -> TestResult {
+    check(|| crate::rtw88::tx_ba_tests::composition::<Case>(true))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba/rtl8821c",
+    smoke_rtw8821ce_tx_ba_wpa2_dhcp_ip_and_recipient_coexistence
+);
+fn smoke_rtw8821ce_tx_ba_distinct_assets_and_h_fallback() -> TestResult {
+    check(crate::rtw88::tx_ba_tests::refusal_and_legacy::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba/rtl8821c",
+    smoke_rtw8821ce_tx_ba_distinct_assets_and_h_fallback
+);
+fn smoke_rtw8821ce_tx_ba_peer_response_and_actual_per_tid_ssn() -> TestResult {
+    check(crate::rtw88::tx_ba_tests::peer_response_and_ssn::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba/rtl8821c",
+    smoke_rtw8821ce_tx_ba_peer_response_and_actual_per_tid_ssn
+);
+fn smoke_rtw8821ce_tx_ba_held_request_ccx_cancel_and_dma() -> TestResult {
+    check(crate::rtw88::tx_ba_tests::held_dialog_and_cancel::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba/rtl8821c",
+    smoke_rtw8821ce_tx_ba_held_request_ccx_cancel_and_dma
+);
+fn smoke_rtw8821ce_tx_ba_mac_fifo_all_sources_and_late_receipts() -> TestResult {
+    check(crate::rtw88::tx_ba_tests::fifo_and_authority::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba/rtl8821c",
+    smoke_rtw8821ce_tx_ba_mac_fifo_all_sources_and_late_receipts
+);
+fn smoke_rtw8821ce_tx_ba_partial_bd_current_authority_and_close() -> TestResult {
+    check(crate::rtw88::tx_ba_tests::partial_publication_and_close::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba/rtl8821c",
+    smoke_rtw8821ce_tx_ba_partial_bd_current_authority_and_close
+);
+fn smoke_rtw8821ce_tx_ba_peer_delba_and_real_key_epoch() -> TestResult {
+    check(crate::rtw88::tx_ba_tests::delba_and_key_epoch::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba/rtl8821c",
+    smoke_rtw8821ce_tx_ba_peer_delba_and_real_key_epoch
+);
 impl cases::Fixture for Case {
     type Io = Backend<Port, Block>;
+    fn tx_request(&self) -> Result<crate::rtw88::TxBaRequest, Error> {
+        self.e.h.port.tx_ba_request()
+    }
+    fn stage_tx(&self, bytes: Vec<u8>, cap: Cap<FirmwareBlob, Read>) -> Result<(), Error> {
+        self.e
+            .h
+            .port
+            .qualify_tx_ba(crate::rtw88::tx_ba_power::Source::Verified {
+                bytes,
+                cap,
+                signer: Some([16; 32]),
+            })
+    }
+    fn descriptors(&self) -> Vec<[u8; 48]> {
+        self.e.h.port.0.lock().packet_model.descriptors.clone()
+    }
+    fn ba_request(&self) -> Result<crate::rtw88::RxBaRequest, Error> {
+        self.e.h.port.rx_ba_request()
+    }
+    fn stage_ba(&self, bytes: Vec<u8>, cap: Cap<FirmwareBlob, Read>) -> Result<(), Error> {
+        self.e
+            .h
+            .port
+            .qualify_rx_ba(crate::rtw88::rx_ba_power::Source::Verified {
+                bytes,
+                signer: Some([14; 32]),
+                cap,
+            })
+    }
+    fn advance_ms(&self, ms: u64) {
+        let mut m = self.e.h.port.0.lock();
+        m.clock.fetch_add(ms, core::sync::atomic::Ordering::AcqRel);
+        m.packet_model.now += ms * 1000;
+    }
     fn make(protected: bool, mcs: u8, sgi: bool, qualified: bool) -> Result<Self, &'static str> {
         let e = setup(protected, true, true, None)?;
         let cap = Cap::bootstrap();
@@ -154,6 +252,77 @@ kernel_test_in!(
     smoke_rtw8821ce_ht_bound_response_and_original_mandatory_selector
 );
 
+// Recipient RX BA uses the same retained H fixture, with a distinct R grant.
+fn smoke_rtw8821ce_rx_ba_open_reordered_dhcp_ip() -> TestResult {
+    check(|| crate::rtw88::rx_ba_tests::composition::<Case>(false))
+}
+fn smoke_rtw8821ce_rx_ba_pre_m4_closed_capture_cannot_stage_or_activate() -> TestResult {
+    check(crate::rtw88::rx_ba_tests::pre_m4_denial::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rx_ba/rtl8821c",
+    smoke_rtw8821ce_rx_ba_pre_m4_closed_capture_cannot_stage_or_activate
+);
+fn smoke_rtw8821ce_rx_ba_delba_before_proposal_or_native_submit() -> TestResult {
+    check(crate::rtw88::rx_ba_tests::delba_before_submit::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rx_ba/rtl8821c",
+    smoke_rtw8821ce_rx_ba_delba_before_proposal_or_native_submit
+);
+kernel_test_in!(
+    "drivers/wireless/rtw88/rx_ba/rtl8821c",
+    smoke_rtw8821ce_rx_ba_open_reordered_dhcp_ip
+);
+fn smoke_rtw8821ce_rx_ba_wpa2_reordered_dhcp_ip() -> TestResult {
+    check(|| crate::rtw88::rx_ba_tests::composition::<Case>(true))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rx_ba/rtl8821c",
+    smoke_rtw8821ce_rx_ba_wpa2_reordered_dhcp_ip
+);
+fn smoke_rtw8821ce_rx_ba_ssn_wrap_bar_holes_and_tu_inactivity() -> TestResult {
+    check(crate::rtw88::rx_ba_tests::windows_bar_timers::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rx_ba/rtl8821c",
+    smoke_rtw8821ce_rx_ba_ssn_wrap_bar_holes_and_tu_inactivity
+);
+fn smoke_rtw8821ce_rx_ba_original3839_amsdu_mic_and_tid_pn() -> TestResult {
+    check(crate::rtw88::rx_ba_tests::original_amsdu::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rx_ba/rtl8821c",
+    smoke_rtw8821ce_rx_ba_original3839_amsdu_mic_and_tid_pn
+);
+fn smoke_rtw8821ce_rx_ba_held_success_ccx_capture_and_peer_delba() -> TestResult {
+    check(crate::rtw88::rx_ba_tests::receipt_and_delba::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rx_ba/rtl8821c",
+    smoke_rtw8821ce_rx_ba_held_success_ccx_capture_and_peer_delba
+);
+fn smoke_rtw8821ce_rx_ba_distinct_asset_refusal_retry_and_h_decline() -> TestResult {
+    check(crate::rtw88::rx_ba_tests::assets_and_fallback::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rx_ba/rtl8821c",
+    smoke_rtw8821ce_rx_ba_distinct_asset_refusal_retry_and_h_decline
+);
+fn smoke_rtw8821ce_rx_ba_current_sources_cancel_and_uncertain_dma() -> TestResult {
+    check(crate::rtw88::rx_ba_tests::authority_and_uncertainty::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rx_ba/rtl8821c",
+    smoke_rtw8821ce_rx_ba_current_sources_cancel_and_uncertain_dma
+);
+fn smoke_rtw8821ce_rx_ba_real_group_reply_retires_old_key_window() -> TestResult {
+    check(crate::rtw88::rx_ba_tests::key_epoch::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rx_ba/rtl8821c",
+    smoke_rtw8821ce_rx_ba_real_group_reply_retires_old_key_window
+);
 fn smoke_rtw8821ce_ht_native_wpa2_lgi_sgi_dhcp_ip() -> TestResult {
     check(|| cases::composition::<Case>(true))
 }

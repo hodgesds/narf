@@ -10,6 +10,7 @@ struct Fixture {
 impl Fixture {
     fn new(full: bool) -> Self {
         let (hardware, firmware) = super::super::runtime::model::create(full);
+        let source = hardware.source_fence().unwrap();
         let (producer, consumer) = narf_ipc::channel();
         let mut consumers = core::array::from_fn(|_| None);
         consumers[1] = Some(consumer);
@@ -22,6 +23,7 @@ impl Fixture {
                 connection: Some(Connection::open_model()),
                 needs_reset: false,
                 producer: None,
+                receive_ipc: None,
                 eapol: VecDeque::new(),
                 tx: consumers,
                 pending: core::array::from_fn(|_| None),
@@ -29,6 +31,10 @@ impl Fixture {
             }),
             control: Mutex::new(None),
             publication: AtomicBool::new(false),
+            source,
+            generation: Arc::new(AtomicU64::new(0)),
+            quarantined: AtomicBool::new(false),
+            admission: IrqSafeSpinLock::new(()),
             mac: [2; 6],
             irq_vector: None,
             channels: alloc::vec![1],
@@ -61,6 +67,7 @@ impl Fixture {
         let mut mpdu = alloc::vec![0; 64+34];
         super::super::boot_context::put16(&mut mpdu, 0, 34);
         super::super::boot_context::put32(&mut mpdu, 12, 3);
+        mpdu[42] = 1;
         mpdu[64..66].copy_from_slice(&[8, 2]);
         mpdu[68..74].copy_from_slice(&[2; 6]);
         mpdu[74..80].copy_from_slice(&[4; 6]);
@@ -166,6 +173,7 @@ fn smoke_iwl_device_retained_eapol_waiter_drop_native_credit_and_receipt() -> Te
     let mut mpdu = alloc::vec![0;64+24+8+m1.len()];
     super::super::boot_context::put16(&mut mpdu, 0, (24 + 8 + m1.len()) as u16);
     super::super::boot_context::put32(&mut mpdu, 12, 3);
+    mpdu[42] = 1;
     mpdu[64..66].copy_from_slice(&[8, 2]);
     mpdu[68..74].copy_from_slice(&[2; 6]);
     mpdu[74..80].copy_from_slice(&[4; 6]);

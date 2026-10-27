@@ -7,7 +7,7 @@ use super::{
     station::{self, Environment},
     station_control::Admission,
 };
-use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, string::String, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
@@ -21,10 +21,12 @@ struct Rings {
     rx: narf_ipc::Producer<Frame, RX_RING_N>,
     tx: narf_ipc::Consumer<Frame, TX_RING_N>,
     pending: Option<Frame>,
+    batch: VecDeque<Frame>,
 }
 impl Rings {
     fn clear(&mut self) {
         self.pending = None;
+        self.batch.clear();
         for _ in 0..TX_RING_N {
             if !matches!(self.tx.try_recv(), Ok(Some(_))) {
                 break;
@@ -107,6 +109,7 @@ impl<I: Io + 'static> Device<I> {
                 rx,
                 tx,
                 pending: None,
+                batch: VecDeque::new(),
             }),
             name: name.into(),
             local,
@@ -296,6 +299,9 @@ impl<I: Io + 'static> Device<I> {
                 return Ok(Vec::new());
             }
             if rings.pending.is_none() {
+                rings.pending = rings.batch.pop_front();
+            }
+            if rings.pending.is_none() {
                 for _ in 0..16 {
                     let Ok(Some(frame)) = rings.tx.try_recv() else {
                         break;
@@ -307,7 +313,47 @@ impl<I: Io + 'static> Device<I> {
                 }
             }
             if owner.station_ready() {
-                if let Some(frame) = rings.pending.as_ref() {
+                if owner.station_batch_active() && rings.pending.is_some() {
+                    let capacity = owner.station_batch_capacity();
+                    for _ in 0..16 {
+                        if rings.batch.len() + 1 >= capacity {
+                            break;
+                        }
+                        let Ok(Some(frame)) = rings.tx.try_recv() else {
+                            break;
+                        };
+                        if station::admitted(frame.payload(), self.local)
+                            && offloads(frame.tx_meta())
+                        {
+                            rings.batch.push_back(frame);
+                        }
+                    }
+                    let mut frames = Vec::new();
+                    if let Some(first) = rings.pending.as_ref() {
+                        frames.push(first.payload());
+                    }
+                    frames.extend(
+                        rings
+                            .batch
+                            .iter()
+                            .take(capacity.saturating_sub(1))
+                            .map(Frame::payload),
+                    );
+                    match owner.station_send_batch(&frames) {
+                        Ok(count) => {
+                            if count == 0 || count > frames.len() {
+                                return Err(Error::State);
+                            }
+                            rings.pending = None;
+                            for _ in 1..count {
+                                rings.batch.pop_front();
+                            }
+                        }
+                        Err(Error::Busy)
+                        | Err(Error::Transport(super::packet_core::Error::Busy)) => {}
+                        Err(error) => return Err(error),
+                    }
+                } else if let Some(frame) = rings.pending.as_ref() {
                     match owner.station_send(frame.payload()) {
                         Ok(()) => rings.pending = None,
                         Err(Error::Busy)
@@ -582,6 +628,15 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         let result = owner
             .station_associate(request.bssid, &request.ssid, pmk, &request.ie)
             .await;
+        #[cfg(feature = "kernel-test")]
+        if let Err(error) = &result {
+            narf_console::klog!(
+                "RTW native association failed {:?}, phase {:?}, peer {:?}\n",
+                error,
+                owner.station_phase(),
+                owner.station_peer()
+            );
+        }
         attempt.armed = false;
         if self.closed() {
             self.link(None, false);

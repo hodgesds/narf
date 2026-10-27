@@ -22,6 +22,28 @@ pub(crate) fn publish_link(name: &str, up: bool) -> bool {
     narf_net::iface::set_link_metadata(name, up, None, None)
 }
 
+/// Shared by production delivery and native reentrant-callback fixtures.
+/// Each callback starts with current authority, releases all native locks,
+/// then revalidates before non-reentrant IPC publication or the next frame.
+pub(crate) fn deliver_received_batch(
+    step: crate::mt7921::firmware_transport::PacketStep,
+    mut current: impl FnMut(u64) -> Result<bool, WirelessError>,
+    mut callback: impl FnMut(&mut Vec<u8>),
+    mut publish: impl FnMut(Vec<u8>, u64) -> Result<(), WirelessError>,
+) -> Result<(), WirelessError> {
+    for mut data in step.received {
+        if !current(step.receive_epoch)? {
+            break;
+        }
+        callback(&mut data);
+        if !current(step.receive_epoch)? {
+            break;
+        }
+        publish(data, step.receive_epoch)?;
+    }
+    Ok(())
+}
+
 /// One retained legacy 2.4/5 GHz station, with carrier gated by association.
 #[derive(Debug)]
 pub struct Mt76Iface {
@@ -38,6 +60,7 @@ pub struct Mt76Iface {
     teardown_needed: AtomicBool,
     recovery_attempts: AtomicU32,
     recovery_after_ns: AtomicU64,
+    receive_epoch: AtomicU64,
 }
 impl Mt76Iface {
     /// Build from validated radio identity, without disconnected frame rings.
@@ -62,6 +85,7 @@ impl Mt76Iface {
             teardown_needed: AtomicBool::new(false),
             recovery_attempts: AtomicU32::new(0),
             recovery_after_ns: AtomicU64::new(0),
+            receive_epoch: AtomicU64::new(0),
         })
     }
     /// Legacy 20 MHz channels on firmware-reported bands.
@@ -127,6 +151,7 @@ impl Mt76Iface {
                     return Ok(());
                 };
                 use crate::mt7921::firmware_transport::{service_boot_keys, Error};
+                self.refresh_receive_epoch()?;
                 match service_boot_keys().await {
                     Ok(()) | Err(Error::Busy) => {}
                     Err(_) => {
@@ -134,6 +159,7 @@ impl Mt76Iface {
                         return Err(WirelessError::HardwareError);
                     }
                 }
+                self.refresh_receive_epoch()?;
             }
         }
         Ok(())
@@ -165,22 +191,82 @@ impl Mt76Iface {
                 return Err(WirelessError::HardwareError);
             }
         };
+        self.refresh_receive_epoch()?;
         let progress = step.transmitted || !step.received.is_empty();
-        for mut data in step.received {
-            // Route outside all driver/ring locks: an ARP response may
-            // synchronously call the driver's transmit callback again.
-            narf_net::iface::on_rx_frame_from(&self.name, &mut data);
-            if let Ok(mut buffer) =
-                narf_io::alloc_coherent(data.len(), narf_lib::id::DomainId::DRIVER_0)
-            {
-                buffer.as_mut_slice()[..data.len()].copy_from_slice(&data);
-                let frame = Frame::new(buffer, data.len() as u32);
-                if let Some(producer) = self.rx_prod.lock().as_mut() {
-                    let _ = producer.try_send(frame);
+        deliver_received_batch(
+            step,
+            |epoch| self.receive_current(epoch),
+            |data| narf_net::iface::on_rx_frame_from(&self.name, data),
+            |data, epoch| {
+                if let Ok(mut buffer) =
+                    narf_io::alloc_coherent(data.len(), narf_lib::id::DomainId::DRIVER_0)
+                {
+                    buffer.as_mut_slice()[..data.len()].copy_from_slice(&data);
+                    let frame = Frame::new(buffer, data.len() as u32);
+                    let published =
+                        crate::mt7921::firmware_transport::boot_receive_publish(epoch, || {
+                            if self.link_up() {
+                                self.ensure_receive_epoch(epoch);
+                                if let Some(producer) = self.rx_prod.lock().as_mut() {
+                                    let _ = producer.try_send(frame);
+                                }
+                            }
+                        });
+                    if published.is_err() {
+                        self.lose_link();
+                        return Err(WirelessError::HardwareError);
+                    }
                 }
+                Ok(())
+            },
+        )?;
+        Ok(progress)
+    }
+
+    fn receive_current(&self, epoch: u64) -> Result<bool, WirelessError> {
+        if !self.link_up() {
+            return Ok(false);
+        }
+        match crate::mt7921::firmware_transport::boot_receive_current(epoch) {
+            Ok(current) => Ok(current),
+            Err(_) => {
+                self.lose_link();
+                Err(WirelessError::HardwareError)
             }
         }
-        Ok(progress)
+    }
+    fn ensure_receive_epoch(&self, epoch: u64) {
+        if self.receive_epoch.load(Ordering::Acquire) != epoch {
+            let (producer, consumer) = narf_ipc::channel::<Frame, RX_RING_N>();
+            *self.rx_ring.lock() = Some(consumer);
+            *self.rx_prod.lock() = Some(producer);
+            self.receive_epoch.store(epoch, Ordering::Release);
+        }
+    }
+    fn retire_receive_ipc(&self) {
+        *self.rx_ring.lock() = None;
+        *self.rx_prod.lock() = None;
+        self.receive_epoch.store(0, Ordering::Release);
+    }
+    fn refresh_receive_epoch(&self) -> Result<(), WirelessError> {
+        use crate::mt7921::firmware_transport::{boot_refresh_receive_epoch, Error};
+        match boot_refresh_receive_epoch(|epoch| {
+            if let Some(epoch) = epoch {
+                if self.link_up() {
+                    self.ensure_receive_epoch(epoch);
+                }
+            } else {
+                self.retire_receive_ipc();
+            }
+        }) {
+            Ok(()) => {}
+            Err(Error::Busy) => {}
+            Err(_) => {
+                self.lose_link();
+                return Err(WirelessError::HardwareError);
+            }
+        }
+        Ok(())
     }
 
     fn next_tx(&self) -> Option<Frame> {
@@ -196,6 +282,7 @@ impl Mt76Iface {
     }
 
     fn clear_link(&self) {
+        self.receive_epoch.store(0, Ordering::Release);
         *self.associated_bssid.lock() = None;
         publish_link(&self.name, false);
         *self.pending_tx.lock() = None;
@@ -317,6 +404,12 @@ impl WirelessNetIface for Mt76Iface {
     fn max_scan_ssids(&self) -> u8 {
         4
     }
+    fn max_scan_ie_len(&self) -> u16 {
+        crate::mt7921::firmware_transport::MAX_SCAN_IE_LEN
+    }
+    fn supports_scan_random_mac(&self) -> bool {
+        true
+    }
     fn get_wireless_info(&self) -> WirelessIfaceInfo {
         WirelessIfaceInfo {
             base_name: self.name.clone(),
@@ -340,7 +433,7 @@ impl WirelessNetIface for Mt76Iface {
         (self.radio.capabilities.phy.ht && self.radio.capabilities.phy.bands & band != 0).then_some(
             narf_wireless::iface::PhyCapabilities {
                 ht: if band == 2 && crate::mt7921::vht::qualified(self.radio) {
-                    crate::mt7921::vht::ht_capability()
+                    crate::mt7921::vht::ht_capability(self.radio)
                 } else {
                     crate::mt7921::ht20::capability40()
                 },
@@ -378,12 +471,16 @@ impl WirelessNetIface for Mt76Iface {
         }
         self.finish_teardown(true).await?;
         {
-            use crate::mt7921::firmware_transport::{scan_boot_active, scan_boot_passive, Error};
-            let result = if req.active {
-                scan_boot_active(&channels, &ssids).await
-            } else {
-                scan_boot_passive(&channels).await
-            };
+            use crate::mt7921::firmware_transport::{scan_boot_with_options, Error, ScanOptions};
+            let result = scan_boot_with_options(
+                &channels,
+                &ssids,
+                ScanOptions {
+                    extra_ies: &req.extra_ies,
+                    random_mac: req.random_mac,
+                },
+            )
+            .await;
             let report = result.map_err(|error| match error {
                 Error::Bounds => WirelessError::InvalidArgs,
                 Error::Busy => WirelessError::Busy,
@@ -527,13 +624,18 @@ impl WirelessNetIface for Mt76Iface {
 }
 fn scan_channels(req: &ScanRequest, bands: u8) -> Result<Vec<u8>, WirelessError> {
     use crate::mt7921::channel;
-    if req.random_mac.is_some()
-        || req.colocated_6ghz
-        || req.duration_mandatory
-        || req.duration_tu.is_some()
-        || !req.extra_ies.is_empty()
-    {
+    if req.colocated_6ghz || req.duration_mandatory || req.duration_tu.is_some() {
         return Err(WirelessError::NotSupported);
+    }
+    crate::mt7921::firmware_transport::validate_scan_options(
+        crate::mt7921::firmware_transport::ScanOptions {
+            extra_ies: &req.extra_ies,
+            random_mac: req.random_mac,
+        },
+    )
+    .map_err(|_| WirelessError::InvalidArgs)?;
+    if !req.active && !req.extra_ies.is_empty() {
+        return Err(WirelessError::InvalidArgs);
     }
     if !req.active && !req.ssids.is_empty()
         || req.ssids.len() > 4
@@ -640,7 +742,8 @@ pub(crate) fn register_scan_iface(info: RadioInfo) -> Result<Arc<Mt76Iface>, Wir
     // Reusing our retained interface grants no new registry access and must
     // not depend on the authority used for its original publication.
     if let Some(existing) = ACTIVE.lock().as_ref() {
-        return if existing.radio.capabilities == info.capabilities
+        return if existing.radio.chip_id == info.chip_id
+            && existing.radio.capabilities == info.capabilities
             && existing.radio.hardware_type == info.hardware_type
         {
             Ok(existing.clone())
@@ -791,6 +894,7 @@ mod tests {
     );
     fn radio() -> RadioInfo {
         RadioInfo {
+            chip_id: 0x7961,
             firmware: Report {
                 version: [0; 10],
                 build_date: [0; 15],
@@ -975,12 +1079,14 @@ mod tests {
             || !info.hw_caps.vht_supported
             || iface
                 .phy_capabilities(5000)
-                .is_none_or(|caps| caps.vht != Some([32, 0, 0, 0, 252, 255, 0, 0, 252, 255, 0, 0]))
+                .is_none_or(|caps| caps.vht != Some([48, 1, 0, 0, 250, 255, 0, 0, 254, 255, 0, 0]))
             || info.hw_caps.he_supported
             || info.hw_caps.eht_supported
             || !iface.supports_handshake_offload()
             || iface.supports_sae_offload()
             || iface.max_scan_ssids() != 4
+            || iface.max_scan_ie_len() != 600
+            || !iface.supports_scan_random_mac()
         {
             return TestResult::Fail("passive interface claims unfinished data/PHY support");
         }
@@ -998,6 +1104,81 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/mt7921/scan",
         mt76_scan_interface_reports_implemented_profile
+    );
+
+    fn mt76_receive_ipc_preserves_current_epoch_and_retires_queued_old_frames() -> TestResult {
+        fn frame(value: u8) -> Frame {
+            let mut buffer = narf_io::alloc_coherent(60, narf_lib::id::DomainId::DRIVER_0).unwrap();
+            buffer.as_mut_slice()[..60].fill(value);
+            Frame::new(buffer, 60)
+        }
+        let iface = Mt76Iface::new(String::from("mt76-ipc-epoch"), radio()).unwrap();
+        iface.ensure_receive_epoch(41);
+        if iface
+            .rx_prod
+            .lock()
+            .as_mut()
+            .unwrap()
+            .try_send(frame(1))
+            .is_err()
+        {
+            return TestResult::Fail("current epoch native IPC fixture publication");
+        }
+        iface.ensure_receive_epoch(41);
+        if iface
+            .rx_ring
+            .lock()
+            .as_mut()
+            .unwrap()
+            .try_recv()
+            .ok()
+            .flatten()
+            .is_none_or(|frame| frame.payload() != [1; 60])
+        {
+            return TestResult::Fail("unchanged receive epoch dropped a current packet");
+        }
+        let _ = iface.rx_prod.lock().as_mut().unwrap().try_send(frame(2));
+        iface.ensure_receive_epoch(42);
+        if iface
+            .rx_ring
+            .lock()
+            .as_mut()
+            .unwrap()
+            .try_recv()
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return TestResult::Fail("new receive epoch inherited an old queued IPC frame");
+        }
+        let _ = iface.rx_prod.lock().as_mut().unwrap().try_send(frame(3));
+        iface.retire_receive_ipc();
+        if iface.rx_ring.lock().is_some()
+            || iface.rx_prod.lock().is_some()
+            || iface.receive_epoch.load(Ordering::Acquire) != 0
+        {
+            return TestResult::Fail(
+                "closed receive epoch retained an IPC producer or queued frame",
+            );
+        }
+        iface.ensure_receive_epoch(43);
+        if iface
+            .rx_ring
+            .lock()
+            .as_mut()
+            .unwrap()
+            .try_recv()
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return TestResult::Fail("reopened IPC receive owner inherited a closed epoch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/mt7921/receive_epoch",
+        mt76_receive_ipc_preserves_current_epoch_and_retires_queued_old_frames
     );
     fn mt76_scan_policy_validates_active_ssids_and_channel_geometry() -> TestResult {
         let mut req = ScanRequest {
@@ -1018,7 +1199,27 @@ mod tests {
         if scan_channels(&req, 3) != Ok(vec![1, 6, 11]) {
             return TestResult::Fail("active wildcard geometry rejected");
         }
+        req.extra_ies = vec![221, 3, 0x50, 0x6f, 0x9a];
+        if scan_channels(&req, 3) != Ok(vec![1, 6, 11]) {
+            return TestResult::Fail("native active probe IE profile rejected");
+        }
         req.active = false;
+        if scan_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
+            return TestResult::Fail("passive scan accepted probe IEs");
+        }
+        req.extra_ies.clear();
+        req.random_mac = Some(narf_wireless::ScanRandomMac {
+            addr: [2, 0, 0, 0, 0, 0],
+            mask: [3, 0, 0, 0, 0, 0],
+        });
+        if scan_channels(&req, 3) != Ok(vec![1, 6, 11]) {
+            return TestResult::Fail("native passive random scan geometry rejected");
+        }
+        req.random_mac.as_mut().unwrap().mask[0] = 0;
+        if scan_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
+            return TestResult::Fail("unbounded multicast random address mask accepted");
+        }
+        req.random_mac = None;
         req.ssids.push(Vec::new());
         if scan_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
             return TestResult::Fail("inconsistent passive request with probe SSIDs accepted");

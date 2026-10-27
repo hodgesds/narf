@@ -191,6 +191,9 @@ fn ethernet(outgoing: bool) -> Vec<u8> {
 fn rx(ethernet: &[u8], sequence: u16) -> Vec<u8> {
     let mut bytes = vec![0; 48 + 24 + 6];
     bytes[12] = 3;
+    // Original API4 reorder_data: no RX BA agreement uses INVALID_BAID127.
+    // Zero names an actual BAID0 and cannot authorize this legacy receiver.
+    bytes[16..20].copy_from_slice(&0x7f00_0000u32.to_le_bytes());
     bytes[32] = 40;
     bytes[34] = 1;
     bytes[48..50].copy_from_slice(&[8, 2]);
@@ -702,7 +705,7 @@ fn smoke_gen2_data_malformed_allocation_and_close_never_retire_other_owners() ->
 }
 fn smoke_gen2_data_receive_strict_profile_and_live_policy_fence() -> TestResult {
     check(|| {
-        for case in 0..16 {
+        for case in 0..17 {
             let mut f = associated(false, 3, false)?;
             prepare(&mut f, false)?;
             let owner = f.owner.as_mut().unwrap();
@@ -721,10 +724,11 @@ fn smoke_gen2_data_receive_strict_profile_and_live_policy_fence() -> TestResult 
                 9 => bad[13] |= 2,
                 10 => bad[12] &= !1,
                 11 => bad[14] |= 0x40,
-                12 => bad[29] = 2, // HT modulation in actual rates-v2 field
-                13 => bad[29] = 8, // 40MHz instead of legacy20
-                14 => bad[28] = 1, // unnegotiated2Mbps
-                _ => bad[28] = 16, // reserved/NSS indicator in legacy format
+                12 => bad[29] = 2,  // HT modulation in actual rates-v2 field
+                13 => bad[29] = 8,  // 40MHz instead of legacy20
+                14 => bad[28] = 1,  // unnegotiated2Mbps
+                15 => bad[28] = 16, // reserved/NSS indicator in legacy format
+                _ => bad[19] = 0,   // BAID0 has no live native agreement
             }
             f.firmware.inject(0xc1, 0, 0x8000, &bad);
             f.firmware.inject(0xc1, 0, 0x8000, &rx(&frame, 10));

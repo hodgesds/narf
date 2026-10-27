@@ -8,6 +8,10 @@ pub(crate) struct Profile {
     capability: [u8; 26],
     operation: [u8; 22],
     secondary: Option<u8>,
+    rx_streams: u8,
+    rx_ldpc: bool,
+    rx_stbc: bool,
+    tx_ldpc: bool,
 }
 
 /// One RX/TX stream, HT20 with optional short GI, no LDPC/STBC/greenfield, 3839-byte
@@ -33,6 +37,7 @@ impl Profile {
     ) -> Self {
         let mut capability = [0; 26];
         let cap = (n.peer_capability() & 12)
+            | u16::from(n.tx_ldpc())
             | (u16::from(n.tx_sgi20()) << 5)
             | if width != 0 {
                 2 | (u16::from(n.tx_sgi40()) << 6)
@@ -51,6 +56,10 @@ impl Profile {
             } else {
                 None
             },
+            rx_streams: if n.local_capability()[4] != 0 { 2 } else { 1 },
+            rx_ldpc: n.rx_ldpc(),
+            rx_stbc: n.rx_stbc(),
+            tx_ldpc: n.tx_ldpc(),
         }
     }
     pub(crate) fn prepare(info: RadioInfo, bss: &ScanBss) -> Result<Self, Error> {
@@ -105,10 +114,26 @@ impl Profile {
             capability,
             operation,
             secondary: None,
+            rx_streams: 1,
+            rx_ldpc: false,
+            rx_stbc: false,
+            tx_ldpc: false,
         })
     }
     pub(crate) fn transmit_mcs(self) -> u8 {
         self.capability[3]
+    }
+    pub(crate) fn receive_streams(self) -> u8 {
+        self.rx_streams
+    }
+    pub(crate) fn receive_ldpc(self) -> bool {
+        self.rx_ldpc
+    }
+    pub(crate) fn receive_stbc(self) -> bool {
+        self.rx_stbc
+    }
+    pub(crate) fn transmit_ldpc(self) -> bool {
+        self.tx_ldpc
     }
     pub(crate) fn ampdu(self) -> u8 {
         self.capability[2] & 31
@@ -119,6 +144,7 @@ impl Profile {
         // wider-width bit survives this local HT20 capability intersection.
         let cap = u16::from_le_bytes(self.capability[..2].try_into().unwrap());
         (cap & (12 | 32))
+            | u16::from(self.tx_ldpc)
             | if self.secondary.is_some() {
                 2 | (u16::from(self.short_gi()) << 6)
             } else {

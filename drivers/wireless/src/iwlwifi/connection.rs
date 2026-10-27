@@ -31,6 +31,7 @@ pub struct Connection {
     sequence: u16,
     security: Option<security::Session>,
     replay: frame_api::Replay,
+    receive_epoch: u64,
     pub authorized: bool,
     pub last_beacon: u64,
     group_keys: [Option<[u8; 16]>; 4],
@@ -109,6 +110,7 @@ impl Connection {
             sequence: 0,
             security: None,
             replay: frame_api::Replay::default(),
+            receive_epoch: 0, // explicit post-association RAM fixture owner
             authorized: true,
             last_beacon: narf_time::now_cycles(),
             group_keys: [None; 4],
@@ -172,6 +174,9 @@ impl Connection {
         roam_from: Option<[u8; 6]>,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<Self, &'static str> {
+        // Reserve before any native await. Neither old notifications nor
+        // descriptors copied while this port is closed belong to the new key.
+        let receive_epoch = hw.close_receive_epoch()?;
         let secure = !matches!(auth, AuthMethod::Open);
         let akm = match &auth {
             AuthMethod::Open => None,
@@ -304,6 +309,7 @@ impl Connection {
             // Set once the PMK is known (after SAE for WPA3).
             security: None,
             replay: frame_api::Replay::default(),
+            receive_epoch,
             authorized: false,
             last_beacon: narf_time::now_cycles(),
             group_keys: [None; 4],
@@ -482,6 +488,9 @@ impl Connection {
                 }
                 activity.await;
             }
+        }
+        if hw.receive_capture_epoch() != Some(this.receive_epoch) {
+            this.open_receive_epoch(hw).await?;
         }
         this.authorized = true;
         Ok(this)
@@ -788,6 +797,22 @@ impl Connection {
         hw: &mut Hardware,
         mpdu: &scan_api::Mpdu<'_>,
     ) -> Result<Option<Vec<u8>>, &'static str> {
+        if !self.authorized {
+            // Closed-port ordinary data must not consume PN even when it is
+            // buffered beside a genuine initial EAPOL message.
+            let Some(ethernet) = frame_api::receive(
+                mpdu,
+                self.local,
+                self.beacon.bssid,
+                self.security.is_some(),
+                &mut self.replay.clone(),
+            ) else {
+                return Ok(None);
+            };
+            if ethernet.get(12..14) != Some(&[0x88, 0x8e]) {
+                return Ok(None);
+            }
+        }
         let Some(ethernet) = self.receive_frame(mpdu)? else {
             return Ok(None);
         };
@@ -808,12 +833,23 @@ impl Connection {
         if packet.header.group_id != 0 {
             return Ok(output);
         }
+        if packet.receive_epoch != Some(self.receive_epoch)
+            && (matches!(packet.header.cmd, 0xc2 | 0xc3)
+                || packet.header.cmd == 0xc1
+                    && scan_api::mpdu(&packet.payload)
+                        .is_some_and(|m| m.frame.first().is_some_and(|fc| fc & 12 == 8)))
+        {
+            return Ok(output);
+        }
         let now = narf_time::now_cycles();
         match packet.header.cmd {
             0xc1 => {
                 let Some(mpdu) = scan_api::mpdu(&packet.payload) else {
                     return Ok(output);
                 };
+                if mpdu.channel != self.beacon.channel {
+                    return Ok(output);
+                }
                 let frame = mpdu.frame;
                 if frame.len() >= 24
                     && frame[0] == 0xd0
@@ -937,6 +973,9 @@ impl Connection {
                     let mut status = 37; // decline delayed BA and unsupported TIDs
                     if immediate && (tid as usize) < self.rx_ba.len() && self.phy.mode != 0 {
                         let existing = self.rx_ba[tid as usize].as_ref();
+                        if existing.is_some_and(|w| w.uncertain()) {
+                            return Err("RX BAID still owns uncertain response/removal");
+                        }
                         if existing.is_some_and(|old| {
                             old.token == token
                                 && old.start == ssn
@@ -958,6 +997,7 @@ impl Connection {
                                 timeout,
                                 narf_time::now_cycles(),
                             )?;
+                            state.reserve_response();
                             let response = hw
                                 .command(5, 0x16, &aggregation::allocate(tid, ssn, window))
                                 .await?;
@@ -984,6 +1024,12 @@ impl Connection {
                     let frame = self.management(0xd0, &response);
                     hw.transmit(self.management_queue, &frame, 24, self.rate())
                         .await?;
+                    if status == 0 {
+                        self.rx_ba[tid as usize]
+                            .as_mut()
+                            .ok_or("RX BAID response lost reservation")?
+                            .activate_response(narf_time::now_cycles())?;
+                    }
                 }
                 Some(Action::Delete {
                     tid,
@@ -1009,12 +1055,23 @@ impl Connection {
     }
 
     async fn stop_rx_ba(&mut self, hw: &mut Hardware, tid: u8) -> Result<(), &'static str> {
-        if self.rx_ba[tid as usize].is_some() {
-            hw.command(5, 0x16, &super::aggregation::remove(tid))
+        if let Some(window) = self.rx_ba[tid as usize].as_mut() {
+            let baid = window.baid;
+            window.reserve_retirement()?;
+            let receipt = hw
+                .command(5, 0x16, &super::aggregation::remove(tid))
                 .await?;
-            // Preserve ordering across BAID reuse: discard packets captured
-            // during removal before accepting a new session with that ID.
-            hw.discard_key_transition_rx()?;
+            // fw/api/datapath.h uses a status-sized BAID response also for
+            // REMOVE; Linux ignores its ADD-only BAID value, not its extent.
+            if receipt.payload.len() != 4 {
+                return Err("invalid BAID removal receipt extent");
+            }
+            let management = hw.synchronize_rx_baid(baid).await?;
+            for packet in management {
+                // Bound AP loss/changed PHY/PMF controls must not disappear
+                // merely because they preceded a native retirement marker.
+                let _ = self.receive_packet(&packet)?;
+            }
             self.rx_ba[tid as usize] = None;
         }
         Ok(())
@@ -1031,6 +1088,9 @@ impl Connection {
         mpdu: &scan_api::Mpdu<'_>,
     ) -> Result<Option<Vec<u8>>, &'static str> {
         let frame = mpdu.frame;
+        if mpdu.channel != self.beacon.channel {
+            return Ok(None);
+        }
         if frame.len() >= 24
             && frame[10..16] == self.beacon.bssid
             && frame[16..22] == self.beacon.bssid
@@ -1116,6 +1176,17 @@ impl Connection {
         let Ok(response) = security.process(&ethernet[14..]) else {
             return Ok(());
         };
+        let changed = response.keys.as_ref().is_some_and(|keys| {
+            keys.pairwise
+                .as_ref()
+                .is_some_and(|key| self.pairwise_key.as_ref() != Some(key))
+                || self.group_keys[keys.group_id as usize] != Some(keys.group)
+        });
+        if changed {
+            self.receive_epoch = hw.close_receive_epoch()?;
+            self.discard_reorder();
+            self.actions.clear();
+        }
         if let Some(keys) = response.keys {
             if let Some(pairwise) = keys.pairwise.as_ref() {
                 if self.pairwise_key.as_ref() != Some(pairwise) {
@@ -1124,7 +1195,6 @@ impl Connection {
                         remove_key(hw, 0, false).await?;
                     }
                     install_key(hw, 0, false, pairwise, 0).await?;
-                    hw.discard_key_transition_rx()?;
                     if let Some(old) = &mut self.pairwise_key {
                         old.zeroize();
                     }
@@ -1142,7 +1212,6 @@ impl Connection {
                     remove_key(hw, keys.group_id, true).await?;
                 }
                 install_key(hw, keys.group_id, true, &keys.group, keys.group_rx_pn).await?;
-                hw.discard_key_transition_rx()?;
                 if let Some(old) = &mut self.group_keys[id] {
                     old.zeroize();
                 }
@@ -1169,7 +1238,19 @@ impl Connection {
         reply.extend_from_slice(&response.bytes);
         // M2/M4 remain unencrypted; subsequent group-key replies use PTK.
         self.send_ethernet(hw, &reply, self.authorized).await?;
+        if changed {
+            self.open_receive_epoch(hw).await?;
+        }
         Ok(())
+    }
+
+    async fn open_receive_epoch(&mut self, hw: &mut Hardware) -> Result<(), &'static str> {
+        for packet in hw.synchronize_receive_epoch().await? {
+            // Ordered peer-loss/PHY/PMF controls remain effective; only old
+            // data/reorder notifications are discarded before the marker.
+            let _ = self.receive_packet(&packet)?;
+        }
+        hw.commit_receive_epoch(self.receive_epoch)
     }
 
     /// Append a BIP-CMAC-128 MMIE to a group-addressed robust management
@@ -1193,6 +1274,7 @@ impl Connection {
 
     pub async fn disconnect(mut self, hw: &mut Hardware) -> Result<(), &'static str> {
         self.authorized = false;
+        hw.close_receive_epoch()?;
         for tid in 0..self.rx_ba.len() {
             self.stop_rx_ba(hw, tid as u8).await?;
         }

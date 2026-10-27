@@ -44,6 +44,20 @@ only with hardware/firmware evidence, not because the initial NARF profile
 omits it. Physical acceptance then supplies RF, interoperability and power
 measurements; source/model results cannot supply those measurements.
 
+The `codex/wifi-aggregation-next` checkpoint passed the coordinated Wi-Fi
+suites: x86_64 2317 pass,0 fail,9 skip; aarch64 1847 pass,0 fail,3 skip.
+The selected scope is `drivers/wireless,wireless,verification/wifi-fixtures`.
+MT76 adds width-valid MCS8/9, actual NIC RX1/2 with TX1 and its HT companion,
+directional LDPC, RXSTBC1, actual-MT7922 contiguous160 with eight-channel
+power grants, and exact recipient windows1–64. Its native record,
+packet and DHCP/IP fixtures pass those software suites. The Intel milestone
+includes native Gen2 BA/pipeline and GTK reconnect history plus Gen3 native
+receipt/source/capture-epoch work. RTL8821CE/RTL8822CE recipient and separately
+qualified transmit BA/pipeline, and AR9285 HT20/recipient BA/RX STBC1/native
+RTS/CTS are implemented and covered by the same coordinated checks. Earlier
+passing counts below describe merged checkpoints. The all-family ledger and
+physical qualification remain open.
+
 The [per-chip inventory](../research/chip-inventory.md) records all 102 registered
 bus identities, actual revision/firmware gates, native-path gaps and measured
 source counts. It distinguishes aliases, catalog-only entries and rejected

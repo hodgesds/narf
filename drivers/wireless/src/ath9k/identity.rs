@@ -45,6 +45,23 @@ pub struct Identity {
     pub tx_chainmask: u8,
     pub big_endian_fields: bool,
 }
+impl Identity {
+    /// Factory capability fact only; emission still needs calibration, policy
+    /// and the distinct measured HT grant. Revalidate the exact retained image.
+    pub(super) fn ht20(&self, image: &[u8; EEPROM_4K_BYTES]) -> bool {
+        let length = if self.big_endian_fields {
+            u16::from_be_bytes([image[0], image[1]])
+        } else {
+            u16::from_le_bytes([image[0], image[1]])
+        };
+        let mut copy = *image;
+        length as usize == EEPROM_4K_BYTES
+            && image[6] & 0x22 == 2
+            && self.rx_chainmask == 1
+            && self.tx_chainmask == 1
+            && decode_identity(self.revision, 0xa55a, &mut copy) == Ok(*self)
+    }
+}
 
 pub(super) trait RegisterIo {
     fn authorized(&self) -> bool {

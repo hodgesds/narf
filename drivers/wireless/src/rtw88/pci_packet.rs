@@ -51,6 +51,18 @@ fn write(memory: &DmaBuffer, offset: usize, data: &[u8]) -> Result<(), packet::E
     Ok(())
 }
 impl Native {
+    pub(in crate::rtw88) fn configure_packet_aggregation(
+        &mut self,
+        cfg: Option<format::Aggregation>,
+    ) -> Result<(), packet::Error> {
+        self.with_packet(|core, _| core.aggregation(cfg))
+    }
+    pub(in crate::rtw88) fn submit_packet_batch(
+        &mut self,
+        b: &[Vec<u8>],
+    ) -> Result<Vec<u64>, packet::Error> {
+        self.with_packet(|core, port| core.submit_batch(port, b))
+    }
     pub(in crate::rtw88) fn configure_packet_profile(
         &mut self,
         profile: format::DataProfile,
@@ -147,12 +159,22 @@ impl Native {
 // qualification. CPU and register accesses invoke its actual current cap;
 // original rings and every published payload stay retained on every exit.
 unsafe impl Port for Native {
+    fn originator_ba_allowed(&self) -> bool {
+        self.packet_gate
+            .as_ref()
+            .is_some_and(crate::rtw88::power_policy::Gate::allows_tx_ba)
+    }
     fn receive_chip(&self) -> Result<crate::rtw88::packet_phy::Chip, packet::Error> {
         match self.device.id.device {
             0xc821 => Ok(crate::rtw88::packet_phy::Chip::C21),
             0xc822 => Ok(crate::rtw88::packet_phy::Chip::C22),
             _ => Err(packet::Error::Packet),
         }
+    }
+    fn recipient_ba_allowed(&self) -> bool {
+        self.packet_gate
+            .as_ref()
+            .is_some_and(crate::rtw88::power_policy::Gate::allows_rx_ba)
     }
     fn transmit_allowed(&mut self) -> Result<(), packet::Error> {
         self.check_packet_permission().map_err(access_error)

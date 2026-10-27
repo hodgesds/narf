@@ -79,3 +79,14 @@ pub(crate) fn block80(primary: u8, center: u8) -> Option<[u8; 4]> {
     (channels.contains(&primary) && channels.iter().all(|ch| band(*ch) == Some(Band::Ghz5)))
         .then_some(channels)
 }
+/// Contiguous160 blocks, each containing eight real20MHz channels. Do not
+/// join the128/132 or144/149 discontinuities into an invented wide channel.
+pub(crate) fn block160(primary: u8, center: u8) -> Option<[u8; 8]> {
+    if ![50, 114, 163].contains(&center) {
+        return None;
+    }
+    let first = center.checked_sub(14)?;
+    let channels = core::array::from_fn(|index| first + index as u8 * 4);
+    (channels.contains(&primary) && channels.iter().all(|ch| band(*ch) == Some(Band::Ghz5)))
+        .then_some(channels)
+}

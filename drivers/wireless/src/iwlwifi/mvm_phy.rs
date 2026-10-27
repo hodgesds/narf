@@ -14,10 +14,13 @@ pub(super) struct Context {
     pub offered: Option<Parameters>,
     pub negotiated: Option<Profile>,
     pub actions: VecDeque<Vec<u8>>,
+    pub ba: super::ba::Context,
 }
 impl Context {
     pub fn emission(&self) -> Emission {
-        if self.offered.is_some() {
+        if self.ba.selected {
+            Emission::Ht20Ba
+        } else if self.offered.is_some() {
             Emission::Ht20
         } else {
             Emission::Legacy
@@ -201,12 +204,15 @@ impl super::Owner {
         {
             return false;
         }
-        let Some(body) = mpdu
-            .body(24, 0)
-            .filter(|b| b.len() == 9 && b[..2] == [3, 0])
-        else {
+        let Some(body) = mpdu.body(24, 0).filter(|b| b.first() == Some(&3)) else {
             return false;
         };
+        if self.capture_ba_action(body) {
+            return true;
+        }
+        if body.len() != 9 || body[..2] != [3, 0] {
+            return true;
+        }
         let parameters = u16::from_le_bytes([body[3], body[4]]);
         let tid = (parameters >> 2) & 15;
         if tid > 7 || self.power.phy.actions.len() >= 4 {
@@ -341,10 +347,15 @@ impl super::Owner {
             elements,
             selected,
         )?;
+        let ba = selected
+            && narf_wireless::association::phy::ApElements::parse(&bss.information_elements)
+                .is_ok_and(|p| p.ht_capability().is_some())
+            && self.supports_native_ba();
         self.power.phy = Context {
             offered: if selected { wmm } else { None },
             ..Context::default()
         };
+        self.power.phy.ba.selected = ba;
         Ok(())
     }
     pub(in crate::iwlwifi) fn station_power_request(

@@ -148,6 +148,18 @@ impl Device {
             owner.transmit_power_request_for(super::mvm_boot::PowerEmission::Ht20)
         })
     }
+    pub(super) async fn ba_power_request(
+        &self,
+    ) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+        let mut state = self.state.lock().await;
+        self.source.invoke(|| {
+            let owner = state.owner.as_mut().ok_or("MVM native owner absent")?;
+            if !owner.supports_native_ba() {
+                return Err("MVM native BA contract unavailable");
+            }
+            owner.transmit_power_request_for(super::mvm_boot::PowerEmission::Ht20Ba)
+        })
+    }
     pub(super) async fn initialize(
         hardware: Hardware,
         firmware: Asset,
@@ -436,6 +448,7 @@ impl Device {
             owner,
             pending,
             scan_time,
+            transmit,
             ..
         } = state;
         let owner = owner.as_mut().ok_or("MVM native owner absent")?;
@@ -507,14 +520,33 @@ impl Device {
                 if self.stopping.load(Ordering::Acquire) {
                     return Err("MVM data stopped before native publication");
                 }
-                owner
-                    .station_send(frame.payload(), || (self.environment.policy)())
-                    .await?;
+                if owner.station_can_pipeline() {
+                    let mut packets = alloc::vec![frame.payload().to_vec()];
+                    if let Some(tx) = transmit.as_mut() {
+                        for _ in 1..8 {
+                            let Some(next) =
+                                tx.try_recv().map_err(|_| "MVM batch input ring failed")?
+                            else {
+                                break;
+                            };
+                            if admitted(next.payload(), self.mac, next.tx_meta()) {
+                                packets.push(next.payload().to_vec());
+                            }
+                        }
+                    }
+                    owner
+                        .transmit_data_batch_using(&packets, || (self.environment.policy)())
+                        .await?;
+                } else {
+                    owner
+                        .station_send(frame.payload(), || (self.environment.policy)())
+                        .await?;
+                }
                 Ok(Outcome::Done)
             }
             Operation::Close => {
                 *pending = None;
-                if let Some(tx) = state.transmit.as_mut() {
+                if let Some(tx) = transmit.as_mut() {
                     for _ in 0..TX_RING_N {
                         if !matches!(tx.try_recv(), Ok(Some(_))) {
                             break;

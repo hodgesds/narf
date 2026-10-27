@@ -375,10 +375,14 @@ impl Harness {
         let clock = {
             let mut m = f.port.0.lock();
             m.packet_model.reaction = Some(Arc::new(move |frame| {
-                actor
-                    .lock()
-                    .react(frame)
-                    .map_err(|_| crate::rtw88::packet_core::Error::Packet)
+                actor.lock().react(frame).map_err(|error| {
+                    narf_console::klog!(
+                        "C21 native AP rejected {:?}, frame prefix {:?}\n",
+                        error,
+                        &frame[..frame.len().min(40)]
+                    );
+                    crate::rtw88::packet_core::Error::Packet
+                })
             }));
             m.clock.clone()
         };

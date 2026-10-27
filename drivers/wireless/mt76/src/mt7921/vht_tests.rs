@@ -47,6 +47,48 @@ pub(super) fn elements(width: u8, primary: u8) -> (Vec<u8>, Vec<u8>) {
     vht.extend_from_slice(&[if width == 2 { 1 } else { 0 }, center, 0, 252, 255]);
     (ht, vht)
 }
+pub(super) fn full_elements(width: u8, primary: u8) -> (Vec<u8>, Vec<u8>) {
+    let (ht, mut vht) = elements(width, primary);
+    maps(&mut vht, 0xfffa, 0xfffa, 0xfffc);
+    (ht, vht)
+}
+fn maps(ies: &mut [u8], rx: u16, tx: u16, basic: u16) {
+    let mut offset = 0;
+    while offset < ies.len() {
+        let end = offset + 2 + usize::from(ies[offset + 1]);
+        match ies[offset] {
+            191 => {
+                ies[offset + 6..offset + 8].copy_from_slice(&rx.to_le_bytes());
+                ies[offset + 10..offset + 12].copy_from_slice(&tx.to_le_bytes());
+            }
+            192 => ies[offset + 5..offset + 7].copy_from_slice(&basic.to_le_bytes()),
+            _ => {}
+        }
+        offset = end;
+    }
+}
+fn ldpc(ies: &mut [u8], enabled: bool) {
+    let mut offset = 0;
+    while offset < ies.len() {
+        match ies[offset] {
+            45 => ies[offset + 2] = (ies[offset + 2] & !1) | u8::from(enabled),
+            191 => ies[offset + 2] = (ies[offset + 2] & !16) | (u8::from(enabled) << 4),
+            _ => {}
+        }
+        offset += 2 + usize::from(ies[offset + 1]);
+    }
+}
+fn ht_rx2_basic(ies: &mut [u8], mandatory: bool) {
+    let mut offset = 0;
+    while offset < ies.len() {
+        match ies[offset] {
+            45 => ies[offset + 6] = 255, // AP RX MCS8..15, independently of our TX1.
+            61 => ies[offset + 9] = u8::from(mandatory), // HT Basic MCS8.
+            _ => {}
+        }
+        offset += 2 + usize::from(ies[offset + 1]);
+    }
+}
 pub(super) fn prepared(width: u8, secure: bool) -> (Session<Model>, ScanBss, TxPermission) {
     let (mut session, mut bss) = super::wmm_tests::prepared(true, secure);
     session.backend.station_channel = 36;
@@ -76,10 +118,15 @@ fn security(secure: bool) -> Security {
         Security::Open
     }
 }
-fn join(s: &mut Session<Model>, b: &ScanBss, p: TxPermission, secure: bool) -> Result<u16, Error> {
+pub(super) fn join(
+    s: &mut Session<Model>,
+    b: &ScanBss,
+    p: TxPermission,
+    secure: bool,
+) -> Result<u16, Error> {
     run(s.associate_station(b, b"narf", security(secure), p, &[]))
 }
-fn record(frame: &[u8], tag: u16) -> Option<&[u8]> {
+pub(super) fn record(frame: &[u8], tag: u16) -> Option<&[u8]> {
     if frame.get(34..36) != Some(&[3, 0]) || frame.get(43) != Some(&7) {
         return None;
     }
@@ -260,7 +307,7 @@ fn native() -> Result<(), &'static str> {
                 f.windows(14).filter(|ie| ie[..2] == [191, 12]).count() != 1
                     || !f
                         .windows(14)
-                        .any(|ie| ie == [191, 12, 32, 0, 0, 0, 252, 255, 0, 0, 252, 255, 0, 0])
+                        .any(|ie| ie == [191, 12, 48, 1, 0, 0, 250, 255, 0, 0, 254, 255, 0, 0])
             }) {
                 return Err("actual local1SS VHT request encoding");
             }
@@ -353,14 +400,22 @@ kernel_test_in!(
 
 fn rx_bounds() -> Result<(), &'static str> {
     for (rate, nss, width, extra) in [
-        (8, 1, 2, 0),
-        (7, 2, 2, 0),
+        (10, 1, 2, 0),
+        (9, 1, 0, 0),
+        (7, 3, 2, 0),
         (7, 1, 3, 0),
         (7, 1, 2, 1 << 11),
         (7, 1, 2, 1 << 22),
         (7, 1, 2, 1 << 24),
     ] {
         let (mut s, b, p) = prepared(2, true);
+        if extra == 1 << 11 {
+            let State::RadioReady(mut info) = s.state else {
+                return Err("LDPC-disabled actual NIC fixture");
+            };
+            info.capabilities.phy.rx_ldpc = false;
+            s.state = State::RadioReady(info);
+        }
         if join(&mut s, &b, p, true) != Ok(42) {
             return Err("VHT RX bounds join");
         }
@@ -384,6 +439,479 @@ fn mt76_vht_native_ppdu_bounds_reject_before_replay_commit() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921/vht",
     mt76_vht_native_ppdu_bounds_reject_before_replay_commit
+);
+
+fn mcs_native() -> Result<(), &'static str> {
+    for secure in [false, true] {
+        for selected in 0..=2 {
+            for peer_rx in [0xfffc, 0xfffe] {
+                let (mut s, mut b, p) = prepared(selected, secure);
+                maps(&mut b.information_elements, peer_rx, 0xfffe, 0xfffc);
+                maps(
+                    s.backend.vht_reply.as_mut().unwrap(),
+                    peer_rx,
+                    0xfffe,
+                    0xfffc,
+                );
+                if join(&mut s, &b, p, secure) != Ok(42) {
+                    return Err("native MCS8/9 profile association");
+                }
+                let valid: u16 = if selected == 0 { 0xfffd } else { 0xfffe };
+                let tx_map = if peer_rx == 0xfffc { 0xfffcu16 } else { valid };
+                let peer = s
+                    .backend
+                    .frames
+                    .iter()
+                    .find_map(|(_, f)| record(f, 10))
+                    .ok_or("native higher MCS peer record")?;
+                if peer[8..10] != tx_map.to_le_bytes() || peer[10..12] != valid.to_le_bytes() {
+                    return Err("directional native MCS maps or selected20MHz cap");
+                }
+                // AP RX0..7 must not reduce our implemented RX0..9. The AP
+                // independently advertised TX0..9 in both bound frames.
+                for width in 0..=selected {
+                    let highest = if width == 0 { 8 } else { 9 };
+                    s.backend.packets.push_back(data(
+                        secure,
+                        width,
+                        highest,
+                        1,
+                        9 + u64::from(width),
+                    ));
+                    if s.receive_ethernet().ok().flatten().is_none() {
+                        return Err("width-valid native higher MCS packet was not delivered");
+                    }
+                }
+                run(s.send_ethernet(&tx())).map_err(|_| "MCS8/9 native firmware-rate data TX")?;
+                run(s.disassociate_station()).map_err(|_| "higher MCS teardown")?;
+            }
+        }
+    }
+    Ok(())
+}
+fn mt76_vht_mcs8_9_native_directional_maps_actual_ppdu_width_and_packets() -> TestResult {
+    mcs_native().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/vht",
+    mt76_vht_mcs8_9_native_directional_maps_actual_ppdu_width_and_packets
+);
+
+fn mcs_basic() -> Result<(), &'static str> {
+    // Both the original and response mandatory map must survive native
+    // width selection. A20MHz cap cannot silently remove required MCS9.
+    for (scan_width, reply_width, scan_basic, reply_basic) in [
+        (0, 0, 0xfffe, 0xfffc),
+        (2, 0, 0xfffc, 0xfffe),
+        (2, 0, 0xfffe, 0xfffc),
+    ] {
+        let (mut s, mut b, p) = prepared(scan_width, false);
+        maps(&mut b.information_elements, 0xfffe, 0xfffe, scan_basic);
+        let (ht, mut vht) = elements(reply_width, 36);
+        maps(&mut vht, 0xfffe, 0xfffe, reply_basic);
+        s.backend.ht_reply = Some(ht);
+        s.backend.vht_reply = Some(vht);
+        let before = s.backend.frames.len();
+        if join(&mut s, &b, p, false).is_ok()
+            || s.vht_profile.is_some()
+            || matches!(s.state, State::Associated { .. })
+            || s.backend.frames[before..]
+                .iter()
+                .any(|(_, f)| record(f, 10).is_some())
+            || scan_width == 0 && s.backend.frames.len() != before
+        {
+            return Err("mandatory MCS9 at20MHz survived preflight/response narrowing");
+        }
+    }
+    let (mut s, mut b, p) = prepared(2, false);
+    maps(&mut b.information_elements, 0xfffe, 0xfffe, 0xfffd);
+    let (ht, mut vht) = elements(0, 36);
+    maps(&mut vht, 0xfffe, 0xfffe, 0xfffd);
+    s.backend.ht_reply = Some(ht);
+    s.backend.vht_reply = Some(vht);
+    if join(&mut s, &b, p, false) != Ok(42)
+        || s.vht_profile.is_none_or(|profile| profile.width() != 0)
+    {
+        return Err("mandatory MCS8 response narrowing was rejected");
+    }
+    // A richer response cannot restore rates omitted by either scan map.
+    let (mut s, b, p) = prepared(2, false);
+    maps(
+        s.backend.vht_reply.as_mut().unwrap(),
+        0xfffe,
+        0xfffe,
+        0xfffc,
+    );
+    if join(&mut s, &b, p, false) != Ok(42) {
+        return Err("MCS scan/response binding fixture");
+    }
+    if s.backend
+        .frames
+        .iter()
+        .find_map(|(_, f)| record(f, 10))
+        .is_none_or(|peer| peer[8..12] != [252, 255, 252, 255])
+    {
+        return Err("response promoted directional native maps beyond scan");
+    }
+    Ok(())
+}
+fn mt76_vht_width_specific_basic_mcs_and_scan_response_maps_are_bound() -> TestResult {
+    mcs_basic().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/vht",
+    mt76_vht_width_specific_basic_mcs_and_scan_response_maps_are_bound
+);
+
+fn receive_nss() -> Result<(), &'static str> {
+    for secure in [false, true] {
+        for streams in [1u8, 2] {
+            for selected in 0..=2 {
+                let (mut s, mut b, p) = prepared(selected, secure);
+                let State::RadioReady(mut info) = s.state else {
+                    return Err("actual receive streams radio fixture");
+                };
+                info.capabilities.phy.spatial_streams = streams;
+                s.state = State::RadioReady(info);
+                maps(&mut b.information_elements, 0xfffa, 0xfffa, 0xfffc);
+                maps(
+                    s.backend.vht_reply.as_mut().unwrap(),
+                    0xfffa,
+                    0xfffa,
+                    0xfffc,
+                );
+                ht_rx2_basic(&mut b.information_elements, streams == 2);
+                ht_rx2_basic(s.backend.ht_reply.as_mut().unwrap(), streams == 2);
+                if join(&mut s, &b, p, secure) != Ok(42) {
+                    return Err("RX2/TX1 native association");
+                }
+                let rx = match (selected, streams) {
+                    (0, 1) => 0xfffdu16,
+                    (0, _) => 0xfff5,
+                    (_, 1) => 0xfffe,
+                    _ => 0xfffa,
+                };
+                let tx_map = if selected == 0 { 0xfffdu16 } else { 0xfffe };
+                let peer = s
+                    .backend
+                    .frames
+                    .iter()
+                    .find_map(|(_, f)| record(f, 10))
+                    .ok_or("RX2/TX1 peer")?;
+                if peer[8..10] != tx_map.to_le_bytes()
+                    || peer[10..12] != rx.to_le_bytes()
+                    || s.vht_profile
+                        .is_none_or(|profile| profile.state() != selected)
+                {
+                    return Err("actual RX NSS promoted TX NSS or lost directional map");
+                }
+                let request = s
+                    .backend
+                    .frames
+                    .iter()
+                    .find(|(_, f)| f.first() == Some(&0))
+                    .ok_or("RX2 local association request")?;
+                let body = request
+                    .1
+                    .windows(28)
+                    .find(|ie| ie[..2] == [45, 26])
+                    .ok_or("RX2 actual local HT companion")?;
+                if body[5] != 255
+                    || body[6] != if streams == 2 { 255 } else { 0 }
+                    || body[17] != if streams == 2 { 3 } else { 1 }
+                {
+                    return Err("HT RX0..15 / TX0..7 asymmetry not encoded");
+                }
+                let mut pn = 9;
+                for width in 0..=selected {
+                    let highest = if width == 0 { 8 } else { 9 };
+                    for nss in 1..=streams {
+                        s.backend
+                            .packets
+                            .push_back(data(secure, width, highest, nss, pn));
+                        if s.receive_ethernet().ok().flatten().is_none() {
+                            return Err("actual bounded NSS VHT packet was not delivered");
+                        }
+                        pn += 1;
+                    }
+                }
+                // Native HT uses global MCS indices; NSTS is not a second
+                // copy of that index. Check its explicit consistency too.
+                let width = selected.min(1);
+                let mut packet = data(secure, width, streams * 8 - 1, streams, pn);
+                let offset = if secure { 40 } else { 24 };
+                let rxv = (2u32 << 24)
+                    | (u32::from(width) << 12)
+                    | (1 << 15)
+                    | (u32::from(streams - 1) << 7)
+                    | u32::from(streams * 8 - 1);
+                packet[offset..offset + 4].copy_from_slice(&rxv.to_le_bytes());
+                s.backend.packets.push_back(packet);
+                if s.receive_ethernet().ok().flatten().is_none() {
+                    return Err("native HT companion MCS0..15 receive bounds");
+                }
+                run(s.send_ethernet(&tx())).map_err(|_| "RX2 retained one-transmitter path")?;
+                run(s.disassociate_station()).map_err(|_| "RX2 native teardown")?;
+            }
+        }
+    }
+    let (mut s, mut b, p) = prepared(2, false);
+    let State::RadioReady(mut info) = s.state else {
+        return Err("HT mandatory MCS8 actual NSS1 fixture");
+    };
+    info.capabilities.phy.spatial_streams = 1;
+    s.state = State::RadioReady(info);
+    ht_rx2_basic(&mut b.information_elements, true);
+    ht_rx2_basic(s.backend.ht_reply.as_mut().unwrap(), true);
+    let before = s.backend.frames.len();
+    if join(&mut s, &b, p, false).is_ok() || s.backend.frames.len() != before {
+        return Err("HT mandatory MCS8 invented actual two-stream receive support");
+    }
+    Ok(())
+}
+fn mt76_vht_actual_two_stream_receive_preserves_one_stream_transmit_and_ht_companion() -> TestResult
+{
+    receive_nss().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/vht",
+    mt76_vht_actual_two_stream_receive_preserves_one_stream_transmit_and_ht_companion
+);
+
+fn invalid_receive_nss() -> Result<(), &'static str> {
+    for (streams, mode, width, rate, nss) in [
+        (1, 4, 2, 9, 2),
+        (2, 4, 2, 9, 3),
+        (2, 4, 0, 9, 2),
+        (2, 2, 1, 15, 1),
+        (2, 2, 1, 7, 2),
+        (2, 2, 1, 16, 2),
+        (2, 2, 2, 15, 2),
+    ] {
+        let (mut s, mut b, p) = prepared(2, true);
+        let State::RadioReady(mut info) = s.state else {
+            return Err("invalid receive NSS radio fixture");
+        };
+        info.capabilities.phy.spatial_streams = streams;
+        s.state = State::RadioReady(info);
+        maps(&mut b.information_elements, 0xfffa, 0xfffa, 0xfffc);
+        maps(
+            s.backend.vht_reply.as_mut().unwrap(),
+            0xfffa,
+            0xfffa,
+            0xfffc,
+        );
+        if join(&mut s, &b, p, true) != Ok(42) {
+            return Err("invalid receive NSS join");
+        }
+        let mut packet = data(true, width, rate, nss, 9);
+        let mut rxv = u32::from_le_bytes(packet[40..44].try_into().unwrap());
+        rxv = (rxv & !(15 << 24)) | (mode << 24);
+        packet[40..44].copy_from_slice(&rxv.to_le_bytes());
+        s.backend.packets.push_back(packet);
+        if s.receive_ethernet() != Ok(None) {
+            return Err("native invalid NSS/MCS pair was delivered");
+        }
+        s.backend.packets.push_back(data(true, 0, 8, 1, 9));
+        if s.receive_ethernet().ok().flatten().is_none() {
+            return Err("unsupported receive NSS/MCS consumed a CCMP PN");
+        }
+    }
+    Ok(())
+}
+fn mt76_vht_receive_nss_and_ht_global_mcs_reject_before_replay_commit() -> TestResult {
+    invalid_receive_nss().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/vht",
+    mt76_vht_receive_nss_and_ht_global_mcs_reject_before_replay_commit
+);
+
+fn directional_ldpc() -> Result<(), &'static str> {
+    for secure in [false, true] {
+        for width in 0..=2 {
+            for (rx, can_tx, scan, response) in [
+                (false, false, true, true),
+                (true, false, true, true),
+                (false, true, true, true),
+                (true, true, false, true),
+                (true, true, true, false),
+                (true, true, true, true),
+            ] {
+                let (mut s, mut b, p) = prepared(width, secure);
+                let State::RadioReady(mut info) = s.state else {
+                    return Err("directional LDPC NIC fixture");
+                };
+                info.capabilities.phy.rx_ldpc = rx;
+                info.capabilities.phy.tx_ldpc = can_tx;
+                s.state = State::RadioReady(info);
+                ldpc(&mut b.information_elements, scan);
+                ldpc(s.backend.ht_reply.as_mut().unwrap(), response);
+                ldpc(s.backend.vht_reply.as_mut().unwrap(), response);
+                if join(&mut s, &b, p, secure) != Ok(42) {
+                    return Err("directional LDPC native association");
+                }
+                let transmit = can_tx && scan && response;
+                let peer = s
+                    .backend
+                    .frames
+                    .iter()
+                    .find_map(|(_, f)| record(f, 10))
+                    .ok_or("LDPC native peer record")?;
+                if peer[4] & 16 != u8::from(transmit) << 4
+                    || !s.backend.frames.iter().any(|(_, f)| {
+                        f.windows(12).any(|tlv| {
+                            tlv == [3, 0, 12, 0, u8::from(transmit), 0, 1, 0, 0, 0, 0, 0]
+                        })
+                    })
+                    || !s.backend.frames.iter().any(|(_, f)| {
+                        f.windows(12)
+                            .any(|tlv| tlv[..6] == [2, 0, 12, 0, 1, u8::from(transmit)])
+                    })
+                {
+                    return Err("LDPC native TX did not intersect NIC/scan/response");
+                }
+                let request = s
+                    .backend
+                    .frames
+                    .iter()
+                    .find(|(_, f)| f.first() == Some(&0))
+                    .ok_or("LDPC local request")?;
+                if request
+                    .1
+                    .windows(14)
+                    .find(|ie| ie[..2] == [191, 12])
+                    .is_none_or(|ie| ie[2] & 16 != u8::from(rx) << 4)
+                    || request
+                        .1
+                        .windows(28)
+                        .find(|ie| ie[..2] == [45, 26])
+                        .is_none_or(|ie| ie[2] & 1 != u8::from(rx))
+                {
+                    return Err("LDPC local RX promise was replaced by peer RX/TX fact");
+                }
+                let mut coded = data(secure, width, if width == 0 { 8 } else { 9 }, 1, 9);
+                let offset = if secure { 40 } else { 24 };
+                let rxv =
+                    u32::from_le_bytes(coded[offset..offset + 4].try_into().unwrap()) | (1 << 11);
+                coded[offset..offset + 4].copy_from_slice(&rxv.to_le_bytes());
+                s.backend.packets.push_back(coded);
+                if s.receive_ethernet()
+                    .map_err(|_| "LDPC receive service failure")?
+                    .is_some()
+                    != rx
+                {
+                    return Err("native LDPC RX did not follow the local receive promise");
+                }
+                let next = if rx { 10 } else { 9 };
+                s.backend.packets.push_back(data(secure, 0, 8, 1, next));
+                if s.receive_ethernet().ok().flatten().is_none() {
+                    return Err("LDPC rejection consumed replay PN or blocked BCC fallback");
+                }
+                run(s.send_ethernet(&tx())).map_err(|_| "LDPC firmware-rate native TX")?;
+                run(s.disassociate_station()).map_err(|_| "LDPC native teardown")?;
+            }
+        }
+    }
+    for byte in [32, 33, 35] {
+        // PHY TLV payload offsets6/7/9 in the fixed NIC reply.
+        let mut bytes = capabilities();
+        bytes[byte] = 2;
+        if NicCapabilities::parse(&bytes) != Err(Error::InvalidIdentity) {
+            return Err("invalid directional LDPC NIC boolean was accepted");
+        }
+    }
+    Ok(())
+}
+fn mt76_vht_ldpc_native_directional_nic_peer_records_and_receive_pn() -> TestResult {
+    directional_ldpc().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/vht",
+    mt76_vht_ldpc_native_directional_nic_peer_records_and_receive_pn
+);
+
+fn receive_stbc() -> Result<(), &'static str> {
+    for enabled in [false, true] {
+        for streams in [1, 2] {
+            for (mode, width, rate, stbc, nsts, valid) in [
+                (4, 0, 8, 1, 2, true),
+                (4, 1, 9, 1, 2, true),
+                (4, 2, 9, 1, 2, true),
+                (2, 0, 7, 1, 2, true),
+                (2, 1, 7, 1, 2, true),
+                (4, 2, 9, 1, 1, false),
+                (4, 2, 9, 1, 3, false),
+                (4, 2, 9, 1, 4, false),
+                (4, 2, 9, 2, 2, false),
+                (4, 2, 9, 3, 2, false),
+                (2, 1, 15, 1, 4, false),
+                (4, 0, 9, 1, 2, false),
+                (2, 2, 7, 1, 2, false),
+                (1, 0, 11, 1, 2, false),
+            ] {
+                let (mut s, b, p) = prepared(2, true);
+                let State::RadioReady(mut info) = s.state else {
+                    return Err("STBC actual NIC fixture");
+                };
+                info.capabilities.phy.rx_stbc = enabled;
+                info.capabilities.phy.spatial_streams = streams;
+                s.state = State::RadioReady(info);
+                if join(&mut s, &b, p, true) != Ok(42) {
+                    return Err("STBC native association");
+                }
+                let request = s
+                    .backend
+                    .frames
+                    .iter()
+                    .find(|(_, f)| f.first() == Some(&0))
+                    .ok_or("STBC actual local request")?;
+                if request
+                    .1
+                    .windows(14)
+                    .find(|ie| ie[..2] == [191, 12])
+                    .is_none_or(|ie| ie[3] & 7 != u8::from(enabled) || ie[2] & 128 != 0)
+                    || request
+                        .1
+                        .windows(28)
+                        .find(|ie| ie[..2] == [45, 26])
+                        .is_none_or(|ie| ie[3] & 3 != u8::from(enabled) || ie[2] & 128 != 0)
+                {
+                    return Err("RXSTBC1 promise promoted TX STBC or more receive data streams");
+                }
+                let mut packet = data(true, width, rate, nsts, 9);
+                let mut rxv = u32::from_le_bytes(packet[40..44].try_into().unwrap());
+                rxv = (rxv & !(15 << 24)) | (mode << 24) | (stbc << 22);
+                packet[40..44].copy_from_slice(&rxv.to_le_bytes());
+                s.backend.packets.push_back(packet);
+                let accepted = enabled && valid;
+                if s.receive_ethernet()
+                    .map_err(|_| "STBC native receive service")?
+                    .is_some()
+                    != accepted
+                {
+                    return Err(
+                        "STBC NSTS/data-NSS/rate/width admission disagreed with local promise",
+                    );
+                }
+                s.backend
+                    .packets
+                    .push_back(data(true, 0, 8, 1, if accepted { 10 } else { 9 }));
+                if s.receive_ethernet().ok().flatten().is_none() {
+                    return Err("invalid STBC consumed a replay PN or blocked uncoded fallback");
+                }
+                run(s.disassociate_station()).map_err(|_| "STBC native teardown")?;
+            }
+        }
+    }
+    Ok(())
+}
+fn mt76_vht_ht_receive_stbc1_uses_two_space_time_streams_and_one_data_stream() -> TestResult {
+    receive_stbc().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/vht",
+    mt76_vht_ht_receive_stbc1_uses_two_space_time_streams_and_one_data_stream
 );
 
 fn failure() -> Result<(), &'static str> {

@@ -56,6 +56,32 @@ pub struct Rtw88Device {
 static IFNAME: IrqSafeSpinLock<&'static str> = IrqSafeSpinLock::new("");
 
 impl Rtw88Device {
+    /// Exact-H/optional-R originator BA emission measurement metadata. No grant.
+    pub async fn tx_ba_request(&self) -> Result<super::TxBaRequest, super::FirmwareError> {
+        if let Some(s) = &self.sibling {
+            s.lifecycle().tx_ba_request().await
+        } else {
+            self.firmware
+                .as_ref()
+                .ok_or(super::FirmwareError::Unsupported)?
+                .lifecycle()
+                .tx_ba_request()
+                .await
+        }
+    }
+    /// Distinct exact-H recipient BA emission measurement metadata. No grant.
+    pub async fn rx_ba_request(&self) -> Result<super::RxBaRequest, super::FirmwareError> {
+        if let Some(s) = &self.sibling {
+            s.lifecycle().rx_ba_request().await
+        } else {
+            self.firmware
+                .as_ref()
+                .ok_or(super::FirmwareError::Unsupported)?
+                .lifecycle()
+                .rx_ba_request()
+                .await
+        }
+    }
     /// Exact distinct C21/C22 HT20 emission measurement metadata. No grant.
     pub async fn ht20_request(&self) -> Result<super::Ht20Request, super::FirmwareError> {
         if let Some(s) = &self.sibling {

@@ -93,6 +93,7 @@ pub(in crate::iwlwifi) struct Firmware {
     used: *mut u8,
     status: *mut u8,
     next: u16,
+    format: rx_rfh::CompletionFormat,
 }
 impl Firmware {
     pub(in crate::iwlwifi) fn tx_write(&self) -> u32 {
@@ -110,25 +111,45 @@ impl Firmware {
         sequence: u16,
         payload: &[u8],
     ) {
+        self.inject_packed(&[(command, group, sequence, payload)]);
+    }
+    /// Real RFH buffers may contain several64-byte-aligned firmware packets;
+    /// returning fewer than64 buffers does not bound notification count to64.
+    pub(in crate::iwlwifi) fn inject_packed(&mut self, packets: &[(u8, u8, u16, &[u8])]) {
         let index = usize::from(self.next);
-        assert!(index < self.buffers.len() && payload.len() + 8 <= RX_BUFFER_BYTES);
-        let mut header = [0; 8];
-        boot_context::put32(&mut header, 0, payload.len() as u32 + 4);
-        header[4] = command;
-        header[5] = group;
-        boot_context::put16(&mut header, 6, sequence);
+        assert!(index < self.buffers.len() && !packets.is_empty());
         // SAFETY: this single-threaded fixture is the sole device-side
         // writer of a still-posted buffer. Injection occurs between future
         // polls, never during a host copy; all complete extents are checked.
         unsafe {
-            core::ptr::copy_nonoverlapping(header.as_ptr(), self.buffers[index], 8);
-            core::ptr::copy_nonoverlapping(
-                payload.as_ptr(),
-                self.buffers[index].add(8),
-                payload.len(),
-            );
+            core::ptr::write_bytes(self.buffers[index], 0, RX_BUFFER_BYTES);
+            let mut offset = 0;
+            for &(command, group, sequence, payload) in packets {
+                assert!(offset + 8 + payload.len() <= RX_BUFFER_BYTES);
+                let mut header = [0; 8];
+                boot_context::put32(&mut header, 0, payload.len() as u32 + 4);
+                header[4] = command;
+                header[5] = group;
+                boot_context::put16(&mut header, 6, sequence);
+                core::ptr::copy_nonoverlapping(header.as_ptr(), self.buffers[index].add(offset), 8);
+                core::ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    self.buffers[index].add(offset + 8),
+                    payload.len(),
+                );
+                offset = (offset + 8 + payload.len()).next_multiple_of(64);
+            }
             core::ptr::write_volatile(
-                self.used.add(index * 4).cast::<u16>(),
+                self.used
+                    .add(
+                        index * self.format.size()
+                            + if self.format == rx_rfh::CompletionFormat::Ax210 {
+                                4
+                            } else {
+                                0
+                            },
+                    )
+                    .cast::<u16>(),
                 (self.next + 1).to_le(),
             );
             dma_barrier();
@@ -172,6 +193,7 @@ pub(in crate::iwlwifi) fn create_for_format(
         used: rx.used.as_mut_ptr(),
         status: rx.status.as_mut_ptr(),
         next: 0,
+        format,
     };
     let mut queue = super::super::data_queue::DataQueue::for_format(format).unwrap();
     let mut response = [0; 8];
@@ -227,6 +249,10 @@ pub(in crate::iwlwifi) fn create_for_format(
         armed: false,
         failed: false,
         station_stop: None,
+        // This RAM constructor models an already admitted post-INIT owner.
+        // Real association immediately closes/reserves its own generation.
+        rx_epoch: rx_epoch::State::model(),
+        sources: None,
     };
     (hardware, firmware)
 }

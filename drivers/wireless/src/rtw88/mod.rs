@@ -13,9 +13,11 @@
 //! same registered Device used by kernel DHCP. The initial data profile
 //! requires basic1Mbps and a fresh lifecycle after terminal closure.
 //!
-//! RTL8821CE retains factory/firmware and inactive MAC ownership; its RF and
-//! station remain gated. RTL8822BE retains diagnostic identification. Physical
-//! validation and deployment board/power assets remain separate gates.
+//! RTL8821CE retains the same firmware/DMA owner through exact-chip calibration,
+//! separately qualified operating power and native station. Both C21/C22 may
+//! separately qualify legacy rates/WMM, HT20 and RX/TX Block Ack. RTL8822BE
+//! retains diagnostic identification. Physical validation and genuine measured
+//! deployment board/power assets remain separate gates.
 //!
 //! ## References (all GPL-2.0; NARF is GPL-2.0-or-later)
 //!
@@ -49,6 +51,16 @@ mod firmware_transport;
 pub mod fw;
 mod hardware;
 mod ht;
+mod rx_ba;
+mod rx_ba_power;
+mod tx_ba;
+mod tx_ba_power;
+#[cfg(feature = "kernel-test")]
+mod tx_ba_tests;
+pub use tx_ba_power::Request as TxBaRequest;
+#[cfg(feature = "kernel-test")]
+mod rx_ba_tests;
+pub use rx_ba_power::Request as RxBaRequest;
 #[cfg(feature = "kernel-test")]
 mod ht_tests;
 pub(super) mod interface;

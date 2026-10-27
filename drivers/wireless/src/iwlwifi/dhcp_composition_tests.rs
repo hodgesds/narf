@@ -9,6 +9,10 @@ use alloc::vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_wifi_fixtures::{udp_ipv4, ApPhase, DhcpServer, FakeAp, NetworkPlan};
 
+#[cfg(feature = "kernel-test")]
+#[path = "sc_source_tests.rs"]
+mod source_tests;
+
 type R<T = ()> = Result<T, &'static str>;
 const OWN: [u8; 6] = [2, 0x71, 2, 3, 4, 5];
 const AP: [u8; 6] = [2, 0x72, 2, 3, 4, 5];
@@ -43,6 +47,8 @@ enum Fault {
     None,
     HoldM4,
     HoldRemoval,
+    HoldRxFence,
+    HoldGroupReply,
 }
 
 struct Wire {
@@ -58,11 +64,15 @@ struct Wire {
     air: Vec<(u16, u16, u8, ApPhase)>,
     replies: Vec<u8>,
     key: Option<Vec<u8>>,
+    ptk: Option<narf_wireless::eapol::Ptk>,
+    group_rekey: bool,
+    group_reply: bool,
     keys: usize,
     next_pn: u64,
     fault: Fault,
     held: Option<(u8, u8, u16)>,
     held_tx: Option<(u16, u16)>,
+    held_rx: Option<u32>,
     m4: bool,
     error: Option<&'static str>,
 }
@@ -153,10 +163,10 @@ impl Wire {
             .map(|entry| if entry[2] == 99 { 0 } else { entry[2] })
             .unwrap_or(0);
         require(
-            bytes[7] == version
+            bytes[7] == 0
                 && usize::from(half(bytes, 4)) + 8 == bytes.len()
                 && sequence == (p.pointer.wrapping_sub(1) & 0xff),
-            "Sc negotiated command header",
+            "Sc bare/WIDE_ID command header",
         )?;
         let body = &bytes[8..];
         self.commands.push((group, cmd, body.to_vec()));
@@ -219,6 +229,8 @@ impl Wire {
                         return Ok(());
                     }
                     queue.2 = false;
+                    response.resize(8, 0);
+                    response[..2].copy_from_slice(&queue.0.to_le_bytes());
                 }
             }
             (5, 0x18) => {
@@ -232,13 +244,21 @@ impl Wire {
                         "Sc installed PTK differs from AP exchange",
                     )?,
                     0x4a => require(
-                        word(body, 8) == 1 && body[16..32] == [0x77; 16],
+                        (word(body, 8) == 1 && body[16..32] == [0x77; 16])
+                            || self.group_rekey && word(body, 8) == 2 && body[16..32] == [0x88; 16],
                         "Sc installed GTK differs from M3",
                     )?,
                     _ => return Err("Sc key flags"),
                 }
                 self.keys += 1;
             }
+            (5, 2) => require(
+                body.len() == 20
+                    && bytes[6] == 0
+                    && body[..16] == [0, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0]
+                    && word(body, 16) != 0,
+                "Sc EMPTY single-RFH epoch native contract",
+            )?,
             (3, 8) => require(body.len() == 52 && body[12..18] == OWN, "Sc MAC identity")?,
             (3, 9) => require(body.len() == 208 && body[16..22] == OWN, "Sc LINK identity")?,
             (3, 10) => require(body.len() == 104 && body[8..14] == AP, "Sc peer identity")?,
@@ -275,7 +295,19 @@ impl Wire {
         }
         self.firmware
             .inject(cmd, if group == 1 { 0 } else { group }, sequence, &response);
-        if (group, cmd) == (3, 5) {
+        if (group, cmd) == (5, 2) {
+            let mut marker = [8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            marker[8..12].copy_from_slice(&body[16..20]);
+            if self.fault == Fault::HoldRxFence {
+                require(
+                    self.held_rx.is_none(),
+                    "Sc repeated uncertain receive fence",
+                )?;
+                self.held_rx = Some(word(body, 16));
+            } else {
+                self.firmware.inject(0xff, 5, 0x8000, &marker);
+            }
+        } else if (group, cmd) == (3, 5) {
             self.firmware.inject(
                 0xfb,
                 3,
@@ -330,7 +362,33 @@ impl Wire {
         let eapol =
             data && frame.get(header..header + 8) == Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
         if !data || eapol {
-            if frame[0] == 0xa0 {
+            if eapol && self.group_rekey {
+                let pdu = frame.get(header + 8..).ok_or("Sc group reply PDU")?;
+                let reply = narf_wireless::eapol::KeyFrame::decode(
+                    pdu.get(4..).ok_or("Sc group reply header")?,
+                    16,
+                )
+                .ok_or("Sc group reply key frame")?;
+                let mut unsigned = pdu.to_vec();
+                unsigned[81..97].fill(0);
+                require(
+                    protected
+                        && reply.key_information == 0x302
+                        && reply.replay_counter == 3
+                        && reply.key_data.is_empty()
+                        && reply.key_mic.as_slice()
+                            == super::super::handshake::compute_mic(
+                                &self.ptk.as_ref().ok_or("Sc group PTK absent")?.kck,
+                                &unsigned,
+                            ),
+                    "Sc actual group response MIC/replay/port",
+                )?;
+                self.group_reply = true;
+                if self.fault == Fault::HoldGroupReply {
+                    self.held_tx = Some((p.queue, p.pointer));
+                    return Ok(());
+                }
+            } else if frame[0] == 0xa0 {
                 require(
                     self.ap.phase() == ApPhase::Authorized,
                     "Sc disconnect before association",
@@ -354,8 +412,9 @@ impl Wire {
                     }
                     let m2 =
                         KeyFrame::decode(&frame[header + 12..], 16).ok_or("Sc M2 key frame")?;
-                    self.key =
-                        Some(derive_ptk(&Sha1, &PMK, &AP, &OWN, &ANONCE, &m2.key_nonce, 16).tk);
+                    let ptk = derive_ptk(&Sha1, &PMK, &AP, &OWN, &ANONCE, &m2.key_nonce, 16);
+                    self.key = Some(ptk.tk.clone());
+                    self.ptk = Some(ptk);
                 }
                 for response in responses {
                     self.mpdu(&response, false);
@@ -456,13 +515,11 @@ fn drain() -> bool {
     {
         let mut slot = HARNESS.lock();
         if let Some((_, wire)) = slot.as_mut() {
-            wire.received.extend(frames.iter().cloned());
+            wire.received.extend(frames.iter().map(|d| d.bytes.clone()));
             progress |= wire.service().unwrap_or(false);
         }
     }
-    for mut frame in frames {
-        narf_net::iface::on_rx_frame_from(device.name(), &mut frame);
-    }
+    device.dispatch(frames);
     progress
 }
 
@@ -494,6 +551,14 @@ impl Guard {
         Self::new_named(secured, fault, None)
     }
     fn new_named(secured: bool, fault: Fault, name: Option<&'static str>) -> R<Self> {
+        Self::build_named(secured, fault, name, None)
+    }
+    fn build_named(
+        secured: bool,
+        fault: Fault,
+        name: Option<&'static str>,
+        sources: Option<(&crate::firmware_asset::Asset, &crate::firmware_asset::Asset)>,
+    ) -> R<Self> {
         require(
             ACTIVE.lock().is_none()
                 && narf_net::iface::lookup(super::super::iwl_ifname()).is_none()
@@ -503,6 +568,15 @@ impl Guard {
         let versions = super::super::firmware_parser_tests::mld_commands();
         let (mut hardware, firmware, trace) = model::station_model();
         model::versions(&mut hardware, &versions);
+        if let Some((firmware, pnvm)) = sources {
+            let parsed = super::super::parse_ucode(&firmware.bytes)
+                .map_err(|_| "Sc source fixture parse")?;
+            require(
+                parsed.api.commands == versions,
+                "Sc source fixture executable/command table mismatch",
+            )?;
+            hardware.bind_sources(firmware, Some(pnvm))?;
+        }
         Device::validate_station_profile(&hardware)?;
         let ap = if secured {
             FakeAp::wpa2(NETWORK, SSID, 6, 7, PMK, ANONCE)
@@ -523,11 +597,15 @@ impl Guard {
             air: Vec::new(),
             replies: Vec::new(),
             key: None,
+            ptk: None,
+            group_rekey: false,
+            group_reply: false,
             keys: 0,
             next_pn: 0,
             fault,
             held: None,
             held_tx: None,
+            held_rx: None,
             m4: false,
             error: None,
         };
@@ -550,6 +628,7 @@ impl Guard {
             connection: None,
             needs_reset: false,
             producer: Some(rx_producer),
+            receive_ipc: None,
             eapol: VecDeque::new(),
             tx: core::array::from_fn(|_| None),
             pending: core::array::from_fn(|_| None),
@@ -560,11 +639,16 @@ impl Guard {
             state.tx[category] = Some(consumer);
             IrqSafeSpinLock::new(Some(producer))
         });
+        let source = state.hardware.source_fence()?;
         let device = Arc::new(Device {
             test_name: name,
             state: Mutex::new(state),
             control: Mutex::new(None),
             publication: AtomicBool::new(true),
+            source,
+            generation: Arc::new(AtomicU64::new(0)),
+            quarantined: AtomicBool::new(false),
+            admission: IrqSafeSpinLock::new(()),
             mac: OWN,
             irq_vector: None,
             channels: nvm.channels,
@@ -727,7 +811,7 @@ fn composition(secured: bool) -> R {
     // activation, under the retained owner lock just as on native progress.
     {
         let _owner = device.state.try_lock().unwrap();
-        device.set_link(true);
+        device.publish_link(AP, device.generation.load(Ordering::Acquire))?;
     }
     require(
         narf_net::iface::lookup(device.name()).is_some_and(|iface| !iface.link_up && iface.carrier),
@@ -1040,6 +1124,7 @@ fn smoke_sc_disconnect_overrides_waiting_old_link_publication() -> TestResult {
         carrier(device, true)?;
         let control = device.control.try_lock().ok_or("Sc fixture control busy")?;
         let state = device.state.try_lock().ok_or("Sc fixture state busy")?;
+        let retired_epoch = device.generation.load(Ordering::Acquire);
         let mut disconnect = Box::pin(device.disassociate());
         require(
             disconnect
@@ -1053,15 +1138,17 @@ fn smoke_sc_disconnect_overrides_waiting_old_link_publication() -> TestResult {
             device.connected_bssid().is_none(),
             "Sc early disconnect left cached BSSID",
         )?;
-        // Complete the old association's publication under its state guard,
+        // Attempt the actual old association publication under its state guard,
         // after disconnect's early close but before it can acquire state.
         require(
             state.connection.as_ref().is_some_and(|c| c.authorized),
             "Sc fixture lacks the previous authorized publisher",
         )?;
-        device.store_bssid(AP);
-        device.set_link(true);
-        carrier(device, true)?;
+        require(
+            device.publish_link(AP, retired_epoch).is_err(),
+            "old native association bypassed close publication generation",
+        )?;
+        carrier(device, false)?;
         drop(state);
         drop(control);
         run(disconnect, service)?.map_err(|_| "Sc interleaved native disconnect")?;
@@ -1070,7 +1157,7 @@ fn smoke_sc_disconnect_overrides_waiting_old_link_publication() -> TestResult {
         require(
             device.connected_bssid().is_none()
                 && narf_net::iface::lookup(device.name()).is_some_and(|i| {
-                    i.link_up && i.carrier_up_count == 2 && i.carrier_down_count == 2
+                    i.link_up && i.carrier_up_count == 1 && i.carrier_down_count == 1
                 }),
             "Sc old publisher reopened cached peer after completed disconnect",
         )?;
@@ -1157,7 +1244,10 @@ fn smoke_sc_socket_owner_close_waits_for_native_m4_then_tears_down() -> TestResu
             narf_scheduler::sleep_pumps::run();
         }
         require(worker_complete, "Sc socket-close worker retained its task")?;
-        association_result?.map_err(|_| "Sc owner-close setup association failed")?;
+        require(
+            association_result?.is_err(),
+            "Sc closing owner allowed stale association carrier publication",
+        )?;
         require(
             waited_for_association,
             "Sc socket-close worker returned Busy and abandoned pending association",

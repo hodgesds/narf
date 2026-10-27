@@ -38,6 +38,8 @@ fn rig() -> Result<(Vec<u32>, Hardware), Error> {
         tokens: packet_tx::Tokens::new(),
         pending_events: VecDeque::new(),
         pending_data: VecDeque::new(),
+        receive_epoch: 0,
+        receive_open: false,
         rx: [
             Ring::allocate(RX_PRE, true)?,
             Ring::allocate(RX_POST, true)?,
@@ -57,6 +59,37 @@ fn rig() -> Result<(Vec<u32>, Hardware), Error> {
         },
     ))
 }
+
+fn mcu_actual_chip_id_uses_current_native_register_and_never_pci_alias() -> TestResult {
+    let (mut words, hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("actual chip native allocation"),
+    };
+    // The fixture's PCI function is0x0616. Chip identity still comes from
+    // MT_HW_CHIPID through the real checked remap transaction.
+    for chip in [0x7961u32, 0x7922, 0x7920] {
+        words[0x40200 / 4] = chip;
+        if hw.chip_id() != Ok(chip as u16) {
+            return TestResult::Fail("actual native chip identity was not retained");
+        }
+    }
+    for chip in [0, 0x0608, 0x0616, u32::MAX] {
+        words[0x40200 / 4] = chip;
+        let expected = if chip == u32::MAX {
+            Error::DeviceGone
+        } else {
+            Error::InvalidIdentity
+        };
+        if hw.chip_id() != Err(expected) {
+            return TestResult::Fail("PCI alias or absent chip register created native identity");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/vht160",
+    mcu_actual_chip_id_uses_current_native_register_and_never_pci_alias
+);
 
 fn mcu_dma_production_tx_descriptor_completion_and_wrap() -> TestResult {
     let (mut words, mut hw) = match rig() {
@@ -119,7 +152,13 @@ fn mt76_recycled_storage_clears_tokens_payloads_indices_and_old_rx() -> TestResu
     }
     storage.data_dma = 4;
     storage.pending_events.push_back(vec![0x66; 36]);
-    storage.pending_data.push_back(vec![0x55; 64]);
+    storage.pending_data.push_back(CapturedData {
+        bytes: vec![0x55; 64],
+        epoch: 7,
+        port_open: true,
+    });
+    storage.receive_epoch = 7;
+    storage.receive_open = true;
     storage.rx[0].index = 9;
     storage.rx[0].set_word(9, 1, (36 << 16) | LAST | DONE);
     // All fixture buffers are CPU-owned; there is no device attached to this
@@ -129,6 +168,8 @@ fn mt76_recycled_storage_clears_tokens_payloads_indices_and_old_rx() -> TestResu
         || storage.data_dma != 0
         || !storage.pending_events.is_empty()
         || !storage.pending_data.is_empty()
+        || storage.receive_epoch != 0
+        || storage.receive_open
     {
         return TestResult::Fail("old firmware tokens/replies survived DMA generation reset");
     }
@@ -617,6 +658,82 @@ fn mcu_packet_router_separates_forwarded_management_from_command_replies() -> Te
     }
     TestResult::Pass
 }
+fn mcu_packet_capture_keeps_closed_and_old_owner_facts_across_native_prefix_open() -> TestResult {
+    let (mut words, mut hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("capture native ring allocation"),
+    };
+    let mut packet = vec![0u8; 64];
+    packet[..4].copy_from_slice(&((2u32 << 27) | 64).to_le_bytes());
+    hw.close_receive_capture(7);
+    for which in 0..3 {
+        inject_rx(&mut words, &hw, which, &packet);
+    }
+    if hw.receive() != Ok(None) || hw.open_receive_capture(7).is_err() {
+        return TestResult::Fail("closed DMA copy/native prefix open");
+    }
+    for _ in 0..3 {
+        if hw.receive_data_captured()
+            != Ok(Some(CapturedData {
+                bytes: packet.clone(),
+                epoch: 7,
+                port_open: false,
+            }))
+        {
+            return TestResult::Fail("already-copied closed packet gained open admission");
+        }
+    }
+    hw.close_receive_capture(8);
+    // This descriptor is complete before opening, but no waiter copied it.
+    inject_rx(&mut words, &hw, 2, &packet);
+    if hw.open_receive_capture(8).is_err()
+        || hw.receive_data_captured()
+            != Ok(Some(CapturedData {
+                bytes: packet.clone(),
+                epoch: 8,
+                port_open: false,
+            }))
+    {
+        return TestResult::Fail("completed native prefix inherited a later port open");
+    }
+    inject_rx(&mut words, &hw, 2, &packet);
+    if hw.receive() != Ok(None) {
+        return TestResult::Fail("open native capture");
+    }
+    hw.close_receive_capture(9);
+    if hw.open_receive_capture(9).is_err()
+        || hw.receive_data_captured()
+            != Ok(Some(CapturedData {
+                bytes: packet.clone(),
+                epoch: 8,
+                port_open: true,
+            }))
+    {
+        return TestResult::Fail("old buffered copy inherited the replacement epoch");
+    }
+    inject_rx(&mut words, &hw, 0, &packet);
+    if hw.receive_data_captured()
+        != Ok(Some(CapturedData {
+            bytes: packet,
+            epoch: 9,
+            port_open: true,
+        }))
+    {
+        return TestResult::Fail("fresh native capture lost its real open owner");
+    }
+    hw.close_receive_capture(10);
+    words[(RX_DATA + 12) as usize / 4] = DEPTH as u32;
+    if hw.open_receive_capture(10) != Err(Error::Ring)
+        || hw.owner.storage.as_ref().unwrap().receive_open
+    {
+        return TestResult::Fail("invalid native cut opened receive admission");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/receive_epoch",
+    mcu_packet_capture_keeps_closed_and_old_owner_facts_across_native_prefix_open
+);
 kernel_test_in!(
     "drivers/wireless/mt7921/tx",
     mcu_packet_router_separates_forwarded_management_from_command_replies
@@ -637,7 +754,7 @@ fn mcu_receive_router_bounds_both_queues_without_dropping_command_replies() -> T
         }
     }
     let storage = hw.owner.storage.as_ref().unwrap();
-    if storage.pending_data.len() != 32 || storage.pending_data.front().unwrap()[63] != 1 {
+    if storage.pending_data.len() != 32 || storage.pending_data.front().unwrap().bytes[63] != 1 {
         return TestResult::Fail("normal RX backlog is unbounded or keeps stale data");
     }
     // Clear the data backlog before exercising event routing on data ring 2.

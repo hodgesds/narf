@@ -23,6 +23,7 @@ pub struct DataQueue {
     id: Option<u16>,
     station_tid: Option<(u8, u8)>,
     aggregated: bool,
+    removing: bool,
     read: u16,
     write: u16,
     #[cfg(any(test, feature = "kernel-test"))]
@@ -44,6 +45,7 @@ impl DataQueue {
             id: None,
             station_tid: None,
             aggregated: false,
+            removing: false,
             read: 0,
             write: 0,
             #[cfg(any(test, feature = "kernel-test"))]
@@ -73,12 +75,45 @@ impl DataQueue {
     pub fn enable_aggregation(&mut self) {
         self.aggregated = self.station_tid.is_some_and(|(_, tid)| tid < 8);
     }
+    pub(super) fn gen2_aggregation(&mut self, enabled: bool) -> Result<(), &'static str> {
+        if !self.pre_ax210 || !self.belongs_to(0, 0) || !self.is_idle() {
+            return Err("Gen2 aggregation transition requires idle station0/TID0");
+        }
+        self.aggregated = enabled;
+        Ok(())
+    }
+
+    pub(super) fn aggregated(&self) -> bool {
+        self.aggregated
+    }
+    pub(super) fn begin_remove(&mut self, station: u8, tid: u8) -> Result<(), &'static str> {
+        if self.removing || !self.belongs_to(station, tid) || !self.is_idle() {
+            return Err("TX queue remove ownership/outstanding phase mismatch");
+        }
+        self.removing = true;
+        Ok(())
+    }
+    pub(super) fn ready_binding(&self, station: u8, tid: u8) -> bool {
+        !self.removing && self.belongs_to(station, tid) && self.is_idle()
+    }
 
     pub fn validate_ba(&self, station: u8, tid: u8, ssn: u16) -> Result<(), &'static str> {
         if !self.aggregated || self.station_tid != Some((station, tid)) {
             return Err("BA completion for unnegotiated station/TID");
         }
-        self.validate_reclaim(ssn)
+        self.validate_reclaim(self.native_pointer(ssn))
+    }
+
+    fn native_pointer(&self, pointer: u16) -> u16 {
+        // cfg/22000.c max_tfd_queue_size256; pcie/tx.c reclaims using
+        // the physical ring index. Keep a monotonic host token separately
+        // from the source's8-bit Qu scheduler pointer (and12-bit WLAN SN).
+        if self.pre_ax210 {
+            self.read
+                .wrapping_add(pointer.wrapping_sub(self.read) & 255)
+        } else {
+            pointer
+        }
     }
 
     fn validate_reclaim(&self, ssn: u16) -> Result<(), &'static str> {
@@ -96,6 +131,7 @@ impl DataQueue {
 
     /// Validate the whole interval before releasing any device-owned buffer.
     pub fn reclaim(&mut self, ssn: u16) -> Result<(), &'static str> {
+        let ssn = self.native_pointer(ssn);
         self.validate_reclaim(ssn)?;
         while self.read != ssn {
             self.pending[self.read as usize & (DEPTH - 1)] = None;
@@ -122,8 +158,13 @@ impl DataQueue {
         }
         let pointer = u16::from_le_bytes(response[4..6].try_into().unwrap());
         self.id = Some(id);
-        self.read = pointer;
-        self.write = pointer;
+        let initial = if self.pre_ax210 {
+            pointer & 255
+        } else {
+            pointer
+        };
+        self.read = initial;
+        self.write = initial;
         Ok(id)
     }
 
@@ -144,7 +185,7 @@ impl DataQueue {
     }
 
     pub fn has_space(&self) -> bool {
-        (self.write.wrapping_sub(self.read) as usize) < DEPTH - 1
+        !self.removing && (self.write.wrapping_sub(self.read) as usize) < DEPTH - 1
     }
 
     pub fn id(&self) -> Option<u16> {
@@ -232,15 +273,20 @@ impl DataQueue {
         self.pending[slot] = Some(dma);
         self.write = self.write.wrapping_add(1);
         dma_barrier();
+        let wire_pointer = if self.pre_ax210 {
+            self.write & 255
+        } else {
+            self.write
+        };
         mmio.write(
             tx_gen2::HBUS_TARG_WRPTR,
-            tx_gen2::tx_doorbell(id as u32, self.write as u32),
+            tx_gen2::tx_doorbell(id as u32, u32::from(wire_pointer)),
         );
         #[cfg(any(test, feature = "kernel-test"))]
         if let Some(trace) = &self.trace {
             trace.published(
                 id,
-                self.write,
+                wire_pointer,
                 self.pending[slot]
                     .as_ref()
                     .ok_or("private packet DMA absent")?,
@@ -260,7 +306,18 @@ impl DataQueue {
             return Err("invalid unaggregated TX response");
         }
         let id = u16::from_le_bytes(response[36..38].try_into().unwrap());
-        let ssn = u32::from_le_bytes(response[44..48].try_into().unwrap()) as u16;
+        let raw_ssn = u32::from_le_bytes(response[44..48].try_into().unwrap());
+        // mvm/tx.c::iwl_mvm_get_scd_ssn: Qu uses12 bits, AX21016.
+        // Reconstruct the retained monotonic descriptor interval across wrap.
+        let mask = if self.pre_ax210 { 0xfff } else { 0xffff };
+        if raw_ssn & !mask != 0 {
+            return Err("TX completion SSN reserved bits");
+        }
+        let ssn = if self.pre_ax210 {
+            self.native_pointer(raw_ssn as u16)
+        } else {
+            raw_ssn as u16
+        };
         if self.id != Some(id)
             || self.read == self.write
             || ssn == self.read
@@ -269,7 +326,7 @@ impl DataQueue {
             return Err("TX completion outside outstanding interval");
         }
         self.reclaim(ssn)?;
-        Ok((ssn, response[40] == 1))
+        Ok((ssn, matches!(response[40], 1 | 2)))
     }
 }
 

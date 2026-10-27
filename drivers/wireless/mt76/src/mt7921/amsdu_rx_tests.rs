@@ -487,11 +487,11 @@ fn mt76_amsdu_key_cancellation_teardown_and_reset_close_received_ownership() -> 
             .packets
             .push_back(packet(&eth, true, 1, marker, 7));
     }
-    if session.receive_ethernet() != Ok(Some(eth.clone()))
+    if session.receive_ethernet() != Ok(None)
         || !session.keys_pending()
-        || session.received_msdu.len() != 1
+        || !session.received_msdu.is_empty()
     {
-        return TestResult::Fail("aggregate/key cancellation fixture");
+        return TestResult::Fail("closed-key aggregate reached pending cancellation ownership");
     }
     session.backend.tx_stall = true;
     {

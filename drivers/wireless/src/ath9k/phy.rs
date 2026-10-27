@@ -130,6 +130,6 @@ pub(super) fn program_live_power(
 mod channel;
 mod modal;
 mod power;
-mod rates;
+pub(super) mod rates;
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;

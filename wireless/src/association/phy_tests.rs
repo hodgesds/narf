@@ -48,6 +48,176 @@ fn local_vht() -> LocalPhy {
     )
     .unwrap()
 }
+fn local_vht160() -> LocalPhy {
+    LocalPhy::vht160(
+        ht40(),
+        LocalVht::new(0xfffe, 0xfffe, true, true, 0)
+            .unwrap()
+            .with_160mhz(true, true),
+    )
+    .unwrap()
+}
+fn ap160(primary: u8, center: u8, revised: bool) -> Bss {
+    let index = usize::from((primary - (center - 14)) / 4);
+    let mut operation = [0; 22];
+    operation[0] = primary;
+    operation[1] = if index & 1 == 0 { 5 } else { 7 };
+    let vht = LocalVht::new(0xfffe, 0xfffe, true, true, 0)
+        .unwrap()
+        .with_160mhz(true, true)
+        .capability_body();
+    let center80 = if index < 4 { center - 8 } else { center + 8 };
+    bss(
+        ht40().capability_body(),
+        operation,
+        Some((
+            vht,
+            [
+                if revised { 1 } else { 2 },
+                if revised { center80 } else { center },
+                if revised { center } else { 0 },
+                0xfc,
+                0xff,
+            ],
+        )),
+        None,
+    )
+}
+fn contiguous160() -> Result<(), &'static str> {
+    for center in [50, 114, 163] {
+        for index in 0..8 {
+            let primary = center - 14 + index * 4;
+            for revised in [false, true] {
+                let ap = ap160(primary, center, revised);
+                let wide =
+                    prepare(&ap, local_vht160()).map_err(|_| "valid contiguous160 profile")?;
+                let offer = wide.offered_phy().unwrap();
+                let expected: Vec<_> = (0..8).map(|i| center - 14 + i * 4).collect();
+                check!(
+                    offer.width() == Width::OneSixty
+                        && offer.center_channel() == center
+                        && offer.occupied_channels() == expected
+                        && offer.vht().unwrap().tx_sgi160()
+                        && offer.vht().unwrap().rx_sgi160(),
+                    "160 original geometry/GI or eight occupied channels"
+                );
+                check!(
+                    offer.vht().unwrap().local_capability()
+                        == [100, 0, 0, 0, 254, 255, 0, 0, 254, 255, 0, 0],
+                    "local contiguous160 capability invented 80+80/NSS/features"
+                );
+                let narrow = prepare(&ap, local_vht()).map_err(|_| "80 station on160 BSS")?;
+                let narrow = narrow.offered_phy().unwrap();
+                let start = if index < 4 { 0 } else { 4 };
+                check!(
+                    narrow.width() == Width::Eighty
+                        && narrow.occupied_channels() == &expected[start..start + 4]
+                        && narrow.vht().unwrap().local_capability()[0] & 0x4c == 0,
+                    "primary80 fallback invented a160 receive promise"
+                );
+            }
+        }
+    }
+    let original = ap160(36, 50, true);
+    let mut plan = ready(&original, local_vht160());
+    let mut narrow = ap(true, true, None);
+    let facts = bodies(&narrow);
+    let mut cap = facts.vht_cap.unwrap();
+    cap[0] &= !0x40;
+    narrow = bss(
+        facts.ht_cap.unwrap(),
+        facts.ht_op.unwrap(),
+        Some((cap, facts.vht_op.unwrap())),
+        None,
+    );
+    check!(
+        plan.association_response(&response(&narrow)) == Ok(Some(7)),
+        "160 response could not shrink to primary80"
+    );
+    check!(
+        plan.negotiated_phy().unwrap().width() == Width::Eighty
+            && !plan.negotiated_phy().unwrap().vht().unwrap().tx_sgi160(),
+        "narrowed response retained unsupported TX SGI160"
+    );
+    Ok(())
+}
+smoke!(
+    smoke_phy_contiguous160_legacy_revised_and_primary80_fallback,
+    contiguous160
+);
+fn contiguous160_boundaries() -> Result<(), &'static str> {
+    let narrow = LocalVht::new(0xfffe, 0xfffe, true, true, 0).unwrap();
+    let wide = narrow.with_160mhz(true, true);
+    check!(
+        LocalPhy::vht160(ht40(), narrow).is_err()
+            && LocalPhy::vht80(ht40(), wide).is_err()
+            && LocalPhy::vht160(LocalHt::siso20(true, true), wide).is_err(),
+        "160 constructor accepted a mismatched local width promise"
+    );
+    let original = ap160(36, 50, true);
+    let facts = bodies(&original);
+    for operation in [
+        [1, 58, 50, 252, 255],  // Wrong primary80 half.
+        [1, 42, 114, 252, 255], // Discontiguous80+80.
+        [2, 50, 50, 252, 255],  // Deprecated160 has no second segment.
+        [2, 82, 0, 252, 255],   // Noncanonical contiguous block.
+        [3, 42, 106, 252, 255], // Explicit80+80.
+    ] {
+        let invalid = bss(
+            facts.ht_cap.unwrap(),
+            facts.ht_op.unwrap(),
+            Some((facts.vht_cap.unwrap(), operation)),
+            None,
+        );
+        check!(
+            prepare(&invalid, local_vht160()).is_err() && prepare(&invalid, local_vht()).is_err(),
+            "invalid160 geometry became wide or narrow admission"
+        );
+    }
+    for bits in [0u8, 12] {
+        // No160 support or reserved supported-width encoding.
+        let mut cap = facts.vht_cap.unwrap();
+        cap[0] = (cap[0] & !12) | bits;
+        let invalid = bss(
+            facts.ht_cap.unwrap(),
+            facts.ht_op.unwrap(),
+            Some((cap, facts.vht_op.unwrap())),
+            None,
+        );
+        check!(
+            prepare(&invalid, local_vht160()).is_err(),
+            "160 operation without a legal peer width capability"
+        );
+    }
+    let mut narrow_plan = ready(&ap(true, true, None), local_vht160());
+    check!(
+        narrow_plan
+            .association_response(&response(&original))
+            .is_err()
+            && narrow_plan.negotiated_phy().is_none(),
+        "response expanded an80 scan offer to160"
+    );
+    let mut cap = facts.vht_cap.unwrap();
+    cap[0] &= !64;
+    let no_sgi = bss(
+        facts.ht_cap.unwrap(),
+        facts.ht_op.unwrap(),
+        Some((cap, facts.vht_op.unwrap())),
+        None,
+    );
+    let mut plan = ready(&no_sgi, local_vht160());
+    check!(
+        plan.association_response(&response(&original)) == Ok(Some(7))
+            && !plan.negotiated_phy().unwrap().vht().unwrap().tx_sgi160()
+            && plan.negotiated_phy().unwrap().vht().unwrap().rx_sgi160(),
+        "response newly enabled TX SGI160 or erased the local RX promise"
+    );
+    Ok(())
+}
+smoke!(
+    smoke_phy_contiguous160_constructor_geometry_response_and_directional_gi,
+    contiguous160_boundaries
+);
 fn element(bytes: &mut Vec<u8>, id: u8, body: &[u8]) {
     bytes.extend_from_slice(&[id, body.len() as u8]);
     bytes.extend_from_slice(body);
@@ -453,6 +623,124 @@ fn ht_directionality() -> Result<(), &'static str> {
 smoke!(
     smoke_phy_ht_directional_mcs_gi_and_peer_tx_facts,
     ht_directionality
+);
+
+fn ldpc_directionality() -> Result<(), &'static str> {
+    for (local_rx, local_tx, scan_rx, response_rx) in [
+        (false, false, true, true),
+        (true, false, true, true),
+        (false, true, true, true),
+        (true, true, false, true),
+        (true, true, true, false),
+        (true, true, true, true),
+    ] {
+        let local = LocalPhy::vht80(
+            ht40().with_ldpc(local_rx, local_tx),
+            LocalVht::new(0xfffe, 0xfffe, true, true, 0)
+                .unwrap()
+                .with_ldpc(local_rx, local_tx),
+        )
+        .unwrap();
+        let original = ap(true, true, None);
+        let facts = bodies(&original);
+        let mut ht = facts.ht_cap.unwrap();
+        let mut vht = facts.vht_cap.unwrap();
+        ht[0] |= u8::from(scan_rx);
+        vht[0] |= u8::from(scan_rx) << 4;
+        let scan = bss(
+            ht,
+            facts.ht_op.unwrap(),
+            Some((vht, facts.vht_op.unwrap())),
+            None,
+        );
+        let mut plan = ready(&scan, local);
+        let offered = plan.offered_phy().unwrap();
+        check!(
+            offered.ht().rx_ldpc() == local_rx
+                && offered.vht().unwrap().rx_ldpc() == local_rx
+                && offered.ht().tx_ldpc() == (local_tx && scan_rx)
+                && offered.vht().unwrap().tx_ldpc() == (local_tx && scan_rx),
+            "LDPC scan directions were conflated"
+        );
+        ht[0] = (ht[0] & !1) | u8::from(response_rx);
+        vht[0] = (vht[0] & !16) | (u8::from(response_rx) << 4);
+        let reply = bss(
+            ht,
+            facts.ht_op.unwrap(),
+            Some((vht, facts.vht_op.unwrap())),
+            None,
+        );
+        check!(
+            plan.association_response(&response(&reply)) == Ok(Some(7)),
+            "compatible LDPC response failed"
+        );
+        let negotiated = plan.negotiated_phy().unwrap();
+        let tx = local_tx && scan_rx && response_rx;
+        check!(
+            negotiated.ht().rx_ldpc() == local_rx
+                && negotiated.vht().unwrap().rx_ldpc() == local_rx
+                && negotiated.ht().tx_ldpc() == tx
+                && negotiated.vht().unwrap().tx_ldpc() == tx,
+            "LDPC response promoted TX or replaced local RX"
+        );
+        check!(
+            negotiated.ht().local_capability()[0] & 1 == u8::from(local_rx)
+                && negotiated.vht().unwrap().local_capability()[0] & 16 == u8::from(local_rx) << 4,
+            "LDPC local capability encoded peer or transmit support"
+        );
+    }
+    check!(
+        LocalHt::siso20(true, true).capability_body()[0] & 1 == 0
+            && LocalVht::new(0xfffc, 0xfffc, true, true, 0)
+                .unwrap()
+                .capability_body()[0]
+                & 16
+                == 0,
+        "LDPC became implicit for existing constructors"
+    );
+    Ok(())
+}
+smoke!(
+    smoke_phy_ldpc_local_receive_and_bound_transmit_are_independent,
+    ldpc_directionality
+);
+
+fn rx_stbc_promise() -> Result<(), &'static str> {
+    for enabled in [false, true] {
+        let ht = ht40().with_rx_stbc(enabled);
+        let vht = LocalVht::new(0xfffe, 0xfffe, true, true, 0)
+            .unwrap()
+            .with_rx_stbc(enabled);
+        check!(
+            ht.capability_body()[1] & 3 == u8::from(enabled)
+                && ht.capability_body()[0] & 128 == 0
+                && vht.capability_body()[1] & 7 == u8::from(enabled)
+                && vht.capability_body()[0] & 128 == 0,
+            "RX STBC1 encoded TX STBC or extra data streams"
+        );
+        let local = LocalPhy::vht80(ht, vht).unwrap();
+        let original = ap(true, true, None);
+        let mut plan = ready(&original, local);
+        check!(
+            plan.offered_phy().unwrap().ht().rx_stbc() == enabled
+                && plan.offered_phy().unwrap().vht().unwrap().rx_stbc() == enabled,
+            "peer facts replaced local STBC receive promise"
+        );
+        check!(
+            plan.association_response(&response(&original)) == Ok(Some(7)),
+            "STBC local promise prevented compatible association"
+        );
+        check!(
+            plan.negotiated_phy().unwrap().ht().rx_stbc() == enabled
+                && plan.negotiated_phy().unwrap().vht().unwrap().rx_stbc() == enabled,
+            "association response lost local RX STBC promise"
+        );
+    }
+    Ok(())
+}
+smoke!(
+    smoke_phy_rx_stbc1_never_promises_transmit_stbc,
+    rx_stbc_promise
 );
 
 fn ht_basic_and_narrowing() -> Result<(), &'static str> {

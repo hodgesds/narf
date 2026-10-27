@@ -129,6 +129,47 @@ pub(super) unsafe trait Registers: Send {
     fn station_ht_request(&mut self) -> Result<super::ht::Request, Error> {
         Err(Error::Unsupported)
     }
+    fn station_rx_ba_extension(
+        &mut self,
+        _: alloc::sync::Arc<super::ht::Grant>,
+    ) -> Result<Option<alloc::sync::Arc<super::rx_ba_power::Grant>>, Error> {
+        Ok(None)
+    }
+    fn station_bind_rx_ba(
+        &mut self,
+        _: alloc::sync::Arc<super::rx_ba_power::Grant>,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_rx_ba_request(&mut self) -> Result<super::RxBaRequest, Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_tx_ba_extension(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<super::tx_ba_power::Grant>>, Error> {
+        Ok(None)
+    }
+    fn station_bind_tx_ba(
+        &mut self,
+        _: alloc::sync::Arc<super::tx_ba_power::Grant>,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_tx_ba_request(&mut self) -> Result<super::TxBaRequest, Error> {
+        Err(Error::Unsupported)
+    }
+    fn packet_aggregation(
+        &mut self,
+        _: Option<super::packet_format::Aggregation>,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn packet_submit_batch(
+        &mut self,
+        _: &[alloc::vec::Vec<u8>],
+    ) -> Result<alloc::vec::Vec<u64>, super::packet_core::Error> {
+        Err(super::packet_core::Error::State)
+    }
     fn mailbox_ready(&mut self) -> Result<bool, Error> {
         Err(Error::Unsupported)
     }
@@ -309,6 +350,47 @@ impl<R: Registers, M: Memory> Backend<R, M> {
 // before publication, poisons before mutation and reopens only on a fresh
 // page completion; R's unsafe contract governs all other native queue state.
 unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
+    fn station_tx_ba_extension(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<super::tx_ba_power::Grant>>, Error> {
+        self.io.station_tx_ba_extension()
+    }
+    fn station_bind_tx_ba(
+        &mut self,
+        g: alloc::sync::Arc<super::tx_ba_power::Grant>,
+    ) -> Result<(), Error> {
+        self.io.station_bind_tx_ba(g)
+    }
+    fn station_tx_ba_request(&mut self) -> Result<super::TxBaRequest, Error> {
+        self.io.station_tx_ba_request()
+    }
+    fn packet_aggregation(
+        &mut self,
+        cfg: Option<super::packet_format::Aggregation>,
+    ) -> Result<(), Error> {
+        self.io.packet_aggregation(cfg)
+    }
+    fn packet_submit_batch(
+        &mut self,
+        b: &[alloc::vec::Vec<u8>],
+    ) -> Result<alloc::vec::Vec<u64>, super::packet_core::Error> {
+        self.io.packet_submit_batch(b)
+    }
+    fn station_rx_ba_extension(
+        &mut self,
+        b: alloc::sync::Arc<super::ht::Grant>,
+    ) -> Result<Option<alloc::sync::Arc<super::rx_ba_power::Grant>>, Error> {
+        self.io.station_rx_ba_extension(b)
+    }
+    fn station_bind_rx_ba(
+        &mut self,
+        g: alloc::sync::Arc<super::rx_ba_power::Grant>,
+    ) -> Result<(), Error> {
+        self.io.station_bind_rx_ba(g)
+    }
+    fn station_rx_ba_request(&mut self) -> Result<super::RxBaRequest, Error> {
+        self.io.station_rx_ba_request()
+    }
     fn station_ht_facts(&self) -> Option<super::ht::Facts> {
         self.io.station_ht_facts()
     }

@@ -54,6 +54,12 @@ pub(super) enum Phase {
     Stopped,
 }
 pub(super) trait Port {
+    fn ht_grant(&self) -> Option<alloc::sync::Arc<super::ht::Grant>> {
+        None
+    }
+    fn rx_ba_grant(&self) -> Option<alloc::sync::Arc<super::rx_ba::Grant>> {
+        None
+    }
     fn transmit_allowed(&self) -> Result<(), Error>;
     /// Actual CPU payload/descriptor access occurs in current device invocation.
     fn access<T>(
@@ -157,7 +163,7 @@ impl Storage {
         let mut blocks: Vec<Memory> = Vec::new();
         for length in [TX_DEPTH * STRIDE, RX_DEPTH * STRIDE]
             .into_iter()
-            .chain(core::iter::repeat_n(descriptor::MAX_MPDU, TX_DEPTH))
+            .chain(core::iter::repeat_n(descriptor::MAX_MPDU + 2, TX_DEPTH))
             .chain(core::iter::repeat_n(descriptor::RX_BYTES, RX_DEPTH))
         {
             let buffer = port.allocate(length)?;
@@ -193,6 +199,8 @@ struct Pending {
     group: bool,
     words: [u32; WORDS],
     deadline: u64,
+    original: Vec<u8>,
+    dma: Vec<u8>,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Delivery {
@@ -219,6 +227,10 @@ pub(super) struct Packet<P: Port> {
     tail: usize,
     held: Option<usize>,
     next_rx: [Option<usize>; RX_DEPTH],
+    ht: Option<super::ht::Profile>,
+    slot_us: u32,
+    edca: Option<u32>,
+    ba: bool,
 }
 impl<P: Port> core::fmt::Debug for Packet<P> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -288,13 +300,103 @@ impl<P: Port> Packet<P> {
             tail: RX_DEPTH - 1,
             held: None,
             next_rx,
+            ht: None,
+            slot_us: 20,
+            edca: None,
+            ba: false,
         })
     }
     pub(super) fn phase(&self) -> Phase {
         self.phase
     }
     pub(super) fn check_transmit(&self) -> Result<(), Error> {
-        self.port.transmit_allowed()
+        self.port.transmit_allowed()?;
+        if self.ht.is_some()
+            && (self.port.read(0x1030)? != 8 * 44
+                || self.port.read(0x1070)? != self.slot_us * 44
+                || self.port.read(0x8014)? & 0x3fff_3fff != (64 * 44) | ((48 * 44) << 16)
+                || self.port.read(0x801c)? & 0x7f != 43)
+        {
+            return Err(Error::Descriptor);
+        }
+        if let Some(word) = self.edca {
+            if self.port.read(0x1040)? != word || self.port.read(0x10c0)? != 0 {
+                return Err(Error::Descriptor);
+            }
+        }
+        if self.ba {
+            self.port
+                .rx_ba_grant()
+                .ok_or(Error::Access)?
+                .readback(&self.port)?;
+        }
+        self.port.access(self.phase != Phase::Prepared, || Ok(()))
+    }
+    pub(super) fn ht_grant(&self) -> Option<alloc::sync::Arc<super::ht::Grant>> {
+        self.port.ht_grant()
+    }
+    pub(super) fn rx_ba_grant(&self) -> Option<alloc::sync::Arc<super::rx_ba::Grant>> {
+        self.port.rx_ba_grant()
+    }
+    pub(super) fn enable_rx_ba(
+        &mut self,
+        grant: &alloc::sync::Arc<super::rx_ba::Grant>,
+    ) -> Result<(), Error> {
+        if self.phase != Phase::Running
+            || self.ht.is_none()
+            || self.ba
+            || self.pending.is_some()
+            || self
+                .port
+                .rx_ba_grant()
+                .is_none_or(|g| !alloc::sync::Arc::ptr_eq(&g, grant))
+        {
+            return Err(Error::State);
+        }
+        grant.check()?;
+        self.phase = Phase::Failed;
+        self.port.transmit_allowed()?;
+        if self.port.read(0x803c)? != 0x17 {
+            return Err(Error::Descriptor);
+        }
+        self.port.write(0x803c, 0x417)?;
+        grant.readback(&self.port)?;
+        self.ba = true;
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    pub(super) fn set_ht(&mut self, profile: super::ht::Profile) -> Result<(), Error> {
+        if self.phase != Phase::Running || self.pending.is_some() || self.ht.is_some() {
+            return Err(Error::State);
+        }
+        let grant = self.port.ht_grant().ok_or(Error::Access)?;
+        if profile.mcs() & !grant.mcs() != 0 {
+            return Err(Error::Packet);
+        }
+        let be = profile.be();
+        self.phase = Phase::Failed;
+        self.port.transmit_allowed()?;
+        grant.readback(&self.port)?;
+        super::mac::edca(&self.port, be)?;
+        grant.readback(&self.port)?;
+        self.ht = Some(profile);
+        self.edca =
+            Some(u32::from(be.cw_min()) | u32::from(be.cw_max()) << 10 | u32::from(be.aifsn) << 20);
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    pub(super) fn observe_ht(
+        &mut self,
+        offer: &narf_wireless::association::phy::Offer,
+        ies: &[u8],
+        basic: usize,
+    ) -> Result<(), Error> {
+        if self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        self.check_transmit()?;
+        self.ht = Some(self.ht.ok_or(Error::State)?.observe(offer, ies, basic)?);
+        Ok(())
     }
     pub(super) fn set_peer(
         &mut self,
@@ -307,6 +409,7 @@ impl<P: Port> Packet<P> {
         self.phase = Phase::Failed;
         self.port.transmit_allowed()?;
         super::mac::peer(&self.port, peer, slot_us)?;
+        self.slot_us = slot_us;
         self.phase = Phase::Running;
         Ok(())
     }
@@ -372,6 +475,40 @@ impl<P: Port> Packet<P> {
             descriptor::transmit_series(frame, local, address, series)
         })
     }
+    pub(super) fn submit_ba_response(&mut self, frame: &[u8], rate: usize) -> Result<u64, Error> {
+        if !self.ba {
+            return Err(Error::State);
+        }
+        let local = self.local;
+        self.submit_inner(frame, |address| {
+            descriptor::transmit_ba_response(frame, local, address, rate)
+        })
+    }
+    pub(super) fn submit_delba(&mut self, frame: &[u8], rate: usize) -> Result<u64, Error> {
+        if !self.ba {
+            return Err(Error::State);
+        }
+        let local = self.local;
+        self.submit_inner(frame, |address| {
+            descriptor::transmit_delba(frame, local, address, rate)
+        })
+    }
+    pub(super) fn submit_ht(&mut self, frame: &[u8], mcs: u8, basic: usize) -> Result<u64, Error> {
+        if self.ht.is_none()
+            || mcs > 7
+            || self
+                .port
+                .ht_grant()
+                .is_none_or(|g| g.mcs() & (1 << mcs) == 0)
+        {
+            return Err(Error::Packet);
+        }
+        let local = self.local;
+        let profile = self.ht.ok_or(Error::State)?;
+        self.submit_inner(frame, |address| {
+            descriptor::transmit_ht(frame, local, address, mcs, basic, profile)
+        })
+    }
     fn submit_inner(
         &mut self,
         frame: &[u8],
@@ -387,11 +524,13 @@ impl<P: Port> Packet<P> {
         let storage = self.storage.as_ref().ok_or(Error::State)?;
         let words =
             encode(u64::from(storage.tx_bytes[slot].address())).map_err(|_| Error::Packet)?;
+        let dma = descriptor::dma_bytes(frame).map_err(|_| Error::Packet)?;
         self.phase = Phase::Failed;
-        self.port.transmit_allowed()?;
+        self.check_transmit()?;
         if self.port.read(QTXE)? & 1 != 0 || self.port.read(QSTS)? & 3 != 0 {
-            self.phase = Phase::Running;
-            return Err(Error::Busy);
+            // No Pending owner exists here. A live queue is ambiguous DMA,
+            // not reusable credit after restoring a policy or status word.
+            return Err(Error::Descriptor);
         }
         let id = self.serial.checked_add(1).ok_or(Error::State)?;
         let deadline = self
@@ -401,7 +540,7 @@ impl<P: Port> Packet<P> {
             .ok_or(Error::Timeout)?;
         self.phase = Phase::Failed;
         self.port.access(true, || {
-            storage.tx_bytes[slot].write_bytes(frame)?;
+            storage.tx_bytes[slot].write_bytes(&dma)?;
             storage.tx_bytes[slot].sync();
             storage.tx.put_words(slot, &words)?;
             storage.tx.sync();
@@ -411,10 +550,12 @@ impl<P: Port> Packet<P> {
         self.pending = Some(Pending {
             slot,
             id,
-            length: frame.len(),
+            length: dma.len(),
             group: frame[4] & 1 != 0,
             words,
             deadline,
+            original: frame.to_vec(),
+            dma,
         });
         self.port
             .write(QTXDP, storage.tx.address() + (slot * STRIDE) as u32)?;
@@ -435,6 +576,7 @@ impl<P: Port> Packet<P> {
         };
         let storage = self.storage.as_ref().ok_or(Error::State)?;
         self.phase = Phase::Failed;
+        self.check_transmit()?;
         let delivery = self.port.access(true, || {
             storage.tx.sync();
             let done = storage
@@ -468,10 +610,13 @@ impl<P: Port> Packet<P> {
                 return Ok(None);
             }
             storage.tx_bytes[pending.slot].sync();
+            if storage.tx_bytes[pending.slot].bytes(pending.length)? != pending.dma {
+                return Err(Error::Descriptor);
+            }
             Ok(Some(Delivery {
                 id: pending.id,
                 delivered: result == TxStatus::Delivered,
-                bytes: storage.tx_bytes[pending.slot].bytes(pending.length)?,
+                bytes: pending.original.clone(),
                 feedback: descriptor::transmit_feedback(&words).map_err(|_| Error::Descriptor)?,
             }))
         })?;
@@ -497,6 +642,7 @@ impl<P: Port> Packet<P> {
         }
         let storage = self.storage.as_ref().ok_or(Error::State)?;
         self.phase = Phase::Failed;
+        self.check_transmit()?;
         let (consumed, frame) = self.port.access(true, || {
             storage.rx.sync();
             if storage.rx.word(slot * STRIDE + descriptor::RX_DONE * 4)? & 1 == 0 {
@@ -520,7 +666,14 @@ impl<P: Port> Packet<P> {
             }
             storage.rx_bytes[slot].sync();
             let payload = storage.rx_bytes[slot].bytes(length)?;
-            let frame = descriptor::receive(&words, &payload).map_err(|_| Error::Descriptor)?;
+            let frame = if self.ba {
+                descriptor::receive_ba(&words, &payload, self.ht.ok_or(Error::State)?)
+            } else if let Some(profile) = self.ht {
+                descriptor::receive_profile(&words, &payload, profile)
+            } else {
+                descriptor::receive(&words, &payload)
+            }
+            .map_err(|_| Error::Descriptor)?;
             if let Some(held) = self.held {
                 let reset =
                     descriptor::receive_descriptor(u64::from(storage.rx_bytes[held].address()), 0)

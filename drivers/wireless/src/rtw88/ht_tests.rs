@@ -41,6 +41,20 @@ pub(super) trait Fixture: Sized {
     fn sources(&self) -> Vec<Cap<FirmwareBlob, Read>>;
     fn conversions(&self) -> Option<usize>;
     fn inject_status(&self, frame: &[u8], status: &[u8], info: u8, present: bool, shift: u8);
+    fn ba_request(&self) -> Result<super::RxBaRequest, firmware_transport::Error>;
+    fn stage_ba(
+        &self,
+        bytes: Vec<u8>,
+        cap: Cap<FirmwareBlob, Read>,
+    ) -> Result<(), firmware_transport::Error>;
+    fn advance_ms(&self, ms: u64);
+    fn tx_request(&self) -> Result<super::TxBaRequest, firmware_transport::Error>;
+    fn stage_tx(
+        &self,
+        bytes: Vec<u8>,
+        cap: Cap<FirmwareBlob, Read>,
+    ) -> Result<(), firmware_transport::Error>;
+    fn descriptors(&self) -> Vec<[u8; 48]>;
 }
 pub(super) fn elements(sgi: bool) -> Vec<u8> {
     let mut b = vec![45, 26];
@@ -92,7 +106,7 @@ fn run<T>(future: impl Future<Output = T>) -> Result<T, &'static str> {
     }
     Err("native HT fixture future did not finish")
 }
-fn request<F: Fixture>(f: &F) -> AssociateRequest {
+pub(super) fn request<F: Fixture>(f: &F) -> AssociateRequest {
     AssociateRequest {
         bssid: AP,
         ssid: b"narf-8822ce".to_vec(),
@@ -106,7 +120,7 @@ fn request<F: Fixture>(f: &F) -> AssociateRequest {
         ie: Vec::new(),
     }
 }
-fn scan<F: Fixture>(f: &F) -> Result<(), &'static str> {
+pub(super) fn scan<F: Fixture>(f: &F) -> Result<(), &'static str> {
     let r = run(f.device().scan(ScanRequest {
         ssids: vec![],
         frequencies_mhz: vec![2412],
@@ -129,6 +143,74 @@ pub(super) fn join<F: Fixture>(f: &F) -> Result<(), &'static str> {
     run(f.device().associate(request(f)))?.map_err(|_| "native HT association/receipts")?;
     if !f.device().link_up() {
         return Err("native HT port not open");
+    }
+    Ok(())
+}
+/// The AP's real M3 and an original protected DATA reach native RX before
+/// the M2 CCX. Only private EAPOL may cross the terminal reply data epoch.
+pub(super) fn early_m3_control<F: Fixture>() -> Result<(), &'static str> {
+    let f = F::make(true, 255, true, true)?;
+    scan(&f)?;
+    let expected = narf_wifi_fixtures::udp_ipv4(
+        OWN,
+        AP,
+        [10, 88, 1, 1],
+        [10, 88, 1, 42],
+        7,
+        49152,
+        b"M3 before M2 CCX",
+    );
+    {
+        let mut p = f.peer().lock();
+        p.hold_m4 = true;
+        p.m2_data = Some(expected.clone());
+    }
+    let controls = f.controls();
+    let retained = f.retained();
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut future = alloc::boxed::Box::pin(f.device().associate(request(&f)));
+    let mut held = false;
+    for _ in 0..16384 {
+        if future.as_mut().poll(&mut cx).is_ready() {
+            return Err("early M3 did not reach actual held M4");
+        }
+        if controls.held.load(core::sync::atomic::Ordering::Acquire) {
+            held = true;
+            break;
+        }
+    }
+    if !held {
+        return Err("M3 copied before terminal M2 was lost");
+    }
+    let original = f
+        .peer()
+        .lock()
+        .m2_original
+        .clone()
+        .ok_or("actual native M2 did not generate early original")?;
+    if f.device().link_up() {
+        return Err("M2 or early M3 authorized DATA before actual M4 receipt");
+    }
+    f.peer().lock().hold_m4 = false;
+    controls
+        .release
+        .store(true, core::sync::atomic::Ordering::Release);
+    let mut finished = false;
+    for _ in 0..16384 {
+        if let Poll::Ready(r) = future.as_mut().poll(&mut cx) {
+            r.map_err(|_| "private M3 after native terminal M2")?;
+            finished = true;
+            break;
+        }
+    }
+    drop(future);
+    if !finished || !f.device().link_up() || !f.received().is_empty() || f.retained() != retained {
+        return Err("private EAPOL epoch exception granted early DATA or lost native owner");
+    }
+    f.inject(&original, 19, 0);
+    f.pump();
+    if f.received() != vec![expected] {
+        return Err("closed M2-batch DATA consumed PN before current original retry");
     }
     Ok(())
 }
@@ -245,18 +327,47 @@ impl narf_wireless::ccmp::AesCcm for Ccm {
             .map_err(|_| narf_wireless::ccmp::CcmpError::AuthFailed)
     }
 }
-fn aggregate<F: Fixture>(
+pub(super) fn aggregate<F: Fixture>(
     f: &F,
     frames: &[Vec<u8>],
     pn: u64,
     tid: u8,
+) -> Result<Vec<u8>, &'static str> {
+    aggregate_sequence(f, frames, pn, tid, 0)
+}
+pub(super) fn aggregate_sequence<F: Fixture>(
+    f: &F,
+    frames: &[Vec<u8>],
+    pn: u64,
+    tid: u8,
+    sequence: u16,
+) -> Result<Vec<u8>, &'static str> {
+    aggregate_control(f, frames, pn, tid, sequence, 0)
+}
+pub(super) fn aggregate_block_ack<F: Fixture>(
+    f: &F,
+    frames: &[Vec<u8>],
+    pn: u64,
+    tid: u8,
+    sequence: u16,
+) -> Result<Vec<u8>, &'static str> {
+    aggregate_control(f, frames, pn, tid, sequence, 0x60)
+}
+fn aggregate_control<F: Fixture>(
+    f: &F,
+    frames: &[Vec<u8>],
+    pn: u64,
+    tid: u8,
+    sequence: u16,
+    policy: u8,
 ) -> Result<Vec<u8>, &'static str> {
     let protected = f.peer().lock().ap.protected();
     let mut h = vec![0x88, if protected { 0x42 } else { 2 }, 0, 0];
     h.extend_from_slice(&OWN);
     h.extend_from_slice(&AP);
     h.extend_from_slice(&AP);
-    h.extend_from_slice(&[0, 0, 0x80 | tid, 0]);
+    h.extend_from_slice(&(sequence << 4).to_le_bytes());
+    h.extend_from_slice(&[0x80 | tid | policy, 0]);
     let mut body = Vec::new();
     for (i, e) in frames.iter().enumerate() {
         body.extend_from_slice(&e[..12]);
@@ -740,7 +851,7 @@ impl Drop for RestoreReceive {
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
     }
 }
-fn group_rekey<F: Fixture>(f: &F) -> Result<Vec<u8>, &'static str> {
+pub(super) fn group_rekey<F: Fixture>(f: &F) -> Result<Vec<u8>, &'static str> {
     use narf_wireless::eapol::KeyFrame;
     let pdu = {
         let peer = f.peer().lock();

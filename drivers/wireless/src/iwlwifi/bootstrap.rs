@@ -194,7 +194,7 @@ impl Owner {
             Some(region) => region,
             None => super::mmio::map(&self.device, &self.cap)?,
         };
-        let hardware = super::runtime::Hardware::new(
+        let mut hardware = super::runtime::Hardware::new(
             self.device,
             self.cap,
             region,
@@ -202,6 +202,7 @@ impl Owner {
             format,
             identity,
         )?;
+        hardware.bind_sources(&input.firmware, input.pnvm.as_ref())?;
         let interface = Device::initialize(hardware, &parsed, &input.firmware.bytes).await?;
         // Retain this SAME live Device before registration/pump publication.
         state.interface = Some(interface.clone());
@@ -245,7 +246,7 @@ impl Owner {
         self.phase
             .store(ProvisionState::Starting as u8, Ordering::Release);
         let _attempt = Attempt(self);
-        let hardware = super::runtime::Hardware::new(
+        let mut hardware = super::runtime::Hardware::new(
             self.device,
             self.cap,
             region,
@@ -253,6 +254,7 @@ impl Owner {
             CompletionFormat::Qu,
             None,
         )?;
+        hardware.bind_sources(&firmware, None)?;
         let interface = super::mvm_device::Device::initialize(hardware, firmware).await?;
         state.mvm = Some(interface.clone());
         state.interface = Some(interface.clone());
@@ -407,6 +409,24 @@ pub async fn gen2_ht20_transmit_power_request(
         .clone()
         .ok_or("native Intel binding is not Gen2")?;
     device.ht20_power_request().await
+}
+
+/// Metadata for firmware-managed BE aggregation and recipient Block Ack.
+/// Tag3 is a separate externally measured program; tag2 cannot authorize it.
+pub async fn gen2_ba_transmit_power_request(
+) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+    let startup = NATIVE.lock().clone().ok_or("Intel native binding absent")?;
+    if startup.phase() != ProvisionState::Ready {
+        return Err("MVM native firmware not configured");
+    }
+    let device = startup
+        .state
+        .lock()
+        .await
+        .mvm
+        .clone()
+        .ok_or("native Intel binding is not Gen2")?;
+    device.ba_power_request().await
 }
 
 #[cfg(feature = "kernel-test")]

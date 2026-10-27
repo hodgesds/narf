@@ -24,6 +24,8 @@ pub(in crate::iwlwifi) enum Emission {
     #[default]
     Legacy = 1,
     Ht20 = 2,
+    /// Firmware-managed TID0 aggregation and recipient autonomous Block Ack.
+    Ht20Ba = 3,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,6 +105,7 @@ fn request(binding: [u8; 32], mac: [u8; 6], emission: Emission) -> PowerRequest 
     let program = match emission {
         Emission::Legacy => "mvm-api77-power-v1",
         Emission::Ht20 => "mvm-api77-ht20-siso-wmm-power-v2",
+        Emission::Ht20Ba => "mvm-api77-ht20-siso-wmm-ba-power-v3",
     };
     PowerRequest {
         name: format!(
@@ -332,6 +335,9 @@ impl Owner {
             Emission::Legacy => &b"NARF Intel MVM API77 qualified static legacy20 power v1"[..],
             Emission::Ht20 => {
                 &b"NARF Intel MVM API77 qualified static HT20 SISO MCS0-7 SGI20 WMM-BE power v2"[..]
+            }
+            Emission::Ht20Ba => {
+                &b"NARF Intel MVM API77 qualified HT20 SISO MCS0-7 SGI20 WMM-BE TID0 TX-BA pipeline8 RX-BA32 control power v3"[..]
             }
         });
         hash.update(&facts);

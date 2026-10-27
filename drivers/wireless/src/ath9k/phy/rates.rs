@@ -9,8 +9,8 @@ use crate::{
     qualcomm_regulatory::Factory,
 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Plan {
-    registers: [(u64, u32); 7],
+pub(in crate::ath9k) struct Plan {
+    pub(in crate::ath9k) registers: [(u64, u32); 7],
 }
 fn target<const N: usize>(
     image: &[u8; EEPROM_4K_BYTES],
@@ -164,6 +164,16 @@ fn initial_ctl(factory: Factory) -> u16 {
     } else {
         factory.ctl_2ghz
     }) | 2
+}
+pub(in crate::ath9k) fn checked_plan(
+    image: &[u8; EEPROM_4K_BYTES],
+    ceiling: u8,
+) -> Result<Plan, BringUpError> {
+    let factory = Factory::from_eeprom(u32::from(u16::from_le_bytes(
+        image[8..10].try_into().unwrap(),
+    )))
+    .map_err(|_| BringUpError::BadCalibration)?;
+    plan(image, 2412, initial_ctl(factory), ceiling)
 }
 pub(super) fn program(
     io: &mut impl RegisterIo,

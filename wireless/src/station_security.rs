@@ -65,6 +65,7 @@ pub struct Security {
     established: bool,
     failed: bool,
     sequence: u16,
+    qos_sequence: [u16; 16],
 }
 impl core::fmt::Debug for Security {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -142,6 +143,7 @@ impl Security {
             established: false,
             failed: false,
             sequence,
+            qos_sequence: [sequence; 16],
         })
     }
     pub fn port_open(&self) -> bool {
@@ -225,6 +227,22 @@ impl Security {
     /// complete authenticated subframes are returned as Ethernet-II frames.
     /// A-MSDU cannot supply EAPOL or drive the retained supplicant/rekey.
     pub fn receive_amsdu(&mut self, mpdu: &impl RawFrame) -> Result<Option<Vec<Vec<u8>>>, Error> {
+        self.receive_amsdu_inner(mpdu, false)
+    }
+    /// Admit normal/BlockAck-policy original A-MSDUs only after the driver
+    /// proves a live BA agreement and releases this MPDU in native SN order.
+    /// Default receive_amsdu remains normal-ACK-only; no header is rewritten.
+    pub fn receive_amsdu_block_ack(
+        &mut self,
+        mpdu: &impl RawFrame,
+    ) -> Result<Option<Vec<Vec<u8>>>, Error> {
+        self.receive_amsdu_inner(mpdu, true)
+    }
+    fn receive_amsdu_inner(
+        &mut self,
+        mpdu: &impl RawFrame,
+        block_ack: bool,
+    ) -> Result<Option<Vec<Vec<u8>>>, Error> {
         if !self.port_open() {
             return Err(Error::State);
         }
@@ -235,7 +253,12 @@ impl Security {
             return Ok(None);
         }
         let header = &bytes[..26];
-        if packet_key::aggregate_header(header).is_err()
+        let admitted = if block_ack {
+            packet_key::aggregate_header_block_ack(header)
+        } else {
+            packet_key::aggregate_header(header)
+        };
+        if admitted.is_err()
             || header[10..16] != self.peer
             || !unicast(header[16..22].try_into().unwrap())
             || header[4..10] != self.own && header[4] & 1 == 0
@@ -254,7 +277,11 @@ impl Security {
         let Some(slot) = slot else {
             return Ok(None);
         };
-        Ok(slot.key.unprotect_amsdu(header, wire).ok())
+        Ok(if block_ack {
+            slot.key.unprotect_amsdu_block_ack(header, wire).ok()
+        } else {
+            slot.key.unprotect_amsdu(header, wire).ok()
+        })
     }
     pub fn receive_with_nonce(
         &mut self,
@@ -420,6 +447,20 @@ impl Security {
         }
         self.transmit_ethernet_inner(ethernet, Some(tid))
     }
+    /// Sample the next exact QoS SN without consuming it or a key PN.
+    /// Native BA callers must freeze their producer and drain all preceding
+    /// packets before using it as an ADDBA SSN; this value grants no BA or
+    /// native queue authority. Non-QoS/EAPOL traffic cannot advance it.
+    pub fn next_qos_sequence(&self, tid: u8) -> Result<u16, Error> {
+        let sequence = self
+            .qos_sequence
+            .get(usize::from(tid))
+            .ok_or(Error::Profile)?;
+        if !self.port_open() {
+            return Err(Error::State);
+        }
+        Ok(*sequence)
+    }
     fn transmit_ethernet_inner(
         &mut self,
         ethernet: &[u8],
@@ -442,11 +483,16 @@ impl Security {
         header.extend_from_slice(&self.peer);
         header.extend_from_slice(&self.own);
         header.extend_from_slice(&ethernet[..6]);
-        header.extend_from_slice(&(self.sequence << 4).to_le_bytes());
+        let sequence = tid.map_or(self.sequence, |tid| self.qos_sequence[usize::from(tid)]);
+        header.extend_from_slice(&(sequence << 4).to_le_bytes());
         if let Some(tid) = tid {
             header.extend_from_slice(&[tid, 0]);
         }
-        self.sequence = (self.sequence + 1) & 4095;
+        if let Some(tid) = tid {
+            self.qos_sequence[usize::from(tid)] = (sequence + 1) & 4095;
+        } else {
+            self.sequence = (sequence + 1) & 4095;
+        }
         let mut body = vec![0xaa, 0xaa, 3, 0, 0, 0];
         body.extend_from_slice(&ethernet[12..]);
         let result = self

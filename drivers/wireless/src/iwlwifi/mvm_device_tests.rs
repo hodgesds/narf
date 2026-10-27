@@ -129,6 +129,17 @@ fn ht_ies() -> Vec<u8> {
 }
 struct Actor {
     ht: bool,
+    ba: bool,
+    rx_ba: [Option<(u8, u16, u16)>; 8],
+    retiring_baid: Option<u8>,
+    tx_ba_enabled: bool,
+    tx_dialog: Option<(Vec<u8>, Vec<u8>)>,
+    tx_ba_refuse: bool,
+    hold_batch: bool,
+    batch: Vec<u16>,
+    batch_dma: Vec<(u64, u16)>,
+    action_responses: Vec<Vec<u8>>,
+    hold_action: bool,
     rx_rate: u32,
     tlc_version: u8,
     stopped: bool,
@@ -167,6 +178,9 @@ impl Actor {
             (1, 0x18) if b[17] == 6 => Some(1),
             (3, 9) if b[24] == 8 && b[56] == 3 => Some(2),
             (5, 15) if b[5] == 1 => Some(3),
+            (1, 0x18) if b[17] == 8 => Some(4),
+            (1, 0x18) if b[17] == 2 => Some(5),
+            (1, 0x18) if b[17] == 16 => Some(6),
             _ => None,
         });
         if stage.is_some() && self.fail_phy == stage {
@@ -209,6 +223,14 @@ impl Actor {
             packet[16..20].copy_from_slice(&0x7f000000u32.to_le_bytes());
             packet[28..32].copy_from_slice(&self.rx_rate.to_le_bytes());
         }
+        if let Some((id, sn, window)) = self.rx_ba[0] {
+            packet[48 + 22..48 + 24].copy_from_slice(&(sn << 4).to_le_bytes());
+            packet[16..20].copy_from_slice(
+                &((u32::from(id) << 24) | (u32::from(sn) << 12) | u32::from((sn + 1) & 4095))
+                    .to_le_bytes(),
+            );
+            self.rx_ba[0] = Some((id, (sn + 1) & 4095, window));
+        }
         self.inject(0xc1, 0, 0x8000, &packet);
         Ok(())
     }
@@ -222,7 +244,59 @@ impl Actor {
             progress = true;
             self.react(p)?;
         }
+        if !self.hold_batch {
+            self.finish_batch()?;
+        }
         Ok(progress)
+    }
+    fn finish_batch(&mut self) -> Result<(), &'static str> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        if !self.tx_ba_enabled {
+            return Err("model aggregated without native TID0 receipt");
+        }
+        if self.tx_dialog.is_none() {
+            // TLC43's firmware manager exchanges this actual dialog with the
+            // model AP. Host code never sends ADDBA or invents its SSN.
+            let request = vec![3, 0, 71, 2, 8, 0, 0, 0x50, 0x73]; // window32, SSN0x735
+            if request[0..3] != [3, 0, 71]
+                || request[3..5] != [2, 8]
+                || request[7..] != [0x50, 0x73]
+            {
+                return Err("independent firmware-manager ADDBA geometry");
+            }
+            let response = vec![
+                3,
+                1,
+                71,
+                if self.tx_ba_refuse { 37 } else { 0 },
+                0,
+                2,
+                8,
+                0,
+                0,
+            ];
+            if response[2] != request[2] || response[5..7] != request[3..5] {
+                return Err("independent AP BA response binding");
+            }
+            self.tx_dialog = Some((request, response));
+        }
+        if self.tx_ba_refuse || self.batch.len() == 1 {
+            for pointer in core::mem::take(&mut self.batch) {
+                self.firmware.tx_complete(24, pointer);
+            }
+        } else {
+            let mut notification = vec![0; 40];
+            notification[14..16].copy_from_slice(&(self.batch.len() as u16).to_le_bytes());
+            notification[16..18].copy_from_slice(&(self.batch.len() as u16).to_le_bytes());
+            notification[28] = 1;
+            notification[32] = 24;
+            notification[34..36].copy_from_slice(&self.batch.last().unwrap().to_le_bytes());
+            self.inject(0xc5, 0, 0x8000, &notification);
+            self.batch.clear();
+        }
+        Ok(())
     }
     fn react(&mut self, p: model::Published) -> Result<(), &'static str> {
         if p.queue == 0 {
@@ -234,6 +308,16 @@ impl Actor {
             let s = u16::from_le_bytes([p.bytes[2], p.bytes[3]]);
             let b = &p.bytes[8..];
             self.commands.push((g, c, b.to_vec()));
+            if self.ba && g == 5 && c == 2 && b.get(12) == Some(&1) {
+                if b.len() != 24 || self.retiring_baid != Some(b[20]) {
+                    return Err("DEL_BA fence without exact native removed BAID");
+                }
+                self.retiring_baid = None;
+                let hold = (self.hold_phy == Some(7)).then_some(self.security.events.len());
+                self.hold_phy = None;
+                self.security.react(p, &mut self.firmware, hold, None)?;
+                return Ok(());
+            }
             if self.protected
                 && (g == 1 && c == 0x17
                     || g == 5 && c == 2
@@ -245,7 +329,11 @@ impl Actor {
                         && b.get(8) == Some(&0))
             {
                 let enable = g == 1 && c == 0x18 && b[20] == 0;
-                let hold = (self.hold_close && self.closing && g == 1 && c == 0x18)
+                let marker = self.closing && self.hold_phy == Some(9) && g == 5 && c == 2;
+                if marker {
+                    self.hold_phy = None;
+                }
+                let hold = (self.hold_close && self.closing && g == 1 && c == 0x18 || marker)
                     .then_some(self.security.events.len());
                 if hold.is_some() {
                     self.hold_close = false;
@@ -356,7 +444,63 @@ impl Actor {
                     if b.len() != 48 || b[16] != 0 {
                         return Err("MVM native station0 identity/extent");
                     }
-                    vec![1, 0, 0, 0]
+                    if self.ba && b[17] == 8 {
+                        let tid = usize::from(b[28]);
+                        if tid > 7 || self.rx_ba[tid].is_some() || b[0] != 1 {
+                            return Err("native RX BA duplicate/foreign reservation");
+                        }
+                        let ssn = u16::from_le_bytes([b[30], b[31]]);
+                        let window = u16::from_le_bytes([b[44], b[45]]);
+                        let mut expected = [0; 48];
+                        expected[0] = 1;
+                        expected[17] = 8;
+                        expected[28] = tid as u8;
+                        expected[30..32].copy_from_slice(&ssn.to_le_bytes());
+                        expected[44..46].copy_from_slice(&window.to_le_bytes());
+                        if b != expected || ssn >= 4096 || !(1..=32).contains(&window) {
+                            return Err("native ADD_STA48 BA field/mask");
+                        }
+                        let id = tid as u8 + 1;
+                        self.rx_ba[tid] = Some((id, ssn, window));
+                        vec![1, id | 0x80, 0, 0]
+                    } else if self.ba && b[17] == 16 {
+                        let tid = usize::from(b[29]);
+                        let mut expected = [0; 48];
+                        expected[0] = 1;
+                        expected[17] = 16;
+                        expected[29] = tid as u8;
+                        if tid > 7 || b != expected || self.rx_ba[tid].is_none() {
+                            return Err("native RX BA remove ownership");
+                        }
+                        self.retiring_baid = self.rx_ba[tid].take().map(|s| s.0);
+                        vec![1, 0, 0, 0]
+                    } else if self.ba && b[17] == 2 {
+                        let mut expected = [0; 48];
+                        expected[0] = 1;
+                        expected[17] = 2;
+                        expected[2..4].copy_from_slice(if b[2] == 254 {
+                            &[254, 255]
+                        } else {
+                            &[255, 255]
+                        });
+                        if b != expected {
+                            return Err("native TX BA permission changed other peer fields");
+                        }
+                        self.tx_ba_enabled = b[2] == 254;
+                        vec![1, 0, 0, 0]
+                    } else {
+                        vec![1, 0, 0, 0]
+                    }
+                }
+                (5, 2) if self.ba && !self.protected => {
+                    if b.len() != 20 || b[..16] != [0, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 1, 0]
+                    {
+                        return Err("Open BA RX marker command");
+                    }
+                    let mut marker = vec![8, 0, 0, 0, 0, 0, 1, 0];
+                    marker.extend_from_slice(&b[16..20]);
+                    self.inject(0xff, 5, 0x8000, &marker);
+                    vec![]
                 }
                 (5, 0x17) => {
                     if b.len() != 36 || b[4..8] != [1, 0, 0, 0] || !matches!(b[8], 0 | 15) {
@@ -440,10 +584,26 @@ impl Actor {
             return Ok(());
         }
         if self.ht && p.queue == 23 && frame[0] == 0xd0 {
-            if frame.get(24..) != Some(&[3, 1, 9, 37, 0, 2, 0, 0, 0]) {
+            if self.ba {
+                let body = frame.get(24..).ok_or("BA management frame truncated")?;
+                if body.len() != 9 && body.len() != 6 {
+                    return Err("BA response extent");
+                }
+                self.action_responses.push(body.to_vec());
+            } else if frame.get(24..) != Some(&[3, 1, 9, 37, 0, 2, 0, 0, 0]) {
                 return Err("native ADDBA decline bytes");
             }
-            self.firmware.tx_complete(23, p.pointer);
+            if self.hold_action {
+                self.hold_action = false;
+                let mut receipt = vec![0; 48];
+                receipt[0] = 1;
+                receipt[36] = 23;
+                receipt[40] = 1;
+                receipt[44..48].copy_from_slice(&u32::from(p.pointer).to_le_bytes());
+                self.held = Some((0x1c, 0, 0x8000, receipt));
+            } else {
+                self.firmware.tx_complete(23, p.pointer);
+            }
             return Ok(());
         }
         if self.protected {
@@ -454,7 +614,13 @@ impl Actor {
                     .is_some_and(|k| k.key_information == 0x30a);
             let held = (m4 && self.hold_m4).then_some(self.security.events.len());
             let before = self.security.data.len();
-            self.security.react(p, &mut self.firmware, held, None)?;
+            if self.ba && p.queue == 24 && self.tx_ba_enabled {
+                self.batch_dma.push((p.dma_base, p.pointer));
+                self.batch.push(p.pointer);
+                self.security.aggregate_packet(p, &mut self.firmware)?;
+            } else {
+                self.security.react(p, &mut self.firmware, held, None)?;
+            }
             if self.security.data.len() > before {
                 let frame = self.security.data.last().unwrap().clone();
                 if let Some(reply) = self.server.receive(&frame) {
@@ -482,7 +648,12 @@ impl Actor {
             ethernet.extend_from_slice(&OWN);
             ethernet.extend_from_slice(&frame[header + 6..]);
             self.security.data.push(ethernet.clone());
-            self.firmware.tx_complete(24, p.pointer);
+            if self.ba && self.tx_ba_enabled {
+                self.batch_dma.push((p.dma_base, p.pointer));
+                self.batch.push(p.pointer);
+            } else {
+                self.firmware.tx_complete(24, p.pointer);
+            }
             if let Some(reply) = self.server.receive(&ethernet) {
                 self.downlink(&reply)?;
             }
@@ -554,12 +725,34 @@ impl Harness {
         emission: u8,
         tlc_version: u8,
     ) -> Result<Self, &'static str> {
+        Self::build_profile(protected, ht, emission, tlc_version, false)
+    }
+    fn build_profile(
+        protected: bool,
+        ht: bool,
+        emission: u8,
+        tlc_version: u8,
+        ba: bool,
+    ) -> Result<Self, &'static str> {
+        Self::build_profile_caps(protected, ht, emission, tlc_version, ba, false)
+    }
+    fn build_profile_caps(
+        protected: bool,
+        ht: bool,
+        emission: u8,
+        tlc_version: u8,
+        ba: bool,
+        ml_baid: bool,
+    ) -> Result<Self, &'static str> {
         if CURRENT.lock().is_some() {
             return Err("MVM interface fixture already owned");
         }
         let mut image = image();
         let parsed = super::super::parse_ucode(&image).unwrap();
         let mut versions = parsed.api.commands.to_vec();
+        if ba {
+            versions.extend_from_slice(&[0xc2, 0, 0, 1, 0xc3, 0, 0, 1, 0xc5, 0, 0, 7]);
+        }
         for entry in versions.chunks_exact_mut(4) {
             if entry[0] == 15 && entry[1] == 5 {
                 entry[2] = tlc_version;
@@ -567,7 +760,11 @@ impl Harness {
         }
         tlv(&mut image, 48, &versions);
         if ht {
-            tlv(&mut image, 30, &[1, 0, 0, 0, 0, 8, 0, 0]);
+            tlv(
+                &mut image,
+                30,
+                &[1, 0, 0, 0, 0, 8, 0, if ml_baid { 128 } else { 0 }],
+            );
         }
         let executable = asset("narf-test/mvm-interface/executable", &image, true)?;
         let parsed = super::super::parse_ucode(&executable.bytes).unwrap();
@@ -578,6 +775,17 @@ impl Harness {
         security.ap = ap(protected)?;
         let mut actor = Actor {
             ht,
+            ba,
+            rx_ba: [None; 8],
+            retiring_baid: None,
+            tx_ba_enabled: false,
+            tx_dialog: None,
+            tx_ba_refuse: false,
+            hold_batch: false,
+            batch: Vec::new(),
+            batch_dma: Vec::new(),
+            action_responses: Vec::new(),
+            hold_action: false,
             rx_rate: if ht { 0x00100207 } else { 0 },
             tlc_version,
             stopped: false,
@@ -1356,5 +1564,9 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2/interface",
     smoke_mvm_interface_retired_publication_token_cannot_follow_new_station
 );
+#[path = "mvm_ba_tests.rs"]
+mod ba_tests;
 #[path = "mvm_ht_tests.rs"]
 mod ht_tests;
+#[path = "mvm_reconnect_tests.rs"]
+mod reconnect_tests;

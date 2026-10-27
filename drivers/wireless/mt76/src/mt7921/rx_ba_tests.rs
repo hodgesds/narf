@@ -17,7 +17,7 @@ pub(super) fn request_packet(tid: u8, ssn: u16, window: u16, timeout: u16, chann
     frame[10..16].copy_from_slice(&AP);
     frame[16..22].copy_from_slice(&AP);
     frame[24..27].copy_from_slice(&[3, 0, 9]);
-    frame[27..29].copy_from_slice(&(3 | u16::from(tid) << 2 | window << 6).to_le_bytes());
+    frame[27..29].copy_from_slice(&(2 | u16::from(tid) << 2 | window << 6).to_le_bytes());
     frame[29..31].copy_from_slice(&timeout.to_le_bytes());
     frame[31..33].copy_from_slice(&(ssn << 4).to_le_bytes());
     wrap(&frame, channel)
@@ -92,13 +92,22 @@ fn establish(
     ssn: u16,
     timeout: u16,
 ) -> Result<(), &'static str> {
+    establish_window(session, tid, ssn, timeout, 32)
+}
+fn establish_window(
+    session: &mut Session<Model>,
+    tid: u8,
+    ssn: u16,
+    timeout: u16,
+    window: u16,
+) -> Result<(), &'static str> {
     let State::Associated { channel, .. } = session.state else {
         return Err("BA needs current association");
     };
     session
         .backend
         .packets
-        .push_back(request_packet(tid, ssn, 64, timeout, channel));
+        .push_back(request_packet(tid, ssn, window, timeout, channel));
     if session.receive_ethernet() != Ok(None)
         || !session.keys_pending()
         || session.rx_ba.active(tid)
@@ -327,7 +336,7 @@ fn duplicates_and_declines() -> Result<(), &'static str> {
     session
         .backend
         .packets
-        .push_back(request_packet(0, 7, 64, 0, 6));
+        .push_back(request_packet(0, 7, 32, 0, 6));
     if session.receive_ethernet() != Ok(None) {
         return Err("repeat ADDBA unexpectedly delivered data");
     }
@@ -339,7 +348,7 @@ fn duplicates_and_declines() -> Result<(), &'static str> {
         session
             .backend
             .packets
-            .push_back(request_packet(0, 7, 64, 0, 6));
+            .push_back(request_packet(0, 7, 32, 0, 6));
     }
     consume(&mut session, "repeat BA flood unexpectedly delivered data")?;
     if !session.control_pending.is_empty() {
@@ -383,6 +392,246 @@ fn mt76_rx_ba_duplicate_admission_preserves_window_and_unsupported_requests_decl
 kernel_test_in!(
     "drivers/wireless/mt7921/rx_ba",
     mt76_rx_ba_duplicate_admission_preserves_window_and_unsupported_requests_decline
+);
+
+fn arbitrary_windows() -> Result<(), &'static str> {
+    for secured in [false, true] {
+        for requested in [0, 1, 3, 5, 31, 33, 48, 63, 64, 127] {
+            let window = if requested == 0 {
+                64
+            } else {
+                requested.min(64)
+            };
+            let mut session = joined(6, false, secured)?;
+            let before = session.backend.frames.len();
+            establish_window(&mut session, 3, 4090, 0, requested)?;
+            let frames = &session.backend.frames[before..];
+            if frames.len() != 3
+                || frames[0].1.get(80..82) != Some(window.to_le_bytes().as_slice())
+                || frames[1].1.get(66..68) != Some(window.to_le_bytes().as_slice())
+            {
+                return Err("native recipient window was rounded or not written to both records");
+            }
+            if window == 64 && frames[2].1.get(24..) != Some(&[3, 1, 9, 0, 0, 14, 16, 0, 0][..])
+                || window == 3 && frames[2].1.get(24..) != Some(&[3, 1, 9, 0, 0, 206, 0, 0, 0][..])
+            {
+                return Err("literal64/non-power-of-two ADDBA response");
+            }
+            // Fill every non-head position in reverse order across the
+            // native12-bit wrap. Distinct SNs must never alias a slot even
+            // when the window does not divide4096.
+            // This is a sub-millisecond burst, not63 separate millisecond
+            // scheduling intervals that legitimately expire the100ms hole.
+            session.backend.tick_step_ns = 1_000;
+            for offset in (1..window).rev() {
+                session.backend.packets.push_back(data(
+                    3,
+                    (4090 + offset) & 4095,
+                    secured.then_some(100 + u64::from(offset)),
+                    offset as u8,
+                ));
+                consume(&mut session, "arbitrary window bypassed its actual SSN gap")?;
+            }
+            session
+                .backend
+                .packets
+                .push_back(data(3, 4090, secured.then_some(100), 0));
+            for value in 0..window {
+                if session.receive_ethernet() != Ok(expected(value as u8)) {
+                    return Err(
+                        "arbitrary window SN-wrap reorder/PN lost or misordered a native packet",
+                    );
+                }
+            }
+            session
+                .backend
+                .packets
+                .push_back(data(3, 4090, secured.then_some(100), 0));
+            consume(
+                &mut session,
+                "arbitrary window admitted replay after full release",
+            )?;
+            session.backend.tick_step_ns = 1_000_000;
+            run(session.disassociate_station())
+                .map_err(|_| "arbitrary RX window native teardown")?;
+        }
+    }
+    Ok(())
+}
+fn mt76_rx_ba_exact_windows_one_through64_reorder_across_sequence_wrap() -> TestResult {
+    arbitrary_windows().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx_ba",
+    mt76_rx_ba_exact_windows_one_through64_reorder_across_sequence_wrap
+);
+
+fn establish_nested(session: &mut Session<Model>, ssn: u16) -> Result<(), &'static str> {
+    let before = session.backend.frames.len();
+    let mut request = request_packet(3, ssn, 64, 0, 6);
+    request[51] |= 1; // Genuine ADDBA A-MSDU support, not an inferred HT bit.
+    session.backend.packets.push_back(request);
+    consume(session, "nested agreement initial capture")?;
+    run(session.service_keys()).map_err(|_| "nested WTBL/STA/response native receipts")?;
+    let frames = &session.backend.frames[before..];
+    let station = [
+        0,
+        1,
+        1,
+        0,
+        1,
+        0,
+        0,
+        0,
+        6,
+        0,
+        12,
+        0,
+        3,
+        2,
+        1,
+        8,
+        (ssn & 255) as u8,
+        (ssn >> 8) as u8,
+        64,
+        0,
+    ];
+    if frames.len() != 3
+        || frames[1].1.get(48..) != Some(station.as_slice())
+        || frames[2].1.get(24..) != Some(&[3, 1, 9, 0, 0, 15, 16, 0, 0][..])
+        || !session.rx_ba.amsdu(3)
+    {
+        return Err("nested permission absent from actual STA_REC_BA/ADDBA receipt");
+    }
+    Ok(())
+}
+fn nested_piece(secured: bool, pn: u64, seq: u16, marker: u8, value: u8) -> Vec<u8> {
+    let mut packet = super::amsdu_rx_tests::packet(
+        &super::amsdu_rx_tests::ethernet(value, 3),
+        secured,
+        pn,
+        marker,
+        seq,
+    );
+    packet[4] |= 1;
+    packet[8..12].copy_from_slice(&(3u32 << 16).to_le_bytes()); // AMPDU, native TID3.
+    packet[if secured { 64 } else { 48 }] = 0xe3; // Original A-MSDU/BlockAck/TID3.
+    packet
+}
+fn nested() -> Result<(), &'static str> {
+    for secured in [false, true] {
+        let mut session = joined(6, false, secured)?;
+        establish_nested(&mut session, 4094)?;
+        for (marker, value) in [(3, 12), (1, 13)] {
+            session
+                .backend
+                .packets
+                .push_back(nested_piece(secured, 12, 0, marker, value));
+        }
+        consume(
+            &mut session,
+            "nested complete future MPDU bypassed the negotiated SSN",
+        )?;
+        session
+            .backend
+            .packets
+            .push_back(data(3, 4095, secured.then_some(11), 11));
+        consume(&mut session, "ordinary future MPDU bypassed nested BA gap")?;
+        session
+            .backend
+            .packets
+            .push_back(nested_piece(secured, 10, 4094, 3, 9));
+        consume(
+            &mut session,
+            "nested prefix was published before complete native MPDU",
+        )?;
+        session
+            .backend
+            .packets
+            .push_back(nested_piece(secured, 10, 4094, 1, 10));
+        for value in [9, 10, 11, 12, 13] {
+            if session.receive_ethernet() != Ok(expected(value)) {
+                return Err("nested/ordinary MPDUs lost SN order across wrap or split one PN");
+            }
+        }
+        if secured && session.security.as_ref().unwrap().pairwise[3] != 12 {
+            return Err("nested aggregate committed more than one PN per original MPDU");
+        }
+        for (marker, value) in [(3, 12), (1, 13)] {
+            session
+                .backend
+                .packets
+                .push_back(nested_piece(secured, 12, 0, marker, value));
+        }
+        consume(&mut session, "nested original replay was admitted")?;
+        run(session.disassociate_station()).map_err(|_| "nested native retirement")?;
+    }
+    Ok(())
+}
+fn mt76_rx_ba_negotiated_nested_amsdu_uses_native_flag_whole_mpdu_and_one_post_reorder_pn(
+) -> TestResult {
+    nested().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx_ba",
+    mt76_rx_ba_negotiated_nested_amsdu_uses_native_flag_whole_mpdu_and_one_post_reorder_pn
+);
+
+fn nested_failures() -> Result<(), &'static str> {
+    for case in 0..7 {
+        let mut session = joined(6, false, true)?;
+        establish_nested(&mut session, 0)?;
+        let first = nested_piece(true, 9, 0, 3, 1);
+        session.backend.packets.push_back(first);
+        consume(&mut session, "nested bad suffix prefix publication")?;
+        let mut last = nested_piece(true, 9, 0, 1, 2);
+        match case {
+            0 => last[4] = 2,  // Wrong native WCID.
+            1 => last[10] = 4, // Native/header TID mismatch.
+            2 => last[8..12].copy_from_slice(&((1u32 << 30) | (3 << 16)).to_le_bytes()),
+            3 => last[7] |= 2, // Integrity error before native assembly.
+            4 => last[88..90].copy_from_slice(&[0x88, 0x8e]), // EAPOL subframe.
+            5 => {
+                let mut ethernet = super::amsdu_rx_tests::ethernet(2, 5);
+                ethernet[12..14].copy_from_slice(&[0x81, 0]);
+                ethernet[14..18].copy_from_slice(&[0, 1, 0x88, 0x8e]);
+                last = super::amsdu_rx_tests::packet(&ethernet, true, 9, 1, 0);
+                last[4] |= 1;
+                last[8..12].copy_from_slice(&(3u32 << 16).to_le_bytes());
+                last[64] = 0xe3;
+            }
+            _ => {
+                last.pop();
+            }
+        }
+        session.backend.packets.push_back(last);
+        consume(
+            &mut session,
+            "bad nested native suffix exposed an authenticated prefix",
+        )?;
+        if session.security.as_ref().unwrap().pairwise[3] != 0 {
+            return Err("bad nested native suffix committed a replay PN");
+        }
+        for (marker, value) in [(3, 3), (1, 4)] {
+            session
+                .backend
+                .packets
+                .push_back(nested_piece(true, 9, 0, marker, value));
+        }
+        for value in [3, 4] {
+            if session.receive_ethernet() != Ok(expected(value)) {
+                return Err("bad nested suffix consumed valid same-PN/SN retry");
+            }
+        }
+    }
+    Ok(())
+}
+fn mt76_rx_ba_nested_native_metadata_bad_tail_and_control_subframe_are_atomic() -> TestResult {
+    nested_failures().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx_ba",
+    mt76_rx_ba_nested_native_metadata_bad_tail_and_control_subframe_are_atomic
 );
 
 fn retirement() -> Result<(), &'static str> {

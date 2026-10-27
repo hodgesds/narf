@@ -303,6 +303,61 @@ Clippy, workspace formatting and release/debug builds pass on both architectures
 The native MT76 channel-switch command now encodes receive-chain count while
 RLM retains its mask; literal and retained-control tests cover their distinction.
 
+The `codex/wifi-aggregation-next` checkpoint passed the coordinated Wi-Fi
+suites: x86_64 2317 pass,0 fail,9 skip; aarch64 1847 pass,0 fail,3 skip.
+The selected scope is `drivers/wireless,wireless,verification/wifi-fixtures`.
+Production boots and both btrfs postflight checks were clean on each
+architecture. Debug/release builds, strict production/test Clippy, exact CI
+feature-context Clippy, workspace formatting and whitespace checks passed.
+MT76 code now extends VHT to
+MCS8 at20MHz and MCS9 at40/80/160MHz, actual NIC RX1/2 with TX1 and the matching
+HT receive companion, directional LDPC and one-data-stream receive STBC.
+Contiguous160 is gated by actual MT_HW_CHIPID0x7922 plus checked NIC facts;
+native domain/SKU/power grants retain all eight occupied channels. Revised
+and deprecated AP encodings, truthful primary80 fallback and response retune
+are implemented, with native Open/WPA2 RX2/BA/nested-A-MSDU DHCP/IP vectors
+passing in those suites. PCI aliases and the opaque NIC max_bw byte grant no160.
+Recipient BA now retains exact negotiated windows1–64 with independent
+sequence slots through12-bit wrap, including non-power-of-two sizes.
+Recipient A-MSDU-in-A-MPDU now binds the actual request/native STA/response
+bit, whole native assembly and post-reorder PN; the shared aggregate parser
+supplies atomic subframe and VLAN control-port checks before delivery.
+Active scanning now carries complete optional Probe Request elements in the
+native600-byte field with preflight and the existing power/cancellation owner.
+Per-request scan randomization resolves the source-defined mask with fallible
+secure host entropy while preserving the original station MAC and passive NO_IR.
+MT76 receive batches now carry current station/key epochs through unlocked
+kernel callbacks and serialized IPC publication, retiring stale batches and
+receive queues across key service and peer/transport replacement.
+Native normal/forwarded copies now retain their original epoch and port
+admission through command/TX waiters and a bounded completed-ring prefix.
+The RSNA owner keeps ordinary RX/TX and BA setup closed between replacement
+M2 and M3 until actual M4/key receipts. The direct async receive API also
+rechecks its original epoch after key service. Native software vectors pass;
+a complete late firmware/MAC/FIFO key-retirement proof remains separate work.
+Native records preserve scan/response directional bounds and width-specific
+mandatory maps; RX metadata is checked before replay-PN commit. Shared typed
+PHY constructors retain default-off optional coding for other drivers.
+The shared software security formatter now retains sixteen independent QoS
+sequence counters and a checked non-consuming SSN sample, separate from
+non-QoS/EAPOL sequences and the shared monotonically increasing key PN.
+An explicit shared BlockAck-policy A-MSDU entry preserves the original CCMP
+header and whole-aggregate PN transaction after native BA/reorder proof;
+default aggregate methods retain their stricter normal-ACK profile.
+The preceding green totals describe earlier merged checkpoints. The Intel
+milestone now includes Gen2 native BA/pipelining,
+retained GTK reconnect history, exact Gen3 command/queue receipts, retained
+executable/PNVM authority and native EMPTY-marker receive epochs. C21/C22
+recipient BA and separately qualified four-slot transmit BA/pipelining pass
+the same native software suites. AR9285 HT20, recipient BA, directional
+RX STBC1 and native RTS/CTS protection are covered too; transmit aggregation
+and wider profiles remain open. Peer review closed stale direct receive and
+IPC-queue paths across native key-owner replacement, plus terminal handling
+of lost notification prefixes. Family specifications retain the exact
+chip, source, qualification and remaining-feature contracts.
+These changes do not close the all-family feature
+ledger or establish physical acceptance.
+
 The preceding station power-save continuation added ordinary firmware station power save to the
 common CYW43439/BCM43602 owner. PM_FAST/PM_OFF and the default sleep-retention
 commands are serialized with station control; partial failure or cancellation

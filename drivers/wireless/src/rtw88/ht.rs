@@ -135,6 +135,7 @@ pub(super) enum Source {
 }
 pub(super) struct Grant {
     request: Request,
+    digest: [u8; 32],
     base: Arc<station_profile::Grant>,
     cap: Cap<FirmwareBlob, Read>,
     facts: Facts,
@@ -225,6 +226,11 @@ impl Grant {
         });
         let g = Self {
             request,
+            digest: {
+                let mut h = narf_crypto::sha256::Sha256::new();
+                h.update(b);
+                h.finalize()
+            },
             base,
             cap,
             facts,
@@ -307,6 +313,18 @@ impl Grant {
     }
     pub(super) fn check(&self) -> Result<(), Error> {
         self.invoke(|| Ok(()))
+    }
+    pub(super) fn rx_ba_identity(&self) -> ([u8; 32], [u8; 32], u16) {
+        (self.request.identity, self.digest, self.base.did())
+    }
+    pub(super) fn rx_ba_limit(&self) -> Result<i16, Error> {
+        let domain = self.base.current_domain()?;
+        Ok(self.base.ht_limit(&domain)?.min(self.ceiling))
+    }
+    pub(super) fn within(&self, limit: i16) -> bool {
+        self.peaks
+            .iter()
+            .all(|&p| i32::from(p) + i32::from(self.antenna) <= i32::from(limit))
     }
     fn words(&self) -> [u32; 16] {
         let mut bytes = [0; 64];

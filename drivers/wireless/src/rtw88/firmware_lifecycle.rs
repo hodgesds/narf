@@ -100,6 +100,22 @@ impl<I: Io> Lifecycle<I> {
             .ok_or(Error::State)?
             .ht20_request()
     }
+    pub(super) async fn rx_ba_request(&self) -> Result<super::RxBaRequest, Error> {
+        self.retained
+            .lock()
+            .await
+            .as_mut()
+            .ok_or(Error::State)?
+            .rx_ba_request()
+    }
+    pub(super) async fn tx_ba_request(&self) -> Result<super::TxBaRequest, Error> {
+        self.retained
+            .lock()
+            .await
+            .as_mut()
+            .ok_or(Error::State)?
+            .tx_ba_request()
+    }
     pub(super) async fn legacy_wmm_request(
         &self,
     ) -> Result<super::station_profile::Request, Error> {

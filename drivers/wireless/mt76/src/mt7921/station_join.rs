@@ -18,7 +18,8 @@ use zeroize::{Zeroize, Zeroizing};
 /// and preserves its key-reinstallation and EAPOL replay checks.
 pub(super) struct StationSecurity {
     supplicant: Supplicant,
-    pairwise: [u64; 17],
+    pub(super) port_open: bool,
+    pub(super) pairwise: [u64; 17],
     group: [Option<[u64; 17]>; 4],
     pending: VecDeque<(Vec<u8>, bool)>,
 }
@@ -30,8 +31,11 @@ impl core::fmt::Debug for StationSecurity {
 }
 
 impl StationSecurity {
+    fn port_open(&self) -> bool {
+        self.port_open && self.pending.is_empty()
+    }
     pub(super) fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
+        !self.port_open()
     }
     pub(super) fn new(
         bss: &ScanBss,
@@ -60,6 +64,7 @@ impl StationSecurity {
             ies = &ies[ie.len()..];
         }
         Ok(Self {
+            port_open: false,
             supplicant: Supplicant::new(bss.bssid, own, [0; 32]).with_rsna(RsnaParams {
                 key_mgmt: KeyMgmt::Psk,
                 pmk: psk.to_vec(),
@@ -95,7 +100,12 @@ impl StationSecurity {
             }
         });
         match result {
-            Ok(rx) => Ok(Some(rx)),
+            Ok(rx) => {
+                // Every accepted handshake step owns the closed port until
+                // its real reply/key receipts explicitly authorize it below.
+                self.port_open = false;
+                Ok(Some(rx))
+            }
             Err(EapolRxError::Drop(_)) => Ok(None),
             Err(EapolRxError::NonceUnavailable) => {
                 Err(failure.unwrap_or(Error::EntropyUnavailable))
@@ -138,8 +148,14 @@ impl Drop for StationSecurity {
 }
 
 pub(crate) fn extract_eapol(frame: &[u8]) -> Option<&[u8]> {
+    extract_native_eapol(frame, false)
+}
+fn extract_native_eapol(frame: &[u8], decrypted: bool) -> Option<&[u8]> {
     let header = frame.get(..24)?;
-    let fc = u16::from_le_bytes([header[0], header[1]]);
+    // Only validated native decrypt metadata can describe an IV/MIC-stripped
+    // protected EAPOL body. This check leaves the original header untouched.
+    let fc =
+        u16::from_le_bytes([header[0], header[1]]) & if decrypted { !0x4000 } else { u16::MAX };
     if !matches!(fc & 0xff, 0x08 | 0x88)
         || !matches!(fc & 0xc700, 0x0100 | 0x0200)
         || header[22] & 15 != 0
@@ -238,6 +254,58 @@ pub fn to_ethernet(frame: &[u8]) -> Option<Vec<u8>> {
 }
 
 impl<B: Backend> Session<B> {
+    pub(super) fn renew_receive_epoch(&mut self) -> Result<(), Error> {
+        self.backend.close_receive_capture(0);
+        self.receive_epoch = 0;
+        self.receive_epoch = super::NEXT_RECEIVE_EPOCH
+            .fetch_update(
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+                |epoch| epoch.checked_add(1),
+            )
+            .map_err(|_| Error::Bounds)?;
+        self.backend.close_receive_capture(self.receive_epoch);
+        Ok(())
+    }
+    fn sync_receive_capture(&mut self) -> Result<bool, Error> {
+        if self.receive_current(self.receive_epoch)? {
+            self.backend.open_receive_capture(self.receive_epoch)?;
+            Ok(true)
+        } else {
+            self.backend.close_receive_capture(self.receive_epoch);
+            Ok(false)
+        }
+    }
+    pub(super) fn receive_current(&self, epoch: u64) -> Result<bool, Error> {
+        if epoch == 0
+            || self.receive_epoch != epoch
+            || self.peer_lost
+            || !matches!(self.state, State::Associated { .. })
+            || self
+                .security
+                .as_ref()
+                .is_some_and(|security| !security.port_open())
+        {
+            return Ok(false);
+        }
+        self.backend.check()?;
+        let Some(permission) = self.station_permission else {
+            return Ok(false);
+        };
+        self.backend.check_tx_permission(permission)?;
+        Ok(true)
+    }
+    pub(super) fn publish_receive(
+        &self,
+        epoch: u64,
+        publish: impl FnOnce(),
+    ) -> Result<bool, Error> {
+        if !self.receive_current(epoch)? {
+            return Ok(false);
+        }
+        publish();
+        Ok(true)
+    }
     pub(super) fn prepare_ht20_receive(
         &mut self,
         bss: &ScanBss,
@@ -278,6 +346,10 @@ impl<B: Backend> Session<B> {
             return None;
         };
         let tid = usize::from(*qos & 15);
+        if native.ampdu && !self.rx_ba.amsdu(tid as u8) {
+            receiver.clear();
+            return None;
+        }
         if self.rx_ba.owns(tid as u8)
             && (!self.rx_ba.active(tid as u8) || native.wcid != 1 || usize::from(native.tid) != tid)
         {
@@ -288,7 +360,12 @@ impl<B: Backend> Session<B> {
             .security
             .as_ref()
             .map(|security| security.pairwise[tid]);
-        let complete = receiver.observe(native, floor, self.backend.now_ns())?;
+        let complete = receiver.observe_with_ba(
+            native,
+            floor,
+            self.backend.now_ns(),
+            self.rx_ba.active(tid as u8),
+        )?;
         if self.rx_ba.active(tid as u8) {
             let sequence = u16::from_le_bytes([native.frame[22], native.frame[23]]) >> 4;
             self.rx_ba.insert(
@@ -319,6 +396,16 @@ impl<B: Backend> Session<B> {
             let Some((tid, mut packet)) = self.rx_ba.pop() else {
                 break;
             };
+            // A queued ordinary packet cannot consume a PN or leave the
+            // controlled port after an earlier ordered EAPOL closes it.
+            if packet.eapol.is_none()
+                && self
+                    .security
+                    .as_ref()
+                    .is_some_and(|security| !security.port_open())
+            {
+                continue;
+            }
             match (self.security.as_mut(), packet.pn) {
                 (Some(security), Some(pn)) if pn > security.pairwise[usize::from(tid)] => {
                     security.pairwise[usize::from(tid)] = pn
@@ -331,6 +418,7 @@ impl<B: Backend> Session<B> {
                 if let Some(security) = &mut self.security {
                     if security.pending.len() < 16 {
                         security.pending.push_back((pdu, packet.pn.is_some()));
+                        self.backend.close_receive_capture(self.receive_epoch);
                     }
                 }
                 continue;
@@ -387,6 +475,7 @@ impl<B: Backend> Session<B> {
         }
         // A cancelled key operation cannot leave an authorized session with
         // its RSNA owner missing. The pending/running state survives cancellation.
+        self.renew_receive_epoch()?;
         self.stage(Stage::EapolHandshake);
         self.clear_aggregate_receive();
         let Some(mut security) = self.security.take() else {
@@ -405,15 +494,15 @@ impl<B: Backend> Session<B> {
                 else {
                     continue;
                 };
-                let (reply, tk, gtk) = match result {
-                    EapolRx::Pairwise1(m1) => (m1.reply, None, None),
+                let (reply, tk, gtk, authorize) = match result {
+                    EapolRx::Pairwise1(m1) => (m1.reply, None, None, false),
                     EapolRx::Pairwise3(m3) => {
                         if !m3.secure {
                             return Err(Error::MalformedEvent);
                         }
-                        (m3.reply, m3.tk, m3.gtk)
+                        (m3.reply, m3.tk, m3.gtk, true)
                     }
-                    EapolRx::Group1(group) => (group.reply, None, group.gtk),
+                    EapolRx::Group1(group) => (group.reply, None, group.gtk, true),
                 };
                 self.send_management(&wrap_eapol_frame(info.capabilities.mac, peer, &reply), 1)
                     .await?;
@@ -429,6 +518,7 @@ impl<B: Backend> Session<B> {
                     self.install_group_key(&gtk).await?;
                     security.commit_group(&gtk)?;
                 }
+                security.port_open = authorize;
             }
             self.check_station_tx()?;
             Ok(())
@@ -452,6 +542,9 @@ impl<B: Backend> Session<B> {
         }
         self.security = Some(security);
         self.state = associated;
+        if let Err(error) = self.sync_receive_capture() {
+            return Err(self.fail_data(error));
+        }
         Ok(())
     }
 
@@ -475,6 +568,9 @@ impl<B: Backend> Session<B> {
             _ => return Err(Error::Busy),
         };
         self.backend.check()?;
+        if !self.sync_receive_capture()? {
+            self.clear_aggregate_receive();
+        }
         if self.rx_ba.tick(self.backend.now_ns()) {
             self.clear_aggregate_receive();
         }
@@ -486,14 +582,28 @@ impl<B: Backend> Session<B> {
         }
         for _ in 0..16 {
             self.backend.check()?;
-            let Some(packet) = self.backend.receive_data()? else {
+            let Some(packet) = self.backend.receive_data_captured()? else {
                 return Ok(None);
             };
-            let Some(native) = super::scan::rx_native_with_amsdu(&packet) else {
+            if packet.epoch != self.receive_epoch {
+                self.clear_aggregate_receive();
+                continue;
+            }
+            let Some(native) = super::scan::rx_native_with_amsdu(&packet.bytes) else {
                 self.clear_aggregate_receive();
                 continue;
             };
             if native.channel != channel {
+                self.clear_aggregate_receive();
+                continue;
+            }
+            // Management and the retained supplicant still make progress
+            // while ordinary RX is closed. Admission is decided from the
+            // original copy and current port before any aggregate/replay work.
+            let ordinary = native.frame.first().is_some_and(|fc| fc & 12 == 8)
+                && (native.amsdu != 0
+                    || extract_native_eapol(native.frame, native.ccmp.is_some()).is_none());
+            if ordinary && (!packet.port_open || !self.receive_current(packet.epoch)?) {
                 self.clear_aggregate_receive();
                 continue;
             }
@@ -530,6 +640,9 @@ impl<B: Backend> Session<B> {
                         ),
                         native.phy,
                         false,
+                        self.ht20_profile.map_or(1, |p| p.receive_streams()),
+                        self.ht20_profile.is_some_and(|p| p.receive_ldpc()),
+                        self.ht20_profile.is_some_and(|p| p.receive_stbc()),
                     )
                 {
                     self.clear_aggregate_receive();
@@ -552,11 +665,6 @@ impl<B: Backend> Session<B> {
                     self.clear_aggregate_receive();
                     return Err(Error::DeviceGone);
                 }
-            }
-            if native.ampdu && native.amsdu != 0 {
-                // Recipient BA explicitly leaves nested A-MSDU unnegotiated.
-                self.clear_aggregate_receive();
-                continue;
             }
             if native.amsdu != 0 {
                 if let Some(frame) = self.receive_aggregate(&native, own, peer, channel) {
@@ -745,6 +853,7 @@ impl<B: Backend> Session<B> {
                             if let Some(pdu) = extract_eapol(frame) {
                                 if security.pending.len() < 16 {
                                     security.pending.push_back((pdu.to_vec(), protected));
+                                    self.backend.close_receive_capture(self.receive_epoch);
                                 }
                             }
                         }
@@ -812,6 +921,7 @@ impl<B: Backend> Session<B> {
     }
 
     pub(super) fn fail_data(&mut self, error: Error) -> Error {
+        self.backend.close_receive_capture(self.receive_epoch);
         self.security = None;
         self.station_permission = None;
         self.wmm = None;
@@ -843,10 +953,7 @@ impl<B: Backend> Session<B> {
         !self.control_pending.is_empty()
             || self.rx_ba.pending(self.backend.now_ns())
             || self.tx_ba.pending(self.backend.now_ns())
-            || self
-                .security
-                .as_ref()
-                .is_some_and(|s| !s.pending.is_empty())
+            || self.security.as_ref().is_some_and(|s| !s.port_open())
     }
 
     /// Publish one frame into this profile's bounded native ownership queue;
@@ -923,6 +1030,7 @@ impl<B: Backend> Session<B> {
         if self.peer_lost || !matches!(self.state, State::Associated { .. }) {
             return Err(Error::DeviceGone);
         }
+        let epoch = self.receive_epoch;
         let ready = self.poll_data_tx()?;
         let transmitted = if let Some(frame) = tx.filter(|_| ready) {
             self.start_ethernet(frame)?;
@@ -937,9 +1045,15 @@ impl<B: Backend> Session<B> {
             };
             received.push(frame);
         }
+        // An EAPOL/key challenge later in this same native drain closes the
+        // earlier collected batch, even if TX still has independent credits.
+        if !self.receive_current(epoch)? {
+            received.clear();
+        }
         Ok(super::PacketStep {
             transmitted,
             received,
+            receive_epoch: epoch,
         })
     }
 
@@ -971,6 +1085,7 @@ impl<B: Backend> Session<B> {
         if !self.rx_ba.begin_connection() || !self.tx_ba.begin_connection() {
             return Err(Error::Busy);
         }
+        self.renew_receive_epoch()?;
         self.tid0_used = false;
 
         self.management_rate = plan.management_rate();
@@ -1120,7 +1235,11 @@ impl<B: Backend> Session<B> {
             if let Some(profile) = plan.ht20() {
                 let mut response_bss = bss.clone();
                 response_bss.information_elements = profile.received_ies();
-                self.ht20_rx = Some(super::amsdu::Receiver::prepare(info, &response_bss)?);
+                self.ht20_rx = Some(super::amsdu::Receiver::prepare_with_streams(
+                    info,
+                    &response_bss,
+                    profile.receive_streams(),
+                )?);
             }
             if let Some(parameters) = plan.wmm() {
                 self.check_station_tx()?;
@@ -1240,6 +1359,7 @@ impl<B: Backend> Session<B> {
                                 let gtk = m3.gtk.as_ref().unwrap();
                                 self.install_group_key(gtk).await?;
                                 security.commit_group(gtk)?;
+                                security.port_open = true;
                                 established = true;
                                 break;
                             }
@@ -1276,6 +1396,9 @@ impl<B: Backend> Session<B> {
                     channel: bss.channel,
                     aid,
                 };
+                if let Err(error) = self.sync_receive_capture() {
+                    return Err(self.fail_data(error));
+                }
                 Ok(aid)
             }
             Err(error) => {
@@ -1303,6 +1426,7 @@ impl<B: Backend> Session<B> {
             State::RadioReady(_) | State::ScanReady(_) | State::Stopped => return Ok(()),
             _ => return Err(Error::Busy),
         };
+        self.backend.close_receive_capture(self.receive_epoch);
         self.boot_started = Some(self.backend.now_ns());
         let secure = self.security.take().is_some();
         let had_wmm = self.wmm.take().is_some();
@@ -1494,7 +1618,12 @@ impl<B: Backend> Session<B> {
         let State::Associated { info, peer, .. } = associated else {
             return Ok(());
         };
-        if self.peer_lost {
+        if self.peer_lost
+            || self
+                .security
+                .as_ref()
+                .is_some_and(|security| security.has_pending())
+        {
             return Ok(());
         }
         self.stage(Stage::StaRecord);

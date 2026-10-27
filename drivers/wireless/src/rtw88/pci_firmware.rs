@@ -861,6 +861,109 @@ unsafe impl Registers for Native {
     fn station_ht_facts(&self) -> Option<super::ht::Facts> {
         self.packet_gate.as_ref()?.ht_facts()
     }
+    fn station_rx_ba_extension(
+        &mut self,
+        base: alloc::sync::Arc<super::ht::Grant>,
+    ) -> Result<Option<alloc::sync::Arc<super::rx_ba_power::Grant>>, Error> {
+        self.station_allowed()?;
+        Ok(super::rx_ba_power::Source::Registered.load(base).ok())
+    }
+    fn station_tx_ba_extension(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<super::tx_ba_power::Grant>>, Error> {
+        self.station_allowed()?;
+        let base = self
+            .packet_gate
+            .as_ref()
+            .and_then(super::power_policy::Gate::tx_base)
+            .ok_or(Error::State)?;
+        Ok(super::tx_ba_power::Source::Registered.load(base).ok())
+    }
+    fn station_bind_tx_ba(
+        &mut self,
+        g: alloc::sync::Arc<super::tx_ba_power::Grant>,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        self.packet_gate = Some(
+            self.packet_gate
+                .as_ref()
+                .ok_or(Error::State)?
+                .with_tx_ba(g)?,
+        );
+        Ok(())
+    }
+    fn station_tx_ba_request(&mut self) -> Result<super::TxBaRequest, Error> {
+        self.station_allowed()?;
+        let gate = self.packet_gate.as_ref().ok_or(Error::State)?;
+        if let Some(g) = gate.tx_grant() {
+            return Ok(g.request());
+        }
+        let base = match gate.tx_base() {
+            Some(b) => b,
+            None => {
+                let l = match gate.ht_base() {
+                    Some(l) => l,
+                    None => super::station_profile::Source::Registered.load(gate.clone())?,
+                };
+                let h = super::ht::Source::Registered.load(l)?;
+                match super::rx_ba_power::Source::Registered.load(h.clone()).ok() {
+                    Some(r) => super::tx_ba_power::Base::R(r),
+                    None => super::tx_ba_power::Base::H(h),
+                }
+            }
+        };
+        super::tx_ba_power::request(&base)
+    }
+    fn packet_aggregation(
+        &mut self,
+        cfg: Option<super::packet_format::Aggregation>,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        if cfg.is_some_and(|c| {
+            self.packet_gate
+                .as_ref()
+                .and_then(super::power_policy::Gate::tx_grant)
+                .is_none_or(|g| !g.allows(c))
+        }) {
+            return Err(Error::Prerequisite);
+        }
+        self.configure_packet_aggregation(cfg)
+            .map_err(|_| Error::State)
+    }
+    fn packet_submit_batch(
+        &mut self,
+        b: &[alloc::vec::Vec<u8>],
+    ) -> Result<alloc::vec::Vec<u64>, super::packet_core::Error> {
+        self.submit_packet_batch(b)
+    }
+    fn station_bind_rx_ba(
+        &mut self,
+        g: alloc::sync::Arc<super::rx_ba_power::Grant>,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        self.packet_gate = Some(
+            self.packet_gate
+                .as_ref()
+                .ok_or(Error::State)?
+                .with_rx_ba(g)?,
+        );
+        Ok(())
+    }
+    fn station_rx_ba_request(&mut self) -> Result<super::RxBaRequest, Error> {
+        self.station_allowed()?;
+        let gate = self.packet_gate.as_ref().ok_or(Error::State)?;
+        let h = match gate.ht_grant() {
+            Some(h) => h,
+            None => {
+                let base = match gate.ht_base() {
+                    Some(b) => b,
+                    None => super::station_profile::Source::Registered.load(gate.clone())?,
+                };
+                super::ht::Source::Registered.load(base)?
+            }
+        };
+        super::rx_ba_power::request(&h)
+    }
     fn station_ht_extension(
         &mut self,
         base: alloc::sync::Arc<super::station_profile::Grant>,

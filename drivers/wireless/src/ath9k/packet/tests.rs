@@ -60,6 +60,11 @@ pub(in crate::ath9k) struct Model {
     pub(in crate::ath9k) cursor: Cell<u32>,
     pub(in crate::ath9k) last_rx: Cell<Option<u32>>,
     pub(in crate::ath9k) reaction: RefCell<Option<Arc<Reaction>>>,
+    pub(in crate::ath9k) ht: RefCell<Option<Arc<crate::ath9k::ht::Grant>>>,
+    pub(in crate::ath9k) ba: RefCell<Option<Arc<crate::ath9k::rx_ba::Grant>>>,
+    pub(in crate::ath9k) ht_rate: Cell<u8>,
+    pub(in crate::ath9k) rx_aggr: Cell<u32>,
+    pub(in crate::ath9k) dma_transmitted: RefCell<Vec<Vec<u8>>>,
 }
 pub(in crate::ath9k) type Reaction =
     dyn Fn(&[u8]) -> Result<(Vec<Vec<u8>>, bool), Error> + Send + Sync;
@@ -72,6 +77,7 @@ impl Model {
                 (QSTS, 0),
                 (DIAG, RX_PARK),
                 (0x24, 0),
+                (0x803c, 0x17),
             ])),
             regions: RefCell::new(Vec::new()),
             master: Cell::new(false),
@@ -86,6 +92,11 @@ impl Model {
             cursor: Cell::new(0),
             last_rx: Cell::new(None),
             reaction: RefCell::new(None),
+            ht: RefCell::new(None),
+            ba: RefCell::new(None),
+            ht_rate: Cell::new(0x80),
+            rx_aggr: Cell::new(0),
+            dma_transmitted: RefCell::new(Vec::new()),
         })
     }
     fn access(&self) -> Result<(), Error> {
@@ -154,6 +165,16 @@ impl Model {
         Ok(())
     }
     pub(in crate::ath9k) fn inject(&self, bytes: &[u8], error: u32) -> Result<(), Error> {
+        let mut padded = Vec::new();
+        if bytes.first() == Some(&0x88) {
+            if bytes.len() < 26 {
+                return Err(Error::Packet);
+            }
+            padded.extend_from_slice(&bytes[..26]);
+            padded.extend_from_slice(&[0, 0]);
+            padded.extend_from_slice(&bytes[26..]);
+        }
+        let bytes = if padded.is_empty() { bytes } else { &padded };
         let descriptor = self.cursor.get();
         if descriptor == 0 || !self.master.get() {
             return Err(Error::State);
@@ -175,17 +196,44 @@ impl Model {
                 pointer.add(index).write_volatile(value);
             }
         }
-        self.put(descriptor + 16, 0x1b << 24)?;
+        self.put(
+            descriptor + 16,
+            u32::from(if bytes.first() == Some(&0x88) {
+                self.ht_rate.get()
+            } else {
+                0x1b
+            }) << 24,
+        )?;
         self.put(descriptor + 20, length as u32)?;
-        self.put(descriptor + 48, 3 | error)?;
+        self.put(
+            descriptor + 48,
+            3 | error
+                | if bytes.first() == Some(&0x88) {
+                    self.rx_aggr.get()
+                } else {
+                    0
+                },
+        )?;
         self.last_rx.set(Some(descriptor));
         self.cursor.set(self.word(descriptor)?);
         Ok(())
     }
 }
 impl Port for Arc<Model> {
+    fn rx_ba_grant(&self) -> Option<Arc<crate::ath9k::rx_ba::Grant>> {
+        self.ba.borrow().clone()
+    }
+    fn ht_grant(&self) -> Option<Arc<crate::ath9k::ht::Grant>> {
+        self.ht.borrow().clone()
+    }
     fn transmit_allowed(&self) -> Result<(), Error> {
         if self.allowed.get() {
+            if let Some(g) = self.rx_ba_grant() {
+                g.check()?;
+            }
+            if let Some(g) = self.ht_grant() {
+                g.readback(self)?;
+            }
             Ok(())
         } else {
             Err(Error::Access)
@@ -200,14 +248,32 @@ impl Port for Arc<Model> {
         if self.master.get() != active {
             return Err(Error::Access);
         }
-        operation()
+        if let Some(g) = self.rx_ba_grant() {
+            g.invoke(operation)
+        } else if let Some(g) = self.ht_grant() {
+            g.invoke(operation)
+        } else {
+            operation()
+        }
     }
     fn read(&self, reg: u64) -> Result<u32, Error> {
         self.as_ref().access()?;
+        if let Some(g) = self.rx_ba_grant() {
+            g.check()?;
+        }
+        if let Some(g) = self.ht_grant() {
+            g.check()?;
+        }
         Ok(*self.registers.borrow().get(&reg).unwrap_or(&0))
     }
     fn write(&self, reg: u64, value: u32) -> Result<(), Error> {
         self.as_ref().access()?;
+        if let Some(g) = self.rx_ba_grant() {
+            g.check()?;
+        }
+        if let Some(g) = self.ht_grant() {
+            g.check()?;
+        }
         if self.ignore.get() == Some(reg) {
             return Ok(());
         }
@@ -230,7 +296,22 @@ impl Port for Arc<Model> {
             if self.word(descriptor)? != 0 || length < 4 {
                 return Err(Error::Descriptor);
             }
-            let observed = self.bytes(body, length - 4)?;
+            let dma_length = (self.word(descriptor + 12)? & 0xfff) as usize;
+            let dma = self.bytes(body, dma_length)?;
+            self.dma_transmitted.borrow_mut().push(dma.clone());
+            let observed = if dma.first() == Some(&0x88) {
+                if dma.len() != length - 2 || dma.len() < 28 || dma[26..28] != [0, 0] {
+                    return Err(Error::Descriptor);
+                }
+                let mut original = dma[..26].to_vec();
+                original.extend_from_slice(&dma[28..]);
+                original
+            } else {
+                if dma_length != length - 4 {
+                    return Err(Error::Descriptor);
+                }
+                dma
+            };
             self.transmitted.borrow_mut().push(observed.clone());
             self.tx.set(Some(descriptor));
             self.registers.borrow_mut().insert(QSTS, 1);

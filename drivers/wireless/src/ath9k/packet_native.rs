@@ -14,6 +14,9 @@ pub(super) struct Native {
     active: AtomicBool,
     report: super::calibration::Report,
     rf_silent: Option<(u8, bool)>,
+    ht: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::ht::Grant>>>,
+    ht_facts: Option<super::ht::Facts>,
+    ba: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::rx_ba::Grant>>>,
 }
 impl Native {
     /// # Safety
@@ -51,7 +54,15 @@ impl Native {
             active: AtomicBool::new(false),
             report,
             rf_silent,
+            ht: narf_lib::sync::IrqSafeSpinLock::new(None),
+            ht_facts: None,
+            ba: narf_lib::sync::IrqSafeSpinLock::new(None),
         })
+    }
+    pub(super) fn qualify_ht(&mut self, facts: super::ht::Facts) {
+        let grant = super::ht::Source::Registered.load(facts.clone()).ok();
+        *self.ht.lock() = grant;
+        self.ht_facts = Some(facts);
     }
     fn command(&self) -> Result<u16, Error> {
         let command =
@@ -146,8 +157,30 @@ narf_kernel_test::kernel_test_in!(
     smoke_ar9285_native_packet_revocation_precedes_config_dma_and_mmio
 );
 impl Port for Native {
+    fn rx_ba_grant(&self) -> Option<alloc::sync::Arc<super::rx_ba::Grant>> {
+        if let Some(grant) = self.ba.lock().clone() {
+            return Some(grant);
+        }
+        let base = self.ht_grant()?;
+        let grant = super::rx_ba::Source::Registered.load(base).ok()?;
+        let mut retained = self.ba.lock();
+        Some(retained.get_or_insert(grant).clone())
+    }
+    fn ht_grant(&self) -> Option<alloc::sync::Arc<super::ht::Grant>> {
+        if let Some(grant) = self.ht.lock().clone() {
+            return Some(grant);
+        }
+        // The report-bound request can be provisioned after legacy packet
+        // preparation. Only an absent optional grant may be loaded; a revoked
+        // established source is never replaced. The cache guard never spans lookup.
+        let grant = super::ht::Source::Registered
+            .load(self.ht_facts.clone()?)
+            .ok()?;
+        let mut retained = self.ht.lock();
+        Some(retained.get_or_insert(grant).clone())
+    }
     fn transmit_allowed(&self) -> Result<(), Error> {
-        let domain = narf_wireless::reg::db::get_domain().ok_or(Error::Access)?;
+        let domain = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
         let permission =
             super::calibration::Permission::from_domain(&domain).map_err(|_| Error::Access)?;
         if !permission.allows_report(self.report) {
@@ -157,6 +190,10 @@ impl Port for Native {
             if (self.read(0x4048)? & (1 << (12 + gpio)) != 0) == polarity {
                 return Err(Error::Access);
             }
+        }
+        let grant = { self.ht.lock().clone() };
+        if let Some(grant) = grant {
+            grant.readback(self)?;
         }
         Ok(())
     }
@@ -172,7 +209,28 @@ impl Port for Native {
             {
                 return Err(Error::Access);
             }
-            operation()
+            let domain = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
+            let permission =
+                super::calibration::Permission::from_domain(&domain).map_err(|_| Error::Access)?;
+            if !permission.allows_report(self.report) {
+                return Err(Error::Access);
+            }
+            if let Some((gpio, polarity)) = self.rf_silent {
+                self.extent(0x4048)?;
+                // SAFETY: checked full input-register extent in current PCI
+                // invocation, without recursively entering this access helper.
+                let value = unsafe { self.bar.read32(0x4048) };
+                if value == u32::MAX || (value & (1 << (12 + gpio)) != 0) == polarity {
+                    return Err(Error::Access);
+                }
+            }
+            let grant = { self.ht.lock().clone() };
+            let ba = { self.ba.lock().clone() };
+            match (ba, grant) {
+                (Some(grant), _) => grant.invoke(operation),
+                (None, Some(grant)) => grant.invoke(operation),
+                (None, None) => operation(),
+            }
         })
     }
     fn read(&self, reg: u64) -> Result<u32, Error> {
