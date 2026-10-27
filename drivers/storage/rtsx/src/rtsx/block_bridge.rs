@@ -3,31 +3,34 @@
 //! ## What this file does
 //!
 //! Wraps an RTSX SD card as a `BlockDeviceSync` and registers it in the
-//! block-device registry under the name `"mmcblk0"` (and partition nodes
-//! `"mmcblk0p1"`, etc. once a partition scanner runs).  The registration
-//! happens on card-detect: when `register_card` is called from the RTSX
-//! driver's card-identify path, the card immediately becomes accessible
-//! as `/dev/mmcblk0` through the existing Wave-13 `devfs_block` bridge.
+//! block-device registry under the name `"mmcblk0"`.  The registration
+//! happens on card-detect: when `register_card` is called from the
+//! RTSX driver's card-identify path, the card immediately becomes
+//! accessible as `/dev/mmcblk0` through the existing Wave-13
+//! `devfs_block` bridge.  `unregister_card` removes it again when the
+//! poll task observes a removal.
 //!
 //! Additionally, `/sys/class/mmc_host/mmc0/mmc0:<rca>/` is populated
-//! with card identity attributes.
+//! with the card's real identity attributes, decoded from the CID the
+//! identify sequence captured with CMD2.
 //!
 //! ## BlockDeviceSync impl
 //!
-//! - `read(lba, n_blocks, out)` → issues CMD17 per block via
-//!   `RtsxController::read_block_dma`.
-//! - `write(lba, n_blocks, data)` → not yet implemented (CMD24 path
-//!   deferred; returns `DriverError`).
-//! - `capacity()` → from `SdCardInfo::capacity_blocks` (or a default of
-//!   0 if the CSD parse is deferred).
+//! - `read(lba, n_blocks, out)` → CMD17 per block via
+//!   `RtsxController::read_block` (ping-pong buffer path).
+//! - `write(lba, n_blocks, data)` → CMD24 per block via
+//!   `RtsxController::write_block`.
+//! - `capacity()` → `SdCardInfo::capacity_blocks`, decoded from the
+//!   card's real CSD during identify.  A card whose CSD does not parse
+//!   never reaches registration, so no default capacity exists here.
 //! - `lba_size()` → always 512 bytes for SD cards.
 //!
 //! ## Sysfs
 //!
-//! - `/sys/class/mmc_host/mmc0/mmc0:<rca>/cid`    → hex CID placeholder
-//! - `/sys/class/mmc_host/mmc0/mmc0:<rca>/name`   → "SD"
-//! - `/sys/class/mmc_host/mmc0/mmc0:<rca>/manfid` → "0x000000"
-//! - `/sys/class/mmc_host/mmc0/mmc0:<rca>/oemid`  → "0x0000"
+//! - `/sys/class/mmc_host/mmc0/mmc0:<rca>/cid`    → hex CID (real, CMD2)
+//! - `/sys/class/mmc_host/mmc0/mmc0:<rca>/name`   → CID product name
+//! - `/sys/class/mmc_host/mmc0/mmc0:<rca>/manfid` → CID manufacturer ID
+//! - `/sys/class/mmc_host/mmc0/mmc0:<rca>/oemid`  → CID OEM ID
 //!
 //! ## Linux reference
 //!
@@ -37,22 +40,26 @@
 //!
 //! ## Deferred
 //!
-//! - CMD24 (WRITE_BLOCK) — write path.
-//! - CMD25/CMD18 (WRITE/READ_MULTIPLE_BLOCK) — multi-block transfers.
-//! - MMC HS200/HS400 tuning.
-//! - CSD parse to extract real capacity.
+//! - CMD18/CMD25 (READ/WRITE_MULTIPLE_BLOCK) over the ADMA ring
+//!   buffer — transfers here are single-block (CMD17/CMD24).
+//! - Partition scanning of the registered device (#834).
+//! - MMC cards / HS200 tuning — this bridge serves SD cards only.
 
 use alloc::format;
+use alloc::string::String;
 use alloc::sync::Arc;
 
-use narf_block::registry::{register_block_device, BlockDeviceSync, BlockIoError};
+use narf_block::registry::{
+    register_block_device, unregister_block_device, BlockDeviceSync, BlockIoError,
+};
+use narf_drivers_storage_core::sd_proto::Cid;
 
 use super::card::SdCardInfo;
 use super::with_controller;
 
 // ── RtsxBlockDevice ───────────────────────────────────────────────────────
 
-/// Adapter: wraps the RTSX controller's SD read path behind
+/// Adapter: wraps the RTSX controller's SD read/write paths behind
 /// `BlockDeviceSync` so it can live in the block-device registry.
 ///
 /// Holds a copy of the card info (RCA, high_capacity, capacity_blocks)
@@ -62,7 +69,7 @@ pub struct RtsxBlockDevice {
     pub rca: u16,
     /// True = SDHC/SDXC (block-addressed); false = SDSC (byte-addressed).
     pub high_capacity: bool,
-    /// Card capacity in 512-byte blocks (may be 0 if CSD not parsed).
+    /// Card capacity in 512-byte blocks, from the card's real CSD.
     pub capacity_blocks: u64,
 }
 
@@ -81,13 +88,17 @@ impl RtsxBlockDevice {
         RtsxBlockDevice {
             rca: info.rca,
             high_capacity: info.high_capacity,
-            capacity_blocks: if info.capacity_blocks > 0 {
-                info.capacity_blocks
-            } else {
-                // Default to 1 GiB (2 Mi blocks) when CSD not parsed.
-                // A real CSD parse (CMD9) lands in a follow-up.
-                2 * 1024 * 1024
-            },
+            capacity_blocks: info.capacity_blocks,
+        }
+    }
+
+    /// Translate a block-layer LBA to the on-card command argument:
+    /// block address for SDHC/SDXC, byte address for SDSC.
+    fn card_addr(&self, lba: u64) -> u32 {
+        if self.high_capacity {
+            lba as u32
+        } else {
+            (lba as u32).saturating_mul(512)
         }
     }
 }
@@ -101,11 +112,7 @@ impl BlockDeviceSync for RtsxBlockDevice {
         self.capacity_blocks
     }
 
-    /// Read `n_blocks` × 512 bytes starting at `lba`.
-    ///
-    /// For SDHC/SDXC `lba` maps directly to a block address.
-    /// For SDSC it would need to be multiplied by 512 — not implemented
-    /// (SDSC cards are extremely rare in practice; 2011 and earlier).
+    /// Read `n_blocks` × 512 bytes starting at `lba` (CMD17 per block).
     ///
     /// Linux ref: `mmc_read_blocks` → `mmc_wait_for_req` →
     /// `rtsx_pci_sdmmc_request` in
@@ -125,29 +132,44 @@ impl BlockDeviceSync for RtsxBlockDevice {
 
         with_controller(|ctrl| {
             for i in 0..n_blocks as u64 {
-                let block_addr = if self.high_capacity {
-                    (lba + i) as u32
-                } else {
-                    // SDSC: byte-addressed; multiply by 512.
-                    ((lba + i) as u32).saturating_mul(512)
-                };
+                let addr = self.card_addr(lba + i);
                 let offset = i as usize * 512;
-                // SAFETY: card must be selected (called after identify_sd_card).
-                unsafe {
-                    ctrl.read_block_dma(block_addr, &mut out[offset..offset + 512])
-                        .map_err(|_| BlockIoError::DriverError)?;
-                }
+                let mut block = [0u8; 512];
+                ctrl.read_block(addr, &mut block)
+                    .map_err(|_| BlockIoError::DriverError)?;
+                out[offset..offset + 512].copy_from_slice(&block);
             }
             Ok::<(), BlockIoError>(())
         })
         .ok_or(BlockIoError::DriverError)?
     }
 
-    /// Write `n_blocks` × 512 bytes starting at `lba`.
-    ///
-    /// CMD24 (WRITE_BLOCK) deferred — see module-level doc.
-    fn write(&self, _lba: u64, _n_blocks: u16, _data: &[u8]) -> Result<(), BlockIoError> {
-        Err(BlockIoError::DriverError)
+    /// Write `n_blocks` × 512 bytes starting at `lba` (CMD24 per block).
+    fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError> {
+        if n_blocks == 0 {
+            return Ok(());
+        }
+        let needed = n_blocks as usize * 512;
+        if data.len() < needed {
+            return Err(BlockIoError::BufferTooSmall);
+        }
+        let max_lba = self.capacity_blocks.saturating_sub(n_blocks as u64);
+        if lba > max_lba {
+            return Err(BlockIoError::OutOfRange);
+        }
+
+        with_controller(|ctrl| {
+            for i in 0..n_blocks as u64 {
+                let addr = self.card_addr(lba + i);
+                let offset = i as usize * 512;
+                let mut block = [0u8; 512];
+                block.copy_from_slice(&data[offset..offset + 512]);
+                ctrl.write_block(addr, &block)
+                    .map_err(|_| BlockIoError::DriverError)?;
+            }
+            Ok::<(), BlockIoError>(())
+        })
+        .ok_or(BlockIoError::DriverError)?
     }
 }
 
@@ -170,9 +192,19 @@ pub fn register_card(info: SdCardInfo) {
     register_sysfs(info);
 }
 
+/// Unregister a previously registered SD card: remove `"mmcblk0"`
+/// from the block registry and drop its sysfs card kobject.
+///
+/// Called from the card-detect path when a ready card is removed.
+pub fn unregister_card(info: SdCardInfo) {
+    unregister_block_device("mmcblk0");
+    unregister_sysfs(info);
+}
+
 // ── Sysfs class registration ──────────────────────────────────────────────
 
-/// Register `/sys/class/mmc_host/mmc0/mmc0:<rca>/` for the inserted card.
+/// Register `/sys/class/mmc_host/mmc0/mmc0:<rca>/` for the inserted card,
+/// with identity attributes decoded from the card's real CID.
 ///
 /// Linux ref: `mmc_alloc_host` in `drivers/mmc/core/host.c` and
 /// `mmc_add_card` in `drivers/mmc/core/bus.c`.
@@ -186,19 +218,50 @@ fn register_sysfs(info: SdCardInfo) {
     let card_name = format!("mmc0:{:04x}", info.rca);
     let card_kobj = class_device_register(mmc0, &card_name);
 
-    // Placeholder CID: real CID requires CMD2 R2 capture, deferred.
-    // Linux: `drivers/mmc/core/mmc.c::mmc_read_cid` issues CMD2 to
-    // get the 128-bit CID; we expose 32 zero hex digits as a stub.
-    let rca = info.rca;
+    let cid = Cid::parse_shifted(&info.cid);
+
+    // Real CID captured by CMD2 during identify, in the shifted-word
+    // layout (the controller strips the CRC7+end byte, so the top
+    // byte of the 128-bit field is zero — the same representation
+    // SDHCI hosts hand to the MMC core).
+    let raw = info.cid;
     kobject_add_attr(&card_kobj, "cid", move || {
-        alloc::format!("{:032x}\n", rca as u64)
+        format!("{:08x}{:08x}{:08x}{:08x}\n", raw[3], raw[2], raw[1], raw[0])
     });
 
-    kobject_add_attr(&card_kobj, "name", move || "SD\n".into());
+    let name = cid_name_string(&cid);
+    kobject_add_attr(&card_kobj, "name", move || format!("{}\n", name));
 
-    kobject_add_attr(&card_kobj, "manfid", move || "0x000000\n".into());
+    let manfid = cid.manufacturer_id;
+    kobject_add_attr(&card_kobj, "manfid", move || {
+        format!("0x{:06x}\n", manfid as u32)
+    });
 
-    kobject_add_attr(&card_kobj, "oemid", move || "0x0000\n".into());
+    let oemid = ((cid.oem_id[0] as u16) << 8) | (cid.oem_id[1] as u16);
+    kobject_add_attr(&card_kobj, "oemid", move || format!("0x{:04x}\n", oemid));
+}
+
+/// Remove the card's sysfs kobject (host kobject `mmc0` stays).
+fn unregister_sysfs(info: SdCardInfo) {
+    use narf_filesystem::sysfs::class_register;
+
+    let mmc_class = class_register("mmc_host");
+    if let Some(mmc0) = mmc_class.get_child("mmc0") {
+        let card_name = format!("mmc0:{:04x}", info.rca);
+        mmc0.remove_child(&card_name);
+    }
+}
+
+/// Product name from the CID as a printable string: the 5-byte PNM
+/// field is ASCII; trailing NUL/space padding is trimmed.
+fn cid_name_string(cid: &Cid) -> String {
+    let raw = core::str::from_utf8(&cid.product_name).unwrap_or("SD");
+    let trimmed = raw.trim_end_matches(['\0', ' ']);
+    if trimmed.is_empty() {
+        String::from("SD")
+    } else {
+        String::from(trimmed)
+    }
 }
 
 // ── Test-only helpers ─────────────────────────────────────────────────────
@@ -225,6 +288,7 @@ pub mod tests {
             high_capacity: true,
             capacity_blocks: 4096,
             selected: true,
+            cid: [0; 4],
         };
         register_card(info);
         let found = narf_block::registry::find_block_device("mmcblk0");
@@ -244,6 +308,7 @@ pub mod tests {
             high_capacity: true,
             capacity_blocks: 8192,
             selected: true,
+            cid: [0; 4],
         };
         let dev = RtsxBlockDevice::new(info);
         if dev.capacity() != 8192 {
@@ -266,6 +331,7 @@ pub mod tests {
             high_capacity: false,
             capacity_blocks: 0,
             selected: true,
+            cid: [0x42; 4],
         };
         register_sysfs(info);
         use narf_filesystem::sysfs::class_register;
@@ -281,5 +347,47 @@ pub mod tests {
     kernel_test_in!(
         "drivers/storage/rtsx/block_bridge",
         smoke_rtsx_sysfs_cid_attr
+    );
+
+    /// The sysfs identity attributes must be the card's REAL CID
+    /// fields, not placeholders: build an SdCardInfo with a known
+    /// CID (manufacturer 0x03, product name "SU08G") and check the
+    /// decoded attrs.
+    fn smoke_rtsx_sysfs_identity_from_cid() -> TestResult {
+        narf_filesystem::sysfs::__reset_for_test();
+        // Build the SdCardInfo CID via the same R2 conversion the
+        // driver uses, from a CID register with MID=0x03,
+        // OID="SD", PNM="SU08G".
+        let mut frame = [0u8; 16];
+        frame[0] = 0x3F;
+        frame[1..16].copy_from_slice(&[
+            0x03, b'S', b'D', b'S', b'U', b'0', b'8', b'G', 0x80, 0x12, 0x34, 0x56, 0x78, 0x01,
+            0x42,
+        ]);
+        let info = SdCardInfo {
+            rca: 0x0007,
+            high_capacity: true,
+            capacity_blocks: 1024,
+            selected: true,
+            cid: crate::rtsx::card::r2_frame_to_shifted_words(&frame),
+        };
+        register_sysfs(info);
+        use narf_filesystem::sysfs::class_register;
+        let mmc_class = class_register("mmc_host");
+        let mmc0 = mmc_class.get_child("mmc0").expect("mmc0 not found");
+        let card = mmc0.get_child("mmc0:0007").expect("mmc0:0007 not found");
+        match card.attr_show("manfid") {
+            Some(v) if v.contains("0x000003") => {}
+            _ => return TestResult::Fail("manfid attr must decode the real CID manufacturer ID"),
+        }
+        match card.attr_show("name") {
+            Some(v) if v.contains("SU08G") => {}
+            _ => return TestResult::Fail("name attr must decode the real CID product name"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/storage/rtsx/block_bridge",
+        smoke_rtsx_sysfs_identity_from_cid
     );
 }

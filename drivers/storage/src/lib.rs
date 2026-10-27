@@ -102,6 +102,19 @@ pub fn register_initcalls() {
         narf_drivers_storage_rtsx::register();
         InitResult::Ok
     });
+    // RTSX card-detect poll: cards inserted after probe produce no
+    // interrupt this driver services, so a Stage::Late task polls
+    // BIPR.SD_EXIST and registers/unregisters the card's block
+    // device. NotPresent when no RTSX controller probed (the USB
+    // supervisor rule).
+    #[cfg(feature = "rtsx")]
+    narf_init::register(Stage::Late, "rtsx-card-poll", || {
+        if !rtsx::is_probed() {
+            return InitResult::NotPresent;
+        }
+        rtsx::spawn_card_poll_task();
+        InitResult::Ok
+    });
     // Intel VMD must register at Stage::Device because its probe appends
     // children into the bus registry that the *same* PCI walk's later probes
     // would not otherwise see. Keeping VMD at Stage::Device leaves the
