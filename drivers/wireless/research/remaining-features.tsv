@@ -53,23 +53,34 @@ ath11k	radar_diagnostics	Radar-detector diagnostics	feature	drivers/wireless/spe
 ath11k	spectral_diagnostics	Spectral diagnostics	feature	drivers/wireless/specification/ath11k.md	1824
 ath11k	twt_dialogs	Per-dialog TWT control	feature	drivers/wireless/specification/ath11k.md	1824
 ath11k	wcn6750_enablement	WCN6750 native platform profile enablement	chip	drivers/wireless/specification/ath11k.md	1827
-ath9k	additional_ac_scheduling	Additional AC scheduling	feature	drivers/wireless/specification/ath9k.md	577
-ath9k	additional_channels	Live operation on additional channels	feature	drivers/wireless/specification/ath9k.md	576
-ath9k	additional_tid_scheduling	Additional TID scheduling	feature	drivers/wireless/specification/ath9k.md	577
-ath9k	channel_retuning	Channel retuning	feature	drivers/wireless/specification/ath9k.md	576
-ath9k	dma_reclamation	DMA reclamation	feature	drivers/wireless/specification/ath9k.md	579
-ath9k	factory_profile_selection	Additional factory-profile selection	feature	drivers/wireless/specification/ath9k.md	576
-ath9k	ht40	HT40	feature	drivers/wireless/specification/ath9k.md	577
-ath9k	interrupt_service	Interrupt-driven packet service	feature	drivers/wireless/specification/ath9k.md	577
-ath9k	larger_tx_aggregates	TX aggregates larger than the implemented two-MPDU sender	feature	drivers/wireless/specification/ath9k.md	577
-ath9k	other_chip_enablement	Other ath9k chip profiles are not enumerated in this ledger	unknown	drivers/wireless/specification/ath9k.md	583
-ath9k	periodic_calibration	Periodic calibration	feature	drivers/wireless/specification/ath9k.md	576
-ath9k	rejoin	Rejoin after terminal closure	feature	drivers/wireless/specification/ath9k.md	579
-ath9k	removal	Device removal	feature	drivers/wireless/specification/ath9k.md	579
-ath9k	reset	Native generation-safe reset	feature	drivers/wireless/specification/ath9k.md	579
-ath9k	sgi40	SGI40	feature	drivers/wireless/specification/ath9k.md	577
-ath9k	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/ath9k.md	577
-ath9k	unexpanded_power_transitions	Power transitions lack individually enumerated states or operations	unknown	drivers/wireless/specification/ath9k.md	578
+ath9k	additional_ac_scheduling	Additional AC scheduling	feature	drivers/wireless/specification/ath9k.md	589
+ath9k	additional_channels	Live operation on additional channels	feature	drivers/wireless/specification/ath9k.md	587
+ath9k	additional_tid_scheduling	Additional TID scheduling	feature	drivers/wireless/specification/ath9k.md	589
+ath9k	ar5416_enablement	AR5416/AR5418 (168c:0023/0024) native enablement	chip	drivers/wireless/specification/ath9k.md	623
+ath9k	ar9160_enablement	AR9160 (168c:0027) native enablement	chip	drivers/wireless/specification/ath9k.md	625
+ath9k	ar9280_enablement	AR9280 (168c:0029/002a) native enablement	chip	drivers/wireless/specification/ath9k.md	626
+ath9k	ar9287_enablement	AR9287 (168c:002d/002e) native enablement	chip	drivers/wireless/specification/ath9k.md	628
+ath9k	ar9300_enablement	AR9380/AR9390 (168c:0030) native enablement	chip	drivers/wireless/specification/ath9k.md	630
+ath9k	ar9462_enablement	AR9462 (168c:0034) native enablement	chip	drivers/wireless/specification/ath9k.md	634
+ath9k	ar9485_enablement	AR9485/AR1111 (168c:0032/0037) native enablement	chip	drivers/wireless/specification/ath9k.md	632
+ath9k	ar9565_enablement	AR9565 (168c:0036) native enablement	chip	drivers/wireless/specification/ath9k.md	636
+ath9k	ar9580_enablement	AR9580 (168c:0033) native enablement	chip	drivers/wireless/specification/ath9k.md	633
+ath9k	channel_retuning	Channel retuning	feature	drivers/wireless/specification/ath9k.md	587
+ath9k	dma_reclamation	DMA reclamation	feature	drivers/wireless/specification/ath9k.md	615
+ath9k	factory_profile_selection	Additional factory-profile selection	feature	drivers/wireless/specification/ath9k.md	587
+ath9k	host_bus_pm	PCIe ASPM host-bus power management	feature	drivers/wireless/specification/ath9k.md	607
+ath9k	ht40	HT40	feature	drivers/wireless/specification/ath9k.md	588
+ath9k	idle_full_sleep	Idle FULL_SLEEP with use-counted wake and AWAKE restore	feature	drivers/wireless/specification/ath9k.md	597
+ath9k	interrupt_service	Interrupt-driven packet service	feature	drivers/wireless/specification/ath9k.md	588
+ath9k	larger_tx_aggregates	TX aggregates larger than the implemented two-MPDU sender	feature	drivers/wireless/specification/ath9k.md	588
+ath9k	periodic_calibration	Periodic calibration	feature	drivers/wireless/specification/ath9k.md	587
+ath9k	rejoin	Rejoin after terminal closure	feature	drivers/wireless/specification/ath9k.md	615
+ath9k	removal	Device removal	feature	drivers/wireless/specification/ath9k.md	615
+ath9k	reset	Native generation-safe reset	feature	drivers/wireless/specification/ath9k.md	615
+ath9k	sgi40	SGI40	feature	drivers/wireless/specification/ath9k.md	588
+ath9k	station_network_sleep	Station NETWORK_SLEEP power save with beacon timers	feature	drivers/wireless/specification/ath9k.md	600
+ath9k	system_suspend	System suspend/resume	feature	drivers/wireless/specification/ath9k.md	604
+ath9k	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/ath9k.md	588
 brcmfmac	additional_chip_profiles	Additional CPU/RAM/chip/OTP profiles (incl. 160 MHz-capable chips; retained BCM43602 is 80 MHz)	chip	drivers/wireless/specification/brcmfmac.md	562
 brcmfmac	ap_mode	Access Point mode	feature	drivers/wireless/specification/cyw43439.md	499
 brcmfmac	confirmed_stop_quiescence	Confirmed transport/device stop and quiescence	feature	drivers/wireless/specification/cyw43439.md	500

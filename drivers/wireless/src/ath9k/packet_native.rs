@@ -30,8 +30,8 @@ impl Native {
         report: super::calibration::Report,
         image: &[u8; super::EEPROM_4K_BYTES],
     ) -> Result<Self, Error> {
-        if device.id.vendor != 0x168c || device.id.device != 0x002b || report.frequency_mhz != 2412
-        {
+        // AR2427 shares this legacy owner; HT stays behind `ht::Facts`.
+        if !crate::ath9k::ar9285_silicon(&device.id) || report.frequency_mhz != 2412 {
             return Err(Error::Packet);
         }
         let bytes = [image[20], image[21]];
@@ -92,13 +92,22 @@ impl Native {
 #[cfg(feature = "kernel-test")]
 fn smoke_ar9285_native_packet_revocation_precedes_config_dma_and_mmio(
 ) -> narf_kernel_test::TestResult {
+    for id in [0x002b, 0x002c] {
+        if let Err(error) = revoked_packet_authority(id) {
+            return narf_kernel_test::TestResult::Fail(error);
+        }
+    }
+    narf_kernel_test::TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+fn revoked_packet_authority(id: u16) -> Result<(), &'static str> {
     use narf_bus::{BarKind, BusAddr, BusKind, DeviceId, PcieAddr};
     let address = PcieAddr::new(0, 0, 7, 0);
     let device = BusDevice {
         addr: BusAddr::Pcie(address),
         id: DeviceId {
             vendor: 0x168c,
-            device: 0x002b,
+            device: id,
             class: 0x028000,
             subsystem_vendor: 0,
             subsystem_id: 0,
@@ -133,7 +142,7 @@ fn smoke_ar9285_native_packet_revocation_precedes_config_dma_and_mmio(
     let Ok(native) =
         (unsafe { Native::new(device, cap, bar, report, &[0; super::EEPROM_4K_BYTES]) })
     else {
-        return narf_kernel_test::TestResult::Fail("native fixture shape");
+        return Err("native fixture shape");
     };
     let mut entered = false;
     if native.access(false, || {
@@ -147,11 +156,12 @@ fn smoke_ar9285_native_packet_revocation_precedes_config_dma_and_mmio(
         || native.master(true) != Err(Error::Access)
         || native.master(false) != Err(Error::Access)
     {
-        return narf_kernel_test::TestResult::Fail(
-            "revoked packet authority reached config, DMA or BAR",
-        );
+        return Err("revoked packet authority reached config, DMA or BAR");
     }
-    narf_kernel_test::TestResult::Pass
+    if native.ht_grant().is_some() {
+        return Err("legacy AR9285-silicon owner loaded HT without measured facts");
+    }
+    Ok(())
 }
 #[cfg(feature = "kernel-test")]
 narf_kernel_test::kernel_test_in!(

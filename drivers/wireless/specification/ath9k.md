@@ -8,11 +8,13 @@
 > acceptance remains pending. Wider channels, recovery and other chips are separate.
 > The additional bounded two-MPDU sender BA/A-MPDU continuation below is
 > implemented with ten new native smokes passing the coordinated validation
-> on both architectures.
+> on both architectures. AR2427 (`168c:002c`, AR9285 silicon with HT bonded
+> out) shares the legacy owner with every HT/BA source closed.
 
 ## 1. Purpose & scope
 
-The currently matched PCIe part is AR9285 (`168c:002b`). Broader ath9k
+The currently matched PCIe parts are AR9285 (`168c:002b`) and AR2427
+(`168c:002c`), Linux's AR9285 silicon with 802.11n bonded out. Broader ath9k
 families are not implemented merely because Linux supports them.
 This is a soft-MAC radio: unlike ath10k it does not use a downloadable
 WLAN firmware to supply MLME and hardware programming.
@@ -28,7 +30,17 @@ AR9285-specific writes follow a checked silicon revision.
 
 ## 3. Public interface
 
-- `register()` installs the AR9285 PCI match.
+- `register()` installs the AR9285 (`ath9k`) and AR2427 (`ath9k-ar2427`)
+  PCI matches; `ar9285_silicon()` is the shared exact vendor/device gate.
+  Linux `hw.c::ath9k_hw_init` accepts `AR2427_DEVID_PCIE` with the same
+  AR9285 silicon revision, `eeprom_4k.c` map and AR9002 reset/INI path, and
+  `hw.c::ath9k_hw_fill_cap_info` clears `ATH9K_HW_CAP_HT` for that ID only.
+  AR2427 therefore runs the identical probe, calibration, legacy packet and
+  station owner, while `ht::Facts::new` (and thus every HT20, RX STBC, RX BA
+  and sender BA grant) admits only `0x002b`. The bound-driver record names
+  `ath9k-ar2427`. Smokes `smoke_ar2427_bonded_out_ht_never_reaches_measured_facts`
+  and the two-ID `smoke_ar9285_native_packet_revocation_precedes_config_dma_and_mmio`
+  cover the gate. Physical AR2427 acceptance is pending like AR9285.
 - `probe()` reads the complete factory calibration image after Linux's
   bounded power-on/warm-reset sequence. It retains the controller instead
   of constructing and immediately discarding an `Arc`.
@@ -574,13 +586,57 @@ device, authenticated deployment policy and measured RF/calibration acceptance.
 No RF or AP interoperability has been demonstrated by the model tests.
 
 Broader live channels/retuning, factory profiles, periodic calibration,
-interrupt-driven operation, HT40/SGI40, larger TX aggregates, TX A-MSDU, additional AC/TID
-scheduling and power transitions
-require separate continuations. Reset/rejoin, removal and DMA reclamation need
+interrupt-driven operation, HT40/SGI40, larger TX aggregates, TX A-MSDU and
+additional AC/TID scheduling require separate continuations.
+
+Power transitions are enumerated from Linux `hw.h::ath9k_power_mode`
+(`AWAKE`, `FULL_SLEEP`, `NETWORK_SLEEP`) and their callers. The current owner
+forces `AR_RTC_FORCE_WAKE` during reset and stays `AWAKE`; AR9285 lacks
+`ATH9K_HW_CAP_AUTOSLEEP` (`hw.c::ath9k_hw_fill_cap_info`), so every sleep entry
+must be software-forced. Remaining named operations:
+
+- `idle_full_sleep`: `main.c::{ath9k_ps_wakeup,ath9k_ps_restore,ath_ps_full_sleep}`
+  use-counted wake, 100 ms idle timer, RX abort/DMA stop and `FULL_SLEEP`,
+  with `hw.c::ath9k_hw_setpower` restoring `AWAKE` before register access.
+- `station_network_sleep`: `NETWORK_SLEEP` station power save with
+  `beacon.c::ath9k_beacon_config_sta`/`hw.c::ath9k_hw_set_sta_beacon_timers`
+  TIM/DTIM timers and beacon/CAB/PS-Poll/TX-ACK wake conditions. Linux leaves
+  `SUPPORTS_PS` behind the `ps_enable` module parameter (default off).
+- `system_suspend`: `pci.c::{ath_pci_suspend,ath_pci_resume}` hardware disable
+  plus forced `FULL_SLEEP`, then PCI RETRY_TIMEOUT (config 0x41) re-disable and
+  ASPM re-initialization on resume.
+- `host_bus_pm`: `pci.c::ath_pci_aspm_init` parent-link ASPM L0s/L1 discovery
+  and `aspm_l1_fix` (config 0x70c) handling.
+
+Wake-on-WLAN is not applicable to the matched parts: `wow.c::ath9k_init_wow`
+requires PCI `driver_data` `ATH9K_PCI_WOW`, which `pci.c` sets only for
+`0x0034` (AR9462) subsystems, and the hardware programming lives in
+`ar9003_wow.c` (AR9003 family only). It belongs to AR9462 enablement.
+
+Reset/rejoin, removal and DMA reclamation need
 an independently proved generation/reset owner; the initial profile retains
 storage and requires a fresh lifecycle after terminal closure.
 
 Other ath9k devices need their own EEPROM maps, reset/PHY tables and
-descriptor/runtime variants before they can be claimed supported.
+descriptor/runtime variants before they can be claimed supported. The Linux
+`pci.c::ath_pci_id_table`/`hw.h` PCI inventory beyond AR9285/AR2427 is:
+
+- `ar5416_enablement`: AR5416 PCI `0x0023` / AR5418 PCIe `0x0024`
+  (AR5008 PHY ops, `eeprom_def.c`, `ar5008_initvals.h`).
+- `ar9160_enablement`: AR9160 PCI `0x0027` (AR9001, `eeprom_def.c`).
+- `ar9280_enablement`: AR9280 PCI `0x0029` / PCIe `0x002a` (AR9002 dual-band,
+  `eeprom_def.c`, AR9280 INI).
+- `ar9287_enablement`: AR9287 PCI `0x002d` / PCIe `0x002e` (AR9002,
+  `eeprom_9287.c`).
+- `ar9300_enablement`: AR9380/AR9390 PCIe `0x0030` (AR9003 EDMA descriptors,
+  `eeprom_9003.c`, `ar9003_2p2_initvals.h`).
+- `ar9485_enablement`: AR9485 `0x0032` and AR1111 `0x0037` (AR9003).
+- `ar9580_enablement`: AR9580 `0x0033` (AR9003).
+- `ar9462_enablement`: AR9462 `0x0034` (AR9003, BT coexistence MCI, WoW);
+  ath10k currently rejects this ID as wrong-driver.
+- `ar9565_enablement`: AR9565 `0x0036` (AR9003, MCI).
+
+SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
+`ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
 Physical acceptance for the initial profile covers EEPROM, RF calibration,
 polled channel/DMA, scan/association/IP traffic and terminal link loss/stop.

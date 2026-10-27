@@ -24,6 +24,7 @@ native Rust model coverage; that does not qualify every deployed image.
 | Chip / revision | PCI ID | Exact BMI target / firmware directory | Reachable committed status | Current WIP |
 |---|---|---|---|---|
 | AR9285 |168c:002b|No executable firmware; actual4k EEPROM and silicon revision required|Calibrated, polled channel1,20MHz,1Mbps Open/WPA2 station; four-SSID active discovery, host CCMP and DHCP/IP|Negotiated legacy1–54Mbps, four native retry series and adaptive terminal-feedback policy; focused x86 software suite passed, combined gate pending|
+| AR2427 |168c:002c|AR9285 silicon, 802.11n bonded out (Linux clears ATH9K_HW_CAP_HT)|Same AR9285 legacy probe/calibration/packet/station owner; every HT/BA source rejects this ID|None|
 | QCA988X HW2.0 |168c:003c|4100016c; `QCA988X/hw2.0`|L|Fixed-country non-DFS5GHz legacy20; both native band-power limits and scan/peer modes; unvalidated|
 | QCA988X Ubiquiti alias |0777:11ac|4100016c; same directory|L; exact board selection still distinct|Same shared WIP, no second backend|
 | QCA6164 HW2.1 |168c:0041|05010000; `QCA6174/hw2.1`|L; device ID distinguishes it from6174|Same shared WIP|
@@ -35,13 +36,13 @@ native Rust model coverage; that does not qualify every deployed image.
 | QCA9888 HW2.0 |168c:0056|01000000; `QCA9888/hw2.0`|L under the same feature gate|Same shared WIP|
 | QCA9377 HW1.0 |168c:0042|05020000; `QCA9377/hw1.0`|L|Same shared WIP|
 | QCA9377 HW1.1 |168c:0042|05020001; same directory, PLL continuation|L; separate target tuple|Same shared WIP|
-| AR9462 |168c:0034|Registered by ath10k as an explicit wrong-driver rejection|No station. It belongs to ath9k; NARF ath9k currently matches only9285|None; a genuine AR9003/9462 backend is separate work|
+| AR9462 |168c:0034|Registered by ath10k as an explicit wrong-driver rejection|No station. It belongs to ath9k; NARF ath9k currently matches only AR9285 silicon (002b/002c)|None; a genuine AR9003/9462 backend is separate work|
 | QCA9887 HW1.0 |168c:0050|4100016d; `QCA9887/hw1.0`|Firmware catalog/parser tuple only: **not registered by the PCI dispatcher**|None; not counted as an active matched-chip port|
 
 Thus ath10k registers9 tuples:8 candidate ath10k tuples spanning7 chip
 families and1 explicit AR9462 rejection. Its12 firmware-selection entries
 include the unreachable9887 tuple. None of these counts is a driver count
-or completion percentage. Together with ath9k there are10 registered tuples.
+or completion percentage. Together with ath9k (AR9285 and AR2427) there are11 registered tuples.
 
 NARF evidence: `ath9k.rs::{register,probe}`, `ath9k/identity.rs`,
 `ath9k/calibration.rs`, `ath9k/packet.rs`, `ath9k/station.rs`,

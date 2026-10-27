@@ -32,6 +32,20 @@ pub use tx_ba::Request as TxBaQualificationRequest;
 
 const ATHEROS_PCI_VENDOR: u16 = 0x168c;
 const ATHEROS_AR9285_DEVICE: u16 = 0x002b;
+/// AR2427 (`hw.h::AR2427_DEVID_PCIE`): AR9285 silicon with 802.11n bonded
+/// out. Linux `hw.c::ath9k_hw_init` accepts it with the AR9285 reset/EEPROM
+/// path and `ath9k_hw_fill_cap_info` clears `ATH9K_HW_CAP_HT` for this ID.
+const ATHEROS_AR2427_DEVICE: u16 = 0x002c;
+/// (PCI device, unique bus-match name, bound-driver name).
+const DEVICES: [(u16, &str, &str); 2] = [
+    (ATHEROS_AR9285_DEVICE, "ath9k", "ath9k-ar9285"),
+    (ATHEROS_AR2427_DEVICE, "ath9k-ar2427", "ath9k-ar2427"),
+];
+
+/// Exact AR9285-silicon PCI functions; only 0x002b may reach any HT owner.
+pub(crate) fn ar9285_silicon(id: &narf_bus::DeviceId) -> bool {
+    id.vendor == ATHEROS_PCI_VENDOR && DEVICES.iter().any(|(device, _, _)| *device == id.device)
+}
 
 /// Retained identity, calibration and the same native MAC/packet/station owner.
 #[derive(Debug)]
@@ -247,7 +261,7 @@ async fn prepare_packets(owner: &Retained) -> Result<RetainedRadio, packet::Erro
 }
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if device.id.vendor != ATHEROS_PCI_VENDOR || device.id.device != ATHEROS_AR9285_DEVICE {
+    if !ar9285_silicon(&device.id) {
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
     // Reserve the address before any hardware access, including an attempt
@@ -312,7 +326,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     });
     *CONTROLLER.lock() = Some(retained.clone());
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name: alloc::string::String::from("ath9k-ar9285"),
+        name: alloc::string::String::from(
+            DEVICES
+                .iter()
+                .find(|(device, _, _)| *device == device_id)
+                .map_or("ath9k", |(_, _, name)| *name),
+        ),
         kind: narf_drivers::BoundKind::Net,
         pci_vid: Some(vendor),
         pci_did: Some(device_id),
@@ -349,12 +368,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 }
 
 pub fn register() {
-    narf_bus::register_pci_driver(narf_bus::PciMatch {
-        name: "ath9k",
-        kind: narf_bus::MatchKind::VendorDevice {
-            vendor: ATHEROS_PCI_VENDOR,
-            device: ATHEROS_AR9285_DEVICE,
-        },
-        probe,
-    });
+    for (device, name, _) in DEVICES {
+        narf_bus::register_pci_driver(narf_bus::PciMatch {
+            name,
+            kind: narf_bus::MatchKind::VendorDevice {
+                vendor: ATHEROS_PCI_VENDOR,
+                device,
+            },
+            probe,
+        });
+    }
 }
