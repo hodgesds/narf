@@ -25,32 +25,43 @@
 //!   `narf-crypto`'s seed-grade key-material surface (issue #996) and
 //!   refuses — typed error, no fallback — when it is unavailable.
 //!
+//! - **Resume environment** (`resume` + `early_blk`, design §6,
+//!   P4 #1000): the early context that drives this pipeline before
+//!   any restored state is trusted — claims → factor via the
+//!   anchor seam → whole-image verification → the `VerifiedResume`
+//!   handoff — reading the image through a polled, read-only
+//!   virtio-blk reader built for the pre-scheduler environment.
+//!
 //! Seams left for the follow-on lanes, deliberately minimal: P2
 //! (#998) gets the hook key derivations ([`derive_hook_key`],
 //! [`derive_hook_anchor_key`]) and the header's hook-region length
-//! field; P4 (#1000) gets the claims/opened/verified reader pipeline
-//! as its entry surface; P8 (#1006) gets the authenticated
-//! [`RecordedPolicy`] record to enforce. Real anchors are later
-//! lanes too: FIDO token P3 (#999), TPM P6 (#1002), Argon2id
-//! passphrase P7 (#1004).
+//! field; P8 (#1006) gets the authenticated [`RecordedPolicy`]
+//! record to enforce. Real anchors are later lanes too: FIDO
+//! token P3 (#999), TPM P6 (#1002), Argon2id passphrase P7
+//! (#1004); the token resume ceremony that drives them from the
+//! resume environment is P5 (#1001).
 
 use alloc::vec::Vec;
 use core::fmt;
 
 mod anchor;
 mod custody;
+mod early_blk;
 mod entropy;
 mod format;
 mod image;
+mod resume;
 mod slots;
 
 pub use anchor::{AnchorError, AnchorKind, KeyCustodyAnchor, UnwrapCtx, WrapCtx, WrappedSlot};
 pub use custody::Secret32;
+pub use early_blk::{EarlyBlkError, EarlyTransport, PolledBlkReader};
 pub use entropy::{HwKeyEntropy, KeyEntropy};
 pub use format::{BlockStore, ImageClaims, ImageStore, PolicyLevel, RecordedPolicy};
 pub use image::{
     derive_hook_anchor_key, derive_hook_key, open_with_sms, parse_claims, OpenedImage, TrustedImage,
 };
+pub use resume::{attempt_resume, ConsolePrompt, ResumePrompt, ResumeRefusal, VerifiedResume};
 pub use slots::{EpochSlots, SlotArea, SlotRecord};
 
 use anchor::AnchorKind as Kind;
