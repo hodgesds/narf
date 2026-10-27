@@ -293,7 +293,6 @@ rtw89	carrier_frequency_tracking	Periodic carrier-frequency offset tracking	feat
 rtw89	device_removal	Device removal	feature	drivers/wireless/specification/rtw89.md	1009
 rtw89	digital_initial_gain_tracking	Periodic digital initial gain control	feature	drivers/wireless/specification/rtw89.md	715
 rtw89	dma_reclamation	Published DMA/map reclamation	feature	drivers/wireless/specification/rtw89.md	1003
-rtw89	dynamic_edca	Live AP WMM/EDCA parameter updates	feature	drivers/wireless/specification/rtw89.md	933
 rtw89	edcca_tracking	Periodic EDCCA tracking	feature	drivers/wireless/specification/rtw89.md	715
 rtw89	eht	EHT operation on RTL8922A	feature	drivers/wireless/specification/rtw89.md	1018
 rtw89	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specification/rtw89.md	1012

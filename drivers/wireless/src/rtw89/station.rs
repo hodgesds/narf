@@ -37,6 +37,15 @@ pub(super) unsafe trait Io: Send {
     ) -> Result<(), power::Error> {
         Err(power::Error::Unsupported)
     }
+    /// Reprogram EDCA for an already admitted QoS peer.
+    async fn station_update_wmm(
+        &mut self,
+        _: narf_wireless::wmm::Parameters,
+        _: bool,
+        _: &Admission,
+    ) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
     async fn station_prepare_initial(
         &mut self,
         own: [u8; 6],
@@ -205,6 +214,9 @@ pub(super) struct State {
     sequence: u16,
     established: bool,
     wmm: Option<narf_wireless::wmm::Parameters>,
+    /// Newer AP EDCA set observed in a peer beacon, awaiting reprogramming.
+    edca_pending: Option<narf_wireless::wmm::Parameters>,
+    short_slot: bool,
     deadline: u64,
     last_peer: u64,
     last_now: u64,
@@ -242,6 +254,8 @@ impl State {
             sequence: 1,
             established: false,
             wmm: None,
+            edca_pending: None,
+            short_slot: false,
             deadline: 0,
             last_peer: 0,
             last_now: 0,
@@ -303,6 +317,7 @@ impl State {
     }
     pub(super) fn stop(&mut self, io: &mut impl Io) -> Result<(), Error> {
         self.wmm = None;
+        self.edca_pending = None;
         self.admission.close();
         self.established = false;
         self.phase = Phase::Stopped;
@@ -333,6 +348,7 @@ impl State {
         self.admission.close();
         self.established = false;
         self.wmm = None;
+        self.edca_pending = None;
         if let Some(security) = &mut self.security {
             security.fail();
         }
@@ -445,22 +461,6 @@ impl State {
             return false;
         };
         let bytes = frame.bytes();
-        if let Some(p) = self.wmm {
-            if association::observe(frame, 1, self.own, None)
-                .ok()
-                .is_some_and(|candidate| {
-                    candidate.bss.bssid == peer.bss.bssid
-                        && narf_wireless::wmm::Parameters::parse(
-                            &candidate.bss.information_elements,
-                        )
-                        .ok()
-                        .flatten()
-                            != Some(p)
-                })
-            {
-                return true;
-            }
-        }
         bytes.len() >= 26
             && matches!(bytes[0], 0xa0 | 0xc0)
             && bytes[1] & 0xc7 == 0
@@ -468,6 +468,73 @@ impl State {
             && bytes[10..16] == peer.bss.bssid
             && bytes[16..22] == peer.bss.bssid
             && (bytes[4..10] == self.own || bytes[4..10] == [255; 6])
+    }
+    /// mac80211 `ieee80211_sta_wmm_params` on a bound peer beacon/probe
+    /// response. An unchanged parameter-set count (and U-APSD bit) is
+    /// ignored. A new count on an established peer queues an EDCA update
+    /// that the async owner applies; loss of WMM, an inadmissible set or a
+    /// change before the link is open still closes the station.
+    fn observe_wmm(&mut self, frame: &Mpdu) -> Result<(), Error> {
+        let (Some(current), Some(peer)) = (self.wmm, &self.peer) else {
+            return Ok(());
+        };
+        let Some(candidate) = association::observe(frame, 1, self.own, None)
+            .ok()
+            .filter(|candidate| candidate.bss.bssid == peer.bss.bssid)
+        else {
+            return Ok(());
+        };
+        let offered = narf_wireless::wmm::Parameters::parse(&candidate.bss.information_elements)
+            .ok()
+            .flatten();
+        let Some(offered) = offered else {
+            return Err(Error::PeerLost);
+        };
+        let base = self.edca_pending.unwrap_or(current);
+        if offered == base
+            || (offered.parameter_set_count == base.parameter_set_count
+                && offered.uapsd == base.uapsd)
+        {
+            return Ok(());
+        }
+        if self.phase != Phase::Open
+            || offered.uapsd != current.uapsd
+            || super::station_control::wmm_admit(offered, self.short_slot).is_err()
+        {
+            return Err(Error::PeerLost);
+        }
+        self.edca_pending = Some(offered);
+        Ok(())
+    }
+    pub(super) fn edca_pending(&self) -> bool {
+        self.edca_pending.is_some() && self.phase == Phase::Open
+    }
+    /// Apply a queued live EDCA change through the source H2C path.
+    pub(super) async fn apply_edca(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        let Some(next) = self.edca_pending else {
+            return Ok(());
+        };
+        if self.phase != Phase::Open || self.wmm.is_none() {
+            return Err(Error::State);
+        }
+        let result = io
+            .station_update_wmm(next, self.short_slot, &self.admission)
+            .await;
+        match result {
+            Ok(()) => {
+                self.wmm = Some(next);
+                if self.edca_pending == Some(next) {
+                    self.edca_pending = None;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if !self.admission.teardown_pending() {
+                    self.fail(io);
+                }
+                Err(Error::Native(error))
+            }
+        }
     }
     fn delivery(&mut self, delivery: Receipt) -> Result<(), Error> {
         let pending = self.pending.take().ok_or(Error::State)?;
@@ -512,6 +579,7 @@ impl State {
                 break;
             }
             if let Some(frame) = step.frame {
+                self.observe_wmm(&frame)?;
                 if self.lost(&frame) {
                     return Err(Error::PeerLost);
                 }
@@ -763,6 +831,7 @@ impl State {
             if let Some((aid, short)) = self.peer_commit {
                 io.station_commit_peer(bssid, aid, short, &self.admission)
                     .await?;
+                self.short_slot = short;
                 if let Some(p) = self.wmm {
                     io.station_configure_wmm(p, short, &self.admission).await?;
                 }

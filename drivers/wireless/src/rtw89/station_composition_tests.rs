@@ -346,6 +346,20 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
             .configure_wmm(&mut self.control, p, short, admission)
             .await
     }
+    async fn station_update_wmm(
+        &mut self,
+        p: narf_wireless::wmm::Parameters,
+        short: bool,
+        admission: &crate::rtw89::station_control::Admission,
+    ) -> Result<(), crate::rtw89::power::Error> {
+        self.station_allowed()?;
+        if !self.wmm {
+            return Err(crate::rtw89::power::Error::Unsupported);
+        }
+        self.controller
+            .update_wmm(&mut self.control, p, short, admission)
+            .await
+    }
     async fn station_prepare_initial(
         &mut self,
         own: [u8; 6],
@@ -1159,4 +1173,79 @@ fn smoke_rtw8852b_irq_driven_worker_services_rearms_and_halts() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89/station",
     smoke_rtw8852b_irq_driven_worker_services_rearms_and_halts
+);
+
+fn edca_beacon(h: &Harness, qos_info: u8, be_aci_aifsn: u8) -> Vec<u8> {
+    let mut wmm = WMM;
+    wmm[8] = qos_info;
+    wmm[14] = be_aci_aifsn;
+    let mut beacon = h.peer.lock().ap.beacon();
+    beacon.extend_from_slice(&wmm);
+    beacon
+}
+fn edca_rows(h: &Harness) -> Vec<Vec<u8>> {
+    h.model(|io| io.control.packets().to_vec())
+}
+fn smoke_rtw8852b_live_ap_edca_change_reprograms_without_reassociation() -> TestResult {
+    let h = Harness::profile(false, true);
+    if h.join().is_err() {
+        return TestResult::Fail("B WMM association failed");
+    }
+    let before = edca_rows(&h).len();
+    // Same parameter-set count with different content: mac80211 ignores it.
+    let ignored = edca_beacon(&h, 0x81, 0x05);
+    if h.model(|io| io.packets.inject(&ignored)).is_err() {
+        return TestResult::Fail("fixture injection failed");
+    }
+    h.pump();
+    complete(h.device.apply_edca());
+    if h.closed() || edca_rows(&h).len() != before {
+        return TestResult::Fail("unchanged parameter-set count reprogrammed or closed");
+    }
+    // New count, BE AIFSN 3 -> 4: four source H2C rows, link stays up.
+    let changed = edca_beacon(&h, 0x82, 0x04);
+    if h.model(|io| io.packets.inject(&changed)).is_err() {
+        return TestResult::Fail("fixture injection failed");
+    }
+    h.pump();
+    complete(h.device.apply_edca());
+    let rows = edca_rows(&h);
+    let added = rows.get(before..).unwrap_or(&[]);
+    if h.closed() || added.len() != 4 || added.iter().any(|row| row.len() != 20) {
+        return TestResult::Fail("live EDCA change did not program exactly four rows");
+    }
+    if !added
+        .iter()
+        .any(|row| row[8..12] == [0, 0, 0, 0] && row[12..16] != [0x46, 0xa5, 0, 0])
+    {
+        return TestResult::Fail("live EDCA BE row unchanged");
+    }
+    // QoS data still flows on the updated peer.
+    let ethernet = udp_ipv4(AP, OWN, h.plan.lease_ip, h.plan.server_ip, 1, 2, b"edca");
+    if narf_net::iface::send_on(h.device.name(), &ethernet).is_err() {
+        return TestResult::Fail("QoS publish refused after EDCA update");
+    }
+    h.pump();
+    if h.peer.lock().uplink.last() != Some(&ethernet) {
+        return TestResult::Fail("QoS data lost after EDCA update");
+    }
+    // A repeated beacon with the applied count is idempotent.
+    h.model(|io| io.packets.inject(&changed)).ok();
+    h.pump();
+    complete(h.device.apply_edca());
+    if edca_rows(&h).len() != before + 4 {
+        return TestResult::Fail("applied EDCA set reprogrammed again");
+    }
+    // An inadmissible set (BE AIFSN 2) still closes the station.
+    let bad = edca_beacon(&h, 0x83, 0x02);
+    h.model(|io| io.packets.inject(&bad)).ok();
+    h.pump();
+    if !h.closed() {
+        return TestResult::Fail("inadmissible live EDCA set kept the link");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/wmm",
+    smoke_rtw8852b_live_ap_edca_change_reprograms_without_reassociation
 );

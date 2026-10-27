@@ -90,6 +90,18 @@ impl<I: Io> Owner<I> {
         self.io.irq_rearm().map_err(super::station::Error::Native)?;
         Ok(frames)
     }
+    pub(super) fn station_edca_pending(&self) -> bool {
+        self.station
+            .as_ref()
+            .is_some_and(super::station::State::edca_pending)
+    }
+    pub(super) async fn station_apply_edca(&mut self) -> Result<(), super::station::Error> {
+        self.station
+            .as_mut()
+            .ok_or(super::station::Error::State)?
+            .apply_edca(&mut self.io)
+            .await
+    }
     /// Arm interrupt delivery for the started station.
     pub(super) fn station_irq(
         &mut self,

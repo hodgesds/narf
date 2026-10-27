@@ -929,8 +929,8 @@ installed domain and cannot reload a cleared installation.
 
 Raw26-byte headers precede host CCMP; native TXWD uses13 halfwords and complete
 shifted IV/ciphertext/MIC validation. Open/WPA2 RX retains source channel and
-per-key/TID replay checks. Valid bound AP parameter changes close the station;
-dynamic EDCA, HT/BA, U-APSD, TSPEC, priority scheduling and other TIDs remain
+per-key/TID replay checks. Live AP EDCA changes are handled below;
+HT/BA, U-APSD, TSPEC, priority scheduling and other TIDs remain
 unsupported. Four native Rust smokes exercise distinct signed recipes/current
 cap revocation, literal source H2C/peer gates, failing/held ACK and cancellation,
 actual native packet owners through Open/WPA2 and exact bidirectional data,
@@ -957,6 +957,22 @@ checks all12 literal TXWD rates, Open/WPA2 data/CCMP, AP response narrowing,
 current PCI loss and unchanged flags3 behavior. HT/HE, adaptive fallback/MRR
 and full WMM AC/TIDs remain software work with additional source and signed
 qualification dependencies.
+
+### Live AP EDCA updates
+
+Bound peer beacons/probe responses on an open WMM link follow mac80211
+`ieee80211_sta_wmm_params`: an unchanged WMM parameter-set count and
+U-APSD bit is ignored; a new count queues the set. The drain worker then
+applies it outside the synchronous poll through
+`station_control::Controller::update_wmm`, which reprograms all four
+BE/BK/VI/VO rows with the same source H2C class9/function15 commands and
+DONE_ACK receipts as initial setup (`rtw89_ops_conf_tx` ->
+`__rtw89_conf_tx` -> `rtw89_fw_h2c_set_edca`). The QoS peer token stays
+valid during the update, as in Linux; a failed or cancelled update
+invalidates it and closes the station. Loss of WMM, a U-APSD change, a
+change before the link is open, or a set that fails the existing EDCA
+admission (e.g. BE AIFSN<3) still closes the station. Smoke:
+`smoke_rtw8852b_live_ap_edca_change_reprograms_without_reassociation`.
 
 ### Interrupt-driven runtime service (AX v0)
 

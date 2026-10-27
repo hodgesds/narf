@@ -381,6 +381,46 @@ impl Controller {
         attempt.armed = false;
         Ok(())
     }
+    /// Live AP EDCA change on an admitted QoS peer (mac80211
+    /// `ieee80211_sta_wmm_params` -> `rtw89_ops_conf_tx` ->
+    /// `__rtw89_conf_tx` -> `rtw89_fw_h2c_set_edca` per AC). The QoS token
+    /// stays valid while the four rows are reprogrammed, as in Linux; a
+    /// failed/cancelled update invalidates the peer and closes admission.
+    pub(super) async fn update_wmm(
+        &mut self,
+        io: &mut impl Interface,
+        p: narf_wireless::wmm::Parameters,
+        short: bool,
+        admission: &Admission,
+    ) -> Result<(), Error> {
+        let rows = codec::wmm_edca(p, short).ok_or(Error::Unsupported)?;
+        if self.phase() != Phase::Associated
+            || self.admission.as_ref().is_none_or(|a| !a.same(admission))
+        {
+            return Err(Error::Terminal);
+        }
+        let peer = self.peer.clone().ok_or(Error::Terminal)?;
+        peer.current()?;
+        if !peer.qos.load(Ordering::Acquire) {
+            return Err(Error::Terminal);
+        }
+        self.phase = Phase::Failed;
+        let mut attempt = Attempt {
+            admission: admission.clone(),
+            peer: Some(peer.clone()),
+            armed: true,
+        };
+        for row in rows {
+            command(io, 9, 15, &row, true, Some(admission)).await?;
+        }
+        admission.run(|| {
+            peer.current()?;
+            self.phase = Phase::Associated;
+            Ok(())
+        })?;
+        attempt.armed = false;
+        Ok(())
+    }
     pub(super) async fn disconnect(
         &mut self,
         io: &mut impl Interface,

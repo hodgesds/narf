@@ -72,6 +72,26 @@ unsafe impl Io for Startup {
             .configure_wmm(&mut native.station_access(), p, short, admission)
             .await
     }
+    async fn station_update_wmm(
+        &mut self,
+        p: narf_wireless::wmm::Parameters,
+        short: bool,
+        admission: &control::Admission,
+    ) -> Result<(), power::Error> {
+        if !self.station_wmm_allowed()? {
+            return Err(power::Error::Unsupported);
+        }
+        let native = self
+            .firmware
+            .as_mut()
+            .ok_or(power::Error::Terminal)?
+            .transport_mut();
+        self.station_controller
+            .as_mut()
+            .ok_or(power::Error::Terminal)?
+            .update_wmm(&mut native.station_access(), p, short, admission)
+            .await
+    }
     async fn station_prepare_initial(
         &mut self,
         own: [u8; 6],

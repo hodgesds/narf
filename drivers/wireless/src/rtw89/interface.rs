@@ -133,6 +133,29 @@ impl<I: Io + 'static> Device<I> {
         self.line.raise();
         Ok(vector)
     }
+    /// Live AP EDCA updates need awaited H2C receipts, so the worker applies
+    /// them outside the synchronous drain.
+    pub(super) async fn apply_edca(&self) {
+        let pending = self
+            .lifecycle
+            .retained
+            .try_lock()
+            .and_then(|owner| owner.as_ref().map(|o| o.station_edca_pending()))
+            .unwrap_or(false);
+        if !pending || self.closed() {
+            return;
+        }
+        let mut storage = self.lifecycle.retained.lock().await;
+        let Some(owner) = storage.as_mut() else {
+            return;
+        };
+        if owner.station_apply_edca().await.is_err() {
+            self.close();
+            if !self.admission.teardown_pending() {
+                let _ = owner.station_stop();
+            }
+        }
+    }
     pub(super) fn interrupts(&self) -> bool {
         self.interrupts.load(Ordering::Acquire) && !self.closed()
     }
@@ -144,6 +167,7 @@ impl<I: Io + 'static> Device<I> {
     pub(super) async fn service_once(&self) {
         let seen = self.line.raised();
         self.drain();
+        self.apply_edca().await;
         let period = if self.interrupts() {
             IRQ_FALLBACK_MS
         } else {
