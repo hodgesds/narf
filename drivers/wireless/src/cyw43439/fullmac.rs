@@ -13,6 +13,29 @@ pub enum Family {
     Sdio,
     Pcie,
 }
+/// Linux `enum brcmf_fwvendor` (`bus.h`): the firmware branch whose
+/// vendor-specific ABI (`fwvid.h` ops) the attached image implements. It is
+/// fixed by the bus match table (`bcmsdh.c`/`pcie.c`), never by a reply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirmwareVendor {
+    /// `BRCMF_FWVENDOR_WCC`: BCM43602 PCIe and the Broadcom-ID 43439 SDIO
+    /// match; SAE passwords use `BRCMF_C_SET_WSEC_PMK` + `BRCMF_WSEC_PASSPHRASE`.
+    Wcc,
+    /// `BRCMF_FWVENDOR_CYW`: the Cypress-ID 43439 SDIO match; SAE passwords
+    /// use the `sae_password` iovar (`struct brcmf_wsec_sae_pwd_le`).
+    Cyw,
+}
+impl FirmwareVendor {
+    /// Linux `bcmsdh.c` `brcmf_sdmmc_ids` for the two 43439 SDIO identities:
+    /// `BRCMF_SDIO_DEVICE(43439, WCC)` and `CYW_SDIO_DEVICE(43439, CYW)`.
+    pub fn sdio(vendor: u16) -> Self {
+        if vendor == 0x04b4 {
+            Self::Cyw
+        } else {
+            Self::Wcc
+        }
+    }
+}
 pub trait Fullmac: Send {
     const FAMILY: Family;
     const EXTERNAL_CLM: bool;
@@ -45,6 +68,10 @@ pub trait Fullmac: Send {
     /// Current negotiated 802.1D-to-AC rank map (`brcmf_get_assoc_ies`).
     /// Transports whose queueing does not consume it ignore the update.
     fn set_ac_priority(&mut self, _ac_priority: [u8; 8]) {}
+    /// Bus-match firmware vendor (Linux `bus_if->fwvid`).
+    fn firmware_vendor(&self) -> FirmwareVendor {
+        FirmwareVendor::Wcc
+    }
 }
 impl<T: PacketTransport> Fullmac for Runtime<T> {
     const FAMILY: Family = Family::Sdio;
@@ -84,5 +111,8 @@ impl<T: PacketTransport> Fullmac for Runtime<T> {
     fn set_link(&mut self, _: Option<[u8; 6]>) {}
     fn set_ac_priority(&mut self, ac_priority: [u8; 8]) {
         Runtime::set_ac_priority(self, ac_priority)
+    }
+    fn firmware_vendor(&self) -> FirmwareVendor {
+        Runtime::firmware_vendor(self)
     }
 }

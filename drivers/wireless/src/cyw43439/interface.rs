@@ -105,6 +105,10 @@ pub struct Device<R: Fullmac> {
     channels: Vec<u32>,
     supplicant: bool,
     mfp_supported: bool,
+    sae_offload: bool,
+    /// Desired firmware PMKID list (nl80211 SET/DEL/FLUSH_PMKSA); the
+    /// worker and each association reconcile firmware with it.
+    pmksa: IrqSafeSpinLock<super::station::pmksa::Cache>,
     ht_capabilities: [Option<[u8; 26]>; 2],
     vht_capabilities: [Option<[u8; 12]>; 2],
     up: AtomicBool,
@@ -187,6 +191,8 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
         channels: station.channels.iter().map(|&ch| u32::from(ch)).collect(),
         supplicant: station.supplicant,
         mfp_supported: station.supports_management_protection(),
+        sae_offload: station.supports_sae_offload(),
+        pmksa: IrqSafeSpinLock::new(Default::default()),
         ht_capabilities: station.ht_capabilities(),
         vht_capabilities: station.vht_capabilities(),
         state: Mutex::new(State {
@@ -454,10 +460,31 @@ impl<R: Fullmac + 'static> Device<R> {
         }
     }
 
+    async fn apply_pmksa(&self) {
+        let desired = self.pmksa.lock().clone();
+        let Some(mut state) = self.state.try_lock() else {
+            return;
+        };
+        if state.station.programmed_pmksa() == Some(&desired) {
+            return;
+        }
+        if let Err(error) = state.station.sync_pmksa(&desired).await {
+            if state.station.bssid.is_none() {
+                self.link(None);
+            }
+            narf_console::klog!(
+                "{}: FullMAC pmkid_info update failed: {:?}\n",
+                self.name,
+                error
+            );
+        }
+    }
+
     async fn receive_worker(self: Arc<Self>) {
         loop {
             self.deliver_received(self.step());
             self.apply_power_save().await;
+            self.apply_pmksa().await;
             narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
         }
     }
@@ -583,6 +610,32 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
     fn supports_optional_mfp(&self) -> bool {
         self.mfp_supported
     }
+    fn supports_sae_offload(&self) -> bool {
+        self.sae_offload
+    }
+    fn set_pmksa(&self, entry: narf_wireless::PmksaEntry) -> Result<(), i32> {
+        // Linux v1 list rows are {bssid, pmkid}; FILS/SSID-only caching is
+        // not a profile here. Full list or missing BSSID is -EINVAL.
+        let (Some(bssid), Some(pmkid)) = (entry.bssid, entry.pmkid) else {
+            return Err(22);
+        };
+        self.pmksa
+            .lock()
+            .set(super::station::pmksa::Entry {
+                bssid,
+                pmkid,
+                ssid: entry.ssid.unwrap_or_default(),
+            })
+            .map_err(|_| 22)
+    }
+    fn del_pmksa(&self, entry: narf_wireless::PmksaEntry) -> Result<(), i32> {
+        let bssid = entry.bssid.ok_or(22)?;
+        self.pmksa.lock().delete(bssid).map_err(|_| 22)
+    }
+    fn flush_pmksa(&self) -> Result<(), i32> {
+        self.pmksa.lock().flush();
+        Ok(())
+    }
     fn reports_disconnect_events(&self) -> bool {
         true
     }
@@ -645,7 +698,13 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
         if ticket == u64::MAX {
             return Err(WirelessError::HardwareError);
         }
-        let result = state.station.associate(request).await;
+        // Firmware inserts cached PMKIDs into its (re)association RSNE;
+        // the list must be current before the join is issued.
+        let desired = self.pmksa.lock().clone();
+        let result = match state.station.sync_pmksa(&desired).await {
+            Ok(()) => state.station.associate(request).await,
+            Err(error) => Err(error),
+        };
         {
             let _publication = self.publication.lock();
             if self.epoch.load(Ordering::Acquire) != ticket {

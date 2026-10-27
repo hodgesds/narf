@@ -4,7 +4,7 @@
 
 use super::{
     channel, events,
-    fullmac::Fullmac,
+    fullmac::{FirmwareVendor, Fullmac},
     ioctl::{self, Direction},
     runtime::Error,
 };
@@ -31,6 +31,13 @@ pub struct Station<R: Fullmac> {
     scan_id: u16,
     pub supplicant: bool,
     mfp_supported: bool,
+    /// Firmware SAE offload: `cap` token `sae` with FWSUP and MFP.
+    sae_offload: bool,
+    /// `BRCMF_FEAT_PMKID_V3` (`wlc_ver` major >= 13).
+    pmkid_v3: bool,
+    /// Firmware PMKID list known to be programmed; `None` after a refused
+    /// or interrupted `pmkid_info` update until it is rewritten.
+    pmksa: Option<pmksa::Cache>,
     mfp_verified: bool,
     phy: Option<phy::Capabilities>,
     ht_verified: bool,
@@ -131,6 +138,22 @@ impl<R: Fullmac> Station<R> {
             Err(Error::Firmware(_)) => false,
             Err(error) => return Err(error),
         };
+        // Linux feature.c brcmf_feat_firmware_capabilities: BRCMF_FEAT_SAE
+        // is the exact `cap` token "sae " (distinct from "sae_ext"). Linux
+        // cfg80211.c only offloads SAE with BRCMF_FEAT_FWSUP; WPA3 also needs
+        // native MFP, so all three firmware features are required.
+        let sae_offload = supplicant
+            && mfp_supported
+            && match get_var(&mut runtime, "cap", sae::CAP_LEN).await {
+                Ok(caps) => sae::has_capability(&caps, b"sae"),
+                Err(Error::Firmware(_)) => false,
+                Err(error) => return Err(error),
+            };
+        let pmkid_v3 = match get_var(&mut runtime, "wlc_ver", pmksa::WLC_VERSION_LEN).await {
+            Ok(reply) => pmksa::v3_from_wlc_version(&reply)?,
+            Err(Error::Firmware(_)) => false,
+            Err(error) => return Err(error),
+        };
         policy::check_initial(&mut runtime, &policy, &domain)?;
         policy::enable(&mut runtime, &policy, &domain).await?;
         policy::check_initial(&mut runtime, &policy, &domain)?;
@@ -170,6 +193,9 @@ impl<R: Fullmac> Station<R> {
             scan_id: 0,
             supplicant,
             mfp_supported,
+            sae_offload,
+            pmkid_v3,
+            pmksa: Some(pmksa::Cache::default()),
             mfp_verified: false,
             phy,
             ht_verified: false,
@@ -193,6 +219,45 @@ impl<R: Fullmac> Station<R> {
     }
 
     /// Last firmware-acknowledged ordinary station power-save policy.
+    /// Firmware WPA3-Personal SAE offload (`NL80211_EXT_FEATURE_SAE_OFFLOAD`).
+    pub fn supports_sae_offload(&self) -> bool {
+        self.sae_offload
+    }
+
+    /// Firmware PMKID cache revision (`BRCMF_FEAT_PMKID_V3`).
+    pub fn pmkid_v3(&self) -> bool {
+        self.pmkid_v3
+    }
+    /// Firmware PMKID list last programmed, if known.
+    pub fn programmed_pmksa(&self) -> Option<&pmksa::Cache> {
+        self.pmksa.as_ref()
+    }
+
+    /// Reconcile the firmware `pmkid_info` list with `desired`
+    /// (Linux `brcmf_update_pmklist` / `brcmf_pmksa_v3_op`). A firmware
+    /// refusal leaves the list unknown, so the next call rewrites it.
+    pub async fn sync_pmksa(&mut self, desired: &pmksa::Cache) -> Result<(), Error> {
+        if self.pmksa.as_ref() == Some(desired) {
+            return Ok(());
+        }
+        self.poll()?;
+        self.operation = true;
+        self.pmksa = None;
+        let result = pmksa::program(&mut self.runtime, self.pmkid_v3, desired).await;
+        self.operation = false;
+        match result {
+            Ok(()) => self.pmksa = Some(desired.clone()),
+            Err(Error::Firmware(_)) => {}
+            Err(_) => {
+                self.bssid = None;
+                self.connection = None;
+                self.runtime.fail();
+                self.runtime.set_link(None);
+            }
+        }
+        result
+    }
+
     pub fn power_save(&self) -> bool {
         self.power_save
     }
@@ -492,29 +557,37 @@ impl<R: Fullmac> Station<R> {
             .ok_or(Error::Malformed)?
             .clone();
         self.refresh_policy()?;
-        let secure = match &request.security {
+        let akm = match &request.security {
             SecurityConfig::Open
                 if matches!(bss.info.security, narf_wireless::scan::BssSecurity::Open) =>
             {
-                false
+                None
             }
-            SecurityConfig::Wpa2 { .. } if self.supplicant => {
-                let rsn = rsn(&bss.ies).ok_or(Error::Unsupported)?;
-                use narf_wireless::rsn::*;
-                let ccmp = Suite::standard(CIPHER_CCMP_128);
-                if rsn.group_cipher != ccmp
-                    || !rsn.pairwise_ciphers.contains(&ccmp)
-                    || !rsn.akms.contains(&Suite::standard(AKM_PSK))
-                {
-                    return Err(Error::Unsupported);
+            SecurityConfig::Wpa2 { .. } if self.supplicant => Some(narf_wireless::rsn::AKM_PSK),
+            SecurityConfig::Wpa3 { password } if self.sae_offload => {
+                if password.is_empty() || password.len() > sae::PASSWORD_MAX {
+                    return Err(Error::Malformed);
                 }
-                true
+                Some(narf_wireless::rsn::AKM_SAE)
             }
             _ => return Err(Error::Unsupported),
         };
+        if let Some(akm) = akm {
+            let rsn = rsn(&bss.ies).ok_or(Error::Unsupported)?;
+            use narf_wireless::rsn::*;
+            let ccmp = Suite::standard(CIPHER_CCMP_128);
+            if rsn.group_cipher != ccmp
+                || !rsn.pairwise_ciphers.contains(&ccmp)
+                || !rsn.akms.contains(&Suite::standard(akm))
+            {
+                return Err(Error::Unsupported);
+            }
+        }
+        let secure = akm.is_some();
+        let sae = akm == Some(narf_wireless::rsn::AKM_SAE);
         let protection =
-            mfp::Profile::negotiate(&bss.ies, &request.ie, secure, self.mfp_supported)?;
-        validate_association_ies(&request.ie, secure, protection.required())?;
+            mfp::Profile::negotiate_akm(&bss.ies, &request.ie, akm, self.mfp_supported)?;
+        validate_association_ies(&request.ie, protection.akm(), protection.required())?;
         let mut ht = self
             .phy
             .as_ref()
@@ -548,7 +621,8 @@ impl<R: Fullmac> Station<R> {
             if self.phy.is_some() || R::BAND_5GHZ {
                 self.configure_width(grant, occupied).await?;
             }
-            self.tx_int(grant, 22, 0).await?;
+            // brcmf_set_auth_type: NL80211_AUTHTYPE_SAE is 3, Open 0.
+            self.tx_int(grant, 22, if sae { 3 } else { 0 }).await?;
             // Linux configures (and clears for Open) the association RSNE
             // before joining. Pin the firmware offload to this driver's
             // single negotiated PSK/CCMP profile even on a mixed-mode AP.
@@ -562,7 +636,13 @@ impl<R: Fullmac> Station<R> {
             self.tx_var(
                 grant,
                 "wpa_auth",
-                &if secure { 128u32 } else { 0 }.to_le_bytes(),
+                // WPA2_AUTH_PSK / WPA3_AUTH_SAE_PSK (brcmu_wifi.h).
+                &match (secure, sae) {
+                    (_, true) => sae::WPA3_AUTH_SAE_PSK,
+                    (true, false) => 128u32,
+                    _ => 0,
+                }
+                .to_le_bytes(),
             )
             .await?;
             self.tx_int(grant, 134, if secure { 4 } else { 0 }).await?;
@@ -579,6 +659,22 @@ impl<R: Fullmac> Station<R> {
             if self.supplicant {
                 self.tx_var(grant, "sup_wpa", &u32::from(secure).to_le_bytes())
                     .await?;
+            }
+            if let SecurityConfig::Wpa3 { password } = &request.security {
+                // Linux: "clean up user-space RSNE" so firmware builds the
+                // SAE RSNE itself, then the fwvid password ABI.
+                self.tx_var(grant, "wpaie", &[]).await?;
+                match self.runtime.firmware_vendor() {
+                    FirmwareVendor::Cyw => {
+                        let body = sae::cyw_password(password)?;
+                        self.tx_var(grant, "sae_password", &body[..]).await?;
+                    }
+                    FirmwareVendor::Wcc => {
+                        let body = sae::wcc_passphrase(password)?;
+                        self.tx_command(grant, ioctl::WLC_SET_WSEC_PMK, &body[..])
+                            .await?;
+                    }
+                }
             }
             if let SecurityConfig::Wpa2 { psk } = &request.security {
                 // CYW legacy wsec_pmk: length/flags + 64-byte key buffer.
@@ -823,8 +919,12 @@ pub use policy::{GlobalPolicy, PolicySource};
 mod mfp;
 #[path = "station_phy.rs"]
 mod phy;
+#[path = "station_pmksa.rs"]
+pub mod pmksa;
 #[path = "station_probe_ies.rs"]
 mod probe_ies;
+#[path = "station_sae.rs"]
+pub mod sae;
 #[path = "station_wmm.rs"]
 pub mod wmm;
 
@@ -834,7 +934,8 @@ const MAX_REPLY: usize = 1502;
 /// nl80211 PSK-offload contract: validate the requested RSNE, consume a
 /// bounded well-formed IE list, and leave firmware-generated capabilities
 /// and RSNXE to the firmware. External-key profiles remain unsupported.
-fn validate_association_ies(mut ies: &[u8], secure: bool, mfp: bool) -> Result<(), Error> {
+fn validate_association_ies(mut ies: &[u8], akm: u8, mfp: bool) -> Result<(), Error> {
+    let secure = akm != 0;
     use narf_wireless::rsn::*;
     if ies.len() > 2048 {
         return Err(Error::Malformed);
@@ -852,7 +953,7 @@ fn validate_association_ies(mut ies: &[u8], secure: bool, mfp: bool) -> Result<(
             let ccmp = Suite::standard(CIPHER_CCMP_128);
             if rsn.group_cipher != ccmp
                 || rsn.pairwise_ciphers != [ccmp]
-                || rsn.akms != [Suite::standard(AKM_PSK)]
+                || rsn.akms != [Suite::standard(akm)]
                 || rsn.rsn_capabilities & RSN_CAP_MFP_REQUIRED != 0 && !mfp
                 || !rsn.pmkids.is_empty()
                 || rsn

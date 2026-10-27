@@ -886,6 +886,20 @@ pub trait WirelessNetIface: Interface {
     fn set_gtk_rekey_data(&self, _data: GtkRekeyData) -> Result<(), i32> {
         Err(EOPNOTSUPP)
     }
+    /// `cfg80211_ops.set_pmksa` (NL80211_CMD_SET_PMKSA): add or replace a
+    /// cached PMKSA in a FullMAC firmware's PMKID list. mac80211 drivers
+    /// keep the default -EOPNOTSUPP; the supplicant owns their cache.
+    fn set_pmksa(&self, _entry: PmksaEntry) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+    /// `cfg80211_ops.del_pmksa` (NL80211_CMD_DEL_PMKSA).
+    fn del_pmksa(&self, _entry: PmksaEntry) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+    /// `cfg80211_ops.flush_pmksa` (NL80211_CMD_FLUSH_PMKSA).
+    fn flush_pmksa(&self) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
 
     /// `wiphy->wowlan`: capabilities the driver advertises for WoWLAN.
     /// Absence means `GET/SET_WOWLAN` must return `-EOPNOTSUPP`.
@@ -1125,6 +1139,15 @@ pub struct GtkRekeyData {
     /// ath11k GTK-offload wire command does not carry it, but preserving it
     /// retains the nl80211 contract for drivers with AKM-specific engines.
     pub akm: Option<u32>,
+}
+
+/// One `struct cfg80211_pmksa` request (NL80211_ATTR_MAC / _PMKID / _SSID).
+/// A PMKID is an identifier, not key material; no PMK is carried here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PmksaEntry {
+    pub bssid: Option<[u8; 6]>,
+    pub pmkid: Option<[u8; 16]>,
+    pub ssid: Option<Vec<u8>>,
 }
 
 /// One SSID/RSSI match condition for WoWLAN network detection.  The RSSI

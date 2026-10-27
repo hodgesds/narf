@@ -61,6 +61,7 @@ pub struct Runtime<T: PacketTransport> {
     events: VecDeque<Event>,
     data: VecDeque<Vec<u8>>,
     failed: bool,
+    vendor: super::fullmac::FirmwareVendor,
 }
 impl<T: PacketTransport> core::fmt::Debug for Runtime<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -89,7 +90,19 @@ impl<T: PacketTransport> Runtime<T> {
             events: VecDeque::new(),
             data: VecDeque::new(),
             failed: false,
+            vendor: super::fullmac::FirmwareVendor::Wcc,
         }
+    }
+
+    /// Record the SDIO match's firmware vendor (Linux `brcmf_sdmmc_ids`:
+    /// Broadcom-ID 43439 is WCC, Cypress-ID 43439 is CYW).
+    pub fn with_firmware_vendor(mut self, vendor: super::fullmac::FirmwareVendor) -> Self {
+        self.vendor = vendor;
+        self
+    }
+
+    pub fn firmware_vendor(&self) -> super::fullmac::FirmwareVendor {
+        self.vendor
     }
 
     pub fn is_failed(&self) -> bool {

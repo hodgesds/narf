@@ -273,6 +273,7 @@ impl Harness {
             .collect();
         let supplicant = station.supplicant;
         let mfp_supported = station.supports_management_protection();
+        let sae_offload = station.supports_sae_offload();
         let ht_capabilities = station.ht_capabilities();
         let vht_capabilities = station.vht_capabilities();
         let (rx, consumer) = narf_ipc::channel();
@@ -290,6 +291,8 @@ impl Harness {
             channels,
             supplicant,
             mfp_supported,
+            sae_offload,
+            pmksa: narf_lib::sync::IrqSafeSpinLock::new(Default::default()),
             ht_capabilities,
             vht_capabilities,
             up: AtomicBool::new(false),

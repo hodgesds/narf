@@ -34,6 +34,8 @@ mod lifetime_tests;
 mod mfp_tests;
 #[path = "optional_mfp_tests.rs"]
 mod optional_mfp_tests;
+#[path = "pmksa_tests.rs"]
+mod pmksa_tests;
 #[path = "probe_ies_tests.rs"]
 mod probe_ies_tests;
 #[path = "wmm_tests.rs"]
@@ -251,6 +253,7 @@ impl Harness {
         let channels = station.channels.iter().map(|&ch| u32::from(ch)).collect();
         let supplicant = station.supplicant;
         let mfp_supported = station.supports_management_protection();
+        let sae_offload = station.supports_sae_offload();
         let ht_capabilities = station.ht_capabilities();
         let vht_capabilities = station.vht_capabilities();
         let (rx, rx_consumer) = narf_ipc::channel();
@@ -268,6 +271,8 @@ impl Harness {
             channels,
             supplicant,
             mfp_supported,
+            sae_offload,
+            pmksa: IrqSafeSpinLock::new(Default::default()),
             ht_capabilities,
             vht_capabilities,
             up: AtomicBool::new(false),

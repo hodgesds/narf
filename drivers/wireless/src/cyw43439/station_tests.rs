@@ -195,6 +195,20 @@ impl Bus {
             })
             .collect()
     }
+    /// Every control request `(command, body)` in transmit order.
+    pub(in crate::cyw43439) fn control_log(&self) -> Vec<(u32, Vec<u8>)> {
+        self.tx
+            .iter()
+            .filter(|bytes| bytes[5] & 15 == 0)
+            .map(|bytes| {
+                let size = usize::from(HwHeader::decode(bytes).unwrap().length);
+                (
+                    BcdcHeader::decode(&bytes[12..]).unwrap().cmd,
+                    bytes[28..size].to_vec(),
+                )
+            })
+            .collect()
+    }
     pub(in crate::cyw43439) fn control_count(&self) -> usize {
         self.tx
             .iter()
@@ -926,7 +940,16 @@ fn smoke_cyw_station_rejects_inconsistent_association_ies() -> TestResult {
         (vec![48, 20, 1], true, Error::Malformed),
         (vec![127], true, Error::Malformed),
     ] {
-        if validate_association_ies(&ies, secure, false) != Err(expected) {
+        if validate_association_ies(
+            &ies,
+            if secure {
+                narf_wireless::rsn::AKM_PSK
+            } else {
+                0
+            },
+            false,
+        ) != Err(expected)
+        {
             return TestResult::Fail(
                 "association IE policy admitted malformed or unsupported security",
             );

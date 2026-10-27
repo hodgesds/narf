@@ -9,6 +9,8 @@ use narf_wireless::rsn::*;
 pub(super) struct Profile {
     mode: u32,
     ap_mfp: u16,
+    /// Negotiated AKM suite type: `AKM_PSK` or (SAE offload) `AKM_SAE`.
+    akm: u8,
 }
 
 /// Shared decoding intentionally accepts optional RSN fields. This native
@@ -86,15 +88,33 @@ impl Profile {
         secure: bool,
         supported: bool,
     ) -> Result<Self, Error> {
+        Self::negotiate_akm(ap, sme, secure.then_some(AKM_PSK), supported)
+    }
+    /// `akm` is `None` for Open. WPA3-Personal (`AKM_SAE`) mandates PMF
+    /// (WPA3 spec §2.2; IEEE 802.11-2020 12.4.2): an SAE profile is never
+    /// negotiated with MFP disabled, and an empty request RSNE selects
+    /// capable(1) or, for an MFPR AP, required(2), as Linux derives `mfp`
+    /// from the supplicant's RSNE in `brcmf_cfg80211_connect`.
+    pub(super) fn negotiate_akm(
+        ap: &[u8],
+        sme: &[u8],
+        akm: Option<u8>,
+        supported: bool,
+    ) -> Result<Self, Error> {
         let ap = rsn(ap)?;
         let sme = rsn(sme)?;
-        if !secure {
+        let Some(akm) = akm else {
             return if ap.is_none() && sme.is_none() {
-                Ok(Self { mode: 0, ap_mfp: 0 })
+                Ok(Self {
+                    mode: 0,
+                    ap_mfp: 0,
+                    akm: 0,
+                })
             } else {
                 Err(Error::Unsupported)
             };
-        }
+        };
+        let sae = akm == AKM_SAE;
         let ap = ap.ok_or(Error::Unsupported)?;
         for ie in core::iter::once(&ap).chain(sme.iter()) {
             let bits = ie.rsn_capabilities;
@@ -111,8 +131,12 @@ impl Profile {
             Some(bits) if bits & RSN_CAP_MFP_REQUIRED != 0 => 2,
             Some(RSN_CAP_MFP_CAPABLE) => 1,
             None if ap_mfp & RSN_CAP_MFP_REQUIRED != 0 => 2,
+            None if sae => 1,
             _ => 0,
         };
+        if sae && (mode == 0 || ap_mfp & RSN_CAP_MFP_CAPABLE == 0) {
+            return Err(Error::Unsupported);
+        }
         if sme
             .as_ref()
             .is_some_and(|ie| mode != 0 && ie.rsn_capabilities & !flags != 0)
@@ -127,7 +151,10 @@ impl Profile {
         {
             return Err(Error::Unsupported);
         }
-        Ok(Self { mode, ap_mfp })
+        Ok(Self { mode, ap_mfp, akm })
+    }
+    pub(super) fn akm(self) -> u8 {
+        self.akm
     }
     pub(super) fn required(self) -> bool {
         self.mode == 2
@@ -143,6 +170,9 @@ impl Profile {
     }
     pub(super) fn rsn(self) -> RsnIe {
         let mut ie = RsnIe::wpa2_psk_ccmp();
+        if self.akm != 0 {
+            ie.akms = alloc::vec![Suite::standard(self.akm)];
+        }
         if self.mode != 0 {
             ie.rsn_capabilities = RSN_CAP_MFP_CAPABLE
                 | if self.required() {
@@ -209,7 +239,7 @@ impl<R: Fullmac> Station<R> {
             let ccmp = Suite::standard(CIPHER_CCMP_128);
             if actual.group_cipher != ccmp
                 || !actual.pairwise_ciphers.contains(&ccmp)
-                || !actual.akms.contains(&Suite::standard(AKM_PSK))
+                || !actual.akms.contains(&Suite::standard(profile.akm))
                 || !actual.pmkids.is_empty()
                 || actual.rsn_capabilities & (RSN_CAP_MFP_REQUIRED | RSN_CAP_MFP_CAPABLE)
                     != profile.ap_mfp
