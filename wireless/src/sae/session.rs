@@ -57,6 +57,8 @@ use super::pt::{pt_h2e_bytes, pwe_from_pt, pwe_hunt_and_peck, pwe_valid};
 pub const EID_EXT_REJECTED_GROUPS: u8 = 92;
 /// `WLAN_EID_EXT_ANTI_CLOGGING_TOKEN`.
 pub const EID_EXT_ANTI_CLOGGING_TOKEN: u8 = 93;
+/// `WLAN_EID_EXT_AKM_SUITE_SELECTOR` (hostap ieee802_11_defs.h).
+pub const EID_EXT_AKM_SUITE_SELECTOR: u8 = 114;
 
 /// How the session derives its PWE (hostap `sae->h2e`).
 #[derive(Debug, Clone)]
@@ -132,6 +134,11 @@ pub struct SaeSession {
     pmkid: Option<[u8; 16]>,
     /// The peer's Rejected Groups element payload (H2E), the keyseed salt.
     peer_rejected_groups: Vec<u8>,
+    /// Our AKM Suite Selector element (hostap `own_akm_suite_selector`),
+    /// sent in every Commit for an SAE-EXT-KEY (AKM 24) session.
+    own_akm_suite: Option<[u8; 4]>,
+    /// The peer Commit's AKM Suite Selector (`peer_akm_suite_selector`).
+    peer_akm_suite: Option<[u8; 4]>,
 }
 
 impl SaeSession {
@@ -212,7 +219,28 @@ impl SaeSession {
             test_rand_mask: None,
             pmkid: None,
             peer_rejected_groups: Vec::new(),
+            own_akm_suite: None,
+            peer_akm_suite: None,
         }
+    }
+
+    /// Bind this H2E session to an AKM Suite Selector element (hostap
+    /// `sae_write_commit` for `wpa_key_mgmt_sae_ext_key`): every Commit
+    /// carries it and the peer's Commit must carry the same selector
+    /// (`sae_parse_commit`: "AKM suite selector mismatch"). hostap parses
+    /// the peer's element only under H2E, so a hunting-and-pecking session
+    /// cannot complete AKM 24 and is refused here.
+    pub fn with_akm_suite_selector(mut self, suite: [u8; 4]) -> Result<Self, SaeError> {
+        if !self.is_h2e() || self.state != SaeState::Nothing {
+            return Err(SaeError::Protocol);
+        }
+        self.own_akm_suite = Some(suite);
+        Ok(self)
+    }
+
+    /// The peer Commit's AKM Suite Selector, once processed.
+    pub fn peer_akm_suite_selector(&self) -> Option<[u8; 4]> {
+        self.peer_akm_suite
     }
 
     /// Whether the PWE is Hash-to-Element (hostap `sae->h2e`): the Commit
@@ -258,6 +286,10 @@ impl SaeSession {
             out.push((1 + t.len()) as u8);
             out.push(EID_EXT_ANTI_CLOGGING_TOKEN);
             out.extend_from_slice(t);
+        }
+        if let Some(suite) = self.own_akm_suite {
+            out.extend_from_slice(&[0xFF, 5, EID_EXT_AKM_SUITE_SELECTOR]);
+            out.extend_from_slice(&suite);
         }
         out
     }
@@ -441,6 +473,7 @@ impl SaeSession {
         // H2E elements after the element (Rejected Groups; the
         // Anti-Clogging Token Container is skipped).
         let mut rejected = Vec::new();
+        let mut peer_akm = None;
         if self.is_h2e() {
             let mut rest = &peer_commit[2 + 32 + 64..];
             while rest.len() >= 3 && rest[0] == 0xFF {
@@ -464,8 +497,20 @@ impl SaeSession {
                     }
                     rejected = groups.to_vec();
                 }
+                if rest[2] == EID_EXT_AKM_SUITE_SELECTOR {
+                    // sae_parse_akm_suite_selector: at least one selector.
+                    let body = &rest[3..2 + len];
+                    peer_akm = Some(
+                        <[u8; 4]>::try_from(body.get(..4).ok_or(SaeError::InvalidParameters)?)
+                            .map_err(|_| SaeError::InvalidParameters)?,
+                    );
+                }
                 rest = &rest[2 + len..];
             }
+        }
+        if self.own_akm_suite.is_some() && self.own_akm_suite != peer_akm {
+            // "SAE: AKM suite selector mismatch".
+            return Err(SaeError::InvalidParameters);
         }
         // Reflection check: the peer sent our own scalar and element.
         if peer_scalar == self.commit_scalar
@@ -476,6 +521,7 @@ impl SaeSession {
         self.peer_scalar = peer_scalar;
         self.peer_element = peer_element;
         self.peer_rejected_groups = rejected;
+        self.peer_akm_suite = peer_akm;
 
         // K = rand · (peer_scalar · PWE + peer_element).
         let pwe = self.pwe.ok_or(SaeError::Protocol)?;
@@ -1176,6 +1222,68 @@ mod session_tests {
         "wireless/sae",
         smoke_sae_commit_parse_rejects_and_token_placement
     );
+
+    /// SAE-EXT-KEY (AKM 24): both Commits carry the AKM Suite Selector
+    /// element after the H2E elements (hostap `sae_write_commit`), a
+    /// matching peer completes with agreeing PMKs, and a missing or
+    /// different peer selector fails (`sae_parse_commit` mismatch). A
+    /// hunting-and-pecking session cannot bind AKM 24.
+    fn smoke_sae_ext_key_akm_suite_selector() -> TestResult {
+        const AKM24: [u8; 4] = [0x00, 0x0F, 0xAC, 24];
+        let mk = |own, peer, seed| {
+            SaeSession::new_h2e_bytes(b"net", b"pw", own, peer).with_test_seed([seed; 64])
+        };
+        let mut a = mk([0x11; 6], [0x22; 6], 0xA1)
+            .with_akm_suite_selector(AKM24)
+            .unwrap();
+        let mut b = mk([0x22; 6], [0x11; 6], 0xB2)
+            .with_akm_suite_selector(AKM24)
+            .unwrap();
+        let ca = a.build_commit();
+        let cb = b.build_commit();
+        if ca.len() != 98 + 7
+            || ca[98..] != [0xFF, 5, EID_EXT_AKM_SUITE_SELECTOR, 0, 0x0F, 0xAC, 24]
+        {
+            return TestResult::Fail("AKM suite selector element layout");
+        }
+        if a.on_commit(&cb).is_err() || b.on_commit(&ca).is_err() {
+            return TestResult::Fail("matching AKM 24 commits refused");
+        }
+        let (fa, fb) = (a.build_confirm(), b.build_confirm());
+        if a.on_confirm(&fb).is_err()
+            || b.on_confirm(&fa).is_err()
+            || a.pmk() != b.pmk()
+            || a.peer_akm_suite_selector() != Some(AKM24)
+        {
+            return TestResult::Fail("AKM 24 handshake did not agree");
+        }
+        let mut c = mk([0x11; 6], [0x22; 6], 0xC3)
+            .with_akm_suite_selector(AKM24)
+            .unwrap();
+        c.build_commit();
+        let mut plain = mk([0x22; 6], [0x11; 6], 0xD4);
+        if c.on_commit(&plain.build_commit()) != Err(SaeError::InvalidParameters) {
+            return TestResult::Fail("missing peer AKM selector accepted");
+        }
+        let mut d = mk([0x11; 6], [0x22; 6], 0xE5)
+            .with_akm_suite_selector(AKM24)
+            .unwrap();
+        d.build_commit();
+        let mut wrong = cb.clone();
+        let n = wrong.len();
+        wrong[n - 1] = 8;
+        if d.on_commit(&wrong) != Err(SaeError::InvalidParameters) {
+            return TestResult::Fail("mismatched peer AKM selector accepted");
+        }
+        if SaeSession::new_hunt_and_peck(b"pw", [0x11; 6], [0x22; 6])
+            .with_akm_suite_selector(AKM24)
+            .is_ok()
+        {
+            return TestResult::Fail("hunting-and-pecking AKM 24 accepted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/sae", smoke_sae_ext_key_akm_suite_selector);
 
     impl SaeSession {
         fn commit_then(mut self, peer: &[u8]) -> Result<(), SaeError> {
