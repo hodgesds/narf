@@ -23,6 +23,8 @@ mod greenfield_tests;
 mod ht20_tests;
 #[path = "ht40_tests.rs"]
 mod ht40_tests;
+#[path = "ht_protection_tests.rs"]
+mod ht_protection_tests;
 #[path = "receive_epoch_tests.rs"]
 mod receive_epoch_tests;
 #[path = "rx_ba_tests.rs"]

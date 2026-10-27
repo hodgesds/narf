@@ -203,9 +203,8 @@ impl Profile {
         ies: &[u8],
     ) -> Result<Self, Error> {
         let vht = n.vht().ok_or(Error::UnsupportedFirmware)?;
-        if n.ht().operation().protection() != 0 {
-            return Err(Error::UnsupportedFirmware);
-        }
+        // HT protection modes 1-3 are firmware-owned on CONNAC2 (see
+        // ht20::DYNAMIC_OPERATION); nothing native depends on mode 0.
         let width = match n.width() {
             phy::Width::Twenty => 0,
             phy::Width::Forty => 1,
@@ -270,7 +269,7 @@ impl Profile {
         ((self.capability >> 23) & 7) as u8
     }
     pub(crate) fn matches(self, ies: &[u8]) -> bool {
-        ApElements::parse(ies).is_ok_and(|ap| ap == self.ap)
+        ApElements::parse(ies).is_ok_and(|ap| super::ht20::same_ap_phy(&self.ap, &ap))
     }
     pub(crate) fn state(self) -> u8 {
         self.width | ((self.tx_streams - 1) << 4)

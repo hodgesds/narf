@@ -3,6 +3,32 @@
 use super::firmware_transport::{Error, RadioInfo, ScanBss};
 use alloc::{vec, vec::Vec};
 
+/// HT Operation subset-2 bits a BSS updates while stations stay associated
+/// (IEEE 802.11-2020 9.4.2.56: HT Protection b0-1, Nongreenfield HT STAs
+/// Present b2, OBSS Non-HT STAs Present b4). Linux mt7921 programs none of
+/// them: `mt7921_bss_info_changed` ignores BSS_CHANGED_HT/ERP_CTS_PROT and the
+/// CONNAC2 BSS/STA records carry no HT protection field, so protection is
+/// firmware-owned. Beacon tracking therefore compares the HT Operation without
+/// these bits, while any width/secondary/basic-MCS change still ends the link.
+pub(crate) const DYNAMIC_OPERATION: u8 = 0b1_0111;
+
+pub(crate) fn static_operation(mut operation: [u8; 22]) -> [u8; 22] {
+    operation[2] &= !DYNAMIC_OPERATION;
+    operation
+}
+
+/// Bound AP PHY facts are unchanged apart from dynamic HT protection state.
+pub(crate) fn same_ap_phy(
+    bound: &narf_wireless::association::phy::ApElements,
+    current: &narf_wireless::association::phy::ApElements,
+) -> bool {
+    bound.ht_capability() == current.ht_capability()
+        && bound.vht_capability() == current.vht_capability()
+        && bound.vht_operation() == current.vht_operation()
+        && bound.ht_operation().map(static_operation)
+            == current.ht_operation().map(static_operation)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Profile {
     capability: [u8; 26],
@@ -86,6 +112,16 @@ impl Profile {
             return Err(Error::UnsupportedFirmware);
         }
         Self::parse(&bss.information_elements, bss.channel)
+    }
+    /// Equality apart from the dynamic HT protection bits of the operation.
+    pub(crate) fn same_static(self, other: Self) -> bool {
+        Self {
+            operation: static_operation(self.operation),
+            ..self
+        } == Self {
+            operation: static_operation(other.operation),
+            ..other
+        }
     }
     pub(crate) fn parse(mut ies: &[u8], channel: u8) -> Result<Self, Error> {
         if ies.len() > 2048 {

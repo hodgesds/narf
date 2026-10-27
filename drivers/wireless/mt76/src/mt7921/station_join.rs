@@ -724,7 +724,8 @@ impl<B: Backend> Session<B> {
                     && f[10..16] == peer
                     && f[16..22] == peer
                     && (f[4..10] == own || f[4..10] == [255; 6])
-                    && narf_wireless::association::phy::ApElements::parse(&f[36..]) != Ok(ap)
+                    && !narf_wireless::association::phy::ApElements::parse(&f[36..])
+                        .is_ok_and(|current| crate::mt7921::ht20::same_ap_phy(&ap, &current))
                 {
                     self.peer_lost = true;
                     self.rx_ba.fence();
@@ -759,9 +760,9 @@ impl<B: Backend> Session<B> {
                     && header[16..22] == peer
                     && (header[4..10] == own || header[4..10] == [0xff; 6])
                     && frame.get(36..).is_some_and(|ies| {
-                        crate::mt7921::ht20::Profile::parse(ies, channel)
+                        !crate::mt7921::ht20::Profile::parse(ies, channel)
                             .and_then(|p| p.with_secondary(profile.negotiated_secondary()))
-                            != Ok(profile)
+                            .is_ok_and(|current| current.same_static(profile))
                     })
                 {
                     self.peer_lost = true;

@@ -239,9 +239,6 @@ impl JoinPlan {
                 return Err(NativeError::UnsupportedFirmware);
             }
             super::vht::check_offer(offer)?;
-            if offer.ht().operation().protection() != 0 {
-                return Err(NativeError::UnsupportedFirmware);
-            }
             plan.ht20 = Some(super::ht20::Profile::from_shared(
                 offer.ht(),
                 permission.native_width(),
@@ -329,10 +326,6 @@ impl JoinPlan {
             }
         }
         if let Some(n) = self.common.negotiated_phy() {
-            if n.ht().operation().protection() != 0 {
-                self.cancel();
-                return Err(Error::Protocol);
-            }
             if n.vht().is_none() {
                 let width = match n.width() {
                     narf_wireless::association::phy::Width::Twenty => 0,

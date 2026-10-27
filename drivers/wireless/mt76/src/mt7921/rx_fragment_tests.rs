@@ -1,6 +1,6 @@
 //! Native station RX defragmentation (Linux `ieee80211_rx_h_defragment`).
 use super::*;
-use fragment::{Cache, MAX_AGE_NS, MAX_MSDU};
+use fragment::{Cache, ENTRIES, MAX_AGE_NS, MAX_MSDU};
 
 const OWN: [u8; 6] = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
 const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];
@@ -234,11 +234,15 @@ fn mt76_protected_rx_defragments_with_sequential_pn_and_replay() -> TestResult {
     }
     // A receive-epoch renewal (every rekey path) discards partial MSDUs.
     let frame = fragment_frame(40, 0, true, true, 0, &MSDU[..5]);
+    let before = session.rx_fragments.pending();
     session
         .backend
         .packets
         .push_back(fragment_packet(&frame, Some(200), true, false));
-    if session.receive_ethernet() != Ok(None) || session.rx_fragments.pending() != 1 {
+    // Earlier rejected bursts may still hold a stale first fragment (seq 21).
+    if session.receive_ethernet() != Ok(None)
+        || session.rx_fragments.pending() != (before + 1).min(ENTRIES)
+    {
         return TestResult::Fail("first fragment not retained");
     }
     session.renew_receive_epoch().unwrap();
