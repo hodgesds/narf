@@ -27,6 +27,7 @@
 
 extern crate alloc;
 
+pub mod acp3x;
 pub mod acp6;
 pub mod acp63;
 pub mod acp63_sdw;
@@ -430,6 +431,7 @@ impl AudioReader {
     fn open_live(cap: Cap<AudioStreamCap, Read>) -> Result<Self, AudioReadError> {
         let card = acp63::capture_card()
             .or_else(acp63_sdw::capture_card)
+            .or_else(acp3x::capture_card)
             .or_else(hda::capture_card)
             .ok_or(AudioReadError::NoActiveStream)?;
         let params = narf_drivers_sound::default_hw_params(card, true)

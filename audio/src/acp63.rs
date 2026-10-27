@@ -400,7 +400,36 @@ pub fn is_probed() -> bool {
 pub fn capture_card() -> Option<u32> {
     CONTROLLER.lock().as_ref().map(|(_, card)| *card)
 }
+/// ACP generation behind the shared 1022:15e2 PCI id. The bus match
+/// is registered once (this module's `register_pci_driver`); the PCI
+/// revision selects the register map, exactly as Linux splits
+/// snd_pci_ps (6.x) from rn-pci-acp3x (3.x) on the same device id.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Generation {
+    Acp3x,
+    Acp63,
+}
+pub(crate) fn generation(revision: u8) -> Option<Generation> {
+    match revision {
+        REVISION => Some(Generation::Acp63),
+        crate::acp3x::REVISION => Some(Generation::Acp3x),
+        _ => None,
+    }
+}
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+    use narf_bus::ProbeError;
+    let revision =
+        narf_bus::pci::read_config32(&cap, &device, 8).map_err(|_| ProbeError::BadDevice)? as u8;
+    if device.id.vendor != VENDOR || device.id.device != DEVICE || device.id.class != 0x048000 {
+        return Err(ProbeError::NotForThisDriver);
+    }
+    match generation(revision) {
+        Some(Generation::Acp63) => probe_63(device, cap),
+        Some(Generation::Acp3x) => crate::acp3x::probe(device, cap),
+        None => Err(ProbeError::NotForThisDriver),
+    }
+}
+fn probe_63(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     use narf_bus::ProbeError;
     let revision =
         narf_bus::pci::read_config32(&cap, &device, 8).map_err(|_| ProbeError::BadDevice)? as u8;
@@ -701,4 +730,22 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("audio/acp63", native_acp63_overrun_and_pin_config);
+
+    fn native_acp_generation_dispatch() -> TestResult {
+        // The shared PCI id dispatches on revision only: 0x63 is the
+        // Phoenix ACP 6.3 map, 0x01 the Renoir ACP 3.x map, and every
+        // other revision (including the 6.0/6.2 silicon this driver
+        // does not implement) stays unbound.
+        if generation(0x63) != Some(Generation::Acp63)
+            || generation(0x01) != Some(Generation::Acp3x)
+            || generation(0x00).is_some()
+            || generation(0x60).is_some()
+            || generation(0x62).is_some()
+            || generation(0x64).is_some()
+        {
+            return TestResult::Fail("ACP generation dispatch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/acp63", native_acp_generation_dispatch);
 }

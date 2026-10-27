@@ -343,6 +343,13 @@ pub struct ModesetPlan {
     pub connector_idx: u8,
     pub timing: ModeTiming,
     pub writes: Vec<DcnWrite>,
+    /// Display-audio enable writes for an external HDMI/DP
+    /// connector (`amdgpu_dcn20_audio`), empty when the connector
+    /// carries no audio endpoint on this path or the caller did not
+    /// resolve the BASE_IDX 2 segment. Execute AFTER `writes`: the
+    /// video sequence ends with OTG_MASTER_EN, and audio starts only
+    /// once scanout is live.
+    pub audio_writes: Vec<DcnWrite>,
 }
 
 /// Build a modeset plan against the given KMS state + family.
@@ -350,7 +357,10 @@ pub struct ModesetPlan {
 /// [`amdgpu_dcn::execute_modeset`].
 ///
 /// `dcn_base` is the discovery-resolved DCN block base
-/// (`amdgpu::ip_block_base(HW_ID_DCN, 0)`).
+/// (`amdgpu::ip_block_base(HW_ID_DCN, 0)`). `dcn_base2` is the
+/// BASE_IDX 2 segment (`ip_block_base_idx(HW_ID_DCN, 0, 2)`), where
+/// the DIG/AFMT and Azalia blocks live; pass 0 when unresolved, and
+/// the plan carries no display audio.
 #[allow(clippy::too_many_arguments)] // wide hardware/ABI signature: each arg maps to a distinct DCN register group
 pub fn plan_modeset(
     kms: &KmsState,
@@ -362,6 +372,7 @@ pub fn plan_modeset(
     stride_pixels: u32,
     surface_phys: u64,
     dcn_base: u32,
+    dcn_base2: u32,
 ) -> Result<ModesetPlan, KmsError> {
     let conn = kms
         .connectors
@@ -386,12 +397,103 @@ pub fn plan_modeset(
         Family::Phoenix => dcn20_modeset_sequence(&timing, surface_phys, stride_pixels, dcn_base),
         _ => dcn20_modeset_sequence(&timing, surface_phys, stride_pixels, dcn_base),
     };
+    // Display audio rides the same plan for the families the 2.0
+    // sequence serves (DCN 2.0 and 3.1.4 share the audio register
+    // map). The baseline stream is LPCM stereo at 48 kHz; sink SAD
+    // negotiation feeding richer requests is follow-up work.
+    let audio_writes = if dcn_base2 != 0 {
+        display_audio_request(kms, conn, crtc_idx, &timing)
+            .map(|req| {
+                crate::amdgpu_dcn20_audio::dcn20_audio_enable_sequence(dcn_base, dcn_base2, &req)
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     Ok(ModesetPlan {
         crtc_idx,
         connector_idx,
         timing,
         writes,
+        audio_writes,
     })
+}
+
+/// The display-audio request for a connector being modeset, if the
+/// connector is an external HDMI/DP output. The DIG and the Azalia
+/// endpoint follow the bound encoder's ATOM instance (falling back
+/// to the connector's own instance); the DTO source is the bound
+/// CRTC's pipe.
+fn display_audio_request(
+    kms: &KmsState,
+    conn: &Connector,
+    crtc_idx: u8,
+    timing: &ModeTiming,
+) -> Option<crate::amdgpu_dcn20_audio::Dcn20AudioRequest> {
+    use crate::amdgpu_dcn20_audio::{Dcn20AudioRequest, DisplayAudioSignal};
+    let signal = match conn.kind {
+        ConnectorKind::HdmiA | ConnectorKind::HdmiB => DisplayAudioSignal::Hdmi,
+        ConnectorKind::Dp => DisplayAudioSignal::Dp,
+        _ => return None,
+    };
+    let dig = conn
+        .bound_encoder
+        .and_then(|e| kms.encoders.get(e as usize))
+        .map_or(conn.instance, |e| e.instance);
+    let otg = kms.crtcs.get(crtc_idx as usize)?.pipe;
+    Some(Dcn20AudioRequest {
+        otg,
+        dig,
+        endpoint: dig,
+        signal,
+        pixel_clock_khz: timing.pixel_clock_khz,
+        h_total: timing.h_total,
+        h_active: timing.h_active,
+        speakers: 0x01,
+        sample_rate_hz: 48_000,
+    })
+}
+
+/// Display-audio teardown writes for a connector, or `None` when
+/// the connector has no audio endpoint on this path. Execute the
+/// returned writes BEFORE the OTG master-enable clear that tears
+/// the mode down: the sequence mutes and disables the endpoint
+/// while scanout is still live, the mirror of `ModesetPlan::
+/// audio_writes` starting after it.
+pub fn plan_audio_disable(
+    kms: &KmsState,
+    connector_idx: u8,
+    dcn_base: u32,
+    dcn_base2: u32,
+) -> Option<Vec<DcnWrite>> {
+    if dcn_base2 == 0 {
+        return None;
+    }
+    let conn = kms.connectors.get(connector_idx as usize)?;
+    let crtc_idx = conn.bound_crtc?;
+    // The disable builder reads only the routing fields; the timing
+    // fields are inert there, so a zeroed timing is honest.
+    let timing = ModeTiming {
+        h_active: 0,
+        v_active: 0,
+        h_total: 0,
+        v_total: 0,
+        h_blank_start: 0,
+        h_blank_end: 0,
+        v_blank_start: 0,
+        v_blank_end: 0,
+        h_sync_start: 0,
+        h_sync_end: 0,
+        v_sync_start: 0,
+        v_sync_end: 0,
+        pixel_clock_khz: 0,
+        h_sync_positive: false,
+        v_sync_positive: false,
+    };
+    let req = display_audio_request(kms, conn, crtc_idx, &timing)?;
+    Some(crate::amdgpu_dcn20_audio::dcn20_audio_disable_sequence(
+        dcn_base, dcn_base2, &req,
+    ))
 }
 
 /// Apply a modeset plan to a KMS state — bookkeeping only,
@@ -424,7 +526,9 @@ pub fn mark_active(kms: &mut KmsState, crtc_idx: u8) {
 
 /// Tear down a CRTC's mode — reset state to `Inactive`. The
 /// driver still needs to write OTG_MASTER_EN=0 itself; this is
-/// the post-write bookkeeping.
+/// the post-write bookkeeping. For a connector with display
+/// audio, execute `plan_audio_disable`'s writes BEFORE that
+/// master-enable clear.
 pub fn unset_mode(kms: &mut KmsState, crtc_idx: u8) {
     if let Some(crtc) = kms.crtcs.get_mut(crtc_idx as usize) {
         crtc.state = CrtcState::Inactive;
@@ -705,6 +809,7 @@ mod smoke_tests {
             1920,
             0x8000_0000,
             0x0000_5000,
+            0,
         ) {
             Ok(p) => p,
             Err(_) => return TestResult::Fail("plan_modeset failed"),
@@ -737,6 +842,99 @@ mod smoke_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_kms_modeset_plan_round_trip);
+
+    fn smoke_kms_modeset_plan_display_audio() -> TestResult {
+        use crate::amdgpu_dcn20_audio::{
+            AFMT_AUDIO_PACKET_CONTROL, DCCG_AUDIO_DTO_SOURCE, DIG_STRIDE,
+        };
+        let mut s = KmsState::new(4);
+        s.connectors.push(Connector {
+            kind: ConnectorKind::HdmiA,
+            instance: 1,
+            status: ConnectorStatus::Connected,
+            bound_crtc: None,
+            bound_encoder: Some(0),
+            device_tag: 0x0080,
+        });
+        s.encoders.push(Encoder {
+            kind: EncoderKind::Hdmi,
+            instance: 1,
+            possible_connectors: 0b0001,
+        });
+        if s.pick_crtc(0).is_err() {
+            return TestResult::Fail("pick_crtc for HDMI");
+        }
+        // Without the BASE_IDX 2 segment the plan stays video-only.
+        let plan = match plan_modeset(
+            &s,
+            Family::Renoir,
+            0,
+            1920,
+            1080,
+            60,
+            1920,
+            0x8000_0000,
+            0x0000_5000,
+            0,
+        ) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("plan_modeset (no base2) failed"),
+        };
+        if !plan.audio_writes.is_empty() {
+            return TestResult::Fail("audio writes without a BASE_IDX 2 base");
+        }
+        if plan_audio_disable(&s, 0, 0x5000, 0).is_some() {
+            return TestResult::Fail("audio disable without a BASE_IDX 2 base");
+        }
+        // With the segment resolved, the plan carries the audio
+        // enable sequence: DTO folded on the video base, AFMT on
+        // the segment-2 base at the bound encoder's DIG (instance 1).
+        let plan = match plan_modeset(
+            &s,
+            Family::Renoir,
+            0,
+            1920,
+            1080,
+            60,
+            1920,
+            0x8000_0000,
+            0x0000_5000,
+            0x0000_9000,
+        ) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("plan_modeset (base2) failed"),
+        };
+        if plan.audio_writes.is_empty() {
+            return TestResult::Fail("HDMI plan must carry audio writes");
+        }
+        if plan.audio_writes[0]
+            != (DcnWrite {
+                addr: 0x5000 + DCCG_AUDIO_DTO_SOURCE,
+                value: 0,
+            })
+        {
+            return TestResult::Fail("audio writes must lead with the DTO source (OTG 0)");
+        }
+        let afmt = 0x9000 + AFMT_AUDIO_PACKET_CONTROL + DIG_STRIDE;
+        if !plan.audio_writes.iter().any(|w| w.addr == afmt) {
+            return TestResult::Fail("audio writes must reach DIG1's AFMT block");
+        }
+        // Teardown mirrors it: disable writes exist and mute first.
+        let off = match plan_audio_disable(&s, 0, 0x5000, 0x9000) {
+            Some(w) => w,
+            None => return TestResult::Fail("HDMI teardown must have audio writes"),
+        };
+        if off.first().copied()
+            != Some(DcnWrite {
+                addr: afmt,
+                value: 0,
+            })
+        {
+            return TestResult::Fail("audio teardown must mute DIG1 first");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_kms_modeset_plan_display_audio);
 
     fn smoke_kms_encoder_binding_validation() -> TestResult {
         let mut s = KmsState::new(4);

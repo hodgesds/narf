@@ -146,6 +146,19 @@ publish one capture-only card. It uses S32LE stereo 48 kHz, four periods of
 translated through 4 KiB scratch-RAM PTEs. It needs no DSP firmware.
 `pin_config_has_pdm` recognizes Linux's PDM-capable mux configurations.
 
+The shared ACP PCI id (1022:15e2) dispatches on PCI revision in
+`acp63::probe`: 0x63 selects the ACP 6.3 map above; 0x01 selects
+`acp3x::probe` (Renoir / Lucienne / Cezanne ACP 3.x), which publishes the
+same capture-only contract — S32LE stereo 48 kHz, four periods of
+4096–8192 bytes, the same fixed ATU DMA window and scratch-PTE scheme —
+with the 3.x generation's PGFSM power-on handshake, CLKMUX select,
+external-interrupt block and SRAM PTE base. Any other revision stays
+unbound. `acp3x::is_probed`, `acp3x::capture_card` mirror the 6.3 entry
+points, and `AudioReader` capture selection falls back 6.3 → 3.x → HDA.
+The Renoir APU's HDA display-audio function (1002:1637) binds through
+`HDA_ATI_HDMI_NS_DEVICES`, receiving the ATI HDMI preset's no-snoop
+treatment (`ati_hdmi_noncoherent`) like the other ATI HDMI functions.
+
 `acp6::probe/register_pci_driver` are compatibility aliases for ACP 6.3.
 The previous generic I2S/RI-upload scaffold is unbound; its direct bring-up
 and firmware methods return UnsupportedDevice without touching hardware.
