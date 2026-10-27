@@ -150,9 +150,10 @@ fn exchange(ap: &Bss, pwe: SaePwe, h2e: bool, akm24: bool) -> Result<JoinPlan, &
             _ => return Err("peer commit not answered with a confirm"),
         };
     check!(confirm[24..30] == [3, 0, 2, 0, 0, 0], "confirm header");
+    // The AP sends its Confirm (entering Confirmed) before verifying ours.
+    let peer_confirm = peer.build_confirm();
     peer.on_confirm(&confirm[30..])
         .map_err(|_| "AP rejected confirm")?;
-    let peer_confirm = peer.build_confirm();
     let assoc = match plan.sae_authentication_response(&from_ap(2, 0, &peer_confirm), &mut sta) {
         Ok(SaeStep::Associate(f)) => f.to_vec(),
         _ => return Err("peer confirm did not complete SAE"),
