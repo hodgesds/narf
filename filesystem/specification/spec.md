@@ -657,6 +657,12 @@ The Linux open path treats `/dev/tty` as the caller's controlling-terminal
 multiplexer: it selects the recorded console or PTY slave, preserves the 5:0
 path-node identity, and reports `ENXIO` for a detached session. `O_PATH`
 continues to open only the side-effect-free path node.
+Userspace writes to console ttys (`/dev/console`, serial and virtual terminals)
+apply the selected tty's output processing and reach its output device without
+creating kernel log records. A kernel-log reader may print records to a tty and
+still drain its source; only explicit kernel logging or `/dev/kmsg` injection
+adds records. Persistent kernel boot logs therefore exclude ordinary userspace
+terminal output.
 PTY master and slave endpoints share one locked control record containing raw
 stable kernel session and foreground-process-group identities. The filesystem
 never translates those identities into a PID namespace: the querying syscall
