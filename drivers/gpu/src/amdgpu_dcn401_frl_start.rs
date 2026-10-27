@@ -169,10 +169,21 @@ impl<I: Io> Engine<I> {
                 .map_err(Error::Firmware)?;
             let at = phy_reg(self.layout, phy, 0x2943);
             let deadline = narf_time::Deadline::after_us(100_000);
+            #[cfg(feature = "kernel-test")]
+            let mut polls = self.io.wait_poll_limit();
             loop {
                 if let Some(mask) = active_lanes(self.read(at)?, lanes) {
                     link.physical_lanes = mask;
                     break;
+                }
+                #[cfg(feature = "kernel-test")]
+                if let Some(left) = &mut polls {
+                    if *left == 0 {
+                        return Err(Error::Timeout(at));
+                    }
+                    *left -= 1;
+                    narf_scheduler::yield_now().await;
+                    continue;
                 }
                 if deadline.expired() {
                     return Err(Error::Timeout(at));

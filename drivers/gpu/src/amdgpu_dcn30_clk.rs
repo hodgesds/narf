@@ -177,6 +177,12 @@ trait Io: Send {
     fn read(&mut self, reg: u32) -> u32;
     fn write(&mut self, reg: u32, value: u32);
     fn idle(&mut self) -> Result<(), Error>;
+    /// Read-driven register models can use a bounded number of cooperative
+    /// polls instead of a wall-clock deadline. Real MMIO always uses time.
+    #[cfg(feature = "kernel-test")]
+    fn wait_poll_limit(&self) -> Option<u32> {
+        None
+    }
 }
 #[derive(Debug)]
 struct Mmio {
@@ -263,6 +269,8 @@ impl<I: Io> Engine<I> {
     async fn settled(&mut self) -> Result<u32, Error> {
         // linux: n/a (dcn30_smu_wait_for_response: 10 us x 200000)
         let deadline = narf_time::Deadline::after_ms(2000);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             let value = self.access(|io| io.read(RESPONSE))?;
             if value == u32::MAX {
@@ -270,6 +278,15 @@ impl<I: Io> Engine<I> {
             }
             if value != 0 {
                 return Ok(value);
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::Timeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 return Err(Error::Timeout);

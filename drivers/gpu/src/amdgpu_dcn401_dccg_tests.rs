@@ -17,6 +17,14 @@ struct Fake {
     dentist_stall: bool,
 }
 impl Io for Fake {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        // The dentist completion lands on a read once pending, delayed by
+        // at most dentist_delay further reads (fixtures use at most 3), so
+        // sixteen polls is over 3x the longest designed completion; a
+        // stalled dentist reaches its Timeout by count instead of burning
+        // the 100 ms deadline under the spin executor (#879).
+        Some(16)
+    }
     fn read(&mut self, at: u64) -> u32 {
         if at == BASE + 0x64 * 4 && self.dentist_pending && !self.dentist_stall {
             if self.dentist_delay == 0 {

@@ -18,6 +18,13 @@ impl Fake {
     }
 }
 impl Io for Fake {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        // A stopped stream reads stopped on the first poll (the stuck flag
+        // only ever withholds that read), so sixteen polls is pure margin;
+        // a stuck stream reaches its Timeout by count instead of burning
+        // the 50 ms deadline under the spin executor (#879).
+        Some(16)
+    }
     fn read(&mut self, reg: u64) -> u32 {
         let value = self.values[reg as usize];
         if reg % STRIDE == DP_VID_STREAM_CNTL % STRIDE && self.stuck {

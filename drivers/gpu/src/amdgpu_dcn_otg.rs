@@ -87,6 +87,12 @@ pub struct GlobalSync {
 trait Io: Send {
     fn read(&mut self, reg: u64) -> u32;
     fn write(&mut self, reg: u64, value: u32);
+    /// Read-driven register models can use a bounded number of cooperative
+    /// polls instead of a wall-clock deadline. Real MMIO always uses time.
+    #[cfg(feature = "kernel-test")]
+    fn wait_poll_limit(&self) -> Option<u32> {
+        None
+    }
 }
 #[derive(Debug)]
 struct Mmio {
@@ -353,6 +359,8 @@ impl<I: Io> Engine<I> {
         self.update(self.otg_vtg(), 1 << 31, 0)?; // linux-lit: 31=VTG0_CONTROL__VTG0_ENABLE__SHIFT
         let clock_control = self.otg(OTG_CLOCK_CONTROL);
         let deadline = narf_time::Deadline::after_ms(100);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             let value = self.access(|io| io.read(clock_control))?;
             if value == u32::MAX {
@@ -362,6 +370,15 @@ impl<I: Io> Engine<I> {
             if value & 1 << 16 == 0 {
                 self.state = State::Idle;
                 return Ok(());
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::Timeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 return Err(Error::Timeout);

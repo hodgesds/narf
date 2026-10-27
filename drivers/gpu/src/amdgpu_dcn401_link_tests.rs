@@ -71,6 +71,9 @@ impl Io for LinkIo {
         }
         self.inner.read(at)
     }
+    fn wait_poll_limit(&self) -> Option<u32> {
+        self.inner.wait_poll_limit()
+    }
     fn write(&mut self, at: u64, value: u32) {
         if [0x212e, 0x211e, 0x2125]
             .iter()

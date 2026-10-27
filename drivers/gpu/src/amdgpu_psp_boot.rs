@@ -215,6 +215,14 @@ trait Io {
     /// Monotonic milliseconds: the clock every wait here is bounded on, so a
     /// model PSP's poll count, not host scheduling, decides its timeouts.
     fn now_ms(&mut self) -> u64;
+    /// Models whose clock is a poll counter can pace waits with
+    /// cooperative yields instead of real sleeps, so a designed timeout
+    /// takes its model poll count rather than that many real
+    /// milliseconds. Real MMIO always sleeps.
+    #[cfg(feature = "kernel-test")]
+    fn yield_pace(&self) -> bool {
+        false
+    }
 }
 #[derive(Debug)]
 struct Mmio {
@@ -277,6 +285,16 @@ impl<I: Io> Engine<I> {
     fn expired(&mut self, began: u64, ms: u64) -> bool {
         self.io.now_ms().saturating_sub(began) >= ms
     }
+    /// One pacing tick of a poll loop. Counter-clocked models pace by
+    /// cooperative yield (see [`Io::yield_pace`]); hardware sleeps 1 ms.
+    async fn pace(&mut self) {
+        #[cfg(feature = "kernel-test")]
+        if self.io.yield_pace() {
+            narf_scheduler::yield_now().await;
+            return;
+        }
+        delay(1).await;
+    }
     fn heartbeat(&mut self) -> Result<u32, Error> {
         match self.access(|io| io.read(SOS))? {
             u32::MAX => Err(Error::DeviceGone),
@@ -309,7 +327,7 @@ impl<I: Io> Engine<I> {
             } else if self.expired(began, timeout) {
                 return Err(Error::Timeout);
             }
-            delay(1).await;
+            self.pace().await;
         }
     }
     async fn alive(&mut self) -> Result<(), Error> {
@@ -324,7 +342,7 @@ impl<I: Io> Engine<I> {
             if self.expired(began, 1000) {
                 return Err(Error::Timeout);
             }
-            delay(1).await;
+            self.pace().await;
         }
     }
     async fn upload(&mut self, bytes: &[u8]) -> Result<(), Error> {

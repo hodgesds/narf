@@ -57,6 +57,12 @@ pub enum StreamClock {
 trait Io: Send {
     fn read(&mut self, reg: u64) -> u32;
     fn write(&mut self, reg: u64, value: u32);
+    /// Read-driven register models can use a bounded number of cooperative
+    /// polls instead of a wall-clock deadline. Real MMIO always uses time.
+    #[cfg(feature = "kernel-test")]
+    fn wait_poll_limit(&self) -> Option<u32> {
+        None
+    }
 }
 #[derive(Debug)]
 struct Mmio {
@@ -238,6 +244,8 @@ impl<I: Io> Engine<I> {
         ] {
             self.update(DENTIST_DISPCLK_CNTL, mask, value)?;
             let deadline = narf_time::Deadline::after_us(timeout_us);
+            #[cfg(feature = "kernel-test")]
+            let mut polls = self.io.wait_poll_limit();
             loop {
                 let reg = self.access(|io| io.read(DENTIST_DISPCLK_CNTL))?;
                 if reg == u32::MAX {
@@ -248,6 +256,15 @@ impl<I: Io> Engine<I> {
                 // linux-lit: 0x7f=DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_RDIVIDER_MASK >> DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_RDIVIDER__SHIFT
                 if reg & done != 0 && (done != 1 << 19 || (reg >> 8) & 0x7f == u32::from(disp)) {
                     break;
+                }
+                #[cfg(feature = "kernel-test")]
+                if let Some(left) = &mut polls {
+                    if *left == 0 {
+                        return Err(Error::Timeout);
+                    }
+                    *left -= 1;
+                    narf_scheduler::yield_now().await;
+                    continue;
                 }
                 if deadline.expired() {
                     return Err(Error::Timeout);

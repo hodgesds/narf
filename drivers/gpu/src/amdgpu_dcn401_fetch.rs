@@ -213,6 +213,8 @@ impl<I: Io> Engine<I> {
     ) -> Result<(), Error> {
         let l = self.layout;
         let kept = self.displays.siblings.pipes;
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             let mut blocked = None;
             for p in l.pool.pipes().filter(|p| kept & 1 << p == 0) {
@@ -238,6 +240,15 @@ impl<I: Io> Engine<I> {
                 }
             }
             if let Some(at) = blocked {
+                #[cfg(feature = "kernel-test")]
+                if let Some(left) = &mut polls {
+                    if *left == 0 {
+                        return Err(Error::Timeout(at));
+                    }
+                    *left -= 1;
+                    narf_scheduler::yield_now().await;
+                    continue;
+                }
                 if deadline.expired() {
                     return Err(Error::Timeout(at));
                 }

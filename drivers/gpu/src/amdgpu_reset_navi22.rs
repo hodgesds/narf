@@ -241,6 +241,14 @@ trait Io {
     fn memsize(&mut self) -> u32;
     /// Monotonic milliseconds.
     fn now_ms(&mut self) -> u64;
+    /// Models whose clock is a poll counter can pace waits with
+    /// cooperative yields instead of real sleeps, so a designed timeout
+    /// takes its model poll count rather than that many real
+    /// milliseconds. Real MMIO always sleeps.
+    #[cfg(feature = "kernel-test")]
+    fn yield_pace(&self) -> bool {
+        false
+    }
     /// amdgpu_device_cache_pci_state followed by pci_clear_master.
     fn save_and_quiesce(&mut self, authority: &Cap<BusDeviceCap, Write>) -> Result<(), Error>;
     /// amdgpu_device_load_pci_state; verifies BARs and Resizable BAR sizes.
@@ -705,6 +713,16 @@ impl<I: Io> Engine<I> {
     fn expired(&mut self, began: u64, ms: u64) -> bool {
         self.io.now_ms().saturating_sub(began) >= ms
     }
+    /// One pacing tick of a poll loop. Counter-clocked models pace by
+    /// cooperative yield (see [`Io::yield_pace`]); hardware sleeps 1 ms.
+    async fn pace(&mut self) {
+        #[cfg(feature = "kernel-test")]
+        if self.io.yield_pace() {
+            narf_scheduler::yield_now().await;
+            return;
+        }
+        sleep_ms(1).await;
+    }
     /// smu_cmn_send_smc_msg_with_param. The first message after load ignores
     /// the stale response register (SMU_FW_INIT), as every message here is.
     /// `read_argument` is false for Mode1Reset: Linux passes no read_arg, and
@@ -733,7 +751,7 @@ impl<I: Io> Engine<I> {
             if self.expired(began, MESSAGE_MS) {
                 return Err(Error::Timeout);
             }
-            sleep_ms(1).await;
+            self.pace().await;
         }
     }
     /// Outer error: revocation. Inner error: the last value, never ready.
@@ -752,7 +770,7 @@ impl<I: Io> Engine<I> {
             if self.expired(began, ms) {
                 return Ok(Err(value));
             }
-            sleep_ms(1).await;
+            self.pace().await;
         }
     }
     /// amdgpu_atombios_scratch_regs_engine_hung.
@@ -821,7 +839,7 @@ impl<I: Io> Engine<I> {
             if self.expired(began, REGISTER_MS) {
                 return Err(Error::Timeout);
             }
-            sleep_ms(1).await;
+            self.pace().await;
         };
         self.engine_hung(false)?;
         let sos_after = self.access(|io| io.mp0(SOS))?;
@@ -893,6 +911,19 @@ impl<I: Io> Engine<I> {
         post.mclk = mclk;
         post.ran = true;
         let began = io.now_ms();
+        #[cfg(feature = "kernel-test")]
+        let yield_pace = io.yield_pace();
+        // Script delays pace through this closure: a counter-clocked
+        // model's clock never advances inside a sleep, so its delays
+        // yield instead of costing real time (#879).
+        let pace = |us: u64| async move {
+            #[cfg(feature = "kernel-test")]
+            if yield_pace {
+                narf_scheduler::yield_now().await;
+                return;
+            }
+            narf_time::SleepUntil::new(narf_time::Deadline::after_us(us).as_instant()).await;
+        };
         let mut state = AtomState::with_hooks(
             1,
             1,
@@ -930,8 +961,7 @@ impl<I: Io> Engine<I> {
                 // msleep/udelay, both as a cooperative sleep.
                 vm::Step::Delay(us) => {
                     post.delay_us = post.delay_us.saturating_add(us);
-                    narf_time::SleepUntil::new(narf_time::Deadline::after_us(us).as_instant())
-                        .await;
+                    pace(us).await;
                     authority.check_live().map_err(|_| Error::Revoked)?;
                 }
             }

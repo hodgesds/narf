@@ -516,6 +516,13 @@ impl Io for Fake {
         self.clock += 1;
         self.clock
     }
+    fn yield_pace(&self) -> bool {
+        // This model's clock is the poll counter above: a real sleep
+        // never advances it, so waits pace by yield and a designed
+        // timeout takes its poll count, not that many real
+        // milliseconds (#879).
+        true
+    }
 }
 fn map() -> MmioRegion {
     MmioRegion {

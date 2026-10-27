@@ -111,6 +111,9 @@ impl Io for TmdsIo {
     fn pause_wait(&self) -> bool {
         self.inner.pause_wait()
     }
+    fn wait_poll_limit(&self) -> Option<u32> {
+        self.inner.wait_poll_limit()
+    }
     fn read(&mut self, at: u64) -> u32 {
         for e in 0..4u8 {
             if at == az(e) + 4 {

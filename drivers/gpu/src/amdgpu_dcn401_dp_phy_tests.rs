@@ -91,6 +91,9 @@ struct PhyIo {
     late: Option<(u64, usize, u64, u32)>,
 }
 impl Io for PhyIo {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        self.inner.wait_poll_limit()
+    }
     fn read(&mut self, at: u64) -> u32 {
         let event = self.completed.swap(0, Ordering::SeqCst);
         let p = self.phy;

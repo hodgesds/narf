@@ -19,6 +19,14 @@ struct Fake {
     revoke: Option<Cap<BusDeviceCap, Write>>,
 }
 impl Io for Fake {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        // The model answers every message synchronously in write(), so a
+        // settled wait still unanswered after sixteen polls is a designed
+        // non-response (stall) whose outcome is the timeout — reached by
+        // count instead of burning the 2000 ms deadline under the spin
+        // executor (#879).
+        Some(16)
+    }
     fn read(&mut self, reg: u32) -> u32 {
         self.reads += 1;
         match reg {
