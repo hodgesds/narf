@@ -252,6 +252,50 @@ pub(crate) async fn run(id: u32, controls: u32, ctl: &mut Control) -> Result<(),
     let mut tunnels = Vec::new();
     let result = async {
         loop {
+            // Tunnel suspend/replay service (#1035): the device-PM
+            // handler latches requests in `tunnel`'s PM state; the
+            // quiesce/replay itself runs here, in task context,
+            // where config transactions may await.
+            if super::tunnel::pm_phase(id) == super::tunnel::PmPhase::SuspendRequested {
+                if let Err(e) = super::tunnel::service_pm_suspend(ctl, &current, &mut tunnels).await
+                {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "usb4: domain {id}: tunnel quiesce failed: {e:?}; suspend stays refused"
+                    );
+                }
+            }
+            if super::tunnel::pm_phase(id) == super::tunnel::PmPhase::ResumeRequested {
+                // Replay against the re-scanned topology, never
+                // the pre-sleep snapshot.
+                let next = scan(ctl, id, controls, &current).await?;
+                let changed = next != current;
+                current = next;
+                if changed {
+                    let mut domains = DOMAINS.lock();
+                    domains.retain(|d| d.id != id);
+                    domains.push(current.clone());
+                }
+                super::tunnel::service_pm_resume(ctl, &current, &mut tunnels).await?;
+            }
+            if matches!(
+                super::tunnel::pm_phase(id),
+                super::tunnel::PmPhase::Quiesced | super::tunnel::PmPhase::SuspendRequested
+            ) {
+                // The fabric is quiesced (or draining): no scan or
+                // reconcile — rediscovery must not reprogram the
+                // paths suspend drained. Just poll for the resume
+                // latch and for events on the usual cadence.
+                let deadline = narf_time::Deadline::after_ms(1000);
+                loop {
+                    ctl.poll_events()?;
+                    if !ctl.events.is_empty() || deadline.expired() {
+                        break;
+                    }
+                    ctl.ring.wait(20).await;
+                }
+                continue;
+            }
             // Process detach before discovery: a replacement at the same route
             // must not inherit the previous peripheral's paths or configuration.
             for event in core::mem::take(&mut ctl.events)

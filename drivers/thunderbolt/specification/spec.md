@@ -51,6 +51,17 @@ such controllers; it never starts, resets, or speaks to the ICM firmware.
   across domains, and `tunnel::orphaned_path_domains()` the domains whose
   CM exited with tunnel writes unrolled-back. Together they are the
   state the CM's device-PM handler gates system suspend on (§4).
+- `tunnel::suspended_tunnels()` returns the tunnels currently quiesced
+  for system suspend (recorded by identity, awaiting replay), and
+  `tunnel::replay_failures()` the tunnels whose resume replay failed
+  and rolled back. The device-PM handlers only latch requests in this
+  state; the per-domain CM task performs the quiesce (journaled
+  teardown, hop drain before credit release) and the replay
+  (re-activation of the recorded endpoints against the re-scanned
+  topology) from its own loop. A peer that vanished across the sleep
+  is torn down, not replayed; a failed replay is never published
+  live and stays named in `replay_failures()` until a resume retry
+  restores it.
 - `register_initcalls()` registers PCI discovery at Device and starts one
   task per natively managed controller at Late. MSI-X wakes the task, with bounded timed
   polling when MSI-X is unavailable. No config transaction holds a spinlock
@@ -101,11 +112,21 @@ router carries a PCIe downstream adapter. A PCIe downstream adapter
 serves at most one live PCIe tunnel, and a tunnel's origin is the
 nearest ancestor router carrying one. The native CM joins the
 device-PM fan-out with a state-checked handler: system suspend is refused
-(`Busy`) only while tunnels are live, or while a domain's CM has exited
-with tunnel writes unrolled-back. With no live paths the handler reports
-ready — an idle, stopped, or cleanly-exited CM never vetoes suspend.
-Tunnel suspend/replay remains unsupported, so live tunnels still block
-sleep. Transport failure clears public snapshots and attempts owned-path
+(`Busy`) while tunnels are live and unquiesced, while a domain's CM has
+exited with tunnel writes unrolled-back, or while a replay failure is
+outstanding. The first refusal latches a quiesce request; the CM task
+drains each live path (hop drain before credit release, via the
+journaled teardown) and records it, after which the handler reports
+ready — an idle, stopped, cleanly-exited, or fully-quiesced CM never
+vetoes suspend. On resume the CM re-scans the topology and replays
+each recorded tunnel through its original activation path; endpoints
+missing from the re-scan are dropped, and a replay that fails rolls
+back through its own journal and is named in the replay-failure
+registry (the resume handler reports it as `DriverError`, and the
+suspend handler keeps refusing until a retry restores it). While a
+domain is quiescing or quiesced, its CM does not scan or reconcile —
+rediscovery never reprograms paths suspend drained. Transport failure
+clears public snapshots and attempts owned-path
 teardown; a poisoned channel can prevent that teardown, and the orphaned
 domain's refusal persists until a CM for it tears the paths down.
 
@@ -138,8 +159,9 @@ it does not emulate an AMD USB4 dock or prove physical monitor output.
 ## 8. Open work
 
 Hardware validation; full DP bandwidth allocation and multiple DP tunnels;
-firmware tunnel adoption; tunnel suspend/replay (live tunnels still veto
-system suspend); controller reset recovery after resume;
+firmware tunnel adoption; controller reset recovery after resume
+(tunnel replay assumes the control channel survives the sleep or is
+re-established by that recovery);
 XDomain tunnels, link bonding and retimer policy.
 Legacy ICM is closed by detect-and-defer (§3): firmware-managed hosts are
 stood aside from, and implementing the ICM protocol itself — or adopting
