@@ -71,6 +71,7 @@ pub mod pstate;
 pub mod rapl;
 
 mod runtime_pm_tests;
+mod suspend_service_hooks_tests;
 mod suspend_service_tests;
 mod tests;
 

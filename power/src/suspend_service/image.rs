@@ -125,6 +125,13 @@ pub(crate) struct WriteRequest<'a> {
     pub image_id: [u8; 16],
     pub smk_wrap_nonce: [u8; 12],
     pub image: &'a [u8],
+    /// Encoded hook region (P2, design §5): already AEAD-sealed
+    /// blobs from the seal fan-out, written between the manifest
+    /// and the chunks; its length is recorded in the sealed body,
+    /// so the region's extent is authenticated even though the
+    /// blobs authenticate themselves individually. Empty for a
+    /// hookless seal (the P1 behaviour, byte for byte).
+    pub hook_region: &'a [u8],
 }
 
 /// Seal `image` into `store` per the format. Chunks and manifest are
@@ -138,7 +145,8 @@ pub(crate) fn write_image(
     if image_len == 0 {
         return Err(ServiceError::EmptyImage);
     }
-    if format::image_total_len(image_len, 0) > store.len_bytes() {
+    let hook_region_len = req.hook_region.len() as u64;
+    if format::image_total_len(image_len, hook_region_len) > store.len_bytes() {
         return Err(ServiceError::ImageTooLarge);
     }
     let chunk_count = image_len.div_ceil(CHUNK_LEN);
@@ -157,7 +165,10 @@ pub(crate) fn write_image(
             &format::chunk_aad(&req.image_id, index),
             &mut buf,
         );
-        store.write_all(format::chunk_offset(chunk_count, 0, index), &buf)?;
+        store.write_all(
+            format::chunk_offset(chunk_count, hook_region_len, index),
+            &buf,
+        )?;
         tags.push(tag);
     }
 
@@ -170,6 +181,13 @@ pub(crate) fn write_image(
         manifest[i * TAG_LEN..(i + 1) * TAG_LEN].copy_from_slice(tag);
     }
     store.write_all(format::manifest_offset(), &manifest)?;
+
+    // Hook region: the seal fan-out's blobs, between manifest and
+    // chunks (design §3.3 layout). Written before the header like
+    // everything else; an interrupted write simply never commits.
+    if hook_region_len > 0 {
+        store.write_all(format::hook_offset(chunk_count), req.hook_region)?;
+    }
 
     // Preamble: plaintext claims, then the wrapped SMK.
     let mut preamble = Vec::new();
@@ -199,7 +217,7 @@ pub(crate) fn write_image(
     let mut body = [0u8; SEALED_BODY_LEN];
     body[0..8].copy_from_slice(&chunk_count.to_le_bytes());
     body[8..16].copy_from_slice(&image_len.to_le_bytes());
-    body[16..24].copy_from_slice(&0u64.to_le_bytes());
+    body[16..24].copy_from_slice(&hook_region_len.to_le_bytes());
     body[24..56].copy_from_slice(&root);
     let body_tag = chacha20_poly1305_seal(
         &man_key,
@@ -467,6 +485,22 @@ impl TrustedImage {
     /// (see [`OpenedImage::hook_key`]).
     pub fn hook_key(&self, name: &str) -> Zeroizing<[u8; 32]> {
         self.opened.hook_key(name)
+    }
+
+    /// Read the image's hook region (P2, design §5). The region's
+    /// *length* is authenticated (it sits in the sealed header
+    /// body), but the bytes returned here are not yet trusted: each
+    /// blob inside authenticates itself when the unseal fan-out
+    /// AEAD-opens it in staging, before any hook callback runs.
+    /// Only a `TrustedImage` can read the region at all — the hook
+    /// surface inherits the image's verify-before-execute order.
+    pub fn read_hook_region(&self, store: &dyn ImageStore) -> Result<Vec<u8>, ServiceError> {
+        let len = self.opened.body.hook_region_len;
+        let mut out = vec![0u8; len as usize];
+        if len > 0 {
+            store.read_exact(format::hook_offset(self.opened.body.chunk_count), &mut out)?;
+        }
+        Ok(out)
     }
 
     /// Plaintext length of the image.
