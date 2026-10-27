@@ -288,7 +288,7 @@ impl Vmd {
         // Linux `vmd.c` uses `resource_size(BAR0) >> 20` for the
         // same calculation (1 MiB per bus, the standard ECAM stride).
         let size = cfgbar.len;
-        let n_buses_full = (size >> 20) as u64;
+        let n_buses_full = size >> 20;
         if n_buses_full == 0 || n_buses_full > 256 {
             return Err(VmdError::BarSizeOutOfRange);
         }
@@ -314,10 +314,7 @@ impl Vmd {
         let first_vec = features.first_vec();
         // SAFETY: caller owns the bridge exclusively.
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        let msix_entries = match unsafe { setup_irq_domain(device, cap, segment, first_vec) } {
-            Ok(n) => n,
-            Err(e) => return Err(e),
-        };
+        let msix_entries = unsafe { setup_irq_domain(device, cap, segment, first_vec) }?;
 
         if narf_bus::register_vmd_domain(VmdDomainInfo {
             segment,
