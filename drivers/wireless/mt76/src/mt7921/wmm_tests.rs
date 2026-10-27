@@ -6,7 +6,7 @@ use narf_wifi_fixtures::{FakeAp, NetworkPlan};
 
 const OWN: [u8; 6] = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
 const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];
-const NETWORK: NetworkPlan = NetworkPlan {
+pub(super) const NETWORK: NetworkPlan = NetworkPlan {
     station: OWN,
     bssid: AP,
     server_ip: [10, 78, 0, 1],
@@ -23,7 +23,11 @@ pub(super) const PARAMETERS: [u8; 26] = [
 ];
 
 pub(super) fn prepared(wmm: bool, wpa2: bool) -> (Session<Model>, ScanBss) {
+    prepared_with_chip(wmm, wpa2, 0)
+}
+pub(super) fn prepared_with_chip(wmm: bool, wpa2: bool, chip_id: u16) -> (Session<Model>, ScanBss) {
     let mut model = Model::new();
+    model.chip_id = chip_id;
     let ap = if wpa2 {
         FakeAp::wpa2(NETWORK, b"narf", 6, 42, [0x55; 32], [0xaa; 32])
     } else {

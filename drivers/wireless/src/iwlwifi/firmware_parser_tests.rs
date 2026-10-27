@@ -73,6 +73,10 @@ pub(super) fn mld_commands() -> Vec<u8> {
     parse_ucode(&bytes).unwrap().api.commands.to_vec()
 }
 
+pub(super) fn mld_image() -> Vec<u8> {
+    image(MLD_COMMANDS)
+}
+
 fn smoke_iwlwifi_authored_tlv_sections_and_first_command_version() -> TestResult {
     let mut bytes = image(&[[0xd, 1, 18, 0], [0xd, 1, 29, 4]]);
     tlv(&mut bytes, 27, &2u32.to_le_bytes());

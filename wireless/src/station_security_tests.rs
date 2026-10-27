@@ -140,7 +140,10 @@ fn deliver(security: &mut Security) {
     security.reply_delivered(length).unwrap();
 }
 fn established() -> Security {
-    let mut s = security();
+    established_with_seed(2)
+}
+fn established_with_seed(sequence: u16) -> Security {
+    let mut s = Security::new(OWN, AP, &PMK, &rsne(), &rsne(), None, sequence).unwrap();
     let p = ptk(AN, SN);
     assert_eq!(
         s.receive(&mpdu(native(&key_frame(0x8a, 1, AN, &[], None), false)), SN),
@@ -507,6 +510,95 @@ fn smoke_station_qos_tx_invalid_tid_and_ring_eapol_do_not_consume_key_state() ->
 kernel_test_in!(
     "wireless/station_security",
     smoke_station_qos_tx_invalid_tid_and_ring_eapol_do_not_consume_key_state
+);
+
+fn smoke_station_qos_sequences_are_per_tid_and_independent_of_eapol() -> TestResult {
+    let mut s = established();
+    let mut eth = vec![2, 0, 0, 0, 0, 3];
+    eth.extend_from_slice(&OWN);
+    eth.extend_from_slice(&[8, 0, 0x45]);
+    let legacy = s.transmit_ethernet(&eth).unwrap();
+    if legacy[22..24] != [64, 0] || legacy[24] != 1 {
+        return TestResult::Fail("non-QoS counter did not retain genuine M2/M4 sequence progress");
+    }
+    for tid in 0..16 {
+        if s.next_qos_sequence(tid) != Ok(2) || s.next_qos_sequence(tid) != Ok(2) {
+            return TestResult::Fail(
+                "sampling/other TID/EAPOL consumed the requested QoS sequence",
+            );
+        }
+        let frame = s.transmit_ethernet_qos(&eth, tid).unwrap();
+        if frame[22..24] != [32, 0]
+            || frame[24..26] != [tid, 0]
+            || frame[26] != tid + 2
+            || s.next_qos_sequence(tid) != Ok(3)
+        {
+            return TestResult::Fail(
+                "native QoS header did not consume the exact sampled SN and shared PN",
+            );
+        }
+    }
+    for tid in [16, 255] {
+        if s.next_qos_sequence(tid) != Err(Error::Profile) {
+            return TestResult::Fail("unsupported QoS sequence sample admitted a TID");
+        }
+    }
+    let p = ptk(AN, SN);
+    let repeated = key_frame(0x13ca, 3, AN, &kde(GTK), Some(&p));
+    if s.receive(&mpdu(native(&repeated, false)), SN) != Ok(Rx::ReplyReady)
+        || s.next_qos_sequence(0) != Err(Error::State)
+    {
+        return TestResult::Fail("pending real rekey reply allowed a QoS BA sequence sample");
+    }
+    deliver(&mut s);
+    let frame = s.transmit_ethernet_qos(&eth, 0).unwrap();
+    if frame[22..24] != [48, 0] || frame[26] != 19 || s.next_qos_sequence(15) != Ok(3) {
+        return TestResult::Fail("non-QoS key reply changed/reset a QoS counter or packet PN");
+    }
+    s.fail();
+    if s.next_qos_sequence(0) != Err(Error::State)
+        || security().next_qos_sequence(0) != Err(Error::State)
+    {
+        return TestResult::Fail("failed or unopened owner supplied a BA starting sequence");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/station_security",
+    smoke_station_qos_sequences_are_per_tid_and_independent_of_eapol
+);
+
+fn smoke_station_qos_sequence_wrap_is_per_tid_and_queries_do_not_consume_pn() -> TestResult {
+    let mut s = established_with_seed(4095);
+    let mut eth = vec![2, 0, 0, 0, 0, 3];
+    eth.extend_from_slice(&OWN);
+    eth.extend_from_slice(&[8, 0, 0x45]);
+    for _ in 0..32 {
+        if s.next_qos_sequence(15) != Ok(4095) || s.next_qos_sequence(0) != Ok(4095) {
+            return TestResult::Fail(
+                "side-effect-free sequence sample changed initialized native SN",
+            );
+        }
+    }
+    let first = s.transmit_ethernet_qos(&eth, 15).unwrap();
+    let second = s.transmit_ethernet_qos(&eth, 15).unwrap();
+    let other = s.transmit_ethernet_qos(&eth, 0).unwrap();
+    if first[22..24] != [0xf0, 0xff]
+        || second[22..24] != [0, 0]
+        || other[22..24] != [0xf0, 0xff]
+        || [first[26], second[26], other[26]] != [1, 2, 3]
+        || s.next_qos_sequence(15) != Ok(1)
+        || s.next_qos_sequence(0) != Ok(0)
+    {
+        return TestResult::Fail(
+            "native12-bit sequence wrap leaked across TIDs or consumed key PN",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/station_security",
+    smoke_station_qos_sequence_wrap_is_per_tid_and_queries_do_not_consume_pn
 );
 
 fn smoke_station_rsna_retry_does_not_reset_installed_key_state() -> TestResult {

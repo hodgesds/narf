@@ -206,30 +206,27 @@ impl Harness {
         if self.aggregate_rx {
             let pn = self.next_pn;
             self.next_pn += 1;
-            let seq = pn as u16 & 0xfff;
+            let seq = if self.ba_rx {
+                let sequence = self.next_sequence;
+                self.next_sequence = (self.next_sequence + 1) & 0xfff;
+                sequence
+            } else {
+                pn as u16 & 0xfff
+            };
             // The second MSDU is an unrelated, bounded Ethernet-II frame.
             // Both belong to one MPDU/CCMP PN; DHCP sees only its own reply.
             let second = super::amsdu_rx_tests::ethernet(0x55, 3);
-            session
-                .backend
-                .packets
-                .push_back(super::amsdu_rx_tests::packet(
-                    eth,
-                    self.protected_link,
-                    pn,
-                    3,
-                    seq,
-                ));
-            session
-                .backend
-                .packets
-                .push_back(super::amsdu_rx_tests::packet(
-                    &second,
-                    self.protected_link,
-                    pn,
-                    1,
-                    seq,
-                ));
+            for (frame, marker) in [(eth, 3), (second.as_slice(), 1)] {
+                let mut packet =
+                    super::amsdu_rx_tests::packet(frame, self.protected_link, pn, marker, seq);
+                packet[12..16].copy_from_slice(&(u32::from(self.channel) << 8).to_le_bytes());
+                if self.ba_rx {
+                    packet[4] |= 1;
+                    packet[8..12].copy_from_slice(&0u32.to_le_bytes());
+                    packet[if self.protected_link { 64 } else { 48 }] = 0xe0;
+                }
+                session.backend.packets.push_back(self.vht_metadata(packet));
+            }
         } else {
             let packet = self.downlink_packet(eth);
             session.backend.packets.push_back(packet);
@@ -287,7 +284,8 @@ impl Harness {
             let r1 = u32::from_le_bytes(packet[4..8].try_into().unwrap()) | (1 << 13);
             packet[4..8].copy_from_slice(&r1.to_le_bytes());
             let offset = if self.protected_link { 40 } else { 24 };
-            let rxv = (4u32 << 24) | (u32::from(width) << 12) | (1 << 15) | 7;
+            let rate = if width == 0 { 8 } else { 9 };
+            let rxv = (4u32 << 24) | (1 << 7) | (u32::from(width) << 12) | (1 << 15) | rate;
             let mut group = [0; 8];
             group[..4].copy_from_slice(&rxv.to_le_bytes());
             packet.splice(offset..offset, group);
@@ -389,6 +387,11 @@ fn composition_native(
     let (ba_rx, ba_tx, vht) = ba;
     let channel = if vht.is_some() { 36 } else { CHANNEL };
     let mut model = Model::new();
+    if vht == Some(3) {
+        // The source160 branch is selected by actual MT_HW_CHIPID before
+        // capability initialization, never by a PCI alias or opaque max_bw.
+        model.chip_id = 0x7922;
+    }
     if wmm {
         model.wmm_reply = Some(super::wmm_tests::PARAMETERS.to_vec());
     }
@@ -396,7 +399,11 @@ fn composition_native(
         model.ht_reply = Some(super::ht20_tests::elements(6));
     }
     if let Some(width) = vht {
-        let (ht, ies) = super::vht_tests::elements(width, channel);
+        let (ht, ies) = if width == 3 {
+            super::vht160_tests::elements(channel, 50, true)
+        } else {
+            super::vht_tests::full_elements(width, channel)
+        };
         model.ht_reply = Some(ht);
         model.vht_reply = Some(ies);
     }
@@ -500,7 +507,29 @@ fn composition_body(
         return TestResult::Fail("harness session missing at join");
     };
     push_beacon(&mut session);
-    let joined = run(session.scan_passive(&[channel]))
+    let scanned = if vht.is_some() {
+        run(session.scan_with_options_and_policy(
+            &[channel],
+            &[SSID.to_vec()],
+            ScanOptions {
+                extra_ies: &[221, 5, 0x50, 0x6f, 0x9a, 9, 0],
+                random_mac: Some(narf_wireless::ScanRandomMac {
+                    addr: [2, 0, 0, 0, 0, 0],
+                    mask: [3, 0, 0, 0, 0, 0],
+                }),
+            },
+            || {
+                Ok(if vht == Some(3) {
+                    super::vht160_tests::domain()
+                } else {
+                    super::vht_tests::domain()
+                })
+            },
+        ))
+    } else {
+        run(session.scan_passive(&[channel]))
+    };
+    let joined = scanned
         .ok()
         .and_then(|report| report.bss.into_iter().next())
         .and_then(|bss| {
@@ -517,7 +546,11 @@ fn composition_body(
                     return None;
                 };
                 crate::mt7921::association::TxPermission::from_ap(
-                    &super::vht_tests::domain(),
+                    &if vht == Some(3) {
+                        super::vht160_tests::domain()
+                    } else {
+                        super::vht_tests::domain()
+                    },
                     info,
                     &bss,
                 )?
@@ -530,7 +563,7 @@ fn composition_body(
                 .ok()
                 .map(|aid| (bss, aid))
         });
-    let Some((_, aid)) = joined else {
+    let Some((bss, aid)) = joined else {
         put_session(session);
         return TestResult::Fail("scan/association did not complete");
     };
@@ -557,10 +590,11 @@ fn composition_body(
         super::amsdu_rx_tests::activate_receive(&mut session);
     }
     if ba_rx {
-        session
-            .backend
-            .packets
-            .push_back(super::rx_ba_tests::request_packet(0, 0, 64, 0, channel));
+        let mut request = super::rx_ba_tests::request_packet(0, 0, 64, 0, channel);
+        if aggregate_rx {
+            request[51] |= 1;
+        }
+        session.backend.packets.push_back(request);
         if session.receive_ethernet() != Ok(None)
             || run(session.service_keys()).is_err()
             || !session.rx_ba.active(0)
@@ -579,6 +613,27 @@ fn composition_body(
     {
         put_session(session);
         return TestResult::Fail("composed DHCP originator transaction did not complete");
+    }
+    if wmm {
+        // Exercise a real bound AP contention update with the negotiated
+        // PHY and BA owners still live, before the production DHCP exchange.
+        // Reuse the complete scan IE stream so a WMM-only change cannot hide
+        // a conflicting HT/VHT announcement.
+        let parameters = super::dynamic_wmm_tests::updated(2);
+        let beacon = super::dynamic_wmm_tests::beacon(&session, &bss, &parameters);
+        session.backend.packets.push_back(beacon);
+        let epoch = session.receive_epoch;
+        if session.receive_ethernet() != Ok(None)
+            || !session.data_controls_pending()
+            || run(session.service_keys()).is_err()
+            || session.wmm_pending.is_some()
+            || session.receive_current(epoch) != Ok(true)
+            || session.tx_ba.active() != ba_tx
+            || session.rx_ba.active(0) != ba_rx
+        {
+            put_session(session);
+            return TestResult::Fail("AP EDCA update lost the composed PHY/BA/controlled port");
+        }
     }
     put_session(session);
 
@@ -743,6 +798,50 @@ fn mt76_vht20_40_80_wpa2_both_ba_native_dhcp_and_exact_ip() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921/vht",
     mt76_vht20_40_80_wpa2_both_ba_native_dhcp_and_exact_ip
+);
+fn nested_vht_composition(secure: bool) -> TestResult {
+    for width in 0..=2 {
+        let result = composition_native(
+            secure,
+            true,
+            true,
+            true,
+            width != 0,
+            (true, true, Some(width)),
+        );
+        if result != TestResult::Pass {
+            return result;
+        }
+    }
+    TestResult::Pass
+}
+fn mt76_mt7922_native160_open_nested_rx2_both_ba_dhcp_and_exact_ip() -> TestResult {
+    composition_native(false, true, true, true, true, (true, true, Some(3)))
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/vht160",
+    mt76_mt7922_native160_open_nested_rx2_both_ba_dhcp_and_exact_ip
+);
+fn mt76_mt7922_native160_wpa2_nested_rx2_both_ba_dhcp_and_exact_ip() -> TestResult {
+    composition_native(true, true, true, true, true, (true, true, Some(3)))
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/vht160",
+    mt76_mt7922_native160_wpa2_nested_rx2_both_ba_dhcp_and_exact_ip
+);
+fn mt76_vht_rx2_nested_amsdu_both_ba_open_dhcp_and_exact_ip() -> TestResult {
+    nested_vht_composition(false)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx_ba",
+    mt76_vht_rx2_nested_amsdu_both_ba_open_dhcp_and_exact_ip
+);
+fn mt76_vht_rx2_nested_amsdu_both_ba_wpa2_dhcp_and_exact_ip() -> TestResult {
+    nested_vht_composition(true)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx_ba",
+    mt76_vht_rx2_nested_amsdu_both_ba_wpa2_dhcp_and_exact_ip
 );
 
 fn mt76_tx_ba_open_ht20_negotiation_dhcp_and_exact_bidirectional_ip() -> TestResult {

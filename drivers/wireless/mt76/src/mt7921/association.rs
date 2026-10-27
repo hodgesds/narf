@@ -147,6 +147,9 @@ impl JoinPlan {
         permission: TxPermission,
     ) -> Result<Self, super::firmware_transport::Error> {
         use super::firmware_transport::Error as NativeError;
+        if permission.native_width() == super::cmd::CH_BW_160 && !super::vht::wide160(info) {
+            return Err(NativeError::UnsupportedFirmware);
+        }
         let mode = if security.is_wpa2() {
             SecurityMode::Wpa2Psk
         } else {
@@ -173,14 +176,32 @@ impl JoinPlan {
             }) {
                 candidate
             } else {
-                ManagementPlan::prepare_with_phy(
+                let narrow = ManagementPlan::prepare_with_phy(
                     bss,
                     own,
                     ssid,
                     mode,
-                    super::vht::ht_fallback(info, permission.native_width() != 0)?,
+                    super::vht::local80(info)?,
                 )
-                .map_err(|_| NativeError::UnsupportedFirmware)?
+                .map_err(|_| NativeError::UnsupportedFirmware)?;
+                if narrow.offered_phy().is_some_and(|offer| {
+                    permission.vht_available()
+                        && offer
+                            .occupied_channels()
+                            .iter()
+                            .all(|ch| permission.channels().contains(ch))
+                }) {
+                    narrow
+                } else {
+                    ManagementPlan::prepare_with_phy(
+                        bss,
+                        own,
+                        ssid,
+                        mode,
+                        super::vht::ht_fallback(info, permission.native_width() != 0)?,
+                    )
+                    .map_err(|_| NativeError::UnsupportedFirmware)?
+                }
             }
         } else {
             ManagementPlan::prepare(bss, own, ssid, mode)
@@ -197,12 +218,18 @@ impl JoinPlan {
             vht: None,
             ap_phy: None,
         };
-        if permission.native_width() == super::cmd::CH_BW_80
+        if permission.native_width() >= super::cmd::CH_BW_80
             && plan.common.offered_phy().is_none_or(|o| o.vht().is_none())
         {
             return Err(NativeError::UnsupportedFirmware);
         }
         if let Some(offer) = plan.common.offered_phy() {
+            if permission.native_width() == super::cmd::CH_BW_160
+                && offer.width() != narf_wireless::association::phy::Width::OneSixty
+            {
+                return Err(NativeError::UnsupportedFirmware);
+            }
+            super::vht::check_offer(offer)?;
             if offer.ht().operation().protection() != 0 {
                 return Err(NativeError::UnsupportedFirmware);
             }
@@ -295,20 +322,29 @@ impl JoinPlan {
                 let width = match n.width() {
                     narf_wireless::association::phy::Width::Twenty => 0,
                     narf_wireless::association::phy::Width::Forty => 1,
-                    narf_wireless::association::phy::Width::Eighty => {
+                    narf_wireless::association::phy::Width::Eighty
+                    | narf_wireless::association::phy::Width::OneSixty => {
                         self.cancel();
                         return Err(Error::Protocol);
                     }
                 };
                 self.ht20 = Some(super::ht20::Profile::from_shared(n.ht(), width));
             } else {
-                let profile = match super::vht::Profile::negotiated(n, &bytes[30..]) {
-                    Ok(profile) => profile,
-                    Err(_) => {
-                        self.cancel();
-                        return Err(Error::Protocol);
-                    }
-                };
+                let profile =
+                    match self
+                        .common
+                        .offered_phy()
+                        .ok_or(Error::Protocol)
+                        .and_then(|offer| {
+                            super::vht::Profile::negotiated(n, offer, &bytes[30..])
+                                .map_err(|_| Error::Protocol)
+                        }) {
+                        Ok(profile) => profile,
+                        Err(_) => {
+                            self.cancel();
+                            return Err(Error::Protocol);
+                        }
+                    };
                 self.ht20 = Some(super::ht20::Profile::from_shared(n.ht(), profile.width()));
                 self.vht = Some(profile);
             }
@@ -351,6 +387,7 @@ impl JoinPlan {
             narf_wireless::association::phy::Width::Twenty => 0,
             narf_wireless::association::phy::Width::Forty => 1,
             narf_wireless::association::phy::Width::Eighty => 2,
+            narf_wireless::association::phy::Width::OneSixty => 3,
         };
         Some((width, n.center_channel()))
     }
@@ -418,6 +455,7 @@ impl JoinPlan {
             out[ra + 6] = profile.transmit_mcs();
             let ht = tlv(&mut out, 2, 12); // nested WTBL_HT.
             out[ht + 4] = 1;
+            out[ht + 5] = u8::from(profile.transmit_ldpc());
             out[ht + 6] = profile.ampdu() & 3;
             out[ht + 7] = profile.ampdu() >> 2;
             let smps = tlv(&mut out, 13, 8); // nested WTBL_SMPS.
@@ -554,7 +592,7 @@ pub(crate) fn bss_record_ht20(bss: &ScanBss, qos: bool, ht: bool) -> Result<Vec<
     Ok(out)
 }
 
-/// A 20 MHz station transmission authorized by the installed host policy.
+/// A complete occupied station channel authorized by the installed host policy.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TxPermission {
     pub country: [u8; 2],
@@ -562,6 +600,7 @@ pub(crate) struct TxPermission {
     channel: u8,
     secondary: Option<u8>,
     center80: Option<u8>,
+    center160: Option<u8>,
     // A currently permitted80-MHz channel in this band, required for VHT
     // even when the selected operation is20/40 (mac80211/vht.c).
     vht80_channel: Option<u8>,
@@ -569,7 +608,7 @@ pub(crate) struct TxPermission {
 
 impl TxPermission {
     pub fn from_domain(domain: &narf_wireless::reg::RegulatoryDomain, channel: u8) -> Option<Self> {
-        Self::occupied(domain, channel, None, None)
+        Self::occupied(domain, channel, None, None, None)
     }
     pub(crate) fn from_domain40(
         domain: &narf_wireless::reg::RegulatoryDomain,
@@ -587,7 +626,7 @@ impl TxPermission {
         {
             return None;
         }
-        Self::occupied(domain, channel, Some(secondary), None)
+        Self::occupied(domain, channel, Some(secondary), None, None)
     }
     pub(crate) fn from_domain80(
         domain: &narf_wireless::reg::RegulatoryDomain,
@@ -596,7 +635,30 @@ impl TxPermission {
     ) -> Option<Self> {
         let channels = super::channel::block80(primary, center)?;
         let index = channels.iter().position(|&ch| ch == primary)?;
-        let mut grant = Self::occupied(domain, primary, Some(channels[index ^ 1]), Some(center))?;
+        let mut grant = Self::occupied(
+            domain,
+            primary,
+            Some(channels[index ^ 1]),
+            Some(center),
+            None,
+        )?;
+        grant.vht80_channel = Some(channels[0]);
+        Some(grant)
+    }
+    pub(crate) fn from_domain160(
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        primary: u8,
+        center: u8,
+    ) -> Option<Self> {
+        let channels = super::channel::block160(primary, center)?;
+        let index = channels.iter().position(|&channel| channel == primary)?;
+        let mut grant = Self::occupied(
+            domain,
+            primary,
+            Some(channels[index ^ 1]),
+            None,
+            Some(center),
+        )?;
         grant.vht80_channel = Some(channels[0]);
         Some(grant)
     }
@@ -617,37 +679,44 @@ impl TxPermission {
             } else {
                 SecurityMode::Open
             };
-            if let Ok(plan) = ManagementPlan::prepare_with_phy(
-                bss,
-                info.capabilities.mac,
-                &bss.ssid,
-                mode,
-                super::vht::local(info).ok()?,
-            ) {
-                if let Some(offer) = plan.offered_phy().filter(|p| p.vht().is_some()) {
-                    use narf_wireless::association::phy::Width;
-                    let permission = match offer.width() {
-                        Width::Eighty => {
-                            Self::from_domain80(domain, bss.channel, offer.center_channel())
-                        }
-                        Width::Forty => offer
-                            .ht()
-                            .operation()
-                            .secondary()
-                            .and_then(|ch| Self::from_domain40(domain, bss.channel, ch)),
-                        Width::Twenty => Self::from_domain(domain, bss.channel),
-                    };
-                    if let Some(mut permission) = permission {
-                        if let Some(primary) =
-                            [36, 52, 100, 116, 132, 149, 165]
+            for local in [super::vht::local(info), super::vht::local80(info)]
+                .into_iter()
+                .flatten()
+            {
+                if let Ok(plan) = ManagementPlan::prepare_with_phy(
+                    bss,
+                    info.capabilities.mac,
+                    &bss.ssid,
+                    mode,
+                    local,
+                ) {
+                    if let Some(offer) = plan.offered_phy().filter(|p| p.vht().is_some()) {
+                        use narf_wireless::association::phy::Width;
+                        let permission = match offer.width() {
+                            Width::Eighty => {
+                                Self::from_domain80(domain, bss.channel, offer.center_channel())
+                            }
+                            Width::OneSixty => {
+                                Self::from_domain160(domain, bss.channel, offer.center_channel())
+                            }
+                            Width::Forty => offer
+                                .ht()
+                                .operation()
+                                .secondary()
+                                .and_then(|ch| Self::from_domain40(domain, bss.channel, ch)),
+                            Width::Twenty => Self::from_domain(domain, bss.channel),
+                        };
+                        if let Some(mut permission) = permission {
+                            if let Some(primary) = [36, 52, 100, 116, 132, 149, 165]
                                 .into_iter()
                                 .find(|&primary| {
                                     let center = primary + 6;
                                     Self::from_domain80(domain, primary, center).is_some()
                                 })
-                        {
-                            permission.vht80_channel = Some(primary);
-                            return Some(permission);
+                            {
+                                permission.vht80_channel = Some(primary);
+                                return Some(permission);
+                            }
                         }
                     }
                 }
@@ -674,13 +743,24 @@ impl TxPermission {
         channel: u8,
         secondary: Option<u8>,
         center80: Option<u8>,
+        center160: Option<u8>,
     ) -> Option<Self> {
         use narf_wireless::reg::RegFlags;
         if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
             return None;
         }
         let primary = super::channel::frequency(channel)?;
-        let center = if let Some(center) = center80 {
+        let center = if let Some(center) = center160 {
+            if center80.is_some() {
+                return None;
+            }
+            let channels = super::channel::block160(channel, center)?;
+            let index = channels.iter().position(|&ch| ch == channel)?;
+            if secondary != Some(channels[index ^ 1]) {
+                return None;
+            }
+            5000 + 5 * u32::from(center)
+        } else if let Some(center) = center80 {
             let channels = super::channel::block80(channel, center)?;
             let index = channels.iter().position(|&ch| ch == channel)?;
             if secondary != Some(channels[index ^ 1]) {
@@ -692,7 +772,9 @@ impl TxPermission {
                 Some((primary + super::channel::frequency(ch)?) / 2)
             })?
         };
-        let width = if center80.is_some() {
+        let width = if center160.is_some() {
+            160
+        } else if center80.is_some() {
             80
         } else if secondary.is_some() {
             40
@@ -733,6 +815,7 @@ impl TxPermission {
             channel,
             secondary,
             center80,
+            center160,
             vht80_channel: None,
         })
     }
@@ -744,8 +827,14 @@ impl TxPermission {
     pub(crate) fn current(self, domain: &narf_wireless::reg::RegulatoryDomain) -> bool {
         self.vht80_channel
             .is_none_or(|primary| Self::from_domain80(domain, primary, primary + 6).is_some())
-            && Self::occupied(domain, self.channel, self.secondary, self.center80)
-                .is_some_and(|now| now.country == self.country && now.power_dbm >= self.power_dbm)
+            && Self::occupied(
+                domain,
+                self.channel,
+                self.secondary,
+                self.center80,
+                self.center160,
+            )
+            .is_some_and(|now| now.country == self.country && now.power_dbm >= self.power_dbm)
     }
 
     pub fn rate_limits(self) -> Vec<u8> {
@@ -773,6 +862,11 @@ impl TxPermission {
         self.secondary
     }
     pub(crate) fn channels(self) -> Vec<u8> {
+        if let Some(center) = self.center160 {
+            return super::channel::block160(self.channel, center)
+                .unwrap()
+                .to_vec();
+        }
         if let Some(center) = self.center80 {
             // Geometry was checked before this grant was constructed.
             return super::channel::block80(self.channel, center)
@@ -786,6 +880,9 @@ impl TxPermission {
         channels
     }
     pub(crate) fn center_channel(self) -> u8 {
+        if let Some(center) = self.center160 {
+            return center;
+        }
         if let Some(center) = self.center80 {
             return center;
         }
@@ -794,7 +891,9 @@ impl TxPermission {
         })
     }
     pub(crate) fn native_width(self) -> u8 {
-        if self.center80.is_some() {
+        if self.center160.is_some() {
+            super::cmd::CH_BW_160
+        } else if self.center80.is_some() {
             super::cmd::CH_BW_80
         } else if self.secondary.is_some() {
             super::cmd::CH_BW_40
@@ -804,6 +903,7 @@ impl TxPermission {
     }
     pub(crate) fn domain_width(self) -> u8 {
         match self.native_width() {
+            3 => 3,
             2 => 2,
             1 => 0,
             _ => 1,
@@ -817,6 +917,7 @@ impl TxPermission {
     pub(crate) fn narrow(self, width: u8, center: u8) -> Option<Self> {
         let mut next = self;
         next.center80 = None;
+        next.center160 = None;
         next.secondary = match width {
             0 if center == self.channel => None,
             1 => Some(if center > self.channel {
@@ -824,8 +925,16 @@ impl TxPermission {
             } else {
                 self.channel.checked_sub(4)?
             }),
-            2 if self.center80 == Some(center) => {
+            2 if self.center80 == Some(center) || self.center160.is_some() => {
+                let channels = super::channel::block80(self.channel, center)?;
+                let index = channels
+                    .iter()
+                    .position(|&channel| channel == self.channel)?;
                 next.center80 = Some(center);
+                Some(channels[index ^ 1])
+            }
+            3 if self.center160 == Some(center) => {
+                next.center160 = Some(center);
                 self.secondary
             }
             _ => return None,

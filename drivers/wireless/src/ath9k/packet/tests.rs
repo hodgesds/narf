@@ -57,9 +57,27 @@ pub(in crate::ath9k) struct Model {
     pub(in crate::ath9k) ignore: Cell<Option<u64>>,
     pub(in crate::ath9k) transmitted: RefCell<Vec<Vec<u8>>>,
     pub(in crate::ath9k) tx: Cell<Option<u32>>,
+    pub(in crate::ath9k) pair_tail: Cell<Option<u32>>,
+    pair_seq: Cell<u16>,
+    pub(in crate::ath9k) last_pair: Cell<Option<(u32, u32)>>,
+    pub(in crate::ath9k) pair_received: Cell<u8>,
+    pub(in crate::ath9k) ba_bitmap: Cell<Option<u64>>,
+    pub(in crate::ath9k) ba_flag: Cell<bool>,
+    pub(in crate::ath9k) ba_tid: Cell<u8>,
+    pub(in crate::ath9k) ba_ssn: Cell<Option<u16>>,
+    pub(in crate::ath9k) hold_pair: Cell<bool>,
+    pub(in crate::ath9k) data_ack: Cell<bool>,
+    pub(in crate::ath9k) retry_receive: Cell<bool>,
+    bar_reply: RefCell<Option<Vec<u8>>>,
     pub(in crate::ath9k) cursor: Cell<u32>,
     pub(in crate::ath9k) last_rx: Cell<Option<u32>>,
     pub(in crate::ath9k) reaction: RefCell<Option<Arc<Reaction>>>,
+    pub(in crate::ath9k) ht: RefCell<Option<Arc<crate::ath9k::ht::Grant>>>,
+    pub(in crate::ath9k) ba: RefCell<Option<Arc<crate::ath9k::rx_ba::Grant>>>,
+    pub(in crate::ath9k) tx_ba: RefCell<Option<Arc<crate::ath9k::tx_ba::Grant>>>,
+    pub(in crate::ath9k) ht_rate: Cell<u8>,
+    pub(in crate::ath9k) rx_aggr: Cell<u32>,
+    pub(in crate::ath9k) dma_transmitted: RefCell<Vec<Vec<u8>>>,
 }
 pub(in crate::ath9k) type Reaction =
     dyn Fn(&[u8]) -> Result<(Vec<Vec<u8>>, bool), Error> + Send + Sync;
@@ -72,6 +90,7 @@ impl Model {
                 (QSTS, 0),
                 (DIAG, RX_PARK),
                 (0x24, 0),
+                (0x803c, 0x17),
             ])),
             regions: RefCell::new(Vec::new()),
             master: Cell::new(false),
@@ -83,9 +102,27 @@ impl Model {
             ignore: Cell::new(None),
             transmitted: RefCell::new(Vec::new()),
             tx: Cell::new(None),
+            pair_tail: Cell::new(None),
+            pair_seq: Cell::new(0),
+            last_pair: Cell::new(None),
+            pair_received: Cell::new(3),
+            ba_bitmap: Cell::new(None),
+            ba_flag: Cell::new(true),
+            ba_tid: Cell::new(0),
+            ba_ssn: Cell::new(None),
+            hold_pair: Cell::new(false),
+            data_ack: Cell::new(true),
+            retry_receive: Cell::new(true),
+            bar_reply: RefCell::new(None),
             cursor: Cell::new(0),
             last_rx: Cell::new(None),
             reaction: RefCell::new(None),
+            ht: RefCell::new(None),
+            ba: RefCell::new(None),
+            tx_ba: RefCell::new(None),
+            ht_rate: Cell::new(0x80),
+            rx_aggr: Cell::new(0),
+            dma_transmitted: RefCell::new(Vec::new()),
         })
     }
     fn access(&self) -> Result<(), Error> {
@@ -146,14 +183,80 @@ impl Model {
     }
     pub(in crate::ath9k) fn complete(&self, success: bool) -> Result<(), Error> {
         let descriptor = self.tx.get().ok_or(Error::State)?;
-        self.put(descriptor + 60, u32::from(success))?;
-        self.put(descriptor + 92, 1)?;
+        let tail = self.pair_tail.get().unwrap_or(descriptor);
+        let mut done = 1;
+        let ba = if self.pair_tail.get().is_some() {
+            Some((
+                self.pair_seq.get(),
+                0,
+                self.ba_bitmap
+                    .get()
+                    .unwrap_or(u64::from(self.pair_received.get())),
+            ))
+        } else {
+            self.bar_reply.borrow().as_ref().map(|b| {
+                (
+                    u16::from_le_bytes([b[18], b[19]]) >> 4,
+                    (u16::from_le_bytes([b[16], b[17]]) >> 12) as u8,
+                    u64::from_le_bytes(b[20..32 - 4].try_into().unwrap()),
+                )
+            })
+        };
+        if let Some((ssn, tid, bitmap)) = ba {
+            self.put(tail + 56, u32::from(self.ba_flag.get()) << 30)?;
+            self.put(tail + 68, bitmap as u32)?;
+            self.put(tail + 72, (bitmap >> 32) as u32)?;
+            let tid = if self.ba_tid.get() != 0 {
+                self.ba_tid.get()
+            } else {
+                tid
+            };
+            done |= u32::from(self.ba_ssn.get().unwrap_or(ssn)) << 1 | u32::from(tid) << 28;
+        }
+        self.put(tail + 60, u32::from(success))?;
+        self.put(tail + 92, done)?;
         self.registers.borrow_mut().insert(QTXE, 0);
         self.registers.borrow_mut().insert(QSTS, 0);
         self.tx.set(None);
+        self.pair_tail.set(None);
+        self.bar_reply.borrow_mut().take();
         Ok(())
     }
+    fn wire(&self, descriptor: u32) -> Result<(Vec<u8>, Vec<u8>), Error> {
+        let length = (self.word(descriptor + 8)? & 0xfff) as usize;
+        let dma = self.bytes(
+            self.word(descriptor + 4)?,
+            (self.word(descriptor + 12)? & 0xfff) as usize,
+        )?;
+        if length < 4 {
+            return Err(Error::Descriptor);
+        }
+        let original = if dma.first() == Some(&0x88) {
+            if dma.len() != length - 2 || dma.len() < 28 || dma[26..28] != [0, 0] {
+                return Err(Error::Descriptor);
+            }
+            let mut f = dma[..26].to_vec();
+            f.extend_from_slice(&dma[28..]);
+            f
+        } else {
+            if dma.len() != length - 4 {
+                return Err(Error::Descriptor);
+            }
+            dma.clone()
+        };
+        Ok((dma, original))
+    }
     pub(in crate::ath9k) fn inject(&self, bytes: &[u8], error: u32) -> Result<(), Error> {
+        let mut padded = Vec::new();
+        if bytes.first() == Some(&0x88) {
+            if bytes.len() < 26 {
+                return Err(Error::Packet);
+            }
+            padded.extend_from_slice(&bytes[..26]);
+            padded.extend_from_slice(&[0, 0]);
+            padded.extend_from_slice(&bytes[26..]);
+        }
+        let bytes = if padded.is_empty() { bytes } else { &padded };
         let descriptor = self.cursor.get();
         if descriptor == 0 || !self.master.get() {
             return Err(Error::State);
@@ -175,17 +278,47 @@ impl Model {
                 pointer.add(index).write_volatile(value);
             }
         }
-        self.put(descriptor + 16, 0x1b << 24)?;
+        self.put(
+            descriptor + 16,
+            u32::from(if bytes.first() == Some(&0x88) {
+                self.ht_rate.get()
+            } else {
+                0x1b
+            }) << 24,
+        )?;
         self.put(descriptor + 20, length as u32)?;
-        self.put(descriptor + 48, 3 | error)?;
+        self.put(
+            descriptor + 48,
+            3 | error
+                | if bytes.first() == Some(&0x88) {
+                    self.rx_aggr.get()
+                } else {
+                    0
+                },
+        )?;
         self.last_rx.set(Some(descriptor));
         self.cursor.set(self.word(descriptor)?);
         Ok(())
     }
 }
 impl Port for Arc<Model> {
+    fn tx_ba_grant(&self) -> Option<Arc<crate::ath9k::tx_ba::Grant>> {
+        self.tx_ba.borrow().clone()
+    }
+    fn rx_ba_grant(&self) -> Option<Arc<crate::ath9k::rx_ba::Grant>> {
+        self.ba.borrow().clone()
+    }
+    fn ht_grant(&self) -> Option<Arc<crate::ath9k::ht::Grant>> {
+        self.ht.borrow().clone()
+    }
     fn transmit_allowed(&self) -> Result<(), Error> {
         if self.allowed.get() {
+            if let Some(g) = self.rx_ba_grant() {
+                g.check()?;
+            }
+            if let Some(g) = self.ht_grant() {
+                g.readback(self)?;
+            }
             Ok(())
         } else {
             Err(Error::Access)
@@ -200,14 +333,45 @@ impl Port for Arc<Model> {
         if self.master.get() != active {
             return Err(Error::Access);
         }
-        operation()
+        let operation = || {
+            if let Some(g) = self.rx_ba_grant() {
+                g.invoke(operation)
+            } else if let Some(g) = self.ht_grant() {
+                g.invoke(operation)
+            } else {
+                operation()
+            }
+        };
+        if let Some(g) = self.tx_ba_grant() {
+            g.invoke(operation)
+        } else {
+            operation()
+        }
     }
     fn read(&self, reg: u64) -> Result<u32, Error> {
         self.as_ref().access()?;
+        if let Some(g) = self.tx_ba_grant() {
+            g.check()?;
+        }
+        if let Some(g) = self.rx_ba_grant() {
+            g.check()?;
+        }
+        if let Some(g) = self.ht_grant() {
+            g.check()?;
+        }
         Ok(*self.registers.borrow().get(&reg).unwrap_or(&0))
     }
     fn write(&self, reg: u64, value: u32) -> Result<(), Error> {
         self.as_ref().access()?;
+        if let Some(g) = self.tx_ba_grant() {
+            g.check()?;
+        }
+        if let Some(g) = self.rx_ba_grant() {
+            g.check()?;
+        }
+        if let Some(g) = self.ht_grant() {
+            g.check()?;
+        }
         if self.ignore.get() == Some(reg) {
             return Ok(());
         }
@@ -225,24 +389,68 @@ impl Port for Arc<Model> {
                 return Err(Error::Access);
             }
             let descriptor = self.read(QTXDP)?;
-            let length = (self.word(descriptor + 8)? & 0xfff) as usize;
-            let body = self.word(descriptor + 4)?;
-            if self.word(descriptor)? != 0 || length < 4 {
+            let tail = self.word(descriptor)?;
+            if tail != 0
+                && (self.word(tail)? != 0
+                    || self.word(descriptor + 12)? & 0x6000_0000 != 0x6000_0000
+                    || self.word(tail + 12)? & 0x6000_0000 != 0x4000_0000
+                    || self.word(tail + 16)? != 0
+                    || self.word(tail + 20)? != 0)
+            {
                 return Err(Error::Descriptor);
             }
-            let observed = self.bytes(body, length - 4)?;
-            self.transmitted.borrow_mut().push(observed.clone());
+            if tail != 0 {
+                self.pair_tail.set(Some(tail));
+                self.last_pair.set(Some((descriptor, tail)));
+            }
             self.tx.set(Some(descriptor));
             self.registers.borrow_mut().insert(QSTS, 1);
             let reaction = { self.reaction.borrow().clone() };
-            if let Some(reaction) = reaction {
-                let (responses, hold) = reaction(&observed)?;
-                if !hold {
-                    self.complete(true)?;
+            let mut held = reaction.is_none() || tail != 0 && self.hold_pair.get();
+            let mut ack = true;
+            for (i, d) in [descriptor, tail].into_iter().enumerate() {
+                if d == 0 {
+                    continue;
                 }
-                for response in responses {
-                    self.inject(&response, 0)?;
+                let (dma, observed) = self.wire(d)?;
+                if tail != 0 && i == 0 {
+                    self.pair_seq
+                        .set(u16::from_le_bytes([observed[22], observed[23]]) >> 4);
                 }
+                self.dma_transmitted.borrow_mut().push(dma);
+                self.transmitted.borrow_mut().push(observed.clone());
+                let data = observed.first() == Some(&0x88);
+                if data && tail == 0 {
+                    ack = self.data_ack.get();
+                }
+                let received = if tail != 0 {
+                    self.pair_received.get() & (1 << i) != 0
+                } else {
+                    !data || observed[1] & 8 == 0 || self.retry_receive.get()
+                };
+                if received {
+                    if let Some(reaction) = &reaction {
+                        let (responses, hold) = reaction(&observed)?;
+                        held |= hold;
+                        for response in responses {
+                            // A solicited compressed BA is consumed by the native
+                            // MAC into BAR TX status, never invented as RAW RX.
+                            if observed.first() == Some(&0x84)
+                                && response.len() == 28
+                                && response[..2] == [0x94, 0]
+                                && response[4..10] == observed[10..16]
+                                && response[10..16] == observed[4..10]
+                            {
+                                *self.bar_reply.borrow_mut() = Some(response);
+                            } else {
+                                self.inject(&response, 0)?;
+                            }
+                        }
+                    }
+                }
+            }
+            if !held {
+                self.complete(ack)?;
             }
         }
         if reg == CR && value == 0x20 {

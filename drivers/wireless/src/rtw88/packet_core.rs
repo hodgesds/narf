@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! One retained RTL8821CE/RTL8822CE packet slot; native rings stay in their original
-//! firmware backend. No reset, descriptor-owner reconstruction or IRQ service.
+//! Retained RTL8821CE/RTL8822CE control and bounded four-buffer DATA ownership;
+//! native rings stay in their original firmware backend. No reset,
+//! descriptor-owner reconstruction or IRQ service.
 use super::packet_format::{self as format, Queue};
-use alloc::vec::Vec;
+use alloc::{collections::VecDeque, vec::Vec};
 use narf_io::DmaBuffer;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,6 +29,15 @@ impl From<format::Error> for Error {
 /// cache maintenance and outer-shareable acquire order before buffer reads.
 /// Every possibly published mapping survives failure, cancellation and drop.
 pub(super) unsafe trait Port {
+    fn rts_threshold(&self) -> Option<u32> {
+        None
+    }
+    fn originator_ba_allowed(&self) -> bool {
+        false
+    }
+    fn recipient_ba_allowed(&self) -> bool {
+        false
+    }
     fn receive_chip(&self) -> Result<super::packet_phy::Chip, Error>;
     fn transmit_allowed(&mut self) -> Result<(), Error>;
     fn memory<T>(&mut self, operation: impl FnOnce() -> Result<T, Error>) -> Result<T, Error>;
@@ -96,6 +106,10 @@ pub(super) struct Step {
 pub(super) struct Core {
     phase: Phase,
     frame: Option<DmaBuffer>,
+    batch_buffers: Vec<DmaBuffer>,
+    batch_pending: VecDeque<batch::Pending>,
+    aggregation: Option<format::Aggregation>,
+    batch_published: bool,
     own: [u8; 6],
     mac_id: u8,
     data_profile: format::DataProfile,
@@ -190,9 +204,26 @@ impl Core {
             return Err(Error::Address);
         }
         port.memory(|| copy_to(&frame, 0, &[0; format::TX_DESC]))?;
+        let mut batch_buffers = Vec::new();
+        batch_buffers
+            .try_reserve_exact(4)
+            .map_err(|_| Error::Memory)?;
+        for _ in 0..4 {
+            let buffer = port.allocate(format::TX_DESC + format::MAX_MPDU)?;
+            format::buffer_descriptor(buffer.dma_addr().raw(), format::MAX_MPDU)?;
+            if buffer.len() < format::TX_DESC + format::MAX_MPDU {
+                return Err(Error::Address);
+            }
+            port.memory(|| copy_to(&buffer, 0, &[0; format::TX_DESC]))?;
+            batch_buffers.push(buffer);
+        }
         Ok(Self {
             phase: Phase::Prepared,
             frame: Some(frame),
+            batch_buffers,
+            batch_pending: VecDeque::new(),
+            aggregation: None,
+            batch_published: false,
             own,
             mac_id,
             data_profile: format::DataProfile::LEGACY,
@@ -219,7 +250,7 @@ impl Core {
         Ok(())
     }
     pub(super) fn ready(&self) -> bool {
-        self.phase == Phase::Running && self.pending.is_none()
+        self.phase == Phase::Running && self.pending.is_none() && self.batch_pending.is_empty()
     }
     pub(super) fn configure_data(&mut self, profile: format::DataProfile) -> Result<(), Error> {
         if !self.ready() || !profile.valid() {
@@ -237,7 +268,7 @@ impl Core {
         if self.phase != Phase::Running {
             return Err(Error::State);
         }
-        if self.pending.is_some() {
+        if self.pending.is_some() || !self.batch_pending.is_empty() {
             return Err(Error::Busy);
         }
         // The64 native six-bit CCX identities may be reused only after every
@@ -255,8 +286,17 @@ impl Core {
             self.reports = 0;
         }
         let sequence = radio_report.then_some(self.reports << 2);
-        let (descriptor, queue) =
+        if format::recipient_control(frame) && !port.recipient_ba_allowed() {
+            return Err(Error::Access);
+        }
+        if format::originator_control(frame) && !port.originator_ba_allowed() {
+            return Err(Error::Access);
+        }
+        let (mut descriptor, queue) =
             format::transmit_profile(frame, self.own, self.mac_id, sequence, self.data_profile)?;
+        if queue == Queue::Data && (!radio_report || frame[0] == 0x88) {
+            super::protection::descriptor(&mut descriptor, frame.len(), port.rts_threshold());
+        }
         let memory = self.frame.as_ref().ok_or(Error::State)?;
         let bd = format::buffer_descriptor(memory.dma_addr().raw(), frame.len())?;
         let id = self.next_id;
@@ -335,6 +375,13 @@ impl Core {
                                 return Err(Error::Packet);
                             }
                         }
+                        for pending in &mut self.batch_pending {
+                            if pending.report_sequence == report.sequence
+                                && pending.report.replace(report.acknowledged).is_some()
+                            {
+                                return Err(Error::Packet);
+                            }
+                        }
                     }
                     step.c2h = Some(body);
                 } else {
@@ -350,11 +397,13 @@ impl Core {
                     };
                     if let Some(phy) = phy {
                         body.truncate(body.len() - 4);
-                        step.frame = Some(Frame {
-                            bytes: body,
-                            rate: metadata.rate,
-                            phy,
-                        });
+                        if body.len() >= 24 || format::native_bar(&body) {
+                            step.frame = Some(Frame {
+                                bytes: body,
+                                rate: metadata.rate,
+                                phy,
+                            });
+                        }
                     }
                 }
             }
@@ -413,7 +462,10 @@ impl Core {
             port.transmit_allowed()?;
             let mut step = Step::default();
             self.receive(port, &mut step)?;
-            step.receipt = self.complete(port)?;
+            step.receipt = match self.complete(port)? {
+                Some(receipt) => Some(receipt),
+                None => self.complete_batch(port)?,
+            };
             Ok(step)
         })();
         if result.is_err() {
@@ -435,8 +487,13 @@ impl Drop for Core {
                 core::mem::forget(memory);
             }
         }
+        if self.batch_published {
+            core::mem::forget(core::mem::take(&mut self.batch_buffers));
+        }
     }
 }
+#[path = "packet_core/batch.rs"]
+mod batch;
 
 #[cfg(feature = "kernel-test")]
 #[path = "packet_core/tests.rs"]

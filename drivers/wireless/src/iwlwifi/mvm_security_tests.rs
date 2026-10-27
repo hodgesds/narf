@@ -155,6 +155,7 @@ pub(in crate::iwlwifi) struct Device {
     last_m3: Vec<u8>,
     last_m4: Vec<u8>,
     rx_pn: u64,
+    expected_group_floor: Option<u64>,
 }
 struct Rekey {
     anonce: Option<[u8; 32]>,
@@ -203,6 +204,44 @@ fn ap_ethernet(pdu: &[u8]) -> Vec<u8> {
     bytes
 }
 impl Device {
+    pub(in crate::iwlwifi) fn restart_authenticator(
+        &mut self,
+        expected_group_floor: u64,
+    ) -> Result<(), &'static str> {
+        if self.enabled || self.keys.iter().any(Option::is_some) || !self.held.is_empty() {
+            return Err("model reconnect before native key/packet retirement");
+        }
+        let mut next = Self::new(self.api)?;
+        next.sync = self.sync;
+        next.events = core::mem::take(&mut self.events);
+        next.data = core::mem::take(&mut self.data);
+        next.expected_group_floor = Some(expected_group_floor);
+        *self = next;
+        Ok(())
+    }
+    /// Device-side aggregate model: authenticate the actual packet/key program
+    /// using the ordinary native model, but defer its single receipt. The
+    /// caller must supply a real model BA prefix or fallback TX_CMD later.
+    pub(in crate::iwlwifi) fn aggregate_packet(
+        &mut self,
+        p: runtime::model::Published,
+        fw: &mut runtime::model::Firmware,
+    ) -> Result<(), &'static str> {
+        if !self.held.is_empty() {
+            return Err("aggregate model overwrote a held control receipt");
+        }
+        let index = self.events.len();
+        self.react(p, fw, Some(index), None)?;
+        if self.events.last() != Some(&Kind::Data)
+            || self.held.len() != 1
+            || self.held[0].command != 0x1c
+            || self.held[0].body.len() != 48
+        {
+            return Err("aggregate model captured non-data transaction");
+        }
+        self.held.clear();
+        Ok(())
+    }
     pub(in crate::iwlwifi) fn release(&mut self, fw: &mut runtime::model::Firmware) {
         for receipt in core::mem::take(&mut self.held) {
             Self::inject(fw, receipt);
@@ -259,6 +298,7 @@ impl Device {
             last_m3: Vec::new(),
             last_m4: Vec::new(),
             rx_pn: 100,
+            expected_group_floor: None,
         })
     }
     fn seed(&self, fw: &mut runtime::model::Firmware) {
@@ -358,16 +398,17 @@ impl Device {
                         if group_key {
                             // Literal Linux CCMP RX-sequence wire cases,
                             // independent of the production key encoder.
-                            let bytes = match (self.api, self.rsc) {
-                                (_, 0) => [0; 8],
-                                (2, 20) => [0, 0, 0, 0, 0, 0, 0, 20],
-                                (3, 20) => [0, 0, 0, 0, 0, 20, 0, 0],
-                                (2, 0x0102_0304_0506) => [1, 2, 0, 0, 3, 4, 5, 6],
-                                (3, 0x0102_0304_0506) => [1, 2, 3, 4, 5, 6, 0, 0],
-                                (2, 0x0203_0405_0607) => [2, 3, 0, 0, 4, 5, 6, 7],
-                                (3, 0x0203_0405_0607) => [2, 3, 4, 5, 6, 7, 0, 0],
-                                _ => return Err("fixture lacks literal RSC case"),
-                            };
+                            let bytes =
+                                match (self.api, self.expected_group_floor.unwrap_or(self.rsc)) {
+                                    (_, 0) => [0; 8],
+                                    (2, 20) => [0, 0, 0, 0, 0, 0, 0, 20],
+                                    (3, 20) => [0, 0, 0, 0, 0, 20, 0, 0],
+                                    (2, 0x0102_0304_0506) => [1, 2, 0, 0, 3, 4, 5, 6],
+                                    (3, 0x0102_0304_0506) => [1, 2, 3, 4, 5, 6, 0, 0],
+                                    (2, 0x0203_0405_0607) => [2, 3, 0, 0, 4, 5, 6, 7],
+                                    (3, 0x0203_0405_0607) => [2, 3, 4, 5, 6, 7, 0, 0],
+                                    _ => return Err("fixture lacks literal RSC case"),
+                                };
                             pn[..8].copy_from_slice(&bytes);
                         }
                         if !self.m4
@@ -381,6 +422,7 @@ impl Device {
                         }
                         self.keys[slot] = Some(expected);
                         kind = if group_key {
+                            self.expected_group_floor = None;
                             self.group_adds += 1;
                             Kind::GroupKey
                         } else {
@@ -392,18 +434,38 @@ impl Device {
                     response = vec![1, 0, 0, 0];
                 }
                 (5, 2) => {
-                    let mut expected = [0; 20];
+                    let delba = b.get(12) == Some(&1);
+                    let mut expected = vec![0; if delba { 24 } else { 20 }];
                     expected[4] = 1;
-                    expected[8] = 8;
+                    expected[8] = if delba { 12 } else { 8 };
+                    expected[12] = u8::from(delba);
                     expected[14] = 1;
                     self.sync = self.sync.checked_add(1).ok_or("fixture sync overflow")?;
                     expected[16..20].copy_from_slice(&self.sync.to_le_bytes());
-                    if b != expected || self.enabled {
+                    if delba {
+                        if b.len() != 24 || b[20] >= 32 {
+                            return Err("native DEL_BA marker BAID/extent");
+                        }
+                        expected[20..24].copy_from_slice(&[b[20], 0, 0, 0]);
+                    }
+                    if b != expected || self.enabled && !delba {
                         return Err("native one-queue RX fence bytes/order");
                     }
                     kind = Kind::Fence;
-                    let mut marker = vec![8, 0, 0, 0, 0, 0, 1, 0];
+                    let mut marker = vec![
+                        if delba { 12 } else { 8 },
+                        0,
+                        0,
+                        0,
+                        u8::from(delba),
+                        0,
+                        1,
+                        0,
+                    ];
                     marker.extend_from_slice(&self.sync.to_le_bytes());
+                    if delba {
+                        marker.extend_from_slice(&b[20..24]);
+                    }
                     output.push(Receipt {
                         command: 0xff,
                         group: 5,
@@ -1761,4 +1823,44 @@ fn smoke_gen2_wpa2_linux_default_key_and_unversioned_rx_sync_contract() -> TestR
 kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2",
     smoke_gen2_wpa2_linux_default_key_and_unversioned_rx_sync_contract
+);
+
+fn smoke_gen2_wpa2_native_history_capacity_keeps_rekey_and_floor_proofs_bounded() -> TestResult {
+    check(|| {
+        let (mut f, mut device) = fixture(3)?;
+        secure(&mut f, &mut device)?;
+        // One PTK + initial GTK +30 genuinely authenticated fresh GTKs.
+        // Every rotation goes through native REMOVE/ADD and the RX marker.
+        for round in 0..30u8 {
+            device.challenge(
+                &mut f.firmware,
+                None,
+                3 + u64::from(round),
+                [0x80 + round; 16],
+                20,
+            )?;
+            service(&mut f, &mut device)?;
+        }
+        let events = device.events.len();
+        device.challenge(&mut f.firmware, None, 33, [0xb0; 16], 20)?;
+        if service(&mut f, &mut device).is_ok() || device.events.len() != events {
+            return Err(
+                "exhausted native history evicted a replay/retirement proof or emitted new key I/O",
+            );
+        }
+        let owner = f.owner.as_mut().unwrap();
+        if owner.phase() != Phase::Failed
+            || owner.data_port_using(|| Ok(policy()))
+            || runtime::model::retained(&owner.hardware).1 != 2
+        {
+            return Err(
+                "history exhaustion reopened secure port or reclaimed uncertain native DMA",
+            );
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/reconnect",
+    smoke_gen2_wpa2_native_history_capacity_keeps_rekey_and_floor_proofs_bounded
 );

@@ -15,16 +15,22 @@ mod active_scan_tests;
 #[path = "amsdu_rx_tests.rs"]
 mod amsdu_rx_tests;
 
+#[path = "dynamic_wmm_tests.rs"]
+mod dynamic_wmm_tests;
 #[path = "ht20_tests.rs"]
 mod ht20_tests;
 #[path = "ht40_tests.rs"]
 mod ht40_tests;
+#[path = "receive_epoch_tests.rs"]
+mod receive_epoch_tests;
 #[path = "rx_ba_tests.rs"]
 mod rx_ba_tests;
 #[path = "tx_ba_tests.rs"]
 mod tx_ba_tests;
 #[path = "tx_pipeline_station_tests.rs"]
 mod tx_pipeline_station_tests;
+#[path = "vht160_tests.rs"]
+mod vht160_tests;
 #[path = "vht_tests.rs"]
 mod vht_tests;
 #[path = "wmm_tests.rs"]
@@ -158,7 +164,12 @@ fn event(cmd: u8, seq: u8, status: u8) -> Vec<u8> {
 }
 #[derive(Debug)]
 struct Model {
+    chip_id: u16,
+    receive_epoch: u64,
+    receive_open: bool,
+    captured_packets: VecDeque<CapturedData>,
     ticks: Cell<u64>,
+    tick_step_ns: u64,
     management_stall_after: Option<usize>,
     ba_error_tag: Option<u16>,
     tx_ba_offer: Option<(u16, u16)>,
@@ -218,7 +229,12 @@ impl Model {
     fn new() -> Self {
         let resources = Arc::new(AtomicUsize::new(1));
         Self {
+            chip_id: 0,
+            receive_epoch: 0,
+            receive_open: false,
+            captured_packets: VecDeque::new(),
             ticks: Cell::new(0),
+            tick_step_ns: 1_000_000,
             management_stall_after: None,
             ba_error_tag: None,
             tx_ba_offer: None,
@@ -297,6 +313,9 @@ impl Drop for Lease {
     }
 }
 impl Backend for Model {
+    fn chip_id(&self) -> Result<u16, Error> {
+        Ok(self.chip_id)
+    }
     fn random_bytes(&mut self, out: &mut [u8]) -> Result<(), Error> {
         self.entropy_calls += 1;
         // Explicit deterministic model boundary, never a native fallback.
@@ -309,7 +328,7 @@ impl Backend for Model {
     }
     fn now_ns(&self) -> u64 {
         let now = self.ticks.get();
-        self.ticks.set(now + 1_000_000);
+        self.ticks.set(now + self.tick_step_ns);
         now
     }
     fn check(&self) -> Result<(), Error> {
@@ -507,7 +526,33 @@ impl Backend for Model {
         }
     }
     fn receive_data(&mut self) -> Result<Option<Vec<u8>>, Error> {
-        Ok(self.packets.pop_front())
+        Ok(self
+            .captured_packets
+            .pop_front()
+            .map(|packet| packet.bytes)
+            .or_else(|| self.packets.pop_front()))
+    }
+    fn receive_data_captured(&mut self) -> Result<Option<CapturedData>, Error> {
+        if let Some(packet) = self.captured_packets.pop_front() {
+            return Ok(Some(packet));
+        }
+        Ok(self.packets.pop_front().map(|bytes| CapturedData {
+            bytes,
+            epoch: self.receive_epoch,
+            port_open: self.receive_open,
+        }))
+    }
+    fn close_receive_capture(&mut self, epoch: u64) {
+        self.receive_epoch = epoch;
+        self.receive_open = false;
+    }
+    fn open_receive_capture(&mut self, epoch: u64) -> Result<(), Error> {
+        self.check()?;
+        if epoch == 0 || epoch != self.receive_epoch {
+            return Err(Error::Busy);
+        }
+        self.receive_open = true;
+        Ok(())
     }
     fn release(&mut self) -> Result<(), Error> {
         self.recovery_trace.push(("release", self.ticks.get()));
@@ -663,15 +708,15 @@ impl Backend for Model {
                     let parameters = u16::from_le_bytes([frame[29], frame[30]]);
                     let window = parameters >> 6;
                     let tid = ((parameters >> 2) & 15) as u8;
-                    if parameters & 3 != 2
+                    if parameters & 2 == 0
                         || tid >= 8
-                        || !(1..=32).contains(&window)
-                        || !window.is_power_of_two()
+                        || !(1..=64).contains(&window)
                         || !self.frames.iter().any(|(_, f)| {
                             f.len() == 68
                                 && f[34..36] == [3, 0]
                                 && f[56..60] == [6, 0, 12, 0]
                                 && f[60] == tid
+                                && f[62] == u8::from(parameters & 1 != 0)
                                 && f[63] == 1 << tid
                                 && f[66..68] == window.to_le_bytes()
                         })
@@ -819,7 +864,7 @@ impl Backend for Model {
     }
     fn receive_idle(&self) -> Result<bool, Error> {
         self.check()?;
-        Ok(self.packets.is_empty())
+        Ok(self.packets.is_empty() && self.captured_packets.is_empty())
     }
     fn management_complete(
         &mut self,
@@ -2186,6 +2231,10 @@ fn mt76_receive_discards_bad_descriptors_and_other_station_frames() -> TestResul
         channel: 6,
         aid: 42,
     };
+    // This isolated decoder fixture explicitly supplies its synthetic native
+    // station grant and receive generation; state alone cannot open RX.
+    session.station_permission = Some(test_permission());
+    session.renew_receive_epoch().unwrap();
     for (offset, value) in [
         (3, 0),       // Invalid RX packet discriminator.
         (7, 0x02),    // Descriptor integrity-error bit.
@@ -2345,6 +2394,7 @@ fn secure_model() -> Session<Model> {
             rsc: 5u64.to_le_bytes(),
         })
         .unwrap();
+    security.port_open = true; // This helper explicitly synthesizes an installed test port.
     session.security = Some(security);
     session.station_permission = Some(test_permission());
     session.state = State::Associated {
@@ -2354,6 +2404,7 @@ fn secure_model() -> Session<Model> {
         aid: 42,
     };
     session.boot_started = None;
+    session.renew_receive_epoch().unwrap();
     session
 }
 

@@ -93,6 +93,7 @@ impl<B: Backend> Session<B> {
         self.tid0_used = false;
         self.security = None;
         self.wmm = None;
+        self.wmm_pending = None;
         self.station_permission = None;
         self.ht20_rx = None;
         self.ht20_profile = None;

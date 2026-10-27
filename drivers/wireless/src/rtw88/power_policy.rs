@@ -160,6 +160,9 @@ pub struct Gate {
     scope: Scope,
     extension: Option<alloc::sync::Arc<super::station_profile::Grant>>,
     ht: Option<alloc::sync::Arc<super::ht::Grant>>,
+    rx_ba: Option<alloc::sync::Arc<super::rx_ba_power::Grant>>,
+    tx_ba: Option<alloc::sync::Arc<super::tx_ba_power::Grant>>,
+    protection: Option<alloc::sync::Arc<super::protection::Grant>>,
 }
 /// A C22 calibration source without extension dispatch. N22L retains this
 /// narrower type, so invoking its base cannot recursively invoke N22L again.
@@ -329,6 +332,9 @@ impl Gate {
         Self {
             extension: None,
             ht: None,
+            rx_ba: None,
+            tx_ba: None,
+            protection: None,
             scope: Scope::C22 {
                 calibration,
                 permission,
@@ -341,6 +347,9 @@ impl Gate {
             scope: Scope::C21(grant),
             extension: None,
             ht: None,
+            rx_ba: None,
+            tx_ba: None,
+            protection: None,
         }
     }
     pub(super) fn did(&self) -> u16 {
@@ -356,6 +365,15 @@ impl Gate {
         }
     }
     pub(super) fn current(&self) -> Result<(), Error> {
+        if let Some(g) = &self.protection {
+            return g.check().map_err(|_| Error::Authority);
+        }
+        if let Some(g) = &self.tx_ba {
+            return g.check().map_err(|_| Error::Authority);
+        }
+        if let Some(g) = &self.rx_ba {
+            return g.check().map_err(|_| Error::Authority);
+        }
         if let Some(g) = &self.ht {
             return g.check().map_err(|_| Error::Authority);
         }
@@ -383,6 +401,15 @@ impl Gate {
         &self,
         operation: impl FnOnce() -> Result<T, super::firmware_transport::Error>,
     ) -> Result<T, super::firmware_transport::Error> {
+        if let Some(g) = &self.protection {
+            return g.invoke(operation);
+        }
+        if let Some(g) = &self.tx_ba {
+            return g.invoke(operation);
+        }
+        if let Some(g) = &self.rx_ba {
+            return g.invoke(operation);
+        }
         if let Some(g) = &self.ht {
             return g.invoke(operation);
         }
@@ -475,6 +502,86 @@ impl Gate {
     pub(super) fn ht_grant(&self) -> Option<alloc::sync::Arc<super::ht::Grant>> {
         self.ht.clone()
     }
+    pub(super) fn with_rx_ba(
+        &self,
+        g: alloc::sync::Arc<super::rx_ba_power::Grant>,
+    ) -> Result<Self, super::firmware_transport::Error> {
+        if self.rx_ba.is_some()
+            || self.tx_ba.is_some()
+            || self.protection.is_some()
+            || self.ht.as_ref().is_none_or(|h| !g.matches(h))
+        {
+            return Err(super::firmware_transport::Error::State);
+        }
+        g.check()?;
+        let mut gate = self.clone();
+        gate.rx_ba = Some(g);
+        Ok(gate)
+    }
+    pub(super) fn allows_rx_ba(&self) -> bool {
+        self.rx_ba.is_some()
+    }
+    pub(super) fn tx_base(&self) -> Option<super::tx_ba_power::Base> {
+        if self.tx_ba.is_some() || self.protection.is_some() {
+            return None;
+        }
+        match &self.rx_ba {
+            Some(r) => Some(super::tx_ba_power::Base::R(r.clone())),
+            None => self.ht.clone().map(super::tx_ba_power::Base::H),
+        }
+    }
+    pub(super) fn with_tx_ba(
+        &self,
+        g: alloc::sync::Arc<super::tx_ba_power::Grant>,
+    ) -> Result<Self, super::firmware_transport::Error> {
+        if self.tx_base().as_ref().is_none_or(|b| !g.matches(b)) {
+            return Err(super::firmware_transport::Error::State);
+        }
+        g.check()?;
+        let mut gate = self.clone();
+        gate.tx_ba = Some(g);
+        Ok(gate)
+    }
+    pub(super) fn allows_tx_ba(&self) -> bool {
+        self.tx_ba.is_some()
+    }
+    pub(super) fn protection_base(&self) -> Option<super::protection::Base> {
+        if self.protection.is_some() {
+            return None;
+        }
+        if let Some(t) = &self.tx_ba {
+            return Some(super::protection::Base::T(t.clone()));
+        }
+        if let Some(r) = &self.rx_ba {
+            return Some(super::protection::Base::R(r.clone()));
+        }
+        self.ht.clone().map(super::protection::Base::H)
+    }
+    pub(super) fn with_protection(
+        &self,
+        g: alloc::sync::Arc<super::protection::Grant>,
+    ) -> Result<Self, super::firmware_transport::Error> {
+        if self
+            .protection_base()
+            .as_ref()
+            .is_none_or(|b| !g.matches(b))
+        {
+            return Err(super::firmware_transport::Error::State);
+        }
+        g.check()?;
+        let mut gate = self.clone();
+        gate.protection = Some(g);
+        Ok(gate)
+    }
+    pub(super) fn protection_grant(&self) -> Option<alloc::sync::Arc<super::protection::Grant>> {
+        self.protection.clone()
+    }
+    pub(super) fn rts_threshold(&self) -> Option<u32> {
+        self.protection.as_ref().map(|g| g.threshold())
+    }
+    pub(super) fn tx_grant(&self) -> Option<alloc::sync::Arc<super::tx_ba_power::Grant>> {
+        self.tx_ba.clone()
+    }
     pub(super) fn with_ht(
         &self,
         g: alloc::sync::Arc<super::ht::Grant>,
@@ -498,6 +605,15 @@ impl Gate {
         domain: &narf_wireless::reg::RegulatoryDomain,
         operation: impl FnOnce() -> Result<T, super::firmware_transport::Error>,
     ) -> Result<T, super::firmware_transport::Error> {
+        if let Some(g) = &self.protection {
+            return g.invoke(operation);
+        }
+        if let Some(g) = &self.tx_ba {
+            return g.invoke(operation);
+        }
+        if let Some(g) = &self.rx_ba {
+            return g.invoke(operation);
+        }
         if let Some(g) = &self.ht {
             return g.invoke(operation);
         }
@@ -554,6 +670,15 @@ impl Gate {
         &self,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<(), Error> {
+        if let Some(g) = &self.protection {
+            return g.check().map_err(|_| Error::Authority);
+        }
+        if let Some(g) = &self.tx_ba {
+            return g.check().map_err(|_| Error::Authority);
+        }
+        if let Some(g) = &self.rx_ba {
+            return g.check().map_err(|_| Error::Authority);
+        }
         if let Some(g) = &self.ht {
             return g.check().map_err(|_| Error::Authority);
         }

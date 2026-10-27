@@ -1,6 +1,8 @@
 //! Coherent PCI backend for x86_64 and aarch64.
 //! Linux reference: ecd997b0189a mt792x_dma.c.
-use super::{Backend, Error, Firmware, RadioInfo, Report, Retained, Session, State, MAX_FRAME};
+use super::{
+    Backend, CapturedData, Error, Firmware, RadioInfo, Report, Retained, Session, State, MAX_FRAME,
+};
 use crate::mt7921::{packet_tx, registers, regs::*};
 use alloc::{collections::VecDeque, vec, vec::Vec};
 #[cfg(not(target_arch = "aarch64"))]
@@ -136,7 +138,9 @@ struct Storage {
     data_dma: usize,
     tokens: packet_tx::Tokens,
     pending_events: VecDeque<Vec<u8>>,
-    pending_data: VecDeque<Vec<u8>>,
+    pending_data: VecDeque<CapturedData>,
+    receive_epoch: u64,
+    receive_open: bool,
 }
 impl Storage {
     // Caller has proved device quiescence and retired every hardware ring reference.
@@ -165,6 +169,8 @@ impl Storage {
         self.data_dma = 0;
         self.pending_events.clear();
         self.pending_data.clear();
+        self.receive_epoch = 0;
+        self.receive_open = false;
         dma_barrier();
     }
 }
@@ -217,11 +223,18 @@ impl Hardware {
         self.owner.storage.as_mut().ok_or(Error::Busy)?.rx[which].index = (slot + 1) % DEPTH;
         Ok(Some(frame))
     }
-    fn route_rx(&mut self, event: Option<bool>) -> Result<Option<Vec<u8>>, Error> {
+    fn route_rx(&mut self, event: Option<bool>) -> Result<Option<CapturedData>, Error> {
         self.check()?;
         let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
         if let Some(packet) = match event {
-            Some(true) => storage.pending_events.pop_front(),
+            Some(true) => storage
+                .pending_events
+                .pop_front()
+                .map(|bytes| CapturedData {
+                    bytes,
+                    epoch: 0,
+                    port_open: false,
+                }),
             Some(false) => storage.pending_data.pop_front(),
             None => None,
         } {
@@ -231,41 +244,93 @@ impl Hardware {
             let Some(packet) = self.receive_ring(which)? else {
                 continue;
             };
-            let rxd = u32::from_le_bytes(packet[..4].try_into().unwrap());
-            let kind = rxd >> 27;
-            let normal = kind == 2 || kind == 7 && (rxd >> 16) & 15 == 1;
-            if kind == 0 {
-                let releases = packet_tx::releases(&packet)?;
-                self.owner
-                    .storage
-                    .as_mut()
-                    .ok_or(Error::Busy)?
-                    .tokens
-                    .firmware_done(&releases)?;
-            } else if normal || kind == 7 {
-                if !normal && packet.len() < 32 {
-                    return Err(Error::MalformedEvent);
-                }
-                if event == Some(!normal) {
-                    return Ok(Some(packet));
-                }
-                let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
-                let queue = if normal {
-                    &mut storage.pending_data
-                } else {
-                    &mut storage.pending_events
-                };
-                if queue.len() == 32 {
-                    if !normal {
-                        return Err(Error::EventOverflow);
-                    }
-                    queue.pop_front(); // bounded RX loss under overload, never drop an MCU reply
-                }
-                queue.push_back(packet);
+            if let Some(packet) = self.route_packet(packet, event)? {
+                return Ok(Some(packet));
             }
             // TX-status and unknown reports do not satisfy a command waiter.
         }
         Ok(None)
+    }
+
+    fn route_packet(
+        &mut self,
+        bytes: Vec<u8>,
+        event: Option<bool>,
+    ) -> Result<Option<CapturedData>, Error> {
+        let rxd = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        let kind = rxd >> 27;
+        let normal = kind == 2 || kind == 7 && (rxd >> 16) & 15 == 1;
+        let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
+        if kind == 0 {
+            storage
+                .tokens
+                .firmware_done(&packet_tx::releases(&bytes)?)?;
+        } else if normal {
+            let packet = CapturedData {
+                bytes,
+                epoch: storage.receive_epoch,
+                port_open: storage.receive_open,
+            };
+            if event == Some(false) {
+                return Ok(Some(packet));
+            }
+            if storage.pending_data.len() == 32 {
+                storage.pending_data.pop_front(); // bounded RX loss under overload
+            }
+            storage.pending_data.push_back(packet);
+        } else if kind == 7 {
+            if bytes.len() < 32 {
+                return Err(Error::MalformedEvent);
+            }
+            if event == Some(true) {
+                return Ok(Some(CapturedData {
+                    bytes,
+                    epoch: 0,
+                    port_open: false,
+                }));
+            }
+            if storage.pending_events.len() == 32 {
+                return Err(Error::EventOverflow);
+            }
+            storage.pending_events.push_back(bytes);
+        }
+        Ok(None)
+    }
+
+    fn open_receive_capture(&mut self, epoch: u64) -> Result<(), Error> {
+        self.check()?;
+        let storage = self.owner.storage.as_ref().ok_or(Error::Busy)?;
+        if epoch == 0 || epoch != storage.receive_epoch {
+            return Err(Error::Busy);
+        }
+        if storage.receive_open {
+            return Ok(());
+        }
+        // Snapshot the finite completed prefix on all actual RX rings. Copies
+        // made while waiting for key/port receipts and this prefix keep their
+        // original closed admission facts. New arrivals do not extend the cut.
+        let mut cuts = [0; 3];
+        for (which, ring) in storage.rx.iter().enumerate() {
+            cuts[which] = self.read(ring.base + 12)? as usize;
+            if cuts[which] >= DEPTH {
+                return Err(Error::Ring);
+            }
+        }
+        for (which, cut) in cuts.into_iter().enumerate() {
+            for _ in 0..DEPTH {
+                if self.owner.storage.as_ref().ok_or(Error::Busy)?.rx[which].index == cut {
+                    break;
+                }
+                let packet = self.receive_ring(which)?.ok_or(Error::Ring)?;
+                let _ = self.route_packet(packet, None)?;
+            }
+            if self.owner.storage.as_ref().ok_or(Error::Busy)?.rx[which].index != cut {
+                return Err(Error::Ring);
+            }
+        }
+        self.check()?;
+        self.owner.storage.as_mut().ok_or(Error::Busy)?.receive_open = true;
+        Ok(())
     }
 
     // Private until association supplies a verified transmit-capable channel.
@@ -516,6 +581,12 @@ impl Backend for Hardware {
     fn check(&self) -> Result<(), Error> {
         crate::mt7921::pci::invoke(&self.authority, || ()).map_err(|_| Error::Authority)
     }
+    fn chip_id(&self) -> Result<u16, Error> {
+        let chip = (self.read(MT_HW_CHIPID)? & 0xffff) as u16;
+        matches!(chip, MTK_DEV_MT7961 | MTK_DEV_MT7922 | MTK_DEV_MT7920)
+            .then_some(chip)
+            .ok_or(Error::InvalidIdentity)
+    }
     fn check_tx_permission(
         &self,
         permission: crate::mt7921::association::TxPermission,
@@ -734,9 +805,23 @@ impl Backend for Hardware {
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, Error> {
         self.route_rx(Some(true))
+            .map(|packet| packet.map(|packet| packet.bytes))
     }
     fn receive_data(&mut self) -> Result<Option<Vec<u8>>, Error> {
         self.route_rx(Some(false))
+            .map(|packet| packet.map(|packet| packet.bytes))
+    }
+    fn receive_data_captured(&mut self) -> Result<Option<CapturedData>, Error> {
+        self.route_rx(Some(false))
+    }
+    fn close_receive_capture(&mut self, epoch: u64) {
+        if let Some(storage) = &mut self.owner.storage {
+            storage.receive_epoch = epoch;
+            storage.receive_open = false;
+        }
+    }
+    fn open_receive_capture(&mut self, epoch: u64) -> Result<(), Error> {
+        Hardware::open_receive_capture(self, epoch)
     }
     fn release(&mut self) -> Result<(), Error> {
         if !self.idle()? || self.read(GLOBAL)? & ENABLE != 0 {
@@ -843,6 +928,8 @@ impl Transport {
                 tokens: packet_tx::Tokens::new(),
                 pending_events: VecDeque::new(),
                 pending_data: VecDeque::new(),
+                receive_epoch: 0,
+                receive_open: false,
                 rx: [
                     Ring::allocate(RX_PRE, true)?,
                     Ring::allocate(RX_POST, true)?,
@@ -887,11 +974,42 @@ impl Transport {
         channels: &[u8],
         ssids: &[Vec<u8>],
     ) -> Result<super::ScanReport, Error> {
+        self.scan_active_with_ies(channels, ssids, &[]).await
+    }
+    /// Complete optional Probe Request elements in the native fixed IE field.
+    pub async fn scan_active_with_ies(
+        &mut self,
+        channels: &[u8],
+        ssids: &[Vec<u8>],
+        extra_ies: &[u8],
+    ) -> Result<super::ScanReport, Error> {
+        if ssids.is_empty() {
+            return Err(Error::Bounds);
+        }
+        self.scan_with_options(
+            channels,
+            ssids,
+            super::ScanOptions {
+                extra_ies,
+                random_mac: None,
+            },
+        )
+        .await
+    }
+    pub async fn scan_with_options(
+        &mut self,
+        channels: &[u8],
+        ssids: &[Vec<u8>],
+        options: super::ScanOptions<'_>,
+    ) -> Result<super::ScanReport, Error> {
+        super::validate_scan_options(options)?;
         // Bootstrap only at this explicit admission boundary. The running
         // scan must observe a cleared installation rather than reload it.
-        narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)?;
+        if !ssids.is_empty() {
+            narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)?;
+        }
         self.session
-            .scan_active_with_policy(channels, ssids, || {
+            .scan_with_options_and_policy(channels, ssids, options, || {
                 narf_wireless::reg::db::get_domain().ok_or(Error::Authority)
             })
             .await
@@ -985,6 +1103,22 @@ impl Transport {
 
     pub(super) fn step_network(&mut self, tx: Option<&[u8]>) -> Result<super::PacketStep, Error> {
         self.session.step_network(tx)
+    }
+    pub(super) fn receive_current(&self, epoch: u64) -> Result<bool, Error> {
+        self.session.receive_current(epoch)
+    }
+    pub(super) fn current_receive_epoch(&self) -> Result<Option<u64>, Error> {
+        let epoch = self.session.receive_epoch;
+        self.session
+            .receive_current(epoch)
+            .map(|current| current.then_some(epoch))
+    }
+    pub(super) fn publish_receive(
+        &self,
+        epoch: u64,
+        publish: impl FnOnce(),
+    ) -> Result<bool, Error> {
+        self.session.publish_receive(epoch, publish)
     }
 
     pub(super) async fn service_keys(&mut self) -> Result<(), Error> {

@@ -12,6 +12,8 @@ use narf_wireless::{
     station_security::{self, RawFrame, Security},
 };
 use zeroize::Zeroizing;
+// One whole mandatory A-MSDU must fit after a bounded ordinary-frame batch.
+const RECEIVE_OUTPUTS: usize = 64 + narf_wireless::amsdu::MAX_SUBFRAMES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Error {
@@ -84,7 +86,10 @@ enum Kind {
     Association,
     Security,
     Data,
+    RtsData,
     Decline,
+    Ba,
+    TxBa,
 }
 struct Pending {
     id: u64,
@@ -114,6 +119,15 @@ pub(super) struct State {
     prepared: bool,
     extension: Option<Arc<super::station_profile::Grant>>,
     ht: Option<Arc<super::ht::Grant>>,
+    rx_ba_grant: Option<Arc<super::rx_ba_power::Grant>>,
+    rx_ba: super::rx_ba::Table,
+    tx_ba_grant: Option<Arc<super::tx_ba_power::Grant>>,
+    protection: Option<Arc<super::protection::Grant>>,
+    tx_ba: super::tx_ba::Originator,
+    tx_config: Option<super::packet_format::Aggregation>,
+    data_pending: VecDeque<Pending>,
+    data_drain: Option<u64>,
+    qos_sequence: u16,
     local_ht: Option<association::phy::LocalPhy>,
     decline: Option<Vec<u8>>,
     wmm_requested: bool,
@@ -124,7 +138,8 @@ pub(super) struct State {
     peer: Option<ObservedBss>,
     plan: Option<JoinPlan>,
     security: Option<Security>,
-    incoming: VecDeque<(Mpdu, bool)>,
+    incoming: VecDeque<(Mpdu, bool, u64, bool)>,
+    ordered: VecDeque<(Mpdu, u64)>,
     received: VecDeque<Vec<u8>>,
     pending: Option<Pending>,
     delivered_reply: Option<Pending>,
@@ -157,6 +172,15 @@ impl State {
             prepared: false,
             extension: None,
             ht: None,
+            rx_ba_grant: None,
+            rx_ba: super::rx_ba::Table::new(),
+            tx_ba_grant: None,
+            protection: None,
+            tx_ba: super::tx_ba::Originator::new(),
+            tx_config: None,
+            data_pending: VecDeque::new(),
+            data_drain: None,
+            qos_sequence: 1,
             local_ht: None,
             decline: None,
             wmm_requested: false,
@@ -168,6 +192,7 @@ impl State {
             plan: None,
             security: None,
             incoming: VecDeque::new(),
+            ordered: VecDeque::new(),
             received: VecDeque::new(),
             pending: None,
             delivered_reply: None,
@@ -203,6 +228,9 @@ impl State {
         self.peer().is_some()
             && self.pending.is_none()
             && self.delivered_reply.is_none()
+            && self.data_pending.is_empty()
+            && self.data_drain.is_none()
+            && !self.tx_ba.waiting()
             && self.security.as_ref().is_none_or(Security::port_open)
     }
     pub(super) fn receive_open(&self) -> bool {
@@ -236,6 +264,12 @@ impl State {
             security.fail();
         }
         self.incoming.clear();
+        self.ordered.clear();
+        self.rx_ba.clear();
+        self.tx_ba.terminal();
+        self.tx_config = None;
+        self.data_pending.clear();
+        self.data_drain = None;
         self.received.clear();
         self.peer_commit = None;
         self.decline = None;
@@ -306,14 +340,24 @@ impl State {
         if self.admission.closed() {
             return Err(Error::State);
         }
-        if self.pending.is_some() || self.delivered_reply.is_some() {
+        if self.pending.is_some()
+            || self.delivered_reply.is_some()
+            || !self.data_pending.is_empty()
+            || self.data_drain.is_some()
+        {
             return Err(Error::Busy);
         }
-        if !matches!(kind, Kind::Security | Kind::Data) {
+        if !matches!(kind, Kind::Security | Kind::Data | Kind::RtsData) && bytes.len() != 20 {
             bytes[22..24].copy_from_slice(&(self.sequence << 4).to_le_bytes());
             self.sequence = (self.sequence + 1) & 4095;
         }
         let id = io.packet_submit(&bytes, kind != Kind::Data)?;
+        if kind == Kind::Ba {
+            self.rx_ba.submitted(&bytes)?;
+        }
+        if kind == Kind::TxBa {
+            self.tx_ba.submitted(&bytes)?;
+        }
         self.pending = Some(Pending { id, bytes, kind });
         Ok(())
     }
@@ -377,6 +421,16 @@ impl State {
             && (bytes[4..10] == self.own || bytes[4..10] == [255; 6])
     }
     fn delivery(&mut self, delivery: Receipt) -> Result<(), Error> {
+        if let Some(data) = self.data_pending.front() {
+            if data.id != delivery.id
+                || data.bytes != delivery.bytes
+                || !delivery.radio_acknowledged
+            {
+                return Err(Error::State);
+            }
+            self.data_pending.pop_front();
+            return Ok(());
+        }
         let pending = self.pending.take().ok_or(Error::State)?;
         if pending.id != delivery.id || pending.bytes != delivery.bytes {
             return Err(Error::State);
@@ -386,6 +440,10 @@ impl State {
         }
         if pending.kind == Kind::Security {
             self.delivered_reply = Some(pending);
+        } else if pending.kind == Kind::Ba {
+            self.rx_ba.delivered(&pending.bytes)?;
+        } else if pending.kind == Kind::TxBa {
+            self.tx_ba.delivered(&pending.bytes)?;
         }
         Ok(())
     }
@@ -418,12 +476,65 @@ impl State {
                 idle = true;
                 break;
             }
-            if let Some(frame) = step.frame {
+            if let Some(mut frame) = step.frame {
                 if frame.phy.is_some_and(|p| !p.initial_channel()) {
+                    continue;
+                }
+                let aggregate = frame.bytes().first() == Some(&0x88)
+                    && frame.bytes().get(24).is_some_and(|q| q & 0x80 != 0);
+                if frame.bytes().len() > super::packet_format::MAX_MPDU && !aggregate
+                    || aggregate && (self.ht.is_none() || frame.rate < 12)
+                {
                     continue;
                 }
                 if self.lost(&frame) {
                     return Err(Error::PeerLost);
+                }
+                if self.receive_open() && self.tx_ba_grant.is_some() {
+                    let ap = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                    if super::tx_ba::peer_delba(frame.bytes(), self.own, ap) {
+                        self.tx_ba.retire();
+                        continue;
+                    }
+                    if self.tx_ba.response(frame.bytes(), self.own, ap) {
+                        continue;
+                    }
+                }
+                // A peer DELBA can arrive while the success response's native
+                // receipt is held. Retire its proposal before any idle commit.
+                if self.receive_open() && self.rx_ba_grant.is_some() {
+                    let ap = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                    if let Some(tid) = super::rx_ba::delba(frame.bytes(), self.own, ap) {
+                        self.rx_ba.retire(tid);
+                        // Requests captured earlier in this same native batch
+                        // have not produced a Table proposal yet. Retire those
+                        // too, so a later loop cannot emit stale success.
+                        self.incoming.retain(|(f, _, _, _)| {
+                            super::rx_ba::request(f.bytes(), self.own, ap)
+                                .is_none_or(|r| r.tid() != tid)
+                        });
+                        continue;
+                    }
+                    if let Some((tid, ssn)) = super::rx_ba::bar(frame.bytes(), self.own, ap) {
+                        let epoch = self.admission.receive_generation();
+                        self.ordered.extend(
+                            self.rx_ba
+                                .advance(tid, ssn, now)?
+                                .into_iter()
+                                .map(|f| (f, epoch)),
+                        );
+                        continue;
+                    }
+                    frame = match self.rx_ba.stage_pending(
+                        frame,
+                        self.own,
+                        ap,
+                        self.admission.receive_generation(),
+                        now,
+                    )? {
+                        Some(f) => f,
+                        None => continue,
+                    };
                 }
                 self.cache(&frame, now);
                 if self.phase != Phase::Passive {
@@ -432,7 +543,16 @@ impl State {
                     }
                     let admitted =
                         self.established && self.security.as_ref().is_none_or(Security::port_open);
-                    self.incoming.push_back((frame, admitted));
+                    let captured = self
+                        .peer
+                        .as_ref()
+                        .is_some_and(|p| self.rx_ba.captured(&frame, self.own, p.bss.bssid));
+                    self.incoming.push_back((
+                        frame,
+                        admitted,
+                        self.admission.receive_generation(),
+                        captured,
+                    ));
                 }
             }
         }
@@ -447,9 +567,38 @@ impl State {
                 }
                 publication.invoke(|| Ok(security.reply_delivered(receipt.bytes.len())))??;
                 self.admission.retire_receive()?;
+                self.rx_ba.clear();
+                self.tx_ba.after_key();
+                self.ordered.clear();
+            }
+            if self.receive_open() {
+                io.station_publication()?.invoke(|| {
+                    let epoch = self.admission.receive_generation();
+                    self.ordered.extend(
+                        self.rx_ba
+                            .idle(now, epoch)
+                            .map_err(|_| firmware_transport::Error::State)?
+                            .into_iter()
+                            .map(|f| (f, epoch)),
+                    );
+                    Ok(())
+                })?;
             }
         }
+        if self.receive_open() && self.rx_ba_grant.is_some() {
+            let epoch = self.admission.receive_generation();
+            let ap = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+            self.ordered.extend(
+                self.rx_ba
+                    .expire(now, self.own, ap)?
+                    .into_iter()
+                    .map(|f| (f, epoch)),
+            );
+        }
         for _ in 0..64 {
+            if self.received.len() >= 64 {
+                break;
+            }
             if self.pending.is_some()
                 || self.delivered_reply.is_some()
                 || self.peer_commit.is_some()
@@ -460,9 +609,52 @@ impl State {
             {
                 break;
             }
-            let Some((frame, data_admitted)) = self.incoming.pop_front() else {
-                break;
-            };
+            let (frame, mut data_admitted, epoch, captured, ordered) =
+                match self.ordered.pop_front() {
+                    Some((f, e)) => (f, true, e, true, true),
+                    None => match self.incoming.pop_front() {
+                        Some((f, a, e, c)) => (f, a, e, c, false),
+                        None => break,
+                    },
+                };
+            // M3 can arrive in native DMA before the host observes the M2
+            // CCX/idle receipt. That receipt retires DATA/publication epochs,
+            // but cannot discard this still-private EAPOL transaction. Only
+            // an exact original plaintext authenticator control may cross;
+            // shared Security must still validate its phase/MIC/replay. Its
+            // captured DATA admission remains false, and it grants no BA.
+            let private_eapol = !ordered
+                && self
+                    .peer
+                    .as_ref()
+                    .is_some_and(|p| plaintext_eapol(frame.bytes(), self.own, p.bss.bssid));
+            if epoch != self.admission.receive_generation() {
+                if !private_eapol {
+                    continue;
+                }
+                // A previous open capture is not current DATA/BA admission.
+                // In particular a QoS EAPOL must not enter a successor TID
+                // window before the real Supplicant validates its control.
+                data_admitted = false;
+            }
+            if !ordered && self.receive_open() && data_admitted && self.rx_ba_grant.is_some() {
+                let ap = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                if let Some((tid, seq)) = super::rx_ba::data(frame.bytes(), self.own, ap) {
+                    if self.rx_ba.active(tid) {
+                        // Originals observed before the agreement's terminal
+                        // publication cannot be authorized retrospectively.
+                        if captured {
+                            self.ordered.extend(
+                                self.rx_ba
+                                    .push(tid, seq, now, frame)?
+                                    .into_iter()
+                                    .map(|f| (f, epoch)),
+                            );
+                        }
+                        continue;
+                    }
+                }
+            }
             match self.phase {
                 Phase::Authentication => {
                     if let Some(mut association) = self
@@ -534,6 +726,37 @@ impl State {
                     }
                 }
                 Phase::FourWay | Phase::Open => {
+                    if self.receive_open() && data_admitted {
+                        if let Some(g) = &self.rx_ba_grant {
+                            let ap = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                            if let Some(r) = super::rx_ba::request(frame.bytes(), self.own, ap) {
+                                if let Some(maximum) = g.window(r.tid()) {
+                                    g.check()?;
+                                    io.station_profile_readback()?;
+                                    let c21 =
+                                        self.ht.as_ref().ok_or(Error::State)?.rx_ba_identity().2
+                                            == 0xc821;
+                                    super::rx_ba::readback(io, c21)?;
+                                    if self.rx_ba.propose(
+                                        r,
+                                        maximum,
+                                        self.own,
+                                        ap,
+                                        now,
+                                        self.admission.receive_generation(),
+                                    )? {
+                                        if !self.rx_ba.active(r.tid()) {
+                                            self.incoming.retain(|(f, _, _, _)| {
+                                                super::rx_ba::data(f.bytes(), self.own, ap)
+                                                    .is_none_or(|(tid, _)| tid != r.tid())
+                                            });
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if self.ht.is_some() {
                         if let Some(bytes) = super::ht::decline(
                             frame.bytes(),
@@ -561,12 +784,17 @@ impl State {
                         continue;
                     }
                     let qos = frame.bytes().get(24..26);
+                    let live_ba = ordered && qos.is_some_and(|q| self.rx_ba.active(q[0] & 15));
                     let aggregate = frame.bytes().first() == Some(&0x88)
                         && qos.is_some_and(|q| q[0] & 0x80 != 0);
                     if frame.bytes().first() == Some(&0x88)
                         && (!self.data_profile.qos
                             || if self.ht.is_some() {
-                                qos.is_none_or(|q| q[0] & 0x70 != 0 || q[1] != 0)
+                                qos.is_none_or(|q| {
+                                    q[0] & 0x10 != 0
+                                        || q[1] != 0
+                                        || q[0] & 0x60 != 0 && !(live_ba && q[0] & 0x60 == 0x60)
+                                })
                             } else {
                                 qos != Some(&[0, 0])
                             })
@@ -600,7 +828,11 @@ impl State {
                             if !s.port_open() {
                                 continue;
                             }
-                            s.receive_amsdu(&frame)?
+                            if live_ba && qos.is_some_and(|q| q[0] & 0x60 == 0x60) {
+                                s.receive_amsdu_block_ack(&frame)?
+                            } else {
+                                s.receive_amsdu(&frame)?
+                            }
                         } else if b[1] & 0x40 == 0 {
                             narf_wireless::amsdu::decode(
                                 &b[26..],
@@ -612,7 +844,7 @@ impl State {
                             None
                         };
                         if let Some(frames) = decoded {
-                            if self.received.len().saturating_add(frames.len()) > 64 {
+                            if self.received.len().saturating_add(frames.len()) > RECEIVE_OUTPUTS {
                                 return Err(Error::State);
                             }
                             self.received.extend(frames);
@@ -636,7 +868,7 @@ impl State {
                                     self.ht.is_some(),
                                 ) {
                                     self.last_peer = now;
-                                    if self.received.len() == 64 {
+                                    if self.received.len() == RECEIVE_OUTPUTS {
                                         return Err(Error::State);
                                     }
                                     self.received.push_back(bytes);
@@ -646,6 +878,13 @@ impl State {
                                 self.admission.retire_receive()?;
                                 self.received.clear();
                                 self.incoming.clear();
+                                self.ordered.clear();
+                                self.rx_ba.clear();
+                                self.tx_ba.stop(
+                                    self.own,
+                                    self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
+                                    now,
+                                );
                                 self.decline = None;
                                 if self.established && !handshake_active {
                                     self.deadline = now.saturating_add(5000);
@@ -661,7 +900,7 @@ impl State {
                         self.ht.is_some(),
                     ) {
                         self.last_peer = now;
-                        if self.received.len() == 64 {
+                        if self.received.len() == RECEIVE_OUTPUTS {
                             return Err(Error::State);
                         }
                         self.received.push_back(bytes);
@@ -670,7 +909,12 @@ impl State {
                 _ => {}
             }
         }
-        if self.pending.is_none() && self.delivered_reply.is_none() {
+        self.service_tx_ba(io, now, idle)?;
+        if self.pending.is_none()
+            && self.delivered_reply.is_none()
+            && self.data_pending.is_empty()
+            && self.data_drain.is_none()
+        {
             if let Some(reply) = self
                 .security
                 .as_ref()
@@ -680,6 +924,10 @@ impl State {
                 self.transmit(io, reply, Kind::Security)?;
             } else if let Some(reply) = self.decline.take() {
                 self.transmit(io, reply, Kind::Decline)?;
+            } else if let Some(reply) = self.rx_ba.next() {
+                self.transmit(io, reply, Kind::Ba)?;
+            } else if let Some(reply) = self.tx_ba.next() {
+                self.transmit(io, reply, Kind::TxBa)?;
             }
         }
         if idle
@@ -844,6 +1092,20 @@ impl State {
                 false,
             )?;
             self.admission.run(|| io.packet_profile(p))?;
+            if let Some(g) = io.station_rx_ba_extension(h.clone())? {
+                self.admission.run(|| io.station_bind_rx_ba(g.clone()))?;
+                self.rx_ba_grant = Some(g);
+            }
+            if let Some(g) = io.station_tx_ba_extension()? {
+                self.admission.run(|| io.station_bind_tx_ba(g.clone()))?;
+                super::tx_ba::program(io)?;
+                self.tx_ba_grant = Some(g);
+            }
+            if let Some(g) = io.station_protection_extension()? {
+                self.admission
+                    .run(|| io.station_bind_protection(g.clone()))?;
+                self.protection = Some(g);
+            }
             self.ht = Some(h);
         }
         station_control::prepare_peer(io, bssid, &self.admission).await?;
@@ -869,7 +1131,7 @@ impl State {
                     Ok(())
                 })?;
             }
-            if self.established {
+            if self.established && (self.tx_ba_grant.is_none() || self.tx_ba.settled()) {
                 attempt.armed = false;
                 return Ok(());
             }
@@ -898,6 +1160,10 @@ impl State {
         result
     }
     fn send_inner(&mut self, io: &mut impl Io, frame: &[u8]) -> Result<(), Error> {
+        if self.tx_ba.active().is_some() {
+            self.send_batch_inner(io, &[frame])?;
+            return Ok(());
+        }
         if !self.ready() || !io.packet_ready() {
             return Err(Error::Busy);
         }
@@ -919,8 +1185,16 @@ impl State {
             bytes.extend_from_slice(&peer);
             bytes.extend_from_slice(&self.own);
             bytes.extend_from_slice(&frame[..6]);
-            bytes.extend_from_slice(&(self.sequence << 4).to_le_bytes());
-            self.sequence = (self.sequence + 1) & 4095;
+            let sequence = if self.tx_ba_grant.is_some() && self.data_profile.qos {
+                let s = self.qos_sequence;
+                self.qos_sequence = (s + 1) & 4095;
+                s
+            } else {
+                let s = self.sequence;
+                self.sequence = (s + 1) & 4095;
+                s
+            };
+            bytes.extend_from_slice(&(sequence << 4).to_le_bytes());
             if self.data_profile.qos {
                 bytes.extend_from_slice(&[0, 0]);
             }
@@ -928,9 +1202,19 @@ impl State {
             bytes.extend_from_slice(&frame[12..]);
             bytes
         };
-        self.transmit(io, native, Kind::Data)
+        let rts = self
+            .protection
+            .as_ref()
+            .is_some_and(|g| native.len() as u64 > u64::from(g.threshold()));
+        self.transmit(io, native, if rts { Kind::RtsData } else { Kind::Data })?;
+        if rts {
+            self.data_drain = Some(self.now()?);
+        }
+        Ok(())
     }
 }
+#[path = "station_tx_ba.rs"]
+mod tx;
 pub(super) fn admitted(frame: &[u8], own: [u8; 6]) -> bool {
     (14..=1514).contains(&frame.len())
         && frame[6..12] == own
@@ -953,10 +1237,14 @@ fn ethernet_profile(
 ) -> Option<Vec<u8>> {
     let header = if frame.first() == Some(&0x88)
         && qos
-        && frame
-            .get(24..26)
-            .is_some_and(|q| q[1] == 0 && if ht { q[0] & 0xf0 == 0 } else { q[0] == 0 })
-    {
+        && frame.get(24..26).is_some_and(|q| {
+            q[1] == 0
+                && if ht {
+                    q[0] & 0x90 == 0 && matches!(q[0] & 0x60, 0 | 0x60)
+                } else {
+                    q[0] == 0
+                }
+        }) {
         26
     } else {
         24
@@ -986,6 +1274,8 @@ fn ethernet_profile(
 fn plaintext_eapol(b: &[u8], own: [u8; 6], ap: [u8; 6]) -> bool {
     let at = if b.first() == Some(&0x88) { 26 } else { 24 };
     b.len() >= at + 12
+        && matches!(b[0], 8 | 0x88)
+        && b[22] & 15 == 0
         && b[1] & 0xc7 == 2
         && b[4..10] == own
         && b[10..16] == ap

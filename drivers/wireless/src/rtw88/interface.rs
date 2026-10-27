@@ -7,8 +7,8 @@ use super::{
     station::{self, Environment},
     station_control::Admission,
 };
-use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use alloc::{boxed::Box, collections::VecDeque, string::String, sync::Arc, vec, vec::Vec};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 use narf_wireless::{
@@ -17,14 +17,19 @@ use narf_wireless::{
 };
 use zeroize::Zeroizing;
 type Error = station::Error;
+const EINVAL: i32 = 22;
+const EBUSY: i32 = 16;
+const ENODEV: i32 = 19;
 struct Rings {
     rx: narf_ipc::Producer<Frame, RX_RING_N>,
     tx: narf_ipc::Consumer<Frame, TX_RING_N>,
     pending: Option<Frame>,
+    batch: VecDeque<Frame>,
 }
 impl Rings {
     fn clear(&mut self) {
         self.pending = None;
+        self.batch.clear();
         for _ in 0..TX_RING_N {
             if !matches!(self.tx.try_recv(), Ok(Some(_))) {
                 break;
@@ -44,6 +49,8 @@ pub(super) struct Device<I: Io> {
     admitted: AtomicBool,
     up: AtomicBool,
     port: AtomicBool,
+    rts_capable: AtomicBool,
+    rts: AtomicU32,
     bssid: AtomicU64,
     ht_capability: IrqSafeSpinLock<Option<[u8; 26]>>,
     receive_generation: AtomicU64,
@@ -107,6 +114,7 @@ impl<I: Io + 'static> Device<I> {
                 rx,
                 tx,
                 pending: None,
+                batch: VecDeque::new(),
             }),
             name: name.into(),
             local,
@@ -115,6 +123,8 @@ impl<I: Io + 'static> Device<I> {
             admitted: AtomicBool::new(false),
             up: AtomicBool::new(false),
             port: AtomicBool::new(false),
+            rts_capable: AtomicBool::new(false),
+            rts: AtomicU32::new(u32::MAX),
             bssid: AtomicU64::new(0),
             ht_capability: IrqSafeSpinLock::new(None),
             receive_generation: AtomicU64::new(0),
@@ -160,6 +170,9 @@ impl<I: Io + 'static> Device<I> {
     }
     fn link(&self, peer: Option<[u8; 6]>, port: bool) {
         let _metadata = self.metadata.lock();
+        if peer.is_none() {
+            self.rts_capable.store(false, Ordering::Release);
+        }
         let peer = peer.filter(|_| !self.closed());
         let mut packed = [0; 8];
         if let Some(peer) = peer {
@@ -184,6 +197,7 @@ impl<I: Io + 'static> Device<I> {
     ) -> Result<super::publication::Publication, Error> {
         let peer = owner.station_peer();
         let port = owner.station_receive_open();
+        let rts = owner.station_rts_threshold();
         let authority = owner.station_publication()?;
         let generation = self.admission.receive_generation();
         self.admission.run(|| {
@@ -192,6 +206,9 @@ impl<I: Io + 'static> Device<I> {
                     self.clear_receive();
                 }
                 self.link(peer, port);
+                self.rts.store(rts.unwrap_or(u32::MAX), Ordering::Release);
+                self.rts_capable
+                    .store(rts.is_some() && peer.is_some(), Ordering::Release);
                 Ok(())
             })
         })?;
@@ -296,6 +313,9 @@ impl<I: Io + 'static> Device<I> {
                 return Ok(Vec::new());
             }
             if rings.pending.is_none() {
+                rings.pending = rings.batch.pop_front();
+            }
+            if rings.pending.is_none() {
                 for _ in 0..16 {
                     let Ok(Some(frame)) = rings.tx.try_recv() else {
                         break;
@@ -307,7 +327,47 @@ impl<I: Io + 'static> Device<I> {
                 }
             }
             if owner.station_ready() {
-                if let Some(frame) = rings.pending.as_ref() {
+                if owner.station_batch_active() && rings.pending.is_some() {
+                    let capacity = owner.station_batch_capacity();
+                    for _ in 0..16 {
+                        if rings.batch.len() + 1 >= capacity {
+                            break;
+                        }
+                        let Ok(Some(frame)) = rings.tx.try_recv() else {
+                            break;
+                        };
+                        if station::admitted(frame.payload(), self.local)
+                            && offloads(frame.tx_meta())
+                        {
+                            rings.batch.push_back(frame);
+                        }
+                    }
+                    let mut frames = Vec::new();
+                    if let Some(first) = rings.pending.as_ref() {
+                        frames.push(first.payload());
+                    }
+                    frames.extend(
+                        rings
+                            .batch
+                            .iter()
+                            .take(capacity.saturating_sub(1))
+                            .map(Frame::payload),
+                    );
+                    match owner.station_send_batch(&frames) {
+                        Ok(count) => {
+                            if count == 0 || count > frames.len() {
+                                return Err(Error::State);
+                            }
+                            rings.pending = None;
+                            for _ in 1..count {
+                                rings.batch.pop_front();
+                            }
+                        }
+                        Err(Error::Busy)
+                        | Err(Error::Transport(super::packet_core::Error::Busy)) => {}
+                        Err(error) => return Err(error),
+                    }
+                } else if let Some(frame) = rings.pending.as_ref() {
                     match owner.station_send(frame.payload()) {
                         Ok(()) => rings.pending = None,
                         Err(Error::Busy)
@@ -450,6 +510,38 @@ impl<I: Io + 'static> Interface for Device<I> {
 }
 #[async_trait::async_trait]
 impl<I: Io + 'static> WirelessNetIface for Device<I> {
+    fn rts_threshold(&self) -> Option<u32> {
+        (!self.closed() && self.rts_capable.load(Ordering::Acquire))
+            .then(|| self.rts.load(Ordering::Acquire))
+    }
+    fn set_rts_threshold(&self, value: u32) -> Result<(), i32> {
+        if value != u32::MAX && value > 2347 {
+            return Err(EINVAL);
+        }
+        if self.closed() {
+            return Err(ENODEV);
+        }
+        let mut storage = self.lifecycle.retained.try_lock().ok_or(EBUSY)?;
+        let owner = storage.as_mut().ok_or(EBUSY)?;
+        let result = owner.station_set_rts_threshold(value);
+        match result {
+            Ok(()) => {
+                let current = owner.station_rts_threshold();
+                self.rts
+                    .store(current.unwrap_or(u32::MAX), Ordering::Release);
+                self.rts_capable.store(current.is_some(), Ordering::Release);
+                Ok(())
+            }
+            Err(Error::Busy | Error::State) => Err(EBUSY),
+            Err(Error::Profile | Error::Native(super::firmware_transport::Error::Unsupported)) => {
+                Err(narf_wireless::EOPNOTSUPP)
+            }
+            Err(_) => {
+                self.close();
+                Err(ENODEV)
+            }
+        }
+    }
     fn supports_handshake_offload(&self) -> bool {
         true
     }
@@ -582,6 +674,15 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         let result = owner
             .station_associate(request.bssid, &request.ssid, pmk, &request.ie)
             .await;
+        #[cfg(feature = "kernel-test")]
+        if let Err(error) = &result {
+            narf_console::klog!(
+                "RTW native association failed {:?}, phase {:?}, peer {:?}\n",
+                error,
+                owner.station_phase(),
+                owner.station_peer()
+            );
+        }
         attempt.armed = false;
         if self.closed() {
             self.link(None, false);

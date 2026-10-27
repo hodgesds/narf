@@ -21,9 +21,11 @@ pub enum Width {
     Twenty,
     Forty,
     Eighty,
+    OneSixty,
 }
 
-/// Initial local encoding supports equal-modulation MCS0..31, no STBC/LDPC,
+/// Local encoding supports equal-modulation MCS0..31, optional directional LDPC
+/// and one-stream RX STBC, no TX STBC,
 /// HT-control, beamforming or optional large A-MSDU. RX/TX must include
 /// mandatory MCS0..7 (IEEE20.3.5; Linux ath10k/mac.c peer HT-rate check).
 /// An optional subset bounds TX selection without changing capability IEs.
@@ -36,6 +38,9 @@ pub struct LocalHt {
     gi: HtGi,
     factor: u8,
     density: u8,
+    rx_ldpc: bool,
+    tx_ldpc: bool,
+    rx_stbc: bool,
 }
 impl LocalHt {
     pub fn new(
@@ -63,6 +68,9 @@ impl LocalHt {
             gi,
             factor: ampdu_factor,
             density: mpdu_density,
+            rx_ldpc: false,
+            tx_ldpc: false,
+            rx_stbc: false,
         })
     }
     pub fn siso20(rx_sgi20: bool, tx_sgi20: bool) -> Self {
@@ -79,7 +87,22 @@ impl LocalHt {
             },
             factor: 0,
             density: 0,
+            rx_ldpc: false,
+            tx_ldpc: false,
+            rx_stbc: false,
         }
+    }
+    /// Advertised LDPC is a local RX promise. TX coding additionally needs
+    /// the bound AP's RX support; neither boolean grants native authority.
+    pub fn with_ldpc(mut self, rx: bool, tx: bool) -> Self {
+        self.rx_ldpc = rx;
+        self.tx_ldpc = tx;
+        self
+    }
+    /// Promise reception of one STBC data stream; TX STBC stays absent.
+    pub fn with_rx_stbc(mut self, enabled: bool) -> Self {
+        self.rx_stbc = enabled;
+        self
     }
     /// Bound TX rate selection to a subset of actual implemented TX support.
     /// This expresses policy facts only; native power/radio proofs remain
@@ -98,7 +121,9 @@ impl LocalHt {
     }
     pub fn capability_body(&self) -> [u8; 26] {
         let mut body = [0; 26];
-        let cap: u16 = 0x000c // SMPS disabled, no optional receive feature.
+        let cap: u16 = 0x000c // SMPS disabled; optional features are explicit below.
+            | u16::from(self.rx_ldpc)
+            | (u16::from(self.rx_stbc) << 8)
             | if self.width == HtWidth::TwentyForty { 2 } else { 0 }
             | if self.gi.rx20 { 0x20 } else { 0 }
             | if self.gi.rx40 { 0x40 } else { 0 };
@@ -121,6 +146,12 @@ pub struct LocalVht {
     rx_sgi: bool,
     tx_sgi: bool,
     factor: u8,
+    rx_ldpc: bool,
+    tx_ldpc: bool,
+    rx_stbc: bool,
+    width160: bool,
+    rx_sgi160: bool,
+    tx_sgi160: bool,
 }
 impl LocalVht {
     pub fn new(
@@ -139,11 +170,38 @@ impl LocalVht {
             rx_sgi: rx_sgi80,
             tx_sgi: tx_sgi80,
             factor: ampdu_exponent,
+            rx_ldpc: false,
+            tx_ldpc: false,
+            rx_stbc: false,
+            width160: false,
+            rx_sgi160: false,
+            tx_sgi160: false,
         })
+    }
+    pub fn with_ldpc(mut self, rx: bool, tx: bool) -> Self {
+        self.rx_ldpc = rx;
+        self.tx_ldpc = tx;
+        self
+    }
+    pub fn with_rx_stbc(mut self, enabled: bool) -> Self {
+        self.rx_stbc = enabled;
+        self
+    }
+    /// Enable contiguous160 only; 80+80 and extended NSS/BW remain absent.
+    pub fn with_160mhz(mut self, rx_sgi160: bool, tx_sgi160: bool) -> Self {
+        self.width160 = true;
+        self.rx_sgi160 = rx_sgi160;
+        self.tx_sgi160 = tx_sgi160;
+        self
     }
     pub fn capability_body(&self) -> [u8; 12] {
         let mut body = [0; 12];
-        let cap = (u32::from(self.factor) << 23) | if self.rx_sgi { 1 << 5 } else { 0 };
+        let cap = (u32::from(self.factor) << 23)
+            | (u32::from(self.rx_ldpc) << 4)
+            | (u32::from(self.rx_stbc) << 8)
+            | (u32::from(self.width160) << 2)
+            | (u32::from(self.rx_sgi160) << 6)
+            | if self.rx_sgi { 1 << 5 } else { 0 };
         body[..4].copy_from_slice(&cap.to_le_bytes());
         body[4..6].copy_from_slice(&self.rx.to_le_bytes());
         body[8..10].copy_from_slice(&self.tx.to_le_bytes());
@@ -175,7 +233,13 @@ impl LocalPhy {
         })
     }
     pub fn vht80(ht: LocalHt, vht: LocalVht) -> Result<Self, Error> {
-        if ht.width != HtWidth::TwentyForty {
+        if ht.width != HtWidth::TwentyForty || vht.width160 {
+            return Err(Error::UnsupportedRates);
+        }
+        Ok(Self { ht, vht: Some(vht) })
+    }
+    pub fn vht160(ht: LocalHt, vht: LocalVht) -> Result<Self, Error> {
+        if ht.width != HtWidth::TwentyForty || !vht.width160 {
             return Err(Error::UnsupportedRates);
         }
         Ok(Self { ht, vht: Some(vht) })
@@ -329,6 +393,15 @@ pub struct HtNegotiation {
     basic: [u8; 10],
 }
 impl HtNegotiation {
+    pub fn rx_stbc(&self) -> bool {
+        self.local.rx_stbc
+    }
+    pub fn rx_ldpc(&self) -> bool {
+        self.local.rx_ldpc
+    }
+    pub fn tx_ldpc(&self) -> bool {
+        self.local.tx_ldpc && self.peer_capability() & 1 != 0
+    }
     pub fn tx_mcs(&self) -> [u8; 10] {
         self.tx
     }
@@ -381,6 +454,21 @@ pub struct VhtNegotiation {
     basic: u16,
 }
 impl VhtNegotiation {
+    pub fn rx_sgi160(&self) -> bool {
+        self.local.rx_sgi160
+    }
+    pub fn tx_sgi160(&self) -> bool {
+        self.local.tx_sgi160 && self.peer_capability() & 0x40 != 0
+    }
+    pub fn rx_stbc(&self) -> bool {
+        self.local.rx_stbc
+    }
+    pub fn rx_ldpc(&self) -> bool {
+        self.local.rx_ldpc
+    }
+    pub fn tx_ldpc(&self) -> bool {
+        self.local.tx_ldpc && self.peer_capability() & (1 << 4) != 0
+    }
     pub fn rx_mcs_map(&self) -> u16 {
         self.local.rx
     }
@@ -420,7 +508,7 @@ struct Selection {
     vht: Option<VhtNegotiation>,
     width: Width,
     center: u8,
-    channels: [u8; 4],
+    channels: [u8; 8],
     count: usize,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -489,9 +577,12 @@ impl Offer {
         // A response cannot restore a transmit GI omitted by the scan offer.
         next.ht.local.gi.tx20 &= self.0.ht.tx_sgi20();
         next.ht.local.gi.tx40 &= self.0.ht.tx_sgi40();
+        next.ht.local.tx_ldpc &= self.0.ht.tx_ldpc();
         if let (Some(old), Some(new)) = (self.0.vht, next.vht.as_mut()) {
             new.tx = intersect_maps(new.tx, old.tx);
             new.local.tx_sgi &= old.tx_sgi80();
+            new.local.tx_sgi160 &= old.tx_sgi160();
+            new.local.tx_ldpc &= old.tx_ldpc();
             if !map_has_rates(new.tx)
                 || !supports_map(new.tx, old.basic)
                 || !supports_map(new.local.rx, old.basic)
@@ -550,14 +641,14 @@ fn select(local: LocalPhy, ap: ApElements, primary: u8) -> Result<Selection, Err
         vht: None,
         width: Width::Twenty,
         center: primary,
-        channels: [primary, 0, 0, 0],
+        channels: [primary, 0, 0, 0, 0, 0, 0, 0],
         count: 1,
     };
     if local.ht.width == HtWidth::TwentyForty && le16(&cap[..2]) & 2 != 0 {
         if let Some(second) = op.secondary {
             selected.width = Width::Forty;
             selected.center = ((u16::from(primary) + u16::from(second)) / 2) as u8;
-            selected.channels = [primary.min(second), primary.max(second), 0, 0];
+            selected.channels = [primary.min(second), primary.max(second), 0, 0, 0, 0, 0, 0];
             selected.count = 2;
         }
     }
@@ -567,7 +658,8 @@ fn select(local: LocalPhy, ap: ApElements, primary: u8) -> Result<Selection, Err
         }
         let peer_info = le32(&peer[..4]);
         // Extended NSS/BW requires a separate implementation of its tables.
-        if peer_info >> 30 != 0 || le16(&peer[10..12]) & (1 << 13) != 0 {
+        if peer_info >> 30 != 0 || le16(&peer[10..12]) & (1 << 13) != 0 || (peer_info >> 2) & 3 == 3
+        {
             return Err(Error::UnsupportedRates);
         }
         let tx = intersect_maps(local_vht.tx, le16(&peer[4..6]));
@@ -575,16 +667,13 @@ fn select(local: LocalPhy, ap: ApElements, primary: u8) -> Result<Selection, Err
         if !map_has_rates(tx) || !supports_map(tx, basic) || !supports_map(local_vht.rx, basic) {
             return Err(Error::UnsupportedRates);
         }
-        if operation[2] != 0 {
-            return Err(Error::UnsupportedRates);
-        }
         match operation[0] {
             0 => {
-                if operation[1] != 0 && operation[1] != selected.center {
+                if operation[2] != 0 || operation[1] != 0 && operation[1] != selected.center {
                     return Err(Error::InvalidBss);
                 }
             }
-            1 => {
+            1 if operation[2] == 0 => {
                 let center = operation[1];
                 if ![42, 58, 106, 122, 138, 155, 171].contains(&center)
                     || selected.width != Width::Forty
@@ -601,8 +690,55 @@ fn select(local: LocalPhy, ap: ApElements, primary: u8) -> Result<Selection, Err
                 }
                 selected.width = Width::Eighty;
                 selected.center = center;
-                selected.channels = channels;
+                selected.channels[..4].copy_from_slice(&channels);
                 selected.count = 4;
+            }
+            1 | 2 => {
+                // Deprecated width2 uses the contiguous160 center in seg0;
+                // revised width1 uses primary80 seg0 and full160 seg1.
+                let center = if operation[0] == 2 {
+                    if operation[2] != 0 {
+                        return Err(Error::UnsupportedRates);
+                    }
+                    operation[1]
+                } else {
+                    operation[2]
+                };
+                if ![1, 2].contains(&((peer_info >> 2) & 3))
+                    || selected.width != Width::Forty
+                    || ![50, 114, 163].contains(&center)
+                {
+                    return Err(Error::UnsupportedRates);
+                }
+                let first = center - 14;
+                let channels = core::array::from_fn(|i| first + i as u8 * 4);
+                let index = channels
+                    .iter()
+                    .position(|ch| *ch == primary)
+                    .ok_or(Error::InvalidBss)?;
+                if op.secondary != Some(channels[index ^ 1])
+                    || operation[0] == 1
+                        && operation[1] != if index < 4 { center - 8 } else { center + 8 }
+                    || channels
+                        .iter()
+                        .any(|ch| channel::band(*ch) != Some(channel::Band::Ghz5))
+                {
+                    return Err(Error::InvalidBss);
+                }
+                if local_vht.width160 {
+                    selected.width = Width::OneSixty;
+                    selected.center = center;
+                    selected.channels = channels;
+                    selected.count = 8;
+                } else {
+                    // A narrower local station may use the primary80 half
+                    // of a real contiguous160 BSS, without advertising160.
+                    let start = if index < 4 { 0 } else { 4 };
+                    selected.width = Width::Eighty;
+                    selected.center = if index < 4 { center - 8 } else { center + 8 };
+                    selected.channels[..4].copy_from_slice(&channels[start..start + 4]);
+                    selected.count = 4;
+                }
             }
             _ => return Err(Error::UnsupportedRates),
         }

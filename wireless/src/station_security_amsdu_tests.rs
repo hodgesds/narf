@@ -2,6 +2,57 @@ use super::*;
 
 const REMOTE: [u8; 6] = [2, 0, 0, 0, 0, 3];
 const GROUP: [u8; 6] = [1, 0, 0x5e, 0, 0, 1];
+
+fn smoke_station_amsdu_block_ack_requires_explicit_raw_current_port_and_shared_key() -> TestResult {
+    let p = ptk(AN, SN);
+    for tid in 0..16 {
+        let mut s = established();
+        let (body, expected) = plaintext(OWN);
+        let frame = aggregate_policy(OWN, tid, &p.tk, 1, 0, &body, 0xe0);
+        let original = frame.bytes.clone();
+        if s.receive_amsdu(&frame) != Ok(None)
+            || s.receive(&frame, SN) != Ok(Rx::Ignored)
+            || s.receive_amsdu_block_ack(&frame) != Ok(Some(expected))
+            || s.receive_amsdu_block_ack(&frame) != Ok(None)
+            || frame.bytes != original
+            || !s.port_open()
+        {
+            return TestResult::Fail(
+                "BlockAck aggregate opt-in/raw header/current key/one replay owner",
+            );
+        }
+    }
+    let (body, expected) = plaintext(OWN);
+    let mut frame = aggregate_policy(OWN, 3, &p.tk, 1, 0, &body, 0xe0);
+    if security().receive_amsdu_block_ack(&frame) != Err(Error::State) {
+        return TestResult::Fail("BlockAck aggregate opened an unestablished port");
+    }
+    let mut s = established();
+    frame.raw = false;
+    if s.receive_amsdu_block_ack(&frame) != Ok(None) {
+        return TestResult::Fail("BlockAck opt-in admitted a transformed native frame");
+    }
+    frame.raw = true;
+    let repeated = key_frame(0x13ca, 3, AN, &kde(GTK), Some(&p));
+    if s.receive(&mpdu(native(&repeated, false)), SN) != Ok(Rx::ReplyReady)
+        || s.receive_amsdu_block_ack(&frame) != Err(Error::State)
+    {
+        return TestResult::Fail("BlockAck aggregate escaped a pending native reply/key receipt");
+    }
+    deliver(&mut s);
+    if s.receive_amsdu_block_ack(&frame) != Ok(Some(expected)) {
+        return TestResult::Fail("pending/raw BlockAck rejection consumed same-PN valid aggregate");
+    }
+    s.fail();
+    if s.receive_amsdu_block_ack(&frame) != Err(Error::State) {
+        return TestResult::Fail("BlockAck aggregate escaped a failed controlled port");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/station_security/amsdu",
+    smoke_station_amsdu_block_ack_requires_explicit_raw_current_port_and_shared_key
+);
 fn plaintext(receiver: [u8; 6]) -> (Vec<u8>, Vec<Vec<u8>>) {
     let mut body = Vec::new();
     let mut expected = Vec::new();
@@ -25,11 +76,22 @@ fn plaintext(receiver: [u8; 6]) -> (Vec<u8>, Vec<Vec<u8>>) {
     (body, expected)
 }
 fn aggregate(receiver: [u8; 6], tid: u8, tk: &[u8], pn: u64, id: u8, body: &[u8]) -> Mpdu {
+    aggregate_policy(receiver, tid, tk, pn, id, body, 0x80)
+}
+fn aggregate_policy(
+    receiver: [u8; 6],
+    tid: u8,
+    tk: &[u8],
+    pn: u64,
+    id: u8,
+    body: &[u8],
+    policy: u8,
+) -> Mpdu {
     let mut header = vec![0x88, 0x42, 0, 0];
     header.extend_from_slice(&receiver);
     header.extend_from_slice(&AP);
     header.extend_from_slice(&REMOTE);
-    header.extend_from_slice(&[0, 0, 0x80 | tid, 0]);
+    header.extend_from_slice(&[0, 0, policy | tid, 0]);
     let wire = crate::ccmp::protect(
         &Ccm,
         &header,

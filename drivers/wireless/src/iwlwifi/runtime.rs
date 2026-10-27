@@ -43,6 +43,9 @@ pub(super) fn write_dma(buffer: &DmaBuffer, offset: usize, bytes: &[u8]) {
 pub struct Packet {
     pub header: rx::RxPacketHeader,
     pub payload: Vec<u8>,
+    /// Immutable RFH copy-time owner. Closed-port captures never acquire a
+    /// later key/association epoch merely because parsing was delayed.
+    pub receive_epoch: Option<u64>,
 }
 
 /// Extract notifications/responses without treating padding or a short
@@ -62,6 +65,7 @@ pub fn packets(bytes: &[u8]) -> Result<Vec<Packet>, &'static str> {
         result.push(Packet {
             header,
             payload: bytes[offset + 8..offset + 4 + length].to_vec(),
+            receive_epoch: None,
         });
         offset += (length + 4).next_multiple_of(64);
     }
@@ -560,6 +564,8 @@ pub struct Hardware {
     armed: bool,
     failed: bool,
     station_stop: Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>,
+    rx_epoch: rx_epoch::State,
+    sources: Option<source::Assets>,
 }
 
 impl core::fmt::Debug for Hardware {
@@ -654,6 +660,8 @@ impl Hardware {
             armed: false,
             failed: false,
             station_stop: None,
+            rx_epoch: rx_epoch::State::default(),
+            sources: None,
         })
     }
 
@@ -782,6 +790,31 @@ impl Hardware {
     }
 
     pub async fn start(&mut self, parsed: &ParsedUcode<'_>) -> Result<[u8; 6], &'static str> {
+        use core::{
+            future::{poll_fn, Future},
+            pin::pin,
+        };
+        let assets = self.source_assets()?;
+        let pci = self.cap;
+        let result = {
+            let mut future = pin!(self.start_inner(parsed));
+            poll_fn(|cx| {
+                assets
+                    .invoke(|| {
+                        super::mmio::invoke(&pci, || future.as_mut().poll(cx))
+                            .map_err(|_| "Intel startup PCI authority revoked")
+                    })
+                    .unwrap_or_else(|e| core::task::Poll::Ready(Err(e)))
+            })
+            .await
+        };
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+
+    async fn start_inner(&mut self, parsed: &ParsedUcode<'_>) -> Result<[u8; 6], &'static str> {
         use super::regs::*;
         if super::chip_config_for_pci_id(self.device.id.vendor, self.device.id.device)
             .is_some_and(|chip| chip.mac == super::MacFamily::ScA0)
@@ -998,9 +1031,11 @@ impl Hardware {
     }
 
     pub fn poll(&mut self) -> Result<(), &'static str> {
-        let result = self.poll_inner();
+        let result = self
+            .source_fence()
+            .and_then(|source| source.invoke(|| self.poll_inner()));
         if result.is_err() {
-            self.failed = true;
+            self.fail();
         }
         result
     }
@@ -1020,10 +1055,15 @@ impl Hardware {
                 return Err("Wi-Fi hardware radio disabled");
             }
         }
-        for packet in self.resources.rx.drain(&mut self.mmio)? {
+        let capture = self.rx_epoch.capture();
+        for mut packet in self.resources.rx.drain(&mut self.mmio)? {
+            packet.receive_epoch = capture;
             if packet.header.group_id == 0 && packet.header.cmd == 0xc5 {
                 if !matches!(self.version(0, 0xc5).map(|v| v.1), Some(4 | 6 | 7)) {
                     return Err("unsupported compressed BA notification");
+                }
+                if self.format == rx_rfh::CompletionFormat::Qu {
+                    super::aggregation::validate_gen2_tx_ba(&packet.payload)?;
                 }
                 super::aggregation::complete_tx_ba(&mut self.resources.data, &packet.payload)?;
                 continue;
@@ -1055,7 +1095,7 @@ impl Hardware {
                 self.responses.push_back(packet);
             } else {
                 if self.notifications.len() == 256 {
-                    self.notifications.pop_front();
+                    return Err("native Intel notification ownership overflow");
                 }
                 self.notifications.push_back(packet);
             }
@@ -1104,24 +1144,77 @@ impl Hardware {
         Ok(())
     }
 
-    pub async fn remove_tx(&mut self, id: u16, station: u8, tid: u8) -> Result<(), &'static str> {
-        let index = self
-            .resources
+    pub(super) fn gen2_tx_aggregation(
+        &mut self,
+        id: u16,
+        enabled: bool,
+    ) -> Result<(), &'static str> {
+        if self.format != rx_rfh::CompletionFormat::Qu
+            || !matches!(self.version(0, 0xc5).map(|v| v.1), Some(4 | 6 | 7))
+        {
+            return Err("unsupported Gen2 compressed BA contract");
+        }
+        self.resources
             .data
-            .iter()
-            .position(|q| q.id() == Some(id))
-            .ok_or("unknown TX queue")?;
-        let mut body = [0; 36];
-        boot_context::put32(&mut body, 0, 1);
-        boot_context::put32(
-            &mut body,
-            4,
-            1u32.checked_shl(station as u32).ok_or("invalid station")?,
-        );
-        boot_context::put32(&mut body, 8, tid as u32);
-        self.command(5, 0x17, &body).await?;
-        self.resources.data.remove(index);
-        Ok(())
+            .iter_mut()
+            .find(|q| q.id() == Some(id))
+            .ok_or("unknown Gen2 aggregate queue")?
+            .gen2_aggregation(enabled)
+    }
+
+    /// One retained bounded batch. Every descriptor owns a separate DMA buffer;
+    /// native TX_CMD singles and compressed-BA prefixes are the only reclaimers.
+    pub(super) async fn transmit_gen2_batch(
+        &mut self,
+        id: u16,
+        frames: &[Vec<u8>],
+    ) -> Result<(), &'static str> {
+        if frames.is_empty()
+            || frames.len() > 8
+            || !self.idle_tx_binding(id, 0, 0)
+            || !self
+                .resources
+                .data
+                .iter()
+                .any(|q| q.id() == Some(id) && q.aggregated())
+        {
+            return Err("invalid Gen2 aggregate batch owner");
+        }
+        self.tx_completed.retain(|entry| entry.0 != id);
+        for frame in frames {
+            if self
+                .station_stop
+                .as_ref()
+                .is_some_and(|s| s.load(Ordering::Acquire))
+            {
+                return Err("MVM batch closed before native publication");
+            }
+            self.enqueue_transmit(id, frame, 26, None)?;
+        }
+        let deadline = narf_time::Deadline::after_ms(2000);
+        loop {
+            let activity = self.activity();
+            self.poll()?;
+            // A failed single identifies the oldest failed frame; subsequent
+            // frames in that same reclaim interval were already acknowledged.
+            // Failure never authorizes resubmission or a successful batch.
+            if self.tx_completed.iter().any(|e| e.0 == id && !e.2) {
+                return Err("Gen2 aggregate native single retry failed");
+            }
+            self.tx_completed.retain(|e| e.0 != id);
+            if self.idle_tx_binding(id, 0, 0) {
+                return Ok(());
+            }
+            if deadline.expired() {
+                self.failed = true;
+                return Err("Gen2 aggregate terminal prefix timeout");
+            }
+            activity.await;
+        }
+    }
+
+    pub async fn remove_tx(&mut self, id: u16, station: u8, tid: u8) -> Result<(), &'static str> {
+        self.remove_idle_tx(id, station, tid).await
     }
 
     /// Retire an unused prerequisite queue only after its exact firmware
@@ -1133,7 +1226,7 @@ impl Hardware {
         station: u8,
         tid: u8,
     ) -> Result<(), &'static str> {
-        if self.failed || self.version(5, 0x17) != Some((3, 2)) {
+        if self.failed || self.version(5, 0x17).map(|v| v.0) != Some(3) {
             return Err("unsupported or failed idle TX queue retirement");
         }
         let index = self
@@ -1142,10 +1235,6 @@ impl Hardware {
             .iter()
             .position(|q| q.id() == Some(id))
             .ok_or("unknown idle TX queue")?;
-        let queue = &self.resources.data[index];
-        if !queue.belongs_to(station, tid) || !queue.is_idle() {
-            return Err("idle TX queue ownership or outstanding descriptor mismatch");
-        }
         let mut body = [0; 36];
         boot_context::put32(&mut body, 0, 1);
         boot_context::put32(
@@ -1155,6 +1244,9 @@ impl Hardware {
                 .ok_or("invalid idle TX station")?,
         );
         boot_context::put32(&mut body, 8, u32::from(tid));
+        // Reserve before publication: dropping the waiter cannot reopen
+        // packet admission, replay REMOVE or let ADD reuse this native ID.
+        self.resources.data[index].begin_remove(station, tid)?;
         let reply = self.command(5, 0x17, &body).await?;
         // fw/api/datapath.h documents the API-v2 iwl_tx_queue_cfg_rsp
         // for allocation/config/removal, not an empty status-less ACK.
@@ -1176,6 +1268,7 @@ impl Hardware {
 
     pub fn fail(&mut self) {
         self.failed = true;
+        self.rx_epoch.deny();
     }
     pub fn is_failed(&self) -> bool {
         self.failed
@@ -1185,7 +1278,7 @@ impl Hardware {
     /// failure. Old allocations are freed only after DMA stop and BME
     /// disable, exactly as on final teardown.
     pub async fn restart(&mut self, parsed: &ParsedUcode<'_>) -> Result<[u8; 6], &'static str> {
-        self.failed = true;
+        self.fail();
         if let Some(interrupts) = &mut self.interrupts {
             interrupts.mask();
         }
@@ -1221,6 +1314,7 @@ impl Hardware {
             core::mem::ManuallyDrop::drop(&mut self.resources);
         }
         self.resources = core::mem::ManuallyDrop::new(resources);
+        self.rx_epoch.reset_after_dma_stop();
         self.armed = false;
         self.failed = false;
         self.notifications.clear();
@@ -1293,22 +1387,25 @@ impl Hardware {
         if self.failed {
             return Err("Wi-Fi transport failed");
         }
+        let sources = self.source_fence()?;
         let queue = self
             .resources
             .data
             .iter_mut()
             .find(|q| q.id() == Some(id))
             .ok_or("unknown TX queue")?;
-        queue.send(&mut self.mmio, frame, header_len, rate)?;
+        sources.invoke(|| queue.send(&mut self.mmio, frame, header_len, rate))?;
         Ok(())
     }
 
     /// An unused prerequisite queue must still belong to the exact peer/TID.
     pub(super) fn idle_tx_binding(&self, id: u16, station: u8, tid: u8) -> bool {
         !self.failed
-            && self.resources.data.iter().any(|queue| {
-                queue.id() == Some(id) && queue.belongs_to(station, tid) && queue.is_idle()
-            })
+            && self
+                .resources
+                .data
+                .iter()
+                .any(|queue| queue.id() == Some(id) && queue.ready_binding(station, tid))
     }
 
     /// The caller owns the async device mutex, so no other submission or
@@ -1358,13 +1455,14 @@ impl Hardware {
         {
             return Err("MVM station closed before native packet publication");
         }
+        let sources = self.source_fence()?;
         let queue = self
             .resources
             .data
             .iter_mut()
             .find(|q| q.id() == Some(id))
             .ok_or("unknown TX queue")?;
-        let ssn = queue.send(&mut self.mmio, frame, header_len, rate)?;
+        let ssn = sources.invoke(|| queue.send(&mut self.mmio, frame, header_len, rate))?;
         let deadline = narf_time::Deadline::after_ms(2000);
         loop {
             let activity = self.activity();
@@ -1405,21 +1503,14 @@ impl Hardware {
         command: u8,
         payload: &[u8],
     ) -> Result<Packet, &'static str> {
-        // Retained CC/Qu MVM callers pass bare opcodes/WIDE_IDs. Their
+        // All reached MVM/MLD callers pass bare opcodes/WIDE_IDs. Their
         // command-ID version is0 even when the payload layout is v3/v5/v12.
         // fw/api/cmdhdr.h extracts wire version only from ID bits16..23;
         // pcie/gen1_2/tx-gen2.c copies those bits into hdr_wide.version.
-        // Preserve the existing Gen3 contract here; explicitly versioned IDs
-        // use command_with_header_version instead of the payload lookup.
-        let version = if self.format == rx_rfh::CompletionFormat::Qu {
-            0
-        } else {
-            self.version(group, command)
-                .map(|v| v.0)
-                .filter(|v| *v != 99)
-                .unwrap_or(0)
-        };
-        self.command_with_header_version(group, command, payload, version)
+        // This is independent of Qu/AX210/Bz completion formats. An actual
+        // explicitly versioned command ID must use the explicit API below;
+        // payload version discovery never synthesizes command-ID bits.
+        self.command_with_header_version(group, command, payload, 0)
             .await
     }
 
@@ -1436,10 +1527,12 @@ impl Hardware {
         if self.failed {
             return Err("Wi-Fi transport failed");
         }
-        let sequence =
+        let sources = self.source_fence()?;
+        let sequence = sources.invoke(|| {
             self.resources
                 .commands
-                .send(&mut self.mmio, group, command, version, payload)?;
+                .send(&mut self.mmio, group, command, version, payload)
+        })?;
         self.responses
             .retain(|packet| packet.header.sequence != sequence);
         let deadline = narf_time::Deadline::after_ms(2000);
@@ -1573,3 +1666,13 @@ pub(super) mod model;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "runtime_gen2_tests.rs"]
 mod gen2_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "runtime_retirement_tests.rs"]
+mod retirement_tests;
+
+#[path = "runtime_rx_epoch.rs"]
+pub(super) mod rx_epoch;
+
+#[path = "runtime_source.rs"]
+pub(super) mod source;

@@ -33,6 +33,12 @@ impl Harness {
         Self::new_rates(protected, None)
     }
     fn new_rates(protected: bool, rates: Option<&[u8]>) -> Self {
+        Self::new_inner(protected, rates, None)
+    }
+    fn new_ht(protected: bool, mcs: u8) -> Self {
+        Self::new_inner(protected, None, Some(mcs))
+    }
+    fn new_inner(protected: bool, rates: Option<&[u8]>, ht: Option<u8>) -> Self {
         assert!(ACTIVE_TEST.lock().is_none());
         let tests::Fixture {
             radio,
@@ -40,7 +46,12 @@ impl Harness {
             peer,
             env,
             plan,
-        } = tests::fixture_rates(protected, rates).unwrap();
+        } = if let Some(mask) = ht {
+            tests::fixture_ht(protected, mask)
+        } else {
+            tests::fixture_rates(protected, rates)
+        }
+        .unwrap();
         let radio: Arc<Mutex<TestRadio>> = Arc::new(Mutex::new(radio));
         let name = narf_net::iface::reserve_name("ar9-native%d");
         let device = Arc::new(Device::new(name, radio).unwrap());
@@ -168,11 +179,61 @@ fn composition_mode(protected: bool, active: bool) -> TestResult {
     composition_rates(protected, active, None)
 }
 fn composition_rates(protected: bool, active: bool, rates: Option<&[u8]>) -> TestResult {
-    let h = Harness::new_rates(protected, rates);
+    composition_inner(protected, active, rates, None)
+}
+fn composition_inner(
+    protected: bool,
+    active: bool,
+    rates: Option<&[u8]>,
+    ht: Option<u8>,
+) -> TestResult {
+    composition_profile(protected, active, rates, ht, None, None, false)
+}
+fn composition_profile(
+    protected: bool,
+    active: bool,
+    rates: Option<&[u8]>,
+    ht: Option<u8>,
+    ba: Option<u8>,
+    protection: Option<(u8, bool)>,
+    sender: bool,
+) -> TestResult {
+    let h = if let Some(mask) = ht {
+        Harness::new_ht(protected, mask)
+    } else {
+        Harness::new_rates(protected, rates)
+    };
+    if let Some(window) = ba {
+        crate::ath9k::rx_ba::tests::qualify(&h.model, window);
+    }
+    if sender {
+        crate::ath9k::tx_ba::tests::qualify(&h.model, 64);
+    }
+    if let Some((mode, erp)) = protection {
+        h.peer.lock().ht = Some(crate::ath9k::ht::tests::protection_elements(mode, erp));
+        let beacon = h.peer.lock().beacon();
+        h.model.inject(&beacon, 0).unwrap();
+        h.device.radio.try_lock().unwrap().poll().unwrap();
+    }
     if !h.closed() || narf_net::dhcp::acquire(h.device.name(), 100).is_ok() {
         return TestResult::Fail("AR9285 DHCP passed before real native association");
     }
     h.join_mode(active);
+    if let Some(window) = ba {
+        h.model
+            .inject(
+                &crate::ath9k::rx_ba::tests::addba(0, 0, u16::from(window), 0, false),
+                0,
+            )
+            .unwrap();
+        h.pump();
+        if h.peer.lock().ba_accepts.len() != 1
+            || h.model.registers.borrow().get(&0x803c) != Some(&0x417)
+        {
+            return TestResult::Fail("DHCP BA setup lacked actual response/filter receipt");
+        }
+        h.model.rx_aggr.set((1 << 17) | (1 << 29));
+    }
     if active {
         let sent = h.model.transmitted.borrow().len();
         let request = ScanRequest {
@@ -242,6 +303,60 @@ fn composition_rates(protected: bool, active: bool, rates: Option<&[u8]>) -> Tes
     h.pump();
     if !h.received().contains(&downlink) || h.rx_count() <= before {
         return TestResult::Fail("AR9285 exact IP downlink missed real Narf-Ring or stack");
+    }
+    if protection.is_some() {
+        let d = h.model.registers.borrow()[&0x800];
+        if h.model.word(d + 8).unwrap() & ((1 << 22) | (1 << 31)) != 1 << 22
+            || h.model.word(d + 24).unwrap() & 0x8000 == 0
+            || h.model.word(d + 36).unwrap() >> 20 & 255 != 0x1b
+        {
+            return TestResult::Fail("real DHCP/IP lost native RTS/CTS protection/control rate");
+        }
+    }
+    if sender {
+        let first = udp_ipv4(
+            AP,
+            h.plan.station,
+            h.plan.lease_ip,
+            h.plan.server_ip,
+            49201,
+            7,
+            b"native-first-burst-original",
+        );
+        let second = udp_ipv4(
+            AP,
+            h.plan.station,
+            h.plan.lease_ip,
+            h.plan.server_ip,
+            49202,
+            7,
+            b"native-second-burst-original",
+        );
+        if narf_net::iface::send_on(h.device.name(), &first).is_err()
+            || narf_net::iface::send_on(h.device.name(), &second).is_err()
+        {
+            return TestResult::Fail("real sender IPC burst admission");
+        }
+        h.pump();
+        let peer = h.peer.lock();
+        if peer.uplink.get(peer.uplink.len().saturating_sub(2)..) != Some(&[first, second][..])
+            || peer.tx_ba_requests.len() != 1
+        {
+            return TestResult::Fail(
+                "two original DMA packets missed real AP/DHCP/IP sender continuation",
+            );
+        }
+        drop(peer);
+        let Some((head, tail)) = h.model.last_pair.get() else {
+            return TestResult::Fail("kernel IP burst did not use actual two-descriptor aggregate");
+        };
+        if h.model.word(head) != Ok(tail)
+            || h.model.word(tail + 56).unwrap() & (1 << 30) == 0
+            || h.model.word(tail + 92).unwrap() & 1 == 0
+            || h.model.tx.get().is_some()
+        {
+            return TestResult::Fail("real kernel burst lacks tail BA/idle receipt");
+        }
     }
     if tests::complete(h.device.disassociate()).is_err() || !h.closed() || h.model.master.get() {
         return TestResult::Fail("AR9285 Device disconnect retained carrier or active DMA");
@@ -473,9 +588,7 @@ kernel_test_in!(
 );
 
 fn smoke_ar9285_native_rekey_missing_m3_expires_despite_fresh_beacons() -> TestResult {
-    use narf_wireless::eapol::{
-        KeyFrame, KI_KEY_ACK, KI_KEY_MIC, KI_KEY_TYPE_PAIRWISE, KI_VERSION_HMAC_SHA1_AES,
-    };
+    use narf_wireless::eapol::{KeyFrame, KI_KEY_MIC};
     let h = Harness::new(true);
     h.join();
     let mappings = h
@@ -486,16 +599,7 @@ fn smoke_ar9285_native_rekey_missing_m3_expires_despite_fresh_beacons() -> TestR
         .map(|r| (r.bus, r.cpu, r.len))
         .collect::<Vec<_>>();
     let before = h.model.transmitted.borrow().len();
-    let mut m1 = KeyFrame::empty(16);
-    m1.key_information = KI_KEY_TYPE_PAIRWISE | KI_KEY_ACK | KI_VERSION_HMAC_SHA1_AES;
-    m1.key_length = 16;
-    m1.replay_counter = 3;
-    m1.key_nonce = [0xbb; 32];
-    let mut ethernet = h.plan.station.to_vec();
-    ethernet.extend_from_slice(&AP);
-    ethernet.extend_from_slice(&[0x88, 0x8e]);
-    ethernet.extend_from_slice(&m1.into_eapol());
-    let wire = h.peer.lock().downlink(&ethernet).unwrap();
+    let wire = h.peer.lock().pairwise_rekey();
     h.model.inject(&wire, 0).unwrap();
     h.pump();
     let m2 = h.peer.lock().uplink.last().cloned().unwrap_or_default();
@@ -504,12 +608,34 @@ fn smoke_ar9285_native_rekey_missing_m3_expires_despite_fresh_beacons() -> TestR
         || m2.get(12..14) != Some(&[0x88, 0x8e])
         || h.model.transmitted.borrow().len() != before + 1
         || h.model.tx.get().is_some()
+        || h.peer.lock().pairwise_replies != 1
         || !h.device.radio.try_lock().unwrap().ready()
         || !h.device.link_up()
     {
         return TestResult::Fail(
             "AR9285 rekey lacks real terminal old-key M2 and reopened old-key port",
         );
+    }
+    let probe = udp_ipv4(
+        AP,
+        h.plan.station,
+        h.plan.lease_ip,
+        h.plan.server_ip,
+        49152,
+        7,
+        b"ar9285-missing-rekey-m3",
+    );
+    // Peer::react opens this actual DMA packet with the retained OLD TK. Its
+    // candidate PTK was used only to check M2's MIC and was never installed.
+    if h.device.enqueue(&probe, Default::default()).is_err() {
+        return TestResult::Fail("AR9285 old-key DATA remained closed after terminal M2");
+    }
+    h.pump();
+    if h.peer.lock().uplink.last() != Some(&probe)
+        || h.model.tx.get().is_some()
+        || !h.device.radio.try_lock().unwrap().ready()
+    {
+        return TestResult::Fail("AR9285 actual old-key DATA failed while awaiting replacement M3");
     }
     let start = h.env.now.load(Ordering::Acquire);
     for delta in [1000, 2000, 3000, 4000, 4999] {
@@ -527,15 +653,6 @@ fn smoke_ar9285_native_rekey_missing_m3_expires_despite_fresh_beacons() -> TestR
     let beacon = h.peer.lock().ap.beacon();
     h.model.inject(&beacon, 0).unwrap();
     h.pump();
-    let probe = udp_ipv4(
-        AP,
-        h.plan.station,
-        h.plan.lease_ip,
-        h.plan.server_ip,
-        49152,
-        7,
-        b"ar9285-missing-rekey-m3",
-    );
     let retained = h
         .model
         .regions
@@ -638,4 +755,455 @@ fn smoke_ar9285_drive_scheduled_retries_policy_and_stops_on_terminal_error() -> 
 kernel_test_in!(
     "drivers/wireless/ath9k/device",
     smoke_ar9285_drive_scheduled_retries_policy_and_stops_on_terminal_error
+);
+fn smoke_ar9285_ht20_native_open_wpa2_all_mcs_kernel_dhcp_and_bidirectional_ip() -> TestResult {
+    let _policy = crate::ath9k::ht::tests::Policy::install();
+    for protected in [false, true] {
+        for mcs in 0..8 {
+            if let failure @ TestResult::Fail(_) =
+                composition_inner(protected, false, None, Some(1 << mcs))
+            {
+                return failure;
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ht",
+    smoke_ar9285_ht20_native_open_wpa2_all_mcs_kernel_dhcp_and_bidirectional_ip
+);
+fn aggregate_for(h: &Harness, pn: u64) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let (body, expected) = crate::ath9k::ht::tests::aggregate_body(h.plan.station);
+    let mut header = vec![0x88, 0x42, 0, 0];
+    header.extend_from_slice(&h.plan.station);
+    header.extend_from_slice(&AP);
+    header.extend_from_slice(&AP);
+    header.extend_from_slice(&[0x10, 0, 0x8f, 0]);
+    let key: [u8; 16] = h
+        .peer
+        .lock()
+        .ptk
+        .as_ref()
+        .unwrap()
+        .tk
+        .as_slice()
+        .try_into()
+        .unwrap();
+    let mut body = body;
+    let cipher =
+        narf_wireless::ccmp::protect(&tests::Ccm, &header, &key, pn, 0, 15, false, &mut body)
+            .unwrap();
+    header.extend_from_slice(&cipher);
+    (header, expected)
+}
+fn smoke_ar9285_ht20_native_final_allocation_and_callback_source_fences() -> TestResult {
+    let _policy = crate::ath9k::ht::tests::Policy::install();
+    for point in [
+        ReceivePoint::AfterFrameAllocation,
+        ReceivePoint::BeforeCallbackAdmission,
+    ] {
+        let h = Harness::new_ht(true, 255);
+        h.join();
+        let (wire, _) = aggregate_for(&h, 9);
+        let model = h.model.clone();
+        let called = Arc::new(AtomicBool::new(false));
+        let seen = called.clone();
+        *h.device.receive_hook.lock() = Some(Arc::new(move |at| {
+            if at == point && !seen.swap(true, Ordering::AcqRel) {
+                model.allowed.set(false);
+            }
+        }));
+        let before = h.rx_count();
+        h.model.inject(&wire, 0).unwrap();
+        h.device.drain();
+        if !called.load(Ordering::Acquire)
+            || !h.closed()
+            || h.rx_count() != before
+            || !h.received().is_empty()
+        {
+            return TestResult::Fail(
+                "HT source lost at actual IPC/callback boundary still published",
+            );
+        }
+        h.model.allowed.set(true);
+        h.model.inject(&wire, 0).ok();
+        h.pump();
+        if !h.closed()
+            || h.device
+                .enqueue(
+                    &udp_ipv4(
+                        AP,
+                        h.plan.station,
+                        h.plan.lease_ip,
+                        h.plan.server_ip,
+                        1,
+                        2,
+                        b"closed",
+                    ),
+                    narf_net::TxMeta::plain(),
+                )
+                .is_ok()
+        {
+            return TestResult::Fail("restored current policy reopened terminal HT interface");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ht",
+    smoke_ar9285_ht20_native_final_allocation_and_callback_source_fences
+);
+fn smoke_ar9285_ht20_native_same_drain_group_reply_retires_aggregate_and_keeps_carrier(
+) -> TestResult {
+    let _policy = crate::ath9k::ht::tests::Policy::install();
+    let h = Harness::new_ht(true, 255);
+    h.join();
+    let (wire, _) = aggregate_for(&h, 9);
+    let group = {
+        let mut p = h.peer.lock();
+        p.hold_group = true;
+        p.group_rekey()
+    };
+    h.model.inject(&wire, 0).unwrap();
+    h.model.inject(&group, 0).unwrap();
+    h.device.drain();
+    if !h.device.link_up()
+        || !h.received().is_empty()
+        || h.peer.lock().group_replies != 1
+        || h.model.tx.get().is_none()
+        || h.device.radio.try_lock().unwrap().receive_open()
+    {
+        return TestResult::Fail(
+            "same-drain group epoch leaked aggregate prefix/carrier or forged receipt",
+        );
+    }
+    let (closed_wire, _) = aggregate_for(&h, 10);
+    h.model.inject(&closed_wire, 0).unwrap();
+    h.device.drain();
+    h.model.complete(true).unwrap();
+    h.pump();
+    if !h.received().is_empty() || !h.device.radio.try_lock().unwrap().receive_open() {
+        return TestResult::Fail("late group receipt published preauthorized ciphertext");
+    }
+    h.model.inject(&closed_wire, 0).unwrap();
+    h.pump();
+    if h.received().len() != 3 || !h.device.link_up() {
+        return TestResult::Fail("closed-port capture advanced PN or fresh epoch failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ht",
+    smoke_ar9285_ht20_native_same_drain_group_reply_retires_aggregate_and_keeps_carrier
+);
+type HtCallback = Arc<dyn Fn(&mut [u8]) + Send + Sync>;
+static HT_CALLBACK: IrqSafeSpinLock<Option<HtCallback>> = IrqSafeSpinLock::new(None);
+fn ht_callback(_name: &str, bytes: &mut [u8]) {
+    let callback = HT_CALLBACK.lock().clone();
+    if let Some(f) = callback {
+        f(bytes);
+    }
+}
+struct RestoreHtCallback;
+impl Drop for RestoreHtCallback {
+    fn drop(&mut self) {
+        *HT_CALLBACK.lock() = None;
+        narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
+    }
+}
+fn smoke_ar9285_ht20_native_reentrant_aggregate_rekey_epoch_and_ordinary_tx_credit() -> TestResult {
+    let _policy = crate::ath9k::ht::tests::Policy::install();
+    for mode in 0..3 {
+        let h = Arc::new(Harness::new_ht(true, 255));
+        h.join();
+        let (wire, expected) = aggregate_for(&h, 9);
+        let group = h.peer.lock().group_rekey();
+        let seen = Arc::new(IrqSafeSpinLock::new(Vec::<Vec<u8>>::new()));
+        let count = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let okay = Arc::new(AtomicBool::new(true));
+        let target = h.clone();
+        let got = seen.clone();
+        let calls = count.clone();
+        let valid = okay.clone();
+        *HT_CALLBACK.lock() = Some(Arc::new(move |bytes| {
+            got.lock().push(bytes.to_vec());
+            if calls.fetch_add(1, Ordering::AcqRel) != 0 {
+                return;
+            }
+            // Actual stack callback must own none of the driver/radio/ring/
+            // publication locks and can synchronously queue host TX+drain.
+            if target.device.radio.try_lock().is_none()
+                || target.device.state.try_lock().is_none()
+                || target.device.publication.try_lock().is_none()
+                || target.device.rx.try_lock().is_none()
+                || target.device.tx.try_lock().is_none()
+            {
+                valid.store(false, Ordering::Release);
+                return;
+            }
+            if mode == 0 {
+                target.peer.lock().hold_data = true;
+                let packet = udp_ipv4(
+                    AP,
+                    target.plan.station,
+                    target.plan.lease_ip,
+                    target.plan.server_ip,
+                    100,
+                    101,
+                    b"held TX",
+                );
+                if target
+                    .device
+                    .enqueue(&packet, narf_net::TxMeta::plain())
+                    .is_err()
+                {
+                    valid.store(false, Ordering::Release);
+                }
+                target.device.drain();
+            } else {
+                target.peer.lock().hold_group = mode == 1;
+                target.model.inject(&group, 0).unwrap();
+                target.device.drain();
+                if mode == 2 {
+                    target.device.drain();
+                }
+            }
+        }));
+        let _restore = RestoreHtCallback;
+        narf_net::iface::install_rx_handler(ht_callback);
+        h.model.inject(&wire, 0).unwrap();
+        h.device.drain();
+        if !okay.load(Ordering::Acquire)
+            || !h.device.link_up()
+            || *seen.lock()
+                != if mode == 0 {
+                    expected
+                } else {
+                    vec![expected[0].clone()]
+                }
+        {
+            return TestResult::Fail("reentrant stack callback escaped key epoch or confused ordinary TX with receive port");
+        }
+        h.peer.lock().hold_data = false;
+        if h.model.tx.get().is_some() {
+            h.model.complete(true).unwrap();
+        }
+        h.pump();
+        let (fresh, _) = aggregate_for(&h, 10);
+        h.model.inject(&fresh, 0).unwrap();
+        h.pump();
+        if seen.lock().len() != if mode == 0 { 6 } else { 4 } {
+            return TestResult::Fail(
+                "fresh current receive epoch could not publish original aggregate",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ht",
+    smoke_ar9285_ht20_native_reentrant_aggregate_rekey_epoch_and_ordinary_tx_credit
+);
+fn smoke_ar9285_ht20_native_held_m4_pre_authorization_aggregate_has_no_late_pn_commit() -> TestResult
+{
+    let _policy = crate::ath9k::ht::tests::Policy::install();
+    let h = Harness::new_ht(true, 255);
+    h.scan();
+    h.peer.lock().hold_m4 = true;
+    let mut future = Box::pin(h.device.associate(h.request()));
+    let mut reached = false;
+    for _ in 0..256 {
+        if future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+        {
+            return TestResult::Fail("held native HT M4 completed early");
+        }
+        if h.peer.lock().ap.phase() == narf_wifi_fixtures::ApPhase::Authorized
+            && h.model.tx.get().is_some()
+        {
+            reached = true;
+            break;
+        }
+    }
+    if !reached || !h.closed() {
+        return TestResult::Fail("initial held M4 published carrier");
+    }
+    let (wire, _) = aggregate_for(&h, 13);
+    h.model.inject(&wire, 0).unwrap();
+    for _ in 0..3 {
+        if future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+        {
+            return TestResult::Fail("preauthorization RX supplied M4 receipt");
+        }
+    }
+    h.model.complete(true).unwrap();
+    if tests::complete(future).is_err() || !h.device.link_up() {
+        return TestResult::Fail("exact positive native M4 could not authorize current link");
+    }
+    h.pump();
+    if !h.received().is_empty() {
+        return TestResult::Fail("late M4 retrospectively published old captured aggregate");
+    }
+    h.model.inject(&wire, 0).unwrap();
+    h.pump();
+    if h.received().len() != 3 {
+        return TestResult::Fail("discarded pre-M4 native ciphertext advanced controlled-port PN");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ht",
+    smoke_ar9285_ht20_native_held_m4_pre_authorization_aggregate_has_no_late_pn_commit
+);
+fn smoke_ar9285_rx_ba_native_open_wpa2_kernel_dhcp_and_bidirectional_ip() -> TestResult {
+    let _policy = crate::ath9k::ht::tests::Policy::install();
+    for protected in [false, true] {
+        if let failure @ TestResult::Fail(_) =
+            composition_profile(protected, false, None, Some(255), Some(64), None, false)
+        {
+            return failure;
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/rx-ba",
+    smoke_ar9285_rx_ba_native_open_wpa2_kernel_dhcp_and_bidirectional_ip
+);
+fn smoke_ar9285_ht20_native_mixed_bss_protection_kernel_dhcp_and_bidirectional_ip() -> TestResult {
+    let _policy = crate::ath9k::ht::tests::Policy::install();
+    for protected in [false, true] {
+        for ba in [None, Some(64)] {
+            if let failure @ TestResult::Fail(_) = composition_profile(
+                protected,
+                false,
+                None,
+                Some(255),
+                ba,
+                Some((3, true)),
+                false,
+            ) {
+                return failure;
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ht",
+    smoke_ar9285_ht20_native_mixed_bss_protection_kernel_dhcp_and_bidirectional_ip
+);
+fn smoke_ar9285_tx_ba_native_open_wpa2_kernel_dhcp_ip_two_originals_and_recipient_coexistence(
+) -> TestResult {
+    let _policy = crate::ath9k::ht::tests::Policy::install();
+    for protected in [false, true] {
+        for recipient in [None, Some(64)] {
+            if let failure @ TestResult::Fail(_) =
+                composition_profile(protected, false, None, Some(255), recipient, None, true)
+            {
+                return failure;
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/tx-ba",
+    smoke_ar9285_tx_ba_native_open_wpa2_kernel_dhcp_ip_two_originals_and_recipient_coexistence
+);
+fn smoke_ar9285_native_ht_rx_ba_receive_runs_during_held_data_then_waits_for_rekey_receipt(
+) -> TestResult {
+    let _policy = crate::ath9k::ht::tests::Policy::install();
+    for ba in [false, true] {
+        let h = Harness::new_ht(true, 255);
+        if ba {
+            crate::ath9k::rx_ba::tests::qualify(&h.model, 64);
+        }
+        h.join();
+        if ba {
+            h.model
+                .inject(&crate::ath9k::rx_ba::tests::addba(0, 0, 64, 0, true), 0)
+                .unwrap();
+            h.pump();
+            h.model.rx_aggr.set((1 << 17) | (1 << 29));
+        }
+        h.peer.lock().hold_data = true;
+        let up = udp_ipv4(
+            AP,
+            h.plan.station,
+            h.plan.lease_ip,
+            h.plan.server_ip,
+            4501,
+            4502,
+            b"held actual data TX",
+        );
+        h.device.enqueue(&up, narf_net::TxMeta::plain()).unwrap();
+        h.device.drain();
+        let pending = h.model.tx.get().unwrap();
+        let down = udp_ipv4(
+            h.plan.station,
+            AP,
+            h.plan.server_ip,
+            h.plan.lease_ip,
+            4502,
+            4501,
+            b"fresh RX during held TX",
+        );
+        let wire = h.peer.lock().downlink(&down).unwrap();
+        h.model.inject(&wire, 0).unwrap();
+        h.device.drain();
+        if h.model.tx.get() != Some(pending) || !h.received().contains(&down) || !h.device.link_up()
+        {
+            return TestResult::Fail(
+                "ordinary native DATA credit stalled independent RX authorization",
+            );
+        }
+        let group = {
+            let mut peer = h.peer.lock();
+            peer.hold_group = true;
+            peer.group_rekey()
+        };
+        h.model.inject(&group, 0).unwrap();
+        h.device.drain();
+        if !h.device.link_up()
+            || h.device.radio.try_lock().unwrap().receive_open()
+            || h.peer.lock().group_replies != 0
+            || h.device.enqueue(&up, narf_net::TxMeta::plain()).is_ok()
+        {
+            return TestResult::Fail(
+                "actual rekey did not close RX while ordinary TX held, or forged free TX credit",
+            );
+        }
+        h.model.complete(true).unwrap();
+        h.device.drain();
+        if h.peer.lock().group_replies != 1 || h.model.tx.get().is_none() {
+            return TestResult::Fail(
+                "terminal ordinary TX did not continue real pending group reply",
+            );
+        }
+        let closed = h.peer.lock().downlink(&down).unwrap();
+        h.model.inject(&closed, 0).unwrap();
+        h.device.drain();
+        assert!(h.received().is_empty());
+        h.model.complete(true).unwrap();
+        h.pump();
+        h.model.inject(&closed, 0).unwrap();
+        h.pump();
+        if !h.received().contains(&down) || !h.device.link_up() {
+            return TestResult::Fail(
+                "closed rekey capture consumed BA sequence/PN or late native receipt failed",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/rx-ba",
+    smoke_ar9285_native_ht_rx_ba_receive_runs_during_held_data_then_waits_for_rekey_receipt
 );

@@ -65,6 +65,9 @@ impl NicCapabilities {
                     }
                     if value[0] > 1
                         || value[1] > 1
+                        || value[6] > 1
+                        || value[7] > 1
+                        || value[9] > 1
                         || !(1..=2).contains(&value[4])
                         || value[10] & 3 == 0
                     {
@@ -113,6 +116,7 @@ impl NicCapabilities {
 /// Packet queues, radio enable and association are separate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RadioInfo {
+    pub chip_id: u16,
     pub firmware: Report,
     pub capabilities: NicCapabilities,
     pub hardware_type: u8,
@@ -407,6 +411,7 @@ impl<B: Backend> Session<B> {
             )
             .await?;
             Ok(RadioInfo {
+                chip_id: self.backend.chip_id()?,
                 firmware,
                 capabilities,
                 hardware_type: block[11],

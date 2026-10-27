@@ -1,6 +1,6 @@
 # rtw88 — Specification
 
-> Status: **v1.3** (RTL8821CE retained firmware/MAC/PHY, separately signed IQK/parked-power/awake-station, legacy12/WMM and exact-chip HT20/SGI continuations; RTL8822CE retained firmware, MAC/PHY, bounded radio calibration,
+> Status: **v1.6** (RTL8821CE retained firmware/MAC/PHY, separately signed IQK/parked-power/awake-station, legacy12/WMM, exact-chip HT20/SGI, separately qualified RX/TX Block Ack and native RTS-threshold continuations; RTL8822CE retained firmware, MAC/PHY, bounded radio calibration,
 > signed operating-power qualification, native packets and channel1 station
 > integration; composed software gates and physical acceptance remain distinct).
 >
@@ -20,7 +20,8 @@ supports Open and WPA2-PSK with host RSNA/CCMP; its ordinary host TX rate is
 fixed at1Mbps by default and requires an AP advertising that basic rate.
 RTL8821CE/RTL8822CE can separately qualify response-bound legacy12 DATA rates
 and WMM BE/TID0, then distinct HT20/one-stream MCS0..7/SGI20 with mandatory
-default A-MSDU receive and native ADDBA refusal; management and EAPOL remain
+default A-MSDU receive and native ADDBA refusal, plus distinct optional recipient
+and BE/TID0 originator Block Ack grants; management and EAPOL remain
 at1Mbps. N21S alone does
 not admit the C21 extension, and neither chip can reuse the other's assets.
 The probe decodes physical EFUSE programming
@@ -994,9 +995,10 @@ BA agreement from an HT offer. A bound, complete immediate single-TID AP
 request produces Category3 response status37 through the retained management
 DMA slot and actual CCX receipt/current authority. Foreign/malformed requests
 produce no transmission; held, cancelled or uncertain native management
-ownership remains pinned. RX BA negotiation/reordering/BAR/timers, TX BA and
-A-MPDU producers remain separate native software work. Shared Reorder does
-not supply Realtek's missing BA negotiation or descriptor ownership.
+ownership remains pinned. This remains the behavior under H alone. The
+separately qualified recipient extension below adds RX BA; the distinct
+originator extension then adds bounded native TX A-MPDU. Shared Reorder alone never
+supplies Realtek BA negotiation, native receipt or descriptor authority.
 
 Twenty-three new native smokes (eleven per chip plus a literal source PHY
 decoder/offset case) compose exact retained owners:
@@ -1012,6 +1014,340 @@ semantics. Actual two-subframe callback regressions cover held/reopened group
 rekey and held ordinary TX, independently checking the actual group reply MIC.
 Physical signed assets, EVM/RF/silicon acceptance and external interoperability
 are deployment/acceptance gates, not outcomes of these software tests.
+
+### C21/C22 separately qualified recipient RX Block Ack
+
+`Rtw88Device::rx_ba_request().await -> RxBaRequest` returns exact-H measurement
+metadata, not a radio grant. The names are
+`rtw88/rtw8821ce-rx-ba-v1-<mac>.bin` and
+`rtw88/rtw8822ce-rx-ba-v1-<mac>.bin`. Each identity binds the retained chip's
+H recipe, complete signed H-record SHA256, factory MAC, original RAW receive
+contract, explicit-SSN BA protocol/control/receipt program and source readbacks.
+Production opens authenticated signed firmware-registry inputs; no real measured
+R asset is supplied. Private synthetic records are fixture inputs only.
+
+The signed little-endian record is exactly128 bytes:
+
+|Offset|Field|
+|---|---|
+|0..4|`N21R`/`N22R`, exact C21/C22|
+|4..8|version1:u16, header128:u16|
+|8..12|total128:u32|
+|12..16|VID0x10ec, exact DID0xc821/0xc822|
+|16..48|RX BA request identity|
+|48..54|exact factory MAC|
+|54..56|channel1, width20|
+|56..60|antenna upper bound and R EIRP ceiling:i16 quarter-dB units|
+|60..66|whole transition, autonomous compressed-BA response and management peaks:i16 quarter-dBm|
+|66..68|full raw thermal envelope0..63|
+|68..70|maximum window1..64; nonzero allowed TID0..7 bitmap|
+|70..128|reserved zero|
+
+Every peak plus antenna must meet the R ceiling, preceding H/source ceiling
+and current overlapping host rules. The transition peak encloses both response
+peaks. Measurements must cover success/DELBA, automatic BA and corresponding
+traffic/duty/supply/antenna/BT states over the full static thermal range. H's
+decline/no-TX-BA program is never reinterpreted as this changed emission program.
+The R grant retains that exact H owner; its actual capability invocation wraps
+native operations and final host publication through the existing acyclic
+grant graph. Missing/malformed/unqualified optional R inputs remain retryable
+before writes and preserve H's native status37 decline/non-BA connection.
+Observed loss of an attached R or preceding source/policy is terminal.
+
+The source `rtw_ops_ampdu_action` RX_START/RX_STOP operations perform no
+per-session register/H2C program. This implementation does not invent a BA
+CAM or applied firmware acknowledgement. Before success it checks retained
+HT gain/crypto state, source RAW/FCS/PHY/RCR flags without BASSN/header conversion,
+each chip's original control filter, BAR retry setting and C22-only BA-parser/
+ACK-type readbacks. C21's no-channel PHY page and C22's reported channel/width
+rules remain unchanged. The retained filter is `RXFLTMAP1=0xffff` on both:
+C21's initial `mac_init` value0x0fff is overwritten by its later source MAC
+table's `0x6a2=0xff,0x6a3=0xff`. R performs no new filter write. These exact
+post-table facts are included in R's request identity. Automatic SIFS BA generation and over-air behavior
+remain physical/firmware acceptance work.
+
+Only the current bound, established HT/WMM peer can request a recipient
+agreement. An exact33-byte immediate-policy request carries the actual SSN,
+dialog, TID0..7, timeout and window; zero window means64, and the signed maximum
+may narrow it. This profile requires request A-MSDU bit1 and emits bound
+response bit1: native RX does not expose reliable aggregate-membership facts,
+so admitting a no-A-MSDU agreement would make a mandatory standalone original
+indistinguishable from an excluded in-A-MPDU original. Requests without that
+bit retain status37 and standalone3839 reception. No delayed/multi-TID BA,
+TID8..15 session, fragmentation or firmware-deaggregated piece is admitted.
+
+Each TID has one bounded window and at most one pending proposal. Same-dialog
+identical retries preserve existing ordering; changed parameters cannot reset
+the active window using the same dialog. A different proposal retires old
+buffered ownership before success. The actual success response uses retained
+management DMA and an immutable-body/native-index/matching-positive-CCX receipt.
+Only an additional genuine RX-idle observation can activate its host window.
+After real native publication, a bounded opaque prefix (at most that window)
+may be staged against the exact pending request, peer/TID/SSN and still-open
+controlled-port/key/receive epoch. The AP can legitimately receive success
+before the host observes CCX. This prefix is neither authenticated nor
+delivered until the exact success ACK plus idle; capture ages are retained
+when originals enter reordering. Pre-proposal, unsent-proposal and closed-port
+captures cannot acquire that grant retrospectively. Failure, cancel, DELBA or
+an epoch change discards the entire pending prefix. A peer originator DELBA
+can cancel a held proposal before its receipt. Unsent success controls and
+same-batch captured requests are removed before publication; a submitted
+control instead retains native ownership/receipt drainage without activation.
+Selection alone never marks a control submitted. Uncertainty/cancel/negative or
+altered receipt closes admission and retains possibly published DMA.
+
+The host window is explicitly seeded with the on-air SSN using shared
+`Reorder::advance`; unknown-SSN offload auto-sequence is not used. Complete
+pre-SSN originals before the BA stream starts follow source semantics through
+the actual key/PN owner without replacing that negotiated head. Complete
+original unicast QoS MPDUs are routed by the current peer/TID, staged opaquely
+and sequence-ordered before shared CCMP/per-TID replay or whole A-MSDU decode.
+Native metadata, original header and negotiated profile must agree before
+staging. The entire3839-byte body, IV and MIC stay intact; no prefix, partial
+firmware piece or cross-TID/key carry is accepted. Normal-ACK QoS can belong
+to BA; explicit BlockAck-policy QoS needs that current ordered session.
+Explicit BlockAck A-MSDU uses the additive shared security opt-in only for a
+reordered original with a current live recipient session; normal-ACK standalone
+input keeps the stricter existing API. The original header is never normalized.
+An ordinary output batch also leaves room for one complete maximum-subframe
+original before any authenticated subframes are handed to publication.
+
+Genuine compressed single-TID20-byte BARs are admitted through a separate
+native control envelope and bound RA/TA/reserved/fragment/SSN checks. They
+advance only the matching active window. Hole expiry runs at100ms even when
+RX is idle; negotiated nonzero inactivity is separately measured in1024us
+TUs. Timeout zero creates no inactivity timer. Inactivity retires host
+admission before a native30-byte recipient DELBA/CCX; a peer's recipient
+DELBA cannot tear down an RX session. ReplyReady, actual terminal key receipt,
+peer loss, local close and current-source loss discard all buffered originals,
+proposals and queued output under the existing receive/publication epochs.
+An exact original plaintext unicast EAPOL from the bound authenticator remains
+private protocol input if M3 was copied before the terminal M2 receipt retires
+the data epoch. It still requires the actual shared Supplicant phase/MIC/replay
+checks; captured data admission remains false and no DATA/BA/publication right
+is inferred. Ordinary and aggregated old/closed captures remain denied.
+CPU staging can be dropped; no such transition reclaims native DMA without
+terminal ownership. Under R without the separate T extension, TX AGG_EN/count
+stay zero and host TX stays BE/TID0.
+
+Twenty-two added native smokes are validated: ten per chip plus literal protocol
+and native separate-grant/CCX cases. They cover Open/WPA2 real DHCP through
+out-of-order native replies and exact IP; explicit SSN/wrap/windows/BAR/100ms/
+TU inactivity; original3839 A-MSDU, bad PHY/MIC-to-same-PN retry, independent
+TID replay and many-subframe admission; held success/peer DELBA/old-capture;
+signed asset refusal/retry/H fallback; every preceding source, R/policy loss,
+cancel/uncertain payload and retained DMA; and a genuine held group-key reply
+retiring an old window. They passed the coordinated native software suites.
+Two additional native reply-epoch regressions, one per chip, inject a real
+M3 and protected DATA before M2 CCX, require the actual held M4 continuation,
+and then retry that identical DATA/PN only after the genuine M4 receipt.
+
+### C21/C22 separately qualified originator TX Block Ack
+
+`Rtw88Device::tx_ba_request().await -> Result<TxBaRequest, FirmwareError>`
+returns the exact current request identity, station MAC and expected registry
+filename. It grants no radio authority. `tx_ba_power` loads a separately
+signed192-byte N21T/N22T record through the actual firmware registry/capability
+owner. T retains an acyclic concrete H base, or R over that exact H; its identity
+binds the complete H record and, when attached, the complete R record/digest.
+An H-only T asset cannot authorize a later R automatic-response program.
+The base gains, previous R peaks and all T peaks must each fit the minimum of
+the current host/channel ceiling, all preceding grants and T's own ceiling.
+Every real publication invokes the current T/base/firmware/PCI authority;
+retained bytes or an earlier valid capability cannot substitute for it.
+
+|Bytes|T record field|
+|---|---|
+|0..4|`N21T`/`N22T`, exact native chip|
+|4..12|version1, header192, total192 (little endian)|
+|12..16|VID10ec and exact DIDc821/c822|
+|16..48|exact H or R-over-H request identity|
+|48..56|station MAC, channel1, width20|
+|56..60|antenna gain and maximum EIRP:i16 quarter-dBm|
+|60..68|complete transition, automatic response, control and entire retry/burst conducted peaks:i16|
+|68..72|full static thermal range0..63, maximum batch2..4, maximum peer window1..64|
+|72..76|maximum native aggregate bytes1560..8191 and conservative airtime2500..4000us:u16|
+|76..108|eight LGI and eight SGI conducted MCS peaks:i16|
+|108..192|reserved zero|
+
+This record's measurement contract includes the actual retry/burst duty,
+transients, supply/antenna/coexistence envelope and native automatic responses.
+It is an external exact-board qualification, not an inference from single-MPDU
+H measurements. No measured real-board T asset is provided. Missing, unsigned,
+malformed or restricted optional T input before binding leaves the existing
+H/R nonaggregate connection unchanged. Once T is attached, observed loss is
+terminal even if its source or policy is subsequently reinstalled.
+
+Source `mac80211.c::rtw_ops_ampdu_action` TX_START is immediate and TX_OPERATIONAL
+sets host per-queue eligibility; it has no per-session firmware ACK command.
+This implementation instead owns the genuine on-air33-byte immediate TID0
+ADDBA request, actual retained management DMA and requested matching CCX,
+bound peer/dialog/status/TID/window/timeout response, actual RX idle and MAC
+quiet before enabling native AGG_EN. The SSN is sampled from the actual next
+per-TID producer before crypto: shared `Security::next_qos_sequence(0)` for
+WPA2 or a separate retained Open QoS counter. Non-QoS EAPOL/management use a
+different counter; no protected header is rewritten and no SSN is invented.
+Fresh key continuations use a fresh dialog, preserving the per-TID sequence.
+Wrong, refused or timed-out peer responses retain nonaggregate H data only
+after submitted control ownership drains and native DELBA closes uncertainty.
+
+Before that dialog, T programs and reads back the exact source
+`coex.c::rtw_coex_limited_tx` retry value `RETRY_LIMIT(0x042a)=0x0808` and
+`AMPDU_MAX_TIME_V1(0x0455)=0x20`. Fixed native MCS/GI and disabled fallback
+remain from H. This is not the entire Bluetooth coexistence state machine.
+The separate R BAR/RA aggregate limit `0x04ce=0x0801` is unchanged and still
+checked by R. These distinct addresses and complete T-over-R emission recipe
+allow the recipient and originator owners to coexist without relaxing either
+grant's readbacks. T alone retains H's recipient refusal.
+
+The native packet Core preallocates four independent coherent32-bit-addressed
+TXD/body buffers while the device is parked, in addition to its original
+control/single-packet allocation. It publishes at most four immutable original
+QoS26 TID0 DATA MPDUs through separate actual BE descriptors and one final WP
+doorbell. Source `tx.c` permits AMPDU and REQ_TX_STATUS independently: W2 has
+AGG_EN bit12, SPERPT bit19 and peer density[22:20]; W3 MAX_AGG_NUM=3 uses the
+mandatory8191-byte/factor0 ceiling. No USB DMA aggregation field, TX A-MSDU,
+protected-header rewrite or invented firmware BA bitmap is used. Byte/airtime
+admission includes hardware FCS, delimiter, padding, HT service/tail symbols,
+mixed preamble and a conservative density allowance before consuming PN/SN.
+The actual current T count/byte/airtime limits and peer window bound each batch.
+
+Each original requires both the actual consumed PCI prefix and its own
+matching positive native CCX; out-of-order CCX cannot reorder software receipts.
+Receipts read the exact retained DMA bodies, not saved host copies. A new
+burst, key publication or control transfer additionally waits for source
+`mac.c::__rtw_mac_flush_prio_queue`'s16-bit reserved/available equality on
+the actual BE and management priority FIFOs selected by `TXDMA_PQ_MAP`.
+The exact C21/C22 queue geometry is independently checked. PCI consumption,
+CCX or ring emptiness alone is insufficient. Invalid counters, changed
+mapping, negative/duplicate reports or a bounded1s drain timeout close and
+retain the native allocations. After an acknowledged burst and genuine MAC
+quiet, an actual20-byte compressed BAR at the producer's current next SSN
+uses retained native control DMA and CCX. No returned bitmap is treated as
+a fabricated radio receipt; native MAC retry/status remain authoritative.
+
+Peer recipient DELBA and negotiated nonzero TU inactivity retire host TX
+eligibility before more DATA. Local key/close/current-source transitions
+retire active TX BA, drain submitted ownership, and serialize a native
+originator DELBA as appropriate. Security's actual controlled-port and current
+key/receive epochs remain authoritative independently of ordinary TX credits.
+All earlier RX publication/callback epoch fences remain in force. Partial BD
+publication, cancellation, corrupt payload or uncertain receipt pins every
+possibly visible buffer; no reset/reclamation proof is inferred.
+
+Twenty added native smokes are validated: eight per chip, three native packet
+Core cases and one literal protocol/receipt case. They exercise Open/WPA2 real
+DHCP/IP, actual four-buffer descriptors and ordered receipts, H/R/T identity
+and power intersections, invalid assets/H fallback, real SSN/response/refusal/
+TU timeout, held request CCX/cancel, FIFO/source/policy loss, partial-BD
+revocation, peer DELBA and genuine group-key reply/drain/reopen. Combined T/R
+cases preserve `0x04ce=0x0801` while checking T's separate program and receiving
+opaque reordered originals through real CCMP/PN. Together with the two
+cross-reply epoch regressions above, all44 added cases passed the coordinated
+native software suites. The full scoped Wi-Fi suites reported x86_64:
+2317 pass/0 fail/9 skip, and aarch64:1847 pass/0 fail/3 skip. These are full
+scoped Wi-Fi totals, not RTW88-only counts. Production boots and both btrfs
+postflight checks also completed cleanly on each architecture. Debug/release
+builds and strict Clippy, including the exact CI feature contexts, passed. None of
+these software results establishes silicon or RF acceptance.
+Full AC/TID scheduling, TX A-MSDU, larger/native IRQ pipelines,
+wider PHY/channels, reset/rejoin and power management remain software work.
+
+### C21/C22 separately qualified native RTS threshold
+
+`Rtw88Device::rts_request().await -> Result<RtsRequest, FirmwareError>`
+returns exact current H/R/T source-program identity, factory MAC and the
+expected `rtw88/rtw882{1,2}ce-rts-v1-<mac>.bin` registry name. It grants no
+power or transmission permission. The optional X extension retains a concrete
+acyclic H, R-over-H or T-over-exact-H/R owner; the request binds every
+preceding recipe and full signed record digest, including the actual T
+retry/burst limits. H/R/T assets cannot themselves grant RTS.
+
+The real registry loader requires a signed128-byte N21X/N22X record. Missing,
+unsigned, malformed or restricted optional input before binding preserves
+the preceding non-RTS station. Actual attached-source or policy loss closes
+the owner and cannot be repaired by a later asset/policy reinstall. The
+minimum of current policy, X and every earlier grant bounds every emission;
+previous H data, R automatic-response and T retry/burst peaks must fit that
+same limit, with each record's own antenna bound. No measured real-board X
+asset is supplied.
+
+|Bytes|X record field|
+|---|---|
+|0..4|exact native chip `N21X` or `N22X`|
+|4..12|version1, header128, total128 (little endian)|
+|12..16|VID10ec, exact DIDc821/c822|
+|16..48|current H/R/T program request identity|
+|48..56|factory MAC, channel1, width20|
+|56..60|antenna upper bound and maximum EIRP:i16 quarter-dB units|
+|60..68|whole transition, native RTS, automatic-response and complete retry/control/burst conducted peaks:i16 quarter-dBm|
+|68..70|full static thermal range0..63|
+|70..72|smallest measured/admitted finite RTS threshold0..2347:u16|
+|72..128|reserved zero|
+
+The measurement contract covers actual RTS/CTS/retry/control/data transitions,
+burst duty, supply, antenna, coexistence and all static raw thermal values.
+It does not infer those quantities from HT gains or a single-MPDU measurement.
+T's existing DATA-PPDU byte/symbol/density limits remain in force when T is
+attached; the extra RTS/control emission envelope requires X independently.
+
+The existing `WirelessNetIface::{rts_threshold,set_rts_threshold}` API is
+implemented for this single live retained HT20 station only after actual
+X admission and negotiated support for source24Mbps RTS. The initial setting
+is disabled (`u32::MAX`), which does not change the original H/R/T emitting
+program. Finite settings must lie between the signed minimum and2347;
+`u32::MAX` disables. Invalid values return EINVAL, unqualified/unsupported
+requests return EOPNOTSUPP, and an occupied native/key/control owner or
+nonempty MAC FIFO returns EBUSY without changing the setting. Configuration
+never waits for another executor while holding an IRQ-safe lock. No additional
+vdev or reset/recovery continuation is implemented by this API.
+
+Before publishing a setting, the exact retained owner must have an open real
+controlled port, no pending DATA/security/BA operation, current H gains/crypto
+readbacks and source native BE/management FIFO emptiness. Its actual X/base
+capabilities enclose the atomic setting change. The value survives a genuine
+same-owner key replacement; it creates no key, peer or controlled-port right.
+The public cached value reports configuration, not transmission authority.
+
+Source `mac80211.c::rtw_ops_set_rts_threshold` and `tx.c` select RTS for eligible
+ordinary DATA only when the original MPDU length is strictly greater than the
+threshold. The native packet Core adds exact source W3 USE_RTS bit12,
+W4 RTSRATE[28:24]=8 (`DESC_RATE24M`) and W5 DATA_RTS_SHORT bit12 to that
+original's descriptor. It requires the bound response's actual24Mbps rate;
+mandatory HT capability alone is not substituted for that negotiated fact.
+The QoS header, sequence, plaintext/ciphertext and CCMP nonce/MIC are never
+rewritten. Management, BA controls and raw24 private M2/M4/group-key replies
+stay on their existing non-RTS source descriptors and legacy rate.
+
+Single RTS DATA requests genuine native CCX and requires its exact retained
+DMA bytes plus consumed PCI ownership and positive radio status. It then
+requires the actual source MAC FIFO drain before another DATA/control/key
+publication or threshold change. T's four-buffer path keeps each MPDU's
+same independent CCX/consumed-prefix/FIFO proofs and R's exact source BAR
+mode. A negative/duplicate/corrupt/missing receipt, invalid FIFO, bounded1s
+drain timeout, cancellation or current-source loss closes admission while
+retaining every possibly published native allocation. There is no fabricated
+RTS firmware acknowledgement or inferred returned BA bitmap.
+
+Twelve new native smokes are authored, six per chip: Open/WPA2 kernel DHCP/IP
+over X-on-H/R/T, literal descriptor flags and strict threshold boundaries,
+disable/old assets/unsigned and malformed input/retry, exact source identity
+and prior-peak intersections, absent24Mbps response support, held CCX and
+genuine group-key reply with RTS absent, native FIFO/corrupt/negative/cancel
+failures, every preceding/X source and current policy loss, and revocation
+between actual batch BDs with retained DMA. All twelve additive RTS cases passed
+on both architectures in the coordinated scoped Wi-Fi suites: x86_64
+2360 pass,0 fail,9 skip; aarch64 1890 pass,0 fail,3 skip. Production boots and
+all btrfs postflights were clean. Earlier RX/TX BA totals describe the preceding
+validated checkpoint. Native RTS/CTS execution and physical
+RF/interoperability acceptance still require real firmware/silicon and the
+external measured X asset.
+
+No CTS-to-self or new AP HT-protection mode is inferred from the source RTS
+path. Current width/stream/channel restrictions remain unchanged. Source
+`rtw_ops_can_aggregate_in_amsdu` explicitly declines TX A-MSDU on2.4GHz;
+this channel1 owner therefore does not add a TX A-MSDU producer. That source
+policy is not a claim that the silicon lacks broader-band A-MSDU capability.
 
 
 ## 4. Invariants
@@ -1096,7 +1432,10 @@ Remaining software ledger:
 | Current signed per-board gain/operating-envelope qualification | Implemented loader, exact identity/source ceilings, cap revocation and current-policy checks; real measured signed artifact is an external deployment gate |
 | Fixed awake ch1 radio/DACK/IQK/OTP/qualified power | Implemented for the explicit version2 CCK/control-response profile; real signed measured envelope remains a deployment gate |
 | C21/C22 legacy12 DATA/WMM BE-TID0 | Separate N21L/N22L exact-chip identities/current signed measurements and host-policy gates; bound response rates/parameters, source EDCA/RA/RRSR, each chip's actual gain readbacks, native fixed legacy DATA, raw QoS/CCMP and Open/WPA2 DHCP/IP composition implemented. Base N21S/N22Cv2 alone retain CCK1; full AC/TID scheduling remains work |
-| C21/C22 HT20/one stream/SGI20 | Distinct N21H/N22H static measured contracts/current source gates; source-native absolute/reference-difference MCS gains, typed original offer/request/response, actual RA/TXD/RXD, authenticated whole3839-byte A-MSDU, native ADDBA-decline/CCX and Open/WPA2 DHCP/IP. Real assets/physical acceptance remain external; RX/TX BA and richer PHY remain work |
+| C21/C22 HT20/one stream/SGI20 | Distinct N21H/N22H static measured contracts/current source gates; source-native absolute/reference-difference MCS gains, typed original offer/request/response, actual RA/TXD/RXD, authenticated whole3839-byte A-MSDU, native ADDBA-decline/CCX and Open/WPA2 DHCP/IP. Real assets/physical acceptance remain external; richer PHY remains work |
+| C21/C22 recipient RX BA | Distinct exact-H N21R/N22R contract; actual bound ADDBA success/CCX/idle, explicit SSN, TIDs0..7/window<=64 with A-MSDU permission, source RAW/PHY admission, opaque originals before CCMP/PN, BAR20/DELBA/hole/TU timers and key/publication epochs implemented; native tests passed the coordinated x86_64/aarch64 software suites. Real measured assets/automatic BA/over-air acceptance remain external |
+| C21/C22 originator TX BA | Distinct exact-H or R-over-H N21T/N22T contract; bound on-air request/response/current SSN, genuine CCX/RX-idle/MAC-FIFO proof, four independent native DMA originals, source AGGEN/density/MAXAGG and per-MPDU status, current-SSN BAR20/DELBA/key drains implemented; native tests passed the coordinated x86_64/aarch64 software suites. Measured assets/real MAC aggregation and over-air behavior remain external |
+| C21/C22 RTS threshold | Separate N21X/N22X over exact current H/R/T; native24Mbps RTS descriptor/control program, actual response-rate admission, drained current-authority setting, CCX/immutable-DMA/FIFO completion and EAPOL exclusion implemented. Twelve native cases pass on both architectures; real measured X assets/RTS-CTS/physical acceptance remain external |
 | Port0 peer/AID/media/RA/default-port control | Implemented bounded source mailbox, long-slot initial MLME, same-owner station integration and close/cancel behavior |
 | Passive scan, authentication/association, WPA2 controlled port | Retained channel1 shared MLME/RSNA/CCMP through actual native DMA and CCX, including held/altered/cancelled M4 and queued peer-loss closure |
 | Native management/data TX, RX, completion and ring ownership | Implemented original rings, source descriptors, exact DMA plus CCX security receipt and current-authority publication |
@@ -1107,7 +1446,7 @@ Per-chip hardware backlog follows original `rtw8821c.c`, `rtw8822b.c` and
 `rtw8822c.c` chip-info/ops. C21 is1SS and C22B/C22C are2SS; all declare2.4/5GHz,
 HT and VHT. A separately qualified HT20/1SS/SGI20/A-MSDU station subset now has
 a complete software path on C21/C22C. Broader HT streams and widths, VHT,
-aggregation/reordering/BA, full WMM AC/TID scheduling, noninitial channels/active scan,
+Broader TX aggregation and recipient negotiation, full WMM AC/TID scheduling, noninitial channels/active scan,
 RF tracking, coexistence, sleep/WoW and controller-proven reset/rejoin. C22B needs
 retained firmware, MAC/PHY/RF/power and packet composition. C21/C22C supply
 separate qualified legacy station chains. None of these initial-profile exclusions are hardware

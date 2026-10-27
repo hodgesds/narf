@@ -24,6 +24,17 @@ struct NativeKey {
     slot: u8,
     rsc: u64,
     api: u8,
+    peer: [u8; 6],
+}
+
+struct KeyHistory {
+    digest: [u8; 32],
+    peer: [u8; 6],
+    group: bool,
+    id: u8,
+    floors: [u64; 17],
+    /// Only native key REMOVE followed by the exact RX marker sets this.
+    retired: bool,
 }
 
 struct Pending {
@@ -42,6 +53,7 @@ struct Exchange {
     waiting: bool,
     complete: bool,
     key_api: u8,
+    first_keys: bool,
 }
 
 #[derive(Default)]
@@ -49,7 +61,7 @@ pub(super) struct Context {
     active: Option<Exchange>,
     // Retired key material must never reset a PN during this native owner
     // lifetime, even after association/data teardown and recreation.
-    history: Vec<[u8; 32]>,
+    history: Vec<KeyHistory>,
     cookie: u32,
     mic_keys: bool,
 }
@@ -223,6 +235,7 @@ impl Owner {
             waiting: true,
             complete: false,
             key_api,
+            first_keys: true,
         });
         self.phase = Phase::SecuringData;
         let result = async {
@@ -475,6 +488,7 @@ impl Owner {
         }
         let mut keys = Vec::new();
         let api = self.security.active.as_ref().unwrap().key_api;
+        let peer = self.security_status()?.bssid;
         if let Some(material) = change.pairwise {
             keys.push(NativeKey {
                 material: Zeroizing::new(material),
@@ -483,6 +497,7 @@ impl Owner {
                 slot: 0,
                 rsc: 0,
                 api,
+                peer,
             });
         }
         keys.push(NativeKey {
@@ -492,9 +507,10 @@ impl Owner {
             slot: change.group_id + 1,
             rsc: change.group_rx_pn,
             api,
+            peer,
         });
         let mut install = Vec::new();
-        for key in keys {
+        for mut key in keys {
             let index = usize::from(key.slot);
             if let Some(old) = self.security.active.as_ref().unwrap().keys[index].as_ref() {
                 if old.material.as_ref() == key.material.as_ref() {
@@ -502,18 +518,94 @@ impl Owner {
                 }
             }
             let digest = key_digest(key.material.as_ref());
-            if self.security.history.contains(&digest)
-                || self.security.history.len() + install.len() >= HISTORY
+            let previous = self
+                .security
+                .history
+                .iter()
+                .find(|entry| entry.digest == digest);
+            if let Some(previous) = previous {
+                // Only an initial authenticated four-way exchange may restore
+                // an RX-only GTK from this exact AP/key index. Never restore a
+                // PTK/TX counter, cross role/peer or a live/uncertain native key.
+                if !self.security.active.as_ref().unwrap().first_keys
+                    || !key.group
+                    || !previous.group
+                    || previous.peer != peer
+                    || previous.id != key.id
+                    || !previous.retired
+                {
+                    return Err("MVM retired key role/peer/epoch reuse");
+                }
+                // Linux sta.c chooses the maximum RX PN across all TIDs for
+                // the single native key-install RSC. This can conservatively
+                // drop a lagging TID; it cannot lower a retired replay floor.
+                key.rsc = key.rsc.max(*previous.floors.iter().max().unwrap());
+                if key.rsc == 0xffff_ffff_ffff {
+                    return Err("MVM retired GTK PN exhausted");
+                }
+            }
+            let fresh = install
+                .iter()
+                .flatten()
+                .filter(|k: &&NativeKey| {
+                    !self
+                        .security
+                        .history
+                        .iter()
+                        .any(|h| h.digest == key_digest(k.material.as_ref()))
+                })
+                .count();
+            if previous.is_none() && self.security.history.len() + fresh >= HISTORY
                 || install
                     .iter()
                     .flatten()
                     .any(|k: &NativeKey| key_digest(k.material.as_ref()) == digest)
             {
-                return Err("MVM retired key reuse/history exhausted");
+                return Err("MVM key history exhausted/aliased");
             }
             install.push(Some(key));
         }
         Ok(install)
+    }
+
+    /// Snapshot only already-committed PN floors before native retirement.
+    /// The ledger remains non-reusable until the later single-RFH marker.
+    fn snapshot_key_history(&mut self, slot: usize) -> Result<usize, &'static str> {
+        let key = self.security.active.as_ref().unwrap().keys[slot]
+            .as_ref()
+            .ok_or("MVM key retirement owner absent")?;
+        let digest = key_digest(key.material.as_ref());
+        let index = self
+            .security
+            .history
+            .iter()
+            .position(|entry| {
+                entry.digest == digest
+                    && entry.peer == key.peer
+                    && entry.group == key.group
+                    && entry.id == key.id
+            })
+            .ok_or("MVM key retirement history identity absent")?;
+        let data = self
+            .power
+            .prepared
+            .as_ref()
+            .unwrap()
+            .mlme
+            .data
+            .as_ref()
+            .unwrap();
+        let floor = if key.group {
+            data.replay.group[usize::from(key.id)]
+        } else {
+            data.replay.pairwise
+        };
+        let entry = &mut self.security.history[index];
+        for (saved, current) in entry.floors.iter_mut().zip(floor) {
+            *saved = (*saved).max(current);
+        }
+        entry.retired = false;
+        Ok(index)
     }
 
     async fn apply_security_keys(
@@ -521,10 +613,12 @@ impl Owner {
         policy: &mut impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(), &'static str> {
         self.clear_data_aggregate();
+        self.retire_ba(Some(&mut *policy)).await?;
         let reply = self
             .qualified_link_command(1, 0x18, &super::auth::disable_tx(true), policy)
             .await?;
         success(&reply)?;
+        let mut retired = Vec::new();
         let count = self
             .security
             .active
@@ -549,6 +643,13 @@ impl Owner {
                 .unwrap();
             let index = usize::from(key.slot);
             let body = key_command(key, false);
+            let digest = key_digest(key.material.as_ref());
+            let (peer, group, id, rsc) = (key.peer, key.group, key.id, key.rsc);
+            let old_history = if self.security.active.as_ref().unwrap().keys[index].is_some() {
+                Some(self.snapshot_key_history(index)?)
+            } else {
+                None
+            };
             if let Some(old) = self.security.active.as_ref().unwrap().keys[index].as_ref() {
                 let remove = key_command(old, true);
                 let reply = self
@@ -556,6 +657,30 @@ impl Owner {
                     .await?;
                 success(&reply)?;
                 self.security.active.as_mut().unwrap().keys[index] = None;
+                retired.push(old_history.unwrap());
+            }
+            // Reserve the fingerprint BEFORE ADD can become device-visible.
+            // An uncertain publication must not leave an old reusable GTK
+            // proof, nor make fresh material appear unseen to a later owner.
+            if let Some(entry) = self
+                .security
+                .history
+                .iter_mut()
+                .find(|h| h.digest == digest)
+            {
+                entry.retired = false;
+                for pn in &mut entry.floors {
+                    *pn = (*pn).max(rsc);
+                }
+            } else {
+                self.security.history.push(KeyHistory {
+                    digest,
+                    peer,
+                    group,
+                    id,
+                    floors: [rsc; 17],
+                    retired: false,
+                });
             }
             let reply = self
                 .qualified_link_command(1, KEY, &body[..], policy)
@@ -572,9 +697,6 @@ impl Owner {
                 .install[entry]
                 .take()
                 .unwrap();
-            self.security
-                .history
-                .push(key_digest(key.material.as_ref()));
             self.security.active.as_mut().unwrap().keys[index] = Some(key);
             self.security
                 .active
@@ -587,6 +709,9 @@ impl Owner {
                 .push(index);
         }
         self.sync_security_rx(Some(policy)).await?;
+        for index in retired {
+            self.security.history[index].retired = true;
+        }
         let active = self.security.active.as_ref().unwrap();
         let pending = active.pending.as_ref().unwrap();
         let data = self
@@ -615,6 +740,7 @@ impl Owner {
             .qualified_link_command(1, 0x18, &super::auth::disable_tx(false), policy)
             .await?;
         success(&reply)?;
+        self.security.active.as_mut().unwrap().first_keys = false;
         self.check_link_power(&policy()?)
     }
 
@@ -622,7 +748,13 @@ impl Owner {
         if self.security.active.is_none() {
             return Ok(());
         }
+        let mut retired = Vec::new();
         for index in 0..5 {
+            let history = if self.security.active.as_ref().unwrap().keys[index].is_some() {
+                Some(self.snapshot_key_history(index)?)
+            } else {
+                None
+            };
             if let Some(key) = self.security.active.as_ref().unwrap().keys[index].as_ref() {
                 let body = key_command(key, true);
                 let reply = self
@@ -631,22 +763,58 @@ impl Owner {
                     .await?;
                 success(&reply.payload)?;
                 self.security.active.as_mut().unwrap().keys[index] = None;
+                retired.push(history.unwrap());
             }
         }
         self.sync_security_rx(None::<&mut fn() -> Result<RegulatoryDomain, &'static str>>)
             .await?;
+        for index in retired {
+            self.security.history[index].retired = true;
+        }
         self.security.active = None;
         Ok(())
     }
 
-    async fn sync_security_rx(
+    pub(super) async fn sync_security_rx(
+        &mut self,
+        policy: Option<&mut impl FnMut() -> Result<RegulatoryDomain, &'static str>>,
+    ) -> Result<(), &'static str> {
+        self.sync_native_rx(policy, None).await
+    }
+
+    pub(super) async fn sync_ba_rx(
+        &mut self,
+        baid: u8,
+        policy: Option<&mut impl FnMut() -> Result<RegulatoryDomain, &'static str>>,
+    ) -> Result<(), &'static str> {
+        self.sync_native_rx(policy, Some(baid)).await
+    }
+
+    async fn sync_native_rx(
         &mut self,
         mut policy: Option<&mut impl FnMut() -> Result<RegulatoryDomain, &'static str>>,
+        baid: Option<u8>,
     ) -> Result<(), &'static str> {
         let bound = if policy.is_some() {
+            let data = self
+                .power
+                .prepared
+                .as_ref()
+                .and_then(|p| p.mlme.data.as_ref())
+                .ok_or("MVM RX epoch data owner absent")?;
+            let queue = data.queue.ok_or("MVM RX epoch queue absent")?;
+            if !self.hardware.idle_tx_binding(queue, 0, 0) {
+                return Err("MVM RX epoch TX still outstanding");
+            }
             Some((
                 self.mac.ok_or("MVM RX epoch MAC absent")?,
-                self.security_status()?,
+                LegacyDataStatus {
+                    bssid: data.status.bssid,
+                    channel: data.status.channel,
+                    queue,
+                    supported_rates: data.status.supported_rates,
+                    protected: data.status.protected,
+                },
             ))
         } else {
             None
@@ -657,11 +825,15 @@ impl Owner {
             .checked_add(1)
             .ok_or("MVM RX key epoch exhausted")?;
         let cookie = self.security.cookie;
-        let mut body = [0; 20];
+        let mut body = alloc::vec![0; if baid.is_some(){24}else{20}];
         put32(&mut body, 4, 1);
-        put32(&mut body, 8, 8);
+        put32(&mut body, 8, if baid.is_some() { 12 } else { 8 });
+        put16(&mut body, 12, u16::from(baid.is_some()));
         put16(&mut body, 14, 1);
         put32(&mut body, 16, cookie);
+        if let Some(id) = baid {
+            put32(&mut body, 20, u32::from(id));
+        }
         let reply = if let Some(p) = policy.as_deref_mut() {
             self.qualified_link_command(5, 2, &body, p).await?
         } else {
@@ -693,7 +865,16 @@ impl Owner {
                 }
                 if packet.header.group_id == 5 && packet.header.cmd == 0xff {
                     let bytes = packet.payload;
-                    if bytes.len() != 12 || bytes[..8] != [8, 0, 0, 0, 0, 0, 1, 0] {
+                    let prefix = if baid.is_some() {
+                        [12, 0, 0, 0, 1, 0, 1, 0]
+                    } else {
+                        [8, 0, 0, 0, 0, 0, 1, 0]
+                    };
+                    let expected_length = if baid.is_some() { 16 } else { 12 };
+                    if bytes.len() != expected_length
+                        || bytes[..8] != prefix
+                        || baid.is_some_and(|id| bytes[12..16] != u32::from(id).to_le_bytes())
+                    {
                         return Err("MVM RX key epoch marker malformed");
                     }
                     if u32::from_le_bytes(bytes[8..12].try_into().unwrap()) == cookie {

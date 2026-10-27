@@ -80,6 +80,13 @@ pub(in crate::rtw88) struct Peer {
     pub(in crate::rtw88) response_wmm: Option<Option<Vec<u8>>>,
     pub(in crate::rtw88) ht: Option<Vec<u8>>,
     pub(in crate::rtw88) declines: Vec<Vec<u8>>,
+    pub(in crate::rtw88) ba_controls: Vec<Vec<u8>>,
+    pub(in crate::rtw88) tx_ba_controls: Vec<Vec<u8>>,
+    pub(in crate::rtw88) tx_ba_window: Option<u8>,
+    pub(in crate::rtw88) tx_ba_timeout: u16,
+    pub(in crate::rtw88) tx_ba_override: Option<Vec<u8>>,
+    pub(in crate::rtw88) hold_tx_ba: bool,
+    tx_next_sequence: Option<u16>,
     pub(in crate::rtw88) hold_decline: bool,
     pub(in crate::rtw88) ap: FakeAp,
     pub(in crate::rtw88) plan: NetworkPlan,
@@ -87,8 +94,12 @@ pub(in crate::rtw88) struct Peer {
     pub(in crate::rtw88) ptk: Option<Ptk>,
     pub(super) replay: narf_wireless::ccmp::ReplayWindow,
     pub(in crate::rtw88) pn: u64,
+    pub(in crate::rtw88) data_sequence: u16,
+    pub(in crate::rtw88) reorder_downlink: bool,
     pub(in crate::rtw88) uplink: Vec<Vec<u8>>,
     pub(in crate::rtw88) hold_m4: bool,
+    pub(in crate::rtw88) m2_data: Option<Vec<u8>>,
+    pub(in crate::rtw88) m2_original: Option<Vec<u8>>,
     pub(in crate::rtw88) hold_data: bool,
 }
 impl Peer {
@@ -117,6 +128,13 @@ impl Peer {
             response_wmm: None,
             ht: None,
             declines: Vec::new(),
+            ba_controls: Vec::new(),
+            tx_ba_controls: Vec::new(),
+            tx_ba_window: None,
+            tx_ba_timeout: 0,
+            tx_ba_override: None,
+            hold_tx_ba: false,
+            tx_next_sequence: None,
             hold_decline: false,
             ap,
             plan,
@@ -124,8 +142,12 @@ impl Peer {
             ptk: None,
             replay: narf_wireless::ccmp::ReplayWindow { last_seen_pn: 0 },
             pn: 1,
+            data_sequence: 0,
+            reorder_downlink: false,
             uplink: Vec::new(),
             hold_m4: false,
+            m2_data: None,
+            m2_original: None,
             hold_data: false,
         }
     }
@@ -139,7 +161,8 @@ impl Peer {
         frame.extend_from_slice(&ethernet[..6]);
         frame.extend_from_slice(&AP);
         frame.extend_from_slice(&ethernet[6..12]);
-        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(&(self.data_sequence << 4).to_le_bytes());
+        self.data_sequence = (self.data_sequence + 1) & 4095;
         if self.qos {
             frame.extend_from_slice(&[0, 0]);
         }
@@ -165,10 +188,86 @@ impl Peer {
         &mut self,
         frame: &[u8],
     ) -> Result<(Vec<Vec<u8>>, bool), &'static str> {
+        if frame.len() == 20 && frame[..2] == [0x84, 0] {
+            let ssn = u16::from_le_bytes([frame[18], frame[19]]);
+            if frame[4..10] != AP
+                || frame[10..16] != self.plan.station
+                || frame[16..18] != [4, 0]
+                || ssn & 15 != 0
+                || self.tx_next_sequence != Some(ssn >> 4)
+            {
+                return Err("native BAR current source SSN/peer");
+            }
+            self.tx_ba_controls.push(frame.to_vec());
+            let mut reply = vec![0x94, 0, 0, 0];
+            reply.extend_from_slice(&self.plan.station);
+            reply.extend_from_slice(&AP);
+            reply.extend_from_slice(&[4, 0]);
+            reply.extend_from_slice(&ssn.to_le_bytes());
+            reply.extend_from_slice(&[0; 8]);
+            return Ok((vec![reply], self.hold_tx_ba));
+        }
         if frame.len() < 24 || frame[4..10] != AP || frame[10..16] != self.plan.station {
             return Err("native AP peer identity");
         }
         if frame[0] == 0xd0 {
+            if frame.len() == 33 && frame[24..26] == [3, 0] {
+                let p = u16::from_le_bytes([frame[27], frame[28]]);
+                let window = p >> 6;
+                let ssn = u16::from_le_bytes([frame[31], frame[32]]);
+                let local = self
+                    .tx_ba_window
+                    .ok_or("unqualified AP received originator request")?;
+                if self.ap.phase() != ApPhase::Authorized
+                    || !self.qos
+                    || self.ht.is_none()
+                    || p & 0x3f != 2
+                    || !(1..=64).contains(&window)
+                    || ssn & 15 != 0
+                {
+                    return Err("native originator request phase/parameter/SSN");
+                }
+                self.tx_ba_controls.push(frame.to_vec());
+                let selected = local.min(window as u8);
+                let mut response = vec![0xd0, 0, 0, 0];
+                response.extend_from_slice(&self.plan.station);
+                response.extend_from_slice(&AP);
+                response.extend_from_slice(&AP);
+                response.extend_from_slice(&[0, 0, 3, 1, frame[26]]);
+                response.extend_from_slice(&(if selected == 0 { 37u16 } else { 0 }).to_le_bytes());
+                response.extend_from_slice(&(2 | u16::from(selected) << 6).to_le_bytes());
+                response.extend_from_slice(&self.tx_ba_timeout.to_le_bytes());
+                self.tx_next_sequence = (selected != 0).then_some(ssn >> 4);
+                return Ok((
+                    vec![self.tx_ba_override.clone().unwrap_or(response)],
+                    self.hold_tx_ba,
+                ));
+            }
+            if frame.len() == 30 && frame[24..30] == [3, 2, 0, 8, 39, 0] {
+                self.tx_ba_controls.push(frame.to_vec());
+                self.tx_next_sequence = None;
+                return Ok((Vec::new(), self.hold_tx_ba));
+            }
+            if frame.len() == 33 && frame[24..26] == [3, 1] && frame[27..29] == [0, 0] {
+                let p = u16::from_le_bytes([frame[29], frame[30]]);
+                if frame[16..22] != AP
+                    || p & 3 != 3
+                    || (p >> 2) & 15 >= 8
+                    || !(1..=64).contains(&(p >> 6))
+                {
+                    return Err("native RX BA success parameters");
+                }
+                self.ba_controls.push(frame.to_vec());
+                return Ok((Vec::new(), self.hold_decline));
+            }
+            if frame.len() == 30 && frame[24..26] == [3, 2] && frame[28..30] == [39, 0] {
+                let p = u16::from_le_bytes([frame[26], frame[27]]);
+                if frame[16..22] != AP || p & 0xfff != 0 || p >> 12 >= 8 {
+                    return Err("native recipient DELBA parameters");
+                }
+                self.ba_controls.push(frame.to_vec());
+                return Ok((Vec::new(), self.hold_decline));
+            }
             if frame.len() != 33 || frame[24..26] != [3, 1] || frame[27..29] != [37, 0] {
                 return Err("native ADDBA decline differs");
             }
@@ -240,10 +339,23 @@ impl Peer {
                     &key.key_nonce,
                     16,
                 ));
+                if let Some(ethernet) = self.m2_data.take() {
+                    let original = self.downlink(&ethernet)?;
+                    self.m2_original = Some(original.clone());
+                    replies.push(original);
+                }
             }
             return Ok((replies, before == ApPhase::Message4 && self.hold_m4));
         }
         let header = if self.qos && frame[0] == 0x88 { 26 } else { 24 };
+        if header == 26 {
+            if let Some(expected) = self.tx_next_sequence {
+                if u16::from_le_bytes([frame[22], frame[23]]) >> 4 != expected {
+                    return Err("actual negotiated originator SSN/sequence differs");
+                }
+                self.tx_next_sequence = Some((expected + 1) & 4095);
+            }
+        }
         if frame.len() < header
             || !matches!(frame[0], 8 | 0x88)
             || frame[0] == 0x88 && !self.qos
@@ -285,7 +397,18 @@ impl Peer {
         }
         self.uplink.push(ethernet.clone());
         let replies = match self.server.receive(&ethernet) {
-            Some(reply) => vec![self.downlink(&reply)?],
+            Some(reply) => {
+                let actual = self.downlink(&reply)?;
+                if self.reorder_downlink {
+                    let mut filler = self.plan.station.to_vec();
+                    filler.extend_from_slice(&AP);
+                    filler.extend_from_slice(&[0x88, 0xb5]);
+                    filler.extend_from_slice(b"BA future before DHCP");
+                    vec![self.downlink(&filler)?, actual]
+                } else {
+                    vec![actual]
+                }
+            }
             None => Vec::new(),
         };
         Ok((replies, self.hold_data))

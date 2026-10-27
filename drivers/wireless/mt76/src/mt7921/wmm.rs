@@ -18,6 +18,7 @@ pub(crate) struct Parameters {
     // Canonical WMM ACI order: BE, BK, VI, VO. Linux's LMAC mapping and
     // set_tx's to_aci permutation compose to this exact command order.
     ac: [Ac; 4],
+    parameter_set_count: u8,
 }
 
 impl Parameters {
@@ -35,6 +36,7 @@ impl Parameters {
             return Err(Error::Protocol);
         }
         Ok(Some(Self {
+            parameter_set_count: parameters.parameter_set_count,
             ac: parameters.ac.map(|ac| Ac {
                 cw_min: ac.cw_min(),
                 cw_max: ac.cw_max(),
@@ -42,6 +44,13 @@ impl Parameters {
                 aifs: u16::from(ac.aifsn),
             }),
         }))
+    }
+
+    /// The AP's four-bit change counter wraps; it is not a monotonic serial
+    /// number. A changed counter earns a fresh native command even when the
+    /// host's conservative BE clamp yields the same command bytes.
+    pub(crate) fn same_set(self, other: Self) -> bool {
+        self.parameter_set_count == other.parameter_set_count
     }
 
     /// Native CE SET_EDCA_PARMS (0x1d), one BSS and WMM set zero.
@@ -54,7 +63,7 @@ impl Parameters {
         ac[0].cw_max = ac[0].cw_max.max(1023);
         ac[0].aifs = ac[0].aifs.max(3);
         ac[0].txop = 0;
-        Self { ac }.encode(true)
+        Self { ac, ..self }.encode(true)
     }
 
     fn encode(self, qos: bool) -> [u8; 44] {
@@ -75,6 +84,7 @@ impl Parameters {
 
 pub(crate) fn legacy_edca() -> [u8; 44] {
     Parameters {
+        parameter_set_count: 0,
         ac: [Ac {
             cw_min: 31,
             cw_max: 1023,

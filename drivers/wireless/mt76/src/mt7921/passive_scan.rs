@@ -4,6 +4,44 @@
 use super::{station::Command, *};
 
 pub use narf_wireless::association::Bss as ScanBss;
+/// Linux MT76_CONNAC_SCAN_IE_LEN; the packed v1 request reserves600 bytes.
+pub const MAX_SCAN_IE_LEN: u16 = 600;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScanOptions<'a> {
+    pub extra_ies: &'a [u8],
+    pub random_mac: Option<narf_wireless::ScanRandomMac>,
+}
+pub fn validate_scan_options(options: ScanOptions<'_>) -> Result<(), Error> {
+    validate_scan_probe_ies(options.extra_ies)?;
+    if options
+        .random_mac
+        .is_some_and(|random| random.mask[0] & 1 == 0 || random.addr[0] & 1 != 0)
+    {
+        return Err(Error::Bounds);
+    }
+    Ok(())
+}
+
+/// Complete opaque Probe Request elements. Firmware owns SSID and legacy
+/// rates; probe content cannot grant a native association/PHY/port feature.
+pub fn validate_scan_probe_ies(mut bytes: &[u8]) -> Result<(), Error> {
+    if bytes.len() > usize::from(MAX_SCAN_IE_LEN) {
+        return Err(Error::Bounds);
+    }
+    while !bytes.is_empty() {
+        let head = bytes.get(..2).ok_or(Error::Bounds)?;
+        let end = 2 + usize::from(head[1]);
+        let body = bytes.get(2..end).ok_or(Error::Bounds)?;
+        match head[0] {
+            0 | 1 | 50 => return Err(Error::Bounds),
+            221 if body.len() < 3 => return Err(Error::Bounds),
+            255 if body.is_empty() => return Err(Error::Bounds),
+            _ => {}
+        }
+        bytes = &bytes[end..];
+    }
+    Ok(())
+}
 /// A completed hardware scan; an empty result is not a fabricated network.
 #[derive(Clone, Debug)]
 pub struct ScanReport {
@@ -259,6 +297,15 @@ pub(super) fn active_scan_request(
     channels: &[u8],
     ssids: &[Vec<u8>],
 ) -> Result<Vec<u8>, Error> {
+    active_scan_request_with_ies(sequence, channels, ssids, &[])
+}
+pub(super) fn active_scan_request_with_ies(
+    sequence: u8,
+    channels: &[u8],
+    ssids: &[Vec<u8>],
+    extra_ies: &[u8],
+) -> Result<Vec<u8>, Error> {
+    validate_scan_probe_ies(extra_ies)?;
     if ssids.is_empty() || ssids.len() > 4 || ssids.iter().any(|ssid| ssid.len() > 32) {
         return Err(Error::Bounds);
     }
@@ -275,6 +322,8 @@ pub(super) fn active_scan_request(
     body[3] = if count == 0 { 1 } else { 4 };
     body[4] = count as u8;
     body[1185] = u8::from(count != 0); // ssid_type_ext: specified-only.
+    body[224..226].copy_from_slice(&(extra_ies.len() as u16).to_le_bytes());
+    body[226..226 + extra_ies.len()].copy_from_slice(extra_ies);
     Ok(body)
 }
 
@@ -413,8 +462,10 @@ impl<B: Backend> Session<B> {
     }
 
     pub(super) async fn scan_passive(&mut self, channels: &[u8]) -> Result<ScanReport, Error> {
-        self.scan_with_policy(channels, &[], || Err(Error::Authority))
-            .await
+        self.scan_with_options_and_policy(channels, &[], ScanOptions::default(), || {
+            Err(Error::Authority)
+        })
+        .await
     }
 
     pub(super) async fn scan_active_with_policy(
@@ -423,23 +474,47 @@ impl<B: Backend> Session<B> {
         ssids: &[Vec<u8>],
         policy: impl FnMut() -> Result<narf_wireless::reg::RegulatoryDomain, Error>,
     ) -> Result<ScanReport, Error> {
-        if ssids.is_empty() {
-            return Err(Error::Bounds);
-        }
-        self.scan_with_policy(channels, ssids, policy).await
+        self.scan_active_with_ies_and_policy(channels, ssids, &[], policy)
+            .await
     }
-
-    async fn scan_with_policy(
+    pub(super) async fn scan_active_with_ies_and_policy(
         &mut self,
         channels: &[u8],
         ssids: &[Vec<u8>],
+        extra_ies: &[u8],
+        policy: impl FnMut() -> Result<narf_wireless::reg::RegulatoryDomain, Error>,
+    ) -> Result<ScanReport, Error> {
+        if ssids.is_empty() {
+            return Err(Error::Bounds);
+        }
+        self.scan_with_options_and_policy(
+            channels,
+            ssids,
+            ScanOptions {
+                extra_ies,
+                random_mac: None,
+            },
+            policy,
+        )
+        .await
+    }
+
+    pub(super) async fn scan_with_options_and_policy(
+        &mut self,
+        channels: &[u8],
+        ssids: &[Vec<u8>],
+        options: ScanOptions<'_>,
         mut policy: impl FnMut() -> Result<narf_wireless::reg::RegulatoryDomain, Error>,
     ) -> Result<ScanReport, Error> {
+        validate_scan_options(options)?;
         let sequence = self.scan_seq % 127 + 1;
-        let request = if ssids.is_empty() {
+        let mut request = if ssids.is_empty() {
+            if !options.extra_ies.is_empty() {
+                return Err(Error::Bounds);
+            }
             scan_request(sequence, channels)?
         } else {
-            active_scan_request(sequence, channels, ssids)?
+            active_scan_request_with_ies(sequence, channels, ssids, options.extra_ies)?
         }; // No writes on invalid input.
         let active = if ssids.is_empty() {
             None
@@ -456,6 +531,18 @@ impl<B: Backend> Session<B> {
                 .is_none_or(|band| info.capabilities.phy.bands & band.capability() == 0)
         }) {
             return Err(Error::InvalidIdentity);
+        }
+        if let Some(random) = options.random_mac {
+            self.backend.check()?;
+            let mut address = [0; 6];
+            self.backend.random_bytes(&mut address)?;
+            for ((byte, supplied), mask) in address.iter_mut().zip(random.addr).zip(random.mask) {
+                *byte = (*byte & !mask) | (supplied & mask);
+            }
+            // Source get_random_mask_addr is host-side; firmware receives
+            // one resolved address, not addr/mask or a fabricated RNG seed.
+            request[6] |= 1; // SCAN_FUNC_RANDOM_MAC, alongside split scan.
+            request[1116..1122].copy_from_slice(&address);
         }
         self.scan_seq = sequence;
         self.boot_started = Some(self.backend.now_ns());

@@ -23,11 +23,17 @@ struct Submission {
     queue: Queue,
     report: Option<u8>,
     length: usize,
+    address: u64,
+    next: u16,
+    rts: bool,
 }
 pub(in crate::rtw88) struct Controls {
     pub(in crate::rtw88) held: AtomicBool,
     pub(in crate::rtw88) release: AtomicBool,
     pub(in crate::rtw88) corrupt_receipt: AtomicBool,
+    pub(in crate::rtw88) fifo_stuck: AtomicBool,
+    pub(in crate::rtw88) fifo_invalid: AtomicBool,
+    pub(in crate::rtw88) rts_failure: AtomicBool,
     pub(in crate::rtw88) incoming: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
     pub(in crate::rtw88) incoming_profiles: IrqSafeSpinLock<VecDeque<(Vec<u8>, u8, u8)>>,
 }
@@ -37,12 +43,18 @@ impl Default for Controls {
             held: AtomicBool::new(false),
             release: AtomicBool::new(false),
             corrupt_receipt: AtomicBool::new(false),
+            fifo_stuck: AtomicBool::new(false),
+            fifo_invalid: AtomicBool::new(false),
+            rts_failure: AtomicBool::new(false),
             incoming: IrqSafeSpinLock::new(VecDeque::new()),
             incoming_profiles: IrqSafeSpinLock::new(VecDeque::new()),
         }
     }
 }
 pub(in crate::rtw88) struct Model {
+    pub(in crate::rtw88) protection: Option<Arc<crate::rtw88::protection::Grant>>,
+    pub(in crate::rtw88) originator_ba: bool,
+    pub(in crate::rtw88) recipient_ba: bool,
     pub(in crate::rtw88) receive_chip: crate::rtw88::packet_phy::Chip,
     indices: [u32; 3],
     pub(in crate::rtw88) now: u64,
@@ -58,13 +70,15 @@ pub(in crate::rtw88) struct Model {
     tag: u16,
     payload_cpu: Option<usize>,
     payload_dma: Option<u64>,
+    payloads: Vec<(u64, usize, usize)>,
     pub(in crate::rtw88) reaction: Option<Arc<Reaction>>,
     pub(in crate::rtw88) authority: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     pub(in crate::rtw88) after_descriptor: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(in crate::rtw88) after_idle: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(in crate::rtw88) last_descriptor: Option<[u8; 48]>,
-    submission: Option<Submission>,
-    held: Option<Submission>,
+    submissions: VecDeque<Submission>,
+    held: VecDeque<Submission>,
+    pub(in crate::rtw88) descriptors: Vec<[u8; 48]>,
     pub(in crate::rtw88) controls: Arc<Controls>,
 }
 impl Model {
@@ -73,6 +87,9 @@ impl Model {
     }
     pub(in crate::rtw88) fn new() -> Self {
         Self {
+            protection: None,
+            recipient_ba: false,
+            originator_ba: false,
             receive_chip: crate::rtw88::packet_phy::Chip::C22,
             indices: [0; 3],
             now: 0,
@@ -88,13 +105,15 @@ impl Model {
             tag: 0,
             payload_cpu: None,
             payload_dma: None,
+            payloads: Vec::new(),
             reaction: None,
             authority: None,
             after_descriptor: None,
             after_idle: None,
             last_descriptor: None,
-            submission: None,
-            held: None,
+            submissions: VecDeque::new(),
+            held: VecDeque::new(),
+            descriptors: Vec::new(),
             controls: Arc::new(Controls::default()),
         }
     }
@@ -173,29 +192,58 @@ impl Model {
         self.receive(&body, true, false);
     }
     pub(in crate::rtw88) fn mutate_payload(&mut self) {
-        if let Some(address) = self.payload_cpu {
+        let Some(submission) = self
+            .held
+            .front()
+            .or_else(|| self.submissions.front())
+            .copied()
+        else {
+            return;
+        };
+        if let Some(&(_, address, extent)) =
+            self.payloads.iter().find(|p| p.0 == submission.address)
+        {
+            if submission.length == 0 || format::TX_DESC + submission.length > extent {
+                return;
+            }
+            // Corrupt the actual submitted body, including a33-byte ADDBA
+            // response or20-byte BAR. Byte50 could otherwise hit only DMA
+            // padding and leave the immutable receipt completely unchanged.
+            let offset = 50.min(submission.length - 1);
             // SAFETY: Model records the live CPU provenance from allocation;
-            // it is retained by Core, and no concurrent CPU/model access runs.
+            // the complete submitted extent is checked and retained by Core,
+            // with no concurrent CPU/model access.
             unsafe {
-                (address as *mut u8)
-                    .add(format::TX_DESC + 50)
-                    .write_volatile(0xee);
+                let byte = (address as *mut u8).add(format::TX_DESC + offset);
+                let value = byte.read_volatile();
+                byte.write_volatile(if value == 0xee { 0xed } else { 0xee });
             }
         }
     }
     pub(in crate::rtw88) fn complete_held(&mut self) -> bool {
-        let Some(submission) = self.held.take() else {
+        if self.held.is_empty() {
             return false;
-        };
-        self.consumed(submission.queue);
-        self.controls.held.store(false, Ordering::Release);
-        if let Some(sequence) = submission.report {
-            self.report(sequence, true);
         }
+        while let Some(submission) = self.held.pop_front() {
+            let i = queue_slot(submission.queue);
+            self.indices[i] = self.indices[i] & 0xffff | u32::from(submission.next) << 16;
+            if let Some(sequence) = submission.report {
+                self.report(sequence, true);
+            }
+        }
+        self.controls.held.store(false, Ordering::Release);
         true
     }
     fn actual_body(&self, submission: Submission) -> Result<Vec<u8>, Error> {
-        let pointer = self.payload_cpu.ok_or(Error::Memory)? as *const u8;
+        let (_, pointer, extent) = *self
+            .payloads
+            .iter()
+            .find(|p| p.0 == submission.address)
+            .ok_or(Error::Address)?;
+        if format::TX_DESC + submission.length > extent {
+            return Err(Error::Address);
+        }
+        let pointer = pointer as *const u8;
         // SAFETY: the model records the CPU pointer from this same retained
         // allocation; tx_descriptor checked the complete submission extent.
         Ok(unsafe {
@@ -226,6 +274,15 @@ impl Model {
 // SAFETY: inert single-threaded model owns unique real coherent allocations;
 // simulated bus addresses only match complete owned maps, never become CPU pointers.
 unsafe impl Port for Model {
+    fn rts_threshold(&self) -> Option<u32> {
+        self.protection.as_ref().map(|g| g.threshold())
+    }
+    fn originator_ba_allowed(&self) -> bool {
+        self.originator_ba
+    }
+    fn recipient_ba_allowed(&self) -> bool {
+        self.recipient_ba
+    }
     fn receive_chip(&self) -> Result<crate::rtw88::packet_phy::Chip, Error> {
         Ok(self.receive_chip)
     }
@@ -251,8 +308,11 @@ unsafe impl Port for Model {
             u64::from(u32::MAX),
         )
         .map_err(|_| Error::Memory)?;
-        self.payload_cpu = Some(buffer.cpu_mut_ptr_at::<u8>(0) as usize);
-        self.payload_dma = Some(buffer.dma_addr().raw());
+        let cpu = buffer.cpu_mut_ptr_at::<u8>(0) as usize;
+        let dma = buffer.dma_addr().raw();
+        self.payload_cpu.get_or_insert(cpu);
+        self.payload_dma.get_or_insert(dma);
+        self.payloads.push((dma, cpu, buffer.len()));
         Ok(buffer)
     }
     fn index(&mut self, reg: u16) -> Result<u32, Error> {
@@ -279,12 +339,16 @@ unsafe impl Port for Model {
             self.tx_publications += 1;
         }
         self.indices[index] = self.indices[index] & 0xffff_0000 | u32::from(host);
-        if let Some(submission) = self
-            .submission
-            .filter(|submission| submission.queue.index() == reg)
-        {
-            self.submission = None;
-            if let Some(reaction) = self.reaction.clone() {
+        if let Some(reaction) = self.reaction.clone() {
+            while let Some(position) = self.submissions.iter().position(|s| s.queue.index() == reg)
+            {
+                let submission = self.submissions.remove(position).ok_or(Error::State)?;
+                if submission.rts && self.controls.rts_failure.load(Ordering::Acquire) {
+                    let i = queue_slot(submission.queue);
+                    self.indices[i] = self.indices[i] & 0xffff | u32::from(submission.next) << 16;
+                    self.report(submission.report.ok_or(Error::Packet)?, false);
+                    continue;
+                }
                 // The simulated device consumes current DMA bytes at the
                 // doorbell, independently of the earlier descriptor write.
                 let body = self.actual_body(submission)?;
@@ -294,10 +358,11 @@ unsafe impl Port for Model {
                     self.receive(&response, false, false);
                 }
                 if hold {
-                    self.held = Some(submission);
+                    self.held.push_back(submission);
                     self.controls.held.store(true, Ordering::Release);
                 } else {
-                    self.consumed(submission.queue);
+                    let i = queue_slot(submission.queue);
+                    self.indices[i] = self.indices[i] & 0xffff | u32::from(submission.next) << 16;
                     if let Some(sequence) = submission.report {
                         self.report(sequence, true);
                     }
@@ -309,16 +374,21 @@ unsafe impl Port for Model {
     fn tx_descriptor(
         &mut self,
         queue: Queue,
-        _slot: usize,
+        slot: usize,
         descriptor: &[u8; 16],
     ) -> Result<(), Error> {
         self.guard()?;
         let address = u32::from_le_bytes(descriptor[4..8].try_into().unwrap()) as u64;
         let length = u32::from_le_bytes(descriptor[8..12].try_into().unwrap()) as usize;
-        if Some(address) != self.payload_dma || length > format::MAX_MPDU {
+        let (_, pointer, extent) = *self
+            .payloads
+            .iter()
+            .find(|p| p.0 == address)
+            .ok_or(Error::Address)?;
+        if length > format::MAX_MPDU || format::TX_DESC + length > extent {
             return Err(Error::Address);
         }
-        let pointer = self.payload_cpu.ok_or(Error::Memory)? as *const u8;
+        let pointer = pointer as *const u8;
         // SAFETY: this CPU pointer was recorded from this exact allocation;
         // full extent is validated, synchronous model observes published data.
         let body = unsafe { core::slice::from_raw_parts(pointer.add(format::TX_DESC), length) };
@@ -328,12 +398,24 @@ unsafe impl Port for Model {
         // from the host station's pending state.
         let descriptor = unsafe { core::slice::from_raw_parts(pointer, format::TX_DESC) };
         self.last_descriptor = Some(descriptor.try_into().map_err(|_| Error::Packet)?);
+        self.descriptors
+            .push(descriptor.try_into().map_err(|_| Error::Packet)?);
         let status = u32::from_le_bytes(descriptor[8..12].try_into().unwrap());
+        let rts = u32::from_le_bytes(descriptor[12..16].try_into().unwrap()) & (1 << 12) != 0;
+        if rts
+            && (u32::from_le_bytes(descriptor[16..20].try_into().unwrap()) >> 24 & 31 != 8
+                || u32::from_le_bytes(descriptor[20..24].try_into().unwrap()) & (1 << 12) == 0)
+        {
+            return Err(Error::Packet);
+        }
         let sequence = descriptor[24] & 0xfc;
-        self.submission = Some(Submission {
+        self.submissions.push_back(Submission {
             queue,
             report: (status & (1 << 19) != 0).then_some(sequence),
             length,
+            address,
+            next: ((slot + 1) % queue.depth()) as u16,
+            rts,
         });
         if let Some(callback) = self.after_descriptor.clone() {
             callback();
@@ -441,6 +523,65 @@ fn check_native_ccx_and_real_rx_idle() -> Result<(), &'static str> {
     }
     Ok(())
 }
+
+fn smoke_rtw88_rx_ba_native_emitter_requires_separate_grant_and_ccx() -> TestResult {
+    let result = (|| -> Result<(), &'static str> {
+        let mut model = Model::new();
+        let mut core = Core::prepare(&mut model, OWN, 0).map_err(|_| "recipient packet prepare")?;
+        core.start(&mut model)
+            .map_err(|_| "recipient packet start")?;
+        core.configure_data(format::DataProfile {
+            rates: 0xfff,
+            qos: true,
+            mcs: 255,
+            sgi: false,
+        })
+        .map_err(|_| "recipient H profile")?;
+        let ap = [2, 0, 0, 0, 0, 1];
+        let mut response = vec![0xd0, 0, 0, 0];
+        response.extend_from_slice(&ap);
+        response.extend_from_slice(&OWN);
+        response.extend_from_slice(&ap);
+        response.extend_from_slice(&[0, 0, 3, 1, 1, 0, 0, 3, 2, 0, 0]);
+        if core.submit(&mut model, &response, true) != Err(Error::Access)
+            || core.pending.is_some()
+            || model.last_descriptor.is_some()
+        {
+            return Err("H alone published BA success");
+        }
+        model.recipient_ba = true;
+        let id = core
+            .submit(&mut model, &response, true)
+            .map_err(|_| "recipient success actual DMA")?;
+        model.consumed(Queue::Management);
+        if core
+            .poll(&mut model)
+            .map_err(|_| "recipient DMA progress")?
+            .receipt
+            .is_some()
+        {
+            return Err("PCI consumption invented CCX");
+        }
+        model.report(0, true);
+        let receipt = core
+            .poll(&mut model)
+            .map_err(|_| "recipient actual CCX")?
+            .receipt
+            .ok_or("recipient CCX missing")?;
+        if receipt.id != id || receipt.bytes != response || !receipt.radio_acknowledged {
+            return Err("recipient exact native response receipt");
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rx_ba",
+    smoke_rtw88_rx_ba_native_emitter_requires_separate_grant_and_ccx
+);
 fn check_native_failure_policy_and_actual_payload() -> Result<(), &'static str> {
     for mode in 0..6 {
         let mut model = Model::new();
@@ -501,4 +642,250 @@ kernel_test_in!(
 kernel_test_in!(
     "drivers/wireless/rtw88/packet",
     smoke_rtw8822ce_native_packet_policy_failure_and_dma_bytes
+);
+
+fn qos_frames() -> Vec<Vec<u8>> {
+    (0..4)
+        .map(|i| {
+            let mut b = frame();
+            b[0] = 0x88;
+            b[24..26].fill(0);
+            b[22..24].copy_from_slice(&((4094u16 + i) & 4095).wrapping_shl(4).to_le_bytes());
+            b[30] = i as u8;
+            b
+        })
+        .collect()
+}
+fn batch_core(model: &mut Model) -> Result<Core, &'static str> {
+    let mut core = Core::prepare(model, OWN, 0).map_err(|_| "batch parked allocation")?;
+    core.start(model).map_err(|_| "batch core start")?;
+    core.configure_data(format::DataProfile {
+        rates: 0xfff,
+        qos: true,
+        mcs: 255,
+        sgi: true,
+    })
+    .map_err(|_| "batch HT profile")?;
+    core.aggregation(Some(format::Aggregation {
+        density: 4,
+        count: 4,
+        bytes: 8191,
+        airtime: 4000,
+    }))
+    .map_err(|_| "batch geometry")?;
+    Ok(core)
+}
+fn native_batch_order() -> Result<(), &'static str> {
+    let mut model = Model::new();
+    model.originator_ba = true;
+    let mut core = batch_core(&mut model)?;
+    let frames = qos_frames();
+    let ids = core
+        .submit_batch(&mut model, &frames)
+        .map_err(|_| "native batch publication")?;
+    if model.allocations != 5
+        || model.tx_publications != 1
+        || model.submissions.len() != 4
+        || model.descriptors.len() != 4
+    {
+        return Err("batch did not use four parked allocations and one actual WP");
+    }
+    let mut addresses = Vec::new();
+    for (i, s) in model.submissions.iter().enumerate() {
+        if addresses.contains(&s.address)
+            || model.actual_body(*s).map_err(|_| "actual DMA body")? != frames[i]
+        {
+            return Err("batch aliased DMA or descriptor/body identity");
+        }
+        addresses.push(s.address);
+        let d = model.descriptors[i];
+        if u32::from_le_bytes(d[8..12].try_into().unwrap()) & 0x0078_1000 != 0x0048_1000
+            || u32::from_le_bytes(d[12..16].try_into().unwrap()) >> 17 & 31 != 3
+        {
+            return Err("literal native AMPDU/CCX/density/factor TXD");
+        }
+    }
+    // Firmware reports can arrive backwards; neither CCX nor consumed PCI
+    // alone returns ownership, and receipts remain original FIFO order.
+    for sequence in [12, 8, 4] {
+        model.report(sequence, true);
+        if core
+            .poll(&mut model)
+            .map_err(|_| "reverse CCX")?
+            .receipt
+            .is_some()
+        {
+            return Err("out-of-order CCX returned prefix early");
+        }
+    }
+    model.indices[1] = 4 | (2 << 16);
+    model.report(0, true);
+    let first = core
+        .poll(&mut model)
+        .map_err(|_| "first consumed prefix")?
+        .receipt
+        .ok_or("first prefix receipt")?;
+    let second = core
+        .poll(&mut model)
+        .map_err(|_| "second consumed prefix")?
+        .receipt
+        .ok_or("second prefix receipt")?;
+    if first.id != ids[0]
+        || first.bytes != frames[0]
+        || second.id != ids[1]
+        || second.bytes != frames[1]
+        || core
+            .poll(&mut model)
+            .map_err(|_| "unconsumed suffix")?
+            .receipt
+            .is_some()
+    {
+        return Err("prefix order/bytes or unconsumed suffix changed");
+    }
+    model.indices[1] = 4 | (4 << 16);
+    for i in 2..4 {
+        let r = core
+            .poll(&mut model)
+            .map_err(|_| "final consumed prefix")?
+            .receipt
+            .ok_or("final receipt")?;
+        if r.id != ids[i] || r.bytes != frames[i] || !r.radio_acknowledged {
+            return Err("final per-MPDU CCX/bytes order");
+        }
+    }
+    if !core.ready() {
+        return Err("all exact receipts did not release CPU credits");
+    }
+    Ok(())
+}
+fn native_batch_failures() -> Result<(), &'static str> {
+    for mode in 0..6 {
+        let mut model = Model::new();
+        model.originator_ba = true;
+        let mut core = batch_core(&mut model)?;
+        let frames = qos_frames();
+        core.submit_batch(&mut model, &frames)
+            .map_err(|_| "failure batch submit")?;
+        match mode {
+            0 => model.allowed = false,
+            1 => model.now = 1_000_000,
+            2 => {
+                model.indices[1] = 4 | (4 << 16);
+                model.report(12, false);
+            }
+            3 => model.indices[1] = 4 | (5 << 16),
+            4 => {
+                model.report(12, true);
+                core.poll(&mut model).map_err(|_| "first suffix CCX")?;
+                model.report(12, true);
+            }
+            _ => {
+                copy_to(&core.batch_buffers[0], format::TX_DESC + 50, &[0xee])
+                    .map_err(|_| "actual batch DMA modification")?;
+                model.indices[1] = 4 | (1 << 16);
+                model.report(0, true);
+            }
+        }
+        let result = core.poll(&mut model);
+        if mode == 5 {
+            let r = result
+                .map_err(|_| "actual modified batch receipt")?
+                .receipt
+                .ok_or("modified batch receipt absent")?;
+            if r.bytes == frames[0] || r.bytes[50] != 0xee {
+                return Err("batch receipt used cached host bytes");
+            }
+        } else if result.is_ok() || core.ready() || core.submit_batch(&mut model, &frames).is_ok() {
+            return Err("failed native batch remained reusable");
+        }
+        if !core.batch_published || core.batch_buffers.len() != 4 {
+            return Err("ambiguous batch reclaimed DMA");
+        }
+    }
+    Ok(())
+}
+fn native_batch_bounds() -> Result<(), &'static str> {
+    let mut model = Model::new();
+    let mut core = batch_core(&mut model)?;
+    let frames = qos_frames();
+    if core.submit_batch(&mut model, &frames) != Err(Error::Access) || model.tx_publications != 0 {
+        return Err("H/R alone emitted TX aggregate");
+    }
+    model.originator_ba = true;
+    let profile = format::DataProfile {
+        rates: 0xfff,
+        qos: true,
+        mcs: 1,
+        sgi: false,
+    };
+    let cfg = format::Aggregation {
+        density: 7,
+        count: 4,
+        bytes: 8191,
+        airtime: 4000,
+    };
+    if cfg.admits_lengths(profile, [usize::MAX].into_iter())
+        || cfg.admits_lengths(profile, [1514; 4].into_iter())
+        || !cfg.admits_lengths(profile, [100].into_iter())
+    {
+        return Err("checked length/symbol/time budget changed");
+    }
+    let admitted = format::Aggregation {
+        density: 0,
+        count: 4,
+        bytes: 8191,
+        airtime: 4000,
+    };
+    if core.aggregation(Some(admitted)).is_err() {
+        return Err("bounded current config");
+    }
+    let alive = Arc::new(AtomicBool::new(true));
+    let authority = alive.clone();
+    model.authority = Some(Arc::new(move || authority.load(Ordering::Acquire)));
+    let calls = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+    let observed = calls.clone();
+    model.after_descriptor = Some(Arc::new(move || {
+        if observed.fetch_add(1, Ordering::AcqRel) == 1 {
+            alive.store(false, Ordering::Release);
+        }
+    }));
+    if core.submit_batch(&mut model, &frames) != Err(Error::Access)
+        || model.submissions.len() != 2
+        || model.tx_publications != 0
+        || !core.batch_published
+        || core.batch_buffers.len() != 4
+    {
+        return Err("between-BD revocation escaped current source fence or DMA pin");
+    }
+    Ok(())
+}
+fn smoke_rtw88_tx_ba_four_native_dma_ccx_consumed_prefix() -> TestResult {
+    match native_batch_order() {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+fn smoke_rtw88_tx_ba_native_failures_duplicates_timeout_and_bytes() -> TestResult {
+    match native_batch_failures() {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+fn smoke_rtw88_tx_ba_native_limits_authority_and_partial_publication() -> TestResult {
+    match native_batch_bounds() {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba",
+    smoke_rtw88_tx_ba_four_native_dma_ccx_consumed_prefix
+);
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba",
+    smoke_rtw88_tx_ba_native_failures_duplicates_timeout_and_bytes
+);
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba",
+    smoke_rtw88_tx_ba_native_limits_authority_and_partial_publication
 );

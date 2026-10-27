@@ -161,8 +161,7 @@ impl Owner {
             .ok_or("MVM data owner is not terminal/ready")?;
         self.check_link_power(policy)?;
         let prepared = self.power.prepared.as_ref().unwrap();
-        if self.power.phy.negotiated.is_some() && prepared.emission != super::power::Emission::Ht20
-        {
+        if self.power.phy.negotiated.is_some() && prepared.emission != self.power.phy.emission() {
             return Err("MVM active PHY differs from qualified emitting program");
         }
         let data = prepared.mlme.data.as_ref().unwrap();
@@ -212,7 +211,7 @@ impl Owner {
         self.authentication_rate(&beacon.information_elements, association.channel)?;
         let phy = self.power.phy.negotiated;
         if phy.is_some()
-            && self.power.prepared.as_ref().unwrap().emission != super::power::Emission::Ht20
+            && self.power.prepared.as_ref().unwrap().emission != self.power.phy.emission()
         {
             return Err("MVM new emitting profile lacks its distinct signed qualification");
         }
@@ -367,6 +366,7 @@ impl Owner {
     }
 
     pub(super) fn data_failed<T>(&mut self, error: &'static str) -> Result<T, &'static str> {
+        self.power.phy.ba.clear_packets();
         self.clear_data_aggregate();
         self.power.phy.actions.clear();
         if let Some(data) = self
@@ -472,6 +472,80 @@ impl Owner {
         }
     }
 
+    /// The worker batches only ordinary BE/TID0 packets. RSNA/EAPOL retains
+    /// the separate management owner and cannot enter this producer.
+    pub(in crate::iwlwifi) async fn transmit_data_batch_using(
+        &mut self,
+        packets: &[Vec<u8>],
+        mut policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<(), &'static str> {
+        if !self.ba_qualified() {
+            for frame in packets {
+                self.transmit_data_using(frame, &mut policy).await?;
+            }
+            return Ok(());
+        }
+        if packets.is_empty() || packets.len() > super::ba::PIPELINE {
+            return Err("MVM batch packet bound");
+        }
+        let status = self.data_ready(&policy()?)?;
+        if status.protected && !self.security.ready() {
+            return Err("MVM BA port not authorized");
+        }
+        let local = self.mac.unwrap();
+        let data = self
+            .power
+            .prepared
+            .as_mut()
+            .unwrap()
+            .mlme
+            .data
+            .as_mut()
+            .unwrap();
+        let mut frames = Vec::with_capacity(packets.len());
+        for packet in packets {
+            if packet.get(12..14) == Some(&[0x88, 0x8e]) {
+                return Err("MVM batch cannot carry EAPOL");
+            }
+            let frame = frame_api::transmit_qos(
+                local,
+                status.bssid,
+                data.sequence,
+                packet,
+                status.protected,
+                0,
+            )
+            .ok_or("MVM invalid BE batch Ethernet")?;
+            data.sequence = data.sequence.wrapping_add(1) & 4095;
+            frames.push(frame);
+        }
+        self.phase = Phase::TransmittingData;
+        let result = async {
+            self.fresh_data_policy(&mut policy).await?;
+            self.enable_ba_tx(&mut policy).await?;
+            {
+                let power = self.power.prepared.as_ref().unwrap();
+                let mut transmit = pin!(self.hardware.transmit_gen2_batch(status.queue, &frames));
+                poll_fn(|cx| {
+                    if let Err(e) = policy().and_then(|p| power.check_applied(&p)) {
+                        return Poll::Ready(Err(e));
+                    }
+                    transmit.as_mut().poll(cx)
+                })
+                .await?;
+            }
+            self.check_link_power(&policy()?)
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                self.phase = Phase::DataPrepared;
+                Ok(())
+            }
+            Err(e) => self.data_failed(e),
+        }
+    }
+
     /// One bounded synchronous native receive drain. No IP packet escapes a
     /// protected port; an active RSNA owner captures EAPOL privately.
     pub fn poll_legacy_receive(&mut self) -> Result<Option<LegacyReceive>, &'static str> {
@@ -522,19 +596,38 @@ impl Owner {
             }
         }
         self.hardware.poll()?;
-        while let Some(index) = self
-            .hardware
-            .notifications
-            .iter()
-            .position(|p| p.header.group_id == 0 && p.header.cmd == 0xc1)
-        {
+        self.power.phy.ba.tick()?;
+        for _ in 0..256 {
             self.check_link_power(&policy()?)?;
-            let packet = self.hardware.notifications.remove(index).unwrap();
-            let Some(mpdu) = scan_api::mpdu_gen2(&packet.payload) else {
+            let (payload, released) =
+                if let Some(bytes) = self.power.phy.ba.pop() {
+                    (bytes, true)
+                } else {
+                    let Some(index) = self.hardware.notifications.iter().position(|p| {
+                        p.header.group_id == 0 && matches!(p.header.cmd, 0xc1..=0xc3)
+                    }) else {
+                        break;
+                    };
+                    let packet = self.hardware.notifications.remove(index).unwrap();
+                    if packet.header.cmd != 0xc1 {
+                        if self.ba_qualified() {
+                            self.power
+                                .phy
+                                .ba
+                                .release(packet.header.cmd, &packet.payload)?;
+                        }
+                        continue;
+                    }
+                    (packet.payload, false)
+                };
+            let Some(mpdu) = scan_api::mpdu_gen2(&payload) else {
                 self.cancel_data_partial();
                 continue;
             };
             let f = mpdu.frame;
+            if self.receive_ba_bar(&mpdu, local, status.bssid, status.channel) {
+                continue;
+            }
             if mpdu.channel != status.channel || f.len() < 24 || f[10..16] != status.bssid {
                 self.clear_data_aggregate();
                 continue;
@@ -590,12 +683,16 @@ impl Owner {
                 || f[1] & 0x87 != 2
                 || f[22] & 15 != 0
                 || mpdu.status & (1 << 22) != 0
-                || qos && f.get(24..26).is_none_or(|q| q[0] & 0x7f > 7 || q[1] != 0)
+                || qos
+                    && f.get(24..26).is_none_or(|q| {
+                        !self.power.phy.ba.qos_policy(q[0], mpdu.reorder)
+                            || q[1] != 0
+                            || (q[0] & 0x80 != 0) != mpdu.amsdu
+                    })
                 || mpdu.amsdu && !phy.is_some_and(|p| p.ht)
-                || phy.is_some() && mpdu.reorder & 0x7f000000 != 0x7f000000
+                || phy.is_some() && mpdu.reorder & 0x7f000000 != 0x7f000000 && !self.ba_qualified()
                 || !mpdu.amsdu && mpdu.amsdu_index != 0
-                || !(legacy_rx_rate(&packet.payload, status)
-                    || phy.is_some_and(|p| p.rx_rate(&packet.payload)))
+                || !(legacy_rx_rate(&payload, status) || phy.is_some_and(|p| p.rx_rate(&payload)))
                 || mpdu
                     .body(header, if f[1] & 0x40 != 0 { 8 } else { 0 })
                     .is_none_or(|b| !(8..=1508).contains(&b.len()))
@@ -617,6 +714,13 @@ impl Owner {
                 }
             } else if mpdu.status & 0xf40 != 0 {
                 self.clear_data_aggregate();
+                continue;
+            }
+            if mpdu.reorder & 0x7f000000 != 0x7f000000 && !released {
+                // Retain the original native packet BEFORE any host replay
+                // update or deaggregation. Released bytes traverse these same
+                // current identity/PHY/crypto checks again, then PN in order.
+                self.power.phy.ba.observe(&payload, local)?;
                 continue;
             }
             let data = self
@@ -711,6 +815,8 @@ impl Owner {
         self.power.phy.actions.clear();
         self.phase = Phase::ClosingData;
         let result = async {
+            self.retire_ba(None::<&mut fn() -> Result<RegulatoryDomain, &'static str>>)
+                .await?;
             let reply = self
                 .hardware
                 .command_with_header_version(1, 0x18, &super::auth::disable_tx(true), 0)
@@ -735,6 +841,7 @@ impl Owner {
         }
     }
     pub(super) fn clear_data_aggregate(&mut self) {
+        self.power.phy.ba.cancel_incomplete();
         if let Some(data) = self
             .power
             .prepared
@@ -745,6 +852,7 @@ impl Owner {
         }
     }
     pub(super) fn cancel_data_partial(&mut self) {
+        self.power.phy.ba.cancel_incomplete();
         if let Some(data) = self
             .power
             .prepared

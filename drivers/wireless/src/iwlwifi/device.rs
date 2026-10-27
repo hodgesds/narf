@@ -25,6 +25,10 @@ pub struct Device {
     state: Mutex<State>,
     control: Mutex<Option<Work>>,
     publication: AtomicBool,
+    source: super::runtime::source::Fence,
+    generation: Arc<AtomicU64>,
+    quarantined: AtomicBool,
+    admission: IrqSafeSpinLock<()>,
     mac: [u8; 6],
     irq_vector: Option<u8>,
     channels: Vec<u8>,
@@ -57,10 +61,42 @@ struct State {
     connection: Option<Connection>,
     needs_reset: bool,
     producer: Option<Producer<Frame, RX_RING_N>>,
+    receive_ipc: Option<super::runtime::rx_epoch::Publication>,
     eapol: VecDeque<Vec<u8>>,
     tx: [Option<Consumer<Frame, TX_RING_N>>; 4],
     pending: [Option<PendingTx<Frame>>; 4],
     tx_progress: bool,
+}
+
+#[derive(Clone)]
+struct Delivery {
+    bytes: Vec<u8>,
+    source: super::runtime::source::Fence,
+    generation: Arc<AtomicU64>,
+    epoch: u64,
+    receive: super::runtime::rx_epoch::Publication,
+}
+impl core::ops::Deref for Delivery {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Vec<u8> {
+        &self.bytes
+    }
+}
+impl Delivery {
+    fn current(&self) -> bool {
+        self.generation.load(Ordering::Acquire) == self.epoch && self.receive.current()
+    }
+    fn invoke<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
+        self.source.invoke(|| {
+            if !self.current() {
+                return Err("stale Intel station publication generation");
+            }
+            operation()
+        })
+    }
 }
 
 impl State {
@@ -143,6 +179,7 @@ impl Device {
         let mac = hardware.start(parsed).await?;
         let nvm = Self::configure(&mut hardware, mac).await?;
         let irq_vector = hardware.irq_vector();
+        let source = hardware.source_fence()?;
         Ok(Arc::new(Self {
             #[cfg(any(test, feature = "kernel-test"))]
             test_name: None,
@@ -153,6 +190,7 @@ impl Device {
                 connection: None,
                 needs_reset: false,
                 producer: None,
+                receive_ipc: None,
                 eapol: VecDeque::new(),
                 tx: core::array::from_fn(|_| None),
                 pending: core::array::from_fn(|_| None),
@@ -160,6 +198,10 @@ impl Device {
             }),
             control: Mutex::new(None),
             publication: AtomicBool::new(false),
+            source,
+            generation: Arc::new(AtomicU64::new(0)),
+            quarantined: AtomicBool::new(false),
+            admission: IrqSafeSpinLock::new(()),
             mac,
             irq_vector,
             channels: nvm.channels,
@@ -206,6 +248,9 @@ impl Device {
     }
 
     async fn recover(&self, state: &mut State) -> Result<(), WirelessError> {
+        if self.quarantined.load(Ordering::Acquire) {
+            return Err(WirelessError::HardwareError);
+        }
         self.set_link(false);
         state.needs_reset = true;
         state.connection = None;
@@ -289,20 +334,29 @@ impl Device {
         });
         // This is the final fallible publication step. Failure leaves all
         // staged channels private and never exposes ACTIVE/netdev/workers.
-        register(authority, RegisteredDevice(self.clone()))?;
-        state.producer = Some(rx_producer);
-        *self.rx.lock() = Some(rx_consumer);
-        for (category, producer, consumer) in tx_channels {
-            *self.tx[category as usize].lock() = Some(producer);
-            state.tx[category as usize] = Some(consumer);
-        }
-        *active = Some(self.clone());
+        self.source.invoke(|| {
+            register(authority, RegisteredDevice(self.clone()))?;
+            state.producer = Some(rx_producer);
+            *self.rx.lock() = Some(rx_consumer);
+            for (category, producer, consumer) in tx_channels {
+                *self.tx[category as usize].lock() = Some(producer);
+                state.tx[category as usize] = Some(consumer);
+            }
+            *active = Some(self.clone());
+            Ok(())
+        })?;
         drop(state);
         drop(active);
-        narf_net::iface::register(self.name(), self.mac, send_frame);
-        narf_net::iface::set_link_metadata(self.name(), false, None, None);
-        narf_net::iface::set_link_state(self.name(), false);
-        narf_net::iface::install_rx_drain(drain_network);
+        self.source.invoke(|| {
+            if !self.current_owner() {
+                return Err("Intel publication owner replaced");
+            }
+            narf_net::iface::register(self.name(), self.mac, send_frame);
+            narf_net::iface::set_link_metadata(self.name(), false, None, None);
+            narf_net::iface::set_link_state(self.name(), false);
+            narf_net::iface::install_rx_drain(drain_network);
+            Ok(())
+        })?;
         let device = self.clone();
         narf_scheduler::spawn(async move {
             device.pump().await;
@@ -311,16 +365,116 @@ impl Device {
     }
 
     fn set_link(&self, up: bool) {
+        let _admission = self.admission.lock();
+        self.set_link_locked(up);
+    }
+    fn set_link_locked(&self, up: bool) {
+        if !up {
+            if let Some(next) = self.generation.load(Ordering::Acquire).checked_add(1) {
+                self.generation.store(next, Ordering::Release);
+            } else {
+                self.quarantined.store(true, Ordering::Release);
+            }
+            if let Some(rx) = self.rx.lock().as_mut() {
+                for _ in 0..RX_RING_N {
+                    if !matches!(rx.try_recv(), Ok(Some(_))) {
+                        break;
+                    }
+                }
+            }
+        }
         let was_up = self.up.swap(up, Ordering::AcqRel);
-        narf_net::iface::set_link_metadata(self.name(), up, None, None);
+        let current = self.current_owner();
+        if current {
+            narf_net::iface::set_link_metadata(self.name(), up, None, None);
+        }
         // Physical carrier preserves operator-controlled IFF_UP and never
         // invokes an administrative open/stop hook under retained locks.
         if !up {
             self.bssid.store(0, Ordering::Release);
         }
-        if was_up && !up {
+        if was_up && !up && current {
             narf_wireless::nl80211::notify_disconnect(self.name(), 1, false);
         }
+    }
+    fn current_owner(&self) -> bool {
+        if !self.publication.load(Ordering::Acquire) {
+            return true;
+        }
+        ACTIVE
+            .lock()
+            .as_ref()
+            .is_some_and(|d| core::ptr::eq(Arc::as_ptr(d), self))
+    }
+    fn publish_link(&self, bssid: [u8; 6], epoch: u64) -> Result<(), &'static str> {
+        let _admission = self.admission.lock();
+        self.source.invoke(|| {
+            if self.generation.load(Ordering::Acquire) != epoch
+                || self.quarantined.load(Ordering::Acquire)
+                || !self.current_owner()
+            {
+                return Err("Intel station publication retired before carrier");
+            }
+            self.store_bssid(bssid);
+            self.up.store(true, Ordering::Release);
+            narf_net::iface::set_link_metadata(self.name(), true, None, None);
+            Ok(())
+        })
+    }
+    fn source_failed(&self, epoch: u64) {
+        let _admission = self.admission.lock();
+        if self.generation.load(Ordering::Acquire) != epoch {
+            return;
+        }
+        self.quarantined.store(true, Ordering::Release);
+        self.set_link_locked(false);
+    }
+
+    fn retire_receive_ipc(&self, state: &mut State) {
+        state.receive_ipc = None;
+        state.producer = None;
+        *self.rx.lock() = None;
+    }
+
+    /// Called under the native state owner, never a stack callback. Replacing
+    /// both endpoints discards queued old-key copies as well as stale outputs.
+    fn refresh_receive_ipc(&self, state: &mut State) -> Result<(), &'static str> {
+        let _admission = self.admission.lock();
+        if state.needs_reset
+            || !state.eapol.is_empty()
+            || !state.connection.as_ref().is_some_and(|c| c.authorized)
+            || !self.up.load(Ordering::Acquire)
+            || self.quarantined.load(Ordering::Acquire)
+            || !self.current_owner()
+        {
+            self.retire_receive_ipc(state);
+            return Ok(());
+        }
+        let Some(receive) = state.hardware.receive_publication() else {
+            self.retire_receive_ipc(state);
+            return Ok(());
+        };
+        let result = self.source.invoke(|| {
+            if !receive.current() {
+                return Err("Intel RX IPC key epoch closed");
+            }
+            if state
+                .receive_ipc
+                .as_ref()
+                .is_none_or(|old| !old.same_epoch(&receive))
+                || state.producer.is_none()
+            {
+                let (producer, consumer) = narf_ipc::channel();
+                state.producer = Some(producer);
+                *self.rx.lock() = Some(consumer);
+                state.receive_ipc = Some(receive);
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            self.retire_receive_ipc(state);
+        }
+        result
     }
 
     /// Cache the associated BSSID for a lock-free `connected_bssid` read.
@@ -340,17 +494,28 @@ impl Device {
     /// Nonblocking drain used both by the executor and synchronous IP
     /// waits. Dispatch to the network stack only after releasing state:
     /// an ARP/ICMP response can call send_frame synchronously.
-    fn step(self: &Arc<Self>, mut cx: Option<&mut Context<'_>>) -> Vec<Vec<u8>> {
+    fn step(self: &Arc<Self>, mut cx: Option<&mut Context<'_>>) -> Vec<Delivery> {
         let mut output = Vec::new();
+        let epoch = self.generation.load(Ordering::Acquire);
+        if !self.current_owner() {
+            return Vec::new();
+        }
         let mut fallback = Context::from_waker(Waker::noop());
         if self
             .poll_control(cx.as_deref_mut().unwrap_or(&mut fallback))
             .is_pending()
         {
-            return output;
+            return Vec::new();
+        }
+        if self.quarantined.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        if self.source.invoke(|| Ok(())).is_err() {
+            self.source_failed(epoch);
+            return Vec::new();
         }
         let Some(mut state) = self.state.try_lock() else {
-            return output;
+            return Vec::new();
         };
         if state.needs_reset {
             state.hardware.fail();
@@ -359,14 +524,13 @@ impl Device {
         let State {
             hardware,
             connection,
-            producer,
             eapol,
             ..
         } = &mut *state;
         if hardware.poll().is_err() {
             state.clear_transmit();
             self.set_link(false);
-            return output;
+            return Vec::new();
         }
         hardware.retire_transmits();
         if let Some(connection) = connection {
@@ -377,13 +541,7 @@ impl Device {
                 match connection.receive_packet(&packet) {
                     Ok(frames) => {
                         for bytes in frames {
-                            queue_ethernet(
-                                bytes,
-                                connection.authorized,
-                                producer,
-                                eapol,
-                                &mut output,
-                            );
+                            queue_ethernet(bytes, connection.authorized, eapol, &mut output);
                         }
                     }
                     Err(_) => {
@@ -395,7 +553,7 @@ impl Device {
             match connection.reorder_tick() {
                 Ok(frames) => {
                     for bytes in frames {
-                        queue_ethernet(bytes, connection.authorized, producer, eapol, &mut output);
+                        queue_ethernet(bytes, connection.authorized, eapol, &mut output);
                     }
                 }
                 Err(_) => {
@@ -419,7 +577,7 @@ impl Device {
                     && (!state.eapol.is_empty() || connection.maintenance_pending())
             });
         if maintenance {
-            self.start_control();
+            self.start_control(&mut state);
         } else if !self.link_up() {
             state.clear_transmit();
         } else if state.progress_transmit(cx.as_deref_mut()).is_err() {
@@ -428,11 +586,55 @@ impl Device {
             state.clear_transmit();
             self.set_link(false);
         }
+        if self.refresh_receive_ipc(&mut state).is_err() {
+            self.source_failed(epoch);
+            return Vec::new();
+        }
+        let mut deliveries = Vec::new();
+        let receive = state.hardware.receive_publication();
+        for bytes in output {
+            let Some(receive) = receive.clone() else {
+                break;
+            };
+            let delivery = Delivery {
+                bytes,
+                source: self.source.clone(),
+                generation: self.generation.clone(),
+                epoch,
+                receive,
+            };
+            let published = {
+                let _admission = self.admission.lock();
+                delivery.invoke(|| {
+                    if !self.link_up()
+                        || self.quarantined.load(Ordering::Acquire)
+                        || !self.current_owner()
+                    {
+                        return Err("Intel RX publication closed");
+                    }
+                    if let (Some(producer), Ok(buffer)) = (
+                        &mut state.producer,
+                        super::runtime::dma_alloc(delivery.bytes.len()),
+                    ) {
+                        let mut frame = Frame::new(buffer, delivery.bytes.len() as u32);
+                        frame.payload_mut().copy_from_slice(&delivery.bytes);
+                        let _ = producer.try_send(frame);
+                    }
+                    Ok(())
+                })
+            };
+            if published.is_ok() {
+                deliveries.push(delivery);
+            } else if delivery.current() {
+                self.source_failed(epoch);
+                break;
+            }
+        }
         drop(state);
         if maintenance {
             let _ = self.poll_control(cx.unwrap_or(&mut fallback));
         }
-        output
+        deliveries
     }
 
     /// The slot owns the complete future, including its device-state guard.
@@ -445,12 +647,17 @@ impl Device {
         poll_fn(|cx| self.poll_control(cx)).await;
     }
 
-    fn start_control(self: &Arc<Self>) {
+    fn start_control(self: &Arc<Self>, state: &mut State) {
         let Some(mut slot) = self.control.try_lock() else {
             return;
         };
         if slot.is_some() {
             return;
+        }
+        // Close the actual consumer before publishing retained EAPOL work,
+        // even if it must wait to acquire state or native M4/key receipts.
+        if !state.eapol.is_empty() {
+            self.retire_receive_ipc(state);
         }
         let device = self.clone();
         *slot = Some(Work::new(async move {
@@ -490,6 +697,12 @@ impl Device {
                 device.set_link(false);
             } else {
                 state.needs_reset = false;
+                if device.refresh_receive_ipc(&mut state).is_err() {
+                    state.hardware.fail();
+                    state.needs_reset = true;
+                    state.clear_transmit();
+                    device.set_link(false);
+                }
             }
         }));
     }
@@ -515,18 +728,52 @@ impl Device {
                 }
             })
             .await;
-            for mut frame in frames {
-                narf_net::iface::on_rx_frame_from(self.name(), &mut frame);
-            }
+            self.dispatch(frames);
             narf_scheduler::yield_now().await;
         }
+    }
+    fn dispatch(&self, deliveries: Vec<Delivery>) -> bool {
+        self.dispatch_with(deliveries, |bytes| {
+            narf_net::iface::on_rx_frame_from(self.name(), bytes);
+        })
+    }
+    fn dispatch_with(
+        &self,
+        deliveries: Vec<Delivery>,
+        mut callback: impl FnMut(&mut Vec<u8>),
+    ) -> bool {
+        let progress = !deliveries.is_empty();
+        for mut delivery in deliveries {
+            let fence = delivery.clone();
+            if !fence.current() {
+                continue;
+            }
+            if fence
+                .invoke(|| {
+                    if !self.link_up()
+                        || self.quarantined.load(Ordering::Acquire)
+                        || !self.current_owner()
+                    {
+                        return Err("Intel stack publication closed");
+                    }
+                    // No owner, admission or ring lock is held by this callback.
+                    callback(&mut delivery.bytes);
+                    Ok(())
+                })
+                .is_err()
+                && fence.current()
+            {
+                self.source_failed(fence.epoch);
+                break;
+            }
+        }
+        progress
     }
 }
 
 fn queue_ethernet(
     bytes: Vec<u8>,
     authorized: bool,
-    producer: &mut Option<Producer<Frame, RX_RING_N>>,
     eapol: &mut VecDeque<Vec<u8>>,
     output: &mut Vec<Vec<u8>>,
 ) {
@@ -535,13 +782,6 @@ fn queue_ethernet(
             eapol.push_back(bytes);
         }
     } else if authorized {
-        if let (Some(producer), Ok(buffer)) =
-            (producer.as_mut(), super::runtime::dma_alloc(bytes.len()))
-        {
-            let mut frame = Frame::new(buffer, bytes.len() as u32);
-            frame.payload_mut().copy_from_slice(&bytes);
-            let _ = producer.try_send(frame);
-        }
         output.push(bytes);
     }
 }
@@ -562,6 +802,9 @@ impl Interface for Device {
     }
     fn link_up(&self) -> bool {
         self.up.load(Ordering::Acquire)
+            && !self.quarantined.load(Ordering::Acquire)
+            && self.current_owner()
+            && self.source.invoke(|| Ok(())).is_ok()
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
         &self.rx
@@ -603,6 +846,10 @@ impl Device {
         if state.connection.is_some() {
             return Err(WirelessError::Busy);
         }
+        let epoch = self.generation.load(Ordering::Acquire);
+        self.source
+            .invoke(|| Ok(()))
+            .map_err(|_| WirelessError::HardwareError)?;
         let beacon = state
             .beacons
             .iter()
@@ -632,9 +879,9 @@ impl Device {
             Ok(connection) => {
                 state.connection = Some(connection);
                 state.needs_reset = false;
-                self.store_bssid(bssid);
-                self.set_link(true);
-                Ok(())
+                self.publish_link(bssid, epoch)
+                    .and_then(|()| self.refresh_receive_ipc(&mut state))
+                    .map_err(|_| WirelessError::HardwareError)
             }
             Err(error) => {
                 use core::fmt::Write;
@@ -934,7 +1181,7 @@ impl WirelessNetIface for Device {
     }
 
     fn connected_bssid(&self) -> Option<[u8; 6]> {
-        self.cached_bssid()
+        self.link_up().then(|| self.cached_bssid()).flatten()
     }
 
     async fn roam(&self, request: AssociateRequest) -> Result<(), WirelessError> {
@@ -985,6 +1232,7 @@ impl WirelessNetIface for Device {
             return Err(WirelessError::HardwareError);
         }
         let bssid = request.bssid;
+        let epoch = self.generation.load(Ordering::Acquire);
         match Connection::associate(
             &mut state.hardware,
             self.mac,
@@ -999,9 +1247,9 @@ impl WirelessNetIface for Device {
             Ok(connection) => {
                 state.connection = Some(connection);
                 state.needs_reset = false;
-                self.store_bssid(bssid);
-                self.set_link(true);
-                Ok(())
+                self.publish_link(bssid, epoch)
+                    .and_then(|()| self.refresh_receive_ipc(&mut state))
+                    .map_err(|_| WirelessError::HardwareError)
             }
             Err(error) => {
                 use core::fmt::Write;
@@ -1037,23 +1285,45 @@ static ACTIVE: IrqSafeSpinLock<Option<Arc<Device>>> = IrqSafeSpinLock::new(None)
 
 fn send_frame(bytes: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     let device = ACTIVE.lock().clone().ok_or(())?;
-    if !device.link_up() {
-        return Err(());
+    device.enqueue(bytes)
+}
+impl Device {
+    fn enqueue(&self, bytes: &[u8]) -> Result<(), ()> {
+        let epoch = self.generation.load(Ordering::Acquire);
+        let result = self.source.invoke(|| {
+            let _admission = self.admission.lock();
+            if !self.link_up()
+                || self.quarantined.load(Ordering::Acquire)
+                || !self.current_owner()
+                || self.generation.load(Ordering::Acquire) != epoch
+            {
+                return Ok(Err(()));
+            }
+            // All ordinary data follows the same bounded queue/credit path. In
+            // particular, no direct send may overtake a pending packet or a rekey.
+            let Ok(buffer) = super::runtime::dma_alloc(bytes.len()) else {
+                return Ok(Err(()));
+            };
+            let mut frame = Frame::new(buffer, bytes.len() as u32);
+            frame.payload_mut().copy_from_slice(bytes);
+            let category = super::qos::Parameters::default().classify(bytes).ok_or(());
+            let Ok(category) = category else {
+                return Ok(Err(()));
+            };
+            let mut producer = self.tx[category].lock();
+            Ok(producer
+                .as_mut()
+                .ok_or(())
+                .and_then(|p| p.try_send(frame).map_err(|_| ())))
+        });
+        match result {
+            Ok(inner) => inner,
+            Err(_) => {
+                self.source_failed(epoch);
+                Err(())
+            }
+        }
     }
-    // All ordinary data follows the same bounded queue/credit path. In
-    // particular, no direct send may overtake a pending packet or a rekey.
-    let buffer = super::runtime::dma_alloc(bytes.len()).map_err(|_| ())?;
-    let mut frame = Frame::new(buffer, bytes.len() as u32);
-    frame.payload_mut().copy_from_slice(bytes);
-    let category = super::qos::Parameters::default()
-        .classify(bytes)
-        .ok_or(())?;
-    let mut producer = device.tx[category].lock();
-    if !device.link_up() {
-        return Err(());
-    }
-    let result = producer.as_mut().ok_or(())?.try_send(frame).map_err(|_| ());
-    result
 }
 
 fn drain_network() -> bool {
@@ -1061,11 +1331,7 @@ fn drain_network() -> bool {
         return false;
     };
     let frames = device.step(None);
-    let progress = !frames.is_empty();
-    for mut frame in frames {
-        narf_net::iface::on_rx_frame_from(device.name(), &mut frame);
-    }
-    progress
+    device.dispatch(frames)
 }
 
 struct RegisteredDevice(Arc<Device>);

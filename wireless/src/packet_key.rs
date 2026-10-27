@@ -197,7 +197,25 @@ impl Key {
     /// The caller's ciphertext is immutable even on successful admission.
     /// Existing `unprotect` keeps rejecting A-MSDU headers.
     pub fn unprotect_amsdu(&mut self, header: &[u8], wire: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
-        let priority = aggregate_header(header)?;
+        self.unprotect_amsdu_inner(header, wire, false)
+    }
+    /// Additional BlockAck-policy admission for an original whole MPDU
+    /// already released by the caller's live native BA/reorder owner. This
+    /// grants no agreement or reorder authority and never rewrites the header.
+    pub fn unprotect_amsdu_block_ack(
+        &mut self,
+        header: &[u8],
+        wire: &[u8],
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        self.unprotect_amsdu_inner(header, wire, true)
+    }
+    fn unprotect_amsdu_inner(
+        &mut self,
+        header: &[u8],
+        wire: &[u8],
+        block_ack: bool,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        let priority = aggregate_header_inner(header, block_ack)?;
         if header[10..16] != self.peer
             || !unicast(header[16..22].try_into().unwrap())
             || match self.role {
@@ -239,13 +257,21 @@ impl Key {
     }
 }
 pub(crate) fn aggregate_header(header: &[u8]) -> Result<u8, Error> {
+    aggregate_header_inner(header, false)
+}
+pub(crate) fn aggregate_header_block_ack(header: &[u8]) -> Result<u8, Error> {
+    aggregate_header_inner(header, true)
+}
+fn aggregate_header_inner(header: &[u8], block_ack: bool) -> Result<u8, Error> {
     // FromDS, protected QoS DATA, no fragments/Address4/HT control/EOSP or
-    // alternate ACK policy. This is the original26-byte station header.
+    // unimplemented ACK policy. The explicit BA entry also permits unicast
+    // BlockAck; this is always the original26-byte station header.
     if header.len() != 26
         || header[0] != 0x88
         || header[1] & 0xc7 != 0x42
         || header[22] & 15 != 0
-        || header[24] & 0xf0 != 0x80
+        || !(header[24] & 0xf0 == 0x80
+            || block_ack && header[24] & 0xf0 == 0xe0 && header[4] & 1 == 0)
         || header[25] != 0
     {
         return Err(Error::Header);

@@ -203,6 +203,8 @@ mod queue;
 
 #[path = "mvm_amsdu.rs"]
 mod amsdu;
+#[path = "mvm_ba.rs"]
+mod ba;
 #[path = "mvm_phy.rs"]
 mod phy;
 #[path = "mvm_power.rs"]

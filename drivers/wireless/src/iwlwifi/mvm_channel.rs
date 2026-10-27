@@ -151,7 +151,11 @@ impl Owner {
         }
         self.hardware.command(1, 8, phy).await?;
         if let Some(rlc) = rlc {
-            self.hardware.command(5, 8, rlc).await?;
+            // phy-ctxt.c uses iwl_cmd_id(RLC_CONFIG_CMD,DATA_PATH_GROUP,2),
+            // an actual versioned ID rather than the ordinary WIDE_ID.
+            self.hardware
+                .command_with_header_version(5, 8, rlc, 2)
+                .await?;
         }
         self.hardware
             .command(3, 9, &inactive_binding(local, true))

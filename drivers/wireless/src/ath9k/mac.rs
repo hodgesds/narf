@@ -171,6 +171,23 @@ pub(super) fn queue0(io: &impl Port) -> Result<(), Error> {
     modify(io, 0xac, 0x3ff, 0)?;
     Ok(())
 }
+/// Source queue0 BE continuation. TXOP stays zero; no new AC is enabled.
+pub(super) fn edca(io: &impl Port, be: narf_wireless::wmm::Ac) -> Result<(), Error> {
+    if be.admission_control
+        || be.txop != 0
+        || be.cw_min() > 1023
+        || be.cw_max() > 1023
+        || !(2..=15).contains(&be.aifsn)
+    {
+        return Err(Error::Packet);
+    }
+    write(
+        io,
+        0x1040,
+        u32::from(be.cw_min()) | (u32::from(be.cw_max()) << 10) | (u32::from(be.aifsn) << 20),
+    )?;
+    write(io, 0x10c0, 0)
+}
 pub(super) fn qos(io: &impl Port) -> Result<(), Error> {
     write(io, 0x8118, 0x100aa)?;
     write(io, 0x811c, 0x3210)?;

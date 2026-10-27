@@ -730,25 +730,37 @@ fn header_contract() -> Result<(), &'static str> {
         (1, 0xc8, 1),
         (1, 0xd, 15),
         (1, 8, 1),
-        (5, 8, 2),
         (1, 0x18, 12),
         (1, 0x19, 2),
         (5, 0x17, 3),
         (1, 0x9f, 5),
+        (1, 0x6a, 4),
+        (1, 0xe, 1),
+        (3, 0xa, 2),
+        (3, 0xc, 1),
+        (3, 5, 3),
+        (5, 0x18, 2),
+        (5, 0x16, 2),
+        (5, 0xf, 6),
     ];
-    for format in [CompletionFormat::Qu, CompletionFormat::Bz] {
+    for format in [
+        CompletionFormat::Qu,
+        CompletionFormat::Ax210,
+        CompletionFormat::Bz,
+    ] {
         let (hardware, firmware, trace) = runtime::model::station_model_for_format(format);
         let mut transport = Transport {
             hardware: Some(hardware),
             firmware,
             trace,
         };
-        let versions = cases
+        let mut versions = cases
             .iter()
             .flat_map(|&(group, id, version)| [id, group, version, 0])
             .collect::<Vec<_>>();
+        versions.extend_from_slice(&[8, 5, 2, 0]);
         runtime::model::versions(transport.hardware.as_mut().unwrap(), &versions);
-        for (sequence, &(group, id, payload_version)) in cases.iter().enumerate() {
+        for (sequence, &(group, id, _payload_version)) in cases.iter().enumerate() {
             let mut operation = pin!(transport
                 .hardware
                 .as_mut()
@@ -761,31 +773,48 @@ fn header_contract() -> Result<(), &'static str> {
                 .trace
                 .take()
                 .ok_or("missing native header contract DMA")?;
-            let expected = if format == CompletionFormat::Qu {
-                0
-            } else {
-                payload_version
-            };
             if observed.bytes.len() != 12
                 || observed.bytes[..2] != [id, group]
                 || observed.bytes[2..4] != (sequence as u16).to_le_bytes()
-                || observed.bytes[7] != expected
+                || observed.bytes[7] != 0
                 || observed.bytes[8..] != [0x5a; 4]
             {
-                return Err("Gen2 copied a payload version into its header or changed the existing Gen3 branch");
+                return Err("native command copied payload layout version into command-ID header");
             }
             transport.firmware.inject(id, group, sequence as u16, &[]);
             if !matches!(poll(operation.as_mut()), Poll::Ready(Ok(_))) {
                 return Err("native header contract receipt did not retire its exact DMA owner");
             }
         }
+        // Actual exception: phy-ctxt.c sends iwl_cmd_id(RLC_CONFIG_CMD,5,2).
+        // Header2 is explicit command-ID data, independent of the default path.
+        let mut operation = pin!(transport
+            .hardware
+            .as_mut()
+            .unwrap()
+            .command_with_header_version(5, 8, &[0xa5; 4], 2));
+        if !poll(operation.as_mut()).is_pending() {
+            return Err("explicit native command header missing DMA");
+        }
+        let observed = transport
+            .trace
+            .take()
+            .ok_or("explicit command trace absent")?;
+        if observed.bytes[7] != 2 || observed.bytes[8..] != [0xa5; 4] {
+            return Err("explicit command-ID version replaced by payload lookup");
+        }
+        transport.firmware.inject(8, 5, cases.len() as u16, &[]);
+        if !matches!(poll(operation.as_mut()), Poll::Ready(Ok(_))) {
+            return Err("explicit command receipt lost exact DMA owner");
+        }
     }
     Ok(())
 }
-fn smoke_iwl_mvm_all_reached_prerequisite_headers_are_zero_and_gen3_is_unchanged() -> TestResult {
+fn smoke_iwl_native_reached_headers_zero_payload_independent_and_explicit_ids_retained(
+) -> TestResult {
     header_contract().map_or_else(TestResult::Fail, |()| TestResult::Pass)
 }
 kernel_test_in!(
-    "drivers/wireless/iwlwifi/gen2",
-    smoke_iwl_mvm_all_reached_prerequisite_headers_are_zero_and_gen3_is_unchanged
+    "drivers/wireless/iwlwifi/runtime",
+    smoke_iwl_native_reached_headers_zero_payload_independent_and_explicit_ids_retained
 );

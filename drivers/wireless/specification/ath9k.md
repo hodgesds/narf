@@ -1,8 +1,14 @@
 # ath9k — Specification
 
-> Status: **AR9285 retained channel1 legacy station profile implemented through
-> kernel DHCP and bidirectional IP.** Physical EEPROM, calibration, RF and DMA
+> Status: **AR9285 retained channel1 legacy station and optional measured
+> HT20/1SS long-GI, RX STBC1, native RTS/CTS protection and recipient BA
+> continuations implemented.** Native software functional validation passed in
+> the coordinated x86_64 and aarch64 scoped Wi-Fi suites. Physical EEPROM,
+> calibration, RF and DMA
 > acceptance remains pending. Wider channels, recovery and other chips are separate.
+> The additional bounded two-MPDU sender BA/A-MPDU continuation below is
+> implemented with ten new native smokes passing the coordinated validation
+> on both architectures.
 
 ## 1. Purpose & scope
 
@@ -92,7 +98,7 @@ AR9285-specific writes follow a checked silicon revision.
   supported bitrate. FIFO/filter/descriptor/TXOP conditions supply no RF-rate
   evidence. Invalid/unprogrammed FinalTxIdx or modified descriptors close the
   owner; pending/RX/security receipts cannot train it. This provides no HT,
-  aggregation or performance measurement claim.
+  aggregation or performance measurement claim for the legacy profile.
 - The facade advertises four active-scan SSIDs and no caller probe IEs.
   Directed binary SSIDs and wildcard discovery use actual broadcast Probe
   Requests through the same calibrated descriptor/DMA owner. Empty active
@@ -109,6 +115,310 @@ AR9285-specific writes follow a checked silicon revision.
   RF-silent GPIO state; metadata and packet publication share terminal closure.
   Disconnect, cancellation, peer loss, policy loss or ambiguous completion
   closes the initial profile permanently and retains every published mapping.
+
+### 3.1 Optional AR9285 revision2 HT20 continuation
+
+The same retained non-EDMA owner can opt into channel1/2412MHz HT20, one
+stream, MCS0..7 **long GI only**. The implemented INI recipe is AR9285_1_2;
+this new profile requires silicon revision2, full376-byte checked EEPROM,
+11G capability, the EEPROM N_2G_HT20 disable flag clear and RX/TX chain1.
+AR9285 has no SGI20 hardware capability: the AR9002 descriptor GI bit does
+not establish one. Local RX and hardware TX both retain mandatory MCS0..7;
+the measured record may narrow actual TX selection independently. Local RX
+STBC1 follows Linux `common-init.c::ath9k_cmn_setup_ht_cap` for AR9280-and-later
+silicon, including AR9285; single-chain TX STBC remains disabled. Native RX
+STBC admission requires the actual AP's TX_STBC in both the observed offer
+and successful association response. AP RX_STBC alone supplies no such
+proof. The optional coding is bound into the exact new qualification identity
+and opaque driver profile; no caller flag enables it. No LDPC, greenfield,
+HT40 or TX A-MSDU is enabled. The separate recipient BA continuation is §3.2;
+TX BA remains absent.
+
+`Ath9k::ht20_qualification_request()` exposes the exact factual `identity`,
+`mac` and external `filename` after the completed one-shot calibration.
+It grants no emission. The identity hashes chip/subsystem/revision, complete
+normalized EEPROM and chains, selected INI/gain/SYNTH9 recipe, actual retained
+calibration results, the seven actual power-register words, local capability,
+descriptor/padding/rate/duration/queue recipe and static operating envelope.
+The identity includes directional RX_STBC1 and native RTS/CTS trains; an
+older recipe's signed measurements cannot authorize these additions.
+The optional external file is
+`ath9k/ar9285-ht20-v1-<twelve lowercase MAC hex digits>.bin`, opened through
+the trusted signed-asset loader. No such binary, signature or measurements
+are supplied by this codebase. Unlike other families, ath9k had **no measured
+legacy emission grant** to extend; this is a distinct new `N85H` contract
+layered on the actual EEPROM, calibration and current regulatory policy.
+
+The little-endian160-byte v1 signed body is:
+
+| Offset | Field |
+| --- | --- |
+| 0 | `N85H`, version:u16=1, header length:u16=160, total length:u32=160 |
+| 12 | PCI vendor:u16=0x168c, device:u16=0x002b |
+| 16 | Exact request SHA-256 identity[32] |
+| 48 | Factory MAC[6], primary:u8=1, width:u8=20, chain:u8=1, GI:u8=0 |
+| 58 | Antenna upper bound:i16 half-dBi, signed board EIRP ceiling:i16 half-dBm |
+| 62 | Nonzero selected TX MCS0..7 bitmap:u8; reserved:u8=0 |
+| 64 | Twenty-one measured conducted upper bounds:i16 half-dBm: global/calibration/retry/transient maximum, twelve legacy rates in driver bitmap order, eight HT MCS0..7 LGI rates |
+| 106 | Reserved[54]=0 |
+
+The signed antenna bound cannot undercut the retained factory antenna gain.
+The signed maximum must cover every per-rate peak. Every peak plus antenna
+upper bound must fit the signed board ceiling and every overlapping current
+host rule; the original calibration ceiling/country must still fit as well.
+The signer attests the **complete static temperature, supply, antenna/posture
+and Bluetooth envelope**, including calibration, responses, retries and mode
+transients; an initial temperature sample or EEPROM target table is not such
+a measurement. Periodic tracking is not inferred. Asset cap invocation and
+current PCI/domain/RF-silent checks surround actual native accesses. Power,
+HT20/chain, key-cache-invalid, FIFO/workaround and IRQ-mask readbacks precede
+profile activation and remain checked at emission/publication boundaries.
+
+An absent optional record can be installed after legacy packet preparation;
+the same native owner loads it before HT association. A retained grant is
+never replaced after revocation. Missing/invalid qualification permits legacy
+fallback only before any new live HT/EDCA program. A partial new program,
+authority loss or ambiguous receipt closes the owner and retains DMA.
+
+Driver-owned shared `LocalHt` facts admit the HT membership selector only
+through actual observed HT Capability/Operation and driver-owned WMM
+Parameter facts. The association request carries generated HT/WMM bytes;
+caller PHY/WMM IEs remain rejected. The actual successful response must fully
+validate/narrow HT primary/operation/basic MCS and WMM BE before queue/profile
+commit. Secondary channel, BE ACM, U-APSD, unrepresentable CW and nonzero BE
+TXOP are refused. Queue0 programs and
+reads back source AIFS/CW/zero-TXOP fields; other queues remain parked.
+
+All three nonzero HT protection modes and actual ERP Use_Protection can
+use native RTS/CTS. The opaque driver profile combines the actual offer and
+successful response; protection required by either cannot disappear because
+the other omits it. ERP is singleton, exactly one byte, with reserved bits
+clear. The bounded first profile requires a negotiated CCK basic control
+rate for protected exchanges, retaining long preambles for non-ERP members.
+Every HT DATA descriptor sets AR_RTSEnable and its enabled rate series'
+AR_RTSCTSQual with the actual packet duration and negotiated control-rate
+code. Hardware forms the RTS/CTS NAV; no fabricated software exchange or
+simultaneous CTS-only flag is used. Actual RTS exhaustion is failed DATA,
+never an authenticated success. Native SIFS/slot/ACK/CTS/microsecond timing
+and immutable descriptors remain checked at capture and receipt boundaries.
+
+Later complete native beacons/probe responses from the current AP can add
+protection conservatively; it stays required until terminal association
+teardown. Foreign peers cannot change this profile. A native descriptor
+already owned by hardware remains immutable through a beacon update; only
+later submissions use the updated protection. An incompatible current PHY,
+BE contention, malformed bound advertisement or unsupported timing program
+closes the owner and retains DMA. Beacon updates never widen the original
+response-bound MCS/coding profile or independently reopen a controlled port.
+
+HT DATA forms the original26-byte BE/TID0 QoS header **before** software
+CCMP. The descriptor uses hardware rate0x80..0x87, native long-GI HT duration,
+one chain, no width/GI/TX-STBC/aggregation/crypto offload and a bounded fixed
+selected MCS series. Legacy management/EAPOL/ADDBA responses retain actual
+negotiated basic rates. Native DMA inserts exactly two transport bytes after
+the original QoS header; BufferLen includes them while FrameLen/FCS and
+duration exclude them. Immutable original and DMA bytes are retained and
+checked through terminal TxDone, ACK and queue-idle proof.
+
+RX validates the actual HT rate, width/GI/STBC/status, complete one-buffer
+extent and original ciphertext before removing only native header padding
+and four FCS bytes. AR9002 RX status3 bit3 reports STBC; it is accepted only
+for MCS0..7 with the source-bound and response-bound RX_STBC1 profile.
+Legacy rates cannot carry STBC metadata. SGI20, extra streams, split buffers,
+A-MPDU flags outside §3.2 and
+delimiter errors remain rejected before CCMP/PN. The existing4092-byte RX
+allocation holds the whole3839-byte A-MSDU plus header, pad, CCMP and FCS.
+The complete aggregate is authenticated once before atomic bounded subframe
+decoding/PN commit, with current PTK/GTK identity and all16 TID replay
+windows. Open aggregates require the protected bit clear and the same native
+peer/header/controlled-port bounds. No subframe supplies EAPOL/control or an
+unauthenticated prefix. Native Category3 immediate ADDBA requests receive
+an exact status37 decline through actual legacy DMA/ACK/idle receipts;
+enqueue alone creates no delivered response or BA agreement.
+
+Native capture records receive-time data admission. Ciphertext seen before
+M4 or during a pending key reply cannot acquire authorization from a later
+receipt and does not advance PN. Actual `ReplyReady`, terminal key receipt
+and close retire decoded/queued data and monotonic receive epochs. Fresh
+current source/policy/port/epoch checks gate IPC allocation/publication and
+each unlocked stack callback, including a fully reopened rekey between two
+callbacks. Initial authorization precedes carrier; an established rekey
+preserves physical carrier while withholding DATA. Ordinary pending TX
+credit does not close receive authorization. All radio/state/ring/publication
+locks are released before actual stack callbacks. The IRQ-masked1ms service,
+NULL tail/buf_hold and published mapping retention remain unchanged.
+Fresh RX continues while an ordinary native DATA TX owns its descriptor;
+ADDBA replies wait for that credit, and an actual EAPOL rekey can immediately
+close receive and retain its reply until the DATA receipt frees native TX.
+Open QoS DATA has independent TID sequence counters, including wrap;
+management/ADDBA replies do not consume them. Secured QoS uses the shared
+per-TID sequence owner preserved across key replies.
+
+### 3.2 Optional native recipient block acknowledgment
+
+`Ath9k::rx_ba_qualification_request()` derives a second factual request from
+the same retained HT owner. The external
+`ath9k/ar9285-rxba-v1-<MAC hex>.bin` signed `N85B` record binds the exact
+`N85H` request **and complete signed-body digest**, actual board identity,
+RX BAR filter, original-MPDU reorder, native PPDU/ADDBA/DELBA/timer recipe,
+and the same20MHz/one-chain/long-GI bounds. No asset or measurements are
+checked in. Missing/invalid optional BA qualification retains the actual
+status37 decline. Once a valid source is retained it cannot be replaced
+after revocation. Software allocations precede the first new live program;
+the source `COMP_BAR` RX filter changes from0x17 to0x417 with exact readback,
+and every later native operation/publication invokes current source/policy.
+
+The96-byte little-endian v1 body contains `N85B`, version:u16=1,
+header length:u16=96, total length:u32=96; vendor/device:u16 at12;
+request identity[32] at16; MAC[6] at48; primary1/width20/chain1/whole-A-MSDU
+flag1 at54; measured global conducted response/transient maximum:i16
+half-dBm at58; maximum window:u8 in1..64 at60; reserved0 at61; signed
+EIRP ceiling:i16 half-dBm at62; reserved[32]=0 at64. The measured maximum
+plus the retained HT antenna bound must fit both signed ceilings and every
+current overlapping host rule. All calibration/legacy/HT and static-envelope
+requirements of `N85H` remain independently required.
+
+Linux `ath9k/main.c::ath9k_ampdu_action` performs no RX_START/RX_STOP
+hardware programming; host BA state is therefore explicit. Linux `recv.c`
+also documents MAC block acknowledgments as frames enter the FIFO/host.
+**A software decline or discarded aggregate does not prove absence of an
+automatic hardware BA emission.** The `N85H` all-response maximum must cover
+automatic responses even to unsolicited traffic; `N85B` additionally binds
+the negotiated/BAR-filter/DELBA continuation. The existing NULL tail and
+delayed descriptor reuse are preserved, never self-linked to fake capacity.
+
+An actual bound immediate ADDBA request supplies dialog/TID/window/SSN and
+TU inactivity. Requests above the HT64-MPDU maximum are declined; window0
+uses the qualified default and a smaller measured maximum narrows the actual
+response. No invented initial sequence is used. An exact native response
+ACK plus queue idle and a fresh RX-idle fence precede activation. A pending
+proposal can stage at most64 opaque originals against its explicit SSN and
+captured receive epoch, only after the proposal and while the controlled port
+was already open. Neither crypto/PN nor delivery occurs before the positive
+receipt; DELBA, key/epoch/source loss, failure and cancellation discard the
+stage. Pre-M4, closed-port and pre-proposal captures are never staged. This
+preserves a legitimate first burst queued before the1ms worker sees TX ACK.
+A duplicate
+unchanged request may receive another success without resetting sequence,
+buffers or timer. A changed live request is declined until explicit teardown.
+
+Sixteen heap-backed TID owners hold at most64 complete original MPDUs each.
+Twelve-bit half-range comparison handles wrap, duplicates, old frames,
+bounded future-window movement and native compressed single-TID BAR.
+Only ordered original MPDUs enter CCMP/PN/A-MSDU admission. Native AR9002
+rate/width/GI/STBC/error status is validated on every descriptor, consistent
+with Linux's per-MPDU preprocessing. FIRST/MORE aggregation context must
+match current unicast peer/TID/rate/STBC coding, at most8191 captured MPDU/FCS/delimiter
+bytes,64 MPDUs and100ms of retained context. This is a bounded host admission
+extent, not an invented total-PHY-length field for unreported null delimiters.
+Missing/invalid/closed-port descriptors retire that context; no stale PHY or
+header is supplied to a later orphan member. Split buffers, HT40, SGI20,
+extra streams, delimiter errors and unsupported crypto images remain closed.
+The whole3839-byte A-MSDU can compose with A-MPDU only when the actual
+ADDBA request/response enables it. Normal ACK and unicast BlockAck policy
+use the original header; the explicit shared BlockAck aggregate method is
+called only with a still-live native session-generation/order proof.
+Multicast normal-ACK GTK traffic retains the existing independent path.
+
+Native progress/idle drives100ms reorder-hole release. Nonzero inactivity is
+exactly `timeout * 1024us`; valid current-TID data and BAR refresh activity.
+Expiry drops the session/buffered originals and queues a recipient DELBA
+(initiator0, reason39). Its actual legacy native descriptor, ACK, queue idle
+and RX idle retire the teardown ticket before replacement. Timers are serviced
+by the existing1ms worker rather than a claimed IRQ path. Current policy,
+power/readbacks and both signed sources still gate descriptor/copy/doorbell,
+receipt and final publication. Pending key replies take priority; CPU teardown
+ownership survives the held reply without authorizing DATA. Incoming peer
+DELBA, key replies, peer loss and terminal close retire opaque ownership;
+key replies preserve the actual protocol sequence head while dropping buffers.
+No timer, Drop or cancellation implicitly delivers buffered data.
+
+This recipient continuation creates no TX BA or native TX A-MPDU; §3.3
+provides that separate measured sender owner. No delayed BA,
+multi-TID BAR, NoAck/NoExplicitAck, fragment, hardware-decap or extra QoS AC
+profile is inferred. Original/decoded receive queues remain bounded to256;
+resource failure closes the owner and retains native mappings.
+
+### 3.3 Optional measured two-MPDU sender BA/A-MPDU
+
+`Ath9k::tx_ba_qualification_request()` returns factual `identity`, `mac`
+and external `filename`, without granting emission or an agreement. The
+distinct `ath9k/ar9285-txba-v1-<twelve lowercase MAC hex digits>.bin` is
+required before initial sender authorization. No asset, signature or measured
+RF value is supplied by this implementation. Its request hashes the exact
+`N85H` request and signed-body digest, chip/calibration/power/antenna facts,
+the two-original descriptor/delimiter/duration recipe, control/retry/BAR/DELBA
+proofs and full static envelope, including automatic responses. Neither
+`N85H` nor recipient `N85B` alone authorizes this transmission train.
+
+The signed little-endian96-byte v1 body has: `N85T`, version:u16=1,
+header:u16=96, length:u32=96 at0; vendor:u16=0x168c/device:u16=0x002b at12;
+exact request identity[32] at16; MAC[6] at48; primary1/width20/chain1/member
+count2 at54; measured all-train conducted peak:i16 half-dBm at58; maximum
+window:u8=4..64 at60; software retry bound:u8=3 at61; board ceiling:i16
+half-dBm at62; reserved[32]=0 at64. The peak plus the base antenna bound
+must fit this ceiling, the base ceiling and every current overlapping host
+rule. Both immutable source caps and current native power/timing/PCI/RF-silent
+proof remain required. Missing qualification keeps ordinary unaggregated HT;
+revocation after binding is terminal rather than a quiet profile fallback.
+
+One sender agreement owns BE/TID0. The driver freezes its producer and reads
+the actual next shared QoS sequence, or the independent Open counter, for
+its genuine ADDBA SSN. A fresh nonzero dialog, native request ACK/queue-idle
+and RX-idle fence, and a complete bound AP response precede activation.
+Foreign/partial/wrong-dialog/TID/policy/window responses create no session.
+Declines retain single-MPDU HT. An accepted window below4 receives an actual
+initiator DELBA before that fallback. Setup and BAR recovery have bounded
+100ms deadlines; nonzero negotiated inactivity is exactly TU*1024us and
+produces native sender DELBA(initiator1, reason39). Ambiguous control failure
+closes the owner. No implicit success is inferred from enqueue or Drop.
+
+The existing two retained payload maps and two descriptors form one real
+two-MPDU aggregate when two valid IPC packets are already available. A lone
+packet remains ordinary normal-ACK and unaggregated; no timer fabricates a
+second member. Each original QoS header and separate CCMP PN/ciphertext is
+formed before transport pad2. FIRST links to the actual tail; tail links to
+NULL. FIRST owns rate/retry/duration, IsAggr|MoreAggr, aggregate length and
+padding delimiters; LAST has IsAggr with zero rate/retry/duration words.
+On-air lengths include each FCS and delimiter, preceding-member alignment
+and actual padding, excluding DMA pad2 and final-member padding. Linux's
+256-byte minimum and conservative AP density bind padding; AR9285 retains
+ent_mode0 and has no later-silicon OTP first60-delimiter quirk. The current
+bound is two original frames<=1550 bytes each,4095 aggregate air bytes and
+4ms HT PPDU, with actual offer/response factor/density narrowing. LGI20,
+chain1 and MCS0..7 remain enforced; no SGI20/TX STBC/LDPC is inferred.
+
+Only actual tail TxDone plus queue idle releases either DMA map. Both
+original padded payloads and immutable descriptors are checked first.
+Actual BAflag, returned TID/SSN and64-bit bitmap prove each acknowledged
+original separately; wrong-TID status retries all, following the documented
+hardware erratum. TxOK without BA is the source STA deaf/mute failure and
+closes the owner. Missing originals get at most three software retries as
+normal-ACK single MPDUs, preserving SC/PN/ciphertext and changing only Retry.
+Exhaustion retires their CPU retry authority and sends an exact20-byte BAR
+to the real next sequence before any new data is admitted.
+
+BAR recovery uses its own native TX descriptor: terminal TxDone, successful
+transmission, BAflag, expected TID0, exact returned BA SSN, queue idle and a
+fresh RX-idle fence. Linux `ar9002_hw_proc_txdesc` parses BA fields for every
+completed descriptor; BAR follows the normal TX-status path. No solicited BA
+is assumed to appear as RAW RX under COMP_BAR. No CONTROL/COMP_BA filter is
+invented; the existing0x17/recipient0x417 filters remain unchanged. Missing or
+wrong native BAR proof leaves the window closed. Physical qualification must
+confirm these actual BAR status fields on the target AR9285.
+
+Key replies retire software retry authority and force current-epoch BAR
+recovery while preserving the actual MAC agreement and in-flight DMA owner.
+Late pair/retry/control receipts cannot authorize a successor epoch. Current
+shared `Security::port_open`, including intentional old-key WaitM3 operation,
+remains authoritative independently of physical carrier. Peer DELBA, close,
+cancel, source loss and uncertain tail never recycle published storage or
+fabricate bitmap/delivery. Open/WPA2 native fixtures consume genuine action,
+two-map DATA, partial retry and BAR descriptor traffic, including real kernel
+DHCP/IP bursts and coexistence with the separately qualified recipient BA.
+The ten new cases passed in the coordinated scoped Wi-Fi suites: x86_64
+2360 pass,0 fail,9 skip; aarch64 1890 pass,0 fail,3 skip. Production boots and
+all btrfs postflights were clean. Physical N85T/BAR qualification remains open.
 
 The former reset-only `Ath9k::new` constructor is removed. Construction
 goes through the PCI authority and identification path. Successful probe
@@ -206,6 +516,13 @@ supplies fallible entropy and AES-CCM, and `net/` owns DHCP/Ethernet delivery.
 
 ## 7. Stage assignment
 
+This wave's HT20, RX STBC1, RTS/CTS, original A-MSDU, recipient BA and
+receive/publication-epoch tests passed the coordinated native Wi-Fi functional
+validation. The full scoped Wi-Fi suites report **x86_64: 2317 passed, 0 failed,
+9 skipped; aarch64: 1847 passed, 0 failed, 3 skipped**. These are suite totals
+across the scoped Wi-Fi families, not ath9k-only counts; they do not attest
+physical EEPROM, calibration, RF, DMA or AP interoperability qualification.
+
 Stage 5 initial retained station profile. Traced smokes exercise the live
 identification helper, complete EEPROM extent, reset register order,
 endianness/checksum/version validation and invalid/busy hardware cases.
@@ -257,7 +574,8 @@ device, authenticated deployment policy and measured RF/calibration acceptance.
 No RF or AP interoperability has been demonstrated by the model tests.
 
 Broader live channels/retuning, factory profiles, periodic calibration,
-interrupt-driven operation, HT/aggregation and power transitions
+interrupt-driven operation, HT40/SGI40, larger TX aggregates, TX A-MSDU, additional AC/TID
+scheduling and power transitions
 require separate continuations. Reset/rejoin, removal and DMA reclamation need
 an independently proved generation/reset owner; the initial profile retains
 storage and requires a fresh lifecycle after terminal closure.

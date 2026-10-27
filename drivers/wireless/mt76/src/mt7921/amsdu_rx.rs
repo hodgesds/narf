@@ -34,8 +34,11 @@ struct Pending {
     header: [u8; 26],
     replay: Option<Replay>,
     started: u64,
-    wire_bytes: usize,
-    frames: VecDeque<Vec<u8>>,
+    wire: Vec<u8>,
+    subframes: usize,
+    ampdu: bool,
+    wcid: u16,
+    tid: u8,
 }
 
 #[derive(Debug)]
@@ -56,8 +59,17 @@ pub(super) struct Complete {
 
 impl Receiver {
     pub(super) fn prepare(info: RadioInfo, bss: &ScanBss) -> Result<Self, Error> {
+        Self::prepare_with_streams(info, bss, 1)
+    }
+    pub(super) fn prepare_with_streams(
+        info: RadioInfo,
+        bss: &ScanBss,
+        rx_streams: u8,
+    ) -> Result<Self, Error> {
         if !info.capabilities.phy.ht
             || info.capabilities.phy.spatial_streams == 0
+            || !(1..=2).contains(&rx_streams)
+            || rx_streams > info.capabilities.phy.spatial_streams
             || bss.bssid == [0; 6]
             || bss.bssid[0] & 1 != 0
             || bss.bssid == info.capabilities.mac
@@ -95,10 +107,15 @@ impl Receiver {
         }
         let ht = ht.ok_or(Error::UnsupportedFirmware)?;
         let operation = operation.ok_or(Error::UnsupportedFirmware)?;
-        // The narrow receive prerequisite is one stream, HT20. Guard
-        // interval selection does not change the native MSDU layout.
-        // Do not infer higher NSS or accept an AP mandatory basic MCS above7.
-        if ht[3] == 0 || operation[7..].iter().any(|&byte| byte != 0) {
+        // Rate/NSS do not change the native MSDU layout. The typed5GHz
+        // VHT companion can promise RX2/TX1 after actual NIC qualification.
+        // Take that bound from the completed typed profile: received_ies()
+        // is intentionally a sanitized HT pair, not the original VHT offer.
+        // Older standalone preparation retains its first-stream bound.
+        if ht[3] == 0
+            || rx_streams == 1 && operation[7] != 0
+            || operation[8..].iter().any(|&byte| byte != 0)
+        {
             return Err(Error::UnsupportedFirmware);
         }
         Ok(Self {
@@ -130,7 +147,16 @@ impl Receiver {
         floor: Option<u64>,
         now: u64,
     ) -> Option<Complete> {
-        let result = self.observe_inner(native, floor, now);
+        self.observe_with_ba(native, floor, now, false)
+    }
+    pub(super) fn observe_with_ba(
+        &mut self,
+        native: &NativeRx<'_>,
+        floor: Option<u64>,
+        now: u64,
+        block_ack: bool,
+    ) -> Option<Complete> {
+        let result = self.observe_inner(native, floor, now, block_ack);
         if result.is_err() {
             self.clear();
         }
@@ -142,6 +168,7 @@ impl Receiver {
         native: &NativeRx<'_>,
         floor: Option<u64>,
         now: u64,
+        block_ack: bool,
     ) -> Result<Option<Complete>, ()> {
         if !self.active || native.channel != self.info.channel || !matches!(native.amsdu, 1..=3) {
             return Err(());
@@ -157,7 +184,7 @@ impl Receiver {
             || header[16..22] == [0; 6]
             || header[16] & 1 != 0
             || header[24] & 0x80 == 0
-            || header[24] & 0x60 != 0
+            || !(header[24] & 0x70 == 0 || block_ack && header[24] & 0x70 == 0x60)
             || header[25] != 0
         {
             return Err(());
@@ -195,24 +222,26 @@ impl Receiver {
         if payload[..6] != [0xaa, 0xaa, 3, 0, 0, 0] || length > 1508 {
             return Err(());
         }
-        let protocol = u16::from_be_bytes([payload[6], payload[7]]);
-        if protocol < 0x600 || matches!(protocol, 0x80f3 | 0x8137 | 0x888e | 0x88c7) {
-            return Err(()); // The retained supplicant owns EAPOL/control port.
-        }
         if native.amsdu == 3 {
             self.pending = Some(Pending {
                 header,
                 replay,
                 started: now,
-                wire_bytes: 0,
-                frames: VecDeque::new(),
+                wire: Vec::new(),
+                subframes: 0,
+                ampdu: native.ampdu,
+                wcid: native.wcid,
+                tid: native.tid,
             });
         }
         let pending = self.pending.as_mut().ok_or(())?;
         if pending.header != header
             || pending.replay != replay
             || now.saturating_sub(pending.started) >= MAX_AGE_NS
-            || pending.frames.len() >= MAX_SUBFRAMES
+            || pending.subframes >= MAX_SUBFRAMES
+            || pending.ampdu != native.ampdu
+            || pending.wcid != native.wcid
+            || pending.tid != native.tid
         {
             return Err(());
         }
@@ -221,23 +250,32 @@ impl Receiver {
         } else {
             extent + padding
         };
-        pending.wire_bytes = pending.wire_bytes.checked_add(added).ok_or(())?;
-        if pending.wire_bytes > MAX_BYTES {
+        let total = pending.wire.len().checked_add(added).ok_or(())?;
+        if total > MAX_BYTES {
             return Err(());
         }
-        let mut ethernet = Vec::with_capacity(6 + 6 + 2 + length - 8);
-        ethernet.extend_from_slice(&subheader[..12]);
-        ethernet.extend_from_slice(&payload[6..]);
-        pending.frames.push_back(ethernet);
+        pending.wire.try_reserve_exact(added).map_err(|_| ())?;
+        pending.wire.extend_from_slice(&bytes[..extent]);
+        // CONNAC2 may strip inter-subframe padding. Its uninterpreted
+        // alignment bytes are reconstructed only in this logical plaintext
+        // aggregate; native MAC/CCMP metadata and subframes stay unchanged.
+        pending.wire.resize(total, 0);
+        pending.subframes += 1;
         if native.amsdu != 1 {
             return Ok(None);
         }
-        if pending.frames.len() < 2 {
+        if pending.subframes < 2 {
             return Err(());
         }
         let complete = self.pending.take().ok_or(())?;
+        let frames = narf_wireless::amsdu::decode(
+            &complete.wire,
+            self.own,
+            header[4..10].try_into().unwrap(),
+        )
+        .map_err(|_| ())?;
         Ok(Some(Complete {
-            frames: complete.frames,
+            frames: frames.into_iter().collect(),
             replay: complete.replay,
         }))
     }

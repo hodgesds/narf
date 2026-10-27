@@ -15,6 +15,14 @@ use narf_wireless::{
 };
 use zeroize::Zeroizing;
 type Error = station::Error;
+#[cfg(feature = "kernel-test")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReceivePoint {
+    AfterFrameAllocation,
+    BeforeCallbackAdmission,
+}
+#[cfg(feature = "kernel-test")]
+type ReceiveHook = Arc<dyn Fn(ReceivePoint) + Send + Sync>;
 struct State {
     rx: narf_ipc::Producer<Frame, RX_RING_N>,
     tx: narf_ipc::Consumer<Frame, TX_RING_N>,
@@ -40,6 +48,9 @@ pub(super) struct Device<P: Port, E: Environment> {
     publication: Arc<IrqSafeSpinLock<()>>,
     up: AtomicBool,
     bssid: AtomicU64,
+    epoch: AtomicU64,
+    #[cfg(feature = "kernel-test")]
+    receive_hook: IrqSafeSpinLock<Option<ReceiveHook>>,
     rx: IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
 }
@@ -70,6 +81,7 @@ impl<P: Port + Send + 'static, E: Environment + 'static> HostClose for Device<P,
         let _publication = self.publication.lock();
         self.closed.store(true, Ordering::Release);
         self.publish_link(None);
+        self.clear_rx();
     }
 }
 impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
@@ -94,6 +106,9 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
             publication,
             up: AtomicBool::new(false),
             bssid: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
+            #[cfg(feature = "kernel-test")]
+            receive_hook: IrqSafeSpinLock::new(None),
             rx: IrqSafeSpinLock::new(Some(consumer)),
             tx: IrqSafeSpinLock::new(Some(producer)),
         })
@@ -145,11 +160,17 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
         {
             return Err(());
         }
+        if !self.permission(None) {
+            return Err(());
+        }
         let buffer = narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
             .map_err(|_| ())?;
         let mut frame = Frame::new(buffer, bytes.len() as u32);
         frame.payload_mut().copy_from_slice(bytes);
         frame.set_tx_meta(meta);
+        if !self.permission(None) {
+            return Err(());
+        }
         self.tx
             .lock()
             .as_mut()
@@ -157,25 +178,54 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
             .try_send(frame)
             .map_err(|_| ())
     }
-    fn progress(&self) -> Vec<Vec<u8>> {
+    fn clear_rx(&self) {
+        if let Some(rx) = self.rx.lock().as_mut() {
+            for _ in 0..RX_RING_N {
+                if !matches!(rx.try_recv(), Ok(Some(_))) {
+                    break;
+                }
+            }
+        }
+    }
+    fn permission(&self, epoch: Option<u64>) -> bool {
         let Some(mut radio) = self.radio.try_lock() else {
-            return Vec::new();
+            return false;
+        };
+        let token = epoch.unwrap_or_else(|| radio.receive_epoch());
+        match radio.current_receive(token) {
+            Ok(open) => open && !self.closed.load(Ordering::Acquire),
+            Err(_) => {
+                self.close();
+                let _ = radio.stop();
+                self.clear_rx();
+                false
+            }
+        }
+    }
+    fn progress(&self) -> (u64, Vec<Vec<u8>>) {
+        let Some(mut radio) = self.radio.try_lock() else {
+            return (0, Vec::new());
         };
         let Some(mut state) = self.state.try_lock() else {
-            return Vec::new();
+            return (0, Vec::new());
         };
         if self.closed.load(Ordering::Acquire) {
             state.clear();
             let _ = radio.stop();
             self.link(None);
-            return Vec::new();
+            self.clear_rx();
+            return (0, Vec::new());
         }
         if !matches!(radio.phase(), Phase::Passive | Phase::Open | Phase::Failed) {
-            return Vec::new();
+            return (0, Vec::new());
         }
         let result: Result<Vec<Vec<u8>>, Error> = (|| {
             let frames = radio.poll()?;
             self.link(radio.peer());
+            let epoch = radio.receive_epoch();
+            if self.epoch.swap(epoch, Ordering::AcqRel) != epoch {
+                self.clear_rx();
+            }
             if self.closed.load(Ordering::Acquire) {
                 state.clear();
                 return Ok(Vec::new());
@@ -183,6 +233,11 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
             if radio.peer().is_none() {
                 state.clear();
                 return Ok(frames);
+            }
+            if !radio.current_receive(epoch)? {
+                state.clear();
+                self.clear_rx();
+                return Ok(Vec::new());
             }
             if state.pending.is_none() {
                 for _ in 0..16 {
@@ -197,7 +252,25 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
             }
             if radio.ready() {
                 if let Some(frame) = state.pending.take() {
-                    radio.send(frame.payload())?;
+                    let mut second = None;
+                    if radio.can_aggregate() {
+                        for _ in 0..16 {
+                            let Ok(Some(next)) = state.tx.try_recv() else {
+                                break;
+                            };
+                            if station::admitted(next.payload(), self.own)
+                                && offloads(next.tx_meta())
+                            {
+                                second = Some(next);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(second) = second {
+                        radio.send_pair(frame.payload(), second.payload())?;
+                    } else {
+                        radio.send(frame.payload())?;
+                    }
                 }
             }
             if self.closed.load(Ordering::Acquire) {
@@ -205,33 +278,52 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
                 return Ok(Vec::new());
             }
             for bytes in &frames {
+                if !radio.current_receive(epoch)? {
+                    self.clear_rx();
+                    return Ok(Vec::new());
+                }
                 if let Ok(buffer) =
                     narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
                 {
                     let mut frame = Frame::new(buffer, bytes.len() as u32);
                     frame.payload_mut().copy_from_slice(bytes);
+                    #[cfg(feature = "kernel-test")]
+                    self.receive_hook(ReceivePoint::AfterFrameAllocation);
+                    if !radio.current_receive(epoch)? {
+                        self.clear_rx();
+                        return Ok(Vec::new());
+                    }
                     let _ = state.rx.try_send(frame);
                 }
             }
             Ok(frames)
         })();
         match result {
-            Ok(frames) => frames,
+            Ok(frames) => (radio.receive_epoch(), frames),
             Err(_) => {
                 self.close();
                 let _ = radio.stop();
                 state.clear();
-                Vec::new()
+                self.clear_rx();
+                (0, Vec::new())
             }
         }
     }
     pub(super) fn drain(&self) -> bool {
-        let frames = self.progress();
+        let (epoch, frames) = self.progress();
         let progress = !frames.is_empty();
         // Stack dispatch can synchronously send ARP/ND; both async guards are
         // gone and no publication lock survives into stack/reentrant enqueue.
         if !self.closed.load(Ordering::Acquire) {
             for mut frame in frames {
+                #[cfg(feature = "kernel-test")]
+                self.receive_hook(ReceivePoint::BeforeCallbackAdmission);
+                if !self.permission(Some(epoch)) {
+                    if self.epoch.load(Ordering::Acquire) == epoch {
+                        self.clear_rx();
+                    }
+                    break;
+                }
                 narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
             }
         }
@@ -240,6 +332,13 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
     #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn admit_for_test(&self) {
         self.admitted.store(true, Ordering::Release);
+    }
+    #[cfg(feature = "kernel-test")]
+    fn receive_hook(&self, point: ReceivePoint) {
+        let hook = { self.receive_hook.lock().clone() };
+        if let Some(h) = hook {
+            h(point);
+        }
     }
 }
 fn offloads(meta: narf_net::TxMeta) -> bool {

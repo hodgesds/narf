@@ -87,10 +87,26 @@ validate identity under the owner lock, and replacement or namespace movement
 resets peer, control-port and cached power-save state.
 
 `association::phy::{LocalHt, LocalVht, LocalPhy}` describes a native driver's
-implemented directional RX/TX limits. Checked HT20/HT40/VHT80 constructors
+implemented directional RX/TX limits. Checked HT20/HT40/VHT80/VHT160 constructors
 encode only local equal-modulation HT MCS0..31, directional VHT MCS/NSS maps,
-GI and aggregation limits; optional LDPC/STBC/beamforming, extended NSS/BW and
+GI and aggregation limits; TX STBC/beamforming, extended NSS/BW and
 large A-MSDU remain absent. Local HT RX/TX include mandatory MCS0..7.
+`LocalVht::with_160mhz(rx_sgi160, tx_sgi160)` opts into contiguous160 and
+directional SGI160. Existing constructors retain their80MHz ceiling;
+`LocalPhy::vht160` requires both this explicit promise and an HT40 companion,
+and `vht80` rejects a mismatched160 local promise.
+`LocalHt::with_ldpc(rx, tx)` and `LocalVht::with_ldpc(rx, tx)` opt into
+directional LDPC, defaulting off in existing constructors. The emitted HT
+LDPC/VHT RXLDPC bits describe local receive support only. Negotiated
+`rx_ldpc()` preserves that promise; `tx_ldpc()` requires actual local TX
+support plus AP RX support in both scan and bound response. A response cannot
+enable TX LDPC omitted by the initial offer. Native coding/decoder programming
+and source authority remain each backend's responsibility.
+`with_rx_stbc(enabled)` on both local types optionally advertises one STBC
+receive data stream, exposed by negotiated `rx_stbc()`. It defaults off,
+does not enable transmit STBC and does not imply two data-stream reception.
+The native decoder must validate space-time stream metadata and the actual
+data-MCS/width limits before replay or packet publication.
 `with_tx_selection` checks a nonempty subset of actual TX support for rate
 selection without changing capability IEs or granting transmit authority.
 These factual values are not capabilities and
@@ -118,8 +134,15 @@ local advertised RX limits and AP TX metadata remain independent. Strict
 HT Basic MCS and both-direction VHT Basic MCS/NSS checks apply, including
 the all-eight-NSS requirement of VHT basic map0. Selected HT requires a bound
 complete response pair. VHT width0 delegates to HT; contiguous80MHz validates
-all four canonical constituents and the matching HT40 primary pair. No
-160/80+80/revised nonzero second segment or extended NSS/BW admission exists.
+all four canonical constituents and the matching HT40 primary pair.
+Contiguous160 uses canonical centers50/114/163, all eight20MHz constituents,
+the actual HT40 pair and a valid peer160-width capability. Both deprecated
+width2/seg0 and revised width1/primary80-seg0/full160-seg1 encodings are
+checked. An80MHz local station may select the actual primary80 half while
+advertising only80MHz support. `Width::OneSixty` exposes the eight-channel
+selection to the native owner. Discontiguous80+80, reserved width encodings
+and extended NSS/BW remain unsupported. SGI160 transmit use cannot gain a
+peer capability omitted from the original scan offer.
 A response may narrow the original occupied set but cannot expand it. All
 address/status/AID/security/rate/membership/PHY checks precede one atomic
 rate/PHY/Associated transition; failure leaves old rates and no partial PHY
@@ -971,6 +994,15 @@ The original `protect`/`unprotect` continue rejecting A-MSDU headers; TX
 aggregation, hardware-deaggregated RX, BA/reordering and larger VHT limits are
 separate native ownership contracts.
 
+`Key::unprotect_amsdu_block_ack` is an additional opt-in after a driver proves
+a live unicast BA agreement and releases the whole original MPDU in SN order.
+It accepts both normal ACK and BlockAck QoS policy (`0x80`/`0xe0` aggregate
+high nibbles), retaining the original header, TID, CCMP key/PN and atomic
+whole-aggregate validation. Multicast BlockAck, NoAck, NoExplicitAck and EOSP
+remain absent. The existing aggregate method stays normal-ACK-only and ordinary
+packet methods keep rejecting aggregates. The helper supplies no BA session,
+native completion or ordering proof.
+
 `reorder::Reorder<T>` supplies a bounded opaque native-MPDU sequence owner,
 independent of crypto, radio, policy and controlled-port authority. Construction
 requires window1..64 and a positive hole timeout. Its slots are heap allocated;
@@ -1035,6 +1067,16 @@ prove AP WMM negotiation, native EDCA/descriptor/peer admission and applicable
 policy. This shared cryptographic formatter grants no HT, aggregation, U-APSD,
 role or radio capability.
 
+QoS sequence numbers use sixteen independent12-bit counters, separate from
+the non-QoS data/EAPOL counter. Each begins at the constructor's checked seed
+and persists across key replacements. `next_qos_sequence(tid)` is a
+side-effect-free sample of the exact next QoS SN: invalid TIDs return Profile,
+and a closed/pending/failed port returns State. Native TX BA owners must freeze
+replenishment and drain previous packets before using that sample as an ADDBA
+starting sequence. `transmit_ethernet_qos` consumes the selected counter while
+forming the original header before CCMP; protected headers are never rewritten.
+The sample alone grants no aggregation, native completion or transmit authority.
+
 `Security::receive_amsdu(&impl RawFrame)` composes that aggregate key operation
 with the existing currently-open controlled port and installed pairwise/group
 slots. It returns `Option<Vec<Vec<u8>>>` of complete Ethernet-II subframes and
@@ -1050,6 +1092,13 @@ association/controlled-port checks. Sixteen native Rust smokes cover exact
 Ethernet, all TIDs, PTK/GTK0/GTK2 and RSC, malformed later subframes, MIC/RA/TA/
 TID/header denial, aggregation-bit injection, atomic PN, default size/work
 bounds, closed/pending ports and real retained pairwise/group rekeys.
+
+`Security::receive_amsdu_block_ack` composes the explicit unicast BA aggregate
+key entry under those same current-port, RAW, peer, slot and replay checks.
+It requires the driver to supply the actual live BA/order proof and never
+relaxes the default aggregate entry. Additional all-TID, unchanged-header,
+malformed-tail/MIC/policy, multicast denial and pending-port vectors pass
+the coordinated Wi-Fi suites on x86_64 and aarch64.
 
 `Security::handshake_active()` reports a retained reply awaiting terminal
 delivery or the supplicant waiting for M3 after M2 delivery. It is false after

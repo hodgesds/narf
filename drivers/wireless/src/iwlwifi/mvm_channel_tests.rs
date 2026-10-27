@@ -11,6 +11,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 struct Fixture {
     owner: Option<Owner>,
     firmware: runtime::model::Firmware,
+    trace: runtime::model::TxTrace,
 }
 fn api() -> FirmwareApi<'static> {
     let mut api = FirmwareApi {
@@ -32,8 +33,8 @@ fn nvm() -> Nvm {
 }
 impl Fixture {
     fn new() -> Self {
-        let (mut hardware, firmware) =
-            runtime::model::create_for_format(false, rx_rfh::CompletionFormat::Qu);
+        let (mut hardware, firmware, trace) =
+            runtime::model::station_model_for_format(rx_rfh::CompletionFormat::Qu);
         runtime::model::versions(
             &mut hardware,
             &[
@@ -59,6 +60,7 @@ impl Fixture {
                 channel: ChannelContext::new(&api),
             }),
             firmware,
+            trace,
         }
     }
 }
@@ -284,4 +286,40 @@ fn smoke_iwl_mvm_inactive_phy_linux_packed_geometry_and_masks() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2",
     smoke_iwl_mvm_inactive_phy_linux_packed_geometry_and_masks
+);
+
+fn smoke_iwl_mvm_native_rlc_v2_uses_source_explicit_command_id_version() -> TestResult {
+    let mut f = Fixture::new();
+    let owner = f.owner.as_mut().unwrap();
+    let mut operation = pin!(prepare(owner));
+    for (sequence, (command, group)) in COMMANDS.into_iter().enumerate() {
+        if !poll(operation.as_mut()).is_pending() {
+            return TestResult::Fail("RLC preparation skipped exact prior receipt");
+        }
+        let Some(p) = f.trace.take() else {
+            return TestResult::Fail("native PHY/RLC trace absent");
+        };
+        let explicit = command == 8 && group == 5;
+        if p.bytes[7] != if explicit { 2 } else { 0 } {
+            return TestResult::Fail(
+                "native RLC explicit ID was confused with WIDE_ID/payload lookup",
+            );
+        }
+        if explicit {
+            let mut expected = [0; 32];
+            expected[4..8].copy_from_slice(&[6, 40, 0, 0]);
+            if p.bytes.get(8..) != Some(expected.as_slice()) {
+                return TestResult::Fail("native RLCv2 changed PHY identity/RX chains/extent");
+            }
+        }
+        f.firmware.inject(command, group, sequence as u16, &[]);
+    }
+    if poll(operation.as_mut()) != Poll::Ready(Ok(())) {
+        return TestResult::Fail("native explicit RLC receipt did not retain completed PHY owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2",
+    smoke_iwl_mvm_native_rlc_v2_uses_source_explicit_command_id_version
 );

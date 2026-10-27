@@ -11,6 +11,7 @@ use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 
 mod calibration;
 mod descriptor;
+mod ht;
 mod identity;
 mod initvals;
 mod interface;
@@ -19,16 +20,20 @@ mod packet;
 mod packet_native;
 mod phy;
 mod rates;
+mod rx_ba;
 mod station;
+mod tx_ba;
 pub use calibration::{Report as RadioCalibration, State as RadioState};
+pub use ht::Request as Ht20QualificationRequest;
 pub use identity::{BringUpError, Identity, EEPROM_4K_BYTES};
 pub use phy::Prepared as BasebandPrepared;
+pub use rx_ba::Request as RxBaQualificationRequest;
+pub use tx_ba::Request as TxBaQualificationRequest;
 
 const ATHEROS_PCI_VENDOR: u16 = 0x168c;
 const ATHEROS_AR9285_DEVICE: u16 = 0x002b;
 
-/// Retained hardware identity and calibration bytes. No netdev or packet
-/// DMA is enabled until the MAC/PHY and soft-MAC runtime are implemented.
+/// Retained identity, calibration and the same native MAC/packet/station owner.
 #[derive(Debug)]
 pub struct Ath9k {
     _mmio: MmioRegion,
@@ -43,6 +48,33 @@ pub struct Ath9k {
 }
 
 impl Ath9k {
+    /// Factual sender-BA qualification request; no emission or agreement grant.
+    pub fn tx_ba_qualification_request(&self) -> Result<TxBaQualificationRequest, BringUpError> {
+        self.station
+            .as_ref()
+            .and_then(|r| r.try_lock())
+            .and_then(|r| r.tx_ba_request())
+            .ok_or(BringUpError::BadState)
+    }
+    /// Optional recipient-BA request from the same current HT source/owner.
+    pub fn rx_ba_qualification_request(&self) -> Result<RxBaQualificationRequest, BringUpError> {
+        self.station
+            .as_ref()
+            .and_then(|radio| radio.try_lock())
+            .and_then(|radio| radio.rx_ba_request())
+            .ok_or(BringUpError::BadState)
+    }
+    /// Exact optional measured qualification request; this is no RF grant.
+    pub fn ht20_qualification_request(&self) -> Result<Ht20QualificationRequest, BringUpError> {
+        ht::Facts::new(
+            self._device,
+            self.identity,
+            self.baseband,
+            self.radio.report().ok_or(BringUpError::BadState)?,
+            &self.calibration,
+        )
+        .map(|facts| facts.request())
+    }
     pub fn calibration(&self) -> &[u8; EEPROM_4K_BYTES] {
         &self.calibration
     }
@@ -177,7 +209,7 @@ async fn prepare_packets(owner: &Retained) -> Result<RetainedRadio, packet::Erro
     controller.packet_attempted = true;
     // SAFETY: same retained sole function/cap/BAR/factory image as the exact
     // successful calibration; this async mutex serializes all native access.
-    let native = unsafe {
+    let mut native = unsafe {
         packet_native::Native::new(
             controller._device,
             controller._cap,
@@ -186,6 +218,17 @@ async fn prepare_packets(owner: &Retained) -> Result<RetainedRadio, packet::Erro
             &controller.calibration,
         )
     }?;
+    if let Ok(facts) = ht::Facts::new(
+        controller._device,
+        controller.identity,
+        controller.baseband,
+        report,
+        &controller.calibration,
+    ) {
+        // Optional qualification is resolved before any new live HT program.
+        // Missing/invalid external measurements preserve the legacy profile.
+        native.qualify_ht(facts);
+    }
     mac::prepare(&native, &controller.calibration, controller.identity.mac)?;
     // SAFETY: factory calibration and complete parked MAC/key-cache/queue
     // preparation succeeded on this same non-cloneable native adapter. Probe

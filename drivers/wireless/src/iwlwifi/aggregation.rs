@@ -12,6 +12,28 @@ use alloc::vec::Vec;
 pub const MAX_WINDOW: u16 = 64;
 pub const MAX_TIDS: usize = 8;
 
+/// Qu API77 uses this exact compressed notification, not an inferred BA bitmap.
+/// Validate the complete envelope before the shared atomic prefix reclaimer.
+pub(super) fn validate_gen2_tx_ba(body: &[u8]) -> Result<(), &'static str> {
+    if body.len() < 32
+        || u32::from_le_bytes(body[..4].try_into().unwrap()) > 5
+        || body[4] != 0
+        || body[19] != 0
+    {
+        return Err("Gen2 compressed BA header");
+    }
+    let count = usize::from(u16::from_le_bytes([body[28], body[29]]));
+    let debug_count = usize::from(u16::from_le_bytes([body[30], body[31]]));
+    if count > 1
+        || debug_count > 8
+        || body.len() != 32 + (count * 8).max(debug_count * 4)
+        || count == 1 && (body[37] != 0 || body[38..40] != [0, 0])
+    {
+        return Err("Gen2 compressed BA TID0 extent/reserved");
+    }
+    Ok(())
+}
+
 /// Validate all entries before reclaiming any DMA, including duplicates and
 /// station/TID ownership. Counts use checked arithmetic before slicing.
 pub fn complete_tx_ba(queues: &mut [DataQueue], body: &[u8]) -> Result<(), &'static str> {
@@ -140,6 +162,8 @@ pub struct Window {
     slots: Vec<Option<Vec<u8>>>,
     last_rx: u64,
     hole_since: Option<u64>,
+    retiring: bool,
+    active: bool,
 }
 impl Window {
     pub fn new(
@@ -167,6 +191,8 @@ impl Window {
             slots: (0..MAX_WINDOW).map(|_| None).collect(),
             last_rx: now,
             hole_since: None,
+            retiring: false,
+            active: true,
         })
     }
 
@@ -174,9 +200,34 @@ impl Window {
         self.slots.iter_mut().for_each(|entry| *entry = None);
         self.hole_since = None;
     }
+    pub(super) fn reserve_retirement(&mut self) -> Result<(), &'static str> {
+        if self.retiring {
+            return Err("RX BAID removal has an uncertain native owner");
+        }
+        self.retiring = true;
+        Ok(())
+    }
+    pub(super) fn uncertain(&self) -> bool {
+        self.retiring || !self.active
+    }
+    pub(super) fn reserve_response(&mut self) {
+        self.active = false;
+    }
+    pub(super) fn activate_response(&mut self, now: u64) -> Result<(), &'static str> {
+        if self.retiring {
+            return Err("RX BAID response cannot revive retirement");
+        }
+        if !self.active {
+            self.last_rx = now;
+            self.active = true;
+        }
+        Ok(())
+    }
 
     pub fn expired(&self, now: u64) -> bool {
-        self.timeout != 0
+        self.active
+            && !self.retiring
+            && self.timeout != 0
             && now.wrapping_sub(self.last_rx)
                 >= narf_time::wall::ns_to_cycles(u64::from(self.timeout) * 1_024_000)
     }
@@ -211,6 +262,9 @@ impl Window {
 
     pub fn push(&mut self, bytes: &[u8], now: u64) -> Vec<Vec<u8>> {
         let mut output = Vec::new();
+        if self.uncertain() {
+            return output;
+        }
         let Some(mpdu) = scan_api::mpdu(bytes) else {
             return output;
         };
@@ -248,6 +302,9 @@ impl Window {
 
     pub fn release(&mut self, nssn: u16, now: u64) -> Vec<Vec<u8>> {
         let mut output = Vec::new();
+        if self.uncertain() {
+            return output;
+        }
         if nssn >= 4096 {
             return output;
         }
@@ -261,6 +318,9 @@ impl Window {
     /// Lost MPDUs cannot stall the data path indefinitely. Release the first
     /// buffered sequence and its contiguous successors after 100ms.
     pub fn tick(&mut self, now: u64) -> Vec<Vec<u8>> {
+        if self.uncertain() {
+            return Vec::new();
+        }
         if self.hole_since.is_some_and(|since| {
             now.wrapping_sub(since) >= narf_time::wall::ns_to_cycles(100_000_000)
         }) {

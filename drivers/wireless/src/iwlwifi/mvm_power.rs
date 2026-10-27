@@ -24,6 +24,10 @@ pub(in crate::iwlwifi) enum Emission {
     #[default]
     Legacy = 1,
     Ht20 = 2,
+    /// Firmware-managed TID0 aggregation and recipient autonomous Block Ack.
+    Ht20Ba = 3,
+    /// The tag3 program plus negotiated nested recipient A-MSDU-in-A-MPDU.
+    Ht20NestedBa = 4,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,6 +107,8 @@ fn request(binding: [u8; 32], mac: [u8; 6], emission: Emission) -> PowerRequest 
     let program = match emission {
         Emission::Legacy => "mvm-api77-power-v1",
         Emission::Ht20 => "mvm-api77-ht20-siso-wmm-power-v2",
+        Emission::Ht20Ba => "mvm-api77-ht20-siso-wmm-ba-power-v3",
+        Emission::Ht20NestedBa => "mvm-api77-ht20-siso-wmm-nested-ba-power-v4",
     };
     PowerRequest {
         name: format!(
@@ -128,6 +134,32 @@ pub(super) fn parse_for(
     channel: u8,
     emission: Emission,
 ) -> Result<Prepared, &'static str> {
+    let values = validate_record(&source, binding, mac, emission)?;
+    Ok(Prepared {
+        emission,
+        source,
+        sar: values.sar,
+        maximum: values.maximum,
+        gain: values.gain,
+        channel,
+        applied: None,
+        active_link: None,
+        mlme: super::assoc::Context::default(),
+        stop: None,
+    })
+}
+
+pub(super) struct Values {
+    sar: [[u8; 5]; 2],
+    maximum: i16,
+    gain: i16,
+}
+pub(super) fn validate_record(
+    source: &Asset,
+    binding: [u8; 32],
+    mac: [u8; 6],
+    emission: Emission,
+) -> Result<Values, &'static str> {
     let bytes = &source.bytes;
     if !source.current() || source.signer.is_none() {
         return Err("MVM platform power qualification is unsigned or revoked");
@@ -151,18 +183,7 @@ pub(super) fn parse_for(
         bytes[48..53].try_into().unwrap(),
         bytes[53..58].try_into().unwrap(),
     ];
-    Ok(Prepared {
-        emission,
-        source,
-        sar,
-        maximum,
-        gain,
-        channel,
-        applied: None,
-        active_link: None,
-        mlme: super::assoc::Context::default(),
-        stop: None,
-    })
+    Ok(Values { sar, maximum, gain })
 }
 
 /// Current-operation publication contract copied only from an acknowledged
@@ -332,6 +353,12 @@ impl Owner {
             Emission::Legacy => &b"NARF Intel MVM API77 qualified static legacy20 power v1"[..],
             Emission::Ht20 => {
                 &b"NARF Intel MVM API77 qualified static HT20 SISO MCS0-7 SGI20 WMM-BE power v2"[..]
+            }
+            Emission::Ht20Ba => {
+                &b"NARF Intel MVM API77 qualified HT20 SISO MCS0-7 SGI20 WMM-BE TID0 TX-BA pipeline8 RX-BA32 control power v3"[..]
+            }
+            Emission::Ht20NestedBa => {
+                &b"NARF Intel MVM API77 qualified HT20 SISO MCS0-7 SGI20 WMM-BE TID0 TX-BA pipeline8 RX-BA32 nested-AMSDU3839 control power v4"[..]
             }
         });
         hash.update(&facts);
