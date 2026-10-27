@@ -236,6 +236,123 @@ not a wake source). With no composition installed the store keeps
 its fail-closed shape: a supported state's write is refused
 `ENODEV`, never silently dropped.
 
+#### Suspend image and key custody (suspend service, S4)
+
+The S4 image machinery of the power-suspend security design
+(§5's "S4 via `hibernate` image" made concrete) lives in
+`suspend_service`. The service is the only component that holds
+unwrapped key material, under the `VkBytes` custody discipline of
+`block/` (design §1.4): secrets live in `Secret32` — minted only
+in `DomainId::KEYS` (or `FRAME`, the same forward-compatible gate
+`VkBytes` documents), yielded only to a closure, zeroized on drop,
+never `Clone`.
+
+```rust
+// suspend_service: custody anchors (design §3.2). Real anchors are
+// separate lanes — FIDO token, TPM sealing, Argon2id passphrase;
+// this surface is all the service ever knows about them.
+pub trait KeyCustodyAnchor: Send + Sync {
+    fn kind(&self) -> AnchorKind;   // Token | Tpm | Tee | Dice | Passphrase | Test
+    fn wrap(&self, ctx: &WrapCtx, secret: &Secret32)
+        -> Result<WrappedSlot, AnchorError>;
+    fn unwrap(&self, ctx: &UnwrapCtx, slot: &WrappedSlot)
+        -> Result<Secret32, AnchorError>;
+    fn epoch(&self) -> Option<u64>;                       // default None
+    fn advance_epoch(&self) -> Result<Option<u64>, AnchorError>;
+}
+
+pub struct SuspendService<E: KeyEntropy> { /* … */ }
+impl SuspendService<HwKeyEntropy> { pub fn production() -> Self; }
+impl<E: KeyEntropy> SuspendService<E> {
+    pub fn create_epoch(&mut self) -> Result<u64, ServiceError>;
+    pub fn enroll(&mut self, anchor: &dyn KeyCustodyAnchor)
+        -> Result<SlotRecord, ServiceError>;
+    pub fn revoke_slot(&mut self, epoch: u64, kind: AnchorKind,
+                       params: &[u8]) -> Result<(), ServiceError>;
+    pub fn rotate_epoch(&mut self, anchors: &[&dyn KeyCustodyAnchor])
+        -> Result<u64, ServiceError>;
+    pub fn retire_epoch(&mut self, epoch: u64) -> Result<(), ServiceError>;
+    pub fn seal_image(&mut self, store: &mut dyn ImageStore,
+                      policy: RecordedPolicy, image: &[u8])
+        -> Result<[u8; 16], ServiceError>;
+    pub fn open_with_anchor(&self, store: &dyn ImageStore,
+                            anchor: &dyn KeyCustodyAnchor)
+        -> Result<OpenedImage, ServiceError>;
+    pub fn open_off(&self, store: &dyn ImageStore)
+        -> Result<OpenedImage, ServiceError>;
+    pub fn slot_area(&self) -> SlotArea;
+}
+
+// Reader trust order (design §6.2): no type before TrustedImage
+// can yield plaintext.
+pub fn parse_claims(store: &dyn ImageStore) -> Result<ImageClaims, ServiceError>;
+pub fn open_with_sms(store: &dyn ImageStore, claims: ImageClaims,
+                     sms: &Secret32) -> Result<OpenedImage, ServiceError>;
+impl OpenedImage {
+    pub fn verify_all(self, store: &dyn ImageStore)
+        -> Result<TrustedImage, ServiceError>;
+}
+impl TrustedImage {
+    pub fn read_chunk(&self, store: &dyn ImageStore, index: u64,
+                      out: &mut Vec<u8>) -> Result<(), ServiceError>;
+}
+
+pub struct RecordedPolicy { pub level: PolicyLevel, pub policy_epoch: u64 }
+pub enum PolicyLevel { Off, Passphrase, Token, TokenTpm, Tpm }
+```
+
+**Key hierarchy (design §3.1).** A per-epoch *slot master secret*
+(SMS, 32B) is wrapped once per enrolled factor into a slot record;
+each image draws a fresh per-image key (SMK, 32B) wrapped under
+`HKDF-SHA256(SMS, "narf-suspend/slot-epoch" ‖ epoch)`, so an
+epoch's material can never unwrap another epoch's images and
+rotation invalidates every previous wrapping in one move. Image
+and manifest keys are HKDF leaves under the SMK
+(`"narf-suspend/image"`, `"narf-suspend/manifest"`); per-hook keys
+derive as `"narf-suspend/hook/" ‖ name` (image mode) and
+`"narf-suspend/hook-anchor/" ‖ name` (anchor mode) — the seam the
+state-hook registry (design §5) consumes. Key generation draws
+**only** from `narf-crypto`'s seed-grade key-material surface
+(crypto §3.2) and refuses — `ServiceError::EntropyUnavailable`,
+no fallback, no partial epoch — when no healthy seed-grade source
+exists. Sealing draws the same way for every policy, OFF included.
+
+**Image format (design §3.3).** On the pre-configured suspend
+partition, byte ranges via `ImageStore` (production: `BlockStore`
+over a registered partition device behind `narf-block`'s
+`BlockDeviceSync`): a 4 KiB header page, then the tag manifest
+(page-padded), the hook region (length 0 until the hook registry
+lands), then the image in 1 MiB AEAD chunks. The header page's
+*preamble* is plaintext claims — magic `NARFSUS1`, format version,
+image id, SMS epoch, recorded-policy level code, policy epoch,
+the epoch's slot records, the SMK wrap nonce and wrapped SMK, in
+that order — and is believed for nothing but factor selection.
+The page's final 72 bytes are the *sealed body* (chunk count,
+image length, hook region length, manifest root) sealed under the
+manifest key with the entire preamble as AAD: any tampered
+preamble byte — the recorded policy above all — fails the header
+seal wholesale. Each chunk is ChaCha20-Poly1305-sealed under the
+image key with nonce `0u32 ‖ chunk_index` and AAD
+`image_id ‖ chunk_index`; the manifest root is a SHA-256 Merkle
+root over the chunk tags. The governing policy is therefore the
+*recorded* one, authenticated, never the machine's current
+configuration (design §10.3). OFF-policy images run the identical
+machinery under a published derivation (`off_policy_sms`): the
+format stays uniform and the header honestly records OFF.
+Slot records also persist outside images in the partition's slot
+area (`SlotArea`, design §10.2) — the secret-free mirror the
+resume environment finds slots through; its codec is strict and
+total (caps before allocation, trailing garbage refused).
+
+**Seams, deliberately minimal.** The hook key derivations and the
+header's hook-region length are the state-hook registry's entry
+surface; `parse_claims` / `OpenedImage` are the resume
+environment's; `RecordedPolicy` is what the policy engine
+administers. Policy levels and floors, the hook registry, and the
+resume environment itself are separate lanes (design §12); this
+section specifies the service, the format, and the custody
+contract only.
+
 ### 3.4 Thermal
 
 Two layers, one registration path.
