@@ -27,6 +27,8 @@ mod ht40_tests;
 mod receive_epoch_tests;
 #[path = "rx_ba_tests.rs"]
 mod rx_ba_tests;
+#[path = "rx_fragment_tests.rs"]
+mod rx_fragment_tests;
 #[path = "tx_ba_tests.rs"]
 mod tx_ba_tests;
 #[path = "tx_nss_tests.rs"]

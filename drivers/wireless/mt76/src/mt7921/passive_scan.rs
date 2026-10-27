@@ -84,13 +84,15 @@ pub(super) struct NativeRx<'a> {
     pub ampdu: bool,
     pub wcid: u16,
     pub tid: u8,
+    /// RXD2 `MT_RXD2_NORMAL_FRAG`.
+    pub fragment: bool,
     /// Optional original P-RXV DW0; absence is not a fabricated PHY rate.
     pub phy: Option<u32>,
 }
 
 pub(super) fn rx_native(packet: &[u8]) -> Option<NativeRx<'_>> {
     let native = rx_native_with_amsdu(packet)?;
-    (native.amsdu == 0).then_some(native)
+    (native.amsdu == 0 && !native.fragment).then_some(native)
 }
 
 /// Decode ownership/security metadata without admitting A-MSDU payloads to
@@ -112,8 +114,16 @@ pub(super) fn rx_native_with_amsdu(packet: &[u8]) -> Option<NativeRx<'_>> {
     let cipher = (r1 >> 16) & 0x1f;
     if !matches!(cipher, 0 | 4) // MT_CIPHER_NONE / MT_CIPHER_AES_CCMP
         || r1 & (0x3f << 23) != 0
-        || r2 & ((1 << 13) | (7 << 23) | (1 << 27)) != 0
+        || r2 & ((1 << 13) | (7 << 23)) != 0
     {
+        return None;
+    }
+    // MT_RXD2_NORMAL_FRAG: a fragment whose CCMP PN mt7921_mac_fill_rx hands
+    // to mac80211 for sequential validation. Only the station defragmenter
+    // consumes these; scan/auth/EAPOL paths (rx_native) never see them, and
+    // hardware A-MSDU deaggregation of a fragment is not a valid layout.
+    let fragment = r2 & (1 << 27) != 0;
+    if fragment && word(packet, 16)? & 3 != 0 {
         return None;
     }
     let mut offset = 24usize;
@@ -149,6 +159,7 @@ pub(super) fn rx_native_with_amsdu(packet: &[u8]) -> Option<NativeRx<'_>> {
         ampdu: r2 & (1 << 30) == 0, // MT_RXD2_NORMAL_NON_AMPDU.
         wcid: (r1 & 0x3ff) as u16,
         tid: ((r2 >> 16) & 15) as u8,
+        fragment,
         phy,
         ccmp: if cipher == 4 {
             Some(CcmpRx {

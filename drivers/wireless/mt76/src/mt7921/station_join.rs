@@ -276,6 +276,8 @@ pub fn to_ethernet(frame: &[u8]) -> Option<Vec<u8>> {
 
 impl<B: Backend> Session<B> {
     pub(super) fn renew_receive_epoch(&mut self) -> Result<(), Error> {
+        // No partial MSDU survives a key or association change.
+        self.rx_fragments.clear();
         self.backend.close_receive_capture(0);
         self.receive_epoch = 0;
         self.receive_epoch = super::NEXT_RECEIVE_EPOCH
@@ -348,6 +350,44 @@ impl<B: Backend> Session<B> {
             receiver.clear();
         }
         self.received_msdu.clear();
+        self.rx_fragments.clear();
+    }
+
+    /// Linux `ieee80211_rx_h_defragment` for the native station path. Each
+    /// hardware-decrypted fragment must beat the current per-queue replay
+    /// counter, and continuations must carry PN `last + 1`; only a complete
+    /// MSDU advances the counter (to the last fragment's PN). Fragments
+    /// bypass the BA reorder buffer, as in `ieee80211_rx_reorder_ampdu`.
+    /// The controlled port never accepts a fragmented EAPOL PDU.
+    fn receive_fragment(&mut self, native: &super::scan::NativeRx<'_>) -> Option<Vec<u8>> {
+        let frame = native.frame;
+        let header = frame.get(..24)?;
+        let fragmented = header[1] & 0x04 != 0 || header[22] & 15 != 0;
+        // Fragments are never A-MPDU subframes, and the RXD FRAG marker must
+        // agree with the MAC header before any PN is trusted.
+        if native.ampdu || native.amsdu != 0 || native.fragment != fragmented {
+            return None;
+        }
+        let pn = match (native.ccmp, self.security.as_ref()) {
+            (Some(ccmp), Some(_)) if ccmp.key_id == 0 => Some(ccmp.pn),
+            (None, None) => None,
+            _ => return None,
+        };
+        let (fragment, _) = super::fragment::Cache::parse(frame, pn)?;
+        if let (Some(pn), Some(security)) = (pn, self.security.as_ref()) {
+            if pn <= security.pairwise[fragment.queue] {
+                return None;
+            }
+        }
+        let complete = self.rx_fragments.insert(frame, pn, self.backend.now_ns())?;
+        let ethernet = to_ethernet(&complete.frame)?;
+        if ethernet[12..14] == [0x88, 0x8e] {
+            return None;
+        }
+        if let (Some(security), Some((_, last))) = (self.security.as_mut(), complete.pn) {
+            security.pairwise[complete.queue] = last;
+        }
+        Some(ethernet)
     }
 
     fn receive_aggregate(
@@ -786,6 +826,12 @@ impl<B: Backend> Session<B> {
                 || header[16] & 1 != 0
                 || header[4] & 1 != 0 && header[16..22] == own
             {
+                continue;
+            }
+            if native.fragment || header[1] & 0x04 != 0 || header[22] & 15 != 0 {
+                if let Some(ethernet) = self.receive_fragment(&native) {
+                    return Ok(Some(ethernet));
+                }
                 continue;
             }
             let qos = (header[0] == 0x88).then(|| frame.get(24..26)).flatten();

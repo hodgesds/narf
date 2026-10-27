@@ -20,6 +20,8 @@ mod amsdu;
 mod ba;
 #[path = "rx_ba_station.rs"]
 mod ba_station;
+#[path = "rx_fragment.rs"]
+mod fragment;
 #[path = "station_join.rs"]
 mod join;
 #[path = "tx_ba.rs"]
@@ -930,6 +932,7 @@ struct Session<B: Backend> {
     control_pending: VecDeque<Vec<u8>>,
     rx_ba: ba::Owner,
     received_msdu: VecDeque<Vec<u8>>,
+    rx_fragments: fragment::Cache,
     receive_epoch: u64,
 }
 impl<B: Backend> Session<B> {
@@ -960,6 +963,7 @@ impl<B: Backend> Session<B> {
             control_pending: VecDeque::new(),
             rx_ba: ba::Owner::default(),
             received_msdu: VecDeque::new(),
+            rx_fragments: fragment::Cache::default(),
             receive_epoch: 0,
         }
     }
@@ -1177,6 +1181,7 @@ impl<B: Backend> Session<B> {
         self.vht_profile = None;
         self.ap_phy = None;
         self.received_msdu.clear();
+        self.rx_fragments.clear();
         self.stage(Stage::Shutdown);
         let result = async {
             self.backend.check()?;
