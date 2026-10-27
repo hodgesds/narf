@@ -1131,6 +1131,16 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Graphics.default_domain(),
     });
+
+    // External DP (lane Q4, #1092): program the combo-DDI HPD
+    // interrupt enables and pick up a sink that was already
+    // attached at boot. The session connect path re-checks the
+    // generation's display support itself.
+    with_controller(|gpu| {
+        let window = DpBarWindow(&gpu.gtt_mmadr);
+        crate::intel_gpu_dp::enable_hpd_interrupts(&window);
+    });
+    poll_dp_hpd_events();
     Ok(())
 }
 
@@ -1210,6 +1220,170 @@ pub fn is_probed() -> bool {
 
 pub fn with_controller<R>(f: impl FnOnce(&IntelGpu) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)
+}
+
+// ── External DisplayPort session (lane Q4, #1092) ──────────────
+//
+// The HPD-driven external-DP path: `intel_gpu_dp` owns the
+// session logic (caps, negotiation, training, ELD publication);
+// this glue owns the parts that need the probed controller —
+// the BAR window, the scanout allocation (same allocator and
+// lifetime as probe's own scanout: the GTT allocator has no
+// free path, so a session allocation is retained and reused
+// across reconnects while it fits), and scanout publication
+// through the same ACTIVE + observer protocol as the takeover
+// path. The single-pipe orchestrator means an external session
+// owns Pipe A while it is live; the last HPD event wins.
+
+/// `MmioWindow` over the controller's BAR0 mapping (same
+/// adapter shape as the DP Alt-Mode bridge).
+struct DpBarWindow<'a>(&'a MmioRegion);
+
+impl crate::intel_gpu_aux::MmioWindow for DpBarWindow<'_> {
+    fn read32(&self, off: u64) -> u32 {
+        // SAFETY: BAR0 is mapped for the lifetime of `IntelGpu`;
+        // `off` is a display register offset from the DP
+        // session code, and a 32-bit register read has no
+        // unwanted side effect.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        unsafe { self.0.read32(off) }
+    }
+    fn write32(&self, off: u64, val: u32) {
+        // SAFETY: same BAR ownership as `read32`; `off` is a
+        // programmable display register.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        unsafe { self.0.write32(off, val) }
+    }
+}
+
+/// Live external-DP session state: the connection, the
+/// framebuffer it scans out, and its retained allocation.
+struct DpSessionState {
+    conn: crate::intel_gpu_dp::DpConnection,
+    fb: crate::intel_gpu_modeset::Framebuffer,
+    alloc: ScanoutAllocation,
+}
+
+static DP_SESSION: IrqSafeSpinLock<Option<DpSessionState>> = IrqSafeSpinLock::new(None);
+
+/// Drain pending combo-DDI hotplug events and act on them.
+/// Called once at the end of probe (a sink already attached at
+/// boot is picked up there); a future periodic-polled caller
+/// can invoke it the same way.
+pub fn poll_dp_hpd_events() {
+    loop {
+        let event = with_controller(|gpu| {
+            let window = DpBarWindow(&gpu.gtt_mmadr);
+            crate::intel_gpu_dp::poll_hpd_event(&window)
+        });
+        match event {
+            Some(Some(event)) => handle_dp_hpd_event(event),
+            _ => return,
+        }
+    }
+}
+
+fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
+    use crate::intel_gpu_dp::HpdEvent;
+    match event {
+        HpdEvent::Connected(ddi) => {
+            if let Some((conn, fb, alloc)) = dp_connect(ddi) {
+                publish_scanout(Some(narf_graphics_driver::generic::GenericFb::new(
+                    alloc.phys_base,
+                    conn.mode.h_active as u32,
+                    conn.mode.v_active as u32,
+                    fb.stride_bytes,
+                    32,
+                )));
+            }
+        }
+        HpdEvent::Disconnected(ddi) => {
+            let session = DP_SESSION.lock().take();
+            if let Some(state) = session {
+                if state.conn.ddi == ddi {
+                    with_controller(|gpu| {
+                        let window = DpBarWindow(&gpu.gtt_mmadr);
+                        crate::intel_gpu_dp::disconnect(&window, &state.conn);
+                    });
+                    publish_scanout(None);
+                } else {
+                    *DP_SESSION.lock() = Some(state);
+                }
+            }
+        }
+        HpdEvent::RetrainRequired(ddi) => {
+            // Snapshot under the session lock, retrain against
+            // the controller, then store back — never hold
+            // DP_SESSION across `with_controller` (the connect
+            // path takes the locks in the opposite order).
+            let current = {
+                let session = DP_SESSION.lock();
+                session
+                    .as_ref()
+                    .filter(|state| state.conn.ddi == ddi)
+                    .map(|state| (state.conn.clone(), state.fb))
+            };
+            if let Some((conn, fb)) = current {
+                let updated = with_controller(|gpu| {
+                    let window = DpBarWindow(&gpu.gtt_mmadr);
+                    crate::intel_gpu_dp::retrain(&window, &conn, &fb).ok()
+                });
+                if let Some(Some(new_conn)) = updated {
+                    let mut session = DP_SESSION.lock();
+                    if let Some(state) = session.as_mut() {
+                        if state.conn.ddi == ddi {
+                            state.conn = new_conn;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Run one external-DP connect against the probed controller:
+/// probe the sink over AUX, allocate its scanout, activate.
+/// On success the session state is stored for disconnect /
+/// retrain handling.
+fn dp_connect(
+    ddi: crate::intel_gpu_ddi::Ddi,
+) -> Option<(
+    crate::intel_gpu_dp::DpConnection,
+    crate::intel_gpu_modeset::Framebuffer,
+    ScanoutAllocation,
+)> {
+    with_controller(|gpu| {
+        if !gpu.chip.generation.display_supported() {
+            return None;
+        }
+        let window = DpBarWindow(&gpu.gtt_mmadr);
+        let probe = crate::intel_gpu_dp::probe_sink(&window, ddi).ok()?;
+        let width = probe.mode.h_active as u32;
+        let height = probe.mode.v_active as u32;
+        let stride_bytes = padded_stride_bytes(width);
+        let size_bytes = scanout_size_bytes(width, height);
+        let alloc =
+            crate::intel_gpu_gtt::alloc_contiguous_scanout(&gpu.gtt_mmadr, size_bytes).ok()?;
+        let alloc = ScanoutAllocation {
+            gtt_offset: alloc.gtt_offset,
+            phys_base: alloc.phys_base(),
+            order: alloc.order,
+            size_bytes: alloc.size_bytes,
+        };
+        let fb = crate::intel_gpu_modeset::Framebuffer {
+            phys_addr: alloc.gtt_offset as u64,
+            stride_bytes,
+            format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
+        };
+        let conn = crate::intel_gpu_dp::activate(&window, &probe, &fb).ok()?;
+        *DP_SESSION.lock() = Some(DpSessionState {
+            conn: conn.clone(),
+            fb,
+            alloc,
+        });
+        Some((conn, fb, alloc))
+    })
+    .flatten()
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
