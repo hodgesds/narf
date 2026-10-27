@@ -89,8 +89,22 @@ resets peer, control-port and cached power-save state.
 `association::phy::{LocalHt, LocalVht, LocalPhy}` describes a native driver's
 implemented directional RX/TX limits. Checked HT20/HT40/VHT80/VHT160 constructors
 encode only local equal-modulation HT MCS0..31, directional VHT MCS/NSS maps,
-GI and aggregation limits; TX STBC/beamforming, extended NSS/BW and
-large A-MSDU remain absent. Local HT RX/TX include mandatory MCS0..7.
+GI and aggregation limits. Local HT RX/TX include mandatory MCS0..7.
+`with_tx_stbc(enabled)` on both local types advertises HT/VHT Tx STBC (bit7);
+negotiated `tx_stbc()` additionally needs the bound peer's Rx STBC field in
+the original offer and the response, as mac80211/ht.c and vht.c copy peer
+Rx STBC only for a local Tx STBC transmitter (`HtNegotiation::
+peer_rx_stbc_streams`). `LocalVht::with_beamforming(VhtBeamforming)`
+advertises checked SU beamformee (2..8 STS), SU beamformer (2..8 sounding
+dimensions) and MU beamformee roles; MU beamformer is AP-only and never
+emitted. `su_beamformee`/`su_beamformer`/`mu_beamformee` require the
+complementary AP role in offer and response (vht.c
+ieee80211_vht_cap_ie_to_sta_vht_cap), and `Offer::advertised_vht_capability`
+(the request IE) drops beamformee roles the AP cannot sound, as
+mlme.c ieee80211_add_vht_ie does. HT TxBF stays zero, as in mac80211.
+Native NDPA/NDP feedback, steering, STBC encoding and the single MU-MIMO
+owner are backend responsibilities. Large A-MSDU limits are described with
+the shared A-MSDU owner below.
 `LocalVht::with_160mhz(rx_sgi160, tx_sgi160)` opts into contiguous160 and
 directional SGI160. Existing constructors retain their80MHz ceiling;
 `LocalPhy::vht160` requires both this explicit promise and an HT40 companion,
@@ -139,7 +153,11 @@ The FullMAC owner must retain and check those independent native facts.
 The opt-in path admits mandatory HT127/VHT126 membership selectors only with
 the corresponding complete compatible PHY, while preserving actual legacy
 basic rates for management frames. GLK/EPD/SAE-H2E/HE/EHT/UHR and unknown
-mandatory selectors remain unsupported. Optional unflagged values grant no
+mandatory selectors remain unsupported and fail closed: SAE-H2E needs a SAE
+`SecurityMode` (JoinPlan offers only Open/WPA2-PSK), HE/EHT/UHR need shared
+HE/EHT/UHR capability/operation parsing and negotiation, and GLK/EPD need
+IEEE802.11ak General Link/EtherType Protocol Discrimination framing, which
+the shared RFC1042 data path does not implement. Optional unflagged values grant no
 membership. Present malformed or orphan PHY elements fail instead of becoming
 legacy fallback. Missing optional PHY can retain legacy operation. Generated
 local capability IEs are protocol-owned; caller HT/VHT capabilities and, on
@@ -158,9 +176,25 @@ the actual HT40 pair and a valid peer160-width capability. Both deprecated
 width2/seg0 and revised width1/primary80-seg0/full160-seg1 encodings are
 checked. An80MHz local station may select the actual primary80 half while
 advertising only80MHz support. `Width::OneSixty` exposes the eight-channel
-selection to the native owner. Discontiguous80+80, reserved width encodings
-and extended NSS/BW remain unsupported. SGI160 transmit use cannot gain a
-peer capability omitted from the original scan offer.
+selection to the native owner. Reserved width encodings remain unsupported.
+`LocalVht::with_80p80` opts into discontiguous80+80 (Supported Channel Width
+Set2). The revised width1 encoding with a non-adjacent second CCFS, or
+deprecated width3, selects two canonical80 segments with the primary in
+seg0; adjacent/overlapping/noncanonical segments, or an AP without 80+80
+support, fail closed. The selection reports `Width::OneSixty` (VHT-SIG-A
+CBW160/80+80), `discontiguous()`, `center_channel()` = seg0 and
+`secondary_center_channel()`; `occupied_channels()` lists all eight. A
+local station without the opt-in uses the primary80 segment.
+`LocalVht::with_extended_nss_bw(true)` declares VHT Extended NSS BW Capable
+(Linux IEEE80211_HW_SUPPORTS_VHT_EXT_NSS_BW): the AP's Extended NSS BW
+Support is then interpreted per IEEE802.11-2020 Table 9-272, including the
+HT Operation CCFS2 second segment where mac80211 ieee80211_chandef_vht_oper
+uses it, and the 160/80+80 TX map is truncated to the AP's reduced NSS
+(cfg80211 ieee80211_get_vht_max_nss); reserved supported-width/ext
+combinations fail closed. A non-capable station reads the AP field as0, so
+APs advertising Extended NSS BW are admitted with their legacy width.
+SGI160 transmit use cannot gain a peer capability omitted from the original
+scan offer.
 A response may narrow the original occupied set but cannot expand it. All
 address/status/AID/security/rate/membership/PHY checks precede one atomic
 rate/PHY/Associated transition; failure leaves old rates and no partial PHY
@@ -187,6 +221,16 @@ open-authentication and association requests, and binds responses to the
 local/AP addresses, transaction phase, status and AID. `SecurityMode` carries
 no PMK. Fragmented responses (including a final fragment with nonzero
 SequenceControl fragment number) leave the phase unchanged.
+`mgmt_defrag::Reassembler` is the admission path for them: it reassembles
+unprotected unicast management MPDUs per IEEE802.11-2020 10.6/10.7 with
+mac80211 ieee80211_rx_h_defragment's four-entry round-robin cache,
+two-second lifetime and consecutive fragment numbers within one TA/SN/frame
+type. Gaps, duplicates and foreign fragments are dropped without disturbing
+buffered sequences; group-addressed or protected fragments and results above
+4096 bytes are refused. The result is the first fragment's header with More
+Fragments cleared plus the concatenated bodies, which the plan admits like an
+unfragmented response. The native owner still binds channel/peer, CRC and
+Retry duplicate detection before pushing.
 `append_sme_ies` accepts checked optional elements before first TX;
 `legacy_rates()` returns IEEE-rate bitmaps rather than hardware indices.
 Before association those bitmaps describe the offered scan-time set. A
@@ -1015,19 +1059,40 @@ key/TID replay update. All failures preserve caller ciphertext and replay
 state. Aggregates and standalone QoS MPDUs share the same sixteen replay
 trackers, key epochs and GTK RSC floors. Ordinary CCMP masks A-MSDU-present
 in AAD; the parser's RFC1042 DA check supplies the Linux aggregation-injection
-mitigation without changing interoperable AAD. No SPP A-MSDU support is claimed.
-The original `protect`/`unprotect` continue rejecting A-MSDU headers; TX
-aggregation, hardware-deaggregated RX, BA/reordering and larger VHT limits are
+mitigation without changing interoperable AAD.
+SPP A-MSDU (RSN Capabilities bit10, IEEE802.11-2020 9.4.2.24.4) is negotiated
+only when both RSNEs advertise it: `JoinPlan::enable_spp_amsdu` patches the
+request RSNE before first TX, `station_security::Security::new` accepts that
+station RSNE and reports `spp_amsdu()`, and its pairwise `Key::with_spp_amsdu`
+keeps A-MSDU Present in the CCMP AAD (12.5.3.3.3; mac80211 wpa.c
+ccmp_gcmp_aad with `spp_amsdu`, `ccmp::build_aad_spp_amsdu`). Group keys keep
+the ordinary AAD. A flipped A-MSDU Present bit then fails the MIC.
+The original `protect`/`unprotect` continue rejecting A-MSDU headers.
+`amsdu::Limit` names the HT3839/HT7935 A-MSDU and VHT3895/7991/11454 MPDU
+sizes (body bound = MPDU minus the46-byte protected QoS/CCMP/FCS overhead);
+`decode_with_limit` and `AmsduAdmission::with_limit` admit a larger aggregate
+only under the size the station actually advertised. Transmit uses
+`amsdu::encode` (zero inter-subframe padding, the receive-side DA/SA/protocol
+rules, peer limit), `Key::protect_amsdu` (ToDS, Normal Ack, Address3 = BSSID
+per Table 9-30 as mac80211 ieee80211_amsdu_prepare_head writes it) and
+`Security::transmit_amsdu_qos`, which consumes one QoS SN and one PN and never
+aggregates the control port. Hardware-deaggregated RX and BA sessions remain
 separate native ownership contracts.
 
 `Key::unprotect_amsdu_block_ack` is an additional opt-in after a driver proves
 a live unicast BA agreement and releases the whole original MPDU in SN order.
 It accepts both normal ACK and BlockAck QoS policy (`0x80`/`0xe0` aggregate
 high nibbles), retaining the original header, TID, CCMP key/PN and atomic
-whole-aggregate validation. Multicast BlockAck, NoAck, NoExplicitAck and EOSP
-remain absent. The existing aggregate method stays normal-ACK-only and ordinary
-packet methods keep rejecting aggregates. The helper supplies no BA session,
-native completion or ordering proof.
+whole-aggregate validation. `Key::unprotect_amsdu_with`/
+`Security::receive_amsdu_with` take an explicit `AmsduAdmission`: No Ack
+(unicast and group, as mac80211 ieee80211_set_qos_hdr marks group QoS data),
+No Explicit Ack and BlockAck (unicast only) and EOSP (IEEE802.11-2020
+9.2.4.5.3/9.2.4.5.4) are each separate opt-ins, and `AmsduReceive` returns
+the frames with the original TID, `AckPolicy` and EOSP bit for the driver's
+U-APSD owner. Multicast BlockAck stays refused. The existing aggregate
+methods keep their normal-ACK/BlockAck-only profiles and ordinary packet
+methods keep rejecting aggregates. The helper supplies no BA session, native
+completion or ordering proof.
 
 `reorder::Reorder<T>` supplies a bounded opaque native-MPDU sequence owner,
 independent of crypto, radio, policy and controlled-port authority. Construction

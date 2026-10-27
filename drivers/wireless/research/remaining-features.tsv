@@ -364,20 +364,9 @@ rtw89	tspec	TSPEC admission	feature	drivers/wireless/specification/rtw89.md	933
 rtw89	uapsd	U-APSD	feature	drivers/wireless/specification/rtw89.md	933
 rtw89	wmm_all_access_categories	Packet scheduling across all WMM access categories	feature	drivers/wireless/specification/rtw89.md	1015
 rtw89	wow	Wake on Wireless	feature	drivers/wireless/specification/rtw89.md	1016
-shared	amsdu_eosp	EOSP aggregate receive	feature	wireless/specification/spec.md	1027
-shared	amsdu_no_explicit_ack	NoExplicitAck-policy aggregate receive	feature	wireless/specification/spec.md	1027
-shared	amsdu_noack	NoAck-policy aggregate receive	feature	wireless/specification/spec.md	1027
-shared	beamforming	Shared typed PHY beamforming support	feature	wireless/specification/spec.md	92
-shared	eht_phy_admission	EHT PHY and mandatory membership admission	feature	wireless/specification/spec.md	141
-shared	epd_membership_selector	EPD mandatory membership-selector admission	feature	wireless/specification/spec.md	141
-shared	extended_nss_bw	Shared extended NSS/BW PHY admission	feature	wireless/specification/spec.md	92
-shared	fragmented_management	Fragmented management-frame reassembly/admission	feature	wireless/specification/spec.md	188
-shared	glk_membership_selector	GLK mandatory membership-selector admission	feature	wireless/specification/spec.md	141
-shared	he_phy_admission	HE PHY and mandatory membership admission	feature	wireless/specification/spec.md	141
-shared	large_rx_amsdu	Receive A-MSDU above retained bounded size	feature	wireless/specification/spec.md	93
-shared	sae_h2e_membership_selector	SAE-H2E mandatory membership-selector admission	feature	wireless/specification/spec.md	141
-shared	spp_amsdu	SPP A-MSDU authentication support	feature	wireless/specification/spec.md	1018
-shared	tx_amsdu	Shared original A-MSDU transmit protection support	feature	wireless/specification/spec.md	1019
-shared	tx_stbc	Shared typed PHY transmit STBC support	feature	wireless/specification/spec.md	92
-shared	uhr_membership_selector	UHR mandatory membership-selector admission	feature	wireless/specification/spec.md	141
-shared	vht_80p80	Shared discontiguous 80+80 PHY admission	feature	wireless/specification/spec.md	161
+shared	eht_phy_admission	EHT PHY and mandatory membership admission; needs shared EHT capability/operation parsing and negotiation	feature	wireless/specification/spec.md	155
+shared	epd_membership_selector	EPD mandatory membership-selector admission; needs 802.11ak EPD MSDU framing	feature	wireless/specification/spec.md	155
+shared	glk_membership_selector	GLK mandatory membership-selector admission; needs 802.11ak General Link operation	feature	wireless/specification/spec.md	155
+shared	he_phy_admission	HE PHY and mandatory membership admission; needs shared HE capability/operation parsing and negotiation	feature	wireless/specification/spec.md	155
+shared	sae_h2e_membership_selector	SAE-H2E mandatory membership-selector admission; needs a SAE JoinPlan SecurityMode	feature	wireless/specification/spec.md	155
+shared	uhr_membership_selector	UHR mandatory membership-selector admission; needs shared UHR PHY negotiation	feature	wireless/specification/spec.md	155
