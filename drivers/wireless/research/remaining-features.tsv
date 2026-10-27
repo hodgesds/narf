@@ -139,7 +139,6 @@ cyw43439	virtual_interfaces	Additional virtual interfaces	feature	drivers/wirele
 cyw43439	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/cyw43439.md	500
 cyw43439	wpa3_sae_offload	WPA3-Personal / SAE firmware offload	feature	drivers/wireless/specification/cyw43439.md	498
 iwlwifi	active_scan_probes	Active scan probes	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	air_deauthentication	Over-air deauthentication	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	ap	AP role	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	ax210_station_enablement	AX210 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1553
 iwlwifi	ax211_station_enablement	AX211 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1553
@@ -153,16 +152,16 @@ iwlwifi	gen2_pmf	Gen2 PMF	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	gen2_recovery	Gen2 recovery	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	gen2_vht	Gen2 VHT	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	gen2_wpa3	Gen2 WPA3	feature	drivers/wireless/specification/iwlwifi.md	1552
+iwlwifi	gen3_unlisted_pci_ids	Linux-claimed So 0x7A70/0x7AF0/0x51F1/0x7F70, Ma 0x2729 and Bz 0xA840/0x7740/0x4D40 PCI IDs absent from the match table	chip	drivers/wireless/specification/iwlwifi.md	1555
 iwlwifi	group_nested_rx	Group-addressed nested A-MSDU-in-A-MPDU RX	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	he	HE	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	ht40	HT40	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	ldpc	LDPC	feature	drivers/wireless/specification/iwlwifi.md	1552
+iwlwifi	ldpc	TX LDPC (TLC_MNG_CFG_FLAGS_LDPC; RX LDPC implemented in §3.28)	feature	drivers/wireless/specification/iwlwifi.md	1734
 iwlwifi	live_regulatory_owner	Gen3 and Sc live regulatory-policy owner	feature	drivers/wireless/specification/iwlwifi.md	1553
 iwlwifi	ml_baid	Alternate ML BAID profile	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	mlo	MLO on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
 iwlwifi	multiple_rx_queues	Multiple RX queues	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	nss2	NSS2	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	other_profile_combinations	Other PCI/firmware combinations lack an enumerated exact admission profile	unknown	drivers/wireless/specification/iwlwifi.md	1555
 iwlwifi	other_qos_ac_tx	Additional QoS AC TX queues	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	other_qos_tid_tx	Additional QoS TID TX queues	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	p2p	P2P role	feature	drivers/wireless/specification/iwlwifi.md	1552
@@ -171,12 +170,14 @@ iwlwifi	platform_power_owner	Gen3 and Sc live platform TX-power enforcement owne
 iwlwifi	ptk_reuse	Safe PTK reuse	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	rss	Receive-side scaling	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	runtime_pm	Runtime power management	feature	drivers/wireless/specification/iwlwifi.md	1552
+iwlwifi	rx_checksum_offload	RX checksum offload (MQ descriptor l3l4_flags)	feature	drivers/wireless/specification/iwlwifi.md	1554
+iwlwifi	sched_scan_offload	Scheduled-scan (PNO/net-detect) firmware offload	feature	drivers/wireless/specification/iwlwifi.md	1554
 iwlwifi	six_ghz	6GHz operation on applicable 6E/7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
-iwlwifi	stbc	STBC (directions not enumerated in ledger)	feature	drivers/wireless/specification/iwlwifi.md	1552
+iwlwifi	stbc	TX STBC (two TX chains + TLC_MNG_CFG_FLAGS_STBC; RX STBC1 implemented in §3.28)	feature	drivers/wireless/specification/iwlwifi.md	1734
 iwlwifi	system_resume	System resume	feature	drivers/wireless/specification/iwlwifi.md	84
 iwlwifi	system_suspend	System suspend	feature	drivers/wireless/specification/iwlwifi.md	84
 iwlwifi	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	unspecified_advanced_offloads	Advanced offloads are not individually enumerated	unknown	drivers/wireless/specification/iwlwifi.md	1554
+iwlwifi	tx_checksum_offload	TX L3/L4 checksum offload (TX_CMD offload_assist)	feature	drivers/wireless/specification/iwlwifi.md	1554
 iwlwifi	width_160	160MHz operation on applicable profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
 iwlwifi	width_320	320MHz operation on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
 iwlwifi	wow	Wake on WLAN	feature	drivers/wireless/specification/iwlwifi.md	1552
