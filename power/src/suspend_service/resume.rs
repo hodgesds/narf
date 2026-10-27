@@ -67,6 +67,7 @@ pub trait ResumePrompt {
 }
 
 /// Production prompt: the early console via `narf-console`.
+#[derive(Debug)]
 pub struct ConsolePrompt;
 
 impl ResumePrompt for ConsolePrompt {
@@ -136,6 +137,7 @@ fn level_name(level: PolicyLevel) -> &'static str {
 /// the manifest at delivery time (the pipeline's own discipline),
 /// so even a store mutated after verification fails closed at
 /// the read, not silently.
+#[derive(Debug)]
 pub struct VerifiedResume {
     trusted: TrustedImage,
     /// Hook-region length from the sealed header body, captured
@@ -257,16 +259,13 @@ pub fn attempt_resume(
                     let ctx = UnwrapCtx {
                         sms_epoch: claims.sms_epoch,
                     };
-                    match anchor.unwrap(&ctx, &record.wrapped()) {
-                        Ok(sms) => {
-                            unwrapped = Some(sms);
-                            break 'attempt;
-                        }
-                        // Refused, unavailable, or failed: all
-                        // are "this factor did not open this
-                        // slot"; try the next pairing, remember
-                        // only that a pairing was attempted.
-                        Err(_) => {}
+                    // Refused, unavailable, or failed: all are
+                    // "this factor did not open this slot" — try
+                    // the next pairing, remembering only that a
+                    // pairing was attempted.
+                    if let Ok(sms) = anchor.unwrap(&ctx, &record.wrapped()) {
+                        unwrapped = Some(sms);
+                        break 'attempt;
                     }
                 }
             }

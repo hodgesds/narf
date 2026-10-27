@@ -64,6 +64,11 @@ pub use image::{
 pub use resume::{attempt_resume, ConsolePrompt, ResumePrompt, ResumeRefusal, VerifiedResume};
 pub use slots::{EpochSlots, SlotArea, SlotRecord};
 
+/// Crate-visible writer surface for fixtures (the resume-env
+/// smokes craft hook-region images the service itself does not
+/// write yet) and for P2's seal path. Not public API.
+pub(crate) use image::{write_image, WriteRequest};
+
 use anchor::AnchorKind as Kind;
 use slots::{EpochCustody, SlotStore};
 
