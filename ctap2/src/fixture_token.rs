@@ -625,7 +625,12 @@ impl FixtureToken {
         self.queue_cbor_payload(cid, &payload);
     }
 
-    fn handle_report(&mut self, report: &[u8; REPORT_LEN]) {
+    /// Feed one client report into the token. Public so
+    /// downstream harnesses whose pipe must be `Send` (e.g. the
+    /// power resume fixtures, whose custody trait demands
+    /// `Send + Sync`) can drive the token through their own
+    /// [`HidPipe`] impl instead of the `Rc`-based [`FixturePipe`].
+    pub fn handle_report(&mut self, report: &[u8; REPORT_LEN]) {
         let cid = u32::from_be_bytes([report[0], report[1], report[2], report[3]]);
         let is_init = report[4] & 0x80 != 0;
         if is_init {
@@ -663,7 +668,11 @@ impl FixtureToken {
         }
     }
 
-    fn next_report(&mut self, out: &mut [u8; REPORT_LEN]) -> Result<(), Error> {
+    /// Take the token's next queued report, or model the wait
+    /// for one (keepalive / touch release / timeout). Public for
+    /// the same downstream-harness reason as
+    /// [`Self::handle_report`].
+    pub fn next_report(&mut self, out: &mut [u8; REPORT_LEN]) -> Result<(), Error> {
         if let Some(r) = self.out_queue.pop_front() {
             *out = r;
             return Ok(());
