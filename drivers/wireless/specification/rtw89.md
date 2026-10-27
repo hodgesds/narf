@@ -958,6 +958,35 @@ current PCI loss and unchanged flags3 behavior. HT/HE, adaptive fallback/MRR
 and full WMM AC/TIDs remain software work with additional source and signed
 qualification dependencies.
 
+### Optional operating programs and all-AC/TID QoS
+
+`radio_policy::Program` generalizes the signed profile byte57: base flags3
+plus one bit per optional emitter program (bit2 `Wmm`, bit3 `QosAll`, which
+requires `Wmm`). Each enabled program extends the board identity in fixed
+order, so a record authorizes exactly the programs it was measured with;
+flags3/7 identities are unchanged, flags15 needs a new chained identity and
+a flags7 record cannot be promoted. `QualificationRequest` logs the flags15
+identity beside the WMM one. New TX programs add a `Program` variant with
+its own fingerprint instead of another ad-hoc flag value.
+
+With `QosAll` granted and a WMM association, `packet_core` publishes ACH1..3
+(BK/VI/VO) beside BE0/MGMT8 and opens exactly their `R_AX_PCIE_DMA_STOP1`
+bits; stop closes ACH0..3, CH8 and WPDMA. Outgoing Ethernet frames are
+classified like `cfg80211_classify8021d` (RFC 8325 DSCP table, MPLS TC,
+802.21 -> 7) and ACM-downgraded like `ieee80211_downgrade_queue` with
+`wme_downgrade_ac`. The TID is carried in the QoS control field (host CCMP
+binds it in the AAD); `packet_format` maps it with `rtw89_core_get_qsel` and
+`rtw89_core_get_ch_dma` to QSEL0..3/ACH0..3 and sets `TXWD_BODY2_TID_INDICATE`
+per `rtw89_core_get_tid_indicate`. RX accepts QoS DATA on any TID0..7 with
+per-TID replay. The packet owner still keeps one frame in flight; the drain
+worker therefore serves a bounded per-AC backlog in strict VO > VI > BE > BK
+order (host stand-in for mac80211 txq scheduling plus hardware EDCA
+contention). Without `QosAll` every frame stays on the flags7 BE/TID0
+recipe. Smokes: `drivers/wireless/rtw89/qos` (classification, downgrade,
+indicate), `smoke_rtw8852b_operating_programs_each_require_their_own_signed_identity`,
+and `smoke_rtw8852b_all_ac_qos_routes_tids_to_ach_rings_with_strict_priority`
+(TID6 on ACH3, VI/BE/BK ordering, TID5 RX, flags7 fallback).
+
 ### Live AP EDCA updates
 
 Bound peer beacons/probe responses on an open WMM link follow mac80211

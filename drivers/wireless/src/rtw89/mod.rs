@@ -102,6 +102,7 @@ mod power_native;
 mod power_regs;
 mod power_tables;
 mod prepared;
+mod qos;
 mod radio_assets;
 mod radio_full;
 mod radio_gain;

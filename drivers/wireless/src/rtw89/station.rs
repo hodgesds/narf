@@ -29,6 +29,10 @@ pub(super) unsafe trait Io: Send {
     fn station_wmm_allowed(&mut self) -> Result<bool, power::Error> {
         Ok(false)
     }
+    /// Signed all-AC/TID QoS program (`radio_policy::Program::QosAll`).
+    fn station_qos_all_allowed(&mut self) -> Result<bool, power::Error> {
+        Ok(false)
+    }
     async fn station_configure_wmm(
         &mut self,
         _: narf_wireless::wmm::Parameters,
@@ -217,6 +221,8 @@ pub(super) struct State {
     /// Newer AP EDCA set observed in a peer beacon, awaiting reprogramming.
     edca_pending: Option<narf_wireless::wmm::Parameters>,
     short_slot: bool,
+    /// All-AC/TID QoS routing is active for this association.
+    qos_all: bool,
     deadline: u64,
     last_peer: u64,
     last_now: u64,
@@ -256,6 +262,7 @@ impl State {
             wmm: None,
             edca_pending: None,
             short_slot: false,
+            qos_all: false,
             deadline: 0,
             last_peer: 0,
             last_now: 0,
@@ -318,6 +325,7 @@ impl State {
     pub(super) fn stop(&mut self, io: &mut impl Io) -> Result<(), Error> {
         self.wmm = None;
         self.edca_pending = None;
+        self.qos_all = false;
         self.admission.close();
         self.established = false;
         self.phase = Phase::Stopped;
@@ -349,6 +357,7 @@ impl State {
         self.established = false;
         self.wmm = None;
         self.edca_pending = None;
+        self.qos_all = false;
         if let Some(security) = &mut self.security {
             security.fail();
         }
@@ -505,6 +514,19 @@ impl State {
         }
         self.edca_pending = Some(offered);
         Ok(())
+    }
+    pub(super) fn qos_all(&self) -> bool {
+        self.qos_all && self.wmm.is_some()
+    }
+    /// 802.1d TID for an outgoing Ethernet frame: classified and ACM
+    /// downgraded with the all-AC program, otherwise the BE/TID0 recipe.
+    fn tid(&self, frame: &[u8]) -> u8 {
+        match self.wmm {
+            Some(p) if self.qos_all => {
+                super::qos::tid_for(frame, p.ac.map(|ac| ac.admission_control))
+            }
+            _ => 0,
+        }
     }
     pub(super) fn edca_pending(&self) -> bool {
         self.edca_pending.is_some() && self.phase == Phase::Open
@@ -817,6 +839,7 @@ impl State {
         if let Some(p) = self.wmm {
             super::station_control::wmm_admit(p, candidate.bss.capability & 0x400 != 0)?;
         }
+        self.qos_all = self.wmm.is_some() && io.station_qos_all_allowed()?;
         io.station_prepare_peer(bssid, &self.admission).await?;
         self.peer = Some(candidate);
         self.deadline = self.now()?.saturating_add(5000);
@@ -877,9 +900,10 @@ impl State {
             return Err(Error::Profile);
         }
         let peer = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+        let tid = self.tid(frame);
         let native = if let Some(security) = &mut self.security {
             if self.wmm.is_some() {
-                security.transmit_ethernet_qos(frame, 0)?
+                security.transmit_ethernet_qos(frame, tid)?
             } else {
                 security.transmit_ethernet(frame)?
             }
@@ -894,7 +918,7 @@ impl State {
             bytes.extend_from_slice(&(self.sequence << 4).to_le_bytes());
             self.sequence = (self.sequence + 1) & 4095;
             if self.wmm.is_some() {
-                bytes.extend_from_slice(&[0, 0]);
+                bytes.extend_from_slice(&[tid, 0]);
             }
             bytes.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
             bytes.extend_from_slice(&frame[12..]);

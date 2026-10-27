@@ -85,6 +85,10 @@ pub(super) struct Peer {
     pub(super) hold_data: bool,
     wmm: Option<Vec<u8>>,
     qos: bool,
+    /// Accept TID1..7 (all-AC program); otherwise only BE/TID0.
+    qos_all: bool,
+    /// QoS TID of each accepted uplink data frame.
+    pub(super) tids: Vec<u8>,
 }
 impl Peer {
     pub(super) fn new(protected: bool) -> Self {
@@ -116,6 +120,8 @@ impl Peer {
             hold_data: false,
             wmm: None,
             qos: false,
+            qos_all: false,
+            tids: Vec::new(),
         }
     }
     pub(super) fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
@@ -192,9 +198,11 @@ impl Peer {
             return Err("native AP data protection/direction");
         }
         let header = if self.qos {
-            if frame.get(24..26) != Some(&[0, 0]) {
+            let tid = frame.get(24).copied().ok_or("AP QoS control")?;
+            if frame.get(25) != Some(&0) || tid > 7 || (!self.qos_all && tid != 0) {
                 return Err("AP BE/TID0 QoS control");
             }
+            self.tids.push(tid);
             26
         } else {
             24
@@ -244,6 +252,7 @@ struct DriverModel {
     stopped: bool,
     packet_error: Option<crate::rtw89::packet_core::Error>,
     wmm: bool,
+    qos_all: bool,
     irq: Option<IrqModel>,
 }
 /// AX v0 interrupt registers with write-1-clear status, behind the same
@@ -287,6 +296,7 @@ impl DriverModel {
             stopped: false,
             packet_error: None,
             wmm: false,
+            qos_all: false,
             irq: None,
         }
     }
@@ -331,6 +341,10 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
     fn station_wmm_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
         self.station_allowed()?;
         Ok(self.wmm)
+    }
+    fn station_qos_all_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
+        self.station_allowed()?;
+        Ok(self.wmm && self.qos_all)
     }
     async fn station_configure_wmm(
         &mut self,
@@ -409,10 +423,11 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         own: [u8; 6],
         macid: u8,
     ) -> Result<(), crate::rtw89::packet_core::Error> {
-        self.core = Some(crate::rtw89::packet_core::Core::prepare(
+        self.core = Some(crate::rtw89::packet_core::Core::prepare_with(
             &mut self.packets,
             own,
             macid,
+            self.wmm && self.qos_all,
         )?);
         Ok(())
     }
@@ -532,9 +547,13 @@ impl Harness {
         Self::rates_profile(protected, wmm, None)
     }
     fn rates_profile(protected: bool, wmm: bool, rates: Option<&[u8]>) -> Self {
+        Self::build(protected, wmm, false, rates)
+    }
+    fn build(protected: bool, wmm: bool, qos_all: bool, rates: Option<&[u8]>) -> Self {
         assert!(ACTIVE_TEST.lock().is_none());
         let mut io = DriverModel::new();
         io.wmm = wmm;
+        io.qos_all = qos_all;
         // The AP sees current DMA at publication; these independent device
         // actions then advance the real modeled RP and emit parsed RPQ.
         io.packets.consume = true;
@@ -550,6 +569,7 @@ impl Harness {
         let peer = Arc::new(IrqSafeSpinLock::new(peer));
         if wmm {
             peer.lock().wmm = Some(WMM.to_vec());
+            peer.lock().qos_all = qos_all;
         }
         let plan = peer.lock().plan;
         let actor = peer.clone();
@@ -1248,4 +1268,106 @@ fn smoke_rtw8852b_live_ap_edca_change_reprograms_without_reassociation() -> Test
 kernel_test_in!(
     "drivers/wireless/rtw89/wmm",
     smoke_rtw8852b_live_ap_edca_change_reprograms_without_reassociation
+);
+
+/// Mark an Ethernet/IPv4 frame with `dscp` and refresh the header checksum.
+fn with_dscp(mut frame: Vec<u8>, dscp: u8) -> Vec<u8> {
+    frame[15] = dscp << 2;
+    frame[24] = 0;
+    frame[25] = 0;
+    let mut sum = 0u32;
+    for chunk in frame[14..34].chunks(2) {
+        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    }
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    frame[24..26].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    frame
+}
+fn smoke_rtw8852b_all_ac_qos_routes_tids_to_ach_rings_with_strict_priority() -> TestResult {
+    for protected in [false, true] {
+        let h = Harness::build(protected, true, true, None);
+        if h.join().is_err() {
+            return TestResult::Fail("all-AC QoS association failed");
+        }
+        let ip = |port: u16, dscp: u8| {
+            with_dscp(
+                udp_ipv4(AP, OWN, h.plan.lease_ip, h.plan.server_ip, port, 9, b"qos"),
+                dscp,
+            )
+        };
+        // EF (DSCP46) -> UP6 -> VO/ACH3 with QSEL3.
+        let voice = ip(1000, 46);
+        if narf_net::iface::send_on(h.device.name(), &voice).is_err() {
+            return TestResult::Fail("VO publish refused");
+        }
+        h.pump();
+        let last = h.model(|io| io.packets.last.map(|s| s.channel));
+        if h.peer.lock().uplink.last() != Some(&voice)
+            || h.peer.lock().tids.last() != Some(&6)
+            || last != Some(3)
+        {
+            return TestResult::Fail("EF frame not sent as TID6 on ACH3");
+        }
+        // Queue BK (CS1), BE (DF) and VI (AF41) before the worker runs: the
+        // host scheduler serves VI, BE, BK in strict AC priority.
+        let background = ip(1001, 8);
+        let best = ip(1002, 0);
+        let video = ip(1003, 34);
+        for frame in [&background, &best, &video] {
+            if narf_net::iface::send_on(h.device.name(), frame).is_err() {
+                return TestResult::Fail("queued publish refused");
+            }
+        }
+        h.pump();
+        let (uplink, tids) = {
+            let peer = h.peer.lock();
+            (peer.uplink.clone(), peer.tids.clone())
+        };
+        let tail = uplink.get(uplink.len().saturating_sub(3)..).unwrap_or(&[]);
+        if tail != [video.clone(), best.clone(), background.clone()]
+            || tids.get(tids.len().saturating_sub(3)..) != Some(&[4, 0, 1][..])
+        {
+            return TestResult::Fail("strict AC priority or TID mapping differs");
+        }
+        if !protected {
+            // RX on a non-zero TID is delivered (per-TID QoS header).
+            let reply = udp_ipv4(OWN, AP, h.plan.server_ip, h.plan.lease_ip, 9, 1003, b"vi");
+            let Ok(mut wire) = h.peer.lock().downlink(&reply) else {
+                return TestResult::Fail("fixture downlink failed");
+            };
+            wire[24] = 5;
+            if h.model(|io| io.packets.inject(&wire)).is_err() {
+                return TestResult::Fail("fixture injection failed");
+            }
+            h.pump();
+            if h.received() != vec![reply] {
+                return TestResult::Fail("TID5 downlink not delivered");
+            }
+        }
+    }
+    // Without the signed all-AC program, EF stays on BE/TID0 (flags7 recipe).
+    let h = Harness::profile(false, true);
+    if h.join().is_err() {
+        return TestResult::Fail("WMM-only association failed");
+    }
+    let voice = with_dscp(
+        udp_ipv4(AP, OWN, h.plan.lease_ip, h.plan.server_ip, 1, 9, b"qos"),
+        46,
+    );
+    if narf_net::iface::send_on(h.device.name(), &voice).is_err() {
+        return TestResult::Fail("WMM-only publish refused");
+    }
+    h.pump();
+    if h.peer.lock().tids.last() != Some(&0)
+        || h.model(|io| io.packets.last.map(|s| s.channel)) != Some(0)
+    {
+        return TestResult::Fail("WMM-only recipe left BE/TID0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/wmm",
+    smoke_rtw8852b_all_ac_qos_routes_tids_to_ach_rings_with_strict_priority
 );

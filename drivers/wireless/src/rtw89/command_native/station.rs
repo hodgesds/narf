@@ -82,7 +82,8 @@ impl Native {
             return Err(packet::Error::State);
         }
         self.ordinary_current()?;
-        let core = packet::Core::prepare(&mut self.station_access(), own, macid);
+        let qos_all = self.station_qos_all_allowed().unwrap_or(false);
+        let core = packet::Core::prepare_with(&mut self.station_access(), own, macid, qos_all);
         match core {
             Ok(core) => {
                 self.station_runtime.core = Some(core);
@@ -387,7 +388,12 @@ unsafe impl packet::Port for Access<'_> {
             event: self.native.station_runtime.backlog.pop_front(),
         })
     }
-    fn start(&mut self) -> Result<(), packet::Error> {
+    fn start(&mut self, open: u32) -> Result<(), packet::Error> {
+        if open & !crate::rtw89::packet_format::STOP_ALL != 0
+            || open & ORDINARY_STOP != ORDINARY_STOP
+        {
+            return Err(packet::Error::State);
+        }
         self.native
             .with_ordinary_current(|native| {
                 native.ordinary_current()?;
@@ -403,10 +409,10 @@ unsafe impl packet::Port for Access<'_> {
                     return Err(power::Error::Access);
                 }
                 let stopped = native.io.read32(0x1010)?;
-                if stopped == u32::MAX || stopped & ORDINARY_STOP != ORDINARY_STOP {
+                if stopped == u32::MAX || stopped & open != open {
                     return Err(power::Error::Access);
                 }
-                native.io.write32(0x1010, stopped & !ORDINARY_STOP)?;
+                native.io.write32(0x1010, stopped & !open)?;
                 native.ordinary_current()?;
                 let functions = native.io.read32(0xc000)?;
                 if functions == u32::MAX {
@@ -432,13 +438,16 @@ unsafe impl packet::Port for Access<'_> {
             if v == u32::MAX {
                 return Err(power::Error::Gone);
             }
-            self.native.io.write32(0x1010, v | ORDINARY_STOP)
+            self.native
+                .io
+                .write32(0x1010, v | crate::rtw89::packet_format::STOP_ALL)
         });
         self.native.station_runtime.started = false;
         cmac?;
         dma?;
         if self.native.io.read32(0xc000)? & (1 << 29) != 0
-            || self.native.io.read32(0x1010)? & ORDINARY_STOP != ORDINARY_STOP
+            || self.native.io.read32(0x1010)? & crate::rtw89::packet_format::STOP_ALL
+                != crate::rtw89::packet_format::STOP_ALL
         {
             return Err(packet::Error::Access);
         }

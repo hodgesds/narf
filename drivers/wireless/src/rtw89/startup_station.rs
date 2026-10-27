@@ -52,6 +52,10 @@ unsafe impl Io for Startup {
         self.station_allowed()?;
         self.station_native()?.station_wmm_allowed()
     }
+    fn station_qos_all_allowed(&mut self) -> Result<bool, power::Error> {
+        self.station_allowed()?;
+        self.station_native()?.station_qos_all_allowed()
+    }
     async fn station_configure_wmm(
         &mut self,
         p: narf_wireless::wmm::Parameters,

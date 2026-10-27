@@ -66,7 +66,10 @@ pub(super) unsafe trait Port: power::Io {
     fn peer_allowed(&mut self, frame: &[u8]) -> Result<(), Error>;
     fn allocate(&mut self, length: usize) -> Result<DmaBuffer, Error>;
     fn receive(&mut self) -> Result<RxStep, Error>;
-    fn start(&mut self) -> Result<(), Error>;
+    /// Clear exactly the `open` DMA stop bits (BE/MGMT/WPDMA, plus BK/VI/VO
+    /// for the all-AC program) and enable CMAC TX.
+    fn start(&mut self, open: u32) -> Result<(), Error>;
+    /// Close every ordinary stop bit (`format::STOP_ALL`) and CMAC TX.
     fn stop(&mut self) -> Result<(), Error>;
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,7 +138,9 @@ pub(super) struct Core {
     phase: Phase,
     own: [u8; 6],
     mac_id: u8,
-    rings: [Ring; 2],
+    rings: Vec<Ring>,
+    /// Stop bits of exactly the rings this owner published.
+    stop: u32,
     next_id: u64,
     pending: Option<Pending>,
     completions: VecDeque<Receipt>,
@@ -195,11 +200,25 @@ fn allocate(port: &mut impl Port, length: usize) -> Result<DmaBuffer, Error> {
 }
 impl Core {
     pub(super) fn prepare(port: &mut impl Port, own: [u8; 6], mac_id: u8) -> Result<Self, Error> {
+        Self::prepare_with(port, own, mac_id, false)
+    }
+    /// `qos_all` additionally publishes ACH1..3 (BK/VI/VO) for the separately
+    /// qualified all-AC QoS program.
+    pub(super) fn prepare_with(
+        port: &mut impl Port,
+        own: [u8; 6],
+        mac_id: u8,
+        qos_all: bool,
+    ) -> Result<Self, Error> {
         if own == [0; 6] || own[0] & 1 != 0 || mac_id != 0 {
             return Err(Error::Packet);
         }
+        let queues = format::Queue::ordinary(qos_all);
+        let stop = queues
+            .iter()
+            .fold(format::STOP_WPDMA, |mask, queue| mask | queue.stop_bit());
         port.current(|port| {
-            if port.read32(0x1010)? & STOP != STOP || port.read32(0xc000)? & (1 << 29) != 0 {
+            if port.read32(0x1010)? & stop != stop || port.read32(0xc000)? & (1 << 29) != 0 {
                 return Err(Error::State);
             }
             let mut make = |kind: format::Queue| -> Result<Ring, Error> {
@@ -216,7 +235,14 @@ impl Core {
                 phase: Phase::Prepared,
                 own,
                 mac_id,
-                rings: [make(format::Queue::Data)?, make(format::Queue::Management)?],
+                rings: {
+                    let mut rings = Vec::new();
+                    for queue in queues {
+                        rings.push(make(*queue)?);
+                    }
+                    rings
+                },
+                stop,
                 next_id: 1,
                 pending: None,
                 completions: VecDeque::new(),
@@ -248,16 +274,17 @@ impl Core {
             return Err(Error::State);
         }
         self.phase = Phase::Failed;
+        let stop = self.stop;
         let result = port.current(|port| {
             port.ordinary_allowed()?;
-            port.start()?;
-            if port.read32(0x1010)? & STOP != 0 || port.read32(0xc000)? & (1 << 29) == 0 {
+            port.start(stop)?;
+            if port.read32(0x1010)? & stop != 0 || port.read32(0xc000)? & (1 << 29) == 0 {
                 return Err(Error::State);
             }
             port.ordinary_allowed()
         });
         if let Err(error) = result {
-            let _ = Self::close_dma(port);
+            let _ = Self::close_dma(port, stop);
             return Err(error);
         }
         self.phase = Phase::Running;
@@ -299,7 +326,11 @@ impl Core {
                 id,
                 length: bytes.len(),
             };
-            let ring = &mut self.rings[kind.slot()];
+            let ring = self
+                .rings
+                .iter_mut()
+                .find(|ring| ring.kind == kind)
+                .ok_or(Error::Packet)?;
             let ticket = ring
                 .queue
                 .reserve(packet, self.mac_id, kind.qsel())
@@ -370,9 +401,13 @@ impl Core {
         });
         if result.is_err() {
             self.phase = Phase::Failed;
-            let _ = Self::close_dma(port);
+            let _ = Self::close_dma(port, self.stop);
         }
         result
+    }
+    /// Whether this owner published the ring for `queue`.
+    pub(super) fn has_queue(&self, queue: format::Queue) -> bool {
+        self.rings.iter().any(|ring| ring.kind == queue)
     }
     fn completed(&mut self, completion: tx_transport::Completion<Packet>) -> Result<(), Error> {
         // All non-success release statuses are terminal; ownership is no longer
@@ -429,7 +464,12 @@ impl Core {
                         return Err(Error::Packet);
                     }
                     pending.report = true;
-                    let ring = &mut self.rings[pending.queue.slot()];
+                    let queue = pending.queue;
+                    let ring = self
+                        .rings
+                        .iter_mut()
+                        .find(|ring| ring.kind == queue)
+                        .ok_or(Error::Packet)?;
                     if let Some(completion) = ring.queue.observe_report(report)? {
                         self.completed(completion)?;
                     }
@@ -471,19 +511,19 @@ impl Core {
             });
         if result.is_err() {
             self.phase = Phase::Failed;
-            let _ = Self::close_dma(port);
+            let _ = Self::close_dma(port, self.stop);
         }
         result
     }
     pub(super) fn stop(&mut self, port: &mut impl Port) -> Result<(), Error> {
         self.phase = Phase::Stopped;
         // Keep published descriptors AND packets regardless of stop readback.
-        Self::close_dma(port)
+        Self::close_dma(port, self.stop)
     }
-    fn close_dma(port: &mut impl Port) -> Result<(), Error> {
+    fn close_dma(port: &mut impl Port, stop: u32) -> Result<(), Error> {
         port.current(|port| {
             port.stop()?;
-            if port.read32(0x1010)? & STOP != STOP || port.read32(0xc000)? & (1 << 29) != 0 {
+            if port.read32(0x1010)? & stop != stop || port.read32(0xc000)? & (1 << 29) != 0 {
                 return Err(Error::Access);
             }
             Ok(())

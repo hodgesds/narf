@@ -101,6 +101,17 @@ impl Bootstrap {
                     request.name(),
                     digest
                 );
+                if let Some(identity) = request.qos_digest() {
+                    let mut digest = String::with_capacity(64);
+                    for byte in identity {
+                        let _ = write!(&mut digest, "{byte:02x}");
+                    }
+                    narf_console::klog!(
+                        "rtw8852b: optional all-AC QoS qualification {} flags=15 identity={}\n",
+                        request.name(),
+                        digest
+                    );
+                }
                 if let Some(identity) = request.wmm_digest() {
                     let mut digest = String::with_capacity(64);
                     for byte in identity {

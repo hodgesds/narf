@@ -438,3 +438,69 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_full_radio_publication_runs_inside_current_signed_scope
 );
+
+fn smoke_rtw8852b_operating_programs_each_require_their_own_signed_identity() -> TestResult {
+    let base = board();
+    let cap = authority();
+    // Unknown bits, missing base bits and QosAll without WMM are rejected.
+    for flags in [1u8, 11, 0x13, 0x83] {
+        if Program::valid(flags) {
+            return TestResult::Fail("invalid program flag combination accepted");
+        }
+    }
+    if !Program::valid(3) || !Program::valid(7) || !Program::valid(15) {
+        return TestResult::Fail("valid program flags rejected");
+    }
+    if Program::QosAll.flags() != 15 || Program::Wmm.flags() != 7 {
+        return TestResult::Fail("program flag bytes differ");
+    }
+    // WMM identity is unchanged by the generalization (frozen chain).
+    let mut wmm = narf_crypto::sha256::Sha256::new();
+    wmm.update(b"NARF RTL8852B WMM BE/TID0 legacy12 optional operating recipe v2");
+    wmm.update(&base.identity());
+    wmm.update(&super::super::station_control::wmm_fingerprint());
+    if base.wmm().identity() != wmm.finalize() {
+        return TestResult::Fail("WMM recipe identity changed");
+    }
+    let qos = base.with_programs(15);
+    if qos.identity() == base.wmm().identity() || qos.identity() == base.identity() {
+        return TestResult::Fail("all-AC program shares an existing identity");
+    }
+    // A flags7 record cannot be promoted to 15, and a 15 record needs the
+    // chained identity.
+    let mut bytes = image(base.wmm());
+    bytes[57] = 15;
+    if Qualification::from_verified(&bytes, Some([3; 32]), base, cap).is_ok() {
+        return TestResult::Fail("WMM record promoted to all-AC QoS");
+    }
+    let mut bytes = image(qos);
+    bytes[57] = 15;
+    let Ok(mut granted) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
+        return TestResult::Fail("genuine all-AC record rejected");
+    };
+    granted.model_domain = Some(domain());
+    if granted.allows(Program::QosAll) != Ok(true)
+        || granted.wmm_allowed() != Ok(true)
+        || !granted.matches(base)
+    {
+        return TestResult::Fail("all-AC record did not grant its programs");
+    }
+    let mut bytes = image(base.wmm());
+    bytes[57] = 7;
+    let Ok(mut wmm_only) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
+        return TestResult::Fail("WMM record rejected");
+    };
+    wmm_only.model_domain = Some(domain());
+    if wmm_only.allows(Program::QosAll) != Ok(false) {
+        return TestResult::Fail("WMM record granted all-AC QoS");
+    }
+    cap.revoke();
+    if granted.allows(Program::QosAll).is_ok() {
+        return TestResult::Fail("revoked record still grants all-AC QoS");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/radio",
+    smoke_rtw8852b_operating_programs_each_require_their_own_signed_identity
+);

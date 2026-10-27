@@ -21,10 +21,41 @@ struct Rings {
     rx: narf_ipc::Producer<Frame, RX_RING_N>,
     tx: narf_ipc::Consumer<Frame, TX_RING_N>,
     pending: Option<Frame>,
+    /// Per-AC host backlog in `qos::Ac` order (VO, VI, BE, BK).
+    backlog: [alloc::collections::VecDeque<Frame>; 4],
 }
+/// Frames pulled from the stack ring into the per-AC backlog per pass.
+const BACKLOG: usize = 16;
 impl Rings {
+    /// Strict-priority service (all-AC program): refill the bounded backlog
+    /// from the stack ring, then hand out the oldest frame of the highest
+    /// non-empty AC. Without the program every frame is BE (FIFO).
+    fn next(&mut self, local: [u8; 6], qos_all: bool) -> Option<Frame> {
+        let mut queued: usize = self.backlog.iter().map(|q| q.len()).sum();
+        while queued < BACKLOG {
+            let Ok(Some(frame)) = self.tx.try_recv() else {
+                break;
+            };
+            if !station::admitted(frame.payload(), local) || !offloads(frame.tx_meta()) {
+                continue;
+            }
+            let ac = if qos_all {
+                super::qos::Ac::of(super::qos::classify(frame.payload()))
+            } else {
+                super::qos::Ac::BestEffort
+            };
+            self.backlog[ac as usize].push_back(frame);
+            queued += 1;
+        }
+        super::qos::Ac::ORDER
+            .iter()
+            .find_map(|ac| self.backlog[*ac as usize].pop_front())
+    }
     fn clear(&mut self) {
         self.pending = None;
+        for queue in &mut self.backlog {
+            queue.clear();
+        }
         for _ in 0..TX_RING_N {
             if !matches!(self.tx.try_recv(), Ok(Some(_))) {
                 break;
@@ -104,6 +135,7 @@ impl<I: Io + 'static> Device<I> {
                 rx,
                 tx,
                 pending: None,
+                backlog: Default::default(),
             }),
             name: name.into(),
             local,
@@ -319,15 +351,7 @@ impl<I: Io + 'static> Device<I> {
                 return Ok(frames);
             }
             if rings.pending.is_none() {
-                for _ in 0..16 {
-                    let Ok(Some(frame)) = rings.tx.try_recv() else {
-                        break;
-                    };
-                    if station::admitted(frame.payload(), self.local) && offloads(frame.tx_meta()) {
-                        rings.pending = Some(frame);
-                        break;
-                    }
-                }
+                rings.pending = rings.next(self.local, owner.station_qos_all());
             }
             if owner.station_ready() {
                 if let Some(frame) = rings.pending.as_ref() {

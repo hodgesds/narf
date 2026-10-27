@@ -12,31 +12,75 @@ pub(super) const DEPTH: u16 = 256;
 pub(super) const IDENTITIES: u16 = 512;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Queue {
+    /// Best effort, ACH0 / `RTW89_TX_QSEL_BE_0`.
     Data,
+    /// Band0 management, CH8 / `RTW89_TX_QSEL_B0_MGMT`.
     Management,
+    /// Background, ACH1 / `RTW89_TX_QSEL_BK_0`.
+    Background,
+    /// Video, ACH2 / `RTW89_TX_QSEL_VI_0`.
+    Video,
+    /// Voice, ACH3 / `RTW89_TX_QSEL_VO_0`.
+    Voice,
 }
 impl Queue {
+    /// `rtw89_core_get_qsel` + `rtw89_core_get_ch_dma` for a QoS TID.
+    pub(super) fn for_tid(tid: u8) -> Self {
+        match super::qos::Ac::of(tid) {
+            super::qos::Ac::BestEffort => Self::Data,
+            super::qos::Ac::Background => Self::Background,
+            super::qos::Ac::Video => Self::Video,
+            super::qos::Ac::Voice => Self::Voice,
+        }
+    }
     pub(super) fn channel(self) -> u8 {
         match self {
             Self::Data => 0,
+            Self::Background => 1,
+            Self::Video => 2,
+            Self::Voice => 3,
             Self::Management => 8,
         }
     }
     pub(super) fn qsel(self) -> u8 {
         match self {
             Self::Data => 0,
+            Self::Background => 1,
+            Self::Video => 2,
+            Self::Voice => 3,
             Self::Management => 0x12,
         }
     }
     pub(super) fn regs(self) -> dma::TxRingRegs {
         dma::addr_set_for_chip(ChipId::Rtl8852B).tx[self.channel() as usize]
     }
-    pub(super) fn slot(self) -> usize {
-        match self {
-            Self::Data => 0,
-            Self::Management => 1,
+    /// `R_AX_PCIE_DMA_STOP1` bit for this channel (`B_AX_STOP_ACHn`/`CH8`).
+    pub(super) fn stop_bit(self) -> u32 {
+        1 << (8 + u32::from(self.channel()))
+    }
+    /// Ordinary rings: BE/MGMT always, BK/VI/VO only for the separately
+    /// qualified all-AC QoS program.
+    pub(super) fn ordinary(qos_all: bool) -> &'static [Self] {
+        if qos_all {
+            &[
+                Self::Data,
+                Self::Management,
+                Self::Background,
+                Self::Video,
+                Self::Voice,
+            ]
+        } else {
+            &[Self::Data, Self::Management]
         }
     }
+}
+/// `B_AX_STOP_WPDMA`.
+pub(super) const STOP_WPDMA: u32 = 1 << 19;
+/// Every ordinary TX stop bit this station can open (ACH0..3, CH8, WPDMA).
+pub(super) const STOP_ALL: u32 = 0xf00 | 1 << 16 | STOP_WPDMA;
+/// QoS TID of a QoS DATA header, if any.
+pub(super) fn qos_tid(frame: &[u8]) -> Option<u8> {
+    (frame.first() == Some(&0x88)).then(|| frame.get(24).map(|b| b & 0x0f))?
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Error {
@@ -61,11 +105,13 @@ pub(super) fn classify(frame: &[u8], own: [u8; 6]) -> Result<Queue, Error> {
         // One non-QoS three-address station. Optional modes are not admitted.
         0x00 | 0xb0 | 0xa0 | 0xc0 if frame[1] & (3 | 64) == 0 => Ok(Queue::Management),
         0x08 if frame[1] & 3 == 1 && unicast(&frame[4..10]) => Ok(Queue::Data),
+        // QoS DATA: TID0..7, normal ack policy, no EOSP/A-MSDU/TXOP bits.
         0x88 if frame[1] & 3 == 1
             && unicast(&frame[4..10])
-            && frame.get(24..26) == Some(&[0, 0]) =>
+            && frame.get(24).is_some_and(|b| b & 0xf8 == 0)
+            && frame.get(25) == Some(&0) =>
         {
-            Ok(Queue::Data)
+            Ok(Queue::for_tid(frame[24]))
         }
         _ => Err(Error::Frame),
     }
@@ -129,6 +175,11 @@ pub(super) fn transmit_rate(
     bytes[..24].copy_from_slice(&baseline[..24]);
     bytes[48..].copy_from_slice(&baseline[24..]);
     let body0 = u32::from_le_bytes(bytes[..4].try_into().map_err(|_| Error::Metadata)?);
+    // RTW89_TXWD_BODY2_TID_INDICATE from rtw89_core_get_tid_indicate.
+    if qos_tid(frame).is_some_and(super::qos::tid_indicate) {
+        let body2 = u32::from_le_bytes(bytes[8..12].try_into().map_err(|_| Error::Metadata)?);
+        put(&mut bytes, 8, body2 | 1 << 23);
+    }
     // Linux management uses hardware SSN selector1/mode1. Non-QoS data
     // retains the supplied host sequence; neither enables hardware crypto.
     put(

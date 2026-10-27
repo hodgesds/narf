@@ -20,6 +20,7 @@ pub(in crate::rtw89) struct QualificationRequest {
     mac: [u8; 6],
     digest: [u8; 32],
     wmm_digest: Option<[u8; 32]>,
+    qos_digest: Option<[u8; 32]>,
 }
 impl QualificationRequest {
     pub(in crate::rtw89) fn version(&self) -> u8 {
@@ -33,6 +34,10 @@ impl QualificationRequest {
     }
     pub(in crate::rtw89) fn wmm_digest(&self) -> Option<[u8; 32]> {
         self.wmm_digest
+    }
+    /// Identity for flags15 (all-AC QoS on top of WMM).
+    pub(in crate::rtw89) fn qos_digest(&self) -> Option<[u8; 32]> {
+        self.qos_digest
     }
     pub(in crate::rtw89) fn name(&self) -> alloc::string::String {
         let m = self.mac;
@@ -108,9 +113,34 @@ impl Native {
                 } else {
                     None
                 },
+                qos_digest: if full {
+                    let power =
+                        radio_power::Plan::from_assets(assets, identity.calibration().rfe_type)
+                            .map_err(denied)?;
+                    Some(
+                        radio_policy::Board::new(
+                            factory,
+                            self.device.id,
+                            assets,
+                            &power,
+                            self.firmware_phycap().ok_or(power::Error::Unsupported)?,
+                        )
+                        .map_err(denied)?
+                        .with_programs(radio_policy::Program::QosAll.flags())
+                        .identity(),
+                    )
+                } else {
+                    None
+                },
             })
         })
         .map_err(denied)?
+    }
+    pub(in crate::rtw89) fn station_qos_all_allowed(&self) -> Result<bool, power::Error> {
+        self.full_radio_scope()
+            .ok_or(power::Error::Unsupported)?
+            .allows(radio_policy::Program::QosAll)
+            .map_err(denied)
     }
     pub(in crate::rtw89) fn station_wmm_allowed(&self) -> Result<bool, power::Error> {
         self.full_radio_scope()

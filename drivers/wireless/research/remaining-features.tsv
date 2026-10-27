@@ -307,7 +307,6 @@ rtw89	multiple_live_functions	Multiple live PCI functions	feature	drivers/wirele
 rtw89	nhm_diagnostics	Noise-histogram/CLM/FAHM environment monitoring	feature	drivers/wireless/specification/rtw89.md	1039
 rtw89	operating_reset	Automatic reset of an operating retained owner	feature	drivers/wireless/specification/rtw89.md	1009
 rtw89	pmf	Protected management frames (hardware unicast encryption on RTL8852C/RTL8922A, host on RTL8852B)	feature	drivers/wireless/specification/rtw89.md	1041
-rtw89	qos_all_tid_routing	QoS packet scheduling across all supported TIDs	feature	drivers/wireless/specification/rtw89.md	1015
 rtw89	randomized_scan_mac	Randomized scan MAC address and sequence number	feature	drivers/wireless/specification/rtw89.md	1037
 rtw89	rf_power_tracking	Periodic RF calibration/power tracking	feature	drivers/wireless/specification/rtw89.md	1006
 rtw89	rtl8851b	RTL8851B retained runtime including exact secure-policy loading	chip	drivers/wireless/specification/rtw89.md	1017
@@ -321,11 +320,9 @@ rtw89	scan_dwell_control	Requested per-channel scan dwell control	feature	driver
 rtw89	scan_probe_extra_ies	Driver-admitted extra probe-request IEs	feature	drivers/wireless/specification/rtw89.md	1037
 rtw89	six_ghz_operation	6GHz band operation on RTL8852C/RTL8922A	feature	drivers/wireless/specification/rtw89.md	1013
 rtw89	system_suspend	System suspend	feature	drivers/wireless/specification/rtw89.md	1009
-rtw89	traffic_priority_scheduling	Traffic priority scheduling	feature	drivers/wireless/specification/rtw89.md	933
 rtw89	tspec	TSPEC/WMM admission control (mac80211-owned host MLME)	feature	drivers/wireless/specification/rtw89.md	1044
 rtw89	uapsd	U-APSD	feature	drivers/wireless/specification/rtw89.md	933
 rtw89	wide_channels	HT40/80MHz widths on all AX chips and 160MHz on RTL8852C/RTL8922A	feature	drivers/wireless/specification/rtw89.md	1035
-rtw89	wmm_all_access_categories	Packet scheduling across all WMM access categories	feature	drivers/wireless/specification/rtw89.md	1015
 rtw89	wow	Wake on Wireless	feature	drivers/wireless/specification/rtw89.md	1043
 shared	glk_membership_selector	GLK mandatory membership-selector admission; needs IEEE802.11-2020 General Link (802.11ak) bridged-link operation, which has no open reference implementation (mac80211 also refuses it)	feature	wireless/specification/spec.md	158
 shared	mlo_station_association	Single-link MLD (Basic Multi-Link) station association in JoinPlan with MLD addressing and MLO key delivery; required before JoinPlan can negotiate UHR (P802.11bn)	feature	wireless/specification/spec.md	249

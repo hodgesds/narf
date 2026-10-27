@@ -606,6 +606,15 @@ pub(super) fn wmm_fingerprint() -> [u8; 32] {
     hash.update(&narf_wireless::wmm::INFORMATION);
     hash.finalize()
 }
+/// Emitter program added by `radio_policy::Program::QosAll`.
+pub(super) fn qos_all_fingerprint() -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"B WMM all-AC v1; cfg80211_classify8021d RFC8325 DSCP; mac80211 ieee802_1d_to_ac + ACM downgrade; TID0..7 QoS raw26");
+    hash.update(b"rtw89_core_get_qsel BE0=0 BK0=1 VI0=2 VO0=3; rtw89_core_get_ch_dma ACH0..3; TXWD_BODY2 TID_INDICATE tids2,3,5,7; DMA_STOP1 ACH0..3+CH8+WPDMA");
+    hash.update(b"single in-flight host strict priority VO>VI>BE>BK; per-AC EDCA rows unchanged from WMM v2; no BA/A-MPDU");
+    hash.update(&[0, 1, 1, 0, 2, 2, 3, 3]);
+    hash.finalize()
+}
 pub(super) fn wmm_admit(p: narf_wireless::wmm::Parameters, short: bool) -> Result<(), Error> {
     codec::wmm_edca(p, short)
         .map(|_| ())

@@ -14,6 +14,65 @@ pub(super) enum Error {
     Identity,
     Policy,
 }
+/// Optional operating programs layered on the signed full-radio record.
+///
+/// Profile byte57 carries the base flags (3) plus one bit per program. Each
+/// enabled program extends the board identity in the fixed `ALL` order, so a
+/// signed record authorizes exactly the emitter programs it was measured
+/// with: enabling another program on an old record fails identity. A program
+/// may require earlier ones (all-AC QoS builds on WMM).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Program {
+    /// WMM BE/TID0 with negotiated legacy rates (recipe revision2).
+    Wmm,
+    /// All four ACs / TID0..7 on ACH0..3 with host strict-priority service.
+    QosAll,
+}
+impl Program {
+    pub(super) const ALL: [Self; 2] = [Self::Wmm, Self::QosAll];
+    pub(super) const BASE: u8 = 3;
+    pub(super) fn bit(self) -> u8 {
+        match self {
+            Self::Wmm => 1 << 2,
+            Self::QosAll => 1 << 3,
+        }
+    }
+    fn requires(self) -> u8 {
+        match self {
+            Self::Wmm => 0,
+            Self::QosAll => Self::Wmm.bit(),
+        }
+    }
+    /// Base flags plus `self` and everything it requires.
+    pub(super) fn flags(self) -> u8 {
+        Self::BASE | self.bit() | self.requires()
+    }
+    /// Valid profile flag byte: base set, only known bits, dependencies met.
+    pub(super) fn valid(flags: u8) -> bool {
+        let known = Self::ALL.iter().fold(Self::BASE, |m, p| m | p.bit());
+        flags & Self::BASE == Self::BASE
+            && flags & !known == 0
+            && Self::ALL
+                .iter()
+                .all(|p| flags & p.bit() == 0 || flags & p.requires() == p.requires())
+    }
+    fn extend(self, identity: [u8; 32]) -> [u8; 32] {
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        match self {
+            Self::Wmm => {
+                hash.update(b"NARF RTL8852B WMM BE/TID0 legacy12 optional operating recipe v2");
+                hash.update(&identity);
+                hash.update(&super::station_control::wmm_fingerprint());
+            }
+            Self::QosAll => {
+                hash.update(b"NARF RTL8852B WMM all-AC TID0..7 optional operating recipe v1");
+                hash.update(&identity);
+                hash.update(&super::station_control::qos_all_fingerprint());
+            }
+        }
+        hash.finalize()
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Board {
     identity: [u8; 32],
@@ -65,12 +124,16 @@ impl Board {
     pub fn identity(&self) -> [u8; 32] {
         self.identity
     }
-    pub(super) fn wmm(mut self) -> Self {
-        let mut hash = narf_crypto::sha256::Sha256::new();
-        hash.update(b"NARF RTL8852B WMM BE/TID0 legacy12 optional operating recipe v2");
-        hash.update(&self.identity);
-        hash.update(&super::station_control::wmm_fingerprint());
-        self.identity = hash.finalize();
+    pub(super) fn wmm(self) -> Self {
+        self.with_programs(Program::Wmm.flags())
+    }
+    /// Extend the identity by every program enabled in `flags`.
+    pub(super) fn with_programs(mut self, flags: u8) -> Self {
+        for program in Program::ALL {
+            if flags & program.bit() != 0 {
+                self.identity = program.extend(self.identity);
+            }
+        }
         self
     }
 }
@@ -88,6 +151,7 @@ pub(super) struct Qualification {
     ceiling_qdbm: i16,
     peaks_qdbm: [i16; 3],
     wmm: bool,
+    flags: u8,
     #[cfg(any(test, feature = "kernel-test"))]
     model_domain: Option<narf_wireless::reg::RegulatoryDomain>,
     #[cfg(any(test, feature = "kernel-test"))]
@@ -135,13 +199,14 @@ impl Qualification {
             || bytes[12..14] != 0x10ecu16.to_le_bytes()
             || bytes[14..16] != board.device.to_le_bytes()
             || bytes[54..57] != [1, 20, 1]
-            || !matches!(bytes[57], 3 | 7)
+            || !Program::valid(bytes[57])
             || bytes[68..] != [0; 60]
         {
             return Err(Error::Format);
         }
-        let wmm = bytes[57] == 7;
-        let board = if wmm { board.wmm() } else { board };
+        let flags = bytes[57];
+        let wmm = flags & Program::Wmm.bit() != 0;
+        let board = board.with_programs(flags);
         if bytes[16..48] != board.identity || bytes[48..54] != board.mac {
             return Err(Error::Identity);
         }
@@ -162,6 +227,7 @@ impl Qualification {
             ceiling_qdbm,
             peaks_qdbm,
             wmm,
+            flags,
             #[cfg(any(test, feature = "kernel-test"))]
             model_domain: None,
             #[cfg(any(test, feature = "kernel-test"))]
@@ -169,7 +235,12 @@ impl Qualification {
         })
     }
     pub fn matches(&self, board: Board) -> bool {
-        self.board == if self.wmm { board.wmm() } else { board }
+        self.board == board.with_programs(self.flags)
+    }
+    /// Current signed authorization for one optional operating program.
+    pub(super) fn allows(&self, program: Program) -> Result<bool, Error> {
+        self.current()?;
+        Ok(self.flags & program.bit() != 0)
     }
     pub(super) fn wmm_allowed(&self) -> Result<bool, Error> {
         self.current()?;

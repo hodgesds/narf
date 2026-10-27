@@ -90,6 +90,11 @@ impl<I: Io> Owner<I> {
         self.io.irq_rearm().map_err(super::station::Error::Native)?;
         Ok(frames)
     }
+    pub(super) fn station_qos_all(&self) -> bool {
+        self.station
+            .as_ref()
+            .is_some_and(super::station::State::qos_all)
+    }
     pub(super) fn station_edca_pending(&self) -> bool {
         self.station
             .as_ref()

@@ -85,7 +85,7 @@ impl Model {
             ))
         };
         let mut registers = vec![0; 65536];
-        registers[0x1010..0x1014].copy_from_slice(&STOP.to_le_bytes());
+        registers[0x1010..0x1014].copy_from_slice(&format::STOP_ALL.to_le_bytes());
         Self {
             registers,
             regions: Vec::new(),
@@ -206,11 +206,16 @@ impl Model {
         Ok(())
     }
     pub(in crate::rtw89) fn consumed(&mut self, submission: Submission) {
-        let queue = if submission.channel == 0 {
-            format::Queue::Data
-        } else {
-            format::Queue::Management
-        };
+        let queue = [
+            format::Queue::Data,
+            format::Queue::Management,
+            format::Queue::Background,
+            format::Queue::Video,
+            format::Queue::Voice,
+        ]
+        .into_iter()
+        .find(|queue| queue.channel() == submission.channel)
+        .unwrap_or(format::Queue::Management);
         let index = queue.regs().idx as u32;
         self.put(
             index,
@@ -256,7 +261,19 @@ impl Model {
         // Decode independently from the descriptor: the raw QoS data header
         // contributes its two actual control bytes to ieee80211_hdrlen/2.
         let header_words = if body[0] & 0xfc == 0x88 {
-            if kind != format::Queue::Data || body.get(24..26) != Some(&[0, 0]) {
+            // Independent decode of the QoS TID -> AC -> ACH mapping.
+            let tid = body.get(24).copied().ok_or(Error::Packet)?;
+            let expected = match tid {
+                0 | 3 => format::Queue::Data,
+                1 | 2 => format::Queue::Background,
+                4 | 5 => format::Queue::Video,
+                6 | 7 => format::Queue::Voice,
+                _ => return Err(Error::Packet),
+            };
+            if kind != expected
+                || body.get(25) != Some(&0)
+                || (word(8) >> 23 & 1 == 1) != matches!(tid, 2 | 3 | 5 | 7)
+            {
                 return Err(Error::Packet);
             }
             13
@@ -276,6 +293,7 @@ impl Model {
         if word(0) != expected0
             || word(4) != 0
             || word(8) >> 24 != 0
+            || body[0] != 0x88 && word(8) >> 23 & 1 != 0
             || word(8) >> 17 & 0x3f != u32::from(kind.qsel())
             || header[16..24] != [0; 8]
             || word(24) & !(0x1ff << 16) != 1 << 30 | 1 << 10
@@ -363,7 +381,13 @@ impl power::Io for Model {
             self.registers[address as usize..address as usize + 2]
                 .copy_from_slice(&value.to_le_bytes());
         }
-        for kind in [format::Queue::Data, format::Queue::Management] {
+        for kind in [
+            format::Queue::Data,
+            format::Queue::Management,
+            format::Queue::Background,
+            format::Queue::Video,
+            format::Queue::Voice,
+        ] {
             if kind.regs().idx == u64::from(address) && !self.ignore {
                 self.doorbell(kind, value, previous)
                     .map_err(|_| power::Error::Access)?;
@@ -464,15 +488,18 @@ unsafe impl Port for Model {
             event,
         })
     }
-    fn start(&mut self) -> Result<(), Error> {
+    fn start(&mut self, open: u32) -> Result<(), Error> {
         self.ordinary_allowed()?;
-        self.put(0x1010, self.word(0x1010) & !STOP);
+        if open & STOP != STOP || open & !format::STOP_ALL != 0 {
+            return Err(Error::State);
+        }
+        self.put(0x1010, self.word(0x1010) & !open);
         self.put(0xc000, self.word(0xc000) | 1 << 29);
         Ok(())
     }
     fn stop(&mut self) -> Result<(), Error> {
         self.guard()?;
-        self.put(0x1010, self.word(0x1010) | STOP);
+        self.put(0x1010, self.word(0x1010) | format::STOP_ALL);
         self.put(0xc000, self.word(0xc000) & !(1 << 29));
         Ok(())
     }
@@ -719,7 +746,10 @@ fn smoke_rtw89_b_packet_rechecks_peer_rf_before_bd_and_retains_uncertain_doorbel
         return TestResult::Fail("unacknowledged actual doorbell accepted");
     }
     let pending = core.pending.as_ref().unwrap();
-    let ring = &mut core.rings[pending.queue.slot()];
+    let queue = pending.queue;
+    let Some(ring) = core.rings.iter_mut().find(|ring| ring.kind == queue) else {
+        return TestResult::Fail("pending ring missing");
+    };
     let base = ring.descriptors.as_ref().unwrap().dma_addr().raw();
     if ring.queue.write_pointer() != 1
         || ring.queue.reserved_mut(pending.ticket).is_ok()
