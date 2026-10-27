@@ -130,7 +130,11 @@ impl KeyPair {
 
 /// AES-256-CBC encrypt with a zero IV (CTAP2 PIN protocol one).
 /// `plaintext` must be a multiple of 16 bytes — padding is the
-/// caller's, per the protocol definitions that need it.
+/// caller's, per the protocol definitions that need it. CBC
+/// chains: each block is XORed with the previous *ciphertext*
+/// block (the zero IV for the first) before encryption —
+/// implemented explicitly because the `aes` crate exposes raw
+/// blocks only.
 pub fn aes256_cbc_encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
     use aes::cipher::{BlockEncrypt, KeyInit};
     use aes::Aes256;
@@ -139,9 +143,14 @@ pub fn aes256_cbc_encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, E
     }
     let cipher = Aes256::new(key.into());
     let mut out = Vec::with_capacity(plaintext.len());
+    let mut prev = [0u8; 16]; // zero IV
     for chunk in plaintext.chunks_exact(16) {
         let mut block = *aes::cipher::generic_array::GenericArray::from_slice(chunk);
+        for i in 0..16 {
+            block[i] ^= prev[i];
+        }
         cipher.encrypt_block(&mut block);
+        prev.copy_from_slice(&block);
         out.extend_from_slice(&block);
     }
     Ok(out)
@@ -258,6 +267,51 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("ctap2/crypto", smoke_aes256_cbc_sp800_38a_first_block);
+
+    fn smoke_aes256_cbc_sp800_38a_full_chain() -> TestResult {
+        // NIST SP 800-38A F.2.5 (CBC-AES256) — the FULL four-block
+        // chain. The single-block pin above cannot see chaining
+        // (block 1 is identical under ECB and zero-IV CBC); this
+        // one exists because an unchained (ECB-shaped) encrypt
+        // passed the first-block pin while garbling every later
+        // block — the failure mode that broke PIN enrollment
+        // (newPinEnc is four blocks). F.2.5's IV is folded into
+        // the first input block, so this crate's fixed zero-IV
+        // CBC must reproduce the published F.2.5 ciphertext
+        // exactly, all four blocks.
+        let key: [u8; 32] = [
+            0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe, 0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d,
+            0x77, 0x81, 0x1f, 0x35, 0x2c, 0x07, 0x3b, 0x61, 0x08, 0xd7, 0x2d, 0x98, 0x10, 0xa3,
+            0x09, 0x14, 0xdf, 0xf4,
+        ];
+        // F.2.5 plaintext blocks with IV 000102...0f XORed into
+        // block 1: 6bc1bee2... ^ 00010203... = 6bc0bce1....
+        let pt: [u8; 64] = [
+            0x6b, 0xc0, 0xbc, 0xe1, 0x2a, 0x45, 0x99, 0x91, 0xe1, 0x34, 0x74, 0x1a, 0x7f, 0x9e,
+            0x19, 0x25, 0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c, 0x9e, 0xb7, 0x6f, 0xac,
+            0x45, 0xaf, 0x8e, 0x51, 0x30, 0xc8, 0x1c, 0x46, 0xa3, 0x5c, 0xe4, 0x11, 0xe5, 0xfb,
+            0xc1, 0x19, 0x1a, 0x0a, 0x52, 0xef, 0xf6, 0x9f, 0x24, 0x45, 0xdf, 0x4f, 0x9b, 0x17,
+            0xad, 0x2b, 0x41, 0x7b, 0xe6, 0x6c, 0x37, 0x10,
+        ];
+        // F.2.5 published ciphertext, all four blocks.
+        let expect: [u8; 64] = [
+            0xf5, 0x8c, 0x4c, 0x04, 0xd6, 0xe5, 0xf1, 0xba, 0x77, 0x9e, 0xab, 0xfb, 0x5f, 0x7b,
+            0xfb, 0xd6, 0x9c, 0xfc, 0x4e, 0x96, 0x7e, 0xdb, 0x80, 0x8d, 0x67, 0x9f, 0x77, 0x7b,
+            0xc6, 0x70, 0x2c, 0x7d, 0x39, 0xf2, 0x33, 0x69, 0xa9, 0xd9, 0xba, 0xcf, 0xa5, 0x30,
+            0xe2, 0x63, 0x04, 0x23, 0x14, 0x61, 0xb2, 0xeb, 0x05, 0xe2, 0xc3, 0x9b, 0xe9, 0xfc,
+            0xda, 0x6c, 0x19, 0x07, 0x8c, 0x6a, 0x9d, 0x1b,
+        ];
+        let ct = try_ok!(aes256_cbc_encrypt(&key, &pt), "cbc encrypt 4 blocks");
+        check_eq!(
+            ct.as_slice(),
+            expect.as_slice(),
+            "AES-256 CBC full chain (F.2.5)"
+        );
+        let back = try_ok!(aes256_cbc_decrypt(&key, &ct), "cbc decrypt 4 blocks");
+        check_eq!(back.as_slice(), pt.as_slice(), "CBC 4-block round trip");
+        TestResult::Pass
+    }
+    kernel_test_in!("ctap2/crypto", smoke_aes256_cbc_sp800_38a_full_chain);
 
     fn smoke_ecdh_rfc5903_vector() -> TestResult {
         // RFC 5903 §8.1 (values as pinned by narf-crypto's own
