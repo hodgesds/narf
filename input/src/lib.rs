@@ -194,6 +194,7 @@ pub enum KeyCode {
     PreviousSong = 165,
     NextSong = 163,
     PlayPause = 164,
+    StopCd = 166,
     BrightnessDown = 224,
     BrightnessUp = 225,
     KbdIlluminationToggle = 228,
@@ -204,6 +205,7 @@ pub enum KeyCode {
     WLan = 238,
     RfKill = 247,
     TouchpadToggle = 530,
+    RotateLockToggle = 560,
     Unknown = 0xFFFF,
 }
 
@@ -351,6 +353,7 @@ impl KeyCode {
             163 => KeyCode::NextSong,
             164 => KeyCode::PlayPause,
             165 => KeyCode::PreviousSong,
+            166 => KeyCode::StopCd,
             224 => KeyCode::BrightnessDown,
             225 => KeyCode::BrightnessUp,
             228 => KeyCode::KbdIlluminationToggle,
@@ -361,6 +364,7 @@ impl KeyCode {
             238 => KeyCode::WLan,
             247 => KeyCode::RfKill,
             530 => KeyCode::TouchpadToggle,
+            560 => KeyCode::RotateLockToggle,
             _ => KeyCode::Unknown,
         }
     }
@@ -668,6 +672,51 @@ pub mod btn {
     pub const BTN_DPAD_RIGHT: u16 = 0x223;
 }
 
+/// Binary switch event for `SW_*` state changes that are neither
+/// keys nor buttons: tablet-mode and dock switches on convertibles,
+/// lid state, rfkill-all, jack insertion. Mirrors Linux evdev
+/// `EV_SW` — the payload is the switch's NEW absolute state
+/// (`on == true` means the switch is engaged: tablet mode active,
+/// docked, lid closed per the individual code's convention in
+/// [`sw`]), not an edge pulse. Producers re-report only on change;
+/// consumers that join late read the producer's cached state
+/// rather than waiting for the next edge. Consumers compare `code`
+/// against constants in [`sw`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SwitchEvent {
+    pub code: u16,
+    pub on: bool,
+}
+
+/// Linux evdev `SW_*` switch codes. Vendored from
+/// `include/uapi/linux/input-event-codes.h` (Linux UAPI, public
+/// per `LICENSES/exceptions/Linux-syscall-note`).
+pub mod sw {
+    /// Lid closed state (1 = lid closed).
+    pub const SW_LID: u16 = 0x00;
+    /// Tablet mode (1 = device folded into tablet mode; the
+    /// built-in keyboard/touchpad are expected to be ignored).
+    pub const SW_TABLET_MODE: u16 = 0x01;
+    pub const SW_HEADPHONE_INSERT: u16 = 0x02;
+    /// All radios killed (1 = rfkill engaged for every radio).
+    pub const SW_RFKILL_ALL: u16 = 0x03;
+    pub const SW_MICROPHONE_INSERT: u16 = 0x04;
+    /// Docked into a docking station (1 = docked).
+    pub const SW_DOCK: u16 = 0x05;
+    pub const SW_LINEOUT_INSERT: u16 = 0x06;
+    pub const SW_JACK_PHYSICAL_INSERT: u16 = 0x07;
+    pub const SW_VIDEOOUT_INSERT: u16 = 0x08;
+    pub const SW_CAMERA_LENS_COVER: u16 = 0x09;
+    pub const SW_KEYPAD_SLIDE: u16 = 0x0A;
+    pub const SW_FRONT_PROXIMITY: u16 = 0x0B;
+    /// Rotation lock engaged (1 = display rotation locked).
+    pub const SW_ROTATE_LOCK: u16 = 0x0C;
+    pub const SW_LINEIN_INSERT: u16 = 0x0D;
+    pub const SW_MUTE_DEVICE: u16 = 0x0E;
+    pub const SW_PEN_INSERTED: u16 = 0x0F;
+    pub const SW_MAX: u16 = 0x10;
+}
+
 /// Per-axis bounds + filter parameters. Drivers cache one of these
 /// per `ABS_*` axis the device exposes; consumers (tablet cursors,
 /// joystick stick mappers) use them to normalise raw
@@ -771,6 +820,7 @@ pub enum InputEvent {
     Absolute(AbsoluteEvent),
     Touch(TouchEvent),
     Button(ButtonEvent),
+    Switch(SwitchEvent),
     /// Raw ASCII / control byte from a character-oriented source
     /// (UART, virtio-console, ...). Producers that already speak
     /// in terms of bytes (rather than scancodes + modifiers) push
@@ -876,6 +926,7 @@ static BYTE_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None
 static ABSOLUTE_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
 static TOUCH_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
 static BUTTON_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
+static SWITCH_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
 
 /// Single waker slot for the `WaitAsciiByteFuture`. There is at most one
 /// console reader blocked on stdin at any time (NARF's shell is single-
@@ -912,12 +963,13 @@ fn ring_for(ev: &InputEvent) -> &'static IrqSafeSpinLock<Option<EventRing>> {
         InputEvent::Absolute(_) => &ABSOLUTE_RING,
         InputEvent::Touch(_) => &TOUCH_RING,
         InputEvent::Button(_) => &BUTTON_RING,
+        InputEvent::Switch(_) => &SWITCH_RING,
         InputEvent::AsciiByte(_) => &BYTE_RING,
     }
 }
 
 /// All per-class rings, in a stable iteration order.
-fn all_rings() -> [&'static IrqSafeSpinLock<Option<EventRing>>; 7] {
+fn all_rings() -> [&'static IrqSafeSpinLock<Option<EventRing>>; 8] {
     [
         &KEY_RING,
         &POINTER_RING,
@@ -925,6 +977,7 @@ fn all_rings() -> [&'static IrqSafeSpinLock<Option<EventRing>>; 7] {
         &ABSOLUTE_RING,
         &TOUCH_RING,
         &BUTTON_RING,
+        &SWITCH_RING,
         &BYTE_RING,
     ]
 }
@@ -1354,8 +1407,7 @@ pub fn pop_button() -> Option<ButtonEvent> {
 /// Generic pop — drains any non-empty ring, no ordering guarantee
 /// across classes. Kept for the boot-time diagnostic panel + a
 /// small set of tests; new consumers should use the typed
-/// variants. Order: Key → Pointer → Scroll → Absolute → Touch →
-/// AsciiByte.
+/// variants. Rings are visited in `all_rings` order.
 pub fn pop_global() -> Option<InputEvent> {
     for ring in all_rings() {
         if let Some(ev) = ring.lock().as_ref().and_then(|r| r.pop()) {

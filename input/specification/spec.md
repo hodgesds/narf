@@ -46,6 +46,13 @@ All code is derived strictly from the references below.
 ### Landed
 - `KeyEvent` / `PointerEvent` / `ScrollEvent` types + `EventRing`
   with the `narf-capabilities`-gated subscriber handle.
+- `ButtonEvent` (generic `BTN_*` codes, `btn` module) and
+  `SwitchEvent` (binary `SW_*` state changes — tablet mode, dock,
+  lid, rfkill-all; `sw` module constants and the
+  `InputEvent::Switch` variant, routed through their own
+  per-class ring). `SW_*` numbering follows the same public
+  evdev UAPI convention as the `btn` / `abs` code tables
+  (Linux UAPI, per `LICENSES/exceptions/Linux-syscall-note`).
 - `evdev` per-device publication surface: `Router::register_device`
   takes a `DeviceCaps` carrying the device's userspace-visible
   identity — `name`, `phys`, `uniq`, `InputId` (`bustype` / `vendor`
