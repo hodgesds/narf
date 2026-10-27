@@ -158,12 +158,34 @@ earlier coverage pass named them in error.
 | alderlake-s (Gen12) | 4680, 4682, 4688, 468A, 468B, 4690, 4692, 4693 |
 | raptorlake-s (Gen12) | A780, A781, A782, A783, A788, A789, A78A, A78B |
 | meteorlake (Xe-LPG) | 7D40, 7D45, 7D55, 7D60, 7DD5 |
+| arrowlake (Xe-LPG) | 7D41, 7D51, 7D67, 7DD1, B640 |
 | pantherlake (Xe3-LPG) | B080, B081, B082, B083, B084, B085, B086, B087, B08F, B090, B0A0, B0B0 |
 
 Note: pci.ids labels 46B0/46B1/46B3 as AlderLake-P silicon; the
 driver has always classified them `raptorlake-p` and the census
 pins that existing behaviour (re-classification is out of scope
 for lane 1).
+
+Arrow Lake (#1023): the five IDs classify
+`Generation::MeteorLake` under `asic: "arrowlake"` — the table
+follows the silicon, not the product name. Arrow Lake's GT is
+Xe-LPG and its display is Xe-LPD, and both Linux drivers bind
+the IDs to the Meteor Lake platform: i915
+`INTEL_ARL_IDS(INTEL_VGA_DEVICE, &mtl_info)` (`i915_pci.c`),
+xe `INTEL_ARL_IDS(..., &mtl_desc)` (`xe_pci.c`), and display
+`INTEL_ARL_IDS(INTEL_DISPLAY_DEVICE, &mtl_desc)`
+(`intel_display_device.c`), with Arrow Lake distinguished
+only as a subplatform (ARL-H = 7D51/7DD1, ARL-U = 7D41,
+ARL-S = 7D67/B640 in `include/drm/intel/pciids.h`, torvalds/linux
+master @ d135ab453a74). This is the Raptor-Lake-under-AlderLake
+pattern one generation up. B640 is in the i915 ID macros and
+current pci.ids ("Arrow Lake-H") but was absent from the
+pci.ids v2.2 extract lane 1 worked from, so it arrives with
+this lane; pci.ids and i915 disagree on B640's segment letter
+(H vs the S macro), never on the family. The
+`smoke_arrowlake_classification` fixture pins the set, the
+generation, and the no-bleed boundary against the sibling
+Meteor Lake IDs in the shared 0x7Dxx space.
 
 A single class-match backstop (`MatchKind::Class { class: 0x03,
 mask: 0xFF }`) catches every PCI VGA controller; the probe body
@@ -174,8 +196,13 @@ probe returns `NotForThisDriver` — it no longer collapses
 silently into the same `BadDevice` used for dead hardware.
 
 Display programming is gated to Gen12 (Tiger Lake / Alder Lake /
-Raptor Lake). Meteor Lake and Panther Lake rows identify and
-announce only; their display engines are tracked in #1016.
+Raptor Lake). Meteor Lake, Arrow Lake, and Panther Lake rows
+identify and announce only; their display engines are tracked
+in #1016. Because Arrow Lake shares the `MeteorLake`
+classification, it inherits whatever display disposition that
+generation carries — when #1016 opens Xe-LPG display for
+Meteor Lake, Arrow Lake takes the same path deliberately:
+Linux binds its display to the same `mtl_desc` descriptor.
 
 ## 6. Out of scope
 
@@ -185,8 +212,9 @@ announce only; their display engines are tracked in #1016.
   this driver: the codec layer is Gen12-shaped (combo-PHY DPLL,
   universal planes), so those generations would need a separate
   display model, not more table rows.
-- Arrow Lake identification (7D41 / 7D51 / 7D67 / 7DD1 in
-  pci.ids) — not yet listed; tracked as a follow-on to lane 1.
+- Arrow Lake display — identification landed (#1023, §5);
+  display support rides #1016's Xe-LPG family via the shared
+  Meteor Lake classification, not a separate Arrow Lake path.
 - Lunar Lake / Battlemage 3D — wait for PRM.
 - Discrete Arc (Alchemist / Battlemage) — could plug into the
   same code path but requires the higher Xe-HPG / Xe2-HPG PRM
