@@ -66,6 +66,9 @@ pub mod xdomain;
 #[cfg(all(feature = "builtin", target_arch = "x86_64"))]
 mod tests;
 
+#[cfg(all(feature = "builtin", feature = "kernel-test"))]
+mod dock_tests;
+
 #[cfg(feature = "module")]
 mod module_probe;
 
