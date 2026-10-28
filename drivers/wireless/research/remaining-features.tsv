@@ -165,16 +165,12 @@ mt76	noncoherent_dma	Non-coherent platform DMA support	feature	drivers/wireless/
 mt76	off_channel_active_scan	Off-channel active scanning	feature	drivers/wireless/specification/mt7921.md	1008
 mt76	other_tx_ba_tids	Transmit BA on TIDs beyond retained TID0	feature	drivers/wireless/specification/mt7921.md	1017
 mt76	p2p_mode	P2P client / GO / device roles	feature	drivers/wireless/specification/mt7921.md	1050
-mt76	pci_removal	PCI removal lifecycle	feature	drivers/wireless/specification/mt7921.md	1010
-mt76	pci_reprobe_generation	PCI reprobe with generation isolation	feature	drivers/wireless/specification/mt7921.md	1010
 mt76	per_domain_iommu	Per-domain IOMMU mappings	feature	drivers/wireless/specification/mt7921.md	1010
 mt76	pmf	Protected management frames (PMF)	feature	drivers/wireless/specification/mt7921.md	1009
 mt76	rx_ba_windows_above_64	Recipient BA windows above 64 (HE-peer only; mac80211 caps non-HE at 64)	feature	drivers/wireless/specification/mt7921.md	1057
 mt76	rx_delayed_ba	Recipient delayed BA agreements	feature	drivers/wireless/specification/mt7921.md	1067
 mt76	rx_multi_tid_ba	Recipient multi-TID BA agreements	feature	drivers/wireless/specification/mt7921.md	1067
 mt76	six_ghz_operation	6 GHz radio operation	feature	drivers/wireless/specification/mt7921.md	1009
-mt76	system_resume	System resume	feature	drivers/wireless/specification/mt7921.md	1010
-mt76	system_suspend	System suspend	feature	drivers/wireless/specification/mt7921.md	1010
 mt76	tspec	TSPEC admission	feature	drivers/wireless/specification/mt7921.md	1016
 mt76	tx_amsdu	Transmit A-MSDU	feature	drivers/wireless/specification/mt7921.md	1068
 mt76	tx_delayed_ba	Originator delayed BA agreements	feature	drivers/wireless/specification/mt7921.md	1068

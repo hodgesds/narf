@@ -32,6 +32,8 @@ pub use amsdu::Ht20ReceiveInfo;
 pub use join::to_ethernet;
 #[path = "recovery.rs"]
 mod recovery;
+#[path = "system_pm.rs"]
+mod system_pm;
 pub(super) use join::{extract_eapol, wrap_eapol_frame};
 
 #[path = "firmware_transport_hw.rs"]
@@ -39,6 +41,9 @@ mod hardware;
 pub use hardware::Transport;
 
 static BOOT_OWNER: narf_lib::mutex::Mutex<Option<Transport>> = narf_lib::mutex::Mutex::new(None);
+/// Set once the boot-time firmware initcall ran; later probes provision
+/// themselves.
+static BOOT_STARTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 // Serializes publication and initial preparation. The work itself lives in
 // KEY_WORK, so cancelling a provisioning caller never drops a started owner.
 static PROVISION: narf_lib::mutex::Mutex<()> = narf_lib::mutex::Mutex::new(());
@@ -103,9 +108,110 @@ fn poll_boot_keys(cx: &mut core::task::Context<'_>) -> Poll<Result<(), Error>> {
         return Poll::Ready(Err(Error::Ring));
     }
     let (transport, result) = work.completed.take().unwrap();
-    *owner = Some(transport);
     *slot = None;
+    let generation = transport.generation();
+    let current = super::pci::generation();
+    if generation != current {
+        drop(owner);
+        let _ = admit_completed(transport, generation, current, retire_transport);
+        return Poll::Ready(Err(Error::DeviceGone));
+    }
+    *owner = Some(transport);
     Poll::Ready(result)
+}
+
+/// Completed retained work is republished only into its own PCI binding
+/// generation. A function removed while the work owned its transport gets
+/// the removal teardown instead, never a new publication.
+fn admit_completed<T>(
+    owner: T,
+    generation: u64,
+    current: u64,
+    retire: impl FnOnce(T),
+) -> Result<T, Error> {
+    if generation == current {
+        Ok(owner)
+    } else {
+        retire(owner);
+        Err(Error::DeviceGone)
+    }
+}
+
+fn retire_transport(mut transport: Transport) {
+    let generation = transport.generation();
+    // Unproven retirement keeps the published rings forever (Retained), so
+    // a later generation's freshly programmed rings can never alias them.
+    let _ = transport.retire_removed();
+    drop(transport);
+    super::pci::release_transport_claim(generation);
+}
+
+/// Removal of binding `generation` (Linux `mt7921e_unregister_device`).
+/// Returns whether the transport is gone with its DMA retirement proven.
+/// Work in flight or a caller holding the owner keeps the transport; it is
+/// retired by a reaper as soon as it is returned, never republished.
+pub(super) fn retire_for_removal(generation: u64) -> bool {
+    let busy = KEY_WORK.try_lock().is_none_or(|work| work.is_some());
+    if !busy {
+        if let Some(mut owner) = BOOT_OWNER.try_lock() {
+            match owner.take() {
+                None => return true,
+                Some(mut transport) if transport.generation() == generation => {
+                    drop(owner);
+                    let proven = transport.retire_removed();
+                    drop(transport);
+                    return proven;
+                }
+                Some(transport) => {
+                    *owner = Some(transport);
+                    return true;
+                }
+            }
+        }
+    }
+    narf_scheduler::spawn(async move {
+        // Drive retained work to completion: its stale generation makes
+        // poll_boot_keys retire instead of republish.
+        loop {
+            let _ = finish_boot_keys().await;
+            let idle = KEY_WORK.try_lock().is_some_and(|work| work.is_none());
+            if idle {
+                let mut owner = BOOT_OWNER.lock().await;
+                if owner
+                    .as_ref()
+                    .is_some_and(|transport| transport.generation() == generation)
+                {
+                    let transport = owner.take().unwrap();
+                    drop(owner);
+                    retire_transport(transport);
+                }
+                return;
+            }
+            narf_scheduler::yield_now().await;
+        }
+    });
+    false
+}
+
+/// A probe after boot-time provisioning (hot-plug/reprobe) starts its own
+/// retried firmware provisioning on the new generation.
+pub(super) fn provision_after_reprobe() {
+    if !BOOT_STARTED.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    narf_scheduler::spawn(async {
+        use core::fmt::Write;
+        let outcome = retry_preflight_until(120, boot_status, provision_boot_radio, || {
+            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000))
+        })
+        .await;
+        let _ = writeln!(
+            narf_console::Writer,
+            "mt76: reprobe provisioning {:?}; retained {:?}",
+            outcome.map(|_| ()),
+            boot_status()
+        );
+    });
 }
 
 async fn finish_boot_keys() -> Result<(), Error> {
@@ -398,6 +504,70 @@ pub async fn recover_boot_radio(expected_mac: [u8; 6]) -> Result<(), Error> {
     reset_boot_transport(Some(expected_mac)).await
 }
 
+/// System-PM prepare phase for the retained radio. The started transition
+/// owns the transport across caller cancellation, like reset. With no
+/// claimed transport the parked PCI function has nothing to quiesce.
+pub async fn suspend_boot_radio() -> Result<(), Error> {
+    retained_owner_work(true, |mut transport| {
+        alloc::boxed::Box::pin(async move {
+            let result = transport.suspend().await;
+            (transport, result)
+        })
+    })
+    .await
+}
+
+/// Resume after [`suspend_boot_radio`]. A failed low-power exit falls back
+/// to verified reset recovery with the same identity; the station is idle.
+pub async fn resume_boot_radio(expected_mac: [u8; 6]) -> Result<(), Error> {
+    if expected_mac == [0; 6] || expected_mac[0] & 1 != 0 {
+        return Err(Error::Bounds);
+    }
+    retained_owner_work(true, move |mut transport| {
+        alloc::boxed::Box::pin(async move {
+            let result = match transport.state() {
+                State::Suspended(_) => transport.resume(expected_mac).await.map(|_| ()),
+                // A suspend that never completed left the radio usable.
+                _ => Ok(()),
+            };
+            (transport, result)
+        })
+    })
+    .await
+}
+
+async fn retained_owner_work(
+    absent_ok: bool,
+    start: impl FnOnce(Transport) -> KeyFuture<Transport>,
+) -> Result<(), Error> {
+    // An earlier failed rekey/reset reported its error; its owner returns
+    // to BOOT_OWNER before a new retained transition may start.
+    let _ = finish_boot_keys().await;
+    {
+        let Some(mut work) = KEY_WORK.try_lock() else {
+            return Err(Error::Busy);
+        };
+        if work.is_some() {
+            return Err(Error::Busy);
+        }
+        let Some(mut owner) = BOOT_OWNER.try_lock() else {
+            return Err(Error::Busy);
+        };
+        let Some(transport) = owner.take() else {
+            return if absent_ok {
+                Ok(())
+            } else {
+                Err(Error::DeviceGone)
+            };
+        };
+        *work = Some(KeyWork {
+            future: Some(start(transport)),
+            completed: None,
+        });
+    }
+    finish_boot_keys().await
+}
+
 async fn reset_boot_transport(expected_mac: Option<[u8; 6]>) -> Result<(), Error> {
     // A prior failed rekey must first return its owned transport. Its error
     // explains the closed port; reset below establishes a fresh radio state.
@@ -473,6 +643,7 @@ where
 pub(super) fn start_boot() -> narf_init::InitResult {
     use core::fmt::Write;
     use narf_init::InitResult;
+    BOOT_STARTED.store(true, core::sync::atomic::Ordering::Release);
     // Before executor polling, regular Mutex (no IRQ spinlock) retained.
     // This future is self-waking and never depends on another executor task.
     let result = narf_scheduler::block_on_spin(provision_boot_radio());
@@ -597,6 +768,8 @@ pub enum Stage {
     RecoveryReset,
     RecoveryReady,
     RecoveryRearm,
+    Suspend,
+    Resume,
     Quiesce,
     Initialize,
     DriverOwn,
@@ -645,6 +818,8 @@ pub enum State {
         channel: u8,
         aid: u16,
     },
+    /// PCIe low-power handoff completed; firmware owns LPCTL and DMA is off.
+    Suspended(RadioInfo),
     Failed {
         stage: Stage,
         error: Error,
@@ -856,6 +1031,22 @@ trait Backend {
     /// This does not prove MAC/FIFO or in-flight firmware quiescence.
     fn receive_idle(&self) -> Result<bool, Error>;
     fn release(&mut self) -> Result<(), Error>;
+    /// `mt7921_pci_suspend`: after the busy poll, clear TX/RX DMA_EN and
+    /// mask host interrupts. Ring configuration is retained for resume.
+    fn suspend_dma(&mut self) -> Result<(), Error>;
+    /// `__mt792x_mcu_fw_pmctrl`: return LPCTL ownership to firmware.
+    fn request_firmware_own(&mut self) -> Result<(), Error>;
+    fn firmware_owned(&mut self) -> Result<bool, Error>;
+    /// Restore memory decoding after a platform power transition, without
+    /// bus mastering (Linux PCI core config restore precedes driver resume).
+    fn restore_bus(&mut self) -> Result<(), Error>;
+    /// `mt792x_dma_need_reinit`: WFDMA lost `DUMMY_CR.NEED_REINIT`.
+    fn dma_needs_reinit(&mut self) -> Result<bool, Error>;
+    /// `mt792x_wpdma_reset(dev, false)`: caller proved DMA disabled and idle;
+    /// retire ring ownership and reprogram the same retained rings.
+    fn reinit_dma(&mut self) -> Result<(), Error>;
+    /// Re-enable retained rings: bus mastering then TX/RX DMA_EN.
+    fn resume_dma(&mut self) -> Result<(), Error>;
     fn park_bus_master(&mut self) -> Result<(), Error>;
     fn request_link_own(&mut self) -> Result<(), Error>;
     fn link_owned(&mut self) -> Result<bool, Error>;

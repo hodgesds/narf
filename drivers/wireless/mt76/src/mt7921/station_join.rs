@@ -1523,7 +1523,9 @@ impl<B: Backend> Session<B> {
     pub(super) async fn disassociate_station(&mut self) -> Result<(), Error> {
         let (info, peer) = match self.state {
             State::Associated { info, peer, .. } => (info, peer),
-            State::RadioReady(_) | State::ScanReady(_) | State::Stopped => return Ok(()),
+            State::RadioReady(_) | State::ScanReady(_) | State::Suspended(_) | State::Stopped => {
+                return Ok(())
+            }
             _ => return Err(Error::Busy),
         };
         self.backend.close_receive_capture(self.receive_epoch);

@@ -349,6 +349,32 @@ impl Mt76Iface {
         Ok(())
     }
 
+    /// cfg80211 `wiphy_suspend` without WoWLAN: leave the BSS (locally
+    /// generated DEAUTH_LEAVING), then the PCIe low-power handoff.
+    async fn prepare_suspend(&self) -> Result<(), WirelessError> {
+        let _control = self.control.lock().await;
+        let connected = self.associated_bssid.lock().is_some();
+        if connected {
+            self.teardown_needed.store(true, Ordering::Release);
+        }
+        self.clear_link();
+        self.scan_cache.lock().clear();
+        if connected {
+            narf_wireless::nl80211::notify_disconnect(&self.name, 3, false);
+        }
+        suspend_result(crate::mt7921::firmware_transport::suspend_boot_radio().await)?;
+        self.teardown_needed.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    async fn resume_from_suspend(&self) -> Result<(), WirelessError> {
+        let _control = self.control.lock().await;
+        suspend_result(crate::mt7921::firmware_transport::resume_boot_radio(self.mac()).await)?;
+        self.recovery_attempts.store(0, Ordering::Release);
+        self.recovery_after_ns.store(0, Ordering::Release);
+        Ok(())
+    }
+
     fn enqueue(&self, bytes: &[u8]) -> Result<(), ()> {
         if !self.link_up() || !transmit_admitted(bytes, self.mac()) {
             return Err(());
@@ -362,6 +388,50 @@ impl Mt76Iface {
             .ok_or(())?
             .try_send(Frame::new(buffer, bytes.len() as u32))
             .map_err(|_| ())
+    }
+}
+
+fn suspend_result(
+    result: Result<(), crate::mt7921::firmware_transport::Error>,
+) -> Result<(), WirelessError> {
+    use crate::mt7921::firmware_transport::Error;
+    result.map_err(|error| match error {
+        Error::Busy => WirelessError::Busy,
+        Error::Timeout => WirelessError::Timeout,
+        Error::Authority => WirelessError::Denied,
+        _ => WirelessError::HardwareError,
+    })
+}
+
+/// System-PM prepare phase (Linux `mt7921_pci_suspend` after cfg80211 and
+/// mac80211 suspend). Runs in executor context with no IRQ lock held; the
+/// started transition is retained across caller cancellation.
+pub async fn system_prepare_suspend() -> Result<(), WirelessError> {
+    let iface = ACTIVE.lock().clone();
+    match iface {
+        Some(iface) => iface.prepare_suspend().await,
+        None => suspend_result(crate::mt7921::firmware_transport::suspend_boot_radio().await),
+    }
+}
+
+/// System-PM resume phase, after synchronous device resume restored config
+/// space. The station is idle afterwards; userspace re-scans/reconnects.
+pub async fn system_resume() -> Result<(), WirelessError> {
+    let iface = ACTIVE.lock().clone();
+    match iface {
+        Some(iface) => iface.resume_from_suspend().await,
+        // A radio suspended before interface publication resumes against
+        // the identity its own owner validated at initialization.
+        None => {
+            use crate::mt7921::firmware_transport::{boot_status, BootStatus, State};
+            match boot_status() {
+                BootStatus::Retained(State::Suspended(info)) => suspend_result(
+                    crate::mt7921::firmware_transport::resume_boot_radio(info.capabilities.mac)
+                        .await,
+                ),
+                _ => Ok(()),
+            }
+        }
     }
 }
 
@@ -773,7 +843,9 @@ pub(crate) fn register_scan_iface(info: RadioInfo) -> Result<Arc<Mt76Iface>, Wir
     narf_net::iface::install_rx_drain(drain_network);
     let worker = iface.clone();
     narf_scheduler::spawn(async move {
-        loop {
+        // Removal withdraws ACTIVE; a removed generation's worker never
+        // touches a reprobed radio.
+        while is_active(&worker) {
             let _ = worker.poll_data().await;
             narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
         }
@@ -782,6 +854,28 @@ pub(crate) fn register_scan_iface(info: RadioInfo) -> Result<Arc<Mt76Iface>, Wir
 }
 
 static ACTIVE: IrqSafeSpinLock<Option<Arc<Mt76Iface>>> = IrqSafeSpinLock::new(None);
+
+/// PCI removal (Linux `mt76_unregister_device` → `ieee80211_unregister_hw`):
+/// close carrier, report the lost link, and withdraw every publication of
+/// this generation's interface. Its service worker exits on its next turn.
+/// A later probe registers a fresh interface from a fresh identity query.
+pub(crate) fn remove_scan_iface() {
+    let Some(iface) = ACTIVE.lock().take() else {
+        return;
+    };
+    iface.lose_link();
+    iface.scan_cache.lock().clear();
+    narf_wireless::registry::unregister(&iface.name);
+    narf_net::registry().unregister(&iface.name);
+    narf_net::iface::unregister(&iface.name);
+}
+
+fn is_active(iface: &Arc<Mt76Iface>) -> bool {
+    ACTIVE
+        .lock()
+        .as_ref()
+        .is_some_and(|active| Arc::ptr_eq(active, iface))
+}
 
 fn send_frame(bytes: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     let iface = ACTIVE.lock().clone().ok_or(())?;

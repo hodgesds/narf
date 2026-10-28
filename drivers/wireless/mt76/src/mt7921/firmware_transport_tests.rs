@@ -31,6 +31,8 @@ mod receive_epoch_tests;
 mod rx_ba_tests;
 #[path = "rx_fragment_tests.rs"]
 mod rx_fragment_tests;
+#[path = "system_pm_tests.rs"]
+mod system_pm_tests;
 #[path = "tx_ba_tests.rs"]
 mod tx_ba_tests;
 #[path = "tx_nss_tests.rs"]
@@ -233,6 +235,18 @@ struct Model {
     reset_asserted_at: Option<u64>,
     reset_stall: bool,
     link_stall: bool,
+    pm: PowerModel,
+}
+/// Low-power state of the model device, for system suspend/resume.
+#[derive(Debug, Default)]
+struct PowerModel {
+    trace: Vec<&'static str>,
+    dma_enabled: bool,
+    firmware_owned: bool,
+    lose_dma: bool,
+    lose_firmware: bool,
+    firmware_own_stall: bool,
+    driver_own_stall: bool,
 }
 impl Model {
     fn new() -> Self {
@@ -302,6 +316,7 @@ impl Model {
             reset_asserted_at: None,
             reset_stall: false,
             link_stall: false,
+            pm: PowerModel::default(),
         }
     }
 }
@@ -377,10 +392,13 @@ impl Backend for Model {
         Ok(())
     }
     fn request_driver_own(&mut self) -> Result<(), Error> {
+        if !self.pm.driver_own_stall {
+            self.pm.firmware_owned = false;
+        }
         Ok(())
     }
     fn driver_owned(&mut self) -> Result<bool, Error> {
-        Ok(true)
+        Ok(!self.pm.firmware_owned)
     }
     fn fw_state(&mut self) -> Result<u32, Error> {
         Ok(if self.loaded { 3 } else { 1 })
@@ -491,6 +509,7 @@ impl Backend for Model {
                 }
                 if !(cmd == 0x5c && frame[71] == 0
                     || cmd == 0x0f
+                    || cmd == 0xca
                     || cmd == 0x5d
                     || cmd == 0x1b
                     || cmd == 0x1d
@@ -570,6 +589,55 @@ impl Backend for Model {
     fn release(&mut self) -> Result<(), Error> {
         self.recovery_trace.push(("release", self.ticks.get()));
         self.owner.published = false;
+        Ok(())
+    }
+    fn suspend_dma(&mut self) -> Result<(), Error> {
+        self.check()?;
+        self.pm.trace.push("dma-off");
+        self.pm.dma_enabled = false;
+        Ok(())
+    }
+    fn request_firmware_own(&mut self) -> Result<(), Error> {
+        self.check()?;
+        self.pm.trace.push("fw-own");
+        if !self.pm.firmware_own_stall {
+            self.pm.firmware_owned = true;
+        }
+        Ok(())
+    }
+    fn firmware_owned(&mut self) -> Result<bool, Error> {
+        Ok(self.pm.firmware_owned)
+    }
+    fn restore_bus(&mut self) -> Result<(), Error> {
+        self.check()?;
+        self.pm.trace.push("bus");
+        // The platform transition happened between suspend and this call.
+        if self.pm.lose_firmware {
+            self.loaded = false;
+        }
+        Ok(())
+    }
+    fn dma_needs_reinit(&mut self) -> Result<bool, Error> {
+        Ok(self.pm.lose_dma)
+    }
+    fn reinit_dma(&mut self) -> Result<(), Error> {
+        if self.pm.dma_enabled || !self.owner.published {
+            return Err(Error::Busy);
+        }
+        self.pm.trace.push("reinit");
+        self.pm.lose_dma = false;
+        self.active = false;
+        self.replies.clear();
+        self.packets.clear();
+        self.pm.dma_enabled = true;
+        Ok(())
+    }
+    fn resume_dma(&mut self) -> Result<(), Error> {
+        if !self.owner.published {
+            return Err(Error::Busy);
+        }
+        self.pm.trace.push("dma-on");
+        self.pm.dma_enabled = true;
         Ok(())
     }
     fn park_bus_master(&mut self) -> Result<(), Error> {

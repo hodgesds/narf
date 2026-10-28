@@ -418,6 +418,19 @@ impl ActiveScan {
     }
 }
 
+/// Unassociated station `BSS_INFO_UPDATE` basic TLV. `active = false` is the
+/// first half of `mt76_connac_mcu_uni_add_dev(.., enable = false)`.
+pub(super) fn station_bss_record(active: bool) -> [u8; 36] {
+    let mut bss = [0u8; 36];
+    bss[6..8].copy_from_slice(&32u16.to_le_bytes());
+    bss[8] = u8::from(active);
+    bss[12..16].copy_from_slice(&0x10001u32.to_le_bytes()); // station/infra
+    bss[16] = 1; // initial connection state
+    bss[24..26].copy_from_slice(&19u16.to_le_bytes()); // reserved BMC WCID
+    bss[30..32].copy_from_slice(&19u16.to_le_bytes());
+    bss
+}
+
 impl<B: Backend> Session<B> {
     pub(super) async fn notify(&mut self, command: Command, body: &[u8]) -> Result<(), Error> {
         self.seq = self.seq % 15 + 1;
@@ -429,13 +442,7 @@ impl<B: Backend> Session<B> {
         super::super::cmd::encode_uni_dev_info_update(0, 0, true, info.capabilities.mac, &mut dev)
             .ok_or(Error::Bounds)?;
         self.exchange(Command::Unified { id: 1 }, &dev).await?;
-        let mut bss = [0u8; 36];
-        bss[6..8].copy_from_slice(&32u16.to_le_bytes());
-        bss[8] = 1; // active
-        bss[12..16].copy_from_slice(&0x10001u32.to_le_bytes()); // station/infra
-        bss[16] = 1; // initial connection state
-        bss[24..26].copy_from_slice(&19u16.to_le_bytes()); // reserved BMC WCID
-        bss[30..32].copy_from_slice(&19u16.to_le_bytes());
+        let bss = station_bss_record(true);
         self.exchange(Command::Unified { id: 2 }, &bss).await?;
         // Every exposed band remains NO_IR during passive scan. Association
         // installs a separate authenticated host policy before transmission.

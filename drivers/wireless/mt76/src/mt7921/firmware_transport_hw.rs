@@ -41,6 +41,17 @@ const RX_PRE: u32 = 0xd4500;
 const RX_POST: u32 = 0xd4540;
 const RX_DATA: u32 = 0xd4520;
 const TX_DATA: u32 = 0xd4300;
+/// `MT_WFDMA0_HOST_INT_DIS`.
+const HOST_INT_DIS: u32 = 0xd422c;
+/// `MT_INT_TX_DONE_ALL`: MCU WM (ENA17), FWDL (ENA16), band0 and GENMASK(18, 4).
+const INT_TX_DONE_ALL: u32 = (1 << 27) | (1 << 26) | (((1 << 15) - 1) << 4);
+/// `MT_INT_RX_DONE_ALL`: WM, WM2 and data.
+const INT_RX_DONE_ALL: u32 = 7;
+/// `MT_INT_MCU_CMD` (`MCU2HOST_SW_INT_ENA`).
+const INT_MCU_CMD: u32 = 1 << 29;
+/// `MT_WFDMA_DUMMY_CR` / `MT_WFDMA_NEED_REINIT`, set by every DMA enable.
+const WFDMA_DUMMY_CR: u32 = 0x54000120;
+const WFDMA_NEED_REINIT: u32 = 1 << 1;
 
 #[derive(Debug)]
 struct Ring {
@@ -594,6 +605,61 @@ impl Backend for Hardware {
         self.check()?;
         super::current_station_permission(permission, narf_wireless::reg::db::snapshot())
     }
+    fn suspend_dma(&mut self) -> Result<(), Error> {
+        self.update(GLOBAL, ENABLE, 0)?;
+        self.write(MT_WFDMA0_HOST_INT_ENA, 0)?;
+        self.write(
+            HOST_INT_DIS,
+            INT_TX_DONE_ALL | INT_RX_DONE_ALL | INT_MCU_CMD,
+        )?;
+        self.write(MT_PCIE_MAC_INT_ENABLE, 0)?;
+        let _ = self.read(GLOBAL)?; // push the disable before the idle poll
+        Ok(())
+    }
+    fn request_firmware_own(&mut self) -> Result<(), Error> {
+        self.write(MT_CONN_ON_LPCTL, PCIE_LPCR_HOST_SET_OWN)
+    }
+    fn firmware_owned(&mut self) -> Result<bool, Error> {
+        Ok(self.read(MT_CONN_ON_LPCTL)? & PCIE_LPCR_HOST_OWN_SYNC != 0)
+    }
+    fn restore_bus(&mut self) -> Result<(), Error> {
+        use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+        // Bus mastering returns only once retained rings are proven current.
+        let command = self.command(BUS_MASTER, MEM_SPACE | INTX_DISABLE)?;
+        if command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) != MEM_SPACE | INTX_DISABLE {
+            return Err(Error::Authority);
+        }
+        Ok(())
+    }
+    fn dma_needs_reinit(&mut self) -> Result<bool, Error> {
+        Ok(self.read(WFDMA_DUMMY_CR)? & WFDMA_NEED_REINIT == 0)
+    }
+    fn reinit_dma(&mut self) -> Result<(), Error> {
+        if !self.idle()? || self.read(GLOBAL)? & ENABLE != 0 {
+            return Err(Error::Busy);
+        }
+        // Same verified ownership sequence as reset recovery, minus WFSYS
+        // reset: unpublish, retire every slot/token, then reprogram.
+        self.release()?;
+        self.recycle()?;
+        self.initialize()
+    }
+    fn resume_dma(&mut self) -> Result<(), Error> {
+        if !self.owner.published {
+            return Err(Error::Busy);
+        }
+        use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+        if self.command(0, BUS_MASTER)? & (BUS_MASTER | MEM_SPACE | INTX_DISABLE)
+            != BUS_MASTER | MEM_SPACE | INTX_DISABLE
+        {
+            return Err(Error::Authority);
+        }
+        // The native owner is polled: host interrupt enables stay masked,
+        // exactly as initialize() leaves them.
+        self.update(GLOBAL, 0, ENABLE)?;
+        let _ = self.read(GLOBAL)?;
+        Ok(())
+    }
     fn park_bus_master(&mut self) -> Result<(), Error> {
         if self.command(narf_bus::pci::cmd::BUS_MASTER, 0)? & narf_bus::pci::cmd::BUS_MASTER != 0 {
             return Err(Error::Busy);
@@ -695,7 +761,7 @@ impl Backend for Hardware {
                 | (1 << 28)
                 | (1 << 30),
         )?;
-        self.update(0x54000120, 0, 2)?;
+        self.update(WFDMA_DUMMY_CR, 0, WFDMA_NEED_REINIT)?;
         self.update(MT_PCIE_MAC_PM, 0, MT_PCIE_MAC_PM_L0S_DIS)?;
         // All published addresses are owned and bounded before enabling DMA.
         use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
@@ -878,6 +944,8 @@ impl Backend for Hardware {
 #[derive(Debug)]
 pub struct Transport {
     session: Session<Hardware>,
+    /// PCI binding generation this transport was claimed under.
+    generation: u64,
 }
 
 #[path = "firmware_transport_hw_tests.rs"]
@@ -897,6 +965,7 @@ impl Transport {
         device: BusDevice,
         authority: Cap<BusDeviceCap, Write>,
         firmware: Firmware,
+        generation: u64,
     ) -> Result<Self, Error> {
         crate::mt7921::pci::invoke(&authority, || {
             authority.check_live().map_err(|_| Error::Authority)?;
@@ -949,6 +1018,7 @@ impl Transport {
                     },
                     firmware,
                 ),
+                generation,
             })
         })
         .map_err(|_| Error::Authority)?
@@ -1074,6 +1144,22 @@ impl Transport {
     /// Stop DMA, verify idle, clear bus mastering and retire ring bases.
     pub async fn shutdown(&mut self) -> Result<(), Error> {
         self.session.shutdown().await
+    }
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+    /// Synchronous removal teardown; true only when DMA retirement was
+    /// proven and the ring memory may be returned.
+    pub(super) fn retire_removed(&mut self) -> bool {
+        self.session.retire_removed()
+    }
+    /// PCIe low-power handoff for system suspend; leaves any association.
+    pub async fn suspend(&mut self) -> Result<(), Error> {
+        self.session.suspend().await
+    }
+    /// Leave the low-power handoff, or reset with the same identity.
+    pub async fn resume(&mut self, expected_mac: [u8; 6]) -> Result<RadioInfo, Error> {
+        self.session.resume(expected_mac).await
     }
     /// Park DMA, reset WFSYS, retire old ring ownership, and reload firmware.
     /// The caller closes carrier before awaiting. No association/key replay is
