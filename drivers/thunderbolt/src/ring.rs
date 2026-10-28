@@ -125,6 +125,21 @@ impl Ring {
     pub fn bind_authority(&mut self, cap: Cap<BusDeviceCap, Write>) {
         self.authority = Some(cap);
     }
+    /// The BAR the data rings share with ring 0 (a copy of the
+    /// mapping; the data-ring pair performs its own accesses
+    /// under the same authority).
+    pub(crate) fn bar(&self) -> MmioRegion {
+        self.bar
+    }
+    /// The NHI's hop count, bounding data-ring HopIDs.
+    pub(crate) fn hops(&self) -> u16 {
+        self.hops
+    }
+    /// The bus authority ring 0 operates under, if bound, so a
+    /// data-ring pair can be gated by the same capability.
+    pub(crate) fn authority(&self) -> Option<Cap<BusDeviceCap, Write>> {
+        self.authority
+    }
     fn write(&self, offset: u64, value: u32) {
         // SAFETY: fixed ring-zero/register offsets inside the validated BAR.
         unsafe { self.bar.write32(offset, value) };

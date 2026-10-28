@@ -73,7 +73,16 @@ such controllers; it never starts, resets, or speaks to the ICM firmware.
 - Each peer advertising the Thunderbolt networking service gets a
   netdev named `tbnet<domain>-<n>` registered with the net registry,
   carrying Ethernet frames over ThunderboltIP data frames once the
-  mutual login completes (see §8 for the data-transport binding).
+  mutual login completes and the data transport is bound (§4).
+- The tbnet data transport is bound per peer through the control
+  channel (`XdChannel::bind_data_link`): an NHI data-ring pair
+  (`dataring::DataRingPair`, frame mode, 256 descriptors of 4 KiB)
+  at HopIDs allocated per direction from the channel's
+  `HopAllocator`, plus the two host-router Hops entries of the
+  in-router DMA path. `release_data_link` disconnects the paths and
+  drops the transport when the session ends or the peer leaves the
+  topology; CM exit disconnects every bound path
+  (`Control::release_all_data_links`).
 - `register_initcalls()` registers PCI discovery at Device and starts one
   task per natively managed controller at Late. MSI-X wakes the task, with bounded timed
   polling when MSI-X is unavailable. No config transaction holds a spinlock
@@ -164,7 +173,7 @@ when its activation completes and removed when its teardown completes, so
 accounting never charges a half-programmed tunnel and never misses a live
 one.
 
-The CM does not request XDomain control. PCIe tunnelling is gated on the
+PCIe tunnelling is gated on the
 PCIe bit of the `_OSC` grant at both layers: without it, router
 configuration never sets ROUTER_CS_5 PTO and `reconcile` never programs a
 PCIe path; with it, a device router's PTO is set only when its parent
@@ -205,7 +214,29 @@ up only once both directions have logged in, after which Ethernet
 frames cross fragmented into 4 KiB data frames and are reassembled
 under the reference validation rules (strict index order, first
 fragment's count and id, any failure discarding the packet in
-progress). Suspend composition: a logged-in XDomain link vetoes
+progress). The data transport follows the session exactly: when the
+mutual login completes, the engine binds one through the control
+channel — the channel allocates a per-direction HopID pair, starts
+and primes the NHI frame-mode data rings (TX `RING_FLAG_FRAME`; RX
+`RING_FLAG_FRAME | RING_FLAG_E2E` with the frame-start/end PDF
+masks), and only then approves the in-router DMA paths (the NHI
+adapter entry at the TX ring HopID forwarding to the lane adapter
+at the peer's announced transmit path; the lane entry at the
+announced local path `0xf` forwarding to the NHI adapter at the RX
+ring HopID, charged the buffer-allocation class credit) — paths
+last, so no frame can arrive at an unprimed ring. Data-path
+entries, like tunnel entries, are never replaced while enabled; an
+occupied entry, an out-of-range announced path, or an exhausted
+credit pool refuses the binding, and a failed binding leaves the
+login standing with the link down, retried on the next CM pass.
+The published link is up only while a transport is bound; when the
+session ends or the peer leaves the topology, the paths are
+disconnected (hop drain before the saved entries are restored)
+before the transport drops and its rings stop. Frames submitted
+to a stopped or full data ring are refused and counted, never
+posted. Because binding follows the login state, the suspend veto
+on a logged-in link covers its live data rings with no separate
+accounting. Suspend composition: a logged-in XDomain link vetoes
 suspend outright — it is not quiesced the way live tunnels are, and
 the veto is checked before any tunnel quiesce is latched; after resume
 the engine re-reads peer properties and re-logs in, which is the
@@ -254,8 +285,10 @@ W1C for the TX/RX ring-zero bits. Physical AMD hardware remains unvalidated.
 
 `bus`, `io`, `interrupts`, `capabilities`, `aml`, `scheduler`, `time`, `power`.
 Register fields and protocol behavior were checked against local Linux
-`/usr/src/linux/drivers/thunderbolt/{pci,nhi,ctl,usb4,path,tunnel,switch,cap}.c`,
-`nhi_regs.h`, `tb_regs.h`, `tb_msgs.h`, and `drivers/acpi/bus.c`. Retimer
+`/usr/src/linux/drivers/thunderbolt/{pci,nhi,ctl,usb4,path,tunnel,switch,cap,xdomain,tb}.c`,
+`nhi_regs.h`, `tb_regs.h`, `tb_msgs.h`, `drivers/net/thunderbolt/main.c`
+(the ThunderboltIP data plane: ring parameters, PDF masks, path
+approval ordering), and `drivers/acpi/bus.c`. Retimer
 sideband registers, `PORT_CS_1` fields and Port Operation FourCCs follow
 the USB4 Specification v2.0 (June 2023) Table 4-18, Table 8-13 and
 Table 8-64 (§4.1.1.2, §4.1.1.3, §8.3.2), cross-checked against Linux
@@ -277,14 +310,17 @@ link bonding and retimer policy.
 Legacy ICM is closed by detect-and-defer (§3): firmware-managed hosts are
 stood aside from, and implementing the ICM protocol itself — or adopting
 the firmware's tunnels — is out of scope by design, not pending work.
-XDomain remainders: the NHI data-ring binding for the ThunderboltIP
-netdev — `drivers/thunderbolt/src/ring.rs` implements only ring 0, so
-no production `DataLink` exists yet; the binding is a TX ring with
-`RING_FLAG_FRAME` and an RX ring with `RING_FLAG_FRAME |
-RING_FLAG_E2E`, frame-start/end PDF masks, HopID `0xf`
-(`TBNET_LOCAL_PATH`), plus the in-router XDomain path programming
-that approves the peer's transmit path — until it lands, logins
-complete but the netdev reports link down and no frames flow. The
+XDomain remainders: data-ring completion harvesting is polled from
+the CM pass cadence — no data ring gets its own MSI-X vector yet
+and the descriptor INTERRUPT bit is never set, so receive latency
+is bounded by the pump interval rather than by an interrupt; the
+RX descriptor CRC-error and buffer-overrun flag bits are not
+modelled (reassembly validation is the content check); and the
+DMA path's buffer-allocation credit uses the class the crate's
+tunnel model charges host-originated data paths, where the
+reference CM programs XDomain DMA tunnels through the same
+`tb_path` machinery (a silicon pass should confirm the class
+against the router's parameter table). The
 local XDomain UUID is a deterministic derivation from the domain and
 router identity (enumeration surfaces no firmware UUID); it is a
 stable placeholder, not a provisioned identity.

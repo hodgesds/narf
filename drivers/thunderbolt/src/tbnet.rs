@@ -16,16 +16,17 @@
 //! derivation, only on uniqueness).
 //!
 //! Data transport seam: frames move through a [`DataLink`]. The
-//! in-kernel binding is the NHI high-speed DMA ring pair
-//! (TX `RING_FLAG_FRAME`, RX `RING_FLAG_FRAME | RING_FLAG_E2E`
-//! with the frame-start/end PDF masks, HopID `TBNET_LOCAL_PATH`);
-//! `drivers/thunderbolt/src/ring.rs` today implements only ring 0,
-//! so no production binding exists yet (specification §8 records
-//! the remaining work with these exact parameters). Until one is
-//! bound, a peer session still completes its ThunderboltIP login,
-//! but the netdev reports link down and no frames flow; the
-//! fixtures bind an in-memory pair and drive the whole data plane
-//! end-to-end.
+//! production binding is the NHI high-speed DMA ring pair in
+//! `dataring.rs` (TX `RING_FLAG_FRAME`, RX
+//! `RING_FLAG_FRAME | RING_FLAG_E2E` with the frame-start/end
+//! PDF masks, HopID `TBNET_LOCAL_PATH` on the wire), created by
+//! the control channel when a peer's mutual login completes and
+//! released when the session ends; the XDomain engine binds it
+//! through the channel seam (see `xdomain.rs`). While no
+//! transport is bound, a peer session still completes its
+//! ThunderboltIP login, but the netdev reports link down and no
+//! frames flow; the fixtures bind an in-memory pair and drive
+//! the whole data plane end-to-end.
 
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::fmt;
@@ -292,13 +293,30 @@ impl NetLink {
         self.mac
     }
 
-    /// Bind the data transport (see the module documentation for
-    /// the production binding's status).
-    // Used by the fixtures; production binding lands with the data transport.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+    /// Bind the data transport: the production NHI data-ring
+    /// pair when the control channel creates one at login, or an
+    /// in-memory pair in the fixtures.
     pub(crate) fn bind(&mut self, link: Box<dyn DataLink>) {
         self.data = Some(link);
         self.refresh_link();
+    }
+
+    /// Whether a data transport is currently bound.
+    pub(crate) fn bound(&self) -> bool {
+        self.data.is_some()
+    }
+
+    /// Take the data transport out (session ended or the peer is
+    /// going away), refreshing the link state. The caller owns
+    /// the returned transport's teardown ordering: the channel
+    /// releases the in-router paths before the transport is
+    /// dropped and its rings stop.
+    pub(crate) fn unbind(&mut self) -> Option<Box<dyn DataLink>> {
+        let link = self.data.take();
+        if link.is_some() {
+            self.refresh_link();
+        }
+        link
     }
 
     /// Record the ThunderboltIP session state (mutual login).
@@ -321,7 +339,7 @@ impl NetLink {
 
     /// The published interface (the registry holds a second
     /// handle to the same object).
-    // Used by the fixtures; production binding lands with the data transport.
+    // Used by the fixtures to drive the stack-side rings.
     #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) fn interface(&self) -> &Arc<TbNetInterface> {
         &self.iface

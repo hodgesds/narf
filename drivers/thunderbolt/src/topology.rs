@@ -444,6 +444,13 @@ pub(crate) async fn run(id: u32, controls: u32, ctl: &mut Control) -> Result<(),
     for tunnel in tunnels.iter_mut().rev() {
         let _ = tunnel.teardown(ctl, &current).await;
     }
+    // Disconnect the XDomain data paths too: their Hops entries
+    // are not tunnel-journaled, and leaving them enabled would
+    // route frames at NHI rings that stop with the engine's
+    // peers when `xd` drops at the end of this scope. The device
+    //-PM teardown after run() returns revokes bus mastering
+    // before any ring state is freed.
+    ctl.release_all_data_links().await;
     // A teardown that could not roll its journal back (e.g. a
     // poisoned channel) leaves paths possibly programmed in the
     // routers with no owner; record that so the device-PM handler
