@@ -35,10 +35,14 @@
 //!   block layer's Flush/FUA advertisement was a durability lie
 //!   (#829)
 //!
-//! Multi-LUN (LUN > 0), Reset Recovery (§5.3), and UAS (USB
-//! Attached SCSI) are deferred.
+//! Multi-LUN devices bind one [`MscDevice`] per LUN after a
+//! GET MAX LUN probe at attach (#831). Reset Recovery (§5.3) is
+//! deferred to the error-recovery work (#830); UAS (USB Attached
+//! SCSI) remains deferred — no issue in the MSC family covers it.
 
 use alloc::vec::Vec;
+
+use core::future::Future;
 
 use crate::xhci::{self, EndpointConfig, EndpointKind, Xhci};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -145,6 +149,159 @@ impl From<xhci::XhciError> for MscError {
     }
 }
 
+/// GET MAX LUN — class-specific request 0xFE (BOT §3.3):
+/// `bmRequestType` 0xA1 (device-to-host, class, interface),
+/// `wValue` 0, `wIndex` = interface number, one data byte: the
+/// largest LUN the device supports (total LUNs − 1).
+pub const BOT_GET_MAX_LUN: u8 = 0xFE;
+
+/// Mass Storage Reset — class-specific request 0xFF (BOT §5.3):
+/// `bmRequestType` 0x21 (host-to-device, class, interface),
+/// `wValue` 0, `wIndex` = interface number, no data stage. The
+/// first step of Reset Recovery (#830).
+pub const BOT_MASS_STORAGE_RESET: u8 = 0xFF;
+
+/// Defensive bound on the LUN index probed at bind. The BOT spec
+/// puts no bound on the GET MAX LUN response byte, but a family
+/// of buggy bridges answers 0xFF to an unsupported request; each
+/// probed LUN costs a READ CAPACITY conversation, so an unbounded
+/// byte could stall bind for minutes. Real multi-LUN devices
+/// (card readers) expose a handful of LUNs; 15 is far above any
+/// shipping reader and far below a hang.
+const MAX_LUN_PROBE: u8 = 15;
+
+/// Transport seam for the BOT conversation: the wire operations
+/// [`MscDevice`] drives, abstracted so kernel-test fixtures can
+/// play the device side of the conversation end to end without an
+/// xHCI controller — the pattern `ccid`'s `CcidTransport`
+/// established in this crate. The production implementation is
+/// [`Xhci`], whose bulk / control methods already have exactly
+/// these shapes; fixtures implement the device side of BOT + the
+/// embedded SCSI conversation independently, from the specs.
+pub trait BotTransport {
+    /// One bulk-IN transfer (CBW data stage or CSW) on `dci`.
+    fn bulk_in(
+        &self,
+        slot_id: u8,
+        dci: u8,
+        out: &mut [u8],
+    ) -> impl Future<Output = Result<usize, MscError>>;
+    /// One bulk-OUT transfer (CBW or data stage) on `dci`.
+    fn bulk_out(
+        &self,
+        slot_id: u8,
+        dci: u8,
+        data: &[u8],
+    ) -> impl Future<Output = Result<usize, MscError>>;
+    /// Control read on EP0 (GET MAX LUN rides this).
+    fn control_in(
+        &self,
+        slot_id: u8,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        out: &mut [u8],
+    ) -> impl Future<Output = Result<usize, MscError>>;
+    /// Control write / no-data control request on EP0
+    /// (SET_CONFIGURATION, CLEAR_FEATURE, Mass Storage Reset).
+    fn control_out(
+        &self,
+        slot_id: u8,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        data: &[u8],
+    ) -> impl Future<Output = Result<usize, MscError>>;
+    /// Host half of halted-endpoint recovery: Reset Endpoint +
+    /// Set TR Dequeue Pointer on the controller side (the
+    /// device-side half is CLEAR_FEATURE(ENDPOINT_HALT), issued by
+    /// the caller over [`Self::control_out`]). See
+    /// `Xhci::reset_endpoint` for the hardware sequence.
+    fn reset_halted_endpoint(
+        &self,
+        slot_id: u8,
+        dci: u8,
+    ) -> impl Future<Output = Result<(), MscError>>;
+    /// Resume this device's hub port if the supervisor has
+    /// idle-suspended it (#840). Production delegates to
+    /// `attach::resume_port`; fixtures have no hub topology and
+    /// take the no-op default.
+    fn resume_hub_port(&self, hub_port: Option<(usize, u8)>) -> impl Future<Output = ()> {
+        async {}
+    }
+    /// Feed the hub idle-suspend activity timer after a completed
+    /// transfer (#840). No-op by default, as above.
+    fn note_hub_activity(&self, hub_port: Option<(usize, u8)>) {}
+}
+
+impl BotTransport for Xhci {
+    async fn bulk_in(&self, slot_id: u8, dci: u8, out: &mut [u8]) -> Result<usize, MscError> {
+        self.bulk_in(slot_id, dci, out)
+            .await
+            .map_err(MscError::Xhci)
+    }
+
+    async fn bulk_out(&self, slot_id: u8, dci: u8, data: &[u8]) -> Result<usize, MscError> {
+        self.bulk_out(slot_id, dci, data)
+            .await
+            .map_err(MscError::Xhci)
+    }
+
+    async fn control_in(
+        &self,
+        slot_id: u8,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        out: &mut [u8],
+    ) -> Result<usize, MscError> {
+        self.control_in(slot_id, bm_request_type, b_request, w_value, w_index, out)
+            .await
+            .map_err(MscError::Xhci)
+    }
+
+    async fn control_out(
+        &self,
+        slot_id: u8,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        data: &[u8],
+    ) -> Result<usize, MscError> {
+        self.control_out(slot_id, bm_request_type, b_request, w_value, w_index, data)
+            .await
+            .map_err(MscError::Xhci)
+    }
+
+    async fn reset_halted_endpoint(&self, slot_id: u8, dci: u8) -> Result<(), MscError> {
+        // `Xhci::reset_endpoint` (the inherent method) additionally
+        // wants the slot's current device generation; resolve it
+        // here so BOT callers only name the endpoint.
+        let generation = self
+            .device_generation(slot_id)
+            .ok_or(MscError::Xhci(xhci::XhciError::CmdFailed(0xFD)))?;
+        self.reset_endpoint(slot_id, generation, dci)
+            .await
+            .map_err(MscError::Xhci)
+    }
+
+    async fn resume_hub_port(&self, hub_port: Option<(usize, u8)>) {
+        if let Some((hub_idx, port)) = hub_port {
+            crate::attach::resume_port(self, hub_idx, port).await;
+        }
+    }
+
+    fn note_hub_activity(&self, hub_port: Option<(usize, u8)>) {
+        if let Some((hub_idx, port)) = hub_port {
+            crate::attach::mark_port_activity(hub_idx, port);
+        }
+    }
+}
+
 /// One bulk-only-transport mass storage device. Ties a previously
 /// addressed + configured xHCI slot to its bulk-IN / bulk-OUT
 /// endpoint DCIs.
@@ -153,6 +310,16 @@ pub struct MscDevice {
     pub slot_id: u8,
     pub bulk_in: u8,  // DCI of the bulk-IN endpoint
     pub bulk_out: u8, // DCI of the bulk-OUT endpoint
+    /// Logical unit number this instance speaks for — the
+    /// `bCBWLUN` byte of every CBW it issues (BOT §5.1). One
+    /// `MscDevice` exists per LUN: a multi-LUN device (a card
+    /// reader) binds one instance per LUN, all sharing the slot
+    /// and the bulk endpoint pair (#831).
+    pub lun: u8,
+    /// `bInterfaceNumber` of the MSC interface — the `wIndex` of
+    /// the class-specific requests (GET MAX LUN, Mass Storage
+    /// Reset).
+    pub interface: u8,
     /// Block size reported by READ CAPACITY(10).
     pub lba_bytes: u32,
     /// Last LBA reported by READ CAPACITY(10).
@@ -185,13 +352,16 @@ pub struct MscDevice {
 /// first interface whose `bInterfaceClass:SubClass:Protocol` matches
 /// MSC BOT, plus its bulk-IN + bulk-OUT endpoints. Returns the
 /// `EndpointConfig` for each direction so a caller can hand them
-/// to `xhci::configure_endpoints`.
+/// to `xhci::configure_endpoints`, plus the matching interface's
+/// `bInterfaceNumber` (the `wIndex` of the class-specific BOT
+/// requests).
 ///
 /// `cfg` is the descriptor blob fetched via
 /// `Xhci::get_config_descriptor`.
-pub fn find_bot_endpoints(cfg: &[u8]) -> Result<(EndpointConfig, EndpointConfig), MscError> {
+pub fn find_bot_endpoints(cfg: &[u8]) -> Result<(EndpointConfig, EndpointConfig, u8), MscError> {
     let mut i = 0usize;
     let mut in_match = false;
+    let mut matched_interface = 0u8;
     let mut bulk_in: Option<EndpointConfig> = None;
     let mut bulk_out: Option<EndpointConfig> = None;
     while i + 2 <= cfg.len() {
@@ -202,6 +372,7 @@ pub fn find_bot_endpoints(cfg: &[u8]) -> Result<(EndpointConfig, EndpointConfig)
         let dtype = cfg[i + 1];
         match dtype {
             // Interface Descriptor (§9.6.5) — bLength 9, dtype 4.
+            //   +2 bInterfaceNumber
             //   +5 bInterfaceClass
             //   +6 bInterfaceSubClass
             //   +7 bInterfaceProtocol
@@ -209,6 +380,9 @@ pub fn find_bot_endpoints(cfg: &[u8]) -> Result<(EndpointConfig, EndpointConfig)
                 in_match = cfg[i + 5] == MSC_INTERFACE_CLASS
                     && cfg[i + 6] == MSC_INTERFACE_SUBCLASS
                     && cfg[i + 7] == MSC_INTERFACE_PROTOCOL;
+                if in_match {
+                    matched_interface = cfg[i + 2];
+                }
             }
             // Endpoint Descriptor (§9.6.6) — bLength 7, dtype 5.
             //   +2 bEndpointAddress (bit 7 = IN)
@@ -244,44 +418,101 @@ pub fn find_bot_endpoints(cfg: &[u8]) -> Result<(EndpointConfig, EndpointConfig)
         i += len;
     }
     match (bulk_in, bulk_out) {
-        (Some(i), Some(o)) => Ok((i, o)),
+        (Some(i), Some(o)) => Ok((i, o, matched_interface)),
         _ => Err(MscError::EndpointsMissing),
     }
 }
 
+/// GET MAX LUN for the interface at `slot_id` (BOT §3.3). A
+/// device that does not implement the request stalls it (or
+/// otherwise errors), which the spec reads as "LUN 0 only" — the
+/// overwhelmingly common single-LUN stick. Any transport error
+/// likewise degrades to LUN 0 rather than failing the bind: a
+/// device with real extra LUNs answers this request.
+async fn get_max_lun<T: BotTransport>(t: &T, slot_id: u8, interface: u8) -> u8 {
+    let mut buf = [0u8; 1];
+    match t
+        .control_in(
+            slot_id,
+            0xA1,
+            BOT_GET_MAX_LUN,
+            0,
+            u16::from(interface),
+            &mut buf,
+        )
+        .await
+    {
+        Ok(n) if n >= 1 => buf[0].min(MAX_LUN_PROBE),
+        _ => 0,
+    }
+}
+
+/// Bind every LUN of an already addressed + configured MSC
+/// interface: GET MAX LUN, then one [`MscDevice`] per LUN
+/// (#831). A LUN whose READ CAPACITY fails on a multi-LUN device
+/// is an empty card-reader slot and is skipped — its failure
+/// must not take the populated slots down with it. On a
+/// single-LUN device (or when *every* LUN fails) the error
+/// propagates, preserving the historic bind contract. Caller
+/// must have already run `xhci.configure_endpoints` for the bulk
+/// pair returned by `find_bot_endpoints`.
+pub async fn attach_all_luns<T: BotTransport>(
+    t: &T,
+    slot_id: u8,
+    bulk_in: u8,
+    bulk_out: u8,
+    interface: u8,
+) -> Result<Vec<MscDevice>, MscError> {
+    let max_lun = get_max_lun(t, slot_id, interface).await;
+    let mut devs = Vec::new();
+    let mut last_err: Option<MscError> = None;
+    for lun in 0..=max_lun {
+        match MscDevice::attach_lun(t, slot_id, bulk_in, bulk_out, interface, lun).await {
+            Ok(dev) => devs.push(dev),
+            Err(e) => {
+                if max_lun == 0 {
+                    return Err(e);
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    if devs.is_empty() {
+        return Err(last_err.unwrap_or(MscError::EndpointsMissing));
+    }
+    Ok(devs)
+}
+
 impl MscDevice {
-    /// Bind to an already addressed + configured slot. Issues
-    /// READ CAPACITY(10) so `lba_bytes` and `last_lba` are
+    /// Bind one LUN of an already addressed + configured slot.
+    /// Issues READ CAPACITY(10) so `lba_bytes` and `last_lba` are
     /// populated. Caller must have already run
     /// `xhci.configure_endpoints` for the bulk pair returned by
     /// `find_bot_endpoints`.
-    pub async fn attach(
-        xhci: &Xhci,
+    pub async fn attach_lun<T: BotTransport>(
+        t: &T,
         slot_id: u8,
         bulk_in: u8,
         bulk_out: u8,
+        interface: u8,
+        lun: u8,
     ) -> Result<Self, MscError> {
-        let dev = MscDevice {
+        let mut dev = MscDevice {
             slot_id,
             bulk_in,
             bulk_out,
+            lun,
+            interface,
             lba_bytes: 0,
             last_lba: 0,
             generation: 0,
             tag: IrqSafeSpinLock::new(1),
             hub_port: None,
         };
-        let cap = dev.read_capacity_10(xhci).await?;
-        Ok(MscDevice {
-            slot_id,
-            bulk_in,
-            bulk_out,
-            lba_bytes: cap.0,
-            last_lba: cap.1,
-            generation: 0,
-            tag: IrqSafeSpinLock::new(2),
-            hub_port: None,
-        })
+        let cap = dev.read_capacity_10(t).await?;
+        dev.lba_bytes = cap.0;
+        dev.last_lba = cap.1;
+        Ok(dev)
     }
 
     /// Allocate a fresh CBW tag.
@@ -292,26 +523,22 @@ impl MscDevice {
         t
     }
 
-    /// Build a 31-byte CBW (§5.1 Table 5.1).
+    /// Build a 31-byte CBW (§5.1 Table 5.1) addressed to this
+    /// device's LUN.
     fn build_cbw(&self, tag: u32, data_len: u32, is_in: bool, cb: &[u8]) -> [u8; 31] {
-        let mut out = [0u8; 31];
-        out[0..4].copy_from_slice(&CBW_SIGNATURE.to_le_bytes());
-        out[4..8].copy_from_slice(&tag.to_le_bytes());
-        out[8..12].copy_from_slice(&data_len.to_le_bytes());
-        out[12] = if is_in { CBW_FLAG_IN } else { 0 };
-        out[13] = 0; // bCBWLUN
-        out[14] = (cb.len() as u8) & 0x1F; // bCBWCBLength (low 5)
-        let n = cb.len().min(16);
-        out[15..15 + n].copy_from_slice(&cb[..n]);
-        out
+        encode_cbw(tag, data_len, is_in, self.lun, cb)
     }
 
     /// Receive + parse a 13-byte CSW (§5.2 Table 5.2). Verifies the
     /// `b'USBS'` signature and returns the bCSWStatus byte (0=ok,
     /// 1=fail, 2=phase err) and the residue.
-    async fn read_csw(&self, xhci: &Xhci, expect_tag: u32) -> Result<(u8, u32), MscError> {
+    async fn read_csw<T: BotTransport>(
+        &self,
+        t: &T,
+        expect_tag: u32,
+    ) -> Result<(u8, u32), MscError> {
         let mut buf = [0u8; 13];
-        let n = xhci.bulk_in(self.slot_id, self.bulk_in, &mut buf).await?;
+        let n = t.bulk_in(self.slot_id, self.bulk_in, &mut buf).await?;
         if n < 13 {
             return Err(MscError::BadCsw);
         }
@@ -325,62 +552,52 @@ impl MscDevice {
         Ok((status, resid))
     }
 
-    /// Resume this device's hub port if the supervisor has
-    /// idle-suspended it, so the transfer below doesn't run
-    /// against a gated port. No-op for root-attached devices and
-    /// for ports that aren't suspended (`resume_port` is
-    /// idempotent). Called at the top of every BOT funnel (#840).
-    async fn resume_hub_port(&self, xhci: &Xhci) {
-        if let Some((hub_idx, port)) = self.hub_port {
-            crate::attach::resume_port(xhci, hub_idx, port).await;
-        }
-    }
-
-    /// Feed the hub idle-suspend activity timer after a completed
-    /// BOT transaction, so an actively used device keeps its port.
-    /// Called on the success path of every BOT funnel (#840).
-    fn note_hub_activity(&self) {
-        if let Some((hub_idx, port)) = self.hub_port {
-            crate::attach::mark_port_activity(hub_idx, port);
-        }
-    }
-
     /// Run a SCSI command with no data stage. Used by TEST UNIT READY
     /// and SYNCHRONIZE CACHE(10).
-    async fn cmd_no_data(&self, xhci: &Xhci, cb: &[u8]) -> Result<(), MscError> {
-        self.resume_hub_port(xhci).await;
+    async fn cmd_no_data<T: BotTransport>(&self, t: &T, cb: &[u8]) -> Result<(), MscError> {
+        t.resume_hub_port(self.hub_port).await;
         let tag = self.next_tag();
         let cbw = self.build_cbw(tag, 0, false, cb);
-        xhci.bulk_out(self.slot_id, self.bulk_out, &cbw).await?;
-        let (status, _) = self.read_csw(xhci, tag).await?;
+        t.bulk_out(self.slot_id, self.bulk_out, &cbw).await?;
+        let (status, _) = self.read_csw(t, tag).await?;
         check_csw_status(status)?;
-        self.note_hub_activity();
+        t.note_hub_activity(self.hub_port);
         Ok(())
     }
 
     /// Run a SCSI command with a host-bound (IN) data stage.
-    async fn cmd_data_in(&self, xhci: &Xhci, cb: &[u8], out: &mut [u8]) -> Result<usize, MscError> {
-        self.resume_hub_port(xhci).await;
+    async fn cmd_data_in<T: BotTransport>(
+        &self,
+        t: &T,
+        cb: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, MscError> {
+        t.resume_hub_port(self.hub_port).await;
         let tag = self.next_tag();
         let cbw = self.build_cbw(tag, out.len() as u32, true, cb);
-        xhci.bulk_out(self.slot_id, self.bulk_out, &cbw).await?;
-        let n = xhci.bulk_in(self.slot_id, self.bulk_in, out).await?;
-        let (status, _) = self.read_csw(xhci, tag).await?;
+        t.bulk_out(self.slot_id, self.bulk_out, &cbw).await?;
+        let n = t.bulk_in(self.slot_id, self.bulk_in, out).await?;
+        let (status, _) = self.read_csw(t, tag).await?;
         check_csw_status(status)?;
-        self.note_hub_activity();
+        t.note_hub_activity(self.hub_port);
         Ok(n)
     }
 
     /// Run a SCSI command with a device-bound (OUT) data stage.
-    async fn cmd_data_out(&self, xhci: &Xhci, cb: &[u8], data: &[u8]) -> Result<usize, MscError> {
-        self.resume_hub_port(xhci).await;
+    async fn cmd_data_out<T: BotTransport>(
+        &self,
+        t: &T,
+        cb: &[u8],
+        data: &[u8],
+    ) -> Result<usize, MscError> {
+        t.resume_hub_port(self.hub_port).await;
         let tag = self.next_tag();
         let cbw = self.build_cbw(tag, data.len() as u32, false, cb);
-        xhci.bulk_out(self.slot_id, self.bulk_out, &cbw).await?;
-        let n = xhci.bulk_out(self.slot_id, self.bulk_out, data).await?;
-        let (status, _) = self.read_csw(xhci, tag).await?;
+        t.bulk_out(self.slot_id, self.bulk_out, &cbw).await?;
+        let n = t.bulk_out(self.slot_id, self.bulk_out, data).await?;
+        let (status, _) = self.read_csw(t, tag).await?;
         check_csw_status(status)?;
-        self.note_hub_activity();
+        t.note_hub_activity(self.hub_port);
         Ok(n)
     }
 
@@ -388,8 +605,8 @@ impl MscDevice {
     /// Returns `Ok(())` if the device is ready to handle media
     /// access; a CSW status of 1 means the device wants the host
     /// to call REQUEST SENSE.
-    pub async fn test_unit_ready(&self, xhci: &Xhci) -> Result<(), MscError> {
-        self.cmd_no_data(xhci, &[SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0])
+    pub async fn test_unit_ready<T: BotTransport>(&self, t: &T) -> Result<(), MscError> {
+        self.cmd_no_data(t, &[SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0])
             .await
     }
 
@@ -398,11 +615,11 @@ impl MscDevice {
     /// returns CSW status 1 (Failed) — the sense data carries the
     /// SENSE KEY, ASC, and ASCQ that describe the error. Callers
     /// interested in CHECK CONDITION detail should call this next.
-    pub async fn request_sense(&self, xhci: &Xhci) -> Result<[u8; 18], MscError> {
+    pub async fn request_sense<T: BotTransport>(&self, t: &T) -> Result<[u8; 18], MscError> {
         // ALLOCATION LENGTH = 18 (fixed-format sense, SPC-4 Table 26).
         let cb = [SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0];
         let mut out = [0u8; 18];
-        let n = self.cmd_data_in(xhci, &cb, &mut out).await?;
+        let n = self.cmd_data_in(t, &cb, &mut out).await?;
         if n < 18 {
             return Err(MscError::BadLength);
         }
@@ -413,15 +630,15 @@ impl MscDevice {
     /// up; `start=false` spins it down / ejects (LOEJ=1 in the CDB)
     /// when `eject=true`. Typical USB-stick eject: `start=false,
     /// eject=true`.
-    pub async fn start_stop_unit(
+    pub async fn start_stop_unit<T: BotTransport>(
         &self,
-        xhci: &Xhci,
+        t: &T,
         start: bool,
         eject: bool,
     ) -> Result<(), MscError> {
         // CDB byte 4: LOEJ bit (bit 1) + START bit (bit 0).
         let flags: u8 = if eject { 0x02 } else { 0x00 } | if start { 0x01 } else { 0x00 };
-        self.cmd_no_data(xhci, &[SCSI_START_STOP_UNIT, 0, 0, 0, flags, 0])
+        self.cmd_no_data(t, &[SCSI_START_STOP_UNIT, 0, 0, 0, flags, 0])
             .await
     }
 
@@ -434,16 +651,16 @@ impl MscDevice {
     /// completion once the flush has actually finished; a
     /// non-zero CSW status surfaces as [`MscError::CswStatus`]
     /// (a failed flush must never read as success — #829).
-    pub async fn synchronize_cache(&self, xhci: &Xhci) -> Result<(), MscError> {
-        self.cmd_no_data(xhci, &encode_synchronize_cache10()).await
+    pub async fn synchronize_cache<T: BotTransport>(&self, t: &T) -> Result<(), MscError> {
+        self.cmd_no_data(t, &encode_synchronize_cache10()).await
     }
 
     /// `INQUIRY` (SPC-4 §6.5). Returns the standard 36-byte INQUIRY
     /// response (vendor / product / revision / etc.).
-    pub async fn inquiry(&self, xhci: &Xhci) -> Result<[u8; 36], MscError> {
+    pub async fn inquiry<T: BotTransport>(&self, t: &T) -> Result<[u8; 36], MscError> {
         let cb = [SCSI_INQUIRY, 0, 0, 0, 36, 0];
         let mut out = [0u8; 36];
-        let n = self.cmd_data_in(xhci, &cb, &mut out).await?;
+        let n = self.cmd_data_in(t, &cb, &mut out).await?;
         if n < 36 {
             return Err(MscError::BadLength);
         }
@@ -453,10 +670,10 @@ impl MscDevice {
     /// `READ CAPACITY(10)` (SBC-3 §5.16). Returns
     /// `(block_bytes, last_lba)` — the device's reported block size
     /// and the index of the last addressable LBA.
-    pub async fn read_capacity_10(&self, xhci: &Xhci) -> Result<(u32, u32), MscError> {
+    pub async fn read_capacity_10<T: BotTransport>(&self, t: &T) -> Result<(u32, u32), MscError> {
         let cb = [SCSI_READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let mut out = [0u8; 8];
-        let n = self.cmd_data_in(xhci, &cb, &mut out).await?;
+        let n = self.cmd_data_in(t, &cb, &mut out).await?;
         if n < 8 {
             return Err(MscError::BadLength);
         }
@@ -468,7 +685,7 @@ impl MscDevice {
 
     /// `READ(10)` for a single block. Returns the `lba_bytes`-sized
     /// data buffer. SBC-3 §5.10.
-    pub async fn read_block(&self, xhci: &Xhci, lba: u32) -> Result<Vec<u8>, MscError> {
+    pub async fn read_block<T: BotTransport>(&self, t: &T, lba: u32) -> Result<Vec<u8>, MscError> {
         if self.lba_bytes == 0 || self.lba_bytes as usize > 4096 {
             return Err(MscError::BadLength);
         }
@@ -487,7 +704,7 @@ impl MscDevice {
             0,
         ];
         let mut out = alloc::vec![0u8; self.lba_bytes as usize];
-        let n = self.cmd_data_in(xhci, &cb, &mut out[..]).await?;
+        let n = self.cmd_data_in(t, &cb, &mut out[..]).await?;
         if n != self.lba_bytes as usize {
             return Err(MscError::BadLength);
         }
@@ -495,7 +712,12 @@ impl MscDevice {
     }
 
     /// `WRITE(10)` for a single block. SBC-3 §5.27.
-    pub async fn write_block(&self, xhci: &Xhci, lba: u32, data: &[u8]) -> Result<(), MscError> {
+    pub async fn write_block<T: BotTransport>(
+        &self,
+        t: &T,
+        lba: u32,
+        data: &[u8],
+    ) -> Result<(), MscError> {
         if data.len() != self.lba_bytes as usize {
             return Err(MscError::BadLength);
         }
@@ -512,7 +734,7 @@ impl MscDevice {
             1,
             0,
         ];
-        let n = self.cmd_data_out(xhci, &cb, data).await?;
+        let n = self.cmd_data_out(t, &cb, data).await?;
         if n != data.len() {
             return Err(MscError::BadLength);
         }
@@ -522,9 +744,9 @@ impl MscDevice {
     /// Multi-block `READ(10)`. Reads `nblocks` consecutive blocks
     /// starting at `lba`. Bounded to `MSC_MAX_BLOCKS_PER_XFER` per
     /// call. Returns the concatenated payload.
-    pub async fn read_blocks(
+    pub async fn read_blocks<T: BotTransport>(
         &self,
-        xhci: &Xhci,
+        t: &T,
         lba: u32,
         nblocks: u16,
     ) -> Result<Vec<u8>, MscError> {
@@ -547,7 +769,7 @@ impl MscDevice {
             0,
         ];
         let mut out: Vec<u8> = alloc::vec![0u8; total];
-        let n = self.cmd_data_in(xhci, &cb, &mut out[..]).await?;
+        let n = self.cmd_data_in(t, &cb, &mut out[..]).await?;
         if n != total {
             return Err(MscError::BadLength);
         }
@@ -556,15 +778,14 @@ impl MscDevice {
 
     /// Multi-block `WRITE(10)`. Writes `nblocks` blocks starting at
     /// `lba`. `data.len()` must equal `nblocks * lba_bytes`.
-    pub async fn write_blocks(
+    pub async fn write_blocks<T: BotTransport>(
         &self,
-        xhci: &Xhci,
+        t: &T,
         lba: u32,
         nblocks: u16,
         data: &[u8],
     ) -> Result<(), MscError> {
-        self.write_blocks_inner(xhci, lba, nblocks, data, false)
-            .await
+        self.write_blocks_inner(t, lba, nblocks, data, false).await
     }
 
     /// Multi-block `WRITE(10)` with Force Unit Access: identical to
@@ -574,20 +795,19 @@ impl MscDevice {
     /// FUA orders nothing written earlier — callers that need a
     /// barrier issue [`Self::synchronize_cache`] first (the block
     /// layer's `write_fua` contract, #829).
-    pub async fn write_blocks_fua(
+    pub async fn write_blocks_fua<T: BotTransport>(
         &self,
-        xhci: &Xhci,
+        t: &T,
         lba: u32,
         nblocks: u16,
         data: &[u8],
     ) -> Result<(), MscError> {
-        self.write_blocks_inner(xhci, lba, nblocks, data, true)
-            .await
+        self.write_blocks_inner(t, lba, nblocks, data, true).await
     }
 
-    async fn write_blocks_inner(
+    async fn write_blocks_inner<T: BotTransport>(
         &self,
-        xhci: &Xhci,
+        t: &T,
         lba: u32,
         nblocks: u16,
         data: &[u8],
@@ -614,7 +834,7 @@ impl MscDevice {
             nb[1],
             0,
         ];
-        let n = self.cmd_data_out(xhci, &cb, data).await?;
+        let n = self.cmd_data_out(t, &cb, data).await?;
         if n != data.len() {
             return Err(MscError::BadLength);
         }
@@ -685,7 +905,7 @@ pub async fn try_bind_msc_already_addressed(
     cfg: &[u8],
     hub_port: Option<(usize, u8)>,
 ) -> Result<usize, MscError> {
-    let (ep_in, ep_out) = find_bot_endpoints(cfg)?;
+    let (ep_in, ep_out, interface) = find_bot_endpoints(cfg)?;
     // SET_CONFIGURATION before any class-specific request (USB 2.0
     // §9.4.7). Use cfg value 1 — every MSC device the bring-up arc
     // targets ships a single config at value 1.
@@ -710,22 +930,34 @@ pub async fn try_bind_msc_already_addressed(
         .map_err(MscError::Xhci)?;
     let bulk_in_dci = ((ep_in.ep_addr & 0x0F) * 2) + 1;
     let bulk_out_dci = (ep_out.ep_addr & 0x0F) * 2; // xHCI OUT DCI: ep_num * 2
-    let mut dev = MscDevice::attach(xhci_dev, slot_id, bulk_in_dci, bulk_out_dci).await?;
-    // Record the hub context *after* attach: the READ CAPACITY(10)
-    // inside attach runs before the supervisor marks the port
-    // bound, and idle-suspend only ever targets bound ports — the
-    // port cannot be suspended yet, so that first transaction
-    // needs no resume.
-    dev.hub_port = hub_port;
-    let idx = insert_device(dev);
-    // Register against the block layer + scan partitions. Done
-    // inline so the post-bind state (block device visible + per-
-    // partition sub-devices registered) is established before the
-    // caller's supervisor cycle moves on. Failure here doesn't
-    // unbind the MSC device — the raw bulk-IN/OUT path still works
-    // through `with_device`; the block-layer view is best-effort.
-    register_msc_block_device(idx);
-    Ok(idx)
+                                                    // One device instance per LUN (#831): GET MAX LUN, then a
+                                                    // READ CAPACITY conversation per LUN inside attach_all_luns.
+    let devs = attach_all_luns(xhci_dev, slot_id, bulk_in_dci, bulk_out_dci, interface).await?;
+    let mut first_idx = None;
+    for mut dev in devs {
+        // Record the hub context *after* attach: the READ
+        // CAPACITY(10) inside attach runs before the supervisor
+        // marks the port bound, and idle-suspend only ever targets
+        // bound ports — the port cannot be suspended yet, so that
+        // first transaction needs no resume.
+        dev.hub_port = hub_port;
+        let idx = insert_device(dev);
+        // Register against the block layer + scan partitions. Done
+        // inline so the post-bind state (block device visible +
+        // per-partition sub-devices registered) is established
+        // before the caller's supervisor cycle moves on. Failure
+        // here doesn't unbind the MSC device — the raw bulk path
+        // still works through `with_device`; the block-layer view
+        // is best-effort. Each LUN registers under its own index,
+        // so a multi-slot reader publishes one `usb-msc{idx}` per
+        // populated slot.
+        register_msc_block_device(idx);
+        if first_idx.is_none() {
+            first_idx = Some(idx);
+        }
+    }
+    // attach_all_luns only succeeds with at least one LUN bound.
+    Ok(first_idx.unwrap_or(0))
 }
 
 /// Per-index cache of the leaked `usb-msc{idx}` block names. The
@@ -938,7 +1170,7 @@ async fn try_attach_msc_port(xhci_dev: &Xhci, port: u8) -> Result<(), MscError> 
             full.truncate(n2);
         }
 
-        let (ep_in, ep_out) = find_bot_endpoints(&full)?;
+        let (ep_in, ep_out, interface) = find_bot_endpoints(&full)?;
         xhci_dev
             .configure_endpoints(slot_id, &[ep_in, ep_out])
             .await
@@ -946,12 +1178,14 @@ async fn try_attach_msc_port(xhci_dev: &Xhci, port: u8) -> Result<(), MscError> 
 
         let bulk_in_dci = ((ep_in.ep_addr & 0x0F) * 2) + 1;
         let bulk_out_dci = (ep_out.ep_addr & 0x0F) * 2; // xHCI OUT DCI: ep_num * 2
-        MscDevice::attach(xhci_dev, slot_id, bulk_in_dci, bulk_out_dci).await
+        attach_all_luns(xhci_dev, slot_id, bulk_in_dci, bulk_out_dci, interface).await
     }
     .await;
     match result {
-        Ok(dev) => {
-            insert_device(dev);
+        Ok(devs) => {
+            for dev in devs {
+                insert_device(dev);
+            }
             Ok(())
         }
         Err(e) => {
@@ -993,6 +1227,8 @@ pub fn __insert_msc_for_test(slot_id: u8) -> usize {
         slot_id,
         bulk_in: 3,
         bulk_out: 2,
+        lun: 0,
+        interface: 0,
         lba_bytes: 512,
         last_lba: 2047,
         generation: 0,
@@ -1011,15 +1247,18 @@ pub fn __insert_msc_for_test(slot_id: u8) -> usize {
 /// `tag` identifies this transaction and is echoed back in the CSW.
 /// `data_len` is the expected transfer length in bytes.  `is_in` sets
 /// bit 7 of `bmCBWFlags` (1 = data flows from device to host).
+/// `lun` is the target logical unit (`bCBWLUN`, §5.1) — 0 for the
+/// single-LUN devices that dominate, the slot index for a
+/// multi-LUN card reader (#831).
 /// `cb` is the SCSI command descriptor block; at most 16 bytes are
 /// copied into `CBWCB[16]`.
-pub fn encode_cbw(tag: u32, data_len: u32, is_in: bool, cb: &[u8]) -> [u8; 31] {
+pub fn encode_cbw(tag: u32, data_len: u32, is_in: bool, lun: u8, cb: &[u8]) -> [u8; 31] {
     let mut out = [0u8; 31];
     out[0..4].copy_from_slice(&CBW_SIGNATURE.to_le_bytes());
     out[4..8].copy_from_slice(&tag.to_le_bytes());
     out[8..12].copy_from_slice(&data_len.to_le_bytes());
     out[12] = if is_in { CBW_FLAG_IN } else { 0 };
-    out[13] = 0; // bCBWLUN
+    out[13] = lun; // bCBWLUN
     out[14] = (cb.len() as u8) & 0x1F; // bCBWCBLength (low 5 bits)
     let n = cb.len().min(16);
     out[15..15 + n].copy_from_slice(&cb[..n]);
@@ -1210,7 +1449,7 @@ impl UsbMscBlockDevice {
     fn transport_snapshot(
         &self,
     ) -> Result<(alloc::sync::Arc<Xhci>, MscDevice), narf_block::BlockIoError> {
-        let (slot_id, bulk_in_dci, bulk_out_dci, lba_bytes, generation, hub_port) = {
+        let (slot_id, bulk_in_dci, bulk_out_dci, lun, interface, lba_bytes, generation, hub_port) = {
             let g = MSC_DEVICES.lock();
             let dev = match g.get(self.idx).and_then(|slot| slot.as_ref()) {
                 Some(d) => d,
@@ -1223,6 +1462,8 @@ impl UsbMscBlockDevice {
                 dev.slot_id,
                 dev.bulk_in,
                 dev.bulk_out,
+                dev.lun,
+                dev.interface,
                 dev.lba_bytes,
                 dev.generation,
                 dev.hub_port,
@@ -1238,6 +1479,8 @@ impl UsbMscBlockDevice {
                 slot_id,
                 bulk_in: bulk_in_dci,
                 bulk_out: bulk_out_dci,
+                lun,
+                interface,
                 lba_bytes,
                 last_lba: 0,
                 generation,
@@ -1267,12 +1510,17 @@ fn sync_bridge<F: core::future::Future>(fut: F) -> F::Output {
     }
 }
 
-/// Per-device exclusion for one CBW → data → CSW exchange. Two sync callers
-/// on different tasks (the supervisor's partition scan and a FAT volume on
-/// the same stick, say) would otherwise interleave bulk-only-transport
-/// phases on the shared endpoints. Indices past the table are left
-/// unserialised (MSC_DEVICES is a handful of sticks in practice).
-const MSC_IO_SLOTS: usize = 16;
+/// Per-interface exclusion for one CBW → data → CSW exchange. Two
+/// sync callers on different tasks (the supervisor's partition
+/// scan and a FAT volume on the same stick, say) would otherwise
+/// interleave bulk-only-transport phases on the shared endpoints.
+/// The claim is keyed by xHCI **slot**, not by registry index:
+/// BOT is a one-command-at-a-time protocol per *interface*, and
+/// since #831 a multi-LUN device holds several registry entries
+/// (one per LUN) over the same slot and endpoint pair — keyed by
+/// index, two LUNs of one reader could interleave phases on the
+/// wire. Slots past the table are left unserialised.
+const MSC_IO_SLOTS: usize = 256;
 static MSC_IO_BUSY: [core::sync::atomic::AtomicBool; MSC_IO_SLOTS] =
     [const { core::sync::atomic::AtomicBool::new(false) }; MSC_IO_SLOTS];
 /// A holder can be preempted mid-exchange; each of its xHCI waits is bounded
@@ -1282,8 +1530,9 @@ const MSC_IO_CLAIM_MS: u64 = 2_000;
 struct MscIoClaim(Option<usize>);
 
 impl MscIoClaim {
-    fn acquire(idx: usize) -> Option<Self> {
+    fn acquire(slot_id: u8) -> Option<Self> {
         use core::sync::atomic::Ordering;
+        let idx = slot_id as usize;
         let Some(busy) = MSC_IO_BUSY.get(idx) else {
             return Some(Self(None));
         };
@@ -1370,10 +1619,10 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
     /// as an error, never as success (#829).
     fn flush(&self) -> Result<(), narf_block::BlockIoError> {
         let (c, dev_snapshot) = self.transport_snapshot()?;
-        let Some(_claim) = MscIoClaim::acquire(self.idx) else {
+        let Some(_claim) = MscIoClaim::acquire(dev_snapshot.slot_id) else {
             return Err(narf_block::BlockIoError::DriverError);
         };
-        let result = sync_bridge(async { dev_snapshot.synchronize_cache(&c).await });
+        let result = sync_bridge(async { dev_snapshot.synchronize_cache(&*c).await });
         match result {
             Ok(()) => Ok(()),
             Err(_) => Err(narf_block::BlockIoError::DriverError),
@@ -1401,13 +1650,13 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
         let (c, dev_snapshot) = self.transport_snapshot()?;
-        let Some(_claim) = MscIoClaim::acquire(self.idx) else {
+        let Some(_claim) = MscIoClaim::acquire(dev_snapshot.slot_id) else {
             return Err(narf_block::BlockIoError::DriverError);
         };
         sync_bridge(async {
             for (start, count, bytes) in chunks {
                 dev_snapshot
-                    .write_blocks_fua(&c, start, count, &data[bytes])
+                    .write_blocks_fua(&*c, start, count, &data[bytes])
                     .await
                     .map_err(|_| narf_block::BlockIoError::DriverError)?;
             }
@@ -1443,7 +1692,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         // anything against the current occupant. The hub context
         // rides along so the snapshot's transfer funnels can
         // resume / feed the port (#840).
-        let (slot_id, bulk_in_dci, bulk_out_dci, lba_bytes, generation, hub_port) = {
+        let (slot_id, bulk_in_dci, bulk_out_dci, lun, interface, lba_bytes, generation, hub_port) = {
             let g = MSC_DEVICES.lock();
             let dev = match g.get(self.idx).and_then(|slot| slot.as_ref()) {
                 Some(d) => d,
@@ -1456,6 +1705,8 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
                 dev.slot_id,
                 dev.bulk_in,
                 dev.bulk_out,
+                dev.lun,
+                dev.interface,
                 dev.lba_bytes,
                 dev.generation,
                 dev.hub_port,
@@ -1469,19 +1720,21 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             slot_id,
             bulk_in: bulk_in_dci,
             bulk_out: bulk_out_dci,
+            lun,
+            interface,
             lba_bytes,
             last_lba: 0,
             generation,
             tag: IrqSafeSpinLock::new(1),
             hub_port,
         };
-        let Some(_claim) = MscIoClaim::acquire(self.idx) else {
+        let Some(_claim) = MscIoClaim::acquire(slot_id) else {
             return Err(narf_block::BlockIoError::DriverError);
         };
         sync_bridge(async {
             for (start, count, bytes) in chunks {
                 let data = dev_snapshot
-                    .read_blocks(&c, start, count)
+                    .read_blocks(&*c, start, count)
                     .await
                     .map_err(|_| narf_block::BlockIoError::DriverError)?;
                 out[bytes].copy_from_slice(&data);
@@ -1507,7 +1760,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         // the disk that reused its index after a replug. The hub
         // context rides along so the snapshot's transfer funnels
         // can resume / feed the port (#840).
-        let (slot_id, bulk_in_dci, bulk_out_dci, lba_bytes, generation, hub_port) = {
+        let (slot_id, bulk_in_dci, bulk_out_dci, lun, interface, lba_bytes, generation, hub_port) = {
             let g = MSC_DEVICES.lock();
             let dev = match g.get(self.idx).and_then(|slot| slot.as_ref()) {
                 Some(d) => d,
@@ -1520,6 +1773,8 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
                 dev.slot_id,
                 dev.bulk_in,
                 dev.bulk_out,
+                dev.lun,
+                dev.interface,
                 dev.lba_bytes,
                 dev.generation,
                 dev.hub_port,
@@ -1533,19 +1788,21 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             slot_id,
             bulk_in: bulk_in_dci,
             bulk_out: bulk_out_dci,
+            lun,
+            interface,
             lba_bytes,
             last_lba: 0,
             generation,
             tag: IrqSafeSpinLock::new(1),
             hub_port,
         };
-        let Some(_claim) = MscIoClaim::acquire(self.idx) else {
+        let Some(_claim) = MscIoClaim::acquire(slot_id) else {
             return Err(narf_block::BlockIoError::DriverError);
         };
         sync_bridge(async {
             for (start, count, bytes) in chunks {
                 dev_snapshot
-                    .write_blocks(&c, start, count, &data[bytes])
+                    .write_blocks(&*c, start, count, &data[bytes])
                     .await
                     .map_err(|_| narf_block::BlockIoError::DriverError)?;
             }

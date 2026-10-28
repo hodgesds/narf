@@ -367,10 +367,13 @@ fn smoke_msc_config_descriptor_parse() -> TestResult {
         9, 2, 32, 0, 1, 1, 0, 0xC0, 0, 9, 4, 0, 0, 2, 0x08, 0x06, 0x50, 0, 7, 5, 0x81, 0x02, 0x00,
         0x02, 0, 7, 5, 0x02, 0x02, 0x00, 0x02, 0,
     ];
-    let (in_ep, out_ep) = match msc::find_bot_endpoints(&cfg) {
+    let (in_ep, out_ep, iface) = match msc::find_bot_endpoints(&cfg) {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("find_bot_endpoints rejected MSC blob"),
     };
+    if iface != 0 {
+        return TestResult::Fail("find_bot_endpoints returned wrong bInterfaceNumber");
+    }
     if in_ep.kind != EndpointKind::BulkIn || in_ep.ep_addr != 0x81 || in_ep.max_packet != 0x0200 {
         return TestResult::Fail("bulk-IN endpoint mis-decoded");
     }
@@ -892,7 +895,7 @@ fn smoke_msc_cbw_encode_round_trip() -> TestResult {
     let cb: [u8; 10] = [0x28, 0, 0x01, 0x02, 0x03, 0x04, 0, 0x00, 0x03, 0];
     let tag: u32 = 0xDEAD_BEEF;
     let data_len: u32 = 3 * 512;
-    let cbw = encode_cbw(tag, data_len, true, &cb);
+    let cbw = encode_cbw(tag, data_len, true, 0, &cb);
 
     let sig = u32::from_le_bytes([cbw[0], cbw[1], cbw[2], cbw[3]]);
     if sig != CBW_SIGNATURE {
@@ -922,7 +925,7 @@ fn smoke_msc_cbw_encode_round_trip() -> TestResult {
         return TestResult::Fail("CBW trailing bytes non-zero");
     }
     // OUT direction: bmCBWFlags bit 7 must be clear.
-    let cbw_out = encode_cbw(1, 512, false, &cb);
+    let cbw_out = encode_cbw(1, 512, false, 0, &cb);
     if cbw_out[12] & 0x80 != 0 {
         return TestResult::Fail("bmCBWFlags OUT direction bit set");
     }
@@ -1016,7 +1019,7 @@ fn smoke_msc_sync_cache_flush_conversation() -> TestResult {
     // The CBW for it: no data stage, so dCBWDataTransferLength = 0
     // and the direction bit stays OUT; the CDB rides in CBWCB.
     let tag: u32 = 0x0BAD_F00D;
-    let cbw = encode_cbw(tag, 0, false, &cdb);
+    let cbw = encode_cbw(tag, 0, false, 0, &cdb);
     if u32::from_le_bytes([cbw[0], cbw[1], cbw[2], cbw[3]]) != CBW_SIGNATURE {
         return TestResult::Fail("flush CBW signature wrong");
     }
