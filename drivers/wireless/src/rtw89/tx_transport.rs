@@ -368,10 +368,12 @@ pub fn prepare_header(
     };
     if fc & 0x4000 != 0
         && (chip != ChipId::Rtl8852B
-            || !matches!(fc & 0x00fc,8|0x88)
-            || fc & 0x0300 != 0x0100
-            //24 native header +8 CCMP IV +>=8 ciphertext +8 MIC.
-            || frame.len() < header_length+24
+            // Host-CCMP data to the AP, or (PMF) a robust disassociation,
+            // deauthentication or Action frame with no DS bits.
+            || !(matches!(fc & 0x00fc, 8 | 0x88) && fc & 0x0300 == 0x0100
+                || matches!(fc & 0x00fc, 0xa0 | 0xc0 | 0xd0) && fc & 0x0300 == 0)
+            //24 native header +8 CCMP IV +ciphertext (>=8 data, >=2 management) +8 MIC.
+            || frame.len() < header_length + if fc & 0x0c == 0 { 18 } else { 24 }
             || frame[header_length+2] != 0
             || frame[header_length+3] & 0x3f != 0x20
             || [frame[header_length], frame[header_length+1], frame[header_length+4], frame[header_length+5], frame[header_length+6], frame[header_length+7]] == [0; 6])

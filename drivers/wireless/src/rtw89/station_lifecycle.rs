@@ -170,13 +170,13 @@ impl<I: Io> Owner<I> {
         &mut self,
         bssid: [u8; 6],
         ssid: &[u8],
-        pmk: Option<zeroize::Zeroizing<[u8; 32]>>,
+        credential: super::station::Credential,
         ies: &[u8],
     ) -> Result<(), super::station::Error> {
         self.station
             .as_mut()
             .ok_or(super::station::Error::State)?
-            .associate(&mut self.io, bssid, ssid, pmk, ies)
+            .associate(&mut self.io, bssid, ssid, credential, ies)
             .await
     }
 }

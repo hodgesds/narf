@@ -8,7 +8,7 @@ use super::{
 };
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec, vec::Vec};
 use narf_wireless::{
-    association::{self, JoinPlan, ObservedBss, SecurityMode},
+    association::{self, AkmSet, JoinOptions, JoinPlan, ObservedBss, Pmf, SecurityMode},
     station_security::{self, RawFrame, Security},
 };
 use zeroize::Zeroizing;
@@ -263,6 +263,35 @@ enum Kind {
     /// Broadcast probe request (never acknowledged).
     Probe,
 }
+/// Association credential, mapped from `SecurityConfig` by the interface.
+pub(super) enum Credential {
+    Open,
+    /// WPA2-PSK PMK; PMF is negotiated (`ieee80211w=1`) from the AP RSNE.
+    Psk(Zeroizing<[u8; 32]>),
+    /// WPA3-Personal SAE password (`sae_pwe=2`, PMF required).
+    Sae(Zeroizing<Vec<u8>>),
+}
+/// mac80211 `ieee80211_process_sa_query_req`: an SA Query Request (category
+/// 8, action 0) from the bound AP to this station is answered with the same
+/// transaction identifier (`IEEE80211_MIN_ACTION_SIZE + sizeof(sa_query)`).
+pub(super) fn sa_query_response(frame: &[u8], own: [u8; 6], peer: [u8; 6]) -> Option<Vec<u8>> {
+    if frame.len() < 28
+        || frame[0] != 0xd0
+        || frame[1] & 0x40 != 0
+        || frame[4..10] != own
+        || frame[10..16] != peer
+        || frame[16..22] != peer
+        || frame[24..26] != [8, 0]
+    {
+        return None;
+    }
+    let mut response = vec![0xd0, 0, 0, 0];
+    response.extend_from_slice(&peer);
+    response.extend_from_slice(&own);
+    response.extend_from_slice(&peer);
+    response.extend_from_slice(&[0, 0, 8, 1, frame[26], frame[27]]);
+    Some(response)
+}
 /// Active-scan probe content: SSIDs (empty = wildcard) and caller IEs.
 pub(super) struct Probe {
     pub(super) ssids: Vec<Vec<u8>>,
@@ -332,6 +361,8 @@ pub(super) struct State {
     peer: Option<ObservedBss>,
     plan: Option<JoinPlan>,
     security: Option<Security>,
+    /// SAE exchange in progress (password element, scalars), boxed.
+    sae: Option<Box<narf_wireless::sae::SaeSession>>,
     incoming: VecDeque<Mpdu>,
     received: VecDeque<Vec<u8>>,
     /// Frames in flight, oldest first. More than one only for aggregated
@@ -398,6 +429,7 @@ impl State {
             peer: None,
             plan: None,
             security: None,
+            sae: None,
             incoming: VecDeque::new(),
             received: VecDeque::new(),
             pending: VecDeque::new(),
@@ -480,7 +512,9 @@ impl State {
         Ok(())
     }
     pub(super) fn stop(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        self.sae = None;
         self.wmm = None;
+
         self.edca_pending = None;
         self.qos_all = false;
         self.firmware_ra = false;
@@ -597,6 +631,14 @@ impl State {
         if assign && !matches!(kind, Kind::Security | Kind::Data) {
             bytes[22..24].copy_from_slice(&(self.sequence << 4).to_le_bytes());
             self.sequence = (self.sequence + 1) & 4095;
+        }
+        // PMF: robust Action frames (Block Ack, SA Query) to the AP are
+        // host-CCMP protected once the port is open (RTL8852B has no
+        // `hw_mgmt_tx_encrypt`; mac80211 `ieee80211_tx_h_encrypt`).
+        if kind == Kind::Action {
+            if let Some(security) = self.security.as_mut().filter(|s| s.pmf() && s.port_open()) {
+                bytes = security.protect_management(&bytes)?;
+            }
         }
         let rate = if kind == Kind::Data && self.wmm.is_some() && self.firmware_ra {
             // rtw89_core_get_data_rate: lowest negotiated rate bounds retries.
@@ -1114,6 +1156,16 @@ impl State {
                 break;
             }
             if let Some(frame) = step.frame {
+                let Some(frame) = self.admit_management(frame)? else {
+                    continue;
+                };
+                if self.phase == Phase::Open && self.mgmt_out.len() < 8 {
+                    let peer = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                    if let Some(response) = sa_query_response(frame.bytes(), self.own, peer) {
+                        self.mgmt_out.push_back(response);
+                        continue;
+                    }
+                }
                 self.observe_wmm(&frame)?;
                 if self.lost(&frame) {
                     return Err(Error::PeerLost);
@@ -1157,6 +1209,28 @@ impl State {
                 break;
             };
             match self.phase {
+                Phase::Authentication if self.sae.is_some() => {
+                    use narf_wireless::association::SaeStep;
+                    let plan = self.plan.as_mut().ok_or(Error::State)?;
+                    let session = self.sae.as_mut().ok_or(Error::State)?;
+                    let next = match plan.sae_authentication_response(frame.bytes(), session)? {
+                        SaeStep::Ignored => None,
+                        SaeStep::Transmit(bytes) => Some((false, bytes.to_vec())),
+                        SaeStep::Associate(bytes) => Some((true, bytes.to_vec())),
+                    };
+                    match next {
+                        None => {}
+                        Some((false, commit)) => self.transmit(io, commit, Kind::Authentication)?,
+                        Some((true, mut association)) => {
+                            self.start_sae_security()?;
+                            if self.wmm.is_some() {
+                                association.extend_from_slice(&narf_wireless::wmm::INFORMATION);
+                            }
+                            self.phase = Phase::Association;
+                            self.transmit(io, association, Kind::Association)?;
+                        }
+                    }
+                }
                 Phase::Authentication => {
                     if let Some(mut association) = self
                         .plan
@@ -1310,6 +1384,49 @@ impl State {
             Ok(Vec::new())
         }
     }
+    /// PMF management admission before any MLME/BA consumer (mac80211
+    /// `ieee80211_drop_unencrypted_mgmt`, host `ieee80211_crypto_ccmp_decrypt`
+    /// and `ieee80211_crypto_aes_cmac_decrypt`). Frames from other BSSs and
+    /// non-PMF associations pass unchanged; `None` drops the frame.
+    fn admit_management(&mut self, frame: Mpdu) -> Result<Option<Mpdu>, Error> {
+        let Some(peer) = self.peer.as_ref().map(|p| p.bss.bssid) else {
+            return Ok(Some(frame));
+        };
+        let Some(security) = self.security.as_mut().filter(|s| s.pmf()) else {
+            return Ok(Some(frame));
+        };
+        let bytes = frame.bytes();
+        if bytes.first().is_none_or(|fc| fc & 0x0c != 0) || bytes.get(10..16) != Some(&peer[..]) {
+            return Ok(Some(frame));
+        }
+        Ok(match security.receive_management(&frame)? {
+            station_security::MgmtRx::Ignored => None,
+            station_security::MgmtRx::Frame(bytes) => Some(Mpdu::new(bytes)),
+        })
+    }
+    /// The accepted SAE's PMK becomes the WPA3 key owner (`Security::new_sae`)
+    /// before the association request; the SAE session is dropped here.
+    fn start_sae_security(&mut self) -> Result<(), Error> {
+        let session = self.sae.take().ok_or(Error::State)?;
+        let pmk = Zeroizing::new(*session.pmk().ok_or(Error::Profile)?);
+        drop(session);
+        let plan = self.plan.as_ref().ok_or(Error::State)?;
+        let peer = self.peer.as_ref().ok_or(Error::State)?;
+        let station_rsne = plan.rsn_body().ok_or(Error::Profile)?;
+        let station_rsnxe = plan.sae().and_then(|sae| sae.station_rsnxe());
+        self.security = Some(Security::new_sae(
+            self.own,
+            peer.bss.bssid,
+            &pmk,
+            &station_rsne,
+            station_rsnxe.as_deref(),
+            peer.ap_rsne.as_deref().ok_or(Error::Profile)?,
+            peer.ap_rsnxe.as_deref(),
+            3,
+        )?);
+        self.initial_nonce = Some(self.environment.nonce().ok_or(Error::Entropy)?);
+        Ok(())
+    }
     pub(super) async fn scan_for(
         &mut self,
         io: &mut impl Io,
@@ -1433,7 +1550,7 @@ impl State {
         io: &mut impl Io,
         bssid: [u8; 6],
         ssid: &[u8],
-        pmk: Option<Zeroizing<[u8; 32]>>,
+        credential: Credential,
         ies: &[u8],
     ) -> Result<(), Error> {
         if self.phase() != Phase::Passive {
@@ -1447,10 +1564,32 @@ impl State {
         if candidate.bss.channel != 1 || candidate.basic_rates & 1 == 0 {
             return Err(Error::Profile);
         }
-        let mode = if pmk.is_some() {
-            SecurityMode::Wpa2Psk
-        } else {
-            SecurityMode::Open
+        // rtw89 sets MFP_CAPABLE: WPA2 offers MFPC (`ieee80211w=1`, PMF and
+        // PSK-SHA256 admitted) to an AP that advertises MFPC; otherwise the
+        // legacy RSNE is kept. WPA3 is SAE with PMF required.
+        let ap_mfpc = candidate
+            .ap_rsne
+            .as_deref()
+            .and_then(narf_wireless::rsn::RsnIe::decode_body)
+            .is_some_and(|rsn| rsn.rsn_capabilities & narf_wireless::rsn::RSN_CAP_MFP_CAPABLE != 0);
+        let (mode, options) = match &credential {
+            Credential::Open => (SecurityMode::Open, JoinOptions::default()),
+            Credential::Psk(_) => (
+                SecurityMode::Wpa2Psk,
+                if ap_mfpc {
+                    JoinOptions::default()
+                        .with_akms(AkmSet::PSK.with(AkmSet::PSK_SHA256))
+                        .with_pmf(Pmf::Optional)
+                } else {
+                    JoinOptions::default()
+                },
+            ),
+            Credential::Sae(_) => (
+                SecurityMode::Wpa3Sae {
+                    pwe: narf_wireless::association::SaePwe::Both,
+                },
+                JoinOptions::default().with_akms(AkmSet::SAE),
+            ),
         };
         // HT is offered only with an AP WMM element and the signed HT20
         // program (which itself requires WMM and firmware RA).
@@ -1468,12 +1607,45 @@ impl State {
                 let he = super::station_control::local_he().ok_or(Error::Profile)?;
                 local = local.with_he(he).map_err(|_| Error::Profile)?;
             }
-            JoinPlan::prepare_with_phy(&candidate.bss, self.own, ssid, mode, local)?
+            JoinPlan::prepare_with_options(
+                &candidate.bss,
+                self.own,
+                ssid,
+                mode,
+                Some(local),
+                options,
+            )?
         } else {
-            JoinPlan::prepare(&candidate.bss, self.own, ssid, mode)?
+            JoinPlan::prepare_with_options(&candidate.bss, self.own, ssid, mode, None, options)?
         };
         plan.append_sme_ies(ies)?;
-        if let Some(pmk) = pmk {
+        if let Credential::Sae(password) = &credential {
+            use narf_wireless::sae::{SaeError, SaeSession};
+            let join = plan.sae().ok_or(Error::Profile)?;
+            let mut session = if join.h2e() {
+                SaeSession::new_h2e_bytes(ssid, password, self.own, bssid)
+            } else {
+                SaeSession::new_hunt_and_peck(password, self.own, bssid)
+            };
+            if let Some(selector) = join.akm_suite_selector() {
+                session = session
+                    .with_akm_suite_selector(selector)
+                    .map_err(|_| Error::Profile)?;
+            }
+            let mut session = Box::new(session);
+            let environment = self.environment.clone();
+            session
+                .try_build_commit_with_entropy(|out| {
+                    for chunk in out.chunks_mut(32) {
+                        let random = environment.nonce().ok_or(SaeError::EntropyUnavailable)?;
+                        chunk.copy_from_slice(&random[..chunk.len()]);
+                    }
+                    Ok(())
+                })
+                .map_err(|_| Error::Entropy)?;
+            self.sae = Some(session);
+        }
+        if let Credential::Psk(pmk) = credential {
             let nonce = self.environment.nonce().ok_or(Error::Entropy)?;
             let station_rsne = plan.rsn_body().ok_or(Error::Profile)?;
             self.security = Some(Security::new(
@@ -1507,7 +1679,11 @@ impl State {
         self.peer = Some(candidate);
         self.deadline = self.now()?.saturating_add(5000);
         self.last_peer = self.last_now;
-        let auth = plan.start_authentication()?.to_vec();
+        let auth = match self.sae.as_deref() {
+            Some(session) => plan.start_sae_authentication(session)?.to_vec(),
+            None => plan.start_authentication()?.to_vec(),
+        };
+
         self.plan = Some(plan);
         self.phase = Phase::Authentication;
         let admission = self.admission.clone();

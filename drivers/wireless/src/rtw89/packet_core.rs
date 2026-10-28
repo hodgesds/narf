@@ -125,6 +125,12 @@ pub(super) struct Receipt {
 pub(super) struct Frame {
     bytes: Vec<u8>,
 }
+impl Frame {
+    /// A host-admitted copy (PMF management with CCMP/BIP removed).
+    pub(super) fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+}
 impl narf_wireless::station_security::RawFrame for Frame {
     fn bytes(&self) -> &[u8] {
         &self.bytes

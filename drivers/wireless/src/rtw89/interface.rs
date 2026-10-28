@@ -548,9 +548,11 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         let bytes = self.bssid.load(Ordering::Acquire).to_le_bytes();
         (bytes[7] != 0).then(|| bytes[..6].try_into().unwrap())
     }
+    /// CCMP-128 data plus host BIP-CMAC-128 for PMF group management.
     fn cipher_suites(&self) -> &'static [u32] {
-        &[0x000fac04]
+        &[0x000fac04, 0x000fac06]
     }
+
     fn scan_information_elements(&self, bssid: [u8; 6]) -> Option<Vec<u8>> {
         self.lifecycle
             .retained
@@ -592,9 +594,13 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         if request.channel != 1 || request.frequency_mhz != 2412 {
             return Err(WirelessError::NotSupported);
         }
-        let pmk = match request.security {
-            SecurityConfig::Open => None,
-            SecurityConfig::Wpa2 { psk } => Some(Zeroizing::new(psk)),
+        let credential = match request.security {
+            SecurityConfig::Open => station::Credential::Open,
+            SecurityConfig::Wpa2 { psk } => station::Credential::Psk(Zeroizing::new(psk)),
+            // SAE password limits as wpa_supplicant/cfg80211 (1..=128).
+            SecurityConfig::Wpa3 { password } if (1..=128).contains(&password.len()) => {
+                station::Credential::Sae(Zeroizing::new(password))
+            }
             _ => return Err(WirelessError::NotSupported),
         };
         let mut attempt = Attempt {
@@ -612,7 +618,7 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             self.rings.lock().await.clear();
         }
         let result = owner
-            .station_associate(request.bssid, &request.ssid, pmk, &request.ie)
+            .station_associate(request.bssid, &request.ssid, credential, &request.ie)
             .await;
         attempt.armed = false;
         if self.closed() {

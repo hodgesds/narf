@@ -1201,6 +1201,63 @@ TX A-MSDU (`IEEE80211_HW_TX_AMSDU`, `SUPPORTS_AMSDU_IN_AMPDU`) is not part
 of this emitter. The ADDBA Response A-MSDU bit is ignored, and the
 remaining `aggregation` work is listed in the open-row table.
 
+### Protected management frames and WPA3-SAE
+
+rtw89 sets `IEEE80211_HW_MFP_CAPABLE` (Linux v7.2 `core.c::rtw89_core_register_hw`).
+RTL8852B has `hw_mgmt_tx_encrypt = false` (`rtw8852b.c`), and this profile
+runs all crypto on the host (`SEC_ENG_CTRL` off). PMF is therefore the
+mac80211 software path on the shared `station_security::Security`.
+
+- **Join.** `SecurityConfig::Wpa2` joins with
+  `JoinOptions::with_akms(PSK|PSK_SHA256).with_pmf(Pmf::Optional)`
+  (`ieee80211w=1`) when the AP RSNE advertises MFPC, so PMF is in force
+  and an MFPR AP is accepted. Against a non-MFPC AP the legacy RSNE is
+  kept unchanged.
+- **WPA3-SAE.** `SecurityConfig::Wpa3 { password }` (1..=128 octets) is
+  `SecurityMode::Wpa3Sae { pwe: Both }` with AKM 8. The station builds a
+  boxed `SaeSession`: H2E when the AP advertises it, else
+  hunting-and-pecking. The Commit scalar comes from `Environment::nonce`
+  entropy. The station then runs `JoinPlan::start_sae_authentication` and
+  `sae_authentication_response` (Commit, anti-clogging retries and Confirm,
+  like mac80211 `ieee80211_send_auth` for an SME-driven SAE), and on
+  acceptance moves the PMK into `Security::new_sae` before the association
+  request. The session is dropped then, and on stop.
+- **RX.** Before any MLME, Block Ack or loss consumer, a management frame
+  from the bound AP on a PMF association goes through
+  `Security::receive_management`. This is mac80211
+  `ieee80211_drop_unencrypted_mgmt` with host `ieee80211_crypto_ccmp_decrypt`
+  and `ieee80211_crypto_aes_cmac_decrypt`. Once the PTK is installed:
+  - unprotected robust unicast frames, management PN replays and failed
+    BIP MMIEs are dropped;
+  - a CCMP-protected deauthentication or disassociation, or a valid
+    BIP-protected broadcast one (IGTK from the message-3 KDE), ends the
+    link as before.
+  - Beacons and other BSSs pass unchanged.
+- **SA Query.** An SA Query Request to this station on an open link is
+  answered with the same transaction identifier
+  (`ieee80211_process_sa_query_req`).
+- **TX.** Robust Action frames (SA Query Response, Block Ack actions) are
+  CCMP-protected with `Security::protect_management` after the sequence
+  number is assigned, once the port is open (mac80211
+  `ieee80211_tx_h_encrypt`). `packet_format::classify` now admits the
+  Protected bit on disassociation, deauthentication and Action frames
+  only, and `tx_transport::prepare_header` admits those frames already
+  host-encrypted (CCMP header plus at least 2 octets of ciphertext). The
+  TXWD carries no SEC fields, as Linux does when `hw_mgmt_tx_encrypt` is
+  false.
+- **Cipher suites.** `cipher_suites` lists CCMP-128 and BIP-CMAC-128.
+
+No operating program gates PMF or SAE: they change neither the RF emitter
+nor any TXWD rate field. The smoke runs on the base profile, which is the
+program-not-granted case. Smoke: `smoke_rtw8852b_pmf_wpa2_sa_query_bip_and_wpa3_sae`:
+- WPA2-PSK against an MFPR AP: PMF negotiated, unprotected SA Query
+  dropped, protected SA Query answered under CCMP with its ID;
+- replayed PN, unprotected deauthentication and forged BIP deauthentication
+  dropped, and a valid BIP broadcast deauthentication ends the link;
+- WPA3-SAE H2E association, then SAE-PTK uplink, then teardown;
+- a wrong SAE password associates nothing and installs no keys.
+
+
 
 ### Active scanning, probe IEs and dwell control
 
@@ -1524,7 +1581,6 @@ Each blocker below was re-checked against this tree.
 | `eht` | Needs the RTL8922A chip row first. `efuse.rs` returns `UnsupportedChip` for 8922A, `irq::Mask::config` rejects the `_v2` layout, there is no BE TXD/RXD (`txrx.h` `BE_TXD_*`) or BE RA H2C (`rtw89_h2c_ra_v1`, `RTW89_H2C_RA_V1_W4_MODE_EHT`), and `station_control::Controller::new` plus the `N52B` qualification record are RTL8852B-only. The shared `association::eht` API is not the gap. |
 | `aggregation` | TX A-MPDU now exists (section "Originator Block Ack and TX A-MPDU"). What is left is TX A-MSDU and A-MSDU-in-A-MPDU (Linux v7.2 `core.c::rtw89_core_register_hw` `TX_AMSDU`/`SUPPORTS_AMSDU_IN_AMPDU`, mac80211 `tx.c::ieee80211_amsdu_aggregate`). `interface.rs` drains one Ethernet frame per `State::send`, with no per-TID txq batching to hand `Security::transmit_amsdu_qos` several frames. `packet_format::classify` refuses the QoS A-MSDU-present bit (`frame[24] & 0xf8`) and any MPDU above `MAX_MPDU` 2304, below the peer HT 3839/7935-byte A-MSDU limit. The ADDBA Response A-MSDU bit (`IEEE80211_TXQ_NO_AMSDU`) is parsed but unused. The aggregate program fingerprint excludes A-MSDU, so it needs its own measured `Program`. |
 
-| `pmf` | Shared layer now provides `FakeAp::wpa3_sae`/`with_pmf`/`with_igtk`/`bip_broadcast_deauth`, `JoinOptions::{akms,pmf}` and the WPA2-PMF RSNE (merge e295558ed). The rtw89 gap remains: `station.rs::associate` builds Open/WPA2-PSK only, `interface.rs` maps only `SecurityConfig::Open`/`Wpa2`, there is no SAE commit/confirm path through `JoinPlan::start_sae_authentication`, and `packet_format::classify` refuses management frames with the Protected bit (host CCMP/BIP on RTL8852B, `hw_mgmt_tx_encrypt` false). |
 | `he_htc` | Shared `Security` now accepts +HTC QoS DATA on RX (merge e295558ed). rtw89 still needs RX admission of the Order bit in `packet_core::receive`/`packet_format`, the HTC_HE capability advertisement, and TX insertion (`__rtw89_core_tx_adjust_he_qos_htc`) gated by RA C2H `might_fallback_legacy` (`rtw89_phy_c2h_ra_rpt_iter`), which the firmware-RA path does not decode yet. |
 
 ### Upstream applicability triage (2026-10-27)

@@ -123,6 +123,12 @@ pub(super) struct Peer {
     pub(super) addba: Option<(u16, u16)>,
 }
 impl Peer {
+    /// A peer around a caller-built AP (WPA3-SAE, PMF profiles).
+    pub(super) fn from_ap(ap: FakeAp) -> Self {
+        let mut peer = Self::new(false);
+        peer.ap = ap;
+        peer
+    }
     pub(super) fn new(protected: bool) -> Self {
         let plan = NetworkPlan {
             station: OWN,
@@ -180,14 +186,8 @@ impl Peer {
         let mut body = vec![0xaa, 0xaa, 3, 0, 0, 0];
         body.extend_from_slice(&ethernet[12..]);
         if self.ap.protected() {
-            let key: &[u8; 16] = self
-                .ptk
-                .as_ref()
-                .ok_or("AP missing TK")?
-                .tk
-                .as_slice()
-                .try_into()
-                .map_err(|_| "AP TK extent")?;
+            // The AP's own PTK (PSK or SAE PMK) keys the downlink.
+            let key = &self.ap.pairwise_tk().ok_or("AP missing TK")?;
             body = narf_wireless::ccmp::protect(&Ccm, &frame, key, self.pn, 0, 0, false, &mut body)
                 .map_err(|_| "AP downlink CCMP")?;
             self.pn += 1;
@@ -302,14 +302,7 @@ impl Peer {
         };
         let mut body = frame[header..].to_vec();
         if self.ap.protected() {
-            let key: &[u8; 16] = self
-                .ptk
-                .as_ref()
-                .ok_or("AP missing uplink TK")?
-                .tk
-                .as_slice()
-                .try_into()
-                .map_err(|_| "AP uplink TK extent")?;
+            let key = &self.ap.pairwise_tk().ok_or("AP missing uplink TK")?;
             body = narf_wireless::ccmp::unprotect(
                 &Ccm,
                 &frame[..header],
@@ -737,6 +730,8 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
 
 type TestDevice = Device<DriverModel>;
 static ACTIVE_TEST: IrqSafeSpinLock<Option<Arc<TestDevice>>> = IrqSafeSpinLock::new(None);
+/// AP for the next `Harness` build (PMF/SAE profiles); consumed once.
+static NEXT_AP: IrqSafeSpinLock<Option<Box<FakeAp>>> = IrqSafeSpinLock::new(None);
 fn send(bytes: &[u8], meta: TxMeta) -> Result<(), ()> {
     let device = ACTIVE_TEST.lock().clone().ok_or(())?;
     device.enqueue(bytes, meta)
@@ -816,7 +811,11 @@ impl Harness {
             clock: io.clock.clone(),
             entropy: AtomicBool::new(true),
         });
-        let mut peer = Peer::new(protected);
+        let next = NEXT_AP.lock().take();
+        let mut peer = match next {
+            Some(ap) => Peer::from_ap(*ap),
+            None => Peer::new(protected),
+        };
         if let Some(rates) = rates {
             peer.ap = peer.ap.with_legacy_rates(rates).unwrap();
         }
@@ -2593,4 +2592,201 @@ fn smoke_rtw8852b_originator_block_ack_tx_ampdu() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89/block_ack",
     smoke_rtw8852b_originator_block_ack_tx_ampdu
+);
+
+fn network() -> NetworkPlan {
+    NetworkPlan {
+        station: OWN,
+        bssid: AP,
+        server_ip: [10, 88, 1, 1],
+        lease_ip: [10, 88, 1, 42],
+        netmask: [255, 255, 255, 0],
+        lease_seconds: 3600,
+    }
+}
+/// Unprotected management frame from the AP to the station.
+fn ap_management(subtype: u8, body: &[u8]) -> Vec<u8> {
+    let mut frame = vec![subtype, 0, 0, 0];
+    frame.extend_from_slice(&OWN);
+    frame.extend_from_slice(&AP);
+    frame.extend_from_slice(&AP);
+    frame.extend_from_slice(&[0x30, 0]);
+    frame.extend_from_slice(body);
+    frame
+}
+/// The AP's host-CCMP management protection under its pairwise TK.
+fn ap_protect(h: &Harness, frame: &[u8], pn: u64) -> Vec<u8> {
+    let tk = h.peer.lock().ap.pairwise_tk().unwrap();
+    let mut header = frame[..24].to_vec();
+    header[1] |= 0x40;
+    let mut body = frame[24..].to_vec();
+    let wire = narf_wireless::ccmp::protect(&Ccm, &header, &tk, pn, 0, 0, true, &mut body).unwrap();
+    header.extend_from_slice(&wire);
+    header
+}
+fn sa_query_responses(h: &Harness) -> Vec<Vec<u8>> {
+    h.peer
+        .lock()
+        .actions
+        .iter()
+        .filter(|a| a.len() > 24)
+        .cloned()
+        .collect()
+}
+const SAE_PASSWORD: &[u8] = b"narf rtw89 sae";
+fn sae_request(password: &[u8]) -> AssociateRequest {
+    AssociateRequest {
+        bssid: AP,
+        ssid: SSID.to_vec(),
+        frequency_mhz: 2412,
+        channel: 1,
+        security: SecurityConfig::Wpa3 {
+            password: password.to_vec(),
+        },
+        ie: Vec::new(),
+    }
+}
+fn smoke_rtw8852b_pmf_wpa2_sa_query_bip_and_wpa3_sae() -> TestResult {
+    use narf_wifi_fixtures::{ApPmf, ApSaePwe};
+    // WPA2-PSK against an MFPR AP: MFPC is advertised and PMF negotiated.
+    let ap = FakeAp::wpa2(network(), SSID, 1, 42, PMK, ANONCE)
+        .and_then(FakeAp::with_basic_1mbps)
+        .and_then(|ap| ap.with_pmf(ApPmf::Required));
+    let Ok(ap) = ap else {
+        return TestResult::Fail("PMF AP fixture");
+    };
+    *NEXT_AP.lock() = Some(Box::new(ap));
+    let h = Harness::new(true);
+    if h.join().is_err() || !h.peer.lock().ap.pmf() {
+        return TestResult::Fail("WPA2-PSK PMF association failed");
+    }
+    // Failure: an unprotected robust SA Query Request is dropped.
+    let request = ap_management(0xd0, &[8, 0, 0x34, 0x12]);
+    let _ = h.model(|io| io.packets.inject(&request));
+    h.pump();
+    h.pump();
+    if !sa_query_responses(&h).is_empty() || !h.device.link_up() {
+        return TestResult::Fail("unprotected SA Query answered under PMF");
+    }
+    // Success: the CCMP-protected request is answered, protected, with
+    // the same transaction identifier.
+    let protected = ap_protect(&h, &request, 100);
+    let _ = h.model(|io| io.packets.inject(&protected));
+    h.pump();
+    h.pump();
+    let responses = sa_query_responses(&h);
+    let Some(response) = responses.first() else {
+        let tx = h.model(|io| {
+            io.packets
+                .transmitted
+                .iter()
+                .filter(|b| b[0] == 0xd0)
+                .count()
+        });
+        let pmf = h.peer.lock().ap.pmf();
+        return TestResult::Fail(match (h.device.link_up(), tx, pmf) {
+            (false, _, _) => "protected SA Query closed the link",
+            (true, 0, _) => "protected SA Query: nothing transmitted",
+            _ => "protected SA Query: transmitted but not recorded",
+        });
+    };
+    let tk = h.peer.lock().ap.pairwise_tk().unwrap();
+    let mut replay = narf_wireless::ccmp::ReplayWindow { last_seen_pn: 0 };
+    let mut body = response[24..].to_vec();
+    let plain =
+        narf_wireless::ccmp::unprotect(&Ccm, &response[..24], &tk, 0, true, &mut replay, &mut body);
+    if responses.len() != 1
+        || response[..2] != [0xd0, 0x40]
+        || response[4..10] != AP
+        || plain.as_deref() != Ok(&[8, 1, 0x34, 0x12][..])
+    {
+        return TestResult::Fail("SA Query response not CCMP-protected or differs");
+    }
+    // A replayed management PN, an unprotected deauthentication and a
+    // forged BIP deauthentication are all dropped.
+    let _ = h.model(|io| io.packets.inject(&protected));
+    let _ = h.model(|io| io.packets.inject(&ap_management(0xc0, &[7, 0])));
+    let Ok(valid) = h.peer.lock().ap.bip_broadcast_deauth(3) else {
+        return TestResult::Fail("BIP deauth fixture");
+    };
+    let mut forged = valid.clone();
+    let last = forged.len() - 1;
+    forged[last] ^= 1;
+    let _ = h.model(|io| io.packets.inject(&forged));
+    h.pump();
+    h.pump();
+    if sa_query_responses(&h).len() != 1 || !h.device.link_up() {
+        return TestResult::Fail("replayed/unprotected/forged management frame admitted");
+    }
+    // Teardown: a valid BIP-protected broadcast deauthentication ends it.
+    let _ = h.model(|io| io.packets.inject(&valid));
+    h.pump();
+    h.pump();
+    if h.device.link_up() || h.device.connected_bssid().is_some() {
+        return TestResult::Fail("BIP deauthentication did not end the PMF link");
+    }
+    drop(h);
+    // WPA3-SAE (H2E): Commit/Confirm through the shared plan, then the
+    // 4-way under the SAE PMK with PMF required.
+    let Ok(ap) = FakeAp::wpa3_sae(
+        network(),
+        SSID,
+        1,
+        42,
+        SAE_PASSWORD,
+        ApSaePwe::HashToElement,
+        ANONCE,
+    )
+    .and_then(FakeAp::with_basic_1mbps) else {
+        return TestResult::Fail("SAE AP fixture");
+    };
+    *NEXT_AP.lock() = Some(Box::new(ap));
+    let h = Harness::new(true);
+    h.scan();
+    if complete(h.device.associate(sae_request(SAE_PASSWORD))).is_err()
+        || !h.device.link_up()
+        || !h.peer.lock().ap.pmf()
+        || h.peer.lock().ap.akm() != Some(narf_wireless::eapol::KeyMgmt::Sae)
+    {
+        return TestResult::Fail("WPA3-SAE association failed");
+    }
+    let frame = udp_ipv4(AP, OWN, h.plan.lease_ip, h.plan.server_ip, 7000, 9, b"sae");
+    if narf_net::iface::send_on(h.device.name(), &frame).is_err() {
+        return TestResult::Fail("SAE uplink refused");
+    }
+    h.pump();
+    if h.peer.lock().uplink.last() != Some(&frame) {
+        return TestResult::Fail("SAE PTK uplink not received by the AP");
+    }
+    if complete(h.device.disassociate()).is_err() || h.device.link_up() {
+        return TestResult::Fail("SAE teardown failed");
+    }
+    drop(h);
+    // Failure: a wrong SAE password never reaches association or keys.
+    let Ok(ap) = FakeAp::wpa3_sae(
+        network(),
+        SSID,
+        1,
+        42,
+        SAE_PASSWORD,
+        ApSaePwe::HashToElement,
+        ANONCE,
+    )
+    .and_then(FakeAp::with_basic_1mbps) else {
+        return TestResult::Fail("SAE AP fixture");
+    };
+    *NEXT_AP.lock() = Some(Box::new(ap));
+    let h = Harness::new(true);
+    h.scan();
+    if complete(h.device.associate(sae_request(b"wrong password"))).is_ok()
+        || h.device.link_up()
+        || h.peer.lock().ap.pairwise_tk().is_some()
+    {
+        return TestResult::Fail("wrong SAE password associated");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/pmf",
+    smoke_rtw8852b_pmf_wpa2_sa_query_bip_and_wpa3_sae
 );
