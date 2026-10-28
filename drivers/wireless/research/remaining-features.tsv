@@ -128,7 +128,6 @@ iwlwifi	eht	EHT on applicable Wi-Fi7 profiles	feature	drivers/wireless/specifica
 iwlwifi	gen2_pmf	Gen2 PMF	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	gen2_vht	Gen2 VHT	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	gen2_wpa3	Gen2 WPA3	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	group_nested_rx	Group-addressed nested A-MSDU-in-A-MPDU RX	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	he	HE	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	ht40	HT40	feature	drivers/wireless/specification/iwlwifi.md	1552
 iwlwifi	ldpc	TX LDPC (TLC_MNG_CFG_FLAGS_LDPC; RX LDPC implemented in §3.28)	feature	drivers/wireless/specification/iwlwifi.md	1734

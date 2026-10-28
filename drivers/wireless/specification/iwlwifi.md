@@ -1552,7 +1552,7 @@ each feature; a Linux chip name or helper structure does not grant a capability.
 
 | Profile | Implemented reachable software | Remaining software gates |
 |---|---|---|
-| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles (Linux Qu PCI IDs 0x02f0/0x06f0/0x34f0/0x3df0/0x4df0/0x43f0/0xa0f0, §3.26) | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO (with §3.28 RX LDPC/STBC1), signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement preceded by §3.25 over-air leaving deauthentication. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced reconnect restoration, extended in §3.30 to cross-peer/cross-index GTK restore, safe same-peer PTK reuse and a radio-scoped ledger across native owners; §3.31 generic tag5 feature programs with per-TID QoS queues for all four ACs; §3.29 firmware/transport recovery and non-WoWLAN system suspend/resume. Authored, execution pending: §3.24 tag4 negotiated unicast-local nested recipient A-MSDU-in-A-MPDU with complete bundles before sequence/PN ownership. | Active probes (scan firmware's emitter/power binding needs source proof); alternate ML BAID; group-addressed nested RX; TX A-MSDU; HT40/NSS2/VHT/HE/TX LDPC/TX STBC; PMF/WPA3; persistent key history. AP/P2P, WoW (with its D3 ARP/NS/GTK offloads), the §3.27 scheduled-scan offload and multiple RX/RSS remain unimplemented even where hardware supports them. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
+| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles (Linux Qu PCI IDs 0x02f0/0x06f0/0x34f0/0x3df0/0x4df0/0x43f0/0xa0f0, §3.26) | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO (with §3.28 RX LDPC/STBC1), signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement preceded by §3.25 over-air leaving deauthentication. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced reconnect restoration, extended in §3.30 to cross-peer/cross-index GTK restore, safe same-peer PTK reuse and a radio-scoped ledger across native owners; §3.31 generic tag5 feature programs with per-TID QoS queues for all four ACs; §3.29 firmware/transport recovery and non-WoWLAN system suspend/resume. Authored, execution pending: §3.24 tag4 negotiated unicast-local nested recipient A-MSDU-in-A-MPDU with complete bundles before sequence/PN ownership. | Active probes (scan firmware's emitter/power binding needs source proof); alternate ML BAID; TX A-MSDU; HT40/NSS2/VHT/HE/TX LDPC/TX STBC; PMF/WPA3; persistent key history. AP/P2P, WoW (with its D3 ARP/NS/GTK offloads), the §3.27 scheduled-scan offload and multiple RX/RSS remain unimplemented even where hardware supports them. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
 | AX210/AX211/AX411 and Bz/BE200 Gen3 transports | Context-v2, generation-selected completion layouts, firmware/PNVM/native boot and MLD helpers. Software-validated continuation: source-selected command-ID header0/explicit RLC2, receipt-fenced TVQM/BAID retirement, retained actual executable/PNVM/PCI authority and immutable DMA-copy receive/publication epochs. | Station admission remains dependent on the exact negotiated MAC/link/STA/TLC/key payload profile; no new payload profile is enabled by the header/source audit. Sc conversation tests do not establish another family's ABI, platform power/SAR program or hardware. Current live regulatory/power ownership remains separate. |
 | Sc c103/BE211 MLD station profile | Deferred retained native publication, actual station/management/data/Open-WPA2-SAE conversations, legacy/HT/VHT to80MHz, key/BA/reorder and userspace SME/port ownership in the existing profile. §§3.21–3.22 header/TVQM, positive BA response/RX-marker retirement, retained executable/PNVM/current-PCI publication and copy-time key epochs passed coordinated native tests on both architectures. | These source/epoch fences do not establish underlying RF quiescence or current live-regulatory/platform-power qualification. HE/EHT/6GHz and MLO,160/320MHz, AP/P2P and the §3.27 scheduled-scan offload remain separate (non-WoWLAN system suspend/resume is §3.29) implementations and must not be inferred from single-link Sc fixtures. |
 | Other advertised PCI/firmware combinations | Identification/firmware selection where defined, including the Linux So/Ma/Bz IDs added in §3.26; 0x7df0 is identification-only (Linux 7.3 `pcie/drv.c` claims no 0x7DF0) and exact admission rejects it | No fallback admits an unknown command table, calibration profile, topology or PHY width. They need their exact source-backed authority/command/receipt/lifetime path. |
@@ -1607,7 +1607,8 @@ A-MSDU bytes including original subheader/padding accounting, and a100ms
 partial deadline. Native recipient MPDUs remain FromDS/unicast to the local
 station, with source station/AP/channel/key/MIC/PHY/header facts checked before
 storage and again on release. Group-addressed nested subframes remain closed;
-this bounded profile supplies no inferred outer-unicast/PTK identity for them.
+this bounded profile supplies no inferred outer-unicast/PTK identity for them; §3.32 records why group-addressed
+nested RX is inapplicable.
 
 Linux `mvm/rxmq.c::iwl_mvm_reorder` explicitly forbids trusting a non-LAST
 subframe's NSSN, which can already point past its not-yet-delivered suffix.
@@ -1922,6 +1923,24 @@ binding table, classification and ACM downgrade, the 9-queue allocation,
 EF/AF41/CS1/CS3/CS6/AF21/BE traffic on its TID queue with DHCP, ordered
 close removing all nine queues, and the tag2 fallback. Measured tag5
 programs and air validation remain external inputs.
+
+### 3.32 Group-addressed QoS receive
+
+Group-addressed data is never covered by a Block Ack agreement (IEEE
+802.11-2020 10.25 applies BlockAck only to individually addressed QoS data)
+and Linux `mvm/rxmq.c::iwl_mvm_reorder` never reorders multicast. The Gen2
+receive owner therefore ignores any BAID the firmware reports for a
+group-addressed MPDU and delivers it on the non-BA path with its GTK replay
+owner, accepting Normal or No Ack policy (mac80211 transmits group QoS data
+with No Ack; the previous BA-session policy check wrongly dropped such
+frames). Linux mac80211 `__ieee80211_rx_h_amsdu` drops every
+group-addressed A-MSDU (the CVE-2020-24588 class of injected subframes), so
+the native path now drops them explicitly too, nested in an A-MPDU or not.
+The group_nested_rx row ("group-addressed nested A-MSDU-in-A-MPDU RX") is
+therefore inapplicable: there is no Linux behaviour that delivers such a
+frame. `smoke_mvm_group_qos_bypasses_reorder_and_group_amsdu_stays_closed`
+covers No Ack/Normal delivery with and without a BAID, rejection of group
+A-MSDU subframes with and without a BAID, and unchanged unicast BA delivery.
 
 ## 4. References
 
