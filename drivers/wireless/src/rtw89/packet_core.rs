@@ -102,11 +102,17 @@ impl Drop for Ring {
     }
 }
 struct Pending {
+    id: u64,
     ticket: tx_transport::Ticket,
     queue: format::Queue,
     started: u64,
     report: bool,
+    /// Published with TXWD AGG_EN (an operational originator session).
+    agg: bool,
 }
+/// Most data MPDUs the aggregate emitter keeps in flight at once
+/// (`radio_policy::Program::Ampdu`). Every other frame is alone in flight.
+pub(super) const AGG_WINDOW: usize = 32;
 #[derive(Debug)]
 pub(super) struct Receipt {
     pub(super) id: u64,
@@ -146,8 +152,11 @@ pub(super) struct Core {
     /// Random scan source address the controller put in the address CAM.
     scan: Option<[u8; 6]>,
     next_id: u64,
-    pending: Option<Pending>,
+    /// In-flight frames, each owning its own TxQueue slot and DMA maps.
+    pending: Vec<Pending>,
     completions: VecDeque<Receipt>,
+    /// Signed aggregate emitter granted (`Program::Ampdu`).
+    aggregate: bool,
 }
 const STOP: u32 = 1 << 8 | 1 << 16 | 1 << 19;
 /// Receive PHY admission granted by the signed operating programs.
@@ -276,8 +285,9 @@ impl Core {
                 rx,
                 scan: None,
                 next_id: 1,
-                pending: None,
+                pending: Vec::new(),
                 completions: VecDeque::new(),
+                aggregate: false,
             };
             for ring in &mut owner.rings {
                 let regs = ring.kind.regs();
@@ -300,6 +310,16 @@ impl Core {
             }
             Ok(owner)
         })
+    }
+    /// Admit up to `AGG_WINDOW` aggregated data frames in flight. Only the
+    /// signed aggregate program (`Program::Ampdu`, which requires HT20)
+    /// enables this, before `start`.
+    pub(super) fn enable_aggregation(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Prepared || self.rx < RxPhy::Ht {
+            return Err(Error::State);
+        }
+        self.aggregate = true;
+        Ok(())
     }
     pub(super) fn start(&mut self, port: &mut impl Port) -> Result<(), Error> {
         if self.phase != Phase::Prepared {
@@ -326,7 +346,7 @@ impl Core {
     /// own address). Only between frames: a probe in flight keeps its source.
     pub(super) fn set_scan_address(&mut self, scan: Option<[u8; 6]>) -> Result<(), Error> {
         if self.phase != Phase::Running
-            || self.pending.is_some()
+            || !self.pending.is_empty()
             || scan.is_some_and(|a| a[0] & 1 != 0 || a == [0; 6] || a == self.own)
         {
             return Err(Error::State);
@@ -335,7 +355,15 @@ impl Core {
         Ok(())
     }
     pub(super) fn ready(&self) -> bool {
-        self.phase == Phase::Running && self.pending.is_none() && self.completions.is_empty()
+        self.phase == Phase::Running && self.pending.is_empty() && self.completions.is_empty()
+    }
+    /// Room for one more aggregated data frame: every frame in flight is
+    /// itself aggregated and the window (including unread receipts) is open.
+    pub(super) fn ready_aggregate(&self) -> bool {
+        self.phase == Phase::Running
+            && self.aggregate
+            && self.pending.iter().all(|pending| pending.agg)
+            && self.pending.len() + self.completions.len() < AGG_WINDOW
     }
     pub(super) fn submit(
         &mut self,
@@ -352,14 +380,33 @@ impl Core {
         radio_report: bool,
         rate: u8,
     ) -> Result<u64, Error> {
+        self.submit_agg(port, bytes, radio_report, rate, None)
+    }
+    /// `submit_rate` with TXWD A-MPDU fields. An aggregated frame may join
+    /// other aggregated frames in flight (`ready_aggregate`).
+    pub(super) fn submit_agg(
+        &mut self,
+        port: &mut impl Port,
+        bytes: &[u8],
+        radio_report: bool,
+        rate: u8,
+        agg: Option<format::Agg>,
+    ) -> Result<u64, Error> {
         if self.phase != Phase::Running {
             return Err(Error::State);
+        }
+        if agg.is_some() && !self.aggregate {
+            return Err(Error::Packet);
         }
         // HE extended-range SU TX belongs to the signed HE program only.
         if rate & format::DATA_ER != 0 && self.rx < RxPhy::He {
             return Err(Error::Packet);
         }
-        if !self.ready() {
+        if if agg.is_some() {
+            !self.ready_aggregate()
+        } else {
+            !self.ready()
+        } {
             return Err(Error::Busy);
         }
         // A probe request from the current random scan address is the only
@@ -399,26 +446,16 @@ impl Core {
             }
             let packet = ring.queue.reserved_mut(ticket)?;
             let preparation = (|| {
-                let (header, actual) = if rate == 0 {
-                    format::transmit(
-                        bytes,
-                        source,
-                        self.mac_id,
-                        ticket.sequence,
-                        packet.body.dma_addr().raw(),
-                        radio_report,
-                    )
-                } else {
-                    format::transmit_rate(
-                        bytes,
-                        source,
-                        self.mac_id,
-                        ticket.sequence,
-                        packet.body.dma_addr().raw(),
-                        radio_report,
-                        rate,
-                    )
-                }?;
+                let (header, actual) = format::transmit_agg(
+                    bytes,
+                    source,
+                    self.mac_id,
+                    ticket.sequence,
+                    packet.body.dma_addr().raw(),
+                    radio_report,
+                    rate,
+                    agg,
+                )?;
                 if actual != kind {
                     return Err(Error::Packet);
                 }
@@ -440,11 +477,13 @@ impl Core {
             // Before the FIRST descriptor write, the queue holds both DMA maps
             // as published; every uncertain failure retains them permanently.
             ring.queue.publish(ticket)?;
-            self.pending = Some(Pending {
+            self.pending.push(Pending {
+                id,
                 ticket,
                 queue: kind,
                 started: port.now_us(),
                 report: false,
+                agg: agg.is_some(),
             });
             copy_to(
                 ring.descriptors.as_ref().ok_or(Error::State)?,
@@ -476,13 +515,18 @@ impl Core {
             return Err(Error::Packet);
         }
         let packet = completion.resource;
+        let index = self
+            .pending
+            .iter()
+            .position(|pending| pending.id == packet.id)
+            .ok_or(Error::Packet)?;
         let bytes = copy_from(&packet.body, packet.length)?;
         self.completions.push_back(Receipt {
             id: packet.id,
             bytes,
             radio_acknowledged: true,
         });
-        self.pending = None;
+        self.pending.remove(index);
         Ok(())
     }
     fn receive(&mut self, port: &mut impl Port, step: &mut Step) -> Result<(), Error> {
@@ -536,15 +580,22 @@ impl Core {
                     return Err(Error::Packet);
                 }
                 for report in reports {
-                    let pending = self.pending.as_mut().ok_or(Error::Packet)?;
-                    if pending.report
-                        || report.sequence != pending.ticket.sequence
-                        || report.channel != pending.queue.channel()
-                        || report.qsel != pending.queue.qsel()
-                        || report.mac_id != self.mac_id
-                    {
+                    // Multi-entry RPQ retirement: each report names exactly
+                    // one unreported in-flight frame by WD sequence, queue
+                    // and MACID; anything else is a stale/forged release.
+                    if report.mac_id != self.mac_id {
                         return Err(Error::Packet);
                     }
+                    let pending = self
+                        .pending
+                        .iter_mut()
+                        .find(|pending| {
+                            !pending.report
+                                && report.sequence == pending.ticket.sequence
+                                && report.channel == pending.queue.channel()
+                                && report.qsel == pending.queue.qsel()
+                        })
+                        .ok_or(Error::Packet)?;
                     pending.report = true;
                     let queue = pending.queue;
                     let ring = self
@@ -564,33 +615,35 @@ impl Core {
         if self.phase != Phase::Running {
             return Err(Error::State);
         }
-        let result =
-            port.current(|port| {
-                port.ordinary_allowed()?;
-                let mut step = Step::default();
-                self.receive(port, &mut step)?;
-                for slot in 0..self.rings.len() {
-                    let ring = &mut self.rings[slot];
-                    let index = port.read32(ring.kind.regs().idx as u32)?;
-                    if index & 0x0fff != u32::from(ring.queue.write_pointer()) {
-                        return Err(Error::Packet);
-                    }
-                    let completions = ring
-                        .queue
-                        .observe_read_pointer(((index >> 16) & 0x0fff) as u16)?;
-                    barrier();
-                    for completion in completions {
-                        self.completed(completion)?;
-                    }
+        let result = port.current(|port| {
+            port.ordinary_allowed()?;
+            let mut step = Step::default();
+            self.receive(port, &mut step)?;
+            for slot in 0..self.rings.len() {
+                let ring = &mut self.rings[slot];
+                let index = port.read32(ring.kind.regs().idx as u32)?;
+                if index & 0x0fff != u32::from(ring.queue.write_pointer()) {
+                    return Err(Error::Packet);
                 }
-                if self.pending.as_ref().is_some_and(|pending| {
-                    port.now_us().saturating_sub(pending.started) >= 1_000_000
-                }) {
-                    return Err(Error::Timeout);
+                let completions = ring
+                    .queue
+                    .observe_read_pointer(((index >> 16) & 0x0fff) as u16)?;
+                barrier();
+                for completion in completions {
+                    self.completed(completion)?;
                 }
-                step.receipt = self.completions.pop_front();
-                Ok(step)
-            });
+            }
+            let now = port.now_us();
+            if self
+                .pending
+                .iter()
+                .any(|pending| now.saturating_sub(pending.started) >= 1_000_000)
+            {
+                return Err(Error::Timeout);
+            }
+            step.receipt = self.completions.pop_front();
+            Ok(step)
+        });
         if result.is_err() {
             self.phase = Phase::Failed;
             let _ = Self::close_dma(port, self.stop);
@@ -606,7 +659,7 @@ impl Core {
     /// every TX channel is stopped and idle with bus mastering off.
     pub(super) unsafe fn reclaim_fenced(&mut self) -> Vec<DmaBuffer> {
         self.phase = Phase::Stopped;
-        self.pending = None;
+        self.pending.clear();
         self.completions.clear();
         let mut storage = Vec::new();
         for ring in &mut self.rings {

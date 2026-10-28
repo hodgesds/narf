@@ -98,6 +98,15 @@ pub(super) fn probe_request(frame: &[u8], own: [u8; 6]) -> bool {
 pub(super) fn qos_tid(frame: &[u8]) -> Option<u8> {
     (frame.first() == Some(&0x88)).then(|| frame.get(24).map(|b| b & 0x0f))?
 }
+/// TX A-MPDU fields of one QoS data MPDU on an operational originator
+/// session (`rtw89_core_tx_update_ampdu_info`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Agg {
+    /// `RTW89_TXWD_INFO1_MAX_AGGNUM`: session `agg_num` - 1.
+    pub(super) num: u8,
+    /// `RTW89_TXWD_INFO2_AMPDU_DENSITY`: peer HT minimum MPDU start spacing.
+    pub(super) density: u8,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Error {
     Frame,
@@ -172,7 +181,28 @@ pub(super) fn transmit_rate(
     report: bool,
     rate: u8,
 ) -> Result<(Vec<u8>, Queue), Error> {
+    transmit_agg(frame, own, mac_id, sequence, address, report, rate, None)
+}
+/// `transmit_rate` plus, for `agg`, `RTW89_TXWD_BODY3_AGG_EN`,
+/// `INFO1_MAX_AGGNUM` and `INFO2_AMPDU_DENSITY` (Linux v7.2
+/// `core.c::rtw89_build_txwd_body3`/`_info1`/`_info2`). Only firmware-RA
+/// QoS DATA can be aggregated.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn transmit_agg(
+    frame: &[u8],
+    own: [u8; 6],
+    mac_id: u8,
+    sequence: u16,
+    address: u64,
+    report: bool,
+    rate: u8,
+    agg: Option<Agg>,
+) -> Result<(Vec<u8>, Queue), Error> {
     let queue = classify(frame, own)?;
+    if agg.is_some_and(|agg| agg.density > 7 || qos_tid(frame).is_none() || rate & FIRMWARE_RA == 0)
+    {
+        return Err(Error::Metadata);
+    }
     let adaptive = rate & FIRMWARE_RA != 0;
     let er = rate & DATA_ER != 0;
     let index = rate & !(FIRMWARE_RA | DATA_ER);
@@ -218,9 +248,15 @@ pub(super) fn transmit_rate(
         // rtw89_build_txwd_info0/1 for data: firmware RA owns the rate;
         // INFO1 DATA_RTY_LOWEST_RATE[24:16] bounds hardware retry fallback.
         put(&mut bytes, 24, u32::from(er) << 15);
-        put(&mut bytes, 28, u32::from(index) << 16);
+        let num = agg.map_or(0, |agg| u32::from(agg.num));
+        put(&mut bytes, 28, u32::from(index) << 16 | num);
     } else {
         put(&mut bytes, 24, 1 << 30 | 1 << 10 | u32::from(rate) << 16); // Source DATA_RATE[24:16].
+    }
+    if let Some(agg) = agg {
+        let body3 = u32::from_le_bytes(bytes[12..16].try_into().map_err(|_| Error::Metadata)?);
+        put(&mut bytes, 12, body3 | 1 << 12);
+        put(&mut bytes, 32, u32::from(agg.density) << 18);
     }
     put(&mut bytes, 36, u32::from(report) << 10);
     put(&mut bytes, 40, 1 << 31 | u32::from(frame[4] & 1 == 0) << 27);

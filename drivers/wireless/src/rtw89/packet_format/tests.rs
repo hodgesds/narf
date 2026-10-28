@@ -157,3 +157,52 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_packet_qos_tid_selects_ach_qsel_and_tid_indicate
 );
+
+fn smoke_rtw89_b_packet_txwd_ampdu_fields() -> TestResult {
+    let mut qos = frame(100, false);
+    qos[0] = 0x88;
+    qos[24..26].fill(0);
+    let agg = Agg {
+        num: 63,
+        density: 5,
+    };
+    let address = 0x1234_5000;
+    let word = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+    let Ok((plain, _)) = transmit_rate(&qos, OWN, 0, 3, address, false, FIRMWARE_RA | 2) else {
+        return TestResult::Fail("plain RA QoS TXWD");
+    };
+    let Ok((bytes, queue)) =
+        transmit_agg(&qos, OWN, 0, 3, address, false, FIRMWARE_RA | 2, Some(agg))
+    else {
+        return TestResult::Fail("aggregated TXWD refused");
+    };
+    // BODY3 AGG_EN(12), INFO1 MAX_AGGNUM[7:0] beside DATA_RTY_LOWEST_RATE,
+    // INFO2 AMPDU_DENSITY[20:18]; every other byte unchanged.
+    let mut expected = plain.clone();
+    expected[12..16].copy_from_slice(&(word(&plain, 12) | 1 << 12).to_le_bytes());
+    expected[28..32].copy_from_slice(&(2u32 << 16 | 63).to_le_bytes());
+    expected[32..36].copy_from_slice(&(5u32 << 18).to_le_bytes());
+    if queue != Queue::Data
+        || bytes != expected
+        || word(&plain, 12) & 1 << 12 != 0
+        || word(&plain, 32) != 0
+    {
+        return TestResult::Fail("TXWD A-MPDU fields differ");
+    }
+    // Only firmware-RA QoS DATA with a 3-bit density is aggregated.
+    let wide = Agg { num: 1, density: 8 };
+    let data = frame(100, false);
+    let management = frame(100, true);
+    if transmit_agg(&data, OWN, 0, 3, address, false, FIRMWARE_RA, Some(agg)).is_ok()
+        || transmit_agg(&qos, OWN, 0, 3, address, false, 2, Some(agg)).is_ok()
+        || transmit_agg(&qos, OWN, 0, 3, address, false, FIRMWARE_RA, Some(wide)).is_ok()
+        || transmit_agg(&management, OWN, 0, 3, address, false, 0, Some(agg)).is_ok()
+    {
+        return TestResult::Fail("aggregation admitted outside firmware-RA QoS DATA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_packet_txwd_ampdu_fields
+);

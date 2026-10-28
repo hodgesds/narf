@@ -36,14 +36,19 @@ pub(super) enum Program {
     /// HE-MCS0..11 NSS1 TX with firmware GI/LTF selection, HE SU/ER SU/MU
     /// RX on any GI/LTF.
     He,
+    /// Originator Block Ack with TX A-MPDU on top of HT20: ADDBA request
+    /// emitter, TXWD AGG_EN/MAX_AGGNUM/AMPDU_DENSITY, RA aggregation limit
+    /// and up to `packet_core::AGG_WINDOW` data frames in flight.
+    Ampdu,
 }
 impl Program {
-    pub(super) const ALL: [Self; 5] = [
+    pub(super) const ALL: [Self; 6] = [
         Self::Wmm,
         Self::QosAll,
         Self::FirmwareRa,
         Self::Ht,
         Self::He,
+        Self::Ampdu,
     ];
     pub(super) const BASE: u8 = 3;
     pub(super) fn bit(self) -> u8 {
@@ -53,6 +58,7 @@ impl Program {
             Self::FirmwareRa => 1 << 4,
             Self::Ht => 1 << 5,
             Self::He => 1 << 6,
+            Self::Ampdu => 1 << 7,
         }
     }
     fn requires(self) -> u8 {
@@ -60,7 +66,7 @@ impl Program {
             Self::Wmm => 0,
             Self::QosAll | Self::FirmwareRa => Self::Wmm.bit(),
             Self::Ht => Self::Wmm.bit() | Self::FirmwareRa.bit(),
-            Self::He => Self::Wmm.bit() | Self::FirmwareRa.bit() | Self::Ht.bit(),
+            Self::He | Self::Ampdu => Self::Wmm.bit() | Self::FirmwareRa.bit() | Self::Ht.bit(),
         }
     }
     /// Base flags plus `self` and everything it requires.
@@ -103,6 +109,11 @@ impl Program {
                 hash.update(b"NARF RTL8852B HE20 optional operating recipe v1");
                 hash.update(&identity);
                 hash.update(&super::station_control::he_fingerprint());
+            }
+            Self::Ampdu => {
+                hash.update(b"NARF RTL8852B originator BA TX A-MPDU optional operating recipe v1");
+                hash.update(&identity);
+                hash.update(&super::station_control::ampdu_fingerprint());
             }
         }
         hash.finalize()

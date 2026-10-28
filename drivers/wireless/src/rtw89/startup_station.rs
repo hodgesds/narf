@@ -120,6 +120,46 @@ unsafe impl Io for Startup {
         self.station_allowed()?;
         self.station_native()?.station_he_allowed()
     }
+    fn station_ampdu_allowed(&mut self) -> Result<bool, power::Error> {
+        self.station_allowed()?;
+        self.station_native()?.station_ampdu_allowed()
+    }
+    async fn station_configure_agg_limit(
+        &mut self,
+        agg_num: Option<u16>,
+        admission: &control::Admission,
+    ) -> Result<(), power::Error> {
+        if agg_num.is_some() && !self.station_ampdu_allowed()? {
+            return Err(power::Error::Unsupported);
+        }
+        let native = self
+            .firmware
+            .as_mut()
+            .ok_or(power::Error::Terminal)?
+            .transport_mut();
+        self.station_controller
+            .as_mut()
+            .ok_or(power::Error::Terminal)?
+            .configure_agg_limit(&mut native.station_access(), agg_num, admission)
+    }
+    fn packet_ready_aggregate(&self) -> bool {
+        self.packet_ready()
+            && self
+                .firmware
+                .as_ref()
+                .is_some_and(|firmware| firmware.transport().packets_ready_aggregate())
+    }
+    fn packet_submit_agg(
+        &mut self,
+        bytes: &[u8],
+        report: bool,
+        rate: u8,
+        agg: crate::rtw89::packet_format::Agg,
+    ) -> Result<u64, packet::Error> {
+        self.station_native()?
+            .submit_packet_agg(bytes, report, rate, agg)
+    }
+
     async fn station_configure_ra(
         &mut self,
         rates: u16,

@@ -591,3 +591,47 @@ kernel_test_in!(
     "drivers/wireless/rtw89/radio",
     smoke_rtw8852b_repeat_flr_lifecycle_requires_its_own_signed_identity
 );
+
+fn smoke_rtw8852b_ampdu_program_requires_ht_and_its_own_signed_identity() -> TestResult {
+    let base = board();
+    let cap = authority();
+    let ampdu = Program::Ampdu.flags();
+    let ht = Program::Ht.flags();
+    // Ampdu requires HT20, which requires WMM and firmware RA.
+    if ampdu != 0xb7 || !Program::valid(ampdu) || !Program::valid(ampdu | Program::He.bit()) {
+        return TestResult::Fail("A-MPDU program flag byte differs");
+    }
+    for flags in [0x87u8, 0x97, 0xa7, 0x83] {
+        if Program::valid(flags) {
+            return TestResult::Fail("A-MPDU accepted without HT/firmware RA/WMM");
+        }
+    }
+    let chained = base.with_programs(ampdu);
+    if chained.identity() == base.with_programs(ht).identity() {
+        return TestResult::Fail("A-MPDU program shares the HT identity");
+    }
+    // An HT20 record cannot be promoted to A-MPDU.
+    let mut bytes = image(base.with_programs(ht));
+    bytes[57] = ampdu;
+    if Qualification::from_verified(&bytes, Some([3; 32]), base, cap).is_ok() {
+        return TestResult::Fail("HT record promoted to A-MPDU");
+    }
+    let mut bytes = image(chained);
+    bytes[57] = ampdu;
+    let Ok(mut granted) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
+        return TestResult::Fail("genuine A-MPDU record rejected");
+    };
+    granted.model_domain = Some(domain());
+    if granted.allows(Program::Ampdu) != Ok(true) || granted.allows(Program::He) != Ok(false) {
+        return TestResult::Fail("A-MPDU record grants differ");
+    }
+    cap.revoke();
+    if granted.allows(Program::Ampdu).is_ok() {
+        return TestResult::Fail("revoked record still grants A-MPDU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/radio",
+    smoke_rtw8852b_ampdu_program_requires_ht_and_its_own_signed_identity
+);

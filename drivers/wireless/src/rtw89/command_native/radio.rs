@@ -151,6 +151,12 @@ impl Native {
             .allows(radio_policy::Program::He)
             .map_err(denied)
     }
+    pub(in crate::rtw89) fn station_ampdu_allowed(&self) -> Result<bool, power::Error> {
+        self.full_radio_scope()
+            .ok_or(power::Error::Unsupported)?
+            .allows(radio_policy::Program::Ampdu)
+            .map_err(denied)
+    }
     pub(in crate::rtw89) fn station_firmware_ra_allowed(&self) -> Result<bool, power::Error> {
         self.full_radio_scope()
             .ok_or(power::Error::Unsupported)?

@@ -1107,8 +1107,100 @@ bits remain dropped); the packet owner admits them only under the HT
 program. Block Ack actions use a non-fatal ACK policy like data. Smokes:
 `drivers/wireless/rtw89/block_ack` (codecs, admission) and
 `smoke_rtw8852b_recipient_block_ack_reorders_and_tears_down` (BA CAM H2C,
-response, hole fill, BAR flush, DELBA, non-HT decline). Originator TX BA
-(CMAC AMPDU table) is tracked with TX A-MPDU as `block_ack_originator`.
+response, hole fill, BAR flush, DELBA, non-HT decline).
+
+### Originator Block Ack and TX A-MPDU
+
+A seventh signed operating program, `radio_policy::Program::Ampdu` (byte57
+bit7, requires `Wmm`, `FirmwareRa` and `Ht`; flags 0xb7), authorizes the
+aggregate emitter. It extends the board identity with
+`station_control::ampdu_fingerprint` in the fixed `ALL` order, so an HT20
+record cannot be promoted. Without the grant nothing below runs: HT data
+is never aggregated and no ADDBA Request is sent.
+
+Multi-frame ownership: `packet_core::Core` keeps a heap `Vec` of in-flight
+frames instead of one `pending` slot. Each entry owns its own TxQueue
+ticket and header/body DMA maps. `enable_aggregation` (before `start`,
+HT RX program or higher) admits up to `AGG_WINDOW` (32) aggregated data
+frames in flight; `ready_aggregate` counts in-flight frames plus unread
+receipts. Any frame without AGG_EN still needs an empty owner, and an
+aggregated frame never joins a non-aggregated one. RPQ retirement matches
+each release report to exactly one unreported in-flight frame by WD
+sequence, channel, QSEL and MACID. An unknown, duplicate or stale report
+closes the owner, as before. Read-pointer and report facts complete frames
+in any order, and the 1s timeout applies to every in-flight frame.
+`reclaim_fenced` already released every TxQueue slot, so teardown with N
+frames in flight returns 2N packet maps plus the rings. The station keeps
+the same rule: `State::pending` is a `VecDeque` matched by receipt id, and
+management, EAPOL and probe frames still need an empty queue.
+
+TXWD (Linux v7.2 `core.c::rtw89_core_tx_update_ampdu_info`,
+`rtw89_build_txwd_body3`/`_info1`/`_info2`): an aggregated frame sets
+`RTW89_TXWD_BODY3_AGG_EN` (keeping `SW_SEQ`),
+`RTW89_TXWD_INFO1_MAX_AGGNUM` = session `agg_num` - 1 and
+`RTW89_TXWD_INFO2_AMPDU_DENSITY` = the peer HT A-MPDU minimum MPDU
+spacing. Only firmware-RA QoS DATA can carry these fields.
+
+Originator state machine (`block_ack::Originator`, heap-boxed in the
+station, after Linux v7.2 `mac80211/agg-tx.c`):
+- **Start.** As in `rtw89_core_txq_check_agg`, the first QoS DATA frame of
+  a TID goes out unaggregated and requests `ieee80211_start_tx_ba_session`.
+  Requests are refused after `HT_AGG_MAX_RETRIES`, and in a burst beyond
+  `HT_AGG_BURST_RETRIES` within `HT_AGG_RETRIES_PERIOD`.
+- **ADDBA Request.** With nothing in flight, the station sends the request
+  (`ieee80211_send_addba_request`) with a fresh dialog token,
+  A-MSDU-capable immediate policy and timeout 0. The buffer is
+  `IEEE80211_MAX_AMPDU_BUF_HT` (64) for an HT peer, or
+  min(`max_tx_agg_num` 128, `IEEE80211_MAX_AMPDU_BUF_HE`) plus an ADDBA
+  Extension element (`NO_FRAG`) for an HE peer. The SSN is the next QoS
+  SN of the TID: `Security::next_qos_sequence` when protected, otherwise
+  the station counter after the request's own sequence number.
+- **Held frames.** Until the session is operational, frames of the TID
+  return `Busy` and stay in the TX ring, like mac80211's `tid_tx->pending`.
+- **ADDBA Response.** Handled like `ieee80211_process_addba_resp`. A
+  matching token with SUCCESS and a nonzero buffer becomes `TX_OPERATIONAL`
+  with `agg_num` = min(buffer, 128). Any other status is
+  `AGG_STOP_DECLINED`: no DELBA, and only the driver `TX_STOP` runs.
+- **Device half.** `rtw89_ops_ampdu_action(TX_OPERATIONAL/TX_STOP_*)` runs
+  on the async owner, before the TID is treated as operational. Its
+  `rtw89_chip_h2c_ampdu_cmac_tbl` is NULL in `rtw8852b_chip_ops` (Linux
+  v7.2 `rtw8852b.c`), so no H2C is sent on this chip.
+  `rtw89_phy_ra_recalc_agg_limit` writes `R_AX_AMPDU_AGG_LIMIT` (0xc610)
+  `B_AX_RA_TRY_RATE_AGG_LMT_MASK` [23:16]: clamp(min `agg_num`, 1, 256) - 1,
+  or 0x3f with no operational session (`Controller::configure_agg_limit`,
+  inside the current capability, admission and peer).
+- **Stops.**
+  - A missing response within `ADDBA_RESP_INTERVAL` (1s,
+    `sta_addba_resp_timer_expired`) is `AGG_STOP_LOCAL_REQUEST`: the
+    station sends DELBA as initiator with `WLAN_REASON_QSTA_NOT_USE`.
+  - An EAPOL frame on a session TID stops that session the same way and
+    forbids a new one for `RTW89_FORBID_BA_TIMER` (4s,
+    `rtw89_core_stop_tx_ba_session`).
+  - A recipient DELBA is `AGG_STOP_PEER_REQUEST`, with no DELBA back.
+  - Disconnect or stop is `AGG_STOP_DESTROY_STA`, with no frame.
+
+Every stop reaches `TX_STOP` (limit recomputed). Aggregated frames stay
+within min(session buffer, `AGG_WINDOW`) in flight.
+
+Smokes:
+- `smoke_rtw89_b_packet_aggregate_window_multi_slot_rpq_retirement`:
+  refused without the program, 32 frames in flight, window closed,
+  non-aggregated frame refused, out-of-order multi-entry retirement,
+  stale report fails closed, reclaim of 3 unretired slots.
+- `smoke_rtw89_b_packet_txwd_ampdu_fields`: exact TXWD delta and refusal
+  outside firmware-RA QoS DATA.
+- `smoke_rtw8852b_ampdu_program_requires_ht_and_its_own_signed_identity`.
+- `smoke_rtw8852b_originator_block_ack_tx_ampdu`:
+  - success: unaggregated trigger frame, ADDBA Request bytes and SSN,
+    limit 63, AGG_EN data, two aggregated frames in flight retired;
+  - teardown: recipient DELBA restores 0x3f and stops aggregation;
+  - failure: a declined response and a response timeout (DELBA 37);
+  - program not granted: no ADDBA and no AGG_EN.
+
+TX A-MSDU (`IEEE80211_HW_TX_AMSDU`, `SUPPORTS_AMSDU_IN_AMPDU`) is not part
+of this emitter. The ADDBA Response A-MSDU bit is ignored, and the
+remaining `aggregation` work is listed in the open-row table.
+
 
 ### Active scanning, probe IEs and dwell control
 
@@ -1430,7 +1522,8 @@ Each blocker below was re-checked against this tree.
 | Row | Concrete blocker |
 |---|---|
 | `eht` | Needs the RTL8922A chip row first. `efuse.rs` returns `UnsupportedChip` for 8922A, `irq::Mask::config` rejects the `_v2` layout, there is no BE TXD/RXD (`txrx.h` `BE_TXD_*`) or BE RA H2C (`rtw89_h2c_ra_v1`, `RTW89_H2C_RA_V1_W4_MODE_EHT`), and `station_control::Controller::new` plus the `N52B` qualification record are RTL8852B-only. The shared `association::eht` API is not the gap. |
-| `aggregation`, `block_ack_originator` | `packet_core::Core` keeps one `pending: Option<Pending>` and `ready()` is false while a frame is in flight. `station::State::pending` and the RPQ retirement are also single-frame. TX A-MPDU needs per-slot header/body DMA ownership for N in-flight tickets, `RTW89_TXWD_BODY3_AGG_EN`/`INFO1_MAX_AGGNUM`/`INFO2_AMPDU_DENSITY`, an originator ADDBA state machine (mac80211 `agg-tx.c`), `rtw89_chip_h2c_ampdu_cmac_tbl` on `TX_OPERATIONAL`/`TX_STOP_*`, and a new signed `Program` for the aggregate emitter. |
+| `aggregation` | TX A-MPDU now exists (section "Originator Block Ack and TX A-MPDU"). What is left is TX A-MSDU and A-MSDU-in-A-MPDU (Linux v7.2 `core.c::rtw89_core_register_hw` `TX_AMSDU`/`SUPPORTS_AMSDU_IN_AMPDU`, mac80211 `tx.c::ieee80211_amsdu_aggregate`). `interface.rs` drains one Ethernet frame per `State::send`, with no per-TID txq batching to hand `Security::transmit_amsdu_qos` several frames. `packet_format::classify` refuses the QoS A-MSDU-present bit (`frame[24] & 0xf8`) and any MPDU above `MAX_MPDU` 2304, below the peer HT 3839/7935-byte A-MSDU limit. The ADDBA Response A-MSDU bit (`IEEE80211_TXQ_NO_AMSDU`) is parsed but unused. The aggregate program fingerprint excludes A-MSDU, so it needs its own measured `Program`. |
+
 | `pmf` | Shared layer now provides `FakeAp::wpa3_sae`/`with_pmf`/`with_igtk`/`bip_broadcast_deauth`, `JoinOptions::{akms,pmf}` and the WPA2-PMF RSNE (merge e295558ed). The rtw89 gap remains: `station.rs::associate` builds Open/WPA2-PSK only, `interface.rs` maps only `SecurityConfig::Open`/`Wpa2`, there is no SAE commit/confirm path through `JoinPlan::start_sae_authentication`, and `packet_format::classify` refuses management frames with the Protected bit (host CCMP/BIP on RTL8852B, `hw_mgmt_tx_encrypt` false). |
 | `he_htc` | Shared `Security` now accepts +HTC QoS DATA on RX (merge e295558ed). rtw89 still needs RX admission of the Order bit in `packet_core::receive`/`packet_format`, the HTC_HE capability advertisement, and TX insertion (`__rtw89_core_tx_adjust_he_qos_htc`) gated by RA C2H `might_fallback_legacy` (`rtw89_phy_c2h_ra_rpt_iter`), which the firmware-RA path does not decode yet. |
 

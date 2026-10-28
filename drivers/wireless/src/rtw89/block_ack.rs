@@ -44,6 +44,14 @@ pub(super) enum Action {
         initiator: bool,
         reason: u16,
     },
+    /// ADDBA Response to our originator request (9.6.4.3).
+    AddbaResponse {
+        token: u8,
+        status: u16,
+        amsdu: bool,
+        tid: u8,
+        buf_size: u16,
+    },
     /// Any other Block Ack category action (ignored by a recipient).
     Other,
 }
@@ -78,6 +86,16 @@ pub(super) fn parse_action(frame: &[u8], own: [u8; 6], peer: [u8; 6]) -> Option<
                 timeout,
                 ssn: ssc >> 4,
             })
+        }
+        1 => {
+            let capab = le16(frame, 29)?;
+            Action::AddbaResponse {
+                token: *frame.get(26)?,
+                status: le16(frame, 27)?,
+                amsdu: capab & 1 != 0,
+                tid: ((capab >> 2) & 0xf) as u8,
+                buf_size: capab >> 6,
+            }
         }
         2 => {
             let params = le16(frame, 26)?;
@@ -144,6 +162,194 @@ pub(super) fn delba(own: [u8; 6], peer: [u8; 6], tid: u8, reason: u16) -> Vec<u8
     bytes.extend_from_slice(&params.to_le_bytes());
     bytes.extend_from_slice(&reason.to_le_bytes());
     bytes
+}
+
+/// `ieee80211_send_delba` from the originator side (`WLAN_BACK_INITIATOR`).
+pub(super) fn delba_initiator(own: [u8; 6], peer: [u8; 6], tid: u8, reason: u16) -> Vec<u8> {
+    let mut bytes = header(own, peer);
+    let params = 1u16 << 11 | u16::from(tid & 0xf) << 12;
+    bytes.extend_from_slice(&[3, 2]);
+    bytes.extend_from_slice(&params.to_le_bytes());
+    bytes.extend_from_slice(&reason.to_le_bytes());
+    bytes
+}
+
+/// `rtw8852b_chip_info.max_tx_agg_num` (`hw->max_tx_aggregation_subframes`).
+pub(super) const MAX_TX_AGG: u16 = 128;
+/// `ADDBA_RESP_INTERVAL` (HZ).
+pub(super) const ADDBA_RESP_MS: u64 = 1000;
+/// `HT_AGG_MAX_RETRIES`, `HT_AGG_BURST_RETRIES`, `HT_AGG_RETRIES_PERIOD`.
+pub(super) const MAX_RETRIES: u8 = 15;
+pub(super) const BURST_RETRIES: u8 = 3;
+pub(super) const RETRIES_PERIOD_MS: u64 = 15_000;
+/// `RTW89_FORBID_BA_TIMER` (4s) after an EAPOL-triggered stop.
+pub(super) const FORBID_MS: u64 = 4000;
+/// `WLAN_REASON_QSTA_NOT_USE`.
+pub(super) const REASON_NOT_USE: u16 = 37;
+
+/// `ieee80211_send_addba_request`: immediate policy, A-MSDU capable (rtw89
+/// sets `SUPPORTS_AMSDU_IN_AMPDU`), timeout 0, `start_seq_num << 4`, and an
+/// ADDBA Extension element (`IEEE80211_ADDBA_EXT_NO_FRAG`) for an HE peer.
+/// `ieee80211_tx_ba_session_handle_start` offers `IEEE80211_MAX_AMPDU_BUF_HT`
+/// to an HT peer and min(`max_tx_agg_num`, `IEEE80211_MAX_AMPDU_BUF_HE`) to
+/// an HE peer.
+pub(super) fn addba_request(
+    own: [u8; 6],
+    peer: [u8; 6],
+    token: u8,
+    tid: u8,
+    ssn: u16,
+    he: bool,
+) -> Vec<u8> {
+    let buf: u16 = if he { MAX_TX_AGG.min(256) } else { 64 };
+    let mut bytes = header(own, peer);
+    let capab = 1u16 | 1 << 1 | u16::from(tid & 0xf) << 2 | buf << 6;
+    bytes.extend_from_slice(&[3, 0, token]);
+    bytes.extend_from_slice(&capab.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&((ssn & 0x0fff) << 4).to_le_bytes());
+    if he {
+        bytes.extend_from_slice(&[159, 1, 1]);
+    }
+    bytes
+}
+
+/// One originator (TX) session per TID (mac80211 `tid_ampdu_tx` state).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TxState {
+    /// `ieee80211_start_tx_ba_session` accepted; the request is not sent.
+    Wanted,
+    /// ADDBA Request with `token` sent at `sent` ms (`HT_AGG_STATE_SENT_ADDBA`).
+    Requested { token: u8, sent: u64 },
+    /// Successful response; `TX_OPERATIONAL` programming is outstanding.
+    Responded { buf: u16 },
+    /// `IEEE80211_AMPDU_TX_OPERATIONAL` done: data carries TXWD AGG_EN.
+    Operational { buf: u16 },
+}
+
+/// mac80211 agg-tx.c originator bookkeeping for one peer.
+#[derive(Debug, Default)]
+pub(super) struct Originator {
+    pub(super) tids: [Option<TxState>; 8],
+    /// `sta->ampdu_mlme.dialog_token_allocator`.
+    token: u8,
+    /// `addba_req_num` / `last_addba_req_time`.
+    attempts: [u8; 8],
+    last_request: [u64; 8],
+    /// `RTW89_TXQ_F_FORBID_BA` until this ms.
+    forbid_until: [u64; 8],
+}
+impl Originator {
+    /// `rtw89_core_txq_check_agg` + `ieee80211_start_tx_ba_session` gates:
+    /// true when a new session for `tid` starts now.
+    pub(super) fn want(&mut self, tid: u8, now: u64) -> bool {
+        let t = usize::from(tid);
+        if tid > 7
+            || self.tids[t].is_some()
+            || now < self.forbid_until[t]
+            || self.attempts[t] > MAX_RETRIES
+            || self.attempts[t] > BURST_RETRIES
+                && now.saturating_sub(self.last_request[t]) < RETRIES_PERIOD_MS
+        {
+            return false;
+        }
+        self.tids[t] = Some(TxState::Wanted);
+        true
+    }
+    /// Next request to send: (tid, token). Assigns the dialog token.
+    pub(super) fn next_request(&mut self, now: u64) -> Option<(u8, u8)> {
+        let t = self.tids.iter().position(|s| *s == Some(TxState::Wanted))?;
+        self.token = self.token.wrapping_add(1);
+        self.tids[t] = Some(TxState::Requested {
+            token: self.token,
+            sent: now,
+        });
+        self.attempts[t] = self.attempts[t].saturating_add(1);
+        self.last_request[t] = now;
+        Some((t as u8, self.token))
+    }
+    /// `ieee80211_process_addba_resp`; returns the buffer size that must be
+    /// programmed before the session becomes operational.
+    pub(super) fn response(
+        &mut self,
+        token: u8,
+        status: u16,
+        tid: u8,
+        buf_size: u16,
+    ) -> Option<u16> {
+        let t = usize::from(tid);
+        match self.tids.get(t).copied().flatten() {
+            Some(TxState::Requested { token: sent, .. }) if sent == token => {}
+            _ => return None,
+        }
+        if status == STATUS_SUCCESS && buf_size != 0 {
+            let buf = buf_size.min(MAX_TX_AGG);
+            self.tids[t] = Some(TxState::Responded { buf });
+            self.attempts[t] = 0;
+            Some(buf)
+        } else {
+            // AGG_STOP_DECLINED: no DELBA.
+            self.tids[t] = None;
+            None
+        }
+    }
+    /// Buffer size of a session awaiting `TX_OPERATIONAL` programming.
+    pub(super) fn responded(&self, tid: u8) -> Option<u16> {
+        match self.tids.get(usize::from(tid)).copied().flatten() {
+            Some(TxState::Responded { buf }) => Some(buf),
+            _ => None,
+        }
+    }
+    pub(super) fn operational(&mut self, tid: u8) -> bool {
+        let t = usize::from(tid);
+        if let Some(TxState::Responded { buf }) = self.tids.get(t).copied().flatten() {
+            self.tids[t] = Some(TxState::Operational { buf });
+            true
+        } else {
+            false
+        }
+    }
+    /// Buffer size of an operational session for `tid`.
+    pub(super) fn aggregating(&self, tid: u8) -> Option<u16> {
+        match self.tids.get(usize::from(tid)).copied().flatten() {
+            Some(TxState::Operational { buf }) => Some(buf),
+            _ => None,
+        }
+    }
+    /// A session is being set up (frames for the TID are held, like
+    /// mac80211's `tid_tx->pending`).
+    pub(super) fn holding(&self, tid: u8) -> bool {
+        matches!(
+            self.tids.get(usize::from(tid)).copied().flatten(),
+            Some(TxState::Wanted | TxState::Requested { .. } | TxState::Responded { .. })
+        )
+    }
+    /// `rtw89_phy_ra_recalc_agg_limit` input: min operational `agg_num`.
+    pub(super) fn min_agg(&self) -> Option<u16> {
+        (0..8).filter_map(|tid| self.aggregating(tid)).min()
+    }
+    /// Remove the session for `tid`; true when one existed.
+    pub(super) fn stop(&mut self, tid: u8) -> bool {
+        self.tids
+            .get_mut(usize::from(tid))
+            .and_then(Option::take)
+            .is_some()
+    }
+    /// `RTW89_TXQ_F_FORBID_BA` after an EAPOL stop.
+    pub(super) fn forbid(&mut self, tid: u8, until: u64) {
+        if let Some(slot) = self.forbid_until.get_mut(usize::from(tid)) {
+            *slot = until;
+        }
+    }
+    /// TIDs whose ADDBA response timer expired (`sta_addba_resp_timer_expired`).
+    pub(super) fn expired(&self, now: u64) -> impl Iterator<Item = u8> + '_ {
+        (0..8u8).filter(move |&tid| {
+            matches!(
+                self.tids[usize::from(tid)],
+                Some(TxState::Requested { sent, .. }) if now.saturating_sub(sent) >= ADDBA_RESP_MS
+            )
+        })
+    }
 }
 
 /// Compressed BlockAckReq (control subtype 8) from `peer`: (TID, SSN).

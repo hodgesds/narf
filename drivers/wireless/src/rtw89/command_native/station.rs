@@ -86,7 +86,14 @@ impl Native {
         let ht = self.station_ht_allowed().unwrap_or(false);
         let he = self.station_he_allowed().unwrap_or(false);
         let rx = packet::RxPhy::from_programs(ht, he);
-        let core = packet::Core::prepare_with(&mut self.station_access(), own, macid, qos_all, rx);
+        let ampdu = ht && self.station_ampdu_allowed().unwrap_or(false);
+        let core = packet::Core::prepare_with(&mut self.station_access(), own, macid, qos_all, rx)
+            .and_then(|mut core| {
+                if ampdu {
+                    core.enable_aggregation()?;
+                }
+                Ok(core)
+            });
         match core {
             Ok(core) => {
                 self.station_runtime.core = Some(core);
@@ -130,6 +137,26 @@ impl Native {
                 .core
                 .as_ref()
                 .is_some_and(packet::Core::ready)
+    }
+    pub(in crate::rtw89) fn packets_ready_aggregate(&self) -> bool {
+        self.state == State::Active
+            && self
+                .station_runtime
+                .core
+                .as_ref()
+                .is_some_and(packet::Core::ready_aggregate)
+    }
+    pub(in crate::rtw89) fn submit_packet_agg(
+        &mut self,
+        bytes: &[u8],
+        report: bool,
+        rate: u8,
+        agg: crate::rtw89::packet_format::Agg,
+    ) -> Result<u64, packet::Error> {
+        if !self.station_ampdu_allowed()? || !self.station_firmware_ra_allowed()? {
+            return Err(packet::Error::Access);
+        }
+        self.packet_operation(|core, port| core.submit_agg(port, bytes, report, rate, Some(agg)))
     }
     pub(in crate::rtw89) fn submit_packet(
         &mut self,

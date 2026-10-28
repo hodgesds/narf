@@ -538,6 +538,29 @@ impl Controller {
         attempt.armed = false;
         Ok(())
     }
+    /// mac80211 `IEEE80211_AMPDU_TX_OPERATIONAL`/`TX_STOP_*` ->
+    /// `rtw89_ops_ampdu_action`: `rtw89_chip_h2c_ampdu_cmac_tbl` is NULL in
+    /// `rtw8852b_chip_ops` (no H2C), then `rtw89_phy_ra_recalc_agg_limit`
+    /// writes `R_AX_AMPDU_AGG_LIMIT` (0xc610) `B_AX_RA_TRY_RATE_AGG_LMT_MASK`
+    /// [23:16] = clamp(min agg_num, 1, 256) - 1, or 0x3f with no TX session.
+    pub(super) fn configure_agg_limit(
+        &mut self,
+        io: &mut impl Interface,
+        agg_num: Option<u16>,
+        admission: &Admission,
+    ) -> Result<(), Error> {
+        if self.phase() != Phase::Associated
+            || self.admission.as_ref().is_none_or(|a| !a.same(admission))
+        {
+            return Err(Error::Terminal);
+        }
+        let peer = self.peer.clone().ok_or(Error::Terminal)?;
+        let limit = agg_num.map_or(0x3f, |n| u32::from(n.clamp(1, 256) - 1));
+        checked(io, Some(admission), |io| {
+            peer.current()?;
+            modify(io, 0xc610, 0xff << 16, limit << 16)
+        })
+    }
     /// Admit TID0..7 on an already WMM-configured peer. Callers grant this
     /// only under the signed all-AC QoS operating program.
     pub(super) fn admit_all_tids(&self, admission: &Admission) -> Result<(), Error> {
@@ -801,6 +824,14 @@ pub(super) fn he_fingerprint() -> [u8; 32] {
             .map(|he| he.capability_body())
             .unwrap_or_default(),
     );
+    hash.finalize()
+}
+/// Emitter program added by `radio_policy::Program::Ampdu`.
+pub(super) fn ampdu_fingerprint() -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"B originator BA v1; mac80211 agg-tx ADDBA request immediate policy A-MSDU-capable buf64 HT / buf128+ADDBA-ext HE timeout0 SSN=next QoS SN; ADDBA_RESP_INTERVAL 1s; HT_AGG_MAX_RETRIES 15; DELBA initiator on teardown/EAPOL");
+    hash.update(b"data TXWD BODY3 AGG_EN, INFO1 MAX_AGGNUM=agg_num-1, INFO2 AMPDU_DENSITY=peer HT MPDU density; R_AX_AMPDU_AGG_LIMIT 0xc610[23:16]=min agg_num-1 else 0x3f; h2c_ampdu_cmac_tbl NULL on 8852B");
+    hash.update(&[super::packet_core::AGG_WINDOW as u8]);
     hash.finalize()
 }
 /// Local HE capability: Linux `rtw89_init_he_cap` for a 2.4GHz station,

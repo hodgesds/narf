@@ -119,6 +119,8 @@ pub(super) struct Peer {
     pub(super) actions: Vec<Vec<u8>>,
     /// Probe requests sent by the station.
     pub(super) probes: Vec<Vec<u8>>,
+    /// Answer an ADDBA Request with (status, buffer size); `None` ignores it.
+    pub(super) addba: Option<(u16, u16)>,
 }
 impl Peer {
     pub(super) fn new(protected: bool) -> Self {
@@ -158,6 +160,7 @@ impl Peer {
             station_he: false,
             actions: Vec::new(),
             probes: Vec::new(),
+            addba: None,
         }
     }
     pub(super) fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
@@ -210,6 +213,22 @@ impl Peer {
         }
         if self.ap.phase() == ApPhase::Authorized && frame[0] == 0xd0 {
             self.actions.push(frame.to_vec());
+            // ADDBA Request -> ADDBA Response (token, status, policy|TID|buf).
+            if let (Some((status, buf)), Some(&[3, 0, token, c0, c1])) =
+                (self.addba, frame.get(24..29))
+            {
+                let tid = (u16::from_le_bytes([c0, c1]) >> 2) & 0xf;
+                let capab = 1u16 << 1 | tid << 2 | buf << 6;
+                let mut response = vec![0xd0, 0, 0, 0];
+                response.extend_from_slice(&OWN);
+                response.extend_from_slice(&AP);
+                response.extend_from_slice(&AP);
+                response.extend_from_slice(&[0x20, 0, 3, 1, token]);
+                response.extend_from_slice(&status.to_le_bytes());
+                response.extend_from_slice(&capab.to_le_bytes());
+                response.extend_from_slice(&[0, 0]);
+                return Ok((vec![response], false));
+            }
             return Ok((Vec::new(), false));
         }
         if self.ap.phase() != ApPhase::Authorized || matches!(frame[0], 0 | 0xb0) {
@@ -330,6 +349,8 @@ struct DriverModel {
     firmware_ra: bool,
     ht: bool,
     he: bool,
+    /// Signed originator BA / TX A-MPDU program (`Program::Ampdu`).
+    ampdu: bool,
     irq: Option<IrqModel>,
     /// HCI DMA stop/busy block behind `dma_stop::stop`.
     dma: crate::rtw89::dma_stop::tests::Model,
@@ -380,6 +401,7 @@ impl DriverModel {
             firmware_ra: false,
             ht: false,
             he: false,
+            ampdu: false,
             irq: None,
             dma: crate::rtw89::dma_stop::tests::Model::new(),
             reclaimed: None,
@@ -453,6 +475,38 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
     fn station_he_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
         self.station_allowed()?;
         Ok(self.wmm && self.firmware_ra && self.ht && self.he)
+    }
+    fn station_ampdu_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
+        self.station_allowed()?;
+        Ok(self.wmm && self.firmware_ra && self.ht && self.ampdu)
+    }
+    async fn station_configure_agg_limit(
+        &mut self,
+        agg_num: Option<u16>,
+        admission: &crate::rtw89::station_control::Admission,
+    ) -> Result<(), crate::rtw89::power::Error> {
+        if agg_num.is_some() && !self.station_ampdu_allowed()? {
+            return Err(crate::rtw89::power::Error::Unsupported);
+        }
+        self.controller
+            .configure_agg_limit(&mut self.control, agg_num, admission)
+    }
+    fn packet_ready_aggregate(&self) -> bool {
+        self.core
+            .as_ref()
+            .is_some_and(crate::rtw89::packet_core::Core::ready_aggregate)
+    }
+    fn packet_submit_agg(
+        &mut self,
+        bytes: &[u8],
+        report: bool,
+        rate: u8,
+        agg: crate::rtw89::packet_format::Agg,
+    ) -> Result<u64, crate::rtw89::packet_core::Error> {
+        if !(self.wmm && self.firmware_ra && self.ht && self.ampdu) {
+            return Err(crate::rtw89::packet_core::Error::Access);
+        }
+        self.packet(|c, p| c.submit_agg(p, bytes, report, rate, Some(agg)))
     }
     async fn station_scan_address(
         &mut self,
@@ -571,7 +625,7 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         own: [u8; 6],
         macid: u8,
     ) -> Result<(), crate::rtw89::packet_core::Error> {
-        self.core = Some(crate::rtw89::packet_core::Core::prepare_with(
+        let mut core = crate::rtw89::packet_core::Core::prepare_with(
             &mut self.packets,
             own,
             macid,
@@ -580,7 +634,11 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
                 self.wmm && self.firmware_ra && self.ht,
                 self.wmm && self.firmware_ra && self.ht && self.he,
             ),
-        )?);
+        )?;
+        if self.wmm && self.firmware_ra && self.ht && self.ampdu {
+            core.enable_aggregation()?;
+        }
+        self.core = Some(core);
         Ok(())
     }
     fn packet_start(&mut self) -> Result<(), crate::rtw89::packet_core::Error> {
@@ -729,8 +787,22 @@ impl Harness {
         ht: bool,
         he: Option<(bool, &[u8])>,
     ) -> Self {
+        Self::build_full(protected, wmm, qos_all, rates, ht, he, false)
+    }
+    /// `ampdu`: the signed aggregate program is granted.
+    fn build_full(
+        protected: bool,
+        wmm: bool,
+        qos_all: bool,
+        rates: Option<&[u8]>,
+        ht: bool,
+        he: Option<(bool, &[u8])>,
+        ampdu: bool,
+    ) -> Self {
         assert!(ACTIVE_TEST.lock().is_none());
         let mut io = DriverModel::new();
+        io.ampdu = ampdu;
+
         io.wmm = wmm;
         io.qos_all = qos_all;
         io.ht = ht;
@@ -2364,4 +2436,161 @@ fn smoke_rtw8852b_removal_retires_station_and_reclaims_behind_stop_proof() -> Te
 kernel_test_in!(
     "drivers/wireless/rtw89/station",
     smoke_rtw8852b_removal_retires_station_and_reclaims_behind_stop_proof
+);
+
+fn ampdu_harness(granted: bool, addba: Option<(u16, u16)>) -> Harness {
+    const RATES: [u8; 12] = [0x82, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+    let h = Harness::build_full(false, true, false, Some(&RATES), true, None, granted);
+    h.peer.lock().addba = addba;
+    h
+}
+fn uplink(h: &Harness, port: u16) -> Result<Vec<u8>, &'static str> {
+    let frame = udp_ipv4(AP, OWN, h.plan.lease_ip, h.plan.server_ip, port, 9, b"agg");
+    narf_net::iface::send_on(h.device.name(), &frame).map_err(|_| "uplink refused")?;
+    h.pump();
+    Ok(frame)
+}
+fn addba_requests(h: &Harness) -> Vec<Vec<u8>> {
+    h.peer
+        .lock()
+        .actions
+        .iter()
+        .filter(|a| a.get(24..26) == Some(&[3, 0][..]))
+        .cloned()
+        .collect()
+}
+fn smoke_rtw8852b_originator_block_ack_tx_ampdu() -> TestResult {
+    // Success: the first TID0 frame goes out unaggregated and starts
+    // ieee80211_start_tx_ba_session; the ADDBA response makes the session
+    // operational after the RA aggregation limit write.
+    let h = ampdu_harness(true, Some((0, 64)));
+    if h.join().is_err() {
+        return TestResult::Fail("HT association failed");
+    }
+    if uplink(&h, 1000).is_err() || h.model(|io| io.packets.last.and_then(|s| s.agg)).is_some() {
+        return TestResult::Fail("session-starting frame differs");
+    }
+    h.pump();
+    let requests = addba_requests(&h);
+    let Some(request) = requests.first() else {
+        return TestResult::Fail("no ADDBA request sent");
+    };
+    // category3 action0 token1, capab A-MSDU|policy|TID0|buf64, timeout0,
+    // SSN = next QoS SN (the triggering frame took the previous one).
+    // Open QoS data shares the station counter: data X, ADDBA X+1, SSN X+2.
+    let ssn = u16::from_le_bytes([request[31], request[32]]) >> 4;
+    let data = h.model(|io| {
+        io.packets
+            .transmitted
+            .iter()
+            .rev()
+            .find(|b| b[0] == 0x88)
+            .map(|b| u16::from_le_bytes([b[22], b[23]]) >> 4)
+    });
+    if request.get(24..31) != Some(&[3, 0, 1, 0x03, 0x10, 0, 0][..])
+        || request.len() != 33
+        || data.map(|x| (x + 2) & 4095) != Some(ssn)
+    {
+        return TestResult::Fail("ADDBA request differs");
+    }
+    complete(h.device.apply_edca());
+    h.pump();
+    // rtw89_phy_ra_recalc_agg_limit: 0xc610[23:16] = 64 - 1.
+    if h.model(|io| io.control.word(0xc610) >> 16 & 0xff) != 63 {
+        return TestResult::Fail("RA aggregation limit not programmed");
+    }
+    if uplink(&h, 1001).is_err()
+        || h.model(|io| io.packets.last.and_then(|s| s.agg)) != Some((63, 0))
+        || h.peer.lock().tids.last() != Some(&0)
+    {
+        return TestResult::Fail("operational session frame lacks TXWD AGG_EN");
+    }
+    // Several aggregated frames in flight on separate slots.
+    h.peer.lock().hold_data = true;
+    let before = h.model(|io| io.packets.history.len());
+    if uplink(&h, 1002).is_err() || uplink(&h, 1003).is_err() {
+        return TestResult::Fail("aggregated frame refused while another was in flight");
+    }
+    let held: Vec<_> = h.model(|io| io.packets.history[before..].to_vec());
+    if held.len() != 2 || held.iter().any(|s| s.agg.is_none()) {
+        return TestResult::Fail("two aggregated frames not in flight together");
+    }
+    h.peer.lock().hold_data = false;
+    let released = h.model(|io| {
+        io.packets.consumed(held[1]);
+        held.iter().try_for_each(|s| io.packets.report(*s, 0))
+    });
+    if released.is_err() {
+        return TestResult::Fail("fixture release");
+    }
+    h.pump();
+    if h.closed() || uplink(&h, 1004).is_err() {
+        return TestResult::Fail("multi-frame retirement failed");
+    }
+    // Teardown: DELBA from the recipient (AGG_STOP_PEER_REQUEST) stops the
+    // session without a DELBA back and restores the 0x3f limit.
+    let delba = ba_action(&[3, 2, 0x00, 0x00, 1, 0]); // TID0, recipient
+    let actions = h.peer.lock().actions.len();
+    let _ = h.model(|io| io.packets.inject(&delba));
+    h.pump();
+    complete(h.device.apply_edca());
+    h.pump();
+    if h.model(|io| io.control.word(0xc610) >> 16 & 0xff) != 0x3f
+        || h.peer.lock().actions.len() != actions
+    {
+        return TestResult::Fail("recipient DELBA did not stop the TX session");
+    }
+    if uplink(&h, 1005).is_err() || h.model(|io| io.packets.last.and_then(|s| s.agg)).is_some() {
+        return TestResult::Fail("aggregation continued after DELBA");
+    }
+    drop(h);
+    // Failure: a declined response leaves the TID unaggregated.
+    let h = ampdu_harness(true, Some((37, 0)));
+    if h.join().is_err() || uplink(&h, 1100).is_err() {
+        return TestResult::Fail("declined fixture join");
+    }
+    h.pump();
+    complete(h.device.apply_edca());
+    h.pump();
+    if addba_requests(&h).len() != 1
+        || uplink(&h, 1101).is_err()
+        || h.model(|io| io.packets.last.and_then(|s| s.agg)).is_some()
+        || h.closed()
+    {
+        return TestResult::Fail("declined ADDBA response aggregated");
+    }
+    drop(h);
+    // Failure: no response within ADDBA_RESP_INTERVAL stops the session
+    // with DELBA(initiator, QSTA_NOT_USE).
+    let h = ampdu_harness(true, None);
+    if h.join().is_err() || uplink(&h, 1200).is_err() {
+        return TestResult::Fail("timeout fixture join");
+    }
+    h.pump();
+    if addba_requests(&h).len() != 1 {
+        return TestResult::Fail("timeout fixture sent no ADDBA request");
+    }
+    h.env.clock.fetch_add(1000, Ordering::AcqRel);
+    h.pump();
+    h.pump();
+    let last = h.peer.lock().actions.last().cloned().unwrap_or_default();
+    if last.get(24..30) != Some(&[3, 2, 0x00, 0x08, 37, 0][..]) || h.closed() {
+        return TestResult::Fail("ADDBA response timeout did not send DELBA");
+    }
+    drop(h);
+    // Program not granted: HT data never starts a TX session.
+    let h = ampdu_harness(false, Some((0, 64)));
+    if h.join().is_err() || uplink(&h, 1300).is_err() || uplink(&h, 1301).is_err() {
+        return TestResult::Fail("ungranted fixture join");
+    }
+    h.pump();
+    if !addba_requests(&h).is_empty() || h.model(|io| io.packets.last.and_then(|s| s.agg)).is_some()
+    {
+        return TestResult::Fail("ADDBA or AGG_EN without the signed program");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/block_ack",
+    smoke_rtw8852b_originator_block_ack_tx_ampdu
 );

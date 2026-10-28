@@ -58,6 +58,34 @@ pub(super) unsafe trait Io: Send {
     fn station_ht_allowed(&mut self) -> Result<bool, power::Error> {
         Ok(false)
     }
+    /// Signed originator BA / TX A-MPDU program (`Program::Ampdu`).
+    fn station_ampdu_allowed(&mut self) -> Result<bool, power::Error> {
+        Ok(false)
+    }
+    /// `IEEE80211_AMPDU_TX_OPERATIONAL`/`TX_STOP_*` device half on RTL8852B:
+    /// `rtw89_phy_ra_recalc_agg_limit` with the minimum operational
+    /// `agg_num` (`None`: no TX session).
+    async fn station_configure_agg_limit(
+        &mut self,
+        _: Option<u16>,
+        _: &Admission,
+    ) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    /// Room for one more aggregated data frame (`Core::ready_aggregate`).
+    fn packet_ready_aggregate(&self) -> bool {
+        false
+    }
+    /// `Core::submit_agg` for one aggregated QoS DATA MPDU.
+    fn packet_submit_agg(
+        &mut self,
+        _: &[u8],
+        _: bool,
+        _: u8,
+        _: super::packet_format::Agg,
+    ) -> Result<u64, packet::Error> {
+        Err(packet::Error::State)
+    }
     /// Signed HE20 program (`Program::He`).
     fn station_he_allowed(&mut self) -> Result<bool, power::Error> {
         Ok(false)
@@ -266,11 +294,17 @@ pub(super) fn probe_request(own: [u8; 6], ssid: &[u8], ies: &[u8]) -> Vec<u8> {
 enum BaOp {
     Start(super::block_ack::Request, u16),
     Stop(u8),
+    /// Originator `TX_OPERATIONAL` for a TID.
+    TxOperational(u8),
+    /// Originator `TX_STOP_*`: recompute the RA aggregation limit.
+    TxLimit,
 }
 struct Pending {
     id: u64,
     bytes: Vec<u8>,
     kind: Kind,
+    /// Published with TXWD AGG_EN.
+    agg: bool,
 }
 struct Entry {
     candidate: ObservedBss,
@@ -300,7 +334,9 @@ pub(super) struct State {
     security: Option<Security>,
     incoming: VecDeque<Mpdu>,
     received: VecDeque<Vec<u8>>,
-    pending: Option<Pending>,
+    /// Frames in flight, oldest first. More than one only for aggregated
+    /// QoS DATA on an operational originator session.
+    pending: VecDeque<Pending>,
     delivered_reply: Option<Pending>,
     initial_nonce: Option<[u8; 32]>,
     sequence: u16,
@@ -323,6 +359,12 @@ pub(super) struct State {
     scan: Option<[u8; 6]>,
     /// Recipient Block Ack sessions per TID.
     ba: [Option<super::block_ack::Session<Mpdu>>; 8],
+    /// Originator (TX) Block Ack sessions under the signed aggregate program.
+    originator: Box<super::block_ack::Originator>,
+    /// `Program::Ampdu` granted and HT negotiated for this association.
+    ampdu: bool,
+    /// Peer HT minimum MPDU start spacing (TXWD AMPDU_DENSITY).
+    density: u8,
     /// BA CAM programming awaiting the async owner.
     ba_ops: VecDeque<BaOp>,
     /// Queued ADDBA responses / DELBAs.
@@ -358,7 +400,7 @@ impl State {
             security: None,
             incoming: VecDeque::new(),
             received: VecDeque::new(),
-            pending: None,
+            pending: VecDeque::new(),
             delivered_reply: None,
             initial_nonce: None,
             sequence: 1,
@@ -373,6 +415,9 @@ impl State {
             er: false,
             scan: None,
             ba: core::array::from_fn(|_| None),
+            originator: Box::default(),
+            ampdu: false,
+            density: 0,
             ba_ops: VecDeque::new(),
             mgmt_out: VecDeque::new(),
             deadline: 0,
@@ -402,7 +447,7 @@ impl State {
     }
     pub(super) fn ready(&self) -> bool {
         self.peer().is_some()
-            && self.pending.is_none()
+            && self.pending.iter().all(|pending| pending.agg)
             && self.delivered_reply.is_none()
             && self.security.as_ref().is_none_or(Security::port_open)
     }
@@ -523,7 +568,7 @@ impl State {
             .map(|candidate| candidate.bss.information_elements)
     }
     fn transmit(&mut self, io: &mut impl Io, bytes: Vec<u8>, kind: Kind) -> Result<(), Error> {
-        self.transmit_with(io, bytes, kind, true)
+        self.transmit_with(io, bytes, kind, true, None)
     }
     /// `assign` false is mac80211 `IEEE80211_TX_CTRL_NO_SEQNO`: the caller
     /// already wrote the sequence number (random-SN probe requests).
@@ -533,12 +578,20 @@ impl State {
         mut bytes: Vec<u8>,
         kind: Kind,
         assign: bool,
+        agg: Option<super::packet_format::Agg>,
     ) -> Result<(), Error> {
         // Caller holds publication; this helper never awaits or re-enters it.
         if self.admission.closed() {
             return Err(Error::State);
         }
-        if self.pending.is_some() || self.delivered_reply.is_some() {
+        // Only aggregated data joins other aggregated data in flight, within
+        // the session window (`agg.num` + 1) and the emitter window.
+        let joins = agg.is_some_and(|agg| {
+            kind == Kind::Data
+                && self.pending.iter().all(|pending| pending.agg)
+                && self.pending.len() < (usize::from(agg.num) + 1).min(packet::AGG_WINDOW)
+        });
+        if !self.pending.is_empty() && !joins || self.delivered_reply.is_some() {
             return Err(Error::Busy);
         }
         if assign && !matches!(kind, Kind::Security | Kind::Data) {
@@ -566,8 +619,27 @@ impl State {
         } else {
             0
         };
-        let id = io.packet_submit_rate(&bytes, kind != Kind::Data, rate)?;
-        self.pending = Some(Pending { id, bytes, kind });
+        let id = match agg {
+            Some(agg) => io.packet_submit_agg(&bytes, false, rate, agg)?,
+            None => io.packet_submit_rate(&bytes, kind != Kind::Data, rate)?,
+        };
+        // rtw89_core_txq_check_agg: an EAPOL frame stops (and forbids for
+        // RTW89_FORBID_BA_TIMER) the originator session of its TID.
+        if kind == Kind::Security {
+            if let Some(tid) = super::packet_format::qos_tid(&bytes).map(|t| t & 7) {
+                if self.originator.stop(tid) {
+                    self.stop_originator(tid, true);
+                }
+                let until = self.last_now.saturating_add(super::block_ack::FORBID_MS);
+                self.originator.forbid(tid, until);
+            }
+        }
+        self.pending.push_back(Pending {
+            id,
+            bytes,
+            kind,
+            agg: agg.is_some(),
+        });
         Ok(())
     }
     fn cache(&mut self, frame: &Mpdu, now: u64) {
@@ -663,8 +735,37 @@ impl State {
         self.edca_pending = Some(offered);
         Ok(())
     }
+    /// After `Originator::stop`: `TX_STOP_*` reaches the driver (RA limit),
+    /// and a locally requested stop (`AGG_STOP_LOCAL_REQUEST`) sends DELBA
+    /// as initiator with `WLAN_REASON_QSTA_NOT_USE` (`ieee80211_stop_tx_ba_cb`).
+    fn stop_originator(&mut self, tid: u8, local: bool) {
+        self.ba_ops.push_back(BaOp::TxLimit);
+        if local {
+            if let Some(peer) = self.peer.as_ref().map(|p| p.bss.bssid) {
+                self.mgmt_out.push_back(super::block_ack::delba_initiator(
+                    self.own,
+                    peer,
+                    tid,
+                    super::block_ack::REASON_NOT_USE,
+                ));
+            }
+        }
+    }
+    /// Operational originator sessions (bitmap by TID).
+    pub(super) fn tx_block_ack_sessions(&self) -> u8 {
+        (0..8u8).fold(0, |m, tid| {
+            if self.originator.aggregating(tid).is_some() {
+                m | 1 << tid
+            } else {
+                m
+            }
+        })
+    }
     fn clear_block_ack(&mut self) {
-        // Drop discards ownership only (shared Reorder contract).
+        // Drop discards ownership only (shared Reorder contract). Station
+        // teardown is AGG_STOP_DESTROY_STA: no DELBA.
+        self.originator = Box::default();
+        self.ampdu = false;
         self.ba = core::array::from_fn(|_| None);
         self.ba_ops.clear();
         self.mgmt_out.clear();
@@ -709,6 +810,43 @@ impl State {
                             status,
                             request.buf_size,
                         ));
+                    }
+                }
+                ba::Action::AddbaResponse {
+                    token,
+                    status,
+                    tid,
+                    buf_size,
+                    ..
+                } => {
+                    // ieee80211_process_addba_resp. `amsdu` only matters to
+                    // A-MSDU-in-A-MPDU, which this emitter never builds.
+                    if self.ampdu {
+                        let requested = matches!(
+                            self.originator.tids.get(usize::from(tid)).copied().flatten(),
+                            Some(ba::TxState::Requested { token: t, .. }) if t == token
+                        );
+                        if self
+                            .originator
+                            .response(token, status, tid, buf_size)
+                            .is_some()
+                        {
+                            self.ba_ops.push_back(BaOp::TxOperational(tid));
+                        } else if requested {
+                            // AGG_STOP_DECLINED: TX_STOP, no DELBA.
+                            self.ba_ops.push_back(BaOp::TxLimit);
+                        }
+                    }
+                }
+                ba::Action::Delba {
+                    tid,
+                    initiator: false,
+                    ..
+                } => {
+                    // ieee80211_process_delba from the recipient:
+                    // AGG_STOP_PEER_REQUEST, no DELBA back.
+                    if self.originator.stop(tid) {
+                        self.stop_originator(tid, false);
                     }
                 }
                 ba::Action::Delba {
@@ -764,6 +902,12 @@ impl State {
     fn block_ack_tick(&mut self, now: u64) -> Result<(), Error> {
         let now_ns = now.saturating_mul(1_000_000);
         let peer = self.peer.as_ref().map(|p| p.bss.bssid);
+        // sta_addba_resp_timer_expired -> ieee80211_stop_tx_ba_session.
+        let expired: Vec<u8> = self.originator.expired(now).collect();
+        for tid in expired {
+            self.originator.stop(tid);
+            self.stop_originator(tid, true);
+        }
         for tid in 0..8u8 {
             let Some(session) = self.ba[usize::from(tid)].as_mut() else {
                 continue;
@@ -841,6 +985,26 @@ impl State {
                     io.station_configure_ba(false, tid, 0, 0, &self.admission)
                         .await
                 }
+                BaOp::TxOperational(tid) => {
+                    match self.originator.responded(tid) {
+                        Some(buf) => {
+                            let limit = self.originator.min_agg().map_or(buf, |m| m.min(buf));
+                            let result = io
+                                .station_configure_agg_limit(Some(limit), &self.admission)
+                                .await;
+                            if result.is_ok() {
+                                self.originator.operational(tid);
+                            }
+                            result
+                        }
+                        // Stopped while the programming was queued.
+                        None => Ok(()),
+                    }
+                }
+                BaOp::TxLimit => {
+                    io.station_configure_agg_limit(self.originator.min_agg(), &self.admission)
+                        .await
+                }
             };
             if let Err(error) = result {
                 if !self.admission.teardown_pending() {
@@ -901,7 +1065,12 @@ impl State {
         }
     }
     fn delivery(&mut self, delivery: Receipt) -> Result<(), Error> {
-        let pending = self.pending.take().ok_or(Error::State)?;
+        let index = self
+            .pending
+            .iter()
+            .position(|pending| pending.id == delivery.id)
+            .ok_or(Error::State)?;
+        let pending = self.pending.remove(index).ok_or(Error::State)?;
         if pending.id != delivery.id || pending.bytes != delivery.bytes {
             return Err(Error::State);
         }
@@ -974,7 +1143,7 @@ impl State {
             }
         }
         for _ in 0..64 {
-            if self.pending.is_some()
+            if !self.pending.is_empty()
                 || self.delivered_reply.is_some()
                 || self.peer_commit.is_some()
                 || self
@@ -1072,7 +1241,7 @@ impl State {
             }
         }
         self.block_ack_tick(now)?;
-        if self.pending.is_none()
+        if self.pending.is_empty()
             && self.delivered_reply.is_none()
             && self.phase == Phase::Open
             && self
@@ -1082,9 +1251,24 @@ impl State {
         {
             if let Some(frame) = self.mgmt_out.pop_front() {
                 self.transmit(io, frame, Kind::Action)?;
+            } else if self.ampdu {
+                if let Some((tid, token)) = self.originator.next_request(now) {
+                    // ieee80211_tx_ba_session_handle_start: SSN is the next
+                    // QoS SN of the TID, sampled with nothing in flight.
+                    let ssn = match &self.security {
+                        Some(security) => security.next_qos_sequence(tid)?,
+                        // Open QoS data shares the station counter, and this
+                        // request takes the current value.
+                        None => (self.sequence + 1) & 4095,
+                    };
+                    let peer = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                    let request =
+                        super::block_ack::addba_request(self.own, peer, token, tid, ssn, self.he);
+                    self.transmit(io, request, Kind::Action)?;
+                }
             }
         }
-        if self.pending.is_none() && self.delivered_reply.is_none() {
+        if self.pending.is_empty() && self.delivered_reply.is_none() {
             if let Some(reply) = self
                 .security
                 .as_ref()
@@ -1096,7 +1280,7 @@ impl State {
         }
         if idle
             && self.incoming.is_empty()
-            && self.pending.is_none()
+            && self.pending.is_empty()
             && self.delivered_reply.is_none()
             && self.phase == Phase::FourWay
             && self.security.as_ref().is_none_or(Security::port_open)
@@ -1180,9 +1364,9 @@ impl State {
             // rtw89_core_scan_complete: restore the own address once the last
             // probe request has retired. A failure closes the station.
             let deadline = until.saturating_add(1000);
-            while self.pending.is_some() {
+            while !self.pending.is_empty() {
                 self.poll(io)?;
-                if self.pending.is_some() {
+                if !self.pending.is_empty() {
                     if self.now()? >= deadline {
                         return Err(Error::State);
                     }
@@ -1211,9 +1395,9 @@ impl State {
                 probe.ssids
             };
             for (index, ssid) in ssids.into_iter().enumerate() {
-                while self.pending.is_some() {
+                while !self.pending.is_empty() {
                     self.poll(io)?;
-                    if self.pending.is_none() {
+                    if self.pending.is_empty() {
                         break;
                     }
                     if self.now()? >= until {
@@ -1232,7 +1416,8 @@ impl State {
                     None => true,
                 };
                 let admission = self.admission.clone();
-                admission.run(|| Ok(self.transmit_with(io, frame, Kind::Probe, assign)))??;
+                admission
+                    .run(|| Ok(self.transmit_with(io, frame, Kind::Probe, assign, None)))??;
             }
         }
         loop {
@@ -1360,6 +1545,10 @@ impl State {
                         });
                         self.ht = ht.is_some();
                         self.he = he.is_some();
+                        self.density = plan
+                            .negotiated_phy()
+                            .map_or(0, |phy| phy.ht().peer_mpdu_density());
+                        self.ampdu = self.ht && io.station_ampdu_allowed()?;
                         self.er = he.is_some_and(|(_, er)| er);
                         io.station_configure_ra(rates, ht, he.map(|(he, _)| he), &self.admission)
                             .await?;
@@ -1400,14 +1589,36 @@ impl State {
         result
     }
     fn send_inner(&mut self, io: &mut impl Io, frame: &[u8]) -> Result<(), Error> {
-        if !self.ready() || !io.packet_ready() {
+        if !self.ready() {
             return Err(Error::Busy);
         }
+
         if !admitted(frame, self.own) {
             return Err(Error::Profile);
         }
         let peer = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
         let tid = self.tid(frame);
+        // Originator BA (rtw89_core_txq_check_agg): frames of a TID whose
+        // session is being set up wait like mac80211's tid_tx->pending;
+        // an operational session carries TXWD AGG_EN.
+        let agg = if self.ampdu && self.wmm.is_some() {
+            if self.originator.holding(tid) {
+                return Err(Error::Busy);
+            }
+            self.originator
+                .aggregating(tid)
+                .map(|buf| super::packet_format::Agg {
+                    num: (buf - 1) as u8,
+                    density: self.density,
+                })
+        } else {
+            None
+        };
+        if agg.is_some() && !io.packet_ready_aggregate()
+            || agg.is_none() && (!self.pending.is_empty() || !io.packet_ready())
+        {
+            return Err(Error::Busy);
+        }
         let native = if let Some(security) = &mut self.security {
             if self.wmm.is_some() {
                 security.transmit_ethernet_qos(frame, tid)?
@@ -1431,7 +1642,14 @@ impl State {
             bytes.extend_from_slice(&frame[12..]);
             bytes
         };
-        self.transmit(io, native, Kind::Data)
+        self.transmit_with(io, native, Kind::Data, true, agg)?;
+        if agg.is_none() && self.ampdu && self.wmm.is_some() {
+            // The triggering frame goes out unaggregated; ba_work then
+            // starts the session (ieee80211_start_tx_ba_session).
+            let now = self.last_now;
+            self.originator.want(tid, now);
+        }
+        Ok(())
     }
 }
 pub(super) fn admitted(frame: &[u8], own: [u8; 6]) -> bool {
