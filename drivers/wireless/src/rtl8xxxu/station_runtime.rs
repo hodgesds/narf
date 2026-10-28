@@ -1327,13 +1327,10 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             }
         }
     }
-    /// The stopped receive owner after a completed `disconnect`; the
-    /// station (keys, PN/replay state, BA sessions, plan) is dropped.
-    pub(super) fn into_radio(self) -> Result<Receiver<C, B>, Self> {
-        if self.phase != Phase::Stopped {
-            return Err(self);
-        }
-        Ok(self.radio)
+    /// The receive owner; the station (keys, PN/replay state, BA sessions,
+    /// plan) is dropped. Callers hand back only a `Stopped` station.
+    pub(super) fn into_radio(self) -> Receiver<C, B> {
+        self.radio
     }
     /// Backpressure precedes encryption/PN consumption. EAPOL is never admitted
     /// from an Ethernet client; only shared-Supplicant replies own that path.

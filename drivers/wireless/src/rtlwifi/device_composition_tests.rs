@@ -1384,7 +1384,7 @@ pub(crate) fn smoke_rtl8188ee_native_device_rate_mask_follows_rx_pwdb() -> TestR
     }
     let count = masks(&h).len();
     complete(h.device.rate_adaptive());
-    if masks(&h).len() != count || state(&h).map(|s| s.1).flatten().is_some() {
+    if masks(&h).len() != count || state(&h).and_then(|s| s.1).is_some() {
         return TestResult::Fail("RA refresh ran on a closed station");
     }
     TestResult::Pass

@@ -451,14 +451,14 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
     /// station with fresh keys. Failure leaves the radio retained and the
     /// caller marks the service failed.
     async fn rejoin_passive(&mut self) -> Result<(), Error> {
-        let station = self.station.take().ok_or(Error::State)?;
-        let mut radio = match station.into_radio() {
-            Ok(radio) => radio,
-            Err(station) => {
-                self.station = Some(station);
-                return Err(Error::State);
-            }
-        };
+        if self
+            .station
+            .as_ref()
+            .is_none_or(|station| station.phase() != station_runtime::Phase::Stopped)
+        {
+            return Err(Error::State);
+        }
+        let mut radio = self.station.take().ok_or(Error::State)?.into_radio();
         self.initial_nonce = None;
         let result = async {
             radio.release_station().await?;
