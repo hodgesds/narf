@@ -791,16 +791,12 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
         };
         // ── RX ──
         let mut buf = [0u8; 64];
-        loop {
-            match xhci_dev.poll_interrupt_in(port.slot_id, port.bulk_in_dci, &mut buf) {
-                Ok(Some(n)) => {
-                    let n = n.min(buf.len());
-                    let (lo, hi) = ingest_rx(port.family, &buf[..n], &mut port.modem);
-                    if hi > lo {
-                        moved += tty.lock().rx.push(&buf[lo..hi]);
-                    }
-                }
-                _ => break,
+        while let Ok(Some(n)) = xhci_dev.poll_interrupt_in(port.slot_id, port.bulk_in_dci, &mut buf)
+        {
+            let n = n.min(buf.len());
+            let (lo, hi) = ingest_rx(port.family, &buf[..n], &mut port.modem);
+            if hi > lo {
+                moved += tty.lock().rx.push(&buf[lo..hi]);
             }
         }
         // ── TX ──
@@ -1268,15 +1264,19 @@ pub mod tests {
         // CP210x hardware flow control is refused with a typed
         // error until AN571 SET_FLOW is modelled — never the old
         // codec-state silent no-op.
-        let mut s = LineSettings::default();
-        s.flow = FlowControl::RtsCts;
+        let s = LineSettings {
+            flow: FlowControl::RtsCts,
+            ..LineSettings::default()
+        };
         match configure_plan(ChipFamily::Cp210x, 0xEA60, 0, &s) {
             Err(PortError::Unsupported(_)) => {}
             _ => return TestResult::Fail("CP210x RtsCts must be a typed refusal"),
         }
         // Baud 0 is unrepresentable in every family's model.
-        let mut z = LineSettings::default();
-        z.baud = 0;
+        let z = LineSettings {
+            baud: 0,
+            ..LineSettings::default()
+        };
         match configure_plan(ChipFamily::Ftdi, 0x6001, 0, &z) {
             Err(PortError::UnsupportedBaud(0)) => {}
             _ => return TestResult::Fail("FTDI baud 0 must be UnsupportedBaud"),

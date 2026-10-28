@@ -31,8 +31,8 @@ use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_capabilities::{Cap, Write};
-use narf_io::DomainId;
 use narf_ipc::{channel, Consumer, Producer};
+use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, Interface, NetIface, RX_RING_N, TX_RING_N};
 
@@ -110,25 +110,28 @@ impl Interface for TbNetInterface {
 
 /// The registry holds one handle and the CM side keeps another, so
 /// the pump and the fixtures can reach the rings after
-/// registration.
-impl Interface for Arc<TbNetInterface> {
+/// registration. A newtype because the orphan rule forbids
+/// implementing the foreign `Interface` for `Arc<_>` directly.
+struct SharedTbNet(Arc<TbNetInterface>);
+
+impl Interface for SharedTbNet {
     fn name(&self) -> &str {
-        (**self).name()
+        self.0.name()
     }
     fn mac(&self) -> [u8; 6] {
-        (**self).mac()
+        self.0.mac()
     }
     fn mtu(&self) -> u32 {
-        (**self).mtu()
+        self.0.mtu()
     }
     fn link_up(&self) -> bool {
-        (**self).link_up()
+        self.0.link_up()
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        (**self).rx_ring()
+        self.0.rx_ring()
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        (**self).tx_ring()
+        self.0.tx_ring()
     }
 }
 
@@ -291,6 +294,8 @@ impl NetLink {
 
     /// Bind the data transport (see the module documentation for
     /// the production binding's status).
+    // Used by the fixtures; production binding lands with the data transport.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) fn bind(&mut self, link: Box<dyn DataLink>) {
         self.data = Some(link);
         self.refresh_link();
@@ -316,6 +321,8 @@ impl NetLink {
 
     /// The published interface (the registry holds a second
     /// handle to the same object).
+    // Used by the fixtures; production binding lands with the data transport.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) fn interface(&self) -> &Arc<TbNetInterface> {
         &self.iface
     }
@@ -330,7 +337,7 @@ impl NetLink {
         let Some(authority) = narf_net::trusted_net_authority() else {
             return;
         };
-        match narf_net::registry().register(&authority, self.iface.clone()) {
+        match narf_net::registry().register(&authority, SharedTbNet(self.iface.clone())) {
             Ok(handle) => {
                 self.handle = Some(handle);
                 self.registered = true;
@@ -347,7 +354,9 @@ impl NetLink {
     /// into the RX ring.
     pub(crate) fn pump(&mut self) {
         self.ensure_registered();
-        let Some(data) = self.data.as_mut() else {
+        // Taken out for the pass so the counters and `deliver` can
+        // borrow `self`; put back before returning.
+        let Some(mut data) = self.data.take() else {
             return;
         };
         if self.link_up() {
@@ -382,6 +391,7 @@ impl NetLink {
                 }
             }
         }
+        self.data = Some(data);
     }
 
     fn deliver(&mut self, packet: Vec<u8>) -> bool {

@@ -722,7 +722,7 @@ impl<T: SbsTransport> SbsBattery<T> {
         let status_changed = self.last_status_word != Some(status.status_word);
         let was_alarm = self
             .last_status_word
-            .map_or(false, |w| w & battery_status::REMAINING_CAPACITY_ALARM != 0);
+            .is_some_and(|w| w & battery_status::REMAINING_CAPACITY_ALARM != 0);
         let capacity_low = status.capacity_alarm() && !was_alarm;
         if status_changed {
             narf_power::battery::notify(0x80);

@@ -128,7 +128,6 @@
 
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_forcewake::{Forcewake, FwDomain, FwError, FW_DOMAINS};
-use crate::intel_gpu_rcs::RCS_BASE;
 
 // ── Register map (intel_gt_regs.h) ──────────────────────────
 
@@ -527,6 +526,7 @@ pub mod tests {
     //! from the implementation under test.
 
     use super::*;
+    use crate::intel_gpu_rcs::RCS_BASE;
     use alloc::collections::BTreeMap;
     use alloc::rc::Rc;
     use alloc::vec::Vec;

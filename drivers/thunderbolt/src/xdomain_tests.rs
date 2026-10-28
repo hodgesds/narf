@@ -59,9 +59,14 @@ fn fixture_domain(id: u32) -> Domain {
     }
 }
 
+/// Control-frame queue shared between a fixture side and its peer.
+type Inbox = Rc<RefCell<Vec<(u8, Vec<u32>)>>>;
+/// One direction of the in-memory data transport.
+type FrameQueue = Arc<narf_lib::sync::IrqSafeSpinLock<Vec<(u8, Vec<u8>)>>>;
+
 struct Side {
     engine: Rc<RefCell<Engine>>,
-    inbox: Rc<RefCell<Vec<(u8, Vec<u32>)>>>,
+    inbox: Inbox,
     domain: Domain,
 }
 
@@ -96,8 +101,8 @@ impl Side {
 /// with the first queued frame matching the reference match rule
 /// (kind 7, masked route equal, protocol UUID equal).
 struct TestChannel {
-    mine: Rc<RefCell<Vec<(u8, Vec<u32>)>>>,
-    peer_inbox: Rc<RefCell<Vec<(u8, Vec<u32>)>>>,
+    mine: Inbox,
+    peer_inbox: Inbox,
     peer_engine: Rc<RefCell<Engine>>,
 }
 
@@ -142,8 +147,8 @@ impl XdChannel for TestChannel {
 
 /// An in-memory data transport pair endpoint.
 struct MemLink {
-    out: Arc<narf_lib::sync::IrqSafeSpinLock<Vec<(u8, Vec<u8>)>>>,
-    inc: Arc<narf_lib::sync::IrqSafeSpinLock<Vec<(u8, Vec<u8>)>>>,
+    out: FrameQueue,
+    inc: FrameQueue,
 }
 
 impl DataLink for MemLink {
@@ -172,7 +177,8 @@ fn drive(a: &Side, b: &Side, rounds: usize) {
 }
 
 fn stack_frame(payload: &[u8]) -> Option<narf_net::Frame> {
-    let buf = narf_io::alloc_coherent(payload.len().max(1), narf_io::DomainId::DRIVER_0).ok()?;
+    let buf =
+        narf_io::alloc_coherent(payload.len().max(1), narf_lib::id::DomainId::DRIVER_0).ok()?;
     // SAFETY: the buffer was just allocated for at least
     // `payload.len()` bytes and is exclusively owned here.
     unsafe {

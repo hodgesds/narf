@@ -657,7 +657,7 @@ fn parse_dir(
         let mut key = [0u8; PROP_KEY_SIZE];
         key[..4].copy_from_slice(&raw[0].to_be_bytes());
         key[4..].copy_from_slice(&raw[1].to_be_bytes());
-        let length = (raw[2] & 0xffff) as u32;
+        let length = raw[2] & 0xffff;
         let ty = (raw[2] >> 24) as u8;
         let value = raw[3];
         // `tb_property_entry_valid`: directory/data/text entries
@@ -1813,7 +1813,9 @@ impl Engine {
             let network = network_service(&root);
             Some((identity, services, network))
         });
-        let Some(peer) = self.peer_mut(route) else {
+        // Field-level borrow (not `peer_mut`) so the netdev counter,
+        // domain and local UUID stay readable below.
+        let Some(peer) = self.peers.iter_mut().find(|p| p.route == route) else {
             return;
         };
         match parsed {
@@ -1914,6 +1916,8 @@ impl Engine {
     /// peer, and the fixtures' link-down step). The LOGOUT exchange
     /// runs on the next service pass; an unanswering peer is torn
     /// down locally after the retry budget.
+    // Used by the fixtures; production binding lands with the data transport.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) fn initiate_logout(&mut self, route: u64) {
         if let Some(peer) = self.peer_mut(route) {
             if peer.connected() {
@@ -1927,6 +1931,8 @@ impl Engine {
     /// binding on hardware; the in-memory pair in fixtures). Until
     /// a transport is bound the session still completes its login,
     /// but the netdev reports link down and no frames flow.
+    // Used by the fixtures; production binding lands with the data transport.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) fn bind_data_link(&mut self, route: u64, link: Box<dyn crate::tbnet::DataLink>) {
         if let Some(peer) = self.peer_mut(route) {
             if let Some(net) = &mut peer.net {
