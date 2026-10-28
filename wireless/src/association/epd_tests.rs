@@ -18,7 +18,7 @@ fn bss(mandatory: bool, capability: u16) -> Bss {
     }
 }
 fn epd_options() -> JoinOptions {
-    JoinOptions { epd: true }
+    JoinOptions::default().with_epd(true)
 }
 fn associate(plan: &mut JoinPlan, capability: u16) -> Result<Vec<u8>, Error> {
     let assoc = plan.start_authentication()?.to_vec();

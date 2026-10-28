@@ -108,12 +108,73 @@ pub struct JoinPlan {
     sae: Option<SaeJoin>,
     /// EPD-mandatory BSS joined with the EPD opt-in.
     epd: bool,
+    /// The negotiated WPA2 AKM/MFP profile (`Wpa2Profile::LEGACY` otherwise).
+    wpa2: Wpa2Profile,
 }
 
 /// Capability Information EPD subfield (bit13, IEEE802.11-2020 9.4.1.4).
 const CAP_EPD: u16 = 0x2000;
 
-/// Native framing opt-ins for `JoinPlan::prepare_with_options`.
+/// AKM suites (IEEE802.11-2020 Table 9-151, OUI 00-0F-AC) whose key
+/// hierarchy the owner's EAPOL/key path implements. JoinPlan negotiates
+/// the AKM as wpa_supplicant `wpa_pick_key_mgmt` intersected with the
+/// driver's cfg80211 `wiphy->akm_suites`: the most preferred AKM offered by
+/// both the AP and this set wins, so a driver that lacks AKM 24's
+/// HMAC-SHA-256 group-19 MIC falls back to SAE AKM 8.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AkmSet(u32);
+impl AkmSet {
+    /// No AKM.
+    pub const NONE: Self = Self(0);
+    /// PSK (AKM 2).
+    pub const PSK: Self = Self(1 << rsn::AKM_PSK);
+    /// PSK-SHA256 (AKM 6): AES-128-CMAC EAPOL MIC, SHA-256 KDF.
+    pub const PSK_SHA256: Self = Self(1 << rsn::AKM_PSK_SHA256);
+    /// SAE (AKM 8).
+    pub const SAE: Self = Self(1 << rsn::AKM_SAE);
+    /// SAE-EXT-KEY (AKM 24, group-dependent HMAC-SHA-2 EAPOL MIC).
+    pub const SAE_EXT_KEY: Self = Self(1 << rsn::AKM_SAE_EXT_KEY);
+    /// The AKMs JoinPlan negotiated before `JoinOptions::akms` existed:
+    /// PSK, SAE and SAE-EXT-KEY. This is the default.
+    pub const LEGACY: Self = Self(Self::PSK.0 | Self::SAE.0 | Self::SAE_EXT_KEY.0);
+    /// Every AKM JoinPlan can negotiate.
+    pub const ALL: Self = Self(Self::LEGACY.0 | Self::PSK_SHA256.0);
+    /// Union.
+    pub const fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+    /// This set without `other`.
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+    /// True when the standard (00-0F-AC) suite type is in the set.
+    pub const fn contains_suite(self, suite_type: u8) -> bool {
+        suite_type < 32 && self.0 & (1 << suite_type) != 0
+    }
+}
+impl Default for AkmSet {
+    fn default() -> Self {
+        Self::LEGACY
+    }
+}
+
+/// wpa_supplicant `ieee80211w` policy for a `SecurityMode::Wpa2Psk` plan.
+/// SAE always requires PMF and ignores it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pmf {
+    /// `ieee80211w=0`: no MFPC; an MFPR AP is refused (the default).
+    #[default]
+    Disabled,
+    /// `ieee80211w=1`: advertise MFPC; PMF is in force when the AP sets MFPC.
+    Optional,
+    /// `ieee80211w=2`: advertise MFPC|MFPR; an AP without MFPC is refused.
+    Required,
+}
+
+/// Native framing and key-path opt-ins for `JoinPlan::prepare_with_options`.
+/// Construct with `JoinOptions::default()` and the `with_*` builders (or
+/// `..Default::default()`): new fields are added with behaviour-preserving
+/// defaults.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct JoinOptions {
     /// The owner's data path implements EtherType Protocol Discrimination
@@ -121,6 +182,90 @@ pub struct JoinOptions {
     /// Capability EPD subfield and an EPD-mandatory BSS (selector 124) is
     /// admitted.
     pub epd: bool,
+    /// AKMs the owner's key path implements (default `AkmSet::LEGACY`).
+    pub akms: AkmSet,
+    /// WPA2-PSK management-frame protection policy (default disabled).
+    pub pmf: Pmf,
+}
+impl JoinOptions {
+    pub fn with_epd(mut self, epd: bool) -> Self {
+        self.epd = epd;
+        self
+    }
+    pub fn with_akms(mut self, akms: AkmSet) -> Self {
+        self.akms = akms;
+        self
+    }
+    pub fn with_pmf(mut self, pmf: Pmf) -> Self {
+        self.pmf = pmf;
+        self
+    }
+}
+
+/// The negotiated WPA2-Personal profile: AKM 2 or 6 and the RSN
+/// Capabilities MFPC/MFPR bits of the station RSNE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Wpa2Profile {
+    akm: u8,
+    mfp: u16,
+    /// Both RSNEs set MFPC: PMF is in force.
+    pmf: bool,
+}
+impl Wpa2Profile {
+    const LEGACY: Self = Self {
+        akm: rsn::AKM_PSK,
+        mfp: 0,
+        pmf: false,
+    };
+    fn rsne(self, spp_amsdu: bool) -> RsnIe {
+        let mut rsne = RsnIe::wpa2_psk_ccmp();
+        rsne.akms = vec![Suite::standard(self.akm)];
+        rsne.rsn_capabilities = self.mfp
+            | if spp_amsdu {
+                rsn::RSN_CAP_SPP_AMSDU_CAPABLE
+            } else {
+                0
+            };
+        rsne
+    }
+    /// wpa_supplicant `wpa_supplicant_set_suites` for WPA-PSK /
+    /// WPA-PSK-SHA256 with `ieee80211w` = `pmf`.
+    fn negotiate(ap: &RsnIe, akms: AkmSet, pmf: Pmf) -> Result<Self, Error> {
+        let ccmp = Suite::standard(rsn::CIPHER_CCMP_128);
+        let ap_mfpc = ap.rsn_capabilities & rsn::RSN_CAP_MFP_CAPABLE != 0;
+        let ap_mfpr = ap.rsn_capabilities & rsn::RSN_CAP_MFP_REQUIRED != 0;
+        if ap.group_cipher != ccmp
+            || !ap.pairwise_ciphers.contains(&ccmp)
+            || ap.rsn_capabilities & rsn::RSN_CAP_NO_PAIRWISE != 0
+            // "MFP required by AP but disabled locally".
+            || (ap_mfpr && pmf == Pmf::Disabled)
+            // "PMF required but AP not MFP capable".
+            || (pmf == Pmf::Required && !ap_mfpc)
+            // Only the default BIP-CMAC-128 is implemented (Security IGTK).
+            || (pmf != Pmf::Disabled
+                && ap_mfpc
+                && ap
+                    .group_management_cipher
+                    .is_some_and(|c| c != Suite::standard(rsn::CIPHER_BIP_CMAC_128)))
+        {
+            return Err(Error::UnsupportedSecurity);
+        }
+        // wpa_pick_key_mgmt: PSK-SHA256 before PSK.
+        let akm = [rsn::AKM_PSK_SHA256, rsn::AKM_PSK]
+            .into_iter()
+            .find(|akm| akms.contains_suite(*akm) && ap.akms.contains(&Suite::standard(*akm)))
+            .ok_or(Error::UnsupportedSecurity)?;
+        let mfp = match pmf {
+            Pmf::Disabled => 0,
+            Pmf::Optional => rsn::RSN_CAP_MFP_CAPABLE,
+            Pmf::Required => rsn::RSN_CAP_MFP_CAPABLE | rsn::RSN_CAP_MFP_REQUIRED,
+        };
+        Ok(Self {
+            akm,
+            mfp,
+            pmf: mfp != 0 && ap_mfpc,
+        })
+    }
 }
 
 /// BSS membership selectors (IEEE802.11-2020 Table 9-80 as amended;
@@ -483,6 +628,22 @@ impl JoinPlan {
     pub fn epd(&self) -> bool {
         self.epd
     }
+    /// The negotiated AKM: PSK/PSK-SHA256 for `Wpa2Psk`, SAE/SAE-EXT-KEY
+    /// for `Wpa3Sae`, `None` for an open plan.
+    pub fn akm(&self) -> Option<crate::eapol::KeyMgmt> {
+        if let Some(sae) = self.sae.as_ref() {
+            return Some(sae.akm());
+        }
+        self.security
+            .is_wpa2()
+            .then(|| crate::eapol::KeyMgmt::from_suite_type(self.wpa2.akm))
+            .flatten()
+    }
+    /// True when the station RSNE advertises MFPC and the AP's RSNE does
+    /// too: robust management frames are protected (always for SAE).
+    pub fn pmf(&self) -> bool {
+        self.sae.is_some() || (self.security.is_wpa2() && self.wpa2.pmf)
+    }
     fn prepare_inner(
         bss: &Bss,
         own: [u8; 6],
@@ -568,6 +729,7 @@ impl JoinPlan {
             return Err(Error::InvalidBss);
         }
         let mut sae = None;
+        let mut wpa2 = Wpa2Profile::LEGACY;
         let negotiated = match security {
             SecurityMode::Open => {
                 if bss.capability & 0x10 != 0 || rsn.is_some() || wpa {
@@ -577,18 +739,11 @@ impl JoinPlan {
             }
             SecurityMode::Wpa2Psk => {
                 let rsn = rsn.ok_or(Error::UnsupportedSecurity)?;
-                if bss.capability & 0x10 == 0
-                    || rsn.group_cipher != Suite::standard(rsn::CIPHER_CCMP_128)
-                    || !rsn
-                        .pairwise_ciphers
-                        .contains(&Suite::standard(rsn::CIPHER_CCMP_128))
-                    || !rsn.akms.contains(&Suite::standard(rsn::AKM_PSK))
-                    || rsn.rsn_capabilities & (rsn::RSN_CAP_MFP_REQUIRED | rsn::RSN_CAP_NO_PAIRWISE)
-                        != 0
-                {
+                if bss.capability & 0x10 == 0 {
                     return Err(Error::UnsupportedSecurity);
                 }
-                Some(RsnIe::wpa2_psk_ccmp().encode_body())
+                wpa2 = Wpa2Profile::negotiate(&rsn, options.akms, options.pmf)?;
+                Some(wpa2.rsne(false).encode_body())
             }
             SecurityMode::Wpa3Sae { pwe } => {
                 let rsn = rsn.as_ref().ok_or(Error::UnsupportedSecurity)?;
@@ -598,6 +753,7 @@ impl JoinPlan {
                     rsn,
                     rsnxe.as_deref(),
                     rate_elements.selectors & SEL_SAE_H2E != 0,
+                    options.akms,
                 )?;
                 let body = join.station_rsne(None);
                 sae = Some(join);
@@ -663,6 +819,7 @@ impl JoinPlan {
             spp_amsdu: false,
             sae,
             epd,
+            wpa2,
         })
     }
     pub fn start_authentication(&mut self) -> Result<&[u8], Error> {
@@ -822,11 +979,7 @@ impl JoinPlan {
             return Some(sae.station_rsne(sae.pmkid()));
         }
         if self.security.is_wpa2() {
-            let mut rsne = RsnIe::wpa2_psk_ccmp();
-            if self.spp_amsdu {
-                rsne.rsn_capabilities |= rsn::RSN_CAP_SPP_AMSDU_CAPABLE;
-            }
-            Some(rsne.encode_body())
+            Some(self.wpa2.rsne(self.spp_amsdu).encode_body())
         } else {
             None
         }
@@ -844,3 +997,7 @@ mod observe_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "association/epd_tests.rs"]
 mod epd_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "association/akm_tests.rs"]
+mod akm_tests;

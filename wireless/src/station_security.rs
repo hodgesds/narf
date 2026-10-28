@@ -108,6 +108,14 @@ fn ie(id: u8, body: &[u8]) -> Result<Vec<u8>, Error> {
     out.extend_from_slice(body);
     Ok(out)
 }
+/// True when the station RSNE's single AKM is SAE (8) or SAE-EXT-KEY (24).
+fn sae_rsne(station_rsne: &[u8]) -> bool {
+    use crate::rsn::{self, Suite};
+    crate::rsn::RsnIe::decode_body(station_rsne).is_some_and(|rsne| {
+        rsne.akms == [Suite::standard(rsn::AKM_SAE)]
+            || rsne.akms == [Suite::standard(rsn::AKM_SAE_EXT_KEY)]
+    })
+}
 fn unicast(mac: [u8; 6]) -> bool {
     mac != [0; 6] && mac[0] & 1 == 0
 }
@@ -133,7 +141,7 @@ impl Security {
             ap_rsnxe,
             sequence,
         )?;
-        if owner.pmf {
+        if sae_rsne(station_rsne) {
             // SAE needs its RSNXE and the PMF owner: use `new_sae`.
             return Err(Error::Profile);
         }
@@ -163,12 +171,13 @@ impl Security {
             ap_rsnxe,
             sequence,
         )?;
-        if !owner.pmf {
+        if !owner.pmf || !sae_rsne(station_rsne) {
             return Err(Error::Profile);
         }
         Ok(owner)
     }
-    /// True for a PMF (SAE) association.
+    /// True for a PMF association: SAE, or WPA2-PSK whose station and AP
+    /// RSNEs both set MFPC (`JoinPlan::pmf()`).
     pub fn pmf(&self) -> bool {
         self.pmf
     }
@@ -207,10 +216,18 @@ impl Security {
         let key_mgmt = match station.akms.as_slice() {
             [akm] if *akm == Suite::standard(rsn::AKM_SAE) => KeyMgmt::Sae,
             [akm] if *akm == Suite::standard(rsn::AKM_SAE_EXT_KEY) => KeyMgmt::SaeExtKey,
+            [akm] if *akm == Suite::standard(rsn::AKM_PSK_SHA256) => KeyMgmt::PskSha256,
             _ => KeyMgmt::Psk,
         };
-        let pmf = key_mgmt.sae();
-        if pmf {
+        let ap = crate::rsn::RsnIe::decode_body(ap_rsne).ok_or(Error::Profile)?;
+        // WPA2-PSK with `JoinOptions::pmf` (ieee80211w=1/2): PMF is in force
+        // when both RSNEs set MFPC (IEEE802.11-2020 12.6.3, wpa_supplicant
+        // `wpa_sm_set_ap_rsn_ie` / `sm->mgmt_group_cipher`).
+        let station_mfp = station.rsn_capabilities & mfp;
+        let pmf = key_mgmt.sae()
+            || (station_mfp & rsn::RSN_CAP_MFP_CAPABLE != 0
+                && ap.rsn_capabilities & rsn::RSN_CAP_MFP_CAPABLE != 0);
+        if key_mgmt.sae() {
             if station.group_cipher != ccmp
                 || station.pairwise_ciphers != [ccmp]
                 || station.rsn_capabilities != mfp
@@ -222,21 +239,28 @@ impl Security {
                 return Err(Error::Profile);
             }
         } else {
+            // Canonical WPA2-PSK/CCMP with AKM 2 or 6, optional SPP A-MSDU
+            // Capable and the `Pmf` MFPC / MFPC|MFPR bits.
             let mut canonical = crate::rsn::RsnIe::wpa2_psk_ccmp();
+            canonical.akms = vec![Suite::standard(key_mgmt.suite_type())];
             canonical.rsn_capabilities =
-                station.rsn_capabilities & crate::rsn::RSN_CAP_SPP_AMSDU_CAPABLE;
-            if station != canonical {
+                station.rsn_capabilities & (crate::rsn::RSN_CAP_SPP_AMSDU_CAPABLE | mfp);
+            if station != canonical || station_mfp == rsn::RSN_CAP_MFP_REQUIRED {
                 return Err(Error::Profile);
             }
         }
-        let ap = crate::rsn::RsnIe::decode_body(ap_rsne).ok_or(Error::Profile)?;
         let ap_mfp_ok = if pmf {
             ap.rsn_capabilities & rsn::RSN_CAP_MFP_CAPABLE != 0
                 && ap
                     .group_management_cipher
                     .is_none_or(|c| c == Suite::standard(rsn::CIPHER_BIP_CMAC_128))
+                // A station requiring PMF needs the AP's MFPC (checked above);
+                // an AP requiring it needs ours.
+                && (ap.rsn_capabilities & rsn::RSN_CAP_MFP_REQUIRED == 0
+                    || station_mfp & rsn::RSN_CAP_MFP_CAPABLE != 0)
         } else {
             ap.rsn_capabilities & rsn::RSN_CAP_MFP_REQUIRED == 0
+                && station_mfp & rsn::RSN_CAP_MFP_REQUIRED == 0
         };
         if ap.group_cipher != ccmp
             || !ap.pairwise_ciphers.contains(&ccmp)

@@ -266,6 +266,37 @@ EtherType (5.1.4 EtherType Protocol Discrimination) instead of RFC1042,
 length values and RFC1042 MSDUs are ignored, RFC1042 A-MSDU transmit/receive
 is refused, and `Security::ethernet(frame)` converts admitted data in either
 discrimination. A BSS that does not mandate EPD keeps LPD framing.
+`JoinOptions` is built from `JoinOptions::default()` with the
+`with_epd(bool)`, `with_akms(AkmSet)` and `with_pmf(Pmf)` builders (or
+`..Default::default()`); every field defaults to the earlier behaviour.
+
+**AKM capability and WPA2 PMF (`association::{AkmSet, Pmf}`).**
+`JoinOptions::akms: AkmSet` declares the AKM suites the owner's key path
+implements (cfg80211 `wiphy->akm_suites`): `AkmSet::{NONE, PSK, PSK_SHA256,
+SAE, SAE_EXT_KEY, LEGACY, ALL}` with `with`, `without` and
+`contains_suite(u8)`. The default `AkmSet::LEGACY` (PSK, SAE, SAE-EXT-KEY)
+keeps the earlier selection. The plan picks the most preferred AKM the AP and
+the set share, in wpa_supplicant `wpa_pick_key_mgmt` order (SAE-EXT-KEY under
+H2E, SAE, PSK-SHA256, PSK). A driver without AKM 24's group-19 HMAC-SHA-256
+EAPOL MIC passes `AkmSet::LEGACY.without(AkmSet::SAE_EXT_KEY)` and an AP that
+offers AKM 8 and 24 joins with AKM 8. If no AKM is shared, the result is
+`UnsupportedSecurity`. `JoinOptions::pmf: Pmf` is wpa_supplicant `ieee80211w`
+for `SecurityMode::Wpa2Psk`:
+- `Disabled` is the default and keeps the earlier no-MFPC body, refusing an
+  MFPR AP.
+- `Optional` advertises MFPC.
+- `Required` advertises MFPC|MFPR and refuses an AP without MFPC.
+
+PMF is in force when both RSNEs set MFPC; the AP's group management cipher
+must then be the default BIP-CMAC-128. With `AkmSet::PSK_SHA256` the plan
+also negotiates AKM 6 (PSK-SHA256), so PMF-required WPA2 APs that offer only
+AKM 6 can be joined as Linux does. `JoinPlan::akm() -> Option<KeyMgmt>` and
+`JoinPlan::pmf() -> bool` (always true for SAE) report the outcome.
+`rsn_body()` returns the negotiated RSNE, and an association-response RSNE
+must repeat it. `Security::new` accepts that RSNE (AKM 2/6, MFPC,
+MFPC|MFPR, SPP) and `Security::pmf()` is then true when both sides set
+MFPC: the IGTK is required in M3, BIP and unicast robust-frame CCMP apply as
+for SAE. `Security::new_sae` refuses non-SAE AKMs.
 
 **WPA3-SAE JoinPlan (`association::{SaePwe, SaeJoin, SaeStep}`).**
 `SecurityMode::Wpa3Sae { pwe: SaePwe }` (`HuntAndPeck` / `HashToElement` /

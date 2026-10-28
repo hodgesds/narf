@@ -89,6 +89,7 @@ impl SaeJoin {
         ap: &RsnIe,
         rsnxe: Option<&[u8]>,
         h2e_required: bool,
+        akms: super::AkmSet,
     ) -> Result<Self, Error> {
         if let Some(b) = rsnxe {
             // Extended RSN Capabilities: bits0..3 are the field length - 1.
@@ -125,9 +126,17 @@ impl SaeJoin {
         }
         // wpa_pick_key_mgmt prefers SAE-EXT-KEY; hostap completes it only
         // under H2E (the AKM Suite Selector element is parsed only then).
-        let akm = if h2e && ap.akms.contains(&Suite::standard(rsn::AKM_SAE_EXT_KEY)) {
+        // Each AKM must also be in the owner's `JoinOptions::akms`
+        // (cfg80211 `wiphy->akm_suites`), so a driver without AKM 24's
+        // HMAC-SHA-256 MIC falls back to AKM 8.
+        let akm = if h2e
+            && akms.contains_suite(rsn::AKM_SAE_EXT_KEY)
+            && ap.akms.contains(&Suite::standard(rsn::AKM_SAE_EXT_KEY))
+        {
             KeyMgmt::SaeExtKey
-        } else if ap.akms.contains(&Suite::standard(rsn::AKM_SAE)) {
+        } else if akms.contains_suite(rsn::AKM_SAE)
+            && ap.akms.contains(&Suite::standard(rsn::AKM_SAE))
+        {
             KeyMgmt::Sae
         } else {
             return Err(Error::UnsupportedSecurity);
@@ -402,7 +411,7 @@ impl JoinPlan {
                 .iter()
                 .any(|own| RsnIe::decode_body(own).as_ref() == Some(&got));
         }
-        self.security.is_wpa2() && got == RsnIe::wpa2_psk_ccmp()
+        self.security.is_wpa2() && got == self.wpa2.rsne(false)
     }
 }
 
