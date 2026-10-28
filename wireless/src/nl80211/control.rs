@@ -790,10 +790,10 @@ fn parse_operation_caps(
     let (psk_offload, sae_offload) = (caps.psk_offload, caps.sae_offload);
     let allowed: &[u16] = match command {
         // 158 = NL80211_ATTR_SCAN_FLAGS, 42 = NL80211_ATTR_IE (probe IEs),
-        // 221/222 = MEASUREMENT_DURATION / _MANDATORY.
+        // 235/236 = MEASUREMENT_DURATION / _MANDATORY.
         // 6 = MAC, 215 = MAC_MASK.  They are accepted only together with
         // RANDOM_ADDR, where they configure the randomized probe source.
-        SCAN => &[3, 6, 42, 44, 45, 158, 215, 221, 222],
+        SCAN => &[3, 6, 42, 44, 45, 158, 215, 235, 236],
         CONNECT => CONNECT_ATTRS,
         DISCONNECT => &[3, 54],
         _ => return Err(EOPNOTSUPP),
@@ -841,8 +841,8 @@ fn parse_operation_caps(
             if ssids.len() > usize::from(caps.max_scan_ssids) || frequencies_mhz.len() > 68 {
                 return Err(EINVAL);
             }
-            let duration_tu = u16_attr(attrs, 221)?;
-            if let Some(mandatory) = attr(attrs, 222) {
+            let duration_tu = u16_attr(attrs, 235)?;
+            if let Some(mandatory) = attr(attrs, 236) {
                 // `NLA_FLAG`: unlike a u8 boolean, the payload is empty.
                 if !mandatory.is_empty() {
                     return Err(EINVAL);
@@ -860,7 +860,7 @@ fn parse_operation_caps(
                 random_mac,
                 colocated_6ghz: flags & (1 << 14) != 0,
                 duration_tu,
-                duration_mandatory: duration_tu.is_some() && attr(attrs, 222).is_some(),
+                duration_mandatory: duration_tu.is_some() && attr(attrs, 236).is_some(),
                 extra_ies: attr(attrs, 42).unwrap_or(&[]).to_vec(),
             };
             let scan_flags = crate::ScanFlags {

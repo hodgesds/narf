@@ -436,6 +436,24 @@ fn smoke_nl80211_wpa_supplicant_wpa2_psk_end_to_end() -> TestResult {
         parse_operation(SCAN, &attributes(&probe_ies).unwrap(), true, false),
         Ok(Operation::Scan(ref r)) if r.extra_ies == [127, 1, 0]
     );
+    // `iw scan duration 50 duration-mandatory`: NL80211_ATTR_MEASUREMENT_DURATION
+    // (235, u16 TUs) and the _MANDATORY flag (236, NLA_FLAG).
+    let mut timed = scan.clone();
+    push_attr(&mut timed, 235, &50u16.to_ne_bytes());
+    push_attr(&mut timed, 236, &[]);
+    let timed_ok = matches!(
+        parse_operation(SCAN, &attributes(&timed).unwrap(), true, false),
+        Ok(Operation::Scan(ref r)) if r.duration_tu == Some(50) && r.duration_mandatory
+    );
+    let mut flag_payload = scan.clone();
+    push_attr(&mut flag_payload, 235, &50u16.to_ne_bytes());
+    push_attr(&mut flag_payload, 236, &[1]);
+    if !timed_ok
+        || parse_operation(SCAN, &attributes(&flag_payload).unwrap(), true, false).err()
+            != Some(EINVAL)
+    {
+        return TestResult::Fail("scan MEASUREMENT_DURATION (235/236) not honoured");
+    }
     if parse_operation(SCAN, &attributes(&random).unwrap(), true, false).err() != Some(EOPNOTSUPP)
         || !carried
         || parse_operation(SCAN, &attributes(&oversized_ies).unwrap(), true, false).err()
