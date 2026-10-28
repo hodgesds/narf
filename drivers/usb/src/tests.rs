@@ -7431,3 +7431,987 @@ fn smoke_uvc_streamon_generation_toggle() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/uvc", smoke_uvc_streamon_generation_toggle);
+
+// ── MSC BOT conversation fixtures (#828/#830/#831/#832) ───────────
+//
+// `FakeBot` plays the device side of the Bulk-Only Transport +
+// embedded SCSI conversation. It is written from the BOT 1.0 and
+// SBC-3/SPC-4 texts — CBW/CSW layouts parsed and built by hand
+// here, sense in the SPC-4 fixed format — and never calls the
+// production encoders, so a constant or framing the driver and
+// the fake might share wrongly cannot pass silently: the happy
+// path test pins the first CBW on the wire byte-for-byte against
+// §5.1, and the fake enforces the protocol's awkward corners
+// (data-phase stalls on refused commands, halt state that only
+// the host+device clear pairing lifts, sense that drains exactly
+// once) the way real bridges behave.
+
+use crate::msc::{BotTransport, MscError};
+use crate::xhci::XhciError;
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use narf_lib::sync::IrqSafeSpinLock;
+
+/// Fixed-format sense data (SPC-4 §4.5): response code 0x70 in
+/// byte 0, sense key in the low nibble of byte 2, additional
+/// length 10 (for the 18-byte form) in byte 7, ASC / ASCQ in
+/// bytes 12 / 13.
+fn fake_sense(key: u8, asc: u8, ascq: u8) -> [u8; 18] {
+    let mut s = [0u8; 18];
+    s[0] = 0x70;
+    s[2] = key & 0x0F;
+    s[7] = 10;
+    s[12] = asc;
+    s[13] = ascq;
+    s
+}
+
+/// The fixture's data model for a never-written block: the LBA's
+/// big-endian bytes cycling, salted per LUN and per offset. The
+/// high LBA bytes land inside the block, so a read that truncated
+/// the LBA to 32 bits returns visibly different bytes; the LUN
+/// salt makes two slots of one reader distinguishable.
+fn fake_block_pattern(lun: u8, lba: u64, block_size: u32) -> Vec<u8> {
+    let tag = lba.to_be_bytes();
+    let salt = lun.wrapping_mul(0x3D);
+    (0..block_size as usize)
+        .map(|i| tag[i % 8] ^ salt ^ (i as u8))
+        .collect()
+}
+
+struct FakeLun {
+    block_size: u32,
+    block_count: u64,
+    present: bool,
+    ua_pending: bool,
+    sense: [u8; 18],
+    written: BTreeMap<u64, Vec<u8>>,
+}
+
+impl FakeLun {
+    fn new(block_count: u64, block_size: u32) -> Self {
+        FakeLun {
+            block_size,
+            block_count,
+            present: true,
+            ua_pending: false,
+            sense: fake_sense(0, 0, 0),
+            written: BTreeMap::new(),
+        }
+    }
+    fn absent(block_count: u64, block_size: u32) -> Self {
+        let mut l = Self::new(block_count, block_size);
+        l.present = false;
+        l
+    }
+    fn with_ua(mut self) -> Self {
+        self.ua_pending = true;
+        self
+    }
+    fn block(&self, lun: u8, lba: u64) -> Vec<u8> {
+        if let Some(b) = self.written.get(&lba) {
+            return b.clone();
+        }
+        fake_block_pattern(lun, lba, self.block_size)
+    }
+}
+
+/// The in-flight command, between its CBW and its CSW.
+struct FakePending {
+    lun: usize,
+    is_in: bool,
+    data_len: u32,
+    csw: [u8; 13],
+    staged_in: Option<Vec<u8>>,
+    write_need: Option<(u64, u64)>,
+    /// Refuse the data phase with a STALL (failed commands and
+    /// the injected data stall both present this way).
+    data_stall: bool,
+    /// The data stall was injected into a command that would
+    /// otherwise pass: when it fires, the CSW turns to Command
+    /// Failed and `stall_sense` becomes the pending sense.
+    stall_patch: bool,
+    phase_data_done: bool,
+}
+
+struct FakeState {
+    luns: Vec<FakeLun>,
+    support_max_lun: bool,
+    pending: Option<FakePending>,
+    halt_in_dev: bool,
+    halt_in_host: bool,
+    halt_out_dev: bool,
+    halt_out_host: bool,
+    stall_data_in_once: bool,
+    phase_error_once: bool,
+    corrupt_csw_once: bool,
+    stall_sense: [u8; 18],
+    cbws: Vec<[u8; 31]>,
+    bot_resets: usize,
+    host_resets: usize,
+    clear_features: usize,
+    max_data_stage: u32,
+}
+
+struct FakeBot {
+    state: IrqSafeSpinLock<FakeState>,
+}
+
+#[derive(Default)]
+struct FakeStats {
+    cbws: Vec<[u8; 31]>,
+    bot_resets: usize,
+    host_resets: usize,
+    clear_features: usize,
+    max_data_stage: u32,
+}
+
+impl FakeStats {
+    fn cbw_opcode_count(&self, opcode: u8) -> usize {
+        self.cbws.iter().filter(|c| c[15] == opcode).count()
+    }
+}
+
+fn fake_stall() -> MscError {
+    // xHCI completion code 6 (Stall Error), as the production
+    // bulk path reports a device STALL.
+    MscError::Xhci(XhciError::CmdFailed(6))
+}
+
+impl FakeBot {
+    fn new(luns: Vec<FakeLun>) -> Self {
+        Self::build(luns, true)
+    }
+    fn without_max_lun(luns: Vec<FakeLun>) -> Self {
+        Self::build(luns, false)
+    }
+    fn build(luns: Vec<FakeLun>, support_max_lun: bool) -> Self {
+        FakeBot {
+            state: IrqSafeSpinLock::new(FakeState {
+                luns,
+                support_max_lun,
+                pending: None,
+                halt_in_dev: false,
+                halt_in_host: false,
+                halt_out_dev: false,
+                halt_out_host: false,
+                stall_data_in_once: false,
+                phase_error_once: false,
+                corrupt_csw_once: false,
+                stall_sense: fake_sense(6, 0x29, 0x00),
+                cbws: Vec::new(),
+                bot_resets: 0,
+                host_resets: 0,
+                clear_features: 0,
+                max_data_stage: 0,
+            }),
+        }
+    }
+    fn stats(&self) -> FakeStats {
+        let st = self.state.lock();
+        FakeStats {
+            cbws: st.cbws.clone(),
+            bot_resets: st.bot_resets,
+            host_resets: st.host_resets,
+            clear_features: st.clear_features,
+            max_data_stage: st.max_data_stage,
+        }
+    }
+    fn set_stall_data_in_once(&self) {
+        self.state.lock().stall_data_in_once = true;
+    }
+    fn set_phase_error_once(&self) {
+        self.state.lock().phase_error_once = true;
+    }
+    fn set_corrupt_csw_once(&self) {
+        self.state.lock().corrupt_csw_once = true;
+    }
+    fn set_stall_sense(&self, sense: [u8; 18]) {
+        self.state.lock().stall_sense = sense;
+    }
+
+    /// Execute one parsed CBW against the LUN model: decide the
+    /// CSW status, stage any IN data, or arm the write sink.
+    /// Mirrors the spec behaviours production must survive —
+    /// UNIT ATTENTION reported once on the first command after
+    /// power-on (and bypassed by INQUIRY / REQUEST SENSE, per
+    /// SPC), absent media as NOT READY / 0x3A, and a refused
+    /// command stalling its data phase rather than consuming it.
+    fn execute(st: &mut FakeState, tag: u32, data_len: u32, is_in: bool, lun: usize, cdb: &[u8]) {
+        st.max_data_stage = st.max_data_stage.max(data_len);
+        let opcode = cdb[0];
+        let mut status = 0u8;
+        let mut staged: Option<Vec<u8>> = None;
+        let mut write_need: Option<(u64, u64)> = None;
+        let mut data_stall = false;
+        if lun >= st.luns.len() {
+            status = 1;
+            data_stall = data_len > 0;
+        } else if opcode == 0x03 {
+            // REQUEST SENSE: report the pending sense, then the
+            // condition is cleared (that is the drain).
+            staged = Some(st.luns[lun].sense.to_vec());
+            st.luns[lun].sense = fake_sense(0, 0, 0);
+        } else if opcode == 0x12 {
+            // INQUIRY (SPC-4 §6.5): standard 36-byte response.
+            let mut buf = [0u8; 36];
+            buf[0] = 0x00; // direct-access block device
+            buf[1] = 0x80; // removable
+            buf[2] = 0x05; // SPC-3
+            buf[3] = 0x02; // response data format
+            buf[4] = 31; // additional length
+            buf[8..16].copy_from_slice(b"NARF    ");
+            buf[16..32].copy_from_slice(b"FAKE BOT DISK   ");
+            buf[32..36].copy_from_slice(b"1.00");
+            staged = Some(buf.to_vec());
+        } else if st.luns[lun].ua_pending {
+            st.luns[lun].ua_pending = false;
+            st.luns[lun].sense = fake_sense(6, 0x29, 0x00);
+            status = 1;
+            data_stall = data_len > 0;
+        } else if !st.luns[lun].present {
+            st.luns[lun].sense = fake_sense(2, 0x3A, 0x00);
+            status = 1;
+            data_stall = data_len > 0;
+        } else {
+            match opcode {
+                0x00 | 0x1B | 0x35 => {}
+                0x25 => {
+                    let l = &st.luns[lun];
+                    let last10 = if l.block_count - 1 > u64::from(u32::MAX) {
+                        u32::MAX
+                    } else {
+                        (l.block_count - 1) as u32
+                    };
+                    let mut buf = [0u8; 8];
+                    buf[0..4].copy_from_slice(&last10.to_be_bytes());
+                    buf[4..8].copy_from_slice(&l.block_size.to_be_bytes());
+                    staged = Some(buf.to_vec());
+                }
+                0x9E => {
+                    if cdb[1] & 0x1F == 0x10 {
+                        let l = &st.luns[lun];
+                        let mut buf = [0u8; 32];
+                        buf[0..8].copy_from_slice(&(l.block_count - 1).to_be_bytes());
+                        buf[8..12].copy_from_slice(&l.block_size.to_be_bytes());
+                        staged = Some(buf.to_vec());
+                    } else {
+                        st.luns[lun].sense = fake_sense(5, 0x20, 0x00);
+                        status = 1;
+                        data_stall = data_len > 0;
+                    }
+                }
+                0x28 | 0x88 => {
+                    let (lba, count) = if opcode == 0x28 {
+                        (
+                            u64::from(u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]])),
+                            u64::from(u16::from_be_bytes([cdb[7], cdb[8]])),
+                        )
+                    } else {
+                        (
+                            u64::from_be_bytes([
+                                cdb[2], cdb[3], cdb[4], cdb[5], cdb[6], cdb[7], cdb[8], cdb[9],
+                            ]),
+                            u64::from(u32::from_be_bytes([cdb[10], cdb[11], cdb[12], cdb[13]])),
+                        )
+                    };
+                    if lba + count > st.luns[lun].block_count {
+                        st.luns[lun].sense = fake_sense(5, 0x21, 0x00);
+                        status = 1;
+                        data_stall = data_len > 0;
+                    } else {
+                        let mut buf = Vec::new();
+                        for i in 0..count {
+                            buf.extend_from_slice(&st.luns[lun].block(lun as u8, lba + i));
+                        }
+                        staged = Some(buf);
+                    }
+                }
+                0x2A | 0x8A => {
+                    let (lba, count) = if opcode == 0x2A {
+                        (
+                            u64::from(u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]])),
+                            u64::from(u16::from_be_bytes([cdb[7], cdb[8]])),
+                        )
+                    } else {
+                        (
+                            u64::from_be_bytes([
+                                cdb[2], cdb[3], cdb[4], cdb[5], cdb[6], cdb[7], cdb[8], cdb[9],
+                            ]),
+                            u64::from(u32::from_be_bytes([cdb[10], cdb[11], cdb[12], cdb[13]])),
+                        )
+                    };
+                    if lba + count > st.luns[lun].block_count {
+                        st.luns[lun].sense = fake_sense(5, 0x21, 0x00);
+                        status = 1;
+                        data_stall = data_len > 0;
+                    } else {
+                        write_need = Some((lba, count));
+                    }
+                }
+                _ => {
+                    st.luns[lun].sense = fake_sense(5, 0x20, 0x00);
+                    status = 1;
+                    data_stall = data_len > 0;
+                }
+            }
+        }
+        let mut stall_patch = false;
+        if status == 0 && is_in && staged.is_some() && st.stall_data_in_once {
+            st.stall_data_in_once = false;
+            data_stall = true;
+            stall_patch = true;
+        }
+        if status == 0 && st.phase_error_once {
+            st.phase_error_once = false;
+            status = 2;
+            staged = None;
+            write_need = None;
+            stall_patch = false;
+            data_stall = data_len > 0;
+        }
+        let residue = if is_in && status != 0 {
+            data_len
+        } else if is_in {
+            data_len - staged.as_ref().map_or(0, |v| v.len() as u32)
+        } else {
+            0
+        };
+        // CSW (§5.2): 'USBS', tag echo, residue, status.
+        let mut csw = [0u8; 13];
+        csw[0..4].copy_from_slice(&0x5342_5355u32.to_le_bytes());
+        if st.corrupt_csw_once {
+            st.corrupt_csw_once = false;
+            csw[0] ^= 0xFF;
+        }
+        csw[4..8].copy_from_slice(&tag.to_le_bytes());
+        csw[8..12].copy_from_slice(&residue.to_le_bytes());
+        csw[12] = status;
+        st.pending = Some(FakePending {
+            lun,
+            is_in,
+            data_len,
+            csw,
+            staged_in: staged,
+            write_need,
+            data_stall,
+            stall_patch,
+            phase_data_done: false,
+        });
+    }
+}
+
+impl BotTransport for FakeBot {
+    async fn bulk_in(&self, _slot_id: u8, _dci: u8, out: &mut [u8]) -> Result<usize, MscError> {
+        let mut st = self.state.lock();
+        if st.halt_in_dev || st.halt_in_host {
+            st.halt_in_host = true;
+            return Err(fake_stall());
+        }
+        // Data phase first, if the pending command has one.
+        let data_phase = match &st.pending {
+            Some(p) => p.is_in && p.data_len > 0 && !p.phase_data_done,
+            None => false,
+        };
+        if data_phase {
+            let (data_stall, stall_patch, lun) = {
+                let p = st.pending.as_ref().unwrap();
+                (p.data_stall, p.stall_patch, p.lun)
+            };
+            if data_stall {
+                st.halt_in_dev = true;
+                st.halt_in_host = true;
+                if stall_patch {
+                    let sense = st.stall_sense;
+                    st.luns[lun].sense = sense;
+                    if let Some(p) = &mut st.pending {
+                        p.csw[12] = 1; // Command Failed
+                    }
+                }
+                if let Some(p) = &mut st.pending {
+                    p.phase_data_done = true;
+                }
+                return Err(fake_stall());
+            }
+            let staged = {
+                let p = st.pending.as_mut().unwrap();
+                let v = p.staged_in.take().unwrap_or_default();
+                p.phase_data_done = true;
+                v
+            };
+            let n = staged.len().min(out.len());
+            out[..n].copy_from_slice(&staged[..n]);
+            return Ok(n);
+        }
+        // Status phase: serve the CSW and close the command.
+        match st.pending.take() {
+            Some(p) => {
+                let n = 13usize.min(out.len());
+                out[..n].copy_from_slice(&p.csw[..n]);
+                Ok(n)
+            }
+            None => Err(MscError::Xhci(XhciError::CmdTimeout)),
+        }
+    }
+
+    async fn bulk_out(&self, _slot_id: u8, _dci: u8, data: &[u8]) -> Result<usize, MscError> {
+        let mut st = self.state.lock();
+        if st.halt_out_dev || st.halt_out_host {
+            st.halt_out_host = true;
+            return Err(fake_stall());
+        }
+        // A pending command expecting OUT data consumes this
+        // transfer as its data phase (or stalls it, if refused).
+        let expecting = match &st.pending {
+            Some(p) => !p.is_in && p.data_len > 0 && !p.phase_data_done,
+            None => false,
+        };
+        if expecting {
+            let (data_stall, write_need, lun) = {
+                let p = st.pending.as_ref().unwrap();
+                (p.data_stall, p.write_need, p.lun)
+            };
+            if data_stall {
+                st.halt_out_dev = true;
+                st.halt_out_host = true;
+                if let Some(p) = &mut st.pending {
+                    p.phase_data_done = true;
+                }
+                return Err(fake_stall());
+            }
+            if let Some((lba, count)) = write_need {
+                let bs = st.luns[lun].block_size as usize;
+                let mut stored = 0u64;
+                while stored < count && (stored as usize + 1) * bs <= data.len() {
+                    let chunk = data[(stored as usize) * bs..(stored as usize + 1) * bs].to_vec();
+                    st.luns[lun].written.insert(lba + stored, chunk);
+                    stored += 1;
+                }
+            }
+            if let Some(p) = &mut st.pending {
+                p.phase_data_done = true;
+            }
+            return Ok(data.len());
+        }
+        if st.pending.is_some() {
+            // Data nobody is waiting for (e.g. the payload of a
+            // command whose data phase was already refused and
+            // stalled once): the device sinks it.
+            return Ok(data.len());
+        }
+        // CBW (§5.1): 31 bytes, 'USBC' signature little-endian.
+        if data.len() != 31 {
+            return Err(fake_stall());
+        }
+        let sig = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        if sig != 0x4342_5355 {
+            return Err(fake_stall());
+        }
+        let mut raw = [0u8; 31];
+        raw.copy_from_slice(data);
+        st.cbws.push(raw);
+        let tag = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let data_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        let is_in = data[12] & 0x80 != 0;
+        let lun = data[13] as usize;
+        let cb_len = ((data[14] & 0x1F) as usize).min(16);
+        if cb_len == 0 {
+            return Err(fake_stall());
+        }
+        let cdb = &data[15..15 + cb_len];
+        Self::execute(&mut st, tag, data_len, is_in, lun, cdb);
+        Ok(data.len())
+    }
+
+    async fn control_in(
+        &self,
+        _slot_id: u8,
+        bm_request_type: u8,
+        b_request: u8,
+        _w_value: u16,
+        _w_index: u16,
+        out: &mut [u8],
+    ) -> Result<usize, MscError> {
+        let mut st = self.state.lock();
+        // GET MAX LUN (BOT §3.3): class/interface IN, 0xFE.
+        if bm_request_type == 0xA1 && b_request == 0xFE {
+            if !st.support_max_lun || out.is_empty() {
+                return Err(fake_stall());
+            }
+            out[0] = (st.luns.len() - 1) as u8;
+            return Ok(1);
+        }
+        Err(fake_stall())
+    }
+
+    async fn control_out(
+        &self,
+        _slot_id: u8,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        _data: &[u8],
+    ) -> Result<usize, MscError> {
+        let mut st = self.state.lock();
+        // Mass Storage Reset (BOT §5.3): class/interface OUT, 0xFF.
+        if bm_request_type == 0x21 && b_request == 0xFF {
+            st.bot_resets += 1;
+            st.pending = None;
+            st.halt_in_dev = false;
+            st.halt_out_dev = false;
+            for l in st.luns.iter_mut() {
+                l.ua_pending = false;
+            }
+            return Ok(0);
+        }
+        // CLEAR_FEATURE(ENDPOINT_HALT) (USB 2.0 §9.4.1): standard
+        // endpoint request, selector 0, wIndex = endpoint address.
+        if bm_request_type == 0x02 && b_request == 0x01 && w_value == 0 {
+            st.clear_features += 1;
+            if w_index & 0x80 != 0 {
+                st.halt_in_dev = false;
+            } else {
+                st.halt_out_dev = false;
+            }
+            return Ok(0);
+        }
+        // SET_CONFIGURATION and anything else class drivers issue
+        // during bind: accept.
+        Ok(0)
+    }
+
+    async fn reset_halted_endpoint(&self, _slot_id: u8, dci: u8) -> Result<(), MscError> {
+        let mut st = self.state.lock();
+        st.host_resets += 1;
+        // DCI parity: odd = IN endpoint, even = OUT endpoint.
+        if dci % 2 == 1 {
+            st.halt_in_host = false;
+        } else {
+            st.halt_out_host = false;
+        }
+        Ok(())
+    }
+}
+
+/// Fixture slot/DCIs for the conversation tests: slot 1, bulk-IN
+/// on DCI 3 (endpoint 0x81), bulk-OUT on DCI 4 (endpoint 0x02) —
+/// the same pairing the canned config blob in
+/// `smoke_msc_config_descriptor_parse` describes.
+const FAKE_SLOT: u8 = 1;
+const FAKE_DCI_IN: u8 = 3;
+const FAKE_DCI_OUT: u8 = 4;
+
+async fn fake_attach(fake: &FakeBot) -> Result<Vec<crate::msc::MscDevice>, MscError> {
+    crate::msc::attach_all_luns(fake, FAKE_SLOT, FAKE_DCI_IN, FAKE_DCI_OUT, 0).await
+}
+
+/// Happy path end to end against the fixture — attach, INQUIRY,
+/// write, read back, pattern read — with the first CBW on the
+/// wire pinned byte-for-byte against BOT §5.1: 'USBC', tag 1,
+/// 8-byte data stage, IN flag set, LUN 0, CB length 10, and the
+/// READ CAPACITY(10) CDB (0x25 followed by zeros).
+async fn msc_fixture_happy_path(fake: &FakeBot) -> Result<(), &'static str> {
+    let mut devs = fake_attach(fake)
+        .await
+        .map_err(|_| "attach_all_luns failed")?;
+    if devs.len() != 1 {
+        return Err("expected exactly one LUN device");
+    }
+    let dev = devs.remove(0);
+    if dev.lun != 0 || dev.lba_bytes != 512 || dev.last_lba != 2047 || dev.cmd16 {
+        return Err("attach capacity fields wrong");
+    }
+    let stats = fake.stats();
+    let pin: [u8; 31] = [
+        0x55, 0x53, 0x42, 0x43, // 'USBC'
+        1, 0, 0, 0, // tag 1
+        8, 0, 0, 0,    // data length 8
+        0x80, // IN
+        0,    // LUN 0
+        10,   // CB length
+        0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0, // READ CAPACITY(10)
+        0, 0, 0, 0, 0, 0, // CBWCB padding
+    ];
+    if stats.cbws.first() != Some(&pin) {
+        return Err("first CBW differs from the BOT §5.1 byte pin");
+    }
+    let inq = dev.inquiry(fake).await.map_err(|_| "INQUIRY failed")?;
+    if &inq[8..12] != b"NARF" {
+        return Err("INQUIRY vendor string wrong");
+    }
+    let mut data = alloc::vec![0u8; 4 * 512];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = (i as u8) ^ 0xA5;
+    }
+    dev.write_blocks(fake, 100, 4, &data)
+        .await
+        .map_err(|_| "write_blocks failed")?;
+    let back = dev
+        .read_blocks(fake, 100, 4)
+        .await
+        .map_err(|_| "read_blocks failed")?;
+    if back != data {
+        return Err("written data did not round-trip");
+    }
+    let pat = dev
+        .read_blocks(fake, 7, 1)
+        .await
+        .map_err(|_| "pattern read failed")?;
+    if pat != fake_block_pattern(0, 7, 512) {
+        return Err("unwritten block is not the fixture pattern");
+    }
+    Ok(())
+}
+
+fn smoke_msc_fixture_happy_path() -> TestResult {
+    let fake = FakeBot::new(alloc::vec![FakeLun::new(2048, 512)]);
+    match narf_scheduler::block_on(msc_fixture_happy_path(&fake)) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_fixture_happy_path);
+
+/// #828: a 100-block request (12.5 per-command chunks) reads and
+/// writes correctly through the driver API, every individual BOT
+/// data stage stays within the single DMA page, and the wire
+/// shows exactly 13 READ(10) and 13 WRITE(10) CBWs.
+async fn msc_fixture_chunked_io(fake: &FakeBot) -> Result<(), &'static str> {
+    let mut devs = fake_attach(fake).await.map_err(|_| "attach failed")?;
+    let dev = devs.remove(0);
+    let got = dev
+        .read_blocks(fake, 10, 100)
+        .await
+        .map_err(|_| "100-block read failed")?;
+    let mut expect = Vec::new();
+    for lba in 10..110 {
+        expect.extend_from_slice(&fake_block_pattern(0, lba, 512));
+    }
+    if got != expect {
+        return Err("100-block read returned wrong bytes");
+    }
+    let mut data = alloc::vec![0u8; 100 * 512];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(7) ^ 0x3C;
+    }
+    dev.write_blocks(fake, 2000, 100, &data)
+        .await
+        .map_err(|_| "100-block write failed")?;
+    let back = dev
+        .read_blocks(fake, 2000, 100)
+        .await
+        .map_err(|_| "read-back of the 100-block write failed")?;
+    if back != data {
+        return Err("100-block write did not round-trip");
+    }
+    let stats = fake.stats();
+    if stats.max_data_stage > 4096 {
+        return Err("a BOT data stage exceeded the xHCI DMA page");
+    }
+    if stats.cbw_opcode_count(0x28) != 26 || stats.cbw_opcode_count(0x2A) != 13 {
+        return Err("chunked I/O did not split into 13-command sequences");
+    }
+    Ok(())
+}
+
+fn smoke_msc_fixture_chunked_io() -> TestResult {
+    let fake = FakeBot::new(alloc::vec![FakeLun::new(8192, 512)]);
+    match narf_scheduler::block_on(msc_fixture_chunked_io(&fake)) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_fixture_chunked_io);
+
+/// #831: a two-slot reader binds both LUNs with their own
+/// capacities, a read on LUN 1 returns LUN 1's data (the pattern
+/// salts differ, so a LUN mix-up changes the bytes), some CBW on
+/// the wire carries bCBWLUN = 1, and a device that stalls
+/// GET MAX LUN still binds as single-LUN.
+async fn msc_fixture_multi_lun(fake: &FakeBot) -> Result<(), &'static str> {
+    let devs = fake_attach(fake).await.map_err(|_| "attach failed")?;
+    if devs.len() != 2 {
+        return Err("multi-LUN device did not bind both LUNs");
+    }
+    if devs[0].lun != 0 || devs[0].last_lba != 2047 {
+        return Err("LUN 0 capacity wrong");
+    }
+    if devs[1].lun != 1 || devs[1].last_lba != 4095 {
+        return Err("LUN 1 capacity wrong (slots share a capacity?)");
+    }
+    let a = devs[0]
+        .read_blocks(fake, 5, 1)
+        .await
+        .map_err(|_| "LUN 0 read failed")?;
+    let b = devs[1]
+        .read_blocks(fake, 5, 1)
+        .await
+        .map_err(|_| "LUN 1 read failed")?;
+    if a != fake_block_pattern(0, 5, 512) || b != fake_block_pattern(1, 5, 512) || a == b {
+        return Err("reads crossed between LUNs");
+    }
+    if !fake.stats().cbws.iter().any(|c| c[13] == 1) {
+        return Err("no CBW on the wire carried bCBWLUN=1");
+    }
+    Ok(())
+}
+
+fn smoke_msc_fixture_multi_lun() -> TestResult {
+    let fake = FakeBot::new(alloc::vec![
+        FakeLun::new(2048, 512),
+        FakeLun::new(4096, 512)
+    ]);
+    match narf_scheduler::block_on(msc_fixture_multi_lun(&fake)) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+    let stubborn = FakeBot::without_max_lun(alloc::vec![FakeLun::new(64, 512)]);
+    let outcome = narf_scheduler::block_on(async {
+        match fake_attach(&stubborn).await {
+            Ok(devs) if devs.len() == 1 && devs[0].lun == 0 => Ok(()),
+            Ok(_) => Err("GET MAX LUN-refusing device bound the wrong LUN set"),
+            Err(_) => Err("GET MAX LUN-refusing device failed to bind at all"),
+        }
+    });
+    match outcome {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_fixture_multi_lun);
+
+/// #831 edge: an empty second slot is skipped, not fatal; a
+/// reader whose only slot is empty binds nothing and errors.
+async fn msc_fixture_absent_lun(fake: &FakeBot, empty: &FakeBot) -> Result<(), &'static str> {
+    let devs = fake_attach(fake)
+        .await
+        .map_err(|_| "bind with an empty second slot failed")?;
+    if devs.len() != 1 || devs[0].lun != 0 {
+        return Err("empty slot was bound (or the populated slot was lost)");
+    }
+    if fake_attach(empty).await.is_ok() {
+        return Err("an all-empty reader bound successfully");
+    }
+    Ok(())
+}
+
+fn smoke_msc_fixture_absent_lun() -> TestResult {
+    let fake = FakeBot::new(alloc::vec![
+        FakeLun::new(2048, 512),
+        FakeLun::absent(4096, 512),
+    ]);
+    let empty = FakeBot::new(alloc::vec![FakeLun::absent(2048, 512)]);
+    match narf_scheduler::block_on(msc_fixture_absent_lun(&fake, &empty)) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_fixture_absent_lun);
+
+/// #832: a > 2 TiB LUN escalates to READ CAPACITY(16), reports
+/// its full 64-bit capacity, and reads past the 32-bit boundary
+/// with a READ(16) CDB carrying the untruncated LBA — while a
+/// LUN of exactly 2^32 blocks (whose RC(10) also saturates)
+/// correctly stays on the 10-byte forms.
+async fn msc_fixture_capacity16(fake: &FakeBot) -> Result<(), &'static str> {
+    let devs = fake_attach(fake).await.map_err(|_| "attach failed")?;
+    if devs.len() != 2 {
+        return Err("expected both capacity LUNs to bind");
+    }
+    let huge: u64 = (1 << 32) + 0x1000;
+    if !devs[0].cmd16 || devs[0].last_lba != huge - 1 {
+        return Err(">2 TiB LUN did not escalate to the 16-byte forms");
+    }
+    if devs[1].cmd16 || devs[1].last_lba != u64::from(u32::MAX) {
+        return Err("exactly-2 TiB LUN was misclassified as 16-byte");
+    }
+    let hi: u64 = 1 << 32;
+    let got = devs[0]
+        .read_blocks(fake, hi, 2)
+        .await
+        .map_err(|_| "read past the 32-bit boundary failed")?;
+    let mut expect = fake_block_pattern(0, hi, 512);
+    expect.extend_from_slice(&fake_block_pattern(0, hi + 1, 512));
+    if got != expect {
+        return Err("read past the 32-bit boundary returned low-LBA bytes");
+    }
+    let stats = fake.stats();
+    let read16 = stats
+        .cbws
+        .iter()
+        .find(|c| c[15] == 0x88)
+        .ok_or("no READ(16) CBW on the wire")?;
+    if read16[17..25] != hi.to_be_bytes() {
+        return Err("READ(16) CDB LBA field truncated");
+    }
+    if stats.cbw_opcode_count(0x9E) != 2 {
+        return Err("READ CAPACITY(16) was not issued for both saturating LUNs");
+    }
+    let top = devs[1]
+        .read_block(fake, u64::from(u32::MAX))
+        .await
+        .map_err(|_| "top-block read on the boundary LUN failed")?;
+    if top != fake_block_pattern(1, u64::from(u32::MAX), 512) {
+        return Err("boundary LUN top block wrong");
+    }
+    if fake.stats().cbws.last().map(|c| c[15]) != Some(0x28) {
+        return Err("boundary LUN read did not use READ(10)");
+    }
+    Ok(())
+}
+
+fn smoke_msc_fixture_capacity16() -> TestResult {
+    let huge: u64 = (1 << 32) + 0x1000;
+    let exact: u64 = 1 << 32;
+    let fake = FakeBot::new(alloc::vec![
+        FakeLun::new(huge, 512),
+        FakeLun::new(exact, 512),
+    ]);
+    match narf_scheduler::block_on(msc_fixture_capacity16(&fake)) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_fixture_capacity16);
+
+/// #830, first access: the device raises UNIT ATTENTION on the
+/// very first READ CAPACITY (the classic powered-on bridge).
+/// Attach must survive it — sense drained (a REQUEST SENSE on
+/// the wire), capacity retried, correct values bound.
+async fn msc_fixture_unit_attention(fake: &FakeBot) -> Result<(), &'static str> {
+    let devs = fake_attach(fake)
+        .await
+        .map_err(|_| "attach did not survive first-access UNIT ATTENTION")?;
+    if devs.len() != 1 || devs[0].last_lba != 2047 {
+        return Err("capacity after UNIT ATTENTION recovery wrong");
+    }
+    let stats = fake.stats();
+    if stats.cbw_opcode_count(0x03) < 1 {
+        return Err("no REQUEST SENSE drained the UNIT ATTENTION");
+    }
+    if stats.cbw_opcode_count(0x25) < 2 {
+        return Err("READ CAPACITY was not retried after the sense drain");
+    }
+    Ok(())
+}
+
+fn smoke_msc_fixture_unit_attention() -> TestResult {
+    let fake = FakeBot::new(alloc::vec![FakeLun::new(2048, 512).with_ua()]);
+    match narf_scheduler::block_on(msc_fixture_unit_attention(&fake)) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_fixture_unit_attention);
+
+/// #830, data-phase STALL: the read stalls mid-conversation;
+/// production must clear the halt on both sides (a host
+/// Reset Endpoint AND a device CLEAR_FEATURE are both visible),
+/// drain the sense the stall carried, retry, and return the
+/// right bytes.
+async fn msc_fixture_stall_recovery(fake: &FakeBot) -> Result<(), &'static str> {
+    let mut devs = fake_attach(fake).await.map_err(|_| "attach failed")?;
+    let dev = devs.remove(0);
+    fake.set_stall_data_in_once();
+    let got = dev
+        .read_blocks(fake, 3, 2)
+        .await
+        .map_err(|_| "read did not recover from a data-phase stall")?;
+    let mut expect = fake_block_pattern(0, 3, 512);
+    expect.extend_from_slice(&fake_block_pattern(0, 4, 512));
+    if got != expect {
+        return Err("post-stall read returned wrong bytes");
+    }
+    let stats = fake.stats();
+    if stats.host_resets < 1 || stats.clear_features < 1 {
+        return Err("stall recovery skipped one half of the halt clear");
+    }
+    if stats.cbw_opcode_count(0x28) != 2 {
+        return Err("stalled read was not retried exactly once");
+    }
+    Ok(())
+}
+
+fn smoke_msc_fixture_stall_recovery() -> TestResult {
+    let fake = FakeBot::new(alloc::vec![FakeLun::new(2048, 512)]);
+    match narf_scheduler::block_on(msc_fixture_stall_recovery(&fake)) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_fixture_stall_recovery);
+
+/// #830, honest failure: a stall whose sense says MEDIUM ERROR
+/// must NOT be retried, and the error must carry the sense data
+/// (key 3, ASC 0x11) instead of a bare status.
+async fn msc_fixture_medium_error(fake: &FakeBot) -> Result<(), &'static str> {
+    let mut devs = fake_attach(fake).await.map_err(|_| "attach failed")?;
+    let dev = devs.remove(0);
+    fake.set_stall_sense(fake_sense(3, 0x11, 0x00));
+    fake.set_stall_data_in_once();
+    match dev.read_blocks(fake, 3, 2).await {
+        Err(MscError::Sense(sense))
+            if sense.sense_key == 3 && sense.additional_sense_code == 0x11 =>
+        {
+            Ok(())
+        }
+        Err(_) => Err("medium error surfaced without its sense data"),
+        Ok(_) => Err("medium error read reported success"),
+    }
+}
+
+fn smoke_msc_fixture_medium_error() -> TestResult {
+    let fake = FakeBot::new(alloc::vec![FakeLun::new(2048, 512)]);
+    let outcome = narf_scheduler::block_on(msc_fixture_medium_error(&fake));
+    // The no-retry half of the verdict: exactly one READ CBW.
+    let reads = fake.stats().cbw_opcode_count(0x28);
+    match outcome {
+        Ok(()) if reads == 1 => TestResult::Pass,
+        Ok(()) => TestResult::Fail("a durable medium error was retried"),
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_fixture_medium_error);
+
+/// #830, Reset Recovery: a Phase Error CSW and (separately) a
+/// CSW with a corrupted signature must each trigger exactly one
+/// BOT Mass Storage Reset and a successful retry.
+async fn msc_fixture_reset_recovery(
+    phase_fake: &FakeBot,
+    csw_fake: &FakeBot,
+) -> Result<(), &'static str> {
+    let mut devs = fake_attach(phase_fake)
+        .await
+        .map_err(|_| "attach (phase) failed")?;
+    let dev = devs.remove(0);
+    phase_fake.set_phase_error_once();
+    dev.test_unit_ready(phase_fake)
+        .await
+        .map_err(|_| "TEST UNIT READY did not recover from a Phase Error")?;
+    if phase_fake.stats().bot_resets != 1 {
+        return Err("Phase Error did not trigger exactly one Reset Recovery");
+    }
+    let mut devs = fake_attach(csw_fake)
+        .await
+        .map_err(|_| "attach (csw) failed")?;
+    let dev = devs.remove(0);
+    csw_fake.set_corrupt_csw_once();
+    dev.test_unit_ready(csw_fake)
+        .await
+        .map_err(|_| "TEST UNIT READY did not recover from a bad CSW")?;
+    if csw_fake.stats().bot_resets != 1 {
+        return Err("bad CSW did not trigger exactly one Reset Recovery");
+    }
+    Ok(())
+}
+
+fn smoke_msc_fixture_reset_recovery() -> TestResult {
+    let phase_fake = FakeBot::new(alloc::vec![FakeLun::new(2048, 512)]);
+    let csw_fake = FakeBot::new(alloc::vec![FakeLun::new(2048, 512)]);
+    match narf_scheduler::block_on(msc_fixture_reset_recovery(&phase_fake, &csw_fake)) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_fixture_reset_recovery);
