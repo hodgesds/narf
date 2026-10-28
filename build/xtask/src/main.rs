@@ -2108,7 +2108,10 @@ impl Arch {
             Arch::Aarch64 => {
                 let mut args = vec![
                     "-machine".into(),
-                    "virt,gic-version=3,mte=on,highmem-ecam=off".into(),
+                    format!(
+                        "virt,gic-version={},mte=on,highmem-ecam=off",
+                        aarch64_gic_version()
+                    ),
                     "-cpu".into(),
                     "max".into(),
                     "-smp".into(),
@@ -2385,8 +2388,15 @@ fn qemu_virt_dtb_path_with_cmdline(cmdline: &str, initrd: Option<&Path>) -> Path
         .and_then(|p| std::fs::metadata(p).ok())
         .map(|m| m.len())
         .unwrap_or(0);
+    // GICv2 trees get their own names: the dumped tree describes the
+    // interrupt controller, so a v3 blob must never be loaded into a v2
+    // machine (or vice versa). v3 keeps the historical names.
+    let gic = match aarch64_gic_version() {
+        "2" => "-gicv2",
+        _ => "",
+    };
     let path = if cmdline.is_empty() && initrd_len == 0 {
-        root.join("target").join("qemu-virt.dtb")
+        root.join("target").join(format!("qemu-virt{gic}.dtb"))
     } else {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for b in cmdline.as_bytes() {
@@ -2397,7 +2407,8 @@ fn qemu_virt_dtb_path_with_cmdline(cmdline: &str, initrd: Option<&Path>) -> Path
             h ^= u64::from(b);
             h = h.wrapping_mul(0x1000_0000_01b3);
         }
-        root.join("target").join(format!("qemu-virt-{h:016x}.dtb"))
+        root.join("target")
+            .join(format!("qemu-virt{gic}-{h:016x}.dtb"))
     };
     if !path.exists() {
         if let Some(parent) = path.parent() {
@@ -2406,7 +2417,8 @@ fn qemu_virt_dtb_path_with_cmdline(cmdline: &str, initrd: Option<&Path>) -> Path
         let _ = Command::new("qemu-system-aarch64")
             .arg("-machine")
             .arg(format!(
-                "virt,gic-version=3,mte=on,highmem-ecam=off,dumpdtb={}",
+                "virt,gic-version={},mte=on,highmem-ecam=off,dumpdtb={}",
+                aarch64_gic_version(),
                 path.display()
             ))
             .args(if cmdline.is_empty() && initrd.is_none() {
@@ -2487,6 +2499,19 @@ fn qemu_virt_dtb_path_with_cmdline(cmdline: &str, initrd: Option<&Path>) -> Path
             .status();
     }
     path
+}
+
+/// GIC architecture version for every aarch64 QEMU `virt` invocation
+/// (kernel boot, DTB dump, UEFI boot). Default `3`; `NARF_GIC_VERSION=2`
+/// boots the GICv2 backend (`interrupts::aarch64::gic`), which is how the
+/// GICv2 path real Qualcomm IPQ SoCs take is exercised under QEMU. Any
+/// other value is rejected loudly rather than silently testing v3.
+fn aarch64_gic_version() -> &'static str {
+    match std::env::var("NARF_GIC_VERSION").as_deref() {
+        Err(_) | Ok("") | Ok("3") => "3",
+        Ok("2") => "2",
+        Ok(other) => panic!("NARF_GIC_VERSION={other:?}: expected 2 or 3"),
+    }
 }
 
 /// The plain device tree, with no kernel command line.
@@ -14378,7 +14403,8 @@ fn aarch64_uefi_boot_cmd(args: &BuildArgs) -> Result<()> {
 
     let mut command = Command::new("qemu-system-aarch64");
     command.arg("-machine").arg(format!(
-        "virt,gic-version=3,mte=on,highmem-ecam=off,acpi=off,dtb={}",
+        "virt,gic-version={},mte=on,highmem-ecam=off,acpi=off,dtb={}",
+        aarch64_gic_version(),
         dtb.display()
     ));
     command

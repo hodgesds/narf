@@ -574,6 +574,7 @@ handlers in `build/xtask/src/main.rs`:
 | `NARF_QEMU_MEM_MB` | total guest RAM in MiB (must be even; split across 2 NUMA nodes) | `1024` |
 | `NARF_QEMU_CPU` | QEMU CPU model, e.g. `max,-x2apic,-tsc-deadline` | `max` |
 | `NARF_QEMU_EXTRA` | extra whitespace-separated QEMU args (e.g. `-gdb tcp::1234`) | unset |
+| `NARF_GIC_VERSION` | aarch64 only: `virt` GIC architecture, `2` or `3` (`2` exercises the GICv2 backend used by Qualcomm IPQ SoCs; DTBs are cached per version) | `3` |
 | `XTASK_QEMU_TAP` | virtio-net TAP; e1000 TAP under `--hw-profile=legacy-only` | unset (SLIRP) |
 | `XTASK_QEMU_LEGACY_TAP` | dedicated e1000 TAP in any hardware profile | unset (SLIRP) |
 | `XTASK_QEMU_APPEND` | kernel cmdline via multiboot2 `-append` | unset |
