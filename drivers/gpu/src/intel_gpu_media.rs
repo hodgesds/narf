@@ -1218,7 +1218,10 @@ pub mod tests {
 
     fn smoke_media_submit_vcs0_write_for_write() -> TestResult {
         let rig = Rig::new();
-        let (mut eng, mut hw) = rig.engine(VCS0_SPEC)?;
+        let (mut eng, mut hw) = match rig.engine(VCS0_SPEC) {
+            Ok(p) => p,
+            Err(f) => return f,
+        };
         // Bring-up programmed this engine's HWS_PGA and nothing
         // else's.
         if rig.regs.writes_to(0x1C_0080) != [eng.status_ggtt()]
@@ -1302,9 +1305,18 @@ pub mod tests {
         // engines aliased a ring, an image, a status page or a
         // doorbell, at least one assertion below breaks.
         let rig = Rig::new();
-        let (mut vcs0, mut hw0) = rig.engine(VCS0_SPEC)?;
-        let (mut vcs1, mut hw1) = rig.engine(VCS1_SPEC)?;
-        let (mut vecs, mut hwv) = rig.engine(VECS0_SPEC)?;
+        let (mut vcs0, mut hw0) = match rig.engine(VCS0_SPEC) {
+            Ok(p) => p,
+            Err(f) => return f,
+        };
+        let (mut vcs1, mut hw1) = match rig.engine(VCS1_SPEC) {
+            Ok(p) => p,
+            Err(f) => return f,
+        };
+        let (mut vecs, mut hwv) = match rig.engine(VECS0_SPEC) {
+            Ok(p) => p,
+            Err(f) => return f,
+        };
         let statuses = [vcs0.status_ggtt(), vcs1.status_ggtt(), vecs.status_ggtt()];
         if statuses[0] == statuses[1] || statuses[1] == statuses[2] || statuses[0] == statuses[2] {
             return TestResult::Fail("status pages alias");
@@ -1365,8 +1377,14 @@ pub mod tests {
 
     fn smoke_media_wedged_engine_does_not_block_peers() -> TestResult {
         let rig = Rig::new();
-        let (mut vcs0, mut hw0) = rig.engine(VCS0_SPEC)?;
-        let (mut vecs, mut hwv) = rig.engine(VECS0_SPEC)?;
+        let (mut vcs0, mut hw0) = match rig.engine(VCS0_SPEC) {
+            Ok(p) => p,
+            Err(f) => return f,
+        };
+        let (mut vecs, mut hwv) = match rig.engine(VECS0_SPEC) {
+            Ok(p) => p,
+            Err(f) => return f,
+        };
         hwv.stuck = true;
         // Queue work on both; VECS's hardware never answers.
         for eng in [&mut vcs0, &mut vecs] {
@@ -1414,7 +1432,10 @@ pub mod tests {
 
     fn smoke_media_ppgtt_va_batch() -> TestResult {
         let rig = Rig::new();
-        let (mut eng, mut hw) = rig.engine(VCS1_SPEC)?;
+        let (mut eng, mut hw) = match rig.engine(VCS1_SPEC) {
+            Ok(p) => p,
+            Err(f) => return f,
+        };
         let ctx = match eng.create_context() {
             Ok(c) => c,
             Err(_) => return TestResult::Fail("create context"),
@@ -1464,7 +1485,10 @@ pub mod tests {
         // sub-domain hold is taken before the submission's
         // doorbell and dropped after it.
         let rig = Rig::new();
-        let (mut eng, mut hw) = rig.engine(VCS0_SPEC)?;
+        let (mut eng, mut hw) = match rig.engine(VCS0_SPEC) {
+            Ok(p) => p,
+            Err(f) => return f,
+        };
         let mut fw = MediaForcewake::new();
         let ctx = match eng.create_context() {
             Ok(c) => c,
