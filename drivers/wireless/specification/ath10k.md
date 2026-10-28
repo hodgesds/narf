@@ -154,7 +154,7 @@ Host-bus/system power transitions remain separate profiles.
   is discarded before later receipts can authorize it. Native RAW transmit
   aggregation is explicitly capped at one MPDU/one MSDU; firmware offload is
   not inferred to be disabled by absence of host ADDBA. TX A-MPDU/A-MSDU,
-  widths beyond the selected bounded HT40 profile, more streams and VHT remain separate work.
+  widths beyond the selected HT40/VHT80 profile and more streams remain separate work.
   Complete first/last native RAW receive MPDUs can carry a default-size A-MSDU
   up to 3839 bytes. The shared opt-in receiver authenticates the original
   QoS header and complete ciphertext before validating every subframe and
@@ -378,9 +378,47 @@ Host-bus/system power transitions remain separate profiles.
   The factory/country binding and power ceiling are the same as for HT40.
   `Permission::check` re-derives the width-tagged receipt, so a narrowed,
   cleared, lower-power or different-country policy closes it. A 40 MHz
-  receipt over the same pair is a different receipt. Nothing selects
-  `width80` yet: the VHT station profile (VHT IE, VHT PEER_ASSOC rates,
-  `MODE_11AC_*`) is still open.
+  receipt over the same pair is a different receipt. The VHT station
+  profile below is the only selector of `width80`.
+- SISO VHT station profile (`wmi_runtime/ht.rs`, `station.rs`, `mlme.rs`;
+  smokes under `drivers/wireless/ath10k/vht`). A nonzero SERVICE_READY
+  `vht_cap_info` builds the local element through the shared
+  `LocalPhy::vht80`/`LocalVht` exactly as Linux v7.2
+  `mac.c::ath10k_create_vht_cap` does for one chain: MCS0-9 for one stream
+  in both maps, SGI80 (0x20), RX LDPC (0x10), RX STBC (0x300) and the A-MPDU
+  exponent; TX STBC is cleared (`cfg_tx_chainmask <= 1`), beamforming roles
+  need a sounding owner and are not advertised, and 160/80+80 are not offered.
+  `Device::phy_capabilities(5000)` and `hw_caps.vht_supported` report it.
+  Because the element promises 80 MHz support, VHT is offered only on a
+  qualified 5-GHz primary whose whole 80 MHz segment
+  `Permission::occupied_width(.., width80)` grants; the occupied receipt is
+  then the AP-selected 20/40/80 geometry (a contiguous160 or 80+80 BSS is used
+  through its primary80). A refused segment, an HT-only AP, a zero
+  `vht_cap_info` or an unusable VHT offer falls back to the HT40/HT20
+  selection above, which sends no VHT element. PEER_ASSOC follows
+  `ath10k_peer_assoc_h_vht`: `WMI_PEER_VHT` (0x0200_0000) and, at 80 MHz,
+  `WMI_PEER_80MHZ` (0x0400_0000) in all six dialect maps; `peer_vht_caps` is
+  the AP's VHT information masked as mac80211
+  `vht.c::ieee80211_vht_cap_ie_to_sta_vht_cap` does (RX LDPC, TXOP PS, +HTC,
+  exponent, link adaptation and antenna bits kept; SGI80 symmetric; peer TX
+  STBC only with our RX STBC); `peer_max_mpdu` is `max(HT, 2^(13+exp)-1)`;
+  the `wmi_vht_rate_set` (TLV tag 102, or the common-command tail at +332) is
+  the AP's RX map narrowed by our TX map and its TX map narrowed by our RX
+  map, with the AP's highest-rate fields; `peer_phymode` is
+  `ath10k_peer_assoc_h_phymode` `MODE_11AC_VHT20/40/80` (8/9/10). VDEV_START
+  follows `chan_to_phymode`, which maps the chandef width only: 20/40 stay
+  `MODE_11NA_HT20/HT40` and 80 MHz is `MODE_11AC_VHT80` with
+  `band_center_freq1` 5210/5775; a VHT profile adds `WMI_CHAN_FLAG_ALLOW_VHT`
+  (bit12) beside ALLOW_HT, and the station inventory lists all four segment
+  rows (HT40_PLUS on the lower channel of each pair) as
+  `ath10k_update_channel_list` does. The association response must keep VHT
+  and the 80 MHz geometry, and a later beacon changing the bound VHT
+  Capabilities/Operation closes the link like an HT change. RX admits
+  `HTT_RX_VHT` (0x0c) PPDUs only when VHT is bound, decoding VHT-SIG-A1/A2 as
+  `htt_rx.c::ath10k_htt_rx_h_rates`: an SU group id (0/63), one space-time
+  stream (two only with STBC and our RX STBC), LDPC only with our RX LDPC,
+  MCS within our map, and a bandwidth/SGI the profile promised. TXBF (0x0d)
+  and MU PPDUs are refused before CCMP/PN.
 - The registered Device binds native preparation, authentication/association,
   WMM/peer/up commands and initial RSNA data to a chosen factory/frequency/power
   receipt. It samples current policy before and after each nested wait and
@@ -1127,8 +1165,7 @@ Across the reached rows, concrete remaining software packages are 2.4-GHz HT40
 coexistence/occupied-power ownership;
 additional streams and TX STBC (which needs a second selected TX chain;
 LDPC and one-stream RX STBC are implemented above);
-response-bound VHT and wider geometry (the 80 MHz permission receipt is
-implemented); PFC fetch/queue ownership;
+VHT160/80+80 (SISO VHT20/40/80 is implemented); PFC fetch/queue ownership;
 dynamic WMM/protection updates and TSPEC/U-APSD; DFS/indoor/beacon-hint
 qualification; associated/off-channel scanning; hardware key/PMF/WPA3 profiles;
 AP/P2P roles; host-bus PM and wake offload (system suspend is implemented);

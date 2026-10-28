@@ -55,6 +55,7 @@ pub(super) struct RadioFeatures {
     power_save: bool,
     ht: Option<[u8; 26]>,
     ht40: Option<[u8; 26]>,
+    vht: Option<[u8; 12]>,
 }
 impl RadioFeatures {
     fn observed<T: Hif + HostMemory + HttMemory>(radio: &Radio<T>) -> Self {
@@ -62,6 +63,7 @@ impl RadioFeatures {
             power_save: radio.power_save_supported(),
             ht: radio.ht_capabilities(),
             ht40: radio.ht40_capabilities(),
+            vht: radio.vht_capabilities(),
         }
     }
 }
@@ -83,6 +85,7 @@ pub(super) struct Device<T: Hif + HostMemory + HttMemory> {
     ps_supported: bool,
     ht_capabilities: Option<[u8; 26]>,
     ht40_capabilities: Option<[u8; 26]>,
+    vht_capabilities: Option<[u8; 12]>,
     ps_request: AtomicU8,
     frequencies: Vec<u16>,
     mac: [u8; 6],
@@ -153,6 +156,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 power_save: false,
                 ht: None,
                 ht40: None,
+                vht: None,
             });
         let frequencies = radio
             .try_lock()
@@ -188,6 +192,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             ps_supported: features.power_save,
             ht_capabilities: features.ht,
             ht40_capabilities: features.ht40,
+            vht_capabilities: features.vht,
             frequencies,
             // Submit the advertised awake default before first carrier.
             ps_request: AtomicU8::new(u8::from(features.power_save)),
@@ -294,7 +299,11 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             } else {
                 self.ht_capabilities?
             },
-            vht: None,
+            vht: if band == 5000 {
+                self.vht_capabilities
+            } else {
+                None
+            },
         })
     }
     #[cfg(any(test, feature = "kernel-test"))]
@@ -1133,7 +1142,7 @@ impl WirelessNetIface for Native {
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
                 ht_supported: self.ht_capabilities.is_some(),
-                vht_supported: false,
+                vht_supported: self.vht_capabilities.is_some(),
                 he_supported: false,
                 eht_supported: false,
             },

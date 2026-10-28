@@ -92,6 +92,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .as_ref()
             .and_then(|c| ht::capability(c, true))
     }
+    pub(in crate::ath10k) fn vht_capabilities(&self) -> Option<[u8; 12]> {
+        self.htt.wmi.caps.as_ref().and_then(ht::vht_capability)
+    }
     async fn send_station_command(
         &mut self,
         command: &[u8],
@@ -132,14 +135,43 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .iter()
             .find(|b| b.bssid == bssid && b.frequency == frequency)
             .ok_or(Error::Unsupported)?;
+        let pair = ht40_pair(frequency);
+        // VHT advertises HT20/40 plus an 80 MHz-capable VHT element, so it is
+        // offered only when the whole 80 MHz segment is host-permitted. The
+        // occupied receipt then matches the AP's selected 20/40/80 geometry;
+        // a VHT offer the AP or policy cannot take falls back to HT40/HT20.
+        if let Some(wide) = pair
+            .filter(|_| ht::vht_supported(caps))
+            .and_then(|s| Permission::occupied_width(caps, domain, frequency, Some(s), true).ok())
+        {
+            if let Ok(Some(v)) = ht::Profile::offer(caps, cached, own, ht::Phy::Vht) {
+                if let Some(vht) = v.vht {
+                    let permission = if vht.eighty {
+                        Ok(wide)
+                    } else {
+                        Permission::occupied(caps, domain, frequency, v.secondary)
+                    };
+                    if let Ok(permission) = permission {
+                        if permission.center != v.center
+                            || permission.secondary != v.secondary
+                            || permission.width80 != vht.eighty
+                        {
+                            return Err(Error::Unsupported);
+                        }
+                        return Ok((permission, Some(v)));
+                    }
+                }
+            }
+        }
         let ht = ht::Profile::offer(
             caps,
             cached,
             own,
-            matches!(
-                frequency,
-                5180 | 5200 | 5220 | 5240 | 5745 | 5765 | 5785 | 5805
-            ),
+            if pair.is_some() {
+                ht::Phy::Ht40
+            } else {
+                ht::Phy::Ht20
+            },
         )?;
         if let Some(h) = ht.filter(|h| h.secondary.is_some()) {
             if let Ok(permission) = Permission::occupied(caps, domain, frequency, h.secondary) {
@@ -155,7 +187,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         // without the occupied40 permission whose native owner it promises.
         Ok((
             Permission::from_domain(caps, domain, frequency)?,
-            ht::Profile::offer(caps, cached, own, false)?,
+            ht::Profile::offer(caps, cached, own, ht::Phy::Ht20)?,
         ))
     }
     pub fn associated_station(&self) -> Option<StationAssociated> {
@@ -323,11 +355,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             bssid: peer.bssid,
             frequency: peer.permission.frequency,
             center_frequency: peer.permission.center,
-            bandwidth_mhz: if peer.permission.secondary.is_some() {
-                40
-            } else {
-                20
-            },
+            bandwidth_mhz: bandwidth(peer.permission),
             peer_id: peer.mapped()?,
             maximum_power_dbm: peer.permission.half_dbm / 2,
         })
@@ -387,10 +415,17 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             } else {
                 4
             };
-            wire::put(&mut start, channel + 12, ht.mode(frequency) | (1 << 11));
+            wire::put(
+                &mut start,
+                channel + 12,
+                ht.start_mode(frequency) | ht.channel_flags(),
+            );
         }
         let inventory = if permission.secondary.is_some() {
-            Some(self.wire.station_ht40_channels(permission)?)
+            Some(
+                self.wire
+                    .station_ht40_channels(permission, ht.is_some_and(|h| h.vht.is_some()))?,
+            )
         } else {
             None
         };
@@ -457,11 +492,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                             bssid,
                             frequency,
                             center_frequency: permission.center,
-                            bandwidth_mhz: if permission.secondary.is_some() {
-                                40
-                            } else {
-                                20
-                            },
+                            bandwidth_mhz: bandwidth(permission),
                             peer_id: id,
                             maximum_power_dbm: permission.half_dbm / 2,
                         });
@@ -682,6 +713,23 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
 }
 
+/// The HT40 partner inside the qualified non-DFS 80 MHz segments.
+fn ht40_pair(frequency: u16) -> Option<u16> {
+    Some(match frequency {
+        5180 | 5220 | 5745 | 5785 => frequency + 20,
+        5200 | 5240 | 5765 | 5805 => frequency - 20,
+        _ => return None,
+    })
+}
+fn bandwidth(permission: Permission) -> u8 {
+    if permission.width80 {
+        80
+    } else if permission.secondary.is_some() {
+        40
+    } else {
+        20
+    }
+}
 pub(super) fn plan_error(error: narf_wireless::association::Error) -> Error {
     use narf_wireless::association::Error as PlanError;
     match error {

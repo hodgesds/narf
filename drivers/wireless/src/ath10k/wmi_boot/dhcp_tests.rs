@@ -18,6 +18,8 @@ mod protection_conversation_tests;
 mod sgi40_conversation_tests;
 #[path = "source_conversation_tests.rs"]
 mod source_conversation_tests;
+#[path = "vht_conversation_tests.rs"]
+mod vht_conversation_tests;
 #[path = "wmm_conversation_tests.rs"]
 mod wmm_conversation_tests;
 fn five_ghz_policy() -> narf_wireless::reg::RegulatoryDomain {
@@ -917,6 +919,7 @@ enum TestPhy {
     Ht,
     Ht40,
     Sgi40,
+    Vht80,
 }
 fn composition_radio(
     version: u32,
@@ -953,6 +956,9 @@ fn composition_radio(
     }
     if phy == TestPhy::Sgi40 {
         sgi40_conversation_tests::enable(&h)?;
+    }
+    if phy == TestPhy::Vht80 {
+        vht_conversation_tests::enable(&h, 2)?;
     }
     if power_save {
         h.model(|model| {

@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Typed response-bound SISO HT20/5GHz HT40. Linux mac.c's get_ht_cap
-//! advertises20/40 with HT, and each GI from its distinct SERVICE_READY bit.
+//! Typed response-bound SISO HT20/5GHz HT40 and 5GHz VHT20/40/80. Linux
+//! mac.c's get_ht_cap advertises20/40 with HT, and each GI from its distinct
+//! SERVICE_READY bit; ath10k_create_vht_cap builds the VHT element.
 use super::{station::plan_error, Error, ScanBss};
 use crate::ath10k::wmi_boot::Capabilities;
 use narf_wireless::association::{
     self,
-    phy::{ApElements, HtGi, HtWidth, LocalHt, LocalPhy, Offer, Width},
+    phy::{intersect_maps, ApElements, HtGi, HtWidth, LocalHt, LocalPhy, LocalVht, Offer, Width},
     Bss, JoinPlan, SecurityMode,
 };
 
@@ -26,8 +27,41 @@ pub(super) struct Profile {
     pub(super) peer_tx_stbc: bool,
     pub(super) center: u16,
     pub(super) secondary: Option<u16>,
+    /// Negotiated VHT facts; `None` for an HT-only profile.
+    pub(super) vht: Option<Vht>,
     local: LocalPhy,
     offered: Offer,
+}
+/// Requested local PHY: the HT20/HT40 profiles, or VHT (HT20/40 plus a
+/// VHT80-capable element) that only a 5GHz 80 MHz-qualified BSS reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Phy {
+    Ht20,
+    Ht40,
+    Vht,
+}
+/// Linux `mac.c::ath10k_peer_assoc_h_vht` facts for PEER_ASSOC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Vht {
+    /// `peer_vht_caps`: the AP's VHT Capabilities Information masked by our
+    /// own as mac80211 `vht.c::ieee80211_vht_cap_ie_to_sta_vht_cap` does.
+    pub(super) capabilities: u32,
+    /// The AP's Maximum A-MPDU Length Exponent (bits23..25).
+    pub(super) factor: u8,
+    /// `wmi_vht_rate_set`: rx = what the AP receives (its RX map narrowed by
+    /// our TX map), tx = what the AP transmits (its TX map narrowed by our
+    /// RX map), each with the AP's highest-rate field.
+    pub(super) rx_max: u16,
+    pub(super) rx_mcs: u16,
+    pub(super) tx_max: u16,
+    pub(super) tx_mcs: u16,
+    /// Occupied VHT80 (`WMI_PEER_80MHZ`, `MODE_11AC_VHT80`).
+    pub(super) eighty: bool,
+    receive_sgi80: bool,
+    receive_ldpc: bool,
+    receive_stbc: bool,
+    /// Our one-stream RX map (low two bits: 0/1/2 = MCS0-7/8/9).
+    receive_map: u16,
 }
 pub(super) fn supported(caps: &Capabilities) -> bool {
     caps.ht & 1 != 0 && (1..=4).contains(&caps.rf_chains)
@@ -44,6 +78,36 @@ pub(super) fn ldpc(caps: &Capabilities) -> bool {
 }
 pub(super) fn rx_stbc(caps: &Capabilities) -> bool {
     caps.ht & 0x30 != 0
+}
+/// VHT is offered only when SERVICE_READY reports a nonzero
+/// `vht_cap_info`; Linux `ath10k_create_vht_cap` copies that word into the
+/// VHT element. A firmware reporting none has no VHT fact to advertise.
+pub(super) fn vht_supported(caps: &Capabilities) -> bool {
+    supported(caps) && caps.vht != 0
+}
+/// Linux `mac.c::ath10k_create_vht_cap` for this SISO profile: one-stream
+/// MCS0-9 RX/TX maps (`IEEE80211_VHT_MCS_SUPPORT_0_9` for chain0 only),
+/// SGI80 (0x20), RX LDPC (0x10), RX STBC (0x300) and the A-MPDU exponent
+/// (bits23..25) from `vht_cap_info`. TX STBC is cleared because
+/// `cfg_tx_chainmask <= 1`; beamforming roles need a sounding owner this
+/// driver lacks, and 160/80+80 are not offered (see vht160).
+fn local_vht(caps: &Capabilities) -> Result<LocalVht, association::Error> {
+    let coding = caps.vht & 0x10 != 0;
+    Ok(LocalVht::new(
+        0xfffe,
+        0xfffe,
+        caps.vht & 0x20 != 0,
+        caps.vht & 0x20 != 0,
+        ((caps.vht >> 23) & 7) as u8,
+    )?
+    .with_ldpc(coding, coding)
+    .with_rx_stbc(caps.vht & 0x300 != 0))
+}
+pub(super) fn vht_capability(caps: &Capabilities) -> Option<[u8; 12]> {
+    if !vht_supported(caps) {
+        return None;
+    }
+    local_vht(caps).ok().map(|v| v.capability_body())
 }
 fn local_ht(caps: &Capabilities, forty: bool) -> Result<LocalHt, association::Error> {
     let mask = [255, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -70,12 +134,12 @@ fn local_ht(caps: &Capabilities, forty: bool) -> Result<LocalHt, association::Er
     .with_ldpc(coding, coding)
     .with_rx_stbc(rx_stbc(caps)))
 }
-fn local(caps: &Capabilities, forty: bool) -> Result<LocalPhy, Error> {
-    let ht = local_ht(caps, forty).map_err(plan_error)?;
-    if forty {
-        LocalPhy::ht40(ht)
-    } else {
-        LocalPhy::ht20(ht)
+fn local(caps: &Capabilities, phy: Phy) -> Result<LocalPhy, Error> {
+    let ht = local_ht(caps, phy != Phy::Ht20).map_err(plan_error)?;
+    match phy {
+        Phy::Ht20 => LocalPhy::ht20(ht),
+        Phy::Ht40 => LocalPhy::ht40(ht),
+        Phy::Vht => LocalPhy::vht80(ht, local_vht(caps).map_err(plan_error)?),
     }
     .map_err(plan_error)
 }
@@ -103,16 +167,19 @@ impl Profile {
         caps: &Capabilities,
         cached: &ScanBss,
         own: [u8; 6],
-        forty: bool,
+        phy: Phy,
     ) -> Result<Option<Self>, Error> {
         let bss = bss(cached)?;
         ApElements::parse(&bss.information_elements).map_err(plan_error)?;
         let wmm = narf_wireless::wmm::Parameters::parse(&bss.information_elements)
             .map_err(|_| Error::Malformed)?;
-        if !supported(caps) || wmm.is_none_or(|p| p.ac[0].admission_control) {
+        if !supported(caps)
+            || wmm.is_none_or(|p| p.ac[0].admission_control)
+            || phy == Phy::Vht && (!vht_supported(caps) || cached.frequency < 3000)
+        {
             return Ok(None);
         }
-        let local = local(caps, forty)?;
+        let local = local(caps, phy)?;
         let mode = if bss.capability & 16 != 0 {
             SecurityMode::Wpa2Psk
         } else {
@@ -128,32 +195,41 @@ impl Profile {
         // channel::frequency (a primary inventory) deliberately rejects them.
         let center = (if cached.frequency < 3000 { 2407 } else { 5000 })
             + 5 * u16::from(offered.center_channel());
-        let secondary = if offered.width() == Width::Forty {
-            offered
+        let secondary = match offered.width() {
+            Width::Forty => offered
                 .occupied_channels()
                 .iter()
                 .find(|c| **c != bss.channel)
                 .and_then(|c| association::channel::frequency(*c))
-                .map(|f| f as u16)
-        } else {
-            None
+                .map(|f| f as u16),
+            // VHT80: the HT40 pair inside the segment (HT Operation).
+            Width::Eighty => offered
+                .ht()
+                .operation()
+                .secondary()
+                .and_then(association::channel::frequency)
+                .map(|f| f as u16),
+            _ => None,
         };
-        if !matches!(offered.width(), Width::Twenty | Width::Forty) {
+        if !matches!(offered.width(), Width::Twenty | Width::Forty)
+            && !(offered.width() == Width::Eighty && offered.vht().is_some() && secondary.is_some())
+        {
             return Err(Error::Unsupported);
         }
         Ok(Some(Self {
             capabilities: native_capabilities(h, offered.width()),
             ampdu: h.peer_ampdu_factor() | h.peer_mpdu_density() << 2,
             mcs: h.tx_mcs()[0],
-            short_gi: h.tx_sgi20() || offered.width() == Width::Forty && h.tx_sgi40(),
+            short_gi: h.tx_sgi20() || offered.width() != Width::Twenty && h.tx_sgi40(),
             receive_sgi20: h.rx_sgi20(),
-            receive_sgi40: offered.width() == Width::Forty && h.rx_sgi40(),
+            receive_sgi40: offered.width() != Width::Twenty && h.rx_sgi40(),
             receive_ldpc: h.rx_ldpc(),
             receive_stbc: h.rx_stbc(),
             transmit_ldpc: h.tx_ldpc(),
             peer_tx_stbc: peer_tx_stbc(h),
             center,
             secondary,
+            vht: offered.vht().map(|v| vht(v, offered.width())),
             local,
             offered,
         }))
@@ -179,20 +255,39 @@ impl Profile {
         self.capabilities = native_capabilities(n.ht(), n.width());
         self.ampdu = n.ht().peer_ampdu_factor() | n.ht().peer_mpdu_density() << 2;
         self.mcs = n.ht().tx_mcs()[0];
-        self.short_gi = n.ht().tx_sgi20() || n.width() == Width::Forty && n.ht().tx_sgi40();
+        self.short_gi = n.ht().tx_sgi20() || n.width() != Width::Twenty && n.ht().tx_sgi40();
         self.receive_sgi20 = n.ht().rx_sgi20();
-        self.receive_sgi40 = n.width() == Width::Forty && n.ht().rx_sgi40();
+        self.receive_sgi40 = n.width() != Width::Twenty && n.ht().rx_sgi40();
         self.receive_ldpc = n.ht().rx_ldpc();
         self.receive_stbc = n.ht().rx_stbc();
         self.transmit_ldpc = n.ht().tx_ldpc();
         self.peer_tx_stbc = peer_tx_stbc(n.ht());
+        // The shared intersection already refuses a response that drops or
+        // adds VHT relative to the offer; rebind the narrowed facts.
+        if n.vht().is_some() != self.vht.is_some() {
+            return Err(Error::Unsupported);
+        }
+        self.vht = n.vht().map(|v| vht(v, n.width()));
         Ok(self)
     }
     /// Linux `ath10k_peer_assoc_h_ht` peer flags beyond HT/BW40: LDPC
     /// (0x10000) from the masked peer LDPC bit and STBC (0x8000) whenever a
     /// masked STBC direction remains. Identical in all six dialect maps.
+    /// `ath10k_peer_assoc_h_vht` adds `WMI_PEER_VHT` (0x0200_0000) and, for
+    /// an 80 MHz peer, `WMI_PEER_80MHZ` (0x0400_0000): equal in every map.
     pub(super) fn peer_flags(self) -> u32 {
-        (if self.transmit_ldpc { 0x1_0000 } else { 0 }) | if self.peer_tx_stbc { 0x8000 } else { 0 }
+        (if self.transmit_ldpc { 0x1_0000 } else { 0 })
+            | if self.peer_tx_stbc { 0x8000 } else { 0 }
+            | self
+                .vht
+                .map_or(0, |v| 0x0200_0000 | if v.eighty { 0x0400_0000 } else { 0 })
+    }
+    /// `peer_max_mpdu`: the HT factor, raised by a larger VHT exponent as
+    /// Linux `ath10k_peer_assoc_h_vht` does (`max(ht, 2^(13+exp)-1)`).
+    pub(super) fn max_mpdu(self) -> u32 {
+        let ht = (1u32 << (13 + (self.ampdu & 3))) - 1;
+        self.vht
+            .map_or(ht, |v| ht.max((1u32 << (13 + u32::from(v.factor))) - 1))
     }
     /// Native RC flags: HT (0x08), CW40 (0x02), SGI (0x04) and
     /// `WMI_RC_TX_STBC_FLAG` (0x20) for a peer transmitting STBC. Peer RX
@@ -202,14 +297,34 @@ impl Profile {
             | if self.secondary.is_some() { 2 } else { 0 }
             | if self.peer_tx_stbc { 0x20 } else { 0 }
     }
+    /// PEER_ASSOC `peer_phymode` (Linux `ath10k_peer_assoc_h_phymode`): a
+    /// VHT peer is `MODE_11AC_VHT20/40/80` (8/9/10) by its bandwidth.
     pub(super) fn mode(self, frequency: u16) -> u32 {
-        if self.secondary.is_some() {
+        match self.vht {
+            Some(v) if v.eighty => 10,
+            Some(_) if self.secondary.is_some() => 9,
+            Some(_) => 8,
+            None => self.start_mode(frequency),
+        }
+    }
+    /// VDEV_START channel mode: Linux `mac.c::chan_to_phymode` maps the
+    /// chandef width only, so 5GHz 20/40 stay `MODE_11NA_HT20/HT40` (4/6)
+    /// for a VHT peer and only 80 MHz selects `MODE_11AC_VHT80` (10).
+    pub(super) fn start_mode(self, frequency: u16) -> u32 {
+        if self.vht.is_some_and(|v| v.eighty) {
+            10
+        } else if self.secondary.is_some() {
             6
         } else if frequency < 3000 {
             5
         } else {
             4
         }
+    }
+    /// VDEV_START/inventory channel permission: `WMI_CHAN_FLAG_ALLOW_HT`
+    /// (bit11) and, for a VHT profile, `WMI_CHAN_FLAG_ALLOW_VHT` (bit12).
+    pub(super) fn channel_flags(self) -> u32 {
+        (1 << 11) | if self.vht.is_some() { 1 << 12 } else { 0 }
     }
     pub(super) fn density(self) -> u32 {
         match (self.ampdu >> 2) & 7 {
@@ -222,6 +337,11 @@ impl Profile {
         ApElements::parse(ies).is_ok_and(|p| {
             p.ht_capability() == Some(self.offered.ht().peer_capability_body())
                 && p.ht_operation() == Some(self.offered.ht().operation().body())
+                // An HT-only profile never bound the AP's VHT elements.
+                && self.offered.vht().is_none_or(|v| {
+                    p.vht_capability() == Some(v.peer_capability_body())
+                        && p.vht_operation() == Some(v.operation_body())
+                })
         })
     }
     pub(super) fn accepts(self, descriptor: &[u8]) -> bool {
@@ -250,8 +370,68 @@ impl Profile {
                             self.receive_sgi40
                         })
             }
+            // HTT_RX_VHT (0x0c); HTT_RX_VHT_WITH_TXBF (0x0d) needs a
+            // beamformee role this profile never advertises.
+            12 => self.vht.is_some_and(|v| {
+                // Linux htt_rx.c::ath10k_htt_rx_h_rates: VHT-SIG-A1 in
+                // info2 (bw bits0..1, STBC bit3, group id bits4..9, SU NSTS
+                // bits10..12) and VHT-SIG-A2 in info3 (SGI bit0, LDPC bit2,
+                // MCS bits4..7). Only SU group ids 0/63 carry our stream.
+                let a1 = word(108);
+                let a2 = word(112);
+                let stbc = a1 >> 3 & 1 != 0;
+                let nsts = a1 >> 10 & 7;
+                let sgi = a2 & 1 != 0;
+                descriptor[103] & 1 == 0
+                    && matches!(a1 >> 4 & 0x3f, 0 | 63)
+                    && if stbc {
+                        nsts == 1 && v.receive_stbc
+                    } else {
+                        nsts == 0
+                    }
+                    && (a2 & 4 == 0 || v.receive_ldpc)
+                    && v.receive_map & 3 != 3
+                    && a2 >> 4 & 15 <= 7 + u32::from(v.receive_map & 3)
+                    && match a1 & 3 {
+                        0 => !sgi || self.receive_sgi20,
+                        1 => self.secondary.is_some() && (!sgi || self.receive_sgi40),
+                        2 => v.eighty && (!sgi || v.receive_sgi80),
+                        _ => false,
+                    }
+            }),
             _ => false,
         }
+    }
+}
+
+/// Bind negotiated VHT into native PEER_ASSOC facts. mac80211
+/// `ieee80211_vht_cap_ie_to_sta_vht_cap` keeps RX LDPC, TXOP PS, +HTC-VHT,
+/// the A-MPDU exponent, link adaptation and antenna-pattern bits as-is; MPDU
+/// length is the minimum (ours is 3895, field 0); SGI80 is symmetric; the
+/// peer's RX STBC needs our absent TX STBC and its TX STBC our RX STBC
+/// promise; beamforming roles need ours (none) and 160/80+80 our width.
+fn vht(v: &association::phy::VhtNegotiation, width: Width) -> Vht {
+    let peer = v.peer_capability();
+    let body = v.peer_capability_body();
+    let kept = 0x10 | 0x0020_0000 | 0x0040_0000 | 0x0380_0000 | 0x0c00_0000 | 0x3000_0000;
+    Vht {
+        capabilities: (peer & kept)
+            | if v.tx_sgi80() { 0x20 } else { 0 }
+            | if v.rx_stbc() && peer & 0x80 != 0 {
+                0x80
+            } else {
+                0
+            },
+        factor: (peer >> 23 & 7) as u8,
+        rx_max: u16::from_le_bytes([body[6], body[7]]) & 0x1fff,
+        rx_mcs: v.tx_mcs_map(),
+        tx_max: u16::from_le_bytes([body[10], body[11]]) & 0x1fff,
+        tx_mcs: intersect_maps(v.peer_tx_mcs_map(), v.rx_mcs_map()),
+        eighty: width == Width::Eighty,
+        receive_sgi80: v.rx_sgi80(),
+        receive_ldpc: v.rx_ldpc(),
+        receive_stbc: v.rx_stbc(),
+        receive_map: v.rx_mcs_map(),
     }
 }
 
@@ -272,9 +452,9 @@ fn native_capabilities(h: &association::phy::HtNegotiation, width: Width) -> u16
     (h.peer_capability() & !0x3e3)
         | if h.tx_ldpc() { 1 } else { 0 }
         | if peer_tx_stbc(h) { 0x80 } else { 0 }
-        | if width == Width::Forty { 2 } else { 0 }
+        | if width != Width::Twenty { 2 } else { 0 }
         | if h.tx_sgi20() { 0x20 } else { 0 }
-        | if width == Width::Forty && h.tx_sgi40() {
+        | if width != Width::Twenty && h.tx_sgi40() {
             0x40
         } else {
             0

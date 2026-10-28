@@ -79,6 +79,7 @@ pub(super) fn peer_phy(
         .filter_map(|(i, rate)| (rates & (1 << i) != 0).then_some(rate))
         .collect();
     let tlv = dialect == Dialect::Tlv;
+    let vht = ht.and_then(|h| h.vht);
     let ht_rates: Vec<u8> = (0..8)
         .filter(|mcs| ht.is_some_and(|ht| ht.mcs & (1 << mcs) != 0))
         .collect();
@@ -120,7 +121,7 @@ pub(super) fn peer_phy(
     wire::put(&mut out, at + 28, 1); // Linux STA listen-interval workaround.
     if let Some(ht) = ht {
         wire::put(&mut out, at + 32, u32::from(ht.capabilities));
-        wire::put(&mut out, at + 36, (1 << (13 + (ht.ampdu & 3))) - 1);
+        wire::put(&mut out, at + 36, ht.max_mpdu());
         wire::put(&mut out, at + 40, ht.density());
         wire::put(&mut out, at + 44, ht.rate_caps());
     }
@@ -134,7 +135,7 @@ pub(super) fn peer_phy(
         2
     }; // 11A/G/B
     if tlv {
-        wire::put(&mut out, at + 48, 1); // one spatial stream, no HT/VHT
+        wire::put(&mut out, at + 48, 1); // one spatial stream
         wire::put(&mut out, at + 56, mode);
         wire::put(&mut out, at + 68, legacy.len() as u32);
         wire::put(&mut out, at + 72, ht_rates.len() as u32);
@@ -144,7 +145,12 @@ pub(super) fn peer_phy(
         let ht_padded = ht_rates.len().next_multiple_of(4);
         wire::put(&mut out, at + 80 + padded, (17 << 16) | ht_padded as u32);
         out[at + 84 + padded..at + 84 + padded + ht_rates.len()].copy_from_slice(&ht_rates);
-        wire::put(&mut out, at + 84 + padded + ht_padded, (102 << 16) | 16);
+        let vht_at = at + 84 + padded + ht_padded;
+        wire::put(&mut out, vht_at, (102 << 16) | 16);
+        if let Some(v) = vht {
+            wire::put(&mut out, at + 52, v.capabilities);
+            vht_rates(&mut out, vht_at + 4, v);
+        }
     } else {
         wire::put(&mut out, at + 48, legacy.len() as u32);
         out[at + 52..at + 52 + legacy.len()].copy_from_slice(&legacy);
@@ -152,6 +158,10 @@ pub(super) fn peer_phy(
         out[at + 188..at + 188 + ht_rates.len()].copy_from_slice(&ht_rates);
         wire::put(&mut out, at + 320, 1);
         wire::put(&mut out, at + 328, mode);
+        if let Some(v) = vht {
+            wire::put(&mut out, at + 324, v.capabilities);
+            vht_rates(&mut out, at + 332, v);
+        }
         if matches!(
             dialect,
             Dialect::TenTwo | Dialect::TenTwoFour | Dialect::TenFour
@@ -160,6 +170,17 @@ pub(super) fn peer_phy(
         }
     }
     Ok(out)
+}
+
+/// `wmi_vht_rate_set` (Linux `ath10k_peer_assoc_h_vht`): rx_max_rate,
+/// rx_mcs_set, tx_max_rate, tx_mcs_set, identical in every dialect.
+fn vht_rates(out: &mut [u8], at: usize, v: super::ht::Vht) {
+    for (i, value) in [v.rx_max, v.rx_mcs, v.tx_max, v.tx_mcs]
+        .into_iter()
+        .enumerate()
+    {
+        wire::put(out, at + i * 4, u32::from(value));
+    }
 }
 
 pub(super) fn up(dialect: Dialect, bssid: [u8; 6], aid: u16) -> Result<Vec<u8>, Error> {

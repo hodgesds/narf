@@ -1,6 +1,7 @@
 //! Firmware-side RAW packet conversation over actual HTT TX/RX DMA storage.
 use super::*;
 use narf_wifi_fixtures::{udp_ipv4, ApPhase, DhcpServer, FakeAp, NetworkPlan};
+use alloc::boxed::Box;
 use narf_wireless::eapol::{KeyFrame, KeyMgmt, Ptk};
 const OWN: [u8; 6] = [2, 3, 4, 5, 6, 7];
 const AP: [u8; 6] = [2, 8, 9, 10, 11, 12];
@@ -104,6 +105,9 @@ pub(super) struct Fixture {
     pub(super) ht_request_coding: u16,
     pub(super) ht_peer_flags: u32,
     pub(super) ht_rate_caps: u32,
+    /// Boxed VHT expectations (stack: the composed tests sit near the
+    /// aarch64 kernel-test stack limit).
+    pub(super) vht: Option<Box<VhtExpect>>,
     rx_phy: Option<(u8, u32, u32)>,
     // Authored native descriptors per actual DMA frame, including invalid
     // stale middle PHY words that the host must never reinterpret.
@@ -114,6 +118,17 @@ pub(super) struct Fixture {
     wmm_fail: bool,
     wmm_policy: Option<TestPolicy>,
     qos_frames: usize,
+}
+/// Source-derived VHT expectations: the exact association-request VHT
+/// Capabilities body and the native PEER_ASSOC/VDEV_START VHT words.
+#[derive(Clone, Copy)]
+pub(super) struct VhtExpect {
+    /// 0 = VHT20, 1 = VHT40, 2 = VHT80 (the AP-selected bandwidth).
+    pub(super) width: u8,
+    pub(super) request: [u8; 12],
+    pub(super) capabilities: u32,
+    pub(super) rates: [u32; 4],
+    pub(super) max_mpdu: u32,
 }
 impl core::fmt::Debug for Fixture {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -160,6 +175,7 @@ impl Fixture {
             ht_request_coding: 0,
             ht_peer_flags: 0,
             ht_rate_caps: 0,
+            vht: None,
             rx_phy: None,
             rx_descriptors: VecDeque::new(),
             wmm_words: WMM_WORDS,
@@ -415,7 +431,10 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
                     0x2c
                 } else {
                     0x0c
-                }) | if m.data.as_ref().unwrap().ht_secondary.is_some() {
+                }) | if m.data.as_ref().unwrap().ht_secondary.is_some()
+                    || m.data.as_ref().unwrap().vht.is_some()
+                {
+                    // VHT's local HT element always offers 20/40.
                     2
                 } else {
                     0
@@ -434,6 +453,19 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
             expected.push(1);
             expected.extend_from_slice(&[0; 10]);
             if !frame.windows(expected.len()).any(|ie| ie == expected) {
+                return Err(BmiError::BadResponse);
+            }
+        }
+        if phase == 1 {
+            // VHT Capabilities appears exactly when a VHT profile is bound.
+            let mut ie = vec![191, 12];
+            let expected = m.data.as_ref().unwrap().vht.as_ref().map(|v| v.request);
+            ie.extend_from_slice(&expected.unwrap_or([0; 12]));
+            let count = frame.windows(2).filter(|w| *w == [191, 12]).count();
+            if expected.is_some() != (count == 1)
+                || count > 1
+                || expected.is_some() && !frame.windows(14).any(|w| w == ie)
+            {
                 return Err(BmiError::BadResponse);
             }
         }
@@ -488,8 +520,24 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
                     | if qos { 2 } else { 0 }
                     | if ht { 0x1000 } else { 0 }
                     | if f.ht_secondary.is_some() { 0x2000 } else { 0 }
-                    | if ht { f.ht_peer_flags } else { 0 })
+                    | if ht { f.ht_peer_flags } else { 0 }
+                    | f.vht.as_ref().map_or(0, |v| {
+                        0x0200_0000 | if v.width == 2 { 0x0400_0000 } else { 0 }
+                    }))
             || word(at + 24) != (if secured { 0x11 } else { 1 })
+        {
+            return Err(BmiError::BadResponse);
+        }
+        // Native VHT words: peer_vht_caps and wmi_vht_rate_set (TLV: the
+        // trailing tag-102 struct; others: the common-command tail).
+        let (caps_at, rates_at) = if dialect == Dialect::Tlv {
+            (at + 52, command.len() - 16)
+        } else {
+            (at + 324, at + 332)
+        };
+        let vht = f.vht.as_deref().copied();
+        if word(caps_at) != vht.map_or(0, |v| v.capabilities)
+            || (0..4).any(|i| word(rates_at + i * 4) != vht.map_or(0, |v| v.rates[i]))
         {
             return Err(BmiError::BadResponse);
         }
@@ -499,7 +547,9 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
         if word(count) != 3
             || command[rates..rates + 3] != [12, 24, 48]
             || word(phy)
-                != if ht {
+                != if let Some(v) = f.vht.as_deref() {
+                    8 + u32::from(v.width)
+                } else if ht {
                     if f.ht_secondary.is_some() {
                         6
                     } else if m.frequency < 3000 {
@@ -522,7 +572,8 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
             };
             let density = [0, 1, 1, 1, 2, 4, 8, 16][usize::from((f.ht_ampdu >> 2) & 7)];
             if word(at + 32) != u32::from(f.ht_capabilities)
-                || word(at + 36) != (1 << (13 + (f.ht_ampdu & 3))) - 1
+                || word(at + 36)
+                    != f.vht.as_ref().map_or((1 << (13 + (f.ht_ampdu & 3))) - 1, |v| v.max_mpdu)
                 || word(at + 40) != density
                 || word(at + 44)
                     != (if f.ht_sgi { 12 } else { 8 }
