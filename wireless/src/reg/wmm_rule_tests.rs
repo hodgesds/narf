@@ -46,7 +46,12 @@ fn smoke_reg_wmm_rule_limits_edca() -> TestResult {
     }
     // Parameters in ACI order BE, BK, VI, VO.
     let params = crate::wmm::Parameters {
-        ac: [ac(3, 4, 10, 0), ac(7, 4, 10, 0), ac(1, 2, 3, 94), ac(1, 1, 2, 47)],
+        ac: [
+            ac(3, 4, 10, 0),
+            ac(7, 4, 10, 0),
+            ac(1, 2, 3, 94),
+            ac(1, 1, 2, 47),
+        ],
         parameter_set_count: 0,
         uapsd: false,
     };

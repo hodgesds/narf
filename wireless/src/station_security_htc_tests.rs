@@ -44,7 +44,10 @@ fn smoke_station_htc_qos_data_is_received() -> TestResult {
     if s.receive(&mpdu(qos(false, 1, &p.tk)), [0; 32]) != Ok(Rx::Ignored) {
         return TestResult::Fail("+HTC frame did not advance the TID replay counter");
     }
-    if !matches!(s.receive(&mpdu(qos(false, 2, &p.tk)), [0; 32]), Ok(Rx::Data(_))) {
+    if !matches!(
+        s.receive(&mpdu(qos(false, 2, &p.tk)), [0; 32]),
+        Ok(Rx::Data(_))
+    ) {
         return TestResult::Fail("plain QoS data after +HTC was dropped");
     }
     // A tampered HT Control field is not authenticated but a tampered QoS

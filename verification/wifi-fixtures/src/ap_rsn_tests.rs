@@ -89,14 +89,18 @@ fn handshake(
         return Err("station refused M1");
     }
     let m2 = security.pending_frame().ok_or("no M2")?.to_vec();
-    security.reply_delivered(m2.len()).map_err(|_| "M2 delivery")?;
+    security
+        .reply_delivered(m2.len())
+        .map_err(|_| "M2 delivery")?;
     let replies = ap.receive(&m2).map_err(|_| "AP refused M2")?;
     let m3 = replies.first().ok_or("no M3")?;
     if security.receive(&Raw(m3.clone()), [0x73; 32]) != Ok(Rx::ReplyReady) {
         return Err("station refused M3");
     }
     let m4 = security.pending_frame().ok_or("no M4")?.to_vec();
-    security.reply_delivered(m4.len()).map_err(|_| "M4 delivery")?;
+    security
+        .reply_delivered(m4.len())
+        .map_err(|_| "M4 delivery")?;
     if ap.receive(&m4).map_err(|_| "AP refused M4")?.is_empty() && security.port_open() {
         Ok(security)
     } else {
@@ -128,8 +132,9 @@ fn sae_join(pwe: ApSaePwe, ap_akms: &[u8], options: JoinOptions) -> Result<KeyMg
         .and_then(|ap| ap.with_akms(ap_akms))
         .map_err(|_| "AP configuration")?;
     let security = SecurityMode::Wpa3Sae { pwe: SaePwe::Both };
-    let mut plan = JoinPlan::prepare_with_options(&bss(&ap), PLAN.station, SSID, security, None, options)
-        .map_err(|_| "station refused the SAE AP")?;
+    let mut plan =
+        JoinPlan::prepare_with_options(&bss(&ap), PLAN.station, SSID, security, None, options)
+            .map_err(|_| "station refused the SAE AP")?;
     let join = plan.sae().ok_or("no SAE plan")?.clone();
     if join.h2e() != (pwe == ApSaePwe::HashToElement) {
         return Err("PWE method");

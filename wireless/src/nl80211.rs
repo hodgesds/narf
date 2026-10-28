@@ -1480,8 +1480,8 @@ pub(crate) const OPERATIONS: &[GenlOperation] = &[
     op(NL80211_CMD_DEL_INTERFACE, DO, UNS),
     op(NL80211_CMD_GET_WOWLAN, DO, OPEN),
     op(NL80211_CMD_SET_WOWLAN, DO, UNS),
-    op(75, DO, UNS), // START_SCHED_SCAN
-    op(76, DO, UNS), // STOP_SCHED_SCAN
+    op(75, DO, UNS),         // START_SCHED_SCAN
+    op(76, DO, UNS),         // STOP_SCHED_SCAN
     op(6, DO, UNS),          // SET_INTERFACE
     op(17, DO | DUMP, OPEN), // GET_STATION
     op(32, DUMP, OPEN),      // GET_SCAN

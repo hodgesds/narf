@@ -2074,5 +2074,8 @@ mod zc_tx_tests {
         unregister(other);
         TestResult::Pass
     }
-    kernel_test_in!("net/iface", smoke_iface_retire_for_rebind_keeps_name_and_ifindex);
+    kernel_test_in!(
+        "net/iface",
+        smoke_iface_retire_for_rebind_keeps_name_and_ifindex
+    );
 }

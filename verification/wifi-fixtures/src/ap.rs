@@ -157,7 +157,8 @@ impl FakeAp {
         .with_test_seed(seed);
         ap.rsn = Some(alloc::boxed::Box::new(RsnProfile {
             akms: vec![narf_wireless::rsn::AKM_SAE],
-            caps: narf_wireless::rsn::RSN_CAP_MFP_CAPABLE | narf_wireless::rsn::RSN_CAP_MFP_REQUIRED,
+            caps: narf_wireless::rsn::RSN_CAP_MFP_CAPABLE
+                | narf_wireless::rsn::RSN_CAP_MFP_REQUIRED,
             rsnxe: (pwe == ApSaePwe::HashToElement).then_some(narf_wireless::rsn::RSNX_CAP_SAE_H2E),
             sae: Some(SaeAp {
                 session,
@@ -252,7 +253,9 @@ impl FakeAp {
     /// The installed pairwise TK after message 2 (for driver tests that
     /// check the key a device installed).
     pub fn pairwise_tk(&self) -> Option<[u8; 16]> {
-        self.ptk.as_ref().and_then(|p| p.tk.as_slice().try_into().ok())
+        self.ptk
+            .as_ref()
+            .and_then(|p| p.tk.as_slice().try_into().ok())
     }
 
     /// The IGTK and key ID delivered in message 3.
@@ -398,9 +401,8 @@ impl FakeAp {
                 self.append_rates(&mut response);
                 if self.protected() {
                     let mut m1 = KeyFrame::empty(16);
-                    m1.key_information = eapol::KI_KEY_TYPE_PAIRWISE
-                        | eapol::KI_KEY_ACK
-                        | self.key_version();
+                    m1.key_information =
+                        eapol::KI_KEY_TYPE_PAIRWISE | eapol::KI_KEY_ACK | self.key_version();
                     m1.key_length = 16;
                     m1.replay_counter = 1;
                     m1.key_nonce = self.anonce;
@@ -712,8 +714,8 @@ impl FakeAp {
                 )
                 .ok_or(ApError::Key)?;
                 let mut pdu = m3.into_eapol();
-                let mic = eapol::wpa_eapol_key_mic(km, version, &ptk.kck, &pdu)
-                    .ok_or(ApError::Mic)?;
+                let mic =
+                    eapol::wpa_eapol_key_mic(km, version, &ptk.kck, &pdu).ok_or(ApError::Mic)?;
                 pdu[81..97].copy_from_slice(&mic[..16]);
                 self.ptk = Some(ptk);
                 self.phase = ApPhase::Message4;

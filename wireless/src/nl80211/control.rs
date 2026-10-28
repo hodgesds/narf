@@ -807,7 +807,12 @@ fn parse_operation_caps(
                 return Err(EINVAL);
             }
             let flags = u32_attr(attrs, 158)?.unwrap_or(0);
-            scan_flags_sn(flags, caps.scan_random_mac, caps.connected, caps.scan_random_sn)?;
+            scan_flags_sn(
+                flags,
+                caps.scan_random_mac,
+                caps.connected,
+                caps.scan_random_sn,
+            )?;
             let random_mac = scan_random_mac(attrs, flags)?;
             let ssids = attr(attrs, 45)
                 .map(attributes)
@@ -1877,18 +1882,18 @@ fn parse_sched_scan(
     if fields.iter().any(|(kind, _)| {
         !extra.contains(kind)
             && ![
-            ATTR_MAC,
-            ATTR_IE,
-            ATTR_SCAN_FREQUENCIES,
-            ATTR_SCAN_SSIDS,
-            ATTR_SCHED_SCAN_INTERVAL,
-            ATTR_SCHED_SCAN_MATCH,
-            ATTR_SCAN_FLAGS,
-            ATTR_MAC_MASK,
-            ATTR_SCHED_SCAN_DELAY,
-            ATTR_SCHED_SCAN_PLANS,
-        ]
-        .contains(kind)
+                ATTR_MAC,
+                ATTR_IE,
+                ATTR_SCAN_FREQUENCIES,
+                ATTR_SCAN_SSIDS,
+                ATTR_SCHED_SCAN_INTERVAL,
+                ATTR_SCHED_SCAN_MATCH,
+                ATTR_SCAN_FLAGS,
+                ATTR_MAC_MASK,
+                ATTR_SCHED_SCAN_DELAY,
+                ATTR_SCHED_SCAN_PLANS,
+            ]
+            .contains(kind)
     }) {
         return Err(EOPNOTSUPP);
     }

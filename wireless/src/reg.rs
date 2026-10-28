@@ -159,7 +159,9 @@ impl RegRule {
     /// channel-access floor a driver applies to every EDCA parameter set it
     /// programs on a channel this rule covers (`WmmRule::limit`).
     pub fn wmm_rule(&self) -> Option<WmmRule> {
-        self.flags.contains(RegFlags::WMM_ETSI).then_some(WmmRule::ETSI)
+        self.flags
+            .contains(RegFlags::WMM_ETSI)
+            .then_some(WmmRule::ETSI)
     }
     pub fn allows_6ghz_client(&self, power: PowerType6Ghz) -> bool {
         match power {

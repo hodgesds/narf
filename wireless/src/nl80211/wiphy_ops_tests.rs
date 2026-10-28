@@ -163,7 +163,10 @@ fn smoke_nl80211_frag_threshold_sched_scan_and_random_sn() -> TestResult {
     push_attr(&mut plan, 1, &30u32.to_ne_bytes());
     let mut plans = Vec::new();
     push_attr(&mut plans, 1 | NLA_F_NESTED, &plan);
-    let start = with_ifindex(ifindex, &[(132 | NLA_F_NESTED, &matches), (225 | NLA_F_NESTED, &plans)]);
+    let start = with_ifindex(
+        ifindex,
+        &[(132 | NLA_F_NESTED, &matches), (225 | NLA_F_NESTED, &plans)],
+    );
     if send(75, &start) != 0
         || ops.sched_started.load(Ordering::Relaxed) != 1
         || ops.sched_match_sets.load(Ordering::Relaxed) != 1
@@ -178,8 +181,7 @@ fn smoke_nl80211_frag_threshold_sched_scan_and_random_sn() -> TestResult {
     if send(76, &with_ifindex(ifindex, &[(88, &5u64.to_ne_bytes())])) != ENOENT {
         return TestResult::Fail("STOP_SCHED_SCAN for an unknown request id");
     }
-    if send(76, &with_ifindex(ifindex, &[])) != 0
-        || ops.sched_stopped.load(Ordering::Relaxed) != 1
+    if send(76, &with_ifindex(ifindex, &[])) != 0 || ops.sched_stopped.load(Ordering::Relaxed) != 1
     {
         return TestResult::Fail("STOP_SCHED_SCAN did not reach the driver");
     }
@@ -202,7 +204,10 @@ fn smoke_nl80211_frag_threshold_sched_scan_and_random_sn() -> TestResult {
     }
     if !matches!(
         parse_operation_caps(SCAN, &attributes(&attrs).unwrap(), caps(true), 0),
-        Ok(Operation::ScanFlagged(_, crate::ScanFlags { random_sn: true }))
+        Ok(Operation::ScanFlagged(
+            _,
+            crate::ScanFlags { random_sn: true }
+        ))
     ) {
         return TestResult::Fail("RANDOM_SN not carried to the driver");
     }
