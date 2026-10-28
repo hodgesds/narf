@@ -70,7 +70,7 @@ device to the highest-specificity matching probe.
 | `narf-drivers-usb` (Hub class)   | xHCI hot-plug, USB class 0x09           | GET_DESCRIPTOR(Hub) + SET_FEATURE(PORT_POWER) + per-port reset + GET_STATUS for downstream device enumeration |
 | `narf-drivers-usb` (xHCI)        | QEMU + AMD Phoenix VID/DIDs | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT |
 | `narf-drivers-usb` (HID kbd)     | xHCI hot-plug | Set Protocol(Boot) → interrupt-IN polling → Usage 0x07 → KeyCode press/release diff → `narf_input` |
-| `narf-drivers-usb` (Mass Storage)| xHCI hot-plug, USB class 08:06:50 | enumerate-and-attach → CBW/CSW Bulk-Only Transport → INQUIRY / READ CAPACITY(10) / READ(10) / WRITE(10) + multi-block read/write up to 8 LBAs/xfer |
+| `narf-drivers-usb` (Mass Storage)| xHCI hot-plug, USB class 08:06:50 | enumerate-and-attach → GET MAX LUN multi-LUN bind → CBW/CSW Bulk-Only Transport → INQUIRY / READ CAPACITY(10)/(16) / READ(10)/(16) / WRITE(10)/(16) with driver-internal chunking (≤4 KiB and ≤8 LBAs per command) + BOT error recovery (halt clear, REQUEST SENSE drain/retry, Reset Recovery) |
 | `narf-audio` (Intel HDA)         | 0x1022:0x15E3 (AMD Phoenix), 0x1002:0x1640 (Radeon) | BAR0 + GCTL.CRST + CORB/RIRB rings + STATESTS codec walk + Get Parameter verbs + output stream descriptor + BDL + cyclic period buffer + 48 kHz S16LE stereo + `start_output` / `load_period` / `load_sine_test_tone` for audible playback |
 | `narf-firmware-fw-cfg`           | x86_64 PIO 0x510/0x511 | QEMU `fw_cfg` directory parse + `find` / `read` / `read_string` |
 

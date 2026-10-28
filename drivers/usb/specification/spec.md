@@ -33,7 +33,10 @@ also consult upstream Linux GPL sources.
   Revision 1.0** (Sep 1999) — USB-IF. Public.
 - **SCSI Block Commands - 3 (SBC-3)** — for the embedded SCSI
   command opcodes (`READ(10)` / `WRITE(10)` / `INQUIRY` /
-  `READ CAPACITY(10)`).
+  `READ CAPACITY(10)`, and the `(16)` forms for > 2 TiB media).
+- **SCSI Primary Commands - 4 (SPC-4)** — `REQUEST SENSE` and the
+  fixed-format sense data (sense key / ASC / ASCQ) used for error
+  reporting and the retry policy.
 
 ### USB HID
 
@@ -490,16 +493,35 @@ the USB download itself remains a target-silicon gate.
   mode) is accepted on the wire but discarded — vertical/horizontal
   wheel + multi-touch land with the Report-Descriptor parser.
 - **MSC** (`msc`): Bulk-Only Transport CBW/CSW codec, INQUIRY,
-  READ_CAPACITY(10), READ(10), WRITE(10). The `BlockDeviceSync` adapter
-  splits filesystem requests into sequential BOT commands of at most 4 KiB
-  (also at most eight logical blocks), with one per-device claim held for
-  the entire request. This supports 16 KiB btrfs metadata on both 512-byte
-  and 4 KiB logical-block media without exceeding the xHCI DMA buffer.
-  The adapter also performs SYNCHRONIZE CACHE(10) for `flush()` and
-  WRITE(10) with the FUA bit for `write_fua()`, so its advertised Flush/FUA
-  capabilities are issued on the wire (#829). FUA requests use the same
-  bounded chunks and whole-request range validation as ordinary writes;
-  every chunk carries FUA and the claim remains held until completion.
+  TEST UNIT READY, REQUEST SENSE, READ CAPACITY(10), READ(10),
+  WRITE(10). Bind issues GET MAX LUN (BOT §3.3; any failure means a
+  single LUN) and binds every populated LUN as its own block device —
+  empty slots in a multi-LUN reader are skipped, not fatal. A LUN
+  whose READ CAPACITY(10) saturates at 0xFFFFFFFF escalates to READ
+  CAPACITY(16); LUNs past 2 TiB use the 16-byte READ(16) / WRITE(16)
+  command forms with 64-bit LBAs throughout the driver and adapter.
+  The driver's read/write entry points chunk arbitrary-size requests
+  internally into sequential BOT commands of at most 4 KiB (also at
+  most eight logical blocks), so no caller has to split; the
+  `BlockDeviceSync` adapter keeps one per-device claim held for the
+  entire request. This supports 16 KiB btrfs metadata on both
+  512-byte and 4 KiB logical-block media without exceeding the xHCI
+  DMA buffer. The adapter also performs SYNCHRONIZE CACHE(10) for
+  `flush()` and WRITE with the FUA bit for `write_fua()`, so its
+  advertised Flush/FUA capabilities are issued on the wire (#829).
+  FUA requests use the same bounded chunks and whole-request range
+  validation as ordinary writes; every chunk carries FUA and the
+  claim remains held until completion.
+  Error recovery follows BOT §5.3/§6: a stalled pipe is cleared on
+  both sides (host Reset Endpoint + device CLEAR_FEATURE) before
+  the CSW is read; a Command Failed status is drained with REQUEST
+  SENSE and the command retried once when the sense is a transient
+  condition (UNIT ATTENTION, or NOT READY while the medium spins
+  up) — any other sense fails the command with the parsed sense
+  attached; a Phase Error or an invalid CSW triggers Reset
+  Recovery (Mass Storage Reset + both pipes cleared) and one
+  retry. The BOT exchanges sit behind a `BotTransport` seam so the
+  conversation is fixture-testable without an xHCI.
 - **Hub** (`hub`): hub class enumeration, multiple-TT detection from the
   Device Descriptor protocol, TT think-time propagation, and downstream
   route addressing so low/full-speed devices behind high-speed hubs are
