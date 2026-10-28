@@ -1279,9 +1279,9 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         }
     }
     /// Close host admission before awaiting any teardown. A completed USB
-    /// Stop retires pending native TX/RX without assuming a radio ACK. This
-    /// initial lifecycle is deliberately one association per firmware claim;
-    /// key history cannot be reset by creating another station after stop.
+    /// Stop retires pending native TX/RX without assuming a radio ACK. Key
+    /// history dies with this station: `into_radio` hands only the stopped
+    /// receive owner back for a later, independent association.
     pub async fn disconnect(&mut self) -> Result<(), Error> {
         if self.phase() == Phase::Stopped {
             return Ok(());
@@ -1326,6 +1326,14 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                 Err(error)
             }
         }
+    }
+    /// The stopped receive owner after a completed `disconnect`; the
+    /// station (keys, PN/replay state, BA sessions, plan) is dropped.
+    pub(super) fn into_radio(self) -> Result<Receiver<C, B>, Self> {
+        if self.phase != Phase::Stopped {
+            return Err(self);
+        }
+        Ok(self.radio)
     }
     /// Backpressure precedes encryption/PN consumption. EAPOL is never admitted
     /// from an Ethernet client; only shared-Supplicant replies own that path.

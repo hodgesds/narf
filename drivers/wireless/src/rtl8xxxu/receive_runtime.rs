@@ -813,6 +813,47 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         }
         result.map_err(Error::Packet)
     }
+    /// mac80211 `ieee80211_set_disassoc` clears the link BSSID, so
+    /// `rtl8xxxu_bss_info_changed(BSS_CHANGED_BSSID)` runs
+    /// `rtl8xxxu_set_bssid(zero)` (REG_BSSID 0x618..0x61d): a stopped
+    /// receiver drops its bound peer and per-association rate state so a
+    /// later `prepare_station` may bind a new peer. Any EP0 failure is
+    /// terminal like every other runtime write.
+    pub(super) async fn release_station(&mut self) -> Result<(), Error> {
+        if self.phase() != Phase::Stopped || self.peer.is_none() {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Configuring;
+        let mut attempt = Attempt {
+            firmware: self.firmware.clone(),
+            armed: true,
+        };
+        let result = async {
+            for i in 0..6u16 {
+                let reg = 0x618 + i;
+                self.firmware.write8(reg, 0).await.map_err(Error::Control)?;
+                if self.firmware.read8(reg).await.map_err(Error::Control)? != 0 {
+                    return Err(Error::State);
+                }
+            }
+            Ok(())
+        }
+        .await;
+        attempt.armed = false;
+        match result {
+            Ok(()) => {
+                self.peer = None;
+                self.ra = None;
+                self.report_time = None;
+                self.phase = Phase::Stopped;
+                Ok(())
+            }
+            Err(error) => {
+                self.fail();
+                Err(error)
+            }
+        }
+    }
     /// Serialized unicast station programming, from Linux set_linktype and
     /// set_bssid. This owner has no packet in flight during this transition.
     pub(super) async fn prepare_station(

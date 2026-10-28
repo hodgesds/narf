@@ -248,10 +248,9 @@ Explicit disconnect closes host admission before awaiting Linux TSF-disable
 and disconnected media state, verifies MAC TX/RX/filter closure, then uses
 proven USB Stop/SetDeq to retire outstanding native receipts. Cancellation
 retains them terminally. AP unicast/broadcast deauth/disassociation and peer
-loss close the carrier. This first service allows one association per
-firmware claim; a stopped or failed owner cannot construct fresh keys/radio
-state for rejoin. Controller-proven EP0 reset/recovery and safe rejoin remain
-software work; successful initial association is not that recovery proof.
+loss close the carrier. A completed explicit disconnect returns the service
+to Passive for a safe rejoin (below); a failed owner cannot construct fresh
+keys/radio state. Controller-proven EP0 reset/recovery remains software work.
 
 Disconnect publishes down immediately and repeats that publication after
 acquiring device state, the same mutex held by every up publisher. A previous
@@ -630,6 +629,45 @@ halted owner, reset failure and cancelled recovery are terminal) and
 station survives IN and OUT halts with a full roundtrip afterwards,
 disconnect of a halted station, failed reset is terminal).
 
+### Safe rejoin after disconnect (implemented)
+
+Linux v7.2 mac80211 `ieee80211_set_disassoc` (`net/mac80211/mlme.c`)
+clears the link BSSID, so `rtl8xxxu/core.c::rtl8xxxu_bss_info_changed`
+runs `BSS_CHANGED_ASSOC` (`report_connect(..., false)`, TSF-update
+disable) and `BSS_CHANGED_BSSID` → `rtl8xxxu_set_bssid(zero)`; the driver
+keeps receiving and mac80211 may scan and associate again with new keys.
+NARF follows that on the retained owners:
+
+- `Service::disconnect` runs the existing `Station::disconnect` (media
+  disconnect, MAC TX/RX/filter closure, proven USB Stop/SetDeq), then
+  `Station::into_radio` returns the stopped `Receiver` and drops the station
+  with its keys, PN/replay windows, BA sessions and plan.
+- `Receiver::release_station` (Stopped only) writes REG_BSSID
+  0x618..0x61d to zero with readback and clears the bound `peer`,
+  `ra_info` and the owed TX report time, so `prepare_station` accepts the
+  next peer. `Receiver::start` (Stopped → Receiving) reopens RX-only
+  reception on a fresh bulk-IN receipt; the service is `Passive` again and
+  a later `connect` builds a fresh station (fresh SNonce/PTK and CCMP).
+- `interface::Device::disassociate` closes admission before waiting (stale
+  publishers are fenced exactly as before) and, only when the disconnect
+  completed with a Passive service and no failure, reopens admission under
+  the same state guard and resets the RX Narf-Ring generation so the next
+  station publishes a new consumer. `closed` is therefore no longer
+  permanent after disassociate; any failed teardown, failed association or
+  authority loss still closes terminally.
+- Any EP0/USB failure while releasing or restarting is terminal and keeps
+  the radio retained (`Service::fail`), like every other runtime write.
+
+Tests: `smoke_rtl8188eu_service_composes_passive_scan_optional_ies_rsna_and_sync_network`
+(disconnect → Passive with BSSID zero and RX-only CR, a second WPA2
+association with fresh 4-way/CCMP and data, second teardown),
+`smoke_rtl8188eu_{open,wpa2}_native_scan_dhcp_and_bidirectional_ip` and
+the HT20 variants (composed Device: old receipt stopped and a distinct
+passive receipt posted, rescan, re-association with a fresh AP session and
+uplink, second disconnect), `smoke_rtl8188eu_disconnect_overrides_waiting_old_link_publication`
+(stale publisher still fenced) and the failed USB stop smoke (teardown
+failure stays closed; no rejoin).
+
 ## 4. Invariants
 
 - Linux's disabled→EMU→active handshake precedes firmware writes. MAC TX/RX
@@ -684,8 +722,8 @@ channels/rates, reset/rejoin and PM still need software implementation.
 | Broader channel/rate profiles and coexistence | Native optional WMM DATA uses negotiated12-rate legacy TX. Separate N8HT HT20/LGI MCS0..7/whole A-MSDU/decline/capture-publication continuation passes native software gates above. Management/basic1Mbps and channel1 remain required. SGI/HT40, retune, broader bands/adaptation and coexistence remain missing |
 | USB transfer ownership / stale handles | EP0 + bulk claims, retained command DMA and generation rejection implemented; slot reuse stays gated |
 | Non-stream bulk stop/drain | Implemented in USB; exact commands/context/event-prefix proof |
-| Disconnect/peer-loss callbacks and normal bulk stop | Implemented; one association per firmware claim |
-| EP0/Halted reset, safe rejoin, FIFO retune and PM recovery | Missing; software prerequisites |
+| Disconnect/peer-loss callbacks and normal bulk stop | Implemented; a completed disconnect returns to Passive (safe rejoin) |
+| EP0/Halted reset, safe rejoin, FIFO retune and PM recovery | Bulk halt recovery and safe rejoin implemented; EP0 reset, FIFO retune and PM missing |
 
 Chip inventory is source-specific: Linux `rtl8xxxu/8188e.c` identifies1TX/1RX;
 `8192e.c` identifies actual1/2TX and2RX; `8723b.c` identifies1TX/1RX and optional

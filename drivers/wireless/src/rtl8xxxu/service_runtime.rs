@@ -428,17 +428,48 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
             failed: self.failed.clone(),
             armed: true,
         };
-        let result = self
-            .station
-            .as_mut()
-            .ok_or(Error::State)?
-            .disconnect()
-            .await
-            .map_err(Error::Station);
+        let result = async {
+            self.station
+                .as_mut()
+                .ok_or(Error::State)?
+                .disconnect()
+                .await
+                .map_err(Error::Station)?;
+            self.rejoin_passive().await
+        }
+        .await;
         attempt.armed = false;
         if result.is_err() {
             self.fail();
         }
+        result
+    }
+    /// Safe rejoin (mac80211 `ieee80211_set_disassoc` then a new scan): the
+    /// stopped station returns its receive owner, which drops the bound
+    /// peer (`rtl8xxxu_set_bssid(zero)`) and restarts RX-only reception, so
+    /// the service is Passive again and a later `connect` builds a fresh
+    /// station with fresh keys. Failure leaves the radio retained and the
+    /// caller marks the service failed.
+    async fn rejoin_passive(&mut self) -> Result<(), Error> {
+        let station = self.station.take().ok_or(Error::State)?;
+        let mut radio = match station.into_radio() {
+            Ok(radio) => radio,
+            Err(station) => {
+                self.station = Some(station);
+                return Err(Error::State);
+            }
+        };
+        self.initial_nonce = None;
+        let result = async {
+            radio.release_station().await?;
+            let authority = radio.authority();
+            authority
+                .fence(radio.start(), core::convert::identity)
+                .await
+        }
+        .await
+        .map_err(Error::Radio);
+        self.radio = Some(radio);
         result
     }
 }

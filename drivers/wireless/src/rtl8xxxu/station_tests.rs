@@ -1188,20 +1188,48 @@ fn smoke_rtl8188eu_service_composes_passive_scan_optional_ies_rsna_and_sync_netw
         return TestResult::Fail("sync service did not retire real TX and deliver CCMP RX");
     }
     narf_scheduler::block_on(service.disconnect()).unwrap();
-    if service.phase() != ServicePhase::Stopped
+    // Safe rejoin: Passive again, BSSID cleared (set_bssid(zero)), RX-only
+    // reception restarted on a fresh receipt; no station/key survives.
+    let first_rx = link.state.lock().rx;
+    if service.phase() != ServicePhase::Passive
         || service.connected_peer().is_some()
         || service.transmit_ready()
         || !service.poll().unwrap().is_empty()
-        || narf_scheduler::block_on(service.connect(
-            AP,
-            b"narf",
-            SecurityMode::Wpa2Psk,
-            Some(Zeroizing::new(PMK)),
-            &[],
-        ))
-        .is_ok()
+        || control.0.lock().regs[0x618..0x61e] != [0; 6]
+        || control.0.lock().regs[0x100] & 0xc0 != 0x80
+        || first_rx.is_none()
     {
-        return TestResult::Fail("stopped service reconstructed station/key history");
+        return TestResult::Fail("disconnected service did not return to Passive");
+    }
+    // A second, independent association: fresh 4-way and CCMP.
+    {
+        let mut state = link.state.lock();
+        state.ptk = None;
+        state.sent.clear();
+        state.queue.push_back(beacon(true).bytes);
+    }
+    service.poll().unwrap();
+    if narf_scheduler::block_on(service.connect(
+        AP,
+        b"narf",
+        SecurityMode::Wpa2Psk,
+        Some(Zeroizing::new(PMK)),
+        &[],
+    ))
+    .is_err()
+        || service.connected_peer() != Some(AP)
+        || control.0.lock().regs[0x618..0x61e] != AP
+    {
+        return TestResult::Fail("Passive service refused a second association");
+    }
+    service.transmit(&ethernet).unwrap();
+    if service.poll().unwrap().len() != 1 || !service.transmit_ready() {
+        return TestResult::Fail("rejoined station lost real TX/CCMP RX");
+    }
+    // Teardown again; a failed teardown (EP0 loss) is terminal, no rejoin.
+    narf_scheduler::block_on(service.disconnect()).unwrap();
+    if service.phase() != ServicePhase::Passive {
+        return TestResult::Fail("second disconnect did not return to Passive");
     }
     TestResult::Pass
 }
@@ -1383,11 +1411,15 @@ fn smoke_rtl8188eu_interface_uses_controlled_port_rings_and_synchronous_usb_prog
     if frame.payload() != expected || !matches!(consumer.try_recv(), Ok(None)) {
         return TestResult::Fail("RX ring delivered altered or extra plaintext");
     }
+    let old_rx = link.state.lock().rx;
     narf_scheduler::block_on(device.disassociate()).unwrap();
+    // The old association's receipt is stopped; safe rejoin posts a new
+    // passive RX receipt for the reopened (carrier-down) interface.
     if device.link_up()
         || device.connected_bssid().is_some()
         || !device.progress().is_empty()
-        || link.state.lock().rx.is_some()
+        || old_rx.is_none()
+        || link.state.lock().rx == old_rx
     {
         return TestResult::Fail(
             "interface disconnect failed to close carrier and stop real receipts",

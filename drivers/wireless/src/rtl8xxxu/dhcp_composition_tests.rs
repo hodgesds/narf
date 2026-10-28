@@ -840,21 +840,66 @@ fn composition_profile(protected: bool, ht: bool) -> Result<(), &'static str> {
             "EU quiet polling cancelled/reposted persistent RX receipt"
         );
     }
+    let old_rx = h.link.0.lock().rx;
     complete(h.device.disassociate())?.map_err(|_| "EU native disconnect/USB retirement")?;
     h.pump();
     ensure!(h.closed(), "EU disconnect retained physical carrier");
     {
         let p = h.link.0.lock();
         ensure!(
-            p.rx.is_none() && p.tx.is_none() && p.stops != 0,
+            // The association's receipt stopped; the Passive restart
+            // posted a distinct new one.
+            p.rx.is_some() && p.rx != old_rx && p.tx.is_none() && p.stops != 0,
             "EU disconnect failed to stop exact receipts"
         );
     }
     ensure!(
-        narf_net::iface::send_on(&h.name, &uplink).is_err()
-            && complete(h.device.associate(h.request()))?.is_err(),
-        "EU stopped one-shot service reopened"
+        narf_net::iface::send_on(&h.name, &uplink).is_err(),
+        "EU disconnected netdev transmitted"
     );
+    // Safe rejoin: the reopened Passive service scans and associates again
+    // with a fresh station (new 4-way/PTK) and carries data.
+    {
+        let mut p = h.link.0.lock();
+        p.ap = if protected {
+            FakeAp::wpa2(network, SSID, 1, 42, PMK, ANONCE)
+        } else {
+            FakeAp::open(network, SSID, 1, 42)
+        }
+        .unwrap()
+        .with_basic_1mbps()
+        .unwrap();
+        p.ptk = None;
+        p.replay = narf_wireless::ccmp::ReplayWindow { last_seen_pn: 0 };
+        p.next_pn = 1;
+    }
+    h.scan()?;
+    complete(h.device.associate(h.request()))?.map_err(|_| {
+        h.link
+            .0
+            .lock()
+            .error
+            .unwrap_or("EU rejoin association/RSNA")
+    })?;
+    ensure!(
+        h.device.link_up() && h.device.connected_bssid() == Some(AP),
+        "EU rejoin carrier identity"
+    );
+    narf_net::iface::send_on(&h.name, &uplink).map_err(|_| "EU rejoined netdev refused uplink")?;
+    h.pump();
+    ensure!(
+        h.link
+            .0
+            .lock()
+            .uplink
+            .iter()
+            .filter(|(f, encrypted)| *f == uplink && *encrypted == protected)
+            .count()
+            == 2,
+        "EU rejoined uplink did not reach the AP"
+    );
+    complete(h.device.disassociate())?.map_err(|_| "EU second disconnect")?;
+    ensure!(!h.device.link_up(), "EU second disconnect kept carrier");
     let name = h.name.clone();
     drop(h);
     ensure!(
@@ -1033,6 +1078,7 @@ fn disconnect_overrides_waiting_old_publisher() -> Result<(), &'static str> {
         b"eu-disconnect-publication",
     );
     narf_net::iface::send_on(&h.name, &probe).map_err(|_| "EU queue before racing disconnect")?;
+    let old_rx = h.link.0.lock().rx;
     complete(
         crate::rtl8xxxu::interface::publication_test::disconnect_after_old_publication(
             &h.device, AP,
@@ -1050,7 +1096,7 @@ fn disconnect_overrides_waiting_old_publisher() -> Result<(), &'static str> {
     );
     let p = h.link.0.lock();
     ensure!(
-        p.rx.is_none() && p.tx.is_none() && p.stops != 0 && p.uplink.is_empty(),
+        p.rx.is_some() && p.rx != old_rx && p.tx.is_none() && p.stops != 0 && p.uplink.is_empty(),
         "EU racing disconnect did not retire USB ownership or discard queued data"
     );
     Ok(())
