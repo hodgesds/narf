@@ -70,10 +70,13 @@ pub mod pstate;
 #[cfg(target_arch = "x86_64")]
 pub mod rapl;
 
+mod resume_env_tests;
 mod runtime_pm_tests;
 mod suspend_service_hooks_tests;
 mod suspend_service_tests;
 mod tests;
+#[cfg(feature = "kernel-test")]
+mod token_resume_tests;
 
 pub use suspend::{SuspendError, SuspendPhase};
 pub use thermal::{
