@@ -1418,7 +1418,7 @@ Linux rtw88 reads no `ht_operation_mode` and takes no protection action
 HT protection modes 1..3 unchanged. The check was local to rtw88; no shared
 `JoinPlan` change was needed.
 
-Evidence: nine `drivers/wireless/rtw88/dm` register-model cases
+Evidence: nine `drivers/wireless/rtw88/dm_engine` register-model cases
 (`dm_tests.rs`), and composed C21/C22 Open/WPA2 watchdog, revocation-restore
 and refusal cases (`dm_station_tests.rs`, `drivers/wireless/rtw88/dm/rtl882{1,2}c`)
 plus HT protection modes 1..3 (`drivers/wireless/rtw88/ht_protection/*`).

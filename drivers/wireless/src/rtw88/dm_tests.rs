@@ -182,12 +182,13 @@ fn smoke_rtw88_dm_payload_admission_per_chip() -> TestResult {
     {
         return TestResult::Fail("C21 DIG/CCK-PD/RA payload refused");
     }
-    let mut bad = Vec::new();
-    bad.push(payload(0, 0x40, 4, 8, 8, 8));
-    bad.push(payload(ALL, 0x5b, 4, 8, 8, 8));
-    bad.push(payload(ALL, 0x1f, 4, 8, 8, 8));
-    bad.push(payload(ALL, 0x40, 5, 8, 8, 8));
-    bad.push(payload(ALL | 1 << 7, 0x40, 4, 8, 8, 8));
+    let mut bad = vec![
+        payload(0, 0x40, 4, 8, 8, 8),
+        payload(ALL, 0x5b, 4, 8, 8, 8),
+        payload(ALL, 0x1f, 4, 8, 8, 8),
+        payload(ALL, 0x40, 5, 8, 8, 8),
+        payload(ALL | 1 << 7, 0x40, 4, 8, 8, 8),
+    ];
     let mut t = ok;
     t[7] = 51;
     bad.push(t);
@@ -200,7 +201,7 @@ fn smoke_rtw88_dm_payload_admission_per_chip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!(
-    "drivers/wireless/rtw88/dm",
+    "drivers/wireless/rtw88/dm_engine",
     smoke_rtw88_dm_payload_admission_per_chip
 );
 
@@ -258,7 +259,7 @@ fn smoke_rtw88_dm_c22_dig_cck_pd_edcca_and_counters() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!(
-    "drivers/wireless/rtw88/dm",
+    "drivers/wireless/rtw88/dm_engine",
     smoke_rtw88_dm_c22_dig_cck_pd_edcca_and_counters
 );
 
@@ -290,7 +291,7 @@ fn smoke_rtw88_dm_cck_pd_source_deltas_and_restore() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!(
-    "drivers/wireless/rtw88/dm",
+    "drivers/wireless/rtw88/dm_engine",
     smoke_rtw88_dm_cck_pd_source_deltas_and_restore
 );
 
@@ -344,7 +345,7 @@ fn smoke_rtw88_dm_ra_rrsr_h2c_and_c2h_report() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!(
-    "drivers/wireless/rtw88/dm",
+    "drivers/wireless/rtw88/dm_engine",
     smoke_rtw88_dm_ra_rrsr_h2c_and_c2h_report
 );
 
@@ -405,7 +406,7 @@ fn smoke_rtw88_dm_path_div_cfo_window_and_bt_reset() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!(
-    "drivers/wireless/rtw88/dm",
+    "drivers/wireless/rtw88/dm_engine",
     smoke_rtw88_dm_path_div_cfo_window_and_bt_reset
 );
 
@@ -442,7 +443,7 @@ fn smoke_rtw88_dm_power_tracking_trigger_clamp_and_envelope() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!(
-    "drivers/wireless/rtw88/dm",
+    "drivers/wireless/rtw88/dm_engine",
     smoke_rtw88_dm_power_tracking_trigger_clamp_and_envelope
 );
 
@@ -457,7 +458,7 @@ fn smoke_rtw88_dm_revoked_authority_writes_nothing() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!(
-    "drivers/wireless/rtw88/dm",
+    "drivers/wireless/rtw88/dm_engine",
     smoke_rtw88_dm_revoked_authority_writes_nothing
 );
 
@@ -503,7 +504,7 @@ fn smoke_rtw88_dm_c21_counters_dig_and_cck_pd() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!(
-    "drivers/wireless/rtw88/dm",
+    "drivers/wireless/rtw88/dm_engine",
     smoke_rtw88_dm_c21_counters_dig_and_cck_pd
 );
 
@@ -550,6 +551,6 @@ fn smoke_rtw88_dm_phy_status_rssi_and_cfo_decode() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!(
-    "drivers/wireless/rtw88/dm",
+    "drivers/wireless/rtw88/dm_engine",
     smoke_rtw88_dm_phy_status_rssi_and_cfo_decode
 );

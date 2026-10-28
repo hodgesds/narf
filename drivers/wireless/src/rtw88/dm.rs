@@ -266,9 +266,9 @@ fn db_2_linear(db: u8) -> u64 {
 }
 fn linear_2_db(linear: u64) -> u8 {
     let mut found = None;
-    'outer: for i in 0..12 {
-        for j in 0..8 {
-            let t = u64::from(DB_INVERT[i][j]);
+    'outer: for (i, row) in DB_INVERT.iter().enumerate() {
+        for (j, &t) in row.iter().enumerate() {
+            let t = u64::from(t);
             if (i <= 2 && (linear << 3) <= t) || (i > 2 && linear <= t) {
                 found = Some((i, j));
                 break 'outer;
@@ -1221,13 +1221,12 @@ impl Tracker {
             if self.facts.c22() {
                 const PD: [i32; 5] = [0, 2, 4, 6, 8];
                 const CS: [i32; 5] = [0, 2, 2, 2, 4];
-                for bw in 0..2 {
-                    for nrx in 0..2 {
+                for (bw, regs) in CCK_PD_REG.iter().enumerate() {
+                    for (nrx, &(rpd, mpd, rcs, mcs)) in regs.iter().enumerate() {
                         let cur = self.cck_pd_lv[bw][nrx];
                         if cur == 0 {
                             continue;
                         }
-                        let (rpd, mpd, rcs, mcs) = CCK_PD_REG[bw][nrx];
                         let pd =
                             (Self::get(io, rpd, mpd)? as i32 - PD[usize::from(cur)]).clamp(0, 255);
                         let cs =
