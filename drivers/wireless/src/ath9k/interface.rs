@@ -176,7 +176,13 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
             .as_mut()
             .ok_or(())?
             .try_send(frame)
-            .map_err(|_| ())
+            .map_err(|_| ())?;
+        // Interrupt-driven service sleeps until a vector fires; stack TX is
+        // the other wake source.
+        if let Some(signal) = self.radio.try_lock().and_then(|r| r.interrupt()) {
+            signal.raise();
+        }
+        Ok(())
     }
     fn clear_rx(&self) {
         if let Some(rx) = self.rx.lock().as_mut() {
@@ -538,6 +544,8 @@ fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
         None => Ok(300),
     }
 }
+/// Housekeeping period while MSI delivery drives RX/TX completion.
+const HOUSEKEEPING_NS: u64 = 20_000_000;
 pub(super) type Native = Device<super::packet_native::Native, station::NativeEnvironment>;
 trait Endpoint: Send + Sync {
     fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()>;
@@ -586,8 +594,28 @@ pub(super) fn publish(radio: super::RetainedRadio) -> Result<Arc<Native>, Error>
     let worker = device.clone();
     narf_scheduler::spawn(async move {
         loop {
+            // Snapshot before servicing so a vector raised mid-pass is seen.
+            let signal = worker.radio.try_lock().and_then(|r| r.interrupt());
+            let seen = signal.as_ref().map(|s| s.count());
             worker.drain();
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+            if worker.closed.load(Ordering::Acquire) {
+                // One more pass already stopped and parked the radio.
+                worker.drain();
+                break;
+            }
+            match (signal, seen) {
+                (Some(signal), Some(seen)) => {
+                    // MLME/RSNA deadlines are millisecond timers; the slow
+                    // housekeeping tick replaces 1 ms polling.
+                    let tick = Box::pin(narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(
+                        HOUSEKEEPING_NS,
+                    )));
+                    signal.wait(seen, tick).await;
+                }
+                _ => {
+                    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+                }
+            }
         }
     });
     Ok(device)

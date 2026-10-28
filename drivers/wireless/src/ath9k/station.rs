@@ -233,6 +233,9 @@ impl<P: Port, E: Environment> Radio<P, E> {
     pub(super) fn receive_open(&self) -> bool {
         self.peer().is_some() && self.security.as_ref().is_none_or(Security::port_open)
     }
+    pub(super) fn interrupt(&self) -> Option<Arc<super::irq::Signal>> {
+        self.packet.interrupt()
+    }
     pub(super) fn receive_epoch(&self) -> u64 {
         self.epoch
     }
@@ -271,6 +274,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
         }
         self.phase = Phase::Failed;
         self.packet.start()?;
+        self.packet.enable_interrupts()?;
         self.last_now = self.environment.now_ms();
         self.phase = Phase::Passive;
         Ok(())
@@ -560,7 +564,16 @@ impl<P: Port, E: Environment> Radio<P, E> {
         let result = {
             let publication = self.publication.clone();
             let _publication = publication.lock();
-            self.progress()
+            // Interrupt bottom half brackets one service pass: causes are
+            // read and IER killed first, then resumed after RX/TX work.
+            self.packet
+                .service_begin()
+                .map_err(Error::from)
+                .and_then(|_| self.progress())
+                .and_then(|frames| {
+                    self.packet.service_end()?;
+                    Ok(frames)
+                })
         };
         if result.is_err() {
             self.fail();

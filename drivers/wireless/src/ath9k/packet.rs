@@ -103,6 +103,15 @@ pub(super) trait Port {
     fn release(&self, buffers: Vec<DmaBuffer>) {
         drop(buffers);
     }
+    /// Wake source when this function's MSI vector is installed. `None`
+    /// keeps the owner on scheduled polling (no INTx route is claimed).
+    fn interrupt(&self) -> Option<alloc::sync::Arc<super::irq::Signal>> {
+        None
+    }
+    /// Open (or close) message delivery after (or before) the chip masks.
+    fn deliver(&self, _enabled: bool) -> Result<(), Error> {
+        Ok(())
+    }
 }
 struct Memory(DmaBuffer);
 impl Memory {
@@ -280,6 +289,8 @@ pub(super) struct Packet<P: Port> {
     ba: bool,
     tx_ba: bool,
     reclaimed: bool,
+    irq: Option<super::irq::Mask>,
+    full_imr: u32,
 }
 impl<P: Port> core::fmt::Debug for Packet<P> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -356,6 +367,8 @@ impl<P: Port> Packet<P> {
             ba: false,
             tx_ba: false,
             reclaimed: false,
+            irq: None,
+            full_imr: 0,
         })
     }
     pub(super) fn phase(&self) -> Phase {
@@ -959,7 +972,72 @@ impl<P: Port> Packet<P> {
         self.phase = Phase::Running;
         Ok(ReceiveStep { consumed, frame })
     }
-    /// `recv.c::ath_stoprecv`: PCU abort, RX filter clear, then
+    /// Program the Linux station interrupt mask and open MSI delivery once
+    /// the rings run. Without an installed vector the owner stays polled.
+    pub(super) fn enable_interrupts(&mut self) -> Result<bool, Error> {
+        if self.phase != Phase::Running || self.irq.is_some() {
+            return Err(Error::State);
+        }
+        if self.port.interrupt().is_none() {
+            return Ok(false);
+        }
+        self.phase = Phase::Failed;
+        let ht = self.port.ht_grant().is_some();
+        let mask = super::irq::enable(&self.port, ht, true)?;
+        self.irq = Some(mask);
+        self.full_imr = mask.imr;
+        self.port.deliver(true)?;
+        self.phase = Phase::Running;
+        Ok(true)
+    }
+    /// The wake source, only while chip interrupts are programmed.
+    pub(super) fn interrupt(&self) -> Option<alloc::sync::Arc<super::irq::Signal>> {
+        self.irq.and_then(|_| self.port.interrupt())
+    }
+    /// `ath_isr` bottom half: read/clear causes and kill IER until
+    /// [`Self::service_end`]. FATAL (HOST1 fatal/PERR or completion timeout)
+    /// closes this owner, the native counterpart of Linux's chip reset.
+    pub(super) fn service_begin(&mut self) -> Result<Option<super::irq::Events>, Error> {
+        let Some(mask) = self.irq else {
+            return Ok(None);
+        };
+        if self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        let events = super::irq::cause(&self.port, mask.imr)?;
+        super::irq::kill(&self.port, mask.msi)?;
+        let Some(events) = events else {
+            return Ok(None);
+        };
+        if events.fatal {
+            self.phase = Phase::Failed;
+            return Err(Error::Access);
+        }
+        if events.rx_eol && mask.imr & super::irq::RX_EOL_ORN != 0 {
+            // ath_isr: drop RXEOL|RXORN until the RX tasklet ran.
+            let imr = mask.imr & !super::irq::RX_EOL_ORN;
+            self.port.write(super::irq::IMR, imr)?;
+            self.irq = Some(super::irq::Mask { imr, ..mask });
+        }
+        Ok(Some(events))
+    }
+    /// `ath9k_tasklet` tail: restore RXEOL|RXORN once RX was serviced, then
+    /// `ath9k_hw_resume_interrupts`.
+    pub(super) fn service_end(&mut self) -> Result<(), Error> {
+        let Some(mut mask) = self.irq else {
+            return Ok(());
+        };
+        if self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        if mask.imr != self.full_imr {
+            self.port.write(super::irq::IMR, self.full_imr)?;
+            mask.imr = self.full_imr;
+            self.irq = Some(mask);
+        }
+        super::irq::resume(&self.port, mask)
+    }
+
     /// `mac.c::ath9k_hw_stopdmarecv` (AR_CR_RXD and an RXE poll).
     fn stop_receive(&self) -> Result<(), Error> {
         let diag = self.port.read(DIAG)?;
@@ -1052,7 +1130,13 @@ impl<P: Port> Packet<P> {
         self.phase = Phase::Stopped;
         let rx = self.stop_receive();
         let tx = self.abort_transmit();
-        let irq = self.port.write(0x24, 0);
+        let irq = super::irq::kill(&self.port, self.irq.is_some_and(|m| m.msi)).and(
+            if self.irq.take().is_some() {
+                self.port.deliver(false)
+            } else {
+                Ok(())
+            },
+        );
         let master = self.port.master(false);
         rx.and(tx).and(irq).and(master)?;
         if !self.quiescent()? {

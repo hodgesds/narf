@@ -18,6 +18,26 @@ pub(super) struct Native {
     ht_facts: Option<super::ht::Facts>,
     ba: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::rx_ba::Grant>>>,
     tx_ba: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::tx_ba::Grant>>>,
+    msi: narf_lib::sync::IrqSafeSpinLock<Option<Msi>>,
+}
+/// Single MSI vector (Linux `ath9k_use_msi` + `pci_enable_msi`). The handler
+/// only raises the retained signal; the BAR is serviced by the station task.
+struct Msi {
+    config: narf_bus::msi::MsiConfig,
+    vector: u8,
+    signal: alloc::sync::Arc<super::irq::Signal>,
+}
+static SIGNAL: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::irq::Signal>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+fn vector_irq(_cookie: u64) -> narf_interrupts::IrqStatus {
+    let signal = { SIGNAL.lock().clone() };
+    match signal {
+        Some(signal) => {
+            signal.raise();
+            narf_interrupts::IrqStatus::Handled
+        }
+        None => narf_interrupts::IrqStatus::None,
+    }
 }
 impl Native {
     /// # Safety
@@ -59,8 +79,76 @@ impl Native {
             ht_facts: None,
             ba: narf_lib::sync::IrqSafeSpinLock::new(None),
             tx_ba: narf_lib::sync::IrqSafeSpinLock::new(None),
+            msi: narf_lib::sync::IrqSafeSpinLock::new(None),
         })
     }
+    /// Discover, program and install one MSI vector while delivery stays
+    /// disabled. Any failure leaves the owner on scheduled polling; a vector
+    /// whose source cannot be proven disabled stays quarantined.
+    pub(super) fn arm_msi(&self) -> bool {
+        if self.msi.lock().is_some() || SIGNAL.lock().is_some() {
+            return false;
+        }
+        let Ok(Ok(mut config)) =
+            self.invoke_cfg(|| narf_bus::msi::enable_msi(&self.cap, &self.device, 1))
+        else {
+            return false;
+        };
+        let Ok(vector) = narf_interrupts::vector::alloc() else {
+            return false;
+        };
+        // SAFETY: this sole retained function owns its cfg space; delivery
+        // is disabled again below before any chip interrupt is unmasked.
+        let programmed =
+            self.invoke_cfg(|| unsafe { narf_bus::msi::program_msi(&mut config, 0, vector) });
+        if !matches!(programmed, Ok(Ok(_))) {
+            let _ = narf_interrupts::vector::free(vector);
+            return false;
+        }
+        let signal = super::irq::Signal::new();
+        *SIGNAL.lock() = Some(signal.clone());
+        narf_interrupts::install_handler_named(vector, "ath9k", 0, vector_irq);
+        let msi = Msi {
+            config,
+            vector,
+            signal,
+        };
+        // SAFETY: same owned cfg space; MSI Enable stays clear until start.
+        if !matches!(
+            self.invoke_cfg(|| unsafe { narf_bus::msi::disable(&msi.config) }),
+            Ok(Ok(()))
+        ) {
+            quarantine(&msi);
+            return false;
+        }
+        *self.msi.lock() = Some(msi);
+        true
+    }
+    fn invoke_cfg<T>(&self, operation: impl FnOnce() -> T) -> Result<T, Error> {
+        identity::invoke(&self.cap, operation).map_err(|_| Error::Access)
+    }
+}
+fn quarantine(msi: &Msi) {
+    narf_interrupts::disable_irq(msi.vector);
+    narf_interrupts::dispatch::clear_all_wakers(msi.vector);
+    narf_interrupts::synchronize_irq(msi.vector);
+}
+/// Disabled delivery: drain the handler and return the vector.
+fn teardown(msi: Msi) {
+    narf_interrupts::disable_irq(msi.vector);
+    let _ = narf_interrupts::remove_handler(msi.vector, "ath9k", 0);
+    narf_interrupts::dispatch::clear_all_wakers(msi.vector);
+    narf_interrupts::synchronize_irq(msi.vector);
+    let _ = narf_interrupts::vector::free(msi.vector);
+    let mut signal = SIGNAL.lock();
+    if signal
+        .as_ref()
+        .is_some_and(|s| alloc::sync::Arc::ptr_eq(s, &msi.signal))
+    {
+        *signal = None;
+    }
+}
+impl Native {
     pub(super) fn qualify_ht(&mut self, facts: super::ht::Facts) {
         let grant = super::ht::Source::Registered.load(facts.clone()).ok();
         *self.ht.lock() = grant;
@@ -323,5 +411,34 @@ impl Port for Native {
     }
     fn now_us(&self) -> u64 {
         narf_time::monotonic_ns() / 1000
+    }
+    fn interrupt(&self) -> Option<alloc::sync::Arc<super::irq::Signal>> {
+        self.msi.lock().as_ref().map(|m| m.signal.clone())
+    }
+    fn deliver(&self, enabled: bool) -> Result<(), Error> {
+        let mut retained = self.msi.lock();
+        let Some(msi) = retained.as_ref() else {
+            return Err(Error::State);
+        };
+        if enabled {
+            narf_interrupts::enable_irq(msi.vector);
+            // SAFETY: sole owner of this function's MSI capability.
+            return match self.invoke_cfg(|| unsafe { narf_bus::msi::enable(&msi.config) }) {
+                Ok(Ok(())) => Ok(()),
+                _ => Err(Error::Access),
+            };
+        }
+        // SAFETY: as above; a failed disable keeps the vector quarantined.
+        let disabled = self.invoke_cfg(|| unsafe { narf_bus::msi::disable(&msi.config) });
+        let msi = retained.take().ok_or(Error::State)?;
+        drop(retained);
+        if matches!(disabled, Ok(Ok(()))) {
+            teardown(msi);
+            Ok(())
+        } else {
+            quarantine(&msi);
+            core::mem::forget(msi);
+            Err(Error::Access)
+        }
     }
 }

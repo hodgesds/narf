@@ -15,6 +15,7 @@ mod ht;
 mod identity;
 mod initvals;
 mod interface;
+mod irq;
 mod mac;
 mod packet;
 mod packet_native;
@@ -244,6 +245,8 @@ async fn prepare_packets(owner: &Retained) -> Result<RetainedRadio, packet::Erro
         native.qualify_ht(facts);
     }
     mac::prepare(&native, &controller.calibration, controller.identity.mac)?;
+    // Optional MSI (Linux `ath9k_use_msi`); without it the owner stays polled.
+    let _ = native.arm_msi();
     // SAFETY: factory calibration and complete parked MAC/key-cache/queue
     // preparation succeeded on this same non-cloneable native adapter. Probe
     // never published packet DMA; prepare allocates but does not start DMA.

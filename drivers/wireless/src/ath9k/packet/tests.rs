@@ -85,6 +85,9 @@ pub(in crate::ath9k) struct Model {
     /// Allocations the owner released after its quiescence proof. The
     /// model keeps them alive; any later device access is an error.
     pub(in crate::ath9k) released: RefCell<Vec<DmaBuffer>>,
+    /// Installed MSI wake source and the delivery transitions requested.
+    pub(in crate::ath9k) signal: RefCell<Option<Arc<crate::ath9k::irq::Signal>>>,
+    pub(in crate::ath9k) delivered: RefCell<Vec<bool>>,
 }
 pub(in crate::ath9k) type Reaction =
     dyn Fn(&[u8]) -> Result<(Vec<Vec<u8>>, bool), Error> + Send + Sync;
@@ -133,6 +136,8 @@ impl Model {
             stuck_tx: Cell::new(false),
             stuck_rx: Cell::new(false),
             released: RefCell::new(Vec::new()),
+            signal: RefCell::new(None),
+            delivered: RefCell::new(Vec::new()),
         })
     }
     fn access(&self) -> Result<(), Error> {
@@ -492,6 +497,14 @@ impl Port for Arc<Model> {
     fn release(&self, buffers: Vec<DmaBuffer>) {
         self.released.borrow_mut().extend(buffers);
     }
+    fn interrupt(&self) -> Option<Arc<crate::ath9k::irq::Signal>> {
+        self.signal.borrow().clone()
+    }
+    fn deliver(&self, enabled: bool) -> Result<(), Error> {
+        self.as_ref().access()?;
+        self.delivered.borrow_mut().push(enabled);
+        Ok(())
+    }
     fn allocate(&self, bytes: usize) -> Result<DmaBuffer, Error> {
         self.as_ref().access()?;
         let memory = narf_io::alloc_coherent_masked(
@@ -838,4 +851,137 @@ kernel_test_in!(
 kernel_test_in!(
     "drivers/wireless/ath9k/packet",
     smoke_ar9285_packet_every_native_access_and_address_readback_failure
+);
+
+fn check_interrupt_service() -> Result<(), &'static str> {
+    use core::future::Future as _;
+    use crate::ath9k::irq;
+    // No vector: the owner stays polled and service is a no-op.
+    let model = Model::new();
+    let mut packet = owner(model.clone()).map_err(|_| "prepare polled")?;
+    if packet.enable_interrupts() != Err(Error::State) {
+        return Err("interrupts enabled before rings ran");
+    }
+    packet.start().map_err(|_| "start polled")?;
+    if packet.enable_interrupts() != Ok(false)
+        || packet.interrupt().is_some()
+        || packet.service_begin() != Ok(None)
+        || model
+            .registers
+            .borrow()
+            .get(&irq::IER)
+            .copied()
+            .unwrap_or(0)
+            != 0
+    {
+        return Err("polled owner programmed interrupts");
+    }
+    let model = Model::new();
+    let signal = irq::Signal::new();
+    *model.signal.borrow_mut() = Some(signal.clone());
+    let mut packet = owner(model.clone()).map_err(|_| "prepare irq")?;
+    packet.start().map_err(|_| "start irq")?;
+    if packet.enable_interrupts() != Ok(true) || packet.interrupt().is_none() {
+        return Err("MSI owner did not enable interrupts");
+    }
+    let reg = |r: u64| model.registers.borrow().get(&r).copied().unwrap_or(0);
+    if reg(irq::IER) != 1
+        || reg(irq::IMR) != irq::imr(false)
+        || irq::imr(false) != 0x9100_04b0
+        || reg(0xa4) != 1 << 16
+        || reg(0xa8) != 1 << 16
+        || reg(0x2c) != (700 << 16) | 250
+        || reg(0x5c) != 6
+        || reg(0x403c) != 2
+        || reg(0x4034) != irq::SYNC_DEFAULT
+        || reg(0x40d4) != 7
+        || reg(0x4094) & 1 == 0
+        || *model.delivered.borrow() != [true]
+    {
+        return Err("interrupt programming differs from Linux station mask");
+    }
+    // Spurious vector: nothing pending, IER is still killed then resumed.
+    if packet.service_begin() != Ok(None) || reg(irq::IER) != 0 {
+        return Err("spurious vector");
+    }
+    packet.service_end().map_err(|_| "resume")?;
+    if reg(irq::IER) != 1 {
+        return Err("IER not resumed");
+    }
+    // RX mitigation + TX descriptor completion on QCU0, plus RXEOL.
+    {
+        let mut r = model.registers.borrow_mut();
+        r.insert(0x4038, 2);
+        r.insert(0x7044, 2);
+        r.insert(0x80, 0x8000_0000);
+        r.insert(0xc0, 0x8000_0000 | 0x80 | 0x10);
+        r.insert(0xc4, 1 << 16);
+    }
+    let events = packet
+        .service_begin()
+        .map_err(|_| "service")?
+        .ok_or("pending causes lost")?;
+    if !events.rx || !events.tx || events.txqs != 1 || !events.rx_eol || events.fatal {
+        return Err("cause decode differs from ar9002_hw_get_isr");
+    }
+    if reg(irq::IER) != 0 || reg(irq::IMR) & irq::RX_EOL_ORN != 0 {
+        return Err("RXEOL did not drop RXEOL|RXORN with IER killed");
+    }
+    packet.service_end().map_err(|_| "resume eol")?;
+    if reg(irq::IER) != 1 || reg(irq::IMR) != irq::imr(false) {
+        return Err("RXEOL|RXORN not restored after service");
+    }
+    // Completion timeout pulses AR_RC_HOSTIF and is fatal for the owner.
+    {
+        let mut r = model.registers.borrow_mut();
+        r.insert(0x4038, 0);
+        r.insert(0x4028, 0x1000);
+    }
+    if packet.service_begin() != Err(Error::Access)
+        || packet.phase() != Phase::Failed
+        || reg(0x4000) != 0
+        || reg(0x4028) != 0x1000
+    {
+        return Err("fatal sync cause did not close the owner");
+    }
+    packet.stop().map_err(|_| "stop irq")?;
+    if *model.delivered.borrow() != [true, false]
+        || packet.interrupt().is_some()
+        || reg(0x403c) != 0
+        || reg(0x402c) != 0
+        || reg(0x40d4) != 0
+    {
+        return Err("stop left interrupt delivery open");
+    }
+    check_reclaimed(&model, &packet)?;
+    // Wake future: a raise between snapshot and wait completes it at once;
+    // otherwise the housekeeping fallback ends it without an interrupt.
+    let waker = core::task::Waker::noop();
+    let mut cx = core::task::Context::from_waker(waker);
+    let seen = signal.count();
+    signal.raise();
+    let mut wait = signal.wait(seen, core::future::pending::<()>());
+    if core::pin::Pin::new(&mut wait).poll(&mut cx) != core::task::Poll::Ready(true) {
+        return Err("raised signal not observed");
+    }
+    let seen = signal.count();
+    let mut wait = signal.wait(seen, core::future::pending::<()>());
+    if core::pin::Pin::new(&mut wait).poll(&mut cx).is_ready() {
+        return Err("idle signal completed");
+    }
+    let mut wait = signal.wait(seen, core::future::ready(()));
+    if core::pin::Pin::new(&mut wait).poll(&mut cx) != core::task::Poll::Ready(false) {
+        return Err("fallback did not end wait");
+    }
+    Ok(())
+}
+fn smoke_ar9285_packet_msi_cause_kill_resume_and_fatal() -> TestResult {
+    match check_interrupt_service() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/packet",
+    smoke_ar9285_packet_msi_cause_kill_resume_and_fatal
 );

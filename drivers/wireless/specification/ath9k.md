@@ -597,8 +597,33 @@ device, authenticated deployment policy and measured RF/calibration acceptance.
 No RF or AP interoperability has been demonstrated by the model tests.
 
 Broader live channels/retuning, factory profiles, periodic calibration,
-interrupt-driven operation, HT40/SGI40, larger TX aggregates, TX A-MSDU and
-additional AC/TID scheduling require separate continuations.
+HT40/SGI40, larger TX aggregates, TX A-MSDU and additional AC/TID scheduling
+require separate continuations.
+
+Interrupt-driven service (`irq.rs`) follows Linux `pci.c` with
+`ath9k_use_msi`: one MSI vector is discovered, programmed and installed with
+delivery disabled after MAC preparation (`Native::arm_msi`); failure leaves
+the owner on 1 ms scheduled polling, since no INTx route is claimed. After the
+rings start, `Packet::enable_interrupts` writes the
+`hw.c::ath9k_hw_init_interrupt_masks` + `mac.c::ath9k_hw_set_interrupts`
+station mask for imask TX|RX|RXEOL|RXORN|FATAL|GLOBAL (CST on HT silicon):
+IMR `0x910004b0` (RX mitigation RXINTM/RXMINTR with RIMT 700/250 us, TXDESC
+and TXEOL for QCU0 via IMR_S0/S1, GENTMR because AR9285 lacks AUTOSLEEP),
+SYNC_DEFAULT, AR_INTCFG MSI RX-mitigation routing, then
+`__ath9k_hw_enable_interrupts` (IER, async MAC_IRQ, sync default, MSI priority
+mask and the 200-try AR_PCIE_MSI re-arm). The vector handler only counts and
+wakes; the station task brackets each service pass with
+`ar9002_mac.c::ar9002_hw_get_isr` (RAC read-clear of ISR/S0_S/S1_S/S5_S, sync
+cause clear, AR_RC_HOSTIF pulse on completion timeout) plus
+`ath9k_hw_kill_interrupts`, and resumes afterwards as `ath9k_tasklet` does.
+RXEOL drops RXEOL|RXORN from IMR until the RX pass completes. FATAL (HOST1
+fatal/PERR, completion timeout) fails and terminally stops the owner. The
+worker sleeps until the vector, a stack TX enqueue or a 20 ms housekeeping
+tick for millisecond MLME/RSNA deadlines. Stop kills IER/async/sync/MSI
+priority enables and disables MSI before the vector is drained and freed; a
+failed MSI disable quarantines the vector. Covered by
+`smoke_ar9285_packet_msi_cause_kill_resume_and_fatal`. Physical MSI delivery
+on AR9285 is unmeasured.
 
 Power transitions are enumerated from Linux `hw.h::ath9k_power_mode`
 (`AWAKE`, `FULL_SLEEP`, `NETWORK_SLEEP`) and their callers. The current owner
