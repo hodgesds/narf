@@ -59,7 +59,6 @@ brcmfmac	confirmed_stop_quiescence	Confirmed transport/device stop and quiescenc
 brcmfmac	gtk_rekey_offload	GTK rekey offload (gtk_key_info; needs host-supplicant KCK/KEK + WOWL_GTK)	feature	drivers/wireless/specification/cyw43439.md	501
 brcmfmac	host_bus_runtime_pm	Host-bus runtime power management	feature	drivers/wireless/specification/cyw43439.md	272
 brcmfmac	iommu_quiescence	IOMMU-backed device quiescence	feature	drivers/wireless/specification/brcmfmac.md	565
-brcmfmac	larger_flow_budget	Larger native flow budgets	feature	drivers/wireless/specification/brcmfmac.md	564
 brcmfmac	monitor_mode	Monitor mode (incl. native 802.11 msgbuf RX with radiotap/HW RX-header metadata)	feature	drivers/wireless/specification/brcmfmac.md	563
 brcmfmac	nonzero_descriptor_prefix	Nonzero native descriptor-prefix geometry	feature	drivers/wireless/specification/brcmfmac.md	561
 brcmfmac	p2p_mode	P2P mode	feature	drivers/wireless/specification/cyw43439.md	499

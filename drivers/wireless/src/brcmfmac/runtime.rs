@@ -113,7 +113,10 @@ struct Resources<M: Memory> {
 const RX_BYTES: usize = 2048;
 const RX_POOL: usize = 32;
 const TX_PENDING: usize = 64;
-const FLOW_LIMIT: usize = 8;
+/// Linux v7.2 `msgbuf.c::brcmf_proto_msgbuf_attach` caps the firmware
+/// `max_flowrings` (`pcie.c::brcmf_pcie_init_ringbuffers`) at
+/// `BRCMF_FLOWRING_HASHSIZE - 1`; flow rings are allocated on create.
+const FLOW_LIMIT: usize = 511;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FlowState {
     Creating,

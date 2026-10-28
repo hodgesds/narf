@@ -410,3 +410,76 @@ kernel_test_in!(
     "drivers/wireless/brcmfmac",
     smoke_brcmf_system_suspend_timeout_unwinds_usable
 );
+
+/// Flow budget follows firmware `max_flowrings` (Linux
+/// `brcmf_pcie_init_ringbuffers`), capped at `BRCMF_FLOWRING_HASHSIZE - 1`.
+fn smoke_brcmf_flow_budget_follows_firmware_max_flowrings() -> TestResult {
+    let (bus, s) = model();
+    {
+        let mut st = s.lock();
+        put(&mut st, INFO + 52, &12u16.to_le_bytes());
+        put(&mut st, INFO + 54, &14u16.to_le_bytes());
+    }
+    let mut owner = match runtime::Runtime::attach(booted(bus)) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("12-flowring firmware rejected"),
+    };
+    if owner.enable_data().is_err() {
+        return TestResult::Fail("RX posting failed");
+    }
+    let source = [2, 0, 0, 0, 0, 0x10];
+    let mut tokens = Vec::new();
+    for i in 0..12u8 {
+        match owner.open_flow(source, [2, 0, 0, 0, 1, i], i % 8) {
+            Ok(token) => tokens.push(token),
+            Err(_) => return TestResult::Fail("flow within firmware max_flowrings refused"),
+        }
+    }
+    let ids: BTreeSet<u16> = {
+        let st = s.lock();
+        let ctrl = pointer(&st, RINGS + 8);
+        let ring = st.dma.get(&ctrl).unwrap();
+        // Create requests follow the 16 control-buffer posts and RX posts
+        // went to ring 1; read every create's flow ring id.
+        ring.chunks(40)
+            .filter(|e| e[0] == 3)
+            .map(|e| u16::from_le_bytes([e[22], e[23]]))
+            .collect()
+    };
+    if ids != (2..14).collect::<BTreeSet<u16>>()
+        || tokens
+            .iter()
+            .any(|&t| owner.flow_state(t) != Ok(runtime::FlowState::Creating))
+    {
+        return TestResult::Fail("flow ring ids beyond the old fixed budget differ");
+    }
+    if owner.open_flow(source, [2, 0, 0, 0, 2, 0], 0) != Err(runtime::Error::Exhausted)
+        || owner.is_failed()
+    {
+        return TestResult::Fail("flow beyond firmware max_flowrings admitted or fatal");
+    }
+    drop(owner);
+    if s.lock().dropped != 0 {
+        return TestResult::Fail("flow-budget teardown freed published DMA");
+    }
+    // Firmware reporting fewer rings still bounds the budget.
+    let (bus, _s) = model();
+    let mut owner = match runtime::Runtime::attach(booted(bus)) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("2-flowring firmware rejected"),
+    };
+    let _ = owner.enable_data();
+    for i in 0..2u8 {
+        if owner.open_flow(source, [2, 0, 0, 0, 3, i], 0).is_err() {
+            return TestResult::Fail("flow within small firmware budget refused");
+        }
+    }
+    if owner.open_flow(source, [2, 0, 0, 0, 3, 9], 0) != Err(runtime::Error::Exhausted) {
+        return TestResult::Fail("small firmware flow budget exceeded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmf_flow_budget_follows_firmware_max_flowrings
+);

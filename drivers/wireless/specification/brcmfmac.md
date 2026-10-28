@@ -584,6 +584,21 @@ release, BME, H2D gating, every mapping freed),
 again, nothing freed) and `smoke_brcmf_late_dma_or_halt_fails_stop_proof`
 (post-clear index change and FWHALT keep memory retained).
 
+### Flow-ring budget
+
+The host flow budget follows the firmware ring info: `max_flowrings`
+(shared >= 6) or `max_submissionrings - 2` (shared 5), validated <= 512
+by `Runtime::attach` exactly as Linux v7.2 `pcie.c::brcmf_pcie_init_ringbuffers`,
+then capped at `BRCMF_FLOWRING_HASHSIZE - 1` (511) as
+`msgbuf.c::brcmf_proto_msgbuf_attach` does. Flow ring ids are
+`index + BRCMF_H2D_MSGRING_FLOWRING_IDSTART` (2) with TCM index slots
+`h2d_{w,r}_idx_ptr + id * 4`, and each 512 x 48-byte ring is allocated on
+create and recycled only after a delete completion. The former fixed host
+cap of eight flows is gone. Smoke:
+`smoke_brcmf_flow_budget_follows_firmware_max_flowrings` (12 firmware
+rings open ids 2..13 and refuse a 13th without failing the owner; a
+2-ring firmware still bounds at 2).
+
 ### System suspend (D3_INFORM) and hot resume (D0_INFORM)
 
 `brcmfmac::register` installs an `AsyncSystemPm` hook ("brcmfmac") — the
@@ -696,7 +711,7 @@ different FIFO is a protocol error. Smoke: `drivers/wireless/brcmfmac/wmm`.
 Additional software outside that retained profile remains: nonzero descriptor
 prefixes, other CPU/RAM/chip/OTP selectors (including 160 MHz-capable
 chips), HE/EHT profiles, monitor mode (which owns native802.11 RX and its
-metadata), larger flow budgets, AP, replayed
+metadata), AP, replayed
 recovery/system PM, IOMMU-backed quiescence.
 These do not expand the initial retained-failure acceptance claim.
 WPA3-SAE offload (WCC `WSEC_PMK` passphrase ABI), the PMKSA cache, firmware
