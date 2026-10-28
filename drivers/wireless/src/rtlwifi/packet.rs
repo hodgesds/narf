@@ -452,7 +452,67 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         };
         let mac = super::super::station_control::disconnected(&self.io);
         let stopped = self.stop_packets();
+        if stopped.is_ok() {
+            // A missing idle proof keeps every mapping retained; it never
+            // turns a completed disconnect into a failure.
+            let _ = self.quiesce().await;
+        }
         report.and(mac).and(stopped)
+    }
+    /// True once `quiesce` proved the stopped rings idle; Drop then
+    /// releases every DMA allocation instead of retaining it.
+    pub(crate) fn reclaimable(&self) -> bool {
+        self.phase == Phase::Stopped && !self.published
+    }
+    /// Card-disable DMA quiescence proof for a stopped owner (Linux
+    /// `rtl88ee_card_disable` → `_rtl88ee_poweroff_adapter` and
+    /// `RTL8188EE_TRANS_ACT_TO_LPS`): with TX paused (REG_TXPAUSE 0x522 =
+    /// 0xff), host TX DMA stopped (REG_PCIE_CTRL_REG+1 0x301 = 0xff) and
+    /// bus mastering cleared by `stop_packets`, poll 0x5f8..0x5fb (TX packet
+    /// buffer empty: "should be zero if no packet is transmitting", pwrseq
+    /// polling, 5000 x 10 us) and REG_RXDMA_CONTROL 0x286 BIT(1) RXDMA_IDLE
+    /// (100 x 10 us). Linux continues after an RXDMA timeout; here a
+    /// timeout leaves every mapping retained. Success is the retirement
+    /// proof that allows the published rings and buffers to be unmapped.
+    pub(crate) async fn quiesce(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Stopped || !self.published {
+            return Err(Error::State);
+        }
+        if self.io.read8(0x522)? != 0xff || self.io.read8(0x301)? != 0xff {
+            return Err(Error::Readback);
+        }
+        let mut empty = false;
+        for _ in 0..5000 {
+            let mut busy = false;
+            for reg in 0x5f8..=0x5fb {
+                let value = self.io.read8(reg)?;
+                if value == 0xff && reg == 0x5f8 && self.io.read32(0x5f8)? == u32::MAX {
+                    return Err(Error::Access(super::AccessError::Gone));
+                }
+                busy |= value != 0;
+            }
+            if !busy {
+                empty = true;
+                break;
+            }
+            self.io.delay_us(10).await;
+        }
+        if !empty {
+            return Err(Error::PacketTimeout);
+        }
+        let mut idle = false;
+        for _ in 0..100 {
+            if self.io.read8(0x286)? & 2 != 0 {
+                idle = true;
+                break;
+            }
+            self.io.delay_us(10).await;
+        }
+        if !idle {
+            return Err(Error::PacketTimeout);
+        }
+        self.published = false;
+        Ok(())
     }
     /// Open the already owned native rings. The one-shot operational MAC,
     /// factory IQ/LC calibration and opaque channel/power grant are required.

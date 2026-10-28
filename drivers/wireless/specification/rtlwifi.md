@@ -138,7 +138,8 @@ Prepared, RadioConfigured, ChannelConfigured, MacConfigured or terminal Failed
 state; the packet core additionally has Running/Stopping/Stopped phases.
 None covers unallocated state (including allocation
 failure) or initialization holding the async guard. Cancellation installs Failed before awaiting LLT. Published mappings
-are retained on every error/Drop until a future reset/quiescence proof; no
+are retained on every error/Drop until the card-disable quiescence proof
+(`Prepared::quiesce`, below) succeeds; no
 firmware/reset helper may reconstruct a second packet owner.
 
 `initialize_registered` now composes authenticated firmware boot with that
@@ -273,7 +274,8 @@ independent IRQ/TX-pause/CR/PCIe-DMA/BME gates and verifies the accessible
 readbacks. Success commits terminal `Stopped`, with no reuse/restart. Every
 published ring/RX buffer and pending payload remains retained on stop, failure,
 cancellation and Drop: parked BME is not claimed as a prefetch-quiescence or
-reclamation proof. The next station facade must invoke this terminal stop on
+reclamation proof; only a later successful `Prepared::quiesce` (TX buffer
+empty and RXDMA idle) releases them. The next station facade must invoke this terminal stop on
 all association/disconnect/error paths; transport readiness alone raises no
 carrier or controlled port.
 
@@ -765,6 +767,29 @@ dozing, disconnect wake ordering, stuck mailbox and radio-off failure) and
 (five-period gate, fwlps off, held DHCP wake, busy-RX leave, re-entry and
 disconnect wake on the composed Device).
 
+### RTL8188EE card-disable DMA quiescence (implemented)
+
+Parked BME alone is not a prefetch fence, so a stopped owner still retains
+every published ring and buffer. `Prepared::quiesce` adds the Linux
+card-disable idle proof (`rtl88ee_card_disable` →
+`_rtl88ee_poweroff_adapter`, `RTL8188EE_TRANS_ACT_TO_LPS`): on a Stopped
+owner, with REG_TXPAUSE (0x522) and REG_PCIE_CTRL_REG+1 (0x301) read back
+as 0xff and bus mastering already cleared by `stop_packets`, it polls the
+TX packet-buffer status bytes 0x5f8..0x5fb for zero ("should be zero if no
+packet is transmitting", pwrseq polling bound 5000 x 10 us) and
+REG_RXDMA_CONTROL (0x286) BIT(1) RXDMA_IDLE (100 x 10 us). Linux proceeds
+after an RXDMA timeout; here any timeout, readback mismatch or all-ones
+read leaves every mapping retained. Success is the retirement proof: the
+owner becomes reclaimable and its Drop releases the rings, RX buffers,
+pending TX payload and reserved-page body instead of leaking them.
+`disconnect_station_peer` runs the proof after a successful stop; a failed
+proof never turns a completed disconnect into an error. A quiesced owner
+never restarts.
+
+Test: `smoke_rtl8188ee_native_card_disable_quiescence_reclaims_dma`
+(non-stopped refusal, busy TX buffer, busy RXDMA, reopened DMA gate,
+successful proof releases every region, unproven stop retains all).
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE
@@ -795,7 +820,7 @@ implemented and software-validated. Physical board qualification remains.
 | Correct BAR2/read-only EFUSE lifecycle and per-chip identity | Implemented; shared-path regressions |
 | Complete source-matched per-chip power/reset qualification | RTL8188EE PCI enable prefix/flow implemented; other families remain incomplete |
 | Authenticated image/header selection and runtime firmware loading | RTL8188EE retained probe owner implemented; other profiles missing |
-| DMA allocation/publication/quiesce, IRQ ownership, H2C/C2H | RTL8188EE retained DMA32 rings/LLT, one-shot polled service, terminal host delivery, demonstrated awake/keepalive/reserved-page/JOIN mailbox and terminal close/retention implemented. MSI interrupt delivery with W1C recognition (polling fallback) is implemented; reclamation/reset/recovery remain |
+| DMA allocation/publication/quiesce, IRQ ownership, H2C/C2H | RTL8188EE retained DMA32 rings/LLT, one-shot polled service, terminal host delivery, demonstrated awake/keepalive/reserved-page/JOIN mailbox and terminal close/retention implemented. MSI interrupt delivery with W1C recognition (polling fallback) and the card-disable DMA quiescence proof are implemented; reset/recovery remain |
 | RF/BB tables, calibration, channel/power and rate control | RTL8188EE tables/retained1T IQK/LCK, static factory antenna, signed board/factory/regulatory legacy20 power, operational MAC and negotiated legacy peer/rate/filter integration implemented. Measured board envelope and silicon qualification remain; optional gain tracking is excluded by measured profile |
 | Scan, management RX/TX, authentication/association and WPA2 | Retained EE channel1 passive scan, Open MLME, shared WPA2/CCMP and exact M4 receipt implemented; Device/composition regressions pass native suites. Other matched chips remain missing |
 | Ethernet packet path and terminal TX completion ownership | EE same-owner native Device/Narf-Ring/stack and Open/WPA2 real-kernel DHCP/exact bidirectional IP fixtures pass software gates; actual board testing remains |
@@ -805,7 +830,7 @@ Per-chip remaining inventory uses Linux per-chip `sw.c` and radio/PCI ops:
 
 | Chip | Source hardware scope | Remaining native software |
 |---|---|---|
-| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, recipient BA/RX reorder, originator BA/TX A-MPDU and capture/publication epochs above. Remaining software: SGI20, HT40, adaptive rates, broader scan/channels, gain tracking, IPS and reset/rejoin (MSI delivery and fwlps leisure power save are implemented). Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
+| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, recipient BA/RX reorder, originator BA/TX A-MPDU and capture/publication epochs above. Remaining software: SGI20, HT40, adaptive rates, broader scan/channels, gain tracking, IPS and reset/rejoin (MSI delivery, fwlps leisure power save and DMA quiescence are implemented). Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
 | RTL8192CE family aliases / RTL8192EE |2.4GHz HT; CE aliases need exact RF-type qualification, including the8176/8188CE variant; EE is2T2R |Retained chip firmware/MAC/PHY/RF/calibration/power/packet/station chain, then full HT/QoS/lifecycle. The8179/8188EE HT path does not admit these IDs. |
 | RTL8192DE |Dual-band dual-MAC HT |Exact per-function reset/power/firmware/DMA/radio ownership and station chains, then bands/HT/QoS/lifecycle |
 | RTL8723AE/BE |2.4GHz1T1R HT with BT |Chip-specific retained chain, antenna/BT coexistence and HT/QoS/lifecycle |

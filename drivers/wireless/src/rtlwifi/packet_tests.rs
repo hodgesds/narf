@@ -1075,3 +1075,61 @@ kernel_test_in!(
 
 #[path = "packet_station_tests.rs"]
 pub(crate) mod station_tests;
+
+/// `_rtl88ee_poweroff_adapter` idle proof: only a stopped owner whose TX
+/// packet buffer is empty and whose RXDMA reports idle may unmap its rings.
+pub(crate) fn smoke_rtl8188ee_native_card_disable_quiescence_reclaims_dma() -> TestResult {
+    let (mut owner, port) = self::owner();
+    if run(owner.quiesce()) != Err(Error::State) {
+        return TestResult::Fail("EE quiesced a never-started owner");
+    }
+    owner.start_packets().unwrap();
+    if run(owner.quiesce()) != Err(Error::State) {
+        return TestResult::Fail("EE quiesced a running owner");
+    }
+    port.model.lock().complete = false;
+    owner.submit(&frame(true), 0).unwrap();
+    owner.stop_packets().unwrap();
+    // A packet still in the TX buffer keeps every mapping.
+    port.radio.hardware_byte(0x286, 2);
+    port.radio.hardware_byte(0x5f9, 1);
+    if run(owner.quiesce()) != Err(Error::PacketTimeout) || owner.reclaimable() {
+        return TestResult::Fail("EE busy TX packet buffer was accepted as idle");
+    }
+    // RXDMA not idle keeps every mapping.
+    port.radio.hardware_byte(0x5f9, 0);
+    port.radio.hardware_byte(0x286, 0);
+    if run(owner.quiesce()) != Err(Error::PacketTimeout) || owner.reclaimable() {
+        return TestResult::Fail("EE busy RXDMA was accepted as idle");
+    }
+    // A reopened host DMA gate is not a stopped owner.
+    port.radio.hardware_byte(0x286, 2);
+    port.radio.hardware_byte(0x301, 0);
+    if run(owner.quiesce()) != Err(Error::Readback) {
+        return TestResult::Fail("EE quiesced with host TX DMA open");
+    }
+    port.radio.hardware_byte(0x301, 0xff);
+    if run(owner.quiesce()).is_err() || !owner.reclaimable() {
+        return TestResult::Fail("EE idle stopped owner was not proven quiescent");
+    }
+    if run(owner.quiesce()) != Err(Error::State) || owner.start_packets() != Err(Error::State) {
+        return TestResult::Fail("EE quiesced owner reopened");
+    }
+    drop(owner);
+    if !port.live_regions().is_empty() {
+        return TestResult::Fail("EE proven-idle owner retained DMA mappings");
+    }
+    // Teardown without proof still retains everything.
+    let (mut owner, port) = self::owner();
+    owner.start_packets().unwrap();
+    owner.stop_packets().unwrap();
+    drop(owner);
+    if port.live_regions().is_empty() || port.drops.load(Ordering::SeqCst) != 0 {
+        return TestResult::Fail("EE unproven stop released DMA mappings");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/packet",
+    smoke_rtl8188ee_native_card_disable_quiescence_reclaims_dma
+);
