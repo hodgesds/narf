@@ -19,7 +19,6 @@ ath10k	p2p	P2P role	feature	drivers/wireless/specification/ath10k.md	947
 ath10k	pfc	PFC fetch and queue protocol ownership	feature	drivers/wireless/specification/ath10k.md	944
 ath10k	pmf	PMF	feature	drivers/wireless/specification/ath10k.md	946
 ath10k	stable_interface_recovery	Stable-interface recovery	feature	drivers/wireless/specification/ath10k.md	950
-ath10k	system_suspend	System suspend	feature	drivers/wireless/specification/ath10k.md	947
 ath10k	tspec	TSPEC	feature	drivers/wireless/specification/ath10k.md	945
 ath10k	tx_ba	Native TX Block Ack	feature	drivers/wireless/specification/ath10k.md	944
 ath10k	tx_pipeline	Independent multi-packet native TX pipeline	feature	drivers/wireless/specification/ath10k.md	944

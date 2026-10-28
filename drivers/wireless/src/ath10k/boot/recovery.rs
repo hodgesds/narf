@@ -10,6 +10,8 @@ pub(in crate::ath10k) struct Restart {
     pub cap: Cap<BusDeviceCap, Write>,
     pub mmio: MmioRegion,
     pub hardware: HwRev,
+    /// The retired owner proved quiescence and frees its DMA on Drop.
+    pub reclaimable: bool,
 }
 
 fn park(
@@ -76,6 +78,7 @@ impl PciBoot {
             cap,
             mmio: self.mmio.io.0,
             hardware: self.hardware,
+            reclaimable: self.reclaimable,
         })
     }
 }

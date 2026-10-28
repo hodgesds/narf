@@ -255,7 +255,29 @@ pub async fn recover() -> Result<RecoveryScheduled, RecoveryError> {
         *attempts += 1;
         *attempts
     };
-    let result = match owner {
+    let restart = retire_owner(owner)
+        .await
+        .map_err(RecoveryError::Transport)?;
+    // A retired transport's Drop performs no hardware access and preserves all
+    // old mappings. A late old firmware/CE write can only hit permanently pinned DMA.
+    *session = None;
+    let revision = clear_generation().ok_or(RecoveryError::Busy)?;
+    narf_scheduler::spawn(boot_task(
+        restart.device,
+        restart.cap,
+        restart.mmio,
+        restart.hardware,
+        revision,
+    ));
+    Ok(RecoveryScheduled { attempt })
+}
+
+/// Retire whichever generation the session holds (host interface first for
+/// a radio), with the DMA-stop proof of `boot/recovery.rs`.
+async fn retire_owner(
+    owner: &mut DriverSession,
+) -> Result<super::boot::Restart, super::bmi::BmiError> {
+    match owner {
         DriverSession::Boot(owner) => owner.bmi.transport.retire_for_restart(),
         DriverSession::Runtime(owner) => owner.htc.transport.retire_for_restart(),
         DriverSession::Wmi(owner) => owner.wmi.htc.transport.retire_for_restart(),
@@ -267,38 +289,87 @@ pub async fn recover() -> Result<RecoveryScheduled, RecoveryError> {
             .await;
             radio.htt.wmi.htc.transport.retire_for_restart()
         }
+    }
+}
+
+static PARKED: IrqSafeSpinLock<Option<(super::boot::Restart, u32)>> = IrqSafeSpinLock::new(None);
+static SUSPEND_PINNED: IrqSafeSpinLock<u8> = IrqSafeSpinLock::new(0);
+
+/// System suspend without WoWLAN (`pm.rs`): retire the live generation and
+/// park the function identity for [`resume`]. A refusal leaves it usable.
+pub async fn suspend() -> Result<(), super::pm::SuspendError> {
+    let mut session = SESSION.lock().await;
+    let facts = super::pm::Facts {
+        device: CONTROLLER.lock().is_some(),
+        session: session.is_some(),
+        restarting: RESTART.restarting(),
+        pinned: *SUSPEND_PINNED.lock(),
     };
-    let restart = result.map_err(RecoveryError::Transport)?;
-    // A retired transport's Drop performs no hardware access and preserves all
-    // old mappings. A late old firmware/CE write can only hit permanently pinned DMA.
+    if super::pm::plan(facts)? == super::pm::Plan::Nothing {
+        return Ok(());
+    }
+    let owner = session.as_mut().ok_or(super::pm::SuspendError::Busy)?;
+    let parked = retire_owner(owner)
+        .await
+        .map_err(super::pm::SuspendError::Failed)?;
     *session = None;
-    let revision = {
-        let mut controller = CONTROLLER.lock();
-        let controller = controller.as_mut().ok_or(RecoveryError::Busy)?;
-        controller.target_info = None;
-        controller.boot_error = None;
-        controller.firmware_prepared = None;
-        controller.firmware_error = None;
-        controller.htc_ready = None;
-        controller.runtime_error = None;
-        controller.wmi_ready = None;
-        controller.wmi_error = None;
-        controller.htt_ready = None;
-        controller.htt_error = None;
-        controller.scan_ready = None;
-        controller.scan_error = None;
-        controller.station_prepared = None;
-        controller.station_error = None;
-        controller.chip_id_rev
+    if !parked.reclaimable {
+        *SUSPEND_PINNED.lock() += 1;
+    }
+    let revision = clear_generation().ok_or(super::pm::SuspendError::Busy)?;
+    *PARKED.lock() = Some((parked, revision));
+    let _ = writeln!(
+        narf_console::Writer,
+        "  ath10k: suspended (generation retired)"
+    );
+    Ok(())
+}
+
+/// `ath10k_pci_resume` + `ath10k_start`: clear config 0x41 and schedule a
+/// fresh-ROM boot of the parked function. `false` when nothing was parked.
+pub fn resume() -> bool {
+    let Some((parked, revision)) = PARKED.lock().take() else {
+        return false;
     };
+    let (cap, device) = (parked.cap, parked.device);
+    let read =
+        crate::qualcomm_pci::invoke(&cap, || narf_bus::pci::read_config32(&cap, &device, 0x40));
+    if let Ok(Ok(value)) = read {
+        if let Some(cleared) = super::pm::retry_timeout(value) {
+            let _ = crate::qualcomm_pci::invoke(&cap, || {
+                narf_bus::pci::write_config32(&cap, &device, 0x40, cleared)
+            });
+        }
+    }
     narf_scheduler::spawn(boot_task(
-        restart.device,
-        restart.cap,
-        restart.mmio,
-        restart.hardware,
+        parked.device,
+        parked.cap,
+        parked.mmio,
+        parked.hardware,
         revision,
     ));
-    Ok(RecoveryScheduled { attempt })
+    true
+}
+
+/// Clear per-generation controller facts; returns the chip revision.
+fn clear_generation() -> Option<u32> {
+    let mut controller = CONTROLLER.lock();
+    let controller = controller.as_mut()?;
+    controller.target_info = None;
+    controller.boot_error = None;
+    controller.firmware_prepared = None;
+    controller.firmware_error = None;
+    controller.htc_ready = None;
+    controller.runtime_error = None;
+    controller.wmi_ready = None;
+    controller.wmi_error = None;
+    controller.htt_ready = None;
+    controller.htt_error = None;
+    controller.scan_ready = None;
+    controller.scan_error = None;
+    controller.station_prepared = None;
+    controller.station_error = None;
+    Some(controller.chip_id_rev)
 }
 
 async fn activate_runtime(

@@ -94,6 +94,7 @@ pub mod hw;
 mod interface;
 mod irq;
 pub mod pci;
+pub mod pm;
 pub mod profile;
 pub mod regulatory;
 pub mod restart;
@@ -108,6 +109,27 @@ pub use pci::{name_for, probe, register_pci_driver, Ath10kDevice, ProbeError};
 /// Entry point invoked from the wireless crate's `register_initcalls`.
 pub fn register() {
     register_pci_driver();
+    // Linux `ath10k_pci_pm_ops` + mac80211 stop/start; the retire step is
+    // async, so it runs before the interrupt-gated device fan-out.
+    narf_power::system_pm::register_async_system_pm("ath10k", alloc::sync::Arc::new(SystemPm));
+}
+
+struct SystemPm;
+impl narf_power::system_pm::AsyncSystemPm for SystemPm {
+    fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            pci::suspend().await.map_err(|error| match error {
+                pm::SuspendError::Busy => narf_power::device_pm::DevicePmError::Busy,
+                _ => narf_power::device_pm::DevicePmError::DriverError,
+            })
+        })
+    }
+    fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            pci::resume();
+            Ok(())
+        })
+    }
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

@@ -455,7 +455,7 @@ Host-bus/system power transitions remain separate profiles.
   pinned. A non-retired terminal Drop uses the same proof after firmware
   DONE. No RF-quiescence proof is claimed. The attempt limit bounds pinned
   generations. It is also the restart step of automatic recovery (below). It is
-  not stable-netdev reconnection or system suspend. Physical reset,
+  not stable-netdev reconnection. Physical reset,
   ROM/firmware restart and repeated RF association still need hardware acceptance.
 - Automatic recovery (`restart.rs`, `pci::firmware_crashed`). Linux
   `pci.c::ath10k_pci_napi_poll` checks `ath10k_pci_has_fw_crashed`
@@ -485,6 +485,32 @@ Host-bus/system power transitions remain separate profiles.
   command timeouts do not yet trigger recovery: Linux `wmi.c` does that in
   `ath10k_wmi_cmd_send` on `-EAGAIN`, and here those timeouts stay
   fail-stop errors for the caller.
+- System suspend (`pm.rs`, `pci::{suspend, resume}`, registered as the
+  `ath10k` `narf_power::system_pm::AsyncSystemPm` hook). This follows the
+  Linux v6.10 non-WoWLAN path. mac80211 `ieee80211_suspend` calls
+  `drv_stop`, which reaches `mac.c::ath10k_stop` (`ath10k_halt`,
+  `ath10k_hif_power_down`). `pci.c::ath10k_pci_pm_suspend` then puts the
+  target to sleep. `ath10k_pci_pm_resume` -> `ath10k_pci_resume`
+  re-disables the RETRY_TIMEOUT byte (config 0x41, lost in D3). mac80211
+  `ieee80211_reconfig` -> `ath10k_start` -> `ath10k_hif_power_up` then
+  performs a full chip reset and firmware boot. Here `prepare_suspend`
+  plans under the session lock (`pm::plan`). With no bound function it
+  returns success. Boot or automatic recovery in progress (no retained
+  session, or RESTARTING) returns `Busy`, which aborts the system suspend
+  with the generation intact. `Pinned` is returned once three earlier
+  suspends left unreclaimable DMA, keeping the generation usable. Otherwise
+  it retires the live generation exactly as recovery does: host interface
+  and radio quarantine first, interrupt teardown, every CE masked and
+  halted, bus mastering verified off, ordered flush proof. It then parks
+  the function identity. A failed retirement leaves that generation
+  terminal (`DriverError`), as a failed `ath10k_stop` would. Resume clears
+  config 0x41 if set, then schedules the ordinary fresh-ROM `boot_task`
+  (reset, BMI, current authenticated firmware/BDF, HTC/WMI/HTT, interface
+  registration). Resume without a parked generation does nothing. As in
+  Linux without WoWLAN, the association is not preserved, and rejoin goes
+  through the new interface. Suspend does not use the recovery attempt
+  budget. WoWLAN (`wow.c`) and PCIe runtime PM/ASPM transitions are not
+  provided (`wake_offload`, `host_bus_pm`).
 - Interrupt service (`irq.rs`, `boot/interrupts.rs`). Linux v6.10
   `pci.c::ath10k_pci_init_irq` tries MSI first; `ath10k_pci_hif_start`
   calls `ath10k_pci_irq_enable`. Here `PciBoot::done_complete` (BMI_DONE
@@ -598,7 +624,7 @@ Host-bus/system power transitions remain separate profiles.
   native command-future poll, including a coalesced no-op request. Failure
   or cancellation closes station admission and retains uncertain DMA;
   reinstalling policy or late receipts cannot reopen it. This profile
-  enables neither U-APSD nor host-bus/system suspend or wake offload.
+  enables neither U-APSD nor host-bus PM or wake offload.
 - Physical packet HIF supplies bounded source-ready, begin-send and poll-now
   operations. Each source pipe retains its bounce occupancy/deadline before
   publication. An occupied source is rejected before any buffer copy; its CE
@@ -1037,7 +1063,7 @@ response-bound VHT and wider geometry; native TX BA, independent
 multi-packet DMA/completion and aggregate retries; PFC fetch/queue ownership;
 dynamic WMM/protection updates and TSPEC/U-APSD; DFS/indoor/beacon-hint
 qualification; associated/off-channel scanning; hardware key/PMF/WPA3 profiles;
-AP/P2P roles; host-bus/system PM and wake offload;
+AP/P2P roles; host-bus PM and wake offload (system suspend is implemented);
 pre-cal/cal-file and DT/NVMEM calibration sources (QCA9887 EEPROM is implemented)
 and automatic credential/stable-interface recovery.
 The existing bounded RX BA/reorder and complete RAW A-MSDU receiver must not be

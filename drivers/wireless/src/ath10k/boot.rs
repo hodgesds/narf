@@ -28,6 +28,7 @@ mod htt_memory;
 mod interrupts;
 #[path = "boot/recovery.rs"]
 mod recovery;
+pub(super) use recovery::Restart;
 #[path = "boot/wmi_memory.rs"]
 mod wmi_memory;
 
