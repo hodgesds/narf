@@ -39,6 +39,7 @@ pub(super) struct RadioIo {
     rx_ba: Option<Arc<crate::rtw88::rx_ba_power::Grant>>,
     tx_ba: Option<Arc<crate::rtw88::tx_ba_power::Grant>>,
     protection: Option<Arc<crate::rtw88::protection::Grant>>,
+    pub(super) continuation: Option<Arc<crate::rtw88::qualification::Grant>>,
     pub(super) edca_writes: Arc<AtomicUsize>,
     pub(super) before_publication: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) clock: Arc<AtomicU64>,
@@ -78,6 +79,7 @@ impl RadioIo {
             rx_ba: None,
             tx_ba: None,
             protection: None,
+            continuation: None,
             edca_writes: Arc::new(AtomicUsize::new(0)),
             before_publication: None,
             clock: Arc::new(AtomicU64::new(0)),
@@ -185,6 +187,20 @@ impl RadioIo {
         self.rx_ba = Some(s.load(self.ht.as_ref().ok_or(Error::State)?.clone())?);
         Ok(())
     }
+    pub(super) fn dm_request(&self) -> Result<crate::rtw88::ContinuationRequest, Error> {
+        crate::rtw88::qualification::request(
+            &crate::rtw88::dm::KIND,
+            self.gate.as_ref().ok_or(Error::State)?,
+        )
+    }
+    pub(super) fn qualify_dm(
+        &mut self,
+        s: crate::rtw88::qualification::Source,
+    ) -> Result<(), Error> {
+        let gate = self.gate.as_ref().ok_or(Error::State)?;
+        self.continuation = Some(s.load(&crate::rtw88::dm::KIND, gate)?);
+        Ok(())
+    }
     pub(super) fn lose_write(&mut self, r: u16) {
         self.lost = Some(r);
     }
@@ -209,6 +225,24 @@ impl RadioIo {
 // SAFETY: isolated same-owner register/receipt model. It never accesses a
 // physical device; every firmware/MAC stage uses the actual retained owner.
 unsafe impl Io for RadioIo {
+    fn station_continuation(
+        &mut self,
+        kind: &'static crate::rtw88::qualification::Kind,
+    ) -> Result<Option<Arc<crate::rtw88::qualification::Grant>>, Error> {
+        self.station_allowed()?;
+        Ok(self.continuation.clone().filter(|g| g.is(kind)))
+    }
+    fn station_continuation_request(
+        &mut self,
+        kind: &'static crate::rtw88::qualification::Kind,
+    ) -> Result<crate::rtw88::ContinuationRequest, Error> {
+        self.station_allowed()?;
+        crate::rtw88::qualification::request(kind, self.gate.as_ref().ok_or(Error::State)?)
+    }
+    fn station_gate(&mut self) -> Result<crate::rtw88::power_policy::Gate, Error> {
+        self.station_allowed()?;
+        self.gate.clone().ok_or(Error::State)
+    }
     fn station_rts_request(&mut self) -> Result<crate::rtw88::RtsRequest, Error> {
         self.station_allowed()?;
         self.rts_request()

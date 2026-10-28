@@ -854,9 +854,10 @@ impl State {
                                     .as_ref()
                                     .and_then(JoinPlan::negotiated_phy)
                                     .ok_or(Error::Profile)?;
-                                if negotiated.width() != association::phy::Width::Twenty
-                                    || negotiated.ht().operation().protection() != 0
-                                {
+                                // Linux rtw88 reads no ht_operation_mode and takes no
+                                // protection action (mac80211.c/tx.c); nonzero HT
+                                // protection modes are admitted unchanged.
+                                if negotiated.width() != association::phy::Width::Twenty {
                                     return Err(Error::Profile);
                                 }
                                 self.data_profile = h.profile(
@@ -1206,9 +1207,11 @@ impl State {
             None => JoinPlan::prepare(&candidate.bss, self.own, ssid, mode)?,
         };
         let ht = proposed.filter(|_| plan.offered_phy().is_some());
-        if plan.offered_phy().is_some_and(|p| {
-            p.width() != association::phy::Width::Twenty || p.ht().operation().protection() != 0
-        }) {
+        // Upstream rtw88 takes no HT protection-mode action (ht_protection_modes).
+        if plan
+            .offered_phy()
+            .is_some_and(|p| p.width() != association::phy::Width::Twenty)
+        {
             return Err(Error::Profile);
         }
         plan.append_sme_ies(ies)?;
@@ -1279,7 +1282,8 @@ impl State {
             self.ht = Some(h);
         }
         if let Some(g) = io.station_continuation(&super::dm::KIND)? {
-            if super::dm::bounds(io.station_gate()?.did(), g.payload()).is_some() {
+            let gate = io.station_gate()?;
+            if super::dm::bounds(gate.did(), g.payload()).is_some() && g.check(&gate).is_ok() {
                 self.tracking.grant = Some(g);
             }
         }

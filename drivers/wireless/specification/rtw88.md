@@ -1369,6 +1369,62 @@ this channel1 owner therefore does not add a TX A-MSDU producer. That source
 policy is not a claim that the silicon lacks broader-band A-MSDU capability.
 
 
+### Separately signed continuation contracts and the dm watchdog
+
+`qualification.rs` is the single reusable loader for every new RTW88 program
+that needs its own measured authority. A static `Kind { tag, stem, source,
+admit }` describes the program; the generic code supplies the 128-byte
+layout (`N21<tag>`/`N22<tag>`, `[1,0,128,0]`, length, `ec 10` + PCI id,
+identity, exact factory MAC, `[tag, 1]`, 64-byte kind payload, zero tail),
+signer and capability checks, and `Grant::invoke(gate, op)`, which re-enters
+the continuation capability and then the current base `Gate` (regulatory
+policy and every bound base capability). The identity binds the chip, the
+MAC, the exact retained board/calibration base (`Gate::extension_request`,
+i.e. N22Cv2 or N21S) and the hashed upstream source contract. Requests are
+filed as `rtw88/rtw882{1,2}ce-<stem>-v1-<mac>.bin`;
+`Rtw88Device::tracking_request()` returns the `ContinuationRequest` for the
+dm kind. New programs add a `Kind` instead of another bespoke loader.
+
+`dm.rs` (tag `D`, stem `dm`) ports Linux `main.c::rtw_watch_dog_work`
+(2 s period, run with the retained owner mutex held) and
+`phy.c::rtw_phy_dynamic_mechanism`:
+
+| Mechanism (payload bit) | Source | Chips |
+|---|---|---|
+| statistics | `rtw_phy_statistics`: RSSI EWMA(10,16) from peer PHY status, `rtw_phy_get_rssi_level`, H2C 0x42; `false_alarm_statistics` counters and reset pulses | both |
+| DIG (0) | `rtw_phy_dig` thresholds/steps/damping/boundaries; signed `dig_max` caps `DIG_PERF_MAX` | C21 `0xc50`, C22 `0x1d70` both paths |
+| CCK PD (1) | `rtw_phy_cck_pd` + `cck_pd_set` (8822c PD/CS deltas, 8821c `0xa08`/`0xaa8`), level capped by payload | both |
+| RA (2) | `rtw_phy_ra_track`: H2C 0x58 WL-PHY info, every fourth period RA_INFO 0x40 with RSSI-level mask and NO_UPDATE, C2H 0x0c RA report, RRSR = retained qualified RRSR & report mask | both |
+| TX path diversity (3) | `rtw_phy_tx_path_diversity` + `rtw8822c_config_{cck,ofdm}_tx_path` | C22 |
+| CFO (4) | `rtw8822c_cfo_track`, crystal `0x1040[23:10]`, BT scoreboard reset, window bounded by payload | C22 |
+| thermal power tracking (5) | `rtw8822c_pwr_track` type 0: RF42 trigger, EWMA(10,4), 2G/CCK swing tables, LCK at 8 steps, `0x18a0`/`0x41a0[6:0]` delta clamped to the signed up/down bound; samples outside the signed thermal window refuse | C22 |
+| EDCCA adaptivity (6) | `rtw8822c_adaptivity` normal/ETSI(45)/JP(60) from the regulatory country (wireless-regdb DFS region), `0x84c` bytes 2/3 | C22 |
+
+The continuation binds at association and the watchdog runs only on an
+established station. Each register group runs inside admission + continuation
++ base gate; H2C goes through the retained mailbox after a fresh grant check.
+Revocation, policy loss or an out-of-envelope sample restores the base program
+(initial IGI/EDCCA, factory crystal, path A, zero power delta, qualified RRSR,
+level-0 CCK PD) under the base gate only and stops tracking for that
+association. Deviations from Linux, each a qualification bound: the RRSR base
+is the qualified mask rather than `RRSR_INIT_2G`; DIG/CCK-PD/crystal/power
+deltas are capped by the signed payload; there is no unlinked DIG because the
+continuation binds at association. DPK tracking is not offered: Linux
+`rtw8822c_dpk_track` returns without a DPK result, and this profile runs no
+DPK calibration.
+
+Linux rtw88 reads no `ht_operation_mode` and takes no protection action
+(`mac80211.c`, `tx.c`), so the retained station now admits APs that advertise
+HT protection modes 1..3 unchanged. The check was local to rtw88; no shared
+`JoinPlan` change was needed.
+
+Evidence: nine `drivers/wireless/rtw88/dm` register-model cases
+(`dm_tests.rs`), and composed C21/C22 Open/WPA2 watchdog, revocation-restore
+and refusal cases (`dm_station_tests.rs`, `drivers/wireless/rtw88/dm/rtl882{1,2}c`)
+plus HT protection modes 1..3 (`drivers/wireless/rtw88/ht_protection/*`).
+These are software/model results. A real signed N2xD measurement and physical
+acceptance remain external deployment gates.
+
 ## 4. Invariants
 
 - Physical reads select Wi-Fi EFUSE bank zero and disable the programming
@@ -1455,6 +1511,7 @@ Remaining software ledger:
 | C21/C22 recipient RX BA | Distinct exact-H N21R/N22R contract; actual bound ADDBA success/CCX/idle, explicit SSN, TIDs0..7/window<=64 with A-MSDU permission, source RAW/PHY admission, opaque originals before CCMP/PN, BAR20/DELBA/hole/TU timers and key/publication epochs implemented; native tests passed the coordinated x86_64/aarch64 software suites. Real measured assets/automatic BA/over-air acceptance remain external |
 | C21/C22 originator TX BA | Distinct exact-H or R-over-H N21T/N22T contract; bound on-air request/response/current SSN, genuine CCX/RX-idle/MAC-FIFO proof, four independent native DMA originals, source AGGEN/density/MAXAGG and per-MPDU status, current-SSN BAR20/DELBA/key drains implemented; native tests passed the coordinated x86_64/aarch64 software suites. Measured assets/real MAC aggregation and over-air behavior remain external |
 | C21/C22 RTS threshold | Separate N21X/N22X over exact current H/R/T; native24Mbps RTS descriptor/control program, actual response-rate admission, drained current-authority setting, CCX/immutable-DMA/FIFO completion and EAPOL exclusion implemented. Twelve native cases pass on both architectures; real measured X assets/RTS-CTS/physical acceptance remain external |
+| Generic continuation contract + dm watchdog | Reusable signed N2x<tag> loader; N2xD rtw_watch_dog_work/rtw_phy_dynamic_mechanism port: DIG/CCK-PD/RA on both chips, path diversity/CFO/thermal power tracking/EDCCA on C22; base restore on revocation. Real N2xD measurement external; no DPK tracking |
 | Port0 peer/AID/media/RA/default-port control | Implemented bounded source mailbox, long-slot initial MLME, same-owner station integration and close/cancel behavior |
 | Passive/active channel1 scan with probe IEs, authentication/association, WPA2 controlled port | Retained channel1 shared MLME/RSNA/CCMP through actual native DMA and CCX, including held/altered/cancelled M4 and queued peer-loss closure |
 | Native management/data TX, RX, completion and ring ownership | Implemented original rings, source descriptors, exact DMA plus CCX security receipt and current-authority publication |

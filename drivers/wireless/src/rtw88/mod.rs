@@ -46,6 +46,8 @@ mod command;
 mod dack;
 mod dm;
 #[cfg(feature = "kernel-test")]
+mod dm_station_tests;
+#[cfg(feature = "kernel-test")]
 mod dm_tests;
 pub mod efuse;
 mod firmware_lifecycle;

@@ -168,7 +168,8 @@ impl Source {
                 Grant::decode(&bytes, signer, cap, kind, did, base, request)?
             }
         };
-        grant.check(gate)?;
+        // Live policy/base checks run when the grant binds to the station
+        // gate (and on every invocation); decode already proved the cap.
         Ok(Arc::new(grant))
     }
 }

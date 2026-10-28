@@ -111,7 +111,57 @@ kernel_test_in!(
     "drivers/wireless/rtw88/tx_ba/rtl8822c",
     smoke_rtw8822ce_tx_ba_peer_delba_and_real_key_epoch
 );
+fn smoke_rtw8822ce_dm_open_watchdog_revocation_restore() -> TestResult {
+    result(|| crate::rtw88::dm_station_tests::composition::<Case>(false))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/dm/rtl8822c",
+    smoke_rtw8822ce_dm_open_watchdog_revocation_restore
+);
+fn smoke_rtw8822ce_dm_wpa2_watchdog_revocation_restore() -> TestResult {
+    result(|| crate::rtw88::dm_station_tests::composition::<Case>(true))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/dm/rtl8822c",
+    smoke_rtw8822ce_dm_wpa2_watchdog_revocation_restore
+);
+fn smoke_rtw8822ce_dm_refusals_and_unqualified_station() -> TestResult {
+    result(crate::rtw88::dm_station_tests::refusals::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/dm/rtl8822c",
+    smoke_rtw8822ce_dm_refusals_and_unqualified_station
+);
+fn smoke_rtw8822ce_ht_protection_modes_admitted() -> TestResult {
+    result(|| {
+        for mode in 1..=3 {
+            crate::rtw88::dm_station_tests::protection_modes::<Case>(mode)?;
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/ht_protection/rtl8822c",
+    smoke_rtw8822ce_ht_protection_modes_admitted
+);
 impl cases::Fixture for Case {
+    fn dm_request(&self) -> Result<crate::rtw88::ContinuationRequest, Error> {
+        self.e.h.model(|io| io.dm_request())
+    }
+    fn stage_dm(
+        &self,
+        bytes: Vec<u8>,
+        cap: Cap<FirmwareBlob, Read>,
+        signed: bool,
+    ) -> Result<(), Error> {
+        self.e.h.model(|io| {
+            io.qualify_dm(crate::rtw88::qualification::Source::Verified {
+                bytes,
+                cap,
+                signer: signed.then_some([18; 32]),
+            })
+        })
+    }
     type Io = RadioIo;
     fn rts_request(&self) -> Result<crate::rtw88::RtsRequest, Error> {
         self.e.h.model(|io| io.rts_request())
