@@ -51,6 +51,7 @@ const ICR: u64 = 0x044;
 
 const FR_TXFF: u32 = 1 << 5;
 const FR_RXFE: u32 = 1 << 4;
+const FR_BUSY: u32 = 1 << 3;
 
 const CR_UARTEN: u32 = 1 << 0;
 const CR_LBE: u32 = 1 << 7;
@@ -159,19 +160,36 @@ impl Pl011 {
         for &b in &PATTERN {
             self.write_byte(b);
         }
-        let mut ok = true;
-        for &want in &PATTERN {
-            let mut got = None;
-            for _ in 0..100_000 {
-                if let Some(b) = self.try_read_byte() {
-                    got = Some(b);
+        // A looped-back byte reaches the RX FIFO only once its
+        // frame has been shifted at the programmed baud rate, so
+        // wait for the transmitter to drain (FR.BUSY clear)
+        // before reading back: polling RX alone can outrun the
+        // wire, and the still-queued pattern then escapes onto
+        // the console the moment LBE drops. Bounded — a
+        // transmitter that never drains fails the selftest
+        // instead of hanging it.
+        let mut ok = false;
+        for _ in 0..10_000_000 {
+            if self.read(FR) & FR_BUSY == 0 {
+                ok = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if ok {
+            for &want in &PATTERN {
+                let mut got = None;
+                for _ in 0..100_000 {
+                    if let Some(b) = self.try_read_byte() {
+                        got = Some(b);
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                if got != Some(want) {
+                    ok = false;
                     break;
                 }
-                core::hint::spin_loop();
-            }
-            if got != Some(want) {
-                ok = false;
-                break;
             }
         }
         self.write(CR, cr & !CR_LBE);
