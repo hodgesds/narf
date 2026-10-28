@@ -167,14 +167,20 @@ pub const VECS0_SPEC: EngineSpec = EngineSpec {
 pub const GEN12_MEDIA_ENGINES: [EngineSpec; 3] = [VCS0_SPEC, VCS1_SPEC, VECS0_SPEC];
 
 /// The media engines a region generation carries. Only Gen12
-/// is served: MTL/PTL GT support does not exist in the tree
-/// (their [`RegionGeneration`] is not modelled yet either), so
-/// no other generation can be asked about — when a second
-/// generation lands, its (possibly different) set goes here,
-/// not in a second table somewhere else.
+/// is served: the Xe-LPG GT is a different engine generation
+/// (GuC-era submission) that this execlists module does not
+/// drive, so XeLpg carries no engines here — the empty set is
+/// the honest inventory, and both callers are built for it
+/// (probe skips the announce; attach refuses `NoEngine`).
+/// Panther Lake has no [`RegionGeneration`] at all
+/// (`Generation::region_generation` returns `None` for it), so
+/// it can never be asked about. When a generation's real media
+/// set lands, it goes here, not in a second table somewhere
+/// else.
 pub fn media_engines_for(gen: RegionGeneration) -> &'static [EngineSpec] {
     match gen {
         RegionGeneration::Gen12 => &GEN12_MEDIA_ENGINES,
+        RegionGeneration::XeLpg => &[],
     }
 }
 
@@ -1035,6 +1041,12 @@ pub mod tests {
         }
         if media_engines_for(RegionGeneration::Gen12).len() != 3 {
             return TestResult::Fail("inventory for Gen12");
+        }
+        // Xe-LPG media is a different (GuC-era) engine
+        // generation this module does not drive: its inventory
+        // is deliberately empty, never the Gen12 table.
+        if !media_engines_for(RegionGeneration::XeLpg).is_empty() {
+            return TestResult::Fail("inventory for XeLpg");
         }
         // Derived register addresses land in each engine's own
         // 0x4000 slot.

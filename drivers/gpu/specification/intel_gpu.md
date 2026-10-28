@@ -1355,7 +1355,11 @@ Public interface:
   `GEN12_MEDIA_ENGINES` and `media_engines_for(gen)` are the
   inventory. The probe path announces exactly this set for a
   probed Gen12 part; no engine-query UAPI exists in the tree
-  yet, and none is claimed here.
+  yet, and none is claimed here. The inventory serves only
+  the Gen12 region generation: for
+  `RegionGeneration::XeLpg` it returns the empty set (Xe-LPG
+  media is not claimed, below), and Panther Lake has no
+  region generation, so it cannot be asked.
 - Descriptor — `context_descriptor_for(spec, lrca, sw_id)`
   in `intel_gpu_rcs`: SW id at bits 37:47, engine instance
   at bits 48:53, engine class at bits 61:63 with the
