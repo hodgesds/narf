@@ -28,7 +28,7 @@ pub mod station_security;
 pub mod wmm;
 
 pub use iface::{AccessCategory, WirelessError, WirelessIface, WirelessIfaceInfo};
-pub use scan::{BssInfo, ScanRandomMac, ScanRequest, ScanResult};
+pub use scan::{BssInfo, ScanFlags, ScanRandomMac, ScanRequest, ScanResult};
 
 /// One `struct ieee80211_iface_limit` exposed through nl80211.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -446,6 +446,14 @@ pub trait WirelessNetIface: Interface {
         false
     }
 
+    /// Whether this wiphy randomizes Probe Request sequence numbers on
+    /// request (`NL80211_EXT_FEATURE_SCAN_RANDOM_SN`). When true,
+    /// `NL80211_SCAN_FLAG_RANDOM_SN` is accepted and reaches
+    /// `scan_with_flags`; otherwise cfg80211's EOPNOTSUPP applies.
+    fn supports_scan_random_sn(&self) -> bool {
+        false
+    }
+
     /// Whether this wiphy exposes `NL80211_EXT_FEATURE_SET_SCAN_DWELL` and
     /// honours `NL80211_ATTR_MEASUREMENT_DURATION` on a triggered scan.
     fn supports_scan_dwell(&self) -> bool {
@@ -541,6 +549,17 @@ pub trait WirelessNetIface: Interface {
 
     /// Triggers an asynchronous scan.
     async fn scan(&self, req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError>;
+
+    /// A triggered scan whose request carried `ScanFlags` (today only
+    /// `random_sn`, after `supports_scan_random_sn()` admitted it). The
+    /// default ignores the flags and runs `scan`.
+    async fn scan_with_flags(
+        &self,
+        req: ScanRequest,
+        _flags: ScanFlags,
+    ) -> Result<Vec<BssInfo>, WirelessError> {
+        self.scan(req).await
+    }
 
     /// Initiates association with an Access Point.
     async fn associate(&self, req: AssociateRequest) -> Result<(), WirelessError>;

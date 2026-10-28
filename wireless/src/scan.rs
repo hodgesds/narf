@@ -45,6 +45,17 @@ pub struct ScanRequest {
     pub extra_ies: Vec<u8>,
 }
 
+/// `NL80211_ATTR_SCAN_FLAGS` bits that travel beside a `ScanRequest`
+/// (`WirelessNetIface::scan_with_flags`). They are separate from `ScanRequest`
+/// so existing request literals stay valid; the default is "no flag".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanFlags {
+    /// `NL80211_SCAN_FLAG_RANDOM_SN`: randomize the 802.11 sequence number
+    /// of every Probe Request in this scan (accepted only when the wiphy
+    /// advertises `NL80211_EXT_FEATURE_SCAN_RANDOM_SN`).
+    pub random_sn: bool,
+}
+
 pub struct ScanResult {
     pub bss_list: Vec<BssInfo>,
 }

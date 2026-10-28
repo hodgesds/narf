@@ -827,7 +827,14 @@ outside station mode is harmless.
 `TRIGGER_SCAN` accepts `SCAN_FLAGS` FLUSH / AP / COLOCATED_6GHZ (a NARF scan
 always replaces the cached results) and refuses feature-gated flags and
 FREQ_KHZ with -EOPNOTSUPP, probe IEs past the advertised maximum of 0 with
--EINVAL. `CONNECT` accepts the attributes wpa_supplicant and NetworkManager
+-EINVAL. The exception is `NL80211_SCAN_FLAG_RANDOM_SN` (bit 11), which is
+accepted when `WirelessNetIface::supports_scan_random_sn()` is true. Such a
+wiphy advertises `NL80211_EXT_FEATURE_SCAN_RANDOM_SN` (extended bit 29), and
+the request reaches the driver as
+`scan_with_flags(ScanRequest, scan::ScanFlags { random_sn })`. The default
+implementation forwards to `scan`. Requests without a flag still call `scan`.
+`ScanFlags` sits beside `ScanRequest` rather than inside it, so the many
+existing request literals stay valid. `CONNECT` accepts the attributes wpa_supplicant and NetworkManager
 always send (`MAC_HINT`, `WIPHY_FREQ_HINT`, `BG_SCAN_PERIOD`, `PREV_BSSID`,
 HT/VHT capability + mask, `CONTROL_PORT`, `CONTROL_PORT_ETHERTYPE` = ETH_P_PAE,
 `CONTROL_PORT_NO_ENCRYPT`, `SOCKET_OWNER`, `EXTERNAL_AUTH_SUPPORT`, `SAE_PWE`,

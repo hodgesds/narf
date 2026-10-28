@@ -1165,6 +1165,9 @@ fn wiphy_security_attrs(attrs: &mut Vec<u8>, iface: &dyn crate::WirelessNetIface
     if iface.supports_scan_dwell() {
         bits.push(5); // SET_SCAN_DWELL
     }
+    if iface.supports_scan_random_sn() {
+        bits.push(29); // SCAN_RANDOM_SN
+    }
     if iface.supports_cqm_rssi_list() {
         bits.push(13); // CQM_RSSI_LIST
     }

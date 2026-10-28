@@ -160,6 +160,8 @@ fn begin_operation(name: &str, namespace: u64, index: u32) -> Result<OperationGu
 
 enum Operation {
     Scan(crate::ScanRequest),
+    /// A scan whose `NL80211_ATTR_SCAN_FLAGS` set a `ScanFlags` bit.
+    ScanFlagged(crate::ScanRequest, crate::ScanFlags),
     Connect {
         ssid: Vec<u8>,
         bssid: Option<[u8; 6]>,
@@ -649,11 +651,28 @@ fn elements(mut ie: &[u8]) -> Result<Vec<(u8, &[u8])>, i32> {
 /// FREQ_KHZ is refused because the frequency list would then be in kHz,
 /// which this handler does not decode.
 fn scan_flags(flags: u32, random_mac_supported: bool, connected: bool) -> Result<(), i32> {
+    scan_flags_sn(flags, random_mac_supported, connected, false)
+}
+
+/// `scan_flags` plus `NL80211_SCAN_FLAG_RANDOM_SN` (bit 11), which
+/// `nl80211_check_scan_flags` gates on `NL80211_EXT_FEATURE_SCAN_RANDOM_SN`.
+fn scan_flags_sn(
+    flags: u32,
+    random_mac_supported: bool,
+    connected: bool,
+    random_sn_supported: bool,
+) -> Result<(), i32> {
     const LOW_PRIORITY: u32 = 1 << 0;
     const RANDOM_ADDR: u32 = 1 << 3;
+    const RANDOM_SN: u32 = 1 << 11;
     const FEATURE_GATED: u32 = 0x1ff0; // bits 4..=12
     const FREQ_KHZ: u32 = 1 << 13;
-    if flags & (LOW_PRIORITY | FEATURE_GATED | FREQ_KHZ) != 0 {
+    let gated = if random_sn_supported {
+        FEATURE_GATED & !RANDOM_SN
+    } else {
+        FEATURE_GATED
+    };
+    if flags & (LOW_PRIORITY | gated | FREQ_KHZ) != 0 {
         return Err(EOPNOTSUPP);
     }
     if flags & RANDOM_ADDR != 0 && (!random_mac_supported || connected) {
@@ -710,6 +729,7 @@ struct ConnectCaps {
     connected: bool,
     max_scan_ssids: u8,
     max_scan_ie_len: u16,
+    scan_random_sn: bool,
 }
 
 impl ConnectCaps {
@@ -725,6 +745,7 @@ impl ConnectCaps {
             connected: iface.connected_bssid().is_some(),
             max_scan_ssids: iface.max_scan_ssids(),
             max_scan_ie_len: iface.max_scan_ie_len(),
+            scan_random_sn: iface.supports_scan_random_sn(),
         }
     }
 }
@@ -750,6 +771,7 @@ fn parse_operation(
             connected: false,
             max_scan_ssids: 16,
             max_scan_ie_len: 512,
+            scan_random_sn: false,
         },
         0,
     )
@@ -781,7 +803,7 @@ fn parse_operation_caps(
                 return Err(EINVAL);
             }
             let flags = u32_attr(attrs, 158)?.unwrap_or(0);
-            scan_flags(flags, caps.scan_random_mac, caps.connected)?;
+            scan_flags_sn(flags, caps.scan_random_mac, caps.connected, caps.scan_random_sn)?;
             let random_mac = scan_random_mac(attrs, flags)?;
             let ssids = attr(attrs, 45)
                 .map(attributes)
@@ -821,7 +843,7 @@ fn parse_operation_caps(
             // requests active scanning. Preserve directed entries even when
             // a wildcard is also present, for hidden-network discovery.
             let active = !ssids.is_empty();
-            Ok(Operation::Scan(crate::ScanRequest {
+            let request = crate::ScanRequest {
                 ssids,
                 frequencies_mhz,
                 channels: Vec::new(),
@@ -831,7 +853,15 @@ fn parse_operation_caps(
                 duration_tu,
                 duration_mandatory: duration_tu.is_some() && attr(attrs, 222).is_some(),
                 extra_ies: attr(attrs, 42).unwrap_or(&[]).to_vec(),
-            }))
+            };
+            let scan_flags = crate::ScanFlags {
+                random_sn: flags & (1 << 11) != 0,
+            };
+            Ok(if scan_flags == crate::ScanFlags::default() {
+                Operation::Scan(request)
+            } else {
+                Operation::ScanFlagged(request, scan_flags)
+            })
         }
         CONNECT => {
             connect_side_attrs(attrs)?;
@@ -1120,7 +1150,7 @@ pub(super) fn handle(
         }
         // cfg80211_disconnect: the owner goes first.
         Operation::Disconnect => station::clear_owner_for_link(iface.name(), namespace, index)?,
-        Operation::Scan(_) => {}
+        Operation::Scan(_) | Operation::ScanFlagged(..) => {}
     }
     narf_scheduler::spawn(async move {
         let _guard = guard;
@@ -3677,10 +3707,18 @@ async fn execute(
     let live = authorized_link(&admin, iface.as_ref(), ns, index);
     // The peer whose controlled port opened with this connect.
     let mut port_authorized = None;
+    let (operation, scan_flags) = match operation {
+        Operation::ScanFlagged(request, flags) => (Operation::Scan(request), Some(flags)),
+        other => (other, None),
+    };
     let (command, group) = match operation {
+        Operation::ScanFlagged(..) => return,
         Operation::Scan(request) => {
             let result = if live {
-                iface.scan(request).await
+                match scan_flags {
+                    Some(flags) => iface.scan_with_flags(request, flags).await,
+                    None => iface.scan(request).await,
+                }
             } else {
                 Err(crate::WirelessError::HardwareError)
             };
