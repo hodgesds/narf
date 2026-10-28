@@ -1729,7 +1729,16 @@ pub fn encode_read10(lba: u32, nblocks: u16) -> [u8; 10] {
     let lba_be = lba.to_be_bytes();
     let nb = nblocks.to_be_bytes();
     [
-        SCSI_READ_10, 0, lba_be[0], lba_be[1], lba_be[2], lba_be[3], 0, nb[0], nb[1], 0,
+        SCSI_READ_10,
+        0,
+        lba_be[0],
+        lba_be[1],
+        lba_be[2],
+        lba_be[3],
+        0,
+        nb[0],
+        nb[1],
+        0,
     ]
 }
 
@@ -1739,7 +1748,16 @@ pub fn encode_write10(lba: u32, nblocks: u16) -> [u8; 10] {
     let lba_be = lba.to_be_bytes();
     let nb = nblocks.to_be_bytes();
     [
-        SCSI_WRITE_10, 0, lba_be[0], lba_be[1], lba_be[2], lba_be[3], 0, nb[0], nb[1], 0,
+        SCSI_WRITE_10,
+        0,
+        lba_be[0],
+        lba_be[1],
+        lba_be[2],
+        lba_be[3],
+        0,
+        nb[0],
+        nb[1],
+        0,
     ]
 }
 
