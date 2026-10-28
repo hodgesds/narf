@@ -559,6 +559,13 @@ Whole-buffer moves transfer ownership without promotion. Up to two exclusively
 owned drained pages are reusable, matching Linux's bounded `tmp_page` cache;
 the final shared reference recovers unique ownership before reuse. Imported
 buffers carry `UserPagePin` references and cannot acquire append rights.
+`unsafe PipeBufs::write_with_raw` accepts an actor which initializes every
+requested byte on success without reading uninitialized destination RAM or
+retaining its pointer. Fresh full pages skip pre-zeroing and enter the ring
+only after successful complete copy. Failed fresh-page copies are freed and
+never cached; partial fresh pages and every reusable spare remain fully
+initialized for the ordinary slice-based actors. Errors after earlier complete
+buffers return that committed prefix. Packet and merge rules are unchanged.
 `fill_from` implements the single-copy buffered-provider fallback into fresh
 pipe pages. `with_front_raw` exposes a retained pointer only for a callback's
 duration, avoiding Rust references over externally mutable imported pages.

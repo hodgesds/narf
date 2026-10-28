@@ -113,19 +113,24 @@ impl<'a> Endpoint<'a> {
     }
 }
 
-/// One transactional iterator write, including capacity/fault distinction for
-/// a blocking syscall which must retain its accepted prefix while sleeping.
-pub(crate) fn write_from_iter(
+/// One transactional raw iterator write, retaining a committed prefix across
+/// a blocking syscall's capacity wait.
+/// # Safety
+/// On success the callback initializes every requested destination byte and
+/// accesses only that range, without reading uninitialized bytes or retaining
+/// a pointer beyond the call. Errors leave that callback's range unpublished.
+pub(crate) unsafe fn write_from_raw_iter(
     ops: &dyn FileOps,
     len: usize,
-    copy: impl FnMut(usize, &mut [u8]) -> Result<(), u64>,
+    copy: impl FnMut(usize, *mut u8, usize) -> Result<(), u64>,
 ) -> Result<(usize, bool), u64> {
     let output = Endpoint::from_file(ops).ok_or(EBADF as u64)?;
     let mut q = lock_queue(output.queue());
     if output.reader_closed() {
         return Err(EPIPE as u64);
     }
-    let n = q.write_with(len, output.packetized(), copy)?;
+    // SAFETY: forwarded complete-initialization contract from the caller.
+    let n = unsafe { q.write_with_raw(len, output.packetized(), copy) }?;
     let full = q.is_full();
     drop(q);
     if n != 0 {

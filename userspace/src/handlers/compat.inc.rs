@@ -3734,9 +3734,25 @@ pub(crate) fn validate_user_range(ptr: u64, len: usize) -> Result<(), u64> {
 /// - The caller's address space must match the AS that mapped `src_uptr`.
 /// - Must not be called from IRQ context.
 pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(), u64> {
-    validate_user_range(src_uptr, dst.len())?;
+    // SAFETY: the slice retains an exclusive writable destination for the copy.
+    unsafe { copy_raw_from_user(dst.as_mut_ptr(), src_uptr, dst.len()) }
+}
+
+/// Guarded copy into retained kernel RAM, which need not be initialized yet.
+/// Success initializes every requested byte; a fault may leave only a prefix
+/// initialized, and the caller must not publish that destination as complete.
+///
+/// # Safety
+/// `dst` must retain `len` exclusively writable bytes, disjoint from the source.
+/// The active address space must be that of the source; IRQ context is forbidden.
+pub(crate) unsafe fn copy_raw_from_user(
+    dst: *mut u8,
+    src_uptr: u64,
+    len: usize,
+) -> Result<(), u64> {
+    validate_user_range(src_uptr, len)?;
     let src = src_uptr as *const u8;
-    // SAFETY: dst is a live kernel slice; src is range-validated; the
+    // SAFETY: dst retains writable kernel RAM; src is range-validated; the
     // guarded copy opens the SMAP bracket itself and catches any
     // unrecoverable fault (#GP non-canonical, #PF on an address a
     // racing munmap just removed from the AS) as Err instead of a
@@ -3744,10 +3760,10 @@ pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(),
     #[cfg(target_arch = "x86_64")]
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        narf_arch::x86_64::smap::copy_user_guarded(dst.as_mut_ptr(), src, dst.len())
+        narf_arch::x86_64::smap::copy_user_guarded(dst, src, len)
             .map_err(|_remaining| EFAULT as u64)?;
     }
-    // SAFETY: dst is a live kernel slice; src is range-validated; the
+    // SAFETY: dst retains writable kernel RAM; src is range-validated; the
     // guarded copy catches any unrecoverable EL1 data abort (a validated-
     // but-unmapped user page, or a racing munmap) as Err instead of a
     // kernel panic — Linux's arm64 uaccess extable-fixup -EFAULT semantics.
@@ -3756,7 +3772,7 @@ pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(),
     #[cfg(target_arch = "aarch64")]
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        narf_arch::aarch64::uaccess::copy_user_guarded(dst.as_mut_ptr(), src, dst.len())
+        narf_arch::aarch64::uaccess::copy_user_guarded(dst, src, len)
             .map_err(|_remaining| EFAULT as u64)?;
     }
     // SAFETY: any other target — plain volatile read of each in-range user
@@ -3764,8 +3780,8 @@ pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(),
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        for (i, b) in dst.iter_mut().enumerate() {
-            *b = core::ptr::read_volatile(src.add(i));
+        for i in 0..len {
+            core::ptr::write(dst.add(i), core::ptr::read_volatile(src.add(i)));
         }
     }
     Ok(())

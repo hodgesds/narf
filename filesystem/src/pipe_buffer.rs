@@ -30,13 +30,19 @@ struct OwnedPage {
 
 impl OwnedPage {
     fn allocate() -> Result<Self, ()> {
-        let frame = narf_memory::alloc_frame().map_err(|_| ())?;
+        let page = Self::allocate_uninit()?;
         // SAFETY: exclusive fresh allocator page. Actors receive initialized
         // mutable slices, including on short reads and copy failures.
         unsafe {
-            core::ptr::write_bytes(frame.start_address().kernel_mut_ptr::<u8>(), 0, PIPE_BUF);
+            core::ptr::write_bytes(page.pointer(), 0, PIPE_BUF);
         }
-        Ok(Self { frame })
+        Ok(page)
+    }
+
+    fn allocate_uninit() -> Result<Self, ()> {
+        narf_memory::alloc_frame()
+            .map(|frame| Self { frame })
+            .map_err(|_| ())
     }
 
     fn pointer(&self) -> *mut u8 {
@@ -257,6 +263,26 @@ impl PipeBufs {
         self.write_internal(len, packet, true, copy)
     }
 
+    /// Copy directly into owned pipe RAM. Fresh full pages avoid the clear
+    /// that initialized-slice actors require. Only a successful complete copy
+    /// turns such a page into a published PipeFrame or reusable spare.
+    ///
+    /// # Safety
+    /// On Ok, `copy` must initialize exactly the requested byte count at its
+    /// destination. It must access no bytes outside that range and retain no
+    /// pointer or reference beyond the callback. The destination may be
+    /// uninitialized and cannot be read before writing. Bytes from a failed
+    /// callback stay unpublished; earlier complete pages remain committed.
+    pub unsafe fn write_with_raw(
+        &mut self,
+        len: usize,
+        packet: bool,
+        copy: impl FnMut(usize, *mut u8, usize) -> Result<(), u64>,
+    ) -> Result<usize, u64> {
+        // SAFETY: the caller supplies the complete-initialization guarantee.
+        unsafe { self.write_internal_raw::<true>(len, packet, true, copy) }
+    }
+
     /// Buffered-provider fallback for a nonmergeable imported pipe buffer.
     pub fn write_unmerged(
         &mut self,
@@ -327,33 +353,49 @@ impl PipeBufs {
         merge: bool,
         mut copy: impl FnMut(usize, &mut [u8]) -> Result<(), u64>,
     ) -> Result<usize, u64> {
+        // SAFETY: false keeps every destination page fully initialized before
+        // this adapter forms a slice. Published and cached pages are always
+        // initialized, including those produced by the raw full-page path.
+        unsafe {
+            self.write_internal_raw::<false>(len, packet, merge, |offset, ptr, count| {
+                copy(offset, core::slice::from_raw_parts_mut(ptr, count))
+            })
+        }
+    }
+
+    unsafe fn write_internal_raw<const UNINIT_FULL_PAGE: bool>(
+        &mut self,
+        len: usize,
+        packet: bool,
+        merge: bool,
+        mut copy: impl FnMut(usize, *mut u8, usize) -> Result<(), u64>,
+    ) -> Result<usize, u64> {
         let mut written = if merge { self.merge_len(len) } else { 0 };
         if written != 0 {
             self.frames
                 .back_mut()
                 .unwrap()
-                .append(written, |dst| copy(0, dst))?;
+                .append(written, |dst| copy(0, dst.as_mut_ptr(), dst.len()))?;
             self.bytes += written;
         }
         while written < len && !self.is_full() {
             let count = (len - written).min(PIPE_BUF);
-            let page = match self.take_spare() {
-                Some(page) => page,
-                None => match OwnedPage::allocate() {
-                    Ok(page) => page,
+            let (page, uninit) = match self.take_spare() {
+                Some(page) => (page, false),
+                None => match if UNINIT_FULL_PAGE && count == PIPE_BUF {
+                    OwnedPage::allocate_uninit()
+                } else {
+                    OwnedPage::allocate()
+                } {
+                    Ok(page) => (page, UNINIT_FULL_PAGE && count == PIPE_BUF),
                     Err(_) if written != 0 => break,
                     Err(_) => return Err(12u64),
                 },
             };
-            let mut frame = PipeFrame {
-                page: Page::Owned(page),
-                offset: 0,
-                len: 0,
-                packet,
-                mergeable: true,
-            };
-            if let Err(errno) = frame.append(count, |dst| copy(written, dst)) {
-                if let Page::Owned(page) = frame.page {
+            if let Err(errno) = copy(written, page.pointer(), count) {
+                // An incomplete raw copy must never enter the initialized
+                // page cache or a PipeFrame; dropping it releases the frame.
+                if !uninit {
                     self.cache_page(page);
                 }
                 if written != 0 {
@@ -361,7 +403,13 @@ impl PipeBufs {
                 }
                 return Err(errno);
             }
-            frame.mergeable = merge && !packet;
+            let frame = PipeFrame {
+                page: Page::Owned(page),
+                offset: 0,
+                len: count,
+                packet,
+                mergeable: merge && !packet,
+            };
             self.frames.push_back(frame);
             self.bytes += count;
             written += count;
@@ -628,5 +676,69 @@ mod tests {
     kernel_test_in!(
         "filesystem/pipe",
         smoke_pipe_sharing_allocation_failure_keeps_unique_page
+    );
+
+    fn smoke_pipe_raw_copy_failure_never_publishes_uninitialized_page() -> TestResult {
+        let mut pipe = PipeBufs::new();
+        // SAFETY: successful callbacks initialize the entire supplied range;
+        // the failing callback writes only inside its range and publishes none.
+        let result = unsafe {
+            pipe.write_with_raw(2 * PIPE_BUF, false, |offset, dst, count| {
+                if offset == 0 {
+                    core::ptr::write_bytes(dst, 0x5a, count);
+                    Ok(())
+                } else {
+                    dst.write(0xa5);
+                    Err(14)
+                }
+            })
+        };
+        if result != Ok(PIPE_BUF)
+            || pipe.len() != PIPE_BUF
+            || pipe.spare.iter().any(Option::is_some)
+            || !pipe.with_front(PIPE_BUF, |bytes| bytes.iter().all(|&byte| byte == 0x5a))
+        {
+            return TestResult::Fail("failed raw page copy published or cached incomplete backing");
+        }
+        pipe.commit(PIPE_BUF);
+        // SAFETY: the error callback writes one in-range byte. The preexisting
+        // cached page remains fully initialized despite the rejected write.
+        if unsafe {
+            pipe.write_with_raw(PIPE_BUF, false, |_, dst, _| {
+                dst.write(0xa5);
+                Err(14)
+            })
+        } != Err(14)
+            || !pipe.is_empty()
+            || pipe.spare.iter().flatten().count() != 1
+        {
+            return TestResult::Fail("failed raw copy did not preserve initialized spare reuse");
+        }
+        let mut partial = PipeBufs::new();
+        // SAFETY: the supplied three-byte destination is completely initialized.
+        if unsafe {
+            partial.write_with_raw(3, false, |_, dst, count| {
+                core::ptr::write_bytes(dst, 0x11, count);
+                Ok(())
+            })
+        } != Ok(3)
+        {
+            return TestResult::Fail("partial raw write fixture failed");
+        }
+        if partial.write_with(PIPE_BUF - 3, false, |_, bytes| {
+            if bytes.iter().any(|&byte| byte != 0) {
+                return Err(5);
+            }
+            bytes.fill(0x22);
+            Ok(())
+        }) != Ok(PIPE_BUF - 3)
+        {
+            return TestResult::Fail("partial raw page left an uninitialized append tail");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "filesystem/pipe",
+        smoke_pipe_raw_copy_failure_never_publishes_uninitialized_page
     );
 }

@@ -73,10 +73,13 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
     }
 
     if crate::pipe::is_pipe(endpoint.ops.as_ref()) {
-        write_pipe_user(ctx, &endpoint, count, |offset, bytes| {
-            // SAFETY: validated scalar range; copy commits one page at a time.
-            unsafe { copy_from_user(bytes, user_ptr + offset as u64) }
-        });
+        // SAFETY: guarded copy initializes every destination byte on Ok and
+        // retains no pointer. A failed page copy remains unpublished.
+        unsafe {
+            write_pipe_user(ctx, &endpoint, count, |offset, dst, len| {
+                copy_raw_from_user(dst, user_ptr + offset as u64, len)
+            });
+        }
         return;
     }
 

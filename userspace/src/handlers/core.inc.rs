@@ -5054,16 +5054,21 @@ fn read_pipe_user(
 /// Native pipes consume scalar/vector iterators directly under their payload
 /// mutex. A blocked large write retains its accepted prefix on the task's
 /// kernel stack instead of restarting and duplicating bytes already sent.
-fn write_pipe_user(
+///
+/// # Safety
+/// `copy` must initialize all requested bytes on Ok, access only the supplied
+/// destination range, and retain no destination pointer after the callback.
+unsafe fn write_pipe_user(
     ctx: &mut dyn TrapContext,
     endpoint: &CopyFdEndpoint,
     count: usize,
-    mut copy: impl FnMut(usize, &mut [u8]) -> Result<(), u64>,
+    mut copy: impl FnMut(usize, *mut u8, usize) -> Result<(), u64>,
 ) {
     let task = current_task_id();
     let mut total = 0;
     loop {
-        match crate::pipe::write_from_iter(endpoint.ops.as_ref(), count - total, |offset, bytes| copy(total + offset, bytes)) {
+        // SAFETY: the syscall adapter guarantees full initialization on Ok.
+        match unsafe { crate::pipe::write_from_raw_iter(endpoint.ops.as_ref(), count - total, |offset, ptr, len| copy(total + offset, ptr, len)) } {
             Ok((n, full)) => {
                 total += n;
                 if total == count || (n != 0 && !full) { break; }

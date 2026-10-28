@@ -118,6 +118,15 @@ Vector reads operate on page fragments
 without a payload-sized staging allocation. Ordinary and packet pipes share
 the same bounded ring implementation as named FIFOs.
 
+Scalar/vector user writes use guarded raw copies. Fresh full pages skip the
+initial clear, as in Linux's `alloc_page` / `copy_page_from_iter` path. They
+become pipe buffers only after the complete page copy succeeds; an incomplete
+fresh page is freed without entering the ring or spare cache. Partial fresh
+pages and all cached pages remain fully initialized, so safe slice actors can
+continue to use unpublished tails. A failed later page returns the previously
+committed prefix. The `filesystem/pipe` regression covers fresh-page faults,
+cached-page faults, and a raw partial write followed by safe tail merging.
+
 Throughput/latency parity requires the statistical protocol in
 `verification/specification/spec.md` §8. Functional QEMU runtimes are not
 performance evidence.

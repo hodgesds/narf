@@ -734,6 +734,11 @@ Ordinary writes own page metadata inline. Tee and partial splice allocate
 shared-reference metadata only when a unique page first becomes shared;
 allocation failure leaves that source page intact and reports `ENOMEM` if no
 prefix was transferred. Whole-buffer splice moves ownership without promotion.
+Scalar and vector pipe writes guarded-copy directly into raw owned RAM. Fresh
+full pages skip pre-zeroing; they become readable only after every byte was
+initialized. Faulted incomplete pages are discarded, while earlier complete
+page buffers remain committed. Partial pages retain initialized backing and
+the user-copy trap fixups, packet atomicity, and error ordering are preserved.
 Both operations acquire per-pipe sleepable mutexes in address order. Payload
 copies and allocations hold no pipe IRQ spinlock. Poll, FIONREAD, and endpoint
 closure use atomic queue snapshots; a per-pipe short publication lock orders
