@@ -36,7 +36,6 @@ ath10k	vht80p80	VHT 80+80 on QCA9984/QCA9888	feature	drivers/wireless/specificat
 ath10k	wake_offload	Wake offload	feature	drivers/wireless/specification/ath10k.md	947
 ath10k	wpa3	WPA3	feature	drivers/wireless/specification/ath10k.md	946
 ath11k	aarch64_composition	Native aarch64 composed startup/PCI/IRQ/board-discovery fixtures; integration fixtures are x86-only and aarch64 lacks DTB/PCI-node plumbing	unknown	drivers/wireless/specification/ath11k.md	1891
-ath11k	dt_board_variant	Device-tree board-variant discovery (and DT memory-region fixed-memory path); needs a kernel boot-DTB accessor and PCI-device-to-DT-node association	feature	drivers/wireless/specification/ath11k.md	1952
 ath11k	ipq5018_enablement	IPQ5018 native SoC/AHB profile enablement	chip	drivers/wireless/specification/ath11k.md	1894
 ath11k	ipq6018_enablement	IPQ6018 native SoC/AHB profile enablement	chip	drivers/wireless/specification/ath11k.md	1894
 ath11k	ipq8074_enablement	IPQ8074 native SoC/AHB profile enablement	chip	drivers/wireless/specification/ath11k.md	1894

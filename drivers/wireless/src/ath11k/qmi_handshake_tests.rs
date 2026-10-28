@@ -2396,3 +2396,227 @@ kernel_test_in!(
     "drivers/wireless/ath11k",
     smoke_wlfw_recover_with_power_cycle
 );
+
+// ── Devicetree board variant / fixed memory region ────────────────
+
+/// A DTB: `/reserved-memory/wlan` (phandle 7) and a host bridge (domain
+/// 0) → root port (devfn 0) → WCN6855 (devfn 0) with `props`.
+fn wcn6855_dtb(props: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut strings = Vec::new();
+    let mut s = Vec::new();
+    let mut prop = |s: &mut Vec<u8>, name: &str, value: &[u8]| {
+        let off = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        s.extend_from_slice(&3u32.to_be_bytes());
+        s.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        s.extend_from_slice(&off.to_be_bytes());
+        s.extend_from_slice(value);
+        while s.len() % 4 != 0 {
+            s.push(0);
+        }
+    };
+    let begin = |s: &mut Vec<u8>, name: &str| {
+        s.extend_from_slice(&1u32.to_be_bytes());
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        while s.len() % 4 != 0 {
+            s.push(0);
+        }
+    };
+    let end = |s: &mut Vec<u8>| s.extend_from_slice(&2u32.to_be_bytes());
+    begin(&mut s, "");
+    begin(&mut s, "reserved-memory");
+    prop(&mut s, "#address-cells", &[0, 0, 0, 2]);
+    prop(&mut s, "#size-cells", &[0, 0, 0, 2]);
+    begin(&mut s, "wlan@8c400000");
+    prop(
+        &mut s,
+        "reg",
+        &[0, 0, 0, 0, 0x8c, 0x40, 0, 0, 0, 0, 0, 0, 0, 0x30, 0, 0],
+    );
+    prop(&mut s, "phandle", &[0, 0, 0, 7]);
+    end(&mut s);
+    end(&mut s);
+    begin(&mut s, "pcie@1c08000");
+    prop(&mut s, "device_type", b"pci\0");
+    prop(&mut s, "linux,pci-domain", &[0, 0, 0, 0]);
+    begin(&mut s, "pcie@0");
+    prop(&mut s, "device_type", b"pci\0");
+    prop(&mut s, "reg", &[0; 20]);
+    begin(&mut s, "wifi@0");
+    prop(&mut s, "reg", &[0; 20]);
+    for (name, value) in props {
+        prop(&mut s, name, value);
+    }
+    end(&mut s);
+    end(&mut s);
+    end(&mut s);
+    end(&mut s);
+    s.extend_from_slice(&9u32.to_be_bytes());
+    let off_struct = 40u32 + 16;
+    let off_strings = off_struct + s.len() as u32;
+    let mut out = Vec::new();
+    for v in [
+        0xd00d_feedu32,
+        off_strings + strings.len() as u32,
+        off_struct,
+        off_strings,
+        40,
+        17,
+        16,
+        0,
+        strings.len() as u32,
+        s.len() as u32,
+    ] {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    out.extend_from_slice(&[0; 16]);
+    out.extend_from_slice(&s);
+    out.extend_from_slice(&strings);
+    out
+}
+
+/// `ath11k_core_check_dt`: `qcom,calibration-variant` before the legacy
+/// `qcom,ath11k-calibration-variant`, `strscpy` truncation, the DT value
+/// replacing an SMBIOS one, `memory-region` → `ATH11K_FLAG_FIXED_MEM_RGN`
+/// with its `/reserved-memory` resource, and no node / no DTB facts.
+fn smoke_wlfw_dt_board_variant() -> TestResult {
+    run_test(|| {
+        let both = wcn6855_dtb(&[
+            ("qcom,ath11k-calibration-variant", b"LEGACY\0"),
+            ("qcom,calibration-variant", b"LE_X13S\0"),
+            ("memory-region", &[0, 0, 0, 7]),
+        ]);
+        let facts = dt_facts_in(&both, 0, &[0, 0]).ok_or("node not associated")?;
+        ensure!(
+            facts.variant.as_deref() == Some(&b"LE_X13S"[..])
+                && facts.memory_region
+                && facts.reserved == Some((0x8c40_0000, 0x30_0000)),
+            "variant / memory-region facts"
+        );
+        let legacy = wcn6855_dtb(&[("qcom,ath11k-calibration-variant", b"LEGACY\0")]);
+        let facts = dt_facts_in(&legacy, 0, &[0, 0]).ok_or("legacy node")?;
+        ensure!(
+            facts.variant.as_deref() == Some(&b"LEGACY"[..]) && !facts.memory_region,
+            "legacy property fallback"
+        );
+        let long = wcn6855_dtb(&[(
+            "qcom,calibration-variant",
+            b"0123456789abcdef0123456789abcdefXYZ\0",
+        )]);
+        ensure!(
+            dt_facts_in(&long, 0, &[0, 0])
+                .and_then(|f| f.variant)
+                .is_some_and(|v| v.len() == ATH11K_QMI_BDF_EXT_STR_LENGTH - 1),
+            "strscpy truncation"
+        );
+        let unterminated = wcn6855_dtb(&[("qcom,calibration-variant", b"NONUL")]);
+        ensure!(
+            dt_facts_in(&unterminated, 0, &[0, 0]).is_some_and(|f| f.variant.is_none()),
+            "unterminated string accepted"
+        );
+        ensure!(
+            dt_facts_in(&both, 0, &[0, 8]).is_none() && dt_facts_in(&both, 1, &[0, 0]).is_none(),
+            "foreign function / domain associated"
+        );
+        let dt = dt_facts_in(&both, 0, &[0, 0]);
+        ensure!(
+            bdf_ext(b"SMBIOS".to_vec(), dt.as_ref()) == b"LE_X13S"
+                && bdf_ext(b"SMBIOS".to_vec(), None) == b"SMBIOS"
+                && bdf_ext(
+                    b"SMBIOS".to_vec(),
+                    dt_facts_in(&wcn6855_dtb(&[]), 0, &[0, 0]).as_ref()
+                ) == b"SMBIOS",
+            "SMBIOS then DT order"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_wlfw_dt_board_variant);
+
+/// `ATH11K_FLAG_FIXED_MEM_RGN`: `ath11k_qmi_assign_target_mem_chunk` puts
+/// HOST_DDR at the reserved region, BDF at `bdf_addr`, CALDB after HOST_DDR
+/// (cold-boot calibration) or at 0, drops other types, never allocates DMA
+/// and never answers "delayed"; a missing/small region or oversized CALDB
+/// fails.
+fn smoke_wlfw_fixed_mem_region() -> TestResult {
+    run_test(|| {
+        let segs = [
+            (QMI_WLANFW_MEM_TYPE_DDR_V01, 0x10_0000),
+            (QMI_WLANFW_MEM_CAL_V01, 0x1000),
+            (QMI_WLANFW_MEM_BDF_V01, 0x2000),
+            (QMI_WLANFW_MEM_M3_V01, 0x3000),
+        ];
+        let region = Some((0x8c40_0000, 0x30_0000));
+        ensure!(
+            assign_fixed_target_mem(&segs, region, 0, true)
+                == Ok(vec![
+                    (0x8c40_0000, 0x10_0000, 1),
+                    (0x8c50_0000, 0x1000, 4),
+                    (0, 0x2000, 2),
+                ]),
+            "cold-boot CALDB after HOST_DDR"
+        );
+        ensure!(
+            assign_fixed_target_mem(&segs[1..2], None, 0, true)
+                == Ok(vec![(ATH11K_QMI_CALDB_ADDRESS, 0x1000, 4)])
+                && assign_fixed_target_mem(&segs[1..2], None, 0, false) == Ok(vec![(0, 0x1000, 4)]),
+            "CALDB without HOST_DDR"
+        );
+        ensure!(
+            assign_fixed_target_mem(&segs, None, 0, true) == Err(ENOENT)
+                && assign_fixed_target_mem(&segs, Some((0x8c40_0000, 0x1000)), 0, true)
+                    == Err(EINVAL)
+                && assign_fixed_target_mem(
+                    &[(QMI_WLANFW_MEM_CAL_V01, ATH11K_QMI_CALDB_SIZE + 1)],
+                    region,
+                    0,
+                    true
+                ) == Err(EINVAL),
+            "assignment failures"
+        );
+        // Full handshake: one round, fixed addresses, only M3 allocated.
+        let mut s = Script::wcn6855();
+        s.mem_rounds = vec![vec![
+            seg(0x10_0000, QMI_WLANFW_MEM_TYPE_DDR_V01),
+            seg(0x1000, QMI_WLANFW_MEM_CAL_V01),
+        ]];
+        let board = elf_blob(100, 7);
+        let cfg = config().with_fixed_mem_region(region);
+        let caldb = if cfg.coldboot_cal_support() {
+            0x8c50_0000
+        } else {
+            0
+        };
+        let mut w = wlfw_with(
+            s,
+            standard_files(&board, &[1, 2, 3], &[9; 64]),
+            FakeDma::new(),
+            cfg,
+        );
+        let info = block(w.run_to_fw_ready()).map_err(|_| "fixed-memory handshake")?;
+        ensure!(
+            info.mem_delayed_rounds == 0
+                && info.target_mem == [(0x8c40_0000, 0x10_0000, 1), (caldb, 0x1000, 4)]
+                && w.dma.allocs.len() == 1,
+            "fixed region answered without DMA chunks"
+        );
+        // A memory-region whose resource cannot be resolved stalls Linux;
+        // here the handshake fails with TARGET_MEM_ALLOC.
+        let mut s = Script::wcn6855();
+        s.mem_rounds = vec![vec![seg(0x10_0000, QMI_WLANFW_MEM_TYPE_DDR_V01)]];
+        let mut w = wlfw_with(
+            s,
+            standard_files(&board, &[1, 2, 3], &[9; 64]),
+            FakeDma::new(),
+            config().with_fixed_mem_region(None),
+        );
+        let e = block(w.run_to_fw_ready())
+            .err()
+            .ok_or("unresolved region")?;
+        ensure!(e.step == step::TARGET_MEM_ALLOC, "TARGET_MEM_ALLOC");
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_wlfw_fixed_mem_region);

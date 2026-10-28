@@ -1888,7 +1888,7 @@ from physical RF, board, firmware and userspace interoperability acceptance.
 
 | Profile | Implemented reachable software | Remaining or inapplicable scope |
 |---|---|---|
-| WCN6855 HW2.0/HW2.1 | Native dynamic-window PCI/MHI/QMI/CE/HTC/WMI/DP; advertised-band legacy/HT/VHT/HE station/AP/P2P, security/keys/PMF, four-vdev/two-channel ownership, scan/ROC, recovery and PS/WoW/cold suspend; firmware power readback and retained recovery channel reservations | Native composed hardware fixtures remain x86-only; real aarch64 startup/PCI/IRQ/board discovery has no equivalent composed configuration. DT board-variant discovery remains missing (no kernel DTB accessor or PCI-device-to-DT-node association for drivers). Per-dialog TWT control and radar-detector diagnostics are implemented as the Linux debugfs-equivalent `Mac`/`Shared` APIs (`mac/diag.rs`; no nl80211 surface exists in Linux either). Non-contiguous RATEMASK programming and spectral diagnostics are inapplicable: Linux refuses the former with `-EINVAL` and initialises spectral only when `hw_params.spectral.fft_sz != 0`, which is false for every admitted profile (`hw::HwRev::spectral`, `hw::spectral_supported`; `group_pn_tests.rs::smoke_ath11k_spectral_inapplicable_on_admitted_pci`). |
+| WCN6855 HW2.0/HW2.1 | Native dynamic-window PCI/MHI/QMI/CE/HTC/WMI/DP; advertised-band legacy/HT/VHT/HE station/AP/P2P, security/keys/PMF, four-vdev/two-channel ownership, scan/ROC, recovery and PS/WoW/cold suspend; firmware power readback and retained recovery channel reservations | Native composed hardware fixtures remain x86-only; real aarch64 startup/PCI/IRQ/board discovery has no equivalent composed configuration. DT board-variant and `memory-region` fixed-memory discovery are implemented (`board::dt_facts`, `wlfw::assign_fixed_target_mem`). Per-dialog TWT control and radar-detector diagnostics are implemented as the Linux debugfs-equivalent `Mac`/`Shared` APIs (`mac/diag.rs`; no nl80211 surface exists in Linux either). Non-contiguous RATEMASK programming and spectral diagnostics are inapplicable: Linux refuses the former with `-EINVAL` and initialises spectral only when `hw_params.spectral.fft_sz != 0`, which is false for every admitted profile (`hw::HwRev::spectral`, `hw::spectral_supported`; `group_pn_tests.rs::smoke_ath11k_spectral_inapplicable_on_admitted_pci`). |
 | QCA6390 HW2.0 | Independent IPQ8074 RX descriptor/DP profile and core dispatch, shared supported MAC/runtime capabilities, native normal/error/coalescing/fragment ownership and composed station/recovery path | The same explicit optional/control and architecture gaps above apply only when target services advertise them. Six-GHz/HE160/80+80/extended security are admitted only from actual band, peer and firmware capabilities, not inferred from WCN6855. |
 | QCN9074 | PCI identity/configuration definitions only; rejected with BME disabled before MMIO/MSI/firmware activation | Missing native static BAR windows, QCN9074 HAL register/operation tables, non-shadow rings, independent core/per-pdev/HTT peer-map-v2 configuration, QCN RX/REO/DP runtime and composed ownership tests. This is missing software for a recognized profile. WCN6855/QCA6390 tests cannot establish it. |
 | Other Linux ath11k SoC/AHB profiles | No native NARF admission | IPQ8074/IPQ6018/IPQ5018/WCN6750 platform IRQ, reset, reserved-memory/board and HAL profiles require their own bus/firmware lifetime contracts. Their helper constants/layouts do not provide an admitted runtime. |
@@ -1949,16 +1949,18 @@ RF acceptance must come from real platform inputs, never this inventory.
   printable ASCII, `strscpy` into 32 bytes (an over-long suffix is kept
   truncated to 31, as Linux leaves it), first structure that sets a
   non-empty `bdf_ext` wins. No 0xF8 / none valid = no variant (QEMU).
-  DT variant (`ath11k_core_check_dt`) is not ported. It is applicable to
-  aarch64 DT platforms carrying a WCN6855 PCIe node (e.g. a
-  `qcom,ath11k-calibration-variant` under the root-port node; Linux runs it
-  after SMBIOS in `ath11k_qmi_request_target_cap`, so a DT value replaces
-  an SMBIOS one), but needs two kernel facilities NARF drivers do not yet
-  have: a boot DTB accessor (the aarch64 `BootInfo::dtb_phys` is consumed
-  only by `boot`/`bus`) and `pci_set_of_node`'s association of a PCI
-  function with its DT child (`of_pci_find_child_device` by devfn under the
-  bridge's node). The same association gates PCI `memory-region`
-  (`ATH11K_FLAG_FIXED_MEM_RGN`) below.
+  DT variant (`ath11k_core_check_dt`, `board::dt_facts`): the probe finds
+  the function's Devicetree node like Linux `pci_set_of_node` — the boot
+  DTB from `narf_bus::boot_dtb()`, the root-bus-first devfn chain from
+  `narf_bus::pci::devfn_path` and `narf_firmware_fdt::for_pci_function`
+  (host bridge by `linux,pci-domain`, one `reg`-devfn child per hop, unique
+  match only). `qcom,calibration-variant`, else the legacy
+  `qcom,ath11k-calibration-variant`, is read with `of_property_read_string`
+  semantics (NUL required) and `strscpy`-truncated to 31 bytes; it replaces
+  the SMBIOS value as Linux's later call in `ath11k_qmi_request_target_cap`
+  does (`board::bdf_ext`). Without a DTB (x86/ACPI, QEMU `-kernel` without
+  `-dtb`) or a node the SMBIOS value stands
+  (`qmi_handshake_tests.rs::smoke_wlfw_dt_board_variant`).
 - NARF-only bounds: Linux waits forever for the WLFW server and for
   REQUEST_MEM / FW_MEM_READY / FW_READY and for QRTR RESUME_TX, and
   silently stalls when the memory-request callback cannot allocate;
@@ -1971,9 +1973,16 @@ RF acceptance must come from real platform inputs, never this inventory.
   `fixed_mem_region` are true only for the IPQ8074/IPQ6018/IPQ5018 AHB
   SoCs (`qmi_wlfw::QmiHwParams` mirrors both false for QCA6390/WCN6855).
   The one PCI route to fixed memory is `ATH11K_FLAG_FIXED_MEM_RGN`, set by
-  `ath11k_pci_probe` only when the device's DT node has `memory-region`; it
-  shares the DT-association prerequisite of the DT board variant above and
-  is unreachable on ACPI/x86 and on DT systems without that property.
+  `ath11k_pci_probe` only when the device's DT node has `memory-region`:
+  `WlfwConfig::with_fixed_mem_region` then makes the REQUEST_MEM handler run
+  `wlfw::assign_fixed_target_mem` (`ath11k_qmi_assign_target_mem_chunk`:
+  HOST_DDR at the first `memory-region` `/reserved-memory` resource, which
+  must hold it; BDF at the PCI `bdf_addr` 0; CALDB after HOST_DDR with
+  cold-boot calibration, `ATH11K_QMI_CALDB_ADDRESS` without a region, else
+  0; other types dropped) instead of DMA allocation, and RESPOND_MEM is never
+  "delayed". An unresolvable region fails with `TARGET_MEM_ALLOC` where Linux
+  stalls (`smoke_wlfw_fixed_mem_region`). The region is boot-reserved
+  (`no-map`) memory the firmware owns; NARF never maps it.
   FTM (`ATH11K_FIRMWARE_MODE_FTM`) is selected only by the `ftm_mode=1`
   module parameter; it then skips mac80211 registration and exposes
   `NL80211_CMD_TESTMODE` passthrough of opaque, vendor-defined WMI FTM

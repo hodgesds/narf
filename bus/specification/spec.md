@@ -118,6 +118,16 @@ pub fn watch() -> impl Stream<Item = BusEvent>;       // hot-plug arrivals / rem
 pub unsafe fn discover_pmu_ppi(dtb: PhysAddr) -> Option<u32>;
 ```
 
+`boot_dtb() -> Option<PhysAddr>` returns the firmware Devicetree blob the
+aarch64 `init` received (`None` on x86_64 or a DTB-less boot); the blob lies
+in boot-reserved RAM under the direct map and drivers read it with
+`narf_firmware_fdt::discover`. `pci::devfn_path(&BusDevice) ->
+Option<Vec<u8>>` returns each hop's `device << 3 | function` from the root
+bus down to the function (via `upstream_bridge`), the chain Linux
+`pci_set_of_node` / `of_pci_find_child_device` follows; drivers pass it to
+`narf_firmware_fdt::for_pci_function` to reach the function's `of_node`
+(ath11k `qcom,calibration-variant` / `memory-region`).
+
 `discover_pmu_ppi` accepts only an `arm,armv8-pmuv3` node with a GIC
 three-cell PPI interrupt specifier and returns its architectural INTID. It has
 no platform-default fallback because the PMU interrupt is implementation-defined.

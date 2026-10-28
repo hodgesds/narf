@@ -206,6 +206,63 @@ pub struct WlfwConfig {
     pub ind_timeout_ms: u32,
     /// `ATH11K_COLD_BOOT_FW_RESET_DELAY` (60 s).
     pub coldboot_timeout_ms: u32,
+    /// `ATH11K_FLAG_FIXED_MEM_RGN`: the PCI function's Devicetree node has
+    /// `memory-region` (`ath11k_pci_probe`); `Some(region)` carries the
+    /// resolved `/reserved-memory` (base, size), `Some(None)` an
+    /// unresolvable one (Linux then fails the assignment).
+    pub fixed_mem_rgn: Option<Option<(u64, u64)>>,
+}
+
+/// `ATH11K_QMI_CALDB_ADDRESS`.
+pub const ATH11K_QMI_CALDB_ADDRESS: u64 = 0x4BA0_0000;
+/// `ATH11K_QMI_CALDB_SIZE`.
+pub const ATH11K_QMI_CALDB_SIZE: u32 = 0x48_0000;
+
+/// `ath11k_qmi_assign_target_mem_chunk` over the firmware's requested
+/// `(type, size)` segments: HOST_DDR takes the reserved region (which
+/// must hold it), BDF the hardware `bdf_addr`, CALDB the bytes after
+/// HOST_DDR (or the fixed CALDB address without a region) when cold-boot
+/// calibration is supported, else 0; other types are dropped ("qmi ignore
+/// invalid mem req type"). Returns the compacted `(paddr, size, type)`
+/// list; `Err` = the HOST_DDR region is missing or too small, or CALDB is
+/// larger than `ATH11K_QMI_CALDB_SIZE`.
+pub fn assign_fixed_target_mem(
+    segments: &[(i32, u32)],
+    region: Option<(u64, u64)>,
+    bdf_addr: u64,
+    coldboot_cal: bool,
+) -> Result<Vec<(u64, u32, i32)>, i32> {
+    let mut out = Vec::with_capacity(segments.len());
+    let mut res: Option<(u64, u64)> = None;
+    let mut host_ddr_sz = 0u64;
+    for &(mem_type, size) in segments {
+        match mem_type as u32 {
+            HOST_DDR_REGION_TYPE => {
+                // of_reserved_mem_region_to_resource / size check.
+                let (start, len) = region.ok_or(ENOENT)?;
+                if len < u64::from(size) {
+                    return Err(EINVAL);
+                }
+                res = Some((start, len));
+                host_ddr_sz = u64::from(size);
+                out.push((start, size, mem_type));
+            }
+            BDF_MEM_REGION_TYPE => out.push((bdf_addr, size, mem_type)),
+            CALDB_MEM_REGION_TYPE => {
+                if size > ATH11K_QMI_CALDB_SIZE {
+                    return Err(EINVAL);
+                }
+                let paddr = match (coldboot_cal, res) {
+                    (true, Some((start, _))) => start + host_ddr_sz,
+                    (true, None) => ATH11K_QMI_CALDB_ADDRESS,
+                    (false, _) => 0,
+                };
+                out.push((paddr, size, mem_type));
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 /// NARF-only: how long to wait for the server or an indication.
@@ -245,7 +302,20 @@ impl WlfwConfig {
             txn_timeout_ms: ATH11K_QMI_WLANFW_TIMEOUT_MS,
             ind_timeout_ms: ATH11K_NARF_IND_TIMEOUT_MS,
             coldboot_timeout_ms: ATH11K_COLD_BOOT_FW_RESET_DELAY_MS,
+            fixed_mem_rgn: None,
         })
+    }
+
+    /// Apply the PCI function's Devicetree `memory-region` facts
+    /// (`ATH11K_FLAG_FIXED_MEM_RGN`).
+    pub fn with_fixed_mem_region(mut self, region: Option<(u64, u64)>) -> Self {
+        self.fixed_mem_rgn = Some(region);
+        self
+    }
+
+    /// `hw_params.fixed_mem_region || ATH11K_FLAG_FIXED_MEM_RGN`.
+    pub fn fixed_mem(&self) -> bool {
+        self.hw.fixed_mem_region || self.fixed_mem_rgn.is_some()
     }
 
     /// `ath11k_core_coldboot_cal_support` (FTM mode off).
@@ -297,6 +367,8 @@ pub struct TargetMemChunk<M> {
     pub prev_size: u32,
     pub prev_type: i32,
     pub mem: Option<M>,
+    /// The physical address of a fixed-memory assignment (no DMA buffer).
+    pub fixed_paddr: Option<u64>,
 }
 
 impl<M> Default for TargetMemChunk<M> {
@@ -307,6 +379,7 @@ impl<M> Default for TargetMemChunk<M> {
             prev_size: 0,
             prev_type: 0,
             mem: None,
+            fixed_paddr: None,
         }
     }
 }
@@ -471,6 +544,39 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
                 seg.mem_type, seg.size
             ));
         }
+        if self.cfg.fixed_mem() {
+            // ath11k_qmi_assign_target_mem_chunk.
+            let segments: Vec<(i32, u32)> = self
+                .target_mem
+                .iter()
+                .take(self.mem_seg_count)
+                .map(|c| (c.mem_type, c.size))
+                .collect();
+            let region = self.cfg.fixed_mem_rgn.flatten();
+            match assign_fixed_target_mem(&segments, region, 0, self.cfg.coldboot_cal_support()) {
+                Ok(list) => {
+                    for (chunk, (paddr, size, mem_type)) in self.target_mem.iter_mut().zip(&list) {
+                        chunk.mem = None;
+                        chunk.fixed_paddr = Some(*paddr);
+                        chunk.size = *size;
+                        chunk.mem_type = *mem_type;
+                    }
+                    self.mem_seg_count = list.len();
+                }
+                Err(errno) => {
+                    // "failed to assign qmi target memory", no event.
+                    self.log(format_args!(
+                        "qmi: failed to assign qmi target memory: -{}",
+                        errno
+                    ));
+                    self.fatal
+                        .get_or_insert(WlfwError::new(step::TARGET_MEM_ALLOC, 0, errno));
+                    return;
+                }
+            }
+            self.events.push_back(WlfwEvent::RequestMem);
+            return;
+        }
         if let Err(e) = self.alloc_target_mem_chunk() {
             // Linux: "failed to allocate qmi target memory", no event.
             self.log(format_args!(
@@ -545,7 +651,8 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
             .take(self.mem_seg_count)
             .map(|c| {
                 (
-                    c.mem.as_ref().map_or(0, |m| m.dma_addr()),
+                    c.fixed_paddr
+                        .unwrap_or_else(|| c.mem.as_ref().map_or(0, |m| m.dma_addr())),
                     c.size,
                     c.mem_type,
                 )
@@ -604,7 +711,7 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
 
     /// `ath11k_qmi_respond_fw_mem_request`.
     pub async fn respond_fw_mem_request(&mut self) -> Result<(), WlfwError> {
-        let delayed = !self.cfg.hw.fixed_mem_region && self.target_mem_delayed;
+        let delayed = !self.cfg.fixed_mem() && self.target_mem_delayed;
         let req = if delayed {
             self.log(format_args!(
                 "qmi: delays mem_request {}",

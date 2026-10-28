@@ -52,6 +52,8 @@ pub struct ReservedRegion {
 }
 
 mod tests;
+pub mod pci;
+pub use pci::{for_pci_function, memory_region_phandle, reserved_memory_region};
 
 fn be_u32(b: &[u8], off: usize) -> Option<u32> {
     if off + 4 > b.len() {

@@ -87,7 +87,7 @@ pub use driver_match::{
 pub use hotplug::{dispatch_event, register_listener, HotplugError, HotplugEvent, HotplugListener};
 pub use msix::{enable_msix, MsixError, MsixTable, MsixVector};
 pub use registry::{
-    append_devices, bootstrap_registry_authority, claim_device, claim_device_cap, devices, init,
+    append_devices, boot_dtb, bootstrap_registry_authority, claim_device, claim_device_cap, devices, init,
     snapshot, BusDeviceCap, BusDeviceHandle, BusRegistryCap, ClaimError,
 };
 pub use vmd_domain::{

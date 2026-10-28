@@ -146,6 +146,9 @@ pub unsafe fn init(
         // an empty Vec (same tolerance as `boot/src/aarch64` §parse_raw).
         // SAFETY: Valid memory or trusted environment
         let devs = unsafe { crate::aarch64::enumerate(dtb) };
+        if let Some(dtb) = dtb {
+            BOOT_DTB.store(dtb.raw(), core::sync::atomic::Ordering::Release);
+        }
         let n = devs.len();
         install(devs);
         n
@@ -153,6 +156,23 @@ pub unsafe fn init(
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         0
+    }
+}
+
+/// Physical address of the firmware Devicetree blob handed to `init`
+/// (aarch64); 0 = none.
+static BOOT_DTB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The boot Devicetree blob's physical address, recorded by the aarch64
+/// `init` (Linux's `initial_boot_params` equivalent for drivers that need
+/// `of_node` facts such as ath11k `qcom,calibration-variant`). The blob
+/// lies in boot-reserved RAM covered by the kernel direct map; drivers
+/// read it with `narf_firmware_fdt::discover`. `None` on x86_64 and on a
+/// DTB-less boot.
+pub fn boot_dtb() -> Option<narf_memory::PhysAddr> {
+    match BOOT_DTB.load(core::sync::atomic::Ordering::Acquire) {
+        0 => None,
+        raw => Some(narf_memory::PhysAddr::new(raw)),
     }
 }
 

@@ -2473,6 +2473,7 @@ dependencies = [
  "narf-drivers-usb",
  "narf-drivers-wireless-mt76",
  "narf-firmware",
+ "narf-firmware-fdt",
  "narf-firmware-smbios",
  "narf-init",
  "narf-interrupts",

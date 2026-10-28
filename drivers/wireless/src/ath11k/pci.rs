@@ -942,7 +942,20 @@ async fn wlfw_bring_up(ctrl: MhiController<Bar0Mhi>, s: MhiStart, api: FwApi) {
         ));
     };
     // `ath11k_core_check_smbios`: the type-0xF8 `BDF_<variant>` string
-    // from the table the boot-time DMI scan kept (empty = no variant).
+    // from the table the boot-time DMI scan kept (empty = no variant);
+    // then `ath11k_core_check_dt` on the function's Devicetree node
+    // (`pci_set_of_node`), whose variant replaces it. The same node's
+    // `memory-region` sets `ATH11K_FLAG_FIXED_MEM_RGN` (`ath11k_pci_probe`).
+    let (domain, bus, slot, function) = s.pci_addr;
+    let dt = narf_bus::devices()
+        .into_iter()
+        .find(|d| {
+            matches!(d.kind, narf_bus::BusKind::Pcie { addr, .. }
+                if (addr.segment, addr.bus, addr.device, addr.function)
+                    == (domain, bus, slot, function))
+        })
+        .and_then(|d| super::board::dt_facts(&d));
+    let bdf_ext = super::board::bdf_ext(super::board::check_smbios().bdf_ext, dt.as_ref());
     let Some(cfg) = WlfwConfig::pci(
         s.hw_rev,
         s.vendor,
@@ -950,8 +963,12 @@ async fn wlfw_bring_up(ctrl: MhiController<Bar0Mhi>, s: MhiStart, api: FwApi) {
         s.subsystem_vendor,
         s.subsystem_device,
         pci_dev_name(s.pci_addr),
-        super::board::check_smbios().bdf_ext,
-    ) else {
+        bdf_ext,
+    )
+    .map(|cfg| match dt.as_ref().filter(|d| d.memory_region) {
+        Some(d) => cfg.with_fixed_mem_region(d.reserved),
+        None => cfg,
+    }) else {
         let mut ctrl = ctrl;
         abort_mhi_bring_up(&mut ctrl).await;
         return wlfw_fail(wlfw::WlfwError::new(
