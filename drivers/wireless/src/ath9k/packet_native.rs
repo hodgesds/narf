@@ -113,11 +113,11 @@ impl Native {
             vector,
             signal,
         };
-        // SAFETY: same owned cfg space; MSI Enable stays clear until start.
-        if !matches!(
-            self.invoke_cfg(|| unsafe { narf_bus::msi::disable(&msi.config) }),
-            Ok(Ok(()))
-        ) {
+        let disabled = self.invoke_cfg(|| {
+            // SAFETY: same owned cfg space; MSI Enable stays clear until start.
+            unsafe { narf_bus::msi::disable(&msi.config) }
+        });
+        if !matches!(disabled, Ok(Ok(()))) {
             quarantine(&msi);
             return false;
         }
