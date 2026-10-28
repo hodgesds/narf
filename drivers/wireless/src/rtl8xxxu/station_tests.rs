@@ -109,6 +109,11 @@ struct LinkState {
     rates: Option<Vec<u8>>,
     /// (bulk-out DCI, QoS TID, TXDESC queue) per published DATA frame.
     data: Vec<(u8, u8, u8)>,
+    /// Halted bulk IN/OUT pipes (xHCI Halted until Reset Endpoint).
+    halt_rx: bool,
+    halt_tx: bool,
+    clears: Vec<u8>,
+    clear_fails: bool,
 }
 #[derive(Clone)]
 struct Link {
@@ -160,7 +165,7 @@ impl Io for Link {
     }
     fn poll_receive(&self, r: &u64, out: &mut [u8]) -> Result<Option<usize>, UsbError> {
         let mut m = self.state.lock();
-        if m.rx != Some(*r) {
+        if m.rx != Some(*r) || m.halt_rx {
             return Err(UsbError::Stall);
         }
         let Some(frame) = m.queue.pop_front() else {
@@ -307,7 +312,7 @@ impl Io for Link {
     fn poll_send(&self, r: &u64) -> Result<Option<usize>, UsbError> {
         let mut m = self.state.lock();
         let (id, n, m4) = m.tx.ok_or(UsbError::Stall)?;
-        if id != *r {
+        if id != *r || m.halt_tx {
             return Err(UsbError::Stall);
         }
         if m4 && m.hold_m4 {
@@ -327,6 +332,21 @@ impl Io for Link {
             return Ok(());
         }
         Err(UsbError::Stall)
+    }
+    async fn clear_halt(&self, endpoint: u8) -> Result<(), UsbError> {
+        let mut m = self.state.lock();
+        m.clears.push(endpoint);
+        if m.clear_fails {
+            return Err(UsbError::Timeout);
+        }
+        if endpoint & 0x80 != 0 {
+            m.rx = None;
+            m.halt_rx = false;
+        } else {
+            m.tx = None;
+            m.halt_tx = false;
+        }
+        Ok(())
     }
 }
 fn raw(
@@ -1467,4 +1487,115 @@ fn smoke_rtl8188eu_service_only_draws_entropy_at_new_handshake_consumption() -> 
 kernel_test_in!(
     "wireless",
     smoke_rtl8188eu_service_only_draws_entropy_at_new_handshake_consumption
+);
+
+/// A Stall on the open station's bulk IN or OUT pipe no longer kills the
+/// association: the async maintenance path resets exactly that endpoint
+/// and reposts/reopens it, best-effort DATA is dropped, a failed reset is
+/// terminal, and disconnect recovers a halted pipe before draining it.
+fn smoke_rtl8188eu_station_endpoint_halt_recovery_keeps_association() -> TestResult {
+    fn open() -> (Link, Station<Fake, Link>) {
+        let (_, link, mut s) = prepared(false);
+        narf_scheduler::block_on(s.begin(0)).unwrap();
+        for now in 1..20 {
+            narf_scheduler::block_on(s.step(now, SN)).unwrap();
+            if s.controlled_port_open() {
+                break;
+            }
+        }
+        (link, s)
+    }
+    fn ethernet(link: &Link) -> Vec<u8> {
+        let mut ethernet = AP.to_vec();
+        ethernet.extend_from_slice(&link.own);
+        ethernet.extend_from_slice(&[8, 0, 0x45, 0, 0, 20]);
+        ethernet
+    }
+    fn roundtrip(link: &Link, s: &mut Station<Fake, Link>, now: u64) -> bool {
+        let ethernet = ethernet(link);
+        if s.send_ethernet(&ethernet, now).is_err() {
+            return false;
+        }
+        for t in now + 1..now + 5 {
+            if s.poll_network(t, SN).is_err() {
+                return false;
+            }
+        }
+        let mut expected = link.own.to_vec();
+        expected.extend_from_slice(&AP);
+        expected.extend_from_slice(&ethernet[12..]);
+        s.pop_received() == Some(expected)
+    }
+    let (link, mut s) = open();
+    if !s.controlled_port_open() {
+        return TestResult::Fail("halt fixture failed to open the station");
+    }
+    // Bulk IN halt: service keeps polling, maintenance recovers.
+    link.state.lock().halt_rx = true;
+    let posts = link.state.lock().posts;
+    for now in 20..23 {
+        if s.poll_network(now, SN).is_err() {
+            return TestResult::Fail("bulk IN Stall was still terminal");
+        }
+    }
+    if !s.maintenance_pending() || narf_scheduler::block_on(s.maintain()).is_err() {
+        return TestResult::Fail("bulk IN halt did not schedule recovery");
+    }
+    {
+        let m = link.state.lock();
+        if m.clears != [0x81] || m.posts != posts + 1 || m.rx.is_none() {
+            return TestResult::Fail("bulk IN recovery did not reset and repost");
+        }
+    }
+    if !roundtrip(&link, &mut s, 30) {
+        return TestResult::Fail("recovered bulk IN lost the association");
+    }
+    // Bulk OUT halt: the DATA frame is dropped and the slot reopened.
+    link.state.lock().halt_tx = true;
+    s.send_ethernet(&ethernet(&link), 40).unwrap();
+    for now in 41..43 {
+        if s.poll_network(now, SN).is_err() {
+            return TestResult::Fail("bulk OUT Stall was still terminal");
+        }
+    }
+    if s.transmit_ready() || narf_scheduler::block_on(s.maintain()).is_err() {
+        return TestResult::Fail("bulk OUT halt did not hold the slot for recovery");
+    }
+    let out = link.state.lock().clears.last().copied();
+    if !matches!(out, Some(2..=4)) || link.state.lock().tx.is_some() {
+        return TestResult::Fail("bulk OUT recovery did not reset the OUT endpoint");
+    }
+    if s.poll_network(43, SN).is_err() || !s.transmit_ready() {
+        return TestResult::Fail("bulk OUT recovery did not reopen the slot");
+    }
+    for _ in 0..8 {
+        if s.pop_received().is_none() {
+            break;
+        }
+    }
+    if !roundtrip(&link, &mut s, 50) {
+        return TestResult::Fail("recovered bulk OUT lost the association");
+    }
+    // Teardown: disconnect recovers a halted pipe before Stop/SetDeq.
+    link.state.lock().halt_rx = true;
+    let _ = s.poll_network(60, SN);
+    if narf_scheduler::block_on(s.disconnect()).is_err()
+        || s.phase() != Phase::Stopped
+        || link.state.lock().rx.is_some()
+    {
+        return TestResult::Fail("halted station could not disconnect");
+    }
+    // Failure: a failed endpoint reset is terminal.
+    let (link, mut s) = open();
+    link.state.lock().halt_rx = true;
+    link.state.lock().clear_fails = true;
+    let _ = s.poll_network(20, SN);
+    if narf_scheduler::block_on(s.maintain()).is_ok() || s.phase() != Phase::Failed {
+        return TestResult::Fail("failed endpoint reset kept the station open");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/packet",
+    smoke_rtl8188eu_station_endpoint_halt_recovery_keeps_association
 );

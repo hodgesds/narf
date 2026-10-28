@@ -352,11 +352,15 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
     /// True when a connected station holds a live EDCA update that only the
     /// async `maintain` path may program over EP0.
     pub fn maintenance_pending(&self) -> bool {
-        self.phase() == Phase::Connected
-            && self
+        match self.phase() {
+            Phase::Connected => self
                 .station
                 .as_ref()
-                .is_some_and(Station::maintenance_pending)
+                .is_some_and(Station::maintenance_pending),
+            // Passive scanning owns the radio directly.
+            Phase::Passive => self.radio.as_ref().is_some_and(Receiver::recovery_pending),
+            _ => false,
+        }
     }
     /// Async counterpart of `poll` for EP0 work the synchronous network path
     /// must not await (live `rtl8xxxu_conf_tx`). Failure is terminal.
@@ -368,13 +372,22 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
             failed: self.failed.clone(),
             armed: true,
         };
-        let result = self
-            .station
-            .as_mut()
-            .ok_or(Error::State)?
-            .maintain()
-            .await
-            .map_err(Error::Station);
+        let result = if self.phase() == Phase::Passive {
+            self.radio
+                .as_mut()
+                .ok_or(Error::State)?
+                .recover()
+                .await
+                .map(|_| ())
+                .map_err(Error::Radio)
+        } else {
+            self.station
+                .as_mut()
+                .ok_or(Error::State)?
+                .maintain()
+                .await
+                .map_err(Error::Station)
+        };
         attempt.armed = false;
         if result.is_err() {
             self.fail();

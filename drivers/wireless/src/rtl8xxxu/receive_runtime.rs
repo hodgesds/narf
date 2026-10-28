@@ -468,11 +468,36 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
                 }
                 Ok(Some(frames))
             }
+            // A halted bulk-IN pipe is pending recovery, not a receipt.
+            Err(packet_transport::Error::Halted) => Ok(None),
             Err(error) => {
                 self.fail();
                 Err(Error::Packet(error))
             }
         }
+    }
+    /// True while a halted bulk pipe awaits `recover`.
+    pub(super) fn recovery_pending(&self) -> bool {
+        self.packets.is_halted()
+    }
+    /// Endpoint halt recovery for the running radio (Reset Endpoint + Set
+    /// TR Dequeue + CLEAR_FEATURE(ENDPOINT_HALT), then repost). Failure or
+    /// cancellation is terminal like every other packet-owner operation.
+    pub(super) async fn recover(&mut self) -> Result<packet_transport::Recovery, Error> {
+        self.current_wmm()?;
+        if !matches!(self.phase(), Phase::Receiving | Phase::Active) {
+            return Err(Error::State);
+        }
+        let mut attempt = Attempt {
+            firmware: self.firmware.clone(),
+            armed: true,
+        };
+        let result = self.packets.recover().await;
+        attempt.armed = false;
+        result.map_err(|error| {
+            self.fail();
+            Error::Packet(error)
+        })
     }
     pub async fn stop(&mut self) -> Result<(), Error> {
         if !matches!(self.phase(), Phase::Receiving | Phase::Active) {
@@ -663,6 +688,7 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         }
         match self.authority().invoke(|| self.packets.poll_transmit())? {
             Ok(result) => Ok(result),
+            Err(packet_transport::Error::Halted) => Ok(None),
             Err(error) => {
                 self.fail();
                 Err(Error::Packet(error))

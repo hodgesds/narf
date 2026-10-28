@@ -588,6 +588,48 @@ levels/bitmaps and the adaptive descriptor; composed
 initial descriptor, the REG_TX_REPORT_TIME EP0 writes, rate_down on a loss
 report, terminal failure of the write and teardown.
 
+### Bulk endpoint halt recovery and transfer-slot reuse (implemented)
+
+xHCI leaves a bulk endpoint Halted after a Stall, Babble or USB Transaction
+Error completion (xHCI 1.2 §4.10.2). Upstream `rtl8xxxu_rx_complete`
+resubmits only after -EPROTO/-EILSEQ/-ETIME/-EOVERFLOW/-ECOMM/-ENOSR (where
+Linux xHCI already performed its internal halted-endpoint reset) and frees
+the URB on -EPIPE, so a stall permanently loses that receive slot. NARF has
+no hidden controller-side reset, so `packet_transport::Owner` follows the
+USB core `usb_clear_halt` contract instead of failing:
+
+- A halting completion on the bulk-IN or bulk-OUT receipt marks only that
+  pipe halted (`Error::Halted`); the receipt stays retained. The other pipe
+  keeps working (independent endpoint contexts). Every other USB error,
+  short transmit and descriptor error stays terminal.
+- `Owner::recover` runs `USBDevice::clear_endpoint_halt` (Reset Endpoint +
+  Set TR Dequeue to a fresh dequeue, proven Stopped, then
+  CLEAR_FEATURE(ENDPOINT_HALT) resetting the device toggle) for exactly the
+  halted endpoint address, drops the now-stale token, reposts the bulk-IN
+  receipt and reopens the single TX slot. The packet that was in flight on
+  a halted OUT pipe is reported as `transmit_lost` (no USB receipt, no ACK
+  claim). Recovery follows the `stop` discipline: the owner is terminal
+  while the future runs, so an error or a dropped future leaves it failed
+  with every receipt retained.
+- `Owner::stop` recovers a halted pipe first (a Halted endpoint cannot be
+  stopped), so a stopped owner is always reusable on its channel by `start`
+  (fresh RX receipt, empty TX slot). `Receiver` stop/start (Stopped →
+  Receiving) is the reopen path for the radio.
+- `Receiver::poll`/`poll_delivery` report a halted pipe as "pending" rather
+  than an error; `recovery_pending` feeds the existing async maintenance
+  path. `Station::maintain` (FourWay/Open) and `Service::maintain` (Passive
+  scan) call `Receiver::recover` inside the current authority fence. A lost
+  best-effort DATA/Control packet is dropped; a lost EAPOL/MLME frame is
+  terminal (no retransmission owner exists for it). Join-phase halts are not
+  recovered: the join deadline fails the attempt as before.
+
+Tests: `smoke_rtl8188eu_packet_halted_pipes_recover_and_reuse_slots` (all
+three halting codes, pipe isolation, IN repost/OUT slot reuse, stop of a
+halted owner, reset failure and cancelled recovery are terminal) and
+`smoke_rtl8188eu_station_endpoint_halt_recovery_keeps_association` (open
+station survives IN and OUT halts with a full roundtrip afterwards,
+disconnect of a halted station, failed reset is terminal).
+
 ## 4. Invariants
 
 - Linux's disabled→EMU→active handshake precedes firmware writes. MAC TX/RX
@@ -595,7 +637,8 @@ report, terminal failure of the write and teardown.
 - Preserve unrelated SYS/MCU/page-selector fields; reset the checksum with
   its W1C bit, disable download mode before start, reset 8051, and await both
   checksum and init-ready. RTL8188EU does not use another chip's HMTFR init.
-- Short reads/writes, checksum/start failures and USB errors are terminal.
+- Short reads/writes, checksum/start failures and USB errors are terminal,
+  except bulk-pipe halts, which `Owner::recover` resets as specified above.
   No failure cleanup may reuse EP0: Future Drop/error does not prove that
   xHCI retired the prior TD or released its persistent control-data buffer.
 - The initialization attempt is bounded to 30 seconds. Cancellation/deadline

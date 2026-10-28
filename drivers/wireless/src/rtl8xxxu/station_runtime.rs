@@ -506,7 +506,8 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         self.edca.or_else(|| self.plan.wmm())
     }
     pub(super) fn maintenance_pending(&self) -> bool {
-        self.edca_pending.is_some()
+        self.radio.recovery_pending()
+            || self.edca_pending.is_some()
             || self.radio.report_time_pending()
             || self
                 .tx_ba
@@ -577,6 +578,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         let result = proof
             .fence(
                 async {
+                    self.recover_endpoints().await?;
                     self.apply_edca().await?;
                     self.radio.apply_report_time().await.map_err(Error::Radio)?;
                     self.apply_tx_ba().await
@@ -589,6 +591,23 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             self.fail();
         }
         result
+    }
+    /// Recover halted bulk pipes. A discarded best-effort DATA/Control
+    /// packet is treated as lost on air (no USB receipt, no ACK claim); a
+    /// lost EAPOL/MLME frame has no retransmission owner here and is
+    /// terminal, as its handshake timer would be.
+    async fn recover_endpoints(&mut self) -> Result<(), Error> {
+        if !self.radio.recovery_pending() {
+            return Ok(());
+        }
+        let recovery = self.radio.recover().await.map_err(Error::Radio)?;
+        if recovery.transmit_lost {
+            match self.pending.as_ref().map(|p| &p.kind) {
+                Some(Tx::Data | Tx::Control) => self.pending = None,
+                _ => return Err(Error::State),
+            }
+        }
+        Ok(())
     }
     fn progress(&mut self, now: u64) -> Result<bool, Error> {
         self.radio.current_wmm().map_err(Error::Radio)?;

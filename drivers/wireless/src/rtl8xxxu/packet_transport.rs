@@ -1,7 +1,10 @@
 //! Persistent RTL8188EU native USB packet ownership.
 //! No receive timeout cancels/reposts a TD; receipts survive quiet intervals.
-//! One owner is bound to one policy-admitted channel. Retune/recovery needs
-//! endpoint stop/drain and cannot be implemented by changing this label.
+//! One owner is bound to one policy-admitted channel. Retune needs endpoint
+//! stop/drain and cannot be implemented by changing this label. A halted
+//! bulk pipe (xHCI halts on Stall, Babble and USB Transaction Error, xHCI
+//! 1.2 §4.10.2) is recovered with `recover`: Reset Endpoint + Set TR
+//! Dequeue + CLEAR_FEATURE(ENDPOINT_HALT) (`usb_clear_halt`), then repost.
 use super::{
     device_init::Endpoints,
     packet_codec::{self, Kind, Record, MAX_TRANSFER},
@@ -19,6 +22,24 @@ pub enum Error {
     Usb(UsbError),
     Packet(packet_codec::Error),
     ShortTransmit,
+    /// A bulk pipe halted; `recover` must run before further service.
+    Halted,
+}
+/// Completion codes after which xHCI leaves the endpoint Halted.
+fn halts(error: UsbError) -> bool {
+    matches!(
+        error,
+        UsbError::Stall | UsbError::Babble | UsbError::TransactionError
+    )
+}
+/// Outcome of one successful halt recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Recovery {
+    /// The bulk-IN pipe was reset and a fresh receipt reposted.
+    pub receive: bool,
+    /// The bulk-OUT pipe was reset; its in-flight packet was discarded
+    /// without a USB delivery receipt.
+    pub transmit_lost: bool,
 }
 /// No caller/DMA alias survives a begin call: native USB stages TX bytes and
 /// retains RX storage itself. Only an exact terminal receipt may copy/reuse.
@@ -34,6 +55,12 @@ pub trait Io: Send + Sync {
     fn begin_send(&self, dci: u8, bytes: &[u8]) -> Result<Self::Receipt, UsbError>;
     fn poll_send(&self, receipt: &Self::Receipt) -> Result<Option<usize>, UsbError>;
     async fn stop(&self, receipt: &Self::Receipt) -> Result<(), UsbError>;
+    /// Host Reset Endpoint + Set TR Dequeue, then device
+    /// CLEAR_FEATURE(ENDPOINT_HALT) for `endpoint` (descriptor address).
+    /// Any retained receipt on that pipe becomes stale.
+    async fn clear_halt(&self, _endpoint: u8) -> Result<(), UsbError> {
+        Err(UsbError::NotConfigured)
+    }
 }
 pub struct UsbIo(Arc<USBDevice>);
 impl core::fmt::Debug for UsbIo {
@@ -68,10 +95,15 @@ impl Io for UsbIo {
     async fn stop(&self, receipt: &BulkToken) -> Result<(), UsbError> {
         self.0.stop_bulk(receipt).await
     }
+    async fn clear_halt(&self, endpoint: u8) -> Result<(), UsbError> {
+        self.0.clear_endpoint_halt(endpoint).await
+    }
 }
 struct Transmit<R> {
     receipt: R,
     bytes: usize,
+    /// Bulk-OUT endpoint address carrying this packet.
+    endpoint: u8,
 }
 /// USB completion does not constitute radio ACK or controlled-port readiness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +121,8 @@ pub struct Owner<I: Io> {
     pub(super) ampdu: Option<(u8, u8)>,
     receive: Option<I::Receipt>,
     transmit: Option<Transmit<I::Receipt>>,
+    /// Halted pipes awaiting `recover` (RX, TX).
+    halted: (bool, bool),
     scratch: Vec<u8>,
 }
 impl<I: Io> core::fmt::Debug for Owner<I> {
@@ -123,6 +157,7 @@ impl<I: Io> Owner<I> {
             ampdu: None,
             receive: None,
             transmit: None,
+            halted: (false, false),
             scratch: alloc::vec![0;MAX_TRANSFER],
         })
     }
@@ -135,6 +170,49 @@ impl<I: Io> Owner<I> {
     pub fn fail(&mut self) {
         self.failed = true;
     }
+    /// True while a halted pipe awaits `recover`.
+    pub fn is_halted(&self) -> bool {
+        self.halted.0 || self.halted.1
+    }
+    /// Recover every halted pipe. Each halted receipt stays retained until
+    /// the controller proves the endpoint Stopped at a fresh dequeue (the
+    /// token is stale afterwards), then RX is reposted and the TX slot
+    /// reopened. Any error or a dropped future leaves the owner terminal
+    /// with its receipts retained, exactly like `stop`.
+    pub async fn recover(&mut self) -> Result<Recovery, Error> {
+        self.check_live()?;
+        let (rx, tx) = self.halted;
+        let mut recovery = Recovery::default();
+        if !rx && !tx {
+            return Ok(recovery);
+        }
+        self.failed = true;
+        if rx {
+            self.io
+                .clear_halt(self.endpoints.input)
+                .await
+                .map_err(Error::Usb)?;
+            self.receive = None;
+            self.halted.0 = false;
+            recovery.receive = true;
+        }
+        if tx {
+            let endpoint = self
+                .transmit
+                .as_ref()
+                .map(|t| t.endpoint)
+                .ok_or(Error::Failed)?;
+            self.io.clear_halt(endpoint).await.map_err(Error::Usb)?;
+            self.transmit = None;
+            self.halted.1 = false;
+            recovery.transmit_lost = true;
+        }
+        self.failed = false;
+        if rx {
+            self.post()?;
+        }
+        Ok(recovery)
+    }
     /// Install the first persistent RX receipt before opening the MAC RX gate.
     pub fn start(&mut self) -> Result<(), Error> {
         self.check()?;
@@ -144,6 +222,26 @@ impl<I: Io> Owner<I> {
         self.post()
     }
     fn check(&self) -> Result<(), Error> {
+        self.check_live()?;
+        if self.is_halted() {
+            return Err(Error::Halted);
+        }
+        Ok(())
+    }
+    /// One direction's gate: a halted IN pipe never blocks bulk OUT, and
+    /// vice versa (each pipe has its own xHCI endpoint context).
+    fn check_pipe(&self, transmit: bool) -> Result<(), Error> {
+        self.check_live()?;
+        if if transmit {
+            self.halted.1
+        } else {
+            self.halted.0
+        } {
+            return Err(Error::Halted);
+        }
+        Ok(())
+    }
+    fn check_live(&self) -> Result<(), Error> {
         if self.failed {
             Err(Error::Failed)
         } else {
@@ -167,11 +265,15 @@ impl<I: Io> Owner<I> {
     }
     /// None is indefinite pending, not an instruction to cancel or retry.
     pub fn poll_receive(&mut self) -> Result<Option<Vec<Record>>, Error> {
-        self.check()?;
+        self.check_pipe(false)?;
         let receipt = self.receive.as_ref().ok_or(Error::NotStarted)?;
         let length = match self.io.poll_receive(receipt, &mut self.scratch) {
             Ok(None) => return Ok(None),
             Ok(Some(length)) => length,
+            Err(e) if halts(e) => {
+                self.halted.0 = true;
+                return Err(Error::Halted);
+            }
             Err(e) => {
                 self.failed = true;
                 return Err(Error::Usb(e));
@@ -209,7 +311,7 @@ impl<I: Io> Owner<I> {
         rate: u8,
         adaptive: Option<u8>,
     ) -> Result<(), Error> {
-        self.check()?;
+        self.check_pipe(true)?;
         if adaptive.is_some() && kind != Kind::Data {
             return Err(Error::Packet(packet_codec::Error::Header));
         }
@@ -242,12 +344,14 @@ impl<I: Io> Owner<I> {
                 self.endpoints.output_count,
             ),
         };
-        let dci = self.endpoints.output[index] * 2;
+        let endpoint = self.endpoints.output[index];
+        let dci = endpoint * 2;
         match self.io.begin_send(dci, &packet) {
             Ok(receipt) => {
                 self.transmit = Some(Transmit {
                     receipt,
                     bytes: packet.len(),
+                    endpoint,
                 });
                 Ok(())
             }
@@ -262,7 +366,10 @@ impl<I: Io> Owner<I> {
     /// Every dropped/failed stop leaves this owner terminal and its receipts
     /// retained. A successful pause permits re-posting on the same channel.
     pub async fn stop(&mut self) -> Result<(), Error> {
-        self.check()?;
+        self.check_live()?;
+        // A halted pipe cannot be stopped (xHCI Context State Error);
+        // reset it first, then drain the reposted receipt below.
+        self.recover().await?;
         self.failed = true;
         if let Some(receipt) = &self.receive {
             self.io.stop(receipt).await.map_err(Error::Usb)?;
@@ -276,13 +383,17 @@ impl<I: Io> Owner<I> {
         Ok(())
     }
     pub fn poll_transmit(&mut self) -> Result<Option<Delivered>, Error> {
-        self.check()?;
+        self.check_pipe(true)?;
         let Some(tx) = self.transmit.as_ref() else {
             return Ok(None);
         };
         let length = match self.io.poll_send(&tx.receipt) {
             Ok(None) => return Ok(None),
             Ok(Some(length)) => length,
+            Err(e) if halts(e) => {
+                self.halted.1 = true;
+                return Err(Error::Halted);
+            }
             Err(e) => {
                 self.failed = true;
                 return Err(Error::Usb(e));
