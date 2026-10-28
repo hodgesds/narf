@@ -2093,6 +2093,67 @@ and cover:
 
 Measured programs and air validation remain external inputs.
 
+### 3.35 Remaining-row blocker audit
+
+This audit checks each remaining open row against the current tree, after
+§§3.33–3.34 landed. The blockers below are concrete.
+
+**Not yet implemented; no shared API is missing.**
+
+- **ht40, nss2, gen2_vht, width_160.** Gen2 PHY_CONTEXT, ADD_STA and TLC
+  are HT20/SISO only:
+  - `mvm_channel.rs` encodes 20MHz with a fixed control position.
+  - `Profile::peer` sets no `STA_FLG_FAT_EN`/`MIMO_EN` and no
+    max-width fields.
+  - `Profile::tlc` leaves `max_ch_width` and the NSS2/VHT rate maps at 0.
+  - `mvm_phy.rs::confirm` refuses any width other than 20MHz.
+
+  Each row needs its own tag5 bit and a qualified program. The shared
+  JoinPlan HT40/VHT/160 negotiation (`LocalPhy::ht40`, `LocalVht`) and the
+  regulatory width rules exist; the native encoders (Linux
+  `iwl_mvm_phy_ctxt_cmd_data`, `iwl_mvm_sta_send_to_fw`,
+  `rs_fw_vht_set_enabled_rates`) do not.
+- **he, eht, six_ghz, width_320, mlo.** The Sc/Gen3 link, STA and TLC
+  encoders (`connection.rs`, `mac_ctx.rs`, `sta.rs`) carry no HE/EHT
+  fields: link HE/EHT flags, `iwl_he_pkt_ext`, STA HE/EHT flags and the TLC
+  `ht_rates` HE/EHT maps. Six-GHz, 320MHz and MLO also need band-qualified
+  regulatory and power admission. These rows are hardware-inapplicable to
+  Gen2 AX200/AX201.
+- **tx_amsdu.** No native path builds an A-MSDU: TLC leaves `amsdu` and
+  `max_tx_op` at 0, and the queue owner sends single MSDUs. The shared
+  encoder (`amsdu::encode`/`Key::protect_amsdu`) is host-crypto only. The
+  native path needs a tag5 bit, the firmware A-MSDU length in TLC (Linux
+  `rs_fw_amsdu_len`/`iwl_mvm_max_amsdu_size`) and checksum assist with
+  `L3_EN`.
+- **active_scan_probes.** `mvm_scan.rs` issues only passive
+  `SCAN_REQ_UMAC`. A probe request emits before any link power is applied,
+  and no signed scan-emission program binds that emitter/channel/power.
+- **multiple_rx_queues, rss.** The Gen2 transport configures one RFH
+  queue. Linux `iwl_mvm_send_rss_cfg_cmd` and `RFH_QUEUE_CONFIG_CMD` (with
+  per-queue RX epochs and markers) have no owner.
+- **ap, p2p.** There is no AP/GO MAC context, beacon template
+  (`BEACON_TEMPLATE_CMD`) or multi-station key/queue owner, although the
+  shared `WirelessNetIface::start_ap` exists.
+- **wow.** There is no D3 firmware image, `D3_CONFIG_CMD` or WoWLAN key
+  material path, although the shared `wowlan_support` exists.
+- **ml_baid.** The alternate ML BAID allocation profile is not
+  implemented.
+- **ax210_station_enablement, ax211_station_enablement,
+  ax411_station_enablement, be200_station_enablement.** Each needs the
+  exact Gen3 MAC/link/STA/TLC/key payload profile, with conversation
+  fixtures per family.
+
+**Blocked by a missing shared or external input.**
+
+- **sched_scan_offload.** The shared crate exposes no `START_SCHED_SCAN`.
+  `nl80211/control.rs` parses scheduled-scan attributes only for WoWLAN
+  net-detect.
+- **persistent_key_history.** NARF provides drivers no authenticated,
+  rollback-protected store bound to the radio (§3.30).
+- **live_regulatory_owner, platform_power_owner.** These need platform
+  SAR/antenna inputs and a live regulatory authority. Both are external
+  and cannot be filled by software defaults.
+
 ## 4. References
 
 - Linux `drivers/net/wireless/intel/iwlwifi/`

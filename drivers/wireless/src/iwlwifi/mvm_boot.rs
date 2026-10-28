@@ -250,16 +250,16 @@ pub(super) mod data_priority {
     pub(in crate::iwlwifi) use super::data::{admitted_priority, user_priority};
 }
 
-#[path = "mvm_security.rs"]
-mod rsna;
 #[path = "mvm_pmf.rs"]
 mod pmf;
+#[path = "mvm_security.rs"]
+mod rsna;
 pub(super) type PowerFence = power::Fence;
 pub(super) fn passive_channel(domain: &narf_wireless::reg::RegulatoryDomain, channel: u8) -> bool {
     scan::passive_permitted(domain, channel)
 }
 #[path = "mvm_station.rs"]
 mod station;
-pub(in crate::iwlwifi) use station::Credential;
 #[cfg(any(test, feature = "kernel-test"))]
 pub(super) use rsna::tests::Device as SecurityModel;
+pub(in crate::iwlwifi) use station::Credential;
