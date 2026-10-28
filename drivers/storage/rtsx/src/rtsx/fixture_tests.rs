@@ -120,6 +120,23 @@ impl FixtureCard {
         }
     }
 
+    /// The 8 GiB SDHC card carrying a two-partition MBR image
+    /// (#834): partition contents are offset-sensitive patterns at
+    /// the blocks the MBR entries point at, so a partition read
+    /// proves both the window bounds and the LBA translation:
+    /// - p1 (type 0x83): blocks 2048..6144 — pattern 0xA1 at its
+    ///   first block, 0xA2 at its last (card block 6143).
+    /// - p2 (type 0x0C): blocks 8192..10240 — pattern 0xB1 at its
+    ///   first block.
+    pub fn sdhc_partitioned() -> Self {
+        let mut card = Self::sdhc_8gib();
+        card.storage.insert(0, partitioned_mbr_sector());
+        card.storage.insert(2048, partition_pattern(0xA1));
+        card.storage.insert(6143, partition_pattern(0xA2));
+        card.storage.insert(8192, partition_pattern(0xB1));
+        card
+    }
+
     /// An SDHC-shaped card whose CSD structure field is 0b10 —
     /// reserved/invalid per SD spec §5.3, so `Csd::parse_shifted`
     /// rejects it. Identification must fail with a typed error.
@@ -128,6 +145,49 @@ impl FixtureCard {
         card.csd_reg[0] = 0x80;
         card
     }
+}
+
+/// One card block filled with an offset-sensitive pattern derived
+/// from `tag`: byte `i` is `tag ^ i`, so reading the right block at
+/// the wrong offset (or the wrong block) cannot pass.
+fn partition_pattern(tag: u8) -> [u8; 512] {
+    let mut b = [0u8; 512];
+    for (i, x) in b.iter_mut().enumerate() {
+        *x = tag ^ (i as u8);
+    }
+    b
+}
+
+/// Write one 16-byte partition entry into an MBR sector image.
+/// Layout per the classic MBR partition table (sector 0, entries at
+/// bytes 446..510): boot flag, CHS-first, type, CHS-last, LBA start
+/// (LE), sector count (LE). The CHS fields carry the 0xFEFFFF
+/// "beyond CHS range" sentinel fdisk writes for LBA-addressed
+/// entries; the scanner (like Linux) reads only type + LBA fields.
+fn write_mbr_entry(sector: &mut [u8; 512], slot: usize, ty: u8, start: u32, count: u32) {
+    let off = 446 + slot * 16;
+    sector[off] = 0x00; // not bootable
+    sector[off + 1..off + 4].copy_from_slice(&[0xFE, 0xFF, 0xFF]);
+    sector[off + 4] = ty;
+    sector[off + 5..off + 8].copy_from_slice(&[0xFE, 0xFF, 0xFF]);
+    sector[off + 8..off + 12].copy_from_slice(&start.to_le_bytes());
+    sector[off + 12..off + 16].copy_from_slice(&count.to_le_bytes());
+}
+
+/// LBA 0 of the partitioned fixture card: a classic MBR with two
+/// primary partitions and the 0x55AA boot signature at bytes
+/// 510..512 (the layout `narf_block::partition::parse_mbr` consumes,
+/// written here from the MBR layout itself, not from the parser):
+/// - p1: type 0x83 (Linux), start LBA 2048, 4096 sectors.
+/// - p2: type 0x0C (FAT32, LBA), start LBA 8192, 2048 sectors.
+/// Slots 3 and 4 stay zeroed (empty entries).
+fn partitioned_mbr_sector() -> [u8; 512] {
+    let mut s = [0u8; 512];
+    write_mbr_entry(&mut s, 0, 0x83, 2048, 4096);
+    write_mbr_entry(&mut s, 1, 0x0C, 8192, 2048);
+    s[510] = 0x55;
+    s[511] = 0xAA;
+    s
 }
 
 // ── Chip model ────────────────────────────────────────────────────
@@ -780,3 +840,115 @@ fn fixture_removal_unregisters() -> TestResult {
     }
 }
 kernel_test_in!("drivers/storage/rtsx/fixture", fixture_removal_unregisters);
+
+fn fixture_partitioned_card_registers_partitions() -> TestResult {
+    let transport = Arc::new(FixtureTransport::with_card(Some(
+        FixtureCard::sdhc_partitioned(),
+    )));
+    let saved = install(transport.clone());
+
+    poll_card_slot();
+
+    let result = (|| {
+        // Both MBR partitions appear as mmcblk0p<N> children with
+        // the windows the MBR entries declare.
+        let p1 = narf_block::registry::find_block_device("mmcblk0p1")
+            .ok_or("mmcblk0p1 not registered after identify")?;
+        if p1.capacity() != 4096 {
+            return Err("mmcblk0p1 capacity must be the MBR sector count (4096)");
+        }
+        let p2 = narf_block::registry::find_block_device("mmcblk0p2")
+            .ok_or("mmcblk0p2 not registered after identify")?;
+        if p2.capacity() != 2048 {
+            return Err("mmcblk0p2 capacity must be the MBR sector count (2048)");
+        }
+        if narf_block::registry::find_block_device("mmcblk0p3").is_some() {
+            return Err("empty MBR slots must not register partitions");
+        }
+        // Reads through a partition land on the card blocks its MBR
+        // entry points at — first block, last block, and the second
+        // partition's distinct pattern.
+        let mut buf = [0u8; 512];
+        p1.read(0, 1, &mut buf)
+            .map_err(|_| "p1 first-block read failed")?;
+        if buf != partition_pattern(0xA1) {
+            return Err("mmcblk0p1 block 0 must be card block 2048");
+        }
+        p1.read(4095, 1, &mut buf)
+            .map_err(|_| "p1 last-block read failed")?;
+        if buf != partition_pattern(0xA2) {
+            return Err("mmcblk0p1 last block must be card block 6143");
+        }
+        p2.read(0, 1, &mut buf)
+            .map_err(|_| "p2 first-block read failed")?;
+        if buf != partition_pattern(0xB1) {
+            return Err("mmcblk0p2 block 0 must be card block 8192");
+        }
+        // The partition window is a bound, not a suggestion.
+        if p1.read(4096, 1, &mut buf).is_ok() {
+            return Err("read past mmcblk0p1's end must fail");
+        }
+        // The parent's own addressing is unshifted: card block 2048
+        // read through mmcblk0 is the same pattern p1 starts with.
+        let parent = narf_block::registry::find_block_device("mmcblk0")
+            .ok_or("mmcblk0 not registered after identify")?;
+        parent
+            .read(2048, 1, &mut buf)
+            .map_err(|_| "parent read failed")?;
+        if buf != partition_pattern(0xA1) {
+            return Err("mmcblk0 block 2048 must match mmcblk0p1 block 0");
+        }
+        Ok(())
+    })();
+
+    // Removal withdraws the partitions together with the parent.
+    transport.remove_card();
+    poll_card_slot();
+    let removed = result.and_then(|()| {
+        for name in ["mmcblk0", "mmcblk0p1", "mmcblk0p2"] {
+            if narf_block::registry::find_block_device(name).is_some() {
+                return Err("partition children must be withdrawn with the card");
+            }
+        }
+        Ok(())
+    });
+
+    restore(saved);
+    match removed {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers/storage/rtsx/fixture",
+    fixture_partitioned_card_registers_partitions
+);
+
+fn fixture_unpartitioned_card_registers_no_partitions() -> TestResult {
+    // Blank storage: block 0 reads as zeros, so there is no MBR
+    // signature — the scan must fail soft and leave the bare card.
+    let transport = Arc::new(FixtureTransport::with_card(Some(FixtureCard::sdhc_8gib())));
+    let saved = install(transport);
+
+    poll_card_slot();
+
+    let result = (|| {
+        if narf_block::registry::find_block_device("mmcblk0").is_none() {
+            return Err("mmcblk0 must register even without a partition table");
+        }
+        if narf_block::registry::find_block_device("mmcblk0p1").is_some() {
+            return Err("unpartitioned card must not gain partition devices");
+        }
+        Ok(())
+    })();
+
+    restore(saved);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers/storage/rtsx/fixture",
+    fixture_unpartitioned_card_registers_no_partitions
+);

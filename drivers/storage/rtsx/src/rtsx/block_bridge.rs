@@ -7,8 +7,10 @@
 //! happens on card-detect: when `register_card` is called from the
 //! RTSX driver's card-identify path, the card immediately becomes
 //! accessible as `/dev/mmcblk0` through the existing Wave-13
-//! `devfs_block` bridge.  `unregister_card` removes it again when the
-//! poll task observes a removal.
+//! `devfs_block` bridge.  Registration also runs the block layer's
+//! partition scan, so a partitioned card gains `mmcblk0p<N>` children
+//! (#834).  `unregister_card` removes the partitions and the parent
+//! again when the poll task observes a removal.
 //!
 //! Additionally, `/sys/class/mmc_host/mmc0/mmc0:<rca>/` is populated
 //! with the card's real identity attributes, decoded from the CID the
@@ -42,12 +44,12 @@
 //!
 //! - CMD18/CMD25 (READ/WRITE_MULTIPLE_BLOCK) over the ADMA ring
 //!   buffer — transfers here are single-block (CMD17/CMD24).
-//! - Partition scanning of the registered device (#834).
 //! - MMC cards / HS200 tuning — this bridge serves SD cards only.
 
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use narf_block::registry::{
     register_block_device, unregister_block_device, BlockDeviceSync, BlockIoError,
@@ -186,7 +188,15 @@ pub fn register_card(info: SdCardInfo) {
     let dev = Arc::new(RtsxBlockDevice::new(info));
 
     // Register as the primary MMC block device.
-    register_block_device("mmcblk0", dev as Arc<dyn BlockDeviceSync>);
+    register_block_device("mmcblk0", dev.clone() as Arc<dyn BlockDeviceSync>);
+
+    // Scan the card for partitions (MBR / GPT) and register each as
+    // `mmcblk0p<N>` — the same publication contract MSC / AHCI /
+    // NVMe follow (#834). Best-effort: a card with no readable
+    // partition table (blank card, superfloppy layout) just keeps
+    // its bare whole-disk entry, so the scan's error is dropped,
+    // exactly as at the other call sites.
+    let _ = narf_block::partition::scan_and_register_partitions(dev, "mmcblk0");
 
     // Populate sysfs.
     register_sysfs(info);
@@ -197,6 +207,17 @@ pub fn register_card(info: SdCardInfo) {
 ///
 /// Called from the card-detect path when a ready card is removed.
 pub fn unregister_card(info: SdCardInfo) {
+    // Withdraw the partition children first: they borrow the card's
+    // I/O path, and the registry has no cascade — MSC's unregister
+    // does the same snapshot-then-remove dance.
+    let children: Vec<&'static str> = narf_block::registry::block_devices()
+        .iter()
+        .filter(|e| e.parent == Some("mmcblk0"))
+        .map(|e| e.name)
+        .collect();
+    for child in children {
+        unregister_block_device(child);
+    }
     unregister_block_device("mmcblk0");
     unregister_sysfs(info);
 }
