@@ -334,6 +334,30 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         self.kick();
         Ok(())
     }
+    /// Send a queued protected SA Query Response (PMF) produced by the
+    /// synchronous drain; a failure closes the link like other data faults.
+    pub(super) async fn flush_management(&self) -> Result<(), WirelessError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(WirelessError::HardwareError);
+        }
+        let Some(mut radio) = self.radio.try_lock() else {
+            return Ok(());
+        };
+        let mut attempt = Attempt {
+            device: self,
+            armed: true,
+        };
+        let result = match self.policy.current() {
+            Ok(domain) => radio.flush_station_management(&domain).await,
+            Err(cause) => Err(cause),
+        };
+        if let Err(cause) = result {
+            radio.fail_station_data();
+            return Err(error(cause));
+        }
+        attempt.armed = false;
+        Ok(())
+    }
     pub(super) async fn apply_power_save(&self) -> Result<(), WirelessError> {
         let request = self.ps_request.load(Ordering::Acquire);
         if request == 0 {
@@ -704,11 +728,20 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         {
             return Err(WirelessError::NotSupported);
         }
-        let (mode, pmk) = match request.security {
-            SecurityConfig::Open => (narf_wireless::association::SecurityMode::Open, None),
+        // WPA3-Personal runs host SAE and PMF; its PMK comes from SAE.
+        let (mode, pmk, password) = match &request.security {
+            SecurityConfig::Open => (narf_wireless::association::SecurityMode::Open, None, None),
             SecurityConfig::Wpa2 { psk } => (
                 narf_wireless::association::SecurityMode::Wpa2Psk,
-                Some(zeroize::Zeroizing::new(psk)),
+                Some(zeroize::Zeroizing::new(*psk)),
+                None,
+            ),
+            SecurityConfig::Wpa3 { password } if !password.is_empty() => (
+                narf_wireless::association::SecurityMode::Wpa3Sae {
+                    pwe: narf_wireless::association::SaePwe::Both,
+                },
+                None,
+                Some(zeroize::Zeroizing::new(password.clone())),
             ),
             _ => return Err(WirelessError::NotSupported),
         };
@@ -742,11 +775,34 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         )
         .await
         .map_err(error)?;
-        wmi_runtime::checked_policy(
-            radio.associate_station_checked(&domain, &request.ssid, mode, &request.ie, &validate),
-            &validate,
-        )
-        .await
+        match password.as_deref() {
+            Some(password) => {
+                wmi_runtime::checked_policy(
+                    radio.associate_station_sae_checked(
+                        &domain,
+                        &request.ssid,
+                        password,
+                        &request.ie,
+                        &validate,
+                    ),
+                    &validate,
+                )
+                .await
+            }
+            None => {
+                wmi_runtime::checked_policy(
+                    radio.associate_station_checked(
+                        &domain,
+                        &request.ssid,
+                        mode,
+                        &request.ie,
+                        &validate,
+                    ),
+                    &validate,
+                )
+                .await
+            }
+        }
         .map_err(error)?;
         let link = wmi_runtime::checked_policy(
             radio.start_data_with_nonce_checked(&domain, pmk.as_deref(), nonce, &validate),
@@ -985,6 +1041,7 @@ fn publish_with_mac(
                 }
                 let seen = signal.count();
                 let progressed = worker.drain();
+                let _ = worker.flush_management().await;
                 let _ = worker.apply_power_save().await;
                 if progressed {
                     narf_scheduler::yield_now().await;

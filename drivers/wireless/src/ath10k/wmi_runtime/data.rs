@@ -3,7 +3,7 @@
 //! have separate ownership; an associated peer alone never admits Ethernet.
 use super::*;
 use crate::ath10k::regulatory::Permission;
-use narf_wireless::station_security::{RawFrame, Rx, Security};
+use narf_wireless::station_security::{MgmtRx, RawFrame, Rx, Security};
 const RECEIVED_FRAMES: usize = 256;
 const INCOMING_FRAMES: usize = 1024;
 #[path = "rx_ba.rs"]
@@ -65,6 +65,10 @@ pub(super) struct State {
     failed: bool,
     authorized: bool,
     last_peer: narf_time::Deadline,
+    /// A CCMP-protected SA Query Response awaiting the native management
+    /// path (one outstanding; a second request before it is sent is
+    /// dropped, as mac80211 answers each request independently).
+    management: Option<Vec<u8>>,
 }
 impl State {
     pub(super) fn protection_allowed(&self) -> bool {
@@ -221,6 +225,62 @@ fn ethernet(frame: &[u8], own: [u8; 6], peer: [u8; 6]) -> Option<Vec<u8>> {
 }
 
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
+    /// mac80211 `ieee80211_set_disassoc` sends Deauthentication (reason 3,
+    /// DEAUTH_LEAVING) on a local disconnect; under PMF it must be
+    /// CCMP-protected with the PTK before the keys are retired.
+    pub(super) fn pmf_deauthentication(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        let own = self.ready.ok_or(Error::Failed)?.mac;
+        let bssid = self.peer.as_ref().ok_or(Error::Failed)?.bssid;
+        let Some(security) = self
+            .data
+            .as_mut()
+            .filter(|d| !d.failed)
+            .and_then(|d| d.security.as_mut())
+            .filter(|s| s.pmf() && s.port_open())
+        else {
+            return Ok(None);
+        };
+        let mut frame = alloc::vec![0xc0, 0, 0, 0];
+        frame.extend_from_slice(&bssid);
+        frame.extend_from_slice(&own);
+        frame.extend_from_slice(&bssid);
+        frame.extend_from_slice(&[0, 0, 3, 0]);
+        security
+            .protect_management(&frame)
+            .map(Some)
+            .map_err(security_error)
+    }
+    /// Publish a queued protected SA Query Response on the native
+    /// management path (the synchronous receive drain cannot await WMI).
+    async fn send_station_management(&mut self) -> Result<bool, Error> {
+        let Some(frame) = self.data.as_mut().and_then(|d| d.management.take()) else {
+            return Ok(false);
+        };
+        let own = self.ready.ok_or(Error::Failed)?.mac;
+        let bssid = self.peer.as_ref().ok_or(Error::Failed)?.bssid;
+        super::management::validate(&frame, own, bssid)?;
+        self.send_management_frame(&frame).await?;
+        Ok(true)
+    }
+    /// The Device service worker's await point for queued robust
+    /// management (Linux transmits the mac80211 SA Query response from its
+    /// TX path); the policy is rechecked before publication.
+    pub(in crate::ath10k) async fn flush_station_management(
+        &mut self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<bool, Error> {
+        if self.failed
+            || self.station_link().is_none()
+            || self.data.as_ref().is_none_or(|d| d.management.is_none())
+        {
+            return Ok(false);
+        }
+        self.check_data_policy(domain)?;
+        self.failed = true;
+        let sent = self.send_station_management().await?;
+        self.failed = false;
+        Ok(sent)
+    }
     pub fn has_station_data(&self) -> bool {
         self.data.is_some()
     }
@@ -357,7 +417,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if self.data.is_some() || !self.htt.data_profile() {
             return Err(Error::Unsupported);
         }
-        if associated.protected != pmk.is_some() {
+        let rsn = self.peer.as_ref().and_then(|p| p.rsn.as_deref());
+        let sae = rsn.is_some_and(|r| r.sae_pmk.is_some());
+        // SAE derives its own PMK; a caller PMK is then refused.
+        if associated.protected != (pmk.is_some() || sae) || sae && pmk.is_some() {
             return Err(Error::Unsupported);
         }
         self.check_data_policy(domain)?;
@@ -379,20 +442,37 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .iter()
             .find(|b| b.bssid == associated.bssid && b.frequency == associated.frequency)
             .ok_or(Error::Failed)?;
-        let security = match pmk {
-            Some(pmk) => Some(
-                Security::new(
-                    own,
-                    associated.bssid,
-                    pmk,
-                    &narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body(),
-                    element(&cached.information_elements, 48)?.ok_or(Error::Unsupported)?,
-                    element(&cached.information_elements, 244)?,
-                    2,
-                )
+        let security = if associated.protected {
+            // The station RSNE/RSNXE are the association's own (plan
+            // `rsn_body`, SAE `station_rsnxe`): WPA2, WPA2-PMF or SAE.
+            let rsn = self
+                .peer
+                .as_ref()
+                .and_then(|p| p.rsn.as_deref())
+                .ok_or(Error::Unsupported)?;
+            let ap_rsne = element(&cached.information_elements, 48)?.ok_or(Error::Unsupported)?;
+            let ap_rsnxe = element(&cached.information_elements, 244)?;
+            Some(
+                match (&rsn.sae_pmk, pmk) {
+                    (Some(sae), None) => Security::new_sae(
+                        own,
+                        associated.bssid,
+                        sae,
+                        &rsn.rsne,
+                        rsn.rsnxe.as_deref(),
+                        ap_rsne,
+                        ap_rsnxe,
+                        2,
+                    ),
+                    (None, Some(pmk)) => {
+                        Security::new(own, associated.bssid, pmk, &rsn.rsne, ap_rsne, ap_rsnxe, 2)
+                    }
+                    _ => return Err(Error::Unsupported),
+                }
                 .map_err(security_error)?,
-            ),
-            None => None,
+            )
+        } else {
+            None
         };
         self.failed = true;
         let mut incoming = VecDeque::new();
@@ -474,6 +554,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             failed: false,
             authorized: !associated.protected,
             last_peer: narf_time::Deadline::after_ms(5000),
+            management: None,
         });
         self.failed = true;
         let deadline = narf_time::Deadline::after_ms(5000);
@@ -722,6 +803,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if let Some(reply) = reply {
             checked_policy(self.send_data(&reply, true), validate).await?;
         }
+        checked_policy(self.send_station_management(), validate).await?;
         validate()?;
         Ok(idle)
     }
@@ -855,9 +937,33 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         data.last_peer = narf_time::Deadline::after_ms(5000);
                     }
                 }
-                if management.status & !0x40 == 0
+                let current = management.status & !0x40 == 0
                     && wire::channel_to_frequency(management.channel)
-                        == Some(peer.permission.frequency)
+                        == Some(peer.permission.frequency);
+                if let Some(security) = data.security.as_mut().filter(|s| s.pmf()) {
+                    // mac80211 ieee80211_drop_unencrypted_mgmt: robust
+                    // frames from the AP pass only CCMP (unicast) or BIP
+                    // (group) admission once keys are in.
+                    if current && f.len() >= 24 && matches!(f[0], 0xa0 | 0xc0 | 0xd0) {
+                        if let MgmtRx::Frame(plain) = security
+                            .receive_management(&Native(f.clone()))
+                            .map_err(security_error)?
+                        {
+                            if matches!(plain[0], 0xa0 | 0xc0) && plain.len() == 26 {
+                                return Err(Error::Failed);
+                            }
+                            if let Some(response) = sa_query_response(&plain, own, bssid) {
+                                if security.port_open() && data.management.is_none() {
+                                    data.management = Some(
+                                        security
+                                            .protect_management(&response)
+                                            .map_err(security_error)?,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else if current
                     && f.len() >= 26
                     && matches!(f[0], 0xa0 | 0xc0)
                     && f[1] & 0xc7 == 0
@@ -992,6 +1098,27 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         };
         Ok((idle, reply))
     }
+}
+
+/// mac80211 `ieee80211_process_sa_query_req`: a unicast SA Query Request
+/// (category8, action0, 2-byte transaction id) from the bound AP is
+/// answered with a Response carrying the same id, to be CCMP-protected.
+fn sa_query_response(frame: &[u8], own: [u8; 6], bssid: [u8; 6]) -> Option<Vec<u8>> {
+    if frame.len() != 28
+        || frame[0] != 0xd0
+        || frame[4..10] != own
+        || frame[10..16] != bssid
+        || frame[16..22] != bssid
+        || frame[24..26] != [8, 0]
+    {
+        return None;
+    }
+    let mut out = alloc::vec![0xd0, 0, 0, 0];
+    out.extend_from_slice(&bssid);
+    out.extend_from_slice(&own);
+    out.extend_from_slice(&bssid);
+    out.extend_from_slice(&[0, 0, 8, 1, frame[26], frame[27]]);
+    Some(out)
 }
 
 /// Linux htt_rx.c::ath10k_htt_rx_h_undecap_raw strips only FCS for software

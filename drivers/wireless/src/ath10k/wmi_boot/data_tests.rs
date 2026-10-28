@@ -108,6 +108,9 @@ pub(super) struct Fixture {
     /// Boxed VHT expectations (stack: the composed tests sit near the
     /// aarch64 kernel-test stack limit).
     pub(super) vht: Option<Box<VhtExpect>>,
+    /// Robust management frames the host sent after authorization (SA
+    /// Query responses, the PMF teardown deauthentication).
+    pub(super) management_tx: Vec<Vec<u8>>,
     rx_phy: Option<(u8, u32, u32)>,
     // Authored native descriptors per actual DMA frame, including invalid
     // stale middle PHY words that the host must never reinterpret.
@@ -176,6 +179,7 @@ impl Fixture {
             ht_peer_flags: 0,
             ht_rate_caps: 0,
             vht: None,
+            management_tx: Vec::new(),
             rx_phy: None,
             rx_descriptors: VecDeque::new(),
             wmm_words: WMM_WORDS,
@@ -254,18 +258,12 @@ impl Fixture {
         }
         let mut body = frame.get(header..).ok_or(BmiError::BadResponse)?.to_vec();
         if self.ap.protected() {
-            let tk: &[u8; 16] = self
-                .ptk
-                .as_ref()
-                .ok_or(BmiError::BadResponse)?
-                .tk
-                .as_slice()
-                .try_into()
-                .unwrap();
+            // The AP's own PTK (PSK, PSK-SHA256 or SAE derivation).
+            let tk = self.ap.pairwise_tk().ok_or(BmiError::BadResponse)?;
             body = narf_wireless::ccmp::unprotect(
                 &Ccm,
                 &frame[..header],
-                tk,
+                &tk,
                 0,
                 false,
                 &mut self.replay,
@@ -329,8 +327,8 @@ impl Fixture {
         let mut body = vec![0xaa, 0xaa, 3, 0, 0, 0];
         body.extend_from_slice(&ethernet[12..]);
         if self.ap.protected() {
-            let tk: &[u8; 16] = self.ptk.as_ref().unwrap().tk.as_slice().try_into().unwrap();
-            body = narf_wireless::ccmp::protect(&Ccm, &frame, tk, self.pn, 0, 0, false, &mut body)
+            let tk = self.ap.pairwise_tk().unwrap();
+            body = narf_wireless::ccmp::protect(&Ccm, &frame, &tk, self.pn, 0, 0, false, &mut body)
                 .unwrap();
             self.pn += 1;
         }
@@ -375,6 +373,7 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
     let is_wmm = qos && native_phase == 2;
     let phase = native_phase - u8::from(qos && native_phase > 2);
     let mut replies = Vec::new();
+    let mut advance = true;
     if is_wmm {
         let expected_id: u32 = match dialect {
             Dialect::Main | Dialect::Tlv => 0x4006,
@@ -410,6 +409,8 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
             return Err(BmiError::BadResponse);
         }
         let frame = mlme_tests::native_frame(m, command)?;
+        // SAE Commits precede the Confirm that completes authentication.
+        advance = frame.get(24..28) != Some(&[3, 0, 1, 0]);
         if phase == 1 && m.data.as_ref().unwrap().wmm_offer.is_some() {
             let expected = [221, 7, 0, 0x50, 0xf2, 2, 0, 1, 0];
             if frame
@@ -604,7 +605,9 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
     } else {
         return Err(BmiError::BadResponse);
     }
-    m.data.as_mut().unwrap().control_phase += 1;
+    if advance {
+        m.data.as_mut().unwrap().control_phase += 1;
+    }
     m.sent.push(bytes.to_vec());
     if is_wmm {
         if let Some(policy) = &m.data.as_ref().unwrap().wmm_policy {
@@ -1076,6 +1079,57 @@ mod dhcp_tests;
 #[path = "tx_pipeline_tests.rs"]
 mod tx_pipeline_tests;
 
+fn management_id(dialect: Dialect) -> u32 {
+    match dialect {
+        Dialect::Main => 0x7006,
+        Dialect::TenOne => 0x9028,
+        Dialect::TenTwo | Dialect::TenTwoFour => 0x9029,
+        Dialect::TenFour => 0x9031,
+        Dialect::Tlv => 0x7008,
+    }
+}
+/// A native management transmit after the AP authorized the station.
+pub(super) fn captures_management(m: &RadioModel, command: &[u8]) -> bool {
+    m.data
+        .as_ref()
+        .is_some_and(|d| d.ap.phase() == ApPhase::Authorized)
+        && command.len() >= 4
+        && u32::from_le_bytes(command[..4].try_into().unwrap()) == management_id(m.inner.inner.dialect)
+}
+pub(super) fn capture_management(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> {
+    let command = &bytes[8..];
+    let frame = mlme_tests::native_frame(m, command)?;
+    m.data.as_mut().unwrap().management_tx.push(frame);
+    if m.inner.inner.dialect == Dialect::Tlv {
+        let mut terminal = vec![16, 0, 0xa7, 1];
+        terminal.extend_from_slice(&command[12..16]);
+        terminal.extend_from_slice(&[0; 12]);
+        add_event(m, 0x7006, &terminal);
+    }
+    m.sent.push(bytes.to_vec());
+    m.inner.inner.rx.push_back((
+        2,
+        vec![
+            2,
+            2,
+            8,
+            0,
+            8,
+            0,
+            0,
+            0,
+            1,
+            4,
+            0,
+            0,
+            2,
+            bytes.len().div_ceil(256) as u8,
+            0,
+            0,
+        ],
+    ));
+    Ok(())
+}
 pub(super) fn protection_handles(d: Dialect, b: &[u8]) -> bool {
     b.get(..4).is_some_and(|id| {
         id == match d {

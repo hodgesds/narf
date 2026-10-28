@@ -419,6 +419,39 @@ Host-bus/system power transitions remain separate profiles.
   stream (two only with STBC and our RX STBC), LDPC only with our RX LDPC,
   MCS within our map, and a bandwidth/SGI the profile promised. TXBF (0x0d)
   and MU PPDUs are refused before CCMP/PN.
+- WPA2-PMF and WPA3-SAE (`wmi_runtime/station_pmf.rs`, `data.rs`,
+  `management.rs`; smokes under `drivers/wireless/ath10k/pmf` and
+  `drivers/wireless/ath10k/wpa3`). Linux v7.2 sets `MFP_CAPABLE`
+  (`mac.c::ath10k_mac_register`) and leaves SAE to wpa_supplicant
+  `sme_sae_auth` over mac80211 `ieee80211_auth`; here the shared
+  `JoinPlan`/`SaeSession` run on the host. A WPA2 join advertises MFPC
+  (`JoinOptions::with_pmf(Pmf::Optional)`, wpa_supplicant `ieee80211w=1`, with
+  PSK-SHA256 admitted) only toward an AP whose scanned RSNE sets MFPC, so the
+  request to any other AP is byte-for-byte unchanged. `SecurityConfig::Wpa3`
+  selects SAE (`sae_pwe=2`): a Commit from the kernel CSPRNG, up to three
+  anti-clogging retries and Confirm cross the initial management transport
+  (algorithm3 frames of any status go to the plan; nothing else advances), and
+  the SAE association request carries the PMKID. The association's station
+  RSNE/RSNXE (`JoinPlan::rsn_body`, SAE `station_rsnxe`) and the SAE PMK are
+  retained, boxed, and build `Security::new` or `Security::new_sae`; the IGTK
+  arrives in message 3. `management::validate` admits only SAE Commit
+  (status 0/126) and Confirm (status 0) besides Open-System auth and
+  association, and Protected Deauthentication/Disassociation (42 bytes) and
+  SA Query Response (44 bytes) already CCMP-protected by the host. Under PMF,
+  WMI management RX from the bound AP goes through `Security::receive_management`
+  (mac80211 `ieee80211_drop_unencrypted_mgmt`): unprotected unicast robust
+  frames, broadcast frames without a valid BIP-CMAC-128 MMIE, replays and bad
+  MICs are dropped; an admitted Deauthentication/Disassociation closes the
+  link, and an admitted SA Query Request queues a protected Response with the
+  same transaction id (`ieee80211_process_sa_query_req`), published by the
+  Device service worker after the synchronous drain (the WMI management path
+  cannot be awaited there). A local disconnect under PMF first sends one
+  Deauthentication (reason 3, `ieee80211_set_disassoc`) protected with the
+  still-installed PTK; non-PMF teardown still sends none. Because this RAW
+  image disables firmware crypto (`ATH10K_CRYPT_MODE_SW`), the host expects
+  robust unicast frames still encrypted on WMI management RX, whereas Linux
+  `wmi.c::ath10k_wmi_rx_is_decrypted` assumes firmware decryption in
+  hardware-crypto mode; that firmware behaviour needs physical confirmation.
 - The registered Device binds native preparation, authentication/association,
   WMM/peer/up commands and initial RSNA data to a chosen factory/frequency/power
   receipt. It samples current policy before and after each nested wait and
@@ -698,9 +731,9 @@ Host-bus/system power transitions remain separate profiles.
   images and invalid/unsigned regulatory policy fail immediately without waiting.
   `RadioSession` retains an `Arc<Mutex<Radio<PciBoot>>>` with the selected image
   and board profile; native PCI APIs and the Device share this single owner.
-  The Device exposes passive/active scan and Open/WPA2-PSK/CCMP on configured
-  channels1–11 and the admitted fixed-country non-DFS 5-GHz centres above,
-  legacy/HT20 or the bounded HT40 pairs above. Unsupported scan options, PHY modes, external EAPOL and
+  The Device exposes passive/active scan and Open/WPA2-PSK/WPA2-PMF/WPA3-SAE
+  CCMP on configured channels1–11 and the admitted fixed-country non-DFS
+  5-GHz centres above, legacy/HT20, the bounded HT40 pairs or VHT above. Unsupported scan options, PHY modes, external EAPOL and
   checksum/TSO/VLAN requests are rejected, including direct frame-ring clients.
   Native control and each bounded packet-progress pass sample the current
   trusted regulatory database rather than an attachment-time clone. Passive
@@ -1167,7 +1200,7 @@ additional streams and TX STBC (which needs a second selected TX chain;
 LDPC and one-stream RX STBC are implemented above);
 VHT160/80+80 (SISO VHT20/40/80 is implemented); PFC fetch/queue ownership;
 dynamic WMM/protection updates and TSPEC/U-APSD; DFS/indoor/beacon-hint
-qualification; associated/off-channel scanning; hardware key/PMF/WPA3 profiles;
+qualification; associated/off-channel scanning; hardware key offload;
 AP/P2P roles; host-bus PM and wake offload (system suspend is implemented);
 pre-cal/cal-file and DT/NVMEM calibration sources (QCA9887 EEPROM is implemented)
 and automatic credential/stable-interface recovery.

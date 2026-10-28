@@ -12,6 +12,8 @@ mod coding_conversation_tests;
 mod ht40_conversation_tests;
 #[path = "ht_conversation_tests.rs"]
 mod ht_conversation_tests;
+#[path = "pmf_conversation_tests.rs"]
+mod pmf_conversation_tests;
 #[path = "protection_conversation_tests.rs"]
 mod protection_conversation_tests;
 #[path = "sgi40_conversation_tests.rs"]
