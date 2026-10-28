@@ -70,6 +70,44 @@ pub fn gic::configure_pmu_ppi(intid: u32) -> Result<(), ()>;
 #[cfg(target_arch = "aarch64")]
 pub fn gic::gicd_typer() -> u32;
 
+// GIC discovery + backend selection (aarch64; GICv2 and GICv3).
+pub mod gic_dt {                       // arch-neutral, allocation-free
+    pub enum GicVersion { V2, V3 }
+    pub struct MmioWindow { pub base: u64, pub len: u64 }
+    pub struct GicDescription {
+        pub version: GicVersion,
+        pub dist: MmioWindow,          // reg[0]: GICD
+        pub cpu: MmioWindow,           // reg[1]: GICC (v2) / GICR region (v3)
+        pub redist_stride: Option<u64>, // v3 `redistributor-stride`
+    }
+    pub enum GicDetectError { BadBlob, NotFound, MissingReg(GicVersion) }
+    pub fn detect(blob: &[u8]) -> Result<GicDescription, GicDetectError>;
+    pub fn version_for_compatible(value: &[u8]) -> Option<GicVersion>;
+}
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn gic::probe(dtb_phys: Option<u64>, gicv3_sysreg: bool)
+    -> Result<(GicDescription, gic::ProbeSource), gic::ProbeError>;
+pub enum gic::ProbeSource { Devicetree, QemuVirtDefault }
+pub enum gic::ProbeError { Devicetree(GicDetectError), NoSysregInterface, NotFound }
+#[cfg(target_arch = "aarch64")]
+pub fn gic::version() -> Option<GicVersion>;  // None before probe
+#[cfg(target_arch = "aarch64")]
+pub fn gic::is_v2() -> bool;                  // boot constant after probe
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn gic::{init_bsp, init_ap(cpu_index: u32)}; // after probe
+#[cfg(target_arch = "aarch64")]
+pub fn gic::remap_mmio(cpu_index: u32);
+
+// Trap-path CPU-interface primitives (called by frame/'s IRQ vector).
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn ack_irq() -> u64;        // ICC_IAR1_EL1 (v3) | GICC_IAR (v2)
+#[cfg(target_arch = "aarch64")]
+pub fn iar_intid(iar: u64) -> u32;     // bits [23:0] (v3) | [9:0] (v2)
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn eoi_for(iar: u64);       // ICC_EOIR1_EL1 (v3) | GICC_EOIR (v2)
+#[cfg(target_arch = "aarch64")]
+pub const SPURIOUS_INTID: u32 = 1023;
+
 // GICv3 ITS (aarch64). Pure model + firmware parsers are arch-neutral.
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn its::discover_firmware(dtb: Option<PhysAddr>) -> its_fw::Source;
@@ -95,7 +133,8 @@ pub mod its_core; // GITS_BASER / CBASER / PROPBASER / PENDBASER negotiation,
                   // ITT sizing, command encodings, queue wrap + stall
 pub mod its_fw;   // FDT / MADT / IORT parsing, RID → DeviceID
 
-// GICv3 SPIs (aarch64): devicetree platform devices (Qualcomm SoCs).
+// GIC SPIs (aarch64, GICv2 + GICv3): devicetree platform devices
+// (Qualcomm SoCs).
 #[cfg(target_arch = "aarch64")]
 pub fn gic::configure_spi(intid: u32, trigger: gic::SpiTrigger) -> Result<(), gic::SpiError>;
 #[cfg(target_arch = "aarch64")]
@@ -115,16 +154,34 @@ pub fn vector::free(vector: u8) -> Result<(), VectorError>;
 ```
 
 SPI contract (aarch64). `configure_spi` disables the INTID, clears its
-pending state, puts it in Group 1 NS at priority 0xA0, programs
-`GICD_ICFGR` (edge/level), routes it with `GICD_IROUTER` to the calling
-CPU's affinity (IRM = 0) and enables it; INTIDs outside
-`32..spi_limit()` are refused. The trap dispatches SPIs on
+pending state, sets priority 0xA0, programs `GICD_ICFGR` (edge/level),
+routes it to the calling CPU and enables it; INTIDs outside
+`32..spi_limit()` are refused (`spi_limit` is `GICD_TYPER.ITLinesNumber`
+on both versions). GICv3 routes with `GICD_IROUTER` = the caller's
+affinity (IRM = 0) and puts the INTID in Group 1 NS; GICv2 writes the
+caller's CPU-interface bit into `GICD_ITARGETSR` and leaves the group as
+firmware configured it (Linux `irq-gic.c` behaviour). The API is identical
+on both backends. The trap dispatches SPIs on
 `intid & 0xFF`, so a driver binding a fixed SPI first claims that slot
 with `vector::reserve` (refused with `Exhausted` when an MSI/LPI or
 another SPI owns it, `OutOfRange` above `ALLOC_MAX`). `pend_spi`
-(`GICD_ISPENDR`) is a self-test aid. The distributor base is still the
-QEMU virt constant; firmware-described GIC bases (SC7280 silicon) are
-an open question (§13).
+(`GICD_ISPENDR`) is a self-test aid.
+
+GIC discovery (aarch64). `gic::probe` runs once on the BSP, IRQs masked,
+before `init_bsp`. It reads the devicetree through `gic_dt::detect`:
+`arm,gic-400`, `arm,cortex-a15-gic` and `qcom,msm-qgic2` select GICv2,
+`arm,gic-v3` selects GICv3, and `reg[0]` / `reg[1]` give the distributor
+and the CPU interface (v2) or redistributor region (v3). A described GIC
+with a missing or short `reg` is refused (`ProbeError::Devicetree`); a
+DT-described v3 without `ID_AA64PFR0_EL1.GIC` is refused
+(`NoSysregInterface`). Only when the devicetree has no GIC node does probe
+fall back to the QEMU `virt` GICv3 bases, and only with the v3 sysreg
+interface present — the pre-discovery behaviour. Parent `ranges` are
+assumed identity (QEMU `virt`, Qualcomm `soc@0`). GICv2 SGIs use
+`GICD_SGIR` with the CPU-interface bits each CPU reads from its banked
+`GICD_ITARGETSR0..7`; the ITS refuses to initialise under GICv2
+(`ItsError::NotGicV3`), so PCI MSI-X falls back as for any ITS-less
+system.
 
 `alloc_block_aligned` returns a contiguous run whose base is a multiple of
 `align` (a power of two). Multi-message MSI requires it: the function writes
@@ -175,6 +232,17 @@ initialisation. Its input must come from firmware discovery.
   delivers only inside that domain.
 - EOI is always issued, even on spurious; missed EOI panics with a
   domain-scoped containment.
+- **The aarch64 GIC backend is a boot constant.** `gic::probe` selects
+  GICv2 or GICv3 exactly once, on the BSP, before any CPU unmasks IRQs;
+  `ack_irq` / `iar_intid` / `eoi_for` branch on that one static and
+  nothing changes it afterwards. `eoi_for` is handed the unmodified
+  `ack_irq` value (GICv2 SGIs carry the source CPU in IAR bits [12:10],
+  which `GICC_EOIR` must echo); the spurious INTID 1023 is never EOI'd.
+  Every GIC MMIO / system-register access uses the `narf_arch`
+  accessors, which carry `compiler_fence(SeqCst)` on both sides. The
+  GICv2 `GICC` window is an `ioremap` Device-nGnRE mapping in TTBR1:
+  present in every address space and untagged, so the trap path reaches
+  it from `DomainId::FRAME` whichever task was interrupted.
 - **PKRS / TCF are saved to the trap frame by `frame/`'s vector
   prologue before `dispatch_trap` runs.** `interrupts/` code executes
   under the Frame's domain (0), not the interrupted task's domain.
@@ -213,13 +281,23 @@ initialisation. Its input must come from firmware discovery.
   instruction for driver-to-driver signalling.
 
 ### aarch64
-- Controllers: GICv3 with ITS for MSI-like delivery. LPIs for per-device.
+- Controllers: GICv3 with ITS for MSI-like delivery (LPIs per device),
+  or GICv2 (QEMU `virt,gic-version=2`; Qualcomm IPQ8074 / IPQ6018 /
+  IPQ5018 `qcom,msm-qgic2`) with SPIs/PPIs/SGIs only. The GICv2 backend
+  follows Linux `irq-gic.c` (`gic_dist_init`, `gic_cpu_init`,
+  `gic_cpu_if_up`, `gic_ipi_send_mask`, `gic_handle_irq`): SPIs routed
+  to the boot CPU, level, priority 0xA0, disabled at distributor init;
+  `GICC_PMR` = 0xFF, `GICC_BPR` = 0, `GICC_CTLR` enable with firmware's
+  bypass-disable bits kept; EOImode 0. GICv2m MSI frames are not
+  implemented. `cargo xtask test --arch=aarch64` boots v2 with
+  `NARF_GIC_VERSION=2`.
 - ITS bring-up follows Linux `irq-gic-v3-its.c` (`its_alloc_tables`,
   `its_setup_baser`, `its_cpu_init_lpis`, `its_create_device`); DeviceIDs
   follow `iort_node_map_id` / `of_map_id`. Indirect (two-level) tables,
   multiple ITSes, per-CPU collections and vLPIs are not implemented; the
-  distributor / per-CPU redistributor setup in `gic.rs` still assumes the
-  QEMU `virt` bases. Validated on QEMU and against register models only.
+  per-CPU redistributor frame is found as `reg[1] + cpu * stride` from the
+  devicetree (not yet by `GICR_TYPER` affinity), and the ITS keeps its own
+  firmware discovery. Validated on QEMU and against register models only.
 - User-mode delivery: no direct UIPI equivalent; closest is FIQ or
   explicit event-register polling by the driver task.
 
@@ -409,13 +487,11 @@ the rest of the cap bundle.
 
 ## 13. Open questions
 
-- **GIC base discovery (aarch64).** `gic.rs` maps the QEMU virt
-  distributor/redistributor constants; Qualcomm IPQ8074/IPQ6018/IPQ5018
-  (`0x0b000000`) and SC7280 (`0x17a00000`) need the DT `arm,gic-v3` /
-  `qcom,msm-qgic2` reg windows (IPQ8074/IPQ6018/IPQ5018 are GICv2: no
-  `GICD_IROUTER`, `ITARGETSR` routing) before `configure_spi` reaches
-  real silicon. GICv2 also has no `ICC_*` system registers: the IAR/EOI
-  pair moves to the `GICC` MMIO frame, which the aarch64 trap entry
-  (`frame/src/aarch64/trap.rs`, TCB) reads today through `ICC_IAR1_EL1`.
+- **GIC discovery residue (aarch64).** Resolved for the common case:
+  the GIC version and windows come from the devicetree and GICv2 is a
+  full backend (§3, §5). Still open: `ranges` translation for a GIC
+  behind a non-identity bus, ACPI MADT GICD/GICC-driven selection,
+  redistributor lookup by `GICR_TYPER` affinity on multi-cluster v3
+  silicon, and GICv2m MSI frames for PCIe on IPQ parts.
 
 (none — all v0.1 questions resolved in §12)
