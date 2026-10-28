@@ -17,7 +17,7 @@ use crate::sdhci::{register_dt_driver, Sdhci, SdhciError};
 
 fn smoke_sdhci_dt_match_registered() -> TestResult {
     register_dt_driver();
-    let found = narf_bus::registered_dt()
+    let found = narf_bus::registered_dt_drivers()
         .iter()
         .any(|m| m.compatible == "xlnx,zynqmp-8.9a");
     if !found {
