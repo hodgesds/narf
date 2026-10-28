@@ -139,6 +139,14 @@ impl<I: Io> Owner<I> {
                 .map_err(super::station::Error::Transport),
         }
     }
+    /// Device removal: stop the station (or private CH12/RX), close the
+    /// owner and release published DMA behind the stop proof. Returns true
+    /// only when nothing remains pinned. The owner never restarts.
+    pub(super) fn retire(&mut self) -> bool {
+        let _ = self.station_stop();
+        self.active = false;
+        self.io.retire_dma()
+    }
     pub(super) async fn station_disconnect(&mut self) -> Result<(), super::station::Error> {
         self.station
             .as_mut()

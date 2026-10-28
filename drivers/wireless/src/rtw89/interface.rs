@@ -732,11 +732,37 @@ pub(super) fn publish<I: Io + 'static>(device: Arc<Device<I>>) -> Result<(), Err
     narf_wireless::registry::register(device.clone());
     device.published.store(true, Ordering::Release);
     narf_scheduler::spawn(async move {
-        loop {
+        while device.published.load(Ordering::Acquire) {
             device.service_once().await;
         }
     });
     Ok(())
+}
+/// Linux `rtw89_core_unregister` for removal: close admission and carrier,
+/// unregister from the wireless/net registries and release the singleton
+/// endpoint claim. Idempotent; the drain worker exits after its pass.
+pub(super) fn withdraw<I: Io + 'static>(device: &Device<I>) {
+    device.close();
+    if !device.published.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    narf_wireless::registry::unregister(&device.name);
+    narf_net::registry().unregister(&device.name);
+    narf_net::iface::unregister(&device.name);
+    let endpoint = device as *const Device<I> as *const ();
+    let mut active = ACTIVE.lock();
+    if active
+        .as_ref()
+        .is_some_and(|current| Arc::as_ptr(current) as *const () == endpoint)
+    {
+        *active = None;
+        CLAIMED.store(false, Ordering::Release);
+    }
+    device.line.raise();
+}
+/// Whether the shell is still registered.
+pub(super) fn published<I: Io + 'static>(device: &Device<I>) -> bool {
+    device.published.load(Ordering::Acquire)
 }
 struct Registered<I: Io>(Arc<Device<I>>);
 impl<I: Io + 'static> Interface for Registered<I> {

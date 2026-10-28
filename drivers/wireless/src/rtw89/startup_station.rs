@@ -15,6 +15,17 @@ impl Startup {
         }
         Ok(firmware.transport_mut())
     }
+    /// Terminal closure plus the DMA-stop proof and reclamation for removal.
+    /// A cold-only owner never published system-memory rings.
+    pub(in crate::rtw89) fn retire_published_dma(&mut self) -> bool {
+        self.fail();
+        if let Some(native) = self.native.as_mut() {
+            return native.retire_dma();
+        }
+        self.firmware
+            .as_mut()
+            .is_none_or(|firmware| firmware.transport_mut().retire_dma())
+    }
     /// Terminal analog closure on the same owner, after source packet/command
     /// closure. Success is not a DMA/resource reclamation receipt.
     pub(in crate::rtw89) async fn finish_station_shutdown(&mut self) -> Result<(), power::Error> {
@@ -329,6 +340,9 @@ unsafe impl Io for Startup {
     }
     fn irq_rearm(&mut self) -> Result<(), power::Error> {
         self.station_native()?.irq_rearm()
+    }
+    fn retire_dma(&mut self) -> bool {
+        self.retire_published_dma()
     }
     fn packet_stop(&mut self) -> Result<(), packet::Error> {
         if let Some(controller) = self.station_controller.as_mut() {

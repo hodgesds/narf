@@ -1079,6 +1079,14 @@ impl Native {
     pub(super) fn dma_reclaimed(&self) -> bool {
         self.dma_reclaimed
     }
+    /// Removal/re-initialization retirement: terminal closure (earning the
+    /// stop proof on RTL8852B), then reclamation. True only when nothing
+    /// this owner ever published remains pinned. CH12 is published before
+    /// RXQ/RPQ or any TX ring, so an unarmed owner published nothing.
+    pub(super) fn retire_dma(&mut self) -> bool {
+        self.fail();
+        self.dma_reclaimed || !self.armed || self.reclaim_dma().is_ok()
+    }
     /// # Safety
     /// Hardware stop/idle and all DMA/prefetch fences are complete. Neither
     /// capability revocation nor BME-off establishes this reclamation proof.

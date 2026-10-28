@@ -331,6 +331,9 @@ struct DriverModel {
     ht: bool,
     he: bool,
     irq: Option<IrqModel>,
+    /// HCI DMA stop/busy block behind `dma_stop::stop`.
+    dma: crate::rtw89::dma_stop::tests::Model,
+    reclaimed: Option<usize>,
 }
 /// AX v0 interrupt registers with write-1-clear status, behind the same
 /// `irq::Mask` programs the native binding runs.
@@ -378,6 +381,8 @@ impl DriverModel {
             ht: false,
             he: false,
             irq: None,
+            dma: crate::rtw89::dma_stop::tests::Model::new(),
+            reclaimed: None,
         }
     }
     fn packet<T>(
@@ -644,6 +649,19 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         model.rearms += 1;
         let mask = model.mask;
         mask.enable(model)
+    }
+    fn retire_dma(&mut self) -> bool {
+        if crate::rtw89::dma_stop::stop(&mut self.dma).is_err() {
+            return false;
+        }
+        // SAFETY: the modeled engines were proven idle with BME off; the
+        // packet model has no device or DMA producer.
+        let storage = self
+            .core
+            .as_mut()
+            .map_or(0, |core| unsafe { core.reclaim_fenced() }.len());
+        self.reclaimed = Some(storage);
+        true
     }
     fn packet_stop(&mut self) -> Result<(), crate::rtw89::packet_core::Error> {
         if let Some(model) = self.irq.as_mut() {
@@ -2219,4 +2237,43 @@ fn smoke_rtw8852b_scan_dwell_follows_requested_duration() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89/station",
     smoke_rtw8852b_scan_dwell_follows_requested_duration
+);
+
+fn smoke_rtw8852b_removal_retires_station_and_reclaims_behind_stop_proof() -> TestResult {
+    for busy in [false, true] {
+        let h = Harness::new(false);
+        if h.join().is_err() {
+            return TestResult::Fail("RTL8852B removal fixture association failed");
+        }
+        if busy {
+            // TX engine never drains within the Linux 100us budget.
+            h.model(|io| io.dma.tx_busy_reads = 64);
+        }
+        let mut retained = h.lifecycle.retained.try_lock().unwrap();
+        let owner = retained.as_mut().unwrap();
+        let reclaimed = owner.retire();
+        let stopped = owner.station_check().is_err()
+            && owner.station_phase() == Some(crate::rtw89::station::Phase::Stopped);
+        let io = &owner.io;
+        let core_reclaimed = io
+            .core
+            .as_ref()
+            .is_some_and(crate::rtw89::packet_core::Core::reclaimed);
+        if !stopped || !io.stopped || io.dma.bme {
+            return TestResult::Fail("removal left the station, packets or BME open");
+        }
+        if busy {
+            if reclaimed || io.reclaimed.is_some() || core_reclaimed {
+                return TestResult::Fail("busy DMA engine still released published storage");
+            }
+        } else if !reclaimed || io.reclaimed.is_none_or(|count| count < 2) || !core_reclaimed {
+            return TestResult::Fail("proven DMA stop did not release published storage");
+        }
+        drop(retained);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_removal_retires_station_and_reclaims_behind_stop_proof
 );

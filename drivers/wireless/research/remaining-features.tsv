@@ -196,32 +196,31 @@ rtw88	tx_ba_all_tids	Originator TX Block Ack on every non-VO TID	feature	drivers
 rtw88	vht	VHT operation	feature	drivers/wireless/specification/rtw88.md	1764
 rtw88	wow	Wake on Wireless on RTL8822CE	feature	drivers/wireless/specification/rtw88.md	1765
 rtw89	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw89.md	1006
-rtw89	aggregation	TX A-MPDU and TX A-MSDU/A-MSDU-in-A-MPDU aggregation	feature	drivers/wireless/specification/rtw89.md	1315
+rtw89	aggregation	TX A-MPDU and TX A-MSDU/A-MSDU-in-A-MPDU aggregation	feature	drivers/wireless/specification/rtw89.md	1340
 rtw89	antenna_diversity_tracking	Dynamic antenna diversity/tracking	feature	drivers/wireless/specification/rtw89.md	713
-rtw89	block_ack_originator	Originator TX BA (ADDBA request/CMAC AMPDU table) with TX A-MPDU	feature	drivers/wireless/specification/rtw89.md	1315
+rtw89	block_ack_originator	Originator TX BA (ADDBA request/CMAC AMPDU table) with TX A-MPDU	feature	drivers/wireless/specification/rtw89.md	1340
 rtw89	carrier_frequency_tracking	Periodic carrier-frequency offset tracking	feature	drivers/wireless/specification/rtw89.md	715
-rtw89	device_removal	Device removal	feature	drivers/wireless/specification/rtw89.md	1318
 rtw89	digital_initial_gain_tracking	Periodic digital initial gain control	feature	drivers/wireless/specification/rtw89.md	715
 rtw89	edcca_tracking	Periodic EDCCA tracking	feature	drivers/wireless/specification/rtw89.md	715
-rtw89	eht	EHT operation on RTL8922A	feature	drivers/wireless/specification/rtw89.md	1314
+rtw89	eht	EHT operation on RTL8922A	feature	drivers/wireless/specification/rtw89.md	1339
 rtw89	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specification/rtw89.md	1012
 rtw89	fragmentation	Host fragmentation/defragmentation with native fragment MPDU admission [API available: WirelessNetIface::set_fragmentation_threshold (SET_WIPHY NL80211_ATTR_WIPHY_FRAG_THRESHOLD routed after cfg80211 validation; default EOPNOTSUPP) (wireless spec 3.1.1)]	feature	drivers/wireless/specification/rtw89.md	1038
-rtw89	he_htc	HE +HTC insertion in QoS DATA [API available: station_security::Security receives +HTC QoS DATA (HT Control skipped, Order masked from the CCMP AAD) on the MSDU and A-MSDU paths, so advertising HTC_HE loses no AP traffic (wireless spec 3.4.1)]	feature	drivers/wireless/specification/rtw89.md	1322
+rtw89	he_htc	HE +HTC insertion in QoS DATA [API available: station_security::Security receives +HTC QoS DATA (HT Control skipped, Order masked from the CCMP AAD) on the MSDU and A-MSDU paths, so advertising HTC_HE loses no AP traffic (wireless spec 3.4.1)]	feature	drivers/wireless/specification/rtw89.md	1346
 rtw89	monitor_mode	Monitor radio mode with PHY-status RX metadata	feature	drivers/wireless/specification/rtw89.md	1039
 rtw89	multiple_live_functions	Multiple live PCI functions	feature	drivers/wireless/specification/rtw89.md	1009
 rtw89	nhm_diagnostics	Noise-histogram/CLM/FAHM environment monitoring	feature	drivers/wireless/specification/rtw89.md	1039
-rtw89	operating_reset	Automatic reset of an operating retained owner	feature	drivers/wireless/specification/rtw89.md	1316
-rtw89	pmf	Protected management frames (hardware unicast encryption on RTL8852C/RTL8922A, host on RTL8852B) [API available: association::JoinOptions::{akms: AkmSet, pmf: Pmf} negotiates AKM 8 fallback without AKM 24 and WPA2-PSK/PSK-SHA256 with MFPC/MFPR; JoinPlan::akm()/pmf(); Security::new admits the WPA2 PMF RSNE (wireless spec 3, AKM capability and WPA2 PMF)] [API available: narf_wifi_fixtures::FakeAp::wpa3_sae (SAE H2E / hunting-and-pecking via the shared SaeSession), with_pmf(ApPmf), with_akms, IGTK KDE in M3 and bip_broadcast_deauth for PMF/WPA3 conversation tests (verification spec, WPA3 and PMF profiles)]	feature	drivers/wireless/specification/rtw89.md	1320
-rtw89	randomized_scan_mac	Randomized scan sequence number (random scan MAC implemented)	feature	drivers/wireless/specification/rtw89.md	1321
+rtw89	operating_reset	Automatic reset of an operating retained owner	feature	drivers/wireless/specification/rtw89.md	1341
+rtw89	pmf	Protected management frames (hardware unicast encryption on RTL8852C/RTL8922A, host on RTL8852B) [API available: association::JoinOptions::{akms: AkmSet, pmf: Pmf} negotiates AKM 8 fallback without AKM 24 and WPA2-PSK/PSK-SHA256 with MFPC/MFPR; JoinPlan::akm()/pmf(); Security::new admits the WPA2 PMF RSNE (wireless spec 3, AKM capability and WPA2 PMF)] [API available: narf_wifi_fixtures::FakeAp::wpa3_sae (SAE H2E / hunting-and-pecking via the shared SaeSession), with_pmf(ApPmf), with_akms, IGTK KDE in M3 and bip_broadcast_deauth for PMF/WPA3 conversation tests (verification spec, WPA3 and PMF profiles)]	feature	drivers/wireless/specification/rtw89.md	1344
+rtw89	randomized_scan_mac	Randomized scan sequence number (random scan MAC implemented)	feature	drivers/wireless/specification/rtw89.md	1345
 rtw89	rf_power_tracking	Periodic RF calibration/power tracking	feature	drivers/wireless/specification/rtw89.md	1006
 rtw89	rtl8851b	RTL8851B retained runtime including exact secure-policy loading	chip	drivers/wireless/specification/rtw89.md	1017
 rtw89	rtl8852a	RTL8852A retained runtime including exact secure-policy loading	chip	drivers/wireless/specification/rtw89.md	1002
 rtw89	rtl8852c	RTL8852C retained runtime	chip	drivers/wireless/specification/rtw89.md	1017
 rtw89	rtl8922a	RTL8922A BE EFUSE/container/descriptor/transport/runtime	chip	drivers/wireless/specification/rtw89.md	1018
 rtw89	runtime_sleep	Runtime sleep/LPS	feature	drivers/wireless/specification/rtw89.md	1016
-rtw89	safe_rejoin	Safe reassociation/rejoin	feature	drivers/wireless/specification/rtw89.md	1317
+rtw89	safe_rejoin	Safe reassociation/rejoin	feature	drivers/wireless/specification/rtw89.md	1342
 rtw89	six_ghz_operation	6GHz band operation on RTL8852C/RTL8922A [API available: association::Bss.band / channel::Band::Ghz6 / frequency_in, he::HeOperation::six_ghz_operation, association::six_ghz::{admit, admit_with_rule, He6GhzCapability, He6GhzOperation}, reg::PowerType6Ghz + RegFlags::NO_6GHZ_{VLP,AFC}_CLIENT (wireless spec 3, 6 GHz band identity); a 6 GHz JoinPlan is not yet available]	feature	drivers/wireless/specification/rtw89.md	1013
-rtw89	system_suspend	System suspend	feature	drivers/wireless/specification/rtw89.md	1319
+rtw89	system_suspend	System suspend	feature	drivers/wireless/specification/rtw89.md	1343
 rtw89	tspec	TSPEC/WMM admission control (mac80211-owned host MLME)	feature	drivers/wireless/specification/rtw89.md	1044
 rtw89	uapsd	U-APSD	feature	drivers/wireless/specification/rtw89.md	933
 rtw89	wide_channels	HT40/80MHz widths on all AX chips and 160MHz on RTL8852C/RTL8922A	feature	drivers/wireless/specification/rtw89.md	1035

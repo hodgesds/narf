@@ -136,6 +136,12 @@ pub(super) unsafe trait Io: Send {
     }
     fn packet_poll(&mut self) -> Result<packet::Step, packet::Error>;
     fn packet_stop(&mut self) -> Result<(), packet::Error>;
+    /// After `packet_stop`: prove every HCI DMA engine idle with bus
+    /// mastering off and free all published storage. True only when nothing
+    /// remains pinned; owners without a proof keep everything (false).
+    fn retire_dma(&mut self) -> bool {
+        false
+    }
     /// Bind interrupt delivery to `line` once packets are started. Owners
     /// without an MSI path stay in polled mode.
     fn irq_start(&mut self, _line: &Arc<super::irq::Line>) -> Result<u8, power::Error> {

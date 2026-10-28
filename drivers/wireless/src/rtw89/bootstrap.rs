@@ -43,6 +43,8 @@ pub(super) struct Bootstrap {
     error: IrqSafeSpinLock<Option<Error>>,
     request: IrqSafeSpinLock<Option<super::command_native::QualificationRequest>>,
     running: AtomicBool,
+    /// Set by the PCI remove hook before it retires the owner.
+    removed: AtomicBool,
 }
 static OWNER: IrqSafeSpinLock<Option<Arc<Bootstrap>>> = IrqSafeSpinLock::new(None);
 static RESERVED: AtomicBool = AtomicBool::new(false);
@@ -142,20 +144,24 @@ impl Bootstrap {
             Some(lifecycle) => lifecycle,
             None => {
                 self.set_stage(Stage::Reset);
-                let fence = self
-                    .reset
-                    .lock()
-                    .await
+                // The reset guard stays held until the lifecycle is
+                // published, so removal sees either the reset or the owner.
+                let mut reset = self.reset.lock().await;
+                let fence = reset
                     .as_mut()
                     .ok_or(Error::Cancelled)?
                     .run()
                     .await
                     .map_err(Error::Reset)?;
+                if self.removed.load(Ordering::Acquire) {
+                    return Err(Error::Cancelled);
+                }
                 let startup = startup::Startup::claim_reset(self.device, self.authority, fence)
                     .map_err(Error::Startup)?;
                 // Retain the exact startup before its first cold/firmware attempt.
                 let lifecycle = Arc::new(Lifecycle::new(startup));
                 *self.lifecycle.lock() = Some(lifecycle.clone());
+                drop(reset);
                 lifecycle
             }
         };
@@ -180,7 +186,15 @@ impl Bootstrap {
         *self.shell.lock() = Some(shell.clone());
         // Source factory discovery ended with BME off. The exact same shell
         // reaches all registries before the first CH12/firmware BME attempt.
+        if self.removed.load(Ordering::Acquire) {
+            return Err(Error::Cancelled);
+        }
         super::interface::publish(shell.clone()).map_err(Error::Station)?;
+        // A removal that read no shell before this publication withdraws it.
+        if self.removed.load(Ordering::Acquire) {
+            super::interface::withdraw(&shell);
+            return Err(Error::Cancelled);
+        }
         loop {
             if shell.closed() {
                 terminalize(&shell, &lifecycle).await;
@@ -282,6 +296,83 @@ async fn advance(io: &mut startup::Startup) -> Result<bool, startup::Error> {
     }
     Ok(false)
 }
+impl Bootstrap {
+    /// Linux `rtw89_pci_remove` order: withdraw the interface
+    /// (`rtw89_core_unregister`), wait out any in-flight FLR quarantine,
+    /// then stop the station and release DMA (`rtw89_pci_clear_resource`)
+    /// behind the stop proof. True only when nothing remains pinned.
+    async fn retire(&self) -> bool {
+        self.removed.store(true, Ordering::Release);
+        let shell = {
+            let shell = self.shell.lock();
+            shell.clone()
+        };
+        if let Some(shell) = shell.as_ref() {
+            super::interface::withdraw(shell);
+        }
+        // An accepted FLR keeps its mandatory no-config quarantine; the
+        // reset is dropped only after `run` returned.
+        drop(self.reset.lock().await.take());
+        let lifecycle = {
+            let lifecycle = self.lifecycle.lock();
+            lifecycle.clone()
+        };
+        let Some(lifecycle) = lifecycle else {
+            // Reset never completed: BME stayed parked, nothing published.
+            self.set_stage(Stage::Terminal);
+            return true;
+        };
+        let taken = lifecycle.retained.lock().await.take();
+        let reclaimed = match taken {
+            Some(mut owner) => {
+                let reclaimed = owner.retire();
+                let _ = owner.io.finish_station_shutdown().await;
+                reclaimed
+            }
+            // Another retirement already took the owner; its result stands.
+            None => false,
+        };
+        self.set_stage(Stage::Terminal);
+        reclaimed
+    }
+}
+/// Release the singleton reservation only after proven reclamation. A
+/// pinned owner stays reserved (and its address quarantined) for the boot.
+async fn finish_remove(owner: Arc<Bootstrap>) -> bool {
+    let reclaimed = owner.retire().await;
+    if reclaimed {
+        let mut retained = OWNER.lock();
+        if retained
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &owner))
+        {
+            *retained = None;
+            RESERVED.store(false, Ordering::Release);
+        }
+    }
+    narf_console::klog!(
+        "rtw8852b: removed; DMA {}\n",
+        if reclaimed {
+            "reclaimed"
+        } else {
+            "pinned, function quarantined"
+        }
+    );
+    reclaimed
+}
+/// `narf_bus` PCI remove hook for the retained RTL8852B owner.
+pub(super) fn remove(device: BusDevice, _authority: Cap<BusDeviceCap, Write>) {
+    let owner = OWNER.lock().clone();
+    let Some(owner) = owner else {
+        return;
+    };
+    if owner.device.addr != device.addr || owner.removed.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    narf_scheduler::spawn(async move {
+        finish_remove(owner).await;
+    });
+}
 /// Safe bus-match path only uses an observed successful FLR. Unsupported
 /// functions remain parked; no board assertion becomes a temporal reset proof.
 pub(super) fn probe(
@@ -332,6 +423,7 @@ pub(super) fn probe(
         error: IrqSafeSpinLock::new(None),
         request: IrqSafeSpinLock::new(None),
         running: AtomicBool::new(false),
+        removed: AtomicBool::new(false),
     });
     publish_owner(owner);
     Ok(())
@@ -392,6 +484,7 @@ pub(super) unsafe fn attach_cold(
         error: IrqSafeSpinLock::new(None),
         request: IrqSafeSpinLock::new(None),
         running: AtomicBool::new(false),
+        removed: AtomicBool::new(false),
     });
     publish_owner(owner);
     Ok(())
@@ -448,6 +541,7 @@ mod tests {
             error: IrqSafeSpinLock::new(None),
             request: IrqSafeSpinLock::new(None),
             running: AtomicBool::new(true),
+            removed: AtomicBool::new(false),
         });
         *OWNER.lock() = Some(owner.clone());
         if probe(device, authority).is_err() {
@@ -469,8 +563,90 @@ mod tests {
         }
         TestResult::Pass
     }
+    fn fixture(
+        device: BusDevice,
+        lifecycle: Option<Arc<Lifecycle<startup::Startup>>>,
+    ) -> Arc<Bootstrap> {
+        Arc::new(Bootstrap {
+            device,
+            authority: Cap::bootstrap(),
+            reset: Mutex::new(None),
+            lifecycle: IrqSafeSpinLock::new(lifecycle),
+            shell: IrqSafeSpinLock::new(None),
+            stage: AtomicU8::new(Stage::Reset as u8),
+            error: IrqSafeSpinLock::new(None),
+            request: IrqSafeSpinLock::new(None),
+            running: AtomicBool::new(true),
+            removed: AtomicBool::new(false),
+        })
+    }
+    fn ready<T>(future: impl core::future::Future<Output = T>) -> Option<T> {
+        let mut future = core::pin::pin!(future);
+        match future.as_mut().poll(&mut core::task::Context::from_waker(
+            core::task::Waker::noop(),
+        )) {
+            core::task::Poll::Ready(value) => Some(value),
+            core::task::Poll::Pending => None,
+        }
+    }
+    fn smoke_rtw8852b_remove_releases_unpublished_and_quarantines_pinned_owner() -> TestResult {
+        if OWNER.lock().is_some()
+            || RESERVED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return TestResult::Skip("physical RTL8852B reservation already exists");
+        }
+        let _reservation = Reservation;
+        let device = device();
+        // Owner that never completed reset: nothing was published.
+        let owner = fixture(device, None);
+        *OWNER.lock() = Some(owner.clone());
+        let mut other = device;
+        other.addr = narf_bus::BusAddr::Pcie(narf_bus::PcieAddr::new(u16::MAX, u8::MAX, 30, 7));
+        remove(other, Cap::bootstrap());
+        if owner.removed.load(Ordering::Acquire) {
+            return TestResult::Fail("remove hook acted on a different function");
+        }
+        if ready(finish_remove(owner.clone())) != Some(true)
+            || OWNER.lock().is_some()
+            || RESERVED.load(Ordering::Acquire)
+            || !owner.removed.load(Ordering::Acquire)
+            || owner.stage.load(Ordering::Acquire) != Stage::Terminal as u8
+        {
+            return TestResult::Fail("unpublished owner removal kept the singleton reservation");
+        }
+        // Owner whose retained DMA owner cannot be proven reclaimed (already
+        // taken): the reservation and address stay quarantined.
+        RESERVED.store(true, Ordering::Release);
+        let lifecycle = Arc::new(Lifecycle {
+            retained: Mutex::new(None),
+        });
+        let pinned = fixture(device, Some(lifecycle));
+        *OWNER.lock() = Some(pinned.clone());
+        if ready(finish_remove(pinned.clone())) != Some(false)
+            || OWNER
+                .lock()
+                .as_ref()
+                .is_none_or(|current| !Arc::ptr_eq(current, &pinned))
+            || !RESERVED.load(Ordering::Acquire)
+        {
+            return TestResult::Fail("unproven removal released the singleton reservation");
+        }
+        // A quarantined address re-probe returns without configuration access.
+        if probe(device, Cap::bootstrap()).is_err() {
+            return TestResult::Fail("quarantined function re-probe touched the device");
+        }
+        // A second hook invocation never schedules another retirement.
+        remove(device, Cap::bootstrap());
+        TestResult::Pass
+    }
     kernel_test_in!(
         "drivers/wireless/rtw89/bootstrap",
         smoke_rtw8852b_retained_probe_never_reparks_or_replaces_reset_owner
+    );
+    kernel_test_in!(
+        "drivers/wireless/rtw89/bootstrap",
+        smoke_rtw8852b_remove_releases_unpublished_and_quarantines_pinned_owner
     );
 }
