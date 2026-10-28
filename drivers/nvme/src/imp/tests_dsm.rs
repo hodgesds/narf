@@ -59,7 +59,7 @@ fn fake_controller(oncs: u16, nsze: u64, cqe0_status: u16) -> Option<FakeCtrl> {
     }
     let mut ctrl = Controller::new(0);
     ctrl.bar0_region = Some(MmioRegion {
-        phys: bar.dma_addr(),
+        phys: bar.phys_addr(),
         virt: bar.dma_addr().raw(),
         len: bar.len() as u64,
         kind: BarKind::Mmio32 {
