@@ -197,8 +197,10 @@ impl Peer {
         {
             return Err("native AP data protection/direction");
         }
+        let mut priority = 0;
         let header = if self.qos {
             let tid = frame.get(24).copied().ok_or("AP QoS control")?;
+            priority = tid;
             if frame.get(25) != Some(&0) || tid > 7 || (!self.qos_all && tid != 0) {
                 return Err("AP BE/TID0 QoS control");
             }
@@ -221,7 +223,7 @@ impl Peer {
                 &Ccm,
                 &frame[..header],
                 key,
-                0,
+                priority,
                 false,
                 &mut self.replay,
                 &mut body,
@@ -358,7 +360,11 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         }
         self.controller
             .configure_wmm(&mut self.control, p, short, admission)
-            .await
+            .await?;
+        if self.qos_all {
+            self.controller.admit_all_tids(admission)?;
+        }
+        Ok(())
     }
     async fn station_update_wmm(
         &mut self,
@@ -1308,6 +1314,18 @@ fn smoke_rtw8852b_all_ac_qos_routes_tids_to_ach_rings_with_strict_priority() -> 
             || h.peer.lock().tids.last() != Some(&6)
             || last != Some(3)
         {
+            let tids = h.peer.lock().tids.clone();
+            let matched = h.peer.lock().uplink.last() == Some(&voice);
+            h.model(|io| {
+                narf_console::klog!(
+                    "rtw8852b qos fixture: matched={} tids={:?} channel={:?} packet={:?} closed={}\n",
+                    matched,
+                    tids,
+                    last,
+                    io.packet_error,
+                    io.stopped
+                )
+            });
             return TestResult::Fail("EF frame not sent as TID6 on ACH3");
         }
         // Queue BK (CS1), BE (DF) and VI (AF41) before the worker runs: the

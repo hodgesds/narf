@@ -70,11 +70,17 @@ unsafe impl Io for Startup {
             .as_mut()
             .ok_or(power::Error::Terminal)?
             .transport_mut();
-        self.station_controller
+        let controller = self
+            .station_controller
             .as_mut()
-            .ok_or(power::Error::Terminal)?
+            .ok_or(power::Error::Terminal)?;
+        controller
             .configure_wmm(&mut native.station_access(), p, short, admission)
-            .await
+            .await?;
+        if native.station_qos_all_allowed()? {
+            controller.admit_all_tids(admission)?;
+        }
+        Ok(())
     }
     async fn station_update_wmm(
         &mut self,

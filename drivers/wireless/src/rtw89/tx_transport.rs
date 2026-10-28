@@ -337,7 +337,11 @@ pub fn prepare_header(
         return Err(Error::BadFrame);
     }
     let header_length = if fc & 0xfc == 0x88 {
-        if chip != ChipId::Rtl8852B || frame.get(24..26) != Some(&[0, 0]) {
+        // TID0..7 with normal ack policy; EOSP/A-MSDU/TXOP bits unsupported.
+        if chip != ChipId::Rtl8852B
+            || frame.get(24).is_none_or(|control| control & 0xf8 != 0)
+            || frame.get(25) != Some(&0)
+        {
             return Err(Error::BadFrame);
         }
         26

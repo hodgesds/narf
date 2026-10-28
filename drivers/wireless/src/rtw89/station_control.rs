@@ -105,6 +105,9 @@ pub(super) struct Peer {
     valid: Arc<AtomicBool>,
     admission: Admission,
     qos: Arc<AtomicBool>,
+    /// QoS DATA TIDs admitted after WMM setup: bit0 (BE/TID0) for the WMM
+    /// recipe, all eight for the signed all-AC program.
+    tids: Arc<core::sync::atomic::AtomicU8>,
 }
 impl Peer {
     pub(super) fn own(&self) -> [u8; 6] {
@@ -130,9 +133,15 @@ impl Peer {
             && frame[4..10] == self.peer
             && frame[10..16] == self.own
             && (frame[0] != 0x88
-                || self.qos.load(Ordering::Acquire) && frame.get(24..26) == Some(&[0, 0]))
+                || self.qos.load(Ordering::Acquire)
+                    && frame.get(25) == Some(&0)
+                    && frame.get(24).is_some_and(|control| {
+                        control & 0xf8 == 0
+                            && self.tids.load(Ordering::Acquire) & (1 << control) != 0
+                    }))
     }
     fn invalidate(&self) {
+        self.tids.store(0, Ordering::Release);
         self.qos.store(false, Ordering::Release);
         self.valid.store(false, Ordering::Release);
     }
@@ -273,6 +282,7 @@ impl Controller {
             valid: Arc::new(AtomicBool::new(false)),
             admission: admission.clone(),
             qos: Arc::new(AtomicBool::new(false)),
+            tids: Arc::new(core::sync::atomic::AtomicU8::new(0)),
         };
         self.peer = Some(peer.clone());
         let mut attempt = Attempt {
@@ -374,12 +384,31 @@ impl Controller {
         }
         admission.run(|| {
             peer.current()?;
+            peer.tids.store(1, Ordering::Release);
             peer.qos.store(true, Ordering::Release);
             self.phase = Phase::Associated;
             Ok(())
         })?;
         attempt.armed = false;
         Ok(())
+    }
+    /// Admit TID0..7 on an already WMM-configured peer. Callers grant this
+    /// only under the signed all-AC QoS operating program.
+    pub(super) fn admit_all_tids(&self, admission: &Admission) -> Result<(), Error> {
+        if self.phase() != Phase::Associated
+            || self.admission.as_ref().is_none_or(|a| !a.same(admission))
+        {
+            return Err(Error::Terminal);
+        }
+        let peer = self.peer.as_ref().ok_or(Error::Terminal)?;
+        admission.run(|| {
+            peer.current()?;
+            if !peer.qos.load(Ordering::Acquire) {
+                return Err(Error::Terminal);
+            }
+            peer.tids.store(0xff, Ordering::Release);
+            Ok(())
+        })
     }
     /// Live AP EDCA change on an admitted QoS peer (mac80211
     /// `ieee80211_sta_wmm_params` -> `rtw89_ops_conf_tx` ->
