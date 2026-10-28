@@ -52,6 +52,20 @@
 //! workload boundary. The Linux schedutil module uses a similar
 //! down-rate-limit; we keep it cheaper at this stage.
 //!
+//! ## Thermal limit (passive cooling)
+//!
+//! ACPI 6.5 §11.3: when a thermal zone crosses its passive trip
+//! point (`_PSV`), the OS reduces the *performance* of the device
+//! in the zone's passive cooling path — for a processor, its clock
+//! rate. The generic thermal registry maps `_PSV` onto the zone's
+//! warn band and its governor raises a cooling level on the
+//! crossing; this governor exposes the matching actuator as a
+//! `thermal::CoolingDevice` ([`CpufreqCoolingDevice`]) whose level
+//! becomes a ceiling in permille of each CPU's policy window. The
+//! ceiling binds both the tick's target computation and the
+//! `min/max` fields programmed into the HWP / CPPC request, so
+//! autonomous hardware selection is capped as well.
+//!
 //! ## Spec / source references
 //!
 //! - Intel SDM Vol 4 §2.16 (HWP MSRs).
@@ -71,8 +85,9 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
 
 use narf_arch::x86_64::cpuid::cpuid;
 use narf_arch::x86_64::msr::{rdmsr_or_gp, wrmsr_or_gp};
@@ -315,6 +330,99 @@ pub fn current_perf(cpu: u32) -> Option<PerfState> {
     })
 }
 
+// ── Thermal limit (passive cooling) ────────────────────────────────
+
+/// Thermal ceiling in permille of each CPU's policy window:
+/// 1000 = the full window (no thermal restriction), 0 = the window
+/// floor only. Written by the passive cooling device, read by
+/// [`tick_cpu`] and by the HWP / CPPC request programmers.
+///
+/// The store is a single atomic because the only writer runs inside
+/// `thermal::CoolingDevice::set_level`, which the thermal registry
+/// invokes while holding its own IRQ-safe registry lock — the write
+/// must never block, and per-CPU governor workers must never wait
+/// on it either.
+static THERMAL_LIMIT_PERMILLE: AtomicU16 = AtomicU16::new(1000);
+
+/// Map a thermal-registry cooling level (0 = no cooling demanded,
+/// 255 = maximum cooling) onto the fraction of the performance
+/// window that remains available, in permille. The endpoints are
+/// exact: level 0 → 1000 (no restriction), level 255 → 0 (window
+/// floor only). The shape between them is linear — ACPI 6.5 §11.3
+/// defines *that* passive cooling reduces performance past `_PSV`
+/// and leaves the reduction curve to OS policy.
+pub const fn cooling_level_limit_permille(level: u8) -> u16 {
+    // u32 arithmetic: 255 · 1000 overflows u16.
+    1000 - ((level as u32 * 1000) / 255) as u16
+}
+
+/// Set the thermal ceiling directly, in permille of the policy
+/// window (clamped to 1000). The passive cooling device is the
+/// production writer; the surface is public so composition code
+/// and tests drive the same store the device writes.
+pub fn set_thermal_limit_permille(permille: u16) {
+    THERMAL_LIMIT_PERMILLE.store(permille.min(1000), Ordering::Release);
+}
+
+/// The current thermal ceiling in permille (1000 = uncapped).
+pub fn thermal_limit_permille() -> u16 {
+    THERMAL_LIMIT_PERMILLE.load(Ordering::Acquire)
+}
+
+/// Pure thermal-cap mapping: the largest perf value inside
+/// `[min, max]` that `limit_permille` leaves available. A limit of
+/// 1000 (or a degenerate window) returns `max` unchanged.
+pub const fn capped_max(min: u8, max: u8, limit_permille: u16) -> u8 {
+    if limit_permille >= 1000 || max <= min {
+        return max;
+    }
+    min + ((max - min) as u32 * limit_permille as u32 / 1000) as u8
+}
+
+/// [`capped_max`] against the live thermal ceiling.
+pub fn thermal_capped_max(min: u8, max: u8) -> u8 {
+    capped_max(min, max, thermal_limit_permille())
+}
+
+// ── Passive cooling device ─────────────────────────────────────────
+
+/// The passive (Processor) cooling device: the thermal registry's
+/// `CoolingDevice` face of this governor. ACPI 6.5 §11.3 passive
+/// cooling for a processor zone means reducing the processor's
+/// performance; until this device existed the registry's only
+/// actuators were fans, so a `_PSV` crossing could move air but
+/// never throttle a clock.
+///
+/// `set_level` runs under the thermal registry's lock on a band
+/// crossing, so it does exactly one atomic store — the per-CPU
+/// workers and the request programmers pick the new ceiling up on
+/// their next pass.
+#[derive(Debug)]
+pub struct CpufreqCoolingDevice;
+
+impl crate::thermal::CoolingDevice for CpufreqCoolingDevice {
+    fn name(&self) -> &'static str {
+        "cpufreq"
+    }
+
+    fn set_level(&self, level: u8) {
+        set_thermal_limit_permille(cooling_level_limit_permille(level));
+    }
+}
+
+/// Register [`CpufreqCoolingDevice`] with the thermal registry.
+/// Called from the `cpufreq-init` initcall after [`enable`] has
+/// succeeded — with no live backend there is nothing to throttle,
+/// and registering a device whose levels do nothing would be a
+/// false publication. The registry itself has existed since
+/// Stage::PostCore. A registration failure is the caller's to log:
+/// active (fan) cooling is unaffected by it.
+pub fn install_passive_cooling() -> Result<(), crate::thermal::ThermalError> {
+    let cap = crate::bootstrap_thermal_authority();
+    let dev: Arc<dyn crate::thermal::CoolingDevice> = Arc::new(CpufreqCoolingDevice);
+    crate::thermal::register_cooling_device(&cap, dev)
+}
+
 /// One-shot governor tick for the executing CPU.
 ///
 /// Returns one when its request changed and zero when hysteresis suppressed
@@ -345,12 +453,22 @@ fn tick_cpu(cpu: usize) -> Result<u32, CpuFreqError> {
     if min == 0 && max == 0 {
         return Err(CpuFreqError::NoSuchCpu);
     }
+    // Thermal ceiling (passive cooling): scale the policy window's
+    // max by the thermal limit before any target is computed, so the
+    // cap binds `Performance` as well as the utilisation-shaped
+    // policies.
+    let max = thermal_capped_max(min, max);
     let target = match policy {
         Policy::Performance => max,
         Policy::Balanced | Policy::Powersave => target_perf(util, min, max),
         Policy::Userspace => 0,
     };
-    if prev != 0 && target.abs_diff(prev) <= HYSTERESIS_BAND {
+    // Hysteresis suppression — except when the previously written
+    // desired now sits *above* the (possibly newly tightened)
+    // ceiling: that write must be corrected even if the new target
+    // is within the band, or a cap drop smaller than the band would
+    // never take effect.
+    if prev != 0 && prev <= max && target.abs_diff(prev) <= HYSTERESIS_BAND {
         return Ok(0);
     }
     write_desired(b, cpu, target)?;
@@ -685,6 +803,10 @@ fn write_desired_hwp(cpu: usize, desired: u8) -> Result<(), CpuFreqError> {
     let pc = PERCPU.lock();
     let (min, max, epp) = (pc[cpu].min_perf, pc[cpu].max_perf, pc[cpu].epp);
     drop(pc);
+    // The request's max field carries the thermal ceiling too: HWP
+    // selects autonomously anywhere inside [min, max], so capping
+    // only `desired` would not bind it.
+    let max = thermal_capped_max(min, max);
     // Build `IA32_HWP_REQUEST` with the policy's current
     // (min, max, desired, EPP) tuple.
     let req = (min as u64) | ((max as u64) << 8) | ((desired as u64) << 16) | ((epp as u64) << 24);
@@ -695,6 +817,9 @@ fn write_desired_cppc(cpu: usize, desired: u8) -> Result<(), CpuFreqError> {
     let pc = PERCPU.lock();
     let (min, max, epp) = (pc[cpu].min_perf, pc[cpu].max_perf, pc[cpu].epp);
     drop(pc);
+    // As with HWP: the CPPC request's max bounds autonomous
+    // selection, so the thermal ceiling applies to it as well.
+    let max = thermal_capped_max(min, max);
     let req = CppcRequest::build(min, max, desired, epp);
     wrmsr_or_gp(MSR_AMD_CPPC_REQ, req.0).map_err(|_| CpuFreqError::RequestGp)
 }
@@ -794,6 +919,7 @@ pub fn __reset_for_test() {
     ENABLED.store(0, Ordering::Release);
     WORKERS_STARTED.store(false, Ordering::Release);
     TICK_COUNT.store(0, Ordering::Release);
+    THERMAL_LIMIT_PERMILLE.store(1000, Ordering::Release);
     let mut pc = PERCPU.lock();
     for slot in pc.iter_mut() {
         *slot = PerCpu::default();
@@ -1093,4 +1219,171 @@ mod smoke_tests {
         TestResult::Pass
     }
     kernel_test_in!("power/cpufreq", smoke_cpufreq_backend_priority);
+
+    /// Thermal-limit mapping pins. The endpoints are the contract
+    /// (level 0 = no restriction, level 255 = window floor only);
+    /// the interior values are hand-computed from the linear map
+    /// `1000 − level·1000/255`:
+    ///   level 128 → 1000 − 501 = 499   (128·1000/255 = 501.96…)
+    ///   level  64 → 1000 − 250 = 750   (64·1000/255 = 250.98…)
+    /// And the window application `min + (max−min)·limit/1000`:
+    ///   (20, 200, 500) → 110, (100, 200, 970) → 197.
+    fn smoke_cpufreq_thermal_limit_mapping() -> TestResult {
+        if cooling_level_limit_permille(0) != 1000 {
+            return TestResult::Fail("level 0 must be uncapped");
+        }
+        if cooling_level_limit_permille(255) != 0 {
+            return TestResult::Fail("level 255 must floor the window");
+        }
+        if cooling_level_limit_permille(128) != 499 {
+            return TestResult::Fail("level 128 must map to 499 permille");
+        }
+        if cooling_level_limit_permille(64) != 750 {
+            return TestResult::Fail("level 64 must map to 750 permille");
+        }
+        // Monotonic non-increasing across the whole level range.
+        let mut prev = 1000u16;
+        for level in 0..=255u8 {
+            let limit = cooling_level_limit_permille(level);
+            if limit > prev {
+                return TestResult::Fail("limit must not rise with level");
+            }
+            prev = limit;
+        }
+        if capped_max(20, 200, 500) != 110 {
+            return TestResult::Fail("(20,200) at 500 permille must cap to 110");
+        }
+        if capped_max(100, 200, 970) != 197 {
+            return TestResult::Fail("(100,200) at 970 permille must cap to 197");
+        }
+        if capped_max(20, 200, 1000) != 200 {
+            return TestResult::Fail("limit 1000 must leave max unchanged");
+        }
+        if capped_max(20, 200, 0) != 20 {
+            return TestResult::Fail("limit 0 must cap to the window floor");
+        }
+        if capped_max(50, 50, 500) != 50 {
+            return TestResult::Fail("degenerate window must be unchanged");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("power/cpufreq", smoke_cpufreq_thermal_limit_mapping);
+
+    /// Tick-level enforcement against the no-op `_PSS` write path:
+    /// with the backend forced to `AcpiPss`, `write_desired` always
+    /// succeeds, so the real governor tick runs end to end and the
+    /// written desired is observable through `current_perf`. The
+    /// window is seeded (20, 100, 200) under `Performance`, i.e.
+    /// the policy window is (100, 200) and the target is always the
+    /// (capped) max — no dependence on the utilisation proxy.
+    fn smoke_cpufreq_thermal_limit_ticks() -> TestResult {
+        __reset_for_test();
+        __force_backend_for_test(Backend::AcpiPss);
+        let cpu = narf_lib::percpu::current_cpu();
+        {
+            let mut pc = PERCPU.lock();
+            seed_slot(&mut pc[cpu], 20, 100, 200);
+            apply_policy_to_slot(&mut pc[cpu], Policy::Performance);
+        }
+        ENABLED.store(1, Ordering::Release);
+        let desired = |cpu: usize| current_perf(cpu as u32).map(|p| p.desired);
+
+        // Uncapped: the tick writes the full window max.
+        set_thermal_limit_permille(1000);
+        if tick() != Ok(1) || desired(cpu) != Some(200) {
+            __reset_for_test();
+            return TestResult::Fail("uncapped tick must write desired 200");
+        }
+        // Ceiling at 500 permille: cap = 100 + 100·500/1000 = 150.
+        set_thermal_limit_permille(500);
+        if tick() != Ok(1) || desired(cpu) != Some(150) {
+            __reset_for_test();
+            return TestResult::Fail("500-permille tick must write desired 150");
+        }
+        // Restore the uncapped write (Δ = 50, outside the band).
+        set_thermal_limit_permille(1000);
+        if tick() != Ok(1) || desired(cpu) != Some(200) {
+            __reset_for_test();
+            return TestResult::Fail("cap release must write desired 200");
+        }
+        // Ceiling at 970 permille: cap = 197. The new target is
+        // within the hysteresis band of the previous write
+        // (|197 − 200| = 3 ≤ 4), but the previous desired sits
+        // *above* the new ceiling — the write must not be
+        // suppressed, or this cap drop would never take effect.
+        set_thermal_limit_permille(970);
+        if tick() != Ok(1) || desired(cpu) != Some(197) {
+            __reset_for_test();
+            return TestResult::Fail("in-band cap drop must still write desired 197");
+        }
+        // Lifting the cap again: target 200 is within the band of
+        // 197 and the previous write is under the ceiling, so
+        // hysteresis legitimately suppresses this tick.
+        set_thermal_limit_permille(1000);
+        if tick() != Ok(0) || desired(cpu) != Some(197) {
+            __reset_for_test();
+            return TestResult::Fail("in-band cap release must stay suppressed");
+        }
+        __reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("power/cpufreq", smoke_cpufreq_thermal_limit_ticks);
+
+    /// End-to-end passive cooling through the real registry chain:
+    /// zone registration, `record_temp` band crossings, the
+    /// installed `StepPolicy` governor and the registered cpufreq
+    /// device move the governor's thermal ceiling. The zone's warn
+    /// band is where the ACPI bridge maps `_PSV`, so crossing it is
+    /// exactly the passive-cooling trigger on real hardware.
+    fn smoke_cpufreq_passive_cooling_end_to_end() -> TestResult {
+        use crate::thermal;
+        __reset_for_test();
+        thermal::__test_reset();
+        thermal::init();
+        let cap = crate::bootstrap_thermal_authority();
+        let zone = match thermal::register_zone(&cap, "TZ0", 80_000, 100_000) {
+            Ok(id) => id,
+            Err(_) => {
+                thermal::__test_reset();
+                return TestResult::Fail("zone registration");
+            }
+        };
+        if install_passive_cooling().is_err() {
+            thermal::__test_reset();
+            return TestResult::Fail("passive cooling registration");
+        }
+        // Below warn: no band crossing, ceiling untouched.
+        let _ = thermal::record_temp(zone, 40_000);
+        if thermal_limit_permille() != 1000 {
+            thermal::__test_reset();
+            __reset_for_test();
+            return TestResult::Fail("no crossing must leave the ceiling at 1000");
+        }
+        // Into the warn (_PSV) band: StepPolicy raises level 128,
+        // which the device maps to a 499-permille ceiling.
+        let _ = thermal::record_temp(zone, 85_000);
+        if thermal_limit_permille() != 499 {
+            thermal::__test_reset();
+            __reset_for_test();
+            return TestResult::Fail("warn crossing must cap the ceiling to 499");
+        }
+        // Into Critical: level 255 floors the window.
+        let _ = thermal::record_temp(zone, 105_000);
+        if thermal_limit_permille() != 0 {
+            thermal::__test_reset();
+            __reset_for_test();
+            return TestResult::Fail("critical crossing must floor the ceiling");
+        }
+        // Back to Normal: level 0 releases the ceiling in full.
+        let _ = thermal::record_temp(zone, 40_000);
+        if thermal_limit_permille() != 1000 {
+            thermal::__test_reset();
+            __reset_for_test();
+            return TestResult::Fail("normal crossing must release the ceiling");
+        }
+        thermal::__test_reset();
+        __reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("power/cpufreq", smoke_cpufreq_passive_cooling_end_to_end);
 }

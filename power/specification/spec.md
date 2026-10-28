@@ -106,6 +106,12 @@ pub fn set_policy_current(policy: Policy) -> Result<(), CpuFreqError>;
 pub fn set_epp_current(epp: u8) -> Result<(), CpuFreqError>;
 pub fn current_perf(cpu: CpuId) -> Option<PerfState>;
 
+// Thermal limit (passive cooling, §3.4): a ceiling in permille of
+// each CPU's policy window — 1000 = uncapped, 0 = window floor.
+pub fn set_thermal_limit_permille(permille: u16);
+pub fn thermal_limit_permille() -> u16;
+pub fn install_passive_cooling() -> Result<(), ThermalError>;
+
 pub trait Governor {
     fn tick(&mut self, load: LoadSnapshot) -> Opp;
     fn name(&self) -> &'static str;
@@ -114,6 +120,20 @@ pub trait Governor {
 
 Built-in governors: `Performance`, `Powersave`, `EnergyAware`
 (scheduler-informed). Pluggability is opt-in via `Cap<Governor, Install>`.
+
+The governor also carries the thermal limit used for passive
+cooling (ACPI 6.5 §11.3). The thermal registry's cooling level
+maps linearly onto a ceiling in permille of the policy window
+(level 0 → 1000 uncapped, level 255 → 0, the window floor). The
+ceiling binds both the tick's target computation and the max
+field programmed into the HWP / CPPC request, so autonomous
+hardware selection is capped as well; a previously written
+desired above a newly tightened ceiling is rewritten even when
+the new target sits inside the hysteresis band.
+`install_passive_cooling()` registers the governor as a
+`thermal::CoolingDevice` and is called by the `cpufreq-init`
+initcall only after `enable()` succeeds — with no live backend
+there is nothing to throttle and no device is published.
 
 On x86_64, `Balanced` is the default schedutil-style policy over Intel
 HWP or AMD CPPC. One hard-pinned worker per online CPU samples that CPU's
@@ -728,6 +748,15 @@ initcall registers `AcpiFan` cooling devices. Both producers log
 registration failures; the fan log prints "no PNP0C0B fans
 discovered" only when discovery genuinely found none.
 
+The passive half of the same loop is the cpufreq governor
+(§3.2): because the bridge maps the zone warn band from `_PSV`,
+the governor's inline drive on a warn crossing raises the fans
+*and* lowers the cpufreq thermal ceiling — one crossing, both
+actuator classes. `cpufreq-init` (Stage::Late) registers the
+`CpufreqCoolingDevice` once a backend has enabled; before it,
+and on machines with no cpufreq backend, the registry's
+actuators are the fans alone.
+
 ### 3.5 Runtime PM for devices
 
 ```rust
@@ -966,6 +995,21 @@ warning hook on a transition into `LaptopStateSnapshot::
 is_running_low_on_battery()` when policy enables it. The §3.3
 production-S3 arm/validated gates are unchanged: the service
 requests suspend, the core still decides.
+
+The temperature providers are registered by the hwmon crate,
+not the platform composition: `narf-drivers-hwmon`'s
+`hwmon-power-providers` initcall (Stage::Late) fills
+`StateProviders.cpu_temp_mc` with a live read of the hwmon
+registry — k10temp `Tdie` preferred, coretemp `Tpackage` as the
+fallback, `None` when neither driver has probed (the field
+stays unknown, never a fabricated zero). The dependency cannot
+run the other way (hwmon already depends on platform), and the
+merge semantics of `register_state_providers` make the order
+between the two compositions immaterial. `gpu_temp_mc` has no
+provider yet: the amdgpu SMU temperature exists only as a
+decode of a metrics-table snapshot with no live in-kernel
+handle, so the field remains `None` in production (#914
+remainder).
 
 The platform battery provider behind `StateProviders.battery`
 is itself multi-source. The composition root

@@ -31,6 +31,7 @@ pub mod it87;
 pub mod jc42;
 pub mod k10temp;
 pub mod nct6775;
+pub mod power_providers;
 pub mod registry;
 pub mod sysfs_bridge;
 
@@ -146,6 +147,14 @@ pub fn register_initcalls() {
     // initialised at Stage::PostCore, so it is live by now.
     narf_init::register(Stage::Late, "hwmon-cooling", || {
         cooling::register_hwmon_cooling_devices();
+        InitResult::Ok
+    });
+    // Stage::Late: publish the CPU temperature into the power
+    // service's fused snapshot (#914). The provider reads this
+    // crate's registry live at snapshot time, so driver probe
+    // order does not matter.
+    narf_init::register(Stage::Late, "hwmon-power-providers", || {
+        power_providers::register_temp_providers();
         InitResult::Ok
     });
 }
