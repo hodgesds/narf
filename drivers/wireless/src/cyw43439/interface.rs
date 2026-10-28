@@ -171,9 +171,32 @@ impl<R: Fullmac> core::fmt::Debug for Device<R> {
     }
 }
 
+type PmFuture<'a> = core::pin::Pin<
+    alloc::boxed::Box<dyn core::future::Future<Output = Result<(), Error>> + Send + 'a>,
+>;
 trait Endpoint: Send + Sync {
     fn enqueue(&self, bytes: &[u8]) -> Result<(), ()>;
     fn drain(&self) -> bool;
+    fn suspend(&self) -> PmFuture<'_>;
+    fn resume(&self) -> PmFuture<'_>;
+}
+/// System-suspend prepare for the attached PCIe FullMAC owner, if any:
+/// Linux `brcmf_cfg80211_suspend` without WoWL (`brcmf_link_down` on a
+/// connected station) followed by the bus `suspend` op.
+pub async fn suspend_pcie() -> Result<(), Error> {
+    let active = ACTIVE_PCIE.lock().clone();
+    match active {
+        Some(active) => active.suspend().await,
+        None => Ok(()),
+    }
+}
+/// Paired resume for [`suspend_pcie`].
+pub async fn resume_pcie() -> Result<(), Error> {
+    let active = ACTIVE_PCIE.lock().clone();
+    match active {
+        Some(active) => active.resume().await,
+        None => Ok(()),
+    }
 }
 static ACTIVE_SDIO: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
 static ACTIVE_PCIE: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
@@ -737,6 +760,28 @@ impl<R: Fullmac + 'static> Endpoint for Device<R> {
     }
     fn drain(&self) -> bool {
         self.deliver_received(self.step())
+    }
+    fn suspend(&self) -> PmFuture<'_> {
+        alloc::boxed::Box::pin(async move {
+            let connected = self.state.lock().await.station.bssid.is_some();
+            if connected {
+                let _ = WirelessNetIface::disassociate(self).await;
+            }
+            let mut state = self.state.lock().await;
+            state.clear_transmit();
+            state.station.runtime.suspend_transport().await
+        })
+    }
+    fn resume(&self) -> PmFuture<'_> {
+        alloc::boxed::Box::pin(async move {
+            let mut state = self.state.lock().await;
+            let result = state.station.runtime.resume_transport().await;
+            if result.is_err() {
+                self.power_save.store(2, Ordering::Release);
+                self.link(None);
+            }
+            result
+        })
     }
 }
 fn send_sdio(bytes: &[u8], _: narf_net::TxMeta) -> Result<(), ()> {

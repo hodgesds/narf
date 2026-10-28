@@ -73,6 +73,17 @@ pub trait Fullmac: Send {
     fn wake_source(&self) -> Option<(alloc::sync::Arc<crate::brcmfmac::irq::Signal>, bool)> {
         None
     }
+    /// System-suspend transport phase after the station link is down
+    /// (Linux `dev_pm_ops.suspend`). Unsupported transports refuse it so
+    /// the coordinator unwinds instead of losing firmware state.
+    fn suspend_transport(&mut self) -> impl Future<Output = Result<(), Error>> + Send {
+        async { Err(Error::Unsupported) }
+    }
+    /// Paired resume (Linux `dev_pm_ops.resume`). An error leaves this
+    /// transport generation terminal.
+    fn resume_transport(&mut self) -> impl Future<Output = Result<(), Error>> + Send {
+        async { Err(Error::Unsupported) }
+    }
     /// Bus-match firmware vendor (Linux `bus_if->fwvid`).
     fn firmware_vendor(&self) -> FirmwareVendor {
         FirmwareVendor::Wcc

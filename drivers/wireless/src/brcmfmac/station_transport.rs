@@ -175,6 +175,44 @@ where
     fn wake_source(&self) -> Option<(alloc::sync::Arc<crate::brcmfmac::irq::Signal>, bool)> {
         Some(self.inner.interrupt())
     }
+    /// `brcmf_cfg80211_suspend` (no WoWL) has already brought the link down;
+    /// retire every flow and TX completion, then `brcmf_pcie_pm_enter_D3`.
+    /// A timeout leaves the transport usable so the suspend unwinds.
+    async fn suspend_transport(&mut self) -> Result<(), Error> {
+        if self.failed {
+            return Err(Error::Failed);
+        }
+        self.set_link(None);
+        let deadline = narf_time::Deadline::after_ms(2000);
+        loop {
+            self.poll()?;
+            if self.flows.is_empty() && self.tx.is_empty() && !self.closing {
+                break;
+            }
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+        }
+        self.inner.enter_d3().await.map_err(map)
+    }
+    /// `brcmf_pcie_pm_leave_D3`: hot resume, or a terminal owner when the
+    /// dongle lost power/firmware (Linux re-probes; NARF needs a transport
+    /// reset, see `brcmfmac.md`).
+    async fn resume_transport(&mut self) -> Result<(), Error> {
+        if self.failed {
+            return Err(Error::Failed);
+        }
+        match self.inner.leave_d3().await {
+            Ok(()) => Ok(()),
+            // Not suspended: nothing to resume, the transport stays usable.
+            Err(runtime::Error::Busy) => Err(Error::Busy),
+            Err(error) => {
+                self.fail();
+                Err(map(error))
+            }
+        }
+    }
     fn poll(&mut self) -> Result<usize, Error> {
         let result = self.progress();
         if result.is_err() {

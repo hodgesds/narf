@@ -317,3 +317,96 @@ kernel_test_in!(
     "drivers/wireless/brcmfmac",
     smoke_brcmf_late_dma_or_halt_fails_stop_proof
 );
+
+fn adapter(
+    d3_ack: bool,
+) -> Option<(
+    crate::brcmfmac::station_transport::Adapter<Model>,
+    Rc<IrqSafeSpinLock<State>>,
+)> {
+    let (bus, s) = model();
+    {
+        let mut st = s.lock();
+        st.msi = true;
+        st.d3_ack = d3_ack;
+        // brcmf_pcie_pm_leave_D3 reads INTMASK: nonzero = still powered.
+        st.registers.insert(PCIE + 0x24, 0x300);
+    }
+    let owner = runtime::Runtime::attach(booted(bus)).ok()?;
+    let adapter = crate::brcmfmac::station_transport::Adapter::new(owner).ok()?;
+    Some((adapter, s))
+}
+
+fn smoke_brcmf_system_suspend_resume_d3_d0_handshake() -> TestResult {
+    use crate::cyw43439::fullmac::Fullmac;
+    let Some((mut adapter, s)) = adapter(true) else {
+        return TestResult::Fail("msgbuf adapter setup failed");
+    };
+    if ready(adapter.suspend_transport()) != Some(Ok(())) {
+        return TestResult::Fail("D3_INFORM/D3_ACK suspend failed");
+    }
+    {
+        let st = s.lock();
+        if st.sbmbx != [H2D_HOST_D3_INFORM] || mask(&st) != 0 {
+            return TestResult::Fail("suspend did not send D3_INFORM and keep the mailbox masked");
+        }
+    }
+    let flushed = s.lock().dma.len();
+    if ready(adapter.resume_transport()) != Some(Ok(())) || adapter.poll().is_err() {
+        return TestResult::Fail("hot D0_INFORM resume failed");
+    }
+    {
+        let st = s.lock();
+        if st.sbmbx != [H2D_HOST_D3_INFORM, H2D_HOST_D0_INFORM]
+            || mask(&st) != MB_INT_D2H_DB | MB_INT_FN0
+            || st.dma.len() != flushed
+            || st.dropped != 0
+        {
+            return TestResult::Fail("resume did not re-enable mailbox on retained rings");
+        }
+    }
+    // Second cycle: the dongle lost power across suspend (INTMASK reads 0).
+    if ready(adapter.suspend_transport()) != Some(Ok(())) {
+        return TestResult::Fail("second suspend failed");
+    }
+    s.lock().registers.insert(PCIE + 0x24, 0);
+    if ready(adapter.resume_transport()) != Some(Err(crate::cyw43439::runtime::Error::Failed))
+        || adapter.poll().is_ok()
+        || s.lock().sbmbx.len() != 3
+    {
+        return TestResult::Fail("cold resume was treated as a live firmware generation");
+    }
+    drop(adapter);
+    let st = s.lock();
+    if st.dropped != 0 || st.disarmed != 1 {
+        return TestResult::Fail("terminal resume freed DMA or kept the vector");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmf_system_suspend_resume_d3_d0_handshake
+);
+
+fn smoke_brcmf_system_suspend_timeout_unwinds_usable() -> TestResult {
+    use crate::cyw43439::fullmac::Fullmac;
+    let Some((mut adapter, s)) = adapter(false) else {
+        return TestResult::Fail("msgbuf adapter setup failed");
+    };
+    if narf_scheduler::block_on(adapter.suspend_transport())
+        != Err(crate::cyw43439::runtime::Error::Timeout)
+        || adapter.poll().is_err()
+        || mask(&s.lock()) != MB_INT_D2H_DB | MB_INT_FN0
+    {
+        return TestResult::Fail("D3 timeout did not leave a usable UP transport");
+    }
+    // Resume without a successful suspend is refused, not replayed.
+    if ready(adapter.resume_transport()).is_none_or(|r| r.is_ok()) {
+        return TestResult::Fail("resume of an UP transport was accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmf_system_suspend_timeout_unwinds_usable
+);

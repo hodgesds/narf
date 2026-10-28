@@ -582,6 +582,36 @@ release, BME, H2D gating, every mapping freed),
 again, nothing freed) and `smoke_brcmf_late_dma_or_halt_fails_stop_proof`
 (post-clear index change and FWHALT keep memory retained).
 
+### System suspend (D3_INFORM) and hot resume (D0_INFORM)
+
+`brcmfmac::register` installs an `AsyncSystemPm` hook ("brcmfmac") — the
+async phase that runs while interrupts still service futures, before the
+interrupt-gated device fan-out — mirroring Linux v7.2 `brcmf_pciedrvr_pm`
+(`.suspend = brcmf_pcie_pm_enter_D3`, `.resume = brcmf_pcie_pm_leave_D3`):
+
+- Prepare: `cyw43439::interface::suspend_pcie` runs Linux
+  `brcmf_cfg80211_suspend` without WoWL — a connected station is brought
+  down (`brcmf_link_down`: DISASSOC and carrier off) and queued TX dropped —
+  then `Fullmac::suspend_transport`. The msgbuf adapter retires every flow
+  (delete completions) and outstanding TX within 2 s and calls
+  `Runtime::enter_d3` (D3_INFORM / D3_ACK, bus down). A D3 timeout or a
+  flow/TX that does not retire returns an error with the transport still UP,
+  so the coordinator unwinds the earlier hooks; nothing is lost.
+- Resume: `resume_pcie` -> `Runtime::leave_d3`: `INTMASK` nonzero (the
+  dongle kept power and firmware) sends `H2D_HOST_D0_INFORM`, re-enables the
+  mailbox and rings host-ready over the retained rings; the station may
+  then associate again (Linux likewise leaves cfg80211 disconnected). A
+  transport that was never suspended refuses resume without failing.
+
+Smokes: `smoke_brcmf_system_suspend_resume_d3_d0_handshake` (D3/D0 words,
+mask state, rings retained, second cycle with a lost dongle fails the
+owner without freeing DMA, vector released on teardown) and
+`smoke_brcmf_system_suspend_timeout_unwinds_usable`.
+
+Cold resume (Linux `cleanup:` -> `brcmf_pcie_remove` + `brcmf_pcie_probe`
+when `INTMASK` reads 0) is not replayed: the owner becomes terminal and the
+carrier stays down. See the `system_resume`/`transport_reset` rows.
+
 IOMMU-backed quiescence remains open: the proof above holds with the
 IOMMU in identity/disabled mode (the only modes the native allocator
 accepts; `PerDomain` is refused in `native_runtime.rs::allocate`).

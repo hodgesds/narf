@@ -66,7 +66,6 @@ brcmfmac	optional_pmf	Optional PMF with MFPC AP omitting response RSNE: native n
 brcmfmac	p2p_mode	P2P mode	feature	drivers/wireless/specification/cyw43439.md	499
 brcmfmac	post_reset_rejoin	Rejoin after native reset	feature	drivers/wireless/specification/cyw43439.md	500
 brcmfmac	system_resume	System resume	feature	drivers/wireless/specification/cyw43439.md	562
-brcmfmac	system_suspend	System suspend	feature	drivers/wireless/specification/cyw43439.md	562
 brcmfmac	transport_reset	Confirmed native transport reset	feature	drivers/wireless/specification/cyw43439.md	500
 brcmfmac	virtual_interfaces	Additional virtual interfaces	feature	drivers/wireless/specification/cyw43439.md	563
 brcmfmac	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/cyw43439.md	500
