@@ -438,7 +438,8 @@ bind the original peer/primary1 offer,20MHz, supported protection mode and WMM.
 No mandatory membership selector is stripped. DATA chooses the highest actual
 response-bound MCS; source TXDESC32/v3 uses rate12..19, USE_DRIVER_RATE,
 DISABLE_DATA_FB, raw26-byte QoS with the classified TID and software CCMP, with SGI/BW40/AGG/RTS
-disabled (AGG/RTS now follow the originator BA rules below). Management and EAPOL keep legacy1Mbps. EU rate selection is host-owned;
+disabled (AGG/RTS now follow the originator BA rules below, and the rate and
+fallback follow host rate adaptation below). Management and EAPOL keep legacy1Mbps. EU rate selection is host-owned;
 no C21/C22 H2C rate-mask callback or invented firmware-applied ACK is added.
 
 Native `rxdesc16` rate/HT/BW, fragment, aggregate, QoS/TID and A-MSDU facts are
@@ -534,8 +535,58 @@ responses, actual held ADDBA/M4 receipts, closed captures, each current source,
 policy loss and reentrant key/ordinary-credit publication. These cases pass
 both-architecture native QEMU and coordinated build/Clippy gates. Physical
 USB/RF/HT interoperability and exact-device measured qualification remain external.
-SGI20, HT40, adaptive rates, broader scans/channels, coexistence
+SGI20, HT40, broader scans/channels, coexistence
 and reset/rejoin remain software work.
+
+#### Host rate adaptation and rate fallback (implemented)
+
+The RTL8188EU has no firmware rate adaptation; Linux runs the vendor
+algorithm on the host (`8188e.c`). `rate_adaptation.rs` ports it as pure
+state: `rtl8188e_ra_info_init_all` (decision MCS7, PT_STAGE 5, report time
+1200 ms), `rtl8188e_update_rate_mask`/`rtl8188e_arfb_refresh`,
+`rtl8188e_rate_decision` with the normal-cut `retry_penalty*`,
+`rssi_threshold`, `n_threshold_*`, `dropping_necessary` and
+`pending_for_rate_up_fail` tables, `rtl8188e_rate_down`/`_up` with the
+`dynamic_tx_rpt_timing` steps, and the power-training stages (upstream forces
+PT off after `rtl8188e_power_training_try_state`, so PT_STAGE falls to 0 after
+the fifth decision and `rtl8188e_power_training_decision` is unreachable).
+Cut I (chip_cut 8) is refused at identification as in
+`rtl8188eu_identify_chip`, so its tables are not carried.
+
+`packet_codec::Record::Report` now keeps the rxdesc16 `pktlen` and the
+DW5:DW4 `macid_valid` words. `Receiver::poll` feeds every rpt_sel 2 record to
+`rtl8188e_handle_ra_tx_report2` (station mode: item 0 only, decision only when
+MACID 0 is valid and the total is nonzero); a changed minimum report time is
+owed to the async `Station::maintain`/`step` path, which writes
+REG_TX_REPORT_TIME (0x4f0) with readback. Failure or cancellation is terminal.
+At association (`rtl8xxxu_bss_info_changed` BSS_CHANGED_ASSOC) the WMM station
+starts RA with the full negotiated mask (`supp_rates[0] | rx_mask[0] << 12`,
+SGI off because the qualified profile is LGI-only) and RATR_STA_INIT. Bound-BSS
+frames addressed to the station, and beacons, update
+`DECLARE_EWMA(rssi, 10, 16)` from PHY status (`rtl8723au_rx_parse_phystats`:
+OFDM `(pwdb_all >> 1) - 110`, CCK `rtl8188e_cck_rssi` LNA/VGA tables; a record
+without PHY status contributes signal 0, as upstream's zeroed rx_status does).
+Every 2 s (`rtl8xxxu_watchdog_callback` -> `rtl8xxxu_ra_iter`) the SNR
+(`rtl8xxxu_signal_to_snr`) becomes `rssi_sta_ra` and
+`rtl8xxxu_refresh_rate_mask` applies the HIGH/MID/LOW hysteresis (thresholds
+50/20, go-up gap 5) and the 1SS B/G/BG/GN/BGN bitmaps.
+
+DATA on the WMM path (`rtl8xxxu_fill_txdesc_v3`) now carries
+`ra->decision_rate`, USE_DRIVER_RATE, PT_STAGE in txdw4[17:15] and the
+0x0001ff00 data/RTS fallback limits with TXDESC_DISABLE_DATA_FB cleared, so
+the MAC falls back autonomously within the limits (`rate_fallback`). Upstream
+never sets DISABLE_DATA_FB; the former fixed highest-rate DATA set it. One
+bound is added: `init_all` starts at MCS7 before any mask exists, and the TX
+rate is clamped to `highest_rate` while the decision lies outside the mask
+(the same clamp rate_decision applies), so a legacy peer never receives an
+MCS. Management and EAPOL keep CCK1, and the non-WMM legacy path keeps CCK1.
+The HT program binding records the host RA emission profile. Smokes under
+`drivers/wireless/rtl8xxxu/rate` (both architectures) cover decision/report
+timing, invalid and short reports, mask floor/clamp, RSSI decoding/EWMA/
+levels/bitmaps and the adaptive descriptor; composed
+`smoke_rtl8188eu_ht20_host_rate_adaptation_and_fallback` (x86_64) covers the
+initial descriptor, the REG_TX_REPORT_TIME EP0 writes, rate_down on a loss
+report, terminal failure of the write and teardown.
 
 ## 4. Invariants
 
@@ -597,7 +648,7 @@ Chip inventory is source-specific: Linux `rtl8xxxu/8188e.c` identifies1TX/1RX;
 `8192e.c` identifies actual1/2TX and2RX; `8723b.c` identifies1TX/1RX and optional
 BT/S0S1. EU's separately qualified HT20/LGI continuation is software-validated above;
 SGI20/HT40,
-adaptive rates, broader active/passive scanning, runtime PM and
+broader active/passive scanning, runtime PM and
 reset/rejoin remain software work. Full WMM AC/TID routing is implemented.
 
 Power-management inventory (upstream `rtl8xxxu/core.c`): `rtl8xxxu_probe`

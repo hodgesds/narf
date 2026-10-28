@@ -1869,6 +1869,113 @@ kernel_test_in!(
     "drivers/wireless/rtl8xxxu/ht20",
     smoke_rtl8188eu_ht20_originator_ba_and_tx_ampdu
 );
+/// One rpt_sel=2 TX_RPT2 record for MACID 0 (`rtl8188e_handle_ra_tx_report2`).
+fn tx_report2(valid: u32, ok: u16, drop: u8) -> Vec<u8> {
+    let mut wire = vec![0; 24 + 8];
+    wire[..4].copy_from_slice(&8u32.to_le_bytes());
+    wire[12..16].copy_from_slice(&(2u32 << 14).to_le_bytes());
+    wire[16..20].copy_from_slice(&valid.to_le_bytes());
+    let o = ok.to_le_bytes();
+    wire[24..32].copy_from_slice(&[o[0], o[1], 0, 0, 0, 0, drop, 0]);
+    wire
+}
+fn ht_rate_adaptation() -> Result<(), &'static str> {
+    use super::super::super::firmware_transport_tests::Op;
+    for fault in [false, true] {
+        let h = Harness::new_profile(true, true)?;
+        h.scan()?;
+        h.join()?;
+        let tx = udp_ipv4(
+            AP,
+            h.device.mac(),
+            [10, 88, 0, 42],
+            [10, 88, 0, 1],
+            7,
+            8,
+            b"EU host RA",
+        );
+        let send = |h: &Harness| -> Result<[u32; 2], &'static str> {
+            ensure!(
+                h.device.enqueue(&tx, Default::default()).is_ok(),
+                "EU RA enqueue"
+            );
+            h.pump();
+            let p = h.link.0.lock();
+            let d = p
+                .native_tx
+                .iter()
+                .rev()
+                .find(|x| x.get(TX_DESC) == Some(&0x88))
+                .ok_or("EU RA QoS data")?;
+            let w = |at: usize| u32::from_le_bytes(d[at..at + 4].try_into().unwrap());
+            Ok([w(16), w(20)])
+        };
+        // Association: init_all decision MCS7, PT_STAGE 5, hardware
+        // fallback enabled with the 0x0001ff00 limits.
+        let [dw4, dw5] = send(&h)?;
+        ensure!(
+            dw5 == 0x0001ff00 | 19 && dw4 & (1 << 10) == 0 && (dw4 >> 15) & 7 == 5,
+            "EU host RA initial decision/fallback/PT_STAGE"
+        );
+        // An invalid MACID 0 item changes nothing but the first
+        // REG_TX_REPORT_TIME write is still owed to the async path.
+        if fault {
+            h.control.0.lock().fail_write = Some(0x4f0);
+        }
+        h.link.0.lock().raw_queue.push_back(tx_report2(0, 0, 20));
+        h.pump();
+        let ops = h.control.0.lock().ops.len();
+        let maintained = complete(h.device.maintain());
+        if fault {
+            ensure!(
+                maintained.is_ok() && {
+                    h.pump();
+                    !h.device.link_up()
+                },
+                "EU failed REG_TX_REPORT_TIME write left the station up"
+            );
+            continue;
+        }
+        maintained?;
+        ensure!(
+            h.control.0.lock().ops[ops..]
+                .iter()
+                .any(|o| matches!(o, Op::Write(0x4f0, v) if v[..] == 0x927cu16.to_le_bytes())),
+            "EU first TX report did not write REG_TX_REPORT_TIME 1200ms"
+        );
+        let [_, dw5] = send(&h)?;
+        ensure!(dw5 & 0x7f == 19, "EU invalid report changed the decision");
+        // A loss report: rate_down to MCS6 and a shorter report period.
+        h.link.0.lock().raw_queue.push_back(tx_report2(1, 0, 20));
+        h.pump();
+        let ops = h.control.0.lock().ops.len();
+        complete(h.device.maintain())?;
+        ensure!(
+            h.control.0.lock().ops[ops..]
+                .iter()
+                .any(|o| matches!(o, Op::Write(0x4f0, v) if v[..] == 0x7a12u16.to_le_bytes())),
+            "EU rate_down did not shorten REG_TX_REPORT_TIME"
+        );
+        let [_, dw5] = send(&h)?;
+        ensure!(
+            dw5 & 0x7f == 18,
+            "EU loss report did not lower DATA to MCS6"
+        );
+        // Teardown drops RA state: a late report after close is ignored.
+        complete(h.device.disassociate())?.map_err(|_| "EU RA close")?;
+        h.link.0.lock().raw_queue.push_back(tx_report2(1, 0, 20));
+        h.pump();
+        ensure!(!h.device.link_up(), "EU RA teardown reopened the link");
+    }
+    Ok(())
+}
+fn smoke_rtl8188eu_ht20_host_rate_adaptation_and_fallback() -> TestResult {
+    ht_result(ht_rate_adaptation())
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/ht20",
+    smoke_rtl8188eu_ht20_host_rate_adaptation_and_fallback
+);
 fn ht_m4() -> Result<(), &'static str> {
     for cancelled in [false, true] {
         let h = Harness::new_profile(true, true)?;
@@ -2049,10 +2156,11 @@ fn ht_rates() -> Result<(), &'static str> {
         let word = |at| u32::from_le_bytes(tx[at..at + 4].try_into().unwrap());
         ensure!(
             word(20) & 0x7f == 12 + mcs
-                && word(16) & 0x7c0 == 0x540
+                && word(16) & 0x7c0 == 0x140
+                && (word(16) >> 15) & 7 == 5
                 && word(8) & (1 << 12) == 0
                 && tx[56..58] == [0, 0],
-            "EU native TXDESC32 rate/LGI/DISFB/AGG/TID changed"
+            "EU native TXDESC32 rate/LGI/host-RA fallback+PT/AGG/TID changed"
         );
         ensure!(
             p.uplink

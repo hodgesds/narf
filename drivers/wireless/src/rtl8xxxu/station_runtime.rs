@@ -146,6 +146,10 @@ pub struct Station<C: ControlIo, B: packet_transport::Io> {
     tx_token: u8,
     addba_req_num: [u8; 8],
     last_addba_req: [u64; 8],
+    /// `sta_info->avg_rssi` / `rssi_level` and the 2 s `ra_watchdog`.
+    rssi: super::rate_adaptation::Rssi,
+    rssi_level: super::rate_adaptation::Level,
+    next_watchdog: u64,
 }
 impl<C: ControlIo, B: packet_transport::Io> core::fmt::Debug for Station<C, B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -205,6 +209,9 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             tx_token: 0,
             addba_req_num: [0; 8],
             last_addba_req: [0; 8],
+            rssi: super::rate_adaptation::Rssi::default(),
+            rssi_level: super::rate_adaptation::Level::Init,
+            next_watchdog: 0,
         })
     }
     pub fn append_sme_ies(&mut self, bytes: &[u8]) -> Result<(), Error> {
@@ -375,6 +382,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
     ) -> Result<(), Error> {
         if matches!(self.phase, Phase::FourWay | Phase::Open) {
             self.apply_edca().await?;
+            self.radio.apply_report_time().await.map_err(Error::Radio)?;
             self.apply_tx_ba().await?;
         }
         if self.phase == Phase::Open {
@@ -437,6 +445,18 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                                 .map_err(Error::Radio)?;
                             self.edca = Some(p);
                             self.update_ampdu_tx();
+                            // rtl8xxxu_bss_info_changed ASSOC: full ramask,
+                            // RATR_STA_INIT, update_rate_mask. Host RA drives
+                            // the WMM DATA path that previously used a fixed
+                            // highest rate.
+                            let (legacy, mcs, _) = self.plan.rate_mask_inputs();
+                            self.radio.start_rate_adaptation(
+                                u32::from(legacy & 0xfff) | u32::from(mcs) << 12,
+                                false,
+                            );
+                            self.rssi = super::rate_adaptation::Rssi::default();
+                            self.rssi_level = super::rate_adaptation::Level::Init;
+                            self.next_watchdog = now.saturating_add(2000);
                         }
                         self.radio
                             .association(aid, true)
@@ -487,6 +507,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
     }
     pub(super) fn maintenance_pending(&self) -> bool {
         self.edca_pending.is_some()
+            || self.radio.report_time_pending()
             || self
                 .tx_ba
                 .iter()
@@ -557,6 +578,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             .fence(
                 async {
                     self.apply_edca().await?;
+                    self.radio.apply_report_time().await.map_err(Error::Radio)?;
                     self.apply_tx_ba().await
                 },
                 Error::Radio,
@@ -598,9 +620,20 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             };
             let admitted = self.controlled_port_open();
             let epoch = self.epoch.load(Ordering::Acquire);
+            let bssid = self.plan.candidate().bssid();
+            let own = self.radio.local().ok_or(Error::State)?;
+            let cut = self.radio.cut();
             for frame in frames {
                 if self.batch.len() >= 256 {
                     return Err(Error::State);
+                }
+                // rtl8xxxu_rx_addr_match/ewma_rssi_add: bound-BSS frames to
+                // us or beacons; no PHY status leaves rx_status->signal 0.
+                let b = &frame.bytes;
+                if b.len() >= 24 && b[10..16] == bssid && (b[4..10] == own || b[0] == 0x80) {
+                    self.rssi.add(
+                        super::rate_adaptation::signal(&frame.phy, frame.rate, cut).unwrap_or(0),
+                    );
                 }
                 self.batch.push_back(Captured {
                     frame,
@@ -827,6 +860,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
     /// RCR_ACCEPT_CTRL_FRAME), so holes advance only by window or timeout.
     fn service_ba(&mut self, now: u64) -> Result<(), Error> {
         self.service_tx_ba(now);
+        self.service_rate_adaptation(now);
         for tid in 0..8u16 {
             let Some(session) = self.rx_ba[usize::from(tid)].as_mut() else {
                 continue;
@@ -858,7 +892,31 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         }
         Ok(())
     }
+    /// `rtl8xxxu_watchdog_callback` -> `rtl8xxxu_ra_iter`: report the SNR of
+    /// the averaged signal and `rtl8xxxu_refresh_rate_mask` (non-forced).
+    fn service_rate_adaptation(&mut self, now: u64) {
+        if now < self.next_watchdog {
+            return;
+        }
+        let (legacy, mcs, ht) = self.plan.rate_mask_inputs();
+        let signal = self.rssi.signal();
+        let level = super::rate_adaptation::level(self.rssi_level, signal);
+        let changed = level != self.rssi_level;
+        let Some(ra) = self.radio.rate_adaptation() else {
+            return;
+        };
+        self.next_watchdog = now.saturating_add(2000);
+        ra.set_rssi(super::rate_adaptation::signal_to_snr(signal));
+        if changed {
+            ra.update_rate_mask(
+                super::rate_adaptation::level_mask(level, legacy, mcs, ht),
+                false,
+            );
+        }
+        self.rssi_level = level;
+    }
     fn retire_ba(&mut self) {
+        self.radio.stop_rate_adaptation();
         for slot in &mut self.rx_ba {
             if let Some(session) = slot.take() {
                 session.reorder.retire();
@@ -1310,7 +1368,12 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         } else {
             0
         };
-        if let Err(error) = self.radio.submit_native_data_rate(&native, rate) {
+        let result = if self.plan.wmm().is_some() && self.radio.rate_adaptation_state().is_some() {
+            self.radio.submit_native_data_adaptive(&native)
+        } else {
+            self.radio.submit_native_data_rate(&native, rate)
+        };
+        if let Err(error) = result {
             self.fail();
             return Err(Error::Radio(error));
         }

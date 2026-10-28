@@ -268,6 +268,16 @@ impl Join {
             .negotiated_phy()
             .map(|phy| (phy.ht().peer_ampdu_factor(), phy.ht().peer_mpdu_density()))
     }
+    /// `rtl8xxxu_refresh_rate_mask` inputs: `supp_rates[0]` (negotiated
+    /// legacy bitmap in DESC rate order), `ht_cap.mcs.rx_mask[0]` (MCS the
+    /// peer receives and this 1T1R profile may send) and `ht_supported`.
+    pub(super) fn rate_mask_inputs(&self) -> (u16, u8, bool) {
+        let mcs = self
+            .plan
+            .negotiated_phy()
+            .map_or(0, |phy| phy.ht().tx_mcs()[0]);
+        (self.plan.legacy_rates().0, mcs, self.ht_selected())
+    }
     pub(super) fn ht_selected(&self) -> bool {
         self.plan.negotiated_phy().is_some()
     }

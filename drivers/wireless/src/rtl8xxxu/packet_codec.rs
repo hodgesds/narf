@@ -126,7 +126,15 @@ impl narf_wireless::station_security::RawFrame for Mpdu {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Record {
     Frame(Mpdu),
-    Report { kind: u8, bytes: Vec<u8> },
+    /// A non-MPDU record (rxdesc16 `rpt_sel` != 0). `length` is the raw
+    /// `pktlen` and `valid` the DW5:DW4 `macid_valid` words that
+    /// `rtl8188e_handle_ra_tx_report2` reads from the descriptor.
+    Report {
+        kind: u8,
+        bytes: Vec<u8>,
+        length: usize,
+        valid: u64,
+    },
 }
 fn word(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
@@ -174,6 +182,8 @@ pub fn receive(bytes: &[u8]) -> Result<Vec<Record>, Error> {
                 // Linux queues the bytes immediately after rxdesc16 for
                 // report handling; drvinfo/shift removal is MPDU-only.
                 bytes: bytes[at + RX_DESC..end].to_vec(),
+                length,
+                valid: u64::from(word(desc, 20)) << 32 | u64::from(word(desc, 16)),
             });
         } else if d0 & ((1 << 14) | (1 << 15)) == 0 {
             // No multi-descriptor reassembly is enabled in this profile.
@@ -306,6 +316,19 @@ pub(super) fn aggregate_fields(packet: &mut [u8], density: u8, operational: bool
     packet[28..30].copy_from_slice(&checksum.to_le_bytes());
 }
 
+/// `rtl8xxxu_fill_txdesc_v3` DATA under host rate adaptation: rate =
+/// `ra->decision_rate` with the 0x0001ff00 data/RTS fallback limits (already
+/// in txdw5), PT_STAGE in txdw4[17:15] and hardware fallback enabled (no
+/// TXDESC_DISABLE_DATA_FB). The descriptor checksum is recomputed.
+pub(super) fn adaptive_fields(packet: &mut [u8], pt_stage: u8) {
+    let dw4 = (word(packet, 16) & !(1 << 10) & !(7 << 15)) | u32::from(pt_stage & 7) << 15;
+    packet[16..20].copy_from_slice(&dw4.to_le_bytes());
+    packet[28..30].fill(0);
+    let checksum = packet[..TX_DESC]
+        .chunks_exact(2)
+        .fold(0u16, |v, b| v ^ u16::from_le_bytes([b[0], b[1]]));
+    packet[28..30].copy_from_slice(&checksum.to_le_bytes());
+}
 /// QoS TID of a DATA frame; non-QoS DATA uses mac80211's BE priority0.
 pub(super) fn data_tid(frame: &[u8]) -> u8 {
     if frame.first() == Some(&0x88) {

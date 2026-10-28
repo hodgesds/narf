@@ -198,7 +198,21 @@ impl<I: Io> Owner<I> {
         self.submit_rate(kind, frame, 0)
     }
     pub(super) fn submit_rate(&mut self, kind: Kind, frame: &[u8], rate: u8) -> Result<(), Error> {
+        self.submit_adaptive(kind, frame, rate, None)
+    }
+    /// `submit_rate`; `adaptive = Some(pt_stage)` encodes DATA under host
+    /// rate adaptation (`packet_codec::adaptive_fields`).
+    pub(super) fn submit_adaptive(
+        &mut self,
+        kind: Kind,
+        frame: &[u8],
+        rate: u8,
+        adaptive: Option<u8>,
+    ) -> Result<(), Error> {
         self.check()?;
+        if adaptive.is_some() && kind != Kind::Data {
+            return Err(Error::Packet(packet_codec::Error::Header));
+        }
         if rate >= 12 && (!self.ht || kind != Kind::Data || frame.first() != Some(&0x88)) {
             return Err(Error::Packet(packet_codec::Error::Header));
         }
@@ -212,6 +226,9 @@ impl<I: Io> Owner<I> {
             return Err(Error::Busy);
         }
         let mut packet = packet_codec::transmit_rate(frame, kind, rate).map_err(Error::Packet)?;
+        if let Some(pt_stage) = adaptive {
+            packet_codec::adaptive_fields(&mut packet, pt_stage);
+        }
         if let (Kind::Data, Some(0x88), true, Some((density, tids))) =
             (kind, frame.first().copied(), self.ht, self.ampdu)
         {

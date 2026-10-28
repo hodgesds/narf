@@ -57,6 +57,10 @@ pub struct Receiver<C: ControlIo, B: PacketIo> {
     wmm: Option<Arc<super::wmm_runtime::Proof>>,
     ht: Option<Arc<super::ht_runtime::Grant>>,
     ht_gains: Option<[u8; 8]>,
+    /// `priv->ra_info` while a station association is bound.
+    ra: Option<super::rate_adaptation::RateAdaptation>,
+    /// REG_TX_REPORT_TIME value owed to the async maintain path.
+    report_time: Option<u16>,
 }
 #[derive(Clone)]
 pub(super) struct Authority {
@@ -134,6 +138,8 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
             wmm: None,
             ht: None,
             ht_gains: None,
+            ra: None,
+            report_time: None,
         })
     }
     pub fn phase(&self) -> Phase {
@@ -436,17 +442,32 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         }
         match self.authority().invoke(|| self.packets.poll_receive())? {
             Ok(None) => Ok(None),
-            Ok(Some(records)) => Ok(Some(
-                records
-                    .into_iter()
-                    .filter_map(|r| match r {
+            Ok(Some(records)) => {
+                let ht = self.ht_enabled();
+                let mut frames = Vec::new();
+                for record in records {
+                    match record {
                         // Hardware decryption is disabled. Never adopt unexpected
                         // plaintext metadata as a software-authenticated MPDU.
-                        Record::Frame(f) if f.admitted_or_aggregate(self.ht_enabled()) => Some(f),
-                        _ => None,
-                    })
-                    .collect(),
-            )),
+                        Record::Frame(f) if f.admitted_or_aggregate(ht) => frames.push(f),
+                        // `rtl8188e_c2hcmd_callback` rpt_sel 2.
+                        Record::Report {
+                            kind: 2,
+                            bytes,
+                            length,
+                            valid,
+                        } => {
+                            if let Some(ra) = &mut self.ra {
+                                if let Some(time) = ra.report2(length & 0x3ff, valid, &bytes) {
+                                    self.report_time = Some(time);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Some(frames))
+            }
             Err(error) => {
                 self.fail();
                 Err(Error::Packet(error))
@@ -662,10 +683,85 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
     pub(super) fn fail_terminal(&mut self) {
         self.fail();
     }
+    /// `rtl8188e_ra_info_init_all` + `rtl8188e_update_rate_mask` at
+    /// association (`rtl8xxxu_bss_info_changed` BSS_CHANGED_ASSOC).
+    pub(super) fn start_rate_adaptation(&mut self, mask: u32, sgi: bool) {
+        let mut ra = super::rate_adaptation::RateAdaptation::new();
+        ra.update_rate_mask(mask, sgi);
+        self.ra = Some(ra);
+        self.report_time = None;
+    }
+    pub(super) fn stop_rate_adaptation(&mut self) {
+        self.ra = None;
+        self.report_time = None;
+    }
+    pub(super) fn rate_adaptation(
+        &mut self,
+    ) -> Option<&mut super::rate_adaptation::RateAdaptation> {
+        self.ra.as_mut()
+    }
+    pub(super) fn rate_adaptation_state(&self) -> Option<&super::rate_adaptation::RateAdaptation> {
+        self.ra.as_ref()
+    }
+    pub(super) fn report_time_pending(&self) -> bool {
+        self.report_time.is_some()
+    }
+    /// Chip cut for `rtl8188e_cck_rssi`.
+    pub(super) fn cut(&self) -> u8 {
+        self.firmware.factory().map_or(0, |f| f.cut)
+    }
+    /// `rtl8188e_handle_ra_tx_report2`: `rtl8xxxu_write16(REG_TX_REPORT_TIME)`
+    /// with readback. Failure or cancellation is terminal.
+    pub(super) async fn apply_report_time(&mut self) -> Result<(), Error> {
+        let Some(time) = self.report_time else {
+            return Ok(());
+        };
+        if self.phase() != Phase::Active {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Configuring;
+        let mut attempt = Attempt {
+            firmware: self.firmware.clone(),
+            armed: true,
+        };
+        let result = async {
+            self.firmware
+                .write16(0x4f0, time)
+                .await
+                .map_err(Error::Control)?;
+            if self.firmware.read16(0x4f0).await.map_err(Error::Control)? != time {
+                return Err(Error::State);
+            }
+            Ok(())
+        }
+        .await;
+        attempt.armed = false;
+        if result.is_ok() {
+            self.phase = Phase::Active;
+            self.report_time = None;
+        } else {
+            self.fail();
+        }
+        result
+    }
+    /// DATA under host rate adaptation (`rtl8xxxu_fill_txdesc_v3`).
+    pub(super) fn submit_native_data_adaptive(&mut self, frame: &[u8]) -> Result<(), Error> {
+        let ra = self.ra.as_ref().ok_or(Error::State)?;
+        let (rate, pt_stage) = (ra.tx_rate(), ra.pt_stage);
+        self.submit_native_data_with(frame, rate, Some(pt_stage))
+    }
     pub(super) fn submit_native_data(&mut self, frame: &[u8]) -> Result<(), Error> {
         self.submit_native_data_rate(frame, 0)
     }
     pub(super) fn submit_native_data_rate(&mut self, frame: &[u8], rate: u8) -> Result<(), Error> {
+        self.submit_native_data_with(frame, rate, None)
+    }
+    fn submit_native_data_with(
+        &mut self,
+        frame: &[u8],
+        rate: u8,
+        adaptive: Option<u8>,
+    ) -> Result<(), Error> {
         self.current_wmm()?;
         if rate != 0 && self.wmm.is_none() {
             return Err(Error::State);
@@ -683,7 +779,7 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         let proof = self.authority();
         let submit = || {
             self.packets
-                .submit_rate(super::packet_codec::Kind::Data, frame, rate)
+                .submit_adaptive(super::packet_codec::Kind::Data, frame, rate, adaptive)
         };
         let result = proof.invoke(submit)?;
         if self.packets.is_failed() {
@@ -890,6 +986,8 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         }
     }
     fn fail(&mut self) {
+        self.ra = None;
+        self.report_time = None;
         self.phase = Phase::Failed;
         self.packets.fail();
         self.firmware.runtime_failed(ControlError::RuntimeState);

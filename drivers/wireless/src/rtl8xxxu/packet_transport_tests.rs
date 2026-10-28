@@ -148,7 +148,7 @@ fn smoke_rtl8188eu_native_rx_24byte_shift_report_and_128_alignment() -> TestResu
     let got = packet_codec::receive(&bytes).unwrap();
     if got.len() != 3
         || !matches!(&got[0],Record::Frame(f)if f.bytes==mpdu&&f.phy==[0x55;32]&&f.timestamp==0x12345678&&f.rate==3&&f.tid==7&&!f.decrypted)
-        || !matches!(&got[1],Record::Report{kind:1,bytes}if bytes==&[0xb0;16])
+        || !matches!(&got[1],Record::Report{kind:1,bytes,..}if bytes==&[0xb0;16])
         || !matches!(&got[2],Record::Frame(f)if f.bytes==mpdu)
     {
         return TestResult::Fail(
@@ -157,7 +157,7 @@ fn smoke_rtl8188eu_native_rx_24byte_shift_report_and_128_alignment() -> TestResu
     }
     let report = descriptor(&[0xb0; 16], 2, 8, 2, 1);
     if !matches!(&packet_codec::receive(&report).unwrap()[0],
-        Record::Report { kind:2, bytes } if bytes.len()==26
+        Record::Report { kind:2, bytes, .. } if bytes.len()==26
             && bytes[..8]==[0x55;8] && bytes[10..]==[0xb0;16])
     {
         return TestResult::Fail("report path incorrectly removed MPDU-only PHY/shift prefix");
