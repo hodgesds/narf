@@ -300,8 +300,9 @@ Public passive scan validates channel/frequency, filters and bounded dwell;
 beacons/probe responses come only from actual consumed native RX descriptors.
 Shared `association::observe` checks raw admission, addresses, ESS/interval,
 singleton IEs, rates and DS/current-channel agreement; EE additionally requires
-channel1/basic1Mbps. Signal is unknown instead of invented RSSI. Active/randomized
-scans and other channels remain unsupported. Without the distinct HT record,
+channel1/basic1Mbps. Signal is unknown instead of invented RSSI. Active scans
+and other channels remain unsupported (randomized scan addresses are
+source-inapplicable, section 8). Without the distinct HT record,
 HT/VHT/HE/EHT remain unselected; VHT/HE/EHT are never admitted by this EE path.
 
 `prepare::station` retains the immutable observed BSS, shared `JoinPlan`, PMK,
@@ -706,6 +707,11 @@ Source-proven inapplicability (rows removed from the remaining inventory):
   RTL8821AE VHT capability (`IEEE80211_VHT_CAP_TXSTBC | RXSTBC_1`) and is part
   of the remaining `vht` work.
 
+- **Randomized scan MAC addresses.** `nl80211.c::nl80211_check_scan_flags`
+  rejects `NL80211_SCAN_FLAG_RANDOM_ADDR` with `-EOPNOTSUPP` unless the wiphy
+  sets `NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR`; mac80211 core never sets it
+  (`main.c` adds only LOW_PRIORITY/AP scan and RANDOM_SN for software scan) and
+  rtlwifi never does, so a random-address scan cannot be requested upstream.
 - **TSPEC admission.** `nl80211.c` exposes `NL80211_CMD_ADD_TX_TS` (and
   `nl80211_add_tx_ts` returns `-EOPNOTSUPP` otherwise) only when the driver sets
   `NL80211_FEATURE_SUPPORTS_WMM_ADMISSION`; mac80211 `ieee80211_add_tx_ts`
