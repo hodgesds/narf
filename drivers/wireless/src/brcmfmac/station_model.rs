@@ -841,6 +841,10 @@ impl Handle {
     pub(crate) fn power_lost(&self) {
         self.0.lock().registers.insert(PCIE + 0x24, 0);
     }
+    /// Every TCM write fails (a refused firmware download).
+    pub(crate) fn fail_tcm(&self, value: bool) {
+        self.0.lock().fail_tcm = value;
+    }
     /// The function fell off the bus.
     pub(crate) fn gone(&self, value: bool) {
         self.0.lock().gone = value;
@@ -1080,14 +1084,36 @@ fn create_inner(
     // these fixture bytes are never registered as deployable firmware/NVRAM.
     let boot = if let Some((selection, assets)) = selected {
         let nvram = boot::pack_nvram(&assets.nvram)?;
-        boot::Cr4::claim_selected(bus, pci(), selection)?.boot(&assets.firmware, &nvram)?
+        boot::Cr4::claim_selected(bus, pci(), selection)
+            .and_then(|cr4| cr4.boot(&assets.firmware, &nvram))
+            .map_err(|refused| refused.error)?
     } else {
-        let nvram = boot::pack_nvram(b"boardrev=1\n").unwrap();
-        boot::Cr4::claim(bus, pci(), profile())?
-            .boot(&[0x44, 0x33, 0x22, 0x11, 9, 8, 7, 6], &nvram)?
+        boot_fixture(bus).map_err(|refused| refused.error)?
     };
     let runtime = runtime::Runtime::attach(boot)?;
     Adapter::new(runtime)
-        .map(|adapter| (adapter, Handle(state)))
+        .map(|adapter| {
+            (
+                adapter.with_reboot(alloc::boxed::Box::new(Reboot)),
+                Handle(state),
+            )
+        })
         .map_err(|_| runtime::Error::Protocol)
+}
+fn boot_fixture(bus: Model) -> Result<boot::Booted<Model>, boot::Refused<Model>> {
+    let nvram = boot::pack_nvram(b"boardrev=1\n").unwrap();
+    boot::Cr4::claim(bus, pci(), profile())?.boot(&[0x44, 0x33, 0x22, 0x11, 9, 8, 7, 6], &nvram)
+}
+/// Retained fixture firmware authority: a transport reset downloads the
+/// same synthetic image through the actual CR4 boot owner again.
+struct Reboot;
+impl crate::brcmfmac::station_transport::Reboot<Model> for Reboot {
+    fn boot(
+        &mut self,
+        bus: Model,
+    ) -> Result<runtime::Runtime<Model>, (runtime::Error, Option<Model>)> {
+        let booted =
+            boot_fixture(bus).map_err(|refused| (refused.error.into(), Some(refused.bus)))?;
+        runtime::Runtime::attach(booted).map_err(|error| (error, None))
+    }
 }

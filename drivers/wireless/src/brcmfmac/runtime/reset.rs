@@ -118,6 +118,32 @@ impl<B: Bus> Runtime<B> {
         }
         Ok(ioctrl)
     }
+    /// Release a proven-stopped generation and hand back its bus for the
+    /// next download (Linux `brcmf_pcie_reset`: release the scratch and
+    /// ring buffers, reset, then `brcmf_pcie_setup` on the same device).
+    /// Every published mapping is freed here. An unproven owner is
+    /// returned unchanged.
+    pub fn into_bus(mut self) -> Result<B, Self> {
+        if !self.reclaimable {
+            return Err(self);
+        }
+        // The device can no longer master any of these.
+        drop(self.resources.take());
+        let mut this = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is never dropped or used again. Each field that
+        // owns memory is moved out or dropped exactly once below; the rest
+        // are `Copy`/plain data.
+        unsafe {
+            let bus = core::ptr::read(&this.bus);
+            core::ptr::drop_in_place(&mut this.resources);
+            core::ptr::drop_in_place(&mut this.pending);
+            core::ptr::drop_in_place(&mut this.response);
+            core::ptr::drop_in_place(&mut this.events);
+            core::ptr::drop_in_place(&mut this.signal);
+            core::ptr::drop_in_place(&mut this.cores);
+            Ok(bus)
+        }
+    }
     /// Stop a generation whose firmware cannot acknowledge D3 (FWHALT,
     /// lost power, a timed-out or terminal owner). On success all
     /// published memory is reclaimable; any failure keeps it pinned.

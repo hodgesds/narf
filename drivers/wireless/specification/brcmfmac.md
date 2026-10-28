@@ -641,6 +641,51 @@ mappings pinned. Smokes: `smoke_brcmf_dead_firmware_stop_resets_and_reclaims`,
 `smoke_brcmf_dead_stop_without_device_keeps_dma_pinned`,
 `smoke_brcmf_remove_after_fwhalt_takes_dead_stop_and_reclaims`.
 
+### Transport reset, generation swap and rejoin
+
+Linux v7.2 `core.c::brcmf_fw_crashed` (FWHALT) schedules
+`brcmf_core_bus_reset` -> `pcie.c::brcmf_pcie_reset`: `brcmf_detach`,
+`brcmf_pcie_release_irq`, scratch/ring release, `brcmf_pcie_reset_device`,
+`brcmf_fw_get_firmwares` -> `brcmf_pcie_setup` (fresh download) and
+`brcmf_attach`, which registers a new netdev. `brcmf_bus_cancel_reset_work`
+(from `brcmf_pcie_remove`) sets `bus_if->removing` so no reset runs after
+removal starts. NARF performs the same sequence as a generation swap:
+
+- `Adapter.inner` is `Option<Runtime>`; `Fullmac::reset_transport`
+  requires a proven stop (confirmed or dead), runs
+  `Runtime::reset_device`, frees the old generation
+  (`Runtime::into_bus`) and boots a fresh one through the retained
+  `station_transport::Reboot` authority, then posts RX buffers.
+- `boot::Cr4::claim`/`claim_selected`/`boot` return `Refused { error, bus }`
+  instead of consuming the bus, so a refused download keeps the reset
+  function in the adapter (`parked`) for a retry.
+- The production authority (`native_runtime::Reprovision`) retains the
+  firmware-registry capability, manifest, explicit board (if any) and
+  discovered chip/revision; every reboot re-runs `select_using` +
+  `load_using` (or `trusted_assets_using`), so revoked or replaced assets
+  refuse the reboot. Every BAR0 access stays gated on the new proof.
+- `Generation::recover` (shared `cyw43439/generation.rs`), serialized with
+  `remove` on the generation mutex: withdraw the old shell (netdev retired),
+  `stop_transport`, `reset_transport`, `take_generation`, re-check removal
+  (a removal that arrived meanwhile wins: the fresh generation is stopped
+  behind its own proof and released, never published), republish under
+  `narf_net::iface::rebind_name` through the publisher (production:
+  `attach_runtime`, i.e. `Station::initialize_live` replay plus the normal
+  registration), then rejoin: the last completed operator association is
+  retained per shell (`Open`/`Wpa2`/`Wpa3`; host-supplicant associations
+  are not, their keys live in userspace; a disconnect clears it), the exact
+  BSS is rescanned on its channel and associated again. An unproven stop,
+  a refused reset or publication leaves the function terminal with no shell
+  (`pinned` recorded for removal when mappings were leaked).
+- `Generation::supervise`, spawned after the first publication, checks
+  every 100 ms for `Fullmac::transport_failed` (FWHALT, lost power, any
+  fatal protocol/access error; broader than Linux, which resets only on
+  FWHALT or a debugfs request) and recovers, up to `MAX_RESETS` (64).
+
+Smokes: `smoke_brcmf_fwhalt_reset_reboots_replays_and_rejoins_same_netdev`,
+`smoke_brcmf_remove_racing_reset_never_republishes`,
+`smoke_brcmf_reset_failures_stay_terminal_or_pinned`.
+
 ### Flow-ring budget
 
 The host flow budget follows the firmware ring info: `max_flowrings`

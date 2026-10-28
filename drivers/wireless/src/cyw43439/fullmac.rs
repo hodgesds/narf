@@ -102,6 +102,26 @@ pub trait Fullmac: Send {
     fn release_transport(&mut self) -> bool {
         false
     }
+    /// After a successful [`Self::stop_transport`]: reset the device and
+    /// boot a fresh firmware generation in place under the retained
+    /// firmware authority (Linux `brcmf_pcie_reset`: release, reset,
+    /// `brcmf_pcie_setup`). Transports without a device reset refuse it.
+    fn reset_transport(&mut self) -> impl Future<Output = Result<(), Error>> + Send {
+        async { Err(Error::Unsupported) }
+    }
+    /// Move the current (rebooted) generation and its retained authority
+    /// into a new owner, leaving this one terminal and empty.
+    fn take_generation(&mut self) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
+    }
+    /// The transport generation is terminal (firmware halt, lost power,
+    /// a fatal protocol or access error) and needs a reset to continue.
+    fn transport_failed(&self) -> bool {
+        false
+    }
 }
 impl<T: PacketTransport> Fullmac for Runtime<T> {
     const FAMILY: Family = Family::Sdio;

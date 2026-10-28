@@ -60,6 +60,55 @@ struct Configuration {
     wide: Option<crate::cyw43439::phy_fixture::Wide>,
     vht: Option<crate::cyw43439::phy_fixture::Vht80>,
 }
+/// The station shell the harness and the generation publisher build.
+fn shell(name: String, station: Station<TestAdapter>) -> Arc<ModelDevice> {
+    let channels = station
+        .channels
+        .iter()
+        .map(|&channel| u32::from(channel))
+        .collect();
+    let supplicant = station.supplicant;
+    let mfp_supported = station.supports_management_protection();
+    let sae_offload = station.supports_sae_offload();
+    let telemetry = Arc::new(crate::cyw43439::telemetry::Counters::default());
+    let ht_capabilities = station.ht_capabilities();
+    let vht_capabilities = station.vht_capabilities();
+    let (rx, consumer) = narf_ipc::channel();
+    let (producer, tx) = narf_ipc::channel();
+    let device = Arc::new(Device {
+        state: Mutex::new(State {
+            station,
+            rx,
+            tx,
+            pending: None,
+            telemetry: telemetry.clone(),
+        }),
+        name: name.clone(),
+        mac: OWN,
+        channels,
+        supplicant,
+        mfp_supported,
+        sae_offload,
+        external_ops: narf_lib::sync::IrqSafeSpinLock::new(Default::default()),
+        telemetry,
+        pmksa: narf_lib::sync::IrqSafeSpinLock::new(Default::default()),
+        ht_capabilities,
+        vht_capabilities,
+        up: AtomicBool::new(false),
+        power_save: AtomicU8::new(0),
+        bssid: AtomicU64::new(0),
+        roaming: AtomicBool::new(false),
+        epoch: AtomicU64::new(0),
+        closing: AtomicBool::new(false),
+        publication: IrqSafeSpinLock::new(()),
+        receive_hook: IrqSafeSpinLock::new(None),
+        rx: IrqSafeSpinLock::new(Some(consumer)),
+        tx: IrqSafeSpinLock::new(Some(producer)),
+        lifecycle: Default::default(),
+    });
+    *ACTIVE_TEST.lock() = Some(device.clone());
+    device
+}
 struct Harness {
     device: Arc<ModelDevice>,
     bus: Handle,
@@ -266,52 +315,8 @@ impl Harness {
         {
             return Err("PCIe firmware identity/channel/key capabilities");
         }
-        let channels = station
-            .channels
-            .iter()
-            .map(|&channel| u32::from(channel))
-            .collect();
-        let supplicant = station.supplicant;
-        let mfp_supported = station.supports_management_protection();
-        let sae_offload = station.supports_sae_offload();
-        let telemetry = Arc::new(crate::cyw43439::telemetry::Counters::default());
-        let ht_capabilities = station.ht_capabilities();
-        let vht_capabilities = station.vht_capabilities();
-        let (rx, consumer) = narf_ipc::channel();
-        let (producer, tx) = narf_ipc::channel();
         let name = narf_net::iface::register("wlan%d", OWN, send);
-        let device = Arc::new(Device {
-            state: Mutex::new(State {
-                station,
-                rx,
-                tx,
-                pending: None,
-                telemetry: telemetry.clone(),
-            }),
-            name: name.clone(),
-            mac: OWN,
-            channels,
-            supplicant,
-            mfp_supported,
-            sae_offload,
-            external_ops: narf_lib::sync::IrqSafeSpinLock::new(Default::default()),
-            telemetry,
-            pmksa: narf_lib::sync::IrqSafeSpinLock::new(Default::default()),
-            ht_capabilities,
-            vht_capabilities,
-            up: AtomicBool::new(false),
-            power_save: AtomicU8::new(0),
-            bssid: AtomicU64::new(0),
-            roaming: AtomicBool::new(false),
-            epoch: AtomicU64::new(0),
-            closing: AtomicBool::new(false),
-            publication: IrqSafeSpinLock::new(()),
-            receive_hook: IrqSafeSpinLock::new(None),
-            rx: IrqSafeSpinLock::new(Some(consumer)),
-            tx: IrqSafeSpinLock::new(Some(producer)),
-            lifecycle: Default::default(),
-        });
-        *ACTIVE_TEST.lock() = Some(device.clone());
+        let device = shell(name.clone(), station);
         narf_net::iface::set_link_state(&name, true); // operator IFF_UP
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
         narf_net::iface::install_rx_drain(drain);

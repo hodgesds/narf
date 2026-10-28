@@ -164,11 +164,42 @@ pub struct Device<R: Fullmac> {
     lifecycle: Lifecycle,
 }
 /// Teardown state of one published shell (one transport generation).
-#[derive(Default)]
 pub(crate) struct Lifecycle {
     /// Set by [`Device::withdraw`]: registrations are gone and the worker
     /// exits; the shell never publishes again.
     withdrawn: AtomicBool,
+    /// The last association the operator requested and the firmware
+    /// completed; a transport reset replays it on the next generation.
+    /// Cleared by a disconnect. Host-supplicant (`External`) associations
+    /// are not retained: their keys live in userspace.
+    request: IrqSafeSpinLock<Option<AssociateRequest>>,
+}
+impl Default for Lifecycle {
+    fn default() -> Self {
+        Self {
+            withdrawn: AtomicBool::new(false),
+            request: IrqSafeSpinLock::new(None),
+        }
+    }
+}
+fn retained_request(request: &AssociateRequest) -> Option<AssociateRequest> {
+    use narf_wireless::SecurityConfig;
+    let security = match &request.security {
+        SecurityConfig::Open => SecurityConfig::Open,
+        SecurityConfig::Wpa2 { psk } => SecurityConfig::Wpa2 { psk: *psk },
+        SecurityConfig::Wpa3 { password } => SecurityConfig::Wpa3 {
+            password: password.clone(),
+        },
+        SecurityConfig::External(_) => return None,
+    };
+    Some(AssociateRequest {
+        bssid: request.bssid,
+        ssid: request.ssid.clone(),
+        frequency_mhz: request.frequency_mhz,
+        channel: request.channel,
+        security,
+        ie: request.ie.clone(),
+    })
 }
 impl<R: Fullmac> core::fmt::Debug for Device<R> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -328,6 +359,13 @@ impl<R: Fullmac + 'static> Device<R> {
     /// Interface name of this shell.
     pub fn interface_name(&self) -> &str {
         &self.name
+    }
+    /// The transport generation is terminal and needs a reset. `false`
+    /// while another path holds the station mutex.
+    pub fn transport_failed(&self) -> bool {
+        self.state
+            .try_lock()
+            .is_some_and(|state| state.station.runtime.transport_failed())
     }
     /// Whether [`Self::withdraw`] has run.
     pub fn withdrawn(&self) -> bool {
@@ -1098,6 +1136,7 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
         if state.station.bssid.is_some() {
             return Err(WirelessError::Busy);
         }
+        let retained = retained_request(&request);
         let ticket = self.close_host();
         state.clear_transmit();
         if ticket == u64::MAX {
@@ -1127,9 +1166,13 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
             }
             self.publish_link(state.station.bssid);
         }
+        if result.is_ok() {
+            *self.lifecycle.request.lock() = retained;
+        }
         result.map_err(wireless_error)
     }
     async fn disassociate(&self) -> Result<(), WirelessError> {
+        self.lifecycle.request.lock().take();
         self.close_host();
         let mut state = self.state.lock().await;
         // Close again under the same lock as association/progress publication:

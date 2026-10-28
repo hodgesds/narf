@@ -583,8 +583,13 @@ fn smoke_brcmf_cr4_board_policy_and_real_boot_transcript() -> TestResult {
     let (bus, s) = model();
     let mut wrong = profile();
     wrong.pci.subsystem_device ^= 1;
-    if !matches!(boot::Cr4::claim(bus, pci(), wrong), Err(boot::Error::Board))
-        || !s.lock().writes.is_empty()
+    if !matches!(
+        boot::Cr4::claim(bus, pci(), wrong),
+        Err(boot::Refused {
+            error: boot::Error::Board,
+            ..
+        })
+    ) || !s.lock().writes.is_empty()
     {
         return TestResult::Fail("board policy must precede hardware writes");
     }

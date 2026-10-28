@@ -22,6 +22,13 @@ struct Tx {
     id: u32,
     deadline: narf_time::Deadline,
 }
+/// Retained firmware authority of one function: downloads and attaches a
+/// fresh generation on a reset, halted bus (signed selection and assets are
+/// re-verified on every call). A refused download returns the bus when the
+/// boot owner kept it.
+pub trait Reboot<B: Bus>: Send {
+    fn boot(&mut self, bus: B) -> Result<runtime::Runtime<B>, (runtime::Error, Option<B>)>;
+}
 pub struct Adapter<B: Bus> {
     /// The current firmware generation. `None` once a teardown or reset
     /// released it; a reset installs the rebooted generation here.
@@ -32,6 +39,9 @@ pub struct Adapter<B: Bus> {
     peer: Option<[u8; 6]>,
     closing: bool,
     failed: bool,
+    reboot: Option<alloc::boxed::Box<dyn Reboot<B>>>,
+    /// A reset bus whose last download was refused, kept for a retry.
+    parked: Option<B>,
 }
 impl<B: Bus> core::fmt::Debug for Adapter<B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -59,7 +69,14 @@ where
             peer: None,
             closing: false,
             failed: false,
+            reboot: None,
+            parked: None,
         })
+    }
+    /// Retain the firmware authority that a transport reset reboots with.
+    pub fn with_reboot(mut self, reboot: alloc::boxed::Box<dyn Reboot<B>>) -> Self {
+        self.reboot = Some(reboot);
+        self
     }
     /// The current firmware generation, if one is attached.
     pub fn runtime(&self) -> Option<&runtime::Runtime<B>> {
@@ -255,6 +272,71 @@ where
             }
             Err(error) => Err(map(error)),
         }
+    }
+    /// Linux v7.2 `pcie.c::brcmf_pcie_reset` after the stop proof:
+    /// `brcmf_pcie_reset_device`, release of every ring and buffer, then a
+    /// fresh download (`brcmf_pcie_setup`) through the retained authority.
+    async fn reset_transport(&mut self) -> Result<(), Error> {
+        if self.reboot.is_none() {
+            return Err(Error::Unsupported);
+        }
+        let bus = match self.parked.take() {
+            Some(bus) => bus,
+            None => {
+                let mut inner = self.inner.take().ok_or(Error::Failed)?;
+                if !inner.is_reclaimable() {
+                    self.inner = Some(inner);
+                    return Err(Error::Busy);
+                }
+                if let Err(error) = inner.reset_device().await {
+                    self.inner = Some(inner);
+                    return Err(map(error));
+                }
+                inner.into_bus().map_err(|_| Error::Failed)?
+            }
+        };
+        let reboot = self.reboot.as_mut().ok_or(Error::Unsupported)?;
+        match reboot.boot(bus) {
+            Ok(mut fresh) => {
+                match fresh.enable_data() {
+                    Ok(()) | Err(runtime::Error::Busy) => {}
+                    Err(error) => return Err(map(error)),
+                }
+                self.inner = Some(fresh);
+                self.events.clear();
+                self.flows.clear();
+                self.tx.clear();
+                self.peer = None;
+                self.closing = false;
+                self.failed = false;
+                Ok(())
+            }
+            Err((error, bus)) => {
+                self.parked = bus;
+                Err(map(error))
+            }
+        }
+    }
+    fn take_generation(&mut self) -> Option<Self> {
+        if self.failed {
+            return None;
+        }
+        let inner = self.inner.take()?;
+        self.failed = true;
+        Some(Self {
+            inner: Some(inner),
+            events: VecDeque::new(),
+            flows: Vec::new(),
+            tx: Vec::new(),
+            peer: None,
+            closing: false,
+            failed: false,
+            reboot: self.reboot.take(),
+            parked: None,
+        })
+    }
+    fn transport_failed(&self) -> bool {
+        self.failed || self.inner.as_ref().is_none_or(|inner| inner.is_failed())
     }
     fn release_transport(&mut self) -> bool {
         self.failed = true;
