@@ -390,6 +390,8 @@ pub mod amdgpu_mqd;
 pub mod amdgpu_mst;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_native_kms;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_present_damage;
 #[path = "amdgpu_navi22_bios.rs"]
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_bios;

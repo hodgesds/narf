@@ -125,14 +125,23 @@ pub fn present_frame(
 }
 /// Present a linear 8888 dumb-buffer frame whose rows outside `damage`
 /// are unchanged since that buffer's previous frame (DIRTYFB). False when
-/// the display only presents whole frames (Navi48) or cannot present now.
+/// the display cannot present natively now.
 pub fn present_damaged(
     display: u8,
     frame: crate::amdgpu_navi48_platform::PlaneFrame,
     damage: core::ops::Range<u32>,
 ) -> bool {
-    navi22()
-        && crate::amdgpu_navi22_platform::present_damaged(display, Some(frame), None, Some(damage))
+    if navi22() {
+        crate::amdgpu_navi22_platform::present_damaged(display, Some(frame), None, Some(damage))
+    } else {
+        crate::amdgpu_navi48_platform::present_damaged(
+            display,
+            Some(frame),
+            core::array::from_fn(|_| None),
+            None,
+            Some(damage),
+        )
+    }
 }
 /// DRM's planes on display `display`'s CRTC (Navi48 only: Navi22 exposes
 /// no overlays or plane placement).

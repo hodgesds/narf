@@ -10,6 +10,19 @@ use crate::{
 };
 use alloc::boxed::Box;
 use narf_bus::{BusDeviceCap, MmioRegion};
+
+/// Advances whenever a staged surface is allocated, cleared, released or
+/// written through its front (`upload`): the contents a CPU presenter
+/// tracked of its staged buffers are then unknown. Its own back-buffer
+/// uploads and flips leave it unchanged.
+static SURFACE_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// [`SURFACE_EPOCH`]'s value.
+pub fn surface_epoch() -> u64 {
+    SURFACE_EPOCH.load(core::sync::atomic::Ordering::Acquire)
+}
+fn surfaces_changed() {
+    SURFACE_EPOCH.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+}
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 #[path = "amdgpu_dcn401_opp.rs"]

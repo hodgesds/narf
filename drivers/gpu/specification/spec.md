@@ -2697,11 +2697,15 @@ the reverse, unknown flags, unpaired ANNOTATE_COPY, over 256 clips);
 `DirtyCmd::rows` reduces the clips to the rows they cover (copy annotations
 count destinations only) and a request covering none presents nothing. A
 native linear 8888 frame goes to `amdgpu_native_kms::present_damaged(display,
-frame, rows)`: Navi22 copies only those rows plus the rows its back buffer
-missed (the front frame's damage), tracked per dumb source, back buffer and
-flip count; another source, a GEM frame, a failed present or a coalesced
-frame of another source copies every row. Navi48 returns false there and the
-frame takes `present_frame`'s whole copy. Xorg's modesetting driver
+frame, rows)`. Navi22 and Navi48 (`present_damaged`, a linear primary
+copied into its back buffer) copy only those rows plus the rows the target
+buffer missed since it last held that framebuffer. `amdgpu_present_damage::
+Damage` tracks this per staged buffer address (`plan`, `presented`,
+`coalesce`); another source, a GEM, tiled or 4:2:0 frame, a failed present,
+a coalesced frame of another source, or a new
+`amdgpu_dcn401_otg::surface_epoch()` (advanced whenever a DCN401 staged
+surface is allocated, cleared, released or written through its front) copies
+every row. A frame merged over a waiting one carries both frames' rows. Xorg's modesetting driver
 probes it once and relies on it for shadow updates to a copying CRTC.
 `amdgpu_native_kms::present_frame` takes the framebuffer's
 fourcc: a frame in the scanned format is copied as packed words into the back

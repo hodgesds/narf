@@ -1734,13 +1734,13 @@ struct PresentSlot {
     presenting: AtomicBool,
     next: narf_lib::sync::IrqSafeSpinLock<Option<Frame>>,
     /// What the scanout buffers hold, for damaged (DIRTYFB) frames.
-    damage: narf_lib::sync::IrqSafeSpinLock<frame_copy::Damage>,
+    damage: narf_lib::sync::IrqSafeSpinLock<crate::amdgpu_present_damage::Damage>,
 }
 static PRESENT: PresentSlot = PresentSlot {
     native: AtomicBool::new(false),
     presenting: AtomicBool::new(false),
     next: narf_lib::sync::IrqSafeSpinLock::new(None),
-    damage: narf_lib::sync::IrqSafeSpinLock::new(frame_copy::Damage::new()),
+    damage: narf_lib::sync::IrqSafeSpinLock::new(crate::amdgpu_present_damage::Damage::new()),
 };
 #[derive(Clone, Debug)]
 struct Frame {
@@ -1938,7 +1938,13 @@ async unsafe fn present_native(
     // Taken for the present: a failed copy or flip leaves both buffers
     // unknown.
     let mut damage = core::mem::take(&mut *PRESENT.damage.lock());
-    let rows = damage.plan(frame, surface.address, scanout.flips());
+    // Navi22 reallocates no buffer behind the presenter (a relight forgets
+    // them), so one epoch serves.
+    let tracked = frame_copy::damage_source(frame);
+    let rows = match tracked {
+        Some(_) => damage.plan(tracked, frame.damage.as_ref(), surface.address, 0),
+        None => 0..frame.height,
+    };
     let width = frame.width.min(back.width);
     let mut pixels = alloc::vec::Vec::new();
     pixels
@@ -1960,10 +1966,8 @@ async unsafe fn present_native(
     let before = boot.display_scanout()?.front().fb;
     boot.flip_display().await?;
     let scanout = boot.display_scanout()?;
-    if let Some(old) = scanout.back() {
-        damage.flipped(frame, old.address, scanout.flips());
-        *PRESENT.damage.lock() = damage;
-    }
+    damage.presented(tracked, frame.damage.as_ref(), Some(surface.address), 0);
+    *PRESENT.damage.lock() = damage;
     Ok((before, scanout.front().fb))
 }
 
