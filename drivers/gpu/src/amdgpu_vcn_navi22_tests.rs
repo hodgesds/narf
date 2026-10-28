@@ -5,8 +5,9 @@
 //! the encoders, and executes work only after an HDP flush, inside an open
 //! NBIF aperture and the MMSCH doorbell range of the right instance.
 use super::*;
-use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, rc::Rc, sync::Arc, vec::Vec};
 use core::{
+    cell::RefCell,
     future::Future,
     sync::atomic::AtomicU32,
     task::{Context, Waker},
@@ -98,6 +99,10 @@ struct Model {
     internal: [[u32; 5]; 2],
     progress: Arc<AtomicU32>,
     revoke: Option<(u64, u32, Cap<BusDeviceCap, Write>)>,
+    /// DPG register lists PSP wrote into each instance's SRAM.
+    sram: Rc<RefCell<BTreeMap<usize, Vec<u32>>>>,
+    /// DPG_PAUSE requests that are never acknowledged.
+    pause_stuck: bool,
 }
 fn mc(map: MmioRegion, offset: u64) -> u64 {
     map.phys.raw() - PHYS + MC + offset
@@ -144,6 +149,8 @@ impl Model {
             internal: [[0; 5]; 2],
             progress: Arc::new(AtomicU32::new(0)),
             revoke: None,
+            sram: Rc::new(RefCell::new(BTreeMap::new())),
+            pause_stuck: false,
         }
     }
     fn reg(&self, address: u64) -> u32 {
@@ -161,7 +168,67 @@ impl Model {
         u64::from(self.reg(low)) | (u64::from(self.reg(high)) << 32)
     }
     fn booted(&self, i: usize) -> bool {
+        if self.dpg(i) {
+            return self.dpg_booted(i);
+        }
         self.reg(v(i, STATUS)) & VCPU_REPORT_BOOTED != 0
+    }
+    fn dpg(&self, i: usize) -> bool {
+        self.reg(v(i, POWER_STATUS)) & POWER_PG_MODE != 0
+    }
+    fn paused(&self, i: usize) -> bool {
+        self.reg(v(i, DPG_PAUSE)) & DPG_PAUSE_ACK != 0
+    }
+    /// The last value the SRAM list gives `r`, by the VCN-internal offset
+    /// Linux's SOC15_DPG_MODE_OFFSET yields for a BASE_IDX 1 register of
+    /// either instance: video registers from 0x80, always-on below.
+    fn dpg_reg(&self, i: usize, r: Reg) -> Option<u32> {
+        assert_eq!(r.0, 1);
+        let internal = if r.1 >= 0x80 {
+            r.1 - 0x80
+        } else {
+            0xc000 + r.1
+        };
+        let lists = self.sram.borrow();
+        let words = lists.get(&i)?;
+        words
+            .chunks_exact(2)
+            .rev()
+            .find(|pair| pair[0] == internal)
+            .map(|pair| pair[1])
+    }
+    fn dpg_shared(&self, i: usize) -> u64 {
+        let low = self.dpg_reg(i, LMI_VCPU_NC0_BAR_LOW).unwrap_or(0);
+        let high = self.dpg_reg(i, LMI_VCPU_NC0_BAR_HIGH).unwrap_or(0);
+        u64::from(low) | (u64::from(high) << 32)
+    }
+    /// A DPG VCPU runs once PSP holds a released, clocked VCPU with the
+    /// firmware and stack windows left to PSP and the context and fw_shared
+    /// windows in VRAM, and dynamic power gating is on.
+    fn dpg_booted(&self, i: usize) -> bool {
+        let r = |reg| self.dpg_reg(i, reg);
+        let power = POWER_PG_MODE | POWER_PG_EN;
+        !self.never_boot[i]
+            && self.reg(v(i, POWER_STATUS)) & power == power
+            && r(VCPU_CNTL) == Some(VCPU_CNTL_DPG)
+            && [
+                LMI_VCPU_CACHE_BAR_LOW,
+                LMI_VCPU_CACHE_BAR_HIGH,
+                VCPU_CACHE_SIZE0,
+                LMI_VCPU_CACHE1_BAR_LOW,
+            ]
+            .iter()
+            .all(|&reg| r(reg) == Some(0))
+            && r(VCPU_CACHE_SIZE1) == Some(STACK_SIZE)
+            && r(VCPU_CACHE_SIZE2) == Some(CONTEXT_SIZE)
+            && r(LMI_VCPU_CACHE2_BAR_LOW).is_some_and(|a| a != 0 && a % 4096 == 0)
+            && self.dpg_shared(i) % 4096 == 0
+            && self.dpg_shared(i) != 0
+            && r(VCPU_NONCACHE_SIZE0) == Some(SHARED_SIZE)
+            && r(GFX10_ADDR_CONFIG) == Some(GB_ADDR)
+            && r(RB_ARB_CTRL) == Some(0)
+            && r(LMI_CTRL2) == Some(0)
+            && r(MASTINT_EN) == Some(MASTINT_VCPU_EN)
     }
     /// PGFSM: config 1 powers a tile on (status 0), 2 off (status 2).
     fn pgfsm(&mut self, i: usize, config: u32) {
@@ -318,8 +385,18 @@ impl Model {
             }
             if index == doorbell::dec(i as u32) {
                 let slot = 3 * i;
+                self.regs.insert(v(i, RBC_RB_WPTR), value);
                 if !self.booted(i) || self.stalled[slot] {
                     return;
+                }
+                if self.dpg(i) {
+                    assert_eq!(self.reg(v(i, SCRATCH2)), value, "DPG wptr in SCRATCH2");
+                    let shared = self.dpg_shared(i);
+                    assert_eq!(
+                        self.word(shared + shared::RB_WPTR),
+                        value,
+                        "fw_shared rb.wptr"
+                    );
                 }
                 let base = self.pair(v(i, LMI_RBC_RB_BAR_LOW), v(i, LMI_RBC_RB_BAR_HIGH));
                 assert_eq!(
@@ -338,7 +415,9 @@ impl Model {
                     continue;
                 }
                 let slot = 3 * i + 1 + j;
-                if !self.booted(i) || self.stalled[slot] {
+                self.regs.insert(v(i, RB_WPTR[j]), value);
+                // DPG keeps no encode ring state outside a pause.
+                if !self.booted(i) || self.stalled[slot] || (self.dpg(i) && !self.paused(i)) {
                     return;
                 }
                 assert_eq!(self.reg(v(i, RB_SIZE[j])), RING_DW);
@@ -386,6 +465,14 @@ impl Io for Model {
         if self.gone {
             return u32::MAX;
         }
+        for i in [0, 1] {
+            let power = self.reg(v(i, POWER_STATUS));
+            if address == v(i, POWER_STATUS) && power & POWER_PG_MODE != 0 {
+                // Powered up (2) while paused and not stalled, else 1.
+                let up = self.paused(i) && power & POWER_STALL_DPG == 0;
+                return (power & !POWER_STATUS_MASK) | if up { 2 } else { 1 };
+            }
+        }
         if self.status_requires_power
             && (0..2).any(|i| {
                 address == v(i, STATUS) && self.reg(v(i, PGFSM_STATUS)) & PGFSM_STATUS_MASK != 0
@@ -412,6 +499,11 @@ impl Io for Model {
             if address == v(i, VCPU_CNTL) {
                 self.progress.fetch_add(1, Ordering::SeqCst);
                 self.vcpu(i, old, value);
+            }
+            if address == v(i, DPG_PAUSE) {
+                let ack = value & DPG_PAUSE_REQ != 0 && !self.pause_stuck;
+                let value = (value & !DPG_PAUSE_ACK) | if ack { DPG_PAUSE_ACK } else { 0 };
+                self.regs.insert(address, value);
             }
         }
         if let Some((reg, want, cap)) = self.revoke {
@@ -445,6 +537,39 @@ impl Io for Model {
     }
 }
 
+/// PSP writing DPG register lists into the model's SRAM.
+struct FakePsp {
+    sram: Rc<RefCell<BTreeMap<usize, Vec<u32>>>>,
+    loads: Vec<usize>,
+    refuse: bool,
+}
+impl FakePsp {
+    fn new(model: &Model) -> Self {
+        Self {
+            sram: model.sram.clone(),
+            loads: Vec::new(),
+            refuse: false,
+        }
+    }
+}
+impl SramLoader for FakePsp {
+    async fn load_sram(&mut self, instance: usize, words: &[u32]) -> Result<(), Error> {
+        self.loads.push(instance);
+        if self.refuse {
+            return Err(Error::Sram(crate::amdgpu_psp_ring::Error::Rejected(0xa)));
+        }
+        assert!(words.len() <= DPG_SRAM_DW && words.len() % 2 == 0);
+        self.sram.borrow_mut().insert(instance, words.to_vec());
+        Ok(())
+    }
+}
+/// The static path never asks PSP for a DPG register list.
+struct NoSram;
+impl SramLoader for NoSram {
+    async fn load_sram(&mut self, _: usize, _: &[u32]) -> Result<(), Error> {
+        panic!("static start loaded a DPG register list")
+    }
+}
 fn engine(model: Model, instances: u8) -> (Pool, Engine<Model>) {
     let pool = pool(4 << 20);
     let vcn = [0, 1].map(|i| (instances & (1 << i) != 0).then(|| Instance::new(&pool, i).unwrap()));
@@ -467,6 +592,8 @@ fn engine(model: Model, instances: u8) -> (Pool, Engine<Model>) {
             jpeg,
             firmware_bytes: FW_BYTES,
             timing: FAST,
+            mode: StartMode::Static,
+            paused: [false; 2],
             state: State::Prepared,
             proof: Proof {
                 instances,
@@ -483,7 +610,7 @@ fn owned(instances: u8) -> u64 {
 fn vcn_navi24_decode_only() -> TestResult {
     let (_pool, mut e) = engine(Model::new(), 1);
     e.enc_count = 0;
-    if run(e.start(firmware(1), None)).is_err()
+    if run(e.start(firmware(1), None, &mut NoSram)).is_err()
         || run(e.start_jpeg()).is_err()
         || run(e.test_ib()).is_err()
         || e.proof.dec_ring != [true, false]
@@ -537,7 +664,7 @@ fn vcn_navi22_powers_tiles_before_reading_vcpu_status() -> TestResult {
     let mut model = Model::new();
     model.status_requires_power = true;
     let (_pool, mut e) = engine(model, 3);
-    if run(e.start(firmware(3), None)).is_err() || e.state != State::Running {
+    if run(e.start(firmware(3), None, &mut NoSram)).is_err() || e.state != State::Running {
         return TestResult::Fail("gated UVD_STATUS mistaken for device removal");
     }
     TestResult::Pass
@@ -553,7 +680,7 @@ fn vcn_navi22_all_ones_vcpu_control_preserves_linux_masked_updates() -> TestResu
         model.regs.insert(v(i, VCPU_CNTL), u32::MAX);
     }
     let (_pool, mut e) = engine(model, 3);
-    if run(e.start(firmware(3), None)).is_err() || e.state != State::Running {
+    if run(e.start(firmware(3), None, &mut NoSram)).is_err() || e.state != State::Running {
         return TestResult::Fail("all-ones VCPU control rejected on a live GPU");
     }
     for i in [0, 1] {
@@ -587,7 +714,7 @@ fn vcn_navi22_all_ones_vcpu_control_checks_independent_device_presence() -> Test
     let mut model = Model::new();
     model.gone_on_vcpu = true;
     let (_pool, mut e) = engine(model, 1);
-    if run(e.start(firmware(1), None)) != Err(Error::DeviceGone)
+    if run(e.start(firmware(1), None, &mut NoSram)) != Err(Error::DeviceGone)
         || e.state != State::Failed
         || e.hw.io.writes.iter().any(|&(a, _)| a == v(0, VCPU_CNTL))
     {
@@ -771,7 +898,7 @@ kernel_test_in!(
 
 fn vcn_navi22_starts_both_instances_with_ring_and_ib_tests() -> TestResult {
     let (pool, mut e) = engine(Model::new(), 3);
-    if run(e.start(firmware(3), None)).is_err() || e.state != State::Running {
+    if run(e.start(firmware(3), None, &mut NoSram)).is_err() || e.state != State::Running {
         return TestResult::Fail("VCN start failed");
     }
     if run(e.start_jpeg()).is_err() || run(e.test_ib()).is_err() || e.state != State::Verified {
@@ -913,7 +1040,7 @@ fn vcn_navi22_starts_both_instances_with_ring_and_ib_tests() -> TestResult {
         return TestResult::Fail("VCN proof");
     }
     let count = e.hw.io.writes.len();
-    if run(e.start(firmware(3), None)) != Err(Error::Busy)
+    if run(e.start(firmware(3), None, &mut NoSram)) != Err(Error::Busy)
         || run(e.start_jpeg()) != Err(Error::Busy)
         || run(e.test_ib()) != Err(Error::Busy)
         || e.hw.io.writes.len() != count
@@ -935,7 +1062,7 @@ fn vcn_navi22_boot_retry_loop_is_bounded() -> TestResult {
     let mut model = Model::new();
     model.boot_failures = [0, 3];
     let (_pool, mut e) = engine(model, 3);
-    if run(e.start(firmware(3), None)).is_err() || e.proof.booted != [1, 4] {
+    if run(e.start(firmware(3), None, &mut NoSram)).is_err() || e.proof.booted != [1, 4] {
         return TestResult::Fail("VCPU reset retries not mirrored");
     }
     // CLK_EN under the inherited reset, then three Linux reset retries.
@@ -952,7 +1079,7 @@ fn vcn_navi22_boot_retry_loop_is_bounded() -> TestResult {
     model.never_boot = [true, false];
     let (pool, mut e) = engine(model, 3);
     let start = narf_time::Deadline::after_ms(5000);
-    if run(e.start(firmware(3), None)) != Err(Error::BootFailed(0))
+    if run(e.start(firmware(3), None, &mut NoSram)) != Err(Error::BootFailed(0))
         || e.state != State::Failed
         || start.expired()
         || e.hw.io.releases[0] != 11
@@ -988,7 +1115,7 @@ fn vcn_navi22_refuses_missing_firmware_and_power_gating() -> TestResult {
         (firmware(3), Some(gated), Error::PowerGated),
     ] {
         let (_pool, mut e) = engine(Model::new(), 3);
-        if run(e.start(images, power)) != Err(want)
+        if run(e.start(images, power, &mut NoSram)) != Err(want)
             || !e.hw.io.writes.is_empty()
             || e.state != State::Failed
         {
@@ -1001,7 +1128,7 @@ fn vcn_navi22_refuses_missing_firmware_and_power_gating() -> TestResult {
     };
     // VCN0 harvested: only instance 1 runs and JPEG does not exist.
     let (_pool, mut e) = engine(Model::new(), 2);
-    if run(e.start(firmware(2), Some(ungated))).is_err()
+    if run(e.start(firmware(2), Some(ungated), &mut NoSram)).is_err()
         || run(e.test_ib()).is_err()
         || e.jpeg_state != JpegState::Absent
         || run(e.start_jpeg()) != Err(Error::Busy)
@@ -1060,7 +1187,7 @@ fn vcn_navi22_failures_are_terminal_and_bounded() -> TestResult {
             }
         };
         let (_pool, mut e) = engine(model, 3);
-        let result = match run(e.start(firmware(3), None)) {
+        let result = match run(e.start(firmware(3), None, &mut NoSram)) {
             Err(error) => Err(error),
             Ok(()) if case == 5 => run(e.start_jpeg()),
             Ok(()) => run(e.test_ib()),
@@ -1091,12 +1218,12 @@ fn vcn_navi22_cancellation_revocation_and_device_loss() -> TestResult {
     let progress = model.progress.clone();
     let (pool, mut e) = engine(model, 3);
     // Instance 0: CLK_EN, BLK_RST release (2), then instance 1's two.
-    if !cancel_at(e.start(firmware(3), None), &progress, 4) {
+    if !cancel_at(e.start(firmware(3), None, &mut NoSram), &progress, 4) {
         return TestResult::Fail("VCN1 boot not reached");
     }
     let count = e.hw.io.writes.len();
     if e.state != State::Starting(1)
-        || run(e.start(firmware(3), None)) != Err(Error::Busy)
+        || run(e.start(firmware(3), None, &mut NoSram)) != Err(Error::Busy)
         || run(e.test_ib()) != Err(Error::Busy)
         || e.hw.io.writes.len() != count
     {
@@ -1113,17 +1240,17 @@ fn vcn_navi22_cancellation_revocation_and_device_loss() -> TestResult {
     let (_pool, mut e) = engine(model, 3);
     e.hw.authority = authority;
     let count = |e: &Engine<Model>| e.hw.io.writes.len();
-    let result = run(e.start(firmware(3), None));
+    let result = run(e.start(firmware(3), None, &mut NoSram));
     let after = count(&e);
     if result != Err(Error::Revoked) || e.state != State::Failed {
         return TestResult::Fail("revoked VCN authority not reported");
     }
-    if run(e.start(firmware(3), None)) != Err(Error::Busy) || count(&e) != after {
+    if run(e.start(firmware(3), None, &mut NoSram)) != Err(Error::Busy) || count(&e) != after {
         return TestResult::Fail("revoked VCN retried");
     }
     // Surprise removal after a successful start.
     let (_pool, mut e) = engine(Model::new(), 3);
-    run(e.start(firmware(3), None)).unwrap();
+    run(e.start(firmware(3), None, &mut NoSram)).unwrap();
     e.hw.io.gone = true;
     if run(e.test_ib()) != Err(Error::DeviceGone) || e.state != State::Failed {
         return TestResult::Fail("VCN device loss not reported");
@@ -1131,7 +1258,7 @@ fn vcn_navi22_cancellation_revocation_and_device_loss() -> TestResult {
     let mut model = Model::new();
     model.gone = true;
     let (_pool, mut e) = engine(model, 1);
-    if run(e.start(firmware(1), None)) != Err(Error::DeviceGone)
+    if run(e.start(firmware(1), None, &mut NoSram)) != Err(Error::DeviceGone)
         || e.hw.io.writes.iter().any(|&(a, _)| a == v(0, PGFSM_CONFIG))
     {
         return TestResult::Fail("removed VCN programmed");
@@ -1148,7 +1275,7 @@ fn vcn_navi22_stop_quiesces_without_power_gating() -> TestResult {
     if run(e.stop()) != Err(Error::Busy) || !e.hw.io.writes.is_empty() {
         return TestResult::Fail("unstarted VCN stopped");
     }
-    run(e.start(firmware(3), None)).unwrap();
+    run(e.start(firmware(3), None, &mut NoSram)).unwrap();
     run(e.start_jpeg()).unwrap();
     run(e.test_ib()).unwrap();
     if run(e.stop()).is_err() || e.state != State::Stopped || e.jpeg_state != JpegState::Stopped {
@@ -1188,7 +1315,7 @@ fn vcn_navi22_stop_quiesces_without_power_gating() -> TestResult {
     }
     // A busy VCPU never reaches idle: the stop wait is bounded.
     let (_pool, mut e) = engine(Model::new(), 1);
-    run(e.start(firmware(1), None)).unwrap();
+    run(e.start(firmware(1), None, &mut NoSram)).unwrap();
     e.hw.io.regs.insert(v(0, STATUS), 0x5);
     if run(e.stop()) != Err(Error::Timeout) || e.state != State::Failed {
         return TestResult::Fail("busy VCN stop unbounded");
@@ -1250,7 +1377,7 @@ kernel_test_in!(
 fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
     use crate::amdgpu_navi22_submit::{encode_media, Ib, MediaFrame, MediaRing, VmRef};
     let (pool, mut e) = engine(Model::new(), 1);
-    if run(e.start(firmware(1), None)).is_err()
+    if run(e.start(firmware(1), None, &mut NoSram)).is_err()
         || run(e.start_jpeg()).is_err()
         || run(e.test_ib()).is_err()
     {
@@ -1461,4 +1588,157 @@ fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/vcn-navi22",
     vcn_navi22_client_jobs_frame_flush_and_throttle
+);
+
+fn dpg_engine(instances: u8) -> (Pool, Engine<Model>, FakePsp) {
+    let model = Model::new();
+    let psp = FakePsp::new(&model);
+    let (pool, mut e) = engine(model, instances);
+    e.mode = StartMode::Dpg;
+    (pool, e, psp)
+}
+fn vcn_navi22_dpg_offsets_follow_soc15_dpg_mode_offset() -> TestResult {
+    let l = layout(3);
+    // Video registers of either instance share internal offsets from 0;
+    // always-on registers (below 0x80) map into 0x30000 bytes.
+    for i in [0, 1] {
+        if dpg_offset(l.reg(i, VCPU_CNTL)) != 0xd6
+            || dpg_offset(l.reg(i, CGC_CTRL)) != 0x0a
+            || dpg_offset(l.reg(i, LMI_VCPU_CACHE_BAR_LOW)) != 0x3bc
+            || dpg_offset(l.reg(i, GFX10_ADDR_CONFIG)) != 0xc04a
+            || dpg_offset(l.reg(i, POWER_STATUS)) != 0xc004
+        {
+            return TestResult::Fail("DPG internal offset");
+        }
+    }
+    // Outside every VCN range the SOC offset passes through.
+    if dpg_offset(0x10_0000 + 0x40) != 0x10 {
+        return TestResult::Fail("DPG offset outside VCN ranges");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22",
+    vcn_navi22_dpg_offsets_follow_soc15_dpg_mode_offset
+);
+
+fn vcn_navi22_dpg_start_programs_the_vcpu_through_psp() -> TestResult {
+    let (_pool, mut e, mut psp) = dpg_engine(3);
+    if run(e.start(firmware(3), None, &mut psp)).is_err() || e.state != State::Running {
+        return TestResult::Fail("DPG start failed");
+    }
+    if psp.loads != [0, 1] || e.paused != [true, true] {
+        return TestResult::Fail("one SRAM load and an encode pause per instance");
+    }
+    {
+        let m = &e.hw.io;
+        // PSP owns the VCPU and cache windows: no direct write, and no
+        // static PGFSM power-up or VCPU boot poll.
+        let direct = [
+            VCPU_CNTL,
+            LMI_VCPU_CACHE_BAR_LOW,
+            VCPU_CACHE_SIZE0,
+            LMI_VCPU_NC0_BAR_LOW,
+            PGFSM_CONFIG,
+            CGC_GATE,
+        ];
+        if m.writes
+            .iter()
+            .any(|&(a, _)| (0..2).any(|i| direct.iter().any(|&r| a == v(i, r))))
+        {
+            return TestResult::Fail("DPG start wrote a PSP-owned register directly");
+        }
+        for i in [0, 1] {
+            let inst = e.vcn[i].as_ref().unwrap();
+            let words = m.sram.borrow()[&i].clone();
+            // Clock gating first, the PSP size-check NOP last; the VCPU is
+            // held in reset until the list releases it.
+            if words.len() != 70
+                || words[..2] != [0x0a, CGC_CTRL_DYN]
+                || words[8..10] != [0xd6, VCPU_CNTL_DPG | VCPU_BLK_RST]
+                || words[64..66] != [0xd6, VCPU_CNTL_DPG]
+                || words[68..] != [0xd6, VCPU_CNTL_DPG]
+                || m.dpg_reg(i, LMI_CTRL) != Some(LMI_CTRL_DPG)
+                || m.dpg_reg(i, LMI_VCPU_CACHE2_BAR_LOW) != Some(inst.address(CONTEXT) as u32)
+                || m.dpg_shared(i) != inst.address(SHARED)
+                || m.dpg_reg(i, REG_XX_MASK) != Some(0x10)
+                || m.dpg_reg(i, RBC_XX_IB_REG_CHECK) != Some(3)
+            {
+                return TestResult::Fail("DPG register list");
+            }
+            let power = m.reg(v(i, POWER_STATUS));
+            let shared = mc(inst.memory.mapping(), SHARED);
+            if power & (POWER_PG_MODE | POWER_PG_EN | POWER_STALL_DPG)
+                != POWER_PG_MODE | POWER_PG_EN
+                || m.reg(v(i, RBC_RB_CNTL)) != RBC_RB_CNTL_IDLE
+                || m.reg(v(i, LMI_RBC_RB_BAR_LOW)) != inst.address(DEC_RING) as u32
+                || m.reg(v(i, RB_BASE_LO[1])) != inst.address(ENC_RING[1]) as u32
+                || m.reg(v(i, RB_SIZE[0])) != RING_DW
+                || m.reg(v(i, SCRATCH9)) != 0xdead_beef
+                || m.word(shared + shared::QUEUE_MODES) != 0
+                || m.word(shared + shared::RB_WPTR) != inst.dec.wptr
+                || m.reg(v(i, SCRATCH2)) != inst.dec.wptr
+            {
+                return TestResult::Fail("DPG power, ring or fw_shared state");
+            }
+        }
+    }
+    if run(e.test_ib()).is_err() || e.state != State::Verified {
+        return TestResult::Fail("DPG IB tests");
+    }
+    if e.proof.dec_ring != [true; 2] || e.proof.enc_ring != [[true; 2]; 2] {
+        return TestResult::Fail("DPG ring proof");
+    }
+    if run(e.stop()).is_err() || e.state != State::Stopped || e.paused != [false; 2] {
+        return TestResult::Fail("DPG stop failed");
+    }
+    for i in [0, 1] {
+        let power = e.hw.io.reg(v(i, POWER_STATUS));
+        if power & POWER_PG_MODE != 0 || e.hw.io.reg(v(i, DPG_PAUSE)) & DPG_PAUSE_REQ != 0 {
+            return TestResult::Fail("DPG stop left dynamic power gating or the pause");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22",
+    vcn_navi22_dpg_start_programs_the_vcpu_through_psp
+);
+
+fn vcn_navi22_dpg_failures_are_terminal() -> TestResult {
+    // PSP refuses the list: nothing reaches a ring.
+    let (_pool, mut e, mut psp) = dpg_engine(1);
+    psp.refuse = true;
+    if run(e.start(firmware(1), None, &mut psp))
+        != Err(Error::Sram(crate::amdgpu_psp_ring::Error::Rejected(0xa)))
+        || e.state != State::Failed
+        || !e.hw.io.doorbells.is_empty()
+    {
+        return TestResult::Fail("refused SRAM load");
+    }
+    // A VCPU that never runs fails the decode ring test, bounded.
+    let (_pool, mut e, mut psp) = dpg_engine(1);
+    e.hw.io.never_boot[0] = true;
+    if run(e.start(firmware(1), None, &mut psp)) != Err(Error::Timeout)
+        || e.state != State::Failed
+        || e.paused[0]
+    {
+        return TestResult::Fail("DPG VCPU that never ran");
+    }
+    // An unacknowledged pause leaves the encode rings unprogrammed.
+    let (_pool, mut e, mut psp) = dpg_engine(1);
+    e.hw.io.pause_stuck = true;
+    if run(e.start(firmware(1), None, &mut psp)) != Err(Error::Timeout)
+        || e.state != State::Failed
+        || !e.proof.dec_ring[0]
+        || e.proof.enc_ring[0] != [false; 2]
+        || e.hw.io.reg(v(0, RB_SIZE[0])) != 0
+    {
+        return TestResult::Fail("unacknowledged DPG pause");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22",
+    vcn_navi22_dpg_failures_are_terminal
 );

@@ -6941,14 +6941,38 @@ the VCPU BO (128 KiB stack, 512 KiB context, 4 KiB fw_shared), 4 KiB decode and
 two encode rings, writeback and IB-test buffers (below 2^40), plus an 8 KiB JPEG
 ring when instance 0 exists. No I/O. Doorbells are 32-bit: decode
 `0x310 + 8i`, encode j `0x312 + j + 8i`, JPEG `0x311`, with NBIO MMSCH0/1
-ranges (size 8). `unsafe start(MediaFirmware, Option<PowerStatus>)` refuses a
-missing per-instance TMR address or a running SMU MM_DPM_PG feature before any
-write, then per instance zeroes the BO, sets fw_shared flags, programs the
-range and runs `vcn_v3_0_start`'s static path with power gating disabled
-(PGFSM all tiles on before any UVD_STATUS read, no UVD_PG_EN; Linux's default DPG mode is not used),
+ranges (size 8). `unsafe start(MediaFirmware, Option<PowerStatus>, &mut Psp)`
+refuses a missing per-instance TMR address or a running SMU MM_DPM_PG feature
+the boot did not power up first, before any write, then per instance zeroes the
+BO, sets fw_shared flags and programs the range. `mode() -> StartMode` reports
+how instances start; `amdgpu_vcn_navi22::set_dpg(bool)` (boot option
+`amdgpu.rdna2_vcn_dpg`, default on) selects it before `new`.
+
+`StartMode::Dpg` (Linux's GC 10.3.2 default, `AMD_PG_SUPPORT_VCN_DPG` with
+indirect SRAM) runs `vcn_v3_0_start_dpg_mode`: UVD_POWER_STATUS anti-hang off
+and PG_MODE/PG_EN on, then the 35-pair register list (`dpg_list`: DPG clock
+gating, VCPU clocked in reset, LMI/MPC, `mc_resume_dpg_mode` with the firmware
+and stack windows left zero for PSP, context and fw_shared windows, GB_ADDR_CONFIG,
+REG_XX_MASK/RBC_XX_IB_REG_CHECK, VCPU release, master interrupt, the PSP
+size-check NOP) at `dpg_offset` (`SOC15_DPG_MODE_OFFSET`) internal offsets goes to
+PSP as LOAD_IP_FW `GFX_FW_TYPE_VCN0_RAM`/`VCN1_RAM`
+(`Psp::load_vcn_sram(instance, words)`, at most 64 pairs; refusal is
+`Error::Sram`). The decode RBC is then programmed under STALL_DPG_POWER_UP with
+the fw_shared `rb` pointers, and every decode commit also writes UVD_SCRATCH2
+and fw_shared `rb.wptr`. No register boot poll exists; the decode ring test is
+the first proof. Before the encode ring tests the instance is paused
+(`vcn_v3_0_pause_dpg_mode`: POWER_STATUS 1, NJ_PAUSE_DPG_REQ/ACK, both encode
+rings programmed, decode pointers restored from fw_shared, POWER_STATUS 2) and
+stays paused (no idle work). `stop()` runs `vcn_v3_0_stop_dpg_mode` (unpause,
+ring drain, PG_MODE off) without PowerDownVcn.
+
+`StartMode::Static` runs `vcn_v3_0_start`'s static path with power
+gating disabled (PGFSM all tiles on before any UVD_STATUS read, no UVD_PG_EN),
 MGCG-style clock-gating disable, PSP-TMR cache window 0, VCPU boot with Linux's
 10-reset retry loop (100 × 10 ms samples each), decode RBC and both encode
-rings, then the SCRATCH9 decode and VCN_ENC_CMD_END encode ring tests.
+rings. On the RX 6750 XT its VCPU registers read all ones and the VCPU never
+boots; a failed start of either mode logs one register line. Both modes then
+run the SCRATCH9 decode and VCN_ENC_CMD_END encode ring tests.
 VCPU_CNTL masked writes preserve the original unselected bits, including an
 all-ones control word, as Linux's WREG32_P does. Before accepting that value,
 the owner checks NBIO's memory-size and doorbell-aperture registers and requires
@@ -6959,8 +6983,8 @@ all-ones reads still fail rather than proving readiness.
 `jpeg_v3_0_start` plus the JPEG pitch ring test. `test_ib()` runs the decoder
 create/destroy message pair and the encoder session initialize/close pair on
 every started ring and waits (1 s) for the fences; register waits are bounded
-by 100 ms. `unsafe stop()` runs `vcn_v3_0_stop`/`jpeg_v3_0_stop` without
-re-enabling power gating. Each operation has one predecessor state;
+by 100 ms. `unsafe stop()` runs `vcn_v3_0_stop` (DPG or static) and
+`jpeg_v3_0_stop` without re-enabling static power gating. Each operation has one predecessor state;
 failure, cancellation, revocation and device loss are terminal and retain
 published memory. `status()` returns `Status { state, jpeg, proof }`.
 `route_interrupts(ih, status)` subscribes the started rings' VCN/VCN1

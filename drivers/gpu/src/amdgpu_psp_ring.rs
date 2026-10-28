@@ -1208,6 +1208,30 @@ impl Psp {
             .await
             .map(|_| ())
     }
+    /// `amdgpu_vcn_psp_update_sram`: LOAD_IP_FW of VCN 3.0 instance
+    /// `instance`'s DPG register list (offset/value dword pairs) as
+    /// GFX_FW_TYPE_VCN0_RAM / VCN1_RAM, which PSP writes into that
+    /// instance's DPG SRAM. The instance's firmware must already be loaded.
+    pub async fn load_vcn_sram(&mut self, instance: usize, words: &[u32]) -> Result<(), Error> {
+        if self.kind.rdna2_profile().is_none() {
+            return Err(Error::Unsupported);
+        }
+        let firmware = self.session.media_firmware;
+        let (loaded, kind) = match instance {
+            0 => (firmware.vcn, 49),  // linux-lit: 49=GFX_FW_TYPE_VCN0_RAM
+            1 => (firmware.vcn1, 50), // linux-lit: 50=GFX_FW_TYPE_VCN1_RAM
+            _ => return Err(Error::Invalid),
+        };
+        if loaded.is_none() {
+            return Err(Error::Busy);
+        }
+        // dpg_sram_bo holds 64 pairs.
+        if words.is_empty() || words.len() % 2 != 0 || words.len() > 128 {
+            return Err(Error::Invalid);
+        }
+        let bytes: alloc::vec::Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        self.session.load_ip(&bytes, kind).await.map(|_| ())
+    }
     /// Load Navi22 SMC once during cold boot, after LOAD_TOC/TMR reservation
     /// and before other IP firmware, then SETUP_TMR (psp_hw_start's
     /// psp_load_smu_fw then psp_tmr_load for pmfw_centralized_cstate_management).

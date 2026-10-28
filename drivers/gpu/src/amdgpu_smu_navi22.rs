@@ -48,6 +48,10 @@ const DISABLE_FEATURES_LOW: u32 = 0xa; // linux: PPSMC_MSG_DisableSmuFeaturesLow
 const DISABLE_FEATURES_HIGH: u32 = 0xb; // linux: PPSMC_MSG_DisableSmuFeaturesHigh
 const ALLOW_GFXOFF: u32 = 0x28; // linux: PPSMC_MSG_AllowGfxOff
 const DISALLOW_GFXOFF: u32 = 0x29; // linux: PPSMC_MSG_DisallowGfxOff
+const POWER_UP_VCN: u32 = 0x2a; // linux: PPSMC_MSG_PowerUpVcn
+const POWER_UP_JPEG: u32 = 0x2c; // linux: PPSMC_MSG_PowerUpJpeg
+                                 // linux-lit: 22=FEATURE_MM_DPM_PG_BIT
+const MM_DPM_PG: u64 = 1 << 22;
 /// The only feature bits the opt-in power-saving path may switch at runtime
 /// (amdgpu_navi22_power_policy): UCLK/FCLK DPM with memory rail scaling,
 /// DS_* and GFX ULV, GFXOFF and MMHUB/ATHUB PG. Never a protection bit.
@@ -1039,6 +1043,23 @@ impl<I: Io> Engine<I> {
         self.end_runtime(resume, &result);
         result
     }
+    /// `sienna_cichlid_dpm_set_vcn_enable(true)` for each unharvested
+    /// instance (PowerUpVcn, `0x10000 * inst`) and
+    /// `sienna_cichlid_dpm_set_jpeg_enable(true)` (PowerUpJpeg), sent only
+    /// while MM_DPM_PG runs, as Linux does. False when it does not run and
+    /// nothing was sent.
+    async fn power_up_media(&mut self, instances: [bool; 2]) -> Result<bool, Error> {
+        let low = self.command(RUNNING_LOW, 0).await?;
+        let high = self.command(RUNNING_HIGH, 0).await?;
+        if (u64::from(low) | (u64::from(high) << 32)) & MM_DPM_PG == 0 {
+            return Ok(false);
+        }
+        for (inst, _) in instances.iter().enumerate().filter(|(_, &on)| on) {
+            self.command(POWER_UP_VCN, 0x1_0000 * inst as u32).await?;
+        }
+        self.command(POWER_UP_JPEG, 0).await?;
+        Ok(true)
+    }
     async fn enable_display_power(&mut self) -> Result<(), Error> {
         if self.state == State::DisplayPowerReady {
             return self.access(|_| ());
@@ -1321,6 +1342,11 @@ impl Smu {
     /// AllowGfxOff/DisallowGfxOff for `amdgpu_navi22_gfxoff`.
     pub(crate) async fn gfx_off_control(&mut self, allow: bool) -> Result<(), Error> {
         self.engine.gfx_off_control(allow).await
+    }
+    /// Power the VCN `instances` and JPEG up through PMFW when MM_DPM_PG
+    /// runs (see [`Engine::power_up_media`]).
+    pub(crate) async fn power_up_media(&mut self, instances: [bool; 2]) -> Result<bool, Error> {
+        self.engine.power_up_media(instances).await
     }
     /// `power_dpm_force_performance_level` for GFXCLK; see
     /// [`Engine::set_gfx_level`]. Rejection leaves the owner reusable.
