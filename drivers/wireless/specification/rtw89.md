@@ -1170,9 +1170,11 @@ or physical hardware acceptance.
 The per-chip source `rtw_chip_info` inventories are broader than this station:
 8851B declares1TX/1RX and2.4/5GHz;8852A/B declare2TX/2RX and2.4/5GHz;
 8852C declares2TX/2RX and2.4/5/6GHz;8922A declares2TX/2RX and2.4/5/6GHz
-with its distinct BE generation. B still needs source-bound HT/HE and widths,
-full QoS AC/TIDs, BA/aggregation/reorder, broader channel/scan policy, tracking,
-runtime sleep/WoW and safe reset/rejoin. A/C/51 need complete chip-specific
+with its distinct BE generation. B now has signed-program HT20, all-AC/TID
+QoS, firmware RA, recipient BA/reorder, MSI delivery, live EDCA and active
+channel-1 scans (section 3); it still needs HE and wider widths, TX
+aggregation/originator BA, other channels, tracking, runtime sleep/WoW and
+safe reset/rejoin. A/C/51 need complete chip-specific
 firmware/security, BB/RF/power/packet/station composition;8922A additionally
 needs BE EFUSE/container/descriptor/transport and EHT operation. Source band
 masks make6GHz inapplicable to A/B/51, not to C/8922A. These are remaining
