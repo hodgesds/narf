@@ -87,7 +87,7 @@ pub(super) struct Frame {
     pub(super) rate: u8,
     pub(super) phy: Option<super::packet_phy::Evidence>,
     /// Original32-byte PHY-status record for dynamic-mechanism statistics.
-    pub(super) status: Option<[u8; 32]>,
+    pub(super) status: Option<alloc::boxed::Box<[u8; 32]>>,
 }
 impl narf_wireless::station_security::RawFrame for Frame {
     fn bytes(&self) -> &[u8] {
@@ -391,7 +391,9 @@ impl Core {
                     let phy = match format::phy_status(descriptor) {
                         Some(range) => {
                             let bytes = port.rx_bytes(slot, range.start, range.len())?;
-                            status = <[u8; 32]>::try_from(bytes.as_slice()).ok();
+                            status = <[u8; 32]>::try_from(bytes.as_slice())
+                                .ok()
+                                .map(alloc::boxed::Box::new);
                             super::packet_phy::parse(self.receive_chip, metadata.rate, &bytes)
                                 .ok()
                                 .filter(|p| p.initial_channel())

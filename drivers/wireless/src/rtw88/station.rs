@@ -158,7 +158,7 @@ pub(super) struct State {
 struct Tracking {
     facts: Option<super::dm::Facts>,
     grant: Option<Arc<super::qualification::Grant>>,
-    tracker: Option<super::dm::Tracker>,
+    tracker: Option<Box<super::dm::Tracker>>,
     next: u64,
     tx_bytes: u64,
     rx_bytes: u64,
@@ -257,7 +257,7 @@ impl State {
         self.tracking.ticks
     }
     pub(super) fn tracker(&self) -> Option<&super::dm::Tracker> {
-        self.tracking.tracker.as_ref()
+        self.tracking.tracker.as_deref()
     }
     /// One Linux `rtw_watch_dog_work` period, at most every 2s, once the
     /// separately qualified N2xD continuation is bound and the station is
@@ -277,7 +277,7 @@ impl State {
         let facts = self.tracking.facts.ok_or(Error::State)?;
         if self.tracking.tracker.is_none() {
             let bounds = super::dm::bounds(facts.did, grant.payload()).ok_or(Error::State)?;
-            self.tracking.tracker = Some(super::dm::Tracker::new(bounds, facts));
+            self.tracking.tracker = Some(Box::new(super::dm::Tracker::new(bounds, facts)));
         }
         let period = super::dm::Period {
             linked: self.peer.is_some(),
@@ -293,7 +293,8 @@ impl State {
             gate: &gate,
         };
         let tracker = self.tracking.tracker.as_mut().ok_or(Error::State)?;
-        let result = tracker.tick(io, &live, period).await;
+        // Boxed: keep the dm state machine off small (aarch64) task stacks.
+        let result = Box::pin(tracker.tick(io, &live, period)).await;
         let commands = match result {
             Ok(c) => c,
             Err(firmware_transport::Error::State) if admission.closed() => {
@@ -305,7 +306,7 @@ impl State {
                     admission: &admission,
                     gate: &gate,
                 };
-                tracker.restore(io, &base).await?;
+                Box::pin(tracker.restore(io, &base)).await?;
                 self.tracking.grant = None;
                 self.tracking.tracker = None;
                 return match e {
@@ -448,7 +449,8 @@ impl State {
         self.tracking.rx_bytes = self.tracking.rx_bytes.saturating_add(b.len() as u64);
         if let Some(sample) = frame
             .status
-            .and_then(|s| super::dm::sample(&facts, frame.rate, &s))
+            .as_deref()
+            .and_then(|s| super::dm::sample(&facts, frame.rate, s))
         {
             tracker.observe(sample);
         }
