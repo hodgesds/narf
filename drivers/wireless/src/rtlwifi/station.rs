@@ -66,6 +66,16 @@ pub(crate) trait Environment: Send + Sync {
     ) -> Result<Option<Arc<super::super::ht::Grant>>, Error> {
         Ok(None)
     }
+    /// The bound MSI vector's wake (Linux `rtl_pci_intr_mode_msi`), or
+    /// `None` on the polling fallback.
+    fn interrupt(&self) -> Option<Arc<super::super::irq::Signal>> {
+        None
+    }
+    /// Enable delivery of the bound vector, or withdraw and release it.
+    /// `false` means no vector remains bound; the owner keeps polling.
+    fn deliver(&self, _enabled: bool) -> bool {
+        false
+    }
 }
 /// Shared public closure and bounded publication gate. No guard crosses an
 /// await; an already-entered native publication completes before close returns.
@@ -1747,6 +1757,17 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             }
         }
         Ok(idle)
+    }
+    /// Linux `rtl_lps_enter_core` link gate: associated, not
+    /// `being_setkey` (RSNA port open, no handshake frame outstanding).
+    pub(crate) fn station_linked(&self) -> bool {
+        self.station_peer().is_some()
+            && matches!(self.station.phase, Phase::Open)
+            && self
+                .station
+                .security
+                .as_ref()
+                .is_none_or(|security| security.port_open() && security.pending_frame().is_none())
     }
     pub(crate) fn station_transmit_ready(&self) -> bool {
         self.station_peer().is_some()

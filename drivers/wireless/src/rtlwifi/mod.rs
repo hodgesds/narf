@@ -86,6 +86,7 @@ pub mod rtl8192ee;
 pub mod rtl8723be;
 pub mod rtl8821ae;
 
+pub use interface::set_leisure_power_save;
 pub use pci::{name_for, probe, register_pci_driver, RtlwifiDevice};
 pub use regs::{ALL_DEV_IDS, REALTEK_VENDOR};
 

@@ -234,6 +234,11 @@ impl<I: Io> Owner<I> {
     pub fn status(&self) -> Status {
         *self.status.lock()
     }
+    /// The retained native adapter, for vector binding only. Register
+    /// access still flows through the gated `PacketIo` continuation.
+    pub(super) fn native(&self) -> &I {
+        &self.io
+    }
     pub(crate) fn identity(&self) -> Option<Identity> {
         if self.status().stage != Stage::Ready {
             return None;

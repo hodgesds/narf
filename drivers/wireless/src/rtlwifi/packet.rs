@@ -89,6 +89,10 @@ pub(super) struct State<M: Memory> {
     reserved: Option<M>,
     pub(super) qos: bool,
     pub(super) ht: bool,
+    /// HIMR/HIMRE/HSIMR currently carry the Linux 88EE masks.
+    interrupts: bool,
+    /// Firmware leisure power save (fw_current_inpsmode) is active.
+    leisure: bool,
 }
 impl<M: Memory> State<M> {
     pub(super) fn new() -> Self {
@@ -102,6 +106,8 @@ impl<M: Memory> State<M> {
             reserved: None,
             qos: false,
             ht: false,
+            interrupts: false,
+            leisure: false,
         }
     }
     pub(super) fn retain(&mut self) {
@@ -401,12 +407,49 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.phase = Phase::Running;
         Ok(())
     }
+    /// True while the firmware is in leisure power save.
+    pub(crate) fn leisure(&self) -> bool {
+        self.packet.leisure
+    }
+    /// Linux `rtl_lps_set_psmode(EAUTOPS)` → HW_VAR_FW_LPS_ACTION(true):
+    /// only a running, idle owner may hand the radio to firmware LPS.
+    pub(crate) async fn enter_leisure(&mut self) -> Result<(), Error> {
+        if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        self.packet.mailbox.doze(&self.io).await?;
+        self.packet.leisure = true;
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    /// Linux `rtl_lps_set_psmode(EACTIVE)` → HW_VAR_FW_LPS_ACTION(false):
+    /// `_rtl88ee_fwlps_leave` RPWM ALL_ON then H2C FW_PS_ACTIVE_MODE.
+    pub(crate) async fn leave_leisure(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Running || !self.packet.leisure {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        self.packet.mailbox.awake(&self.io).await?;
+        self.packet.leisure = false;
+        self.phase = Phase::Running;
+        Ok(())
+    }
     pub(crate) async fn disconnect_station_peer(&mut self) -> Result<(), Error> {
         if !matches!(self.phase, Phase::Running | Phase::Failed) {
             return Err(Error::State);
         }
         self.phase = Phase::Failed;
-        let report = self.packet.mailbox.send(&self.io, 1, &[0]).await;
+        // mac80211 disassociation leaves PS before the join report clears.
+        let awake = if core::mem::take(&mut self.packet.leisure) {
+            self.packet.mailbox.awake(&self.io).await
+        } else {
+            Ok(())
+        };
+        let report = match awake {
+            Ok(()) => self.packet.mailbox.send(&self.io, 1, &[0]).await,
+            Err(error) => Err(error),
+        };
         let mac = super::super::station_control::disconnected(&self.io);
         let stopped = self.stop_packets();
         report.and(mac).and(stopped)
@@ -446,6 +489,80 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         self.phase = Phase::Running;
         Ok(())
+    }
+    /// True while the Linux 88EE masks are programmed (IRQ profile).
+    pub(crate) fn interrupts_enabled(&self) -> bool {
+        self.packet.interrupts
+    }
+    /// Linux `rtl88ee_enable_interrupt`: HIMR/HIMRE = irq_mask[0]/[1],
+    /// clear firmware-notified C2H events (REG_C2HEVT_CLEAR = 0) so the
+    /// firmware keeps scheduling commands, then HSIMR = sys_irq_mask. Only
+    /// a running owner whose vector is bound may unmask; the polling
+    /// fallback keeps every mask clear.
+    pub(crate) fn enable_interrupts(&mut self) -> Result<(), Error> {
+        use super::super::irq::*;
+        if self.phase != Phase::Running || self.packet.interrupts {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        self.io.authority(true, || Ok(()))?;
+        self.io.write32(0xb0, IRQ_MASK0_88E)?;
+        self.io.write32(0xb8, IRQ_MASK1_88E)?;
+        self.packet.interrupts = true;
+        self.io.write8(REG_C2HEVT_CLEAR_88E, 0)?;
+        self.io.write32(REG_HSIMR_88E, SYS_IRQ_MASK_88E)?;
+        if self.io.read32(0xb0)? != IRQ_MASK0_88E
+            || self.io.read32(0xb8)? != IRQ_MASK1_88E
+            || self.io.read32(REG_HSIMR_88E)? != SYS_IRQ_MASK_88E
+        {
+            return Err(Error::Readback);
+        }
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    /// Linux `rtl88ee_disable_interrupt` (HIMR/HIMRE = IMR_DISABLED). Used
+    /// when the bound vector is withdrawn while the owner keeps polling.
+    pub(crate) fn disable_interrupts(&mut self) -> Result<(), Error> {
+        self.packet.interrupts = false;
+        self.io.write32(0xb0, 0)?;
+        self.io.write32(0xb8, 0)?;
+        if self.io.read32(0xb0)? != 0 || self.io.read32(0xb8)? != 0 {
+            return Err(Error::Readback);
+        }
+        Ok(())
+    }
+    /// One `_rtl_pci_interrupt` bottom-half pass: mask (disable_interrupt),
+    /// `rtl88ee_interrupt_recognized` W1C of HISR/HISRE under irq_mask,
+    /// `_rtl_pci_hs_interrupt` HSISR W1C when IMR_HSISR_IND_ON_INT is set,
+    /// then unmask (enable_interrupt). RX/TX ring service follows in the
+    /// caller's existing ring walk, exactly where Linux calls
+    /// `_rtl_pci_rx_interrupt`/`_rtl_pci_tx_isr`. An all-ones status means
+    /// the function vanished and is terminal.
+    pub(crate) fn recognize_interrupts(&mut self) -> Result<super::super::irq::Recognized, Error> {
+        use super::super::irq::*;
+        if self.phase != Phase::Running || !self.packet.interrupts {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        self.io.write32(0xb0, 0)?;
+        self.io.write32(0xb8, 0)?;
+        let raw = self.io.read32(0xb4)?;
+        if raw == u32::MAX {
+            return Err(Error::Access(super::AccessError::Gone));
+        }
+        let inta = raw & IRQ_MASK0_88E;
+        self.io.write32(0xb4, inta)?;
+        let intb = self.io.read32(0xbc)? & IRQ_MASK1_88E;
+        self.io.write32(0xbc, intb)?;
+        if inta & IMR_HSISR_IND_ON_INT != 0 {
+            let hsisr = self.io.read8(REG_HSISR_88E)?;
+            self.io
+                .write8(REG_HSISR_88E, hsisr | SYS_IRQ_MASK_88E as u8)?;
+        }
+        self.io.write32(0xb0, IRQ_MASK0_88E)?;
+        self.io.write32(0xb8, IRQ_MASK1_88E)?;
+        self.phase = Phase::Running;
+        Ok(Recognized { inta, intb })
     }
     fn validate_rings(&self) -> Result<(), Error> {
         for (queue, ring) in self.tx.iter().enumerate() {
@@ -803,6 +920,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return Err(Error::State);
         }
         self.phase = Phase::Stopping;
+        self.packet.interrupts = false;
+        self.packet.leisure = false;
         let mut result = Ok(());
         for operation in [
             self.io.write32(0xb0, 0).map_err(Error::from),

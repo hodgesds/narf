@@ -686,6 +686,85 @@ versus ordinary TX credit. They use inert native register/DMA/firmware/AP inputs
 build/test gates pass; exact-board RF/firmware/external interoperability acceptance
 remains outstanding. This initial EE feature does not complete rtlwifi.
 
+### RTL8188EE interrupt delivery (implemented)
+
+Linux `rtl_pci_intr_mode_decide` prefers MSI (`rtl_pci_intr_mode_msi`:
+`pci_enable_msi` + `request_irq(_rtl_pci_interrupt)`). `interface::publish`
+arms one MSI vector on the retained function (`firmware_native::PciIo::
+arm_msi`: `narf_bus::msi::enable_msi`/`program_msi`, a
+`narf_interrupts::vector` and a handler that only raises an
+`irq::Signal`; delivery stays disabled until the owner is running). The
+publisher worker then sleeps on the signal with a 20 ms housekeeping tick
+instead of polling every 1 ms; stack TX (`enqueue`) is the second wake
+source. Without a vector (no MSI capability, allocation failure, refused
+enable) every mask stays clear and the worker keeps the 1 ms polled
+service, so the polling-fallback goldens (`HIMR`/`HIMRE` = 0 after
+`start_packets`) are unchanged.
+
+On the first service pass after `start_packets` with a bound vector, the
+owner runs `rtl88ee_enable_interrupt` exactly: `HIMR` = `irq_mask[0]`
+(0x200084ff: PSTIMEOUT, HSISR_IND_ON_INT, C2HCMD, HIGHDOK, MGNTDOK,
+BK/BE/VI/VO DOK, RDU, ROK — `rtl8188ee/sw.c::rtl88e_init_sw_vars`),
+`HIMRE` = `irq_mask[1]` (IMR_RXFOVW), `REG_C2HEVT_CLEAR` = 0, then
+`HSIMR` = `sys_irq_mask` (PDN|RON), with readback; MSI delivery is enabled
+afterwards. Each woken pass runs one `_rtl_pci_interrupt` bottom half:
+disable (`HIMR`/`HIMRE` = 0), `rtl88ee_interrupt_recognized` (read `HISR`
+and `HISRE`, AND with the masks, write the same bits back: W1C),
+`_rtl_pci_hs_interrupt` (`HSISR` |= sys mask) when IMR_HSISR_IND_ON_INT is
+set, then re-enable. The existing ring walk follows, exactly where Linux
+calls `_rtl_pci_rx_interrupt`/`_rtl_pci_tx_isr`. An all-ones `HISR`
+(function gone) and any readback mismatch are terminal. Close masks the
+chip (`rtl88ee_disable_interrupt`; `stop_packets` also clears the masks)
+before the vector is disabled, its handler removed, synchronized and freed
+(`rtl_pci_deinit`); a cfg-space disable failure quarantines the vector.
+
+Tests: `smoke_rtl8188ee_native_irq_masks_and_w1c_recognition_match_linux`
+(write order/values, W1C of masked bits only, HSISR ack, ring service
+after recognition, withdraw/stop masking, all-ones and readback failures)
+and `smoke_rtl8188ee_native_device_irq_worker_binds_and_releases_vector`
+(composed Device: bind after join, woken W1C pass, TX wake, release after
+masking at disassociate, refused delivery falls back to masked polling).
+
+### RTL8188EE leisure power save (implemented)
+
+Linux `rtl88ee_mod_params.fwctrl_lps` defaults off; `rtlwifi::
+set_leisure_power_save` is the `fwlps=` module-parameter equivalent and
+the default stays off. With it on, the publisher worker runs the
+`rtl_watchdog_wq_callback` decision every `RTL_WATCHDOG_TIME` (2 s):
+`cnt_after_linked` counts linked periods (cap 20); `num_rx + num_tx > 8 ||
+num_rx > 2` calls `rtl_lps_leave`, otherwise `rtl_lps_enter`, whose
+`rtl_lps_enter_core` gates are fwctrl_lps, `cnt_after_linked >= 5`, an
+associated station and no `being_setkey` (RSNA port open, no handshake
+frame outstanding). The data path also requests a leave when a pass
+crosses the busy threshold (`_rtl_pci_rx_interrupt`/`_rtl_pci_tx_isr`)
+and holds EAPOL/ARP/DHCP TX until the firmware is awake
+(`rtl_is_special_data`). The `busytraffic` 4-period average (>100
+frames/period) is subsumed: it can only be true when the per-period
+threshold already chose leave.
+
+`enter_leisure` is `_rtl88ee_fwlps_enter` with `low_power_enable = false`
+(`rtl88e_init_sw_vars`): H2C SETPWRMODE 0x20 `[1, 0x10, 5, 0, 0]` (mode
+`FW_PS_DTIM_MODE` != 0, RLBM 0, smart_ps 1, `reg_max_lps_awakeintvl` 5,
+no U-APSD, `FW_PWR_STATE_RF_OFF`; `rtl88e_set_fw_pwrmode_cmd`), then
+`HW_VAR_SET_RPWM(FW_PS_STATE_RF_OFF_88E)` toggling `REG_PCIE_HRPWM` bit 7.
+`leave_leisure` is `_rtl88ee_fwlps_leave`: RPWM ALL_ON then SETPWRMODE
+`FW_PS_ACTIVE_MODE` `[0, 0x10, 5, 0, 0x0c]` (the existing `awake`). On
+this path RF_OFF_88E and ALL_ON_88E are both `FW_PS_CLOCK_ON`: registers
+and DMA stay live, no CPWM acknowledgement is awaited (only the
+low_power_enable clock-on path polls IMR_CPWM), and ordinary TX is still
+serviced. The firmware's Null/PS-Poll frames use the reserved pages
+already published by the join. `disconnect_station_peer` leaves LPS before
+the JOINBSSRPT report; `stop_packets` clears the state. A firmware that
+never consumes SETPWRMODE, or radio-off, is terminal like every other
+mailbox failure.
+
+Tests: `smoke_rtl8188ee_native_leisure_power_save_matches_linux_fwlps`
+(exact H2C/RPWM vectors, double enter/leave refusal, ring service while
+dozing, disconnect wake ordering, stuck mailbox and radio-off failure) and
+`smoke_rtl8188ee_native_device_leisure_policy_follows_linux_watchdog`
+(five-period gate, fwlps off, held DHCP wake, busy-RX leave, re-entry and
+disconnect wake on the composed Device).
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE
@@ -716,7 +795,7 @@ implemented and software-validated. Physical board qualification remains.
 | Correct BAR2/read-only EFUSE lifecycle and per-chip identity | Implemented; shared-path regressions |
 | Complete source-matched per-chip power/reset qualification | RTL8188EE PCI enable prefix/flow implemented; other families remain incomplete |
 | Authenticated image/header selection and runtime firmware loading | RTL8188EE retained probe owner implemented; other profiles missing |
-| DMA allocation/publication/quiesce, IRQ ownership, H2C/C2H | RTL8188EE retained DMA32 rings/LLT, one-shot polled service, terminal host delivery, demonstrated awake/keepalive/reserved-page/JOIN mailbox and terminal close/retention implemented. Reclamation/reset/recovery and optional IRQ/C2H expansion remain outside the initial profile |
+| DMA allocation/publication/quiesce, IRQ ownership, H2C/C2H | RTL8188EE retained DMA32 rings/LLT, one-shot polled service, terminal host delivery, demonstrated awake/keepalive/reserved-page/JOIN mailbox and terminal close/retention implemented. MSI interrupt delivery with W1C recognition (polling fallback) is implemented; reclamation/reset/recovery remain |
 | RF/BB tables, calibration, channel/power and rate control | RTL8188EE tables/retained1T IQK/LCK, static factory antenna, signed board/factory/regulatory legacy20 power, operational MAC and negotiated legacy peer/rate/filter integration implemented. Measured board envelope and silicon qualification remain; optional gain tracking is excluded by measured profile |
 | Scan, management RX/TX, authentication/association and WPA2 | Retained EE channel1 passive scan, Open MLME, shared WPA2/CCMP and exact M4 receipt implemented; Device/composition regressions pass native suites. Other matched chips remain missing |
 | Ethernet packet path and terminal TX completion ownership | EE same-owner native Device/Narf-Ring/stack and Open/WPA2 real-kernel DHCP/exact bidirectional IP fixtures pass software gates; actual board testing remains |
@@ -726,7 +805,7 @@ Per-chip remaining inventory uses Linux per-chip `sw.c` and radio/PCI ops:
 
 | Chip | Source hardware scope | Remaining native software |
 |---|---|---|
-| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, recipient BA/RX reorder, originator BA/TX A-MPDU and capture/publication epochs above. Remaining software: SGI20, HT40, adaptive rates, broader scan/channels, tracking/PM and reset/rejoin. Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
+| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, recipient BA/RX reorder, originator BA/TX A-MPDU and capture/publication epochs above. Remaining software: SGI20, HT40, adaptive rates, broader scan/channels, gain tracking, IPS and reset/rejoin (MSI delivery and fwlps leisure power save are implemented). Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
 | RTL8192CE family aliases / RTL8192EE |2.4GHz HT; CE aliases need exact RF-type qualification, including the8176/8188CE variant; EE is2T2R |Retained chip firmware/MAC/PHY/RF/calibration/power/packet/station chain, then full HT/QoS/lifecycle. The8179/8188EE HT path does not admit these IDs. |
 | RTL8192DE |Dual-band dual-MAC HT |Exact per-function reset/power/firmware/DMA/radio ownership and station chains, then bands/HT/QoS/lifecycle |
 | RTL8723AE/BE |2.4GHz1T1R HT with BT |Chip-specific retained chain, antenna/BT coexistence and HT/QoS/lifecycle |
