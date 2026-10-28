@@ -2294,6 +2294,22 @@ fn smoke_userspace_thread_group_live_count() -> TestResult {
         __test_thread_group_live_reset();
         return TestResult::Fail("untracked exit must stay on the single-thread fast path");
     }
+    // Distinct shards retain independent counts while both contribute to
+    // the global multithreaded-group fast-path counter.
+    const OTHER_PID: u64 = PID + 1;
+    thread_group_live_inc(PID);
+    thread_group_live_inc(OTHER_PID);
+    if thread_group_live_count(PID) != 2 || thread_group_live_count(OTHER_PID) != 2 {
+        __test_thread_group_live_reset();
+        return TestResult::Fail("thread groups on separate shards must count independently");
+    }
+    if thread_group_live_dec_state(OTHER_PID) != (false, true)
+        || thread_group_live_count(PID) != 2
+        || thread_group_live_count(OTHER_PID) != 1
+    {
+        __test_thread_group_live_reset();
+        return TestResult::Fail("retiring one shard must preserve other group accounting");
+    }
     __test_thread_group_live_reset();
     TestResult::Pass
 }

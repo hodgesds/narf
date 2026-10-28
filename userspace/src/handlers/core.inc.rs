@@ -15792,14 +15792,34 @@ pub(crate) fn release_exited_thread_task(pid: u64, tid: u64) {
 /// and reports `group_dead` on its sole exit. The last thread to
 /// decrement to zero is `group_dead` and runs the process-scoped exit
 /// observers exactly once (see `user_task::notify_task_exited`).
-static THREAD_GROUP_LIVE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+const THREAD_GROUP_LIVE_SHARDS: usize = 64;
 
-/// Number of keys in [`THREAD_GROUP_LIVE`]. Most workloads, including the
+#[repr(align(64))]
+struct ThreadGroupLiveShard {
+    groups: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>>,
+}
+
+impl ThreadGroupLiveShard {
+    const fn new() -> Self {
+        Self {
+            groups: narf_lib::sync::IrqSafeSpinLock::new(None),
+        }
+    }
+}
+
+static THREAD_GROUP_LIVE: [ThreadGroupLiveShard; THREAD_GROUP_LIVE_SHARDS] =
+    [const { ThreadGroupLiveShard::new() }; THREAD_GROUP_LIVE_SHARDS];
+
+#[inline]
+fn thread_group_live_shard(pid: u64) -> &'static ThreadGroupLiveShard {
+    &THREAD_GROUP_LIVE[(pid as usize) & (THREAD_GROUP_LIVE_SHARDS - 1)]
+}
+
+/// Number of keys across [`THREAD_GROUP_LIVE`]. Most workloads, including the
 /// stress-ng wait workers, contain only single-threaded fork children. Let
 /// those paths prove that no group expansion is possible with one atomic load
-/// instead of taking the global live-group lock and the pid↔task map lock on
-/// every wait/wake operation.
+/// instead of taking a shard lock and the pid↔task map lock on every
+/// wait/wake operation.
 static MULTITHREADED_GROUPS: AtomicUsize = AtomicUsize::new(0);
 
 #[inline]
@@ -15811,7 +15831,7 @@ fn has_multithreaded_groups() -> bool {
 /// implicit main thread counts as 1, so the first extra thread makes
 /// the tracked count 2; each subsequent thread adds one.
 pub fn thread_group_live_inc(pid: u64) {
-    let mut g = THREAD_GROUP_LIVE.lock();
+    let mut g = thread_group_live_shard(pid).groups.lock();
     let m = g.get_or_insert_with(BTreeMap::new);
     let new_group = !m.contains_key(&pid);
     let e = m.entry(pid).or_insert(1);
@@ -15829,7 +15849,7 @@ pub fn thread_group_live_inc(pid: u64) {
 /// tracked multi-threaded group. The second result lets exit cleanup avoid a
 /// process-registry lookup for ordinary single-threaded fork children.
 pub(crate) fn thread_group_live_dec_state(pid: u64) -> (bool, bool) {
-    let mut g = THREAD_GROUP_LIVE.lock();
+    let mut g = thread_group_live_shard(pid).groups.lock();
     let Some(m) = g.as_mut() else {
         return (true, false);
     };
@@ -15859,7 +15879,7 @@ pub fn thread_group_live_count(pid: u64) -> u64 {
     if !has_multithreaded_groups() {
         return 1;
     }
-    let g = THREAD_GROUP_LIVE.lock();
+    let g = thread_group_live_shard(pid).groups.lock();
     g.as_ref()
         .and_then(|m| m.get(&pid).copied())
         .map(|n| n as u64)
@@ -15870,7 +15890,9 @@ pub fn thread_group_live_count(pid: u64) -> u64 {
 /// Test-only: reset the live-thread accounting.
 #[doc(hidden)]
 pub fn __test_thread_group_live_reset() {
-    *THREAD_GROUP_LIVE.lock() = Some(BTreeMap::new());
+    for shard in &THREAD_GROUP_LIVE {
+        *shard.groups.lock() = Some(BTreeMap::new());
+    }
     MULTITHREADED_GROUPS.store(0, Ordering::Release);
 }
 

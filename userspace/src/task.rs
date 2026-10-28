@@ -28,6 +28,7 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
@@ -208,7 +209,7 @@ impl Task {
             poll_files: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             select_park: narf_lib::sync::IrqSafeSpinLock::new(None),
         });
-        TASKS.lock().insert(tid, t.clone());
+        task_registry_shard(tid).tasks.lock().insert(tid, t.clone());
         // /proc/[pid]/stat starttime source — every task (spawn, fork,
         // clone, the abi-test harness) registers exactly once, so this
         // is THE creation timestamp. Swept with the other per-task
@@ -291,8 +292,38 @@ impl core::fmt::Debug for Task {
 }
 
 /// The task registry — NARF's pid table. Holds ONE `Arc` per task
-/// from spawn to reap.
-static TASKS: IrqSafeSpinLock<BTreeMap<u64, Arc<Task>>> = IrqSafeSpinLock::new(BTreeMap::new());
+/// from spawn to reap. Point lookups, registration, and removal use one
+/// TGID-independent shard so parallel thread groups do not serialize on a
+/// single tree lock. Whole-registry readers visit shards in ascending order.
+const TASK_SHARD_COUNT: usize = 64;
+
+#[repr(align(64))]
+struct TaskShard {
+    tasks: IrqSafeSpinLock<BTreeMap<u64, Arc<Task>>>,
+}
+
+impl TaskShard {
+    const fn new() -> Self {
+        Self {
+            tasks: IrqSafeSpinLock::new(BTreeMap::new()),
+        }
+    }
+}
+
+static TASKS: [TaskShard; TASK_SHARD_COUNT] = [const { TaskShard::new() }; TASK_SHARD_COUNT];
+
+#[inline]
+fn task_registry_shard(tid: u64) -> &'static TaskShard {
+    &TASKS[(tid as usize) & (TASK_SHARD_COUNT - 1)]
+}
+
+fn task_registry_snapshot() -> Vec<Arc<Task>> {
+    let mut tasks = Vec::new();
+    for shard in &TASKS {
+        tasks.extend(shard.tasks.lock().values().cloned());
+    }
+    tasks
+}
 
 /// `get_task_struct`: resolve a tid to a live (or zombie) task,
 /// taking a reference. Safe to dereference after the registry lock is
@@ -308,11 +339,16 @@ static TASKS: IrqSafeSpinLock<BTreeMap<u64, Arc<Task>>> = IrqSafeSpinLock::new(B
 /// is simply skipped by the caller's own lookup, which matches the racy
 /// nature of the Linux syscall anyway.
 pub fn task_ids() -> alloc::vec::Vec<u64> {
-    TASKS.lock().keys().copied().collect()
+    let mut ids: Vec<u64> = task_registry_snapshot()
+        .into_iter()
+        .map(|task| task.tid)
+        .collect();
+    ids.sort_unstable();
+    ids
 }
 
 pub fn task_get(tid: u64) -> Option<Arc<Task>> {
-    TASKS.lock().get(&tid).cloned()
+    task_registry_shard(tid).tasks.lock().get(&tid).cloned()
 }
 
 /// Resolve `tid`, using the stackful task's cached owner when it names the
@@ -428,7 +464,7 @@ pub(crate) fn cache_effective_ids(tid: u64, uid: u32, gid: u32) {
 /// Reset the mirror alongside the test-only credential table reset.
 #[doc(hidden)]
 pub(crate) fn reset_effective_ids() {
-    for task in TASKS.lock().values() {
+    for task in task_registry_snapshot() {
         task.effective_ids.store(0, Ordering::Release);
     }
 }
@@ -460,18 +496,21 @@ pub(crate) fn inherit_process_group_id(parent: u64, child: u64, fallback: u64) {
 /// caller serializes this with `PGID_TABLE`; observing either the old or new
 /// atomic value during a concurrent syscall is a valid before/after result.
 pub(crate) fn set_process_group_id(leader: u64, pgid: u64) {
-    let tasks = TASKS.lock();
-    let Some(process_pid) = tasks
+    // Process-group membership changes are rare; lock every shard in one
+    // global order here to preserve the old all-tasks update boundary while
+    // allowing ordinary lookup/clone/reap to touch only one shard.
+    let tasks: [_; TASK_SHARD_COUNT] = core::array::from_fn(|i| TASKS[i].tasks.lock());
+    let Some(process_pid) = tasks[(leader as usize) & (TASK_SHARD_COUNT - 1)]
         .get(&leader)
         .map(|task| task.pid.load(Ordering::Acquire))
     else {
         return;
     };
-    let process_group_pid = tasks
+    let process_group_pid = tasks[(pgid as usize) & (TASK_SHARD_COUNT - 1)]
         .get(&pgid)
         .map(|task| task.pid.load(Ordering::Acquire))
         .unwrap_or(pgid);
-    for task in tasks.values() {
+    for task in tasks.iter().flat_map(|shard| shard.values()) {
         if task.pid.load(Ordering::Acquire) == process_pid {
             task.process_group_id.store(pgid, Ordering::Release);
             task.process_group_pid
@@ -483,7 +522,7 @@ pub(crate) fn set_process_group_id(leader: u64, pgid: u64) {
 /// Reset mirrored PGIDs alongside the test-only authoritative table reset.
 #[doc(hidden)]
 pub(crate) fn __test_reset_process_group_ids() {
-    for task in TASKS.lock().values() {
+    for task in task_registry_snapshot() {
         task.process_group_id.store(task.tid, Ordering::Release);
         task.process_group_pid
             .store(task.pid.load(Ordering::Acquire), Ordering::Release);
@@ -634,12 +673,13 @@ pub fn __test_reset_cpu_ns(tid: u64) {
 /// CPU-time sum: the task still exists until it is reaped, and Linux keeps
 /// it in the group list until `release_task`.
 pub fn thread_group_tids(pid: u64) -> alloc::vec::Vec<u64> {
-    let tasks = TASKS.lock();
-    tasks
-        .values()
+    let mut tids: Vec<u64> = task_registry_snapshot()
+        .into_iter()
         .filter(|task| task.pid.load(Ordering::Relaxed) == pid)
         .map(|task| task.tid)
-        .collect()
+        .collect();
+    tids.sort_unstable();
+    tids
 }
 
 /// Total CPU time (user + system) of thread group `pid`, in nanoseconds —
@@ -655,24 +695,26 @@ pub fn thread_group_tids(pid: u64) -> alloc::vec::Vec<u64> {
 /// contention, and the caller simply rechecks on the next tick; a limit
 /// measured in whole seconds does not care about a missed sample.
 pub(crate) fn thread_group_cpu_ns_try(pid: u64) -> Option<u64> {
-    let tasks = TASKS.try_lock()?;
-    Some(
-        tasks
+    let mut total = 0u64;
+    for shard in &TASKS {
+        let tasks = shard.tasks.try_lock()?;
+        total = tasks
             .values()
             .filter(|task| task.pid.load(Ordering::Relaxed) == pid)
-            .fold(0u64, |total, task| {
+            .fold(total, |total, task| {
                 total
                     .saturating_add(task.user_cpu_ns.load(Ordering::Relaxed))
                     .saturating_add(task.kernel_cpu_ns.load(Ordering::Relaxed))
-            }),
-    )
+            });
+    }
+    Some(total)
 }
 
 /// Non-blocking form for timer-trap callers (the unix-latency-trace
 /// diagnostics and the CPU-itimer tick check). `None` means registry lock
 /// contention; an absent task is a successful zero snapshot.
 pub(crate) fn cpu_times_try(tid: u64) -> Option<(u64, u64)> {
-    let tasks = TASKS.try_lock()?;
+    let tasks = task_registry_shard(tid).tasks.try_lock()?;
     Some(tasks.get(&tid).map_or((0, 0), |task| {
         (
             task.user_cpu_ns.load(Ordering::Relaxed),
@@ -853,7 +895,7 @@ fn dbg_profile_report() {
 #[cfg(feature = "unix-latency-trace")]
 pub fn dbg_proc_roster() {
     use core::fmt::Write as _;
-    let tasks: alloc::vec::Vec<Arc<Task>> = TASKS.lock().values().cloned().collect();
+    let tasks = task_registry_snapshot();
     for t in tasks {
         let pid = t.pid.load(Ordering::Relaxed);
         let cpu = crate::handlers::cpu_split_ns_try(t.tid);
@@ -943,7 +985,7 @@ pub fn dbg_proc_roster() {
 #[cfg(feature = "unix-latency-trace")]
 pub fn dbg_park_census(tag: &str) {
     use core::fmt::Write as _;
-    let tasks: alloc::vec::Vec<Arc<Task>> = TASKS.lock().values().cloned().collect();
+    let tasks = task_registry_snapshot();
     for t in tasks {
         let uc = &t.uctx;
         if !uc.parked_in_syscall.load(Ordering::Relaxed) {
@@ -1080,7 +1122,7 @@ pub fn dbg_park_snapshot() -> alloc::vec::Vec<(
     u64,  // epoll_wait_fd (biased +1; 0 = not in epoll_wait)
     bool, // has_signal_waker — can wake_signal actually rouse it?
 )> {
-    let tasks: alloc::vec::Vec<Arc<Task>> = TASKS.lock().values().cloned().collect();
+    let tasks = task_registry_snapshot();
     tasks
         .iter()
         .map(|t| {
@@ -1119,7 +1161,7 @@ pub fn dbg_park_snapshot() -> alloc::vec::Vec<(
 /// exactly like an idle desktop — every CPU halts, the stall watchdog's
 /// `runnable > 0` guard never trips, and nothing is ever reported.
 pub fn dbg_stranded_wakes() -> alloc::vec::Vec<(u64, u64, u32)> {
-    let tasks: alloc::vec::Vec<Arc<Task>> = TASKS.lock().values().cloned().collect();
+    let tasks = task_registry_snapshot();
     let mut out = alloc::vec::Vec::new();
     for t in tasks {
         if !t.uctx.parked_in_syscall.load(Ordering::Relaxed) {
@@ -1195,7 +1237,7 @@ pub type StrandedPollWaiter = (u64, u64, i32, u32, u64, u64, bool, bool, bool, u
 ///     about the same fd; frozen means the syscall never re-executes.
 ///     `park_checks` cannot answer this — it climbs in both cases.
 pub fn dbg_stranded_poll_waiters() -> alloc::vec::Vec<StrandedPollWaiter> {
-    let tasks: alloc::vec::Vec<Arc<Task>> = TASKS.lock().values().cloned().collect();
+    let tasks = task_registry_snapshot();
     let mut out = alloc::vec::Vec::new();
     for t in tasks {
         if !t.uctx.parked_in_syscall.load(Ordering::Relaxed) {
@@ -1362,7 +1404,7 @@ pub fn release_task(tid: u64) -> Option<Arc<Task>> {
     let _identity = crate::handlers::PID_TASK_MUTATION.lock();
     let owner = task_get(tid)?;
     let _binding = owner.rlimit_override.lock();
-    let removed = TASKS.lock().remove(&tid);
+    let removed = task_registry_shard(tid).tasks.lock().remove(&tid);
     // Every retained-target transaction takes this task's binding gate before
     // revalidating TASKS. Unregistration therefore needs no shared process
     // lock; siblings retain their own owners and may keep using their limits.
@@ -1377,11 +1419,12 @@ pub fn release_task(tid: u64) -> Option<Arc<Task>> {
 /// resolution (which locks the scheduler ready queues) — that nesting is the
 /// kind of lock-order inversion the rest of the tree is careful to avoid.
 pub fn snapshot_identities() -> alloc::vec::Vec<(u64, u64)> {
-    TASKS
-        .lock()
-        .values()
+    let mut identities: Vec<(u64, u64)> = task_registry_snapshot()
+        .into_iter()
         .map(|t| (t.tid, t.pid.load(Ordering::Relaxed)))
-        .collect()
+        .collect();
+    identities.sort_unstable_by_key(|(tid, _)| *tid);
+    identities
 }
 
 /// Visit every registered task's `(tid, pid)` in ascending TaskId order.
@@ -1397,15 +1440,25 @@ pub(crate) fn for_each_identity(mut visit: impl FnMut(u64, u64) -> bool) {
     loop {
         let mut batch = [(0u64, 0u64); BATCH];
         let mut len = 0;
-        {
-            let tasks = TASKS.lock();
-            let lower = after.map_or(core::ops::Bound::Unbounded, core::ops::Bound::Excluded);
+        let lower = after.map_or(core::ops::Bound::Unbounded, core::ops::Bound::Excluded);
+        for shard in &TASKS {
+            let tasks = shard.tasks.lock();
             for (&tid, task) in tasks
                 .range((lower, core::ops::Bound::Unbounded))
                 .take(BATCH)
             {
-                batch[len] = (tid, task.pid.load(Ordering::Relaxed));
-                len += 1;
+                let item = (tid, task.pid.load(Ordering::Relaxed));
+                let insert_at = batch[..len].partition_point(|existing| existing.0 < tid);
+                if insert_at == BATCH {
+                    continue;
+                }
+                if len < BATCH {
+                    len += 1;
+                }
+                if insert_at + 1 < len {
+                    batch.copy_within(insert_at..len - 1, insert_at + 1);
+                }
+                batch[insert_at] = item;
             }
         }
         for &(tid, pid) in &batch[..len] {

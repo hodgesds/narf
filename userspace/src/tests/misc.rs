@@ -2362,6 +2362,44 @@ kernel_test_in!(
     smoke_userspace_exited_pthread_does_not_remain_zombie
 );
 
+fn smoke_userspace_task_registry_shards_preserve_lookup_and_iteration() -> TestResult {
+    const PID: u64 = 70_201;
+    const TID_A: u64 = 70_211;
+    const TID_B: u64 = TID_A + 1;
+
+    let _a = crate::task::Task::new_registered(TID_A, PID);
+    let _b = crate::task::Task::new_registered(TID_B, PID);
+    let lookups = crate::task::task_get(TID_A).is_some() && crate::task::task_get(TID_B).is_some();
+    let group_tids = crate::task::thread_group_tids(PID);
+    let all_ids = crate::task::task_ids();
+    let identities = crate::task::snapshot_identities();
+    let iteration = group_tids == [TID_A, TID_B]
+        && all_ids.windows(2).all(|pair| pair[0] < pair[1])
+        && identities.windows(2).all(|pair| pair[0].0 < pair[1].0)
+        && identities
+            .iter()
+            .any(|&(tid, pid)| tid == TID_A && pid == PID)
+        && identities
+            .iter()
+            .any(|&(tid, pid)| tid == TID_B && pid == PID);
+
+    let removed_a = crate::task::release_task(TID_A).is_some();
+    let removed_b = crate::task::release_task(TID_B).is_some();
+    if !lookups || !iteration || !removed_a || !removed_b {
+        return TestResult::Fail(
+            "sharded task registry lost lookup, ordered iteration, or removal",
+        );
+    }
+    if crate::task::task_get(TID_A).is_some() || crate::task::task_get(TID_B).is_some() {
+        return TestResult::Fail("task removal left an entry visible in its registry shard");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_userspace_task_registry_shards_preserve_lookup_and_iteration
+);
+
 kernel_test_in!("userspace", smoke_userspace_futex_park_word_revalidation);
 
 /// The io-waiter LATCH closes the scan->register lost-wake race precisely: a
