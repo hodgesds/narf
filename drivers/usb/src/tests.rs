@@ -7449,8 +7449,9 @@ kernel_test_in!("drivers/usb/uvc", smoke_uvc_streamon_generation_toggle);
 use crate::msc::{BotTransport, MscError};
 use crate::xhci::XhciError;
 use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
-use narf_lib::sync::IrqSafeSpinLock;
+// `Vec` and `IrqSafeSpinLock` are already imported at module scope
+// by the UVC section above; `use` bindings cover the whole module,
+// so re-importing them here is a duplicate-import error.
 
 /// Fixed-format sense data (SPC-4 §4.5): response code 0x70 in
 /// byte 0, sense key in the low nibble of byte 2, additional

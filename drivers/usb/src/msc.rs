@@ -263,12 +263,12 @@ pub trait BotTransport {
     /// idle-suspended it (#840). Production delegates to
     /// `attach::resume_port`; fixtures have no hub topology and
     /// take the no-op default.
-    fn resume_hub_port(&self, hub_port: Option<(usize, u8)>) -> impl Future<Output = ()> {
+    fn resume_hub_port(&self, _hub_port: Option<(usize, u8)>) -> impl Future<Output = ()> {
         async {}
     }
     /// Feed the hub idle-suspend activity timer after a completed
     /// transfer (#840). No-op by default, as above.
-    fn note_hub_activity(&self, hub_port: Option<(usize, u8)>) {}
+    fn note_hub_activity(&self, _hub_port: Option<(usize, u8)>) {}
 }
 
 impl BotTransport for Xhci {
