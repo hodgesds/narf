@@ -341,10 +341,18 @@ fn handle_hkey_notify_aml(_target: &str, value: u64) {
 /// Reference: `thinkpad_acpi.c::tpacpi_acpi_driver_init()` — installs
 /// the notify handler for each HKEY HID variant.
 pub fn init() {
+    let mut found = false;
     for hid in &["LEN0268", "IBM0068", "LEN0018"] {
         for dev in narf_aml::find_all_devices_by_hid(hid) {
             narf_aml::sync::register_notify_handler(&dev.path, handle_hkey_notify_aml);
+            found = true;
         }
+    }
+    if found {
+        // An HKEY device is present, so the EC fan behind `\HFNF`
+        // is too: expose it as a CoolingDevice so the thermal
+        // governor can drive it (#911).
+        crate::fan::register_thinkpad_fan();
     }
 }
 

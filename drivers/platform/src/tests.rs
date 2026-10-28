@@ -209,6 +209,15 @@ fn fx_name_zero(seg: &[u8; 4]) -> alloc::vec::Vec<u8> {
     v
 }
 
+/// NameString `\SEG` (root + one NameSeg).
+fn fx_ref1(seg: &[u8; 4]) -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let mut v = Vec::new();
+    v.push(b'\\');
+    v.extend_from_slice(seg);
+    v
+}
+
 /// NameString `\A.B` (root + DualNamePrefix + two segs).
 fn fx_ref2(a: &[u8; 4], b: &[u8; 4]) -> alloc::vec::Vec<u8> {
     use alloc::vec::Vec;
@@ -460,6 +469,170 @@ fn smoke_thermal_loop_end_to_end() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/platform/thermal", smoke_thermal_loop_end_to_end);
+
+// ── #911: vendor fan CoolingDevice fixtures ──────────────────────
+//
+// The vendor laptop fan controls (ThinkPad `\HFNF`, ASUS fan
+// boost) are CoolingDevices as of this lane; these fixtures drive
+// them through the real governor (registry + StepPolicy) and
+// observe the vendor wire writes in fixture firmware, in the
+// fx_zone99_fan9 idiom: the expected values are the vendor
+// protocols' own (thinkpad_acpi.c fan levels 0..=7 + full-speed;
+// asus-wmi.c DEVID_FAN_BOOST 0x00110018 with mode values
+// 0/1/2 via DEVS, method id 1), never what the wrapper computes.
+
+/// Root-level ThinkPad fan fixture: `Name(HFNL, 0xAA)` +
+/// `Method(HFNF, 1) { Store(Arg0, \HFNL) }` — the root-method
+/// shape of the real ThinkPad surface `set_fan_level` writes.
+/// 0xAA is a sentinel the vendor ladder can never produce (its
+/// values are 0..=7 and 255), so "never written" is observable.
+fn fx_hfnf() -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&fx_name_byte(b"HFNL", 0xAA));
+    let mut body = Vec::new();
+    body.push(0x70); // StoreOp
+    body.push(0x68); // Arg0
+    body.extend_from_slice(&fx_ref1(b"HFNL"));
+    blob.extend_from_slice(&fx_method(b"HFNF", 1, &body));
+    blob
+}
+
+fn smoke_thinkpad_fan_governor_drives_hfnf() -> TestResult {
+    let blob = fx_hfnf();
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("fixture HFNF parse failed");
+    }
+    if fx_name_int("\\HFNL") != Some(0xAA) {
+        return TestResult::Fail("fixture HFNL sentinel missing");
+    }
+    crate::thinkpad_acpi::__test_reset();
+    ensure_thermal_registry();
+    let cap = narf_power::bootstrap_thermal_authority();
+    if narf_power::thermal::install_active_cooling(&cap, narf_power::thermal::StepPolicy).is_err() {
+        return TestResult::Fail("install_active_cooling rejected a live cap");
+    }
+    // The production registration path (thinkpad_acpi::init calls
+    // this once an HKEY device is found).
+    crate::fan::register_thinkpad_fan();
+    let zone = match narf_power::thermal::register_zone(&cap, "TZTP", 70_000, 90_000) {
+        Ok(id) => id,
+        Err(_) => return TestResult::Fail("register_zone rejected a live cap"),
+    };
+
+    // No crossing yet → no actuation.
+    let _ = narf_power::thermal::record_temp(zone, 40_000);
+    if fx_name_int("\\HFNL") != Some(0xAA) {
+        return TestResult::Fail("HFNF written before any crossing");
+    }
+    // Warm → StepPolicy 128 → ThinkPad ladder L5 on the wire.
+    let _ = narf_power::thermal::record_temp(zone, 75_000);
+    if fx_name_int("\\HFNL") != Some(5) {
+        return TestResult::Fail("Warm crossing did not write HFNF level 5");
+    }
+    // Critical → 255 → FullSpeed (255 on the wire).
+    let _ = narf_power::thermal::record_temp(zone, 95_000);
+    if fx_name_int("\\HFNL") != Some(255) {
+        return TestResult::Fail("Critical crossing did not write HFNF full-speed");
+    }
+    // Normal → 0 → Auto (0 on the wire: firmware control).
+    let _ = narf_power::thermal::record_temp(zone, 50_000);
+    if fx_name_int("\\HFNL") != Some(0) {
+        return TestResult::Fail("Normal crossing did not write HFNF auto");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/thermal",
+    smoke_thinkpad_fan_governor_drives_hfnf
+);
+
+/// Fixture ASUS WMI device: Names LSTM/LSTD/LSTC (sentinel 0xEE)
+/// and `Method(WMAA, 4)` recording the WMI mapper's arguments —
+/// Arg1 (method id) → LSTM, Arg2 (devid) → LSTD, Arg3 (ctrl) →
+/// LSTC — then `Return(0)`. Paired with `__test_install_guid` for
+/// the ASUS WMI GUID it models the ATKD method surface that
+/// `asus_wmi::set_devstate` invokes. 0xEE never occurs in the
+/// recorded values (method id 1, devid 0x00110018, ctrl 0..=2),
+/// so "never written" is observable.
+fn fx_atk9() -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let mut inside = Vec::new();
+    inside.extend_from_slice(&fx_name_byte(b"LSTM", 0xEE));
+    inside.extend_from_slice(&fx_name_byte(b"LSTD", 0xEE));
+    inside.extend_from_slice(&fx_name_byte(b"LSTC", 0xEE));
+    let mut body = Vec::new();
+    for (arg, name) in [(0x69u8, b"LSTM"), (0x6Au8, b"LSTD"), (0x6Bu8, b"LSTC")] {
+        body.push(0x70); // StoreOp
+        body.push(arg);
+        body.extend_from_slice(&fx_ref2(b"ATK9", name));
+    }
+    body.push(0xA4); // ReturnOp
+    body.push(0x00); // ZeroOp
+    inside.extend_from_slice(&fx_method(b"WMAA", 4, &body));
+    fx_wrap(0x82, b"ATK9", &inside)
+}
+
+fn smoke_asus_fan_governor_drives_fan_boost() -> TestResult {
+    let blob = fx_atk9();
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("fixture ATK9 parse failed");
+    }
+    let guid = match crate::wmi_vendors::guid_str_to_bytes(crate::asus_wmi::ASUS_WMI_GUID) {
+        Some(g) => g,
+        None => return TestResult::Fail("ASUS WMI GUID did not encode"),
+    };
+    narf_aml::wmi::__test_install_guid(guid, "\\ATK9", *b"AA");
+    if fx_name_int("\\ATK9.LSTC") != Some(0xEE) {
+        return TestResult::Fail("fixture ATK9 sentinel missing");
+    }
+    crate::asus_wmi::__test_reset();
+    ensure_thermal_registry();
+    let cap = narf_power::bootstrap_thermal_authority();
+    if narf_power::thermal::install_active_cooling(&cap, narf_power::thermal::StepPolicy).is_err() {
+        return TestResult::Fail("install_active_cooling rejected a live cap");
+    }
+    // The production registration path (asus_wmi::init calls this
+    // when the ASUS WMI GUID is present).
+    crate::fan::register_asus_fan();
+    let zone = match narf_power::thermal::register_zone(&cap, "TZAS", 70_000, 90_000) {
+        Ok(id) => id,
+        Err(_) => return TestResult::Fail("register_zone rejected a live cap"),
+    };
+
+    // No crossing yet → no actuation.
+    let _ = narf_power::thermal::record_temp(zone, 40_000);
+    if fx_name_int("\\ATK9.LSTC") != Some(0xEE) {
+        return TestResult::Fail("fan boost written before any crossing");
+    }
+    // Warm → StepPolicy 128 → Normal: a DEVS call (method id 1)
+    // carrying DEVID_FAN_BOOST (0x00110018) with ctrl 0.
+    let _ = narf_power::thermal::record_temp(zone, 75_000);
+    if fx_name_int("\\ATK9.LSTM") != Some(1) {
+        return TestResult::Fail("fan boost write did not use DEVS (method id 1)");
+    }
+    if fx_name_int("\\ATK9.LSTD") != Some(0x0011_0018) {
+        return TestResult::Fail("fan boost write carried the wrong devid");
+    }
+    if fx_name_int("\\ATK9.LSTC") != Some(0) {
+        return TestResult::Fail("Warm crossing did not set fan boost Normal");
+    }
+    // Critical → 255 → Overboost (ctrl 1).
+    let _ = narf_power::thermal::record_temp(zone, 95_000);
+    if fx_name_int("\\ATK9.LSTC") != Some(1) {
+        return TestResult::Fail("Critical crossing did not set fan boost Overboost");
+    }
+    // Normal → 0 → Silent (ctrl 2).
+    let _ = narf_power::thermal::record_temp(zone, 50_000);
+    if fx_name_int("\\ATK9.LSTC") != Some(2) {
+        return TestResult::Fail("Normal crossing did not set fan boost Silent");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/thermal",
+    smoke_asus_fan_governor_drives_fan_boost
+);
 
 fn smoke_ec_sci_dispatch_notifies_subscribers() -> TestResult {
     use crate::ec;
