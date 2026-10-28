@@ -164,6 +164,29 @@ struct RxBa {
     timeout_tu: u16,
     last_rx: u64,
 }
+/// mac80211 `sta_info.h` originator retry policy and `ADDBA_RESP_INTERVAL`.
+const HT_AGG_MAX_RETRIES: u8 = 15;
+const HT_AGG_BURST_RETRIES: u8 = 3;
+const HT_AGG_RETRIES_PERIOD_MS: u64 = 15_000;
+const ADDBA_RESP_INTERVAL_MS: u64 = 1000;
+/// `rtl_tx_status` -> `ieee80211_start_tx_ba_session(sta, tid, 5000)`.
+const TX_BA_TIMEOUT_TU: u16 = 5000;
+/// `_rtl_tx_aggr_check`: `cnt_after_linked < 3` with the 2 s
+/// `RTL_WATCH_DOG_TIME` watchdog incrementing it once per period.
+const TX_BA_LINK_SETTLE_MS: u64 = 3 * 2000;
+/// `WLAN_REASON_QSTA_NOT_USE`: DELBA for a local originator stop.
+const REASON_NOT_USE: u16 = 37;
+/// One originator BA session (mac80211 `tid_ampdu_tx` plus rtlwifi
+/// `rtl_tid_data.agg.agg_state`). `rtl_tx_agg_start` returns
+/// `IEEE80211_AMPDU_TX_START_IMMEDIATE` and `rtl_tx_agg_oper`/`_stop` only
+/// record the state, so no device access accompanies a transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TxBa {
+    /// ADDBA Request queued; `ADDBA_RESP_INTERVAL` runs to `deadline`.
+    Requested { token: u8, deadline: u64 },
+    /// RTL_AGG_OPERATIONAL: QoS DATA on the TID carries TXD AGG_EN.
+    Operational { timeout_tu: u16, last_tx: u64 },
+}
 fn action_header(peer: [u8; 6], own: [u8; 6]) -> Vec<u8> {
     let mut header = vec![0xd0, 0, 0, 0];
     header.extend_from_slice(&peer);
@@ -262,6 +285,16 @@ pub(super) struct State {
     rx_ba: [Option<RxBa>; 8],
     /// mac80211 `ampdu_mlme.unexpected_agg`: one DELBA per TID.
     unexpected_ba: u16,
+    /// Originator BA sessions by TID with mac80211 retry bookkeeping.
+    tx_ba: [Option<TxBa>; 8],
+    tx_token: u8,
+    addba_req_num: [u8; 8],
+    last_addba_req: [u64; 8],
+    /// TIDs left at RTL_AGG_PROGRESS after mac80211 refused a start
+    /// (-EBUSY): `_rtl_tx_aggr_check` never retries them on this link.
+    tx_ba_stuck: u8,
+    /// Time the association completed (`MAC80211_LINKED`).
+    linked_at: Option<u64>,
 }
 impl State {
     pub(super) fn new() -> Self {
@@ -296,6 +329,12 @@ impl State {
             retire: None,
             rx_ba: Default::default(),
             unexpected_ba: 0,
+            tx_ba: [None; 8],
+            tx_token: 0,
+            addba_req_num: [0; 8],
+            last_addba_req: [0; 8],
+            tx_ba_stuck: 0,
+            linked_at: None,
         }
     }
     fn fail(&mut self) {
@@ -337,6 +376,144 @@ impl State {
             }
         }
         self.unexpected_ba = 0;
+        self.tx_ba = [None; 8];
+        self.addba_req_num = [0; 8];
+        self.last_addba_req = [0; 8];
+        self.tx_ba_stuck = 0;
+        self.linked_at = None;
+    }
+    /// TXD aggregation facts for one frame: (peer density, operational).
+    /// `rtl8188ee_tx_fill_desc` sets the station's density and, for an
+    /// `IEEE80211_TX_CTL_AMPDU` frame, AGG_EN + MAX_AGG_NUM.
+    fn aggregate(&mut self, bytes: &[u8], now: u64) -> Option<(u8, bool)> {
+        let profile = self.ht_profile?;
+        if bytes.first() != Some(&0x88) || bytes.len() < 26 {
+            return None;
+        }
+        let tid = usize::from(bytes[24] & 7);
+        let operational = match &mut self.tx_ba[tid] {
+            Some(TxBa::Operational { last_tx, .. }) => {
+                *last_tx = now;
+                true
+            }
+            _ => false,
+        };
+        Some((profile.peer_mpdu_density(), operational))
+    }
+    /// `rtl_tx_status` on a delivered QoS DATA frame (never EAPOL):
+    /// `_rtl_tx_aggr_check` then `ieee80211_start_tx_ba_session`, which
+    /// mac80211 refuses beyond HT_AGG_BURST_RETRIES within
+    /// HT_AGG_RETRIES_PERIOD or HT_AGG_MAX_RETRIES. The immediate start sends
+    /// the ADDBA Request (`ieee80211_send_addba_request`: SUPPORTS_AMSDU_IN_
+    /// AMPDU A-MSDU bit, immediate policy, window IEEE80211_MAX_AMPDU_BUF_HT,
+    /// timeout 5000 TU, SSN = the TID's next sequence).
+    fn tx_status(&mut self, bytes: &[u8], now: u64, own: [u8; 6]) -> Result<(), Error> {
+        if self.ht_profile.is_none() || bytes.first() != Some(&0x88) || bytes.len() < 26 {
+            return Ok(());
+        }
+        let tid = bytes[24] & 7;
+        let i = usize::from(tid);
+        if self.tx_ba[i].is_some()
+            || self.tx_ba_stuck & (1 << tid) != 0
+            || self
+                .linked_at
+                .is_none_or(|at| now < at.saturating_add(TX_BA_LINK_SETTLE_MS))
+        {
+            return Ok(());
+        }
+        let tries = self.addba_req_num[i];
+        if tries > HT_AGG_MAX_RETRIES
+            || tries > HT_AGG_BURST_RETRIES
+                && now < self.last_addba_req[i].saturating_add(HT_AGG_RETRIES_PERIOD_MS)
+        {
+            self.tx_ba_stuck |= 1 << tid;
+            return Ok(());
+        }
+        let peer = self
+            .candidate
+            .as_ref()
+            .map(|c| c.bss.bssid)
+            .ok_or(Error::State)?;
+        if self.controls.len() == 8 {
+            return Err(Error::Allocation);
+        }
+        let ssn = match &self.security {
+            Some(security) => security.next_qos_sequence(tid).map_err(Error::Security)?,
+            None => self.qos_sequence[i],
+        };
+        self.tx_token = self.tx_token.wrapping_add(1);
+        let token = self.tx_token;
+        let mut request = action_header(peer, own);
+        request.extend_from_slice(&[3, 0, token]);
+        request
+            .extend_from_slice(&(1 | 2 | u16::from(tid) << 2 | BA_MAX_WINDOW << 6).to_le_bytes());
+        request.extend_from_slice(&TX_BA_TIMEOUT_TU.to_le_bytes());
+        request.extend_from_slice(&((ssn & 4095) << 4).to_le_bytes());
+        self.controls.push_back(request);
+        self.last_addba_req[i] = now;
+        self.addba_req_num[i] = tries.saturating_add(1);
+        self.tx_ba[i] = Some(TxBa::Requested {
+            token,
+            deadline: now.saturating_add(ADDBA_RESP_INTERVAL_MS),
+        });
+        Ok(())
+    }
+    /// `ieee80211_process_addba_resp`: only the outstanding dialog token is
+    /// matched; success with a nonzero window makes the TID operational
+    /// (`rtl_tx_agg_oper`), anything else stops it without a DELBA
+    /// (AGG_STOP_DECLINED -> `rtl_tx_agg_stop`, RTL_AGG_STOP).
+    fn addba_response(&mut self, token: u8, status: u16, p: u16, timeout: u16, now: u64) {
+        let tid = usize::from((p >> 2) & 15);
+        if tid >= 8 {
+            return;
+        }
+        let Some(TxBa::Requested {
+            token: outstanding, ..
+        }) = self.tx_ba[tid]
+        else {
+            return;
+        };
+        if outstanding != token {
+            return;
+        }
+        self.tx_ba[tid] = if status == 0 && p >> 6 != 0 {
+            self.addba_req_num[tid] = 0;
+            Some(TxBa::Operational {
+                timeout_tu: timeout,
+                last_tx: now,
+            })
+        } else {
+            None
+        };
+    }
+    /// `sta_addba_resp_timer_expired` and `sta_tx_agg_session_timer_expired`
+    /// stop as a local request: initiator DELBA `WLAN_REASON_QSTA_NOT_USE`.
+    fn service_tx_ba(&mut self, now: u64, peer: [u8; 6], own: [u8; 6]) -> Result<(), Error> {
+        for tid in 0..8u16 {
+            let expired = match self.tx_ba[usize::from(tid)] {
+                Some(TxBa::Requested { deadline, .. }) => now >= deadline,
+                Some(TxBa::Operational {
+                    timeout_tu,
+                    last_tx,
+                }) => {
+                    timeout_tu != 0
+                        && now.saturating_sub(last_tx) >= u64::from(timeout_tu) * 1024 / 1000
+                }
+                None => false,
+            };
+            if expired {
+                self.tx_ba[usize::from(tid)] = None;
+                if self.controls.len() == 8 {
+                    return Err(Error::Allocation);
+                }
+                let mut frame = action_header(peer, own);
+                frame.extend_from_slice(&[3, 2]);
+                frame.extend_from_slice(&(tid << 12 | 1 << 11).to_le_bytes());
+                frame.extend_from_slice(&REASON_NOT_USE.to_le_bytes());
+                self.controls.push_back(frame);
+            }
+        }
+        Ok(())
     }
     /// mac80211 `__ieee80211_start_rx_ba_session`; returns (status, TID, window).
     fn addba_request(
@@ -404,6 +581,7 @@ impl State {
             .as_ref()
             .map(|c| c.bss.bssid)
             .ok_or(Error::State)?;
+        self.service_tx_ba(now, peer, own)?;
         for tid in 0..8u16 {
             let Some(session) = self.rx_ba[usize::from(tid)].as_mut() else {
                 continue;
@@ -872,11 +1050,16 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .ok_or(Error::Profile)?
             .clone();
         let ht = self.station.ht.clone();
+        let aggregate = if matches!(kind, Kind::Data) {
+            self.station.aggregate(&bytes, now)
+        } else {
+            None
+        };
         let mut publish = || {
             let op = || {
                 self.check_station_policy(environment)
                     .map_err(|_| RadioError::Power(super::super::channel_power::Error::Policy))?;
-                self.submit(&bytes, rate)
+                self.submit_aggregate(&bytes, rate, aggregate)
             };
             if let Some(ht) = &ht {
                 ht.invoke(op)
@@ -1022,6 +1205,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         ht.readback(&self.io, self.station.ht_indices, true)?;
                         self.packet.ht = true;
                     }
+                    self.station.linked_at = Some(environment.now_ms());
                     let base = self
                         .station
                         .calibration
@@ -1178,6 +1362,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     // A real host receipt is necessary but queued DMA must be
                     // copied under the still-closed capture generation first.
                     self.station.delivered_reply = Some(pending);
+                } else if matches!(pending.kind, Kind::Data) {
+                    let own = self.local().ok_or(Error::State)?;
+                    self.station.tx_status(&pending.bytes, now, own)?;
                 }
             }
         }
@@ -1270,15 +1457,25 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         response.extend_from_slice(&timeout.to_le_bytes());
                         self.station.controls.push_back(response);
                     }
-                    // ieee80211_process_delba from the originator.
+                    1 if bytes.len() >= 33 => {
+                        let token = bytes[26];
+                        let status = u16::from_le_bytes([bytes[27], bytes[28]]);
+                        let p = u16::from_le_bytes([bytes[29], bytes[30]]);
+                        let timeout = u16::from_le_bytes([bytes[31], bytes[32]]);
+                        self.station.addba_response(token, status, p, timeout, now);
+                    }
+                    // ieee80211_process_delba: initiator set tears down our
+                    // recipient session; clear ends our originator session
+                    // (AGG_STOP_PEER_REQUEST, no DELBA of our own).
                     2 if bytes.len() >= 30 => {
                         let p = u16::from_le_bytes([bytes[26], bytes[27]]);
+                        let tid = usize::from(p >> 12) & 7;
                         if p & (1 << 11) != 0 {
-                            if let Some(session) =
-                                self.station.rx_ba[usize::from(p >> 12) & 7].take()
-                            {
+                            if let Some(session) = self.station.rx_ba[tid].take() {
                                 session.reorder.retire();
                             }
+                        } else {
+                            self.station.tx_ba[tid] = None;
                         }
                     }
                     _ => {}

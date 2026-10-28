@@ -33,7 +33,7 @@ pub(super) fn request(
     h.update(&base.digest);
     h.update(super::fw::FW_8188EE.as_bytes());
     h.update(&firmware.digest);
-    h.update(b"EFUSE1b signed high nibble; BW40base16; pathA PG8-row groups; TXAGCe10/e14; unusede18/e1c0; BW603.2=1 BB800/900.0=0 RF18 preserveupper+c01; SIFS14 EDCA16+9*AIFSN; fixedTXD5c..13 LGI USE_RATE DISFB QOS TID0-7 AC rings/QSEL=TID noAGG; softwareCCMP CAM0 rawRX3839; bound HT45/61/WMM; ADDBA37 nativeOWN; noBA RTS CTS tracking PM");
+    h.update(b"EFUSE1b signed high nibble; BW40base16; pathA PG8-row groups; TXAGCe10/e14; unusede18/e1c0; BW603.2=1 BB800/900.0=0 RF18 preserveupper+c01; SIFS14 EDCA16+9*AIFSN; fixedTXD5c..13 LGI USE_RATE DISFB QOS TID0-7 AC rings/QSEL=TID; QoS DATA peer AMPDU_DENSITY, AGG_EN+MAX_AGG_NUM0x14 only on operational originator BA TID (rtl_tx_status start after cnt_after_linked3, timeout5000TU, noRTS); softwareCCMP CAM0 rawRX3839; bound HT45/61/WMM; ADDBA37 nativeOWN; noRTS CTS tracking PM");
     h.update(b"full static factory antenna/IQK/LCK/thermal0..63 supply envelope; all legacy+automaticresponse+decline and8MCS conducted peaks; no measured data supplied; exact capture/key/IPC/callback epochs");
     Request {
         name: format!(

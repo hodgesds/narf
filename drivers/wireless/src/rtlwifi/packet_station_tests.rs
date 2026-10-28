@@ -168,8 +168,8 @@ impl Peer {
             return Err("native AP peer identity");
         }
         if frame[0] == 0xd0 && self.ht.is_some() {
-            // Driver-owned BA actions: ADDBA Response (33) or DELBA (30).
-            if !(frame.len() == 33 && frame[24..26] == [3, 1]
+            // Driver-owned BA actions: ADDBA Request/Response (33) or DELBA (30).
+            if !(frame.len() == 33 && matches!(frame[24..26], [3, 0] | [3, 1])
                 || frame.len() == 30 && frame[24..26] == [3, 2])
             {
                 return Err("AP native BA action identity");

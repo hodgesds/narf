@@ -473,7 +473,7 @@ ready executable identity. It supplies no
 measured gain or radio permission. This continuation applies only to
 `10ec:8179`, channel1/2412MHz, one TX/RX stream, mandatory MCS0–7, long GI,
 response-bound WMM (classified TID0..7 on its AC ring) and Open or WPA2-PSK/software CCMP. It adds no SGI,
-HT40, LDPC/STBC, RTS/CTS protection, BA agreement, TX aggregation, extra AC,
+HT40, LDPC/STBC, RTS/CTS protection, extra AC,
 antenna tracking, PM or restart. Other matched chips cannot enter it.
 
 The optional signed file is
@@ -589,7 +589,7 @@ window0 selects64 (`rtl_rx_ampdu_apply` keeps `IEEE80211_MAX_AMPDU_BUF_HT`
 without BT limits), a repeated dialog token succeeds only with an unchanged
 timeout, a new token replaces the session. The response sets immediate policy
 and the A-MSDU bit, because rtlwifi sets `SUPPORTS_AMSDU_IN_AMPDU`; `packet.rs`
-publishes ADDBA Response and DELBA actions on the management ring with the
+publishes ADDBA Request/Response and DELBA actions on the management ring with the
 same terminal-receipt ownership as before.
 
 Native RXD DW1 PAGGR/FAGGR are now reported (`Mpdu::aggregated`) on the HT
@@ -611,7 +611,51 @@ literal response, out-of-order release, BAR release across a missing SN,
 timeout release, sessionless A-MPDU refusal and single DELBA, originator
 DELBA), `smoke_rtl8188ee_ht20_rx_ba_policy_and_inactivity_delba` and the
 updated `smoke_rtl8188ee_ht20_real_addba_response_terminal_receipt_and_cancelled_dma`
-cover the paths. TX aggregation/originator BA remain separate rows.
+cover the paths.
+
+#### Originator Block Ack and TX A-MPDU (implemented)
+
+rtlwifi starts originator sessions from its own rate-control `tx_status`
+(`rc.c::rtl_tx_status`): a delivered QoS DATA frame (not EAPOL) to an HT
+station passes `_rtl_tx_aggr_check` (not scanning, `cnt_after_linked >= 3`
+watchdog periods of `RTL_WATCH_DOG_TIME` 2 s after association, TID at
+RTL_AGG_STOP) and calls `ieee80211_start_tx_ba_session(sta, tid, 5000)`.
+`station.rs::tx_status` records the delivery after the terminal OWN receipt.
+mac80211 refuses a start beyond HT_AGG_BURST_RETRIES (3) within
+HT_AGG_RETRIES_PERIOD (15 s) or beyond HT_AGG_MAX_RETRIES (15); because
+rtlwifi had already moved the TID to RTL_AGG_PROGRESS, that TID is never
+retried on the current link (`tx_ba_stuck`), exactly as upstream.
+`rtl_tx_agg_start` returns `IEEE80211_AMPDU_TX_START_IMMEDIATE` and
+`rtl_tx_agg_oper`/`rtl_tx_agg_stop` only record `agg_state`, so no register
+or H2C access accompanies any transition. The ADDBA Request
+(`agg-tx.c::ieee80211_send_addba_request`) carries the A-MSDU bit
+(SUPPORTS_AMSDU_IN_AMPDU), immediate policy, window 64
+(IEEE80211_MAX_AMPDU_BUF_HT), timeout 5000 TU and SSN = the TID's next
+sequence (Open counter or shared `Security::next_qos_sequence`).
+`ieee80211_process_addba_resp` matches only the outstanding dialog token:
+status 0 with a nonzero window makes the TID operational with the response
+timeout, anything else stops it without DELBA (AGG_STOP_DECLINED). No
+response within ADDBA_RESP_INTERVAL (1 s) or an operational session idle past
+its timeout stops it as a local request with an initiator DELBA
+`WLAN_REASON_QSTA_NOT_USE`; a recipient DELBA stops it silently
+(AGG_STOP_PEER_REQUEST). Failure and disconnect drop every session and the
+retry bookkeeping.
+
+`rtl8188ee/trx.c::rtl88ee_tx_fill_desc` writes the station's
+`ht_cap.ampdu_density` into TXD DW2[22:20] and, for an
+`IEEE80211_TX_CTL_AMPDU` frame, DW2 AGG_EN (bit 12) and DW6 MAX_AGG_NUM 0x14
+(bits 15:11). `packet.rs::submit_aggregate` applies these to QoS DATA on the
+HT profile only (density is meaningless without AGG_EN, so management, EAPOL
+and non-QoS frames keep a zero field). `rts_enable` follows mac80211 rate
+flags, not aggregation, so A-MPDUs carry no RTS (row `rts_cts_protection`).
+Frames on a TID whose ADDBA is outstanding go out unaggregated instead of
+waiting on the stopped mac80211 TXQ; the peer receives them as ordinary
+MPDUs. The HT program binding (`ht.rs::request`) records the new emission
+profile, so an older signed NEHT record no longer matches. Smoke
+`smoke_rtl8188ee_ht20_originator_ba_and_tx_ampdu` (Open and WPA2) covers the
+link-settle gate, literal request, stale-token rejection, AGG_EN/density/
+MAX_AGG_NUM descriptor bits, peer DELBA, restart token, response-timeout
+DELBA, silent declines, the burst-retry park and teardown.
 
 RX originals capture controlled-port admission and a receive generation while
 the actual descriptor is copied. A terminal EAPOL TX receipt must additionally
@@ -682,7 +726,7 @@ Per-chip remaining inventory uses Linux per-chip `sw.c` and radio/PCI ops:
 
 | Chip | Source hardware scope | Remaining native software |
 |---|---|---|
-| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, recipient BA/RX reorder and capture/publication epochs above. Remaining software: SGI20, HT40, originator TX BA/aggregation, adaptive rates, broader scan/channels, tracking/PM and reset/rejoin. Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
+| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, recipient BA/RX reorder, originator BA/TX A-MPDU and capture/publication epochs above. Remaining software: SGI20, HT40, adaptive rates, broader scan/channels, tracking/PM and reset/rejoin. Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
 | RTL8192CE family aliases / RTL8192EE |2.4GHz HT; CE aliases need exact RF-type qualification, including the8176/8188CE variant; EE is2T2R |Retained chip firmware/MAC/PHY/RF/calibration/power/packet/station chain, then full HT/QoS/lifecycle. The8179/8188EE HT path does not admit these IDs. |
 | RTL8192DE |Dual-band dual-MAC HT |Exact per-function reset/power/firmware/DMA/radio ownership and station chains, then bands/HT/QoS/lifecycle |
 | RTL8723AE/BE |2.4GHz1T1R HT with BT |Chip-specific retained chain, antenna/BT coexistence and HT/QoS/lifecycle |

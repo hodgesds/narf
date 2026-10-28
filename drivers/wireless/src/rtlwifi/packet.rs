@@ -165,6 +165,8 @@ impl narf_wireless::station_security::RawFrame for Mpdu {
 
 const OWN: u32 = 1 << 31;
 const MAX_MPDU: usize = 2304;
+/// `rtl8188ee_tx_fill_desc`: `set_tx_desc_max_agg_num(pdesc, 0x14)`.
+const MAX_AGG_NUM: u32 = 0x14;
 
 fn queue(frame: &[u8], local: [u8; 6], qos: bool) -> Result<(usize, u16, u8), Error> {
     if !(24..=MAX_MPDU).contains(&frame.len()) || frame[10..16] != local || frame[22] & 15 != 0 {
@@ -179,7 +181,7 @@ fn queue(frame: &[u8], local: [u8; 6], qos: bool) -> Result<(usize, u16, u8), Er
             && (matches!((fc >> 4) & 15, 0 | 4 | 10 | 11 | 12)
                 || qos
                     && (fc >> 4) & 15 == 13
-                    && (frame.len() == 33 && frame[24..26] == [3, 1]
+                    && (frame.len() == 33 && matches!(frame[24..26], [3, 0] | [3, 1])
                         || frame.len() == 30 && frame[24..26] == [3, 2])) =>
         {
             // MGMT vector1, Linux MGNT_QUEUE6, QSLT_MGNT0x12.
@@ -481,8 +483,25 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// One outstanding native frame is retained across all active queues.
     /// A free descriptor alone cannot substitute a different pending payload.
     pub(crate) fn submit(&mut self, frame: &[u8], rate: u8) -> Result<u64, Error> {
+        self.submit_aggregate(frame, rate, None)
+    }
+    /// `submit` with `rtl8188ee_tx_fill_desc` aggregation fields for QoS
+    /// DATA to an HT station: `aggregate = (ampdu_density, ampdu)` sets
+    /// TXD DW2 AMPDU_DENSITY and, for an `IEEE80211_TX_CTL_AMPDU` frame,
+    /// DW2 AGG_EN + DW6 MAX_AGG_NUM 0x14.
+    pub(crate) fn submit_aggregate(
+        &mut self,
+        frame: &[u8],
+        rate: u8,
+        aggregate: Option<(u8, bool)>,
+    ) -> Result<u64, Error> {
         if self.phase != Phase::Running || self.packet.pending.is_some() {
             return Err(Error::State);
+        }
+        if aggregate.is_some_and(|(density, _)| density > 7)
+            || aggregate.is_some() && !(self.packet.ht && frame.first() == Some(&0x88))
+        {
+            return Err(Error::Packet);
         }
         if rate > 11
             && !(self.packet.ht && (12..=19).contains(&rate) && frame.first() == Some(&0x88))
@@ -526,6 +545,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if frame[0] == 0x88 {
             prefix[4] |= 1 << 6;
         } // EE TXD.QOS; host SSN retained.
+        if let Some((density, ampdu)) = aggregate {
+            prefix[2] |= u32::from(density) << 20;
+            if ampdu {
+                prefix[2] |= 1 << 12;
+                prefix[6] |= MAX_AGG_NUM << 11;
+            }
+        }
         prefix[5] = u32::from(rate) | (0x1f << 8) | (15 << 13);
         prefix[7] = frame.len() as u32;
         prefix[8] = address;

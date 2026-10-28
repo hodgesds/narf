@@ -198,8 +198,6 @@ rtlwifi	rx_amsdu_7935	7935-byte (MAX_AMSDU) RX A-MSDU with 9100-byte RX buffers;
 rtlwifi	safe_rejoin	Safe reassociation/rejoin; blocked on operating_reset/dma_reclamation (one association per firmware claim)	feature	drivers/wireless/specification/rtlwifi.md	685
 rtlwifi	sgi20	SGI20; blocked on a signed NEHT record covering SGI emissions (NEHT v1 binds LGI) and SGI RX admission	feature	drivers/wireless/specification/rtlwifi.md	685
 rtlwifi	system_suspend	System suspend; blocked on dma_reclamation/operating_reset (suspend/resume re-initializes the retained owner)	feature	drivers/wireless/specification/rtlwifi.md	679
-rtlwifi	tx_aggregation	TX aggregation; pending port of the rtl8xxxu originator template to rtl88ee TXD AGG_EN/AMPDU density plus rtl_tx_agg_start; also needs NEHT qualification of aggregated emissions	feature	drivers/wireless/specification/rtlwifi.md	476
-rtlwifi	tx_block_ack	Originator TX Block Ack; pending port of the rtl8xxxu originator BA state machine (agg-tx.c) to the EE station; depends on tx_aggregation descriptor fields	feature	drivers/wireless/specification/rtlwifi.md	685
 rtlwifi	vht	VHT operation including TX/RX STBC on RTL8821AE; blocked on the rtl8821ae runtime	feature	drivers/wireless/specification/rtlwifi.md	738
 rtlwifi	wowlan	WoWLAN magic-packet/pattern wake on RTL8821AE/8812AE; blocked on the rtl8821ae runtime and system_suspend	feature	drivers/wireless/specification/rtlwifi.md	764
 rtw88	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw88.md	1468
