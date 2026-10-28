@@ -557,3 +557,37 @@ kernel_test_in!(
     "drivers/wireless/rtw89/radio",
     smoke_rtw8852b_he_program_requires_ht_and_its_own_signed_identity
 );
+
+fn smoke_rtw8852b_repeat_flr_lifecycle_requires_its_own_signed_identity() -> TestResult {
+    let base = board();
+    let cap = authority();
+    let repeat = base.lifecycle(Lifecycle::Repeat);
+    let mut chain = narf_crypto::sha256::Sha256::new();
+    chain.update(
+        b"NARF RTL8852B repeat observed-FLR PCI lifecycle v1;SER-L2 reset or S3 resume;same boot",
+    );
+    chain.update(&base.identity());
+    if base.lifecycle(Lifecycle::Initial) != base
+        || repeat.identity() != chain.finalize()
+        || repeat.identity() == base.identity()
+        || repeat.wmm().identity() == base.wmm().identity()
+    {
+        return TestResult::Fail("repeat lifecycle identity is not a distinct frozen chain");
+    }
+    // An initial-lifecycle record never qualifies a reset/resumed generation.
+    if Qualification::from_verified(&image(base), Some([3; 32]), repeat, cap).is_ok() {
+        return TestResult::Fail("initial-lifecycle record qualified a repeat FLR lifecycle");
+    }
+    let Ok(granted) = Qualification::from_verified(&image(repeat), Some([3; 32]), repeat, cap)
+    else {
+        return TestResult::Fail("genuine repeat-lifecycle record rejected");
+    };
+    if !granted.matches(repeat) || granted.matches(base) {
+        return TestResult::Fail("repeat-lifecycle record matched the initial lifecycle");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/radio",
+    smoke_rtw8852b_repeat_flr_lifecycle_requires_its_own_signed_identity
+);

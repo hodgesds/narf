@@ -99,6 +99,8 @@ pub struct Native {
     dma_idle: Option<super::dma_stop::Idle>,
     /// Every published ring, buffer and packet was released after the proof.
     dma_reclaimed: bool,
+    /// Observed-FLR lifecycle that selects the signed radio identity.
+    lifecycle: super::radio_policy::Lifecycle,
 }
 /// Current-authority BAR/config adapter for the DMA-stop proof.
 struct StopPort<'a> {
@@ -261,6 +263,7 @@ impl Native {
             phycap_attempted: false,
             dma_idle: None,
             dma_reclaimed: false,
+            lifecycle: super::radio_policy::Lifecycle::Initial,
             gain_bases: None,
             radio_started: false,
             radio_shutdown: super::radio_shutdown::Shutdown::default(),
@@ -1075,6 +1078,10 @@ impl Native {
         self.armed = false;
         self.dma_reclaimed = true;
         released
+    }
+    /// Set by Startup from its reset fence before any radio identity use.
+    pub(super) fn set_lifecycle(&mut self, lifecycle: super::radio_policy::Lifecycle) {
+        self.lifecycle = lifecycle;
     }
     pub(super) fn dma_reclaimed(&self) -> bool {
         self.dma_reclaimed

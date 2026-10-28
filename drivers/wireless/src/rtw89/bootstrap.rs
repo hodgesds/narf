@@ -24,6 +24,8 @@ pub(super) enum Stage {
     Radio,
     WaitingAssets,
     Station,
+    /// Generation retired for system suspend; waits for resume.
+    Suspended,
     Terminal,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +51,8 @@ pub(super) struct Bootstrap {
     pinned: AtomicBool,
     /// Generations started after the first (SER L2-style resets).
     generation: AtomicU32,
+    /// System suspend requested; the supervisor parks instead of resetting.
+    suspended: AtomicBool,
 }
 static OWNER: IrqSafeSpinLock<Option<Arc<Bootstrap>>> = IrqSafeSpinLock::new(None);
 static RESERVED: AtomicBool = AtomicBool::new(false);
@@ -155,14 +159,32 @@ impl Bootstrap {
                 result.is_ok(),
                 self.removed.load(Ordering::Acquire),
                 reclaimed,
+                self.suspended.load(Ordering::Acquire),
                 generation,
             );
-            if action == Action::Stop {
+            if action == Action::Park {
+                // Linux `rtw89_ops_stop` without WoW: the generation is
+                // retired; resume restarts with a fresh FLR.
+                self.set_stage(Stage::Suspended);
+                while self.suspended.load(Ordering::Acquire)
+                    && !self.removed.load(Ordering::Acquire)
+                {
+                    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(10_000_000)).await;
+                }
+                if self.removed.load(Ordering::Acquire) {
+                    self.set_stage(Stage::Terminal);
+                    attempt.complete = true;
+                    return Err(Error::Cancelled);
+                }
+                narf_console::klog!("rtw8852b: resuming with a fresh FLR\n");
+            } else if action == Action::Stop {
                 self.set_stage(Stage::Terminal);
                 attempt.complete = result.is_ok();
                 return result;
             }
-            narf_console::klog!("rtw8852b: generation {} closed; resetting\n", generation);
+            if action == Action::Regenerate {
+                narf_console::klog!("rtw8852b: generation {} closed; resetting\n", generation);
+            }
             match self.rearm().await {
                 Some(kept) => name = kept.or(name),
                 None => {
@@ -215,7 +237,9 @@ impl Bootstrap {
         // SAFETY: the singleton reservation is still held, the previous
         // generation's DMA was proven stopped/reclaimed with BME off and no
         // producer remains; the reset still earns its own temporal fence.
-        let reset = unsafe { pci_reset::Reset::claim(self.device, self.authority) }.ok()?;
+        let reset = unsafe { pci_reset::Reset::claim(self.device, self.authority) }
+            .ok()?
+            .repeat();
         let mut slot = self.reset.lock().await;
         if self.removed.load(Ordering::Acquire) {
             return None;
@@ -285,7 +309,7 @@ impl Bootstrap {
             return Err(Error::Cancelled);
         }
         loop {
-            if shell.closed() {
+            if shell.closed() || self.suspended.load(Ordering::Acquire) {
                 terminalize(&shell, &lifecycle).await;
                 return Err(Error::Cancelled);
             }
@@ -354,6 +378,8 @@ impl Bootstrap {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
     Regenerate,
+    /// System suspend: hold the retired generation until resume.
+    Park,
     Stop,
 }
 /// Bound on generations per boot, so a station that keeps halting cannot
@@ -362,8 +388,22 @@ const MAX_GENERATIONS: u32 = 64;
 /// Regenerate only a generation that reached a started station, while the
 /// function is not being removed and its DMA was proven reclaimed. A startup
 /// failure before the station (missing assets, firmware, calibration) stops.
-fn supervise(reached_station: bool, removed: bool, reclaimed: bool, generation: u32) -> Action {
-    if reached_station && !removed && reclaimed && generation + 1 < MAX_GENERATIONS {
+/// A suspend parks any generation whose DMA was reclaimed, started or not.
+fn supervise(
+    reached_station: bool,
+    removed: bool,
+    reclaimed: bool,
+    suspended: bool,
+    generation: u32,
+) -> Action {
+    if suspended && !removed && reclaimed && generation + 1 < MAX_GENERATIONS {
+        Action::Park
+    } else if !suspended
+        && reached_station
+        && !removed
+        && reclaimed
+        && generation + 1 < MAX_GENERATIONS
+    {
         Action::Regenerate
     } else {
         Action::Stop
@@ -421,6 +461,68 @@ impl Bootstrap {
         let reclaimed = self.retire_generation().await;
         self.set_stage(Stage::Terminal);
         reclaimed
+    }
+}
+/// How long system suspend waits for the generation to retire.
+const SUSPEND_MS: u64 = 10_000;
+/// `rtw89_ops_stop` (no WoW) for system suspend: close the current
+/// generation and wait until the supervisor retired it behind the DMA proof
+/// and parked (or stopped). On timeout the request is withdrawn so the
+/// device stays usable, as `AsyncSystemPm::prepare_suspend` requires.
+async fn suspend_owner(
+    owner: &Bootstrap,
+    timeout_ms: u64,
+) -> Result<(), narf_power::device_pm::DevicePmError> {
+    let stage = owner.stage.load(Ordering::Acquire);
+    if stage == Stage::Terminal as u8 || !owner.running.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    owner.suspended.store(true, Ordering::Release);
+    let shell = {
+        let shell = owner.shell.lock();
+        shell.clone()
+    };
+    if let Some(shell) = shell {
+        shell.admission().close();
+    }
+    let deadline = narf_time::Deadline::after_ms(timeout_ms);
+    loop {
+        let stage = owner.stage.load(Ordering::Acquire);
+        if stage == Stage::Suspended as u8 || stage == Stage::Terminal as u8 {
+            return Ok(());
+        }
+        if deadline.expired() {
+            owner.suspended.store(false, Ordering::Release);
+            return Err(narf_power::device_pm::DevicePmError::Busy);
+        }
+        narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+    }
+}
+/// `rtw89_ops_start` after resume: release the parked supervisor, which
+/// claims a fresh FLR and restarts with the `Repeat` radio identity.
+fn resume_owner(owner: &Bootstrap) {
+    owner.suspended.store(false, Ordering::Release);
+}
+/// Async system-PM hook (the interrupt-gated `DevicePmOps` fan-out cannot
+/// await firmware/H2C or the DMA-stop retirement).
+pub(super) struct SystemPm;
+impl narf_power::system_pm::AsyncSystemPm for SystemPm {
+    fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            let owner = OWNER.lock().clone();
+            match owner {
+                Some(owner) => suspend_owner(&owner, SUSPEND_MS).await,
+                None => Ok(()),
+            }
+        })
+    }
+    fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            if let Some(owner) = OWNER.lock().clone() {
+                resume_owner(&owner);
+            }
+            Ok(())
+        })
     }
 }
 /// Release the singleton reservation only after proven reclamation. A
@@ -513,6 +615,7 @@ pub(super) fn probe(
         removed: AtomicBool::new(false),
         pinned: AtomicBool::new(false),
         generation: AtomicU32::new(0),
+        suspended: AtomicBool::new(false),
     });
     publish_owner(owner);
     Ok(())
@@ -576,6 +679,7 @@ pub(super) unsafe fn attach_cold(
         removed: AtomicBool::new(false),
         pinned: AtomicBool::new(false),
         generation: AtomicU32::new(0),
+        suspended: AtomicBool::new(false),
     });
     publish_owner(owner);
     Ok(())
@@ -635,6 +739,7 @@ mod tests {
             removed: AtomicBool::new(false),
             pinned: AtomicBool::new(false),
             generation: AtomicU32::new(0),
+            suspended: AtomicBool::new(false),
         });
         *OWNER.lock() = Some(owner.clone());
         if probe(device, authority).is_err() {
@@ -673,6 +778,7 @@ mod tests {
             removed: AtomicBool::new(false),
             pinned: AtomicBool::new(false),
             generation: AtomicU32::new(0),
+            suspended: AtomicBool::new(false),
         })
     }
     fn ready<T>(future: impl core::future::Future<Output = T>) -> Option<T> {
@@ -740,8 +846,8 @@ mod tests {
     fn smoke_rtw8852b_generation_supervisor_regenerates_only_proven_station_closures() -> TestResult
     {
         // Halted or disconnected started station with proven reclamation.
-        if supervise(true, false, true, 0) != Action::Regenerate
-            || supervise(true, false, true, MAX_GENERATIONS - 2) != Action::Regenerate
+        if supervise(true, false, true, false, 0) != Action::Regenerate
+            || supervise(true, false, true, false, MAX_GENERATIONS - 2) != Action::Regenerate
         {
             return TestResult::Fail("closed station with reclaimed DMA was not reset");
         }
@@ -751,7 +857,7 @@ mod tests {
             (true, false, false, 0),
             (true, false, true, MAX_GENERATIONS - 1),
         ] {
-            if supervise(reached, removed, reclaimed, generation) != Action::Stop {
+            if supervise(reached, removed, reclaimed, false, generation) != Action::Stop {
                 return TestResult::Fail(
                     "startup failure, removal, pinned DMA or generation bound regenerated",
                 );
@@ -769,6 +875,15 @@ mod tests {
         if ready(owner.retire_generation()) != Some(false) {
             return TestResult::Fail("pinned generation reported reclamation");
         }
+        // System suspend parks any reclaimed generation, never one with
+        // pinned DMA or a removed function; resume then regenerates.
+        if supervise(false, false, true, true, 0) != Action::Park
+            || supervise(true, false, true, true, 3) != Action::Park
+            || supervise(true, false, false, true, 0) != Action::Stop
+            || supervise(true, true, true, true, 0) != Action::Stop
+        {
+            return TestResult::Fail("suspend parking policy differed");
+        }
         // A removal racing a rearm stops it before any reset is stored.
         let owner = fixture(device(), None);
         owner.removed.store(true, Ordering::Release);
@@ -780,9 +895,45 @@ mod tests {
         }
         TestResult::Pass
     }
+    fn smoke_rtw8852b_system_suspend_waits_for_parked_generation_or_withdraws() -> TestResult {
+        use narf_power::device_pm::DevicePmError;
+        // No running supervisor: nothing to suspend.
+        let idle = fixture(device(), None);
+        idle.running.store(false, Ordering::Release);
+        if ready(suspend_owner(&idle, 0)) != Some(Ok(())) || idle.suspended.load(Ordering::Acquire)
+        {
+            return TestResult::Fail("idle owner suspend did not complete without a request");
+        }
+        // A supervisor that already parked the retired generation.
+        let parked = fixture(device(), None);
+        parked.set_stage(Stage::Suspended);
+        if ready(suspend_owner(&parked, 0)) != Some(Ok(()))
+            || !parked.suspended.load(Ordering::Acquire)
+        {
+            return TestResult::Fail("parked generation did not satisfy suspend");
+        }
+        resume_owner(&parked);
+        if parked.suspended.load(Ordering::Acquire) {
+            return TestResult::Fail("resume did not release the parked supervisor");
+        }
+        // A generation that never retires: suspend fails and withdraws its
+        // request so the device stays usable.
+        let busy = fixture(device(), None);
+        busy.set_stage(Stage::Station);
+        if ready(suspend_owner(&busy, 0)) != Some(Err(DevicePmError::Busy))
+            || busy.suspended.load(Ordering::Acquire)
+        {
+            return TestResult::Fail("unretired generation suspended or kept the request");
+        }
+        TestResult::Pass
+    }
     kernel_test_in!(
         "drivers/wireless/rtw89/bootstrap",
         smoke_rtw8852b_retained_probe_never_reparks_or_replaces_reset_owner
+    );
+    kernel_test_in!(
+        "drivers/wireless/rtw89/bootstrap",
+        smoke_rtw8852b_system_suspend_waits_for_parked_generation_or_withdraws
     );
     kernel_test_in!(
         "drivers/wireless/rtw89/bootstrap",

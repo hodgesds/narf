@@ -109,6 +109,7 @@ impl Fixture {
             phycap_attempted: false,
             dma_idle: None,
             dma_reclaimed: false,
+            lifecycle: super::super::radio_policy::Lifecycle::Initial,
         };
         Ok(Self { native, words })
     }

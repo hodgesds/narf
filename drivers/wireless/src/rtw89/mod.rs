@@ -194,6 +194,11 @@ pub const ALL_DEV_IDS: &[u16] = &[
 /// (one level up in `drivers/wireless/src/lib.rs`).
 pub fn register() {
     register_pci_driver();
+    // Linux `rtw89_pm_ops` + mac80211 stop/start; retirement is async.
+    narf_power::system_pm::register_async_system_pm(
+        "rtw89",
+        alloc::sync::Arc::new(bootstrap::SystemPm),
+    );
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

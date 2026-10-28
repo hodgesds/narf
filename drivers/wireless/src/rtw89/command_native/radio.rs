@@ -76,7 +76,8 @@ impl Native {
             let digest = if full {
                 let power = radio_power::Plan::from_assets(assets, identity.calibration().rfe_type)
                     .map_err(denied)?;
-                radio_policy::Board::new(
+                radio_policy::Board::new_for(
+                    self.lifecycle,
                     factory,
                     self.device.id,
                     assets,
@@ -99,7 +100,8 @@ impl Native {
                         radio_power::Plan::from_assets(assets, identity.calibration().rfe_type)
                             .map_err(denied)?;
                     Some(
-                        radio_policy::Board::new(
+                        radio_policy::Board::new_for(
+                            self.lifecycle,
                             factory,
                             self.device.id,
                             assets,
@@ -118,7 +120,8 @@ impl Native {
                         radio_power::Plan::from_assets(assets, identity.calibration().rfe_type)
                             .map_err(denied)?;
                     Some(
-                        radio_policy::Board::new(
+                        radio_policy::Board::new_for(
+                            self.lifecycle,
                             factory,
                             self.device.id,
                             assets,
@@ -218,7 +221,8 @@ impl Native {
             let plan = radio_power::Plan::from_assets(assets, identity.calibration().rfe_type)
                 .map_err(denied)?;
             let tracking = tssi::Tracking::from_assets(assets).map_err(denied)?;
-            let board = radio_policy::Board::new(
+            let board = radio_policy::Board::new_for(
+                self.lifecycle,
                 factory,
                 self.device.id,
                 assets,
@@ -266,7 +270,8 @@ impl Native {
         let plan = radio_power::Plan::from_assets(assets, identity.calibration().rfe_type)
             .map_err(denied)?;
         let tracking = tssi::Tracking::from_assets(assets).map_err(denied)?;
-        let board = radio_policy::Board::new(
+        let board = radio_policy::Board::new_for(
+            self.lifecycle,
             factory,
             self.device.id,
             assets,

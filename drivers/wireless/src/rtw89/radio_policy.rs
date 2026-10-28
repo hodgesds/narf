@@ -108,6 +108,18 @@ impl Program {
         hash.finalize()
     }
 }
+/// Which observed-FLR PCI lifecycle of this boot the radio runs in. The
+/// measured v2 qualification binds "one fresh PCI lifecycle": the first
+/// observed FLR after boot. Any later generation (SER L2-style reset or a
+/// resume from system suspend) repeats the FLR but follows an earlier
+/// operating generation or a platform power transition, so it carries its
+/// own identity and needs its own signed measured record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum Lifecycle {
+    #[default]
+    Initial,
+    Repeat,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Board {
     identity: [u8; 32],
@@ -158,6 +170,27 @@ impl Board {
     }
     pub fn identity(&self) -> [u8; 32] {
         self.identity
+    }
+    /// `Board::new` bound to the observed-FLR lifecycle. `Initial` keeps the
+    /// existing identity unchanged.
+    pub(super) fn new_for(
+        lifecycle: Lifecycle,
+        factory: &Factory,
+        device: narf_bus::DeviceId,
+        assets: &Assets,
+        power: &Plan,
+        phycap: &super::firmware_phycap::Receipt,
+    ) -> Result<Self, Error> {
+        Self::new(factory, device, assets, power, phycap).map(|board| board.lifecycle(lifecycle))
+    }
+    pub(super) fn lifecycle(mut self, lifecycle: Lifecycle) -> Self {
+        if lifecycle == Lifecycle::Repeat {
+            let mut h = narf_crypto::sha256::Sha256::new();
+            h.update(b"NARF RTL8852B repeat observed-FLR PCI lifecycle v1;SER-L2 reset or S3 resume;same boot");
+            h.update(&self.identity);
+            self.identity = h.finalize();
+        }
+        self
     }
     pub(super) fn wmm(self) -> Self {
         self.with_programs(Program::Wmm.flags())

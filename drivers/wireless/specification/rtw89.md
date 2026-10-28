@@ -1280,10 +1280,16 @@ fresh `pci_reset::Reset` (stored under the reset mutex after a removed
 check), so the next generation repeats the observed FLR, discovery,
 firmware, MAC/RX, full radio and station start on the same function and
 publishes a new shell under the same `wlan%d` name, ready to scan and
-associate again. Each generation is again one fresh PCI lifecycle after an
-observed FLR, which is exactly what `radio_policy::Board`'s signed identity
-binds, so the same measured qualification applies and no new identity is
-introduced. A generation that fails before the station, an unproven stop
+associate again. `radio_policy::Board` binds "one fresh PCI lifecycle", the
+first observed FLR after boot. Every later generation is claimed with
+`pci_reset::Reset::repeat`; its `Fence` carries `radio_policy::Lifecycle::Repeat`
+into `Startup` and `Native`, and `Board::new_for` chains the identity with
+"repeat observed-FLR PCI lifecycle v1". A reset or resumed generation
+therefore needs its own signed measured record (the operating programs
+chain on top of it as before); until one is installed it waits in
+`Stage::WaitingAssets` and logs the exact requested identity, exactly like a
+first boot without assets. An initial-lifecycle record never qualifies it.
+A generation that fails before the station, an unproven stop
 (the function is marked pinned and stays quarantined), removal or the bound
 stops the supervisor in `Stage::Terminal` as before.
 
@@ -1300,6 +1306,31 @@ implemented. Smokes:
 `smoke_rtw8852b_removal_retires_station_and_reclaims_behind_stop_proof`
 (the retirement step on an associated station, idle and busy DMA). The full
 FLR-to-station regeneration itself needs the physical function.
+
+### System suspend (no WoW)
+
+`rtw89::register` registers `bootstrap::SystemPm` with
+`narf_power::system_pm::register_async_system_pm`, the async hook ath10k
+also uses, because the interrupt-gated `DevicePmOps` fan-out cannot await
+the retirement. `prepare_suspend` follows Linux v7.2 mac80211
+`drv_stop` -> `rtw89_ops_stop` -> `rtw89_core_stop` (WoW not configured):
+it sets the suspend request and closes the shell admission; the supervisor
+(`generation` also checks the request between startup steps) retires the
+generation behind the DMA-stop proof and `supervise` returns `Park` for any
+reclaimed generation, started or not. The hook waits up to 10s for
+`Stage::Suspended` or `Stage::Terminal`; on timeout it withdraws the request
+and returns `Busy`, leaving the device usable as the async contract
+requires. `resume_from_suspend` (`rtw89_ops_start` -> `rtw89_core_start`)
+releases the parked supervisor, which claims a fresh `Reset::repeat` FLR
+(the second temporal FLR of the boot) and restarts discovery, firmware,
+radio and station under the `Repeat` radio identity described above.
+Removal while parked stops the supervisor. A pinned generation stops in
+`Terminal` and suspend proceeds with its DMA pinned and BME off. Smokes:
+`smoke_rtw8852b_system_suspend_waits_for_parked_generation_or_withdraws`,
+the suspend rows of
+`smoke_rtw8852b_generation_supervisor_regenerates_only_proven_station_closures`
+and `smoke_rtw8852b_repeat_flr_lifecycle_requires_its_own_signed_identity`.
+WoW (`wow`) remains open.
 
 ## 4. Invariants
 
@@ -1349,7 +1380,7 @@ or physical hardware acceptance.
 | RF/BB calibration, regulatory channel/power and coexistence | Initial B actual factory + firmware PHY_CAP, static PHY operating/XTAL, WLAN-only coexistence, NCTL/basic RFK, channel MAC/BB/RF/scheduler/ADC, actual trims/RXAB, IQK/TSSI/DPK and real source power-table composition implemented. Separate signed measured v2 binds all calibration/packet/autonomous-response peaks and actual source recipes; native publication uses current signed/device invocations. Broader AX/BE profiles, host periodic RF tracking/retuning and physical measured qualification remain outside this initial profile |
 | Initial B scan, MLME, WPA2 and Ethernet | Source controller plus shared host MLME/RSNA/CCMP, exact M4/RX-idle admission, kernel DHCP/IP, rekey and terminal disconnect/cancellation are implemented; physical acceptance remains |
 | BE EFUSE/block format and BE transport | Missing |
-| Broader lifecycle | Initial independent reset, terminal ownership and proven-reclamation removal and SER L2-style generation reset/rejoin implemented; suspend, automatic reset/rejoin and multiple live functions remain outside this first profile |
+| Broader lifecycle | Initial independent reset, terminal ownership, proven-reclamation removal, SER L2-style generation reset/rejoin and no-WoW system suspend implemented; in-place SER L1 recovery, WoW and multiple live functions remain outside this first profile |
 
 The per-chip source `rtw_chip_info` inventories are broader than this station:
 8851B declares1TX/1RX and2.4/5GHz;8852A/B declare2TX/2RX and2.4/5GHz;
@@ -1378,7 +1409,6 @@ Each blocker below was re-checked against this tree.
 |---|---|
 | `eht` | Needs the RTL8922A chip row first. `efuse.rs` returns `UnsupportedChip` for 8922A, `irq::Mask::config` rejects the `_v2` layout, there is no BE TXD/RXD (`txrx.h` `BE_TXD_*`) or BE RA H2C (`rtw89_h2c_ra_v1`, `RTW89_H2C_RA_V1_W4_MODE_EHT`), and `station_control::Controller::new` plus the `N52B` qualification record are RTL8852B-only. The shared `association::eht` API is not the gap. |
 | `aggregation`, `block_ack_originator` | `packet_core::Core` keeps one `pending: Option<Pending>` and `ready()` is false while a frame is in flight. `station::State::pending` and the RPQ retirement are also single-frame. TX A-MPDU needs per-slot header/body DMA ownership for N in-flight tickets, `RTW89_TXWD_BODY3_AGG_EN`/`INFO1_MAX_AGGNUM`/`INFO2_AMPDU_DENSITY`, an originator ADDBA state machine (mac80211 `agg-tx.c`), `rtw89_chip_h2c_ampdu_cmac_tbl` on `TX_OPERATIONAL`/`TX_STOP_*`, and a new signed `Program` for the aggregate emitter. |
-| `system_suspend` | `narf_power::device_pm::DevicePmOps` callbacks are synchronous and IRQ-gated and may not schedule. Linux suspend without WoW (`drv_stop` -> `rtw89_core_stop`) and resume (`rtw89_core_start`, firmware download, awaited H2C DONE_ACKs) are async here. Resume also needs a second temporal FLR (`pci_reset.rs` makes one attempt) and a new identity, because `radio_policy::Board` binds "one fresh PCI lifecycle". The non-terminal teardown above is a prerequisite. |
 | `pmf` | The rtw89 station has no SAE: `station.rs::associate` builds Open/WPA2-PSK only and `interface.rs` maps only `SecurityConfig::Open`/`Wpa2`. `packet_format::classify` refuses management frames with the Protected bit. The shared `JoinPlan::start_sae_authentication`, `Security::new_sae`, `protect_management` and `receive_management` exist. The composition smoke additionally needs a shared SAE/PMF AP fixture: `narf_wifi_fixtures::FakeAp` only offers open/WPA2-PSK, with no SAE commit/confirm, MFPC/MFPR, IGTK or BIP. |
 | `randomized_scan_mac` | The random MAC is implemented (section 3). Random sequence numbers need `NL80211_SCAN_FLAG_RANDOM_SN` in shared `narf_wireless::scan::ScanRequest`. |
 | `he_htc` | The shared `station_security::Security::normalize` rejects +HTC RX (Order bit, `b[1] & 0x87 != 2`) and the `RawFrame` contract forbids stripping HT Control. TX additionally needs RA C2H `might_fallback_legacy` (`rtw89_phy_c2h_ra_rpt_iter`) and Order-bit admission in `packet_format::classify`. |

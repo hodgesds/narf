@@ -66,6 +66,7 @@ struct Caps {
 /// The sole consumer is Startup::claim_reset below. No Clone, caller-created
 /// field, generic consume operation or BME/power-only constructor is exposed.
 pub(super) struct Fence {
+    lifecycle: super::radio_policy::Lifecycle,
     binding: Binding,
     caps: Caps,
     bars: [u32; 6],
@@ -196,6 +197,7 @@ pub(super) struct Reset<I = Native> {
     io: I,
     binding: Binding,
     phase: Phase,
+    lifecycle: super::radio_policy::Lifecycle,
 }
 impl<I> core::fmt::Debug for Reset<I> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -233,7 +235,14 @@ impl Reset<Native> {
             io,
             binding,
             phase: Phase::New,
+            lifecycle: super::radio_policy::Lifecycle::Initial,
         })
+    }
+    /// Mark a later observed-FLR generation of this boot (reset or resume);
+    /// its fence selects the `Repeat` radio identity.
+    pub(super) fn repeat(mut self) -> Self {
+        self.lifecycle = super::radio_policy::Lifecycle::Repeat;
+        self
     }
 }
 const PARK_MASK: u16 = 7;
@@ -340,6 +349,7 @@ impl<I: Io> Reset<I> {
         validate_identity(&mut reset.io, reset.binding)?;
         reset.phase = Phase::Ready;
         let fence = Fence {
+            lifecycle: reset.lifecycle,
             binding: reset.binding,
             caps,
             bars,
@@ -507,7 +517,9 @@ impl super::startup::Startup {
         })?;
         // SAFETY: exact current successful temporal FLR fence consumed above;
         // caller retains its original singleton reservation throughout handoff.
-        unsafe { Self::claim(device, authority) }
+        let mut startup = unsafe { Self::claim(device, authority) }?;
+        startup.lifecycle = fence.lifecycle;
+        Ok(startup)
     }
 }
 
