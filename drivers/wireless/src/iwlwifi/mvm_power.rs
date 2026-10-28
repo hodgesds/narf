@@ -43,8 +43,14 @@ pub(in crate::iwlwifi) mod feature {
     pub const NESTED_BA: u16 = 1 << 1;
     /// Per-TID QoS data queues for all eight TIDs / four access categories.
     pub const QOS_TIDS: u16 = 1 << 2;
+    /// HT TX LDPC coding toward an LDPC-capable peer
+    /// (`IWL_TLC_MNG_CFG_FLAGS_LDPC_MSK`).
+    pub const TX_LDPC: u16 = 1 << 3;
+    /// HT TX STBC from two transmit chains toward a peer with Rx STBC
+    /// (`IWL_TLC_MNG_CFG_FLAGS_STBC_MSK`, HT Tx STBC advertised).
+    pub const TX_STBC: u16 = 1 << 4;
     /// Every bit this driver can emit; other bits are refused.
-    pub const KNOWN: u16 = BA | NESTED_BA | QOS_TIDS;
+    pub const KNOWN: u16 = BA | NESTED_BA | QOS_TIDS | TX_LDPC | TX_STBC;
 }
 
 impl Emission {

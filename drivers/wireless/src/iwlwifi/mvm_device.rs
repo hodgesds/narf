@@ -50,7 +50,7 @@ impl Environment {
                 let authority = narf_firmware::trusted_loader_authority()
                     .and_then(|c| c.derive().ok())
                     .ok_or("MVM power loader authority unavailable")?;
-                if let Some(bits) = owner.feature_offer() {
+                for bits in owner.feature_offers() {
                     let request = owner.transmit_power_request_for(
                         super::mvm_boot::PowerEmission::Features(bits),
                     )?;

@@ -1552,7 +1552,7 @@ each feature; a Linux chip name or helper structure does not grant a capability.
 
 | Profile | Implemented reachable software | Remaining software gates |
 |---|---|---|
-| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles (Linux Qu PCI IDs 0x02f0/0x06f0/0x34f0/0x3df0/0x4df0/0x43f0/0xa0f0, §3.26) | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO (with §3.28 RX LDPC/STBC1), §3.33 host WPA3-SAE with PMF, signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement preceded by §3.25 over-air leaving deauthentication. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced reconnect restoration, extended in §3.30 to cross-peer/cross-index GTK restore, safe same-peer PTK reuse and a radio-scoped ledger across native owners; §3.31 generic tag5 feature programs with per-TID QoS queues for all four ACs; §3.29 firmware/transport recovery and non-WoWLAN system suspend/resume. Authored, execution pending: §3.24 tag4 negotiated unicast-local nested recipient A-MSDU-in-A-MPDU with complete bundles before sequence/PN ownership. | Active probes (scan firmware's emitter/power binding needs source proof); alternate ML BAID; TX A-MSDU; HT40/NSS2/VHT/HE/TX LDPC/TX STBC; SAE-EXT-KEY (AKM 24) and WPA2-PSK with PMF; persistent key history. AP/P2P, WoW (with its D3 ARP/NS/GTK offloads), the §3.27 scheduled-scan offload and multiple RX/RSS remain unimplemented even where hardware supports them. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
+| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles (Linux Qu PCI IDs 0x02f0/0x06f0/0x34f0/0x3df0/0x4df0/0x43f0/0xa0f0, §3.26) | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO (with §3.28 RX LDPC/STBC1), §3.33 host WPA3-SAE with PMF, §3.34 tag5 HT TX LDPC/TX STBC, signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement preceded by §3.25 over-air leaving deauthentication. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced reconnect restoration, extended in §3.30 to cross-peer/cross-index GTK restore, safe same-peer PTK reuse and a radio-scoped ledger across native owners; §3.31 generic tag5 feature programs with per-TID QoS queues for all four ACs; §3.29 firmware/transport recovery and non-WoWLAN system suspend/resume. Authored, execution pending: §3.24 tag4 negotiated unicast-local nested recipient A-MSDU-in-A-MPDU with complete bundles before sequence/PN ownership. | Active probes (scan firmware's emitter/power binding needs source proof); alternate ML BAID; TX A-MSDU; HT40/NSS2/VHT/HE; SAE-EXT-KEY (AKM 24) and WPA2-PSK with PMF; persistent key history. AP/P2P, WoW (with its D3 ARP/NS/GTK offloads), the §3.27 scheduled-scan offload and multiple RX/RSS remain unimplemented even where hardware supports them. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
 | AX210/AX211/AX411 and Bz/BE200 Gen3 transports | Context-v2, generation-selected completion layouts, firmware/PNVM/native boot and MLD helpers. Software-validated continuation: source-selected command-ID header0/explicit RLC2, receipt-fenced TVQM/BAID retirement, retained actual executable/PNVM/PCI authority and immutable DMA-copy receive/publication epochs. | Station admission remains dependent on the exact negotiated MAC/link/STA/TLC/key payload profile; no new payload profile is enabled by the header/source audit. Sc conversation tests do not establish another family's ABI, platform power/SAR program or hardware. Current live regulatory/power ownership remains separate. |
 | Sc c103/BE211 MLD station profile | Deferred retained native publication, actual station/management/data/Open-WPA2-SAE conversations, legacy/HT/VHT to80MHz, key/BA/reorder and userspace SME/port ownership in the existing profile. §§3.21–3.22 header/TVQM, positive BA response/RX-marker retirement, retained executable/PNVM/current-PCI publication and copy-time key epochs passed coordinated native tests on both architectures. | These source/epoch fences do not establish underlying RF quiescence or current live-regulatory/platform-power qualification. HE/EHT/6GHz and MLO,160/320MHz, AP/P2P and the §3.27 scheduled-scan offload remain separate (non-WoWLAN system suspend/resume is §3.29) implementations and must not be inferred from single-link Sc fixtures. |
 | Other advertised PCI/firmware combinations | Identification/firmware selection where defined, including the Linux So/Ma/Bz IDs added in §3.26; 0x7df0 is identification-only (Linux 7.3 `pcie/drv.c` claims no 0x7DF0) and exact admission rejects it | No fallback admits an unknown command table, calibration profile, topology or PHY width. They need their exact source-backed authority/command/receipt/lifetime path. |
@@ -2036,6 +2036,62 @@ unchanged, so no new emitting program is needed.
 - AP rejection, an unverifiable Confirm and an M3 without an IGTK;
 - refusal of AKM 24, of SAE without the key API, and of mixing the
   WPA2/SAE owners, plus the legacy and PMF deauthentication rules.
+
+### 3.34 Tag5 HT TX LDPC and TX STBC
+
+Rows ldpc and stbc. §3.28 left two transmit-side HT coding options out:
+TX LDPC and TX STBC. Each now has its own tag5 feature bit (§3.31):
+`TX_LDPC` = bit 3 and `TX_STBC` = bit 4. A signed program for exactly that
+bit set must be selected before either can be used.
+
+**Availability.** `select_station_offer` derives the bits an offer can use
+from the observed AP and the NVM, following Linux `mvm/rs-fw.c::
+rs_fw_get_config_flags` for the rf-hr/rf-jf `ht_params = { .stbc, .ldpc }`:
+
+- `QOS_TIDS` is available on a selected WMM/HT20 offer.
+- `TX_LDPC` is available when the AP's HT Capabilities set LDPC
+  (`IEEE80211_HT_CAP_LDPC_CODING`).
+- `TX_STBC` is available when the NVM has more than one valid TX antenna
+  and the AP advertises Rx STBC.
+
+**Program selection.** `Owner::feature_offers` lists every non-empty subset
+of the available bits, widest first, each with BA added when the BA
+profile is selected. The native power loader tries the signed program for
+each set in turn. An absent program (NotFound) moves on to the next set.
+An unsigned or invalid program fails without downgrading. If none is
+found, the loader falls back to the narrower tag2/3/4 programs as before.
+`feature_offer()` remains the `QOS_TIDS` set, and `select_feature_power`
+accepts any listed set.
+
+**Effects of a selected bit.**
+
+- The local HT profile (`local_ht_for`) opts in to TX LDPC, a transmit
+  choice that does not change the advertised RX LDPC bit.
+- It opts in to TX STBC, which advertises HT Tx STBC (bit 7) as Linux
+  `iwl_init_ht_hw_capab` does when there is more than one TX chain.
+- The shared HT negotiation enables each option only if the AP's offer
+  and response both carry the matching receive capability.
+- The TLC config sets `IWL_TLC_MNG_CFG_FLAGS_STBC_MSK` (bit 0) and
+  `IWL_TLC_MNG_CFG_FLAGS_LDPC_MSK` (bit 1) at offset 8 of the
+  v2/v3/v4 payload (`fw/api/rs.h`).
+- With STBC, the TLC chain mask is every valid TX antenna, as in Linux
+  `rs_fw_set_active_chains(iwl_mvm_get_valid_tx_ant)`; SISO keeps one
+  antenna.
+- A beacon that drops the peer's LDPC or Rx STBC capability ends the
+  link, like any other change to the retained HT profile.
+- ADD_STA is unchanged: Linux sets no STA flag for these options.
+
+`drivers/wireless/iwlwifi/gen2/coding` smokes run complete interface joins
+and cover:
+
+- TX_LDPC toward an LDPC peer (TLC flags 2, one chain), with an ordered
+  close;
+- TX_STBC (flags 1, chain mask 3) and the combined TX_LDPC|TX_STBC program
+  (flags 3);
+- an LDPC/STBC peer without a tag5 program (flags 0);
+- refusal of each program toward a peer without the receive capability.
+
+Measured programs and air validation remain external inputs.
 
 ## 4. References
 

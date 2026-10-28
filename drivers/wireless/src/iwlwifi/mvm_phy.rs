@@ -18,6 +18,9 @@ pub(super) struct Context {
     /// Extra tag5 feature bits selected by an actual signed program
     /// (never BA/NESTED_BA, which the BA context owns).
     pub features: u16,
+    /// Extra tag5 bits the selected offer could use (`QOS_TIDS` on WMM,
+    /// `TX_LDPC`/`TX_STBC` when the observed AP and NVM permit them).
+    pub available: u16,
 }
 impl Context {
     pub fn emission(&self) -> Emission {
@@ -56,6 +59,8 @@ impl Context {
             rx_sgi: false,
             rx_ldpc: false,
             rx_stbc: false,
+            tx_ldpc: false,
+            tx_stbc: false,
             protection: 0,
             dynamic_smps: false,
             ampdu_exp: 0,
@@ -73,6 +78,11 @@ impl Context {
             profile.rx_sgi = ht.rx_sgi20();
             profile.rx_ldpc = ht.rx_ldpc();
             profile.rx_stbc = ht.rx_stbc();
+            // The shared negotiation requires the local TX opt-in (only a
+            // granted tag5 bit sets it) and the peer's RX capability in
+            // both the offer and the response.
+            profile.tx_ldpc = ht.tx_ldpc();
+            profile.tx_stbc = ht.tx_stbc();
             profile.dynamic_smps = (ht.peer_capability() >> 2) & 3 == 1;
             profile.ampdu_exp = ht.peer_ampdu_factor();
             profile.density = ht.peer_mpdu_density();
@@ -97,6 +107,9 @@ pub(super) struct Profile {
     /// Local HT receive-coding promises from [`local_ht`].
     pub rx_ldpc: bool,
     pub rx_stbc: bool,
+    /// TX coding granted by a tag5 program and negotiated with the peer.
+    pub tx_ldpc: bool,
+    pub tx_stbc: bool,
     pub protection: u32,
     pub dynamic_smps: bool,
     pub ampdu_exp: u8,
@@ -109,9 +122,17 @@ pub(super) struct Profile {
 /// promises only: TX STBC needs a second TX chain and TX LDPC the TLC
 /// LDPC flag; this single-stream emitting profile uses neither.
 pub(in crate::iwlwifi) fn local_ht() -> LocalHt {
+    local_ht_for(0)
+}
+/// [`local_ht`] plus the TX coding a granted tag5 program adds: TX LDPC
+/// (a local transmit choice; the advertised LDPC bit stays the RX promise)
+/// and TX STBC, which also sets the HT Tx STBC bit as Linux
+/// `iwl_init_ht_hw_capab` does for more than one TX chain.
+pub(in crate::iwlwifi) fn local_ht_for(features: u16) -> LocalHt {
     LocalHt::siso20(true, true)
-        .with_ldpc(true, false)
+        .with_ldpc(true, features & feature::TX_LDPC != 0)
         .with_rx_stbc(true)
+        .with_tx_stbc(features & feature::TX_STBC != 0)
 }
 pub(super) fn parameters(ies: &[u8]) -> Result<Option<Parameters>, &'static str> {
     let parsed = Parameters::parse(ies).map_err(|_| "MVM malformed WMM parameters")?;
@@ -147,6 +168,8 @@ impl Profile {
             && cap[2] & 3 == self.ampdu_exp
             && (cap[2] >> 2) & 7 == self.density
             && ((u16::from_le_bytes([cap[0], cap[1]]) >> 2) & 3 == 1) == self.dynamic_smps
+            && (!self.tx_ldpc || cap[0] & 1 != 0)
+            && (!self.tx_stbc || cap[1] & 3 != 0)
     }
     pub fn edca(&self, local: [u8; 6]) -> [u8; 208] {
         let mut out = [0; 208];
@@ -197,6 +220,12 @@ impl Profile {
         let mut out = alloc::vec![0;length];
         out[5] = u8::from(self.ht);
         out[6] = chains;
+        // rs_fw_get_config_flags: STBC bit0, LDPC bit1.
+        put16(
+            &mut out,
+            8,
+            u16::from(self.tx_stbc) | u16::from(self.tx_ldpc) << 1,
+        );
         put16(&mut out, 10, rates);
         put16(&mut out, 12, u16::from(self.tx_mcs));
         // v2/3 SGI byte22; v4 byte7. A-MSDU and all NSS2/width>20 rates0.
@@ -323,7 +352,8 @@ impl super::Owner {
         if !self.supports_native_ht20() {
             return Err("MVM native HT20 contract unavailable");
         }
-        LocalPhy::ht20(local_ht()).map_err(|_| "MVM local HT20 profile invalid")
+        LocalPhy::ht20(local_ht_for(self.power.phy.features))
+            .map_err(|_| "MVM local HT20 profile invalid")
     }
     pub(super) fn station_plan(
         &self,
@@ -376,8 +406,27 @@ impl super::Owner {
             && narf_wireless::association::phy::ApElements::parse(&bss.information_elements)
                 .is_ok_and(|p| p.ht_capability().is_some())
             && self.supports_native_ba();
+        let ap_ht = narf_wireless::association::phy::ApElements::parse(&bss.information_elements)
+            .ok()
+            .and_then(|p| p.ht_capability());
+        let chains = self.nvm.as_ref().map_or(0, |n| n.tx_chains);
+        let mut available = 0;
+        if selected {
+            available |= feature::QOS_TIDS;
+            if let Some(cap) = ap_ht {
+                // rs_fw_get_config_flags: LDPC to an LDPC-capable peer;
+                // STBC needs more than one valid TX antenna and peer Rx STBC.
+                if cap[0] & 1 != 0 {
+                    available |= feature::TX_LDPC;
+                }
+                if chains.count_ones() > 1 && cap[1] & 3 != 0 {
+                    available |= feature::TX_STBC;
+                }
+            }
+        }
         self.power.phy = Context {
             offered: if selected { wmm } else { None },
+            available,
             ..Context::default()
         };
         self.power.phy.ba.selected = ba;
@@ -417,13 +466,29 @@ impl super::Owner {
     /// The tag5 feature set this offer would emit with per-TID QoS queues:
     /// WMM/HT20 selected, plus the BA bit when the BA profile is selected.
     pub(in crate::iwlwifi) fn feature_offer(&self) -> Option<u16> {
+        self.feature_offers()
+            .into_iter()
+            .find(|bits| bits & !(feature::BA | feature::NESTED_BA) == feature::QOS_TIDS)
+    }
+    /// Every tag5 set this offer could emit, widest first: each non-empty
+    /// subset of the available bits, plus BA when the BA profile is
+    /// selected. Each set names its own signed program.
+    pub(in crate::iwlwifi) fn feature_offers(&self) -> Vec<u16> {
+        if self.phase != super::Phase::Configured || self.power.phy.offered.is_none() {
+            return Vec::new();
+        }
         let ba = if self.power.phy.ba.selected {
             feature::BA
         } else {
             0
         };
-        (self.phase == super::Phase::Configured && self.power.phy.offered.is_some())
-            .then_some(feature::QOS_TIDS | ba)
+        let available = self.power.phy.available;
+        let mut sets: Vec<u16> = (1..=available)
+            .filter(|bits| bits & !available == 0)
+            .map(|bits| bits | ba)
+            .collect();
+        sets.sort_by_key(|bits| core::cmp::Reverse(bits.count_ones()));
+        sets
     }
     /// Selection requires the actual signed tag5 asset for exactly `bits`.
     pub(in crate::iwlwifi) fn select_feature_power(
@@ -432,7 +497,7 @@ impl super::Owner {
         binding: [u8; 32],
         bits: u16,
     ) -> Result<(), &'static str> {
-        if self.feature_offer() != Some(bits) {
+        if !self.feature_offers().contains(&bits) {
             return Err("MVM feature program differs from the selected offer");
         }
         super::power::validate_record(
