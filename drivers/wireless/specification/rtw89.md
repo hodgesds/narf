@@ -1128,10 +1128,33 @@ equals `ceil(duration_tu * 1024 / 1000)` ms (default 200ms; 0, >1000TU or
 a missing mandatory duration are refused before any RF activity).
 Deviation: Linux uses firmware scan offload (`rtw89_hw_scan_*`) across
 channels; this profile is qualified for channel 1 only, so host probing on
-that channel is the faithful subset. Random-address scans remain refused
-(`randomized_scan_mac`): the RX address filter only accepts the own MAC.
-Smokes: `smoke_rtw8852b_active_scan_probe_requests_and_extra_ies`,
+that channel is the faithful subset. Smokes: `smoke_rtw8852b_active_scan_probe_requests_and_extra_ies`,
 `smoke_rtw8852b_scan_dwell_follows_requested_duration`.
+
+Random scan address: the device advertises
+`NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR` (`rtw89_core_register_hw`). A
+request whose mask randomizes the group bit or whose base address is
+multicast is refused like cfg80211 `nl80211_parse_random_mac`. For an
+active scan the address is `get_random_mask_addr` (random bits outside the
+mask, base bits inside). As in `rtw89_core_scan_start`, the passive
+controller first rewrites the address CAM SMA through `rtw89_fw_h2c_cam`
+(`Controller::scan_address`, DONE_ACK, refused with a peer bound), and the
+packet owner then admits a probe request from exactly that address.
+Probe requests use it as SA and A2, and responses directed to it are
+observed. After the dwell and the last probe's retirement (bounded at
+1s), `rtw89_core_scan_complete` restores the packet owner and then the CAM
+SMA to the own address. A failed CAM update or retirement is terminal like
+any other controller step, and association refuses a live scan address.
+A passive scan transmits nothing and leaves the CAM unchanged. Smoke:
+`smoke_rtw8852b_random_scan_address_cam_probe_and_restore` (group-bit
+mask refused with no H2C, masked SA, response observation, CAM move and
+restore, own-address scan and association afterwards). Random-address
+scanning uses the same probe emitter as active scanning, which no
+operating program gates. The sequence-number half of `randomized_scan_mac`
+stays open because shared `narf_wireless::scan::ScanRequest` has no
+`NL80211_SCAN_FLAG_RANDOM_SN` field, so the driver cannot tell when
+mac80211/firmware `rand_seq_num` (`fw.c::rtw89_hw_scan_add_chan_list`)
+applies.
 
 ### Live AP EDCA updates
 
@@ -1244,6 +1267,23 @@ References: Linux `rtw89/efuse.c`, `rtw8852a.h`, `rtw8852b_common.h`,
 `rtw8852c.h`, `rtw8851b.h`, `core.c::rtw89_core_get_ch_dma`,
 `pci.c::{rtw89_pci_txwd_submit,rtw89_pci_release_txwd_skb,rtw89_pci_fill_txaddr_info,rtw89_pci_fill_txaddr_info_v1}`,
 and per-chip PCI configuration.
+
+### Open rows: verified blockers (2026-10-28)
+
+Each blocker below was re-checked against this tree.
+
+| Row | Concrete blocker |
+|---|---|
+| `eht` | Needs the RTL8922A chip row first. `efuse.rs` returns `UnsupportedChip` for 8922A, `irq::Mask::config` rejects the `_v2` layout, there is no BE TXD/RXD (`txrx.h` `BE_TXD_*`) or BE RA H2C (`rtw89_h2c_ra_v1`, `RTW89_H2C_RA_V1_W4_MODE_EHT`), and `station_control::Controller::new` plus the `N52B` qualification record are RTL8852B-only. The shared `association::eht` API is not the gap. |
+| `aggregation`, `block_ack_originator` | `packet_core::Core` keeps one `pending: Option<Pending>` and `ready()` is false while a frame is in flight. `station::State::pending` and the RPQ retirement are also single-frame. TX A-MPDU needs per-slot header/body DMA ownership for N in-flight tickets, `RTW89_TXWD_BODY3_AGG_EN`/`INFO1_MAX_AGGNUM`/`INFO2_AMPDU_DENSITY`, an originator ADDBA state machine (mac80211 `agg-tx.c`), `rtw89_chip_h2c_ampdu_cmac_tbl` on `TX_OPERATIONAL`/`TX_STOP_*`, and a new signed `Program` for the aggregate emitter. |
+| `operating_reset` | `HALT_C2H`/`WDT_TIMEOUT` close the station terminally (`station::Error::Halted`). SER L1 (`ser.c` `ser_l1_reset_pre_st_hdl` -> `rtw89_hci_reset` -> `pci.c::rtw89_pci_reset_trx_rings`) needs a proven HCI DMA stop and ring-index reset so retained rings can be republished, and this tree has neither. |
+| `dma_reclamation` | Teardown deliberately retains published DMA: `packet_core::Ring::drop` and `rx_dma::retain` `mem::forget` armed descriptors and buffers, and `TxQueue` retains published packets. Freeing them needs an idle proof, i.e. `R_AX_PCIE_DMA_STOP1` read-back with `rtw89_pci_poll_txdma_ch_idle`/`rtw89_pci_poll_rxdma_ch_idle` before BME clear. No such proof exists. |
+| `safe_rejoin` | `station_control::Controller::disconnect` ends in `Phase::Stopped` and `initialize` accepts only `Phase::New`. `station::State::{stop,disconnect}` end in `Phase::Stopped`, and `bootstrap.rs` terminalizes the radio once the shell closes. Rejoin needs a controller Stopped->Passive path (`rtw89_ops_sta_state` NOTEXIST -> `rtw89_core_sta_remove`, CAM back to own/`[0;6]`) and a non-terminal station reset. |
+| `device_removal` | rtw89 registers no `narf_bus::register_remove` callback, and `bootstrap::probe` keeps the static `OWNER` for the boot. A remove path depends on `dma_reclamation`'s DMA-stop proof; without it the device can only be parked. |
+| `system_suspend` | `narf_power::device_pm::DevicePmOps` callbacks are synchronous and IRQ-gated and may not schedule. Linux suspend without WoW (`drv_stop` -> `rtw89_core_stop`) and resume (`rtw89_core_start`, firmware download, awaited H2C DONE_ACKs) are async here. Resume also needs a second temporal FLR (`pci_reset.rs` makes one attempt) and a new identity, because `radio_policy::Board` binds "one fresh PCI lifecycle". The non-terminal teardown above is a prerequisite. |
+| `pmf` | The rtw89 station has no SAE: `station.rs::associate` builds Open/WPA2-PSK only and `interface.rs` maps only `SecurityConfig::Open`/`Wpa2`. `packet_format::classify` refuses management frames with the Protected bit. The shared `JoinPlan::start_sae_authentication`, `Security::new_sae`, `protect_management` and `receive_management` exist. The composition smoke additionally needs a shared SAE/PMF AP fixture: `narf_wifi_fixtures::FakeAp` only offers open/WPA2-PSK, with no SAE commit/confirm, MFPC/MFPR, IGTK or BIP. |
+| `randomized_scan_mac` | The random MAC is implemented (section 3). Random sequence numbers need `NL80211_SCAN_FLAG_RANDOM_SN` in shared `narf_wireless::scan::ScanRequest`. |
+| `he_htc` | The shared `station_security::Security::normalize` rejects +HTC RX (Order bit, `b[1] & 0x87 != 2`) and the `RawFrame` contract forbids stripping HT Control. TX additionally needs RA C2H `might_fallback_legacy` (`rtw89_phy_c2h_ra_rpt_iter`) and Order-bit admission in `packet_format::classify`. |
 
 ### Upstream applicability triage (2026-10-27)
 

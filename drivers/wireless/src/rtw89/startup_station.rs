@@ -89,6 +89,22 @@ unsafe impl Io for Startup {
         self.station_allowed()?;
         self.station_native()?.station_ht_allowed()
     }
+    async fn station_scan_address(
+        &mut self,
+        address: Option<[u8; 6]>,
+        admission: &control::Admission,
+    ) -> Result<(), power::Error> {
+        let native = self
+            .firmware
+            .as_mut()
+            .ok_or(power::Error::Terminal)?
+            .transport_mut();
+        self.station_controller
+            .as_mut()
+            .ok_or(power::Error::Terminal)?
+            .scan_address(&mut native.station_access(), address, admission)
+            .await
+    }
     fn station_he_allowed(&mut self) -> Result<bool, power::Error> {
         self.station_allowed()?;
         self.station_native()?.station_he_allowed()
@@ -267,6 +283,9 @@ unsafe impl Io for Startup {
             return Err(packet::Error::State);
         }
         self.station_native()?.prepare_packets(own, macid)
+    }
+    fn packet_scan_address(&mut self, scan: Option<[u8; 6]>) -> Result<(), packet::Error> {
+        self.station_native()?.scan_address_packets(scan)
     }
     fn packet_start(&mut self) -> Result<(), packet::Error> {
         self.station_native()?.start_packets()

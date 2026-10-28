@@ -117,6 +117,12 @@ impl Native {
     pub(in crate::rtw89) fn start_packets(&mut self) -> Result<(), packet::Error> {
         self.packet_operation(|core, port| core.start(port))
     }
+    pub(in crate::rtw89) fn scan_address_packets(
+        &mut self,
+        scan: Option<[u8; 6]>,
+    ) -> Result<(), packet::Error> {
+        self.packet_operation(|core, _| core.set_scan_address(scan))
+    }
     pub(in crate::rtw89) fn packets_ready(&self) -> bool {
         self.state == State::Active
             && self

@@ -143,6 +143,8 @@ pub(super) struct Core {
     stop: u32,
     /// Highest signed RX PHY program admitted for this owner.
     rx: RxPhy,
+    /// Random scan source address the controller put in the address CAM.
+    scan: Option<[u8; 6]>,
     next_id: u64,
     pending: Option<Pending>,
     completions: VecDeque<Receipt>,
@@ -272,6 +274,7 @@ impl Core {
                 },
                 stop,
                 rx,
+                scan: None,
                 next_id: 1,
                 pending: None,
                 completions: VecDeque::new(),
@@ -319,6 +322,18 @@ impl Core {
         self.phase = Phase::Running;
         Ok(())
     }
+    /// Mirror the controller's scan address CAM update (`None` restores the
+    /// own address). Only between frames: a probe in flight keeps its source.
+    pub(super) fn set_scan_address(&mut self, scan: Option<[u8; 6]>) -> Result<(), Error> {
+        if self.phase != Phase::Running
+            || self.pending.is_some()
+            || scan.is_some_and(|a| a[0] & 1 != 0 || a == [0; 6] || a == self.own)
+        {
+            return Err(Error::State);
+        }
+        self.scan = scan;
+        Ok(())
+    }
     pub(super) fn ready(&self) -> bool {
         self.phase == Phase::Running && self.pending.is_none() && self.completions.is_empty()
     }
@@ -347,14 +362,20 @@ impl Core {
         if !self.ready() {
             return Err(Error::Busy);
         }
-        let kind = format::classify(bytes, self.own)?;
+        // A probe request from the current random scan address is the only
+        // frame with a source other than the own address.
+        let source = match self.scan {
+            Some(scan) if format::probe_request(bytes, scan) => scan,
+            _ => self.own,
+        };
+        let kind = format::classify(bytes, source)?;
         let id = self.next_id;
         let next_id = id.checked_add(1).ok_or(Error::State)?;
         let result = port.current(|port| {
             port.ordinary_allowed()?;
             // An active-scan probe request has no peer; everything else
             // needs the current peer token.
-            if !format::probe_request(bytes, self.own) {
+            if !format::probe_request(bytes, source) {
                 port.peer_allowed(bytes)?;
             }
             let packet = Packet {
@@ -381,7 +402,7 @@ impl Core {
                 let (header, actual) = if rate == 0 {
                     format::transmit(
                         bytes,
-                        self.own,
+                        source,
                         self.mac_id,
                         ticket.sequence,
                         packet.body.dma_addr().raw(),
@@ -390,7 +411,7 @@ impl Core {
                 } else {
                     format::transmit_rate(
                         bytes,
-                        self.own,
+                        source,
                         self.mac_id,
                         ticket.sequence,
                         packet.body.dma_addr().raw(),
@@ -413,7 +434,7 @@ impl Core {
                 }
             };
             port.ordinary_allowed()?;
-            if !format::probe_request(bytes, self.own) {
+            if !format::probe_request(bytes, source) {
                 port.peer_allowed(bytes)?;
             }
             // Before the FIRST descriptor write, the queue holds both DMA maps

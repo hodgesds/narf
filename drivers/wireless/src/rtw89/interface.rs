@@ -458,6 +458,10 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
     fn supports_scan_dwell(&self) -> bool {
         true
     }
+    /// `NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR` (`rtw89_core_register_hw`).
+    fn supports_scan_random_mac(&self) -> bool {
+        true
+    }
     /// `RTW89_SCANOFLD_MAX_SSID`.
     fn max_scan_ssids(&self) -> u8 {
         8
@@ -515,9 +519,14 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             attempt.armed = false;
             return Err(WirelessError::Busy);
         }
+        let address = match (&request.random_mac, request.active) {
+            (Some(random), true) => Some(random_scan_address(random)?),
+            _ => None,
+        };
         let probe = request.active.then(|| station::Probe {
             ssids: request.ssids.clone(),
             ies: request.extra_ies.clone(),
+            address,
         });
         let result = owner.station_scan(dwell, probe).await;
         attempt.armed = false;
@@ -646,8 +655,24 @@ fn probe_ies_valid(mut ies: &[u8]) -> bool {
     }
     true
 }
+/// `get_random_mask_addr`: random bits outside `mask`, `addr` bits inside.
+fn random_scan_address(
+    random: &narf_wireless::scan::ScanRandomMac,
+) -> Result<[u8; 6], WirelessError> {
+    let mut bytes = [0u8; 6];
+    narf_crypto::try_fill_random_bytes(&mut bytes).map_err(|_| WirelessError::HardwareError)?;
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = *byte & !random.mask[i] | random.addr[i] & random.mask[i];
+    }
+    Ok(bytes)
+}
 fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
-    if request.random_mac.is_some()
+    // cfg80211 `nl80211_parse_random_mac`: the mask must keep the group bit
+    // from a unicast base address.
+    if request
+        .random_mac
+        .as_ref()
+        .is_some_and(|r| r.mask[0] & 1 == 0 || r.addr[0] & 1 != 0)
         || request.colocated_6ghz
         || (!request.active && !request.extra_ies.is_empty())
         || !probe_ies_valid(&request.extra_ies)

@@ -62,6 +62,19 @@ pub(super) unsafe trait Io: Send {
     fn station_he_allowed(&mut self) -> Result<bool, power::Error> {
         Ok(false)
     }
+    /// `rtw89_core_scan_start`/`_complete` address CAM update: a random scan
+    /// SMA, or `None` to restore the own address.
+    async fn station_scan_address(
+        &mut self,
+        _: Option<[u8; 6]>,
+        _: &Admission,
+    ) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    /// Mirror the scan source address in the packet owner.
+    fn packet_scan_address(&mut self, _: Option<[u8; 6]>) -> Result<(), packet::Error> {
+        Err(packet::Error::State)
+    }
     /// Signed all-AC/TID QoS program (`radio_policy::Program::QosAll`).
     fn station_qos_all_allowed(&mut self) -> Result<bool, power::Error> {
         Ok(false)
@@ -220,6 +233,8 @@ enum Kind {
 pub(super) struct Probe {
     pub(super) ssids: Vec<Vec<u8>>,
     pub(super) ies: Vec<u8>,
+    /// Random scan source address (`NL80211_SCAN_FLAG_RANDOM_ADDR`).
+    pub(super) address: Option<[u8; 6]>,
 }
 /// mac80211 `ieee80211_build_probe_req` for this 2.4GHz channel1 profile:
 /// SSID, Supported Rates (1,2,5.5,11,6,9,12,18), Extended Supported Rates
@@ -294,6 +309,8 @@ pub(super) struct State {
     he: bool,
     /// Data TXWD `DATA_ER` (Linux `er_cap`: HE operation allows ER SU).
     er: bool,
+    /// Random scan address live in the address CAM during an active scan.
+    scan: Option<[u8; 6]>,
     /// Recipient Block Ack sessions per TID.
     ba: [Option<super::block_ack::Session<Mpdu>>; 8],
     /// BA CAM programming awaiting the async owner.
@@ -344,6 +361,7 @@ impl State {
             ht: false,
             he: false,
             er: false,
+            scan: None,
             ba: core::array::from_fn(|_| None),
             ba_ops: VecDeque::new(),
             mgmt_out: VecDeque::new(),
@@ -414,6 +432,7 @@ impl State {
         self.ht = false;
         self.he = false;
         self.er = false;
+        self.scan = None;
         self.clear_block_ack();
         self.admission.close();
         self.established = false;
@@ -451,6 +470,7 @@ impl State {
         self.ht = false;
         self.he = false;
         self.er = false;
+        self.scan = None;
         self.clear_block_ack();
         if let Some(security) = &mut self.security {
             security.fail();
@@ -532,7 +552,8 @@ impl State {
     fn cache(&mut self, frame: &Mpdu, now: u64) {
         // This native profile exposes no calibrated per-frame dBm estimate.
         let signal = None;
-        let Ok(candidate) = association::observe(frame, 1, self.own, signal) else {
+        let own = self.scan.unwrap_or(self.own);
+        let Ok(candidate) = association::observe(frame, 1, own, signal) else {
             return;
         };
         if candidate.basic_rates & 1 == 0 {
@@ -1107,7 +1128,49 @@ impl State {
             return Err(Error::State);
         }
         let until = self.now()?.saturating_add(dwell_ms);
+        let address = probe.as_ref().and_then(|p| p.address);
+        if let Some(address) = address {
+            if address[0] & 1 != 0 || address == [0; 6] || address == self.own {
+                return Err(Error::Profile);
+            }
+            // rtw89_core_scan_start: the address CAM SMA follows the random
+            // scan address before the first probe request.
+            io.station_scan_address(Some(address), &self.admission)
+                .await?;
+            let admission = self.admission.clone();
+            admission.run(|| Ok(io.packet_scan_address(Some(address))))??;
+            self.scan = Some(address);
+        }
+        let result = self.scan_dwell(io, until, probe).await;
+        // A failed dwell is terminal: the interface stops the station.
+        if address.is_some() && result.is_ok() {
+            // rtw89_core_scan_complete: restore the own address once the last
+            // probe request has retired. A failure closes the station.
+            let deadline = until.saturating_add(1000);
+            while self.pending.is_some() {
+                self.poll(io)?;
+                if self.pending.is_some() {
+                    if self.now()? >= deadline {
+                        return Err(Error::State);
+                    }
+                    self.environment.pause().await;
+                }
+            }
+            let admission = self.admission.clone();
+            admission.run(|| Ok(io.packet_scan_address(None)))??;
+            self.scan = None;
+            io.station_scan_address(None, &self.admission).await?;
+        }
+        result
+    }
+    async fn scan_dwell(
+        &mut self,
+        io: &mut impl Io,
+        until: u64,
+        probe: Option<Probe>,
+    ) -> Result<Vec<ObservedBss>, Error> {
         if let Some(probe) = probe {
+            let source = probe.address.unwrap_or(self.own);
             let ssids = if probe.ssids.is_empty() {
                 vec![Vec::new()]
             } else {
@@ -1124,7 +1187,7 @@ impl State {
                     }
                     self.environment.pause().await;
                 }
-                let frame = probe_request(self.own, &ssid, &probe.ies);
+                let frame = probe_request(source, &ssid, &probe.ies);
                 let admission = self.admission.clone();
                 admission.run(|| Ok(self.transmit(io, frame, Kind::Probe)))??;
             }

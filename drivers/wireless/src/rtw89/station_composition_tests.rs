@@ -198,7 +198,8 @@ impl Peer {
             self.probes.push(frame.to_vec());
             let mut response = self.ap.beacon();
             response[0] = 0x50;
-            response[4..10].copy_from_slice(&self.plan.station);
+            // Directed to the probe's source (own or random scan address).
+            response[4..10].copy_from_slice(&frame[10..16]);
             if let Some(p) = &self.wmm {
                 response.extend_from_slice(p);
             }
@@ -447,6 +448,21 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
     fn station_he_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
         self.station_allowed()?;
         Ok(self.wmm && self.firmware_ra && self.ht && self.he)
+    }
+    async fn station_scan_address(
+        &mut self,
+        address: Option<[u8; 6]>,
+        admission: &crate::rtw89::station_control::Admission,
+    ) -> Result<(), crate::rtw89::power::Error> {
+        self.controller
+            .scan_address(&mut self.control, address, admission)
+            .await
+    }
+    fn packet_scan_address(
+        &mut self,
+        scan: Option<[u8; 6]>,
+    ) -> Result<(), crate::rtw89::packet_core::Error> {
+        self.packet(|c, _| c.set_scan_address(scan))
     }
     async fn station_configure_ra(
         &mut self,
@@ -1992,6 +2008,85 @@ kernel_test_in!(
     smoke_rtw8852b_recipient_block_ack_reorders_and_tears_down
 );
 
+fn cam_with(packets: &[Vec<u8>], address: [u8; 6]) -> Vec<usize> {
+    packets
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.len() == 68 && p.windows(6).any(|w| w == address))
+        .map(|(i, _)| i)
+        .collect()
+}
+fn smoke_rtw8852b_random_scan_address_cam_probe_and_restore() -> TestResult {
+    let h = Harness::new(false);
+    let request = |random_mac| ScanRequest {
+        ssids: vec![SSID.to_vec()],
+        frequencies_mhz: vec![2412],
+        channels: vec![1],
+        active: true,
+        random_mac,
+        colocated_6ghz: false,
+        duration_tu: Some(20),
+        duration_mandatory: false,
+        extra_ies: Vec::new(),
+    };
+    let base = narf_wireless::ScanRandomMac {
+        addr: [0x02, 0x11, 0x22, 0, 0, 0],
+        mask: [0xff, 0xff, 0xff, 0, 0, 0],
+    };
+    // Failure: a mask that randomizes the group bit (cfg80211 rejects it)
+    // is refused before any controller or RF activity.
+    let before = h.model(|io| io.control.packets().len());
+    let bad = narf_wireless::ScanRandomMac {
+        addr: base.addr,
+        mask: [0xfe, 0xff, 0xff, 0, 0, 0],
+    };
+    if complete(h.device.scan(request(Some(bad)))).is_ok()
+        || h.model(|io| io.control.packets().len()) != before
+        || !h.peer.lock().probes.is_empty()
+    {
+        return TestResult::Fail("random scan with a group-bit mask accepted");
+    }
+    // Success: probe from the masked random address, response directed to
+    // it is cached, and the address CAM moves to it and back.
+    let Ok(seen) = complete(h.device.scan(request(Some(base)))) else {
+        return TestResult::Fail("random-address scan failed");
+    };
+    let probes = h.peer.lock().probes.clone();
+    let Some(probe) = probes.last() else {
+        return TestResult::Fail("no random-address probe request");
+    };
+    let mut random = [0u8; 6];
+    random.copy_from_slice(&probe[10..16]);
+    if random[..3] != base.addr[..3] || random == OWN || random[0] & 1 != 0 {
+        return TestResult::Fail("probe source is not the masked random address");
+    }
+    if seen.len() != 1 || seen[0].bssid != AP {
+        return TestResult::Fail("response to the random address not observed");
+    }
+    let packets = h.model(|io| io.control.packets().to_vec());
+    let to_random = cam_with(&packets, random);
+    let to_own: Vec<usize> = cam_with(&packets, OWN)
+        .into_iter()
+        .filter(|i| to_random.first().is_some_and(|r| i > r))
+        .collect();
+    if to_random.len() != 1 || to_own.len() != 1 {
+        return TestResult::Fail("address CAM not moved to the scan address and restored");
+    }
+    // Teardown/restore: an ordinary scan and association use the own address.
+    if complete(h.device.scan(request(None))).is_err()
+        || h.peer.lock().probes.last().map(|p| p[10..16].to_vec()) != Some(OWN.to_vec())
+    {
+        return TestResult::Fail("own-address scan after random scan differs");
+    }
+    if complete(h.device.associate(h.request())).is_err() || !h.device.link_up() {
+        return TestResult::Fail("association after random scan failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/scan",
+    smoke_rtw8852b_random_scan_address_cam_probe_and_restore
+);
 fn smoke_rtw8852b_active_scan_probe_requests_and_extra_ies() -> TestResult {
     let h = Harness::new(false);
     let active = |ssids: Vec<Vec<u8>>, extra_ies: Vec<u8>| ScanRequest {
@@ -2045,8 +2140,9 @@ fn smoke_rtw8852b_active_scan_probe_requests_and_extra_ies() -> TestResult {
     {
         return TestResult::Fail("per-SSID probe requests differ");
     }
-    // Malformed or driver-owned IEs, oversize IEs, too many SSIDs and
-    // random MAC requests are refused without transmitting.
+    // Malformed or driver-owned IEs, oversize IEs, too many SSIDs and a
+    // random-MAC mask that randomizes the group bit are refused without
+    // transmitting (valid random MACs: random_scan_address smoke).
     let before = h.peer.lock().probes.len();
     for request in [
         active(vec![SSID.to_vec()], vec![0, 1, 0x41]),
@@ -2061,10 +2157,10 @@ fn smoke_rtw8852b_active_scan_probe_requests_and_extra_ies() -> TestResult {
     let mut random = active(Vec::new(), Vec::new());
     random.random_mac = Some(narf_wireless::scan::ScanRandomMac {
         addr: [2, 0, 0, 0, 0, 9],
-        mask: [0xff, 0xff, 0xff, 0, 0, 0],
+        mask: [0xfe, 0xff, 0xff, 0, 0, 0],
     });
     if complete(h.device.scan(random)).is_ok() || h.peer.lock().probes.len() != before {
-        return TestResult::Fail("random-MAC scan accepted or probe sent");
+        return TestResult::Fail("group-bit random-MAC scan accepted or probe sent");
     }
     if h.closed() && h.device.connected_bssid().is_some() {
         return TestResult::Fail("station state disturbed by scans");

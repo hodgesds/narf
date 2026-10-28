@@ -163,6 +163,8 @@ pub(super) struct Controller {
     admission: Option<Admission>,
     /// Static BA CAM entries (`rtw8852b bacam_num = 2`): owning TID.
     ba_cam: [Option<u8>; 2],
+    /// Random scan address currently in the address CAM SMA.
+    scan: Option<[u8; 6]>,
 }
 struct Attempt {
     admission: Admission,
@@ -192,6 +194,7 @@ impl Controller {
             peer: None,
             admission: None,
             ba_cam: [None; 2],
+            scan: None,
         })
     }
     pub(super) fn own(&self) -> [u8; 6] {
@@ -274,6 +277,7 @@ impl Controller {
         if self.phase() != Phase::Passive
             || self.admission.as_ref().is_none_or(|a| !a.same(admission))
             || self.peer.is_some()
+            || self.scan.is_some()
             || !unicast(bssid)
             || bssid == self.own
         {
@@ -310,6 +314,48 @@ impl Controller {
         })?;
         attempt.armed = false;
         Ok(peer)
+    }
+    /// `rtw89_core_scan_start` / `rtw89_core_scan_complete` ->
+    /// `rtw89_fw_h2c_cam`: point the passive address CAM SMA at a random
+    /// scan address, or (`None`) back at the own address. A failed or
+    /// cancelled update closes admission like every other controller step.
+    pub(super) async fn scan_address(
+        &mut self,
+        io: &mut impl Interface,
+        address: Option<[u8; 6]>,
+        admission: &Admission,
+    ) -> Result<(), Error> {
+        let sma = address.unwrap_or(self.own);
+        if self.phase() != Phase::Passive
+            || self.admission.as_ref().is_none_or(|a| !a.same(admission))
+            || self.peer.is_some()
+            || address.is_some() == self.scan.is_some()
+            || !unicast(sma)
+        {
+            return Err(Error::Unsupported);
+        }
+        self.phase = Phase::Failed;
+        let mut attempt = Attempt {
+            admission: admission.clone(),
+            peer: None,
+            armed: true,
+        };
+        command(
+            io,
+            6,
+            0,
+            &codec::cam(sma, [0; 6], 0, false, true),
+            true,
+            Some(admission),
+        )
+        .await?;
+        admission.run(|| {
+            self.scan = address;
+            self.phase = Phase::Passive;
+            Ok(())
+        })?;
+        attempt.armed = false;
+        Ok(())
     }
     pub(super) async fn commit_peer(
         &mut self,
