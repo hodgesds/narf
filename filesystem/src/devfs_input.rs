@@ -372,8 +372,10 @@ fn identity_bytes(value: &str, fallback: &str) -> Vec<u8> {
 // ── InputEventFile ────────────────────────────────────────────────────────────
 
 /// Whether the underlying device was created by uinput or by a
-/// hardware driver. Both accept `write()` (Linux evdev injection);
-/// the kind still keys the `/dev/input/by-*` alias naming.
+/// hardware driver. `write()` differs by kind: uinput files accept
+/// event injection; hardware files accept only the LED-output
+/// records of `write_hardware_led`. The kind also keys the
+/// `/dev/input/by-*` alias naming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceKind {
     Hardware,
@@ -513,22 +515,29 @@ impl FileOps for InputEventFile {
 
     /// Write events into the device.
     ///
-    /// Both device kinds accept a buffer of 24-byte Linux
+    /// UserDevice (uinput) files accept a buffer of 24-byte Linux
     /// `input_event` records, unpack each into an internal
-    /// `EvdevEvent`, and inject them via `ROUTER.dispatch`. For a
-    /// hardware device this is Linux's `evdev_write` →
-    /// `input_inject_event` path: an `EV_LED` record updates the
-    /// device's LED state in the input core and fires the producer's
-    /// output hook (keyboard lock LEDs), and any other record is
-    /// delivered as if the device had produced it. For a uinput
-    /// UserDevice the same loop is the injection contract. Records
-    /// with an unrecognised `EV_*` type are skipped but still counted
-    /// as consumed (Linux is equally lenient).
+    /// `EvdevEvent`, and inject them via `ROUTER.dispatch` — that
+    /// injection is the uinput contract. Records with an
+    /// unrecognised `EV_*` type are skipped but still counted as
+    /// consumed (Linux uinput is equally lenient).
+    ///
+    /// Hardware devices take the narrow exception in
+    /// [`Self::write_hardware_led`]: LED output records only.
+    /// Arbitrary input injection into a hardware device stays
+    /// impossible — the pre-#768 blanket denial is preserved for
+    /// everything except that one path. (Linux's own `evdev_write`
+    /// injects any event type into hardware devices; NARF
+    /// deliberately narrows this, with access already gated by the
+    /// device node's permissions.)
     ///
     /// Ref: `uinput.c::uinput_write` (line ~502);
     /// `evdev.c::evdev_write` + `input.c::input_inject_event`.
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
+            if self.kind == DeviceKind::Hardware {
+                return self.write_hardware_led(buf);
+            }
             if buf.len() % LINUX_INPUT_EVENT_SIZE != 0 {
                 return Err(FsError::InvalidPath);
             }
@@ -543,6 +552,41 @@ impl FileOps for InputEventFile {
             }
             Ok(consumed)
         })
+    }
+
+    /// The hardware-device write path: keyboard LED output, and
+    /// nothing else.
+    ///
+    /// The buffer must consist *solely* of `EV_LED` records whose
+    /// codes the device declares in its ledbit. The whole buffer is
+    /// validated before any record is dispatched, so a denied write
+    /// changes no state. Anything else — an `EV_KEY` record above
+    /// all, a mixed buffer, an LED code the device does not declare,
+    /// an LED record for a device with no LED capability, or a
+    /// malformed length — is `PermissionDenied`, exactly as every
+    /// hardware write was before the LED path existed. Accepted
+    /// records flow through `ROUTER.dispatch`, which updates the
+    /// core LED bitmap and fires the producer's output hook (the
+    /// i8042 Set-LEDs exchange / I2C-HID Output report sync).
+    fn write_hardware_led(&self, buf: &[u8]) -> Result<usize, FsError> {
+        if buf.len() % LINUX_INPUT_EVENT_SIZE != 0 {
+            return Err(FsError::PermissionDenied);
+        }
+        let caps = ROUTER.caps(self.device_id).ok_or(FsError::NotFound)?;
+        let count = buf.len() / LINUX_INPUT_EVENT_SIZE;
+        let mut events = alloc::vec::Vec::with_capacity(count);
+        for i in 0..count {
+            let src = &buf[i * LINUX_INPUT_EVENT_SIZE..(i + 1) * LINUX_INPUT_EVENT_SIZE];
+            let ev = unpack_linux_event(src).ok_or(FsError::PermissionDenied)?;
+            if ev.type_ != EventType::Led || !caps.ledbit.get(ev.code) {
+                return Err(FsError::PermissionDenied);
+            }
+            events.push(ev);
+        }
+        for ev in events {
+            ROUTER.dispatch(self.device_id, ev);
+        }
+        Ok(buf.len())
     }
 
     /// Stat: character device, mode 0o060660 (device file, input group

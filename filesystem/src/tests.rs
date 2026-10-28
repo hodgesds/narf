@@ -2731,12 +2731,37 @@ kernel_test_in!(
     smoke_dev_input_read_five_events_in_one_call
 );
 
-/// 5. Write to hardware device → PermissionDenied.
+/// 5. Write to hardware device: the blanket denial stands for
+///    everything except the narrow LED-output path (issue #768).
+///    Denied: any non-LED record (the original all-zeros case, and
+///    EV_KEY above all — arbitrary input injection into a hardware
+///    device must stay impossible); an EV_LED record for a device
+///    with no LED capability; a mixed buffer (validated whole —
+///    nothing from it is dispatched); an EV_LED record naming a
+///    code the device does not declare. Accepted: a pure EV_LED
+///    buffer of declared codes on an LED-capable device.
 fn smoke_dev_input_write_hardware_denied() -> TestResult {
-    use crate::devfs_input::{DeviceKind, InputEventFile};
+    use crate::devfs_input::{DeviceKind, InputEventFile, LINUX_INPUT_EVENT_SIZE};
     use crate::{FileOps, FsError};
-    use narf_input::evdev::{DeviceCaps, ROUTER};
+    use narf_input::evdev::key::KEY_A;
+    use narf_input::evdev::{led, DeviceCaps, EventType, ROUTER};
 
+    fn record(type_: EventType, code: u16, value: i32) -> [u8; LINUX_INPUT_EVENT_SIZE] {
+        let mut r = [0u8; LINUX_INPUT_EVENT_SIZE];
+        r[16..18].copy_from_slice(&(type_ as u16).to_le_bytes());
+        r[18..20].copy_from_slice(&code.to_le_bytes());
+        r[20..24].copy_from_slice(&value.to_le_bytes());
+        r
+    }
+    fn denied(file: &InputEventFile, buf: &[u8]) -> bool {
+        matches!(
+            poll_once_devfs_input(file.write(0, buf)),
+            Some(Err(FsError::PermissionDenied))
+        )
+    }
+
+    // A device with no capabilities at all (the original smoke's
+    // device): every write shape is denied.
     let (id, _node) = ROUTER.register_device(DeviceCaps::new());
     let file = match InputEventFile::open(id, DeviceKind::Hardware) {
         Some(f) => f,
@@ -2745,18 +2770,65 @@ fn smoke_dev_input_write_hardware_denied() -> TestResult {
             return TestResult::Fail("open returned None");
         }
     };
-
-    // Attempt to write one 24-byte Linux input_event of zeros.
-    let payload = [0u8; crate::devfs_input::LINUX_INPUT_EVENT_SIZE];
-    let result = poll_once_devfs_input(file.write(0, &payload));
+    if !denied(&file, &[0u8; LINUX_INPUT_EVENT_SIZE]) {
+        ROUTER.unregister_device(id);
+        return TestResult::Fail("all-zeros (EV_SYN) hardware write was not denied");
+    }
+    if !denied(&file, &record(EventType::Key, KEY_A, 1)) {
+        ROUTER.unregister_device(id);
+        return TestResult::Fail("EV_KEY hardware write was not denied (injection hole)");
+    }
+    if !denied(&file, &record(EventType::Led, led::LED_CAPSL, 1)) {
+        ROUTER.unregister_device(id);
+        return TestResult::Fail("EV_LED write to an LED-incapable device was not denied");
+    }
     ROUTER.unregister_device(id);
 
-    match result {
-        Some(Err(FsError::PermissionDenied)) => TestResult::Pass,
-        Some(Err(_)) => TestResult::Fail("wrong error variant for hardware write"),
-        Some(Ok(_)) => TestResult::Fail("hardware write unexpectedly succeeded"),
-        None => TestResult::Fail("hardware write returned Pending"),
+    // An LED-capable device: the exception is exactly the LED path.
+    let mut caps = DeviceCaps::new();
+    caps.add_led(led::LED_NUML);
+    caps.add_led(led::LED_CAPSL);
+    caps.add_led(led::LED_SCROLLL);
+    let (id, _node) = ROUTER.register_device(caps);
+    let file = match InputEventFile::open(id, DeviceKind::Hardware) {
+        Some(f) => f,
+        None => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("open returned None for LED device");
+        }
+    };
+    // Mixed buffer: denied whole, and its LED record is NOT
+    // dispatched (state stays dark).
+    let mut mixed = [0u8; LINUX_INPUT_EVENT_SIZE * 2];
+    mixed[..LINUX_INPUT_EVENT_SIZE].copy_from_slice(&record(EventType::Led, led::LED_CAPSL, 1));
+    mixed[LINUX_INPUT_EVENT_SIZE..].copy_from_slice(&record(EventType::Key, KEY_A, 1));
+    if !denied(&file, &mixed) {
+        ROUTER.unregister_device(id);
+        return TestResult::Fail("mixed LED+KEY hardware write was not denied");
     }
+    if ROUTER.led_state(id) != Some(0) {
+        ROUTER.unregister_device(id);
+        return TestResult::Fail("denied mixed write dispatched its LED record");
+    }
+    // Undeclared LED code: denied.
+    if !denied(&file, &record(EventType::Led, led::LED_MAIL, 1)) {
+        ROUTER.unregister_device(id);
+        return TestResult::Fail("EV_LED write with undeclared code was not denied");
+    }
+    // Pure declared EV_LED buffer: accepted.
+    match poll_once_devfs_input(file.write(0, &record(EventType::Led, led::LED_CAPSL, 1))) {
+        Some(Ok(n)) if n == LINUX_INPUT_EVENT_SIZE => {}
+        _ => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("pure declared EV_LED hardware write was not accepted");
+        }
+    }
+    let state = ROUTER.led_state(id);
+    ROUTER.unregister_device(id);
+    if state != Some(1 << led::LED_CAPSL) {
+        return TestResult::Fail("accepted EV_LED write did not set the LED state");
+    }
+    TestResult::Pass
 }
 kernel_test_in!(
     "filesystem/devfs_input",

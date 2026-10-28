@@ -71,8 +71,10 @@ All code is derived strictly from the references below.
   On every change the core invokes the producer's registered LED
   sink (`DeviceNode::set_led_sink`, a plain `fn(u16)`) — or the
   producer polls `led_state` from its own pump (I2C-HID). evdev
-  `write()` accepts records on hardware devices too (Linux
-  injection), so an `EV_LED` write drives the same path. Wire
+  `write()` on a hardware device accepts *only* a pure `EV_LED`
+  buffer of codes the device declares (validated whole before any
+  dispatch) — the blanket denial of hardware writes otherwise
+  stands, so arbitrary input injection stays impossible. Wire
   encodings are producer-local and differ from the core order:
   i8042's Set-LEDs data byte is Scroll/Num/Caps at bits 0/1/2;
   a HID LED Output report follows descriptor usage order.
