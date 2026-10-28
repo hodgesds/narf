@@ -590,7 +590,8 @@ impl WirelessNetIface for Mt76Iface {
         }
         let protected = match &req.security {
             narf_wireless::SecurityConfig::Open => false,
-            narf_wireless::SecurityConfig::Wpa2 { .. } => true,
+            narf_wireless::SecurityConfig::Wpa2 { .. }
+            | narf_wireless::SecurityConfig::Wpa3 { .. } => true,
             _ => return Err(WirelessError::NotSupported),
         };
         crate::mt7921::association::validate_sme_ies(&req.ie, protected).map_err(|error| {
@@ -608,7 +609,13 @@ impl WirelessNetIface for Mt76Iface {
             narf_wireless::SecurityConfig::Wpa2 { psk } => {
                 crate::mt7921::association::Security::Wpa2Psk { psk }
             }
-            narf_wireless::SecurityConfig::Wpa3 { .. } => return Err(WirelessError::NotSupported),
+            // WPA3-Personal: the driver runs SAE (sae_pwe=2) and PMF itself.
+            narf_wireless::SecurityConfig::Wpa3 { password } => {
+                crate::mt7921::association::Security::Wpa3Sae {
+                    password: crate::mt7921::association::SaePassword::new(&password)
+                        .ok_or(WirelessError::InvalidArgs)?,
+                }
+            }
             // No external-supplicant mode: mt7921's firmware path runs the
             // handshake from the PMK (nl80211 never builds this for it).
             narf_wireless::SecurityConfig::External(_) => return Err(WirelessError::NotSupported),

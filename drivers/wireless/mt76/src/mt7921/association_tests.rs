@@ -87,7 +87,7 @@ fn mt76_join_plan_encodes_rates_and_exact_wpa2_rsn() -> TestResult {
     if sec_rec.len() != 164
         || sec_rec[..8] != [0, 1, 6, 0, 1, 0, 0, 0]
         || sec_rec[120..128] != [17, 0, 44, 0, 0, 1, 0, 0]
-        || sec_rec[128..132] != [6, 36, 0, 16]
+        || sec_rec[128..132] != [5, 36, 0, 16]
         || sec_rec[132..148] != key
         || sec_rec[16] != 2
         || sec_rec[64] != 2
@@ -258,7 +258,7 @@ fn mt76_group_wtbl_and_key_request_match_linux_null_station() -> TestResult {
     if record.len() != 52
         || record[..20]
             != [
-                0, 19, 1, 0, 1, 14, 0, 0, 17, 0, 44, 0, 0, 1, 0, 0, 6, 36, 2, 16,
+                0, 19, 1, 0, 1, 14, 0, 0, 17, 0, 44, 0, 0, 1, 0, 0, 5, 36, 2, 16,
             ]
         || record[20..36] != [0x77; 16]
         || record[36..] != [0; 16]
@@ -272,7 +272,7 @@ fn mt76_group_wtbl_and_key_request_match_linux_null_station() -> TestResult {
     if pairwise.len() != 52
         || pairwise[..20]
             != [
-                0, 1, 1, 0, 1, 0, 0, 0, 17, 0, 44, 0, 0, 1, 0, 0, 6, 36, 0, 16,
+                0, 1, 1, 0, 1, 0, 0, 0, 17, 0, 44, 0, 0, 1, 0, 0, 5, 36, 0, 16,
             ]
         || pairwise[20..36] != [0x66; 16]
         || pairwise[36..] != [0; 16]

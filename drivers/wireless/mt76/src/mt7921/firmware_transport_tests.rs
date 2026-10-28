@@ -27,6 +27,8 @@ mod ht20_tests;
 mod ht40_tests;
 #[path = "ht_protection_tests.rs"]
 mod ht_protection_tests;
+#[path = "pmf_tests.rs"]
+mod pmf_tests;
 #[path = "receive_epoch_tests.rs"]
 mod receive_epoch_tests;
 #[path = "rx_ba_tests.rs"]
@@ -718,9 +720,11 @@ impl Backend for Model {
                 // validates the exact closing frame and retires that fixture
                 // peer; it adds no production RX or cleanup acceptance.
                 let beacon = ap.beacon();
+                // Under PMF the closing deauth is CCMP protected (Protected bit).
+                let protected = if ap.pmf() { 0x40 } else { 0 };
                 if ap.phase() != narf_wifi_fixtures::ApPhase::Authorized
                     || frame.len() != 26
-                    || frame[1..4] != [0; 3]
+                    || frame[1..4] != [protected, 0, 0]
                     || frame[4..10] != beacon[10..16]
                     || frame[10..16] != [2, 0x11, 0x22, 0x33, 0x44, 0x55]
                     || frame[16..22] != beacon[10..16]
@@ -735,9 +739,20 @@ impl Backend for Model {
         if frame.first() == Some(&0xd0) {
             if let Some(ap) = &self.access_point {
                 let beacon = ap.beacon();
+                let protected = if ap.pmf() { 0x40 } else { 0 };
+                // SA Query Response (category 8, action 1) under PMF.
+                if ap.pmf()
+                    && frame.len() == 28
+                    && frame[1..4] == [0x40, 0, 0]
+                    && frame[4..10] == beacon[10..16]
+                    && frame[16..22] == beacon[10..16]
+                    && frame[24..26] == [8, 1]
+                {
+                    return Ok(());
+                }
                 if ap.phase() != narf_wifi_fixtures::ApPhase::Authorized
                     || !matches!(frame.len(), 30 | 33)
-                    || frame[1..4] != [0; 3]
+                    || frame[1..4] != [protected, 0, 0]
                     || frame[4..10] != beacon[10..16]
                     || frame[10..16] != [2, 0x11, 0x22, 0x33, 0x44, 0x55]
                     || frame[16..22] != beacon[10..16]
@@ -2111,7 +2126,7 @@ fn live_join_wpa2(channel: u8, ofdm: bool, entropy_failure: bool) -> TestResult 
             && f[43] == 7
             && f.len() >= 48 + 44
             && f[49] == 1
-            && f[f.len() - 44..f.len() - 32] == [17, 0, 44, 0, 0, 1, 0, 0, 6, 36, 0, 16]
+            && f[f.len() - 44..f.len() - 32] == [17, 0, 44, 0, 0, 1, 0, 0, 5, 36, 0, 16]
     });
     if secure_sta_rec.is_none() {
         return TestResult::Fail("secure STA_REC with native KEY_V2 tag 17 not emitted");
@@ -2573,7 +2588,7 @@ fn secure_model() -> Session<Model> {
     )
     .unwrap();
     let mut security =
-        join::StationSecurity::new(&bss, &plan, info.capabilities.mac, [0x55; 32]).unwrap();
+        join::StationSecurity::new(&bss, &plan, info.capabilities.mac, &[0x55; 32]).unwrap();
     security
         .commit_group(&narf_wireless::eapol::Gtk {
             key_id: 1,

@@ -37,6 +37,14 @@ pub(super) fn management(
     }
     let subtype = u32::from((fc >> 4) & 15);
     let multicast = frame[4] & 1 != 0;
+    // A unicast management frame with the Protected bit is a PMF robust
+    // frame for the installed PTK: mt76_connac2_mac_write_txwi sets
+    // MT_TXD3_PROTECT_FRAME (bit 1) whenever mac80211 selected a hardware
+    // key. Native data here (EAPOL) is never pre-protected.
+    let protected = fc & 0x4000 != 0;
+    if protected && (multicast || !is_mgmt) {
+        return Err(Error::Bounds);
+    }
     let words = [
         (frame.len() as u32 + 32) | (0x10 << 25), // CT, LMAC ALTX0.
         (1 << 31) | (2 << 16) | (12 << 11) | u32::from(wcid),
@@ -45,7 +53,7 @@ pub(super) fn management(
             | (u32::from(multicast) << 10)
             | subtype
             | if is_data { 2 << 4 } else { 0 },
-        (1 << 28) | (15 << 11) | u32::from(multicast),
+        (1 << 28) | (15 << 11) | (u32::from(protected) << 1) | u32::from(multicast),
         0,
         0,
         4 | (u32::from(rate.hardware()) << 16),

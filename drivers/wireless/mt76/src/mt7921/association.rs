@@ -35,24 +35,96 @@ impl LegacyRate {
         self.0
     }
 }
+/// An SAE password, held by value so `Security` stays `Copy`. Linux mt7921
+/// leaves SAE to the SME; NARF's in-kernel SME bounds it at 128 octets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SaePassword {
+    bytes: [u8; 128],
+    len: u8,
+}
+impl core::fmt::Debug for SaePassword {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("SaePassword { .. }")
+    }
+}
+impl SaePassword {
+    pub fn new(password: &[u8]) -> Option<Self> {
+        if password.is_empty() || password.len() > 128 {
+            return None;
+        }
+        let mut bytes = [0; 128];
+        bytes[..password.len()].copy_from_slice(password);
+        Some(Self {
+            bytes,
+            len: password.len() as u8,
+        })
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Security {
     Open,
-    Wpa2Psk { psk: [u8; 32] },
+    /// WPA2-PSK without management-frame protection (`ieee80211w=0`).
+    Wpa2Psk {
+        psk: [u8; 32],
+    },
+    /// WPA2-PSK/PSK-SHA256 with `ieee80211w=1` (`required = false`) or
+    /// `ieee80211w=2`: MFPC (|MFPR) in the RSNE, IGTK and BIP when the AP
+    /// also sets MFPC.
+    Wpa2PskPmf {
+        psk: [u8; 32],
+        required: bool,
+    },
+    /// WPA3-Personal: SAE authentication (sae_pwe=2), PMF required.
+    Wpa3Sae {
+        password: SaePassword,
+    },
 }
 impl core::fmt::Debug for Security {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(if self.is_wpa2() {
-            "Wpa2Psk { .. }"
-        } else {
-            "Open"
+        f.write_str(match self {
+            Self::Open => "Open",
+            Self::Wpa2Psk { .. } => "Wpa2Psk { .. }",
+            Self::Wpa2PskPmf { .. } => "Wpa2PskPmf { .. }",
+            Self::Wpa3Sae { .. } => "Wpa3Sae { .. }",
         })
     }
 }
 impl Security {
+    /// Any RSN profile (WPA2 or WPA3): the association runs the 4-way
+    /// handshake and installs hardware keys.
     #[inline]
     pub fn is_wpa2(&self) -> bool {
-        matches!(self, Self::Wpa2Psk { .. })
+        !matches!(self, Self::Open)
+    }
+    /// The shared plan's security mode.
+    pub fn mode(&self) -> SecurityMode {
+        match self {
+            Self::Open => SecurityMode::Open,
+            Self::Wpa2Psk { .. } | Self::Wpa2PskPmf { .. } => SecurityMode::Wpa2Psk,
+            Self::Wpa3Sae { .. } => SecurityMode::Wpa3Sae {
+                pwe: narf_wireless::association::SaePwe::Both,
+            },
+        }
+    }
+    /// The shared plan's key-path options. The legacy WPA2 profile keeps
+    /// the default AKM set; PMF/SAE profiles add PSK-SHA256 (AKM 6), whose
+    /// AES-128-CMAC EAPOL MIC the shared supplicant implements.
+    pub fn options(&self) -> narf_wireless::association::JoinOptions {
+        use narf_wireless::association::{AkmSet, JoinOptions, Pmf};
+        match self {
+            Self::Open | Self::Wpa2Psk { .. } => JoinOptions::default(),
+            Self::Wpa2PskPmf { required, .. } => JoinOptions::default()
+                .with_akms(AkmSet::ALL)
+                .with_pmf(if *required {
+                    Pmf::Required
+                } else {
+                    Pmf::Optional
+                }),
+            Self::Wpa3Sae { .. } => JoinOptions::default().with_akms(AkmSet::ALL),
+        }
     }
 }
 /// Retains MT76 record inputs; all IEEE frame preparation/transitions are
@@ -82,6 +154,12 @@ fn unicast(address: [u8; 6]) -> bool {
 // mt76_connac_mcu.h enum STA_REC_KEY_V2; mt7921 set_key uses this
 // common key TLV with MCU_UNI_CMD(STA_REC_UPDATE). Tag 18 is STA_REC_MURU.
 const STA_REC_KEY_V2: u16 = 17;
+/// Linux v7.2 mt76_connac_mcu.h `enum mcu_cipher_type`: NONE, WEP40, WEP104,
+/// WEP128, TKIP, AES_CCMP (5), CCMP_256, GCMP, GCMP_256, WAPI,
+/// BIP_CMAC_128 (10). (The RXD cipher field uses the different MAC
+/// `enum mt76_cipher_type`, where AES_CCMP is 4.)
+pub(crate) const MCU_CIPHER_AES_CCMP: u8 = 5;
+pub(crate) const MCU_CIPHER_BIP_CMAC_128: u8 = 10;
 
 fn tlv(bytes: &mut Vec<u8>, id: u16, len: usize) -> usize {
     let offset = bytes.len();
@@ -120,12 +198,9 @@ impl JoinPlan {
         ssid: &[u8],
         security: Security,
     ) -> Result<Self, Error> {
-        let mode = if security.is_wpa2() {
-            SecurityMode::Wpa2Psk
-        } else {
-            SecurityMode::Open
-        };
-        let common = ManagementPlan::prepare(bss, own, ssid, mode)?;
+        let mode = security.mode();
+        let common =
+            ManagementPlan::prepare_with_options(bss, own, ssid, mode, None, security.options())?;
         let wmm = wmm::Parameters::parse(&bss.information_elements)?;
         Ok(Self {
             common,
@@ -152,11 +227,8 @@ impl JoinPlan {
         if permission.native_width() == super::cmd::CH_BW_160 && !super::vht::wide160(info) {
             return Err(NativeError::UnsupportedFirmware);
         }
-        let mode = if security.is_wpa2() {
-            SecurityMode::Wpa2Psk
-        } else {
-            SecurityMode::Open
-        };
+        let mode = security.mode();
+        let options = security.options();
         let wmm =
             wmm::Parameters::parse(&bss.information_elements).map_err(|_| NativeError::Bounds)?;
         let ap = narf_wireless::association::phy::ApElements::parse(&bss.information_elements)
@@ -166,12 +238,18 @@ impl JoinPlan {
             && wmm.is_some()
             && ap.vht_capability().is_some()
         {
-            let candidate = ManagementPlan::prepare_with_phy(
+            let candidate = ManagementPlan::prepare_with_options(
                 bss,
                 own,
                 ssid,
                 mode,
-                super::he::with_he(super::vht::local(info)?, info, true, true)?,
+                Some(super::he::with_he(
+                    super::vht::local(info)?,
+                    info,
+                    true,
+                    true,
+                )?),
+                options,
             )
             .map_err(|_| NativeError::UnsupportedFirmware)?;
             if candidate.offered_phy().is_some_and(|offer| {
@@ -183,12 +261,18 @@ impl JoinPlan {
             }) {
                 candidate
             } else {
-                let narrow = ManagementPlan::prepare_with_phy(
+                let narrow = ManagementPlan::prepare_with_options(
                     bss,
                     own,
                     ssid,
                     mode,
-                    super::he::with_he(super::vht::local80(info)?, info, true, false)?,
+                    Some(super::he::with_he(
+                        super::vht::local80(info)?,
+                        info,
+                        true,
+                        false,
+                    )?),
+                    options,
                 )
                 .map_err(|_| NativeError::UnsupportedFirmware)?;
                 if narrow.offered_phy().is_some_and(|offer| {
@@ -200,12 +284,16 @@ impl JoinPlan {
                 }) {
                     narrow
                 } else {
-                    ManagementPlan::prepare_with_phy(
+                    ManagementPlan::prepare_with_options(
                         bss,
                         own,
                         ssid,
                         mode,
-                        super::vht::ht_fallback(info, permission.native_width() != 0)?,
+                        Some(super::vht::ht_fallback(
+                            info,
+                            permission.native_width() != 0,
+                        )?),
+                        options,
                     )
                     .map_err(|_| NativeError::UnsupportedFirmware)?
                 }
@@ -218,10 +306,10 @@ impl JoinPlan {
             } else {
                 local
             };
-            ManagementPlan::prepare_with_phy(bss, own, ssid, mode, local)
+            ManagementPlan::prepare_with_options(bss, own, ssid, mode, Some(local), options)
                 .map_err(|_| NativeError::UnsupportedFirmware)?
         } else {
-            ManagementPlan::prepare(bss, own, ssid, mode)
+            ManagementPlan::prepare_with_options(bss, own, ssid, mode, None, options)
                 .map_err(|_| NativeError::UnsupportedFirmware)?
         };
         let mut plan = Self {
@@ -318,6 +406,39 @@ impl JoinPlan {
         }
         self.wmm_association.extend_from_slice(&wmm::INFORMATION);
         Ok(Some(&self.wmm_association))
+    }
+    /// Bind `session`'s first Commit (shared `start_sae_authentication`).
+    pub fn start_sae_authentication(
+        &mut self,
+        session: &narf_wireless::sae::SaeSession,
+    ) -> Result<&[u8], Error> {
+        self.common.start_sae_authentication(session)
+    }
+    /// One SAE Authentication receipt. `Some(Ok(frame))` transmits a Commit
+    /// retry or our Confirm; `Some(Err(request))` is the accepted SAE's
+    /// association request, extended exactly like the open/PSK request
+    /// (WMM Information, untyped HT Capabilities).
+    pub fn sae_authentication_response(
+        &mut self,
+        bytes: &[u8],
+        session: &mut narf_wireless::sae::SaeSession,
+    ) -> Result<Option<Result<Vec<u8>, Vec<u8>>>, Error> {
+        use narf_wireless::association::SaeStep;
+        let typed_phy = self.common.offered_phy().is_some();
+        let request = match self.common.sae_authentication_response(bytes, session)? {
+            SaeStep::Ignored => return Ok(None),
+            SaeStep::Transmit(frame) => return Ok(Some(Ok(frame.to_vec()))),
+            SaeStep::Associate(request) => request.to_vec(),
+        };
+        if self.wmm.is_none() {
+            return Ok(Some(Err(request)));
+        }
+        let mut out = request;
+        if let Some(profile) = self.ht20.filter(|_| !typed_phy) {
+            out.extend_from_slice(&profile.request_ie());
+        }
+        out.extend_from_slice(&wmm::INFORMATION);
+        Ok(Some(Err(out)))
     }
     pub fn association_response(&mut self, bytes: &[u8]) -> Result<Option<u16>, Error> {
         let Some(aid) = self.common.association_response(bytes)? else {
@@ -446,7 +567,7 @@ impl JoinPlan {
         out[4] = 1; // WCID 1, five TLVs, append
         let basic = tlv(&mut out, 0, 20);
         out[basic + 4..basic + 8].copy_from_slice(&0x10002u32.to_le_bytes());
-        out[basic + 8] = if associated && !self.security.is_wpa2() {
+        out[basic + 8] = if associated && self.security == SecurityMode::Open {
             2
         } else {
             1
@@ -535,7 +656,7 @@ impl JoinPlan {
     /// Emits a completed station record for WCID 1 containing CCMP-128
     /// key installation and CONN_STATE_PORT_SECURE.
     pub fn secure_peer_record(&self, aid: u16, key: &[u8]) -> Result<Vec<u8>, Error> {
-        if !self.security.is_wpa2() || key.len() != 16 {
+        if self.security == SecurityMode::Open || key.len() != 16 {
             return Err(Error::UnsupportedSecurity);
         }
         let mut out = self.peer_record(aid, true)?;
@@ -545,7 +666,7 @@ impl JoinPlan {
         let sec = tlv(&mut out, STA_REC_KEY_V2, 44);
         out[sec + 4] = 0; // enum set_key_cmd::SET_KEY, copied verbatim by Linux.
         out[sec + 5] = 1; // n_cipher = 1
-        out[sec + 8] = 6; // cipher_id = MCU_CIPHER_AES_CCMP (6)
+        out[sec + 8] = MCU_CIPHER_AES_CCMP;
         out[sec + 9] = 36; // cipher_len
         out[sec + 10] = 0; // key_id = 0
         out[sec + 11] = 16; // key_len = 16
@@ -579,6 +700,33 @@ pub fn group_record(peer: [u8; 6], aid: u16) -> Result<Vec<u8>, Error> {
 
 /// Install/remove one CCMP-128 key without replaying the peer/WTBL state.
 /// WCID 1 is pairwise key zero; WCID 19 holds the VIF's indexed GTKs.
+/// Install the AES-CMAC IGTK on the VIF's BMC WCID 19 (Linux v7.2
+/// mt7921/main.c `mt7921_set_key`: a group key with `sta == NULL` uses
+/// `mvif->sta`, `hw_key_idx2`, `IEEE80211_KEY_FLAG_GENERATE_MMIE`).
+/// mt76_connac_mcu.c `mt76_connac_mcu_sta_key_tlv` sends the full
+/// two-entry `sta_rec_sec` (len 80, n_cipher 2): `key[0]` repeats the last
+/// CCMP group key stored for the BIP batch update (`sta_key_conf`, the
+/// GTK and its index) and `key[1]` carries `MCU_CIPHER_BIP_CMAC_128` with
+/// the IGTK (its `key_id` is left zero by Linux).
+pub fn igtk_record(gtk_id: u8, gtk: &[u8], igtk: &[u8]) -> Result<Vec<u8>, Error> {
+    if gtk_id > 3 || gtk.len() != 16 || igtk.len() != 16 {
+        return Err(Error::UnsupportedSecurity);
+    }
+    let mut out = vec![0; 8];
+    out[1] = 19;
+    out[2] = 1;
+    out[4] = 1;
+    out[5] = 0xe;
+    let sec = tlv(&mut out, STA_REC_KEY_V2, 80);
+    out[sec + 4] = 0; // SET_KEY
+    out[sec + 5] = 2; // n_cipher
+    out[sec + 8..sec + 12].copy_from_slice(&[MCU_CIPHER_AES_CCMP, 36, gtk_id, 16]);
+    out[sec + 12..sec + 28].copy_from_slice(gtk);
+    out[sec + 44..sec + 48].copy_from_slice(&[MCU_CIPHER_BIP_CMAC_128, 36, 0, 16]);
+    out[sec + 48..sec + 64].copy_from_slice(igtk);
+    Ok(out)
+}
+
 pub fn key_record(wcid: u8, key_id: u8, key: Option<&[u8]>) -> Result<Vec<u8>, Error> {
     if !matches!(wcid, 1 | 19)
         || key_id > 3
@@ -598,7 +746,7 @@ pub fn key_record(wcid: u8, key_id: u8, key: Option<&[u8]>) -> Result<Vec<u8>, E
     out[sec + 4] = u8::from(key.is_none());
     if let Some(key) = key {
         out[sec + 5] = 1;
-        out[sec + 8..sec + 12].copy_from_slice(&[6, 36, key_id, 16]);
+        out[sec + 8..sec + 12].copy_from_slice(&[MCU_CIPHER_AES_CCMP, 36, key_id, 16]);
         out[sec + 12..sec + 28].copy_from_slice(key);
     }
     Ok(out)
