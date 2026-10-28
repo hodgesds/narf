@@ -17,11 +17,13 @@
 extern crate alloc;
 
 pub mod dispatch;
+pub mod gic_dt;
 pub mod its_core;
 pub mod its_fw;
 pub mod vector;
 pub mod wait;
 
+mod gic_dt_tests;
 mod gic_spi_tests;
 #[path = "its_tests.rs"]
 mod its_tests;
