@@ -141,6 +141,8 @@ pub(super) struct Core {
     rings: Vec<Ring>,
     /// Stop bits of exactly the rings this owner published.
     stop: u32,
+    /// Signed HT program: admit 20MHz HT MCS0..15 receptions.
+    ht: bool,
     next_id: u64,
     pending: Option<Pending>,
     completions: VecDeque<Receipt>,
@@ -200,7 +202,7 @@ fn allocate(port: &mut impl Port, length: usize) -> Result<DmaBuffer, Error> {
 }
 impl Core {
     pub(super) fn prepare(port: &mut impl Port, own: [u8; 6], mac_id: u8) -> Result<Self, Error> {
-        Self::prepare_with(port, own, mac_id, false)
+        Self::prepare_with(port, own, mac_id, false, false)
     }
     /// `qos_all` additionally publishes ACH1..3 (BK/VI/VO) for the separately
     /// qualified all-AC QoS program.
@@ -209,6 +211,7 @@ impl Core {
         own: [u8; 6],
         mac_id: u8,
         qos_all: bool,
+        ht: bool,
     ) -> Result<Self, Error> {
         if own == [0; 6] || own[0] & 1 != 0 || mac_id != 0 {
             return Err(Error::Packet);
@@ -243,6 +246,7 @@ impl Core {
                     rings
                 },
                 stop,
+                ht,
                 next_id: 1,
                 pending: None,
                 completions: VecDeque::new(),
@@ -434,13 +438,16 @@ impl Core {
         match received.event {
             None | Some(rx_packet::Event::Dropped) => {}
             Some(rx_packet::Event::Firmware(event)) => step.c2h = Some(event.bytes),
+            // Without the signed HT program an HT PPDU is dropped exactly as
+            // the assembler dropped every non-legacy rate before.
+            Some(rx_packet::Event::Wifi(meta, _)) if meta.rate > 11 && !self.ht => {}
             Some(rx_packet::Event::Wifi(meta, bytes)) => {
                 if meta.crc_error
                     || meta.icv_error
                     || meta.hardware_decrypted
                     || meta.aggregate
                     || meta.bandwidth != 0
-                    || meta.rate > 11
+                    || !(meta.rate <= 11 || self.ht && (0x80..=0x8f).contains(&meta.rate))
                     || bytes.len() < 24
                     || bytes.len() > format::MAX_MPDU
                     || meta.size != bytes.len() + 4

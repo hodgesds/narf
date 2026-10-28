@@ -174,10 +174,16 @@ impl Model {
         Ok(unsafe { core::slice::from_raw_parts(pointer, length).to_vec() })
     }
     pub(in crate::rtw89) fn inject(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.inject_rate(bytes, 0)
+    }
+    /// Inject with an RXWD DWORD1 rate (e.g. `0x80` = HT MCS0).
+    pub(in crate::rtw89) fn inject_rate(&mut self, bytes: &[u8], rate: u16) -> Result<(), Error> {
         let mut wire = vec![0; 20];
         let size = (20 + bytes.len() + 4) as u32;
         wire[..4].copy_from_slice(&(size | 1 << 15 | 1 << 14).to_le_bytes());
         wire[4..8].copy_from_slice(&((bytes.len() + 4) as u32).to_le_bytes());
+        // RXWD DWORD1 (after the 4-byte RXBD info) carries RX_DATARATE[24:16].
+        wire[8..12].copy_from_slice(&(u32::from(rate) << 16).to_le_bytes());
         wire.extend_from_slice(bytes);
         wire.extend_from_slice(&[0; 4]);
         let event = rx_packet::Assembler::default()

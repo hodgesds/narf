@@ -83,7 +83,8 @@ impl Native {
         }
         self.ordinary_current()?;
         let qos_all = self.station_qos_all_allowed().unwrap_or(false);
-        let core = packet::Core::prepare_with(&mut self.station_access(), own, macid, qos_all);
+        let ht = self.station_ht_allowed().unwrap_or(false);
+        let core = packet::Core::prepare_with(&mut self.station_access(), own, macid, qos_all, ht);
         match core {
             Ok(core) => {
                 self.station_runtime.core = Some(core);

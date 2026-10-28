@@ -29,21 +29,26 @@ pub(super) enum Program {
     QosAll,
     /// Firmware rate adaptation and hardware retry fallback (H2C RA).
     FirmwareRa,
+    /// HT20 station: HT capability IE, firmware RA over MCS0..7 TX,
+    /// MCS0..15 RX.
+    Ht,
 }
 impl Program {
-    pub(super) const ALL: [Self; 3] = [Self::Wmm, Self::QosAll, Self::FirmwareRa];
+    pub(super) const ALL: [Self; 4] = [Self::Wmm, Self::QosAll, Self::FirmwareRa, Self::Ht];
     pub(super) const BASE: u8 = 3;
     pub(super) fn bit(self) -> u8 {
         match self {
             Self::Wmm => 1 << 2,
             Self::QosAll => 1 << 3,
             Self::FirmwareRa => 1 << 4,
+            Self::Ht => 1 << 5,
         }
     }
     fn requires(self) -> u8 {
         match self {
             Self::Wmm => 0,
             Self::QosAll | Self::FirmwareRa => Self::Wmm.bit(),
+            Self::Ht => Self::Wmm.bit() | Self::FirmwareRa.bit(),
         }
     }
     /// Base flags plus `self` and everything it requires.
@@ -76,6 +81,11 @@ impl Program {
                 hash.update(b"NARF RTL8852B firmware RA legacy optional operating recipe v1");
                 hash.update(&identity);
                 hash.update(&super::station_control::firmware_ra_fingerprint());
+            }
+            Self::Ht => {
+                hash.update(b"NARF RTL8852B HT20 optional operating recipe v1");
+                hash.update(&identity);
+                hash.update(&super::station_control::ht_fingerprint());
             }
         }
         hash.finalize()

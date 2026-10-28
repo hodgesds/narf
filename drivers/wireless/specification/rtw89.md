@@ -1005,6 +1005,25 @@ revision2 fixed fastest-rate recipe is unchanged. Smoke:
 `smoke_rtw8852b_firmware_ra_h2c_and_adaptive_data_txwd`. RA C2H reports
 are not consumed (Linux uses them only for statistics).
 
+### HT20 station operation
+
+`radio_policy::Program::Ht` (byte57 bit5, requires `Wmm` and `FirmwareRa`)
+enables HT20. When the AP also advertises WMM, the station prepares its
+join through the shared `JoinPlan::prepare_with_phy(LocalPhy::ht20(..))`
+with `station_control::local_ht()`: Linux `rtw89_init_ht_cap` restricted to
+this TX-A/RX-AB 20MHz profile (SGI20, LDPC, RX STBC1, 64K A-MPDU factor,
+no density, RX MCS0..15, TX MCS0..7). HT40/DSSSCCK40/SGI40 belong to
+`wide_channels`; TX STBC needs a second TX path this profile lacks; the
+large A-MSDU bit belongs to `aggregation`. The negotiated HT facts feed the
+firmware RA H2C exactly like `rtw89_phy_ra_sta_update`'s HT branch
+(`mode |= HT`, peer RX MCS bytes shifted to bits 12/24/36/48, masked to
+`RA_MASK_HT_1SS_RATES|SUBOFDM|SUBCCK` for one TX stream, SGI20/LDPC from the
+negotiation, STBC0, SS_NUM0). The RX assembler now passes 20MHz HT MCS0..15
+(`RTW89_HW_RATE_MCS0..MCS15`); the packet owner admits them only under the
+HT program and otherwise drops them as before without closing the station.
+Smoke: `smoke_rtw8852b_ht20_capability_ra_mcs_and_rx` (HT element in the
+association request, HT RA mask, RA data TXWD, MCS7 RX, non-HT drop).
+
 ### Live AP EDCA updates
 
 Bound peer beacons/probe responses on an open WMM link follow mac80211

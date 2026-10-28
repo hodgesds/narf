@@ -56,11 +56,19 @@ unsafe impl Io for Startup {
         self.station_allowed()?;
         self.station_native()?.station_firmware_ra_allowed()
     }
+    fn station_ht_allowed(&mut self) -> Result<bool, power::Error> {
+        self.station_allowed()?;
+        self.station_native()?.station_ht_allowed()
+    }
     async fn station_configure_ra(
         &mut self,
         rates: u16,
+        ht: Option<control::HtRa>,
         admission: &control::Admission,
     ) -> Result<(), power::Error> {
+        if ht.is_some() && !self.station_ht_allowed()? {
+            return Err(power::Error::Unsupported);
+        }
         if !self.station_firmware_ra_allowed()? {
             return Err(power::Error::Unsupported);
         }
@@ -72,7 +80,7 @@ unsafe impl Io for Startup {
         self.station_controller
             .as_mut()
             .ok_or(power::Error::Terminal)?
-            .configure_ra(&mut native.station_access(), rates, admission)
+            .configure_ra(&mut native.station_access(), rates, ht, admission)
             .await
     }
     fn station_qos_all_allowed(&mut self) -> Result<bool, power::Error> {

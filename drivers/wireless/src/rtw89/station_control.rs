@@ -399,9 +399,10 @@ impl Controller {
         &mut self,
         io: &mut impl Interface,
         rates: u16,
+        ht: Option<codec::HtRa>,
         admission: &Admission,
     ) -> Result<(), Error> {
-        let body = codec::ra(rates).ok_or(Error::Unsupported)?;
+        let body = codec::ra_ht(rates, ht).ok_or(Error::Unsupported)?;
         if self.phase() != Phase::Associated
             || self.admission.as_ref().is_none_or(|a| !a.same(admission))
         {
@@ -652,6 +653,7 @@ async fn edca(
 }
 #[path = "station_control/codec.rs"]
 mod codec;
+pub(super) use codec::HtRa;
 
 pub(super) fn profile_fingerprint() -> [u8; 32] {
     let mut hash = narf_crypto::sha256::Sha256::new();
@@ -670,6 +672,21 @@ pub(super) fn wmm_fingerprint() -> [u8; 32] {
     hash.update(&[11, 10, 9, 8, 7, 6, 3, 5, 4, 2, 1, 0]);
     hash.update(&narf_wireless::wmm::INFORMATION);
     hash.finalize()
+}
+/// Emitter program added by `radio_policy::Program::Ht`.
+pub(super) fn ht_fingerprint() -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"B HT20 v1; HT cap SGI20 LDPC RXSTBC1 ampdu64K density0 RX MCS0..15 TX MCS0..7; no HT40/greenfield/TXSTBC/A-MPDU");
+    hash.update(b"RA mode CCK|OFDM|HT mask HT1SS|SUBOFDM|SUBCCK, SGI20/LDPC from negotiation, STBC0, SS1; RX 20MHz MCS0..15 admitted");
+    hash.update(&super::station_control::local_ht().capability_body());
+    hash.finalize()
+}
+/// Local HT20 capability (Linux `rtw89_init_ht_cap` restricted to the
+/// retained TX-A/RX-AB 20MHz profile).
+pub(super) fn local_ht() -> narf_wireless::association::phy::LocalHt {
+    narf_wireless::association::phy::LocalHt::siso20(true, true)
+        .with_ldpc(true, true)
+        .with_rx_stbc(true)
 }
 /// Emitter program added by `radio_policy::Program::FirmwareRa`.
 pub(super) fn firmware_ra_fingerprint() -> [u8; 32] {

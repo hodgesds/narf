@@ -222,7 +222,8 @@ impl Assembler {
                     || descriptor.hardware_decrypted
                     || descriptor.aggregate
                     || descriptor.bandwidth != 0
-                    || descriptor.rate > 11
+                    // Legacy CCK1..OFDM54 or 20MHz HT MCS0..15 (RTW89_HW_RATE_MCS0).
+                    || !(descriptor.rate <= 11 || (0x80..=0x8f).contains(&descriptor.rate))
                 {
                     Event::Dropped
                 } else {

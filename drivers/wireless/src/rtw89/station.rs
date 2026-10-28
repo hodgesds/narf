@@ -34,8 +34,17 @@ pub(super) unsafe trait Io: Send {
         Ok(false)
     }
     /// Program firmware RA for the WMM-configured peer.
-    async fn station_configure_ra(&mut self, _: u16, _: &Admission) -> Result<(), power::Error> {
+    async fn station_configure_ra(
+        &mut self,
+        _: u16,
+        _: Option<super::station_control::HtRa>,
+        _: &Admission,
+    ) -> Result<(), power::Error> {
         Err(power::Error::Unsupported)
+    }
+    /// Signed HT20 program (`Program::Ht`).
+    fn station_ht_allowed(&mut self) -> Result<bool, power::Error> {
+        Ok(false)
     }
     /// Signed all-AC/TID QoS program (`radio_policy::Program::QosAll`).
     fn station_qos_all_allowed(&mut self) -> Result<bool, power::Error> {
@@ -233,6 +242,8 @@ pub(super) struct State {
     qos_all: bool,
     /// Firmware rate adaptation owns DATA rates for this association.
     firmware_ra: bool,
+    /// HT20 was negotiated for this association.
+    ht: bool,
     deadline: u64,
     last_peer: u64,
     last_now: u64,
@@ -274,6 +285,7 @@ impl State {
             short_slot: false,
             qos_all: false,
             firmware_ra: false,
+            ht: false,
             deadline: 0,
             last_peer: 0,
             last_now: 0,
@@ -338,6 +350,7 @@ impl State {
         self.edca_pending = None;
         self.qos_all = false;
         self.firmware_ra = false;
+        self.ht = false;
         self.admission.close();
         self.established = false;
         self.phase = Phase::Stopped;
@@ -371,6 +384,7 @@ impl State {
         self.edca_pending = None;
         self.qos_all = false;
         self.firmware_ra = false;
+        self.ht = false;
         if let Some(security) = &mut self.security {
             security.fail();
         }
@@ -534,6 +548,9 @@ impl State {
         }
         self.edca_pending = Some(offered);
         Ok(())
+    }
+    pub(super) fn ht(&self) -> bool {
+        self.ht
     }
     pub(super) fn qos_all(&self) -> bool {
         self.qos_all && self.wmm.is_some()
@@ -829,7 +846,20 @@ impl State {
         } else {
             SecurityMode::Open
         };
-        let mut plan = JoinPlan::prepare(&candidate.bss, self.own, ssid, mode)?;
+        // HT is offered only with an AP WMM element and the signed HT20
+        // program (which itself requires WMM and firmware RA).
+        let ap_wmm = narf_wireless::wmm::Parameters::parse(&candidate.bss.information_elements)
+            .ok()
+            .flatten()
+            .is_some();
+        let mut plan = if ap_wmm && io.station_wmm_allowed()? && io.station_ht_allowed()? {
+            let local =
+                narf_wireless::association::phy::LocalPhy::ht20(super::station_control::local_ht())
+                    .map_err(|_| Error::Profile)?;
+            JoinPlan::prepare_with_phy(&candidate.bss, self.own, ssid, mode, local)?
+        } else {
+            JoinPlan::prepare(&candidate.bss, self.own, ssid, mode)?
+        };
         plan.append_sme_ies(ies)?;
         if let Some(pmk) = pmk {
             let nonce = self.environment.nonce().ok_or(Error::Entropy)?;
@@ -879,8 +909,19 @@ impl State {
                 if let Some(p) = self.wmm {
                     io.station_configure_wmm(p, short, &self.admission).await?;
                     if self.firmware_ra {
-                        let rates = self.plan.as_ref().ok_or(Error::State)?.legacy_rates().0;
-                        io.station_configure_ra(rates, &self.admission).await?;
+                        let plan = self.plan.as_ref().ok_or(Error::State)?;
+                        let rates = plan.legacy_rates().0;
+                        let ht = plan.negotiated_phy().map(|phy| {
+                            let ht = phy.ht();
+                            let m = ht.peer_rx_mcs();
+                            super::station_control::HtRa {
+                                peer_rx_mcs: [m[0], m[1], m[2], m[3]],
+                                sgi20: ht.tx_sgi20(),
+                                ldpc: ht.tx_ldpc(),
+                            }
+                        });
+                        self.ht = ht.is_some();
+                        io.station_configure_ra(rates, ht, &self.admission).await?;
                     }
                 }
                 self.admission.run(|| {

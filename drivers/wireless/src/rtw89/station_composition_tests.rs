@@ -21,6 +21,12 @@ const WMM: [u8; 26] = [
     0x27, 0xa4, 0, 0,
 ];
 const PMK: [u8; 32] = [0x55; 32];
+/// AP HT Capabilities (LDPC|SGI20, 64K/no density, RX MCS0..15) and HT
+/// Operation (primary channel 1, 20MHz).
+const HT_IES: [u8; 52] = [
+    45, 26, 33, 0, 3, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 61,
+    22, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
 const ANONCE: [u8; 32] = [0xaa; 32];
 struct Env {
     clock: Arc<AtomicU64>,
@@ -89,6 +95,10 @@ pub(super) struct Peer {
     qos_all: bool,
     /// QoS TID of each accepted uplink data frame.
     pub(super) tids: Vec<u8>,
+    /// AP HT Capabilities + HT Operation appended to the association response.
+    ht: Option<Vec<u8>>,
+    /// Station association request carried an HT Capabilities element.
+    pub(super) station_ht: bool,
 }
 impl Peer {
     pub(super) fn new(protected: bool) -> Self {
@@ -122,6 +132,8 @@ impl Peer {
             qos: false,
             qos_all: false,
             tids: Vec::new(),
+            ht: None,
+            station_ht: false,
         }
     }
     pub(super) fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
@@ -163,6 +175,16 @@ impl Peer {
         if self.ap.phase() != ApPhase::Authorized || matches!(frame[0], 0 | 0xb0) {
             if frame[0] == 0 {
                 self.qos = self.wmm.is_some() && frame.ends_with(&narf_wireless::wmm::INFORMATION);
+                // Fixed fields end at 28; walk the IEs for HT Capabilities.
+                let mut ies = frame.get(28..).unwrap_or(&[]);
+                self.station_ht = false;
+                while ies.len() >= 2 {
+                    let end = 2 + usize::from(ies[1]);
+                    if ies[0] == 45 && ies[1] == 26 {
+                        self.station_ht = true;
+                    }
+                    ies = ies.get(end..).unwrap_or(&[]);
+                }
             }
             let before = self.ap.phase();
             let mut replies = self
@@ -173,6 +195,9 @@ impl Peer {
                 if reply.first() == Some(&0x10) {
                     if let Some(p) = &self.wmm {
                         reply.extend_from_slice(p);
+                    }
+                    if let Some(ht) = &self.ht {
+                        reply.extend_from_slice(ht);
                     }
                 }
             }
@@ -256,6 +281,7 @@ struct DriverModel {
     wmm: bool,
     qos_all: bool,
     firmware_ra: bool,
+    ht: bool,
     irq: Option<IrqModel>,
 }
 /// AX v0 interrupt registers with write-1-clear status, behind the same
@@ -301,6 +327,7 @@ impl DriverModel {
             wmm: false,
             qos_all: false,
             firmware_ra: false,
+            ht: false,
             irq: None,
         }
     }
@@ -350,16 +377,21 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         self.station_allowed()?;
         Ok(self.wmm && self.firmware_ra)
     }
+    fn station_ht_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
+        self.station_allowed()?;
+        Ok(self.wmm && self.firmware_ra && self.ht)
+    }
     async fn station_configure_ra(
         &mut self,
         rates: u16,
+        ht: Option<crate::rtw89::station_control::HtRa>,
         admission: &crate::rtw89::station_control::Admission,
     ) -> Result<(), crate::rtw89::power::Error> {
-        if !self.station_firmware_ra_allowed()? {
+        if !self.station_firmware_ra_allowed()? || ht.is_some() && !self.ht {
             return Err(crate::rtw89::power::Error::Unsupported);
         }
         self.controller
-            .configure_ra(&mut self.control, rates, admission)
+            .configure_ra(&mut self.control, rates, ht, admission)
             .await
     }
     fn station_qos_all_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
@@ -452,6 +484,7 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
             own,
             macid,
             self.wmm && self.qos_all,
+            self.wmm && self.firmware_ra && self.ht,
         )?);
         Ok(())
     }
@@ -573,13 +606,15 @@ impl Harness {
         Self::rates_profile(protected, wmm, None)
     }
     fn rates_profile(protected: bool, wmm: bool, rates: Option<&[u8]>) -> Self {
-        Self::build(protected, wmm, false, rates)
+        Self::build(protected, wmm, false, rates, false)
     }
-    fn build(protected: bool, wmm: bool, qos_all: bool, rates: Option<&[u8]>) -> Self {
+    fn build(protected: bool, wmm: bool, qos_all: bool, rates: Option<&[u8]>, ht: bool) -> Self {
         assert!(ACTIVE_TEST.lock().is_none());
         let mut io = DriverModel::new();
         io.wmm = wmm;
         io.qos_all = qos_all;
+        io.ht = ht;
+        io.firmware_ra |= ht;
         // The AP sees current DMA at publication; these independent device
         // actions then advance the real modeled RP and emit parsed RPQ.
         io.packets.consume = true;
@@ -620,6 +655,10 @@ impl Harness {
             let mut beacon = peer.lock().ap.beacon();
             if wmm {
                 beacon.extend_from_slice(&WMM);
+            }
+            if ht {
+                beacon.extend_from_slice(&HT_IES);
+                peer.lock().ht = Some(HT_IES.to_vec());
             }
             let mut retained = lifecycle.retained.try_lock().unwrap();
             retained
@@ -1313,7 +1352,7 @@ fn with_dscp(mut frame: Vec<u8>, dscp: u8) -> Vec<u8> {
 }
 fn smoke_rtw8852b_all_ac_qos_routes_tids_to_ach_rings_with_strict_priority() -> TestResult {
     for protected in [false, true] {
-        let h = Harness::build(protected, true, true, None);
+        let h = Harness::build(protected, true, true, None, false);
         if h.join().is_err() {
             return TestResult::Fail("all-AC QoS association failed");
         }
@@ -1477,4 +1516,85 @@ fn smoke_rtw8852b_firmware_ra_h2c_and_adaptive_data_txwd() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89/rates",
     smoke_rtw8852b_firmware_ra_h2c_and_adaptive_data_txwd
+);
+
+fn smoke_rtw8852b_ht20_capability_ra_mcs_and_rx() -> TestResult {
+    const RATES: [u8; 12] = [0x82, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+    for protected in [false, true] {
+        let h = Harness::build(protected, true, false, Some(&RATES), true);
+        if h.join().is_err() {
+            return TestResult::Fail("HT20 association failed");
+        }
+        if !h.peer.lock().station_ht {
+            return TestResult::Fail("association request lacked HT Capabilities");
+        }
+        // CCK|OFDM|HT, SGI20 and LDPC negotiated; legacy 0xfff plus peer
+        // MCS0..15 masked to HT1SS|SUBOFDM|SUBCCK = 0xff015.
+        let mut expected = [0u8; 16];
+        expected[..4].copy_from_slice(&0x0070_000eu32.to_le_bytes());
+        expected[4..8].copy_from_slice(&0x000f_f015u32.to_le_bytes());
+        let commands = h.model(|io| io.control.packets().to_vec());
+        if commands
+            .iter()
+            .filter(|p| p.len() == 24 && p[8..] == expected)
+            .count()
+            != 1
+        {
+            return TestResult::Fail("HT RA_MACIDCFG H2C missing or differs");
+        }
+        let ethernet = udp_ipv4(AP, OWN, h.plan.lease_ip, h.plan.server_ip, 5, 6, b"ht");
+        if narf_net::iface::send_on(h.device.name(), &ethernet).is_err() {
+            return TestResult::Fail("HT data refused");
+        }
+        h.pump();
+        if h.peer.lock().uplink.last() != Some(&ethernet)
+            || h.model(|io| io.packets.last.map(|s| s.fixed_rate)) != Some(false)
+        {
+            return TestResult::Fail("HT data not handed to firmware RA");
+        }
+        // Downlink at HT MCS7 (RTW89_HW_RATE_MCS0 + 7) is delivered.
+        let reply = udp_ipv4(OWN, AP, h.plan.server_ip, h.plan.lease_ip, 6, 5, b"mcs7");
+        let Ok(wire) = h.peer.lock().downlink(&reply) else {
+            return TestResult::Fail("fixture downlink failed");
+        };
+        if h.model(|io| io.packets.inject_rate(&wire, 0x87)).is_err() {
+            return TestResult::Fail("fixture injection failed");
+        }
+        h.pump();
+        if h.received() != vec![reply] {
+            return TestResult::Fail("HT MCS7 downlink not delivered");
+        }
+    }
+    // Without the program: no HT element, and an HT PPDU is dropped
+    // without closing the station.
+    let h = Harness::rates_profile(false, true, Some(&RATES));
+    if h.join().is_err() || h.peer.lock().station_ht {
+        return TestResult::Fail("HT offered without the signed program");
+    }
+    let reply = udp_ipv4(OWN, AP, h.plan.server_ip, h.plan.lease_ip, 6, 5, b"mcs7");
+    let Ok(wire) = h.peer.lock().downlink(&reply) else {
+        return TestResult::Fail("fixture downlink failed");
+    };
+    if h.model(|io| io.packets.inject_rate(&wire, 0x87)).is_err() {
+        return TestResult::Fail("fixture injection failed");
+    }
+    h.pump();
+    if !h.received().is_empty() {
+        return TestResult::Fail("non-HT station accepted an HT PPDU");
+    }
+    if h.closed() {
+        h.model(|io| {
+            narf_console::klog!(
+                "rtw8852b ht drop: packet {:?} stopped {}\n",
+                io.packet_error,
+                io.stopped
+            )
+        });
+        return TestResult::Fail("non-HT station died on an HT PPDU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/rates",
+    smoke_rtw8852b_ht20_capability_ra_mcs_and_rx
 );

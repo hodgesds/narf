@@ -139,7 +139,23 @@ pub(super) fn edca(ac: u8, short: bool) -> [u8; 12] {
 /// bitmap in hardware order (CCK1,2,5.5,11, OFDM6..54). No calibrated RSSI
 /// exists, so the RSSI floor keeps every rate and `init_rate_lv` is 0, as
 /// Linux does for an RSSI of 0/1.
+/// Negotiated HT facts consumed by `rtw89_phy_ra_sta_update`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::rtw89) struct HtRa {
+    /// Peer RX MCS bitmap bytes 0..3 (`ht_cap.mcs.rx_mask`).
+    pub(in crate::rtw89) peer_rx_mcs: [u8; 4],
+    /// Peer RX SGI20 intersected with local TX SGI20.
+    pub(in crate::rtw89) sgi20: bool,
+    /// Peer RX LDPC intersected with local TX LDPC.
+    pub(in crate::rtw89) ldpc: bool,
+}
 pub(super) fn ra(rates: u16) -> Option<[u8; 16]> {
+    ra_ht(rates, None)
+}
+/// HT branch: `mode |= HT`, MCS mask from the peer RX bitmap, then masked
+/// to this profile's one TX stream (`rtw89_ra_mask_ht_rates[0]`) plus
+/// `RA_MASK_SUBOFDM_RATES`/`RA_MASK_SUBCCK_RATES`.
+pub(super) fn ra_ht(rates: u16, ht: Option<HtRa>) -> Option<[u8; 16]> {
     const CCK: u64 = 0xf;
     const OFDM: u64 = 0xff0;
     const SUBCCK: u64 = 0x5;
@@ -154,9 +170,27 @@ pub(super) fn ra(rates: u16) -> Option<[u8; 16]> {
     if supported & OFDM != 0 {
         mode |= 2; // RTW89_RA_MODE_OFDM
     }
+    let mut supported = supported;
+    if let Some(ht) = ht {
+        mode |= 4; // RTW89_RA_MODE_HT
+        let m = ht.peer_rx_mcs;
+        supported |= u64::from(m[3]) << 48
+            | u64::from(m[2]) << 36
+            | u64::from(m[1]) << 24
+            | u64::from(m[0]) << 12;
+    }
     let backup = supported;
     let mut mask = supported;
-    if mode & 2 != 0 {
+    if mode >= 4 {
+        let mut allowed = 0xff000; // RA_MASK_HT_1SS_RATES
+        if mode & 2 != 0 {
+            allowed |= 0x10; // RA_MASK_SUBOFDM_RATES
+        }
+        if mode & 1 != 0 {
+            allowed |= SUBCCK;
+        }
+        mask &= allowed;
+    } else if mode & 2 != 0 {
         mask &= OFDM | SUBCCK;
     }
     // rtw89_phy_ra_mask_recover
@@ -168,7 +202,12 @@ pub(super) fn ra(rates: u16) -> Option<[u8; 16]> {
     }
     let mut bytes = [0; 16];
     // MODE[5:1], BW_CAP 20MHz, MACID0, INIT_RATE_LV0, UPD_ALL, SS_NUM0.
-    word(&mut bytes, 0, mode << 1 | 1 << 20);
+    let (sgi, ldpc) = ht.map_or((false, false), |ht| (ht.sgi20, ht.ldpc));
+    word(
+        &mut bytes,
+        0,
+        mode << 1 | 1 << 20 | u32::from(sgi) << 21 | u32::from(ldpc) << 22,
+    );
     word(&mut bytes, 1, mask as u32);
     word(&mut bytes, 2, (mask >> 32) as u32 & 0x7fff_ffff);
     Some(bytes)
