@@ -379,10 +379,7 @@ impl RateAdaptation {
             + u16::from(stage_id) * 16
             + 2;
         self.pt_smooth_factor = smooth.min(192) as u8;
-        let mut temp = (self.pt_smooth_factor >> 6) * 2;
-        if temp != 0 {
-            temp -= 1;
-        }
+        let mut temp = ((self.pt_smooth_factor >> 6) * 2).saturating_sub(1);
         if self.drop > 3 {
             temp = 0;
         }
