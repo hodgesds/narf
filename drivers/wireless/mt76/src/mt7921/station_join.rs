@@ -1072,7 +1072,7 @@ impl<B: Backend> Session<B> {
         // cleared by a TX BA agreement without the A-MSDU bit.
         let amsdu = self.wmm.is_some()
             && self.ht20_profile.is_some()
-            && !(self.tx_ba.active() && !self.tx_ba.amsdu());
+            && (!self.tx_ba.active() || self.tx_ba.amsdu());
         self.backend.set_hw_amsdu(amsdu);
         let result = if tid != 0 {
             self.backend.submit_data_tid(
