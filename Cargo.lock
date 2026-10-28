@@ -2054,6 +2054,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-qcom-soc"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-firmware-fdt",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-time",
+]
+
+[[package]]
 name = "narf-drivers-sdio"
 version = "0.0.0"
 dependencies = [
