@@ -155,6 +155,15 @@ impl Owner {
         );
         self.mac = Some(mac);
         self.nvm = Some(nvm);
+        // Private RAM fixtures share one MAC and must not leak key history
+        // into each other; native owners adopt their radio's ledger.
+        #[cfg(any(test, feature = "kernel-test"))]
+        let adopt = !super::runtime::model::is_model(&self.hardware);
+        #[cfg(not(any(test, feature = "kernel-test")))]
+        let adopt = true;
+        if adopt {
+            self.security.adopt_ledger(mac);
+        }
         self.phase = Phase::Configured;
         Ok(())
     }

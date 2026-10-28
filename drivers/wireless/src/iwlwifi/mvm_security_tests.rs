@@ -1984,3 +1984,58 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2/reconnect",
     smoke_gen2_key_history_restore_policy_cross_peer_index_and_ptk_reuse
 );
+
+fn smoke_gen2_key_history_ledger_crosses_native_owners_of_one_radio() -> TestResult {
+    // Unique fixture identities: no RAM owner adopts a ledger by default.
+    const RADIO: [u8; 6] = [0x02, 0xfe, 0xed, 0, 0, 1];
+    const OTHER: [u8; 6] = [0x02, 0xfe, 0xed, 0, 0, 2];
+    {
+        let mut first = Context::default();
+        first.adopt_ledger(RADIO);
+        first.history.push(history_entry(true, 1, RADIO, true));
+        let mut live = history_entry(false, 0, RADIO, false);
+        live.digest = [2; 32];
+        first.history.push(live);
+    }
+    // Another radio never sees this ledger.
+    let mut other = Context::default();
+    other.adopt_ledger(OTHER);
+    if !other.history.is_empty() {
+        return TestResult::Fail("ledger crossed to another radio");
+    }
+    let mut second = Context::default();
+    // An entry the new owner already holds merges: floors rise and it is
+    // reusable only if both copies were retired.
+    let mut own = history_entry(true, 1, RADIO, false);
+    own.floors = [2000; 17];
+    own.tx_floor = 1;
+    second.history.push(own);
+    second.adopt_ledger(RADIO);
+    let merged = second.history.iter().find(|h| h.digest == [1; 32]);
+    let live = second.history.iter().find(|h| h.digest == [2; 32]);
+    if second.history.len() != 2
+        || !merged.is_some_and(|h| h.floors[5] == 2000 && h.tx_floor == 4242 && !h.retired)
+        || !live.is_some_and(|h| !h.retired && h.tx_floor == 4242)
+    {
+        return TestResult::Fail("adopted ledger lost a floor or reuse proof");
+    }
+    // Adoption is one-shot; a dropped owner hands the ledger back intact.
+    drop(second);
+    let mut third = Context::default();
+    third.adopt_ledger(RADIO);
+    third.adopt_ledger(RADIO);
+    if third.history.len() != 2 {
+        return TestResult::Fail("ledger not returned by dropped owner");
+    }
+    // Leave no fixture ledger behind.
+    third.ledger = None;
+    other.ledger = None;
+    LEDGERS
+        .lock()
+        .retain(|(mac, _)| *mac != RADIO && *mac != OTHER);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/reconnect",
+    smoke_gen2_key_history_ledger_crosses_native_owners_of_one_radio
+);

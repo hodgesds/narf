@@ -120,12 +120,73 @@ pub(super) struct Context {
     history: Vec<KeyHistory>,
     cookie: u32,
     mic_keys: bool,
+    /// Station identity whose radio-scoped ledger this owner adopted.
+    ledger: Option<[u8; 6]>,
 }
+
+/// Radio-scoped retired-key ledgers, keyed by station MAC. A native owner
+/// adopts its radio's ledger after configuration and hands it back when it
+/// is dropped, so a later owner of the same radio (re-probe/rebind) keeps
+/// every replay floor and TX PN bound instead of starting from an empty
+/// history. Entries hold only key fingerprints and counters, never key
+/// material. Entries still live when their owner dropped stay unretired,
+/// so they are never reused, only kept as floors.
+static LEDGERS: narf_lib::sync::IrqSafeSpinLock<Vec<([u8; 6], Vec<KeyHistory>)>> =
+    narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+/// Bound on retained radio identities; the oldest ledger is evicted.
+const LEDGER_RADIOS: usize = 4;
+
+impl Drop for Context {
+    fn drop(&mut self) {
+        let Some(mac) = self.ledger else {
+            return;
+        };
+        let history = core::mem::take(&mut self.history);
+        let mut ledgers = LEDGERS.lock();
+        ledgers.retain(|(owner, _)| *owner != mac);
+        if ledgers.len() == LEDGER_RADIOS {
+            ledgers.remove(0);
+        }
+        ledgers.push((mac, history));
+    }
+}
+
 impl Context {
+    /// Adopt the ledger a previous owner of this radio left behind, merging
+    /// by fingerprint (floors and TX bounds only rise; an entry stays
+    /// reusable only if both copies are retired).
+    pub(super) fn adopt_ledger(&mut self, mac: [u8; 6]) {
+        if self.ledger.is_some() {
+            return;
+        }
+        self.ledger = Some(mac);
+        let mut ledgers = LEDGERS.lock();
+        let Some(index) = ledgers.iter().position(|(owner, _)| *owner == mac) else {
+            return;
+        };
+        let (_, previous) = ledgers.remove(index);
+        drop(ledgers);
+        for entry in previous {
+            if let Some(own) = self.history.iter_mut().find(|h| h.digest == entry.digest) {
+                for (saved, old) in own.floors.iter_mut().zip(entry.floors) {
+                    *saved = (*saved).max(old);
+                }
+                own.tx_floor = own.tx_floor.max(entry.tx_floor);
+                own.retired &= entry.retired;
+            } else {
+                // Never drop a floor: an over-full ledger makes later key
+                // installation fail closed ("history exhausted").
+                self.history.push(entry);
+            }
+        }
+    }
     pub(super) fn new(api: &super::super::firmware_api::FirmwareApi<'_>) -> Self {
         Self {
+            active: None,
+            history: Vec::new(),
+            cookie: 0,
             mic_keys: api.api_changes[0] & (1 << 29) != 0,
-            ..Self::default()
+            ledger: None,
         }
     }
     pub(super) fn ready(&self) -> bool {
