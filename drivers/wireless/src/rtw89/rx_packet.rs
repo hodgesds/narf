@@ -24,12 +24,19 @@ fn word(bytes: &[u8], offset: usize) -> Result<u32, Error> {
             .map_err(|_| Error::Extent)?,
     ))
 }
+/// `RTW89_HW_RATE_HE_NSS1_MCS0..MCS11` or `RTW89_HW_RATE_HE_NSS2_MCS0..MCS11`:
+/// the HE rates this two-RX-path station can receive.
+pub(super) fn he_rate(rate: u16) -> bool {
+    (0x180..=0x18b).contains(&rate) || (0x190..=0x19b).contains(&rate)
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Descriptor {
     pub size: usize,
     pub offset: usize,
     pub kind: u8,
     pub rate: u16,
+    /// `AX_RXD_RX_GI_LTF_MASK` (`enum rtw89_gi_ltf` for HE PPDUs).
+    pub gi_ltf: u8,
     pub bandwidth: u8,
     pub crc_error: bool,
     pub icv_error: bool,
@@ -64,6 +71,7 @@ impl Descriptor {
             offset,
             kind: ((d0 >> 24) & 15) as u8,
             rate: ((d1 >> 16) & 0x1ff) as u16,
+            gi_ltf: ((d1 >> 25) & 7) as u8,
             bandwidth: (d1 >> 30) as u8,
             crc_error: d3 & (1 << 9) != 0,
             icv_error: d3 & (1 << 10) != 0,
@@ -226,8 +234,12 @@ impl Assembler {
                     || descriptor.hardware_decrypted
                     || descriptor.aggregate
                     || descriptor.bandwidth != 0
-                    // Legacy CCK1..OFDM54 or 20MHz HT MCS0..15 (RTW89_HW_RATE_MCS0).
-                    || !(descriptor.rate <= 11 || (0x80..=0x8f).contains(&descriptor.rate))
+                    // Legacy CCK1..OFDM54, 20MHz HT MCS0..15 (RTW89_HW_RATE_MCS0)
+                    // or HE NSS1/NSS2 MCS0..11 with a defined GI/LTF
+                    // (RTW89_HW_RATE_HE_NSS1_MCS0, RTW89_GILTF_1XHE08 = 5).
+                    || !(descriptor.rate <= 11
+                        || (0x80..=0x8f).contains(&descriptor.rate)
+                        || he_rate(descriptor.rate) && descriptor.gi_ltf <= 5)
                 {
                     Event::Dropped
                 } else {

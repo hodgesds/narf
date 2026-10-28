@@ -504,3 +504,56 @@ kernel_test_in!(
     "drivers/wireless/rtw89/radio",
     smoke_rtw8852b_operating_programs_each_require_their_own_signed_identity
 );
+
+fn smoke_rtw8852b_he_program_requires_ht_and_its_own_signed_identity() -> TestResult {
+    let base = board();
+    let cap = authority();
+    let he = Program::He.flags();
+    let ht = Program::Ht.flags();
+    // He requires Ht, which requires WMM and firmware RA.
+    if he != 0x77 || ht != 0x37 || !Program::valid(he) {
+        return TestResult::Fail("HE program flag byte differs");
+    }
+    for flags in [0x47u8, 0x57, 0x67, 0x43] {
+        if Program::valid(flags) {
+            return TestResult::Fail("HE accepted without HT/firmware RA/WMM");
+        }
+    }
+    let chained = base.with_programs(he);
+    if chained.identity() == base.with_programs(ht).identity() {
+        return TestResult::Fail("HE program shares the HT identity");
+    }
+    // An HT20 record cannot be promoted to HE.
+    let mut bytes = image(base.with_programs(ht));
+    bytes[57] = he;
+    if Qualification::from_verified(&bytes, Some([3; 32]), base, cap).is_ok() {
+        return TestResult::Fail("HT record promoted to HE");
+    }
+    let mut bytes = image(chained);
+    bytes[57] = he;
+    let Ok(mut granted) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
+        return TestResult::Fail("genuine HE record rejected");
+    };
+    granted.model_domain = Some(domain());
+    if granted.allows(Program::He) != Ok(true) || granted.allows(Program::Ht) != Ok(true) {
+        return TestResult::Fail("HE record did not grant HE and HT");
+    }
+    let mut bytes = image(base.with_programs(ht));
+    bytes[57] = ht;
+    let Ok(mut ht_only) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
+        return TestResult::Fail("HT record rejected");
+    };
+    ht_only.model_domain = Some(domain());
+    if ht_only.allows(Program::He) != Ok(false) {
+        return TestResult::Fail("HT record granted HE");
+    }
+    cap.revoke();
+    if granted.allows(Program::He).is_ok() {
+        return TestResult::Fail("revoked record still grants HE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/radio",
+    smoke_rtw8852b_he_program_requires_ht_and_its_own_signed_identity
+);

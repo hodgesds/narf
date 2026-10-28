@@ -27,6 +27,18 @@ const HT_IES: [u8; 52] = [
     45, 26, 33, 0, 3, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 61,
     22, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
+/// AP HE Capabilities (2.4GHz 20MHz, HTC_HE, LDPC, STBC RX, DCM RX 16QAM,
+/// RX/TX 2SS HE-MCS0..11) and HE Operation (BSS color 1, basic NSS1
+/// HE-MCS0..7, ER SU allowed).
+const HE_IES: [u8; 33] = [
+    255, 22, 35, 0x01, 0, 0, 0, 0, 0, 0x00, 0x20, 0x08, 0x18, 0, 0, 0, 0, 0, 0, 0, 0xfa, 0xff,
+    0xfa, 0xff, 255, 7, 36, 0, 0, 0, 1, 0xfc, 0xff,
+];
+/// `HE_IES` with HE Operation ER SU Disable set and no DCM RX.
+const HE_IES_NO_ER: [u8; 33] = [
+    255, 22, 35, 0x01, 0, 0, 0, 0, 0, 0x00, 0x20, 0x08, 0x00, 0, 0, 0, 0, 0, 0, 0, 0xfa, 0xff,
+    0xfa, 0xff, 255, 7, 36, 0, 0, 1, 1, 0xfc, 0xff,
+];
 const ANONCE: [u8; 32] = [0xaa; 32];
 struct Env {
     clock: Arc<AtomicU64>,
@@ -99,6 +111,10 @@ pub(super) struct Peer {
     ht: Option<Vec<u8>>,
     /// Station association request carried an HT Capabilities element.
     pub(super) station_ht: bool,
+    /// AP HE Capabilities + HE Operation appended to the association response.
+    he: Option<Vec<u8>>,
+    /// Station association request carried an HE Capabilities element.
+    pub(super) station_he: bool,
     /// Action frames sent by the station after authorization.
     pub(super) actions: Vec<Vec<u8>>,
     /// Probe requests sent by the station.
@@ -138,6 +154,8 @@ impl Peer {
             tids: Vec::new(),
             ht: None,
             station_ht: false,
+            he: None,
+            station_he: false,
             actions: Vec::new(),
             probes: Vec::new(),
         }
@@ -199,10 +217,14 @@ impl Peer {
                 // Fixed fields end at 28; walk the IEs for HT Capabilities.
                 let mut ies = frame.get(28..).unwrap_or(&[]);
                 self.station_ht = false;
+                self.station_he = false;
                 while ies.len() >= 2 {
                     let end = 2 + usize::from(ies[1]);
                     if ies[0] == 45 && ies[1] == 26 {
                         self.station_ht = true;
+                    }
+                    if ies[0] == 255 && ies.get(2) == Some(&35) {
+                        self.station_he = true;
                     }
                     ies = ies.get(end..).unwrap_or(&[]);
                 }
@@ -219,6 +241,9 @@ impl Peer {
                     }
                     if let Some(ht) = &self.ht {
                         reply.extend_from_slice(ht);
+                    }
+                    if let Some(he) = &self.he {
+                        reply.extend_from_slice(he);
                     }
                 }
             }
@@ -303,6 +328,7 @@ struct DriverModel {
     qos_all: bool,
     firmware_ra: bool,
     ht: bool,
+    he: bool,
     irq: Option<IrqModel>,
 }
 /// AX v0 interrupt registers with write-1-clear status, behind the same
@@ -349,6 +375,7 @@ impl DriverModel {
             qos_all: false,
             firmware_ra: false,
             ht: false,
+            he: false,
             irq: None,
         }
     }
@@ -417,17 +444,25 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         self.station_allowed()?;
         Ok(self.wmm && self.firmware_ra && self.ht)
     }
+    fn station_he_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
+        self.station_allowed()?;
+        Ok(self.wmm && self.firmware_ra && self.ht && self.he)
+    }
     async fn station_configure_ra(
         &mut self,
         rates: u16,
         ht: Option<crate::rtw89::station_control::HtRa>,
+        he: Option<crate::rtw89::station_control::HeRa>,
         admission: &crate::rtw89::station_control::Admission,
     ) -> Result<(), crate::rtw89::power::Error> {
-        if !self.station_firmware_ra_allowed()? || ht.is_some() && !self.ht {
+        if !self.station_firmware_ra_allowed()?
+            || ht.is_some() && !self.ht
+            || he.is_some() && !self.station_he_allowed()?
+        {
             return Err(crate::rtw89::power::Error::Unsupported);
         }
         self.controller
-            .configure_ra(&mut self.control, rates, ht, admission)
+            .configure_ra(&mut self.control, rates, ht, he, admission)
             .await
     }
     fn station_qos_all_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
@@ -520,7 +555,10 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
             own,
             macid,
             self.wmm && self.qos_all,
-            self.wmm && self.firmware_ra && self.ht,
+            crate::rtw89::packet_core::RxPhy::from_programs(
+                self.wmm && self.firmware_ra && self.ht,
+                self.wmm && self.firmware_ra && self.ht && self.he,
+            ),
         )?);
         Ok(())
     }
@@ -645,11 +683,24 @@ impl Harness {
         Self::build(protected, wmm, false, rates, false)
     }
     fn build(protected: bool, wmm: bool, qos_all: bool, rates: Option<&[u8]>, ht: bool) -> Self {
+        Self::build_phy(protected, wmm, qos_all, rates, ht, None)
+    }
+    /// `he`: `Some(program granted)` makes the AP advertise `HE_IES`
+    /// (with ER SU disabled when `HE_IES_NO_ER` is chosen by the caller).
+    fn build_phy(
+        protected: bool,
+        wmm: bool,
+        qos_all: bool,
+        rates: Option<&[u8]>,
+        ht: bool,
+        he: Option<(bool, &[u8])>,
+    ) -> Self {
         assert!(ACTIVE_TEST.lock().is_none());
         let mut io = DriverModel::new();
         io.wmm = wmm;
         io.qos_all = qos_all;
         io.ht = ht;
+        io.he = he.is_some_and(|(granted, _)| granted);
         io.firmware_ra |= ht;
         // The AP sees current DMA at publication; these independent device
         // actions then advance the real modeled RP and emit parsed RPQ.
@@ -695,6 +746,10 @@ impl Harness {
             if ht {
                 beacon.extend_from_slice(&HT_IES);
                 peer.lock().ht = Some(HT_IES.to_vec());
+            }
+            if let Some((_, ies)) = he {
+                beacon.extend_from_slice(ies);
+                peer.lock().he = Some(ies.to_vec());
             }
             let mut retained = lifecycle.retained.try_lock().unwrap();
             retained
@@ -1633,6 +1688,172 @@ fn smoke_rtw8852b_ht20_capability_ra_mcs_and_rx() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89/rates",
     smoke_rtw8852b_ht20_capability_ra_mcs_and_rx
+);
+
+fn he_ra(w0: u32, w1: u32) -> [u8; 16] {
+    let mut expected = [0u8; 16];
+    expected[..4].copy_from_slice(&w0.to_le_bytes());
+    expected[4..8].copy_from_slice(&w1.to_le_bytes());
+    expected
+}
+fn smoke_rtw8852b_he20_capability_ra_er_and_gi_ltf_rx() -> TestResult {
+    const RATES: [u8; 12] = [0x82, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+    for protected in [false, true] {
+        let h = Harness::build_phy(
+            protected,
+            true,
+            false,
+            Some(&RATES),
+            true,
+            Some((true, &HE_IES)),
+        );
+        if h.join().is_err() {
+            return TestResult::Fail("HE20 association failed");
+        }
+        if !h.peer.lock().station_ht || !h.peer.lock().station_he {
+            return TestResult::Fail("association request lacked HT/HE Capabilities");
+        }
+        // MODE HE|CCK|OFDM (0x13 << 1), DCM (peer DCM RX), UPD_ALL, SGI20
+        // (HT), LDPC (peer HE); mask legacy 0xfff + HE NSS1 MCS0..11 masked
+        // to HE1SS|SUBOFDM|SUBCCK = 0xfff015; no fixed GI/LTF.
+        let commands = h.model(|io| io.control.packets().to_vec());
+        let expected = he_ra(0x0071_0026, 0x00ff_f015);
+        if commands
+            .iter()
+            .filter(|p| p.len() == 24 && p[8..] == expected)
+            .count()
+            != 1
+        {
+            return TestResult::Fail("HE RA_MACIDCFG H2C missing or differs");
+        }
+        let ethernet = udp_ipv4(AP, OWN, h.plan.lease_ip, h.plan.server_ip, 5, 6, b"he");
+        if narf_net::iface::send_on(h.device.name(), &ethernet).is_err() {
+            return TestResult::Fail("HE data refused");
+        }
+        h.pump();
+        if h.peer.lock().uplink.last() != Some(&ethernet)
+            || h.model(|io| io.packets.last.map(|s| (s.fixed_rate, s.er))) != Some((false, true))
+        {
+            return TestResult::Fail("HE data not on firmware RA with DATA_ER");
+        }
+        // Downlink at HE NSS1 MCS11 1xLTF+0.8us and NSS2 MCS0 4xLTF+3.2us.
+        for (rate, gi_ltf, tag) in [(0x18bu16, 5u8, &b"mcs11"[..]), (0x190, 0, &b"nss2"[..])] {
+            let reply = udp_ipv4(OWN, AP, h.plan.server_ip, h.plan.lease_ip, 6, 5, tag);
+            let Ok(wire) = h.peer.lock().downlink(&reply) else {
+                return TestResult::Fail("fixture downlink failed");
+            };
+            if h.model(|io| io.packets.inject_phy(&wire, rate, gi_ltf))
+                .is_err()
+            {
+                return TestResult::Fail("fixture injection failed");
+            }
+            h.pump();
+            if h.received() != vec![reply] {
+                return TestResult::Fail("HE downlink not delivered");
+            }
+        }
+        // Undefined GI/LTF (6) and HE NSS3 are dropped, not fatal.
+        for (rate, gi_ltf) in [(0x18bu16, 6u8), (0x1a0, 0)] {
+            let reply = udp_ipv4(OWN, AP, h.plan.server_ip, h.plan.lease_ip, 6, 5, b"bad");
+            let Ok(wire) = h.peer.lock().downlink(&reply) else {
+                return TestResult::Fail("fixture downlink failed");
+            };
+            if h.model(|io| io.packets.inject_phy(&wire, rate, gi_ltf))
+                .is_err()
+            {
+                return TestResult::Fail("fixture injection failed");
+            }
+            h.pump();
+            if !h.received().is_empty() || h.closed() {
+                return TestResult::Fail("invalid HE PPDU delivered or fatal");
+            }
+        }
+        // Teardown clears the negotiated HE state with the station.
+        if complete(h.device.disassociate()).is_err() || !h.closed() || !h.model(|io| io.stopped) {
+            return TestResult::Fail("HE disconnect not parked");
+        }
+    }
+    // ER SU disabled by the AP: no DATA_ER; no AP DCM RX: no DCM bit.
+    let h = Harness::build_phy(
+        false,
+        true,
+        false,
+        Some(&RATES),
+        true,
+        Some((true, &HE_IES_NO_ER)),
+    );
+    if h.join().is_err() {
+        return TestResult::Fail("HE20 no-ER association failed");
+    }
+    let expected = he_ra(0x0070_0026, 0x00ff_f015);
+    if !h
+        .model(|io| io.control.packets().to_vec())
+        .iter()
+        .any(|p| p.len() == 24 && p[8..] == expected)
+    {
+        return TestResult::Fail("HE RA without DCM differs");
+    }
+    let ethernet = udp_ipv4(AP, OWN, h.plan.lease_ip, h.plan.server_ip, 5, 6, b"noer");
+    if narf_net::iface::send_on(h.device.name(), &ethernet).is_err() {
+        return TestResult::Fail("HE no-ER data refused");
+    }
+    h.pump();
+    if h.model(|io| io.packets.last.map(|s| s.er)) != Some(false) {
+        return TestResult::Fail("DATA_ER set although the AP disabled ER SU");
+    }
+    drop(h);
+    // Program not granted: HT only, no HE element, HE PPDU dropped
+    // without closing the station.
+    let h = Harness::build_phy(
+        false,
+        true,
+        false,
+        Some(&RATES),
+        true,
+        Some((false, &HE_IES)),
+    );
+    if h.join().is_err() || !h.peer.lock().station_ht || h.peer.lock().station_he {
+        return TestResult::Fail("HE offered without the signed program");
+    }
+    let ht = he_ra(0x0070_000e, 0x000f_f015);
+    if !h
+        .model(|io| io.control.packets().to_vec())
+        .iter()
+        .any(|p| p.len() == 24 && p[8..] == ht)
+    {
+        return TestResult::Fail("non-HE station did not keep the HT RA");
+    }
+    let reply = udp_ipv4(OWN, AP, h.plan.server_ip, h.plan.lease_ip, 6, 5, b"he");
+    let Ok(wire) = h.peer.lock().downlink(&reply) else {
+        return TestResult::Fail("fixture downlink failed");
+    };
+    if h.model(|io| io.packets.inject_phy(&wire, 0x185, 3))
+        .is_err()
+    {
+        return TestResult::Fail("fixture injection failed");
+    }
+    h.pump();
+    if !h.received().is_empty() || h.closed() {
+        return TestResult::Fail("non-HE station accepted or died on an HE PPDU");
+    }
+    drop(h);
+    // Failure: an AP without HE keeps the HT association under the program.
+    let h = Harness::build_phy(false, true, false, Some(&RATES), true, None);
+    if h.join().is_err() || h.peer.lock().station_he {
+        return TestResult::Fail("HT-only AP association changed");
+    }
+    if !h
+        .model(|io| io.control.packets().to_vec())
+        .iter()
+        .any(|p| p.len() == 24 && p[8..] == ht)
+    {
+        return TestResult::Fail("HT-only AP did not get the HT RA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/rates",
+    smoke_rtw8852b_he20_capability_ra_er_and_gi_ltf_rx
 );
 
 fn ba_action(body: &[u8]) -> Vec<u8> {

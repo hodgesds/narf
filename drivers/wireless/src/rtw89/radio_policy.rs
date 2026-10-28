@@ -32,9 +32,19 @@ pub(super) enum Program {
     /// HT20 station: HT capability IE, firmware RA over MCS0..7 TX,
     /// MCS0..15 RX.
     Ht,
+    /// HE20 station on top of HT20: HE capability IE, firmware RA over
+    /// HE-MCS0..11 NSS1 TX with firmware GI/LTF selection, HE SU/ER SU/MU
+    /// RX on any GI/LTF.
+    He,
 }
 impl Program {
-    pub(super) const ALL: [Self; 4] = [Self::Wmm, Self::QosAll, Self::FirmwareRa, Self::Ht];
+    pub(super) const ALL: [Self; 5] = [
+        Self::Wmm,
+        Self::QosAll,
+        Self::FirmwareRa,
+        Self::Ht,
+        Self::He,
+    ];
     pub(super) const BASE: u8 = 3;
     pub(super) fn bit(self) -> u8 {
         match self {
@@ -42,6 +52,7 @@ impl Program {
             Self::QosAll => 1 << 3,
             Self::FirmwareRa => 1 << 4,
             Self::Ht => 1 << 5,
+            Self::He => 1 << 6,
         }
     }
     fn requires(self) -> u8 {
@@ -49,6 +60,7 @@ impl Program {
             Self::Wmm => 0,
             Self::QosAll | Self::FirmwareRa => Self::Wmm.bit(),
             Self::Ht => Self::Wmm.bit() | Self::FirmwareRa.bit(),
+            Self::He => Self::Wmm.bit() | Self::FirmwareRa.bit() | Self::Ht.bit(),
         }
     }
     /// Base flags plus `self` and everything it requires.
@@ -86,6 +98,11 @@ impl Program {
                 hash.update(b"NARF RTL8852B HT20 optional operating recipe v1");
                 hash.update(&identity);
                 hash.update(&super::station_control::ht_fingerprint());
+            }
+            Self::He => {
+                hash.update(b"NARF RTL8852B HE20 optional operating recipe v1");
+                hash.update(&identity);
+                hash.update(&super::station_control::he_fingerprint());
             }
         }
         hash.finalize()

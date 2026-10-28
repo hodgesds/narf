@@ -1024,6 +1024,65 @@ HT program and otherwise drops them as before without closing the station.
 Smoke: `smoke_rtw8852b_ht20_capability_ra_mcs_and_rx` (HT element in the
 association request, HT RA mask, RA data TXWD, MCS7 RX, non-HT drop).
 
+### HE20 station operation and GI/LTF variants
+
+`radio_policy::Program::He` (byte57 bit6, requires `Ht`, hence `Wmm` and
+`FirmwareRa`; flags `0x77`) enables HE on the HT20 profile. When granted, the
+join adds `station_control::local_he()` through the shared
+`LocalPhy::with_he`: Linux `core.c::rtw89_init_he_cap` for a 2.4GHz station,
+restricted to this TX-A/RX-AB 20MHz profile. MAC: TF MAC padding 16us,
+ALL_ACK, A-MPDU length exponent extension 2, HT/VHT trigger-frame RX. PHY:
+20MHz-only width set, device class A, LDPC, HE SU/MU 1x/2xLTF+0.8us GI,
+NDP 4xLTF+3.2us, STBC RX, Doppler TX, DCM 16QAM (TX NSS1), partial-BW
+extended range, power boost, 4xLTF+0.8us SU/MU, ER SU 4xLTF/1xLTF+0.8us,
+DCM max RU996, >16 SIG-B symbols, TX/RX 1024QAM below 242-tone RU, full-BW
+SU in MU (compressed and non-compressed SIG-B) and 16us nominal padding;
+RX HE-MCS0..11 on two streams and TX HE-MCS0..11 on one. Linux bits that
+need 40MHz (`wide_channels`), a second TX path (STBC TX, DCM TX NSS2),
+HE +HTC (`HTC_HE`, `BSR`; `he_htc`), power save (`OPS`), RX A-MSDU
+(`AMSDU_IN_AMPDU`; `aggregation`) or beamforming feedback
+(`rtw89_mac_bf_assoc` sounding: SU beamformee, NG16, codebook sizes,
+triggered SU feedback, MaxNc) are cleared.
+
+The negotiated HE facts feed the firmware RA H2C like the HE branch of
+`phy.c::rtw89_phy_ra_sta_update`: `mode = HE|CCK|OFDM` (no HT bit), mask
+`get_he_ra_mask` (`get_mcs_ra_mask(map, 11, 2)`) over the peer RX map
+intersected with the local TX map (mac80211
+`ieee80211_he_mcs_intersection`), masked to `RA_MASK_HE_1SS_RATES` plus
+SUBOFDM/SUBCCK and recovered; SGI from the HT SGI20 negotiation (Linux reads
+`ht_cap` at 20MHz); LDPC from the peer HE PHY; `W0_DCM` when the peer
+advertises any DCM RX constellation (`DCM_MAX_CONST_RX_16_QAM` mask); STBC0
+and SS_NUM0 for the single TX path, as in the HT program. `fix_giltf_en`
+stays clear (`rtw89_phy_ra_gi_ltf` applies only to a user bitrate mask), so
+firmware RA chooses among the 0.8/1.6/3.2us GI and 1x/2x/4x LTF variants;
+this is the `he_gi_ltf` TX half. `W0_ER` is zero because Linux sets
+`rtwsta->er_cap` in `rtw89_core_sta_assoc` only after `rtw89_phy_ra_assoc`;
+data TXWDs then carry `RTW89_TXWD_INFO0_DATA_ER` (`desc_info->er_cap`)
+unless the AP's HE Operation sets ER SU Disable. The packet owner refuses
+`DATA_ER` without the HE program.
+
+RX: the assembler now decodes `AX_RXD_RX_GI_LTF_MASK` and passes 20MHz
+`RTW89_HW_RATE_HE_NSS1_MCS0..11` and `HE_NSS2_MCS0..11` with a defined
+`enum rtw89_gi_ltf` value (0..5, `LGI_4XHE32`..`1XHE08`); undefined GI/LTF,
+NSS3+ or other widths are dropped. `packet_core::RxPhy` admits HE rates
+only under the HE program; without it an HE PPDU is dropped without closing
+the station, exactly like HT without `Ht`. Stop/disconnect clear the HE and
+ER state with the rest of the association. Smokes:
+`smoke_rtw8852b_he_program_requires_ht_and_its_own_signed_identity`,
+`smoke_rtw8852b_he_capability_and_ra_codec_match_linux_profile` and
+`smoke_rtw8852b_he20_capability_ra_er_and_gi_ltf_rx` (HE element, HE RA
+mask with/without DCM, DATA_ER with/without ER SU Disable, HE MCS11 1xLTF
+and NSS2 4xLTF RX, invalid GI/LTF and NSS3 drop, disconnect, HT-only AP
+fallback, program-not-granted).
+
+HE +HTC (`he_htc`) stays open: advertising `HTC_HE` lets the AP send +HTC
+QoS DATA, but the shared `station_security::Security::normalize` rejects
+the Order bit (`b[1] & 0x87 != 2`) and only knows 24/26-byte headers, and
+the `RawFrame` contract forbids the driver from stripping the HT Control
+field. Linux `__rtw89_core_tx_check_he_qos_htc` also needs the RA report's
+`might_fallback_legacy` (`rtw89_phy_c2h_ra_rpt_iter`), which this station
+does not yet consume.
+
 ### Recipient Block Ack and RX reordering
 
 On an open HT link the station acts as the mac80211 recipient for rtw89
@@ -1170,9 +1229,10 @@ or physical hardware acceptance.
 The per-chip source `rtw_chip_info` inventories are broader than this station:
 8851B declares1TX/1RX and2.4/5GHz;8852A/B declare2TX/2RX and2.4/5GHz;
 8852C declares2TX/2RX and2.4/5/6GHz;8922A declares2TX/2RX and2.4/5/6GHz
-with its distinct BE generation. B now has signed-program HT20, all-AC/TID
-QoS, firmware RA, recipient BA/reorder, MSI delivery, live EDCA and active
-channel-1 scans (section 3); it still needs HE and wider widths, TX
+with its distinct BE generation. B now has signed-program HT20, HE20 (with
+firmware GI/LTF selection), all-AC/TID QoS, firmware RA, recipient
+BA/reorder, MSI delivery, live EDCA and active channel-1 scans (section 3);
+it still needs HE +HTC and wider widths, TX
 aggregation/originator BA, other channels, tracking, runtime sleep/WoW and
 safe reset/rejoin. A/C/51 need complete chip-specific
 firmware/security, BB/RF/power/packet/station composition;8922A additionally

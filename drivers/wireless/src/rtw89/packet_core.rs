@@ -141,13 +141,38 @@ pub(super) struct Core {
     rings: Vec<Ring>,
     /// Stop bits of exactly the rings this owner published.
     stop: u32,
-    /// Signed HT program: admit 20MHz HT MCS0..15 receptions.
-    ht: bool,
+    /// Highest signed RX PHY program admitted for this owner.
+    rx: RxPhy,
     next_id: u64,
     pending: Option<Pending>,
     completions: VecDeque<Receipt>,
 }
 const STOP: u32 = 1 << 8 | 1 << 16 | 1 << 19;
+/// Receive PHY admission granted by the signed operating programs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum RxPhy {
+    /// CCK1..OFDM54 only.
+    Legacy,
+    /// `Program::Ht`: plus 20MHz HT MCS0..15 and A-MPDU subframes.
+    Ht,
+    /// `Program::He`: plus 20MHz HE NSS1/NSS2 MCS0..11 on any GI/LTF.
+    He,
+}
+impl RxPhy {
+    pub(super) fn from_programs(ht: bool, he: bool) -> Self {
+        match (ht, he) {
+            (true, true) => Self::He,
+            (true, false) => Self::Ht,
+            _ => Self::Legacy,
+        }
+    }
+    /// Whether a received `RX_DATARATE` is inside this admission.
+    pub(super) fn admits(self, rate: u16) -> bool {
+        rate <= 11
+            || self >= Self::Ht && (0x80..=0x8f).contains(&rate)
+            || self >= Self::He && rx_packet::he_rate(rate)
+    }
+}
 fn barrier() {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     #[cfg(target_arch = "aarch64")]
@@ -202,7 +227,7 @@ fn allocate(port: &mut impl Port, length: usize) -> Result<DmaBuffer, Error> {
 }
 impl Core {
     pub(super) fn prepare(port: &mut impl Port, own: [u8; 6], mac_id: u8) -> Result<Self, Error> {
-        Self::prepare_with(port, own, mac_id, false, false)
+        Self::prepare_with(port, own, mac_id, false, RxPhy::Legacy)
     }
     /// `qos_all` additionally publishes ACH1..3 (BK/VI/VO) for the separately
     /// qualified all-AC QoS program.
@@ -211,7 +236,7 @@ impl Core {
         own: [u8; 6],
         mac_id: u8,
         qos_all: bool,
-        ht: bool,
+        rx: RxPhy,
     ) -> Result<Self, Error> {
         if own == [0; 6] || own[0] & 1 != 0 || mac_id != 0 {
             return Err(Error::Packet);
@@ -246,7 +271,7 @@ impl Core {
                     rings
                 },
                 stop,
-                ht,
+                rx,
                 next_id: 1,
                 pending: None,
                 completions: VecDeque::new(),
@@ -314,6 +339,10 @@ impl Core {
     ) -> Result<u64, Error> {
         if self.phase != Phase::Running {
             return Err(Error::State);
+        }
+        // HE extended-range SU TX belongs to the signed HE program only.
+        if rate & format::DATA_ER != 0 && self.rx < RxPhy::He {
+            return Err(Error::Packet);
         }
         if !self.ready() {
             return Err(Error::Busy);
@@ -444,10 +473,11 @@ impl Core {
         match received.event {
             None | Some(rx_packet::Event::Dropped) => {}
             Some(rx_packet::Event::Firmware(event)) => step.c2h = Some(event.bytes),
-            // Without the signed HT program an HT PPDU is dropped exactly as
-            // the assembler dropped every non-legacy rate before.
-            Some(rx_packet::Event::Wifi(meta, _)) if (meta.rate > 11 || meta.ampdu) && !self.ht => {
-            }
+            // A PPDU above the signed RX PHY program (HT without `Ht`, HE
+            // without `He`) is dropped exactly as the assembler dropped every
+            // non-legacy rate before, without closing the station.
+            Some(rx_packet::Event::Wifi(meta, _))
+                if !self.rx.admits(meta.rate) || meta.ampdu && self.rx < RxPhy::Ht => {}
             // Linux forwards control frames to the host (RTW89_CTRL ->
             // RTW89_FWD_TO_HOST). Those shorter than an ordinary header are
             // surfaced from 16 bytes (PS-Poll/BAR); malformed ones are dropped.
@@ -471,7 +501,7 @@ impl Core {
                     || meta.hardware_decrypted
                     || meta.aggregate
                     || meta.bandwidth != 0
-                    || !(meta.rate <= 11 || self.ht && (0x80..=0x8f).contains(&meta.rate))
+                    || !self.rx.admits(meta.rate)
                     || bytes.len() < 24
                     || bytes.len() > format::MAX_MPDU
                     || meta.size != bytes.len() + 4

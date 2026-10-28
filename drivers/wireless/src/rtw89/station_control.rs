@@ -457,9 +457,15 @@ impl Controller {
         io: &mut impl Interface,
         rates: u16,
         ht: Option<codec::HtRa>,
+        he: Option<codec::HeRa>,
         admission: &Admission,
     ) -> Result<(), Error> {
-        let body = codec::ra_ht(rates, ht).ok_or(Error::Unsupported)?;
+        let body = match (ht, he) {
+            (Some(ht), Some(he)) => codec::ra_he(rates, ht, he),
+            (_, Some(_)) => None,
+            (ht, None) => codec::ra_ht(rates, ht),
+        }
+        .ok_or(Error::Unsupported)?;
         if self.phase() != Phase::Associated
             || self.admission.as_ref().is_none_or(|a| !a.same(admission))
         {
@@ -710,7 +716,7 @@ async fn edca(
 }
 #[path = "station_control/codec.rs"]
 mod codec;
-pub(super) use codec::HtRa;
+pub(super) use codec::{HeRa, HtRa};
 
 pub(super) fn profile_fingerprint() -> [u8; 32] {
     let mut hash = narf_crypto::sha256::Sha256::new();
@@ -737,6 +743,48 @@ pub(super) fn ht_fingerprint() -> [u8; 32] {
     hash.update(b"RA mode CCK|OFDM|HT mask HT1SS|SUBOFDM|SUBCCK, SGI20/LDPC from negotiation, STBC0, SS1; RX 20MHz MCS0..15 admitted");
     hash.update(&super::station_control::local_ht().capability_body());
     hash.finalize()
+}
+/// Emitter program added by `radio_policy::Program::He`.
+pub(super) fn he_fingerprint() -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"B HE20 v1; rtw89_init_he_cap 2.4GHz STA restricted: no 40MHz/HTC-HE/BSR/OPS/A-MSDU-in-A-MPDU/STBC-TX/DCM-NSS2/beamformee/NG16/codebook/MaxNc; RX 2SS TX 1SS HE-MCS0..11");
+    hash.update(b"RA mode HE|CCK|OFDM mask HE1SS|SUBOFDM|SUBCCK from peer RX map, SGI20 from HT, LDPC/DCM from peer HE PHY, STBC0, SS1, ER0, no fixed GI/LTF");
+    hash.update(b"data TXWD INFO0 DATA_ER when HE operation allows ER SU; RX HE NSS1/NSS2 MCS0..11 20MHz GI/LTF 0..5; HE TB/ER SU autonomous responses measured");
+    hash.update(
+        &local_he()
+            .map(|he| he.capability_body())
+            .unwrap_or_default(),
+    );
+    hash.finalize()
+}
+/// Local HE capability: Linux `rtw89_init_he_cap` for a 2.4GHz station,
+/// restricted to the retained TX-A/RX-AB 20MHz profile. Bits needing
+/// 40MHz (`wide_channels`), a second TX path (STBC TX, DCM TX NSS2), HE
+/// +HTC (`he_htc`: BSR, HTC_HE), power save (OPS), RX A-MSDU (`aggregation`)
+/// or beamforming feedback (`rtw89_mac_bf_assoc` sounding: SU beamformee,
+/// NG16, codebook, triggered SU feedback, MaxNc) are clear.
+pub(super) fn local_he() -> Option<narf_wireless::association::he::LocalHe> {
+    const MAC: [u8; 6] = [
+        0x00, // no HTC_HE (he_htc)
+        0x08, // TF_MAC_PAD_DUR_16US
+        0x02, // ALL_ACK
+        0x10, // MAX_AMPDU_LEN_EXP_EXT_2
+        0x00, // no OPS / AMSDU_IN_AMPDU
+        0x80, // HT_VHT_TRIG_FRAME_RX
+    ];
+    const PHY: [u8; 11] = [
+        0x00, // 20MHz only in 2.4GHz
+        0x70, // DEVICE_CLASS_A | LDPC_CODING_IN_PAYLOAD | HE_LTF_AND_GI_0_8US
+        0x1a, // NDP_4x_LTF_AND_3_2US | STBC_RX_UNDER_80MHZ | DOPPLER_TX
+        0x1b, // DCM_MAX_CONST_RX_16_QAM | DCM_MAX_CONST_TX_16_QAM (NSS1)
+        0x00, 0x00, 0x20, // PARTIAL_BW_EXT_RANGE
+        0x06, // POWER_BOOST_FACTOR_SUPP | HE_SU_MU_PPDU_4XLTF_AND_08_US_GI
+        0x91, // ER_SU_4XLTF_08 | ER_SU_1XLTF_08 | DCM_MAX_RU_996
+        0xbd, // >16 SIGB | TX/RX 1024QAM <242 RU | full-BW SU in MU | 16us padding
+        0x00,
+    ];
+    // RX MCS0..11 on both RX paths, TX MCS0..11 on the single TX path.
+    narf_wireless::association::he::LocalHe::new(MAC, PHY, 0xfffa, 0xfffe).ok()
 }
 /// Local HT20 capability (Linux `rtw89_init_ht_cap` restricted to the
 /// retained TX-A/RX-AB 20MHz profile).

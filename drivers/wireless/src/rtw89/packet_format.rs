@@ -77,6 +77,9 @@ impl Queue {
 /// `rate` flag for firmware rate adaptation (Linux data frames: USE_RATE=0,
 /// DISDATAFB=0); the low bits carry `DATA_RTY_LOWEST_RATE`.
 pub(super) const FIRMWARE_RA: u8 = 0x80;
+/// With `FIRMWARE_RA`: `RTW89_TXWD_INFO0_DATA_ER` (Linux `desc_info->er_cap`
+/// for an HE peer whose HE operation leaves ER SU enabled).
+pub(super) const DATA_ER: u8 = 0x40;
 /// `B_AX_STOP_WPDMA`.
 pub(super) const STOP_WPDMA: u32 = 1 << 19;
 /// Every ordinary TX stop bit this station can open (ACH0..3, CH8, WPDMA).
@@ -171,10 +174,12 @@ pub(super) fn transmit_rate(
 ) -> Result<(Vec<u8>, Queue), Error> {
     let queue = classify(frame, own)?;
     let adaptive = rate & FIRMWARE_RA != 0;
-    let index = rate & !FIRMWARE_RA;
+    let er = rate & DATA_ER != 0;
+    let index = rate & !(FIRMWARE_RA | DATA_ER);
     if mac_id != 0
         || sequence >= IDENTITIES
         || index > 11
+        || er && !adaptive
         || queue == Queue::Management && rate != 0
     {
         return Err(Error::Metadata);
@@ -212,7 +217,7 @@ pub(super) fn transmit_rate(
     if adaptive {
         // rtw89_build_txwd_info0/1 for data: firmware RA owns the rate;
         // INFO1 DATA_RTY_LOWEST_RATE[24:16] bounds hardware retry fallback.
-        put(&mut bytes, 24, 0);
+        put(&mut bytes, 24, u32::from(er) << 15);
         put(&mut bytes, 28, u32::from(index) << 16);
     } else {
         put(&mut bytes, 24, 1 << 30 | 1 << 10 | u32::from(rate) << 16); // Source DATA_RATE[24:16].

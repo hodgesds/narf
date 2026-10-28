@@ -38,6 +38,7 @@ pub(super) unsafe trait Io: Send {
         &mut self,
         _: u16,
         _: Option<super::station_control::HtRa>,
+        _: Option<super::station_control::HeRa>,
         _: &Admission,
     ) -> Result<(), power::Error> {
         Err(power::Error::Unsupported)
@@ -55,6 +56,10 @@ pub(super) unsafe trait Io: Send {
     }
     /// Signed HT20 program (`Program::Ht`).
     fn station_ht_allowed(&mut self) -> Result<bool, power::Error> {
+        Ok(false)
+    }
+    /// Signed HE20 program (`Program::He`).
+    fn station_he_allowed(&mut self) -> Result<bool, power::Error> {
         Ok(false)
     }
     /// Signed all-AC/TID QoS program (`radio_policy::Program::QosAll`).
@@ -285,6 +290,10 @@ pub(super) struct State {
     firmware_ra: bool,
     /// HT20 was negotiated for this association.
     ht: bool,
+    /// HE20 was negotiated for this association.
+    he: bool,
+    /// Data TXWD `DATA_ER` (Linux `er_cap`: HE operation allows ER SU).
+    er: bool,
     /// Recipient Block Ack sessions per TID.
     ba: [Option<super::block_ack::Session<Mpdu>>; 8],
     /// BA CAM programming awaiting the async owner.
@@ -333,6 +342,8 @@ impl State {
             qos_all: false,
             firmware_ra: false,
             ht: false,
+            he: false,
+            er: false,
             ba: core::array::from_fn(|_| None),
             ba_ops: VecDeque::new(),
             mgmt_out: VecDeque::new(),
@@ -401,6 +412,8 @@ impl State {
         self.qos_all = false;
         self.firmware_ra = false;
         self.ht = false;
+        self.he = false;
+        self.er = false;
         self.clear_block_ack();
         self.admission.close();
         self.established = false;
@@ -436,6 +449,8 @@ impl State {
         self.qos_all = false;
         self.firmware_ra = false;
         self.ht = false;
+        self.he = false;
+        self.er = false;
         self.clear_block_ack();
         if let Some(security) = &mut self.security {
             security.fail();
@@ -495,7 +510,12 @@ impl State {
             if rates == 0 {
                 return Err(Error::Profile);
             }
-            super::packet_format::FIRMWARE_RA | rates.trailing_zeros() as u8
+            let er = if self.er {
+                super::packet_format::DATA_ER
+            } else {
+                0
+            };
+            super::packet_format::FIRMWARE_RA | er | rates.trailing_zeros() as u8
         } else if kind == Kind::Data && self.wmm.is_some() {
             let rates = self.plan.as_ref().ok_or(Error::State)?.legacy_rates().0;
             [11, 10, 9, 8, 7, 6, 3, 5, 4, 2, 1, 0]
@@ -791,6 +811,9 @@ impl State {
     }
     pub(super) fn ht(&self) -> bool {
         self.ht
+    }
+    pub(super) fn he(&self) -> bool {
+        self.he
     }
     pub(super) fn qos_all(&self) -> bool {
         self.qos_all && self.wmm.is_some()
@@ -1145,9 +1168,15 @@ impl State {
             .flatten()
             .is_some();
         let mut plan = if ap_wmm && io.station_wmm_allowed()? && io.station_ht_allowed()? {
-            let local =
+            let mut local =
                 narf_wireless::association::phy::LocalPhy::ht20(super::station_control::local_ht())
                     .map_err(|_| Error::Profile)?;
+            // HE is offered only under the signed HE20 program (which
+            // itself requires HT20).
+            if io.station_he_allowed()? {
+                let he = super::station_control::local_he().ok_or(Error::Profile)?;
+                local = local.with_he(he).map_err(|_| Error::Profile)?;
+            }
             JoinPlan::prepare_with_phy(&candidate.bss, self.own, ssid, mode, local)?
         } else {
             JoinPlan::prepare(&candidate.bss, self.own, ssid, mode)?
@@ -1212,8 +1241,22 @@ impl State {
                                 ldpc: ht.tx_ldpc(),
                             }
                         });
+                        let he = plan.negotiated_phy().and_then(|phy| phy.he()).map(|he| {
+                            let peer = he.peer_capability().phy_capability();
+                            (
+                                super::station_control::HeRa {
+                                    peer_rx_mcs: he.tx_mcs_map(),
+                                    ldpc: he.tx_ldpc(),
+                                    dcm: peer[3] & 0x18 != 0,
+                                },
+                                !he.operation().er_su_disabled(),
+                            )
+                        });
                         self.ht = ht.is_some();
-                        io.station_configure_ra(rates, ht, &self.admission).await?;
+                        self.he = he.is_some();
+                        self.er = he.is_some_and(|(_, er)| er);
+                        io.station_configure_ra(rates, ht, he.map(|(he, _)| he), &self.admission)
+                            .await?;
                     }
                 }
                 self.admission.run(|| {
