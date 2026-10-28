@@ -135,21 +135,17 @@ fn probe_error(e: &AhbError) -> narf_bus::ProbeError {
     }
 }
 
-/// Platforms probed and awaiting their bring-up task.
-static PROBED: narf_lib::sync::IrqSafeSpinLock<Vec<AhbPlatform>> =
-    narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
-
 /// The DT probe (`ath11k_ahb_probe`'s devicetree half): resolve the
-/// node, then hand it to the bring-up.
+/// node, then spawn the bring-up task ([`super::ahb_live::spawn_bring_up`]).
 pub fn ahb_dt_probe(blob: &'static [u8], path: &str) -> Result<(), narf_bus::ProbeError> {
     let p = probe_node(blob, path).map_err(|e| probe_error(&e))?;
-    PROBED.lock().push(p);
+    super::ahb_live::spawn_bring_up(blob, p);
     Ok(())
 }
 
-/// Take the platforms probed so far.
-pub fn take_probed() -> Vec<AhbPlatform> {
-    core::mem::take(&mut *PROBED.lock())
+/// [`ahb_dt_probe`]'s error mapping.
+pub fn dt_probe_error(e: &AhbError) -> narf_bus::ProbeError {
+    probe_error(e)
 }
 
 /// One bring-up step ([`bring_up`] order).
@@ -164,13 +160,14 @@ pub enum BringUpStep {
     QmiReady,
 }
 
-/// The actions [`bring_up`] sequences. Production binds GIC lines through
+/// The actions [`bring_up`] sequences. Production
+/// ([`super::ahb_live::LiveAhb`]) binds GIC lines through
 /// `narf_drivers_qcom_soc::irq`, boots through `Q6Wcss` / `PasRproc` and
 /// runs QRTR over `GlinkQrtr`; fixtures record.
 pub trait AhbBringUp {
     fn hal_ce_alloc(&mut self, p: &AhbPlatform) -> Result<(), AhbError>;
     fn qmi_init_service(&mut self, p: &AhbPlatform) -> Result<(), AhbError>;
-    fn rproc_irqs(&mut self, p: &AhbPlatform) -> Result<(), AhbError>;
+    fn rproc_irqs(&mut self, p: &AhbPlatform) -> impl Future<Output = Result<(), AhbError>>;
     fn rproc_boot(&mut self, p: &AhbPlatform) -> impl Future<Output = Result<(), AhbError>>;
     fn glink_start(&mut self, p: &AhbPlatform) -> impl Future<Output = Result<(), AhbError>>;
     fn config_irq(&mut self, p: &AhbPlatform) -> Result<(), AhbError>;
@@ -187,7 +184,7 @@ pub async fn bring_up<B: AhbBringUp>(
     use BringUpStep::*;
     b.hal_ce_alloc(p).map_err(|e| (HalCeAlloc, e))?;
     b.qmi_init_service(p).map_err(|e| (QmiInit, e))?;
-    b.rproc_irqs(p).map_err(|e| (RprocIrqs, e))?;
+    b.rproc_irqs(p).await.map_err(|e| (RprocIrqs, e))?;
     b.rproc_boot(p).await.map_err(|e| (RprocBoot, e))?;
     let r = async {
         b.glink_start(p).await.map_err(|e| (GlinkStart, e))?;

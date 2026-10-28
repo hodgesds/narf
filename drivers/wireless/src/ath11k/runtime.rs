@@ -4440,6 +4440,24 @@ pub async fn start_pci(core: super::core::PciCore, dp: Dp) {
     ));
 }
 
+/// [`start_ahb`]'s result: the runtime and the MAC (or the
+/// `device_caps` failure).
+pub type AhbStart<Io, Irq, Q> = (Arc<Shared<Io, Irq, Q>>, Result<[u8; 6], TransportError>);
+
+/// The AHB counterpart of [`start_pci`]'s runtime half, after
+/// `ath11k_core_qmi_firmware_ready`: the runtime over the ready core and
+/// its DP ([`Rt`] + [`Shared`]) and the MAC `device_caps` reports
+/// (`ath11k_mac_register`'s input). The netdev registration
+/// ([`super::iface::register_pci`]) is PCI-typed and not done here.
+pub fn start_ahb<Io: RtIo, Irq: DpIrq, Q: RtQmi>(
+    core: Ath11kCore<CeHif<Io, Irq>, Q>,
+    dp: Dp,
+) -> AhbStart<Io, Irq, Q> {
+    let rt = Rt::new(core, dp);
+    let mac = rt.device_caps().map(|c| c.mac_addr);
+    (Shared::new(rt, secure_random), mac)
+}
+
 fn secure_random(out: &mut [u8]) -> Result<(), i32> {
     narf_crypto::try_fill_random_bytes(out).map_err(|_| super::mac::errno::EIO)
 }

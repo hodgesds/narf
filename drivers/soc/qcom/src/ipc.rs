@@ -73,3 +73,20 @@ impl<R: RegIo> Kick for Ipcc<R> {
         );
     }
 }
+
+/// The kick a DT `mboxes` / `qcom,ipc` entry names
+/// (`platform::KickDt`), over its mapped window.
+#[derive(Debug)]
+pub enum DtKick<R: RegIo> {
+    Apcs(ApcsIpc<R>),
+    Ipcc(Ipcc<R>),
+}
+
+impl<R: RegIo> Kick for DtKick<R> {
+    fn kick(&self) {
+        match self {
+            DtKick::Apcs(k) => k.kick(),
+            DtKick::Ipcc(k) => k.kick(),
+        }
+    }
+}

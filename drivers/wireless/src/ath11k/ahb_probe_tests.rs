@@ -92,7 +92,7 @@ impl AhbBringUp for Rec {
     fn qmi_init_service(&mut self, _p: &AhbPlatform) -> Result<(), AhbError> {
         self.step(BringUpStep::QmiInit, "qmi_init")
     }
-    fn rproc_irqs(&mut self, _p: &AhbPlatform) -> Result<(), AhbError> {
+    async fn rproc_irqs(&mut self, _p: &AhbPlatform) -> Result<(), AhbError> {
         self.step(BringUpStep::RprocIrqs, "q6_irqs")
     }
     async fn rproc_boot(&mut self, _p: &AhbPlatform) -> Result<(), AhbError> {
@@ -160,13 +160,31 @@ kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_ahb_bring_up_order);
 /// The bus DT match table binds the AHB node once, through
 /// `ahb_dt_probe`, by its full path; a second walk is a no-op and a
 /// driver-less tree binds nothing.
+static PROBED: narf_lib::sync::IrqSafeSpinLock<Vec<AhbPlatform>> =
+    narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+
+/// `ahb_dt_probe` minus the live task (QEMU has no IPQ MMIO).
+fn fixture_dt_probe(blob: &'static [u8], path: &str) -> Result<(), narf_bus::ProbeError> {
+    let p = probe_node(blob, path).map_err(|e| dt_probe_error(&e))?;
+    PROBED.lock().push(p);
+    Ok(())
+}
+
+fn take_probed() -> Vec<AhbPlatform> {
+    core::mem::take(&mut *PROBED.lock())
+}
+
 fn smoke_ath11k_ahb_dt_driver_match() -> TestResult {
     let blob: &'static [u8] =
         alloc::boxed::Box::leak(ipq6018_wifi_dt("qcom,ipq6018-wifi", &SPIS).into_boxed_slice());
     narf_bus::unregister_dt_driver(AHB_DT_DRIVER);
     kt_assert_eq!(narf_bus::probe_dt_blob(blob), 0);
     let _ = take_probed();
-    register_dt_driver();
+    narf_bus::register_dt_driver(narf_bus::DtMatch {
+        name: AHB_DT_DRIVER,
+        compatible: &AHB_DT_COMPATIBLE,
+        probe: fixture_dt_probe,
+    });
     let n = narf_bus::probe_dt_blob(blob);
     let again = narf_bus::probe_dt_blob(blob);
     let bound = narf_bus::bound_dt_nodes();

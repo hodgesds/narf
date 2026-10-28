@@ -32,7 +32,9 @@ pub const WPSS_CRASH_REASON: u32 = 626;
 #[derive(Debug)]
 pub struct PasRproc {
     pub pas_id: u32,
-    pub q6: Q6v5,
+    /// Leaked at [`Self::new`]: GIC handlers hold `&'static` to it
+    /// (`irq::Q6Irqs::bind_gic`) for the remoteproc's lifetime.
+    pub q6: &'static Q6v5,
     mem_reloc: u64,
     state: RprocState,
 }
@@ -41,7 +43,7 @@ impl PasRproc {
     pub fn new(pas_id: u32) -> Self {
         Self {
             pas_id,
-            q6: Q6v5::new(),
+            q6: alloc::boxed::Box::leak(alloc::boxed::Box::new(Q6v5::new())),
             mem_reloc: 0,
             state: RprocState::Offline,
         }
@@ -63,10 +65,10 @@ impl PasRproc {
         alloc: &mut A,
         fw_name: &str,
         mdt: &[u8],
-        src: &dyn SegmentSource,
+        src: &(dyn SegmentSource + Sync),
         carveout: &mut Carveout<'_>,
         delay: &D,
-        pump: &mut dyn FnMut(&Q6v5),
+        pump: &mut (dyn FnMut(&Q6v5) + Send),
     ) -> Result<(), RprocError> {
         if self.state == RprocState::Running {
             return Err(RprocError::BadState(self.state));
@@ -112,9 +114,9 @@ impl PasRproc {
     pub async fn stop<C: SmcConduit, D: Delay + ?Sized>(
         &mut self,
         scm: &mut Scm<C>,
-        stop: &dyn StopState,
+        stop: &(dyn StopState + Sync),
         delay: &D,
-        pump: &mut dyn FnMut(&Q6v5),
+        pump: &mut (dyn FnMut(&Q6v5) + Send),
     ) -> Result<(), RprocError> {
         if self.state == RprocState::Offline {
             return Err(RprocError::BadState(self.state));

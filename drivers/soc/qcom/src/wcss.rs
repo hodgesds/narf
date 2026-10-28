@@ -92,9 +92,9 @@ pub struct WcssRegs<R: RegIo> {
 /// The GCC reset lines (`reset-names`).
 #[derive(Clone, Copy)]
 pub struct WcssResets<'a> {
-    pub aon: &'a dyn ResetLine,
-    pub wcss: &'a dyn ResetLine,
-    pub q6: &'a dyn ResetLine,
+    pub aon: &'a (dyn ResetLine + Sync),
+    pub wcss: &'a (dyn ResetLine + Sync),
+    pub q6: &'a (dyn ResetLine + Sync),
 }
 
 impl core::fmt::Debug for WcssResets<'_> {
@@ -107,7 +107,9 @@ impl core::fmt::Debug for WcssResets<'_> {
 #[derive(Debug)]
 pub struct Q6Wcss<R: RegIo> {
     pub regs: WcssRegs<R>,
-    pub q6: Q6v5,
+    /// Leaked at [`Self::new`]: GIC handlers hold `&'static` to it
+    /// (`irq::Q6Irqs::bind_gic`) for the remoteproc's lifetime.
+    pub q6: &'static Q6v5,
     boot_addr: Option<u32>,
     mem_reloc: u64,
     state: RprocState,
@@ -119,7 +121,7 @@ impl<R: RegIo> Q6Wcss<R> {
     pub fn new(regs: WcssRegs<R>) -> Self {
         Self {
             regs,
-            q6: Q6v5::new(),
+            q6: alloc::boxed::Box::leak(alloc::boxed::Box::new(Q6v5::new())),
             boot_addr: None,
             mem_reloc: 0,
             state: RprocState::Offline,
@@ -142,7 +144,7 @@ impl<R: RegIo> Q6Wcss<R> {
         &mut self,
         fw_name: &str,
         mdt: &[u8],
-        src: &dyn SegmentSource,
+        src: &(dyn SegmentSource + Sync),
         carveout: &mut Carveout<'_>,
     ) -> Result<(), RprocError> {
         let m = Mdt::parse(mdt)?;
@@ -203,7 +205,7 @@ impl<R: RegIo> Q6Wcss<R> {
         &mut self,
         resets: WcssResets<'_>,
         delay: &D,
-        pump: &mut dyn FnMut(&Q6v5),
+        pump: &mut (dyn FnMut(&Q6v5) + Send),
     ) -> Result<(), RprocError> {
         let boot_addr = self.boot_addr.ok_or(RprocError::BadState(self.state))?;
         self.q6.prepare();
@@ -345,9 +347,9 @@ impl<R: RegIo> Q6Wcss<R> {
     pub async fn stop<D: Delay + ?Sized>(
         &mut self,
         resets: WcssResets<'_>,
-        stop: &dyn StopState,
+        stop: &(dyn StopState + Sync),
         delay: &D,
-        pump: &mut dyn FnMut(&Q6v5),
+        pump: &mut (dyn FnMut(&Q6v5) + Send),
     ) -> Result<(), RprocError> {
         if self.state == RprocState::Offline {
             return Err(RprocError::BadState(self.state));

@@ -177,7 +177,7 @@ impl Q6v5 {
         flag: &AtomicBool,
         delay: &D,
         timeout_ms: u32,
-        pump: &mut dyn FnMut(&Self),
+        pump: &mut (dyn FnMut(&Self) + Send),
         crash_aborts: bool,
     ) -> Result<(), Q6Error> {
         let deadline = delay.now_us() + timeout_ms as u64 * 1000;
@@ -204,7 +204,7 @@ impl Q6v5 {
         &self,
         delay: &D,
         timeout_ms: u32,
-        pump: &mut dyn FnMut(&Self),
+        pump: &mut (dyn FnMut(&Self) + Send),
     ) -> Result<(), Q6Error> {
         let r = self
             .wait(&self.start_done, delay, timeout_ms, pump, true)
@@ -222,7 +222,7 @@ impl Q6v5 {
         &self,
         delay: &D,
         timeout_ms: u32,
-        pump: &mut dyn FnMut(&Self),
+        pump: &mut (dyn FnMut(&Self) + Send),
     ) -> Result<(), Q6Error> {
         self.running.store(false, Ordering::Release);
         self.wait(&self.stop_done, delay, timeout_ms, pump, false)

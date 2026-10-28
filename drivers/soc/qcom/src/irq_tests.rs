@@ -76,7 +76,7 @@ fn smoke_qcom_irq_smp2p_routes_to_q6v5() -> TestResult {
     let q6 = Q6v5::new();
     q6.prepare();
     // Remote publishes the entry, then raises ready (bit 1).
-    let ri = crate::tests::remote_item(&smem, &lock, cfg, &[("master-kernel", 0)], false);
+    let ri = crate::fixtures::remote_item(&smem, &lock, cfg, &[("master-kernel", 0)], false);
     kt_assert_eq!(smp2p_dispatch(&mut e, &smem, EDGE, &handles, &r, &q6), 0);
     regs.set(ri + 36, 1 << 1);
     kt_assert_eq!(smp2p_dispatch(&mut e, &smem, EDGE, &handles, &r, &q6), 1);

@@ -102,6 +102,7 @@ pub trait HwSpinlock { fn lock(&self, ms) -> impl Future<..> + Send; fn unlock(&
 pub struct TcsrMutex<R, D>;
 pub struct Smem<R>;  impl Smem { probe(mem, size), get(host, item), alloc(lock, host, item, size), read_bytes }
 pub trait Kick { fn kick(&self); }  pub struct ApcsIpc<R>;  pub struct Ipcc<R>;
+pub enum DtKick<R> { Apcs(ApcsIpc<R>), Ipcc(Ipcc<R>) }   // impl Kick: the DT `mboxes` kick, either block
 pub struct Smp2p<K>; impl Smp2p { new(smem, lock, cfg, kick), add_outbound, update_bits,
     outbound_value, add_inbound, enable_irq, disable_irq, handle_interrupt -> Vec<Smp2pIrq> }
 ```
@@ -119,8 +120,10 @@ pub struct Gcc<R>; impl Gcc { set_reset, reset_line, enable_branch, disable_bran
 pub struct Q6v5;  impl Q6v5 { prepare, unprepare, signal(Q6Event), wait_for_start, wait_for_stop, crash }
 pub trait StopState { fn set_stop(&self, on: bool); }
 pub struct Carveout<'a> { phys, mem: &'a mut [u8] }
-pub struct Q6Wcss<R>; impl Q6Wcss { new(WcssRegs), load, start(WcssResets, delay, pump), stop(.., &dyn StopState, ..) }
-pub struct PasRproc;  impl PasRproc { new(pas_id), start(scm, alloc, fw, mdt, src, carveout, delay, pump), stop }
+pub struct Q6Wcss<R> { pub q6: &'static Q6v5, .. }; impl Q6Wcss { new(WcssRegs), load, start(WcssResets, delay, pump), stop(.., &(dyn StopState + Sync), ..) }
+pub struct PasRproc { pub q6: &'static Q6v5, .. };  impl PasRproc { new(pas_id), start(scm, alloc, fw, mdt, src, carveout, delay, pump), stop }
+pub struct WcssResets<'a> { aon, wcss, q6: &'a (dyn ResetLine + Sync) }
+// pump: &mut (dyn FnMut(&Q6v5) + Send); src: &(dyn SegmentSource + Sync)
 pub enum RprocState { Offline, Running, Crashed }
 pub enum RprocError { .. }
 ```
@@ -178,8 +181,12 @@ is threaded: the edge's interrupt only wakes the task running
 allocation) and signals each routed rising edge. On x86_64 `GicSpi::bind`
 is `NotSupported`.
 
-`pump` is called on every wait iteration; production passes a no-op (IRQ
-handlers call `Q6v5::signal`), fixtures use it to play the remote.
+`pump` is called on every wait iteration; fixtures use it to play the
+remote, and the ath11k AHB bring-up runs one `qcom_smp2p_intr` pass per
+edge from it (GIC lines still call `Q6v5::signal` from hard IRQ). The
+`Send` / `Sync` bounds on `pump`, `src`, `StopState` and `ResetLine` keep
+the start / stop futures `Send`, so a spawned task can boot the remote.
+`new` leaks the `Q6v5` so `Q6Irqs::bind_gic` can chain its `&'static`.
 
 ## 4. Invariants
 - No busy waits on hardware registers: every poll sleeps via `Delay`.

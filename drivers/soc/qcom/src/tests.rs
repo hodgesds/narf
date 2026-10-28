@@ -14,7 +14,7 @@ use narf_kernel_test::{kernel_test_in, kt_assert, kt_assert_eq, TestResult};
 use crate::fixtures::*;
 use crate::gcc::{self, Gcc, GccError, ResetLine};
 use crate::hwlock::{HwLockError, HwSpinlock, TcsrMutex};
-use crate::io::{Delay, RegIo};
+use crate::io::Delay;
 use crate::ipc::{ApcsIpc, Ipcc, Kick};
 use crate::mdt::{self, Mdt, MdtError, PT_LOAD, QCOM_MDT_RELOCATABLE, QCOM_MDT_TYPE_HASH};
 use crate::pas::PasRproc;
@@ -23,7 +23,7 @@ use crate::q6v5::{Q6Error, Q6Event, Q6v5};
 use crate::rproc::{Carveout, RprocError, RprocState, StopState};
 use crate::scm::{self, Convention, Scm, ScmError};
 use crate::smem::{Smem, SmemError};
-use crate::smp2p::{Smp2p, Smp2pConfig, ITEM_SIZE, SMP2P_MAGIC};
+use crate::smp2p::{Smp2p, Smp2pConfig, SMP2P_MAGIC};
 use crate::wcss::{self, Q6Wcss, WcssRegs, WcssResets};
 
 const SUB: &str = "drivers/soc/qcom";
@@ -462,47 +462,6 @@ impl Kick for &CountKick {
     fn kick(&self) {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
-}
-
-/// Play the remote: allocate and fill its outbound (our inbound) item.
-pub(crate) fn remote_item(
-    smem: &Smem<&FakeRegs>,
-    lock: &impl HwSpinlock,
-    cfg: Smp2pConfig,
-    entries: &[(&str, u32)],
-    ssr: bool,
-) -> u32 {
-    run(smem.alloc(lock, cfg.remote_pid, cfg.smem_in, ITEM_SIZE))
-        .unwrap()
-        .unwrap();
-    let it = smem.get(cfg.remote_pid, cfg.smem_in).unwrap();
-    let m = smem.mem();
-    m.write32(it.offset, SMP2P_MAGIC);
-    m.write32(it.offset + 4, 1 | (1 << 8));
-    m.write32(
-        it.offset + 8,
-        cfg.remote_pid as u32 | ((cfg.local_pid as u32) << 16),
-    );
-    m.write32(it.offset + 12, 16 | ((entries.len() as u32) << 16));
-    m.write32(it.offset + 16, ssr as u32);
-    for (i, (name, v)) in entries.iter().enumerate() {
-        let e = it.offset + 20 + i as u32 * 20;
-        let mut raw = [0u8; 16];
-        raw[..name.len()].copy_from_slice(name.as_bytes());
-        for w in 0..4 {
-            m.write32(
-                e + w * 4,
-                u32::from_le_bytes([
-                    raw[w as usize * 4],
-                    raw[w as usize * 4 + 1],
-                    raw[w as usize * 4 + 2],
-                    raw[w as usize * 4 + 3],
-                ]),
-            );
-        }
-        m.write32(e + 16, *v);
-    }
-    it.offset
 }
 
 fn smoke_qcom_smp2p_edge() -> TestResult {

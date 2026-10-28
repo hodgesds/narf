@@ -978,6 +978,49 @@ pub const AHB_IRQ_NAMES: [&str; 52] = [
     "tcl2host-status-ring",
 ];
 
+// ── SMP2P remote ─
+
+/// Play the remote: allocate and fill its outbound (our inbound) item.
+pub fn remote_item(
+    smem: &crate::smem::Smem<&FakeRegs>,
+    lock: &impl crate::hwlock::HwSpinlock,
+    cfg: crate::smp2p::Smp2pConfig,
+    entries: &[(&str, u32)],
+    ssr: bool,
+) -> u32 {
+    run(smem.alloc(lock, cfg.remote_pid, cfg.smem_in, crate::smp2p::ITEM_SIZE))
+        .unwrap()
+        .unwrap();
+    let it = smem.get(cfg.remote_pid, cfg.smem_in).unwrap();
+    let m = smem.mem();
+    m.write32(it.offset, crate::smp2p::SMP2P_MAGIC);
+    m.write32(it.offset + 4, 1 | (1 << 8));
+    m.write32(
+        it.offset + 8,
+        cfg.remote_pid as u32 | ((cfg.local_pid as u32) << 16),
+    );
+    m.write32(it.offset + 12, 16 | ((entries.len() as u32) << 16));
+    m.write32(it.offset + 16, ssr as u32);
+    for (i, (name, v)) in entries.iter().enumerate() {
+        let e = it.offset + 20 + i as u32 * 20;
+        let mut raw = [0u8; 16];
+        raw[..name.len()].copy_from_slice(name.as_bytes());
+        for w in 0..4 {
+            m.write32(
+                e + w * 4,
+                u32::from_le_bytes([
+                    raw[w as usize * 4],
+                    raw[w as usize * 4 + 1],
+                    raw[w as usize * 4 + 2],
+                    raw[w as usize * 4 + 3],
+                ]),
+            );
+        }
+        m.write32(e + 16, *v);
+    }
+    it.offset
+}
+
 // ── GLINK remote ───────────────────────────────────────────────────
 
 /// The remote end of a GLINK-SMEM edge over a [`FakeRegs`] SMEM region:

@@ -1911,7 +1911,7 @@ DT bring-up (`ahb_probe.rs`):
 pub struct AhbPlatform { res: AhbResources, remote: AhbRemote, q6_irqs: Q6Irqs, glink: GlinkEdgeDt, lines: Vec<AhbLine> }
 impl AhbPlatform { fn probe(blob, &PlatformDevice) -> Result<Self, AhbError>; fn smp2p_edges(&self) -> Vec<String>; }
 pub enum BringUpStep { HalCeAlloc, QmiInit, RprocIrqs, RprocBoot, GlinkStart, ConfigIrq, QmiReady }
-pub trait AhbBringUp { hal_ce_alloc, qmi_init_service, rproc_irqs, async rproc_boot, async glink_start,
+pub trait AhbBringUp { hal_ce_alloc, qmi_init_service, async rproc_irqs, async rproc_boot, async glink_start,
                        config_irq, async qmi_ready, async rproc_shutdown }
 pub async fn bring_up<B: AhbBringUp>(&AhbPlatform, &mut B) -> Result<(), (BringUpStep, AhbError)>;
 pub enum AhbError { .., LoaderMismatch, Failed(errno) }
@@ -1921,9 +1921,61 @@ pub enum AhbError { .., LoaderMismatch, Failed(errno) }
 `ath11k_core_init`: QMI service, `hif_power_up` = `rproc_boot` with the
 remoteproc's Q6 lines / SMP2P edges bound first and the glink subdev
 started after → `ath11k_ahb_config_irq` → QMI server arrival / firmware
-ready) and shuts the remoteproc down on a failure after it booted. The
-production `AhbBringUp` (MMIO mapping, `Q6Wcss` / `PasRproc` boot,
-`GlinkSmem` + `GlinkQrtr`, the WLFW task) is not written yet.
+ready) and shuts the remoteproc down on a failure after it booted.
+
+DT driver: `ahb_probe::register_dt_driver()` registers `ath11k_ahb`
+(`AHB_DT_COMPATIBLE` = `ath11k_ahb_of_match`) with the bus DT match table
+(`narf_bus::register_dt_driver`, bus spec §3.2) at `Stage::Subsys`; a
+`Stage::Device` initcall walks the boot DTB (`narf_bus::probe_all_dt`).
+`ahb_dt_probe(blob, path)` = `probe_node` (→ `AhbPlatform::probe`) +
+`ahb_live::spawn_bring_up`.
+
+Production bring-up (`ahb_live.rs`):
+
+```rust
+pub trait AhbEnv: Send + Sync + 'static {
+    type Regs: RegIo; type Delay: Delay; type Smc: SmcConduit; type ScmAlloc: ScmAlloc;
+    type Fw: FirmwareLoader; type Dma: DmaAllocator; type Bus: GlinkBus;
+    fn map(&mut self, phys, len) -> Result<&'static Regs, AhbError>;          // devm_ioremap
+    fn carveout(&mut self, phys, len) -> Result<&'static mut [u8], AhbError>; // memory-region
+    fn delay, firmware, scm, dma, clock;
+    fn bind_lines(&mut self, Vec<AhbLine>, AhbHwParams) -> Result<AhbIrq, AhbError>;
+    fn bind_q6_gic(&mut self, &Q6Irqs, &'static Q6v5) -> Result<(), AhbError>;
+    fn glink_bus(&mut self, blob, &GlinkEdgeDt) -> Result<Bus, AhbError>;
+    fn remote_tick(&self) {}                                                  // fixtures play the remote
+}
+pub struct LiveAhb<E: AhbEnv> { pub env: E, pub outcome: Option<LiveOutcome<E>>, pub failure, .. } // impl AhbBringUp
+impl LiveAhb { new(env, blob), hif(), rproc_state(), qrtr_open(), glink_negotiated(), set_wlan_smp2p(v) }
+pub enum LiveOutcome<E> { Ready(Box<AhbCore<E>>, Box<Dp>), Stranded(Box<AhbCore<E>>, Option<Box<Dp>>) }
+pub type AhbWlfw<E> = Wlfw<GlinkQrtr<GlinkSmem<&Regs, DtKick<&Regs>>, Bus>, Fw, Dma>;
+pub struct NarfAhbEnv;      // MmioRegs, NarfDelay, ArchSmc, CoherentAlloc, NarfFirmware, Dma32, AhbGlinkBus
+pub enum AhbGlinkBus { Gic(GicSpi), Ipcc { line: GicSpi, regs } }   // impl GlinkBus
+pub async fn bring_up_task(blob, AhbPlatform);  pub fn spawn_bring_up(blob, AhbPlatform);
+pub fn ahb_runtimes() -> Vec<Arc<NarfAhbShared>>;
+pub fn runtime::start_ahb(core, dp) -> (Arc<Shared<..>>, Result<[u8; 6], TransportError>);
+```
+
+`hal_ce_alloc` maps `reg[0]` (+ the IPQ5018 CE remap) into `AhbIo` and
+builds the HIF (`ahb_ce_hif`); WCN6750 allocates the CE pipes only.
+`rproc_irqs` maps SMEM and the TCSR mutex, creates one `Smp2p` per edge
+(`qcom_smp2p_probe`) with the Q6 inbound bits, the `stop` and
+`wlan-smp2p-out` outbound entries, the remoteproc object and its `wdog`
+GIC line. `rproc_boot` loads the MDT from the firmware registry into the
+carve-out and runs `Q6Wcss::start` (GCC resets from the DT) or
+`PasRproc::start`; every wait iteration runs one `qcom_smp2p_intr` pass
+per edge (so GIC- and IPCC-parented edges behave alike).
+`glink_start` registers `GlinkSmem` and claims `IPCRTR` (`GlinkQrtr`)
+over the `glink-edge` interrupt: a GIC SPI, or on WCN6750 the IPCC
+(client, signal) behind the IPCC block's SPI, unmasked with
+`ipcc_set_enabled` and drained with `ipcc_pending`. `config_irq` binds
+the CE / DP lines. `qmi_ready` runs WLFW to FW_READY; WCN6750 then maps
+the DEVICE_INFO BAR as `AhbIo { window: Some(WCN6750_REGS) }` (static
+windows) and builds the HIF; then `CoreConfig::for_hw` +
+`qmi_firmware_ready` with `DpHooks` (`DpHwParams::for_rev`). The WLFW
+task hands a ready core to `runtime::start_ahb` (`Rt` + `Shared`, MAC
+from `device_caps`); a failed core is kept. Not done: the AHB netdev
+(`iface` registration is PCI-typed), post-boot SMP2P crash monitoring
+(`fatal` / `wdog` → recovery), and RPMh / AOSS QMP votes (§8).
 
 Per-chip `hw_ops` (`hw_ops.rs`, Linux `hw.c` `*_ops`; the `rx_desc_*`
 members are `RxDescriptor`):

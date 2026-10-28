@@ -211,7 +211,7 @@ impl<'a> Mdt<'a> {
     pub fn read_metadata(
         &self,
         fw_name: &str,
-        src: &dyn SegmentSource,
+        src: &(dyn SegmentSource + Sync),
         out: &mut Vec<u8>,
     ) -> Result<(), MdtError> {
         if self.phnum < 2 {
@@ -257,7 +257,7 @@ impl<'a> Mdt<'a> {
     pub fn load(
         &self,
         fw_name: &str,
-        src: &dyn SegmentSource,
+        src: &(dyn SegmentSource + Sync),
         mem: &mut [u8],
         mem_phys: u64,
     ) -> Result<u64, MdtError> {
@@ -306,7 +306,7 @@ impl<'a> Mdt<'a> {
     pub async fn pas_init<C: SmcConduit, A: ScmAlloc, D: Delay + ?Sized>(
         &self,
         fw_name: &str,
-        src: &dyn SegmentSource,
+        src: &(dyn SegmentSource + Sync),
         scm: &mut Scm<C>,
         alloc: &mut A,
         pas_id: u32,
