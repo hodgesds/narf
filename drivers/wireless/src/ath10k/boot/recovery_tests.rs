@@ -199,6 +199,11 @@ fn smoke_ath10k_recovery_retired_physical_drop_preserves_successor_and_pins_dma(
         saved_aspm: None,
         retired: false,
         reclaimable: false,
+        interrupts: None,
+        msi: None,
+        signal: crate::ath10k::irq::Signal::new(),
+        serviced: 0,
+        firmware_crashed: false,
     };
     if !matches!(owner.retire_for_restart(), Err(BmiError::Pci))
         || !owner.retired
@@ -282,6 +287,11 @@ fn smoke_ath10k_recovery_reclaimable_retired_drop_frees_without_hardware_access(
         saved_aspm: None,
         retired: true,
         reclaimable,
+        interrupts: None,
+        msi: None,
+        signal: crate::ath10k::irq::Signal::new(),
+        serviced: 0,
+        firmware_crashed: false,
     };
     let mut owner = make(&mut words, false);
     // Not a PCIe function: no Device Control ordering proof exists.

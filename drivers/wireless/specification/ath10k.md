@@ -26,11 +26,12 @@ Linux `drivers/net/wireless/ath/ath10k/` is the reference implementation.
 Probe owns the PCI function exclusively. BAR0 is mapped with device
 attributes and must cover the selected RTC, core, PCI-local and CE
 windows. Boot uses coherent DMA32 storage and keeps the target awake.
-Boot messages are serialized and polled asynchronously. The initial native
-packet service polls with CE interrupts masked; synchronous network drains
-and the periodic worker drive the same bounded state without waiting on
-another executor task. IRQ throughput and host-bus/system power transitions
-remain separate profiles.
+Boot messages are serialized and polled asynchronously. After BMI_DONE the
+runtime owner arms one MSI vector when the function has one (see
+"Interrupt service" in §3); otherwise it keeps 1 ms polling with CE
+interrupts masked. Synchronous network drains and the service worker drive
+the same bounded state without waiting on another executor task.
+Host-bus/system power transitions remain separate profiles.
 
 ## 3. Public interface
 
@@ -442,6 +443,45 @@ remain separate profiles.
   recovery,
   stable-netdev reconnection or system suspend. Physical reset,
   ROM/firmware restart and repeated RF association still need hardware acceptance.
+- Interrupt service (`irq.rs`, `boot/interrupts.rs`). Linux v6.10
+  `pci.c::ath10k_pci_init_irq` tries MSI first; `ath10k_pci_hif_start`
+  calls `ath10k_pci_irq_enable`. Here `PciBoot::done_complete` (BMI_DONE
+  accepted) first runs `Program::disable` (`ath10k_pci_irq_disable`: every
+  CE's copy-complete/watermark HOST_IE and MISC_IE error bits, then
+  `ath10k_pci_disable_and_clear_intx_irq` and `ath10k_pci_irq_msi_fw_mask`).
+  It then discovers the MSI capability, allocates and programs one vector,
+  installs the handler and sets MSI Enable. Only after that does it run
+  `Program::enable`. This is `ath10k_ce_per_engine_handler_adjust`:
+  copy-complete for engines with a Linux host callback (CE0/CE3 send,
+  CE1/CE2/CE5/CE8 receive when present). CE4 (`CE_ATTR_DIS_INTR`) and CE7
+  (diagnostics) stay off, and watermark is always off. It also writes
+  `PCIE_INTR_ENABLE = FIRMWARE_MASK | CE_MASK_ALL` and sets the
+  CORE_CTRL `PCIE_REG_31` firmware MSI gate (QCA988X/QCA9887/QCA6174/QCA9377
+  only; Linux leaves QCA99X0-class as TODO). Register constants come from
+  `hw.c::{qca988x,qca6174,qca99x0}_regs` and `qcax_{wm,misc}_reg`.
+  The vector handler only raises an edge-latched `irq::Signal`; it never
+  touches the BAR. The owner's next service runs the hard-handler and
+  `ath10k_pci_napi_poll` sequence. First comes `ath10k_pci_has_fw_crashed`
+  (see automatic recovery). Next come the line/firmware mask and
+  `ath10k_ce_per_engine_service_any`'s HOST_IS clear for every summarized
+  engine, both before the rings are polled. Last, the epilogue re-enables
+  only when `ath10k_ce_interrupt_summary` reads empty. Otherwise it keeps
+  the line masked and re-raises the signal, which is the `napi_schedule`
+  path. The data worker waits on that signal, a host TX/power-save kick or
+  a 10 ms missed-edge backstop. It re-runs at once while a drain made
+  progress. Protocol waits in `hif_poll` use the same wait, clamped to
+  their budget. Without MSI (no capability, no vector, a non-PCI function,
+  or an aarch64 host whose MSI programming fails) chip interrupts stay
+  masked and service keeps the previous 1 ms period. The INTx program is
+  limited to the `ath10k_pci_irq_pending` cause check. Blocker for a
+  line-interrupt mode: NARF has no ath10k INTx route, meaning a
+  level-triggered GSI handler allowed to write `PCIE_INTR_CLR` from the
+  hard IRQ. Teardown (`stop_interrupts`) runs on retirement before the
+  park and on non-retired Drop. It disables every source, clears MSI
+  Enable and frees the vector. A failed cfg-space disable keeps the vector
+  quarantined (masked, no waker, never reallocated). All-ones reads from
+  surprise removal are never decoded as a cause, crash or summary. No
+  interrupt-rate or throughput claim is made without hardware.
 - `pci::start_station_data(pmk)` starts the retained packet owner after native
   association, with `None` for Open or the caller's WPA2 PMK. It requires
   firmware `RAW_MODE_SUPPORT` (bit10), RAW RX selected during WMI INIT, and a
@@ -528,8 +568,8 @@ remain separate profiles.
 - The Device's synchronous drain uses try-locks, bounded poll/submit and Narf
   frame rings, and releases its Radio/ring state before stack callbacks. It
   never uses block_on and can complete the actual kernel DHCP conversation
-  without a scheduled worker. A masked-interrupt periodic poll also supplies
-  idle RX/security progress. A five-second no-peer deadline is refreshed by
+  without a scheduled worker. The interrupt-driven service worker (or the
+  1 ms poll without MSI) also supplies idle RX/security progress. A five-second no-peer deadline is refreshed by
   bound BSS beacons or admitted native peer traffic; stale/replayed/forged
   CCMP cannot refresh it. Expiry closes the port and carrier while retaining
   uncertain CE/HTT DMA. The owner deliberately does not reset/reclaim firmware,
@@ -955,7 +995,7 @@ response-bound VHT and wider geometry; native TX BA, independent
 multi-packet DMA/completion and aggregate retries; PFC fetch/queue ownership;
 dynamic WMM/protection updates and non-BE TX/TSPEC/U-APSD; DFS/indoor/beacon-hint
 qualification; associated/off-channel scanning; hardware key/PMF/WPA3 profiles;
-AP/P2P roles; interrupt-driven throughput; host-bus/system PM and wake offload;
+AP/P2P roles; host-bus/system PM and wake offload;
 pre-cal/cal-file and DT/NVMEM calibration sources (QCA9887 EEPROM is implemented)
 and automatic credential/stable-interface recovery.
 The existing bounded RX BA/reorder and complete RAW A-MSDU receiver must not be

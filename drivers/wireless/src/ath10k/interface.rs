@@ -97,6 +97,8 @@ pub(super) struct Device<T: Hif + HostMemory + HttMemory> {
     bssid: AtomicU64,
     rx: IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
+    /// Owner interrupt signal shared with the service worker.
+    wake: IrqSafeSpinLock<Option<Arc<super::irq::Signal>>>,
 }
 impl<T: Hif + HostMemory + HttMemory> core::fmt::Debug for Device<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -206,6 +208,14 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             bssid: AtomicU64::new(0),
             rx: IrqSafeSpinLock::new(Some(consumer)),
             tx: IrqSafeSpinLock::new(Some(producer)),
+            wake: IrqSafeSpinLock::new(None),
+        }
+    }
+    /// Kick the service worker (host TX / power-save request).
+    fn kick(&self) {
+        let wake = self.wake.lock().clone();
+        if let Some(wake) = wake {
+            wake.raise();
         }
     }
     fn link(&self, peer: Option<[u8; 6]>) {
@@ -252,7 +262,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             .as_mut()
             .ok_or(())?
             .try_send(frame)
-            .map_err(|_| ())
+            .map_err(|_| ())?;
+        self.kick();
+        Ok(())
     }
     pub(super) fn enqueue_generation(
         &self,
@@ -310,6 +322,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         }
         self.ps_request
             .store(if enabled { 2 } else { 1 }, Ordering::Release);
+        self.kick();
         Ok(())
     }
     pub(super) async fn apply_power_save(&self) -> Result<(), WirelessError> {
@@ -928,6 +941,7 @@ fn publish_with_mac(
     quarantine: &AtomicBool,
     features: RadioFeatures,
     frequencies: Vec<u16>,
+    wake: (Arc<super::irq::Signal>, bool),
 ) -> Result<Arc<Native>, Error> {
     narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Unsupported)?;
     let authority = narf_net::trusted_net_authority()
@@ -949,15 +963,27 @@ fn publish_with_mac(
         narf_net::iface::set_link_metadata(name, false, None, None);
         narf_net::iface::install_rx_drain(drain);
         narf_wireless::registry::register(device.clone());
+        let (signal, delivered) = wake;
+        *device.wake.lock() = Some(signal.clone());
         let worker = device.clone();
+        // NAPI-equivalent service: wait for a CE/firmware vector, a host TX
+        // or power-save kick, or the bounded backstop; re-run at once while
+        // a drain made progress (Linux `napi_schedule` when work remains).
         narf_scheduler::spawn(async move {
             loop {
                 if worker.closed.load(Ordering::Acquire) {
                     break;
                 }
-                worker.drain();
+                let seen = signal.count();
+                let progressed = worker.drain();
                 let _ = worker.apply_power_save().await;
-                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+                if progressed {
+                    narf_scheduler::yield_now().await;
+                    continue;
+                }
+                let ms = super::irq::fallback_ms(delivered);
+                let timer = narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(ms * 1_000_000));
+                signal.wait(seen, core::pin::pin!(timer)).await;
             }
         });
         Ok(device)
@@ -992,6 +1018,7 @@ pub(super) fn publish(
                 .copied()
                 .filter(|f| super::regulatory::Permission::profile_frequency(*f))
                 .collect(),
+            r.htt.wmi.htc.transport.interrupt(),
         )
     })
     .map_err(|_| Error::Failed)?;
@@ -1029,6 +1056,7 @@ pub(super) async fn wait_publish(
                             .copied()
                             .filter(|f| super::regulatory::Permission::profile_frequency(*f))
                             .collect(),
+                        r.htt.wmi.htc.transport.interrupt(),
                     )
                 })
                 .map_err(|_| Error::Failed)?;

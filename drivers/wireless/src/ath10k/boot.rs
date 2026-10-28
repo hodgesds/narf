@@ -24,6 +24,8 @@ mod hif;
 pub(super) use hif::tests::CeFixture;
 #[path = "boot/htt_memory.rs"]
 mod htt_memory;
+#[path = "boot/interrupts.rs"]
+mod interrupts;
 #[path = "boot/recovery.rs"]
 mod recovery;
 #[path = "boot/wmi_memory.rs"]
@@ -160,6 +162,14 @@ pub(super) struct PciBoot {
     /// A retired generation proved every CE halted, bus mastering off and
     /// ordered flushing; its Drop may free (but never touch hardware).
     reclaimable: bool,
+    /// Runtime CE/firmware interrupt program once a vector delivers it.
+    interrupts: Option<super::irq::Program>,
+    msi: Option<interrupts::Msi>,
+    signal: alloc::sync::Arc<super::irq::Signal>,
+    /// Signal count consumed by the last interrupt service.
+    serviced: u64,
+    /// FW_IND_EVENT_PENDING observed; this generation is terminal.
+    firmware_crashed: bool,
 }
 
 impl PciBoot {
@@ -244,6 +254,11 @@ impl PciBoot {
             saved_aspm: None,
             retired: false,
             reclaimable: false,
+            interrupts: None,
+            msi: None,
+            signal: super::irq::Signal::new(),
+            serviced: 0,
+            firmware_crashed: false,
         })
     }
 
@@ -517,6 +532,7 @@ impl Transport for PciBoot {
     }
     fn done_complete(&mut self) {
         self.hif_live = true;
+        self.start_interrupts();
     }
 
     async fn exchange(&mut self, request: &[u8], response: &mut [u8]) -> Result<usize, BmiError> {
@@ -697,6 +713,9 @@ impl<B: Memory> Resources<B> {
 
 impl Drop for PciBoot {
     fn drop(&mut self) {
+        if !self.retired {
+            self.stop_interrupts();
+        }
         if self.retired {
             // A successor may own this function: never halt or reconfigure
             // it. Free only what retirement proved quiescent.

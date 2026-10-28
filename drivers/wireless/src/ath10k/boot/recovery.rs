@@ -47,6 +47,9 @@ impl PciBoot {
             return Err(BmiError::BadResponse);
         }
         let cap = self.mmio.cap.derive::<Write>().map_err(|_| BmiError::Pci)?;
+        // ath10k_pci_hif_stop: mask CE/line/firmware sources and release the
+        // vector before the generation becomes terminal.
+        self.stop_interrupts();
         // Terminal before the first register operation. In particular, a late
         // Drop must never disable a successor's bus mastering or CE rings.
         self.retired = true;

@@ -92,6 +92,7 @@ pub mod htt;
 pub mod htt_runtime;
 pub mod hw;
 mod interface;
+mod irq;
 pub mod pci;
 pub mod profile;
 pub mod regulatory;

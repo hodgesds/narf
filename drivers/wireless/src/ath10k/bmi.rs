@@ -18,6 +18,9 @@ pub enum BmiError {
     AddressOverflow,
     AfterDone,
     Unsupported,
+    /// `FW_IND_EVENT_PENDING` (Linux `ath10k_pci_has_fw_crashed`): the
+    /// generation is terminal and automatic recovery has been requested.
+    FirmwareCrashed,
 }
 
 impl From<DmaError> for BmiError {
