@@ -11,6 +11,9 @@ use zeroize::{Zeroize, Zeroizing};
 /// Native receive admission supplied by the hardware adapter. The adapter
 /// must bind the descriptor to its current peer/channel/profile, reject
 /// transport/CRC/fragment errors, and retain the original native 802.11 bytes.
+/// That includes a +HTC QoS DATA MPDU's Order bit and four-octet HT Control
+/// field: `Security` skips HT Control and masks Order from the CCMP AAD
+/// itself, so a station advertising HTC_HE keeps receiving such traffic.
 /// Hardware-decrypted or firmware-decapsulated data is not admitted here.
 /// This trait grants no radio, key, carrier or controlled-port authority.
 pub trait RawFrame {
@@ -398,7 +401,25 @@ impl Security {
         }
     }
     fn normalize(&mut self, mpdu: &impl RawFrame) -> Result<Option<Vec<u8>>, Error> {
-        let b = mpdu.bytes();
+        let raw = mpdu.bytes();
+        // +HTC QoS DATA (IEEE802.11-2020 9.2.4.1.10, mac80211
+        // `ieee80211_hdrlen`): the Order bit marks a four-octet HT Control
+        // field after QoS Control. CCMP excludes it from the AAD and masks
+        // Order for QoS data (12.5.3.3.3, mac80211 `ccmp_gcmp_aad`), so the
+        // MPDU is processed as the equivalent 26-octet header with Order
+        // clear; the HT Control field (link adaptation only) is dropped.
+        // Order on non-QoS DATA (strictly ordered service) stays refused.
+        let stripped;
+        let b = if mpdu.unmodified() && raw.len() >= 30 && raw[0] == 0x88 && raw[1] & 0x80 != 0 {
+            let mut v = Vec::with_capacity(raw.len() - 4);
+            v.extend_from_slice(&raw[..26]);
+            v[1] &= !0x80;
+            v.extend_from_slice(&raw[30..]);
+            stripped = v;
+            stripped.as_slice()
+        } else {
+            raw
+        };
         if !mpdu.unmodified()
             || b.len() < 24
             || b.len() > 4096
@@ -481,7 +502,20 @@ impl Security {
         if self.epd {
             return Ok(None);
         }
-        let bytes = mpdu.bytes();
+        let raw = mpdu.bytes();
+        // +HTC QoS DATA: drop the HT Control field and Order bit (see
+        // `normalize`); CCMP authenticates the same AAD either way.
+        let stripped;
+        let bytes = if raw.len() >= 30 && raw[0] == 0x88 && raw[1] & 0x80 != 0 {
+            let mut v = Vec::with_capacity(raw.len() - 4);
+            v.extend_from_slice(&raw[..26]);
+            v[1] &= !0x80;
+            v.extend_from_slice(&raw[30..]);
+            stripped = v;
+            stripped.as_slice()
+        } else {
+            raw
+        };
         if !mpdu.unmodified()
             || !(26 + 16 + 22..=26 + 16 + admission.limit().bytes()).contains(&bytes.len())
         {

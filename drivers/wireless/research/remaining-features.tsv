@@ -207,7 +207,7 @@ rtw89	edcca_tracking	Periodic EDCCA tracking	feature	drivers/wireless/specificat
 rtw89	eht	EHT operation on RTL8922A	feature	drivers/wireless/specification/rtw89.md	1277
 rtw89	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specification/rtw89.md	1012
 rtw89	fragmentation	Host fragmentation/defragmentation with native fragment MPDU admission [API available: WirelessNetIface::set_fragmentation_threshold (SET_WIPHY NL80211_ATTR_WIPHY_FRAG_THRESHOLD routed after cfg80211 validation; default EOPNOTSUPP) (wireless spec 3.1.1)]	feature	drivers/wireless/specification/rtw89.md	1038
-rtw89	he_htc	HE +HTC insertion in QoS DATA	feature	drivers/wireless/specification/rtw89.md	1286
+rtw89	he_htc	HE +HTC insertion in QoS DATA [API available: station_security::Security receives +HTC QoS DATA (HT Control skipped, Order masked from the CCMP AAD) on the MSDU and A-MSDU paths, so advertising HTC_HE loses no AP traffic (wireless spec 3.4.1)]	feature	drivers/wireless/specification/rtw89.md	1286
 rtw89	monitor_mode	Monitor radio mode with PHY-status RX metadata	feature	drivers/wireless/specification/rtw89.md	1039
 rtw89	multiple_live_functions	Multiple live PCI functions	feature	drivers/wireless/specification/rtw89.md	1009
 rtw89	nhm_diagnostics	Noise-histogram/CLM/FAHM environment monitoring	feature	drivers/wireless/specification/rtw89.md	1039

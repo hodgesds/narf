@@ -3,6 +3,8 @@ use super::*;
 mod amsdu_tests;
 #[path = "station_security_epd_tests.rs"]
 mod epd_tests;
+#[path = "station_security_htc_tests.rs"]
+mod htc_tests;
 #[path = "station_security_sae_tests.rs"]
 mod sae_tests;
 use crate::eapol::{self, KeyFrame, KeyMgmt, Ptk};

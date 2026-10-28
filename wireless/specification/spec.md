@@ -1275,6 +1275,13 @@ second local-disconnect event.
 Address4 / QoS TID. It excludes Duration/HT Control, mutes data subtype bits
 4–6 (preserving the QoS indicator), Retry/PM/MoreData and QoS Order, and
 forces Protected. Management subtype and non-QoS Order remain authenticated.
+`station_security::Security` receives +HTC QoS DATA (Order set; the
+four-octet HT Control field follows QoS Control, mac80211
+`ieee80211_hdrlen`) on both the MSDU and the A-MSDU path. It authenticates
+the MPDU as the equivalent 26-octet header with Order clear, which gives the
+same AAD and nonce, and drops the HT Control field. The `RawFrame` contract
+therefore keeps HT Control and Order unmodified, and advertising HTC_HE
+loses no AP traffic. Order on non-QoS DATA is still refused.
 `build_nonce` includes the transmitter address and big-endian 48-bit PN.
 `protect` / `unprotect` take an `AesCcm` backend and are both fallible: a
 backend seal/open refusal propagates as `CcmpError` (`TooLong` for a body
