@@ -512,7 +512,21 @@ no CCX report) under the same current PCI/calibration/regulatory checks as
 authentication, so a NO_IR or otherwise disallowed policy prevents the first
 probe DMA. Probes are published one at a time and retired on DMA consumption
 before the dwell; unicast Probe Responses feed the same shared observer as
-beacons. Random-MAC and 6 GHz scanning stay refused. HT capability elements
+beacons. Random-MAC scanning follows Linux v6.12: `main.c::rtw_register_hw`
+sets `NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR` (`supports_scan_random_mac`),
+and `rtw_core_scan_start` points port0 `REG_MACID` (0x610) at the
+mac80211 `get_random_mask_addr` address (random bits outside the mask, base
+bits inside; cfg80211 `nl80211_parse_random_mac` requires the mask to keep
+the group bit of a unicast base). Every probe uses that SA, packet core
+admits a broadcast Probe Request from exactly the current scan address,
+and Probe Responses to it feed the observer. `rtw_core_scan_complete`
+restores the own address and clears the packet scan address on every
+exit. Passive requests transmit nothing and bind no address; association
+always uses the own address. Evidence: `drivers/wireless/rtw88/narrow/scan`
+(mask/variation/probe SA) and `drivers/wireless/rtw88/random_scan`
+(actual DMA probe SA, 0x610 follows and is restored, joining afterwards
+uses the own address); a mask clearing the group bit is refused.
+6 GHz scanning stays refused. HT capability elements
 are not added to probes. Native smokes: `scan_tests.rs` (exact preq bytes,
 SSID/IE budget, malformed/unsupported requests, BMC/MGMT/no-report
 descriptor) and `station_composition_tests.rs` (actual DMA probes, probe-

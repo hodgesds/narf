@@ -562,6 +562,10 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
     fn reports_disconnect_events(&self) -> bool {
         true
     }
+    /// Linux `main.c::rtw_register_hw` sets `NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR`.
+    fn supports_scan_random_mac(&self) -> bool {
+        true
+    }
     fn supports_scan_dwell(&self) -> bool {
         true
     }
@@ -629,7 +633,9 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             attempt.armed = false;
             return Err(WirelessError::Busy);
         }
-        let result = owner.station_scan(plan.dwell_ms, &plan.probes).await;
+        let result = owner
+            .station_scan(plan.dwell_ms, &plan.probes, plan.address)
+            .await;
         attempt.armed = false;
         if result.is_err() {
             self.close();

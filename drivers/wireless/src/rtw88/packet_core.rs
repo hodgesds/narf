@@ -113,6 +113,8 @@ pub(super) struct Core {
     aggregation: Option<format::Aggregation>,
     batch_published: bool,
     own: [u8; 6],
+    /// Current random scan SA (`rtw_core_scan_start`), probes only.
+    scan: Option<[u8; 6]>,
     mac_id: u8,
     data_profile: format::DataProfile,
     receive_chip: super::packet_phy::Chip,
@@ -239,6 +241,7 @@ impl Core {
             mac_id,
             data_profile: format::DataProfile::LEGACY,
             receive_chip,
+            scan: None,
             tx_host: [0; 5],
             tx_device: [0; 5],
             rx: 0,
@@ -262,6 +265,16 @@ impl Core {
     }
     pub(super) fn ready(&self) -> bool {
         self.phase == Phase::Running && self.pending.is_none() && self.batch_pending.is_empty()
+    }
+    /// Admit broadcast Probe Requests from a unicast random scan address.
+    pub(super) fn set_scan(&mut self, address: Option<[u8; 6]>) -> Result<(), Error> {
+        if address.is_some_and(|a| a == [0; 6] || a[0] & 1 != 0 || a == self.own)
+            || address.is_some() == self.scan.is_some()
+        {
+            return Err(Error::State);
+        }
+        self.scan = address;
+        Ok(())
     }
     pub(super) fn configure_data(&mut self, profile: format::DataProfile) -> Result<(), Error> {
         if !self.ready() || !profile.valid() {
@@ -303,8 +316,21 @@ impl Core {
         if format::originator_control(frame) && !port.originator_ba_allowed() {
             return Err(Error::Access);
         }
+        // A Probe Request from the current random scan address is the only
+        // frame whose source is not the own address.
+        let source = match self.scan {
+            Some(scan)
+                if frame.len() >= 24
+                    && frame[..4] == [0x40, 0, 0, 0]
+                    && frame[4..10] == [255; 6]
+                    && frame[10..16] == scan =>
+            {
+                scan
+            }
+            _ => self.own,
+        };
         let (mut descriptor, queue) =
-            format::transmit_profile(frame, self.own, self.mac_id, sequence, self.data_profile)?;
+            format::transmit_profile(frame, source, self.mac_id, sequence, self.data_profile)?;
         if queue.data() && (!radio_report || frame[0] == 0x88) {
             super::protection::descriptor(&mut descriptor, frame.len(), port.rts_threshold());
         }

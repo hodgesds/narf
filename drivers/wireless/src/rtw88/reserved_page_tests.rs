@@ -901,6 +901,14 @@ unsafe impl Registers for Port {
             .map_err(|_| crate::rtw88::packet_core::Error::Access)?;
         self.packet_with(|core, port| core.submit(port, frame, report))
     }
+    fn packet_scan_address(
+        &mut self,
+        address: Option<[u8; 6]>,
+    ) -> Result<(), crate::rtw88::packet_core::Error> {
+        self.station_allowed()
+            .map_err(|_| crate::rtw88::packet_core::Error::Access)?;
+        self.packet_with(|core, _| core.set_scan(address))
+    }
     fn packet_poll(
         &mut self,
     ) -> Result<crate::rtw88::packet_core::Step, crate::rtw88::packet_core::Error> {

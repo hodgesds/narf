@@ -196,7 +196,6 @@ rtw88	multi_stream_ht	Multi-stream HT on RTL8822B/RTL8822C	feature	drivers/wirel
 rtw88	operating_reset	Reset of an operating retained owner	feature	drivers/wireless/specification/rtw88.md	1462
 rtw88	radio_coexistence	Complete radio coexistence state machine	feature	drivers/wireless/specification/rtw88.md	1469
 rtw88	rate_fallback	DATA rate fallback	feature	drivers/wireless/specification/rtw88.md	968
-rtw88	randomized_scan_mac	Randomized scan MAC addresses	feature	drivers/wireless/specification/rtw88.md	515
 rtw88	rf_power_tracking	Thermal RF power tracking on RTL8821CE (TXAGC/txscale swing; RTL8822C done by dm)	feature	drivers/wireless/specification/rtw88.md	1372
 rtw88	rtl8822be	RTL8822BE retained firmware/radio/packet/station runtime	chip	drivers/wireless/specification/rtw88.md	1469
 rtw88	runtime_sleep	Runtime sleep	feature	drivers/wireless/specification/rtw88.md	1469

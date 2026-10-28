@@ -30,6 +30,20 @@ pub(super) struct Plan {
     pub dwell_ms: u64,
     /// Complete unsequenced Probe Request MPDUs, without FCS.
     pub probes: Vec<Vec<u8>>,
+    /// Random scan SA for an active request (`rtw_core_scan_start`).
+    pub address: Option<[u8; 6]>,
+}
+
+/// mac80211 `get_random_mask_addr`: random bits outside `mask`, `addr`
+/// bits inside. cfg80211 `nl80211_parse_random_mac` already requires the
+/// mask to keep the group bit of a unicast base address.
+fn random_address(random: &narf_wireless::scan::ScanRandomMac) -> Result<[u8; 6], WirelessError> {
+    let mut bytes = [0u8; 6];
+    narf_crypto::try_fill_random_bytes(&mut bytes).map_err(|_| WirelessError::HardwareError)?;
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = *byte & !random.mask[i] | random.addr[i] & random.mask[i];
+    }
+    Ok(bytes)
 }
 
 /// Caller probe elements: well formed, bounded, never duplicating an element
@@ -77,7 +91,10 @@ fn probe(own: [u8; 6], ssid: &[u8], extra: &[u8]) -> Result<Vec<u8>, WirelessErr
 /// Admit one channel1 scan request. Passive requests keep the original
 /// receive-only behaviour; active requests add the software-scan probes.
 pub(super) fn plan(request: &ScanRequest, own: [u8; 6]) -> Result<Plan, WirelessError> {
-    if request.random_mac.is_some()
+    if request
+        .random_mac
+        .as_ref()
+        .is_some_and(|r| r.mask[0] & 1 == 0 || r.addr[0] & 1 != 0)
         || request.colocated_6ghz
         || !request.active && !request.extra_ies.is_empty()
         || request.frequencies_mhz.iter().any(|f| *f != 2412)
@@ -95,15 +112,26 @@ pub(super) fn plan(request: &ScanRequest, own: [u8; 6]) -> Result<Plan, Wireless
         None => 200,
     };
     if !request.active {
+        // A passive software scan transmits nothing; the address is unused.
         return Ok(Plan {
             dwell_ms,
             probes: Vec::new(),
+            address: None,
         });
     }
     if own == [0; 6] || own[0] & 1 != 0 {
         return Err(WirelessError::InvalidArgs);
     }
     validate_ies(&request.extra_ies)?;
+    let address = match &request.random_mac {
+        Some(r) => {
+            let a = random_address(r)?;
+            // A collision with the own address keeps the ordinary source.
+            (a != own && a != [0; 6]).then_some(a)
+        }
+        None => None,
+    };
+    let own = address.unwrap_or(own);
     let mut probes = Vec::new();
     probes
         .try_reserve_exact(request.ssids.len().max(1))
@@ -114,5 +142,9 @@ pub(super) fn plan(request: &ScanRequest, own: [u8; 6]) -> Result<Plan, Wireless
     for ssid in &request.ssids {
         probes.push(probe(own, ssid, &request.extra_ies)?);
     }
-    Ok(Plan { dwell_ms, probes })
+    Ok(Plan {
+        dwell_ms,
+        probes,
+        address,
+    })
 }

@@ -234,6 +234,9 @@ pub(super) unsafe trait Registers: Send {
     fn packet_submit(&mut self, _: &[u8], _: bool) -> Result<u64, super::packet_core::Error> {
         Err(super::packet_core::Error::State)
     }
+    fn packet_scan_address(&mut self, _: Option<[u8; 6]>) -> Result<(), super::packet_core::Error> {
+        Err(super::packet_core::Error::State)
+    }
     fn packet_poll(&mut self) -> Result<super::packet_core::Step, super::packet_core::Error> {
         Err(super::packet_core::Error::State)
     }
@@ -686,6 +689,12 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
         report: bool,
     ) -> Result<u64, super::packet_core::Error> {
         self.io.packet_submit(frame, report)
+    }
+    fn packet_scan_address(
+        &mut self,
+        address: Option<[u8; 6]>,
+    ) -> Result<(), super::packet_core::Error> {
+        self.io.packet_scan_address(address)
     }
     fn packet_poll(&mut self) -> Result<super::packet_core::Step, super::packet_core::Error> {
         self.io.packet_poll()

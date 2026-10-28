@@ -41,6 +41,8 @@ pub(super) struct RadioIo {
     protection: Option<Arc<crate::rtw88::protection::Grant>>,
     pub(super) continuation: Vec<Arc<crate::rtw88::qualification::Grant>>,
     pub(super) edca_writes: Arc<AtomicUsize>,
+    /// Every byte written to port0 `REG_MACID` byte 0 (0x610).
+    pub(super) port_writes: Vec<u8>,
     pub(super) before_publication: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) clock: Arc<AtomicU64>,
     pub(super) policy: Arc<narf_lib::sync::IrqSafeSpinLock<narf_wireless::reg::RegulatoryDomain>>,
@@ -81,6 +83,7 @@ impl RadioIo {
             protection: None,
             continuation: Vec::new(),
             edca_writes: Arc::new(AtomicUsize::new(0)),
+            port_writes: Vec::new(),
             before_publication: None,
             clock: Arc::new(AtomicU64::new(0)),
             policy: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
@@ -451,6 +454,9 @@ unsafe impl Io for RadioIo {
             return Err(Error::Access);
         }
         self.base.write8(r, v)?;
+        if r == 0x610 {
+            self.port_writes.push(v);
+        }
         if self.radio && r == 0x3d9 && !self.awake_stuck {
             self.base.regs[0x3da] ^= 0x80;
         }
@@ -692,6 +698,14 @@ unsafe impl Io for RadioIo {
         self.station_allowed()
             .map_err(|_| crate::rtw88::packet_core::Error::Access)?;
         self.packet_with(|core, port| core.submit(port, frame, report))
+    }
+    fn packet_scan_address(
+        &mut self,
+        address: Option<[u8; 6]>,
+    ) -> Result<(), crate::rtw88::packet_core::Error> {
+        self.station_allowed()
+            .map_err(|_| crate::rtw88::packet_core::Error::Access)?;
+        self.packet_with(|core, _| core.set_scan(address))
     }
     fn packet_poll(
         &mut self,

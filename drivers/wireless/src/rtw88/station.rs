@@ -129,6 +129,8 @@ pub(super) struct State {
     coding: Option<(Arc<super::qualification::Grant>, u8)>,
     /// Firmware RA_INFO still carries LDPC after a coding downgrade.
     coding_restore: bool,
+    /// Current random scan SA (`rtw_core_scan_start`).
+    scan_address: Option<[u8; 6]>,
     /// Bound N2xQ all-TID QoS routing (`qos`, tag `Q`) and its AC set.
     qos: Option<(Arc<super::qualification::Grant>, u8)>,
     tx_ba: super::tx_ba::Originator,
@@ -226,6 +228,7 @@ impl State {
             coding: None,
             coding_restore: false,
             qos: None,
+            scan_address: None,
             tx_ba: super::tx_ba::Originator::new(),
             tx_config: None,
             data_pending: VecDeque::new(),
@@ -527,9 +530,14 @@ impl State {
     fn cache(&mut self, frame: &Mpdu, now: u64) {
         // This native profile exposes no calibrated per-frame dBm estimate.
         let signal = None;
+        // During a random-address scan, Probe Responses answer that SA.
+        let own = match self.scan_address {
+            Some(a) if frame.bytes().get(4..10) == Some(&a[..]) => a,
+            _ => self.own,
+        };
         let observed = match &self.local_ht {
-            Some(p) => association::observe_with_phy(frame, 1, self.own, signal, p),
-            None => association::observe(frame, 1, self.own, signal),
+            Some(p) => association::observe_with_phy(frame, 1, own, signal, p),
+            None => association::observe(frame, 1, own, signal),
         };
         let Ok(candidate) = observed else {
             return;
@@ -1164,11 +1172,16 @@ impl State {
     /// is published and retired (DMA consumption, no ACK) before the next,
     /// then the dwell runs from the last retirement. Empty `probes` is the
     /// original passive scan.
+    ///
+    /// With `address`, Linux `main.c::rtw_core_scan_start` points the port0
+    /// MAC (`REG_MACID` 0x610) at the random scan address for the duration
+    /// of the scan and `rtw_core_scan_complete` restores the own address.
     pub(super) async fn scan_for(
         &mut self,
         io: &mut impl Io,
         dwell_ms: u64,
         probes: &[Vec<u8>],
+        address: Option<[u8; 6]>,
     ) -> Result<Vec<ObservedBss>, Error> {
         if !(1..=1024).contains(&dwell_ms) || probes.len() > 4 {
             return Err(Error::Profile);
@@ -1176,15 +1189,48 @@ impl State {
         if self.phase() != Phase::Passive {
             return Err(Error::State);
         }
+        let source = address.unwrap_or(self.own);
+        if address
+            .is_some_and(|a| a == self.own || a[0] & 1 != 0 || a == [0; 6] || probes.is_empty())
+        {
+            return Err(Error::Profile);
+        }
         for probe in probes {
             if probe.len() < 24
                 || probe[..4] != [0x40, 0, 0, 0]
                 || probe[4..10] != [255; 6]
-                || probe[10..16] != self.own
+                || probe[10..16] != source
                 || probe[16..22] != [255; 6]
             {
                 return Err(Error::Profile);
             }
+        }
+        if let Some(a) = address {
+            station_control::port_address(io, a, &self.admission)?;
+            let admission = self.admission.clone();
+            admission.run(|| Ok(io.packet_scan_address(Some(a))))??;
+            self.scan_address = Some(a);
+        }
+        let result = self.scan_inner(io, dwell_ms, probes).await;
+        if self.scan_address.take().is_some() {
+            // rtw_core_scan_complete: back to the own address on every exit.
+            let own = self.own;
+            let restored = station_control::port_address(io, own, &self.admission)
+                .map_err(Error::Native)
+                .and_then(|()| io.packet_scan_address(None).map_err(Error::Transport));
+            if result.is_ok() {
+                restored?;
+            }
+        }
+        result
+    }
+    async fn scan_inner(
+        &mut self,
+        io: &mut impl Io,
+        dwell_ms: u64,
+        probes: &[Vec<u8>],
+    ) -> Result<Vec<ObservedBss>, Error> {
+        for probe in probes {
             let admission = self.admission.clone();
             admission.run(|| Ok(self.transmit(io, probe.clone(), Kind::Probe)))??;
             while self.pending.is_some() {

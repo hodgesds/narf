@@ -148,6 +148,12 @@ impl Native {
     ) -> Result<u64, packet::Error> {
         self.with_packet(|core, port| core.submit(port, frame, radio_report))
     }
+    pub(in crate::rtw88) fn scan_packet_address(
+        &mut self,
+        address: Option<[u8; 6]>,
+    ) -> Result<(), packet::Error> {
+        self.with_packet(|core, _| core.set_scan(address))
+    }
     pub(in crate::rtw88) fn poll_packets(&mut self) -> Result<packet::Step, packet::Error> {
         self.with_packet(|core, port| core.poll(port))
     }

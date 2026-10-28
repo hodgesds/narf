@@ -1036,12 +1036,61 @@ kernel_test_in!(
     smoke_rtw8822ce_native_active_scan_probe_response_joins
 );
 
+/// `randomized_scan_mac`: `rtw_core_scan_start` points port0 `REG_MACID`
+/// (0x610) at the random SA for the scan; `rtw_core_scan_complete`
+/// restores the own address. The AP answers the random SA.
+fn smoke_rtw8822ce_native_random_mac_scan_restores_port_address() -> TestResult {
+    let h = Harness::new(false);
+    h.scan();
+    h.env.clock.fetch_add(20_000, Ordering::AcqRel);
+    let random = narf_wireless::scan::ScanRandomMac {
+        addr: [0x0a, 0x0b, 0, 0, 0, 0],
+        mask: [0xff, 0xff, 0, 0, 0, 0],
+    };
+    let seen = complete(h.device.scan(ScanRequest {
+        random_mac: Some(random),
+        ..active_request(vec![SSID.to_vec()], Vec::new())
+    }));
+    if !seen.is_ok_and(|s| s.len() == 1 && s[0].bssid == AP) {
+        return TestResult::Fail("RTL8822CE random-MAC scan missed the probe response");
+    }
+    let probes = h.peer.lock().probes.clone();
+    let Some(sa) = probes.first().map(|p| p[10..16].to_vec()) else {
+        return TestResult::Fail("RTL8822CE random-MAC scan sent no probe");
+    };
+    if sa[..2] != [0x0a, 0x0b] || sa == OWN {
+        return TestResult::Fail("RTL8822CE probe SA is not the masked random address");
+    }
+    let port: Vec<u8> = (0..6)
+        .map(|i| h.model(|io| io.register(0x610 + i) as u8))
+        .collect();
+    if port != OWN {
+        return TestResult::Fail("RTL8822CE port0 MAC not restored after random scan");
+    }
+    if !h.model(|io| io.port_writes.contains(&sa[0])) {
+        return TestResult::Fail("RTL8822CE port0 MAC never followed the random scan SA");
+    }
+    // Ordinary scans and association keep the own address afterwards.
+    if complete(h.device.associate(h.request())).is_err() || !h.device.link_up() {
+        return TestResult::Fail("RTL8822CE could not join after a random-MAC scan");
+    }
+    let assoc = h.peer.lock().association.clone().unwrap_or_default();
+    if assoc.get(10..16) != Some(&OWN[..]) {
+        return TestResult::Fail("RTL8822CE associated with the random scan address");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/random_scan",
+    smoke_rtw8822ce_native_random_mac_scan_restores_port_address
+);
+
 fn smoke_rtw8822ce_native_active_scan_refuses_policy_and_unsupported_requests() -> TestResult {
     let h = Harness::new(false);
     for request in [
         ScanRequest {
             random_mac: Some(narf_wireless::scan::ScanRandomMac {
-                addr: [2, 0, 0, 0, 0, 0],
+                addr: [3, 0, 0, 0, 0, 0],
                 mask: [0xff, 0, 0, 0, 0, 0],
             }),
             ..active_request(Vec::new(), Vec::new())

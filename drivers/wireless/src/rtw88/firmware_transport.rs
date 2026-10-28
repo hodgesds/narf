@@ -399,6 +399,10 @@ pub(super) unsafe trait Io: Send {
     fn packet_submit(&mut self, _: &[u8], _: bool) -> Result<u64, super::packet_core::Error> {
         Err(super::packet_core::Error::State)
     }
+    /// Admit Probe Requests from `address` (a random scan SA) until cleared.
+    fn packet_scan_address(&mut self, _: Option<[u8; 6]>) -> Result<(), super::packet_core::Error> {
+        Err(super::packet_core::Error::State)
+    }
     fn packet_poll(&mut self) -> Result<super::packet_core::Step, super::packet_core::Error> {
         Err(super::packet_core::Error::State)
     }
@@ -637,12 +641,13 @@ impl<I: Io> Owner<I> {
         &mut self,
         dwell_ms: u64,
         probes: &[alloc::vec::Vec<u8>],
+        address: Option<[u8; 6]>,
     ) -> Result<alloc::vec::Vec<narf_wireless::association::ObservedBss>, super::station::Error>
     {
         self.station
             .as_deref_mut()
             .ok_or(super::station::Error::State)?
-            .scan_for(&mut self.io, dwell_ms, probes)
+            .scan_for(&mut self.io, dwell_ms, probes, address)
             .await
     }
     pub(super) async fn station_associate(

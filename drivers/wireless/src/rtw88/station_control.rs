@@ -271,6 +271,18 @@ pub(super) async fn prepare_initial(
     }
     Err(Error::Timeout)
 }
+/// `rtw_vif_port_config(PORT_SET_MAC_ADDR)`: port0 `REG_MACID` (0x610).
+pub(super) fn port_address(
+    io: &mut impl Io,
+    mac: [u8; 6],
+    admission: &Admission,
+) -> Result<(), Error> {
+    admission.check()?;
+    if !mac_valid(mac) {
+        return Err(Error::Prerequisite);
+    }
+    address(io, 0x610, mac, Some(admission))
+}
 pub(super) async fn prepare_peer(
     io: &mut impl Io,
     peer: [u8; 6],

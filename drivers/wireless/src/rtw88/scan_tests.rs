@@ -89,9 +89,10 @@ fn smoke_rtw88_scan_plan_rejects_unsupported_and_malformed_requests() -> TestRes
     let cases: [(ScanRequest, WirelessError); 9] = [
         (
             ScanRequest {
+                // cfg80211 nl80211_parse_random_mac: mask must keep the group bit.
                 random_mac: Some(narf_wireless::scan::ScanRandomMac {
                     addr: [2, 0, 0, 0, 0, 0],
-                    mask: [0xff, 0, 0, 0, 0, 0],
+                    mask: [0xfe, 0, 0, 0, 0, 0],
                 }),
                 ..base()
             },
@@ -192,4 +193,50 @@ fn smoke_rtw88_probe_request_descriptor_is_broadcast_management() -> TestResult 
 kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw88_probe_request_descriptor_is_broadcast_management
+);
+
+/// `randomized_scan_mac`: mac80211 `get_random_mask_addr` keeps the masked
+/// base bits, randomizes the rest and uses it as every probe SA.
+fn smoke_rtw88_scan_plan_random_mac_address() -> TestResult {
+    let random = narf_wireless::scan::ScanRandomMac {
+        addr: [0x02, 0x11, 0x22, 0, 0, 0],
+        mask: [0xff, 0xff, 0xff, 0, 0, 0],
+    };
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        let Ok(p) = scan::plan(
+            &ScanRequest {
+                random_mac: Some(random),
+                ..request(true, vec![b"x".to_vec(), Vec::new()], Vec::new())
+            },
+            OWN,
+        ) else {
+            return TestResult::Fail("random-MAC active plan refused");
+        };
+        let Some(a) = p.address else {
+            return TestResult::Fail("random-MAC active plan has no address");
+        };
+        if a[..3] != [0x02, 0x11, 0x22] || a == OWN || p.probes.iter().any(|f| f[10..16] != a) {
+            return TestResult::Fail("random scan address mask or probe SA");
+        }
+        seen.push(a);
+    }
+    if seen.iter().all(|a| *a == seen[0]) {
+        return TestResult::Fail("random scan address did not vary");
+    }
+    let passive = scan::plan(
+        &ScanRequest {
+            random_mac: Some(random),
+            ..request(false, Vec::new(), Vec::new())
+        },
+        OWN,
+    );
+    if !passive.is_ok_and(|p| p.address.is_none() && p.probes.is_empty()) {
+        return TestResult::Fail("passive random-MAC plan transmitted or bound an address");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/narrow/scan",
+    smoke_rtw88_scan_plan_random_mac_address
 );

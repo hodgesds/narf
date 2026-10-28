@@ -1116,6 +1116,12 @@ unsafe impl Registers for Native {
     ) -> Result<u64, super::packet_core::Error> {
         self.submit_packet(frame, report)
     }
+    fn packet_scan_address(
+        &mut self,
+        address: Option<[u8; 6]>,
+    ) -> Result<(), super::packet_core::Error> {
+        self.scan_packet_address(address)
+    }
     fn packet_poll(&mut self) -> Result<super::packet_core::Step, super::packet_core::Error> {
         self.poll_packets()
     }
