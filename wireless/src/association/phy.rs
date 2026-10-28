@@ -1130,7 +1130,8 @@ fn select(local: LocalPhy, ap: ApElements, primary: u8, native: bool) -> Result<
         he: None,
         eht: None,
         uhr: None,
-        native,
+        // Only an MLD-asserting native owner differs from a JoinPlan offer.
+        native: native && local.uhr.is_some_and(|u| u.mld_association()),
         width: Width::Twenty,
         center: primary,
         channels: [primary, 0, 0, 0, 0, 0, 0, 0],
