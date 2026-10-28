@@ -99,7 +99,7 @@ fn offload<const PCIE: bool>(vendor: FirmwareVendor, ap_caps: u16) -> Result<(),
     }
     let log = &station.runtime.fw.log[start..];
     let position =
-        |pred: &dyn Fn(&super::fullmac_fixture::Command) -> bool| log.iter().position(|c| pred(c));
+        |pred: &dyn Fn(&super::fullmac_fixture::Command) -> bool| log.iter().position(pred);
     let set = Direction::Set;
     let auth = position(&|c| c.direction == set && c.command == 22);
     let wpaie: Vec<usize> = log

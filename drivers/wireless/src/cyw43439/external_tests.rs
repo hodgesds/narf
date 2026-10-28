@@ -37,7 +37,7 @@ fn join<const PCIE: bool>(station: &mut Station<Mock<PCIE>>, akm: u8) -> Result<
 fn vectors() -> Result<(), &'static str> {
     let key = [0xa5; 16];
     let pairwise = external::wsec_key(0, &key, &[], Some(AP)).map_err(|_| "pairwise")?;
-    let mut expected = vec![0u8; 164];
+    let mut expected = [0u8; 164];
     expected[4] = 16;
     expected[8..24].copy_from_slice(&key);
     expected[112] = 4; // CRYPTO_ALGO_AES_CCM
@@ -46,7 +46,7 @@ fn vectors() -> Result<(), &'static str> {
         return Err("pairwise wsec_key differs from brcmf_wsec_key_le");
     }
     let group = external::wsec_key(1, &key, &[1, 2, 3, 4, 5, 6], None).map_err(|_| "group")?;
-    let mut expected = vec![0u8; 164];
+    let mut expected = [0u8; 164];
     expected[0] = 1;
     expected[4] = 16;
     expected[8..24].copy_from_slice(&key);
