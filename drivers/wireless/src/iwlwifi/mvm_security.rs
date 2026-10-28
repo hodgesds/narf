@@ -101,8 +101,17 @@ struct Pending {
     changed: Vec<usize>,
 }
 
+/// An IGTK this owner installed with MGMT_MCAST_KEY (index 4 or 5).
+struct InstalledIgtk {
+    material: Zeroizing<[u8; 16]>,
+    id: u16,
+}
+
 struct Exchange {
     session: security::Session,
+    /// WPA3-SAE: every key carries `STA_KEY_MFP` and IGTKs are installed.
+    pmf: bool,
+    igtks: [Option<InstalledIgtk>; 2],
     keys: [Option<NativeKey>; 5],
     incoming: VecDeque<(Vec<u8>, bool)>,
     pending: Option<Pending>,
@@ -217,12 +226,14 @@ impl Context {
     }
 }
 
-fn key_command(key: &NativeKey, remove: bool) -> Zeroizing<[u8; 76]> {
+fn key_command(key: &NativeKey, remove: bool, mfp: bool) -> Zeroizing<[u8; 76]> {
     let mut bytes = Zeroizing::new([0; 76]);
     bytes[1] = key.slot;
+    // Linux iwl_mvm_send_sta_key adds STA_KEY_MFP for an MFP station.
     let flags = 8
         | u16::from(key.id) << 8
         | if key.group { 1 << 14 } else { 0 }
+        | if mfp { super::pmf::STA_KEY_MFP } else { 0 }
         | if remove { 1 << 11 } else { 2 };
     put16(&mut bytes[..], 2, flags);
     if !remove {
@@ -310,10 +321,58 @@ impl Owner {
     pub(super) async fn secure_using(
         &mut self,
         pmk: [u8; 32],
+        nonce: impl FnMut() -> Result<[u8; 32], &'static str>,
+        policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<(), &'static str> {
+        let pmk = Zeroizing::new(pmk);
+        if self.associated_pmf() {
+            return Err("MVM PMF association requires its SAE PMK owner");
+        }
+        self.secure_with(security::Akm::Wpa2Psk, pmk, nonce, policy)
+            .await
+    }
+
+    /// WPA3-SAE four-way exchange with the PMK the retained SAE
+    /// authentication derived. The station RSNE in message 2 repeats the
+    /// association request's (with its PMKID); message 3 must carry the
+    /// IGTK, which is installed with MGMT_MCAST_KEY.
+    pub async fn secure_legacy_sae(&mut self) -> Result<(), &'static str> {
+        self.secure_sae_using(security::fresh_nonce, || {
+            narf_wireless::reg::db::get_domain().ok_or("MVM WPA3 policy unavailable")
+        })
+        .await
+    }
+    pub(super) async fn secure_sae_using(
+        &mut self,
+        nonce: impl FnMut() -> Result<[u8; 32], &'static str>,
+        policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<(), &'static str> {
+        if !self.associated_pmf() {
+            return Err("MVM SAE security requires a PMF association");
+        }
+        let pmk = self
+            .power
+            .prepared
+            .as_mut()
+            .and_then(|p| p.mlme.sae_pmk.take())
+            .ok_or("MVM SAE PMK absent or already consumed")?;
+        self.secure_with(security::Akm::Wpa3Sae, pmk, nonce, policy)
+            .await
+    }
+    fn associated_pmf(&self) -> bool {
+        self.power
+            .prepared
+            .as_ref()
+            .and_then(|p| p.mlme.data.as_ref())
+            .is_some_and(|d| d.status.pmf)
+    }
+    async fn secure_with(
+        &mut self,
+        akm: security::Akm,
+        pmk: Zeroizing<[u8; 32]>,
         mut nonce: impl FnMut() -> Result<[u8; 32], &'static str>,
         mut policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(), &'static str> {
-        let pmk = Zeroizing::new(pmk);
         if self.phase != Phase::DataPrepared || self.security.started() {
             return Err("MVM WPA2 already started or data owner not ready");
         }
@@ -340,16 +399,28 @@ impl Owner {
                 None
             })
             .ok_or("MVM actual WPA2 RSN offer absent")?;
+        let pmf = akm == security::Akm::Wpa3Sae;
+        let station_rsn = if pmf {
+            Some(
+                self.power
+                    .prepared
+                    .as_ref()
+                    .and_then(|p| p.mlme.plan.as_ref())
+                    .and_then(|plan| plan.rsn_body())
+                    .ok_or("MVM SAE association RSNE absent")?,
+            )
+        } else {
+            None
+        };
         let snonce = Zeroizing::new(nonce()?);
+        let session = security::Session::new(akm, *pmk, status.bssid, own, *snonce, rsn);
         self.security.active = Some(Exchange {
-            session: security::Session::new(
-                security::Akm::Wpa2Psk,
-                *pmk,
-                status.bssid,
-                own,
-                *snonce,
-                rsn,
-            ),
+            session: match station_rsn {
+                Some(body) => session.with_station_rsn(body),
+                None => session,
+            },
+            pmf,
+            igtks: [None, None],
             keys: core::array::from_fn(|_| None),
             incoming: VecDeque::new(),
             pending: None,
@@ -604,7 +675,13 @@ impl Owner {
         let Some(change) = change else {
             return Ok(Vec::new());
         };
-        if change.igtk.is_some() || change.group_id > 3 || change.group_rx_pn >> 48 != 0 {
+        let pmf = self.security.active.as_ref().unwrap().pmf;
+        if change
+            .igtk
+            .is_some_and(|(_, id, ipn)| !pmf || !matches!(id, 4 | 5) || ipn >> 48 != 0)
+            || change.group_id > 3
+            || change.group_rx_pn >> 48 != 0
+        {
             return Err("unsupported MVM key update");
         }
         let mut keys = Vec::new();
@@ -765,7 +842,8 @@ impl Owner {
                 .as_ref()
                 .unwrap();
             let index = usize::from(key.slot);
-            let body = key_command(key, false);
+            let pmf = self.security.active.as_ref().unwrap().pmf;
+            let body = key_command(key, false, pmf);
             let digest = key_digest(key.material.as_ref());
             let (peer, group, id, rsc, tx_pn) = (key.peer, key.group, key.id, key.rsc, key.tx_pn);
             let old_history = if self.security.active.as_ref().unwrap().keys[index].is_some() {
@@ -774,7 +852,7 @@ impl Owner {
                 None
             };
             if let Some(old) = self.security.active.as_ref().unwrap().keys[index].as_ref() {
-                let remove = key_command(old, true);
+                let remove = key_command(old, true, pmf);
                 let reply = self
                     .qualified_link_command(1, KEY, &remove[..], policy)
                     .await?;
@@ -839,6 +917,7 @@ impl Owner {
                 .changed
                 .push(index);
         }
+        let igtk = self.install_igtk(policy).await?;
         self.sync_security_rx(Some(policy)).await?;
         for index in retired {
             self.security.history[index].retired = true;
@@ -862,9 +941,22 @@ impl Owner {
             } else if let Some(floors) = key.restored {
                 data.replay.reset_pairwise();
                 data.replay.pairwise = floors;
+                // The AP's single per-key PN also bounds robust management.
+                data.pmf.mgmt_pn = floors.iter().copied().max().unwrap_or(0);
             } else {
                 data.replay.reset_pairwise();
+                data.pmf.mgmt_pn = 0;
             }
+        }
+        // Host BIP verification uses the IGTK only after its native receipt
+        // and the RX epoch, with the KDE IPN as replay floor (mac80211
+        // ieee80211_crypto_aes_cmac_decrypt over the installed rx_pn).
+        if let Some((material, id, ipn)) = igtk {
+            data.pmf
+                .mfp
+                .install_active(*material, id)
+                .map_err(|_| "MVM IGTK key index invalid")?;
+            data.pmf.mfp.active.as_mut().unwrap().rx_pn = ipn;
         }
         let change = pending.change.as_ref().unwrap();
         for pn in &mut data.replay.group[usize::from(change.group_id)] {
@@ -890,7 +982,7 @@ impl Owner {
                 None
             };
             if let Some(key) = self.security.active.as_ref().unwrap().keys[index].as_ref() {
-                let body = key_command(key, true);
+                let body = key_command(key, true, self.security.active.as_ref().unwrap().pmf);
                 let reply = self
                     .hardware
                     .command_with_header_version(1, KEY, &body[..], 0)
@@ -900,13 +992,70 @@ impl Owner {
                 retired.push(history.unwrap());
             }
         }
+        for slot in 0..2 {
+            let Some(id) = self.security.active.as_ref().unwrap().igtks[slot]
+                .as_ref()
+                .map(|k| k.id)
+            else {
+                continue;
+            };
+            let body = super::pmf::igtk_command(None, id, 0);
+            self.hardware
+                .command_with_header_version(0, super::pmf::MGMT_MCAST_KEY, &body[..], 0)
+                .await?;
+            self.security.active.as_mut().unwrap().igtks[slot] = None;
+        }
         self.sync_security_rx(None::<&mut fn() -> Result<RegulatoryDomain, &'static str>>)
             .await?;
         for index in retired {
             self.security.history[index].retired = true;
         }
         self.security.active = None;
+        if let Some(data) = self
+            .power
+            .prepared
+            .as_mut()
+            .and_then(|p| p.mlme.data.as_mut())
+        {
+            data.pmf = super::pmf::PmfRx::default();
+        }
         Ok(())
+    }
+
+    /// Install a new IGTK from the pending update with MGMT_MCAST_KEY
+    /// (Linux `iwl_mvm_send_sta_igtk`; the command's response carries no
+    /// status Linux checks, so its receipt alone completes it). Identical
+    /// material at the same index is never reinstalled, so its IPN floor
+    /// cannot be reset. Returns the key the host BIP owner must adopt.
+    async fn install_igtk(
+        &mut self,
+        policy: &mut impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<Option<(Zeroizing<[u8; 16]>, u16, u64)>, &'static str> {
+        let active = self.security.active.as_ref().unwrap();
+        let Some((material, id, ipn)) = active
+            .pending
+            .as_ref()
+            .and_then(|p| p.change.as_ref())
+            .and_then(|c| c.igtk)
+        else {
+            return Ok(None);
+        };
+        let material = Zeroizing::new(material);
+        let slot = usize::from(id - 4);
+        if active.igtks[slot]
+            .as_ref()
+            .is_some_and(|k| k.material.as_ref() == material.as_ref())
+        {
+            return Ok(None);
+        }
+        let body = super::pmf::igtk_command(Some(&material), id, ipn);
+        self.qualified_link_command(0, super::pmf::MGMT_MCAST_KEY, &body[..], policy)
+            .await?;
+        self.security.active.as_mut().unwrap().igtks[slot] = Some(InstalledIgtk {
+            material: material.clone(),
+            id,
+        });
+        Ok(Some((material, id, ipn)))
     }
 
     /// Firmware restart retirement. The transport has acknowledged its DMA
@@ -939,6 +1088,14 @@ impl Owner {
             self.security.history[index].retired = true;
         }
         self.security.active = None;
+        if let Some(data) = self
+            .power
+            .prepared
+            .as_mut()
+            .and_then(|p| p.mlme.data.as_mut())
+        {
+            data.pmf = super::pmf::PmfRx::default();
+        }
         Ok(())
     }
 
@@ -1025,7 +1182,13 @@ impl Owner {
                     && packet.header.cmd == 0xc1
                     && super::super::scan_api::mpdu_gen2(&packet.payload).is_some_and(|mpdu| {
                         let (mac, status) = bound.unwrap();
-                        super::data::ap_disconnected(&mpdu, mac, status)
+                        let data = self
+                            .power
+                            .prepared
+                            .as_mut()
+                            .and_then(|p| p.mlme.data.as_mut());
+                        let pmf = data.and_then(|d| d.status.pmf.then_some(&mut d.pmf));
+                        super::pmf::ap_disconnected(&mpdu, mac, status.bssid, status.channel, pmf)
                     })
                 {
                     return Err("MVM AP disconnected during native RX key epoch");

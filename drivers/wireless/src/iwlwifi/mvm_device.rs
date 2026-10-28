@@ -110,7 +110,7 @@ struct Join {
     ssid: Vec<u8>,
     channel: u8,
     elements: Vec<u8>,
-    pmk: Option<Zeroizing<[u8; 32]>>,
+    credential: super::mvm_boot::Credential,
 }
 enum Outcome {
     Scan(Vec<BssInfo>),
@@ -132,6 +132,7 @@ pub(super) struct Device {
     mac: [u8; 6],
     channels: Vec<u8>,
     wpa2: bool,
+    sae: bool,
     ht20: bool,
     irq: Option<u8>,
     publication: AtomicBool,
@@ -237,6 +238,7 @@ impl Device {
         let channels = nvm.channels.clone();
         let irq = owner.station_irq();
         let wpa2 = owner.station_wpa2_supported();
+        let sae = owner.station_sae_supported();
         let ht20 = owner.supports_native_ht20();
         let stopping = Arc::new(AtomicBool::new(false));
         owner.bind_station_stop(stopping.clone());
@@ -255,6 +257,7 @@ impl Device {
             mac,
             channels,
             wpa2,
+            sae,
             ht20,
             irq,
             publication: AtomicBool::new(false),
@@ -620,7 +623,7 @@ impl Device {
                     &request.ssid,
                     request.channel,
                     &request.elements,
-                    request.pmk.is_some(),
+                    request.credential.mode(),
                 )?;
                 let (source, binding) = (self.environment.power)(owner)?;
                 owner
@@ -629,7 +632,7 @@ impl Device {
                         &request.ssid,
                         request.channel,
                         &request.elements,
-                        request.pmk,
+                        request.credential,
                         source,
                         binding,
                         self.stopping.clone(),
@@ -1045,6 +1048,10 @@ impl WirelessNetIface for Device {
     fn supports_handshake_offload(&self) -> bool {
         self.wpa2
     }
+    /// Host SAE plus the native PMF key owner (§3.33).
+    fn supports_sae_offload(&self) -> bool {
+        self.sae
+    }
     fn reports_disconnect_events(&self) -> bool {
         true
     }
@@ -1160,21 +1167,17 @@ impl WirelessNetIface for Device {
         {
             return Err(WirelessError::InvalidArgs);
         }
-        if !matches!(
-            request.security,
-            narf_wireless::SecurityConfig::Open | narf_wireless::SecurityConfig::Wpa2 { .. }
-        ) {
-            return Err(WirelessError::NotSupported);
-        }
-        if matches!(request.security, narf_wireless::SecurityConfig::Wpa2 { .. }) && !self.wpa2 {
-            return Err(WirelessError::NotSupported);
-        }
-        let pmk = match &mut request.security {
-            narf_wireless::SecurityConfig::Open => None,
-            narf_wireless::SecurityConfig::Wpa2 { psk } => {
+        use super::mvm_boot::Credential;
+        let credential = match &mut request.security {
+            narf_wireless::SecurityConfig::Open => Credential::Open,
+            narf_wireless::SecurityConfig::Wpa2 { psk } if self.wpa2 => {
                 let key = Zeroizing::new(*psk);
                 psk.zeroize();
-                Some(key)
+                Credential::Psk(key)
+            }
+            narf_wireless::SecurityConfig::Wpa3 { password } if self.sae => {
+                let secret = Zeroizing::new(core::mem::take(password));
+                Credential::Sae(secret)
             }
             _ => return Err(WirelessError::NotSupported),
         };
@@ -1183,7 +1186,7 @@ impl WirelessNetIface for Device {
             ssid: request.ssid,
             channel,
             elements: request.ie,
-            pmk,
+            credential,
         };
         let reply = self.begin(Operation::Join(join)).map_err(error)?;
         self.wait(reply).await.map_err(error).map(|_| ())

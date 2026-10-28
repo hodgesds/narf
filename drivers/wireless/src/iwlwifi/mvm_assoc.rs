@@ -25,9 +25,13 @@ pub(super) struct Authenticated {
 #[derive(Default)]
 pub(super) struct Context {
     pub authenticated: Option<Authenticated>,
-    plan: Option<JoinPlan>,
+    pub(super) plan: Option<JoinPlan>,
     pub(super) prepared: Option<AssociationStatus>,
     pub(super) data: Option<super::data::Prepared>,
+    /// Retained SAE plan/request/PMK between authentication and association.
+    pub(super) sae: Option<alloc::boxed::Box<super::pmf::SaeAuthenticated>>,
+    /// SAE PMK retained by a completed PMF association for its 4-way owner.
+    pub(super) sae_pmk: Option<zeroize::Zeroizing<[u8; 32]>>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AssociationStatus {
@@ -40,6 +44,8 @@ pub struct AssociationStatus {
     pub short_preamble: bool,
     pub short_slot: bool,
     pub erp_protection: bool,
+    /// Management-frame protection negotiated (WPA3-SAE, MFPR).
+    pub pmf: bool,
 }
 
 fn peer(aid: u16) -> [u8; 48] {
@@ -77,6 +83,12 @@ fn link(local: [u8; 6], status: AssociationStatus, interval: u16, dtim: u8) -> [
     put32(&mut body, 136, u32::from(interval));
     put32(&mut body, 140, u32::from(interval) * u32::from(dtim));
     body
+}
+fn beacon_timing(beacon: &super::super::connection::Beacon) -> Result<(u16, u8), &'static str> {
+    if beacon.interval == 0 {
+        return Err("association beacon interval missing");
+    }
+    Ok((beacon.interval, beacon.dtim.max(1)))
 }
 impl Owner {
     pub fn associated_station(&self) -> Option<AssociationStatus> {
@@ -143,6 +155,12 @@ impl Owner {
             beacon_interval: beacon.interval,
             information_elements: beacon.information_elements.clone(),
         };
+        if security.is_sae() {
+            let timing = beacon_timing(beacon)?;
+            return self
+                .associate_sae_using(local, queue, timing, &mut policy)
+                .await;
+        }
         let mut plan = self.station_plan(
             &bss,
             ssid,
@@ -180,17 +198,29 @@ impl Owner {
         frame[22..24].copy_from_slice(&16u16.to_le_bytes()); // next management sequence1
         let rate = self.authentication_rate(&bss.information_elements, bss.channel)?;
         self.check_link_power(&policy()?)?;
-        let (interval, dtim) = (beacon.interval, beacon.dtim.max(1));
-        if interval == 0 {
-            return Err("association beacon interval missing");
-        }
+        let (interval, dtim) = beacon_timing(beacon)?;
         let mlme = &mut self.power.prepared.as_mut().unwrap().mlme;
         mlme.authenticated = None;
         mlme.plan = Some(plan);
         mlme.prepared = None;
         self.phase = Phase::Associating;
+        self.finish_association(local, queue, &frame, rate, interval, dtim, &mut policy)
+            .await
+    }
+    /// Shared tail of every association: reserve, exchange, publish.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn finish_association(
+        &mut self,
+        local: [u8; 6],
+        queue: u16,
+        frame: &[u8],
+        rate: u32,
+        interval: u16,
+        dtim: u8,
+        policy: &mut impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<AssociationStatus, &'static str> {
         let result = self
-            .associate_inner(local, queue, &frame, rate, interval, dtim, &mut policy)
+            .associate_inner(local, queue, frame, rate, interval, dtim, policy)
             .await;
         match result {
             Ok(status) => {
@@ -352,7 +382,8 @@ impl Owner {
                         aid,
                         supported_rates,
                         basic_rates,
-                        protected: plan.security().is_wpa2(),
+                        protected: plan.security().is_rsn(),
+                        pmf: plan.security().is_sae(),
                         short_preamble: active.channel <= 14 && negotiated & 32 != 0,
                         short_slot: active.channel > 14 || negotiated & 1024 != 0,
                         erp_protection: active.channel <= 14 && erp.is_some_and(|erp| erp & 2 != 0),
@@ -372,8 +403,12 @@ impl Owner {
     /// first (the close owner drains the TX ring), then one Deauthentication
     /// goes to the current AP while the association, peer, management queue
     /// and keys are still installed, and its terminal TX receipt is awaited
-    /// before any station teardown. The frame is unprotected: this profile
-    /// negotiates no MFP, so IEEE 802.11-2020 11.13 does not protect it.
+    /// before any station teardown. Without MFP the frame is unprotected
+    /// (IEEE 802.11-2020 11.13). A PMF association with an installed PTK
+    /// sets Protected: Gen2's new TX API leaves no IV space and firmware
+    /// CCMP-encrypts with the station key (`iwl_mvm_set_tx_params` clears
+    /// `IWL_TX_FLAGS_ENCRYPT_DIS` for a hardware key, mac80211.c omits
+    /// `PUT_IV_SPACE` on the new TX API).
     ///
     /// Without current platform/host emission authority the close stays
     /// local (Linux `tx=false`). A terminal TX_CMD without ACK is a complete
@@ -404,6 +439,7 @@ impl Owner {
             .as_ref()
             .ok_or("missing deauthentication NVM")?
             .tx_chains;
+        let keyed = self.security.has_pairwise();
         let data = self
             .power
             .prepared
@@ -411,13 +447,16 @@ impl Owner {
             .and_then(|p| p.mlme.data.as_mut())
             .ok_or("MVM deauthentication data owner absent")?;
         data.port_open = false;
-        let frame = super::super::frame_api::management(
+        let mut frame = super::super::frame_api::management(
             DEAUTHENTICATION,
             local,
             data.status.bssid,
             data.sequence,
             &reason.to_le_bytes(),
         );
+        if data.status.pmf && keyed {
+            frame[1] |= 0x40;
+        }
         data.sequence = data.sequence.wrapping_add(1) & 4095;
         let rate = super::super::rates::Rates {
             supported: data.status.supported_rates,

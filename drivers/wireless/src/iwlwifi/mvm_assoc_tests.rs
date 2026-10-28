@@ -145,6 +145,7 @@ fn success(protected: bool) -> Result<(), &'static str> {
         short_preamble: false,
         short_slot: false,
         erp_protection: false,
+        pmf: false,
     };
     {
         let mut op = pin!(owner.associate_legacy_using(

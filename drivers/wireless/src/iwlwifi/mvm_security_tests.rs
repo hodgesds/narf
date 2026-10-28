@@ -1953,13 +1953,13 @@ fn smoke_gen2_key_history_restore_policy_cross_peer_index_and_ptk_reuse() -> Tes
     {
         return TestResult::Fail("same-peer PTK reuse floors differ");
     }
-    let body = key_command(&ptk, false);
+    let body = key_command(&ptk, false, false);
     if body[68..76] != 4243u64.to_le_bytes() {
         return TestResult::Fail("reused PTK transmit_seq_cnt not programmed");
     }
-    if key_command(&history_key(false, 0, A), false)[68..76] != [0; 8]
-        || key_command(&history_key(true, 1, A), false)[68..76] != [0; 8]
-        || key_command(&ptk, true)[68..76] != [0; 8]
+    if key_command(&history_key(false, 0, A), false, false)[68..76] != [0; 8]
+        || key_command(&history_key(true, 1, A), false, false)[68..76] != [0; 8]
+        || key_command(&ptk, true, false)[68..76] != [0; 8]
     {
         return TestResult::Fail("fresh/group/remove key carried a TX PN");
     }

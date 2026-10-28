@@ -1268,7 +1268,7 @@ impl Connection {
             // 802.11w: install the IGTK and arm management-frame protection.
             // The host verifies group-addressed robust mgmt frames (BIP) and
             // drops unprotected ones; per-frame BIP math lives in `mfp`.
-            if let Some((igtk, key_id)) = keys.igtk {
+            if let Some((igtk, key_id, _)) = keys.igtk {
                 self.mfp
                     .install_active(igtk, key_id)
                     .map_err(|_| "invalid IGTK key index")?;

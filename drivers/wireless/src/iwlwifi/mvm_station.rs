@@ -9,6 +9,26 @@ use narf_wireless::{
 };
 use zeroize::Zeroizing;
 
+/// Station credential of one native join.
+pub(in crate::iwlwifi) enum Credential {
+    Open,
+    /// WPA2-PSK PMK for the native four-way owner.
+    Psk(Zeroizing<[u8; 32]>),
+    /// WPA3-Personal password for host SAE (sae_pwe 2) plus PMF.
+    Sae(Zeroizing<Vec<u8>>),
+}
+impl Credential {
+    pub(in crate::iwlwifi) fn mode(&self) -> SecurityMode {
+        match self {
+            Credential::Open => SecurityMode::Open,
+            Credential::Psk(_) => SecurityMode::Wpa2Psk,
+            Credential::Sae(_) => SecurityMode::Wpa3Sae {
+                pwe: narf_wireless::association::SaePwe::Both,
+            },
+        }
+    }
+}
+
 impl Owner {
     #[cfg(any(test, feature = "kernel-test"))]
     pub(in crate::iwlwifi) fn model_expire_receive_aggregate(&mut self) {
@@ -316,7 +336,7 @@ impl Owner {
         ssid: &[u8],
         channel: u8,
         elements: &[u8],
-        pmk: Option<Zeroizing<[u8; 32]>>,
+        credential: Credential,
         source: Asset,
         binding: [u8; 32],
         stop: Arc<AtomicBool>,
@@ -326,11 +346,7 @@ impl Owner {
         if self.phase != Phase::Configured {
             return Err("MVM station requires configured scan owner");
         }
-        let mode = if pmk.is_some() {
-            SecurityMode::Wpa2Psk
-        } else {
-            SecurityMode::Open
-        };
+        let mode = credential.mode();
         let beacon = self
             .beacons
             .iter()
@@ -369,14 +385,32 @@ impl Owner {
             .await?;
         self.power.prepared.as_mut().unwrap().stop = Some(stop);
         self.activate_link_using(&mut policy).await?;
-        if self.authenticate_open_using(&mut policy).await?.status != 0 {
+        let authenticated = match &credential {
+            Credential::Sae(password) => {
+                let ssid_owned = ssid.to_vec();
+                self.authenticate_sae_using(
+                    ssid,
+                    elements,
+                    narf_wireless::association::SaePwe::Both,
+                    |join, own, peer| {
+                        super::pmf::fresh_session(join, &ssid_owned, password, own, peer)
+                    },
+                    &mut policy,
+                )
+                .await?
+            }
+            _ => self.authenticate_open_using(&mut policy).await?,
+        };
+        if authenticated.status != 0 {
             return Err("MVM AP refused authentication");
         }
         self.associate_elements_using(ssid, mode, elements, &mut policy)
             .await?;
         self.prepare_data_using(&mut policy).await?;
-        if let Some(pmk) = pmk {
-            self.secure_using(*pmk, &mut nonce, &mut policy).await?;
+        match credential {
+            Credential::Psk(pmk) => self.secure_using(*pmk, &mut nonce, &mut policy).await?,
+            Credential::Sae(_) => self.secure_sae_using(&mut nonce, &mut policy).await?,
+            Credential::Open => {}
         }
         if !self.data_port_using(&mut policy) {
             return Err("MVM station native controlled port not completed");

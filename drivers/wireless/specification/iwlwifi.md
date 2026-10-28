@@ -1552,7 +1552,7 @@ each feature; a Linux chip name or helper structure does not grant a capability.
 
 | Profile | Implemented reachable software | Remaining software gates |
 |---|---|---|
-| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles (Linux Qu PCI IDs 0x02f0/0x06f0/0x34f0/0x3df0/0x4df0/0x43f0/0xa0f0, §3.26) | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO (with §3.28 RX LDPC/STBC1), signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement preceded by §3.25 over-air leaving deauthentication. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced reconnect restoration, extended in §3.30 to cross-peer/cross-index GTK restore, safe same-peer PTK reuse and a radio-scoped ledger across native owners; §3.31 generic tag5 feature programs with per-TID QoS queues for all four ACs; §3.29 firmware/transport recovery and non-WoWLAN system suspend/resume. Authored, execution pending: §3.24 tag4 negotiated unicast-local nested recipient A-MSDU-in-A-MPDU with complete bundles before sequence/PN ownership. | Active probes (scan firmware's emitter/power binding needs source proof); alternate ML BAID; TX A-MSDU; HT40/NSS2/VHT/HE/TX LDPC/TX STBC; PMF/WPA3; persistent key history. AP/P2P, WoW (with its D3 ARP/NS/GTK offloads), the §3.27 scheduled-scan offload and multiple RX/RSS remain unimplemented even where hardware supports them. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
+| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles (Linux Qu PCI IDs 0x02f0/0x06f0/0x34f0/0x3df0/0x4df0/0x43f0/0xa0f0, §3.26) | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO (with §3.28 RX LDPC/STBC1), §3.33 host WPA3-SAE with PMF, signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement preceded by §3.25 over-air leaving deauthentication. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced reconnect restoration, extended in §3.30 to cross-peer/cross-index GTK restore, safe same-peer PTK reuse and a radio-scoped ledger across native owners; §3.31 generic tag5 feature programs with per-TID QoS queues for all four ACs; §3.29 firmware/transport recovery and non-WoWLAN system suspend/resume. Authored, execution pending: §3.24 tag4 negotiated unicast-local nested recipient A-MSDU-in-A-MPDU with complete bundles before sequence/PN ownership. | Active probes (scan firmware's emitter/power binding needs source proof); alternate ML BAID; TX A-MSDU; HT40/NSS2/VHT/HE/TX LDPC/TX STBC; SAE-EXT-KEY (AKM 24) and WPA2-PSK with PMF; persistent key history. AP/P2P, WoW (with its D3 ARP/NS/GTK offloads), the §3.27 scheduled-scan offload and multiple RX/RSS remain unimplemented even where hardware supports them. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
 | AX210/AX211/AX411 and Bz/BE200 Gen3 transports | Context-v2, generation-selected completion layouts, firmware/PNVM/native boot and MLD helpers. Software-validated continuation: source-selected command-ID header0/explicit RLC2, receipt-fenced TVQM/BAID retirement, retained actual executable/PNVM/PCI authority and immutable DMA-copy receive/publication epochs. | Station admission remains dependent on the exact negotiated MAC/link/STA/TLC/key payload profile; no new payload profile is enabled by the header/source audit. Sc conversation tests do not establish another family's ABI, platform power/SAR program or hardware. Current live regulatory/power ownership remains separate. |
 | Sc c103/BE211 MLD station profile | Deferred retained native publication, actual station/management/data/Open-WPA2-SAE conversations, legacy/HT/VHT to80MHz, key/BA/reorder and userspace SME/port ownership in the existing profile. §§3.21–3.22 header/TVQM, positive BA response/RX-marker retirement, retained executable/PNVM/current-PCI publication and copy-time key epochs passed coordinated native tests on both architectures. | These source/epoch fences do not establish underlying RF quiescence or current live-regulatory/platform-power qualification. HE/EHT/6GHz and MLO,160/320MHz, AP/P2P and the §3.27 scheduled-scan offload remain separate (non-WoWLAN system suspend/resume is §3.29) implementations and must not be inferred from single-link Sc fixtures. |
 | Other advertised PCI/firmware combinations | Identification/firmware selection where defined, including the Linux So/Ma/Bz IDs added in §3.26; 0x7df0 is identification-only (Linux 7.3 `pcie/drv.c` claims no 0x7DF0) and exact admission rejects it | No fallback admits an unknown command table, calibration profile, topology or PHY width. They need their exact source-backed authority/command/receipt/lifetime path. |
@@ -1941,6 +1941,101 @@ therefore inapplicable: there is no Linux behaviour that delivers such a
 frame. `smoke_mvm_group_qos_bypasses_reorder_and_group_amsdu_stays_closed`
 covers No Ack/Normal delivery with and without a BAID, rejection of group
 A-MSDU subframes with and without a BAID, and unchanged unicast BA delivery.
+
+### 3.33 Gen2 host WPA3-SAE and management-frame protection
+
+Rows gen2_wpa3 and gen2_pmf. The Gen2 native owner now joins a WPA3-Personal
+BSS with host SAE, MFP-required association, the AKM 8 four-way exchange and
+native IGTK/PMF state. Each step follows Linux and uses the shared APIs of
+`wireless/specification/spec.md` §3.
+
+- **SAE authentication** (`mvm_pmf.rs::authenticate_sae_using`). This follows
+  mac80211 `ieee80211_auth` with wpa_supplicant `sme_send_authentication`/
+  `sme_sae_auth` (`sae_pwe` 2). `JoinPlan::prepare*` with
+  `SecurityMode::Wpa3Sae { pwe: Both }` admits the AP. The driver builds the
+  `SaeSession` from its own entropy (H2E or hunting-and-pecking as
+  `SaeJoin::h2e()` selects). The exchange then runs:
+  `start_sae_authentication`, Commit, then `sae_authentication_response`
+  for every AP Authentication frame of algorithm 3, which yields
+  `Transmit` (Confirm, or an anti-clogging Commit) or `Associate`. The
+  exchange is bounded by five frames.
+
+  The temporary peer TX window has the same order as open authentication:
+  ADD_STA MODIFY enables it, each frame waits for its TX_CMD receipt, and a
+  MODIFY disables it before the result is published. Management sequence
+  numbers are 0 and 1 for the SAE frames and 2 for association. An AP
+  rejection status is published after the peer is disabled and retains
+  nothing. A protocol failure, such as a Confirm that does not verify, fails
+  the owner. The retained plan, its association request (RSNE with the SAE
+  PMKID, RSNXE for H2E) and the PMK move to the association.
+- **Association** (`associate_sae_using`). The plan's own request is sent
+  (plus the WMM element when the HT20 profile is selected), and the same plan
+  checks the response. `AssociationStatus::pmf` records MFP.
+  `protected` now uses `SecurityMode::is_rsn` (it was `is_wpa2`).
+- **Four-way exchange** (`secure_sae_using`). The retained PMK runs the local
+  `security::Session` with `Akm::Wpa3Sae` (SHA-256 KDF, AES-128-CMAC MIC,
+  descriptor version 0). Message 2 repeats the exact association-request
+  RSNE (`Session::with_station_rsn`, as wpa_supplicant echoes
+  `assoc_wpa_ie`; IEEE 802.11-2020 12.7.6.3). Message 3 must carry the IGTK
+  KDE, whose IPN is now parsed. Native PTK/GTK ADD_STA_KEY commands carry
+  `STA_KEY_MFP` (bit 15), as `iwl_mvm_send_sta_key` sets it for `sta->mfp`.
+  The IGTK is installed with MGMT_MCAST_KEY (group 0, 0x1f) v2: 52 bytes,
+  `STA_KEY_FLG_CCM` for AES-CMAC, IGTK in the 32-byte field, key ID,
+  station 0, and the IPN as `receive_seq_cnt`. This matches
+  `iwl_mvm_send_sta_igtk`, which uses v2 because 22000 devices have the new
+  RX API. The IGTK is installed before the RX epoch marker and the peer
+  re-enable. Linux checks no status in the command response, so its receipt
+  alone completes it. Identical material at the same index is never
+  reinstalled.
+- **PMF receive** (`mvm_pmf.rs::ap_disconnected`). This follows mac80211
+  `ieee80211_drop_unencrypted_mgmt`, with `WLAN_STA_MFP` set at association,
+  and `ieee80211_crypto_aes_cmac_decrypt`:
+  - An unprotected unicast Deauthentication or Disassociation is dropped.
+  - A protected one ends the association only when firmware reports
+    station0 CCM decryption with a valid MIC (the data path's
+    `0xa4c` status) and its CCMP PN advances a dedicated management replay
+    counter. The counter resets with fresh PTK material; a reused PTK
+    starts at its highest restored data floor.
+  - A group-addressed frame needs a valid BIP-CMAC-128 MMIE under the
+    installed IGTK. The host `mfp::MfpKeyStore` adopts the IGTK after its
+    native receipt and RX epoch, with `rx_pn` set to the KDE IPN.
+
+  Dropped frames change no state. The same rule applies during native RX
+  key epochs.
+- **Teardown**. The §3.25 leaving Deauthentication sets Protected once a
+  PTK is installed. Gen2's new TX API reserves no IV space (mac80211.c omits
+  `PUT_IV_SPACE`), and the TX command leaves `ENCRYPT_DIS` clear, so
+  firmware CCMP-encrypts with the station key (`iwl_mvm_set_tx_params`).
+  Close removes the PTK and GTK, then each IGTK (MGMT_MCAST_KEY
+  `STA_KEY_NOT_VALID`), then fences RX before queue removal. Firmware
+  restart retirement also clears host PMF state.
+- **Interface**. `Device::supports_sae_offload` reports the native key API.
+  `associate` accepts `SecurityConfig::Wpa3 { password }`, which becomes
+  `Credential::Sae`, and `station_join` runs SAE, association and the SAE
+  four-way exchange.
+
+**Not covered.** SAE-EXT-KEY (AKM 24) is refused before anything is sent:
+its group-19 HMAC-SHA-256 MIC is not in the local key owner, and a BSS that
+offers AKMs 8 and 24 under H2E makes the plan select 24. WPA2-PSK with PMF
+(AKM 2 with MFPC, or AKM 6) is not offered: the shared `Wpa2Psk` JoinPlan
+mode refuses MFP-required APs and negotiates no MFPC. Beacon protection
+(BIGTK) and SA Query remain the MLME owner's. The emitted PPDUs are
+unchanged, so no new emitting program is needed.
+
+`drivers/wireless/iwlwifi/gen2/pmf` smokes cover:
+
+- the complete hunting-and-pecking and H2E conversations with an
+  independently authored AP (its own `SaeSession`, SHA-256-KDF PTK,
+  AES-CMAC MICs, GTK and IGTK KDEs);
+- exact key flags and MGMT_MCAST_KEY bytes;
+- dropped unprotected, undecrypted, forged-BIP and replayed-BIP frames,
+  then disconnects on a valid protected deauthentication and on a valid
+  BIP deauthentication;
+- the protected leaving deauthentication with ordered PTK/GTK/IGTK/epoch/
+  queue close;
+- AP rejection, an unverifiable Confirm and an M3 without an IGTK;
+- refusal of AKM 24, of SAE without the key API, and of mixing the
+  WPA2/SAE owners, plus the legacy and PMF deauthentication rules.
 
 ## 4. References
 

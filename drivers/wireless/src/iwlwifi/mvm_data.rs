@@ -54,6 +54,8 @@ pub(super) struct Prepared {
     pub(super) replay: frame_api::Replay,
     pub(super) last_peer: u64,
     pub(super) aggregate: super::amsdu::Receiver,
+    /// PMF receive owner (IGTKs, management PN) when `status.pmf`.
+    pub(super) pmf: super::pmf::PmfRx,
 }
 
 /// 802.1D user priority of an Ethernet frame, as Linux
@@ -153,24 +155,6 @@ fn legacy_rx_rate(payload: &[u8], status: LegacyDataStatus) -> bool {
         _ => return false,
     };
     rate & (0xf0 | (7 << 11)) == 0 && status.supported_rates & (1 << bit) != 0
-}
-
-pub(super) fn ap_disconnected(
-    mpdu: &scan_api::Mpdu<'_>,
-    local: [u8; 6],
-    status: LegacyDataStatus,
-) -> bool {
-    let f = mpdu.frame;
-    mpdu.channel == status.channel
-        && f.len() >= 24
-        && matches!(f[0], 0xa0 | 0xc0)
-        && f[1] & 0xc7 == 0
-        && f[4..10] == local
-        && f[10..16] == status.bssid
-        && f[16..22] == status.bssid
-        && f[22] & 15 == 0
-        && !mpdu.amsdu
-        && mpdu.body(24, 0).is_some_and(|b| b.len() == 2)
 }
 
 impl Owner {
@@ -323,6 +307,7 @@ impl Owner {
             replay: frame_api::Replay::default(),
             last_peer: narf_time::now_cycles(),
             aggregate: super::amsdu::Receiver::default(),
+            pmf: super::pmf::PmfRx::default(),
         });
         self.phase = Phase::PreparingData;
         let result = self.prepare_data_inner(&edca, &payload, &mut policy).await;
@@ -773,7 +758,22 @@ impl Owner {
                 self.clear_data_aggregate();
                 continue;
             }
-            if ap_disconnected(&mpdu, local, status) {
+            let data = self
+                .power
+                .prepared
+                .as_mut()
+                .unwrap()
+                .mlme
+                .data
+                .as_mut()
+                .unwrap();
+            if super::pmf::ap_disconnected(
+                &mpdu,
+                local,
+                status.bssid,
+                status.channel,
+                data.status.pmf.then_some(&mut data.pmf),
+            ) {
                 return Err("MVM current AP disconnected legacy station");
             }
             if f[0] == 0x80

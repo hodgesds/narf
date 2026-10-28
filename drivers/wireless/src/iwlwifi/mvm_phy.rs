@@ -350,7 +350,7 @@ impl super::Owner {
         ssid: &[u8],
         channel: u8,
         elements: &[u8],
-        secure: bool,
+        mode: SecurityMode,
     ) -> Result<(), &'static str> {
         if self.phase != super::Phase::Configured {
             return Err("MVM offer requires configured owner");
@@ -371,17 +371,7 @@ impl super::Owner {
         };
         let wmm = parameters(&bss.information_elements)?;
         let selected = wmm.is_some() && channel != 14 && self.supports_native_ht20();
-        self.station_plan(
-            &bss,
-            ssid,
-            if secure {
-                SecurityMode::Wpa2Psk
-            } else {
-                SecurityMode::Open
-            },
-            elements,
-            selected,
-        )?;
+        self.station_plan(&bss, ssid, mode, elements, selected)?;
         let ba = selected
             && narf_wireless::association::phy::ApElements::parse(&bss.information_elements)
                 .is_ok_and(|p| p.ht_capability().is_some())

@@ -340,6 +340,8 @@ pub struct IgtkKde {
     pub key_id: u16,
     /// IGTK material (16 bytes for BIP-CMAC-128).
     pub igtk: [u8; 16],
+    /// IGTK packet number (IPN) the receiver's BIP replay floor starts at.
+    pub ipn: u64,
 }
 
 /// Parse the IGTK KDE (§12.7.2, Figure 12-43) from a plaintext KDE
@@ -360,7 +362,11 @@ pub fn parse_igtk_kde(kde_data: &[u8]) -> Option<IgtkKde> {
             let key_id = u16::from_le_bytes([data[4], data[5]]);
             let mut igtk = [0u8; 16];
             igtk.copy_from_slice(&data[12..28]);
-            return Some(IgtkKde { key_id, igtk });
+            // IPN is little-endian like the BIP MMIE (IEEE 802.11-2020 12.7.2).
+            let mut ipn = [0u8; 8];
+            ipn[..6].copy_from_slice(&data[6..12]);
+            let ipn = u64::from_le_bytes(ipn);
+            return Some(IgtkKde { key_id, igtk, ipn });
         }
         pos += len;
     }
@@ -682,7 +688,8 @@ pub mod tests {
         ];
         kde.extend_from_slice(&igtk);
         match parse_igtk_kde(&kde) {
-            Some(parsed) if parsed.key_id == 4 && parsed.igtk == igtk => {}
+            Some(parsed)
+                if parsed.key_id == 4 && parsed.igtk == igtk && parsed.ipn == 0x0605_0403_0201 => {}
             _ => return TestResult::Fail("IGTK KDE not parsed correctly"),
         }
         // A GTK-only key-data stream yields no IGTK.
