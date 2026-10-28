@@ -33,6 +33,9 @@ const UNI_HIF_CTRL: u16 = 0x07;
 const OWN_RETRIES: usize = 10;
 /// `mt76_poll_msec_tick(.., 50, 1)` per LPCTL attempt.
 const OWN_POLL_MS: u64 = 50;
+/// WFDMA busy poll around the DMA_EN clear. Linux polls 1 ms; the bound is
+/// widened to a few scheduler ticks so one late poll is not a failure.
+const IDLE_POLL_MS: u64 = 10;
 /// `MCU_EXT_CMD_ID_RADIO_ON_OFF_CTRL` and its `EXT_CMD_RADIO_{ON,OFF}_LED`.
 const EXT_RADIO_ON_OFF_CTRL: u8 = 0x05;
 const RADIO_ON_LED: u8 = 0x2;
@@ -147,13 +150,17 @@ impl<B: Backend> Session<B> {
             &deep_sleep_config(true),
         )
         .await?;
-        self.wait(1, |backend| backend.idle().map(|idle| idle.then_some(())))
-            .await?;
+        self.wait(IDLE_POLL_MS, |backend| {
+            backend.idle().map(|idle| idle.then_some(()))
+        })
+        .await?;
         self.backend.suspend_dma()?;
         // Clearing DMA_EN after the busy poll must leave the engine idle
         // before ownership leaves the host.
-        self.wait(1, |backend| backend.idle().map(|idle| idle.then_some(())))
-            .await?;
+        self.wait(IDLE_POLL_MS, |backend| {
+            backend.idle().map(|idle| idle.then_some(()))
+        })
+        .await?;
         for _ in 0..OWN_RETRIES {
             self.backend.request_firmware_own()?;
             match self

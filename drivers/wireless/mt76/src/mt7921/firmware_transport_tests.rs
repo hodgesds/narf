@@ -783,7 +783,7 @@ impl Backend for Model {
                     }
                 } else if frame[24..26] != [3, 1] {
                     return Err(Error::Bounds);
-                } else if frame[27..29] == [37, 0] {
+                } else if matches!(frame[27..29], [37, 0] | [38, 0]) {
                     if frame[29] & !0x3e != 0 || frame[30..33] != [0; 3] {
                         return Err(Error::Bounds);
                     }

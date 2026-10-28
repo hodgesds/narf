@@ -862,6 +862,10 @@ fn mt76_wmm_classifies_all_user_priorities_onto_lmac_queues_and_downgrades_acm()
                 // First row (VO, ACI 3): set its ACM bit.
                 ies[at + 10] |= 0x10;
             }
+            // The response parameter set replaces the scan copy.
+            if let Some(reply) = session.backend.wmm_reply.as_mut() {
+                reply[10] |= 0x10;
+            }
         }
         if run(session.associate_station(&bss, b"narf", Security::Open, test_permission(), &[]))
             .is_err()

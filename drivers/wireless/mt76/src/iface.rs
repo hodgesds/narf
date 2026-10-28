@@ -1164,12 +1164,12 @@ mod tests {
             || !info.hw_caps.ht_supported
             || iface
                 .phy_capabilities(2400)
-                .is_none_or(|caps| caps.ht[..5] != [127, 1, 28, 255, 255] || caps.vht.is_some())
+                .is_none_or(|caps| caps.ht[..5] != [255, 1, 28, 255, 255] || caps.vht.is_some())
             || iface.phy_capabilities(6000).is_some()
             || !info.hw_caps.vht_supported
-            || iface
-                .phy_capabilities(5000)
-                .is_none_or(|caps| caps.vht != Some([48, 1, 0, 0, 250, 255, 0, 0, 250, 255, 0, 0]))
+            || iface.phy_capabilities(5000).is_none_or(|caps| {
+                caps.vht != Some([176, 113, 16, 0, 250, 255, 0, 0, 250, 255, 0, 32])
+            })
             || info.hw_caps.he_supported
             || info.hw_caps.eht_supported
             || !iface.supports_handshake_offload()
