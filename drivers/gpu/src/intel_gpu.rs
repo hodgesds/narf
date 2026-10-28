@@ -647,8 +647,8 @@ pub const DEVICE_TABLE: &[DeviceEntry] = &[
     },
     // Arrow Lake (Xe-LPG) — classified Generation::MeteorLake
     // (the silicon and both Linux drivers' binding), announced
-    // under its own name. Identify + announce only, exactly
-    // like the Meteor Lake rows above.
+    // under its own name. Display disposition is exactly the
+    // Meteor Lake rows' above (Xe-LPG display, #1016).
     DeviceEntry {
         name: "intel-gpu-arl-7D41",
         did: ARL_7D41,
@@ -2282,14 +2282,14 @@ pub mod tests {
             if info.generation != Generation::MeteorLake {
                 return TestResult::Fail("Arrow Lake must classify as MeteorLake (Xe-LPG)");
             }
-            // Current disposition: identify + announce only —
-            // no display programming, no Stage-0 region map,
-            // exactly like the Meteor Lake rows.
-            if info.generation.display_supported() {
-                return TestResult::Fail("Arrow Lake must not arm display programming");
+            // Disposition follows the Meteor Lake rows exactly:
+            // since #1016 that is the Xe-LPG display sequence and
+            // region map — never the Gen12 one.
+            if !info.generation.display_supported() {
+                return TestResult::Fail("Arrow Lake must arm the Xe-LPG display (#1016)");
             }
-            if info.generation.region_generation().is_some() {
-                return TestResult::Fail("Arrow Lake must not claim a Stage-0 region map");
+            if info.generation.region_generation() != Some(RegionGeneration::XeLpg) {
+                return TestResult::Fail("Arrow Lake must claim the Xe-LPG region map");
             }
         }
         // No bleed across the shared 0x7Dxx space: the sibling
