@@ -26,11 +26,12 @@ type ReceiveHook = Arc<dyn Fn(ReceivePoint) + Send + Sync>;
 struct State {
     rx: narf_ipc::Producer<Frame, RX_RING_N>,
     tx: narf_ipc::Consumer<Frame, TX_RING_N>,
-    pending: Option<Frame>,
+    /// Per-TID software queues (`ath_tx_queue_tid`); TID0 FIFO without N85Q.
+    pending: super::qos::Scheduler<Frame>,
 }
 impl State {
     fn clear(&mut self) {
-        self.pending = None;
+        self.pending.clear();
         for _ in 0..TX_RING_N {
             if !matches!(self.tx.try_recv(), Ok(Some(_))) {
                 break;
@@ -97,7 +98,7 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
             state: Mutex::new(State {
                 rx,
                 tx,
-                pending: None,
+                pending: super::qos::Scheduler::default(),
             }),
             name: name.into(),
             own,
@@ -245,30 +246,33 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
                 self.clear_rx();
                 return Ok(Vec::new());
             }
-            if state.pending.is_none() {
-                for _ in 0..16 {
-                    let Ok(Some(frame)) = state.tx.try_recv() else {
-                        break;
-                    };
-                    if station::admitted(frame.payload(), self.own) && offloads(frame.tx_meta()) {
-                        state.pending = Some(frame);
-                        break;
-                    }
+            // Classify into per-TID queues; the total stays within one TID's
+            // bound, so the IPC ring keeps backpressure and nothing drops.
+            for _ in 0..16 {
+                if state.pending.len() >= super::qos::PER_TID {
+                    break;
+                }
+                let Ok(Some(frame)) = state.tx.try_recv() else {
+                    break;
+                };
+                if station::admitted(frame.payload(), self.own) && offloads(frame.tx_meta()) {
+                    let tid = radio.transmit_tid(frame.payload());
+                    let _ = state.pending.push(tid, frame);
                 }
             }
             if radio.ready() {
-                if let Some(frame) = state.pending.take() {
+                if let Some((tid, frame)) = state.pending.pop() {
+                    // The measured two-MPDU sender aggregates BE/TID0 only.
+                    // Frames queued before N85Q activation are re-classified.
                     let mut second = None;
-                    if radio.can_aggregate() {
-                        for _ in 0..16 {
-                            let Ok(Some(next)) = state.tx.try_recv() else {
-                                break;
-                            };
-                            if station::admitted(next.payload(), self.own)
-                                && offloads(next.tx_meta())
-                            {
+                    if tid == 0 && radio.can_aggregate() && radio.transmit_tid(frame.payload()) == 0
+                    {
+                        if let Some(next) = state.pending.pop_tid(0) {
+                            let now = radio.transmit_tid(next.payload());
+                            if now == 0 {
                                 second = Some(next);
-                                break;
+                            } else {
+                                let _ = state.pending.push(now, next);
                             }
                         }
                     }

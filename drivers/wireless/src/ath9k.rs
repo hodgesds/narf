@@ -20,6 +20,7 @@ mod mac;
 mod packet;
 mod packet_native;
 mod phy;
+mod qos;
 mod rates;
 mod rx_ba;
 mod station;
@@ -28,6 +29,7 @@ pub use calibration::{Report as RadioCalibration, State as RadioState};
 pub use ht::Request as Ht20QualificationRequest;
 pub use identity::{BringUpError, Identity, EEPROM_4K_BYTES};
 pub use phy::Prepared as BasebandPrepared;
+pub use qos::Request as QosQualificationRequest;
 pub use rx_ba::Request as RxBaQualificationRequest;
 pub use tx_ba::Request as TxBaQualificationRequest;
 
@@ -70,6 +72,14 @@ pub struct Ath9k {
 }
 
 impl Ath9k {
+    /// Factual four-AC/eight-TID QoS request; no emission grant.
+    pub fn qos_qualification_request(&self) -> Result<QosQualificationRequest, BringUpError> {
+        self.station
+            .as_ref()
+            .and_then(|r| r.try_lock())
+            .and_then(|r| r.qos_request())
+            .ok_or(BringUpError::BadState)
+    }
     /// Factual sender-BA qualification request; no emission or agreement grant.
     pub fn tx_ba_qualification_request(&self) -> Result<TxBaQualificationRequest, BringUpError> {
         self.station

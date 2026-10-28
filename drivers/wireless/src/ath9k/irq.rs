@@ -152,6 +152,17 @@ pub(super) fn enable(port: &impl Port, ht: bool, msi: bool) -> Result<Mask, Erro
     Ok(mask)
 }
 
+/// `ah->intr_txqs` for the additional data QCUs once the N85Q program is
+/// active: TXDESC (IMR_S0) and TXEOL (IMR_S1) for QCU0..3.
+pub(super) fn data_queues(port: &impl Port) -> Result<(), Error> {
+    port.write(IMR_S0, 0xf << 16)?;
+    port.write(IMR_S1, 0xf << 16)?;
+    if port.read(IMR_S0)? != 0xf << 16 || port.read(IMR_S1)? != 0xf << 16 {
+        return Err(Error::Descriptor);
+    }
+    Ok(())
+}
+
 /// `__ath9k_hw_enable_interrupts`, including the bounded AR_PCIE_MSI re-arm.
 pub(super) fn resume(port: &impl Port, mask: Mask) -> Result<(), Error> {
     port.write(IER, 1)?;

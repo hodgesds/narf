@@ -82,6 +82,9 @@ pub(super) trait Port {
     fn rx_ba_grant(&self) -> Option<alloc::sync::Arc<super::rx_ba::Grant>> {
         None
     }
+    fn qos_grant(&self) -> Option<alloc::sync::Arc<super::qos::Grant>> {
+        None
+    }
     fn transmit_allowed(&self) -> Result<(), Error>;
     /// Actual CPU payload/descriptor access occurs in current device invocation.
     fn access<T>(
@@ -246,6 +249,7 @@ struct Pending {
     deadline: u64,
     original: Vec<u8>,
     dma: Vec<u8>,
+    queue: u64,
 }
 struct PairPending {
     slots: [usize; 2],
@@ -291,6 +295,7 @@ pub(super) struct Packet<P: Port> {
     ht: Option<super::ht::Profile>,
     slot_us: u32,
     edca: Option<u32>,
+    qos: Option<super::qos::Profile>,
     ba: bool,
     tx_ba: bool,
     reclaimed: bool,
@@ -369,6 +374,7 @@ impl<P: Port> Packet<P> {
             ht: None,
             slot_us: 20,
             edca: None,
+            qos: None,
             ba: false,
             tx_ba: false,
             reclaimed: false,
@@ -398,6 +404,10 @@ impl<P: Port> Packet<P> {
             if self.port.read(0x1040)? != word || self.port.read(0x10c0)? != 0 {
                 return Err(Error::Descriptor);
             }
+        }
+        if let Some(profile) = self.qos {
+            self.port.qos_grant().ok_or(Error::Access)?.check()?;
+            super::mac::check_data_queues(&self.port, &profile.words())?;
         }
         if self.ba {
             self.port
@@ -452,6 +462,54 @@ impl<P: Port> Packet<P> {
         }
         grant.readback(&self.port)?;
         self.tx_ba = true;
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    pub(super) fn qos_grant(&self) -> Option<alloc::sync::Arc<super::qos::Grant>> {
+        self.port.qos_grant()
+    }
+    pub(super) fn qos(&self) -> Option<super::qos::Profile> {
+        self.qos
+    }
+    /// `ath9k_conf_tx` for the three additional ACs on their own QCU/DCU,
+    /// under the measured N85Q program. BE/queue0 was already programmed by
+    /// [`Self::set_ht`] and must read back unchanged.
+    pub(super) fn enable_qos(
+        &mut self,
+        grant: &alloc::sync::Arc<super::qos::Grant>,
+        profile: super::qos::Profile,
+    ) -> Result<(), Error> {
+        if self.phase != Phase::Running
+            || self.ht.is_none()
+            || self.qos.is_some()
+            || self.pending.is_some()
+            || self.pair.is_some()
+            || self
+                .port
+                .qos_grant()
+                .is_none_or(|g| !alloc::sync::Arc::ptr_eq(&g, grant))
+            || self
+                .port
+                .ht_grant()
+                .is_none_or(|g| !alloc::sync::Arc::ptr_eq(&g, grant.base()))
+        {
+            return Err(Error::State);
+        }
+        let words = profile.words();
+        if self.edca != Some(words[0]) {
+            return Err(Error::Packet);
+        }
+        grant.check()?;
+        self.phase = Phase::Failed;
+        self.port.transmit_allowed()?;
+        for queue in 1..4u64 {
+            super::mac::data_queue(&self.port, queue, words[queue as usize])?;
+        }
+        if self.irq.is_some() {
+            super::irq::data_queues(&self.port)?;
+        }
+        super::mac::check_data_queues(&self.port, &words)?;
+        self.qos = Some(profile);
         self.phase = Phase::Running;
         Ok(())
     }
@@ -515,6 +573,11 @@ impl<P: Port> Packet<P> {
         }
         self.check_transmit()?;
         self.ht = Some(self.ht.ok_or(Error::State)?.observe(offer, ies, basic)?);
+        if let Some(profile) = self.qos {
+            if super::qos::Profile::parse(ies)? != profile {
+                return Err(Error::Packet);
+            }
+        }
         Ok(())
     }
     pub(super) fn set_peer(
@@ -624,8 +687,15 @@ impl<P: Port> Packet<P> {
         }
         let local = self.local;
         let profile = self.ht.ok_or(Error::State)?;
-        self.submit_inner(frame, |address| {
-            descriptor::transmit_ht(frame, local, address, mcs, basic, profile)
+        // QoS DATA leaves on its AC's QCU only under the N85Q program.
+        let tids = if self.qos.is_some() { 7 } else { 0 };
+        let queue = if self.qos.is_some() && frame.first() == Some(&0x88) && frame.len() > 24 {
+            super::qos::queue(frame[24] & 7)
+        } else {
+            0
+        };
+        self.submit_queue(frame, queue, |address| {
+            descriptor::transmit_ht_tid(frame, local, address, mcs, basic, profile, tids)
         })
     }
     pub(super) fn submit_sender_action(
@@ -784,6 +854,17 @@ impl<P: Port> Packet<P> {
         frame: &[u8],
         encode: impl FnOnce(u64) -> Result<[u32; WORDS], descriptor::Error>,
     ) -> Result<u64, Error> {
+        self.submit_queue(frame, 0, encode)
+    }
+    fn submit_queue(
+        &mut self,
+        frame: &[u8],
+        queue: u64,
+        encode: impl FnOnce(u64) -> Result<[u32; WORDS], descriptor::Error>,
+    ) -> Result<u64, Error> {
+        if queue != 0 && self.qos.is_none() || queue > 3 {
+            return Err(Error::State);
+        }
         if self.phase != Phase::Running {
             return Err(Error::State);
         }
@@ -797,7 +878,10 @@ impl<P: Port> Packet<P> {
         let dma = descriptor::dma_bytes(frame).map_err(|_| Error::Packet)?;
         self.phase = Phase::Failed;
         self.check_transmit()?;
-        if self.port.read(QTXE)? & 1 != 0 || self.port.read(QSTS)? & 3 != 0 {
+        if self.port.read(QTXE)? & 0xf != 0
+            || self.port.read(QSTS)? & 3 != 0
+            || self.qos.is_some() && !self.data_queues_idle()?
+        {
             // No Pending owner exists here. A live queue is ambiguous DMA,
             // not reusable credit after restoring a policy or status word.
             return Err(Error::Descriptor);
@@ -826,14 +910,16 @@ impl<P: Port> Packet<P> {
             deadline,
             original: frame.to_vec(),
             dma,
+            queue,
         });
+        let txdp = QTXDP + queue * 4;
         self.port
-            .write(QTXDP, storage.tx.address() + (slot * STRIDE) as u32)?;
-        if self.port.read(QTXDP)? != storage.tx.address() + (slot * STRIDE) as u32 {
+            .write(txdp, storage.tx.address() + (slot * STRIDE) as u32)?;
+        if self.port.read(txdp)? != storage.tx.address() + (slot * STRIDE) as u32 {
             return Err(Error::Descriptor);
         }
         self.port.transmit_allowed()?;
-        self.port.write(QTXE, 1)?;
+        self.port.write(QTXE, 1 << queue)?;
         self.phase = Phase::Running;
         Ok(id)
     }
@@ -877,7 +963,9 @@ impl<P: Port> Packet<P> {
                 }
                 return Ok(None);
             }
-            if self.port.read(QTXE)? & 1 != 0 || self.port.read(QSTS)? & 3 != 0 {
+            if self.port.read(QTXE)? & (1 << pending.queue) != 0
+                || self.port.read(QSTS + pending.queue * 4)? & 3 != 0
+            {
                 if self.port.now_us() >= pending.deadline {
                     return Err(Error::Timeout);
                 }
@@ -1066,6 +1154,15 @@ impl<P: Port> Packet<P> {
             self.port.delay_us(10);
         }
         Err(Error::Timeout)
+    }
+    /// The additional data QCUs (1..3) have no pending frame.
+    fn data_queues_idle(&self) -> Result<bool, Error> {
+        for queue in 1..4 {
+            if self.port.read(QSTS + queue * 4)? & 3 != 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
     /// `mac.c::ath9k_hw_numtxpending(q) == 0`.
     fn tx_idle(&self, queue: u64) -> Result<bool, Error> {

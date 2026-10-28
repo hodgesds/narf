@@ -100,6 +100,8 @@ pub(in crate::ath9k) struct Peer {
     pub(in crate::ath9k) sender_delbas: Vec<Vec<u8>>,
     sender_reorder: Option<narf_wireless::reorder::Reorder<Vec<u8>>>,
     rx_sequence: u16,
+    /// Accept uplink QoS TIDs 0..7 (N85Q); otherwise only TID0.
+    pub(in crate::ath9k) qos_tids: bool,
 }
 impl Peer {
     pub(in crate::ath9k) fn new_rates(protected: bool, rates: Option<&[u8]>) -> Self {
@@ -159,6 +161,7 @@ impl Peer {
             sender_delbas: Vec::new(),
             sender_reorder: None,
             rx_sequence: 0,
+            qos_tids: false,
         }
     }
     pub(in crate::ath9k) fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
@@ -420,7 +423,7 @@ impl Peer {
             return Err("native AP data protection/direction");
         }
         let h = if frame[0] == 0x88 { 26 } else { 24 };
-        if h == 26 && frame[24..26] != [0, 0] {
+        if h == 26 && (frame[25] != 0 || frame[24] > if self.qos_tids { 7 } else { 0 }) {
             return Err("native AP QoS TID/header");
         }
         let mut body = frame[h..].to_vec();
@@ -437,7 +440,7 @@ impl Peer {
                 &Ccm,
                 &frame[..h],
                 key,
-                0,
+                if h == 26 { frame[24] & 15 } else { 0 },
                 false,
                 if h == 26 {
                     &mut self.qos_replay[usize::from(frame[24] & 15)]

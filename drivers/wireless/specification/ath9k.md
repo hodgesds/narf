@@ -10,6 +10,8 @@
 > implemented with ten new native smokes passing the coordinated validation
 > on both architectures. AR2427 (`168c:002c`, AR9285 silicon with HT bonded
 > out) shares the legacy owner with every HT/BA source closed.
+> The optional measured `N85Q` continuation (§3.4) adds four-AC EDCA on
+> QCU0..3 and eight-TID classification/scheduling on the same owner.
 
 ## 1. Purpose & scope
 
@@ -432,6 +434,75 @@ The ten new cases passed in the coordinated scoped Wi-Fi suites: x86_64
 2360 pass,0 fail,9 skip; aarch64 1890 pass,0 fail,3 skip. Production boots and
 all btrfs postflights were clean. Physical N85T/BAR qualification remains open.
 
+### 3.4 Optional measured four-AC EDCA and eight-TID scheduling
+
+`Ath9k::qos_qualification_request()` returns factual `identity`, `mac` and
+external `filename` (`ath9k/ar9285-qos-v1-<twelve lowercase MAC hex
+digits>.bin`) derived from the retained `N85H` grant; it grants nothing and
+no asset or measurement is checked in. The request hashes the exact `N85H`
+identity and signed-body digest, the classification/downgrade rules, the
+QCU/DCU recipe, the single-in-flight host scheduler and the full static
+envelope including every AC's contention, retry and automatic-response peak.
+
+The little-endian 96-byte v1 body has `N85Q`, version:u16=1, header:u16=96,
+length:u32=96 at 0; vendor:u16=0x168c/device:u16=0x002b at 12; request
+identity[32] at 16; MAC[6] at 48; primary1/width20/chain1/AC count4 at 54;
+measured all-AC conducted peak:i16 half-dBm at 58; TID count:u8=8 at 60;
+starvation bound:u8=8 at 61; board ceiling:i16 half-dBm at 62; reserved[32]=0
+at 64. The peak plus the base antenna bound must fit this ceiling, the base
+ceiling and every current overlapping host rule at every native access
+(`qos::Grant::invoke` nests inside the `N85H`/BA invocations).
+
+Linux behaviour followed:
+
+- Classification: `net/wireless/util.c::cfg80211_classify8021d` (RFC 8325
+  DSCP table, IPv6 traffic class, MPLS TC, 802.21 = 7; no QoS Map/VLAN input
+  exists natively) and `net/mac80211/wme.c::ieee80211_downgrade_queue`
+  (ACM-marked ACs step VO->VI->BE->BK without an admitted TSPEC).
+- Queues: `init.c::ath9k_init_queues` sets up one DATA QCU per AC and
+  `hw.c::ath9k_hw_init_queues` writes `AR_DQCUMASK(q) = 1 << q`;
+  `main.c::ath9k_conf_tx` -> `xmit.c::ath_txq_update` ->
+  `mac.c::ath9k_hw_resettxqueue` programs `AR_DLCL_IFS` (CWmin/CWmax/AIFS),
+  `AR_DRETRY_LIMIT`, `AR_QMISC` (DCU early termination) and `AR_DMISC`
+  (CW backoff, frag wait, threshold 2) from the AP's WMM parameters.
+  NARF keeps BE on its original QCU0 owner, uses Linux's VI=1 and BK=3
+  indices and places VO on the free QCU2. Retry limits match queue0.
+  `AR_DCHNTIME` stays 0: Linux programs `txop * 32` us, but each NARF QCU
+  holds one MPDU per access, which stays within any advertised TXOP limit.
+- Scheduling: Linux `xmit.c::ath_tx_queue_tid`/`ath_txq_schedule` keep
+  per-TID software queues drained per hardware queue and let the DCUs
+  contend. The NARF owner keeps exactly one native PPDU in flight across all
+  QCUs (the existing terminal TxDone + queue-idle proof), so the host
+  `qos::Scheduler` serves the highest backlogged AC (VO, VI, BE, BK), serves
+  any AC passed over 8 consecutive times first, and alternates the two TIDs of
+  an AC. Its total backlog stays within one TID's 16-frame bound, so the IPC
+  ring retains backpressure and nothing is dropped. Without the grant every
+  frame is TID0 and the scheduler is the original FIFO.
+
+The successful association response must carry a complete WMM Parameter
+element: BE keeps the §3.1 rules (no ACM, TXOP 0, no U-APSD) and must equal
+the programmed queue0 word; every AC needs AIFSN 2..15 and CWmin<=CWmax<=1023.
+An invalid non-BE AC leaves the qualified BE-only owner unchanged (no queue
+is programmed). `Packet::enable_qos` programs QCU1..3, opens IMR_S0/S1
+TXDESC/TXEOL for QCU0..3 when MSI is armed and reads every data DCU back;
+the same readback gates each later transmit. A later beacon whose WMM
+parameters differ closes the owner, as BE changes already did.
+
+Open QoS DATA uses the existing independent per-TID sequence counters;
+secured QoS uses the shared per-TID sequence owner, and the QoS control TID
+is the classified user priority. The two-MPDU sender BA (§3.3) still owns
+BE/TID0 only: the interface pairs only TID0 frames and `send_pair` refuses any
+other TID. Management, EAPOL, BA control and BAR stay on queue0.
+Teardown is the §4 stop proof, which already aborts and polls all ten QCUs;
+a frame held on QCU2 is reclaimed and a wedged DCU pins every mapping.
+Covered by `smoke_ar9285_qos_classify_downgrade_and_scheduler_order`,
+`smoke_ar9285_qos_signed_contract_and_missing_source_keeps_be_queue0`,
+`smoke_ar9285_qos_native_four_ac_program_tids_and_queues` and
+`smoke_ar9285_qos_teardown_revocation_and_invalid_ac_fallback`; the
+filtered `drivers/wireless/ath9k` kernel-test suites report 112 pass, 0 fail,
+0 skip on both x86_64 and aarch64. Physical N85Q qualification and over-air
+EDCA behaviour are unmeasured.
+
 The former reset-only `Ath9k::new` constructor is removed. Construction
 goes through the PCI authority and identification path. Successful probe
 records hardware identity and then programs Linux's AR9285 2GHz HT20
@@ -598,9 +669,9 @@ profile are implemented. Hardware testing requires an exact EEPROM-bearing
 device, authenticated deployment policy and measured RF/calibration acceptance.
 No RF or AP interoperability has been demonstrated by the model tests.
 
-Broader live channels/retuning, factory profiles, periodic calibration,
-HT40/SGI40, larger TX aggregates, TX A-MSDU and additional AC/TID scheduling
-require separate continuations.
+Additional AC/TID scheduling is implemented in §3.4. Broader live
+channels/retuning, factory profiles, periodic calibration, HT40/SGI40,
+larger TX aggregates and TX A-MSDU require separate continuations.
 
 Interrupt-driven service (`irq.rs`) follows Linux `pci.c` with
 `ath9k_use_msi`: one MSI vector is discovered, programmed and installed with

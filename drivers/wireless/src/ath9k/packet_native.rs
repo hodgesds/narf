@@ -18,6 +18,7 @@ pub(super) struct Native {
     ht_facts: Option<super::ht::Facts>,
     ba: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::rx_ba::Grant>>>,
     tx_ba: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::tx_ba::Grant>>>,
+    qos: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::qos::Grant>>>,
     msi: narf_lib::sync::IrqSafeSpinLock<Option<Msi>>,
 }
 /// Single MSI vector (Linux `ath9k_use_msi` + `pci_enable_msi`). The handler
@@ -79,6 +80,7 @@ impl Native {
             ht_facts: None,
             ba: narf_lib::sync::IrqSafeSpinLock::new(None),
             tx_ba: narf_lib::sync::IrqSafeSpinLock::new(None),
+            qos: narf_lib::sync::IrqSafeSpinLock::new(None),
             msi: narf_lib::sync::IrqSafeSpinLock::new(None),
         })
     }
@@ -257,6 +259,14 @@ narf_kernel_test::kernel_test_in!(
     smoke_ar9285_native_packet_revocation_precedes_config_dma_and_mmio
 );
 impl Port for Native {
+    fn qos_grant(&self) -> Option<alloc::sync::Arc<super::qos::Grant>> {
+        if let Some(g) = self.qos.lock().clone() {
+            return Some(g);
+        }
+        let grant = super::qos::Source::Registered.load(self.ht_grant()?).ok()?;
+        let mut retained = self.qos.lock();
+        Some(retained.get_or_insert(grant).clone())
+    }
     fn tx_ba_grant(&self) -> Option<alloc::sync::Arc<super::tx_ba::Grant>> {
         if let Some(g) = self.tx_ba.lock().clone() {
             return Some(g);
@@ -337,12 +347,20 @@ impl Port for Native {
             let grant = { self.ht.lock().clone() };
             let ba = { self.ba.lock().clone() };
             let tx = { self.tx_ba.lock().clone() };
+            let qos = { self.qos.lock().clone() };
             let operation = || match (ba, grant) {
                 (Some(g), _) => g.invoke(operation),
                 (None, Some(g)) => g.invoke(operation),
                 (None, None) => operation(),
             };
-            if let Some(g) = tx {
+            let operation = || {
+                if let Some(g) = tx {
+                    g.invoke(operation)
+                } else {
+                    operation()
+                }
+            };
+            if let Some(g) = qos {
                 g.invoke(operation)
             } else {
                 operation()

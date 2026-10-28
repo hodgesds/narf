@@ -75,6 +75,10 @@ pub(in crate::ath9k) struct Model {
     pub(in crate::ath9k) ht: RefCell<Option<Arc<crate::ath9k::ht::Grant>>>,
     pub(in crate::ath9k) ba: RefCell<Option<Arc<crate::ath9k::rx_ba::Grant>>>,
     pub(in crate::ath9k) tx_ba: RefCell<Option<Arc<crate::ath9k::tx_ba::Grant>>>,
+    pub(in crate::ath9k) qos: RefCell<Option<Arc<crate::ath9k::qos::Grant>>>,
+    /// QCU of the in-flight submission, and every submitted QCU in order.
+    pub(in crate::ath9k) tx_queue: Cell<u64>,
+    pub(in crate::ath9k) queues: RefCell<Vec<u64>>,
     pub(in crate::ath9k) ht_rate: Cell<u8>,
     pub(in crate::ath9k) rx_aggr: Cell<u32>,
     pub(in crate::ath9k) dma_transmitted: RefCell<Vec<Vec<u8>>>,
@@ -130,6 +134,9 @@ impl Model {
             ht: RefCell::new(None),
             ba: RefCell::new(None),
             tx_ba: RefCell::new(None),
+            qos: RefCell::new(None),
+            tx_queue: Cell::new(0),
+            queues: RefCell::new(Vec::new()),
             ht_rate: Cell::new(0x80),
             rx_aggr: Cell::new(0),
             dma_transmitted: RefCell::new(Vec::new()),
@@ -244,7 +251,9 @@ impl Model {
         self.put(tail + 60, u32::from(success))?;
         self.put(tail + 92, done)?;
         self.registers.borrow_mut().insert(QTXE, 0);
-        self.registers.borrow_mut().insert(QSTS, 0);
+        self.registers
+            .borrow_mut()
+            .insert(QSTS + self.tx_queue.get() * 4, 0);
         self.tx.set(None);
         self.pair_tail.set(None);
         self.bar_reply.borrow_mut().take();
@@ -330,6 +339,9 @@ impl Model {
     }
 }
 impl Port for Arc<Model> {
+    fn qos_grant(&self) -> Option<Arc<crate::ath9k::qos::Grant>> {
+        self.qos.borrow().clone()
+    }
     fn tx_ba_grant(&self) -> Option<Arc<crate::ath9k::tx_ba::Grant>> {
         self.tx_ba.borrow().clone()
     }
@@ -387,6 +399,9 @@ impl Port for Arc<Model> {
         if let Some(g) = self.ht_grant() {
             g.check()?;
         }
+        if let Some(g) = self.qos_grant() {
+            g.check()?;
+        }
         Ok(*self.registers.borrow().get(&reg).unwrap_or(&0))
     }
     fn write(&self, reg: u64, value: u32) -> Result<(), Error> {
@@ -398,6 +413,9 @@ impl Port for Arc<Model> {
             g.check()?;
         }
         if let Some(g) = self.ht_grant() {
+            g.check()?;
+        }
+        if let Some(g) = self.qos_grant() {
             g.check()?;
         }
         if self.ignore.get() == Some(reg) {
@@ -412,11 +430,14 @@ impl Port for Arc<Model> {
                 self.cursor.set(self.word(last)?);
             }
         }
-        if reg == QTXE && value == 1 {
+        if reg == QTXE && value.count_ones() == 1 && value & 0xf != 0 {
             if !self.master.get() || !self.allowed.get() {
                 return Err(Error::Access);
             }
-            let descriptor = self.read(QTXDP)?;
+            let queue = u64::from(value.trailing_zeros());
+            self.tx_queue.set(queue);
+            self.queues.borrow_mut().push(queue);
+            let descriptor = self.read(QTXDP + queue * 4)?;
             let tail = self.word(descriptor)?;
             if tail != 0
                 && (self.word(tail)? != 0
@@ -432,7 +453,7 @@ impl Port for Arc<Model> {
                 self.last_pair.set(Some((descriptor, tail)));
             }
             self.tx.set(Some(descriptor));
-            self.registers.borrow_mut().insert(QSTS, 1);
+            self.registers.borrow_mut().insert(QSTS + queue * 4, 1);
             let reaction = { self.reaction.borrow().clone() };
             let mut held = reaction.is_none() || tail != 0 && self.hold_pair.get();
             let mut ack = true;
@@ -495,7 +516,9 @@ impl Port for Arc<Model> {
         if reg == QTXD && value & 1 != 0 && !self.stuck_tx.get() {
             // Disabled DCU: the in-flight descriptor is abandoned unsent.
             self.registers.borrow_mut().insert(QTXE, 0);
-            self.registers.borrow_mut().insert(QSTS, 0);
+            self.registers
+                .borrow_mut()
+                .insert(QSTS + self.tx_queue.get() * 4, 0);
             self.tx.set(None);
             self.pair_tail.set(None);
         }
