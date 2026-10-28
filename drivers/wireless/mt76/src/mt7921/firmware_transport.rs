@@ -1132,6 +1132,7 @@ struct Session<B: Backend> {
     ht20_rx: Option<amsdu::Receiver>,
     ht20_profile: Option<crate::mt7921::ht20::Profile>,
     vht_profile: Option<crate::mt7921::vht::Profile>,
+    he_profile: Option<crate::mt7921::he::Profile>,
     ap_phy: Option<narf_wireless::association::phy::ApElements>,
     control_pending: VecDeque<Vec<u8>>,
     rx_ba: ba::Owner,
@@ -1163,6 +1164,7 @@ impl<B: Backend> Session<B> {
             ht20_rx: None,
             ht20_profile: None,
             vht_profile: None,
+            he_profile: None,
             ap_phy: None,
             control_pending: VecDeque::new(),
             rx_ba: ba::Owner::default(),
@@ -1383,6 +1385,7 @@ impl<B: Backend> Session<B> {
         self.ht20_rx = None;
         self.ht20_profile = None;
         self.vht_profile = None;
+        self.he_profile = None;
         self.ap_phy = None;
         self.received_msdu.clear();
         self.rx_fragments.clear();

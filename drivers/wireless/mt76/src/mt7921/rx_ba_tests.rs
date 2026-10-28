@@ -43,6 +43,9 @@ fn delba(tid: u8) -> Vec<u8> {
     wrap(&frame, 6)
 }
 fn data(tid: u8, sequence: u16, pn: Option<u64>, value: u8) -> Vec<u8> {
+    data_on(6, tid, sequence, pn, value)
+}
+pub(super) fn data_on(channel: u8, tid: u8, sequence: u16, pn: Option<u64>, value: u8) -> Vec<u8> {
     let ethernet = super::amsdu_rx_tests::ethernet(value, 3);
     let mut frame = vec![0; 26];
     frame[..2].copy_from_slice(&[0x88, if pn.is_some() { 0x42 } else { 2 }]);
@@ -63,7 +66,7 @@ fn data(tid: u8, sequence: u16, pn: Option<u64>, value: u8) -> Vec<u8> {
     };
     packet[4..8].copy_from_slice(&r1.to_le_bytes());
     packet[8..12].copy_from_slice(&(u32::from(tid) << 16).to_le_bytes()); // AMPDU; native TID.
-    packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
+    packet[12..16].copy_from_slice(&(u32::from(channel) << 8).to_le_bytes());
     if let Some(pn) = pn {
         packet[24..30].copy_from_slice(&pn.to_le_bytes()[..6]);
     }
@@ -94,7 +97,7 @@ fn establish(
 ) -> Result<(), &'static str> {
     establish_window(session, tid, ssn, timeout, 32)
 }
-fn establish_window(
+pub(super) fn establish_window(
     session: &mut Session<Model>,
     tid: u8,
     ssn: u16,

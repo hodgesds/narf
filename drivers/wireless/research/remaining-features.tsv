@@ -129,7 +129,6 @@ mt76	associated_active_scan	Active scanning while associated	feature	drivers/wir
 mt76	colocated_6ghz_scan	Colocated 6 GHz scanning	feature	drivers/wireless/specification/mt7921.md	132
 mt76	country_wmm_constraints	Country-specific WMM constraints	feature	drivers/wireless/specification/mt7921.md	1100
 mt76	fragmentation	TX fragmentation under a configured wiphy fragmentation threshold (RX defragmentation implemented)	feature	drivers/wireless/specification/mt7921.md	1104
-mt76	he_phy	HE PHY operation	feature	drivers/wireless/specification/mt7921.md	1093
 mt76	loadable_packet_abi	Loadable wireless packet ABI	feature	drivers/wireless/specification/mt7921.md	1096
 mt76	midstream_tx_ba_restart	Midstream transmit BA restart	feature	drivers/wireless/specification/mt7921.md	1103
 mt76	monitor_mode	Monitor mode (mac80211 MONITOR + WANT_MONITOR_VIF)	feature	drivers/wireless/specification/mt7921.md	1148
@@ -141,7 +140,6 @@ mt76	other_tx_ba_tids	Transmit BA on TIDs beyond retained TID0	feature	drivers/w
 mt76	p2p_mode	P2P client / GO / device roles	feature	drivers/wireless/specification/mt7921.md	1148
 mt76	per_domain_iommu	Per-domain IOMMU mappings	feature	drivers/wireless/specification/mt7921.md	1069
 mt76	pmf	Protected management frames (PMF)	feature	drivers/wireless/specification/mt7921.md	1093
-mt76	rx_ba_windows_above_64	Recipient BA windows above 64 (HE-peer only; mac80211 caps non-HE at 64)	feature	drivers/wireless/specification/mt7921.md	1155
 mt76	six_ghz_operation	6 GHz radio operation	feature	drivers/wireless/specification/mt7921.md	1093
 mt76	tspec	TSPEC admission	feature	drivers/wireless/specification/mt7921.md	1103
 mt76	uapsd	U-APSD	feature	drivers/wireless/specification/mt7921.md	1103

@@ -6,9 +6,12 @@ use alloc::{collections::VecDeque, vec, vec::Vec};
 pub(super) const TIDS: usize = 8; // Native STA_REC_BA.ba_en is one octet.
 
 // CONNAC2 WTBL/STA_REC_BA carry the actual16-bit window, without CONNAC1's
-// discrete range index. Retain an HT-sized64 MPDU host bound; wider HE/EHT
-// agreements require separate negotiated profiles.
-const MAX_WINDOW: u16 = 64;
+// discrete range index. mac80211 agg-rx.c bounds a non-HE peer at
+// IEEE80211_MAX_AMPDU_BUF_HT (64) and an HE peer at IEEE80211_MAX_AMPDU_BUF_HE
+// (256, also mt792x's max_rx_aggregation_subframes); EHT/MLO is not admitted.
+pub(super) const HT_WINDOW: u16 = 64;
+pub(super) const HE_WINDOW: u16 = crate::mt7921::he::MAX_AMPDU_BUF_HE;
+const MAX_WINDOW: u16 = HE_WINDOW;
 const MAX_READY: usize = TIDS * MAX_WINDOW as usize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,7 +24,9 @@ pub(super) struct Request {
     pub amsdu: bool,
 }
 impl Request {
-    pub fn parse(frame: &[u8]) -> Option<Self> {
+    /// `limit` is the peer's mac80211 `max_buf_size`: `HE_WINDOW` for a
+    /// negotiated HE peer, otherwise `HT_WINDOW`.
+    pub fn parse(frame: &[u8], limit: u16) -> Option<Self> {
         if frame.len() != 33 || frame[24..26] != [3, 0] {
             return None;
         }
@@ -32,10 +37,13 @@ impl Request {
         if parameters & 2 == 0 || usize::from(tid) >= TIDS || sequence & 15 != 0 {
             return None;
         }
+        if !matches!(limit, HT_WINDOW | HE_WINDOW) {
+            return None;
+        }
         let window = if requested == 0 {
-            MAX_WINDOW
+            limit
         } else {
-            requested.min(MAX_WINDOW)
+            requested.min(limit)
         };
         Some(Self {
             dialog: frame[26],

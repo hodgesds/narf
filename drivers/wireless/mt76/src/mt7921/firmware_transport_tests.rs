@@ -19,6 +19,8 @@ mod amsdu_rx_tests;
 mod dynamic_wmm_tests;
 #[path = "greenfield_tests.rs"]
 mod greenfield_tests;
+#[path = "he_tests.rs"]
+mod he_tests;
 #[path = "ht20_tests.rs"]
 mod ht20_tests;
 #[path = "ht40_tests.rs"]
@@ -519,6 +521,7 @@ impl Backend for Model {
                     || cmd == 0x5d
                     || cmd == 0x1b
                     || cmd == 0x1d
+                    || cmd == 0xb0
                     || cmd == 3 && self.scan_stall)
                 {
                     self.replies.push_back(reply);
@@ -797,7 +800,7 @@ impl Backend for Model {
                     let tid = ((parameters >> 2) & 15) as u8;
                     if parameters & 2 == 0
                         || tid >= 8
-                        || !(1..=64).contains(&window)
+                        || !(1..=256).contains(&window) // HE peers: IEEE80211_MAX_AMPDU_BUF_HE
                         || !self.frames.iter().any(|(_, f)| {
                             f.len() == 68
                                 && f[34..36] == [3, 0]

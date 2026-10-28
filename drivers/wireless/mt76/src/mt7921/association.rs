@@ -67,6 +67,7 @@ pub struct JoinPlan {
     wmm_association: Vec<u8>,
     ht20: Option<super::ht20::Profile>,
     vht: Option<super::vht::Profile>,
+    he: Option<super::he::Profile>,
     ap_phy: Option<narf_wireless::association::phy::ApElements>,
 }
 impl core::ops::Deref for JoinPlan {
@@ -135,6 +136,7 @@ impl JoinPlan {
             wmm_association: Vec::new(),
             ht20: None,
             vht: None,
+            he: None,
             ap_phy: None,
         })
     }
@@ -164,9 +166,14 @@ impl JoinPlan {
             && wmm.is_some()
             && ap.vht_capability().is_some()
         {
-            let candidate =
-                ManagementPlan::prepare_with_phy(bss, own, ssid, mode, super::vht::local(info)?)
-                    .map_err(|_| NativeError::UnsupportedFirmware)?;
+            let candidate = ManagementPlan::prepare_with_phy(
+                bss,
+                own,
+                ssid,
+                mode,
+                super::he::with_he(super::vht::local(info)?, info, true, true)?,
+            )
+            .map_err(|_| NativeError::UnsupportedFirmware)?;
             if candidate.offered_phy().is_some_and(|offer| {
                 permission.vht_available()
                     && offer
@@ -181,7 +188,7 @@ impl JoinPlan {
                     own,
                     ssid,
                     mode,
-                    super::vht::local80(info)?,
+                    super::he::with_he(super::vht::local80(info)?, info, true, false)?,
                 )
                 .map_err(|_| NativeError::UnsupportedFirmware)?;
                 if narrow.offered_phy().is_some_and(|offer| {
@@ -204,14 +211,15 @@ impl JoinPlan {
                 }
             }
         } else if info.capabilities.phy.ht && wmm.is_some() && ap.ht_capability().is_some() {
-            ManagementPlan::prepare_with_phy(
-                bss,
-                own,
-                ssid,
-                mode,
-                super::vht::ht_fallback(info, permission.native_width() != 0)?,
-            )
-            .map_err(|_| NativeError::UnsupportedFirmware)?
+            let local = super::vht::ht_fallback(info, permission.native_width() != 0)?;
+            // mt7921_init_he_caps also registers 2.4GHz HE on the HT companion.
+            let local = if bss.channel <= 14 {
+                super::he::with_he(local, info, false, false)?
+            } else {
+                local
+            };
+            ManagementPlan::prepare_with_phy(bss, own, ssid, mode, local)
+                .map_err(|_| NativeError::UnsupportedFirmware)?
         } else {
             ManagementPlan::prepare(bss, own, ssid, mode)
                 .map_err(|_| NativeError::UnsupportedFirmware)?
@@ -225,6 +233,7 @@ impl JoinPlan {
             wmm_association: Vec::new(),
             ht20: None,
             vht: None,
+            he: None,
             ap_phy: None,
         };
         if permission.native_width() >= super::cmd::CH_BW_80
@@ -356,6 +365,17 @@ impl JoinPlan {
                 self.ht20 = Some(super::ht20::Profile::from_shared(n.ht(), profile.width()));
                 self.vht = Some(profile);
             }
+            self.he = if n.he().is_some() {
+                match super::he::Profile::negotiated(n, &bytes[30..], self.channel > 14) {
+                    Ok(profile) => Some(profile),
+                    Err(_) => {
+                        self.cancel();
+                        return Err(Error::Protocol);
+                    }
+                }
+            } else {
+                None
+            };
             self.ap_phy = Some(narf_wireless::association::phy::ApElements::parse(
                 &bytes[30..],
             )?);
@@ -376,6 +396,7 @@ impl JoinPlan {
         self.wmm = None;
         self.ht20 = None;
         self.vht = None;
+        self.he = None;
         self.ap_phy = None;
         self.wmm_association.clear();
         self.common.cancel();
@@ -385,6 +406,9 @@ impl JoinPlan {
     }
     pub(crate) fn vht(&self) -> Option<super::vht::Profile> {
         self.vht
+    }
+    pub(crate) fn he(&self) -> Option<super::he::Profile> {
+        self.he
     }
     pub(crate) fn ap_phy(&self) -> Option<narf_wireless::association::phy::ApElements> {
         self.ap_phy
@@ -496,6 +520,14 @@ impl JoinPlan {
             out[amsdu + 5] = u8::from(max_amsdu >= 7991);
             out[amsdu + 6] = 1;
             out[2] += 1;
+            // mt76_connac_mcu_sta_tlv: STA_REC_HE and STA_REC_HE_V2 after
+            // HW_AMSDU, and PHY_TYPE_BIT_HE (get_phy_mode_v2) for an HE peer.
+            if let Some(he) = self.he {
+                out[phy + 6] |= super::he::PHY_TYPE_BIT_HE;
+                out.extend_from_slice(&he.sta());
+                out.extend_from_slice(&he.sta_v2());
+                out[2] += 2;
+            }
         }
         Ok(out)
     }

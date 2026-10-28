@@ -54,6 +54,7 @@ pub mod regs;
 pub(crate) mod tx_priority;
 pub mod txrx;
 pub(crate) mod vht;
+pub(crate) mod he;
 
 pub use pci::{
     firmware_blobs_for, l1_remap, name_for, probe, register_pci_driver, Mt7921Device, ProbeError,

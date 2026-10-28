@@ -594,6 +594,7 @@ impl<B: Backend> Session<B> {
             self.ht20_rx = None;
             self.ht20_profile = None;
             self.vht_profile = None;
+            self.he_profile = None;
             self.ap_phy = None;
             self.rx_ba.fence();
             self.tx_ba.fence();
@@ -670,8 +671,24 @@ impl<B: Backend> Session<B> {
                 self.clear_aggregate_receive();
                 continue;
             }
+            // HE P-RXV modes (8..11) are admitted only by a negotiated HE
+            // profile; every other mode keeps the HT/VHT checks below.
+            let he_ppdu = native
+                .phy
+                .filter(|v| (8..=11).contains(&((v >> 24) & 15)))
+                .map(|v| {
+                    self.he_profile.is_some_and(|he| {
+                        crate::mt7921::he::receive_allowed(he.width(), v, he.rx_limits())
+                    })
+                });
+            if he_ppdu == Some(false) {
+                self.clear_aggregate_receive();
+                continue;
+            }
             if let Some(profile) = self.vht_profile {
-                if native.frame.len() > 3895 || !profile.receive_allowed(native.phy) {
+                if native.frame.len() > 3895
+                    || he_ppdu.is_none() && !profile.receive_allowed(native.phy)
+                {
                     self.clear_aggregate_receive();
                     continue;
                 }
@@ -696,6 +713,7 @@ impl<B: Backend> Session<B> {
             }
             if let Some(ap) = self.ap_phy {
                 if self.vht_profile.is_none()
+                    && he_ppdu.is_none()
                     && !crate::mt7921::vht::receive_allowed(
                         u8::from(
                             self.ht20_profile
@@ -1014,6 +1032,7 @@ impl<B: Backend> Session<B> {
         self.ht20_rx = None;
         self.ht20_profile = None;
         self.vht_profile = None;
+        self.he_profile = None;
         self.ap_phy = None;
         self.rx_ba.fence();
         self.tx_ba.fence();
@@ -1202,6 +1221,7 @@ impl<B: Backend> Session<B> {
         self.ht20_rx = None;
         self.ht20_profile = None;
         self.vht_profile = None;
+        self.he_profile = None;
         self.ap_phy = None;
         self.control_pending.clear();
         self.received_msdu.clear();
@@ -1373,6 +1393,20 @@ impl<B: Backend> Session<B> {
                 .await?;
                 self.confirm_command_progress().await?;
                 self.check_station_tx()?;
+                // mt7921_mcu_set_tx: SET_MU_EDCA_PARMS follows SET_EDCA_PARMS
+                // whenever he_support is set (no firmware reply either).
+                if let Some(he) = plan.he() {
+                    self.notify(
+                        Command::Ce {
+                            id: crate::mt7921::he::SET_MU_EDCA_PARMS,
+                            query: false,
+                        },
+                        &he.mu_edca_request(true),
+                    )
+                    .await?;
+                    self.confirm_command_progress().await?;
+                    self.check_station_tx()?;
+                }
             }
             let mut bss_record = crate::mt7921::association::bss_record_ht20(
                 bss,
@@ -1383,8 +1417,17 @@ impl<B: Backend> Session<B> {
             if plan.vht().is_some() {
                 bss_record[29] |= 1 << 5;
             } // PHY_MODE_AC.
+            if let Some(he) = plan.he() {
+                bss_record[29] |= he.phy_mode();
+            }
             self.exchange_station(Command::Unified { id: 2 }, &bss_record)
                 .await?;
+            if let Some(he) = plan.he() {
+                // mt7921_mac_sta_event(ASSOC) -> uni_add_bss(enable = true):
+                // HE_BASIC + BSS_COLOR follow BASIC/QBSS once he_support is set.
+                self.exchange_station(Command::Unified { id: 2 }, &he.bss(true))
+                    .await?;
+            }
             if let Some(profile) = plan.vht() {
                 self.exchange_station(
                     Command::Unified { id: 2 },
@@ -1503,6 +1546,7 @@ impl<B: Backend> Session<B> {
                 self.wmm = plan.wmm();
                 self.ht20_profile = plan.ht20();
                 self.vht_profile = plan.vht();
+                self.he_profile = plan.he();
                 self.ap_phy = plan.ap_phy();
                 if let Some(receiver) = &mut self.ht20_rx {
                     receiver.active = true;
@@ -1526,6 +1570,7 @@ impl<B: Backend> Session<B> {
                 self.ht20_rx = None;
                 self.ht20_profile = None;
                 self.vht_profile = None;
+                self.he_profile = None;
                 self.ap_phy = None;
                 plan.cancel();
                 let stage = match self.state {
@@ -1560,6 +1605,7 @@ impl<B: Backend> Session<B> {
         self.ht20_rx = None;
         self.ht20_profile = None;
         self.vht_profile = None;
+        let had_he = self.he_profile.take();
         self.ap_phy = None;
         self.control_pending.clear();
         self.received_msdu.clear();
@@ -1608,6 +1654,12 @@ impl<B: Backend> Session<B> {
                 let record = crate::mt7921::association::bss_record_qos(bss, false, false)
                     .map_err(|_| Error::Bounds)?;
                 self.exchange(Command::Unified { id: 2 }, &record).await?;
+                // mt76_connac_mcu_uni_add_bss(enable = false) still sends the
+                // HE request while he_support is set, with BSS color disabled.
+                if let Some(he) = had_he {
+                    self.exchange(Command::Unified { id: 2 }, &he.bss(false))
+                        .await?;
+                }
             }
             if had_wmm {
                 self.notify(
@@ -1651,6 +1703,7 @@ impl<B: Backend> Session<B> {
             self.ht20_rx = None;
             self.ht20_profile = None;
             self.vht_profile = None;
+            self.he_profile = None;
             self.ap_phy = None;
             self.rx_ba.fence();
             self.tx_ba.fence();
@@ -1779,6 +1832,7 @@ impl<B: Backend> Session<B> {
             self.station_permission = None;
             self.ht20_profile = None;
             self.vht_profile = None;
+            self.he_profile = None;
             self.ap_phy = None;
             self.ht20_rx = None;
             self.rx_ba.fence();

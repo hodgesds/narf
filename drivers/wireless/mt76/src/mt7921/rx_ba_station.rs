@@ -46,7 +46,12 @@ impl<B: Backend> Session<B> {
             return false;
         }
         if header[25] == 0 && frame.len() == 33 {
-            if ba::Request::parse(frame)
+            let limit = if self.he_profile.is_some() {
+                ba::HE_WINDOW
+            } else {
+                ba::HT_WINDOW
+            };
+            if ba::Request::parse(frame, limit)
                 .is_some_and(|r| self.rx_ba.reserve(r, self.backend.now_ns()))
             {
                 return true;
