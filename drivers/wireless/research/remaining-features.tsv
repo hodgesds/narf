@@ -284,7 +284,6 @@ rtw88	vht	VHT operation	feature	drivers/wireless/specification/rtw88.md	1467
 rtw88	wmm_all_access_categories	Packet scheduling across all WMM access categories	feature	drivers/wireless/specification/rtw88.md	1468
 rtw88	wow	Wake on Wireless on RTL8822CE	feature	drivers/wireless/specification/rtw88.md	1570
 rtw89	active_scanning	Active scanning through firmware scan offload	feature	drivers/wireless/specification/rtw89.md	1037
-rtw89	adaptive_rate_fallback	Adaptive rate fallback	feature	drivers/wireless/specification/rtw89.md	957
 rtw89	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw89.md	1006
 rtw89	aggregation	TX A-MPDU and TX A-MSDU/A-MSDU-in-A-MPDU aggregation	feature	drivers/wireless/specification/rtw89.md	1036
 rtw89	antenna_diversity_tracking	Dynamic antenna diversity/tracking	feature	drivers/wireless/specification/rtw89.md	713
@@ -302,7 +301,6 @@ rtw89	he_gi_ltf	HE/EHT 0.8/1.6/3.2us GI and LTF variants	feature	drivers/wireles
 rtw89	he_htc	HE +HTC insertion in QoS DATA	feature	drivers/wireless/specification/rtw89.md	1040
 rtw89	ht	HT station operation	feature	drivers/wireless/specification/rtw89.md	1014
 rtw89	monitor_mode	Monitor radio mode with PHY-status RX metadata	feature	drivers/wireless/specification/rtw89.md	1039
-rtw89	multi_rate_retry	Multi-rate retry	feature	drivers/wireless/specification/rtw89.md	957
 rtw89	multiple_live_functions	Multiple live PCI functions	feature	drivers/wireless/specification/rtw89.md	1009
 rtw89	nhm_diagnostics	Noise-histogram/CLM/FAHM environment monitoring	feature	drivers/wireless/specification/rtw89.md	1039
 rtw89	operating_reset	Automatic reset of an operating retained owner	feature	drivers/wireless/specification/rtw89.md	1009

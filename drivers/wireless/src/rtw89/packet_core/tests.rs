@@ -24,6 +24,10 @@ struct Region {
 #[derive(Clone, Copy, Debug)]
 pub(in crate::rtw89) struct Submission {
     pub(in crate::rtw89) legacy_rate: u16,
+    /// INFO0 USE_RATE: false when firmware RA owns the DATA rate.
+    pub(in crate::rtw89) fixed_rate: bool,
+    /// INFO1 DATA_RTY_LOWEST_RATE.
+    pub(in crate::rtw89) retry_lowest: u16,
     pub(in crate::rtw89) sequence: u16,
     pub(in crate::rtw89) channel: u8,
     pub(in crate::rtw89) qsel: u8,
@@ -296,10 +300,16 @@ impl Model {
             || body[0] != 0x88 && word(8) >> 23 & 1 != 0
             || word(8) >> 17 & 0x3f != u32::from(kind.qsel())
             || header[16..24] != [0; 8]
-            || word(24) & !(0x1ff << 16) != 1 << 30 | 1 << 10
-            || (word(24) >> 16) & 0x1ff > 11
+            // Either a fixed source rate (USE_RATE|DISDATAFB, INFO1 zero) or
+            // firmware RA data (INFO0 zero, INFO1 lowest retry rate only).
+            || !(word(24) & !(0x1ff << 16) == 1 << 30 | 1 << 10
+                && (word(24) >> 16) & 0x1ff <= 11
+                && word(28) == 0
+                || kind != format::Queue::Management
+                    && word(24) == 0
+                    && word(28) & !(0x1ff << 16) == 0
+                    && (word(28) >> 16) & 0x1ff <= 11)
             || kind == format::Queue::Management && word(24) & (0x1ff << 16) != 0
-            || word(28) != 0
             || word(32) != 0
             || word(36) & !(1 << 10) != 0
             || word(40) != 1 << 31 | 1 << 27
@@ -317,6 +327,8 @@ impl Model {
         }
         let submission = Submission {
             legacy_rate: ((word(24) >> 16) & 0x1ff) as u16,
+            fixed_rate: word(24) & 1 << 30 != 0,
+            retry_lowest: ((word(28) >> 16) & 0x1ff) as u16,
             sequence: sequence & 0x7fff,
             channel: kind.channel(),
             qsel: kind.qsel(),

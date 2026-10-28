@@ -392,6 +392,42 @@ impl Controller {
         attempt.armed = false;
         Ok(())
     }
+    /// `rtw89_phy_ra_assoc` -> `rtw89_fw_h2c_ra`: hand rate selection for
+    /// the WMM-configured peer to firmware RA. Linux requests neither
+    /// receive nor done ACK for this H2C.
+    pub(super) async fn configure_ra(
+        &mut self,
+        io: &mut impl Interface,
+        rates: u16,
+        admission: &Admission,
+    ) -> Result<(), Error> {
+        let body = codec::ra(rates).ok_or(Error::Unsupported)?;
+        if self.phase() != Phase::Associated
+            || self.admission.as_ref().is_none_or(|a| !a.same(admission))
+        {
+            return Err(Error::Terminal);
+        }
+        let peer = self.peer.clone().ok_or(Error::Terminal)?;
+        peer.current()?;
+        if !peer.qos.load(Ordering::Acquire) {
+            return Err(Error::Terminal);
+        }
+        self.phase = Phase::Failed;
+        let mut attempt = Attempt {
+            admission: admission.clone(),
+            peer: Some(peer.clone()),
+            armed: true,
+        };
+        admission.check()?;
+        io.command(2, 1, 0, &body, false, Some(admission)).await?;
+        admission.run(|| {
+            peer.current()?;
+            self.phase = Phase::Associated;
+            Ok(())
+        })?;
+        attempt.armed = false;
+        Ok(())
+    }
     /// Admit TID0..7 on an already WMM-configured peer. Callers grant this
     /// only under the signed all-AC QoS operating program.
     pub(super) fn admit_all_tids(&self, admission: &Admission) -> Result<(), Error> {
@@ -633,6 +669,13 @@ pub(super) fn wmm_fingerprint() -> [u8; 32] {
     hash.update(b"TXWD_INFO0 DATA_RATE[24:16] USE_RATE DISDATAFB; common response rate intersection; management/EAPOL CCK1");
     hash.update(&[11, 10, 9, 8, 7, 6, 3, 5, 4, 2, 1, 0]);
     hash.update(&narf_wireless::wmm::INFORMATION);
+    hash.finalize()
+}
+/// Emitter program added by `radio_policy::Program::FirmwareRa`.
+pub(super) fn firmware_ra_fingerprint() -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"B firmware RA v1; H2C OUTSRC cat2 class1 func0 RA_MACIDCFG AX no-CSI; rtw89_phy_ra_sta_update legacy CCK|OFDM mask &= OFDM|SUBCCK, recover; 20MHz SS1 MACID0 UPD_ALL init_rate_lv0");
+    hash.update(b"data TXWD INFO0 USE_RATE=0 DISDATAFB=0; INFO1 DATA_RTY_LOWEST_RATE=lowest negotiated; management/EAPOL CCK1 fixed");
     hash.finalize()
 }
 /// Emitter program added by `radio_policy::Program::QosAll`.

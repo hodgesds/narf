@@ -255,6 +255,7 @@ struct DriverModel {
     packet_error: Option<crate::rtw89::packet_core::Error>,
     wmm: bool,
     qos_all: bool,
+    firmware_ra: bool,
     irq: Option<IrqModel>,
 }
 /// AX v0 interrupt registers with write-1-clear status, behind the same
@@ -299,6 +300,7 @@ impl DriverModel {
             packet_error: None,
             wmm: false,
             qos_all: false,
+            firmware_ra: false,
             irq: None,
         }
     }
@@ -343,6 +345,22 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
     fn station_wmm_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
         self.station_allowed()?;
         Ok(self.wmm)
+    }
+    fn station_firmware_ra_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
+        self.station_allowed()?;
+        Ok(self.wmm && self.firmware_ra)
+    }
+    async fn station_configure_ra(
+        &mut self,
+        rates: u16,
+        admission: &crate::rtw89::station_control::Admission,
+    ) -> Result<(), crate::rtw89::power::Error> {
+        if !self.station_firmware_ra_allowed()? {
+            return Err(crate::rtw89::power::Error::Unsupported);
+        }
+        self.controller
+            .configure_ra(&mut self.control, rates, admission)
+            .await
     }
     fn station_qos_all_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
         self.station_allowed()?;
@@ -458,7 +476,9 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         report: bool,
         rate: u8,
     ) -> Result<u64, crate::rtw89::packet_core::Error> {
-        if rate != 0 && !self.wmm {
+        if rate != 0 && !self.wmm
+            || rate & crate::rtw89::packet_format::FIRMWARE_RA != 0 && !self.firmware_ra
+        {
             return Err(crate::rtw89::packet_core::Error::Access);
         }
         self.packet(|c, p| c.submit_rate(p, bytes, report, rate))
@@ -1388,4 +1408,73 @@ fn smoke_rtw8852b_all_ac_qos_routes_tids_to_ach_rings_with_strict_priority() -> 
 kernel_test_in!(
     "drivers/wireless/rtw89/wmm",
     smoke_rtw8852b_all_ac_qos_routes_tids_to_ach_rings_with_strict_priority
+);
+
+fn smoke_rtw8852b_firmware_ra_h2c_and_adaptive_data_txwd() -> TestResult {
+    const RATES: [u8; 12] = [0x82, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+    // AP response: 1(basic),2,5.5,11,6,24,54 -> hardware bits 0..4, 8, 11.
+    const RESPONSE: [u8; 7] = [0x82, 4, 11, 22, 12, 48, 108];
+    for protected in [false, true] {
+        let h = Harness::rates_profile(protected, true, Some(&RATES));
+        {
+            let mut p = h.peer.lock();
+            let ap = core::mem::replace(&mut p.ap, Peer::new(protected).ap);
+            let Ok(ap) = ap.with_legacy_rates(&RESPONSE) else {
+                return TestResult::Fail("fixture AP rates");
+            };
+            p.ap = ap;
+        }
+        h.model(|io| io.firmware_ra = true);
+        if h.join().is_err() {
+            return TestResult::Fail("firmware RA association failed");
+        }
+        // Independent rtw89_phy_ra_sta_update arithmetic: mask 0x91f &
+        // (OFDM|SUBCCK) = 0x915, mode CCK|OFDM, UPD_ALL, 20MHz, MACID0.
+        let mut expected = [0u8; 16];
+        expected[..4].copy_from_slice(&0x0010_0006u32.to_le_bytes());
+        expected[4..8].copy_from_slice(&0x0915u32.to_le_bytes());
+        let commands = h.model(|io| io.control.packets().to_vec());
+        if commands
+            .iter()
+            .filter(|p| p.len() == 24 && p[8..] == expected)
+            .count()
+            != 1
+        {
+            return TestResult::Fail("RA_MACIDCFG H2C missing or differs");
+        }
+        let ethernet = udp_ipv4(AP, OWN, h.plan.lease_ip, h.plan.server_ip, 7, 8, b"ra");
+        if narf_net::iface::send_on(h.device.name(), &ethernet).is_err() {
+            return TestResult::Fail("firmware RA data refused");
+        }
+        h.pump();
+        let last = h.model(|io| io.packets.last.map(|s| (s.fixed_rate, s.retry_lowest)));
+        if h.peer.lock().uplink.last() != Some(&ethernet) || last != Some((false, 0)) {
+            return TestResult::Fail("data TXWD did not hand the rate to firmware RA");
+        }
+    }
+    // Without the signed program the revision2 fixed fastest rate remains.
+    let h = Harness::rates_profile(false, true, Some(&RATES));
+    if h.join().is_err() {
+        return TestResult::Fail("fixed-rate association failed");
+    }
+    let ethernet = udp_ipv4(AP, OWN, h.plan.lease_ip, h.plan.server_ip, 7, 8, b"fixed");
+    if narf_net::iface::send_on(h.device.name(), &ethernet).is_err() {
+        return TestResult::Fail("fixed-rate data refused");
+    }
+    h.pump();
+    let last = h.model(|io| io.packets.last.map(|s| (s.fixed_rate, s.legacy_rate)));
+    if last != Some((true, 11)) {
+        return TestResult::Fail("fixed-rate recipe changed without firmware RA");
+    }
+    if h.model(|io| io.control.packets().to_vec())
+        .iter()
+        .any(|p| p.len() == 24 && p[8..12] == 0x0010_0006u32.to_le_bytes())
+    {
+        return TestResult::Fail("RA H2C sent without the signed program");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/rates",
+    smoke_rtw8852b_firmware_ra_h2c_and_adaptive_data_txwd
 );

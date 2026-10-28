@@ -138,6 +138,11 @@ impl Native {
         if rate != 0 && !self.station_wmm_allowed()? {
             return Err(packet::Error::Access);
         }
+        if rate & crate::rtw89::packet_format::FIRMWARE_RA != 0
+            && !self.station_firmware_ra_allowed()?
+        {
+            return Err(packet::Error::Access);
+        }
         self.packet_operation(|core, port| core.submit_rate(port, bytes, report, rate))
     }
     /// `rtw89_pci_request_irq` + `rtw89_pci_ops_start`: bind one MSI vector

@@ -987,6 +987,24 @@ indicate), `smoke_rtw8852b_operating_programs_each_require_their_own_signed_iden
 and `smoke_rtw8852b_all_ac_qos_routes_tids_to_ach_rings_with_strict_priority`
 (TID6 on ACH3, VI/BE/BK ordering, TID5 RX, flags7 fallback).
 
+### Firmware rate adaptation and retry fallback
+
+`radio_policy::Program::FirmwareRa` (byte57 bit4, requires `Wmm`) hands
+DATA rates to firmware like Linux. After the WMM EDCA rows, the controller
+sends `rtw89_fw_h2c_ra` (H2C OUTSRC cat2/class1/func0 RA_MACIDCFG, AX
+layout, no CSI, no ACK requested) built as `rtw89_phy_ra_sta_update` does
+for a legacy 2.4GHz peer: the response-bound rate bitmap, mode CCK|OFDM,
+mask `&= OFDM|SUBCCK` then `rtw89_phy_ra_mask_recover`, 20MHz, one stream,
+MACID0, `UPD_ALL`. No calibrated RSSI exists, so the RSSI floor keeps every
+rate and `init_rate_lv` is 0 (Linux's value for RSSI<=1). Data TXWDs then
+clear `INFO0 USE_RATE`/`DISDATAFB` and set `INFO1 DATA_RTY_LOWEST_RATE` to
+the lowest negotiated rate (`rtw89_core_get_data_rate`), so firmware RA
+adapts the rate and hardware retries fall back toward that floor (multi-rate
+retry). Management/EAPOL stay fixed CCK1, and without the program the
+revision2 fixed fastest-rate recipe is unchanged. Smoke:
+`smoke_rtw8852b_firmware_ra_h2c_and_adaptive_data_txwd`. RA C2H reports
+are not consumed (Linux uses them only for statistics).
+
 ### Live AP EDCA updates
 
 Bound peer beacons/probe responses on an open WMM link follow mac80211

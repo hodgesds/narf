@@ -29,6 +29,14 @@ pub(super) unsafe trait Io: Send {
     fn station_wmm_allowed(&mut self) -> Result<bool, power::Error> {
         Ok(false)
     }
+    /// Signed firmware rate-adaptation program (`Program::FirmwareRa`).
+    fn station_firmware_ra_allowed(&mut self) -> Result<bool, power::Error> {
+        Ok(false)
+    }
+    /// Program firmware RA for the WMM-configured peer.
+    async fn station_configure_ra(&mut self, _: u16, _: &Admission) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
     /// Signed all-AC/TID QoS program (`radio_policy::Program::QosAll`).
     fn station_qos_all_allowed(&mut self) -> Result<bool, power::Error> {
         Ok(false)
@@ -223,6 +231,8 @@ pub(super) struct State {
     short_slot: bool,
     /// All-AC/TID QoS routing is active for this association.
     qos_all: bool,
+    /// Firmware rate adaptation owns DATA rates for this association.
+    firmware_ra: bool,
     deadline: u64,
     last_peer: u64,
     last_now: u64,
@@ -263,6 +273,7 @@ impl State {
             edca_pending: None,
             short_slot: false,
             qos_all: false,
+            firmware_ra: false,
             deadline: 0,
             last_peer: 0,
             last_now: 0,
@@ -326,6 +337,7 @@ impl State {
         self.wmm = None;
         self.edca_pending = None;
         self.qos_all = false;
+        self.firmware_ra = false;
         self.admission.close();
         self.established = false;
         self.phase = Phase::Stopped;
@@ -358,6 +370,7 @@ impl State {
         self.wmm = None;
         self.edca_pending = None;
         self.qos_all = false;
+        self.firmware_ra = false;
         if let Some(security) = &mut self.security {
             security.fail();
         }
@@ -410,7 +423,14 @@ impl State {
             bytes[22..24].copy_from_slice(&(self.sequence << 4).to_le_bytes());
             self.sequence = (self.sequence + 1) & 4095;
         }
-        let rate = if kind == Kind::Data && self.wmm.is_some() {
+        let rate = if kind == Kind::Data && self.wmm.is_some() && self.firmware_ra {
+            // rtw89_core_get_data_rate: lowest negotiated rate bounds retries.
+            let rates = self.plan.as_ref().ok_or(Error::State)?.legacy_rates().0 & 0xfff;
+            if rates == 0 {
+                return Err(Error::Profile);
+            }
+            super::packet_format::FIRMWARE_RA | rates.trailing_zeros() as u8
+        } else if kind == Kind::Data && self.wmm.is_some() {
             let rates = self.plan.as_ref().ok_or(Error::State)?.legacy_rates().0;
             [11, 10, 9, 8, 7, 6, 3, 5, 4, 2, 1, 0]
                 .into_iter()
@@ -840,6 +860,7 @@ impl State {
             super::station_control::wmm_admit(p, candidate.bss.capability & 0x400 != 0)?;
         }
         self.qos_all = self.wmm.is_some() && io.station_qos_all_allowed()?;
+        self.firmware_ra = self.wmm.is_some() && io.station_firmware_ra_allowed()?;
         io.station_prepare_peer(bssid, &self.admission).await?;
         self.peer = Some(candidate);
         self.deadline = self.now()?.saturating_add(5000);
@@ -857,6 +878,10 @@ impl State {
                 self.short_slot = short;
                 if let Some(p) = self.wmm {
                     io.station_configure_wmm(p, short, &self.admission).await?;
+                    if self.firmware_ra {
+                        let rates = self.plan.as_ref().ok_or(Error::State)?.legacy_rates().0;
+                        io.station_configure_ra(rates, &self.admission).await?;
+                    }
                 }
                 self.admission.run(|| {
                     self.peer_commit = None;

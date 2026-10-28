@@ -134,6 +134,45 @@ pub(super) fn edca(ac: u8, short: bool) -> [u8; 12] {
     );
     bytes
 }
+/// `rtw89_phy_ra_sta_update` + `rtw89_fw_h2c_ra` (AX, no CSI) for a
+/// legacy 2.4GHz station: `rates` is the response-bound supported-rate
+/// bitmap in hardware order (CCK1,2,5.5,11, OFDM6..54). No calibrated RSSI
+/// exists, so the RSSI floor keeps every rate and `init_rate_lv` is 0, as
+/// Linux does for an RSSI of 0/1.
+pub(super) fn ra(rates: u16) -> Option<[u8; 16]> {
+    const CCK: u64 = 0xf;
+    const OFDM: u64 = 0xff0;
+    const SUBCCK: u64 = 0x5;
+    let supported = u64::from(rates) & (CCK | OFDM);
+    if supported == 0 {
+        return None;
+    }
+    let mut mode = 0u32;
+    if supported & CCK != 0 {
+        mode |= 1; // RTW89_RA_MODE_CCK
+    }
+    if supported & OFDM != 0 {
+        mode |= 2; // RTW89_RA_MODE_OFDM
+    }
+    let backup = supported;
+    let mut mask = supported;
+    if mode & 2 != 0 {
+        mask &= OFDM | SUBCCK;
+    }
+    // rtw89_phy_ra_mask_recover
+    if mask & !(CCK | OFDM) == 0 {
+        mask |= backup & !(CCK | OFDM);
+    }
+    if mask == 0 {
+        mask |= backup & (CCK | OFDM);
+    }
+    let mut bytes = [0; 16];
+    // MODE[5:1], BW_CAP 20MHz, MACID0, INIT_RATE_LV0, UPD_ALL, SS_NUM0.
+    word(&mut bytes, 0, mode << 1 | 1 << 20);
+    word(&mut bytes, 1, mask as u32);
+    word(&mut bytes, 2, (mask >> 32) as u32 & 0x7fff_ffff);
+    Some(bytes)
+}
 pub(super) fn wmm_edca(p: narf_wireless::wmm::Parameters, short: bool) -> Option<[[u8; 12]; 4]> {
     if p.ac[0].admission_control
         || p.ac.iter().any(|a| {
