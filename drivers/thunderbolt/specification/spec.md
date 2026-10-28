@@ -106,7 +106,12 @@ such controllers; it never starts, resets, or speaks to the ICM firmware.
   chain as `Port::retimers`; an enumeration or agreement fault is
   published as the typed `Port::retimer_fault`, never folded into the
   empty-chain state. `retimer::sb_read`/`sb_write`/`port_op` are the raw
-  sideband and Port Operation primitives underneath.
+  sideband and Port Operation primitives underneath; each takes an
+  `retimer::SbChannel` (the route/port/capability/target/index addressing
+  of one transaction, built by `SbChannel::retimer`/`SbChannel::router`)
+  and is generic over the config-space seam, which is therefore public
+  as `control::Config` (the module's transaction machinery stays
+  crate-private).
 - `retimer::nvm_sector_size`, `nvm_write`, `nvm_read` and
   `nvm_authenticate` are the retimer firmware-update surface (64-byte
   Data-register blocks, offset staged in Metadata, authenticate restarts

@@ -33,7 +33,7 @@ pub mod adapter;
 #[cfg(feature = "builtin")]
 pub mod cm;
 #[cfg(feature = "builtin")]
-mod control;
+pub mod control;
 #[cfg(feature = "builtin")]
 mod dataring;
 #[cfg(feature = "builtin")]
