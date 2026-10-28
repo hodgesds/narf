@@ -337,6 +337,35 @@ Host-bus/system power transitions remain separate profiles.
   reply in flight. Teardown and failure close the owner but keep every
   in-flight ID and its DMA until whole-device reset. A completion is never
   invented. The per-ID deadline (3 s) fails the owner, as before.
+- Firmware-owned TX Block Ack and aggregate retransmission. Linux v7.2
+  sets `TX_AMPDU_SETUP_IN_HW` and `mac.c::ath10k_ampdu_action` returns
+  -EOPNOTSUPP for every mac80211 TX action (TX_START, TX_OPERATIONAL,
+  TX_STOP_*). Firmware originates ADDBA, keeps the BA window, builds the
+  A-MPDU and retransmits unacknowledged subframes. The host's
+  `WMI_ADDBA_SEND_CMDID` path exists only for the debugfs manual
+  `aggr_mode` (`debugfs_sta.c`), so this tree never sends ADDBA or
+  DELBA itself. The host obligations are all met:
+  1. an HT peer with the QoS flag and A-MPDU length/density in PEER_ASSOC
+     (`ath10k_peer_assoc_h_ht` `peer_max_mpdu`/`peer_mpdu_density`);
+  2. the 802.11 TID in each QoS descriptor (`tx_qos.rs`);
+  3. several MPDUs of one TID owned at once (the N-deep pipeline above).
+  The AP's ADDBA Response and DELBA action frames belong to firmware's
+  session. The station owner ignores them: no WMI command, no state change.
+  Firmware performs the retries while each MPDU's ID and DMA stay owned. A
+  completion indication is terminal after its retry budget. One indication
+  may name a whole BA window. ACK, NO_ACK (retries exhausted) and
+  DISCARD/POSTPONE are counted per TID (`Radio::tx_counters`). None of these
+  outcomes fails the link. A status above POSTPONE is malformed and is
+  rejected before any ID is freed. The LL completion carries no
+  per-attempt retry count. Linux reports one only through 10.4
+  `HTT_10_4_T2H_MSG_TYPE_PEER_STATS` (`htt_rx.c::ath10k_htt_fetch_peer_stats`
+  `retry_pkts`), which firmware emits only after `WMI_EXT_RESOURCE_CFG`
+  enables `WMI_10_4_PEER_STATS` (`core.c::ath10k_core_start`). This tree
+  sends no EXT_RESOURCE_CFG, so per-attempt counts are not claimed.
+  Smokes under `drivers/wireless/ath10k/ht` cover eight TID-0 MPDUs in flight
+  on all six dialects, an ignored ADDBA/DELBA exchange, mixed
+  ACK/NO_ACK/DISCARD outcomes, malformed status, and teardown keeping the
+  aggregate's DMA.
 - The registered Device binds native preparation, authentication/association,
   WMM/peer/up commands and initial RSNA data to a chosen factory/frequency/power
   receipt. It samples current policy before and after each nested wait and
