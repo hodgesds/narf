@@ -257,6 +257,8 @@ impl Owner {
     pub fn station(&self, enable: bool) -> Vec<u8> {
         let mut out = vec![0; 20];
         out[..14].copy_from_slice(&[0, 1, 1, 0, 1, 0, 0, 0, 6, 0, 12, 0, 0, 1]);
+        // mt76_connac_mcu_sta_ba_tlv: ba->amsdu = params->amsdu.
+        out[14] = u8::from(enable && self.amsdu);
         out[15] = u8::from(enable);
         if enable {
             out[18..20].copy_from_slice(&self.window.to_le_bytes());

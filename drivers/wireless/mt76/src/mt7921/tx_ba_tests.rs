@@ -63,7 +63,7 @@ fn native() -> Result<(), &'static str> {
                 ];
                 let sta = [0, 1, 1, 0, 1, 0, 0, 0, 6, 0, 12, 0, 0, 1, 0, 1, 0, 0, 64, 0];
                 if frames.len() != 3
-                    || frames[0].1.get(24..) != Some(&[3, 0, 1, 2, 16, 0, 0, 0, 0][..])
+                    || frames[0].1.get(24..) != Some(&[3, 0, 1, 3, 16, 0, 0, 0, 0][..])
                     || frames[1].1.get(48..) != Some(&wtbl[..])
                     || frames[2].1.get(48..) != Some(&sta[..])
                 {
@@ -554,8 +554,11 @@ fn tx_amsdu() -> Result<(), &'static str> {
         {
             return Err("STA_REC_HW_AMSDU fields");
         }
-        run(session.send_ethernet(&frame(1))).map_err(|_| "pre-BA data")?;
-        if session.backend.data_amsdu.last() != Some(&true) {
+        // Data before an agreement (a separate fresh peer: the originator
+        // negotiates only before the first TID0 MPDU).
+        let mut plain = joined(6, false, true)?;
+        run(plain.send_ethernet(&frame(1))).map_err(|_| "pre-BA data")?;
+        if plain.backend.data_amsdu.last() != Some(&true) {
             return Err("HT peer data without wcid->amsdu");
         }
         if responder_amsdu {
