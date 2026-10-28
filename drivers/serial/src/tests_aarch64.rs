@@ -32,9 +32,17 @@ fn smoke_pl011_dt_bound_and_loopback() -> TestResult {
     if !published {
         return TestResult::Fail("PL011 not published in the serial registry");
     }
-    match crate::pl011::selftest_loopback() {
-        Some(true) => TestResult::Pass,
-        Some(false) => TestResult::Fail("PL011 loopback round-trip mismatch"),
+    match crate::pl011::selftest_loopback_diag() {
+        Some(crate::pl011::LoopbackOutcome::Pass) => TestResult::Pass,
+        Some(crate::pl011::LoopbackOutcome::LbeNotSet(_)) => {
+            TestResult::Fail("PL011 loopback: CR.LBE did not stick when read back")
+        }
+        Some(crate::pl011::LoopbackOutcome::RxEmpty(_)) => {
+            TestResult::Fail("PL011 loopback: RX FIFO empty during read-back")
+        }
+        Some(crate::pl011::LoopbackOutcome::WrongByte { .. }) => {
+            TestResult::Fail("PL011 loopback: read-back byte differs from pattern")
+        }
         None => TestResult::Fail("bound PL011 vanished before the loopback test"),
     }
 }

@@ -75,6 +75,32 @@ pub struct Pl011 {
     irq: Option<u32>,
 }
 
+/// Outcome of the PL011 loopback self-test, with the failure
+/// mode named. The CI log's single "mismatch" string could not
+/// distinguish an empty RX FIFO from a wrong byte, and the fix
+/// round's FR.BUSY theory misread QEMU's model: QEMU delivers
+/// loopback synchronously at DR-write time (its
+/// `pl011_write_txdata` calls `pl011_loopback_tx` before
+/// queueing the byte for the backend) AND still sends the byte
+/// to the backend — pattern bytes on the console are expected
+/// QEMU loopback behavior (QEMU commit f576e0733cc), not
+/// evidence that bytes escaped instead of looping back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopbackOutcome {
+    Pass,
+    /// CR.LBE did not stick when read back (CR value shown).
+    LbeNotSet(u32),
+    /// No byte arrived within the poll budget at this pattern
+    /// position.
+    RxEmpty(usize),
+    /// Wrong byte at this pattern position.
+    WrongByte {
+        position: usize,
+        want: u8,
+        got: u8,
+    },
+}
+
 impl Pl011 {
     /// Map the register window described by the device record.
     ///
@@ -148,53 +174,79 @@ impl Pl011 {
     }
 
     /// Hardware loopback round-trip (CR.LBE): the TX path drives
-    /// the RX path internally and the external TXD line stays
-    /// disconnected, so the pattern never reaches the console
-    /// wire. Proves the mapped window is the live device — the
-    /// step-4 binding proof the boot smoke asserts.
-    pub fn loopback_selftest(&mut self) -> bool {
+    /// the RX path internally. Proves the mapped window is the
+    /// live device — the step-4 binding proof the boot smoke
+    /// asserts. NOTE on QEMU: the model loops TX back into RX
+    /// and still sends it to the backend, so pattern bytes on
+    /// the console are expected, not a failure sign.
+    ///
+    /// Failure modes are named, not collapsed into one
+    /// "mismatch": the loopback bit is verified stuck via a CR
+    /// read-back; the transmitter-drain wait is advisory only
+    /// (on QEMU the loopback bytes are already in the RX FIFO
+    /// when the DR writes land, and FR.BUSY's model semantics
+    /// are not the real-hardware bit-time contract — a BUSY
+    /// wait that never clears must never skip the read-back,
+    /// as the old code did); the read-back poll budget is
+    /// generous so host-scheduling delays in the model cannot
+    /// masquerade as a device failure.
+    pub fn loopback_selftest_diag(&mut self) -> LoopbackOutcome {
         while self.try_read_byte().is_some() {} // drain stale RX
         let cr = self.read(CR);
         self.write(CR, cr | CR_LBE);
+        // Verify the loopback bit actually stuck: a CR write
+        // that does not land must fail loudly here, not as a
+        // downstream "mismatch".
+        let cr_after = self.read(CR);
+        if cr_after & CR_LBE == 0 {
+            self.write(CR, cr);
+            return LoopbackOutcome::LbeNotSet(cr_after);
+        }
         const PATTERN: [u8; 3] = [0xA5, 0x3C, 0x55];
         for &b in &PATTERN {
             self.write_byte(b);
         }
-        // A looped-back byte reaches the RX FIFO only once its
-        // frame has been shifted at the programmed baud rate, so
-        // wait for the transmitter to drain (FR.BUSY clear)
-        // before reading back: polling RX alone can outrun the
-        // wire, and the still-queued pattern then escapes onto
-        // the console the moment LBE drops. Bounded — a
-        // transmitter that never drains fails the selftest
-        // instead of hanging it.
-        let mut ok = false;
+        // Advisory drain wait only — never gates the read-back.
         for _ in 0..10_000_000 {
             if self.read(FR) & FR_BUSY == 0 {
-                ok = true;
                 break;
             }
             core::hint::spin_loop();
         }
-        if ok {
-            for &want in &PATTERN {
-                let mut got = None;
-                for _ in 0..100_000 {
-                    if let Some(b) = self.try_read_byte() {
-                        got = Some(b);
-                        break;
-                    }
-                    core::hint::spin_loop();
-                }
-                if got != Some(want) {
-                    ok = false;
+        let mut outcome = LoopbackOutcome::Pass;
+        for (i, &want) in PATTERN.iter().enumerate() {
+            let mut got = None;
+            for _ in 0..10_000_000 {
+                if let Some(b) = self.try_read_byte() {
+                    got = Some(b);
                     break;
                 }
+                core::hint::spin_loop();
+            }
+            match got {
+                None => {
+                    outcome = LoopbackOutcome::RxEmpty(i);
+                    break;
+                }
+                Some(b) if b != want => {
+                    outcome = LoopbackOutcome::WrongByte {
+                        position: i,
+                        want,
+                        got: b,
+                    };
+                    break;
+                }
+                _ => {}
             }
         }
         self.write(CR, cr & !CR_LBE);
         while self.try_read_byte().is_some() {} // drain any residue
-        ok
+        outcome
+    }
+
+    /// Boolean form of [`Self::loopback_selftest_diag`].
+    pub fn loopback_selftest(&mut self) -> bool {
+        self.loopback_selftest_diag() == LoopbackOutcome::Pass
     }
 }
 
@@ -212,6 +264,12 @@ pub fn bound_port() -> Option<(u64, Option<u32>)> {
 /// PL011 is bound.
 pub fn selftest_loopback() -> Option<bool> {
     BOUND.lock().as_mut().map(|p| p.loopback_selftest())
+}
+
+/// Diagnostic form of [`selftest_loopback`]: the failure mode,
+/// not just pass/fail.
+pub fn selftest_loopback_diag() -> Option<LoopbackOutcome> {
+    BOUND.lock().as_mut().map(|p| p.loopback_selftest_diag())
 }
 
 fn probe_pl011(
