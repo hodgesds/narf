@@ -184,15 +184,15 @@ rtw88	tx_ba_all_tids	Originator TX Block Ack on every non-VO TID	feature	drivers
 rtw88	vht	VHT operation	feature	drivers/wireless/specification/rtw88.md	1884
 rtw88	wow	Wake on Wireless on RTL8822CE	feature	drivers/wireless/specification/rtw88.md	1885
 rtw89	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw89.md	1006
-rtw89	aggregation	TX A-MSDU/A-MSDU-in-A-MPDU aggregation (TX A-MPDU implemented)	feature	drivers/wireless/specification/rtw89.md	1579
+rtw89	aggregation	TX A-MSDU/A-MSDU-in-A-MPDU aggregation (TX A-MPDU implemented)	feature	drivers/wireless/specification/rtw89.md	1582
 rtw89	antenna_diversity_tracking	Dynamic antenna diversity/tracking	feature	drivers/wireless/specification/rtw89.md	713
 rtw89	carrier_frequency_tracking	Periodic carrier-frequency offset tracking	feature	drivers/wireless/specification/rtw89.md	715
 rtw89	digital_initial_gain_tracking	Periodic digital initial gain control	feature	drivers/wireless/specification/rtw89.md	715
 rtw89	edcca_tracking	Periodic EDCCA tracking	feature	drivers/wireless/specification/rtw89.md	715
-rtw89	eht	EHT operation on RTL8922A	feature	drivers/wireless/specification/rtw89.md	1578
+rtw89	eht	EHT operation on RTL8922A	feature	drivers/wireless/specification/rtw89.md	1581
 rtw89	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specification/rtw89.md	1012
 rtw89	fragmentation	Host fragmentation/defragmentation with native fragment MPDU admission [API available: WirelessNetIface::set_fragmentation_threshold (SET_WIPHY NL80211_ATTR_WIPHY_FRAG_THRESHOLD routed after cfg80211 validation; default EOPNOTSUPP) (wireless spec 3.1.1)]	feature	drivers/wireless/specification/rtw89.md	1038
-rtw89	he_htc	HE +HTC insertion in QoS DATA [API available: station_security::Security receives +HTC QoS DATA (HT Control skipped, Order masked from the CCMP AAD) on the MSDU and A-MSDU paths, so advertising HTC_HE loses no AP traffic (wireless spec 3.4.1)]	feature	drivers/wireless/specification/rtw89.md	1581
+rtw89	he_htc	HE +HTC insertion in QoS DATA [API available: station_security::Security receives +HTC QoS DATA (HT Control skipped, Order masked from the CCMP AAD) on the MSDU and A-MSDU paths, so advertising HTC_HE loses no AP traffic (wireless spec 3.4.1)]	feature	drivers/wireless/specification/rtw89.md	1584
 rtw89	monitor_mode	Monitor radio mode with PHY-status RX metadata	feature	drivers/wireless/specification/rtw89.md	1039
 rtw89	multiple_live_functions	Multiple live PCI functions	feature	drivers/wireless/specification/rtw89.md	1009
 rtw89	nhm_diagnostics	Noise-histogram/CLM/FAHM environment monitoring	feature	drivers/wireless/specification/rtw89.md	1039
