@@ -35,6 +35,7 @@ pub(in crate::amdgpu_dcn401_otg::tests) enum Command {
     Setup(u8, u32),
     Enable(Path, u32),
     Disable(Path),
+    PowerDown(Path),
 }
 pub(in crate::amdgpu_dcn401_otg::tests) struct Firmware {
     pub(in crate::amdgpu_dcn401_otg::tests) ready: bool,
@@ -79,6 +80,9 @@ impl crate::amdgpu_dcn401_otg::hdmi_link::Firmware for Firmware {
     }
     async fn disable(&mut self, path: Path) -> Result<(), dmub::Error> {
         self.issue(Command::Disable(path), DISABLED)
+    }
+    async fn power_down(&mut self, path: Path) -> Result<(), dmub::Error> {
+        self.issue(Command::PowerDown(path), 0)
     }
 }
 /// Firmware-owned transmitter effects and the frontend clock/FIFO handshakes.
@@ -479,7 +483,11 @@ fn dcn401_hdmi_video_mutes_stops_and_the_link_stops_and_restarts() -> TestResult
     run(e.stop_hdmi_link(&mut fw, path(p))).unwrap();
     if e.status.state != State::HdmiLinkStopped
         || !e.status.state.reusable()
-        || fw.commands.last().map(|c| c.0) != Some(Command::Disable(path(p)))
+        // dce110_clock_source_power_down follows the disabled transmitter.
+        || fw.commands[fw.commands.len().saturating_sub(2)..]
+            .iter()
+            .map(|c| c.0)
+            .ne([Command::Disable(path(p)), Command::PowerDown(path(p))])
         || r(&e, dio(p, 0x20bd)) & 1 != 0
         || r(&e, dio(p, 0x20bc)) & 0x7f00 != 0
         || r(&e, dio(stream, 0x2094)) & 0x2c10 != 0

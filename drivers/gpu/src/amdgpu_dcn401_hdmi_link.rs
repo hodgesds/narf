@@ -136,6 +136,7 @@ pub(super) trait Firmware {
         khz: u32,
     ) -> impl Future<Output = Result<(), dmub::Error>> + Send;
     fn disable(&mut self, path: Path) -> impl Future<Output = Result<(), dmub::Error>> + Send;
+    fn power_down(&mut self, path: Path) -> impl Future<Output = Result<(), dmub::Error>> + Send;
 }
 impl Firmware for dmub::Dmub {
     fn ready(&self) -> bool {
@@ -158,6 +159,9 @@ impl Firmware for dmub::Dmub {
     }
     async fn disable(&mut self, path: Path) -> Result<(), dmub::Error> {
         self.disable_tmds(path).await
+    }
+    async fn power_down(&mut self, path: Path) -> Result<(), dmub::Error> {
+        self.power_down_pixel_clock(path).await
     }
 }
 fn phy_at(l: Layout, phy: u8, reg: u64) -> u64 {
@@ -835,7 +839,11 @@ impl<I: Io> Engine<I> {
         self.hdmi_update(plan, 17, u32::MAX, 0)?;
         self.hdmi_update(plan, 15, u32::MAX, 0)?;
         self.hdmi_update(plan, 11, 0x0100001f, 0x11)?;
-        self.hdmi_link_verify(*plan, false)
+        self.hdmi_link_verify(*plan, false)?;
+        // dcn401_reset_back_old_streams then powers the old clock source
+        // down (cs_power_down); Linux only logs a failure.
+        let _ = firmware.power_down(plan.path).await;
+        Ok(())
     }
     pub(in crate::amdgpu_dcn401_otg) async fn stop_hdmi_link(
         &mut self,
