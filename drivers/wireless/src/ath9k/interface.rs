@@ -315,6 +315,19 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
             }
         }
     }
+    /// Host-side retirement of this generation (see [`retire`]).
+    pub(super) fn retire_host(&self) {
+        self.close();
+        if let Some(mut state) = self.state.try_lock() {
+            state.clear();
+        }
+        narf_wireless::registry::unregister(&self.name);
+        narf_net::registry().unregister(&self.name);
+        // Reserve while still registered so no other wlan%d allocation can
+        // take the name between unregister and reservation.
+        narf_net::iface::reserve_name(&self.name);
+        narf_net::iface::unregister(&self.name);
+    }
     pub(super) fn drain(&self) -> bool {
         let (epoch, frames) = self.progress();
         let progress = !frames.is_empty();
@@ -560,6 +573,8 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Endpoint for Device<P, 
     }
 }
 static ACTIVE: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
+/// The concrete published generation, for retirement by radio identity.
+static CURRENT: IrqSafeSpinLock<Option<Arc<Native>>> = IrqSafeSpinLock::new(None);
 static CLAIMED: AtomicBool = AtomicBool::new(false);
 fn send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     let device = ACTIVE.lock().clone().ok_or(())?;
@@ -582,6 +597,7 @@ pub(super) fn publish(radio: super::RetainedRadio) -> Result<Arc<Native>, Error>
         .register(&authority, Registered(device.clone()))
         .map_err(|_| Error::Profile)?;
     *ACTIVE.lock() = Some(device.clone());
+    *CURRENT.lock() = Some(device.clone());
     narf_net::iface::register(device.name(), device.own, send);
     device.link(None);
     device.admitted.store(true, Ordering::Release);
@@ -619,6 +635,25 @@ pub(super) fn publish(radio: super::RetainedRadio) -> Result<Arc<Native>, Error>
         }
     });
     Ok(device)
+}
+/// Withdraw only the generation that owns `radio`: close carrier and rings,
+/// leave every registry, and keep the retired name reserved so a late old
+/// publisher cannot address a successor. Returns whether it was published.
+pub(super) fn retire(radio: &super::RetainedRadio) -> bool {
+    let device = {
+        let mut current = CURRENT.lock();
+        match current.as_ref() {
+            Some(device) if Arc::ptr_eq(&device.radio, radio) => current.take(),
+            _ => None,
+        }
+    };
+    let Some(device) = device else {
+        return false;
+    };
+    *ACTIVE.lock() = None;
+    device.retire_host();
+    CLAIMED.store(false, Ordering::Release);
+    true
 }
 struct Registered(Arc<Native>);
 impl Interface for Registered {

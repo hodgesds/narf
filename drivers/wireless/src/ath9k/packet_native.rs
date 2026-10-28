@@ -412,6 +412,16 @@ impl Port for Native {
     fn now_us(&self) -> u64 {
         narf_time::monotonic_ns() / 1000
     }
+    fn ordered(&self) -> bool {
+        // PCIe Device Control bit 4: Enable Relaxed Ordering.
+        let Ok(read) = self.cap.derive::<narf_capabilities::Read>() else {
+            return false;
+        };
+        matches!(
+            self.invoke_cfg(|| narf_bus::pci_express::read_status(&read, &self.device)),
+            Ok(Ok(status)) if status.device_control & (1 << 4) == 0
+        )
+    }
     fn interrupt(&self) -> Option<alloc::sync::Arc<super::irq::Signal>> {
         self.msi.lock().as_ref().map(|m| m.signal.clone())
     }

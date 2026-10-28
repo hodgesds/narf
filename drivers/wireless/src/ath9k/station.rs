@@ -236,6 +236,15 @@ impl<P: Port, E: Environment> Radio<P, E> {
     pub(super) fn interrupt(&self) -> Option<Arc<super::irq::Signal>> {
         self.packet.interrupt()
     }
+    /// Stop (if still running) and report whether the packet owner proved
+    /// DMA quiescence and released its storage.
+    pub(super) fn retire(&mut self) -> bool {
+        let _ = self.stop();
+        self.packet.reclaimed()
+    }
+    pub(super) fn terminal(&self) -> bool {
+        matches!(self.phase(), Phase::Stopped | Phase::Failed)
+    }
     pub(super) fn receive_epoch(&self) -> u64 {
         self.epoch
     }

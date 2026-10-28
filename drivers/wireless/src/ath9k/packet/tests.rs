@@ -205,6 +205,11 @@ impl Model {
         Ok(bytes)
     }
     pub(in crate::ath9k) fn complete(&self, success: bool) -> Result<(), Error> {
+        if self.tx.get().is_none() && !self.released.borrow().is_empty() {
+            // The owner aborted the queue and reclaimed its storage: a late
+            // completion has no descriptor left to write.
+            return Ok(());
+        }
         let descriptor = self.tx.get().ok_or(Error::State)?;
         let tail = self.pair_tail.get().unwrap_or(descriptor);
         let mut done = 1;
@@ -398,7 +403,7 @@ impl Port for Arc<Model> {
         if self.ignore.get() == Some(reg) {
             return Ok(());
         }
-        self.registers.borrow_mut().insert(reg, value);
+        let prior = self.registers.borrow_mut().insert(reg, value).unwrap_or(0);
         if reg == RXDP {
             self.cursor.set(value);
         }
@@ -476,8 +481,13 @@ impl Port for Arc<Model> {
                 self.complete(ack)?;
             }
         }
-        if reg == CR && value == 0x20 && !self.stuck_rx.get() {
-            self.registers.borrow_mut().insert(CR, 0);
+        if reg == CR && value == 0x20 {
+            let rxe = if self.stuck_rx.get() { 4 } else { 0 };
+            self.registers.borrow_mut().insert(CR, rxe);
+        }
+        if reg == 0x4028 {
+            // AR_INTR_SYNC_CAUSE_CLR is write-one-to-clear.
+            self.registers.borrow_mut().insert(reg, prior & !value);
         }
         if reg == CR && value == 4 && self.stuck_rx.get() {
             self.registers.borrow_mut().insert(CR, 4);
@@ -854,8 +864,8 @@ kernel_test_in!(
 );
 
 fn check_interrupt_service() -> Result<(), &'static str> {
-    use core::future::Future as _;
     use crate::ath9k::irq;
+    use core::future::Future as _;
     // No vector: the owner stays polled and service is a no-op.
     let model = Model::new();
     let mut packet = owner(model.clone()).map_err(|_| "prepare polled")?;
@@ -940,7 +950,7 @@ fn check_interrupt_service() -> Result<(), &'static str> {
     if packet.service_begin() != Err(Error::Access)
         || packet.phase() != Phase::Failed
         || reg(0x4000) != 0
-        || reg(0x4028) != 0x1000
+        || reg(0x4028) != 0
     {
         return Err("fatal sync cause did not close the owner");
     }

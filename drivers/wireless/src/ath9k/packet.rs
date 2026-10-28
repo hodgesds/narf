@@ -103,6 +103,11 @@ pub(super) trait Port {
     fn release(&self, buffers: Vec<DmaBuffer>) {
         drop(buffers);
     }
+    /// The flush-read proof needs PCIe ordering: a read completion may pass
+    /// earlier posted DMA writes only with Relaxed Ordering enabled.
+    fn ordered(&self) -> bool {
+        true
+    }
     /// Wake source when this function's MSI vector is installed. `None`
     /// keeps the owner on scheduled polling (no INTx route is claimed).
     fn interrupt(&self) -> Option<alloc::sync::Arc<super::irq::Signal>> {
@@ -1108,6 +1113,9 @@ impl<P: Port> Packet<P> {
     /// earlier device-originated posted DMA write (PCIe completions never pass
     /// posted requests), so idle engines here prove no outstanding access.
     fn quiescent(&self) -> Result<bool, Error> {
+        if !self.port.ordered() {
+            return Ok(false);
+        }
         if self.port.read(CR)? & 4 != 0 || self.port.read(DIAG)? & RX_PARK != RX_PARK {
             return Ok(false);
         }
@@ -1131,7 +1139,9 @@ impl<P: Port> Packet<P> {
         let rx = self.stop_receive();
         let tx = self.abort_transmit();
         let irq = super::irq::kill(&self.port, self.irq.is_some_and(|m| m.msi)).and(
-            if self.irq.take().is_some() {
+            // An armed vector is torn down even if chip interrupts were
+            // never enabled (start failed before `enable_interrupts`).
+            if self.irq.take().is_some() || self.port.interrupt().is_some() {
                 self.port.deliver(false)
             } else {
                 Ok(())

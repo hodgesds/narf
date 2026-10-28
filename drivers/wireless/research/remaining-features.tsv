@@ -60,9 +60,6 @@ ath9k	ht40	HT40	feature	drivers/wireless/specification/ath9k.md	588
 ath9k	idle_full_sleep	Idle FULL_SLEEP with use-counted wake and AWAKE restore	feature	drivers/wireless/specification/ath9k.md	597
 ath9k	larger_tx_aggregates	TX aggregates larger than the implemented two-MPDU sender	feature	drivers/wireless/specification/ath9k.md	588
 ath9k	periodic_calibration	Periodic calibration	feature	drivers/wireless/specification/ath9k.md	587
-ath9k	rejoin	Rejoin after terminal closure	feature	drivers/wireless/specification/ath9k.md	615
-ath9k	removal	Device removal	feature	drivers/wireless/specification/ath9k.md	615
-ath9k	reset	Native generation-safe reset	feature	drivers/wireless/specification/ath9k.md	615
 ath9k	sgi40	SGI40	feature	drivers/wireless/specification/ath9k.md	588
 ath9k	station_network_sleep	Station NETWORK_SLEEP power save with beacon timers	feature	drivers/wireless/specification/ath9k.md	600
 ath9k	system_suspend	System suspend/resume	feature	drivers/wireless/specification/ath9k.md	604

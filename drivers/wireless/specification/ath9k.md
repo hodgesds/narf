@@ -502,7 +502,9 @@ current capability invocation, including the actual configuration accesses.
   idle-high channel and ignored backoff while each QCU's pending count and
   TXE bit are polled up to 1000 times 5 us apart. IER is cleared and BME is
   disabled with readback. Only if every step succeeded and post-BME-off BAR
-  reads (which order behind earlier device-posted DMA writes) still show RXE,
+  reads (which order behind earlier device-posted DMA writes; the native port
+  requires PCIe Device Control Relaxed Ordering disabled, otherwise the proof
+  is refused) still show RXE,
   TXE and pending counts clear, RX parked and IER off, are the rings and
   buffers released (`Packet::reclaimed`). Any timeout, hang signature or
   access failure keeps every mapping pinned for the rest of the boot. The
@@ -653,8 +655,38 @@ DMA reclamation is implemented by the terminal stop described in §4 and
 covered by `smoke_ar9285_packet_dma_stop_proof_reclaims_storage` (held TX
 abort, never-started owner, wedged DCU and RX DMA with exact Linux poll
 budgets, DMADBG_7 hang and revoked authority), and by the ownership smoke,
-whose model device faults on any access to a released mapping. Reset/rejoin
-and removal still need an independently proved generation/reset owner.
+whose model device faults on any access to a released mapping.
+
+Generation reset, rejoin and removal build on that proof:
+
+- `reset`: `ath9k::reset_radio` (Linux `main.c::ath_reset` /
+  `hw.c::ath9k_hw_reset`) retires the current generation — host interface
+  withdrawn (`interface::retire`), station stopped, DMA-stop proof required
+  (`Radio::retire`). An unproven stop pins the owner forever (`pinned`), so no
+  successor can start while the function might still master. After verified
+  BME-off it re-runs the probe's AR_RTC power-on + warm reset and EEPROM read
+  on the same function, requires the identical identity and 376-byte factory
+  image, reprograms INI/PLL/RF (`phy::program`), discards the old calibration
+  receipt, bumps `generation` and re-enters the one-shot calibration, packet
+  preparation (fresh rings, fresh MSI vector) and station publication.
+- `rejoin`: after publication a supervisor watches the station; once it is
+  terminal (disassociation, peer loss, FATAL interrupt, failed DMA) it resets
+  into a fresh generation so the radio can be joined again. Three consecutive
+  failed resets, a removed owner or a pinned generation end supervision. Each
+  generation publishes a new `wlan%d` name; retired names stay reserved
+  (stable names are not claimed).
+- `removal`: `narf_bus::register_pci_remove` for both AR9285 and AR2427 match
+  names (Linux `pci.c::ath_pci_remove`). The hook marks the owner removed
+  before waiting (blocking any initialization, reset or supervisor), retires
+  the generation, drops the controller and releases the singleton address
+  only when DMA was reclaimed; otherwise the address stays quarantined.
+  `narf_drivers` has no bound-driver unrecord API, so the bound record is left.
+
+Covered by `smoke_ar9285_station_retirement_reports_exact_dma_reclamation`
+(reclaimed vs wedged DCU, idempotent retire) and
+`smoke_ar9285_native_device_retire_host_withdraws_generation` (carrier,
+interface table, reserved name, late TX, DMA stop). Physical chip reset and
+re-association after reset are unmeasured.
 
 Other ath9k devices need their own EEPROM maps, reset/PHY tables and
 descriptor/runtime variants before they can be claimed supported. The Linux

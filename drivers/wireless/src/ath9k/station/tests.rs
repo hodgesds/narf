@@ -1049,3 +1049,52 @@ kernel_test_in!(
     "drivers/wireless/ath9k/ht",
     smoke_ar9285_open_ht_native_qos_sequence_wrap_is_independent_of_legacy_control
 );
+/// Generation retirement (reset/rejoin/removal precondition): a joined
+/// station with a held TX descriptor is stopped with the Linux DMA-stop
+/// sequence and reports reclamation; a wedged DCU reports pinned storage.
+fn retirement() -> Result<(), &'static str> {
+    for wedged in [false, true] {
+        let mut f = fixture(true)?;
+        complete(f.radio.associate(AP, SSID, Some(Zeroizing::new(PMK)), &[]))
+            .map_err(|_| "native association")?;
+        f.peer.lock().hold_data = true;
+        let outbound = udp_ipv4(
+            f.plan.bssid,
+            f.plan.station,
+            f.plan.lease_ip,
+            f.plan.server_ip,
+            4001,
+            4002,
+            b"AR9285 held before reset",
+        );
+        f.radio.send(&outbound).map_err(|_| "held send")?;
+        if f.model.tx.get().is_none() || f.radio.terminal() {
+            return Err("fixture lacks pending native DMA");
+        }
+        f.model.stuck_tx.set(wedged);
+        let reclaimed = f.radio.retire();
+        if reclaimed == wedged
+            || !f.radio.terminal()
+            || f.radio.peer().is_some()
+            || f.model.master.get()
+            || f.model.released.borrow().is_empty() != wedged
+        {
+            return Err("retirement misreported DMA reclamation");
+        }
+        // Retiring again is idempotent and never re-claims or frees.
+        if f.radio.retire() != reclaimed || f.radio.poll().is_ok() {
+            return Err("retired generation reopened");
+        }
+    }
+    Ok(())
+}
+fn smoke_ar9285_station_retirement_reports_exact_dma_reclamation() -> TestResult {
+    match retirement() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/station",
+    smoke_ar9285_station_retirement_reports_exact_dma_reclamation
+);
