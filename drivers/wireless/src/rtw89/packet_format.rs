@@ -81,6 +81,16 @@ pub(super) const FIRMWARE_RA: u8 = 0x80;
 pub(super) const STOP_WPDMA: u32 = 1 << 19;
 /// Every ordinary TX stop bit this station can open (ACH0..3, CH8, WPDMA).
 pub(super) const STOP_ALL: u32 = 0xf00 | 1 << 16 | STOP_WPDMA;
+/// Wildcard-addressed probe request (`fc 0x40`, DA/BSSID broadcast) from
+/// `own`. It has no peer; the packet owner admits it without a peer token.
+pub(super) fn probe_request(frame: &[u8], own: [u8; 6]) -> bool {
+    frame.len() >= 24
+        && frame[0] == 0x40
+        && frame[1] == 0
+        && frame[4..10] == [0xff; 6]
+        && frame[10..16] == own
+        && frame[16..22] == [0xff; 6]
+}
 /// QoS TID of a QoS DATA header, if any.
 pub(super) fn qos_tid(frame: &[u8]) -> Option<u8> {
     (frame.first() == Some(&0x88)).then(|| frame.get(24).map(|b| b & 0x0f))?
@@ -109,6 +119,8 @@ pub(super) fn classify(frame: &[u8], own: [u8; 6]) -> Result<Queue, Error> {
         // Association, authentication, disassociation, deauthentication and
         // (Block Ack) action frames.
         0x00 | 0xb0 | 0xa0 | 0xc0 | 0xd0 if frame[1] & (3 | 64) == 0 => Ok(Queue::Management),
+        // Broadcast probe request of an active scan (see probe_request).
+        0x40 if probe_request(frame, own) => Ok(Queue::Management),
         0x08 if frame[1] & 3 == 1 && unicast(&frame[4..10]) => Ok(Queue::Data),
         // QoS DATA: TID0..7, normal ack policy, no EOSP/A-MSDU/TXOP bits.
         0x88 if frame[1] & 3 == 1

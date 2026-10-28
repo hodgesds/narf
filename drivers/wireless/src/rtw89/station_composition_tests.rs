@@ -101,6 +101,8 @@ pub(super) struct Peer {
     pub(super) station_ht: bool,
     /// Action frames sent by the station after authorization.
     pub(super) actions: Vec<Vec<u8>>,
+    /// Probe requests sent by the station.
+    pub(super) probes: Vec<Vec<u8>>,
 }
 impl Peer {
     pub(super) fn new(protected: bool) -> Self {
@@ -137,6 +139,7 @@ impl Peer {
             ht: None,
             station_ht: false,
             actions: Vec::new(),
+            probes: Vec::new(),
         }
     }
     pub(super) fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
@@ -172,6 +175,17 @@ impl Peer {
         Ok(frame)
     }
     pub(super) fn react(&mut self, frame: &[u8]) -> Result<(Vec<Vec<u8>>, bool), &'static str> {
+        if frame[0] == 0x40 {
+            // Answer like an AP: the beacon body as a directed probe response.
+            self.probes.push(frame.to_vec());
+            let mut response = self.ap.beacon();
+            response[0] = 0x50;
+            response[4..10].copy_from_slice(&self.plan.station);
+            if let Some(p) = &self.wmm {
+                response.extend_from_slice(p);
+            }
+            return Ok((vec![response], false));
+        }
         if frame.len() < 24 || frame[4..10] != AP || frame[10..16] != self.plan.station {
             return Err("native AP peer identity");
         }
@@ -1755,4 +1769,137 @@ fn smoke_rtw8852b_recipient_block_ack_reorders_and_tears_down() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89/block_ack",
     smoke_rtw8852b_recipient_block_ack_reorders_and_tears_down
+);
+
+fn smoke_rtw8852b_active_scan_probe_requests_and_extra_ies() -> TestResult {
+    let h = Harness::new(false);
+    let active = |ssids: Vec<Vec<u8>>, extra_ies: Vec<u8>| ScanRequest {
+        ssids,
+        frequencies_mhz: vec![2412],
+        channels: vec![1],
+        active: true,
+        random_mac: None,
+        colocated_6ghz: false,
+        duration_tu: Some(20),
+        duration_mandatory: false,
+        extra_ies,
+    };
+    let vendor = vec![221, 4, 0x00, 0x11, 0x22, 0x33];
+    let Ok(seen) = complete(h.device.scan(active(vec![SSID.to_vec()], vendor.clone()))) else {
+        return TestResult::Fail("active scan failed");
+    };
+    let probes = h.peer.lock().probes.clone();
+    let Some(probe) = probes.first() else {
+        return TestResult::Fail("no probe request transmitted");
+    };
+    let mut body = vec![0, SSID.len() as u8];
+    body.extend_from_slice(SSID);
+    body.extend_from_slice(&[1, 8, 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24]);
+    body.extend_from_slice(&[50, 4, 0x30, 0x48, 0x60, 0x6c, 3, 1, 1]);
+    body.extend_from_slice(&vendor);
+    if probes.len() != 1
+        || probe[..2] != [0x40, 0]
+        || probe[4..10] != [0xff; 6]
+        || probe[10..16] != OWN
+        || probe[16..22] != [0xff; 6]
+        || probe[24..] != body[..]
+        || seen.len() != 1
+        || seen[0].bssid != AP
+    {
+        return TestResult::Fail("directed probe request or response handling differs");
+    }
+    // Wildcard (no SSIDs) and one probe per requested SSID.
+    if complete(h.device.scan(active(Vec::new(), Vec::new()))).is_err()
+        || h.peer.lock().probes.last().map(|p| p[24..26].to_vec()) != Some(vec![0, 0])
+    {
+        return TestResult::Fail("wildcard probe request differs");
+    }
+    let before = h.peer.lock().probes.len();
+    if complete(
+        h.device
+            .scan(active(vec![SSID.to_vec(), b"other".to_vec()], Vec::new())),
+    )
+    .is_err()
+        || h.peer.lock().probes.len() != before + 2
+    {
+        return TestResult::Fail("per-SSID probe requests differ");
+    }
+    // Malformed or driver-owned IEs, oversize IEs, too many SSIDs and
+    // random MAC requests are refused without transmitting.
+    let before = h.peer.lock().probes.len();
+    for request in [
+        active(vec![SSID.to_vec()], vec![0, 1, 0x41]),
+        active(vec![SSID.to_vec()], vec![221, 9, 0]),
+        active(vec![SSID.to_vec()], vec![221; 513]),
+        active(vec![SSID.to_vec(); 9], Vec::new()),
+    ] {
+        if complete(h.device.scan(request)).is_ok() {
+            return TestResult::Fail("invalid active scan request accepted");
+        }
+    }
+    let mut random = active(Vec::new(), Vec::new());
+    random.random_mac = Some(narf_wireless::scan::ScanRandomMac {
+        addr: [2, 0, 0, 0, 0, 9],
+        mask: [0xff, 0xff, 0xff, 0, 0, 0],
+    });
+    if complete(h.device.scan(random)).is_ok() || h.peer.lock().probes.len() != before {
+        return TestResult::Fail("random-MAC scan accepted or probe sent");
+    }
+    if h.closed() && h.device.connected_bssid().is_some() {
+        return TestResult::Fail("station state disturbed by scans");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_active_scan_probe_requests_and_extra_ies
+);
+
+fn smoke_rtw8852b_scan_dwell_follows_requested_duration() -> TestResult {
+    let h = Harness::new(false);
+    let request = |duration_tu: Option<u16>, duration_mandatory: bool| ScanRequest {
+        ssids: vec![SSID.to_vec()],
+        frequencies_mhz: vec![2412],
+        channels: vec![1],
+        active: false,
+        random_mac: None,
+        colocated_6ghz: false,
+        duration_tu,
+        duration_mandatory,
+        extra_ies: Vec::new(),
+    };
+    // NL80211_ATTR_MEASUREMENT_DURATION in TUs -> dwell ceil(TU*1024/1000) ms.
+    for (tu, ms) in [(50u16, 52u64), (200, 205), (1000, 1024)] {
+        let start = h.env.clock.load(Ordering::Acquire);
+        let Ok(seen) = complete(h.device.scan(request(Some(tu), true))) else {
+            return TestResult::Fail("dwell-controlled scan failed");
+        };
+        let elapsed = h.env.clock.load(Ordering::Acquire) - start;
+        if seen.len() != 1 || !(ms..=ms + 1).contains(&elapsed) {
+            return TestResult::Fail("scan dwell differs from the requested duration");
+        }
+    }
+    // Default dwell without a request is 200ms.
+    let start = h.env.clock.load(Ordering::Acquire);
+    if complete(h.device.scan(request(None, false))).is_err()
+        || !(200..=201).contains(&(h.env.clock.load(Ordering::Acquire) - start))
+    {
+        return TestResult::Fail("default scan dwell differs");
+    }
+    // Out-of-range or missing mandatory durations are refused before scanning.
+    for (tu, mandatory) in [(Some(0), false), (Some(1001), true), (None, true)] {
+        let start = h.env.clock.load(Ordering::Acquire);
+        if !matches!(
+            complete(h.device.scan(request(tu, mandatory))),
+            Err(narf_wireless::WirelessError::InvalidArgs)
+        ) || h.env.clock.load(Ordering::Acquire) != start
+        {
+            return TestResult::Fail("invalid scan duration accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_scan_dwell_follows_requested_duration
 );

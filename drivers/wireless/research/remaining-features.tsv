@@ -283,7 +283,6 @@ rtw88	tx_path_diversity	TX path diversity on RTL8822C	feature	drivers/wireless/s
 rtw88	vht	VHT operation	feature	drivers/wireless/specification/rtw88.md	1467
 rtw88	wmm_all_access_categories	Packet scheduling across all WMM access categories	feature	drivers/wireless/specification/rtw88.md	1468
 rtw88	wow	Wake on Wireless on RTL8822CE	feature	drivers/wireless/specification/rtw88.md	1570
-rtw89	active_scanning	Active scanning through firmware scan offload	feature	drivers/wireless/specification/rtw89.md	1037
 rtw89	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw89.md	1006
 rtw89	aggregation	TX A-MPDU and TX A-MSDU/A-MSDU-in-A-MPDU aggregation	feature	drivers/wireless/specification/rtw89.md	1036
 rtw89	antenna_diversity_tracking	Dynamic antenna diversity/tracking	feature	drivers/wireless/specification/rtw89.md	713
@@ -312,8 +311,6 @@ rtw89	rtl8852c	RTL8852C retained runtime	chip	drivers/wireless/specification/rtw
 rtw89	rtl8922a	RTL8922A BE EFUSE/container/descriptor/transport/runtime	chip	drivers/wireless/specification/rtw89.md	1018
 rtw89	runtime_sleep	Runtime sleep/LPS	feature	drivers/wireless/specification/rtw89.md	1016
 rtw89	safe_rejoin	Safe reassociation/rejoin	feature	drivers/wireless/specification/rtw89.md	1016
-rtw89	scan_dwell_control	Requested per-channel scan dwell control	feature	drivers/wireless/specification/rtw89.md	1037
-rtw89	scan_probe_extra_ies	Driver-admitted extra probe-request IEs	feature	drivers/wireless/specification/rtw89.md	1037
 rtw89	six_ghz_operation	6GHz band operation on RTL8852C/RTL8922A	feature	drivers/wireless/specification/rtw89.md	1013
 rtw89	system_suspend	System suspend	feature	drivers/wireless/specification/rtw89.md	1009
 rtw89	tspec	TSPEC/WMM admission control (mac80211-owned host MLME)	feature	drivers/wireless/specification/rtw89.md	1044

@@ -323,7 +323,11 @@ impl Core {
         let next_id = id.checked_add(1).ok_or(Error::State)?;
         let result = port.current(|port| {
             port.ordinary_allowed()?;
-            port.peer_allowed(bytes)?;
+            // An active-scan probe request has no peer; everything else
+            // needs the current peer token.
+            if !format::probe_request(bytes, self.own) {
+                port.peer_allowed(bytes)?;
+            }
             let packet = Packet {
                 header: allocate(port, format::HEADER)?,
                 body: allocate(port, bytes.len())?,
@@ -380,7 +384,9 @@ impl Core {
                 }
             };
             port.ordinary_allowed()?;
-            port.peer_allowed(bytes)?;
+            if !format::probe_request(bytes, self.own) {
+                port.peer_allowed(bytes)?;
+            }
             // Before the FIRST descriptor write, the queue holds both DMA maps
             // as published; every uncertain failure retains them permanently.
             ring.queue.publish(ticket)?;

@@ -458,6 +458,14 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
     fn supports_scan_dwell(&self) -> bool {
         true
     }
+    /// `RTW89_SCANOFLD_MAX_SSID`.
+    fn max_scan_ssids(&self) -> u8 {
+        8
+    }
+    /// `RTW89_SCANOFLD_MAX_IE_LEN`.
+    fn max_scan_ie_len(&self) -> u16 {
+        512
+    }
     fn connected_bssid(&self) -> Option<[u8; 6]> {
         if !self.link_up() {
             return None;
@@ -507,7 +515,11 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             attempt.armed = false;
             return Err(WirelessError::Busy);
         }
-        let result = owner.station_scan(dwell).await;
+        let probe = request.active.then(|| station::Probe {
+            ssids: request.ssids.clone(),
+            ies: request.extra_ies.clone(),
+        });
+        let result = owner.station_scan(dwell, probe).await;
         attempt.armed = false;
         if result.is_err() {
             self.close();
@@ -617,11 +629,29 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         result.map_err(error)
     }
 }
+/// Caller probe IEs: well-formed TLVs within `max_scan_ie_len`
+/// (`RTW89_SCANOFLD_MAX_IE_LEN`), not duplicating driver-generated IEs.
+fn probe_ies_valid(mut ies: &[u8]) -> bool {
+    if ies.len() > 512 {
+        return false;
+    }
+    while !ies.is_empty() {
+        let Some(&[id, length]) = ies.get(..2) else {
+            return false;
+        };
+        if matches!(id, 0 | 1 | 3 | 50) || ies.len() < 2 + usize::from(length) {
+            return false;
+        }
+        ies = &ies[2 + usize::from(length)..];
+    }
+    true
+}
 fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
-    if request.active
-        || request.random_mac.is_some()
+    if request.random_mac.is_some()
         || request.colocated_6ghz
-        || !request.extra_ies.is_empty()
+        || (!request.active && !request.extra_ies.is_empty())
+        || !probe_ies_valid(&request.extra_ies)
+        || request.active && request.ssids.len() > 8
         || request.frequencies_mhz.iter().any(|f| *f != 2412)
         || request.channels.iter().any(|ch| *ch != 1)
         || request.ssids.len() > 32

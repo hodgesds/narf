@@ -318,7 +318,8 @@ impl Model {
             || kind == format::Queue::Management && word(24) & (0x1ff << 16) != 0
             || word(32) != 0
             || word(36) & !(1 << 10) != 0
-            || word(40) != 1 << 31 | 1 << 27
+            // BMC (no ACK) only for a broadcast probe request.
+            || word(40) != 1 << 31 | if body[0] == 0x40 && body[4] & 1 != 0 { 0 } else { 1 << 27 }
             || word(44) != 0
             || sequence & 0x8000 == 0
             || sequence & 0x7fff >= 512

@@ -208,6 +208,30 @@ enum Kind {
     Data,
     /// Block Ack action frames: like data, a missing ACK is not fatal.
     Action,
+    /// Broadcast probe request (never acknowledged).
+    Probe,
+}
+/// Active-scan probe content: SSIDs (empty = wildcard) and caller IEs.
+pub(super) struct Probe {
+    pub(super) ssids: Vec<Vec<u8>>,
+    pub(super) ies: Vec<u8>,
+}
+/// mac80211 `ieee80211_build_probe_req` for this 2.4GHz channel1 profile:
+/// SSID, Supported Rates (1,2,5.5,11,6,9,12,18), Extended Supported Rates
+/// (24,36,48,54), DS Parameter Set, then the caller's extra IEs.
+pub(super) fn probe_request(own: [u8; 6], ssid: &[u8], ies: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0x40, 0, 0, 0];
+    frame.extend_from_slice(&[0xff; 6]);
+    frame.extend_from_slice(&own);
+    frame.extend_from_slice(&[0xff; 6]);
+    frame.extend_from_slice(&[0, 0]);
+    frame.extend_from_slice(&[0, ssid.len() as u8]);
+    frame.extend_from_slice(ssid);
+    frame.extend_from_slice(&[1, 8, 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24]);
+    frame.extend_from_slice(&[50, 4, 0x30, 0x48, 0x60, 0x6c]);
+    frame.extend_from_slice(&[3, 1, 1]);
+    frame.extend_from_slice(ies);
+    frame
 }
 enum BaOp {
     Start(super::block_ack::Request, u16),
@@ -816,7 +840,9 @@ impl State {
         if pending.id != delivery.id || pending.bytes != delivery.bytes {
             return Err(Error::State);
         }
-        if !delivery.radio_acknowledged && !matches!(pending.kind, Kind::Data | Kind::Action) {
+        if !delivery.radio_acknowledged
+            && !matches!(pending.kind, Kind::Data | Kind::Action | Kind::Probe)
+        {
             return Err(Error::State);
         }
         if pending.kind == Kind::Security {
@@ -1040,6 +1066,17 @@ impl State {
         io: &mut impl Io,
         dwell_ms: u64,
     ) -> Result<Vec<ObservedBss>, Error> {
+        self.scan_with(io, dwell_ms, None).await
+    }
+    /// Scan channel 1 for `dwell_ms`. An active scan first transmits one
+    /// probe request per SSID (wildcard when none) like mac80211's software
+    /// scan, then listens for the dwell.
+    pub(super) async fn scan_with(
+        &mut self,
+        io: &mut impl Io,
+        dwell_ms: u64,
+        probe: Option<Probe>,
+    ) -> Result<Vec<ObservedBss>, Error> {
         if !(1..=1024).contains(&dwell_ms) {
             return Err(Error::Profile);
         }
@@ -1047,6 +1084,28 @@ impl State {
             return Err(Error::State);
         }
         let until = self.now()?.saturating_add(dwell_ms);
+        if let Some(probe) = probe {
+            let ssids = if probe.ssids.is_empty() {
+                vec![Vec::new()]
+            } else {
+                probe.ssids
+            };
+            for ssid in ssids {
+                while self.pending.is_some() {
+                    self.poll(io)?;
+                    if self.pending.is_none() {
+                        break;
+                    }
+                    if self.now()? >= until {
+                        return Ok(self.candidates());
+                    }
+                    self.environment.pause().await;
+                }
+                let frame = probe_request(self.own, &ssid, &probe.ies);
+                let admission = self.admission.clone();
+                admission.run(|| Ok(self.transmit(io, frame, Kind::Probe)))??;
+            }
+        }
         loop {
             self.poll(io)?;
             if self.now()? >= until {

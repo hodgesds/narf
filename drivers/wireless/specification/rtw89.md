@@ -1051,6 +1051,29 @@ program. Block Ack actions use a non-fatal ACK policy like data. Smokes:
 response, hole fill, BAR flush, DELBA, non-HT decline). Originator TX BA
 (CMAC AMPDU table) is tracked with TX A-MPDU as `block_ack_originator`.
 
+### Active scanning, probe IEs and dwell control
+
+`WirelessNetIface::scan` now accepts active channel-1 scans. The station
+transmits one broadcast probe request per requested SSID (a wildcard when
+none, at most `RTW89_SCANOFLD_MAX_SSID` 8) on the management queue, as
+mac80211's software scan does, then listens for the requested dwell. The
+request body follows `ieee80211_build_probe_req` for this 2.4GHz profile:
+SSID, Supported Rates 1..18Mbps, Extended Supported Rates 24..54Mbps, DS
+Parameter Set channel1, then caller IEs. Caller IEs must be well-formed
+TLVs within `RTW89_SCANOFLD_MAX_IE_LEN` (512, advertised as
+`max_scan_ie_len`) and may not duplicate the driver-generated elements;
+passive scans refuse them. A wildcard-addressed probe request from the own
+address is the only frame the packet owner admits without a peer token;
+it is sent BMC (no ACK) and a missing ACK is not fatal. The measured dwell
+equals `ceil(duration_tu * 1024 / 1000)` ms (default 200ms; 0, >1000TU or
+a missing mandatory duration are refused before any RF activity).
+Deviation: Linux uses firmware scan offload (`rtw89_hw_scan_*`) across
+channels; this profile is qualified for channel 1 only, so host probing on
+that channel is the faithful subset. Random-address scans remain refused
+(`randomized_scan_mac`): the RX address filter only accepts the own MAC.
+Smokes: `smoke_rtw8852b_active_scan_probe_requests_and_extra_ies`,
+`smoke_rtw8852b_scan_dwell_follows_requested_duration`.
+
 ### Live AP EDCA updates
 
 Bound peer beacons/probe responses on an open WMM link follow mac80211
