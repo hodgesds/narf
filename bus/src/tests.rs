@@ -347,7 +347,11 @@ fn smoke_bus_dt_decode_fixture_census() -> TestResult {
     let Some(bridge) = find("pci-host-ecam-generic") else {
         return TestResult::Fail("PCIe host bridge not decoded from DT");
     };
-    if bridge.regs != [(0x4010_0000_0000, 0x1000_0000)] {
+    // The ECAM window is the bridge's `reg` under the root's 2/2
+    // cells — (0x40_1000_0000, 0x1000_0000) per the blob's cells
+    // 0x00000040 0x10000000 | 0x00000000 0x10000000 — not the
+    // node's @10000000 name suffix (that is its low MMIO base).
+    if bridge.regs != [(0x40_1000_0000, 0x1000_0000)] {
         return TestResult::Fail("host bridge ECAM window mismatch");
     }
     let Some(pl061) = find("arm,pl061") else {
