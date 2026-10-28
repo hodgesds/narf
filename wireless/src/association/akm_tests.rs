@@ -41,6 +41,7 @@ fn bss(rsne: &[u8], rsnxe: Option<u8>) -> Bss {
         bssid: AP,
         ssid: b"narf".to_vec(),
         channel: 1,
+        band: None,
         signal_dbm: None,
         capability: 0x11,
         beacon_interval: 100,
@@ -89,7 +90,10 @@ fn sae_akm_capability() -> Result<(), &'static str> {
     }
     Ok(())
 }
-smoke!(smoke_join_sae_akm_capability_falls_back_to_akm8, sae_akm_capability);
+smoke!(
+    smoke_join_sae_akm_capability_falls_back_to_akm8,
+    sae_akm_capability
+);
 
 fn wpa2_legacy_unchanged() -> Result<(), &'static str> {
     // Default options keep the canonical AKM 2 / no-PMF body even when the
@@ -110,7 +114,10 @@ fn wpa2_legacy_unchanged() -> Result<(), &'static str> {
     }
     Ok(())
 }
-smoke!(smoke_join_wpa2_default_profile_unchanged, wpa2_legacy_unchanged);
+smoke!(
+    smoke_join_wpa2_default_profile_unchanged,
+    wpa2_legacy_unchanged
+);
 
 fn wpa2_pmf() -> Result<(), &'static str> {
     let options = JoinOptions::default()
@@ -127,8 +134,16 @@ fn wpa2_pmf() -> Result<(), &'static str> {
     {
         return Err("WPA2 PSK-SHA256 PMF plan has the wrong RSNE");
     }
-    let owner = Security::new(OWN, AP, &[7; 32], &p.rsn_body().unwrap(), &ap_rsne(&[6], MFPC | MFPR), None, 0)
-        .map_err(|_| "Security refused the WPA2 PMF RSNE")?;
+    let owner = Security::new(
+        OWN,
+        AP,
+        &[7; 32],
+        &p.rsn_body().unwrap(),
+        &ap_rsne(&[6], MFPC | MFPR),
+        None,
+        0,
+    )
+    .map_err(|_| "Security refused the WPA2 PMF RSNE")?;
     if !owner.pmf() {
         return Err("Security did not negotiate WPA2 PMF");
     }
@@ -138,8 +153,16 @@ fn wpa2_pmf() -> Result<(), &'static str> {
     if p.akm() != Some(KeyMgmt::Psk) || !p.pmf() {
         return Err("WPA2 AKM 2 with optional PMF not negotiated");
     }
-    let owner = Security::new(OWN, AP, &[7; 32], &p.rsn_body().unwrap(), &ap_rsne(&[2], MFPC), None, 0)
-        .map_err(|_| "Security refused AKM 2 + MFPC")?;
+    let owner = Security::new(
+        OWN,
+        AP,
+        &[7; 32],
+        &p.rsn_body().unwrap(),
+        &ap_rsne(&[2], MFPC),
+        None,
+        0,
+    )
+    .map_err(|_| "Security refused AKM 2 + MFPC")?;
     if !owner.pmf() {
         return Err("AKM 2 + MFPC owner without PMF");
     }
@@ -149,8 +172,16 @@ fn wpa2_pmf() -> Result<(), &'static str> {
     if p.pmf() || station_rsne(&p).map(|r| r.rsn_capabilities) != Some(MFPC) {
         return Err("optional PMF against a non-MFPC AP");
     }
-    let owner = Security::new(OWN, AP, &[7; 32], &p.rsn_body().unwrap(), &ap_rsne(&[2], 0), None, 0)
-        .map_err(|_| "Security refused optional PMF to a legacy AP")?;
+    let owner = Security::new(
+        OWN,
+        AP,
+        &[7; 32],
+        &p.rsn_body().unwrap(),
+        &ap_rsne(&[2], 0),
+        None,
+        0,
+    )
+    .map_err(|_| "Security refused optional PMF to a legacy AP")?;
     if owner.pmf() {
         return Err("PMF in force without AP MFPC");
     }
@@ -164,7 +195,18 @@ fn wpa2_pmf() -> Result<(), &'static str> {
         return Err("required PMF RSNE lacks MFPR");
     }
     // A WPA2 PMF RSNE is not an SAE owner.
-    if Security::new_sae(OWN, AP, &[7; 32], &p.rsn_body().unwrap(), None, &ap_rsne(&[6], MFPC | MFPR), None, 0).is_ok() {
+    if Security::new_sae(
+        OWN,
+        AP,
+        &[7; 32],
+        &p.rsn_body().unwrap(),
+        None,
+        &ap_rsne(&[6], MFPC | MFPR),
+        None,
+        0,
+    )
+    .is_ok()
+    {
         return Err("new_sae accepted a WPA2 PMF RSNE");
     }
     // AKM 6 without the local capability is not chosen.
@@ -175,7 +217,13 @@ fn wpa2_pmf() -> Result<(), &'static str> {
     // A non-default group management cipher cannot be protected.
     let mut gmac = RsnIe::decode_body(&ap_rsne(&[2], MFPC)).unwrap();
     gmac.group_management_cipher = Some(Suite::standard(rsn::CIPHER_BIP_GMAC_256));
-    if plan(&bss(&gmac.encode_body(), None), SecurityMode::Wpa2Psk, options).is_ok() {
+    if plan(
+        &bss(&gmac.encode_body(), None),
+        SecurityMode::Wpa2Psk,
+        options,
+    )
+    .is_ok()
+    {
         return Err("BIP-GMAC-256 AP admitted for PMF");
     }
     Ok(())

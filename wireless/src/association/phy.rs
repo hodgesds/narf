@@ -473,7 +473,13 @@ impl ApElements {
                         if value.he_op.is_some() {
                             return Err(Error::InvalidBss);
                         }
-                        value.he_op = Some(HeOperation::parse(rest)?);
+                        let op = HeOperation::parse(rest)?;
+                        // 6 GHz Operation Information belongs to a 6 GHz
+                        // BSS (`six_ghz::admit`), never this 2.4/5 GHz path.
+                        if op.six_ghz_operation().is_some() {
+                            return Err(Error::InvalidBss);
+                        }
+                        value.he_op = Some(op);
                     }
                     Some((&eht::EXT_EHT_CAPABILITIES, rest)) => {
                         if eht_cap.is_some() || rest.len() > 64 {
@@ -650,7 +656,8 @@ impl HtOperation {
                     38, 46, 54, 62, 102, 110, 118, 126, 134, 142, 151, 159, 167, 175,
                 ]
                 .contains(&center),
-                None => false,
+                // HT Operation never describes a 6 GHz channel.
+                Some(channel::Band::Ghz6) | None => false,
             };
             if !valid || body[1] & 4 == 0 {
                 return Err(Error::InvalidBss);

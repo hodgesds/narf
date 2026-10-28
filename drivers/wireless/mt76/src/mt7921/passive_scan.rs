@@ -253,6 +253,7 @@ pub(super) fn beacon(packet: &[u8], nss: u8) -> Option<ScanBss> {
         bssid,
         ssid: ssid?,
         channel,
+        band: None,
         signal_dbm: signal,
         capability: u16::from_le_bytes([frame[34], frame[35]]),
         beacon_interval: u16::from_le_bytes([frame[32], frame[33]]),

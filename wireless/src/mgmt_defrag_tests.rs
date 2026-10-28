@@ -189,6 +189,7 @@ fn smoke_mgmt_defrag_fragmented_association_response_is_admitted() -> TestResult
         bssid: AP,
         ssid: b"narf".to_vec(),
         channel: 1,
+        band: None,
         signal_dbm: None,
         capability: 1,
         beacon_interval: 100,

@@ -237,6 +237,7 @@ fn bss(cap: [u8; 26], op: [u8; 22], vht: Option<([u8; 12], [u8; 5])>, selector: 
         bssid: AP,
         ssid: b"narf".to_vec(),
         channel: op[0],
+        band: None,
         signal_dbm: None,
         capability: 1,
         beacon_interval: 100,

@@ -48,6 +48,7 @@ pub(super) fn prepared_with_phy(
         bssid: AP,
         ssid: b"narf".to_vec(),
         channel: 6,
+        band: None,
         signal_dbm: Some(-45),
         capability: u16::from_le_bytes([beacon[34], beacon[35]]),
         beacon_interval: 100,

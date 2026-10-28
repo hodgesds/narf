@@ -109,6 +109,7 @@ fn ap(eht: Option<(Vec<u8>, Vec<u8>)>, he: bool, selector: Option<u8>) -> Bss {
         bssid: AP,
         ssid: b"narf".to_vec(),
         channel: 36,
+        band: None,
         signal_dbm: None,
         capability: 1,
         beacon_interval: 100,

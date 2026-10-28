@@ -11,6 +11,7 @@ fn bss(mandatory: bool, capability: u16) -> Bss {
         bssid: AP,
         ssid: b"narf".to_vec(),
         channel: 1,
+        band: None,
         signal_dbm: None,
         capability,
         beacon_interval: 100,

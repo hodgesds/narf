@@ -210,6 +210,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             ssid: wire::owned(&cached.ssid)?,
             channel: channel::from_frequency(u32::from(cached.frequency))
                 .ok_or(Error::Unsupported)?,
+            band: None,
             signal_dbm: None, // Native SNR is not an invented RSSI measurement.
             capability: cached.capability,
             beacon_interval: cached.beacon_interval,

@@ -28,6 +28,43 @@ bitflags::bitflags! {
         /// Receive/passive discovery only until a driver proves a supported
         /// relaxation; no active probes or host-initiated station TX.
         const NO_IR      = 1 << 3;
+        /// cfg80211 `NL80211_RRF_NO_6GHZ_VLP_CLIENT`: a client may not
+        /// connect to a 6 GHz Very Low Power AP under this rule.
+        const NO_6GHZ_VLP_CLIENT = 1 << 4;
+        /// cfg80211 `NL80211_RRF_NO_6GHZ_AFC_CLIENT`: a client may not
+        /// connect to a 6 GHz Standard Power (AFC) AP under this rule.
+        const NO_6GHZ_AFC_CLIENT = 1 << 5;
+    }
+}
+
+/// 6 GHz AP regulatory power type (`enum ieee80211_ap_reg_power`): Low
+/// Power Indoor, Standard Power (AFC-controlled) or Very Low Power.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerType6Ghz {
+    Lpi,
+    Sp,
+    Vlp,
+}
+
+impl RegRule {
+    /// True when `mhz` lies inside `[freq_start_mhz, freq_end_mhz]`.
+    pub fn covers_mhz(&self, mhz: u32) -> bool {
+        (self.freq_start_mhz..=self.freq_end_mhz).contains(&mhz)
+    }
+    /// `NO_6GHZ_AFC_CLIENT`: also selects LPI for an Indoor SP AP
+    /// (`cfg80211_6ghz_power_type`).
+    pub fn no_6ghz_afc_client(&self) -> bool {
+        self.flags.contains(RegFlags::NO_6GHZ_AFC_CLIENT)
+    }
+    /// cfg80211 `cfg80211_6ghz_power_type_valid`: whether a station may
+    /// associate with a 6 GHz AP of `power` under this rule. LPI is always
+    /// permitted by the rule itself (INDOOR_ONLY still applies).
+    pub fn allows_6ghz_client(&self, power: PowerType6Ghz) -> bool {
+        match power {
+            PowerType6Ghz::Lpi => true,
+            PowerType6Ghz::Sp => !self.flags.contains(RegFlags::NO_6GHZ_AFC_CLIENT),
+            PowerType6Ghz::Vlp => !self.flags.contains(RegFlags::NO_6GHZ_VLP_CLIENT),
+        }
     }
 }
 

@@ -107,14 +107,14 @@ iwlwifi	persistent_key_history	Persistent key history	feature	drivers/wireless/s
 iwlwifi	platform_power_owner	Gen3 and Sc live platform TX-power enforcement owner	feature	drivers/wireless/specification/iwlwifi.md	1556
 iwlwifi	rss	Receive-side scaling	feature	drivers/wireless/specification/iwlwifi.md	1555
 iwlwifi	sched_scan_offload	Scheduled-scan (PNO/net-detect) firmware offload	feature	drivers/wireless/specification/iwlwifi.md	1557
-iwlwifi	six_ghz	6GHz operation on applicable 6E/7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1557
+iwlwifi	six_ghz	6GHz operation on applicable 6E/7 profiles [API available: association::Bss.band / channel::Band::Ghz6 / frequency_in, he::HeOperation::six_ghz_operation, association::six_ghz::{admit, admit_with_rule, He6GhzCapability, He6GhzOperation}, reg::PowerType6Ghz + RegFlags::NO_6GHZ_{VLP,AFC}_CLIENT (wireless spec 3, 6 GHz band identity); a 6 GHz JoinPlan is not yet available]	feature	drivers/wireless/specification/iwlwifi.md	1557
 iwlwifi	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/iwlwifi.md	1555
 iwlwifi	width_160	160MHz operation on applicable profiles	feature	drivers/wireless/specification/iwlwifi.md	1557
 iwlwifi	width_320	320MHz operation on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1557
 iwlwifi	wow	Wake on WLAN	feature	drivers/wireless/specification/iwlwifi.md	1555
 mt76	ap_mode	Access Point mode (mt792x_init_wiphy NL80211_IFTYPE_AP)	feature	drivers/wireless/specification/mt7921.md	1315
 mt76	associated_active_scan	Active scanning while associated	feature	drivers/wireless/specification/mt7921.md	1322
-mt76	colocated_6ghz_scan	Colocated 6 GHz scanning	feature	drivers/wireless/specification/mt7921.md	1268
+mt76	colocated_6ghz_scan	Colocated 6 GHz scanning [API available: association::Bss.band / channel::Band::Ghz6 / frequency_in, he::HeOperation::six_ghz_operation, association::six_ghz::{admit, admit_with_rule, He6GhzCapability, He6GhzOperation}, reg::PowerType6Ghz + RegFlags::NO_6GHZ_{VLP,AFC}_CLIENT (wireless spec 3, 6 GHz band identity); a 6 GHz JoinPlan is not yet available]	feature	drivers/wireless/specification/mt7921.md	1268
 mt76	country_wmm_constraints	Country-specific WMM constraints	feature	drivers/wireless/specification/mt7921.md	1198
 mt76	fragmentation	TX fragmentation under a configured wiphy fragmentation threshold (RX defragmentation implemented)	feature	drivers/wireless/specification/mt7921.md	1302
 mt76	loadable_packet_abi	Loadable wireless packet ABI	feature	drivers/wireless/specification/mt7921.md	1194
@@ -128,7 +128,7 @@ mt76	other_tx_ba_tids	Transmit BA on TIDs beyond retained TID0	feature	drivers/w
 mt76	p2p_mode	P2P client / GO / device roles	feature	drivers/wireless/specification/mt7921.md	1315
 mt76	per_domain_iommu	Per-domain IOMMU mappings	feature	drivers/wireless/specification/mt7921.md	1167
 mt76	pmf	Protected management frames (PMF) [API available: association::JoinOptions::{akms: AkmSet, pmf: Pmf} negotiates AKM 8 fallback without AKM 24 and WPA2-PSK/PSK-SHA256 with MFPC/MFPR; JoinPlan::akm()/pmf(); Security::new admits the WPA2 PMF RSNE (wireless spec 3, AKM capability and WPA2 PMF)]	feature	drivers/wireless/specification/mt7921.md	1283
-mt76	six_ghz_operation	6 GHz radio operation	feature	drivers/wireless/specification/mt7921.md	1268
+mt76	six_ghz_operation	6 GHz radio operation [API available: association::Bss.band / channel::Band::Ghz6 / frequency_in, he::HeOperation::six_ghz_operation, association::six_ghz::{admit, admit_with_rule, He6GhzCapability, He6GhzOperation}, reg::PowerType6Ghz + RegFlags::NO_6GHZ_{VLP,AFC}_CLIENT (wireless spec 3, 6 GHz band identity); a 6 GHz JoinPlan is not yet available]	feature	drivers/wireless/specification/mt7921.md	1268
 mt76	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/mt7921.md	1309
 mt76	wpa3_sae	WPA3-Personal / SAE authentication [API available: association::JoinOptions::{akms: AkmSet, pmf: Pmf} negotiates AKM 8 fallback without AKM 24 and WPA2-PSK/PSK-SHA256 with MFPC/MFPR; JoinPlan::akm()/pmf(); Security::new admits the WPA2 PMF RSNE (wireless spec 3, AKM capability and WPA2 PMF)]	feature	drivers/wireless/specification/mt7921.md	1283
 rtl8xxxu	additional_operating_channels	Noninitial operating channels and safe FIFO retuning; blocked on per-channel signed N8PC envelope rows beyond channel1 and a FIFO-safe retune while bulk RX is posted, which needs endpoint_reset/slot reuse	feature	drivers/wireless/specification/rtl8xxxu.md	594
@@ -221,7 +221,7 @@ rtw89	rtl8852c	RTL8852C retained runtime	chip	drivers/wireless/specification/rtw
 rtw89	rtl8922a	RTL8922A BE EFUSE/container/descriptor/transport/runtime	chip	drivers/wireless/specification/rtw89.md	1018
 rtw89	runtime_sleep	Runtime sleep/LPS	feature	drivers/wireless/specification/rtw89.md	1016
 rtw89	safe_rejoin	Safe reassociation/rejoin	feature	drivers/wireless/specification/rtw89.md	1281
-rtw89	six_ghz_operation	6GHz band operation on RTL8852C/RTL8922A	feature	drivers/wireless/specification/rtw89.md	1013
+rtw89	six_ghz_operation	6GHz band operation on RTL8852C/RTL8922A [API available: association::Bss.band / channel::Band::Ghz6 / frequency_in, he::HeOperation::six_ghz_operation, association::six_ghz::{admit, admit_with_rule, He6GhzCapability, He6GhzOperation}, reg::PowerType6Ghz + RegFlags::NO_6GHZ_{VLP,AFC}_CLIENT (wireless spec 3, 6 GHz band identity); a 6 GHz JoinPlan is not yet available]	feature	drivers/wireless/specification/rtw89.md	1013
 rtw89	system_suspend	System suspend	feature	drivers/wireless/specification/rtw89.md	1283
 rtw89	tspec	TSPEC/WMM admission control (mac80211-owned host MLME)	feature	drivers/wireless/specification/rtw89.md	1044
 rtw89	uapsd	U-APSD	feature	drivers/wireless/specification/rtw89.md	933

@@ -57,6 +57,7 @@ fn bss(rsne: Option<Vec<u8>>, rsnxe: Option<u8>, h2e_only: bool) -> Bss {
         bssid: AP,
         ssid: SSID.to_vec(),
         channel: 1,
+        band: None,
         signal_dbm: None,
         capability: 0x11,
         beacon_interval: 100,

@@ -15,6 +15,7 @@ fn bss(wpa2: bool) -> ScanBss {
         bssid: AP,
         ssid: b"narf".to_vec(),
         channel: 6,
+        band: None,
         signal_dbm: Some(-50),
         capability: if wpa2 { 0x11 } else { 1 },
         beacon_interval: 100,

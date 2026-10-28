@@ -298,6 +298,64 @@ MFPC|MFPR, SPP) and `Security::pmf()` is then true when both sides set
 MFPC: the IGTK is required in M3, BIP and unicast robust-frame CCMP apply as
 for SAE. `Security::new_sae` refuses non-SAE AKMs.
 
+**6 GHz band identity (`association::{channel, six_ghz}`, `reg`).**
+`channel::Band` gains `Ghz6`. `channel::band(u8)` still classifies only the
+2.4/5 GHz legacy numbering and never returns it.
+- `channel::frequency_in(Band, u8) -> Option<u32>` is cfg80211
+  `ieee80211_channel_to_freq_khz` in MHz (6 GHz: 5950 + 5n MHz, channel 2 =
+  5935 MHz).
+- `channel::from_frequency_band(mhz) -> Option<(Band, u8)>` is the inverse.
+- `channel::valid_6ghz(u8)` tests a 6 GHz channel number.
+
+`association::Bss` gains `band: Option<Band>`. `None` means the 2.4/5 GHz
+numbering, so existing literals add `band: None`. `Bss::band()` returns the
+explicit band or the derived one, and `Bss::frequency_mhz()` returns the
+primary frequency. `observe` records the explicit band. `JoinPlan` stays a
+2.4/5 GHz plan and refuses a BSS whose explicit band disagrees with
+`channel::band(channel)`, so a 6 GHz channel 1 is never joined as 2412 MHz.
+The `scan::BssInfo.frequency_mhz` scan identity is unchanged.
+
+`he::HeOperation::parse` accepts 6 GHz Operation Information and exposes it
+as `six_ghz_operation() -> Option<six_ghz::He6GhzOperation>`. The 2.4/5 GHz
+`phy::ApElements` parser still refuses an HE Operation that carries it.
+
+`six_ghz::He6GhzOperation { primary, control, ccfs0, ccfs1, min_rate }`
+provides:
+- `channel() -> Result<SixGhzChannel, Error>`: mac80211
+  `ieee80211_chandef_he_6ghz_oper`, HE-only path. It returns 20/40/80/160 or
+  80+80 MHz, `center_mhz` and `center2_mhz`, with the primary validated
+  inside an aligned span.
+- `regulatory_info()`.
+- `power_type(no_afc_client) -> Option<reg::PowerType6Ghz>`: cfg80211
+  `cfg80211_6ghz_power_type`, Linux v7.2 four-bit REG_INFO, where Indoor SP
+  falls back to LPI under NO_6GHZ_AFC_CLIENT.
+- `duplicate_beacon()`.
+
+`six_ghz::He6GhzCapability` (element ID extension 59,
+`EXT_HE_6GHZ_CAPABILITIES`; `parse`, `new`, `bits`, `min_mpdu_start`,
+`max_ampdu_len_exp`, `max_mpdu_len`, `sm_ps`, `rd_responder`, `element()`)
+is the band capability. `ieee80211_put_he_6ghz_cap` builds it from the
+station's own values.
+
+`six_ghz::admit(ies, primary) -> Result<SixGhzBss, Error>` is mac80211
+`ieee80211_determine_chan_mode` for 6 GHz. HE Capabilities, HE 6 GHz Band
+Capabilities and an HE Operation with 6 GHz information whose primary equals
+the receive channel are all required, there is no legacy fallback, and every
+element appears once. A missing capability is `UnsupportedRates`. The result
+`SixGhzBss` carries both HE elements, the band capability, the 6 GHz
+operation, the channel and the power type.
+`six_ghz::admit_with_rule(ies, primary, &RegRule)` also applies cfg80211
+`cfg80211_6ghz_power_type_valid` (`UnsupportedRates` on a power mismatch).
+
+`reg::RegFlags` gains `NO_6GHZ_VLP_CLIENT` and `NO_6GHZ_AFC_CLIENT` (NRGD flag
+bits 4 and 5; nl80211 `NL80211_RRF_NO_6GHZ_*_CLIENT`). It is joined by
+`reg::PowerType6Ghz { Lpi, Sp, Vlp }` and the `RegRule` methods
+`covers_mhz`, `no_6ghz_afc_client` and `allows_6ghz_client(PowerType6Ghz)`.
+
+A 6 GHz `JoinPlan` (OFDM-only rates, the HE 6 GHz capability in the request,
+a LocalPhy HE 6 GHz profile) is future work. Drivers that associate
+through firmware use `six_ghz::admit` for the station-side admission facts.
+
 **WPA3-SAE JoinPlan (`association::{SaePwe, SaeJoin, SaeStep}`).**
 `SecurityMode::Wpa3Sae { pwe: SaePwe }` (`HuntAndPeck` / `HashToElement` /
 `Both` = wpa_supplicant `sae_pwe` 0/1/2; `is_sae()`, `is_rsn()`; `is_wpa2()`

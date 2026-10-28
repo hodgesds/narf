@@ -14,6 +14,8 @@ pub mod he;
 pub mod phy;
 #[path = "association/sae_join.rs"]
 mod sae_join;
+#[path = "association/six_ghz.rs"]
+pub mod six_ghz;
 #[path = "association/uhr.rs"]
 pub mod uhr;
 pub use sae_join::{SaeJoin, SaePwe, SaeStep};
@@ -24,10 +26,26 @@ pub struct Bss {
     pub bssid: [u8; 6],
     pub ssid: Vec<u8>,
     pub channel: u8,
+    /// The band `channel` is numbered in. `None` is the 2.4/5 GHz legacy
+    /// numbering (`channel::band(channel)`); 6 GHz channel numbers collide
+    /// with 2.4/5 GHz ones and must say `Some(Band::Ghz6)`.
+    pub band: Option<channel::Band>,
     pub signal_dbm: Option<i8>,
     pub capability: u16,
     pub beacon_interval: u16,
     pub information_elements: Vec<u8>,
+}
+impl Bss {
+    /// The band of `channel`: the explicit `band`, else the 2.4/5 GHz
+    /// legacy numbering. `None` for an unknown channel.
+    pub fn band(&self) -> Option<channel::Band> {
+        self.band.or_else(|| channel::band(self.channel))
+    }
+    /// Centre frequency of the primary channel in MHz (cfg80211
+    /// `ieee80211_channel_to_freq_khz`).
+    pub fn frequency_mhz(&self) -> Option<u32> {
+        channel::frequency_in(self.band()?, self.channel)
+    }
 }
 /// Decoded raw beacon/probe facts. These carry no channel, transmit, key or
 /// association authority; the driver supplies its immutable receive channel.
@@ -454,6 +472,7 @@ fn observe_inner(
             bssid: bytes[10..16].try_into().map_err(|_| Error::InvalidBss)?,
             ssid: ssid.ok_or(Error::InvalidBss)?,
             channel,
+            band: channel::band(channel),
             signal_dbm,
             capability,
             beacon_interval,
@@ -656,6 +675,8 @@ impl JoinPlan {
             || !unicast(bss.bssid)
             || own == bss.bssid
             || channel::band(bss.channel).is_none()
+            // JoinPlan is a 2.4/5 GHz plan; an explicit band must agree.
+            || bss.band.is_some_and(|band| Some(band) != channel::band(bss.channel))
             || bss.information_elements.len() > 2048
             || ssid.is_empty()
             || ssid.len() > 32

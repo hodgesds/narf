@@ -249,6 +249,7 @@ fn admission() -> Result<(), &'static str> {
         bssid: [2, 0, 0, 0, 0, 2],
         ssid: b"narf".to_vec(),
         channel: 36,
+        band: None,
         signal_dbm: None,
         capability: 1,
         beacon_interval: 100,

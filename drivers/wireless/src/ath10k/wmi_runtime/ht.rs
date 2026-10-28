@@ -91,6 +91,7 @@ pub(super) fn bss(cached: &ScanBss) -> Result<Bss, Error> {
         ssid: cached.ssid.clone(),
         channel: association::channel::from_frequency(u32::from(cached.frequency))
             .ok_or(Error::Unsupported)?,
+        band: None,
         signal_dbm: None,
         capability: cached.capability,
         beacon_interval: cached.beacon_interval,

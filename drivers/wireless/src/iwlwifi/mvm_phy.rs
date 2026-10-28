@@ -684,6 +684,7 @@ impl super::Owner {
             bssid,
             ssid: b.ssid.clone(),
             channel,
+            band: None,
             signal_dbm: None,
             capability: b.capabilities,
             beacon_interval: b.interval,

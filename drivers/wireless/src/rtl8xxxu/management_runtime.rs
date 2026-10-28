@@ -143,6 +143,7 @@ impl Candidate {
                 bssid: bytes[10..16].try_into().unwrap(),
                 ssid: ssid.ok_or(Error::Frame)?,
                 channel,
+                band: None,
                 signal_dbm: None,
                 capability,
                 beacon_interval,

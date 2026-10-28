@@ -211,6 +211,7 @@ impl Owner {
             bssid: beacon.bssid,
             ssid: beacon.ssid.clone(),
             channel: beacon.channel,
+            band: None,
             signal_dbm: None,
             capability: beacon.capabilities,
             beacon_interval: beacon.interval,

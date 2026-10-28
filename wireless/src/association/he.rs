@@ -277,11 +277,14 @@ pub struct HeOperation {
     basic: u16,
     vht: Option<[u8; 3]>,
     co_hosted: Option<u8>,
+    /// 6 GHz Operation Information (`ieee80211_he_6ghz_oper`).
+    six_ghz: Option<[u8; 5]>,
 }
 impl HeOperation {
     /// Exact `ieee80211_he_oper_size` length. Reserved bits are ignored on
-    /// reception (IEEE802.11-2020 9.2.2). Six-GHz Operation Information is
-    /// refused here because this plan admits only 2.4/5GHz BSSs.
+    /// reception (IEEE802.11-2020 9.2.2). 6 GHz Operation Information is
+    /// parsed into `six_ghz_operation()`; the 2.4/5 GHz `ApElements` path
+    /// refuses an element that carries it, and `six_ghz::admit` requires it.
     pub fn parse(body: &[u8]) -> Result<Self, Error> {
         if body.len() < 6 {
             return Err(Error::InvalidBss);
@@ -292,17 +295,34 @@ impl HeOperation {
             + if params & OP_VHT_INFO != 0 { 3 } else { 0 }
             + usize::from(params & OP_CO_HOSTED != 0)
             + if params & OP_6GHZ_INFO != 0 { 5 } else { 0 };
-        if body.len() != expected || params & OP_6GHZ_INFO != 0 {
+        if body.len() != expected {
             return Err(Error::InvalidBss);
         }
         let vht = (params & OP_VHT_INFO != 0).then(|| [body[6], body[7], body[8]]);
-        let co_hosted = (params & OP_CO_HOSTED != 0).then(|| body[expected - 1]);
+        let six_ghz = (params & OP_6GHZ_INFO != 0).then(|| {
+            let at = expected - 5;
+            [
+                body[at],
+                body[at + 1],
+                body[at + 2],
+                body[at + 3],
+                body[at + 4],
+            ]
+        });
+        let co_hosted = (params & OP_CO_HOSTED != 0)
+            .then(|| body[expected - 1 - if six_ghz.is_some() { 5 } else { 0 }]);
         Ok(Self {
             params,
             basic,
             vht,
             co_hosted,
+            six_ghz,
         })
+    }
+    /// The 6 GHz Operation Information field, when present.
+    pub fn six_ghz_operation(&self) -> Option<super::six_ghz::He6GhzOperation> {
+        self.six_ghz
+            .map(super::six_ghz::He6GhzOperation::from_bytes)
     }
     pub fn default_pe_duration(&self) -> u8 {
         (self.params & 7) as u8
@@ -534,6 +554,8 @@ pub(super) fn negotiate(
             _ => (Width::Twenty, false),
         },
         channel::Band::Ghz5 if !both(PHY0_40_80_5G) => (Width::Twenty, false),
+        // `channel::band` never yields 6 GHz; see `six_ghz::admit`.
+        channel::Band::Ghz6 => return Err(Error::InvalidBss),
         channel::Band::Ghz5 => match (width, discontiguous) {
             (Width::OneSixty, false) if both(PHY0_160_5G) => (Width::OneSixty, false),
             (Width::OneSixty, true) if both(PHY0_80P80_5G) => (Width::OneSixty, true),
