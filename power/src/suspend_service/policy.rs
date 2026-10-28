@@ -37,6 +37,7 @@
 //!    deferred to #1008, deliberately not built here.
 
 use alloc::vec::Vec;
+use core::fmt;
 
 use super::anchor::{AnchorError, AnchorKind, KeyCustodyAnchor, UnwrapCtx};
 use super::custody::Secret32;
@@ -674,6 +675,44 @@ pub struct PolicyChange<'a> {
     pub token_verification: Option<TokenVerification>,
 }
 
+// Manual Debug impls for the three flow types above: they hold
+// `&dyn KeyCustodyAnchor` references, which carry no Debug of
+// their own, and an anchor is a custody seam — the honest Debug
+// surface is the factor *shape* (bucket counts and the plain
+// policy fields), never anything an anchor could print.
+impl fmt::Debug for FactorSet<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FactorSet")
+            .field("tokens", &self.tokens.len())
+            .field("tpms", &self.tpms.len())
+            .field("passphrases", &self.passphrases.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for FreshInstall<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FreshInstall")
+            .field("factors", &self.factors)
+            .field("floor", &self.floor)
+            .field("recovery_opt_out", &self.recovery_opt_out)
+            .field("token_verification", &self.token_verification)
+            .finish()
+    }
+}
+
+impl fmt::Debug for PolicyChange<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PolicyChange")
+            .field("level", &self.level)
+            .field("factors", &self.factors)
+            .field("off_confirmation", &self.off_confirmation)
+            .field("include_recovery", &self.include_recovery)
+            .field("token_verification", &self.token_verification)
+            .finish()
+    }
+}
+
 /// Rotate the service to a fresh SMS epoch realizing `level` over
 /// `factors` — the shared core of level changes and same-level
 /// re-enrollment. OFF rotates nothing (OFF images are written
@@ -724,7 +763,7 @@ fn rotate_for_level<E: KeyEntropy>(
             svc.rotate_epoch_composition(&factors.tokens, &factors.tpms)?;
             if include_recovery {
                 for anchor in &factors.passphrases {
-                    svc.enroll(anchor)?;
+                    svc.enroll(*anchor)?;
                 }
             }
             Ok(())
@@ -793,13 +832,13 @@ impl PolicyStore {
             PolicyLevel::Token => {
                 svc.create_epoch()?;
                 for anchor in &install.factors.tokens {
-                    svc.enroll(anchor)?;
+                    svc.enroll(*anchor)?;
                 }
                 // Decision 2: the recovery slot defaults ON for
                 // the first epoch; opting out is the explicit act.
                 if !install.recovery_opt_out {
                     for anchor in &install.factors.passphrases {
-                        svc.enroll(anchor)?;
+                        svc.enroll(*anchor)?;
                     }
                 }
             }
@@ -809,7 +848,7 @@ impl PolicyStore {
                 }
                 svc.create_epoch()?;
                 for anchor in &install.factors.passphrases {
-                    svc.enroll(anchor)?;
+                    svc.enroll(*anchor)?;
                 }
             }
             _ => unreachable!("fresh-install default is Token or Passphrase"),

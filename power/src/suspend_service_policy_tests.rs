@@ -38,6 +38,7 @@
 extern crate alloc;
 
 use alloc::rc::Rc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
