@@ -6412,7 +6412,6 @@ pub(crate) fn release_dumb_backing_ref(card_index: u32, gem_handle: u32) {
 // every 512th — so a steady 60 fps costs a line every ~8 seconds.
 
 static SETCRTC_N: AtomicU64 = AtomicU64::new(0);
-static DIRTYFB_N: AtomicU64 = AtomicU64::new(0);
 static PAGEFLIP_N: AtomicU64 = AtomicU64::new(0);
 static ATOMIC_N: AtomicU64 = AtomicU64::new(0);
 static BLIT_N: AtomicU64 = AtomicU64::new(0);
@@ -6827,18 +6826,6 @@ fn handle_dirty_fb(
         (crtcs, frame)
     };
     let rows = frame.as_ref().map_or(0..0, |f| cmd.rows(&clips, f.height));
-    let (log, n) = should_log(&DIRTYFB_N);
-    if log {
-        let _ = writeln!(
-            narf_console::Writer,
-            "  drm: DIRTYFB #{n} fb={} crtcs={} backing={} rows={}..{}",
-            cmd.fb_id,
-            crtcs.len(),
-            if frame.is_some() { "yes" } else { "NONE" },
-            rows.start,
-            rows.end
-        );
-    }
     // A request whose clips cover no row changes nothing on screen.
     if let Some(f) = frame.filter(|_| !rows.is_empty()) {
         for crtc in crtcs {
