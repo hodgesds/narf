@@ -329,7 +329,8 @@ impl<'a, M: MmioWindow + ?Sized> AuxChannel for IntelAux<'a, M> {
         req: &AuxRequest<'_>,
         reply_buf: &'b mut [u8],
     ) -> Result<AuxResponse<'b>, AuxError> {
-        // Encode the request into the on-wire 4..20 byte frame.
+        // Encode the request into the on-wire 3..20 byte frame (3 =
+        // an I²C address-only request).
         let mut wire = [0u8; 20];
         let n = encode_request(req, &mut wire)?;
 

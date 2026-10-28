@@ -2575,8 +2575,9 @@ pub mod tests {
         /// Run one AUX transaction against the sink model:
         /// unpack the wire frame from the AUX DATA registers,
         /// dispatch it, and leave the reply in the DATA
-        /// registers. Returns the reply length in bytes.
-        fn aux_engine(&self) -> usize {
+        /// registers. `msgsize` is the request length from
+        /// AUX_CTL. Returns the reply length in bytes.
+        fn aux_engine(&self, msgsize: usize) -> usize {
             use crate::intel_gpu_aux::{DDI_AUX_DATA_DWORDS, DDI_AUX_DATA_OFFSET};
             let base = Ddi::A.base() + DDI_AUX_DATA_OFFSET;
             let mut wire = [0u8; 20];
@@ -2589,6 +2590,9 @@ pub mod tests {
             let len = (wire[3] as usize) + 1;
             let mut reply = [0u8; 17]; // status byte + payload
             let reply_len = match cmd {
+                // I²C address-only (the bare 3-byte header): a
+                // start or, MOT clear, the STOP. Ack, no data.
+                _ if msgsize == 3 => 1,
                 0x8 => {
                     // Native write.
                     self.sink.borrow_mut().write(addr, &wire[4..4 + len]);
@@ -2724,7 +2728,9 @@ pub mod tests {
                 }
                 o if o == Ddi::A.base() + DDI_AUX_CTL_OFFSET => {
                     if val & AUX_CTL_SEND_BUSY != 0 {
-                        let reply_len = self.aux_engine();
+                        let msgsize =
+                            ((val & AUX_CTL_MSGSIZE_MASK) >> AUX_CTL_MSGSIZE_SHIFT) as usize;
+                        let reply_len = self.aux_engine(msgsize);
                         let ctl = (val & !AUX_CTL_SEND_BUSY & !AUX_CTL_MSGSIZE_MASK)
                             | ((reply_len as u32) << AUX_CTL_MSGSIZE_SHIFT)
                             | crate::intel_gpu_aux::AUX_CTL_DONE;

@@ -664,7 +664,8 @@ fn smoke_dp_aux_native_read_request_round_trip() -> TestResult {
     let req = AuxRequest {
         cmd: AuxCommand::NativeRead,
         address: 0x0_2000, // DPCD_REV
-        data: &[],
+        // A read's `data` is its length placeholder: one byte.
+        data: &[0],
     };
     let mut wire = [0u8; 4];
     let n = match encode_request(&req, &mut wire) {
@@ -676,6 +677,9 @@ fn smoke_dp_aux_native_read_request_round_trip() -> TestResult {
     }
     if wire[0] >> 4 != AuxCommand::NativeRead as u8 {
         return TestResult::Fail("command nibble mis-encoded");
+    }
+    if wire[3] != 0 {
+        return TestResult::Fail("one-byte read must encode LEN-1 = 0");
     }
     // Reply: 1 status byte + 1 data byte. ACK + data 0x14 (DP 1.4).
     let raw_reply = [0x00u8, 0x14];
@@ -1000,7 +1004,9 @@ kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_displayobj_iter_paths);
 
 fn smoke_dp_edid_over_aux_round_trip() -> TestResult {
     // StubAux that returns canned EDID bytes for I2C reads at
-    // address 0x50<<1 + read flag.
+    // address 0x50<<1 + read flag, and checks the Linux
+    // `drm_dp_i2c_xfer` shape: MOT on the offset write and every
+    // read burst, then an address-only read without MOT (STOP).
     use crate::dp_aux::{AuxChannel, AuxCommand, AuxError, AuxRequest, AuxResponse, AuxStatus};
     use crate::dp_edid::read_panel_edid;
 
@@ -1027,6 +1033,9 @@ fn smoke_dp_edid_over_aux_round_trip() -> TestResult {
     struct StubAux {
         edid: [u8; 128],
         cursor: usize,
+        /// I²C transaction open (no STOP seen since the start).
+        open: bool,
+        stops: usize,
     }
     impl AuxChannel for StubAux {
         fn transact<'a>(
@@ -1035,26 +1044,30 @@ fn smoke_dp_edid_over_aux_round_trip() -> TestResult {
             reply_buf: &'a mut [u8],
         ) -> Result<AuxResponse<'a>, AuxError> {
             match req.cmd {
-                AuxCommand::I2cWrite => {
+                AuxCommand::I2cWriteMot => {
                     // The driver writes the EDID offset (0) to
                     // position the slave; reset the cursor.
                     self.cursor = 0;
+                    self.open = true;
                     reply_buf[0] = 0;
                     Ok(AuxResponse {
                         status: AuxStatus::Ack,
                         data: &reply_buf[1..1],
                     })
                 }
-                AuxCommand::I2cRead | AuxCommand::I2cReadMot => {
-                    // Serve the read burst starting at cursor.
-                    // `read_edid_block` issues one I2C transaction
-                    // per block with MOT clear on every burst but
-                    // the last (DP 1.4a §2.7.6), so a stub that
-                    // only answers I2cReadMot rejects the very
-                    // first chunk; the MOT bit does not change
-                    // what bytes a read returns. Reply with
-                    // exactly the bytes copied, not the buffer's
-                    // capacity.
+                AuxCommand::I2cRead if req.data.is_empty() && self.open => {
+                    // Address-only, MOT clear: the STOP.
+                    self.open = false;
+                    self.stops += 1;
+                    reply_buf[0] = 0;
+                    Ok(AuxResponse {
+                        status: AuxStatus::Ack,
+                        data: &reply_buf[1..1],
+                    })
+                }
+                AuxCommand::I2cReadMot if self.open => {
+                    // Return up to (reply_buf.len() - 1) bytes
+                    // starting at cursor.
                     let n = reply_buf.len() - 1;
                     reply_buf[0] = 0;
                     let end = (self.cursor + n).min(self.edid.len());
@@ -1070,12 +1083,20 @@ fn smoke_dp_edid_over_aux_round_trip() -> TestResult {
             }
         }
     }
-    let mut aux = StubAux { edid, cursor: 0 };
+    let mut aux = StubAux {
+        edid,
+        cursor: 0,
+        open: false,
+        stops: 0,
+    };
     let mut buf = [0u8; 128];
     let parsed = match read_panel_edid(&mut aux, &mut buf) {
         Ok(e) => e,
         Err(_) => return TestResult::Fail("read_panel_edid rejected stub bytes"),
     };
+    if aux.open || aux.stops != 1 {
+        return TestResult::Fail("block read must end with exactly one STOP");
+    }
     if parsed.manufacturer() != *b"AMD" {
         return TestResult::Fail("manufacturer round-trip");
     }
