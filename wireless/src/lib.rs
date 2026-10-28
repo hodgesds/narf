@@ -28,7 +28,10 @@ pub mod station_security;
 pub mod wmm;
 
 pub use iface::{AccessCategory, WirelessError, WirelessIface, WirelessIfaceInfo};
-pub use scan::{BssInfo, ScanFlags, ScanRandomMac, ScanRequest, ScanResult};
+pub use scan::{
+    BssInfo, ColocatedAp, Scan6GhzPlan, Scan6GhzTarget, ScanFlags, ScanRandomMac, ScanRequest,
+    ScanResult,
+};
 
 /// One `struct ieee80211_iface_limit` exposed through nl80211.
 #[derive(Clone, Debug, PartialEq, Eq)]

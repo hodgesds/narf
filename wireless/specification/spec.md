@@ -412,6 +412,35 @@ station-side admission facts.
 
 2.4/5 GHz plans are byte-for-byte unchanged.
 
+**Colocated 6 GHz scan (`scan::{parse_colocated_aps, plan_6ghz_scan,
+ColocatedAp, Scan6GhzPlan, Scan6GhzTarget, short_ssid, is_psc_6ghz}`).**
+- `parse_colocated_aps(ies) -> Vec<ColocatedAp>` is cfg80211
+  `cfg80211_parse_colocated_ap` (Linux v7.2 net/wireless/scan.c). It reads
+  the Reduced Neighbor Report elements (`EID_REDUCED_NEIGHBOR_REPORT` = 201)
+  of one 2.4/5 GHz beacon or probe response and keeps only TBTT-type entries
+  with a 6 GHz operating class (131..=135, 137), a TBTT length of 8, 9 or at
+  least 12, a valid unicast BSSID and the colocated-AP bit. Disabled MLD
+  links and repeated BSSID/channel pairs are dropped. A malformed RNR, or a
+  missing or oversized SSID element, yields nothing.
+- `ColocatedAp` carries `bssid`, `channel`/`frequency_mhz`, `short_ssid`
+  (reported, or the reporter's when `same_ssid`), `ssid` (when
+  `same_ssid`), the BSS-parameter flags (`oct_recommended`, `same_ssid`,
+  `multi_bss`, `transmitted_bssid`, `unsolicited_probe`, `colocated_ess`)
+  and `psd_20` (`PSD_RESERVED` when absent).
+- `plan_6ghz_scan(&ScanRequest, &[ColocatedAp], bssid) -> Scan6GhzPlan` is
+  `cfg80211_scan_6ghz`. Without `ScanRequest::colocated_6ghz` it scans
+  every requested 6 GHz frequency and produces no targets. With it, PSC
+  channels (`is_psc_6ghz`: channel % 16 == 5) are scanned blind unless a
+  directed one-SSID scan found a colocated-ESS AP with that SSID. Each
+  colocated AP on a requested channel that matches the SSIDs
+  (`cfg80211_find_ssid_match`, by SSID or `short_ssid()` CRC-32) and the
+  optional BSSID becomes a `Scan6GhzTarget` (`frequency_mhz`, `channel`,
+  `bssid`, `short_ssid`, `unsolicited_probe`, `psd_20`, `psc_no_listen`).
+  Channel usability stays with the driver.
+- `ScanResult` gains `colocated_6ghz: Vec<ColocatedAp>`, so a driver that
+  honours `colocated_6ghz` can return the APs it collected. `BssInfo` and
+  `ScanRequest` are unchanged.
+
 **WPA3-SAE JoinPlan (`association::{SaePwe, SaeJoin, SaeStep}`).**
 `SecurityMode::Wpa3Sae { pwe: SaePwe }` (`HuntAndPeck` / `HashToElement` /
 `Both` = wpa_supplicant `sae_pwe` 0/1/2; `is_sae()`, `is_rsn()`; `is_wpa2()`
