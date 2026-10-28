@@ -293,8 +293,10 @@ native BSSID/mode and complete bounded actual association request/response
 RSN snapshots under its current source and full occupied-power grant. An
 exact-consumption local check rejects partial/trailing RSN fields before any
 BIP default normalization; valid legacy18/default20/22/explicit26 extents remain.
-An MFPC AP requires matching actual response MFPC/MFPR and PSK/CCMP/BIP-CMAC128
-facts; missing, malformed or changed proof closes that submitted lifecycle.
+A present response RSNE from an MFPC AP must match its MFPC/MFPR and
+PSK/CCMP/BIP-CMAC128 facts; malformed or changed proof closes that submitted
+lifecycle. An omitted (non-FT) response RSNE is admitted as protected, per
+IEEE 802.11-2020 12.6.3 negotiation and Linux `brcmf_configure_wpaie`.
 An AP without MFPC can complete unprotected, including an absent response
 RSNE, without falsely setting protected metadata. Another real native ring
 idle precedes port publication. Current policy, cancellation, host close and
@@ -310,10 +312,10 @@ real Open/WPA2 protected/unprotected DHCP/IP, including occupied VHT80.
 Existing required-PMF coverage remains. These additions pass coordinated
 software gates and do not establish firmware-internal BIP or physical PMF.
 
-Broad optional-PMF interoperability remains open: MFPC APs omitting response
-RSNE require a source-proven native negotiated-MFP indication. The local
-Linux ABI supplies no such `sta_info` flag. Configured1 or IOCTL success
-cannot replace that proof. This residual is not closed by the bounded profile.
+MFPC APs omitting the response RSNE now complete as protected associations
+(Linux v7.2 `cfg80211.c::brcmf_configure_wpaie` trusts firmware's `mfp`; see
+[CYW §3](cyw43439.md) for the IEEE 802.11-2020 9.3.3.6/12.6.3 argument). The
+shared `optional_pmf` smokes cover that admission on both families.
 
 ### Firmware-qualified HT20/HT40 and short GI admission
 

@@ -147,7 +147,9 @@ pub(super) fn proof<F: Factory>(factory: &mut F) -> Result<(), &'static str> {
         return Err("AP MFPR without MFPC reached native association");
     }
     drop(invalid_ap);
-    for kind in 0..12 {
+    // kind 0 (an MFPC AP omitting its response RSNE) is a valid negotiated
+    // association and is admitted below.
+    for kind in 1..12 {
         let mut plan = Conversation::new(1, if kind == 2 { 0 } else { 128 });
         match kind {
             0 => plan.response = Some(Vec::new()),
@@ -185,9 +187,9 @@ pub(super) fn proof<F: Factory>(factory: &mut F) -> Result<(), &'static str> {
             return Err("late valid key receipt revived failed optional PMF proof");
         }
     }
-    for ap in [0, 128] {
+    for (ap, omitted) in [(0, true), (128, false), (128, true)] {
         let mut plan = Conversation::new(1, ap);
-        if ap == 0 {
+        if omitted {
             plan.response = Some(Vec::new());
         } else {
             let mut default = rsne(128);
@@ -199,7 +201,7 @@ pub(super) fn proof<F: Factory>(factory: &mut F) -> Result<(), &'static str> {
         let h = factory.create(true, true, plan, None)?;
         associate(&h, 1, true)?;
         if protected(&h) != (ap != 0) {
-            return Err("absent non-MFPC response/default BIP semantics invented protection");
+            return Err("absent response RSNE/default BIP changed negotiated protection");
         }
     }
     Ok(())

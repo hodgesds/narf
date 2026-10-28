@@ -229,9 +229,16 @@ impl<R: Fullmac> Station<R> {
         if ies.len() != length || request != profile.rsn() {
             return Err(Error::Unsupported);
         }
-        // CAPABLE1 is policy, not an assertion that PMF was negotiated. For
-        // an optional protected association require original AP response RSN
-        // evidence as well as the firmware-owned completed key exchange.
+        // A response RSNE, when present, must agree with the AP's advertised
+        // capabilities. Its absence is normal: IEEE 802.11-2020 9.3.3.6/
+        // 9.3.3.7 carry an RSNE in a (Re)Association Response only for FT
+        // (and OCI/OWE cases outside this profile), and 12.6.3 negotiates
+        // MFP when both the AP's advertised RSNE and the STA's request RSNE
+        // set MFPC. Both are verified above (profile.ap_mfp from the
+        // selected BSS, the transmitted assoc_req_ies RSNE, and the firmware
+        // `mfp` readback); Linux v7.2 `cfg80211.c::brcmf_configure_wpaie`
+        // likewise sets bsscfg `mfp` from the connect RSNE and trusts
+        // firmware without any negotiated-state readback.
         let actual = if response == 0 {
             None
         } else {
@@ -255,8 +262,6 @@ impl<R: Fullmac> Station<R> {
             {
                 return Err(Error::Unsupported);
             }
-        } else if profile.mode() == 1 && profile.protected() {
-            return Err(Error::Unsupported);
         }
         Ok(profile.protected())
     }
