@@ -696,8 +696,14 @@ impl Firmware {
         if !self.hold_tx {
             while let Some((id, flow)) = self.completions.pop_front() {
                 let ring = pointer(state, RINGS + 3 * 16 + 8);
-                let at = usize::from(self.tx_write) * 16;
-                let entry = &mut state.dma.get_mut(&ring).unwrap()[at..at + 16];
+                // Shared 7 TX status items are 24 bytes (msgbuf.h).
+                let size = if word(state, SHARED) & 0xff >= 7 {
+                    24
+                } else {
+                    16
+                };
+                let at = usize::from(self.tx_write) * size;
+                let entry = &mut state.dma.get_mut(&ring).unwrap()[at..at + size];
                 entry.fill(0);
                 entry[0] = 0x10;
                 entry[4..8].copy_from_slice(&id.to_le_bytes());
@@ -712,8 +718,14 @@ impl Firmware {
             let (id, address) = self.rx_posts.pop_front().unwrap();
             state.dma.get_mut(&address).unwrap()[256..256 + bytes.len()].copy_from_slice(&bytes);
             let ring = pointer(state, RINGS + 4 * 16 + 8);
-            let at = usize::from(self.rx_write) * 32;
-            let entry = &mut state.dma.get_mut(&ring).unwrap()[at..at + 32];
+            // Shared 7 RX completion items are 40 bytes (msgbuf.h).
+            let size = if word(state, SHARED) & 0xff >= 7 {
+                40
+            } else {
+                32
+            };
+            let at = usize::from(self.rx_write) * size;
+            let entry = &mut state.dma.get_mut(&ring).unwrap()[at..at + size];
             entry.fill(0);
             entry[0] = 0x12;
             entry[4..8].copy_from_slice(&id.to_le_bytes());
@@ -998,7 +1010,7 @@ fn create_inner(
         &crate::brcmfmac::provision::Assets,
     )>,
 ) -> Result<(TestAdapter, Handle), runtime::Error> {
-    assert!(matches!(version, 5 | 6));
+    assert!(matches!(version, 5..=7));
     let (bus, state) = model();
     {
         let mut s = state.lock();

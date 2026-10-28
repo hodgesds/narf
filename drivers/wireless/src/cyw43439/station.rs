@@ -154,7 +154,9 @@ impl<R: Fullmac> Station<R> {
                 Err(error) => return Err(error),
             };
         let pmkid_v3 = match get_var(&mut runtime, "wlc_ver", pmksa::WLC_VERSION_LEN).await {
-            Ok(reply) => pmksa::v3_from_wlc_version(&reply)?,
+            // A reply shorter than brcmf_wlc_version_le carries no WLC
+            // major version: keep the v1 list.
+            Ok(reply) => pmksa::v3_from_wlc_version(&reply).unwrap_or(false),
             Err(Error::Firmware(_)) => false,
             Err(error) => return Err(error),
         };

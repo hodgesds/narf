@@ -71,6 +71,8 @@ pub(crate) struct Firmware {
     pub bssid: [u8; 6],
     /// Peer the scripted join completes against (`SET_SSID`).
     pub join_events: bool,
+    /// Firmware is associated (with `bssid`) after a join until disassoc.
+    pub associated: bool,
     pub assoc_req_ies: Vec<u8>,
     pub assoc_resp_ies: Vec<u8>,
     pub hook: Option<Hook>,
@@ -94,6 +96,7 @@ impl Firmware {
             channels: vec![1, 6, 11],
             bssid: AP,
             join_events: true,
+            associated: false,
             assoc_req_ies: Vec::new(),
             assoc_resp_ies: Vec::new(),
             hook: None,
@@ -181,6 +184,7 @@ impl Firmware {
                 Ok(Vec::new())
             }
             (Direction::Set, 26) if self.join_events => {
+                self.associated = true;
                 let peer = self.bssid;
                 self.event(16, 0, 1, peer, &[]);
                 self.event(0, 0, 0, peer, &[]);
@@ -194,7 +198,8 @@ impl Firmware {
                 Ok(Vec::new())
             }
             (Direction::Set, 52) => {
-                if let Some(peer) = self.link {
+                if core::mem::take(&mut self.associated) {
+                    let peer = self.bssid;
                     self.event(16, 0, 0, peer, &[]);
                 }
                 Ok(Vec::new())

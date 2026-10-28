@@ -191,7 +191,10 @@ impl<B: Bus> Runtime<B> {
             shared,
             ..
         } = boot;
-        if bus.dma_enabled()? || !(5..=6).contains(&shared.version) || shared.rx_dataoffset != 0 {
+        // Shared 7 (BRCMF_PCIE_SHARED_VERSION_7) keeps the v6 ring-info
+        // layout and only widens the D2H TX/RX completion items to 24/40
+        // bytes (pcie.c brcmf_ring_itemsize vs brcmf_ring_itemsize_pre_v7).
+        if bus.dma_enabled()? || !(5..=7).contains(&shared.version) || shared.rx_dataoffset != 0 {
             return Err(Error::Protocol);
         }
         let mut bytes = [0; RINGINFO_SIZE];
@@ -240,7 +243,7 @@ impl<B: Bus> Runtime<B> {
         }
         let mut rings = Vec::new();
         for id in 0..5u8 {
-            let layout = msgbuf::ring_layout(id, true).ok_or(Error::Protocol)?;
+            let layout = msgbuf::ring_layout(id, shared.version < 7).ok_or(Error::Protocol)?;
             let mut memory =
                 bus.allocate(usize::from(layout.depth) * usize::from(layout.item_len))?;
             if memory.len() < usize::from(layout.depth) * usize::from(layout.item_len) {

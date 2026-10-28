@@ -621,7 +621,8 @@ fn composition_native(
     Ok(())
 }
 fn smoke_brcmf_native_open_station_to_dhcp_and_bidirectional_ip() -> TestResult {
-    for version in [5, 6] {
+    // Shared 7 runs the same conversation over 24/40-byte D2H completions.
+    for version in [5, 6, 7] {
         if let Err(error) = composition(version, false, false) {
             return TestResult::Fail(error);
         }
@@ -647,7 +648,7 @@ kernel_test_in!(
     smoke_brcmf_native_open_station_to_dhcp_and_bidirectional_ip
 );
 fn smoke_brcmf_native_wpa2_station_to_dhcp_and_bidirectional_ip() -> TestResult {
-    for version in [5, 6] {
+    for version in [5, 6, 7] {
         for first in [false, true] {
             if let Err(error) = composition(version, true, first) {
                 return TestResult::Fail(error);

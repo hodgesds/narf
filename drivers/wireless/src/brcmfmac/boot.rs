@@ -264,9 +264,9 @@ impl<B: Bus> Cr4<B> {
         let mut bytes = [0; 76];
         self.bus.read_tcm(shared, &mut bytes)?;
         let info = SharedInfo::parse(&bytes).ok_or(Error::Metadata)?;
-        // First runtime handles v5/v6 classic msgbuf and TCM indices. No v7
-        // admission until its completion geometry has a real runtime owner.
-        if !(5..=6).contains(&info.version)
+        // The runtime handles v5/v6 classic msgbuf and v7's wider D2H
+        // completion items (Linux brcmf_ring_itemsize) over TCM indices.
+        if !(5..=7).contains(&info.version)
             || info.rx_dataoffset != 0
             || !self.ram.contains(info.ring_info_addr, 58)
             || !self.ram.contains(info.htod_mb_data_addr, 4)

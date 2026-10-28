@@ -55,7 +55,7 @@ fn native(version: u32, secured: bool) -> Result<(), &'static str> {
     Ok(())
 }
 fn smoke_brcmf_wmm_negotiated_state_and_per_fifo_native_flows() -> TestResult {
-    for version in [5, 6] {
+    for version in [5, 6, 7] {
         for secured in [false, true] {
             if let Err(error) = native(version, secured) {
                 return TestResult::Fail(error);

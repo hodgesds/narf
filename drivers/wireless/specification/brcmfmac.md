@@ -147,9 +147,14 @@ metadata. Firmware RAM hints may shrink, never enlarge discovered RAM.
 
 `runtime::Runtime<B: runtime::Bus>::attach(Booted<B>)` owns five common rings,
 eight IOCTL-response buffers, eight event buffers, request input, scratch and
-ring-update memory. Shared versions5/6 use checked disjoint TCM metadata and
-16-bit indices at 4-byte strides. Nonzero rx_dataoffset descriptor-prefix
-geometries and v7 remain gated before any DMA allocation/publication. Optional host DMA-index
+ring-update memory. Shared versions5/6/7 use checked disjoint TCM metadata and
+16-bit indices at 4-byte strides. Shared 7 keeps the v6 ring-info layout and
+selects Linux `brcmf_ring_itemsize` (24-byte TX status, 40-byte RX complete)
+instead of `brcmf_ring_itemsize_pre_v7` for the D2H rings; the completion
+fields consumed here are unchanged (smokes `drivers/wireless/brcmfmac/station`
+Open/WPA2 DHCP/IP and `drivers/wireless/brcmfmac/wmm` run on shared 5/6/7
+with the firmware model writing v7-stride completions). Nonzero rx_dataoffset descriptor-prefix
+geometries remain gated before any DMA allocation/publication. Optional host DMA-index
 fields are cleared to select the supported TCM fallback. All DMA allocations
 and host addresses are retained before publication and before enabling BME.
 
@@ -559,7 +564,7 @@ descriptor flags (`BRCMF_MSGBUF_PKT_FLAGS_PRIO_SHIFT`); a priority from a
 different FIFO is a protocol error. Smoke: `drivers/wireless/brcmfmac/wmm`.
 
 Additional software outside that retained profile remains: nonzero descriptor
-prefixes/shared 7, other CPU/RAM/chip/OTP selectors (including 160 MHz-capable
+prefixes, other CPU/RAM/chip/OTP selectors (including 160 MHz-capable
 chips), HE/EHT profiles, monitor mode (which owns native802.11 RX and its
 metadata), larger flow budgets, AP, replayed
 recovery/system PM, confirmed stop/IOMMU quiescence and DMA reclamation, and IRQ delivery.

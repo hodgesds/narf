@@ -179,14 +179,20 @@ fn failures() -> Result<(), &'static str> {
             Err(Error::Malformed),
             Err(Error::Failed),
         ];
+        // A failed re-key is consumed by the poll inside complete_roam,
+        // which then has no pending roam left to report.
         if (fault < 2 && result != expected[fault])
-            || (fault == 2 && result.is_ok())
+            || (fault == 2 && !matches!(result, Ok(None) | Err(_)))
             || station.bssid.is_some()
             || station.roam_pending().is_some()
             || station.runtime.fw.link.is_some()
             || !station.runtime.fw.failed
         {
-            return Err("failed roam did not stay closed and poison the runtime");
+            return Err(match fault {
+                0 => "inadmissible roamed channel did not close and poison",
+                1 => "roamed BSSID mismatch did not close and poison",
+                _ => "failed roam re-key did not close and poison",
+            });
         }
     }
     // Deauthentication by the new peer during a roam is a plain link loss.
