@@ -36,26 +36,26 @@ ath11k	ipq6018_enablement	IPQ6018 native SoC/AHB profile enablement; Qualcomm So
 ath11k	ipq8074_enablement	IPQ8074 native SoC/AHB profile enablement; Qualcomm SoC layer (drivers/soc/qcom: DT platform device, SCM/PAS, MDT loader, SMEM/SMP2P, GCC resets, Q6 remoteprocs) and ath11k AHB glue (ahb.rs: of_match, hw_params, CE/DP IRQ map, AhbIo register access, DT resources, qcom,rproc boot) are implemented and fixture-tested; residual blockers: QRTR over GLINK-SMEM for WLFW QMI (Linux rpmsg/qcom_glink_smem.c, net/qrtr/smd.c), AHB HIF wiring (AhbIo ChipIo and CE IE enables exist; no CeHif<AhbIo> with a per-CE GIC CeIrq source, no DP ext-IRQ group service, no admission into the HwRev-keyed runtime), GIC/IPCC/SMP2P interrupt delivery for DT devices into Q6v5::signal and Smp2p::handle_interrupt, and wlfw::Wlfw::new refusing fixed_bdf_addr/fixed_mem_region; plus the multi-pdev core/HTT/DP runtime (max_radios 3, single_pdev_only=false, rxdma1 monitor rings, per-pdev WMI CE7/CE9) with ipq8074_ops, and an IPQ8074 WCSS DT binding (mainline ipq8074.dtsi has no remoteproc node and gcc-ipq8074.c no GCC_WCSSAON_RESET)	chip	drivers/wireless/specification/ath11k.md	1933
 ath11k	qcn9074_enablement	QCN9074 native HAL/core/DP/runtime enablement; unported Linux hw.c/hal.c qcn9074 profile: register map and hw_ops (hal_rx_desc_qcn9074), static BAR windows, non-shadow SRNG setup, per-pdev core and HTT peer-map-v2 RX/REO/DP runtime	chip	drivers/wireless/specification/ath11k.md	1893
 ath11k	wcn6750_enablement	WCN6750 native platform profile enablement; Qualcomm SoC layer (drivers/soc/qcom: DT platform device, SCM/PAS, MDT loader, SMEM/SMP2P, GCC resets, Q6 remoteprocs) and ath11k AHB glue (ahb.rs: of_match, hw_params, CE/DP IRQ map, AhbIo register access, DT resources, qcom,rproc boot) are implemented and fixture-tested; residual blockers: QRTR over GLINK-SMEM for WLFW QMI (Linux rpmsg/qcom_glink_smem.c, net/qrtr/smd.c), AHB HIF wiring (AhbIo ChipIo and CE IE enables exist; no CeHif<AhbIo> with a per-CE GIC CeIrq source, no DP ext-IRQ group service, no admission into the HwRev-keyed runtime), GIC/IPCC/SMP2P interrupt delivery for DT devices into Q6v5::signal and Smp2p::handle_interrupt, and wlfw::Wlfw::new refusing hybrid_bus_type (DEVICE_INFO); plus the hybrid HIF (ath11k_pcic over DT MSI vectors), RPMh xo and cx/mx proxy votes with AOSS QMP load_state around the WPSS PAS start, and the unported hal_rx_desc_qcn9074 layout	chip	drivers/wireless/specification/ath11k.md	1933
-ath9k	additional_channels	Live operation on additional channels	feature	drivers/wireless/specification/ath9k.md	587
-ath9k	ar5416_enablement	AR5416/AR5418 (168c:0023/0024) native enablement	chip	drivers/wireless/specification/ath9k.md	623
-ath9k	ar9160_enablement	AR9160 (168c:0027) native enablement	chip	drivers/wireless/specification/ath9k.md	625
-ath9k	ar9280_enablement	AR9280 (168c:0029/002a) native enablement	chip	drivers/wireless/specification/ath9k.md	626
-ath9k	ar9287_enablement	AR9287 (168c:002d/002e) native enablement	chip	drivers/wireless/specification/ath9k.md	628
-ath9k	ar9300_enablement	AR9380/AR9390 (168c:0030) native enablement	chip	drivers/wireless/specification/ath9k.md	630
-ath9k	ar9462_enablement	AR9462 (168c:0034) native enablement	chip	drivers/wireless/specification/ath9k.md	634
-ath9k	ar9485_enablement	AR9485/AR1111 (168c:0032/0037) native enablement	chip	drivers/wireless/specification/ath9k.md	632
-ath9k	ar9565_enablement	AR9565 (168c:0036) native enablement	chip	drivers/wireless/specification/ath9k.md	636
-ath9k	ar9580_enablement	AR9580 (168c:0033) native enablement	chip	drivers/wireless/specification/ath9k.md	633
-ath9k	channel_retuning	Channel retuning	feature	drivers/wireless/specification/ath9k.md	587
-ath9k	factory_profile_selection	Additional factory-profile selection	feature	drivers/wireless/specification/ath9k.md	587
-ath9k	host_bus_pm	PCIe ASPM host-bus power management	feature	drivers/wireless/specification/ath9k.md	607
-ath9k	ht40	HT40	feature	drivers/wireless/specification/ath9k.md	588
-ath9k	idle_full_sleep	Idle FULL_SLEEP with use-counted wake and AWAKE restore	feature	drivers/wireless/specification/ath9k.md	597
-ath9k	larger_tx_aggregates	TX aggregates larger than the implemented two-MPDU sender	feature	drivers/wireless/specification/ath9k.md	588
-ath9k	periodic_calibration	Periodic calibration	feature	drivers/wireless/specification/ath9k.md	587
-ath9k	sgi40	SGI40	feature	drivers/wireless/specification/ath9k.md	588
-ath9k	station_network_sleep	Station NETWORK_SLEEP power save with beacon timers	feature	drivers/wireless/specification/ath9k.md	600
-ath9k	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/ath9k.md	588
+ath9k	additional_channels	Live operation on additional channels	feature	drivers/wireless/specification/ath9k.md	675
+ath9k	ar5416_enablement	AR5416/AR5418 (168c:0023/0024) native enablement	chip	drivers/wireless/specification/ath9k.md	846
+ath9k	ar9160_enablement	AR9160 (168c:0027) native enablement	chip	drivers/wireless/specification/ath9k.md	848
+ath9k	ar9280_enablement	AR9280 (168c:0029/002a) native enablement	chip	drivers/wireless/specification/ath9k.md	849
+ath9k	ar9287_enablement	AR9287 (168c:002d/002e) native enablement	chip	drivers/wireless/specification/ath9k.md	851
+ath9k	ar9300_enablement	AR9380/AR9390 (168c:0030) native enablement	chip	drivers/wireless/specification/ath9k.md	853
+ath9k	ar9462_enablement	AR9462 (168c:0034) native enablement	chip	drivers/wireless/specification/ath9k.md	857
+ath9k	ar9485_enablement	AR9485/AR1111 (168c:0032/0037) native enablement	chip	drivers/wireless/specification/ath9k.md	855
+ath9k	ar9565_enablement	AR9565 (168c:0036) native enablement	chip	drivers/wireless/specification/ath9k.md	859
+ath9k	ar9580_enablement	AR9580 (168c:0033) native enablement	chip	drivers/wireless/specification/ath9k.md	856
+ath9k	channel_retuning	Channel retuning	feature	drivers/wireless/specification/ath9k.md	675
+ath9k	factory_profile_selection	Additional factory-profile selection	feature	drivers/wireless/specification/ath9k.md	695
+ath9k	host_bus_pm	PCIe ASPM host-bus power management	feature	drivers/wireless/specification/ath9k.md	734
+ath9k	ht40	HT40	feature	drivers/wireless/specification/ath9k.md	689
+ath9k	idle_full_sleep	Idle FULL_SLEEP with use-counted wake and AWAKE restore	feature	drivers/wireless/specification/ath9k.md	723
+ath9k	larger_tx_aggregates	TX aggregates larger than the implemented two-MPDU sender	feature	drivers/wireless/specification/ath9k.md	710
+ath9k	periodic_calibration	Periodic calibration	feature	drivers/wireless/specification/ath9k.md	700
+ath9k	sgi40	SGI40	feature	drivers/wireless/specification/ath9k.md	689
+ath9k	station_network_sleep	Station NETWORK_SLEEP power save with beacon timers	feature	drivers/wireless/specification/ath9k.md	730
+ath9k	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/ath9k.md	716
 brcmfmac	additional_chip_profiles	Additional CPU/RAM/chip/OTP profiles (incl. 160 MHz-capable chips; retained BCM43602 is 80 MHz)	chip	drivers/wireless/specification/brcmfmac.md	562
 brcmfmac	ap_mode	Access Point mode	feature	drivers/wireless/specification/cyw43439.md	499
 brcmfmac	confirmed_stop_quiescence	Confirmed transport/device stop and quiescence	feature	drivers/wireless/specification/cyw43439.md	500

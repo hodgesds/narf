@@ -669,9 +669,77 @@ profile are implemented. Hardware testing requires an exact EEPROM-bearing
 device, authenticated deployment policy and measured RF/calibration acceptance.
 No RF or AP interoperability has been demonstrated by the model tests.
 
-Additional AC/TID scheduling is implemented in §3.4. Broader live
-channels/retuning, factory profiles, periodic calibration, HT40/SGI40,
-larger TX aggregates and TX A-MSDU require separate continuations.
+Additional AC/TID scheduling is implemented in §3.4. The remaining software
+rows and the tree facts that keep each open:
+
+- `additional_channels`, `channel_retuning`: every live owner is bound to
+  2412 MHz. `packet_native.rs::Native::new` and `ht::Facts::new` reject any
+  calibration report whose frequency is not 2412; `phy/channel.rs` is invoked
+  only for the inactive reference; the one-shot calibration receipt cannot be
+  replayed without the full generation reset; and the `N85H/N85B/N85T/N85Q`
+  bodies fix primary channel 1 at offset 54 while each `invoke` intersects
+  only host rules overlapping 2402-2422 MHz. Linux retunes through
+  `main.c::ath9k_config` -> `channel.c::ath_chanctx_set_channel` ->
+  `main.c::ath_reset_internal` -> `hw.c::ath9k_hw_reset` (per-channel INI,
+  `ar9002_phy.c::ar9002_hw_set_channel`, spur mitigation, calibration and
+  `ath9k_hw_do_fastcc`). Closing these needs a per-channel calibration
+  report/permission and a channel-set field in every signed record (a v2 of
+  all four formats), plus multi-channel scan. Signed HT40 has the same
+  dependency.
+- `ht40`, `sgi40`: Linux `common-init.c::ath9k_cmn_setup_ht_cap` advertises
+  `SUP_WIDTH_20_40 | SGI_40` for AR9285, but HT40 needs a secondary channel
+  (rejected by `ht::response` and `Profile::observe`), the extension
+  channel/`AR_PHY_TURBO` dynamic 20/40 programming, HT40 CTL/target-power
+  planning (`phy/rates.rs` plans only CCK/OFDM/HT20) and the multi-channel
+  record above; SGI40 depends on HT40 (`N85H` byte 57 fixes GI 0).
+- `factory_profile_selection`: the production owner accepts only the AR9285
+  `eeprom_4k.c` 376-byte map, version 14.1+, chain masks 1/1 and the
+  channel1 plan (`identity.rs::decode_identity`, `phy/`). The spec line names
+  no further Linux variant to select; the enumerated variants are the chip
+  rows below.
+- `periodic_calibration`: Linux `link.c::ath_ani_calibrate` runs a short IQ
+  calibration (`ATH_STA_SHORT_CALINTERVAL` 1 s) until done and a 30 s
+  (`ATH_LONG_CALINTERVAL`) long calibration
+  (`ar9002_calib.c::ar9002_hw_calibrate`: `ar9285_hw_pa_cal(ah, false)`
+  incremental PA tracking, `calib.c::ath9k_hw_getnf/loadnf/start_nfcal`),
+  plus ANI. `calibration.rs` is a one-shot `New -> Running -> Ready` owner
+  that runs before packet preparation and cannot be re-entered while the
+  rings run; PA tracking changes live transmit gain, which the `N85H`
+  envelope explicitly excludes ("Periodic tracking is not inferred"). It needs
+  a live-owner calibration hook and its own measured tracking record.
+- `larger_tx_aggregates`: the sender owns exactly two maps/descriptors
+  (`packet.rs` `TX_DEPTH = 2`, `submit_pair(&[Vec<u8>; 2])`,
+  `tx_ba/protocol.rs` pair state and two-bit BA accounting) and `N85T` v1
+  fixes member count 2 and 4095 air bytes. Linux `xmit.c::ath_tx_form_aggr`
+  builds up to the BAW/`ATH_AMPDU_LIMIT_MAX`/4 ms limit. It needs N-slot TX
+  storage, an N-member chain/retry/bitmap owner and an `N85T` v2 member count.
+- `tx_amsdu`: Linux ath9k never sets `IEEE80211_HW_TX_AMSDU`
+  (`init.c::ath9k_set_hw_capab`), so mac80211 forms no TX A-MSDU for this
+  driver and there is no Linux reference path. Natively the TX maps are
+  `descriptor::MAX_MPDU + 2` (2306) bytes and `descriptor::transmit_ht`
+  rejects longer frames; `N85H` hashes "noTXAMSDU". The shared
+  `station_security::transmit_amsdu_qos` encoder exists but needs larger maps
+  and a separate measured record.
+- `idle_full_sleep`: Linux `main.c::ath_ps_full_sleep` aborts RX and enters
+  FULL_SLEEP only while mac80211 reports `IEEE80211_CONF_IDLE`, and leaving
+  idle reprograms the channel through `ath_reset`. Natively the only
+  FULL_SLEEP entry is the suspend path (`identity::disable_and_sleep`); every
+  `Port` register access assumes AWAKE and no use-counted wake wraps the
+  packet/irq/station owners, and the station has no idle notion distinct from
+  its passive scan cache, which keeps RX running.
+- `station_network_sleep`: Linux sets `SUPPORTS_PS` only with
+  `ps_enable=1` (`init.c`, default off). Natively there is no beacon-timer
+  programming (`ath9k_hw_set_sta_beacon_timers`), TIM parsing, PS-Poll or
+  NULL-data PM signalling, and IMR_S5 TIM_TIMER stays cleared (`irq.rs`).
+- `host_bus_pm`: `narf_bus::pci::upstream_bridge` now finds the parent
+  bridge, but no API lets a function driver read it: `pci_express::read_status`
+  needs a `Cap<BusDeviceCap, Read>` for the bridge itself (only the TCB
+  registry authority can mint one, by claiming the bridge) and omits Link
+  Control. The missing shared API is a read-only parent `PCI_EXP_LNKCTL`
+  accessor derived from the child's capability. The AR9285 power-off half
+  cannot land alone: `hw-ops.h::ath9k_hw_configpcipowersave` returns unless
+  `ah->aspm_enabled`, which only `pci.c::ath_pci_aspm_init` sets from that
+  parent read.
 
 Interrupt-driven service (`irq.rs`) follows Linux `pci.c` with
 `ath9k_use_msi`: one MSI vector is discovered, programmed and installed with
@@ -789,6 +857,22 @@ descriptor/runtime variants before they can be claimed supported. The Linux
 - `ar9462_enablement`: AR9462 `0x0034` (AR9003, BT coexistence MCI, WoW);
   ath10k currently rejects this ID as wrong-driver.
 - `ar9565_enablement`: AR9565 `0x0036` (AR9003, MCI).
+
+Every chip row shares these tree blockers: `identity.rs::identify` rejects
+any `AR_SREV` macro version other than 0xC0 (AR9285) before the first write;
+`decode_identity` accepts only the 376-byte `ar5416_eeprom_4k` map with chain
+masks 1/1; `initvals.rs` carries only the AR9285_1_2 tables; `phy/` and
+`calibration.rs` implement only the single-chain AR9285 recipe
+(`ar9002_calib.c` AR9285 CL/PA paths); `descriptor.rs` is the AR9002
+non-EDMA format; and every signed record names device `0x002b`. Per row the
+Linux pieces still to port are: AR9287 (closest relative: AR9002, 2.4 GHz
+only) `eeprom_9287.c`, `ar9287_initvals.h` modes/common/TX-gain tables, the
+AR9287 calibration branches and two-chain masks; AR9280 `eeprom_def.c`,
+`ar9280_initvals` (AR9280_2) and 5 GHz; AR5416/AR9160 the AR5008 PHY
+(`ar5008_phy.c` analog RF banks) and `eeprom_def.c`; AR9380/AR9485/AR9580/
+AR9462/AR9565 the AR9003 EDMA TX-status/RX-FIFO path (`ar9003_mac.c`),
+`eeprom_9003.c`, per-chip `ar9003_*_initvals.h`, `ar9003_calib.c`, plus MCI
+for AR9462/AR9565.
 
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
