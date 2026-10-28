@@ -2383,7 +2383,7 @@ pub mod tests {
         e[21] = 53; // 53 cm wide
         e[22] = 30; // 30 cm high
         let d = 0x36; // first detailed-timing descriptor
-        e[d] = 0x1A; // pixel clock 14850 × 10 kHz, LE
+        e[d] = 0x02; // pixel clock 14850 (0x3A02) × 10 kHz, LE
         e[d + 1] = 0x3A;
         e[d + 2] = 0x80; // h active low (1920)
         e[d + 3] = 0x18; // h blanking low (280)

@@ -716,7 +716,8 @@ pub mod tests {
     // ── The MMIO register model ─────────────────────────────────
 
     const PWR_WELL_CTL2: u64 = 0x4_5404;
-    const DPLL0_ENABLE: u64 = 0x4_6010;
+    /// DPLL0/1/2_ENABLE: combo DDIs A/B/C each lock their own PLL.
+    const DPLL_ENABLES: [u64; 3] = [0x4_6010, 0x4_6014, 0x4_6018];
     const PLL_POWER_STATE: u32 = 1 << 26;
     const PLL_LOCK: u32 = 1 << 30;
 
@@ -807,8 +808,17 @@ pub mod tests {
                 // at 0x2 << 2i, STATE at 0x1 << 2i.
                 return v | ((v & 0xAAAA_AAAA) >> 1);
             }
-            if off == DPLL0_ENABLE {
+            if DPLL_ENABLES.contains(&off) {
                 return v | PLL_POWER_STATE | PLL_LOCK;
+            }
+            // DBUF slices grant power when requested.
+            {
+                use crate::intel_gpu_wm::{
+                    DBUF_CTL_S1, DBUF_CTL_S2, DBUF_POWER_REQUEST, DBUF_POWER_STATE,
+                };
+                if (off == DBUF_CTL_S1 || off == DBUF_CTL_S2) && v & DBUF_POWER_REQUEST != 0 {
+                    return v | DBUF_POWER_STATE;
+                }
             }
             // PIPECONF (pipe + transcoder A): STATE follows ENABLE.
             let pipeconf_offs = [
@@ -1121,8 +1131,8 @@ pub mod tests {
         // CFGCR1 write carrying the HBR2 row (K/1, P/3) must
         // appear after a CFGCR1 write carrying the HBR3 row
         // (K/1, P/2).
-        use crate::intel_gpu_pll::{COMBO_HBR2, COMBO_HBR3, DPLL_CFGCR0_DPLL0};
-        let cfgcr1_off = crate::intel_gpu_pll::dpll_cfgcr1(DPLL_CFGCR0_DPLL0);
+        use crate::intel_gpu_pll::{COMBO_HBR2, COMBO_HBR3, DPLL_CFGCR0_DPLL1};
+        let cfgcr1_off = crate::intel_gpu_pll::dpll_cfgcr1(DPLL_CFGCR0_DPLL1);
         let cfgcr1_writes = mmio.writes_to(cfgcr1_off);
         let pos_hbr3 = cfgcr1_writes.iter().position(|w| *w == COMBO_HBR3.cfgcr1);
         let pos_hbr2 = cfgcr1_writes.iter().position(|w| *w == COMBO_HBR2.cfgcr1);
