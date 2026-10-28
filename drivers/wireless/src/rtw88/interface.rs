@@ -139,6 +139,20 @@ impl<I: Io + 'static> Device<I> {
     pub(super) fn admission(&self) -> Admission {
         self.admission.clone()
     }
+    /// Linux `rtw_watch_dog_work`: one dynamic-mechanism period under the
+    /// retained owner mutex. A failed period closes the shell.
+    pub(super) async fn watchdog(&self) -> bool {
+        if self.closed() || !self.admitted.load(Ordering::Acquire) {
+            return false;
+        }
+        match self.lifecycle.watchdog().await {
+            Ok(ran) => ran,
+            Err(_) => {
+                self.close();
+                false
+            }
+        }
+    }
     pub(super) async fn activate(&self) -> Result<(), Error> {
         if !self.published.load(Ordering::Acquire) || self.closed() {
             return Err(Error::State);
@@ -787,8 +801,14 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
     narf_wireless::registry::register(device.clone());
     device.published.store(true, Ordering::Release);
     narf_scheduler::spawn(async move {
+        let mut ticks = 0u32;
         loop {
             device.drain();
+            ticks = ticks.wrapping_add(1);
+            // The station rate-limits itself to the source 2s period.
+            if ticks % 250 == 0 {
+                device.watchdog().await;
+            }
             narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
         }
     });

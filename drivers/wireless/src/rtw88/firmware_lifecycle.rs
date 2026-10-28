@@ -124,6 +124,21 @@ impl<I: Io> Lifecycle<I> {
             .ok_or(Error::State)?
             .rts_request()
     }
+    pub(super) async fn tracking_request(&self) -> Result<super::ContinuationRequest, Error> {
+        self.retained
+            .lock()
+            .await
+            .as_mut()
+            .ok_or(Error::State)?
+            .tracking_request()
+    }
+    /// Periodic dynamic-mechanism watchdog under the retained owner mutex.
+    pub(super) async fn watchdog(&self) -> Result<bool, super::station::Error> {
+        match self.retained.lock().await.as_mut() {
+            Some(owner) => owner.station_watchdog().await,
+            None => Ok(false),
+        }
+    }
     pub(super) async fn legacy_wmm_request(
         &self,
     ) -> Result<super::station_profile::Request, Error> {

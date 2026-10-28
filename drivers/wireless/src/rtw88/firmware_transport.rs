@@ -329,6 +329,24 @@ pub(super) unsafe trait Io: Send {
     fn station_rts_request(&mut self) -> Result<super::RtsRequest, Error> {
         Err(Error::Unsupported)
     }
+    /// Load the exact separately signed continuation `kind` over the
+    /// current station gate (Registered source on real hardware).
+    fn station_continuation(
+        &mut self,
+        _: &'static super::qualification::Kind,
+    ) -> Result<Option<alloc::sync::Arc<super::qualification::Grant>>, Error> {
+        Ok(None)
+    }
+    fn station_continuation_request(
+        &mut self,
+        _: &'static super::qualification::Kind,
+    ) -> Result<super::ContinuationRequest, Error> {
+        Err(Error::Unsupported)
+    }
+    /// A clone of the current retained station gate.
+    fn station_gate(&mut self) -> Result<super::power_policy::Gate, Error> {
+        Err(Error::Unsupported)
+    }
     fn station_bind_tx_ba(
         &mut self,
         _: alloc::sync::Arc<super::tx_ba_power::Grant>,
@@ -422,6 +440,7 @@ pub(super) struct Owner<I: Io> {
     radio: Option<super::radio::Info>,
     radio_gate: Option<super::power_policy::Gate>,
     station: Option<super::station::State>,
+    tracking_facts: Option<super::dm::Facts>,
 }
 impl<I: Io> core::fmt::Debug for Owner<I> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -453,6 +472,7 @@ impl<I: Io> Owner<I> {
             radio: None,
             radio_gate: None,
             station: None,
+            tracking_facts: None,
         }
     }
     pub fn phase(&self) -> Phase {
@@ -472,6 +492,7 @@ impl<I: Io> Owner<I> {
         self.phase = Phase::Failed; // poison before the first awaited prerequisite
         self.station = Some(super::station::State::new(own, environment, admission));
         let station = self.station.as_mut().ok_or(super::station::Error::State)?;
+        station.set_tracking_facts(self.tracking_facts);
         station.start(&mut self.io).await?;
         self.phase = Phase::Station;
         Ok(station.admission())
@@ -837,6 +858,15 @@ impl<I: Io> Owner<I> {
         self.radio_gate = Some(gate.clone());
         let info = super::radio::prepare(&mut io, factory, mac, phy, gain, gate).await?;
         self.radio = Some(info);
+        let p = self.phy.ok_or(Error::State)?;
+        self.tracking_facts = Some(super::dm::Facts {
+            did: 0xc822,
+            rfe: p.rfe,
+            crystal: p.crystal,
+            thermal: factory.thermal(),
+            power_track_type: (factory.logical()[0xc8] >> 4) & 15,
+            cck_gi: info.cck_gi,
+        });
         self.phase = Phase::Calibrated;
         Ok(info)
     }
@@ -884,6 +914,21 @@ impl<I: Io> Owner<I> {
     }
     pub(super) fn rts_request(&mut self) -> Result<super::RtsRequest, Error> {
         self.io.station_rts_request()
+    }
+    /// N2xD dynamic-mechanism measurement metadata. No grant.
+    pub(super) fn tracking_request(&mut self) -> Result<super::ContinuationRequest, Error> {
+        self.io.station_continuation_request(&super::dm::KIND)
+    }
+    /// One periodic dynamic-mechanism watchdog step (Linux
+    /// `rtw_watch_dog_work`, run with the retained owner held).
+    pub(super) async fn station_watchdog(&mut self) -> Result<bool, super::station::Error> {
+        match self.station.as_mut() {
+            Some(s) if self.phase == Phase::Station => s.watchdog(&mut self.io).await,
+            _ => Ok(false),
+        }
+    }
+    pub(super) fn station_tracking(&self) -> Option<&super::station::State> {
+        self.station.as_ref().filter(|s| s.tracking_active())
     }
     pub(super) fn station_rts_threshold(&self) -> Option<u32> {
         self.station
@@ -1046,6 +1091,15 @@ impl<I: Io> Owner<I> {
         .await
         .map_err(|_| Error::Deadline)??;
         self.station_radio8821c = Some(result);
+        let p = self.phy8821c.ok_or(Error::State)?;
+        self.tracking_facts = Some(super::dm::Facts {
+            did: 0xc821,
+            rfe: p.rfe,
+            crystal: p.crystal,
+            thermal: [factory.thermal(), 0xff],
+            power_track_type: 0,
+            cck_gi: [0, 0],
+        });
         self.phase = Phase::Radio8821cPrepared;
         Ok(result)
     }

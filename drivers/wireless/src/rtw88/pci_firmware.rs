@@ -903,6 +903,27 @@ unsafe impl Registers for Native {
         );
         Ok(())
     }
+    fn station_continuation(
+        &mut self,
+        kind: &'static super::qualification::Kind,
+    ) -> Result<Option<alloc::sync::Arc<super::qualification::Grant>>, Error> {
+        self.station_allowed()?;
+        let gate = self.packet_gate.as_ref().ok_or(Error::State)?;
+        Ok(super::qualification::Source::Registered
+            .load(kind, gate)
+            .ok())
+    }
+    fn station_continuation_request(
+        &mut self,
+        kind: &'static super::qualification::Kind,
+    ) -> Result<super::ContinuationRequest, Error> {
+        self.station_allowed()?;
+        super::qualification::request(kind, self.packet_gate.as_ref().ok_or(Error::State)?)
+    }
+    fn station_gate(&mut self) -> Result<super::power_policy::Gate, Error> {
+        self.station_allowed()?;
+        self.packet_gate.clone().ok_or(Error::State)
+    }
     fn station_rts_request(&mut self) -> Result<super::RtsRequest, Error> {
         self.station_allowed()?;
         let gate = self.packet_gate.as_ref().ok_or(Error::State)?;

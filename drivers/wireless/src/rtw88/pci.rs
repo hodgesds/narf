@@ -82,6 +82,22 @@ impl Rtw88Device {
                 .await
         }
     }
+    /// Separately signed N2xD dynamic-mechanism (watchdog/tracking)
+    /// measurement metadata over the exact current base. No grant.
+    pub async fn tracking_request(
+        &self,
+    ) -> Result<super::ContinuationRequest, super::FirmwareError> {
+        if let Some(s) = &self.sibling {
+            s.lifecycle().tracking_request().await
+        } else {
+            self.firmware
+                .as_ref()
+                .ok_or(super::FirmwareError::Unsupported)?
+                .lifecycle()
+                .tracking_request()
+                .await
+        }
+    }
     /// Distinct exact-H recipient BA emission measurement metadata. No grant.
     pub async fn rx_ba_request(&self) -> Result<super::RxBaRequest, super::FirmwareError> {
         if let Some(s) = &self.sibling {

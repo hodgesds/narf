@@ -163,6 +163,24 @@ pub(super) unsafe trait Registers: Send {
     fn station_rts_request(&mut self) -> Result<super::RtsRequest, Error> {
         Err(Error::Unsupported)
     }
+    /// Load the exact separately signed continuation `kind` over the
+    /// current station gate (Registered source on real hardware).
+    fn station_continuation(
+        &mut self,
+        _: &'static super::qualification::Kind,
+    ) -> Result<Option<alloc::sync::Arc<super::qualification::Grant>>, Error> {
+        Ok(None)
+    }
+    fn station_continuation_request(
+        &mut self,
+        _: &'static super::qualification::Kind,
+    ) -> Result<super::ContinuationRequest, Error> {
+        Err(Error::Unsupported)
+    }
+    /// A clone of the current retained station gate.
+    fn station_gate(&mut self) -> Result<super::power_policy::Gate, Error> {
+        Err(Error::Unsupported)
+    }
     fn station_bind_tx_ba(
         &mut self,
         _: alloc::sync::Arc<super::tx_ba_power::Grant>,
@@ -382,6 +400,21 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     }
     fn station_rts_request(&mut self) -> Result<super::RtsRequest, Error> {
         self.io.station_rts_request()
+    }
+    fn station_continuation(
+        &mut self,
+        kind: &'static super::qualification::Kind,
+    ) -> Result<Option<alloc::sync::Arc<super::qualification::Grant>>, Error> {
+        self.io.station_continuation(kind)
+    }
+    fn station_continuation_request(
+        &mut self,
+        kind: &'static super::qualification::Kind,
+    ) -> Result<super::ContinuationRequest, Error> {
+        self.io.station_continuation_request(kind)
+    }
+    fn station_gate(&mut self) -> Result<super::power_policy::Gate, Error> {
+        self.io.station_gate()
     }
     fn station_bind_tx_ba(
         &mut self,

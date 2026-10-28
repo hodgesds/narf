@@ -151,6 +151,45 @@ pub(super) struct State {
     deadline: u64,
     last_peer: u64,
     last_now: u64,
+    tracking: Tracking,
+}
+/// Separately qualified dynamic-mechanism watchdog (`dm`, tag `D`).
+#[derive(Default)]
+struct Tracking {
+    facts: Option<super::dm::Facts>,
+    grant: Option<Arc<super::qualification::Grant>>,
+    tracker: Option<super::dm::Tracker>,
+    next: u64,
+    tx_bytes: u64,
+    rx_bytes: u64,
+    ticks: u64,
+}
+/// Every dm register group: current admission, continuation and base gate.
+struct Live<'a> {
+    admission: &'a Admission,
+    grant: &'a super::qualification::Grant,
+    gate: &'a super::power_policy::Gate,
+}
+impl super::dm::Authority for Live<'_> {
+    fn run<T>(
+        &self,
+        op: impl FnOnce() -> Result<T, firmware_transport::Error>,
+    ) -> Result<T, firmware_transport::Error> {
+        self.admission.run(|| self.grant.invoke(self.gate, op))
+    }
+}
+/// Base-gate-only authority used to restore the base program.
+struct Base<'a> {
+    admission: &'a Admission,
+    gate: &'a super::power_policy::Gate,
+}
+impl super::dm::Authority for Base<'_> {
+    fn run<T>(
+        &self,
+        op: impl FnOnce() -> Result<T, firmware_transport::Error>,
+    ) -> Result<T, firmware_transport::Error> {
+        self.admission.run(|| self.gate.invoke(op))
+    }
 }
 impl core::fmt::Debug for State {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -204,7 +243,83 @@ impl State {
             deadline: 0,
             last_peer: 0,
             last_now: 0,
+            tracking: Tracking::default(),
         }
+    }
+    /// Exact retained factory/radio facts for the dm watchdog statistics.
+    pub(super) fn set_tracking_facts(&mut self, facts: Option<super::dm::Facts>) {
+        self.tracking.facts = facts;
+    }
+    pub(super) fn tracking_active(&self) -> bool {
+        self.tracking.grant.is_some()
+    }
+    pub(super) fn tracking_ticks(&self) -> u64 {
+        self.tracking.ticks
+    }
+    pub(super) fn tracker(&self) -> Option<&super::dm::Tracker> {
+        self.tracking.tracker.as_ref()
+    }
+    /// One Linux `rtw_watch_dog_work` period, at most every 2s, once the
+    /// separately qualified N2xD continuation is bound and the station is
+    /// established. Losing the continuation or leaving its measured envelope
+    /// restores the base program under the base gate and stops tracking.
+    pub(super) async fn watchdog(&mut self, io: &mut impl Io) -> Result<bool, Error> {
+        if self.tracking.grant.is_none() || !self.established || !self.ready() {
+            return Ok(false);
+        }
+        let now = self.now()?;
+        if now < self.tracking.next {
+            return Ok(false);
+        }
+        self.tracking.next = now.saturating_add(super::dm::PERIOD_MS);
+        let grant = self.tracking.grant.clone().ok_or(Error::State)?;
+        let gate = io.station_gate()?;
+        let facts = self.tracking.facts.ok_or(Error::State)?;
+        if self.tracking.tracker.is_none() {
+            let bounds = super::dm::bounds(facts.did, grant.payload()).ok_or(Error::State)?;
+            self.tracking.tracker = Some(super::dm::Tracker::new(bounds, facts));
+        }
+        let period = super::dm::Period {
+            linked: self.peer.is_some(),
+            profile: self.data_profile,
+            tx_bytes: core::mem::take(&mut self.tracking.tx_bytes),
+            rx_bytes: core::mem::take(&mut self.tracking.rx_bytes),
+            country: narf_wireless::reg::db::get_domain().map_or(*b"00", |d| d.country_code),
+        };
+        let admission = self.admission.clone();
+        let live = Live {
+            admission: &admission,
+            grant: &grant,
+            gate: &gate,
+        };
+        let tracker = self.tracking.tracker.as_mut().ok_or(Error::State)?;
+        let result = tracker.tick(io, &live, period).await;
+        let commands = match result {
+            Ok(c) => c,
+            Err(firmware_transport::Error::State) if admission.closed() => {
+                return Err(Error::State)
+            }
+            Err(e) => {
+                // Restore through the base gate; a failed restore is terminal.
+                let base = Base {
+                    admission: &admission,
+                    gate: &gate,
+                };
+                tracker.restore(io, &base).await?;
+                self.tracking.grant = None;
+                self.tracking.tracker = None;
+                return match e {
+                    firmware_transport::Error::Gone => Err(Error::Native(e)),
+                    _ => Ok(false),
+                };
+            }
+        };
+        for words in commands {
+            grant.check(&gate)?;
+            station_control::send(io, words, Some(&admission)).await?;
+        }
+        self.tracking.ticks += 1;
+        Ok(true)
     }
     pub(super) fn admission(&self) -> Admission {
         self.admission.clone()
@@ -314,6 +429,29 @@ impl State {
         drop(reservation);
         control?;
         stopped
+    }
+    /// `rx.c::rtw_rx_addr_match_iter`: peer frames to us (or its beacons).
+    fn observe(&mut self, frame: &Mpdu, facts: super::dm::Facts) {
+        let Some(tracker) = self.tracking.tracker.as_mut() else {
+            return;
+        };
+        let Some(peer) = self.peer.as_ref().map(|p| p.bss.bssid) else {
+            return;
+        };
+        let b = frame.bytes();
+        if b.len() < 24 || b[0] & 0x0c == 0x04 || b[10..16] != peer {
+            return;
+        }
+        if b[4..10] != self.own && b[0] != 0x80 {
+            return;
+        }
+        self.tracking.rx_bytes = self.tracking.rx_bytes.saturating_add(b.len() as u64);
+        if let Some(sample) = frame
+            .status
+            .and_then(|s| super::dm::sample(&facts, frame.rate, &s))
+        {
+            tracker.observe(sample);
+        }
     }
     fn now(&mut self) -> Result<u64, Error> {
         let now = self.environment.now_ms();
@@ -473,6 +611,12 @@ impl State {
             let step = io.packet_poll()?;
             if let Some(receipt) = step.receipt {
                 self.delivery(receipt)?;
+            }
+            if let (Some(body), Some(t)) = (&step.c2h, self.tracking.tracker.as_mut()) {
+                t.c2h(body);
+            }
+            if let (Some(frame), Some(facts)) = (&step.frame, self.tracking.facts) {
+                self.observe(frame, facts);
             }
             if !step.consumed_rx {
                 idle = true;
@@ -1134,6 +1278,11 @@ impl State {
             }
             self.ht = Some(h);
         }
+        if let Some(g) = io.station_continuation(&super::dm::KIND)? {
+            if super::dm::bounds(io.station_gate()?.did(), g.payload()).is_some() {
+                self.tracking.grant = Some(g);
+            }
+        }
         station_control::prepare_peer(io, bssid, &self.admission).await?;
         self.peer = Some(candidate);
         self.deadline = self.now()?.saturating_add(5000);
@@ -1186,6 +1335,7 @@ impl State {
         result
     }
     fn send_inner(&mut self, io: &mut impl Io, frame: &[u8]) -> Result<(), Error> {
+        self.tracking.tx_bytes = self.tracking.tx_bytes.saturating_add(frame.len() as u64);
         if self.tx_ba.active().is_some() {
             self.send_batch_inner(io, &[frame])?;
             return Ok(());
