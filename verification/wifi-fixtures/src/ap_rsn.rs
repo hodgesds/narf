@@ -56,6 +56,12 @@ pub(crate) struct SaeAp {
     pub session: SaeSession,
     pub pwe: ApSaePwe,
     pub accepted: bool,
+    /// Inputs to rebuild the session bound to an AKM Suite Selector when a
+    /// station's H2E Commit selects SAE-EXT-KEY (`sae_write_commit`).
+    pub ssid: Vec<u8>,
+    pub password: Vec<u8>,
+    pub seed: [u8; 64],
+    pub addresses: ([u8; 6], [u8; 6]),
 }
 
 impl RsnProfile {
@@ -156,6 +162,22 @@ impl RsnProfile {
     }
 }
 
+/// The AKM Suite Selector element of a group-19 SAE Commit body, if any.
+fn akm_suite_selector(body: &[u8]) -> Option<[u8; 4]> {
+    let mut rest = body.get(2 + 32 + 64..)?;
+    while rest.len() >= 2 {
+        let len = usize::from(rest[1]);
+        let element = rest.get(2..2 + len)?;
+        if rest[0] == 255
+            && element.first() == Some(&narf_wireless::sae::session::EID_EXT_AKM_SUITE_SELECTOR)
+        {
+            return element.get(1..5)?.try_into().ok();
+        }
+        rest = &rest[2 + len..];
+    }
+    None
+}
+
 impl SaeAp {
     /// Station Commit (`seq` 1) or Confirm (`seq` 2) body after the status
     /// field. Returns the AP's reply body (Commit or Confirm) and status.
@@ -166,6 +188,16 @@ impl SaeAp {
         };
         match seq {
             1 if status == want && self.session.state() == SaeState::Nothing => {
+                // An H2E Commit for AKM 24 carries the AKM Suite Selector
+                // element after group, scalar and element; ours must match.
+                if let Some(selector) = akm_suite_selector(body) {
+                    let (own, peer) = self.addresses;
+                    self.session =
+                        SaeSession::new_h2e_bytes(&self.ssid, &self.password, own, peer)
+                            .with_test_seed(self.seed)
+                            .with_akm_suite_selector(selector)
+                            .ok()?;
+                }
                 let commit = self.session.try_build_commit().ok()?;
                 self.session.on_commit(body).ok()?;
                 Some((1, want, commit))

@@ -247,9 +247,11 @@ fn operation_wire() -> Result<(), &'static str> {
     let mut six = ap_op(0xfffc, 1);
     six[3] |= 0x02; // 6GHz Operation Information Present (bit17).
     six.extend_from_slice(&[1, 0, 7, 0, 6]);
+    // 6 GHz Operation Information parses (six_ghz::admit uses it); the
+    // 2.4/5 GHz ApElements path refuses it (six_ghz_tests).
     check!(
-        HeOperation::parse(&six[1..]).is_err(),
-        "six-GHz operation admitted on a 2.4/5GHz plan"
+        HeOperation::parse(&six[1..]).is_ok_and(|op| op.six_ghz_operation().is_some()),
+        "6 GHz Operation Information not parsed"
     );
     Ok(())
 }

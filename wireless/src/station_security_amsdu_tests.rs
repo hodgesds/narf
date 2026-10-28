@@ -458,7 +458,10 @@ fn smoke_station_spp_amsdu_negotiates_from_both_rsnes_and_binds_pairwise_aad() -
         || new(spp, spp | RSN_CAP_SPP_AMSDU_REQUIRED) != Ok(true)
         || new(spp, spp) != Ok(true)
         || new(spp | RSN_CAP_SPP_AMSDU_REQUIRED, spp).is_ok()
-        || new(RSN_CAP_MFP_CAPABLE, 0).is_ok()
+        // WPA2 PMF: MFPC alone is optional PMF (not in force without the
+        // AP's MFPC); MFPR without MFPC is malformed.
+        || new(RSN_CAP_MFP_CAPABLE, 0) != Ok(false)
+        || new(crate::rsn::RSN_CAP_MFP_REQUIRED, 0).is_ok()
     {
         return TestResult::Fail("SPP A-MSDU was not the exact two-RSNE intersection");
     }

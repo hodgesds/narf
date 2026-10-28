@@ -34,11 +34,17 @@ fn qos(htc: bool, pn: u64, tk: &[u8]) -> Vec<u8> {
 fn smoke_station_htc_qos_data_is_received() -> TestResult {
     let mut s = established();
     let p = ptk(AN, SN);
-    let Ok(Rx::Data(ethernet)) = s.receive(&mpdu(qos(true, 1, &p.tk)), [0; 32]) else {
+    let Ok(Rx::Data(frame)) = s.receive(&mpdu(qos(true, 1, &p.tk)), [0; 32]) else {
         return TestResult::Fail("+HTC QoS data from the AP was dropped");
     };
-    if ethernet[..6] != OWN || ethernet[6..12] != AP || ethernet[12..14] != [8, 0] {
-        return TestResult::Fail("+HTC QoS data decapsulated wrongly");
+    // The admitted MPDU: 26-octet QoS header, Order and Protected clear,
+    // no HT Control, then the plaintext LLC/SNAP MSDU.
+    if frame.len() != 26 + 8 + 20
+        || frame[..2] != [0x88, 0x02]
+        || frame[24] != 5
+        || frame[26..34] != [0xaa, 0xaa, 3, 0, 0, 0, 0x08, 0x00]
+    {
+        return TestResult::Fail("+HTC QoS data normalized wrongly");
     }
     // The same PN without HT Control is a replay: one shared TID counter.
     if s.receive(&mpdu(qos(false, 1, &p.tk)), [0; 32]) != Ok(Rx::Ignored) {
