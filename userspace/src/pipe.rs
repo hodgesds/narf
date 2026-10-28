@@ -211,6 +211,11 @@ pub(crate) fn transfer(
         src.copy_prefix_to(&mut dst, max)
     } else {
         src.move_prefix_to(&mut dst, max)
+    }
+    .map_err(|_| FsError::OutOfMemory);
+    let n = match n {
+        Ok(n) => n,
+        Err(error) => return Some(Err(error)),
     };
     drop(dst);
     drop(src);
@@ -495,12 +500,15 @@ impl PipeShared {
         wake_all: bool,
         urgent_handoff: bool,
     ) {
-        if !self.readiness_active.load(Ordering::Acquire) {
-            return;
-        }
         // Re-sample under the publication lock so a delayed older writer
         // cannot overwrite a newer state or a final-close notification.
         let _publish = self.publish.lock();
+        // Serialize the inactive decision with first activation too: either
+        // activation samples this completed mutation, or we see it active and
+        // publish. An early return outside the lock permits both to miss.
+        if !self.readiness_active.load(Ordering::Acquire) {
+            return;
+        }
         let (len, full) = self.queue.snapshot();
         self.publish_readiness_state_with_policy(event, len, full, wake_all, urgent_handoff);
     }

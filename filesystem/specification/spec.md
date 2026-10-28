@@ -549,9 +549,15 @@ FIFO handle discards queued data and restores the default capacity before a
 new opener can observe the inode. `FifoShared::queue` and `notify_transfer`
 allow anonymous/named transfers to use one ordered transaction.
 
-`PipeBufs` owns a bounded descriptor ring; owned payloads use allocator pages
-with reference-counted descriptors and up to two reusable, exclusively owned
-drained pages, matching Linux's bounded `tmp_page` cache. Imported
+`PipeBufs` owns a bounded descriptor ring. Ordinary payload pages have inline
+unique ownership, with no per-page heap allocation for reference metadata.
+`copy_prefix_to(&mut self, ...)` and `move_prefix_to(&mut self, ...)` return
+`Result<usize, u64>`: tee or a partial move promotes unique backing to a shared
+reference only when needed. Promotion allocates before changing the source;
+failure returns `ENOMEM` without losing its page, or an already copied prefix.
+Whole-buffer moves transfer ownership without promotion. Up to two exclusively
+owned drained pages are reusable, matching Linux's bounded `tmp_page` cache;
+the final shared reference recovers unique ownership before reuse. Imported
 buffers carry `UserPagePin` references and cannot acquire append rights.
 `fill_from` implements the single-copy buffered-provider fallback into fresh
 pipe pages. `with_front_raw` exposes a retained pointer only for a callback's

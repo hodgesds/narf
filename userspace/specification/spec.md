@@ -730,10 +730,16 @@ consumed pages; only a mergeable tail accepts the write's page remainder.
 `tee` duplicates page references and clears the destination merge flag.
 `splice` moves whole buffers or shares a partial buffer reference, preserving
 packet flags and leaving append rights with only the source of a split.
+Ordinary writes own page metadata inline. Tee and partial splice allocate
+shared-reference metadata only when a unique page first becomes shared;
+allocation failure leaves that source page intact and reports `ENOMEM` if no
+prefix was transferred. Whole-buffer splice moves ownership without promotion.
 Both operations acquire per-pipe sleepable mutexes in address order. Payload
 copies and allocations hold no pipe IRQ spinlock. Poll, FIONREAD, and endpoint
 closure use atomic queue snapshots; a per-pipe short publication lock orders
-readiness updates. Descriptor-table locks are released before pipe resizing
+readiness updates. First readiness activation and the inactive-publication
+decision use that same publication lock, so neither can miss the other's
+completed queue state. Descriptor-table locks are released before pipe resizing
 or transfers can wait. `splice` and `tee` flags use the low unsigned 32 bits.
 
 Linux `vmsplice(2)` preserves the kernel entry-point's observable validation
