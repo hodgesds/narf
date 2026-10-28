@@ -94,7 +94,8 @@ pub(super) struct State<M: Memory> {
     /// Firmware leisure power save (fw_current_inpsmode) is active.
     leisure: bool,
     /// `sta_entry->ratr_index` of the installed `H2C_88E_RA_MASK`: DATA
-    /// rate fallback is only enabled while the firmware owns this mask.
+    /// rate fallback is only enabled while the firmware owns this mask
+    /// and the caller holds a current `NEFB` grant.
     rate_mask: Option<u8>,
     /// Reserved-page bodies of earlier associations on this claim. Each
     /// upload was proven by BCN_VALID, but its command-beacon OWN bit may
@@ -779,10 +780,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// DATA to an HT station: `aggregate = (ampdu_density, ampdu)` sets
     /// TXD DW2 AMPDU_DENSITY and, for an `IEEE80211_TX_CTL_AMPDU` frame,
     /// DW2 AGG_EN + DW6 MAX_AGG_NUM 0x14. `adaptive` marks ordinary DATA
-    /// (Linux `rtl_get_tcb_desc` with a non-zero rix): once the firmware
-    /// owns an RA mask, TXD DW1 RATE_ID = `ratr_index` and DW4 DISDATAFB
-    /// is clear (`rtl88ee_tx_fill_desc`), so the firmware falls back from
-    /// the highest rate (USE_RATE stays set: 88EE forces use_driver_rate).
+    /// (Linux `rtl_get_tcb_desc` with a non-zero rix) under a current
+    /// separately signed `NEFB` fallback grant (checked by the caller):
+    /// once the firmware owns an RA mask, TXD DW1 RATE_ID = `ratr_index`
+    /// and DW4 DISDATAFB is clear (`rtl88ee_tx_fill_desc`), so the firmware
+    /// falls back from the highest rate (USE_RATE stays set: 88EE forces
+    /// use_driver_rate). Otherwise the frame keeps USE_RATE + DISFB.
     pub(crate) fn submit_aggregate(
         &mut self,
         frame: &[u8],

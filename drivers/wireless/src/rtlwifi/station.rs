@@ -66,6 +66,14 @@ pub(crate) trait Environment: Send + Sync {
     ) -> Result<Option<Arc<super::super::ht::Grant>>, Error> {
         Ok(None)
     }
+    /// The separately signed DATA rate fallback continuation (`NEFB`)
+    /// over `base`, or `None` (DATA stays USE_RATE + DISFB).
+    fn fallback(
+        &self,
+        _base: Arc<super::super::channel_power::Calibration>,
+    ) -> Result<Option<Arc<super::super::fallback::Grant>>, Error> {
+        Ok(None)
+    }
     /// The bound MSI vector's wake (Linux `rtl_pci_intr_mode_msi`), or
     /// `None` on the polling fallback.
     fn interrupt(&self) -> Option<Arc<super::super::irq::Signal>> {
@@ -307,6 +315,9 @@ pub(super) struct State {
     linked_at: Option<u64>,
     /// `dm.undec_sm_pwdb` and `ra.pre_ratr_state` (driver RA mask).
     ra: super::super::rate_adaptive::State,
+    /// The `NEFB` grant consulted for this association; dropped on the
+    /// first send or watchdog pass that finds it revoked.
+    fallback: Option<Arc<super::super::fallback::Grant>>,
 }
 impl State {
     pub(super) fn new() -> Self {
@@ -346,6 +357,7 @@ impl State {
             addba_req_num: [0; 8],
             last_addba_req: [0; 8],
             ra: super::super::rate_adaptive::State::new(),
+            fallback: None,
             tx_ba_stuck: 0,
             linked_at: None,
         }
@@ -394,6 +406,16 @@ impl State {
         self.delivered_reply = None;
         self.retire_ba();
         self.ra = super::super::rate_adaptive::State::new();
+        self.fallback = None;
+    }
+    /// Whether the association's fallback grant is still current; a
+    /// revoked grant is dropped so DATA returns to the fixed rate.
+    fn fallback_current(&mut self) -> bool {
+        let current = self.fallback.as_ref().is_some_and(|g| g.current());
+        if !current {
+            self.fallback = None;
+        }
+        current
     }
     fn retire_receive(&mut self) {
         self.received.clear();
@@ -1095,11 +1117,14 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         } else {
             None
         };
+        // Ordinary DATA may clear DISFB only under a current NEFB grant;
+        // without it the base programs' fixed USE_RATE + DISFB applies.
+        let fallback = matches!(kind, Kind::Data) && self.station.fallback_current();
         let mut publish = || {
             let op = || {
                 self.check_station_policy(environment)
                     .map_err(|_| RadioError::Power(super::super::channel_power::Error::Policy))?;
-                self.submit_aggregate(&bytes, rate, aggregate, matches!(kind, Kind::Data))
+                self.submit_aggregate(&bytes, rate, aggregate, fallback)
             };
             if let Some(ht) = &ht {
                 ht.invoke(op)
@@ -1252,6 +1277,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         .as_ref()
                         .ok_or(Error::State)?
                         .clone();
+                    let base_for_fallback = base.clone();
                     let ht = self.station.ht.clone();
                     let permission = self.permission.ok_or(Error::State)?;
                     super::super::ht::wait(
@@ -1273,6 +1299,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     .await?;
                     self.check_station_policy(environment)?;
                     self.station.native_associated = true;
+                    self.station.fallback = None;
+                    if let Some(grant) = environment.fallback(base_for_fallback.clone())? {
+                        if !grant.matches(&base_for_fallback) {
+                            return Err(Error::Profile);
+                        }
+                        self.station.fallback = Some(grant);
+                    }
                     // core.c BSS_CHANGED_ASSOC: update_rate_tbl(sta, 0).
                     self.install_station_rate_mask(
                         super::super::rate_adaptive::STA_INIT,
@@ -1843,6 +1876,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         &mut self,
         environment: &impl Environment,
     ) -> Result<bool, Error> {
+        // Each watchdog pass re-proves the fallback grant (revocation
+        // returns DATA to the fixed rate without touching the link).
+        self.station.fallback_current();
         if !self.station_linked()
             || self.leisure()
             || !self.transmit_ready()
@@ -1861,6 +1897,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         result?;
         self.station.ra.commit(level);
         Ok(true)
+    }
+    /// Whether ordinary DATA currently runs with firmware rate fallback.
+    pub(crate) fn station_fallback(&self) -> bool {
+        self.station.fallback.is_some()
     }
     /// Smoothed station PWDB (`dm.undec_sm_pwdb`) and RA level.
     pub(crate) fn station_rate_state(&self) -> (i64, u8) {

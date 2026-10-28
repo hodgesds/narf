@@ -56,6 +56,7 @@ pub mod channel;
 pub mod channel_power;
 pub mod dma;
 pub mod efuse;
+mod fallback;
 mod firmware_native;
 pub mod firmware_transport;
 pub mod fw;

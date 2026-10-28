@@ -459,7 +459,8 @@ required for those transmissions. Signed NEPC class envelopes already cover
 all four CCK and all eight OFDM rates; each selected rate keeps its checked
 factory/PG gain and current power/source admission. The submit path is the
 highest rate (`rtl_get_tcb_desc` hw_rate); once the firmware owns an RA mask
-(below) ordinary DATA may fall back to lower rates of that same mask. No
+(below) and a separately signed NEFB grant is current, ordinary DATA may
+fall back to lower rates of that same mask. No
 additional response rate is inferred.
 The exact retained signed calibration invocation encloses allocation,
 descriptor/body publication and doorbell, with fresh host policy inside it.
@@ -837,7 +838,7 @@ the firmware RA mask. `rate_adaptive.rs` ports it:
   `pre_ratr_state`. A linked station outside LPS with a mask is required.
 * TXD (`rtl8188ee/trx.c::rtl88ee_tx_fill_desc` with `useramask`, and
   `base.c::_rtl_txrate_selectmode`): ordinary DATA (`Kind::Data`) after the
-  mask carries DW1 RATE_ID = `ratr_index` (MACID 0) and DW4 DISDATAFB
+  mask, under a current NEFB grant (below), carries DW1 RATE_ID = `ratr_index` (MACID 0) and DW4 DISDATAFB
   clear; USE_RATE stays set because 88EE forces `use_driver_rate`, so the
   highest negotiated rate is the initial rate and the firmware falls back
   within the mask (`set_tx_desc_disable_fb(disable_ratefallback = 0)`).
@@ -851,6 +852,48 @@ the firmware RA mask. `rate_adaptive.rs` ports it:
   mask, so a later owner starts with fallback disabled; a mailbox that is
   never consumed or radio-off is terminal for the owner and never enables
   fallback; a failed refresh aborts the station.
+
+#### Separately qualified DATA fallback (`NEFB` v1, `fallback.rs`)
+
+The NEPC legacy record and the NEHT HT20 program (whose binding text says
+`USE_RATE DISFB`) qualify a fixed-rate emission profile: every frame at one
+rate, DW4 DISDATAFB set. Letting the firmware step down changes the emitted
+rate sequence over time, so — like rtw88 `N2xF` — it is its own signed
+continuation, `rtlwifi/rtl8188ee-fallback-v1-<mac>.bin` (128 bytes):
+`NEFB`, version 1, header length 128, total length, `10ec:8179`, a 32-byte
+binding over the program title, factory identity, retained NEPC digest,
+firmware name and image digest and the Linux source text
+(`base.c::rtl_get_tcb_desc` station DATA `disable_ratefallback = 0`,
+`ratr_index = sta_entry->ratr_index`; `rtl88ee_tx_fill_desc` forced
+`use_driver_rate`, DISABLE_FB DW4.10, RATE_ID DW1.16–19), then the factory
+identity, NEPC digest and MAC again, payload byte0 = 1 and every other byte
+zero. Unsigned, mis-bound or non-zero-reserved records are refused; a
+present but inadmissible record fails the association rather than silently
+changing the profile.
+
+* Consulted at association (`Environment::fallback`, `NativeEnvironment`
+  loads the registered asset) and held for that association only;
+  `reset_passive` (safe rejoin) forgets it.
+* Every DATA submit and every watchdog pass re-proves it through
+  `Cap::invoke` on the record, the NEPC calibration and the firmware
+  identity. A revoked grant is dropped: the next DATA frame carries
+  USE_RATE + DISDATAFB + RATE_ID 0 at the same highest rate, and the link,
+  keys, BA sessions and installed RA mask stay (no reassociation).
+* The RA mask H2C itself is sent with or without the grant: Linux sends it
+  from `core.c::rtl_op_sta_add`/`rtl_op_bss_info_changed(BSS_CHANGED_ASSOC)`
+  (`update_rate_tbl`) and `rtl88e_dm_refresh_rate_adaptive_mask` without
+  regard to any frame's `disable_ratefallback`, and with DISDATAFB set the
+  firmware never applies it to a DATA frame.
+
+Tests: `smoke_rtl8188ee_data_fallback_requires_separate_signed_grant`
+(open and WPA2 legacy: granted DATA clears DISDATAFB with RATE_ID 4,
+revocation mid-link returns to DISFB/RATE_ID 0 with the link and mask kept,
+the watchdog never resurrects it, disassociation forgets it, an
+inadmissible record refuses the association),
+`smoke_rtl8188ee_ht20_data_fallback_is_a_separate_revocable_grant` (HT20
+MCS7: same with real RX after revocation) and the ungranted fixed-rate
+descriptors in `smoke_rtl8188ee_negotiated_legacy_data_rate_uses_native_descriptor_and_ccmp`
+and `smoke_rtl8188ee_ht20_wpa2_native_kernel_dhcp_and_ip`.
 
 Tests: `smoke_rtl8188ee_rx_pwdb_and_smoothing_match_linux` and
 `smoke_rtl8188ee_rate_mask_levels_match_linux` (hand-computed Linux CCK/

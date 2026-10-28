@@ -113,6 +113,12 @@ struct DeviceEnvironment {
     ht: Option<HtFixtureSource>,
 }
 impl Environment for DeviceEnvironment {
+    fn fallback(
+        &self,
+        base: Arc<super::super::super::super::super::channel_power::Calibration>,
+    ) -> Result<Option<Arc<super::super::super::super::super::fallback::Grant>>, StationError> {
+        self.base.fallback(base)
+    }
     fn ht20(
         &self,
         base: Arc<super::super::super::super::super::channel_power::Calibration>,
@@ -1278,9 +1284,15 @@ kernel_test_in!(
 /// Linux `rtl88e_dm_watchdog` RA: the association installs the level-0
 /// mask (`update_rate_tbl(sta, 0)`), BSSID-matching RX PHY status feeds
 /// `undec_sm_pwdb`, and each 2 s refresh re-sends the mask only when the
-/// hysteresis level changes. DATA after the mask carries fallback.
+/// hysteresis level changes. DATA after the mask carries fallback under
+/// the separately signed NEFB grant.
 pub(crate) fn smoke_rtl8188ee_native_device_rate_mask_follows_rx_pwdb() -> TestResult {
     let h = Harness::new(false);
+    *h.env.fallback.lock() = Some((
+        narf_capabilities::Cap::bootstrap(),
+        h.firmware.identity().unwrap(),
+        true,
+    ));
     {
         // All 12 legacy rates: WIRELESS_MODE_G (supp_rates > 0xf).
         let mut p = h.peer.lock();

@@ -630,6 +630,12 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         progressed
     }
     #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn fallback_for_test(&self) -> Option<bool> {
+        self.prepared
+            .try_lock()
+            .map(|storage| storage.as_ref().is_some_and(|o| o.station_fallback()))
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn pending_for_test(&self) -> Option<bool> {
         self.state.try_lock().map(|state| state.pending.is_some())
     }
@@ -1044,6 +1050,13 @@ impl Environment for NativeEnvironment {
         base: Arc<super::channel_power::Calibration>,
     ) -> Result<Option<Arc<super::ht::Grant>>, Error> {
         super::ht::Grant::registered(base, self.firmware.identity().ok_or(Error::State)?)
+            .map_err(Error::Radio)
+    }
+    fn fallback(
+        &self,
+        base: Arc<super::channel_power::Calibration>,
+    ) -> Result<Option<Arc<super::fallback::Grant>>, Error> {
+        super::fallback::Grant::registered(base, self.firmware.identity().ok_or(Error::State)?)
             .map_err(Error::Radio)
     }
     fn admission(&self) -> Option<&Arc<station::Admission>> {

@@ -16,6 +16,21 @@ pub(super) struct Env {
     policy: Option<Arc<narf_wireless::reg::db::Database>>,
     qualification:
         Option<narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>>,
+    /// `NEFB` fixture: (source cap, firmware identity, admissible body).
+    pub(super) fallback: IrqSafeSpinLock<Option<FallbackSource>>,
+}
+pub(super) type FallbackSource = (
+    narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+    super::super::super::super::firmware_transport::Identity,
+    bool,
+);
+/// A fresh `NEFB` fixture source over an unsourced firmware identity.
+pub(super) fn fallback_source(valid: bool) -> FallbackSource {
+    (
+        narf_capabilities::Cap::bootstrap(),
+        super::super::super::super::firmware_transport::Identity::fixture(b"ee fallback fw"),
+        valid,
+    )
 }
 impl Env {
     fn new() -> Self {
@@ -25,10 +40,32 @@ impl Env {
             entropy: AtomicBool::new(true),
             policy: None,
             qualification: None,
+            fallback: IrqSafeSpinLock::new(None),
         }
     }
 }
 impl Environment for Env {
+    fn fallback(
+        &self,
+        base: Arc<super::super::super::super::channel_power::Calibration>,
+    ) -> Result<Option<Arc<super::super::super::super::fallback::Grant>>, StationError> {
+        let Some((cap, firmware, valid)) = *self.fallback.lock() else {
+            return Ok(None);
+        };
+        let mut body = super::super::super::super::fallback::tests::artifact(&base, firmware);
+        if !valid {
+            body[119] = 1; // Any payload byte beyond byte0 is inadmissible.
+        }
+        super::super::super::super::fallback::Grant::parse(
+            base,
+            firmware,
+            &body,
+            Some([0x77; 32]),
+            cap,
+        )
+        .map(|g| Some(Arc::new(g)))
+        .map_err(StationError::Radio)
+    }
     fn now_ms(&self) -> u64 {
         self.now.load(Ordering::Acquire)
     }
@@ -399,12 +436,13 @@ fn smoke_rtl8188ee_negotiated_legacy_data_rate_uses_native_descriptor_and_ccmp()
                 return TestResult::Fail("EE actual richer-rate native data/CCMP");
             }
             let descriptor = port.descriptor(4, slot);
-            // The level-0 RA mask is installed at association: DATA keeps
-            // USE_RATE at the highest rate, clears DISDATAFB and carries
-            // the mask's RATE_ID (B: 6 for CCK-only, else G: 4).
+            // The level-0 RA mask is installed at association, but without
+            // a separate NEFB grant DATA keeps the signed fixed-rate
+            // profile: USE_RATE + DISDATAFB at the highest rate, RATE_ID 0.
             if word(&descriptor, 20) & 63 != expected
-                || word(&descriptor, 16) & ((1 << 8) | (1 << 10)) != (1 << 8)
-                || (word(&descriptor, 4) >> 16) & 15 != if expected <= 3 { 6 } else { 4 }
+                || word(&descriptor, 16) & ((1 << 8) | (1 << 10)) != (1 << 8) | (1 << 10)
+                || (word(&descriptor, 4) >> 16) & 15 != 0
+                || owner.rate_mask() != Some(if expected <= 3 { 6 } else { 4 })
             {
                 return TestResult::Fail("EE response intersection or native forced rate differs");
             }
@@ -430,6 +468,116 @@ fn smoke_rtl8188ee_negotiated_legacy_data_rate_uses_native_descriptor_and_ccmp()
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rates",
     smoke_rtl8188ee_negotiated_legacy_data_rate_uses_native_descriptor_and_ccmp
+);
+/// One legacy DATA frame: (DISDATAFB set, TXD RATE_ID, forced rate).
+fn data_profile(
+    owner: &mut Prepared<PacketPort, Block>,
+    port: &PacketPort,
+    peer: &Arc<IrqSafeSpinLock<Peer>>,
+    env: &Env,
+    n: u8,
+) -> Result<(bool, u32, u32), &'static str> {
+    let plan = peer.lock().plan;
+    let ethernet = udp_ipv4(
+        PEER,
+        plan.station,
+        plan.lease_ip,
+        plan.server_ip,
+        44000,
+        44001,
+        &[n; 24],
+    );
+    let slot = port.model.lock().slots[4];
+    if owner.send_station_ethernet(&ethernet, env).is_err()
+        || owner.progress_station(env).is_err()
+        || peer.lock().uplink.last() != Some(&ethernet)
+    {
+        return Err("EE fallback-profile DATA was not delivered");
+    }
+    let d = port.descriptor(4, slot);
+    if word(&d, 16) & (1 << 8) == 0 {
+        return Err("EE DATA lost the forced USE_RATE (88EE use_driver_rate)");
+    }
+    Ok((
+        word(&d, 16) & (1 << 10) != 0,
+        (word(&d, 4) >> 16) & 15,
+        word(&d, 20) & 63,
+    ))
+}
+fn smoke_rtl8188ee_data_fallback_requires_separate_signed_grant() -> TestResult {
+    for protected in [false, true] {
+        // Granted at association: DATA clears DISDATAFB and carries the
+        // RA mask's RATE_ID (G: 4) at the highest negotiated rate.
+        let (mut owner, port, peer, env) =
+            started_rates(protected, Some(WMM.to_vec()), Some(&LEGACY_RATES));
+        *env.fallback.lock() = Some(fallback_source(true));
+        let fallback = (*env.fallback.lock()).unwrap().0;
+        if complete(owner.connect_station(
+            PEER,
+            SSID,
+            if protected {
+                SecurityMode::Wpa2Psk
+            } else {
+                SecurityMode::Open
+            },
+            protected.then(|| Zeroizing::new(PMK)),
+            &[],
+            &env,
+        ))
+        .is_err()
+            || !owner.station_fallback()
+            || owner.rate_mask() != Some(4)
+        {
+            return TestResult::Fail("EE granted association did not hold the NEFB grant");
+        }
+        match data_profile(&mut owner, &port, &peer, &env, 1) {
+            Ok((false, 4, 11)) => {}
+            Ok(_) => return TestResult::Fail("EE granted DATA did not enable firmware fallback"),
+            Err(e) => return TestResult::Fail(e),
+        }
+        // Revoked mid-link: the next DATA returns to USE_RATE + DISFB at
+        // the same rate; the link, keys and the RA mask stay.
+        fallback.revoke();
+        match data_profile(&mut owner, &port, &peer, &env, 2) {
+            Ok((true, 0, 11)) => {}
+            Ok(_) => return TestResult::Fail("EE revoked NEFB grant kept firmware fallback"),
+            Err(e) => return TestResult::Fail(e),
+        }
+        if owner.station_fallback()
+            || owner.station_peer().is_none()
+            || !owner.station_linked()
+            || owner.rate_mask() != Some(4)
+        {
+            return TestResult::Fail("EE NEFB revocation dropped the link or kept the grant");
+        }
+        // The watchdog pass re-proves the grant and never re-enables it.
+        if complete(owner.refresh_station_rate_mask(&env)).is_err() || owner.station_fallback() {
+            return TestResult::Fail("EE watchdog pass resurrected a revoked NEFB grant");
+        }
+        match data_profile(&mut owner, &port, &peer, &env, 3) {
+            Ok((true, 0, 11)) => {}
+            _ => return TestResult::Fail("EE post-revocation DATA changed"),
+        }
+        // Teardown: disassociation forgets the association's grant.
+        if complete(owner.disconnect_station()).is_err() || owner.station_fallback() {
+            return TestResult::Fail("EE disassociation kept the NEFB grant");
+        }
+    }
+    // An inadmissible (non-zero reserved payload) signed record refuses
+    // the association instead of silently changing the emission profile.
+    let (mut owner, _port, _peer, env) =
+        started_rates(false, Some(WMM.to_vec()), Some(&LEGACY_RATES));
+    *env.fallback.lock() = Some(fallback_source(false));
+    if complete(owner.connect_station(PEER, SSID, SecurityMode::Open, None, &[], &env)).is_ok()
+        || owner.station_fallback()
+    {
+        return TestResult::Fail("EE inadmissible NEFB record changed DATA fallback");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rates",
+    smoke_rtl8188ee_data_fallback_requires_separate_signed_grant
 );
 fn smoke_rtl8188ee_wmm_real_dma_edca_and_open_wpa2_qos_data() -> TestResult {
     for protected in [false, true] {

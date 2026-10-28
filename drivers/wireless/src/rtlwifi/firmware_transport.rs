@@ -113,6 +113,11 @@ impl Identity {
             source,
         }
     }
+    /// An unsourced identity over `bytes` for qualification fixtures.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn fixture(bytes: &[u8]) -> Self {
+        Self::from_bytes(bytes, None)
+    }
     pub(super) fn invoke<T>(
         &self,
         operation: impl FnOnce() -> Result<T, super::prepare::Error>,

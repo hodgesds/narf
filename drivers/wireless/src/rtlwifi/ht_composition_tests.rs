@@ -98,9 +98,10 @@ fn composition(protected: bool) -> Result<(), &'static str> {
         return Err("HT actual software-CCMP uplink mismatch");
     }
     let d = h.packet.model.lock().descriptors.last().unwrap().clone();
-    // RA mask (NGB, RATE_ID 0) installed: USE_RATE kept, DISDATAFB clear.
+    // RA mask (NGB) installed but no NEFB grant: the signed HT20 fixed
+    // profile (USE_RATE + DISDATAFB) is what the descriptor carries.
     if word(&d, 20) & 127 != 19
-        || word(&d, 16) & ((1 << 6) | (1 << 8) | (1 << 10)) != 0x140
+        || word(&d, 16) & ((1 << 6) | (1 << 8) | (1 << 10)) != 0x540
         || (word(&d, 4) >> 16) & 15 != 0
         || word(&d, 16) & ((1 << 25) | (3 << 20)) != 0
         || word(&d, 8) & (1 << 12) != 0
@@ -135,6 +136,64 @@ fn smoke_rtl8188ee_ht20_wpa2_native_kernel_dhcp_and_ip() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtlwifi/ht20",
     smoke_rtl8188ee_ht20_wpa2_native_kernel_dhcp_and_ip
+);
+/// DISDATAFB of the last HT DATA descriptor after one real uplink frame.
+fn uplink_disfb(h: &Harness, n: u8) -> Result<bool, &'static str> {
+    let up = packet(h, n, true);
+    h.device
+        .enqueue(&up, TxMeta::default())
+        .map_err(|_| "HT fallback enqueue")?;
+    h.pump();
+    if h.peer.lock().uplink.last() != Some(&up) {
+        return Err("HT fallback uplink mismatch");
+    }
+    let d = h.packet.model.lock().descriptors.last().unwrap().clone();
+    if word(&d, 20) & 127 != 19 || word(&d, 16) & ((1 << 6) | (1 << 8)) != 0x140 {
+        return Err("HT fallback DATA lost MCS7/QoS/USE_RATE");
+    }
+    Ok(word(&d, 16) & (1 << 10) != 0)
+}
+fn smoke_rtl8188ee_ht20_data_fallback_is_a_separate_revocable_grant() -> TestResult {
+    check(|| {
+        for protected in [false, true] {
+            let h = Harness::new_profile(protected, true);
+            let cap = narf_capabilities::Cap::bootstrap();
+            *h.env.fallback.lock() = Some((cap, h.firmware.identity().unwrap(), true));
+            ht_join(&h)?;
+            if h.device.fallback_for_test() != Some(true) {
+                return Err("HT association did not consult the NEFB grant");
+            }
+            if uplink_disfb(&h, 1)? {
+                return Err("HT granted DATA kept DISDATAFB");
+            }
+            // Revocation mid-link: fixed rate again, link and IP stay.
+            cap.revoke();
+            if !uplink_disfb(&h, 2)? || h.device.fallback_for_test() != Some(false) {
+                return Err("HT revoked NEFB grant kept DATA fallback");
+            }
+            if !h.device.link_up() {
+                return Err("HT NEFB revocation dropped the link");
+            }
+            let down = packet(&h, 3, false);
+            let raw = h.peer.lock().downlink(&down)?;
+            h.packet
+                .emit_native(&raw, 0x53, 0, None)
+                .map_err(|_| "HT RX injection")?;
+            h.pump();
+            if !h.received().contains(&down) || !uplink_disfb(&h, 4)? {
+                return Err("HT post-revocation RX/TX changed");
+            }
+            complete(h.device.disassociate()).map_err(|_| "HT fallback close")?;
+            if !h.closed() || h.device.fallback_for_test() != Some(false) {
+                return Err("HT close kept the NEFB grant");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/ht20",
+    smoke_rtl8188ee_ht20_data_fallback_is_a_separate_revocable_grant
 );
 fn smoke_rtl8188ee_ht20_all_mcs_bound_actual_response_and_lgi_descriptors() -> TestResult {
     check(|| {
