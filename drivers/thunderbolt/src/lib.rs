@@ -3,8 +3,10 @@
 //! PCI discovery includes AMD Pink Sardine and Intel USB4 class controllers.
 //! Firmware `_OSC` must grant USB3/DisplayPort ownership before ring zero is
 //! started; PCIe tunnelling is additionally programmed only when the `_OSC`
-//! grant includes the PCIe bit. One actor owns each NHI's DMA rings, config
-//! transactions, topology, and tunnels. XDomain tunneling is not implemented.
+//! grant includes the PCIe bit, and the XDomain engine (host-to-host
+//! connections, service discovery, ThunderboltIP networking) runs only when
+//! the grant includes the XDomain bit. One actor owns each NHI's DMA rings,
+//! config transactions, topology, tunnels and XDomain peers.
 //! Legacy ICM (firmware-CM) hosts are detected from NHI firmware status
 //! before ring 0 starts and the native CM stands down for those controllers
 //! (see `icm`); the ICM protocol itself is deliberately not implemented.
@@ -48,9 +50,13 @@ mod runtime;
 #[cfg(feature = "builtin")]
 pub mod switch;
 #[cfg(feature = "builtin")]
+mod tbnet;
+#[cfg(feature = "builtin")]
 pub mod topology;
 #[cfg(feature = "builtin")]
 pub mod tunnel;
+#[cfg(feature = "builtin")]
+pub mod xdomain;
 
 #[cfg(all(feature = "builtin", target_arch = "x86_64"))]
 mod tests;

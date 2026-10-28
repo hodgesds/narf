@@ -27,6 +27,8 @@ narf-scheduler    = { path = "../../scheduler", optional = true }
 narf-time         = { path = "../../time", optional = true }
 narf-aml          = { path = "../../aml", optional = true }
 narf-power        = { path = "../../power", optional = true }
+narf-net          = { path = "../../net", optional = true }
+narf-ipc          = { path = "../../ipc", optional = true }
 
 [features]
 # Dual-build: built-in (rlib) or loadable `.ko`. `default = builtin` keeps the
@@ -38,6 +40,7 @@ builtin = [
     "dep:narf-drivers", "dep:narf-init", "dep:narf-memory",
     "dep:narf-kernel-test", "dep:narf-io", "dep:narf-interrupts",
     "dep:narf-scheduler", "dep:narf-time", "dep:narf-aml", "dep:narf-power",
+    "dep:narf-net", "dep:narf-ipc",
 ]
 module = []
 # Declared so `#[cfg(feature = "kernel-test")]` in src/ doesn't trip the

@@ -12,11 +12,13 @@ use narf_aml::Value;
 pub(crate) const CONTROL_USB3: u32 = 1 << 0;
 pub(crate) const CONTROL_DP: u32 = 1 << 1;
 pub(crate) const CONTROL_PCIE: u32 = 1 << 2;
+pub(crate) const CONTROL_XDOMAIN: u32 = 1 << 3;
 
 /// What this CM requests from firmware: USB3, DisplayPort and PCIe
-/// tunnelling. XDomain (bit 3) is a separate programme lane and is
-/// deliberately not requested here.
-pub(crate) const CONTROL_REQUEST: u32 = CONTROL_USB3 | CONTROL_DP | CONTROL_PCIE;
+/// tunnelling, plus XDomain connections (bit 3, requested since
+/// the XDomain engine landed; the grant still decides — the engine
+/// stays inert on domains where the bit comes back clear).
+pub(crate) const CONTROL_REQUEST: u32 = CONTROL_USB3 | CONTROL_DP | CONTROL_PCIE | CONTROL_XDOMAIN;
 
 fn handshake(uuid: [u8; 16], caps: &[u32]) -> Option<Vec<u32>> {
     let mut input = caps.to_vec();
@@ -63,8 +65,8 @@ pub(crate) fn native_control() -> Option<u32> {
     if platform[1] & (1 << 18) == 0 {
         return None;
     }
-    // This CM manages display, USB3 and PCIe tunnelling; it does
-    // not request XDomain. The handshake ANDs the request with the
+    // This CM manages display, USB3 and PCIe tunnelling and
+    // XDomain connections. The handshake ANDs the request with the
     // firmware reply, so the returned mask is exactly the granted
     // subset of CONTROL_REQUEST — callers gate each protocol on its
     // own bit.

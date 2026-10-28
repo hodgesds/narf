@@ -11,9 +11,11 @@ configuration/topology helpers remain available for callers and tests.
 ACPI `_SB._OSC` must confirm native USB4 support and grant the corresponding
 control bits (USB4 `_OSC` capabilities DWORD 2: bit 0 USB3 tunnelling,
 bit 1 DisplayPort tunnelling, bit 2 PCIe tunnelling, bit 3 XDomain). The CM
-requests USB3, DisplayPort and PCIe and proceeds per protocol on the bits
-actually granted: a platform that grants USB3/DP but not PCIe still gets
-USB3/DP tunnels, and PCIe paths are never programmed without the PCIe grant.
+requests USB3, DisplayPort, PCIe and XDomain and proceeds per protocol on
+the bits actually granted: a platform that grants USB3/DP but not PCIe
+still gets USB3/DP tunnels, and PCIe paths are never programmed without
+the PCIe grant. XDomain (host-to-host) services likewise run only under
+the XDomain grant.
 A controller needs an accessible BAR0 and coherent DMA.
 PCI class `0x0c0340` identifies a USB4 NHI, including AMD Pink Sardine. The
 number of NHI functions does not determine the number of physical USB-C ports.
@@ -62,6 +64,16 @@ such controllers; it never starts, resets, or speaks to the ICM firmware.
   is torn down, not replayed; a failed replay is never published
   live and stays named in `replay_failures()` until a resume retry
   restores it.
+- `xdomain::peers()` returns `PeerInfo` snapshots of the discovered
+  peer hosts (domain, route, XDomain UUID, advertised identity and
+  services, ThunderboltIP login state, link state, peer MAC and
+  transmit path). A peer host appears here once its depth-1 router has
+  been probed and its property block fetched and validated; it is
+  removed when its router leaves the topology.
+- Each peer advertising the Thunderbolt networking service gets a
+  netdev named `tbnet<domain>-<n>` registered with the net registry,
+  carrying Ethernet frames over ThunderboltIP data frames once the
+  mutual login completes (see §8 for the data-transport binding).
 - `register_initcalls()` registers PCI discovery at Device and starts one
   task per natively managed controller at Late. MSI-X wakes the task, with bounded timed
   polling when MSI-X is unavailable. No config transaction holds a spinlock
@@ -117,6 +129,7 @@ Hop pending is read from DWORD 1 and must clear before credits are released.
 USB3 bandwidth ownership uses the CMR/HCA handshake in both directions.
 Protocol adapters retain vendor-defined ingress credit/flow-control fields.
 
+
 DP bandwidth groups are never overcommitted: a tunnel's envelope is fitted
 under its group's free budget — the first link's budget less every live
 tunnel charged to the group, USB3 tunnels included — by stepping the rate
@@ -142,20 +155,45 @@ router carries a PCIe downstream adapter. A PCIe downstream adapter
 serves at most one live PCIe tunnel, and a tunnel's origin is the
 nearest ancestor router carrying one. The native CM joins the
 device-PM fan-out with a state-checked handler: system suspend is refused
-(`Busy`) while tunnels are live and unquiesced, while a domain's CM has
-exited with tunnel writes unrolled-back, or while a replay failure is
-outstanding. The first refusal latches a quiesce request; the CM task
+(`Busy`) while tunnels are live and unquiesced, while a host-to-host
+XDomain link is logged in, while a domain's CM has exited with tunnel
+writes unrolled-back, or while a replay failure is outstanding. The
+first tunnel refusal latches a quiesce request; the CM task
 drains each live path (hop drain before credit release, via the
 journaled teardown) and records it, after which the handler reports
-ready — an idle, stopped, cleanly-exited, or fully-quiesced CM never
-vetoes suspend. On resume the CM re-scans the topology and replays
+ready — an idle, stopped, cleanly-exited, or fully-quiesced CM with no
+logged-in XDomain link never vetoes suspend. On resume the CM re-scans
+the topology and replays
 each recorded tunnel through its original activation path; endpoints
 missing from the re-scan are dropped, and a replay that fails rolls
 back through its own journal and is named in the replay-failure
 registry (the resume handler reports it as `DriverError`, and the
 suspend handler keeps refusing until a retry restores it). While a
 domain is quiescing or quiesced, its CM does not scan or reconcile —
-rediscovery never reprograms paths suspend drained. Transport failure
+rediscovery never reprograms paths suspend drained.
+
+Host-to-host XDomain runs inside the CM task under the XDomain `_OSC`
+grant: the engine probes each depth-1 router (a peer host) by UUID
+exchange, fetches and validates its property block (fail-closed: strict
+per-message lengths, bounded block size, root/directory structure and
+payload bounds all checked before any state is taken from it), and
+answers inbound requests from the same rules — an unknown destination
+UUID draws an error response, an out-of-range properties offset draws
+silence, and malformed frames are dropped. A peer whose generation
+advances restarts its ThunderboltIP session; a properties-changed
+notification at the same generation revalidates the view without
+dropping the session. Peer errors are absorbed into per-peer state and
+never fail the CM loop. The ThunderboltIP login is mutual: the link is
+up only once both directions have logged in, after which Ethernet
+frames cross fragmented into 4 KiB data frames and are reassembled
+under the reference validation rules (strict index order, first
+fragment's count and id, any failure discarding the packet in
+progress). Suspend composition: a logged-in XDomain link vetoes
+suspend outright — it is not quiesced the way live tunnels are, and
+the veto is checked before any tunnel quiesce is latched; after resume
+the engine re-reads peer properties and re-logs in, which is the
+XDomain half of the replay world (tunnel replay restores paths; XDomain
+replay re-establishes sessions). Transport failure
 clears public snapshots and attempts owned-path
 teardown; a poisoned channel can prevent that teardown, and the orphaned
 domain's refusal persists until a CM for it tears the paths down.
@@ -191,10 +229,21 @@ it does not emulate an AMD USB4 dock or prove physical monitor output.
 Hardware validation; firmware tunnel adoption; controller reset recovery after resume
 (tunnel replay assumes the control channel survives the sleep or is
 re-established by that recovery);
-XDomain tunnels, link bonding and retimer policy.
+link bonding and retimer policy.
 Legacy ICM is closed by detect-and-defer (§3): firmware-managed hosts are
 stood aside from, and implementing the ICM protocol itself — or adopting
 the firmware's tunnels — is out of scope by design, not pending work.
+XDomain remainders: the NHI data-ring binding for the ThunderboltIP
+netdev — `drivers/thunderbolt/src/ring.rs` implements only ring 0, so
+no production `DataLink` exists yet; the binding is a TX ring with
+`RING_FLAG_FRAME` and an RX ring with `RING_FLAG_FRAME |
+RING_FLAG_E2E`, frame-start/end PDF masks, HopID `0xf`
+(`TBNET_LOCAL_PATH`), plus the in-router XDomain path programming
+that approves the peer's transmit path — until it lands, logins
+complete but the netdev reports link down and no frames flow. The
+local XDomain UUID is a deterministic derivation from the domain and
+router identity (enumeration surfaces no firmware UUID); it is a
+stable placeholder, not a provisioned identity.
 DP remainders: UHBR (128b/132b) tunnel envelopes, Gen 4 asymmetric link
 transitions, and renegotiating the programmed REMOTE_CAP envelope itself
 in response to allocation changes (today the source re-trains within the
