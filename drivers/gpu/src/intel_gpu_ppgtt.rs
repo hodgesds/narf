@@ -882,14 +882,28 @@ pub mod tests {
         // (a) Reserved bit set in the PD entry (bit 5 is not
         // assigned by the GFX PTE definition): the walk must
         // stop Corrupt at the PD level, not follow the entry.
-        let pd_entry = mem.raw_read(pdpt, 2);
-        mem.raw_write(pdpt, 2, pd_entry | (1 << 5));
+        // The PD entry is the one *in* the PD table (index 3,
+        // pointing at the PT): `level` names the table that
+        // holds the offending entry, the convention
+        // `WalkOutcome` documents and the PML4/PT cases pin.
+        let pd_entry = mem.raw_read(pd, 3);
+        mem.raw_write(pd, 3, pd_entry | (1 << 5));
         match vm.translate(&mem, va) {
             Ok(WalkOutcome::Corrupt { level: LEVEL_PD }) => {}
             _ => return TestResult::Fail("reserved-bit PD entry must be Corrupt at PD"),
         }
-        mem.raw_write(pdpt, 2, pd_entry);
-        // (b) Present leaf with a zero physical address.
+        mem.raw_write(pd, 3, pd_entry);
+        // (b) Same tamper one level up: the entry in the PDPT
+        // (index 2, pointing at the PD) must stop the walk
+        // Corrupt at the PDPT level.
+        let pdpt_entry = mem.raw_read(pdpt, 2);
+        mem.raw_write(pdpt, 2, pdpt_entry | (1 << 5));
+        match vm.translate(&mem, va) {
+            Ok(WalkOutcome::Corrupt { level: LEVEL_PDPT }) => {}
+            _ => return TestResult::Fail("reserved-bit PDPT entry must be Corrupt at PDPT"),
+        }
+        mem.raw_write(pdpt, 2, pdpt_entry);
+        // (c) Present leaf with a zero physical address.
         let leaf = mem.raw_read(pt, 4);
         mem.raw_write(pt, 4, PTE_PRESENT);
         match vm.translate(&mem, va) {
@@ -897,7 +911,7 @@ pub mod tests {
             _ => return TestResult::Fail("zero-phys leaf must be Corrupt at PT"),
         }
         mem.raw_write(pt, 4, leaf);
-        // (c) Reserved bit in the leaf (bit 39 is outside the
+        // (d) Reserved bit in the leaf (bit 39 is outside the
         // 39-bit phys field and unassigned in a leaf).
         mem.raw_write(pt, 4, leaf | (1 << 39));
         match vm.translate(&mem, va) {
