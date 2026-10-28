@@ -3,7 +3,7 @@
 //! Extracted from MT76 association; no firmware command/rate index, PMK,
 //! regulatory authority, key installation or controlled-port state is stored.
 use crate::rsn::{self, RsnIe, Suite};
-use alloc::{vec, vec::Vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 #[path = "association/channel.rs"]
 pub mod channel;
 #[path = "association/eht.rs"]
@@ -128,6 +128,9 @@ pub struct JoinPlan {
     epd: bool,
     /// The negotiated WPA2 AKM/MFP profile (`Wpa2Profile::LEGACY` otherwise).
     wpa2: Wpa2Profile,
+    /// 6 GHz state of a `prepare_6ghz` plan (boxed: `JoinPlan` stays small
+    /// for the 2.4/5 GHz callers' stacks).
+    six_ghz: Option<Box<six_ghz::SixGhzPlan>>,
 }
 
 /// Capability Information EPD subfield (bit13, IEEE802.11-2020 9.4.1.4).
@@ -578,6 +581,17 @@ impl JoinPlan {
             return Err(Error::InvalidBss);
         }
         validate_sme_ies(bytes, self.security.is_wpa2())?;
+        if self.six_ghz.is_some() {
+            // HT and VHT are not allowed on 6 GHz (mac80211 never adds HT
+            // or VHT Capabilities to a 6 GHz association request).
+            ies(bytes, |id, _| {
+                if matches!(id, 45 | 61 | 191 | 192) {
+                    Err(Error::UnsupportedRates)
+                } else {
+                    Ok(())
+                }
+            })?;
+        }
         if self.phy_enabled {
             ies(bytes, |id, _| {
                 if matches!(id, 61 | 192) {
@@ -601,7 +615,7 @@ impl JoinPlan {
         ssid: &[u8],
         security: SecurityMode,
     ) -> Result<Self, Error> {
-        Self::prepare_inner(bss, own, ssid, security, None, JoinOptions::default())
+        Self::prepare_inner(bss, own, ssid, security, None, JoinOptions::default(), None)
     }
     /// Prepare using an implementation profile derived by the native owner.
     /// AP facts are reparsed and bound here, never accepted as an external grant.
@@ -619,6 +633,7 @@ impl JoinPlan {
             security,
             Some(local),
             JoinOptions::default(),
+            None,
         )
     }
     pub fn offered_phy(&self) -> Option<&phy::Offer> {
@@ -637,7 +652,40 @@ impl JoinPlan {
         local: Option<phy::LocalPhy>,
         options: JoinOptions,
     ) -> Result<Self, Error> {
-        Self::prepare_inner(bss, own, ssid, security, local, options)
+        Self::prepare_inner(bss, own, ssid, security, local, options, None)
+    }
+    /// Prepare a 6 GHz station plan. `bss.band` must be `Some(Band::Ghz6)`
+    /// and its HE Operation must carry 6 GHz Operation Information;
+    /// `six_ghz::plan` admits it against `local`'s regulatory rule and
+    /// derives the channel, width and HE/EHT facts (`six_ghz()`).
+    ///
+    /// The 802.11ax 6 GHz security rule (IEEE802.11-2024 12.13.2: no open,
+    /// WEP, TKIP or PSK AKM, PMF required; WPA3 SAE must use H2E) is not
+    /// enforced by Linux v7.2 mac80211/cfg80211 on the station side; it is
+    /// wpa_supplicant's 6 GHz BSS filter. NARF has no separate BSS filter,
+    /// so the plan applies it: `Open` and `Wpa2Psk` are
+    /// `UnsupportedSecurity`, and `Wpa3Sae` must resolve to hash-to-element
+    /// (an AP or policy that only allows hunting-and-pecking is refused).
+    /// SAE already requires an MFP-capable AP and sends MFPC|MFPR.
+    /// OWE is not a `SecurityMode` and so cannot be joined either.
+    ///
+    /// The request carries no HT/VHT Capabilities; after RSNE/RSNXE it
+    /// sends HE Capabilities, HE 6 GHz Band Capabilities, Non-AP STA
+    /// Regulatory Connectivity and (if negotiated) EHT Capabilities.
+    pub fn prepare_6ghz(
+        bss: &Bss,
+        own: [u8; 6],
+        ssid: &[u8],
+        security: SecurityMode,
+        local: &six_ghz::SixGhzLocal,
+        options: JoinOptions,
+    ) -> Result<Self, Error> {
+        Self::prepare_inner(bss, own, ssid, security, None, options, Some(local))
+    }
+    /// The negotiated 6 GHz operation, power type, channel/width and HE
+    /// (and EHT) facts of a `prepare_6ghz` plan; `None` on 2.4/5 GHz.
+    pub fn six_ghz(&self) -> Option<&six_ghz::SixGhzPlan> {
+        self.six_ghz.as_deref()
     }
     /// True when this BSS mandates EtherType Protocol Discrimination (EPD
     /// membership selector 124) and both the AP and this station advertise
@@ -670,13 +718,30 @@ impl JoinPlan {
         security: SecurityMode,
         local: Option<phy::LocalPhy>,
         options: JoinOptions,
+        six: Option<&six_ghz::SixGhzLocal>,
     ) -> Result<Self, Error> {
+        let band = match six {
+            // A 6 GHz plan needs the explicit band and a 6 GHz channel.
+            Some(_) if bss.band == Some(channel::Band::Ghz6) => {
+                channel::frequency_in(channel::Band::Ghz6, bss.channel).map(|_| channel::Band::Ghz6)
+            }
+            Some(_) => None,
+            // Otherwise a 2.4/5 GHz plan; an explicit band must agree.
+            None if bss
+                .band
+                .is_some_and(|band| Some(band) != channel::band(bss.channel)) =>
+            {
+                None
+            }
+            None => channel::band(bss.channel),
+        };
+        let six_ghz_band = band == Some(channel::Band::Ghz6);
         if !unicast(own)
             || !unicast(bss.bssid)
             || own == bss.bssid
-            || channel::band(bss.channel).is_none()
-            // JoinPlan is a 2.4/5 GHz plan; an explicit band must agree.
-            || bss.band.is_some_and(|band| Some(band) != channel::band(bss.channel))
+            || band.is_none()
+            // A 6 GHz plan has no HT/VHT PHY profile.
+            || (six_ghz_band && local.is_some())
             || bss.information_elements.len() > 2048
             || ssid.is_empty()
             || ssid.len() > 32
@@ -685,8 +750,13 @@ impl JoinPlan {
         {
             return Err(Error::InvalidBss);
         }
+        if six_ghz_band && !security.is_sae() {
+            // 6 GHz security rule (see `prepare_6ghz`).
+            return Err(Error::UnsupportedSecurity);
+        }
         let mut rate_elements = RateElements {
             allowed: if local.is_some() { SEL_PHY } else { 0 }
+                | if six_ghz_band { SEL_HE | SEL_EHT } else { 0 }
                 | if security.is_sae() { SEL_SAE_H2E } else { 0 }
                 | if options.epd { SEL_EPD } else { 0 },
             ..Default::default()
@@ -725,7 +795,8 @@ impl JoinPlan {
         })?;
         let mut rates = rate_elements.rates;
         let basic = rate_elements.basic;
-        if channel::band(bss.channel) == Some(channel::Band::Ghz5) {
+        // 5 and 6 GHz are OFDM-only (no DSSS/CCK rates).
+        if band != Some(channel::Band::Ghz2) {
             if basic & 15 != 0 {
                 return Err(Error::UnsupportedRates);
             }
@@ -742,6 +813,17 @@ impl JoinPlan {
                 rate_elements.selectors,
             )?,
             None => None,
+        };
+        let six_ghz = match six {
+            Some(six) if six_ghz_band => {
+                let plan = six_ghz::plan(&bss.information_elements, bss.channel, six)?;
+                // An EHT membership selector needs negotiated EHT.
+                if rate_elements.selectors & SEL_EHT != 0 && plan.eht().is_none() {
+                    return Err(Error::UnsupportedRates);
+                }
+                Some(Box::new(plan))
+            }
+            _ => None,
         };
         // IEEE802.11-2020 9.4.1.4: an EPD-mandatory BSS advertises the EPD
         // capability subfield (bit13); an inconsistent beacon is malformed.
@@ -776,6 +858,10 @@ impl JoinPlan {
                     rate_elements.selectors & SEL_SAE_H2E != 0,
                     options.akms,
                 )?;
+                if six_ghz_band && !join.h2e() {
+                    // SAE on 6 GHz uses hash-to-element only.
+                    return Err(Error::UnsupportedSecurity);
+                }
                 let body = join.station_rsne(None);
                 sae = Some(join);
                 Some(body)
@@ -785,10 +871,10 @@ impl JoinPlan {
         auth.extend_from_slice(&[0, 0, 1, 0, 0, 0]);
         let mut assoc = management(0, own, bss.bssid);
         // ESS, negotiated privacy, and only AP-supported short preamble/slot.
-        let optional = if channel::band(bss.channel) == Some(channel::Band::Ghz5) {
-            0x0400
-        } else {
+        let optional = if band == Some(channel::Band::Ghz2) {
             0x0420
+        } else {
+            0x0400
         };
         let capability = 1
             | (bss.capability & optional)
@@ -824,6 +910,9 @@ impl JoinPlan {
         if let Some(offer) = offered_phy.as_ref() {
             offer.append_capabilities(&mut assoc);
         }
+        if let Some(plan) = six_ghz.as_ref() {
+            plan.append_capabilities(&mut assoc);
+        }
         Ok(Self {
             own,
             peer: bss.bssid,
@@ -841,6 +930,7 @@ impl JoinPlan {
             sae,
             epd,
             wpa2,
+            six_ghz,
         })
     }
     pub fn start_authentication(&mut self) -> Result<&[u8], Error> {
@@ -927,7 +1017,12 @@ impl JoinPlan {
                 SEL_SAE_H2E
             } else {
                 0
-            } | if self.epd { SEL_EPD } else { 0 },
+            } | if self.epd { SEL_EPD } else { 0 }
+                | if self.six_ghz.is_some() {
+                    SEL_HE | SEL_EHT
+                } else {
+                    0
+                },
             ..Default::default()
         };
         if let Err(error) = ies(&bytes[30..], |id, body| response.observe(id, body)) {
@@ -943,6 +1038,12 @@ impl JoinPlan {
         if !response.supported || rates == 0 || basic & !rates != 0 {
             self.phase = Phase::Failed;
             return Err(Error::UnsupportedRates);
+        }
+        if self.six_ghz.is_some() {
+            if let Err(error) = self.six_ghz_response(&bytes[30..]) {
+                self.phase = Phase::Failed;
+                return Err(error);
+            }
         }
         let negotiated_phy = if self.phy_enabled {
             // Validate every relevant element before committing any AID/rate/PHY.
@@ -979,6 +1080,44 @@ impl JoinPlan {
         self.negotiated_phy = negotiated_phy;
         self.phase = Phase::Associated { aid };
         Ok(Some(aid))
+    }
+    /// 6 GHz response checks (mac80211 `ieee80211_assoc_config_link`): no
+    /// HT/VHT element, exactly one HE Capabilities and HE Operation (an HE
+    /// connection whose response lacks them is refused) and an RSNE that
+    /// repeats the request's.
+    fn six_ghz_response(&self, bytes: &[u8]) -> Result<(), Error> {
+        let (mut cap, mut op, mut rsn_seen) = (false, false, false);
+        ies(bytes, |id, body| {
+            match (id, body.split_first()) {
+                (45 | 61 | 191 | 192, _) => return Err(Error::UnsupportedRates),
+                (48, _) => {
+                    if rsn_seen || !self.response_rsne_matches(body) {
+                        return Err(Error::UnsupportedSecurity);
+                    }
+                    rsn_seen = true;
+                }
+                (255, Some((&he::EXT_HE_CAPABILITIES, b))) => {
+                    if cap {
+                        return Err(Error::Protocol);
+                    }
+                    he::HeCapability::parse(b).map_err(|_| Error::Protocol)?;
+                    cap = true;
+                }
+                (255, Some((&he::EXT_HE_OPERATION, b))) => {
+                    if op {
+                        return Err(Error::Protocol);
+                    }
+                    he::HeOperation::parse(b).map_err(|_| Error::Protocol)?;
+                    op = true;
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        if !cap || !op {
+            return Err(Error::UnsupportedRates);
+        }
+        Ok(())
     }
     pub fn cancel(&mut self) {
         self.phase = Phase::Failed;

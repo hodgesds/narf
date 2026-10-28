@@ -310,9 +310,11 @@ for SAE. `Security::new_sae` refuses non-SAE AKMs.
 `association::Bss` gains `band: Option<Band>`. `None` means the 2.4/5 GHz
 numbering, so existing literals add `band: None`. `Bss::band()` returns the
 explicit band or the derived one, and `Bss::frequency_mhz()` returns the
-primary frequency. `observe` records the explicit band. `JoinPlan` stays a
-2.4/5 GHz plan and refuses a BSS whose explicit band disagrees with
-`channel::band(channel)`, so a 6 GHz channel 1 is never joined as 2412 MHz.
+primary frequency. `observe` records the explicit band. `prepare`,
+`prepare_with_phy` and `prepare_with_options` stay 2.4/5 GHz plans and
+refuse a BSS whose explicit band disagrees with `channel::band(channel)`,
+so a 6 GHz channel 1 is never joined as 2412 MHz. Only `prepare_6ghz`
+(below) joins a 6 GHz BSS.
 The `scan::BssInfo.frequency_mhz` scan identity is unchanged.
 
 `he::HeOperation::parse` accepts 6 GHz Operation Information and exposes it
@@ -351,10 +353,64 @@ operation, the channel and the power type.
 bits 4 and 5; nl80211 `NL80211_RRF_NO_6GHZ_*_CLIENT`). It is joined by
 `reg::PowerType6Ghz { Lpi, Sp, Vlp }` and the `RegRule` methods
 `covers_mhz`, `no_6ghz_afc_client` and `allows_6ghz_client(PowerType6Ghz)`.
+`RegRule` also derives `Debug`, `PartialEq` and `Eq`.
 
-A 6 GHz `JoinPlan` (OFDM-only rates, the HE 6 GHz capability in the request,
-a LocalPhy HE 6 GHz profile) is future work. Drivers that associate
-through firmware use `six_ghz::admit` for the station-side admission facts.
+**6 GHz JoinPlan (`JoinPlan::prepare_6ghz`, `six_ghz::{SixGhzLocal,
+SixGhzPlan, SixGhzOperatingChannel, SixGhzWidth, plan}`).** Drivers that
+associate through firmware can still use `six_ghz::admit` alone for the
+station-side admission facts.
+- `six_ghz::SixGhzLocal::new(LocalHe, He6GhzCapability, RegRule)` holds the
+  station's 6 GHz HE profile, its band capability (`sband_iftype_data.
+  he_6ghz_capa`; zero is refused) and the regulatory rule covering the BSS
+  primary. `with_eht(LocalEht)` adds EHT. `transmitted_capability()` is
+  mac80211 `ieee80211_put_he_6ghz_cap` with SMPS off (SM PS = disabled).
+  `regulatory_connectivity()` is `ieee80211_put_reg_conn` (LPI valid/set, SP
+  valid, SP set unless `NO_6GHZ_AFC_CLIENT`).
+- `eht::LocalEht::with_320mhz([u8; 3])` adds the 6 GHz 320 MHz set and PHY
+  B1 (it needs the 160 MHz set). `width320()` reports it, and
+  `phy::LocalPhy::with_eht` (2.4/5 GHz) refuses such a profile.
+  `eht::EhtNegotiation::width320()` is true for a 320 MHz selection, whose
+  `width()` reports `OneSixty`.
+- `JoinPlan::prepare_6ghz(bss, own, ssid, security, &SixGhzLocal,
+  JoinOptions)` needs `bss.band == Some(Band::Ghz6)` and a 6 GHz channel. It
+  calls `six_ghz::plan`, which is mac80211 `ieee80211_determine_chan_mode`
+  for `NL80211_BAND_6GHZ`. That applies `admit_with_rule` against the rule,
+  covering power types LPI/SP/VLP, where SP needs AFC and is refused under
+  `NO_6GHZ_AFC_CLIENT` (Indoor SP then falls back to LPI). The channel comes
+  from the 6 GHz Operation Information (`ieee80211_chandef_he_6ghz_oper`),
+  or from EHT Operation Information when local EHT and both AP EHT elements
+  are present. The EHT channel must contain the HE channel (STRICT "HE/EHT
+  incompatible", `InvalidBss`), and a punctured or 80+80 EHT BSS is joined
+  as HE. The channel is then narrowed to both stations' Channel Width Set:
+  HE B2 (40/80), B3 (160), B4 (80+80), and EHT B1 for 320 MHz, which needs
+  negotiated EHT. HE is mandatory, so no usable HE is `UnsupportedRates`.
+  Rates are OFDM-only, as on 5 GHz.
+- 6 GHz security: Linux v7.2 mac80211/cfg80211 do not enforce the
+  802.11ax 6 GHz security rule on the station side; wpa_supplicant's 6 GHz
+  BSS filter does. NARF has no separate BSS filter, so `prepare_6ghz`
+  refuses `Open` and `Wpa2Psk` (`UnsupportedSecurity`) and requires
+  `Wpa3Sae` to resolve to hash-to-element. SAE already requires an
+  MFP-capable AP and sends MFPC|MFPR (PMF required). OWE is not a
+  `SecurityMode`.
+- The association request carries no HT or VHT element. After RSNE/RSNXE
+  it sends HE Capabilities, HE 6 GHz Band Capabilities (ext 59), Non-AP STA
+  Regulatory Connectivity (ext 137, `six_ghz::EXT_NON_AP_STA_REG_CON`) and,
+  when negotiated, EHT Capabilities. `append_sme_ies` refuses HT/VHT
+  Capabilities/Operation on a 6 GHz plan. The association response must
+  carry no HT/VHT element, exactly one HE Capabilities and one HE
+  Operation, and an RSNE that repeats the request's.
+- `JoinPlan::six_ghz() -> Option<&SixGhzPlan>` is `None` for 2.4/5 GHz
+  plans. The state is boxed, adding 8 bytes to `JoinPlan`. `SixGhzPlan`
+  exposes `operation()` (`He6GhzOperation`), `power_type()`,
+  `channel() -> &SixGhzOperatingChannel` (`primary`, `primary_mhz`,
+  `width: SixGhzWidth { Twenty, Forty, Eighty, OneSixty, ThreeTwenty }`,
+  `discontiguous`, `center`/`center_mhz`, `center2`/`center2_mhz`),
+  `width()`, `peer_capability()` and `local_capability()` (the AP's and the
+  transmitted `He6GhzCapability`, for STA_REC_HE_6G), `regulatory_
+  connectivity()`, `he() -> &HeNegotiation` (at most 160 MHz) and
+  `eht() -> Option<&EhtNegotiation>`.
+
+2.4/5 GHz plans are byte-for-byte unchanged.
 
 **WPA3-SAE JoinPlan (`association::{SaePwe, SaeJoin, SaeStep}`).**
 `SecurityMode::Wpa3Sae { pwe: SaePwe }` (`HuntAndPeck` / `HashToElement` /

@@ -21,7 +21,7 @@ impl RegulatoryDomain {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegRule {
     pub freq_start_mhz: u32,
     pub freq_end_mhz: u32,

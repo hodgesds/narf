@@ -147,10 +147,14 @@ impl EhtCapability {
     /// 160MHz. A 20MHz-only set has four ranges; the others report MCS0-9
     /// for both of the first two.
     fn ranges(&self, bw160: bool) -> [u8; 4] {
+        self.ranges_at(if bw160 { 3 } else { 0 })
+    }
+    /// `ranges` for the set at octet `at`: 0 (<=80MHz), 3 (160MHz) or 6
+    /// (6 GHz 320MHz).
+    fn ranges_at(&self, at: usize) -> [u8; 4] {
         if self.mcs_len == 4 {
             return [self.mcs[0], self.mcs[1], self.mcs[2], self.mcs[3]];
         }
-        let at = if bw160 { 3 } else { 0 };
         [
             self.mcs[at],
             self.mcs[at],
@@ -160,6 +164,10 @@ impl EhtCapability {
     }
     fn has_160(&self) -> bool {
         self.mcs_len >= 6
+    }
+    /// 320MHz in 6 GHz (PHY B1) with its MCS/NSS set.
+    fn has_320(&self) -> bool {
+        self.phy[0] & PHY0_320_6G != 0 && self.mcs_len == 9
     }
 }
 
@@ -208,6 +216,22 @@ impl LocalEht {
         self.0.mcs[3..6].copy_from_slice(&set);
         self.0.mcs_len = 6;
         Ok(self)
+    }
+    /// Add 320MHz-in-6GHz (PHY B1) with its MCS/NSS set (needs the 160MHz
+    /// set). Only `six_ghz::SixGhzLocal::with_eht` accepts such a profile:
+    /// `LocalPhy::with_eht` (2.4/5 GHz) refuses it.
+    pub fn with_320mhz(mut self, set: [u8; 3]) -> Result<Self, Error> {
+        if self.0.mcs_len != 6 || set[0] & 0x0f == 0 || set[0] >> 4 == 0 {
+            return Err(Error::UnsupportedRates);
+        }
+        self.0.phy[0] |= PHY0_320_6G;
+        self.0.mcs[6..9].copy_from_slice(&set);
+        self.0.mcs_len = 9;
+        Ok(self)
+    }
+    /// True for a `with_320mhz` profile.
+    pub fn width320(&self) -> bool {
+        self.0.has_320()
     }
     /// Advertise a complete EHT PPE Thresholds field (sets PHY B37).
     pub fn with_ppe_thresholds(mut self, ppe: &[u8]) -> Result<Self, Error> {
@@ -302,6 +326,8 @@ pub struct EhtNegotiation {
     width: Width,
     tx: [u8; 4],
     allowed: u8,
+    /// 6 GHz 320MHz operation (`width` is then `OneSixty`).
+    bw320: bool,
 }
 const FLAG_BFEE: u8 = 1;
 const FLAG_BFER: u8 = 2;
@@ -309,6 +335,11 @@ impl EhtNegotiation {
     /// EHT PPDU bandwidth (the negotiated HE width).
     pub fn width(&self) -> Width {
         self.width
+    }
+    /// True for a 6 GHz 320MHz EHT selection (`six_ghz::plan`); `width()`
+    /// then reports `OneSixty` and the MCS/NSS ranges are the 320MHz set.
+    pub fn width320(&self) -> bool {
+        self.bw320
     }
     /// Per-range TX max NSS (MCS0-7, 8-9, 10-11, 12-13): local TX limited
     /// by the AP's RX at `width()`. Zero means the range is unusable.
@@ -319,7 +350,7 @@ impl EhtNegotiation {
     pub fn rx_max_nss(&self) -> [u8; 4] {
         self.local
             .0
-            .ranges(self.width == Width::OneSixty)
+            .ranges_at(range_at(self.width, self.bw320))
             .map(|v| v & 0x0f)
     }
     pub fn peer_capability(&self) -> &EhtCapability {
@@ -442,7 +473,48 @@ pub(super) fn negotiate(
         width: he.width(),
         tx,
         allowed: 0xff,
+        bw320: false,
     }))
+}
+
+fn range_at(width: Width, bw320: bool) -> usize {
+    match (width, bw320) {
+        (_, true) => 6,
+        (Width::OneSixty, _) => 3,
+        _ => 0,
+    }
+}
+
+/// EHT on a 6 GHz channel (`six_ghz::plan`) after HE: the EHT channel
+/// (`width`, or 320MHz when `bw320`) was already derived from the EHT
+/// Operation Information and narrowed to both sides' capability. `None`
+/// keeps HE where mac80211 falls back: an unsupported Basic EHT-MCS/NSS set,
+/// a missing 160/320MHz set or no usable single-stream range.
+pub(super) fn negotiate_6ghz(
+    local: LocalEht,
+    peer: EhtCapability,
+    operation: EhtOperation,
+    width: Width,
+    bw320: bool,
+) -> Option<EhtNegotiation> {
+    if !local_covers(&local, operation.basic)
+        || (width == Width::OneSixty && (!local.0.has_160() || !peer.has_160()))
+        || (bw320 && (!local.0.has_320() || !peer.has_320()))
+    {
+        return None;
+    }
+    let at = range_at(width, bw320);
+    let (mine, theirs) = (local.0.ranges_at(at), peer.ranges_at(at));
+    let tx: [u8; 4] = core::array::from_fn(|i| (mine[i] >> 4).min(theirs[i] & 0x0f));
+    (tx[0] != 0).then_some(EhtNegotiation {
+        local,
+        peer,
+        operation,
+        width,
+        tx,
+        allowed: 0xff,
+        bw320,
+    })
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

@@ -407,7 +407,8 @@ impl LocalPhy {
     /// (`ieee80211_eht_mcs_nss_size`), and a160MHz set requires HE160.
     pub fn with_eht(mut self, eht: LocalEht) -> Result<Self, Error> {
         let he = self.he.ok_or(Error::UnsupportedRates)?;
-        if !eht.matches_he(he.capability().phy_capability()[0]) {
+        // 320MHz is a 6 GHz capability (`six_ghz::SixGhzLocal::with_eht`).
+        if eht.width320() || !eht.matches_he(he.capability().phy_capability()[0]) {
             return Err(Error::UnsupportedRates);
         }
         self.eht = Some(eht);

@@ -580,6 +580,52 @@ pub(super) fn negotiate(
     }))
 }
 
+/// HE negotiation on a 6 GHz channel (`six_ghz::plan`): mac80211
+/// `ieee80211_determine_chan_mode` takes the channel from the 6 GHz
+/// Operation Information and there is no VHT/HT layer, so the AP's
+/// `width`/`discontiguous` is narrowed only by both sides' HE Channel Width
+/// Set (B2 40/80, B3 160, B4 80+80, which apply to 5 and 6 GHz alike).
+/// `None` where mac80211 would have no HE mode; on 6 GHz that refuses the
+/// BSS ("Rejecting non-HE 6/7 GHz connection").
+pub(super) fn negotiate_6ghz(
+    local: LocalHe,
+    peer: HeCapability,
+    operation: HeOperation,
+    width: Width,
+    discontiguous: bool,
+) -> Option<HeNegotiation> {
+    if operation.vht.is_some()
+        || !nss1(peer.mcs.rx80)
+        || !nss1(peer.mcs.tx80)
+        || !covers(peer.mcs.rx80, operation.basic)
+        || !covers(peer.mcs.tx80, operation.basic)
+        || !local_covers(&local.0, operation.basic)
+    {
+        return None;
+    }
+    let (lphy, pphy) = (local.0.phy[0], peer.phy[0]);
+    let both = |bit: u8| lphy & pphy & bit != 0;
+    let (he_width, he_discontiguous) = match (width, discontiguous) {
+        _ if !both(PHY0_40_80_5G) => (Width::Twenty, false),
+        (Width::OneSixty, false) if both(PHY0_160_5G) => (Width::OneSixty, false),
+        (Width::OneSixty, true) if both(PHY0_80P80_5G) => (Width::OneSixty, true),
+        (Width::OneSixty, _) => (Width::Eighty, false),
+        (other, _) => (other, false),
+    };
+    let (_, local_tx) = local.0.maps(he_width, he_discontiguous);
+    let (peer_rx, _) = peer.maps(he_width, he_discontiguous);
+    let tx = intersect_maps(local_tx, peer_rx);
+    nss1(tx).then_some(HeNegotiation {
+        local,
+        peer,
+        operation,
+        width: he_width,
+        discontiguous: he_discontiguous,
+        tx,
+        allowed: 0xff,
+    })
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "he_tests.rs"]
 mod tests;
