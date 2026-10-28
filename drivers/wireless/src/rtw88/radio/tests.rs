@@ -199,7 +199,8 @@ impl RadioIo {
     ) -> Result<(), Error> {
         let gate = self.gate.as_ref().ok_or(Error::State)?;
         let g = s.load(&crate::rtw88::dm::KIND, gate)?;
-        self.continuation.retain(|old| !old.is(&crate::rtw88::dm::KIND));
+        self.continuation
+            .retain(|old| !old.is(&crate::rtw88::dm::KIND));
         self.continuation.push(g);
         Ok(())
     }
@@ -288,12 +289,16 @@ unsafe impl Io for RadioIo {
         self.gate = Some(gate);
         Ok(())
     }
-    fn station_bind_coding(
+    fn station_bind_continuation(
         &mut self,
         g: Arc<crate::rtw88::qualification::Grant>,
     ) -> Result<(), Error> {
         self.station_allowed()?;
-        let gate = self.gate.as_ref().ok_or(Error::State)?.with_coding(g)?;
+        let gate = self
+            .gate
+            .as_ref()
+            .ok_or(Error::State)?
+            .with_continuation(g)?;
         self.gate = Some(gate);
         Ok(())
     }

@@ -56,7 +56,7 @@ pub(in crate::rtw88) struct Model {
     pub(in crate::rtw88) originator_ba: bool,
     pub(in crate::rtw88) recipient_ba: bool,
     pub(in crate::rtw88) receive_chip: crate::rtw88::packet_phy::Chip,
-    indices: [u32; 3],
+    indices: [u32; 6],
     pub(in crate::rtw88) now: u64,
     pub(in crate::rtw88) live: bool,
     pub(in crate::rtw88) allowed: bool,
@@ -65,7 +65,7 @@ pub(in crate::rtw88) struct Model {
     pub(in crate::rtw88) publications: usize,
     pub(in crate::rtw88) tx_publications: usize,
     ignore: bool,
-    bodies: [Option<Vec<u8>>; 2],
+    bodies: [Option<Vec<u8>>; 6],
     rx: VecDeque<Received>,
     tag: u16,
     payload_cpu: Option<usize>,
@@ -91,7 +91,7 @@ impl Model {
             recipient_ba: false,
             originator_ba: false,
             receive_chip: crate::rtw88::packet_phy::Chip::C22,
-            indices: [0; 3],
+            indices: [0; 6],
             now: 0,
             live: true,
             allowed: true,
@@ -100,7 +100,7 @@ impl Model {
             publications: 0,
             tx_publications: 0,
             ignore: false,
-            bodies: [None, None],
+            bodies: Default::default(),
             rx: VecDeque::new(),
             tag: 0,
             payload_cpu: None,
@@ -122,8 +122,15 @@ impl Model {
             0x3b0 => Ok(0),
             0x3a8 => Ok(1),
             0x3b4 => Ok(2),
+            0x3ac => Ok(3),
+            0x3a4 => Ok(4),
+            0x3a0 => Ok(5),
             _ => Err(Error::Address),
         }
+    }
+    /// Model index slot of a TX queue (the RX index is slot 2).
+    fn ring(queue: Queue) -> usize {
+        Self::slot(queue.index()).unwrap_or(0)
     }
     pub(in crate::rtw88) fn guard(&self) -> Result<(), Error> {
         if self.live {
@@ -133,7 +140,7 @@ impl Model {
         }
     }
     pub(in crate::rtw88) fn consumed(&mut self, queue: Queue) {
-        let i = queue_slot(queue);
+        let i = Self::ring(queue);
         let host = self.indices[i] & 0xfff;
         self.indices[i] = host | host << 16;
     }
@@ -225,7 +232,7 @@ impl Model {
             return false;
         }
         while let Some(submission) = self.held.pop_front() {
-            let i = queue_slot(submission.queue);
+            let i = Self::ring(submission.queue);
             self.indices[i] = self.indices[i] & 0xffff | u32::from(submission.next) << 16;
             if let Some(sequence) = submission.report {
                 self.report(sequence, true);
@@ -335,7 +342,7 @@ unsafe impl Port for Model {
             return Err(Error::Access);
         }
         let index = Self::slot(reg)?;
-        if index < 2 {
+        if index != 2 {
             self.tx_publications += 1;
         }
         self.indices[index] = self.indices[index] & 0xffff_0000 | u32::from(host);
@@ -344,7 +351,7 @@ unsafe impl Port for Model {
             {
                 let submission = self.submissions.remove(position).ok_or(Error::State)?;
                 if submission.rts && self.controls.rts_failure.load(Ordering::Acquire) {
-                    let i = queue_slot(submission.queue);
+                    let i = Self::ring(submission.queue);
                     self.indices[i] = self.indices[i] & 0xffff | u32::from(submission.next) << 16;
                     self.report(submission.report.ok_or(Error::Packet)?, false);
                     continue;
@@ -352,7 +359,7 @@ unsafe impl Port for Model {
                 // The simulated device consumes current DMA bytes at the
                 // doorbell, independently of the earlier descriptor write.
                 let body = self.actual_body(submission)?;
-                self.bodies[queue_slot(submission.queue)] = Some(body.clone());
+                self.bodies[Self::ring(submission.queue)] = Some(body.clone());
                 let (responses, hold) = reaction(&body)?;
                 for response in responses {
                     self.receive(&response, false, false);
@@ -361,7 +368,7 @@ unsafe impl Port for Model {
                     self.held.push_back(submission);
                     self.controls.held.store(true, Ordering::Release);
                 } else {
-                    let i = queue_slot(submission.queue);
+                    let i = Self::ring(submission.queue);
                     self.indices[i] = self.indices[i] & 0xffff | u32::from(submission.next) << 16;
                     if let Some(sequence) = submission.report {
                         self.report(sequence, true);
@@ -392,7 +399,7 @@ unsafe impl Port for Model {
         // SAFETY: this CPU pointer was recorded from this exact allocation;
         // full extent is validated, synchronous model observes published data.
         let body = unsafe { core::slice::from_raw_parts(pointer.add(format::TX_DESC), length) };
-        self.bodies[queue_slot(queue)] = Some(body.to_vec());
+        self.bodies[Self::ring(queue)] = Some(body.to_vec());
         // SAFETY: descriptor is the first48 bytes of this same validated live
         // mapping. Observe actual requested CCX identity, never synthesize one
         // from the host station's pending state.
@@ -537,6 +544,7 @@ fn smoke_rtw88_rx_ba_native_emitter_requires_separate_grant_and_ccx() -> TestRes
             sgi: false,
             ldpc: false,
             stbc: false,
+            acs: 0,
         })
         .map_err(|_| "recipient H profile")?;
         let ap = [2, 0, 0, 0, 0, 1];
@@ -668,6 +676,7 @@ fn batch_core(model: &mut Model) -> Result<Core, &'static str> {
         sgi: true,
         ldpc: false,
         stbc: false,
+        acs: 0,
     })
     .map_err(|_| "batch HT profile")?;
     core.aggregation(Some(format::Aggregation {
@@ -823,6 +832,7 @@ fn native_batch_bounds() -> Result<(), &'static str> {
         sgi: false,
         ldpc: false,
         stbc: false,
+        acs: 0,
     };
     let cfg = format::Aggregation {
         density: 7,

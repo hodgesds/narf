@@ -44,6 +44,9 @@ fn peer<F: Fixture>(f: &F, ldpc: bool, stbc: bool) -> Result<(), &'static str> {
         b
     };
     f.peer().lock().ht = Some(elements);
+    // Age out the fixture's first observation (10 s lifetime) so the scan
+    // binds the re-advertised capabilities.
+    f.advance_ms(20_000);
     f.inject(&beacon, 0, 0);
     Ok(())
 }
@@ -128,16 +131,18 @@ pub(super) fn composition<F: Fixture>() -> Result<(), &'static str> {
 /// Contract not granted, or a peer without coding: base RX advertisement
 /// only and an uncoded descriptor/RA_INFO.
 pub(super) fn not_granted<F: Fixture>() -> Result<(), &'static str> {
-    let f = F::make(false, 255, true, true)?;
-    peer(&f, true, true)?;
-    ht::join(&f)?;
-    let rx = if F::c21() { 0x100 } else { 0x101 };
-    if requested_cap(&f)? & 0x381 != rx {
-        return Err("unqualified station advertised TX STBC or wrong RX coding");
-    }
-    let d = uplink(&f, 3)?;
-    if word5(&d) & (7 << 7) != 0 || ra_info(&f.mailboxes()) != Some(0x40) {
-        return Err("unqualified station emitted coded DATA");
+    {
+        let f = F::make(false, 255, true, true)?;
+        peer(&f, true, true)?;
+        ht::join(&f)?;
+        let rx = if F::c21() { 0x100 } else { 0x101 };
+        if requested_cap(&f)? & 0x381 != rx {
+            return Err("unqualified station advertised TX STBC or wrong RX coding");
+        }
+        let d = uplink(&f, 3)?;
+        if word5(&d) & (7 << 7) != 0 || ra_info(&f.mailboxes()) != Some(0x40) {
+            return Err("unqualified station emitted coded DATA");
+        }
     }
     // Qualified, but the AP advertises neither LDPC nor RX STBC.
     let g = F::make(false, 255, true, true)?;
@@ -158,8 +163,7 @@ pub(super) fn not_granted<F: Fixture>() -> Result<(), &'static str> {
 pub(super) fn refusals<F: Fixture>() -> Result<(), &'static str> {
     let f = F::make(false, 255, true, true)?;
     let good = record(&f, LDPC)?;
-    if f
-        .stage_kind(&coding::KIND, good.clone(), Cap::bootstrap(), false)
+    if f.stage_kind(&coding::KIND, good.clone(), Cap::bootstrap(), false)
         .is_ok()
     {
         return Err("unsigned N2xC admitted");
@@ -184,13 +188,17 @@ pub(super) fn refusals<F: Fixture>() -> Result<(), &'static str> {
         cases.push(record(&f, STBC)?);
     }
     for b in cases {
-        if f.stage_kind(&coding::KIND, b, Cap::bootstrap(), true).is_ok() {
+        if f.stage_kind(&coding::KIND, b, Cap::bootstrap(), true)
+            .is_ok()
+        {
             return Err("altered/foreign N2xC admitted");
         }
     }
     let revoked = Cap::bootstrap();
     revoked.revoke();
-    if f.stage_kind(&coding::KIND, good.clone(), revoked, true).is_ok() {
+    if f.stage_kind(&coding::KIND, good.clone(), revoked, true)
+        .is_ok()
+    {
         return Err("revoked N2xC source admitted");
     }
     // A qualified station tears down cleanly and keeps the HT link uncoded
@@ -220,6 +228,7 @@ fn ht_profile(ldpc: bool, stbc: bool) -> DataProfile {
         sgi: true,
         ldpc,
         stbc,
+        acs: 0,
     }
 }
 

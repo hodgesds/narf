@@ -145,25 +145,53 @@ kernel_test_in!(
     smoke_rtw8821ce_ht_protection_modes_admitted
 );
 fn smoke_rtw8821ce_coding_ldpc_stbc_and_revocation() -> TestResult {
-    result(crate::rtw88::coding_tests::composition::<Case>)
+    check(crate::rtw88::coding_tests::composition::<Case>)
 }
 kernel_test_in!(
     "drivers/wireless/rtw88/coding/rtl8821c",
     smoke_rtw8821ce_coding_ldpc_stbc_and_revocation
 );
 fn smoke_rtw8821ce_coding_not_granted_or_uncoded_peer() -> TestResult {
-    result(crate::rtw88::coding_tests::not_granted::<Case>)
+    check(crate::rtw88::coding_tests::not_granted::<Case>)
 }
 kernel_test_in!(
     "drivers/wireless/rtw88/coding/rtl8821c",
     smoke_rtw8821ce_coding_not_granted_or_uncoded_peer
 );
 fn smoke_rtw8821ce_coding_refusals_and_teardown() -> TestResult {
-    result(crate::rtw88::coding_tests::refusals::<Case>)
+    check(crate::rtw88::coding_tests::refusals::<Case>)
 }
 kernel_test_in!(
     "drivers/wireless/rtw88/coding/rtl8821c",
     smoke_rtw8821ce_coding_refusals_and_teardown
+);
+fn smoke_rtw8821ce_qos_open_all_ac_tid_routing_and_revocation() -> TestResult {
+    check(|| crate::rtw88::qos_tests::composition::<Case>(false))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/qos/rtl8821c",
+    smoke_rtw8821ce_qos_open_all_ac_tid_routing_and_revocation
+);
+fn smoke_rtw8821ce_qos_wpa2_all_ac_tid_routing_and_revocation() -> TestResult {
+    check(|| crate::rtw88::qos_tests::composition::<Case>(true))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/qos/rtl8821c",
+    smoke_rtw8821ce_qos_wpa2_all_ac_tid_routing_and_revocation
+);
+fn smoke_rtw8821ce_qos_not_granted_and_subset() -> TestResult {
+    check(crate::rtw88::qos_tests::not_granted::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/qos/rtl8821c",
+    smoke_rtw8821ce_qos_not_granted_and_subset
+);
+fn smoke_rtw8821ce_qos_refusals() -> TestResult {
+    check(crate::rtw88::qos_tests::refusals::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/qos/rtl8821c",
+    smoke_rtw8821ce_qos_refusals
 );
 impl cases::Fixture for Case {
     fn kind_request(

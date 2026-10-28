@@ -97,6 +97,9 @@ pub(in crate::rtw88) struct Peer {
     pub(in crate::rtw88) data_sequence: u16,
     pub(in crate::rtw88) reorder_downlink: bool,
     pub(in crate::rtw88) uplink: Vec<Vec<u8>>,
+    /// Admit QoS DATA on every TID (N2xQ); each uplink's TID is recorded.
+    pub(in crate::rtw88) any_tid: bool,
+    pub(in crate::rtw88) tids: Vec<u8>,
     pub(in crate::rtw88) hold_m4: bool,
     pub(in crate::rtw88) m2_data: Option<Vec<u8>>,
     pub(in crate::rtw88) m2_original: Option<Vec<u8>>,
@@ -147,6 +150,8 @@ impl Peer {
             data_sequence: 0,
             reorder_downlink: false,
             uplink: Vec::new(),
+            any_tid: false,
+            tids: Vec::new(),
             hold_m4: false,
             m2_data: None,
             m2_original: None,
@@ -380,7 +385,9 @@ impl Peer {
         if frame.len() < header
             || !matches!(frame[0], 8 | 0x88)
             || frame[0] == 0x88 && !self.qos
-            || header == 26 && frame[24..26] != [0, 0]
+            || header == 26
+                && frame[24..26] != [0, 0]
+                && !(self.any_tid && frame[24] & 0xf8 == 0 && frame[25] == 0)
             || frame[1] & 3 != 1
             || (frame[1] & 0x40 != 0) != self.ap.protected()
         {
@@ -400,7 +407,7 @@ impl Peer {
                 &Ccm,
                 &frame[..header],
                 key,
-                0,
+                if header == 26 { frame[24] & 15 } else { 0 },
                 false,
                 &mut self.replay,
                 &mut body,
@@ -415,6 +422,9 @@ impl Peer {
         ethernet.extend_from_slice(&body[6..]);
         if self.qos && header == 24 && ethernet.get(12..14) != Some(&[0x88, 0x8e]) {
             return Err("native WMM non-QoS data is not private EAPOL");
+        }
+        if header == 26 {
+            self.tids.push(frame[24]);
         }
         self.uplink.push(ethernet.clone());
         let replies = match self.server.receive(&ethernet) {

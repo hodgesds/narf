@@ -129,6 +129,8 @@ pub(super) struct State {
     coding: Option<(Arc<super::qualification::Grant>, u8)>,
     /// Firmware RA_INFO still carries LDPC after a coding downgrade.
     coding_restore: bool,
+    /// Bound N2xQ all-TID QoS routing (`qos`, tag `Q`) and its AC set.
+    qos: Option<(Arc<super::qualification::Grant>, u8)>,
     tx_ba: super::tx_ba::Originator,
     tx_config: Option<super::packet_format::Aggregation>,
     data_pending: VecDeque<Pending>,
@@ -223,6 +225,7 @@ impl State {
             protection: None,
             coding: None,
             coding_restore: false,
+            qos: None,
             tx_ba: super::tx_ba::Originator::new(),
             tx_config: None,
             data_pending: VecDeque::new(),
@@ -271,7 +274,8 @@ impl State {
     /// restores the base program under the base gate and stops tracking.
     pub(super) async fn watchdog(&mut self, io: &mut impl Io) -> Result<bool, Error> {
         if self.established && self.ready() {
-            self.coding_live(io)?;
+            let admission = self.admission.clone();
+            admission.run(|| Ok(self.coding_live(io).and_then(|()| self.qos_live(io))))??;
             if self.coding_restore {
                 // Source RA_INFO without LDPC once coding is no longer current.
                 super::wmm::ra_info(io, self.data_profile, &self.admission).await?;
@@ -410,6 +414,7 @@ impl State {
         self.data_profile = super::packet_format::DataProfile::LEGACY;
         self.coding = None;
         self.coding_restore = false;
+        self.qos = None;
         if self.prepared {
             io.packet_stop()?;
         }
@@ -867,6 +872,7 @@ impl State {
                                 sgi: false,
                                 ldpc: false,
                                 stbc: false,
+                                acs: 0,
                             };
                             if let Some(h) = &self.ht {
                                 let negotiated = self
@@ -893,6 +899,11 @@ impl State {
                                         negotiated.ht().tx_stbc(),
                                     );
                                 }
+                            }
+                        }
+                        if let Some((_, acs)) = &self.qos {
+                            if self.data_profile.qos {
+                                self.data_profile.acs = *acs;
                             }
                         }
                         self.peer_commit = Some((aid, short));
@@ -970,6 +981,9 @@ impl State {
                                         || q[1] != 0
                                         || q[0] & 0x60 != 0 && !(live_ba && q[0] & 0x60 == 0x60)
                                 })
+                            } else if self.data_profile.acs != 0 {
+                                // N2xQ: any TID0..7 with normal ack.
+                                qos.is_none_or(|q| q[0] & 0xf8 != 0 || q[1] != 0)
                             } else {
                                 qos != Some(&[0, 0])
                             })
@@ -1040,7 +1054,7 @@ impl State {
                                     self.own,
                                     self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
                                     self.data_profile.qos,
-                                    self.ht.is_some(),
+                                    self.ht.is_some() || self.data_profile.acs != 0,
                                 ) {
                                     self.last_peer = now;
                                     if self.received.len() == RECEIVE_OUTPUTS {
@@ -1072,7 +1086,7 @@ impl State {
                         self.own,
                         self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
                         self.data_profile.qos,
-                        self.ht.is_some(),
+                        self.ht.is_some() || self.data_profile.acs != 0,
                     ) {
                         self.last_peer = now;
                         if self.received.len() == RECEIVE_OUTPUTS {
@@ -1232,12 +1246,15 @@ impl State {
         };
         // N2xC TX coding needs the HT program and its own exact continuation.
         let coding = match &proposed {
-            Some(_) => io.station_continuation(&super::coding::KIND)?.and_then(|g| {
-                let gate = io.station_gate().ok()?;
-                let flags = super::coding::bounds(gate.did(), g.payload())?;
-                g.check(&gate).ok()?;
-                Some((g, flags))
-            }),
+            // Identity only here: the live check runs once the extension and
+            // HT programs enclose it (`station_bind_continuation`).
+            Some(_) => io
+                .station_continuation(&super::coding::KIND)?
+                .and_then(|g| {
+                    let gate = io.station_gate().ok()?;
+                    let flags = super::coding::bounds(gate.did(), g.payload())?;
+                    g.matches(&gate).then_some((g, flags))
+                }),
             None => None,
         };
         let flags = coding.as_ref().map_or(0, |c| c.1);
@@ -1295,13 +1312,31 @@ impl State {
                 self.admission
                     .run(|| io.station_bind_extension(grant.clone()))?;
                 self.extension = Some(grant);
+                if self.wmm_requested {
+                    if let Some(g) = io.station_continuation(&super::qos::KIND)? {
+                        let gate = io.station_gate()?;
+                        if let Some(acs) = super::qos::bounds(g.payload()) {
+                            if g.check(&gate).is_ok() {
+                                self.admission
+                                    .run(|| io.station_bind_continuation(g.clone()))?;
+                                self.qos = Some((g, acs));
+                            }
+                        }
+                    }
+                }
             }
         }
         if let Some(h) = ht {
             self.admission.run(|| io.station_bind_ht(h.clone()))?;
             if let Some((g, flags)) = coding {
-                self.admission.run(|| io.station_bind_coding(g.clone()))?;
-                self.coding = Some((g, flags));
+                // A grant that is not current leaves TX uncoded.
+                if self
+                    .admission
+                    .run(|| io.station_bind_continuation(g.clone()))
+                    .is_ok()
+                {
+                    self.coding = Some((g, flags));
+                }
             }
             h.program(io, &self.admission).await?;
             // RX may arrive at negotiated HT rates immediately after the AP's
@@ -1404,14 +1439,44 @@ impl State {
         self.coding = None;
         self.coding_restore |= self.data_profile.ldpc;
         let p = self.data_profile.uncoded();
-        self.admission.run(|| io.packet_profile(p))?;
+        // Callers already run inside the current admission.
+        io.packet_profile(p)?;
+        self.data_profile = p;
+        Ok(())
+    }
+    /// All-TID routing requires the current N2xQ continuation. A revoked or
+    /// mismatched one returns every frame to BE/TID0 under the base gate.
+    pub(super) fn qos_live(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        if self.data_profile.acs == 0 {
+            return Ok(());
+        }
+        let gate = io.station_gate()?;
+        if self
+            .qos
+            .as_ref()
+            .is_some_and(|(g, _)| g.check(&gate).is_ok())
+        {
+            return Ok(());
+        }
+        self.qos = None;
+        let p = super::packet_format::DataProfile {
+            acs: 0,
+            ..self.data_profile
+        };
+        io.packet_profile(p)?;
         self.data_profile = p;
         Ok(())
     }
     fn send_inner(&mut self, io: &mut impl Io, frame: &[u8]) -> Result<(), Error> {
         self.coding_live(io)?;
+        self.qos_live(io)?;
         self.tracking.tx_bytes = self.tracking.tx_bytes.saturating_add(frame.len() as u64);
-        if self.tx_ba.active().is_some() {
+        let acm = self
+            .wmm
+            .map_or([false; 4], |p| p.ac.map(|a| a.admission_control));
+        let tid = super::qos::tid_for(frame, acm, self.data_profile);
+        // Originator BA aggregates only the TID0 (BE) agreement.
+        if self.tx_ba.active().is_some() && tid == 0 {
             self.send_batch_inner(io, &[frame])?;
             return Ok(());
         }
@@ -1424,7 +1489,7 @@ impl State {
         let peer = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
         let native = if let Some(security) = &mut self.security {
             if self.data_profile.qos {
-                security.transmit_ethernet_qos(frame, 0)?
+                security.transmit_ethernet_qos(frame, tid)?
             } else {
                 security.transmit_ethernet(frame)?
             }
@@ -1436,7 +1501,7 @@ impl State {
             bytes.extend_from_slice(&peer);
             bytes.extend_from_slice(&self.own);
             bytes.extend_from_slice(&frame[..6]);
-            let sequence = if self.tx_ba_grant.is_some() && self.data_profile.qos {
+            let sequence = if self.tx_ba_grant.is_some() && self.data_profile.qos && tid == 0 {
                 let s = self.qos_sequence;
                 self.qos_sequence = (s + 1) & 4095;
                 s
@@ -1447,7 +1512,7 @@ impl State {
             };
             bytes.extend_from_slice(&(sequence << 4).to_le_bytes());
             if self.data_profile.qos {
-                bytes.extend_from_slice(&[0, 0]);
+                bytes.extend_from_slice(&[tid, 0]);
             }
             bytes.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
             bytes.extend_from_slice(&frame[12..]);

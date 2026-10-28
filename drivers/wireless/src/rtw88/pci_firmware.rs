@@ -903,7 +903,7 @@ unsafe impl Registers for Native {
         );
         Ok(())
     }
-    fn station_bind_coding(
+    fn station_bind_continuation(
         &mut self,
         g: alloc::sync::Arc<super::qualification::Grant>,
     ) -> Result<(), Error> {
@@ -912,7 +912,7 @@ unsafe impl Registers for Native {
             self.packet_gate
                 .as_ref()
                 .ok_or(Error::State)?
-                .with_coding(g)?,
+                .with_continuation(g)?,
         );
         Ok(())
     }

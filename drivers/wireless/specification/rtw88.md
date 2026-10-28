@@ -869,7 +869,7 @@ responses or native register/RF/IQK loss, held/modified/late M4 and actual
 descriptor/final-RX publication revocation. Firmware bounce bytes and native
 packet allocation identity stay unchanged; ambiguous exits retain DMA.
 These are inert software models, not physical RF acceptance. Real full-envelope
-signed assets, HT/VHT widths/aggregation, other bands/channels, full AC/TID,
+signed assets, HT/VHT widths/aggregation, other bands/channels, full AC/TID (now N2xQ),
 dynamic tracking/coexistence, recovery and PM remain explicit gates/work.
 
 
@@ -1447,9 +1447,11 @@ STBC1, and C22 also carries LDPC. Emitting coded PPDUs changes the waveform,
 so it needs a separate `N2xC` continuation over the exact retained base.
 Payload byte 0 requests TX LDPC (bit 0) and TX STBC (bit 1); every other
 byte is zero. C21 is one-path and may request LDPC only, matching Linux,
-which gates no TX LDPC on the chip. The grant loads before `JoinPlan`
-preparation, so the offer advertises `TX_STBC` only when it is qualified.
-It binds into the retained `Gate` (`with_coding`) right after the HT program.
+which gates no TX LDPC on the chip. The grant loads, identity-matched, before
+`JoinPlan` preparation, so the offer advertises `TX_STBC` only when a
+matching N2xC exists. Its live check runs when it binds into the retained
+`Gate` (`with_continuation`), right after the HT program. A grant that is
+not current at that point leaves TX uncoded.
 At the association response the data profile takes LDPC/STBC only where the
 qualified flags and the shared `HtNegotiation::tx_ldpc`/`tx_stbc` (peer
 capability) agree. `wmm::ra_info` sets RA_INFO bit 26 and the native
@@ -1470,6 +1472,46 @@ bits, payload bounds, peer/flag intersection) and composed C21/C22 cases in
 advertisement, coded descriptor and RA_INFO, revocation downgrade, an
 unqualified station, a peer without coding, refused records and teardown.
 A real signed N2xC measurement and over-the-air acceptance remain external.
+
+### C21/C22 all-AC WMM and all-TID QoS routing (`N2xQ`)
+
+`qos.rs` (tag `Q`, stem `qos`) lifts the base N2xL single BE/TID0 producer
+to every TID and all four EDCA rings. Sources:
+
+- `net/wireless/util.c::cfg80211_classify8021d` (RFC 8325 DSCP to 802.1d,
+  IPv4/IPv6/MPLS/802.21, no QoS map) picks the TID of each Ethernet frame.
+- `net/mac80211/wme.c::{ieee802_1d_to_ac,wme_downgrade_ac,
+  ieee80211_downgrade_queue}`: with no admitted TSPEC, ACs whose AP WMM
+  parameter has ACM set are stepped down (BK when every lower AC needs
+  admission).
+- `rtw88/tx.c::rtw_tx_ac_to_hwq` maps VO/VI/BE/BK to the hardware rings
+  and `rtw_tx_pkt_info_update` sets `qsel = skb->priority` (the TID).
+- `rtw88/pci.h` `RTK_PCI_TXBD_IDX_{VO,VI,BE,BK}Q` (0x3a0/0x3a4/0x3a8/0x3ac)
+  and `pci.c::max_num_of_tx_queue` (BE 256, others 128). The original
+  retained owner already maps all seven rings; packet core now drives
+  BE/BK/VI/VO.
+
+Payload byte 0 is the qualified set of extra ACs (bit 0 BK, bit 1 VI,
+bit 2 VO); every other byte is zero. The continuation binds into the
+retained `Gate` right after the WMM extension, and only when the AP
+advertised WMM. `DataProfile::acs` carries the set and
+`Gate::allows_profile` admits it only with a current bound grant.
+Classification is followed by the ACM downgrade. A TID whose AC is not
+qualified then steps further down; an unqualified BK falls back to
+BE/TID0. QoS Control carries the TID with normal ack and no
+EOSP/A-MSDU bit, and the descriptor QSEL is the TID. EDCA for all four
+ACs is already programmed from the bound AP parameters (`wmm.rs`). RX
+accepts QoS DATA on any TID while `acs` is set. Originator BA still
+aggregates only its TID0 agreement, so other TIDs use single-MPDU
+publication. Revocation is checked on every send and every watchdog pass,
+like N2xC; it returns every frame to BE/TID0 without dropping the link.
+
+Evidence: two `drivers/wireless/rtw88/narrow/qos` cases (DSCP mapping,
+ACM downgrade, qualified-AC fallback, ring/index/QSEL and payload bounds)
+and composed C21/C22 Open/WPA2 cases in `drivers/wireless/rtw88/qos/*`
+(`qos_tests.rs`): per-TID routing to the AP, revocation and teardown, an
+unqualified station, a VI-only subset and refused records. A real signed
+N2xQ measurement and over-the-air acceptance remain external.
 
 ## 4. Invariants
 
@@ -1552,12 +1594,13 @@ Remaining software ledger:
 | C21 awake radio/packet/port0/station | Exact N21S identity/current triple signed-source authority and live policy, C21 gain/channel/thermal and real wake/CAM receipts, parked same-owner beacon disarm and native Open/WPA2 DHCP/IP composition implemented; measured assets/physical acceptance remain external |
 | Current signed per-board gain/operating-envelope qualification | Implemented loader, exact identity/source ceilings, cap revocation and current-policy checks; real measured signed artifact is an external deployment gate |
 | Fixed awake ch1 radio/DACK/IQK/OTP/qualified power | Implemented for the explicit version2 CCK/control-response profile; real signed measured envelope remains a deployment gate |
-| C21/C22 legacy12 DATA/WMM BE-TID0 | Separate N21L/N22L exact-chip identities/current signed measurements and host-policy gates; bound response rates/parameters, source EDCA/RA/RRSR, each chip's actual gain readbacks, native fixed legacy DATA, raw QoS/CCMP and Open/WPA2 DHCP/IP composition implemented. Base N21S/N22Cv2 alone retain CCK1; full AC/TID scheduling remains work |
+| C21/C22 legacy12 DATA/WMM BE-TID0 | Separate N21L/N22L exact-chip identities/current signed measurements and host-policy gates; bound response rates/parameters, source EDCA/RA/RRSR, each chip's actual gain readbacks, native fixed legacy DATA, raw QoS/CCMP and Open/WPA2 DHCP/IP composition implemented. Base N21S/N22Cv2 alone retain CCK1; full AC/TID scheduling is the separate N2xQ program |
 | C21/C22 HT20/one stream/SGI20 | Distinct N21H/N22H static measured contracts/current source gates; source-native absolute/reference-difference MCS gains, typed original offer/request/response, actual RA/TXD/RXD, authenticated whole3839-byte A-MSDU, native ADDBA-decline/CCX and Open/WPA2 DHCP/IP. Real assets/physical acceptance remain external; richer PHY remains work |
 | C21/C22 recipient RX BA | Distinct exact-H N21R/N22R contract; actual bound ADDBA success/CCX/idle, explicit SSN, TIDs0..7/window<=64 with A-MSDU permission, source RAW/PHY admission, opaque originals before CCMP/PN, BAR20/DELBA/hole/TU timers and key/publication epochs implemented; native tests passed the coordinated x86_64/aarch64 software suites. Real measured assets/automatic BA/over-air acceptance remain external |
 | C21/C22 originator TX BA | Distinct exact-H or R-over-H N21T/N22T contract; bound on-air request/response/current SSN, genuine CCX/RX-idle/MAC-FIFO proof, four independent native DMA originals, source AGGEN/density/MAXAGG and per-MPDU status, current-SSN BAR20/DELBA/key drains implemented; native tests passed the coordinated x86_64/aarch64 software suites. Measured assets/real MAC aggregation and over-air behavior remain external |
 | C21/C22 RTS threshold | Separate N21X/N22X over exact current H/R/T; native24Mbps RTS descriptor/control program, actual response-rate admission, drained current-authority setting, CCX/immutable-DMA/FIFO completion and EAPOL exclusion implemented. Twelve native cases pass on both architectures; real measured X assets/RTS-CTS/physical acceptance remain external |
 | C21/C22 HT TX coding (LDPC/STBC) | N2xC continuation: base RX STBC1 (+C22 RX LDPC) advertisement, qualified TX LDPC (both) / TX STBC (C22) intersected with the peer, W5 bit7/bits9:8, RA_INFO bit26, revocation downgrade. Real N2xC measurement external |
+| C21/C22 all-AC WMM / all-TID QoS | N2xQ continuation: cfg80211_classify8021d + ACM downgrade, BK/VI/VO/BE rings with QSEL=TID, any-TID RX, revocation to BE/TID0. Real N2xQ measurement external |
 | Generic continuation contract + dm watchdog | Reusable signed N2x<tag> loader; N2xD rtw_watch_dog_work/rtw_phy_dynamic_mechanism port: DIG/CCK-PD/RA on both chips, path diversity/CFO/thermal power tracking/EDCCA on C22; base restore on revocation. Real N2xD measurement external; no DPK tracking |
 | Port0 peer/AID/media/RA/default-port control | Implemented bounded source mailbox, long-slot initial MLME, same-owner station integration and close/cancel behavior |
 | Passive/active channel1 scan with probe IEs, authentication/association, WPA2 controlled port | Retained channel1 shared MLME/RSNA/CCMP through actual native DMA and CCX, including held/altered/cancelled M4 and queued peer-loss closure |
@@ -1569,7 +1612,7 @@ Per-chip hardware backlog follows original `rtw8821c.c`, `rtw8822b.c` and
 `rtw8822c.c` chip-info/ops. C21 is1SS and C22B/C22C are2SS; all declare2.4/5GHz,
 HT and VHT. A separately qualified HT20/1SS/SGI20/A-MSDU station subset now has
 a complete software path on C21/C22C. Broader HT streams and widths, VHT,
-Broader TX aggregation and recipient negotiation, full WMM AC/TID scheduling, noninitial channels (channel1 active scan is implemented),
+Broader TX aggregation and recipient negotiation, noninitial channels (channel1 active scan is implemented),
 RF tracking, coexistence, sleep/WoW and controller-proven reset/rejoin. C22B needs
 retained firmware, MAC/PHY/RF/power and packet composition. C21/C22C supply
 separate qualified legacy station chains. None of these initial-profile exclusions are hardware

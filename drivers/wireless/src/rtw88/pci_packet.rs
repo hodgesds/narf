@@ -197,7 +197,7 @@ unsafe impl Port for Native {
         Native::allocate(self, length).map_err(access_error)
     }
     fn index(&mut self, register: u16) -> Result<u32, packet::Error> {
-        if !matches!(register, 0x3a8 | 0x3b0 | 0x3b4) {
+        if !matches!(register, 0x3a0 | 0x3a4 | 0x3a8 | 0x3ac | 0x3b0 | 0x3b4) {
             return Err(packet::Error::Address);
         }
         let value = self.read32(register).map_err(access_error)?;
@@ -207,7 +207,7 @@ unsafe impl Port for Native {
         Ok(value)
     }
     fn publish(&mut self, register: u16, host: u16) -> Result<(), packet::Error> {
-        if !matches!(register, 0x3a8 | 0x3b0 | 0x3b4) {
+        if !matches!(register, 0x3a0 | 0x3a4 | 0x3a8 | 0x3ac | 0x3b0 | 0x3b4) {
             return Err(packet::Error::Address);
         }
         self.check_packet_permission().map_err(access_error)?;
@@ -229,6 +229,9 @@ unsafe impl Port for Native {
             let index = match queue {
                 Queue::Management => 5,
                 Queue::Data => 2,
+                Queue::Background => 1,
+                Queue::Voice => 3,
+                Queue::Video => 4,
             };
             let ring = owner.tx.get(index).ok_or(packet::Error::State)?;
             if ring.index != queue.index() || ring.depth != queue.depth() || slot >= ring.depth {

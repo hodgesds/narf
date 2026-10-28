@@ -86,6 +86,9 @@ mod probe_guard;
 mod protection;
 #[cfg(feature = "kernel-test")]
 mod protection_tests;
+mod qos;
+#[cfg(feature = "kernel-test")]
+mod qos_tests;
 pub use protection::Request as RtsRequest;
 mod publication;
 mod qualification;

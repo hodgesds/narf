@@ -160,8 +160,8 @@ pub(super) unsafe trait Registers: Send {
     ) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
-    /// Bind the N2xC TX-coding continuation into the retained station gate.
-    fn station_bind_coding(
+    /// Bind an N2xC/N2xQ continuation into the retained station gate.
+    fn station_bind_continuation(
         &mut self,
         _: alloc::sync::Arc<super::qualification::Grant>,
     ) -> Result<(), Error> {
@@ -405,11 +405,11 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     ) -> Result<(), Error> {
         self.io.station_bind_protection(g)
     }
-    fn station_bind_coding(
+    fn station_bind_continuation(
         &mut self,
         g: alloc::sync::Arc<super::qualification::Grant>,
     ) -> Result<(), Error> {
-        self.io.station_bind_coding(g)
+        self.io.station_bind_continuation(g)
     }
     fn station_rts_request(&mut self) -> Result<super::RtsRequest, Error> {
         self.io.station_rts_request()

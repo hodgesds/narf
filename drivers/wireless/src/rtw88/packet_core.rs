@@ -116,8 +116,8 @@ pub(super) struct Core {
     mac_id: u8,
     data_profile: format::DataProfile,
     receive_chip: super::packet_phy::Chip,
-    tx_host: [u16; 2],
-    tx_device: [u16; 2],
+    tx_host: [u16; 5],
+    tx_device: [u16; 5],
     rx: u16,
     tag: u16,
     next_id: u64,
@@ -130,6 +130,9 @@ fn queue_slot(queue: Queue) -> usize {
     match queue {
         Queue::Management => 0,
         Queue::Data => 1,
+        Queue::Background => 2,
+        Queue::Video => 3,
+        Queue::Voice => 4,
     }
 }
 fn barrier() {
@@ -186,7 +189,13 @@ impl Core {
         }
         port.transmit_allowed()?;
         let receive_chip = port.receive_chip()?;
-        for queue in [Queue::Management, Queue::Data] {
+        for queue in [
+            Queue::Management,
+            Queue::Data,
+            Queue::Background,
+            Queue::Video,
+            Queue::Voice,
+        ] {
             if port.index(queue.index())? & 0x0fff_0fff != 0 {
                 return Err(Error::State);
             }
@@ -230,8 +239,8 @@ impl Core {
             mac_id,
             data_profile: format::DataProfile::LEGACY,
             receive_chip,
-            tx_host: [0; 2],
-            tx_device: [0; 2],
+            tx_host: [0; 5],
+            tx_device: [0; 5],
             rx: 0,
             tag: 0,
             next_id: 1,
@@ -296,7 +305,7 @@ impl Core {
         }
         let (mut descriptor, queue) =
             format::transmit_profile(frame, self.own, self.mac_id, sequence, self.data_profile)?;
-        if queue == Queue::Data && (!radio_report || frame[0] == 0x88) {
+        if queue.data() && (!radio_report || frame[0] == 0x88) {
             super::protection::descriptor(&mut descriptor, frame.len(), port.rts_threshold());
         }
         let memory = self.frame.as_ref().ok_or(Error::State)?;

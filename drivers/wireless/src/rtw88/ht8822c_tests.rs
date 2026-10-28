@@ -165,6 +165,34 @@ kernel_test_in!(
     "drivers/wireless/rtw88/coding/rtl8822c",
     smoke_rtw8822ce_coding_refusals_and_teardown
 );
+fn smoke_rtw8822ce_qos_open_all_ac_tid_routing_and_revocation() -> TestResult {
+    result(|| crate::rtw88::qos_tests::composition::<Case>(false))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/qos/rtl8822c",
+    smoke_rtw8822ce_qos_open_all_ac_tid_routing_and_revocation
+);
+fn smoke_rtw8822ce_qos_wpa2_all_ac_tid_routing_and_revocation() -> TestResult {
+    result(|| crate::rtw88::qos_tests::composition::<Case>(true))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/qos/rtl8822c",
+    smoke_rtw8822ce_qos_wpa2_all_ac_tid_routing_and_revocation
+);
+fn smoke_rtw8822ce_qos_not_granted_and_subset() -> TestResult {
+    result(crate::rtw88::qos_tests::not_granted::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/qos/rtl8822c",
+    smoke_rtw8822ce_qos_not_granted_and_subset
+);
+fn smoke_rtw8822ce_qos_refusals() -> TestResult {
+    result(crate::rtw88::qos_tests::refusals::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/qos/rtl8822c",
+    smoke_rtw8822ce_qos_refusals
+);
 impl cases::Fixture for Case {
     fn kind_request(
         &self,

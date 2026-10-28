@@ -326,8 +326,8 @@ pub(super) unsafe trait Io: Send {
     ) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
-    /// Bind the N2xC TX-coding continuation into the retained station gate.
-    fn station_bind_coding(
+    /// Bind an N2xC/N2xQ continuation into the retained station gate.
+    fn station_bind_continuation(
         &mut self,
         _: alloc::sync::Arc<super::qualification::Grant>,
     ) -> Result<(), Error> {

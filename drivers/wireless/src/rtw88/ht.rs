@@ -281,6 +281,7 @@ impl Grant {
             sgi,
             ldpc: false,
             stbc: false,
+            acs: 0,
         };
         if !self.allows(p) {
             return Err(Error::Unsupported);

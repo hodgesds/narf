@@ -268,18 +268,14 @@ unsafe impl Registers for Port {
         self.station_allowed()?;
         Ok(self.0.lock().protection.clone())
     }
-    fn station_bind_coding(
+    fn station_bind_continuation(
         &mut self,
         g: Arc<crate::rtw88::qualification::Grant>,
     ) -> Result<(), Error> {
         self.station_allowed()?;
-        let mut m = self.0.lock();
-        let gate = m
-            .station_gate
-            .as_ref()
-            .ok_or(Error::State)?
-            .with_coding(g)?;
-        m.station_gate = Some(gate);
+        let base = self.0.lock().station_gate.clone().ok_or(Error::State)?;
+        let gate = base.with_continuation(g)?;
+        self.0.lock().station_gate = Some(gate);
         Ok(())
     }
     fn station_bind_protection(

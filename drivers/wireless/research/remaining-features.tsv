@@ -194,10 +194,9 @@ rtw88	ht40	HT40 operation (40MHz width, DSSS/CCK40, SGI40)	feature	drivers/wirel
 rtw88	multi_device	Multiple live device lifetimes	feature	drivers/wireless/specification/rtw88.md	1462
 rtw88	multi_stream_ht	Multi-stream HT on RTL8822B/RTL8822C	feature	drivers/wireless/specification/rtw88.md	1467
 rtw88	operating_reset	Reset of an operating retained owner	feature	drivers/wireless/specification/rtw88.md	1462
-rtw88	qos_all_tid_routing	QoS packet scheduling across all supported TIDs	feature	drivers/wireless/specification/rtw88.md	1468
 rtw88	radio_coexistence	Complete radio coexistence state machine	feature	drivers/wireless/specification/rtw88.md	1469
-rtw88	randomized_scan_mac	Randomized scan MAC addresses	feature	drivers/wireless/specification/rtw88.md	515
 rtw88	rate_fallback	DATA rate fallback	feature	drivers/wireless/specification/rtw88.md	968
+rtw88	randomized_scan_mac	Randomized scan MAC addresses	feature	drivers/wireless/specification/rtw88.md	515
 rtw88	rf_power_tracking	Thermal RF power tracking on RTL8821CE (TXAGC/txscale swing; RTL8822C done by dm)	feature	drivers/wireless/specification/rtw88.md	1372
 rtw88	rtl8822be	RTL8822BE retained firmware/radio/packet/station runtime	chip	drivers/wireless/specification/rtw88.md	1469
 rtw88	runtime_sleep	Runtime sleep	feature	drivers/wireless/specification/rtw88.md	1469
@@ -207,7 +206,6 @@ rtw88	system_suspend	System suspend	feature	drivers/wireless/specification/rtw88
 rtw88	tx_amsdu_5ghz	TX A-MSDU and A-MSDU-in-A-MPDU outside 2.4GHz	feature	drivers/wireless/specification/rtw88.md	1564
 rtw88	tx_ba_all_tids	Originator TX Block Ack on every non-VO TID	feature	drivers/wireless/specification/rtw88.md	1564
 rtw88	vht	VHT operation	feature	drivers/wireless/specification/rtw88.md	1467
-rtw88	wmm_all_access_categories	Packet scheduling across all WMM access categories	feature	drivers/wireless/specification/rtw88.md	1468
 rtw88	wow	Wake on Wireless on RTL8822CE	feature	drivers/wireless/specification/rtw88.md	1570
 rtw89	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw89.md	1006
 rtw89	aggregation	TX A-MPDU and TX A-MSDU/A-MSDU-in-A-MPDU aggregation	feature	drivers/wireless/specification/rtw89.md	1278

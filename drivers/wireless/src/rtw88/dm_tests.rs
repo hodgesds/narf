@@ -151,6 +151,7 @@ fn period(linked: bool) -> Period {
             sgi: false,
             ldpc: false,
             stbc: false,
+            acs: 0,
         },
         tx_bytes: 0,
         rx_bytes: 0,
