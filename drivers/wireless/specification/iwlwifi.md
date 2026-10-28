@@ -1552,7 +1552,7 @@ each feature; a Linux chip name or helper structure does not grant a capability.
 
 | Profile | Implemented reachable software | Remaining software gates |
 |---|---|---|
-| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles (Linux Qu PCI IDs 0x02f0/0x06f0/0x34f0/0x3df0/0x4df0/0x43f0/0xa0f0, §3.26) | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO (with §3.28 RX LDPC/STBC1), signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement preceded by §3.25 over-air leaving deauthentication. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced reconnect restoration, extended in §3.30 to cross-peer/cross-index GTK restore and safe same-peer PTK reuse; §3.29 firmware/transport recovery and non-WoWLAN system suspend/resume. Authored, execution pending: §3.24 tag4 negotiated unicast-local nested recipient A-MSDU-in-A-MPDU with complete bundles before sequence/PN ownership. | Active probes (scan firmware's emitter/power binding needs source proof); alternate ML BAID; group-addressed nested RX; other QoS AC/TID TX queues and TX A-MSDU; HT40/NSS2/VHT/HE/TX LDPC/TX STBC; PMF/WPA3; persistent/cross-owner key history. AP/P2P, WoW (with its D3 ARP/NS/GTK offloads), the §3.27 scheduled-scan offload and multiple RX/RSS remain unimplemented even where hardware supports them. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
+| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles (Linux Qu PCI IDs 0x02f0/0x06f0/0x34f0/0x3df0/0x4df0/0x43f0/0xa0f0, §3.26) | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO (with §3.28 RX LDPC/STBC1), signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement preceded by §3.25 over-air leaving deauthentication. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced reconnect restoration, extended in §3.30 to cross-peer/cross-index GTK restore, safe same-peer PTK reuse and a radio-scoped ledger across native owners; §3.31 generic tag5 feature programs with per-TID QoS queues for all four ACs; §3.29 firmware/transport recovery and non-WoWLAN system suspend/resume. Authored, execution pending: §3.24 tag4 negotiated unicast-local nested recipient A-MSDU-in-A-MPDU with complete bundles before sequence/PN ownership. | Active probes (scan firmware's emitter/power binding needs source proof); alternate ML BAID; group-addressed nested RX; TX A-MSDU; HT40/NSS2/VHT/HE/TX LDPC/TX STBC; PMF/WPA3; persistent key history. AP/P2P, WoW (with its D3 ARP/NS/GTK offloads), the §3.27 scheduled-scan offload and multiple RX/RSS remain unimplemented even where hardware supports them. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
 | AX210/AX211/AX411 and Bz/BE200 Gen3 transports | Context-v2, generation-selected completion layouts, firmware/PNVM/native boot and MLD helpers. Software-validated continuation: source-selected command-ID header0/explicit RLC2, receipt-fenced TVQM/BAID retirement, retained actual executable/PNVM/PCI authority and immutable DMA-copy receive/publication epochs. | Station admission remains dependent on the exact negotiated MAC/link/STA/TLC/key payload profile; no new payload profile is enabled by the header/source audit. Sc conversation tests do not establish another family's ABI, platform power/SAR program or hardware. Current live regulatory/power ownership remains separate. |
 | Sc c103/BE211 MLD station profile | Deferred retained native publication, actual station/management/data/Open-WPA2-SAE conversations, legacy/HT/VHT to80MHz, key/BA/reorder and userspace SME/port ownership in the existing profile. §§3.21–3.22 header/TVQM, positive BA response/RX-marker retirement, retained executable/PNVM/current-PCI publication and copy-time key epochs passed coordinated native tests on both architectures. | These source/epoch fences do not establish underlying RF quiescence or current live-regulatory/platform-power qualification. HE/EHT/6GHz and MLO,160/320MHz, AP/P2P and the §3.27 scheduled-scan offload remain separate (non-WoWLAN system suspend/resume is §3.29) implementations and must not be inferred from single-link Sc fixtures. |
 | Other advertised PCI/firmware combinations | Identification/firmware selection where defined, including the Linux So/Ma/Bz IDs added in §3.26; 0x7df0 is identification-only (Linux 7.3 `pcie/drv.c` claims no 0x7DF0) and exact admission rejects it | No fallback admits an unknown command table, calibration profile, topology or PHY width. They need their exact source-backed authority/command/receipt/lifetime path. |
@@ -1873,6 +1873,55 @@ newly authenticated material with the same fingerprint:
 `smoke_gen2_key_history_restore_policy_cross_peer_index_and_ptk_reuse`
 covers the policy table and key-command bytes; the existing reconnect
 smokes cover the native same-peer GTK conversation.
+
+**Cross-owner ledger.** A native owner adopts the retired-key ledger a
+previous owner of the same radio (station MAC) left behind when it is
+configured, merging by fingerprint (floors and TX bounds only rise; an entry
+stays reusable only if both copies are retired), and hands its ledger back
+when dropped (`Context::adopt_ledger`/`Drop`). A later owner after
+re-probe/rebind therefore never restarts from an empty history. Entries
+hold fingerprints and counters only. At most four radio ledgers are kept.
+RAM fixtures share one MAC and do not adopt ledgers;
+`smoke_gen2_key_history_ledger_crosses_native_owners_of_one_radio` covers
+the ledger directly.
+
+**Persistent key history (blocked).** Persisting the ledger across reboots
+needs an authenticated, rollback-protected persistent store bound to this
+radio; NARF exposes none to drivers, and Linux keeps no key history at all.
+Within one boot the ledger above survives every owner of the radio.
+
+### 3.31 Generic feature programs and per-TID QoS queues
+
+Every additional emitting feature needs its own externally measured power
+program. Instead of a new hard-coded tag per feature, `mvm_power.rs` defines
+a generic tag5 program: the tag2 HT20/SISO/WMM base plus exactly the
+`feature` bits it names (`BA`, `NESTED_BA`, `QOS_TIDS`). The asset name
+(`mvm-api77-ht20-siso-wmm-features-<bits>-power-v5-<MAC>.bin`), the binding
+domain (`NARF Intel MVM API77 qualified HT20 SISO MCS0-7 SGI20 WMM feature
+program power v5` followed by the bit set) and NIPW record bytes 62..64 all
+carry the exact set, so one set never authorizes another; empty, unknown or
+`NESTED_BA`-without-`BA` sets are refused. tag3/tag4 map onto the same bits
+for BA checks. The native loader tries the tag5 program for the offered
+feature set first and keeps the narrower program only on an actual
+NotFound; an unsigned, malformed or revoked tag5 asset fails.
+
+`QOS_TIDS` (rows other_qos_ac_tx/other_qos_tid_tx) follows Linux DQA
+(`mvm/sta.c::iwl_mvm_sta_alloc_queue`, one queue per RA/TID): data
+preparation allocates SCD queues for TIDs 1..=7 next to TID0 with the
+same receipt-fenced `SCD_QUEUE_CFG` owner, and close removes each by its
+exact receipt. Ethernet frames take their 802.1D priority from the IPv4 TOS
+/ IPv6 traffic-class DSCP exactly as `cfg80211_classify8021d` (RFC 8325
+table) and an AC that requires admission control downgrades VO->VI->BE->BK
+like `ieee80211_downgrade_queue`. Each TID keeps its own QoS sequence
+counter and its frames carry that TID in QoS Control. The firmware-managed
+TX BA pipeline stays BE/TID0 (other TIDs keep TX aggregation disabled in
+ADD_STA) and batches only TID0 frames; other TIDs are sent singly on their
+own queue. Without a tag5 `QOS_TIDS` program all traffic stays on BE/TID0.
+`drivers/wireless/iwlwifi/gen2/qos` smokes cover the tag5 record/name/
+binding table, classification and ACM downgrade, the 9-queue allocation,
+EF/AF41/CS1/CS3/CS6/AF21/BE traffic on its TID queue with DHCP, ordered
+close removing all nine queues, and the tag2 fallback. Measured tag5
+programs and air validation remain external inputs.
 
 ## 4. References
 
