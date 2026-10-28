@@ -29,6 +29,16 @@ pub struct BootOptions<'a> {
     pub gpu_recovery: bool,
     /// The power-saving list to apply; `None` applies nothing.
     pub power_saving: Option<&'a str>,
+    /// `amdgpu.rdna2_dmub_tables=0` runs the DCN3.0 display VBIOS tables
+    /// (SetPixelClock, DIG encoder/transmitter control, pipe power gating)
+    /// in NARF's ATOM interpreter even while DMCUB runs. Diagnostic: Linux
+    /// always sends them to DMCUB (`debug.dmub_command_table`).
+    pub dmub_tables: bool,
+    /// `amdgpu.rdna2_atom_pixclk=1` runs SetPixelClock alone in the ATOM
+    /// interpreter while every other display table still goes to DMCUB
+    /// (DMCUB implements the tables itself; its golden init does more than
+    /// the bytecode). Diagnostic.
+    pub atom_pixclk: bool,
 }
 impl Default for BootOptions<'_> {
     fn default() -> Self {
@@ -72,6 +82,8 @@ impl<'a> BootOptions<'a> {
             ),
             gpu_recovery: switch("amdgpu.gpu_recovery", None, true),
             power_saving,
+            dmub_tables: switch("amdgpu.rdna2_dmub_tables", None, true),
+            atom_pixclk: switch("amdgpu.rdna2_atom_pixclk", None, false),
         }
     }
 }

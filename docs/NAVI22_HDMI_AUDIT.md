@@ -187,6 +187,112 @@ captured. The next bench run captures settled and post-SETCRTC registers
 automatically, including frame counters, clock patterns, DRR and MPC state,
 and saves available working-Linux display state before VFIO takeover.
 
+Those captures succeeded in `guest-e3rutSQT`. DIG0's clock pattern is already
+0x1f in every sample, excluding the reset-pattern hypothesis for this run.
+The post-Xorg counter advances from 685 to 725 between snapshot windows
+`1793104100.822358006..1793104100.877330275` and
+`1793104101.880248962..1793104101.934992655`. This is not consistent with
+the requested 60-Hz cadence if the counter increments once per frame; the
+sampling windows do not establish the PLL's actual frequency. Totals remain
+4000 by 2222, both HUBP addresses agree, and no HUBP underflow is observed.
+Working Linux uses the same EDID mode with two 1920-wide frontend slices.
+The clock path requires further hardware comparison; no visible-output
+acceptance is inferred from these register values.
+
+The same capture confirms that `OTG_V_TOTAL_LAST_USED_BY_DRR` contains 2222,
+while the programmed `V_TOTAL` contains 2221. Linux's
+`optc2_get_last_used_drr_vtotal` returns the former verbatim. NARF now samples
+that status count without adding one, with the captured value in a regression.
+
+## OTG pixel rate — 2026-10-27
+
+Frame count and vertical position from two snapshot pairs about 1.06 s
+apart give the OTG's actual rate. `guest-k3wUxt9t` advances 88668 lines
+after settling and 88381 lines after Xorg, about 83.6k lines/s. With
+H_TOTAL 4000 that is about 334 MHz, or 37.6 Hz, not the requested
+533.25 MHz. `guest-e3rutSQT` gives the same rate.
+
+The root launcher now saves the same registers read-only from working
+Linux before VFIO takeover, with a timed frame-rate sample
+(`guest-OZvqJQdJ/host-linux/registers.txt`). Linux's OTG runs at
+533.249 MHz (59.997 Hz) by the same counter method, so the guest
+measurement method is sound and the slow NARF OTG is a real defect.
+Linux drives the mode on one OTG and one OPP: ODM source select is a single
+OPP 0 segment and OTG_H_TIMING_CNTL is 0. The two 1920-wide HUBPs in its
+DTN log are an MPC split (MPCC 0 and 5 both feed OPP 0), which halves
+DPPCLK. An earlier reading of that log as ODM 2:1 was wrong.
+
+A NARF build that forced ODM 2:1 above 340 MHz on that wrong premise
+failed its verification with an OPTC underflow (`otg: true, hubp: 0`).
+That policy is removed: HDMI admission uses DML30's ODM decision again,
+which keeps this mode on one pipe. The ODM 2:1 support added for it stays
+for streams DML30 splits, and is model-verified only:
+
+- SetPixelClock and the DP DTO get the timing's clock divided by the ODM
+  segment count (dcn20 `get_pixel_clock_parameters`); the transmitter keeps
+  the character rate.
+- Both ODM OPPs get FMT and output CSC. Flips arm both HUBPs under the OTG
+  master lock, and the cursor is placed per slice.
+- Two multi-stream HDMI defects are fixed. The HDMI format stage ran after
+  `set_odm_combine` and reset its H divider to bypass. SCDC was not
+  forwarded through `Links`, so a scrambled stream failed.
+
+Every register both captures share matches Linux on the HDMI clock path:
+DIG0, DPCS0 TX clock, RDPCSTX clock and PHY_CNTL0/1/3/6/8, PHYPLL0 resync,
+OTG0_PIXEL_RATE_CNTL. The remaining OTG timing differences (VTG FP2 1 vs 0,
+HUBP VREADY_AT_OR_AFTER_VSYNC) do not set the pixel rate. The DCCG blocks
+and the PHY's MPLLB settings (PHY_CNTL9..14) were not in the older NARF
+captures. The next run records them, including at `phase=transmitter`
+so a failed light still leaves a snapshot.
+
+Reading the RDPCSTX control/interrupt registers and the PHY block in one
+sweep on the host returned zeros for PHY_CNTL0, which single reads moments
+earlier had returned as 0x30314704. The probe no longer sweeps that window;
+PHY_CNTL9..14 are single reads taken before any block read.
+
+## Root cause: DENTIST VCO, then DIRTYFB — 2026-10-27
+
+The slow OTG was a DISPCLK/DPPCLK shortfall, not the HDMI clock path. NARF
+derived the DENTIST VCO from CLK0_CLK_PLL_REQ (FbMult 49, 4.9 GHz) and
+programmed DISPCLK DID 0x23 and DPPCLK DID 0x24 for 560 and 544 MHz.
+Linux's DCN3.0 clock manager reads that register through
+`CLK_COMMON_MASK_SH_LIST_DCN20_BASE`, which has no FbMult fields, so
+`dcn30_get_vco_frequency_from_reg` returns 0 and Linux always uses its
+3.65 GHz default. Linux's own dividers confirm it: DID 0x1a for the
+561.538 MHz DML clock of 4K60/533.25 and 0x18 for 608.333 MHz at 594 MHz
+decode only at 3.65 GHz. At that VCO NARF's DISPCLK was 417 MHz and its
+DPPCLK 406 MHz, below the 533.25 MHz pixel rate. The OTG ran at
+334.21 MHz (37.60 Hz), the DIG FIFO reported LEVEL_ERROR, and the sink
+saw a valid scrambled clock without a usable stream.
+
+With the 3.65 GHz VCO (`guest-I9bkOuGT`), DENTIST is 0x1b191919, the OTG
+measures 533.24 MHz (59.995 Hz) against Linux's 533.249 MHz, the DIG FIFO
+holds 8-9 with no error, settled SCDC reports clock and all channel locks,
+and the boot colour bars appear on the monitor.
+
+The desktop then stayed on the bars. NARF's native amdgpu presenter copies
+a dumb framebuffer into its own back buffer at SETCRTC and flips, rather
+than scanning the client buffer in place. It had no
+`DRM_IOCTL_MODE_DIRTYFB`, so Xorg's modesetting probe failed and it never
+reported shadow updates: the only copy was its still-black first frame.
+DIRTYFB now presents the framebuffer again on every CRTC showing it
+(whole frame; clip rectangles are accepted but not yet used). In
+`guest-5nyflrvC` the scanout holds the SDDM greeter and the monitor shows
+it.
+
+Linux-parity fixes found on the way, kept: SetPixelClock with a zero clock
+(`dce110_clock_source_power_down`, DC_LOG_BIOS-confirmed) on takeover of a
+lit DIG, on stream teardown and before a PLL's first stream is programmed;
+the ODM-divided SetPixelClock and DP DTO targets; ODM combine after the HDMI
+format stage; SCDC forwarded through multi-stream `Links`. The VBIOS image
+NARF reads through ROM registers is byte-identical to the host's VFCT copy.
+This board's VBIOS has no SetPixelClock bytecode; DMCUB implements the
+display command tables itself, and its golden init enables the DCHUB timer
+where the bytecode does not.
+
+The sink's EDID limits it to 23-80 Hz (600 MHz max dot clock), with 4K at
+60 and 30 Hz; 60 Hz is its highest 4K refresh.
+
 ## Kernel-log feedback
 
 Userspace tty output previously entered the kernel log. Printing `dmesg`

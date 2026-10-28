@@ -335,6 +335,35 @@ pub struct Stream {
     /// AMD FreeSync SPD, replacing desktop identification while supported.
     pub spd: Option<[u8; 36]>,
 }
+impl Stream {
+    /// The SetPixelClock target for an OTG fed by `opps` ODM segments:
+    /// dcn20 `get_pixel_clock_parameters` divides the timing's clock by four
+    /// for 4:1, else by two for 4:2:0 *or* 2:1 (once, not both), then
+    /// `dcn3_get_pix_clk_dividers` applies the deep-colour ratio (4:2:2 is
+    /// sent as 8 bpc). The PLL drives the OTG pixel rate; the TMDS character
+    /// rate stays [`Stream::character_khz`] on the transmitter.
+    pub fn pll_target_100hz(&self, timing_khz: u32, opps: u32) -> u32 {
+        if opps <= 1 {
+            return self.character_100hz;
+        }
+        let requested = u64::from(timing_khz) * 10;
+        let requested = if opps >= 4 {
+            requested / 4
+        } else {
+            requested / 2
+        };
+        let target = if self.format.encoding.is_422() {
+            requested
+        } else {
+            match self.format.depth {
+                Depth::Bpc8 => requested,
+                Depth::Bpc10 => (requested * 5) >> 2,
+                Depth::Bpc12 => (requested * 6) >> 2,
+            }
+        };
+        u32::try_from(target).unwrap_or(u32::MAX)
+    }
+}
 
 /// HF-VSDB/HF-SCDB LTE_340Mcsc_scramble, as DRM's
 /// `drm_parse_hdmi_forum_scds` sets `scrambling.low_rates`: SCDC present,

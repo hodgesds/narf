@@ -591,12 +591,25 @@ fn navi22_modeset_hdmi_end_to_end_follows_linux_order() -> TestResult {
         {
             return TestResult::Fail("audio stop order");
         }
-        // The PHY PLL is never "powered down" with a zero clock.
-        if log[enabled..]
+        // dcn20_reset_back_end's cs_power_down: one zero-clock SetPixelClock
+        // after the OTG stops (DC_LOG_BIOS: clock 0, tg 255, pll 20):
+        // CRTC invalid, no encoder, CRT mode, FORCE_PROG_PPLL.
+        let slot = |i: u32| MARK + 16 * m::SLOT_PIXEL_CLOCK + i;
+        let downs: Vec<usize> = log[enabled..]
             .iter()
-            .any(|w| w.dword == MARK + 16 * m::SLOT_PIXEL_CLOCK)
-        {
-            return TestResult::Fail("SetPixelClock(0) on disable");
+            .enumerate()
+            .filter(|(_, w)| w.dword == slot(0) && w.value == 0)
+            .map(|(i, _)| enabled + i)
+            .collect();
+        let shaped = downs.first().is_some_and(|&i| {
+            log.get(i + 1)
+                .is_some_and(|w| w.dword == slot(1) && w.value & 0xffff_ff00 == 0x010f_0000)
+                && log
+                    .get(i + 2)
+                    .is_some_and(|w| w.dword == slot(2) && w.value & 0xff == 0xff)
+        });
+        if downs.len() != 1 || !shaped {
+            return TestResult::Fail("PLL power-down on disable");
         }
         // The scanout stays excluded from reuse after the stop.
         if p.scanout().is_none_or(|s| s.reusable_for_test()) {

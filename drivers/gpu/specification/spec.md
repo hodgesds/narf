@@ -2677,7 +2677,12 @@ format (EINVAL across formats). A committed framebuffer records its format
 with `request_display_format`; a running display scanning another one is
 relit in it by the monitor, like a mode request, and a failed relight
 returns every display to XRGB8888 with its preferred mode, as does the last
-DRM file closing. `amdgpu_native_kms::present_frame` takes the framebuffer's
+DRM file closing. `DRM_IOCTL_MODE_DIRTYFB` (DRM master) presents a dumb
+framebuffer again on every CRTC showing it, through the same `present_frame`
+path as SETCRTC (whole frame; clip rectangles are accepted, not used); a GEM
+framebuffer is scanned in place and needs nothing. Xorg's modesetting driver
+probes it once and relies on it for shadow updates to a copying CRTC.
+`amdgpu_native_kms::present_frame` takes the framebuffer's
 fourcc: a frame in the scanned format is copied as packed words into the back
 buffer; one in the requested format waits for the relight and presents (or
 completes) after that monitor pass; others complete at once. The console and
@@ -7381,8 +7386,9 @@ multi-plane DRAM clock change margin (SynchronizedVBlank false: no OTG sync)
 and stutter critical plane, one watermark set, DSC delay (`dscceComputeDelay`)
 and ODM after-scaler allowance — and `display_rq_dlg_calc_30.c` per pipe (an
 ODM slice's viewport, swath and blank end). `Stream { config, dsc:
-Option<Dsc { slices, bits_per_pixel_x16 }>, phy_khz }` (`Stream::tmds(config)`
-for 8-bpc TMDS); `JointPlan { prefetch_mode, clocks, watermarks, hubbub,
+Option<Dsc { slices, bits_per_pixel_x16 }>, phy_khz, odm }` (`Stream::tmds(config)`
+for 8-bpc TMDS; `odm` is the least ODM the caller drives, which mode support
+still checks); `JointPlan { prefetch_mode, clocks, watermarks, hubbub,
 dram_clock_change, urgent_bandwidth_thousandths, planes: Vec<PlanePlan { odm,
 geometry, prefetch, dppclk_khz, dsc_delay, pipes: [Option<PipePlan {
 viewport_x, viewport_width, registers, cursor }>; 2] }> }`. The prefetch-mode
@@ -7394,7 +7400,9 @@ A top DCFCLK below `dcn3_0_soc.min_dcfclk` (500 MHz) is refused.
 (`Plan { prefetch_mode, geometry, clocks, watermarks, prefetch, registers:
 amdgpu_dml_regs::Registers, hubbub: WatermarkSet, dram_clock_change,
 urgent_bandwidth_thousandths, cursor }`; a stream needing ODM is
-`Unsupported` there). `dcn3_0_ip` / `dcn3_0_soc` constants (184 KiB DET per
+`Unsupported` there). `plan_odm(&Config, &Soc, Odm) -> Result<(Plan,
+PlanePlan), Error>` is the one-stream form on at least `Odm`'s pipes: the
+first pipe's `Plan` and the plane with every slice. `dcn3_0_ip` / `dcn3_0_soc` constants (184 KiB DET per
 pipe, 84 PTE requests, 191-cycle ping, 404 us p-state, 15.5/20 us self refresh,
 fabric-adjusted urgent latency) in `amdgpu_dml::Fx` fixed point. Register
 fields are Linux's `(unsigned int)` truncations and are refused (not wrapped)
@@ -7403,6 +7411,11 @@ when they exceed the DCN3.0 mask; everything fails before hardware is touched.
 `Soc::from_board(levels, channels, width, dchub_refclk)` builds the top
 bounding-box state from the DAL DPM table (DCFCLK doubling as fabric clock,
 `memclk*16`, DENTIST-reachable DISP/DPP ceilings, PHY ceiling, VCO).
+The DCN3.0 DENTIST VCO is Linux's effective 3.65 GHz: `dcn3_clk_mgr_construct`
+reads CLK0_CLK_PLL_REQ through a mask list without FbMult fields, gets 0 and
+falls back to 3650000 kHz. The register (FbMult 49 on Navi22) is read only
+to detect a lost device; dividers derived from it under-clock DISPCLK and
+DPPCLK.
 It defaults `Soc::dcn_revision` to 0. `Soc::for_gpu(gpu)` selects revision
 0/2/3 from an exact discrete RDNA2 profile before admission; other values
 are rejected. This selects resource limits and the corresponding latency
@@ -7454,7 +7467,24 @@ stream's SAT row, ACT, ALLOCATE_PAYLOAD and VC rate), then every front end
 under its OTG lock (`hubp.select_vtg`, an ODM slice's viewport at its offset).
 `leases()`, `plans()`, `joint()`, `members()`, `state() -> GroupState`.
 Pipeline additions: `set_odm_combine`, `set_odm_bypass`,
-`mpc_rate_control_off`; `Hubp::{program_at, select_vtg}`.
+`mpc_rate_control_off`, `combine_slice` (after the master's HDMI format
+stage, whose OTG step writes the bypass H divider: the combine, then the
+slice OPP's rate control, size, black, FMT and output CSC);
+`Hubp::{program_at, select_vtg}`. `program_pix_clk` takes the OTG's ODM
+segment count: SetPixelClock and the DP DTO run at the timing's clock
+divided by it (dcn20 `get_pixel_clock_parameters`, then the deep-colour
+ratio via `hdmi::Stream::pll_target_100hz`), the transmitter at the TMDS
+character rate. `Links::{scdc_read, scdc_write}(link, ..)` (default: no
+SCDC) forward HDMI SCDC to connector `link`'s DDC.
+
+The single-stream `Pipeline` drives ODM 2:1 when `hdmi_plan` admits it
+(DML30 mode support chooses the split; a split non-RGB stream is refused).
+The secondary is the highest other pipe (`dcn30_find_split_pipe`), lit and
+torn down with the master (FMT/OCSC, front end under the master's OTG lock,
+underflow, `set_odm_bypass` after the OTG stops). `odm_pipes() ->
+Option<[(pipe, viewport_x, width); 2]>`. Hardware status: a forced 2:1
+3840x2160@60 on the RX 6750 XT reported an OPTC underflow at verification;
+this path is model-verified only.
 
 `amdgpu_dcn30_dsc` is the DCN2.0 DSC block as DCN3.0 instantiates it:
 `select(timing, dsc_caps, fec_caps, link_kbps) -> Option<DscConfig>`
@@ -7598,7 +7628,8 @@ write failure requires teardown. Fixed-mode startup also clears inherited DRR
 and static-screen event state. This backend refuses DCN3.1.4.
 Navi22 publishes `vrr_capable`/`VRR_ENABLED` only for admitted routed sinks;
 the monitor applies committed state outside the KMS lock. The single-stream
-scanout uses completed DRR totals sampled within a stable frame counter,
+scanout uses completed DRR totals (actual counts, unlike MIN/MAX's minus-one
+programming) sampled within a stable frame counter,
 strobes the DCN3.0 manual trigger after a flip, and bounds the timeout by the
 longest admitted frame. Its VRR vblank clock never extrapolates nominal-rate
 frames while hardware sampling is unavailable. These controls do not add
@@ -7686,16 +7717,24 @@ armed), `set_interrupt`/`ack(Interrupt::{Flip, Vupdate, Vblank})` are
 `irq_service_dcn30`'s SURFACE_FLIP_INT_MASK/CLEAR and
 OTG_GLOBAL_SYNC_STATUS VUPDATE_NO_LOCK/VSTARTUP enable/clear, and
 `position()` samples OTG_STATUS_POSITION with a stable 24-bit frame count.
+`unsafe with_odm(gpu, pipe)` adds the ODM secondary HUBP: `program` arms
+both inside `optc1_lock`/`optc1_unlock` so they latch at one VUPDATE, and
+`pending` ORs both (`dc_plane_get_status`).
 `unsafe amdgpu_dcn30_cursor::Cursor::new(gpu, pci_cap, pipe)`:
 `show(addr, (w, h), at, viewport, (refclk, pixclk))` programs
 `hubp2_cursor_set_attributes` + `dpp3_set_cursor_attributes` (premultiplied
 ARGB, 256-pixel pitch, no degamma) and the position under
 `mpc1_cursor_lock` (CUR_VUPDATE_LOCK_SET, base index 3); `move_to`, `hide`.
 `placement` follows amdgpu_dm `get_cursor_position` and
-`hubp2_cursor_set_position` (negative origin into the hotspot, 256x256 cap).
+`hubp2_cursor_set_position` (negative origin into the hotspot, 256x256 cap);
+`placement_in` places it in a slice starting at `viewport_x`. `unsafe
+with_odm(gpu, slices)` programs attributes and position on every slice's
+HUBP/DPP (stream x in CURSOR_POSITION; visibility and DST_X_OFFSET within
+the slice) under the master OPP's cursor lock.
 
-`unsafe amdgpu_navi22_scanout::Scanout::new(gpu, pci_cap, pipe, front, map,
-timing, refclk)` adopts the lit surface as buffer 0: `prepare_back(pool,
+`unsafe amdgpu_navi22_scanout::Scanout::new(gpu, pci_cap, pipe, odm, front,
+map, timing, refclk)` (`odm`: the pipeline's `odm_pipes()`, for the flip and
+cursor owners) adopts the lit surface as buffer 0: `prepare_back(pool,
 flush)` reserves/clears/publishes buffer 1, `upload_back(x, y, row)` writes
 it, `flip(flush)` HDP-flushes, arms and waits up to `flip_timeout_us` (four
 frames + 20 ms, at least 50 ms) for EARLIEST_INUSE, then swaps roles;

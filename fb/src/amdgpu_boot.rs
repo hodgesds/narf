@@ -445,10 +445,11 @@ fn completed(generation: &str, result: impl core::fmt::Debug, status: impl core:
 /// unless `amdgpu.rdna2_hw_cursor=0`.
 fn navi22_native_display() {
     use core::fmt::Write;
-    platform::set_hw_cursor(
-        narf_drivers_gpu::amdgpu_rdna2::options::BootOptions::parse(narf_boot::args().raw())
-            .hw_cursor,
-    );
+    let options =
+        narf_drivers_gpu::amdgpu_rdna2::options::BootOptions::parse(narf_boot::args().raw());
+    platform::set_hw_cursor(options.hw_cursor);
+    narf_drivers_gpu::amdgpu_navi22_bios::set_dmub_tables(options.dmub_tables);
+    narf_drivers_gpu::amdgpu_navi22_bios::set_atom_pixclk(options.atom_pixclk);
     // SAFETY: final synchronous boot initcall after a successful firmware run;
     // no other display client exists and only the console writes scanout.
     let lit = narf_scheduler::block_on_spin(unsafe {

@@ -151,19 +151,22 @@ fn frequency(vco: u32, did: u8) -> u32 {
     // linux-lit: 4=DENTIST_DIVIDER_RANGE_SCALE_FACTOR
     (u64::from(vco) * 4 / u64::from(divider(did))) as u32
 }
+/// `dcn3_clk_mgr_construct`'s DENTIST VCO. `dcn30_get_vco_frequency_from_reg`
+/// reads CLK0_CLK_PLL_REQ through `CLK_COMMON_MASK_SH_LIST_DCN20_BASE`,
+/// which defines no FbMult fields: both masks are zero, the result is 0,
+/// and Linux always uses its 3.65 GHz default. The dividers Linux programs
+/// (DID 0x1a for 561.538 MHz, 0x18 for 608.333 MHz) match only that VCO,
+/// although the register's integer part reads 49 (4.9 GHz) on Navi22;
+/// dividers computed from 4.9 GHz left DISPCLK at 417 MHz on hardware.
+/// The register is still read: all ones means the device is gone.
 fn vco(pll: u32) -> Result<u32, Error> {
     if pll == u32::MAX {
         return Err(Error::DeviceGone);
     }
-    // FbMult is an integer in bits 8:0 plus a /65536 fraction in bits 31:16.
-    // linux: n/a (FbMult_int/FbMult_frac masks in dcn30_clk_mgr.h, dfs_ref_freq_khz 100000)
-    let khz = (u64::from(pll & 0x1ff) * 100_000 + u64::from(pll >> 16) * 100_000 / 65536) as u32;
-    if !(600_000..=6_000_000).contains(&khz) {
-        // linux: n/a (NARF VCO sanity range)
-        return Err(Error::Invalid);
-    }
-    Ok(khz)
+    Ok(DENTIST_VCO_KHZ)
 }
+// linux: n/a (dcn3_clk_mgr_construct: dentist_vco_freq_khz = 3650000 fallback)
+const DENTIST_VCO_KHZ: u32 = 3_650_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     Dormant,

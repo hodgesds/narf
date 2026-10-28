@@ -208,8 +208,13 @@ fn navi22_dentist_plan_rounds_up_without_exceeding_board() -> TestResult {
             return TestResult::Fail("unrepresentable/overclock admitted");
         }
     }
-    if vco(0).is_ok() || vco(u32::MAX) != Err(Error::DeviceGone) || vco(61).is_ok() {
-        return TestResult::Fail("invalid PLL invented a default");
+    // Linux's DCN30 mask list has no FbMult fields: the VCO is always the
+    // 3.65 GHz default, whatever the register's integer part says.
+    if vco(0) != Ok(3_650_000)
+        || vco(0x31) != Ok(3_650_000)
+        || vco(u32::MAX) != Err(Error::DeviceGone)
+    {
+        return TestResult::Fail("DENTIST VCO is not Linux's 3.65 GHz");
     }
     TestResult::Pass
 }

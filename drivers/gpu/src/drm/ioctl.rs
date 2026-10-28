@@ -59,6 +59,7 @@ pub enum IoctlCmd {
     ModeAddFb = 0xAE,
     ModeRmFb = 0xAF,
     ModePageFlip = 0xB0,
+    ModeDirtyFb = 0xB1,
     ModeCreateDumb = 0xB2,
     ModeMapDumb = 0xB3,
     ModeDestroyDumb = 0xB4,
@@ -119,6 +120,7 @@ impl IoctlCmd {
             0xB6 => IoctlCmd::ModeGetPlane,
             0xB7 => IoctlCmd::ModeSetPlane,
             0xB0 => IoctlCmd::ModePageFlip,
+            0xB1 => IoctlCmd::ModeDirtyFb,
             0xB2 => IoctlCmd::ModeCreateDumb,
             0xB3 => IoctlCmd::ModeMapDumb,
             0xB4 => IoctlCmd::ModeDestroyDumb,
@@ -453,6 +455,7 @@ pub fn dispatch(
         | IoctlCmd::ModeGetPlane
         | IoctlCmd::ModeSetPlane
         | IoctlCmd::ModePageFlip
+        | IoctlCmd::ModeDirtyFb
         | IoctlCmd::ModeCreateDumb
         | IoctlCmd::ModeMapDumb
         // CURSOR / CURSOR2 are handled in the bridge (they drive narf_fb's

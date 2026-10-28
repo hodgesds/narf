@@ -25,8 +25,10 @@
 //! 5. `dce110_power_down` when any DIG backend is enabled:
 //!    `power_down_encoders` (DP streams blanked, VBIOS transmitter DISABLE
 //!    with `SIGNAL_TYPE_NONE`), then `power_down_controllers` (every OTG's
-//!    `optc1_disable_crtc`). `power_down_clock_sources` is a no-op on DCN:
-//!    `set_pixel_clock_v7` rejects `CONTROLLER_ID_UNDEFINED`.
+//!    `optc1_disable_crtc`), then `power_down_clock_sources`: every combo
+//!    PHY PLL gets `dce110_clock_source_power_down`'s zero-clock
+//!    SetPixelClock (`CONTROLLER_ID_UNDEFINED` maps to ATOM_CRTC_INVALID;
+//!    Linux's DC_LOG_BIOS trace shows it executed), the DP DTO none.
 //!
 //! 6. `hubbub3_init_watermarks` (set A copied to B..D) when the VBIOS is not
 //!    in accelerated mode, called by the modeset owner after `retire`.
@@ -648,6 +650,11 @@ impl Takeover<'_> {
                 Ok(()) | Err(BlockError::Timeout) => {}
                 Err(error) => return Err(Error::Block(error)),
             }
+        }
+        // power_down_clock_sources: Linux only logs a failed power-down.
+        for pll in 0..self.profile()?.streams() {
+            let bus = crate::amdgpu_navi22_modeset::bios_bus(self.gpu, self.regs.authority);
+            let _ = tables.power_down_pixel_clock(bus, pll);
         }
         Ok(())
     }

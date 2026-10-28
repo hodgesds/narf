@@ -223,7 +223,7 @@ pub(crate) fn vsdb(flags: u8, max_5mhz: u8) -> Vec<u8> {
     vec![0x67, 0x03, 0x0c, 0x00, 0x10, 0x00, flags, max_5mhz]
 }
 /// HF-VSDB: version 1, Max_TMDS_Character_Rate, SCDC_Present/LTE flags.
-pub(super) fn hf_vsdb(rate_5mhz: u8, flags: u8) -> Vec<u8> {
+pub(crate) fn hf_vsdb(rate_5mhz: u8, flags: u8) -> Vec<u8> {
     vec![0x67, 0xd8, 0x5d, 0xc4, 0x01, rate_5mhz, flags, 0x00]
 }
 /// A base block whose preferred mode is `dtd`, and one CTA extension

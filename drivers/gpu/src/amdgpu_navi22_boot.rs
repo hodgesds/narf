@@ -2109,6 +2109,7 @@ impl ColdBoot {
             let refclk = pipeline.admitted()?.refclk_khz;
             Some((address, map, refclk))
         })();
+        let odm = pipeline.odm_pipes();
         h.modeset = Some(pipeline);
         let (address, map, refclk) = adopted.ok_or(Error::Invalid)?;
         let front = crate::amdgpu_navi22_scanout::Surface {
@@ -2123,6 +2124,7 @@ impl ColdBoot {
                 &h.gpu,
                 h.authority,
                 route.pipe,
+                odm,
                 front,
                 map,
                 output.timing,

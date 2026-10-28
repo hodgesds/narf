@@ -2227,6 +2227,10 @@ pub(crate) fn dispatch_card_for_file(
         // SETCRTC / PAGE_FLIP — blit dumb buffer into the active scanout.
         IoctlCmd::ModeSetCrtc => handle_setcrtc(card_index, &mode_state, arg, &ctx),
         IoctlCmd::ModePageFlip => handle_page_flip(card_index, &mode_state, arg, &ctx, events),
+        // DIRTYFB — the client wrote into a framebuffer on screen; a CRTC
+        // that copies (rather than scans the dumb buffer in place) presents
+        // it again. Xorg's modesetting driver relies on it for its shadow.
+        IoctlCmd::ModeDirtyFb => handle_dirty_fb(card_index, &mode_state, arg, &ctx),
         // CURSOR / CURSOR2 — a card with native cursor planes (Navi48)
         // updates the CRTC's cursor plane (drm_mode_cursor_universal).
         // Otherwise there is no hardware cursor plane: funnel the pointer
@@ -6408,6 +6412,7 @@ pub(crate) fn release_dumb_backing_ref(card_index: u32, gem_handle: u32) {
 // every 512th — so a steady 60 fps costs a line every ~8 seconds.
 
 static SETCRTC_N: AtomicU64 = AtomicU64::new(0);
+static DIRTYFB_N: AtomicU64 = AtomicU64::new(0);
 static PAGEFLIP_N: AtomicU64 = AtomicU64::new(0);
 static ATOMIC_N: AtomicU64 = AtomicU64::new(0);
 static BLIT_N: AtomicU64 = AtomicU64::new(0);
@@ -6774,6 +6779,60 @@ fn note_missing_backing(op: &str, fb_id: u32) {
             "  drm: {op} fb={fb_id} has no dumb backing — nothing presented (#{n})"
         );
     }
+}
+
+/// DRM_IOCTL_MODE_DIRTYFB (`drm_mode_dirtyfb_ioctl`, DRM_MASTER): the
+/// contents of `fb_id` changed. Linux's dumb-buffer drivers flush them to
+/// the display (`drm_atomic_helper_dirtyfb`); here every CRTC showing the
+/// framebuffer presents it again through the same path as SETCRTC. Clip
+/// rectangles are accepted and the whole frame is presented. A GEM
+/// framebuffer is scanned out in place and needs nothing.
+fn handle_dirty_fb(
+    card_index: u32,
+    mode_state: &Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    ctx: &DrmFileCtx,
+) -> Result<u64, FsError> {
+    if !ctx.is_master {
+        return Err(FsError::PermissionDenied);
+    }
+    // struct drm_mode_fb_dirty_cmd { fb_id, flags, color, num_clips: u32;
+    // clips_ptr: u64 } is 24 bytes.
+    // SAFETY: `arg` is the user drm_mode_fb_dirty_cmd pointer.
+    let raw = unsafe { copy_in(arg, 24)? };
+    let fb_id = u32::from_le_bytes(raw[..4].try_into().map_err(|_| FsError::InvalidData)?);
+    let (crtcs, frame) = {
+        let card = mode_state.lock();
+        let fb = card.framebuffer(fb_id).map_err(|_| FsError::NotFound)?;
+        let crtcs: Vec<u32> = card
+            .crtcs
+            .iter()
+            .filter(|c| c.primary_fb == Some(fb_id))
+            .map(|c| c.id)
+            .collect();
+        let frame = if fb.bo.is_some() {
+            None
+        } else {
+            card.dumb_backing(fb.gem_handle)
+                .map(|b| fb_frame(fb, b.phys))
+        };
+        (crtcs, frame)
+    };
+    let (log, n) = should_log(&DIRTYFB_N);
+    if log {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  drm: DIRTYFB #{n} fb={fb_id} crtcs={} backing={}",
+            crtcs.len(),
+            if frame.is_some() { "yes" } else { "NONE" }
+        );
+    }
+    if let Some(f) = frame {
+        for crtc in crtcs {
+            present_frame(card_index, crtc, f.clone(), None);
+        }
+    }
+    Ok(0)
 }
 
 /// DRM_IOCTL_MODE_PAGE_FLIP — same blit as SETCRTC, no vblank event.

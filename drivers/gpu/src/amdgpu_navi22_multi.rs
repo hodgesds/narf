@@ -233,9 +233,33 @@ impl Pipeline {
         )?;
         self.regs.write(self.otg_reg(OTG0_OTG_H_TIMING_CNTL), 1)
     }
+    /// The ODM half of `dcn20_enable_stream_timing` and
+    /// `dce110_apply_single_controller_ctx_to_hw` for a 2:1 stream, after
+    /// the master's timing and HDMI format stages (whose OTG step writes the
+    /// bypass H divider): both OPPs combined, then the slice OPP's rate
+    /// control, dimensions and black, and for HDMI its FMT, output CSC and
+    /// black colour (`opp_program_fmt` and `program_output_csc` run on every
+    /// ODM OPP).
+    pub(super) async fn combine_slice(
+        &mut self,
+        slice: &mut Slice,
+        width: u32,
+        v_active: u32,
+    ) -> Result<(), Error> {
+        self.set_odm_combine([self.route.pipe, slice.pipe], width)?;
+        self.mpc_rate_control_off(slice.pipe)?;
+        slice.opp.program(Encoding::Rgb, width, v_active)?;
+        slice.opp.set_blank(true)?;
+        if let Some(stream) = self.hdmi.filter(|_| self.connector.signal == Signal::Hdmi) {
+            slice.format.program_fmt(stream.format)?;
+            slice.format.program_ocsc(stream.format).await?;
+            slice.format.set_blank_color(stream.format)?;
+        }
+        Ok(())
+    }
     /// `optc3_set_odm_bypass`: one segment from this OTG's own OPP, the
     /// others parked, no division and no memory.
-    fn set_odm_bypass(&mut self) -> Result<(), Error> {
+    pub(super) fn set_odm_bypass(&mut self) -> Result<(), Error> {
         let pipe = u32::from(self.route.pipe);
         self.regs.write(
             self.odm_reg(ODM0_OPTC_DATA_SOURCE_SELECT),
@@ -257,7 +281,7 @@ impl Pipeline {
     }
     /// `dcn20_power_on_plane_resources` for pipe `pipe` (an ODM slice);
     /// as [`Pipeline::power_on_plane`].
-    async fn power_on_pipe(&mut self, pipe: u8) -> Result<(), Error> {
+    pub(super) async fn power_on_pipe(&mut self, pipe: u8) -> Result<(), Error> {
         let p = u64::from(pipe);
         let request = self.d2(DC_IP_REQUEST_CNTL);
         self.regs.write(request, 1)?;
@@ -281,7 +305,7 @@ impl Pipeline {
             .update(clock, HUBP_CLOCK_ENABLE, HUBP_CLOCK_ENABLE)
     }
     /// `HUBP_UNDERFLOW_STATUS` of pipe `pipe`, cleared or read.
-    fn hubp_underflow(&mut self, pipe: u8, clear: bool) -> Result<u8, Error> {
+    pub(super) fn hubp_underflow(&mut self, pipe: u8, clear: bool) -> Result<u8, Error> {
         let reg = self.d2(HUBP0_DCHUBP_CNTL + u64::from(pipe) * HUBP_STRIDE);
         if clear {
             self.regs
@@ -291,7 +315,7 @@ impl Pipeline {
         Ok(((self.regs.read(reg)? & HUBP_UNDERFLOW_STATUS) >> 28) as u8)
     }
     /// `hubp2_program_deadline`'s cursor half for pipe `pipe`.
-    fn program_cursor_ttu_at(
+    pub(super) fn program_cursor_ttu_at(
         &mut self,
         pipe: u8,
         ttu: Option<dml30::CursorTtu>,
@@ -313,14 +337,40 @@ impl Pipeline {
     }
 }
 
-/// An ODM secondary pipe's front end: the second half of the line.
+/// An ODM secondary pipe's front end: the second half of the line, and
+/// its OPP's output format (Linux programs FMT and the output CSC on every
+/// ODM OPP of the stream).
 #[derive(Debug)]
 pub struct Slice {
     pub pipe: u8,
-    hubp: Hubp,
-    dpp: Dpp,
-    mpc: Mpc,
-    opp: Opp,
+    pub(super) hubp: Hubp,
+    pub(super) dpp: Dpp,
+    pub(super) mpc: Mpc,
+    pub(super) opp: Opp,
+    pub(super) format: hdmi::Formatter,
+}
+impl Slice {
+    /// # Safety
+    /// The caller exclusively owns `pipe`'s HUBP, DPP, MPCC, OPP/FMT and MPC
+    /// output CSC as its stream's ODM secondary, with PCI authority and a
+    /// permanent mapping.
+    pub(super) unsafe fn new(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pipe: u8,
+    ) -> Result<Self, Error> {
+        // SAFETY: forwarded.
+        unsafe {
+            Ok(Self {
+                pipe,
+                hubp: Hubp::new(gpu, authority, pipe)?,
+                dpp: Dpp::new(gpu, authority, pipe)?,
+                mpc: Mpc::new(gpu, authority, pipe)?,
+                opp: Opp::new(gpu, authority, pipe)?,
+                format: hdmi::Formatter::new(gpu, authority, pipe)?,
+            })
+        }
+    }
 }
 
 // ── Requests and admission ─────────────────────────────────────────────
@@ -380,6 +430,7 @@ fn dml_stream(
             bits_per_pixel_x16: c.bpp_x16,
         }),
         phy_khz,
+        odm: dml30::Odm::None,
     }
 }
 
@@ -533,6 +584,25 @@ pub trait Links: Send {
         address: u32,
         data: &[u8],
     ) -> impl Future<Output = Result<(), Error>> + Send;
+    /// One HDMI SCDC register on connector `link`'s DDC (I2C 0x54); a
+    /// connector without SCDC fails, as [`Aux::scdc_read`].
+    fn scdc_read(
+        &mut self,
+        link: usize,
+        offset: u8,
+    ) -> impl Future<Output = Result<u8, Error>> + Send {
+        let _ = (link, offset);
+        core::future::ready(Err(Error::Hdmi(hdmi::Error::Scdc)))
+    }
+    fn scdc_write(
+        &mut self,
+        link: usize,
+        offset: u8,
+        value: u8,
+    ) -> impl Future<Output = Result<(), Error>> + Send {
+        let _ = (link, offset, value);
+        core::future::ready(Err(Error::Hdmi(hdmi::Error::Scdc)))
+    }
 }
 /// One connector's AUX out of [`Links`].
 pub struct On<'a, L: Links> {
@@ -551,6 +621,12 @@ impl<L: Links> Aux for On<'_, L> {
     async fn write(&mut self, address: u32, data: &[u8]) -> Result<(), Error> {
         self.links.write(self.link, address, data).await
     }
+    async fn scdc_read(&mut self, offset: u8) -> Result<u8, Error> {
+        self.links.scdc_read(self.link, offset).await
+    }
+    async fn scdc_write(&mut self, offset: u8, value: u8) -> Result<(), Error> {
+        self.links.scdc_write(self.link, offset, value).await
+    }
 }
 /// The board's connectors through [`crate::amdgpu_navi22_display::Display`].
 impl Links for crate::amdgpu_navi22_display::Display {
@@ -568,6 +644,22 @@ impl Links for crate::amdgpu_navi22_display::Display {
             index: link,
         }
         .write(address, data)
+        .await
+    }
+    async fn scdc_read(&mut self, link: usize, offset: u8) -> Result<u8, Error> {
+        crate::amdgpu_navi22_display::DisplayAux {
+            display: self,
+            index: link,
+        }
+        .scdc_read(offset)
+        .await
+    }
+    async fn scdc_write(&mut self, link: usize, offset: u8, value: u8) -> Result<(), Error> {
+        crate::amdgpu_navi22_display::DisplayAux {
+            display: self,
+            index: link,
+        }
+        .scdc_write(offset, value)
         .await
     }
 }
@@ -972,15 +1064,7 @@ impl Group {
         for lease in &leases {
             let slice = match lease.odm_pipe {
                 // SAFETY: the pipe is this stream's lease, owned exclusively.
-                Some(pipe) => Some(unsafe {
-                    Slice {
-                        pipe,
-                        hubp: Hubp::new(&self.gpu, self.authority, pipe)?,
-                        dpp: Dpp::new(&self.gpu, self.authority, pipe)?,
-                        mpc: Mpc::new(&self.gpu, self.authority, pipe)?,
-                        opp: Opp::new(&self.gpu, self.authority, pipe)?,
-                    }
-                }),
+                Some(pipe) => Some(unsafe { Slice::new(&self.gpu, self.authority, pipe)? }),
                 None => None,
             };
             self.slices.push(slice);
@@ -1205,7 +1289,16 @@ impl Group {
         let m = &mut self.members[k];
         m.at(Step::PixelClock);
         m.enable_optc_clock().await?;
-        m.program_pix_clk(tables, timing.pixel_clock_khz)?;
+        // The first stream on a shared PHY PLL powers it down; later
+        // sharers only add their OTG (streams are enabled in lease order).
+        let fresh = match lease.route.clock {
+            ClockSource::Pll(pll) => !self.leases[..k]
+                .iter()
+                .any(|l| l.route.clock == ClockSource::Pll(pll)),
+            ClockSource::DpDto => true,
+        };
+        let m = &mut self.members[k];
+        m.program_pix_clk(tables, timing.pixel_clock_khz, plane.odm.pipes(), fresh)?;
         self.reached[k] = Step::Timing;
         m.at(Step::Timing);
         let sync = GlobalSync {
@@ -1219,16 +1312,13 @@ impl Group {
             Signal::DisplayPort => m.otg.program_timing(&timing, &sync)?,
         }
         let width = timing.h_active / plane.odm.pipes();
-        if let Some(slice) = self.slices[k].as_mut() {
-            m.set_odm_combine([lease.route.pipe, slice.pipe], width)?;
-            m.mpc_rate_control_off(slice.pipe)?;
-            slice.opp.program(Encoding::Rgb, width, timing.v_active)?;
-            slice.opp.set_blank(true)?;
-        }
         m.mpc_rate_control_off(lease.route.pipe)?;
         m.opp.program(Encoding::Rgb, width, timing.v_active)?;
         m.opp.set_blank(true)?;
         m.hdmi_format().await?;
+        if let Some(slice) = self.slices[k].as_mut() {
+            m.combine_slice(slice, width, timing.v_active).await?;
+        }
         self.reached[k] = Step::Start;
         m.at(Step::Start);
         m.otg.enable()?;
@@ -1601,6 +1691,7 @@ impl Group {
             }
             if reached >= Step::PixelClock {
                 record(m.disable_optc_clock());
+                record(m.power_down_pix_clk(tables));
             }
             if lease.dsc {
                 if let Some(dsc) = self.dsc.as_mut() {

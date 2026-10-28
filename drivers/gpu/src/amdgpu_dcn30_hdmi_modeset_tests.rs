@@ -618,3 +618,103 @@ kernel_test_in!(
     "drivers/gpu/dcn30-hdmi",
     dcn30_hdmi_freesync_timing_packet_and_metadata_share_one_live_stream
 );
+
+/// 1280x720 CEA geometry at 371.25 MHz (5x 720p60): a scrambled stream
+/// whose surface stays small enough for the model's VRAM.
+const DTD_720P_371: [u8; 18] = [
+    0x05, 0x91, 0x00, 0x72, 0x51, 0xd0, 0x1e, 0x20, 0x6e, 0x28, 0x55, 0x00, 0, 0, 0, 0, 0, 0x1e,
+];
+
+fn dcn30_hdmi_odm_stream_halves_otg_pixel_clock() -> TestResult {
+    let vram = Vram::new(8 << 20);
+    let e = edid(DTD_720P_371, &[vsdb(0, 68), hf_vsdb(120, 0x88)]);
+    // DISPCLK capped at 350 MHz: DML30 needs both pipes for 371.25 MHz.
+    let mut lit = match light_with(e, 8, &vram, |b| b.display_cap(350)) {
+        Ok(l) => l,
+        Err(why) => return TestResult::Fail(why),
+    };
+    let p = lit.pipe;
+    let marker = |slot: u32, i: u32| lit.bench.get(MARK + 16 * slot + i);
+    let Some([(left, 0, 640), (5, 640, 640)]) = lit.pipeline.odm_pipes() else {
+        return TestResult::Fail("no ODM 2:1 slices under a 350 MHz DISPCLK cap");
+    };
+    if u32::from(left) != p {
+        return TestResult::Fail("ODM master is not the route's pipe");
+    }
+    // get_pixel_clock_parameters halves the PLL target for the OTG's two
+    // pixels per clock; the transmitter keeps the character rate.
+    if marker(m::SLOT_PIXEL_CLOCK, 0) != 1_856_250 {
+        return TestResult::Fail("SetPixelClock not at the halved OTG rate");
+    }
+    if marker(m::SLOT_TRANSMITTER, 1) != 37_125 {
+        return TestResult::Fail("transmitter not at the TMDS character rate");
+    }
+    // optc3_set_odm_combine survives the HDMI format stages: both OPPs as
+    // segments, 640-wide, H timing divided by two.
+    if lit.bench.get(d2(0x1acb + p * 0x10)) != 1 | p << 8 | 5 << 12
+        || lit.bench.get(d2(0x1ace + p * 0x10)) & 0x1fff != 640
+        || lit.bench.get(d2(0x1b2e + p * 0x80)) & 0x3 != 1
+    {
+        return TestResult::Fail("ODM combine lost after HDMI format");
+    }
+    // The right half: HUBP 5 on the master's VTG from x 640, OPP 5 at the
+    // slice size, MPCC 5 into OPP 5.
+    if (lit.bench.get(d2(0x5f3 + 5 * 0xdc)) >> 4) & 0xf != p
+        || lit.bench.get(d2(0x5e9 + 5 * 0xdc)) != 640
+        || lit.bench.get(d2(0x1856 + 5 * 0x5a)) != 720 | 640 << 16
+        || lit.bench.get(d2(0x1856 + p * 0x5a)) != 720 | 640 << 16
+        || lit.bench.get(d3(0x580 + 5 * 4)) & 0xf != 5
+    {
+        return TestResult::Fail("ODM slice front end");
+    }
+    // opp_program_fmt and the output CSC on both ODM OPPs.
+    let fmt = |pipe: u32, reg: u32| lit.bench.get(d2(reg + pipe * 0x5a));
+    let csc = |pipe: u32, reg: u32| lit.bench.get(d3(reg + pipe * 0xd));
+    if fmt(p, 0x1841) != fmt(5, 0x1841)
+        || fmt(p, 0x1845) != fmt(5, 0x1845)
+        || csc(p, 0x599) != csc(5, 0x599)
+        || csc(p, 0x59a) != csc(5, 0x59a)
+        || csc(5, 0x599) != 1
+    {
+        return TestResult::Fail("slice OPP format differs from the master's");
+    }
+    if let Err(why) = stop(&mut lit) {
+        return TestResult::Fail(why);
+    }
+    // optc3_set_odm_bypass after the OTG stops.
+    if lit.bench.get(d2(0x1acb + p * 0x10)) & 0x3 != 0
+        || lit.bench.get(d2(0x1b2e + p * 0x80)) & 0x3 != 0
+    {
+        return TestResult::Fail("ODM bypass not restored on stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi",
+    dcn30_hdmi_odm_stream_halves_otg_pixel_clock
+);
+
+fn dcn30_hdmi_above_340mhz_stays_on_one_pipe_when_dispclk_allows() -> TestResult {
+    // Working Linux lights this board's 533.25 MHz 4K60 on one OTG and OPP
+    // at the full pixel clock (its two HUBPs are an MPC split): above
+    // 340 MHz alone is no reason to divide the OTG.
+    let vram = Vram::new(8 << 20);
+    let e = edid(DTD_720P_371, &[vsdb(0, 68), hf_vsdb(120, 0x88)]);
+    let mut lit = match light(e, 8, &vram) {
+        Ok(l) => l,
+        Err(why) => return TestResult::Fail(why),
+    };
+    if lit.pipeline.odm_pipes().is_some()
+        || lit.bench.get(MARK + 16 * m::SLOT_PIXEL_CLOCK) != 3_712_500
+    {
+        return TestResult::Fail("a stream one pipe carries was split");
+    }
+    if let Err(why) = stop(&mut lit) {
+        return TestResult::Fail(why);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi",
+    dcn30_hdmi_above_340mhz_stays_on_one_pipe_when_dispclk_allows
+);

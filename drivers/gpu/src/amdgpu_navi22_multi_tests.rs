@@ -184,7 +184,20 @@ impl Links for TestLinks {
         let sink = self.sinks.get_mut(&link).ok_or(Error::Aux)?;
         Aux::write(sink, address, data).await
     }
+    /// An HDMI 2.0 sink's SCDC: Sink_Version 1, writes logged.
+    async fn scdc_read(&mut self, _: usize, offset: u8) -> Result<u8, Error> {
+        Ok(u8::from(offset == 1))
+    }
+    async fn scdc_write(&mut self, _: usize, offset: u8, value: u8) -> Result<(), Error> {
+        self.model.0.lock().log.push(m::Write {
+            dword: SCDC_WRITE | u32::from(offset),
+            value: u32::from(value),
+        });
+        Ok(())
+    }
 }
+/// SCDC writes in the model log: `SCDC_WRITE | offset` = value.
+const SCDC_WRITE: u32 = 0x2000_0000;
 
 /// A sink whose preferred (only) mode is `dtd`.
 fn sink_with(signal: Signal, dpcd: Option<[u8; 16]>, dtd: [u8; 18]) -> Sink {
@@ -424,10 +437,26 @@ fn navi22_multi_identical_hdmi_timings_share_one_phy_pll() -> TestResult {
     // dcn3_program_pix_clk runs for each OTG on the shared PLL: two
     // SetPixelClock calls, one PLL, OTG 0 and 1.
     let log = bench.log();
+    // Power-downs (pixclk 0, CRT mode) aside: the first stream's PLL is
+    // powered down once before it is programmed, never between sharers.
+    let word1 = MARK + 16 * m::SLOT_PIXEL_CLOCK + 1;
+    let is_down = |w: &m::Write| (w.value >> 16) & 0xff == 0x0f;
+    let programs: Vec<usize> = (0..log.len())
+        .filter(|&i| log[i].dword == word1 && !is_down(&log[i]))
+        .collect();
+    let downs_before = (0..programs.first().copied().unwrap_or(0))
+        .filter(|&i| log[i].dword == word1 && is_down(&log[i]))
+        .count();
+    let downs_between = programs
+        .windows(2)
+        .any(|p| (p[0]..p[1]).any(|i| log[i].dword == word1 && is_down(&log[i])));
+    if downs_before == 0 || downs_between {
+        return TestResult::Fail("shared PLL powered down between sharers");
+    }
     let calls: Vec<(u32, u32)> = log
         .iter()
         .enumerate()
-        .filter(|(_, w)| w.dword == MARK + 16 * m::SLOT_PIXEL_CLOCK + 1)
+        .filter(|(_, w)| w.dword == word1 && !is_down(w))
         .map(|(i, w)| {
             (
                 w.value & 0xff,
@@ -479,6 +508,16 @@ fn navi22_multi_odm_combines_two_pipes_for_one_stream() -> TestResult {
         && any(&log, |w| w.dword == d2(0x1b2e) && w.value == 1))
     {
         return TestResult::Fail("ODM combine registers");
+    }
+    // get_pixel_clock_parameters halves the request for 2:1: the DTO
+    // drives an OTG that takes two pixels per clock.
+    let pixel_khz = group.plans()[0].timing.pixel_clock_khz;
+    let (half, _) = dp_dto(pixel_khz / 2);
+    let (full, _) = dp_dto(pixel_khz);
+    if !any(&log, |w| w.dword == d1(0x81) && w.value == half)
+        || any(&log, |w| w.dword == d1(0x81) && w.value == full)
+    {
+        return TestResult::Fail("ODM DP DTO not at the halved OTG rate");
     }
     // The right half: HUBP 5 on OTG 0's timing from pixel 960, OPP 5
     // blanking only its half, MPCC 5 into OPP 5.
@@ -735,4 +774,80 @@ fn navi22_multi_pll_sharing_includes_tmds_encoding_depth_and_target() -> TestRes
 kernel_test_in!(
     "drivers/gpu/navi22-multi",
     navi22_multi_pll_sharing_includes_tmds_encoding_depth_and_target
+);
+
+/// 1280x720 CEA geometry at 371.25 MHz: a scrambled HDMI 2.0 stream.
+const DTD_720P_371: [u8; 18] = [
+    0x05, 0x91, 0x00, 0x72, 0x51, 0xd0, 0x1e, 0x20, 0x6e, 0x28, 0x55, 0x00, 0, 0, 0, 0, 0, 0x1e,
+];
+
+fn navi22_multi_hdmi_odm_keeps_combine_through_hdmi_format() -> TestResult {
+    use crate::amdgpu_dcn30_hdmi::tests::{edid, hf_vsdb, vsdb};
+    let bench = Bench::new();
+    // DISPCLK capped at 350 MHz: one pipe cannot carry 371.25 MHz.
+    bench.display_cap(350);
+    let mut links = TestLinks {
+        model: bench.model.clone(),
+        sinks: BTreeMap::new(),
+        extra: BTreeMap::new(),
+        hub: None,
+    };
+    let sink = Sink {
+        edid: edid(DTD_720P_371, &[vsdb(0, 68), hf_vsdb(120, 0x88)]),
+        preferred: None,
+        hdmi: true,
+        dpcd: None,
+    };
+    let requests = [request(0, m::connector(Signal::Hdmi, 3, 3), sink)];
+    let (group, result, stopped) = run(light(&bench, &requests, &mut links, 10));
+    if result.is_err() || stopped.is_err() {
+        return TestResult::Fail("scrambled HDMI on ODM refused");
+    }
+    if group.leases()[0].odm_pipe != Some(5) {
+        return TestResult::Fail("no ODM lease");
+    }
+    let log = bench.log();
+    // The scrambled link's TMDS_Config reached the sink through Links.
+    if !any(&log, |w| w.dword == SCDC_WRITE | 0x20 && w.value == 3) {
+        return TestResult::Fail("SCDC TMDS_Config not forwarded");
+    }
+    // optc3_set_odm_combine's divide-by-two is the last H timing write
+    // before the teardown's bypass: the HDMI format stage must not undo it.
+    let combine = log
+        .iter()
+        .position(|w| w.dword == d2(0x1acb) && w.value == 1 | 5 << 12);
+    let bypass = combine.and_then(|c| {
+        log[c..]
+            .iter()
+            .position(|w| w.dword == d2(0x1acb) && w.value & 0x3 == 0)
+            .map(|b| c + b)
+    });
+    let (Some(c), Some(b)) = (combine, bypass) else {
+        return TestResult::Fail("ODM combine/bypass not programmed");
+    };
+    let h_timing = |w: &&m::Write| w.dword == d2(0x1b2e);
+    let divided = log[c..b]
+        .iter()
+        .position(|w| h_timing(&w) && w.value & 0x3 == 1);
+    let cleared = divided.is_some_and(|d| {
+        log[c + d..b]
+            .iter()
+            .any(|w| h_timing(&w) && w.value & 0x3 != 1)
+    });
+    if divided.is_none() || cleared {
+        return TestResult::Fail("HDMI format cleared the ODM H divider");
+    }
+    // The halved OTG rate for SetPixelClock; slice OPP format as the master.
+    if !any(&log, |w| {
+        w.dword == MARK + 16 * m::SLOT_PIXEL_CLOCK && w.value == 1_856_250
+    }) || bench.get(d3(0x599 + 5 * 0xd)) != bench.get(d3(0x599))
+        || bench.get(d2(0x1845 + 5 * 0x5a)) != bench.get(d2(0x1845))
+    {
+        return TestResult::Fail("ODM HDMI clock or slice format");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-multi",
+    navi22_multi_hdmi_odm_keeps_combine_through_hdmi_format
 );

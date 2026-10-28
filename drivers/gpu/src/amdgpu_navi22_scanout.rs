@@ -139,23 +139,35 @@ impl Scanout {
     /// HUBP was programmed with), keeps it reserved for this owner's
     /// lifetime and serializes every access to the pipe's HUBP/DPP/OTG/MPC
     /// registers with this owner; permanent mappings and PCI authority.
+    /// `odm` is the pipeline's ODM 2:1 slices (pipe, `viewport_x`, width;
+    /// the first is `pipe`): flips and the cursor then drive both HUBPs.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn new(
         gpu: &AmdGpu,
         authority: Cap<BusDeviceCap, Write>,
         pipe: u8,
+        odm: Option<[(u8, u32, u32); 2]>,
         front: Surface,
         map: narf_bus::MmioRegion,
         timing: Timing,
         refclk_khz: u32,
     ) -> Result<Self, Error> {
-        // SAFETY: forwarded pipe ownership.
-        let mut flip = unsafe { Flip::new(gpu, authority, pipe) }?;
+        // SAFETY: forwarded pipe ownership, the ODM secondary's included.
+        let (mut flip, cursor) = unsafe {
+            let flip = Flip::new(gpu, authority, pipe)?;
+            let cursor = Cursor::new(gpu, authority, pipe)?;
+            match odm {
+                None => (flip, cursor),
+                Some(slices) => (
+                    flip.with_odm(gpu, slices[1].0)?,
+                    cursor.with_odm(gpu, slices)?,
+                ),
+            }
+        };
         flip.adopt(front.address);
         Ok(Self {
             flip,
-            // SAFETY: as above.
-            cursor: unsafe { Cursor::new(gpu, authority, pipe) }?,
+            cursor,
             timing,
             refclk_khz,
             buffers: Buffers::new(front),

@@ -44,6 +44,7 @@ pub(crate) const OTG_V_BLANK_START_END: u64 = 0x1b36; // linux: mmOTG0_OTG_V_BLA
 pub(crate) const OTG_STATUS_POSITION: u64 = 0x1b4a; // linux: mmOTG0_OTG_STATUS_POSITION
 pub(crate) const OTG_STATUS_FRAME_COUNT: u64 = 0x1b4c; // linux: mmOTG0_OTG_STATUS_FRAME_COUNT
 pub(crate) const OTG_GLOBAL_SYNC_STATUS: u64 = 0x1b8a; // linux: mmOTG0_OTG_GLOBAL_SYNC_STATUS
+pub(crate) const OTG_MASTER_UPDATE_LOCK: u64 = 0x1b8b; // linux: mmOTG0_OTG_MASTER_UPDATE_LOCK
 pub(crate) const OTG_STRIDE: u64 = 0x80; // linux: mmOTG1_OTG_CONTROL - mmOTG0_OTG_CONTROL
 #[cfg(feature = "kernel-test")]
 // linux: n/a (NARF test bound)
@@ -72,6 +73,10 @@ const VSTARTUP_EVENT_CLEAR: u32 = 1 << 4;
 const VUPDATE_NO_LOCK_INT_EN: u32 = 1 << 12;
 // linux: OTG0_OTG_GLOBAL_SYNC_STATUS__VUPDATE_NO_LOCK_EVENT_CLEAR_MASK
 const VUPDATE_NO_LOCK_EVENT_CLEAR: u32 = 1 << 16;
+// linux: OTG0_OTG_MASTER_UPDATE_LOCK__UPDATE_LOCK_STATUS_MASK
+const UPDATE_LOCK_STATUS: u32 = 1 << 8;
+/// `optc1_lock`'s REG_WAIT bound (10 polls).
+const UPDATE_LOCK_POLLS: u32 = 10; // linux: n/a (optc1_lock REG_WAIT 1 us x 10)
 const COUNT_MASK: u32 = 0x7fff; // linux: OTG0_OTG_STATUS_POSITION__OTG_VERT_COUNT_MASK
                                 // linux: OTG0_OTG_STATUS_FRAME_COUNT__OTG_FRAME_COUNT_MASK
 pub(crate) const FRAME_MASK: u32 = 0x00ff_ffff;
@@ -134,13 +139,20 @@ pub(crate) struct Engine<I: Io> {
     pub(crate) io: I,
     pub(crate) authority: Cap<BusDeviceCap, Write>,
     pub(crate) pipe: u8,
+    /// The ODM 2:1 secondary HUBP on the same OTG, fetching the same surface
+    /// from its own viewport.
+    pub(crate) odm: Option<u8>,
     /// The surface the last flip requested (`hubp->request_address`).
     pub(crate) requested: Option<u64>,
 }
 impl<I: Io> Engine<I> {
     fn hubp(&self, reg: u64) -> u64 {
-        reg + u64::from(self.pipe) * HUBP_STRIDE
+        Self::hubp_of(self.pipe, reg)
     }
+    fn hubp_of(pipe: u8, reg: u64) -> u64 {
+        reg + u64::from(pipe) * HUBP_STRIDE
+    }
+
     fn otg(&self, reg: u64) -> u64 {
         reg + u64::from(self.pipe) * OTG_STRIDE
     }
@@ -167,19 +179,49 @@ impl<I: Io> Engine<I> {
         if address == 0 || address >= 1 << ADDRESS_BITS || address % ADDRESS_ALIGN != 0 {
             return Err(Error::Invalid);
         }
-        let flip = self.hubp(FLIP_CONTROL);
+        if self.odm.is_none() {
+            return self.program_hubp(self.pipe, address);
+        }
+        // commit_planes_for_stream's pipe_control_lock (optc1_lock): every
+        // ODM slice's address latches at the same VUPDATE. The lock is
+        // always released so a failure cannot freeze the OTG's updates.
+        self.otg_lock(true)?;
+        let pipes: [Option<u8>; 2] = [Some(self.pipe), self.odm];
+        let mut result = Ok(());
+        for pipe in pipes.into_iter().flatten() {
+            result = result.and_then(|()| self.program_hubp(pipe, address));
+        }
+        result.and(self.otg_lock(false))
+    }
+    /// One HUBP's half of [`Engine::program_flip`].
+    fn program_hubp(&mut self, pipe: u8, address: u64) -> Result<(), Error> {
+        let flip = Self::hubp_of(pipe, FLIP_CONTROL);
         self.update(flip, FLIP_TYPE, 0)?;
-        self.update(self.hubp(VMID_SETTINGS_0), VMID_MASK, 0)?;
+        self.update(Self::hubp_of(pipe, VMID_SETTINGS_0), VMID_MASK, 0)?;
         self.update(flip, STEREO, 0)?;
-        self.update(self.hubp(SURFACE_CONTROL), TMZ, 0)?;
-        let high = self.hubp(PRIMARY_SURFACE_ADDRESS_HIGH);
-        let low = self.hubp(PRIMARY_SURFACE_ADDRESS);
+        self.update(Self::hubp_of(pipe, SURFACE_CONTROL), TMZ, 0)?;
+        let high = Self::hubp_of(pipe, PRIMARY_SURFACE_ADDRESS_HIGH);
+        let low = Self::hubp_of(pipe, PRIMARY_SURFACE_ADDRESS);
         self.access(|io| {
             io.write(high, (address >> 32) as u32 & ADDRESS_HIGH_MASK);
             // The low half last: it latches the high half and arms the flip.
             io.write(low, address as u32);
         })?;
         self.requested = Some(address);
+        Ok(())
+    }
+    /// `optc1_lock` / `optc1_unlock` of this OTG (its LOCK_SEL was set when
+    /// the pipeline lit it). Linux's status wait only logs a timeout.
+    fn otg_lock(&mut self, lock: bool) -> Result<(), Error> {
+        let reg = self.otg(OTG_MASTER_UPDATE_LOCK);
+        self.access(|io| io.write(reg, u32::from(lock)))?;
+        if lock {
+            for _ in 0..UPDATE_LOCK_POLLS {
+                if self.read(reg)? & UPDATE_LOCK_STATUS != 0 {
+                    break;
+                }
+            }
+        }
         Ok(())
     }
     /// optc2_program_manual_trigger, after the new address is armed. This
@@ -190,17 +232,26 @@ impl<I: Io> Engine<I> {
         self.access(|io| io.write(reg, 1))
     }
     /// `hubp2_is_flip_pending` against the last requested surface.
+    /// With ODM, `dc_plane_get_status` ORs it over every slice's HUBP.
     pub(crate) fn pending(&mut self) -> Result<bool, Error> {
         let requested = self.requested.ok_or(Error::Invalid)?;
-        if self.read(self.hubp(FLIP_CONTROL))? & FLIP_PENDING != 0 {
-            return Ok(true);
+        let pipes: [Option<u8>; 2] = [Some(self.pipe), self.odm];
+        for pipe in pipes.into_iter().flatten() {
+            if self.read(Self::hubp_of(pipe, FLIP_CONTROL))? & FLIP_PENDING != 0
+                || self.in_use_of(pipe)? != requested
+            {
+                return Ok(true);
+            }
         }
-        Ok(self.in_use()? != requested)
+        Ok(false)
     }
     /// SURFACE_EARLIEST_INUSE: the oldest surface fetch still references.
     pub(crate) fn in_use(&mut self) -> Result<u64, Error> {
-        let low = self.read(self.hubp(EARLIEST_INUSE))?;
-        let high = self.read(self.hubp(EARLIEST_INUSE_HIGH))? & ADDRESS_HIGH_MASK;
+        self.in_use_of(self.pipe)
+    }
+    fn in_use_of(&mut self, pipe: u8) -> Result<u64, Error> {
+        let low = self.read(Self::hubp_of(pipe, EARLIEST_INUSE))?;
+        let high = self.read(Self::hubp_of(pipe, EARLIEST_INUSE_HIGH))? & ADDRESS_HIGH_MASK;
         Ok(u64::from(high) << 32 | u64::from(low))
     }
     /// Adopt the surface the pipeline programmed at activation.
@@ -264,7 +315,9 @@ impl<I: Io> Engine<I> {
             // linux-lit: 0x1b9b=mmOTG0_OTG_DRR_CONTROL
             // linux-lit: 0x7fff0000=OTG0_OTG_DRR_CONTROL__OTG_V_TOTAL_LAST_USED_BY_DRR_MASK
             let total = if drr {
-                (self.read(self.otg(0x1b9b))? >> 16 & 0x7fff) + 1
+                // optc2_get_last_used_drr_vtotal returns this actual line
+                // count verbatim; unlike MIN/MAX, it is not total minus one.
+                self.read(self.otg(0x1b9b))? >> 16 & 0x7fff
             } else {
                 0
             };
@@ -356,11 +409,23 @@ impl Flip {
             },
             authority,
             pipe,
+            odm: None,
             requested: None,
         }))
     }
     pub fn pipe(&self) -> u8 {
         self.0.pipe
+    }
+    /// Also flip ODM 2:1 secondary `pipe` (same OTG, same surface).
+    ///
+    /// # Safety
+    /// As [`Flip::new`], for `pipe`'s HUBP too.
+    pub unsafe fn with_odm(mut self, gpu: &AmdGpu, pipe: u8) -> Result<Self, Error> {
+        if pipe == self.0.pipe || pipe >= Profile::resolve(gpu)?.pipes() {
+            return Err(Error::Invalid);
+        }
+        self.0.odm = Some(pipe);
+        Ok(self)
     }
     /// Position and last completed DRR total sampled in the same frame.
     pub fn position_drr(&mut self) -> Result<(Position, u32), Error> {

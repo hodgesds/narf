@@ -9,6 +9,8 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 // the test pass with the same mistaken request number as the implementation.
 const ADDFB: u32 = 0xc01c_64ae;
 const RMFB: u32 = 0xc004_64af;
+/// `DRM_IOWR('d', 0xB1, struct drm_mode_fb_dirty_cmd)` (24 bytes).
+const DIRTYFB: u32 = 0xc018_64b1;
 
 fn request(handle: u32, bpp: u32, depth: u32, pitch: u32) -> [u8; 28] {
     let mut arg = [0u8; 28];
@@ -183,6 +185,9 @@ fn legacy_framebuffer_permissions_and_linux_request_numbers() -> TestResult {
         || crate::drm_uapi::DRM_IOCTL_MODE_RMFB != RMFB
         || IoctlCmd::from_raw(ADDFB) != IoctlCmd::ModeAddFb
         || IoctlCmd::from_raw(RMFB) != IoctlCmd::ModeRmFb
+        // Xorg's modesetting probes DIRTYFB once and, if it is unknown,
+        // never reports shadow updates to a CRTC that copies its buffer.
+        || IoctlCmd::from_raw(DIRTYFB) != IoctlCmd::ModeDirtyFb
     {
         return TestResult::Fail("framebuffer ioctl numbers differ from Linux UAPI");
     }
