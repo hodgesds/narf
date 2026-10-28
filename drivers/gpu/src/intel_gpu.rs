@@ -191,20 +191,40 @@ pub enum Generation {
 impl Generation {
     /// Map the sub-architecture to the BAR0 region-enumeration
     /// generation. TGL / ADL / RPL share the Xe-LP MMIO map
-    /// (`RegionGeneration::Gen12`); Meteor Lake's Xe-LPG map is
-    /// out of scope for the Stage-0 enumeration.
+    /// (`RegionGeneration::Gen12`); Meteor Lake maps to the
+    /// Xe-LPG region table (#1016); Panther Lake's Xe3-LPD map
+    /// is not modelled yet.
     pub const fn region_generation(self) -> Option<RegionGeneration> {
         match self {
             Generation::TigerLake | Generation::AlderLake => Some(RegionGeneration::Gen12),
-            Generation::MeteorLake | Generation::PantherLake => None,
+            Generation::MeteorLake => Some(RegionGeneration::XeLpg),
+            Generation::PantherLake => None,
         }
     }
 
     /// Whether this lane programs the display engine for the
-    /// generation. Only Gen12 (TGL/ADL/RPL) has a validated
-    /// register sequence; MTL/ARL/PTL identify and announce but
-    /// skip modeset until #1016 lands their display engines.
+    /// generation. Gen12 (TGL/ADL/RPL) and Meteor Lake (Xe-LPG,
+    /// #1016) have validated register sequences. Panther Lake
+    /// stays gated off: Xe3-LPD is a different display IP
+    /// generation from Xe-LPG (its own PHY arrangement, PLL
+    /// tables, and widened clock-select fields), so claiming it
+    /// from the MTL sequence would claim support that cannot be
+    /// driven — the exact failure this gate exists to prevent.
     pub const fn display_supported(self) -> bool {
+        matches!(
+            self,
+            Generation::TigerLake | Generation::AlderLake | Generation::MeteorLake
+        )
+    }
+
+    /// Whether the backlight PWM install is valid for the
+    /// generation. The install programs the Gen12 BXT-style PWM
+    /// block; MTL's backlight path is owned by the backlight
+    /// composition lane (PR #1037, #947/#949/#951), which flips
+    /// this predicate when the MTL registers land. Keeping it
+    /// separate from `display_supported` lets the MTL modeset
+    /// ship without claiming a backlight it cannot drive.
+    pub const fn backlight_supported(self) -> bool {
         matches!(self, Generation::TigerLake | Generation::AlderLake)
     }
 }
@@ -823,8 +843,8 @@ pub struct IntelGpu {
     pub gmd_id: u32,
     pub active_scanout: narf_lib::sync::IrqSafeSpinLock<Option<ActiveScanout>>,
     /// Owned scanout backing, set by probe when the allocation
-    /// and plane programming succeed. `None` on MTL/PTL (display
-    /// skipped) or when allocation failed (logged at probe).
+    /// and plane programming succeed. `None` on PTL (display
+    /// gated off) or when allocation failed (logged at probe).
     pub scanout: Option<ScanoutAllocation>,
 }
 
@@ -1042,8 +1062,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // not scanning), but it no longer panics and it logs
         // each failing step instead of collapsing to silence.
         let mode_opt = if panel_on {
-            // Activate backlight PWM (Gen12 BXT-style registers).
-            narf_drivers_backlight::intel_bl::install(dev.gtt_mmadr);
+            // Activate backlight PWM where the generation's PWM
+            // block is modelled (Gen12 today; MTL's install is
+            // gated on the backlight composition lane, PR #1037).
+            if dev.chip.generation.backlight_supported() {
+                narf_drivers_backlight::intel_bl::install(dev.gtt_mmadr);
+            }
             let mode = crate::intel_gpu_modeset::takeover_display(&dev);
             if mode.is_some() {
                 // The PPS backlight gate opens only with live
@@ -1144,10 +1168,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             None => {}
         }
     } else {
-        // MTL / PTL: identification is real, the Gen12 display
-        // sequence is not valid on Xe-LPG / Xe3-LPG silicon.
+        // PTL: identification is real, but Xe3-LPD is a
+        // different display IP generation from both Gen12 and
+        // Xe-LPG — no validated sequence exists for it yet.
         log_probe(
-            "display programming skipped — Xe-LPG/Xe3 display engine is tracked separately (#1016)",
+            "display programming skipped — Xe3-LPD display engine is not modelled (Panther Lake gated off in #1016)",
             &device,
         );
     }
@@ -1161,16 +1186,20 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     let scanout_mode = dev.current_mode();
     // Power management (Q9, #1015) covers the Gen12 register
-    // map — the same predicate the RCS attach uses. Xe-LPG
-    // parts are identified but get no PM until #1016's engine.
-    let pm_supported = dev.chip.generation.region_generation().is_some();
+    // map only. Xe-LPG now has a region map and a display
+    // engine (#1016), but its forcewake/RC6/DMC programming is
+    // not modelled, so MTL still gets no PM.
+    let pm_supported = matches!(
+        dev.chip.generation.region_generation(),
+        Some(RegionGeneration::Gen12)
+    );
     *CONTROLLER.lock() = Some(dev);
 
     // Register with drm_registry. With a live scanout the card
     // carries real KMS mode state (CRTC 1 + mode, encoder 2,
     // eDP connector 3 — the virtio/bochs pattern in lib.rs) and
     // the scanout is published to the framebuffer console;
-    // without one (MTL/PTL gate, allocation failure) the card
+    // without one (PTL gate, allocation failure) the card
     // stays identity-only, as before lane 1.
     let drm_count = crate::drm_registry::count() as u32;
     let card_name = alloc::format!("card{}", drm_count);
@@ -1855,9 +1884,29 @@ pub mod tests {
         {
             return TestResult::Fail("Gen12 generations must allow display programming");
         }
-        if Generation::MeteorLake.display_supported() || Generation::PantherLake.display_supported()
+        // #1016: Meteor Lake's Xe-LPG sequence is implemented, so
+        // the gate opens for MTL. Panther Lake (Xe3-LPD, a
+        // different display IP) must stay gated off.
+        if !Generation::MeteorLake.display_supported() {
+            return TestResult::Fail("MTL must allow display programming (#1016)");
+        }
+        if Generation::PantherLake.display_supported() {
+            return TestResult::Fail("PTL must skip display programming (Xe3-LPD not modelled)");
+        }
+        // Backlight stays Gen12-only until the composition lane
+        // (PR #1037) lands the MTL PWM path.
+        if !Generation::TigerLake.backlight_supported()
+            || !Generation::AlderLake.backlight_supported()
+            || Generation::MeteorLake.backlight_supported()
+            || Generation::PantherLake.backlight_supported()
         {
-            return TestResult::Fail("MTL/PTL must skip display programming in this lane");
+            return TestResult::Fail("backlight gate must be Gen12-only pending #1037");
+        }
+        // Region generations follow the same split.
+        if Generation::MeteorLake.region_generation() != Some(RegionGeneration::XeLpg)
+            || Generation::PantherLake.region_generation().is_some()
+        {
+            return TestResult::Fail("region generation map wrong for MTL/PTL");
         }
         TestResult::Pass
     }

@@ -712,6 +712,8 @@ pub mod intel_gpu_hdmi;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_modeset;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_modeset_xelpg;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_pcode;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_pipes;
@@ -729,6 +731,8 @@ pub mod intel_gpu_rcs;
 pub mod intel_gpu_regions;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_wm;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_xelpg;
 pub mod nvidia_gpu;
 pub mod nvidia_gpu_disp;
 pub mod nvidia_gpu_falcon;
