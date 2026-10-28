@@ -371,8 +371,9 @@ fn identity_bytes(value: &str, fallback: &str) -> Vec<u8> {
 
 // ── InputEventFile ────────────────────────────────────────────────────────────
 
-/// Whether the underlying device was created by uinput (writes allowed)
-/// or a hardware driver (writes denied).
+/// Whether the underlying device was created by uinput or by a
+/// hardware driver. Both accept `write()` (Linux evdev injection);
+/// the kind still keys the `/dev/input/by-*` alias naming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceKind {
     Hardware,
@@ -510,21 +511,24 @@ impl FileOps for InputEventFile {
         })
     }
 
-    /// Write events into the device (uinput path).
+    /// Write events into the device.
     ///
-    /// Hardware devices return `FsError::PermissionDenied`.
-    /// UserDevice files accept a buffer of 24-byte Linux `input_event`
-    /// records, unpack each into an internal `EvdevEvent`, and inject
-    /// them via `ROUTER.dispatch`.  Records with an unrecognised `EV_*`
-    /// type are skipped but still counted as consumed (Linux uinput is
-    /// equally lenient).
+    /// Both device kinds accept a buffer of 24-byte Linux
+    /// `input_event` records, unpack each into an internal
+    /// `EvdevEvent`, and inject them via `ROUTER.dispatch`. For a
+    /// hardware device this is Linux's `evdev_write` →
+    /// `input_inject_event` path: an `EV_LED` record updates the
+    /// device's LED state in the input core and fires the producer's
+    /// output hook (keyboard lock LEDs), and any other record is
+    /// delivered as if the device had produced it. For a uinput
+    /// UserDevice the same loop is the injection contract. Records
+    /// with an unrecognised `EV_*` type are skipped but still counted
+    /// as consumed (Linux is equally lenient).
     ///
-    /// Ref: `uinput.c::uinput_write` (line ~502).
+    /// Ref: `uinput.c::uinput_write` (line ~502);
+    /// `evdev.c::evdev_write` + `input.c::input_inject_event`.
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
-            if self.kind == DeviceKind::Hardware {
-                return Err(FsError::PermissionDenied);
-            }
             if buf.len() % LINUX_INPUT_EVENT_SIZE != 0 {
                 return Err(FsError::InvalidPath);
             }
@@ -778,16 +782,34 @@ impl FileOps for InputEventFile {
                 // Our event timestamps are already monotonic; accept + no-op.
                 Ok(0)
             }
-            EVIOC_NR_GMTSLOTS | EVIOC_NR_GKEY | EVIOC_NR_GLED | EVIOC_NR_GSND | EVIOC_NR_GSW => {
-                // Multitouch-slot state and current key/LED/sound/switch
+            EVIOC_NR_GLED => {
+                // EVIOCGLED(len) → the device's current LED bitmap,
+                // maintained by the input core (`dev->led`) — bit N
+                // set means LED code N is lit. The bitmap is copied
+                // out little-endian (LED codes 0..16 fit the first
+                // two bytes); the rest of the requested length is
+                // zeros, matching the fixed-size bitmap copy Linux
+                // performs.
+                let leds = ROUTER.led_state(self.device_id).ok_or(FsError::NotFound)?;
+                let mut bytes = alloc::vec![0u8; size];
+                let le = leds.to_le_bytes();
+                let take = le.len().min(size);
+                bytes[..take].copy_from_slice(&le[..take]);
+                // SAFETY: `arg` is the user buffer of `size` bytes, validated
+                // by the syscall layer before dispatch.
+                let n = unsafe { copy_to_user_bytes(arg, &bytes)? };
+                Ok(n as u64)
+            }
+            EVIOC_NR_GMTSLOTS | EVIOC_NR_GKEY | EVIOC_NR_GSND | EVIOC_NR_GSW => {
+                // Multitouch-slot state and current key/sound/switch
                 // state. We synthesise none of these, but libevdev
                 // (libinput's backend) issues them at device init and
                 // treats a FAILURE as fatal, rejecting the device.
                 // Report an all-zero buffer of the requested length: no
-                // keys/LEDs/switches active. (Properties and the
-                // phys/uniq strings are real now — see the GPROP /
-                // GPHYS / GUNIQ arms above.) Linux ref:
-                // `libevdev_set_fd`.
+                // keys/sounds/switches active. (LED state is real —
+                // see the GLED arm above; properties and the phys/uniq
+                // strings are real too — see the GPROP / GPHYS / GUNIQ
+                // arms.) Linux ref: `libevdev_set_fd`.
                 let zeros = alloc::vec![0u8; size];
                 // SAFETY: `arg` is the user buffer of `size` bytes, validated
                 // by the syscall layer before dispatch.
@@ -811,6 +833,7 @@ impl FileOps for InputEventFile {
                         Some(EventType::Key) => caps.keybit.as_bytes(),
                         Some(EventType::Rel) => caps.relbit.as_bytes(),
                         Some(EventType::Abs) => caps.absbit.as_bytes(),
+                        Some(EventType::Led) => caps.ledbit.as_bytes(),
                         // No bitmap tracked for other types — report none.
                         _ => &[],
                     };

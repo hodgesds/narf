@@ -437,6 +437,38 @@ pub(crate) fn route_sensor_report(
     false
 }
 
+/// Push the keyboard node's LED state to the device when it moved
+/// since the last successful send. Runs in pump (task) context —
+/// the pump owns the driver, so unlike the i8042 path no sink hook
+/// is registered on the node; the input core still owns the state
+/// (lock-key presses toggle it in `DeviceNode::dispatch`, evdev
+/// `write()`s of `EV_LED` records set it). A userspace-driven change
+/// is picked up at the next keyboard/consumer report. A failed send
+/// leaves `sent` stale so the next report retries.
+async fn sync_kbd_leds(
+    driver: &I2cHidDriver,
+    node: &narf_input::evdev::DeviceNode,
+    profile: &Option<narf_hid::keyboard::LedOutputProfile>,
+    sent: &mut u16,
+) {
+    let want = node.led_state();
+    if want == *sent {
+        return;
+    }
+    match profile {
+        Some(lp) => {
+            let body = crate::i2c_hid_keyboard::led_report_body(lp, want);
+            if driver.set_output_report(lp.report_id, &body).await.is_ok() {
+                *sent = want;
+            }
+        }
+        // No LED Output field in this descriptor: latch the state
+        // so we don't re-check on every report; the core bitmap
+        // (EVIOCGLED) still reflects reality.
+        None => *sent = want,
+    }
+}
+
 /// Per-device pump future. Owns the driver. Loops forever — exits
 /// only if the bus returns a fatal error.
 async fn pump_task(
@@ -637,6 +669,17 @@ async fn pump_task(
     // Per-device keyboard + consumer report-diff trackers.
     let mut kbd_state = crate::i2c_hid_keyboard::KeyboardPumpState::new();
     let mut consumer_state = crate::i2c_hid_keyboard::ConsumerPumpState::new();
+    // Keyboard LED Output profile (descriptor LED-page Output
+    // field), resolved once; `kbd_led_sent` is the last LED bitmap
+    // the device was successfully sent. The pump diffs the node's
+    // core LED state against it after every keyboard/consumer
+    // report — the same pattern as virtio-input's `sync_leds`.
+    let led_profile = if keyboard.is_some() {
+        narf_hid::keyboard::detect_led_output(&parsed)
+    } else {
+        None
+    };
+    let mut kbd_led_sent: u16 = 0;
 
     loop {
         if irq_wired {
@@ -682,6 +725,7 @@ async fn pump_task(
             if profile.input_report_id == 0 || payload.first() == Some(&profile.input_report_id) {
                 if let Ok(decoded) = narf_hid::keyboard::decode_input(profile, payload) {
                     crate::i2c_hid_keyboard::pump_report(node, &mut kbd_state, &decoded);
+                    sync_kbd_leds(&driver, node, &led_profile, &mut kbd_led_sent).await;
                     continue;
                 }
             }
@@ -694,6 +738,7 @@ async fn pump_task(
                         &mut consumer_state,
                         &active,
                     );
+                    sync_kbd_leds(&driver, node, &led_profile, &mut kbd_led_sent).await;
                     continue;
                 }
             }
