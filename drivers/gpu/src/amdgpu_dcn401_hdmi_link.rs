@@ -661,6 +661,12 @@ impl<I: Io> Engine<I> {
         // dcn401_program_pix_clk: PHY PLL from the pixel clock and depth,
         // then dce112_program_pixel_clk_resync's DCCG_DEEP_COLOR_CNTL.
         self.hdmi_link_verify(*plan, false)?;
+        // The PHY's PLL is programmed from off, as Linux always has it: its
+        // init_hw powers every clock source down when firmware left a DIG
+        // lit, and a replaced stream's cs_power_down follows its reset. The
+        // GOP's PLL is still running after its stream's retirement here.
+        // Linux only logs a failed power-down.
+        let _ = firmware.power_down(path).await;
         // pixel_clk_params->controller_id = tg->inst + 1.
         firmware
             .pixel_clock(path, self.layout.inst(pipe), plan.pixel_khz, plan.depth)

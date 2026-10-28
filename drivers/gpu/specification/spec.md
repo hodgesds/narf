@@ -2017,7 +2017,9 @@ combo PHY PLL down (`hdmi_link::Firmware::power_down` ->
 `Dmub::power_down_pixel_clock`: SET_PIXEL_CLOCK v7 with no clock, no encoder,
 CRT mode, FORCE_PROG_PPLL and ATOM_CRTC_INVALID, as
 `dce110_clock_source_power_down`); a failure is ignored, as Linux only logs
-it. The monitor enables HPD on every DP and HDMI port.
+it. `prepare_hdmi_link` powers it down the same way before SET_PIXEL_CLOCK,
+so the PLL is always programmed from off, as after Linux's `init_hw` power
+down of a firmware-lit DIG (a retired GOP stream leaves its PLL running). The monitor enables HPD on every DP and HDMI port.
 Training then walks narf's fallback ladder (`link_candidates`), trying only
 settings that carry the mode: the link rate drops first; below RBR the lanes
 halve and the rate restarts at this attempt's starting rate. Legacy DSC also
