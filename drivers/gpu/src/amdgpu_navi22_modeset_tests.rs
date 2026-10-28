@@ -418,6 +418,16 @@ fn navi22_modeset_resources_follow_the_dcn30_pool() -> TestResult {
     if choose(&with_hdmi).map(|(c, _)| c) != Some(hdmi) {
         return TestResult::Fail("HDMI preference");
     }
+    // amdgpu.rdna2_connector: the preferred kind wins when connected, and
+    // the other lights when it is not.
+    let pick = |r: &[Report], p| choose_preferring(r, p).map(|(c, _)| c);
+    if pick(&with_hdmi, Some(Signal::DisplayPort)) != Some(dp(1))
+        || pick(&with_hdmi, Some(Signal::Hdmi)) != Some(hdmi)
+        || pick(&reports, Some(Signal::Hdmi)) != Some(dp(1))
+        || pick(&with_hdmi, None) != Some(hdmi)
+    {
+        return TestResult::Fail("connector preference");
+    }
     // DP DTO: 25.175 MHz is a /1.001 video rate; 148.5 MHz is not in range.
     if dp_dto(25_175) != (25_200 * 1000, 730_000 * 1001)
         || dp_dto(148_500) != (148_500_000, 730_000_000)

@@ -327,7 +327,8 @@ paths re-export the same modules, preserving type identity and source
 compatibility.
 
 `amdgpu_rdna2::options::BootOptions::parse(cmdline)` yields
-`{native_display, accel, multi, hw_cursor, power_saving}`. Switches
+`{native_display, accel, multi, hw_cursor, gpu_recovery, power_saving,
+dmub_tables, atom_pixclk, connector}`. Switches
 `amdgpu.native_display`, `amdgpu.rdna2_accel`, `amdgpu.rdna2_multi` and
 `amdgpu.rdna2_hw_cursor` accept a bare flag or `=1|on|y|yes|true` (on) and
 `=0|off|n|no|false` (off); any other value keeps the default. The
@@ -339,6 +340,13 @@ absent; `=none|off|0` or an empty value applies nothing. The first canonical
 power value takes precedence over the first legacy value, including an empty
 or invalid canonical value; invalid power lists enable nothing. Defaulted
 power features still pass every display-admission and driver prerequisite.
+`amdgpu.rdna2_dmub_tables=0` and `amdgpu.rdna2_atom_pixclk=1` are Navi22
+diagnostics that run display VBIOS tables (all, or SetPixelClock alone) in
+the ATOM interpreter instead of DMCUB. `amdgpu.rdna2_connector=dp|hdmi`
+(`options::Connector`; anything else is `Any`) makes the single-display
+Navi22 boot modeset light that kind of sink first when one is connected
+(`amdgpu_navi22_modeset::set_connector_preference`, `choose_preferring`);
+`Any` keeps Linux's order, HDMI first.
 
 Clock/power capability flags come from each profile's Linux
 `nv_common_early_init` selection. Navi21/22/23 share the existing capability

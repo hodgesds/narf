@@ -368,6 +368,27 @@ impl Resources {
 /// (Navi48's policy: HPD asserted, EDID read, DPCD read). Report order is
 /// VBIOS table order.
 pub fn choose(reports: &[Report]) -> Option<(Connector, &Sink)> {
+    let prefer = match PREFER.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => Some(Signal::Hdmi),
+        2 => Some(Signal::DisplayPort),
+        _ => None,
+    };
+    choose_preferring(reports, prefer)
+}
+/// `amdgpu.rdna2_connector`: 0 Linux's order, 1 HDMI, 2 DisplayPort.
+static PREFER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// Set once from the boot options, before the first modeset.
+pub fn set_connector_preference(prefer: crate::amdgpu_rdna2::options::Connector) {
+    use crate::amdgpu_rdna2::options::Connector as C;
+    let v = match prefer {
+        C::Any => 0,
+        C::Hdmi => 1,
+        C::DisplayPort => 2,
+    };
+    PREFER.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+/// [`choose`] with `prefer`'s kind of sink first, when one is connected.
+pub fn choose_preferring(reports: &[Report], prefer: Option<Signal>) -> Option<(Connector, &Sink)> {
     let connected = |want: Signal| {
         reports.iter().find_map(|r| match &r.detection {
             Detection::Connected(sink)
@@ -380,7 +401,8 @@ pub fn choose(reports: &[Report]) -> Option<(Connector, &Sink)> {
             _ => None,
         })
     };
-    connected(Signal::Hdmi).or_else(|| connected(Signal::DisplayPort))
+    let first = prefer.and_then(connected);
+    first.or_else(|| connected(Signal::Hdmi).or_else(|| connected(Signal::DisplayPort)))
 }
 
 /// Underflow status as the hardware latched it.
