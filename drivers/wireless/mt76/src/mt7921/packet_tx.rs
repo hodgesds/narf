@@ -69,6 +69,86 @@ pub(super) fn management(
     Ok(bytes)
 }
 
+/// Encode one software fragment of a station data MSDU (Linux v7.2
+/// mt76_connac_mac.c `mt76_connac2_mac_write_txwi` +
+/// `mt76_connac2_mac_write_txwi_80211`): an 802.11 (QoS) DATA MPDU from
+/// mac80211 `ieee80211_fragment`, `MT_HDR_FORMAT_802_11` with the header
+/// length in `MT_TXD1_HDR_INFO`, the TID, `MT_TXD2_FRAG` FIRST (1) / MID (2)
+/// / LAST (3) from MoreFrags and the fragment number, the AC queue of the
+/// TID, no fixed rate (not management, not multicast) and
+/// `MT_TXD3_PROTECT_FRAME` when the frame carries the Protected bit.
+pub(super) fn fragment(
+    frame: &[u8],
+    payload: u64,
+    token: u16,
+    wcid: u16,
+) -> Result<[u8; HEADER], Error> {
+    if !(24..=2346).contains(&frame.len()) {
+        return Err(Error::Bounds);
+    }
+    if payload
+        .checked_add(frame.len() as u64 - 1)
+        .is_none_or(|end| end > u64::from(u32::MAX))
+    {
+        return Err(Error::DmaAddress);
+    }
+    let qos = match frame[0] {
+        0x08 => false,
+        0x88 => true,
+        _ => return Err(Error::Bounds),
+    };
+    let header = if qos { 26 } else { 24 };
+    let more = frame[1] & 0x04 != 0;
+    let number = frame[22] & 15;
+    // ToDS only, never Order/A-MSDU; a fragment carries payload.
+    if frame.len() <= header
+        || frame[1] & !0x44 != 0x01
+        || frame[4] & 1 != 0
+        || qos && frame[24] & 0xf0 != 0
+        || !more && number == 0
+        || token == 0
+        || token >= TOKEN_LIMIT
+        || wcid >= 20
+    {
+        return Err(Error::Bounds);
+    }
+    let tid = if qos { frame[24] & 7 } else { 0 };
+    let queue = if qos {
+        3 - u32::from(super::tx_priority::UP_TO_AC[usize::from(tid)])
+    } else {
+        0
+    };
+    let position = match (more, number) {
+        (true, 0) => 1,
+        (true, _) => 2,
+        (false, _) => 3,
+    };
+    let protected = frame[1] & 0x40 != 0;
+    let subtype = if qos { 8 } else { 0 };
+    let words = [
+        (frame.len() as u32 + 32) | (queue << 25),
+        (1 << 31)
+            | (u32::from(tid) << 20)
+            | (2 << 16)
+            | ((header as u32 / 2) << 11)
+            | u32::from(wcid),
+        (position << 14) | (2 << 4) | subtype,
+        (15 << 11) | (u32::from(protected) << 1),
+        0,
+        0,
+        0,
+        (2 << 20) | (subtype << 16),
+    ];
+    let mut bytes = [0; HEADER];
+    for (i, word) in words.iter().enumerate() {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    bytes[32..34].copy_from_slice(&(token | 0x8000).to_le_bytes());
+    bytes[40..44].copy_from_slice(&(payload as u32).to_le_bytes());
+    bytes[44..46].copy_from_slice(&((frame.len() as u16) | 0x8000).to_le_bytes());
+    Ok(bytes)
+}
+
 /// Encode an 802.3 Ethernet frame for transmission on the WFDMA data queue.
 pub(super) fn ethernet(
     frame: &[u8],

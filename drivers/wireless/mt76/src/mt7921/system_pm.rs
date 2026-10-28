@@ -285,6 +285,7 @@ impl<B: Backend> Session<B> {
         self.he_profile = None;
         self.ap_phy = None;
         self.control_pending.clear();
+        self.tx_fragments.clear();
         self.received_msdu.clear();
         self.rx_fragments.clear();
         self.data_pending.clear();

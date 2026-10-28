@@ -575,6 +575,27 @@ impl WirelessNetIface for Mt76Iface {
         *self.associated_bssid.lock()
     }
 
+    /// The radio-wide threshold the native station fragments under.
+    fn fragmentation_threshold(&self) -> Option<u32> {
+        Some(
+            crate::mt7921::firmware_transport::BOOT_FRAG_THRESHOLD
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// mac80211 `ieee80211_set_wiphy_params(WIPHY_PARAM_FRAG_THRESHOLD)`:
+    /// mt7921 has no `set_frag_threshold` op, so `drv_set_frag_threshold`
+    /// succeeds and mac80211 itself fragments (with 802.3 encap offload off)
+    /// from the next frame. nl80211 already validated the value.
+    fn set_fragmentation_threshold(&self, threshold: u32) -> Result<(), i32> {
+        if threshold != u32::MAX && (threshold < 256 || threshold & 1 != 0) {
+            return Err(22); // EINVAL
+        }
+        crate::mt7921::firmware_transport::BOOT_FRAG_THRESHOLD
+            .store(threshold, core::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     async fn associate(&self, req: AssociateRequest) -> Result<(), WirelessError> {
         let _control = self.control.lock().await;
         let channel = u8::try_from(req.channel).map_err(|_| WirelessError::InvalidArgs)?;

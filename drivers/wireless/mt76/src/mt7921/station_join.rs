@@ -1267,6 +1267,7 @@ impl<B: Backend> Session<B> {
     }
 
     pub(super) fn fail_data(&mut self, error: Error) -> Error {
+        self.tx_fragments.clear();
         self.backend.close_receive_capture(self.receive_epoch);
         self.security = None;
         self.station_permission = None;
@@ -1321,7 +1322,10 @@ impl<B: Backend> Session<B> {
         {
             return Err(Error::Bounds);
         }
-        if self.data_pending.len() >= self.data_capacity() || self.data_controls_pending() {
+        if self.data_pending.len() >= self.data_capacity()
+            || self.data_controls_pending()
+            || !self.tx_fragments.is_empty()
+        {
             return Err(Error::Busy);
         }
         self.check_station_tx()?;
@@ -1336,6 +1340,9 @@ impl<B: Backend> Session<B> {
             && self.ht20_profile.is_some()
             && (!self.tx_ba.active() || self.tx_ba.amsdu());
         self.backend.set_hw_amsdu(amsdu);
+        if let Some(fragments) = self.fragments(frame, tid) {
+            return self.start_fragments(fragments, tid);
+        }
         let result = if tid != 0 {
             self.backend.submit_data_tid(
                 frame,
@@ -1366,6 +1373,72 @@ impl<B: Backend> Session<B> {
         Ok(())
     }
 
+    /// mac80211 `ieee80211_tx_h_fragment` / `ieee80211_fragment` for the
+    /// native station: with a wiphy threshold set, Linux disables 802.3
+    /// encapsulation offload (iface.c `ieee80211_set_sdata_offload_flags`:
+    /// mt76 lacks `SUPPORTS_TX_FRAG`) and splits each unicast MSDU whose
+    /// MPDU + FCS exceeds the threshold, unless it goes out as A-MPDU
+    /// (`IEEE80211_TX_CTL_DONTFRAG`). Every fragment repeats the
+    /// (QoS) DATA header with ToDS, Protected under a PTK, the fragment
+    /// number and MoreFrags on all but the last; each carries
+    /// `threshold - header - FCS` body octets (RFC1042 LLC/SNAP + payload).
+    pub(super) fn fragments(&self, frame: &[u8], tid: u8) -> Option<Vec<Vec<u8>>> {
+        let State::Associated { peer, .. } = self.state else {
+            return None;
+        };
+        let qos = self.wmm.is_some();
+        let header = if qos { 26 } else { 24 };
+        let threshold = usize::try_from(self.frag_threshold).ok()?;
+        let body = frame.len() - 14 + 8;
+        if self.frag_threshold == u32::MAX
+            || header + body + 4 <= threshold
+            || tid == 0 && self.tx_ba.active()
+        {
+            return None;
+        }
+        let per = threshold.checked_sub(header + 4).filter(|per| *per > 0)?;
+        let mut msdu = Vec::with_capacity(body);
+        msdu.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
+        msdu.extend_from_slice(&frame[12..]);
+        let count = msdu.len().div_ceil(per);
+        let mut out = Vec::with_capacity(count);
+        for (number, chunk) in msdu.chunks(per).enumerate() {
+            let mut mpdu = vec![0; header];
+            mpdu[0] = if qos { 0x88 } else { 0x08 };
+            mpdu[1] = 0x01
+                | if self.security.is_some() { 0x40 } else { 0 }
+                | if number + 1 < count { 0x04 } else { 0 };
+            mpdu[4..10].copy_from_slice(&peer);
+            mpdu[10..16].copy_from_slice(&frame[6..12]);
+            mpdu[16..22].copy_from_slice(&frame[..6]);
+            mpdu[22] = number as u8;
+            if qos {
+                mpdu[24] = tid;
+            }
+            mpdu.extend_from_slice(chunk);
+            out.push(mpdu);
+        }
+        Some(out)
+    }
+
+    fn start_fragments(&mut self, fragments: Vec<Vec<u8>>, tid: u8) -> Result<(), Error> {
+        let mut fragments = VecDeque::from(fragments);
+        let Some(first) = fragments.pop_front() else {
+            return Err(Error::Bounds);
+        };
+        match self.backend.submit_fragment(&first, 1) {
+            Ok(()) => {}
+            Err(Error::Busy) => return Err(Error::Busy),
+            Err(error) => return Err(self.fail_data(error)),
+        }
+        self.tx_fragments = fragments;
+        self.data_pending.push_back(self.backend.now_ns());
+        if self.wmm.is_some() && tid == 0 {
+            self.tid0_used = true;
+        }
+        Ok(())
+    }
+
     pub(super) fn poll_data_tx(&mut self) -> Result<bool, Error> {
         for _ in 0..packet_tx::PIPELINE {
             let Some(&started) = self.data_pending.front() else {
@@ -1383,6 +1456,16 @@ impl<B: Backend> Session<B> {
                 if completion.status != 0 {
                     return Err(self.fail_data(Error::Rejected(completion.status)));
                 }
+                // The next fragment follows its predecessor's terminal TX.
+                if let Some(next) = self.tx_fragments.pop_front() {
+                    if let Err(error) = self.check_station_tx() {
+                        return Err(self.fail_data(error));
+                    }
+                    if let Err(error) = self.backend.submit_fragment(&next, 1) {
+                        return Err(self.fail_data(error));
+                    }
+                    self.data_pending.push_back(self.backend.now_ns());
+                }
                 continue;
             }
             if self.backend.now_ns().saturating_sub(started) >= TIMEOUT_MS * 1_000_000 {
@@ -1390,7 +1473,9 @@ impl<B: Backend> Session<B> {
             }
             break;
         }
-        Ok(self.data_pending.len() < self.data_capacity() && !self.data_controls_pending())
+        Ok(self.data_pending.len() < self.data_capacity()
+            && !self.data_controls_pending()
+            && self.tx_fragments.is_empty())
     }
 
     pub(super) fn step_network(&mut self, tx: Option<&[u8]>) -> Result<super::PacketStep, Error> {
@@ -1541,6 +1626,7 @@ impl<B: Backend> Session<B> {
         self.he_profile = None;
         self.ap_phy = None;
         self.control_pending.clear();
+        self.tx_fragments.clear();
         self.received_msdu.clear();
         self.boot_started = Some(self.backend.now_ns());
         self.security = None;
@@ -1958,6 +2044,7 @@ impl<B: Backend> Session<B> {
         let had_he = self.he_profile.take();
         self.ap_phy = None;
         self.control_pending.clear();
+        self.tx_fragments.clear();
         self.received_msdu.clear();
         let peer_lost = self.peer_lost;
         self.stage(Stage::StaRecord);
@@ -2059,6 +2146,7 @@ impl<B: Backend> Session<B> {
             self.rx_ba.fence();
             self.tx_ba.fence();
             self.control_pending.clear();
+            self.tx_fragments.clear();
             self.clear_aggregate_receive();
             let stage = match self.state {
                 State::Running(stage) | State::Failed { stage, .. } => stage,
@@ -2189,6 +2277,7 @@ impl<B: Backend> Session<B> {
             self.rx_ba.fence();
             self.tx_ba.fence();
             self.control_pending.clear();
+            self.tx_fragments.clear();
             self.received_msdu.clear();
             self.state = State::Failed {
                 stage: Stage::StaRecord,

@@ -457,6 +457,12 @@ pub(crate) fn boot_receive_publish(epoch: u64, publish: impl FnOnce()) -> Result
     owner.publish_receive(epoch, publish)
 }
 
+/// cfg80211 `wiphy->frag_threshold` as set through
+/// `WirelessNetIface::set_fragmentation_threshold` (`u32::MAX` = off). The
+/// boot owner samples it before each packet step.
+pub(crate) static BOOT_FRAG_THRESHOLD: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
 pub fn step_boot_network(tx: Option<&[u8]>) -> Result<PacketStep, Error> {
     let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
     match poll_boot_keys(&mut cx) {
@@ -1068,6 +1074,8 @@ trait Backend {
     fn management_complete(
         &mut self,
     ) -> Result<Option<crate::mt7921::packet_tx::Completion>, Error>;
+    /// One 802.11 data fragment (`packet_tx::fragment`) on the data ring.
+    fn submit_fragment(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error>;
     fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error>;
     fn submit_data_pipelined(
         &mut self,
@@ -1135,6 +1143,11 @@ struct Session<B: Backend> {
     he_profile: Option<crate::mt7921::he::Profile>,
     ap_phy: Option<narf_wireless::association::phy::ApElements>,
     control_pending: VecDeque<Vec<u8>>,
+    /// The remaining software fragments of the MSDU in flight (each one
+    /// waits for the previous fragment's terminal completion).
+    tx_fragments: VecDeque<Vec<u8>>,
+    /// The wiphy fragmentation threshold (`u32::MAX` = off).
+    frag_threshold: u32,
     rx_ba: ba::Owner,
     received_msdu: VecDeque<Vec<u8>>,
     rx_fragments: fragment::Cache,
@@ -1167,6 +1180,8 @@ impl<B: Backend> Session<B> {
             he_profile: None,
             ap_phy: None,
             control_pending: VecDeque::new(),
+            tx_fragments: VecDeque::new(),
+            frag_threshold: u32::MAX,
             rx_ba: ba::Owner::default(),
             received_msdu: VecDeque::new(),
             rx_fragments: fragment::Cache::default(),

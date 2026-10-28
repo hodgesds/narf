@@ -17,6 +17,8 @@ mod amsdu_rx_tests;
 
 #[path = "dynamic_wmm_tests.rs"]
 mod dynamic_wmm_tests;
+#[path = "frag_tests.rs"]
+mod frag_tests;
 #[path = "greenfield_tests.rs"]
 mod greenfield_tests;
 #[path = "he_tests.rs"]
@@ -942,6 +944,12 @@ impl Backend for Model {
                 }
             }
         }
+        Ok(())
+    }
+    fn submit_fragment(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error> {
+        self.check()?;
+        crate::mt7921::packet_tx::fragment(frame, 0x1000, 1, wcid)?;
+        self.frames.push((false, frame.to_vec()));
         Ok(())
     }
     fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error> {

@@ -345,6 +345,22 @@ impl Hardware {
         wcid: u16,
         rate: crate::mt7921::association::LegacyRate,
     ) -> Result<(), Error> {
+        self.submit_80211(frame, |payload, token| {
+            packet_tx::management(frame, payload, token, wcid, rate)
+        })
+    }
+    fn submit_fragment(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error> {
+        self.submit_80211(frame, |payload, token| {
+            packet_tx::fragment(frame, payload, token, wcid)
+        })
+    }
+    /// Publish one native 802.11 MPDU with the TXD `encode` builds for its
+    /// DMA payload address and token.
+    fn submit_80211(
+        &mut self,
+        frame: &[u8],
+        encode: impl FnOnce(u64, u16) -> Result<[u8; packet_tx::HEADER], Error>,
+    ) -> Result<(), Error> {
         self.check()?;
         if !self.owner.published {
             return Err(Error::Busy);
@@ -360,7 +376,7 @@ impl Hardware {
         let payload = address
             .checked_add(packet_tx::HEADER as u64)
             .ok_or(Error::DmaAddress)?;
-        let header = packet_tx::management(frame, payload, token, wcid, rate)?;
+        let header = encode(payload, token)?;
         // SAFETY: fully validated lengths; this slot has neither DMA nor
         // firmware ownership until the publication below.
         unsafe {
@@ -914,6 +930,9 @@ impl Backend for Hardware {
     ) -> Result<(), Error> {
         self.submit_management(frame, wcid, rate)
     }
+    fn submit_fragment(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error> {
+        self.submit_fragment(frame, wcid)
+    }
     fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error> {
         self.submit_data(frame, protected, qos)
     }
@@ -1211,6 +1230,8 @@ impl Transport {
     }
 
     pub(super) fn step_network(&mut self, tx: Option<&[u8]>) -> Result<super::PacketStep, Error> {
+        self.session.frag_threshold =
+            super::BOOT_FRAG_THRESHOLD.load(core::sync::atomic::Ordering::Relaxed);
         self.session.step_network(tx)
     }
     pub(super) fn receive_current(&self, epoch: u64) -> Result<bool, Error> {
