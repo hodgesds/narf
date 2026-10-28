@@ -14,6 +14,8 @@ mod ht40_conversation_tests;
 mod ht_conversation_tests;
 #[path = "pmf_conversation_tests.rs"]
 mod pmf_conversation_tests;
+#[path = "rebind_conversation_tests.rs"]
+mod rebind_conversation_tests;
 #[path = "protection_conversation_tests.rs"]
 mod protection_conversation_tests;
 #[path = "sgi40_conversation_tests.rs"]
@@ -39,6 +41,9 @@ fn five_ghz_policy() -> narf_wireless::reg::RegulatoryDomain {
 }
 type ModelDevice = Device<RadioModel>;
 static ACTIVE_TEST: IrqSafeSpinLock<Option<Arc<ModelDevice>>> = IrqSafeSpinLock::new(None);
+/// A rebound generation name (`interface::generation_name`) for the next
+/// Harness, in place of a fresh `wlan%d`.
+static NEXT_NAME: IrqSafeSpinLock<Option<&'static str>> = IrqSafeSpinLock::new(None);
 fn send(generation: u64, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     let device = ACTIVE_TEST.lock().clone().ok_or(())?;
     device.enqueue_generation(generation, bytes, meta)
@@ -133,7 +138,12 @@ impl Harness {
             HwRev::Qca988x
         };
         m.ce = Some(crate::ath10k::boot::CeFixture::new(hardware));
-        let name = String::from(narf_net::iface::reserve_name("wlan%d"));
+        let name = String::from(
+            NEXT_NAME
+                .lock()
+                .take()
+                .unwrap_or_else(|| narf_net::iface::reserve_name("wlan%d")),
+        );
         let policy = Arc::new(IrqSafeSpinLock::new(Some(if frequency < 3000 {
             station_tests::policy()
         } else {

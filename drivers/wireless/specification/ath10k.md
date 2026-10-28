@@ -617,10 +617,18 @@ Host-bus/system power transitions remain separate profiles.
   the old DMA pinned. Success is `Outcome::Scheduled { attempt }`. The
   outcome is published through `pci::last_automatic_recovery`, and
   RESTARTING is cleared so a successor's crash can recover again. The
-  fresh generation re-registers its station interface. Rejoin goes through
-  that interface's normal scan/associate path; Linux
-  `ieee80211_restart_hw` replay of keys and association is the separate
-  `automatic_credential_replay`/`stable_interface_recovery` work. WMI
+  fresh generation rebinds the same station interface (smokes under
+  `drivers/wireless/ath10k/recovery`): as mac80211 `ieee80211_restart_hw`
+  keeps the `net_device`, `interface::retire` (recovery and suspend) retires
+  it with `narf_net::iface::retire_for_rebind`, which reserves the name
+  atomically with removal and keeps its entry, and remembers the name; the
+  next `publish_with_mac` claims it with `rebind_name`, so the `wlan%d`
+  name, ifindex, addresses, counters and the operator's IFF_UP survive while
+  carrier stays down until a new association. The old generation's send
+  hook is dropped. A registered or never-retired name is never handed out;
+  publication then allocates a fresh `wlan%d`. Rejoin goes through the
+  interface's normal scan/associate path; Linux replay of keys and
+  association is the separate `automatic_credential_replay` work. WMI
   command timeouts do not yet trigger recovery: Linux `wmi.c` does that in
   `ath10k_wmi_cmd_send` on `-EAGAIN`, and here those timeouts stay
   fail-stop errors for the caller.
@@ -1203,7 +1211,7 @@ dynamic WMM/protection updates and TSPEC/U-APSD; DFS/indoor/beacon-hint
 qualification; associated/off-channel scanning; hardware key offload;
 AP/P2P roles; host-bus PM and wake offload (system suspend is implemented);
 pre-cal/cal-file and DT/NVMEM calibration sources (QCA9887 EEPROM is implemented)
-and automatic credential/stable-interface recovery.
+and automatic credential replay after recovery.
 Firmware-owned TX BA, the N-deep HTT pipeline and aggregate retry accounting
 are implemented above, beside the bounded RX BA/reorder and RAW A-MSDU receiver. Unsupported role, width, stream,
 or security capability remains closed; this ledger makes no per-chip RF or

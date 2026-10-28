@@ -317,10 +317,16 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         }
         narf_wireless::registry::unregister(&self.name);
         narf_net::registry().unregister(&self.name);
-        // Reserve while still registered: another family's wlan%d allocation
-        // must never take this name between unregister and reservation.
-        narf_net::iface::reserve_name(&self.name);
-        narf_net::iface::unregister(&self.name);
+        // Keep the netdev for the next generation (mac80211
+        // `ieee80211_restart_hw` never unregisters it): the name is reserved
+        // atomically with removal, so no other wlan%d allocation can take it,
+        // and ifindex/admin state/addresses survive a `rebind_name`.
+        if !narf_net::iface::retire_for_rebind(&self.name) {
+            narf_net::iface::reserve_name(&self.name);
+        }
+    }
+    pub(super) fn name(&self) -> &str {
+        &self.name
     }
     pub(super) fn request_power_save(&self, enabled: bool) -> Result<(), i32> {
         if !self.ps_supported {
@@ -945,6 +951,25 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Interface for Device<T> {
 }
 type Native = Device<super::boot::PciBoot>;
 static ACTIVE: IrqSafeSpinLock<Option<Arc<Native>>> = IrqSafeSpinLock::new(None);
+/// The interface name retired by the last recovery/suspend generation.
+static REBIND: IrqSafeSpinLock<Option<String>> = IrqSafeSpinLock::new(None);
+/// Record the retired generation's name for the next publication.
+pub(super) fn remember_rebind(name: &str) {
+    *REBIND.lock() = Some(String::from(name));
+}
+/// The next generation's name: the retired `wlan%d` while
+/// `narf_net::iface::rebind_name` still holds it, else a fresh one. The
+/// flag reports a rebind, whose restored operator state is kept.
+pub(super) fn generation_name() -> (&'static str, bool) {
+    match REBIND
+        .lock()
+        .take()
+        .and_then(|name| narf_net::iface::rebind_name(&name))
+    {
+        Some(name) => (name, true),
+        None => (narf_net::iface::reserve_name("wlan%d"), false),
+    }
+}
 fn send(generation: u64, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     let device = ACTIVE.lock().clone().ok_or(())?;
     device.enqueue_generation(generation, bytes, meta)
@@ -960,6 +985,7 @@ pub(super) fn retire(radio: &Arc<Mutex<Radio<super::boot::PciBoot>>>) {
     *active = None;
     drop(active);
     device.retire_host();
+    remember_rebind(device.name());
 }
 fn drain() -> bool {
     let device = ACTIVE.lock().clone();
@@ -1017,14 +1043,17 @@ fn publish_with_mac(
         if active.is_some() {
             return Err(Error::Failed);
         }
-        let name = narf_net::iface::reserve_name("wlan%d");
+        let (name, rebound) = generation_name();
         let device = Arc::new(Device::new(name, mac, radio, features, frequencies));
         narf_net::registry()
             .register(&authority, Registered(device.clone()))
             .map_err(|_| Error::Unsupported)?;
         *active = Some(device.clone());
         narf_net::iface::register_with_context(name, mac, device.generation, send);
-        narf_net::iface::set_link_state(name, false);
+        if !rebound {
+            // A rebound netdev keeps the operator's IFF_UP across recovery.
+            narf_net::iface::set_link_state(name, false);
+        }
         narf_net::iface::set_link_metadata(name, false, None, None);
         narf_net::iface::install_rx_drain(drain);
         narf_wireless::registry::register(device.clone());
