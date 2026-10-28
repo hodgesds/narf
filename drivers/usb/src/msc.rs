@@ -27,9 +27,15 @@
 //! - INQUIRY (0x12) — vendor / product / revision
 //! - START STOP UNIT (0x1B) — spin up / down / eject
 //! - READ CAPACITY(10) (0x25) — last LBA + block size
+//! - READ CAPACITY(16) (0x9E) — issued at attach when the
+//!   10-byte form reports `0xFFFF_FFFF`; its 64-bit last LBA
+//!   decides the capacity of > 2 TiB media (#832)
 //! - READ(10) (0x28) / WRITE(10) (0x2A) — single and multi-block;
 //!   WRITE(10) also in its FUA form (byte 1 bit 3) for
 //!   [`UsbMscBlockDevice`]'s native `write_fua`
+//! - READ(16) (0x88) / WRITE(16) (0x8A) — the 16-byte forms,
+//!   selected per LUN when its capacity crossed the 32-bit
+//!   boundary (#832)
 //! - SYNCHRONIZE CACHE(10) (0x35) — whole-medium cache flush
 //!   backing [`UsbMscBlockDevice`]'s `flush()`; without it the
 //!   block layer's Flush/FUA advertisement was a durability lie
@@ -75,6 +81,8 @@ const SCSI_START_STOP_UNIT: u8 = 0x1B;
 const SCSI_READ_CAPACITY_10: u8 = 0x25;
 const SCSI_READ_10: u8 = 0x28;
 const SCSI_WRITE_10: u8 = 0x2A;
+const SCSI_READ_16: u8 = 0x88;
+const SCSI_WRITE_16: u8 = 0x8A;
 const SCSI_SYNCHRONIZE_CACHE_10: u8 = 0x35;
 
 /// WRITE(10) CDB byte 1 bit 3: Force Unit Access — the device must
@@ -320,10 +328,18 @@ pub struct MscDevice {
     /// the class-specific requests (GET MAX LUN, Mass Storage
     /// Reset).
     pub interface: u8,
-    /// Block size reported by READ CAPACITY(10).
+    /// Block size reported by READ CAPACITY(10), or by
+    /// READ CAPACITY(16) when the 10-byte form overflows.
     pub lba_bytes: u32,
-    /// Last LBA reported by READ CAPACITY(10).
-    pub last_lba: u32,
+    /// Last LBA reported by READ CAPACITY. This is a `u64`
+    /// because a device over 2 TiB reports it through
+    /// READ CAPACITY(16) (#832).
+    pub last_lba: u64,
+    /// Whether this LUN needs the 16-byte READ/WRITE CDBs:
+    /// selected at attach when READ CAPACITY(16) reports a last
+    /// LBA above the 32-bit range. Devices at or below 2 TiB keep
+    /// the 10-byte forms.
+    pub cmd16: bool,
     /// Bind generation, stamped by [`insert_device`] from a
     /// process-wide monotonic counter. Zero means "not yet
     /// inserted" (a freshly attached or test-constructed device);
@@ -485,10 +501,11 @@ pub async fn attach_all_luns<T: BotTransport>(
 
 impl MscDevice {
     /// Bind one LUN of an already addressed + configured slot.
-    /// Issues READ CAPACITY(10) so `lba_bytes` and `last_lba` are
-    /// populated. Caller must have already run
-    /// `xhci.configure_endpoints` for the bulk pair returned by
-    /// `find_bot_endpoints`.
+    /// Issues READ CAPACITY(10) — escalating to READ CAPACITY(16)
+    /// when the 10-byte form overflows — so `lba_bytes`,
+    /// `last_lba`, and the 10/16-byte command form are populated.
+    /// Caller must have already run `xhci.configure_endpoints`
+    /// for the bulk pair returned by `find_bot_endpoints`.
     pub async fn attach_lun<T: BotTransport>(
         t: &T,
         slot_id: u8,
@@ -505,13 +522,25 @@ impl MscDevice {
             interface,
             lba_bytes: 0,
             last_lba: 0,
+            cmd16: false,
             generation: 0,
             tag: IrqSafeSpinLock::new(1),
             hub_port: None,
         };
-        let cap = dev.read_capacity_10(t).await?;
-        dev.lba_bytes = cap.0;
-        dev.last_lba = cap.1;
+        let (block_bytes, last_lba10) = dev.read_capacity_10(t).await?;
+        dev.lba_bytes = block_bytes;
+        dev.last_lba = u64::from(last_lba10);
+        if last_lba10 == u32::MAX {
+            // SBC-3 READ CAPACITY(10): a returned last LBA of
+            // 0xFFFF_FFFF means the capacity does not fit the
+            // 10-byte response (or ends exactly there). Ask again
+            // with READ CAPACITY(16) and let its 64-bit last LBA
+            // decide both the capacity and the command form.
+            let (block_bytes16, last_lba16) = dev.read_capacity_16(t).await?;
+            dev.lba_bytes = block_bytes16;
+            dev.last_lba = last_lba16;
+            dev.cmd16 = last_lba16 > u64::from(u32::MAX);
+        }
         Ok(dev)
     }
 
@@ -683,112 +712,141 @@ impl MscDevice {
         Ok((blocksz, last_lba))
     }
 
-    /// `READ(10)` for a single block. Returns the `lba_bytes`-sized
-    /// data buffer. SBC-3 §5.10.
-    pub async fn read_block<T: BotTransport>(&self, t: &T, lba: u32) -> Result<Vec<u8>, MscError> {
+    /// `READ CAPACITY(16)` (SBC-3 §5.16.2). Returns
+    /// `(block_bytes, last_lba)` with a 64-bit last LBA. Issued
+    /// at attach only when READ CAPACITY(10) reports
+    /// `0xFFFF_FFFF`, the standard's signal that the capacity
+    /// does not fit the 10-byte response (#832). The CDB and
+    /// response parser are the shared T10 codecs in
+    /// `narf_block::scsi`.
+    pub async fn read_capacity_16<T: BotTransport>(&self, t: &T) -> Result<(u32, u64), MscError> {
+        let cb = narf_block::scsi::read_capacity_16(32);
+        let mut out = [0u8; 32];
+        let n = self.cmd_data_in(t, &cb, &mut out).await?;
+        if n < 12 {
+            return Err(MscError::BadLength);
+        }
+        let (last_lba, blocksz, _prot) =
+            narf_block::scsi::parse_read_capacity_16(&out[..n]).map_err(|_| MscError::BadLength)?;
+        Ok((blocksz, last_lba))
+    }
+
+    /// Build the READ CDB this LUN uses: READ(16) when the
+    /// device crossed the 32-bit capacity boundary at attach,
+    /// READ(10) otherwise. Returns the CDB bytes and their
+    /// length (the backing array is sized for the 16-byte form).
+    fn read_cdb(&self, lba: u64, nblocks: u32) -> Result<([u8; 16], usize), MscError> {
+        if self.cmd16 {
+            let cb = encode_read16(lba, nblocks);
+            Ok((cb, cb.len()))
+        } else {
+            if lba > u64::from(u32::MAX) || nblocks > u32::from(u16::MAX) {
+                return Err(MscError::BadLength);
+            }
+            let cb10 = encode_read10(lba as u32, nblocks as u16);
+            let mut cb = [0u8; 16];
+            cb[..10].copy_from_slice(&cb10);
+            Ok((cb, 10))
+        }
+    }
+
+    /// WRITE counterpart of [`Self::read_cdb`], with the FUA bit
+    /// carried in byte 1 of either form.
+    fn write_cdb(&self, lba: u64, nblocks: u32, fua: bool) -> Result<([u8; 16], usize), MscError> {
+        if self.cmd16 {
+            let cb = if fua {
+                encode_write16_fua(lba, nblocks)
+            } else {
+                encode_write16(lba, nblocks)
+            };
+            Ok((cb, cb.len()))
+        } else {
+            if lba > u64::from(u32::MAX) || nblocks > u32::from(u16::MAX) {
+                return Err(MscError::BadLength);
+            }
+            let cb10 = if fua {
+                encode_write10_fua(lba as u32, nblocks as u16)
+            } else {
+                encode_write10(lba as u32, nblocks as u16)
+            };
+            let mut cb = [0u8; 16];
+            cb[..10].copy_from_slice(&cb10);
+            Ok((cb, 10))
+        }
+    }
+
+    /// `READ(10)` or `READ(16)` for a single block, selected by
+    /// the LUN's attach-time capacity form. Returns the
+    /// `lba_bytes`-sized data buffer. (SBC-3 READ(10) / READ(16).)
+    pub async fn read_block<T: BotTransport>(&self, t: &T, lba: u64) -> Result<Vec<u8>, MscError> {
         if self.lba_bytes == 0 || self.lba_bytes as usize > 4096 {
             return Err(MscError::BadLength);
         }
-        let lba_be = lba.to_be_bytes();
-        // CDB layout: opcode | flags | LBA[3..0] | group | xferlen[1..0] | ctrl
-        let cb = [
-            SCSI_READ_10,
-            0,
-            lba_be[0],
-            lba_be[1],
-            lba_be[2],
-            lba_be[3],
-            0,
-            0,
-            1,
-            0,
-        ];
+        let (cb, cb_len) = self.read_cdb(lba, 1)?;
         let mut out = alloc::vec![0u8; self.lba_bytes as usize];
-        let n = self.cmd_data_in(t, &cb, &mut out[..]).await?;
+        let n = self.cmd_data_in(t, &cb[..cb_len], &mut out[..]).await?;
         if n != self.lba_bytes as usize {
             return Err(MscError::BadLength);
         }
         Ok(out)
     }
 
-    /// `WRITE(10)` for a single block. SBC-3 §5.27.
+    /// `WRITE(10)` or `WRITE(16)` for a single block, selected
+    /// like [`Self::read_block`]. (SBC-3 WRITE(10) / WRITE(16).)
     pub async fn write_block<T: BotTransport>(
         &self,
         t: &T,
-        lba: u32,
+        lba: u64,
         data: &[u8],
     ) -> Result<(), MscError> {
         if data.len() != self.lba_bytes as usize {
             return Err(MscError::BadLength);
         }
-        let lba_be = lba.to_be_bytes();
-        let cb = [
-            SCSI_WRITE_10,
-            0,
-            lba_be[0],
-            lba_be[1],
-            lba_be[2],
-            lba_be[3],
-            0,
-            0,
-            1,
-            0,
-        ];
-        let n = self.cmd_data_out(t, &cb, data).await?;
+        let (cb, cb_len) = self.write_cdb(lba, 1, false)?;
+        let n = self.cmd_data_out(t, &cb[..cb_len], data).await?;
         if n != data.len() {
             return Err(MscError::BadLength);
         }
         Ok(())
     }
 
-    /// Multi-block `READ(10)`. Reads `nblocks` consecutive blocks
-    /// starting at `lba`. Bounded to `MSC_MAX_BLOCKS_PER_XFER` per
-    /// call. Returns the concatenated payload.
+    /// Multi-block READ. Reads `nblocks` consecutive blocks
+    /// starting at `lba`, in the LUN's 10- or 16-byte command
+    /// form. Bounded to `MSC_MAX_BLOCKS_PER_XFER` per call.
+    /// Returns the concatenated payload.
     pub async fn read_blocks<T: BotTransport>(
         &self,
         t: &T,
-        lba: u32,
+        lba: u64,
         nblocks: u16,
     ) -> Result<Vec<u8>, MscError> {
         if self.lba_bytes == 0 || nblocks == 0 || nblocks > MSC_MAX_BLOCKS_PER_XFER {
             return Err(MscError::BadLength);
         }
         let total = self.lba_bytes as usize * nblocks as usize;
-        let lba_be = lba.to_be_bytes();
-        let nb = nblocks.to_be_bytes();
-        let cb = [
-            SCSI_READ_10,
-            0,
-            lba_be[0],
-            lba_be[1],
-            lba_be[2],
-            lba_be[3],
-            0,
-            nb[0],
-            nb[1],
-            0,
-        ];
+        let (cb, cb_len) = self.read_cdb(lba, u32::from(nblocks))?;
         let mut out: Vec<u8> = alloc::vec![0u8; total];
-        let n = self.cmd_data_in(t, &cb, &mut out[..]).await?;
+        let n = self.cmd_data_in(t, &cb[..cb_len], &mut out[..]).await?;
         if n != total {
             return Err(MscError::BadLength);
         }
         Ok(out)
     }
 
-    /// Multi-block `WRITE(10)`. Writes `nblocks` blocks starting at
-    /// `lba`. `data.len()` must equal `nblocks * lba_bytes`.
+    /// Multi-block WRITE. Writes `nblocks` blocks starting at
+    /// `lba`, in the LUN's 10- or 16-byte command form.
+    /// `data.len()` must equal `nblocks * lba_bytes`.
     pub async fn write_blocks<T: BotTransport>(
         &self,
         t: &T,
-        lba: u32,
+        lba: u64,
         nblocks: u16,
         data: &[u8],
     ) -> Result<(), MscError> {
         self.write_blocks_inner(t, lba, nblocks, data, false).await
     }
 
-    /// Multi-block `WRITE(10)` with Force Unit Access: identical to
+    /// Multi-block WRITE with Force Unit Access: identical to
     /// [`Self::write_blocks`] except the CDB carries the FUA bit, so
     /// the device must commit the data to the medium (not merely to
     /// its volatile write cache) before the CSW reports completion.
@@ -798,7 +856,7 @@ impl MscDevice {
     pub async fn write_blocks_fua<T: BotTransport>(
         &self,
         t: &T,
-        lba: u32,
+        lba: u64,
         nblocks: u16,
         data: &[u8],
     ) -> Result<(), MscError> {
@@ -808,7 +866,7 @@ impl MscDevice {
     async fn write_blocks_inner<T: BotTransport>(
         &self,
         t: &T,
-        lba: u32,
+        lba: u64,
         nblocks: u16,
         data: &[u8],
         fua: bool,
@@ -820,21 +878,8 @@ impl MscDevice {
         {
             return Err(MscError::BadLength);
         }
-        let lba_be = lba.to_be_bytes();
-        let nb = nblocks.to_be_bytes();
-        let cb = [
-            SCSI_WRITE_10,
-            if fua { WRITE10_FUA } else { 0 },
-            lba_be[0],
-            lba_be[1],
-            lba_be[2],
-            lba_be[3],
-            0,
-            nb[0],
-            nb[1],
-            0,
-        ];
-        let n = self.cmd_data_out(t, &cb, data).await?;
+        let (cb, cb_len) = self.write_cdb(lba, u32::from(nblocks), fua)?;
+        let n = self.cmd_data_out(t, &cb[..cb_len], data).await?;
         if n != data.len() {
             return Err(MscError::BadLength);
         }
@@ -1231,6 +1276,7 @@ pub fn __insert_msc_for_test(slot_id: u8) -> usize {
         interface: 0,
         lba_bytes: 512,
         last_lba: 2047,
+        cmd16: false,
         generation: 0,
         tag: IrqSafeSpinLock::new(1),
         hub_port: None,
@@ -1342,6 +1388,34 @@ pub fn encode_write10_fua(lba: u32, nblocks: u16) -> [u8; 10] {
     cb
 }
 
+/// Encode a READ(16) CDB (SBC-3 READ(16)): opcode 0x88, the
+/// 64-bit LBA big-endian at bytes 2..10, and the 32-bit transfer
+/// length (in blocks) big-endian at bytes 10..14. Used for LUNs
+/// whose capacity crossed the 32-bit boundary (#832).
+pub fn encode_read16(lba: u64, nblocks: u32) -> [u8; 16] {
+    let mut cb = [0u8; 16];
+    cb[0] = SCSI_READ_16;
+    cb[2..10].copy_from_slice(&lba.to_be_bytes());
+    cb[10..14].copy_from_slice(&nblocks.to_be_bytes());
+    cb
+}
+
+/// Encode a WRITE(16) CDB (SBC-3 WRITE(16)): opcode 0x8A, with
+/// the same LBA / transfer-length layout as [`encode_read16`].
+pub fn encode_write16(lba: u64, nblocks: u32) -> [u8; 16] {
+    let mut cb = encode_read16(lba, nblocks);
+    cb[0] = SCSI_WRITE_16;
+    cb
+}
+
+/// Encode a WRITE(16) CDB with Force Unit Access set (byte 1
+/// bit 3), the 16-byte counterpart of [`encode_write10_fua`].
+pub fn encode_write16_fua(lba: u64, nblocks: u32) -> [u8; 16] {
+    let mut cb = encode_write16(lba, nblocks);
+    cb[1] = WRITE10_FUA;
+    cb
+}
+
 /// Encode a SYNCHRONIZE CACHE(10) CDB (SBC-3) for a whole-medium
 /// flush: LBA = 0 and NUMBER OF BLOCKS = 0, which the standard
 /// defines as "all blocks from the LBA to the end of the medium".
@@ -1399,6 +1473,12 @@ pub struct UsbMscBlockDevice {
     lba_size: u32,
     /// Cached capacity in LBAs.
     capacity: u64,
+    /// Cached command form of the bound LUN: true when its
+    /// capacity crossed the 32-bit boundary and BOT commands use
+    /// the 16-byte CDBs (#832). Captured at construction like
+    /// `lba_size` / `capacity`; the request range preflight uses
+    /// it to judge which LBA space a request must fit.
+    cmd16: bool,
 }
 
 impl core::fmt::Debug for UsbMscBlockDevice {
@@ -1408,6 +1488,7 @@ impl core::fmt::Debug for UsbMscBlockDevice {
             .field("generation", &self.generation)
             .field("lba_size", &self.lba_size)
             .field("capacity", &self.capacity)
+            .field("cmd16", &self.cmd16)
             .finish()
     }
 }
@@ -1426,7 +1507,8 @@ impl UsbMscBlockDevice {
             idx,
             generation: dev.generation,
             lba_size: dev.lba_bytes,
-            capacity: dev.last_lba as u64 + 1,
+            capacity: dev.last_lba + 1,
+            cmd16: dev.cmd16,
         })
     }
 
@@ -1449,7 +1531,17 @@ impl UsbMscBlockDevice {
     fn transport_snapshot(
         &self,
     ) -> Result<(alloc::sync::Arc<Xhci>, MscDevice), narf_block::BlockIoError> {
-        let (slot_id, bulk_in_dci, bulk_out_dci, lun, interface, lba_bytes, generation, hub_port) = {
+        let (
+            slot_id,
+            bulk_in_dci,
+            bulk_out_dci,
+            lun,
+            interface,
+            lba_bytes,
+            cmd16,
+            generation,
+            hub_port,
+        ) = {
             let g = MSC_DEVICES.lock();
             let dev = match g.get(self.idx).and_then(|slot| slot.as_ref()) {
                 Some(d) => d,
@@ -1465,6 +1557,7 @@ impl UsbMscBlockDevice {
                 dev.lun,
                 dev.interface,
                 dev.lba_bytes,
+                dev.cmd16,
                 dev.generation,
                 dev.hub_port,
             )
@@ -1483,6 +1576,7 @@ impl UsbMscBlockDevice {
                 interface,
                 lba_bytes,
                 last_lba: 0,
+                cmd16,
                 generation,
                 tag: IrqSafeSpinLock::new(1),
                 hub_port,
@@ -1566,14 +1660,23 @@ fn block_chunks(
     lba: u64,
     n_blocks: u16,
     lba_bytes: u32,
-) -> Result<impl Iterator<Item = (u32, u16, core::ops::Range<usize>)>, narf_block::BlockIoError> {
+    cmd16: bool,
+) -> Result<impl Iterator<Item = (u64, u16, core::ops::Range<usize>)>, narf_block::BlockIoError> {
     if !lba_bytes.is_power_of_two() || !(512..=4096).contains(&lba_bytes) {
         return Err(narf_block::BlockIoError::DriverError);
     }
     let end = lba
         .checked_add(n_blocks as u64)
         .ok_or(narf_block::BlockIoError::OutOfRange)?;
-    if lba > u32::MAX as u64 || end > u32::MAX as u64 + 1 {
+    // The request must fit the LUN's command form: a 10-byte-CDB
+    // device addresses at most 2^32 blocks, while a 16-byte-CDB
+    // device (#832) spans the full u64 LBA space.
+    let max_end = if cmd16 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX) + 1
+    };
+    if end > max_end {
         return Err(narf_block::BlockIoError::OutOfRange);
     }
     let max_blocks = (4096 / lba_bytes).min(MSC_MAX_BLOCKS_PER_XFER as u32) as usize;
@@ -1583,7 +1686,7 @@ fn block_chunks(
             let count = (n_blocks as usize - offset).min(max_blocks);
             let start = offset * lba_bytes as usize;
             (
-                (lba + offset as u64) as u32,
+                lba + offset as u64,
                 count as u16,
                 start..start + count * lba_bytes as usize,
             )
@@ -1644,7 +1747,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         {
             return Err(narf_block::BlockIoError::OutOfRange);
         }
-        let chunks = block_chunks(lba, n_blocks, self.lba_size)?;
+        let chunks = block_chunks(lba, n_blocks, self.lba_size, self.cmd16)?;
         let expected = n_blocks as usize * self.lba_size as usize;
         if data.len() < expected {
             return Err(narf_block::BlockIoError::BufferTooSmall);
@@ -1675,7 +1778,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         {
             return Err(narf_block::BlockIoError::OutOfRange);
         }
-        let chunks = block_chunks(lba, n_blocks, self.lba_size)?;
+        let chunks = block_chunks(lba, n_blocks, self.lba_size, self.cmd16)?;
         let expected = n_blocks as usize * self.lba_size as usize;
         if out.len() < expected {
             return Err(narf_block::BlockIoError::BufferTooSmall);
@@ -1692,7 +1795,17 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         // anything against the current occupant. The hub context
         // rides along so the snapshot's transfer funnels can
         // resume / feed the port (#840).
-        let (slot_id, bulk_in_dci, bulk_out_dci, lun, interface, lba_bytes, generation, hub_port) = {
+        let (
+            slot_id,
+            bulk_in_dci,
+            bulk_out_dci,
+            lun,
+            interface,
+            lba_bytes,
+            cmd16,
+            generation,
+            hub_port,
+        ) = {
             let g = MSC_DEVICES.lock();
             let dev = match g.get(self.idx).and_then(|slot| slot.as_ref()) {
                 Some(d) => d,
@@ -1708,6 +1821,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
                 dev.lun,
                 dev.interface,
                 dev.lba_bytes,
+                dev.cmd16,
                 dev.generation,
                 dev.hub_port,
             )
@@ -1724,6 +1838,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             interface,
             lba_bytes,
             last_lba: 0,
+            cmd16,
             generation,
             tag: IrqSafeSpinLock::new(1),
             hub_port,
@@ -1749,7 +1864,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         {
             return Err(narf_block::BlockIoError::OutOfRange);
         }
-        let chunks = block_chunks(lba, n_blocks, self.lba_size)?;
+        let chunks = block_chunks(lba, n_blocks, self.lba_size, self.cmd16)?;
         let expected = n_blocks as usize * self.lba_size as usize;
         if data.len() < expected {
             return Err(narf_block::BlockIoError::BufferTooSmall);
@@ -1760,7 +1875,17 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         // the disk that reused its index after a replug. The hub
         // context rides along so the snapshot's transfer funnels
         // can resume / feed the port (#840).
-        let (slot_id, bulk_in_dci, bulk_out_dci, lun, interface, lba_bytes, generation, hub_port) = {
+        let (
+            slot_id,
+            bulk_in_dci,
+            bulk_out_dci,
+            lun,
+            interface,
+            lba_bytes,
+            cmd16,
+            generation,
+            hub_port,
+        ) = {
             let g = MSC_DEVICES.lock();
             let dev = match g.get(self.idx).and_then(|slot| slot.as_ref()) {
                 Some(d) => d,
@@ -1776,6 +1901,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
                 dev.lun,
                 dev.interface,
                 dev.lba_bytes,
+                dev.cmd16,
                 dev.generation,
                 dev.hub_port,
             )
@@ -1792,6 +1918,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             interface,
             lba_bytes,
             last_lba: 0,
+            cmd16,
             generation,
             tag: IrqSafeSpinLock::new(1),
             hub_port,
@@ -1818,7 +1945,7 @@ mod block_tests {
 
     fn smoke_msc_filesystem_request_chunks() -> TestResult {
         // A btrfs node on a 512-byte disk, including a partial final chunk.
-        let chunks: Vec<_> = block_chunks(100, 33, 512).unwrap().collect();
+        let chunks: Vec<_> = block_chunks(100, 33, 512, false).unwrap().collect();
         if chunks
             != [
                 (100, 8, 0..4096),
@@ -1830,17 +1957,27 @@ mod block_tests {
         {
             return TestResult::Fail("filesystem request lost or overlapped blocks");
         }
-        let chunks: Vec<_> = block_chunks(u32::MAX as u64 - 1, 2, 4096)
+        let chunks: Vec<_> = block_chunks(u32::MAX as u64 - 1, 2, 4096, false)
             .unwrap()
             .collect();
         if chunks != [(u32::MAX - 1, 1, 0..4096), (u32::MAX, 1, 4096..8192)] {
             return TestResult::Fail("4K logical blocks exceeded the DMA buffer");
         }
-        if block_chunks(u32::MAX as u64, 2, 512).is_ok()
-            || block_chunks(0, 1, 8192).is_ok()
-            || block_chunks(0, 1, 0).is_ok()
+        if block_chunks(u32::MAX as u64, 2, 512, false).is_ok()
+            || block_chunks(0, 1, 8192, false).is_ok()
+            || block_chunks(0, 1, 0, false).is_ok()
         {
             return TestResult::Fail("invalid BOT geometry or READ(10) range accepted");
+        }
+        // The same range that overflows a 10-byte CDB is ordinary
+        // on a 16-byte-CDB device (#832): chunking must accept it
+        // and carry the full 64-bit LBA into every chunk.
+        let wide: Vec<_> = match block_chunks(u32::MAX as u64, 2, 512, true) {
+            Ok(it) => it.collect(),
+            Err(_) => return TestResult::Fail("READ(16) range refused by chunking"),
+        };
+        if wide != [(u32::MAX as u64, 2, 0..1024)] {
+            return TestResult::Fail("READ(16) chunks lost the high LBA bits");
         }
         TestResult::Pass
     }
@@ -1853,6 +1990,7 @@ mod block_tests {
             generation: 0,
             lba_size: 512,
             capacity: u64::MAX,
+            cmd16: false,
         };
         // The first LBA fits WRITE(10), but the final one does not. Refuse
         // the whole request before looking up transport or taking a claim.
