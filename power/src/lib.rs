@@ -78,6 +78,7 @@ mod suspend_service_tests;
 mod tests;
 #[cfg(feature = "kernel-test")]
 mod token_resume_tests;
+#[cfg(feature = "kernel-test")]
 mod tpm_anchor_tests;
 #[cfg(feature = "kernel-test")]
 mod tpm_lifecycle_tests;
