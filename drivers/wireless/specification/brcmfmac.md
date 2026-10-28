@@ -608,6 +608,39 @@ mapping freed, a second removal is absent),
 again, nothing freed) and `smoke_brcmf_late_dma_or_halt_fails_stop_proof`
 (post-clear index change and FWHALT keep memory retained).
 
+### Dead-firmware stop (FWHALT, lost power)
+
+A generation whose firmware halted (`BRCMF_D2H_DEV_FWHALT`, Linux v7.2
+`pcie.c::brcmf_pcie_handle_mb_data` -> `core.c::brcmf_fw_crashed`), lost
+power across suspend (`brcmf_pcie_pm_leave_D3` reads `INTMASK` == 0) or
+never answered D3_INFORM cannot complete the confirmed stop above.
+`Runtime::stop_dead` (`runtime/reset.rs`) is its proof:
+
+1. Bus down and terminal; `brcmf_pcie_release_irq`; BME cleared with a
+   verified readback.
+2. Two non-posted flush reads after the clear (D2H write indices, then
+   `MAILBOXINT`, then the indices again): the function must be present
+   (not all-ones) and the indices unchanged.
+3. `Runtime::reset_device`, exactly Linux `brcmf_pcie_reset_device`: clear
+   `BRCMF_PCIE_LINK_STATUS_CTRL_ASPM_ENAB` in config `0xBC`, write 4 to the
+   ChipCommon `watchdog` (0x80), sleep 100 ms, restore the link-control
+   word and, on PCIe2 core revision <= 13, rewrite the eleven
+   `BRCMF_PCIE_CFGREG_*` words through `CONFIGADDR`/`CONFIGDATA`. BME must
+   still read clear after that shadow restore (re-parked once if not).
+4. The ARM CR4 is halted (`brcmf_chip_set_passive`: CR4 reset with
+   `ARMCR4_BCMA_IOCTL_CPUHALT`, D11 cores disabled) and its wrapper
+   `ioctrl` must read back `CPUHALT` with `resetctrl` out of reset.
+
+Only then is the owner reclaimable. `Adapter::stop_transport` takes this
+path when the generation is already terminal or `quiesce` failed with
+`Failed` (FWHALT during the wait) or `Timeout` (no ack); a confirmed-stop
+proof that observed device activity after the BME clear (`Protocol`)
+never falls back and stays pinned. A vanished function (all-ones reads)
+or a revoked firmware proof (every BAR0 access is gated on it) keeps the
+mappings pinned. Smokes: `smoke_brcmf_dead_firmware_stop_resets_and_reclaims`,
+`smoke_brcmf_dead_stop_without_device_keeps_dma_pinned`,
+`smoke_brcmf_remove_after_fwhalt_takes_dead_stop_and_reclaims`.
+
 ### Flow-ring budget
 
 The host flow budget follows the firmware ring info: `max_flowrings`

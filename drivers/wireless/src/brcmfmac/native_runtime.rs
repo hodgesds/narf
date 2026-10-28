@@ -607,7 +607,27 @@ impl runtime::Bus for PcieBackplane {
     fn disarm_interrupts(&mut self) {
         self.disarm_msi();
     }
+    fn link_control(&mut self) -> Result<u32, runtime::Error> {
+        self.qualified().map_err(|_| runtime::Error::Access)?;
+        let cap = self.cap;
+        invoke_registers(&cap, || {
+            narf_bus::pci::read_config32(&self.cap, &self.device, LINK_STATUS_CTRL)
+                .map_err(|_| runtime::Error::Access)
+        })
+        .map_err(|_| runtime::Error::Access)?
+    }
+    fn set_link_control(&mut self, value: u32) -> Result<(), runtime::Error> {
+        self.qualified().map_err(|_| runtime::Error::Access)?;
+        let cap = self.cap;
+        invoke_registers(&cap, || {
+            narf_bus::pci::write_config32(&self.cap, &self.device, LINK_STATUS_CTRL, value)
+                .map_err(|_| runtime::Error::Access)
+        })
+        .map_err(|_| runtime::Error::Access)?
+    }
 }
+/// Linux `BRCMF_PCIE_REG_LINK_STATUS_CTRL`.
+const LINK_STATUS_CTRL: u16 = 0xbc;
 /// Linux `BRCMF_PCIE_REG_SBMBX`: host-to-dongle mailbox doorbell in
 /// configuration space.
 const SBMBX: u16 = 0x98;

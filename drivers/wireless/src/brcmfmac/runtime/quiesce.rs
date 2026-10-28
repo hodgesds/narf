@@ -145,7 +145,7 @@ impl<B: Bus> Runtime<B> {
             }
         }
     }
-    fn completion_indices(&mut self) -> Result<[u16; 3], Error> {
+    pub(super) fn completion_indices(&mut self) -> Result<[u16; 3], Error> {
         let mut indices = [0; 3];
         for (slot, ring_id) in (2..5).enumerate() {
             let address = self.resources.as_ref().unwrap().rings[ring_id].wptr;

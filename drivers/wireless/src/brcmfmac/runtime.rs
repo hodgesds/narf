@@ -14,8 +14,11 @@ use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 pub mod mailbox;
 #[path = "runtime/quiesce.rs"]
 mod quiesce;
+#[path = "runtime/reset.rs"]
+mod reset;
 use super::irq::Signal;
 pub use quiesce::StopProof;
+pub use reset::DeadStop;
 
 const INPUT: usize = 1518;
 const CONTROL: usize = 8192;
@@ -80,6 +83,14 @@ pub trait Bus: BootBus {
     }
     /// Release a vector bound by [`Self::arm_interrupts`].
     fn disarm_interrupts(&mut self) {}
+    /// Config dword `BRCMF_PCIE_REG_LINK_STATUS_CTRL` (0xBC).
+    fn link_control(&mut self) -> Result<u32, Error> {
+        Err(Error::Protocol)
+    }
+    /// Write config dword `BRCMF_PCIE_REG_LINK_STATUS_CTRL` (0xBC).
+    fn set_link_control(&mut self, _value: u32) -> Result<(), Error> {
+        Err(Error::Protocol)
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Kind {
@@ -194,6 +205,9 @@ pub struct Runtime<B: Bus> {
     /// Set only by a complete confirmed-stop proof (`quiesce.rs`).
     reclaimable: bool,
     hostrdy_db1: bool,
+    /// Discovered AI cores of the booted chip (ChipCommon watchdog, PCIe2
+    /// config shadow and ARM CR4 halt for `brcmf_pcie_reset_device`).
+    cores: Vec<super::chip::Core>,
 }
 impl<B: Bus> core::fmt::Debug for Runtime<B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -227,7 +241,7 @@ impl<B: Bus> Runtime<B> {
             ram,
             shared_address,
             shared,
-            ..
+            chip,
         } = boot;
         // Shared 7 (BRCMF_PCIE_SHARED_VERSION_7) keeps the v6 ring-info
         // layout and only widens the D2H TX/RX completion items to 24/40
@@ -358,6 +372,7 @@ impl<B: Bus> Runtime<B> {
             down: false,
             reclaimable: false,
             hostrdy_db1: shared.hostrdy_db1(),
+            cores: chip.cores,
         };
         if let Some(reg) = runtime.bus.mailbox() {
             for address in [shared.htod_mb_data_addr, shared.dtoh_mb_data_addr] {

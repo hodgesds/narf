@@ -60,6 +60,16 @@ struct State {
     parks: usize,
     /// A device posted write lands after BME clear (flush proof must fail).
     late_dma: bool,
+    /// `BRCMF_PCIE_REG_LINK_STATUS_CTRL` and every value written to it.
+    lsc: u32,
+    lsc_writes: Vec<u32>,
+    /// ChipCommon watchdog resets and PCIe2 config-shadow rewrites.
+    watchdogs: usize,
+    shadow_restores: usize,
+    /// Allocations made before the last watchdog reset.
+    generation_base: usize,
+    /// The function fell off the bus: every BAR read returns all-ones.
+    gone: bool,
 }
 pub(crate) struct Model(Rc<IrqSafeSpinLock<State>>);
 pub(crate) struct Mem {
@@ -112,6 +122,9 @@ impl Memory for Mem {
 impl chip::Backplane for Model {
     fn read32(&mut self, at: u32) -> Result<u32, chip::Error> {
         let s = self.0.lock();
+        if s.gone {
+            return Ok(u32::MAX);
+        }
         if at == ARM + 0x44 {
             return Ok(15);
         }
@@ -128,6 +141,13 @@ impl chip::Backplane for Model {
         }
         s.registers.insert(at, value);
         s.writes.push((at, value));
+        if at == chip::ENUM_BASE + 0x80 && value == 4 {
+            watchdog(&mut s);
+        }
+        // CONFIGDATA of the discovered PCIe2 core (EROM base 0x18012000).
+        if at == PCIE2_CORE + 0x124 {
+            s.shadow_restores += 1;
+        }
         if at == WRAP + 0x408
             && value & 0x20 == 0
             && s.writes.iter().any(|&(a, v)| a == 0 && v == 0x11223344)
@@ -187,7 +207,9 @@ impl runtime::Bus for Model {
     }
     fn enable_dma(&mut self) -> Result<(), runtime::Error> {
         let mut s = self.0.lock();
-        if s.allocated != 24 {
+        // Every generation publishes exactly 24 mappings before BME; an
+        // earlier generation's are freed (or pinned) by then.
+        if s.allocated - s.generation_base != 24 {
             return Err(runtime::Error::Protocol);
         }
         s.dma_enable = true;
@@ -238,8 +260,42 @@ impl runtime::Bus for Model {
         s.disarmed += 1;
         s.signal = None;
     }
+    fn link_control(&mut self) -> Result<u32, runtime::Error> {
+        Ok(self.0.lock().lsc)
+    }
+    fn set_link_control(&mut self, value: u32) -> Result<(), runtime::Error> {
+        let mut s = self.0.lock();
+        s.lsc = value;
+        s.lsc_writes.push(value);
+        Ok(())
+    }
+}
+/// ChipCommon watchdog reset: the firmware generation, its TCM indices and
+/// mailbox state are lost; the chip waits halted for a new download.
+fn watchdog(s: &mut State) {
+    s.watchdogs += 1;
+    s.generation_base = s.allocated;
+    s.started = false;
+    s.writes.retain(|&(at, _)| at != 0);
+    for base in [H2DW, H2DR, D2HW, D2HR] {
+        put(s, base, &[0; 0x40]);
+    }
+    put(s, HTOD_MB, &[0; 8]);
+    put(s, BASE + SIZE - 4, &[0; 4]);
+    for register in [PCIE + 0x24, PCIE + 0x48, PCIE + 0x4c] {
+        s.registers.insert(register, 0);
+    }
+    if let Some(firmware) = s.firmware.as_mut() {
+        firmware.control_read = 0;
+        firmware.completion_write = 0;
+        firmware.responses.clear();
+        if let Some(station) = firmware.station.as_mut() {
+            station.reboot();
+        }
+    }
 }
 const PCIE: u32 = 0x18003000;
+const PCIE2_CORE: u32 = 0x18012000;
 const HTOD_MB: u32 = BASE + 0x500;
 const DTOH_MB: u32 = BASE + 0x504;
 /// Firmware half of the host<->dongle mailbox: consumes the H2D word and
@@ -479,7 +535,10 @@ fn profile() -> boot::BoardProfile {
         nvram: "brcm/fixture.txt",
     }
 }
-fn booted(bus: Model) -> boot::Booted<Model> {
+fn booted(mut bus: Model) -> boot::Booted<Model> {
+    let cores = chip::Chip::discover(&mut bus)
+        .map(|chip| chip.cores)
+        .unwrap_or_default();
     let s = bus.0.lock();
     let mut bytes = [0; 76];
     for (i, b) in bytes.iter_mut().enumerate() {
@@ -497,7 +556,7 @@ fn booted(bus: Model) -> boot::Booted<Model> {
         chip: chip::Chip {
             id: 43602,
             revision: 3,
-            cores: vec![],
+            cores,
         },
     }
 }

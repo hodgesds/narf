@@ -136,6 +136,22 @@ impl Firmware {
             statuses: 0,
         }
     }
+    /// Watchdog reset: the session (rings, flows, association, keys)
+    /// is lost; the configured profile of this fixture is kept.
+    pub(super) fn reboot(&mut self) {
+        let mut fresh = Self::new(self.secured);
+        fresh.keys_first = self.keys_first;
+        fresh.mfp_supported = self.mfp_supported;
+        fresh.pmf_required = self.pmf_required;
+        fresh.mfp_fault = self.mfp_fault;
+        fresh.mfp_missing = self.mfp_missing;
+        fresh.phy_profile = self.phy_profile;
+        fresh.wide = self.wide.take();
+        fresh.vht = self.vht.take();
+        fresh.channel = self.channel;
+        fresh.wme_ac_sta = self.wme_ac_sta;
+        *self = fresh;
+    }
     pub(super) fn post_event(&mut self, descriptor: &[u8]) {
         self.event_posts.push_back((
             u32::from_le_bytes(descriptor[4..8].try_into().unwrap()),
@@ -816,6 +832,27 @@ impl Handle {
     pub(crate) fn mappings(&self) -> (usize, usize) {
         let s = self.0.lock();
         (s.allocated, s.dropped)
+    }
+    /// Firmware posts `BRCMF_D2H_DEV_FWHALT` (Linux `brcmf_fw_crashed`).
+    pub(crate) fn fwhalt(&self) {
+        raise_mailbox(&mut self.0.lock(), runtime::mailbox::D2H_DEV_FWHALT);
+    }
+    /// The dongle lost power across suspend: `INTMASK` reads zero.
+    pub(crate) fn power_lost(&self) {
+        self.0.lock().registers.insert(PCIE + 0x24, 0);
+    }
+    /// The function fell off the bus.
+    pub(crate) fn gone(&self, value: bool) {
+        self.0.lock().gone = value;
+    }
+    /// (watchdog resets, config-shadow rewrites, link-control writes).
+    pub(crate) fn resets(&self) -> (usize, usize, Vec<u32>) {
+        let s = self.0.lock();
+        (s.watchdogs, s.shadow_restores, s.lsc_writes.clone())
+    }
+    /// ARM CR4 wrapper `ioctrl` (bit 5 = `CPUHALT`).
+    pub(crate) fn cr4_ioctrl(&self) -> u32 {
+        *self.0.lock().registers.get(&(WRAP + 0x408)).unwrap_or(&0)
     }
     pub(crate) fn dma_enabled(&self) -> bool {
         self.0.lock().dma_enable

@@ -88,3 +88,38 @@ kernel_test_in!(
     "drivers/wireless/brcmfmac/station",
     smoke_brcmf_remove_without_stop_proof_keeps_mappings_pinned
 );
+
+/// FWHALT (Linux `brcmf_fw_crashed`) fails the joined generation; removal
+/// cannot get a D3 ack and takes the dead-firmware stop: BME clear, flush,
+/// ChipCommon watchdog, halted CR4, and only then every mapping is freed.
+fn smoke_brcmf_remove_after_fwhalt_takes_dead_stop_and_reclaims() -> TestResult {
+    let harness = match joined() {
+        Ok(harness) => harness,
+        Err(error) => return TestResult::Fail(error),
+    };
+    harness.bus.fwhalt();
+    harness.device.drain();
+    if harness.device.link_up() {
+        return TestResult::Fail("FWHALT left the carrier up");
+    }
+    let generation = Generation::new(harness.device.clone());
+    if narf_scheduler::block_on(generation.remove()) != Removal::Reclaimed {
+        return TestResult::Fail("halted generation was not reclaimed by the dead stop");
+    }
+    let (allocated, dropped) = harness.bus.mappings();
+    let (watchdogs, shadows, _) = harness.bus.resets();
+    if allocated != dropped
+        || watchdogs != 1
+        || shadows != 11
+        || harness.bus.cr4_ioctrl() & 0x20 == 0
+        || harness.bus.dma_enabled()
+    {
+        return TestResult::Fail("dead stop skipped reset/halt or left DMA mapped");
+    }
+    restore(&harness);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/station",
+    smoke_brcmf_remove_after_fwhalt_takes_dead_stop_and_reclaims
+);

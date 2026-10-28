@@ -240,7 +240,21 @@ where
         if inner.is_reclaimable() {
             return Ok(());
         }
-        inner.quiesce().await.map(|_| ()).map_err(map)
+        // A live generation acknowledges D3. A halted or terminal one (or
+        // one whose ack never came) takes the dead-firmware stop; a proof
+        // that observed device activity after the BME clear never does.
+        let confirmed = if inner.is_failed() {
+            Err(runtime::Error::Failed)
+        } else {
+            inner.quiesce().await.map(|_| ())
+        };
+        match confirmed {
+            Ok(()) => Ok(()),
+            Err(runtime::Error::Failed | runtime::Error::Timeout) => {
+                inner.stop_dead().await.map(|_| ()).map_err(map)
+            }
+            Err(error) => Err(map(error)),
+        }
     }
     fn release_transport(&mut self) -> bool {
         self.failed = true;

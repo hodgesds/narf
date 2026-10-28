@@ -411,6 +411,92 @@ kernel_test_in!(
     smoke_brcmf_system_suspend_timeout_unwinds_usable
 );
 
+/// FWHALT: no D3 ack can arrive. The dead stop releases the IRQ, clears
+/// BME, flushes, runs `brcmf_pcie_reset_device` (ASPM off, ChipCommon
+/// watchdog, ASPM restore, PCIe2 rev <= 13 shadow rewrite) and reads back a
+/// halted CR4; only then are the mappings freed.
+fn smoke_brcmf_dead_firmware_stop_resets_and_reclaims() -> TestResult {
+    let (bus, s) = model();
+    {
+        let mut st = s.lock();
+        st.msi = true;
+        st.lsc = 0x0011_0043;
+    }
+    let mut owner = match runtime::Runtime::attach(booted(bus)) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("attach failed"),
+    };
+    if owner.enable_data().is_err() {
+        return TestResult::Fail("RX posting failed");
+    }
+    raise_mailbox(&mut s.lock(), D2H_DEV_FWHALT);
+    if owner.poll().is_ok() || !owner.is_failed() {
+        return TestResult::Fail("FWHALT did not fail the generation");
+    }
+    if ready(owner.quiesce()) != Some(Err(runtime::Error::Failed)) {
+        return TestResult::Fail("halted firmware entered the D3 handshake");
+    }
+    let proof = match narf_scheduler::block_on(owner.stop_dead()) {
+        Ok(proof) => proof,
+        Err(_) => return TestResult::Fail("dead-firmware stop failed"),
+    };
+    {
+        let st = s.lock();
+        if !owner.is_reclaimable() || st.dma_enable || st.disarmed != 1 || mask(&st) != 0 {
+            return TestResult::Fail("dead stop missed IRQ release or BME clear");
+        }
+        if st.lsc_writes != [0x0011_0040, 0x0011_0043]
+            || st.watchdogs != 1
+            || st.shadow_restores != 11
+        {
+            return TestResult::Fail("dead stop missed ASPM/watchdog/config shadow");
+        }
+        if proof.halted & 0x20 == 0 || st.dropped != 0 {
+            return TestResult::Fail("dead stop missed CR4 halt or freed early");
+        }
+    }
+    if narf_scheduler::block_on(owner.stop_dead()) != Err(runtime::Error::Busy) {
+        return TestResult::Fail("second dead stop accepted");
+    }
+    drop(owner);
+    let st = s.lock();
+    if st.dropped != st.allocated || st.unsafe_free != 0 {
+        return TestResult::Fail("dead stop did not reclaim every mapping");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmf_dead_firmware_stop_resets_and_reclaims
+);
+
+/// A function that fell off the bus answers all-ones: the flush read
+/// cannot prove ordering, nothing is reset and every mapping stays pinned.
+fn smoke_brcmf_dead_stop_without_device_keeps_dma_pinned() -> TestResult {
+    let (bus, s) = model();
+    let mut owner = match runtime::Runtime::attach(booted(bus)) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("attach failed"),
+    };
+    owner.fail();
+    s.lock().gone = true;
+    if narf_scheduler::block_on(owner.stop_dead()) != Err(runtime::Error::Access)
+        || owner.is_reclaimable()
+        || s.lock().watchdogs != 0
+    {
+        return TestResult::Fail("vanished function passed the dead stop");
+    }
+    drop(owner);
+    if s.lock().dropped != 0 {
+        return TestResult::Fail("unproven dead stop released DMA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmf_dead_stop_without_device_keeps_dma_pinned
+);
+
 /// Flow budget follows firmware `max_flowrings` (Linux
 /// `brcmf_pcie_init_ringbuffers`), capped at `BRCMF_FLOWRING_HASHSIZE - 1`.
 fn smoke_brcmf_flow_budget_follows_firmware_max_flowrings() -> TestResult {
