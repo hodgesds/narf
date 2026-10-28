@@ -100,6 +100,35 @@ pub fn capture() {
 // baseline was stale by exactly those merges. The entries below
 // are updated to the verified set; the fixture still asserts
 // exact-set, exact-order equality.
+//
+// CORRECTION (2026-10-28, CI run 40671227858 on this branch's
+// rebased head 262e83cf8): the baseline again predates merges
+// that landed on main after the 2026-10-27 refresh — Subsys
+// recorded 152 where the snapshot composes 154, and Late
+// recorded 65 where the snapshot composes 68. Each delta name
+// is accounted for by a named, already-merged PR, verified
+// against the registration sites on main and the crate call
+// order in frame's boot sequence: PR #1144 (WWAN CDC-MBIM)
+// added `wwan-usb-mbim` at Subsys (snapshot index 81, directly
+// before `ext-fs-factory`; `narf-drivers-wwan` registers it at
+// drivers/wwan/src/lib.rs:182, and frame calls that crate after
+// media, before the fs factories); PR #1105 (vendor laptop WMI
+// surfaces) added `think-lmi` at Subsys (directly after
+// `laptop-vendor-drivers` — the platform crate's last Subsys
+// registration, drivers/platform/src/lib.rs:289) and
+// `wmi-userspace-surfaces` at Late (directly after
+// `power-service-wiring` — the platform crate's last Late
+// registration, lib.rs:298); PR #1127 (SBS smart battery) added
+// `acpi-sbs` at Late (directly before `power-service-wiring`,
+// its registration order at lib.rs:204); PR #1137 (RTSX) added
+// `rtsx-card-poll` at Late (snapshot index 5, directly before
+// `usb-hid-supervisor`; the storage facade registers it at
+// drivers/storage/src/lib.rs:111, and frame calls the facade
+// after usbpd, before usb) — it is also added to
+// STORAGE_GROUP_NAMES below, since the facade owns it. No
+// other stage diverged, and no delta name is unaccounted for.
+// The entries below are updated to the verified set; the
+// fixture still asserts exact-set, exact-order equality.
 // The recording is reality, not an ideal: on x86_64 the `arch` stage
 // is empty and `ipmi`, `itco_wdt`, and `usb-r8152` each register
 // twice at Subsys (pre-existing duplicate registrations; the census
@@ -201,6 +230,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "media-cec-gpio",
         "media-rtl2832",
         "media-tc358743",
+        "wwan-usb-mbim",
         "ext-fs-factory",
         "ext4-fs-features",
         "fat-fs-factory",
@@ -230,6 +260,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "amd-aoac",
         "wmi-vendors",
         "laptop-vendor-drivers",
+        "think-lmi",
         "hwmon-k10temp",
         "hwmon-nct6775",
         "hwmon-it87",
@@ -272,7 +303,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "itco_wdt",
         "pl011",
         "psmouse",
-    ], // subsys: 152
+    ], // subsys: 154
     &[
         "modules-sysfs",
         "devfs-mount",
@@ -309,12 +340,15 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "virtio-mem-config-pump",
         "usbpd-ucsi-acpi",
         "usbpd-tcpc-probe",
+        "rtsx-card-poll",
         "usb-hid-supervisor",
         "usb-ccid-supervisor",
         "usb4-native-cm",
         "fat-bootlog",
         "btrfs-crash-check",
+        "acpi-sbs",
         "power-service-wiring",
+        "wmi-userspace-surfaces",
         "hwmon-sysfs-bridge",
         "hwmon-cooling",
         "intel-gpu-dp-bridge",
@@ -369,7 +403,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "virtio-gpu-splash",
         "mt76-firmware",
         "amdgpu-discrete-firmware",
-    ], // late: 65
+    ], // late: 68
 ];
 
 /// The recorded baseline for the running arch, if one has been
@@ -410,10 +444,10 @@ const NET_GROUP_NAMES: &[&str] = &[
 ];
 
 /// Names the storage facade registers when frame's
-/// `drivers-storage` group is selected: six Subsys registrations
-/// plus the Device-stage VMD registration, from
-/// `narf_drivers_storage::register_initcalls`. Same maintenance
-/// rule as `NET_GROUP_NAMES`.
+/// `drivers-storage` group is selected: six Subsys registrations,
+/// the Late RTSX card-detect poll, and the Device-stage VMD
+/// registration, from `narf_drivers_storage::register_initcalls`.
+/// Same maintenance rule as `NET_GROUP_NAMES`.
 const STORAGE_GROUP_NAMES: &[&str] = &[
     "ahci",
     "megaraid",
@@ -421,6 +455,7 @@ const STORAGE_GROUP_NAMES: &[&str] = &[
     "mpt3sas",
     "sdhci",
     "rtsx",
+    "rtsx-card-poll",
     "intel-vmd",
 ];
 
