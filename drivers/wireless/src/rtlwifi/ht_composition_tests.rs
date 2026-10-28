@@ -117,8 +117,8 @@ fn composition(protected: bool) -> Result<(), &'static str> {
         return Err("HT native RX exact IP/retained DMA changed");
     }
     complete(h.device.disassociate()).map_err(|_| "HT native close")?;
-    if !h.closed() || h.packet.model.lock().master {
-        return Err("HT terminal close retained admission");
+    if !h.closed() || !h.passive() {
+        return Err("HT close did not return to Passive");
     }
     Ok(())
 }

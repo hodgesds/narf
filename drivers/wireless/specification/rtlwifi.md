@@ -899,6 +899,47 @@ keeps the owner and every mapping; never-associated removal) and
 address ignored, quarantined re-probe refused without I/O, reclaimed
 removal lifts the quarantine).
 
+### RTL8188EE safe rejoin after disassociation (implemented)
+
+Linux v7.2 never stops the PCI engines on disassociation: mac80211
+`ieee80211_set_disassoc` reaches `core.c::rtl_op_bss_info_changed`
+(`BSS_CHANGED_ASSOC`, `!assoc`), which leaves LPS, sends
+`HW_VAR_H2C_FW_JOINBSSRPT(RT_MEDIA_DISCONNECT)`, sets the NO_LINK network
+type and clears the BSSID, then `rtl_op_sta_remove` drops the station; a
+later scan/association reuses the same rings, firmware and interrupts.
+`Prepared::disconnect_station` follows that when the owner is running and
+its last frame has a host receipt (`rejoinable`):
+
+- `leave_station_peer` leaves LPS, sends JOINBSSRPT `[0]`, runs
+  `station_control::disconnected` (MSR NO_LINK, BSSID 0x618..0x61d zero,
+  AID, RCR without BSSID filtering, BCN_CTRL TSF-update disable) with
+  readback, withdraws the firmware RA mask and the QoS/HT TXD profile and
+  keeps DMA, rings and interrupts live. The reserved-page body moves to a
+  retired list: its upload was proven by BCN_VALID but the command-beacon
+  OWN bit may stay set, so it is released only with the quiescence proof
+  (or pinned with the owner). The next association reuses BEACON_QUEUE
+  descriptor 0 like Linux `rtl_cmd_send_packet`, which is only admitted
+  after such a proven upload.
+- The station state forgets the association (plan, keys/PN/replay, BA,
+  WMM/HT negotiation, AID, RA smoothing), advances the receive epoch and
+  returns to `Passive`; the HT grant, scan cache and signed calibration are
+  kept. `interface::Device::disassociate` then reopens admission under the
+  owner and publication locks, so scan and associate work again; stale
+  publishers are fenced by the advanced epoch.
+- A frame still owned by the device, a non-running owner or any mailbox/
+  register failure keeps the terminal path (`disconnect_station_peer`:
+  stop, quiescence proof, `Stopped`) or aborts the owner.
+
+Tests: `smoke_rtl8188ee_native_leave_peer_keeps_dma_for_rejoin` (exact
+JOINBSSRPT, NO_LINK/BSSID registers, RA mask withdrawn, ring service
+continues, device-owned frame refused, stuck mailbox terminal),
+`smoke_rtl8188ee_real_station_open_wpa2_native_exact_ip` (Passive, BME on,
+no peer), `smoke_rtl8188ee_native_device_{open,wpa2}_kernel_dhcp_exact_ip`
+(composed Device: disconnect report, rescan, second association with a
+fresh AP session, a new reserved-page upload on the reused descriptor,
+exact uplink, second disconnect) and the HT20 and paused-publisher
+regressions (stale publisher still fenced, Passive after close).
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE

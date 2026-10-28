@@ -372,6 +372,17 @@ impl Harness {
             self.device.drain();
         }
     }
+    /// The live owner returned to Passive scanning (safe rejoin).
+    fn passive(&self) -> bool {
+        self.packet.model.lock().master
+            && self.device.prepared.try_lock().is_some_and(|owner| {
+                owner.as_ref().is_some_and(|owner| {
+                    owner.phase() == Phase::Running
+                        && owner.station_phase()
+                            == super::super::super::super::station::Phase::Passive
+                })
+            })
+    }
     fn closed(&self) -> bool {
         !self.device.link_up()
             && self.device.connected_bssid().is_none()
@@ -460,13 +471,51 @@ fn composition(protected: bool) -> TestResult {
     if h.packet.model.lock().error.is_some() || h.firmware.claim_packet_io().is_ok() {
         return TestResult::Fail("EE device failed native wire or reopened firmware owner");
     }
-    if complete(h.device.disassociate()).is_err() || !h.closed() || h.packet.model.lock().master {
-        return TestResult::Fail("EE disconnect retained carrier or bus mastering");
+    let reports = h.packet.model.lock().commands.len();
+    if complete(h.device.disassociate()).is_err() || !h.closed() || !h.passive() {
+        return TestResult::Fail("EE disconnect retained carrier or left Passive");
     }
-    if complete(h.device.associate(h.request())).is_ok()
+    if h.packet.model.lock().commands[reports..] != [(1, vec![0])]
         || narf_net::iface::send_on(h.device.name(), &uplink).is_ok()
     {
-        return TestResult::Fail("EE terminal native station reopened");
+        return TestResult::Fail("EE disconnect skipped JOINBSSRPT or kept data admission");
+    }
+    // Safe rejoin on the same live owner: a fresh AP session, a new
+    // reserved-page upload on the reused beacon descriptor, and data.
+    {
+        let mut p = h.peer.lock();
+        let fresh = Peer::new(protected);
+        p.ap = fresh.ap;
+        p.ptk = fresh.ptk;
+        p.replay = fresh.replay;
+        p.pn = fresh.pn;
+    }
+    let uploads = h.packet.model.lock().reserved.len();
+    h.scan();
+    if complete(h.device.associate(h.request())).is_err()
+        || !h.device.link_up()
+        || h.packet.model.lock().reserved.len() != uploads + 1
+    {
+        return TestResult::Fail("EE Passive owner refused a second association");
+    }
+    let again = udp_ipv4(
+        PEER,
+        plan.station,
+        plan.lease_ip,
+        plan.server_ip,
+        49153,
+        7,
+        b"native-ee-device-rejoin",
+    );
+    if narf_net::iface::send_on(h.device.name(), &again).is_err() {
+        return TestResult::Fail("EE rejoined Device rejected IP uplink");
+    }
+    h.pump();
+    if h.peer.lock().uplink.last() != Some(&again) {
+        return TestResult::Fail("EE rejoined Device uplink/MIC differs");
+    }
+    if complete(h.device.disassociate()).is_err() || !h.passive() {
+        return TestResult::Fail("EE second disconnect did not return to Passive");
     }
     let before = h.packet.drops.load(Ordering::SeqCst);
     let packet = h.packet.clone();
@@ -519,6 +568,9 @@ pub(crate) fn smoke_rtl8188ee_native_device_irq_worker_binds_and_releases_vector
     if complete(h.device.disassociate()).is_err() {
         return TestResult::Fail("EE IRQ-bound disassociate failed");
     }
+    // Disassociation keeps the live owner (Linux keeps interrupts on);
+    // removal masks the chip before releasing the vector.
+    let _ = complete(h.device.remove());
     h.pump();
     if h.packet.radio.word(0xb0) != 0
         || h.packet.radio.word(0xb8) != 0
@@ -1110,8 +1162,9 @@ pub(crate) fn smoke_rtl8188ee_native_device_paused_publisher_cannot_outlive_clos
         return TestResult::Fail("EE paused publisher final native teardown failed");
     }
     h.pump();
-    if !h.closed() || h.packet.model.lock().master {
-        return TestResult::Fail("EE paused publisher failed to stop retained native DMA");
+    // Safe rejoin: carrier closed, owner live and Passive (DMA not stopped).
+    if !h.closed() || !h.passive() {
+        return TestResult::Fail("EE paused publisher teardown did not return to Passive");
     }
     TestResult::Pass
 }

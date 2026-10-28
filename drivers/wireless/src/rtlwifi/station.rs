@@ -368,6 +368,33 @@ impl State {
             security.fail();
         }
     }
+    /// mac80211 `ieee80211_set_disassoc` + `rtl_op_sta_remove`: forget the
+    /// association (plan, keys, PN/replay, BA, WMM/HT negotiation, AID, RA
+    /// smoothing) and return to Passive scanning. The receive epoch was
+    /// already advanced by `retire_receive`; the HT grant, scan cache and
+    /// signed calibration belong to the radio and are kept.
+    fn reset_passive(&mut self) {
+        self.phase = Phase::Passive;
+        self.candidate = None;
+        self.plan = None;
+        self.pmk = None;
+        self.security = None;
+        self.pending = None;
+        self.incoming.clear();
+        self.received.clear();
+        self.aid = None;
+        self.native_associated = false;
+        self.admitted = false;
+        self.qos_sequence = [0; 8];
+        self.deadline = 0;
+        self.capability = 0;
+        self.wmm = None;
+        self.ht_profile = None;
+        self.controls.clear();
+        self.delivered_reply = None;
+        self.retire_ba();
+        self.ra = super::super::rate_adaptive::State::new();
+    }
     fn retire_receive(&mut self) {
         self.received.clear();
         // Exhaustion is terminal and never wraps back to a captured token.
@@ -1923,8 +1950,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         result
     }
+    /// Disassociation. A live owner with no device-owned frame leaves the
+    /// peer (`leave_station_peer`) and returns to Passive for a safe rejoin;
+    /// otherwise the terminal stop/quiesce path runs. Any failure aborts
+    /// the station and stops the packet engines.
     pub(crate) async fn disconnect_station(&mut self) -> Result<(), Error> {
-        if self.station.phase == Phase::Stopped {
+        if matches!(self.station.phase, Phase::Stopped | Phase::Passive) {
             return Ok(());
         }
         self.station.phase = Phase::Stopping;
@@ -1941,10 +1972,18 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             failed: self.station.failed.clone(),
             armed: true,
         };
-        let result = self.disconnect_station_peer().await.map_err(Error::Radio);
+        let rejoin = self.rejoinable();
+        let result = if rejoin {
+            self.leave_station_peer().await
+        } else {
+            self.disconnect_station_peer().await
+        }
+        .map_err(Error::Radio);
         attempt.armed = false;
         if result.is_err() {
             self.abort_station();
+        } else if rejoin {
+            self.station.reset_passive();
         } else {
             self.station.native_associated = false;
             self.station.phase = Phase::Stopped;

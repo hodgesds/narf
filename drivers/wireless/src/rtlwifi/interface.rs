@@ -509,7 +509,8 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         };
         self.withdraw_interrupts(owner);
         if owner.station_peer().is_some() {
-            let _ = owner.disconnect_station().await;
+            // Report the disconnect, then stop and prove the engines idle.
+            let _ = owner.disconnect_station_peer().await;
         }
         let reclaimed = owner.retire().await;
         if reclaimed {
@@ -876,6 +877,20 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         let owner = storage.as_mut().ok_or(WirelessError::Busy)?;
         let result = owner.disconnect_station().await.map_err(error);
         attempt.armed = false;
+        // Safe rejoin: a completed disassociation leaves a Passive station
+        // on the same live owner. Reopen admission under the owner and
+        // publication locks; the advanced receive epoch fences every stale
+        // publisher and the next station gets a new RX Narf-Ring.
+        if result.is_ok()
+            && owner.station_phase() == station::Phase::Passive
+            && !self.removed.load(Ordering::Acquire)
+        {
+            let _publication = self.admission.publication.lock();
+            self.admission.abort.store(false, Ordering::Release);
+            self.admission.closed.store(false, Ordering::Release);
+            self.ht
+                .store(owner.station_ht_capability().is_some(), Ordering::Release);
+        }
         result
     }
     async fn set_config(&self, config: WirelessConfig) -> Result<(), WirelessError> {

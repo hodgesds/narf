@@ -1249,3 +1249,58 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/packet",
     smoke_rtl8188ee_native_rate_mask_enables_data_fallback
 );
+
+/// Linux `rtl_op_bss_info_changed(!assoc)` on a live owner: JOINBSSRPT
+/// disconnect and NO_LINK MAC state with DMA still running; a device-owned
+/// frame keeps the terminal path; a stuck mailbox is terminal.
+pub(crate) fn smoke_rtl8188ee_native_leave_peer_keeps_dma_for_rejoin() -> TestResult {
+    let (mut owner, port) = self::owner();
+    if run(owner.leave_station_peer()) != Err(Error::State) || owner.rejoinable() {
+        return TestResult::Fail("EE left a peer before packet service");
+    }
+    owner.start_packets().unwrap();
+    port.radio.hardware_word(0x6c, 1 << 31);
+    run(owner.install_rate_mask([0x05, 0xf0, 0x0f, 0x00, 0x80], None)).unwrap();
+    for (index, byte) in [2u8, 9, 8, 7, 6, 5].into_iter().enumerate() {
+        port.radio.write8(0x618 + index as u16, byte).unwrap();
+    }
+    port.model.lock().commands.clear();
+    if !owner.rejoinable()
+        || run(owner.leave_station_peer()).is_err()
+        || port.model.lock().commands != [(1, vec![0])]
+        || owner.phase() != Phase::Running
+        || !port.model.lock().master
+        || owner.rate_mask().is_some()
+        || (0x618..0x61e).any(|reg| port.radio.read8(reg).unwrap() != 0)
+        || port.radio.read8(0x102).unwrap() & 3 != 0
+    {
+        return TestResult::Fail("EE leave differs from JOINBSSRPT + NO_LINK on a live owner");
+    }
+    // Ring service continues after leaving the peer.
+    let id = owner.submit(&frame(false), 0).unwrap();
+    if owner.poll_delivery().ok().flatten().map(|d| d.id) != Some(id) {
+        return TestResult::Fail("EE leave stopped native ring service");
+    }
+    // A frame without its host receipt keeps the terminal path.
+    port.model.lock().complete = false;
+    owner.submit(&frame(false), 0).unwrap();
+    if owner.rejoinable() || run(owner.leave_station_peer()) != Err(Error::State) {
+        return TestResult::Fail("EE left a peer with a device-owned frame");
+    }
+    // Failure: a firmware that never consumes JOINBSSRPT is terminal.
+    let (mut owner, port) = self::owner();
+    owner.start_packets().unwrap();
+    port.radio.hardware_word(0x6c, 1 << 31);
+    port.model.lock().hold_command = Some(1);
+    if run(owner.leave_station_peer()) != Err(Error::CommandTimeout)
+        || owner.phase() != Phase::Failed
+        || owner.rejoinable()
+    {
+        return TestResult::Fail("EE stuck JOINBSSRPT left a live owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/packet",
+    smoke_rtl8188ee_native_leave_peer_keeps_dma_for_rejoin
+);

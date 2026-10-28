@@ -96,6 +96,10 @@ pub(super) struct State<M: Memory> {
     /// `sta_entry->ratr_index` of the installed `H2C_88E_RA_MASK`: DATA
     /// rate fallback is only enabled while the firmware owns this mask.
     rate_mask: Option<u8>,
+    /// Reserved-page bodies of earlier associations on this claim. Each
+    /// upload was proven by BCN_VALID, but its command-beacon OWN bit may
+    /// stay set, so the body is only released with a quiescence proof.
+    retired: Vec<M>,
 }
 impl<M: Memory> State<M> {
     pub(super) fn new() -> Self {
@@ -112,6 +116,7 @@ impl<M: Memory> State<M> {
             interrupts: false,
             leisure: false,
             rate_mask: None,
+            retired: Vec::new(),
         }
     }
     pub(super) fn retain(&mut self) {
@@ -119,6 +124,7 @@ impl<M: Memory> State<M> {
         // BME clear alone never permits releasing it at a terminal stop.
         core::mem::forget(self.pending.take());
         core::mem::forget(self.reserved.take());
+        core::mem::forget(core::mem::take(&mut self.retired));
     }
 }
 struct Pending<M: Memory> {
@@ -351,9 +357,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             }
             policy(self)?;
             let ring = &mut self.tx[0];
+            // A rejoin reuses the command-beacon descriptor whose previous
+            // upload BCN_VALID already proved (Linux rtl_cmd_send_packet
+            // reuses BEACON_QUEUE descriptor 0 the same way).
+            let proven = !self.packet.retired.is_empty();
             self.io.authority(true, || {
                 ring.sync();
-                if ring.read32(0)? & OWN != 0 {
+                if ring.read32(0)? & OWN != 0 && !proven {
                     return Err(Error::Descriptor);
                 }
                 for (index, value) in prefix.into_iter().enumerate() {
@@ -480,6 +490,50 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.packet.leisure = false;
         self.phase = Phase::Running;
         Ok(())
+    }
+    /// Linux `rtl_op_bss_info_changed(BSS_CHANGED_ASSOC)` with `!assoc` on a
+    /// live owner: leave LPS, `HW_VAR_H2C_FW_JOINBSSRPT(RT_MEDIA_DISCONNECT)`,
+    /// then the disconnected MSR/BSSID/AID/RCR/BCN_CTRL state
+    /// (`rtl88ee_set_network_type(NO_LINK)` and `HW_VAR_BSSID` zero). DMA,
+    /// rings and interrupts stay live (Linux never stops the PCI engines on
+    /// disassociation); an in-flight frame is first retired by its host
+    /// receipt (`rejoinable`). The firmware RA mask and the per-association
+    /// QoS/HT TXD profile are withdrawn; the reserved-page body is retired,
+    /// not freed. Any failure is terminal for the owner.
+    pub(crate) async fn leave_station_peer(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Running || self.packet.pending.is_some() {
+            return Err(Error::State);
+        }
+        self.packet
+            .retired
+            .try_reserve(1)
+            .map_err(|_| Error::Memory)?;
+        self.phase = Phase::Failed;
+        if core::mem::take(&mut self.packet.leisure) {
+            self.packet.mailbox.awake(&self.io).await?;
+        }
+        self.packet.mailbox.send(&self.io, 1, &[0]).await?;
+        super::super::station_control::disconnected(&self.io)?;
+        self.packet.rate_mask = None;
+        self.packet.qos = false;
+        self.packet.ht = false;
+        if let Some(reserved) = self.packet.reserved.take() {
+            self.packet.retired.push(reserved);
+        }
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    /// A running owner whose last frame has its host receipt may leave the
+    /// peer without stopping DMA. A frame still owned by the device (no
+    /// receipt) keeps the terminal `disconnect_station_peer` path.
+    pub(crate) fn rejoinable(&mut self) -> bool {
+        if self.phase != Phase::Running {
+            return false;
+        }
+        if self.packet.pending.is_some() && self.poll_delivery().is_err() {
+            return false;
+        }
+        self.phase == Phase::Running && self.packet.pending.is_none()
     }
     pub(crate) async fn disconnect_station_peer(&mut self) -> Result<(), Error> {
         if !matches!(self.phase, Phase::Running | Phase::Failed) {

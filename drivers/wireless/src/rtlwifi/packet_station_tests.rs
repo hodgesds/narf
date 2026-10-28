@@ -894,11 +894,17 @@ pub(crate) fn smoke_rtl8188ee_real_station_open_wpa2_native_exact_ip() -> TestRe
             return TestResult::Fail("native station downlink exact Ethernet/IP mismatch");
         }
         complete(owner.disconnect_station()).unwrap();
-        if owner.station_peer().is_some() || port.model.lock().master {
-            return TestResult::Fail("native station disconnect retained carrier/BME");
+        // Safe rejoin: the live owner (BME on) is Passive with no peer.
+        if owner.station_peer().is_some()
+            || !port.model.lock().master
+            || owner.station_phase() != Logical::Passive
+            || owner.rate_mask().is_some()
+            || port.radio.read8(0x618).unwrap() != 0
+        {
+            return TestResult::Fail("native station disconnect kept the peer or stopped DMA");
         }
         if owner.station_transmit_ready() {
-            return TestResult::Fail("native stopped station reopened transmit");
+            return TestResult::Fail("native disconnected station reopened transmit");
         }
     }
     TestResult::Pass
