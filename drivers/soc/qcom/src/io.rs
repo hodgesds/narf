@@ -42,6 +42,38 @@ pub enum MapError {
     Ioremap,
 }
 
+/// Byte-granular read through 32-bit accesses (`memcpy_fromio`).
+pub fn read_bytes<M: RegIo + ?Sized>(mem: &M, off: u32, buf: &mut [u8]) {
+    let mut i = 0usize;
+    while i < buf.len() {
+        let a = off + i as u32;
+        let w = mem.read32(a & !3).to_le_bytes();
+        let s = (a & 3) as usize;
+        let n = (4 - s).min(buf.len() - i);
+        buf[i..i + n].copy_from_slice(&w[s..s + n]);
+        i += n;
+    }
+}
+
+/// Byte-granular write through 32-bit accesses (`memcpy_toio`):
+/// partial words at either end are read-modify-written.
+pub fn write_bytes<M: RegIo + ?Sized>(mem: &M, off: u32, data: &[u8]) {
+    let mut i = 0usize;
+    while i < data.len() {
+        let a = off + i as u32;
+        let s = (a & 3) as usize;
+        let n = (4 - s).min(data.len() - i);
+        let mut w = if s == 0 && n == 4 {
+            [0u8; 4]
+        } else {
+            mem.read32(a & !3).to_le_bytes()
+        };
+        w[s..s + n].copy_from_slice(&data[i..i + n]);
+        mem.write32(a & !3, u32::from_le_bytes(w));
+        i += n;
+    }
+}
+
 /// A device register window mapped Device-nGnRE (`ioremap`).
 #[derive(Copy, Clone, Debug)]
 pub struct MmioRegs {

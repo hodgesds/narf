@@ -14,6 +14,7 @@
 //! | [`smem`]    | `drivers/soc/qcom/smem.c`                            |
 //! | [`ipc`]     | `qcom-apcs-ipc-mailbox.c`, `qcom-ipcc.c` (send side) |
 //! | [`smp2p`]   | `drivers/soc/qcom/smp2p.c`                           |
+//! | [`glink`]   | `drivers/rpmsg/qcom_glink_{native,smem}.c`           |
 //! | [`gcc`]     | `drivers/clk/qcom/{reset.c,clk-branch.c,gcc-ipq*.c}` |
 //! | [`q6v5`]    | `drivers/remoteproc/qcom_q6v5.c`                     |
 //! | [`wcss`]    | `drivers/remoteproc/qcom_q6v5_wcss.c` (IPQ8074 ops)  |
@@ -35,6 +36,7 @@ extern crate alloc;
 
 pub mod dt;
 pub mod gcc;
+pub mod glink;
 pub mod hwlock;
 pub mod io;
 pub mod ipc;
@@ -50,5 +52,7 @@ pub mod wcss;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod fixtures;
+#[cfg(any(test, feature = "kernel-test"))]
+mod glink_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;

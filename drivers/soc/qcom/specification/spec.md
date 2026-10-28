@@ -18,13 +18,16 @@
   per-SoC tables.
 - Q6v5 start/stop signalling, the Q6 WCSS (host reset) and PAS
   (TrustZone) remoteproc sequences.
+- GLINK over SMEM (`qcom_glink_native.c` + `qcom_glink_smem.c`): FIFO
+  transport and the native channel/intent protocol, as a non-blocking
+  state machine.
 
 **Does NOT own:**
 - The SMC trap itself (`arch/` `aarch64::smccc`).
 - MMIO mapping (`memory/` `ioremap`) or DMA allocation (`io/`).
 - IRQ delivery: callers route GIC/SMP2P interrupts into `Q6v5::signal`
   and `Smp2p::handle_interrupt`.
-- GLINK/QRTR transports, RPMh/AOSS-QMP power votes, SMMU/IOMMU
+- QRTR framing over GLINK (ath11k `qrtr_glink.rs`), RPMh/AOSS-QMP power votes, SMMU/IOMMU
   programming, sysmon/SSR notifications (not implemented; §8).
 - A general clock/reset framework.
 
@@ -48,6 +51,8 @@ pub struct MmioRegs;  // map(phys, len) via ioremap Device; unsafe from_raw(virt
 pub trait Delay { fn sleep_us(&self, us: u32) -> impl Future<Output = ()> + Send; fn now_us(&self) -> u64; }
 pub struct NarfDelay; // narf_time::SleepUntil
 pub async fn poll_reg(io, delay, off, cond, sleep_us, timeout_us) -> Result<u32, u32>;
+pub fn read_bytes<M: RegIo + ?Sized>(mem, off, buf: &mut [u8]);   // memcpy_fromio
+pub fn write_bytes<M: RegIo + ?Sized>(mem, off, data: &[u8]);     // memcpy_toio (RMW edges)
 ```
 `poll_reg` is `readl_poll_timeout`: it sleeps between reads; nothing in
 this crate spins on a register.
@@ -118,6 +123,33 @@ pub struct PasRproc;  impl PasRproc { new(pas_id), start(scm, alloc, fw, mdt, sr
 pub enum RprocState { Offline, Running, Crashed }
 pub enum RprocError { .. }
 ```
+### 3.8 GLINK (`glink`)
+```rust
+pub trait GlinkPipe { rx_avail, rx_peek(buf, offset), rx_advance(n), tx_avail, tx_len,
+                      tx_write(hdr, data), kick }        // struct qcom_glink_pipe
+pub struct GlinkSmem<M: RegIo, K: Kick>;                 // items 478/479/480
+impl GlinkSmem { async register(smem: Smem<M>, lock, remote_pid, kick) -> Result<Self, GlinkError>;
+                 smem, remote_pid, descriptor, tx_fifo, rx_fifo }
+pub struct Glink<P: GlinkPipe>;                          // struct qcom_glink
+impl Glink { new(pipe, features) /* sends VERSION */, accept(name, intents), open(name, intents) -> lcid,
+             close(lcid), send(lcid, data), service_tx, process_rx /* edge IRQ */,
+             take_event, lcid_of, is_open, remote_intents, negotiated, features, tx_backlog, stats }
+pub enum GlinkEvent { Negotiated, Open, RemoteOpen, Data, Closed, SendFailed, Flow }
+pub enum GlinkError { Smem, BadDescriptor, NoChannel, NotOpen, TooBig, BadName, NoCid }
+pub const GLINK_FEATURE_INTENT_REUSE, GLINK_DEFAULT_INTENTS /* 5 x 1 KiB */, GLINK_CMD_*;
+```
+`Glink` never blocks: commands go through one ordered queue flushed while
+the TX FIFO has room (a full FIFO sends one `READ_NOTIF`); payloads wait
+per channel for the smallest free remote intent, sending one
+`RX_INTENT_REQ` when none fits (a refusal drops the message as
+`SendFailed`). Payloads over 8 KiB go out as `TX_DATA` + `TX_DATA_CONT`.
+Received data completes into a local intent and is answered with
+`RX_DONE_W_REUSE` (base intents) or `RX_DONE` (one-shot intents granted
+to a remote `RX_INTENT_REQ`). Remote-initiated channels follow the rpmsg
+probe order: `OPEN_ACK` + `OPEN` once claimed, base intents after the
+remote's `OPEN_ACK`. Linux's deferred commands (`VERSION`, `OPEN`,
+`CLOSE`, …) are processed inline in FIFO order.
+
 `pump` is called on every wait iteration; production passes a no-op (IRQ
 handlers call `Q6v5::signal`), fixtures use it to play the remote.
 
@@ -153,9 +185,10 @@ Stage 5 "Silicon" (ath11k IPQ8074/IPQ6018/IPQ5018/WCN6750 enablement).
 Tests: `cargo xtask test --subsystem drivers/soc/qcom --kernel-tests-only`.
 
 ## 8. Open questions
-- **GLINK (SMEM transport) + QRTR over GLINK** is not implemented; ath11k
-  AHB QMI rides on it (`glink-edge` "rtr"/"wpss"). This is the next
-  blocker for any AHB WiFi bring-up.
+- **GLINK**: intentless edges (RPM `qcom,glink-rpm`), the `qcom,intents`
+  DT property (callers pass intent groups explicitly) and the glink
+  chrdev/`rpmsg_ctrl` are not implemented. The edge interrupt is
+  delivered by the caller (`Glink::process_rx` on each SPI).
 - **RPMh / AOSS QMP** proxy votes (WPSS `xo`, `cx`/`mx`, `load_state`) are
   not implemented; `PasRproc` assumes firmware already holds them.
 - **IPQ8074 AON reset:** mainline has no `GCC_WCSSAON_RESET` for IPQ8074

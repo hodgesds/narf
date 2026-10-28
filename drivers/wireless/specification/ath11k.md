@@ -276,6 +276,14 @@ tables.
   flow control) + `qmi_txn_wait` (match by `txn_id` only, decode with
   the transaction's decoder), `wait_inbound`, `take_inbound`
   (`ServerArrive` / `ServerExit` / indication bytes).
+- `qrtr_glink` — the AHB transport (`net/qrtr/smd.c`):
+  `GlinkQrtr<P: GlinkPipe, B: GlinkBus>` implements `QrtrPipe` over a
+  `narf_drivers_qcom_soc::glink::Glink` edge. `new` claims the
+  remote-initiated `IPCRTR` channel with the default 5 × 1 KiB intents;
+  one rpmsg message = one QRTR packet; `send` before the channel is open
+  (or after the remote closed it) is `-ENOTCONN`, an oversize frame
+  `-EMSGSIZE`; `wait(ms)` = `GlinkBus::wait_irq` (the edge SPI) then
+  `Glink::process_rx`; `take_closed` reports a remote CLOSE once.
 - `wlfw` — `Wlfw<P, F: FirmwareLoader, A: DmaAllocator>`, whose
   `A::Mem: CoherentMem` supplies DMA address, length, write and immutable
   CPU bytes (the latter for pre-reset device-coredump collection), the

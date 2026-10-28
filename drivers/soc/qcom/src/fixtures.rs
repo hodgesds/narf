@@ -373,6 +373,18 @@ pub fn build_mdt(entry: u32, segs: &[Seg], inline: bool) -> (Vec<u8>, Vec<Vec<u8
 /// partition, and a `SIII` info block (`item_count` items).
 /// Returns (global partition base, private partition base).
 pub fn build_smem_v12(regs: &FakeRegs, size: u32, remote: u16, item_count: u16) -> (u32, u32) {
+    build_smem_v12_sized(regs, size, remote, item_count, 0x4000)
+}
+
+/// [`build_smem_v12`] with a `priv_size`-byte private partition at
+/// 0x3000 (GLINK needs two 16 KiB FIFOs).
+pub fn build_smem_v12_sized(
+    regs: &FakeRegs,
+    size: u32,
+    remote: u16,
+    item_count: u16,
+    priv_size: u32,
+) -> (u32, u32) {
     use crate::smem::*;
     regs.set(
         HDR_VERSION + SMEM_MASTER_SBL_VERSION_INDEX * 4,
@@ -382,7 +394,6 @@ pub fn build_smem_v12(regs: &FakeRegs, size: u32, remote: u16, item_count: u16) 
     let glob = 0x1000;
     let glob_size = 0x2000;
     let priv_base = 0x3000;
-    let priv_size = 0x4000;
     regs.set(ptable, u32::from_le_bytes(PTABLE_MAGIC));
     regs.set(ptable + 4, 1);
     regs.set(ptable + 8, 2);
@@ -948,3 +959,227 @@ pub const AHB_IRQ_NAMES: [&str; 52] = [
     "wbm2host-tx-completions-ring1",
     "tcl2host-status-ring",
 ];
+
+// ── GLINK remote ───────────────────────────────────────────────────
+
+/// The remote end of a GLINK-SMEM edge over a [`FakeRegs`] SMEM region:
+/// it fills the host's RX FIFO (item 480) and drains the host's TX FIFO
+/// (item 479), keeping the shared descriptor indices as the Q6 would.
+#[derive(Debug)]
+pub struct GlinkRemote<'a> {
+    pub regs: &'a FakeRegs,
+    /// Descriptor: host tx tail, tx head, rx tail, rx head.
+    pub desc: u32,
+    /// Host TX FIFO (offset, len) — what the remote reads.
+    pub host_tx: (u32, u32),
+    /// Host RX FIFO (offset, len) — what the remote writes.
+    pub host_rx: (u32, u32),
+}
+
+impl<'a> GlinkRemote<'a> {
+    fn rd_bytes(&self, off: u32, n: usize) -> Vec<u8> {
+        let mut v = Vec::with_capacity(n);
+        for i in 0..n as u32 {
+            let a = off + i;
+            v.push(self.regs.get(a & !3).to_le_bytes()[(a & 3) as usize]);
+        }
+        v
+    }
+    fn wr_byte(&self, a: u32, b: u8) {
+        let mut w = self.regs.get(a & !3).to_le_bytes();
+        w[(a & 3) as usize] = b;
+        self.regs.set(a & !3, u32::from_le_bytes(w));
+    }
+
+    /// Append raw bytes (one or more commands, each 8-aligned) to the
+    /// host's RX FIFO and publish the new head.
+    pub fn push(&self, bytes: &[u8]) {
+        let (fifo, len) = self.host_rx;
+        let mut head = self.regs.get(self.desc + 12);
+        for b in bytes {
+            self.wr_byte(fifo + head, *b);
+            head += 1;
+            if head >= len {
+                head = 0;
+            }
+        }
+        let mut h = (head + 7) & !7;
+        if h >= len {
+            h -= len;
+        }
+        self.regs.set(self.desc + 12, h);
+    }
+
+    /// Bytes the host has written and the remote not yet consumed.
+    pub fn tx_pending(&self) -> usize {
+        let (_, len) = self.host_tx;
+        let tail = self.regs.get(self.desc);
+        let head = self.regs.get(self.desc + 4);
+        if head >= tail {
+            (head - tail) as usize
+        } else {
+            (len - tail + head) as usize
+        }
+    }
+
+    /// Drain the host's TX FIFO into whole commands: each element is
+    /// (cmd, param1, param2, trailing bytes of that command).
+    pub fn pop(&self) -> Vec<(u16, u16, u32, Vec<u8>)> {
+        use crate::glink::*;
+        let (fifo, len) = self.host_tx;
+        let mut out = Vec::new();
+        let read = |t: u32, n: usize| -> Vec<u8> {
+            let first = (n as u32).min(len - t) as usize;
+            let mut v = self.rd_bytes(fifo + t, first);
+            if first < n {
+                v.extend(self.rd_bytes(fifo, n - first));
+            }
+            v
+        };
+        while self.tx_pending() > 0 {
+            let tail = self.regs.get(self.desc);
+            let h = read(tail, 8);
+            let cmd = u16::from_le_bytes([h[0], h[1]]);
+            let p1 = u16::from_le_bytes([h[2], h[3]]);
+            let p2 = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+            let t2 = (tail + 8) % len;
+            let extra = match cmd {
+                GLINK_CMD_OPEN => p2 as usize,
+                GLINK_CMD_INTENT => p2 as usize * 8,
+                GLINK_CMD_TX_DATA | GLINK_CMD_TX_DATA_CONT => {
+                    let c = read(t2, 4);
+                    8 + u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize
+                }
+                _ => 0,
+            };
+            let body = read(t2, extra);
+            out.push((cmd, p1, p2, body));
+            let next = (tail as usize + ((8 + extra + 7) & !7)) % len as usize;
+            self.regs.set(self.desc, next as u32);
+        }
+        out
+    }
+}
+
+/// Encode one GLINK command (header + body, padded to 8).
+pub fn glink_cmd(cmd: u16, p1: u16, p2: u32, body: &[u8]) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(&cmd.to_le_bytes());
+    v.extend_from_slice(&p1.to_le_bytes());
+    v.extend_from_slice(&p2.to_le_bytes());
+    v.extend_from_slice(body);
+    while v.len() % 8 != 0 {
+        v.push(0);
+    }
+    v
+}
+
+/// Encode a remote `TX_DATA`/`TX_DATA_CONT` chunk.
+pub fn glink_data(cont: bool, rcid: u16, liid: u32, chunk: &[u8], left: u32) -> Vec<u8> {
+    use crate::glink::*;
+    let mut body = Vec::new();
+    body.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+    body.extend_from_slice(&left.to_le_bytes());
+    body.extend_from_slice(chunk);
+    let cmd = if cont {
+        GLINK_CMD_TX_DATA_CONT
+    } else {
+        GLINK_CMD_TX_DATA
+    };
+    glink_cmd(cmd, rcid, liid, &body)
+}
+
+/// A counting [`Kick`](crate::ipc::Kick).
+#[derive(Debug, Default)]
+pub struct CountingKick(pub core::sync::atomic::AtomicUsize);
+impl crate::ipc::Kick for &CountingKick {
+    fn kick(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+impl CountingKick {
+    pub fn count(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// A GLINK-SMEM edge over a fresh RAM SMEM with the remote's RX FIFO
+/// allocated: returns the edge (VERSION already queued and flushed)
+/// and its [`GlinkRemote`]. `regs` must outlive both.
+pub fn glink_smem_edge<'a>(
+    regs: &'a FakeRegs,
+    lock_regs: &'a FakeRegs,
+    delay: &'a FakeDelay,
+    kick: &'a CountingKick,
+    remote_pid: u16,
+) -> (
+    crate::glink::Glink<crate::glink::GlinkSmem<&'a FakeRegs, &'a CountingKick>>,
+    GlinkRemote<'a>,
+) {
+    use crate::glink::*;
+    use crate::hwlock::TcsrMutex;
+    use crate::smem::Smem;
+    const SIZE: u32 = 0x20000;
+    build_smem_v12_sized(regs, SIZE, remote_pid, 512, 0x10000);
+    let lock = TcsrMutex::new(lock_regs, delay, 3).expect("tcsr");
+    let smem = Smem::probe(regs, SIZE).expect("smem");
+    // The remote allocates its own TX FIFO (our RX) before it starts.
+    run(smem.alloc(&lock, remote_pid, SMEM_GLINK_NATIVE_XPRT_FIFO_1, 0x4000))
+        .expect("pending")
+        .expect("alloc rx fifo");
+    let rx = smem
+        .get(remote_pid, SMEM_GLINK_NATIVE_XPRT_FIFO_1)
+        .expect("rx");
+    let pipe = run(GlinkSmem::register(smem, &lock, remote_pid, kick))
+        .expect("pending")
+        .expect("register");
+    let remote = GlinkRemote {
+        regs,
+        desc: pipe.descriptor(),
+        host_tx: pipe.tx_fifo(),
+        host_rx: (rx.offset, rx.len),
+    };
+    (Glink::new(pipe, GLINK_FEATURE_INTENT_REUSE), remote)
+}
+
+/// Play the remote through version negotiation and a remote-initiated
+/// open of `name` (remote cid `rcid`), offering `intents` (size, iid)
+/// once the host's OPEN arrives. Returns the host lcid.
+pub fn glink_remote_open<P: crate::glink::GlinkPipe>(
+    g: &mut crate::glink::Glink<P>,
+    r: &GlinkRemote<'_>,
+    name: &str,
+    rcid: u16,
+    intents: &[(u32, u32)],
+) -> Option<u16> {
+    use crate::glink::*;
+    r.pop();
+    r.push(&glink_cmd(
+        GLINK_CMD_VERSION,
+        1,
+        GLINK_FEATURE_INTENT_REUSE,
+        &[],
+    ));
+    let mut nm = Vec::from(name.as_bytes());
+    nm.push(0);
+    r.push(&glink_cmd(GLINK_CMD_OPEN, rcid, nm.len() as u32, &nm));
+    g.process_rx();
+    let out = r.pop();
+    let lcid = out.iter().find(|m| m.0 == GLINK_CMD_OPEN)?.1;
+    let mut body = Vec::new();
+    for (size, iid) in intents {
+        body.extend_from_slice(&size.to_le_bytes());
+        body.extend_from_slice(&iid.to_le_bytes());
+    }
+    r.push(&glink_cmd(GLINK_CMD_OPEN_ACK, lcid, 0, &[]));
+    if !intents.is_empty() {
+        r.push(&glink_cmd(
+            GLINK_CMD_INTENT,
+            rcid,
+            intents.len() as u32,
+            &body,
+        ));
+    }
+    g.process_rx();
+    Some(lcid)
+}

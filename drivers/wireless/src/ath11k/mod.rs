@@ -74,6 +74,7 @@ pub mod qmi;
 pub mod qmi_client;
 pub mod qmi_wlfw;
 pub mod qrtr;
+pub mod qrtr_glink;
 pub mod runtime;
 pub mod rx_descriptor;
 pub mod tx_hdr;
