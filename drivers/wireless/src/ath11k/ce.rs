@@ -327,13 +327,22 @@ pub static CE_MSI_FIRES: AtomicU64 = AtomicU64::new(0);
 /// the owner task (the tasklet's work runs there). Ignored while CE
 /// interrupts are disabled, as in Linux.
 fn ce_msi_irq(cookie: u64) -> narf_interrupts::IrqStatus {
+    raise_ce(cookie as u32);
+    narf_interrupts::IrqStatus::Handled
+}
+
+/// Record that the CEs in `mask` interrupted and wake the owner task
+/// (the MSI handler above and the AHB per-CE GIC lines,
+/// [`super::ahb_hif`]). `false` (nothing recorded) while CE interrupts
+/// are disabled.
+pub(crate) fn raise_ce(mask: u32) -> bool {
     if !CE_IRQ_ENABLED.load(Ordering::Acquire) {
-        return narf_interrupts::IrqStatus::Handled;
+        return false;
     }
     CE_MSI_FIRES.fetch_add(1, Ordering::Relaxed);
-    CE_IRQ_PENDING.fetch_or(cookie as u32, Ordering::AcqRel);
+    CE_IRQ_PENDING.fetch_or(mask, Ordering::AcqRel);
     wake_waiters();
-    narf_interrupts::IrqStatus::Handled
+    true
 }
 
 /// Hook the CE MSI vectors (`ath11k_pcic_config_irq`, CE part). The
@@ -368,6 +377,13 @@ pub trait CeIrq {
     fn take_pending(&self) -> u32;
     /// Resolve when a CE interrupt arrives or `ms` pass.
     fn wait(&self, ms: u32) -> impl Future<Output = ()> + Send;
+    /// Bus-side CE interrupt enable run by the HIF `start` before the RX
+    /// buffers are posted (`ath11k_ahb_start` → `ath11k_ahb_ce_irqs_enable`:
+    /// the `CE_HOST_IE_*` registers). PCI has none (MSI is host-side).
+    fn hif_start(&self, _io: &impl ChipIo) {}
+    /// Bus-side CE interrupt disable run by the HIF `stop`
+    /// (`ath11k_ahb_stop`: skipped under `ATH11K_FLAG_CRASH_FLUSH`).
+    fn hif_stop(&self, _io: &impl ChipIo, _crash_flush: bool) {}
 }
 
 /// The real CE interrupts (MSI handlers above).

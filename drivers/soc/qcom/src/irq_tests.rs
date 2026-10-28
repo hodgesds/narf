@@ -171,3 +171,54 @@ fn smoke_qcom_irq_gic_cookie_and_ipcc() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/soc/qcom", smoke_qcom_irq_gic_cookie_and_ipcc);
+
+/// `GicSpi::set_enabled` on QEMU virt's GICv3: an edge pended while the
+/// line is masked (`disable_irq_nosync`) is not delivered, and is
+/// delivered once on unmask (`enable_irq`) — the protocol the ath11k AHB
+/// HIF relies on.
+#[cfg(target_arch = "aarch64")]
+fn smoke_qcom_irq_gic_spi_mask_latches() -> TestResult {
+    use narf_interrupts::aarch64::gic;
+    static HITS: AtomicU32 = AtomicU32::new(0);
+    fn handler(_cookie: u64) -> narf_interrupts::IrqStatus {
+        HITS.fetch_add(1, Ordering::AcqRel);
+        narf_interrupts::IrqStatus::Handled
+    }
+    fn wait_hits(n: u32, ms: u64) {
+        let start = narf_time::Instant::now();
+        while HITS.load(Ordering::Acquire) < n
+            && narf_time::Instant::now().cycles_since(start)
+                < narf_time::ns_to_cycles(ms * 1_000_000)
+        {
+            core::hint::spin_loop();
+        }
+    }
+    let Some(line) = (200u32..240)
+        .filter(|i| *i < gic::spi_limit())
+        .find_map(|i| GicSpi::bind(i, true).ok())
+    else {
+        return TestResult::Skip("no free SPI dispatch slot");
+    };
+    line.install("qcom-irq-mask-test", 1, handler);
+    HITS.store(0, Ordering::Release);
+    let was = narf_arch::interrupts_enabled();
+    line.set_enabled(false);
+    let _ = gic::pend_spi(line.intid());
+    // SAFETY: the GIC is initialised at boot and the SPI is ours.
+    unsafe { narf_arch::enable_interrupts() };
+    wait_hits(1, 50);
+    let while_masked = HITS.load(Ordering::Acquire);
+    line.set_enabled(true);
+    wait_hits(1, 500);
+    let after = HITS.load(Ordering::Acquire);
+    if !was {
+        // SAFETY: restore the caller's mask.
+        unsafe { narf_arch::disable_interrupts() };
+    }
+    line.release("qcom-irq-mask-test", 1);
+    kt_assert_eq!(while_masked, 0);
+    kt_assert_eq!(after, 1);
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("drivers/soc/qcom", smoke_qcom_irq_gic_spi_mask_latches);

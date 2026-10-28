@@ -1442,9 +1442,11 @@ impl<Io: ChipIo, Irq: CeIrq> Hif for CeHif<Io, Irq> {
     }
     fn start(&mut self) {
         (self.on_start)();
+        self.irq.hif_start(&self.io);
         self.ce.start(&self.io);
     }
     fn stop(&mut self) {
+        self.irq.hif_stop(&self.io, self.ce.crash_flush);
         self.ce.stop();
     }
     fn send(&mut self, pipe: u8, frame: &[u8], transfer_id: u16) -> Result<(), TransportError> {

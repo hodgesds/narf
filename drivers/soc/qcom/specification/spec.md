@@ -155,7 +155,8 @@ remote's `OPEN_ACK`. Linux's deferred commands (`VERSION`, `OPEN`,
 ```rust
 pub trait IrqLine { fn wait(&self, ms) -> impl Future<Output = bool> + Send; }
 pub struct GicSpi;   impl GicSpi { bind(intid, edge) -> Result<Self, IrqBindError>, intid, vector,
-                                   install(name, cookie, SyncHandler), release(name, cookie) }  // impl IrqLine
+                                   install(name, cookie, SyncHandler), set_enabled(on), release(name, cookie) }  // impl IrqLine
+pub fn spi_set_enabled(intid, on);   // enable_irq / disable_irq_nosync at the distributor (hard-IRQ safe)
 pub enum IrqBindError { OutOfRange(u32), SlotTaken(u8), NotSupported }
 pub const fn dt_flags_edge(flags) -> bool;
 pub enum Q6Route { Gic { intid, event }, Smp2p { edge, entry, bit, event } }

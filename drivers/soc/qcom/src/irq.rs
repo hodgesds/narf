@@ -112,6 +112,11 @@ impl GicSpi {
         narf_interrupts::install_handler_named(self.vector, name, cookie, handler);
     }
 
+    /// `enable_irq` / `disable_irq_nosync` (see [`spi_set_enabled`]).
+    pub fn set_enabled(&self, on: bool) {
+        spi_set_enabled(self.intid, on);
+    }
+
     /// `free_irq`: mask at the distributor, drop the handler, release
     /// the slot.
     pub fn release(self, name: &str, cookie: u64) {
@@ -121,6 +126,27 @@ impl GicSpi {
         }
         narf_interrupts::remove_handler(self.vector, name, cookie);
         let _ = narf_interrupts::vector::free(self.vector);
+    }
+}
+
+/// `enable_irq` / `disable_irq_nosync` for a bound SPI: unmask / mask
+/// it at the distributor (`GICD_ISENABLER` / `GICD_ICENABLER`). An edge
+/// that arrives while masked stays pending in the distributor and is
+/// delivered on unmask. Safe in hard-IRQ context (one MMIO write). A
+/// no-op off aarch64 and for INTIDs outside the distributor.
+pub fn spi_set_enabled(intid: u32, on: bool) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        use narf_interrupts::aarch64::gic;
+        let _ = if on {
+            gic::unmask_spi(intid)
+        } else {
+            gic::mask_spi(intid)
+        };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (intid, on);
     }
 }
 

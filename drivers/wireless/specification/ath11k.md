@@ -515,6 +515,10 @@ Linux's: entry size / ring size / HP / TP in 32-bit words.
   CE vectors, no `pci.rs` change), `set_ce_irqs_enabled`
   (`ATH11K_FLAG_CE_IRQ_ENABLED`). On PCI there is no CE interrupt
   enable register (`CE_HOST_IE_*` is AHB-only).
+- `CeIrq` also has default-no-op bus hooks `hif_start(io)` /
+  `hif_stop(io, crash_flush)`, which `CeHif::start` / `stop` run around
+  `Ce::start` / `Ce::stop` (the AHB `CE_HOST_IE_*` gating,
+  [`ahb_hif`]).
 
 ### 3.5 DP descriptor layouts (`dp.rs`)
 
@@ -1876,6 +1880,30 @@ impl AhbRemote { fn resolve(blob, &AhbResources) -> Result<Self, AhbError>; fn l
 `RING_MASK_IPQ8074` / `RING_MASK_WCN6750`. `power_up`/`power_down` are
 `Q6Wcss::{load,start,stop}` (IPQ) or `PasRproc::{start,stop}` (WCN6750)
 driven with the resources `AhbRemote` resolves.
+
+AHB HIF (`ahb_hif.rs`, Linux `ahb.c` IRQ / start / stop paths):
+
+```rust
+pub enum AhbLineKind { Ce(u32 /* CE mask */), Dp(u32 /* ext-group mask */) }
+pub struct AhbLine { intid: u32, kind: AhbLineKind }
+pub fn ahb_lines(&AhbResources) -> Vec<AhbLine>;    // ath11k_ahb_config_irq / _config_ext_irq; hybrid: pcic over DT MSI
+pub type LineCtl = fn(intid, on);                   // enable_irq / disable_irq_nosync
+#[derive(Clone)] pub struct AhbIrq;                 // impl CeIrq + DpIrq
+impl AhbIrq { new(lines, AhbHwParams, LineCtl), bind_gic(lines, AhbHwParams) -> Result<Self, IrqBindError>,
+              release(), line_fired(i) /* hard-IRQ body */, lines(), masked(), fires() }
+pub fn ahb_ce_hif<R: RegIo>(&AhbResources, AhbIo<R>, AhbIrq, clock) -> Result<CeHif<AhbIo<R>, AhbIrq>, TransportError>;
+```
+
+A line's hard-IRQ body masks it at the distributor (DP: every line of the
+group, `ath11k_ahb_ext_grp_disable`) and records the CE / group bits in
+the state the PCI MSI handlers feed (`ce::raise_ce`, `runtime::raise_dp`),
+so `Rt::service` services AHB and PCI alike; `take_pending` /
+`take_dp_pending` unmask the taken lines before the service pass (Linux
+unmasks after it; an edge during the pass stays pending in the
+distributor). `hif_start` / `hif_stop` set / clear the `CE_HOST_IE_*`
+bits (`ath11k_ahb_ce_irqs_{enable,disable}`; kept under crash flush).
+Lines bind through `narf_drivers_qcom_soc::irq::GicSpi`, so the GIC
+backend underneath can change (the IPQ SoCs are GICv2).
 
 `HwRev`-keyed admission: `CoreConfig::for_hw` covers all four AHB parts
 (`num_rxdma_per_pdev = 1`; IPQ `single_pdev_only = false`, `num_vdevs =

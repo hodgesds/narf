@@ -620,13 +620,21 @@ pub static DP_MSI_FIRES: AtomicU64 = AtomicU64::new(0);
 /// so there is no per-group mask to set (Linux `disable_irq_nosync` →
 /// NAPI → `enable_irq`).
 fn dp_msi_irq(cookie: u64) -> narf_interrupts::IrqStatus {
+    raise_dp(cookie as u32);
+    narf_interrupts::IrqStatus::Handled
+}
+
+/// Record that the ext groups in `mask` interrupted and wake the device
+/// owner (the MSI handler above and the AHB per-ring GIC lines,
+/// [`super::ahb_hif`]). `false` while ext interrupts are disabled.
+pub(crate) fn raise_dp(mask: u32) -> bool {
     if !DP_IRQ_ENABLED.load(Ordering::Acquire) {
-        return narf_interrupts::IrqStatus::Handled;
+        return false;
     }
     DP_MSI_FIRES.fetch_add(1, Ordering::Relaxed);
-    DP_IRQ_PENDING.fetch_or(cookie as u32, Ordering::AcqRel);
+    DP_IRQ_PENDING.fetch_or(mask, Ordering::AcqRel);
     ce::wake_waiters();
-    narf_interrupts::IrqStatus::Handled
+    true
 }
 
 /// `true` while DP groups are pending (the CE wait future resolves on it).
