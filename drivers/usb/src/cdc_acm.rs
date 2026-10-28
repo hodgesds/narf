@@ -265,7 +265,11 @@ pub const RT_HOST_TO_DEV_CLASS_IFACE: u8 = 0x21;
 /// One bound CDC-ACM device. Held in the global [`ACM_DEVICES`]
 /// registry; the supervisor drains its bulk-IN endpoint each cycle
 /// and pushes received bytes onto `narf_input`'s AsciiByte ring so
-/// `/dev/console` reads them just like UART input.
+/// `/dev/console` reads them just like UART input. The same bytes
+/// also land in the device's `/dev/ttyACM<N>` RX ring, and the
+/// pump drains that node's TX ring onto bulk-OUT and decodes
+/// notification-endpoint reports into the node's modem state
+/// (`cdc_acm_bridge`).
 #[derive(Debug)]
 pub struct AcmDevice {
     pub slot_id: u8,
@@ -279,10 +283,24 @@ pub struct AcmDevice {
     pub bulk_in_dci: u8,
     /// DCI of the bulk-OUT endpoint (host-to-device bytes).
     pub bulk_out_dci: u8,
+    /// DCI of the Comm interface's interrupt-IN notification
+    /// endpoint (PSTN 1.2 §6.5), when the device carries one.
+    /// Armed at bind; SerialState reports decoded from it drive
+    /// the ttyACM modem state (#757).
+    pub notify_dci: Option<u8>,
+    /// ACM functional-descriptor capabilities the device declares
+    /// (PSTN 1.2 §3.6.2.1); all-clear when it omits the
+    /// descriptor. Gates `SEND_BREAK`.
+    pub capabilities: AcmCapabilities,
+    /// The `/dev/ttyACM<N>` index this device is published as
+    /// (#753), assigned by the bind path's bridge registration.
+    pub tty_index: Option<usize>,
     /// Live line coding: the bind default, updated by every
     /// successful `CdcAcmPort::set_line_coding`. This is the
     /// state the suspend/resume replay replays (#763), so it
-    /// tracks actuations, not just the bind.
+    /// tracks actuations, not just the bind. Updated ONLY after
+    /// a `SET_LINE_CODING` the device accepted, so the cache
+    /// always describes the state the device is actually in (#759).
     pub line_coding: IrqSafeSpinLock<LineCoding>,
     /// Last control-line bitmask (`CTRL_DTR` / `CTRL_RTS`)
     /// successfully driven via `SET_CONTROL_LINE_STATE`;
@@ -299,9 +317,27 @@ pub struct AcmDevice {
 /// [`try_bind_acm_already_addressed`]; drained by [`pump_all`].
 static ACM_DEVICES: IrqSafeSpinLock<Vec<Arc<AcmDevice>>> = IrqSafeSpinLock::new(Vec::new());
 
+/// The result of scanning a configuration blob for a CDC-ACM
+/// function: the Comm + Data interface pair, the bulk endpoints
+/// that carry terminal bytes, the Comm interface's notification
+/// endpoint (when present), and the capabilities the ACM
+/// functional descriptor declares.
+#[derive(Clone, Debug)]
+pub struct AcmInterfaces {
+    pub comm_iface: u8,
+    pub data_iface: u8,
+    pub bulk_in: EndpointConfig,
+    pub bulk_out: EndpointConfig,
+    /// Interrupt-IN notification endpoint on the Comm interface
+    /// (PSTN 1.2 §6.5), when the device carries one.
+    pub notify: Option<EndpointConfig>,
+    /// ACM functional-descriptor capabilities (PSTN 1.2
+    /// §3.6.2.1); all-clear when the device omits the descriptor.
+    pub capabilities: AcmCapabilities,
+}
+
 /// Walk a configuration descriptor looking for a CDC-ACM Comm +
-/// Data interface pair. Returns:
-///   `(comm_iface, data_iface, bulk_in_ep, bulk_out_ep)`
+/// Data interface pair.
 ///
 /// Topology (CDC PSTN §3.6 + USB 2.0 §9.6.5 + IAD ECN):
 ///   - Optional Interface Association Descriptor (type 0x0B)
@@ -309,18 +345,50 @@ static ACM_DEVICES: IrqSafeSpinLock<Vec<Arc<AcmDevice>>> = IrqSafeSpinLock::new(
 ///     where `bDeviceClass=0xEF`. Recognised but not required;
 ///     the scanner accepts both IAD-led and bare interface layouts.
 ///   - Interface descriptor with class=0x02 (Comm) subclass=0x02
-///     (ACM) — that's the Comm interface; usually carries one
+///     (ACM) — that's the Comm interface; carries the
+///     class-specific functional descriptors and (usually) one
 ///     interrupt-IN notification endpoint.
 ///   - Interface descriptor with class=0x0A (Data) — that's the
 ///     Data interface; carries the bulk-IN + bulk-OUT pair we
 ///     drain for terminal bytes.
-pub fn find_acm_interfaces(cfg: &[u8]) -> Option<(u8, u8, EndpointConfig, EndpointConfig)> {
+///
+/// Pairing rule: when the Comm interface carries a Union
+/// functional descriptor (CDC 1.2 §5.2.3.2) naming this Comm
+/// interface as its control interface, the Union's subordinate
+/// list governs — the Data interface is the first subordinate
+/// that presents a bulk pair, and if no subordinate does, the
+/// scan fails closed rather than binding some other function's
+/// pair. Without a Union, the first Data interface with a bulk
+/// pair wins (the historical class/position scan).
+pub fn find_acm_interfaces(cfg: &[u8]) -> Option<AcmInterfaces> {
+    use crate::cdc::{UnionDescriptor, CS_INTERFACE};
+
     let mut i = 0usize;
     let mut comm_iface: Option<u8> = None;
-    let mut data_iface: Option<u8> = None;
-    let mut bulk_in: Option<EndpointConfig> = None;
-    let mut bulk_out: Option<EndpointConfig> = None;
+    let mut notify: Option<EndpointConfig> = None;
+    let mut capabilities = AcmCapabilities::decode(0);
+    let mut union_subordinates: Option<Vec<u8>> = None;
+    // Completed Data-interface bulk pairs, in walk order:
+    // (interface number, bulk-IN, bulk-OUT).
+    let mut data_pairs: Vec<(u8, EndpointConfig, EndpointConfig)> = Vec::new();
+    // The Data interface currently being walked, with its
+    // partially-collected bulk pair.
+    let mut cur_data: Option<(u8, Option<EndpointConfig>, Option<EndpointConfig>)> = None;
+    let mut current_iface: Option<u8> = None;
     let mut current_class: u8 = 0;
+
+    // Close out the Data interface being walked, if it completed
+    // a bulk pair.
+    macro_rules! finish_data {
+        () => {
+            if let Some((num, Some(bi), Some(bo))) = cur_data.take() {
+                data_pairs.push((num, bi, bo));
+            } else {
+                cur_data = None;
+            }
+        };
+    }
+
     while i + 2 <= cfg.len() {
         let len = cfg[i] as usize;
         if len < 2 || i + len > cfg.len() {
@@ -346,49 +414,98 @@ pub fn find_acm_interfaces(cfg: &[u8]) -> Option<(u8, u8, EndpointConfig, Endpoi
                 // we bind to this function rather than a stale
                 // partial match from earlier in the blob.
                 if fc == USB_CLASS_CDC_COMM && fsc == CDC_SUBCLASS_ACM {
+                    finish_data!();
                     comm_iface = None;
-                    data_iface = None;
-                    bulk_in = None;
-                    bulk_out = None;
+                    notify = None;
+                    capabilities = AcmCapabilities::decode(0);
+                    union_subordinates = None;
+                    data_pairs.clear();
+                    current_iface = None;
                     current_class = 0;
                 }
             }
             // Interface Descriptor (USB 2.0 §9.6.5).
             4 if len >= 9 => {
+                finish_data!();
+                let num = cfg[i + 2];
                 let cls = cfg[i + 5];
                 let sub = cfg[i + 6];
+                current_iface = Some(num);
                 current_class = cls;
                 if cls == USB_CLASS_CDC_COMM && sub == CDC_SUBCLASS_ACM {
-                    comm_iface = Some(cfg[i + 2]);
+                    if comm_iface.is_none() {
+                        comm_iface = Some(num);
+                    }
                 } else if cls == USB_CLASS_CDC_DATA {
-                    data_iface = Some(cfg[i + 2]);
+                    cur_data = Some((num, None, None));
                 }
             }
-            // Endpoint Descriptor (USB 2.0 §9.6.6). Only the bulk
-            // pair on the Data interface matters for the terminal
-            // pipeline; the Comm interface's interrupt-IN
-            // notification endpoint we ignore for now.
-            5 if len >= 7 && current_class == USB_CLASS_CDC_DATA => {
+            // Class-specific functional descriptor (CDC 1.2
+            // §5.2.3) attached to the Comm interface: the ACM
+            // descriptor declares capabilities; the Union
+            // descriptor names the Data interface(s) this Comm
+            // interface controls.
+            CS_INTERFACE if len >= 3 => {
+                if current_iface == comm_iface && comm_iface.is_some() {
+                    match cfg[i + 2] {
+                        subtype if subtype == FunctionalSubtype::Acm.to_byte() => {
+                            if let Ok(d) = AcmDescriptor::parse(&cfg[i..i + len]) {
+                                capabilities = d.capabilities;
+                            }
+                        }
+                        subtype if subtype == FunctionalSubtype::Union.to_byte() => {
+                            if let Ok(u) = UnionDescriptor::parse(&cfg[i..i + len]) {
+                                if Some(u.control_interface) == comm_iface {
+                                    union_subordinates = Some(u.subordinate_interfaces);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Endpoint Descriptor (USB 2.0 §9.6.6). On the Data
+            // interface only the bulk pair matters for the
+            // terminal pipeline; on the Comm interface the
+            // interrupt-IN endpoint is the notification pipe
+            // (PSTN 1.2 §6.5).
+            5 if len >= 7 => {
                 let ep_addr = cfg[i + 2];
                 let attr = cfg[i + 3];
                 let mps = u16::from_le_bytes([cfg[i + 4], cfg[i + 5]]);
+                let interval = cfg[i + 6];
                 let xfer_t = attr & 0x03;
-                if xfer_t == 2 {
-                    // Bulk
-                    let ep_cfg = EndpointConfig {
-                        ep_addr,
-                        max_packet: mps,
-                        kind: if ep_addr & 0x80 != 0 {
-                            EndpointKind::BulkIn
-                        } else {
-                            EndpointKind::BulkOut
-                        },
-                        interval: 0,
-                    };
-                    if ep_addr & 0x80 != 0 && bulk_in.is_none() {
-                        bulk_in = Some(ep_cfg);
-                    } else if ep_addr & 0x80 == 0 && bulk_out.is_none() {
-                        bulk_out = Some(ep_cfg);
+                let is_in = ep_addr & 0x80 != 0;
+                if current_class == USB_CLASS_CDC_DATA {
+                    if xfer_t == 2 {
+                        // Bulk
+                        let ep_cfg = EndpointConfig {
+                            ep_addr,
+                            max_packet: mps,
+                            kind: if is_in {
+                                EndpointKind::BulkIn
+                            } else {
+                                EndpointKind::BulkOut
+                            },
+                            interval: 0,
+                        };
+                        if let Some((_, bi, bo)) = &mut cur_data {
+                            if is_in && bi.is_none() {
+                                *bi = Some(ep_cfg);
+                            } else if !is_in && bo.is_none() {
+                                *bo = Some(ep_cfg);
+                            }
+                        }
+                    }
+                } else if current_iface == comm_iface && comm_iface.is_some() {
+                    if xfer_t == 3 && is_in && notify.is_none() {
+                        // Interrupt-IN — notification endpoint.
+                        notify = Some(EndpointConfig {
+                            ep_addr,
+                            max_packet: mps,
+                            kind: EndpointKind::InterruptIn,
+                            interval,
+                        });
                     }
                 }
             }
@@ -396,7 +513,30 @@ pub fn find_acm_interfaces(cfg: &[u8]) -> Option<(u8, u8, EndpointConfig, Endpoi
         }
         i += len;
     }
-    Some((comm_iface?, data_iface?, bulk_in?, bulk_out?))
+    finish_data!();
+
+    let comm_iface = comm_iface?;
+    let (data_iface, bulk_in, bulk_out) = match &union_subordinates {
+        Some(subs) => {
+            let mut found = None;
+            for sub in subs {
+                if let Some(p) = data_pairs.iter().find(|(num, _, _)| num == sub) {
+                    found = Some(*p);
+                    break;
+                }
+            }
+            found?
+        }
+        None => *data_pairs.first()?,
+    };
+    Some(AcmInterfaces {
+        comm_iface,
+        data_iface,
+        bulk_in,
+        bulk_out,
+        notify,
+        capabilities,
+    })
 }
 
 // ── CdcAcmPort — public per-port API ─────────────────────────────
@@ -422,48 +562,41 @@ impl CdcAcmPort {
         Some(Self { dev, xhci })
     }
 
-    /// Send `SET_LINE_CODING` with the supplied parameters.
+    /// Grab the bound CDC-ACM device on `slot_id`, if any.
+    pub fn for_slot(xhci: Arc<Xhci>, slot_id: u8) -> Option<Self> {
+        let dev = ACM_DEVICES
+            .lock()
+            .iter()
+            .find(|d| d.slot_id == slot_id)
+            .cloned()?;
+        Some(Self { dev, xhci })
+    }
+
+    /// The line coding the device last accepted (the bind
+    /// default, or the most recent successful
+    /// [`CdcAcmPort::set_line_coding`]).
+    pub fn line_coding(&self) -> LineCoding {
+        *self.dev.line_coding.lock()
+    }
+
+    /// Send `SET_LINE_CODING` (PSTN 1.2 §6.3.10) with the
+    /// supplied parameters.
     ///
-    /// `baud` is the DTE rate in bits/s (e.g. 115200).
-    /// `bits` is the data-bit count (5, 6, 7, 8, or 16).
-    /// `parity` is the `Parity` discriminant encoded as its wire
-    /// byte (0 = None, 1 = Odd, 2 = Even, 3 = Mark, 4 = Space).
-    /// `stop` is the `StopBits` discriminant (0 = 1 stop, 1 =
-    /// 1.5, 2 = 2).
-    pub fn set_line_coding(
-        &self,
-        baud: u32,
-        bits: u8,
-        parity: u8,
-        stop: u8,
-    ) -> Result<(), CdcError> {
-        let coding = LineCoding {
-            baud_rate: baud,
-            data_bits: bits,
-            parity: match parity {
-                0 => Parity::None,
-                1 => Parity::Odd,
-                2 => Parity::Even,
-                3 => Parity::Mark,
-                4 => Parity::Space,
-                _ => return Err(CdcError::MalformedField),
-            },
-            stop_bits: match stop {
-                0 => StopBits::One,
-                1 => StopBits::OnePointFive,
-                2 => StopBits::Two,
-                _ => return Err(CdcError::MalformedField),
-            },
-        };
+    /// The transfer's result is propagated honestly: a STALLed
+    /// or failed request returns [`CdcError::Transfer`] and the
+    /// cached line coding is left describing the state the
+    /// device is actually in; the cache updates only after the
+    /// device accepts the new coding (#759).
+    pub fn set_line_coding(&self, coding: LineCoding) -> Result<(), CdcError> {
+        if !matches!(coding.data_bits, 5 | 6 | 7 | 8 | 16) {
+            return Err(CdcError::MalformedField);
+        }
         let coding_bytes = coding.encode();
-        // The transfer is issued synchronously by parking on the
-        // xHCI command ring via `block_on`. The cached line
-        // coding updates only on success: the suspend/resume
-        // replay (#763) replays the cache, so it must describe
-        // the state the device is actually in — never a request
-        // the device refused. A failed transfer is a typed
-        // error, not the old silent `Ok`.
-        let sent = narf_scheduler::block_on(async {
+        // The control transfer is issued synchronously by
+        // parking on the xHCI command ring via `block_on`. No
+        // lock is held across the bridge (the cache update below
+        // takes the lock only after the transfer completes).
+        let res = narf_scheduler::block_on(async {
             self.xhci
                 .control_out(
                     self.dev.slot_id,
@@ -475,20 +608,20 @@ impl CdcAcmPort {
                 )
                 .await
         });
-        match sent {
-            Ok(_) => {
-                *self.dev.line_coding.lock() = coding;
-                Ok(())
-            }
-            Err(_) => Err(CdcError::Transfer),
-        }
+        res.map_err(|_| CdcError::Transfer)?;
+        *self.dev.line_coding.lock() = coding;
+        Ok(())
     }
 
     /// Send `SET_CONTROL_LINE_STATE` — sets DTR (`bit 0`) and RTS
     /// (`bit 1`) in the `wValue` field per PSTN 1.2 §6.3.12.
+    ///
+    /// A STALLed or failed request returns [`CdcError::Transfer`]
+    /// — the caller is never told the lines moved when the
+    /// device did not accept the request (#759).
     pub fn set_control_lines(&self, dtr: bool, rts: bool) -> Result<(), CdcError> {
         let state: u16 = if dtr { CTRL_DTR } else { 0 } | if rts { CTRL_RTS } else { 0 };
-        let sent = narf_scheduler::block_on(async {
+        let res = narf_scheduler::block_on(async {
             self.xhci
                 .control_out(
                     self.dev.slot_id,
@@ -500,15 +633,36 @@ impl CdcAcmPort {
                 )
                 .await
         });
-        match sent {
-            Ok(_) => {
-                // Recorded for the resume replay (#763) only once
-                // the device has actually taken the state.
-                self.dev.control_lines.store(state, Ordering::SeqCst);
-                Ok(())
-            }
-            Err(_) => Err(CdcError::Transfer),
+        res.map_err(|_| CdcError::Transfer)
+    }
+
+    /// Send `SEND_BREAK` (PSTN 1.2 §6.3, request `0x23`):
+    /// `duration_ms` is the break duration carried in `wValue` —
+    /// a millisecond count, `0` to stop an ongoing break, or
+    /// `0xFFFF` to break until the next request.
+    ///
+    /// Refused with [`CdcError::Unsupported`] when the device
+    /// did not declare the send-break capability in its ACM
+    /// functional descriptor (PSTN 1.2 §3.6.2.1) — the request
+    /// is never issued to a device that did not opt in.
+    pub fn send_break(&self, duration_ms: u16) -> Result<(), CdcError> {
+        if !self.dev.capabilities.send_break {
+            return Err(CdcError::Unsupported);
         }
+        let setup = build_send_break(self.dev.comm_iface, duration_ms);
+        let res = narf_scheduler::block_on(async {
+            self.xhci
+                .control_out(
+                    self.dev.slot_id,
+                    setup.bm_request_type,
+                    setup.b_request,
+                    setup.w_value,
+                    setup.w_index,
+                    &[],
+                )
+                .await
+        });
+        res.map_err(|_| CdcError::Transfer)
     }
 
     /// Receive up to `buf.len()` bytes from the device's bulk-IN
@@ -544,12 +698,22 @@ pub async fn try_bind_cdc_acm_already_addressed(
     hub_port: Option<(usize, u8)>,
 ) -> Result<(), CdcError> {
     let _ = speed; // reserved for future MaxPacketSize-aware setup
-    let (comm_iface, data_iface, bulk_in, bulk_out) =
-        find_acm_interfaces(cfg).ok_or(CdcError::Truncated)?;
+    let ifaces = find_acm_interfaces(cfg).ok_or(CdcError::Truncated)?;
+    let comm_iface = ifaces.comm_iface;
+    let data_iface = ifaces.data_iface;
+    let bulk_in = ifaces.bulk_in;
+    let bulk_out = ifaces.bulk_out;
 
-    // Configure xHC-side endpoint contexts for the bulk pair.
+    // Configure xHC-side endpoint contexts for the bulk pair,
+    // plus the notification endpoint when the device carries
+    // one — without a configured endpoint context the
+    // notification pipe can never be armed (#757).
+    let mut ep_list: Vec<EndpointConfig> = alloc::vec![bulk_in, bulk_out];
+    if let Some(notify) = ifaces.notify {
+        ep_list.push(notify);
+    }
     xhci_dev
-        .configure_endpoints(slot_id, &[bulk_in, bulk_out])
+        .configure_endpoints(slot_id, &ep_list)
         .await
         .map_err(|_| CdcError::Truncated)?;
 
@@ -611,12 +775,38 @@ pub async fn try_bind_cdc_acm_already_addressed(
         .arm_interrupt_in(slot_id, bulk_in_dci, bulk_in.max_packet.min(64) as u32)
         .map_err(|_| CdcError::Truncated)?;
 
+    // Arm the notification endpoint the same way (#757): the
+    // device can now raise SerialState reports, which the pump
+    // decodes into the ttyACM node's modem state.
+    let notify_dci = match ifaces.notify {
+        Some(notify) => {
+            let dci = ((notify.ep_addr & 0x0F) * 2) + 1;
+            xhci_dev
+                .arm_interrupt_in(slot_id, dci, notify.max_packet.min(64) as u32)
+                .map_err(|_| CdcError::Truncated)?;
+            Some(dci)
+        }
+        None => None,
+    };
+
+    // Publish the per-device /dev/ttyACM<N> node (#753). The
+    // transport resolves the device lazily through this registry
+    // on each ioctl, so registering just before the registry
+    // push is safe: an ioctl landing in between is answered
+    // ENODEV, the honest state of a half-bound device.
+    let tty_index = crate::cdc_acm_bridge::register_tty_acm(Arc::new(
+        crate::cdc_acm_bridge::XhciAcmTransport::new(slot_id, ifaces.capabilities),
+    ));
+
     let dev = Arc::new(AcmDevice {
         slot_id,
         data_iface,
         comm_iface,
         bulk_in_dci,
         bulk_out_dci,
+        notify_dci,
+        capabilities: ifaces.capabilities,
+        tty_index: Some(tty_index),
         line_coding: IrqSafeSpinLock::new(coding),
         control_lines: AtomicU16::new(CTRL_DTR | CTRL_RTS),
         hub_port,
@@ -636,18 +826,38 @@ pub async fn try_bind_cdc_acm_already_addressed(
 
 /// Detach the ACM device bound to `slot_id` (unplugged or torn
 /// down by the supervisor): drop the binding so `pump_all` stops
-/// polling the dead slot. Returns true when a binding was removed.
+/// polling the dead slot, and withdraw its `/dev/ttyACM<N>`
+/// publication. Returns true when a binding was removed.
 pub fn detach_acm(slot_id: u8) -> bool {
-    let mut g = ACM_DEVICES.lock();
-    let before = g.len();
-    g.retain(|d| d.slot_id != slot_id);
-    g.len() != before
+    let (removed, indices) = {
+        let mut g = ACM_DEVICES.lock();
+        let indices: Vec<usize> = g
+            .iter()
+            .filter(|d| d.slot_id == slot_id)
+            .filter_map(|d| d.tty_index)
+            .collect();
+        let before = g.len();
+        g.retain(|d| d.slot_id != slot_id);
+        (g.len() != before, indices)
+    };
+    for idx in indices {
+        crate::cdc_acm_bridge::unregister_tty_acm(idx);
+    }
+    removed
 }
 
-/// Drop every ACM binding. Called on a controller recovery epoch
-/// change.
+/// Drop every ACM binding and ttyACM publication. Called on a
+/// controller recovery epoch change.
 pub fn clear_acm() {
-    ACM_DEVICES.lock().clear();
+    let indices: Vec<usize> = {
+        let mut g = ACM_DEVICES.lock();
+        let v: Vec<usize> = g.iter().filter_map(|d| d.tty_index).collect();
+        g.clear();
+        v
+    };
+    for idx in indices {
+        crate::cdc_acm_bridge::unregister_tty_acm(idx);
+    }
 }
 
 // ── Suspend / resume (system PM) ──────────────────────────────────
@@ -810,6 +1020,11 @@ pub async fn resume_suspended_hub_ports(xhci_dev: &Xhci) {
 /// [`narf_input::InputEvent::AsciiByte`] events. `/dev/console` reads
 /// pop these the same way it consumes UART input — so a USB serial
 /// adaptor wired to a debug header becomes a kernel console source.
+/// The same bytes also land in the device's `/dev/ttyACM<N>` RX
+/// ring (#753), the pump drains that node's TX ring onto bulk-OUT,
+/// and notification-endpoint reports are decoded into the node's
+/// modem state (#757). All controller calls here are non-blocking
+/// polls; no lock is held across any of them.
 pub fn pump_all(xhci_dev: &Xhci) -> usize {
     // Quiesced for system suspend (#763): the PM prepare hook
     // latches this before the controller fan-out; leave every
@@ -823,17 +1038,69 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
     };
     let mut total = 0usize;
     for d in &devs {
+        // ── RX: bulk-IN → console input ring + ttyACM RX ring ──
         let mut buf = [0u8; 64];
         loop {
             match xhci_dev.poll_interrupt_in(d.slot_id, d.bulk_in_dci, &mut buf) {
                 Ok(Some(n)) => {
-                    for &b in &buf[..n.min(buf.len())] {
+                    let n = n.min(buf.len());
+                    for &b in &buf[..n] {
                         narf_input::push_global(narf_input::InputEvent::AsciiByte(b));
                         total += 1;
+                    }
+                    if let Some(idx) = d.tty_index {
+                        crate::cdc_acm_bridge::feed_rx(idx, &buf[..n]);
                     }
                 }
                 Ok(None) => break,
                 Err(_) => break,
+            }
+        }
+        if let Some(idx) = d.tty_index {
+            // ── Notifications: SerialState → ttyACM modem state ──
+            if let Some(dci) = d.notify_dci {
+                let mut nbuf = [0u8; 64];
+                while let Ok(Some(n)) = xhci_dev.poll_interrupt_in(d.slot_id, dci, &mut nbuf) {
+                    let n = n.min(nbuf.len());
+                    match Notification::decode(&nbuf[..n]) {
+                        Ok(Notification::SerialState(s)) => {
+                            crate::cdc_acm_bridge::note_serial_state(idx, s);
+                        }
+                        Ok(Notification::NetworkConnection { up }) => {
+                            crate::cdc_acm_bridge::note_network_connection(idx, up);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // ── TX: ttyACM TX ring → bulk-OUT ──
+            // Peek/skip discipline (the vendor-serial pump's):
+            // bytes leave the ring only once the controller
+            // reports the transfer complete. A TCXONC-stopped
+            // port peeks as empty, so its bytes simply wait.
+            let mut chunk = [0u8; 64];
+            let pending = crate::cdc_acm_bridge::tx_peek(idx, &mut chunk);
+            if pending > 0 {
+                if let Some(generation) = xhci_dev.device_generation(d.slot_id) {
+                    if let Ok(token) = xhci_dev.begin_bulk_out(
+                        d.slot_id,
+                        d.bulk_out_dci,
+                        generation,
+                        &chunk[..pending],
+                    ) {
+                        for _ in 0..512 {
+                            match xhci_dev.poll_bulk_out(&token) {
+                                Ok(Some(sent)) => {
+                                    crate::cdc_acm_bridge::tx_skip(idx, sent.min(pending));
+                                    total += sent;
+                                    break;
+                                }
+                                Ok(None) => continue,
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1086,6 +1353,9 @@ pub mod tests {
             comm_iface: 0,
             bulk_in_dci: 3,
             bulk_out_dci: 2,
+            notify_dci: None,
+            capabilities: AcmCapabilities::decode(0),
+            tty_index: None,
             line_coding: IrqSafeSpinLock::new(LineCoding::N_115200_8N1),
             control_lines: AtomicU16::new(CTRL_DTR | CTRL_RTS),
             hub_port: None,
@@ -1210,24 +1480,27 @@ pub mod tests {
     ///   8  IAD                       (bFirstInterface=0, bInterfaceCount=2,
     ///                                 bFunctionClass=0x02, bFunctionSubClass=0x02)
     ///   9  Interface 0               (class=0x02 CDC-Comm, subclass=0x02 ACM)
-    ///   7  Endpoint 0x83             (Interrupt-IN — notification ep, ignored)
+    ///   5  Header functional desc    (bcdCDC 0x0120)
+    ///   4  ACM functional desc       (bmCapabilities=0x07)
+    ///   5  Union functional desc     (control=0, subordinate=1)
+    ///   7  Endpoint 0x83             (Interrupt-IN — notification ep)
     ///   9  Interface 1               (class=0x0A CDC-Data, subclass=0x00)
     ///   7  Endpoint 0x81             (Bulk-IN)
     ///   7  Endpoint 0x02             (Bulk-OUT)
     ///
-    /// Total = 9+8+9+7+9+7+7 = 56 bytes
+    /// Total = 9+8+9+5+4+5+7+9+7+7 = 70 bytes
     /// ```
     fn smoke_iad_acm_data_bind_detect() -> TestResult {
         use crate::xhci::EndpointKind;
 
         // Configuration Descriptor (9 bytes):
         //   bLength=9, bDescriptorType=2 (Configuration),
-        //   wTotalLength=56, bNumInterfaces=2, bConfigurationValue=1,
+        //   wTotalLength=70, bNumInterfaces=2, bConfigurationValue=1,
         //   iConfiguration=0, bmAttributes=0xC0, bMaxPower=50
-        let cfg: [u8; 56] = [
+        let cfg: [u8; 70] = [
             9,
             2,
-            56,
+            70,
             0,
             2,
             1,
@@ -1258,6 +1531,30 @@ pub mod tests {
             0x02,
             0x01,
             0,
+            // Header functional descriptor (5 bytes):
+            // bFunctionLength=5, CS_INTERFACE (0x24), subtype 0x00,
+            // bcdCDC=0x0120 (CDC 1.2).
+            5,
+            CS_INTERFACE,
+            0x00,
+            0x20,
+            0x01,
+            // ACM functional descriptor (4 bytes):
+            // bFunctionLength=4, CS_INTERFACE, subtype 0x02 (ACM),
+            // bmCapabilities=0x07 (comm feature + line coding/state
+            // + send break; no network-connection notification).
+            4,
+            CS_INTERFACE,
+            0x02,
+            0x07,
+            // Union functional descriptor (5 bytes):
+            // bFunctionLength=5, CS_INTERFACE, subtype 0x06 (Union),
+            // bControlInterface=0, bSubordinateInterface0=1.
+            5,
+            CS_INTERFACE,
+            0x06,
+            0,
+            1,
             // Endpoint 0x83 (7 bytes): Interrupt-IN (notification)
             // ep_addr=0x83, bmAttributes=0x03 (Interrupt), wMaxPacketSize=16, bInterval=255
             7,
@@ -1300,25 +1597,42 @@ pub mod tests {
             0,
         ];
 
-        let (comm, data, bulk_in, bulk_out) = match find_acm_interfaces(&cfg) {
+        let r = match find_acm_interfaces(&cfg) {
             Some(r) => r,
             None => return TestResult::Fail("IAD-led ACM+Data not detected"),
         };
 
-        if comm != 0 {
+        if r.comm_iface != 0 {
             return TestResult::Fail("comm iface should be 0");
         }
-        if data != 1 {
+        if r.data_iface != 1 {
             return TestResult::Fail("data iface should be 1");
         }
-        if bulk_in.ep_addr != 0x81 || bulk_in.kind != EndpointKind::BulkIn {
+        if r.bulk_in.ep_addr != 0x81 || r.bulk_in.kind != EndpointKind::BulkIn {
             return TestResult::Fail("bulk-IN mis-identified");
         }
-        if bulk_out.ep_addr != 0x02 || bulk_out.kind != EndpointKind::BulkOut {
+        if r.bulk_out.ep_addr != 0x02 || r.bulk_out.kind != EndpointKind::BulkOut {
             return TestResult::Fail("bulk-OUT mis-identified");
         }
-        if bulk_in.max_packet != 64 || bulk_out.max_packet != 64 {
+        if r.bulk_in.max_packet != 64 || r.bulk_out.max_packet != 64 {
             return TestResult::Fail("max_packet mis-decoded");
+        }
+        // The Comm interface's interrupt-IN endpoint is captured
+        // as the notification pipe (#757) — not dropped.
+        match r.notify {
+            Some(n) if n.ep_addr == 0x83 && n.kind == EndpointKind::InterruptIn => {}
+            _ => return TestResult::Fail("notification endpoint not captured"),
+        }
+        if n_max_packet(&r) != 16 {
+            return TestResult::Fail("notification max_packet mis-decoded");
+        }
+        // ACM functional descriptor bmCapabilities=0x07 decoded.
+        let caps = r.capabilities;
+        if !caps.comm_feature || !caps.line_coding_state || !caps.send_break {
+            return TestResult::Fail("ACM capabilities lost in scan");
+        }
+        if caps.network_connection {
+            return TestResult::Fail("capability bits over-set");
         }
         TestResult::Pass
     }
@@ -1377,6 +1691,9 @@ pub mod tests {
             comm_iface,
             bulk_in_dci: 3,
             bulk_out_dci: 2,
+            notify_dci: None,
+            capabilities: AcmCapabilities::decode(0),
+            tty_index: None,
             line_coding: IrqSafeSpinLock::new(coding),
             control_lines: AtomicU16::new(control_lines),
             hub_port: None,
@@ -1588,4 +1905,108 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/cdc_acm", smoke_acm_pm_latch);
+
+    fn n_max_packet(r: &AcmInterfaces) -> u16 {
+        r.notify.map(|n| n.max_packet).unwrap_or(0)
+    }
+
+    // ── Descriptor blob builders for the Union tests ─────────
+
+    fn cfg_header(total: u16) -> alloc::vec::Vec<u8> {
+        alloc::vec![9, 2, total as u8, (total >> 8) as u8, 2, 1, 0, 0xC0, 50]
+    }
+
+    fn iface(num: u8, class: u8, sub: u8, n_eps: u8) -> alloc::vec::Vec<u8> {
+        alloc::vec![9, 4, num, 0, n_eps, class, sub, 0, 0]
+    }
+
+    fn ep(addr: u8, attr: u8, mps: u16) -> alloc::vec::Vec<u8> {
+        alloc::vec![7, 5, addr, attr, mps as u8, (mps >> 8) as u8, 1]
+    }
+
+    fn join(parts: &[alloc::vec::Vec<u8>]) -> alloc::vec::Vec<u8> {
+        let total: usize = parts.iter().map(|p| p.len()).sum::<usize>() + 9;
+        let mut out = cfg_header(total as u16);
+        for p in parts {
+            out.extend_from_slice(p);
+        }
+        out
+    }
+
+    /// Masking-defeating: TWO CDC-Data interfaces carry bulk
+    /// pairs. The first (interface 1) is not in the Comm
+    /// interface's Union; the Union names interface 2. The scan
+    /// must bind interface 2's pair — the class/position scan
+    /// alone would have taken interface 1's.
+    fn smoke_union_selects_named_data_interface() -> TestResult {
+        let cfg = join(&[
+            iface(0, 0x02, 0x02, 1),
+            // Union: control=0, subordinate=2 (5 bytes).
+            alloc::vec![5, CS_INTERFACE, 0x06, 0, 2],
+            ep(0x83, 0x03, 16),
+            iface(1, 0x0A, 0x00, 2),
+            ep(0x82, 0x02, 64),
+            ep(0x03, 0x02, 64),
+            iface(2, 0x0A, 0x00, 2),
+            ep(0x84, 0x02, 64),
+            ep(0x04, 0x02, 64),
+        ]);
+        let r = match find_acm_interfaces(&cfg) {
+            Some(r) => r,
+            None => return TestResult::Fail("union-led ACM not detected"),
+        };
+        if r.data_iface != 2 {
+            return TestResult::Fail("Union-named data interface must win");
+        }
+        if r.bulk_in.ep_addr != 0x84 || r.bulk_out.ep_addr != 0x04 {
+            return TestResult::Fail("bound the wrong function's bulk pair");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/cdc_acm",
+        smoke_union_selects_named_data_interface
+    );
+
+    /// A Union naming a subordinate that does not exist fails
+    /// closed — the scan must not fall back to an unrelated
+    /// Data interface's pair the Union did not name.
+    fn smoke_union_dangling_fails_closed() -> TestResult {
+        let cfg = join(&[
+            iface(0, 0x02, 0x02, 1),
+            // Union: control=0, subordinate=3 (does not exist).
+            alloc::vec![5, CS_INTERFACE, 0x06, 0, 3],
+            ep(0x83, 0x03, 16),
+            iface(1, 0x0A, 0x00, 2),
+            ep(0x81, 0x02, 64),
+            ep(0x02, 0x02, 64),
+        ]);
+        if find_acm_interfaces(&cfg).is_some() {
+            return TestResult::Fail("dangling Union must fail closed");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_acm", smoke_union_dangling_fails_closed);
+
+    /// SEND_BREAK setup packet, pinned byte-for-byte against
+    /// PSTN 1.2 §6.3 (request 0x23): bmRequestType 0x21
+    /// (class/interface/host-to-device), wValue = duration in
+    /// milliseconds, wIndex = Comm interface, wLength 0.
+    fn smoke_send_break_setup_layout() -> TestResult {
+        let s = build_send_break(1, 250);
+        let bytes = s.encode();
+        let expect = [0x21u8, 0x23, 250, 0, 1, 0, 0, 0];
+        if bytes != expect {
+            return TestResult::Fail("SEND_BREAK setup layout wrong");
+        }
+        // 0xFFFF = break until stopped; 0 = stop break.
+        if build_send_break(0, 0xFFFF).w_value != 0xFFFF {
+            return TestResult::Fail("continuous-break wValue lost");
+        }
+        if build_send_break(0, 0).w_value != 0 {
+            return TestResult::Fail("stop-break wValue lost");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_acm", smoke_send_break_setup_layout);
 }

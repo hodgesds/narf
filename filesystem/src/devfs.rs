@@ -683,6 +683,18 @@ pub fn install_ccid_hooks(
     });
 }
 
+pub fn install_tty_acm_hooks(
+    lookup: providers::DeviceLookup,
+    enumerate: providers::DeviceEnumeration,
+) {
+    register_provider(DeviceProvider {
+        name: "tty_acm",
+        lookup,
+        lookup_dir: |_| None,
+        enumerate,
+    });
+}
+
 pub fn install_video_hooks(
     lookup: providers::DeviceLookup,
     enumerate: providers::DeviceEnumeration,
