@@ -1329,7 +1329,7 @@ trusted.
   preloaded DDI_BUF_TRANS table).
 - §5's device table is unchanged by this lane: the MTL DIDs
   were already in the census; only their display gate moved.
-## 14. Media engines — VCS / VECS (`intel_gpu_media`, #1022)
+## 18. Media engines — VCS / VECS (`intel_gpu_media`, #1022)
 
 The Gen12 media engines brought to the §8 (RCS0) standard.
 The execlists machinery of §8 is shared, not forked:
