@@ -845,6 +845,12 @@ impl Handle {
     pub(crate) fn fail_tcm(&self, value: bool) {
         self.0.lock().fail_tcm = value;
     }
+    /// A still-powered dongle answers D0_INFORM (INTMASK stays nonzero).
+    pub(crate) fn d0_alive(&self) {
+        let mut s = self.0.lock();
+        s.d0_alive = true;
+        s.registers.insert(PCIE + 0x24, 0x300);
+    }
     /// The function fell off the bus.
     pub(crate) fn gone(&self, value: bool) {
         self.0.lock().gone = value;

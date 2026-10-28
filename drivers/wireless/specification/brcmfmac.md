@@ -686,6 +686,25 @@ Smokes: `smoke_brcmf_fwhalt_reset_reboots_replays_and_rejoins_same_netdev`,
 `smoke_brcmf_remove_racing_reset_never_republishes`,
 `smoke_brcmf_reset_failures_stay_terminal_or_pinned`.
 
+### Cold resume
+
+Linux v7.2 `pcie.c::brcmf_pcie_pm_leave_D3` resumes hot when `INTMASK`
+reads nonzero (D0_INFORM, below); otherwise the dongle lost power or
+firmware across suspend and Linux calls `brcmf_pcie_remove` followed by
+`brcmf_pcie_probe` on the same function. The `brcmfmac` system-PM resume
+hook now calls `native_runtime::resume` -> `Generation::resume`: the hot
+path is unchanged, and a `Failed` (cold) resume runs `Generation::recover`
+under the generation mutex, i.e. the dead-firmware stop (no D3 ack can
+come from lost firmware), `brcmf_pcie_reset_device`, a fresh signed
+download, `Station::initialize_live` replay and republication under the
+same netdev name. Suspend disconnected the station (Linux
+`brcmf_cfg80211_suspend` without WoWL), so nothing is rejoined. A
+concurrent supervisor recovery is not repeated: `recover` returns early
+when the current generation is no longer terminal. Smoke:
+`smoke_brcmf_cold_resume_swaps_generation_and_keeps_netdev` (cold resume
+swaps the generation; the next suspend/resume of the rebooted firmware is
+hot; removal frees both generations).
+
 ### Flow-ring budget
 
 The host flow budget follows the firmware ring info: `max_flowrings`

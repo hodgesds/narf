@@ -266,6 +266,16 @@ async fn provision_checked(
     drop(slot);
     Ok(())
 }
+/// System resume for the published BCM43602 generation, if any: hot
+/// D0_INFORM resume or, when the dongle lost power, the cold-resume
+/// generation swap (`Generation::resume`). `None` when no generation exists.
+pub(super) async fn resume() -> Option<Result<(), crate::cyw43439::runtime::Error>> {
+    let generation = BOOTSTRAP
+        .lock()
+        .clone()
+        .and_then(|owner| owner.generation.lock().clone())?;
+    Some(generation.resume().await)
+}
 /// Retained signed firmware/NVRAM selection authority of the owner. Every
 /// (re)boot re-runs `select_using`/`load_using` (or the explicit board's
 /// `trusted_assets_using`), so a revoked or replaced asset refuses the

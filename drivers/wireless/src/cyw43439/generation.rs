@@ -101,7 +101,13 @@ impl<R: Fullmac + 'static> Generation<R> {
         if self.removed() {
             return Err(Error::Busy);
         }
-        let old = current.take().ok_or(Error::Failed)?;
+        let old = current.clone().ok_or(Error::Failed)?;
+        if !old.state.lock().await.station.runtime.transport_failed() {
+            // Another caller (supervisor or resume) already swapped in a
+            // healthy generation.
+            return Ok(());
+        }
+        current.take();
         old.withdraw();
         let request = old.lifecycle.request.lock().take();
         let mut fresh = {
@@ -173,6 +179,21 @@ impl<R: Fullmac + 'static> Generation<R> {
         }
         *current = Some(device);
         Ok(())
+    }
+    /// System resume (Linux v7.2 `pcie.c::brcmf_pcie_pm_leave_D3`): a
+    /// still-powered dongle (`INTMASK` != 0) resumes hot by D0_INFORM; one
+    /// that lost power or firmware is removed and probed again
+    /// (`brcmf_pcie_remove` + `brcmf_pcie_probe`), here the dead-firmware
+    /// stop plus a generation swap keeping the netdev.
+    pub async fn resume(&self) -> Result<(), Error> {
+        let device = self.current.lock().await.clone();
+        let Some(device) = device else {
+            return Ok(());
+        };
+        match device.resume().await {
+            Err(Error::Failed) => Box::pin(self.recover()).await,
+            other => other,
+        }
     }
     /// Watch the current generation and reset it when its transport turns
     /// terminal (FWHALT, lost power, fatal protocol/access error). Ends on

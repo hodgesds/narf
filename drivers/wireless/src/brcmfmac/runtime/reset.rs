@@ -123,9 +123,9 @@ impl<B: Bus> Runtime<B> {
     /// ring buffers, reset, then `brcmf_pcie_setup` on the same device).
     /// Every published mapping is freed here. An unproven owner is
     /// returned unchanged.
-    pub fn into_bus(mut self) -> Result<B, Self> {
+    pub fn into_bus(mut self) -> Result<B, alloc::boxed::Box<Self>> {
         if !self.reclaimable {
-            return Err(self);
+            return Err(alloc::boxed::Box::new(self));
         }
         // The device can no longer master any of these.
         drop(self.resources.take());

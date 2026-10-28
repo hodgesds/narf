@@ -85,9 +85,13 @@ impl narf_power::system_pm::AsyncSystemPm for SystemPm {
     }
     fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
         alloc::boxed::Box::pin(async {
-            crate::cyw43439::interface::resume_pcie()
-                .await
-                .map_err(pm_error)
+            // brcmf_pcie_pm_leave_D3: hot resume, or remove + probe again
+            // (a generation swap keeping the netdev) when power was lost.
+            let result = match native_runtime::resume().await {
+                Some(result) => result,
+                None => crate::cyw43439::interface::resume_pcie().await,
+            };
+            result.map_err(pm_error)
         })
     }
 }

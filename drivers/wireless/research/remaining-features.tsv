@@ -63,7 +63,7 @@ brcmfmac	monitor_mode	Monitor mode (incl. native 802.11 msgbuf RX with radiotap/
 brcmfmac	nonzero_descriptor_prefix	Nonzero native descriptor-prefix geometry	feature	drivers/wireless/specification/cyw43439.md	521
 brcmfmac	p2p_mode	P2P mode	feature	drivers/wireless/specification/cyw43439.md	519
 brcmfmac	post_reset_rejoin	Rejoin after native reset (CYW43439 SDIO only; BCM43602 PCIe closed in brcmfmac.md: SDIO needs a host WL_REG_ON/card power cycle)	feature	drivers/wireless/specification/cyw43439.md	515
-brcmfmac	system_resume	System resume	feature	drivers/wireless/specification/cyw43439.md	517
+brcmfmac	system_resume	System resume (CYW43439 SDIO only; BCM43602 PCIe hot and cold resume closed in brcmfmac.md: SDIO needs MMC_PM_KEEP_POWER or a host WL_REG_ON/card power cycle)	feature	drivers/wireless/specification/cyw43439.md	517
 brcmfmac	transport_reset	Confirmed native transport reset (CYW43439 SDIO only; BCM43602 PCIe closed in brcmfmac.md: SDIO needs a host WL_REG_ON/card power cycle)	feature	drivers/wireless/specification/cyw43439.md	515
 brcmfmac	virtual_interfaces	Additional virtual interfaces	feature	drivers/wireless/specification/cyw43439.md	519
 brcmfmac	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/cyw43439.md	518

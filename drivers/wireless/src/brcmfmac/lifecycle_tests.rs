@@ -239,8 +239,8 @@ kernel_test_in!(
 
 /// A refused download keeps the reset bus (Cr4 refusal returns it) but
 /// publishes nothing; the old generation was proven stopped and freed. A
-/// healthy generation whose stop proof sees post-clear DMA never resets
-/// and its mappings stay pinned through removal.
+/// healthy generation is never reset, and when its stop proof sees
+/// post-clear DMA the chip is not reset and its mappings stay pinned.
 fn smoke_brcmf_reset_failures_stay_terminal_or_pinned() -> TestResult {
     let harness = match joined() {
         Ok(harness) => harness,
@@ -270,10 +270,18 @@ fn smoke_brcmf_reset_failures_stay_terminal_or_pinned() -> TestResult {
     harness.bus.late_dma(true);
     let (_, before) = harness.bus.mappings();
     let generation = Generation::with_publisher(harness.device.clone(), publisher());
-    if narf_scheduler::block_on(generation.recover()).is_ok()
+    // A healthy generation is not reset: recovery is a no-op.
+    if narf_scheduler::block_on(generation.recover()).is_err()
+        || generation.resets() != 0
+        || generation
+            .current()
+            .is_none_or(|device| !Arc::ptr_eq(&device, &harness.device))
+    {
+        return TestResult::Fail("healthy generation was reset");
+    }
+    if narf_scheduler::block_on(generation.remove()) != Removal::Pinned
         || harness.bus.resets().0 != 0
         || harness.bus.mappings().1 != before
-        || narf_scheduler::block_on(generation.remove()) != Removal::Pinned
     {
         return TestResult::Fail("unproven stop reset the chip or released DMA");
     }
@@ -283,4 +291,61 @@ fn smoke_brcmf_reset_failures_stay_terminal_or_pinned() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/brcmfmac/station",
     smoke_brcmf_reset_failures_stay_terminal_or_pinned
+);
+
+/// Cold resume (Linux v7.2 `brcmf_pcie_pm_leave_D3` with `INTMASK` == 0):
+/// the D3-suspended dongle lost power, so the firmware is gone. Resume
+/// performs the remove + probe equivalent: dead stop, reset, fresh download
+/// and initialization replay under the same netdev. A hot resume of the
+/// fresh generation afterwards takes the D0_INFORM path without a reset.
+fn smoke_brcmf_cold_resume_swaps_generation_and_keeps_netdev() -> TestResult {
+    let harness = match joined() {
+        Ok(harness) => harness,
+        Err(error) => return TestResult::Fail(error),
+    };
+    harness.bus.d3_ack(true);
+    let generation = Generation::with_publisher(harness.device.clone(), publisher());
+    if narf_scheduler::block_on(Endpoint::suspend(&*harness.device)).is_err() {
+        return TestResult::Fail("D3 suspend failed");
+    }
+    harness.bus.power_lost();
+    if narf_scheduler::block_on(generation.resume()).is_err() {
+        return TestResult::Fail("cold resume did not re-probe the function");
+    }
+    let Some(device) = generation.current() else {
+        return TestResult::Fail("no generation after cold resume");
+    };
+    let (watchdogs, _, _) = harness.bus.resets();
+    if Arc::ptr_eq(&device, &harness.device)
+        || generation.resets() != 1
+        || watchdogs < 1
+        || !harness.bus.dma_enabled()
+        || device.transport_failed()
+        || device.interface_name() != harness.name
+        || narf_net::iface::lookup(&harness.name).is_none()
+        || device.connected_bssid().is_some()
+    {
+        return TestResult::Fail("cold resume did not publish a fresh unjoined generation");
+    }
+    // A second suspend/resume of the rebooted firmware resumes hot.
+    if narf_scheduler::block_on(Endpoint::suspend(&*device)).is_err() {
+        return TestResult::Fail("rebooted generation refused D3");
+    }
+    harness.bus.d0_alive();
+    if narf_scheduler::block_on(generation.resume()).is_err() || generation.resets() != 1 {
+        return TestResult::Fail("hot resume of the fresh generation reset it");
+    }
+    if narf_scheduler::block_on(generation.remove()) != Removal::Reclaimed {
+        return TestResult::Fail("resumed generation was not reclaimed on removal");
+    }
+    let (allocated, dropped) = harness.bus.mappings();
+    if allocated != dropped {
+        return TestResult::Fail("a generation's mappings survived removal");
+    }
+    restore(&harness);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/station",
+    smoke_brcmf_cold_resume_swaps_generation_and_keeps_netdev
 );
