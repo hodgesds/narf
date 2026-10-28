@@ -19,7 +19,9 @@ use crate::control::Config;
 use crate::ring::Error;
 use crate::topology::{Domain, Port, Router};
 use crate::tunnel::tests::Model;
-use crate::tunnel::{displays, forget_domain, reconcile, Endpoint, Protocol, Tunnel, TunnelInfo};
+use crate::tunnel::{
+    displays, forget_domain, reconcile, usb3_tunnels, Endpoint, Protocol, Tunnel, TunnelInfo,
+};
 use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -332,9 +334,10 @@ fn usb4_dp_bw_multi_tunnel_shared_and_independent_groups() -> TestResult {
         return TestResult::Fail("contention reconcile");
     }
     let live: Vec<TunnelInfo> = displays().into_iter().filter(|t| t.domain == 4).collect();
-    let usb3: Vec<&TunnelInfo> = live
-        .iter()
-        .filter(|t| t.protocol == Protocol::Usb3)
+    // USB3 tunnels are published apart from the displays.
+    let usb3: Vec<TunnelInfo> = usb3_tunnels()
+        .into_iter()
+        .filter(|t| t.domain == 4)
         .collect();
     if usb3.len() != 1 || usb3[0].consumed_mbps != 225 {
         return TestResult::Fail("USB3 consumption must be charged in Mb/s");
@@ -373,7 +376,7 @@ fn usb4_dp_bw_multi_tunnel_shared_and_independent_groups() -> TestResult {
                 group: 2,
                 budget_mbps: 9_000,
             })
-        || m.get(0, 6, CfgSpace::Port, 37) != 0x1000_1200
+        || m.get(0, 6, CfgSpace::Port, 37) != 0x1000_2100
         || m.get(0, 6, CfgSpace::Port, 38) != 34 << 24
     {
         return TestResult::Fail("DP2 must fall back to HBR x4 on its own budget");
@@ -433,7 +436,8 @@ fn usb4_dp_bw_hbr3_falls_back_on_thin_link() -> TestResult {
     // HBR3 x4 (25_920 Mb/s) and HBR2 x4 (17_280) exceed the
     // budget; the ladder lands on HBR x4 (8_640): REMOTE_CAP
     // rate code 1, 8 whole 1-Gb/s units granted, estimate 9.
-    if m.get(0, 5, CfgSpace::Port, 37) != 0x1000_1200
+    // DP_COMMON_CAP: rate in bits 11:8, lanes in 14:12 (x4 = 2).
+    if m.get(0, 5, CfgSpace::Port, 37) != 0x1000_2100
         || m.get(0, 5, CfgSpace::Port, 38) != 8 << 24
         || (m.get(0, 5, CfgSpace::Port, 34) >> 24) & 0xff != 9
     {
