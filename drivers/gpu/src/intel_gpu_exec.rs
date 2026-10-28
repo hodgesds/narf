@@ -36,6 +36,48 @@ pub struct ExecRequest {
 }
 
 impl ExecRequest {
+    /// Freeze a validated request into one owned batch. Revalidate even when
+    /// the request was constructed by a kernel caller rather than `read`.
+    pub fn prepare(&self, format: PteFormat, pat_index: u8) -> Result<ResidentBatch, FsError> {
+        if self.objects.is_empty()
+            || self.objects.len() > MAX_OBJECTS
+            || self.objects.iter().any(|entry| {
+                entry.va < PAGE
+                    || entry.va % PAGE != 0
+                    || entry
+                        .va
+                        .checked_add(entry.object.size())
+                        .is_none_or(|end| end > VA_SIZE - PAGE)
+            })
+        {
+            return Err(FsError::InvalidData);
+        }
+        let end = self
+            .batch_va
+            .checked_add(self.batch_len)
+            .ok_or(FsError::InvalidData)?;
+        if self.batch_len == 0
+            || self.batch_va % 8 != 0
+            || self.batch_len % 8 != 0
+            || end > VA_SIZE
+            || !self.objects.iter().any(|entry| {
+                self.batch_va >= entry.va
+                    && entry
+                        .va
+                        .checked_add(entry.object.size())
+                        .is_some_and(|limit| end <= limit)
+            })
+        {
+            return Err(FsError::InvalidData);
+        }
+        Ok(ResidentBatch {
+            space: self.address_space(format, pat_index)?,
+            format,
+            address: self.batch_va,
+            length: self.batch_len,
+        })
+    }
+
     /// Admit the modern no-relocation, fixed-placement subset. Rejection
     /// changes no object, VM or context and never writes an output offset.
     pub fn read(user: &dyn IoctlContext, address: u64, gem: &GemState) -> Result<Self, FsError> {
@@ -172,6 +214,31 @@ impl ExecRequest {
             }
         }
         Ok(space)
+    }
+}
+
+/// Tables and leaf objects move together into the hardware request. The
+/// engine may release them only after verified completion or a proven reset.
+#[derive(Debug)]
+pub struct ResidentBatch {
+    space: AddressSpace,
+    format: PteFormat,
+    address: u64,
+    length: u64,
+}
+
+impl ResidentBatch {
+    pub fn format(&self) -> PteFormat {
+        self.format
+    }
+    pub fn address(&self) -> u64 {
+        self.address
+    }
+    pub fn length(&self) -> u64 {
+        self.length
+    }
+    pub fn space(&self) -> &AddressSpace {
+        &self.space
     }
 }
 

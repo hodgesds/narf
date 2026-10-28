@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.10** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.11** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -10,9 +10,9 @@
 > full single-stream landed — see §14; multi-pipe
 > display + DP MST landed — see §16).
 >
-> Clean-room driver for Intel integrated graphics from Tiger Lake
-> through Meteor Lake. **No GPL Linux `i915` / `xe` source
-> consulted.**
+> Driver for Intel integrated graphics from Tiger Lake through Meteor Lake.
+> References include Intel PRMs and the cited MIT-licensed Linux i915 ABI,
+> command and register definitions.
 
 ## 1. Why this is feasible
 
@@ -370,25 +370,31 @@ Public interface:
 - `write_batch(dwords) -> BatchBuf` — GGTT batch allocation;
   the batch must end with `MI_BATCH_BUFFER_END`.
 - `submit(ctx, batch) -> request id` — appends
-  `MI_BATCH_BUFFER_START` (GGTT) + an `MI_STORE_DWORD_IMM`
-  breadcrumb (per-context seqno) to the ring, advances the
+  `MI_BATCH_BUFFER_START` (GGTT), a render-cache drain/stall and a separate
+  PIPE_CONTROL GGTT post-sync breadcrumb (XCS uses MI_FLUSH_DW), advances the
   image tail, and pumps the execlist ports. The context must
   be idle: this driver never patches an image the hardware
   may be restoring or saving, so re-submitting to a loaded
   context is `ContextBusy` (queued-but-unloaded contexts
   accept further submits and are covered together).
+- `submit_resident(ctx, ResidentBatch) -> ResidentSubmission` — owns arbitrary
+  PPGTT batch placement and its complete residency until verified retirement.
+  A resident context must have no queued or loaded work. Returns a request ID
+  and a cancellation-safe `CompletionFence`; see `spec.md` §3 for loss/reset.
 - `poll_completions() -> Vec<CompletedRequest>` — drains the
   Gen12 CSB from the engine status page (promote / preempt /
-  complete), retires requests, frees batch allocations, and
-  pumps the next ports. `wait_seqno` is the bounded-poll
-  wrapper. Production glue: `submit_dwords` /
+  complete), verifies the final breadcrumb and saved ring head, retires
+  requests, frees batch allocations, and
+  pumps the next ports. `wait_seqno_async` samples through timer awaits;
+  `wait_seqno` is its spin-safe sync bridge outside executor polls.
+  Production glue: `submit_dwords` /
   `poll_default_completions` attach lazily to the probed
   controller on a default context.
 - `attach_ppgtt(ctx, root_phys)` / `detach_ppgtt(ctx)` /
   `ppgtt_root(ctx)` — program a PPGTT root (§9) into the
   context image's PDP0 pair. Idle-context discipline, like
   every image patch here: a loaded or covered context refuses
-  with `ContextBusy`; an unaligned or >46-bit root is
+  with `ContextBusy`, including queued requests; an unaligned or >46-bit root is
   `InvalidPpgttRoot`.
 
 Invariants:
@@ -400,17 +406,23 @@ Invariants:
   Legacy-64B, PDP image fields zero, batch ASI = GGTT. With
   a PPGTT root attached (§9) the PDP0 pair carries the raw root address
   and the hardware walk runs under the context; batch
-  allocations remain GGTT-backed and batch ASI stays GGTT
-  until a VA-batch consumer lands.
+  allocations from `write_batch` remain GGTT-backed; `submit_ppgtt` uses their
+  identity VA, whereas `submit_resident` uses the admitted arbitrary PPGTT VA.
 - A context's requests retire strictly in submission order;
   a preempted context's covered requests return to the queue
   front and are resubmitted, never retired early.
 - Every allocation (image / ring / HWSP / batch / status
   page) is arena-accounted; destroy and retirement return
   the arena to its prior balance.
+- Missing breadcrumb/head proof sets `CompletionLost` and stops publication
+  without completing fences or releasing resident tables/BOs. A context's CSB
+  software identity is not reused during the engine lifetime. Proven hardware
+  reset is the only alternate release path; pending fences report reset error.
+- Qword-aligned ring tails include wrap-padding in capacity checks. Hardware
+  release/acquire barriers order the submission doorbell and CSB publication.
 
 Flagged for first-silicon verification (single named
-constants in `intel_gpu_rcs`): `CSB_ENTRIES` = 8 (Gen11+
+constants in `intel_gpu_rcs`): `CSB_ENTRIES` = 12 (Gen11+
 CSB depth), `RCS_IMAGE_PAGES` = 48 (allocation bound above
 the hardware image size), and the descriptor Legacy-64B
 mode choice.
@@ -429,7 +441,7 @@ Public interface:
   allocated PML4 root page. `root_phys()` is the value a
   context programs as its PPGTT root (§8's
   `RcsEngine::attach_ppgtt`).
-- `map(mem, va, phys, pat, executable)` / `unmap(mem, va)` —
+- `map(mem, va, phys, pat, writable)` / `unmap(mem, va)` —
   4 KiB leaf mappings over the 48-bit VA space (levels
   PML4 → PDPT → PD → PT, 512 entries per table). Double
   mapping is `AlreadyMapped`; unmapping an absent VA is
@@ -1472,13 +1484,20 @@ before shared DRM/KMS dispatch and acquire mmap backing atomically.
 This is **not a working Mesa 3D backend**. Validated execbuffer requests still
 return NotImplemented. No userspace engines or acceleration capabilities are
 advertised. Gen12 production execlists helpers no longer admit Meteor/Arrow
-Lake merely because those devices have a region map. Xe-LPG needs its own GT
-and GuC owner, including firmware acquisition/authentication, CT transport,
-context registration, scheduling, completion and reset/loss lifetime handling.
+Lake merely because those devices have a region map. The Xe-LPG GT/GuC owner
+still needs firmware upload/authentication, context registration, scheduling,
+completion and hardware reset integration.
 `intel_gpu_guc` now supplies validated CSS component ranges and coherent CTB
-send/receive primitives; neither is a boot/authentication or scheduling claim.
-Full context setup, topology, cache/fence protocol, accelerated PRIME/presentation and real
-Mesa OpenGL/Vulkan acceptance are also outstanding for Gen12.
+send/receive primitives. `intel_gpu_guc_firmware` acquires a bounded immutable
+MTL/Arrow GuC-70 image through invoked registry/blob capabilities, preserving
+its identity. `intel_gpu_guc_transport` owns coherent GGTT CT memory and the
+graphics-GuC MMIO registration/enable/disable state machine. Its partial
+registration, timeout and broken-CT paths retain allocations until disable
+acknowledgment or proven reset. These do not upload/authenticate or schedule
+firmware by themselves. Gen12 owned resident submission, cache-flushed
+post-sync breadcrumbs, terminal fences and loss retention now have native
+hardware models; full GT/context setup, topology, hardware reset, accelerated
+PRIME/presentation and real Mesa acceptance remain outstanding.
 
 The memory audit corrected previous x86-like GPU PTE assumptions. Gen12
 PPGTT PAT bits are 3,4,7 and Xe-LPG adds bit62; Xe-LPG GGTT uses bits52,53.
@@ -1502,3 +1521,9 @@ Primary references:
 - [Logical context root registers](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/i915/gt/intel_lrc_reg.h), MIT.
 - [GuC/HuC firmware layout](https://docs.kernel.org/gpu/xe/xe_firmware.html),
   required background for the Xe-LPG firmware owner; no loader is claimed here.
+- [Gen12 render and XCS completion streams](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/i915/gt/gen8_engine_cs.c),
+  MIT command ordering and generation workarounds, with `gen8_engine_cs.h` and
+  `intel_gpu_commands.h` bitfields.
+- [GuC CT registration](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/i915/gt/uc/intel_guc_ct.c),
+  MIT; `intel_guc.c` and the actions/KLV/message ABI headers specify the MMIO
+  mailbox, receive-first registration and CONTROL_CTB acknowledgment protocol.
