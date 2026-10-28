@@ -573,6 +573,7 @@ fn smoke_nvme_suspend_identity_match() -> TestResult {
         nn: 1,
         rtd3e: 0,
         vwc: 1,
+        oncs: 0,
     };
     let ns = super::ns::NamespaceInfo {
         nsid: 1,

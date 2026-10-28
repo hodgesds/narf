@@ -116,6 +116,23 @@ multipath / fabrics (defer).
   request gate, then flushes + sends CC.SHN; a controller that never drains
   still gets CC.SHN written straight to the register (`SlotShutdown::Forced`,
   logged as an error). Never waits from interrupt context.
+- **Dataset Management / Write Zeroes** (#927). `IdentifyController::oncs`
+  (bytes 256..258); `Controller::supports_dataset_mgmt()` (ONCS bit 2),
+  `supports_write_zeroes()` (ONCS bit 3), `dataset_mgmt_ns(ns, ranges)`
+  (I/O opcode 0x09 with CDW11 AD=1; at most 256 ranges per command; the
+  range-definition length is the 1-based block count, NVM Command Set
+  §3.2.3 Figures 39–41; the range list is staged in the controller's
+  persistent DSM page) and `write_zeroes_ns(ns, lba, n_blocks)` (opcode
+  0x08, CDW12 NLB 0-based, at most 65 536 blocks per command, no data
+  transfer). Both return `NvmeError::NotImplemented` on a controller
+  without the ONCS bit — never a silent success. The block surfaces
+  advertise exactly what ONCS supports: `BlockDeviceSync::supports_trim`
+  / `trim` on `NvmeBlockSync` / `NvmeNamespaceBlock`, and
+  `NvmeBlockDevice::supports(Discard | WriteZeroes)` with
+  `BlockOp::Trim` / `BlockOp::WriteZeroes` issuing the real opcodes
+  (the request buffer is never written to the device). The advisory
+  DMRL / DMRSL / DMSL processing limits are not yet parsed; commands
+  stay within the architectural limits above.
 - **System suspend / resume** (`DevicePmOps`, #926). `suspend` drains the
   request gate (30 s budget; `DeviceSuspendError::Busy` if it never frees —
   no forced quiesce, unlike final shutdown), then `Controller::suspend_pm`:
