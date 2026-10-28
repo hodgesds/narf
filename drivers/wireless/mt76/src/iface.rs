@@ -528,8 +528,14 @@ impl WirelessNetIface for Mt76Iface {
     }
 
     async fn scan(&self, req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        let mut channels = scan_channels(&req, self.radio.capabilities.phy.bands)?;
-        let ssids = if req.active {
+        let six = crate::mt7921::six_ghz::qualified(self.radio);
+        let mut channels = scan_channels(&req, self.radio.capabilities.phy.bands, six)?;
+        // WIPHY_FLAG_SPLIT_SCAN_6GHZ (mt792x_core.c:711): the 2.4/5 GHz
+        // channels are scanned first, then the 6 GHz channels that
+        // cfg80211_scan_6ghz selects from their Reduced Neighbor Reports.
+        let requested_6ghz: Vec<u8> = channels.iter().copied().filter(|&id| id > 180).collect();
+        channels.retain(|&id| id <= 180);
+        let ssids = if req.active && !channels.is_empty() {
             let domain =
                 narf_wireless::reg::db::ensure_domain().map_err(|_| WirelessError::Denied)?;
             channels = active_channels(&req, channels, &domain)?;
@@ -548,35 +554,54 @@ impl WirelessNetIface for Mt76Iface {
         self.finish_teardown(true).await?;
         {
             use crate::mt7921::firmware_transport::{scan_boot_with_options, Error, ScanOptions};
-            let result = scan_boot_with_options(
-                &channels,
-                &ssids,
-                ScanOptions {
-                    extra_ies: &req.extra_ies,
-                    random_mac: req.random_mac,
-                },
-            )
-            .await;
-            let report = result.map_err(|error| match error {
+            let map_error = |error| match error {
                 Error::Bounds => WirelessError::InvalidArgs,
                 Error::Busy => WirelessError::Busy,
                 Error::Timeout => WirelessError::Timeout,
                 Error::Authority => WirelessError::Denied,
                 _ => WirelessError::HardwareError,
-            })?;
-            let results = report
-                .bss
+            };
+            let mut found = Vec::new();
+            if !channels.is_empty() {
+                let report = scan_boot_with_options(
+                    &channels,
+                    &ssids,
+                    ScanOptions {
+                        extra_ies: &req.extra_ies,
+                        random_mac: req.random_mac,
+                    },
+                )
+                .await
+                .map_err(map_error)?;
+                found = report.bss;
+            }
+            let six_ids = six_ghz_scan_ids(&req, &requested_6ghz, &found);
+            if !six_ids.is_empty() {
+                // 6 GHz channels are scanned passively under a NO_IR domain.
+                let report = scan_boot_with_options(
+                    &six_ids,
+                    &[],
+                    ScanOptions {
+                        extra_ies: &[],
+                        random_mac: req.random_mac,
+                    },
+                )
+                .await
+                .map_err(map_error)?;
+                found.extend(report.bss);
+            }
+            let results = found
                 .iter()
                 .map(|bss| BssInfo {
                     bssid: bss.bssid,
                     ssid: bss.ssid.clone(),
-                    frequency_mhz: crate::mt7921::channel::frequency(bss.channel).unwrap_or(0),
+                    frequency_mhz: scan_frequency(bss).unwrap_or(0),
                     channel: u32::from(bss.channel),
                     rssi: bss.signal_dbm.unwrap_or(-128),
                     security: scan_security(bss),
                 })
                 .collect();
-            *self.scan_cache.lock() = report.bss;
+            *self.scan_cache.lock() = found;
             Ok(results)
         }
     }
@@ -740,9 +765,16 @@ impl WirelessNetIface for Mt76Iface {
         Err(WirelessError::NotSupported)
     }
 }
-fn scan_channels(req: &ScanRequest, bands: u8) -> Result<Vec<u8>, WirelessError> {
+/// Scan channel ids (`channel::rx_channel`: 2.4/5 GHz channel numbers, 6 GHz
+/// RXD CH_FREQ values 181..=239). 6 GHz entries come only from 6 GHz
+/// frequencies (or, for a default colocated scan, the whole 6 GHz sband):
+/// a bare channel number never selects 6 GHz.
+fn scan_channels(req: &ScanRequest, bands: u8, six: bool) -> Result<Vec<u8>, WirelessError> {
     use crate::mt7921::channel;
-    if req.colocated_6ghz || req.duration_mandatory || req.duration_tu.is_some() {
+    if req.duration_mandatory || req.duration_tu.is_some() {
+        return Err(WirelessError::NotSupported);
+    }
+    if req.colocated_6ghz && !six {
         return Err(WirelessError::NotSupported);
     }
     crate::mt7921::firmware_transport::validate_scan_options(
@@ -768,31 +800,58 @@ fn scan_channels(req: &ScanRequest, bands: u8) -> Result<Vec<u8>, WirelessError>
             .frequencies_mhz
             .iter()
             .map(|&freq| {
+                if let Some((narf_wireless::association::channel::Band::Ghz6, number)) =
+                    narf_wireless::association::channel::from_frequency_band(freq)
+                {
+                    if !six {
+                        return Err(WirelessError::NotSupported);
+                    }
+                    return channel::rx_channel(channel::Band::Ghz6, number)
+                        .map(u32::from)
+                        .ok_or(WirelessError::NotSupported);
+                }
                 channel::from_frequency(freq)
                     .map(u32::from)
                     .ok_or(WirelessError::NotSupported)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // The legacy selector names channel numbers, not scan ids.
+        let numbers: Vec<u32> = channels
+            .iter()
+            .filter_map(|&id| {
+                channel::from_rx_channel(u8::try_from(id).ok()?).map(|(_, n)| u32::from(n))
+            })
+            .collect();
         if !req.channels.is_empty()
-            && (req.channels.len() != channels.len()
-                || !req
-                    .channels
-                    .iter()
-                    .all(|channel| channels.contains(channel)))
+            && (req.channels.len() != numbers.len()
+                || !req.channels.iter().all(|channel| numbers.contains(channel)))
         {
             return Err(WirelessError::InvalidArgs);
         }
         channels
     };
     if requested.is_empty() {
-        return Ok(channel::channels(bands));
+        let mut channels = channel::channels(bands);
+        // cfg80211 includes every 6 GHz channel; the colocated plan below
+        // narrows them (cfg80211_scan_6ghz). Without the flag a default
+        // scan keeps its 2.4/5 GHz profile.
+        if req.colocated_6ghz {
+            channels.extend(
+                channel::channels_6ghz()
+                    .filter_map(|number| channel::rx_channel(channel::Band::Ghz6, number)),
+            );
+        }
+        return Ok(channels);
     }
     let mut channels = Vec::new();
     for requested in requested {
         let value = u8::try_from(requested).map_err(|_| WirelessError::InvalidArgs)?;
-        let band = channel::band(value).ok_or(WirelessError::InvalidArgs)?;
-        if bands & band.capability() == 0 {
+        let (band, _) = channel::from_rx_channel(value).ok_or(WirelessError::InvalidArgs)?;
+        if band != channel::Band::Ghz6 && bands & band.capability() == 0 {
             return Err(WirelessError::NotSupported);
+        }
+        if band == channel::Band::Ghz6 && req.frequencies_mhz.is_empty() {
+            return Err(WirelessError::InvalidArgs);
         }
         if channels.contains(&value) {
             return Err(WirelessError::InvalidArgs);
@@ -800,6 +859,69 @@ fn scan_channels(req: &ScanRequest, bands: u8) -> Result<Vec<u8>, WirelessError>
         channels.push(value);
     }
     Ok(channels)
+}
+
+/// A scan result's centre frequency in its own band.
+fn scan_frequency(bss: &crate::mt7921::firmware_transport::ScanBss) -> Option<u32> {
+    use crate::mt7921::channel;
+    if crate::mt7921::association::is_six_ghz(bss) {
+        channel::frequency_in(channel::Band::Ghz6, bss.channel)
+    } else {
+        channel::frequency(bss.channel)
+    }
+}
+
+/// cfg80211 `cfg80211_scan_6ghz` for the split 6 GHz phase: the colocated
+/// APs of the 2.4/5 GHz results' Reduced Neighbor Reports
+/// (`parse_colocated_aps`) select the requested 6 GHz channels through the
+/// shared `plan_6ghz_scan`. Without `colocated_6ghz` every requested 6 GHz
+/// channel is scanned. The result is in scan-id form, deduplicated.
+///
+/// Linux v7.2 mt7921 programs no per-target fields: `mt76_connac_mcu_hw_scan`
+/// sends only the 6 GHz channel list (band 3), and the RNR BSSID table of
+/// `mt76_connac_mcu_build_rnr_scan_param` is consumed by mt7925 alone.
+pub(crate) fn six_ghz_scan_ids(
+    req: &ScanRequest,
+    requested: &[u8],
+    found: &[crate::mt7921::firmware_transport::ScanBss],
+) -> Vec<u8> {
+    use crate::mt7921::channel;
+    use narf_wireless::association::channel::{from_frequency_band, Band};
+    if requested.is_empty() {
+        return Vec::new();
+    }
+    let colocated: Vec<narf_wireless::scan::ColocatedAp> = found
+        .iter()
+        .filter(|bss| !crate::mt7921::association::is_six_ghz(bss))
+        .flat_map(|bss| narf_wireless::scan::parse_colocated_aps(&bss.information_elements))
+        .collect();
+    let six_request = ScanRequest {
+        ssids: req.ssids.clone(),
+        frequencies_mhz: requested
+            .iter()
+            .filter_map(|&id| channel::from_rx_channel(id))
+            .filter_map(|(band, number)| channel::frequency_in(band, number))
+            .collect(),
+        channels: Vec::new(),
+        active: req.active,
+        random_mac: req.random_mac,
+        colocated_6ghz: req.colocated_6ghz,
+        duration_tu: None,
+        duration_mandatory: false,
+        extra_ies: Vec::new(),
+    };
+    let plan = narf_wireless::scan::plan_6ghz_scan(&six_request, &colocated, None);
+    let mut ids = Vec::new();
+    for mhz in plan.frequencies_mhz {
+        if let Some((Band::Ghz6, number)) = from_frequency_band(mhz) {
+            if let Some(id) = channel::rx_channel(channel::Band::Ghz6, number) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    ids
 }
 
 fn active_channels(
@@ -1337,19 +1459,19 @@ mod tests {
             duration_mandatory: false,
             extra_ies: Vec::new(),
         };
-        if scan_channels(&req, 3) != Ok(vec![1, 6, 11]) {
+        if scan_channels(&req, 3, false) != Ok(vec![1, 6, 11]) {
             return TestResult::Fail("valid passive request");
         }
         req.active = true;
-        if scan_channels(&req, 3) != Ok(vec![1, 6, 11]) {
+        if scan_channels(&req, 3, false) != Ok(vec![1, 6, 11]) {
             return TestResult::Fail("active wildcard geometry rejected");
         }
         req.extra_ies = vec![221, 3, 0x50, 0x6f, 0x9a];
-        if scan_channels(&req, 3) != Ok(vec![1, 6, 11]) {
+        if scan_channels(&req, 3, false) != Ok(vec![1, 6, 11]) {
             return TestResult::Fail("native active probe IE profile rejected");
         }
         req.active = false;
-        if scan_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
+        if scan_channels(&req, 3, false) != Err(WirelessError::InvalidArgs) {
             return TestResult::Fail("passive scan accepted probe IEs");
         }
         req.extra_ies.clear();
@@ -1357,29 +1479,31 @@ mod tests {
             addr: [2, 0, 0, 0, 0, 0],
             mask: [3, 0, 0, 0, 0, 0],
         });
-        if scan_channels(&req, 3) != Ok(vec![1, 6, 11]) {
+        if scan_channels(&req, 3, false) != Ok(vec![1, 6, 11]) {
             return TestResult::Fail("native passive random scan geometry rejected");
         }
         req.random_mac.as_mut().unwrap().mask[0] = 0;
-        if scan_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
+        if scan_channels(&req, 3, false) != Err(WirelessError::InvalidArgs) {
             return TestResult::Fail("unbounded multicast random address mask accepted");
         }
         req.random_mac = None;
         req.ssids.push(Vec::new());
-        if scan_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
+        if scan_channels(&req, 3, false) != Err(WirelessError::InvalidArgs) {
             return TestResult::Fail("inconsistent passive request with probe SSIDs accepted");
         }
         req.ssids.clear();
         req.channels = vec![35];
-        if scan_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
+        if scan_channels(&req, 3, false) != Err(WirelessError::InvalidArgs) {
             return TestResult::Fail("unimplemented band exposed");
         }
         req.channels = vec![1, 1];
-        if scan_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
+        if scan_channels(&req, 3, false) != Err(WirelessError::InvalidArgs) {
             return TestResult::Fail("duplicate channel");
         }
         req.channels.clear();
-        if scan_channels(&req, 3) != Ok(crate::mt7921::channel::channels(3)) {
+        if scan_channels(&req, 3, false) != Ok(crate::mt7921::channel::channels(3))
+            || scan_channels(&req, 3, true) != Ok(crate::mt7921::channel::channels(3))
+        {
             return TestResult::Fail("default scan channels");
         }
         TestResult::Pass
@@ -1387,6 +1511,96 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/mt7921/scan",
         mt76_scan_policy_validates_active_ssids_and_channel_geometry
+    );
+
+    /// cfg80211_scan_6ghz / WIPHY_FLAG_SPLIT_SCAN_6GHZ policy: 6 GHz scan
+    /// ids, the colocated flag and the RNR-selected 6 GHz phase.
+    fn mt76_colocated_6ghz_scan_selects_rnr_and_psc_channels() -> TestResult {
+        use crate::mt7921::firmware_transport::ScanBss;
+        let mut req = ScanRequest {
+            ssids: Vec::new(),
+            frequencies_mhz: Vec::new(),
+            channels: Vec::new(),
+            active: false,
+            random_mac: None,
+            colocated_6ghz: true,
+            duration_tu: None,
+            duration_mandatory: false,
+            extra_ies: Vec::new(),
+        };
+        // A default colocated scan adds the whole 6 GHz sband (ids 181..).
+        let Ok(all) = scan_channels(&req, 3, true) else {
+            return TestResult::Fail("default colocated scan refused");
+        };
+        if all.len() != 39 + 59 || all[39] != 181 || all[97] != 239 {
+            return TestResult::Fail("colocated default 6 GHz sband");
+        }
+        if scan_channels(&req, 3, false) != Err(WirelessError::NotSupported) {
+            return TestResult::Fail("colocated scan without MT_NIC_CAP_6G");
+        }
+        // 6 GHz is selected by frequency (6 GHz channel 37 = 6135 MHz) only.
+        req.colocated_6ghz = false;
+        req.frequencies_mhz = vec![2437, 6135];
+        if scan_channels(&req, 3, true) != Ok(vec![6, 190])
+            || scan_channels(&req, 3, false) != Err(WirelessError::NotSupported)
+        {
+            return TestResult::Fail("6 GHz frequency to scan id");
+        }
+        req.channels = vec![6, 37];
+        if scan_channels(&req, 3, true) != Ok(vec![6, 190]) {
+            return TestResult::Fail("legacy selector names 6 GHz channel numbers");
+        }
+        req.frequencies_mhz.clear();
+        req.channels = vec![190];
+        if scan_channels(&req, 3, true) != Err(WirelessError::InvalidArgs) {
+            return TestResult::Fail("a bare number selected a 6 GHz scan id");
+        }
+        // A 2.4 GHz beacon whose RNR names a colocated AP on 6 GHz channel 33
+        // (operating class 131, TBTT length 13, colocated + same SSID).
+        let mut ies = vec![0, 4];
+        ies.extend_from_slice(b"narf");
+        ies.extend_from_slice(&[201, 17, 0x00, 13, 131, 33, 0]);
+        ies.extend_from_slice(&[2, 9, 8, 7, 6, 5]);
+        ies.extend_from_slice(&[0, 0, 0, 0, 0x42, 0xfe]);
+        let found = [ScanBss {
+            bssid: [2, 1, 2, 3, 4, 5],
+            ssid: b"narf".to_vec(),
+            channel: 6,
+            band: None,
+            signal_dbm: Some(-40),
+            capability: 0x11,
+            beacon_interval: 100,
+            information_elements: ies,
+        }];
+        let six: Vec<u8> = crate::mt7921::channel::channels_6ghz()
+            .filter_map(|n| {
+                crate::mt7921::channel::rx_channel(crate::mt7921::channel::Band::Ghz6, n)
+            })
+            .collect();
+        req.channels.clear();
+        req.colocated_6ghz = true;
+        let ids = six_ghz_scan_ids(&req, &six, &found);
+        // PSC channels (5, 21, ..., 229) are scanned blind, plus the RNR's non-PSC 33.
+        let psc: Vec<u8> = (0..15u8).map(|k| 181 + (5 + 16 * k - 1) / 4).collect();
+        if !ids.contains(&189)
+            || !psc.iter().all(|id| ids.contains(id))
+            || ids.len() != psc.len() + 1
+        {
+            return TestResult::Fail("cfg80211_scan_6ghz colocated selection");
+        }
+        // Without the flag every requested 6 GHz channel is scanned, and
+        // nothing is scanned when no 6 GHz channel was requested.
+        req.colocated_6ghz = false;
+        if six_ghz_scan_ids(&req, &six, &found) != six
+            || !six_ghz_scan_ids(&req, &[], &found).is_empty()
+        {
+            return TestResult::Fail("non-colocated 6 GHz phase");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/mt7921/scan",
+        mt76_colocated_6ghz_scan_selects_rnr_and_psc_channels
     );
 
     fn mt76_active_scan_default_filters_policy_and_explicit_denial_is_closed() -> TestResult {
@@ -1428,7 +1642,7 @@ mod tests {
                 },
             ],
         };
-        let hardware = scan_channels(&request, 3).unwrap();
+        let hardware = scan_channels(&request, 3, false).unwrap();
         let channels = active_channels(&request, hardware, &domain).unwrap();
         if channels.len() != 23
             || !channels.contains(&6)
@@ -1457,18 +1671,18 @@ mod tests {
         }
         request.active = false;
         request.ssids.clear();
-        if scan_channels(&request, 3) != Ok(vec![6]) {
+        if scan_channels(&request, 3, false) != Ok(vec![6]) {
             return TestResult::Fail(
                 "NO_IR deployment restriction disabled passive receive geometry",
             );
         }
         request.active = true;
         request.ssids = vec![Vec::new(); 5];
-        if scan_channels(&request, 3) != Err(WirelessError::InvalidArgs) {
+        if scan_channels(&request, 3, false) != Err(WirelessError::InvalidArgs) {
             return TestResult::Fail("active scan accepted more than Linux's four SSIDs");
         }
         request.ssids = vec![vec![0; 33]];
-        if scan_channels(&request, 3) != Err(WirelessError::InvalidArgs) {
+        if scan_channels(&request, 3, false) != Err(WirelessError::InvalidArgs) {
             return TestResult::Fail("oversized active scan SSID accepted");
         }
         TestResult::Pass

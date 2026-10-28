@@ -482,6 +482,94 @@ fn refusals() -> Result<(), &'static str> {
     Ok(())
 }
 
+fn scan() -> Result<(), &'static str> {
+    use crate::mt7921::firmware_transport::ScanOptions;
+    let (mut session, _) = prepared(elements(PRIMARY, 0, PRIMARY, 0, 0));
+    // A 6 GHz beacon (DS Parameter Set 165) received with CH_FREQ 222.
+    let mut packet = super::scan_beacon(PRIMARY, b"narf6");
+    packet[12..16].copy_from_slice(&(u32::from(RX_TAG) << 8).to_le_bytes());
+    session.backend.packets.push_back(packet);
+    // The same channel number on 5 GHz is a different BSS and is ignored
+    // by a 6 GHz-only scan.
+    session
+        .backend
+        .packets
+        .push_back(super::scan_beacon(PRIMARY, b"narf5"));
+    let before = session.backend.frames.len();
+    let report = run(Box::pin(session.scan_with_options_and_policy(
+        &[RX_TAG],
+        &[],
+        ScanOptions::default(),
+        || Err(Error::Authority),
+    )))
+    .map_err(|_| "6 GHz passive scan")?;
+    if report.bss.len() != 1
+        || report.bss[0].channel != PRIMARY
+        || report.bss[0].band != Some(SharedBand::Ghz6)
+        || report.bss[0].ssid != b"narf6"
+        || !matches!(session.state, State::ScanReady(_))
+    {
+        return Err("6 GHz scan result identity");
+    }
+    let frames: Vec<&Vec<u8>> = session.backend.frames[before..]
+        .iter()
+        .map(|(_, f)| f)
+        .collect();
+    let six_domain = frames
+        .iter()
+        .position(|f| ce(f, 0x0f).is_some_and(|b| b[10] == 59 && b.len() == 12 + 8 * (39 + 59)));
+    let start = frames.iter().position(|f| ce(f, 3).is_some());
+    let closed = frames
+        .iter()
+        .rposition(|f| ce(f, 0x0f).is_some_and(|b| b[10] == 0));
+    if six_domain.is_none() || six_domain > start || closed < start {
+        return Err("NO_IR 6 GHz channel domain around the scan only");
+    }
+    let request = ce(frames[start.unwrap()], 3).unwrap();
+    if request[159] != 1 || request[160..162] != [3, PRIMARY] || request[2] != 0 {
+        return Err("mt76_connac_mcu_hw_scan 6 GHz channel entry (band 3)");
+    }
+    // 6 GHz is never probed: an active scan naming it has no grant.
+    let before = session.backend.frames.len();
+    if !matches!(
+        run(Box::pin(session.scan_with_options_and_policy(
+            &[RX_TAG],
+            &[b"narf6".to_vec()],
+            ScanOptions::default(),
+            || Ok(domain(RegFlags::empty(), 23)),
+        ))),
+        Err(Error::Authority)
+    ) || session.backend.frames.len() != before
+    {
+        return Err("6 GHz active probing admitted");
+    }
+    // Without MT_NIC_CAP_6G the 6 GHz channel is refused before any write.
+    if let State::ScanReady(info) = &mut session.state {
+        info.capabilities.has_6ghz = false;
+    }
+    if !matches!(
+        run(Box::pin(session.scan_with_options_and_policy(
+            &[RX_TAG],
+            &[],
+            ScanOptions::default(),
+            || Err(Error::Authority),
+        ))),
+        Err(Error::InvalidIdentity)
+    ) || session.backend.frames.len() != before
+    {
+        return Err("6 GHz scanned without MT_NIC_CAP_6G");
+    }
+    Ok(())
+}
+
+fn mt76_six_ghz_passive_scan_band_three_channels_and_result_identity() -> TestResult {
+    scan().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/six_ghz",
+    mt76_six_ghz_passive_scan_band_three_channels_and_result_identity
+);
+
 fn mt76_six_ghz_refuses_open_wpa2_missing_capability_and_wrong_band() -> TestResult {
     refusals().map_or_else(TestResult::Fail, |()| TestResult::Pass)
 }
