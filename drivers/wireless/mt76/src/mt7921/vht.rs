@@ -40,7 +40,19 @@ fn local_vht(info: RadioInfo, allow160: bool) -> Result<LocalVht, Error> {
     let mut vht = LocalVht::new(rx_map(info), rx_map(info), true, true, 0)
         .map_err(|_| Error::UnsupportedFirmware)?
         .with_ldpc(info.capabilities.phy.rx_ldpc, info.capabilities.phy.tx_ldpc)
-        .with_rx_stbc(info.capabilities.phy.rx_stbc);
+        .with_rx_stbc(info.capabilities.phy.rx_stbc)
+        .with_tx_stbc(tx_stbc(info))
+        // mt792x_core.c sets SUPPORTS_VHT_EXT_NSS_BW for every family member.
+        .with_extended_nss_bw(true)
+        // mt7921/init.c: SU and MU beamformee with BEAMFORMEE_STS field 3
+        // (four space-time streams). Sounding feedback is firmware-owned;
+        // the host hands it the peer beamformer facts in STA_REC_VHT.
+        .with_beamforming(phy::VhtBeamforming {
+            su_beamformee_sts: Some(4),
+            su_beamformer_sounding: None,
+            mu_beamformee: true,
+        })
+        .map_err(|_| Error::UnsupportedFirmware)?;
     if allow160 && wide160(info) {
         vht = vht.with_160mhz(true, true);
     }
@@ -68,7 +80,15 @@ fn local_ht(info: RadioInfo) -> LocalHt {
     .expect("fixed implemented HT companion profile")
     .with_ldpc(info.capabilities.phy.rx_ldpc, info.capabilities.phy.tx_ldpc)
     .with_rx_stbc(info.capabilities.phy.rx_stbc)
+    .with_tx_stbc(tx_stbc(info))
     .with_greenfield(true, true)
+}
+/// mt76_init_stream_cap (mac80211.c): HT TX_STBC and VHT TXSTBC are
+/// advertised exactly when more than one TX stream exists; firmware rate
+/// control then applies STBC to a peer whose RX STBC field survives
+/// mac80211's own-TX-STBC masking (ht.c/vht.c *_cap_ie_to_sta_*_cap).
+fn tx_stbc(info: RadioInfo) -> bool {
+    info.capabilities.phy.spatial_streams > 1
 }
 pub(crate) fn ht_capability(info: RadioInfo) -> [u8; 26] {
     local_ht(info).capability_body()
@@ -100,7 +120,8 @@ pub(crate) fn ht_fallback(info: RadioInfo, wide: bool) -> Result<LocalPhy, Error
         )
         .map_err(|_| Error::UnsupportedFirmware)?
         .with_ldpc(info.capabilities.phy.rx_ldpc, info.capabilities.phy.tx_ldpc)
-        .with_rx_stbc(info.capabilities.phy.rx_stbc);
+        .with_rx_stbc(info.capabilities.phy.rx_stbc)
+        .with_tx_stbc(tx_stbc(info));
         let ht = ht.with_greenfield(true, true);
         LocalPhy::ht20(ht).map_err(|_| Error::UnsupportedFirmware)
     }
@@ -230,10 +251,21 @@ impl Profile {
         let offered = offer.vht().ok_or(Error::UnsupportedFirmware)?;
         Ok(Self {
             ap: ApElements::parse(ies).map_err(|_| Error::Bounds)?,
-            // Peer receive aggregation limit and transmit SGI intersection;
-            // TX STBC/beamforming remain unimplemented. The native LDPC
-            // flag is local TX use of the AP's independently bounded RX bit.
+            // Peer receive aggregation limit and transmit SGI intersection.
+            // The native LDPC flag is local TX use of the AP's independently
+            // bounded RX bit; the peer RXSTBC field survives only with local
+            // TXSTBC (mac80211 ieee80211_vht_cap_ie_to_sta_vht_cap), which is
+            // what STA_REC_VHT hands firmware rate control.
             capability: (vht.peer_capability() & (7 << 23))
+                | if vht.tx_stbc() {
+                    vht.peer_capability() & (7 << 8)
+                } else {
+                    0
+                }
+                // Local SU/MU beamformee keeps the peer's SU beamformer,
+                // sounding dimensions and MU beamformer bits; hardware
+                // EXT_NSS_BW support keeps its Extended NSS BW field.
+                | (vht.peer_capability() & ((1 << 11) | (7 << 16) | (1 << 19) | (3 << 30)))
                 | (u32::from(vht.tx_sgi80()) << 5)
                 | (u32::from(vht.tx_ldpc()) << 4)
                 | if width == 3 {

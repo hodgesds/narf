@@ -38,6 +38,7 @@ pub(crate) struct Profile {
     tx_streams: u8,
     rx_ldpc: bool,
     rx_stbc: bool,
+    tx_stbc: bool,
     tx_ldpc: bool,
     rx_greenfield: bool,
     tx_greenfield: bool,
@@ -65,7 +66,14 @@ impl Profile {
         width: u8,
     ) -> Self {
         let mut capability = [0; 26];
+        // mac80211 ieee80211_ht_cap_ie_to_sta_ht_cap keeps the peer's RX
+        // STBC field only when the local radio advertises TX_STBC.
         let cap = (n.peer_capability() & 12)
+            | if n.tx_stbc() {
+                n.peer_capability() & 0x0300
+            } else {
+                0
+            }
             | u16::from(n.tx_ldpc())
             | (u16::from(n.tx_greenfield()) << 4)
             | (u16::from(n.tx_sgi20()) << 5)
@@ -98,6 +106,7 @@ impl Profile {
             tx_streams,
             rx_ldpc: n.rx_ldpc(),
             rx_stbc: n.rx_stbc(),
+            tx_stbc: n.tx_stbc(),
             tx_ldpc: n.tx_ldpc(),
             rx_greenfield: n.rx_greenfield(),
             tx_greenfield: n.tx_greenfield(),
@@ -169,6 +178,7 @@ impl Profile {
             tx_streams: 1,
             rx_ldpc: false,
             rx_stbc: false,
+            tx_stbc: false,
             tx_ldpc: false,
             rx_greenfield: false,
             tx_greenfield: false,
@@ -192,6 +202,9 @@ impl Profile {
     pub(crate) fn receive_stbc(self) -> bool {
         self.rx_stbc
     }
+    pub(crate) fn transmit_stbc(self) -> bool {
+        self.tx_stbc
+    }
     pub(crate) fn transmit_ldpc(self) -> bool {
         self.tx_ldpc
     }
@@ -207,6 +220,7 @@ impl Profile {
         // wider-width bit survives this local HT20 capability intersection.
         let cap = u16::from_le_bytes(self.capability[..2].try_into().unwrap());
         (cap & (12 | 32))
+            | if self.tx_stbc { cap & 0x0300 } else { 0 }
             | u16::from(self.tx_ldpc)
             | (u16::from(self.tx_greenfield) << 4)
             | if self.secondary.is_some() {

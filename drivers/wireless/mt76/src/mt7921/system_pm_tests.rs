@@ -48,9 +48,14 @@ fn mt76_system_suspend_leaves_station_stops_vif_and_hands_off_ownership() -> Tes
         uni_body(frame, 7)
             .is_some_and(|body| body == [2, 0, 0, 0, 0, 0, 12, 0, 1, 0, 0, 0, 0, 0, 0, 0])
     });
+    let led_off = frames.iter().rposition(|frame| {
+        frame.len() >= 68 && frame[36] == 0xed && frame[41] == 5 && frame[64] == 3
+    });
+    // mt7921_pci_suspend: LED off, HIF suspend (acked), then deep sleep.
     let ordered = matches!(
-        (deauth, bss_off, dev_off, mac_off, deep, hif),
-        (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) if a < b && b < c && c < d && d < e && e < f
+        (deauth, bss_off, dev_off, mac_off, led_off, hif, deep),
+        (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f), Some(g))
+            if a < b && b < c && c < d && d < e && e < f && f < g
     );
     if !ordered
         || session.backend.pm.trace != ["dma-off", "fw-own"]
@@ -119,8 +124,11 @@ fn mt76_system_resume_reenables_retained_dma_and_requires_fresh_station() -> Tes
     let hif = frames
         .iter()
         .position(|frame| uni_body(frame, 7).is_some_and(|body| body[0] == 2 && body[8] == 0));
+    let led_on = frames.iter().position(|frame| {
+        frame.len() >= 68 && frame[36] == 0xed && frame[41] == 5 && frame[64] == 2
+    });
     if session.backend.pm.trace != ["bus", "dma-on"]
-        || !matches!((deep, hif), (Some(a), Some(b)) if a < b)
+        || !matches!((deep, hif, led_on), (Some(a), Some(b), Some(c)) if a < b && b < c)
         || session.backend.pm.firmware_owned
         || !session.events.is_empty()
         || session

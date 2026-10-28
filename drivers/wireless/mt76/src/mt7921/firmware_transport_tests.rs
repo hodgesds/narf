@@ -236,6 +236,7 @@ struct Model {
     reset_stall: bool,
     link_stall: bool,
     pm: PowerModel,
+    data_tids: Vec<u8>,
 }
 /// Low-power state of the model device, for system suspend/resume.
 #[derive(Debug, Default)]
@@ -317,6 +318,7 @@ impl Model {
             reset_stall: false,
             link_stall: false,
             pm: PowerModel::default(),
+            data_tids: Vec::new(),
         }
     }
 }
@@ -931,6 +933,22 @@ impl Backend for Model {
         self.data_qos.push(qos);
         self.data_aggregation.push(false);
         self.data_ba_disabled.push(header[15] & 0x10 != 0);
+        Ok(())
+    }
+    fn submit_data_tid(
+        &mut self,
+        frame: &[u8],
+        protected: bool,
+        tid: u8,
+        _pipelined: bool,
+    ) -> Result<(), Error> {
+        if tid == 0 {
+            return Err(Error::Bounds);
+        }
+        self.submit_data(frame, protected, true)?;
+        let header = crate::mt7921::packet_tx::ethernet_tid(frame, 0x1000, 1, 1, protected, tid)?;
+        self.data_tids.push(tid);
+        *self.data_ba_disabled.last_mut().unwrap() = header[15] & 0x10 != 0;
         Ok(())
     }
     fn submit_data_aggregated(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {

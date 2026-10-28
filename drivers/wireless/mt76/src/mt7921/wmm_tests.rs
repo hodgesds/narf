@@ -79,9 +79,10 @@ fn command(frame: &[u8], id: u8) -> bool {
 fn mt76_wmm_parameter_validation_and_native_edca_wire_values() -> TestResult {
     let parameters = Parameters::parse(&PARAMETERS).unwrap().unwrap();
     // mt7921_mcu_set_tx's ten-byte EDCA rows in BE/BK/VI/VO ACI order;
-    // CW values are (1 << ECW)-1, TXOP remains in units of 32 us.
+    // CW values are (1 << ECW)-1, TXOP remains in units of 32 us. Every AC
+    // carries the AP's own parameters (no host clamp, as Linux).
     let expected = [
-        31, 0, 255, 3, 0, 0, 3, 0, 0, 0, 15, 0, 255, 3, 0, 0, 7, 0, 0, 0, 7, 0, 15, 0, 94, 0, 2, 0,
+        15, 0, 255, 3, 0, 0, 3, 0, 0, 0, 15, 0, 255, 3, 0, 0, 7, 0, 0, 0, 7, 0, 15, 0, 94, 0, 2, 0,
         0, 0, 3, 0, 7, 0, 47, 0, 2, 0, 0, 0, 0, 1, 0, 0,
     ];
     if parameters.edca() != expected
@@ -776,4 +777,110 @@ fn mt76_wmm_teardown_retires_host_grant_before_cancelled_or_uncertain_cleanup() 
 kernel_test_in!(
     "drivers/wireless/mt7921/wmm",
     mt76_wmm_teardown_retires_host_grant_before_cancelled_or_uncertain_cleanup
+);
+
+fn ipv4(tos: u8) -> Vec<u8> {
+    let mut eth = vec![0; 60];
+    eth[..6].copy_from_slice(&AP);
+    eth[6..12].copy_from_slice(&OWN);
+    eth[12..14].copy_from_slice(&[8, 0]);
+    eth[14] = 0x45;
+    eth[15] = tos;
+    eth
+}
+
+fn mt76_wmm_classifies_all_user_priorities_onto_lmac_queues_and_downgrades_acm() -> TestResult {
+    use crate::mt7921::tx_priority::{acm_mask, classify8021d, downgrade, UP_TO_AC};
+    // cfg80211_classify8021d RFC 8325 table (DSCP -> UP).
+    for (dscp, up) in [
+        (0, 0),
+        (8, 1),
+        (10, 0),
+        (16, 0),
+        (18, 3),
+        (24, 4),
+        (26, 4),
+        (32, 4),
+        (34, 4),
+        (40, 5),
+        (44, 6),
+        (46, 6),
+        (48, 7),
+        (56, 7),
+    ] {
+        if classify8021d(&ipv4(dscp << 2)) != up {
+            return TestResult::Fail("IPv4 DSCP did not follow cfg80211_classify8021d");
+        }
+    }
+    let mut v6 = vec![0; 60];
+    v6[12..14].copy_from_slice(&[0x86, 0xdd]);
+    v6[14] = 0x6b; // version 6, traffic class high nibble 0xb
+    v6[15] = 0x80; // traffic class 0xb8 = EF
+    let mut mpls = vec![0; 60];
+    mpls[12..14].copy_from_slice(&[0x88, 0x47]);
+    mpls[16] = 5 << 1; // TC 5
+    let mut x8021 = vec![0; 20];
+    x8021[12..14].copy_from_slice(&[0x89, 0x17]);
+    if classify8021d(&v6) != 6
+        || classify8021d(&mpls) != 5
+        || classify8021d(&x8021) != 7
+        || classify8021d(&ipv4(0xb8)[..15]) != 0
+    {
+        return TestResult::Fail("IPv6/MPLS/802.21/truncated classification");
+    }
+    // wmm_acm bits per ACI and ieee80211_downgrade_queue steps.
+    let vo = acm_mask([false, false, false, true]);
+    let vi_vo = acm_mask([false, false, true, true]);
+    if vo != 0xc0
+        || acm_mask([true, true, false, false]) != 0x0f
+        || downgrade(6, vo) != 5
+        || downgrade(7, vi_vo) != 3
+        || downgrade(0, 0x0f) != 2
+        || downgrade(1, 0xff) != 1
+        || UP_TO_AC != [2, 3, 3, 2, 1, 1, 0, 0]
+    {
+        return TestResult::Fail("ACM downgrade/ieee802_1d_to_ac mapping");
+    }
+    // TXD: TID in TXD1[22:20], Q_IDX = 3 - AC in TXD0[31:25].
+    for tid in 0..8u8 {
+        let txd =
+            crate::mt7921::packet_tx::ethernet_tid(&ipv4(0), 0x1000, 1, 1, false, tid).unwrap();
+        let w0 = u32::from_le_bytes(txd[..4].try_into().unwrap());
+        let w1 = u32::from_le_bytes(txd[4..8].try_into().unwrap());
+        if w0 >> 25 != 3 - u32::from(UP_TO_AC[usize::from(tid)]) || (w1 >> 20) & 7 != u32::from(tid)
+        {
+            return TestResult::Fail("native TXD queue/TID for user priority");
+        }
+    }
+    // Native station: QoS frames reach the backend on their own TIDs; the
+    // AP's VO admission control downgrades EF voice to VI (TID 5).
+    for vo_acm in [false, true] {
+        let (mut session, mut bss) = prepared(true, false);
+        if vo_acm {
+            let ies = &mut bss.information_elements;
+            if let Some(at) = ies.windows(8).position(|w| w == &PARAMETERS[..8]) {
+                // First row (VO, ACI 3): set its ACM bit.
+                ies[at + 10] |= 0x10;
+            }
+        }
+        if run(session.associate_station(&bss, b"narf", Security::Open, test_permission(), &[]))
+            .is_err()
+        {
+            return TestResult::Fail("WMM all-AC fixture association");
+        }
+        for tos in [0xb8, 0x88, 0x20, 0x00] {
+            if run(session.send_ethernet(&ipv4(tos))).is_err() {
+                return TestResult::Fail("classified QoS data submission");
+            }
+        }
+        let expected: &[u8] = if vo_acm { &[5, 4, 1] } else { &[6, 4, 1] };
+        if session.backend.data_tids != expected || session.backend.data_qos.len() != 4 {
+            return TestResult::Fail("station did not transmit on classified/downgraded TIDs");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/wmm",
+    mt76_wmm_classifies_all_user_priorities_onto_lmac_queues_and_downgrades_acm
 );

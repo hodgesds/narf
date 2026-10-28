@@ -19,6 +19,8 @@ pub(crate) struct Parameters {
     // set_tx's to_aci permutation compose to this exact command order.
     ac: [Ac; 4],
     parameter_set_count: u8,
+    /// mac80211 `wmm_acm`: user priorities whose AC requires admission.
+    acm: u8,
 }
 
 impl Parameters {
@@ -37,6 +39,7 @@ impl Parameters {
         }
         Ok(Some(Self {
             parameter_set_count: parameters.parameter_set_count,
+            acm: super::super::tx_priority::acm_mask(parameters.ac.map(|ac| ac.admission_control)),
             ac: parameters.ac.map(|ac| Ac {
                 cw_min: ac.cw_min(),
                 cw_max: ac.cw_max(),
@@ -53,17 +56,16 @@ impl Parameters {
         self.parameter_set_count == other.parameter_set_count
     }
 
-    /// Native CE SET_EDCA_PARMS (0x1d), one BSS and WMM set zero.
-    /// The host has no country-specific WMM rule interface yet. Its sole
-    /// selected AC therefore contends at least as conservatively as legacy
-    /// DCF, with no TXOP burst. Unused ACs never receive a TX descriptor.
+    /// Native CE SET_EDCA_PARMS (0x1d), one BSS and WMM set zero, carrying
+    /// the AP's parameters for every AC exactly as mt7921_mcu_set_tx does
+    /// (to_aci order; the ACM bit is not part of the firmware row).
     pub(crate) fn edca(self) -> [u8; 44] {
-        let mut ac = self.ac;
-        ac[0].cw_min = ac[0].cw_min.max(31);
-        ac[0].cw_max = ac[0].cw_max.max(1023);
-        ac[0].aifs = ac[0].aifs.max(3);
-        ac[0].txop = 0;
-        Self { ac, ..self }.encode(true)
+        self.encode(true)
+    }
+
+    /// User priorities that require admission control (downgraded on TX).
+    pub(crate) fn acm(self) -> u8 {
+        self.acm
     }
 
     fn encode(self, qos: bool) -> [u8; 44] {
@@ -85,6 +87,7 @@ impl Parameters {
 pub(crate) fn legacy_edca() -> [u8; 44] {
     Parameters {
         parameter_set_count: 0,
+        acm: 0,
         ac: [Ac {
             cw_min: 31,
             cw_max: 1023,

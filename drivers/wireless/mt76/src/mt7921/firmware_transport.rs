@@ -1080,6 +1080,17 @@ trait Backend {
     fn submit_data_aggregated(&mut self, _frame: &[u8], _protected: bool) -> Result<(), Error> {
         Err(Error::UnsupportedFirmware)
     }
+    /// QoS data on user priority `tid` 1..=7 (TID 0 uses the BE paths above).
+    /// Never BA-aggregated: the originator agreement is TID0-only.
+    fn submit_data_tid(
+        &mut self,
+        _frame: &[u8],
+        _protected: bool,
+        _tid: u8,
+        _pipelined: bool,
+    ) -> Result<(), Error> {
+        Err(Error::UnsupportedFirmware)
+    }
 }
 
 /// Active station checks consume only the currently installed snapshot.

@@ -41,14 +41,6 @@ const RX_PRE: u32 = 0xd4500;
 const RX_POST: u32 = 0xd4540;
 const RX_DATA: u32 = 0xd4520;
 const TX_DATA: u32 = 0xd4300;
-/// `MT_WFDMA0_HOST_INT_DIS`.
-const HOST_INT_DIS: u32 = 0xd422c;
-/// `MT_INT_TX_DONE_ALL`: MCU WM (ENA17), FWDL (ENA16), band0 and GENMASK(18, 4).
-const INT_TX_DONE_ALL: u32 = (1 << 27) | (1 << 26) | (((1 << 15) - 1) << 4);
-/// `MT_INT_RX_DONE_ALL`: WM, WM2 and data.
-const INT_RX_DONE_ALL: u32 = 7;
-/// `MT_INT_MCU_CMD` (`MCU2HOST_SW_INT_ENA`).
-const INT_MCU_CMD: u32 = 1 << 29;
 /// `MT_WFDMA_DUMMY_CR` / `MT_WFDMA_NEED_REINIT`, set by every DMA enable.
 const WFDMA_DUMMY_CR: u32 = 0x54000120;
 const WFDMA_NEED_REINIT: u32 = 1 << 1;
@@ -414,6 +406,20 @@ impl Hardware {
         pipelined: bool,
         aggregated: bool,
     ) -> Result<(), Error> {
+        self.submit_data_txd(frame, protected, qos, pipelined, aggregated, 0)
+    }
+    fn submit_data_txd(
+        &mut self,
+        frame: &[u8],
+        protected: bool,
+        qos: bool,
+        pipelined: bool,
+        aggregated: bool,
+        tid: u8,
+    ) -> Result<(), Error> {
+        if tid >= 8 || tid != 0 && (aggregated || !qos) {
+            return Err(Error::Bounds);
+        }
         if aggregated && (!qos || !pipelined) {
             return Err(Error::Bounds);
         }
@@ -442,7 +448,7 @@ impl Hardware {
         let header = if aggregated {
             packet_tx::ethernet_aggregated(frame, payload, token, protected)?
         } else if qos {
-            packet_tx::ethernet_qos(frame, payload, token, 1, protected, true)?
+            packet_tx::ethernet_tid(frame, payload, token, 1, protected, tid)?
         } else {
             packet_tx::ethernet(frame, payload, token, 1, protected)?
         };
@@ -608,10 +614,6 @@ impl Backend for Hardware {
     fn suspend_dma(&mut self) -> Result<(), Error> {
         self.update(GLOBAL, ENABLE, 0)?;
         self.write(MT_WFDMA0_HOST_INT_ENA, 0)?;
-        self.write(
-            HOST_INT_DIS,
-            INT_TX_DONE_ALL | INT_RX_DONE_ALL | INT_MCU_CMD,
-        )?;
         self.write(MT_PCIE_MAC_INT_ENABLE, 0)?;
         let _ = self.read(GLOBAL)?; // push the disable before the idle poll
         Ok(())
@@ -923,6 +925,18 @@ impl Backend for Hardware {
     }
     fn submit_data_aggregated(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {
         self.submit_data_profile(frame, protected, true, true, true)
+    }
+    fn submit_data_tid(
+        &mut self,
+        frame: &[u8],
+        protected: bool,
+        tid: u8,
+        pipelined: bool,
+    ) -> Result<(), Error> {
+        if tid == 0 {
+            return Err(Error::Bounds);
+        }
+        self.submit_data_txd(frame, protected, true, pipelined, false, tid)
     }
     fn receive_idle(&self) -> Result<bool, Error> {
         self.check()?;

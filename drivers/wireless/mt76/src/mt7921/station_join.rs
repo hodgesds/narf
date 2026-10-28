@@ -1063,7 +1063,19 @@ impl<B: Backend> Session<B> {
             return Err(Error::Busy);
         }
         self.check_station_tx()?;
-        let result = if self.tx_ba.active() {
+        // cfg80211_classify8021d + ieee80211_downgrade_queue: QoS stations
+        // transmit on the frame's user priority/AC; non-QoS uses TID 0.
+        let tid = self
+            .wmm
+            .map_or(0, |wmm| super::super::tx_priority::select(frame, wmm.acm()));
+        let result = if tid != 0 {
+            self.backend.submit_data_tid(
+                frame,
+                self.security.is_some(),
+                tid,
+                self.data_capacity() > 1,
+            )
+        } else if self.tx_ba.active() {
             self.backend
                 .submit_data_aggregated(frame, self.security.is_some())
         } else if self.data_capacity() > 1 {
@@ -1079,7 +1091,7 @@ impl<B: Backend> Session<B> {
             Err(error) => return Err(self.fail_data(error)),
         }
         self.data_pending.push_back(self.backend.now_ns());
-        if self.wmm.is_some() {
+        if self.wmm.is_some() && tid == 0 {
             self.tid0_used = true;
         }
         self.tx_ba.touch(self.backend.now_ns());

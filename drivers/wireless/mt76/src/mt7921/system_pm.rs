@@ -33,6 +33,10 @@ const UNI_HIF_CTRL: u16 = 0x07;
 const OWN_RETRIES: usize = 10;
 /// `mt76_poll_msec_tick(.., 50, 1)` per LPCTL attempt.
 const OWN_POLL_MS: u64 = 50;
+/// `MCU_EXT_CMD_ID_RADIO_ON_OFF_CTRL` and its `EXT_CMD_RADIO_{ON,OFF}_LED`.
+const EXT_RADIO_ON_OFF_CTRL: u8 = 0x05;
+const RADIO_ON_LED: u8 = 0x2;
+const RADIO_OFF_LED: u8 = 0x3;
 
 /// `struct mt76_connac_config` carrying `"KeepFullPwr %d"` (`!enable`).
 pub(super) fn deep_sleep_config(enable: bool) -> [u8; 328] {
@@ -127,19 +131,20 @@ impl<B: Backend> Session<B> {
             return Err(Error::Busy);
         }
         self.take_driver_own().await?;
+        self.radio_led(RADIO_OFF_LED).await?;
+        // set_hif_suspend(mdev, true, true): the firmware acknowledgement is
+        // awaited before deep sleep is forced.
+        self.exchange(
+            Command::Unified { id: UNI_HIF_CTRL },
+            &hif_suspend_request(true),
+        )
+        .await?;
         self.notify(
             Command::Ce {
                 id: CE_CHIP_CONFIG,
                 query: false,
             },
             &deep_sleep_config(true),
-        )
-        .await?;
-        // The UNI option carries MCU_CMD_ACK (mt76_connac2_mcu_fill_message),
-        // so the acknowledgement is consumed instead of aliasing a later seq.
-        self.exchange(
-            Command::Unified { id: UNI_HIF_CTRL },
-            &hif_suspend_request(true),
         )
         .await?;
         self.wait(1, |backend| backend.idle().map(|idle| idle.then_some(())))
@@ -182,7 +187,7 @@ impl<B: Backend> Session<B> {
         Err(Error::Timeout)
     }
 
-    async fn resume_inner(&mut self, _info: RadioInfo) -> Result<(), Error> {
+    async fn resume_inner(&mut self, info: RadioInfo) -> Result<(), Error> {
         self.stage(Stage::Resume);
         self.backend.restore_bus()?;
         self.take_driver_own().await?;
@@ -220,6 +225,35 @@ impl<B: Backend> Session<B> {
         self.exchange(
             Command::Unified { id: UNI_HIF_CTRL },
             &hif_suspend_request(false),
+        )
+        .await?;
+        // mt7921_mcu_regd_update: the firmware's country/CLC limits are
+        // reloaded from the same package-selected world tables used at
+        // initialization, then the radio LED returns on.
+        let responses = info.capabilities.chip_capabilities & 1 != 0;
+        for body in self.firmware.world_limits(info.hardware_type, responses)? {
+            let command = Command::Ce {
+                id: 0x5c,
+                query: false,
+            };
+            if responses {
+                self.exchange(command, &body).await?;
+            } else {
+                self.notify(command, &body).await?;
+            }
+        }
+        self.radio_led(RADIO_ON_LED).await
+    }
+
+    /// `mt7921_mcu_radio_led_ctrl`: EXT `ID_RADIO_ON_OFF_CTRL` `{ctrlid, rsv}`.
+    /// Extended commands carry `ext_cid_ack`, so the reply is consumed.
+    async fn radio_led(&mut self, value: u8) -> Result<(), Error> {
+        self.exchange(
+            Command::Extended {
+                id: EXT_RADIO_ON_OFF_CTRL,
+                query: false,
+            },
+            &[value, 0, 0, 0],
         )
         .await
         .map(|_| ())

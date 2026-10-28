@@ -51,6 +51,7 @@ pub mod pci;
 mod registers;
 mod registers_tests;
 pub mod regs;
+pub(crate) mod tx_priority;
 pub mod txrx;
 pub(crate) mod vht;
 

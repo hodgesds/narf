@@ -51,14 +51,20 @@ impl<B: Backend> Session<B> {
             {
                 return true;
             }
+            // agg-rx.c __ieee80211_start_rx_ba_session: a delayed policy needs
+            // both HT DELAY_BA and the S1G HT_DELAYED_BA capability, so a
+            // non-S1G CONNAC2 peer is always refused with INVALID_QOS_PARAM
+            // (38); other refusals are REQUEST_DECLINED (37). The response
+            // always carries the immediate policy (policy argument 1).
+            let status = if frame[27] & 2 == 0 { 38 } else { 37 };
             if self.control_pending.len() < 4 {
                 let mut response = vec![0; 33];
                 response[0] = 0xd0;
                 response[4..10].copy_from_slice(&peer);
                 response[10..16].copy_from_slice(&own);
                 response[16..22].copy_from_slice(&peer);
-                response[24..29].copy_from_slice(&[3, 1, frame[26], 37, 0]);
-                response[29] = frame[27] & 0x3e;
+                response[24..29].copy_from_slice(&[3, 1, frame[26], status, 0]);
+                response[29] = (frame[27] & 0x3c) | 2;
                 self.control_pending.push_back(response);
             }
             return true;

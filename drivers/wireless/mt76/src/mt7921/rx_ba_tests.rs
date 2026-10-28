@@ -933,3 +933,54 @@ kernel_test_in!(
     "drivers/wireless/mt7921/rx_ba",
     mt76_rx_ba_setup_response_and_teardown_cancel_retain_native_ownership
 );
+
+/// Set IEEE80211_HT_CAP_DELAY_BA in every HT Capabilities element.
+fn with_delayed_ba(elements: &mut [u8]) {
+    let mut offset = 0;
+    while offset + 2 <= elements.len() {
+        let length = usize::from(elements[offset + 1]);
+        if elements[offset] == 45 && length >= 2 {
+            elements[offset + 3] |= 0x04;
+        }
+        offset += 2 + length;
+    }
+}
+
+fn delayed() -> Result<(), &'static str> {
+    // agg-rx.c requires HT DELAY_BA *and* the S1G HT_DELAYED_BA capability
+    // for a delayed policy; a non-S1G peer is refused with INVALID_QOS_PARAM
+    // and an immediate-policy response even when it advertises DELAY_BA.
+    for advertise in [false, true] {
+        let (mut session, mut bss) = super::ht20_tests::prepared(6, false);
+        if advertise {
+            with_delayed_ba(&mut bss.information_elements);
+            if let Some(reply) = session.backend.ht_reply.as_mut() {
+                with_delayed_ba(reply);
+            }
+        }
+        run(session.associate_station(&bss, b"narf", Security::Open, test_permission_for(6), &[]))
+            .map_err(|_| "delayed-BA HT station")?;
+        let mut packet = request_packet(2, 10, 32, 0, 6);
+        packet[24 + 27] &= !2;
+        session.backend.packets.push_back(packet);
+        consume(&mut session, "declined delayed ADDBA delivered data")?;
+        let before = session.backend.frames.len();
+        run(session.service_keys()).map_err(|_| "delayed ADDBA decline")?;
+        let frames = &session.backend.frames[before..];
+        if session.rx_ba.active(2)
+            || frames.len() != 1
+            || frames[0].1.get(24..29) != Some(&[3, 1, 9, 38, 0][..])
+            || frames[0].1[29] != (2 | 2 << 2)
+        {
+            return Err("delayed ADDBA was not refused with INVALID_QOS_PARAM/immediate policy");
+        }
+    }
+    Ok(())
+}
+fn mt76_rx_ba_delayed_policy_is_refused_invalid_qos_for_non_s1g_peer() -> TestResult {
+    delayed().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx_ba",
+    mt76_rx_ba_delayed_policy_is_refused_invalid_qos_for_non_s1g_peer
+);

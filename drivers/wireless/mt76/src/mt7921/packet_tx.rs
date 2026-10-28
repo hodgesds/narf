@@ -83,6 +83,42 @@ pub(super) fn ethernet_qos(
     protected: bool,
     qos: bool,
 ) -> Result<[u8; HEADER], Error> {
+    ethernet_txd(frame, payload, token, wcid, protected, qos.then_some(0))
+}
+
+/// QoS data on 802.1D user priority `tid`: mt76_connac2_mac_write_txwi_8023
+/// puts the TID in TXD1, and mt76_connac2_mac_write_txwi selects
+/// `Q_IDX = mt76_connac_lmac_mapping(ac)` (3 - mac80211 AC) for the TID's
+/// ieee802_1d_to_ac queue.
+pub(super) fn ethernet_tid(
+    frame: &[u8],
+    payload: u64,
+    token: u16,
+    wcid: u16,
+    protected: bool,
+    tid: u8,
+) -> Result<[u8; HEADER], Error> {
+    ethernet_txd(frame, payload, token, wcid, protected, Some(tid))
+}
+
+fn ethernet_txd(
+    frame: &[u8],
+    payload: u64,
+    token: u16,
+    wcid: u16,
+    protected: bool,
+    tid: Option<u8>,
+) -> Result<[u8; HEADER], Error> {
+    let qos = tid.is_some();
+    let tid = tid.unwrap_or(0);
+    if tid >= 8 {
+        return Err(Error::Bounds);
+    }
+    let queue = if qos {
+        3 - u32::from(super::tx_priority::UP_TO_AC[usize::from(tid)])
+    } else {
+        0
+    };
     if !(14..=1514).contains(&frame.len()) {
         return Err(Error::Bounds);
     }
@@ -101,8 +137,8 @@ pub(super) fn ethernet_qos(
     }
     let is_eth_802_3 = true;
     let words = [
-        (frame.len() as u32 + 32) | (u32::from(qos) << 25),
-        (1 << 31) | (u32::from(is_eth_802_3) << 15) | u32::from(wcid),
+        (frame.len() as u32 + 32) | (queue << 25),
+        (1 << 31) | (u32::from(tid) << 20) | (u32::from(is_eth_802_3) << 15) | u32::from(wcid),
         (2 << 4) | if qos { 8 } else { 0 }, // DATA / QoS DATA; AP receiver is unicast.
         (1 << 28) | (15 << 11) | (u32::from(protected) << 1), // BA_DISABLE; installed PTK only.
         0,
