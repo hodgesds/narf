@@ -47,6 +47,8 @@ mod tx_pipeline_station_tests;
 mod vht160_tests;
 #[path = "vht_tests.rs"]
 mod vht_tests;
+#[path = "wmm_regulatory_tests.rs"]
+mod wmm_regulatory_tests;
 #[path = "wmm_tests.rs"]
 mod wmm_tests;
 

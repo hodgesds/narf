@@ -63,6 +63,33 @@ impl Parameters {
         self.encode(true)
     }
 
+    /// The EDCA command after Linux v7.2 net/mac80211/util.c
+    /// `ieee80211_regulatory_limit_wmm_params` (called per AC from mlme.c
+    /// `_ieee80211_sta_wmm_params`): for a station on a channel whose
+    /// regulatory rule carries a `wmm_rule`, `cw_min`/`cw_max`/`aifs` are
+    /// raised to the rule's client values and `txop` is capped at its
+    /// channel occupancy time / 32 us. No rule leaves the AP's parameters.
+    pub(crate) fn edca_limited(self, rule: Option<narf_wireless::reg::WmmRule>) -> [u8; 44] {
+        self.limited(rule).encode(true)
+    }
+
+    pub(crate) fn limited(mut self, rule: Option<narf_wireless::reg::WmmRule>) -> Self {
+        let Some(rule) = rule else {
+            return self;
+        };
+        // Canonical ACI order BE, BK, VI, VO -> mac80211 AC (VO 0, VI 1,
+        // BE 2, BK 3), the index of `wmm_rule.client[]`.
+        for (aci, ac) in [2usize, 3, 1, 0].into_iter().enumerate() {
+            let limit = rule.client[ac];
+            let params = &mut self.ac[aci];
+            params.cw_min = params.cw_min.max(limit.cw_min);
+            params.cw_max = params.cw_max.max(limit.cw_max);
+            params.aifs = params.aifs.max(u16::from(limit.aifsn));
+            params.txop = params.txop.min(limit.cot_us / 32);
+        }
+        self
+    }
+
     /// User priorities that require admission control (downgraded on TX).
     pub(crate) fn acm(self) -> u8 {
         self.acm

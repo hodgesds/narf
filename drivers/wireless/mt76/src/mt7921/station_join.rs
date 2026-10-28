@@ -1713,7 +1713,7 @@ impl<B: Backend> Session<B> {
                         id: 0x1d,
                         query: false,
                     },
-                    &parameters.edca(),
+                    &parameters.edca_limited(self.station_permission.and_then(|p| p.wmm_rule())),
                 )
                 .await?;
                 self.confirm_command_progress().await?;
@@ -2214,7 +2214,7 @@ impl<B: Backend> Session<B> {
                 id: 0x1d,
                 query: false,
             },
-            &parameters.edca(),
+            &parameters.edca_limited(self.station_permission.and_then(|p| p.wmm_rule())),
         )
         .await?;
         self.check_station_tx()?;

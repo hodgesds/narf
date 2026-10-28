@@ -803,6 +803,9 @@ pub(crate) struct TxPermission {
     // A currently permitted80-MHz channel in this band, required for VHT
     // even when the selected operation is20/40 (mac80211/vht.c).
     vht80_channel: Option<u8>,
+    /// The primary channel's regulatory WMM rule (cfg80211 `freq_reg_info`
+    /// at the chandef's `chan->center_freq`, `rrule->has_wmm`).
+    wmm_rule: Option<narf_wireless::reg::WmmRule>,
 }
 
 impl TxPermission {
@@ -986,7 +989,10 @@ impl TxPermission {
         };
         // A permissive wide rule cannot erase a restrictive overlapping rule.
         if domain.rules.iter().filter(overlaps).any(|rule| {
-            rule.flags.bits() & !RegFlags::NO_P2P.bits() != 0 || rule.max_bandwidth_mhz < width
+            // WMM_ETSI is a constraint this owner applies to EDCA
+            // (`wmm_rule`), not a transmit prohibition.
+            rule.flags.bits() & !(RegFlags::NO_P2P | RegFlags::WMM_ETSI).bits() != 0
+                || rule.max_bandwidth_mhz < width
         }) {
             return None;
         }
@@ -1016,7 +1022,13 @@ impl TxPermission {
             center80,
             center160,
             vht80_channel: None,
+            wmm_rule: domain.wmm_rule_for(primary),
         })
+    }
+
+    /// The regulatory WMM rule for the station's primary channel.
+    pub(crate) fn wmm_rule(self) -> Option<narf_wireless::reg::WmmRule> {
+        self.wmm_rule
     }
 
     pub fn permits(self, channel: u8) -> bool {
