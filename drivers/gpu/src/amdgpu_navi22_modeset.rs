@@ -1471,7 +1471,7 @@ impl Pipeline {
         let width = timing.h_active / opps;
         self.opp.program(Encoding::Rgb, width, timing.v_active)?;
         self.opp.set_blank(true)?;
-        self.hdmi_format().await?;
+        self.output_format().await?;
         if let Some(mut slice) = self.slice.take() {
             let combined = self.combine_slice(&mut slice, width, timing.v_active).await;
             self.slice = Some(slice);
@@ -1733,14 +1733,21 @@ impl Pipeline {
             ..hdmi::Limits::DEFAULT
         }
     }
-    /// m5hdmi: the HDMI stream's output format on the pipe, after the timing
-    /// and before the OTG starts: OTG 4:2:0 container, FMT dither/clamp/
-    /// encoding, OCSC and the DPG's black for the colour space.
-    async fn hdmi_format(&mut self) -> Result<(), Error> {
-        let Some(stream) = self.hdmi.filter(|_| self.connector.signal == Signal::Hdmi) else {
-            return Ok(());
+    /// m5hdmi: the stream's output format on the pipe, after the timing and
+    /// before the OTG starts: OTG 4:2:0 container, FMT dither/clamp/
+    /// encoding, OCSC and the DPG's black for the colour space. Linux
+    /// programs these for every signal (optc1_program_timing's
+    /// OPTC_DATA_FORMAT, opp_program_fmt, dcn20_program_pipe's
+    /// program_output_csc): DisplayPort SST is full-range 8-bpc RGB, as its
+    /// MSA says, rather than whatever an earlier stream left on the pipe.
+    async fn output_format(&mut self) -> Result<(), Error> {
+        let format = match self.connector.signal {
+            Signal::Hdmi => match self.hdmi {
+                Some(stream) => stream.format,
+                None => return Ok(()),
+            },
+            Signal::DisplayPort => hdmi::Format::RGB8,
         };
-        let format = stream.format;
         self.format.program_otg(format)?;
         self.format.program_fmt(format)?;
         self.format.program_ocsc(format).await?;
@@ -1780,13 +1787,17 @@ impl Pipeline {
             Depth::Bpc8.bits_per_pixel(),
         )
         .ok_or(Error::NoMode)?;
-        self.link_dp_at(tables, timing, &caps, setting, aux).await
+        self.link_dp_at(tables, timing, &caps, setting, aux, true)
+            .await
     }
     /// `link_set_dpms_on` for DisplayPort SST at `setting`: DIG setup, stream
     /// attributes and SDPs, the PHY clock, the backend connected
     /// (`setup_dio_stream_encoder` before training), training with retries
     /// (`perform_link_training_with_retries`), then `dcn20_enable_stream`
-    /// and `dcn20_unblank_stream`.
+    /// and `dcn20_unblank_stream`. At a `commit`, a link that never trained
+    /// still enables its stream, as `link_set_dpms_on` does for SST ("some
+    /// DP monitors will recover and show the stream anyway"); a retrain
+    /// reports the failure.
     async fn link_dp_at<A: Aux + Send>(
         &mut self,
         tables: &Tables<'_>,
@@ -1794,13 +1805,16 @@ impl Pipeline {
         caps: &dp_link::Caps,
         setting: DpLink,
         aux: &mut A,
+        commit: bool,
     ) -> Result<(), Error> {
         self.dig.setup(DigMode::DisplayPort)?;
         self.dig.setup_stereo_sync(self.route.pipe)?;
         // DPRX_FEATURE_ENUMERATION_LIST (retrieve_link_cap, extended caps
         // only): SST_SPLIT_SDP_CAP bit 1, VSC_SDP_COLORIMETRY_SUPPORTED bit 3.
         let feature = caps.dprx_feature;
-        let vsc_colorimetry = feature & 1 << 3 != 0;
+        // amdgpu_dm's VSC colorimetry also needs a DPCD 1.4 receiver.
+        // linux-lit: 0x14=DP_DPCD_REV_14
+        let vsc_colorimetry = caps.rev() >= 0x14 && feature & 1 << 3 != 0;
         let vsc = vsc_colorimetry.then(|| dp::vsc_packet(Depth::Bpc8));
         self.dp_stream.set_stream_attribute(
             timing,
@@ -1831,7 +1845,20 @@ impl Pipeline {
             link: self.dp_link,
             phy: &mut phy,
         };
-        let trained = dp_link::train_with_retries(aux, &mut source, caps, setting).await?;
+        dp_link::disable_mst_on_sink(aux, caps).await;
+        let trained = match dp_link::train_with_retries(aux, &mut source, caps, setting).await {
+            Ok(trained) => trained,
+            // The last attempt left the PHY on at `setting`.
+            Err(Error::Training(error)) if commit => {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi22 DP link training failed ({error:?}); enabling the stream anyway"
+                );
+                setting
+            }
+            Err(error) => return Err(error),
+        };
         self.link = Some(trained);
         self.dig.setup(DigMode::DisplayPort)?;
         // dcn20_enable_stream, then dcn20_unblank_stream.
@@ -2206,7 +2233,7 @@ impl Pipeline {
         }
         self.unlink_dp(tables, aux).await?;
         sleep_us(DP_BLANK_SETTLE_US).await;
-        self.link_dp_at(tables, &output.timing, &caps, setting, aux)
+        self.link_dp_at(tables, &output.timing, &caps, setting, aux, false)
             .await?;
         self.state = State::At(Step::Running);
         let sink = Sink {

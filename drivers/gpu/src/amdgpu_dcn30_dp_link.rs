@@ -335,6 +335,29 @@ async fn write_ignored<A: Aux + Send>(aux: &mut A, address: u32, data: &[u8]) {
     let _ = aux.write(address, data).await;
 }
 
+const MSTM_CAP: u32 = 0x021; // linux: DP_MSTM_CAP
+const MSTM_CTRL: u32 = 0x111; // linux: DP_MSTM_CTRL
+const MST_EN: u8 = 1; // linux: DP_MST_CAP, DP_MST_EN
+
+/// `enable_link_dp`'s SST step for a sink `read_is_mst_supported` calls MST
+/// capable (DPCD 1.2+ with MSTM_CAP.MST_CAP): `enable_mst_on_sink(false)`,
+/// clearing MSTM_CTRL.MST_EN that an earlier MST source may have left set
+/// (such a sink trains but expects MTP framing). Linux ignores the AUX
+/// results.
+pub async fn disable_mst_on_sink<A: Aux + Send>(aux: &mut A, caps: &Caps) {
+    // linux-lit: 0x12=DPCD_REV_12
+    if caps.rev() < 0x12 {
+        return;
+    }
+    let mut cap = [0];
+    if aux.read(MSTM_CAP, &mut cap).await.is_err() || cap[0] & MST_EN == 0 {
+        return;
+    }
+    let mut ctrl = [0];
+    let _ = aux.read(MSTM_CTRL, &mut ctrl).await;
+    write_ignored(aux, MSTM_CTRL, &[ctrl[0] & !MST_EN]).await;
+}
+
 /// `wake_up_aux_channel`: up to ten SET_POWER reads 1 ms apart; a sink that
 /// never answers gets D0 then D3 and the link is refused.
 async fn wake_up_aux_channel<A: Aux + Send>(aux: &mut A) -> Result<(), Error> {

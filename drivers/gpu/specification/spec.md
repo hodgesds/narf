@@ -7677,8 +7677,15 @@ prepare_bandwidth (clocks then watermarks), `dcn20_enable_stream_timing`
 DP DTO phase/modulo, timing, OPP black, `enable_crtc`, one frame),
 `link_set_dpms_on` (HDMI: setup, STREAM_SETUP, attributes, AVI, transmitter
 ENABLE, setup, BE→FE, AVI, AVMUTE off; DP: setup, MSA/VSC, PHYCLK floor,
-BE→FE, `amdgpu_dcn30_dp_link::train_with_retries` at the least verified link
-carrying the mode, setup, unblank; see "Navi 22 DP link layer"),
+BE→FE, `amdgpu_dcn30_dp_link::disable_mst_on_sink` (MSTM_CTRL.MST_EN
+cleared on a DPCD 1.2+ MST-capable sink), `train_with_retries` at the least
+verified link carrying the mode, setup, unblank; see "Navi 22 DP link
+layer"). A commit whose SST training fails still enables and unblanks the
+stream at that setting, as `link_set_dpms_on` does; a retrain reports
+`Error::Training`. Every signal programs its output format after the
+timing (OPTC_DATA_FORMAT and stereo, FMT dither/clamp, OCSC, DPG black):
+HDMI its admitted stream's, DP full-range 8-bpc RGB. VSC colorimetry needs
+a DPCD 1.4 receiver and its DPRX feature bit.
 then the front end under `optc3_lock` and a two-frame underflow watch.
 `Output` carries the route, trained `DpLink` and `Inherited` GOP state.
 Failure records `State::Failed { step, error }` and undoes only started steps

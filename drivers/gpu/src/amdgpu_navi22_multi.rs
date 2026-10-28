@@ -1315,7 +1315,7 @@ impl Group {
         m.mpc_rate_control_off(lease.route.pipe)?;
         m.opp.program(Encoding::Rgb, width, timing.v_active)?;
         m.opp.set_blank(true)?;
-        m.hdmi_format().await?;
+        m.output_format().await?;
         if let Some(slice) = self.slices[k].as_mut() {
             m.combine_slice(slice, width, timing.v_active).await?;
         }
@@ -1371,7 +1371,9 @@ impl Group {
         m.dig.setup(DigMode::DisplayPort)?;
         m.dig.setup_stereo_sync(lease.route.pipe)?;
         let feature = caps.dprx_feature;
-        let vsc_colorimetry = feature & 1 << 3 != 0;
+        // amdgpu_dm's VSC colorimetry also needs a DPCD 1.4 receiver.
+        // linux-lit: 0x14=DP_DPCD_REV_14
+        let vsc_colorimetry = caps.rev() >= 0x14 && feature & 1 << 3 != 0;
         let vsc = vsc_colorimetry.then(|| dp::vsc_packet(Depth::Bpc8));
         m.dp_stream.set_stream_attribute(
             &timing,
@@ -1412,6 +1414,7 @@ impl Group {
             dsc,
             transmitter,
         };
+        dp_link::disable_mst_on_sink(&mut port, &caps).await;
         let trained =
             dp_link::train_with_retries_fec(&mut port, &mut source, &caps, setting, true).await?;
         m.link = Some(trained);
