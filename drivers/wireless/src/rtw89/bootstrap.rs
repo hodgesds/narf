@@ -459,7 +459,7 @@ impl Bootstrap {
         }
         // An accepted FLR keeps its mandatory no-config quarantine; the
         // reset is dropped only after `run` returned.
-        drop(self.reset.lock().await.take());
+        let _ = self.reset.lock().await.take();
         let reclaimed = self.retire_generation().await;
         self.set_stage(Stage::Terminal);
         reclaimed

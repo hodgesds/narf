@@ -127,8 +127,9 @@ kernel_test_in!(
     smoke_rtw89_dma_stop_proves_idle_after_linux_order_and_bme_off
 );
 
+type Case = (fn(&mut Model), Error);
 fn smoke_rtw89_dma_stop_busy_ignored_and_gone_keep_dma_pinned() -> TestResult {
-    let cases: [(fn(&mut Model), Error); 6] = [
+    let cases: [Case; 6] = [
         (|m| m.tx_busy_reads = 11, Error::TxBusy),
         (|m| m.rx_busy_reads = 12, Error::RxBusy),
         (|m| m.ignore_stop = true, Error::Ignored),
