@@ -1150,11 +1150,31 @@ A passive scan transmits nothing and leaves the CAM unchanged. Smoke:
 mask refused with no H2C, masked SA, response observation, CAM move and
 restore, own-address scan and association afterwards). Random-address
 scanning uses the same probe emitter as active scanning, which no
-operating program gates. The sequence-number half of `randomized_scan_mac`
-stays open because shared `narf_wireless::scan::ScanRequest` has no
-`NL80211_SCAN_FLAG_RANDOM_SN` field, so the driver cannot tell when
-mac80211/firmware `rand_seq_num` (`fw.c::rtw89_hw_scan_add_chan_list`)
-applies.
+operating program gates.
+
+Random probe sequence numbers: the device advertises
+`NL80211_EXT_FEATURE_SCAN_RANDOM_SN` (Linux v7.2 `core.c::rtw89_core_register_hw`)
+through `supports_scan_random_sn()`, and `scan_with_flags` carries
+`ScanFlags::random_sn` into the station probe. As in Linux v7.2
+`mac80211/scan.c::ieee80211_scan_state_send_probe` (which maps
+`NL80211_SCAN_FLAG_RANDOM_SN` to `IEEE80211_PROBE_FLAG_RANDOM_SN`) and
+`ieee80211_send_scan_probe_req`, every probe request of an active scan
+gets `IEEE80211_SN_TO_SEQ(get_random_u16())` in its Sequence Control and
+is sent with `IEEE80211_TX_CTRL_NO_SEQNO` semantics: the station's
+management sequence counter is neither used nor advanced. The random
+values come from one `Environment::nonce` draw taken before any address
+CAM or RF activity, so missing entropy fails the scan (terminal, like any
+failed scan) without a transmission. The TXWD is unchanged: management
+keeps `HW_SSN_SEL=1`/`HW_SSN_MODE=1` exactly as Linux v7.2
+`core.c::rtw89_core_tx_update_mgmt_info` does for every management frame,
+random-SN probes included. A passive scan accepts the flag and transmits
+nothing. The probe emitter is not gated by any operating program, so
+there is no program-not-granted case. Linux offloads scans to firmware
+(`fw.c::rtw89_hw_scan_add_chan_list` `rand_seq_num`); the channel-1 host
+probe path here is the faithful subset. Smoke:
+`smoke_rtw8852b_random_sn_probe_requests` (counted SN without the flag,
+random SN per probe with it, counter not advanced, passive scan, no
+entropy refused with no probe or H2C, station stopped afterwards).
 
 ### Live AP EDCA updates
 
@@ -1412,7 +1432,6 @@ Each blocker below was re-checked against this tree.
 | `eht` | Needs the RTL8922A chip row first. `efuse.rs` returns `UnsupportedChip` for 8922A, `irq::Mask::config` rejects the `_v2` layout, there is no BE TXD/RXD (`txrx.h` `BE_TXD_*`) or BE RA H2C (`rtw89_h2c_ra_v1`, `RTW89_H2C_RA_V1_W4_MODE_EHT`), and `station_control::Controller::new` plus the `N52B` qualification record are RTL8852B-only. The shared `association::eht` API is not the gap. |
 | `aggregation`, `block_ack_originator` | `packet_core::Core` keeps one `pending: Option<Pending>` and `ready()` is false while a frame is in flight. `station::State::pending` and the RPQ retirement are also single-frame. TX A-MPDU needs per-slot header/body DMA ownership for N in-flight tickets, `RTW89_TXWD_BODY3_AGG_EN`/`INFO1_MAX_AGGNUM`/`INFO2_AMPDU_DENSITY`, an originator ADDBA state machine (mac80211 `agg-tx.c`), `rtw89_chip_h2c_ampdu_cmac_tbl` on `TX_OPERATIONAL`/`TX_STOP_*`, and a new signed `Program` for the aggregate emitter. |
 | `pmf` | Shared layer now provides `FakeAp::wpa3_sae`/`with_pmf`/`with_igtk`/`bip_broadcast_deauth`, `JoinOptions::{akms,pmf}` and the WPA2-PMF RSNE (merge e295558ed). The rtw89 gap remains: `station.rs::associate` builds Open/WPA2-PSK only, `interface.rs` maps only `SecurityConfig::Open`/`Wpa2`, there is no SAE commit/confirm path through `JoinPlan::start_sae_authentication`, and `packet_format::classify` refuses management frames with the Protected bit (host CCMP/BIP on RTL8852B, `hw_mgmt_tx_encrypt` false). |
-| `randomized_scan_mac` | The random MAC is implemented (section 3). Shared `supports_scan_random_sn()`/`scan_with_flags` (`NL80211_SCAN_FLAG_RANDOM_SN`) now exist (merge e295558ed); rtw89 still needs a `Device` override accepting the flag and a random initial sequence number in the probe-request path (`station.rs::scan_with` / `packet_format` probe builder). |
 | `he_htc` | Shared `Security` now accepts +HTC QoS DATA on RX (merge e295558ed). rtw89 still needs RX admission of the Order bit in `packet_core::receive`/`packet_format`, the HTC_HE capability advertisement, and TX insertion (`__rtw89_core_tx_adjust_he_qos_htc`) gated by RA C2H `might_fallback_legacy` (`rtw89_phy_c2h_ra_rpt_iter`), which the firmware-RA path does not decode yet. |
 
 ### Upstream applicability triage (2026-10-27)

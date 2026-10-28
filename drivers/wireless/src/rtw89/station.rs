@@ -241,6 +241,10 @@ pub(super) struct Probe {
     pub(super) ies: Vec<u8>,
     /// Random scan source address (`NL80211_SCAN_FLAG_RANDOM_ADDR`).
     pub(super) address: Option<[u8; 6]>,
+    /// `NL80211_SCAN_FLAG_RANDOM_SN`: every probe request carries a random
+    /// sequence number and leaves the station counter untouched
+    /// (`IEEE80211_TX_CTRL_NO_SEQNO`).
+    pub(super) random_sn: bool,
 }
 /// mac80211 `ieee80211_build_probe_req` for this 2.4GHz channel1 profile:
 /// SSID, Supported Rates (1,2,5.5,11,6,9,12,18), Extended Supported Rates
@@ -518,7 +522,18 @@ impl State {
             .find(|candidate| candidate.bss.bssid == bssid)
             .map(|candidate| candidate.bss.information_elements)
     }
-    fn transmit(&mut self, io: &mut impl Io, mut bytes: Vec<u8>, kind: Kind) -> Result<(), Error> {
+    fn transmit(&mut self, io: &mut impl Io, bytes: Vec<u8>, kind: Kind) -> Result<(), Error> {
+        self.transmit_with(io, bytes, kind, true)
+    }
+    /// `assign` false is mac80211 `IEEE80211_TX_CTRL_NO_SEQNO`: the caller
+    /// already wrote the sequence number (random-SN probe requests).
+    fn transmit_with(
+        &mut self,
+        io: &mut impl Io,
+        mut bytes: Vec<u8>,
+        kind: Kind,
+        assign: bool,
+    ) -> Result<(), Error> {
         // Caller holds publication; this helper never awaits or re-enters it.
         if self.admission.closed() {
             return Err(Error::State);
@@ -526,7 +541,7 @@ impl State {
         if self.pending.is_some() || self.delivered_reply.is_some() {
             return Err(Error::Busy);
         }
-        if !matches!(kind, Kind::Security | Kind::Data) {
+        if assign && !matches!(kind, Kind::Security | Kind::Data) {
             bytes[22..24].copy_from_slice(&(self.sequence << 4).to_le_bytes());
             self.sequence = (self.sequence + 1) & 4095;
         }
@@ -1133,6 +1148,18 @@ impl State {
         if self.phase() != Phase::Passive {
             return Err(Error::State);
         }
+        // ieee80211_send_scan_probe_req: one get_random_u16() per probe,
+        // drawn before any address CAM or RF activity so missing entropy
+        // fails the scan without a transmission.
+        let random_sn = match &probe {
+            Some(p) if p.random_sn => {
+                if p.ssids.len() > 8 {
+                    return Err(Error::Profile);
+                }
+                Some(self.environment.nonce().ok_or(Error::Entropy)?)
+            }
+            _ => None,
+        };
         let until = self.now()?.saturating_add(dwell_ms);
         let address = probe.as_ref().and_then(|p| p.address);
         if let Some(address) = address {
@@ -1147,7 +1174,7 @@ impl State {
             admission.run(|| Ok(io.packet_scan_address(Some(address))))??;
             self.scan = Some(address);
         }
-        let result = self.scan_dwell(io, until, probe).await;
+        let result = self.scan_dwell(io, until, probe, random_sn).await;
         // A failed dwell is terminal: the interface stops the station.
         if address.is_some() && result.is_ok() {
             // rtw89_core_scan_complete: restore the own address once the last
@@ -1174,6 +1201,7 @@ impl State {
         io: &mut impl Io,
         until: u64,
         probe: Option<Probe>,
+        random_sn: Option<[u8; 32]>,
     ) -> Result<Vec<ObservedBss>, Error> {
         if let Some(probe) = probe {
             let source = probe.address.unwrap_or(self.own);
@@ -1182,7 +1210,7 @@ impl State {
             } else {
                 probe.ssids
             };
-            for ssid in ssids {
+            for (index, ssid) in ssids.into_iter().enumerate() {
                 while self.pending.is_some() {
                     self.poll(io)?;
                     if self.pending.is_none() {
@@ -1193,9 +1221,18 @@ impl State {
                     }
                     self.environment.pause().await;
                 }
-                let frame = probe_request(source, &ssid, &probe.ies);
+                let mut frame = probe_request(source, &ssid, &probe.ies);
+                let assign = match random_sn {
+                    Some(random) => {
+                        // IEEE80211_SN_TO_SEQ(get_random_u16()).
+                        let sn = u16::from_le_bytes([random[2 * index], random[2 * index + 1]]);
+                        frame[22..24].copy_from_slice(&((sn & 0x0fff) << 4).to_le_bytes());
+                        false
+                    }
+                    None => true,
+                };
                 let admission = self.admission.clone();
-                admission.run(|| Ok(self.transmit(io, frame, Kind::Probe)))??;
+                admission.run(|| Ok(self.transmit_with(io, frame, Kind::Probe, assign)))??;
             }
         }
         loop {

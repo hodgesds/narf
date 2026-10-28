@@ -119,6 +119,73 @@ impl<I: Io + 'static> Close for Device<I> {
     }
 }
 impl<I: Io + 'static> Device<I> {
+    /// Triggered scan with its `NL80211_ATTR_SCAN_FLAGS`.
+    async fn scan_flagged(
+        &self,
+        request: ScanRequest,
+        flags: narf_wireless::scan::ScanFlags,
+    ) -> Result<Vec<BssInfo>, WirelessError> {
+        let dwell = scan_dwell(&request)?;
+        self.control_ready()?;
+        let mut attempt = Attempt {
+            device: self,
+            armed: true,
+        };
+        let mut storage = self.lifecycle.retained.lock().await;
+        self.control_ready()?;
+        let owner = storage.as_mut().ok_or(WirelessError::Busy)?;
+        if owner.station_phase() != Some(station::Phase::Passive) {
+            attempt.armed = false;
+            return Err(WirelessError::Busy);
+        }
+        let address = match (&request.random_mac, request.active) {
+            (Some(random), true) => Some(random_scan_address(random)?),
+            _ => None,
+        };
+        let probe = request.active.then(|| station::Probe {
+            ssids: request.ssids.clone(),
+            ies: request.extra_ies.clone(),
+            address,
+            random_sn: flags.random_sn,
+        });
+        let result = owner.station_scan(dwell, probe).await;
+        attempt.armed = false;
+        if result.is_err() {
+            self.close();
+            if !self.admission.teardown_pending() {
+                let _ = owner.station_stop();
+            }
+        }
+        let result = result.map_err(error)?;
+        if self.closed() {
+            self.link(None, false);
+            return Err(WirelessError::HardwareError);
+        }
+        Ok(result
+            .into_iter()
+            .filter(|c| {
+                request.ssids.is_empty()
+                    || request
+                        .ssids
+                        .iter()
+                        .any(|s| s.is_empty() || *s == c.bss.ssid)
+            })
+            .map(|c| BssInfo {
+                bssid: c.bss.bssid,
+                ssid: c.bss.ssid,
+                channel: 1,
+                frequency_mhz: 2412,
+                rssi: i8::MIN,
+                security: if c.ap_rsne.is_some() {
+                    narf_wireless::scan::BssSecurity::Wpa2
+                } else if c.bss.capability & 16 != 0 {
+                    narf_wireless::scan::BssSecurity::Wep
+                } else {
+                    narf_wireless::scan::BssSecurity::Open
+                },
+            })
+            .collect())
+    }
     pub(super) fn new(
         name: &str,
         local: [u8; 6],
@@ -462,6 +529,10 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
     fn supports_scan_random_mac(&self) -> bool {
         true
     }
+    /// `NL80211_EXT_FEATURE_SCAN_RANDOM_SN` (`rtw89_core_register_hw`).
+    fn supports_scan_random_sn(&self) -> bool {
+        true
+    }
     /// `RTW89_SCANOFLD_MAX_SSID`.
     fn max_scan_ssids(&self) -> u8 {
         8
@@ -506,65 +577,15 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         }
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        let dwell = scan_dwell(&request)?;
-        self.control_ready()?;
-        let mut attempt = Attempt {
-            device: self,
-            armed: true,
-        };
-        let mut storage = self.lifecycle.retained.lock().await;
-        self.control_ready()?;
-        let owner = storage.as_mut().ok_or(WirelessError::Busy)?;
-        if owner.station_phase() != Some(station::Phase::Passive) {
-            attempt.armed = false;
-            return Err(WirelessError::Busy);
-        }
-        let address = match (&request.random_mac, request.active) {
-            (Some(random), true) => Some(random_scan_address(random)?),
-            _ => None,
-        };
-        let probe = request.active.then(|| station::Probe {
-            ssids: request.ssids.clone(),
-            ies: request.extra_ies.clone(),
-            address,
-        });
-        let result = owner.station_scan(dwell, probe).await;
-        attempt.armed = false;
-        if result.is_err() {
-            self.close();
-            if !self.admission.teardown_pending() {
-                let _ = owner.station_stop();
-            }
-        }
-        let result = result.map_err(error)?;
-        if self.closed() {
-            self.link(None, false);
-            return Err(WirelessError::HardwareError);
-        }
-        Ok(result
-            .into_iter()
-            .filter(|c| {
-                request.ssids.is_empty()
-                    || request
-                        .ssids
-                        .iter()
-                        .any(|s| s.is_empty() || *s == c.bss.ssid)
-            })
-            .map(|c| BssInfo {
-                bssid: c.bss.bssid,
-                ssid: c.bss.ssid,
-                channel: 1,
-                frequency_mhz: 2412,
-                rssi: i8::MIN,
-                security: if c.ap_rsne.is_some() {
-                    narf_wireless::scan::BssSecurity::Wpa2
-                } else if c.bss.capability & 16 != 0 {
-                    narf_wireless::scan::BssSecurity::Wep
-                } else {
-                    narf_wireless::scan::BssSecurity::Open
-                },
-            })
-            .collect())
+        self.scan_flagged(request, narf_wireless::scan::ScanFlags::default())
+            .await
+    }
+    async fn scan_with_flags(
+        &self,
+        request: ScanRequest,
+        flags: narf_wireless::scan::ScanFlags,
+    ) -> Result<Vec<BssInfo>, WirelessError> {
+        self.scan_flagged(request, flags).await
     }
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
         self.control_ready()?;

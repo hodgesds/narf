@@ -2105,6 +2105,94 @@ kernel_test_in!(
     "drivers/wireless/rtw89/scan",
     smoke_rtw8852b_random_scan_address_cam_probe_and_restore
 );
+fn smoke_rtw8852b_random_sn_probe_requests() -> TestResult {
+    use narf_wireless::scan::ScanFlags;
+    let h = Harness::new(false);
+    if !h.device.supports_scan_random_sn() {
+        return TestResult::Fail("NL80211_EXT_FEATURE_SCAN_RANDOM_SN not advertised");
+    }
+    let request = |ssids: Vec<Vec<u8>>| ScanRequest {
+        ssids,
+        frequencies_mhz: vec![2412],
+        channels: vec![1],
+        active: true,
+        random_mac: None,
+        colocated_6ghz: false,
+        duration_tu: Some(20),
+        duration_mandatory: false,
+        extra_ies: Vec::new(),
+    };
+    let random = ScanFlags { random_sn: true };
+    let seq = |p: &Vec<u8>| u16::from_le_bytes([p[22], p[23]]);
+    // Ordinary flags: the station counter numbers the probe.
+    if complete(
+        h.device
+            .scan_with_flags(request(vec![SSID.to_vec()]), ScanFlags::default()),
+    )
+    .is_err()
+    {
+        return TestResult::Fail("flagless scan failed");
+    }
+    let Some(counted) = h.peer.lock().probes.last().map(seq) else {
+        return TestResult::Fail("no counted probe request");
+    };
+    // Success: each probe carries its own get_random_u16() SN (the fixture
+    // entropy is 0x33.., so SN 0x333) and the counter is not advanced.
+    let Ok(seen) = complete(
+        h.device
+            .scan_with_flags(request(vec![SSID.to_vec(), b"other".to_vec()]), random),
+    ) else {
+        return TestResult::Fail("random-SN scan failed");
+    };
+    let probes = h.peer.lock().probes.clone();
+    if probes.len() != 3
+        || probes[1..].iter().any(|p| seq(p) != 0x333 << 4)
+        || seen.len() != 1
+        || seen[0].bssid != AP
+    {
+        return TestResult::Fail("random-SN probe requests differ");
+    }
+    if complete(h.device.scan(request(vec![SSID.to_vec()]))).is_err()
+        || h.peer.lock().probes.last().map(seq) != Some(counted.wrapping_add(1 << 4))
+    {
+        return TestResult::Fail("random-SN scan advanced the station sequence counter");
+    }
+    // Passive scan: the flag is accepted and nothing is transmitted.
+    let mut passive = request(Vec::new());
+    passive.active = false;
+    let before = h.peer.lock().probes.len();
+    if complete(h.device.scan_with_flags(passive, random)).is_err()
+        || h.peer.lock().probes.len() != before
+    {
+        return TestResult::Fail("passive random-SN scan transmitted");
+    }
+    // Failure: no entropy refuses the scan before any probe or CAM write
+    // (the station closes like any failed scan).
+    h.env.entropy.store(false, Ordering::Release);
+    let packets = h.model(|io| io.control.packets().len());
+    if complete(
+        h.device
+            .scan_with_flags(request(vec![SSID.to_vec()]), random),
+    )
+    .is_ok()
+        || h.peer.lock().probes.len() != before
+        || h.model(|io| io.control.packets().len()) != packets
+    {
+        return TestResult::Fail("random-SN scan without entropy transmitted");
+    }
+    // Teardown: the failed scan stopped the station; nothing scans again.
+    if complete(h.device.scan(request(vec![SSID.to_vec()]))).is_ok()
+        || h.peer.lock().probes.len() != before
+        || h.device.connected_bssid().is_some()
+    {
+        return TestResult::Fail("failed random-SN scan left the station open");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/scan",
+    smoke_rtw8852b_random_sn_probe_requests
+);
 fn smoke_rtw8852b_active_scan_probe_requests_and_extra_ies() -> TestResult {
     let h = Harness::new(false);
     let active = |ssids: Vec<Vec<u8>>, extra_ies: Vec<u8>| ScanRequest {
