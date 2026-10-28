@@ -228,3 +228,72 @@ kernel_test_in!(
     "drivers/gpu/drm/fb_legacy",
     legacy_framebuffer_permissions_and_linux_request_numbers
 );
+
+fn dirty(flags: u32, num_clips: u32, clips_ptr: u64) -> [u8; 24] {
+    let mut arg = [0u8; 24];
+    arg[..4].copy_from_slice(&7u32.to_le_bytes());
+    arg[4..8].copy_from_slice(&flags.to_le_bytes());
+    arg[12..16].copy_from_slice(&num_clips.to_le_bytes());
+    arg[16..24].copy_from_slice(&clips_ptr.to_le_bytes());
+    arg
+}
+
+fn clips(rects: &[[u16; 4]]) -> alloc::vec::Vec<u8> {
+    rects
+        .iter()
+        .flat_map(|r| r.iter().flat_map(|v| v.to_le_bytes()))
+        .collect()
+}
+
+fn dirtyfb_request_validation_and_damaged_rows_follow_linux() -> TestResult {
+    use super::fb_cmd::DirtyCmd;
+    // drm_mode_dirtyfb_ioctl's -EINVAL cases.
+    for (flags, n, ptr) in [
+        (0, 1, 0),
+        (0, 0, 0x1000),
+        (4, 0, 0),
+        (1, 3, 0x1000),
+        (0, 257, 0x1000),
+    ] {
+        if DirtyCmd::parse(&dirty(flags, n, ptr)).is_some() {
+            return TestResult::Fail("DIRTYFB request Linux refuses was admitted");
+        }
+    }
+    let Some(full) = DirtyCmd::parse(&dirty(0, 0, 0)) else {
+        return TestResult::Fail("clipless DIRTYFB refused");
+    };
+    if full.fb_id != 7 || full.rows(&[], 2160) != (0..2160) {
+        return TestResult::Fail("clipless DIRTYFB does not damage the whole framebuffer");
+    }
+    let cmd = DirtyCmd::parse(&dirty(0, 3, 0x1000)).unwrap();
+    // A typed glyph, a cursor-line band, and an empty rect that must not
+    // widen the span.
+    let rects = clips(&[[10, 400, 18, 416], [0, 380, 3840, 390], [5, 0, 5, 2000]]);
+    if cmd.rows(&rects, 2160) != (380..416) {
+        return TestResult::Fail("clip rows are not the covering span of non-empty clips");
+    }
+    if cmd.rows(
+        &clips(&[[0, 2100, 8, 9000], [0, 0, 0, 0], [0, 0, 0, 0]]),
+        2160,
+    ) != (2100..2160)
+    {
+        return TestResult::Fail("clip rows not clamped to the framebuffer");
+    }
+    if cmd.rows(
+        &clips(&[[0, 3000, 8, 3010], [0, 0, 0, 0], [0, 0, 0, 0]]),
+        2160,
+    ) != (0..0)
+    {
+        return TestResult::Fail("off-framebuffer clips damaged rows");
+    }
+    // ANNOTATE_COPY pairs (destination, source): sources do not count.
+    let copy = DirtyCmd::parse(&dirty(1, 2, 0x1000)).unwrap();
+    if copy.rows(&clips(&[[0, 100, 8, 110], [0, 1000, 8, 1010]]), 2160) != (100..110) {
+        return TestResult::Fail("copy annotation source counted as damage");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm/fb_legacy",
+    dirtyfb_request_validation_and_damaged_rows_follow_linux
+);

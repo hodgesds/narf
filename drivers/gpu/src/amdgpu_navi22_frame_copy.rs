@@ -3,6 +3,7 @@
 use super::{Frame, ScanError};
 use crate::{amdgpu_gem::GemPlacement, amdgpu_navi48_platform::PlaneFrame};
 use alloc::sync::Arc;
+use core::ops::Range;
 
 impl Frame {
     pub(super) fn from_plane(p: PlaneFrame, ticket: Option<u64>) -> Option<Self> {
@@ -36,8 +37,101 @@ impl Frame {
             offset: u64::from(p.offsets[0]),
             bo: p.bo,
             ticket,
+            damage: None,
         })
     }
+}
+
+/// A dumb-buffer source: frames of one source and size share contents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Source {
+    phys: u64,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    offset: u64,
+}
+impl Source {
+    fn of(frame: &Frame) -> Option<Self> {
+        frame.bo.is_none().then_some(Self {
+            phys: frame.phys,
+            pitch: frame.pitch,
+            width: frame.width,
+            height: frame.height,
+            offset: frame.offset,
+        })
+    }
+}
+
+fn span(a: &Range<u32>, b: &Range<u32>) -> Range<u32> {
+    if a.is_empty() {
+        b.clone()
+    } else if b.is_empty() {
+        a.clone()
+    } else {
+        a.start.min(b.start)..a.end.max(b.end)
+    }
+}
+
+/// What the two scanout buffers hold of a dumb source, so a damaged frame
+/// copies only the rows its back buffer lacks. The back buffer is the
+/// frame before the front, so it lacks the front's damage and the new
+/// frame's. Anything else (another source, a GEM frame, an unknown back
+/// buffer) copies every row.
+#[derive(Debug, Default)]
+pub(super) struct Damage {
+    /// The front buffer shows this source in full, as of its frame.
+    front: Option<Source>,
+    /// The back buffer (by address, after `flips` flips) shows this source
+    /// except these rows.
+    back: Option<(Source, u64, u64, Range<u32>)>,
+}
+impl Damage {
+    pub(super) const fn new() -> Self {
+        Self {
+            front: None,
+            back: None,
+        }
+    }
+    /// The rows of `frame` to copy into the back buffer at `back`, after
+    /// the scanout's `flips` flips.
+    pub(super) fn plan(&self, frame: &Frame, back: u64, flips: u64) -> Range<u32> {
+        let all = 0..frame.height;
+        let (Some(source), Some(rows)) = (Source::of(frame), frame.damage.as_ref()) else {
+            return all;
+        };
+        match &self.back {
+            Some((s, address, f, stale)) if *s == source && *address == back && *f == flips => {
+                let rows = span(stale, rows);
+                rows.start.min(frame.height)..rows.end.min(frame.height)
+            }
+            _ => all,
+        }
+    }
+    /// `frame` (copied per `plan`) was flipped to the front; `back` is the
+    /// new back buffer (the old front), and `flips` the scanout's count.
+    pub(super) fn flipped(&mut self, frame: &Frame, back: u64, flips: u64) {
+        let source = Source::of(frame);
+        let rows = frame.damage.clone().unwrap_or(0..frame.height);
+        self.back = match (self.front, source) {
+            (Some(f), Some(s)) if f == s => Some((s, back, flips, rows)),
+            _ => None,
+        };
+        self.front = source;
+    }
+    /// Neither buffer's contents are known.
+    pub(super) fn forget(&mut self) {
+        *self = Self::new();
+    }
+}
+
+/// `next` replaces the waiting `old`: its damage must cover both, since
+/// `old` is never copied.
+pub(super) fn coalesce(old: &Frame, next: &mut Frame) {
+    next.damage = match (Source::of(old), Source::of(next), &old.damage, &next.damage) {
+        (Some(a), Some(b), Some(x), Some(y)) if a == b => Some(span(x, y)),
+        _ => None,
+    };
 }
 
 fn error(e: narf_filesystem::FsError) -> ScanError {
@@ -283,5 +377,87 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi22",
         navi22_linear_gem_copy_waits_for_render_fence_without_owner
+    );
+
+    fn dumb(phys: u64, damage: Option<Range<u32>>) -> Frame {
+        let mut frame =
+            Frame::from_plane(PlaneFrame::linear(phys, 64, 16, 100, 0x3432_5258), None).unwrap();
+        frame.damage = damage;
+        frame
+    }
+
+    fn navi22_dirty_frames_copy_only_what_the_back_buffer_lacks() -> TestResult {
+        const A: u64 = 0x1000_0000;
+        const B: u64 = 0x2000_0000;
+        let mut d = Damage::new();
+        // Nothing is known of either buffer yet: every row.
+        let first = dumb(0x8000_0000, Some(10..20));
+        if d.plan(&first, B, 0) != (0..100) {
+            return TestResult::Fail("unknown back buffer took a partial copy");
+        }
+        d.flipped(&first, A, 1);
+        // The new back (A) held whatever preceded this source.
+        let second = dumb(0x8000_0000, Some(10..20));
+        if d.plan(&second, A, 1) != (0..100) {
+            return TestResult::Fail("back buffer from before the source took a partial copy");
+        }
+        d.flipped(&second, B, 2);
+        // B shows the first frame: it lacks the second's and third's rows.
+        let third = dumb(0x8000_0000, Some(30..40));
+        if d.plan(&third, B, 2) != (10..40) {
+            return TestResult::Fail("partial copy is not both frames' damage");
+        }
+        // Another buffer, another flip count, another source, or a full
+        // frame each copies every row.
+        if d.plan(&third, A, 2) != (0..100)
+            || d.plan(&third, B, 3) != (0..100)
+            || d.plan(&dumb(0x9000_0000, Some(30..40)), B, 2) != (0..100)
+            || d.plan(&dumb(0x8000_0000, None), B, 2) != (0..100)
+        {
+            return TestResult::Fail("unrelated back buffer took a partial copy");
+        }
+        d.flipped(&third, A, 3);
+        if d.plan(&dumb(0x8000_0000, Some(95..400)), A, 3) != (30..100) {
+            return TestResult::Fail("damage not clamped to the frame");
+        }
+        // A full frame leaves its successor's back buffer stale everywhere.
+        d.flipped(&dumb(0x8000_0000, None), B, 4);
+        if d.plan(&dumb(0x8000_0000, Some(1..2)), B, 4) != (0..100) {
+            return TestResult::Fail("full frame's successor took a partial copy");
+        }
+        // Switching sources forgets the back buffer.
+        d.flipped(&dumb(0x9000_0000, Some(1..2)), A, 5);
+        if d.plan(&dumb(0x9000_0000, Some(1..2)), A, 5) != (0..100) {
+            return TestResult::Fail("new source's first back buffer took a partial copy");
+        }
+        d.forget();
+        if d.plan(&third, A, 3) != (0..100) {
+            return TestResult::Fail("forgotten buffers took a partial copy");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi22",
+        navi22_dirty_frames_copy_only_what_the_back_buffer_lacks
+    );
+
+    fn navi22_replaced_dirty_frame_keeps_its_damage() -> TestResult {
+        let mut next = dumb(0x8000_0000, Some(50..60));
+        coalesce(&dumb(0x8000_0000, Some(10..20)), &mut next);
+        if next.damage != Some(10..60) {
+            return TestResult::Fail("replaced frame's damage lost");
+        }
+        for old in [dumb(0x8000_0000, None), dumb(0x9000_0000, Some(1..2))] {
+            let mut next = dumb(0x8000_0000, Some(50..60));
+            coalesce(&old, &mut next);
+            if next.damage.is_some() {
+                return TestResult::Fail("frame replacing a full or foreign frame stayed partial");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi22",
+        navi22_replaced_dirty_frame_keeps_its_damage
     );
 }

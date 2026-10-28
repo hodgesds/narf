@@ -6800,14 +6800,22 @@ fn handle_dirty_fb(
     // clips_ptr: u64 } is 24 bytes.
     // SAFETY: `arg` is the user drm_mode_fb_dirty_cmd pointer.
     let raw = unsafe { copy_in(arg, 24)? };
-    let fb_id = u32::from_le_bytes(raw[..4].try_into().map_err(|_| FsError::InvalidData)?);
+    let cmd = crate::drm::fb_cmd::DirtyCmd::parse(&raw).ok_or(FsError::InvalidData)?;
+    let clips = if cmd.num_clips == 0 {
+        Vec::new()
+    } else {
+        let len = cmd.num_clips as usize * crate::drm::fb_cmd::CLIP_RECT_BYTES;
+        // SAFETY: `clips_ptr` is the user drm_clip_rect array of
+        // `num_clips` entries (at most DIRTY_MAX_CLIPS, so 2 KiB).
+        unsafe { copy_in(cmd.clips_ptr as usize, len)? }
+    };
     let (crtcs, frame) = {
         let card = mode_state.lock();
-        let fb = card.framebuffer(fb_id).map_err(|_| FsError::NotFound)?;
+        let fb = card.framebuffer(cmd.fb_id).map_err(|_| FsError::NotFound)?;
         let crtcs: Vec<u32> = card
             .crtcs
             .iter()
-            .filter(|c| c.primary_fb == Some(fb_id))
+            .filter(|c| c.primary_fb == Some(cmd.fb_id))
             .map(|c| c.id)
             .collect();
         let frame = if fb.bo.is_some() {
@@ -6818,21 +6826,53 @@ fn handle_dirty_fb(
         };
         (crtcs, frame)
     };
+    let rows = frame.as_ref().map_or(0..0, |f| cmd.rows(&clips, f.height));
     let (log, n) = should_log(&DIRTYFB_N);
     if log {
         let _ = writeln!(
             narf_console::Writer,
-            "  drm: DIRTYFB #{n} fb={fb_id} crtcs={} backing={}",
+            "  drm: DIRTYFB #{n} fb={} crtcs={} backing={} rows={}..{}",
+            cmd.fb_id,
             crtcs.len(),
-            if frame.is_some() { "yes" } else { "NONE" }
+            if frame.is_some() { "yes" } else { "NONE" },
+            rows.start,
+            rows.end
         );
     }
-    if let Some(f) = frame {
+    // A request whose clips cover no row changes nothing on screen.
+    if let Some(f) = frame.filter(|_| !rows.is_empty()) {
         for crtc in crtcs {
-            present_frame(card_index, crtc, f.clone(), None);
+            present_dirty(card_index, crtc, f.clone(), rows.clone());
         }
     }
     Ok(0)
+}
+
+/// Present dumb framebuffer `f` on `crtc_id` after DIRTYFB damaged `rows`:
+/// a native amdgpu display copies just those rows (and what its back
+/// buffer missed); anything else presents the whole frame.
+fn present_dirty(
+    card_index: u32,
+    crtc_id: u32,
+    f: crate::drm::card::PlaneFrame,
+    rows: core::ops::Range<u32>,
+) {
+    #[cfg(feature = "amdgpu")]
+    if crate::drm_registry::driver_name(card_index) == Some("amdgpu")
+        && f.bo.is_none()
+        && f.modifier == 0
+        && f.offsets == [0; 2]
+        && f.chroma_pitch == 0
+        && matches!(f.format, DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888)
+    {
+        if let Some(display) = crate::amdgpu_native_kms::crtc_display(crtc_id) {
+            if crate::amdgpu_native_kms::present_damaged(display, f.clone(), rows) {
+                narf_console::fb_take_for_user();
+                return;
+            }
+        }
+    }
+    present_frame(card_index, crtc_id, f, None);
 }
 
 /// DRM_IOCTL_MODE_PAGE_FLIP — same blit as SETCRTC, no vblank event.
