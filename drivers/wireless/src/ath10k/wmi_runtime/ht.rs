@@ -211,9 +211,9 @@ impl Profile {
                 .map(|f| f as u16),
             _ => None,
         };
-        if !matches!(offered.width(), Width::Twenty | Width::Forty)
-            && !(offered.width() == Width::Eighty && offered.vht().is_some() && secondary.is_some())
-        {
+        let eighty =
+            offered.width() == Width::Eighty && offered.vht().is_some() && secondary.is_some();
+        if !(matches!(offered.width(), Width::Twenty | Width::Forty) || eighty) {
             return Err(Error::Unsupported);
         }
         Ok(Some(Self {
