@@ -45,6 +45,8 @@ mod calibration8821c;
 mod command;
 mod dack;
 mod dm;
+#[cfg(feature = "kernel-test")]
+mod dm_tests;
 pub mod efuse;
 mod firmware_lifecycle;
 mod firmware_native;

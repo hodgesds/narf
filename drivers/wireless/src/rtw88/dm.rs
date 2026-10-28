@@ -816,7 +816,8 @@ impl Tracker {
         let upper = lower
             .saturating_add(DIG_RSSI_GAIN_OFFSET)
             .clamp(min, max.max(min));
-        let igi = igi.clamp(lower, upper.max(lower));
+        // Linux clamp_t(lower, upper) = min(max(v, lower), upper).
+        let igi = igi.max(lower).min(upper);
         // rtw_phy_dig_recorder
         let up = u8::from(igi > self.igi_history[0]);
         self.igi_bitmap = ((self.igi_bitmap << 1) & 0xfe) | up;
