@@ -173,6 +173,9 @@ impl PciBoot {
     fn crashed(&mut self) -> BmiError {
         self.poisoned = true;
         self.firmware_crashed = true;
+        if !self.retired {
+            crate::ath10k::pci::firmware_crashed();
+        }
         BmiError::FirmwareCrashed
     }
     /// The owner's wake source and whether a vector actually delivers it.

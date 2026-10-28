@@ -198,6 +198,49 @@ pub struct RecoveryScheduled {
     pub attempt: u8,
 }
 
+static RESTART: super::restart::Gate = super::restart::Gate::new();
+static LAST_RECOVERY: IrqSafeSpinLock<Option<super::restart::Outcome>> = IrqSafeSpinLock::new(None);
+
+/// Firmware crash reported by the PCIe owner's service (Linux
+/// `ath10k_pci_fw_dump_work` -> `ath10k_core_start_recovery`). One supervisor
+/// runs at a time; it drives [`recover`] and records the outcome.
+pub(in crate::ath10k) fn firmware_crashed() {
+    if !RESTART.request() {
+        return;
+    }
+    let _ = writeln!(
+        narf_console::Writer,
+        "  ath10k: firmware crashed (count {}), restarting",
+        RESTART.crashes()
+    );
+    narf_scheduler::spawn(async {
+        let delay = super::restart::BUSY_DELAY_MS * 1_000_000;
+        let outcome = super::restart::supervise(
+            recover,
+            || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(delay)),
+            super::restart::BUSY_RETRIES,
+        )
+        .await;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ath10k: automatic recovery {:?}",
+            outcome
+        );
+        *LAST_RECOVERY.lock() = Some(outcome);
+        RESTART.complete();
+    });
+}
+
+/// Firmware crashes observed this boot (`fw_crash_counter`).
+pub fn firmware_crash_count() -> u32 {
+    RESTART.crashes()
+}
+
+/// Outcome of the most recent automatic recovery, if any.
+pub fn last_automatic_recovery() -> Option<super::restart::Outcome> {
+    *LAST_RECOVERY.lock()
+}
+
 /// Schedule fresh chip reset, authenticated ROM provisioning and a new runtime
 /// interface. Three attempts per boot bound permanently pinned old DMA.
 /// Success reports scheduling, not readiness, RF quiescence or DMA reclamation.

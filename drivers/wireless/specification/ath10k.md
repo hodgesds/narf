@@ -439,10 +439,37 @@ Host-bus/system power transitions remain separate profiles.
   mastering. Any halt, BME, ordering or flush failure keeps every mapping
   pinned. A non-retired terminal Drop uses the same proof after firmware
   DONE. No RF-quiescence proof is claimed. The attempt limit bounds pinned
-  generations. This is manual replacement/rejoin support, not automatic
-  recovery,
-  stable-netdev reconnection or system suspend. Physical reset,
+  generations. It is also the restart step of automatic recovery (below). It is
+  not stable-netdev reconnection or system suspend. Physical reset,
   ROM/firmware restart and repeated RF association still need hardware acceptance.
+- Automatic recovery (`restart.rs`, `pci::firmware_crashed`). Linux
+  `pci.c::ath10k_pci_napi_poll` checks `ath10k_pci_has_fw_crashed`
+  (`FW_INDICATOR & FW_IND_EVENT_PENDING`) before any CE service. It clears
+  the bit and queues `ath10k_pci_fw_dump_work`, which counts
+  `fw_crash_counter` and calls `core.c::ath10k_core_start_recovery`. That
+  function deduplicates with `ATH10K_FLAG_RESTARTING` and queues
+  `ath10k_core_restart`. Here every runtime service (`hif_poll`,
+  `hif_poll_now`, interrupt-driven or polled) checks the indicator first. On
+  a crash it clears only EVENT_PENDING, poisons the generation (all later
+  sends/polls fail) and returns `BmiError::FirmwareCrashed`. A
+  non-retired owner then calls `pci::firmware_crashed`. A `restart::Gate`
+  counts the crash (`pci::firmware_crash_count`). Only the request that
+  sets RESTARTING spawns a supervisor; later crashes while restarting are
+  counted, never spawned again. The supervisor calls `pci::recover()`.
+  `Busy` (the crashed stage has not yet stored its owner) backs off 50 ms,
+  up to 100 times, then gives up as `Outcome::Abandoned`. `Exhausted` is
+  `Outcome::Wedged`, the `ATH10K_STATE_WEDGED` analogue for the three
+  attempts per boot. A failed retirement is `Outcome::Failed` and keeps
+  the old DMA pinned. Success is `Outcome::Scheduled { attempt }`. The
+  outcome is published through `pci::last_automatic_recovery`, and
+  RESTARTING is cleared so a successor's crash can recover again. The
+  fresh generation re-registers its station interface. Rejoin goes through
+  that interface's normal scan/associate path; Linux
+  `ieee80211_restart_hw` replay of keys and association is the separate
+  `automatic_credential_replay`/`stable_interface_recovery` work. WMI
+  command timeouts do not yet trigger recovery: Linux `wmi.c` does that in
+  `ath10k_wmi_cmd_send` on `-EAGAIN`, and here those timeouts stay
+  fail-stop errors for the caller.
 - Interrupt service (`irq.rs`, `boot/interrupts.rs`). Linux v6.10
   `pci.c::ath10k_pci_init_irq` tries MSI first; `ath10k_pci_hif_start`
   calls `ath10k_pci_irq_enable`. Here `PciBoot::done_complete` (BMI_DONE

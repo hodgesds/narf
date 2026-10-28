@@ -96,6 +96,7 @@ mod irq;
 pub mod pci;
 pub mod profile;
 pub mod regulatory;
+pub mod restart;
 mod swap;
 pub mod wmi;
 pub mod wmi_boot;
