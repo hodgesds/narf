@@ -265,7 +265,7 @@ pub fn divisor_for(sspclk: u32, hz: u32) -> Option<(u8, u8)> {
         // Smallest (1 + SCR) that brings SCK to ≤ hz at this
         // prescaler; skip the prescaler if even SCR=255 can't.
         let denom = cpsdvr * hz;
-        let one_plus_scr = (sspclk + denom - 1) / denom;
+        let one_plus_scr = sspclk.div_ceil(denom);
         if one_plus_scr <= 256 {
             let actual = sspclk / (cpsdvr * one_plus_scr);
             if actual <= hz && best.is_none_or(|(_, _, b)| actual > b) {
