@@ -14,7 +14,6 @@ ath10k	ht2040_coexistence	HT20/40 coexistence control	feature	drivers/wireless/s
 ath10k	ht40_2ghz	2.4GHz HT40	feature	drivers/wireless/specification/ath10k.md	940
 ath10k	indoor_regulatory	Indoor-only channel admission	feature	drivers/wireless/specification/ath10k.md	946
 ath10k	multiple_spatial_streams	Additional spatial streams	feature	drivers/wireless/specification/ath10k.md	942
-ath10k	non_be_tx	Non-BE TX classification and scheduling	feature	drivers/wireless/specification/ath10k.md	945
 ath10k	offchannel_scan	Off-channel scanning	feature	drivers/wireless/specification/ath10k.md	946
 ath10k	p2p	P2P role	feature	drivers/wireless/specification/ath10k.md	947
 ath10k	pfc	PFC fetch and queue protocol ownership	feature	drivers/wireless/specification/ath10k.md	944

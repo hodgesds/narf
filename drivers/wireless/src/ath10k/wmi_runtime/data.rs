@@ -8,6 +8,8 @@ const RECEIVED_FRAMES: usize = 256;
 const INCOMING_FRAMES: usize = 1024;
 #[path = "rx_ba.rs"]
 mod rx_ba;
+#[path = "tx_qos.rs"]
+mod tx_qos;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Link {
@@ -56,8 +58,12 @@ pub(super) struct State {
     #[cfg(any(test, feature = "kernel-test"))]
     receive_time: Option<u64>,
     received: VecDeque<Vec<u8>>,
-    sequence: u16,
+    /// Open-path 802.11 sequence counters per TID (non-QoS uses slot 0,
+    /// as before; mac80211 keeps `sta->tid_seq` per TID).
+    sequence: [u16; 8],
     qos: bool,
+    /// WMM ACM per canonical ACI (BE, BK, VI, VO) for queue downgrade.
+    acm: [bool; 4],
     failed: bool,
     authorized: bool,
     last_peer: narf_time::Deadline,
@@ -448,8 +454,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             #[cfg(any(test, feature = "kernel-test"))]
             receive_time: None,
             received: VecDeque::new(),
-            sequence: 2,
+            sequence: [2; 8],
             qos: self.peer.as_ref().ok_or(Error::Failed)?.wmm.is_some(),
+            acm: self
+                .peer
+                .as_ref()
+                .ok_or(Error::Failed)?
+                .wmm
+                .as_ref()
+                .map_or([false; 4], tx_qos::admission),
             failed: false,
             authorized: !associated.protected,
             last_peer: narf_time::Deadline::after_ms(5000),
@@ -494,9 +507,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if data.pending.is_some() || data.security.as_ref().is_some_and(|s| !s.port_open()) {
             return Err(Error::Htt(htt::Error::Busy));
         }
+        // ieee80211_select_queue + ieee80211_downgrade_queue (tx_qos.rs).
+        let tid = if data.qos {
+            tx_qos::priority(bytes, data.acm)
+        } else {
+            0
+        };
         let frame = if let Some(security) = &mut data.security {
             if data.qos {
-                security.transmit_ethernet_qos(bytes, 0)
+                security.transmit_ethernet_qos(bytes, tid)
             } else {
                 security.transmit_ethernet(bytes)
             }
@@ -517,10 +536,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             frame.extend_from_slice(&link.bssid);
             frame.extend_from_slice(&own);
             frame.extend_from_slice(&bytes[..6]);
-            frame.extend_from_slice(&(data.sequence << 4).to_le_bytes());
-            data.sequence = (data.sequence + 1) & 4095;
+            let sequence = &mut data.sequence[usize::from(tid)];
+            frame.extend_from_slice(&(*sequence << 4).to_le_bytes());
+            *sequence = (*sequence + 1) & 4095;
             if data.qos {
-                frame.extend_from_slice(&[0, 0]);
+                frame.extend_from_slice(&[tid, 0]);
             }
             frame.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
             frame.extend_from_slice(&bytes[12..]);
@@ -545,7 +565,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             htt::tx::Parameters {
                 kind: htt::tx::Kind::Raw,
                 vdev: 0,
-                tid: if frame[0] == 0x88 { 0 } else { 16 },
+                tid: tx_qos::descriptor_tid(&frame),
                 hardware_crypto: false,
             },
             &frame,
@@ -624,7 +644,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 htt::tx::Parameters {
                     kind: htt::tx::Kind::Raw,
                     vdev: 0,
-                    tid: if frame[0] == 0x88 { 0 } else { 16 },
+                    tid: tx_qos::descriptor_tid(frame),
                     hardware_crypto: false,
                 },
                 frame,

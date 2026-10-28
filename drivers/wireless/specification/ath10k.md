@@ -287,17 +287,32 @@ Host-bus/system power transitions remain separate profiles.
 - The single-vdev RAW station can negotiate WMM from an actual AP Parameter IE.
   It appends its own Information IE with U-APSD disabled; caller-supplied WMM
   cannot duplicate or replace that negotiation. The bound successful association
-  response supplies the final contention values. Missing, duplicate, malformed
-  or BE-admission-controlled response parameters fail before peer/data admission.
+  response supplies the final contention values. Missing, duplicate or malformed
+  response parameters fail before peer/data admission, as does BE ACM. With
+  no TSPEC owner, that would leave ordinary traffic only BK. VO/VI/BK ACM is
+  accepted, and transmit downgrades past ACM ACs (below).
   Native per-dialect PDEV WMM records program BE/BK/VI/VO contention, converting
   IEEE TXOP32-us units to native microseconds; PEER_ASSOC carries the real QoS
   flag only after those transport receipts. This one-radio profile has no
   per-vdev concurrency and makes no firmware ACK claim for these commands.
-  Ordinary Ethernet uses QoS BE/TID0 through actual RAW HTT metadata and the
-  shared host CCMP formatter; EAPOL/key replies remain legacy non-QoS. RX binds
-  QoS TID to the native descriptor before replay/PN commitment. BA/TX
-  aggregation, TSPEC, U-APSD and non-BE transmit classification remain separate
-  features. APs without WMM retain the legacy packet/command profile.
+  Non-BE transmit classification (`wmi_runtime/tx_qos.rs`): on a WMM
+  association each host Ethernet frame gets the user priority from Linux
+  `net/mac80211/wme.c::ieee80211_select_queue`. That is priority 7 for
+  EAPOL; otherwise `net/wireless/util.c::cfg80211_classify8021d` (IPv4 TOS,
+  IPv6 traffic class, MPLS TC, RFC 8325 exceptions; the ath11k
+  `tx_hdr::classify8021d` port is reused). `ieee80211_downgrade_queue` /
+  `wme_downgrade_ac` then step VO to VI (UP 5), VI to BE (UP 3) and BE to
+  BK (UP 2) while the AP's WMM Parameter ACM bit covers the AC, using BK
+  even when BK also requires admission (no TSPEC is admitted). The TID goes
+  into the QoS Control field (open path, or the shared CCMP formatter's
+  `transmit_ethernet_qos`, which keeps per-TID sequence and PN) and into
+  the HTT descriptor TID (`htt_tx.c::ath10k_htt_tx`
+  `HTT_DATA_TX_DESC_FLAGS1_EXT_TID`). The open path also keeps per-TID
+  sequence counters. Firmware schedules the four AC queues from the PDEV
+  WMM records. EAPOL/key replies remain legacy non-QoS (descriptor TID
+  16). RX binds QoS TID to the native descriptor before replay/PN
+  commitment. TX aggregation, TSPEC and U-APSD remain separate features.
+  APs without WMM retain the legacy packet/command profile.
 - The registered Device binds native preparation, authentication/association,
   WMM/peer/up commands and initial RSNA data to a chosen factory/frequency/power
   receipt. It samples current policy before and after each nested wait and
@@ -1020,7 +1035,7 @@ additional streams and TX STBC (which needs a second selected TX chain;
 LDPC and one-stream RX STBC are implemented above);
 response-bound VHT and wider geometry; native TX BA, independent
 multi-packet DMA/completion and aggregate retries; PFC fetch/queue ownership;
-dynamic WMM/protection updates and non-BE TX/TSPEC/U-APSD; DFS/indoor/beacon-hint
+dynamic WMM/protection updates and TSPEC/U-APSD; DFS/indoor/beacon-hint
 qualification; associated/off-channel scanning; hardware key/PMF/WPA3 profiles;
 AP/P2P roles; host-bus/system PM and wake offload;
 pre-cal/cal-file and DT/NVMEM calibration sources (QCA9887 EEPROM is implemented)
