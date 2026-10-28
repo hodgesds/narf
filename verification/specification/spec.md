@@ -76,6 +76,28 @@ Non-DFS 5 GHz fixture channels36/40/44/48/149/153/157/161/165 use OFDM;
 CCK profiles on those channels, malformed/duplicate rates, absent basic rates
 and post-authentication profile replacement are refused. These fixture profiles
 grant no device, calibration or regulatory authority.
+
+**WPA3 and PMF profiles.** `FakeAp::wpa3_sae(plan, ssid, channel, aid,
+password, ApSaePwe::{HuntAndPeck, HashToElement}, anonce)` builds a
+WPA3-Personal AP. It offers AKM 8 with MFPC|MFPR, plus the RSNXE SAE-H2E
+bit under H2E, and runs the AP side of SAE with the shared `SaeSession`
+(seeded from `anonce`). It answers a station Commit with its own Commit
+(status 0 or 126) and a verified Confirm with its Confirm.
+`FakeAp::with_pmf(ApPmf::{Optional, Required})` adds MFPC or MFPC|MFPR to a
+WPA2-PSK AP. `with_akms(&[u8])` changes the offered AKMs, for example
+`[8, 24]` or `[6]`. `with_igtk(key, key_id, ipn)` selects the IGTK.
+
+A profiled AP validates the association RSNE the way hostapd
+`wpa_validate_wpa_ie` does: one offered AKM, MFPR on either side requiring
+MFPC on the other, and a PMKID that, when present, is the SAE PMKID. The
+negotiated AKM then selects the Key Descriptor Version, the PTK KDF and the
+EAPOL MIC (`wpa_pmk_to_ptk`, `wpa_eapol_key_mic`). Message 2 must repeat the
+association RSNE and RSNXE. Message 3 carries the AP RSNE and RSNXE, the GTK
+and, when PMF is negotiated, the IGTK KDE.
+`bip_broadcast_deauth(reason)` emits a BIP-CMAC-128 protected
+group-addressed Deauthentication with the next IPN. `pmf()`, `akm()`,
+`pairwise_tk()` and `igtk()` expose the outcome. Without a profile the AP
+keeps its byte-exact legacy WPA2 behaviour.
 The kit has no device, driver-registration or carrier authority.
 Driver adapters retain native RX/TX framing, completions and controlled-port
 admission. MT76 and ath11k compose production station/security paths through a
