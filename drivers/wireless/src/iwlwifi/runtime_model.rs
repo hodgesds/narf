@@ -249,6 +249,7 @@ pub(in crate::iwlwifi) fn create_for_format(
         armed: false,
         failed: false,
         station_stop: None,
+        protected_tx: 0,
         // This RAM constructor models an already admitted post-INIT owner.
         // Real association immediately closes/reserves its own generation.
         rx_epoch: rx_epoch::State::model(),

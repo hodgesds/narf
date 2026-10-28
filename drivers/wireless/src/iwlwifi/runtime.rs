@@ -568,6 +568,10 @@ pub struct Hardware {
     armed: bool,
     failed: bool,
     station_stop: Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>,
+    /// Protected MPDUs published to data/management queues. Each consumes
+    /// at most one fresh firmware TX PN (retries reuse it), so differences
+    /// bound the PN range a pairwise key can have used.
+    protected_tx: u64,
     rx_epoch: rx_epoch::State,
     sources: Option<source::Assets>,
 }
@@ -664,6 +668,7 @@ impl Hardware {
             armed: false,
             failed: false,
             station_stop: None,
+            protected_tx: 0,
             rx_epoch: rx_epoch::State::default(),
             sources: None,
         })
@@ -1280,6 +1285,17 @@ impl Hardware {
         }
     }
 
+    fn count_protected(&mut self, frame: &[u8]) {
+        if frame.get(1).is_some_and(|fc| fc & 0x40 != 0) {
+            self.protected_tx = self.protected_tx.saturating_add(1);
+        }
+    }
+
+    /// Monotonic count of published protected MPDUs (see `protected_tx`).
+    pub(super) fn protected_transmits(&self) -> u64 {
+        self.protected_tx
+    }
+
     pub fn fail(&mut self) {
         self.failed = true;
         self.rx_epoch.deny();
@@ -1461,6 +1477,7 @@ impl Hardware {
             .find(|q| q.id() == Some(id))
             .ok_or("unknown TX queue")?;
         sources.invoke(|| queue.send_assisted(&mut self.mmio, frame, header_len, rate, assist))?;
+        self.count_protected(frame);
         Ok(())
     }
 
@@ -1572,6 +1589,7 @@ impl Hardware {
             .ok_or("unknown TX queue")?;
         let ssn = sources
             .invoke(|| queue.send_assisted(&mut self.mmio, frame, header_len, rate, assist))?;
+        self.count_protected(frame);
         let deadline = narf_time::Deadline::after_ms(2000);
         loop {
             let activity = self.activity();

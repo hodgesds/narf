@@ -25,6 +25,13 @@ struct NativeKey {
     rsc: u64,
     api: u8,
     peer: [u8; 6],
+    /// Pairwise TX PN handed to firmware (`transmit_seq_cnt`). Zero for
+    /// fresh material; a safely reused PTK starts above its retired floor.
+    tx_pn: u64,
+    /// `Hardware::protected_transmits` when this key became device-visible.
+    tx_base: u64,
+    /// Per-TID host RX replay floors restored for a reused PTK.
+    restored: Option<[u64; 17]>,
 }
 
 struct KeyHistory {
@@ -33,8 +40,57 @@ struct KeyHistory {
     group: bool,
     id: u8,
     floors: [u64; 17],
+    /// Upper bound of every pairwise TX PN the firmware may have used with
+    /// this material: its install PN plus each protected MPDU published
+    /// while it was installed (retries reuse their PN).
+    tx_floor: u64,
     /// Only native key REMOVE followed by the exact RX marker sets this.
     retired: bool,
+}
+
+/// What a retired history entry permits for newly authenticated material
+/// with the same fingerprint. Replay floors only ever rise.
+///
+/// * GTK (RX-only): restorable after an initial four-way exchange from any
+///   peer and at any key index (cross-peer / cross-index restore). The
+///   floor is per key material, so the maximum committed TID floor
+///   carries over unchanged (Linux `sta.c` single install RSC).
+/// * PTK: reusable only from the same peer at index 0. Host RX replay
+///   floors are restored per TID instead of reset, and the firmware TX PN
+///   starts above every PN the old installation could have used, so no
+///   CCMP nonce repeats (Linux `iwl_mvm_send_sta_key` `transmit_seq_cnt`).
+/// * A live (unretired) entry or a role change is never reused.
+fn restore_retired(
+    previous: &KeyHistory,
+    key: &mut NativeKey,
+    first_keys: bool,
+) -> Result<(), &'static str> {
+    if !previous.retired || previous.group != key.group || !first_keys && key.group {
+        return Err("MVM retired key role/peer/epoch reuse");
+    }
+    let floor = *previous.floors.iter().max().unwrap();
+    if key.group {
+        key.rsc = key.rsc.max(floor);
+        if key.rsc >= 0xffff_ffff_ffff {
+            return Err("MVM retired GTK PN exhausted");
+        }
+        return Ok(());
+    }
+    if previous.peer != key.peer || previous.id != key.id {
+        return Err("MVM retired PTK cross-peer reuse");
+    }
+    let tx = previous
+        .tx_floor
+        .checked_add(1)
+        .filter(|pn| *pn < 0xffff_ffff_ffff)
+        .ok_or("MVM retired PTK TX PN exhausted")?;
+    if floor >= 0xffff_ffff_ffff {
+        return Err("MVM retired PTK RX PN exhausted");
+    }
+    key.tx_pn = tx;
+    key.rsc = floor;
+    key.restored = Some(previous.floors);
+    Ok(())
 }
 
 struct Pending {
@@ -117,8 +173,12 @@ fn key_command(key: &NativeKey, remove: bool) -> Zeroizing<[u8; 76]> {
         bytes[36..38].copy_from_slice(&pn[2..4]);
         let tail = if key.api == 2 { 40 } else { 38 };
         bytes[tail..tail + 4].copy_from_slice(&pn[4..]);
-        // Native TX PN starts0 only for authenticated new material. Firmware
-        // owns increments and IV/MIC insertion; retries never re-add this key.
+        // Native TX PN starts0 only for authenticated new material; a
+        // reused PTK continues above its retired floor. Firmware owns
+        // increments and IV/MIC insertion; retries never re-add this key.
+        if !key.group {
+            bytes[68..76].copy_from_slice(&key.tx_pn.to_le_bytes());
+        }
     }
     bytes
 }
@@ -498,6 +558,9 @@ impl Owner {
                 rsc: 0,
                 api,
                 peer,
+                tx_pn: 0,
+                tx_base: 0,
+                restored: None,
             });
         }
         keys.push(NativeKey {
@@ -508,6 +571,9 @@ impl Owner {
             rsc: change.group_rx_pn,
             api,
             peer,
+            tx_pn: 0,
+            tx_base: 0,
+            restored: None,
         });
         let mut install = Vec::new();
         for mut key in keys {
@@ -524,25 +590,11 @@ impl Owner {
                 .iter()
                 .find(|entry| entry.digest == digest);
             if let Some(previous) = previous {
-                // Only an initial authenticated four-way exchange may restore
-                // an RX-only GTK from this exact AP/key index. Never restore a
-                // PTK/TX counter, cross role/peer or a live/uncertain native key.
-                if !self.security.active.as_ref().unwrap().first_keys
-                    || !key.group
-                    || !previous.group
-                    || previous.peer != peer
-                    || previous.id != key.id
-                    || !previous.retired
-                {
-                    return Err("MVM retired key role/peer/epoch reuse");
-                }
-                // Linux sta.c chooses the maximum RX PN across all TIDs for
-                // the single native key-install RSC. This can conservatively
-                // drop a lagging TID; it cannot lower a retired replay floor.
-                key.rsc = key.rsc.max(*previous.floors.iter().max().unwrap());
-                if key.rsc == 0xffff_ffff_ffff {
-                    return Err("MVM retired GTK PN exhausted");
-                }
+                restore_retired(
+                    previous,
+                    &mut key,
+                    self.security.active.as_ref().unwrap().first_keys,
+                )?;
             }
             let fresh = install
                 .iter()
@@ -600,10 +652,20 @@ impl Owner {
         } else {
             data.replay.pairwise
         };
+        let used = if key.group {
+            0
+        } else {
+            key.tx_pn.saturating_add(
+                self.hardware
+                    .protected_transmits()
+                    .wrapping_sub(key.tx_base),
+            )
+        };
         let entry = &mut self.security.history[index];
         for (saved, current) in entry.floors.iter_mut().zip(floor) {
             *saved = (*saved).max(current);
         }
+        entry.tx_floor = entry.tx_floor.max(used);
         entry.retired = false;
         Ok(index)
     }
@@ -644,7 +706,7 @@ impl Owner {
             let index = usize::from(key.slot);
             let body = key_command(key, false);
             let digest = key_digest(key.material.as_ref());
-            let (peer, group, id, rsc) = (key.peer, key.group, key.id, key.rsc);
+            let (peer, group, id, rsc, tx_pn) = (key.peer, key.group, key.id, key.rsc, key.tx_pn);
             let old_history = if self.security.active.as_ref().unwrap().keys[index].is_some() {
                 Some(self.snapshot_key_history(index)?)
             } else {
@@ -668,7 +730,12 @@ impl Owner {
                 .iter_mut()
                 .find(|h| h.digest == digest)
             {
+                // A restored GTK may now live at another index or peer;
+                // retirement must find the entry under its current identity.
                 entry.retired = false;
+                entry.peer = peer;
+                entry.id = id;
+                entry.tx_floor = entry.tx_floor.max(tx_pn);
                 for pn in &mut entry.floors {
                     *pn = (*pn).max(rsc);
                 }
@@ -679,9 +746,11 @@ impl Owner {
                     group,
                     id,
                     floors: [rsc; 17],
+                    tx_floor: tx_pn,
                     retired: false,
                 });
             }
+            let tx_base = self.hardware.protected_transmits();
             let reply = self
                 .qualified_link_command(1, KEY, &body[..], policy)
                 .await?;
@@ -697,6 +766,7 @@ impl Owner {
                 .install[entry]
                 .take()
                 .unwrap();
+            let key = NativeKey { tx_base, ..key };
             self.security.active.as_mut().unwrap().keys[index] = Some(key);
             self.security
                 .active
@@ -728,6 +798,9 @@ impl Owner {
             if key.group {
                 data.replay.group[usize::from(key.id)].fill(key.rsc);
                 data.replay.group_valid[usize::from(key.id)] = true;
+            } else if let Some(floors) = key.restored {
+                data.replay.reset_pairwise();
+                data.replay.pairwise = floors;
             } else {
                 data.replay.reset_pairwise();
             }
