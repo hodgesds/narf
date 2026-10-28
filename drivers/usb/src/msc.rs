@@ -2343,7 +2343,12 @@ mod block_tests {
         let chunks: Vec<_> = block_chunks(u32::MAX as u64 - 1, 2, 4096, false)
             .unwrap()
             .collect();
-        if chunks != [(u32::MAX - 1, 1, 0..4096), (u32::MAX, 1, 4096..8192)] {
+        if chunks
+            != [
+                (u32::MAX as u64 - 1, 1, 0..4096),
+                (u32::MAX as u64, 1, 4096..8192),
+            ]
+        {
             return TestResult::Fail("4K logical blocks exceeded the DMA buffer");
         }
         if block_chunks(u32::MAX as u64, 2, 512, false).is_ok()
