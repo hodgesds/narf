@@ -210,6 +210,38 @@ pub const fn build_trans_ddi_func_ctl(ddi_index: u8, mode: u32, lanes: u8) -> u3
         | trans_ddi_port_width(lanes)
 }
 
+/// `TRANS_DDI_FUNC_CTL[0]` — HDMI scrambling enable (TGL PRM
+/// Vol. 2c, TRANS_DDI_FUNC_CTL: "Setting this bit enables
+/// scrambling over the HDMI link. Scrambling must be enabled
+/// when the HDMI link symbol rate is greater than 340 MHz...
+/// This must not be changed while the port is enabled.").
+pub const TRANS_DDI_HDMI_SCRAMBLING: u32 = 1 << 0;
+/// `TRANS_DDI_FUNC_CTL[4]` — high TMDS character rate (TGL PRM
+/// Vol. 2c: "It must be enabled when the HDMI link symbol rate
+/// is greater than 340 MHz. It must be disabled when the HDMI
+/// link symbol rate is less than or equal to 340 MHz.").
+pub const TRANS_DDI_HIGH_TMDS_CHAR_RATE: u32 = 1 << 4;
+
+/// Build the `TRANS_DDI_FUNC_CTL` value for an HDMI stream:
+/// HDMI mode select, 8 bpc, the fixed 4-lane port width HDMI
+/// always uses (PRM Vol. 2c: the port-width field "is ignored
+/// for HDMI and DVI which always use all 4 lanes"), plus the
+/// scrambling / high-character-rate bits for >340 Mcsc modes.
+pub const fn build_trans_ddi_func_ctl_hdmi(
+    ddi_index: u8,
+    scrambling: bool,
+    high_tmds_char_rate: bool,
+) -> u32 {
+    let mut v = build_trans_ddi_func_ctl(ddi_index, TRANS_DDI_MODE_HDMI, 4);
+    if scrambling {
+        v |= TRANS_DDI_HDMI_SCRAMBLING;
+    }
+    if high_tmds_char_rate {
+        v |= TRANS_DDI_HIGH_TMDS_CHAR_RATE;
+    }
+    v
+}
+
 // ── DP M/N registers (TGL PRM Vol. 12 §"Transcoder MN Values") ──
 //
 // One instance per transcoder, in the timing region:
