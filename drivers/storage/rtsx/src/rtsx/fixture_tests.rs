@@ -187,7 +187,14 @@ impl FixtureState {
             match ty {
                 WRITE_REG_CMD => {
                     self.reg_write(addr, mask, data);
-                    if addr == SD_TRANSFER && (data & SD_TRANSFER_START) != 0 {
+                    // `addr` is the entry's 14-bit wire address (the
+                    // command encoding masks with 0x3FFF, exactly as
+                    // Linux `rtsx_pci_add_cmd` does), so the trigger
+                    // comparison must use the masked register address
+                    // too — comparing against the unmasked SD_TRANSFER
+                    // constant (0xFDB3) can never match and the SD
+                    // engine would never run.
+                    if masked(addr) == masked(SD_TRANSFER) && (data & SD_TRANSFER_START) != 0 {
                         self.run_sd_transfer();
                     }
                 }
