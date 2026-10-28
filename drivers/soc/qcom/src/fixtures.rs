@@ -696,7 +696,18 @@ pub fn ipq6018_wifi_dt(compat: &str, wifi_irqs: &[u32]) -> Vec<u8> {
                         .u32s("qcom,smem-states", &[ph::SMP2P_OUT, 0, ph::SMP2P_OUT, 1])
                         .strs("qcom,smem-state-names", &["shutdown", "stop"])
                         .u32s("memory-region", &[ph::Q6_REGION])
-                        .u32s("phandle", &[ph::RPROC]),
+                        .u32s("phandle", &[ph::RPROC])
+                        .child(
+                            Node::new("glink-edge")
+                                .u32s("interrupts", &spi(321))
+                                .strs("label", &["rtr"])
+                                .u32s("qcom,remote-pid", &[1])
+                                .u32s("mboxes", &[ph::APCS, 8])
+                                .child(
+                                    Node::new("qrtr_requests")
+                                        .strs("qcom,glink-channels", &["IPCRTR"]),
+                                ),
+                        ),
                 )
                 .child(
                     Node::new("wifi@c000000")
@@ -852,7 +863,14 @@ pub fn sc7280_wifi_dt() -> Vec<u8> {
                         .u32s("memory-region", &[ph::WPSS_MEM])
                         .u32s("qcom,smem-states", &[ph::SMP2P_OUT, 0])
                         .strs("qcom,smem-state-names", &["stop"])
-                        .u32s("phandle", &[ph::RPROC]),
+                        .u32s("phandle", &[ph::RPROC])
+                        .child(
+                            Node::new("glink-edge")
+                                .u32s("interrupts-extended", &[ph::IPCC, 24, 0, 1])
+                                .u32s("mboxes", &[ph::IPCC, 24, 0])
+                                .strs("label", &["wpss"])
+                                .u32s("qcom,remote-pid", &[13]),
+                        ),
                 )
                 .child(
                     Node::new("wifi@17a10040")

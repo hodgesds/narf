@@ -816,6 +816,11 @@ pub enum AhbError {
     MissingIrq(&'static str),
     /// `qcom,rproc` absent (`-ENOENT`).
     NoRproc,
+    /// The remoteproc's loader does not match the chip (IPQ: WCSS;
+    /// WCN6750: PAS).
+    LoaderMismatch,
+    /// A bring-up action failed with this errno.
+    Failed(i32),
 }
 
 impl From<DtError> for AhbError {

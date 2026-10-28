@@ -1905,6 +1905,26 @@ bits (`ath11k_ahb_ce_irqs_{enable,disable}`; kept under crash flush).
 Lines bind through `narf_drivers_qcom_soc::irq::GicSpi`, so the GIC
 backend underneath can change (the IPQ SoCs are GICv2).
 
+DT bring-up (`ahb_probe.rs`):
+
+```rust
+pub struct AhbPlatform { res: AhbResources, remote: AhbRemote, q6_irqs: Q6Irqs, glink: GlinkEdgeDt, lines: Vec<AhbLine> }
+impl AhbPlatform { fn probe(blob, &PlatformDevice) -> Result<Self, AhbError>; fn smp2p_edges(&self) -> Vec<String>; }
+pub enum BringUpStep { HalCeAlloc, QmiInit, RprocIrqs, RprocBoot, GlinkStart, ConfigIrq, QmiReady }
+pub trait AhbBringUp { hal_ce_alloc, qmi_init_service, rproc_irqs, async rproc_boot, async glink_start,
+                       config_irq, async qmi_ready, async rproc_shutdown }
+pub async fn bring_up<B: AhbBringUp>(&AhbPlatform, &mut B) -> Result<(), (BringUpStep, AhbError)>;
+pub enum AhbError { .., LoaderMismatch, Failed(errno) }
+```
+
+`bring_up` runs Linux's order (`ath11k_ahb_probe`: HAL/CE alloc →
+`ath11k_core_init`: QMI service, `hif_power_up` = `rproc_boot` with the
+remoteproc's Q6 lines / SMP2P edges bound first and the glink subdev
+started after → `ath11k_ahb_config_irq` → QMI server arrival / firmware
+ready) and shuts the remoteproc down on a failure after it booted. The
+production `AhbBringUp` (MMIO mapping, `Q6Wcss` / `PasRproc` boot,
+`GlinkSmem` + `GlinkQrtr`, the WLFW task) is not written yet.
+
 `HwRev`-keyed admission: `CoreConfig::for_hw` covers all four AHB parts
 (`num_rxdma_per_pdev = 1`; IPQ `single_pdev_only = false`, `num_vdevs =
 16 + 1`; WCN6750 single-pdev, three vdevs), `wlfw_hw_params(HwRev)`

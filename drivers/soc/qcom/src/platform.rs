@@ -186,6 +186,23 @@ pub fn smp2p_edge(blob: &[u8], path: &str) -> Result<Smp2pDt, DtError> {
         .first()
         .cloned()
         .ok_or(DtError::MissingResource("interrupts"))?;
+    let kick = mbox_kick(blob, &node)?;
+    Ok(Smp2pDt {
+        path: node.path.clone(),
+        cfg: Smp2pConfig {
+            smem_in: smem[0],
+            smem_out: smem[1],
+            local_pid: local as u16,
+            remote_pid: remote as u16,
+        },
+        kick,
+        irq,
+    })
+}
+
+/// The first `mboxes` entry of `node` as an outgoing kick (APCS global
+/// IPC or IPCC).
+fn mbox_kick(blob: &[u8], node: &PlatformDevice) -> Result<KickDt, DtError> {
     let mbox = node
         .phandle_args(blob, "mboxes", "#mbox-cells")?
         .into_iter()
@@ -216,18 +233,58 @@ pub fn smp2p_edge(blob: &[u8], path: &str) -> Result<Smp2pDt, DtError> {
             _ => return Err(DtError::Malformed("apcs mboxes")),
         }
     } else {
-        return Err(DtError::Malformed("unsupported smp2p mailbox"));
+        return Err(DtError::Malformed("unsupported mailbox"));
     };
-    Ok(Smp2pDt {
+    Ok(kick)
+}
+
+/// A remoteproc's `glink-edge` subnode (`qcom_add_glink_subdev`,
+/// `qcom,glink-edge.yaml`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GlinkEdgeDt {
+    pub path: String,
+    /// `label` (`rtr`, `wpss`, ...).
+    pub label: String,
+    /// `qcom,remote-pid` (the SMEM host of the FIFO items).
+    pub remote_pid: u16,
+    /// The edge's incoming interrupt (GIC SPI or IPCC signal).
+    pub irq: IrqSpec,
+    /// `mboxes`: the outgoing kick.
+    pub kick: KickDt,
+    /// Every child's `qcom,glink-channels` (e.g. `IPCRTR`).
+    pub channels: Vec<String>,
+}
+
+/// The `glink-edge` child of the remoteproc at `rproc_path`.
+pub fn glink_edge(blob: &[u8], rproc_path: &str) -> Result<GlinkEdgeDt, DtError> {
+    let node = dt::children(blob, rproc_path)
+        .into_iter()
+        .find(|n| n.path.rsplit('/').next() == Some("glink-edge"))
+        .ok_or(DtError::NotFound)?;
+    let remote_pid = node
+        .prop_u32("qcom,remote-pid")
+        .ok_or(DtError::MissingResource("qcom,remote-pid"))?;
+    let irq = node
+        .irqs
+        .first()
+        .cloned()
+        .ok_or(DtError::MissingResource("interrupts"))?;
+    let kick = mbox_kick(blob, &node)?;
+    let channels = dt::children(blob, &node.path)
+        .iter()
+        .flat_map(|c| c.prop_strings("qcom,glink-channels"))
+        .collect();
+    Ok(GlinkEdgeDt {
         path: node.path.clone(),
-        cfg: Smp2pConfig {
-            smem_in: smem[0],
-            smem_out: smem[1],
-            local_pid: local as u16,
-            remote_pid: remote as u16,
-        },
-        kick,
+        label: node
+            .prop_strings("label")
+            .into_iter()
+            .next()
+            .unwrap_or_default(),
+        remote_pid: remote_pid as u16,
         irq,
+        kick,
+        channels,
     })
 }
 

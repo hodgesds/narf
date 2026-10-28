@@ -124,6 +124,11 @@ pub struct PasRproc;  impl PasRproc { new(pas_id), start(scm, alloc, fw, mdt, sr
 pub enum RprocState { Offline, Running, Crashed }
 pub enum RprocError { .. }
 ```
+`platform::glink_edge(blob, rproc_path) -> Result<GlinkEdgeDt, DtError>`
+resolves a remoteproc's `glink-edge` child: `GlinkEdgeDt { path, label,
+remote_pid, irq: IrqSpec, kick: KickDt, channels }` (the same `mboxes`
+decoding as SMP2P edges: APCS global IPC or IPCC).
+
 ### 3.8 GLINK (`glink`)
 ```rust
 pub trait GlinkPipe { rx_avail, rx_peek(buf, offset), rx_advance(n), tx_avail, tx_len,

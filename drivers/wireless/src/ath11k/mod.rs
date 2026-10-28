@@ -46,6 +46,7 @@ extern crate alloc;
 
 pub mod ahb;
 pub mod ahb_hif;
+pub mod ahb_probe;
 pub mod autoconnect;
 pub mod board;
 pub mod ce;
