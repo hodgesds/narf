@@ -63,6 +63,11 @@
 //!   suspend/resume section below: an async system-PM hook whose
 //!   resume rebuilds every bound port's open plan from its
 //!   retained [`LineSettings`].
+//! - The termios / modem ioctl surface (#756) lives in
+//!   [`super::devfs_bridge`] and actuates through this module's
+//!   [`set_line_settings`], [`set_modem_lines`] and
+//!   [`set_break_state`]; suspend/resume line-state replay is
+//!   #763.
 
 extern crate alloc;
 
@@ -409,6 +414,100 @@ pub fn decode_modem_byte(family: ChipFamily, byte: u8) -> ModemStatus {
     }
 }
 
+/// The single control transfer that drives the DTR/RTS output
+/// lines for a family — exactly the modem transfer embedded in
+/// [`configure_plan`], factored out so a modem-only change
+/// (TIOCMSET & friends, #756) does not reprogram baud and line
+/// format along with it. Encodings are the family codecs' own:
+/// FTDI `MODEM_CTRL` mask/value word, CP210x AN571 `SET_MHS`,
+/// PL2303 CDC `SET_CONTROL_LINE_STATE` (wValue bit 0 = DTR,
+/// bit 1 = RTS), CH341 `MODEM_CTRL` register write.
+pub fn modem_plan(family: ChipFamily, iface: u8, dtr: bool, rts: bool) -> Vec<ControlXfer> {
+    match family {
+        ChipFamily::Ftdi => alloc::vec![ControlXfer::new(
+            ftdi::RT_HOST_TO_DEV,
+            ftdi::REQ_MODEM_CTRL,
+            ftdi::encode_modem_ctrl(dtr, rts),
+            0,
+        )],
+        ChipFamily::Cp210x => alloc::vec![ControlXfer::new(
+            cp210x::REQTYPE_HOST_TO_INTERFACE,
+            cp210x::SET_MHS,
+            cp210x::encode_modem_ctrl(dtr, rts),
+            iface as u16,
+        )],
+        ChipFamily::Pl2303 => {
+            let mut lines: u16 = 0;
+            if dtr {
+                lines |= 0x0001;
+            }
+            if rts {
+                lines |= 0x0002;
+            }
+            alloc::vec![ControlXfer::new(0x21, 0x22, lines, iface as u16)]
+        }
+        ChipFamily::Ch341 => alloc::vec![ControlXfer::new(
+            ch341::RT_HOST_TO_DEV_VENDOR,
+            ch341::REQ_MODEM_CTRL,
+            ch341::encode_modem_ctrl(dtr, rts),
+            0,
+        )],
+    }
+}
+
+/// The control transfers that raise (`on = true`) or clear a
+/// break condition, given the line format currently programmed
+/// (`settings` — FTDI's break rides the SET_DATA word, so the
+/// current format word is rewritten with the break bit set or
+/// clear, the Linux `ftdi_break_ctl` form).
+///
+/// Grounded families: FTDI (AN232B / `ftdi_sio.h`
+/// `FTDI_SIO_SET_BREAK`, bit 14 of the SET_DATA wValue) and
+/// CP210x (AN571 §5.20 `SET_BREAK`). PL2303 break (believed to
+/// be the CDC PSTN `SEND_BREAK` request) and CH341 break (a
+/// `REG_BREAK` read-modify-write whose bit layout the in-tree
+/// codec does not model, and which needs a control-IN stage the
+/// plan executor does not issue) are refused with a typed
+/// [`PortError::Unsupported`] rather than guessed at.
+pub fn break_plan(
+    family: ChipFamily,
+    iface: u8,
+    settings: &LineSettings,
+    on: bool,
+) -> Result<Vec<ControlXfer>, PortError> {
+    match family {
+        ChipFamily::Ftdi => {
+            let mut word =
+                ftdi::encode_data_format(settings.data_bits, settings.parity, settings.stop_bits);
+            if on {
+                word |= ftdi::DATA_BREAK;
+            }
+            Ok(alloc::vec![ControlXfer::new(
+                ftdi::RT_HOST_TO_DEV,
+                ftdi::REQ_SET_DATA,
+                word,
+                0,
+            )])
+        }
+        ChipFamily::Cp210x => Ok(alloc::vec![ControlXfer::new(
+            cp210x::REQTYPE_HOST_TO_INTERFACE,
+            cp210x::SET_BREAK,
+            if on {
+                cp210x::BREAK_ON
+            } else {
+                cp210x::BREAK_OFF
+            },
+            iface as u16,
+        )]),
+        ChipFamily::Pl2303 => Err(PortError::Unsupported(
+            "pl2303 send-break (CDC SEND_BREAK not modelled)",
+        )),
+        ChipFamily::Ch341 => Err(PortError::Unsupported(
+            "ch341 break (REG_BREAK read-modify-write not modelled)",
+        )),
+    }
+}
+
 /// Split one received bulk-IN packet into its payload range,
 /// updating `modem` from any status prefix the family carries.
 /// FTDI prefixes every packet with 2 status bytes (AN232B); the
@@ -744,11 +843,85 @@ pub async fn set_line_settings(
     };
     let plan = configure_plan(family, pid, iface, &settings)?;
     apply_plan(xhci_dev, slot_id, &plan).await?;
-    let mut g = SERIAL_PORTS.lock();
-    if let Some(p) = g.iter_mut().find(|p| p.slot_id == slot_id) {
-        p.settings = settings;
+    let tty_index = {
+        let mut g = SERIAL_PORTS.lock();
+        let mut found = None;
+        if let Some(p) = g.iter_mut().find(|p| p.slot_id == slot_id) {
+            p.settings = settings;
+            found = Some(p.tty_index);
+        }
+        found
+    };
+    // Keep the devfs node's cached view in step (TCGETS /
+    // TIOCMGET read it) — see devfs_bridge::note_settings.
+    if let Some(idx) = tty_index {
+        devfs_bridge::note_settings(idx, settings);
     }
     Ok(())
+}
+
+/// Snapshot of the binding published as `ttyUSB<tty_index>`:
+/// `(slot_id, settings, modem)`, or `None` when no device is
+/// bound to that node. The devfs ioctl surface (#756) keys its
+/// actuation off this lookup.
+pub fn binding_for_tty(tty_index: usize) -> Option<(u8, LineSettings, ModemStatus)> {
+    let g = SERIAL_PORTS.lock();
+    g.iter()
+        .find(|p| p.tty_index == tty_index)
+        .map(|p| (p.slot_id, p.settings, p.modem))
+}
+
+/// Drive only the DTR/RTS output lines of a bound port (the
+/// actuation behind TIOCMSET / TIOCMBIS / TIOCMBIC, #756). The
+/// cached settings' `dtr` / `rts` fields update only after the
+/// transfer succeeds, mirroring [`set_line_settings`].
+pub async fn set_modem_lines(
+    xhci_dev: &Xhci,
+    slot_id: u8,
+    dtr: bool,
+    rts: bool,
+) -> Result<(), PortError> {
+    let (family, iface, tty_index) = {
+        let g = SERIAL_PORTS.lock();
+        let p = g
+            .iter()
+            .find(|p| p.slot_id == slot_id)
+            .ok_or(PortError::UnknownDevice)?;
+        (p.family, p.iface, p.tty_index)
+    };
+    let plan = modem_plan(family, iface, dtr, rts);
+    apply_plan(xhci_dev, slot_id, &plan).await?;
+    let settings = {
+        let mut g = SERIAL_PORTS.lock();
+        let mut found = None;
+        if let Some(p) = g.iter_mut().find(|p| p.slot_id == slot_id) {
+            p.settings.dtr = dtr;
+            p.settings.rts = rts;
+            found = Some(p.settings);
+        }
+        found
+    };
+    if let Some(s) = settings {
+        devfs_bridge::note_settings(tty_index, s);
+    }
+    Ok(())
+}
+
+/// Raise or clear the break condition on a bound port (the
+/// actuation behind TCSBRK / TIOCSBRK / TIOCCBRK, #756).
+/// Families whose break encoding is not grounded return
+/// [`PortError::Unsupported`] from [`break_plan`].
+pub async fn set_break_state(xhci_dev: &Xhci, slot_id: u8, on: bool) -> Result<(), PortError> {
+    let (family, iface, settings) = {
+        let g = SERIAL_PORTS.lock();
+        let p = g
+            .iter()
+            .find(|p| p.slot_id == slot_id)
+            .ok_or(PortError::UnknownDevice)?;
+        (p.family, p.iface, p.settings)
+    };
+    let plan = break_plan(family, iface, &settings, on)?;
+    apply_plan(xhci_dev, slot_id, &plan).await
 }
 
 /// Poll a bound port's modem status over the control pipe
@@ -771,9 +944,17 @@ pub async fn refresh_modem_status(xhci_dev: &Xhci, slot_id: u8) -> Option<ModemS
         return None;
     }
     let status = decode_modem_byte(family, buf[0]);
-    let mut g = SERIAL_PORTS.lock();
-    if let Some(p) = g.iter_mut().find(|p| p.slot_id == slot_id) {
-        p.modem = status;
+    let tty_index = {
+        let mut g = SERIAL_PORTS.lock();
+        let mut found = None;
+        if let Some(p) = g.iter_mut().find(|p| p.slot_id == slot_id) {
+            p.modem = status;
+            found = Some(p.tty_index);
+        }
+        found
+    };
+    if let Some(idx) = tty_index {
+        devfs_bridge::note_modem(idx, status);
     }
     Some(status)
 }
@@ -1009,9 +1190,19 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
                 moved += tty.lock().rx.push(&buf[lo..hi]);
             }
         }
+        // Mirror the freshest modem snapshot into the devfs node
+        // (FTDI status arrives in-band with RX packets; TIOCMGET
+        // reads the node's copy).
+        tty.lock().modem = port.modem;
         // ── TX ──
+        // TCXONC's TCOOFF parks output: leave the ring untouched
+        // until TCOON resumes it.
         let mut chunk = [0u8; 64];
-        let pending = tty.lock().tx.peek(&mut chunk);
+        let pending = if tty.lock().tx_stopped {
+            0
+        } else {
+            tty.lock().tx.peek(&mut chunk)
+        };
         if pending > 0 {
             if let Some(generation) = xhci_dev.device_generation(port.slot_id) {
                 if let Ok(token) = xhci_dev.begin_bulk_out(
@@ -1750,5 +1941,147 @@ pub mod tests {
     kernel_test_in!(
         "drivers/usb/serial/port",
         smoke_serial_hub_ports_filter_and_pm_latch
+    );
+
+    // ── Modem / break plans (#756 actuation) ─────────────────
+
+    fn smoke_modem_plan_matches_configure_plan() -> TestResult {
+        // The modem-only plan must be exactly the modem transfer
+        // embedded in each family's full configure plan — two
+        // independent derivations of the same wire bytes, compared.
+        // FTDI: MODEM_CTRL is transfer index 2 of configure_plan.
+        let full = match configure_plan(ChipFamily::Ftdi, 0x6001, 0, &LineSettings::default()) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("FTDI configure plan should build"),
+        };
+        let only = modem_plan(ChipFamily::Ftdi, 0, true, false);
+        if only.len() != 1 || only[0] != full[2] {
+            return TestResult::Fail("FTDI modem plan must equal configure plan's MODEM_CTRL");
+        }
+        if only[0].w_value != ftdi::encode_modem_ctrl(true, false) {
+            return TestResult::Fail("FTDI modem plan wValue must be DTR-high/RTS-low encoding");
+        }
+        // CP210x: SET_MHS is transfer index 2, indexed by iface.
+        let s = LineSettings {
+            dtr: false,
+            rts: true,
+            ..LineSettings::default()
+        };
+        let full = match configure_plan(ChipFamily::Cp210x, 0xEA60, 3, &s) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("CP210x configure plan should build"),
+        };
+        let only = modem_plan(ChipFamily::Cp210x, 3, false, true);
+        if only.len() != 1 || only[0] != full[2] || only[0].w_index != 3 {
+            return TestResult::Fail("CP210x modem plan must equal configure plan's SET_MHS");
+        }
+        // PL2303: SET_CONTROL_LINE_STATE is transfer index 1;
+        // DTR bit 0 / RTS bit 1 of wValue.
+        let full = match configure_plan(ChipFamily::Pl2303, 0x2303, 0, &LineSettings::default()) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("PL2303 configure plan should build"),
+        };
+        let only = modem_plan(ChipFamily::Pl2303, 0, true, true);
+        if only.len() != 1 || only[0] != full[1] || only[0].w_value != 0x0003 {
+            return TestResult::Fail("PL2303 modem plan must equal configure plan's line-state");
+        }
+        // CH341: MODEM_CTRL is the last configure transfer.
+        let full = match configure_plan(ChipFamily::Ch341, 0x7523, 0, &LineSettings::default()) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("CH341 configure plan should build"),
+        };
+        let only = modem_plan(ChipFamily::Ch341, 0, true, true);
+        if only.len() != 1 || only[0] != full[full.len() - 1] {
+            return TestResult::Fail("CH341 modem plan must equal configure plan's MODEM_CTRL");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/serial/port",
+        smoke_modem_plan_matches_configure_plan
+    );
+
+    fn smoke_break_plan_ftdi_and_cp210x_pinned() -> TestResult {
+        // FTDI break ON: the current SET_DATA word (8N1 = 0x0008)
+        // with the SET_BREAK bit (bit 14) set → 0x4008. OFF
+        // rewrites the plain word.
+        let plan = match break_plan(ChipFamily::Ftdi, 0, &LineSettings::default(), true) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("FTDI break plan should build"),
+        };
+        if plan.len() != 1
+            || plan[0].bm_request_type != 0x40
+            || plan[0].b_request != ftdi::REQ_SET_DATA
+            || plan[0].w_value != 0x4008
+        {
+            return TestResult::Fail("FTDI break-on must be SET_DATA 0x4008");
+        }
+        let plan = match break_plan(ChipFamily::Ftdi, 0, &LineSettings::default(), false) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("FTDI break-off plan should build"),
+        };
+        if plan[0].w_value != 0x0008 {
+            return TestResult::Fail("FTDI break-off must rewrite the plain SET_DATA word");
+        }
+        // The break bit ORs into the CURRENT format word: 7E2
+        // (0x1207) with break → 0x5207.
+        let s = LineSettings {
+            data_bits: DataBits::Seven,
+            parity: Parity::Even,
+            stop_bits: StopBits::Two,
+            ..LineSettings::default()
+        };
+        let plan = match break_plan(ChipFamily::Ftdi, 0, &s, true) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("FTDI 7E2 break plan should build"),
+        };
+        if plan[0].w_value != 0x5207 {
+            return TestResult::Fail("FTDI break must preserve the current line format word");
+        }
+        // CP210x: AN571 SET_BREAK (0x05) on 0x41, wValue 0x0001 /
+        // 0x0000, wIndex = interface.
+        let plan = match break_plan(ChipFamily::Cp210x, 2, &LineSettings::default(), true) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("CP210x break plan should build"),
+        };
+        if plan.len() != 1
+            || plan[0].bm_request_type != 0x41
+            || plan[0].b_request != cp210x::SET_BREAK
+            || plan[0].w_value != 0x0001
+            || plan[0].w_index != 2
+        {
+            return TestResult::Fail("CP210x break-on must be SET_BREAK wValue 1 on the interface");
+        }
+        let plan = match break_plan(ChipFamily::Cp210x, 2, &LineSettings::default(), false) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("CP210x break-off plan should build"),
+        };
+        if plan[0].w_value != 0x0000 {
+            return TestResult::Fail("CP210x break-off must be SET_BREAK wValue 0");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/serial/port",
+        smoke_break_plan_ftdi_and_cp210x_pinned
+    );
+
+    fn smoke_break_plan_unmodelled_families_refuse() -> TestResult {
+        // PL2303 / CH341 break encodings are not grounded in the
+        // vendor documents the codecs cite, so they refuse with a
+        // typed error instead of emitting a guessed transfer.
+        match break_plan(ChipFamily::Pl2303, 0, &LineSettings::default(), true) {
+            Err(PortError::Unsupported(_)) => {}
+            _ => return TestResult::Fail("PL2303 break must be a typed refusal"),
+        }
+        match break_plan(ChipFamily::Ch341, 0, &LineSettings::default(), true) {
+            Err(PortError::Unsupported(_)) => {}
+            _ => return TestResult::Fail("CH341 break must be a typed refusal"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/serial/port",
+        smoke_break_plan_unmodelled_families_refuse
     );
 }

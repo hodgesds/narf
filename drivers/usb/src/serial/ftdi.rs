@@ -112,6 +112,12 @@ pub const DATA_STOP_BITS_1: u16 = 0x0 << 11;
 pub const DATA_STOP_BITS_15: u16 = 0x1 << 11;
 /// Stop bits: 2 (bits 12:11 = 0b10).
 pub const DATA_STOP_BITS_2: u16 = 0x2 << 11;
+/// Break condition (bit 14 of the SET_DATA wValue): 1 = TX held in
+/// the break (spacing) state, 0 = normal transmission. Linux
+/// `ftdi_sio.h`: `FTDI_SIO_SET_BREAK (0x1 << 14)`; `ftdi_break_ctl`
+/// raises a break by OR-ing this bit into the last programmed
+/// SET_DATA word and clears it by rewriting the plain word.
+pub const DATA_BREAK: u16 = 0x1 << 14;
 
 // ── Flow-control bits (REQ_SET_FLOW_CTRL wIndex high byte) ────────
 
