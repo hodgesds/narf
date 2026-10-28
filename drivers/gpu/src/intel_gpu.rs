@@ -1081,6 +1081,23 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         };
         panel_mode = mode_opt;
 
+        // The internal display owns Pipe A from here on
+        // (#1017): external sessions arbitrate the remaining
+        // pipes through `intel_gpu_multipipe` instead of
+        // silently sharing this one. Claimed only when a
+        // firmware pipeline was actually taken over — with no
+        // internal display live, Pipe A stays free for the
+        // first external session, as before multi-pipe support.
+        if mode_opt.is_some() {
+            let _ = crate::intel_gpu_multipipe::claim_pipe(
+                crate::intel_gpu_pipes::Pipe::A,
+                crate::intel_gpu_multipipe::PipeOwner {
+                    ddi: crate::intel_gpu_ddi::Ddi::A,
+                    used_for: crate::intel_gpu_multipipe::PipeUse::InternalPanel,
+                },
+            );
+        }
+
         let width = mode_opt.as_ref().map(|m| m.h_active as u32).unwrap_or(1024);
         let height = mode_opt.as_ref().map(|m| m.v_active as u32).unwrap_or(768);
         let stride_bytes = padded_stride_bytes(width);
@@ -1463,8 +1480,11 @@ pub fn with_controller<R>(f: impl FnOnce(&IntelGpu) -> R) -> Option<R> {
 // free path, so a session allocation is retained and reused
 // across reconnects while it fits), and scanout publication
 // through the same ACTIVE + observer protocol as the takeover
-// path. The single-pipe orchestrator means an external session
-// owns Pipe A while it is live; the last HPD event wins.
+// path. Since #1017 a session claims its pipe from
+// `intel_gpu_multipipe` and allocates in that pipe's GGTT
+// window, so an internal panel and external sessions scan out
+// concurrently; the fb-console publication slot is still
+// single, so the last HPD event wins it.
 
 /// `MmioWindow` over the controller's BAR0 mapping (same
 /// adapter shape as the DP Alt-Mode bridge).
@@ -1530,6 +1550,37 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
     use crate::intel_gpu_dp::HpdEvent;
     match event {
         HpdEvent::Connected(ddi) => {
+            // An MST branch device (hub / dock / daisy-chain
+            // monitor) gets the MST session (#1017): if the
+            // device advertises MST and a stream comes up, the
+            // SST path never runs for this connector. Anything
+            // else — an SST sink, or an MST attempt that found
+            // no usable sink — falls through to the SST connect.
+            if mst_session_ddi() == Some(ddi) {
+                // MST session already live on this connector; a
+                // repeat connect event changes nothing.
+                return;
+            }
+            if mst_connect(ddi) {
+                let stored = {
+                    let session = MST_SESSION.lock();
+                    session.as_ref().and_then(|s| {
+                        s.streams
+                            .first()
+                            .map(|g| (g.alloc, g.fb, g.mode.h_active, g.mode.v_active))
+                    })
+                };
+                if let Some((alloc, fb, width, height)) = stored {
+                    publish_scanout(Some(narf_graphics_driver::generic::GenericFb::new(
+                        alloc.phys_base,
+                        width as u32,
+                        height as u32,
+                        fb.stride_bytes,
+                        32,
+                    )));
+                }
+                return;
+            }
             if let Some(conn) = dp_connect(ddi) {
                 // Publish from the stored session state (the
                 // retained allocation + framebuffer the session
@@ -1567,12 +1618,21 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
             }
         }
         HpdEvent::Disconnected(ddi) => {
+            if mst_session_ddi() == Some(ddi) {
+                mst_disconnect(ddi);
+                publish_scanout(None);
+                return;
+            }
             let session = DP_SESSION.lock().take();
             if let Some(state) = session {
                 if state.conn.ddi == ddi {
                     with_controller(|gpu| {
                         let window = DpBarWindow(&gpu.gtt_mmadr);
                         crate::intel_gpu_dp::disconnect(&window, &state.conn);
+                        // Hand the pipe back and re-split the
+                        // DBUF pool across the survivors.
+                        crate::intel_gpu_multipipe::release_pipe(state.conn.pipe, ddi);
+                        crate::intel_gpu_multipipe::reprogram_active_dbuf_shares(&window);
                     });
                     publish_scanout(None);
                     return;
@@ -1593,6 +1653,14 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
             }
         }
         HpdEvent::RetrainRequired(ddi) => {
+            if mst_session_ddi() == Some(ddi) {
+                // MST links don't revalidate per-lane status the
+                // SST way; branch notifications are the change
+                // channel. Drain them (they're also how a sink
+                // disappearing mid-session first surfaces).
+                mst_poll_notifications(ddi);
+                return;
+            }
             // Snapshot under the session lock, retrain against
             // the controller, then store back — never hold
             // DP_SESSION across `with_controller` (the connect
@@ -1607,7 +1675,14 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
             if let Some((conn, fb)) = current {
                 let updated = with_controller(|gpu| {
                     let window = DpBarWindow(&gpu.gtt_mmadr);
-                    crate::intel_gpu_dp::retrain(&window, &conn, &fb).ok()
+                    let out = crate::intel_gpu_dp::retrain(&window, &conn, &fb).ok();
+                    if out.is_some() {
+                        // The retrained modeset wrote the
+                        // single-pipe watermark shape; restore
+                        // the multi-pipe DBUF split.
+                        crate::intel_gpu_multipipe::reprogram_active_dbuf_shares(&window);
+                    }
+                    out
                 });
                 if let Some(Some(new_conn)) = updated {
                     let mut session = DP_SESSION.lock();
@@ -1623,9 +1698,11 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
 }
 
 /// Run one external-DP connect against the probed controller:
-/// probe the sink over AUX, allocate its scanout, activate.
-/// On success the session state is stored for disconnect /
-/// retrain handling.
+/// probe the sink over AUX, claim a pipe, allocate its scanout
+/// in the pipe's GGTT window, activate on that pipe. On
+/// success the session state is stored for disconnect /
+/// retrain handling. The claim is re-entrant per DDI, so a
+/// repeat connect event for a live session reuses its pipe.
 fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpConnection> {
     with_controller(|gpu| {
         if !gpu.chip.generation.display_supported() {
@@ -1633,12 +1710,37 @@ fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpC
         }
         let window = DpBarWindow(&gpu.gtt_mmadr);
         let probe = crate::intel_gpu_dp::probe_sink(&window, ddi).ok()?;
+        let pipe =
+            crate::intel_gpu_multipipe::claim_pipe_for(crate::intel_gpu_multipipe::PipeOwner {
+                ddi,
+                used_for: crate::intel_gpu_multipipe::PipeUse::ExternalSst,
+            })?;
+        // When this claim lights a second (or third) pipe, the
+        // session modesets with its DBUF share and the pipes
+        // already live are reprogrammed to theirs afterwards.
+        let share = {
+            let active = crate::intel_gpu_multipipe::active_pipes();
+            if active.len() >= 2 {
+                crate::intel_gpu_multipipe::share_for(&active, pipe)
+            } else {
+                None
+            }
+        };
         let width = probe.mode.h_active as u32;
         let height = probe.mode.v_active as u32;
         let stride_bytes = padded_stride_bytes(width);
         let size_bytes = scanout_size_bytes(width, height);
-        let alloc =
-            crate::intel_gpu_gtt::alloc_contiguous_scanout(&gpu.gtt_mmadr, size_bytes).ok()?;
+        let alloc = match crate::intel_gpu_gtt::alloc_contiguous_scanout_at(
+            &gpu.gtt_mmadr,
+            crate::intel_gpu_multipipe::scanout_gtt_offset(pipe),
+            size_bytes,
+        ) {
+            Ok(alloc) => alloc,
+            Err(_) => {
+                crate::intel_gpu_multipipe::release_pipe(pipe, ddi);
+                return None;
+            }
+        };
         let alloc = ScanoutAllocation {
             gtt_offset: alloc.gtt_offset,
             phys_base: alloc.phys_base(),
@@ -1650,7 +1752,14 @@ fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpC
             stride_bytes,
             format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
         };
-        let conn = crate::intel_gpu_dp::activate(&window, &probe, &fb).ok()?;
+        let conn = match crate::intel_gpu_dp::activate_on_pipe(&window, &probe, &fb, pipe, share) {
+            Ok(conn) => conn,
+            Err(_) => {
+                crate::intel_gpu_multipipe::release_pipe(pipe, ddi);
+                return None;
+            }
+        };
+        crate::intel_gpu_multipipe::reprogram_active_dbuf_shares(&window);
         *DP_SESSION.lock() = Some(DpSessionState {
             conn: conn.clone(),
             fb,
@@ -1699,6 +1808,223 @@ fn hdmi_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_hdmi:
         Some(conn)
     })
     .flatten()
+}
+
+// ── DP MST session (lane Q11, #1017) ─────────────────────────
+//
+// The MST counterpart of the SST glue above: `intel_gpu_mst`
+// owns the session logic (topology, payload allocation,
+// per-stream modesets); this glue owns the controller-bound
+// parts — pipe claims, per-pipe scanout windows and
+// allocations, DBUF reprogramming as the active set changes,
+// and fb-console publication of the first stream (the
+// publication slot is single; see the SST section's note).
+
+/// Per-stream glue state: the retained allocation and
+/// framebuffer for one live MST stream.
+struct MstStreamGlue {
+    sink: crate::dp_mst_mgr::Sink,
+    mode: crate::intel_gpu_modeset::Mode,
+    fb: crate::intel_gpu_modeset::Framebuffer,
+    alloc: ScanoutAllocation,
+}
+
+/// Live MST session state for one DDI.
+struct MstSessionState {
+    link: crate::intel_gpu_mst::MstLink,
+    streams: alloc::vec::Vec<MstStreamGlue>,
+}
+
+static MST_SESSION: IrqSafeSpinLock<Option<MstSessionState>> = IrqSafeSpinLock::new(None);
+
+/// The DDI the live MST session sits on, if any.
+fn mst_session_ddi() -> Option<crate::intel_gpu_ddi::Ddi> {
+    MST_SESSION.lock().as_ref().map(|s| s.link.ddi())
+}
+
+/// Try to bring an MST session up on `ddi`. Returns `false`
+/// (leaving no trace — MST is stopped again, no pipe claimed)
+/// when the device doesn't advertise MST, the topology probe
+/// fails, or no sink stream could be lit; the caller then
+/// falls back to the SST connect.
+fn mst_connect(ddi: crate::intel_gpu_ddi::Ddi) -> bool {
+    use crate::dp_aux::AuxChannel as _;
+    let state = with_controller(|gpu| {
+        if !gpu.chip.generation.display_supported() {
+            return None;
+        }
+        let window = DpBarWindow(&gpu.gtt_mmadr);
+        // Capability gate: DP 1.2+ and MSTM_CAP set. Anything
+        // less is an SST device and not this path's business.
+        let mut aux = crate::intel_gpu_aux::IntelAux::new(&window, ddi);
+        let caps = crate::dp_link_training::read_caps(&mut aux).ok()?;
+        let mut raw_caps = [0u8; 16];
+        aux.dpcd_read(0, &mut raw_caps).ok()?;
+        let mut mstm_cap = [0u8; 1];
+        aux.dpcd_read(crate::dp_mst_mgr::MSTM_CAP, &mut mstm_cap)
+            .ok()?;
+        if caps.dpcd_rev < 0x12 || mstm_cap[0] & 1 == 0 {
+            return None;
+        }
+
+        let mut maux = crate::intel_gpu_mst::IntelMstAux::new(&window, ddi);
+        let mut link = crate::intel_gpu_mst::MstLink::new(ddi);
+        if link.connect(&mut maux, caps, &raw_caps).is_err() {
+            return None;
+        }
+        if link.probe_topology(&mut maux).is_err() {
+            link.disconnect(&mut maux);
+            return None;
+        }
+        let sinks = link.topology().map(|t| t.sinks()).unwrap_or_default();
+        let mut streams: alloc::vec::Vec<MstStreamGlue> = alloc::vec::Vec::new();
+        for sink in sinks {
+            let Some(pipe) =
+                crate::intel_gpu_multipipe::claim_any_pipe(crate::intel_gpu_multipipe::PipeOwner {
+                    ddi,
+                    used_for: crate::intel_gpu_multipipe::PipeUse::ExternalMst,
+                })
+            else {
+                break;
+            };
+            let mode = match link.sink_mode(&mut maux, sink) {
+                Ok(mode) => mode,
+                Err(_) => {
+                    crate::intel_gpu_multipipe::release_pipe(pipe, ddi);
+                    continue;
+                }
+            };
+            let width = mode.h_active as u32;
+            let height = mode.v_active as u32;
+            let stride_bytes = padded_stride_bytes(width);
+            let size_bytes = scanout_size_bytes(width, height);
+            let alloc = match crate::intel_gpu_gtt::alloc_contiguous_scanout_at(
+                &gpu.gtt_mmadr,
+                crate::intel_gpu_multipipe::scanout_gtt_offset(pipe),
+                size_bytes,
+            ) {
+                Ok(alloc) => ScanoutAllocation {
+                    gtt_offset: alloc.gtt_offset,
+                    phys_base: alloc.phys_base(),
+                    order: alloc.order,
+                    size_bytes: alloc.size_bytes,
+                },
+                Err(_) => {
+                    crate::intel_gpu_multipipe::release_pipe(pipe, ddi);
+                    continue;
+                }
+            };
+            let fb = crate::intel_gpu_modeset::Framebuffer {
+                phys_addr: alloc.gtt_offset as u64,
+                stride_bytes,
+                format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
+            };
+            let share = {
+                let active = crate::intel_gpu_multipipe::active_pipes();
+                if active.len() >= 2 {
+                    crate::intel_gpu_multipipe::share_for(&active, pipe)
+                } else {
+                    None
+                }
+            };
+            match link.add_stream(&window, &mut maux, sink, mode, pipe, &fb, share) {
+                Ok(_) => {
+                    streams.push(MstStreamGlue {
+                        sink,
+                        mode,
+                        fb,
+                        alloc,
+                    });
+                    crate::intel_gpu_multipipe::reprogram_active_dbuf_shares(&window);
+                }
+                Err(_) => {
+                    crate::intel_gpu_multipipe::release_pipe(pipe, ddi);
+                }
+            }
+        }
+        if streams.is_empty() {
+            // Nothing lit: not an MST session. Stop MST so the
+            // branch presents as an SST device to the fallback.
+            link.disconnect(&mut maux);
+            return None;
+        }
+        Some(MstSessionState { link, streams })
+    })
+    .flatten();
+    match state {
+        Some(state) => {
+            *MST_SESSION.lock() = Some(state);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Tear the MST session on `ddi` down: streams in reverse
+/// bring-up order (payloads deallocated, pipes torn down),
+/// MST off, pipes released.
+fn mst_disconnect(ddi: crate::intel_gpu_ddi::Ddi) {
+    let state = {
+        let mut session = MST_SESSION.lock();
+        match session.as_ref() {
+            Some(s) if s.link.ddi() == ddi => session.take(),
+            _ => None,
+        }
+    };
+    let Some(mut state) = state else { return };
+    let pipes: alloc::vec::Vec<crate::intel_gpu_pipes::Pipe> =
+        state.link.streams().iter().map(|s| s.pipe).collect();
+    let sinks: alloc::vec::Vec<crate::dp_mst_mgr::Sink> =
+        state.streams.iter().map(|g| g.sink).collect();
+    with_controller(|gpu| {
+        let window = DpBarWindow(&gpu.gtt_mmadr);
+        let mut maux = crate::intel_gpu_mst::IntelMstAux::new(&window, ddi);
+        for sink in sinks.iter().rev() {
+            let _ = state.link.remove_stream(&window, &mut maux, *sink);
+        }
+        state.link.disconnect(&mut maux);
+        for pipe in pipes {
+            crate::intel_gpu_multipipe::release_pipe(pipe, ddi);
+        }
+        crate::intel_gpu_multipipe::reprogram_active_dbuf_shares(&window);
+    });
+}
+
+/// Drain branch notifications for the MST session on `ddi`
+/// (the RetrainRequired route). Events are logged; acting on
+/// a vanished sink beyond the log is the session layer's next
+/// step, not this glue's.
+fn mst_poll_notifications(ddi: crate::intel_gpu_ddi::Ddi) {
+    use core::fmt::Write as _;
+    let state = {
+        let mut session = MST_SESSION.lock();
+        match session.as_ref() {
+            Some(s) if s.link.ddi() == ddi => session.take(),
+            _ => None,
+        }
+    };
+    let Some(mut state) = state else { return };
+    with_controller(|gpu| {
+        let window = DpBarWindow(&gpu.gtt_mmadr);
+        let mut maux = crate::intel_gpu_mst::IntelMstAux::new(&window, ddi);
+        if let Ok(events) = state.link.poll_notifications(&mut maux) {
+            for event in events {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "intel-gpu: MST event on DDI {:?}: {:?}",
+                    ddi,
+                    event,
+                );
+            }
+        }
+    });
+    // Restore the session (teardown races are the HPD
+    // sequencer's problem, exactly as in the SST retrain path:
+    // the store-back is unconditional).
+    let mut session = MST_SESSION.lock();
+    if session.is_none() {
+        *session = Some(state);
+    }
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

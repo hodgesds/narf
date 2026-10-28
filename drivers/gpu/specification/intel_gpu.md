@@ -7,7 +7,8 @@
 > bounds/flush discipline landed — see §9; forcewake domains
 > landed — see §11; RC6 + DMC landed — see §12; suspend/resume
 > + D-state transitions landed — see §13; external DisplayPort
-> full single-stream landed — see §14).
+> full single-stream landed — see §14; multi-pipe
+> display + DP MST landed — see §16).
 >
 > Clean-room driver for Intel integrated graphics from Tiger Lake
 > through Meteor Lake. **No GPL Linux `i915` / `xe` source
@@ -1129,6 +1130,111 @@ no infoframes/SCDC — a follow-up, not filed here), YCbCr
 the rate rule's premise is 8 bpc RGB), HDCP (separate
 programme), HDMI 2.1 FRL, Type-C HDMI alt mode.
 
+## 16. Multi-pipe display + DP MST (lane Q11 — `intel_gpu_multipipe`, `intel_gpu_mst`, #1017)
+
+Supersedes §14's "DP MST and multi-pipe" remainder. Compiled
+only under the gpu crate's `intel` feature. Sources: VESA
+DisplayPort 1.4a (§2.7.6 sideband messaging, §2.11 MST
+payload management, PBN accounting), TGL PRM Vol. 11 (DPLL,
+power wells), Vol. 12 (DBUF allocation, transcoder/DDI),
+Vol. 14 (plane watermarks). The sideband codec and topology
+manager are the vendor-neutral `dp_mst` / `dp_mst_mgr`
+modules (shared with the AMD MST consumer); this lane adds
+the Intel transport adapter, the pipe/DBUF substrate, and
+the session composition. No new initcalls: sessions ride
+the §14 HPD/initcall flow.
+
+### Multi-pipe substrate (`intel_gpu_multipipe`, `Modeset::for_pipe`)
+
+- **Pipe ownership.** Pipes A–C are allocatable; Pipe D is
+  refused (no power well in the Gen12 orchestrator map).
+  `PipeAllocator` hands a pipe to exactly one
+  `PipeOwner { ddi, used_for }` (`InternalPanel`,
+  `ExternalSst`, `ExternalMst`, `AltModeBridge`). Claims are
+  idempotent for the same owner, owner-only on release; the
+  process-global registry (`PIPE_ALLOCATOR`) is the single
+  arbiter between the internal panel, SST sessions, MST
+  streams, and Alt-Mode bridge sessions. Probe claims Pipe A
+  for the internal panel when takeover produced a mode.
+- **Per-pipe modeset.** `Modeset::for_pipe(pipe)` binds the
+  pipe, its same-index transcoder, its power well (PG2/PG3/
+  PG4 for pipes A/B/C — the i915 ICL+ domain map), and its
+  DPLL index (DDI A→DPLL0, B→DPLL1, C→DPLL2; TC DDIs D–H
+  share DPLL0 historically — TC PHY PLL programming is a
+  named remainder). `Modeset::new` is `for_pipe(Pipe::A)`
+  and the single-pipe register sequence is byte-identical
+  to the pre-lane orchestrator.
+- **Per-pipe GGTT scanout windows.** Windows are strided
+  32 MiB apart from `SCANOUT_GTT_OFFSET_PIPE_A`
+  (A 0x1000000, B 0x3000000, C 0x5000000) via
+  `alloc_contiguous_scanout_at`, so concurrent sessions
+  never share a scanout block.
+- **DBUF partition.** The partition covers 1024 blocks
+  (slice S1; PRM Vol. 12: S1 alone = 1024, S1+S2 = 2048).
+  Q6 (#1024) now powers both slices at modeset, but the
+  multi-pipe split stays within S1 — using S2 and the PRM
+  slice-assignment table are named remainders. With ≥2
+  active pipes the coordinator
+  (`reprogram_dbuf_shares`) partitions the 1024 blocks into
+  contiguous equal shares over the sorted active set and
+  reprograms each pipe's PLANE_BUF_CFG / PLANE_WM level 0
+  from its share. A lone pipe keeps the preboot programming
+  untouched; when the active set drops back to one pipe the
+  survivor keeps its last share until its next modeset.
+  A pipe with an explicit share is programmed in the
+  preboot shape at its share's size; a lone pipe (no share)
+  runs Q6 (#1024)'s latency-based watermark algorithm over
+  the whole DDB on its own pipe, falling back to the preboot
+  values as before.
+
+### MST session (`intel_gpu_mst`)
+
+- **Transport.** `IntelMstAux` implements the manager's
+  `MstAux` trait over `IntelAux`, chunking every transfer
+  at the 16-byte native AUX limit. `MstLink` owns one DDI's
+  `dp_mst_mgr::Manager`, the negotiated caps, the trained
+  link, a per-hop available-PBN ledger seeded from
+  ENUM_PATH_RESOURCES at probe, and the live stream set.
+- **Stream lifecycle.** `add_stream` refuses locally —
+  before any modeset or allocation traffic — when the
+  stream's PBN exceeds any hop's ledger availability
+  (`InsufficientBandwidth { needed_pbn, available_pbn }`).
+  The primary stream trains the link via
+  `Modeset::modeset_mst_primary` (TRANS_DDI_FUNC_CTL DP-MST
+  mode); secondary streams reuse the trained link via
+  `modeset_mst_secondary` and never touch the shared link
+  blocks (DPLL, DPCLKA, BUF_TRANS, training, DDI buffer).
+  Payload commit order per stream: source payload-table
+  entry (`write_payload` part 1), then ALLOCATE_PAYLOAD to
+  the end branch (part 2); a partial grant (granted ≠
+  requested) is a refusal. Any failure rolls back in
+  reverse — payload deallocation and table clear, then
+  modeset teardown (full teardown + untrain only when no
+  stream survives; otherwise a pipe-scoped
+  `teardown_stream`) — so a refused or failed stream never
+  disturbs a live one. `remove_stream` deallocates,
+  clears the table entry, tears down, credits the ledger,
+  and compacts surviving streams' table slots back to
+  dense (slot 0 is the MTP header; VCPIs are 1..=63).
+- **Notifications.** Up requests drained on the HPD
+  RetrainRequired path surface as `MstEvent`s;
+  RESOURCE_STATUS_NOTIFY additionally updates the ledger
+  entry for the notifying branch's port.
+- **Failure discipline.** Sideband timeouts, NAKs, and
+  malformed replies are the manager's typed errors,
+  wrapped unchanged (`MstError::Mgr`); AUX failures stay
+  `MstError::Aux`. A DDI whose sink lacks MST capability
+  (DPCD rev < 1.2 or MSTM_CAP clear) falls back to the §14
+  SST session. An HPD disconnect tears streams down in
+  reverse order, disconnects the manager, and releases
+  the pipes.
+
+Named remainders: per-stream MST display audio, DSC/FEC
+over MST, TC PHY PLL programming for DDI D–H, DBUF slice
+S2, fb-console publication staying single-slot (last HPD
+wins; per-pipe publication is a console-layer decision),
+and the Alt-Mode bridge holding its pipe claim for the
+session lifetime (the bridge trait has no exit hook).
 ## 17. Xe-LPG display — Meteor Lake (lane Q10, #1016)
 
 Meteor Lake's display engine is Xe-LPG, a different IP block

@@ -62,7 +62,7 @@ use crate::intel_gpu_audio;
 use crate::intel_gpu_aux::{IntelAux, MmioWindow};
 use crate::intel_gpu_ddi::Ddi;
 use crate::intel_gpu_modeset::{Framebuffer, LinkPlan, Mode, Modeset, ModesetError};
-use crate::intel_gpu_pipes::Transcoder;
+use crate::intel_gpu_pipes::Pipe;
 
 /// GEN8 DE Port interrupt status register (live levels).
 pub const GEN8_DE_PORT_ISR: u64 = 0x4_4440;
@@ -249,6 +249,11 @@ pub struct DpSinkProbe {
 pub struct DpConnection {
     /// The DDI the sink hangs off.
     pub ddi: Ddi,
+    /// The pipe scanning this connection out, claimed from
+    /// `intel_gpu_multipipe` by the glue. Connections made
+    /// through the original single-pipe entry points sit on
+    /// Pipe A, as they always did (#1017).
+    pub pipe: Pipe,
     /// The mode being scanned out.
     pub mode: Mode,
     /// The link as actually trained (post-fallback).
@@ -268,8 +273,11 @@ pub fn sink_id_for(ddi: Ddi) -> DisplaySinkId {
 
 /// Convert the EDID's preferred detailed timing into the
 /// modeset's `Mode` shape (same field mapping the modeset's own
-/// EDID path uses).
-fn mode_from_edid(edid_raw: &[u8]) -> Result<Mode, DpError> {
+/// EDID path uses). Shared with the MST session layer (#1017),
+/// whose per-sink EDIDs arrive over sideband messages instead
+/// of the native I²C-over-AUX channel — the conversion must not
+/// fork.
+pub(crate) fn mode_from_edid(edid_raw: &[u8]) -> Result<Mode, DpError> {
     let edid = narf_graphics::edid::Edid::parse(&edid_raw[..128])
         .map_err(|e| DpError::Edid(EdidReadError::Parse(e)))?;
     let d = edid
@@ -325,11 +333,31 @@ pub fn activate<M: MmioWindow + ?Sized>(
     probe: &DpSinkProbe,
     fb: &Framebuffer,
 ) -> Result<DpConnection, DpError> {
+    activate_on_pipe(mmio, probe, fb, Pipe::A, None)
+}
+
+/// [`activate`] on a caller-claimed pipe (#1017): the modeset
+/// binds `pipe` (and its same-index transcoder, which the audio
+/// path also keys on), and `dbuf_share` carries the pipe's
+/// DBUF share when the multi-pipe coordinator computed one.
+/// Pipe ownership itself is the caller's business
+/// (`intel_gpu_multipipe`); this layer only records the pipe
+/// on the connection so disconnect/retrain return to it.
+pub fn activate_on_pipe<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    probe: &DpSinkProbe,
+    fb: &Framebuffer,
+    pipe: Pipe,
+    dbuf_share: Option<(u16, u16)>,
+) -> Result<DpConnection, DpError> {
     let plan = LinkPlan {
         rate: probe.negotiated.rate,
         lanes: probe.negotiated.lanes,
     };
-    let mut modeset = Modeset::new(mmio, probe.ddi);
+    let mut modeset = Modeset::for_pipe(mmio, probe.ddi, pipe);
+    if let Some((start, end)) = dbuf_share {
+        modeset.set_dbuf_share(start, end);
+    }
     let (mode, trained) = modeset.modeset_with_plan(fb, &probe.mode, plan)?;
 
     let mut audio_published = false;
@@ -339,13 +367,14 @@ pub fn activate<M: MmioWindow + ?Sized>(
         (probe.ddi as u64) + 1,
     ) {
         publish_display_audio(sink_id_for(probe.ddi), publication);
-        intel_gpu_audio::audio_codec_enable(mmio, Transcoder::A);
-        intel_gpu_audio::set_eld_valid(mmio, Transcoder::A, true);
+        intel_gpu_audio::audio_codec_enable(mmio, pipe.transcoder());
+        intel_gpu_audio::set_eld_valid(mmio, pipe.transcoder(), true);
         audio_published = true;
     }
 
     Ok(DpConnection {
         ddi: probe.ddi,
+        pipe,
         mode,
         trained,
         caps: probe.caps,
@@ -360,8 +389,18 @@ pub fn connect<M: MmioWindow + ?Sized>(
     ddi: Ddi,
     fb: &Framebuffer,
 ) -> Result<DpConnection, DpError> {
+    connect_on_pipe(mmio, ddi, fb, Pipe::A)
+}
+
+/// [`connect`] on a caller-claimed pipe (#1017).
+pub fn connect_on_pipe<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    ddi: Ddi,
+    fb: &Framebuffer,
+    pipe: Pipe,
+) -> Result<DpConnection, DpError> {
     let probe = probe_sink(mmio, ddi)?;
-    activate(mmio, &probe, fb)
+    activate_on_pipe(mmio, &probe, fb, pipe, None)
 }
 
 /// Disconnect: silence audio (codec disable + sink clear)
@@ -369,10 +408,10 @@ pub fn connect<M: MmioWindow + ?Sized>(
 /// an ELD whose display is already gone.
 pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &DpConnection) {
     if conn.audio_published {
-        intel_gpu_audio::audio_codec_disable(mmio, Transcoder::A);
+        intel_gpu_audio::audio_codec_disable(mmio, conn.pipe.transcoder());
         clear_display_audio(sink_id_for(conn.ddi));
     }
-    let mut modeset = Modeset::new(mmio, conn.ddi);
+    let mut modeset = Modeset::for_pipe(mmio, conn.ddi, conn.pipe);
     modeset.teardown();
 }
 
@@ -406,7 +445,9 @@ pub fn retrain<M: MmioWindow + ?Sized>(
     if cr_alive {
         return Ok(conn.clone());
     }
-    connect(mmio, conn.ddi, fb)
+    // The reconnect lands on the connection's own pipe: the
+    // session's claim and scanout window are keyed to it.
+    connect_on_pipe(mmio, conn.ddi, fb, conn.pipe)
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

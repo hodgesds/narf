@@ -11,11 +11,11 @@
 //! - **Pipeline shape** (this file) — the orchestration steps in
 //!   the order the PRM mandates.
 //! - **Power well sequencing** — basic PG1 enable (always
-//!   required for any display work). Per-pipe / per-DDI power
-//!   wells (PG2/PG3/PG4/PG5) are noted in comments but Stage 1
-//!   leaves them as TODOs — they need real-HW validation since
-//!   the PRM's listed power-well-to-pipe mapping has silicon-
-//!   specific corrections (see i915 `display/intel_dmc.c`).
+//!   required for any display work), plus the per-pipe wells:
+//!   Pipe A under PG2, Pipe B under PG3, Pipe C under PG4 (the
+//!   ICL+ power-well domain assignment in i915
+//!   `display/intel_display_power_well.c`). Multi-pipe support
+//!   (#1017) enables the well for the orchestrator's own pipe.
 //! - **eDP-only modeset** — laptop panels. External DP is the
 //!   same path with a few additional hotplug detection steps.
 //!   HDMI has its own entry point ([`Modeset::modeset_hdmi`],
@@ -33,7 +33,6 @@
 //! - PSR (Panel Self Refresh) — eDP power saving
 //! - VRR (Variable Refresh Rate)
 //! - HDR metadata / wide-gamut colorspace
-//! - Multi-pipe / multi-monitor
 //! - Cursor + overlay + sprite planes
 //! - DMC firmware loading (required for runtime PM, not boot
 //!   modeset)
@@ -85,8 +84,8 @@ const fn pwr_well_state(pw_idx: u32) -> u32 {
 enum PowerWell {
     Pg1 = 0,
     Pg2 = 1,
-    #[allow(dead_code)]
     Pg3 = 2,
+    Pg4 = 3,
 }
 
 // ── DPLL enable register block (Tiger Lake PRM Vol. 11 §"DPLL Enable";
@@ -102,18 +101,36 @@ enum PowerWell {
 
 const DPLL0_ENABLE: u64 = 0x4_6010;
 const DPLL1_ENABLE: u64 = 0x4_6014;
+const DPLL2_ENABLE: u64 = 0x4_6018;
 const PLL_ENABLE: u32 = 1 << 31;
 const PLL_LOCK: u32 = 1 << 30;
 const PLL_POWER_ENABLE: u32 = 1 << 27;
 const PLL_POWER_STATE: u32 = 1 << 26;
 
-/// DDI A maps to DPLL 0 on Gen12 Combo PHY by default. Multi-DDI
-/// arbitration via DPCLKA_CFGCR0 lands in Stage-3.
+/// The DPLL enable register for a Combo PHY DPLL index: the
+/// block is a plain 4-byte stride from DPLL0 (i915
+/// `_DPLL0_ENABLE` / `_DPLL1_ENABLE` / `_DPLL2_ENABLE`).
 const fn dpll_enable_off(dpll_idx: u32) -> u64 {
-    if dpll_idx == 0 {
-        DPLL0_ENABLE
-    } else {
-        DPLL1_ENABLE
+    match dpll_idx {
+        0 => DPLL0_ENABLE,
+        1 => DPLL1_ENABLE,
+        _ => DPLL2_ENABLE,
+    }
+}
+
+/// The DPLL a modeset on `ddi` programs and routes: Combo PHY
+/// DDIs A/B/C own DPLL 0/1/2 respectively (the DPCLKA default
+/// assignment i915 programs). Type-C DDIs (D–H) keep the
+/// historical DPLL 0 selection — TC PHY PLL programming (MG /
+/// TBT PLLs) has no model in this driver yet, so a TC modeset
+/// behaves exactly as it did before multi-pipe support; see
+/// specification §16's open items (#1017).
+const fn dpll_index_for(ddi: Ddi) -> u32 {
+    match ddi {
+        Ddi::A => 0,
+        Ddi::B => 1,
+        Ddi::C => 2,
+        _ => 0,
     }
 }
 
@@ -292,27 +309,91 @@ pub fn to_pll_rate(rate: crate::dp_link_training::LinkRate) -> LinkRate {
     }
 }
 
+/// How the link-training step of a modeset run is satisfied.
+/// The legacy eDP-shaped entry trains and discards the result
+/// (historical behaviour); the plan entries train at the
+/// negotiated configuration and consume the outcome; an MST
+/// secondary stream's link was already trained by the primary
+/// stream on the same DDI, so its run programs from the trained
+/// configuration and must not touch the shared link blocks
+/// (DPLL, DPCLKA routing, BUF_TRANS, training, DDI buffer).
+enum LinkStep {
+    Legacy,
+    Plan(LinkPlan),
+    Trained(crate::dp_link_training::TrainedLink),
+}
+
 /// Modeset orchestrator for one CRTC (= pipe + transcoder + DDI).
 /// Stateless — every call walks the full sequence on the assumption
 /// the caller has already serialized concurrent modesets at a
 /// higher layer (today: nothing else touches Intel display).
+///
+/// Before #1017 the orchestrator was hardwired to Pipe A /
+/// Transcoder A / DPLL0: an internal panel and an external
+/// display could never be live at once, and every session —
+/// including the DP Alt-Mode bridge on Type-C DDIs — funnelled
+/// into the same pipe. [`Modeset::new`] keeps that Pipe A shape
+/// exactly (every pre-existing caller and fixture is
+/// byte-identical); [`Modeset::for_pipe`] binds the run to any
+/// pipe, with ownership arbitrated by `intel_gpu_multipipe`.
 pub struct Modeset<'a, M: MmioWindow + ?Sized> {
     mmio: &'a M,
     /// The physical port for this modeset (eDP is usually DDI A
     /// on Gen12 laptops).
     pub ddi: Ddi,
+    /// The pipe (and, by the Gen12 same-index binding, the
+    /// transcoder) this run programs.
+    pipe: Pipe,
+    /// Explicit DBUF share `(start_block, end_block)` for this
+    /// pipe's primary plane, set by the multi-pipe coordinator
+    /// when more than one pipe is active. `None` keeps the PRM
+    /// pre-boot single-pipe programming.
+    dbuf_share: Option<(u16, u16)>,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for Modeset<'a, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Modeset").field("ddi", &self.ddi).finish()
+        f.debug_struct("Modeset")
+            .field("ddi", &self.ddi)
+            .field("pipe", &self.pipe)
+            .finish()
     }
 }
 
 impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
-    /// Create an orchestrator for a port + MMIO window pair.
+    /// Create an orchestrator for a port + MMIO window pair,
+    /// bound to Pipe A (the historical single-pipe shape).
     pub fn new(mmio: &'a M, ddi: Ddi) -> Self {
-        Self { mmio, ddi }
+        Self::for_pipe(mmio, ddi, Pipe::A)
+    }
+
+    /// Create an orchestrator bound to `pipe`. Pipe D is
+    /// refused by the power-well step (Gen12 display here
+    /// arbitrates pipes A–C; see `intel_gpu_multipipe`).
+    pub fn for_pipe(mmio: &'a M, ddi: Ddi, pipe: Pipe) -> Self {
+        Self {
+            mmio,
+            ddi,
+            pipe,
+            dbuf_share: None,
+        }
+    }
+
+    /// The pipe this run programs.
+    pub fn pipe(&self) -> Pipe {
+        self.pipe
+    }
+
+    /// The transcoder this run programs (same-index binding).
+    fn transcoder(&self) -> crate::intel_gpu_pipes::Transcoder {
+        self.pipe.transcoder()
+    }
+
+    /// Set the explicit DBUF share for this pipe's primary
+    /// plane, as `(start_block, end_block)` in DBUF blocks
+    /// (see `intel_gpu_multipipe::dbuf_shares`).
+    pub fn set_dbuf_share(&mut self, start_block: u16, end_block: u16) {
+        self.dbuf_share = Some((start_block, end_block));
     }
 
     /// Run the modeset. The orchestrator owns the
@@ -327,8 +408,13 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         primary_fb: &Framebuffer,
         fallback_mode: Option<&Mode>,
     ) -> Result<Mode, ModesetError> {
-        self.modeset_impl(primary_fb, fallback_mode, None)
-            .map(|(mode, _)| mode)
+        self.modeset_impl(
+            primary_fb,
+            fallback_mode,
+            LinkStep::Legacy,
+            crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST,
+        )
+        .map(|(mode, _)| mode)
     }
 
     /// Run the modeset for an external DP sink whose link was
@@ -357,10 +443,61 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         mode: &Mode,
         plan: LinkPlan,
     ) -> Result<(Mode, crate::dp_link_training::TrainedLink), ModesetError> {
-        match self.modeset_impl(primary_fb, Some(mode), Some(plan))? {
+        match self.modeset_impl(
+            primary_fb,
+            Some(mode),
+            LinkStep::Plan(plan),
+            crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST,
+        )? {
             (mode, Some(trained)) => Ok((mode, trained)),
             (_, None) => unreachable!("plan path always trains"),
         }
+    }
+
+    /// Run the modeset for the *primary* stream of a DP MST
+    /// link (#1017): like [`Modeset::modeset_with_plan`], but
+    /// the transcoder binds to the DDI in DP-MST mode
+    /// (`TRANS_DDI_FUNC_CTL` mode = DP MST) from the start, so
+    /// the link trains as an MST link and the branch device
+    /// sees a multi-stream source.
+    pub fn modeset_mst_primary(
+        &mut self,
+        primary_fb: &Framebuffer,
+        mode: &Mode,
+        plan: LinkPlan,
+    ) -> Result<(Mode, crate::dp_link_training::TrainedLink), ModesetError> {
+        match self.modeset_impl(
+            primary_fb,
+            Some(mode),
+            LinkStep::Plan(plan),
+            crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_MST,
+        )? {
+            (mode, Some(trained)) => Ok((mode, trained)),
+            (_, None) => unreachable!("plan path always trains"),
+        }
+    }
+
+    /// Run the modeset for a *secondary* stream of a DP MST
+    /// link (#1017): the link on this DDI was already trained
+    /// by the primary stream (`trained`), so this run programs
+    /// only its own pipe/transcoder/plane — per-stream M/N,
+    /// `TRANS_DDI_FUNC_CTL` in DP-MST mode, its DBUF share —
+    /// and never touches the shared link blocks (DPLL, DPCLKA
+    /// routing, BUF_TRANS, training, DDI buffer), which would
+    /// disturb the streams already scanning out.
+    pub fn modeset_mst_secondary(
+        &mut self,
+        primary_fb: &Framebuffer,
+        mode: &Mode,
+        trained: crate::dp_link_training::TrainedLink,
+    ) -> Result<Mode, ModesetError> {
+        self.modeset_impl(
+            primary_fb,
+            Some(mode),
+            LinkStep::Trained(trained),
+            crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_MST,
+        )
+        .map(|(mode, _)| mode)
     }
 
     /// Tear the pipeline down in the PRM's safe order (plane →
@@ -414,7 +551,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.program_dpll_coeffs(&coeffs)?;
         self.program_cdclk_floor(mode);
         self.program_dpclka_routing();
-        self.enable_pipe_power_well(Pipe::A)?;
+        self.enable_pipe_power_well(self.pipe)?;
         self.program_transcoder(mode);
         self.program_pipe(mode);
         // No step 7b: HDMI has no M/N.
@@ -431,32 +568,53 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         Ok(*mode)
     }
 
-    /// Bind Transcoder A to this DDI in HDMI mode (8 bpc, the
-    /// fixed 4-lane width, scrambling bits per the plan).
+    /// Bind this run's transcoder to the DDI in HDMI mode (8 bpc,
+    /// the fixed 4-lane width, scrambling bits per the plan).
     fn program_trans_ddi_func_ctl_hdmi(&mut self, scrambling: bool, high_tmds_char_rate: bool) {
-        use crate::intel_gpu_pipes::{
-            build_trans_ddi_func_ctl_hdmi, Transcoder, TRANS_DDI_FUNC_CTL_OFFSET,
-        };
+        use crate::intel_gpu_pipes::{build_trans_ddi_func_ctl_hdmi, TRANS_DDI_FUNC_CTL_OFFSET};
         let val = build_trans_ddi_func_ctl_hdmi(self.ddi as u8, scrambling, high_tmds_char_rate);
         self.mmio
-            .write32(Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET, val);
+            .write32(self.transcoder().base() + TRANS_DDI_FUNC_CTL_OFFSET, val);
         compiler_fence(Ordering::SeqCst);
+    }
+
+    /// Tear down only this run's pipe pipeline (plane → pipe →
+    /// transcoder), leaving the DDI buffer and the shared link
+    /// up. Used when one MST stream of several goes away
+    /// (#1017): the surviving streams keep scanning out of the
+    /// same DDI.
+    pub fn teardown_stream(&mut self) {
+        self.disable_pipe_pipeline();
     }
 
     fn modeset_impl(
         &mut self,
         primary_fb: &Framebuffer,
         fallback_mode: Option<&Mode>,
-        plan: Option<LinkPlan>,
+        link: LinkStep,
+        ddi_mode: u32,
     ) -> Result<(Mode, Option<crate::dp_link_training::TrainedLink>), ModesetError> {
         // Step 0: validate inputs that don't require touching HW.
         validate_framebuffer(primary_fb)?;
+
+        // The plan, where the run carries one (the legacy shape
+        // derives its link parameters at the steps that consume
+        // them; the already-trained shape takes them from the
+        // trained link).
+        let plan = match link {
+            LinkStep::Plan(p) => Some(p),
+            _ => None,
+        };
+        let already_trained = match link {
+            LinkStep::Trained(t) => Some(t),
+            _ => None,
+        };
 
         // Step 1: pick the mode. On the plan path the session
         // layer owns EDID and hands the mode in; on the legacy
         // path, EDID readback over AUX, falling back to the
         // caller's fallback mode.
-        let mode = if plan.is_some() {
+        let mode = if plan.is_some() || already_trained.is_some() {
             match fallback_mode {
                 Some(m) => *m,
                 None => return Err(ModesetError::EdidUnavailable),
@@ -479,8 +637,15 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
 
         // Step 3: disable the existing pipeline if it's running.
         // PRM mandates a "disable first" sequence to avoid
-        // glitching the panel.
-        self.disable_pipeline();
+        // glitching the panel. An MST secondary stream disables
+        // only its own pipe pipeline — the DDI buffer carries
+        // the streams already live on this link and must stay
+        // up (#1017).
+        if already_trained.is_some() {
+            self.disable_pipe_pipeline();
+        } else {
+            self.disable_pipeline();
+        }
 
         // Step 4: program DPLL for the mode's pixel clock.
         // Gen12 Combo PHY DPLL programming — DPLL_CFGCR0 has the
@@ -489,10 +654,14 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // Stage 1 wires the actual MMIO writes here. The DPLL
         // synthesises the *link* clock: on the plan path that is
         // the negotiated rate; the legacy path derives the lowest
-        // sufficient rate from the pixel clock.
-        match plan {
-            Some(p) => self.program_dpll_with_rate(&mode, to_pll_rate(p.rate))?,
-            None => self.program_dpll(&mode)?,
+        // sufficient rate from the pixel clock. An MST secondary
+        // stream skips this entirely — the primary stream's run
+        // already clocked the shared link, and re-running the
+        // PLL power/enable sequence would glitch it.
+        match (plan, already_trained) {
+            (Some(p), _) => self.program_dpll_with_rate(&mode, to_pll_rate(p.rate))?,
+            (None, Some(_)) => {}
+            (None, None) => self.program_dpll(&mode)?,
         }
 
         // Step 4b (lane 1, #1010): raise CDCLK to the floor this
@@ -501,16 +670,21 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // a faster firmware CDCLK is left alone.
         self.program_cdclk_floor(&mode);
 
-        // Step 4c (lane 1): route DPLL0 to this DDI in
+        // Step 4c (lane 1): route this DDI's DPLL to the DDI in
         // DPCLKA_CFGCR0 — select the PLL and turn the DDI clock
         // on in separate writes, per the PRM sequence. This
-        // register was never written before lane 1.
-        self.program_dpclka_routing();
+        // register was never written before lane 1. Skipped for
+        // an MST secondary stream: routing is per-DDI and the
+        // primary stream's run already latched it.
+        if already_trained.is_none() {
+            self.program_dpclka_routing();
+        }
 
-        // Step 5: enable per-pipe power well (PG2 for Pipe A).
-        // Stage-2: real PG2 sequencing via HSW_PWR_WELL_CTL2,
-        // mirroring i915's `hsw_set_power_well`.
-        self.enable_pipe_power_well(Pipe::A)?;
+        // Step 5: enable the per-pipe power well for this run's
+        // pipe (PG2 / PG3 / PG4 for Pipe A / B / C on Gen12),
+        // via HSW_PWR_WELL_CTL2, mirroring i915's
+        // `hsw_set_power_well`.
+        self.enable_pipe_power_well(self.pipe)?;
 
         // Step 6: program transcoder timing. PRM Vol. 14 §"TRANS_*"
         // — HTOTAL / VTOTAL / HSYNC / VSYNC registers.
@@ -521,26 +695,37 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.program_pipe(&mode);
 
         // Step 7b (lane 1): DP data/link M/N for the stream
-        // (24 bpp, uncompressed SST). LINK_N is written
+        // (24 bpp, uncompressed). LINK_N is written
         // last — it triggers the hardware update of all four.
         // Pre-training this carries the planned (or legacy
         // derived) link configuration; the plan path reprograms
         // it with the trained values after training (step 9b).
-        match plan {
-            Some(p) => self.program_mn_link(&mode, p.rate, p.lanes),
-            None => self.program_mn(&mode),
+        // An MST stream's M/N is per-stream: every stream
+        // programs its own transcoder's values from its mode
+        // against the one trained link.
+        match (plan, already_trained) {
+            (Some(p), _) => self.program_mn_link(&mode, p.rate, p.lanes),
+            (None, Some(t)) => self.program_mn_link(&mode, t.rate, t.lanes),
+            (None, None) => self.program_mn(&mode),
         }
 
         // Step 7c (lane 1): bind the transcoder to the DDI port
-        // (TRANS_DDI_FUNC_CTL, DP-SST, 8 bpc, planned lanes).
-        // Never written before lane 1 — routing was firmware
-        // leftover.
-        self.program_trans_ddi_func_ctl(plan.map(|p| p.lanes).unwrap_or(4));
+        // (TRANS_DDI_FUNC_CTL, 8 bpc, planned lanes; DP-SST for
+        // the single-stream entries, DP-MST for the MST stream
+        // entries, #1017). Never written before lane 1 — routing
+        // was firmware leftover.
+        let func_ctl_lanes = plan
+            .map(|p| p.lanes)
+            .or_else(|| already_trained.map(|t| t.lanes))
+            .unwrap_or(4);
+        self.program_trans_ddi_func_ctl_mode(func_ctl_lanes, ddi_mode);
 
         // Step 7d (lane 1; extended by Q6 #1024): power the
         // DBUF slices, then program the latency-based
-        // watermarks + DBUF allocation before the plane is
-        // armed; the PLANE_SURF write in step 8 latches them.
+        // watermarks + DBUF allocation (or this pipe's explicit
+        // share when the multi-pipe coordinator set one, #1017)
+        // before the plane is armed; the PLANE_SURF write in
+        // step 8 latches them.
         self.enable_dbuf_slices()?;
         self.program_watermarks(&mode, primary_fb);
 
@@ -557,14 +742,24 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // rate training starts at before training — the source
         // PHY needs its coefficients while training runs. If
         // training settles on a different rate, reload.
-        let start_rate = plan
-            .map(|p| to_pll_rate(p.rate))
-            .unwrap_or(LinkRate::DpHbr2);
-        self.load_buf_trans(start_rate);
-        let (trained_pll, trained_link) = self.train_dp_link(plan)?;
-        if trained_pll != start_rate {
-            self.load_buf_trans(trained_pll);
-        }
+        //
+        // An MST secondary stream skips the whole step: the
+        // link is already trained and BUF_TRANS already loaded
+        // by the primary stream's run on this DDI.
+        let (trained_pll, trained_link) = match already_trained {
+            Some(t) => (to_pll_rate(t.rate), Some(t)),
+            None => {
+                let start_rate = plan
+                    .map(|p| to_pll_rate(p.rate))
+                    .unwrap_or(LinkRate::DpHbr2);
+                self.load_buf_trans(start_rate);
+                let (pll, trained) = self.train_dp_link(plan)?;
+                if pll != start_rate {
+                    self.load_buf_trans(pll);
+                }
+                (pll, trained)
+            }
+        };
 
         // Step 9b (plan path, #1092): if the fallback ladder
         // settled somewhere other than the plan, reprogram the
@@ -578,12 +773,16 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             }
             if t.rate != p.rate || t.lanes != p.lanes {
                 self.program_mn_link(&mode, t.rate, t.lanes);
-                self.program_trans_ddi_func_ctl(t.lanes);
+                self.program_trans_ddi_func_ctl_mode(t.lanes, ddi_mode);
             }
         }
 
-        // Step 10: enable DDI buffer — physical output drivers on.
-        self.enable_ddi_buffer(trained_link.map(|t| t.lanes).unwrap_or(4));
+        // Step 10: enable DDI buffer — physical output drivers
+        // on. Skipped for an MST secondary stream: the buffer
+        // is already driving the link for the primary stream.
+        if already_trained.is_none() {
+            self.enable_ddi_buffer(trained_link.map(|t| t.lanes).unwrap_or(4));
+        }
 
         // Step 11: enable transcoder, then pipe, then plane.
         // Sequence matters: transcoder pulls timing from PLL, pipe
@@ -636,21 +835,27 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.enable_power_well(PowerWell::Pg1)
     }
 
-    /// Enable the per-pipe power well (PG2 for Pipe A on Gen12).
-    /// Required before any pipe / plane / transcoder programming.
+    /// Enable the per-pipe power well for `pipe`. Required
+    /// before any pipe / plane / transcoder programming.
+    ///
+    /// The well assignment is the ICL+ power-well domain map
+    /// (i915 `display/intel_display_power_well.c`,
+    /// `icl_power_wells` / `tgl_power_wells`): Pipe A under PG2,
+    /// Pipe B under PG3, Pipe C under PG4. Pipe D has no well
+    /// in this driver's arbitration set (pipes A–C, #1017) and
+    /// is refused with the same `PowerWellTimeout` a grant
+    /// failure surfaces as, so callers see one clean error.
     ///
     /// Reference: Linux `drivers/gpu/drm/i915/display/
     /// intel_display_power_well.c::hsw_set_power_well` — issues
     /// the REQUEST bit in `HSW_PWR_WELL_CTL2` and polls the STATE
     /// bit for grant. Default enable timeout is 1 ms.
     fn enable_pipe_power_well(&mut self, pipe: Pipe) -> Result<(), ModesetError> {
-        // On Gen12, Pipe A always lives under PG2. Pipe B+ require
-        // PG3 sequencing the orchestrator doesn't currently enable
-        // — Stage-2 restricts itself to Pipe A. A non-A pipe
-        // surfaces as PowerWellTimeout so callers see a clean error.
         let pw = match pipe {
             Pipe::A => PowerWell::Pg2,
-            _ => return Err(ModesetError::PowerWellTimeout),
+            Pipe::B => PowerWell::Pg3,
+            Pipe::C => PowerWell::Pg4,
+            Pipe::D => return Err(ModesetError::PowerWellTimeout),
         };
         self.enable_power_well(pw)
     }
@@ -699,16 +904,22 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// Reference: Linux drivers/gpu/drm/i915/display/intel_pipe.c
     /// (`intel_disable_pipe`, `intel_disable_transcoder`).
     fn disable_pipeline(&mut self) {
-        use crate::intel_gpu_ddi::{
-            DDI_BUF_CTL_ENABLE, DDI_BUF_CTL_IDLE_STATUS, DDI_BUF_CTL_OFFSET,
-        };
+        self.disable_pipe_pipeline();
+        self.disable_ddi_buffer();
+    }
+
+    /// Steps 1–3 of the disable: this run's plane → pipe →
+    /// transcoder, in that order. The DDI buffer is left alone,
+    /// so an MST stream can be torn down without disturbing the
+    /// other streams on its link (#1017).
+    fn disable_pipe_pipeline(&mut self) {
         use crate::intel_gpu_pipes::{
-            Pipe as PipeIdx, Transcoder, PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE,
-            PLANE_CTL_ENABLE, PLANE_CTL_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SURF_OFFSET,
+            PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE, PLANE_CTL_ENABLE, PLANE_CTL_OFFSET,
+            PLANE_PRIMARY_OFFSET, PLANE_SURF_OFFSET,
         };
         // 1) Plane: clear ENABLE then re-arm via PLANE_SURF write
         //    so the next vblank latches "no plane".
-        let plane_base = PipeIdx::A.base() + PLANE_PRIMARY_OFFSET;
+        let plane_base = self.pipe.base() + PLANE_PRIMARY_OFFSET;
         let ctl = self.mmio.read32(plane_base + PLANE_CTL_OFFSET);
         self.mmio
             .write32(plane_base + PLANE_CTL_OFFSET, ctl & !PLANE_CTL_ENABLE);
@@ -718,20 +929,30 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         compiler_fence(Ordering::SeqCst);
 
         // 2) Pipe: clear ENABLE, wait for state-inactive.
-        let pipe_off = PipeIdx::A.base() + PIPECONF_OFFSET;
+        let pipe_off = self.pipe.base() + PIPECONF_OFFSET;
         let pconf = self.mmio.read32(pipe_off);
         self.mmio.write32(pipe_off, pconf & !PIPECONF_ENABLE);
         compiler_fence(Ordering::SeqCst);
         let _ = wait_bit(self.mmio, pipe_off, PIPECONF_STATE, false, 100_000_000);
 
-        // 3) Transcoder: same pattern as pipe.
-        let trans_off = Transcoder::A.conf_base() + PIPECONF_OFFSET;
+        // 3) Transcoder: same pattern as pipe. On Gen12 the
+        //    transcoder CONF register is aliased into the pipe
+        //    block (same address as step 2's); the sequence is
+        //    kept as the PRM lists it — two clears of the same
+        //    bit are idempotent.
+        let trans_off = self.transcoder().conf_base() + PIPECONF_OFFSET;
         let tconf = self.mmio.read32(trans_off);
         self.mmio.write32(trans_off, tconf & !PIPECONF_ENABLE);
         compiler_fence(Ordering::SeqCst);
         let _ = wait_bit(self.mmio, trans_off, PIPECONF_STATE, false, 100_000_000);
+    }
 
-        // 4) DDI buffer: clear ENABLE, poll IDLE_STATUS asserts.
+    /// Step 4 of the disable: this run's DDI buffer off, polling
+    /// IDLE_STATUS asserting.
+    fn disable_ddi_buffer(&mut self) {
+        use crate::intel_gpu_ddi::{
+            DDI_BUF_CTL_ENABLE, DDI_BUF_CTL_IDLE_STATUS, DDI_BUF_CTL_OFFSET,
+        };
         let ddi_off = self.ddi.base() + DDI_BUF_CTL_OFFSET;
         let dconf = self.mmio.read32(ddi_off);
         self.mmio.write32(ddi_off, dconf & !DDI_BUF_CTL_ENABLE);
@@ -784,10 +1005,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         &mut self,
         coeffs: &crate::intel_gpu_pll::DpllCoeffs,
     ) -> Result<(), ModesetError> {
-        // DDI A → DPLL 0 (default Combo-PHY mapping). Stage-2 only
-        // exercises this; multi-DDI port arbitration via DPCLKA_CFGCR0
-        // lands when Pipe B+ comes online.
-        let dpll_idx: u32 = 0;
+        // Combo PHY DDIs A/B/C program DPLL 0/1/2 respectively
+        // (the DPCLKA default assignment); Type-C DDIs keep the
+        // historical DPLL 0 selection (see `dpll_index_for`).
+        let dpll_idx: u32 = dpll_index_for(self.ddi);
         let dpll_enable = dpll_enable_off(dpll_idx);
 
         // Step 1 — power the PLL up.
@@ -800,7 +1021,11 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
 
         // Step 2 — CFGCR0 / CFGCR1.
         let cfgcr0 = encode_cfgcr0(coeffs);
-        let cfgcr0_off = crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0;
+        let cfgcr0_off = match dpll_idx {
+            0 => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0,
+            1 => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL1,
+            _ => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL2,
+        };
         let cfgcr1_off = crate::intel_gpu_pll::dpll_cfgcr1(cfgcr0_off);
         self.mmio.write32(cfgcr0_off, cfgcr0);
         self.mmio.write32(cfgcr1_off, coeffs.cfgcr1);
@@ -827,22 +1052,23 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// start/end - 1" for the sync fields. Field packing comes
     /// from intel_gpu_pipes::build_transcoder.
     ///
-    /// Stage-2 binds Pipe A ↔ Transcoder A (mobile eDP often
-    /// uses Transcoder::Edp; Stage-3 will branch on port type).
+    /// The transcoder bound is this run's pipe's same-index
+    /// transcoder (mobile eDP on Pipe A uses Transcoder A on
+    /// Gen12; the dedicated Edp transcoder is pre-Gen12).
     ///
     /// Reference: Linux drivers/gpu/drm/i915/display/intel_pipe.c
     /// (`intel_set_transcoder_timings`).
     fn program_transcoder(&mut self, mode: &Mode) {
         use crate::intel_gpu_pipes::{
-            build_transcoder, Transcoder, TRANS_HBLANK_OFFSET, TRANS_HSYNC_OFFSET,
-            TRANS_HTOTAL_OFFSET, TRANS_VBLANK_OFFSET, TRANS_VSYNC_OFFSET, TRANS_VTOTAL_OFFSET,
+            build_transcoder, TRANS_HBLANK_OFFSET, TRANS_HSYNC_OFFSET, TRANS_HTOTAL_OFFSET,
+            TRANS_VBLANK_OFFSET, TRANS_VSYNC_OFFSET, TRANS_VTOTAL_OFFSET,
         };
         let timing = mode_to_display_timing(mode);
         let prog = match build_transcoder(&timing) {
             Ok(p) => p,
             Err(_) => return, // bad timing; downstream poll will time out
         };
-        let base = Transcoder::A.base();
+        let base = self.transcoder().base();
         self.mmio.write32(base + TRANS_HTOTAL_OFFSET, prog.htotal);
         self.mmio.write32(base + TRANS_HBLANK_OFFSET, prog.hblank);
         self.mmio.write32(base + TRANS_HSYNC_OFFSET, prog.hsync);
@@ -859,7 +1085,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// Reference: Linux drivers/gpu/drm/i915/display/intel_pipe.c
     /// (`intel_set_pipe_src_size`).
     fn program_pipe(&mut self, mode: &Mode) {
-        use crate::intel_gpu_pipes::{build_pipe, Pipe as PipeIdx, PIPE_SRCSZ_OFFSET};
+        use crate::intel_gpu_pipes::{build_pipe, PIPE_SRCSZ_OFFSET};
         let timing = mode_to_display_timing(mode);
         let prog = match build_pipe(&timing) {
             Ok(p) => p,
@@ -867,7 +1093,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         };
         // PIPE_SRCSZ lives inside the pipe MMIO block.
         self.mmio
-            .write32(PipeIdx::A.trans_base() + PIPE_SRCSZ_OFFSET, prog.srcsz);
+            .write32(self.pipe.trans_base() + PIPE_SRCSZ_OFFSET, prog.srcsz);
         compiler_fence(Ordering::SeqCst);
     }
 
@@ -887,9 +1113,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// the per-plane register writes in `skl_plane_update_*`).
     fn program_plane(&mut self, fb: &Framebuffer, mode: &Mode) {
         use crate::intel_gpu_pipes::{
-            build_primary_plane, Pipe as PipeIdx, PixelFormat as PipeFmt, PLANE_CTL_OFFSET,
-            PLANE_OFFSET_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SIZE_OFFSET, PLANE_STRIDE_OFFSET,
-            PLANE_SURF_OFFSET,
+            build_primary_plane, PixelFormat as PipeFmt, PLANE_CTL_OFFSET, PLANE_OFFSET_OFFSET,
+            PLANE_PRIMARY_OFFSET, PLANE_SIZE_OFFSET, PLANE_STRIDE_OFFSET, PLANE_SURF_OFFSET,
         };
         let pipe_fmt = match fb.format {
             // XRGB8888 → 8:8:8:8 ARGB encoding (alpha treated as
@@ -906,7 +1131,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             Ok(p) => p,
             Err(_) => return,
         };
-        let base = PipeIdx::A.base() + PLANE_PRIMARY_OFFSET;
+        let base = self.pipe.base() + PLANE_PRIMARY_OFFSET;
         // Per Linux skl_plane_update: program everything *except*
         // PLANE_CTL.ENABLE first, then the SURF register last —
         // writing SURF arms the plane on the next vblank.
@@ -985,9 +1210,11 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         compiler_fence(Ordering::SeqCst);
     }
 
-    /// Program DPCLKA_CFGCR0 routing: DPLL0 → this DDI, clock
-    /// on, in the PRM's two writes (select with the clock off,
-    /// then clear the off bit).
+    /// Program DPCLKA_CFGCR0 routing: this DDI's DPLL
+    /// (`dpll_index_for`) → this DDI, clock on, in the PRM's two
+    /// writes (select with the clock off, then clear the off
+    /// bit). For DDI A / DPLL 0 this is byte-identical to the
+    /// pre-multi-pipe programming.
     fn program_dpclka_routing(&mut self) {
         use crate::intel_gpu_pll::{
             dpclka_clk_off, dpclka_clk_sel, dpclka_clk_sel_mask, DPCLKA_CFGCR0,
@@ -995,7 +1222,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         let phy = self.ddi as u32;
         let cur = self.mmio.read32(DPCLKA_CFGCR0);
         let selected = (cur & !dpclka_clk_sel_mask(phy) & !dpclka_clk_off(phy))
-            | dpclka_clk_sel(0, phy)
+            | dpclka_clk_sel(dpll_index_for(self.ddi), phy)
             | dpclka_clk_off(phy);
         self.mmio.write32(DPCLKA_CFGCR0, selected);
         compiler_fence(Ordering::SeqCst);
@@ -1024,7 +1251,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         compiler_fence(Ordering::SeqCst);
     }
 
-    /// Program the DP data/link M/N registers for Transcoder A.
+    /// Program the DP data/link M/N registers for this run's
+    /// transcoder.
     fn program_mn(&mut self, mode: &Mode) {
         let rate = link_rate_for_pixel_clock(mode.pixel_clock_khz);
         let ls_khz = rate.megabits_per_sec() * 100;
@@ -1040,11 +1268,11 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
 
     fn program_mn_values(&mut self, mode: &Mode, ls_khz: u32, lanes: u8) {
         use crate::intel_gpu_pipes::{
-            dp_mn, Transcoder, PIPE_DATA_M1_OFFSET, PIPE_DATA_N1_OFFSET, PIPE_LINK_M1_OFFSET,
+            dp_mn, PIPE_DATA_M1_OFFSET, PIPE_DATA_N1_OFFSET, PIPE_LINK_M1_OFFSET,
             PIPE_LINK_N1_OFFSET,
         };
         let (dm, dn, lm, ln) = dp_mn(mode.pixel_clock_khz, ls_khz, lanes as u32, 3);
-        let base = Transcoder::A.base();
+        let base = self.transcoder().base();
         self.mmio.write32(base + PIPE_DATA_M1_OFFSET, dm);
         self.mmio.write32(base + PIPE_DATA_N1_OFFSET, dn);
         self.mmio.write32(base + PIPE_LINK_M1_OFFSET, lm);
@@ -1053,16 +1281,16 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         compiler_fence(Ordering::SeqCst);
     }
 
-    /// Bind Transcoder A to this DDI (DP-SST, 8 bpc, `lanes`
-    /// lanes — 4 on the legacy path, the negotiated count on
-    /// the plan path).
-    fn program_trans_ddi_func_ctl(&mut self, lanes: u8) {
-        use crate::intel_gpu_pipes::{
-            build_trans_ddi_func_ctl, Transcoder, TRANS_DDI_FUNC_CTL_OFFSET, TRANS_DDI_MODE_DP_SST,
-        };
-        let val = build_trans_ddi_func_ctl(self.ddi as u8, TRANS_DDI_MODE_DP_SST, lanes);
+    /// Bind this run's transcoder to this DDI with an explicit
+    /// DDI mode field (`TRANS_DDI_MODE_*`): DP-SST for SST
+    /// runs (8 bpc, `lanes` lanes — 4 on the legacy path, the
+    /// negotiated count on the plan path), DP-MST for MST
+    /// stream runs (#1017).
+    fn program_trans_ddi_func_ctl_mode(&mut self, lanes: u8, mode: u32) {
+        use crate::intel_gpu_pipes::{build_trans_ddi_func_ctl, TRANS_DDI_FUNC_CTL_OFFSET};
+        let val = build_trans_ddi_func_ctl(self.ddi as u8, mode, lanes);
         self.mmio
-            .write32(Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET, val);
+            .write32(self.transcoder().base() + TRANS_DDI_FUNC_CTL_OFFSET, val);
         compiler_fence(Ordering::SeqCst);
     }
 
@@ -1083,6 +1311,14 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// and program PLANE_WM levels 0..5, the SAGV and
     /// transition watermarks, and PLANE_BUF_CFG.
     ///
+    /// Multi-pipe (#1017): when the coordinator set an explicit
+    /// DBUF share for this pipe, the PRM basic programming
+    /// carries the share's block range instead (level-0
+    /// watermark = the share size at 2 lines, PLANE_BUF_CFG =
+    /// the share's (start, end)); the latency algorithm here
+    /// models a single consumer owning the whole DDB. A single
+    /// active pipe never gets a share.
+    ///
     /// Fallback: if the pcode latency read fails, or the
     /// computed set has no usable level 0, program lane 1's
     /// PRM pre-OS-boot basics instead — a conservative fixed
@@ -1094,6 +1330,15 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             adjust_latencies, compute_plane_watermarks, encode_plane_buf_cfg, encode_wm_level,
             validate_watermarks, WmParams, PRIMARY_DDB_END, PRIMARY_DDB_START,
         };
+        if let Some((start, end)) = self.dbuf_share {
+            write_wm_block(
+                self.mmio,
+                self.pipe,
+                plane_wm0_for_blocks(end - start + 1),
+                dbuf_buf_cfg(start, end),
+            );
+            return;
+        }
         let mmio = self.mmio;
         let computed = (|| {
             let raw = crate::intel_gpu_pcode::read_mem_latencies(mmio).ok()?;
@@ -1125,7 +1370,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                 return;
             }
         };
-        let wm_base = Pipe::A.base() + PLANE_WM_BASE_OFFSET;
+        let wm_base = self.pipe.base() + PLANE_WM_BASE_OFFSET;
         for (level, wm_level) in wm.levels.iter().enumerate() {
             self.mmio
                 .write32(wm_base + level as u64 * 4, encode_wm_level(wm_level));
@@ -1139,7 +1384,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.mmio
             .write32(wm_base + PLANE_WM_TRANS_OFFSET, encode_wm_level(&wm.trans));
         self.mmio.write32(
-            Pipe::A.base() + PLANE_BUF_CFG_OFFSET,
+            self.pipe.base() + PLANE_BUF_CFG_OFFSET,
             encode_plane_buf_cfg(PRIMARY_DDB_START, PRIMARY_DDB_END),
         );
         compiler_fence(Ordering::SeqCst);
@@ -1149,26 +1394,19 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// the latency-based algorithm cannot run: the PRM's
     /// "Display Buffer Allocation and Watermark Programming
     /// Prior to OS Boot" values (TGL PRM Vol. 12) — 160 DBUF
-    /// blocks for Pipe A's primary plane (PLANE_BUF_CFG =
+    /// blocks for this pipe's primary plane (PLANE_BUF_CFG =
     /// END 159 / START 0), level-0 watermark 160 blocks /
     /// 2 lines (0x800080A0), all higher levels, SAGV and
     /// transition watermarks disabled. The PRM scopes this
     /// programming to any resolution, linear surfaces,
     /// <=32 bpp, one universal plane per pipe.
     fn program_watermarks_preboot(&mut self) {
-        let wm_base = Pipe::A.base() + PLANE_WM_BASE_OFFSET;
-        self.mmio.write32(wm_base, PLANE_WM0_PREBOOT);
-        for level in 1..6u64 {
-            self.mmio.write32(wm_base + level * 4, 0);
-        }
-        self.mmio.write32(wm_base + PLANE_WM_SAGV_OFFSET, 0);
-        self.mmio.write32(wm_base + PLANE_WM_SAGV_TRANS_OFFSET, 0);
-        self.mmio.write32(wm_base + PLANE_WM_TRANS_OFFSET, 0);
-        self.mmio.write32(
-            Pipe::A.base() + PLANE_BUF_CFG_OFFSET,
+        write_wm_block(
+            self.mmio,
+            self.pipe,
+            PLANE_WM0_PREBOOT,
             PLANE_BUF_CFG_PREBOOT_A,
         );
-        compiler_fence(Ordering::SeqCst);
     }
 
     // ── DDI buffer enable ────────────────────────────────────
@@ -1201,16 +1439,14 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
 
     // ── Final enables (PRM-mandated order) ───────────────────
 
-    /// Enable Transcoder A. TRANS_CONF.ENABLE + state-active poll
-    /// per PRM Vol. 14 §"Transcoder Enable".
+    /// Enable this run's transcoder. TRANS_CONF.ENABLE +
+    /// state-active poll per PRM Vol. 14 §"Transcoder Enable".
     ///
     /// Reference: Linux drivers/gpu/drm/i915/display/intel_pipe.c
     /// (`intel_enable_transcoder`).
     fn enable_transcoder(&mut self) {
-        use crate::intel_gpu_pipes::{
-            Transcoder, PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE,
-        };
-        let off = Transcoder::A.conf_base() + PIPECONF_OFFSET;
+        use crate::intel_gpu_pipes::{PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE};
+        let off = self.transcoder().conf_base() + PIPECONF_OFFSET;
         let cur = self.mmio.read32(off);
         self.mmio.write32(off, cur | PIPECONF_ENABLE);
         compiler_fence(Ordering::SeqCst);
@@ -1219,18 +1455,16 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         let _ = wait_bit(self.mmio, off, PIPECONF_STATE, true, 100_000_000);
     }
 
-    /// Enable Pipe A. Same register block as the transcoder on
-    /// Gen12 (PIPE_CONF / TRANS_CONF are aliased at the per-
-    /// pipe block); writing the same ENABLE bit at Pipe A's base
-    /// turns on the per-pipe raster engine.
+    /// Enable this run's pipe. Same register block as the
+    /// transcoder on Gen12 (PIPE_CONF / TRANS_CONF are aliased
+    /// at the per-pipe block); writing the same ENABLE bit at
+    /// the pipe's base turns on the per-pipe raster engine.
     ///
     /// Reference: Linux drivers/gpu/drm/i915/display/intel_pipe.c
     /// (`intel_enable_pipe`).
     fn enable_pipe(&mut self) {
-        use crate::intel_gpu_pipes::{
-            Pipe as PipeIdx, PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE,
-        };
-        let off = PipeIdx::A.base() + PIPECONF_OFFSET;
+        use crate::intel_gpu_pipes::{PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE};
+        let off = self.pipe.base() + PIPECONF_OFFSET;
         let cur = self.mmio.read32(off);
         self.mmio.write32(off, cur | PIPECONF_ENABLE);
         compiler_fence(Ordering::SeqCst);
@@ -1320,15 +1554,69 @@ fn cdclk_decode_khz(ctl: u32) -> u32 {
 // = 0x70268, PLANE_BUF_CFG_1_A = 0x7027C — expressed here as
 // offsets from Pipe::A.base() (0x70000).
 
-const PLANE_WM_BASE_OFFSET: u64 = 0x0240;
+pub(crate) const PLANE_WM_BASE_OFFSET: u64 = 0x0240;
 const PLANE_WM_SAGV_OFFSET: u64 = 0x0018;
 const PLANE_WM_SAGV_TRANS_OFFSET: u64 = 0x001C;
 const PLANE_WM_TRANS_OFFSET: u64 = 0x0028;
-const PLANE_BUF_CFG_OFFSET: u64 = 0x027C;
+pub(crate) const PLANE_BUF_CFG_OFFSET: u64 = 0x027C;
 /// PRM pre-OS-boot level-0 watermark: enable | 2 lines | 160 blocks.
 const PLANE_WM0_PREBOOT: u32 = 0x8000_80A0;
 /// PRM pre-OS-boot DBUF allocation for Pipe A: END 159, START 0.
 const PLANE_BUF_CFG_PREBOOT_A: u32 = 0x009F_0000;
+
+/// `PLANE_WM` level-0 value for a plane allocated `blocks` DBUF
+/// blocks, in the PRM's basic programming shape: WM enable,
+/// 2 lines, `blocks` in the blocks field (bits [13:0]).
+/// `plane_wm0_for_blocks(160)` is exactly
+/// [`PLANE_WM0_PREBOOT`] — the pre-boot programming is this
+/// shape at 160 blocks (pinned by a fixture).
+pub const fn plane_wm0_for_blocks(blocks: u16) -> u32 {
+    (1 << 31) | (2 << 14) | (blocks as u32 & 0x3FFF)
+}
+
+/// `PLANE_BUF_CFG` value for the DBUF block range
+/// `start..=end`: END in bits [26:16], START in bits [10:0].
+/// `dbuf_buf_cfg(0, 159)` is exactly [`PLANE_BUF_CFG_PREBOOT_A`].
+pub const fn dbuf_buf_cfg(start: u16, end: u16) -> u32 {
+    ((end as u32 & 0x7FF) << 16) | (start as u32 & 0x7FF)
+}
+
+/// Write one pipe's watermark block + DBUF allocation: level-0
+/// watermark `wm0`, levels 1–5 / SAGV / transition disabled,
+/// PLANE_BUF_CFG `buf_cfg`. The PLANE_SURF write of a later
+/// modeset (or the plane's next vblank latch) applies them.
+fn write_wm_block<M: MmioWindow + ?Sized>(mmio: &M, pipe: Pipe, wm0: u32, buf_cfg: u32) {
+    let wm_base = pipe.base() + PLANE_WM_BASE_OFFSET;
+    mmio.write32(wm_base, wm0);
+    for level in 1..6u64 {
+        mmio.write32(wm_base + level * 4, 0);
+    }
+    mmio.write32(wm_base + PLANE_WM_SAGV_OFFSET, 0);
+    mmio.write32(wm_base + PLANE_WM_SAGV_TRANS_OFFSET, 0);
+    mmio.write32(wm_base + PLANE_WM_TRANS_OFFSET, 0);
+    mmio.write32(pipe.base() + PLANE_BUF_CFG_OFFSET, buf_cfg);
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Reprogram an already-live pipe's DBUF share (#1017): when
+/// the set of active pipes changes, the multi-pipe coordinator
+/// rewrites every surviving pipe's watermark block and
+/// PLANE_BUF_CFG with its new share of the DBUF pool, exactly
+/// as i915 recomputes DBUF allocations on every atomic commit
+/// that changes the active-pipe set.
+pub fn program_pipe_dbuf_share<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    pipe: Pipe,
+    start_block: u16,
+    end_block: u16,
+) {
+    write_wm_block(
+        mmio,
+        pipe,
+        plane_wm0_for_blocks(end_block - start_block + 1),
+        dbuf_buf_cfg(start_block, end_block),
+    );
+}
 
 /// Poll an MMIO register's `mask` bits until they assert (when
 /// `want_set` is `true`) or deassert (when `false`). Returns
@@ -1495,20 +1783,110 @@ pub mod tests {
         smoke_enable_pg2_polls_and_writes_request
     );
 
-    fn smoke_enable_pg_rejects_nonzero_pipe_b() -> TestResult {
-        let mmio = FakeMmio::new();
-        let mut ms = Modeset::new(&mmio, Ddi::A);
+    fn smoke_enable_pg3_for_pipe_b() -> TestResult {
+        // Multi-pipe (#1017): Pipe B lives under PG3. With the
+        // PG3 STATE bit granted, the enable must succeed and
+        // the REQUEST write must carry the PG3 request bit.
+        let mut mmio = FakeMmio::new();
+        mmio.state_offset = super::PWR_WELL_CTL2;
+        mmio.state_value = super::pwr_well_state(super::PowerWell::Pg3 as u32);
+        let mut ms = Modeset::for_pipe(&mmio, Ddi::B, Pipe::B);
         match ms.enable_pipe_power_well(Pipe::B) {
-            Err(ModesetError::PowerWellTimeout) => TestResult::Pass,
-            other => {
-                let _ = other;
-                TestResult::Fail("Pipe B should require Stage-3 PG3 work")
+            Ok(()) => {}
+            Err(e) => {
+                let _ = e;
+                return TestResult::Fail("PG3 enable returned error with state asserted");
             }
         }
+        let req = super::pwr_well_req(super::PowerWell::Pg3 as u32);
+        let writes = mmio.writes_to(super::PWR_WELL_CTL2);
+        if writes.iter().all(|w| (w & req) == 0) {
+            return TestResult::Fail("PG3 REQUEST bit never set");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_modeset", smoke_enable_pg3_for_pipe_b);
+
+    fn smoke_enable_pg4_for_pipe_c() -> TestResult {
+        // Pipe C lives under PG4 (#1017).
+        let mut mmio = FakeMmio::new();
+        mmio.state_offset = super::PWR_WELL_CTL2;
+        mmio.state_value = super::pwr_well_state(super::PowerWell::Pg4 as u32);
+        let mut ms = Modeset::for_pipe(&mmio, Ddi::C, Pipe::C);
+        match ms.enable_pipe_power_well(Pipe::C) {
+            Ok(()) => {}
+            Err(e) => {
+                let _ = e;
+                return TestResult::Fail("PG4 enable returned error with state asserted");
+            }
+        }
+        let req = super::pwr_well_req(super::PowerWell::Pg4 as u32);
+        let writes = mmio.writes_to(super::PWR_WELL_CTL2);
+        if writes.iter().all(|w| (w & req) == 0) {
+            return TestResult::Fail("PG4 REQUEST bit never set");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_modeset", smoke_enable_pg4_for_pipe_c);
+
+    fn smoke_enable_pg_rejects_pipe_d() -> TestResult {
+        // Pipe D is outside this driver's arbitration set: the
+        // refusal is immediate and names no well — no CTL2
+        // write may happen at all.
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::for_pipe(&mmio, Ddi::A, Pipe::D);
+        match ms.enable_pipe_power_well(Pipe::D) {
+            Err(ModesetError::PowerWellTimeout) => {}
+            other => {
+                let _ = other;
+                return TestResult::Fail("Pipe D must be refused");
+            }
+        }
+        if !mmio.writes_to(super::PWR_WELL_CTL2).is_empty() {
+            return TestResult::Fail("Pipe D refusal must not touch PWR_WELL_CTL2");
+        }
+        TestResult::Pass
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
-        smoke_enable_pg_rejects_nonzero_pipe_b
+        smoke_enable_pg_rejects_pipe_d
+    );
+
+    fn smoke_dbuf_share_encodings_match_preboot() -> TestResult {
+        // The share encodings must reproduce the PRM pre-boot
+        // constants at the pre-boot allocation: 160 blocks at
+        // (0, 159). If either drifts, single-pipe programming
+        // silently changes shape.
+        if super::plane_wm0_for_blocks(160) != super::PLANE_WM0_PREBOOT {
+            return TestResult::Fail("WM0(160 blocks) != PLANE_WM0_PREBOOT");
+        }
+        if super::dbuf_buf_cfg(0, 159) != super::PLANE_BUF_CFG_PREBOOT_A {
+            return TestResult::Fail("BUF_CFG(0,159) != PLANE_BUF_CFG_PREBOOT_A");
+        }
+        // program_pipe_dbuf_share writes the pipe's own block:
+        // Pipe B share (512, 1023) → BUF_CFG at 0x7127C.
+        let mmio = FakeMmio::new();
+        super::program_pipe_dbuf_share(&mmio, Pipe::B, 512, 1023);
+        let buf_cfg_off = Pipe::B.base() + super::PLANE_BUF_CFG_OFFSET;
+        if mmio.writes_to(buf_cfg_off) != alloc::vec![super::dbuf_buf_cfg(512, 1023)] {
+            return TestResult::Fail("Pipe B PLANE_BUF_CFG share not written");
+        }
+        let wm_off = Pipe::B.base() + super::PLANE_WM_BASE_OFFSET;
+        if mmio.writes_to(wm_off) != alloc::vec![super::plane_wm0_for_blocks(512)] {
+            return TestResult::Fail("Pipe B PLANE_WM0 share not written");
+        }
+        // And nothing lands in Pipe A's block.
+        if !mmio
+            .writes_to(Pipe::A.base() + super::PLANE_BUF_CFG_OFFSET)
+            .is_empty()
+        {
+            return TestResult::Fail("share reprogram leaked into Pipe A");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_dbuf_share_encodings_match_preboot
     );
 
     fn smoke_link_rate_for_pixel_clock_floors() -> TestResult {
@@ -1811,7 +2189,7 @@ pub mod tests {
         use crate::intel_gpu_pipes::{Pipe as PipeIdx, Transcoder, TRANS_DDI_FUNC_CTL_OFFSET};
         let mmio = FakeMmio::new();
         let mut ms = Modeset::new(&mmio, Ddi::A);
-        ms.program_trans_ddi_func_ctl(4);
+        ms.program_trans_ddi_func_ctl_mode(4, crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST);
         let want = (1u32 << 31) | (1 << 27) | (2 << 24) | (3 << 1);
         let writes = mmio.writes_to(Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET);
         if writes != alloc::vec![want] {
