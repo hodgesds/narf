@@ -59,8 +59,8 @@ fn fake_controller(oncs: u16, nsze: u64, cqe0_status: u16) -> Option<FakeCtrl> {
     }
     let mut ctrl = Controller::new(0);
     ctrl.bar0_region = Some(MmioRegion {
-        phys: bar.dma_addr(),
-        virt: bar.dma_addr().raw(),
+        phys: narf_memory::PhysAddr::new(bar.dma_addr().raw()),
+        virt: bar.cpu_ptr::<u8>() as u64,
         len: bar.len() as u64,
         kind: BarKind::Mmio32 {
             prefetchable: false,

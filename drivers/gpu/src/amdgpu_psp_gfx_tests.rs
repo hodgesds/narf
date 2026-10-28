@@ -555,6 +555,10 @@ fn psp_navi48_interrupted_upload_preserves_ownership() -> TestResult {
         let (pool, mut s) = prepared();
         s.engine.io.stall_command = Some(6);
         s.engine.io.stall_type = Some(kind);
+        // Fifty polls reach the last upload (DMUB); the stalled
+        // command must still be outstanding when the future is
+        // dropped, not time out at the default sixteen-poll cap.
+        s.engine.io.poll_limit = 64;
         {
             let mut future = core::pin::pin!(s.load_gfx12(&images));
             for _ in 0..50 {

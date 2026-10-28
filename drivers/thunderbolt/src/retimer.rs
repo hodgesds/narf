@@ -270,6 +270,7 @@ async fn sb_command(
 /// Read `len` bytes (1..=64) from SB register `reg` of the selected
 /// target. The data dwords land in `PORT_CS_2`.. in increasing
 /// address order, little-endian within each dword.
+#[allow(clippy::too_many_arguments)] // the USB4 sideband request's fields
 pub async fn sb_read(
     ctl: &mut impl Config,
     route: u64,
@@ -301,6 +302,7 @@ pub async fn sb_read(
 
 /// Write `data` dwords to SB register `reg` of the selected target.
 /// Data is staged in `PORT_CS_2`.. before the command is issued.
+#[allow(clippy::too_many_arguments)] // the USB4 sideband request's fields
 pub async fn sb_write(
     ctl: &mut impl Config,
     route: u64,
@@ -333,6 +335,7 @@ pub async fn sb_write(
 /// [`Error::NotSupported`], anything else is
 /// [`Error::Malformed`]. Callers stage any operation Metadata/Data
 /// before calling.
+#[allow(clippy::too_many_arguments)] // the USB4 sideband request's fields
 pub async fn port_op(
     ctl: &mut impl Config,
     route: u64,

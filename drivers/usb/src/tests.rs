@@ -7449,8 +7449,6 @@ kernel_test_in!("drivers/usb/uvc", smoke_uvc_streamon_generation_toggle);
 use crate::msc::{BotTransport, MscError};
 use crate::xhci::XhciError;
 use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
-use narf_lib::sync::IrqSafeSpinLock;
 
 /// Fixed-format sense data (SPC-4 §4.5): response code 0x70 in
 /// byte 0, sense key in the low nibble of byte 2, additional
@@ -7932,7 +7930,7 @@ impl BotTransport for FakeBot {
         _w_index: u16,
         out: &mut [u8],
     ) -> Result<usize, MscError> {
-        let mut st = self.state.lock();
+        let st = self.state.lock();
         // GET MAX LUN (BOT §3.3): class/interface IN, 0xFE.
         if bm_request_type == 0xA1 && b_request == 0xFE {
             if !st.support_max_lun || out.is_empty() {
@@ -8162,9 +8160,8 @@ fn smoke_msc_fixture_multi_lun() -> TestResult {
         FakeLun::new(2048, 512),
         FakeLun::new(4096, 512)
     ]);
-    match narf_scheduler::block_on(msc_fixture_multi_lun(&fake)) {
-        Ok(()) => TestResult::Pass,
-        Err(m) => TestResult::Fail(m),
+    if let Err(m) = narf_scheduler::block_on(msc_fixture_multi_lun(&fake)) {
+        return TestResult::Fail(m);
     }
     let stubborn = FakeBot::without_max_lun(alloc::vec![FakeLun::new(64, 512)]);
     let outcome = narf_scheduler::block_on(async {

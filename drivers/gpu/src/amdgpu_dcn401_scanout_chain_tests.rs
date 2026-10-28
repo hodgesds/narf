@@ -520,6 +520,7 @@ fn start_hdmi(
         event: e.io.inner.event.clone(),
         writes: e.io.inner.writes.clone(),
         fail: None,
+        power_downs: Vec::new(),
     };
     let request = crate::amdgpu_dcn401_otg::HdmiLinkRequest {
         stream,
@@ -1245,6 +1246,7 @@ fn unwind_stage(c: &mut Chain, stage: u32) {
         event: c.e.io.inner.event.clone(),
         writes: c.e.io.inner.writes.clone(),
         fail: None,
+        power_downs: Vec::new(),
     };
     run(c.e.stop_hdmi_link(&mut firmware, path(0))).unwrap();
     run(c.e.retire(0)).unwrap();

@@ -764,6 +764,7 @@ fn publish_console(boot: &boot::ColdBoot) {
 /// its buffers, and every retired CPU view drained.
 async fn withdraw(boot: &boot::ColdBoot) {
     PRESENT.native.store(false, Ordering::Release);
+    PRESENT.damage.lock().forget();
     if let Some(s) = boot.display_scanout_ref() {
         let ours = |addr| {
             [Some(s.front()), s.back()]
@@ -885,6 +886,7 @@ async unsafe fn light(
     // Without a back buffer (allocation failed) DRM frames fall back to
     // copies onto the visible front.
     let back = boot.prepare_display_back_buffer().await;
+    PRESENT.damage.lock().forget();
     PRESENT.native.store(back.is_ok(), Ordering::Release);
     restart_vblank();
     publish_console(boot);
@@ -1731,11 +1733,14 @@ struct PresentSlot {
     native: AtomicBool,
     presenting: AtomicBool,
     next: narf_lib::sync::IrqSafeSpinLock<Option<Frame>>,
+    /// What the scanout buffers hold, for damaged (DIRTYFB) frames.
+    damage: narf_lib::sync::IrqSafeSpinLock<crate::amdgpu_present_damage::Damage>,
 }
 static PRESENT: PresentSlot = PresentSlot {
     native: AtomicBool::new(false),
     presenting: AtomicBool::new(false),
     next: narf_lib::sync::IrqSafeSpinLock::new(None),
+    damage: narf_lib::sync::IrqSafeSpinLock::new(crate::amdgpu_present_damage::Damage::new()),
 };
 #[derive(Clone, Debug)]
 struct Frame {
@@ -1746,6 +1751,9 @@ struct Frame {
     offset: u64,
     bo: Option<alloc::sync::Arc<crate::amdgpu_gem::ScanoutPin>>,
     ticket: Option<u64>,
+    /// The rows that changed since the source's previous frame (DIRTYFB);
+    /// None: all of them.
+    damage: Option<core::ops::Range<u32>>,
 }
 
 #[path = "amdgpu_navi22_frame_copy.rs"]
@@ -1815,6 +1823,18 @@ pub(crate) fn present_plane(
     plane: Option<crate::amdgpu_navi48_platform::PlaneFrame>,
     ticket: Option<u64>,
 ) -> bool {
+    present_damaged(display, plane, ticket, None)
+}
+
+/// As [`present_plane`], for a dumb-buffer frame whose rows outside
+/// `damage` are unchanged since that buffer's previous frame (DIRTYFB).
+/// Only those rows, and what the back buffer missed, are copied.
+pub(crate) fn present_damaged(
+    display: u8,
+    plane: Option<crate::amdgpu_navi48_platform::PlaneFrame>,
+    ticket: Option<u64>,
+    damage: Option<core::ops::Range<u32>>,
+) -> bool {
     let Some(plane) = plane else {
         complete_flip(display, ticket, None);
         return true;
@@ -1825,9 +1845,13 @@ pub(crate) fn present_plane(
         complete_flip(display, ticket, None);
         return false;
     };
+    frame.damage = damage;
     {
         let mut next = PRESENT.next.lock();
         frame.ticket = ticket.max(next.as_ref().and_then(|f| f.ticket));
+        if let Some(old) = next.as_ref() {
+            frame_copy::coalesce(old, &mut frame);
+        }
         *next = Some(frame);
     }
     if !PRESENT.presenting.swap(true, Ordering::AcqRel) {
@@ -1909,14 +1933,25 @@ async unsafe fn present_native(
             .map_err(|_| ScanError::DeviceGone)?;
     }
     let scanout = boot.display_scanout()?;
-    let back = scanout.back().ok_or(ScanError::Invalid)?.fb;
+    let surface = scanout.back().ok_or(ScanError::Invalid)?;
+    let back = surface.fb;
+    // Taken for the present: a failed copy or flip leaves both buffers
+    // unknown.
+    let mut damage = core::mem::take(&mut *PRESENT.damage.lock());
+    // Navi22 reallocates no buffer behind the presenter (a relight forgets
+    // them), so one epoch serves.
+    let tracked = frame_copy::damage_source(frame);
+    let rows = match tracked {
+        Some(_) => damage.plan(tracked, frame.damage.as_ref(), surface.address, 0),
+        None => 0..frame.height,
+    };
     let width = frame.width.min(back.width);
     let mut pixels = alloc::vec::Vec::new();
     pixels
         .try_reserve_exact(width as usize)
         .map_err(|_| ScanError::Allocation)?;
     pixels.resize(width as usize, 0u32);
-    for y in 0..frame.height.min(back.height) {
+    for y in rows.start..rows.end.min(back.height) {
         // OWNER excludes reset while CPU reads a visible VRAM source.
         boot.access_vram(|| {
             frame_copy::row(frame, source, y, &mut pixels)
@@ -1930,7 +1965,10 @@ async unsafe fn present_native(
     }
     let before = boot.display_scanout()?.front().fb;
     boot.flip_display().await?;
-    Ok((before, boot.display_scanout()?.front().fb))
+    let scanout = boot.display_scanout()?;
+    damage.presented(tracked, frame.damage.as_ref(), Some(surface.address), 0);
+    *PRESENT.damage.lock() = damage;
+    Ok((before, scanout.front().fb))
 }
 
 // ── Opt-in power saving (`amdgpu.navi22_pg`) ────────────────────────────

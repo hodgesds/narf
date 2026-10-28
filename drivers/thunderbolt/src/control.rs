@@ -376,7 +376,10 @@ impl Control {
 }
 
 /// Config-space transport used by both the native ring and device-model tests.
-pub(crate) trait Config {
+/// `pub` only so the public retimer operations may name it; `control` stays
+/// private, and every implementer is in this crate.
+#[allow(async_fn_in_trait)]
+pub trait Config {
     async fn read(
         &mut self,
         route: u64,

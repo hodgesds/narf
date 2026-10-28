@@ -175,6 +175,8 @@ pub const GEN12_MEDIA_ENGINES: [EngineSpec; 3] = [VCS0_SPEC, VCS1_SPEC, VECS0_SP
 pub fn media_engines_for(gen: RegionGeneration) -> &'static [EngineSpec] {
     match gen {
         RegionGeneration::Gen12 => &GEN12_MEDIA_ENGINES,
+        // MTL's media engines sit on a separate media GT, not modelled.
+        RegionGeneration::XeLpg => &[],
     }
 }
 

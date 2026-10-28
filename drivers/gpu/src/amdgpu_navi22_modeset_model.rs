@@ -479,6 +479,8 @@ pub(crate) struct DpSink {
     pub feature: u8,
     /// Receiver caps at DPCD 0x0 (and, with bit 7 of 0xE, at 0x2200).
     pub caps: [u8; 16],
+    /// MSTM_CAP (DPCD 0x21).
+    pub mstm_cap: u8,
 }
 impl DpSink {
     pub fn new(model: Arc<Model>) -> Self {
@@ -488,6 +490,7 @@ impl DpSink {
             fail_rates: Vec::new(),
             feature: 0,
             caps: dpcd(0x12),
+            mstm_cap: 0,
         }
     }
 }
@@ -513,6 +516,8 @@ impl crate::amdgpu_dcn30_dp::Aux for DpSink {
                 0x204 | 0x200e if locked => 0x01,
                 0x600 => *self.dpcd.get(&0x600).unwrap_or(&1),
                 0x2210 => self.feature,
+                0x021 => self.mstm_cap,
+                0x111 => *self.dpcd.get(&0x111).unwrap_or(&0),
                 _ => 0,
             };
         }

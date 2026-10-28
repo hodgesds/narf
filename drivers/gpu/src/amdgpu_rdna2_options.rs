@@ -39,6 +39,19 @@ pub struct BootOptions<'a> {
     /// (DMCUB implements the tables itself; its golden init does more than
     /// the bytecode). Diagnostic.
     pub atom_pixclk: bool,
+    /// `amdgpu.rdna2_connector=dp|hdmi`: the output the single-display boot
+    /// modeset lights when both kinds have a sink (Linux's order, HDMI
+    /// first, otherwise). Diagnostic: lets either output be tested with
+    /// both cables attached.
+    pub connector: Connector,
+}
+/// [`BootOptions::connector`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Connector {
+    #[default]
+    Any,
+    Hdmi,
+    DisplayPort,
 }
 impl Default for BootOptions<'_> {
     fn default() -> Self {
@@ -84,6 +97,11 @@ impl<'a> BootOptions<'a> {
             power_saving,
             dmub_tables: switch("amdgpu.rdna2_dmub_tables", None, true),
             atom_pixclk: switch("amdgpu.rdna2_atom_pixclk", None, false),
+            connector: match value("amdgpu.rdna2_connector") {
+                Some(Some("dp" | "DP" | "displayport")) => Connector::DisplayPort,
+                Some(Some("hdmi" | "HDMI")) => Connector::Hdmi,
+                _ => Connector::Any,
+            },
         }
     }
 }
@@ -131,5 +149,14 @@ mod tests {
         // A typo neither enables an opt-in feature nor disables a default.
         let typo = BootOptions::parse("amdgpu.rdna2_multi=maybe amdgpu.rdna2_accel=nope");
         assert!(!typo.multi && typo.accel);
+        assert_eq!(default.connector, Connector::Any);
+        for (raw, want) in [
+            ("amdgpu.rdna2_connector=dp", Connector::DisplayPort),
+            ("amdgpu.rdna2_connector=hdmi", Connector::Hdmi),
+            ("amdgpu.rdna2_connector=vga", Connector::Any),
+            ("amdgpu.rdna2_connector", Connector::Any),
+        ] {
+            assert_eq!(BootOptions::parse(raw).connector, want);
+        }
     }
 }

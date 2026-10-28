@@ -1,6 +1,7 @@
 //! DCN30's linear primary: a retained GEM placement or a dumb buffer,
 //! copied into the native back buffer before its VUPDATE flip.
 use super::{Frame, ScanError};
+use crate::amdgpu_present_damage as damage;
 use crate::{amdgpu_gem::GemPlacement, amdgpu_navi48_platform::PlaneFrame};
 use alloc::sync::Arc;
 
@@ -36,8 +37,30 @@ impl Frame {
             offset: u64::from(p.offsets[0]),
             bo: p.bo,
             ticket,
+            damage: None,
         })
     }
+}
+
+/// The dumb buffer `frame` copies from, for damage tracking (None: a GEM
+/// frame).
+pub(super) fn damage_source(frame: &Frame) -> Option<damage::Source> {
+    frame.bo.is_none().then_some(damage::Source {
+        phys: frame.phys,
+        pitch: frame.pitch,
+        width: frame.width,
+        height: frame.height,
+        offset: frame.offset,
+    })
+}
+
+/// `next` replaces the waiting `old`: its damage must cover both, since
+/// `old` is never copied.
+pub(super) fn coalesce(old: &Frame, next: &mut Frame) {
+    next.damage = damage::coalesce(
+        (damage_source(old), old.damage.as_ref()),
+        (damage_source(next), next.damage.as_ref()),
+    );
 }
 
 fn error(e: narf_filesystem::FsError) -> ScanError {
@@ -283,5 +306,32 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi22",
         navi22_linear_gem_copy_waits_for_render_fence_without_owner
+    );
+
+    fn navi22_replaced_dirty_frame_keeps_its_damage() -> TestResult {
+        let dumb = |phys, damage| {
+            let mut frame =
+                Frame::from_plane(PlaneFrame::linear(phys, 64, 16, 100, 0x3432_5258), None)
+                    .unwrap();
+            frame.damage = damage;
+            frame
+        };
+        let mut next = dumb(0x8000_0000, Some(50..60));
+        coalesce(&dumb(0x8000_0000, Some(10..20)), &mut next);
+        if next.damage != Some(10..60) || damage_source(&next).map(|s| s.offset) != Some(0) {
+            return TestResult::Fail("replaced frame's damage lost");
+        }
+        for old in [dumb(0x8000_0000, None), dumb(0x9000_0000, Some(1..2))] {
+            let mut next = dumb(0x8000_0000, Some(50..60));
+            coalesce(&old, &mut next);
+            if next.damage.is_some() {
+                return TestResult::Fail("frame replacing a full or foreign frame stayed partial");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi22",
+        navi22_replaced_dirty_frame_keeps_its_damage
     );
 }

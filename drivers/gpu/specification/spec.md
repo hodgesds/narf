@@ -327,7 +327,8 @@ paths re-export the same modules, preserving type identity and source
 compatibility.
 
 `amdgpu_rdna2::options::BootOptions::parse(cmdline)` yields
-`{native_display, accel, multi, hw_cursor, power_saving}`. Switches
+`{native_display, accel, multi, hw_cursor, gpu_recovery, power_saving,
+dmub_tables, atom_pixclk, connector}`. Switches
 `amdgpu.native_display`, `amdgpu.rdna2_accel`, `amdgpu.rdna2_multi` and
 `amdgpu.rdna2_hw_cursor` accept a bare flag or `=1|on|y|yes|true` (on) and
 `=0|off|n|no|false` (off); any other value keeps the default. The
@@ -339,6 +340,13 @@ absent; `=none|off|0` or an empty value applies nothing. The first canonical
 power value takes precedence over the first legacy value, including an empty
 or invalid canonical value; invalid power lists enable nothing. Defaulted
 power features still pass every display-admission and driver prerequisite.
+`amdgpu.rdna2_dmub_tables=0` and `amdgpu.rdna2_atom_pixclk=1` are Navi22
+diagnostics that run display VBIOS tables (all, or SetPixelClock alone) in
+the ATOM interpreter instead of DMCUB. `amdgpu.rdna2_connector=dp|hdmi`
+(`options::Connector`; anything else is `Any`) makes the single-display
+Navi22 boot modeset light that kind of sink first when one is connected
+(`amdgpu_navi22_modeset::set_connector_preference`, `choose_preferring`);
+`Any` keeps Linux's order, HDMI first.
 
 Clock/power capability flags come from each profile's Linux
 `nv_common_early_init` selection. Navi21/22/23 share the existing capability
@@ -2004,8 +2012,14 @@ clock is the TMDS divide-by-four rate and its timing `Signal::Tmds`, and the
 link starts with `prepare_hdmi_link` (stream = pipe), `start_hdmi_video` and
 scanout. HDMI has no link status: `check_modeset` reports HPD and scanout
 only, `retrain_modeset` is `Unsupported`, and stop/unplug use
-`stop_hdmi_video` then `stop_hdmi_link`. The monitor enables HPD on every DP
-and HDMI port.
+`stop_hdmi_video` then `stop_hdmi_link`. A stopped link then powers its
+combo PHY PLL down (`hdmi_link::Firmware::power_down` ->
+`Dmub::power_down_pixel_clock`: SET_PIXEL_CLOCK v7 with no clock, no encoder,
+CRT mode, FORCE_PROG_PPLL and ATOM_CRTC_INVALID, as
+`dce110_clock_source_power_down`); a failure is ignored, as Linux only logs
+it. `prepare_hdmi_link` powers it down the same way before SET_PIXEL_CLOCK,
+so the PLL is always programmed from off, as after Linux's `init_hw` power
+down of a firmware-lit DIG (a retired GOP stream leaves its PLL running). The monitor enables HPD on every DP and HDMI port.
 Training then walks narf's fallback ladder (`link_candidates`), trying only
 settings that carry the mode: the link rate drops first; below RBR the lanes
 halve and the rate restarts at this attempt's starting rate. Legacy DSC also
@@ -2678,9 +2692,22 @@ with `request_display_format`; a running display scanning another one is
 relit in it by the monitor, like a mode request, and a failed relight
 returns every display to XRGB8888 with its preferred mode, as does the last
 DRM file closing. `DRM_IOCTL_MODE_DIRTYFB` (DRM master) presents a dumb
-framebuffer again on every CRTC showing it, through the same `present_frame`
-path as SETCRTC (whole frame; clip rectangles are accepted, not used); a GEM
-framebuffer is scanned in place and needs nothing. Xorg's modesetting driver
+framebuffer again on every CRTC showing it; a GEM framebuffer is scanned in
+place and needs nothing. `drm::fb_cmd::DirtyCmd` decodes the request and
+refuses `drm_mode_dirtyfb_ioctl`'s -EINVAL cases (clip count without clips or
+the reverse, unknown flags, unpaired ANNOTATE_COPY, over 256 clips);
+`DirtyCmd::rows` reduces the clips to the rows they cover (copy annotations
+count destinations only) and a request covering none presents nothing. A
+native linear 8888 frame goes to `amdgpu_native_kms::present_damaged(display,
+frame, rows)`. Navi22 and Navi48 (`present_damaged`, a linear primary
+copied into its back buffer) copy only those rows plus the rows the target
+buffer missed since it last held that framebuffer. `amdgpu_present_damage::
+Damage` tracks this per staged buffer address (`plan`, `presented`,
+`coalesce`); another source, a GEM, tiled or 4:2:0 frame, a failed present,
+a coalesced frame of another source, or a new
+`amdgpu_dcn401_otg::surface_epoch()` (advanced whenever a DCN401 staged
+surface is allocated, cleared, released or written through its front) copies
+every row. A frame merged over a waiting one carries both frames' rows. Xorg's modesetting driver
 probes it once and relies on it for shadow updates to a copying CRTC.
 `amdgpu_native_kms::present_frame` takes the framebuffer's
 fourcc: a frame in the scanned format is copied as packed words into the back
@@ -7650,8 +7677,15 @@ prepare_bandwidth (clocks then watermarks), `dcn20_enable_stream_timing`
 DP DTO phase/modulo, timing, OPP black, `enable_crtc`, one frame),
 `link_set_dpms_on` (HDMI: setup, STREAM_SETUP, attributes, AVI, transmitter
 ENABLE, setup, BE→FE, AVI, AVMUTE off; DP: setup, MSA/VSC, PHYCLK floor,
-BE→FE, `amdgpu_dcn30_dp_link::train_with_retries` at the least verified link
-carrying the mode, setup, unblank; see "Navi 22 DP link layer"),
+BE→FE, `amdgpu_dcn30_dp_link::disable_mst_on_sink` (MSTM_CTRL.MST_EN
+cleared on a DPCD 1.2+ MST-capable sink), `train_with_retries` at the least
+verified link carrying the mode, setup, unblank; see "Navi 22 DP link
+layer"). A commit whose SST training fails still enables and unblanks the
+stream at that setting, as `link_set_dpms_on` does; a retrain reports
+`Error::Training`. Every signal programs its output format after the
+timing (OPTC_DATA_FORMAT and stereo, FMT dither/clamp, OCSC, DPG black):
+HDMI its admitted stream's, DP full-range 8-bpc RGB. VSC colorimetry needs
+a DPCD 1.4 receiver and its DPRX feature bit.
 then the front end under `optc3_lock` and a two-frame underflow watch.
 `Output` carries the route, trained `DpLink` and `Inherited` GOP state.
 Failure records `State::Failed { step, error }` and undoes only started steps

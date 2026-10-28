@@ -1208,6 +1208,10 @@ struct Peer {
     login_retries: u8,
     logout_retries: u8,
     want_logout: bool,
+    /// The session ended by logout since this engine's last pass: no
+    /// login until that pass has released its data transport. Like
+    /// `tbnet_tear_down`, a logout never relogins at once.
+    relogin_hold: bool,
     sequence: u8,
 }
 
@@ -1234,6 +1238,7 @@ impl Peer {
             login_retries: 0,
             logout_retries: 0,
             want_logout: false,
+            relogin_hold: false,
             sequence: 0,
         }
     }
@@ -1360,6 +1365,9 @@ impl Engine {
         }
         self.service_data_links(ch, domain).await;
         for peer in &mut self.peers {
+            // The ended sessions' transports are released: logins may
+            // resume next pass.
+            peer.relogin_hold = false;
             if let Some(net) = &mut peer.net {
                 net.pump();
             }
@@ -1653,6 +1661,7 @@ impl Engine {
                     ),
                 ));
                 peer.session = Session::default();
+                peer.relogin_hold = true;
             }
             // Responses belong to exchanges; unsolicited ones are
             // dropped.
@@ -1711,6 +1720,7 @@ impl Engine {
                             // retry budget: tear down locally.
                             peer.want_logout = false;
                             peer.session = Session::default();
+                            peer.relogin_hold = true;
                             continue;
                         }
                         let id = peer.next_command_id();
@@ -1735,6 +1745,7 @@ impl Engine {
                         });
                     }
                     if peer.has_network
+                        && !peer.relogin_hold
                         && !peer.session.login_sent
                         && peer.login_retries <= TBIP_LOGIN_RETRIES
                     {
@@ -2012,6 +2023,7 @@ impl Engine {
                 peer.want_logout = false;
                 peer.logout_retries = 0;
                 peer.session = Session::default();
+                peer.relogin_hold = true;
             }
             Err(Error::Timeout) => {
                 peer.logout_retries = peer.logout_retries.saturating_add(1);
@@ -2019,6 +2031,7 @@ impl Engine {
             Err(_) => {
                 peer.want_logout = false;
                 peer.session = Session::default();
+                peer.relogin_hold = true;
             }
         }
     }

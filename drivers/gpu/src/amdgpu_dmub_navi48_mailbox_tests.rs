@@ -924,6 +924,35 @@ kernel_test_in!(
     dmub_navi48_tmds_bringup_commands_reject_invalid_requests_without_submission
 );
 
+fn dmub_navi48_pixel_clock_power_down_matches_dce110_clock_source_power_down() -> TestResult {
+    for phy in 0..4 {
+        let (_pool, mut e) = ready();
+        let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
+        run(e.power_down_pixel_clock(hdmi_path(phy, 1))).unwrap();
+        // set_pixel_clock_v7 with no clock: the PHY's PLL, no encoder
+        // object, ATOM_ENCODER_MODE_CRT, FORCE_PROG_PPLL, ATOM_CRTC_INVALID.
+        let mut golden = [0; 64];
+        golden[..4].copy_from_slice(&[128, 2, 0, 16]);
+        golden[8] = 20 + phy;
+        golden[10] = 15;
+        golden[11] = 0x01;
+        golden[12] = 0xff;
+        assert_eq!(e.io.slot(offset), golden);
+        assert_eq!(e.mailbox.state, MailboxState::Ready);
+    }
+    let (_pool, mut e) = ready();
+    let before = e.io.bytes.clone();
+    for path in [hdmi_path(4, 1), hdmi_path(1, 0), dp_path(1, 1)] {
+        assert_eq!(run(e.power_down_pixel_clock(path)), Err(Error::Invalid));
+    }
+    assert_eq!(e.io.bytes, before);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_pixel_clock_power_down_matches_dce110_clock_source_power_down
+);
+
 fn dmub_navi48_tmds_pixel_clock_scales_deep_colour_like_linux() -> TestResult {
     let path = hdmi_path(2, 3);
     for (depth, clock, ratio) in [

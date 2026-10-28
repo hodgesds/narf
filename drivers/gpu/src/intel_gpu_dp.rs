@@ -524,9 +524,10 @@ pub mod tests {
         nack_all: bool,
         /// Every request frame, verbatim, in order.
         wire_log: Vec<Vec<u8>>,
-        /// I²C transaction shape: (command nibble, was MOT) for
-        /// every I²C read burst, in order.
-        i2c_read_log: Vec<(u8, bool)>,
+        /// I²C transaction shape: (command nibble, data length)
+        /// for every I²C-over-AUX request, in order; length 0 is
+        /// an address-only request.
+        i2c_log: Vec<(u8, usize)>,
     }
 
     impl DpSink {
@@ -544,7 +545,7 @@ pub mod tests {
                 fail_bw: [0, 0],
                 nack_all: false,
                 wire_log: Vec::new(),
-                i2c_read_log: Vec::new(),
+                i2c_log: Vec::new(),
             }
         }
 
@@ -662,6 +663,20 @@ pub mod tests {
             }
             let cmd = wire[0] >> 4;
             let addr = (((wire[0] & 0x0F) as u32) << 16) | ((wire[1] as u32) << 8) | wire[2] as u32;
+            // I²C requests carry the 7-bit slave address; only
+            // the EDID EEPROM at 0x50 answers (I2C_NACK else).
+            if cmd & 0x8 == 0 && addr != 0x50 {
+                return alloc::vec![0x40];
+            }
+            // An I²C address-only request is the bare 3-byte
+            // header (no LEN byte); with MOT clear it is the STOP.
+            if wire.len() == 3 {
+                if cmd & 0x8 != 0 {
+                    return alloc::vec![0x10];
+                }
+                self.i2c_log.push((cmd, 0));
+                return alloc::vec![0x00];
+            }
             let len = wire[3] as usize + 1;
             match cmd {
                 // NATIVE_WRITE
@@ -675,14 +690,16 @@ pub mod tests {
                     reply.extend_from_slice(&self.read_dpcd(addr, len));
                     reply
                 }
-                // I2C_WRITE: set the EDID offset pointer.
-                0x0 => {
+                // I2C_WRITE (MOT clear) / I2C_WRITE_MOT: set the
+                // EDID offset pointer.
+                0x0 | 0x4 => {
+                    self.i2c_log.push((cmd, len));
                     self.i2c_ptr = wire[4] as usize;
                     alloc::vec![0x00]
                 }
-                // I2C_READ (MOT=0) / I2C_READ_MOT (MOT=1).
+                // I2C_READ (MOT clear) / I2C_READ_MOT.
                 0x1 | 0x5 => {
-                    self.i2c_read_log.push((cmd, cmd == 0x5));
+                    self.i2c_log.push((cmd, len));
                     let mut reply = alloc::vec![0x00];
                     for i in 0..len {
                         let b = self.edid.get(self.i2c_ptr + i).copied().unwrap_or(0);
@@ -699,7 +716,8 @@ pub mod tests {
     // ── The MMIO register model ─────────────────────────────────
 
     const PWR_WELL_CTL2: u64 = 0x4_5404;
-    const DPLL0_ENABLE: u64 = 0x4_6010;
+    /// DPLL0/1/2_ENABLE: combo DDIs A/B/C each lock their own PLL.
+    const DPLL_ENABLES: [u64; 3] = [0x4_6010, 0x4_6014, 0x4_6018];
     const PLL_POWER_STATE: u32 = 1 << 26;
     const PLL_LOCK: u32 = 1 << 30;
 
@@ -790,8 +808,17 @@ pub mod tests {
                 // at 0x2 << 2i, STATE at 0x1 << 2i.
                 return v | ((v & 0xAAAA_AAAA) >> 1);
             }
-            if off == DPLL0_ENABLE {
+            if DPLL_ENABLES.contains(&off) {
                 return v | PLL_POWER_STATE | PLL_LOCK;
+            }
+            // DBUF slices grant power when requested.
+            {
+                use crate::intel_gpu_wm::{
+                    DBUF_CTL_S1, DBUF_CTL_S2, DBUF_POWER_REQUEST, DBUF_POWER_STATE,
+                };
+                if (off == DBUF_CTL_S1 || off == DBUF_CTL_S2) && v & DBUF_POWER_REQUEST != 0 {
+                    return v | DBUF_POWER_STATE;
+                }
             }
             // PIPECONF (pipe + transcoder A): STATE follows ENABLE.
             let pipeconf_offs = [
@@ -1104,8 +1131,8 @@ pub mod tests {
         // CFGCR1 write carrying the HBR2 row (K/1, P/3) must
         // appear after a CFGCR1 write carrying the HBR3 row
         // (K/1, P/2).
-        use crate::intel_gpu_pll::{COMBO_HBR2, COMBO_HBR3, DPLL_CFGCR0_DPLL0};
-        let cfgcr1_off = crate::intel_gpu_pll::dpll_cfgcr1(DPLL_CFGCR0_DPLL0);
+        use crate::intel_gpu_pll::{COMBO_HBR2, COMBO_HBR3, DPLL_CFGCR0_DPLL1};
+        let cfgcr1_off = crate::intel_gpu_pll::dpll_cfgcr1(DPLL_CFGCR0_DPLL1);
         let cfgcr1_writes = mmio.writes_to(cfgcr1_off);
         let pos_hbr3 = cfgcr1_writes.iter().position(|w| *w == COMBO_HBR3.cfgcr1);
         let pos_hbr2 = cfgcr1_writes.iter().position(|w| *w == COMBO_HBR2.cfgcr1);
@@ -1136,21 +1163,25 @@ pub mod tests {
         if probe.edid[..256] != edid[..] {
             return TestResult::Fail("EDID bytes must arrive verbatim");
         }
-        // I²C read shape per block: 8 bursts of 16 bytes; MOT
-        // clear on the first 7, set on the last (one I²C read
-        // transaction per block). Two blocks = 16 bursts.
+        // I²C shape per block, as Linux `drm_dp_i2c_xfer` drives
+        // it: the offset write and 8 read bursts of 16 bytes all
+        // carry MOT (0x4 / 0x5 — no STOP, one I²C transaction),
+        // then an address-only I2C_READ with MOT clear is the
+        // STOP. Two blocks = 2 x (1 + 8 + 1) requests.
         let sink = mmio.sink.borrow();
-        if sink.i2c_read_log.len() != 16 {
-            return TestResult::Fail("EDID read must be 16 bursts of 16 bytes");
+        if sink.i2c_log.len() != 20 {
+            return TestResult::Fail("EDID read must be 2 x (write + 8 bursts + stop)");
         }
-        for (i, (cmd, mot)) in sink.i2c_read_log.iter().enumerate() {
-            let last_in_block = i % 8 == 7;
-            if last_in_block {
-                if !(*mot && *cmd == 0x5) {
-                    return TestResult::Fail("final burst of a block must be I2C_READ_MOT");
-                }
-            } else if *mot || *cmd != 0x1 {
-                return TestResult::Fail("non-final bursts must be I2C_READ (MOT clear)");
+        for (i, (cmd, len)) in sink.i2c_log.iter().enumerate() {
+            let ok = match i % 10 {
+                0 => *cmd == 0x4 && *len == 1,
+                9 => *cmd == 0x1 && *len == 0,
+                _ => *cmd == 0x5 && *len == 16,
+            };
+            if !ok {
+                return TestResult::Fail(
+                    "block read must be WRITE_MOT, 8 x READ_MOT, then an address-only STOP",
+                );
             }
         }
         TestResult::Pass

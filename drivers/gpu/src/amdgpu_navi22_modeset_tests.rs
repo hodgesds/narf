@@ -418,6 +418,16 @@ fn navi22_modeset_resources_follow_the_dcn30_pool() -> TestResult {
     if choose(&with_hdmi).map(|(c, _)| c) != Some(hdmi) {
         return TestResult::Fail("HDMI preference");
     }
+    // amdgpu.rdna2_connector: the preferred kind wins when connected, and
+    // the other lights when it is not.
+    let pick = |r: &[Report], p| choose_preferring(r, p).map(|(c, _)| c);
+    if pick(&with_hdmi, Some(Signal::DisplayPort)) != Some(dp(1))
+        || pick(&with_hdmi, Some(Signal::Hdmi)) != Some(hdmi)
+        || pick(&reports, Some(Signal::Hdmi)) != Some(dp(1))
+        || pick(&with_hdmi, None) != Some(hdmi)
+    {
+        return TestResult::Fail("connector preference");
+    }
     // DP DTO: 25.175 MHz is a /1.001 video rate; 148.5 MHz is not in range.
     if dp_dto(25_175) != (25_200 * 1000, 730_000 * 1001)
         || dp_dto(148_500) != (148_500_000, 730_000_000)
@@ -819,6 +829,81 @@ fn navi22_modeset_dp_sst_verifies_falls_back_and_follows_linux_order() -> TestRe
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22-modeset",
     navi22_modeset_dp_sst_verifies_falls_back_and_follows_linux_order
+);
+
+/// The DP SST commit as Linux's `link_set_dpms_on` makes it beyond the
+/// link itself: the pipe's output format, OCSC and dither replace what an
+/// earlier stream left; an MST-capable sink left in MST mode is returned to
+/// SST before training (and a pre-1.2 one is never asked); a link that
+/// never trains still enables the stream; and VSC colorimetry needs a
+/// DPCD 1.4 receiver.
+fn navi22_modeset_dp_sst_commit_programs_format_clears_mst_and_survives_training() -> TestResult {
+    for (revision, mst) in [(0x13u8, true), (0x11, true), (0x12, false)] {
+        let bench = Bench::new();
+        bench.set(m::MP1 + 0x274, 1);
+        let vram = Vram::new(VRAM_BYTES);
+        let image = m::vbios(7);
+        let tables = Tables::new(&image).unwrap();
+        let connector = m::connector(Signal::DisplayPort, 1, 1);
+        let r = Resources::new().acquire(&connector).unwrap();
+        let (p0, f) = (u32::from(r.pipe), u32::from(r.stream));
+        // An earlier HDMI 4:2:0 stream's container, OCSC and stereo.
+        bench.set(d2(0x1acc + p0 * 0x10), 2);
+        bench.set(d3(0x599 + p0 * 0xd), 0);
+        bench.set(d3(0x59a + p0 * 0xd), 0xf345 << 16 | 0xe04);
+        bench.set(d2(0x1b54 + p0 * 0x80), 0x1234);
+        let mut p = pipeline(&bench, connector, r);
+        let sink = m::sink(Signal::DisplayPort, Some(m::dpcd(revision)));
+        let mut aux = DpSink::new(bench.model.clone());
+        aux.caps = m::dpcd(revision);
+        aux.caps[14] = 0x80; // extended receiver caps at 0x2200
+        aux.feature = 0x0a; // SST split SDP and VSC colorimetry
+        aux.mstm_cap = u8::from(mst);
+        aux.dpcd.insert(0x111, 0x05); // MST_EN left set, plus UP_REQ_EN
+                                      // Verification passes at HBR2; the RBR x1 commit never locks.
+        aux.fail_rates = vec![6];
+        let output = match run(enable_with(&mut p, &vram, &tables, &sink, &mut aux)) {
+            Ok(o) => o,
+            Err(_) => return TestResult::Fail("untrained SST link refused the stream"),
+        };
+        if p.state() != State::At(Step::Running) || output.link.map(|l| l.rate) != Some(6) {
+            return TestResult::Fail("untrained SST stream state");
+        }
+        if bench.get(d2(0x1acc + p0 * 0x10)) & 3 != 0
+            || bench.get(d3(0x599 + p0 * 0xd)) != 1
+            || bench.get(d3(0x59a + p0 * 0xd)) != 0x2000
+            || bench.get(d2(0x1b54 + p0 * 0x80)) != 0
+            || bench.get(d2(0x1841 + p0 * 0x5a)) == 0
+        {
+            return TestResult::Fail("DP output format, OCSC, stereo or dither");
+        }
+        let log = bench.log();
+        let cleared = log
+            .iter()
+            .position(|w| w.dword == m::AUX_WRITE | 0x111 && w.value == 0x04);
+        let asked = log.iter().any(|w| w.dword == m::AUX_READ | 0x021);
+        let trained = log
+            .iter()
+            .position(|w| w.dword == m::AUX_WRITE | 0x100 && w.value == 6);
+        match (revision >= 0x12 && mst, cleared, trained) {
+            (true, Some(c), Some(t)) if c < t => {}
+            (false, None, Some(_)) if asked == (revision >= 0x12) => {}
+            _ => return TestResult::Fail("MST_EN before SST training"),
+        }
+        let gsp0 = bench.get(d2(0x212b + f * 0x100)) & 1 << 20 != 0;
+        let misc1 = bench.get(d2(0x210e + f * 0x100)) & 0x40 != 0;
+        if gsp0 || misc1 {
+            return TestResult::Fail("VSC colorimetry below DPCD 1.4");
+        }
+        if run(p.disable(&tables, &mut aux)).is_err() {
+            return TestResult::Fail("DP disable");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_modeset_dp_sst_commit_programs_format_clears_mst_and_survives_training
 );
 
 /// The first write of each enable step in a clean HDMI run, by step.
