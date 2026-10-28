@@ -35,8 +35,12 @@
 //! [`crate::intel_gpu_ppgtt`] (#1012): [`RcsEngine::attach_ppgtt`]
 //! programs the root into the image's PDP3 pair (the 4-level
 //! root slot) so the hardware walk runs under the context.
-//! Batch *allocations* stay GGTT-backed even then — submitting
-//! VA batches is the media lane's step, not this one's. The
+//! Batch *allocations* stay GGTT-backed even then. VA-batch
+//! submission ([`RcsEngine::submit_ppgtt`], the PPGTT form of
+//! the batch-start) landed with the media engines in
+//! [`crate::intel_gpu_media`] (#1022), which also generalises
+//! this engine over the execlists engine identity
+//! ([`EngineSpec`]). The
 //! GGTT machinery of [`crate::intel_gpu_gtt`] is used as-is;
 //! this module adds the missing GGTT *allocator* (a first-fit
 //! arena above the scanout reservation) to own ring / image /
@@ -74,6 +78,7 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::intel_gpu_aux::MmioWindow;
@@ -126,14 +131,129 @@ pub const RING_EXECLIST_STATUS: u64 = RCS_BASE + 0x234;
 pub const RING_CONTEXT_CONTROL: u64 = RCS_BASE + 0x244;
 /// `RING_CTX_TIMESTAMP`.
 pub const RING_CTX_TIMESTAMP: u64 = RCS_BASE + 0x3A8;
+/// `GEN8_RING_PDP_LDW(n)` for the engine at `base`.
+pub const fn ring_pdp_ldw_at(base: u64, n: u32) -> u64 {
+    base + 0x270 + 8 * (n as u64)
+}
+/// `GEN8_RING_PDP_UDW(n)` for the engine at `base`.
+pub const fn ring_pdp_udw_at(base: u64, n: u32) -> u64 {
+    ring_pdp_ldw_at(base, n) + 4
+}
 /// `GEN8_RING_PDP_LDW(n)` — PPGTT descriptor pointer low dwords.
 pub const fn ring_pdp_ldw(n: u32) -> u64 {
-    RCS_BASE + 0x270 + 8 * (n as u64)
+    ring_pdp_ldw_at(RCS_BASE, n)
 }
 /// `GEN8_RING_PDP_UDW(n)`.
 pub const fn ring_pdp_udw(n: u32) -> u64 {
     ring_pdp_ldw(n) + 4
 }
+
+/// `RING_HWS_PGA` offset from an engine register-block base.
+pub const RING_HWS_PGA_OFF: u64 = 0x80;
+/// `RING_ELSP` offset from an engine register-block base.
+pub const RING_ELSP_OFF: u64 = 0x230;
+/// `RING_EXECLIST_STATUS` offset from an engine register-block
+/// base.
+pub const RING_EXECLIST_STATUS_OFF: u64 = 0x234;
+
+// ── Engine identity (Gen11+ descriptor fields) ──────────────────
+//
+// The execlists machinery in this module is not render-specific:
+// every Gen11+ engine (RCS, BCS, VCS, VECS) shares the ring /
+// context-image / CSB protocol and differs only in its register
+// base, its descriptor engine class + instance, its context
+// image size, and the render-only `R_PWR_CLK_STATE` template
+// group. `EngineSpec` carries exactly those differences; the
+// media engines in `intel_gpu_media` instantiate the same
+// `RcsEngine` over their own specs.
+
+/// Descriptor engine-class field (bits 61:63) values, Gen11+.
+///
+/// The numbering is the one the Gen12-era execlists driver
+/// writes into the descriptor: i915's `intel_engine_types.h`
+/// class defines of the v5.10 tree (`RENDER_CLASS` 0,
+/// `VIDEO_DECODE_CLASS` 1, `VIDEO_ENHANCEMENT_CLASS` 2,
+/// `COPY_ENGINE_CLASS` 3, `OTHER_CLASS` 4), ORed into the
+/// descriptor upper dword at `GEN11_ENGINE_CLASS_SHIFT` (61)
+/// by `intel_lrc.c`. (Later i915 trees renumbered their
+/// internal class enum; the Gen12 execlists descriptor is
+/// written by the Gen12-era construction, which is what this
+/// follows.)
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EngineClass {
+    /// Render command streamer (RCS).
+    Render,
+    /// Video command streamer (VCS / BSD).
+    VideoDecode,
+    /// Video enhancement command streamer (VECS / VEBox).
+    VideoEnhance,
+    /// Blitter / copy engine (BCS).
+    Copy,
+    /// Anything else.
+    Other,
+}
+
+impl EngineClass {
+    /// The value this class occupies in descriptor bits 61:63.
+    pub const fn descriptor_value(self) -> u64 {
+        match self {
+            EngineClass::Render => 0,
+            EngineClass::VideoDecode => 1,
+            EngineClass::VideoEnhance => 2,
+            EngineClass::Copy => 3,
+            EngineClass::Other => 4,
+        }
+    }
+}
+
+/// One execlists engine's identity: everything about the shared
+/// machinery that varies per engine.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct EngineSpec {
+    /// Short name ("rcs0", "vcs0", ...) for logs and reporting.
+    pub name: &'static str,
+    /// Descriptor engine class.
+    pub class: EngineClass,
+    /// Descriptor engine instance (descriptor bits 48:53).
+    pub instance: u8,
+    /// Engine register block base within BAR0.
+    pub base: u64,
+    /// Pages allocated per context image (an allocation bound
+    /// above the engine's hardware image; see the owning
+    /// module's notes).
+    pub image_pages: u32,
+}
+
+impl EngineSpec {
+    /// Absolute `RING_HWS_PGA` for this engine.
+    pub const fn hws_pga(&self) -> u64 {
+        self.base + RING_HWS_PGA_OFF
+    }
+    /// Absolute `RING_ELSP` for this engine.
+    pub const fn elsp(&self) -> u64 {
+        self.base + RING_ELSP_OFF
+    }
+    /// Absolute `RING_EXECLIST_STATUS` for this engine.
+    pub const fn execlist_status(&self) -> u64 {
+        self.base + RING_EXECLIST_STATUS_OFF
+    }
+    /// Whether the register-state template carries the
+    /// render-only `R_PWR_CLK_STATE` group (i915 programs
+    /// `CTX_R_PWR_CLK_STATE` only for render-class contexts;
+    /// its Gen12 XCS template has no third group).
+    pub const fn has_pwr_clk_state(&self) -> bool {
+        matches!(self.class, EngineClass::Render)
+    }
+}
+
+/// RCS0: render class, instance 0, register base 0x2000.
+pub const RCS0_SPEC: EngineSpec = EngineSpec {
+    name: "rcs0",
+    class: EngineClass::Render,
+    instance: 0,
+    base: RCS_BASE,
+    image_pages: RCS_IMAGE_PAGES,
+};
 
 // ── MI command codecs (TGL PRM Vol. 2a) ─────────────────────────
 
@@ -166,9 +286,7 @@ pub fn mi_batch_buffer_start_ggtt(ggtt_addr: u64) -> [u32; 3] {
 /// context's PPGTT: identical framing to the GGTT form with
 /// the address-space indicator set, and the address is a
 /// virtual address in the attached PPGTT (see
-/// [`RcsEngine::attach_ppgtt`]). The engine does not emit this
-/// yet — batches are GGTT-backed — but the codec is pinned
-/// here so the first VA-batch consumer does not re-derive it.
+/// [`RcsEngine::attach_ppgtt`] and [`RcsEngine::submit_ppgtt`]).
 pub fn mi_batch_buffer_start_ppgtt(ppgtt_va: u64) -> [u32; 3] {
     [
         (0x31 << 23) | 1 | BB_START_ASI_PPGTT,
@@ -219,20 +337,29 @@ pub const IDLE_SW_ID: u16 = 0x7FF;
 /// image at GGTT offset `lrca` (must be 4 KiB aligned and below
 /// 4 GiB — the LRCA field is descriptor bits 31:12) with software
 /// context id `sw_ctx_id` (11 bits, encoded in the Gen11+ upper
-/// dword at bits 37:47). Engine class (render = 0), engine
-/// instance (RCS0 = 0) and SW counter (0 — this driver matches
-/// CSB events by SW id + FIFO order) occupy the remaining upper
-/// fields as zero.
-pub fn context_descriptor(lrca: u32, sw_ctx_id: u16) -> u64 {
+/// dword at bits 37:47), for the engine `spec` names. The
+/// descriptor's engine class (bits 61:63) and engine instance
+/// (bits 48:53) come from the spec; the SW counter stays 0 —
+/// this driver matches CSB events by SW id + FIFO order.
+pub fn context_descriptor_for(spec: &EngineSpec, lrca: u32, sw_ctx_id: u16) -> u64 {
     debug_assert!(lrca & 0xFFF == 0);
     debug_assert!(sw_ctx_id < IDLE_SW_ID);
+    debug_assert!(spec.instance < 64);
     let lo = DESC_VALID
         | DESC_MODE_LEGACY_64B
         | DESC_L3LLC_COHERENT
         | DESC_PRIVILEGE
         | (lrca as u64 & 0xFFFF_F000);
-    let hi = ((sw_ctx_id as u64) & 0x7FF) << 5;
+    let mut hi = ((sw_ctx_id as u64) & 0x7FF) << 5;
+    hi |= ((spec.instance as u64) & 0x3F) << 16;
+    hi |= spec.class.descriptor_value() << 29;
     (hi << 32) | lo
+}
+
+/// Build the RCS0 context descriptor (render class, instance 0 —
+/// the historical form of [`context_descriptor_for`]).
+pub fn context_descriptor(lrca: u32, sw_ctx_id: u16) -> u64 {
+    context_descriptor_for(&RCS0_SPEC, lrca, sw_ctx_id)
 }
 
 /// Extract the LRCA (GGTT offset of the context image) from a
@@ -244,6 +371,17 @@ pub fn descriptor_lrca(desc: u64) -> u32 {
 /// Extract the SW context id from a descriptor.
 pub fn descriptor_sw_id(desc: u64) -> u16 {
     ((desc >> 37) & 0x7FF) as u16
+}
+
+/// Extract the engine instance (bits 48:53) from a descriptor.
+pub fn descriptor_instance(desc: u64) -> u8 {
+    ((desc >> 48) & 0x3F) as u8
+}
+
+/// Extract the engine class value (bits 61:63) from a
+/// descriptor, as an [`EngineClass::descriptor_value`].
+pub fn descriptor_class(desc: u64) -> u64 {
+    (desc >> 61) & 0x7
 }
 
 // ── Register-state image (the LRC template) ─────────────────────
@@ -322,56 +460,79 @@ pub const fn ring_ctl_value(ring_bytes: u32) -> u32 {
     (((ring_bytes / 4096) - 1) << 1) | 1
 }
 
-/// Build the register-state template for a fresh context whose
-/// ring lives at GGTT offset `ring_ggtt` with size `ring_bytes`.
-/// Everything the hardware restores on first submission that
-/// this driver has an opinion about is set here; the PDP pairs
-/// are zero (GGTT addressing — PPGTT is #1012), the batch-head
-/// pairs are zero, and the workaround-batch pointers are zero
-/// (no WA batches in this lane).
-pub fn build_reg_state(ring_ggtt: u32, ring_bytes: u32) -> [u32; REG_STATE_DWORDS] {
+/// Build the register-state template for a fresh context on
+/// the engine `spec` names, whose ring lives at GGTT offset
+/// `ring_ggtt` with size `ring_bytes`. Everything the hardware
+/// restores on first submission that this driver has an opinion
+/// about is set here; the PDP pairs are zero (GGTT addressing —
+/// PPGTT is #1012), the batch-head pairs are zero, and the
+/// workaround-batch pointers are zero (no WA batches in this
+/// lane).
+///
+/// The dword layout is engine-independent (the PRM ENGINE
+/// CONTEXT table); the register *addresses* in the pairs are
+/// the engine's own (`spec.base` + the shared offsets). The one
+/// structural difference between engines is group 2:
+/// `R_PWR_CLK_STATE` exists only in render-class templates
+/// (i915's Gen12 XCS offset table has no third group), so
+/// non-render templates leave those dwords zero — the restore
+/// stream reads them as NOOP padding before the terminator.
+pub fn build_reg_state_for(
+    spec: &EngineSpec,
+    ring_ggtt: u32,
+    ring_bytes: u32,
+) -> [u32; REG_STATE_DWORDS] {
+    let b = spec.base;
     let mut r = [0u32; REG_STATE_DWORDS];
     // Group 0: 14 pairs (11 common + BB_PER_CTX_PTR + the two
-    // RCS indirect-context registers).
+    // indirect-context registers).
     r[CTX_LRI_HEADER_0] = mi_load_register_imm(14, true);
-    r[CTX_CONTEXT_CONTROL] = RING_CONTEXT_CONTROL as u32;
+    r[CTX_CONTEXT_CONTROL] = (b + 0x244) as u32;
     r[CTX_CONTEXT_CONTROL + 1] = CTX_CONTROL_VALUE;
-    r[CTX_RING_HEAD] = RING_HEAD as u32;
+    r[CTX_RING_HEAD] = (b + 0x34) as u32;
     r[CTX_RING_HEAD + 1] = 0;
-    r[CTX_RING_TAIL] = RING_TAIL as u32;
+    r[CTX_RING_TAIL] = (b + 0x30) as u32;
     r[CTX_RING_TAIL + 1] = 0;
-    r[CTX_RING_BUFFER_START] = RING_START as u32;
+    r[CTX_RING_BUFFER_START] = (b + 0x38) as u32;
     r[CTX_RING_BUFFER_START + 1] = ring_ggtt;
-    r[CTX_RING_BUFFER_CONTROL] = RING_CTL as u32;
+    r[CTX_RING_BUFFER_CONTROL] = (b + 0x3C) as u32;
     r[CTX_RING_BUFFER_CONTROL + 1] = ring_ctl_value(ring_bytes);
-    r[CTX_BB_HEAD_U] = RING_BBADDR_UDW as u32;
-    r[CTX_BB_HEAD_L] = RING_BBADDR as u32;
-    r[CTX_BB_STATE] = RING_BBSTATE as u32;
+    r[CTX_BB_HEAD_U] = (b + 0x168) as u32;
+    r[CTX_BB_HEAD_L] = (b + 0x140) as u32;
+    r[CTX_BB_STATE] = (b + 0x110) as u32;
     // BB_STATE value 0: batches addressed via GGTT (the BB_START
     // command's own indicator agrees).
-    r[CTX_SECOND_BB_HEAD_U] = RING_SBBADDR_UDW as u32;
-    r[CTX_SECOND_BB_HEAD_L] = RING_SBBADDR as u32;
-    r[CTX_SECOND_BB_STATE] = RING_SBBSTATE as u32;
-    r[CTX_BB_PER_CTX_PTR] = RING_BB_PER_CTX_PTR as u32;
-    r[CTX_RCS_INDIRECT_CTX] = RING_INDIRECT_CTX as u32;
-    r[CTX_RCS_INDIRECT_CTX_OFFSET] = RING_INDIRECT_CTX_OFFSET as u32;
+    r[CTX_SECOND_BB_HEAD_U] = (b + 0x11C) as u32;
+    r[CTX_SECOND_BB_HEAD_L] = (b + 0x114) as u32;
+    r[CTX_SECOND_BB_STATE] = (b + 0x118) as u32;
+    r[CTX_BB_PER_CTX_PTR] = (b + 0x1C0) as u32;
+    r[CTX_RCS_INDIRECT_CTX] = (b + 0x1C4) as u32;
+    r[CTX_RCS_INDIRECT_CTX_OFFSET] = (b + 0x1C8) as u32;
     // Group 1: 9 pairs — context timestamp + PDP3..PDP0 (zero:
     // GGTT contexts do not program PDPs).
     r[CTX_LRI_HEADER_1] = mi_load_register_imm(9, true);
-    r[CTX_CTX_TIMESTAMP] = RING_CTX_TIMESTAMP as u32;
+    r[CTX_CTX_TIMESTAMP] = (b + 0x3A8) as u32;
     for i in 0..4u32 {
         let udw_idx = CTX_PDP3_UDW + (i as usize) * 4;
-        r[udw_idx] = ring_pdp_udw(3 - i) as u32;
-        r[udw_idx + 2] = ring_pdp_ldw(3 - i) as u32;
+        r[udw_idx] = ring_pdp_udw_at(b, 3 - i) as u32;
+        r[udw_idx + 2] = ring_pdp_ldw_at(b, 3 - i) as u32;
     }
-    // Group 2 (RCS only): R_PWR_CLK_STATE — zero selects the
+    // Group 2 (render only): R_PWR_CLK_STATE — zero selects the
     // default SSEU power/clock configuration.
-    r[CTX_LRI_HEADER_2] = mi_load_register_imm(1, false);
-    r[CTX_R_PWR_CLK_STATE] = R_PWR_CLK_STATE as u32;
+    if spec.has_pwr_clk_state() {
+        r[CTX_LRI_HEADER_2] = mi_load_register_imm(1, false);
+        r[CTX_R_PWR_CLK_STATE] = R_PWR_CLK_STATE as u32;
+    }
     // Gen10+ context images terminate the restore batch with
     // MI_BATCH_BUFFER_END | 1.
     r[CTX_END] = MI_BATCH_BUFFER_END | 1;
     r
+}
+
+/// Build the RCS0 register-state template (the historical form
+/// of [`build_reg_state_for`]).
+pub fn build_reg_state(ring_ggtt: u32, ring_bytes: u32) -> [u32; REG_STATE_DWORDS] {
+    build_reg_state_for(&RCS0_SPEC, ring_ggtt, ring_bytes)
 }
 
 // ── Context status buffer (Gen12 format) ────────────────────────
@@ -510,6 +671,9 @@ pub enum SubmitError {
     /// suspended) — nothing was programmed. See
     /// [`crate::intel_gpu_pm`].
     Suspended,
+    /// A VA batch was submitted to a context with no PPGTT root
+    /// attached ([`RcsEngine::submit_ppgtt`]).
+    PpgttNotAttached,
 }
 
 // ── GPU-memory backing seam ─────────────────────────────────────
@@ -806,6 +970,50 @@ impl GpuAllocator for GgttArena {
     }
 }
 
+/// A cloneable handle to one [`GgttArena`]. Production runs
+/// several engines (RCS + the media engines) over the single
+/// GGTT; each engine owns its allocator by value, so the one
+/// physical arena is shared through this lock-wrapper —
+/// engines hold clones, and the arena itself stays the single
+/// first-fit allocator, so two engines can never be handed
+/// the same GGTT offset.
+#[derive(Clone)]
+pub struct SharedArena {
+    inner: Arc<narf_lib::sync::IrqSafeSpinLock<GgttArena>>,
+}
+
+impl core::fmt::Debug for SharedArena {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SharedArena").finish_non_exhaustive()
+    }
+}
+
+impl SharedArena {
+    /// Wrap an arena for sharing between engines.
+    pub fn new(arena: GgttArena) -> Self {
+        Self {
+            inner: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(arena)),
+        }
+    }
+}
+
+impl GpuAllocator for SharedArena {
+    type Backing = FrameBacking;
+
+    fn alloc(&mut self, pages: u32) -> Result<FrameBacking, SubmitError> {
+        self.inner.lock().alloc(pages)
+    }
+    fn free(&mut self, backing: FrameBacking) {
+        self.inner.lock().free(backing)
+    }
+    fn live_allocations(&self) -> usize {
+        self.inner.lock().live_allocations()
+    }
+    fn live_pages(&self) -> u32 {
+        self.inner.lock().live_pages()
+    }
+}
+
 // ── Ring / context / engine ─────────────────────────────────────
 
 /// Ring size per context: 128 KiB (the i915 default), 32 pages.
@@ -968,11 +1176,15 @@ struct Request<A: GpuAllocator> {
     batch: BatchBuf<A>,
 }
 
-/// The RCS0 execlists engine: context table, two submission
-/// ports, CSB drain. Generic over the MMIO window and the GGTT
-/// allocator so fixtures can drive the full protocol against a
-/// modelled GPU.
+/// An execlists engine: context table, two submission ports,
+/// CSB drain. Instantiated for RCS0 by default; the media
+/// engines in [`crate::intel_gpu_media`] instantiate the same
+/// machinery over their own [`EngineSpec`] via
+/// [`RcsEngine::with_spec`]. Generic over the MMIO window and
+/// the GGTT allocator so fixtures can drive the full protocol
+/// against a modelled GPU.
 pub struct RcsEngine<M: MmioWindow, A: GpuAllocator> {
+    spec: EngineSpec,
     mmio: M,
     alloc: A,
     status: A::Backing,
@@ -990,6 +1202,7 @@ pub struct RcsEngine<M: MmioWindow, A: GpuAllocator> {
 impl<M: MmioWindow, A: GpuAllocator> core::fmt::Debug for RcsEngine<M, A> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("RcsEngine")
+            .field("engine", &self.spec.name)
             .field("status_ggtt", &self.status.ggtt_offset())
             .field("csb_head", &self.csb_head)
             .field("contexts", &self.contexts.len())
@@ -1000,14 +1213,21 @@ impl<M: MmioWindow, A: GpuAllocator> core::fmt::Debug for RcsEngine<M, A> {
 }
 
 impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
-    /// Bring up the engine: allocate the engine status page and
-    /// program `RING_HWS_PGA`, then adopt the hardware's current
-    /// CSB write pointer so no stale entry is replayed.
-    pub fn new(mmio: M, mut alloc: A) -> Result<Self, SubmitError> {
+    /// Bring up the RCS0 engine (render class, base 0x2000).
+    pub fn new(mmio: M, alloc: A) -> Result<Self, SubmitError> {
+        Self::with_spec(RCS0_SPEC, mmio, alloc)
+    }
+
+    /// Bring up the engine `spec` names: allocate the engine
+    /// status page and program that engine's `RING_HWS_PGA`,
+    /// then adopt the hardware's current CSB write pointer so
+    /// no stale entry is replayed.
+    pub fn with_spec(spec: EngineSpec, mmio: M, mut alloc: A) -> Result<Self, SubmitError> {
         let status = alloc.alloc(1)?;
-        mmio.write32(RING_HWS_PGA, status.ggtt_offset());
+        mmio.write32(spec.hws_pga(), status.ggtt_offset());
         let head = ((status.read32(CSB_WRITE_BYTE) & 0xFF) as u8) % CSB_ENTRIES;
         Ok(Self {
+            spec,
             mmio,
             alloc,
             status,
@@ -1026,6 +1246,11 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// GGTT offset of the engine status page (the CSB page).
     pub fn status_ggtt(&self) -> u32 {
         self.status.ggtt_offset()
+    }
+
+    /// The identity of the engine this instance drives.
+    pub fn spec(&self) -> EngineSpec {
+        self.spec
     }
 
     /// Live-allocation accounting of the underlying arena
@@ -1077,7 +1302,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
                 self.contexts.len() - 1
             }
         };
-        let image = self.alloc.alloc(RCS_IMAGE_PAGES)?;
+        let image = self.alloc.alloc(self.spec.image_pages)?;
         let ring_mem = match self.alloc.alloc(RING_PAGES) {
             Ok(r) => r,
             Err(e) => {
@@ -1093,13 +1318,13 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
                 return Err(e);
             }
         };
-        let template = build_reg_state(ring_mem.ggtt_offset(), RING_BYTES);
+        let template = build_reg_state_for(&self.spec, ring_mem.ggtt_offset(), RING_BYTES);
         for (i, dw) in template.iter().enumerate() {
             image.write32(REG_STATE_PAGE_BYTE + (i as u64) * 4, *dw);
         }
         let generation = self.generations[slot];
         let sw_id = (slot as u16) + 1;
-        let descriptor = context_descriptor(image.ggtt_offset(), sw_id);
+        let descriptor = context_descriptor_for(&self.spec, image.ggtt_offset(), sw_id);
         self.contexts[slot] = Some(RcsContext {
             slot: slot as u32,
             generation,
@@ -1175,7 +1400,8 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
 
     /// Submit a batch on a context: emit the batch-start +
     /// breadcrumb prologue into its ring, advance the image
-    /// tail, and queue the request for the next free port.
+    /// tail, and queue the request for the next free port. The
+    /// batch is addressed through the GGTT.
     ///
     /// The context must be *idle* (not loaded, nothing in
     /// flight) — see [`SubmitError::ContextBusy`]. Submitting
@@ -1184,6 +1410,43 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// covered together when the context is next loaded.
     /// Returns the engine-wide request id.
     pub fn submit(&mut self, id: ContextId, batch: BatchBuf<A>) -> Result<u64, SubmitError> {
+        self.submit_inner(id, batch, false)
+    }
+
+    /// Submit a batch addressed through the context's PPGTT
+    /// (the batch-start carries the PPGTT address-space
+    /// indicator; see [`mi_batch_buffer_start_ppgtt`]).
+    ///
+    /// The batch allocation stays GGTT-backed, and the VA the
+    /// engine is handed is the batch's GGTT offset: the caller
+    /// must have mapped the batch's pages at that same VA in
+    /// the attached PPGTT (identity placement — the natural
+    /// layout over this driver's GGTT arena, whose offsets are
+    /// stable VAs). The engine cannot verify the mapping; it
+    /// only refuses ([`SubmitError::PpgttNotAttached`]) when no
+    /// root is attached at all. Same idle discipline and return
+    /// contract as [`Self::submit`].
+    pub fn submit_ppgtt(&mut self, id: ContextId, batch: BatchBuf<A>) -> Result<u64, SubmitError> {
+        match self.context(id) {
+            Ok(c) if c.ppgtt_root.is_some() => {}
+            Ok(_) => {
+                self.alloc.free(batch.backing);
+                return Err(SubmitError::PpgttNotAttached);
+            }
+            Err(e) => {
+                self.alloc.free(batch.backing);
+                return Err(e);
+            }
+        }
+        self.submit_inner(id, batch, true)
+    }
+
+    fn submit_inner(
+        &mut self,
+        id: ContextId,
+        batch: BatchBuf<A>,
+        ppgtt_form: bool,
+    ) -> Result<u64, SubmitError> {
         let (slot, generation) = match self.context(id) {
             Ok(c) => (c.slot, c.generation),
             Err(e) => {
@@ -1203,7 +1466,11 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         let seqno = {
             let ctx = self.context_mut(id)?;
             let seqno = ctx.next_seqno;
-            let start = mi_batch_buffer_start_ggtt(batch.backing.ggtt_offset() as u64);
+            let start = if ppgtt_form {
+                mi_batch_buffer_start_ppgtt(batch.backing.ggtt_offset() as u64)
+            } else {
+                mi_batch_buffer_start_ggtt(batch.backing.ggtt_offset() as u64)
+            };
             let store =
                 mi_store_dword_imm_ggtt(ctx.hwsp.ggtt_offset() as u64 + HWSP_SEQNO_BYTE, seqno);
             let mut prologue = [0u32; 7];
@@ -1367,11 +1634,11 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// register is read instead).
     fn elsp_write(&mut self, port0: u64, port1: u64) {
         compiler_fence(Ordering::SeqCst);
-        self.mmio.write32(RING_ELSP, (port1 >> 32) as u32);
-        self.mmio.write32(RING_ELSP, port1 as u32);
-        self.mmio.write32(RING_ELSP, (port0 >> 32) as u32);
-        self.mmio.write32(RING_ELSP, port0 as u32);
-        let _ = self.mmio.read32(RING_EXECLIST_STATUS);
+        self.mmio.write32(self.spec.elsp(), (port1 >> 32) as u32);
+        self.mmio.write32(self.spec.elsp(), port1 as u32);
+        self.mmio.write32(self.spec.elsp(), (port0 >> 32) as u32);
+        self.mmio.write32(self.spec.elsp(), port0 as u32);
+        let _ = self.mmio.read32(self.spec.execlist_status());
     }
 
     /// Drain every CSB entry the hardware has published since
@@ -1547,6 +1814,16 @@ pub struct BarWindow {
     bar: narf_bus::bar::MmioRegion,
 }
 
+impl BarWindow {
+    /// Wrap a BAR0 (`GTTMMADR`) mapping as an engine MMIO
+    /// window. Shared by the RCS glue above and the media
+    /// engines' glue in [`crate::intel_gpu_media`], which drive
+    /// the same BAR0 at media-engine offsets.
+    pub fn new(bar: narf_bus::bar::MmioRegion) -> Self {
+        Self { bar }
+    }
+}
+
 impl core::fmt::Debug for BarWindow {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("BarWindow")
@@ -1558,7 +1835,7 @@ impl core::fmt::Debug for BarWindow {
 impl MmioWindow for BarWindow {
     fn read32(&self, off: u64) -> u32 {
         // SAFETY: `self.bar` is the BAR0 (`GTTMMADR`) region
-        // mapped at probe; `off` is an RCS0 register offset
+        // mapped at probe; `off` is an engine register offset
         // inside the GT block, and a 32-bit register read has no
         // unwanted side effect.
         // SAFETY: Valid MMIO bounds or trusted driver environment
@@ -1566,13 +1843,30 @@ impl MmioWindow for BarWindow {
     }
     fn write32(&self, off: u64, val: u32) {
         // SAFETY: same BAR ownership as `read32`; `off` is a
-        // programmable RCS0 register (ELSP / HWS_PGA).
+        // programmable engine register (ELSP / HWS_PGA).
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.bar.write32(off, val) }
     }
 }
 
-type ProductionEngine = RcsEngine<BarWindow, GgttArena>;
+type ProductionEngine = RcsEngine<BarWindow, SharedArena>;
+
+static PRODUCTION_ARENA: narf_lib::sync::IrqSafeSpinLock<Option<SharedArena>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// The one GGTT arena every production engine on the probed
+/// controller allocates from (RCS here, the media engines in
+/// [`crate::intel_gpu_media`]). Created over the first probed
+/// controller's BAR — the driver binds a single controller,
+/// so first-wins matches the `CONTROLLER` singleton
+/// discipline in `intel_gpu`.
+pub fn production_arena(bar: narf_bus::bar::MmioRegion) -> SharedArena {
+    let mut guard = PRODUCTION_ARENA.lock();
+    if guard.is_none() {
+        *guard = Some(SharedArena::new(GgttArena::new(bar)));
+    }
+    guard.as_ref().expect("set above").clone()
+}
 
 /// The default engine's production state: the engine
 /// itself, its lazily created default context, the
@@ -1621,9 +1915,9 @@ pub fn production_idle() -> bool {
 fn attach_default() -> Result<(), SubmitError> {
     let (engine, fw_window) = crate::intel_gpu::with_controller(|gpu| {
         gpu.chip_info().generation.region_generation()?;
-        let arena = GgttArena::new(gpu.gtt_mmadr);
-        let engine = RcsEngine::new(BarWindow { bar: gpu.gtt_mmadr }, arena).ok()?;
-        Some((engine, BarWindow { bar: gpu.gtt_mmadr }))
+        let arena = production_arena(gpu.gtt_mmadr);
+        let engine = RcsEngine::new(BarWindow::new(gpu.gtt_mmadr), arena).ok()?;
+        Some((engine, BarWindow::new(gpu.gtt_mmadr)))
     })
     .flatten()
     .ok_or(SubmitError::NoEngine)?;
