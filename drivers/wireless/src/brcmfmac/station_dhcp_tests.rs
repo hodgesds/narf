@@ -309,6 +309,7 @@ impl Harness {
             receive_hook: IrqSafeSpinLock::new(None),
             rx: IrqSafeSpinLock::new(Some(consumer)),
             tx: IrqSafeSpinLock::new(Some(producer)),
+            lifecycle: Default::default(),
         });
         *ACTIVE_TEST.lock() = Some(device.clone());
         narf_net::iface::set_link_state(&name, true); // operator IFF_UP
@@ -798,3 +799,6 @@ kernel_test_in!(
 
 #[path = "live_policy_tests.rs"]
 mod live_policy_tests;
+
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;

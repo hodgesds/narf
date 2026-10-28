@@ -804,6 +804,22 @@ impl Handle {
         operation(state.firmware.as_mut().unwrap().station.as_mut().unwrap());
         firmware_step(&mut state);
     }
+    /// Firmware answers D3_INFORM with D3_ACK (confirmed stop).
+    pub(crate) fn d3_ack(&self, value: bool) {
+        self.0.lock().d3_ack = value;
+    }
+    /// A device posted write lands after the BME clear.
+    pub(crate) fn late_dma(&self, value: bool) {
+        self.0.lock().late_dma = value;
+    }
+    /// (allocated, dropped) host DMA mappings.
+    pub(crate) fn mappings(&self) -> (usize, usize) {
+        let s = self.0.lock();
+        (s.allocated, s.dropped)
+    }
+    pub(crate) fn dma_enabled(&self) -> bool {
+        self.0.lock().dma_enable
+    }
     pub(crate) fn wme_ac_sta(&self, rows: [u8; 16]) {
         self.change(|f| f.wme_ac_sta = rows);
     }

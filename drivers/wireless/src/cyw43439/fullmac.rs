@@ -88,6 +88,20 @@ pub trait Fullmac: Send {
     fn firmware_vendor(&self) -> FirmwareVendor {
         FirmwareVendor::Wcc
     }
+    /// Confirmed device stop for teardown or reset (Linux
+    /// `brcmf_pcie_remove`/`brcmf_pcie_reset` before the ring release).
+    /// `Ok` only when the transport proved its published DMA reclaimable;
+    /// either way this generation accepts no further work. Transports
+    /// without such a proof refuse it, which keeps teardown pinned.
+    fn stop_transport(&mut self) -> impl Future<Output = Result<(), Error>> + Send {
+        async { Err(Error::Unsupported) }
+    }
+    /// Drop the current transport generation now. Returns true only when
+    /// its published memory was released after a complete stop proof;
+    /// otherwise every mapping stays pinned (leaked by design).
+    fn release_transport(&mut self) -> bool {
+        false
+    }
 }
 impl<T: PacketTransport> Fullmac for Runtime<T> {
     const FAMILY: Family = Family::Sdio;

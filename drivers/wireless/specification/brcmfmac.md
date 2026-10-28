@@ -578,8 +578,32 @@ Ordering on its DMA writes (Linux brcmfmac never enables RO for it; NARF
 `narf_bus::pci_express` exposes only an OR-in `set_device_control`, so it
 cannot clear `DEVCTL.RO` either).
 
+Production caller (PCI removal). `register_pci_driver` registers a
+`narf_bus::register_pci_remove` hook for every BCM43602 id (Linux v7.2
+`pcie.c::brcmf_pcie_remove`: `BRCMFMAC_PCIE_STATE_DOWN`,
+`brcmf_bus_cancel_reset_work`, `brcmf_detach`, `brcmf_pcie_release_irq`,
+then `brcmf_pcie_release_{scratch,ring}buffers`). The hook quarantines the
+BDF and runs `native_runtime::remove`: it marks the bootstrap removed (no
+later provisioning attempt), waits out an in-flight attempt (the parked
+slot is held from boot through station publication), then
+`Generation::remove` withdraws the shell — `Device::withdraw` clears the
+active endpoint, unregisters the wireless and network-registry entries,
+retires the netdev with `narf_net::iface::retire_for_rebind` (a later probe
+of the function reclaims the name via `rebind_name`) and stops the worker —
+and `Device::teardown` runs `Fullmac::stop_transport` (the confirmed stop
+above) and `release_transport` under the station mutex. Only a complete
+proof frees the mappings and releases the BDF claim; otherwise the
+generation is dropped with its mappings pinned and the address stays
+quarantined (`probe` refuses it). A never-booted owner has nothing to
+release. Linux disconnect (`brcmf_cfg80211_disconnect`) does not stop the
+bus, so disconnect keeps the transport running here too.
+
 Smokes: `smoke_brcmf_confirmed_stop_reclaims_published_dma` (drain, IRQ
 release, BME, H2D gating, every mapping freed),
+`smoke_brcmf_remove_withdraws_then_reclaims_after_stop_proof` (joined
+station: withdrawn, netdev retired for rebind, admission closed, every
+mapping freed, a second removal is absent),
+`smoke_brcmf_remove_without_stop_proof_keeps_mappings_pinned`,
 `smoke_brcmf_unacknowledged_d3_reverts_and_retains_dma` (2 s timeout, UP
 again, nothing freed) and `smoke_brcmf_late_dma_or_halt_fails_stop_proof`
 (post-clear index change and FWHALT keep memory retained).

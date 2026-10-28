@@ -291,6 +291,7 @@ impl Harness {
             receive_hook: IrqSafeSpinLock::new(None),
             rx: IrqSafeSpinLock::new(Some(rx_consumer)),
             tx: IrqSafeSpinLock::new(Some(tx_producer)),
+            lifecycle: Default::default(),
         });
         *ACTIVE_TEST.lock() = Some(device.clone());
         narf_net::iface::set_link_state(&name, true); // operator IFF_UP

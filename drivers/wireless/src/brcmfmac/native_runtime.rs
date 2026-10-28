@@ -56,12 +56,23 @@ pub enum ProvisionState {
     Ready = 2,
     Failed = 3,
 }
+/// The published station generation of the retained BCM43602 owner.
+pub(super) type PcieGeneration = crate::cyw43439::interface::generation::Generation<
+    super::station_transport::Adapter<PcieBackplane>,
+>;
 struct Bootstrap {
+    /// Held across the whole provisioning attempt (boot through station
+    /// publication) so removal waits for it and then sees its result.
     parked: Mutex<Option<PcieBackplane>>,
     state: AtomicU8,
     chip: u16,
     revision: u8,
+    /// `bus_if->removing`: set by [`remove`]; no later attempt may start.
+    removed: core::sync::atomic::AtomicBool,
+    generation: IrqSafeSpinLock<Option<Arc<PcieGeneration>>>,
 }
+/// Interface name of the last published generation, kept for a rebind.
+static LAST_NAME: IrqSafeSpinLock<Option<&'static str>> = IrqSafeSpinLock::new(None);
 static BOOTSTRAP: IrqSafeSpinLock<Option<Arc<Bootstrap>>> = IrqSafeSpinLock::new(None);
 struct Attempt<'a>(&'a AtomicU8);
 impl Drop for Attempt<'_> {
@@ -129,6 +140,8 @@ pub(super) fn start(device: &mut BrcmfmacDevice) {
         state: AtomicU8::new(ProvisionState::Parked as u8),
         chip: device.chip.id,
         revision: device.chip.revision,
+        removed: core::sync::atomic::AtomicBool::new(false),
+        generation: IrqSafeSpinLock::new(None),
     });
     *BOOTSTRAP.lock() = Some(owner);
     narf_scheduler::spawn(async {
@@ -178,6 +191,9 @@ async fn provision_checked(
     let mut slot = owner.parked.lock().await;
     if owner.state.load(Ordering::Acquire) != ProvisionState::Parked as u8 {
         return Err("BCM43602 provisioning already attempted");
+    }
+    if owner.removed.load(Ordering::Acquire) {
+        return Err("BCM43602 owner removed");
     }
     let bus = slot.as_ref().ok_or("parked BCM43602 owner unavailable")?;
     let pci = identity(&bus.device);
@@ -248,15 +264,51 @@ async fn provision_checked(
         .map_err(|_| "RX buffer posting failed")?;
     let adapter = super::station_transport::Adapter::new(runtime)
         .map_err(|_| "station transport setup failed")?;
-    drop(slot);
-    let name = narf_net::iface::reserve_name("wlan%d");
-    crate::cyw43439::interface::attach_runtime(name, adapter, &[])
+    // A function removed and probed again reclaims its retired netdev.
+    let name = LAST_NAME
+        .lock()
+        .and_then(narf_net::iface::rebind_name)
+        .unwrap_or_else(|| narf_net::iface::reserve_name("wlan%d"));
+    let device = crate::cyw43439::interface::attach_runtime(name, adapter, &[])
         .await
         .map_err(|_| "BCM43602 station attachment failed")?;
+    *LAST_NAME.lock() = Some(name);
+    *owner.generation.lock() = Some(Arc::new(PcieGeneration::new(device)));
     owner
         .state
         .store(ProvisionState::Ready as u8, Ordering::Release);
+    // The parked slot stays locked until the generation is installed, so a
+    // concurrent `remove` tears down exactly this published shell.
+    drop(slot);
     Ok(())
+}
+/// Linux v7.2 `pcie.c::brcmf_pcie_remove` for the retained BCM43602 owner:
+/// no later provisioning attempt may start, an in-flight attempt is waited
+/// out, and the published generation is withdrawn, stopped and released.
+/// Returns true when nothing remains mapped: no attempt published DMA, or
+/// the confirmed stop proved it reclaimable. A failed boot attempt or an
+/// unproven stop keeps its mappings pinned.
+pub(super) async fn remove() -> bool {
+    let Some(owner) = BOOTSTRAP.lock().take() else {
+        return true;
+    };
+    owner.removed.store(true, Ordering::Release);
+    let mut parked = owner.parked.lock().await;
+    // Never booted: nothing was published; the bus authority drops here.
+    drop(parked.take());
+    let state = owner.state.load(Ordering::Acquire);
+    let generation = owner.generation.lock().take();
+    let released = match generation {
+        Some(generation) => generation.remove().await.released(),
+        // Starting/Failed without a published generation leaked whatever
+        // the attempt had published (Runtime drop without a proof).
+        None => state == ProvisionState::Parked as u8,
+    };
+    owner
+        .state
+        .store(ProvisionState::Failed as u8, Ordering::Release);
+    drop(parked);
+    released
 }
 /// One serialized production control request. Cancellation makes the owner
 /// terminal while retaining all device-visible addresses and request bytes.
@@ -675,6 +727,8 @@ mod provision_tests {
             state: AtomicU8::new(ProvisionState::Parked as u8),
             chip: 43602,
             revision: 3,
+            removed: core::sync::atomic::AtomicBool::new(false),
+            generation: IrqSafeSpinLock::new(None),
         };
         for _ in 0..2 {
             if !matches!(

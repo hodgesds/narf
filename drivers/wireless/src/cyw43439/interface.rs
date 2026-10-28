@@ -161,6 +161,14 @@ pub struct Device<R: Fullmac> {
     receive_hook: IrqSafeSpinLock<Option<ReceiveHook>>,
     rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    lifecycle: Lifecycle,
+}
+/// Teardown state of one published shell (one transport generation).
+#[derive(Default)]
+pub(crate) struct Lifecycle {
+    /// Set by [`Device::withdraw`]: registrations are gone and the worker
+    /// exits; the shell never publishes again.
+    withdrawn: AtomicBool,
 }
 impl<R: Fullmac> core::fmt::Debug for Device<R> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -277,6 +285,7 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
         receive_hook: IrqSafeSpinLock::new(None),
         rx: IrqSafeSpinLock::new(Some(rx_consumer)),
         tx: IrqSafeSpinLock::new(Some(tx_producer)),
+        lifecycle: Lifecycle::default(),
     });
     {
         let mut active = slot.lock();
@@ -316,6 +325,55 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
 }
 
 impl<R: Fullmac + 'static> Device<R> {
+    /// Interface name of this shell.
+    pub fn interface_name(&self) -> &str {
+        &self.name
+    }
+    /// Whether [`Self::withdraw`] has run.
+    pub fn withdrawn(&self) -> bool {
+        self.lifecycle.withdrawn.load(Ordering::Acquire)
+    }
+    /// Linux `brcmf_detach` for this shell: close host admission, drop the
+    /// carrier and withdraw the wireless, network-registry and kernel
+    /// netdev publications. The netdev is retired, not unregistered
+    /// (`narf_net::iface::retire_for_rebind`), so a later generation of the
+    /// same function reclaims its name, ifindex and configuration. The
+    /// receive worker exits at its next iteration. The transport itself is
+    /// stopped by [`Self::teardown`].
+    pub fn withdraw(self: &Arc<Self>) {
+        if self.lifecycle.withdrawn.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.close_host();
+        {
+            let mut active = active_slot(R::FAMILY).lock();
+            let this = Arc::as_ptr(self) as *const ();
+            if active
+                .as_ref()
+                .is_some_and(|owner| Arc::as_ptr(owner) as *const () == this)
+            {
+                *active = None;
+            }
+        }
+        narf_wireless::registry::unregister(&self.name);
+        narf_net::registry().unregister(&self.name);
+        narf_net::iface::retire_for_rebind(&self.name);
+    }
+    /// Withdraw the shell, then stop and release the transport generation
+    /// under the station mutex (Linux `brcmf_pcie_remove`: `brcmf_detach`,
+    /// release IRQ, then the ring/scratch buffers). Returns true only when
+    /// the confirmed stop proved every published mapping reclaimable and
+    /// they were freed; otherwise they stay pinned.
+    pub async fn teardown(self: &Arc<Self>) -> bool {
+        self.withdraw();
+        let mut state = self.state.lock().await;
+        state.clear_transmit();
+        state.station.bssid = None;
+        let proof = state.station.runtime.stop_transport().await.is_ok();
+        let released = state.station.runtime.release_transport();
+        self.power_save.store(2, Ordering::Release);
+        proof && released
+    }
     fn link(&self, peer: Option<[u8; 6]>) {
         let _publication = self.publication.lock();
         self.publish_link(peer);
@@ -704,7 +762,7 @@ impl<R: Fullmac + 'static> Device<R> {
 
     async fn receive_worker(self: Arc<Self>) {
         let mut wake = None;
-        loop {
+        while !self.withdrawn() {
             // A transport generation may rebind its vector; re-read the wake
             // source whenever the state is uncontended. The count is sampled
             // before service so a vector raised during service re-runs it.
@@ -1338,6 +1396,9 @@ impl<R: Fullmac + 'static> Interface for Registered<R> {
         self.0.tx_ring()
     }
 }
+
+#[path = "generation.rs"]
+pub mod generation;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "interface_dhcp_tests.rs"]

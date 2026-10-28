@@ -23,7 +23,9 @@ struct Tx {
     deadline: narf_time::Deadline,
 }
 pub struct Adapter<B: Bus> {
-    inner: runtime::Runtime<B>,
+    /// The current firmware generation. `None` once a teardown or reset
+    /// released it; a reset installs the rebooted generation here.
+    inner: Option<runtime::Runtime<B>>,
     events: VecDeque<Event>,
     flows: Vec<Flow>,
     tx: Vec<Tx>,
@@ -50,7 +52,7 @@ where
             Err(e) => return Err(map(e)),
         }
         Ok(Self {
-            inner,
+            inner: Some(inner),
             events: VecDeque::new(),
             flows: Vec::new(),
             tx: Vec::new(),
@@ -59,13 +61,18 @@ where
             failed: false,
         })
     }
+    /// The current firmware generation, if one is attached.
+    pub fn runtime(&self) -> Option<&runtime::Runtime<B>> {
+        self.inner.as_ref()
+    }
     fn progress(&mut self) -> Result<usize, Error> {
         if self.failed {
             return Err(Error::Failed);
         }
-        let count = self.inner.poll().map_err(map)?;
+        let inner = self.inner.as_mut().ok_or(Error::Failed)?;
+        let count = inner.poll().map_err(map)?;
         for _ in 0..32 {
-            let Some(bytes) = self.inner.pop_event() else {
+            let Some(bytes) = inner.pop_event() else {
                 break;
             };
             let event = events::parse_event(&bytes).map_err(|_| Error::Malformed)?;
@@ -77,7 +84,7 @@ where
                 payload: event.payload.to_vec(),
             });
         }
-        while let Some(receipt) = self.inner.pop_tx_receipt() {
+        while let Some(receipt) = inner.pop_tx_receipt() {
             let index = self
                 .tx
                 .iter()
@@ -92,12 +99,7 @@ where
         // before its retained hardware slot can be reopened with a generation.
         let mut index = 0;
         while index < self.flows.len() {
-            if self
-                .inner
-                .flow_state(self.flows[index].token)
-                .map_err(map)?
-                == FlowState::Closed
-            {
+            if inner.flow_state(self.flows[index].token).map_err(map)? == FlowState::Closed {
                 self.flows.remove(index);
             } else {
                 index += 1;
@@ -106,10 +108,10 @@ where
         if self.closing {
             let mut closed = true;
             for flow in &self.flows {
-                match self.inner.flow_state(flow.token).map_err(map)? {
+                match inner.flow_state(flow.token).map_err(map)? {
                     FlowState::Open => {
                         closed = false;
-                        match self.inner.close_flow(flow.token) {
+                        match inner.close_flow(flow.token) {
                             Ok(()) | Err(runtime::Error::Busy) => {}
                             Err(e) => return Err(map(e)),
                         }
@@ -124,7 +126,7 @@ where
             }
         }
         if self.peer.is_none() || self.closing {
-            while self.inner.pop_received().is_some() {}
+            while inner.pop_received().is_some() {}
         }
         Ok(count)
     }
@@ -157,6 +159,8 @@ where
         };
         let mut response = self
             .inner
+            .as_mut()
+            .ok_or(Error::Failed)?
             .command(command, input, extent)
             .await
             .map_err(map)?;
@@ -173,7 +177,7 @@ where
         Ok(())
     }
     fn wake_source(&self) -> Option<(alloc::sync::Arc<crate::brcmfmac::irq::Signal>, bool)> {
-        Some(self.inner.interrupt())
+        self.inner.as_ref().map(|inner| inner.interrupt())
     }
     /// `brcmf_cfg80211_suspend` (no WoWL) has already brought the link down;
     /// retire every flow and TX completion, then `brcmf_pcie_pm_enter_D3`.
@@ -194,7 +198,12 @@ where
             }
             narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
         }
-        self.inner.enter_d3().await.map_err(map)
+        self.inner
+            .as_mut()
+            .ok_or(Error::Failed)?
+            .enter_d3()
+            .await
+            .map_err(map)
     }
     /// `brcmf_pcie_pm_leave_D3`: hot resume, or a terminal owner when the
     /// dongle lost power/firmware (Linux re-probes; NARF needs a transport
@@ -203,7 +212,10 @@ where
         if self.failed {
             return Err(Error::Failed);
         }
-        match self.inner.leave_d3().await {
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(Error::Failed);
+        };
+        match inner.leave_d3().await {
             Ok(()) => Ok(()),
             // Not suspended: nothing to resume, the transport stays usable.
             Err(runtime::Error::Busy) => Err(Error::Busy),
@@ -211,6 +223,33 @@ where
                 self.fail();
                 Err(map(error))
             }
+        }
+    }
+    /// Linux v7.2 `brcmf_pcie_remove`/`brcmf_pcie_reset` stop the device
+    /// before `brcmf_pcie_release_ringbuffers`. Here the stop is the
+    /// confirmed-stop proof (`Runtime::quiesce`, `brcmfmac.md` "Confirmed
+    /// stop and DMA reclamation"); the generation never resumes either way.
+    async fn stop_transport(&mut self) -> Result<(), Error> {
+        self.peer = None;
+        self.closing = false;
+        self.flows.clear();
+        self.tx.clear();
+        self.events.clear();
+        self.failed = true;
+        let inner = self.inner.as_mut().ok_or(Error::Failed)?;
+        if inner.is_reclaimable() {
+            return Ok(());
+        }
+        inner.quiesce().await.map(|_| ()).map_err(map)
+    }
+    fn release_transport(&mut self) -> bool {
+        self.failed = true;
+        self.peer = None;
+        match self.inner.take() {
+            // Drop frees every mapping only after a complete proof and
+            // otherwise leaks them (`Runtime`'s `Drop`).
+            Some(inner) => inner.is_reclaimable(),
+            None => true,
         }
     }
     fn poll(&mut self) -> Result<usize, Error> {
@@ -223,7 +262,9 @@ where
     fn fail(&mut self) {
         self.failed = true;
         self.peer = None;
-        self.inner.fail();
+        if let Some(inner) = self.inner.as_mut() {
+            inner.fail();
+        }
     }
     fn pop_event(&mut self) -> Option<Event> {
         self.events.pop_front()
@@ -232,7 +273,7 @@ where
         if self.peer.is_none() || self.closing {
             return None;
         }
-        self.inner.pop_received()
+        self.inner.as_mut()?.pop_received()
     }
     fn send_data(&mut self, frame: &[u8], priority: u8) -> Result<(), Error> {
         if self.failed || self.peer.is_none() {
@@ -244,6 +285,7 @@ where
         if frame.len() < 14 || priority > 7 {
             return Err(Error::Malformed);
         }
+        let inner = self.inner.as_mut().ok_or(Error::Failed)?;
         let source = frame[6..12].try_into().unwrap();
         let destination = frame[..6].try_into().unwrap();
         let token = if let Some(flow) = self.flows.iter().find(|f| {
@@ -255,16 +297,16 @@ where
         }) {
             flow.token
         } else {
-            let token = match self.inner.open_flow(source, destination, priority) {
+            let token = match inner.open_flow(source, destination, priority) {
                 Ok(token) => token,
                 Err(runtime::Error::Exhausted) => {
                     // A bounded cache may evict an idle destination, but
                     // never recycle its firmware slot before delete ACK.
                     for flow in &self.flows {
-                        if self.inner.flow_state(flow.token).map_err(map)? != FlowState::Open {
+                        if inner.flow_state(flow.token).map_err(map)? != FlowState::Open {
                             continue;
                         }
-                        match self.inner.close_flow(flow.token) {
+                        match inner.close_flow(flow.token) {
                             Ok(()) => return Err(Error::Busy),
                             Err(runtime::Error::Busy) => continue,
                             Err(error) => return Err(map(error)),
@@ -282,8 +324,7 @@ where
             });
             return Err(Error::Busy);
         };
-        let id = self
-            .inner
+        let id = inner
             .send_with_priority(token, frame, priority)
             .map_err(map)?;
         self.tx.push(Tx {
