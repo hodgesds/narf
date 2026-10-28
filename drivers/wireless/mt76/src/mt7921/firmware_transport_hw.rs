@@ -183,6 +183,8 @@ struct Hardware {
     device: BusDevice,
     authority: Cap<BusDeviceCap, Write>,
     owner: Retained<Storage>,
+    /// Linux `wcid->amsdu` for the station peer (TXD7 HW_AMSDU).
+    hw_amsdu: bool,
 }
 impl Hardware {
     fn receive_ring(&mut self, which: usize) -> Result<Option<Vec<u8>>, Error> {
@@ -445,13 +447,16 @@ impl Hardware {
         let payload = address
             .checked_add(packet_tx::HEADER as u64)
             .ok_or(Error::DmaAddress)?;
-        let header = if aggregated {
+        let mut header = if aggregated {
             packet_tx::ethernet_aggregated(frame, payload, token, protected)?
         } else if qos {
             packet_tx::ethernet_tid(frame, payload, token, 1, protected, tid)?
         } else {
             packet_tx::ethernet(frame, payload, token, 1, protected)?
         };
+        if qos && self.hw_amsdu {
+            packet_tx::set_hw_amsdu(&mut header);
+        }
         // SAFETY: fully validated lengths; this slot has neither DMA nor
         // firmware ownership until the publication below.
         unsafe {
@@ -938,6 +943,9 @@ impl Backend for Hardware {
         }
         self.submit_data_txd(frame, protected, true, pipelined, false, tid)
     }
+    fn set_hw_amsdu(&mut self, enabled: bool) {
+        self.hw_amsdu = enabled;
+    }
     fn receive_idle(&self) -> Result<bool, Error> {
         self.check()?;
         let storage = self.owner.storage.as_ref().ok_or(Error::Busy)?;
@@ -1029,6 +1037,7 @@ impl Transport {
                             storage: Some(storage),
                             published: false,
                         },
+                        hw_amsdu: false,
                     },
                     firmware,
                 ),

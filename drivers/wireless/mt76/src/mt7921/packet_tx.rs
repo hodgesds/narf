@@ -156,9 +156,17 @@ fn ethernet_txd(
     Ok(bytes)
 }
 
+/// mt76_connac2_mac_write_txwi: `MT_TXD7_HW_AMSDU` (bit 10) when the peer's
+/// `wcid->amsdu` is set; firmware aggregates up to STA_REC_HW_AMSDU's count.
+pub(super) fn set_hw_amsdu(header: &mut [u8; HEADER]) {
+    let word = u32::from_le_bytes(header[28..32].try_into().unwrap()) | (1 << 10);
+    header[28..32].copy_from_slice(&word.to_le_bytes());
+}
+
 /// Only the completed originator owner selects this native eligibility.
-/// Firmware still chooses rate/sequence/aggregation and owns CCMP PN; no TX
-/// A-MSDU bit is enabled and each MSDU keeps its own token/terminal status.
+/// Firmware still chooses rate/sequence/aggregation and owns CCMP PN; the
+/// TX A-MSDU bit follows the peer's `wcid->amsdu` and each MSDU keeps its own
+/// token/terminal status.
 pub(super) fn ethernet_aggregated(
     frame: &[u8],
     payload: u64,

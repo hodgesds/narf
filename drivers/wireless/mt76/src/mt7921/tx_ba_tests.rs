@@ -108,7 +108,9 @@ kernel_test_in!(
 );
 
 fn fallback() -> Result<(), &'static str> {
-    for case in 0..11 {
+    // Case 6 (responder A-MSDU bit) is an accepted agreement, not a
+    // fallback: ieee80211_process_addba_resp keeps it (see the TX A-MSDU test).
+    for case in (0..11).filter(|case| *case != 6) {
         let mut session = joined(6, false, true)?;
         match case {
             0 => session.backend.tx_ba_offer = None,
@@ -518,4 +520,83 @@ fn mt76_tx_ba_actual_rx_idle_drains_data_ahead_of_peer_close_before_activation()
 kernel_test_in!(
     "drivers/wireless/mt7921/tx_ba",
     mt76_tx_ba_actual_rx_idle_drains_data_ahead_of_peer_close_before_activation
+);
+
+fn tx_amsdu() -> Result<(), &'static str> {
+    let mut header = crate::mt7921::packet_tx::ethernet_qos(&frame(0), 0x1000, 1, 1, false, true)
+        .map_err(|_| "TXD fixture")?;
+    crate::mt7921::packet_tx::set_hw_amsdu(&mut header);
+    if u32::from_le_bytes(header[28..32].try_into().unwrap()) & (1 << 10) == 0 {
+        return Err("MT_TXD7_HW_AMSDU is TXD7 bit 10");
+    }
+    for responder_amsdu in [true, false] {
+        let mut session = joined(6, false, true)?;
+        // mt76_connac_mcu_sta_amsdu_tlv on the HT peer record.
+        let profile = session.ht20_profile.ok_or("HT profile")?;
+        let record = session
+            .backend
+            .frames
+            .iter()
+            .rev()
+            .find_map(|(_, f)| super::vht_tests::record(f, 15))
+            .ok_or("STA_REC_HW_AMSDU absent from the HT peer record")?;
+        if record
+            != [
+                15,
+                0,
+                8,
+                0,
+                8,
+                u8::from(profile.max_amsdu_len() >= 7991),
+                1,
+                0,
+            ]
+        {
+            return Err("STA_REC_HW_AMSDU fields");
+        }
+        run(session.send_ethernet(&frame(1))).map_err(|_| "pre-BA data")?;
+        if session.backend.data_amsdu.last() != Some(&true) {
+            return Err("HT peer data without wcid->amsdu");
+        }
+        if responder_amsdu {
+            session.backend.tx_ba_fault = 3; // responder sets A-MSDU-in-A-MPDU.
+        }
+        let before = session.backend.frames.len();
+        establish(&mut session)?;
+        if !session.backend.frames[before..]
+            .iter()
+            .any(|(_, f)| f.len() == 33 && f[24..26] == [3, 0] && f[27..29] == [3, 16])
+            || session.tx_ba.amsdu() != responder_amsdu
+        {
+            return Err("ADDBA request lacked AMSDU or response bit was not retained");
+        }
+        run(session.send_ethernet(&frame(2))).map_err(|_| "aggregated data")?;
+        if session.backend.data_aggregation.last() != Some(&true)
+            || session.backend.data_amsdu.last() != Some(&responder_amsdu)
+        {
+            return Err("BA agreement did not set wcid->amsdu from the responder bit");
+        }
+    }
+    // A legacy (non-QoS) station never carries TX A-MSDU.
+    let (mut session, bss) = super::wmm_tests::prepared(false, false);
+    run(session.associate_station(&bss, b"narf", Security::Open, test_permission(), &[]))
+        .map_err(|_| "legacy station")?;
+    run(session.send_ethernet(&frame(3))).map_err(|_| "legacy data")?;
+    if session.backend.data_amsdu.last() != Some(&false)
+        || session
+            .backend
+            .frames
+            .iter()
+            .any(|(_, f)| super::vht_tests::record(f, 15).is_some())
+    {
+        return Err("non-HT station programmed hardware A-MSDU");
+    }
+    Ok(())
+}
+fn mt76_tx_amsdu_follows_ht_peer_record_and_ba_responder_bit() -> TestResult {
+    tx_amsdu().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/tx_ba",
+    mt76_tx_amsdu_follows_ht_peer_record_and_ba_responder_bit
 );

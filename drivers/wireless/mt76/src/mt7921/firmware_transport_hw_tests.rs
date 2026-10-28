@@ -56,6 +56,7 @@ fn rig() -> Result<(Vec<u32>, Hardware), Error> {
                 storage: Some(storage),
                 published: false,
             },
+            hw_amsdu: false,
         },
     ))
 }

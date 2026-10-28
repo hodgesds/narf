@@ -237,6 +237,8 @@ struct Model {
     link_stall: bool,
     pm: PowerModel,
     data_tids: Vec<u8>,
+    hw_amsdu: bool,
+    data_amsdu: Vec<bool>,
 }
 /// Low-power state of the model device, for system suspend/resume.
 #[derive(Debug, Default)]
@@ -319,6 +321,8 @@ impl Model {
             link_stall: false,
             pm: PowerModel::default(),
             data_tids: Vec::new(),
+            hw_amsdu: false,
+            data_amsdu: Vec::new(),
         }
     }
 }
@@ -748,7 +752,7 @@ impl Backend for Model {
                         return Err(Error::Bounds);
                     }
                 } else if frame[24..26] == [3, 0] {
-                    if frame[26] == 0 || frame[27..33] != [2, 16, 0, 0, 0, 0] {
+                    if frame[26] == 0 || frame[27..33] != [3, 16, 0, 0, 0, 0] {
                         return Err(Error::Bounds);
                     }
                     if let Some((window, timeout)) = self.tx_ba_offer {
@@ -928,12 +932,16 @@ impl Backend for Model {
             return Err(Error::Bounds);
         }
         let header = crate::mt7921::packet_tx::ethernet_qos(frame, 0x1000, 1, 1, protected, qos)?;
+        self.data_amsdu.push(qos && self.hw_amsdu);
         self.frames.push((false, frame.to_vec()));
         self.data_protection.push(protected);
         self.data_qos.push(qos);
         self.data_aggregation.push(false);
         self.data_ba_disabled.push(header[15] & 0x10 != 0);
         Ok(())
+    }
+    fn set_hw_amsdu(&mut self, enabled: bool) {
+        self.hw_amsdu = enabled;
     }
     fn submit_data_tid(
         &mut self,

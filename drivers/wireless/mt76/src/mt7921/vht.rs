@@ -216,6 +216,8 @@ pub(crate) struct Profile {
     rx_ldpc: bool,
     rx_stbc: bool,
     rx_greenfield: bool,
+    /// Peer VHT Maximum MPDU Length field (bits 0..1).
+    peer_mpdu: u8,
 }
 impl Profile {
     pub(crate) fn negotiated(
@@ -289,6 +291,7 @@ impl Profile {
             rx_ldpc: vht.rx_ldpc(),
             rx_stbc: vht.rx_stbc(),
             rx_greenfield: n.ht().rx_greenfield(),
+            peer_mpdu: (vht.peer_capability() & 3) as u8,
         })
     }
     pub(crate) fn width(self) -> u8 {
@@ -296,6 +299,14 @@ impl Profile {
     }
     pub(crate) fn center(self) -> u8 {
         self.center
+    }
+    /// mac80211 vht.c `agg.max_amsdu_len` (overrides the HT value).
+    pub(crate) fn max_amsdu_len(self) -> u16 {
+        match self.peer_mpdu {
+            2 => 11454,
+            1 => 7991,
+            _ => 3895,
+        }
     }
     pub(crate) fn ampdu_factor(self) -> u8 {
         ((self.capability >> 23) & 7) as u8

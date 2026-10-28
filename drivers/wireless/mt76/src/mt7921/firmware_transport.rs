@@ -1080,6 +1080,8 @@ trait Backend {
     fn submit_data_aggregated(&mut self, _frame: &[u8], _protected: bool) -> Result<(), Error> {
         Err(Error::UnsupportedFirmware)
     }
+    /// Linux `wcid->amsdu`: hardware TX A-MSDU (TXD7 HW_AMSDU) for this peer.
+    fn set_hw_amsdu(&mut self, _enabled: bool) {}
     /// QoS data on user priority `tid` 1..=7 (TID 0 uses the BE paths above).
     /// Never BA-aggregated: the originator agreement is TID0-only.
     fn submit_data_tid(

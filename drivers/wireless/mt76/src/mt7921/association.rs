@@ -485,6 +485,17 @@ impl JoinPlan {
                 out.extend_from_slice(&vht.sta());
                 out[2] += 1;
             }
+            // mt76_connac_mcu_sta_amsdu_tlv: STA_REC_HW_AMSDU (15) after
+            // HT/VHT for every HT station; eight subframes, the large MPDU
+            // size flag at agg.max_amsdu_len >= 7991, enabled.
+            let max_amsdu = self
+                .vht
+                .map_or(profile.max_amsdu_len(), |vht| vht.max_amsdu_len());
+            let amsdu = tlv(&mut out, 15, 8);
+            out[amsdu + 4] = 8;
+            out[amsdu + 5] = u8::from(max_amsdu >= 7991);
+            out[amsdu + 6] = 1;
+            out[2] += 1;
         }
         Ok(out)
     }

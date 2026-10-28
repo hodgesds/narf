@@ -42,6 +42,8 @@ pub(crate) struct Profile {
     tx_ldpc: bool,
     rx_greenfield: bool,
     tx_greenfield: bool,
+    /// Peer HT Capabilities Maximum A-MSDU Length (7935 instead of 3839).
+    peer_amsdu_7935: bool,
 }
 
 /// One RX/TX stream, HT20 with optional short GI, no LDPC/STBC/greenfield, 3839-byte
@@ -110,6 +112,7 @@ impl Profile {
             tx_ldpc: n.tx_ldpc(),
             rx_greenfield: n.rx_greenfield(),
             tx_greenfield: n.tx_greenfield(),
+            peer_amsdu_7935: n.peer_capability() & 0x0800 != 0,
         }
     }
     pub(crate) fn prepare(info: RadioInfo, bss: &ScanBss) -> Result<Self, Error> {
@@ -182,6 +185,7 @@ impl Profile {
             tx_ldpc: false,
             rx_greenfield: false,
             tx_greenfield: false,
+            peer_amsdu_7935: cap & 0x0800 != 0,
         })
     }
     pub(crate) fn transmit_mcs_mask(self) -> [u8; 10] {
@@ -201,6 +205,14 @@ impl Profile {
     }
     pub(crate) fn receive_stbc(self) -> bool {
         self.rx_stbc
+    }
+    /// mac80211 ht.c `agg.max_amsdu_len` for this HT peer.
+    pub(crate) fn max_amsdu_len(self) -> u16 {
+        if self.peer_amsdu_7935 {
+            7935
+        } else {
+            3839
+        }
     }
     pub(crate) fn transmit_stbc(self) -> bool {
         self.tx_stbc

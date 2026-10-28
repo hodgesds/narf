@@ -27,6 +27,8 @@ pub(super) struct Owner {
     published: bool,
     remote: bool,
     notify: bool,
+    /// The response's A-MSDU-in-A-MPDU bit (mac80211 `tid_tx->amsdu`).
+    amsdu: bool,
 }
 impl Default for Owner {
     fn default() -> Self {
@@ -43,6 +45,7 @@ impl Default for Owner {
             published: false,
             remote: false,
             notify: false,
+            amsdu: false,
         }
     }
 }
@@ -56,6 +59,7 @@ impl Owner {
         self.window = 0;
         self.timeout = 0;
         self.notify = false;
+        self.amsdu = false;
         true
     }
     pub fn start(&mut self, own: [u8; 6], peer: [u8; 6], channel: u8) -> Result<bool, Error> {
@@ -89,6 +93,10 @@ impl Owner {
     pub fn published(&self) -> bool {
         self.published
     }
+    /// Whether the active agreement permits A-MSDU inside the A-MPDU.
+    pub fn amsdu(&self) -> bool {
+        self.amsdu
+    }
     pub fn remote(&self) -> bool {
         self.remote
     }
@@ -100,7 +108,8 @@ impl Owner {
         frame[26] = self.dialog;
         // Source HT compatibility window64; no TX A-MSDU. This request's
         // fresh TID0 SSN0 is distinct from the native operational SN field.
-        frame[27..29].copy_from_slice(&0x1002u16.to_le_bytes());
+        // ieee80211_send_addba_request: AMSDU | immediate policy | TID0 | 64.
+        frame[27..29].copy_from_slice(&0x1003u16.to_le_bytes());
         frame
     }
     fn action(&self, length: usize, action: u8) -> Vec<u8> {
@@ -149,10 +158,13 @@ impl Owner {
                 self.phase = Phase::Fallback;
                 return true;
             }
-            if parameters & 3 != 2 || !(1..=64).contains(&window) {
+            if parameters & 2 != 2 || !(1..=64).contains(&window) {
                 self.phase = Phase::Fallback;
                 return true;
             }
+            // agg-tx.c ieee80211_process_addba_resp keeps the responder's
+            // A-MSDU bit; mt7921_mcu_uni_tx_ba clears wcid->amsdu without it.
+            self.amsdu = parameters & 1 != 0;
             self.window = window;
             self.timeout = u16::from_le_bytes([frame[31], frame[32]]);
             self.phase = Phase::Offered;

@@ -1068,6 +1068,12 @@ impl<B: Backend> Session<B> {
         let tid = self
             .wmm
             .map_or(0, |wmm| super::super::tx_priority::select(frame, wmm.acm()));
+        // wcid->amsdu: set by the STA_REC_HW_AMSDU record of an HT peer and
+        // cleared by a TX BA agreement without the A-MSDU bit.
+        let amsdu = self.wmm.is_some()
+            && self.ht20_profile.is_some()
+            && !(self.tx_ba.active() && !self.tx_ba.amsdu());
+        self.backend.set_hw_amsdu(amsdu);
         let result = if tid != 0 {
             self.backend.submit_data_tid(
                 frame,
