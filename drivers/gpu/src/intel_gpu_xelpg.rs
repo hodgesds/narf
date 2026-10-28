@@ -1687,8 +1687,10 @@ pub mod tests {
                 // ACK bits mirror their REQUEST bits (bit n-1):
                 // refclk requests (bits 29/25) always ACK; the
                 // injection switch withholds the PLL ACKs
-                // (bits 31/27 → 30/26).
-                let mut v = s | ((s & 0x2200_0000) >> 1);
+                // (bits 31/27 → 30/26). ACKs are read-only: a
+                // read-modify-write carrying them must not latch
+                // them, so stored ACK bits are masked off.
+                let mut v = (s & !0x5500_0000) | ((s & 0x2200_0000) >> 1);
                 if !self.no_clock_ack.get() {
                     v |= (s & 0x8800_0000) >> 1;
                 }
@@ -1700,8 +1702,10 @@ pub mod tests {
             if off == self.port.buf_ctl2() {
                 let s = self.stored(off);
                 // Powerdown-update bits self-clear; lane PHY status
-                // mirrors the pipe-reset bits (>>2).
-                return (s & !0x0300_0000) | ((s & 0xC000_0000) >> 2);
+                // mirrors the pipe-reset bits (>>2). Status is
+                // read-only: a read-modify-write that carries the
+                // read-back status bits must not latch them.
+                return (s & !0x3300_0000) | ((s & 0xC000_0000) >> 2);
             }
             self.stored(off)
         }
