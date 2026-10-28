@@ -1214,7 +1214,7 @@ fn wiphy_security_attrs(attrs: &mut Vec<u8>, iface: &dyn crate::WirelessNetIface
         bits.push(58); // BSS_COLOR
     }
     if iface.supports_station_tx_power() {
-        bits.push(36); // STA_TX_PWR
+        bits.push(37); // STA_TX_PWR
     }
     if iface.supports_ack_signal() {
         bits.push(27); // ACK_SIGNAL_SUPPORT
