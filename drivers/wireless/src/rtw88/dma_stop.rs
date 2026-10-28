@@ -193,7 +193,8 @@ pub(super) mod tests {
         if run(&mut regs).is_err() || regs.get32(RXPKT_NUM) & RW_RELEASE == 0 {
             return TestResult::Fail("stopped idle controller was not proven");
         }
-        let cases: [(fn(&mut Regs), Error, &str); 7] = [
+        type Case = (fn(&mut Regs), Error, &'static str);
+        let cases: [Case; 7] = [
             (|r| r.bme = true, Error::Prerequisite, "BME open"),
             (|r| r.set32(0xb8, 1), Error::Prerequisite, "HIMR1 armed"),
             (|r| r.bytes[0x522] = 0, Error::Prerequisite, "TX unpaused"),

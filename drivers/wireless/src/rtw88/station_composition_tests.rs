@@ -721,7 +721,7 @@ fn smoke_rtw8822ce_removal_withdraws_then_reclaims_after_dma_proof() -> TestResu
     {
         return TestResult::Fail("RTL8822CE removed lifecycle still retains an owner");
     }
-    if complete(h.device.associate(h.request())).is_ok() || complete(h.lifecycle.remove()) != true {
+    if complete(h.device.associate(h.request())).is_ok() || !complete(h.lifecycle.remove()) {
         return TestResult::Fail("RTL8822CE removed owner reopened");
     }
     TestResult::Pass
