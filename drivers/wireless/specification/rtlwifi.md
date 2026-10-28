@@ -575,13 +575,43 @@ whole original default3839 aggregate plus its actual header/status/FCS extents.
 Standalone A-MSDUs use shared authenticated whole-original receive, or bounded
 Open decoding, before any Ethernet publication. Every suffix and inner
 address/control/VLAN check succeeds before complete delivery and protected PN
-commit. No prefix, deaggregated firmware fragment or nested/BA packet is admitted.
-An actual current-peer ADDBA request instead queues a bounded native status37
-response with matching token/TID and A-MSDU permission clear. The control owns
-the actual linked management descriptor/body until its terminal receipt;
-key work/close retires unsent controls and uncertain published DMA stays owned.
-Linux's recipient start/stop is host state only; this slice invents no BA CAM
-command or firmware acknowledgement and claims no successful agreement.
+commit. No prefix or deaggregated firmware fragment is admitted.
+
+#### Recipient Block Ack and RX reordering (implemented)
+
+`rtl_op_ampdu_action` RX_START/RX_STOP reach `rtl_rx_agg_start`/`stop`, which
+only record per-TID host state (and consult BT coexistence, absent on 88EE);
+mac80211 owns the session and reorder buffer while the MAC acknowledges
+A-MPDUs autonomously. `station.rs` follows `agg-rx.c`
+`__ieee80211_start_rx_ba_session` for a peer-bound ADDBA Request on the HT
+profile: TID>=8 answers status37, delayed policy or window>64 answers38,
+window0 selects64 (`rtl_rx_ampdu_apply` keeps `IEEE80211_MAX_AMPDU_BUF_HT`
+without BT limits), a repeated dialog token succeeds only with an unchanged
+timeout, a new token replaces the session. The response sets immediate policy
+and the A-MSDU bit, because rtlwifi sets `SUPPORTS_AMSDU_IN_AMPDU`; `packet.rs`
+publishes ADDBA Response and DELBA actions on the management ring with the
+same terminal-receipt ownership as before.
+
+Native RXD DW1 PAGGR/FAGGR are now reported (`Mpdu::aggregated`) on the HT
+profile and accepted only for QoS DATA; the station refuses any A-MPDU member
+on a TID without a session before CCMP/PN. Unicast QoS DATA from the peer on a
+session TID passes through the shared `narf_wireless::reorder` buffer
+(`ieee80211_rx_reorder_ampdu`) at capture, keeping its capture-time admission
+and epoch, so CCMP/PN and A-MSDU deaggregation see sequence order. RCR_ACF is
+part of the 88EE `receive_config` and mac80211 never clears it in station mode,
+so 20-byte BlockAckReq frames are admitted natively and handled as
+`ieee80211_rx_h_ctrl`: release up to the BAR SSN and refresh the session timer;
+a BAR on a TID without a session sends one recipient DELBA
+`WLAN_REASON_QSTA_REQUIRE_SETUP` per TID. Holes release after the 100ms
+`HT_RX_REORDER_BUF_TIMEOUT`; session inactivity sends recipient DELBA
+`WLAN_REASON_QSTA_TIMEOUT`; an originator DELBA purges the session; failure and
+disconnect purge all sessions. Smokes
+`smoke_rtl8188ee_ht20_rx_ba_reorders_ampdu_and_bar_before_pn` (Open/WPA2:
+literal response, out-of-order release, BAR release across a missing SN,
+timeout release, sessionless A-MPDU refusal and single DELBA, originator
+DELBA), `smoke_rtl8188ee_ht20_rx_ba_policy_and_inactivity_delba` and the
+updated `smoke_rtl8188ee_ht20_real_addba_response_terminal_receipt_and_cancelled_dma`
+cover the paths. TX aggregation/originator BA remain separate rows.
 
 RX originals capture controlled-port admission and a receive generation while
 the actual descriptor is copied. A terminal EAPOL TX receipt must additionally
@@ -652,7 +682,7 @@ Per-chip remaining inventory uses Linux per-chip `sw.c` and radio/PCI ops:
 
 | Chip | Source hardware scope | Remaining native software |
 |---|---|---|
-| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, ADDBA refusal and capture/publication epochs above. Remaining software: SGI20, HT40, successful RX/TX BA/reorder/aggregation, adaptive rates, broader scan/channels, tracking/PM and reset/rejoin. Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
+| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, recipient BA/RX reorder and capture/publication epochs above. Remaining software: SGI20, HT40, originator TX BA/aggregation, adaptive rates, broader scan/channels, tracking/PM and reset/rejoin. Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
 | RTL8192CE family aliases / RTL8192EE |2.4GHz HT; CE aliases need exact RF-type qualification, including the8176/8188CE variant; EE is2T2R |Retained chip firmware/MAC/PHY/RF/calibration/power/packet/station chain, then full HT/QoS/lifecycle. The8179/8188EE HT path does not admit these IDs. |
 | RTL8192DE |Dual-band dual-MAC HT |Exact per-function reset/power/firmware/DMA/radio ownership and station chains, then bands/HT/QoS/lifecycle |
 | RTL8723AE/BE |2.4GHz1T1R HT with BT |Chip-specific retained chain, antenna/BT coexistence and HT/QoS/lifecycle |

@@ -168,12 +168,11 @@ impl Peer {
             return Err("native AP peer identity");
         }
         if frame[0] == 0xd0 && self.ht.is_some() {
-            if frame.len() != 33
-                || frame[24..26] != [3, 1]
-                || frame[27..29] != [37, 0]
-                || frame[29] & 1 != 0
+            // Driver-owned BA actions: ADDBA Response (33) or DELBA (30).
+            if !(frame.len() == 33 && frame[24..26] == [3, 1]
+                || frame.len() == 30 && frame[24..26] == [3, 2])
             {
-                return Err("AP native ADDBA refusal identity/status");
+                return Err("AP native BA action identity");
             }
             self.controls.push(frame.to_vec());
             return Ok((Vec::new(), self.hold_control));

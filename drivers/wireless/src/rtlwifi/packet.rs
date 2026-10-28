@@ -130,6 +130,8 @@ pub struct Mpdu {
     bytes: Vec<u8>,
     channel: u8,
     ht: bool,
+    /// Native RXD DW1 PAGGR/FAGGR: this MPDU arrived inside an A-MPDU.
+    aggregated: bool,
 }
 /// Consuming a rejected packet/report is progress, never a receive-idle
 /// proof. Station output waits for a genuine OWN-owned next descriptor.
@@ -146,6 +148,10 @@ impl Mpdu {
     }
     pub(super) fn ht(&self) -> bool {
         self.ht
+    }
+    /// Only the station's recipient BA owner may admit such an MPDU.
+    pub(super) fn aggregated(&self) -> bool {
+        self.aggregated
     }
 }
 impl narf_wireless::station_security::RawFrame for Mpdu {
@@ -173,9 +179,8 @@ fn queue(frame: &[u8], local: [u8; 6], qos: bool) -> Result<(usize, u16, u8), Er
             && (matches!((fc >> 4) & 15, 0 | 4 | 10 | 11 | 12)
                 || qos
                     && (fc >> 4) & 15 == 13
-                    && frame.len() == 33
-                    && frame[24..26] == [3, 1]
-                    && frame[27..29] == [37, 0]) =>
+                    && (frame.len() == 33 && frame[24..26] == [3, 1]
+                        || frame.len() == 30 && frame[24..26] == [3, 2])) =>
         {
             // MGMT vector1, Linux MGNT_QUEUE6, QSLT_MGNT0x12.
             Ok((1, 1 << 6, 0x12))
@@ -672,13 +677,17 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 && (12..=19).contains(&(report & 63))
                 && report & ((1 << 7) | (1 << 8) | (1 << 9)) == 0;
             let legacy_profile = !ht && report & (1 << 9) == 0 && report & 63 <= 11;
+            // DW1 PAGGR/FAGGR (rtl8188ee trx.h): A-MPDU membership is only
+            // admissible on the HT profile, where the station BA owner gates it.
+            let aggregated = extra & (3 << 14) != 0;
             if ordinary
                 && status & 0xc000 == 0
                 && status & 0x3000_0000 == 0x3000_0000
-                && extra & ((3 << 14) | (1 << 27)) == 0
+                && extra & (1 << 27) == 0
+                && (!aggregated || ht_profile)
                 && sequence & 0xf000 == 0
                 && (legacy_profile || ht_profile)
-                && (28..=if self.packet.ht {
+                && (24..=if self.packet.ht {
                     26 + 16 + narf_wireless::amsdu::MAX_BYTES + 4
                 } else {
                     MAX_MPDU + 4
@@ -716,12 +725,30 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 let fc = u16::from_le_bytes([bytes[0], bytes[1]]);
                 // Open frames may legitimately have SWDEC clear (Linux trx.c).
                 // Protected frames must retain their IV/CCMP ciphertext/MIC.
-                if fc & 0x400 == 0
+                if bytes.len() == 20 {
+                    // BlockAckReq: RCR_ACF stays set (rtl8188ee sw.c receive_config;
+                    // mac80211 never toggles FIF_CONTROL in station mode).
+                    if fc == 0x84 && !aggregated && status & (1 << 23) == 0 {
+                        packet = Some(Mpdu {
+                            bytes,
+                            channel,
+                            ht,
+                            aggregated,
+                        });
+                    }
+                } else if bytes.len() >= 24
+                    && fc & 0x400 == 0
                     && bytes[22] & 15 == 0
                     && (status & (1 << 23) != 0) == (fc & 0x8c == 0x88)
                     && (fc & 0x4000 == 0 || status & (1 << 27) != 0)
+                    && (!aggregated || fc & 0xfc == 0x88)
                 {
-                    packet = Some(Mpdu { bytes, channel, ht });
+                    packet = Some(Mpdu {
+                        bytes,
+                        channel,
+                        ht,
+                        aggregated,
+                    });
                 }
             }
             for word in 0..6 {

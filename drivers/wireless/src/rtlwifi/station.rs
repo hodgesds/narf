@@ -145,6 +145,41 @@ struct Captured {
     admitted: bool,
     epoch: u64,
 }
+/// mac80211 `IEEE80211_MAX_AMPDU_BUF_HT`; `rtl_rx_ampdu_apply` keeps it
+/// without a BT-coexistence aggregation limit (RTL8188EE has no BT).
+const BA_MAX_WINDOW: u16 = 64;
+/// mac80211 `HT_RX_REORDER_BUF_TIMEOUT` (HZ / 10).
+const REORDER_TIMEOUT_NS: u64 = 100_000_000;
+/// `WLAN_STATUS_REQUEST_DECLINED` / `WLAN_STATUS_INVALID_QOS_PARAM`.
+const STATUS_DECLINED: u16 = 37;
+const STATUS_INVALID_QOS: u16 = 38;
+/// `WLAN_REASON_QSTA_REQUIRE_SETUP` / `WLAN_REASON_QSTA_TIMEOUT`.
+const REASON_REQUIRE_SETUP: u16 = 38;
+const REASON_TIMEOUT: u16 = 39;
+/// One accepted recipient BA session. `rtl_rx_agg_start`/`rtl_rx_agg_stop`
+/// only record per-TID host state; the EE MAC acknowledges autonomously.
+struct RxBa {
+    reorder: narf_wireless::reorder::Reorder<Captured>,
+    token: u8,
+    timeout_tu: u16,
+    last_rx: u64,
+}
+fn action_header(peer: [u8; 6], own: [u8; 6]) -> Vec<u8> {
+    let mut header = vec![0xd0, 0, 0, 0];
+    header.extend_from_slice(&peer);
+    header.extend_from_slice(&own);
+    header.extend_from_slice(&peer);
+    header.extend_from_slice(&[0, 0]);
+    header
+}
+fn delba(peer: [u8; 6], own: [u8; 6], tid: u16, reason: u16) -> Vec<u8> {
+    // ieee80211_send_delba as recipient: initiator bit clear.
+    let mut frame = action_header(peer, own);
+    frame.extend_from_slice(&[3, 2]);
+    frame.extend_from_slice(&(tid << 12).to_le_bytes());
+    frame.extend_from_slice(&reason.to_le_bytes());
+    frame
+}
 pub(crate) struct Publication {
     pci: super::packet::Publication,
     base: Arc<super::super::channel_power::Calibration>,
@@ -223,6 +258,10 @@ pub(super) struct State {
     delivered_reply: Option<Pending>,
     epoch: Arc<AtomicU64>,
     retire: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Recipient BA sessions by TID (mac80211 `tid_ampdu_rx`).
+    rx_ba: [Option<RxBa>; 8],
+    /// mac80211 `ampdu_mlme.unexpected_agg`: one DELBA per TID.
+    unexpected_ba: u16,
 }
 impl State {
     pub(super) fn new() -> Self {
@@ -255,6 +294,8 @@ impl State {
             delivered_reply: None,
             epoch: Arc::new(AtomicU64::new(1)),
             retire: None,
+            rx_ba: Default::default(),
+            unexpected_ba: 0,
         }
     }
     fn fail(&mut self) {
@@ -267,6 +308,7 @@ impl State {
         self.wmm = None;
         self.retire_receive();
         self.controls.clear();
+        self.retire_ba();
         if let Some(plan) = &mut self.plan {
             plan.cancel();
         }
@@ -287,6 +329,106 @@ impl State {
         if let Some(retire) = &self.retire {
             retire();
         }
+    }
+    fn retire_ba(&mut self) {
+        for slot in &mut self.rx_ba {
+            if let Some(session) = slot.take() {
+                session.reorder.retire();
+            }
+        }
+        self.unexpected_ba = 0;
+    }
+    /// mac80211 `__ieee80211_start_rx_ba_session`; returns (status, TID, window).
+    fn addba_request(
+        &mut self,
+        token: u8,
+        p: u16,
+        timeout: u16,
+        ssn: u16,
+        now: u64,
+    ) -> (u16, u8, u16) {
+        let policy = (p >> 1) & 1;
+        let tid = ((p >> 2) & 15) as u8;
+        let mut buf = p >> 6;
+        if tid >= 8 {
+            return (STATUS_DECLINED, tid, buf);
+        }
+        if policy != 1 || buf > BA_MAX_WINDOW {
+            return (STATUS_INVALID_QOS, tid, buf);
+        }
+        if buf == 0 {
+            buf = BA_MAX_WINDOW;
+        }
+        let slot = &mut self.rx_ba[usize::from(tid)];
+        if let Some(session) = slot {
+            if session.token == token {
+                let status = if session.timeout_tu == timeout {
+                    0
+                } else {
+                    STATUS_DECLINED
+                };
+                return (status, tid, buf);
+            }
+            if let Some(old) = slot.take() {
+                old.reorder.retire();
+            }
+        }
+        let Ok(mut reorder) = narf_wireless::reorder::Reorder::new(buf as u8, REORDER_TIMEOUT_NS)
+        else {
+            return (STATUS_DECLINED, tid, buf);
+        };
+        if reorder.advance(ssn, now.saturating_mul(1_000_000)).is_err() {
+            return (STATUS_DECLINED, tid, buf);
+        }
+        *slot = Some(RxBa {
+            reorder,
+            token,
+            timeout_tu: timeout,
+            last_rx: now,
+        });
+        self.unexpected_ba &= !(1 << tid);
+        (0, tid, buf)
+    }
+    fn release(&mut self, released: Vec<Captured>) -> Result<(), Error> {
+        if self.incoming.len() + released.len() > 256 {
+            return Err(Error::Allocation);
+        }
+        self.incoming.extend(released);
+        Ok(())
+    }
+    /// Session inactivity (`sta_rx_agg_session_timer_expired`) and reorder
+    /// hole expiry (`sta_rx_agg_reorder_timer_expired`).
+    fn service_ba(&mut self, now: u64, own: [u8; 6]) -> Result<(), Error> {
+        let peer = self
+            .candidate
+            .as_ref()
+            .map(|c| c.bss.bssid)
+            .ok_or(Error::State)?;
+        for tid in 0..8u16 {
+            let Some(session) = self.rx_ba[usize::from(tid)].as_mut() else {
+                continue;
+            };
+            if session.timeout_tu != 0
+                && now.saturating_sub(session.last_rx)
+                    >= u64::from(session.timeout_tu) * 1024 / 1000
+            {
+                if let Some(session) = self.rx_ba[usize::from(tid)].take() {
+                    session.reorder.retire();
+                }
+                if self.controls.len() == 8 {
+                    return Err(Error::Allocation);
+                }
+                self.controls
+                    .push_back(delba(peer, own, tid, REASON_TIMEOUT));
+                continue;
+            }
+            let released = session
+                .reorder
+                .expire(now.saturating_mul(1_000_000))
+                .unwrap_or_default();
+            self.release(released)?;
+        }
+        Ok(())
     }
     fn receive_open(&self) -> bool {
         self.phase == Phase::Open
@@ -1045,6 +1187,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .candidate
             .as_ref()
             .map(|candidate| candidate.bss.bssid);
+        if self.station.receive_open() {
+            self.station.service_ba(now, own)?;
+        }
         let mut idle = false;
         for _ in 0..64 {
             let step = self.poll_receive_step()?;
@@ -1080,7 +1225,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 continue;
             }
             let bytes = frame.bytes();
-            if bytes.len() < 24 || Some(bytes[10..16].try_into().unwrap()) != peer {
+            let bar = bytes.len() == 20 && bytes[0] == 0x84;
+            if bytes.len() < 24 && !bar || Some(bytes[10..16].try_into().unwrap()) != peer {
                 continue;
             }
             if matches!(bytes[0], 0xa0 | 0xc0)
@@ -1092,29 +1238,95 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 }
                 return Err(Error::PeerLost);
             }
+            let peer_address = peer.ok_or(Error::State)?;
             if bytes[0] == 0xd0
                 && self.station.ht_profile.is_some()
                 && self.station.receive_open()
-                && bytes.len() == 33
+                && bytes.len() >= 26
                 && bytes[1] & 0xc7 == 0
                 && bytes[4..10] == own
                 && bytes[16..22] == bytes[10..16]
                 && bytes[22] & 15 == 0
-                && bytes[24..26] == [3, 0]
+                && bytes[24] == 3
             {
-                let p = u16::from_le_bytes([bytes[27], bytes[28]]);
-                if p & 2 != 0 && (p >> 2) & 15 < 8 && bytes[31] & 15 == 0 && (p >> 6) != 0 {
-                    if self.station.controls.len() == 8 {
-                        return Err(Error::Allocation);
+                match bytes[25] {
+                    // ieee80211_process_addba_request; the response A-MSDU bit
+                    // follows SUPPORTS_AMSDU_IN_AMPDU, which rtlwifi sets.
+                    0 if bytes.len() >= 33 => {
+                        if self.station.controls.len() == 8 {
+                            return Err(Error::Allocation);
+                        }
+                        let token = bytes[26];
+                        let p = u16::from_le_bytes([bytes[27], bytes[28]]);
+                        let timeout = u16::from_le_bytes([bytes[29], bytes[30]]);
+                        let ssn = u16::from_le_bytes([bytes[31], bytes[32]]) >> 4;
+                        let (status, tid, buf) =
+                            self.station.addba_request(token, p, timeout, ssn, now);
+                        let params = (buf << 6) | (u16::from(tid) << 2) | 2 | 1;
+                        let mut response = action_header(peer_address, own);
+                        response.extend_from_slice(&[3, 1, token]);
+                        response.extend_from_slice(&status.to_le_bytes());
+                        response.extend_from_slice(&params.to_le_bytes());
+                        response.extend_from_slice(&timeout.to_le_bytes());
+                        self.station.controls.push_back(response);
                     }
-                    let mut response = vec![0xd0, 0, 0, 0];
-                    response.extend_from_slice(&bytes[10..16]);
-                    response.extend_from_slice(&own);
-                    response.extend_from_slice(&bytes[10..16]);
-                    response.extend_from_slice(&[0, 0, 3, 1, bytes[26], 37, 0]);
-                    response.extend_from_slice(&(p & !1).to_le_bytes());
-                    response.extend_from_slice(&bytes[29..31]);
-                    self.station.controls.push_back(response);
+                    // ieee80211_process_delba from the originator.
+                    2 if bytes.len() >= 30 => {
+                        let p = u16::from_le_bytes([bytes[26], bytes[27]]);
+                        if p & (1 << 11) != 0 {
+                            if let Some(session) =
+                                self.station.rx_ba[usize::from(p >> 12) & 7].take()
+                            {
+                                session.reorder.retire();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            // ieee80211_rx_h_ctrl BlockAckReq: release up to its SSN, refresh
+            // the session timer; a BAR for a TID without a session sends one
+            // recipient DELBA QSTA_REQUIRE_SETUP per TID.
+            if bar {
+                if bytes[4..10] != own
+                    || self.station.ht_profile.is_none()
+                    || !self.station.receive_open()
+                {
+                    continue;
+                }
+                let control = u16::from_le_bytes([bytes[16], bytes[17]]);
+                let tid = control >> 12;
+                let ssn = u16::from_le_bytes([bytes[18], bytes[19]]) >> 4;
+                match self
+                    .station
+                    .rx_ba
+                    .get_mut(usize::from(tid))
+                    .and_then(Option::as_mut)
+                {
+                    Some(session) => {
+                        if session.timeout_tu != 0 {
+                            session.last_rx = now;
+                        }
+                        let released = session
+                            .reorder
+                            .advance(ssn, now.saturating_mul(1_000_000))
+                            .unwrap_or_default();
+                        self.station.release(released)?;
+                    }
+                    None if self.station.unexpected_ba & (1 << tid) == 0 => {
+                        if self.station.controls.len() == 8 {
+                            return Err(Error::Allocation);
+                        }
+                        self.station.unexpected_ba |= 1 << tid;
+                        self.station.controls.push_back(delba(
+                            peer_address,
+                            own,
+                            tid,
+                            REASON_REQUIRE_SETUP,
+                        ));
+                    }
+                    None => {}
                 }
                 continue;
             }
@@ -1126,14 +1338,40 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             let data = self.station.phase == Phase::Open
                 && (bytes[0] == 8 || self.station.wmm.is_some() && bytes[0] == 0x88);
             if management || key && self.station.phase != Phase::Passive || data {
-                if self.station.incoming.len() == 64 {
+                if self.station.incoming.len() >= 64 {
                     return Err(Error::Allocation);
                 }
-                self.station.incoming.push_back(Captured {
+                // ieee80211_rx_reorder_ampdu: unicast QoS DATA from the peer
+                // on a session TID is ordered before CCMP/PN and delivery.
+                let session_tid = (data
+                    && bytes[0] == 0x88
+                    && bytes.len() >= 26
+                    && bytes[1] & 3 == 2
+                    && bytes[4..10] == own
+                    && bytes[22] & 15 == 0)
+                    .then_some(usize::from(bytes[24] & 15))
+                    .filter(|tid| self.station.rx_ba.get(*tid).is_some_and(Option::is_some));
+                let sequence = u16::from_le_bytes([bytes[22], bytes[23]]) >> 4;
+                let aggregated = frame.aggregated();
+                let captured = Captured {
                     admitted: self.station.receive_open(),
                     epoch: self.station.epoch.load(Ordering::Acquire),
                     frame,
-                });
+                };
+                if let Some(tid) = session_tid {
+                    if let Some(session) = self.station.rx_ba[tid].as_mut() {
+                        session.last_rx = now;
+                        let released = session
+                            .reorder
+                            .push(sequence, now.saturating_mul(1_000_000), captured)
+                            .unwrap_or_default();
+                        self.station.release(released)?;
+                    }
+                } else if !aggregated {
+                    // A-MPDU membership without an accepted session is refused
+                    // before CCMP/PN.
+                    self.station.incoming.push_back(captured);
+                }
             }
         }
         if idle {
@@ -1395,6 +1633,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.station.retire_receive();
         self.station.controls.clear();
         self.station.incoming.clear();
+        self.station.retire_ba();
         self.station.pmk = None;
         if let Some(security) = &mut self.station.security {
             security.fail();

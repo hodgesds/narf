@@ -269,7 +269,7 @@ fn addba(h: &Harness, tid: u8) -> Vec<u8> {
     f.extend_from_slice(&[0, 0, 0x30, 0x12]);
     f
 }
-fn smoke_rtl8188ee_ht20_real_addba_decline_terminal_receipt_and_cancelled_dma() -> TestResult {
+fn smoke_rtl8188ee_ht20_real_addba_response_terminal_receipt_and_cancelled_dma() -> TestResult {
     check(|| {
         for fault in 0..3 {
             let h = Harness::new_profile(true, true);
@@ -285,15 +285,16 @@ fn smoke_rtl8188ee_ht20_real_addba_decline_terminal_receipt_and_cancelled_dma() 
                 let response = peer
                     .controls
                     .last()
-                    .ok_or("native ADDBA refusal not delivered to peer")?;
+                    .ok_or("native ADDBA response not delivered to peer")?;
+                // mac80211 accepts (status0); rtlwifi's SUPPORTS_AMSDU_IN_AMPDU
+                // sets the response A-MSDU bit.
                 if response.len() != 33
                     || response[26] != 71
-                    || response[27..29] != [37, 0]
-                    || response[29] & 1 != 0
-                    || (u16::from_le_bytes([response[29], response[30]]) >> 2) & 15
-                        != u16::from(tid)
+                    || response[27..29] != [0, 0]
+                    || u16::from_le_bytes([response[29], response[30]])
+                        != 3 | (u16::from(tid) << 2) | (32 << 6)
                 {
-                    return Err("native ADDBA decline lost token/TID/status/A-MSDU refusal");
+                    return Err("native ADDBA response lost token/TID/status/A-MSDU/window");
                 }
                 drop(peer);
                 let d = h.packet.model.lock().descriptors.last().unwrap().clone();
@@ -301,7 +302,7 @@ fn smoke_rtl8188ee_ht20_real_addba_decline_terminal_receipt_and_cancelled_dma() 
                     || word(&d, 16) & (1 << 6) != 0
                     || word(&d, 8) & (1 << 12) != 0
                 {
-                    return Err("BA refusal used MCS/QoS/AGG instead of native legacy management");
+                    return Err("BA response used MCS/QoS/AGG instead of native legacy management");
                 }
                 if fault != 0 {
                     break;
@@ -321,7 +322,7 @@ fn smoke_rtl8188ee_ht20_real_addba_decline_terminal_receipt_and_cancelled_dma() 
                     return Err("late decline receipt reopened cancelled owner");
                 }
             } else if !h.device.link_up() {
-                return Err("successful refusal changed station admission");
+                return Err("successful BA response changed station admission");
             }
             if retained(&h) < count {
                 return Err("uncertain ADDBA control released native DMA");
@@ -332,7 +333,232 @@ fn smoke_rtl8188ee_ht20_real_addba_decline_terminal_receipt_and_cancelled_dma() 
 }
 kernel_test_in!(
     "drivers/wireless/rtlwifi/ht20",
-    smoke_rtl8188ee_ht20_real_addba_decline_terminal_receipt_and_cancelled_dma
+    smoke_rtl8188ee_ht20_real_addba_response_terminal_receipt_and_cancelled_dma
+);
+/// One non-A-MSDU QoS DATA MPDU on `tid`, sequence `seq`, CCMP PN `pn`.
+fn qos(h: &Harness, seq: u16, tid: u8, pn: u64, n: u8) -> Result<(Vec<u8>, Vec<u8>), &'static str> {
+    let e = packet(h, n, false);
+    let mut p = h.peer.lock();
+    p.pn = p.pn.max(pn.saturating_add(1));
+    let mut header = vec![0x88, if p.ap.protected() { 0x42 } else { 2 }, 0, 0];
+    header.extend_from_slice(&p.plan.station);
+    header.extend_from_slice(&PEER);
+    header.extend_from_slice(&PEER);
+    header.extend_from_slice(&(seq << 4).to_le_bytes());
+    header.extend_from_slice(&[tid, 0]);
+    let mut body = vec![0xaa, 0xaa, 3, 0, 0, 0];
+    body.extend_from_slice(&e[12..]);
+    if p.ap.protected() {
+        let key = p
+            .ptk
+            .as_ref()
+            .ok_or("BA AP key absent")?
+            .tk
+            .as_slice()
+            .try_into()
+            .map_err(|_| "BA TK extent")?;
+        let mut clear = body;
+        body = narf_wireless::ccmp::protect(&Ccm, &header, key, pn, 0, tid, false, &mut clear)
+            .map_err(|_| "BA CCMP")?;
+    }
+    header.extend_from_slice(&body);
+    Ok((header, e))
+}
+fn addba_with(h: &Harness, token: u8, params: u16, timeout: u16, ssn: u16) -> Vec<u8> {
+    let mut f = vec![0xd0, 0, 0, 0];
+    f.extend_from_slice(&h.peer.lock().plan.station);
+    f.extend_from_slice(&PEER);
+    f.extend_from_slice(&PEER);
+    f.extend_from_slice(&[0, 0, 3, 0, token]);
+    f.extend_from_slice(&params.to_le_bytes());
+    f.extend_from_slice(&timeout.to_le_bytes());
+    f.extend_from_slice(&(ssn << 4).to_le_bytes());
+    f
+}
+fn bar(h: &Harness, tid: u16, ssn: u16) -> Vec<u8> {
+    let mut f = vec![0x84, 0, 0, 0];
+    f.extend_from_slice(&h.peer.lock().plan.station);
+    f.extend_from_slice(&PEER);
+    f.extend_from_slice(&(tid << 12 | 4).to_le_bytes());
+    f.extend_from_slice(&(ssn << 4).to_le_bytes());
+    f
+}
+fn originator_delba(h: &Harness, tid: u16) -> Vec<u8> {
+    let mut f = vec![0xd0, 0, 0, 0];
+    f.extend_from_slice(&h.peer.lock().plan.station);
+    f.extend_from_slice(&PEER);
+    f.extend_from_slice(&PEER);
+    f.extend_from_slice(&[0, 0, 3, 2]);
+    f.extend_from_slice(&(tid << 12 | 1 << 11).to_le_bytes());
+    f.extend_from_slice(&1u16.to_le_bytes());
+    f
+}
+const PAGGR: u32 = 1 << 14;
+fn smoke_rtl8188ee_ht20_rx_ba_reorders_ampdu_and_bar_before_pn() -> TestResult {
+    check(|| {
+        for protected in [false, true] {
+            let h = Harness::new_profile(protected, true);
+            ht_join(&h)?;
+            // Window16 TID6 session at SSN200; A-MSDU permitted in A-MPDU.
+            let params = 3u16 | 6 << 2 | 16 << 6;
+            h.packet.emit(&addba_with(&h, 9, params, 0, 200)).unwrap();
+            h.pump();
+            {
+                let peer = h.peer.lock();
+                let r = peer.controls.last().ok_or("EE ADDBA response missing")?;
+                if r.len() != 33
+                    || r[26] != 9
+                    || r[27..29] != [0, 0]
+                    || r[29..31] != params.to_le_bytes()
+                    || r[31..33] != [0, 0]
+                {
+                    return Err("EE ADDBA acceptance status/params/A-MSDU");
+                }
+            }
+            let (f200, e200) = qos(&h, 200, 6, 200, 20)?;
+            let (f201, e201) = qos(&h, 201, 6, 201, 21)?;
+            let (f202, e202) = qos(&h, 202, 6, 202, 22)?;
+            h.packet
+                .emit_native(&f200, 0x53, PAGGR | 1 << 15, None)
+                .unwrap();
+            h.pump();
+            if h.received() != vec![e200] {
+                return Err("EE BA head MPDU");
+            }
+            h.packet.emit_native(&f202, 0x53, PAGGR, None).unwrap();
+            h.pump();
+            if !h.received().is_empty() {
+                return Err("EE BA delivered across a hole");
+            }
+            h.packet.emit_native(&f201, 0x53, PAGGR, None).unwrap();
+            h.pump();
+            if h.received() != vec![e201, e202] {
+                return Err("EE BA hole fill order");
+            }
+            // BAR moves the window past a missing SN204 and releases SN205.
+            let (f205, e205) = qos(&h, 205, 6, 205, 25)?;
+            h.packet.emit_native(&f205, 0x53, PAGGR, None).unwrap();
+            h.pump();
+            if !h.received().is_empty() {
+                return Err("EE BA delivered before BAR");
+            }
+            h.packet.emit(&bar(&h, 6, 205)).unwrap();
+            h.pump();
+            if h.received() != vec![e205] {
+                return Err("EE BlockAckReq did not release up to its SSN");
+            }
+            // Reorder hole timeout (100ms).
+            let (f208, e208) = qos(&h, 208, 6, 208, 28)?;
+            h.packet.emit_native(&f208, 0x53, PAGGR, None).unwrap();
+            h.pump();
+            if !h.received().is_empty() {
+                return Err("EE BA delivered before reorder timeout");
+            }
+            h.env.now.fetch_add(101, Ordering::AcqRel);
+            h.pump();
+            if h.received() != vec![e208] {
+                return Err("EE BA reorder timeout release");
+            }
+            // A-MPDU without a session is refused before PN; BAR for such a
+            // TID sends one DELBA QSTA_REQUIRE_SETUP.
+            let (f0, _) = qos(&h, 0, 0, 300, 30)?;
+            h.packet.emit_native(&f0, 0x53, PAGGR, None).unwrap();
+            h.pump();
+            if !h.received().is_empty() || !h.device.link_up() {
+                return Err("EE A-MPDU accepted without session");
+            }
+            for _ in 0..2 {
+                h.packet.emit(&bar(&h, 2, 0)).unwrap();
+                h.pump();
+            }
+            {
+                let peer = h.peer.lock();
+                let delbas: Vec<_> = peer
+                    .controls
+                    .iter()
+                    .filter(|c| c.len() == 30 && c[24..26] == [3, 2])
+                    .collect();
+                if delbas.len() != 1
+                    || delbas[0][26..28] != (2u16 << 12).to_le_bytes()
+                    || delbas[0][28..30] != [38, 0]
+                {
+                    return Err("EE unexpected BAR DELBA");
+                }
+            }
+            // Originator DELBA ends the session.
+            h.packet.emit(&originator_delba(&h, 6)).unwrap();
+            h.pump();
+            let (f209, _) = qos(&h, 209, 6, 309, 31)?;
+            h.packet.emit_native(&f209, 0x53, PAGGR, None).unwrap();
+            h.pump();
+            if !h.received().is_empty() || !h.device.link_up() {
+                return Err("EE A-MPDU accepted after originator DELBA");
+            }
+            let (f210, e210) = qos(&h, 210, 6, 310, 32)?;
+            h.packet.emit_native(&f210, 0x53, 0, None).unwrap();
+            h.pump();
+            if h.received() != vec![e210] {
+                return Err("EE ordinary QoS after DELBA");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/ht20",
+    smoke_rtl8188ee_ht20_rx_ba_reorders_ampdu_and_bar_before_pn
+);
+fn smoke_rtl8188ee_ht20_rx_ba_policy_and_inactivity_delba() -> TestResult {
+    check(|| {
+        let h = Harness::new_profile(false, true);
+        ht_join(&h)?;
+        let status = |request: Vec<u8>| -> Result<[u8; 4], &'static str> {
+            let before = h.peer.lock().controls.len();
+            h.packet.emit(&request).unwrap();
+            h.pump();
+            let peer = h.peer.lock();
+            if peer.controls.len() != before + 1 {
+                return Err("EE ADDBA response missing");
+            }
+            let r = peer.controls.last().unwrap();
+            Ok([r[27], r[28], r[29], r[30]])
+        };
+        let tid9 = status(addba_with(&h, 1, 2 | 9 << 2 | 8 << 6, 0, 0))?;
+        let delayed = status(addba_with(&h, 2, 3 << 2 | 8 << 6, 0, 0))?;
+        let wide = status(addba_with(&h, 3, 2 | 3 << 2 | 65 << 6, 0, 0))?;
+        let zero = status(addba_with(&h, 4, 2 | 3 << 2, 100, 0))?;
+        if tid9[..2] != [37, 0]
+            || delayed[..2] != [38, 0]
+            || wide[..2] != [38, 0]
+            || zero != [0, 0, 0x0f, 0x10]
+        {
+            return Err("EE ADDBA status/window differs from mac80211");
+        }
+        let same = status(addba_with(&h, 4, 2 | 3 << 2, 100, 0))?;
+        let changed = status(addba_with(&h, 4, 2 | 3 << 2, 200, 0))?;
+        if same[..2] != [0, 0] || changed[..2] != [37, 0] {
+            return Err("EE ADDBA same-token update policy");
+        }
+        let before = h.peer.lock().controls.len();
+        h.env.now.fetch_add(103, Ordering::AcqRel);
+        h.pump();
+        let peer = h.peer.lock();
+        let d = peer.controls.last().ok_or("EE DELBA missing")?;
+        if peer.controls.len() != before + 1
+            || d.len() != 30
+            || d[24..26] != [3, 2]
+            || d[26..28] != (3u16 << 12).to_le_bytes()
+            || d[28..30] != [39, 0]
+            || !h.device.link_up()
+        {
+            return Err("EE BA inactivity DELBA");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/ht20",
+    smoke_rtl8188ee_ht20_rx_ba_policy_and_inactivity_delba
 );
 fn smoke_rtl8188ee_ht20_bad_assets_retry_before_writes_and_live_legacy_no_upgrade() -> TestResult {
     check(|| {
