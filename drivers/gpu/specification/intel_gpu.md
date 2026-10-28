@@ -118,15 +118,14 @@ Stage-3 driver core consumes these codecs through the
 `Transport`-equivalent indirection used elsewhere in narf
 (direct MMIO in kernel mode, cap-mediated MMIO in userspace).
 
-### Stage 3 (future) — Display-only driver core
-- Wire GMBUS to `narf-graphics::edid::Edid::parse` for EDID
-  read-out on whatever DDI the firmware left active.
-  (The GMBUS transport itself landed in #1018; the session
-  wiring into the driver core is the remaining step.)
-- Compute pipe / transcoder timing from EDID detailed-timing
+### Stage 3 (partially landed) — Display-only driver core
+- Internal-panel takeover uses Pipe A / DDI A and reads EDID
+  over AUX. External HDMI sessions use GMBUS (§15).
+- Compute pipe / transcoder timing from an EDID detailed-timing
   block; program PIPE / TRANS / PLANE through the Stage-2 codec.
-- Take over scanout from UEFI GOP without re-training the link
-  (modeset to firmware-supplied mode).
+- Take over an enabled firmware Pipe A surface with link
+  retraining. Arbitrary firmware pipe / DDI routing and a
+  takeover preserving the trained link remain open.
 
 ### Stage 4 (partially landed) — Frame buffer + KMS
 - GTT entry table population from the Stage-2 codec.
@@ -136,9 +135,12 @@ Stage-3 driver core consumes these codecs through the
 
 ### Stage 5+ (partially landed) — 3D / compute (TGL only)
 - Command streamer (RCS0) ring submission — **landed** as the
-  execlists path in `intel_gpu_rcs` (§8). GGTT addressing only.
-- Remaining: PPGTT per-context page tables, media engines,
-  full 3D pipeline state. Out of scope for v1; the
+  execlists path in `intel_gpu_rcs` (§8), with GGTT batches and
+  attached-context PPGTT batches (§18).
+- PPGTT per-context page tables and media submission — **landed**
+  (§9, §18).
+- Remaining: full 3D pipeline state and userspace render UAPI.
+  Out of scope for v1; the
   kernel-resident driver only needs a display surface plus
   batch submission.
 
@@ -269,6 +271,29 @@ DDI A / eDP, single pipe):
   protocol the AMD display pipeline uses, and the DRM card
   carries real KMS mode state (CRTC 1, encoder 2 TMDS,
   connector 3 eDP) instead of the identity stub.
+
+Scanout handoff requires an enabled firmware Pipe A and a successful
+takeover mode. Panel power with no admitted mode allocates no internal
+surface and publishes no synthetic 1024×768 display. The owned scanout
+becomes active only after its primary-plane register program is armed.
+
+Takeover and relight share generation dispatch (Gen12 versus Xe-LPG),
+with Panther Lake refused before MMIO. Restore uses `modeset_fixed` on
+the selected orchestrator, preserving the saved timing used to size the
+new allocation even if EDID now advertises a different preferred mode.
+Plane geometry, pitch and the complete 32-bit GGTT surface extent are
+validated before pipeline teardown. This does not enable Xe-LPG PM or
+establish physical display/suspend acceptance.
+The external-session gate is separate: combo HPD enable/poll, DP, HDMI,
+MST and USB-C DP Alt Mode remain Gen12-only until their Xe-LPG port
+sequences exist. Unsupported generations return before HPD register
+access; enabling the Xe-LPG internal panel must not enable Gen12 ports.
+
+Intel-only crate builds (`--no-default-features --features intel`) and
+their `kernel-test` fixtures use vendor feature guards throughout shared
+DRM hooks and tests. AMD native placement admission cannot be constructed
+without its backend; generic DRM/DP fixtures and the registration census
+remain enabled. Intel media and MST modules likewise require `intel`.
 
 ### Lane Q6 (#1024) — display follow-ons
 

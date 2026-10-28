@@ -1276,7 +1276,10 @@ impl FileOps for DriRenderFile {
         })
     }
     fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>) {
+        #[cfg(feature = "amdgpu")]
         crate::amdgpu_gem::cpu_mapping::published(lifetime);
+        #[cfg(not(feature = "amdgpu"))]
+        let _ = lifetime;
     }
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { Ok(0) })
@@ -1437,6 +1440,7 @@ impl FileOps for DriRenderFile {
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
             // amdgpu_drm_ioctl: pm_runtime_get_sync … put_autosuspend.
+            #[cfg(feature = "amdgpu")]
             let _rpm = crate::amdgpu_navi48_runtime_pm::ioctl_enter(self.index).await?;
             // DRM syncobjs from a user open: fd export/import and waits
             // that park this syscall. amdgpu has timelines, virtio-gpu not.
@@ -1460,6 +1464,7 @@ impl FileOps for DriRenderFile {
                 return crate::drm_ioctl_bridge::wait_virtgpu_render(arg as usize, &self.virtgpu)
                     .await;
             }
+            #[cfg(feature = "amdgpu")]
             if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
                 if let Some(result) =
                     crate::amdgpu_info::dispatch_live(self.index, cmd, arg as usize).await
@@ -1467,6 +1472,7 @@ impl FileOps for DriRenderFile {
                     return result;
                 }
             }
+            #[cfg(feature = "amdgpu")]
             if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
                 if let Some(result) =
                     crate::amdgpu_gem::dispatch_async(cmd, arg as usize, &self.amdgpu_gem).await
@@ -1485,6 +1491,7 @@ impl FileOps for DriRenderFile {
                 }
             }
             // amdgpu CS and WAIT_CS park on a card whose queue runs them.
+            #[cfg(feature = "amdgpu")]
             if crate::drm_registry::driver_name(self.index) == Some("amdgpu")
                 && crate::amdgpu_cs::is_async_ioctl(cmd)
             {

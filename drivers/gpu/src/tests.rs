@@ -173,6 +173,7 @@ fn smoke_virtio_gpu_scanout_initialised() -> TestResult {
 }
 kernel_test_in!("drivers/gpu", smoke_virtio_gpu_scanout_initialised);
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_pci_matches_registered() -> TestResult {
     // Structural: register the amdgpu driver and assert every
     // explicit AMD VID/DID match plus the class-match backstop
@@ -237,11 +238,13 @@ fn smoke_amdgpu_pci_matches_registered() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     smoke_amdgpu_pci_matches_registered
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_family_table_documented_offsets() -> TestResult {
     // Family::mp0_base() is documented for Vega + Navi1; the
     // Stage-2 spec leaves Phoenix/Strix/Renoir/Navi2 marked TBD
@@ -266,12 +269,14 @@ fn smoke_amdgpu_family_table_documented_offsets() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu", smoke_amdgpu_family_table_documented_offsets);
 
 // `smoke_amdgpu_scanout_picker_idle` lives in `fb/src/tests.rs`
 // to avoid a `narf-drivers-gpu` ↔ `narf-fb` Cargo cycle (fb
 // already depends on drivers/gpu for the picker).
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_atombios_table_directory_round_trip() -> TestResult {
     // Synthesize an ATOMBIOS image: PCI ROM signature + ATOM
     // marker + master data table at a known offset + 3 indexable
@@ -342,6 +347,7 @@ fn smoke_amdgpu_atombios_table_directory_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/atombios",
     smoke_amdgpu_atombios_table_directory_round_trip
@@ -353,6 +359,7 @@ kernel_test_in!(
 /// build them: on a graphics ring the register writes and the write-wait
 /// run on the PFP and a PFP_SYNC_ME follows; on MMHUB the engine semaphore
 /// is acquired first (a register wait for 1) and released last.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_pm4_vm_flush_and_fence_like_linux() -> TestResult {
     use crate::amdgpu_pm4::Pm4Builder;
     use crate::amdgpu_vmhub_regs::{invalidate_req, GFXHUB_V12_0, MMHUB_V4_1};
@@ -455,11 +462,13 @@ fn smoke_amdgpu_pm4_vm_flush_and_fence_like_linux() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu",
     smoke_amdgpu_pm4_vm_flush_and_fence_like_linux
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_pm4_indirect_buffer_packet() -> TestResult {
     // INDIRECT_BUFFER is 4 dwords: header + ib_lo + ib_hi +
     // (size | vmid<<24). Verify the header type/opcode/count
@@ -495,8 +504,10 @@ fn smoke_amdgpu_pm4_indirect_buffer_packet() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu", smoke_amdgpu_pm4_indirect_buffer_packet);
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_pm4_write_data_fence_packet() -> TestResult {
     use crate::amdgpu_pm4::Pm4Builder;
     let mut buf = [0u32; 8];
@@ -532,8 +543,10 @@ fn smoke_amdgpu_pm4_write_data_fence_packet() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu", smoke_amdgpu_pm4_write_data_fence_packet);
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_ring_submit_advances_wptr() -> TestResult {
     use crate::amdgpu_ring::{
         DoorbellKind, Ring, RingError, DOORBELL_STRIDE_BYTES, NOP_DW, RING_SIZE_DW,
@@ -657,6 +670,7 @@ fn smoke_amdgpu_ring_submit_advances_wptr() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu", smoke_amdgpu_ring_submit_advances_wptr);
 
 fn smoke_dp_aux_native_read_request_round_trip() -> TestResult {
@@ -732,6 +746,7 @@ fn smoke_dp_aux_native_write_encodes_payload() -> TestResult {
 kernel_test_in!("drivers/gpu", smoke_dp_aux_native_write_encodes_payload);
 
 /// Offsets spelled out from `offsetof` on `struct atom_firmware_info_v3_4`.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_atom_fwinfo_v3_round_trip() -> TestResult {
     use crate::amdgpu_atom_fwinfo::{
         parse, FwInfoError, ATOM_FIRMWARE_CAP_FIRMWARE_POSTED, FWINFO_V3_1_BYTES, FWINFO_V3_4_BYTES,
@@ -823,6 +838,7 @@ fn smoke_amdgpu_atom_fwinfo_v3_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_fwinfo_v3_round_trip);
 
 fn smoke_dp_link_training_completes_against_stub() -> TestResult {
@@ -935,6 +951,7 @@ kernel_test_in!("drivers/gpu", smoke_dp_link_training_completes_against_stub);
 // the hardware this driver targets, so the modules are deleted rather than
 // rewritten against a table that would still never be read.
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_atom_displayobj_iter_paths() -> TestResult {
     use crate::amdgpu_atom_displayobj::{ConnectorKind, DisplayObjError, DisplayObjectTable};
     // Build a synthetic display-object table with 3 paths. An object id is
@@ -1000,6 +1017,7 @@ fn smoke_amdgpu_atom_displayobj_iter_paths() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_displayobj_iter_paths);
 
 fn smoke_dp_edid_over_aux_round_trip() -> TestResult {
@@ -1114,6 +1132,7 @@ fn smoke_dp_edid_over_aux_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/gpu", smoke_dp_edid_over_aux_round_trip);
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_offsets_runtime_registry_overrides_compile_time() -> TestResult {
     use crate::amdgpu::Family;
     use crate::amdgpu_offsets::{
@@ -1165,6 +1184,7 @@ fn smoke_amdgpu_offsets_runtime_registry_overrides_compile_time() -> TestResult 
     __reset_for_test();
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu",
     smoke_amdgpu_offsets_runtime_registry_overrides_compile_time
@@ -1183,6 +1203,7 @@ kernel_test_in!(
 
 /// An object id packs type at 15:12, enum id at 11:8 and the object's own id
 /// at 7:0 (`displayobject.h`). Values spelled out from `ObjectID.h`.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_displayobj_object_chain_walker() -> TestResult {
     use crate::amdgpu_atom_displayobj::{
         ConnectorKind, DisplayObjectTable, ObjectLink, ENUM_ID_MASK, ENUM_ID_SHIFT,
@@ -1293,8 +1314,10 @@ fn smoke_amdgpu_displayobj_object_chain_walker() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu", smoke_amdgpu_displayobj_object_chain_walker);
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_atombios_command_table_directory() -> TestResult {
     // Symmetric to the data-table directory smoke from Stage 3
     // — but exercise the command-table path. Build an ATOMBIOS
@@ -1349,6 +1372,7 @@ fn smoke_amdgpu_atombios_command_table_directory() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/atombios",
     smoke_amdgpu_atombios_command_table_directory
@@ -1358,6 +1382,7 @@ kernel_test_in!(
 /// literals here rather than built from the module's constants: `offsetof` on
 /// the Linux structures is the authority, so a wrong constant has to fail
 /// rather than be restated.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_rlc_header_v2_2_round_trip() -> TestResult {
     use crate::amdgpu_rlc::{parse, region, RlcError};
     // A v2.2 blob: common header, the v2.0/v2.1/v2.2 tails, and three
@@ -1450,8 +1475,10 @@ fn smoke_amdgpu_rlc_header_v2_2_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu", smoke_amdgpu_rlc_header_v2_2_round_trip);
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_rlc_autoload_toc_bitfields() -> TestResult {
     use crate::amdgpu_rlc::{autoload_iter, autoload_total_size};
     // Four 16-byte entries, the last with an out-of-range id so the walk
@@ -1511,10 +1538,12 @@ fn smoke_amdgpu_rlc_autoload_toc_bitfields() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu", smoke_amdgpu_rlc_autoload_toc_bitfields);
 
 /// Entry layout from `struct atom_gpio_pin_assignment`: a 32-bit register
 /// index, then three bytes and a reserved one.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_atom_gpio_pin_lut_round_trip() -> TestResult {
     use crate::amdgpu_atom_gpiopin::{
         GpioPinLut, GPIO_PIN_ASSIGNMENT_BYTES, I2C_HW_CAP, PP_AC_DC_SWITCH_GPIO_PINID,
@@ -1597,10 +1626,12 @@ fn smoke_amdgpu_atom_gpio_pin_lut_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_gpio_pin_lut_round_trip);
 
 /// Record types from `enum atom_object_record_type_id` and cap bits from
 /// `enum atom_encoder_caps_def`, both spelled out.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_encoder_caps_record_iter() -> TestResult {
     use crate::amdgpu_atom_encoder_caps::{
         find_encoder_caps, RecordIter, ATOM_ENCODER_CAP_RECORD_TYPE, ATOM_HPD_INT_RECORD_TYPE,
@@ -1657,6 +1688,7 @@ fn smoke_amdgpu_encoder_caps_record_iter() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu", smoke_amdgpu_encoder_caps_record_iter);
 
 fn smoke_dp_link_training_fallback_walks_ladder() -> TestResult {
@@ -1761,6 +1793,7 @@ kernel_test_in!("drivers/gpu", smoke_dp_link_training_fallback_walks_ladder);
 /// Build a synthetic IP-discovery blob with one die enumerating
 /// two IPs (GC and MP0). Returns the bytes + the (mp0_base,
 /// gc_base) values the parser should observe.
+#[cfg(feature = "amdgpu")]
 pub(crate) fn build_synthetic_discovery_blob() -> (alloc::vec::Vec<u8>, u32, u32) {
     use crate::amdgpu_discovery as d;
     let mut blob = alloc::vec![0u8; 0x200];
@@ -1846,6 +1879,7 @@ pub(crate) fn build_synthetic_discovery_blob() -> (alloc::vec::Vec<u8>, u32, u32
     (blob, mp0_base, gc_base)
 }
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_discovery_signature_constants() -> TestResult {
     use crate::amdgpu_discovery::{BINARY_SIGNATURE, DISCOVERY_TABLE_SIGNATURE};
     // BINARY_SIGNATURE is the LE-encoded byte sequence 07 14 21 28.
@@ -1861,11 +1895,13 @@ fn smoke_amdgpu_discovery_signature_constants() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/discovery",
     smoke_amdgpu_discovery_signature_constants
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_discovery_hw_id_constants_match_linux() -> TestResult {
     use crate::amdgpu_discovery as d;
     // Spot-check the load-bearing HW_IDs against the values
@@ -1899,11 +1935,13 @@ fn smoke_amdgpu_discovery_hw_id_constants_match_linux() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/discovery",
     smoke_amdgpu_discovery_hw_id_constants_match_linux
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_discovery_parse_synthetic_blob() -> TestResult {
     use crate::amdgpu_discovery::{find_ip, parse_discovery, HW_ID_GC, HW_ID_MP0};
     let (blob, want_mp0, want_gc) = build_synthetic_discovery_blob();
@@ -1948,11 +1986,13 @@ fn smoke_amdgpu_discovery_parse_synthetic_blob() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/discovery",
     smoke_amdgpu_discovery_parse_synthetic_blob
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_discovery_rejects_bad_signature() -> TestResult {
     use crate::amdgpu_discovery::{parse_discovery, DiscoveryError};
     // Garbage blob (all 0xFF, mimicking a QEMU read from
@@ -1977,11 +2017,13 @@ fn smoke_amdgpu_discovery_rejects_bad_signature() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/discovery",
     smoke_amdgpu_discovery_rejects_bad_signature
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_discovery_rejects_bad_outer_checksum() -> TestResult {
     use crate::amdgpu_discovery::{parse_discovery, DiscoveryError};
     let (mut blob, _, _) = build_synthetic_discovery_blob();
@@ -1998,11 +2040,13 @@ fn smoke_amdgpu_discovery_rejects_bad_outer_checksum() -> TestResult {
         Ok(_) => TestResult::Fail("corrupted blob accepted"),
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/discovery",
     smoke_amdgpu_discovery_rejects_bad_outer_checksum
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_discovery_probe_skipped_on_qemu() -> TestResult {
     // Live-device probe smoke: on QEMU the AMD GPU isn't present
     // so the controller is absent and discovery is necessarily
@@ -2021,6 +2065,7 @@ fn smoke_amdgpu_discovery_probe_skipped_on_qemu() -> TestResult {
     })
     .unwrap_or(TestResult::Skip("controller vanished"))
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/discovery",
     smoke_amdgpu_discovery_probe_skipped_on_qemu
@@ -2033,6 +2078,7 @@ kernel_test_in!(
 // and steps them through `amdgpu_atom_vm::execute_bytes`, validating
 // that PS / WS slots end up where Linux's `atom.c` would put them.
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_atom_vm_move_imm_dword_into_ps() -> TestResult {
     use crate::amdgpu_atom_vm::{execute_bytes, AtomState};
 
@@ -2049,11 +2095,13 @@ fn smoke_amdgpu_atom_vm_move_imm_dword_into_ps() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/atom-vm",
     smoke_amdgpu_atom_vm_move_imm_dword_into_ps
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_atom_vm_add_into_ws() -> TestResult {
     use crate::amdgpu_atom_vm::{execute_bytes, AtomState};
 
@@ -2073,11 +2121,13 @@ fn smoke_amdgpu_atom_vm_add_into_ws() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/atom-vm",
     smoke_amdgpu_atom_vm_add_into_ws
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_atom_vm_compare_jump_equal_taken() -> TestResult {
     use crate::amdgpu_atom_vm::{execute_bytes, AtomState};
 
@@ -2107,11 +2157,13 @@ fn smoke_amdgpu_atom_vm_compare_jump_equal_taken() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/atom-vm",
     smoke_amdgpu_atom_vm_compare_jump_equal_taken
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_atom_vm_bad_opcode_rejected() -> TestResult {
     use crate::amdgpu_atom_vm::{execute_bytes, Anomaly, AtomState};
     // 127 == ATOM_OP_CNT: atom.c breaks out of the table, returning 0.
@@ -2124,11 +2176,13 @@ fn smoke_amdgpu_atom_vm_bad_opcode_rejected() -> TestResult {
         Err(_) => TestResult::Fail("bad opcode aborted instead of ending the table"),
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/atom-vm",
     smoke_amdgpu_atom_vm_bad_opcode_rejected
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_atom_vm_reg_write_via_closure() -> TestResult {
     use crate::amdgpu_atom_vm::{execute_bytes, AtomState};
     use alloc::boxed::Box;
@@ -2167,6 +2221,7 @@ fn smoke_amdgpu_atom_vm_reg_write_via_closure() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/atom-vm",
     smoke_amdgpu_atom_vm_reg_write_via_closure
@@ -2175,6 +2230,7 @@ kernel_test_in!(
 /// `atom.c:650`: `amdgpu_atom_execute_table_locked(ctx, idx, ctx->ps +
 /// ctx->ps_shift, ctx->ps_size - ctx->ps_shift)`. A callee gets the parameter
 /// window *above* the caller's own, not the caller's window again.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_atom_vm_calltable_shifts_the_parameter_window() -> TestResult {
     use crate::amdgpu_atom_vm::{execute_table, AtomError, AtomState, ResolvedTable};
     use alloc::boxed::Box;
@@ -2242,6 +2298,7 @@ fn smoke_amdgpu_atom_vm_calltable_shifts_the_parameter_window() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/atom-vm",
     smoke_amdgpu_atom_vm_calltable_shifts_the_parameter_window
@@ -2249,6 +2306,7 @@ kernel_test_in!(
 
 /// `ATOM_CT_PS_PTR` is byte 5 of a command table and `ATOM_CT_PS_MASK` is
 /// 0x7F, so the top bit of that byte is not part of the parameter size.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_atombios_cmd_table_ps_size() -> TestResult {
     use crate::amdgpu_atombios::{ATOM_CT_CODE_PTR, ATOM_CT_PS_MASK, ATOM_CT_PS_PTR};
     if ATOM_CT_PS_PTR != 5 || ATOM_CT_PS_MASK != 0x7F || ATOM_CT_CODE_PTR != 6 {
@@ -2261,6 +2319,7 @@ fn smoke_amdgpu_atombios_cmd_table_ps_size() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/atom-vm",
     smoke_amdgpu_atombios_cmd_table_ps_size
@@ -2272,6 +2331,7 @@ kernel_test_in!(
 // happen on real silicon; here we stage a mock that scripts the
 // canonical sequence (handshake → clear → arg → msg → response).
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_smu_send_message_drives_canonical_sequence() -> TestResult {
     use crate::amdgpu_smu::{
         send_message, MockSmu, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_MSG_REL, MP1_C2PMSG_RESP_REL,
@@ -2318,11 +2378,13 @@ fn smoke_amdgpu_smu_send_message_drives_canonical_sequence() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_send_message_drives_canonical_sequence
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_smu_send_message_surfaces_smu_rejection() -> TestResult {
     use crate::amdgpu_smu::{
         send_message, MockSmu, SmuError, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL,
@@ -2346,11 +2408,13 @@ fn smoke_amdgpu_smu_send_message_surfaces_smu_rejection() -> TestResult {
         Ok(_) => TestResult::Fail("SMU rejection silently passed"),
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_send_message_surfaces_smu_rejection
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_smu_handshake_timeout_when_resp_stays_busy() -> TestResult {
     use crate::amdgpu_smu::{send_message, MockSmu, SmuError, PPSMC_MSG_TEST_MESSAGE};
     // Stage nothing — the mock returns 0 (busy) on every read.
@@ -2360,6 +2424,7 @@ fn smoke_amdgpu_smu_handshake_timeout_when_resp_stays_busy() -> TestResult {
         _ => TestResult::Fail("expected HandshakeTimeout on busy mock"),
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_handshake_timeout_when_resp_stays_busy
@@ -2374,6 +2439,7 @@ kernel_test_in!(
 // Renoir / Cezanne silicon; these smokes run on QEMU and cover
 // everything up to the register-bus write boundary.
 
+#[cfg(feature = "amdgpu")]
 fn smoke_dcn20_build_modeset_from_discovery_produces_seq() -> TestResult {
     use crate::amdgpu_dcn::{build_modeset_from_discovery, timing_for_mode};
     use crate::amdgpu_discovery::{IpBlock, HW_ID_DCN, MAX_BASE_ADDRS};
@@ -2411,11 +2477,13 @@ fn smoke_dcn20_build_modeset_from_discovery_produces_seq() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/dcn",
     smoke_dcn20_build_modeset_from_discovery_produces_seq
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_dcn20_timing_for_1080p60_shape() -> TestResult {
     use crate::amdgpu_dcn::timing_for_mode;
     let t = match timing_for_mode(1920, 1080, 60) {
@@ -2445,11 +2513,13 @@ fn smoke_dcn20_timing_for_1080p60_shape() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/dcn",
     smoke_dcn20_timing_for_1080p60_shape
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_dcn20_set_mode_rejects_without_fw() -> TestResult {
     use crate::amdgpu::{with_controller_mut, AmdgpuError, Mode};
     // Probe runs at boot. On QEMU the probe may or may not bind
@@ -2485,11 +2555,13 @@ fn smoke_dcn20_set_mode_rejects_without_fw() -> TestResult {
         None => TestResult::Skip("controller vanished mid-test"),
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/dcn",
     smoke_dcn20_set_mode_rejects_without_fw
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_dcn20_modeset_seq_contains_expected_offsets() -> TestResult {
     use crate::amdgpu_dcn::{
         dcn20_modeset_sequence, timing_for_mode, HUBP0_DCHUBP_CNTL, HUBP_BLANK_FORCE,
@@ -2531,11 +2603,13 @@ fn smoke_dcn20_modeset_seq_contains_expected_offsets() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/dcn",
     smoke_dcn20_modeset_seq_contains_expected_offsets
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_dcn35_modeset_seq_contains_expected_offsets() -> TestResult {
     use crate::amdgpu_dcn::{
         dcn35_modeset_sequence, timing_for_mode, DCN35_OTG0_OTG_CONTROL, DCN35_OTG0_OTG_H_TOTAL,
@@ -2592,11 +2666,13 @@ fn smoke_dcn35_modeset_seq_contains_expected_offsets() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/dcn",
     smoke_dcn35_modeset_seq_contains_expected_offsets
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_dcn35_uses_different_offsets_than_dcn20() -> TestResult {
     use crate::amdgpu_dcn::{
         DCN35_OTG0_OTG_CONTROL, DCN35_OTG0_OTG_INTERRUPT_CONTROL, DCN35_OTG0_OTG_V_BLANK_START_END,
@@ -2622,6 +2698,7 @@ fn smoke_dcn35_uses_different_offsets_than_dcn20() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/dcn",
     smoke_dcn35_uses_different_offsets_than_dcn20
@@ -2637,6 +2714,7 @@ kernel_test_in!(
 // Register offsets are literals here, from `mp_13_0_4_offset.h`: C2PMSG_N is
 // dword 0x40 + N, so byte 0x100 + N * 4 within the MP0 window.
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_psp_mailbox_register_offsets() -> TestResult {
     use crate::amdgpu_psp::{
         MP0_C2PMSG_35_REL, MP0_C2PMSG_36_REL, MP0_C2PMSG_64_REL, MP0_C2PMSG_69_REL,
@@ -2664,11 +2742,13 @@ fn smoke_amdgpu_psp_mailbox_register_offsets() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/psp",
     smoke_amdgpu_psp_mailbox_register_offsets
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_psp_bootloader_load_shifts_address_by_twenty() -> TestResult {
     use crate::amdgpu_psp::{
         bootloader_cmd, bootloader_load_component, is_sos_alive, MockPsp, PspError,
@@ -2731,11 +2811,13 @@ fn smoke_amdgpu_psp_bootloader_load_shifts_address_by_twenty() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/psp",
     smoke_amdgpu_psp_bootloader_load_shifts_address_by_twenty
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_psp_ring_create_sequence() -> TestResult {
     use crate::amdgpu_psp::{
         gfx_ctrl_cmd_id, ring_control, ring_create, MockPsp, PspError, MP0_C2PMSG_64_REL,
@@ -2794,11 +2876,13 @@ fn smoke_amdgpu_psp_ring_create_sequence() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/psp",
     smoke_amdgpu_psp_ring_create_sequence
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_psp_surfaces_rejection_status() -> TestResult {
     use crate::amdgpu_psp::{
         bootloader_cmd, bootloader_load_component, MockPsp, PspError, MP0_C2PMSG_35_REL,
@@ -2846,11 +2930,13 @@ fn smoke_amdgpu_psp_surfaces_rejection_status() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/psp",
     smoke_amdgpu_psp_surfaces_rejection_status
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_psp_timeout_when_done_never_sets() -> TestResult {
     use crate::amdgpu_psp::{bootloader_cmd, bootloader_load_component, MockPsp, PspError};
     // Stage nothing — the mock returns 0 (DONE never set) on every read.
@@ -2866,6 +2952,7 @@ fn smoke_amdgpu_psp_timeout_when_done_never_sets() -> TestResult {
         _ => TestResult::Fail("expected PspError::Timeout when DONE never sets"),
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/psp",
     smoke_amdgpu_psp_timeout_when_done_never_sets
@@ -2874,6 +2961,7 @@ kernel_test_in!(
 /// The command ids for loading firmware are ring commands, not mailbox
 /// commands, and the mailbox entry point must refuse them rather than write a
 /// sequence that appears in no `psp_v*.c`.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_psp_image_load_is_not_a_mailbox_command() -> TestResult {
     use crate::amdgpu_psp::{gfx_cmd_id, load_ip_firmware, MockPsp, PspError};
     let mut m = MockPsp::new();
@@ -2894,6 +2982,7 @@ fn smoke_amdgpu_psp_image_load_is_not_a_mailbox_command() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/psp",
     smoke_amdgpu_psp_image_load_is_not_a_mailbox_command
@@ -2906,6 +2995,7 @@ kernel_test_in!(
 // match-check. Each step needs its own scripted RESP-then-OK
 // alternation plus an ARG read-back.
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_smu_bring_up_happy_path() -> TestResult {
     use crate::amdgpu_smu::{
         bring_up, MockSmu, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL, SMU12_DRIVER_IF_VERSION,
@@ -2944,11 +3034,13 @@ fn smoke_amdgpu_smu_bring_up_happy_path() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_bring_up_happy_path
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_smu_bring_up_test_message_echo_mismatch() -> TestResult {
     use crate::amdgpu_smu::{
         bring_up, BringUpError, MockSmu, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL,
@@ -2977,11 +3069,13 @@ fn smoke_amdgpu_smu_bring_up_test_message_echo_mismatch() -> TestResult {
         Ok(_) => TestResult::Fail("bad echo silently accepted"),
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_bring_up_test_message_echo_mismatch
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_smu_bring_up_driver_if_mismatch_rejected() -> TestResult {
     use crate::amdgpu_smu::{
         bring_up, BringUpError, MockSmu, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL,
@@ -3018,11 +3112,13 @@ fn smoke_amdgpu_smu_bring_up_driver_if_mismatch_rejected() -> TestResult {
         Ok(_) => TestResult::Fail("schema mismatch silently accepted"),
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_bring_up_driver_if_mismatch_rejected
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_smu_bring_up_phoenix_driver_if_version() -> TestResult {
     use crate::amdgpu_smu::{
         bring_up, MockSmu, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL, SMU_13_0_4_DRIVER_IF_VERSION,
@@ -3057,6 +3153,7 @@ fn smoke_amdgpu_smu_bring_up_phoenix_driver_if_version() -> TestResult {
         }
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_bring_up_phoenix_driver_if_version
@@ -3072,6 +3169,7 @@ kernel_test_in!(
 //   half-programmed state and wedges)
 // - the per-step register writes carry the expected encodings.
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gfx9_ring_init_emits_canonical_order() -> TestResult {
     use crate::amdgpu_gfx::{
         build_gfx9_ring_init, CP_ME_CNTL_HALT_ALL, CP_ME_CNTL_REL, CP_RB0_BASE_HI_REL,
@@ -3151,11 +3249,13 @@ fn smoke_amdgpu_gfx9_ring_init_emits_canonical_order() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/gfx",
     smoke_amdgpu_gfx9_ring_init_emits_canonical_order
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gfx9_ring_init_rejects_bad_ring_size() -> TestResult {
     use crate::amdgpu_gfx::{build_gfx9_ring_init, GfxError};
     // Non-power-of-two size — CP_RB0_CNTL can't encode it.
@@ -3165,11 +3265,13 @@ fn smoke_amdgpu_gfx9_ring_init_rejects_bad_ring_size() -> TestResult {
         _ => TestResult::Fail("non-pow2 ring size must be rejected"),
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/gfx",
     smoke_amdgpu_gfx9_ring_init_rejects_bad_ring_size
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gfx9_ring_init_rejects_unaligned_ring_phys() -> TestResult {
     use crate::amdgpu_gfx::{build_gfx9_ring_init, GfxError};
     // Ring base must be 256-byte aligned (low 8 bits zero).
@@ -3179,11 +3281,13 @@ fn smoke_amdgpu_gfx9_ring_init_rejects_unaligned_ring_phys() -> TestResult {
         _ => TestResult::Fail("unaligned ring phys must be rejected"),
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/gfx",
     smoke_amdgpu_gfx9_ring_init_rejects_unaligned_ring_phys
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gfx9_ring_init_rptr_writeback_alignment() -> TestResult {
     use crate::amdgpu_gfx::{build_gfx9_ring_init, GfxError};
     // RPTR writeback target must be 8-byte aligned.
@@ -3199,6 +3303,7 @@ fn smoke_amdgpu_gfx9_ring_init_rptr_writeback_alignment() -> TestResult {
         _ => TestResult::Fail("unaligned rptr-writeback must be rejected"),
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/gfx",
     smoke_amdgpu_gfx9_ring_init_rptr_writeback_alignment
@@ -3214,6 +3319,7 @@ kernel_test_in!(
 
 /// Every literal is from `amdgpu_doorbell.h` or from the `*_ring_set_wptr`
 /// function named beside it, never from the constant it checks.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_ring_doorbell_index_space_and_payload() -> TestResult {
     use crate::amdgpu_ring::{doorbell_payload_for, DoorbellKind, Ring, DOORBELL_STRIDE_BYTES};
 
@@ -3282,11 +3388,13 @@ fn smoke_amdgpu_ring_doorbell_index_space_and_payload() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu",
     smoke_amdgpu_ring_doorbell_index_space_and_payload
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gfx_pm4_write_data_lands_in_ring() -> TestResult {
     use crate::amdgpu_pm4::Pm4Builder;
     use crate::amdgpu_ring::{DoorbellKind, Ring};
@@ -3351,11 +3459,13 @@ fn smoke_amdgpu_gfx_pm4_write_data_lands_in_ring() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/gfx",
     smoke_amdgpu_gfx_pm4_write_data_lands_in_ring
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gfx_pm4_multi_packet_ib_lands_in_ring() -> TestResult {
     use crate::amdgpu_pm4::Pm4Builder;
     use crate::amdgpu_ring::Ring;
@@ -3420,6 +3530,7 @@ fn smoke_amdgpu_gfx_pm4_multi_packet_ib_lands_in_ring() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/gfx",
     smoke_amdgpu_gfx_pm4_multi_packet_ib_lands_in_ring
@@ -3432,6 +3543,7 @@ kernel_test_in!(
 // a Fence the caller can poll. Without a real CP, fence completion
 // is staged via the test-only set_fence_for_test helper.
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gfx_context_submit_ib_advances_fence_and_ring() -> TestResult {
     use crate::amdgpu_gfx::GfxContext;
 
@@ -3487,11 +3599,13 @@ fn smoke_amdgpu_gfx_context_submit_ib_advances_fence_and_ring() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/gfx",
     smoke_amdgpu_gfx_context_submit_ib_advances_fence_and_ring
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gfx_context_submit_ib_ring_contents() -> TestResult {
     use crate::amdgpu_gfx::GfxContext;
 
@@ -3561,6 +3675,7 @@ fn smoke_amdgpu_gfx_context_submit_ib_ring_contents() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/gfx",
     smoke_amdgpu_gfx_context_submit_ib_ring_contents
@@ -3574,6 +3689,7 @@ kernel_test_in!(
 // - last write enables the ring (CNTL with RB_ENABLE set)
 // - doorbell programmed in between
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_sdma4_ring_init_emits_canonical_order() -> TestResult {
     use crate::amdgpu_sdma::{
         build_sdma4_ring_init, SDMA_DOORBELL_ENABLE, SDMA_GFX_DOORBELL_OFFSET_REL,
@@ -3631,11 +3747,13 @@ fn smoke_amdgpu_sdma4_ring_init_emits_canonical_order() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/sdma",
     smoke_amdgpu_sdma4_ring_init_emits_canonical_order
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_sdma4_ring_init_validates_inputs() -> TestResult {
     use crate::amdgpu_sdma::{build_sdma4_ring_init, SdmaError};
     // Non-pow2 ring size.
@@ -3655,11 +3773,13 @@ fn smoke_amdgpu_sdma4_ring_init_validates_inputs() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/sdma",
     smoke_amdgpu_sdma4_ring_init_validates_inputs
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_sdma4_ring_init_enable_strictly_after_disable() -> TestResult {
     use crate::amdgpu_sdma::{build_sdma4_ring_init, SDMA_GFX_RB_CNTL_REL, SDMA_RB_ENABLE};
     let sdma_base: u32 = 0x0006_0000;
@@ -3699,6 +3819,7 @@ fn smoke_amdgpu_sdma4_ring_init_enable_strictly_after_disable() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/sdma",
     smoke_amdgpu_sdma4_ring_init_enable_strictly_after_disable
@@ -3710,6 +3831,7 @@ kernel_test_in!(
 // three canonical packets — COPY linear, FENCE, NOP — and reject
 // degenerate inputs (empty / oversize copy).
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_sdma_packet_copy_linear_layout() -> TestResult {
     use crate::amdgpu_sdma::{SdmaBuilder, SdmaGeneration};
     let mut buf = [0u32; 7];
@@ -3755,11 +3877,13 @@ fn smoke_amdgpu_sdma_packet_copy_linear_layout() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/sdma",
     smoke_amdgpu_sdma_packet_copy_linear_layout
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_sdma_packet_fence_layout() -> TestResult {
     use crate::amdgpu_sdma::{SdmaBuilder, SdmaGeneration, SdmaPktError};
     let mut buf = [0u32; 4];
@@ -3805,11 +3929,13 @@ fn smoke_amdgpu_sdma_packet_fence_layout() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/sdma",
     smoke_amdgpu_sdma_packet_fence_layout
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_sdma_packet_rejects_empty_and_oversize_copy() -> TestResult {
     use crate::amdgpu_sdma::{SdmaBuilder, SdmaGeneration, SdmaPktError};
     // `sdma_v4_0.c:2612` .copy_max_bytes = 1 << 22 (COUNT mask 0x003FFFFF);
@@ -3843,11 +3969,13 @@ fn smoke_amdgpu_sdma_packet_rejects_empty_and_oversize_copy() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/sdma",
     smoke_amdgpu_sdma_packet_rejects_empty_and_oversize_copy
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_sdma_packet_nop_and_trap() -> TestResult {
     use crate::amdgpu_sdma::{SdmaBuilder, SdmaGeneration};
     let mut buf = [0u32; 3];
@@ -3877,6 +4005,7 @@ fn smoke_amdgpu_sdma_packet_nop_and_trap() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/sdma",
     smoke_amdgpu_sdma_packet_nop_and_trap
@@ -3887,6 +4016,7 @@ kernel_test_in!(
 // ACQUIRE_MEM (cache flush), SET_CONTEXT_REG / SET_CONFIG_REG
 // (state push), CONTEXT_CONTROL (load/shadow control).
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_pm4_acquire_mem_full_invalidate_layout() -> TestResult {
     use crate::amdgpu_pm4::{Pm4Builder, ACQUIRE_FULL_SHADER_INVALIDATE};
     let mut buf = [0u32; 7];
@@ -3967,11 +4097,13 @@ fn smoke_amdgpu_pm4_acquire_mem_full_invalidate_layout() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/pm4",
     smoke_amdgpu_pm4_acquire_mem_full_invalidate_layout
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_pm4_set_context_reg_layout() -> TestResult {
     use crate::amdgpu_pm4::Pm4Builder;
     let mut buf = [0u32; 6];
@@ -3998,11 +4130,13 @@ fn smoke_amdgpu_pm4_set_context_reg_layout() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/pm4",
     smoke_amdgpu_pm4_set_context_reg_layout
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_pm4_context_control_layout() -> TestResult {
     use crate::amdgpu_pm4::Pm4Builder;
     let mut buf = [0u32; 3];
@@ -4024,11 +4158,13 @@ fn smoke_amdgpu_pm4_context_control_layout() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/pm4",
     smoke_amdgpu_pm4_context_control_layout
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_pm4_set_context_reg_rejects_empty_values() -> TestResult {
     use crate::amdgpu_pm4::{Pm4Builder, Pm4Error};
     let mut buf = [0u32; 4];
@@ -4039,6 +4175,7 @@ fn smoke_amdgpu_pm4_set_context_reg_rejects_empty_values() -> TestResult {
         _ => TestResult::Fail("empty values must be rejected"),
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/pm4",
     smoke_amdgpu_pm4_set_context_reg_rejects_empty_values
@@ -4046,6 +4183,7 @@ kernel_test_in!(
 
 // ── amdgpu/ih (interrupt handler ring) ─────────────────────────────
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_ih4_ring_init_emits_canonical_order() -> TestResult {
     use crate::amdgpu_ih::{
         build_ih4_ring_init, IH_DOORBELL_ENABLE, IH_DOORBELL_RPTR_REL, IH_RB_BASE_HI_REL,
@@ -4094,11 +4232,13 @@ fn smoke_amdgpu_ih4_ring_init_emits_canonical_order() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/ih",
     smoke_amdgpu_ih4_ring_init_emits_canonical_order
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_ih4_validation_rejects_bad_inputs() -> TestResult {
     use crate::amdgpu_ih::{build_ih4_ring_init, IhError};
     match build_ih4_ring_init(0x0009_0000, 0x1_0000_0000, 999, 0, 0x2_0000_0000) {
@@ -4115,6 +4255,7 @@ fn smoke_amdgpu_ih4_validation_rejects_bad_inputs() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/ih",
     smoke_amdgpu_ih4_validation_rejects_bad_inputs
@@ -4124,6 +4265,7 @@ kernel_test_in!(
 /// `ivsrcid/dcn/irqsrcs_dcn_1_0.h` or `irq_service_dcn314.c` — not from the
 /// constant it checks. A cookie decode composed from its own constants
 /// round-trips whatever it holds, which is why this one does not.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_ih_cookie_header_round_trip() -> TestResult {
     use crate::amdgpu_ih::{
         dcn_vblank_source_id, decode_hpd_ctxid, HpdEvent, IhCookieHeader, CLIENT_ID_ATHUB,
@@ -4214,11 +4356,13 @@ fn smoke_amdgpu_ih_cookie_header_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/ih",
     smoke_amdgpu_ih_cookie_header_round_trip
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_ih_enable_strictly_after_disable() -> TestResult {
     use crate::amdgpu_ih::{build_ih4_ring_init, IH_RB_CNTL_REL, IH_RB_ENABLE};
     let ih_base: u32 = 0x0009_0000;
@@ -4251,6 +4395,7 @@ fn smoke_amdgpu_ih_enable_strictly_after_disable() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/ih",
     smoke_amdgpu_ih_enable_strictly_after_disable
@@ -4261,6 +4406,7 @@ kernel_test_in!(
 // Higher-level wrappers on top of the mailbox primitive that
 // pack the (clk_id, freq_mhz) arg format the SMU expects.
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_smu_pack_clk_arg_layout() -> TestResult {
     use crate::amdgpu_smu::{pack_clk_arg, pack_dpm_arg, SMU_CLK_GFXCLK, SMU_CLK_UCLK};
     // Clock id in bits[15:0], freq in bits[31:16].
@@ -4274,11 +4420,13 @@ fn smoke_amdgpu_smu_pack_clk_arg_layout() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_pack_clk_arg_layout
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_smu_set_clock_range_drives_two_messages() -> TestResult {
     use crate::amdgpu_smu::{
         pack_clk_arg, set_clock_range, MockSmu, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_MSG_REL,
@@ -4338,11 +4486,13 @@ fn smoke_amdgpu_smu_set_clock_range_drives_two_messages() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_set_clock_range_drives_two_messages
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_smu_get_max_dpm_freq_returns_arg() -> TestResult {
     use crate::amdgpu_smu::{
         get_max_dpm_freq, MockSmu, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL, SMU_CLK_DCEFCLK,
@@ -4366,6 +4516,7 @@ fn smoke_amdgpu_smu_get_max_dpm_freq_returns_arg() -> TestResult {
         Err(_) => TestResult::Fail("get_max_dpm_freq errored on happy path"),
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_get_max_dpm_freq_returns_arg
@@ -4373,6 +4524,7 @@ kernel_test_in!(
 
 // ── amdgpu/gmc (GART PTE format) ───────────────────────────────────
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gmc_gart_pte_round_trip() -> TestResult {
     use crate::amdgpu_gmc::{
         make_pte_gfx9, parse_pte, pte_is_valid, GART_PTE_FLAGS_GTT_DEFAULT, GART_PTE_PFN_SHIFT,
@@ -4401,11 +4553,13 @@ fn smoke_amdgpu_gmc_gart_pte_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/gmc",
     smoke_amdgpu_gmc_gart_pte_round_trip
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gmc_gart_pte_rejects_unaligned_and_oversize() -> TestResult {
     use crate::amdgpu_gmc::{make_pte_gfx9, GartError, GART_PTE_FLAGS_GTT_DEFAULT};
     // Unaligned phys (bottom 12 bits non-zero).
@@ -4420,11 +4574,13 @@ fn smoke_amdgpu_gmc_gart_pte_rejects_unaligned_and_oversize() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/gmc",
     smoke_amdgpu_gmc_gart_pte_rejects_unaligned_and_oversize
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gmc_gart_default_flags_compose_correctly() -> TestResult {
     use crate::amdgpu_gmc::{
         GART_PTE_CACHEABLE, GART_PTE_FLAGS_GTT_DEFAULT, GART_PTE_SNOOP, GART_PTE_SYSTEM,
@@ -4441,6 +4597,7 @@ fn smoke_amdgpu_gmc_gart_default_flags_compose_correctly() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/gmc",
     smoke_amdgpu_gmc_gart_default_flags_compose_correctly
@@ -4448,6 +4605,7 @@ kernel_test_in!(
 
 // ── amdgpu/sdma (v6.0 Phoenix) ─────────────────────────────────────
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_sdma6_ring_init_phoenix_delta() -> TestResult {
     use crate::amdgpu_sdma::build_sdma6_ring_init;
     let base: u32 = 0x0007_0000;
@@ -4546,6 +4704,7 @@ fn smoke_amdgpu_sdma6_ring_init_phoenix_delta() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/sdma",
     smoke_amdgpu_sdma6_ring_init_phoenix_delta
@@ -4563,6 +4722,7 @@ kernel_test_in!(
 /// that matched neither generation (0x1F..0x2D against a real 0x80..0xAB).
 /// Asserting that two things differ is only ever as good as the reason they
 /// should, and there was none.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_sdma_v4_and_v6_share_offsets() -> TestResult {
     use crate::amdgpu_sdma::*;
 
@@ -4611,6 +4771,7 @@ fn smoke_amdgpu_sdma_v4_and_v6_share_offsets() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/sdma",
     smoke_amdgpu_sdma_v4_and_v6_share_offsets
@@ -4619,6 +4780,7 @@ kernel_test_in!(
 
 /// Build a valid 128-byte EDID base block with `ext_count` set,
 /// then fix up the checksum so the block sums to a multiple of 256.
+#[cfg(feature = "amdgpu")]
 fn build_valid_edid_block(ext_count: u8) -> [u8; 128] {
     let mut b = [0u8; 128];
     // VESA header.
@@ -4639,10 +4801,12 @@ fn build_valid_edid_block(ext_count: u8) -> [u8; 128] {
 /// by the (offset / 128) — block 0 is at offset 0, block 1 at
 /// offset 128, etc. Reads at non-block-aligned offsets return
 /// `BadHeader` indirectly via zero-filled bytes.
+#[cfg(feature = "amdgpu")]
 struct MockEdidTransport {
     blocks: alloc::vec::Vec<[u8; 128]>,
 }
 
+#[cfg(feature = "amdgpu")]
 impl crate::amdgpu_ddc::DdcTransport for MockEdidTransport {
     fn read(
         &mut self,
@@ -4674,6 +4838,7 @@ impl crate::amdgpu_ddc::DdcTransport for MockEdidTransport {
     }
 }
 
+#[cfg(feature = "amdgpu")]
 fn smoke_read_edid_via_mock_transport_round_trips_block_0() -> TestResult {
     use crate::amdgpu_ddc::{read_edid, EDID_BLOCK_BYTES};
     let block = build_valid_edid_block(0);
@@ -4695,11 +4860,13 @@ fn smoke_read_edid_via_mock_transport_round_trips_block_0() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/ddc",
     smoke_read_edid_via_mock_transport_round_trips_block_0
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_read_edid_rejects_bad_checksum() -> TestResult {
     use crate::amdgpu_ddc::{read_edid, DdcError};
     let mut block = build_valid_edid_block(0);
@@ -4714,11 +4881,13 @@ fn smoke_read_edid_rejects_bad_checksum() -> TestResult {
         Err(_) => TestResult::Fail("read_edid returned wrong error kind for bad checksum"),
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/ddc",
     smoke_read_edid_rejects_bad_checksum
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_read_edid_handles_one_extension_block() -> TestResult {
     use crate::amdgpu_ddc::{read_edid, EDID_BLOCK_BYTES};
     let base = build_valid_edid_block(1);
@@ -4748,11 +4917,13 @@ fn smoke_read_edid_handles_one_extension_block() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/ddc",
     smoke_read_edid_handles_one_extension_block
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_read_edid_caps_extension_blocks() -> TestResult {
     use crate::amdgpu_ddc::{read_edid, EDID_BLOCK_BYTES, MAX_EXT_BLOCKS};
     // Base claims 10 extensions — way over the cap of 4.
@@ -4780,11 +4951,13 @@ fn smoke_read_edid_caps_extension_blocks() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/ddc",
     smoke_read_edid_caps_extension_blocks
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_gpio_ddc_bit_bang_sequences_start_address_stop() -> TestResult {
     // Exercise GpioDdcTransport against a closure that captures
     // every bus operation. We then assert the trace begins with a
@@ -4843,6 +5016,7 @@ fn smoke_gpio_ddc_bit_bang_sequences_start_address_stop() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/ddc",
     smoke_gpio_ddc_bit_bang_sequences_start_address_stop
@@ -5190,6 +5364,7 @@ kernel_test_in!(
 /// The function this replaces claimed to follow it and did not: it was the
 /// GFX9 sequence with a different halt register. What it got wrong is listed
 /// in the commit; what this test pins is each thing it got wrong.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gfx11_ring_init_matches_linux() -> TestResult {
     use crate::amdgpu_gfx::{build_gfx11_ring_init, GfxError, GfxStep};
 
@@ -5383,6 +5558,7 @@ fn smoke_amdgpu_gfx11_ring_init_matches_linux() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/gfx",
     smoke_amdgpu_gfx11_ring_init_matches_linux
@@ -5390,6 +5566,7 @@ kernel_test_in!(
 
 // ── amdgpu (initialize orchestrator) ───────────────────────────────
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_expected_smu_driver_if_per_family() -> TestResult {
     use crate::amdgpu::with_controller;
     use crate::amdgpu_smu::{SMU12_DRIVER_IF_VERSION, SMU_13_0_4_DRIVER_IF_VERSION};
@@ -5418,11 +5595,13 @@ fn smoke_amdgpu_expected_smu_driver_if_per_family() -> TestResult {
         None => TestResult::Skip("controller vanished mid-test"),
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/initialize",
     smoke_amdgpu_expected_smu_driver_if_per_family
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_initialize_rejects_without_mp1_discovery() -> TestResult {
     use crate::amdgpu::with_controller;
     if !crate::amdgpu::is_probed() {
@@ -5446,6 +5625,7 @@ fn smoke_amdgpu_initialize_rejects_without_mp1_discovery() -> TestResult {
         None => TestResult::Skip("controller vanished mid-test"),
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/initialize",
     smoke_amdgpu_initialize_rejects_without_mp1_discovery
@@ -5453,6 +5633,7 @@ kernel_test_in!(
 
 // ── amdgpu/backlight ───────────────────────────────────────────────
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_backlight_user_level_for_percent() -> TestResult {
     use crate::amdgpu_backlight::user_level_for_percent;
     if user_level_for_percent(0) != 0 {
@@ -5472,6 +5653,7 @@ fn smoke_amdgpu_backlight_user_level_for_percent() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/backlight",
     smoke_amdgpu_backlight_user_level_for_percent
@@ -5479,6 +5661,7 @@ kernel_test_in!(
 
 /// Register ids and field positions are literals from
 /// `dcn_3_1_4_offset.h`/`_sh_mask.h`.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_backlight_registers_and_fields() -> TestResult {
     use crate::amdgpu_backlight::*;
     // regPWRSEQ0_BL_PWM_CNTL 0x2f19, then CNTL2, PERIOD_CNTL, GRP1_REG_LOCK —
@@ -5525,6 +5708,7 @@ fn smoke_amdgpu_backlight_registers_and_fields() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/backlight",
     smoke_amdgpu_backlight_registers_and_fields
@@ -5533,6 +5717,7 @@ kernel_test_in!(
 /// `dce_panel_cntl_set_backlight_level`'s own worked example: with a masked
 /// period of 0x24 and a bit count of 6, a brightness of 0xEFF0 gives an
 /// active product of 0x21BDC0 and a duty of 0x86F7.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_backlight_duty_scales_against_period() -> TestResult {
     use crate::amdgpu_backlight::active_duty_count;
     // BITCNT 6 in bits 19:16, period 0x24. The header's own arithmetic:
@@ -5556,11 +5741,13 @@ fn smoke_amdgpu_backlight_duty_scales_against_period() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/backlight",
     smoke_amdgpu_backlight_duty_scales_against_period
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_backlight_set_user_level_locks_then_unlocks() -> TestResult {
     use crate::amdgpu_backlight::*;
     let period_cntl = (6u32 << 16) | 0x24;
@@ -5588,11 +5775,13 @@ fn smoke_amdgpu_backlight_set_user_level_locks_then_unlocks() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/backlight",
     smoke_amdgpu_backlight_set_user_level_locks_then_unlocks
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_backlight_init_rejects_period_overflow() -> TestResult {
     use crate::amdgpu_backlight::{build_backlight_init, BacklightError, BL_PWM_PERIOD_MAX};
     // The field is sixteen bits, so the 200 Hz-at-100 MHz period of 500_000
@@ -5613,6 +5802,7 @@ fn smoke_amdgpu_backlight_init_rejects_period_overflow() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/backlight",
     smoke_amdgpu_backlight_init_rejects_period_overflow
@@ -5622,6 +5812,7 @@ kernel_test_in!(
 
 /// Field offsets are literals from `offsetof` on `SmuMetrics_t` in
 /// `smu13_driver_if_v13_0_4.h`, not the module's own constants.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_smu_metrics_table_decode() -> TestResult {
     use crate::amdgpu_smu::{parse_metrics, SMU_METRICS_V13_0_4_BYTES};
     if SMU_METRICS_V13_0_4_BYTES != 160 {
@@ -5692,6 +5883,7 @@ fn smoke_amdgpu_smu_metrics_table_decode() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_metrics_table_decode
@@ -5701,6 +5893,7 @@ kernel_test_in!(
 /// `smu_v13_0_4_ppsmc.h`. The whole table checks out; this pins the ones the
 /// bring-up path depends on, and the message-count bound that showed the
 /// temperature message to be fabricated.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_smu_v13_message_ids() -> TestResult {
     use crate::amdgpu_smu_v13::*;
     if V13_MSG_TEST != 0x01 || V13_MSG_GET_PMFW_VERSION != 0x02 || V13_MSG_GET_DRIVER_IF != 0x03 {
@@ -5733,6 +5926,7 @@ fn smoke_amdgpu_smu_v13_message_ids() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu/amdgpu/smu", smoke_amdgpu_smu_v13_message_ids);
 
 // ── DMA-buf smokes ────────────────────────────────────────────────────
@@ -6578,6 +6772,7 @@ kernel_test_in!(
 /// without DRM_MODE_FB_MODIFIERS the BO's GEM_METADATA tiling flags; a
 /// modifier the planes do not list, mismatched per-plane modifiers, a
 /// second BO or a short BO are EINVAL.
+#[cfg(feature = "amdgpu")]
 fn smoke_drm_addfb2_takes_gfx12_modifiers_and_nv12() -> TestResult {
     use crate::amdgpu_dm_modifiers::{DccBlock, Swizzle, Tiling, NV12};
     use crate::drm::ioctl::{dispatch, DrmIoctlResult};
@@ -6704,6 +6899,7 @@ fn smoke_drm_addfb2_takes_gfx12_modifiers_and_nv12() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/drm",
     smoke_drm_addfb2_takes_gfx12_modifiers_and_nv12
@@ -7543,6 +7739,7 @@ kernel_test_in!(
 // detection path, SmuFwVersion decode, and the version-dispatched
 // public API against a FakeMmio mock.
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_smu_v12_opcode_table_spot_checks() -> TestResult {
     // Confirm that the SMU12 opcode table returns the expected numeric
     // ids for a representative subset of canonical messages.
@@ -7584,11 +7781,13 @@ fn smoke_amdgpu_smu_v12_opcode_table_spot_checks() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_v12_opcode_table_spot_checks
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_smu_v13_opcode_table_spot_checks() -> TestResult {
     // Confirm that the SMU13.0.4 opcode table returns the expected
     // numeric ids.
@@ -7636,11 +7835,13 @@ fn smoke_amdgpu_smu_v13_opcode_table_spot_checks() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_v13_opcode_table_spot_checks
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_smu_version_detect_from_driver_if() -> TestResult {
     // Verify that SmuVersion::from_driver_if maps the correct
     // driver-IF constants to the right enum variant.
@@ -7665,11 +7866,13 @@ fn smoke_amdgpu_smu_version_detect_from_driver_if() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_version_detect_from_driver_if
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_smu_fw_version_decode() -> TestResult {
     // SmuFwVersion::from_raw should decode the BCD-packed word into
     // separate major/minor/revision fields.
@@ -7704,8 +7907,10 @@ fn smoke_amdgpu_smu_fw_version_decode() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu/amdgpu/smu", smoke_amdgpu_smu_fw_version_decode);
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_smu_get_clock_mhz_end_to_end() -> TestResult {
     // End-to-end mock: write msg → simulate response → read result.
     // Tests the `get_clock_mhz` public API via a FakeMmio that
@@ -7751,11 +7956,13 @@ fn smoke_amdgpu_smu_get_clock_mhz_end_to_end() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_get_clock_mhz_end_to_end
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_smu_v12_v13_opcodes_differ_where_expected() -> TestResult {
     // Structural: confirm that the key messages that differ between
     // V12 and V13 actually carry distinct numeric ids. If they ever
@@ -7801,6 +8008,7 @@ fn smoke_amdgpu_smu_v12_v13_opcodes_differ_where_expected() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_v12_v13_opcodes_differ_where_expected
@@ -7816,6 +8024,7 @@ kernel_test_in!(
 // Lock the three explicit PCI IDs in so an accidental rename or
 // table edit surfaces immediately.
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_foundations_bringup_target_pci_ids() -> TestResult {
     use crate::amdgpu;
     if amdgpu::RENOIR != 0x1636 {
@@ -7832,6 +8041,7 @@ fn smoke_amdgpu_foundations_bringup_target_pci_ids() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_foundations_bringup_target_pci_ids
@@ -7839,6 +8049,7 @@ kernel_test_in!(
 
 // ── Foundations wave — GFX register surface ────────────────────────
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_foundations_grbm_status_idle_decode() -> TestResult {
     use crate::amdgpu_gfx::GrbmStatus;
     // All zeros → idle.
@@ -7919,6 +8130,7 @@ fn smoke_amdgpu_foundations_grbm_status_idle_decode() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_foundations_grbm_status_idle_decode
@@ -7934,6 +8146,7 @@ kernel_test_in!(
 /// distinct owner, and `rptr` actually read back from it.
 /// The HPD status register, and the gap between the cookie's connector space
 /// and the registers this ASIC actually has.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_hpd_status_register_window() -> TestResult {
     use crate::amdgpu_dcn as dcn;
     // regHPD0_DC_HPD_INT_STATUS 0x1f14 and regHPD1_... 0x1f1c, BASE_IDX 2.
@@ -7964,11 +8177,13 @@ fn smoke_amdgpu_hpd_status_register_window() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_hpd_status_register_window
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gfx_writeback_slots_are_separate() -> TestResult {
     use crate::amdgpu_gfx::{
         GfxContext, WB_BYTES, WB_FENCE_OFFSET, WB_RPTR_OFFSET, WB_SLOT_BYTES, WB_WPTR_OFFSET,
@@ -8012,6 +8227,7 @@ fn smoke_amdgpu_gfx_writeback_slots_are_separate() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_gfx_writeback_slots_are_separate
@@ -8027,6 +8243,7 @@ kernel_test_in!(
 /// different answer. The failure mode is a queue the firmware accepts and that
 /// never runs, which is the worst kind to debug, so the addresses come from
 /// one place.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gfx_queue_description_is_consistent() -> TestResult {
     use crate::amdgpu_gfx::{build_gfx11_ring_init, GfxContext, MQD_BYTES};
     use crate::amdgpu_mqd::{CP_GFX_HQD_BASE, CP_GFX_HQD_BASE_HI, MQD_DWORDS};
@@ -8112,6 +8329,7 @@ fn smoke_amdgpu_gfx_queue_description_is_consistent() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_gfx_queue_description_is_consistent
@@ -8126,6 +8344,7 @@ kernel_test_in!(
 /// `CP_RB0_CNTL` write exists, so a sequence applied without it writes the
 /// same value twice for no reason and the ring-size field may not have
 /// settled.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gfx11_sequence_applies_in_order() -> TestResult {
     use crate::amdgpu_cp_fw::CpFwMmio;
     use crate::amdgpu_gfx::{apply_gfx11_sequence, build_gfx11_ring_init, GfxStep};
@@ -8223,6 +8442,7 @@ fn smoke_amdgpu_gfx11_sequence_applies_in_order() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_gfx11_sequence_applies_in_order
@@ -8235,6 +8455,7 @@ kernel_test_in!(
 /// register. The MEC is `CP_MEC_RS64_CNTL`, a different register in a
 /// different window, and nothing wrote it — so the compute pipes stayed
 /// halted while bring-up reported success.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gfx11_compute_enable_and_doorbell_range() -> TestResult {
     use crate::amdgpu_gfx::{
         build_cp_set_doorbell_range, cp_compute_enable_value, GFX11_CP_MEC_DOORBELL_RANGE_LOWER,
@@ -8372,6 +8593,7 @@ fn smoke_amdgpu_gfx11_compute_enable_and_doorbell_range() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_gfx11_compute_enable_and_doorbell_range
@@ -8384,6 +8606,7 @@ kernel_test_in!(
 /// GC BASE_IDX 1 is 0xA000, so the resolved address is 0xC040 and the packet
 /// carries 0x40. A version built from the bare id would carry 0x2040 — a
 /// number still inside no aperture at all, naming nothing the CP would accept.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gfx11_ring_test_packet() -> TestResult {
     use crate::amdgpu_gfx::{
         build_ring_test_packet, ring_test_scratch_dword, GFX11_SCRATCH_REG0, RING_TEST_EXPECT,
@@ -8466,6 +8689,7 @@ fn smoke_amdgpu_gfx11_ring_test_packet() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_gfx11_ring_test_packet
@@ -8477,6 +8701,7 @@ kernel_test_in!(
 /// `ring->me` is **`mec + 1`** (`gfx_v11_0_compute_ring_init`: "mec0 is me1"),
 /// and the mapping packet's `queue_type` is `Compute`. Both produce a packet
 /// that looks entirely valid and sends the queue to the wrong engine.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_compute_context_describes_itself() -> TestResult {
     use crate::amdgpu_compute::ComputeQueue;
     use crate::amdgpu_gfx::{ComputeContext, COMPUTE_MQD_BYTES};
@@ -8614,6 +8839,7 @@ fn smoke_amdgpu_compute_context_describes_itself() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_compute_context_describes_itself
@@ -8627,6 +8853,7 @@ kernel_test_in!(
 /// none of those things, and the second is not cosmetic — a 12 GiB RX 6750 XT
 /// exposes 256 MiB through BAR0, so claiming 12 GiB is CPU-visible hands a
 /// client a mapping of nothing.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_discrete_is_not_an_apu() -> TestResult {
     use crate::amdgpu::{gc_version_is_apu, Family, APU_GC_VERSIONS};
     use crate::amdgpu_discovery::{GcInfo, IpBlock, HW_ID_GC, MAX_BASE_ADDRS};
@@ -8801,11 +9028,13 @@ fn smoke_amdgpu_discrete_is_not_an_apu() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_discrete_is_not_an_apu
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_passive_mode_reads_the_hub_not_the_timing() -> TestResult {
     use crate::amdgpu_dcn as dcn;
     // regHUBP0_DCHUBP_CNTL 0x05f3, regHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION
@@ -8850,11 +9079,13 @@ fn smoke_amdgpu_passive_mode_reads_the_hub_not_the_timing() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_passive_mode_reads_the_hub_not_the_timing
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gc_window_and_dword_conversion() -> TestResult {
     use crate::amdgpu::mm_dword;
     use crate::amdgpu_cp_fw::{CpEngine, CP_PFP_IC_BASE_LO};
@@ -8911,11 +9142,13 @@ fn smoke_amdgpu_gc_window_and_dword_conversion() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_gc_window_and_dword_conversion
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_foundations_grbm_gfx_index_encoding() -> TestResult {
     use crate::amdgpu_gfx::{grbm_gfx_index_broadcast, grbm_gfx_index_for};
     // Broadcast must light all three top bits.
@@ -8944,6 +9177,7 @@ fn smoke_amdgpu_foundations_grbm_gfx_index_encoding() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_foundations_grbm_gfx_index_encoding
@@ -8961,6 +9195,7 @@ kernel_test_in!(
 ///
 /// An offset test can only restate a number, so what it buys is a tripwire:
 /// changing one of these now requires saying which header line justifies it.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_foundations_gfx_per_family_register_offsets_distinct() -> TestResult {
     use crate::amdgpu_gfx::{
         CP_ME_CNTL_REL, CP_RB0_BASE_HI_REL, CP_RB0_BASE_REL, CP_RB0_CNTL_REL,
@@ -9031,6 +9266,7 @@ fn smoke_amdgpu_foundations_gfx_per_family_register_offsets_distinct() -> TestRe
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_foundations_gfx_per_family_register_offsets_distinct
@@ -9038,6 +9274,7 @@ kernel_test_in!(
 
 // ── Foundations wave — GMC aperture decode ─────────────────────────
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_foundations_vram_aperture_decode_renoir_uma() -> TestResult {
     use crate::amdgpu_gmc::decode_vram_aperture;
     // Renoir UMA carve-out example: base = 0x100, top = 0x1FF →
@@ -9062,11 +9299,13 @@ fn smoke_amdgpu_foundations_vram_aperture_decode_renoir_uma() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_foundations_vram_aperture_decode_renoir_uma
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_foundations_system_aperture_decode_in_4kib_units() -> TestResult {
     use crate::amdgpu_gmc::decode_system_aperture;
     // 4 KiB units: low=0x100000 -> 4 GiB, high=0x200000 -> 8 GiB.
@@ -9079,11 +9318,13 @@ fn smoke_amdgpu_foundations_system_aperture_decode_in_4kib_units() -> TestResult
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_foundations_system_aperture_decode_in_4kib_units
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_foundations_aperture_layout_predicates() -> TestResult {
     use crate::amdgpu_gmc::ApertureLayout;
     let empty = ApertureLayout::default();
@@ -9104,6 +9345,7 @@ fn smoke_amdgpu_foundations_aperture_layout_predicates() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_foundations_aperture_layout_predicates
@@ -9123,6 +9365,7 @@ kernel_test_in!(
 ///
 /// The values below are from `gc_9_0_offset.h` (GFX9, GC block, BASE_IDX 0)
 /// and `gc_11_0_0_offset.h` (GFX11).
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_foundations_mc_register_offsets_stable() -> TestResult {
     use crate::amdgpu_gmc::*;
 
@@ -9190,6 +9433,7 @@ fn smoke_amdgpu_foundations_mc_register_offsets_stable() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_foundations_mc_register_offsets_stable
@@ -9203,6 +9447,7 @@ kernel_test_in!(
 // bring-up's load-bearing IPs — MP0, MP1, GC, DCN — out of the
 // returned `Vec<IpBlock>`. Same synthetic blob helper.
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_foundations_discovery_resolves_load_bearing_blocks() -> TestResult {
     // Foundations wave needs the discovery parser to surface at
     // least the GC IP block (for `AmdGpu::gc_base` → GRBM/CP
@@ -9242,6 +9487,7 @@ fn smoke_amdgpu_foundations_discovery_resolves_load_bearing_blocks() -> TestResu
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_foundations_discovery_resolves_load_bearing_blocks
@@ -9263,6 +9509,7 @@ kernel_test_in!(
 ///     RDNA2 (GFX 10.3.6), an architecture earlier.
 ///   * `PHOENIX_FW` held the Strix bundle outright (GFX 11.5, DCN 3.5,
 ///     PSP 14.0.1), under a doc comment that said so.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_phoenix_identity_matches_linux() -> TestResult {
     use crate::amdgpu;
     // pci.ids, vendor 1002.
@@ -9390,6 +9637,7 @@ fn smoke_amdgpu_phoenix_identity_matches_linux() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu", smoke_amdgpu_phoenix_identity_matches_linux);
 
 /// Build a discovery blob carrying a `gc_info` v1.2 table describing a
@@ -9398,6 +9646,7 @@ kernel_test_in!("drivers/gpu", smoke_amdgpu_phoenix_identity_matches_linux);
 /// 1 SE x 2 SA x (2 x (3 + 3)) CU = 24 — wait, the 780M has 12 CUs, so the
 /// banks are 3 and 0: `2 * (3 + 0) = 6` CU per SA, x 2 SA x 1 SE = 12.
 /// That asymmetry is the point of v1 having two WGP banks at all.
+#[cfg(feature = "amdgpu")]
 fn build_gc_info_blob(version_minor: u16, fields: &[u32]) -> alloc::vec::Vec<u8> {
     use crate::amdgpu_discovery as d;
     let mut blob = alloc::vec![0u8; 0x400];
@@ -9438,6 +9687,7 @@ fn build_gc_info_blob(version_minor: u16, fields: &[u32]) -> alloc::vec::Vec<u8>
 /// this reason (`amdgpu_discovery_get_gfx_info`): a 780M and a 760M are both
 /// GFX 11.0.1 and differ in CU count, so anything hardcoded per IP version
 /// would be wrong for one of them.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gc_info_reports_the_tables_topology() -> TestResult {
     use crate::amdgpu_discovery::{parse_gc_info, DiscoveryError};
 
@@ -9558,6 +9808,7 @@ fn smoke_amdgpu_gc_info_reports_the_tables_topology() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/discovery",
     smoke_amdgpu_gc_info_reports_the_tables_topology
@@ -9572,6 +9823,7 @@ kernel_test_in!(
 /// matters is the VALUES, and that they came from the GC table rather than
 /// from a guess. The replies are decoded back through the mirrored structs,
 /// whose layout is pinned against the C header separately.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_info_reports_the_sourced_device() -> TestResult {
     use crate::amdgpu::Family;
     use crate::amdgpu_discovery::{GcInfo, IpBlock, HW_ID_GC, HW_ID_SDMA0, MAX_BASE_ADDRS};
@@ -9801,6 +10053,7 @@ fn smoke_amdgpu_info_reports_the_sourced_device() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu", smoke_amdgpu_info_reports_the_sourced_device);
 
 /// The amdgpu GEM lifecycle, and the isolation that makes per-open handles
@@ -9810,6 +10063,7 @@ kernel_test_in!("drivers/gpu", smoke_amdgpu_info_reports_the_sourced_device);
 /// the creation parameters back → `GEM_CLOSE`. Plus the validations Linux runs
 /// before allocating anything, which are the part a client can reach with
 /// hostile input.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gem_lifecycle_and_handle_isolation() -> TestResult {
     use crate::amdgpu_gem::{dispatch, GemState};
     use crate::amdgpu_uapi as u;
@@ -10077,6 +10331,7 @@ fn smoke_amdgpu_gem_lifecycle_and_handle_isolation() -> TestResult {
     let _ = dispatch(close_cmd, c2.as_mut_ptr() as usize, &state);
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu",
     smoke_amdgpu_gem_lifecycle_and_handle_isolation
@@ -10090,6 +10345,7 @@ kernel_test_in!(
 /// recomputes the decomposition independently of the module so a transcription
 /// slip in either shows up as a disagreement: a wrong level shift walks the GPU
 /// into the wrong page table.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_vm_gmc11_geometry() -> TestResult {
     use crate::amdgpu_vm::{Geometry, Level, GPU_PAGE_SHIFT};
 
@@ -10161,6 +10417,7 @@ fn smoke_amdgpu_vm_gmc11_geometry() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu/amdgpu_vm", smoke_amdgpu_vm_gmc11_geometry);
 
 /// The five `DEV_INFO` fields describing the address space, against the
@@ -10178,6 +10435,7 @@ kernel_test_in!("drivers/gpu/amdgpu_vm", smoke_amdgpu_vm_gmc11_geometry);
 /// high_offset     = HOLE_END                         = 0xffff_8000_0000_0000
 /// high_max        = HOLE_END | vm_size               = 0xffff_ffff_ffbf_0000
 /// ```
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_vm_dev_info_va_window() -> TestResult {
     use crate::amdgpu_vm::Geometry;
     let va = Geometry::GMC11.va_info();
@@ -10221,6 +10479,7 @@ fn smoke_amdgpu_vm_dev_info_va_window() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu/amdgpu_vm", smoke_amdgpu_vm_dev_info_va_window);
 
 /// PTE composition, including the bits `gmc_v11_0_get_vm_pte` CLEARS.
@@ -10230,6 +10489,7 @@ kernel_test_in!("drivers/gpu/amdgpu_vm", smoke_amdgpu_vm_dev_info_va_window);
 /// flags held, and PRT clears `VALID` — a PRT entry is deliberately not a valid
 /// translation. A transcription that only ORed the positive cases would look
 /// right and grant execute permission on every mapping.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_vm_pte_flags_match_gmc11() -> TestResult {
     use crate::amdgpu_uapi as u;
     use crate::amdgpu_vm::*;
@@ -10327,12 +10587,14 @@ fn smoke_amdgpu_vm_pte_flags_match_gmc11() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_vm_pte_flags_match_gmc11
 );
 
 /// `AMDGPU_GEM_VA`'s validation and bookkeeping.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_vm_gem_va_maps_and_validates() -> TestResult {
     use crate::amdgpu_gem::GemState;
     use crate::amdgpu_uapi as u;
@@ -10515,6 +10777,7 @@ fn smoke_amdgpu_vm_gem_va_maps_and_validates() -> TestResult {
     let _ = crate::amdgpu_gem::dispatch(0x09, c.as_mut_ptr() as usize, &gem);
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_vm_gem_va_maps_and_validates
@@ -10528,6 +10791,7 @@ kernel_test_in!(
 /// walkable chain — root PDE → PDB1 PDE → PDB0 PDE → leaf PTE — with the
 /// physical address and flags at each step, and that unmapping restores the
 /// invalid pattern and frees the directories that are left empty.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_vm_page_tables_are_walkable() -> TestResult {
     use crate::amdgpu_gem::GemState;
     use crate::amdgpu_uapi as u;
@@ -10718,6 +10982,7 @@ fn smoke_amdgpu_vm_page_tables_are_walkable() -> TestResult {
     let _ = crate::amdgpu_gem::dispatch(0x09, c.as_mut_ptr() as usize, &gem);
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_vm_page_tables_are_walkable
@@ -10730,6 +10995,7 @@ kernel_test_in!(
 /// submitting work. The interesting part is the priority gate: NORMAL and
 /// below are open to everyone, above needs CAP_SYS_NICE or DRM master, and
 /// garbage in the field is DELIBERATELY not an error.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_ctx_alloc_query_and_priority_gate() -> TestResult {
     use crate::amdgpu_ctx::{dispatch, CtxState};
     use crate::amdgpu_uapi as u;
@@ -10931,6 +11197,7 @@ fn smoke_amdgpu_ctx_alloc_query_and_priority_gate() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_ctx",
     smoke_amdgpu_ctx_alloc_query_and_priority_gate
@@ -10942,6 +11209,7 @@ kernel_test_in!(
 /// enabled, TLB invalidated after. A forgotten invalidate means the MMU keeps
 /// serving translations cached for whatever previously held the VMID — one
 /// process reading another's memory, silently.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_vm_activate_programs_both_hubs() -> TestResult {
     use crate::amdgpu_gem::GemState;
     use crate::amdgpu_uapi as u;
@@ -11110,6 +11378,7 @@ fn smoke_amdgpu_vm_activate_programs_both_hubs() -> TestResult {
     let _ = crate::amdgpu_gem::dispatch(0x09, c.as_mut_ptr() as usize, &gem);
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_vm_activate_programs_both_hubs
@@ -11119,6 +11388,7 @@ kernel_test_in!(
 /// to 55:54 and honours only NC and UC, marks PRT at 56 with IS_PTE at 63
 /// (no LOG), sets DCC for a GFX12_DCC buffer and forces UC only for an
 /// UNCACHED one; PDE_PTE and the block fragment size move to 63 and 62:58.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_vm_gmc12_pte_format() -> TestResult {
     use crate::amdgpu_uapi as u;
     use crate::amdgpu_vm::{self as vm, PteFormat::*};
@@ -11192,11 +11462,13 @@ fn smoke_amdgpu_vm_gmc12_pte_format() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu/amdgpu_vm", smoke_amdgpu_vm_gmc12_pte_format);
 
 /// A GMC 12 address space writes GMC 12 entries: a UC mapping's leaf has
 /// its memory type at 55:54, and an emptied directory is restored to GMC
 /// 12's PDE_PTE pattern (bit 63), not GMC 11's (bit 54).
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_vm_gmc12_tables() -> TestResult {
     use crate::amdgpu_gem::GemState;
     use crate::amdgpu_uapi as u;
@@ -11257,11 +11529,13 @@ fn smoke_amdgpu_vm_gmc12_tables() -> TestResult {
     let _ = crate::amdgpu_gem::dispatch(0x09, c.as_mut_ptr() as usize, &gem);
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu/amdgpu_vm", smoke_amdgpu_vm_gmc12_tables);
 
 /// A client's address space follows its card: GMC 12 for a Navi4x id (the
 /// RX 9070 XT), GMC 11's layout and encoding for every other family and
 /// for an unknown card, as before.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_vm_geometry_follows_the_card() -> TestResult {
     use crate::amdgpu::{family_for_pci_id, Family, AMD_VENDOR, NAVI22, NAVI48};
     use crate::amdgpu_vm::{Geometry, VmState};
@@ -11276,12 +11550,14 @@ fn smoke_amdgpu_vm_geometry_follows_the_card() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_vm_geometry_follows_the_card
 );
 
 /// GEM_CREATE on an amdgpu open, returning the handle or the error.
+#[cfg(feature = "amdgpu")]
 fn gem_create_on(
     gem: &crate::amdgpu_gem::GemState,
     bytes: u64,
@@ -11300,6 +11576,7 @@ fn gem_create_on(
 }
 
 /// GEM_VA `op` of `size` bytes of `handle` at `offset`, at `va`.
+#[cfg(feature = "amdgpu")]
 fn gem_va_on(
     vm: &crate::amdgpu_vm::VmState,
     gem: &crate::amdgpu_gem::GemState,
@@ -11331,6 +11608,7 @@ fn gem_va_on(
 /// reference goes with the mapping. A CLEAR of a mapping's middle splits it
 /// as `amdgpu_vm_bo_clear_mappings` does: the ends stay mapped (the right
 /// one at its advanced offset) and only the cleared entries go.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_vm_mappings_hold_their_buffers() -> TestResult {
     use crate::amdgpu_gem::GemState;
     use crate::amdgpu_uapi as u;
@@ -11391,6 +11669,7 @@ fn smoke_amdgpu_vm_mappings_hold_their_buffers() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_vm_mappings_hold_their_buffers
@@ -11402,6 +11681,7 @@ kernel_test_in!(
 /// without SYSTEM or SNOOPED. GTT-only buffers, and VRAM|GTT ones once the
 /// heap is full, are system pages; ordinary VRAM-preferred buffers also
 /// allow GTT fallback, as amdgpu_bo_create sets allowed_domains.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gem_places_buffers_in_card_vram() -> TestResult {
     use crate::amdgpu_gem::{register_vram_heap, unregister_vram_heap, GemState, VramHeap};
     use crate::amdgpu_uapi as u;
@@ -11510,6 +11790,7 @@ fn smoke_amdgpu_gem_places_buffers_in_card_vram() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_gem_places_buffers_in_card_vram
@@ -11518,12 +11799,15 @@ kernel_test_in!(
 /// A fake engine clear for `smoke_amdgpu_gem_places_hidden_buffers_past_the_bar`:
 /// records each clear and hands back one shared, CPU-controlled fence.
 #[derive(Debug)]
+#[cfg(feature = "amdgpu")]
 struct FakeVramClear {
     calls: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>,
     done: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
     refuse: core::sync::atomic::AtomicBool,
 }
+#[cfg(feature = "amdgpu")]
 struct FakeClearFence(alloc::sync::Arc<core::sync::atomic::AtomicBool>);
+#[cfg(feature = "amdgpu")]
 impl narf_filesystem::DrmFence for FakeClearFence {
     fn is_signalled(&self) -> bool {
         self.0.load(core::sync::atomic::Ordering::Acquire)
@@ -11532,6 +11816,7 @@ impl narf_filesystem::DrmFence for FakeClearFence {
         self.is_signalled()
     }
 }
+#[cfg(feature = "amdgpu")]
 impl crate::amdgpu_gem::VramClear for FakeVramClear {
     fn clear(
         &self,
@@ -11551,6 +11836,7 @@ impl crate::amdgpu_gem::VramClear for FakeVramClear {
 /// address, and the engine's clear as its KERNEL fence, which mapping it
 /// makes every job of the space wait for. Other VRAM buffers stay in the
 /// visible heap, and a hidden one falls back there when the rest is full.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gem_places_hidden_buffers_past_the_bar() -> TestResult {
     use crate::amdgpu_gem::{
         register_vram_heap, unregister_vram_heap, GemState, UnmappedHeap, VramHeap,
@@ -11692,6 +11978,7 @@ fn smoke_amdgpu_gem_places_hidden_buffers_past_the_bar() -> TestResult {
         Err(why) => TestResult::Fail(why),
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_gem_places_hidden_buffers_past_the_bar
@@ -11706,6 +11993,7 @@ kernel_test_in!(
 /// user-controlled pointers three levels deep, with two user-controlled counts
 /// bounding them, and it decides whether an address the client named is one it
 /// actually owns.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_cs_parser_rejects_hostile_input() -> TestResult {
     use crate::amdgpu_cs::{parse, Ib};
     use crate::amdgpu_ctx::{dispatch as ctx_dispatch, CtxState};
@@ -12021,6 +12309,7 @@ fn smoke_amdgpu_cs_parser_rejects_hostile_input() -> TestResult {
     let _ = crate::amdgpu_gem::dispatch(0x09, c.as_mut_ptr() as usize, &gem);
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_cs",
     smoke_amdgpu_cs_parser_rejects_hostile_input
@@ -12032,6 +12321,7 @@ kernel_test_in!(
 /// completes it (a zero deadline does not wait), handle 0 is idle, and an
 /// unknown context is refused. Without a submitter the async route
 /// declines, leaving the synchronous refusal in place.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
     use crate::amdgpu_cs::{dispatch_async, register_submitter, unregister_submitter};
     use crate::amdgpu_ctx::{dispatch as ctx_dispatch, CtxState};
@@ -12588,6 +12878,7 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_cs",
     smoke_amdgpu_cs_submits_through_a_card_submitter
@@ -12598,6 +12889,7 @@ kernel_test_in!(
 /// that emptied wait in the card's deferred list until the engine reports
 /// that job complete; a dropped address space waits the same way. Before
 /// any job, frees are immediate.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_vm_holds_job_memory_until_its_fence() -> TestResult {
     use crate::amdgpu_cs::{deferred, retire};
     use crate::amdgpu_gem::GemState;
@@ -12700,6 +12992,7 @@ fn smoke_amdgpu_vm_holds_job_memory_until_its_fence() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_vm_holds_job_memory_until_its_fence
@@ -12709,6 +13002,7 @@ kernel_test_in!(
 /// address space keeps one for its life; once a job ran in it, its PASID
 /// waits for that job's fence like its memory, so a late fault is never
 /// charged to the next space given the same PASID.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_vm_pasids_outlive_their_jobs() -> TestResult {
     use crate::amdgpu_cs::retire;
     use crate::amdgpu_vm::VmState;
@@ -12748,6 +13042,7 @@ fn smoke_amdgpu_vm_pasids_outlive_their_jobs() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_vm_pasids_outlive_their_jobs
@@ -12756,6 +13051,7 @@ kernel_test_in!(
 /// With an IH service attributing IVs by PASID, a released PASID waits for
 /// an empty-ring pass that began after release before reuse, and a late
 /// fault naming it is charged to no one meanwhile.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_pasid_reuse_waits_for_ih_drain() -> TestResult {
     use crate::amdgpu_vmid::{
         fault, ih_drained, record_fault, track_ih_drains, FaultInfo, PasidHandle,
@@ -12799,6 +13095,7 @@ fn smoke_amdgpu_pasid_reuse_waits_for_ih_drain() -> TestResult {
     drop((after, freed));
     result
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_pasid_reuse_waits_for_ih_drain
@@ -12808,6 +13105,7 @@ kernel_test_in!(
 /// (`amdgpu_vm_update_fault_cache`): the last nonzero-status fault charged
 /// to its PASID, zeros before any; a zero status does not replace a useful
 /// one, a fault for a freed PASID is dropped, and other opens see nothing.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_info_gpuvm_fault_follows_the_open() -> TestResult {
     use crate::amdgpu_uapi as u;
     use crate::amdgpu_vm::VmState;
@@ -12854,6 +13152,7 @@ fn smoke_amdgpu_info_gpuvm_fault_follows_the_open() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_info_gpuvm_fault_follows_the_open
@@ -12865,6 +13164,7 @@ kernel_test_in!(
 /// and printing `offsetof(field) / 4`, so what this test adds is the VALUES:
 /// the register defaults they build on, the shifts, and the two fields whose
 /// sense is easy to invert.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_mqd_gfx11_matches_linux() -> TestResult {
     use crate::amdgpu_mqd::*;
 
@@ -13053,6 +13353,7 @@ fn smoke_amdgpu_mqd_gfx11_matches_linux() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_mqd",
     smoke_amdgpu_mqd_gfx11_matches_linux
@@ -13063,6 +13364,7 @@ kernel_test_in!(
 /// `v11_compute_mqd` is a different register image from `v11_gfx_mqd` — the
 /// indices come from the `// offset:` comments `v11_structs.h:674` carries,
 /// and the values from `gc_11_0_0_default.h` and `gc_11_0_0_sh_mask.h`.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_mqd_compute_matches_linux() -> TestResult {
     use crate::amdgpu_mqd::*;
 
@@ -13288,6 +13590,7 @@ fn smoke_amdgpu_mqd_compute_matches_linux() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_mqd",
     smoke_amdgpu_mqd_compute_matches_linux
@@ -13302,6 +13605,7 @@ kernel_test_in!(
 /// because the failure the MES descriptor produces is a scheduler that maps
 /// successfully and never runs, and a copy of the compute path would look
 /// entirely plausible.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_mqd_mes_differs_from_compute() -> TestResult {
     use crate::amdgpu_mqd::*;
 
@@ -13487,6 +13791,7 @@ fn smoke_amdgpu_mqd_mes_differs_from_compute() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_mqd",
     smoke_amdgpu_mqd_mes_differs_from_compute
@@ -13500,6 +13805,7 @@ kernel_test_in!(
 /// the argument register at byte 0x3A4 where C2PMSG_66 is at 0xA08. Every SMU
 /// message went to the wrong register and every response was read from
 /// another.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_smu_mailbox_offsets_match_mp13() -> TestResult {
     use crate::amdgpu_smu::{
         MP1_C2PMSG_ARG_REL, MP1_C2PMSG_MSG_REL, MP1_C2PMSG_PMFW_HI_REL, MP1_C2PMSG_PMFW_LO_REL,
@@ -13536,6 +13842,7 @@ fn smoke_amdgpu_smu_mailbox_offsets_match_mp13() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_mailbox_offsets_match_mp13
@@ -13549,6 +13856,7 @@ kernel_test_in!(
 /// per-block bases those offsets were added to, and the unit — `DcnWrite::addr`
 /// goes into helpers that accept DWORD IDs, while the tables were in bytes.
 /// The IDs are absolute now; the hardware boundary converts them to bytes.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_dcn_offsets_match_headers() -> TestResult {
     use crate::amdgpu_dcn::*;
 
@@ -13614,6 +13922,7 @@ fn smoke_amdgpu_dcn_offsets_match_headers() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_dcn",
     smoke_amdgpu_dcn_offsets_match_headers
@@ -13623,6 +13932,7 @@ kernel_test_in!(
 /// a flush until it removes a mapping or its flush is pending on another
 /// ring; a new space takes an idle VMID and flushes; nothing idle means
 /// waiting; the LUT entry is rewritten only for a new PASID.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_vmid_grab_reuses_and_flushes_like_linux() -> TestResult {
     use crate::amdgpu_vmid::{GrabRequest, VmidManager};
     let mut m = VmidManager::new(1, 2);
@@ -13697,6 +14007,7 @@ fn smoke_amdgpu_vmid_grab_reuses_and_flushes_like_linux() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_vmid",
     smoke_amdgpu_vmid_grab_reuses_and_flushes_like_linux
@@ -13706,6 +14017,7 @@ kernel_test_in!(
 /// flags and a blob of at most 256 bytes on the buffer, GET returns them
 /// and leaves the rest of the data array alone, an empty SET clears the
 /// blob but keeps its flags, and an unknown handle is ENOENT.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gem_metadata_round_trips() -> TestResult {
     use crate::amdgpu_gem::{dispatch, GemState};
     use crate::amdgpu_uapi as u;
@@ -13780,6 +14092,7 @@ fn smoke_amdgpu_gem_metadata_round_trips() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_gem",
     smoke_amdgpu_gem_metadata_round_trips
@@ -13789,6 +14102,7 @@ kernel_test_in!(
 /// whose entries carry PRT without VALID; REPLACE commits a buffer into
 /// part of it and REPLACE with PRT decommits it again; CLEAR drops it. A
 /// non-PRT map still needs a buffer.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_vm_prt_ranges_back_sparse_binding() -> TestResult {
     use crate::amdgpu_gem::GemState;
     use crate::amdgpu_uapi as u;
@@ -13868,6 +14182,7 @@ fn smoke_amdgpu_vm_prt_ranges_back_sparse_binding() -> TestResult {
         Err(why) => TestResult::Fail(why),
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_vm_prt_ranges_back_sparse_binding
@@ -13877,6 +14192,7 @@ kernel_test_in!(
 /// are two chunks, 33 MiB (past the allocator's 32 MiB blocks) works, and
 /// the frames, the GPU entries and CPU access agree page by page. Usage
 /// is charged against half of RAM and returned on close.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gem_system_buffers_span_chunks() -> TestResult {
     use crate::amdgpu_gem::{gtt_limit, gtt_used, GemState};
     use crate::amdgpu_uapi as u;
@@ -13955,6 +14271,7 @@ fn smoke_amdgpu_gem_system_buffers_span_chunks() -> TestResult {
         Err(why) => TestResult::Fail(why),
     }
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_gem_system_buffers_span_chunks
@@ -13963,6 +14280,7 @@ kernel_test_in!(
 /// A CPU mapping holds its buffer (`GemState::mapping_object`, which the
 /// render and card nodes hand the mapping as its lifetime): GEM_CLOSE drops
 /// the handle, but the pages stay until the mapping goes.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gem_mapping_outlives_gem_close() -> TestResult {
     use crate::amdgpu_gem::{dispatch, GemState};
     use crate::amdgpu_uapi as u;
@@ -14005,6 +14323,7 @@ fn smoke_amdgpu_gem_mapping_outlives_gem_close() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_gem",
     smoke_amdgpu_gem_mapping_outlives_gem_close
@@ -14014,6 +14333,7 @@ kernel_test_in!(
 /// maps its frames, and imports into another open of the same card as one
 /// handle (the same one on a second import), sharing the buffer and its
 /// reservation; another card's open refuses it.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gem_prime_export_import() -> TestResult {
     use crate::amdgpu_gem::{dispatch, GemState};
     use crate::amdgpu_uapi as u;
@@ -14114,6 +14434,7 @@ fn smoke_amdgpu_gem_prime_export_import() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_gem",
     smoke_amdgpu_gem_prime_export_import
@@ -14122,6 +14443,7 @@ kernel_test_in!(
 /// AMDGPU_INFO_HW_IP_INFO's `available_rings` follows the open's card: bit 0
 /// for an IP whose ring 0 the card's submitter serves, zero otherwise or
 /// with no submitter.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_info_available_rings_follow_the_submitter() -> TestResult {
     use crate::amdgpu_info::available_rings;
     use crate::amdgpu_uapi as u;
@@ -14172,11 +14494,13 @@ fn smoke_amdgpu_info_available_rings_follow_the_submitter() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu_info",
     smoke_amdgpu_info_available_rings_follow_the_submitter
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_rdna2_chip_identity_and_startup_gate() -> TestResult {
     use crate::{amdgpu, amdgpu_rdna2};
     for profile in amdgpu_rdna2::PROFILES {
@@ -14204,6 +14528,7 @@ fn smoke_rdna2_chip_identity_and_startup_gate() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     smoke_rdna2_chip_identity_and_startup_gate
@@ -14237,4 +14562,7 @@ fn smoke_gpu_vendor_feature_registration_census() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu", smoke_gpu_vendor_feature_registration_census);
+kernel_test_in!(
+    "drivers/gpu/vendor_features",
+    smoke_gpu_vendor_feature_registration_census
+);

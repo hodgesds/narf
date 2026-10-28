@@ -711,11 +711,13 @@ pub mod intel_gpu_gmbus;
 pub mod intel_gpu_gtt;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_hdmi;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_media;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_modeset;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_modeset_xelpg;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_mst;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_multipipe;

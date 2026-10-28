@@ -324,6 +324,18 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             },
         };
 
+        self.modeset_fixed(primary_fb, &mode)
+    }
+
+    /// Restore exactly the caller's timing without an EDID mode substitution.
+    pub fn modeset_fixed(
+        &mut self,
+        primary_fb: &Framebuffer,
+        mode: &Mode,
+    ) -> Result<Mode, ModesetError> {
+        crate::intel_gpu_modeset::validate_framebuffer_mode(primary_fb, mode)?;
+        let mode = *mode;
+
         // Step 2: power wells — PW_1 (transcoder A / DDI A-B),
         // PW_A (pipe A), and this port's AUX well (the PHY
         // message bus and AUX channel both hang off it).
@@ -725,62 +737,8 @@ fn validate_framebuffer(fb: &Framebuffer) -> Result<(), ModesetError> {
 /// surface registers (PIPECONF / PLANE_SURF / PLANE_STRIDE) sit
 /// at the same BAR0 offsets on Xe-LPG.
 pub fn takeover_display(gpu: &crate::intel_gpu::IntelGpu) -> Option<Mode> {
-    use crate::intel_gpu_pipes::{
-        Pipe, PIPECONF_ENABLE, PIPECONF_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_STRIDE_OFFSET,
-        PLANE_SURF_OFFSET,
-    };
-    use narf_bus::bar::MmioRegion;
-
-    struct MmioAdapter<'a>(&'a MmioRegion);
-    impl<'a> MmioWindow for MmioAdapter<'a> {
-        fn read32(&self, off: u64) -> u32 {
-            // SAFETY: `self.0` is the GPU's MMADR BAR window mapped by the
-            // probe; `off` is a register offset within that BAR supplied by the
-            // modeset code, and a 32-bit display register read has no
-            // unwanted read side-effect.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            unsafe { self.0.read32(off) }
-        }
-        fn write32(&self, off: u64, val: u32) {
-            // SAFETY: `self.0` is the probe-mapped MMADR BAR owned exclusively
-            // by this driver; `off` is an in-range display register offset and
-            // the write targets a programmable 32-bit register.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            unsafe { self.0.write32(off, val) }
-        }
-    }
-
-    let adapter = MmioAdapter(&gpu.gtt_mmadr);
-    let pipe_a_base = Pipe::A.base();
-    // SAFETY: `gtt_mmadr` is the probe-mapped MMADR BAR; `pipe_a_base +
-    // PIPECONF_OFFSET` is the Pipe A PIPECONF register, in range of the BAR,
-    // and reading it has no side-effect.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let pipeconf = unsafe { gpu.gtt_mmadr.read32(pipe_a_base + PIPECONF_OFFSET) };
-    if pipeconf & PIPECONF_ENABLE == 0 {
-        // Pipe A not enabled by firmware; nothing to take over safely.
-        return None;
-    }
-
-    let plane_base = pipe_a_base + PLANE_PRIMARY_OFFSET;
-    // SAFETY: `gtt_mmadr` is the probe-mapped MMADR BAR; `plane_base +
-    // PLANE_SURF_OFFSET` is the primary plane surface-address register, in
-    // range, read with no side-effect.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let surf = unsafe { gpu.gtt_mmadr.read32(plane_base + PLANE_SURF_OFFSET) };
-    // SAFETY: same BAR; `plane_base + PLANE_STRIDE_OFFSET` is the primary
-    // plane stride register, in range, read with no side-effect.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let stride_val = unsafe { gpu.gtt_mmadr.read32(plane_base + PLANE_STRIDE_OFFSET) };
-
-    let fb = Framebuffer {
-        phys_addr: (surf & !0xFFF) as u64,
-        stride_bytes: stride_val << 6,
-        format: PixelFormat::Xrgb8888,
-    };
-
-    let mut modeset = XeLpgModeset::new(&adapter, XeLpgPort::A);
-    modeset.modeset(&fb, None).ok()
+    let window = crate::intel_gpu_edp::BarWindow(&gpu.gtt_mmadr);
+    crate::intel_gpu_modeset::takeover_display_with(&window, gpu.chip.generation)
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -986,6 +944,36 @@ pub mod tests {
             format: PixelFormat::Xrgb8888,
         }
     }
+
+    fn smoke_mtl_restore_uses_xelpg_sequence() -> TestResult {
+        let fake = MtlFake::new(XeLpgPort::A);
+        let mode = Mode::VESA_1024X768_60;
+        if crate::intel_gpu_modeset::modeset_display(
+            &fake,
+            crate::intel_gpu::Generation::MeteorLake,
+            &test_fb(),
+            Some(&mode),
+        ) != Ok(mode)
+        {
+            return TestResult::Fail("MTL restore must complete through the shared dispatch");
+        }
+        if fake.writes_to(0x6_4040).is_empty() || fake.writes_to(0x6_40e0).is_empty() {
+            return TestResult::Fail("MTL restore must use C10 message bus and port clock");
+        }
+        if fake.writes_to(TRANS_CLK_SEL_A) != [0x1000_0000] {
+            return TestResult::Fail("MTL restore must route PHY A");
+        }
+        for off in [0x16_4280, 0x16_4284, 0x4_6010, 0x6_4000] {
+            if !fake.writes_to(off).is_empty() {
+                return TestResult::Fail("MTL restore must not write Gen12 clock registers");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset_xelpg",
+        smoke_mtl_restore_uses_xelpg_sequence
+    );
 
     fn smoke_mtl_modeset_ddi_a_full_run() -> TestResult {
         let fake = MtlFake::new(XeLpgPort::A);

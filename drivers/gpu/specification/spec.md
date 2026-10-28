@@ -63,6 +63,41 @@ AMD-only configs do not. Neither vendor is offered as a loadable
 module: the module loader exists, but there is no GPU-class
 datapath ABI yet, so the feature gate is the selection mechanism.
 
+The feature split applies to the shared DRM render-node hooks, native AMD
+plane metadata and placement admission, and vendor-specific test helpers
+and registrations. Without AMD, native placement admission is uninhabited;
+generic KMS request decoding, primary planes, EDID and software cursors
+remain available. Intel media and MST modules require `intel`, like the
+rest of that backend. Generic DRM/DP fixtures stay enabled with either or
+both vendors disabled. The registration census has its own test subsystem,
+`drivers/gpu/vendor_features`, for focused boot checks.
+
+### Intel scanout takeover and restore
+
+`intel_gpu_modeset::Modeset::modeset_fixed` and
+`intel_gpu_modeset_xelpg::XeLpgModeset::modeset_fixed` program the
+caller's exact timing without replacing it with an EDID preferred mode.
+Probe takeover and `intel_gpu::relight_display` share generation dispatch:
+Tiger/Alder/Raptor Lake use Gen12; Meteor/Arrow Lake use Xe-LPG; Panther
+Lake refuses programming with `ModesetError::UnsupportedGeneration`.
+This dispatch does not enable Xe-LPG power management, which remains gated.
+`Generation::external_display_supported` admits only Gen12: external
+DP/HDMI/MST sessions, combo HPD enable/poll and the USB-C DP bridge use
+that gate before register access. Meteor/Arrow Lake internal-panel support
+does not admit the Gen12 external port sequence.
+
+The framebuffer's historical `phys_addr` field is a page-aligned 32-bit
+GGTT byte offset. Both display paths reject invalid plane dimensions,
+zero/unaligned/short pitch and surfaces extending past the 32-bit GGTT
+window before changing a live pipeline. An explicit restore uses the
+timing for which its backing allocation was sized.
+Probe allocates an owned internal-panel surface only after takeover of
+an enabled firmware pipe returns a mode. It publishes the owned surface
+to DRM and the framebuffer console only after primary-plane programming;
+panel power alone cannot produce a synthetic active 1024×768 display.
+Native register-model smokes cover these paths; physical scanout and
+suspend/resume acceptance remain separate hardware work.
+
 ### Legacy framebuffers and native mode timing
 
 DCN3.0 DIO scanout explicitly selects `OTG_OUT_MUX = OUT_MUX_DIO` before

@@ -217,6 +217,12 @@ impl Generation {
         )
     }
 
+    /// The external sessions and HPD block currently implement Gen12 only.
+    /// Xe-LPG's internal-panel sequence does not validate these registers.
+    pub const fn external_display_supported(self) -> bool {
+        matches!(self, Generation::TigerLake | Generation::AlderLake)
+    }
+
     /// Whether the backlight PWM install is valid for the
     /// generation. The install programs the Gen12 BXT-style PWM
     /// block; MTL's backlight path is owned by the backlight
@@ -1098,91 +1104,88 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             );
         }
 
-        let width = mode_opt.as_ref().map(|m| m.h_active as u32).unwrap_or(1024);
-        let height = mode_opt.as_ref().map(|m| m.v_active as u32).unwrap_or(768);
-        let stride_bytes = padded_stride_bytes(width);
-        let size_bytes = scanout_size_bytes(width, height);
+        // A powered panel alone does not establish a scanning pipeline.
+        // Allocate and publish only after takeover returned an actual mode.
+        if let Some(mode) = mode_opt {
+            let width = u32::from(mode.h_active);
+            let height = u32::from(mode.v_active);
+            let stride_bytes = padded_stride_bytes(width);
+            let size_bytes = scanout_size_bytes(width, height);
 
-        match if panel_on {
-            Some(crate::intel_gpu_gtt::alloc_contiguous_scanout(
-                &dev.gtt_mmadr,
-                size_bytes,
-            ))
-        } else {
-            None
-        } {
-            Some(Ok(alloc)) => {
-                let phys_base = alloc.phys_base();
-                dev.scanout = Some(ScanoutAllocation {
-                    gtt_offset: alloc.gtt_offset,
-                    phys_base,
-                    order: alloc.order,
-                    size_bytes: alloc.size_bytes,
-                });
-                *dev.active_scanout.lock() = Some(ActiveScanout {
-                    width,
-                    height,
-                    stride_bytes,
-                    gtt_offset: alloc.gtt_offset,
-                    phys_base,
-                });
-                match crate::intel_gpu_pipes::build_primary_plane(
-                    width as u16,
-                    height as u16,
-                    stride_bytes,
-                    alloc.gtt_offset,
-                    crate::intel_gpu_pipes::PixelFormat::Argb8888,
-                ) {
-                    Ok(prog) => {
-                        let plane_base = crate::intel_gpu_pipes::Pipe::A.base()
-                            + crate::intel_gpu_pipes::PLANE_PRIMARY_OFFSET;
-                        // SAFETY: `dev.gtt_mmadr` is the BAR0 region mapped in
-                        // `bring_up`, and we own the device. `plane_base` is
-                        // Pipe A's primary plane block; every offset is a
-                        // known in-range plane register.
-                        // SAFETY: Valid MMIO bounds or trusted driver environment
-                        unsafe {
-                            dev.gtt_mmadr.write32(
-                                plane_base + crate::intel_gpu_pipes::PLANE_STRIDE_OFFSET,
-                                prog.plane_stride,
-                            );
-                            dev.gtt_mmadr.write32(
-                                plane_base + crate::intel_gpu_pipes::PLANE_SIZE_OFFSET,
-                                prog.plane_size,
-                            );
-                            dev.gtt_mmadr.write32(
-                                plane_base + crate::intel_gpu_pipes::PLANE_OFFSET_OFFSET,
-                                prog.plane_offset,
-                            );
-                            dev.gtt_mmadr.write32(
-                                plane_base + crate::intel_gpu_pipes::PLANE_CTL_OFFSET,
-                                prog.plane_ctl,
-                            );
-                            dev.gtt_mmadr.write32(
-                                plane_base + crate::intel_gpu_pipes::PLANE_SURF_OFFSET,
-                                prog.plane_surf,
-                            );
+            match crate::intel_gpu_gtt::alloc_contiguous_scanout(&dev.gtt_mmadr, size_bytes) {
+                Ok(alloc) => {
+                    let phys_base = alloc.phys_base();
+                    dev.scanout = Some(ScanoutAllocation {
+                        gtt_offset: alloc.gtt_offset,
+                        phys_base,
+                        order: alloc.order,
+                        size_bytes: alloc.size_bytes,
+                    });
+                    match crate::intel_gpu_pipes::build_primary_plane(
+                        width as u16,
+                        height as u16,
+                        stride_bytes,
+                        alloc.gtt_offset,
+                        crate::intel_gpu_pipes::PixelFormat::Argb8888,
+                    ) {
+                        Ok(prog) => {
+                            let plane_base = crate::intel_gpu_pipes::Pipe::A.base()
+                                + crate::intel_gpu_pipes::PLANE_PRIMARY_OFFSET;
+                            // SAFETY: `dev.gtt_mmadr` is the BAR0 region mapped in
+                            // `bring_up`, and we own the device. `plane_base` is
+                            // Pipe A's primary plane block; every offset is a
+                            // known in-range plane register.
+                            // SAFETY: Valid MMIO bounds or trusted driver environment
+                            unsafe {
+                                dev.gtt_mmadr.write32(
+                                    plane_base + crate::intel_gpu_pipes::PLANE_STRIDE_OFFSET,
+                                    prog.plane_stride,
+                                );
+                                dev.gtt_mmadr.write32(
+                                    plane_base + crate::intel_gpu_pipes::PLANE_SIZE_OFFSET,
+                                    prog.plane_size,
+                                );
+                                dev.gtt_mmadr.write32(
+                                    plane_base + crate::intel_gpu_pipes::PLANE_OFFSET_OFFSET,
+                                    prog.plane_offset,
+                                );
+                                dev.gtt_mmadr.write32(
+                                    plane_base + crate::intel_gpu_pipes::PLANE_CTL_OFFSET,
+                                    prog.plane_ctl,
+                                );
+                                dev.gtt_mmadr.write32(
+                                    plane_base + crate::intel_gpu_pipes::PLANE_SURF_OFFSET,
+                                    prog.plane_surf,
+                                );
+                            }
+                            compiler_fence(Ordering::SeqCst);
+                            *dev.active_scanout.lock() = Some(ActiveScanout {
+                                width,
+                                height,
+                                stride_bytes,
+                                gtt_offset: alloc.gtt_offset,
+                                phys_base,
+                            });
                         }
-                    }
-                    Err(e) => {
-                        use core::fmt::Write as _;
-                        let _ = writeln!(
+                        Err(e) => {
+                            use core::fmt::Write as _;
+                            let _ = writeln!(
                             narf_console::Writer,
                             "intel-gpu: primary-plane build failed: {:?} ({}x{} stride {}) — scanout allocated but plane not reprogrammed",
                             e, width, height, stride_bytes,
                         );
+                        }
                     }
                 }
-            }
-            Some(Err(e)) => {
-                use core::fmt::Write as _;
-                let _ = writeln!(
+                Err(e) => {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
                     narf_console::Writer,
                     "intel-gpu: scanout allocation failed: {:?} ({}x{} padded stride {}, {} bytes) — display left on firmware surface",
                     e, width, height, stride_bytes, size_bytes,
                 );
+                }
             }
-            None => {}
         }
     } else {
         // PTL: identification is real, but Xe3-LPD is a
@@ -1312,7 +1315,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // generation's display support itself.
     with_controller(|gpu| {
         let window = DpBarWindow(&gpu.gtt_mmadr);
-        crate::intel_gpu_dp::enable_hpd_interrupts(&window);
+        enable_external_hpd(&window, gpu.chip.generation);
     });
     poll_dp_hpd_events();
 
@@ -1373,9 +1376,9 @@ pub fn relight_display(mode: &crate::intel_gpu_modeset::Mode) -> Option<ActiveSc
         format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
     };
     let window = BarWindow(&dev.gtt_mmadr);
-    let applied = crate::intel_gpu_modeset::Modeset::new(&window, crate::intel_gpu_ddi::Ddi::A)
-        .modeset(&fb, Some(mode))
-        .ok()?;
+    let applied =
+        crate::intel_gpu_modeset::modeset_display(&window, dev.chip.generation, &fb, Some(mode))
+            .ok()?;
     let scanout = ActiveScanout {
         width: u32::from(applied.h_active),
         height: u32::from(applied.v_active),
@@ -1555,13 +1558,29 @@ pub fn poll_dp_hpd_events() {
     loop {
         let event = with_controller(|gpu| {
             let window = DpBarWindow(&gpu.gtt_mmadr);
-            crate::intel_gpu_dp::poll_hpd_event(&window)
+            poll_external_hpd(&window, gpu.chip.generation)
         });
         match event {
             Some(Some(event)) => handle_dp_hpd_event(event),
             _ => return,
         }
     }
+}
+
+fn enable_external_hpd<M: crate::intel_gpu_aux::MmioWindow>(mmio: &M, generation: Generation) {
+    if generation.external_display_supported() {
+        crate::intel_gpu_dp::enable_hpd_interrupts(mmio);
+    }
+}
+
+fn poll_external_hpd<M: crate::intel_gpu_aux::MmioWindow>(
+    mmio: &M,
+    generation: Generation,
+) -> Option<crate::intel_gpu_dp::HpdEvent> {
+    if !generation.external_display_supported() {
+        return None;
+    }
+    crate::intel_gpu_dp::poll_hpd_event(mmio)
 }
 
 fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
@@ -1723,7 +1742,7 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
 /// repeat connect event for a live session reuses its pipe.
 fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpConnection> {
     with_controller(|gpu| {
-        if !gpu.chip.generation.display_supported() {
+        if !gpu.chip.generation.external_display_supported() {
             return None;
         }
         let window = DpBarWindow(&gpu.gtt_mmadr);
@@ -1795,7 +1814,7 @@ fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpC
 /// not answer — an HDMI sink never answers AUX.
 fn hdmi_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_hdmi::HdmiConnection> {
     with_controller(|gpu| {
-        if !gpu.chip.generation.display_supported() {
+        if !gpu.chip.generation.external_display_supported() {
             return None;
         }
         let window = DpBarWindow(&gpu.gtt_mmadr);
@@ -1868,7 +1887,7 @@ fn mst_session_ddi() -> Option<crate::intel_gpu_ddi::Ddi> {
 fn mst_connect(ddi: crate::intel_gpu_ddi::Ddi) -> bool {
     use crate::dp_aux::AuxChannel as _;
     let state = with_controller(|gpu| {
-        if !gpu.chip.generation.display_supported() {
+        if !gpu.chip.generation.external_display_supported() {
             return None;
         }
         let window = DpBarWindow(&gpu.gtt_mmadr);
@@ -2223,7 +2242,7 @@ pub mod tests {
     }
     kernel_test_in!("drivers/gpu/intel_gpu", smoke_probe_stride_1366_regression);
 
-    fn smoke_display_gate_is_gen12_only() -> TestResult {
+    fn smoke_display_generation_gates() -> TestResult {
         if !Generation::TigerLake.display_supported() || !Generation::AlderLake.display_supported()
         {
             return TestResult::Fail("Gen12 generations must allow display programming");
@@ -2236,6 +2255,13 @@ pub mod tests {
         }
         if Generation::PantherLake.display_supported() {
             return TestResult::Fail("PTL must skip display programming (Xe3-LPD not modelled)");
+        }
+        if !Generation::TigerLake.external_display_supported()
+            || !Generation::AlderLake.external_display_supported()
+            || Generation::MeteorLake.external_display_supported()
+            || Generation::PantherLake.external_display_supported()
+        {
+            return TestResult::Fail("external display sequences must remain Gen12-only");
         }
         // Backlight stays Gen12-only until the composition lane
         // (PR #1037) lands the MTL PWM path.
@@ -2254,7 +2280,30 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu/intel_gpu", smoke_display_gate_is_gen12_only);
+    kernel_test_in!("drivers/gpu/intel_gpu", smoke_display_generation_gates);
+
+    fn smoke_unsupported_external_hpd_never_touches_mmio() -> TestResult {
+        struct NoAccess;
+        impl crate::intel_gpu_aux::MmioWindow for NoAccess {
+            fn read32(&self, _: u64) -> u32 {
+                panic!("unsupported HPD generation read MMIO")
+            }
+            fn write32(&self, _: u64, _: u32) {
+                panic!("unsupported HPD generation wrote MMIO")
+            }
+        }
+        for generation in [Generation::MeteorLake, Generation::PantherLake] {
+            enable_external_hpd(&NoAccess, generation);
+            if poll_external_hpd(&NoAccess, generation).is_some() {
+                return TestResult::Fail("unsupported HPD generation must report no events");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu",
+        smoke_unsupported_external_hpd_never_touches_mmio
+    );
 
     /// Arrow Lake classification (#1023): the product name says
     /// "new generation", the silicon says Xe-LPG. Linux binds

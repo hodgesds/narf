@@ -235,8 +235,9 @@ impl PixelFormat {
 /// Framebuffer description for the primary plane.
 #[derive(Copy, Clone, Debug)]
 pub struct Framebuffer {
-    /// Physical address of the surface. Must be page-aligned for
-    /// GGTT mapping.
+    /// Page-aligned GGTT byte offset of the surface, as consumed by
+    /// PLANE_SURF. Despite the historical field name, this is not a
+    /// host-physical address; the caller installs the GGTT mapping.
     pub phys_addr: u64,
     /// Stride in bytes. Stage 1 callers compute this from the
     /// mode + format; we validate against the linear-surface
@@ -251,6 +252,8 @@ pub struct Framebuffer {
 /// past <step>" without parsing a wrapped chain.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ModesetError {
+    /// No display programming sequence exists for this generation.
+    UnsupportedGeneration,
     /// EDID readback failed AND no fallback mode was provided.
     EdidUnavailable,
     /// AUX transaction failed during initialization (e.g. panel
@@ -277,9 +280,8 @@ pub enum ModesetError {
     /// not match the transaction (e.g. a wrong-generation PHY
     /// behind the port). The Gen12 path never produces this.
     PhyBusFailure,
-    /// Caller-supplied framebuffer doesn't satisfy Gen12 plane
-    /// alignment (stride must be a multiple of 64 for linear
-    /// surfaces).
+    /// Invalid plane geometry, pitch or GGTT range. Linear pitch must
+    /// be nonzero, 64-byte aligned and cover the active row.
     InvalidFramebuffer,
 }
 
@@ -319,6 +321,7 @@ pub fn to_pll_rate(rate: crate::dp_link_training::LinkRate) -> LinkRate {
 /// (DPLL, DPCLKA routing, BUF_TRANS, training, DDI buffer).
 enum LinkStep {
     Legacy,
+    FixedMode,
     Plan(LinkPlan),
     Trained(crate::dp_link_training::TrainedLink),
 }
@@ -412,6 +415,22 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             primary_fb,
             fallback_mode,
             LinkStep::Legacy,
+            crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST,
+        )
+        .map(|(mode, _)| mode)
+    }
+
+    /// Restore an admitted mode without replacing it with a new EDID mode.
+    /// The caller has sized its scanout allocation for exactly this timing.
+    pub fn modeset_fixed(
+        &mut self,
+        primary_fb: &Framebuffer,
+        mode: &Mode,
+    ) -> Result<Mode, ModesetError> {
+        self.modeset_impl(
+            primary_fb,
+            Some(mode),
+            LinkStep::FixedMode,
             crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST,
         )
         .map(|(mode, _)| mode)
@@ -535,7 +554,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         scrambling: bool,
         high_tmds_char_rate: bool,
     ) -> Result<Mode, ModesetError> {
-        validate_framebuffer(primary_fb)?;
+        validate_framebuffer_mode(primary_fb, mode)?;
         let coeffs = match crate::intel_gpu_pll::hdmi_wrpll_coeffs(
             mode.pixel_clock_khz,
             // Same DSSM-strap family selection as the DP path
@@ -610,11 +629,9 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             _ => None,
         };
 
-        // Step 1: pick the mode. On the plan path the session
-        // layer owns EDID and hands the mode in; on the legacy
-        // path, EDID readback over AUX, falling back to the
-        // caller's fallback mode.
-        let mode = if plan.is_some() || already_trained.is_some() {
+        // Step 1: sessions and resume supply an exact mode. Only legacy
+        // discovery reads EDID and optionally falls back to the caller.
+        let mode = if !matches!(link, LinkStep::Legacy) {
             match fallback_mode {
                 Some(m) => *m,
                 None => return Err(ModesetError::EdidUnavailable),
@@ -628,6 +645,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                 },
             }
         };
+
+        validate_framebuffer_mode(primary_fb, &mode)?;
 
         // Step 2: enable PG1 (the always-required power well).
         // PG0 is power-good from BIOS / pre-boot firmware; we
@@ -1647,15 +1666,67 @@ fn wait_bit<M: MmioWindow + ?Sized>(
 
 fn validate_framebuffer(fb: &Framebuffer) -> Result<(), ModesetError> {
     // Gen12 linear-surface stride must be multiple of 64.
-    if fb.stride_bytes % 64 != 0 {
+    if fb.stride_bytes == 0 || fb.stride_bytes % 64 != 0 {
         return Err(ModesetError::InvalidFramebuffer);
     }
-    // Stride must be at least active-width-times-bpp.
-    if fb.phys_addr & 0xFFF != 0 {
+    // PLANE_SURF carries a page-aligned, 32-bit GGTT offset.
+    if fb.phys_addr & 0xFFF != 0 || fb.phys_addr > u64::from(u32::MAX) {
         // Page alignment for GGTT mapping.
         return Err(ModesetError::InvalidFramebuffer);
     }
     Ok(())
+}
+
+/// Validate the plane before either orchestrator disables a live pipeline.
+pub(crate) fn validate_framebuffer_mode(fb: &Framebuffer, mode: &Mode) -> Result<(), ModesetError> {
+    validate_framebuffer(fb)?;
+    if fb.stride_bytes < u32::from(mode.h_active) * 4 {
+        return Err(ModesetError::InvalidFramebuffer);
+    }
+    let end = fb.phys_addr + u64::from(fb.stride_bytes) * u64::from(mode.v_active);
+    if end > 1u64 << 32 {
+        return Err(ModesetError::InvalidFramebuffer);
+    }
+    crate::intel_gpu_pipes::build_primary_plane(
+        mode.h_active,
+        mode.v_active,
+        fb.stride_bytes,
+        fb.phys_addr as u32,
+        crate::intel_gpu_pipes::PixelFormat::Argb8888,
+    )
+    .map_err(|_| ModesetError::InvalidFramebuffer)?;
+    Ok(())
+}
+
+/// Internal-panel modeset dispatch shared by takeover and resume.
+/// `Some(mode)` restores exactly that timing; `None` discovers it over AUX.
+pub(crate) fn modeset_display<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    generation: crate::intel_gpu::Generation,
+    fb: &Framebuffer,
+    mode: Option<&Mode>,
+) -> Result<Mode, ModesetError> {
+    use crate::intel_gpu::Generation;
+    match generation {
+        Generation::TigerLake | Generation::AlderLake => {
+            let mut ms = Modeset::new(mmio, Ddi::A);
+            match mode {
+                Some(mode) => ms.modeset_fixed(fb, mode),
+                None => ms.modeset(fb, None),
+            }
+        }
+        Generation::MeteorLake => {
+            let mut ms = crate::intel_gpu_modeset_xelpg::XeLpgModeset::new(
+                mmio,
+                crate::intel_gpu_xelpg::XeLpgPort::A,
+            );
+            match mode {
+                Some(mode) => ms.modeset_fixed(fb, mode),
+                None => ms.modeset(fb, None),
+            }
+        }
+        Generation::PantherLake => Err(ModesetError::UnsupportedGeneration),
+    }
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -1728,6 +1799,139 @@ pub mod tests {
             self.writes.borrow_mut().push((off, val));
         }
     }
+
+    fn smoke_takeover_requires_enabled_firmware_pipe() -> TestResult {
+        for generation in [
+            crate::intel_gpu::Generation::TigerLake,
+            crate::intel_gpu::Generation::AlderLake,
+            crate::intel_gpu::Generation::MeteorLake,
+            crate::intel_gpu::Generation::PantherLake,
+        ] {
+            let mmio = FakeMmio::new();
+            if takeover_display_with(&mmio, generation).is_some() {
+                return TestResult::Fail("disabled firmware pipe must not produce a mode");
+            }
+            if !mmio.writes.borrow().is_empty() {
+                return TestResult::Fail("disabled firmware pipe must not be programmed");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_takeover_requires_enabled_firmware_pipe
+    );
+
+    fn smoke_display_dispatch_rejects_unmodelled_generation() -> TestResult {
+        struct NoMmio;
+        impl MmioWindow for NoMmio {
+            fn read32(&self, _: u64) -> u32 {
+                panic!("unsupported generation touched MMIO")
+            }
+            fn write32(&self, _: u64, _: u32) {
+                panic!("unsupported generation touched MMIO")
+            }
+        }
+        if modeset_display(
+            &NoMmio,
+            crate::intel_gpu::Generation::PantherLake,
+            &fb_1080p(),
+            Some(&Mode::VESA_1024X768_60),
+        ) != Err(ModesetError::UnsupportedGeneration)
+        {
+            return TestResult::Fail("Panther Lake must refuse display programming");
+        }
+        if takeover_display_with(&NoMmio, crate::intel_gpu::Generation::PantherLake).is_some() {
+            return TestResult::Fail("Panther Lake must refuse takeover");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_display_dispatch_rejects_unmodelled_generation
+    );
+
+    fn smoke_fixed_modeset_rejects_invalid_surface_before_mmio() -> TestResult {
+        let valid = Framebuffer {
+            phys_addr: 0x100_0000,
+            stride_bytes: 4096,
+            format: PixelFormat::Xrgb8888,
+        };
+        let mode = Mode::VESA_1024X768_60;
+        // Zero/short/misaligned pitch, misaligned or truncated GGTT address,
+        // and a valid base whose pitched surface crosses the 32-bit window.
+        for fb in [
+            Framebuffer {
+                stride_bytes: 0,
+                ..valid
+            },
+            Framebuffer {
+                stride_bytes: 4032,
+                ..valid
+            },
+            Framebuffer {
+                stride_bytes: 4097,
+                ..valid
+            },
+            Framebuffer {
+                phys_addr: 0x100_0001,
+                ..valid
+            },
+            Framebuffer {
+                phys_addr: 0x1_0000_0000,
+                ..valid
+            },
+            Framebuffer {
+                phys_addr: 0xffff_f000,
+                ..valid
+            },
+        ] {
+            for generation in [
+                crate::intel_gpu::Generation::TigerLake,
+                crate::intel_gpu::Generation::AlderLake,
+                crate::intel_gpu::Generation::MeteorLake,
+            ] {
+                let mmio = FakeMmio::new();
+                if modeset_display(&mmio, generation, &fb, Some(&mode))
+                    != Err(ModesetError::InvalidFramebuffer)
+                    || !mmio.writes.borrow().is_empty()
+                {
+                    return TestResult::Fail("invalid surface must fail before display writes");
+                }
+            }
+        }
+        for mode in [
+            Mode {
+                h_active: 0,
+                ..mode
+            },
+            Mode {
+                v_active: 0,
+                ..mode
+            },
+            Mode {
+                v_active: 8193,
+                ..mode
+            },
+        ] {
+            let mmio = FakeMmio::new();
+            if modeset_display(
+                &mmio,
+                crate::intel_gpu::Generation::TigerLake,
+                &valid,
+                Some(&mode),
+            ) != Err(ModesetError::InvalidFramebuffer)
+                || !mmio.writes.borrow().is_empty()
+            {
+                return TestResult::Fail("unencodable plane geometry must fail before writes");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_fixed_modeset_rejects_invalid_surface_before_mmio
+    );
 
     fn smoke_pwr_well_req_state_bits_match_i915() -> TestResult {
         // PG1 (idx=0) — request bit 1, state bit 0.
@@ -2752,6 +2956,39 @@ pub mod tests {
         }
     }
 
+    fn smoke_gen12_restore_keeps_allocated_mode() -> TestResult {
+        for generation in [
+            crate::intel_gpu::Generation::TigerLake,
+            crate::intel_gpu::Generation::AlderLake,
+        ] {
+            // The sink advertises 1920x1080, but resume owns a 1024x768
+            // allocation. EDID must not silently enlarge that scanout.
+            let mmio = ScriptedSinkMmio::new(1 << 29);
+            let fb = Framebuffer {
+                stride_bytes: 4096,
+                ..fb_1080p()
+            };
+            let mode = Mode::VESA_1024X768_60;
+            if modeset_display(&mmio, generation, &fb, Some(&mode)) != Ok(mode) {
+                return TestResult::Fail("resume must retain the allocation's exact mode");
+            }
+            if mmio.writes_to(0x70190).last() != Some(&0x02ff_03ff) {
+                return TestResult::Fail("restored plane must be 1024x768");
+            }
+            if mmio
+                .writes_to(crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0)
+                .is_empty()
+            {
+                return TestResult::Fail("Gen12 resume must program the combo DPLL");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_gen12_restore_keeps_allocated_mode
+    );
+
     fn smoke_modeset_full_run_scripted_sink() -> TestResult {
         // DSSM strap: 19.2 MHz (field 1).
         let mmio = ScriptedSinkMmio::new(1 << 29);
@@ -2899,81 +3136,33 @@ pub mod tests {
 /// Attempt to take over the display from UEFI GOP without disrupting
 /// the existing framebuffer mapping.
 pub fn takeover_display(gpu: &crate::intel_gpu::IntelGpu) -> Option<Mode> {
-    // Generation dispatch (#1016): Meteor Lake's display engine
-    // is Xe-LPG, not Gen12 — running this module's sequence on it
-    // was the defect lane Q10 closes. The dispatch lives at the
-    // single takeover entry so the Gen12 body below stays
-    // byte-identical for Gen12 silicon. Panther Lake (Xe3-LPD)
-    // remains gated off in `display_supported` and never reaches
-    // here.
-    if matches!(
-        gpu.chip.generation,
-        crate::intel_gpu::Generation::MeteorLake
-    ) {
-        return crate::intel_gpu_modeset_xelpg::takeover_display(gpu);
-    }
-    use crate::intel_gpu_aux::MmioWindow;
-    use crate::intel_gpu_ddi::Ddi;
+    let window = crate::intel_gpu_edp::BarWindow(&gpu.gtt_mmadr);
+    takeover_display_with(&window, gpu.chip.generation)
+}
+
+/// Take over only an enabled firmware pipe, using its current surface.
+pub(crate) fn takeover_display_with<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    generation: crate::intel_gpu::Generation,
+) -> Option<Mode> {
     use crate::intel_gpu_pipes::{
         Pipe, PIPECONF_ENABLE, PIPECONF_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_STRIDE_OFFSET,
         PLANE_SURF_OFFSET,
     };
-    use narf_bus::bar::MmioRegion;
-
-    struct MmioAdapter<'a>(&'a MmioRegion);
-    impl<'a> MmioWindow for MmioAdapter<'a> {
-        fn read32(&self, off: u64) -> u32 {
-            // SAFETY: `self.0` is the GPU's MMADR BAR window mapped by the
-            // probe; `off` is a register offset within that BAR supplied by the
-            // modeset code, and a 32-bit display register read has no
-            // unwanted read side-effect.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            unsafe { self.0.read32(off) }
-        }
-        fn write32(&self, off: u64, val: u32) {
-            // SAFETY: `self.0` is the probe-mapped MMADR BAR owned exclusively
-            // by this driver; `off` is an in-range display register offset and
-            // the write targets a programmable 32-bit register.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            unsafe { self.0.write32(off, val) }
-        }
-    }
-
-    let adapter = MmioAdapter(&gpu.gtt_mmadr);
-    let mut modeset = Modeset::new(&adapter, Ddi::A);
-
-    // Read the existing GOP framebuffer offset from Pipe A.
-    let pipe_a_base = Pipe::A.base();
-    // SAFETY: `gtt_mmadr` is the probe-mapped MMADR BAR; `pipe_a_base +
-    // PIPECONF_OFFSET` is the Pipe A PIPECONF register, in range of the BAR,
-    // and reading it has no side-effect.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let pipeconf = unsafe { gpu.gtt_mmadr.read32(pipe_a_base + PIPECONF_OFFSET) };
-    if pipeconf & PIPECONF_ENABLE == 0 {
-        // Pipe A not enabled by firmware; nothing to take over safely.
+    if !generation.display_supported() {
         return None;
     }
-
-    let plane_base = pipe_a_base + PLANE_PRIMARY_OFFSET;
-    // SAFETY: `gtt_mmadr` is the probe-mapped MMADR BAR; `plane_base +
-    // PLANE_SURF_OFFSET` is the primary plane surface-address register, in
-    // range of the BAR, and the read has no side-effect.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let surf = unsafe { gpu.gtt_mmadr.read32(plane_base + PLANE_SURF_OFFSET) };
-    // SAFETY: same BAR; `plane_base + PLANE_STRIDE_OFFSET` is the primary
-    // plane stride register, in range, read with no side-effect.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let stride_val = unsafe { gpu.gtt_mmadr.read32(plane_base + PLANE_STRIDE_OFFSET) };
-
+    let pipe_base = Pipe::A.base();
+    if mmio.read32(pipe_base + PIPECONF_OFFSET) & PIPECONF_ENABLE == 0 {
+        return None;
+    }
+    let plane_base = pipe_base + PLANE_PRIMARY_OFFSET;
+    let surf = mmio.read32(plane_base + PLANE_SURF_OFFSET);
+    let stride = mmio.read32(plane_base + PLANE_STRIDE_OFFSET);
     let fb = Framebuffer {
-        phys_addr: (surf & !0xFFF) as u64,
-        stride_bytes: stride_val << 6,
+        phys_addr: u64::from(surf & !0xFFF),
+        stride_bytes: stride.checked_mul(64)?,
         format: PixelFormat::Xrgb8888,
     };
-
-    // Single modeset run. Before lane 1 (#1010) this called
-    // `modeset()` twice — discarding the first result and running
-    // the full DPLL + link-training sequence a second time on
-    // hardware that had just been programmed.
-    modeset.modeset(&fb, None).ok()
+    modeset_display(mmio, generation, &fb, None).ok()
 }
