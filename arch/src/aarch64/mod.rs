@@ -30,6 +30,7 @@ pub mod rme;
 pub mod rndr;
 pub mod sctlr2;
 pub mod sme;
+pub mod smccc;
 pub mod smmuv3;
 pub mod spe;
 pub mod specres;

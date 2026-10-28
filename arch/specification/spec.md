@@ -116,6 +116,25 @@ pub unsafe fn aarch64::sysreg::read_ttbr0_el1() -> u64;
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn aarch64::sysreg::write_ttbr0_el1(value: u64);
 
+/// Full-register SMCCC conduit (DEN0028E §2.6) for SiP firmware services
+/// that use more than `x0..x3` (Qualcomm SCM: `x1` arginfo, `x2..x5`
+/// values, `x6` session word returned on a retried call). `regs` carries
+/// `x0..x7` in and out; `x8..x17` are clobbered; the asm is not `nomem`
+/// and is bracketed by `compiler_fence(SeqCst)` (§4). `psci::smc`/`hvc`
+/// remain the 4-register PSCI helpers.
+#[cfg(target_arch = "aarch64")]
+pub mod aarch64::smccc {
+    pub const FAST_CALL: u32;   // x0 bit 31
+    pub const SMC64: u32;       // x0 bit 30
+    pub const OWNER_SHIFT: u32; // 24
+    pub const OWNER_CPU: u32;
+    pub const OWNER_SIP: u32;
+    pub const OWNER_STANDARD: u32;
+    pub const fn call_val(fast: bool, smc64: bool, owner: u32, function: u32) -> u32;
+    pub unsafe fn smc_call(regs: &mut [u64; 8]);
+    pub unsafe fn hvc_call(regs: &mut [u64; 8]);
+}
+
 /// FSGSBASE is enabled independently on every supporting CPU before EL0 runs.
 /// The accessors use RDFSBASE/WRFSBASE only when the current CPU's CR4 cache
 /// confirms the enable bit and otherwise use the architectural MSR fallback.
