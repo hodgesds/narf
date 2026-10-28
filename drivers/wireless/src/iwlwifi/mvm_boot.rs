@@ -224,6 +224,7 @@ pub(super) use phy::local_ht;
 mod power;
 pub type PowerRequest = power::PowerRequest;
 pub type PowerStatus = power::PowerStatus;
+pub(super) use power::feature as feature_bits;
 pub(super) use power::Emission as PowerEmission;
 
 #[path = "mvm_link.rs"]
@@ -243,6 +244,10 @@ pub type AssociationSecurity = narf_wireless::association::SecurityMode;
 mod data;
 pub type LegacyDataStatus = data::LegacyDataStatus;
 pub type LegacyReceive = data::LegacyReceive;
+#[cfg(any(test, feature = "kernel-test"))]
+pub(super) mod data_priority {
+    pub(in crate::iwlwifi) use super::data::{admitted_priority, user_priority};
+}
 
 #[path = "mvm_security.rs"]
 mod rsna;

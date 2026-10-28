@@ -22,12 +22,51 @@ const REDUCE_TX_POWER: u8 = 0x9f;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(in crate::iwlwifi) enum Emission {
     #[default]
-    Legacy = 1,
-    Ht20 = 2,
+    Legacy,
+    Ht20,
     /// Firmware-managed TID0 aggregation and recipient autonomous Block Ack.
-    Ht20Ba = 3,
+    Ht20Ba,
     /// The tag3 program plus negotiated nested recipient A-MSDU-in-A-MPDU.
-    Ht20NestedBa = 4,
+    Ht20NestedBa,
+    /// Generic feature program (tag5): the tag2 HT20/SISO/WMM base plus
+    /// exactly the [`feature`] bits it names. Each distinct bit set is its
+    /// own externally qualified program, bound by name, binding domain and
+    /// record bytes 62..64; one set never authorizes another.
+    Features(u16),
+}
+
+/// Emitting-feature bits of a tag5 program.
+pub(in crate::iwlwifi) mod feature {
+    /// Firmware-managed TID0 TX BA pipeline and recipient BA (tag3 set).
+    pub const BA: u16 = 1 << 0;
+    /// Negotiated nested recipient A-MSDU-in-A-MPDU (tag4 set).
+    pub const NESTED_BA: u16 = 1 << 1;
+    /// Per-TID QoS data queues for all eight TIDs / four access categories.
+    pub const QOS_TIDS: u16 = 1 << 2;
+    /// Every bit this driver can emit; other bits are refused.
+    pub const KNOWN: u16 = BA | NESTED_BA | QOS_TIDS;
+}
+
+impl Emission {
+    /// NIPW record byte 46.
+    pub(in crate::iwlwifi) fn tag(self) -> u8 {
+        match self {
+            Emission::Legacy => 1,
+            Emission::Ht20 => 2,
+            Emission::Ht20Ba => 3,
+            Emission::Ht20NestedBa => 4,
+            Emission::Features(_) => 5,
+        }
+    }
+    /// Feature bits granted by this program (tag3/4 imply their BA bits).
+    pub(in crate::iwlwifi) fn features(self) -> u16 {
+        match self {
+            Emission::Legacy | Emission::Ht20 => 0,
+            Emission::Ht20Ba => feature::BA,
+            Emission::Ht20NestedBa => feature::BA | feature::NESTED_BA,
+            Emission::Features(bits) => bits,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,11 +143,16 @@ impl Prepared {
 }
 
 fn request(binding: [u8; 32], mac: [u8; 6], emission: Emission) -> PowerRequest {
+    let features;
     let program = match emission {
         Emission::Legacy => "mvm-api77-power-v1",
         Emission::Ht20 => "mvm-api77-ht20-siso-wmm-power-v2",
         Emission::Ht20Ba => "mvm-api77-ht20-siso-wmm-ba-power-v3",
         Emission::Ht20NestedBa => "mvm-api77-ht20-siso-wmm-nested-ba-power-v4",
+        Emission::Features(bits) => {
+            features = format!("mvm-api77-ht20-siso-wmm-features-{bits:04x}-power-v5");
+            &features
+        }
     };
     PowerRequest {
         name: format!(
@@ -161,6 +205,14 @@ pub(super) fn validate_record(
     emission: Emission,
 ) -> Result<Values, &'static str> {
     let bytes = &source.bytes;
+    if let Emission::Features(bits) = emission {
+        if bits == 0
+            || bits & !feature::KNOWN != 0
+            || bits & feature::NESTED_BA != 0 && bits & feature::BA == 0
+        {
+            return Err("MVM feature program names an unsupported emission set");
+        }
+    }
     if !source.current() || source.signer.is_none() {
         return Err("MVM platform power qualification is unsigned or revoked");
     }
@@ -169,8 +221,12 @@ pub(super) fn validate_record(
         || bytes[4..8] != [1, 0, RECORD_LEN as u8, 0]
         || bytes[8..40] != binding
         || bytes[40..46] != mac
-        || bytes[46..48] != [emission as u8, 0]
-        || bytes[62..64] != [0; 2]
+        || bytes[46..48] != [emission.tag(), 0]
+        || bytes[62..64]
+            != match emission {
+                Emission::Features(bits) => bits.to_le_bytes(),
+                _ => [0; 2],
+            }
     {
         return Err("MVM platform power qualification format or identity mismatch");
     }
@@ -360,7 +416,13 @@ impl Owner {
             Emission::Ht20NestedBa => {
                 &b"NARF Intel MVM API77 qualified HT20 SISO MCS0-7 SGI20 WMM-BE TID0 TX-BA pipeline8 RX-BA32 nested-AMSDU3839 control power v4"[..]
             }
+            Emission::Features(_) => {
+                &b"NARF Intel MVM API77 qualified HT20 SISO MCS0-7 SGI20 WMM feature program power v5"[..]
+            }
         });
+        if let Emission::Features(bits) = emission {
+            hash.update(&bits.to_le_bytes());
+        }
         hash.update(&facts);
         hash.update(&mac);
         hash.update(&nvm.tx_chains.to_le_bytes());

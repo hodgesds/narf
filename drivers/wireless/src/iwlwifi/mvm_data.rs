@@ -44,11 +44,65 @@ pub enum LegacyReceive {
 pub(super) struct Prepared {
     pub(super) status: AssociationStatus,
     pub(super) queue: Option<u16>,
+    /// DQA queues for TIDs 1..=7 under a tag5 `QOS_TIDS` program (index 0
+    /// unused; TID0 keeps `queue`). Linux `iwl_mvm_sta_alloc_queue`.
+    pub(super) tid_queues: [Option<u16>; 8],
+    /// Per-TID QoS sequence counters for TIDs 1..=7 (TID0 uses `sequence`).
+    pub(super) tid_sequences: [u16; 8],
     pub(super) port_open: bool,
     pub(super) sequence: u16,
     pub(super) replay: frame_api::Replay,
     pub(super) last_peer: u64,
     pub(super) aggregate: super::amsdu::Receiver,
+}
+
+/// 802.1D user priority of an Ethernet frame, as Linux
+/// `net/wireless/util.c::cfg80211_classify8021d` derives it from the IPv4
+/// TOS / IPv6 traffic-class DSCP (RFC 8325 mapping).
+pub(in crate::iwlwifi) fn user_priority(ethernet: &[u8]) -> u8 {
+    let dscp = match ethernet.get(12..14) {
+        Some([8, 0]) if ethernet.len() >= 34 && ethernet[14] >> 4 == 4 => ethernet[15] & 0xfc,
+        Some([0x86, 0xdd]) if ethernet.len() >= 54 && ethernet[14] >> 4 == 6 => {
+            ((ethernet[14] & 0xf) << 4 | ethernet[15] >> 4) & 0xfc
+        }
+        _ => return 0,
+    };
+    match dscp >> 2 {
+        10 | 12 | 14 | 16 => 0, // AF11-13, CS2
+        18 | 20 | 22 => 3,      // AF21-23
+        24 => 4,                // CS3
+        40 => 5,                // CS5
+        44 | 46 => 6,           // VOICE-ADMIT, EF
+        48 => 7,                // CS6
+        _ => dscp >> 5,
+    }
+}
+
+/// Apply WMM admission control like `net/mac80211/wme.c::
+/// ieee80211_downgrade_queue`: an AC requiring ACM (which this station
+/// never negotiates) downgrades VO->VI->BE->BK; BK is the floor.
+pub(in crate::iwlwifi) fn admitted_priority(
+    wmm: &narf_wireless::wmm::Parameters,
+    mut up: u8,
+) -> u8 {
+    loop {
+        // WMM ACI: BE=0, BK=1, VI=2, VO=3.
+        let aci = match up {
+            1 | 2 => 1,
+            4 | 5 => 2,
+            6 | 7 => 3,
+            _ => 0,
+        };
+        if !wmm.ac[aci].admission_control {
+            return up;
+        }
+        up = match up {
+            6 | 7 => 5,
+            4 | 5 => 3,
+            0 | 3 => 2,
+            _ => return up,
+        };
+    }
 }
 
 fn edca(local: [u8; 6], use_11b: bool) -> [u8; 208] {
@@ -262,6 +316,8 @@ impl Owner {
         self.power.prepared.as_mut().unwrap().mlme.data = Some(Prepared {
             status: association,
             queue: None,
+            tid_queues: [None; 8],
+            tid_sequences: [0; 8],
             port_open: false,
             sequence: 0,
             replay: frame_api::Replay::default(),
@@ -329,6 +385,31 @@ impl Owner {
             .unwrap()
             .queue = Some(id);
         self.check_link_power(&policy()?)?;
+        if self.qos_tids() {
+            for tid in 1..8u8 {
+                let id = {
+                    let power = self.power.prepared.as_ref().unwrap();
+                    let mut allocation = pin!(self.hardware.allocate_tx(STATION, tid));
+                    poll_fn(|cx| {
+                        if let Err(e) = policy().and_then(|p| power.check_applied(&p)) {
+                            return Poll::Ready(Err(e));
+                        }
+                        allocation.as_mut().poll(cx)
+                    })
+                    .await?
+                };
+                self.power
+                    .prepared
+                    .as_mut()
+                    .unwrap()
+                    .mlme
+                    .data
+                    .as_mut()
+                    .unwrap()
+                    .tid_queues[usize::from(tid)] = Some(id);
+                self.check_link_power(&policy()?)?;
+            }
+        }
         self.hardware.discard_key_transition_rx()?;
         if !self
             .power
@@ -366,6 +447,27 @@ impl Owner {
         // TX-disable and has no caller flag/key/RSNA-completion shortcut.
         data.port_open = !data.status.protected;
         Ok(())
+    }
+
+    /// Per-TID QoS queues are granted only by an applied tag5 program with
+    /// `QOS_TIDS` on a negotiated WMM link.
+    pub(super) fn qos_tids(&self) -> bool {
+        self.power.phy.negotiated.is_some()
+            && self
+                .power
+                .prepared
+                .as_ref()
+                .is_some_and(|p| p.emission.features() & super::power::feature::QOS_TIDS != 0)
+    }
+
+    /// Native TID for an ordinary Ethernet frame: its admitted 802.1D
+    /// priority under `QOS_TIDS`, otherwise BE/TID0.
+    pub(in crate::iwlwifi) fn data_tid(&self, ethernet: &[u8]) -> u8 {
+        if !self.qos_tids() {
+            return 0;
+        }
+        let wmm = self.power.phy.negotiated.as_ref().unwrap().wmm;
+        admitted_priority(&wmm, user_priority(ethernet))
     }
 
     pub(super) fn data_failed<T>(&mut self, error: &'static str) -> Result<T, &'static str> {
@@ -421,6 +523,8 @@ impl Owner {
         if ethernet.get(12..14) == Some(&[0x88, 0x8e]) {
             return Err("MVM ordinary data producer cannot submit EAPOL");
         }
+        let qos = self.power.phy.negotiated.is_some();
+        let tid = self.data_tid(ethernet);
         let data = self
             .power
             .prepared
@@ -430,15 +534,24 @@ impl Owner {
             .data
             .as_mut()
             .unwrap();
-        let qos = self.power.phy.negotiated.is_some();
+        let queue = if tid == 0 {
+            status.queue
+        } else {
+            data.tid_queues[usize::from(tid)].ok_or("MVM QoS TID queue missing")?
+        };
+        let sequence = if tid == 0 {
+            data.sequence
+        } else {
+            data.tid_sequences[usize::from(tid)]
+        };
         let frame = if qos {
             frame_api::transmit_qos(
                 self.mac.unwrap(),
                 status.bssid,
-                data.sequence,
+                sequence,
                 ethernet,
                 status.protected,
-                0,
+                tid,
             )
         } else {
             frame_api::transmit(
@@ -450,14 +563,19 @@ impl Owner {
             )
         }
         .ok_or("invalid MVM legacy Ethernet frame")?;
-        data.sequence = data.sequence.wrapping_add(1) & 0xfff;
+        if tid == 0 {
+            data.sequence = data.sequence.wrapping_add(1) & 0xfff;
+        } else {
+            let next = &mut data.tid_sequences[usize::from(tid)];
+            *next = next.wrapping_add(1) & 0xfff;
+        }
         self.phase = Phase::TransmittingData;
         let result = async {
             self.fresh_data_policy(&mut policy).await?;
             {
                 let power = self.power.prepared.as_ref().unwrap();
                 let mut tx = pin!(self.hardware.transmit_assisted(
-                    status.queue,
+                    queue,
                     &frame,
                     if qos { 26 } else { 24 },
                     None,
@@ -472,7 +590,7 @@ impl Owner {
                 .await?;
             }
             self.check_link_power(&policy()?)?;
-            if !self.hardware.idle_tx_binding(status.queue, STATION, TID) {
+            if !self.hardware.idle_tx_binding(queue, STATION, tid) {
                 return Err("MVM data completion left outstanding DMA");
             }
             Ok(())
@@ -509,6 +627,10 @@ impl Owner {
             return Err("MVM BA port not authorized");
         }
         let local = self.mac.unwrap();
+        if packets.iter().any(|(packet, _)| self.data_tid(packet) != 0) {
+            return Err("MVM BA batch carries only BE/TID0 packets");
+        }
+        let mut frames = Vec::with_capacity(packets.len());
         let data = self
             .power
             .prepared
@@ -518,7 +640,6 @@ impl Owner {
             .data
             .as_mut()
             .unwrap();
-        let mut frames = Vec::with_capacity(packets.len());
         for (packet, assist) in packets {
             if packet.get(12..14) == Some(&[0x88, 0x8e]) {
                 return Err("MVM batch cannot carry EAPOL");
@@ -856,7 +977,28 @@ impl Owner {
             }
             self.remove_security_keys().await?;
             self.hardware.discard_key_transition_rx()?;
-            self.hardware.remove_idle_tx(queue, STATION, TID).await
+            self.hardware.remove_idle_tx(queue, STATION, TID).await?;
+            for tid in 1..8u8 {
+                let extra = self
+                    .power
+                    .prepared
+                    .as_ref()
+                    .and_then(|p| p.mlme.data.as_ref())
+                    .and_then(|d| d.tid_queues[usize::from(tid)]);
+                if let Some(extra) = extra {
+                    self.hardware.remove_idle_tx(extra, STATION, tid).await?;
+                    self.power
+                        .prepared
+                        .as_mut()
+                        .unwrap()
+                        .mlme
+                        .data
+                        .as_mut()
+                        .unwrap()
+                        .tid_queues[usize::from(tid)] = None;
+                }
+            }
+            Ok(())
         }
         .await;
         match result {

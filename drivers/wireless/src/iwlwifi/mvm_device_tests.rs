@@ -165,6 +165,10 @@ struct Actor {
     deauths: Vec<(usize, Vec<u8>)>,
     deauth_status: u8,
     hold_deauth: bool,
+    /// Tag5 QOS_TIDS fixture: DQA queues 25..=31 for TIDs 1..=7.
+    qos_tids: bool,
+    /// Independent receiver view of Open QoS data: (TID, queue, Ethernet).
+    tid_frames: Vec<(u8, u16, Vec<u8>)>,
 }
 // SAFETY: fixture-only device-side pointers refer to the retained Owner's
 // posted coherent buffers. CURRENT retains both endpoints; every device-side
@@ -533,10 +537,17 @@ impl Actor {
                     vec![]
                 }
                 (5, 0x17) => {
-                    if b.len() != 36 || b[4..8] != [1, 0, 0, 0] || !matches!(b[8], 0 | 15) {
+                    if b.len() != 36
+                        || b[4..8] != [1, 0, 0, 0]
+                        || !(matches!(b[8], 0 | 15) || self.qos_tids && (1..8).contains(&b[8]))
+                    {
                         return Err("MVM native queue identity/extent");
                     }
-                    let id = if b[8] == 15 { 23u16 } else { 24u16 };
+                    let id = if b[8] == 15 {
+                        23u16
+                    } else {
+                        24 + u16::from(b[8])
+                    };
                     if b[0] == 0 {
                         if b[8] == 0 {
                             self.data_added = true;
@@ -590,7 +601,9 @@ impl Actor {
             self.reply(c, if g == 1 && c == 0x18 { 0 } else { g }, s, body);
             return Ok(());
         }
-        if !matches!(p.queue, 23 | 24) || p.bytes.len() < 48 {
+        if !(matches!(p.queue, 23 | 24) || self.qos_tids && (25..32).contains(&p.queue))
+            || p.bytes.len() < 48
+        {
             return Err("MVM native interface packet queue/header");
         }
         let frame = &p.bytes[24..];
@@ -687,13 +700,19 @@ impl Actor {
         } else {
             let mut frame = frame.to_vec();
             let header = if self.ht { 26 } else { 24 };
+            let mut tid = 0;
             if self.ht {
-                if frame.get(26..28) != Some(&[0, 0]) || frame.get(24..26) != Some(&[0, 0]) {
+                tid = frame.get(24).copied().unwrap_or(0xff);
+                if frame.get(26..28) != Some(&[0, 0])
+                    || frame.get(25) != Some(&0)
+                    || tid > 7
+                    || tid != 0 && !self.qos_tids
+                {
                     return Err("Open QoS padding/TID");
                 }
                 frame.drain(26..28);
             }
-            if p.queue != 24
+            if p.queue != 24 + u16::from(tid)
                 || frame[0..2] != [if self.ht { 0x88 } else { 8 }, 1]
                 || frame[4..10] != AP
                 || frame[10..16] != OWN
@@ -705,7 +724,12 @@ impl Actor {
             ethernet.extend_from_slice(&OWN);
             ethernet.extend_from_slice(&frame[header + 6..]);
             self.security.data.push(ethernet.clone());
-            if self.ba && self.tx_ba_enabled {
+            if self.qos_tids {
+                self.tid_frames.push((tid, p.queue, ethernet.clone()));
+            }
+            if tid != 0 {
+                self.firmware.tx_complete(p.queue, p.pointer);
+            } else if self.ba && self.tx_ba_enabled {
                 self.batch_dma.push((p.dma_base, p.pointer));
                 self.batch.push(p.pointer);
             } else {
@@ -801,6 +825,18 @@ impl Harness {
         ba: bool,
         ml_baid: bool,
     ) -> Result<Self, &'static str> {
+        Self::build_features(protected, ht, emission, tlc_version, ba, ml_baid, 0)
+    }
+    /// `emission == 5` stages a tag5 feature program for exactly `features`.
+    fn build_features(
+        protected: bool,
+        ht: bool,
+        emission: u8,
+        tlc_version: u8,
+        ba: bool,
+        ml_baid: bool,
+        features: u16,
+    ) -> Result<Self, &'static str> {
         if CURRENT.lock().is_some() {
             return Err("MVM interface fixture already owned");
         }
@@ -868,6 +904,8 @@ impl Harness {
             deauths: Vec::new(),
             deauth_status: 1,
             hold_deauth: false,
+            qos_tids: features & super::super::mvm_boot::feature_bits::QOS_TIDS != 0,
+            tid_frames: Vec::new(),
         };
         {
             let mut configure = Box::pin(owner.model_configure());
@@ -888,6 +926,9 @@ impl Harness {
         let source = owner.station_source(executable.cap, true);
         let mut limits = power();
         limits[46] = emission;
+        if emission == 5 {
+            limits[62..64].copy_from_slice(&features.to_le_bytes());
+        }
         let signed = asset("narf-test/mvm-interface/power", &limits, true)?;
         let cap = signed.cap;
         let digest = signed.digest;
@@ -926,6 +967,9 @@ impl Harness {
                 };
                 if emission == 4 {
                     owner.select_nested_power(&asset, BINDING)?;
+                }
+                if emission == 5 {
+                    owner.select_feature_power(&asset, BINDING, features)?;
                 }
                 Ok((asset, BINDING))
             }),
@@ -1762,6 +1806,8 @@ kernel_test_in!(
 mod ba_tests;
 #[path = "mvm_ht_tests.rs"]
 mod ht_tests;
+#[path = "mvm_qos_tests.rs"]
+mod qos_tests;
 #[path = "mvm_reconnect_tests.rs"]
 mod reconnect_tests;
 #[path = "mvm_recovery_tests.rs"]

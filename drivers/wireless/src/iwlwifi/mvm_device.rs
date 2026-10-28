@@ -50,6 +50,21 @@ impl Environment {
                 let authority = narf_firmware::trusted_loader_authority()
                     .and_then(|c| c.derive().ok())
                     .ok_or("MVM power loader authority unavailable")?;
+                if let Some(bits) = owner.feature_offer() {
+                    let request = owner.transmit_power_request_for(
+                        super::mvm_boot::PowerEmission::Features(bits),
+                    )?;
+                    match crate::firmware_asset::load(&authority, &request.name, 64, true) {
+                        Ok(source) => {
+                            owner.select_feature_power(&source, request.binding, bits)?;
+                            return Ok((source, request.binding));
+                        }
+                        // An absent optional program keeps the narrower
+                        // BE-only program; an invalid one never downgrades.
+                        Err(narf_firmware::FirmwareError::NotFound) => {}
+                        Err(_) => return Err("MVM signed feature power source invalid"),
+                    }
+                }
                 if owner.nested_ba_offer() {
                     let request = owner
                         .transmit_power_request_for(super::mvm_boot::PowerEmission::Ht20NestedBa)?;
@@ -643,7 +658,9 @@ impl Device {
                     super::csum::prepare_tx(&mut bytes, frame.tx_meta().csum_l4)
                         .map(|assist| (bytes, assist))
                 };
-                if owner.station_can_pipeline() {
+                // The BA pipeline carries only BE/TID0; other QoS TIDs use
+                // their own DQA queue singly.
+                if owner.station_can_pipeline() && owner.data_tid(frame.payload()) == 0 {
                     let mut packets = alloc::vec![prepare(&frame)?];
                     if let Some(tx) = transmit.as_mut() {
                         for _ in 1..8 {
@@ -652,9 +669,16 @@ impl Device {
                             else {
                                 break;
                             };
-                            if admitted(next.payload(), self.mac, next.tx_meta()) {
-                                packets.push(prepare(&next)?);
+                            if !admitted(next.payload(), self.mac, next.tx_meta()) {
+                                continue;
                             }
+                            if owner.data_tid(next.payload()) != 0 {
+                                // Keep order within this TID: it is the next
+                                // single send.
+                                *pending = Some(next);
+                                break;
+                            }
+                            packets.push(prepare(&next)?);
                         }
                     }
                     owner

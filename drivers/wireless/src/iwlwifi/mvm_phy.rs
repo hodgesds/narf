@@ -1,7 +1,7 @@
 //! Retained optional native MVM PHY/QoS facts. This is distinct from the
 //! Gen3 MLD payload encoders; all radio authority remains with signed power.
 use super::super::boot_context::{put16, put32};
-use super::power::Emission;
+use super::power::{feature, Emission};
 use alloc::{collections::VecDeque, vec::Vec};
 use narf_wireless::association::{
     phy::{LocalHt, LocalPhy},
@@ -15,9 +15,22 @@ pub(super) struct Context {
     pub negotiated: Option<Profile>,
     pub actions: VecDeque<Vec<u8>>,
     pub ba: super::ba::Context,
+    /// Extra tag5 feature bits selected by an actual signed program
+    /// (never BA/NESTED_BA, which the BA context owns).
+    pub features: u16,
 }
 impl Context {
     pub fn emission(&self) -> Emission {
+        if self.features != 0 {
+            let mut bits = self.features;
+            if self.ba.selected {
+                bits |= feature::BA;
+            }
+            if self.ba.nested_selected {
+                bits |= feature::NESTED_BA;
+            }
+            return Emission::Features(bits);
+        }
         if self.ba.nested_selected {
             Emission::Ht20NestedBa
         } else if self.ba.selected {
@@ -409,6 +422,37 @@ impl super::Owner {
             Emission::Ht20NestedBa,
         )?;
         self.power.phy.ba.nested_selected = true;
+        Ok(())
+    }
+    /// The tag5 feature set this offer would emit with per-TID QoS queues:
+    /// WMM/HT20 selected, plus the BA bit when the BA profile is selected.
+    pub(in crate::iwlwifi) fn feature_offer(&self) -> Option<u16> {
+        (self.phase == super::Phase::Configured && self.power.phy.offered.is_some()).then(|| {
+            feature::QOS_TIDS
+                | if self.power.phy.ba.selected {
+                    feature::BA
+                } else {
+                    0
+                }
+        })
+    }
+    /// Selection requires the actual signed tag5 asset for exactly `bits`.
+    pub(in crate::iwlwifi) fn select_feature_power(
+        &mut self,
+        source: &crate::firmware_asset::Asset,
+        binding: [u8; 32],
+        bits: u16,
+    ) -> Result<(), &'static str> {
+        if self.feature_offer() != Some(bits) {
+            return Err("MVM feature program differs from the selected offer");
+        }
+        super::power::validate_record(
+            source,
+            binding,
+            self.mac.ok_or("MVM feature program MAC absent")?,
+            Emission::Features(bits),
+        )?;
+        self.power.phy.features = bits & !(feature::BA | feature::NESTED_BA);
         Ok(())
     }
     pub(in crate::iwlwifi) fn supports_native_ht20(&self) -> bool {
