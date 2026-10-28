@@ -44,6 +44,7 @@
 
 extern crate alloc;
 
+pub mod ahb;
 pub mod autoconnect;
 pub mod board;
 pub mod ce;

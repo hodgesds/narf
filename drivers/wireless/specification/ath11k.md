@@ -1798,6 +1798,44 @@ semantics + a SERVER_EXIT recovery without power cycle (queues stopped
 then woken); firmware / restart failures (latched, dead, control
 operations refused) and the reset gate.
 
+### 3.12 AHB / platform glue (`ahb.rs`, Linux `ahb.c`)
+
+Built on the Qualcomm SoC layer `narf-drivers-qcom-soc`
+(`drivers/soc/qcom/specification/spec.md`): devicetree platform devices,
+SCM/PAS, MDT loader, SMEM, SMP2P, GCC resets, Q6 WCSS and PAS remoteprocs.
+
+```rust
+pub enum AhbChip { Ipq8074, Ipq6018Hw10, Ipq5018Hw10, Wcn6750Hw10 }
+pub const AHB_OF_MATCH: [(&str, AhbChip); 4];          // ath11k_ahb_of_match
+impl AhbChip { fn from_compatible(&[String]) -> Option<Self>; const fn params(self) -> AhbHwParams; }
+pub struct AhbHwParams { chip, name, fw_dir, max_radios, bdf_addr, regs, ring_mask,
+    qmi_service_ins_id, host_ce_config, target_ce_config, svc_to_ce_map, ce_ie_addr,
+    ce_remap, single_pdev_only, rxdma1_enable, htt_peer_map_v2, supports_shadow_regs,
+    credit_flow, hal_desc, hybrid_bus_type, static_window_map, fixed_fw_mem,
+    fixed_bdf_addr, smp2p_wow_exit, mac_map, msi }
+pub const IRQ_NAMES: [&str; 52];                           // ahb.c irq_name[]
+pub fn ce_irqs(&AhbHwParams) -> Vec<(ce_id, irq_idx)>;      // ath11k_ahb_config_irq
+pub fn ext_irq_groups(&AhbHwParams) -> [Vec<u8>; 11];      // ath11k_ahb_config_ext_irq
+pub fn ce_irq_enable_bits(&AhbHwParams, ce_id, ce_offset) -> Vec<(reg, bit)>;
+pub fn wcn6750_window_offset(&HalRegs, offset) -> u32;    // static windows
+pub fn smp2p_power_save_value(seq_no, PowerSaveMsg) -> u32;
+pub const AHB_CE_WINDOW_OFFSET: u32;                       // ATH11K_CE_OFFSET for a CE remap
+pub struct AhbIo<R: RegIo> { mem, ce: Option<R>, window: Option<&HalRegs> } // impl ChipIo
+pub fn ce_irq_set(&impl ChipIo, &AhbHwParams, ce_id, ce_offset, enable);    // ath11k_ahb_ce_irq_{en,dis}able
+pub fn ce_irqs_set(&impl ChipIo, &AhbHwParams, ce_offset, enable);
+pub fn find_ahb_devices(blob) -> Vec<(PlatformDevice, AhbChip)>;
+pub fn probe_resources(blob, &PlatformDevice) -> Result<AhbResources, AhbError>;
+pub struct AhbRemote { platform: Q6Platform }             // ath11k_core_get_rproc
+impl AhbRemote { fn resolve(blob, &AhbResources) -> Result<Self, AhbError>; fn loader_matches(&self, AhbChip) -> bool; }
+```
+
+`hw.rs` adds `IPQ8074_REGS`, `IPQ5018_REGS`, `WCN6750_REGS` (verbatim
+`hw.c`; IPQ5018 CE offsets relative to the remapped CE window) and
+`RING_MASK_IPQ8074` / `RING_MASK_WCN6750`. `power_up`/`power_down` are
+`Q6Wcss::{load,start,stop}` (IPQ) or `PasRproc::{start,stop}` (WCN6750)
+driven with the resources `AhbRemote` resolves. The AHB profiles are not
+admitted into `HwRev`/the PCI runtime; see §8.
+
 ## 4. Invariants
 
 - Failure-step codes (`wifi: <stage> FAILED step=N` on the panel) are
@@ -1865,7 +1903,8 @@ card (QEMU emulates none) is exercised once, after phase 8.
 
 ## 6. Dependencies
 
-`narf-bus` (BAR, MSI), `narf-io` (coherent DMA), `narf-firmware`
+`narf-bus` (BAR, MSI), `narf-drivers-qcom-soc` (AHB: DT platform devices,
+SCM/PAS, MDT, SMEM/SMP2P, GCC, Q6 WCSS/PAS remoteprocs), `narf-io` (coherent DMA), `narf-firmware`
 (`firmware-2.bin` or `amss.bin` + `m3.bin`, `board-2.bin`, `regdb.bin`
 — distro packages ship them `.zst`-compressed), `narf-wireless` (iface
 trait, EAPOL /
@@ -1891,7 +1930,7 @@ from physical RF, board, firmware and userspace interoperability acceptance.
 | WCN6855 HW2.0/HW2.1 | Native dynamic-window PCI/MHI/QMI/CE/HTC/WMI/DP; advertised-band legacy/HT/VHT/HE station/AP/P2P, security/keys/PMF, four-vdev/two-channel ownership, scan/ROC, recovery and PS/WoW/cold suspend; firmware power readback and retained recovery channel reservations | Native composed hardware fixtures remain x86-only: they compile on aarch64, but un-gating them (2026-10-27) killed the aarch64 test kernel inside the composed DHCP/integration fixture before the suite summary, consistent with kernel-stack overflow from by-value fixture state, so they stay gated until that footprint is reworked. DT board-variant and `memory-region` fixed-memory discovery are implemented (`board::dt_facts`, `wlfw::assign_fixed_target_mem`). Per-dialog TWT control and radar-detector diagnostics are implemented as the Linux debugfs-equivalent `Mac`/`Shared` APIs (`mac/diag.rs`; no nl80211 surface exists in Linux either). Non-contiguous RATEMASK programming and spectral diagnostics are inapplicable: Linux refuses the former with `-EINVAL` and initialises spectral only when `hw_params.spectral.fft_sz != 0`, which is false for every admitted profile (`hw::HwRev::spectral`, `hw::spectral_supported`; `group_pn_tests.rs::smoke_ath11k_spectral_inapplicable_on_admitted_pci`). |
 | QCA6390 HW2.0 | Independent IPQ8074 RX descriptor/DP profile and core dispatch, shared supported MAC/runtime capabilities, native normal/error/coalescing/fragment ownership and composed station/recovery path | The same explicit optional/control and architecture gaps above apply only when target services advertise them. Six-GHz/HE160/80+80/extended security are admitted only from actual band, peer and firmware capabilities, not inferred from WCN6855. |
 | QCN9074 | PCI identity/configuration definitions only; rejected with BME disabled before MMIO/MSI/firmware activation | Missing native static BAR windows, QCN9074 HAL register/operation tables, non-shadow rings, independent core/per-pdev/HTT peer-map-v2 configuration, QCN RX/REO/DP runtime and composed ownership tests. This is missing software for a recognized profile. WCN6855/QCA6390 tests cannot establish it. |
-| Other Linux ath11k SoC/AHB profiles | No native NARF admission | IPQ8074/IPQ6018/IPQ5018/WCN6750 platform IRQ, reset, reserved-memory/board and HAL profiles require their own bus/firmware lifetime contracts. Their helper constants/layouts do not provide an admitted runtime. Concrete blocker: NARF has no Qualcomm SoC platform layer — no AHB platform device, no Q6 WCSS (IPQ) or WPSS (WCN6750 hybrid bus) remoteproc/PIL loader with SCM/TrustZone image authentication, no reset/clock controllers and no SMP2P/SMEM (Linux `ath11k/ahb.c`, `remoteproc/qcom_q6v5_{wcss,adsp}.c`). The `memory-region`/fixed-memory QMI path these SoCs use is now implemented for PCI (`wlfw::assign_fixed_target_mem`). |
+| Other Linux ath11k SoC/AHB profiles (IPQ8074, IPQ6018, IPQ5018, WCN6750) | Qualcomm SoC platform layer (`drivers/soc/qcom`, `narf-drivers-qcom-soc`): DT platform devices and remoteproc resource resolution, SCM over SMCCC (PAS init/mem-setup/auth-and-reset/shutdown), MDT/MBN split loader, SMEM v11/v12, TCSR mutex, SMP2P, APCS/IPCC kicks, GCC reset/branch tables, Q6 WCSS host-reset start/stop (IPQ) and PAS WPSS start/stop (WCN6750). ath11k AHB glue (§3.12, `ahb.rs`): `ath11k_ahb_of_match`, the four AHB `hw_params` entries (CE/target-CE/service maps, QMI instance ids, ring masks, `ipq8074_regs`/`ipq5018_regs`/`wcn6750_regs`, CE remap/IE addresses, BDF address, firmware dir), the 52 named IRQs with CE and DP-group mapping, WCN6750 static windows and hybrid MSI resources, MSA/CE `memory-region`s, `qcom,rproc` resolution and boot through the matching loader; fixture-tested only (`ahb_tests.rs`, `drivers/soc/qcom/src/tests.rs`) | Not admitted into `HwRev`/the runtime. Residual blockers, all chips: (1) QRTR over GLINK-SMEM (Linux `rpmsg/qcom_glink_{native,smem}.c`, `net/qrtr/smd.c`) — AHB WLFW QMI rides on the remoteproc `glink-edge`; NARF QRTR runs only over MHI. (2) AHB HIF wiring: `AhbIo` (`ChipIo` over `ab->mem`/`mem_ce`/WCN6750 windows) and the CE IE1/IE2/IE3 enable writes exist, but no `CeHif<AhbIo, _>` is built — the AHB CE interrupt source (a `CeIrq` fed by the per-CE GIC lines), the DP ext-IRQ group service and admission into the `HwRev`-keyed core/runtime are missing. (3) Platform IRQ delivery: GIC SPI / IPCC / SMP2P-virtual interrupt handlers for DT devices calling `Q6v5::signal` and `Smp2p::handle_interrupt`. (4) `wlfw::Wlfw::new` refuses `fixed_bdf_addr` (IPQ: BDF ioremapped at `bdf_addr`), `fixed_mem_region` and `hybrid_bus_type` (WCN6750 DEVICE_INFO). IPQ8074/IPQ6018/IPQ5018: (5) multi-pdev core/HTT/DP runtime (`single_pdev_only = false`, `max_radios` 3/2/1, `rxdma1_enable` monitor rings, per-pdev WMI CE7/CE9) and `ipq8074_ops`/`ipq6018_ops`/`ipq5018_ops`. IPQ8074: (6) mainline has no WCSS DT node and no `GCC_WCSSAON_RESET` (only IPQ6018 has the node). IPQ5018: (7) `hal_rx_desc_qcn9074` layout (shared with QCN9074) and no upstream `ipq5018` WCSS remoteproc binding. WCN6750: (8) RPMh `xo` and `cx`/`mx` proxy votes + AOSS QMP `load_state` around WPSS start; (9) `hal_rx_desc_qcn9074`. |
 
 802.11be/MLO/EHT is not an ath11k Wi-Fi6/6E contract; it belongs to newer
 hardware/driver families. Firmware-owned HT/HE BA, OFDMA/TWT behavior is distinct

@@ -2482,6 +2482,7 @@ dependencies = [
  "narf-crypto",
  "narf-driver-runtime",
  "narf-drivers",
+ "narf-drivers-qcom-soc",
  "narf-drivers-sdio",
  "narf-drivers-usb",
  "narf-drivers-wireless-mt76",
