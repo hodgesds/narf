@@ -302,6 +302,7 @@ impl<'a> Mdt<'a> {
     /// carve-out (`pas_mem_setup`). The metadata buffer is returned so the
     /// caller releases it only after `auth_and_reset`
     /// (`qcom_scm_pas_metadata_release`).
+    #[allow(clippy::too_many_arguments)]
     pub async fn pas_init<C: SmcConduit, A: ScmAlloc, D: Delay + ?Sized>(
         &self,
         fw_name: &str,
