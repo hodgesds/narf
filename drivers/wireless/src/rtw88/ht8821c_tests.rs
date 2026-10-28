@@ -193,6 +193,34 @@ kernel_test_in!(
     "drivers/wireless/rtw88/qos/rtl8821c",
     smoke_rtw8821ce_qos_refusals
 );
+fn smoke_rtw8821ce_fallback_open_firmware_ra_and_revocation() -> TestResult {
+    check(|| crate::rtw88::fallback_tests::composition::<Case>(false))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/fallback/rtl8821c",
+    smoke_rtw8821ce_fallback_open_firmware_ra_and_revocation
+);
+fn smoke_rtw8821ce_fallback_wpa2_firmware_ra_and_revocation() -> TestResult {
+    check(|| crate::rtw88::fallback_tests::composition::<Case>(true))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/fallback/rtl8821c",
+    smoke_rtw8821ce_fallback_wpa2_firmware_ra_and_revocation
+);
+fn smoke_rtw8821ce_fallback_not_granted_stays_fixed_rate() -> TestResult {
+    check(crate::rtw88::fallback_tests::not_granted::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/fallback/rtl8821c",
+    smoke_rtw8821ce_fallback_not_granted_stays_fixed_rate
+);
+fn smoke_rtw8821ce_fallback_refusals() -> TestResult {
+    check(crate::rtw88::fallback_tests::refusals::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/fallback/rtl8821c",
+    smoke_rtw8821ce_fallback_refusals
+);
 impl cases::Fixture for Case {
     fn kind_request(
         &self,

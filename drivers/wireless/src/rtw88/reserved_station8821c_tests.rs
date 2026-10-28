@@ -156,6 +156,7 @@ fn smoke_rtw8821ce_native_station_radio_retry_receipts_and_retained_reserved_dma
                     ldpc: false,
                     stbc: false,
                     acs: 0,
+                    fallback: false,
                 })
                 || g.allows_profile(crate::rtw88::packet_format::DataProfile {
                     rates: 1,
@@ -165,6 +166,7 @@ fn smoke_rtw8821ce_native_station_radio_retry_receipts_and_retained_reserved_dma
                     ldpc: false,
                     stbc: false,
                     acs: 0,
+                    fallback: false,
                 })
         })
         || m.command_ring.pending()

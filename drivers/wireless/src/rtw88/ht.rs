@@ -282,6 +282,7 @@ impl Grant {
             ldpc: false,
             stbc: false,
             acs: 0,
+            fallback: false,
         };
         if !self.allows(p) {
             return Err(Error::Unsupported);

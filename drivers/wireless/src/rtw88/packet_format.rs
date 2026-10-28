@@ -149,6 +149,9 @@ pub(super) struct DataProfile {
     /// Separately qualified (N2xQ) QoS routing: nonzero admits every TID,
     /// with BK/VI/VO TIDs limited to these `ACS_*` rings.
     pub acs: u8,
+    /// Separately qualified (N2xF) firmware RA fallback: DATA clears
+    /// W3 USE_RATE/DISDATAFB.
+    pub fallback: bool,
 }
 impl DataProfile {
     pub(super) const LEGACY: Self = Self {
@@ -159,6 +162,7 @@ impl DataProfile {
         ldpc: false,
         stbc: false,
         acs: 0,
+        fallback: false,
     };
     pub(super) fn valid(self) -> bool {
         self.rates != 0
@@ -366,7 +370,11 @@ pub(super) fn transmit_profile(
         u32::from(mac_id) | qsel << 8 | u32::from(rate_id) << 16,
     );
     put(&mut bytes, 8, u32::from(report.is_some()) << 19);
-    put(&mut bytes, 12, 1 << 8 | 1 << 10);
+    // Source rtw_tx_pkt_info_update: firmware RA chooses and falls back for
+    // station DATA; everything else keeps USE_RATE|DISDATAFB.
+    if !(ordinary && profile.fallback) {
+        put(&mut bytes, 12, 1 << 8 | 1 << 10);
+    }
     put(
         &mut bytes,
         16,

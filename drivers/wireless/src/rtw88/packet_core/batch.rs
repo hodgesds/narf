@@ -65,7 +65,12 @@ impl Core {
                 self.own,
                 self.mac_id,
                 Some(sequence),
-                self.data_profile,
+                // The N2xT burst envelope is fixed-rate/no-fallback; N2xF
+                // never extends to aggregated bursts.
+                format::DataProfile {
+                    fallback: false,
+                    ..self.data_profile
+                },
             )?;
             if queue != Queue::Data {
                 return Err(Error::Packet);

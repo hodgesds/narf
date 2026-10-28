@@ -169,26 +169,25 @@ rtlwifi	sgi20	SGI20; blocked on a signed NEHT record covering SGI emissions (NEH
 rtlwifi	system_suspend	System suspend; blocked on operating_reset (resume re-runs power-on, firmware download and ring publication on the retained owner); DMA quiescence (Prepared::quiesce) exists	feature	drivers/wireless/specification/rtlwifi.md	679
 rtlwifi	vht	VHT operation including TX/RX STBC on RTL8821AE; blocked on the rtl8821ae runtime	feature	drivers/wireless/specification/rtlwifi.md	738
 rtlwifi	wowlan	WoWLAN magic-packet/pattern wake on RTL8821AE/8812AE; blocked on the rtl8821ae runtime and system_suspend	feature	drivers/wireless/specification/rtlwifi.md	764
-rtw88	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw88.md	1827
-rtw88	beamforming	Beamforming	feature	drivers/wireless/specification/rtw88.md	1828
-rtw88	dpk_tracking	DPK calibration (rtw8822c_do_dpk) and thermal DPK tracking on RTL8822C	feature	drivers/wireless/specification/rtw88.md	1829
-rtw88	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specification/rtw88.md	1830
-rtw88	ht40	HT40 operation (40MHz width, DSSS/CCK40, SGI40)	feature	drivers/wireless/specification/rtw88.md	1831
-rtw88	multi_device	Multiple live device lifetimes	feature	drivers/wireless/specification/rtw88.md	1832
-rtw88	multi_stream_ht	Multi-stream HT on RTL8822B/RTL8822C	feature	drivers/wireless/specification/rtw88.md	1833
-rtw88	operating_reset	Reset of an operating retained owner	feature	drivers/wireless/specification/rtw88.md	1834
-rtw88	radio_coexistence	Complete radio coexistence state machine	feature	drivers/wireless/specification/rtw88.md	1835
-rtw88	rate_fallback	DATA rate fallback	feature	drivers/wireless/specification/rtw88.md	1836
-rtw88	rf_power_tracking	Thermal RF power tracking on RTL8821CE (TXAGC/txscale swing; RTL8822C done by dm)	feature	drivers/wireless/specification/rtw88.md	1837
-rtw88	rtl8822be	RTL8822BE retained firmware/radio/packet/station runtime	chip	drivers/wireless/specification/rtw88.md	1838
-rtw88	runtime_sleep	Runtime sleep	feature	drivers/wireless/specification/rtw88.md	1839
-rtw88	safe_rejoin	Safe reassociation/rejoin	feature	drivers/wireless/specification/rtw88.md	1840
-rtw88	smps_txrx_1ss	Coexistence-driven static SMPS on RTL8822C	feature	drivers/wireless/specification/rtw88.md	1841
-rtw88	system_suspend	System suspend	feature	drivers/wireless/specification/rtw88.md	1842
-rtw88	tx_amsdu_5ghz	TX A-MSDU and A-MSDU-in-A-MPDU outside 2.4GHz	feature	drivers/wireless/specification/rtw88.md	1843
-rtw88	tx_ba_all_tids	Originator TX Block Ack on every non-VO TID	feature	drivers/wireless/specification/rtw88.md	1844
-rtw88	vht	VHT operation	feature	drivers/wireless/specification/rtw88.md	1845
-rtw88	wow	Wake on Wireless on RTL8822CE	feature	drivers/wireless/specification/rtw88.md	1846
+rtw88	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw88.md	1867
+rtw88	beamforming	Beamforming	feature	drivers/wireless/specification/rtw88.md	1868
+rtw88	dpk_tracking	DPK calibration (rtw8822c_do_dpk) and thermal DPK tracking on RTL8822C	feature	drivers/wireless/specification/rtw88.md	1869
+rtw88	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specification/rtw88.md	1870
+rtw88	ht40	HT40 operation (40MHz width, DSSS/CCK40, SGI40)	feature	drivers/wireless/specification/rtw88.md	1871
+rtw88	multi_device	Multiple live device lifetimes	feature	drivers/wireless/specification/rtw88.md	1872
+rtw88	multi_stream_ht	Multi-stream HT on RTL8822B/RTL8822C	feature	drivers/wireless/specification/rtw88.md	1873
+rtw88	operating_reset	Reset of an operating retained owner	feature	drivers/wireless/specification/rtw88.md	1874
+rtw88	radio_coexistence	Complete radio coexistence state machine	feature	drivers/wireless/specification/rtw88.md	1875
+rtw88	rf_power_tracking	Thermal RF power tracking on RTL8821CE (TXAGC/txscale swing; RTL8822C done by dm)	feature	drivers/wireless/specification/rtw88.md	1876
+rtw88	rtl8822be	RTL8822BE retained firmware/radio/packet/station runtime	chip	drivers/wireless/specification/rtw88.md	1877
+rtw88	runtime_sleep	Runtime sleep	feature	drivers/wireless/specification/rtw88.md	1878
+rtw88	safe_rejoin	Safe reassociation/rejoin	feature	drivers/wireless/specification/rtw88.md	1879
+rtw88	smps_txrx_1ss	Coexistence-driven static SMPS on RTL8822C	feature	drivers/wireless/specification/rtw88.md	1880
+rtw88	system_suspend	System suspend	feature	drivers/wireless/specification/rtw88.md	1881
+rtw88	tx_amsdu_5ghz	TX A-MSDU and A-MSDU-in-A-MPDU outside 2.4GHz	feature	drivers/wireless/specification/rtw88.md	1882
+rtw88	tx_ba_all_tids	Originator TX Block Ack on every non-VO TID	feature	drivers/wireless/specification/rtw88.md	1883
+rtw88	vht	VHT operation	feature	drivers/wireless/specification/rtw88.md	1884
+rtw88	wow	Wake on Wireless on RTL8822CE	feature	drivers/wireless/specification/rtw88.md	1885
 rtw89	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw89.md	1006
 rtw89	aggregation	TX A-MPDU and TX A-MSDU/A-MSDU-in-A-MPDU aggregation	feature	drivers/wireless/specification/rtw89.md	1413
 rtw89	antenna_diversity_tracking	Dynamic antenna diversity/tracking	feature	drivers/wireless/specification/rtw89.md	713

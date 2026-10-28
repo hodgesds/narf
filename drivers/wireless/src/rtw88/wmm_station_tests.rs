@@ -176,6 +176,7 @@ fn smoke_rtw8822ce_legacy12_descriptor_rate_order_and_wmm_register_units() -> Te
                 ldpc: false,
                 stbc: false,
                 acs: 0,
+                fallback: false,
             };
             let mut frame = vec![0x88, 1, 0, 0];
             frame.extend_from_slice(&AP);
@@ -212,6 +213,7 @@ fn smoke_rtw8822ce_legacy12_descriptor_rate_order_and_wmm_register_units() -> Te
             ldpc: false,
             stbc: false,
             acs: 0,
+            fallback: false,
         })
         .rate()
             != 3

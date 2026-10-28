@@ -54,6 +54,9 @@ mod dm_station_tests;
 mod dm_tests;
 mod dma_stop;
 pub mod efuse;
+mod fallback;
+#[cfg(feature = "kernel-test")]
+mod fallback_tests;
 mod firmware_lifecycle;
 mod firmware_native;
 mod firmware_transport;

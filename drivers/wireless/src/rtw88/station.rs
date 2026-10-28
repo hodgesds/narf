@@ -129,6 +129,8 @@ pub(super) struct State {
     coding: Option<(Arc<super::qualification::Grant>, u8)>,
     /// Firmware RA_INFO still carries LDPC after a coding downgrade.
     coding_restore: bool,
+    /// Bound N2xF DATA rate fallback (`fallback`, tag `F`).
+    fallback: Option<Arc<super::qualification::Grant>>,
     /// Current random scan SA (`rtw_core_scan_start`).
     scan_address: Option<[u8; 6]>,
     /// Bound N2xQ all-TID QoS routing (`qos`, tag `Q`) and its AC set.
@@ -227,6 +229,7 @@ impl State {
             protection: None,
             coding: None,
             coding_restore: false,
+            fallback: None,
             qos: None,
             scan_address: None,
             tx_ba: super::tx_ba::Originator::new(),
@@ -278,7 +281,12 @@ impl State {
     pub(super) async fn watchdog(&mut self, io: &mut impl Io) -> Result<bool, Error> {
         if self.established && self.ready() {
             let admission = self.admission.clone();
-            admission.run(|| Ok(self.coding_live(io).and_then(|()| self.qos_live(io))))??;
+            admission.run(|| {
+                Ok(self
+                    .coding_live(io)
+                    .and_then(|()| self.qos_live(io))
+                    .and_then(|()| self.fallback_live(io)))
+            })??;
             if self.coding_restore {
                 // Source RA_INFO without LDPC once coding is no longer current.
                 super::wmm::ra_info(io, self.data_profile, &self.admission).await?;
@@ -417,6 +425,7 @@ impl State {
         self.data_profile = super::packet_format::DataProfile::LEGACY;
         self.coding = None;
         self.coding_restore = false;
+        self.fallback = None;
         self.qos = None;
         if self.prepared {
             io.packet_stop()?;
@@ -881,6 +890,7 @@ impl State {
                                 ldpc: false,
                                 stbc: false,
                                 acs: 0,
+                                fallback: false,
                             };
                             if let Some(h) = &self.ht {
                                 let negotiated = self
@@ -914,6 +924,7 @@ impl State {
                                 self.data_profile.acs = *acs;
                             }
                         }
+                        self.data_profile.fallback = self.fallback.is_some();
                         self.peer_commit = Some((aid, short));
                         self.last_peer = now;
                         // Firmware peer commit is an awaited continuation in associate().
@@ -1358,6 +1369,15 @@ impl State {
                 self.admission
                     .run(|| io.station_bind_extension(grant.clone()))?;
                 self.extension = Some(grant);
+                // N2xF fallback needs only the bound extension.
+                if let Some(g) = io.station_continuation(&super::fallback::KIND)? {
+                    let gate = io.station_gate()?;
+                    if super::fallback::bounds(g.payload()) && g.check(&gate).is_ok() {
+                        self.admission
+                            .run(|| io.station_bind_continuation(g.clone()))?;
+                        self.fallback = Some(g);
+                    }
+                }
                 if self.wmm_requested {
                     if let Some(g) = io.station_continuation(&super::qos::KIND)? {
                         let gate = io.station_gate()?;
@@ -1513,9 +1533,33 @@ impl State {
         self.data_profile = p;
         Ok(())
     }
+    /// Firmware RA fallback requires the current N2xF continuation. A
+    /// revoked or mismatched one returns DATA to the fixed rate.
+    pub(super) fn fallback_live(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        if !self.data_profile.fallback {
+            return Ok(());
+        }
+        let gate = io.station_gate()?;
+        if self
+            .fallback
+            .as_ref()
+            .is_some_and(|g| g.check(&gate).is_ok())
+        {
+            return Ok(());
+        }
+        self.fallback = None;
+        let p = super::packet_format::DataProfile {
+            fallback: false,
+            ..self.data_profile
+        };
+        io.packet_profile(p)?;
+        self.data_profile = p;
+        Ok(())
+    }
     fn send_inner(&mut self, io: &mut impl Io, frame: &[u8]) -> Result<(), Error> {
         self.coding_live(io)?;
         self.qos_live(io)?;
+        self.fallback_live(io)?;
         self.tracking.tx_bytes = self.tracking.tx_bytes.saturating_add(frame.len() as u64);
         let acm = self
             .wmm

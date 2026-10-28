@@ -1527,6 +1527,46 @@ and composed C21/C22 Open/WPA2 cases in `drivers/wireless/rtw88/qos/*`
 unqualified station, a VI-only subset and refused records. A real signed
 N2xQ measurement and over-the-air acceptance remain external.
 
+### C21/C22 DATA rate fallback (`N2xF`)
+
+`fallback.rs` (tag `F`, stem `fallback`) lets firmware rate adaptation
+step DATA down instead of transmitting every frame at one fixed rate.
+Sources (Linux v7.2 rtw88):
+
+- `tx.c::rtw_tx_data_pkt_info_update` leaves `use_rate` and
+  `dis_rate_fallback` false for a station DATA frame. Only
+  `dm_info->fix_rate` forces both on. The descriptor rate is the highest
+  negotiated rate, which the base profile already carries.
+  `rtw_tx_mgmt_pkt_info_update` keeps management frames fixed with both
+  bits set.
+- `tx.c::rtw_tx_fill_tx_desc`: `RTW_TX_DESC_W3_USE_RATE` (bit 8) and
+  `RTW_TX_DESC_W3_DISDATAFB` (bit 10).
+- `fw.c::rtw_fw_send_ra_info`: rate ID, `SET_RA_INFO_RA_MASK0..3` and a
+  clear `DIS_RA`. `wmm.rs::ra_info` already sends this with the bound rate
+  and MCS mask at peer commit, so firmware RA is running and falls back
+  within the mask.
+
+Payload byte 0 is 1; every other byte is zero. The continuation binds into
+the retained `Gate` right after the base N2xL extension. It needs no WMM
+or HT program. `DataProfile::fallback` carries it, and
+`Gate::allows_profile` admits it only with a current bound grant. With the
+grant, ordinary DATA (including QoS DATA and the HT profile) clears both
+W3 bits. Management, EAPOL/radio-report frames and BAR keep
+USE_RATE|DISDATAFB, and so do originator BA bursts: the N2xT burst
+envelope is qualified as fixed-rate/no-fallback, unlike Linux, which
+lets firmware RA run on A-MPDUs too. Revocation is checked on every send and every watchdog
+pass (`Station::fallback_live`). It returns DATA to the fixed rate without
+dropping the link.
+
+Evidence: `drivers/wireless/rtw88/narrow/fallback` (payload and chip
+bounds; W3 bits for QoS/non-QoS DATA with and without the profile; a
+Probe Request staying fixed) and composed C21/C22 cases in
+`drivers/wireless/rtw88/fallback/*` (`fallback_tests.rs`): Open and WPA2
+joins with fallback DATA, then revocation back to fixed rate and teardown;
+an unqualified station staying fixed; unsigned, altered, foreign and
+revoked records refused. A real signed N2xF measurement and over-the-air
+rate behaviour remain external.
+
 ### PCI DMA-stop proof and reclamation (`dma_stop.rs`)
 
 A stopped owner used to keep every published mapping forever: the seven TX
@@ -1831,16 +1871,15 @@ changes. None is a physical blocker unless stated.
 | `ht40` | `station.rs` refuses any offered/negotiated width other than `Width::Twenty`, and the radio programs only BW20. Needs `rtw8822c_set_channel_bb` BW40 and DSSS/CCK40 programming, plus SGI40 in the measured HT gate. |
 | `multi_device` | Not attempted. Each `Rtw88Device` owns one retained lifecycle, and there is no multi-instance composition test. |
 | `multi_stream_ht` | `ht.rs::local` advertises and transmits MCS0..7 only, and `ht.rs::program` writes one-stream TXAGC words. 2SS TXAGC/RA mask programming and a measured 2SS envelope are missing. |
-| `operating_reset` | No `rtw_core_stop`/`rtw_core_start` restart over a retained owner. The DMA-stop proof (`dma_stop.rs`) now releases a stopped owner, but no generation reset re-runs power-on, firmware download and the retained stages over the same device. |
+| `operating_reset` | No `rtw_core_stop`/`rtw_core_start` generation reset over a retained owner. `dma_stop.rs` now proves a stopped owner idle and releases it, and `Lifecycle::remove` tears one down, but the lifecycle is one-shot. Its `started` latch, the `pci_firmware::allocate` cold-power precondition (`power::power_on` card-disable to enable runs only in `pci::bring_up`) and the interface `Admission`, which never reopens after `close`, all forbid re-running power-on, firmware download, MAC/PHY/radio and station start on the same function and shell. Needs a generation counter across `Lifecycle`/`Firmware`/`Sibling`/`interface::Device`, a re-entrant cold-power path and admission reopen, plus re-qualification of every continuation against the new generation (patterns: ath9k `reset_owner`, iwlwifi `Owner::recover`). |
 | `radio_coexistence` | No `coex.c` state machine (BT scoreboard, TDMA tables, `rtw_coex_*` notifications) is ported. |
-| `rate_fallback` | `packet_format.rs::transmit_profile` sets W3 USE_RATE|DISDATAFB (bits 8/10) on every frame. Firmware RA fallback needs a qualified per-rate envelope over the RA mask; that is software work, not attempted this round. |
 | `rf_power_tracking` | `dm.rs` admits `PWR_TRACK` only on C22 (`C21_MECHANISMS` = DIG/CCK-PD/RA). The `rtw8821c_pwr_track` TXAGC/txscale port is missing. |
 | `rtl8822be` | The firmware loader and every retained stage reject `10ec:b822`. RTL8822B firmware/MAC/PHY/RF tables are not ported. |
-| `runtime_sleep` | No `ps.c` LPS/IPS (`rtw_enter_lps`, `rtw_leave_ips`); the station stays awake/CAM. |
-| `safe_rejoin` | Rejoin needs a fresh lifecycle after terminal closure (§3) and is blocked on `operating_reset`. |
+| `runtime_sleep` | No `ps.c` port. LPS needs `H2C_CMD_SET_PWR_MODE` (0x20) in an LPS mode plus the `rtw_leave_lps_core` path; `station_control.rs` only ever sends the ACTIVE/awake form. IPS (`rtw_enter_ips` = `rtw_core_stop` + `rtw_hci_link_ps`, `rtw_leave_ips` = `rtw_ips_pwr_up`) is a full stop/start, so it is blocked on `operating_reset`. |
+| `safe_rejoin` | Rejoin after a terminal disconnect needs a fresh owner generation (§3: one-shot station, closed `Admission`). It is blocked on `operating_reset`; `narf_net::iface::retire_for_rebind`/`rebind_name` now exist for keeping the `wlan` name across generations. |
 | `smps_txrx_1ss` | Driven only by coexistence (`rtw_vif_smps_iter` on `hal.txrx_1ss`), so blocked on `radio_coexistence`. |
 | `system_suspend` | Linux `rtw_pci_suspend`/`resume` only toggle the CLKREQ pad (8822C RFE 6); the stack stops the radio through mac80211 (`rtw_ops_stop` → `rtw_core_stop`) and restarts it (`rtw_ops_start` → `rtw_core_start`: power-on, firmware download, MAC/PHY init). The DMA-stop proof now covers the stop half, but the resume half is exactly the missing generation reset, so this is blocked on `operating_reset`. |
 | `tx_amsdu_5ghz` | Blocked on `five_ghz_operation`. |
-| `tx_ba_all_tids` | `tx_ba.rs::Originator` holds one TID0 agreement, and `packet_core/batch.rs` aggregates only `Queue::Data`. With N2xQ in place, per-TID agreements and BK/VI/VO batches remain software work, not attempted this round. |
+| `tx_ba_all_tids` | `tx_ba.rs::Originator` holds one TID0 dialog and builds TID0 ADDBA/BAR/DELBA; `station.rs` aggregates and assigns BA sequence numbers only for `tid == 0`; `packet_core/batch.rs` publishes bursts only on `Queue::Data` (BE, host index slot 1); and the signed N2xT identity in `tx_ba_power.rs` is bound to `"originator HT20 BE/TID0 BA/burst v1"`. Per-TID agreements need a per-TID originator table, BK/VI/VO burst publication, and a new or extended signed burst envelope covering those rings. |
 | `vht` | The HT station builds `LocalPhy::ht20` only, and VHT80 needs ht40 channel/BW80 programming first; blocked on `ht40`. |
 | `wow` | No `rtw8822c` wowlan firmware swap (`wow_fw_name`) or `wow.c` pattern/RF-kill programming is ported. |

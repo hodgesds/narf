@@ -169,6 +169,9 @@ pub struct Gate {
     /// Separately qualified N2xQ all-TID QoS routing over the WMM extension.
     /// Not part of `current`/`invoke`: revocation returns to BE/TID0.
     qos: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    /// Separately qualified N2xF DATA rate fallback over the extension.
+    /// Revocation returns to fixed-rate DATA.
+    fallback: Option<alloc::sync::Arc<super::qualification::Grant>>,
 }
 /// A C22 calibration source without extension dispatch. N22L retains this
 /// narrower type, so invoking its base cannot recursively invoke N22L again.
@@ -343,6 +346,7 @@ impl Gate {
             protection: None,
             coding: None,
             qos: None,
+            fallback: None,
             scope: Scope::C22 {
                 calibration,
                 permission,
@@ -360,6 +364,7 @@ impl Gate {
             protection: None,
             coding: None,
             qos: None,
+            fallback: None,
         }
     }
     pub(super) fn did(&self) -> u16 {
@@ -486,8 +491,17 @@ impl Gate {
         {
             return false;
         }
+        if p.fallback
+            && !self
+                .fallback
+                .as_ref()
+                .is_some_and(|g| super::fallback::bounds(g.payload()) && g.check(self).is_ok())
+        {
+            return false;
+        }
         let p = super::packet_format::DataProfile {
             acs: 0,
+            fallback: false,
             ..p.uncoded()
         };
         if let Some(g) = &self.ht {
@@ -618,15 +632,21 @@ impl Gate {
             && self.extension.as_ref().is_some_and(|e| e.wmm())
             && self.qos.is_none()
             && super::qos::bounds(g.payload()).is_some();
-        if !coding && !qos {
+        let fallback = g.is(&super::fallback::KIND)
+            && self.extension.is_some()
+            && self.fallback.is_none()
+            && super::fallback::bounds(g.payload());
+        if !coding && !qos && !fallback {
             return Err(super::firmware_transport::Error::State);
         }
         g.check(self)?;
         let mut gate = self.clone();
         if coding {
             gate.coding = Some(g);
-        } else {
+        } else if qos {
             gate.qos = Some(g);
+        } else {
+            gate.fallback = Some(g);
         }
         Ok(gate)
     }
