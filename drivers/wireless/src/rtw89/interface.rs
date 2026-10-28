@@ -742,12 +742,24 @@ pub(super) fn publish<I: Io + 'static>(device: Arc<Device<I>>) -> Result<(), Err
 /// unregister from the wireless/net registries and release the singleton
 /// endpoint claim. Idempotent; the drain worker exits after its pass.
 pub(super) fn withdraw<I: Io + 'static>(device: &Device<I>) {
+    withdraw_inner(device, false);
+}
+/// Generation reset: as [`withdraw`], but the name is reserved while still
+/// registered so the next generation's shell keeps it.
+pub(super) fn withdraw_keep_name<I: Io + 'static>(device: &Device<I>) -> String {
+    withdraw_inner(device, true);
+    device.name.clone()
+}
+fn withdraw_inner<I: Io + 'static>(device: &Device<I>, keep: bool) {
     device.close();
     if !device.published.swap(false, Ordering::AcqRel) {
         return;
     }
     narf_wireless::registry::unregister(&device.name);
     narf_net::registry().unregister(&device.name);
+    if keep {
+        narf_net::iface::reserve_name(&device.name);
+    }
     narf_net::iface::unregister(&device.name);
     let endpoint = device as *const Device<I> as *const ();
     let mut active = ACTIVE.lock();

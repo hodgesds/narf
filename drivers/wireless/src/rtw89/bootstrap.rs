@@ -10,7 +10,7 @@ use super::{
 };
 use alloc::{string::String, sync::Arc};
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
@@ -45,6 +45,10 @@ pub(super) struct Bootstrap {
     running: AtomicBool,
     /// Set by the PCI remove hook before it retires the owner.
     removed: AtomicBool,
+    /// A retired generation could not prove its DMA stopped.
+    pinned: AtomicBool,
+    /// Generations started after the first (SER L2-style resets).
+    generation: AtomicU32,
 }
 static OWNER: IrqSafeSpinLock<Option<Arc<Bootstrap>>> = IrqSafeSpinLock::new(None);
 static RESERVED: AtomicBool = AtomicBool::new(false);
@@ -128,6 +132,12 @@ impl Bootstrap {
             }
         }
     }
+    /// Generation supervisor (Linux SER L2, `ser.c::ser_l2_reset_st_hdl`:
+    /// `rtw89_core_stop` then `ieee80211_restart_hw`). Every generation that
+    /// reached a started station and then closed (firmware HALT_C2H/WDT,
+    /// a fatal transport error or a disconnect) is retired behind the DMA
+    /// proof; a proven reclamation rearms a fresh FLR and a new startup on
+    /// the same function and interface name so the station can rejoin.
     async fn drive(&self) -> Result<(), Error> {
         self.running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -136,6 +146,85 @@ impl Bootstrap {
             owner: self,
             complete: false,
         };
+        let mut name: Option<String> = None;
+        loop {
+            let result = self.generation(name.as_deref()).await;
+            let reclaimed = self.retire_generation().await;
+            let generation = self.generation.load(Ordering::Acquire);
+            let action = supervise(
+                result.is_ok(),
+                self.removed.load(Ordering::Acquire),
+                reclaimed,
+                generation,
+            );
+            if action == Action::Stop {
+                self.set_stage(Stage::Terminal);
+                attempt.complete = result.is_ok();
+                return result;
+            }
+            narf_console::klog!("rtw8852b: generation {} closed; resetting\n", generation);
+            match self.rearm().await {
+                Some(kept) => name = kept.or(name),
+                None => {
+                    self.set_stage(Stage::Terminal);
+                    attempt.complete = true;
+                    return Err(Error::Cancelled);
+                }
+            }
+        }
+    }
+    /// Retire the current generation's owner (station stop, DMA proof,
+    /// reclamation, XTAL/RF shutdown) under its lifecycle mutex. True only
+    /// when nothing remains pinned; a pinned owner marks the function.
+    async fn retire_generation(&self) -> bool {
+        let lifecycle = {
+            let lifecycle = self.lifecycle.lock();
+            lifecycle.clone()
+        };
+        let Some(lifecycle) = lifecycle else {
+            return !self.pinned.load(Ordering::Acquire);
+        };
+        let mut retained = lifecycle.retained.lock().await;
+        let reclaimed = match retained.as_mut() {
+            Some(owner) => {
+                let reclaimed = owner.retire();
+                let _ = owner.io.finish_station_shutdown().await;
+                reclaimed
+            }
+            None => !self.pinned.load(Ordering::Acquire),
+        };
+        *retained = None;
+        if !reclaimed {
+            self.pinned.store(true, Ordering::Release);
+        }
+        reclaimed
+    }
+    /// Withdraw the closed shell (keeping its name), drop the retired
+    /// lifecycle and claim a fresh reset for the next generation. The reset
+    /// is stored under its mutex after the removed check, so a concurrent
+    /// removal either sees it (and drops it) or stops this rearm.
+    async fn rearm(&self) -> Option<Option<String>> {
+        if self.removed.load(Ordering::Acquire) {
+            return None;
+        }
+        let shell = self.shell.lock().take();
+        let kept = shell
+            .as_ref()
+            .map(|shell| super::interface::withdraw_keep_name(shell));
+        *self.lifecycle.lock() = None;
+        // SAFETY: the singleton reservation is still held, the previous
+        // generation's DMA was proven stopped/reclaimed with BME off and no
+        // producer remains; the reset still earns its own temporal fence.
+        let reset = unsafe { pci_reset::Reset::claim(self.device, self.authority) }.ok()?;
+        let mut slot = self.reset.lock().await;
+        if self.removed.load(Ordering::Acquire) {
+            return None;
+        }
+        *slot = Some(reset);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        Some(kept)
+    }
+    async fn generation(&self, kept: Option<&str>) -> Result<(), Error> {
         let retained_lifecycle = {
             let owner = self.lifecycle.lock();
             owner.clone()
@@ -176,7 +265,7 @@ impl Bootstrap {
                 .await
                 .map_err(Error::Startup)?
         };
-        let name = narf_net::iface::reserve_name("wlan%d");
+        let name = kept.unwrap_or_else(|| narf_net::iface::reserve_name("wlan%d"));
         let shell = Arc::new(Device::new(
             name,
             identity.mac(),
@@ -259,9 +348,25 @@ impl Bootstrap {
             }
             narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
         }
-        self.set_stage(Stage::Terminal);
-        attempt.complete = true;
         Ok(())
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    Regenerate,
+    Stop,
+}
+/// Bound on generations per boot, so a station that keeps halting cannot
+/// cycle FLR/firmware download forever.
+const MAX_GENERATIONS: u32 = 64;
+/// Regenerate only a generation that reached a started station, while the
+/// function is not being removed and its DMA was proven reclaimed. A startup
+/// failure before the station (missing assets, firmware, calibration) stops.
+fn supervise(reached_station: bool, removed: bool, reclaimed: bool, generation: u32) -> Action {
+    if reached_station && !removed && reclaimed && generation + 1 < MAX_GENERATIONS {
+        Action::Regenerate
+    } else {
+        Action::Stop
     }
 }
 async fn terminalize(shell: &Device<startup::Startup>, lifecycle: &Lifecycle<startup::Startup>) {
@@ -313,25 +418,7 @@ impl Bootstrap {
         // An accepted FLR keeps its mandatory no-config quarantine; the
         // reset is dropped only after `run` returned.
         drop(self.reset.lock().await.take());
-        let lifecycle = {
-            let lifecycle = self.lifecycle.lock();
-            lifecycle.clone()
-        };
-        let Some(lifecycle) = lifecycle else {
-            // Reset never completed: BME stayed parked, nothing published.
-            self.set_stage(Stage::Terminal);
-            return true;
-        };
-        let taken = lifecycle.retained.lock().await.take();
-        let reclaimed = match taken {
-            Some(mut owner) => {
-                let reclaimed = owner.retire();
-                let _ = owner.io.finish_station_shutdown().await;
-                reclaimed
-            }
-            // Another retirement already took the owner; its result stands.
-            None => false,
-        };
+        let reclaimed = self.retire_generation().await;
         self.set_stage(Stage::Terminal);
         reclaimed
     }
@@ -424,6 +511,8 @@ pub(super) fn probe(
         request: IrqSafeSpinLock::new(None),
         running: AtomicBool::new(false),
         removed: AtomicBool::new(false),
+        pinned: AtomicBool::new(false),
+        generation: AtomicU32::new(0),
     });
     publish_owner(owner);
     Ok(())
@@ -485,6 +574,8 @@ pub(super) unsafe fn attach_cold(
         request: IrqSafeSpinLock::new(None),
         running: AtomicBool::new(false),
         removed: AtomicBool::new(false),
+        pinned: AtomicBool::new(false),
+        generation: AtomicU32::new(0),
     });
     publish_owner(owner);
     Ok(())
@@ -542,6 +633,8 @@ mod tests {
             request: IrqSafeSpinLock::new(None),
             running: AtomicBool::new(true),
             removed: AtomicBool::new(false),
+            pinned: AtomicBool::new(false),
+            generation: AtomicU32::new(0),
         });
         *OWNER.lock() = Some(owner.clone());
         if probe(device, authority).is_err() {
@@ -578,6 +671,8 @@ mod tests {
             request: IrqSafeSpinLock::new(None),
             running: AtomicBool::new(true),
             removed: AtomicBool::new(false),
+            pinned: AtomicBool::new(false),
+            generation: AtomicU32::new(0),
         })
     }
     fn ready<T>(future: impl core::future::Future<Output = T>) -> Option<T> {
@@ -623,6 +718,7 @@ mod tests {
             retained: Mutex::new(None),
         });
         let pinned = fixture(device, Some(lifecycle));
+        pinned.pinned.store(true, Ordering::Release);
         *OWNER.lock() = Some(pinned.clone());
         if ready(finish_remove(pinned.clone())) != Some(false)
             || OWNER
@@ -641,9 +737,56 @@ mod tests {
         remove(device, Cap::bootstrap());
         TestResult::Pass
     }
+    fn smoke_rtw8852b_generation_supervisor_regenerates_only_proven_station_closures() -> TestResult
+    {
+        // Halted or disconnected started station with proven reclamation.
+        if supervise(true, false, true, 0) != Action::Regenerate
+            || supervise(true, false, true, MAX_GENERATIONS - 2) != Action::Regenerate
+        {
+            return TestResult::Fail("closed station with reclaimed DMA was not reset");
+        }
+        for (reached, removed, reclaimed, generation) in [
+            (false, false, true, 0),
+            (true, true, true, 0),
+            (true, false, false, 0),
+            (true, false, true, MAX_GENERATIONS - 1),
+        ] {
+            if supervise(reached, removed, reclaimed, generation) != Action::Stop {
+                return TestResult::Fail(
+                    "startup failure, removal, pinned DMA or generation bound regenerated",
+                );
+            }
+        }
+        // Retirement of a generation with no owner reports the pinned mark.
+        let lifecycle = Arc::new(Lifecycle {
+            retained: Mutex::new(None),
+        });
+        let owner = fixture(device(), Some(lifecycle.clone()));
+        if ready(owner.retire_generation()) != Some(true) {
+            return TestResult::Fail("ownerless unpinned generation was not reclaimable");
+        }
+        owner.pinned.store(true, Ordering::Release);
+        if ready(owner.retire_generation()) != Some(false) {
+            return TestResult::Fail("pinned generation reported reclamation");
+        }
+        // A removal racing a rearm stops it before any reset is stored.
+        let owner = fixture(device(), None);
+        owner.removed.store(true, Ordering::Release);
+        if ready(owner.rearm()) != Some(None)
+            || owner.reset.try_lock().is_none_or(|reset| reset.is_some())
+            || owner.generation.load(Ordering::Acquire) != 0
+        {
+            return TestResult::Fail("rearm stored a reset for a removed function");
+        }
+        TestResult::Pass
+    }
     kernel_test_in!(
         "drivers/wireless/rtw89/bootstrap",
         smoke_rtw8852b_retained_probe_never_reparks_or_replaces_reset_owner
+    );
+    kernel_test_in!(
+        "drivers/wireless/rtw89/bootstrap",
+        smoke_rtw8852b_generation_supervisor_regenerates_only_proven_station_closures
     );
     kernel_test_in!(
         "drivers/wireless/rtw89/bootstrap",
