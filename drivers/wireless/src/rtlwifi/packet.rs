@@ -505,6 +505,19 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         report.and(mac).and(stopped)
     }
+    /// Removal (`rtl_op_stop` → `rtl_pci_stop` → `rtl88ee_card_disable`):
+    /// stop a not-yet-stopped owner, then run the card-disable quiescence
+    /// proof. True when the owner may be dropped with its DMA released
+    /// (never published, or proven idle); false keeps every mapping pinned.
+    pub(crate) async fn retire(&mut self) -> bool {
+        if !self.published {
+            return true;
+        }
+        if self.phase != Phase::Stopped && self.stop_packets().is_err() {
+            return false;
+        }
+        self.quiesce().await.is_ok()
+    }
     /// True once `quiesce` proved the stopped rings idle; Drop then
     /// releases every DMA allocation instead of retaining it.
     pub(crate) fn reclaimable(&self) -> bool {

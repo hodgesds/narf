@@ -1340,3 +1340,87 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/device",
     smoke_rtl8188ee_native_device_rate_mask_follows_rx_pwdb
 );
+
+/// Linux `rtl_pci_remove` on the composed Device: the linked station sends
+/// its disconnect report, the chip is masked before the vector is released,
+/// and the rings are freed only after the card-disable quiescence proof.
+pub(crate) fn smoke_rtl8188ee_native_device_remove_releases_after_quiescence() -> TestResult {
+    use super::super::super::super::super::irq::{Signal, IRQ_MASK0_88E};
+    let owner_present = |h: &Harness| {
+        h.device
+            .prepared
+            .try_lock()
+            .map(|storage| storage.is_some())
+    };
+    // Success: bound vector, linked station, idle TX buffer and RXDMA.
+    let h = Harness::new(false);
+    let signal = Signal::new();
+    *h.irq.signal.lock() = Some(signal.clone());
+    h.join();
+    h.pump();
+    if h.packet.radio.word(0xb0) != IRQ_MASK0_88E {
+        return TestResult::Fail("EE removal fixture did not bind its vector");
+    }
+    h.packet.radio.hardware_byte(0x286, 2);
+    h.packet.model.lock().commands.clear();
+    if !complete(h.device.remove()) || !h.device.removed_for_test() {
+        return TestResult::Fail("EE idle removal did not reclaim DMA");
+    }
+    {
+        let model = h.packet.model.lock();
+        if model.commands.first() != Some(&(1, vec![0])) || model.master {
+            return TestResult::Fail("EE removal skipped the disconnect report or kept BME");
+        }
+    }
+    if h.packet.radio.word(0xb0) != 0
+        || h.irq.delivered.lock().last() != Some(&false)
+        || h.irq.signal.lock().is_some()
+    {
+        return TestResult::Fail("EE removal released the vector before masking");
+    }
+    if owner_present(&h) != Some(false)
+        || !h.packet.live_regions().is_empty()
+        || h.device.link_up()
+        || h.device.connected_bssid().is_some()
+        || narf_net::iface::lookup(h.device.name()).is_some()
+    {
+        return TestResult::Fail("EE removal kept the owner, DMA, carrier or netdev");
+    }
+    if !complete(h.device.remove()) || complete(h.device.associate(h.request())).is_ok() {
+        return TestResult::Fail("EE removed Device was not idempotent or reopened");
+    }
+    drop(h);
+    // Failure: RXDMA never idles -> the owner and every mapping stay pinned.
+    let h = Harness::new(false);
+    h.join();
+    h.pump();
+    h.packet.radio.hardware_byte(0x286, 0);
+    if complete(h.device.remove()) || owner_present(&h) != Some(true) {
+        return TestResult::Fail("EE busy RXDMA removal released the owner");
+    }
+    let regions = h.packet.live_regions();
+    let drops = h.packet.drops.load(Ordering::SeqCst);
+    let packet = h.packet.clone();
+    drop(h);
+    if regions.iter().any(|r| !r.live.load(Ordering::Acquire))
+        || packet.drops.load(Ordering::SeqCst) != drops
+    {
+        return TestResult::Fail("EE unproven removal freed pinned DMA");
+    }
+    // Teardown before any association: the never-started owner is stopped
+    // and proven idle, without a disconnect report.
+    let h = Harness::new(false);
+    h.packet.radio.hardware_byte(0x286, 2);
+    h.packet.model.lock().commands.clear();
+    if !complete(h.device.remove())
+        || owner_present(&h) != Some(false)
+        || !h.packet.model.lock().commands.is_empty()
+    {
+        return TestResult::Fail("EE never-associated removal differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/device",
+    smoke_rtl8188ee_native_device_remove_releases_after_quiescence
+);

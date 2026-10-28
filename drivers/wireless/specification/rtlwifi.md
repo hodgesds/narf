@@ -864,6 +864,41 @@ Device: level-0 mask at association, fallback DATA descriptor, strong and
 weak beacon PWDB moving HIGH → MIDDLE → LOW, no re-send at an unchanged
 level, no refresh after disassociate).
 
+### RTL8188EE device removal (implemented)
+
+`pci.rs` registers `narf_bus::register_pci_remove` for every matched id.
+The hook follows Linux v7.2 `pci.c::rtl_pci_remove`: only the bound
+function detaches from the controller slot, its address is quarantined
+(`probe` refuses it before any config/BAR access), and an async task runs
+`interface::Device::remove`:
+
+1. `ieee80211_unregister_hw`: the publisher worker is told to exit, the
+   admission closes (carrier down, `nl80211` disconnect), and the
+   registrations `publish` made are withdrawn (`ACTIVE`/`CLAIMED`,
+   `narf_wireless::registry`, `narf_net::registry`, `narf_net::iface`).
+2. `rtl_op_stop` → `rtl_pci_stop`: `rtl88ee_disable_interrupt` masks
+   HIMR/HIMRE before `rtl_pci_deinit` disables MSI and frees the vector
+   (`withdraw_interrupts`); a linked station first leaves LPS and sends the
+   JOINBSSRPT disconnect (`disconnect_station`).
+3. `rtl88ee_card_disable`: `Prepared::retire` stops a not-yet-stopped
+   owner (`stop_packets`, BME cleared) and runs the card-disable
+   quiescence proof (`Prepared::quiesce`). Only a proven-idle (or never
+   published) owner is dropped, which releases every ring, RX buffer,
+   pending payload and reserved-page body, and the quarantine is lifted.
+   An unproven owner keeps every mapping pinned and its address stays
+   quarantined. Removal is idempotent and a removed Device never reopens.
+
+Non-8188EE diagnostic profiles never publish DMA; their removal only
+withdraws the static interface and wireless registration.
+
+Tests: `smoke_rtl8188ee_native_device_remove_releases_after_quiescence`
+(linked removal: disconnect report, mask before vector release, BME
+parked, owner/DMA/netdev/carrier gone, idempotent, no reopen; busy RXDMA
+keeps the owner and every mapping; never-associated removal) and
+`smoke_rtl8188ee_pci_remove_detaches_and_quarantines_exact_owner` (wrong
+address ignored, quarantined re-probe refused without I/O, reclaimed
+removal lifts the quarantine).
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE
@@ -898,7 +933,7 @@ implemented and software-validated. Physical board qualification remains.
 | RF/BB tables, calibration, channel/power and rate control | RTL8188EE tables/retained1T IQK/LCK, static factory antenna, signed board/factory/regulatory legacy20 power, operational MAC and negotiated legacy peer/rate/filter integration implemented. Measured board envelope and silicon qualification remain; optional gain tracking is excluded by measured profile |
 | Scan, management RX/TX, authentication/association and WPA2 | Retained EE channel1 passive scan, Open MLME, shared WPA2/CCMP and exact M4 receipt implemented; Device/composition regressions pass native suites. Other matched chips remain missing |
 | Ethernet packet path and terminal TX completion ownership | EE same-owner native Device/Narf-Ring/stack and Open/WPA2 real-kernel DHCP/exact bidirectional IP fixtures pass software gates; actual board testing remains |
-| Multi-radio, removal, suspend/reset/recovery | Missing |
+| Multi-radio, removal, suspend/reset/recovery | RTL8188EE PCI removal (quiescence-gated DMA release) implemented; multi-radio, suspend and reset missing |
 
 Per-chip remaining inventory uses Linux per-chip `sw.c` and radio/PCI ops:
 

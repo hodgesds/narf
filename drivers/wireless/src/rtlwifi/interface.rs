@@ -53,6 +53,8 @@ pub(crate) struct Device<I: Port<Buffer = M>, M: Memory, E: Environment> {
     rx: Arc<IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
     leisure: IrqSafeSpinLock<Leisure>,
+    /// `rtl_pci_remove` ran: the publisher worker exits.
+    removed: AtomicBool,
 }
 /// Linux `rtl_watchdog_wq_callback` LPS bookkeeping (`link_info`
 /// num_rx/tx_inperiod, `mac->cnt_after_linked`) plus a pending
@@ -181,6 +183,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             rx: Arc::new(IrqSafeSpinLock::new(Some(consumer))),
             tx: IrqSafeSpinLock::new(Some(producer)),
             leisure: IrqSafeSpinLock::new(Leisure::default()),
+            removed: AtomicBool::new(false),
         }
     }
     fn update_link(&self, peer: Option<[u8; 6]>) {
@@ -482,6 +485,65 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         } else if periods >= 5 && !owner.leisure() && owner.transmit_ready() {
             let _ = owner.enter_leisure().await;
         }
+    }
+    /// Linux `rtl_pci_remove` for the native owner. `ieee80211_unregister_hw`
+    /// closes every control/packet path and withdraws the netdev, wireless
+    /// and stack registrations; `rtl_op_stop` → `rtl_pci_stop` masks the chip
+    /// (`disable_interrupt`) before `rtl_pci_deinit` releases the MSI vector;
+    /// a linked station first sends its JOINBSSRPT disconnect. The retained
+    /// owner is then stopped and must pass the card-disable quiescence proof
+    /// (`Prepared::quiesce`) before it is dropped and its rings released.
+    /// Returns whether the DMA mappings were reclaimed; otherwise they stay
+    /// pinned for the kernel's lifetime. Idempotent.
+    pub(super) async fn remove(self: &Arc<Self>) -> bool {
+        self.removed.store(true, Ordering::Release);
+        self.close();
+        if let Some(signal) = self.environment.interrupt() {
+            signal.raise();
+        }
+        self.withdraw();
+        let mut storage = self.prepared.lock().await;
+        self.state.lock().await.clear();
+        let Some(owner) = storage.as_mut() else {
+            return true;
+        };
+        self.withdraw_interrupts(owner);
+        if owner.station_peer().is_some() {
+            let _ = owner.disconnect_station().await;
+        }
+        let reclaimed = owner.retire().await;
+        if reclaimed {
+            // Proven idle (or never published): Drop releases every ring.
+            storage.take();
+        }
+        reclaimed
+    }
+    /// Withdraw this device from every registry `publish` entered.
+    fn withdraw(self: &Arc<Self>) {
+        if !self.published.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let was_active = {
+            let mut active = ACTIVE.lock();
+            let this = Arc::as_ptr(self) as *const ();
+            let matches = active
+                .as_ref()
+                .is_some_and(|a| Arc::as_ptr(a) as *const () == this);
+            if matches {
+                *active = None;
+            }
+            matches
+        };
+        narf_wireless::registry::unregister(&self.name);
+        narf_net::registry().unregister(&self.name);
+        narf_net::iface::unregister(&self.name);
+        if was_active {
+            CLAIMED.store(false, Ordering::Release);
+        }
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn removed_for_test(&self) -> bool {
+        self.removed.load(Ordering::Acquire)
     }
     /// `rtl88e_dm_watchdog` RA step: refresh the firmware rate mask from
     /// the smoothed RX PWDB. A failed H2C aborts the station (the next
@@ -1047,6 +1109,9 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
     device.environment.firmware.native().arm_msi();
     narf_scheduler::spawn(async move {
         loop {
+            if device.removed.load(Ordering::Acquire) {
+                break;
+            }
             // Snapshot before servicing so a vector raised mid-pass is seen.
             let signal = device.environment.interrupt();
             let seen = signal.as_ref().map(|s| s.count());
