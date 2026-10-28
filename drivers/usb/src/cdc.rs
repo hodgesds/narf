@@ -239,6 +239,10 @@ pub enum CdcError {
     /// suspend/resume replay) can tell a refused request from a
     /// malformed one.
     Transfer,
+    /// The device did not declare support for the requested
+    /// operation (e.g. `SEND_BREAK` without the ACM functional
+    /// descriptor's send-break capability bit).
+    Unsupported,
 }
 
 // ── Header functional descriptor (CDC 1.2 §5.2.3.1) ──────────────
