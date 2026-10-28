@@ -37,6 +37,7 @@ narf-filesystem      = { path = "../../filesystem" }
 narf-io              = { path = "../../io" }
 narf-interrupts      = { path = "../../interrupts" }
 narf-drivers-backlight = { path = "../backlight" }
+narf-drivers-sound = { path = "../sound" }
 
 [features]
 # Each GPU vendor's driver set is a selectable feature. `default`

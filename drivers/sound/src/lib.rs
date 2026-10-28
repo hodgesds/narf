@@ -68,6 +68,7 @@ extern crate alloc;
 mod alsa;
 pub mod codec;
 pub mod devfs_bridge;
+pub mod display_audio;
 pub mod format;
 pub mod hardware;
 pub mod hda;

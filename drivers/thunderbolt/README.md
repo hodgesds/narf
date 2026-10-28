@@ -36,8 +36,13 @@ tunneling between parent and child routers using the bandwidth-ownership
 handshake in both directions, PCIe tunnelling between a PCIe
 downstream adapter on an ancestor router and the PCIe upstream
 adapter on a device router (journaled path programming in both
-directions, adapters enabled last), and a host-to-device DisplayPort tunnel
-per domain at base link rate. Tunnel writes are journaled before
+directions, adapters enabled last), and multiple host-to-device
+DisplayPort tunnels per domain at the negotiated link rate (RBR
+through HBR3), with USB4 bandwidth-allocation mode for adapters
+that support it: per-link bandwidth groups shared with USB3
+tunnels, allocation requests serviced through the CM Acknowledge
+handshake, and graceful rate/lane fallback when a link cannot
+carry the demanded envelope. Tunnel writes are journaled before
 submission and rolled back in reverse on failure, and existing
 firmware-enabled tunnels are preserved rather than claimed. Reporting a
 tunnel is not a claim that a monitor has trained or that scanout is live.

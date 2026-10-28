@@ -34,6 +34,8 @@ pub mod cm;
 #[cfg(feature = "builtin")]
 mod control;
 #[cfg(feature = "builtin")]
+pub mod dp_bw;
+#[cfg(feature = "builtin")]
 mod firmware;
 #[cfg(feature = "builtin")]
 pub mod icm;

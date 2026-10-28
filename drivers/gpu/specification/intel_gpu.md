@@ -1,12 +1,13 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.9** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.10** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
 > bounds/flush discipline landed — see §9; forcewake domains
 > landed — see §11; RC6 + DMC landed — see §12; suspend/resume
-> + D-state transitions landed — see §13).
+> + D-state transitions landed — see §13; external DisplayPort
+> full single-stream landed — see §14).
 >
 > Clean-room driver for Intel integrated graphics from Tiger Lake
 > through Meteor Lake. **No GPL Linux `i915` / `xe` source
@@ -60,8 +61,8 @@ The volume layout is stable across Gen12 (TGL / ADL / RPL):
 | 2a  | Command Reference: Instructions      | `intel_gpu_rcs` (MI command codecs) |
 | 2c  | Command Reference: Engines           | `intel_gpu_rcs` (execlists / LRC model) |
 | 5   | Memory Views                         | `intel_gpu_gtt`, `intel_gpu_rcs` |
-| 11  | Display Engine Registers             | `intel_gpu_pll`       |
-| 12  | Display DDIs / Plane Programming     | `intel_gpu_ddi`, `intel_gpu_gmbus` |
+| 11  | Display Engine Registers             | `intel_gpu_pll`, `intel_gpu_dp` (HPD) |
+| 12  | Display DDIs / Plane Programming     | `intel_gpu_ddi`, `intel_gpu_gmbus`, `intel_gpu_audio` |
 | 14  | Display Engine                       | `intel_gpu_pipes`     |
 | 16  | Workarounds                          | (consult per-bug)     |
 
@@ -889,3 +890,239 @@ snapshot's RC6 bit is currently always off. D3cold is not
 used (the bus layer supports D3hot only; the link stays
 up and config survives). PSR/DC-state runtime policy and
 S0ix are out of scope.
+
+## 14. External DisplayPort, full single-stream (lane Q4 — `intel_gpu_dp`, #1092)
+
+The external-DP path for combo DDIs A/B/C, Gen12. Compiled
+only under the gpu crate's `intel` feature. Sources: VESA
+DisplayPort 1.4a (§2.7 AUX, §2.7.6 I²C-over-AUX, §3.5 link
+training, DPCD receiver-capability field), TGL PRM Vol. 11
+(PLL table, HPD block) and Vol. 12 (DDI, audio), CEA-861-D
+§7.5 (ELD).
+
+Public interface:
+
+- `probe_sink(mmio, ddi) -> DpSinkProbe` — the AUX
+  conversation: DPCD capabilities, the *complete* EDID (base +
+  extension blocks), and link negotiation for the preferred
+  mode. No display registers are touched beyond AUX.
+- `activate(mmio, probe, fb) -> DpConnection` — modeset at
+  the negotiated plan (`Modeset::modeset_with_plan`), then
+  display-audio publication. `connect` composes the two.
+- `disconnect(mmio, conn)` — audio disable + sink clear, then
+  pipeline teardown. `retrain(mmio, conn, fb)` answers an
+  IRQ_HPD short pulse: the connection stands if every trained
+  lane still reports CR_DONE, else a fresh connect runs.
+- `HpdMonitor` / `poll_hpd_event` — GEN8 DE Port block
+  (ISR 0x44440, IMR 0x44444, IIR 0x44448, IER 0x4444C; combo
+  hotplug bits at `1 << (3 + ddi_index)`). Level rise/fall is
+  Connect/Disconnect; a latched IIR bit on a steady high level
+  is the DP short pulse → `RetrainRequired`. Production glue
+  in `intel_gpu::poll_dp_hpd_events` drains events, allocates
+  the scanout (probe's allocator/lifetime), and publishes
+  through the §7 ACTIVE + observer protocol.
+
+Two seams are defined here for named consumers:
+
+- **Shared link-training core** —
+  `dp_link_training::{read_caps, negotiate, train_negotiated}`
+  (with `DpcdCaps`, `SourceCaps`, `NegotiatedLink`): the
+  vendor-neutral caps + negotiation + training composition
+  over `dp_aux::AuxChannel`. Negotiation policy: lanes first
+  (largest mutually supported of 4/2/1), then the lowest rate
+  whose 8b/10b payload covers the stream demand, capped by
+  both sides; an uncoverable demand settles at the mutual
+  ceiling with `over_budget` reported. **Thunderbolt lane 3
+  (#1095) consumes this seam** over tunnelled AUX and must not
+  re-implement it.
+- **Shared display-audio sink** —
+  `narf_drivers_sound::display_audio`: `build_eld` turns a
+  complete EDID into the CEA-861 ELD publication (layout
+  field-checked against the HDA codec's own ELD parser);
+  `publish_display_audio` / `clear_display_audio` /
+  `current_display_audio` are the registry. **HDMI-full
+  (#1019) consumes this seam** as second publisher (same sink
+  id per physical connector: DDI index + 1). The Intel codec
+  side (`intel_gpu_audio`: AUD_CONFIG DP timestamp update,
+  AUD_PIN_ELD_CP_VLD output-enable / ELD-valid sequencing per
+  `hsw_audio_codec_enable/disable`) raises ELD_VALID only
+  after the ELD is published in the sink.
+
+Modeset plan path (`Modeset::modeset_with_plan`): the DPLL
+is programmed at the negotiated rate, M/N and the
+`TRANS_DDI_FUNC_CTL` port width carry the planned rate/lanes,
+and if the fallback ladder settles elsewhere the DPLL, M/N,
+port width and BUF_TRANS are reprogrammed to the trained
+configuration before the DDI buffer enables. The legacy eDP
+path (`Modeset::modeset`) is byte-for-byte unchanged.
+
+Invariants:
+
+- Every DPCD read on the wire requests exactly the byte count
+  its caller waits for. (Found defect, fixed in this lane:
+  `dp_aux::AuxChannel::dpcd_read` and the `dp_edid` chunk
+  reads passed an empty length placeholder, so over the Intel
+  MMIO transport every multi-byte read failed reply-length
+  decode and EDID readback silently fell back to the
+  hardcoded mode. The per-address test stubs that ignored the
+  request length masked it; the composed transport+sink
+  fixtures here are the regression pin.)
+- EDID-over-AUX is one I²C read transaction per 128-byte
+  block: offset write, then 16-byte bursts with MOT clear on
+  all but the final burst (MOT set = STOP). Extension blocks
+  are fetched per the base block's byte 126; blocks past the
+  first 256-byte segment would need the I²C 0x30 segment
+  pointer, which is not driven (the CTA block is extension 1).
+- The plan path programs the DPLL at the negotiated rate
+  under the DSSM-selected reference family (lane Q6, #1024 —
+  `decode_refclk_family` + `combo_coeffs(rate, family)`), the
+  same resolver the legacy path uses; both PRM families
+  (19.2/38.4 MHz and 24 MHz) are fixture-pinned there.
+- Audio is published only when the sink's CTA extension
+  carries at least one SAD; a sink without audio gets video
+  only, and disconnect always clears the publication before
+  the pipeline comes down.
+
+Deliberate remainders: DP MST and multi-pipe (#1017),
+Xe-LPG display (#1016), Type-C HPD via the GEN11 DE HPD block
+(the Alt-Mode bridge's DDIs), DSC/FEC, and the HPD IRQ
+handler itself (interrupt enables are programmed; the
+session is poll-driven until an IRQ consumer lands).
+
+## 15. External HDMI, full (lane Q5 — `intel_gpu_hdmi`, #1019)
+
+The external-HDMI path for combo DDIs, Gen12. Compiled
+only under the gpu crate's `intel` feature. Sources: HDMI
+1.4 §5.3.5 and CTA-861 infoframe packing (as implemented
+by Linux `drivers/video/hdmi.c`), HDMI 2.0 §10 (SCDC; the
+register map as carried by `drm_scdc_helper.h`), TGL PRM
+Vol. 2c (TRANS_DDI_FUNC_CTL HDMI bits), Vol. 11 (WRPLL —
+the `cnl_ddi_calculate_wrpll` search i915 uses for HDMI on
+CNL and ICL+), Vol. 12 (DIP banks, AUD_CONFIG), CEA-861-D
+§7.5 (ELD, via the §14 sink).
+
+Public interface:
+
+- `probe_sink(mmio, ddi) -> HdmiSinkProbe` — the complete
+  EDID over DDC, the preferred mode, the HDMI Forum VSDB
+  capabilities, and whether the mode's character rate
+  demands scrambling. No display registers are touched.
+- `activate(mmio, probe, fb) -> HdmiConnection` — SCDC
+  configuration where required, the WRPLL modeset
+  (`Modeset::modeset_hdmi`), the AVI infoframe, then
+  display-audio publication. `connect` composes the two.
+- `disconnect(mmio, conn)` — audio disable + sink clear,
+  DIP disable, pipeline teardown.
+
+DDC runs over the **GMBUS codec** (`intel_gpu_gmbus`): the
+base EDID block uses the codec's own read program verbatim;
+indexed and segment-pointer reads, and the SCDC writes,
+compose the codec's field helpers — no second DDC
+transport. The session drives the codec's documented
+caller sequence (program GMBUS0/GMBUS1, poll GMBUS2 via
+`GmbusStatus`, drain/fill GMBUS3, restore GMBUS0 = 0)
+directly, because Q3 (#1018) has not landed a transport
+yet; when it does, the engine functions in
+`intel_gpu_hdmi` are the swap-out point. The GMBUS_BASE
+correction (0xC510 → 0xC5100) and the duplicated GMBUS2
+HW_DONE bit are #1018's and are not duplicated here — the
+session and its fixtures key off the codec's constants,
+never a private copy of the base.
+
+Character-rate rule (HDMI 2.0 §10.4): at 8 bpc the TMDS
+character rate of a mode is its pixel clock. Above
+340 Mcsc the stream requires SCDC scrambling and the 1/40
+TMDS bit-clock ratio, plus both TRANS_DDI_FUNC_CTL HDMI
+bits (Scrambling Enabled bit 0, High TMDS Char Rate
+bit 4); the PLL still runs at 5× the character rate (the
+1/40 ratio divides the bit clock, not the character-rate
+clock). At or below 340 Mcsc the sink is not touched over
+SCDC at all. A >340 Mcsc mode against a sink whose HF-VSDB
+does not declare SCDC is refused with
+`ScramblingUnsupported`, never silently degraded.
+
+SCDC sequence (`configure_scdc`): refuse unless the
+HF-VSDB declares SCDC_Present; read-modify-write
+TMDS_CONFIG (0x20) setting SCRAMBLING_ENABLE | ratio 1/40;
+wait out the specification's 1 ms minimum settle
+(poll-counted, per the #879 poll-budget discipline); read
+SCRAMBLER_STATUS (0x21) and require the scrambling bit,
+else `ScramblingVerifyFailed`. Configuration runs before
+the modeset binds the transcoder.
+
+Clocking: HDMI rates do not come from the fixed DP PLL
+rows — `intel_gpu_pll::hdmi_wrpll_coeffs` runs the WRPLL
+search (AFE = 5× TMDS clock; DCO window 7 998–10 000 MHz;
+the divider list and P/Q/K decomposition transcribed from
+`cnl_ddi_calculate_wrpll` / `cnl_wrpll_get_multipliers`;
+38.4 MHz reference treated as 19.2 per
+`cnl_hdmi_pll_ref_clock`), under the reference family
+decoded from the DSSM strap (lane Q6, #1024), as on the DP
+path. Rows are fixture-pinned with an
+independent decode check (DCO / (P·Q·K) must reproduce
+exactly 5× the TMDS clock). `Modeset::modeset_hdmi` omits
+the DP-only steps: no M/N, no BUF_TRANS load, no link
+training; the DDI buffer enables at the HDMI-fixed 4-lane
+width.
+
+Infoframes: AVI (type 0x82, v2, 13 data bytes) and audio
+(type 0x84, v1, 10 data bytes) packed per HDMI 1.4 §5.3.5
+with the checksum byte making the whole frame sum to
+0 mod 256; both pinned byte-for-byte in fixtures. The VIC
+comes from the mode's geometry (a small table; exact
+timings still govern the modeset — 720×480 pins the 4:3
+VIC 2 because the mode shape carries no pixel aspect).
+The AVI frame is written through the HSW+ video DIP:
+CTL enable bit cleared, the 32-byte DIP image written to
+the AVI data bank (the frame's checksum slot is a 1-byte
+hardware ECC hole at buffer position 3), enable set,
+posting read. The audio infoframe is *not* DIP-programmed
+— this hardware has no audio DIP bank; the HDA codec
+synthesises it from the published ELD, and the packed
+frame rides the connection for that consumer.
+
+Audio consumes the §14 **shared display-audio sink** as
+second publisher (`DisplayConnector::Hdmi`; same sink id
+per physical connector — DDI index + 1 — because a
+connector is either DP or HDMI at a time). The codec side
+is the HDMI branch of `intel_gpu_audio`: AUD_CONFIG
+carries the PRM pixel-clock code for the TMDS clock and
+latches with N_PROG_ENABLE only (no DP timestamp mode, no
+N_VALUE_INDEX — the disable path conditions that bit on
+the old configuration being DP, so the HDMI disable omits
+it too). Publication order matches §14: ELD into the sink
+first, codec enable, then ELD_VALID. The cross-vendor
+display-audio story is tracked in #778 (AMD), referenced
+not closed by this lane.
+
+HPD is the §14 GEN8 DE Port block, shared: HDMI sinks
+answer DDC, DP sinks answer AUX, so the glue
+(`intel_gpu::handle_dp_hpd_event`) tries the DP connect
+first and falls back to HDMI; a fall tears down whichever
+session owns the DDI. Short pulses remain DP-only.
+
+Invariants:
+
+- A ≤340 Mcsc connect produces zero SCDC-slave traffic
+  (fixture-asserted over the recorded GMBUS programs).
+- SCDC writes precede the first TRANS_DDI_FUNC_CTL write
+  (fixture-asserted over the recorded write log).
+- The modeset's CFGCR0/CFGCR1 writes for a mode equal the
+  WRPLL fixture rows for that TMDS clock.
+- Disconnect clears the ELD publication before the
+  pipeline comes down, and clears the DDI buffer last.
+
+Fixtures: a GMBUS sink model (EDID store + SCDC register
+file decoding the GMBUS1 program fields itself) exercising
+1080p connect with no SCDC traffic, 4K60 connect with the
+SCDC RMW + verify + func-ctl bit pins, 4K60 refused
+without SCDC, scrambling-verify failure, sink NACK,
+4-block EDID over the E-DDC segment pointer, HF-VSDB
+parsing past a decoy HDMI Licensing VSDB, infoframe
+byte pins, and disconnect teardown order.
+
+Deliberate remainders: DVI signalling (same TMDS path,
+no infoframes/SCDC — a follow-up, not filed here), YCbCr
+4:2:0 and deep colour (character rate ≠ pixel clock —
+the rate rule's premise is 8 bpc RGB), HDCP (separate
+programme), HDMI 2.1 FRL, Type-C HDMI alt mode.

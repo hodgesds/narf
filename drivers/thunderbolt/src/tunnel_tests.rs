@@ -189,6 +189,8 @@ fn tunnel(protocol: Protocol) -> Tunnel {
             output: Endpoint { route: 1, port },
             protocol,
             dprx_done: false,
+            dp: None,
+            consumed_mbps: 0,
         },
         writes: Vec::new(),
         resource: false,

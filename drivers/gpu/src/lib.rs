@@ -688,11 +688,15 @@ pub mod drm_uapi;
 #[cfg(feature = "intel")]
 pub mod intel_gpu;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_audio;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_aux;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_ddi;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_dmc;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_dp;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_dp_bridge;
 #[cfg(feature = "intel")]
@@ -703,6 +707,8 @@ pub mod intel_gpu_forcewake;
 pub mod intel_gpu_gmbus;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gtt;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_hdmi;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_modeset;
 #[cfg(feature = "intel")]

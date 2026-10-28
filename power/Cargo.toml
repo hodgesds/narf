@@ -29,12 +29,14 @@ narf-event-bus    = { path = "../event_bus" }
 narf-filesystem   = { path = "../filesystem" }
 narf-input        = { path = "../input" }
 narf-crypto       = { path = "../crypto" }
+narf-ctap2        = { path = "../ctap2" }
 narf-block        = { path = "../block" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 zeroize           = { version = "1", default-features = false, features = ["alloc"] }
+argon2            = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
 
 [features]
-kernel-test = []
+kernel-test = ["narf-ctap2/fixture-token"]
 
 [lints]
 workspace = true

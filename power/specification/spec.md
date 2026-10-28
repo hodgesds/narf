@@ -413,10 +413,183 @@ total (caps before allocation, trailing garbage refused).
 are the resume environment's entry surface (it also consumes
 `decode_hook_region` + `TrustedImage::read_hook_region` to stage
 hook blobs); `RecordedPolicy` is what the policy engine
-administers. Policy levels and floors and the resume environment
-itself are separate lanes (design §12); this section specifies
-the service, the format, the custody contract, and the state-hook
-contract.
+administers. Policy levels and floors are a separate lane (design
+§12); this section specifies the service, the format, the custody
+contract, and the state-hook contract. The resume environment
+that consumes the reader pipeline is specified next.
+
+#### Resume environment (S4 resume)
+
+The early context of design §6 (`power/src/suspend_service/resume.rs`
++ `early_blk.rs`). It stands up before any restored state is
+trusted, and its whole interface is one function:
+
+- `attempt_resume(store, anchors, prompt) -> Result<VerifiedResume, ResumeRefusal>`
+  drives the normative trust order of design §6.2: parse the
+  header claims (`parse_claims`); announce the attempt under the
+  *claimed* policy through the `ResumePrompt` seam (production:
+  `ConsolePrompt` over the early console) — claims are announced
+  as attempts, never as facts; satisfy the recorded policy
+  through the `KeyCustodyAnchor` seam (OFF via the published
+  derivation; a wrapped image via the first anchor whose kind
+  matches an enrolled slot and whose unwrap succeeds — the first
+  successful unwrap decides, and there is no fallback between
+  policy paths); verify the whole image (`verify_all`); only
+  then mint the handoff value.
+- `VerifiedResume` is the only output restored state may be built
+  from. It wraps the pipeline's `TrustedImage`, so chunk delivery
+  re-verifies against the manifest at read time, and exposes the
+  authenticated policy record, image/chunk extents, the
+  authenticated hook-region length, and the per-hook key
+  derivation the state-hook registry consumes at unseal.
+- `ResumeRefusal` classes exist for boot routing: `NoImage`
+  (header magic mismatch — the ordinary cold-boot case),
+  `UnsupportedVersion`, `FactorUnavailable` (no provided anchor
+  implements a kind the recorded policy needs; never a cue to
+  try a weaker policy), `FactorRefused` (matching anchors all
+  refused or failed), `AuthenticationFailed` (one class for SMK
+  unwrap, header seal, manifest, and chunk failures — the resume
+  path is not an oracle for which check failed), and `Service`
+  (structural/store failures, carried verbatim). On every
+  refusal, no part of the image has been delivered to anyone.
+
+The image is read through the **early block reader**
+(`early_blk.rs`, design §6.3): a polled, read-only virtio-blk
+reader for the pre-scheduler context — one device, one queue,
+one request in flight, no interrupts — because the running block
+layer is part of what a resume restores. Its surface:
+
+- `EarlyTransport`, the hardware seam: 32-bit register accesses
+  over the virtio-mmio window (VirtIO 1.2 §4.2.2) plus DMA byte
+  copies into the queue window. All queue memory crosses this
+  seam as little-endian byte accesses.
+- `PolledBlkReader::open(transport, dma_base, dma_len)` performs
+  the §2.1 handshake accepting only `VIRTIO_F_VERSION_1`, programs
+  queue 0 in the DMA window, and reads the §5.2.4 capacity.
+  Legacy-version devices, non-block devices, refused features,
+  unusable queues, and zero capacity are typed `EarlyBlkError`
+  refusals; completion and reset polls are bounded, so a wedged
+  device is a `Timeout` refusal, never a hang. The reader
+  implements `ImageStore` offset-generally and refuses writes:
+  the resume side only ever reads ciphertext.
+- Transport scope: virtio-mmio. A PCI common-config front end
+  slots behind `EarlyTransport` without touching the
+  queue/request core; it is a named follow-on, as is boot wiring
+  (partition discovery, early window mapping, calling
+  `attempt_resume` from the boot path).
+
+#### Suspend service — token resume ceremony (S4 token, issue #1001)
+
+Landed by P5: the FIDO token anchor and the ceremony the resume
+environment drives for token-factor policies,
+`suspend_service::token_anchor`.
+
+- `TokenAnchor<P: HidPipe, R: RandomSource, U: TokenUserInterface>`
+  is the production `KeyCustodyAnchor` of kind token (code 1),
+  built on P3's `narf-ctap2` `Client`. `HidPipe` is the
+  transport seam: production binds it to the resume
+  environment's polled HID path; fixtures bind it to P3's
+  fixture authenticator. `TokenUserInterface` is the ceremony's
+  user seam — progress lines out, PIN in (as zeroizing bytes);
+  `ConsoleTokenUi` is the production binding (polled console,
+  masked echo, empty entry = abandon).
+- Slot record framing (params, version 1): version byte, then
+  credential id length (u16 LE) and id, then a fresh 32-byte
+  salt1 for the hmac-secret derivation. The blob is
+  nonce(12) ‖ ciphertext(32) ‖ tag(16): the epoch SMS
+  AEAD-wrapped (ChaCha20-Poly1305) under
+  HKDF-SHA256(slot output, `"narf-suspend/token-slot"` ‖ epoch
+  LE), with the epoch and credential id as AAD. The hmac-secret
+  output is never stored or logged; the SMS is reachable only
+  through a completed ceremony.
+- Ceremony (unwrap): derive the slot output through P3's
+  `derive_slot_output` (PIN protocol ONE; `uv` required exactly
+  when a PIN is in play), then open the blob. The failure
+  mapping is part of the contract: `CTAP2_ERR_PIN_INVALID`
+  re-asks, announcing the authenticator's own remaining-retry
+  count (read back via `getPinRetries`) — PIN retry state is
+  the token's, never replicated locally; `PIN_BLOCKED` /
+  `PIN_AUTH_BLOCKED` refuse; `NO_CREDENTIALS` /
+  `INVALID_CREDENTIAL` refuse so the resume driver tries the
+  next enrolled slot (backup tokens — any enrolled credential
+  resumes, not just the primary); transport timeouts are
+  `Unavailable`; everything else, including AEAD-open failure,
+  is `Failed`, with no per-cause oracle.
+- Policy posture (decided 2026-10-26): touch+PIN is the
+  default for token-only policies (`TokenPinMode::TouchAndPin`);
+  touch-only is the explicit enrollment-time choice. Abandoning
+  the PIN prompt refuses the slot — the ceremony never
+  downgrades to a weaker factor.
+- `resume_with_token(store, pipe, rng, ui, config, prompt)` is
+  the presence-aware driver: a successful connect runs
+  `attempt_resume` with the connected anchor; a failed connect
+  runs it with none, so a token-policy image with no
+  authenticator present refuses as `FactorUnavailable` — never
+  the OFF path.
+- Enrollment: an anchor built by `TokenAnchor::from_client`
+  carrying an enrolled credential id wraps the epoch SMS when
+  `SuspendService::enroll` calls it (credential creation and
+  the ≥2-distinct-credential rule are P3's `enroll_token` path,
+  unchanged). Resume-side anchors are unwrap-only: `wrap`
+  without an enrolled credential fails.
+
+#### Passphrase anchor (S4 floor and recovery slot)
+
+The Argon2id passphrase factor of design §9
+(`power/src/suspend_service/passphrase.rs`, issue #1004),
+behind the same `KeyCustodyAnchor` seam (`AnchorKind::Passphrase`,
+code 5):
+
+- `PassphraseAnchor::wrap` records a slot whose params block is
+  `version ‖ flags ‖ memory ‖ time ‖ lanes ‖ salt[32]` and whose
+  blob is a ChaCha20-Poly1305 wrap of the SMS under
+  `Argon2id(passphrase, salt, params)` (version 0x13, 32-byte
+  output, via the workspace's `argon2` crate — the LUKS2
+  binding), with the SMS epoch and the full params block bound
+  as AAD. Salt and wrap nonce are drawn from the service's
+  seed-grade entropy seam; without it, wrap is
+  `AnchorError::Unavailable` — no degraded slot is ever minted.
+- `PassphraseAnchor::unwrap` derives at the slot's *recorded*
+  parameters (the floor is not hardware-bound, design §9.2) but
+  only inside the anchor's `PassphrasePolicy` window: caps
+  mirror the LUKS2 unlock policy (1 GiB / 16 passes / 64 lanes)
+  as a resume-environment exhaustion bound, floors are the
+  anti-downgrade bound. Out-of-window records refuse
+  (`Refused`) before the passphrase is requested and before any
+  KDF work runs. A wrong passphrase, a wrong combiner secret,
+  and a tampered blob or params block are the single class
+  `Failed` — no oracle.
+- The design §9.1 operating point is memory 512 MiB, lanes 4,
+  time cost calibrated at enrollment to the ~2 s target
+  (`calibrate_time_cost`); the calibrated set is what the slot
+  records. `argon2id_kdf` is the single derivation entry point,
+  validated byte-for-byte against the RFC 9106 §5.3 vector.
+- The §9.3 UEFI combiner is an anchor option, default off:
+  with a machine secret configured, the KEK is
+  `HKDF(KEK_pass ‖ machine_secret)`, the slot records a
+  combiner flag (never the secret), and a combiner slot
+  refuses where the secret is not presented. Provisioning and
+  reading the UEFI variable is platform integration, not part
+  of this surface.
+- `change_passphrase(service, old_anchor, old_params,
+  new_anchor)` replaces a slot in place: the old anchor must
+  unwrap the existing record (proof of the current
+  passphrase), the replacement enrolls, and only then is the
+  old record revoked — a failure leaves the old slot intact.
+- `resume_with_passphrase(store, anchors, prompt, delay)`
+  wraps `attempt_resume` with the §9.4 floor discipline:
+  retries only `FactorRefused`, exponential backoff
+  (`backoff_millis`: 1 s doubling, 60 s cap) between attempts
+  through the `ResumeDelay` seam (production: `MonotonicDelay`
+  on the monotonic clock), the attempt count held in RAM only,
+  and after `MAX_RESUME_PASSPHRASE_FAILURES` (10) refusals the
+  cold-boot offer is announced (image retained) and the
+  refusal returned. Other refusal classes return immediately —
+  a tampered image is never retried into an oracle.
+- Passphrase entry is the `PassphraseSource` seam (production:
+  `ConsolePassphraseSource`, early console, no echo,
+  1024-byte cap), called inside `unwrap` so the resume
+  prompt's attempt/fact ordering is preserved.
 
 ### 3.4 Thermal
 
