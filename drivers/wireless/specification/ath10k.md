@@ -452,6 +452,9 @@ Host-bus/system power transitions remain separate profiles.
   robust unicast frames still encrypted on WMI management RX, whereas Linux
   `wmi.c::ath10k_wmi_rx_is_decrypted` assumes firmware decryption in
   hardware-crypto mode; that firmware behaviour needs physical confirmation.
+  PEER_ASSOC carries no `WMI_PEER_PMF`: Linux `mac.c::ath10k_peer_assoc_h_crypto`
+  sets it only with `ATH10K_FW_FEATURE_MFP_SUPPORT`, for firmware-side
+  management crypto that this software-crypto image does not use.
 - The registered Device binds native preparation, authentication/association,
   WMM/peer/up commands and initial RSNA data to a chosen factory/frequency/power
   receipt. It samples current policy before and after each nested wait and
