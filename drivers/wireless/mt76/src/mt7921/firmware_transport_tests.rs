@@ -37,6 +37,8 @@ mod receive_epoch_tests;
 mod rx_ba_tests;
 #[path = "rx_fragment_tests.rs"]
 mod rx_fragment_tests;
+#[path = "six_ghz_tests.rs"]
+mod six_ghz_tests;
 #[path = "system_pm_tests.rs"]
 mod system_pm_tests;
 #[path = "tx_ba_tests.rs"]

@@ -109,7 +109,9 @@ pub(super) fn rx_native_with_amsdu(packet: &[u8]) -> Option<NativeRx<'_>> {
     let r2 = word(packet, 8)?;
     let frequency = (word(packet, 12)? >> 8) & 0x1ff;
     let channel = u8::try_from(frequency).ok()?;
-    super::super::channel::band(channel)?;
+    // RXD3 CH_FREQ, kept raw: 6 GHz values (181..) decode through
+    // mt792x_get_status_freq_info and are compared against rx_channel().
+    super::super::channel::from_rx_channel(channel)?;
     let r4 = word(packet, 16)?;
     let cipher = (r1 >> 16) & 0x1f;
     if !matches!(cipher, 0 | 4) // MT_CIPHER_NONE / MT_CIPHER_AES_CCMP

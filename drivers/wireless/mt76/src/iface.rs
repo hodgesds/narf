@@ -106,6 +106,16 @@ impl Mt76Iface {
                     .collect(),
             });
         }
+        // mt7921_set_stream_he_caps: the 6 GHz sband exists only with
+        // MT_NIC_CAP_6G (and inside has_5ghz).
+        if crate::mt7921::six_ghz::qualified(self.radio) {
+            bands.push(WirelessBand {
+                freq_mhz: 6000,
+                channels: crate::mt7921::channel::channels_6ghz()
+                    .map(u32::from)
+                    .collect(),
+            });
+        }
         bands
     }
 
@@ -599,8 +609,15 @@ impl WirelessNetIface for Mt76Iface {
     async fn associate(&self, req: AssociateRequest) -> Result<(), WirelessError> {
         let _control = self.control.lock().await;
         let channel = u8::try_from(req.channel).map_err(|_| WirelessError::InvalidArgs)?;
-        if crate::mt7921::channel::frequency(channel) != Some(req.frequency_mhz) {
+        // A 6 GHz request is identified by its frequency: channel numbers
+        // alone collide with 2.4/5 GHz.
+        let six = narf_wireless::association::channel::from_frequency_band(req.frequency_mhz)
+            == Some((narf_wireless::association::channel::Band::Ghz6, channel));
+        if !six && crate::mt7921::channel::frequency(channel) != Some(req.frequency_mhz) {
             return Err(WirelessError::InvalidArgs);
+        }
+        if six && !crate::mt7921::six_ghz::qualified(self.radio) {
+            return Err(WirelessError::NotSupported);
         }
         if req.ssid.is_empty()
             || req.ssid.len() > 32
@@ -646,14 +663,21 @@ impl WirelessNetIface for Mt76Iface {
             .lock()
             .iter()
             .find(|b| {
-                b.bssid == req.bssid && b.ssid == req.ssid && u32::from(b.channel) == req.channel
+                b.bssid == req.bssid
+                    && b.ssid == req.ssid
+                    && u32::from(b.channel) == req.channel
+                    && crate::mt7921::association::is_six_ghz(b) == six
             })
             .cloned()
             .ok_or(WirelessError::InvalidArgs)?;
 
         let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| WirelessError::Denied)?;
-        crate::mt7921::association::TxPermission::from_domain(&domain, bss.channel)
-            .ok_or(WirelessError::Denied)?;
+        if six {
+            crate::mt7921::association::TxPermission::from_ap(&domain, self.radio, &bss)
+        } else {
+            crate::mt7921::association::TxPermission::from_domain(&domain, bss.channel)
+        }
+        .ok_or(WirelessError::Denied)?;
 
         {
             use crate::mt7921::firmware_transport::{associate_boot_station, Error};
@@ -1187,7 +1211,10 @@ mod tests {
             || iface.rx_ring().lock().is_some()
             || iface.tx_ring().lock().is_some()
             || info.base_name != "wlan7"
-            || info.bands.len() != 2
+            // MT_NIC_CAP_6G is reported: the 6 GHz band (1, 5, ..., 233).
+            || info.bands.len() != 3
+            || info.bands[2].freq_mhz != 6000
+            || info.bands[2].channels != (1..=233).step_by(4).collect::<Vec<_>>()
             || info.bands[0].channels != (1..=11).collect::<Vec<_>>()
             || !info.hw_caps.ht_supported
             || iface

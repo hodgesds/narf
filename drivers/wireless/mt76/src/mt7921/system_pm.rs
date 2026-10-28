@@ -237,8 +237,25 @@ impl<B: Backend> Session<B> {
         // mt7921_mcu_regd_update: the firmware's country/CLC limits are
         // reloaded from the same package-selected world tables used at
         // initialization, then the radio LED returns on.
+        self.program_6ghz_power_type(info, crate::mt7921::six_ghz::MT_AP_UNSET)
+            .await?;
+        self.radio_led(RADIO_ON_LED).await
+    }
+
+    /// `__mt7921_mcu_regd_update` -> `__mt7921_mcu_set_clc`: post the
+    /// package-selected world CLC tables with `env_6g` (offset 12 of the
+    /// request) set to the station's `enum mt792x_reg_power_type`.
+    /// `mt7921_regd_set_6ghz_power_type` (mt7921/main.c:766-806) runs this
+    /// with the AP's power type when a 6 GHz station is added and with
+    /// `MT_AP_UNSET` when it is removed.
+    pub(super) async fn program_6ghz_power_type(
+        &mut self,
+        info: super::RadioInfo,
+        env_6g: u8,
+    ) -> Result<(), Error> {
         let responses = info.capabilities.chip_capabilities & 1 != 0;
-        for body in self.firmware.world_limits(info.hardware_type, responses)? {
+        for mut body in self.firmware.world_limits(info.hardware_type, responses)? {
+            body[12] = env_6g;
             let command = Command::Ce {
                 id: 0x5c,
                 query: false,
@@ -249,7 +266,7 @@ impl<B: Backend> Session<B> {
                 self.notify(command, &body).await?;
             }
         }
-        self.radio_led(RADIO_ON_LED).await
+        Ok(())
     }
 
     /// `mt7921_mcu_radio_led_ctrl`: EXT `ID_RADIO_ON_OFF_CTRL` `{ctrlid, rsv}`.

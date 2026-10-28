@@ -1,5 +1,8 @@
 //! Legacy 20 MHz channel geometry from Linux mt76/mac80211.c.
-//! Channel numbers with the CONNAC2 6 GHz flag never enter this profile.
+//! 6 GHz channel numbers overlap the 2.4/5 GHz numbering, so they never enter
+//! [`band`]; a 6 GHz channel is always carried with an explicit
+//! [`Band::Ghz6`] (see [`rx_channel`] / [`from_rx_channel`] for the RXD
+//! encoding).
 use alloc::vec::Vec;
 
 pub(crate) const CHANNELS_5GHZ: [u8; 28] = [
@@ -11,20 +14,78 @@ pub(crate) const CHANNELS_5GHZ: [u8; 28] = [
 pub(crate) enum Band {
     Ghz2,
     Ghz5,
+    /// Linux v7.2 `NL80211_BAND_6GHZ`. Never derived from a bare channel
+    /// number; gated on the NIC `MT_NIC_CAP_6G` TLV, not on `phy.bands`.
+    Ghz6,
 }
 
 impl Band {
+    /// The `MT_NIC_CAP_PHY` band bit. 6 GHz has none (its capability is the
+    /// separate `has_6ghz` TLV), so its bit never matches `phy.bands & 3`.
     pub(crate) fn capability(self) -> u8 {
         self.scan_tag()
     }
+    /// mt76_connac_mcu_hw_scan / tx_power_limit_tlv / config_sniffer band:
+    /// 2.4 GHz 1, 5 GHz 2, 6 GHz 3 (mt7921/mcu.c:1167).
     pub(crate) fn scan_tag(self) -> u8 {
         match self {
             Self::Ghz2 => 1,
             Self::Ghz5 => 2,
+            Self::Ghz6 => 3,
         }
     }
+    /// mt7921_mcu_set_chan_info `channel_band`: the nl80211 band, except
+    /// that 6 GHz is 2 (mt7921/mcu.c:892).
     pub(crate) fn switch_tag(self) -> u8 {
         self.scan_tag() - 1
+    }
+    /// UNI_BSS_INFO_RLM `band`: the raw nl80211 band
+    /// (mt76_connac_mcu_uni_set_chctx), `NL80211_BAND_6GHZ` = 3.
+    pub(crate) fn nl80211(self) -> u8 {
+        match self {
+            Self::Ghz2 => 0,
+            Self::Ghz5 => 1,
+            Self::Ghz6 => 3,
+        }
+    }
+}
+
+/// 6 GHz 20 MHz channel numbers 1, 5, ..., 233 (cfg80211
+/// `ieee80211_channel_to_freq_khz`: 5950 + 5n MHz).
+pub(crate) fn channels_6ghz() -> impl Iterator<Item = u8> {
+    (1..=233u8).step_by(4)
+}
+
+/// The CONNAC2 RXD3 `CH_FREQ` value for a channel, as decoded by Linux
+/// `mt792x_get_status_freq_info`: 6 GHz channel n is `181 + (n - 1) / 4`.
+pub(crate) fn rx_channel(band: Band, channel: u8) -> Option<u8> {
+    match band {
+        Band::Ghz6 => (narf_wireless::association::channel::valid_6ghz(channel)
+            && channel % 4 == 1)
+            .then(|| 181 + (channel - 1) / 4),
+        _ => (self::band(channel) == Some(band)).then_some(channel),
+    }
+}
+
+/// Inverse of [`rx_channel`] (`mt792x_get_status_freq_info`): values above
+/// 180 are 6 GHz, above 14 are 5 GHz, the rest 2.4 GHz.
+pub(crate) fn from_rx_channel(value: u8) -> Option<(Band, u8)> {
+    if value > 180 {
+        let channel = (value - 181).checked_mul(4)?.checked_add(1)?;
+        narf_wireless::association::channel::valid_6ghz(channel).then_some((Band::Ghz6, channel))
+    } else {
+        band(value).map(|band| (band, value))
+    }
+}
+
+/// The centre frequency of a channel in an explicit band.
+pub(crate) fn frequency_in(band: Band, channel: u8) -> Option<u32> {
+    match band {
+        Band::Ghz6 => narf_wireless::association::channel::frequency_in(
+            narf_wireless::association::channel::Band::Ghz6,
+            channel,
+        ),
+        _ => frequency(channel).filter(|_| self::band(channel) == Some(band)),
     }
 }
 
@@ -42,6 +103,7 @@ pub(crate) fn frequency(channel: u8) -> Option<u32> {
     Some(match band(channel)? {
         Band::Ghz2 => 2407 + 5 * u32::from(channel),
         Band::Ghz5 => 5000 + 5 * u32::from(channel),
+        Band::Ghz6 => return None,
     })
 }
 

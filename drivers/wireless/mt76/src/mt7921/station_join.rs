@@ -1522,6 +1522,7 @@ impl<B: Backend> Session<B> {
         ssid: &[u8],
         own: [u8; 6],
         password: crate::mt7921::association::SaePassword,
+        rx_channel: u8,
     ) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>), Error> {
         use narf_wireless::sae::{SaeError, SaeSession};
         let join = plan.sae().ok_or(Error::MalformedEvent)?;
@@ -1560,7 +1561,7 @@ impl<B: Backend> Session<B> {
                         let Some(packet) = backend.receive_data()? else {
                             break;
                         };
-                        if let Some(reply) = rx_on_channel(&packet, bss.channel) {
+                        if let Some(reply) = rx_on_channel(&packet, rx_channel) {
                             if let Some(step) = plan
                                 .sae_authentication_response(reply, &mut session)
                                 .map_err(|_| Error::MalformedEvent)?
@@ -1597,13 +1598,25 @@ impl<B: Backend> Session<B> {
             State::Associated { .. } => return Err(Error::Busy),
             _ => return Err(Error::Busy),
         };
-        let band = crate::mt7921::channel::band(bss.channel).ok_or(Error::Bounds)?;
-        if !permission.permits(bss.channel) {
+        let six = crate::mt7921::association::is_six_ghz(bss);
+        let band = if six {
+            // MT_NIC_CAP_6G gates the 6 GHz band (mt7921/mcu.c:595).
+            if !crate::mt7921::six_ghz::qualified(info) {
+                return Err(Error::InvalidIdentity);
+            }
+            crate::mt7921::channel::Band::Ghz6
+        } else {
+            crate::mt7921::channel::band(bss.channel).ok_or(Error::Bounds)?
+        };
+        if !permission.permits_bss(bss) || permission.band() != Some(band) {
             return Err(Error::Authority);
         }
-        if info.capabilities.phy.bands & band.capability() == 0 {
+        if !six && info.capabilities.phy.bands & band.capability() == 0 {
             return Err(Error::InvalidIdentity);
         }
+        // RXD3 CH_FREQ of the operating channel (mt792x_get_status_freq_info).
+        let rx_channel =
+            crate::mt7921::channel::rx_channel(band, bss.channel).ok_or(Error::Bounds)?;
         let initial_limits = permission
             .rate_limits_for_paths(info.capabilities.phy.spatial_streams)
             .ok_or(Error::Bounds)?;
@@ -1641,6 +1654,13 @@ impl<B: Backend> Session<B> {
             }
             self.stage(Stage::ChannelSwitch);
             self.check_station_tx()?;
+            if let Some(grant) = permission.six {
+                // mt7921_mac_sta_add -> mt7921_regd_set_6ghz_power_type: the
+                // AP's power type reaches the CLC as env_6g before the peer.
+                self.program_6ghz_power_type(info, crate::mt7921::six_ghz::env_6g(grant.power))
+                    .await?;
+                self.check_station_tx()?;
+            }
             // 1. Authorize transmission on the target channel in channel domain (NO_IR = 0):
             let channels = permission.channels();
             let mut domain = vec![0u8; 12 + 8 * channels.len()];
@@ -1711,7 +1731,7 @@ impl<B: Backend> Session<B> {
             self.stage(Stage::Authenticate);
             let assoc_req = if let Security::Wpa3Sae { password } = security {
                 let (request, pmk) = self
-                    .authenticate_sae(&mut plan, bss, ssid, own, password)
+                    .authenticate_sae(&mut plan, bss, ssid, own, password, rx_channel)
                     .await?;
                 sae_pmk = Some(pmk);
                 request
@@ -1725,7 +1745,7 @@ impl<B: Backend> Session<B> {
                         let Some(packet) = backend.receive_data()? else {
                             break;
                         };
-                        if let Some(frame) = rx_on_channel(&packet, bss.channel) {
+                        if let Some(frame) = rx_on_channel(&packet, rx_channel) {
                             if let Some(assoc) = plan
                                 .authentication_response(frame)
                                 .map_err(|_| Error::MalformedEvent)?
@@ -1750,7 +1770,7 @@ impl<B: Backend> Session<B> {
                         let Some(packet) = backend.receive_data()? else {
                             break;
                         };
-                        if let Some(frame) = rx_on_channel(&packet, bss.channel) {
+                        if let Some(frame) = rx_on_channel(&packet, rx_channel) {
                             if let Some(aid) = plan
                                 .association_response(frame)
                                 .map_err(|_| Error::MalformedEvent)?
@@ -1857,6 +1877,19 @@ impl<B: Backend> Session<B> {
                     ),
                 )
                 .await?;
+            } else if six {
+                // mt76_connac_mcu_uni_set_chctx with band = NL80211_BAND_6GHZ.
+                self.exchange_station(
+                    Command::Unified { id: 2 },
+                    &crate::mt7921::six_ghz::rlm(
+                        bss.channel,
+                        permission.center_channel(),
+                        permission.native_width(),
+                        plan.transmit_streams(),
+                        (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
+                    ),
+                )
+                .await?;
             }
             let peer_record = plan.peer_record(aid, true).map_err(|_| Error::Bounds)?;
             self.exchange_station(Command::Unified { id: 3 }, &peer_record)
@@ -1897,7 +1930,7 @@ impl<B: Backend> Session<B> {
                                         break;
                                     };
                                     if let Some(pdu) =
-                                        peer_eapol(&packet, own, bss.bssid, bss.channel)
+                                        peer_eapol(&packet, own, bss.bssid, rx_channel)
                                     {
                                         if let Some(result) =
                                             security.process(pdu, false, |out| {
@@ -1984,7 +2017,7 @@ impl<B: Backend> Session<B> {
                 self.state = State::Associated {
                     info,
                     peer: bss.bssid,
-                    channel: bss.channel,
+                    channel: rx_channel,
                     aid,
                 };
                 if let Err(error) = self.sync_receive_capture() {
@@ -2110,6 +2143,12 @@ impl<B: Backend> Session<B> {
                 .await?;
                 self.confirm_command_progress().await?;
             }
+            if closing_permission.is_some_and(|p| p.six.is_some()) {
+                // mt7921_mac_sta_remove -> mt7921_regd_set_6ghz_power_type
+                // (is_add = false): IEEE80211_REG_UNSET_AP -> MT_AP_UNSET.
+                self.program_6ghz_power_type(info, crate::mt7921::six_ghz::MT_AP_UNSET)
+                    .await?;
+            }
             Ok(())
         }
         .await;
@@ -2173,7 +2212,7 @@ impl<B: Backend> Session<B> {
         let limits = permission
             .rate_limits_for_paths(info.capabilities.phy.spatial_streams)
             .ok_or(Error::Bounds)?;
-        let band = crate::mt7921::channel::band(channel).ok_or(Error::Bounds)?;
+        let band = permission.band().ok_or(Error::Bounds)?;
         let channels = permission.channels();
         let mut domain = vec![0; 12 + 8 * channels.len()];
         domain[..2].copy_from_slice(&permission.country);

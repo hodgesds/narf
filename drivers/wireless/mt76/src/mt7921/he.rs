@@ -170,7 +170,12 @@ pub(crate) struct Profile {
 
 impl Profile {
     pub(crate) fn negotiated(n: &phy::Negotiated, ies: &[u8], five: bool) -> Result<Self, Error> {
-        let he: &HeNegotiation = n.he().ok_or(Error::UnsupportedFirmware)?;
+        Self::from_he(n.he().ok_or(Error::UnsupportedFirmware)?, ies, five)
+    }
+    /// The profile of one shared HE negotiation: the 2.4/5 GHz PHY plan's,
+    /// or a 6 GHz plan's `SixGhzPlan::he()` (6 GHz HE capabilities equal
+    /// the 5 GHz ones in `mt7921_init_he_caps`, so `five` is set).
+    pub(crate) fn from_he(he: &HeNegotiation, ies: &[u8], five: bool) -> Result<Self, Error> {
         let local = he.local_capability();
         // capability_body(): extension ID, MAC(6), PHY(11), maps.
         let local = narf_wireless::association::he::HeCapability::parse(
