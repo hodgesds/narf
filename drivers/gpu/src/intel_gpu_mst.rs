@@ -1322,7 +1322,9 @@ pub mod tests {
             let branch_idx = if lct == 1 {
                 0
             } else if lct == 2 {
-                let port_no = rad[0] & 0xF;
+                // The first hop's port is RAD[0]'s high nibble
+                // (Linux `drm_dp_calculate_rad`, shift 4 at LCT 1).
+                let port_no = rad[0] >> 4;
                 self.branches.first()?.ports.iter().find_map(|p| {
                     if p.number == port_no {
                         p.child
@@ -1674,6 +1676,15 @@ pub mod tests {
             if (0x4_6010..=0x4_6018).contains(&off) && (off - 0x4_6010) % 4 == 0 {
                 return v | PLL_POWER_STATE | PLL_LOCK;
             }
+            // DBUF slices grant power when requested.
+            {
+                use crate::intel_gpu_wm::{
+                    DBUF_CTL_S1, DBUF_CTL_S2, DBUF_POWER_REQUEST, DBUF_POWER_STATE,
+                };
+                if (off == DBUF_CTL_S1 || off == DBUF_CTL_S2) && v & DBUF_POWER_REQUEST != 0 {
+                    return v | DBUF_POWER_STATE;
+                }
+            }
             for pipe in [Pipe::A, Pipe::B, Pipe::C] {
                 if off == pipe.base() + PIPECONF_OFFSET {
                     use crate::intel_gpu_pipes::{PIPECONF_ENABLE, PIPECONF_STATE};
@@ -1856,6 +1867,19 @@ pub mod tests {
             stride: u32,
         ) -> Result<MstStream, MstError> {
             let mode = self.mode_of(sink)?;
+            self.add_mode(sink, mode, pipe, fb_phys, stride)
+        }
+
+        /// `add` with the sink's mode already read, so a caller
+        /// can snapshot the hub after the EDID traffic.
+        fn add_mode(
+            &mut self,
+            sink: Sink,
+            mode: Mode,
+            pipe: Pipe,
+            fb_phys: u64,
+            stride: u32,
+        ) -> Result<MstStream, MstError> {
             let fb = Framebuffer {
                 phys_addr: fb_phys,
                 stride_bytes: stride,
@@ -2024,12 +2048,18 @@ pub mod tests {
         if fx.add(sink1, Pipe::B, phys, stride).is_err() {
             return TestResult::Fail("stream 1 add");
         }
+        // The sink's EDID (a REMOTE_I2C_READ) is read before the
+        // snapshot: the refusal under test is the allocation's.
+        let mode2 = match fx.mode_of(sink2) {
+            Ok(m) => m,
+            Err(_) => return TestResult::Fail("sink 2 EDID"),
+        };
         // Snapshot everything the refused add must not touch.
         let requests_before = fx.hub(|h| h.request_log.len());
         let table_before = fx.hub(|h| h.source_table.clone());
         let writes_before = fx.mmio.writes.borrow().len();
         let avail_before = fx.hub(|h| h.branches[0].ports[1].avail_pbn);
-        match fx.add(sink2, Pipe::C, 0x500_0000, 10240) {
+        match fx.add_mode(sink2, mode2, Pipe::C, 0x500_0000, 10240) {
             Err(MstError::InsufficientBandwidth {
                 needed_pbn,
                 available_pbn,

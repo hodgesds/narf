@@ -683,6 +683,15 @@ pub mod tests {
                 // Every DPLL enable block reads powered + locked.
                 return v | PLL_POWER_STATE | PLL_LOCK;
             }
+            // DBUF slices grant power when requested.
+            {
+                use crate::intel_gpu_wm::{
+                    DBUF_CTL_S1, DBUF_CTL_S2, DBUF_POWER_REQUEST, DBUF_POWER_STATE,
+                };
+                if (off == DBUF_CTL_S1 || off == DBUF_CTL_S2) && v & DBUF_POWER_REQUEST != 0 {
+                    return v | DBUF_POWER_STATE;
+                }
+            }
             // PIPECONF blocks (pipe/transcoder conf are aliased
             // per pipe): STATE mirrors ENABLE.
             for pipe in [Pipe::A, Pipe::B, Pipe::C] {
