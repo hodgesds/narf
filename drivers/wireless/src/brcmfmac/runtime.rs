@@ -12,7 +12,10 @@ use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 
 #[path = "runtime/mailbox.rs"]
 pub mod mailbox;
+#[path = "runtime/quiesce.rs"]
+mod quiesce;
 use super::irq::Signal;
+pub use quiesce::StopProof;
 
 const INPUT: usize = 1518;
 const CONTROL: usize = 8192;
@@ -185,6 +188,9 @@ pub struct Runtime<B: Bus> {
     delivered: bool,
     /// Linux `BRCMFMAC_PCIE_STATE_DOWN`: no H2D posts or mailbox re-enable.
     down: bool,
+    /// Set only by a complete confirmed-stop proof (`quiesce.rs`).
+    reclaimable: bool,
+    hostrdy_db1: bool,
 }
 impl<B: Bus> core::fmt::Debug for Runtime<B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -196,16 +202,19 @@ impl<B: Bus> core::fmt::Debug for Runtime<B> {
 }
 impl<B: Bus> Drop for Runtime<B> {
     fn drop(&mut self) {
-        if self.published {
+        if self.published && !self.reclaimable {
             self.stop_interrupts();
             let _ = self.bus.park_dma();
-            // BME readback cannot prove all old posted PCI writes drained.
-            // No physical stop/IOMMU quiescence API exists yet. Leak this
-            // bounded per-device owner rather than returning live DMA pages.
+            // Without a confirmed stop (D3 ack, drained completions, verified
+            // BME clear and post-clear flush reads) BME readback alone cannot
+            // prove old posted PCI writes drained. Leak this bounded owner
+            // rather than returning live DMA pages.
             if let Some(resources) = self.resources.take() {
                 core::mem::forget(resources);
             }
         }
+        // A reclaimable owner drops its resources normally: the device can no
+        // longer master any of them.
     }
 }
 impl<B: Bus> Runtime<B> {
@@ -344,6 +353,8 @@ impl<B: Bus> Runtime<B> {
             signal: Signal::new(),
             delivered: false,
             down: false,
+            reclaimable: false,
+            hostrdy_db1: shared.hostrdy_db1(),
         };
         if let Some(reg) = runtime.bus.mailbox() {
             for address in [shared.htod_mb_data_addr, shared.dtoh_mb_data_addr] {
@@ -496,6 +507,9 @@ impl<B: Bus> Runtime<B> {
         if self.failed {
             return Err(Error::Failed);
         }
+        if self.down {
+            return Err(Error::Busy);
+        }
         if self.pending.is_some() {
             return Err(Error::Busy);
         }
@@ -592,6 +606,15 @@ impl<B: Bus> Runtime<B> {
         {
             return Err(Error::Timeout);
         }
+        let processed = self.service_rings()?;
+        if !self.down {
+            self.replenish()?;
+            self.replenish_rx()?;
+        }
+        Ok(processed)
+    }
+    /// One bounded fair pass over the three D2H completion rings.
+    fn service_rings(&mut self) -> Result<usize, Error> {
         let mut processed = 0;
         for ring_id in 2..5 {
             let mut ring_budget = 0;
@@ -629,8 +652,6 @@ impl<B: Bus> Runtime<B> {
                 ring_budget += 1;
             }
         }
-        self.replenish()?;
-        self.replenish_rx()?;
         Ok(processed)
     }
     fn control_completion(&mut self, entry: &[u8]) -> Result<(), Error> {
@@ -846,6 +867,9 @@ impl<B: Bus> Runtime<B> {
         if self.failed {
             return Err(Error::Failed);
         }
+        if self.down {
+            return Err(Error::Busy);
+        }
         if source == [0; 6] || source[0] & 1 != 0 || destination == [0; 6] || priority > 7 {
             return Err(Error::Protocol);
         }
@@ -998,6 +1022,9 @@ impl<B: Bus> Runtime<B> {
         if self.failed {
             return Err(Error::Failed);
         }
+        if self.down {
+            return Err(Error::Busy);
+        }
         self.control_available()?;
         let data = self
             .resources
@@ -1084,6 +1111,9 @@ impl<B: Bus> Runtime<B> {
     ) -> Result<u32, Error> {
         if self.failed {
             return Err(Error::Failed);
+        }
+        if self.down {
+            return Err(Error::Busy);
         }
         if !(15..=1514).contains(&frame.len()) || u16::from_be_bytes([frame[12], frame[13]]) < 0x600
         {

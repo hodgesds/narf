@@ -99,7 +99,7 @@ pub struct InterruptStats {
 }
 
 impl<B: Bus> Runtime<B> {
-    fn read_reg(&mut self, address: u32) -> Result<u32, Error> {
+    pub(super) fn read_reg(&mut self, address: u32) -> Result<u32, Error> {
         let value = self.bus.read32(address).map_err(|_| Error::Access)?;
         if value == u32::MAX {
             // A function that fell off the bus reads all-ones.

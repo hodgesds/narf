@@ -540,6 +540,60 @@ Smokes `drivers/wireless/brcmfmac`
 wake, W1C acknowledge, DS ACK (immediate and deferred), FWHALT, all-ones
 loss, polled fallback and vector release.
 
+### Confirmed stop and DMA reclamation
+
+`Runtime::quiesce` is the only path that makes published msgbuf memory
+(common rings, flow rings, control/event/RX buffers, IOCTL input, scratch and
+ring-update buffers, pending TX payloads) reclaimable:
+
+1. `enter_d3` (Linux v7.2 `brcmf_pcie_pm_enter_D3`): refuse while an IOCTL
+   is pending, set the bus down (`BRCMF_BUS_DOWN`: every H2D post — IOCTL,
+   flow create/delete, TX — now returns `Busy`, and RX/control buffers are
+   no longer reposted), send `BRCMF_H2D_HOST_D3_INFORM`
+   (`brcmf_pcie_send_mb_data`, 100 x 10 ms pending-word wait) and wait
+   `BRCMF_PCIE_MBDATA_TIMEOUT` (2 s) for `BRCMF_D2H_DEV_D3_ACK` through the
+   mailbox service. On timeout the bus returns to UP with the mailbox
+   re-enabled, exactly as Linux, and nothing is reclaimed; `FWHALT` fails
+   the owner.
+2. Consume every D2H completion published before the ack, without
+   reposting, and require each completion ring's firmware write index to
+   equal the host read index.
+3. `brcmf_pcie_release_irq` (mask, free vector, clear status), then clear
+   BME with a verified readback (`park_dma` + `dma_enabled`).
+4. Flush: non-posted BAR2/BAR0 reads issued after the BME clear must
+   still observe the same D2H write indices and a present function
+   (`MAILBOXINT` not all-ones). PCIe ordering forbids a read completion
+   passing the function's earlier posted writes, so a write issued before
+   the clear has landed by then, and any later index change voids the proof.
+
+Only a complete proof sets `reclaimable`; `Drop` then releases every
+mapping. Any failure (timeout, FWHALT, access fault, a changed index) fails
+the owner and keeps the published memory leaked by design. Linux frees the
+rings after `brcmf_pcie_release_irq` (`brcmf_pcie_reset`,
+`brcmf_pcie_remove`) without device-side evidence; this proof is the
+stricter NARF reclaim gate. It assumes the function does not set Relaxed
+Ordering on its DMA writes (Linux brcmfmac never enables RO for it; NARF
+`narf_bus::pci_express` exposes only an OR-in `set_device_control`, so it
+cannot clear `DEVCTL.RO` either).
+
+Smokes: `smoke_brcmf_confirmed_stop_reclaims_published_dma` (drain, IRQ
+release, BME, H2D gating, every mapping freed),
+`smoke_brcmf_unacknowledged_d3_reverts_and_retains_dma` (2 s timeout, UP
+again, nothing freed) and `smoke_brcmf_late_dma_or_halt_fails_stop_proof`
+(post-clear index change and FWHALT keep memory retained).
+
+IOMMU-backed quiescence remains open: the proof above holds with the
+IOMMU in identity/disabled mode (the only modes the native allocator
+accepts; `PerDomain` is refused in `native_runtime.rs::allocate`).
+`narf-io` would need a per-device detach that confirms completion — e.g.
+`narf_io::iommu::IommuDomain::detach_and_flush(&self, bdf: Bdf) ->
+Result<FlushReceipt, IoError>` that clears the DTE/context entry, issues
+the device IOTLB invalidation and waits for its completion (AMD-Vi
+`COMPLETION_WAIT`, VT-d invalidation-wait descriptor, SMMUv3 `CMD_SYNC`)
+before returning — plus a `PerDomain` `alloc_coherent` that maps into that
+device's domain. Today `IommuDomain::detach`/`unmap` only adjust counters
+and `PerDomain` map/unmap return `NotMapped`.
+
 ## 4. Invariants
 
 - No bus mastering without owned DMA mappings, ring lifetimes, and a
@@ -575,9 +629,9 @@ shared 5/6 TCM indices, retained common/control/flow/RX/TX DMA, bounded correlat
 IOCTL/events/data ownership, generation-safe retained flow recycling, shared
 station/control-port lifecycle and native probe-to-interface dispatch.
 
-The retained initial profile is shared 5/6, zero descriptor prefix, polling,
+The retained initial profile is shared 5/6, zero descriptor prefix, MSI or polled mailbox service,
 2.4/5 GHz Open or firmware-supplicant WPA2-PSK/CCMP, with one-shot terminal failure
-and permanent retention of published DMA. Its remaining deployment requirements
+and retention of published DMA unless a confirmed stop proves it reclaimable. Its remaining deployment requirements
 are real target identity/calibration/firmware assets, a verified selection manifest
 (or trusted platform registration), authenticated regulatory policy and physical
 station acceptance. No deployment board is manufactured by these tests.
@@ -611,8 +665,8 @@ Additional software outside that retained profile remains: nonzero descriptor
 prefixes, other CPU/RAM/chip/OTP selectors (including 160 MHz-capable
 chips), HE/EHT profiles, monitor mode (which owns native802.11 RX and its
 metadata), larger flow budgets, AP, replayed
-recovery/system PM, confirmed stop/IOMMU quiescence and DMA reclamation.
-These do not expand the initial polling/retained-failure acceptance claim.
+recovery/system PM, IOMMU-backed quiescence.
+These do not expand the initial retained-failure acceptance claim.
 WPA3-SAE offload (WCC `WSEC_PMK` passphrase ABI), the PMKSA cache, firmware
 roaming/FT, per-AC telemetry and host-supplicant fallback are common FullMAC
 work shared with CYW; see [CYW §3](cyw43439.md).

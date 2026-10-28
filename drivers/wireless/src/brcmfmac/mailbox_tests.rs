@@ -177,3 +177,143 @@ kernel_test_in!(
     "drivers/wireless/brcmfmac",
     smoke_brcmf_pcie_signal_wait_and_reginfo
 );
+
+/// Event buffer 9 (first of the eight posted event buffers) completes.
+fn post_event(st: &mut State, slot: usize) {
+    let at = pointer(st, RINGS + 2 * 16 + 8);
+    let entry = &mut st.dma.get_mut(&at).unwrap()[slot * 24..slot * 24 + 24];
+    entry[0] = 0xe;
+    entry[4..8].copy_from_slice(&9u32.to_le_bytes());
+    entry[12..14].copy_from_slice(&4u16.to_le_bytes());
+    put(st, D2HW, &((slot + 1) as u16).to_le_bytes());
+}
+
+fn smoke_brcmf_confirmed_stop_reclaims_published_dma() -> TestResult {
+    let (bus, s) = model();
+    {
+        let mut st = s.lock();
+        st.msi = true;
+        st.d3_ack = true;
+    }
+    let mut owner = match runtime::Runtime::attach(booted(bus)) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("attach failed"),
+    };
+    if owner.enable_data().is_err() {
+        return TestResult::Fail("RX posting failed");
+    }
+    // A completion published before the ack is drained, not abandoned.
+    post_event(&mut s.lock(), 0);
+    let proof = match ready(owner.quiesce()) {
+        Some(Ok(proof)) => proof,
+        _ => return TestResult::Fail("acknowledged D3 stop did not complete"),
+    };
+    {
+        let st = s.lock();
+        if proof.drained != 1
+            || proof.indices != [1, 0, 0]
+            || !owner.is_reclaimable()
+            || !owner.is_down()
+            || st.dma_enable
+            || st.sbmbx != [H2D_HOST_D3_INFORM]
+            || st.disarmed != 1
+            || mask(&st) != 0
+        {
+            return TestResult::Fail("D3 ack / drain / IRQ release / BME proof incomplete");
+        }
+    }
+    if owner.pop_event().is_none() {
+        return TestResult::Fail("drained event completion was lost");
+    }
+    if owner.begin_ioctl(262, b"ver\0", 4).err() != Some(runtime::Error::Busy)
+        || owner.open_flow([2, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 2], 0) != Err(runtime::Error::Busy)
+        || ready(owner.quiesce()) != Some(Err(runtime::Error::Busy))
+    {
+        return TestResult::Fail("stopped owner accepted a new H2D post or second stop");
+    }
+    drop(owner);
+    let st = s.lock();
+    if st.dropped != st.allocated || st.unsafe_free != 0 {
+        return TestResult::Fail("confirmed stop did not reclaim every published mapping");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmf_confirmed_stop_reclaims_published_dma
+);
+
+fn smoke_brcmf_unacknowledged_d3_reverts_and_retains_dma() -> TestResult {
+    let (bus, s) = model();
+    let mut owner = match runtime::Runtime::attach(booted(bus)) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("attach failed"),
+    };
+    // Firmware never answers D3_INFORM: Linux times out after 2 s and
+    // returns the bus to UP.
+    if narf_scheduler::block_on(owner.quiesce()) != Err(runtime::Error::Timeout)
+        || owner.is_down()
+        || owner.is_reclaimable()
+        || owner.is_failed()
+        || mask(&s.lock()) != MB_INT_D2H_DB | MB_INT_FN0
+        || owner.begin_ioctl(262, b"ver\0", 4).is_err()
+    {
+        return TestResult::Fail("D3 timeout did not revert to a usable UP owner");
+    }
+    drop(owner);
+    if s.lock().dropped != 0 {
+        return TestResult::Fail("unproven stop released published DMA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmf_unacknowledged_d3_reverts_and_retains_dma
+);
+
+fn smoke_brcmf_late_dma_or_halt_fails_stop_proof() -> TestResult {
+    // A device write observed by the post-BME flush read voids the proof.
+    let (bus, s) = model();
+    {
+        let mut st = s.lock();
+        st.d3_ack = true;
+        st.late_dma = true;
+    }
+    let mut owner = match runtime::Runtime::attach(booted(bus)) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("attach failed"),
+    };
+    if ready(owner.quiesce()) != Some(Err(runtime::Error::Protocol))
+        || owner.is_reclaimable()
+        || !owner.is_failed()
+        || s.lock().parks == 0
+    {
+        return TestResult::Fail("post-BME DMA activity was accepted as quiescence");
+    }
+    drop(owner);
+    if s.lock().dropped != 0 {
+        return TestResult::Fail("failed flush proof released published DMA");
+    }
+    // Firmware halts instead of acknowledging D3.
+    let (bus, s) = model();
+    let mut owner = match runtime::Runtime::attach(booted(bus)) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("attach failed"),
+    };
+    raise_mailbox(&mut s.lock(), D2H_DEV_FWHALT);
+    if ready(owner.quiesce()) != Some(Err(runtime::Error::Failed))
+        || !owner.is_failed()
+        || owner.is_reclaimable()
+    {
+        return TestResult::Fail("FWHALT during D3 wait did not fail the owner");
+    }
+    drop(owner);
+    if s.lock().dropped != 0 {
+        return TestResult::Fail("halted firmware stop released published DMA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmf_late_dma_or_halt_fails_stop_proof
+);

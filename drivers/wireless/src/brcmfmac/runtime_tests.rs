@@ -57,6 +57,9 @@ struct State {
     /// Firmware answers D0_INFORM by restoring INTMASK (still powered).
     d0_alive: bool,
     signal: Option<Rc<super::irq::Signal>>,
+    parks: usize,
+    /// A device posted write lands after BME clear (flush proof must fail).
+    late_dma: bool,
 }
 pub(crate) struct Model(Rc<IrqSafeSpinLock<State>>);
 pub(crate) struct Mem {
@@ -192,7 +195,14 @@ impl runtime::Bus for Model {
         Ok(())
     }
     fn park_dma(&mut self) -> Result<(), runtime::Error> {
-        self.0.lock().dma_enable = false;
+        let mut s = self.0.lock();
+        s.dma_enable = false;
+        s.parks += 1;
+        if s.late_dma {
+            // A completion index write still in flight across the BME clear.
+            let index = word(&s, D2HW) as u16;
+            put(&mut s, D2HW, &(index + 1).to_le_bytes());
+        }
         Ok(())
     }
     fn doorbell(&mut self) -> Result<(), runtime::Error> {
