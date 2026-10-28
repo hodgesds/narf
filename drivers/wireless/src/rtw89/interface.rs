@@ -744,8 +744,9 @@ pub(super) fn publish<I: Io + 'static>(device: Arc<Device<I>>) -> Result<(), Err
 pub(super) fn withdraw<I: Io + 'static>(device: &Device<I>) {
     withdraw_inner(device, false);
 }
-/// Generation reset: as [`withdraw`], but the name is reserved while still
-/// registered so the next generation's shell keeps it.
+/// Generation reset: as [`withdraw`], but the netdev is retired for rebind
+/// (`narf_net::iface::retire_for_rebind`) so the next generation's shell
+/// re-registers the same interface.
 pub(super) fn withdraw_keep_name<I: Io + 'static>(device: &Device<I>) -> String {
     withdraw_inner(device, true);
     device.name.clone()
@@ -757,10 +758,11 @@ fn withdraw_inner<I: Io + 'static>(device: &Device<I>, keep: bool) {
     }
     narf_wireless::registry::unregister(&device.name);
     narf_net::registry().unregister(&device.name);
-    if keep {
-        narf_net::iface::reserve_name(&device.name);
+    // `ieee80211_restart_hw` keeps the net_device: retire it for rebind so
+    // the next generation restores its ifindex, addresses and sockets.
+    if !keep || !narf_net::iface::retire_for_rebind(&device.name) {
+        narf_net::iface::unregister(&device.name);
     }
-    narf_net::iface::unregister(&device.name);
     let endpoint = device as *const Device<I> as *const ();
     let mut active = ACTIVE.lock();
     if active

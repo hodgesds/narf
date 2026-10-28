@@ -289,7 +289,9 @@ impl Bootstrap {
                 .await
                 .map_err(Error::Startup)?
         };
-        let name = kept.unwrap_or_else(|| narf_net::iface::reserve_name("wlan%d"));
+        let name = kept
+            .and_then(narf_net::iface::rebind_name)
+            .unwrap_or_else(|| narf_net::iface::reserve_name("wlan%d"));
         let shell = Arc::new(Device::new(
             name,
             identity.mac(),

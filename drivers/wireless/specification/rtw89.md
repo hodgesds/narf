@@ -1274,12 +1274,14 @@ transport error, or a disconnect) is retired under its lifecycle mutex:
 reclamation, then the XTAL/RF shutdown. `supervise` regenerates only when
 the generation reached the station, the function is not being removed, the
 DMA was proven reclaimed and fewer than `MAX_GENERATIONS` (64) generations
-ran. `rearm` withdraws the closed shell while reserving its name
-(`interface::withdraw_keep_name`), drops the retired lifecycle and claims a
+ran. `rearm` withdraws the closed shell and retires its netdev for rebind
+(`interface::withdraw_keep_name` -> `narf_net::iface::retire_for_rebind`,
+so the next generation's `rebind_name` registration restores the ifindex,
+addresses and sockets as `ieee80211_restart_hw` keeps the net_device), drops the retired lifecycle and claims a
 fresh `pci_reset::Reset` (stored under the reset mutex after a removed
 check), so the next generation repeats the observed FLR, discovery,
 firmware, MAC/RX, full radio and station start on the same function and
-publishes a new shell under the same `wlan%d` name, ready to scan and
+publishes a new shell on the same interface, ready to scan and
 associate again. `radio_policy::Board` binds "one fresh PCI lifecycle", the
 first observed FLR after boot. Every later generation is claimed with
 `pci_reset::Reset::repeat`; its `Fence` carries `radio_policy::Lifecycle::Repeat`
@@ -1409,9 +1411,9 @@ Each blocker below was re-checked against this tree.
 |---|---|
 | `eht` | Needs the RTL8922A chip row first. `efuse.rs` returns `UnsupportedChip` for 8922A, `irq::Mask::config` rejects the `_v2` layout, there is no BE TXD/RXD (`txrx.h` `BE_TXD_*`) or BE RA H2C (`rtw89_h2c_ra_v1`, `RTW89_H2C_RA_V1_W4_MODE_EHT`), and `station_control::Controller::new` plus the `N52B` qualification record are RTL8852B-only. The shared `association::eht` API is not the gap. |
 | `aggregation`, `block_ack_originator` | `packet_core::Core` keeps one `pending: Option<Pending>` and `ready()` is false while a frame is in flight. `station::State::pending` and the RPQ retirement are also single-frame. TX A-MPDU needs per-slot header/body DMA ownership for N in-flight tickets, `RTW89_TXWD_BODY3_AGG_EN`/`INFO1_MAX_AGGNUM`/`INFO2_AMPDU_DENSITY`, an originator ADDBA state machine (mac80211 `agg-tx.c`), `rtw89_chip_h2c_ampdu_cmac_tbl` on `TX_OPERATIONAL`/`TX_STOP_*`, and a new signed `Program` for the aggregate emitter. |
-| `pmf` | The rtw89 station has no SAE: `station.rs::associate` builds Open/WPA2-PSK only and `interface.rs` maps only `SecurityConfig::Open`/`Wpa2`. `packet_format::classify` refuses management frames with the Protected bit. The shared `JoinPlan::start_sae_authentication`, `Security::new_sae`, `protect_management` and `receive_management` exist. The composition smoke additionally needs a shared SAE/PMF AP fixture: `narf_wifi_fixtures::FakeAp` only offers open/WPA2-PSK, with no SAE commit/confirm, MFPC/MFPR, IGTK or BIP. |
-| `randomized_scan_mac` | The random MAC is implemented (section 3). Random sequence numbers need `NL80211_SCAN_FLAG_RANDOM_SN` in shared `narf_wireless::scan::ScanRequest`. |
-| `he_htc` | The shared `station_security::Security::normalize` rejects +HTC RX (Order bit, `b[1] & 0x87 != 2`) and the `RawFrame` contract forbids stripping HT Control. TX additionally needs RA C2H `might_fallback_legacy` (`rtw89_phy_c2h_ra_rpt_iter`) and Order-bit admission in `packet_format::classify`. |
+| `pmf` | Shared layer now provides `FakeAp::wpa3_sae`/`with_pmf`/`with_igtk`/`bip_broadcast_deauth`, `JoinOptions::{akms,pmf}` and the WPA2-PMF RSNE (merge e295558ed). The rtw89 gap remains: `station.rs::associate` builds Open/WPA2-PSK only, `interface.rs` maps only `SecurityConfig::Open`/`Wpa2`, there is no SAE commit/confirm path through `JoinPlan::start_sae_authentication`, and `packet_format::classify` refuses management frames with the Protected bit (host CCMP/BIP on RTL8852B, `hw_mgmt_tx_encrypt` false). |
+| `randomized_scan_mac` | The random MAC is implemented (section 3). Shared `supports_scan_random_sn()`/`scan_with_flags` (`NL80211_SCAN_FLAG_RANDOM_SN`) now exist (merge e295558ed); rtw89 still needs a `Device` override accepting the flag and a random initial sequence number in the probe-request path (`station.rs::scan_with` / `packet_format` probe builder). |
+| `he_htc` | Shared `Security` now accepts +HTC QoS DATA on RX (merge e295558ed). rtw89 still needs RX admission of the Order bit in `packet_core::receive`/`packet_format`, the HTC_HE capability advertisement, and TX insertion (`__rtw89_core_tx_adjust_he_qos_htc`) gated by RA C2H `might_fallback_legacy` (`rtw89_phy_c2h_ra_rpt_iter`), which the firmware-RA path does not decode yet. |
 
 ### Upstream applicability triage (2026-10-27)
 
