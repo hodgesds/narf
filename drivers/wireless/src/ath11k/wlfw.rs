@@ -37,10 +37,11 @@
 //! firmware's handshake are handled as `ath11k_qmi_driver_event_work`
 //! does once `ATH11K_FLAG_REGISTERED` is set.
 //!
-//! Not ported (not reached on PCIe WCN6855): `ath11k_qmi_assign_target_mem_chunk`
-//! (`fixed_mem_region`), `ath11k_qmi_request_device_info`
-//! (`hybrid_bus_type`), the `fixed_bdf_addr` ioremap path of
-//! `load_file_target_mem`, `ath11k_qmi_fwreset_from_cold_boot`, FTM
+//! AHB parts: `ath11k_qmi_assign_target_mem_chunk` (`fixed_mem_region`),
+//! `ath11k_qmi_request_device_info` (`hybrid_bus_type`) and the
+//! `fixed_bdf_addr` window of `load_file_target_mem`
+//! ([`DmaAllocator::iomem_write`]) are ported ([`WlfwConfig::ahb`]).
+//! Not ported: `ath11k_qmi_fwreset_from_cold_boot`, FTM
 //! mode. During the first bring-up a SERVER_EXIT ends the handshake with
 //! an error (Linux waits for the server to return).
 //!
@@ -115,8 +116,13 @@ pub mod step {
     /// FW_INIT_DONE after registration outside a recovery (Linux queues
     /// `restart_work`; the runtime's recovery takes that path).
     pub const FW_RESTART: u32 = 62;
-    /// `fixed_mem_region` / `hybrid_bus_type` part (not ported).
+    /// Unsupported chip / configuration.
     pub const UNSUPPORTED: u32 = 63;
+    /// `ath11k_qmi_request_device_info` failed (hybrid bus; detail =
+    /// reason: 1 txn/result, 2 missing TLV, 3 bad address/size).
+    pub const DEVICE_INFO: u32 = 64;
+    /// `fixed_bdf_addr` window could not be written (detail = offset).
+    pub const BDF_IOREMAP: u32 = 65;
 }
 
 /// A bring-up failure: diag step + detail, and the Linux errno.
@@ -156,6 +162,7 @@ pub const ENOMEM: i32 = 12;
 pub const EINVAL: i32 = 22;
 pub const ETIMEDOUT: i32 = 110;
 pub const EOPNOTSUPP: i32 = 95;
+pub const EIO: i32 = 5;
 
 /// `firmware_request_nowarn` for `ath11k/<dir>/<file>` paths.
 pub trait FirmwareLoader {
@@ -183,6 +190,19 @@ pub trait DmaAllocator {
     type Mem: CoherentMem;
     /// `None` = allocation failure.
     fn alloc_coherent(&mut self, size: usize) -> Option<Self::Mem>;
+    /// `ioremap(phys, map_len)` + `memcpy_toio(va + off, data)` — the
+    /// `fixed_bdf_addr` window of the AHB parts. `Err` = positive errno.
+    /// The default has no such window.
+    fn iomem_write(
+        &mut self,
+        phys: u64,
+        map_len: usize,
+        off: usize,
+        data: &[u8],
+    ) -> Result<(), i32> {
+        let _ = (phys, map_len, off, data);
+        Err(EIO)
+    }
 }
 
 /// The ath11k fields the handshake needs beyond [`WlfwHwParams`].
@@ -211,6 +231,8 @@ pub struct WlfwConfig {
     /// resolved `/reserved-memory` (base, size), `Some(None)` an
     /// unresolvable one (Linux then fails the assignment).
     pub fixed_mem_rgn: Option<Option<(u64, u64)>>,
+    /// `ath11k_bus_str(ab->hif.bus)`: names `cal-<bus>-<dev>.bin`.
+    pub bus: &'static str,
 }
 
 /// `ATH11K_QMI_CALDB_ADDRESS`.
@@ -296,6 +318,7 @@ impl WlfwConfig {
                 chip_id: 0,
                 board_id: 0,
                 bdf_ext,
+                ahb: false,
             },
             dev_name,
             cold_boot_cal: true,
@@ -303,7 +326,40 @@ impl WlfwConfig {
             ind_timeout_ms: ATH11K_NARF_IND_TIMEOUT_MS,
             coldboot_timeout_ms: ATH11K_COLD_BOOT_FW_RESET_DELAY_MS,
             fixed_mem_rgn: None,
+            bus: board::BUS_PCI,
         })
+    }
+
+    /// The values `ath11k_ahb_probe` / `ath11k_core_init` give an AHB
+    /// part: `ab->id` is zero (no PCI ids, default board search),
+    /// `dev_name` is the platform device name (`c000000.wifi`), and the
+    /// DT `memory-region[0]` (when present) feeds the HOST_DDR segment of
+    /// `fixed_mem_region` parts.
+    pub fn ahb(chip: super::ahb::AhbChip, dev_name: String, host_ddr: Option<(u64, u64)>) -> Self {
+        let p = chip.params();
+        Self {
+            hw_rev: HwRev::Unknown,
+            hw: chip.wlfw_hw_params(),
+            fw_dir: p.fw_dir,
+            board: BoardId {
+                search_bus_and_board: false,
+                vendor: 0,
+                device: 0,
+                subsystem_vendor: 0,
+                subsystem_device: 0,
+                chip_id: 0,
+                board_id: 0,
+                bdf_ext: Vec::new(),
+                ahb: true,
+            },
+            dev_name,
+            cold_boot_cal: true,
+            txn_timeout_ms: ATH11K_QMI_WLANFW_TIMEOUT_MS,
+            ind_timeout_ms: ATH11K_NARF_IND_TIMEOUT_MS,
+            coldboot_timeout_ms: ATH11K_COLD_BOOT_FW_RESET_DELAY_MS,
+            fixed_mem_rgn: host_ddr.map(Some),
+            bus: board::BUS_AHB,
+        }
     }
 
     /// Apply the PCI function's Devicetree `memory-region` facts
@@ -434,6 +490,8 @@ pub struct Wlfw<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> {
     pub regdb_sent: Option<usize>,
     /// `ab->fw` (`ath11k_fw_pre_init`): the M3 IE of `firmware-N.bin`.
     pub fw_api: FwApi,
+    /// DEVICE_INFO BAR (hybrid bus).
+    device_bar: Option<(u64, u32)>,
     phase: Phase,
     /// The event work is running for a crash recovery
     /// ([`Self::run_to_fw_restart`]).
@@ -444,9 +502,6 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
     /// `ath11k_qmi_init_service`: zeroed target info / memory,
     /// `target_mem_mode = fw_mem_mode` (carried in `cfg.hw`).
     pub fn new(pipe: P, fw: F, dma: A, cfg: WlfwConfig) -> Result<Self, WlfwError> {
-        if cfg.hw.fixed_mem_region || cfg.hw.hybrid_bus_type || cfg.hw.fixed_bdf_addr {
-            return Err(WlfwError::new(step::UNSUPPORTED, 0, EOPNOTSUPP));
-        }
         let mut target_mem = Vec::with_capacity(ATH11K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01);
         target_mem.resize_with(
             ATH11K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01,
@@ -471,6 +526,7 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
             board_choice: None,
             regdb_sent: None,
             fw_api: FwApi::api1(),
+            device_bar: None,
             phase: Phase::Server,
             recovering: false,
         })
@@ -553,7 +609,12 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
                 .map(|c| (c.mem_type, c.size))
                 .collect();
             let region = self.cfg.fixed_mem_rgn.flatten();
-            match assign_fixed_target_mem(&segments, region, 0, self.cfg.coldboot_cal_support()) {
+            match assign_fixed_target_mem(
+                &segments,
+                region,
+                self.cfg.hw.bdf_addr,
+                self.cfg.coldboot_cal_support(),
+            ) {
                 Ok(list) => {
                     for (chunk, (paddr, size, mem_type)) in self.target_mem.iter_mut().zip(&list) {
                         chunk.mem = None;
@@ -774,7 +835,38 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
         Ok(())
     }
 
-    /// `ath11k_qmi_load_file_target_mem` (no `fixed_bdf_addr`).
+    /// `ath11k_qmi_request_device_info`: hybrid-bus parts (WCN6750)
+    /// learn the register BAR from firmware; it must be exactly
+    /// `ATH11K_QMI_DEVICE_BAR_SIZE`. The HIF maps it ([`Self::device_bar`]).
+    pub async fn request_device_info(&mut self) -> Result<(), WlfwError> {
+        if !self.cfg.hw.hybrid_bus_type {
+            return Ok(());
+        }
+        let resp: DeviceInfoResp = self
+            .txn(&DeviceInfoReq, step::DEVICE_INFO, "device info")
+            .await?;
+        self.check(resp.resp, step::DEVICE_INFO, "device info")?;
+        let (Some(addr), Some(size)) = (resp.bar_addr, resp.bar_size) else {
+            self.log(format_args!("qmi device info response invalid"));
+            return Err(WlfwError::new(step::DEVICE_INFO, 2, EINVAL));
+        };
+        if addr == 0 || size != ATH11K_QMI_DEVICE_BAR_SIZE {
+            self.log(format_args!(
+                "qmi device info invalid address and size: {} {}",
+                addr, size
+            ));
+            return Err(WlfwError::new(step::DEVICE_INFO, 3, EINVAL));
+        }
+        self.device_bar = Some((addr, size));
+        Ok(())
+    }
+
+    /// `ab->mem` / `ab->mem_len` from DEVICE_INFO (hybrid bus).
+    pub fn device_bar(&self) -> Option<(u64, u32)> {
+        self.device_bar
+    }
+
+    /// `ath11k_qmi_load_file_target_mem` (and the `fixed_bdf_addr` window).
     pub async fn load_file_target_mem(
         &mut self,
         data: &[u8],
@@ -782,6 +874,33 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
         step: u32,
     ) -> Result<(), WlfwError> {
         let board_id = self.target.board_id;
+        if self.cfg.hw.fixed_bdf_addr {
+            // `memcpy_toio(bdf_addr [+ cal_offset], data, len)` then one
+            // request without a data TLV.
+            let off = if file_type == ATH11K_QMI_FILE_TYPE_CALDATA {
+                self.cfg.hw.cal_offset
+            } else {
+                0
+            };
+            let map_len = self.cfg.hw.board_size;
+            if file_type != ATH11K_QMI_FILE_TYPE_EEPROM {
+                // Linux maps `board_size` bytes and copies past it when
+                // caldata exceeds `board_size - cal_offset`; refuse instead.
+                if off + data.len() > map_len {
+                    return Err(WlfwError::new(step::BDF_IOREMAP, off as u32, EINVAL));
+                }
+                if let Err(e) = self
+                    .dma
+                    .iomem_write(self.cfg.hw.bdf_addr, map_len, off, data)
+                {
+                    self.log(format_args!("qmi ioremap error for bdf_addr"));
+                    return Err(WlfwError::new(step::BDF_IOREMAP, off as u32, e));
+                }
+            }
+            let req = bdf_fixed_addr_request(board_id, data.len() as u32, file_type);
+            let resp: BdfDownloadResp = self.txn(&req, step, "board file download").await?;
+            return self.check(resp.resp, step, "board file download");
+        }
         if file_type == ATH11K_QMI_FILE_TYPE_EEPROM {
             let req = bdf_eeprom_request(board_id);
             let resp: BdfDownloadResp = self.txn(&req, step, "board file download").await?;
@@ -934,7 +1053,7 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
                 .inspect_err(|_| self.log(format_args!("qmi failed to load caldata")));
         }
         // cal-<bus>-<id>.bin, then caldata.bin.
-        let cal_name = format!("cal-{}-{}.bin", board::BUS_PCI, self.cfg.dev_name);
+        let cal_name = format!("cal-{}-{}.bin", self.cfg.bus, self.cfg.dev_name);
         let blob = match self.fw.request(&self.fw_path(&cal_name)) {
             Ok(b) => b,
             Err(_) => match self.fw.request(&self.fw_path(ATH11K_DEFAULT_CAL_FILE)) {
@@ -965,7 +1084,7 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
     /// `ath11k_qmi_event_load_bdf`.
     pub async fn event_load_bdf(&mut self) -> Result<(), WlfwError> {
         self.request_target_cap().await?;
-        // ath11k_qmi_request_device_info: hybrid-bus parts only.
+        self.request_device_info().await?;
         if self.cfg.hw.supports_regdb {
             // The result is ignored, as in Linux.
             let _ = self.load_bdf_qmi(true).await;
@@ -1324,6 +1443,21 @@ impl CoherentMem for narf_io::DmaBuffer {
 
 impl DmaAllocator for Dma32 {
     type Mem = narf_io::DmaBuffer;
+    fn iomem_write(
+        &mut self,
+        phys: u64,
+        map_len: usize,
+        off: usize,
+        data: &[u8],
+    ) -> Result<(), i32> {
+        use narf_drivers_qcom_soc::io::{write_bytes, MmioRegs};
+        if off.checked_add(data.len()).is_none_or(|end| end > map_len) {
+            return Err(EINVAL);
+        }
+        let win = MmioRegs::map(phys, map_len as u64).map_err(|_| EIO)?;
+        write_bytes(&win, off as u32, data);
+        Ok(())
+    }
     fn alloc_coherent(&mut self, size: usize) -> Option<narf_io::DmaBuffer> {
         if size == 0 {
             return None;

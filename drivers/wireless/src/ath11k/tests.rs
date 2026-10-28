@@ -653,6 +653,8 @@ fn smoke_ath11k_step_codes_unique_and_in_range() -> TestResult {
                 super::wlfw::step::COLDBOOT_MODE,
                 super::wlfw::step::FW_RESTART,
                 super::wlfw::step::UNSUPPORTED,
+                super::wlfw::step::DEVICE_INFO,
+                super::wlfw::step::BDF_IOREMAP,
             ],
         ),
         (

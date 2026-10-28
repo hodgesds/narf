@@ -113,6 +113,11 @@ struct Script {
     early_mem_ind: bool,
     /// Send a stray response (wrong txn) before each real one.
     stray_responses: bool,
+    /// DEVICE_INFO answer: (bar_addr, bar_size) TLVs.
+    device_bar: Option<(u64, u32)>,
+    /// Send FW_READY after the first BDF_DOWNLOAD (fixed_fw_mem parts
+    /// never see REQUEST_MEM / FW_MEM_READY).
+    ready_on_bdf: bool,
 }
 
 fn seg(size: u32, mem_type: i32) -> MemSeg {
@@ -159,6 +164,8 @@ impl Script {
             ack_flow: true,
             early_mem_ind: false,
             stray_responses: false,
+            device_bar: None,
+            ready_on_bdf: false,
         }
     }
 }
@@ -349,6 +356,21 @@ impl FakeFw {
                     self.ind(QMI_WLFW_FW_READY_IND_V01, &[]);
                 }
             }
+            QMI_WLANFW_DEVICE_INFO_REQ_V01 => {
+                let mut w = TlvWriter::new(64);
+                w.u32(0x02, 0);
+                if let Some((addr, size)) = self.s.device_bar {
+                    w.u64(0x10, addr);
+                    w.u32(0x11, size);
+                }
+                let p = w.finish().unwrap();
+                self.resp(msg_id, txn, &p);
+            }
+            QMI_WLANFW_BDF_DOWNLOAD_REQ_V01 if self.s.ready_on_bdf => {
+                self.resp(msg_id, txn, &OK);
+                self.s.ready_on_bdf = false;
+                self.ind(QMI_WLFW_FW_READY_IND_V01, &[]);
+            }
             _ => self.resp(msg_id, txn, &OK),
         }
         if reply == Reply::ThenDelServer {
@@ -405,7 +427,7 @@ impl QrtrPipe for FakePipe {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct FakeFiles {
     files: BTreeMap<String, Vec<u8>>,
     requested: Vec<String>,
@@ -1091,6 +1113,7 @@ fn id(variant: &[u8]) -> BoardId {
         chip_id: 2,
         board_id: 255,
         bdf_ext: variant.to_vec(),
+        ahb: false,
     }
 }
 
@@ -1469,6 +1492,7 @@ fn smoke_wlfw_smbios_table_variant() -> TestResult {
             chip_id: 2,
             board_id: 255,
             bdf_ext: st.bdf_ext,
+            ahb: false,
         };
         ensure!(
             board_name(&id, true, BdfNameType::Full)
@@ -2620,3 +2644,231 @@ fn smoke_wlfw_fixed_mem_region() -> TestResult {
     })
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_wlfw_fixed_mem_region);
+
+// ── AHB (IPQ8074 / WCN6750) ────────────────────────────────────────
+
+/// FakeDma plus a recorded `fixed_bdf_addr` window.
+struct IoDma {
+    dma: FakeDma,
+    io: Vec<(u64, usize, usize, Vec<u8>)>,
+}
+
+impl DmaAllocator for IoDma {
+    type Mem = FakeMem;
+    fn alloc_coherent(&mut self, size: usize) -> Option<FakeMem> {
+        self.dma.alloc_coherent(size)
+    }
+    fn iomem_write(
+        &mut self,
+        phys: u64,
+        map_len: usize,
+        off: usize,
+        data: &[u8],
+    ) -> Result<(), i32> {
+        self.io.push((phys, map_len, off, data.to_vec()));
+        Ok(())
+    }
+}
+
+fn ahb_files(dir: &str, files: &[(&str, Vec<u8>)]) -> FakeFiles {
+    let mut f = FakeFiles::default();
+    for (n, d) in files {
+        f.files.insert(format!("ath11k/{}/{}", dir, n), d.clone());
+    }
+    f
+}
+
+fn bdf_payloads(fw: &FakeFw) -> Vec<Vec<u8>> {
+    fw.reqs
+        .iter()
+        .filter(|m| u16::from_le_bytes([m[3], m[4]]) == QMI_WLANFW_BDF_DOWNLOAD_REQ_V01)
+        .map(|m| m[7..].to_vec())
+        .collect()
+}
+
+fn smoke_wlfw_ahb_ipq8074_fixed_mem_and_bdf() -> TestResult {
+    use super::ahb::AhbChip;
+    run_test(|| {
+        let mut s = Script::wcn6855();
+        s.instance = qmi_instance(1, ATH11K_QMI_WLFW_SERVICE_INS_ID_V01_IPQ8074);
+        s.mem_rounds = vec![vec![
+            seg(0x30_0000, HOST_DDR_REGION_TYPE as i32),
+            seg(0x4_0000, BDF_MEM_REGION_TYPE as i32),
+            seg(0x48_0000, CALDB_MEM_REGION_TYPE as i32),
+        ]];
+        // cbcal_restart_fw: FW_READY is ignored, FW_INIT_DONE registers.
+        s.fw_ready = false;
+        s.init_done = true;
+        let board = bin_blob(9_000, 4);
+        let cal = bin_blob(5_000, 5);
+        let files = ahb_files(
+            "IPQ8074/hw2.0",
+            &[
+                ("board.bin", board.clone()),
+                ("cal-ahb-c000000.wifi.bin", cal.clone()),
+            ],
+        );
+        let mut cfg = WlfwConfig::ahb(
+            AhbChip::Ipq8074,
+            String::from("c000000.wifi"),
+            Some((0x4b00_0000, 0x0080_0000)),
+        );
+        // ath11k_cold_boot_cal=0: no calibration pass in this test.
+        cfg.cold_boot_cal = false;
+        ensure!(
+            cfg.hw.fixed_bdf_addr && cfg.hw.fixed_mem_region,
+            "IPQ8074 flags"
+        );
+        ensure!(cfg.hw.qmi_service_ins_id == 0x02, "IPQ8074 instance");
+        let dma = IoDma {
+            dma: FakeDma::new(),
+            io: Vec::new(),
+        };
+        let mut w = wlfw_with(s, files, dma, cfg);
+        block(w.run_to_fw_ready()).map_err(|_| "IPQ8074 handshake must register")?;
+        // ath11k_qmi_assign_target_mem_chunk: region, bdf_addr, CALDB 0
+        // (no cold-boot calibration).
+        ensure!(
+            w.target_mem_list()
+                == vec![
+                    (0x4b00_0000, 0x30_0000, HOST_DDR_REGION_TYPE as i32),
+                    (0x4b0c_0000, 0x4_0000, BDF_MEM_REGION_TYPE as i32),
+                    (0, 0x48_0000, CALDB_MEM_REGION_TYPE as i32),
+                ],
+            "fixed target memory list"
+        );
+        ensure!(
+            w.dma.dma.allocs.is_empty(),
+            "no coherent DMA for target memory"
+        );
+        // memcpy_toio into the BDF window: board at 0, caldata at cal_offset.
+        ensure!(
+            w.dma.io
+                == vec![
+                    (0x4b0c_0000, 256 * 1024, 0, board.clone()),
+                    (0x4b0c_0000, 256 * 1024, 128 * 1024, cal.clone()),
+                ],
+            "BDF window writes"
+        );
+        // One request per file, no data TLV, end = 1, total_size = len.
+        let p = bdf_payloads(&w.client.pipe.fw);
+        let want_board = bdf_fixed_addr_request(0xff, 9_000, ATH11K_QMI_BDF_TYPE_BIN)
+            .payload()
+            .unwrap();
+        let want_cal = bdf_fixed_addr_request(0xff, 5_000, ATH11K_QMI_FILE_TYPE_CALDATA)
+            .payload()
+            .unwrap();
+        ensure!(p == vec![want_board, want_cal], "fixed-addr BDF requests");
+        ensure!(
+            !w.client
+                .pipe
+                .fw
+                .msg_ids()
+                .contains(&QMI_WLANFW_DEVICE_INFO_REQ_V01),
+            "no DEVICE_INFO on IPQ8074"
+        );
+        // Board names say bus=ahb.
+        let mut id = w.cfg.board.clone();
+        id.chip_id = 2;
+        id.board_id = 255;
+        ensure!(
+            board_name(&id, false, BdfNameType::Full) == "bus=ahb,qmi-chip-id=2,qmi-board-id=255",
+            "ahb board name"
+        );
+        // Caldata larger than board_size - cal_offset is refused.
+        let mut s = Script::wcn6855();
+        s.instance = qmi_instance(1, ATH11K_QMI_WLFW_SERVICE_INS_ID_V01_IPQ8074);
+        s.mem_rounds = vec![vec![seg(0x4_0000, BDF_MEM_REGION_TYPE as i32)]];
+        let files = ahb_files(
+            "IPQ8074/hw2.0",
+            &[("board.bin", board), ("caldata.bin", bin_blob(200_000, 6))],
+        );
+        let mut cfg = WlfwConfig::ahb(AhbChip::Ipq8074, String::from("c000000.wifi"), None);
+        cfg.cold_boot_cal = false;
+        let dma = IoDma {
+            dma: FakeDma::new(),
+            io: Vec::new(),
+        };
+        let mut w = wlfw_with(s, files, dma, cfg);
+        let e = block(w.run_to_fw_ready()).err().ok_or("oversize caldata")?;
+        ensure!(
+            e.step == step::BDF_IOREMAP && e.errno == EINVAL,
+            "BDF_IOREMAP"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_wlfw_ahb_ipq8074_fixed_mem_and_bdf
+);
+
+fn smoke_wlfw_ahb_wcn6750_device_info() -> TestResult {
+    use super::ahb::AhbChip;
+    run_test(|| {
+        let mut s = Script::wcn6855();
+        s.instance = qmi_instance(1, super::ahb::ATH11K_QMI_WLFW_SERVICE_INS_ID_V01_WCN6750);
+        s.mem_rounds = Vec::new();
+        s.fw_ready = false;
+        s.ready_on_bdf = true;
+        s.device_bar = Some((0x1780_0000, ATH11K_QMI_DEVICE_BAR_SIZE));
+        let board = elf_blob(11_000, 7);
+        let files = ahb_files("WCN6750/hw1.0", &[("board.bin", board)]);
+        let mut cfg = WlfwConfig::ahb(AhbChip::Wcn6750Hw10, String::from("17a10040.wifi"), None);
+        cfg.cold_boot_cal = false;
+        ensure!(
+            cfg.hw.hybrid_bus_type && cfg.hw.fixed_fw_mem,
+            "WCN6750 flags"
+        );
+        let mut w = wlfw_with(s.clone(), files.clone(), FakeDma::new(), cfg.clone());
+        block(w.run_to_fw_ready()).map_err(|_| "WCN6750 handshake must reach FW_READY")?;
+        // fixed_fw_mem: BDF straight after host_cap; DEVICE_INFO after CAP.
+        let ids = w.client.pipe.fw.msg_ids();
+        let cap = ids
+            .iter()
+            .position(|&m| m == QMI_WLANFW_CAP_REQ_V01)
+            .ok_or("CAP")?;
+        ensure!(
+            ids.get(cap + 1) == Some(&QMI_WLANFW_DEVICE_INFO_REQ_V01),
+            "DEVICE_INFO follows CAP"
+        );
+        ensure!(
+            !ids.contains(&QMI_WLANFW_RESPOND_MEM_REQ_V01),
+            "no RESPOND_MEM on fixed_fw_mem"
+        );
+        ensure!(
+            w.device_bar() == Some((0x1780_0000, 0x20_0000)),
+            "device BAR recorded"
+        );
+        // DEVICE_INFO request is the bare header.
+        let req = w
+            .client
+            .pipe
+            .fw
+            .reqs
+            .iter()
+            .find(|m| u16::from_le_bytes([m[3], m[4]]) == QMI_WLANFW_DEVICE_INFO_REQ_V01)
+            .ok_or("DEVICE_INFO req")?;
+        ensure!(req.len() == 7, "empty DEVICE_INFO request");
+        // Wrong BAR size / missing TLVs fail at DEVICE_INFO.
+        for (bar, detail) in [
+            (Some((0x1780_0000, 0x1000)), 3),
+            (None, 2),
+            (Some((0, 0x20_0000)), 3),
+        ] {
+            let mut s2 = s.clone();
+            s2.device_bar = bar;
+            let mut w = wlfw_with(s2, files.clone(), FakeDma::new(), cfg.clone());
+            let e = block(w.run_to_fw_ready()).err().ok_or("bad DEVICE_INFO")?;
+            ensure!(
+                e.step == step::DEVICE_INFO && e.detail == detail && e.errno == EINVAL,
+                "DEVICE_INFO error"
+            );
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_wlfw_ahb_wcn6750_device_info
+);

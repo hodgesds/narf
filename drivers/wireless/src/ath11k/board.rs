@@ -85,6 +85,8 @@ pub const ATH11K_SMBIOS_CC_WW: u8 = 2;
 
 /// `ath11k_bus_str(ATH11K_BUS_PCI)`.
 pub const BUS_PCI: &str = "pci";
+/// `ath11k_bus_str(ATH11K_BUS_AHB)`.
+pub const BUS_AHB: &str = "ahb";
 
 const fn align4(n: usize) -> usize {
     (n + 3) & !3
@@ -118,6 +120,8 @@ pub struct BoardId {
     pub board_id: u32,
     /// `target.bdf_ext` without its NUL (empty = no variant).
     pub bdf_ext: Vec<u8>,
+    /// `ab->hif.bus == ATH11K_BUS_AHB` (`bus=ahb` in board names).
+    pub ahb: bool,
 }
 
 /// `scnprintf` into a `BOARD_NAME_SIZE` buffer: at most 199 bytes.
@@ -145,6 +149,7 @@ pub fn board_name(id: &BoardId, with_variant: bool, name_type: BdfNameType) -> S
     }
     let chip = id.chip_id as i32;
     let board = id.board_id as i32;
+    let bus = if id.ahb { BUS_AHB } else { BUS_PCI };
     let mut s = String::new();
     if id.search_bus_and_board {
         match name_type {
@@ -153,7 +158,7 @@ pub fn board_name(id: &BoardId, with_variant: bool, name_type: BdfNameType) -> S
                     s,
                     "bus={},vendor={:04x},device={:04x},subsystem-vendor={:04x},\
                      subsystem-device={:04x},qmi-chip-id={},qmi-board-id={}{}",
-                    BUS_PCI,
+                    bus,
                     id.vendor,
                     id.device,
                     id.subsystem_vendor,
@@ -164,17 +169,17 @@ pub fn board_name(id: &BoardId, with_variant: bool, name_type: BdfNameType) -> S
                 );
             }
             BdfNameType::BusName => {
-                let _ = write!(s, "bus={}", BUS_PCI);
+                let _ = write!(s, "bus={}", bus);
             }
             BdfNameType::ChipId => {
-                let _ = write!(s, "bus={},qmi-chip-id={}", BUS_PCI, chip);
+                let _ = write!(s, "bus={},qmi-chip-id={}", bus, chip);
             }
         }
     } else {
         let _ = write!(
             s,
             "bus={},qmi-chip-id={},qmi-board-id={}{}",
-            BUS_PCI, chip, board, variant
+            bus, chip, board, variant
         );
     }
     truncate(s, BOARD_NAME_SIZE)

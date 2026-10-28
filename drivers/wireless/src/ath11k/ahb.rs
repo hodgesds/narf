@@ -18,9 +18,12 @@
 //! - [`AhbRemote`] — `ath11k_core_get_rproc` + `power_up`/`power_down`
 //!   (`rproc_boot`/`rproc_shutdown`) over the WCSS or PAS loader.
 //!
-//! What is not here (ledger rows `ipq8074_enablement`, …): QRTR over
-//! GLINK for QMI, the multi-pdev core/DP runtime, and the per-SoC
-//! `hw_ops`; see `drivers/wireless/specification/ath11k.md` §8.
+//! QMI rides QRTR over GLINK ([`super::qrtr_glink`]); the WLFW AHB paths
+//! (`fixed_mem_region`, `fixed_bdf_addr`, DEVICE_INFO) take
+//! [`AhbChip::wlfw_hw_params`]. What is not here (ledger rows
+//! `ipq8074_enablement`, …): the AHB HIF (`CeHif<AhbIo>`), the
+//! multi-pdev core/DP runtime and the per-SoC `hw_ops`; see
+//! `drivers/wireless/specification/ath11k.md` §8.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -38,7 +41,8 @@ use super::hw::{
     RING_MASK_IPQ8074, RING_MASK_WCN6750, WCN6750_REGS,
 };
 use super::qmi_wlfw::{
-    CeTgtPipeCfg, ATH11K_QMI_WLFW_SERVICE_INS_ID_V01_IPQ8074, TARGET_CE_CONFIG_WLAN_QCA6390,
+    CeTgtPipeCfg, WlfwHwParams, ATH11K_QMI_WLFW_SERVICE_INS_ID_V01_IPQ8074,
+    TARGET_CE_CONFIG_WLAN_QCA6390,
 };
 
 /// `ATH11K_QMI_WLFW_SERVICE_INS_ID_V01_WCN6750`.
@@ -436,6 +440,47 @@ impl AhbChip {
                 fixed_bdf_addr: false,
                 smp2p_wow_exit: true,
                 msi: Some(&MSI_CONFIG_WCN6750),
+                ..ipq
+            },
+        }
+    }
+
+    /// The QMI fields of the same `ath11k_hw_params[]` entry
+    /// (`core.c`): IPQ parts take target memory from the reserved
+    /// region and write the BDF through `bdf_addr`; WCN6750 uses the
+    /// hybrid bus (DEVICE_INFO) with firmware-owned memory.
+    pub const fn wlfw_hw_params(self) -> WlfwHwParams {
+        let p = self.params();
+        let ipq = WlfwHwParams {
+            qmi_service_ins_id: p.qmi_service_ins_id,
+            m3_fw_support: false,
+            internal_sleep_clock: false,
+            global_reset: false,
+            fw_mem_mode: 0,
+            fixed_fw_mem: false,
+            fixed_bdf_addr: true,
+            supports_shadow_regs: false,
+            fw_wmi_diag_event: false,
+            supports_regdb: false,
+            board_size: 256 * 1024,
+            coldboot_cal_mm: true,
+            coldboot_cal_ftm: true,
+            cbcal_restart_fw: true,
+            fixed_mem_region: true,
+            hybrid_bus_type: false,
+            bdf_addr: p.bdf_addr as u64,
+            cal_offset: 128 * 1024,
+        };
+        match self {
+            AhbChip::Ipq8074 | AhbChip::Ipq6018Hw10 | AhbChip::Ipq5018Hw10 => ipq,
+            AhbChip::Wcn6750Hw10 => WlfwHwParams {
+                fixed_fw_mem: true,
+                fixed_bdf_addr: false,
+                supports_shadow_regs: true,
+                supports_regdb: true,
+                cbcal_restart_fw: false,
+                fixed_mem_region: false,
+                hybrid_bus_type: true,
                 ..ipq
             },
         }

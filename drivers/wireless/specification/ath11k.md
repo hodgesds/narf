@@ -298,7 +298,20 @@ tables.
   `FwReadyInfo`), and `firmware_start(mode, shadow_reg_v2)` =
   wlan_ini (`fw_wmi_diag_event`) → wlan_cfg (QCA6390 CE + service
   maps, shadow v2 clamped to 36) → wlan_mode. `WlfwConfig::pci(..)`
-  carries `ab->id`, `dev_name` (caldata name) and the timeouts.
+  carries `ab->id`, `dev_name` (caldata name) and the timeouts;
+  `WlfwConfig::ahb(chip, dev_name, host_ddr)` the AHB values
+  (`AhbChip::wlfw_hw_params()`, `bus=ahb` board names, `cal-ahb-<dev>.bin`,
+  DT `memory-region[0]` as the HOST_DDR region). AHB paths:
+  `fixed_mem_region` → `assign_fixed_target_mem` (HOST_DDR = region,
+  BDF = `hw.bdf_addr`, CALDB after HOST_DDR / `ATH11K_QMI_CALDB_ADDRESS` /
+  0); `fixed_bdf_addr` → `DmaAllocator::iomem_write(bdf_addr, board_size,
+  off, file)` (caldata at `cal_offset`; a file past `board_size` is
+  refused with `BDF_IOREMAP`, where Linux would overrun its mapping) and
+  one `bdf_fixed_addr_request` (no data TLV, `end = 1`, `total_size` =
+  length); `hybrid_bus_type` → `request_device_info` after target_cap
+  (BAR must be non-zero and `ATH11K_QMI_DEVICE_BAR_SIZE`; `device_bar()`
+  hands it to the HIF). `Dma32::iomem_write` maps the window with
+  `narf_drivers_qcom_soc::io::MmioRegs`.
   After FW_READY (REGISTERED): `late_event()` pumps the link, runs the
   QMI handlers (COLD_BOOT_CAL_DONE / FW_READY set `cal_done`, REQUEST_MEM
   allocates) and classifies what `ath11k_qmi_driver_event_work` would
@@ -1817,7 +1830,8 @@ SCM/PAS, MDT loader, SMEM, SMP2P, GCC resets, Q6 WCSS and PAS remoteprocs.
 ```rust
 pub enum AhbChip { Ipq8074, Ipq6018Hw10, Ipq5018Hw10, Wcn6750Hw10 }
 pub const AHB_OF_MATCH: [(&str, AhbChip); 4];          // ath11k_ahb_of_match
-impl AhbChip { fn from_compatible(&[String]) -> Option<Self>; const fn params(self) -> AhbHwParams; }
+impl AhbChip { fn from_compatible(&[String]) -> Option<Self>; const fn params(self) -> AhbHwParams;
+               const fn wlfw_hw_params(self) -> WlfwHwParams; }
 pub struct AhbHwParams { chip, name, fw_dir, max_radios, bdf_addr, regs, ring_mask,
     qmi_service_ins_id, host_ce_config, target_ce_config, svc_to_ce_map, ce_ie_addr,
     ce_remap, single_pdev_only, rxdma1_enable, htt_peer_map_v2, supports_shadow_regs,

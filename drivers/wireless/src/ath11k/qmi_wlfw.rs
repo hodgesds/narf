@@ -82,6 +82,8 @@ pub const QMI_WLANFW_WLAN_CFG_REQ_V01: u16 = 0x0023;
 pub const QMI_WLANFW_WLAN_CFG_RESP_V01: u16 = 0x0023;
 pub const QMI_WLANFW_CAP_REQ_V01: u16 = 0x0024;
 pub const QMI_WLANFW_CAP_RESP_V01: u16 = 0x0024;
+/// `ATH11K_QMI_DEVICE_BAR_SIZE`.
+pub const ATH11K_QMI_DEVICE_BAR_SIZE: u32 = 0x20_0000;
 pub const QMI_WLANFW_BDF_DOWNLOAD_REQ_V01: u16 = 0x0025;
 pub const QMI_WLANFW_BDF_DOWNLOAD_RESP_V01: u16 = 0x0025;
 pub const QMI_WLANFW_WLAN_INI_REQ_V01: u16 = 0x002F;
@@ -231,6 +233,11 @@ pub struct WlfwHwParams {
     pub fixed_mem_region: bool,
     /// `hybrid_bus_type` — sends DEVICE_INFO (WCN6750 only).
     pub hybrid_bus_type: bool,
+    /// `bdf_addr` — the BDF_MEM segment / `fixed_bdf_addr` window.
+    pub bdf_addr: u64,
+    /// `fw.cal_offset` — caldata offset inside the `fixed_bdf_addr`
+    /// window.
+    pub cal_offset: usize,
 }
 
 /// QCA6390 and all WCN6855-family entries in `ath11k_hw_params`
@@ -254,6 +261,8 @@ const QCA6390_FAMILY: WlfwHwParams = WlfwHwParams {
     cbcal_restart_fw: false,
     fixed_mem_region: false,
     hybrid_bus_type: false,
+    bdf_addr: 0x4B0C_0000,
+    cal_offset: 128 * 1024,
 };
 
 /// `ath11k_hw_params` QMI fields for `rev` (`core.c`).
@@ -283,6 +292,8 @@ pub fn wlfw_hw_params(rev: HwRev) -> Option<WlfwHwParams> {
             cbcal_restart_fw: true,
             fixed_mem_region: false,
             hybrid_bus_type: false,
+            bdf_addr: 0,
+            cal_offset: 128 * 1024,
         },
         HwRev::Unknown => return None,
     })
@@ -1100,6 +1111,21 @@ pub fn bdf_eeprom_request(board_id: u32) -> BdfDownloadReq<'static> {
         data: None,
         end: Some(1),
         bdf_type: Some(ATH11K_QMI_FILE_TYPE_EEPROM),
+    }
+}
+
+/// The single request `ath11k_qmi_load_file_target_mem` sends on
+/// `fixed_bdf_addr` parts after copying the file into the BDF window:
+/// no data TLV, `end = 1`, `total_size` = the file length, segment 0.
+pub fn bdf_fixed_addr_request(board_id: u32, len: u32, bdf_type: u8) -> BdfDownloadReq<'static> {
+    BdfDownloadReq {
+        valid: 1,
+        file_id: Some(board_id as i32),
+        total_size: Some(len),
+        seg_id: Some(0),
+        data: None,
+        end: Some(1),
+        bdf_type: Some(bdf_type),
     }
 }
 
