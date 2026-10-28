@@ -224,6 +224,7 @@ pub(super) use phy::local_ht;
 mod power;
 pub type PowerRequest = power::PowerRequest;
 pub type PowerStatus = power::PowerStatus;
+#[cfg(any(test, feature = "kernel-test"))]
 pub(super) use power::feature as feature_bits;
 pub(super) use power::Emission as PowerEmission;
 

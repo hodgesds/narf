@@ -815,6 +815,14 @@ impl Owner {
             // PHY, reorder and crypto shapes before any replay publication.
             let qos = f[0] == 0x88;
             let header = if qos { 26 } else { 24 };
+            // Group-addressed data is never under a Block Ack agreement
+            // (IEEE 802.11-2020 10.25) and Linux mvm/rxmq.c::iwl_mvm_reorder
+            // never reorders multicast: any reported BAID is ignored and the
+            // MPDU takes the non-BA path with its GTK replay owner. Its Ack
+            // Policy may be Normal or No Ack (mac80211 sends group QoS data
+            // with No Ack). mac80211 `__ieee80211_rx_h_amsdu` drops every
+            // group-addressed A-MSDU (nested or not), so they stay closed.
+            let group = f[4] & 1 != 0;
             if !matches!(f[0], 8 | 0x88)
                 || qos && phy.is_none()
                 || f[1] & 0x87 != 2
@@ -822,12 +830,18 @@ impl Owner {
                 || mpdu.status & (1 << 22) != 0
                 || qos
                     && f.get(24..26).is_none_or(|q| {
-                        !self.power.phy.ba.qos_policy(q[0], mpdu.reorder)
-                            || q[1] != 0
+                        !(if group {
+                            q[0] & 15 < 8 && matches!(q[0] & 0x60, 0 | 0x20)
+                        } else {
+                            self.power.phy.ba.qos_policy(q[0], mpdu.reorder)
+                        }) || q[1] != 0
                             || (q[0] & 0x80 != 0) != mpdu.amsdu
                     })
-                || mpdu.amsdu && !phy.is_some_and(|p| p.ht)
-                || phy.is_some() && mpdu.reorder & 0x7f000000 != 0x7f000000 && !self.ba_qualified()
+                || mpdu.amsdu && (group || !phy.is_some_and(|p| p.ht))
+                || phy.is_some()
+                    && !group
+                    && mpdu.reorder & 0x7f000000 != 0x7f000000
+                    && !self.ba_qualified()
                 || !mpdu.amsdu && mpdu.amsdu_index != 0
                 || !(legacy_rx_rate(&payload, status) || phy.is_some_and(|p| p.rx_rate(&payload)))
                 || mpdu
@@ -853,7 +867,7 @@ impl Owner {
                 self.clear_data_aggregate();
                 continue;
             }
-            if mpdu.reorder & 0x7f000000 != 0x7f000000 && !released {
+            if mpdu.reorder & 0x7f000000 != 0x7f000000 && !released && !group {
                 // Retain the original native packet BEFORE any host replay
                 // update or deaggregation. Released bytes traverse these same
                 // current identity/PHY/crypto checks again, then PN in order.

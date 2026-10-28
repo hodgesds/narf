@@ -262,15 +262,19 @@ impl Device {
         state.connection = None;
         state.clear_transmit();
         state.eapol.clear();
+        // RAM fixture: no PCI function or embedded CPU to restart.
         #[cfg(any(test, feature = "kernel-test"))]
-        let model = super::runtime::model::is_model(&state.hardware);
-        #[cfg(not(any(test, feature = "kernel-test")))]
-        let model = false;
-        let mac = if model {
-            // RAM fixture: no PCI function or embedded CPU to restart.
+        let model = if super::runtime::model::is_model(&state.hardware) {
             super::runtime::model::restart(&mut state.hardware)
                 .map_err(|_| WirelessError::HardwareError)?;
-            self.mac
+            Some(self.mac)
+        } else {
+            None
+        };
+        #[cfg(not(any(test, feature = "kernel-test")))]
+        let model: Option<[u8; 6]> = None;
+        let mac = if let Some(mac) = model {
+            mac
         } else {
             let mut parsed =
                 super::parse_ucode(&self.firmware).map_err(|_| WirelessError::HardwareError)?;
