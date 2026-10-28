@@ -90,7 +90,7 @@ struct Model {
     rx_ba: Option<Arc<crate::rtw88::rx_ba_power::Grant>>,
     tx_ba: Option<Arc<crate::rtw88::tx_ba_power::Grant>>,
     protection: Option<Arc<crate::rtw88::protection::Grant>>,
-    dm: Option<Arc<crate::rtw88::qualification::Grant>>,
+    dm: Vec<Arc<crate::rtw88::qualification::Grant>>,
     before_publication: Option<Arc<dyn Fn() + Send + Sync>>,
     edca_writes: usize,
     packet_model: crate::rtw88::packet_core::tests::Model,
@@ -136,9 +136,26 @@ impl Port {
         )
     }
     fn qualify_dm(&self, s: crate::rtw88::qualification::Source) -> Result<(), Error> {
+        self.qualify(&crate::rtw88::dm::KIND, s)
+    }
+    pub(super) fn kind_request(
+        &self,
+        kind: &'static crate::rtw88::qualification::Kind,
+    ) -> Result<crate::rtw88::ContinuationRequest, Error> {
+        let m = self.0.lock();
+        crate::rtw88::qualification::request(kind, m.station_gate.as_ref().ok_or(Error::State)?)
+    }
+    /// Stage one continuation of `kind`, replacing an earlier one of it.
+    pub(super) fn qualify(
+        &self,
+        kind: &'static crate::rtw88::qualification::Kind,
+        s: crate::rtw88::qualification::Source,
+    ) -> Result<(), Error> {
         let gate = self.0.lock().station_gate.clone().ok_or(Error::State)?;
-        let g = s.load(&crate::rtw88::dm::KIND, &gate)?;
-        self.0.lock().dm = Some(g);
+        let g = s.load(kind, &gate)?;
+        let mut m = self.0.lock();
+        m.dm.retain(|old| !old.is(kind));
+        m.dm.push(g);
         Ok(())
     }
     fn qualify_protection(&self, s: crate::rtw88::protection::Source) -> Result<(), Error> {
@@ -227,7 +244,7 @@ unsafe impl Registers for Port {
         kind: &'static crate::rtw88::qualification::Kind,
     ) -> Result<Option<Arc<crate::rtw88::qualification::Grant>>, Error> {
         self.station_allowed()?;
-        Ok(self.0.lock().dm.clone().filter(|g| g.is(kind)))
+        Ok(self.0.lock().dm.iter().find(|g| g.is(kind)).cloned())
     }
     fn station_continuation_request(
         &mut self,
@@ -250,6 +267,20 @@ unsafe impl Registers for Port {
     ) -> Result<Option<Arc<crate::rtw88::protection::Grant>>, Error> {
         self.station_allowed()?;
         Ok(self.0.lock().protection.clone())
+    }
+    fn station_bind_coding(
+        &mut self,
+        g: Arc<crate::rtw88::qualification::Grant>,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        let mut m = self.0.lock();
+        let gate = m
+            .station_gate
+            .as_ref()
+            .ok_or(Error::State)?
+            .with_coding(g)?;
+        m.station_gate = Some(gate);
+        Ok(())
     }
     fn station_bind_protection(
         &mut self,
@@ -952,7 +983,7 @@ fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
         rx_ba: None,
         tx_ba: None,
         protection: None,
-        dm: None,
+        dm: Vec::new(),
         before_publication: None,
         edca_writes: 0,
         packet_model: crate::rtw88::packet_core::tests::Model::new(),

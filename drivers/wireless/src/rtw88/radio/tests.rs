@@ -39,7 +39,7 @@ pub(super) struct RadioIo {
     rx_ba: Option<Arc<crate::rtw88::rx_ba_power::Grant>>,
     tx_ba: Option<Arc<crate::rtw88::tx_ba_power::Grant>>,
     protection: Option<Arc<crate::rtw88::protection::Grant>>,
-    pub(super) continuation: Option<Arc<crate::rtw88::qualification::Grant>>,
+    pub(super) continuation: Vec<Arc<crate::rtw88::qualification::Grant>>,
     pub(super) edca_writes: Arc<AtomicUsize>,
     pub(super) before_publication: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) clock: Arc<AtomicU64>,
@@ -79,7 +79,7 @@ impl RadioIo {
             rx_ba: None,
             tx_ba: None,
             protection: None,
-            continuation: None,
+            continuation: Vec::new(),
             edca_writes: Arc::new(AtomicUsize::new(0)),
             before_publication: None,
             clock: Arc::new(AtomicU64::new(0)),
@@ -198,7 +198,26 @@ impl RadioIo {
         s: crate::rtw88::qualification::Source,
     ) -> Result<(), Error> {
         let gate = self.gate.as_ref().ok_or(Error::State)?;
-        self.continuation = Some(s.load(&crate::rtw88::dm::KIND, gate)?);
+        let g = s.load(&crate::rtw88::dm::KIND, gate)?;
+        self.continuation.retain(|old| !old.is(&crate::rtw88::dm::KIND));
+        self.continuation.push(g);
+        Ok(())
+    }
+    pub(super) fn kind_request(
+        &self,
+        kind: &'static crate::rtw88::qualification::Kind,
+    ) -> Result<crate::rtw88::ContinuationRequest, Error> {
+        crate::rtw88::qualification::request(kind, self.gate.as_ref().ok_or(Error::State)?)
+    }
+    /// Stage one continuation of `kind`, replacing an earlier one of it.
+    pub(super) fn qualify(
+        &mut self,
+        kind: &'static crate::rtw88::qualification::Kind,
+        s: crate::rtw88::qualification::Source,
+    ) -> Result<(), Error> {
+        let g = s.load(kind, self.gate.as_ref().ok_or(Error::State)?)?;
+        self.continuation.retain(|old| !old.is(kind));
+        self.continuation.push(g);
         Ok(())
     }
     pub(super) fn lose_write(&mut self, r: u16) {
@@ -230,7 +249,7 @@ unsafe impl Io for RadioIo {
         kind: &'static crate::rtw88::qualification::Kind,
     ) -> Result<Option<Arc<crate::rtw88::qualification::Grant>>, Error> {
         self.station_allowed()?;
-        Ok(self.continuation.clone().filter(|g| g.is(kind)))
+        Ok(self.continuation.iter().find(|g| g.is(kind)).cloned())
     }
     fn station_continuation_request(
         &mut self,
@@ -266,6 +285,15 @@ unsafe impl Io for RadioIo {
         let current = gate.clone();
         self.packets.authority = Some(Arc::new(move || current.current().is_ok()));
         self.packets.protection = Some(g);
+        self.gate = Some(gate);
+        Ok(())
+    }
+    fn station_bind_coding(
+        &mut self,
+        g: Arc<crate::rtw88::qualification::Grant>,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        let gate = self.gate.as_ref().ok_or(Error::State)?.with_coding(g)?;
         self.gate = Some(gate);
         Ok(())
     }

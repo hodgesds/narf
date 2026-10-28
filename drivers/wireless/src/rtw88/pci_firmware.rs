@@ -903,6 +903,19 @@ unsafe impl Registers for Native {
         );
         Ok(())
     }
+    fn station_bind_coding(
+        &mut self,
+        g: alloc::sync::Arc<super::qualification::Grant>,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        self.packet_gate = Some(
+            self.packet_gate
+                .as_ref()
+                .ok_or(Error::State)?
+                .with_coding(g)?,
+        );
+        Ok(())
+    }
     fn station_continuation(
         &mut self,
         kind: &'static super::qualification::Kind,

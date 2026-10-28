@@ -106,6 +106,10 @@ pub(super) struct DataProfile {
     pub qos: bool,
     pub mcs: u8,
     pub sgi: bool,
+    /// Source `tx.c::rtw_tx_pkt_info_update`: `si->ldpc_en` (W5 bit7).
+    pub ldpc: bool,
+    /// Source `si->stbc_en` unless `hal.txrx_1ss` (W5 bits9:8 = 1).
+    pub stbc: bool,
 }
 impl DataProfile {
     pub(super) const LEGACY: Self = Self {
@@ -113,11 +117,22 @@ impl DataProfile {
         qos: false,
         mcs: 0,
         sgi: false,
+        ldpc: false,
+        stbc: false,
     };
     pub(super) fn valid(self) -> bool {
         self.rates != 0
             && self.rates & !0xfff == 0
             && (self.mcs == 0 && !self.sgi || self.mcs != 0 && self.qos)
+            && (self.mcs != 0 || !self.ldpc && !self.stbc)
+    }
+    /// The same profile without separately qualified TX coding.
+    pub(super) fn uncoded(self) -> Self {
+        Self {
+            ldpc: false,
+            stbc: false,
+            ..self
+        }
     }
     pub(super) fn rate_id(self) -> u8 {
         if self.mcs != 0 {
@@ -309,7 +324,14 @@ pub(super) fn transmit_profile(
     );
     put(&mut bytes, 24, u32::from(report.unwrap_or(0)));
     if ordinary && profile.mcs != 0 {
-        put(&mut bytes, 20, u32::from(profile.sgi) << 4);
+        // Source W5_DATA_SHORT bit4, W5_DATA_LDPC bit7, W5_DATA_STBC bits9:8.
+        put(
+            &mut bytes,
+            20,
+            u32::from(profile.sgi) << 4
+                | u32::from(profile.ldpc) << 7
+                | u32::from(profile.stbc) << 8,
+        );
     }
     let sequence = if frame.len() == 20 {
         0

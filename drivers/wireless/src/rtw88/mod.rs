@@ -42,6 +42,9 @@
 extern crate alloc;
 
 mod calibration8821c;
+mod coding;
+#[cfg(feature = "kernel-test")]
+mod coding_tests;
 mod command;
 mod dack;
 mod dm;

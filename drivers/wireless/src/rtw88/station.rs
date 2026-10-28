@@ -125,6 +125,10 @@ pub(super) struct State {
     rx_ba: super::rx_ba::Table,
     tx_ba_grant: Option<Arc<super::tx_ba_power::Grant>>,
     protection: Option<Arc<super::protection::Grant>>,
+    /// Bound N2xC TX coding (`coding`, tag `C`) and its admitted flags.
+    coding: Option<(Arc<super::qualification::Grant>, u8)>,
+    /// Firmware RA_INFO still carries LDPC after a coding downgrade.
+    coding_restore: bool,
     tx_ba: super::tx_ba::Originator,
     tx_config: Option<super::packet_format::Aggregation>,
     data_pending: VecDeque<Pending>,
@@ -217,6 +221,8 @@ impl State {
             rx_ba: super::rx_ba::Table::new(),
             tx_ba_grant: None,
             protection: None,
+            coding: None,
+            coding_restore: false,
             tx_ba: super::tx_ba::Originator::new(),
             tx_config: None,
             data_pending: VecDeque::new(),
@@ -264,6 +270,14 @@ impl State {
     /// established. Losing the continuation or leaving its measured envelope
     /// restores the base program under the base gate and stops tracking.
     pub(super) async fn watchdog(&mut self, io: &mut impl Io) -> Result<bool, Error> {
+        if self.established && self.ready() {
+            self.coding_live(io)?;
+            if self.coding_restore {
+                // Source RA_INFO without LDPC once coding is no longer current.
+                super::wmm::ra_info(io, self.data_profile, &self.admission).await?;
+                self.coding_restore = false;
+            }
+        }
         if self.tracking.grant.is_none() || !self.established || !self.ready() {
             return Ok(false);
         }
@@ -394,6 +408,8 @@ impl State {
         self.wmm = None;
         self.wmm_requested = false;
         self.data_profile = super::packet_format::DataProfile::LEGACY;
+        self.coding = None;
+        self.coding_restore = false;
         if self.prepared {
             io.packet_stop()?;
         }
@@ -849,6 +865,8 @@ impl State {
                                 qos: self.wmm.is_some(),
                                 mcs: 0,
                                 sgi: false,
+                                ldpc: false,
+                                stbc: false,
                             };
                             if let Some(h) = &self.ht {
                                 let negotiated = self
@@ -867,6 +885,14 @@ impl State {
                                     negotiated.ht().tx_mcs()[0],
                                     negotiated.ht().tx_sgi20(),
                                 )?;
+                                if let Some((_, flags)) = &self.coding {
+                                    self.data_profile = super::coding::apply(
+                                        *flags,
+                                        self.data_profile,
+                                        negotiated.ht().tx_ldpc(),
+                                        negotiated.ht().tx_stbc(),
+                                    );
+                                }
                             }
                         }
                         self.peer_commit = Some((aid, short));
@@ -1204,8 +1230,25 @@ impl State {
             }
             _ => None,
         };
+        // N2xC TX coding needs the HT program and its own exact continuation.
+        let coding = match &proposed {
+            Some(_) => io.station_continuation(&super::coding::KIND)?.and_then(|g| {
+                let gate = io.station_gate().ok()?;
+                let flags = super::coding::bounds(gate.did(), g.payload())?;
+                g.check(&gate).ok()?;
+                Some((g, flags))
+            }),
+            None => None,
+        };
+        let flags = coding.as_ref().map_or(0, |c| c.1);
         let mut plan = match &proposed {
-            Some(h) => JoinPlan::prepare_with_phy(&candidate.bss, self.own, ssid, mode, h.local())?,
+            Some(h) => JoinPlan::prepare_with_phy(
+                &candidate.bss,
+                self.own,
+                ssid,
+                mode,
+                h.local_coded(flags),
+            )?,
             None => JoinPlan::prepare(&candidate.bss, self.own, ssid, mode)?,
         };
         let ht = proposed.filter(|_| plan.offered_phy().is_some());
@@ -1256,6 +1299,10 @@ impl State {
         }
         if let Some(h) = ht {
             self.admission.run(|| io.station_bind_ht(h.clone()))?;
+            if let Some((g, flags)) = coding {
+                self.admission.run(|| io.station_bind_coding(g.clone()))?;
+                self.coding = Some((g, flags));
+            }
             h.program(io, &self.admission).await?;
             // RX may arrive at negotiated HT rates immediately after the AP's
             // association response, before the awaited native peer commit.
@@ -1340,7 +1387,29 @@ impl State {
         }
         result
     }
+    /// Coded DATA requires the current N2xC continuation. A revoked or
+    /// mismatched one downgrades to the uncoded base HT profile.
+    pub(super) fn coding_live(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        if !self.data_profile.ldpc && !self.data_profile.stbc {
+            return Ok(());
+        }
+        let gate = io.station_gate()?;
+        if self
+            .coding
+            .as_ref()
+            .is_some_and(|(g, _)| g.check(&gate).is_ok())
+        {
+            return Ok(());
+        }
+        self.coding = None;
+        self.coding_restore |= self.data_profile.ldpc;
+        let p = self.data_profile.uncoded();
+        self.admission.run(|| io.packet_profile(p))?;
+        self.data_profile = p;
+        Ok(())
+    }
     fn send_inner(&mut self, io: &mut impl Io, frame: &[u8]) -> Result<(), Error> {
+        self.coding_live(io)?;
         self.tracking.tx_bytes = self.tracking.tx_bytes.saturating_add(frame.len() as u64);
         if self.tx_ba.active().is_some() {
             self.send_batch_inner(io, &[frame])?;

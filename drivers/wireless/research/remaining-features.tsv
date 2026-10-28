@@ -191,7 +191,6 @@ rtw88	dma_reclamation	Published DMA/map reclamation	feature	drivers/wireless/spe
 rtw88	dpk_tracking	DPK calibration (rtw8822c_do_dpk) and thermal DPK tracking on RTL8822C	feature	drivers/wireless/specification/rtw88.md	1372
 rtw88	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specification/rtw88.md	1465
 rtw88	ht40	HT40 operation (40MHz width, DSSS/CCK40, SGI40)	feature	drivers/wireless/specification/rtw88.md	1563
-rtw88	ldpc	HT/VHT LDPC RX advertisement and peer-gated TX on RTL8822B/RTL8822C	feature	drivers/wireless/specification/rtw88.md	1566
 rtw88	multi_device	Multiple live device lifetimes	feature	drivers/wireless/specification/rtw88.md	1462
 rtw88	multi_stream_ht	Multi-stream HT on RTL8822B/RTL8822C	feature	drivers/wireless/specification/rtw88.md	1467
 rtw88	operating_reset	Reset of an operating retained owner	feature	drivers/wireless/specification/rtw88.md	1462
@@ -204,7 +203,6 @@ rtw88	rtl8822be	RTL8822BE retained firmware/radio/packet/station runtime	chip	dr
 rtw88	runtime_sleep	Runtime sleep	feature	drivers/wireless/specification/rtw88.md	1469
 rtw88	safe_rejoin	Safe reassociation/rejoin	feature	drivers/wireless/specification/rtw88.md	1469
 rtw88	smps_txrx_1ss	Coexistence-driven static SMPS on RTL8822C	feature	drivers/wireless/specification/rtw88.md	1568
-rtw88	stbc	One-stream RX STBC on all chips and TX STBC on multi-path chips	feature	drivers/wireless/specification/rtw88.md	1567
 rtw88	system_suspend	System suspend	feature	drivers/wireless/specification/rtw88.md	1462
 rtw88	tx_amsdu_5ghz	TX A-MSDU and A-MSDU-in-A-MPDU outside 2.4GHz	feature	drivers/wireless/specification/rtw88.md	1564
 rtw88	tx_ba_all_tids	Originator TX Block Ack on every non-VO TID	feature	drivers/wireless/specification/rtw88.md	1564

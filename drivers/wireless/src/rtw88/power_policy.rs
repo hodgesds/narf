@@ -163,6 +163,9 @@ pub struct Gate {
     rx_ba: Option<alloc::sync::Arc<super::rx_ba_power::Grant>>,
     tx_ba: Option<alloc::sync::Arc<super::tx_ba_power::Grant>>,
     protection: Option<alloc::sync::Arc<super::protection::Grant>>,
+    /// Separately qualified N2xC TX coding over the exact base and bound H.
+    /// Not part of `current`/`invoke`: revocation downgrades to uncoded TX.
+    coding: Option<alloc::sync::Arc<super::qualification::Grant>>,
 }
 /// A C22 calibration source without extension dispatch. N22L retains this
 /// narrower type, so invoking its base cannot recursively invoke N22L again.
@@ -335,6 +338,7 @@ impl Gate {
             rx_ba: None,
             tx_ba: None,
             protection: None,
+            coding: None,
             scope: Scope::C22 {
                 calibration,
                 permission,
@@ -350,6 +354,7 @@ impl Gate {
             rx_ba: None,
             tx_ba: None,
             protection: None,
+            coding: None,
         }
     }
     pub(super) fn did(&self) -> u16 {
@@ -459,8 +464,17 @@ impl Gate {
         }
     }
     pub(super) fn allows_profile(&self, p: super::packet_format::DataProfile) -> bool {
+        if (p.ldpc || p.stbc)
+            && !self.coding.as_ref().is_some_and(|g| {
+                super::coding::bounds(self.did(), g.payload())
+                    .is_some_and(|f| super::coding::permits(f, p))
+                    && g.check(self).is_ok()
+            })
+        {
+            return false;
+        }
         if let Some(g) = &self.ht {
-            return g.allows(p);
+            return g.allows(p.uncoded());
         }
         if p.mcs != 0 || p.sgi {
             return false;
@@ -572,6 +586,26 @@ impl Gate {
         let mut gate = self.clone();
         gate.protection = Some(g);
         Ok(gate)
+    }
+    /// Bind the N2xC TX-coding continuation over the bound HT program.
+    pub(super) fn with_coding(
+        &self,
+        g: alloc::sync::Arc<super::qualification::Grant>,
+    ) -> Result<Self, super::firmware_transport::Error> {
+        if self.ht.is_none()
+            || self.coding.is_some()
+            || !g.is(&super::coding::KIND)
+            || super::coding::bounds(self.did(), g.payload()).is_none()
+        {
+            return Err(super::firmware_transport::Error::State);
+        }
+        g.check(self)?;
+        let mut gate = self.clone();
+        gate.coding = Some(g);
+        Ok(gate)
+    }
+    pub(super) fn coding_grant(&self) -> Option<alloc::sync::Arc<super::qualification::Grant>> {
+        self.coding.clone()
     }
     pub(super) fn protection_grant(&self) -> Option<alloc::sync::Arc<super::protection::Grant>> {
         self.protection.clone()

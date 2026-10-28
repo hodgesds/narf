@@ -535,6 +535,8 @@ fn smoke_rtw88_rx_ba_native_emitter_requires_separate_grant_and_ccx() -> TestRes
             qos: true,
             mcs: 255,
             sgi: false,
+            ldpc: false,
+            stbc: false,
         })
         .map_err(|_| "recipient H profile")?;
         let ap = [2, 0, 0, 0, 0, 1];
@@ -664,6 +666,8 @@ fn batch_core(model: &mut Model) -> Result<Core, &'static str> {
         qos: true,
         mcs: 255,
         sgi: true,
+        ldpc: false,
+        stbc: false,
     })
     .map_err(|_| "batch HT profile")?;
     core.aggregation(Some(format::Aggregation {
@@ -817,6 +821,8 @@ fn native_batch_bounds() -> Result<(), &'static str> {
         qos: true,
         mcs: 1,
         sgi: false,
+        ldpc: false,
+        stbc: false,
     };
     let cfg = format::Aggregation {
         density: 7,

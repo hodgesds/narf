@@ -1425,6 +1425,52 @@ plus HT protection modes 1..3 (`drivers/wireless/rtw88/ht_protection/*`).
 These are software/model results. A real signed N2xD measurement and physical
 acceptance remain external deployment gates.
 
+### C21/C22 HT TX coding: LDPC and STBC (`N2xC`)
+
+`coding.rs` (tag `C`, stem `coding`) is the first TX/PHY feature qualified
+through the generic continuation contract. Linux v6.12 sources:
+
+- `main.c::rtw_init_ht_cap` (~L1540): every chip advertises one-stream RX
+  STBC (`1 << IEEE80211_HT_CAP_RX_STBC_SHIFT`); HT `LDPC_CODING` only with
+  `chip->rx_ldpc` (`rtw8822c.c` `.rx_ldpc = true`, `rtw8821c.c` false);
+  HT `TX_STBC` only with `chip->tx_stbc` (`rtw8822c.c`).
+- `main.c::rtw_update_sta_info` (~L1200): `si->ldpc_en` from the peer's HT
+  `LDPC_CODING`, `si->stbc_en` from the peer's nonzero HT `RX_STBC`.
+- `tx.c::rtw_tx_pkt_info_update` (~L375): `stbc = hal.txrx_1ss ? false :
+  si->stbc_en`, `ldpc = si->ldpc_en`; `tx.c::rtw_tx_fill_tx_desc` encodes
+  `tx.h` `RTW_TX_DESC_W5_DATA_LDPC` (BIT 7) and `W5_DATA_STBC` (bits 9:8).
+- `fw.c::rtw_fw_send_ra_info` / `fw.h` `SET_RA_INFO_LDPC` (H2C word0 bit 26).
+
+RX advertisement is a local decode promise and belongs to the base HT
+station: with a bound N2xH every HT association request now carries RX
+STBC1, and C22 also carries LDPC. Emitting coded PPDUs changes the waveform,
+so it needs a separate `N2xC` continuation over the exact retained base.
+Payload byte 0 requests TX LDPC (bit 0) and TX STBC (bit 1); every other
+byte is zero. C21 is one-path and may request LDPC only, matching Linux,
+which gates no TX LDPC on the chip. The grant loads before `JoinPlan`
+preparation, so the offer advertises `TX_STBC` only when it is qualified.
+It binds into the retained `Gate` (`with_coding`) right after the HT program.
+At the association response the data profile takes LDPC/STBC only where the
+qualified flags and the shared `HtNegotiation::tx_ldpc`/`tx_stbc` (peer
+capability) agree. `wmm::ra_info` sets RA_INFO bit 26 and the native
+descriptor sets W5 bit 7 and W5 bits 9:8 = 1. `Gate::allows_profile` admits a
+coded profile only with a current bound grant whose flags permit it.
+
+`hal.txrx_1ss` is never set because coexistence-driven SMPS is not
+implemented (`smps_txrx_1ss` stays open), so STBC is not forced off. The
+coding grant is not part of `Gate::current`. Every DATA send and every
+watchdog pass call `coding_live`. If the grant is revoked or no longer
+matches, the station drops to the uncoded HT profile under the base gate.
+The next watchdog then resends RA_INFO without LDPC, and the link stays up.
+Teardown clears the bound coding.
+
+Evidence: two `drivers/wireless/rtw88/narrow/coding` cases (descriptor W5
+bits, payload bounds, peer/flag intersection) and composed C21/C22 cases in
+`drivers/wireless/rtw88/coding/rtl882{1,2}c` (`coding_tests.rs`):
+advertisement, coded descriptor and RA_INFO, revocation downgrade, an
+unqualified station, a peer without coding, refused records and teardown.
+A real signed N2xC measurement and over-the-air acceptance remain external.
+
 ## 4. Invariants
 
 - Physical reads select Wi-Fi EFUSE bank zero and disable the programming
@@ -1511,6 +1557,7 @@ Remaining software ledger:
 | C21/C22 recipient RX BA | Distinct exact-H N21R/N22R contract; actual bound ADDBA success/CCX/idle, explicit SSN, TIDs0..7/window<=64 with A-MSDU permission, source RAW/PHY admission, opaque originals before CCMP/PN, BAR20/DELBA/hole/TU timers and key/publication epochs implemented; native tests passed the coordinated x86_64/aarch64 software suites. Real measured assets/automatic BA/over-air acceptance remain external |
 | C21/C22 originator TX BA | Distinct exact-H or R-over-H N21T/N22T contract; bound on-air request/response/current SSN, genuine CCX/RX-idle/MAC-FIFO proof, four independent native DMA originals, source AGGEN/density/MAXAGG and per-MPDU status, current-SSN BAR20/DELBA/key drains implemented; native tests passed the coordinated x86_64/aarch64 software suites. Measured assets/real MAC aggregation and over-air behavior remain external |
 | C21/C22 RTS threshold | Separate N21X/N22X over exact current H/R/T; native24Mbps RTS descriptor/control program, actual response-rate admission, drained current-authority setting, CCX/immutable-DMA/FIFO completion and EAPOL exclusion implemented. Twelve native cases pass on both architectures; real measured X assets/RTS-CTS/physical acceptance remain external |
+| C21/C22 HT TX coding (LDPC/STBC) | N2xC continuation: base RX STBC1 (+C22 RX LDPC) advertisement, qualified TX LDPC (both) / TX STBC (C22) intersected with the peer, W5 bit7/bits9:8, RA_INFO bit26, revocation downgrade. Real N2xC measurement external |
 | Generic continuation contract + dm watchdog | Reusable signed N2x<tag> loader; N2xD rtw_watch_dog_work/rtw_phy_dynamic_mechanism port: DIG/CCK-PD/RA on both chips, path diversity/CFO/thermal power tracking/EDCCA on C22; base restore on revocation. Real N2xD measurement external; no DPK tracking |
 | Port0 peer/AID/media/RA/default-port control | Implemented bounded source mailbox, long-slot initial MLME, same-owner station integration and close/cancel behavior |
 | Passive/active channel1 scan with probe IEs, authentication/association, WPA2 controlled port | Retained channel1 shared MLME/RSNA/CCMP through actual native DMA and CCX, including held/altered/cancelled M4 and queued peer-loss closure |

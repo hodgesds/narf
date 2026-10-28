@@ -144,7 +144,52 @@ kernel_test_in!(
     "drivers/wireless/rtw88/ht_protection/rtl8822c",
     smoke_rtw8822ce_ht_protection_modes_admitted
 );
+fn smoke_rtw8822ce_coding_ldpc_stbc_and_revocation() -> TestResult {
+    result(crate::rtw88::coding_tests::composition::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/coding/rtl8822c",
+    smoke_rtw8822ce_coding_ldpc_stbc_and_revocation
+);
+fn smoke_rtw8822ce_coding_not_granted_or_uncoded_peer() -> TestResult {
+    result(crate::rtw88::coding_tests::not_granted::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/coding/rtl8822c",
+    smoke_rtw8822ce_coding_not_granted_or_uncoded_peer
+);
+fn smoke_rtw8822ce_coding_refusals_and_teardown() -> TestResult {
+    result(crate::rtw88::coding_tests::refusals::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/coding/rtl8822c",
+    smoke_rtw8822ce_coding_refusals_and_teardown
+);
 impl cases::Fixture for Case {
+    fn kind_request(
+        &self,
+        kind: &'static crate::rtw88::qualification::Kind,
+    ) -> Result<crate::rtw88::ContinuationRequest, Error> {
+        self.e.h.model(|io| io.kind_request(kind))
+    }
+    fn stage_kind(
+        &self,
+        kind: &'static crate::rtw88::qualification::Kind,
+        bytes: Vec<u8>,
+        cap: Cap<FirmwareBlob, Read>,
+        signed: bool,
+    ) -> Result<(), Error> {
+        self.e.h.model(|io| {
+            io.qualify(
+                kind,
+                crate::rtw88::qualification::Source::Verified {
+                    bytes,
+                    cap,
+                    signer: signed.then_some([19; 32]),
+                },
+            )
+        })
+    }
     fn dm_request(&self) -> Result<crate::rtw88::ContinuationRequest, Error> {
         self.e.h.model(|io| io.dm_request())
     }
@@ -255,6 +300,9 @@ impl cases::Fixture for Case {
     }
     fn inject(&self, b: &[u8], r: u8, w: u8) {
         self.e.h.model(|io| io.packets.receive_rate(b, r, w))
+    }
+    fn mailboxes(&self) -> Vec<[u8; 8]> {
+        self.e.h.model(|io| io.mailboxes.clone())
     }
     fn descriptor(&self) -> Option<[u8; 48]> {
         self.e.h.model(|io| io.packets.last_descriptor)

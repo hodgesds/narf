@@ -149,6 +149,8 @@ fn period(linked: bool) -> Period {
             qos: true,
             mcs: 0xff,
             sgi: false,
+            ldpc: false,
+            stbc: false,
         },
         tx_bytes: 0,
         rx_bytes: 0,

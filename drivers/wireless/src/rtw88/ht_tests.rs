@@ -69,6 +69,20 @@ pub(super) trait Fixture: Sized {
         cap: Cap<FirmwareBlob, Read>,
         signed: bool,
     ) -> Result<(), firmware_transport::Error>;
+    /// Every firmware H2C mailbox command issued so far.
+    fn mailboxes(&self) -> Vec<[u8; 8]>;
+    /// Generic N2x<tag> continuation request over the exact current base.
+    fn kind_request(
+        &self,
+        kind: &'static qualification::Kind,
+    ) -> Result<super::ContinuationRequest, firmware_transport::Error>;
+    fn stage_kind(
+        &self,
+        kind: &'static qualification::Kind,
+        bytes: Vec<u8>,
+        cap: Cap<FirmwareBlob, Read>,
+        signed: bool,
+    ) -> Result<(), firmware_transport::Error>;
 }
 pub(super) fn elements(sgi: bool) -> Vec<u8> {
     let mut b = vec![45, 26];
