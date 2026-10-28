@@ -198,9 +198,11 @@ fn smoke_ath10k_recovery_retired_physical_drop_preserves_successor_and_pins_dma(
         poisoned: false,
         saved_aspm: None,
         retired: false,
+        reclaimable: false,
     };
     if !matches!(owner.retire_for_restart(), Err(BmiError::Pci))
         || !owner.retired
+        || owner.reclaimable
         || owner.hif_source_ready(3).is_ok()
     {
         return TestResult::Fail("failed physical park did not retire old transport");
@@ -230,4 +232,72 @@ fn smoke_ath10k_recovery_retired_physical_drop_preserves_successor_and_pins_dma(
 kernel_test_in!(
     "drivers/wireless/ath10k/recovery",
     smoke_ath10k_recovery_retired_physical_drop_preserves_successor_and_pins_dma
+);
+
+/// A retirement that proved quiescence frees on Drop without any hardware
+/// access; a function without a PCIe ordering proof is never reclaimable.
+fn smoke_ath10k_recovery_reclaimable_retired_drop_frees_without_hardware_access() -> TestResult {
+    let hardware = HwRev::Qca6174;
+    let registers = hardware.registers().unwrap();
+    let mut words = vec![0u32; 0x100000 / 4];
+    let base = narf_memory::PhysAddr::new(0);
+    let device = BusDevice {
+        addr: narf_bus::BusAddr::Mmio(base),
+        id: narf_bus::DeviceId {
+            vendor: 0x168c,
+            device: 0x003e,
+            class: 0x028000,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: narf_bus::BusKind::VirtioMmio {
+            base,
+            len: 0x1000,
+            device_id: 1,
+        },
+    };
+    let make = |words: &mut Vec<u32>, reclaimable: bool| PciBoot {
+        mmio: Mmio {
+            cap: Cap::bootstrap(),
+            sources: None,
+            io: RawMmio(MmioRegion {
+                phys: base,
+                virt: words.as_mut_ptr() as u64,
+                len: 0x100000,
+                kind: narf_bus::BarKind::Mmio32 {
+                    prefetchable: false,
+                },
+            }),
+        },
+        hardware,
+        registers,
+        device,
+        resources: ManuallyDrop::new(Resources::allocate(hardware).unwrap()),
+        hif: ManuallyDrop::new(None),
+        hif_live: false,
+        mission_pending: true,
+        power_ready: false,
+        armed: true,
+        poisoned: true,
+        saved_aspm: None,
+        retired: true,
+        reclaimable,
+    };
+    let mut owner = make(&mut words, false);
+    // Not a PCIe function: no Device Control ordering proof exists.
+    if owner.flushed() {
+        return TestResult::Fail("non-PCIe function produced an ordered flush proof");
+    }
+    drop(owner);
+    let owner = make(&mut words, true);
+    words.fill(0x5678); // A successor's live register state.
+    drop(owner);
+    if words.iter().any(|value| *value != 0x5678) {
+        return TestResult::Fail("reclaiming retired Drop touched successor hardware");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/recovery",
+    smoke_ath10k_recovery_reclaimable_retired_drop_frees_without_hardware_access
 );

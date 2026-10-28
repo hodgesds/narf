@@ -426,11 +426,21 @@ remain separate profiles.
   PCI bus-master disable. A failed halt still attempts master disable but cannot
   start a successor. The retired physical owner is terminal before hardware
   access, and its late Drop performs no MMIO, BME or ASPM operation against a
-  successor. All old boot/firmware/WMI/management/HTT allocations remain pinned,
-  even after successful reset scheduling: no posted-DMA drain, reclamation or
-  RF-quiescence proof is claimed. The attempt limit bounds these retained DMA
-  generations. This is manual replacement/rejoin support, not automatic recovery,
-  stable-netdev reconnection, system suspend or reclaimed DMA. Physical reset,
+  successor. DMA reclamation (`boot.rs::PciBoot::flushed`,
+  `boot/recovery.rs`): after every CE is halted and PCI bus mastering reads
+  back clear, the retiring owner checks PCIe Device Control Relaxed Ordering
+  is disabled and completes a non-posted BAR read, which then orders behind
+  every earlier device-posted write. Only then is it `reclaimable`, and its
+  late Drop frees the boot/firmware/WMI/management/HTT allocations (still with
+  no hardware access). With BME off no CE or firmware-directed write can start;
+  every successor performs the Linux `ath10k_pci_safe_chip_reset` warm CE/CPU
+  or cold SoC reset and reprograms the CE rings before it re-enables bus
+  mastering. Any halt, BME, ordering or flush failure keeps every mapping
+  pinned. A non-retired terminal Drop uses the same proof after firmware
+  DONE. No RF-quiescence proof is claimed. The attempt limit bounds pinned
+  generations. This is manual replacement/rejoin support, not automatic
+  recovery,
+  stable-netdev reconnection or system suspend. Physical reset,
   ROM/firmware restart and repeated RF association still need hardware acceptance.
 - `pci::start_station_data(pmk)` starts the retained packet owner after native
   association, with `None` for Open or the caller's WPA2 PMK. It requires

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Park an old generation before fresh-ROM recovery. Published allocations
-//! remain pinned: CE halt/BME readback do not prove posted DMA or RF quiescence.
+//! Park an old generation before fresh-ROM recovery. After every CE halted
+//! and bus mastering reads back clear, an ordered flush read (no Relaxed
+//! Ordering) lets the retired owner free its allocations on Drop; any failed
+//! step keeps them pinned. No RF-quiescence claim is made.
 use super::*;
 
 pub(in crate::ath10k) struct Restart {
@@ -65,6 +67,7 @@ impl PciBoot {
             })
             .map_err(|_| BmiError::Pci)?
         })?;
+        self.reclaimable = self.flushed();
         Ok(Restart {
             device,
             cap,

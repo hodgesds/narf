@@ -8,7 +8,6 @@ ath10k	automatic_protection	Automatic AP protection-mode updates	feature	drivers
 ath10k	automatic_recovery	Automatic firmware recovery	feature	drivers/wireless/specification/ath10k.md	432
 ath10k	beacon_hints	Beacon-hint regulatory updates	feature	drivers/wireless/specification/ath10k.md	946
 ath10k	dfs	DFS	feature	drivers/wireless/specification/ath10k.md	945
-ath10k	dma_reclamation	DMA reclamation after terminal/reset ownership	feature	drivers/wireless/specification/ath10k.md	430
 ath10k	dynamic_wmm	Dynamic WMM/EDCA updates	feature	drivers/wireless/specification/ath10k.md	945
 ath10k	hardware_keys	Hardware key and crypto offload	feature	drivers/wireless/specification/ath10k.md	946
 ath10k	host_bus_pm	Host-bus power management	feature	drivers/wireless/specification/ath10k.md	947

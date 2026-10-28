@@ -157,9 +157,36 @@ pub(super) struct PciBoot {
     poisoned: bool,
     saved_aspm: Option<u16>,
     retired: bool,
+    /// A retired generation proved every CE halted, bus mastering off and
+    /// ordered flushing; its Drop may free (but never touch hardware).
+    reclaimable: bool,
 }
 
 impl PciBoot {
+    /// Post-BME-off reclamation proof. With bus mastering verified clear the
+    /// function cannot start new DMA; a non-posted BAR read then orders behind
+    /// every earlier device-posted write unless PCIe Relaxed Ordering (Device
+    /// Control bit 4) lets completions pass them, in which case no proof holds.
+    /// Any successor resets the target (warm CE/CPU or cold SoC reset, as
+    /// Linux `ath10k_pci_safe_chip_reset`) before it re-enables bus mastering.
+    fn flushed(&mut self) -> bool {
+        let ordered = self
+            .mmio
+            .cap
+            .derive::<narf_capabilities::Read>()
+            .ok()
+            .and_then(|read| {
+                crate::qualcomm_pci::invoke(&self.mmio.cap, || {
+                    narf_bus::pci_express::read_status(&read, &self.device)
+                })
+                .ok()
+                .and_then(Result::ok)
+            })
+            .is_some_and(|status| status.device_control & (1 << 4) == 0);
+        ordered
+            && self.mmio.authorized()
+            && self.mmio.read32(self.registers.soc_core + 8) != u32::MAX
+    }
     pub(super) fn bind_sources(&mut self, source: super::firmware_source::Source) {
         // Set once after ROM identity and before the first executable copy.
         if self.mmio.sources.is_some() || source.bind_pci(self.mmio.cap).is_err() {
@@ -216,6 +243,7 @@ impl PciBoot {
             poisoned: false,
             saved_aspm: None,
             retired: false,
+            reclaimable: false,
         })
     }
 
@@ -670,8 +698,16 @@ impl<B: Memory> Resources<B> {
 impl Drop for PciBoot {
     fn drop(&mut self) {
         if self.retired {
-            // A successor owns this function. Keep every old mapping pinned
-            // and never halt or reconfigure the new physical generation.
+            // A successor may own this function: never halt or reconfigure
+            // it. Free only what retirement proved quiescent.
+            if self.reclaimable {
+                // SAFETY: retirement halted every CE, verified BME clear and
+                // completed an ordered flush read; no DMA can reach these.
+                unsafe {
+                    ManuallyDrop::drop(&mut self.resources);
+                    ManuallyDrop::drop(&mut self.hif);
+                }
+            }
             return;
         }
         let mut stopped = true;
@@ -688,7 +724,9 @@ impl Drop for PciBoot {
         .is_ok()
             && narf_bus::pci::read_command(&self.mmio.cap, &self.device)
                 .is_ok_and(|command| command & narf_bus::pci::cmd::BUS_MASTER == 0);
-        if stopped && disabled && !self.mission_pending {
+        // After DONE, firmware may still direct writes; with BME verified off
+        // and an ordered flush read those can neither start nor be in flight.
+        if stopped && disabled && (!self.mission_pending || self.flushed()) {
             barrier();
             // SAFETY: no CE can access the allocations and PCI BME is clear.
             unsafe {
