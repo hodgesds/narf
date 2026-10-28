@@ -65,6 +65,8 @@ pub struct Ath9k {
     /// A retired generation could not prove DMA quiescence: its mappings stay
     /// pinned and the function may still master, so no successor may start.
     pinned: bool,
+    /// System suspend parked the chip in FULL_SLEEP; only resume reopens it.
+    suspended: bool,
 }
 
 impl Ath9k {
@@ -304,7 +306,10 @@ pub async fn reset_radio() -> Result<RadioCalibration, BringUpError> {
 async fn reset_owner(owner: &Retained) -> Result<RadioCalibration, BringUpError> {
     {
         let mut controller = owner.state.lock().await;
-        if owner.removed.load(core::sync::atomic::Ordering::Acquire) || controller.pinned {
+        if owner.removed.load(core::sync::atomic::Ordering::Acquire)
+            || controller.pinned
+            || controller.suspended
+        {
             return Err(BringUpError::DeviceGone);
         }
         if !retire_generation(&mut controller).await {
@@ -390,6 +395,77 @@ async fn supervise(owner: Arc<Retained>) {
             }
         }
     }
+}
+
+/// `pci.c::ath_pci_suspend`. The station generation is retired first (as
+/// mac80211 stops interfaces before PCI suspend), its DMA-stop proof is
+/// required, then the chip is disabled and forced into FULL_SLEEP. A held
+/// owner lock reports Busy so the orchestrator aborts; unproven DMA pins the
+/// owner and fails suspend rather than powering down a mastering device.
+fn pm_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    use narf_power::device_pm::DeviceSuspendError;
+    let Some(owner) = CONTROLLER.lock().clone() else {
+        return Ok(());
+    };
+    if owner.removed.load(core::sync::atomic::Ordering::Acquire) {
+        return Ok(());
+    }
+    let mut controller = owner.state.try_lock().ok_or(DeviceSuspendError::Busy)?;
+    if controller.pinned {
+        return Err(DeviceSuspendError::DriverError);
+    }
+    if let Some(station) = controller.station.clone() {
+        let mut radio = station.try_lock().ok_or(DeviceSuspendError::Busy)?;
+        interface::retire(&station);
+        if !radio.retire() {
+            controller.pinned = true;
+            return Err(DeviceSuspendError::DriverError);
+        }
+    }
+    controller.station = None;
+    controller.radio = calibration::Calibration::default();
+    // Blocks initialization until resume re-identifies the chip.
+    controller.packet_attempted = true;
+    controller.suspended = true;
+    identity::sleep(controller._mmio, controller._cap).map_err(|_| DeviceSuspendError::DriverError)
+}
+
+/// `pci.c::ath_pci_resume`: re-disable PCI RETRY_TIMEOUT (config 0x41) that
+/// suspend reset, then a generation reset (power-on reset, identical EEPROM,
+/// INI/PLL/RF, calibration) republishes the station.
+fn pm_resume() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    use narf_power::device_pm::DeviceSuspendError;
+    let Some(owner) = CONTROLLER.lock().clone() else {
+        return Ok(());
+    };
+    {
+        let mut controller = owner.state.try_lock().ok_or(DeviceSuspendError::Busy)?;
+        if !controller.suspended {
+            return Ok(());
+        }
+        let (cap, device) = (controller._cap, controller._device);
+        let value = identity::invoke(&cap, || narf_bus::pci::read_config32(&cap, &device, 0x40))
+            .map_err(|_| DeviceSuspendError::DriverError)?
+            .map_err(|_| DeviceSuspendError::DriverError)?;
+        if value & 0xff00 != 0 {
+            identity::invoke(&cap, || {
+                narf_bus::pci::write_config32(&cap, &device, 0x40, value & 0xffff_00ff)
+            })
+            .map_err(|_| DeviceSuspendError::DriverError)?
+            .map_err(|_| DeviceSuspendError::DriverError)?;
+        }
+        controller.suspended = false;
+    }
+    narf_scheduler::spawn(async move {
+        if let Err(error) = reset_owner(&owner).await {
+            let _ = writeln!(
+                narf_console::Writer,
+                "ath9k: resume reset closed: {:?}",
+                error
+            );
+        }
+    });
+    Ok(())
 }
 
 /// Linux `ath_pci_remove`: mark the owner removed before waiting, withdraw
@@ -497,6 +573,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             packet_attempted: false,
             generation: 0,
             pinned: false,
+            suspended: false,
         }),
         removed: core::sync::atomic::AtomicBool::new(false),
     });
@@ -556,4 +633,5 @@ pub fn register() {
         });
         narf_bus::register_pci_remove(name, remove);
     }
+    narf_power::device_pm::register_device_pm("ath9k", pm_suspend, pm_resume);
 }

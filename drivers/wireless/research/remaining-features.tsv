@@ -61,7 +61,6 @@ ath9k	larger_tx_aggregates	TX aggregates larger than the implemented two-MPDU se
 ath9k	periodic_calibration	Periodic calibration	feature	drivers/wireless/specification/ath9k.md	587
 ath9k	sgi40	SGI40	feature	drivers/wireless/specification/ath9k.md	588
 ath9k	station_network_sleep	Station NETWORK_SLEEP power save with beacon timers	feature	drivers/wireless/specification/ath9k.md	600
-ath9k	system_suspend	System suspend/resume	feature	drivers/wireless/specification/ath9k.md	604
 ath9k	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/ath9k.md	588
 brcmfmac	additional_chip_profiles	Additional CPU/RAM/chip/OTP profiles (incl. 160 MHz-capable chips; retained BCM43602 is 80 MHz)	chip	drivers/wireless/specification/brcmfmac.md	562
 brcmfmac	ap_mode	Access Point mode	feature	drivers/wireless/specification/cyw43439.md	499

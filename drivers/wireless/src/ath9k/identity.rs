@@ -6,6 +6,8 @@ use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, NoopOp, Write};
 
 const AR_RC: u64 = 0x4000;
+const AR_STA_ID1: u64 = 0x8004;
+const AR_STA_ID1_PWR_SAV: u32 = 0x0004_0000;
 const AR_SREV: u64 = 0x4020;
 const AR_INTR_SYNC_CAUSE: u64 = 0x4028;
 const AR_INTR_SYNC_ENABLE: u64 = 0x402c;
@@ -174,6 +176,37 @@ fn reset(io: &mut impl RegisterIo) -> Result<(), BringUpError> {
     io.wait(AR_RTC_RC, 3, 0)?;
     io.write32(AR_RC, 0);
     Ok(())
+}
+
+/// `pci.c::ath_pci_suspend`: `hw.c::ath9k_hw_disable` (AWAKE + cold
+/// reset; the PLL is not reprogrammed because the chip sleeps immediately)
+/// followed by the forced `hw.c::ath9k_set_power_sleep` FULL_SLEEP entry:
+/// STA_ID1 PWR_SAV, RTC force-wake clear, AR_RC AHB|HOSTIF held in reset and
+/// the active-low RTC reset asserted. Resume needs a full power-on reset.
+pub(super) fn disable_and_sleep(io: &mut impl RegisterIo) -> Result<(), BringUpError> {
+    if !io.authorized() {
+        return Err(BringUpError::DeviceGone);
+    }
+    reset(io)?;
+    let id1 = io.read32(AR_STA_ID1);
+    let wake = io.read32(AR_RTC_FORCE_WAKE);
+    let rtc = io.read32(AR_RTC_RESET);
+    if [id1, wake, rtc].contains(&u32::MAX) {
+        return Err(BringUpError::DeviceGone);
+    }
+    io.write32(AR_STA_ID1, id1 | AR_STA_ID1_PWR_SAV);
+    io.write32(AR_RTC_FORCE_WAKE, wake & !1);
+    io.write32(AR_RC, 0x101);
+    io.write32(AR_RTC_RESET, rtc & !1);
+    io.delay_us(2);
+    Ok(())
+}
+
+pub(super) fn sleep(
+    mmio: narf_bus::MmioRegion,
+    cap: Cap<BusDeviceCap, Write>,
+) -> Result<(), BringUpError> {
+    disable_and_sleep(&mut Registers::new(mmio, cap))
 }
 
 fn decode_identity(

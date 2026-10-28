@@ -640,11 +640,23 @@ must be software-forced. Remaining named operations:
   `beacon.c::ath9k_beacon_config_sta`/`hw.c::ath9k_hw_set_sta_beacon_timers`
   TIM/DTIM timers and beacon/CAB/PS-Poll/TX-ACK wake conditions. Linux leaves
   `SUPPORTS_PS` behind the `ps_enable` module parameter (default off).
-- `system_suspend`: `pci.c::{ath_pci_suspend,ath_pci_resume}` hardware disable
-  plus forced `FULL_SLEEP`, then PCI RETRY_TIMEOUT (config 0x41) re-disable and
-  ASPM re-initialization on resume.
 - `host_bus_pm`: `pci.c::ath_pci_aspm_init` parent-link ASPM L0s/L1 discovery
   and `aspm_l1_fix` (config 0x70c) handling.
+
+System suspend is implemented through `narf_power::device_pm` ("ath9k"):
+`pm_suspend` (Linux `pci.c::ath_pci_suspend`, with mac80211's prior
+interface stop) retires the station generation and requires its DMA-stop
+proof, then `identity::disable_and_sleep` performs `ath9k_hw_disable` (AWAKE
++ cold reset; PLL not reprogrammed since the chip sleeps immediately) and the
+forced `hw.c::ath9k_set_power_sleep` FULL_SLEEP entry (STA_ID1 PWR_SAV, RTC
+force-wake clear, AR_RC AHB|HOSTIF, active-low RTC reset asserted). A held
+owner lock returns Busy so the orchestrator aborts; unproven DMA pins the
+owner and fails suspend. `pm_resume` (`ath_pci_resume`) re-disables PCI
+RETRY_TIMEOUT (config 0x41) and spawns a generation reset (power-on reset,
+identical EEPROM, INI/PLL/RF, calibration, republication). ASPM
+re-initialization belongs to the open `host_bus_pm` row. Covered by
+`smoke_ath9k_ar9285_suspend_disable_then_forced_full_sleep` plus the
+retirement smokes; physical S3 is unmeasured.
 
 Wake-on-WLAN is not applicable to the matched parts: `wow.c::ath9k_init_wow`
 requires PCI `driver_data` `ATH9K_PCI_WOW`, which `pci.c` sets only for
