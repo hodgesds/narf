@@ -100,6 +100,15 @@ pub fn register_initcalls() {
         ath11k::register();
         InitResult::Ok
     });
+    // ath11k AHB (IPQ8074/6018/5018, WCN6750): bind the DT nodes the
+    // Subsys initcall's `register_dt_driver` claims.
+    narf_init::register(Stage::Device, "ath11k-ahb", || {
+        if narf_bus::probe_all_dt() == 0 {
+            InitResult::NotPresent
+        } else {
+            InitResult::Ok
+        }
+    });
     narf_init::register(Stage::Subsys, "ath10k", || {
         ath10k::register();
         InitResult::Ok

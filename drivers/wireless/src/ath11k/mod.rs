@@ -99,6 +99,7 @@ pub use pci::{probe, register_pci_driver, Ath11kDevice, ProbeError};
 /// `drivers/wireless/src/lib.rs`).
 pub fn register() {
     register_pci_driver();
+    ahb_probe::register_dt_driver();
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

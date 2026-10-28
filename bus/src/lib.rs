@@ -39,6 +39,7 @@ pub mod bar;
 pub mod cxl;
 pub mod device;
 pub mod driver_match;
+pub mod dt_match;
 pub mod ecam;
 pub mod hotplug;
 pub mod msi;
@@ -83,6 +84,11 @@ pub use driver_match::{
     set_probe_log, set_probe_log_hook, unregister_module_pci_drivers, MatchKind,
     ModuleCallbackCallGate, ModuleCallbackFn, ModuleProbeCallGate, ModuleProbeFn, ModuleTxCallGate,
     ModuleTxFn, PciMatch, PciProbeFn, PciRemoveFn, ProbeError,
+};
+pub use dt_match::{
+    bound as bound_dt_nodes, probe_all as probe_all_dt, probe_blob as probe_dt_blob,
+    register as register_dt_driver, registered as registered_dt_drivers,
+    unregister as unregister_dt_driver, DtMatch, DtProbeFn,
 };
 pub use hotplug::{dispatch_event, register_listener, HotplugError, HotplugEvent, HotplugListener};
 pub use msix::{enable_msix, MsixError, MsixTable, MsixVector};

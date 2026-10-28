@@ -156,3 +156,32 @@ fn smoke_ath11k_ahb_bring_up_order() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_ahb_bring_up_order);
+
+/// The bus DT match table binds the AHB node once, through
+/// `ahb_dt_probe`, by its full path; a second walk is a no-op and a
+/// driver-less tree binds nothing.
+fn smoke_ath11k_ahb_dt_driver_match() -> TestResult {
+    let blob: &'static [u8] =
+        alloc::boxed::Box::leak(ipq6018_wifi_dt("qcom,ipq6018-wifi", &SPIS).into_boxed_slice());
+    narf_bus::unregister_dt_driver(AHB_DT_DRIVER);
+    kt_assert_eq!(narf_bus::probe_dt_blob(blob), 0);
+    let _ = take_probed();
+    register_dt_driver();
+    let n = narf_bus::probe_dt_blob(blob);
+    let again = narf_bus::probe_dt_blob(blob);
+    let bound = narf_bus::bound_dt_nodes();
+    let probed = take_probed();
+    narf_bus::unregister_dt_driver(AHB_DT_DRIVER);
+    kt_assert_eq!(n, 1);
+    kt_assert_eq!(again, 0);
+    kt_assert!(bound
+        .iter()
+        .any(|(p, d)| p.ends_with("/wifi@c000000") && *d == AHB_DT_DRIVER));
+    kt_assert_eq!(probed.len(), 1);
+    kt_assert_eq!(probed[0].res.chip, AhbChip::Ipq6018Hw10);
+    kt_assert!(narf_bus::bound_dt_nodes()
+        .iter()
+        .all(|(_, d)| *d != AHB_DT_DRIVER));
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_ahb_dt_driver_match);

@@ -92,6 +92,66 @@ impl AhbPlatform {
     }
 }
 
+// ── DT platform driver ─────────────────────────────────────────────
+
+/// `ath11k_ahb_driver.driver.of_match_table` (`ath11k_ahb_of_match`).
+pub const AHB_DT_COMPATIBLE: [&str; 4] = [
+    super::ahb::AHB_OF_MATCH[0].0,
+    super::ahb::AHB_OF_MATCH[1].0,
+    super::ahb::AHB_OF_MATCH[2].0,
+    super::ahb::AHB_OF_MATCH[3].0,
+];
+
+/// The bus DT driver-match name.
+pub const AHB_DT_DRIVER: &str = "ath11k_ahb";
+
+/// `module_platform_driver(ath11k_ahb_driver)`: register with the bus
+/// DT match table (`narf_bus::register_dt_driver`).
+pub fn register_dt_driver() {
+    narf_bus::register_dt_driver(narf_bus::DtMatch {
+        name: AHB_DT_DRIVER,
+        compatible: &AHB_DT_COMPATIBLE,
+        probe: ahb_dt_probe,
+    });
+}
+
+/// Resolve the matched node at `path` into an [`AhbPlatform`].
+pub fn probe_node(blob: &[u8], path: &str) -> Result<AhbPlatform, AhbError> {
+    let (node, _) = super::ahb::find_ahb_devices(blob)
+        .into_iter()
+        .find(|(n, _)| n.path == path)
+        .ok_or(AhbError::Unsupported)?;
+    AhbPlatform::probe(blob, &node)
+}
+
+fn probe_error(e: &AhbError) -> narf_bus::ProbeError {
+    match e {
+        AhbError::Unsupported => narf_bus::ProbeError::NotForThisDriver,
+        AhbError::Dt(_) | AhbError::MissingIrq(_) | AhbError::NoRproc => {
+            narf_bus::ProbeError::BadDevice
+        }
+        AhbError::LoaderMismatch => narf_bus::ProbeError::Other("ath11k: remoteproc loader"),
+        AhbError::Failed(_) => narf_bus::ProbeError::Other("ath11k: bring-up"),
+    }
+}
+
+/// Platforms probed and awaiting their bring-up task.
+static PROBED: narf_lib::sync::IrqSafeSpinLock<Vec<AhbPlatform>> =
+    narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+
+/// The DT probe (`ath11k_ahb_probe`'s devicetree half): resolve the
+/// node, then hand it to the bring-up.
+pub fn ahb_dt_probe(blob: &'static [u8], path: &str) -> Result<(), narf_bus::ProbeError> {
+    let p = probe_node(blob, path).map_err(|e| probe_error(&e))?;
+    PROBED.lock().push(p);
+    Ok(())
+}
+
+/// Take the platforms probed so far.
+pub fn take_probed() -> Vec<AhbPlatform> {
+    core::mem::take(&mut *PROBED.lock())
+}
+
 /// One bring-up step ([`bring_up`] order).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BringUpStep {
