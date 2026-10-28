@@ -126,6 +126,8 @@ pub mod mac_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod mhi_tests;
 #[cfg(any(test, feature = "kernel-test"))]
+pub mod multi_pdev_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 pub mod qmi_handshake_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod qmi_tests;

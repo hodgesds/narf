@@ -200,3 +200,44 @@ const _: () = assert!(offset_of!(HalRxDescQcn9074, hdr_status) == 264);
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "qcn9074_tests.rs"]
 mod tests;
+
+// ── static BAR windows (`static_window_map`, Linux pci.c) ──────────
+
+/// `HAL_CE_WFSS_CE_REG_BASE` (hal.h).
+pub const HAL_CE_WFSS_CE_REG_BASE: u32 = 0x01b8_0000;
+
+/// `ath11k_pci_get_window_start` for a `static_window_map` part: the DP
+/// (UMAC) range sits in window 3, the CE range in window 2, everything
+/// else in the dynamic window 1.
+pub const fn static_window_start(regs: &super::hw::HalRegs, offset: u32) -> u32 {
+    use super::hw::{ATH11K_PCI_WINDOW_RANGE_MASK as RANGE, ATH11K_PCI_WINDOW_START as START};
+    if (offset ^ super::hal::HAL_SEQ_WCSS_UMAC_OFFSET) < RANGE {
+        3 * START
+    } else if (offset ^ regs.hal_seq_wcss_umac_ce0_src_reg) < RANGE {
+        2 * START
+    } else {
+        START
+    }
+}
+
+/// The BAR0 offset of a register in a static window (`window_start +
+/// (offset & ATH11K_PCI_WINDOW_RANGE_MASK)`), or `None` when it lies in
+/// the dynamic window (select-then-access, as on WCN6855).
+pub const fn static_bar_offset(regs: &super::hw::HalRegs, offset: u32) -> Option<u32> {
+    let start = static_window_start(regs, offset);
+    if start == super::hw::ATH11K_PCI_WINDOW_START {
+        None
+    } else {
+        Some(start + (offset & super::hw::ATH11K_PCI_WINDOW_RANGE_MASK))
+    }
+}
+
+/// `ath11k_pci_select_static_window`: the value written to
+/// `ATH11K_PCI_WINDOW_REG_ADDRESS` after `ath11k_mhi_start` (UMAC window
+/// in bits 17:12, CE window in bits 11:6).
+pub const fn static_window_select_value() -> u32 {
+    use super::hw::{ATH11K_PCI_WINDOW_ENABLE_BIT, ATH11K_PCI_WINDOW_VALUE_MASK as M};
+    let umac = (super::hal::HAL_SEQ_WCSS_UMAC_OFFSET & M) >> 19;
+    let ce = (HAL_CE_WFSS_CE_REG_BASE & M) >> 19;
+    ATH11K_PCI_WINDOW_ENABLE_BIT | (umac << 12) | (ce << 6)
+}

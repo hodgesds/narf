@@ -169,14 +169,27 @@ pub struct NativeIo {
     mmio: MmioRegion,
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
+    /// `static_window_map` parts (QCN9074): the register map whose CE
+    /// range takes window 2 (UMAC/DP: window 3).
+    static_window: Option<&'static super::hw::HalRegs>,
 }
 impl NativeIo {
     fn invoke<T>(&self, operation: impl FnOnce() -> T) -> Result<T, narf_capabilities::CapError> {
         crate::qualcomm_pci::invoke(&self.cap, operation)
     }
+    /// The static-window BAR0 offset of `offset`, if it has one.
+    fn static_at(&self, offset: u32, direct: bool) -> Option<u32> {
+        if direct || offset < hw::ATH11K_PCI_WINDOW_START {
+            return None;
+        }
+        self.static_window
+            .and_then(|r| super::qcn9074::static_bar_offset(r, offset))
+    }
     fn valid(&self, offset: u32, direct: bool) -> bool {
         let at = if direct || offset < hw::ATH11K_PCI_WINDOW_START {
             offset
+        } else if let Some(at) = self.static_at(offset, direct) {
+            at
         } else {
             windowed_bar_offset(offset)
         };
@@ -187,6 +200,13 @@ impl NativeIo {
     fn read(&self, offset: u32, direct: bool) -> u32 {
         if !self.valid(offset, direct) {
             return u32::MAX;
+        }
+        if let Some(at) = self.static_at(offset, direct) {
+            // SAFETY: bound-checked by `valid`; static windows need no
+            // selector transaction.
+            return self
+                .invoke(|| unsafe { self.mmio.read32(u64::from(at)) })
+                .unwrap_or(u32::MAX);
         }
         self.invoke(|| {
             // SAFETY: full exact-width bound and current retained PCI invocation;
@@ -203,6 +223,11 @@ impl NativeIo {
     }
     fn write(&self, offset: u32, value: u32, direct: bool) {
         if !self.valid(offset, direct) {
+            return;
+        }
+        if let Some(at) = self.static_at(offset, direct) {
+            // SAFETY: as `read`.
+            let _ = self.invoke(|| unsafe { self.mmio.write32(u64::from(at), value) });
             return;
         }
         let _ = self.invoke(|| {
@@ -830,6 +855,14 @@ async fn mhi_bring_up(s: MhiStart) -> Result<(MhiController<Bar0Mhi>, FwApi), Mh
         );
         ctrl.set_firmware(fw);
         ctrl.sync_power_up().await?;
+        // ath11k_pci_start → ath11k_pci_select_static_window.
+        if s.io.static_window.is_some() {
+            s.io.write(
+                hw::ATH11K_PCI_WINDOW_REG_ADDRESS,
+                super::qcn9074::static_window_select_value(),
+                true,
+            );
+        }
         ctrl.prepare_for_transfer("IPCR").await
     }
     .await;
@@ -1059,7 +1092,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     };
 
     // Quiesce an inherited function before identifying or resetting it.
-    // Unsupported families such as QCN9074 are rejected before mapping,
+    // Unsupported families (an incomplete runtime profile) are rejected before mapping,
     // MMIO/MSI setup, or DMA. Accepted profiles retain decode off for sizing.
     let owner = CONTROLLER
         .lock()
@@ -1259,10 +1292,11 @@ fn bring_up_current(
         return Err(ProbeError::Bar0MapFailed);
     }
 
-    let native = NativeIo {
+    let mut native = NativeIo {
         mmio: mmio_bar0,
         device: *device,
         cap: *cap,
+        static_window: None,
     };
     // SAFETY: BAR0 mapped + owned; TCSR_SOC_HW_VERSION is a readable
     // chip register.
@@ -1286,6 +1320,9 @@ fn bring_up_current(
         .params()
         .ok_or(ProbeError::UnsupportedSoc { major, minor })?;
     validate_runtime_profile(hw_rev)?;
+    if params.static_window_map {
+        native.static_window = params.regs;
+    }
     diag::set_wifi_stage(WifiStage::Probe);
 
     // SAFETY: caller owns cfg space exclusively.
@@ -1561,6 +1598,7 @@ mod native_authority_tests {
         };
         let cap = Cap::<BusDeviceCap, Write>::bootstrap();
         let io = NativeIo {
+            static_window: None,
             device,
             cap,
             mmio: MmioRegion {

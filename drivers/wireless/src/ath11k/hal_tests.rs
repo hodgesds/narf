@@ -130,8 +130,8 @@ fn smoke_ath11k_hal_hw_params_wcn6855() -> TestResult {
     }
     let qcn = HwRev::Qcn9074Hw10.params().unwrap();
     check!(
-        qcn.regs.is_none() && !qcn.supports_shadow_regs && qcn.ce_count() == 6,
-        "QCN9074: no HAL map ported, no shadow regs, 6 CEs"
+        qcn.regs.is_some() && !qcn.supports_shadow_regs && qcn.ce_count() == 6,
+        "QCN9074: qcn9074_regs, no shadow regs, 6 CEs"
     );
     TestResult::Pass
 }
@@ -921,10 +921,12 @@ fn smoke_ath11k_hal_setup_negatives() -> TestResult {
     );
 
     // No register map.
-    let e = Hal::new(&HwRev::Qcn9074Hw10.params().unwrap()).unwrap_err();
+    let mut noregs = HwRev::Qcn9074Hw10.params().unwrap();
+    noregs.regs = None;
+    let e = Hal::new(&noregs).unwrap_err();
     check!(
         e.step == step::NO_REGS && e.errno == errno::EINVAL,
-        "QCN9074: NO_REGS"
+        "no register map: NO_REGS"
     );
     TestResult::Pass
 }

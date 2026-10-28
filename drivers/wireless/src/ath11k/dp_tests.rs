@@ -261,6 +261,9 @@ pub(super) const SMALL: DpRingSizes = DpRingSizes {
     rx_mac_buf: 16,
     rxdma_err_dst: 16,
     rxdma_mon_status: 8,
+    rxdma_mon_buf: 8,
+    rxdma_mon_dst: 8,
+    rxdma_mon_desc: 8,
     tx_status_fifo: 8,
     n_link_desc: Some(64),
 };
@@ -493,8 +496,8 @@ fn smoke_ath11k_dp_hw_params_wcn6855() -> TestResult {
         "QCA6390 uses native IPQ8074 RX descriptors"
     );
     check!(
-        DpHwParams::for_rev(HwRev::Qcn9074Hw10).is_none(),
-        "QCN9074 DP not ported"
+        DpHwParams::for_rev(HwRev::Qcn9074Hw10).is_some_and(|d| d.full_monitor_mode),
+        "QCN9074 multi-pdev DP (full monitor mode)"
     );
     // 2730 + 227 + 4681 + 10922 = 18560 → 1 << fls(18560) = 32768
     check!(wbm_idle_n_link_desc() == 32768, "n_link_desc");

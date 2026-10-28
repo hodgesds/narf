@@ -427,8 +427,8 @@ fn smoke_ath11k_ahb_hwrev_admission() -> TestResult {
     );
     kt_assert_eq!(dp.hal_params.tcl2wbm_rbm_map[1].wbm_ring_num, 4);
     kt_assert!(
-        DpHwParams::for_rev(HwRev::Ipq8074).is_none(),
-        "IPQ8074 multi-pdev DP is not admitted"
+        DpHwParams::for_rev(HwRev::Ipq8074).is_some_and(|d| d.rxdma1_enable && !d.single_pdev_only),
+        "IPQ8074 multi-pdev DP admitted with rxdma1"
     );
     // IPQ5018: CE ring registers move into the remapped CE window.
     let h5 = match Hal::new(&HwRev::Ipq5018Hw10.params().unwrap()) {

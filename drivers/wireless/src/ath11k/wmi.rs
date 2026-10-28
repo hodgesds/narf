@@ -279,6 +279,8 @@ pub const WMI_HOST_WLAN_2G_5G_CAP: u32 = 0x3;
 
 /// `WMI_RSRC_CFG_FLAG1_BSS_CHANNEL_INFO_64`.
 pub const WMI_RSRC_CFG_FLAG1_BSS_CHANNEL_INFO_64: u32 = 1 << 5;
+/// `WMI_RSRC_CFG_FLAG1_ACK_RSSI`.
+pub const WMI_RSRC_CFG_FLAG1_ACK_RSSI: u32 = 1 << 18;
 /// `WMI_RSRC_CFG_FLAG2_CALC_NEXT_DTIM_COUNT_SET`.
 pub const WMI_RSRC_CFG_FLAG2_CALC_NEXT_DTIM_COUNT_SET: u32 = 1 << 9;
 /// `WMI_CFG_HOST_SERVICE_FLAG_REG_CC_EXT` (bit position).
@@ -793,6 +795,72 @@ impl TargetResourceConfig {
         }
     }
 
+    /// `ath11k_init_wmi_config_ipq8074` (hw.c) — the IPQ8074 / IPQ6018 /
+    /// QCN9074 / IPQ5018 `hw_ops->wmi_init_config` — plus the
+    /// `is_reg_cc_ext_event_supported` fix-up. `hw_num_vdevs` /
+    /// `hw_num_peers` are `hw_params.num_vdevs` / `num_peers`,
+    /// `num_radios` is `ab->num_radios` (SERVICE_READY_EXT).
+    pub fn ipq8074(
+        hw_num_vdevs: u32,
+        hw_num_peers: u32,
+        num_radios: u32,
+        num_rf_chains: u32,
+        reg_cc_ext: bool,
+    ) -> Self {
+        let chain_mask = (1u32 << num_rf_chains).wrapping_sub(1);
+        // TARGET_NUM_PEERS_PDEV, then _SINGLE / _DBS / _DBS_SBS.
+        let per_pdev = hw_num_peers + hw_num_vdevs;
+        let num_peers = match num_radios {
+            2 => 2 * per_pdev,
+            3 => 3 * per_pdev,
+            _ => per_pdev,
+        };
+        TargetResourceConfig {
+            num_vdevs: num_radios * hw_num_vdevs,
+            num_peers,
+            // TARGET_NUM_TIDS(ab, x)
+            num_tids: 2 * num_peers + 4 * hw_num_vdevs + 8,
+            num_offload_peers: 4,
+            num_offload_reorder_buffs: 4,
+            num_peer_keys: target::NUM_PEER_KEYS,
+            ast_skid_limit: target::AST_SKID_LIMIT,
+            tx_chain_mask: chain_mask,
+            rx_chain_mask: chain_mask,
+            rx_timeout_pri: [
+                target::RX_TIMEOUT_LO_PRI,
+                target::RX_TIMEOUT_LO_PRI,
+                target::RX_TIMEOUT_LO_PRI,
+                target::RX_TIMEOUT_HI_PRI,
+            ],
+            rx_decap_mode: target::DECAP_MODE_NATIVE_WIFI,
+            scan_max_pending_req: target::SCAN_MAX_PENDING_REQS,
+            bmiss_offload_max_vdev: target::BMISS_OFFLOAD_MAX_VDEV,
+            roam_offload_max_vdev: target::ROAM_OFFLOAD_MAX_VDEV,
+            roam_offload_max_ap_profiles: target::ROAM_OFFLOAD_MAX_AP_PROFILES,
+            num_mcast_groups: 12,
+            num_mcast_table_elems: 64,
+            mcast2ucast_mode: 2,
+            tx_dbg_log_size: target::TX_DBG_LOG_SIZE,
+            num_wds_entries: 32,
+            dma_burst_size: 1,
+            rx_skip_defrag_timeout_dup_detection_check: 1,
+            vow_config: target::VOW_CONFIG,
+            gtk_offload_max_vdev: 3,
+            num_msdu_desc: 2500,
+            // num_radios * TARGET_MAX_BCN_OFFLD, + ema_max_vap_cnt.
+            beacon_tx_offload_max_vdev: num_radios * 16 + num_radios,
+            rx_batchmode: target::RX_BATCHMODE,
+            peer_map_unmap_v2_support: 1,
+            twt_ap_pdev_count: num_radios,
+            twt_ap_sta_count: 1000,
+            flag1: WMI_RSRC_CFG_FLAG1_BSS_CHANNEL_INFO_64 | WMI_RSRC_CFG_FLAG1_ACK_RSSI,
+            ema_max_vap_cnt: num_radios,
+            ema_max_profile_period: 8,
+            is_reg_cc_ext_event_supported: reg_cc_ext,
+            ..Default::default()
+        }
+    }
+
     /// `ath11k_wmi_copy_resource_config` + the `tlv_header` write in
     /// `ath11k_init_cmd_send`: the 292-byte `struct wmi_resource_config`.
     ///
@@ -922,7 +990,46 @@ pub struct InitCmdParam {
     pub band_to_mac: Vec<BandToMac>,
 }
 
+/// `ath11k_fill_band_to_mac_param`: pdev `i`'s frequency span from
+/// `hal_reg_cap[i]` by its `supported_bands` (an unknown band mask leaves
+/// the span zero, as Linux does).
+pub fn band_to_mac(ext: &ServiceReadyExt, num_radios: u32) -> Vec<BandToMac> {
+    let mut out = Vec::new();
+    for (i, p) in ext.pdevs.iter().take(num_radios as usize).enumerate() {
+        let cap = ext.hal_reg_cap(i as u32).copied().unwrap_or_default();
+        let (start_freq, end_freq) = match p.supported_bands {
+            b if b == WMI_HOST_WLAN_2G_CAP | WMI_HOST_WLAN_5G_CAP => {
+                (cap.low_2ghz_chan, cap.high_5ghz_chan)
+            }
+            WMI_HOST_WLAN_2G_CAP => (cap.low_2ghz_chan, cap.high_2ghz_chan),
+            WMI_HOST_WLAN_5G_CAP => (cap.low_5ghz_chan, cap.high_5ghz_chan),
+            _ => (0, 0),
+        };
+        out.push(BandToMac {
+            pdev_id: p.pdev_id,
+            start_freq,
+            end_freq,
+        });
+    }
+    out
+}
+
 impl InitCmdParam {
+    /// `ath11k_wmi_cmd_init` for a multi-pdev chip: `hw_mode_id =
+    /// preferred_hw_mode`, one band-to-mac entry per radio.
+    pub fn multi_pdev(
+        res_cfg: TargetResourceConfig,
+        hw_mode_id: u32,
+        band_to_mac: Vec<BandToMac>,
+    ) -> Self {
+        InitCmdParam {
+            res_cfg,
+            mem_chunks: Vec::new(),
+            hw_mode_id,
+            band_to_mac,
+        }
+    }
+
     /// `ath11k_wmi_cmd_init` for a `single_pdev_only` chip (WCN6855):
     /// no host mem chunks, `hw_mode_id = WMI_HOST_HW_MODE_MAX`.
     pub fn single_pdev(res_cfg: TargetResourceConfig) -> Self {

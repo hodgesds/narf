@@ -366,6 +366,11 @@ pub const TARGET_SERVICE_TO_CE_MAP_WLAN_IPQ6018: [ServiceToPipe; 19] = concat(
 pub const TARGET_SERVICE_TO_CE_MAP_WLAN_IPQ5018: [ServiceToPipe; 17] =
     concat(IPQ_HEAD, [], IPQ_TAIL);
 
+/// Linux `ath11k_target_service_to_ce_map_wlan_qcn9074`: the same 17
+/// entries as IPQ5018 (no per-pdev WMI MAC1/MAC2 pipes).
+pub const TARGET_SERVICE_TO_CE_MAP_WLAN_QCN9074: [ServiceToPipe; 17] =
+    TARGET_SERVICE_TO_CE_MAP_WLAN_IPQ5018;
+
 /// `ath11k_msi_config` for `ATH11K_HW_WCN6750_HW10` (pcic.c).
 pub const MSI_CONFIG_WCN6750: MsiConfig = MsiConfig {
     total_vectors: 28,

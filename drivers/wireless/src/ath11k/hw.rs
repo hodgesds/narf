@@ -395,7 +395,7 @@ impl HwRev {
             bool,
         ) = match self {
             HwRev::Qca6390Hw20 => (Some(&QCA6390_REGS), &HOST_CE_CONFIG_QCA6390, true, true),
-            HwRev::Qcn9074Hw10 => (None, &HOST_CE_CONFIG_QCN9074, false, false),
+            HwRev::Qcn9074Hw10 => (Some(&QCN9074_REGS), &HOST_CE_CONFIG_QCN9074, false, false),
             HwRev::Wcn6855Hw20 | HwRev::Wcn6855Hw21 | HwRev::Qca2066Hw21 | HwRev::Qca6698aqHw21 => {
                 (Some(&WCN6855_REGS), &HOST_CE_CONFIG_QCA6390, true, true)
             }
@@ -688,6 +688,60 @@ pub const IPQ8074_REGS: HalRegs = HalRegs {
     hal_shadow_base_addr: 0x0000_0000,
     hal_reo1_misc_ctl: 0x0000_0000,
 };
+/// Linux `qcn9074_regs` (hw.c).
+pub const QCN9074_REGS: HalRegs = HalRegs {
+    hal_tcl1_ring_base_lsb: 0x0000_04f0,
+    hal_tcl1_ring_base_msb: 0x0000_04f4,
+    hal_tcl1_ring_id: 0x0000_04f8,
+    hal_tcl1_ring_misc: 0x0000_0500,
+    hal_tcl1_ring_tp_addr_lsb: 0x0000_050c,
+    hal_tcl1_ring_tp_addr_msb: 0x0000_0510,
+    hal_tcl1_ring_consumer_int_setup_ix0: 0x0000_0520,
+    hal_tcl1_ring_consumer_int_setup_ix1: 0x0000_0524,
+    hal_tcl1_ring_msi1_base_lsb: 0x0000_0538,
+    hal_tcl1_ring_msi1_base_msb: 0x0000_053c,
+    hal_tcl1_ring_msi1_data: 0x0000_0540,
+    hal_tcl2_ring_base_lsb: 0x0000_0548,
+    hal_tcl_ring_base_lsb: 0x0000_05f8,
+    hal_tcl_status_ring_base_lsb: 0x0000_0700,
+    hal_reo1_ring_base_lsb: 0x0000_029c,
+    hal_reo1_ring_base_msb: 0x0000_02a0,
+    hal_reo1_ring_id: 0x0000_02a4,
+    hal_reo1_ring_misc: 0x0000_02ac,
+    hal_reo1_ring_hp_addr_lsb: 0x0000_02b0,
+    hal_reo1_ring_hp_addr_msb: 0x0000_02b4,
+    hal_reo1_ring_producer_int_setup: 0x0000_02c0,
+    hal_reo1_ring_msi1_base_lsb: 0x0000_02e4,
+    hal_reo1_ring_msi1_base_msb: 0x0000_02e8,
+    hal_reo1_ring_msi1_data: 0x0000_02ec,
+    hal_reo2_ring_base_lsb: 0x0000_02f4,
+    hal_reo1_aging_thresh_ix_0: 0x0000_0564,
+    hal_reo1_aging_thresh_ix_1: 0x0000_0568,
+    hal_reo1_aging_thresh_ix_2: 0x0000_056c,
+    hal_reo1_aging_thresh_ix_3: 0x0000_0570,
+    hal_reo1_ring_hp: 0x0000_3038,
+    hal_reo1_ring_tp: 0x0000_303c,
+    hal_reo2_ring_hp: 0x0000_3040,
+    hal_reo_tcl_ring_base_lsb: 0x0000_03fc,
+    hal_reo_tcl_ring_hp: 0x0000_3058,
+    hal_reo_cmd_ring_base_lsb: 0x0000_0194,
+    hal_reo_cmd_ring_hp: 0x0000_3020,
+    hal_reo_status_ring_base_lsb: 0x0000_0504,
+    hal_reo_status_hp: 0x0000_3070,
+    hal_sw2reo_ring_base_lsb: 0x0000_01ec,
+    hal_sw2reo_ring_hp: 0x0000_3028,
+    hal_seq_wcss_umac_ce0_src_reg: 0x01b8_0000,
+    hal_seq_wcss_umac_ce0_dst_reg: 0x01b8_1000,
+    hal_seq_wcss_umac_ce1_src_reg: 0x01b8_2000,
+    hal_seq_wcss_umac_ce1_dst_reg: 0x01b8_3000,
+    hal_wbm_idle_link_ring_base_lsb: 0x0000_0874,
+    hal_wbm_idle_link_ring_misc: 0x0000_0884,
+    hal_wbm_release_ring_base_lsb: 0x0000_01ec,
+    hal_wbm0_release_ring_base_lsb: 0x0000_0924,
+    hal_wbm1_release_ring_base_lsb: 0x0000_097c,
+    hal_shadow_base_addr: 0x0000_0000,
+    hal_reo1_misc_ctl: 0x0000_0000,
+};
 /// Linux `ipq5018_regs` (hw.c).
 pub const IPQ5018_REGS: HalRegs = HalRegs {
     hal_tcl1_ring_base_lsb: 0x0000_0694,
@@ -911,6 +965,17 @@ pub const HW_HAL_PARAMS_IPQ8074: HwHalParams = HwHalParams {
             rbm_id: rbm::SW2_BM,
         },
     ],
+};
+
+/// Linux `ath11k_hw_hal_params_ipq5018` (`ath11k_hw_tcl2wbm_rbm_map_ipq5018`:
+/// one TX ring, SW0_BM; RX buffers on SW3_BM).
+pub const HW_HAL_PARAMS_IPQ5018: HwHalParams = HwHalParams {
+    rx_buf_rbm: rbm::SW3_BM,
+    tcl2wbm_rbm_map: &[Tcl2WbmRbmMap {
+        tcl_ring_num: 0,
+        wbm_ring_num: 0,
+        rbm_id: rbm::SW0_BM,
+    }],
 };
 
 /// Linux `ath11k_hw_hal_params_wcn6750`: three TCL data rings, the

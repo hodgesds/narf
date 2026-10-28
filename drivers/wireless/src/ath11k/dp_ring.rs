@@ -433,8 +433,34 @@ impl DpHwParams {
                 alloc_cacheable_memory: false,
                 single_pdev_only: true,
             }),
-            // IPQ8074 / IPQ6018 / IPQ5018 / QCN9074: multi-pdev with
-            // rxdma1 monitor rings and HTT peer-map v2 (not ported).
+            // IPQ8074 / IPQ6018 / IPQ5018 / QCN9074 (`core.c`): multi-pdev,
+            // one RXDMA per pdev with the rxdma1 monitor rings, HTT
+            // peer-map v2, three TCL rings (IPQ5018: one), TCL retry.
+            HwRev::Ipq8074 | HwRev::Ipq6018Hw10 | HwRev::Ipq5018Hw10 | HwRev::Qcn9074Hw10 => {
+                Some(DpHwParams {
+                    hw: rev.params()?,
+                    hal_params: if rev == HwRev::Ipq5018Hw10 {
+                        &super::hw::HW_HAL_PARAMS_IPQ5018
+                    } else {
+                        &super::hw::HW_HAL_PARAMS_IPQ8074
+                    },
+                    num_rxdma_per_pdev: 1,
+                    rx_mac_buf_ring: false,
+                    rxdma1_enable: true,
+                    supports_monitor: rev != HwRev::Ipq5018Hw10,
+                    full_monitor_mode: rev == HwRev::Qcn9074Hw10,
+                    htt_peer_map_v2: true,
+                    tcl_ring_retry: true,
+                    tx_ring_size: DP_TCL_DATA_RING_SIZE,
+                    hal_desc_sz: if matches!(rev, HwRev::Ipq8074 | HwRev::Ipq6018Hw10) {
+                        super::ipq8074::HalRxDescIpq8074::SIZE
+                    } else {
+                        super::qcn9074::HalRxDescQcn9074::SIZE
+                    },
+                    alloc_cacheable_memory: true,
+                    single_pdev_only: false,
+                })
+            }
             _ => None,
         }
     }
@@ -466,6 +492,10 @@ pub struct DpRingSizes {
     pub rx_mac_buf: u32,
     pub rxdma_err_dst: u32,
     pub rxdma_mon_status: u32,
+    /// rxdma1 monitor rings (`rxdma1_enable`): buf, dst, desc.
+    pub rxdma_mon_buf: u32,
+    pub rxdma_mon_dst: u32,
+    pub rxdma_mon_desc: u32,
     /// `tx_ring[i].tx_status` FIFO length (`DP_TX_COMP_RING_SIZE`).
     pub tx_status_fifo: u32,
     /// `ath11k_wbm_idle_ring_setup`'s computed total when `None`.
@@ -489,6 +519,9 @@ impl DpRingSizes {
         rx_mac_buf: 1024,
         rxdma_err_dst: DP_RXDMA_ERR_DST_RING_SIZE,
         rxdma_mon_status: DP_RXDMA_MON_STATUS_RING_SIZE,
+        rxdma_mon_buf: super::dp::DP_RXDMA_MONITOR_BUF_RING_SIZE,
+        rxdma_mon_dst: super::dp::DP_RXDMA_MONITOR_DST_RING_SIZE,
+        rxdma_mon_desc: super::dp::DP_RXDMA_MONITOR_DESC_RING_SIZE,
         tx_status_fifo: DP_TX_COMP_RING_SIZE,
         n_link_desc: None,
     };
@@ -761,6 +794,14 @@ pub struct PdevDp {
     pub rx_mac_buf_ring: Vec<DpSrng>,
     pub rxdma_err_dst_ring: Vec<DpSrng>,
     pub rx_mon_status_refill_ring: Vec<RxdmaRing>,
+    /// rxdma1 (`rxdma1_enable`): `rxdma_mon_buf_ring`.
+    pub rxdma_mon_buf_ring: Option<RxdmaRing>,
+    pub rxdma_mon_dst_ring: Option<DpSrng>,
+    pub rxdma_mon_desc_ring: Option<DpSrng>,
+    /// `mon_data.link_desc_banks` (`ath11k_dp_rx_pdev_mon_attach`) and
+    /// the link descriptors posted to `rxdma_mon_desc_ring`.
+    pub mon_link_desc_banks: Vec<LinkDescBank>,
+    pub mon_link_desc_posted: u32,
     /// `num_tx_pending`.
     pub num_tx_pending: u32,
 }
@@ -1077,6 +1118,9 @@ pub struct Dp {
     pub reo_status_ring: DpSrng,
     pub reo_dst_ring: Vec<DpSrng>,
     pub pdev: Option<PdevDp>,
+    /// Multi-pdev parts (`single_pdev_only = false`): the pdevs after
+    /// the first (`mac_id` 1, 2), in allocation order.
+    pub extra_pdevs: Vec<PdevDp>,
     pub htt: HttTarget,
     pub peers: Vec<DpPeer>,
     /// Linux's `ppdu_stats_info` list: firmware may split the TLVs for one
@@ -1551,16 +1595,38 @@ impl Dp {
     /// buffers of `ath11k_dp_rxdma_pdev_buf_free`; the monitor reap timer
     /// is the runtime's). Only once the hardware no longer uses the rings.
     pub fn pdev_free(&mut self, hal: &mut Hal) {
-        let Some(p) = self.pdev.take() else { return };
-        hal.srng_free(p.rx_refill_buf_ring.refill_buf_ring.ring_id);
-        for r in p.rx_mac_buf_ring.iter().chain(p.rxdma_err_dst_ring.iter()) {
-            hal.srng_free(r.ring_id);
+        let extra = core::mem::take(&mut self.extra_pdevs);
+        for p in self.pdev.take().into_iter().chain(extra) {
+            hal.srng_free(p.rx_refill_buf_ring.refill_buf_ring.ring_id);
+            for r in p.rx_mac_buf_ring.iter().chain(p.rxdma_err_dst_ring.iter()) {
+                hal.srng_free(r.ring_id);
+            }
+            for r in &p.rx_mon_status_refill_ring {
+                hal.srng_free(r.refill_buf_ring.ring_id);
+            }
+            if let Some(r) = &p.rxdma_mon_buf_ring {
+                hal.srng_free(r.refill_buf_ring.ring_id);
+            }
+            for r in p
+                .rxdma_mon_dst_ring
+                .iter()
+                .chain(p.rxdma_mon_desc_ring.iter())
+            {
+                hal.srng_free(r.ring_id);
+            }
+            // The RX buffers in the IDRs and the monitor link
+            // descriptor banks go with `p`.
+            drop(p);
         }
-        for r in &p.rx_mon_status_refill_ring {
-            hal.srng_free(r.refill_buf_ring.ring_id);
-        }
-        // The RX buffers in the IDRs go with `p`.
-        drop(p);
+    }
+
+    /// Every allocated pdev, `mac_id` order (`ab->pdevs[]`).
+    pub fn pdevs(&self) -> impl Iterator<Item = &PdevDp> {
+        self.pdev.iter().chain(self.extra_pdevs.iter())
+    }
+
+    fn has_pdev(&self, mac_id: u32) -> bool {
+        self.pdevs().any(|p| p.mac_id == mac_id)
     }
 
     /// Linux `ath11k_dp_free` (`ath11k_core_reconfigure_on_crash`, after
@@ -1632,7 +1698,13 @@ impl Dp {
         )?;
 
         // ath11k_dp_link_desc_setup
-        let (banks, posted) = Self::link_desc_setup(hal, io, wbm_idle_ring.ring_id, n_link_desc)?;
+        let (banks, posted) = Self::link_desc_setup(
+            hal,
+            io,
+            HalRingType::WbmIdleLink,
+            wbm_idle_ring.ring_id,
+            n_link_desc,
+        )?;
 
         // ath11k_dp_srng_common_setup
         let wbm_desc_rel_ring = dp_srng_setup(
@@ -1777,6 +1849,7 @@ impl Dp {
             reo_status_ring,
             reo_dst_ring: Vec::new(),
             pdev: None,
+            extra_pdevs: Vec::new(),
             htt: HttTarget::default(),
             peers: Vec::new(),
             ppdu_stats_pending: VecDeque::new(),
@@ -1807,6 +1880,7 @@ impl Dp {
     fn link_desc_setup(
         hal: &mut Hal,
         io: &impl ChipIo,
+        ty: HalRingType,
         ring: u32,
         n_link_desc: u32,
     ) -> Result<(Vec<LinkDescBank>, u32), TransportError> {
@@ -1834,9 +1908,9 @@ impl Dp {
             });
         }
 
-        let entry_sz = hal.entry_size_bytes(HalRingType::WbmIdleLink);
+        let entry_sz = hal.entry_size_bytes(ty);
         let tot_mem_sz = entry_sz * n_link_desc;
-        if tot_mem_sz > DP_LINK_DESC_ALLOC_SIZE_THRESH {
+        if ty == HalRingType::WbmIdleLink && tot_mem_sz > DP_LINK_DESC_ALLOC_SIZE_THRESH {
             // ath11k_dp_scatter_idle_link_desc_setup — not ported.
             return Err(dp_err(step::SCATTER_UNSUPPORTED, tot_mem_sz, EOPNOTSUPP));
         }
@@ -1950,7 +2024,7 @@ impl Dp {
             e.report("ath11k DP pdev alloc");
             // ath11k_dp_pdev_alloc's err: ath11k_dp_pdev_free (the rings
             // this attempt set up; nothing was sent to the firmware yet).
-            if self.pdev.is_none() {
+            if !self.has_pdev(mac_id) {
                 release_new_rings(hal, &before);
             }
         }
@@ -1963,8 +2037,14 @@ impl Dp {
         io: &impl ChipIo,
         mac_id: u32,
     ) -> Result<Vec<Vec<u8>>, TransportError> {
-        if self.pdev.is_some() {
+        if self.has_pdev(mac_id) {
             return Err(dp_err(step::ALREADY_SET_UP, 2, errno::EINVAL));
+        }
+        // A single-pdev part has only mac 0; a multi-pdev part allocates
+        // its pdevs in order (`ath11k_dp_pdev_alloc`'s loop).
+        let expect = self.pdevs().count() as u32;
+        if (self.cfg.single_pdev_only && mac_id != 0) || mac_id != expect {
+            return Err(dp_err(step::ALREADY_SET_UP, 3, errno::EINVAL));
         }
         let mask = *self.cfg.hw.ring_mask;
         let m = self.msi;
@@ -2027,8 +2107,51 @@ impl Dp {
                 bufs_max: 0,
             });
         }
-        // rxdma1_enable = false: no monitor buf / dst / desc rings (the
-        // mon reap timer is the caller's: `reap_mon_status`).
+        // rxdma1_enable: the monitor buf / dst / desc rings (else the mon
+        // reap timer is the caller's: `reap_mon_status`).
+        let (mut mon_buf, mon_dst, mon_desc) = if cfg.rxdma1_enable {
+            let buf = dp_srng_setup(
+                hal,
+                io,
+                &mask,
+                m.as_ref(),
+                HalRingType::RxdmaMonitorBuf,
+                0,
+                mac_id,
+                sz.rxdma_mon_buf,
+            )?;
+            let dst = dp_srng_setup(
+                hal,
+                io,
+                &mask,
+                m.as_ref(),
+                HalRingType::RxdmaMonitorDst,
+                0,
+                mac_id,
+                sz.rxdma_mon_dst,
+            )?;
+            let desc = dp_srng_setup(
+                hal,
+                io,
+                &mask,
+                m.as_ref(),
+                HalRingType::RxdmaMonitorDesc,
+                0,
+                mac_id,
+                sz.rxdma_mon_desc,
+            )?;
+            (
+                Some(RxdmaRing {
+                    refill_buf_ring: buf,
+                    bufs: Idr::default(),
+                    bufs_max: 0,
+                }),
+                Some(dst),
+                Some(desc),
+            )
+        } else {
+            (None, None, None)
+        };
 
         // ath11k_dp_rxdma_pdev_buf_setup
         let mut refill_ring = RxdmaRing {
@@ -2037,6 +2160,9 @@ impl Dp {
             bufs_max: 0,
         };
         self.rxdma_ring_buf_setup(hal, io, mac_id, &mut refill_ring, HalRingType::RxdmaBuf);
+        if let Some(r) = mon_buf.as_mut() {
+            self.rxdma_ring_buf_setup(hal, io, mac_id, r, HalRingType::RxdmaMonitorBuf);
+        }
         for ring in mon_status.iter_mut() {
             self.rxdma_ring_buf_setup(hal, io, mac_id, ring, HalRingType::RxdmaMonitorStatus);
         }
@@ -2078,6 +2204,15 @@ impl Dp {
                 .to_vec(),
             );
         }
+        if let (Some(b), Some(d), Some(s)) = (&mon_buf, &mon_dst, &mon_desc) {
+            for (id, ty) in [
+                (b.refill_buf_ring.ring_id, HalRingType::RxdmaMonitorBuf),
+                (d.ring_id, HalRingType::RxdmaMonitorDst),
+                (s.ring_id, HalRingType::RxdmaMonitorDesc),
+            ] {
+                msgs.push(htt::srng_setup_msg(hal, rmb, id, mac_id, ty)?.to_vec());
+            }
+        }
         for (i, r) in mon_status.iter().enumerate() {
             msgs.push(
                 htt::srng_setup_msg(
@@ -2091,14 +2226,34 @@ impl Dp {
             );
         }
 
-        self.pdev = Some(PdevDp {
+        // ath11k_dp_rx_pdev_mon_attach: the monitor link descriptors
+        // into rxdma_mon_desc_ring.
+        let (mon_link_desc_banks, mon_link_desc_posted) = match &mon_desc {
+            Some(d) => {
+                let n = d.size / hal.entry_size_bytes(HalRingType::RxdmaMonitorDesc);
+                Self::link_desc_setup(hal, io, HalRingType::RxdmaMonitorDesc, d.ring_id, n)?
+            }
+            None => (Vec::new(), 0),
+        };
+
+        let p = PdevDp {
             mac_id,
             rx_refill_buf_ring: refill_ring,
             rx_mac_buf_ring,
             rxdma_err_dst_ring,
             rx_mon_status_refill_ring: mon_status,
+            rxdma_mon_buf_ring: mon_buf,
+            rxdma_mon_dst_ring: mon_dst,
+            rxdma_mon_desc_ring: mon_desc,
+            mon_link_desc_banks,
+            mon_link_desc_posted,
             num_tx_pending: 0,
-        });
+        };
+        if mac_id == 0 {
+            self.pdev = Some(p);
+        } else {
+            self.extra_pdevs.push(p);
+        }
         Ok(msgs)
     }
 

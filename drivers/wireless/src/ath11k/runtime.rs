@@ -812,20 +812,25 @@ impl<Io: ChipIo, Irq: CeIrq, Q: QmiFw> CoreHooks<CeHif<Io, Irq>, Q> for DpHooks 
         &mut self,
         core: &mut Ath11kCore<CeHif<Io, Irq>, Q>,
     ) -> Result<(), TransportError> {
-        let dp = self.dp.as_mut().ok_or(missing(3))?;
-        let hif = &mut core.hif;
-        // ath11k_dp_pdev_alloc (pdev 0; latches + prints its failures).
-        let msgs = dp.pdev_alloc(&mut hif.ce.hal, &hif.io, 0)?;
-        // ath11k_dp_tx_htt_srng_setup per ring, in Linux's order; the
-        // first failure ends the pdev alloc.
-        for (i, m) in msgs.iter().enumerate() {
-            core.htt_send(m).map_err(|e| {
-                TransportError::new(
-                    step::SRING_SETUP_SEND,
-                    (i as u32) << 16 | (e.step & 0xffff),
-                    e.errno,
-                )
-            })?;
+        // ath11k_dp_pdev_alloc: one pdev per radio (`ab->num_radios`).
+        let radios = core.num_radios();
+        for mac_id in 0..radios {
+            let dp = self.dp.as_mut().ok_or(missing(3))?;
+            let hif = &mut core.hif;
+            // ath11k_dp_rx_pdev_alloc + _mon_attach (latches + prints its
+            // failures).
+            let msgs = dp.pdev_alloc(&mut hif.ce.hal, &hif.io, mac_id)?;
+            // ath11k_dp_tx_htt_srng_setup per ring, in Linux's order; the
+            // first failure ends the pdev alloc.
+            for (i, m) in msgs.iter().enumerate() {
+                core.htt_send(m).map_err(|e| {
+                    TransportError::new(
+                        step::SRING_SETUP_SEND,
+                        mac_id << 24 | (i as u32) << 16 | (e.step & 0xffff),
+                        e.errno,
+                    )
+                })?;
+            }
         }
         // ath11k_mac_register is the caller's (the mac layer is built on
         // the runtime once the core is ready).
@@ -1897,10 +1902,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
             encap: TxEncap::NativeWifi,
             priority: built.tid as u32,
             queue: built.ac,
-            // hw_ops->get_ring_selector (ath11k_hw_ipq8074_get_tcl_ring_selector:
-            // smp_processor_id()); WCN6855 has one TCL data ring
+            // hw_ops->get_ring_selector: smp_processor_id() (ipq8074 ops)
+            // or skb_get_hash() (WCN6750); WCN6855 has one TCL data ring
             // (tcl2wbm_rbm_map_ipq5018), so `% num_tx_rings` picks ring 0.
-            ring_selector: narf_lib::percpu::current_cpu() as u32,
+            ring_selector: tx_ring_selector(self.dp.cfg.hw.hw_rev, || super::txq::flow_hash(eth)),
             // NETIF_F_HW_CSUM (`tx_offload::OFFLOADS`).
             csum_partial,
             pdev_idx: 0,
@@ -1961,7 +1966,8 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
             encap: TxEncap::NativeWifi,
             priority: built.tid as u32,
             queue: built.ac,
-            ring_selector: narf_lib::percpu::current_cpu() as u32,
+            // A Null frame has no flow: skb_get_hash() is 0.
+            ring_selector: tx_ring_selector(self.dp.cfg.hw.hw_rev, || 0),
             csum_partial: false,
             pdev_idx: 0,
             lmac_id: 0,
@@ -4438,6 +4444,18 @@ pub async fn start_pci(core: super::core::PciCore, dp: Dp) {
         "{}: registered, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (data path up; starts on IFF_UP)",
         name, m[0], m[1], m[2], m[3], m[4], m[5]
     ));
+}
+
+/// `hw_ops->get_ring_selector` input for a TX frame: the current CPU
+/// (`ath11k_hw_ipq8074_get_tcl_ring_selector`) or the frame's flow hash
+/// (`ath11k_hw_wcn6750_get_tcl_ring_selector`, `skb_get_hash`), computed
+/// only when the chip uses it.
+pub fn tx_ring_selector(rev: super::hw::HwRev, flow_hash: impl FnOnce() -> u32) -> u32 {
+    let cpu = narf_lib::percpu::current_cpu() as u32;
+    match rev.hw_ops().map(|o| o.ring_selector) {
+        Some(super::hw_ops::RingSelector::FlowHash) => flow_hash(),
+        _ => cpu,
+    }
 }
 
 /// [`start_ahb`]'s result: the runtime and the MAC (or the
