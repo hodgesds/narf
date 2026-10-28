@@ -494,8 +494,9 @@ kernel_test_in!("bluetooth/smp", smoke_smp_pick_pairing_method_just_works);
 
 fn smoke_smp_initiator_just_works_walk() -> TestResult {
     use crate::smp::{
-        Initiator, IoCapability, PairingError, PairingFeatureExchange, PairingState, SmpCrypto,
-        AUTH_BONDING, AUTH_SC, SMP_PAIRING_DHKEY_CHECK, SMP_PAIRING_PUBLIC_KEY, SMP_PAIRING_RANDOM,
+        confirm_value, dhkey_check_value, Initiator, IoCapability, PairingError,
+        PairingFeatureExchange, PairingState, SmpCrypto, AUTH_BONDING, AUTH_SC,
+        SMP_PAIRING_CONFIRM, SMP_PAIRING_DHKEY_CHECK, SMP_PAIRING_PUBLIC_KEY, SMP_PAIRING_RANDOM,
         SMP_PAIRING_REQUEST, SMP_PAIRING_RESPONSE,
     };
 
@@ -541,11 +542,14 @@ fn smoke_smp_initiator_just_works_walk() -> TestResult {
         responder_key_distribution: 0,
     }
     .encode(SMP_PAIRING_RESPONSE);
-    let pk = init.feed(&peer).expect("feed rsp").expect("expect PK");
-    if pk.code != SMP_PAIRING_PUBLIC_KEY || init.state != PairingState::SentPublicKey {
-        return TestResult::Fail("response did not advance to PublicKey");
+    let out = init.feed(&peer).expect("feed rsp");
+    if out.len() != 1 || out[0].code != SMP_PAIRING_PUBLIC_KEY {
+        return TestResult::Fail("response did not emit Public Key");
     }
-    if pk.payload.len() != 64 {
+    if init.state != PairingState::SentPublicKey {
+        return TestResult::Fail("response did not advance to SentPublicKey");
+    }
+    if out[0].payload.len() != 64 {
         return TestResult::Fail("public key payload not 64 bytes");
     }
 
@@ -561,38 +565,88 @@ fn smoke_smp_initiator_just_works_walk() -> TestResult {
         code: SMP_PAIRING_PUBLIC_KEY,
         payload: peer_pk,
     };
-    let after_pk = init.feed(&peer_pk_smp).expect("peer PK");
-    if after_pk.is_some() || init.state != PairingState::WaitConfirm {
+    // Stage 1: the initiator now commits Ca before seeing Nb.
+    let out = init.feed(&peer_pk_smp).expect("peer PK");
+    let want_ca = confirm_value(&StubCrypto, &[0x22; 32], &[0x66; 32], &[0x55; 16], 0);
+    if out.len() != 1 || out[0].code != SMP_PAIRING_CONFIRM || out[0].payload != want_ca {
+        return TestResult::Fail("peer PK did not produce the f4 confirm Ca");
+    }
+    if init.state != PairingState::WaitConfirm {
         return TestResult::Fail("after peer PK we should be in WaitConfirm");
     }
 
-    // Peer sends Pairing Random (Nb).
+    // Peer's Pairing Confirm (Cb), computed by the peer model
+    // orientation of table 2.1: the responder's key first.
+    let nb = [0x88u8; 16];
+    let cb = confirm_value(&StubCrypto, &[0x66; 32], &[0x22; 32], &nb, 0);
+    let out = init
+        .feed(&crate::smp::Pdu {
+            code: SMP_PAIRING_CONFIRM,
+            payload: cb.to_vec(),
+        })
+        .expect("cb");
+    if !out.is_empty() || init.state != PairingState::WaitRandom {
+        return TestResult::Fail("Cb should advance silently to WaitRandom");
+    }
+
+    // Peer sends Pairing Random (Nb): Cb verifies, f5 derives,
+    // and [Na, Ea] leave together.
     let peer_random = crate::smp::Pdu {
         code: SMP_PAIRING_RANDOM,
-        payload: vec![0x88u8; 16],
+        payload: nb.to_vec(),
     };
-    let our_random = init
-        .feed(&peer_random)
-        .expect("nb")
-        .expect("should emit Na");
-    if our_random.code != SMP_PAIRING_RANDOM {
-        return TestResult::Fail("expected Pairing Random outbound");
+    let out = init.feed(&peer_random).expect("nb");
+    if out.len() != 2 || out[0].code != SMP_PAIRING_RANDOM || out[0].payload != [0x55u8; 16] {
+        return TestResult::Fail("expected [Pairing Random Na, DHKey Check Ea]");
     }
-    if init.state != PairingState::SentRandom {
-        return TestResult::Fail("should be in SentRandom");
+    let want_ea = dhkey_check_value(
+        &StubCrypto,
+        &init.mac_key,
+        &[0x55; 16],
+        &nb,
+        &[0u8; 16],
+        &[
+            AUTH_BONDING | AUTH_SC,
+            0,
+            IoCapability::NoInputNoOutput as u8,
+        ],
+        &[0u8; 7],
+        &[0u8; 7],
+    );
+    if out[1].code != SMP_PAIRING_DHKEY_CHECK || out[1].payload != want_ea {
+        return TestResult::Fail("Ea is not the f6 check value");
+    }
+    if init.state != PairingState::SentDhKeyCheck {
+        return TestResult::Fail("should be in SentDhKeyCheck");
     }
     if init.ltk == [0u8; 16] {
         return TestResult::Fail("LTK should be derived non-zero by f5");
     }
 
-    // Peer sends DHKey Check; pairing completes.
-    let peer_check = crate::smp::Pdu {
-        code: SMP_PAIRING_DHKEY_CHECK,
-        payload: vec![0x99u8; 16],
-    };
-    let _ = init.feed(&peer_check).expect("dhkey check");
-    if init.state != PairingState::Done {
-        return TestResult::Fail("should be in Done after DHKey Check");
+    // Peer sends its DHKey Check (Eb, table 2.2 swapped form);
+    // pairing completes only when it verifies.
+    let eb = dhkey_check_value(
+        &StubCrypto,
+        &init.mac_key,
+        &nb,
+        &[0x55; 16],
+        &[0u8; 16],
+        &[
+            AUTH_BONDING | AUTH_SC,
+            0,
+            IoCapability::NoInputNoOutput as u8,
+        ],
+        &[0u8; 7],
+        &[0u8; 7],
+    );
+    let out = init
+        .feed(&crate::smp::Pdu {
+            code: SMP_PAIRING_DHKEY_CHECK,
+            payload: eb.to_vec(),
+        })
+        .expect("dhkey check");
+    if !out.is_empty() || init.state != PairingState::Done {
+        return TestResult::Fail("should be in Done after a verified DHKey Check");
     }
 
     // Re-feeding a PDU after Done → Protocol error.
@@ -607,6 +661,207 @@ fn smoke_smp_initiator_just_works_walk() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bluetooth/smp", smoke_smp_initiator_just_works_walk);
+
+/// The initiator's verifications reject: a garbage Cb fails at
+/// the Nb step with BadConfirm, and a garbage Eb fails at the
+/// final step with BadDhKeyCheck. An implementation that accepts
+/// placeholder check values (the defect this lane removes)
+/// cannot pass either arm.
+fn smoke_smp_initiator_rejects_tampered_values() -> TestResult {
+    use crate::smp::{
+        confirm_value, Initiator, IoCapability, PairingError, PairingFeatureExchange, PairingState,
+        Pdu, SmpCrypto, AUTH_BONDING, AUTH_SC, SMP_PAIRING_CONFIRM, SMP_PAIRING_DHKEY_CHECK,
+        SMP_PAIRING_PUBLIC_KEY, SMP_PAIRING_RANDOM, SMP_PAIRING_RESPONSE,
+    };
+
+    struct StubCrypto;
+    impl SmpCrypto for StubCrypto {
+        fn p256_keygen(&self) -> ([u8; 32], [u8; 32], [u8; 32]) {
+            ([0x11; 32], [0x22; 32], [0x33; 32])
+        }
+        fn p256_dh(&self, _: &[u8; 32], _: &[u8; 32], _: &[u8; 32]) -> [u8; 32] {
+            [0x44; 32]
+        }
+        fn aes_cmac(&self, key: &[u8; 16], data: &[u8]) -> [u8; 16] {
+            let mut out = [0u8; 16];
+            for (i, b) in key.iter().enumerate() {
+                out[i] ^= *b;
+            }
+            for (i, b) in data.iter().enumerate() {
+                out[i % 16] ^= *b;
+            }
+            out
+        }
+        fn rand128(&self) -> [u8; 16] {
+            [0x55; 16]
+        }
+    }
+
+    // Drive a fresh initiator to WaitRandom with the given Cb.
+    fn to_wait_random(cb: [u8; 16]) -> Initiator<StubCrypto> {
+        let mut init = Initiator::new(StubCrypto, [0u8; 7], [0u8; 7]);
+        let _ = init.start();
+        let peer = PairingFeatureExchange {
+            io_capability: IoCapability::NoInputNoOutput as u8,
+            oob_data_flag: 0,
+            auth_req: AUTH_BONDING | AUTH_SC,
+            max_encryption_key_size: 16,
+            initiator_key_distribution: 0,
+            responder_key_distribution: 0,
+        }
+        .encode(SMP_PAIRING_RESPONSE);
+        let _ = init.feed(&peer);
+        let mut peer_pk = vec![0x66u8; 32];
+        peer_pk.extend_from_slice(&[0x77u8; 32]);
+        let _ = init.feed(&Pdu {
+            code: SMP_PAIRING_PUBLIC_KEY,
+            payload: peer_pk,
+        });
+        let _ = init.feed(&Pdu {
+            code: SMP_PAIRING_CONFIRM,
+            payload: cb.to_vec(),
+        });
+        init
+    }
+
+    let nb = [0x88u8; 16];
+    // Arm 1: garbage Cb → BadConfirm at the Nb reveal.
+    let mut init = to_wait_random([0x99; 16]);
+    match init.feed(&Pdu {
+        code: SMP_PAIRING_RANDOM,
+        payload: nb.to_vec(),
+    }) {
+        Err(PairingError::BadConfirm) => {}
+        _ => return TestResult::Fail("garbage Cb was not rejected with BadConfirm"),
+    }
+    if init.state != PairingState::Failed {
+        return TestResult::Fail("initiator not in Failed after a bad confirm");
+    }
+
+    // Arm 2: honest Cb, garbage Eb → BadDhKeyCheck at the end.
+    let cb = confirm_value(&StubCrypto, &[0x66; 32], &[0x22; 32], &nb, 0);
+    let mut init = to_wait_random(cb);
+    let out = match init.feed(&Pdu {
+        code: SMP_PAIRING_RANDOM,
+        payload: nb.to_vec(),
+    }) {
+        Ok(v) => v,
+        _ => return TestResult::Fail("honest Cb did not advance the exchange"),
+    };
+    if out.len() != 2 || init.state != PairingState::SentDhKeyCheck {
+        return TestResult::Fail("initiator did not reach SentDhKeyCheck");
+    }
+    match init.feed(&Pdu {
+        code: SMP_PAIRING_DHKEY_CHECK,
+        payload: vec![0x99u8; 16],
+    }) {
+        Err(PairingError::BadDhKeyCheck) => {}
+        _ => return TestResult::Fail("garbage Eb was not rejected with BadDhKeyCheck"),
+    }
+    if init.state != PairingState::Failed {
+        return TestResult::Fail("initiator not in Failed after a bad DHKey check");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/smp", smoke_smp_initiator_rejects_tampered_values);
+
+/// Both state machines against each other: every PDU one side
+/// emits is fed to the other. The full §2.3.5.6 sequence must
+/// complete with both sides Done and identical MacKey + LTK.
+/// The two sides' f6 forms are mirror images (nonce + address
+/// order), so a one-sided swap breaks the loopback; the f4 key
+/// orientation is pinned separately by the stub walks and the
+/// production fixtures, which use distinct key pairs.
+fn smoke_smp_loopback_full_exchange() -> TestResult {
+    match run_loopback_exchange() {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("bluetooth/smp", smoke_smp_loopback_full_exchange);
+
+fn run_loopback_exchange() -> Result<(), &'static str> {
+    use crate::smp::{Initiator, PairingState, Pdu, Responder, ResponderState, SmpCrypto};
+
+    /// Stub whose nonce is its seed byte, so the two roles draw
+    /// distinct Na / Nb.
+    struct StubCrypto(u8);
+    impl SmpCrypto for StubCrypto {
+        fn p256_keygen(&self) -> ([u8; 32], [u8; 32], [u8; 32]) {
+            ([0x11; 32], [0x22; 32], [0x33; 32])
+        }
+        fn p256_dh(&self, _: &[u8; 32], _: &[u8; 32], _: &[u8; 32]) -> [u8; 32] {
+            [0x44; 32]
+        }
+        fn aes_cmac(&self, key: &[u8; 16], data: &[u8]) -> [u8; 16] {
+            let mut out = [0u8; 16];
+            for (i, b) in key.iter().enumerate() {
+                out[i] ^= *b;
+            }
+            for (i, b) in data.iter().enumerate() {
+                out[i % 16] ^= *b;
+            }
+            out
+        }
+        fn rand128(&self) -> [u8; 16] {
+            [self.0; 16]
+        }
+    }
+
+    fn xfer(out: Vec<Pdu>, want: usize) -> Result<Vec<Pdu>, &'static str> {
+        if out.len() == want {
+            Ok(out)
+        } else {
+            Err("loopback step emitted the wrong PDU count")
+        }
+    }
+
+    let iat = [1u8; 7];
+    let rat = [2u8; 7];
+    let mut init = Initiator::new(StubCrypto(0xA0), iat, rat);
+    let mut resp = Responder::new(StubCrypto(0xB0), iat, rat);
+
+    let req = init.start();
+    let step = resp
+        .feed(&req)
+        .map_err(|_| "responder rejected the request")?;
+    let step = xfer(step, 1)?;
+    let step = init
+        .feed(&step[0])
+        .map_err(|_| "initiator rejected the response")?;
+    let step = xfer(step, 1)?;
+    let step = resp.feed(&step[0]).map_err(|_| "responder rejected PKa")?;
+    let step = xfer(step, 1)?;
+    let step = init.feed(&step[0]).map_err(|_| "initiator rejected PKb")?;
+    let step = xfer(step, 1)?; // Ca
+    let step = resp.feed(&step[0]).map_err(|_| "responder rejected Ca")?;
+    let step = xfer(step, 2)?; // [Cb, Nb]
+    let cb = step[0].clone();
+    let nb = step[1].clone();
+    let out = init.feed(&cb).map_err(|_| "initiator rejected Cb")?;
+    let _ = xfer(out, 0)?;
+    let step = init.feed(&nb).map_err(|_| "initiator rejected Nb")?;
+    let step = xfer(step, 2)?; // [Na, Ea]
+    let na = step[0].clone();
+    let ea = step[1].clone();
+    let out = resp.feed(&na).map_err(|_| "responder rejected Na")?;
+    let _ = xfer(out, 0)?;
+    let step = resp.feed(&ea).map_err(|_| "responder rejected Ea")?;
+    let step = xfer(step, 1)?; // Eb
+    let out = init.feed(&step[0]).map_err(|_| "initiator rejected Eb")?;
+    let _ = xfer(out, 0)?;
+
+    if init.state != PairingState::Done || resp.state != ResponderState::Done {
+        return Err("loopback did not complete on both sides");
+    }
+    if init.ltk == [0u8; 16] || init.ltk != resp.ltk {
+        return Err("loopback LTKs disagree or are zero");
+    }
+    if init.mac_key != resp.mac_key {
+        return Err("loopback MacKeys disagree");
+    }
+    Ok(())
+}
 
 // ── SMP Numeric Comparison + Responder ─────────────────────────────
 
@@ -654,9 +909,10 @@ kernel_test_in!(
 
 fn smoke_smp_responder_full_walk() -> TestResult {
     use crate::smp::{
-        IoCapability, PairingFeatureExchange, Pdu, Responder, ResponderState, SmpCrypto,
-        AUTH_BONDING, AUTH_SC, SMP_PAIRING_DHKEY_CHECK, SMP_PAIRING_PUBLIC_KEY, SMP_PAIRING_RANDOM,
-        SMP_PAIRING_REQUEST, SMP_PAIRING_RESPONSE,
+        confirm_value, dhkey_check_value, IoCapability, PairingFeatureExchange, Pdu, Responder,
+        ResponderState, SmpCrypto, AUTH_BONDING, AUTH_SC, SMP_PAIRING_CONFIRM,
+        SMP_PAIRING_DHKEY_CHECK, SMP_PAIRING_PUBLIC_KEY, SMP_PAIRING_RANDOM, SMP_PAIRING_REQUEST,
+        SMP_PAIRING_RESPONSE,
     };
 
     struct StubCrypto;
@@ -695,8 +951,8 @@ fn smoke_smp_responder_full_walk() -> TestResult {
     }
     .encode(SMP_PAIRING_REQUEST);
 
-    let rsp = r.feed(&req).expect("rsp").expect("expected response");
-    if rsp.code != SMP_PAIRING_RESPONSE {
+    let out = r.feed(&req).expect("rsp");
+    if out.len() != 1 || out[0].code != SMP_PAIRING_RESPONSE {
         return TestResult::Fail("responder didn't emit Pairing Response");
     }
     if r.state != ResponderState::GotRequest {
@@ -708,38 +964,90 @@ fn smoke_smp_responder_full_walk() -> TestResult {
         code: SMP_PAIRING_PUBLIC_KEY,
         payload: alloc::vec![0xAAu8; 64],
     };
-    let our_pk = r.feed(&pk).expect("pk").expect("expect our PK");
-    if our_pk.code != SMP_PAIRING_PUBLIC_KEY {
+    let out = r.feed(&pk).expect("pk");
+    if out.len() != 1 || out[0].code != SMP_PAIRING_PUBLIC_KEY {
         return TestResult::Fail("responder didn't emit Public Key");
     }
     if r.state != ResponderState::SentPublicKey {
         return TestResult::Fail("state didn't advance to SentPublicKey");
     }
 
-    // Initiator's Pairing Random (Na).
-    let na = Pdu {
-        code: SMP_PAIRING_RANDOM,
-        payload: alloc::vec![0x77u8; 16],
-    };
-    let our_nb = r.feed(&na).expect("na").expect("expect our Nb");
-    if our_nb.code != SMP_PAIRING_RANDOM {
-        return TestResult::Fail("responder didn't emit Pairing Random");
+    // Initiator's Pairing Confirm (Ca): the initiator commits
+    // with its own key (0xAA×32) first, the responder's key
+    // (0x02×32) second, over the Na it is about to reveal. The
+    // responder answers [Cb, Nb]; Cb takes the responder's key
+    // first (table 2.1).
+    let na = [0x77u8; 16];
+    let ca = confirm_value(&StubCrypto, &[0xAA; 32], &[2; 32], &na, 0);
+    let out = r
+        .feed(&Pdu {
+            code: SMP_PAIRING_CONFIRM,
+            payload: ca.to_vec(),
+        })
+        .expect("ca");
+    let want_cb = confirm_value(&StubCrypto, &[2; 32], &[0xAA; 32], &[0x55; 16], 0);
+    if out.len() != 2 || out[0].code != SMP_PAIRING_CONFIRM || out[0].payload != want_cb {
+        return TestResult::Fail("responder didn't emit the f4 confirm Cb");
+    }
+    if out[1].code != SMP_PAIRING_RANDOM || out[1].payload != [0x55u8; 16] {
+        return TestResult::Fail("responder didn't emit Pairing Random Nb");
     }
     if r.state != ResponderState::SentRandom {
         return TestResult::Fail("state didn't advance to SentRandom");
+    }
+
+    // Initiator's Pairing Random (Na): Ca verifies, f5 derives.
+    let out = r
+        .feed(&Pdu {
+            code: SMP_PAIRING_RANDOM,
+            payload: na.to_vec(),
+        })
+        .expect("na");
+    if !out.is_empty() {
+        return TestResult::Fail("responder emitted a PDU on the Na step");
+    }
+    if r.state != ResponderState::WaitDhKeyCheck {
+        return TestResult::Fail("state didn't advance to WaitDhKeyCheck");
     }
     if r.ltk == [0u8; 16] {
         return TestResult::Fail("LTK should be derived non-zero");
     }
 
-    // Initiator's DHKey Check.
-    let ea = Pdu {
-        code: SMP_PAIRING_DHKEY_CHECK,
-        payload: alloc::vec![0x99u8; 16],
-    };
-    let our_eb = r.feed(&ea).expect("ea").expect("expect our DHKey check");
-    if our_eb.code != SMP_PAIRING_DHKEY_CHECK {
-        return TestResult::Fail("responder didn't emit DHKey check");
+    // Initiator's DHKey Check (Ea) — answered with Eb only when
+    // Ea verifies; Eb is the table 2.2 swapped form under the
+    // responder's own IOcap ([0x0D, 0, DisplayYesNo]).
+    let ea = dhkey_check_value(
+        &StubCrypto,
+        &r.mac_key,
+        &na,
+        &[0x55; 16],
+        &[0u8; 16],
+        &[
+            AUTH_BONDING | AUTH_SC,
+            0,
+            IoCapability::NoInputNoOutput as u8,
+        ],
+        &[0u8; 7],
+        &[0u8; 7],
+    );
+    let out = r
+        .feed(&Pdu {
+            code: SMP_PAIRING_DHKEY_CHECK,
+            payload: ea.to_vec(),
+        })
+        .expect("ea");
+    let want_eb = dhkey_check_value(
+        &StubCrypto,
+        &r.mac_key,
+        &[0x55; 16],
+        &na,
+        &[0u8; 16],
+        &[0x0D, 0, IoCapability::DisplayYesNo as u8],
+        &[0u8; 7],
+        &[0u8; 7],
+    );
+    if out.len() != 1 || out[0].code != SMP_PAIRING_DHKEY_CHECK || out[0].payload != want_eb {
+        return TestResult::Fail("responder didn't emit the f6 DHKey check Eb");
     }
     if r.state != ResponderState::Done {
         return TestResult::Fail("responder didn't reach Done");

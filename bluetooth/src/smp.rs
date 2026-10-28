@@ -15,7 +15,9 @@
 //!
 //! ## Pairing flow (LE Secure Connections, §2.3.5.6)
 //!
-//! Today's surface implements LE Secure Connections **Just Works**:
+//! Today's surface implements LE Secure Connections **Just Works**
+//! (the §2.3.5.6.2 commitment sequence is shared with Numeric
+//! Comparison; only the user-confirmation step differs):
 //!
 //!   Initiator                       Responder
 //!   ─────────                       ─────────
@@ -23,20 +25,25 @@
 //!                     ◄───────── Pairing_Response
 //!   Public_Key (PKa)  ─────────►
 //!                     ◄───────── Public_Key (PKb)
-//!                                 (compute DHKey)
-//!   (compute DHKey)
-//!   Pairing_Confirm   ─────────►   (Just Works skips the confirm
-//!                                    exchange — initiator sends a
-//!                                    zero confirm to advance)
+//!   (DHKey; Ca = f4(PKa, PKb, Na, 0))
+//!   Pairing_Confirm   ─────────►   (store Ca)
+//!                     ◄───────── Pairing_Confirm (Cb = f4(PKb, PKa, Nb, 0))
 //!                     ◄───────── Pairing_Random (Nb)
-//!   Pairing_Random    ─────────►   (verify Cb against Nb)
-//!                                 (LTK = f5(DHKey, Na, Nb, A, B))
-//!   Pairing_DHKey_Check ─────────►
-//!                     ◄───────── Pairing_DHKey_Check
+//!   (verify Cb; MacKey‖LTK = f5(DHKey, Na, Nb, A, B);
+//!    Ea = f6(MacKey, Na, Nb, 0, IOcapA, A, B))
+//!   Pairing_Random    ─────────►   (verify Ca)
+//!   Pairing_DHKey_Check (Ea) ────► (verify Ea;
+//!                                   Eb = f6(MacKey, Nb, Na, 0, IOcapB, B, A))
+//!                     ◄───────── Pairing_DHKey_Check (Eb)
+//!   (verify Eb)
 //!
-//! Numeric Comparison + Passkey + OOB extensions land alongside an
-//! authentication-policy hook; the state machine here is parameterised
-//! on a Pairing Method enum.
+//! A confirm mismatch aborts with Pairing Failed reason 0x04
+//! (Confirm Value Failed); a DHKey Check mismatch with 0x0B
+//! (DHKey Check Failed) — §3.5.5 table 3.7.
+//!
+//! Passkey + OOB extensions land alongside an authentication-policy
+//! hook; the state machine here is parameterised on a Pairing
+//! Method enum.
 
 use alloc::vec::Vec;
 
@@ -239,8 +246,8 @@ pub trait SmpCrypto {
     fn p256_keygen(&self) -> ([u8; 32], [u8; 32], [u8; 32]);
 
     /// Compute the X coordinate of the shared secret from our
-    /// private and the peer's public point. §2.2.6 "Diffie-Hellman
-    /// Key (DHKey)".
+    /// private and the peer's public point — the DHKey of
+    /// §2.3.5.6.1.
     fn p256_dh(&self, private: &[u8; 32], peer_pub_x: &[u8; 32], peer_pub_y: &[u8; 32])
         -> [u8; 32];
 
@@ -249,6 +256,102 @@ pub trait SmpCrypto {
 
     /// 16 random bytes (used for Na / Nb nonces).
     fn rand128(&self) -> [u8; 16];
+}
+
+// ── f4 / f5 / f6 derivation helpers (§2.2.6 – §2.2.8) ─────────────
+
+/// IOcap input to f6 (§2.2.8): the 24-bit value whose most
+/// significant octet is the AuthReq parameter, middle octet the
+/// OOB data flag, and least significant octet the IO capability —
+/// the reverse of the Pairing Request/Response payload order.
+pub fn iocap_bytes(features: &PairingFeatureExchange) -> [u8; 3] {
+    [
+        features.auth_req,
+        features.oob_data_flag,
+        features.io_capability,
+    ]
+}
+
+/// f4 confirm value (§2.2.6): `AES-CMAC_X(U ‖ V ‖ Z)` where X is
+/// the computing device's own nonce. Per table 2.1 each device
+/// passes its **own** public-key X coordinate as U and the peer's
+/// as V — the initiator computes `Ca = f4(PKax, PKbx, Na, 0)` and
+/// the responder `Cb = f4(PKbx, PKax, Nb, 0)`. `z` is 0 for Just
+/// Works and Numeric Comparison.
+pub fn confirm_value(
+    crypto: &dyn SmpCrypto,
+    own_pk_x: &[u8; 32],
+    peer_pk_x: &[u8; 32],
+    own_nonce: &[u8; 16],
+    z: u8,
+) -> [u8; 16] {
+    let mut data = Vec::with_capacity(65);
+    data.extend_from_slice(own_pk_x);
+    data.extend_from_slice(peer_pk_x);
+    data.push(z);
+    crypto.aes_cmac(own_nonce, &data)
+}
+
+/// f5 key derivation (§2.2.7): returns `(MacKey, LTK)`, the
+/// counter-0 and counter-1 halves of `f5(W, N1, N2, A1, A2)` with
+/// `T = AES-CMAC_SALT(W)` and W = DHKey. A1/A2 are the initiator /
+/// responder addresses (type byte + BD_ADDR).
+pub fn derive_mac_key_and_ltk(
+    crypto: &dyn SmpCrypto,
+    dh_key: &[u8; 32],
+    na: &[u8; 16],
+    nb: &[u8; 16],
+    iat_addr: &[u8; 7],
+    rat_addr: &[u8; 7],
+) -> ([u8; 16], [u8; 16]) {
+    const SALT: [u8; 16] = [
+        0x6C, 0x88, 0x83, 0x91, 0xAA, 0xF5, 0xA5, 0x38, 0x60, 0x37, 0x0B, 0xDB, 0x5A, 0x60, 0x83,
+        0xBE,
+    ];
+    let t = crypto.aes_cmac(&SALT, dh_key);
+    // Layout (§2.2.7): counter (1) ‖ keyID "btle" ‖ N1 ‖ N2 ‖
+    // A1 ‖ A2 ‖ Length (256 as two octets, 0x01 0x00).
+    let mut buf = Vec::with_capacity(53);
+    buf.push(0x00);
+    buf.extend_from_slice(b"btle");
+    buf.extend_from_slice(na);
+    buf.extend_from_slice(nb);
+    buf.extend_from_slice(iat_addr);
+    buf.extend_from_slice(rat_addr);
+    buf.extend_from_slice(&[0x01, 0x00]);
+    let mac_key = crypto.aes_cmac(&t, &buf);
+    // Counter 0x01 produces the LTK half.
+    buf[0] = 0x01;
+    let ltk = crypto.aes_cmac(&t, &buf);
+    (mac_key, ltk)
+}
+
+/// f6 DHKey check value (§2.2.8):
+/// `AES-CMAC_W(N1 ‖ N2 ‖ R ‖ IOcap ‖ A1 ‖ A2)` keyed on the f5
+/// MacKey. Per table 2.2, for Just Works / Numeric Comparison the
+/// initiator's check is `Ea = f6(MacKey, Na, Nb, 0, IOcapA, A, B)`
+/// and the responder's is `Eb = f6(MacKey, Nb, Na, 0, IOcapB, B, A)`
+/// — the responder's form swaps both the nonce order and the
+/// address order. `r` is the 128-bit random (zero for JW/NC);
+/// `iocap` comes from [`iocap_bytes`].
+pub fn dhkey_check_value(
+    crypto: &dyn SmpCrypto,
+    mac_key: &[u8; 16],
+    n1: &[u8; 16],
+    n2: &[u8; 16],
+    r: &[u8; 16],
+    iocap: &[u8; 3],
+    a1: &[u8; 7],
+    a2: &[u8; 7],
+) -> [u8; 16] {
+    let mut data = Vec::with_capacity(65);
+    data.extend_from_slice(n1);
+    data.extend_from_slice(n2);
+    data.extend_from_slice(r);
+    data.extend_from_slice(iocap);
+    data.extend_from_slice(a1);
+    data.extend_from_slice(a2);
+    crypto.aes_cmac(mac_key, &data)
 }
 
 // ── Pairing state machine (Just Works LE-SC, initiator side) ──────
@@ -260,7 +363,7 @@ pub enum PairingState {
     SentRequest,
     SentPublicKey,
     WaitConfirm,
-    SentRandom,
+    WaitRandom,
     SentDhKeyCheck,
     Done,
     Failed,
@@ -272,13 +375,15 @@ pub enum PairingError {
     PeerFailed(u8),
     /// Peer's confirm value didn't match what we recomputed.
     BadConfirm,
+    /// Peer's DHKey Check value didn't match what we recomputed.
+    BadDhKeyCheck,
     /// Peer sent a PDU we don't know how to consume in this state.
     Protocol,
 }
 
 /// Initiator-side pairing state. The application drives `start()`
 /// then feeds incoming PDUs through `feed()`; each call returns
-/// the next outgoing PDU (or completion / error).
+/// the outgoing PDUs to send (or completion / error).
 #[derive(Debug)]
 pub struct Initiator<C: SmpCrypto> {
     pub state: PairingState,
@@ -299,6 +404,10 @@ pub struct Initiator<C: SmpCrypto> {
     pub dh_key: [u8; 32],
     /// Final LTK derived via f5.
     pub ltk: [u8; 16],
+    /// MacKey half of f5 — keys the f6 DHKey checks.
+    pub mac_key: [u8; 16],
+    /// Peer's confirm value Cb (captured from Pairing_Confirm).
+    peer_confirm: [u8; 16],
     /// Initiator + responder addresses (used in f5/f6 inputs).
     iat_addr: [u8; 7], // address-type byte + 6-byte BD_ADDR
     rat_addr: [u8; 7],
@@ -325,6 +434,8 @@ impl<C: SmpCrypto> Initiator<C> {
             nb: [0; 16],
             dh_key: [0; 32],
             ltk: [0; 16],
+            mac_key: [0; 16],
+            peer_confirm: [0; 16],
             iat_addr,
             rat_addr,
             features: PairingFeatureExchange {
@@ -352,8 +463,10 @@ impl<C: SmpCrypto> Initiator<C> {
         self.features.encode(SMP_PAIRING_REQUEST)
     }
 
-    /// Feed one incoming PDU. Returns the outgoing PDU to send, if any.
-    pub fn feed(&mut self, rx: &Pdu) -> Result<Option<Pdu>, PairingError> {
+    /// Feed one incoming PDU. Returns the outgoing PDUs to send
+    /// (one step emits two: Pairing_Random and the DHKey Check
+    /// leave together once Nb has been verified).
+    pub fn feed(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
         if rx.code == SMP_PAIRING_FAILED {
             self.state = PairingState::Failed;
             let reason = rx
@@ -366,13 +479,14 @@ impl<C: SmpCrypto> Initiator<C> {
         match self.state {
             PairingState::SentRequest => self.on_response(rx),
             PairingState::SentPublicKey => self.on_peer_public_key(rx),
-            PairingState::WaitConfirm => self.on_pairing_random(rx),
-            PairingState::SentRandom => self.on_dhkey_check(rx),
+            PairingState::WaitConfirm => self.on_pairing_confirm(rx),
+            PairingState::WaitRandom => self.on_pairing_random(rx),
+            PairingState::SentDhKeyCheck => self.on_dhkey_check(rx),
             _ => Err(PairingError::Protocol),
         }
     }
 
-    fn on_response(&mut self, rx: &Pdu) -> Result<Option<Pdu>, PairingError> {
+    fn on_response(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
         if rx.code != SMP_PAIRING_RESPONSE {
             return Err(PairingError::Protocol);
         }
@@ -396,10 +510,10 @@ impl<C: SmpCrypto> Initiator<C> {
             payload: pk,
         };
         self.state = PairingState::SentPublicKey;
-        Ok(Some(out))
+        Ok(alloc::vec![out])
     }
 
-    fn on_peer_public_key(&mut self, rx: &Pdu) -> Result<Option<Pdu>, PairingError> {
+    fn on_peer_public_key(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
         if rx.code != SMP_PAIRING_PUBLIC_KEY {
             return Err(PairingError::Protocol);
         }
@@ -412,13 +526,32 @@ impl<C: SmpCrypto> Initiator<C> {
             .crypto
             .p256_dh(&self.priv_key, &self.peer_pub_x, &self.peer_pub_y);
 
-        // Just Works skips the Confirm exchange in LE-SC: the
-        // initiator just waits for the responder's Pairing_Random.
+        // Authentication stage 1 (§2.3.5.6.2): commit to both
+        // public keys and our nonce with Ca (§2.2.6 table 2.1)
+        // before Na is revealed to the responder.
+        let ca = confirm_value(&self.crypto, &self.pub_x, &self.peer_pub_x, &self.na, 0);
         self.state = PairingState::WaitConfirm;
-        Ok(None)
+        Ok(alloc::vec![Pdu {
+            code: SMP_PAIRING_CONFIRM,
+            payload: ca.to_vec(),
+        }])
     }
 
-    fn on_pairing_random(&mut self, rx: &Pdu) -> Result<Option<Pdu>, PairingError> {
+    fn on_pairing_confirm(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
+        if rx.code != SMP_PAIRING_CONFIRM {
+            return Err(PairingError::Protocol);
+        }
+        if rx.payload.len() < 16 {
+            return Err(PairingError::Protocol);
+        }
+        // Cb cannot be checked yet — it commits the responder to
+        // Nb, which is only revealed by the next PDU.
+        self.peer_confirm.copy_from_slice(&rx.payload[..16]);
+        self.state = PairingState::WaitRandom;
+        Ok(Vec::new())
+    }
+
+    fn on_pairing_random(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
         if rx.code != SMP_PAIRING_RANDOM {
             return Err(PairingError::Protocol);
         }
@@ -427,62 +560,85 @@ impl<C: SmpCrypto> Initiator<C> {
         }
         self.nb.copy_from_slice(&rx.payload[..16]);
 
-        // Send our Na to the responder.
-        let na_pdu = Pdu {
-            code: SMP_PAIRING_RANDOM,
-            payload: self.na.to_vec(),
-        };
+        // Verify Cb now that Nb is revealed (§2.2.6 table 2.1:
+        // the responder's confirm takes the responder's key
+        // first). A mismatch aborts the pairing — the caller
+        // maps BadConfirm to Pairing Failed 0x04.
+        let want_cb = confirm_value(&self.crypto, &self.peer_pub_x, &self.pub_x, &self.nb, 0);
+        if self.peer_confirm != want_cb {
+            self.state = PairingState::Failed;
+            return Err(PairingError::BadConfirm);
+        }
 
-        // Derive LTK via the f5 function (§2.2.7).
-        // f5(W, N1, N2, A1, A2) where W = DHKey:
-        //   T = AES-CMAC(salt, W)  with salt = 0x6C888391AAF5A53860370BDB5A6083BE
-        //   LTK = AES-CMAC(T, "btle" || Counter=0 || N1 || N2 || A1 || A2 || Length=0x0100)
-        const SALT: [u8; 16] = [
-            0x6C, 0x88, 0x83, 0x91, 0xAA, 0xF5, 0xA5, 0x38, 0x60, 0x37, 0x0B, 0xDB, 0x5A, 0x60,
-            0x83, 0xBE,
-        ];
-        let t = self.crypto.aes_cmac(&SALT, &self.dh_key);
-
-        // f5 input layout (§2.2.7): 0x00 (counter byte) || 'btle' ||
-        // N1 (16) || N2 (16) || A1 (7) || A2 (7) || Length BE(0x0100).
-        let mut buf = Vec::with_capacity(53);
-        buf.push(0x00);
-        buf.extend_from_slice(b"btle");
-        buf.extend_from_slice(&self.na);
-        buf.extend_from_slice(&self.nb);
-        buf.extend_from_slice(&self.iat_addr);
-        buf.extend_from_slice(&self.rat_addr);
-        buf.extend_from_slice(&[0x01, 0x00]);
-        let mac_key = self.crypto.aes_cmac(&t, &buf);
-
-        // For the second f5 call, increment the counter to 0x01 to
-        // produce the LTK. Re-encode with counter=0x01.
-        buf[0] = 0x01;
-        let ltk = self.crypto.aes_cmac(&t, &buf);
+        // Derive MacKey + LTK via f5 (§2.2.7).
+        let (mac_key, ltk) = derive_mac_key_and_ltk(
+            &self.crypto,
+            &self.dh_key,
+            &self.na,
+            &self.nb,
+            &self.iat_addr,
+            &self.rat_addr,
+        );
+        self.mac_key = mac_key;
         self.ltk = ltk;
-        let _ = mac_key; // MacKey is used for f6 / DHKey check; carried for future use.
 
-        self.state = PairingState::SentRandom;
-        Ok(Some(na_pdu))
+        // Authentication stage 2 (§2.3.5.6.5): our DHKey Check
+        // Ea leaves with Na. Ea = f6(MacKey, Na, Nb, 0, IOcapA,
+        // A, B) per §2.2.8 table 2.2.
+        let ea = dhkey_check_value(
+            &self.crypto,
+            &self.mac_key,
+            &self.na,
+            &self.nb,
+            &[0u8; 16],
+            &iocap_bytes(&self.features),
+            &self.iat_addr,
+            &self.rat_addr,
+        );
+        self.state = PairingState::SentDhKeyCheck;
+        Ok(alloc::vec![
+            Pdu {
+                code: SMP_PAIRING_RANDOM,
+                payload: self.na.to_vec(),
+            },
+            Pdu {
+                code: SMP_PAIRING_DHKEY_CHECK,
+                payload: ea.to_vec(),
+            },
+        ])
     }
 
-    fn on_dhkey_check(&mut self, rx: &Pdu) -> Result<Option<Pdu>, PairingError> {
+    fn on_dhkey_check(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
         if rx.code != SMP_PAIRING_DHKEY_CHECK {
             return Err(PairingError::Protocol);
         }
         if rx.payload.len() < 16 {
             return Err(PairingError::Protocol);
         }
-        // Peer's Eb captured but not verified against the f6 output
-        // here — the f6 verification path lands when the auth-policy
-        // module wires it in. Just-Works skips MITM verification by
-        // definition (§2.3.5.6.5).
+        // Verify Eb = f6(MacKey, Nb, Na, 0, IOcapB, B, A)
+        // (§2.2.8 table 2.2) — the responder's form swaps both
+        // the nonce order and the address order. A mismatch
+        // aborts the pairing (Pairing Failed 0x0B at the caller).
+        let want_eb = dhkey_check_value(
+            &self.crypto,
+            &self.mac_key,
+            &self.nb,
+            &self.na,
+            &[0u8; 16],
+            &iocap_bytes(&self.peer_features),
+            &self.rat_addr,
+            &self.iat_addr,
+        );
+        if rx.payload[..16] != want_eb[..] {
+            self.state = PairingState::Failed;
+            return Err(PairingError::BadDhKeyCheck);
+        }
         self.state = PairingState::Done;
-        Ok(None)
+        Ok(Vec::new())
     }
 }
 
-// ── Numeric Comparison g2 helper (§2.2.8) ──────────────────────────
+// ── Numeric Comparison g2 helper (§2.2.9) ──────────────────────────
 
 /// Numeric Comparison value derivation. Both sides display this
 /// 6-digit decimal and the user confirms they match.
@@ -502,7 +658,7 @@ pub fn numeric_comparison_value(
     data.extend_from_slice(responder_pk_x);
     data.extend_from_slice(responder_nonce);
     let mac = crypto.aes_cmac(initiator_nonce, &data);
-    // Per §2.2.8, take the low 32 bits big-endian of the MAC and
+    // Per §2.2.9, take the low 32 bits big-endian of the MAC and
     // mod 10^6 to get the 6-digit display value.
     let v = u32::from_be_bytes([mac[12], mac[13], mac[14], mac[15]]);
     v % 1_000_000
@@ -521,6 +677,7 @@ pub enum ResponderState {
     GotRequest,
     SentPublicKey,
     SentRandom,
+    WaitDhKeyCheck,
     Done,
     Failed,
 }
@@ -539,6 +696,10 @@ pub struct Responder<C: SmpCrypto> {
     pub na: [u8; 16],
     pub dh_key: [u8; 32],
     pub ltk: [u8; 16],
+    /// MacKey half of f5 — keys the f6 DHKey checks.
+    pub mac_key: [u8; 16],
+    /// Peer's confirm value Ca (captured from Pairing_Confirm).
+    peer_confirm: [u8; 16],
     iat_addr: [u8; 7],
     rat_addr: [u8; 7],
     features_local: PairingFeatureExchange,
@@ -566,6 +727,8 @@ impl<C: SmpCrypto> Responder<C> {
             na: [0; 16],
             dh_key: [0; 32],
             ltk: [0; 16],
+            mac_key: [0; 16],
+            peer_confirm: [0; 16],
             iat_addr,
             rat_addr,
             features_local: PairingFeatureExchange {
@@ -588,7 +751,7 @@ impl<C: SmpCrypto> Responder<C> {
         }
     }
 
-    pub fn feed(&mut self, rx: &Pdu) -> Result<Option<Pdu>, PairingError> {
+    pub fn feed(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
         if rx.code == SMP_PAIRING_FAILED {
             self.state = ResponderState::Failed;
             let reason = rx
@@ -601,13 +764,14 @@ impl<C: SmpCrypto> Responder<C> {
         match self.state {
             ResponderState::Idle => self.on_request(rx),
             ResponderState::GotRequest => self.on_initiator_public_key(rx),
-            ResponderState::SentPublicKey => self.on_pairing_random(rx),
-            ResponderState::SentRandom => self.on_dhkey_check(rx),
+            ResponderState::SentPublicKey => self.on_pairing_confirm(rx),
+            ResponderState::SentRandom => self.on_pairing_random(rx),
+            ResponderState::WaitDhKeyCheck => self.on_dhkey_check(rx),
             _ => Err(PairingError::Protocol),
         }
     }
 
-    fn on_request(&mut self, rx: &Pdu) -> Result<Option<Pdu>, PairingError> {
+    fn on_request(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
         if rx.code != SMP_PAIRING_REQUEST {
             return Err(PairingError::Protocol);
         }
@@ -629,10 +793,10 @@ impl<C: SmpCrypto> Responder<C> {
 
         let rsp = self.features_local.encode(SMP_PAIRING_RESPONSE);
         self.state = ResponderState::GotRequest;
-        Ok(Some(rsp))
+        Ok(alloc::vec![rsp])
     }
 
-    fn on_initiator_public_key(&mut self, rx: &Pdu) -> Result<Option<Pdu>, PairingError> {
+    fn on_initiator_public_key(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
         if rx.code != SMP_PAIRING_PUBLIC_KEY {
             return Err(PairingError::Protocol);
         }
@@ -653,10 +817,37 @@ impl<C: SmpCrypto> Responder<C> {
             payload: pk,
         };
         self.state = ResponderState::SentPublicKey;
-        Ok(Some(out))
+        Ok(alloc::vec![out])
     }
 
-    fn on_pairing_random(&mut self, rx: &Pdu) -> Result<Option<Pdu>, PairingError> {
+    fn on_pairing_confirm(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
+        if rx.code != SMP_PAIRING_CONFIRM {
+            return Err(PairingError::Protocol);
+        }
+        if rx.payload.len() < 16 {
+            return Err(PairingError::Protocol);
+        }
+        self.peer_confirm.copy_from_slice(&rx.payload[..16]);
+
+        // Commit Cb and reveal Nb together (§2.3.5.6.2). Our
+        // confirm takes our own key first (§2.2.6 table 2.1).
+        // Ca itself is verified when Na arrives — a commitment
+        // cannot be checked before its nonce is revealed.
+        let cb = confirm_value(&self.crypto, &self.pub_x, &self.peer_pub_x, &self.nb, 0);
+        self.state = ResponderState::SentRandom;
+        Ok(alloc::vec![
+            Pdu {
+                code: SMP_PAIRING_CONFIRM,
+                payload: cb.to_vec(),
+            },
+            Pdu {
+                code: SMP_PAIRING_RANDOM,
+                payload: self.nb.to_vec(),
+            },
+        ])
+    }
+
+    fn on_pairing_random(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
         if rx.code != SMP_PAIRING_RANDOM {
             return Err(PairingError::Protocol);
         }
@@ -664,6 +855,16 @@ impl<C: SmpCrypto> Responder<C> {
             return Err(PairingError::Protocol);
         }
         self.na.copy_from_slice(&rx.payload[..16]);
+
+        // Verify the initiator's commitment Ca now that Na is
+        // revealed (§2.2.6 table 2.1: Ca takes the initiator's
+        // key first). A mismatch aborts the pairing — the caller
+        // maps BadConfirm to Pairing Failed 0x04.
+        let want_ca = confirm_value(&self.crypto, &self.peer_pub_x, &self.pub_x, &self.na, 0);
+        if self.peer_confirm != want_ca {
+            self.state = ResponderState::Failed;
+            return Err(PairingError::BadConfirm);
+        }
 
         // Compute Numeric Comparison value if that's the negotiated
         // method — application confirms before we mark Done.
@@ -677,50 +878,61 @@ impl<C: SmpCrypto> Responder<C> {
             ));
         }
 
-        // Send our Nb.
-        let nb_pdu = Pdu {
-            code: SMP_PAIRING_RANDOM,
-            payload: self.nb.to_vec(),
-        };
-
-        // Derive LTK via f5 (same as initiator path).
-        const SALT: [u8; 16] = [
-            0x6C, 0x88, 0x83, 0x91, 0xAA, 0xF5, 0xA5, 0x38, 0x60, 0x37, 0x0B, 0xDB, 0x5A, 0x60,
-            0x83, 0xBE,
-        ];
-        let t = self.crypto.aes_cmac(&SALT, &self.dh_key);
-        let mut buf = alloc::vec::Vec::with_capacity(53);
-        buf.push(0x00);
-        buf.extend_from_slice(b"btle");
-        buf.extend_from_slice(&self.na);
-        buf.extend_from_slice(&self.nb);
-        buf.extend_from_slice(&self.iat_addr);
-        buf.extend_from_slice(&self.rat_addr);
-        buf.extend_from_slice(&[0x01, 0x00]);
-        let _mac_key = self.crypto.aes_cmac(&t, &buf);
-        buf[0] = 0x01;
-        let ltk = self.crypto.aes_cmac(&t, &buf);
+        // Derive MacKey + LTK via f5 (§2.2.7).
+        let (mac_key, ltk) = derive_mac_key_and_ltk(
+            &self.crypto,
+            &self.dh_key,
+            &self.na,
+            &self.nb,
+            &self.iat_addr,
+            &self.rat_addr,
+        );
+        self.mac_key = mac_key;
         self.ltk = ltk;
 
-        self.state = ResponderState::SentRandom;
-        Ok(Some(nb_pdu))
+        self.state = ResponderState::WaitDhKeyCheck;
+        Ok(Vec::new())
     }
 
-    fn on_dhkey_check(&mut self, rx: &Pdu) -> Result<Option<Pdu>, PairingError> {
+    fn on_dhkey_check(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
         if rx.code != SMP_PAIRING_DHKEY_CHECK {
             return Err(PairingError::Protocol);
         }
         if rx.payload.len() < 16 {
             return Err(PairingError::Protocol);
         }
-        // Emit our DHKey check back. Just Works skips the f6
-        // verification step; Numeric Comparison / Passkey land it
-        // when the auth policy module wires up f6.
-        let our_check = Pdu {
-            code: SMP_PAIRING_DHKEY_CHECK,
-            payload: alloc::vec![0u8; 16],
-        };
+        // Verify Ea = f6(MacKey, Na, Nb, 0, IOcapA, A, B)
+        // (§2.2.8 table 2.2). A mismatch aborts the pairing
+        // (Pairing Failed 0x0B at the caller).
+        let want_ea = dhkey_check_value(
+            &self.crypto,
+            &self.mac_key,
+            &self.na,
+            &self.nb,
+            &[0u8; 16],
+            &iocap_bytes(&self.features_peer),
+            &self.iat_addr,
+            &self.rat_addr,
+        );
+        if rx.payload[..16] != want_ea[..] {
+            self.state = ResponderState::Failed;
+            return Err(PairingError::BadDhKeyCheck);
+        }
+        // Answer with Eb — the swapped form (§2.2.8 table 2.2).
+        let eb = dhkey_check_value(
+            &self.crypto,
+            &self.mac_key,
+            &self.nb,
+            &self.na,
+            &[0u8; 16],
+            &iocap_bytes(&self.features_local),
+            &self.rat_addr,
+            &self.iat_addr,
+        );
         self.state = ResponderState::Done;
-        Ok(Some(our_check))
+        Ok(alloc::vec![Pdu {
+            code: SMP_PAIRING_DHKEY_CHECK,
+            payload: eb.to_vec(),
+        }])
     }
 }
