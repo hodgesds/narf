@@ -151,6 +151,7 @@ fn layout() -> Layout {
 }
 struct Fake {
     index: u32,
+    index_extra: u32,
     writes: Vec<u32>,
     dead: bool,
     disabled_sa: u8,
@@ -162,11 +163,11 @@ impl Io for Fake {
         match a / 4 {
             0x2249 => u32::from(self.disabled_sa) << 8,
             0x224a => 0,
-            0xc200 => self.index,  // GRBM_GFX_INDEX 0xA000+0x2200
-            0x0d31 => 0x0200_0000, // NBIO 0xD20+0x11
-            0x263e => GB_ADDR,     // the Mesa-visible 0x263e
+            0xc200 => self.index | self.index_extra, // GRBM_GFX_INDEX
+            0x0d31 => 0x0200_0000,                   // NBIO 0xD20+0x11
+            0x263e => GB_ADDR,                       // the Mesa-visible 0x263e
             0x263d => (se * 2 + sh) << 16 & 0x10000, // CC_RB: RB0 off on odd SAs
-            0x26df => 0,           // GC_USER_RB 0x1260+0x147f
+            0x26df => 0,                             // GC_USER_RB 0x1260+0x147f
             0x226f => {
                 if self.dead {
                     u32::MAX
@@ -190,6 +191,7 @@ impl Io for Fake {
 fn gfx10_topology_register_model_selects_each_array_and_restores_broadcast() -> TestResult {
     let mut f = Fake {
         index: BROADCAST,
+        index_extra: 0,
         writes: Vec::new(),
         dead: false,
         disabled_sa: 0,
@@ -217,6 +219,7 @@ fn gfx10_topology_register_model_selects_each_array_and_restores_broadcast() -> 
     }
     let mut dead = Fake {
         index: BROADCAST,
+        index_extra: 0,
         writes: Vec::new(),
         dead: true,
         disabled_sa: 0,
@@ -234,6 +237,7 @@ kernel_test_in!(
 fn rdna2_navi21_skips_whole_disabled_shader_arrays() -> TestResult {
     let mut f = Fake {
         index: BROADCAST,
+        index_extra: 0,
         writes: Vec::new(),
         dead: false,
         disabled_sa: 2,
@@ -254,4 +258,26 @@ fn rdna2_navi21_skips_whole_disabled_shader_arrays() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_navi21_skips_whole_disabled_shader_arrays
+);
+
+fn gfx10_topology_ignores_reserved_index_bits_but_checks_selector() -> TestResult {
+    let mut f = Fake {
+        index: BROADCAST,
+        index_extra: 0x1f00_0000,
+        writes: Vec::new(),
+        dead: false,
+        disabled_sa: 0,
+    };
+    if sample(&mut f, &layout(), limits()).is_err() || f.index != BROADCAST {
+        return TestResult::Fail("reserved selector bits rejected valid topology");
+    }
+    f.index_extra = 1 << 8;
+    if sample(&mut f, &layout(), limits()) != Err(Error::Readback) {
+        return TestResult::Fail("a stuck SA selector was accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    gfx10_topology_ignores_reserved_index_bits_but_checks_selector
 );

@@ -500,6 +500,37 @@ fn poll_nearest_deadline(task_id: u64, fds: &[PollFd]) -> Option<u64> {
     best
 }
 
+/// Scheduler wake deadline, distinct from the caller's actual timeout.
+/// Shared by poll/ppoll and the kernel-owned select/pselect fd array.
+/// A legacy provider without a notification source (e.g. a serial tty)
+/// requires a sleeping recheck; a generic network wake cannot rescue it.
+pub(crate) fn poll_wake_deadline(
+    task_id: u64,
+    fds: &[PollFd],
+    current: u64,
+    now: u64,
+    arms: ReadinessArms,
+) -> u64 {
+    let wake = poll_nearest_deadline(task_id, fds).map_or(current, |d| {
+        if current == 0 {
+            d
+        } else {
+            current.min(d)
+        }
+    });
+    if arms.needs_rescan {
+        const SILENT_RECHECK_NS: u64 = 10_000_000;
+        let retry = now.saturating_add(SILENT_RECHECK_NS);
+        if wake == 0 {
+            retry
+        } else {
+            wake.min(retry)
+        }
+    } else {
+        wake
+    }
+}
+
 /// Record a blocking poll park's fd set into the task ctx for the stall
 /// watchdog (see `UserTaskCtx::poll_wait_fds`): slot = `events<<32 | (fd+1)`.
 fn record_poll_wait(uc: &crate::user_task::UserTaskCtx, fds: &[PollFd]) {
@@ -660,17 +691,22 @@ pub(crate) fn install_poll_files(task_id: u64, fds: &[PollFd]) {
 /// cell's arm-vs-set lock. In that case the generic I/O waiter is redundant
 /// and harmful: its broadcast wake re-executes this poll on every unrelated
 /// readiness transition. A set containing even one legacy descriptor keeps
-/// the generic waiter so that descriptor cannot strand.
+/// the generic waiter. A legacy provider that does not notify also needs a
+/// bounded scheduler recheck; no I/O-generation event is promised for it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReadinessArms {
     pub(crate) any_ready: bool,
     pub(crate) all_armed: bool,
+    pub(crate) needs_rescan: bool,
 }
 
 impl ReadinessArms {
     const NONE: Self = Self {
         any_ready: false,
         all_armed: false,
+        // No provider registrations are known (including after a consumed
+        // readiness edge caused us to disarm). Never trust an infinite park.
+        needs_rescan: true,
     };
 }
 
@@ -688,13 +724,17 @@ pub(crate) fn arm_readiness_cells(
     fd::with_table(task_id, |t| {
         let mut any_ready = false;
         let mut all_armed = true;
+        let mut needs_rescan = false;
         for pfd in fds {
             if pfd.fd < 0 {
                 continue;
             }
-            let armed = t.get(pfd.fd as u32).and_then(|e| {
+            let (armed, notifies) = t.get(pfd.fd as u32).map_or((None, false), |e| {
                 let interest = (pfd.events as u32) | POLL_ERR | POLL_HUP | POLL_NVAL;
-                e.ops.arm_readiness(task_id, interest, waker)
+                (
+                    e.ops.arm_readiness(task_id, interest, waker),
+                    e.ops.readiness_notifies(),
+                )
             });
             match armed {
                 Some(poll) => {
@@ -702,12 +742,16 @@ pub(crate) fn arm_readiness_cells(
                         any_ready = true;
                     }
                 }
-                None => all_armed = false,
+                None => {
+                    all_armed = false;
+                    needs_rescan |= !notifies;
+                }
             }
         }
         ReadinessArms {
             any_ready,
             all_armed,
+            needs_rescan,
         }
     })
     .unwrap_or(ReadinessArms::NONE)
@@ -934,17 +978,15 @@ pub(crate) fn poll_wait_kernel(
     uctx.durable_io_wait
         .store(arms.all_armed, Ordering::Release);
     record_poll_wait(uctx, fds);
-    if let Some(timer_deadline) = poll_nearest_deadline(task_id, fds) {
-        let current = uctx.sleep_deadline_ns.load(Ordering::Acquire);
-        uctx.sleep_deadline_ns.store(
-            if current == 0 {
-                timer_deadline
-            } else {
-                current.min(timer_deadline)
-            },
-            Ordering::Release,
-        );
-    }
+    let wake_deadline = poll_wake_deadline(
+        task_id,
+        fds,
+        uctx.sleep_deadline_ns.load(Ordering::Acquire),
+        now,
+        arms,
+    );
+    uctx.sleep_deadline_ns
+        .store(wake_deadline, Ordering::Release);
     ctx.set_rip(ctx.rip().wrapping_sub(2));
     // SAFETY: this is the current task's live context and the scheduler owns
     // the subsequent state transition.
@@ -1254,17 +1296,14 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout_ns:
             // re-evaluated from the watchdog tick. Refreshed on every
             // re-execution; cleared on every return path.
             record_poll_wait(uc, &fds);
-            // Clamp the scheduler wake-up to the nearest armed timerfd (its
-            // expiry fires no readiness notify).
-            if let Some(timer_dl) = poll_nearest_deadline(task, &fds) {
-                let cur = uc.sleep_deadline_ns.load(Ordering::Acquire);
-                let clamped = if cur == 0 {
-                    timer_dl
-                } else {
-                    cur.min(timer_dl)
-                };
-                uc.sleep_deadline_ns.store(clamped, Ordering::Release);
-            }
+            let wake_deadline = poll_wake_deadline(
+                task,
+                &fds,
+                uc.sleep_deadline_ns.load(Ordering::Acquire),
+                narf_scheduler::narf_time::monotonic_ns(),
+                arms,
+            );
+            uc.sleep_deadline_ns.store(wake_deadline, Ordering::Release);
             // Rewind RIP over the 2-byte syscall so we re-execute poll on wake.
             ctx.set_rip(ctx.rip().wrapping_sub(2));
             ctx.save_user_state(uc.state.get() as *mut u8);

@@ -95,6 +95,10 @@ pub const COLOR_RANGE_ENUMS: [(u64, &[u8]); 2] = [
 /// The formats plane `id` lists: a primary's `plane_formats`, an overlay's
 /// `overlay_formats`, a cursor's `CURSOR_FORMATS`.
 fn formats_of(card: &Card, id: u32) -> Option<&'static [u32]> {
+    if crate::amdgpu_native_kms::linear_gem_card(card) && card.native_planes.is_empty() {
+        let index = id.checked_sub(PRIMARY_PLANE_ID_BASE)?;
+        return card.crtcs.get(index as usize).and(card.plane_formats);
+    }
     let p = card.native_plane(id)?;
     if p.is_cursor() {
         Some(&CURSOR_FORMATS)

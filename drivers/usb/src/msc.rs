@@ -1311,6 +1311,36 @@ impl Drop for MscIoClaim {
     }
 }
 
+/// Keep each BOT command within the xHCI endpoint's single-page DMA buffer.
+/// Filesystem requests (notably 16 KiB btrfs nodes) can span many commands.
+fn block_chunks(
+    lba: u64,
+    n_blocks: u16,
+    lba_bytes: u32,
+) -> Result<impl Iterator<Item = (u32, u16, core::ops::Range<usize>)>, narf_block::BlockIoError> {
+    if !lba_bytes.is_power_of_two() || !(512..=4096).contains(&lba_bytes) {
+        return Err(narf_block::BlockIoError::DriverError);
+    }
+    let end = lba
+        .checked_add(n_blocks as u64)
+        .ok_or(narf_block::BlockIoError::OutOfRange)?;
+    if lba > u32::MAX as u64 || end > u32::MAX as u64 + 1 {
+        return Err(narf_block::BlockIoError::OutOfRange);
+    }
+    let max_blocks = (4096 / lba_bytes).min(MSC_MAX_BLOCKS_PER_XFER as u32) as usize;
+    Ok((0..n_blocks as usize)
+        .step_by(max_blocks)
+        .map(move |offset| {
+            let count = (n_blocks as usize - offset).min(max_blocks);
+            let start = offset * lba_bytes as usize;
+            (
+                (lba + offset as u64) as u32,
+                count as u16,
+                start..start + count * lba_bytes as usize,
+            )
+        }))
+}
+
 impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
     fn lba_size(&self) -> u32 {
         self.lba_size
@@ -1365,9 +1395,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         {
             return Err(narf_block::BlockIoError::OutOfRange);
         }
-        let lba32: u32 = lba
-            .try_into()
-            .map_err(|_| narf_block::BlockIoError::OutOfRange)?;
+        let chunks = block_chunks(lba, n_blocks, self.lba_size)?;
         let expected = n_blocks as usize * self.lba_size as usize;
         if data.len() < expected {
             return Err(narf_block::BlockIoError::BufferTooSmall);
@@ -1376,15 +1404,15 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         let Some(_claim) = MscIoClaim::acquire(self.idx) else {
             return Err(narf_block::BlockIoError::DriverError);
         };
-        let result = sync_bridge(async {
-            dev_snapshot
-                .write_blocks_fua(&c, lba32, n_blocks, &data[..expected])
-                .await
-        });
-        match result {
-            Ok(()) => Ok(()),
-            Err(_) => Err(narf_block::BlockIoError::DriverError),
-        }
+        sync_bridge(async {
+            for (start, count, bytes) in chunks {
+                dev_snapshot
+                    .write_blocks_fua(&c, start, count, &data[bytes])
+                    .await
+                    .map_err(|_| narf_block::BlockIoError::DriverError)?;
+            }
+            Ok(())
+        })
     }
     fn read(
         &self,
@@ -1398,9 +1426,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         {
             return Err(narf_block::BlockIoError::OutOfRange);
         }
-        let lba32: u32 = lba
-            .try_into()
-            .map_err(|_| narf_block::BlockIoError::OutOfRange)?;
+        let chunks = block_chunks(lba, n_blocks, self.lba_size)?;
         let expected = n_blocks as usize * self.lba_size as usize;
         if out.len() < expected {
             return Err(narf_block::BlockIoError::BufferTooSmall);
@@ -1452,14 +1478,16 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         let Some(_claim) = MscIoClaim::acquire(self.idx) else {
             return Err(narf_block::BlockIoError::DriverError);
         };
-        let result = sync_bridge(async { dev_snapshot.read_blocks(&c, lba32, n_blocks).await });
-        match result {
-            Ok(data) => {
-                out[..expected].copy_from_slice(&data);
-                Ok(())
+        sync_bridge(async {
+            for (start, count, bytes) in chunks {
+                let data = dev_snapshot
+                    .read_blocks(&c, start, count)
+                    .await
+                    .map_err(|_| narf_block::BlockIoError::DriverError)?;
+                out[bytes].copy_from_slice(&data);
             }
-            Err(_) => Err(narf_block::BlockIoError::DriverError),
-        }
+            Ok(())
+        })
     }
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
         if lba
@@ -1468,9 +1496,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         {
             return Err(narf_block::BlockIoError::OutOfRange);
         }
-        let lba32: u32 = lba
-            .try_into()
-            .map_err(|_| narf_block::BlockIoError::OutOfRange)?;
+        let chunks = block_chunks(lba, n_blocks, self.lba_size)?;
         let expected = n_blocks as usize * self.lba_size as usize;
         if data.len() < expected {
             return Err(narf_block::BlockIoError::BufferTooSmall);
@@ -1516,14 +1542,73 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         let Some(_claim) = MscIoClaim::acquire(self.idx) else {
             return Err(narf_block::BlockIoError::DriverError);
         };
-        let result = sync_bridge(async {
-            dev_snapshot
-                .write_blocks(&c, lba32, n_blocks, &data[..expected])
-                .await
-        });
-        match result {
-            Ok(()) => Ok(()),
-            Err(_) => Err(narf_block::BlockIoError::DriverError),
-        }
+        sync_bridge(async {
+            for (start, count, bytes) in chunks {
+                dev_snapshot
+                    .write_blocks(&c, start, count, &data[bytes])
+                    .await
+                    .map_err(|_| narf_block::BlockIoError::DriverError)?;
+            }
+            Ok(())
+        })
     }
+}
+
+#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+mod block_tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_msc_filesystem_request_chunks() -> TestResult {
+        // A btrfs node on a 512-byte disk, including a partial final chunk.
+        let chunks: Vec<_> = block_chunks(100, 33, 512).unwrap().collect();
+        if chunks
+            != [
+                (100, 8, 0..4096),
+                (108, 8, 4096..8192),
+                (116, 8, 8192..12288),
+                (124, 8, 12288..16384),
+                (132, 1, 16384..16896),
+            ]
+        {
+            return TestResult::Fail("filesystem request lost or overlapped blocks");
+        }
+        let chunks: Vec<_> = block_chunks(u32::MAX as u64 - 1, 2, 4096)
+            .unwrap()
+            .collect();
+        if chunks != [(u32::MAX - 1, 1, 0..4096), (u32::MAX, 1, 4096..8192)] {
+            return TestResult::Fail("4K logical blocks exceeded the DMA buffer");
+        }
+        if block_chunks(u32::MAX as u64, 2, 512).is_ok()
+            || block_chunks(0, 1, 8192).is_ok()
+            || block_chunks(0, 1, 0).is_ok()
+        {
+            return TestResult::Fail("invalid BOT geometry or READ(10) range accepted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/msc", smoke_msc_filesystem_request_chunks);
+
+    fn smoke_msc_fua_preflights_whole_request() -> TestResult {
+        use narf_block::{BlockDeviceSync, BlockIoError};
+        let device = UsbMscBlockDevice {
+            idx: usize::MAX,
+            generation: 0,
+            lba_size: 512,
+            capacity: u64::MAX,
+        };
+        // The first LBA fits WRITE(10), but the final one does not. Refuse
+        // the whole request before looking up transport or taking a claim.
+        if device.write_fua(u32::MAX as u64, 2, &[0; 1024]) != Err(BlockIoError::OutOfRange) {
+            return TestResult::Fail("FUA did not validate the complete WRITE(10) range");
+        }
+        // An exactly representable request passes preflight and reaches
+        // the normal stale/missing-device gate, without touching a controller.
+        if device.write_fua(u32::MAX as u64 - 1, 2, &[0; 1024]) != Err(BlockIoError::DeviceRemoved)
+        {
+            return TestResult::Fail("FUA refused a valid boundary request before identity lookup");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/msc", smoke_msc_fua_preflights_whole_request);
 }

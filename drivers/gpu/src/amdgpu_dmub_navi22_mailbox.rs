@@ -366,6 +366,51 @@ impl<I: Io> Engine<I> {
         })();
         self.finish_mailbox(result)
     }
+    /// DMUB_CMD__EDID_CEA: retain mailbox ownership across all sixteen
+    /// chunks. A dropped future keeps InFlight, as for typed AUX requests.
+    pub(super) async fn hdmi_freesync_caps(
+        &mut self,
+        edid: &[u8],
+    ) -> Result<Option<crate::amdgpu_freesync::AmdVsdb>, Error> {
+        let Some(cta) = crate::amdgpu_freesync::hdmi_amd_vsdb_cea(edid) else {
+            return Ok(None);
+        };
+        self.begin_mailbox()?;
+        let result = self.hdmi_freesync_cea(cta).await;
+        self.finish_mailbox(result)
+    }
+    async fn hdmi_freesync_cea(
+        &mut self,
+        cta: &[u8],
+    ) -> Result<Option<crate::amdgpu_freesync::AmdVsdb>, Error> {
+        let mut found = None;
+        for (i, chunk) in cta.chunks_exact(8).enumerate() {
+            let offset = (i * 8) as u16;
+            let mut request = header(79, 16); // linux-lit: 79=DMUB_CMD__EDID_CEA
+            request[4..6].copy_from_slice(&offset.to_le_bytes());
+            request[6] = 8;
+            request[7..9].copy_from_slice(&128u16.to_le_bytes());
+            request[9..17].copy_from_slice(chunk);
+            let reply = self.command(request).await?;
+            if reply == request {
+                return Ok(None);
+            } // Optional command absent in this firmware.
+            match reply[4] {
+                1 => {
+                    found =
+                        (reply[5] != 0 && reply[6] != 0).then(|| crate::amdgpu_freesync::AmdVsdb {
+                            version: u16::from_le_bytes(reply[7..9].try_into().unwrap()),
+                            min_hz: u16::from_le_bytes(reply[9..11].try_into().unwrap()),
+                            max_hz: u16::from_le_bytes(reply[11..13].try_into().unwrap()),
+                            vcp_code: reply[13],
+                        });
+                }
+                2 if reply[5..7] == offset.to_le_bytes() && reply[7] != 0 => {}
+                _ => return Err(Error::Protocol),
+            }
+        }
+        Ok(found)
+    }
     pub(super) async fn hpd(&mut self, instance: u8) -> Result<bool, Error> {
         if instance >= NATIVE_CHANNELS {
             return Err(Error::Invalid);
@@ -485,6 +530,14 @@ impl<I: Io> Engine<I> {
 impl Dmub {
     pub fn mailbox_state(&self) -> MailboxState {
         self.engine.mailbox.state
+    }
+    /// Optional firmware-authenticated HDMI FreeSync capabilities. Sinks
+    /// without a valid AMD VSDB cause no mailbox access.
+    pub async fn hdmi_freesync_caps(
+        &mut self,
+        edid: &[u8],
+    ) -> Result<Option<crate::amdgpu_freesync::AmdVsdb>, Error> {
+        self.engine.hdmi_freesync_caps(edid).await
     }
     /// Query a native AUX/HPD instance within this generation's channel count.
     pub async fn hpd(&mut self, instance: u8) -> Result<bool, Error> {

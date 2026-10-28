@@ -294,8 +294,10 @@ rejected CS returns an error to Mesa rather than wedging the ring.
 
 ## RX 6000 boot options
 
-Every functionally complete RX 6000 feature is on by default; none has run on
-silicon yet, so each has an off switch for bring-up:
+Every functionally complete RX 6000 feature is on by default. Firmware,
+kernel queue proofs and native modeset programming have executed on the
+RX 6750 XT; a visible native Plasma session remains unverified. Each feature
+has an off switch for bring-up:
 
 | Feature | Default | Off / on |
 | --- | --- | --- |
@@ -333,6 +335,48 @@ canonical name wins. An explicit `rdna2_pg` value takes precedence over
 nothing.
 
 ## RX 6000 software behavior
+
+### Entry-path audit, 2026-10-23
+
+The follow-up [DCN3.0 HDMI audit](NAVI22_HDMI_AUDIT.md) records the selected
+Linux callbacks, missing VTG and progressive-timing initialization, explicit
+DIO routing, and the single-stream MPC output-rate gap. It distinguishes
+register-model evidence from physical sink lock and visible output.
+
+The CachyOS audit follows `fb/src/amdgpu_boot.rs` through the retained RDNA2
+platform, display monitor and first DRM client operations. Linux references
+are the local checkout at `ecd997b0189a`; register fields were compared with
+both DCN 3.0.0 and 3.1.4 headers where the owners are shared. Kernel register
+models establish sequencing and lifetime behavior; they do not establish a
+physical HDMI link or Mesa shader execution on this card.
+
+| Entry / continuation | Native evidence and audit outcome |
+| --- | --- |
+| Preflight, firmware, GMC/GART, doorbells, kernel GFX/compute/SDMA queues | Latest boot completed these stages and their ring/IB proofs. Reviewed readiness gates before client publication; user VMIDs and context switching have separate submission models. |
+| IH delivery, faults, HPD and display interrupts | Native IH proof used polling. Source routing, subscribe-before-enable, acknowledgement and bounded polling fallback are covered by existing models. Physical MSI delivery is unverified. |
+| DMUB, connector detection, HDMI clocks/attributes/SCDC | DMUB started and the Lenovo sink was detected. Compared the timing/PHY/SCDC sequence with Linux. Moved `max_bpc` application before the first modeset. The saved SCDC sample precedes final unblank; it does not establish settled link lock. |
+| HUBP/DPP/MPC activation | Fixed inherited rotation, alignment, alpha/metadata, VMID/stereo state; initialized conversion, color/scaler bypass and line-buffer storage; bypassed an inherited output-gamma LUT. The continuation audit also adds Linux's HUBP power-up ECO/TTU initialization and device-derived fabric geometry. Power brackets preserve inherited requests and release their own request on errors/cancellation. Poisoned-state regressions fail the original code. |
+| Native KMS publication and first client commit | Fixed inherited RDNA4 overlay/modifier capabilities. DCN30 now advertises LINEAR 8888 explicitly, accepts matching GEM framebuffers, resolves atomic placement targets, and retains their pins into presentation. Tests cover publication, ADDFB2, TEST_ONLY, rejection and handoff. |
+| Render completion, copying, page flip and vblank | Fixed missing GEM-source presentation. Retained placements wait on rendering outside OWNER; visible VRAM copies rows and hidden VRAM uses SDMA readback. Tests cover offsets, bounds, format rejection, pins and fence/owner ordering. Existing flip models cover latch, timeout, address order and wrapped frame counts. |
+| Cursor and hotplug / later modeset | Reviewed the existing cursor placement/locking, EDID re-probe and KMS convergence paths and their models. Secondary CRTCs still have no presentation/vblank implementation and remain opt-in. |
+| Post-modeset power saving | Latest boot failed on an all-ones RLC override read after partial writes. The register address matches Linux. Its full-word override operand now follows Linux's RMW, with a fresh running-RLC control probe before accepting all-set data; status and other control reads still fail on all ones. A model reproduces the old rejection and checks the independent loss/halt cases. GFXOFF remains refused because submission has not declared every GC access guarded. Physical power transitions remain unverified. |
+| Recovery, cancellation and device loss | Reviewed terminal recovery ownership, quarantine, generation changes and waiter completion against the existing failure/cancellation models. This does not certify physical mode1 reset. |
+| Optional media and topology | Native VCN degraded to `BootFailed(0)` and topology returned `Readback`; JPEG verified. Topology now checks defined GRBM selector fields while ignoring reserved read bits; a stuck real selector still fails. Native topology and VCN decoding remain unverified. |
+
+The earlier native boot also failed in the dynamic loader before Plasma
+startup. The separate VFS/Btrfs fixes and their private-mmap regression must
+be included in the same production image. Complete software checks and
+package/boot-chain verification precede another hardware attempt; add live
+tracing only where the code audit and models leave a specific question.
+
+The 2026-10-26 VFIO run exposed an additional launcher defect: QEMU's KVM
+`host-phys-bits` passthrough overrode `phys-bits=40`. QMP reported 48 effective
+bits and the RX 6750 XT VRAM BAR near 14 TiB. The launcher now also supplies
+`host-phys-bits-limit=40` (or the caller's explicit width). A disposable KVM
+fixture with 12 GiB RAM and a 16 GiB PCI BAR reproduced the old 48-bit/14-TiB
+layout; the corrected options report 40 bits and place that BAR at 768 GiB.
+This verifies address placement, not visible HDMI. Restart the physical-GPU
+VM to apply the corrected layout; a running VM retains its original options.
 
 Device-info replies report VBIOS memory type/bus width and timestamp frequency,
 common GPU/slot PCIe capabilities, Linux's per-ASIC Infinity Cache sizes, and

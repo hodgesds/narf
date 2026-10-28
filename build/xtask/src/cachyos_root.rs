@@ -53,6 +53,11 @@ pub struct Args {
     #[command(flatten)]
     pub build: super::BuildArgs,
 
+    /// Boot this prebuilt kernel instead of rebuilding the shared target
+    /// artifact. Firmware is still packed from the selected build options.
+    #[arg(long, value_name = "ELF")]
+    pub prebuilt: Option<PathBuf>,
+
     /// Boot `narf.disks=root-rw` (the real root is mounted writable, no
     /// tmpfs overlay) on a fresh scratch copy of the image.
     #[arg(long)]
@@ -236,6 +241,7 @@ fn slow_start_jobs(serial: &str) -> Vec<(String, String)> {
 }
 
 const PANIC_MARKERS: &[&str] = &[
+    "*** CPU EXCEPTION ***",
     "*** KERNEL PANIC ***",
     "panicked at",
     "double fault",
@@ -315,8 +321,36 @@ fn boot_and_login(args: &Args) -> Result<()> {
     super::configure_systemd_pid1_build(&mut build, false);
     super::add_passthrough_firmware(&mut build);
     let root = super::workspace_root()?;
-    let out_dir = super::cargo_build(&build, &root)?;
-    let kernel = out_dir.join(&build.package);
+    let (kernel, out_dir) = match &args.prebuilt {
+        Some(path) => {
+            let kernel = path
+                .canonicalize()
+                .with_context(|| format!("open prebuilt kernel {}", path.display()))?;
+            if !kernel.is_file() {
+                bail!(
+                    "prebuilt kernel is not a regular file: {}",
+                    kernel.display()
+                );
+            }
+            let out_dir = kernel
+                .parent()
+                .context("prebuilt kernel has no parent")?
+                .to_path_buf();
+            (kernel, out_dir)
+        }
+        None => {
+            let out_dir = super::cargo_build(&build, &root)?;
+            (out_dir.join(&build.package), out_dir)
+        }
+    };
+    let digest: String = sha256_file(&kernel)?
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    println!(
+        "xtask cachyos-root-smoke: kernel {} SHA-256 {digest}",
+        kernel.display()
+    );
     // Firmware the display needs before the root mounts (a passed-through
     // GPU) arrives as the initramfs.
     let firmware = super::initramfs_firmware_entries(&build, &root)?;
@@ -641,7 +675,28 @@ fn interactive(
     let _ = reader.join();
     report_start_jobs(&serial);
     println!("\nxtask cachyos-root-smoke: QEMU exited ({status})");
+    interactive_outcome(&serial, status)
+}
+
+fn interactive_outcome(serial: &str, status: std::process::ExitStatus) -> Result<()> {
+    if let Some(marker) = PANIC_MARKERS.iter().find(|marker| serial.contains(*marker)) {
+        bail!("xtask cachyos-root-smoke: guest fatal marker: {marker}");
+    }
+    if !status.success() {
+        bail!("xtask cachyos-root-smoke: QEMU failed ({status})");
+    }
+    if serial.is_empty() {
+        bail!("xtask cachyos-root-smoke: guest exited without serial output");
+    }
     Ok(())
+}
+
+fn report_completion(interactive: bool) {
+    if interactive {
+        println!("xtask cachyos-root-smoke: interactive session ended; boot checks were not run");
+    } else {
+        println!("xtask cachyos-root-smoke: OK");
+    }
 }
 
 /// The bare-metal command line, for the smoke image's UUID.
@@ -943,7 +998,7 @@ pub fn run(args: &Args) -> Result<()> {
         );
     }
     result?;
-    println!("xtask cachyos-root-smoke: OK");
+    report_completion(args.interactive);
     Ok(())
 }
 
@@ -1026,13 +1081,30 @@ fn run_disk(args: &Args, root: &Path, base: &Path) -> Result<()> {
     }
     verdict.map_err(|e| anyhow::anyhow!("xtask cachyos-root-smoke: {e}"))?;
     result?;
-    println!("xtask cachyos-root-smoke: OK");
+    report_completion(args.interactive);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn interactive_guest_failure_cannot_report_success() {
+        use std::os::unix::process::ExitStatusExt;
+        for (serial, code) in [
+            ("*** CPU EXCEPTION ***\nvector: 13", 85),
+            ("*** CPU EXCEPTION ***\nvector: 13", 0),
+            ("NARF booting", 1),
+            ("", 0),
+        ] {
+            assert!(
+                interactive_outcome(serial, std::process::ExitStatus::from_raw(code << 8)).is_err()
+            );
+        }
+        assert!(interactive_outcome("NARF booting", std::process::ExitStatus::from_raw(0)).is_ok());
+    }
 
     #[test]
     fn report_strips_console_escapes() {

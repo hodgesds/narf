@@ -73,8 +73,33 @@ struct Lit {
 }
 /// Light `edid` on HDMI transmitter 3 at `max_bpc`.
 fn light(edid: Vec<u8>, max_bpc: u8, vram: &Vram) -> Result<Lit, &'static str> {
+    light_with(edid, max_bpc, vram, |_| {})
+}
+fn light_with(
+    edid: Vec<u8>,
+    max_bpc: u8,
+    vram: &Vram,
+    prepare: impl FnOnce(&Bench),
+) -> Result<Lit, &'static str> {
+    light_config(
+        edid,
+        crate::amdgpu_dcn30_hdmi::OutputSettings {
+            max_bpc,
+            ..Default::default()
+        },
+        vram,
+        prepare,
+    )
+}
+fn light_config(
+    edid: Vec<u8>,
+    settings: crate::amdgpu_dcn30_hdmi::OutputSettings,
+    vram: &Vram,
+    prepare: impl FnOnce(&Bench),
+) -> Result<Lit, &'static str> {
     let bench = Bench::new();
     bench.set(m::MP1 + 0x274, 1);
+    prepare(&bench);
     let image = m::vbios(7);
     let connector = m::connector(Signal::Hdmi, 3, 3);
     let route = Resources::new().acquire(&connector).map_err(|_| "route")?;
@@ -92,8 +117,7 @@ fn light(edid: Vec<u8>, max_bpc: u8, vram: &Vram) -> Result<Lit, &'static str> {
         hdmi: true,
         dpcd: None,
     };
-    let before = crate::amdgpu_navi48_boot::max_bpc();
-    crate::amdgpu_navi48_boot::set_max_bpc(max_bpc);
+    pipeline.set_hdmi_settings(settings);
     let result = {
         let tables = Tables::new(&image).map_err(|_| "tables")?;
         let links = [connector];
@@ -111,7 +135,6 @@ fn light(edid: Vec<u8>, max_bpc: u8, vram: &Vram) -> Result<Lit, &'static str> {
             )
         })
     };
-    crate::amdgpu_navi48_boot::set_max_bpc(before);
     result.map_err(|_| "enable")?;
     let enabled = bench.writes();
     Ok(Lit {
@@ -129,6 +152,67 @@ fn stop(lit: &mut Lit) -> Result<(), &'static str> {
     run(lit.pipeline.disable(&tables, &mut lit.sink)).map_err(|_| "disable")
 }
 
+fn dcn30_hdmi_progressive_output_retires_stereo_state() -> TestResult {
+    let vram = Vram::new(2 << 20);
+    let e = edid(DTD_640X480, &[vsdb(0, 68)]);
+    let mut lit = match light_with(e, 8, &vram, |b| {
+        b.set(d2(0x1840), 1);
+        b.set(d2(0x1b54), 1 << 24);
+        b.set(d2(0x1b83), 0x1001);
+        b.set(d2(0x1884), 0x8000_3fff);
+        b.set(d2(0x1885), 0x800f_ffff);
+    }) {
+        Ok(lit) => lit,
+        Err(why) => return TestResult::Fail(why),
+    };
+    let clean = lit.bench.get(d2(0x1840)) & 1 == 0
+        && lit.bench.get(d2(0x1b54)) == 0
+        && lit.bench.get(d2(0x1b83)) == 0
+        && lit.bench.get(d2(0x1884)) == 0x8000_0000
+        && lit.bench.get(d2(0x1885)) == 0x8000_0000;
+    if let Err(why) = stop(&mut lit) {
+        return TestResult::Fail(why);
+    }
+    if !clean {
+        return TestResult::Fail("HDMI inherited stereo/frame-packing state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi",
+    dcn30_hdmi_progressive_output_retires_stereo_state
+);
+
+fn dcn30_hdmi_running_link_observes_lock_and_lost_configuration() -> TestResult {
+    let vram = Vram::new(2 << 20);
+    let e = edid(DTD_640X480, &[vsdb(0, 68), hf_vsdb(120, 0x88)]);
+    let mut lit = match light(e, 8, &vram) {
+        Ok(lit) => lit,
+        Err(why) => return TestResult::Fail(why),
+    };
+    lit.sink.regs[0x40] = 15;
+    lit.sink.regs[0x21] = 1;
+    if run(lit.pipeline.hdmi_link_health(&mut lit.sink)) != super::LinkHealth::Locked {
+        return TestResult::Fail("running HDMI did not observe reception");
+    }
+    // The sink went through a power cycle without dropping HPD.
+    lit.sink.regs[0x20] = 0;
+    if run(lit.pipeline.hdmi_link_health(&mut lit.sink)) != super::LinkHealth::ConfigurationLost {
+        return TestResult::Fail("lost TMDS configuration was hidden");
+    }
+    if let Err(why) = stop(&mut lit) {
+        return TestResult::Fail(why);
+    }
+    if run(lit.pipeline.hdmi_link_health(&mut lit.sink)) != super::LinkHealth::Unmonitored {
+        return TestResult::Fail("stopped HDMI stream kept monitoring DDC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi/link",
+    dcn30_hdmi_running_link_observes_lock_and_lost_configuration
+);
+
 fn dcn30_hdmi_modeset_deep_colour_scrambled_with_scdc_in_linux_order() -> TestResult {
     // 640x480 on an HDMI 2.0 sink with DC_36 and LTE_340Mcsc_scramble, at
     // amdgpu.max_bpc=12: 37.755 MHz 12-bpc TMDS, scrambled at the
@@ -145,6 +229,10 @@ fn dcn30_hdmi_modeset_deep_colour_scrambled_with_scdc_in_linux_order() -> TestRe
     // dcn3_get_pix_clk_dividers: 25.17 MHz x 3/2 in 100 Hz; DCCG 3:2 DTO.
     if marker(m::SLOT_PIXEL_CLOCK, 0) != 377_550 || lit.bench.get(d1(0x40)) & 0x30 != 0x20 {
         return TestResult::Fail("12-bpc pixel clock");
+    }
+    let timing = lit.pipeline.output().unwrap().timing;
+    if lit.pipeline.audio_stream(&timing).timing.pixel_clock_khz != 25_170 {
+        return TestResult::Fail("audio pixel clock incorrectly includes deep-colour PLL scale");
     }
     // dcn3_program_pix_clk → dce112_program_pix_clk leaves color_depth 0:
     // set_pixel_clock_v7's deep_color_ratio (PS byte 9) is RATIO_DIS even at
@@ -187,6 +275,18 @@ fn dcn30_hdmi_modeset_deep_colour_scrambled_with_scdc_in_linux_order() -> TestRe
     let status = tx.and_then(|a| pos(&log, a, |w| w.dword == SCDC_READ | 0x20));
     if status.is_none() {
         return TestResult::Fail("SCDC before the transmitter");
+    }
+    // The first sample precedes pixels. A second sample must observe the
+    // final unblank/unlock, rather than treating early zero lock bits as
+    // evidence that the running HDMI link failed.
+    let unlock = status.and_then(|a| {
+        pos(&log, a, |w| {
+            w.dword == d2(0x1b8b + p * 0x80) && w.value == 0
+        })
+    });
+    let settled = unlock.and_then(|a| pos(&log, a, |w| w.dword == SCDC_READ | 0x40));
+    if settled.is_none() {
+        return TestResult::Fail("no settled HDMI sink status after final unlock");
     }
     // Teardown: AVMUTE, legacy TMDS_Config 0, then the transmitter DISABLE.
     if let Err(why) = stop(&mut lit) {
@@ -262,6 +362,10 @@ fn dcn30_hdmi_modeset_ycbcr420_through_otg_fmt_ocsc_and_dpg() -> TestResult {
     let get = |d| lit.bench.get(d);
     if get(MARK + 16 * m::SLOT_PIXEL_CLOCK) != 371_250 || get(d1(0x40)) & 0x30 != 0 {
         return TestResult::Fail("4:2:0 pixel clock");
+    }
+    let timing = lit.pipeline.output().unwrap().timing;
+    if lit.pipeline.audio_stream(&timing).timing.pixel_clock_khz != 37_125 {
+        return TestResult::Fail("4:2:0 audio DTO/ACR uses the unhalved pixel clock");
     }
     // OTG: two pixels per container, set after the timing, before enable.
     let timing = pos(&log, 0, |w| w.dword == d2(0x1b2a + p * 0x80));
@@ -354,4 +458,263 @@ fn dcn30_hdmi_unplug_teardown_sends_legacy_scdc_only_to_scdc_sinks() -> TestResu
 kernel_test_in!(
     "drivers/gpu/dcn30-hdmi",
     dcn30_hdmi_unplug_teardown_sends_legacy_scdc_only_to_scdc_sinks
+);
+
+fn dcn30_hdmi_modeset_y422_hdr_and_live_metadata_update() -> TestResult {
+    use crate::amdgpu_dcn30_hdmi::OutputSettings;
+    use crate::amdgpu_hdr::{
+        ColorFormat, HdrMetadataInfoframe, HdrOutputMetadata, DRM_MODE_COLORIMETRY_BT2020_YCC,
+    };
+    let vram = Vram::new(8 << 20);
+    let mut e = edid(DTD_720P, &[vsdb(0, 68), hf_vsdb(120, 0x80)]);
+    super::cta_byte(&mut e, 131, 0x10);
+    let settings = OutputSettings {
+        max_bpc: 12,
+        color_format: ColorFormat::Ycbcr422,
+        colorspace: DRM_MODE_COLORIMETRY_BT2020_YCC,
+        hdr: Some(HdrOutputMetadata {
+            hdmi_metadata_type1: HdrMetadataInfoframe {
+                eotf: 2,
+                max_cll: 1000,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+    };
+    let mut lit = match light_config(e, settings, &vram, |_| {}) {
+        Ok(l) => l,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if lit.bench.get(d2(0x1840 + lit.pipe * 0x5a)) & 0x2f_0000 != 0x9_0000
+        || lit.bench.get(d2(0x208b + lit.fe * 0x100)) & (1 << 28) == 0
+        || lit.bench.get(d2(0x2093 + lit.fe * 0x100)) & 0x3100_0000 != 0x2000_0000
+        || lit.bench.get(d3(0x59a + lit.pipe * 0xd)) != 0xf149_1000
+    {
+        return TestResult::Fail("422/HDR format stages");
+    }
+    let before = lit.bench.writes();
+    let mut next = settings;
+    next.hdr.as_mut().unwrap().hdmi_metadata_type1.max_cll = 2000;
+    if run(lit.pipeline.update_hdmi_metadata(next)).is_err()
+        || lit
+            .pipeline
+            .hdmi_output()
+            .and_then(|s| s.hdr)
+            .is_none_or(|p| p[27..29] != 2000u16.to_le_bytes())
+    {
+        return TestResult::Fail("live HDR metadata update");
+    }
+    let log = lit.bench.log();
+    if log[before..]
+        .iter()
+        .any(|w| w.dword & 0xf000_0000 != 0 || w.dword == d2(0x1b41 + lit.pipe * 0x80))
+        || !log[before..]
+            .iter()
+            .any(|w| w.dword == d2(0x2069 + lit.fe * 0x100) && w.value == 0x001a_0187)
+    {
+        return TestResult::Fail("metadata-only update retrained or missed HDR packet RAM");
+    }
+    let before = lit.bench.writes();
+    if run(lit
+        .pipeline
+        .update_hdmi_metadata(OutputSettings { hdr: None, ..next }))
+    .is_ok()
+        || before != lit.bench.writes()
+    {
+        return TestResult::Fail("HDR disable bypassed modeset");
+    }
+    if let Err(why) = stop(&mut lit) {
+        return TestResult::Fail(why);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi",
+    dcn30_hdmi_modeset_y422_hdr_and_live_metadata_update
+);
+
+fn dcn30_hdmi_freesync_timing_packet_and_metadata_share_one_live_stream() -> TestResult {
+    use crate::amdgpu_dcn30_hdmi::OutputSettings;
+    use crate::amdgpu_freesync::AmdVsdb;
+    use crate::amdgpu_hdr::{HdrMetadataInfoframe, HdrOutputMetadata};
+    let vram = Vram::new(8 << 20);
+    let settings = OutputSettings {
+        max_bpc: 8,
+        hdr: Some(HdrOutputMetadata {
+            hdmi_metadata_type1: HdrMetadataInfoframe {
+                eotf: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let e = edid(DTD_720P, &[vsdb(0, 68)]);
+    let mut lit = match light_config(e, settings, &vram, |_| {}) {
+        Ok(l) => l,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let caps = AmdVsdb {
+        version: 1,
+        min_hz: 40,
+        max_hz: 75,
+        vcp_code: 0,
+    };
+    let bounds = match run(lit.pipeline.configure_hdmi_vrr(Some(caps), true)) {
+        Ok(Some(bounds)) => bounds,
+        _ => return TestResult::Fail("FreeSync enable"),
+    };
+    if bounds.v_total_min != 750
+        || bounds.v_total_max != 1125
+        || lit.bench.get(d2(0x1b31 + lit.pipe * 0x80)) != 1124
+        || lit.bench.get(d2(0x1b33 + lit.pipe * 0x80)) & 0xffff_ff9f != 0x0002_0003
+        || lit
+            .pipeline
+            .hdmi_output()
+            .and_then(|s| s.spd)
+            .is_none_or(|p| p[10] != 7 || p[11] != 40 || p[12] != 60)
+    {
+        return TestResult::Fail("FreeSync timing/packet range disagreement");
+    }
+    let mut metadata = settings;
+    metadata.hdr.as_mut().unwrap().hdmi_metadata_type1.max_cll = 1000;
+    if run(lit.pipeline.update_hdmi_metadata(metadata)).is_err()
+        || lit
+            .pipeline
+            .hdmi_output()
+            .and_then(|s| s.spd)
+            .is_none_or(|p| p[10] != 7)
+    {
+        return TestResult::Fail("HDR update retired active FreeSync SPD");
+    }
+    if run(lit.pipeline.configure_hdmi_vrr(Some(caps), false)) != Ok(None)
+        || lit.bench.get(d2(0x1b31 + lit.pipe * 0x80)) != 749
+        || lit.bench.get(d2(0x1b33 + lit.pipe * 0x80)) & 0xffff_ff9f != 0
+        || lit
+            .pipeline
+            .hdmi_output()
+            .and_then(|s| s.spd)
+            .is_none_or(|p| p[10] != 1 || p[11] != 60)
+    {
+        return TestResult::Fail("FreeSync disable left variable timing or enabled packet flags");
+    }
+    let writes = lit.bench.writes();
+    if run(lit.pipeline.configure_hdmi_vrr(Some(caps), false)).is_err()
+        || lit.bench.writes() != writes
+    {
+        return TestResult::Fail("unchanged FreeSync state reprogrammed hardware");
+    }
+    if run(lit.pipeline.configure_hdmi_vrr(None, false)).is_err()
+        || lit.pipeline.hdmi_output().and_then(|s| s.spd).is_some()
+    {
+        return TestResult::Fail("departed FreeSync capability kept vendor SPD");
+    }
+    if let Err(why) = stop(&mut lit) {
+        return TestResult::Fail(why);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi",
+    dcn30_hdmi_freesync_timing_packet_and_metadata_share_one_live_stream
+);
+
+/// 1280x720 CEA geometry at 371.25 MHz (5x 720p60): a scrambled stream
+/// whose surface stays small enough for the model's VRAM.
+const DTD_720P_371: [u8; 18] = [
+    0x05, 0x91, 0x00, 0x72, 0x51, 0xd0, 0x1e, 0x20, 0x6e, 0x28, 0x55, 0x00, 0, 0, 0, 0, 0, 0x1e,
+];
+
+fn dcn30_hdmi_odm_stream_halves_otg_pixel_clock() -> TestResult {
+    let vram = Vram::new(8 << 20);
+    let e = edid(DTD_720P_371, &[vsdb(0, 68), hf_vsdb(120, 0x88)]);
+    // DISPCLK capped at 350 MHz: DML30 needs both pipes for 371.25 MHz.
+    let mut lit = match light_with(e, 8, &vram, |b| b.display_cap(350)) {
+        Ok(l) => l,
+        Err(why) => return TestResult::Fail(why),
+    };
+    let p = lit.pipe;
+    let marker = |slot: u32, i: u32| lit.bench.get(MARK + 16 * slot + i);
+    let Some([(left, 0, 640), (5, 640, 640)]) = lit.pipeline.odm_pipes() else {
+        return TestResult::Fail("no ODM 2:1 slices under a 350 MHz DISPCLK cap");
+    };
+    if u32::from(left) != p {
+        return TestResult::Fail("ODM master is not the route's pipe");
+    }
+    // get_pixel_clock_parameters halves the PLL target for the OTG's two
+    // pixels per clock; the transmitter keeps the character rate.
+    if marker(m::SLOT_PIXEL_CLOCK, 0) != 1_856_250 {
+        return TestResult::Fail("SetPixelClock not at the halved OTG rate");
+    }
+    if marker(m::SLOT_TRANSMITTER, 1) != 37_125 {
+        return TestResult::Fail("transmitter not at the TMDS character rate");
+    }
+    // optc3_set_odm_combine survives the HDMI format stages: both OPPs as
+    // segments, 640-wide, H timing divided by two.
+    if lit.bench.get(d2(0x1acb + p * 0x10)) != 1 | p << 8 | 5 << 12
+        || lit.bench.get(d2(0x1ace + p * 0x10)) & 0x1fff != 640
+        || lit.bench.get(d2(0x1b2e + p * 0x80)) & 0x3 != 1
+    {
+        return TestResult::Fail("ODM combine lost after HDMI format");
+    }
+    // The right half: HUBP 5 on the master's VTG from x 640, OPP 5 at the
+    // slice size, MPCC 5 into OPP 5.
+    if (lit.bench.get(d2(0x5f3 + 5 * 0xdc)) >> 4) & 0xf != p
+        || lit.bench.get(d2(0x5e9 + 5 * 0xdc)) != 640
+        || lit.bench.get(d2(0x1856 + 5 * 0x5a)) != 720 | 640 << 16
+        || lit.bench.get(d2(0x1856 + p * 0x5a)) != 720 | 640 << 16
+        || lit.bench.get(d3(0x580 + 5 * 4)) & 0xf != 5
+    {
+        return TestResult::Fail("ODM slice front end");
+    }
+    // opp_program_fmt and the output CSC on both ODM OPPs.
+    let fmt = |pipe: u32, reg: u32| lit.bench.get(d2(reg + pipe * 0x5a));
+    let csc = |pipe: u32, reg: u32| lit.bench.get(d3(reg + pipe * 0xd));
+    if fmt(p, 0x1841) != fmt(5, 0x1841)
+        || fmt(p, 0x1845) != fmt(5, 0x1845)
+        || csc(p, 0x599) != csc(5, 0x599)
+        || csc(p, 0x59a) != csc(5, 0x59a)
+        || csc(5, 0x599) != 1
+    {
+        return TestResult::Fail("slice OPP format differs from the master's");
+    }
+    if let Err(why) = stop(&mut lit) {
+        return TestResult::Fail(why);
+    }
+    // optc3_set_odm_bypass after the OTG stops.
+    if lit.bench.get(d2(0x1acb + p * 0x10)) & 0x3 != 0
+        || lit.bench.get(d2(0x1b2e + p * 0x80)) & 0x3 != 0
+    {
+        return TestResult::Fail("ODM bypass not restored on stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi",
+    dcn30_hdmi_odm_stream_halves_otg_pixel_clock
+);
+
+fn dcn30_hdmi_above_340mhz_stays_on_one_pipe_when_dispclk_allows() -> TestResult {
+    // Working Linux lights this board's 533.25 MHz 4K60 on one OTG and OPP
+    // at the full pixel clock (its two HUBPs are an MPC split): above
+    // 340 MHz alone is no reason to divide the OTG.
+    let vram = Vram::new(8 << 20);
+    let e = edid(DTD_720P_371, &[vsdb(0, 68), hf_vsdb(120, 0x88)]);
+    let mut lit = match light(e, 8, &vram) {
+        Ok(l) => l,
+        Err(why) => return TestResult::Fail(why),
+    };
+    if lit.pipeline.odm_pipes().is_some()
+        || lit.bench.get(MARK + 16 * m::SLOT_PIXEL_CLOCK) != 3_712_500
+    {
+        return TestResult::Fail("a stream one pipe carries was split");
+    }
+    if let Err(why) = stop(&mut lit) {
+        return TestResult::Fail(why);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-hdmi",
+    dcn30_hdmi_above_340mhz_stays_on_one_pipe_when_dispclk_allows
 );

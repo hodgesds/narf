@@ -79,8 +79,6 @@
 //! DMA-coherent allocations come from a kernel-minted shared frame
 //! pool. Per spec: see `drivers/runtime/src/lib.rs`.
 
-use core::sync::atomic::{compiler_fence, Ordering};
-
 use alloc::vec::Vec;
 use narf_capabilities::{CapError, CapOp};
 use narf_driver_runtime::{
@@ -88,6 +86,9 @@ use narf_driver_runtime::{
 };
 
 use crate::amdgpu_discovery::{self, IpBlock};
+
+#[path = "amdgpu_index.rs"]
+mod index;
 
 // ── Vendor + device ids ────────────────────────────────────────────
 
@@ -178,8 +179,6 @@ const BAR_REGS: u8 = 5;
 // reached through `MM_INDEX` (write the register address, then
 // read/write `MM_DATA`). All offsets below are in BAR5.
 
-/// `MM_INDEX` — register-window address latch. Write a 32-bit
-/// register-bus address here, then access `MM_DATA`.
 /// `mmRCC_CONFIG_MEMSIZE` — the VRAM size in MiB, as an ABSOLUTE dword
 /// address with no IP base.
 ///
@@ -190,7 +189,6 @@ const BAR_REGS: u8 = 5;
 /// base exists.
 pub(crate) const RCC_CONFIG_MEMSIZE: u32 = 0x0de3;
 
-const MM_INDEX: u64 = 0x0000;
 /// `MM_DATA` — register-window data port.
 const MM_DATA: u64 = 0x0004;
 
@@ -879,43 +877,51 @@ impl AmdGpu {
             return Err(AmdgpuError::UnknownAsic);
         }
         // SAFETY: caller-authority over BAR0 + BAR5.
-        let fb_bar = unsafe { map_bar(device, BAR_FB) }.map_err(|_| AmdgpuError::BarMapFailed)?;
+        let fb_bar = unsafe { map_bar(device, BAR_FB) }.map_err(|error| {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: {:04x}:{:04x} BAR{BAR_FB} mapping failed: {error:?}",
+                device.id.vendor,
+                device.id.device,
+            );
+            AmdgpuError::BarMapFailed
+        })?;
         // SAFETY: caller-authority over BAR0 + BAR5 (the `bring_up` contract);
         // `BAR_REGS` selects the MMIO register BAR which the caller owns
         // exclusively for the duration of probe.
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        let regs = unsafe { map_bar(device, BAR_REGS) }.map_err(|_| AmdgpuError::BarMapFailed)?;
+        let regs = unsafe { map_bar(device, BAR_REGS) }.map_err(|error| {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: {:04x}:{:04x} BAR{BAR_REGS} mapping failed: {error:?}",
+                device.id.vendor,
+                device.id.device,
+            );
+            AmdgpuError::BarMapFailed
+        })?;
 
-        if regs.len < MM_INDEX + 4 {
+        if regs.len < MM_DATA + 4 {
             return Err(AmdgpuError::BarMapFailed);
         }
         cap.invoke(ProbeOp(|| {
-            // Presence test: MM_INDEX is read/write; write a sentinel,
-            // read it back, restore. A wedged controller reads
-            // 0xFFFFFFFF or fails to round-trip.
-            // SAFETY: identity-mapped MMIO; MM_INDEX is a register
-            // latch with no side effects when the data port isn't
-            // touched.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            let prev = unsafe { regs.read32(MM_INDEX) };
-            if prev == 0xFFFF_FFFF {
+            // SAFETY: probe exclusively owns a live BAR5 mapping of at
+            // least eight bytes, under the current PCI capability.
+            if let Err(error) = unsafe { index::probe(&regs) } {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: {:04x}:{:04x} MM_INDEX probe failed: {error:x?}; expected={:#010x} (BAR{BAR_REGS} phys={:#x} virt={:#x} len={:#x})",
+                    device.id.vendor,
+                    device.id.device,
+                    index::PROBE_ADDRESS,
+                    regs.phys.raw(),
+                    regs.virt,
+                    regs.len,
+                );
                 return Err(AmdgpuError::DeviceGone);
             }
-            // SAFETY: same.
-            unsafe {
-                regs.write32(MM_INDEX, 0xCAFE_F00D);
-            }
-            compiler_fence(Ordering::SeqCst);
-            // SAFETY: same.
-            let echo = unsafe { regs.read32(MM_INDEX) };
-            // SAFETY: restore prior value.
-            unsafe {
-                regs.write32(MM_INDEX, prev);
-            }
-            if echo != 0xCAFE_F00D {
-                return Err(AmdgpuError::DeviceGone);
-            }
-
             Ok(())
         }))
         .map_err(|_| AmdgpuError::DeviceGone)??;
@@ -1109,14 +1115,14 @@ impl AmdGpu {
     }
 
     /// Resolve a `(byte offset, GC window)` register location to the dword
-    /// address MM_INDEX wants.
+    /// register ID the indexed helpers accept.
     ///
     /// Two conversions happen here and nowhere else. `amdgpu_gfx`'s `*_REL`
     /// constants are BYTE offsets — that module's own callers reach registers
     /// through a directly mapped window and scale with `<< 2` — while
-    /// [`mm_read`] and [`mm_write`] go through MM_INDEX, a DWORD port. And the
-    /// window comes from the register, so it indexes `base_addrs` rather than
-    /// defaulting to 0.
+    /// [`mm_read`] and [`mm_write`] accept DWORD register IDs and scale them
+    /// for the byte-addressed MM_INDEX port. The register selects its window
+    /// in `base_addrs` rather than always using window 0.
     ///
     /// `None` when discovery did not publish that window: a caller must not
     /// fall back to window 0.
@@ -1229,7 +1235,7 @@ impl AmdGpu {
     /// than touching hardware, so the whole sequence is inspectable without a
     /// GPU. Nothing executed it. This does, through the same `CpFwMmio`
     /// adapter the firmware load uses — which is where the sequence's **byte**
-    /// offsets become the dword addresses MM_INDEX wants.
+    /// offsets become the DWORD register IDs the indexed helpers accept.
     ///
     /// # Safety
     /// Caller owns BAR5 exclusively for the whole sequence: MM_INDEX is a
@@ -1393,7 +1399,7 @@ impl AmdGpu {
     /// described as "OTG H_TOTAL / V_TOTAL register-bus offsets per the public
     /// DCN1+ register map". No DCN header defines anything in that range;
     /// `regOTG0_OTG_H_TOTAL` is dword 0x1b2a. They were also used with no DCN
-    /// base and through MM_INDEX, which takes a dword address, so the reads
+    /// base and the indexed helpers, which accept DWORD register IDs, so the reads
     /// landed on four unrelated registers. The derivation on top was wrong
     /// too: `h_active` came out as `h_total - (blank_end - blank_start)`, but
     /// `optc1_program_timing` writes `OTG_H_BLANK_END` BELOW
@@ -1859,7 +1865,7 @@ impl AmdGpu {
         // value this driver chooses.
         // SAFETY: caller-asserted BAR5 ownership; the register is inside the
         // DCN window `ip_block_base` resolved.
-        // `mm_read`/`mm_write` drive MM_INDEX, which takes a **dword**
+        // `mm_read`/`mm_write` drive the helpers, which accept a **dword**
         // register address — `reg_offset[IP][inst][BASE_IDX] + dword_id`, the
         // same sum `SOC15_REG_OFFSET` forms. `ip_block_base` returns that
         // dword base straight out of the discovery blob, so the dword id is
@@ -2017,7 +2023,7 @@ pub struct MultiFwReport {
 /// Adapter that implements `CpFwMmio` over MM_INDEX / MM_DATA.
 ///
 /// `CpFwMmio` hands out `(base + dword_id) << 2`, a byte offset into a
-/// directly mapped window. MM_INDEX is a dword port, so this shifts it back —
+/// directly mapped window. The helper API accepts DWORD IDs, so this shifts back —
 /// the one place in the driver where the two conventions meet, rather than at
 /// every call site.
 struct CpRegsAdapter<'a> {
@@ -2065,29 +2071,72 @@ impl<'a> crate::amdgpu_smu::SmuMmio for SmuRegsAdapter<'a> {
 /// exclusive ownership of the register window for the duration
 /// of the read (MM_INDEX is a shared latch).
 unsafe fn mm_read(regs: &MmioRegion, addr: u32) -> u32 {
-    // SAFETY: caller-asserted ownership.
-    unsafe {
-        regs.write32(MM_INDEX, addr);
-    }
-    compiler_fence(Ordering::SeqCst);
-    // SAFETY: same.
-    unsafe { regs.read32(MM_DATA) }
+    // SAFETY: caller owns the live >=8-byte BAR5 mapping and its index
+    // latch under PCI authority. The helper converts DWORD IDs to bytes.
+    unsafe { index::read(regs, addr) }
 }
 
-/// Indexed register write.
-///
-/// # Safety
-/// Same as `mm_read`.
 /// Convert one of `amdgpu_gfx`/`amdgpu_cp_fw`'s byte-offset `*_REL` constants
-/// into the dword address MM_INDEX wants.
+/// into the dword register ID the indexed helpers accept.
 ///
 /// The driver carries both conventions on purpose: a module that owns a
-/// directly mapped register window indexes it in bytes, while MM_INDEX is a
-/// dword port. Mixing them silently addresses a register four times further
-/// in, which is what [`AmdGpu::write_grbm_gfx_index`] and
+/// directly mapped register window indexes it in bytes, while the indexed
+/// helpers accept DWORD register IDs. Mixing them addresses a register four
+/// times further in, which is what [`AmdGpu::write_grbm_gfx_index`] and
 /// [`AmdGpu::read_grbm_status`] were doing.
 pub(crate) const fn mm_dword(rel_bytes: u32) -> u32 {
     rel_bytes / 4
+}
+
+/// Establish wall-time conversions before the discrete firmware handoff.
+/// Its initcall precedes frame's HPET/timer setup; using the identity scale
+/// there makes both minimum delays and timeouts too short on a >1 GHz TSC.
+pub(crate) fn boot_clock_ready() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (mut hz, mut source) = narf_time::calibrate_clocks_with_source();
+        if hz == 0 && !narf_time::hpet::is_present() {
+            // KVM can mask CPUID frequency leaves and AMD P-state MSRs.
+            // This handoff precedes frame's HPET/IRQ timer setup. Borrow
+            // only the counter for calibration; do not publish a virtual
+            // base as the physical address frame must map later.
+            let phys = narf_time::hpet::base_phys_for_ioremap();
+            // SAFETY: exclusive boot-time clock setup; this is the same
+            // platform HPET window used by frame's later timer installation.
+            if let Ok(mapping) = unsafe {
+                narf_memory::ioremap::ioremap(phys, 0x1000, narf_memory::ioremap::MmioAttrs::Device)
+            } {
+                // SAFETY: permanent device mapping, before IRQ timer setup;
+                // no other CPU or HPET owner accesses the counter here.
+                if let Some(measured) = unsafe { narf_time::hpet::calibrate_tsc_at(mapping.virt) }
+                    .filter(|hz| (1_000_000_000..=6_500_000_000).contains(hz))
+                {
+                    narf_arch::x86_64::tsc::set_hz_via_hpet(measured);
+                    // Installs both wall-time conversion directions from
+                    // the measured cache, before any firmware delay.
+                    hz = narf_time::calibrate_clocks_with_source().0;
+                    source = narf_time::CalibrationSource::HpetXcheck;
+                }
+            }
+        }
+        if hz == 0 {
+            return false;
+        }
+        // Stamp the existing per-stage checkpoints only after their clock
+        // reports real ns. Frame's later installation uses the same scale.
+        narf_console::klog::set_clock(narf_time::monotonic_ns);
+        use core::fmt::Write;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: boot clock calibrated to {hz} Hz via {}",
+            source.name()
+        );
+        true
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        true
+    }
 }
 
 /// Busy-wait `us` microseconds of wall-clock time.
@@ -2108,16 +2157,13 @@ fn delay_us(us: u32) {
     }
 }
 
+/// Indexed register write of a DWORD register ID.
+///
+/// # Safety
+/// Same mapping, latch ownership and PCI authority contract as `mm_read`.
 pub(crate) unsafe fn mm_write(regs: &MmioRegion, addr: u32, value: u32) {
-    // SAFETY: caller-asserted ownership.
-    unsafe {
-        regs.write32(MM_INDEX, addr);
-    }
-    compiler_fence(Ordering::SeqCst);
-    // SAFETY: same.
-    unsafe {
-        regs.write32(MM_DATA, value);
-    }
+    // SAFETY: same mapping, latch ownership and PCI authority as mm_read.
+    unsafe { index::write(regs, addr, value) }
 }
 
 /// Read the absolute VRAM-size register through BAR5's direct register window.
@@ -2340,11 +2386,29 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             | narf_bus::pci::cmd::BUS_MASTER
             | narf_bus::pci::cmd::INTX_DISABLE,
     )
-    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    .map_err(|error| {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: {:04x}:{:04x} enabling PCI command failed: {error:?}",
+            device.id.vendor,
+            device.id.device,
+        );
+        narf_bus::ProbeError::BadDevice
+    })?;
     // SAFETY: caller-authority.
     let mut dev = match unsafe { AmdGpu::bring_up(&device, &cap) } {
         Ok(d) => d,
-        Err(_) => return Err(narf_bus::ProbeError::BadDevice),
+        Err(error) => {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: {:04x}:{:04x} bring-up failed: {error:?}",
+                device.id.vendor,
+                device.id.device,
+            );
+            return Err(narf_bus::ProbeError::BadDevice);
+        }
     };
     // SAFETY: probe owns the GPU mappings; boot ACPI tables remain mapped.
     let vbios = unsafe { crate::amdgpu_vbios::discover(&dev, &device, &cap) };

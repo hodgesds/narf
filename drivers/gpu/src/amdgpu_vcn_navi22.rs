@@ -137,6 +137,7 @@ pub(crate) mod regs {
     /// nbio_2_3_offset.h / nbio_v2_3.c, NBIO BASE_IDX 2.
     // linux-ctx: hdr=nbio seg=2
     pub const NBIO_DOORBELL_APER_EN: u32 = 0x0c0; // linux: mmRCC_DEV0_EPF0_RCC_DOORBELL_APER_EN
+    pub const NBIO_CONFIG_MEMSIZE: u32 = 0x0c3; // linux: mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
     /// linux: mmBIF_MMSCH0_DOORBELL_RANGE; mmBIF_MMSCH1_DOORBELL_RANGE
     pub const NBIO_MMSCH_DOORBELL_RANGE: [u32; 2] = [0x1d3, 0x1d8];
     pub const LAST_NBIO: u32 = 0x1d8; // linux: mmBIF_MMSCH1_DOORBELL_RANGE
@@ -486,7 +487,15 @@ impl Io for Mmio {
     fn read(&mut self, address: u64) -> u32 {
         // SAFETY: Layout bounds every VCN/GC/NBIO/HDP bank inside BAR5 and
         // this exclusive owner only calls this inside live PCI authority.
-        unsafe { self.regs.read32(address) }
+        let value = unsafe { self.regs.read32(address) };
+        if value == u32::MAX {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: VCN MMIO {address:#x} returned all ones"
+            );
+        }
+        value
     }
     fn write(&mut self, address: u64, value: u32) {
         // SAFETY: same bounded exclusive register mapping and authority.
@@ -529,6 +538,30 @@ fn update<I: Io>(io: &mut I, address: u64, mask: u32, value: u32) -> Result<(), 
     io.write(address, (old & !mask) | (value & mask));
     Ok(())
 }
+/// Linux uses WREG32_P for VCPU_CNTL, preserving all unselected bits even
+/// when the register reads all ones. That control word alone cannot prove
+/// removal: verify NBIO's memory-size and aperture registers before accepting
+/// it. GC registers themselves can return all ones while GFXOFF is active.
+fn update_vcpu<I: Io>(
+    io: &mut I,
+    layout: Layout,
+    instance: usize,
+    mask: u32,
+    value: u32,
+) -> Result<(), Error> {
+    let address = layout.reg(instance, VCPU_CNTL);
+    let old = io.read(address);
+    if old == u32::MAX {
+        if checked(io.read(layout.nbio(NBIO_CONFIG_MEMSIZE)))? == 0 {
+            return Err(Error::Invalid);
+        }
+        if checked(io.read(layout.nbio(NBIO_DOORBELL_APER_EN)))? & 1 == 0 {
+            return Err(Error::Invalid);
+        }
+    }
+    io.write(address, (old & !mask) | (value & mask));
+    Ok(())
+}
 async fn delay(us: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_us(us).as_instant()).await;
 }
@@ -537,7 +570,7 @@ fn flush<I: Io>(io: &mut I, l: Layout) {
     barrier(Ordering::SeqCst);
     // linux: n/a (MMIO_REG_HOLE_OFFSET write, amdgpu_hdp_generic_flush)
     io.write(0x7f000, 0);
-    io.read(l.nbio + 0xc3 * 4); // linux-lit: 0xc3=mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
+    io.read(l.nbio(NBIO_CONFIG_MEMSIZE));
     barrier(Ordering::SeqCst);
 }
 /// HDP read-cache invalidate before the CPU samples engine writes.
@@ -1019,7 +1052,9 @@ impl<I: Io> Engine<I> {
         let r = move |l: Layout, reg: Reg| l.reg(i, reg);
         // vcn_v3_0_disable_static_power_gating, !AMD_PG_SUPPORT_VCN branch.
         self.hw.access(|io, l| {
-            checked(io.read(r(l, STATUS)))?;
+            // UVD_STATUS belongs to the gated domain. Like vcn_v3_0_start,
+            // power the tiles first; GC and NBIO liveness were checked before
+            // reaching here. A gated status read is not proof of device loss.
             io.write(r(l, PGFSM_CONFIG), PGFSM_ALL_ON);
             Ok(())
         })?;
@@ -1055,7 +1090,7 @@ impl<I: Io> Engine<I> {
             )?;
             update(io, r(l, SUVD_CGC_CTRL), SUVD_CGC_CTRL_MODES, 0)?;
             // enable VCPU clock, disable master interrupt, LMI channels on
-            update(io, r(l, VCPU_CNTL), VCPU_CLK_EN, VCPU_CLK_EN)?;
+            update_vcpu(io, l, i, VCPU_CLK_EN, VCPU_CLK_EN)?;
             update(io, r(l, MASTINT_EN), MASTINT_VCPU_EN, 0)?;
             update(io, r(l, LMI_CTRL2), LMI_CTRL2_STALL_ARB_UMC, 0)?;
             update(io, r(l, SOFT_RESET), SOFT_RESET_LMI | SOFT_RESET_LMI_UMC, 0)?;
@@ -1097,7 +1132,7 @@ impl<I: Io> Engine<I> {
             io.write(r(l, GFX10_ADDR_CONFIG), gb_addr_config);
             // unblock VCPU register access, release VCPU reset to boot
             update(io, r(l, RB_ARB_CTRL), RB_ARB_VCPU_DIS, 0)?;
-            update(io, r(l, VCPU_CNTL), VCPU_BLK_RST, 0)?;
+            update_vcpu(io, l, i, VCPU_BLK_RST, 0)?;
             Ok(())
         })?;
         let attempt = self.boot_vcpu(i).await?;
@@ -1117,10 +1152,10 @@ impl<I: Io> Engine<I> {
             }
             // "decode not responding, trying to reset the VCPU"
             self.hw
-                .access(|io, l| update(io, l.reg(i, VCPU_CNTL), VCPU_BLK_RST, VCPU_BLK_RST))?;
+                .access(|io, l| update_vcpu(io, l, i, VCPU_BLK_RST, VCPU_BLK_RST))?;
             delay(t.reset_us).await;
             self.hw
-                .access(|io, l| update(io, l.reg(i, VCPU_CNTL), VCPU_BLK_RST, 0))?;
+                .access(|io, l| update_vcpu(io, l, i, VCPU_BLK_RST, 0))?;
             delay(t.reset_us).await;
         }
         Err(Error::BootFailed(i as u8))
@@ -1384,8 +1419,8 @@ impl<I: Io> Engine<I> {
             self.hw.access(|io, l| {
                 let r = |x: Reg| reg(l, x);
                 update(io, r(RB_ARB_CTRL), RB_ARB_VCPU_DIS, RB_ARB_VCPU_DIS)?;
-                update(io, r(VCPU_CNTL), VCPU_BLK_RST, VCPU_BLK_RST)?;
-                update(io, r(VCPU_CNTL), VCPU_CLK_EN, 0)?;
+                update_vcpu(io, l, i, VCPU_BLK_RST, VCPU_BLK_RST)?;
+                update_vcpu(io, l, i, VCPU_CLK_EN, 0)?;
                 update(io, r(SOFT_RESET), SOFT_RESET_LMI_UMC, SOFT_RESET_LMI_UMC)?;
                 update(io, r(SOFT_RESET), SOFT_RESET_LMI, SOFT_RESET_LMI)?;
                 io.write(r(STATUS), 0);

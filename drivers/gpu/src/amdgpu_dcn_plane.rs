@@ -21,10 +21,19 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 // linux-ctx: hdr=dcn seg=2
 const DPP_CONTROL: u64 = 0x0cc5; // linux: mmDPP_TOP0_DPP_CONTROL
 const CNVC_SURFACE_PIXEL_FORMAT: u64 = 0x0ccf; // linux: mmCNVC_CFG0_CNVC_SURFACE_PIXEL_FORMAT
+const FORMAT_CONTROL: u64 = 0x0cd0; // linux: mmCNVC_CFG0_FORMAT_CONTROL
+const PRE_DEALPHA: u64 = 0x0cde; // linux: mmCNVC_CFG0_PRE_DEALPHA
+const PRE_DEGAM: u64 = 0x0ced; // linux: mmCNVC_CFG0_PRE_DEGAM
+const PRE_REALPHA: u64 = 0x0cee; // linux: mmCNVC_CFG0_PRE_REALPHA
+const CM_CONTROL: u64 = 0x0d20; // linux: mmCM0_CM_CONTROL
 const SCL_MODE: u64 = 0x0cfb; // linux: mmDSCL0_SCL_MODE
+const DSCL_CONTROL: u64 = 0x0cfd; // linux: mmDSCL0_DSCL_CONTROL
+const DSCL_AUTOCAL: u64 = 0x0d0c; // linux: mmDSCL0_DSCL_AUTOCAL
 const RECOUT_START: u64 = 0x0d11; // linux: mmDSCL0_RECOUT_START
 const RECOUT_SIZE: u64 = 0x0d12; // linux: mmDSCL0_RECOUT_SIZE
 const MPC_SIZE: u64 = 0x0d13; // linux: mmDSCL0_MPC_SIZE
+const LB_DATA_FORMAT: u64 = 0x0d14; // linux: mmDSCL0_LB_DATA_FORMAT
+const LB_MEMORY_CTRL: u64 = 0x0d15; // linux: mmDSCL0_LB_MEMORY_CTRL
 const DPP_STRIDE: u64 = 0x16b; // linux: mmDPP_TOP1_DPP_CONTROL - mmDPP_TOP0_DPP_CONTROL
                                // OPP block (base index 2): FMT stride 0x5a, shared by DPG and OPP_PIPE.
 const FMT_CONTROL: u64 = 0x1840; // linux: mmFMT0_FMT_CONTROL
@@ -43,12 +52,17 @@ const MPCC_BOT_SEL: u64 = 0x0001; // linux: mmMPCC0_MPCC_BOT_SEL
 const MPCC_OPP_ID: u64 = 0x0002; // linux: mmMPCC0_MPCC_OPP_ID
 const MPCC_CONTROL: u64 = 0x0003; // linux: mmMPCC0_MPCC_CONTROL
 const MPCC_STRIDE: u64 = 0x20; // linux: mmMPCC1_MPCC_TOP_SEL - mmMPCC0_MPCC_TOP_SEL
+const MPCC_OGAM_CONTROL: u64 = 0x0100; // linux: mmMPCC_OGAM0_MPCC_OGAM_CONTROL
+const MPCC_GAMUT_REMAP_MODE: u64 = 0x014b; // linux: mmMPCC_OGAM0_MPCC_GAMUT_REMAP_MODE
+const OGAM_STRIDE: u64 = 0x80; // linux: mmMPCC_OGAM1_MPCC_OGAM_CONTROL - mmMPCC_OGAM0_MPCC_OGAM_CONTROL
+const MPC_RMU_CONTROL: u64 = 0x0680; // linux: mmMPC_RMU_CONTROL
+static RMU_MUX_LOCK: narf_lib::sync::IrqSafeSpinLock<()> = narf_lib::sync::IrqSafeSpinLock::new(());
 const MPC_OUT_MUX: u64 = 0x0580; // linux: mmMPC_OUT0_MUX
 const MPC_OUT_STRIDE: u64 = 4; // linux: mmMPC_OUT1_MUX - mmMPC_OUT0_MUX
                                // linux-ctx: hdr=dcn
 
 #[cfg(feature = "kernel-test")]
-const DPP_LAST_REG: u32 = (MPC_SIZE + 3 * DPP_STRIDE) as u32; // linux: n/a (test-only bank bound)
+const DPP_LAST_REG: u32 = (CM_CONTROL + 3 * DPP_STRIDE) as u32; // linux: n/a (test-only bank bound)
 #[cfg(feature = "kernel-test")]
 // linux: n/a (test-only bank bound)
 const OPP_LAST_REG: u32 = (OPP_PIPE_CONTROL + 3 * OPP_STRIDE) as u32;
@@ -249,8 +263,45 @@ impl<I: Io> Block<I> {
         // linux-lit: 4=DPP_TOP0_DPP_CONTROL__DPP_CLOCK_ENABLE__SHIFT
         self.update(reg, 1 << 4, 1 << 4)?;
         let reg = self.dpp(CNVC_SURFACE_PIXEL_FORMAT);
-        // linux-lit: 0x7f=CNVC_CFG0_CNVC_SURFACE_PIXEL_FORMAT__CNVC_SURFACE_PIXEL_FORMAT_MASK
-        self.update(reg, 0x7f, cnvc_format(format))?;
+        // No separate alpha surface (RGBE_ALPHA is not an accepted format).
+        // linux-lit: 0x17f=CNVC_CFG0_CNVC_SURFACE_PIXEL_FORMAT__CNVC_SURFACE_PIXEL_FORMAT_MASK | CNVC_CFG0_CNVC_SURFACE_PIXEL_FORMAT__CNVC_ALPHA_PLANE_ENABLE_MASK
+        self.update(reg, 0x17f, cnvc_format(format))?;
+        // dpp3_cnv_setup: zero expansion, R/G/B crossbar 0/1/2, no float,
+        // clamp or converter bypass inherited from a previous stream.
+        let reg = self.dpp(FORMAT_CONTROL);
+        let alpha = u32::from(format != Format::Rgb16) << 8;
+        // linux-lit: 0x3f033111=CNVC_CFG0_FORMAT_CONTROL__FORMAT_EXPANSION_MODE_MASK | CNVC_CFG0_FORMAT_CONTROL__FORMAT_CNV16_MASK | CNVC_CFG0_FORMAT_CONTROL__ALPHA_EN_MASK | CNVC_CFG0_FORMAT_CONTROL__CNVC_BYPASS_MASK | CNVC_CFG0_FORMAT_CONTROL__CNVC_BYPASS_MSB_ALIGN_MASK | CNVC_CFG0_FORMAT_CONTROL__CLAMP_POSITIVE_MASK | CNVC_CFG0_FORMAT_CONTROL__CLAMP_POSITIVE_C_MASK | CNVC_CFG0_FORMAT_CONTROL__FORMAT_CROSSBAR_R_MASK | CNVC_CFG0_FORMAT_CONTROL__FORMAT_CROSSBAR_G_MASK | CNVC_CFG0_FORMAT_CONTROL__FORMAT_CROSSBAR_B_MASK
+        self.update(reg, 0x3f03_3111, 0x2400_0001 | alpha)?;
+        for field in [PRE_DEALPHA, PRE_REALPHA] {
+            let reg = self.dpp(field);
+            // linux-lit: 0x11=CNVC_CFG0_PRE_DEALPHA__PRE_DEALPHA_EN_MASK | CNVC_CFG0_PRE_DEALPHA__PRE_DEALPHA_ABLND_EN_MASK
+            self.update(reg, 0x11, 0)?;
+        }
+        // CNVC's ROM degamma is before the CM block, so bypass both. This
+        // path accepts already encoded RGB pixels and owns no color LUTs.
+        let reg = self.dpp(PRE_DEGAM);
+        // linux-lit: 0x73=CNVC_CFG0_PRE_DEGAM__PRE_DEGAM_MODE_MASK | CNVC_CFG0_PRE_DEGAM__PRE_DEGAM_SELECT_MASK
+        self.update(reg, 0x73, 0)?;
+        let reg = self.dpp(CM_CONTROL);
+        // linux-lit: 1=CM0_CM_CONTROL__CM_BYPASS_MASK
+        self.update(reg, 1, 1)?;
+        // dpp1_dscl_set_scaler_manual_scale still initializes autocal,
+        // boundary mode and line-buffer storage for SCALING_444_BYPASS.
+        // It only skips these for DSCL_BYPASS (the separate FP16 path).
+        let reg = self.dpp(DSCL_AUTOCAL);
+        // linux-lit: 0x3303=DSCL0_DSCL_AUTOCAL__AUTOCAL_MODE_MASK | DSCL0_DSCL_AUTOCAL__AUTOCAL_NUM_PIPE_MASK | DSCL0_DSCL_AUTOCAL__AUTOCAL_PIPE_ID_MASK
+        self.update(reg, 0x3303, 0)?;
+        let reg = self.dpp(DSCL_CONTROL);
+        self.update(reg, 1, 0)?; // linux-lit: 1=DSCL0_DSCL_CONTROL__SCL_BOUNDARY_MODE_MASK
+        let reg = self.dpp(LB_DATA_FORMAT);
+        // Opaque RGB: neither alpha nor chroma interleave uses LB storage.
+        // linux-lit: 0x11=DSCL0_LB_DATA_FORMAT__INTERLEAVE_EN_MASK | DSCL0_LB_DATA_FORMAT__ALPHA_EN_MASK
+        self.update(reg, 0x11, 0)?;
+        let reg = self.dpp(LB_MEMORY_CTRL);
+        // Linux's use_max_lb RGB choice, MEMORY_CONFIG_0 (all three banks),
+        // with the pre-DCN3.2 maximum of 63 partitions. No scaling/taps.
+        // linux-lit: 0x3f00=63 << DSCL0_LB_MEMORY_CTRL__LB_MAX_PARTITIONS__SHIFT
+        self.set(reg, 0x3f00)?;
         // Bypass the scaler outright rather than programming unity taps.
         let reg = self.dpp(SCL_MODE);
         self.update(reg, DSCL_MODE, SCALER_BYPASS)?;
@@ -268,6 +319,41 @@ impl<I: Io> Block<I> {
         if dpp >= self.profile.pipes() || opp >= self.profile.pipes() {
             return Err(Error::Invalid);
         }
+        if self.profile.is_dcn30() {
+            // dcn30_program_gamut_remap: an encoded RGB desktop has no
+            // stream gamut matrix. OGAM bypass alone does not bypass this.
+            let reg = MPCC_GAMUT_REMAP_MODE + u64::from(self.instance) * OGAM_STRIDE;
+            self.update(reg, 3, 0)?; // linux-lit: 3=MPCC_OGAM0_MPCC_GAMUT_REMAP_MODE__MPCC_GAMUT_REMAP_MODE_MASK
+                                     // dcn30_set_mpc_shaper_3dlut(NULL) -> release_rmu. Only detach
+                                     // muxes belonging to this MPCC; other streams retain their LUTs.
+                                     // DCN3 has three RMUs, with MUX/STATUS nibble pairs per byte.
+            {
+                // Different MPCC owners share this register. Serialize the
+                // masked updates, with no await or hardware wait under lock.
+                let _mux = RMU_MUX_LOCK.lock();
+                let rmu = self.access(|io| io.read(MPC_RMU_CONTROL))?;
+                if rmu == u32::MAX {
+                    return Err(Error::DeviceGone);
+                }
+                // Resource caps: DCN3.0 has 3, 3.0.2 has 2, 3.0.3 has 1.
+                let units = match self.profile {
+                    Profile::Navi22 => 3,
+                    Profile::Dcn302 => 2,
+                    Profile::Dcn303 => 1,
+                    Profile::Dcn314 => 0,
+                };
+                for unit in 0..units {
+                    let shift = 8 * unit;
+                    if (rmu >> (shift + 4)) & 0xf == u32::from(self.instance) {
+                        self.update(MPC_RMU_CONTROL, 0xf << shift, 0xf << shift)?;
+                    }
+                }
+            }
+        }
+        // mpc3_program_ogam(NULL): this passthrough path owns no output
+        // gamma LUT. A firmware LUT may still be selected after mpc_init.
+        let reg = MPCC_OGAM_CONTROL + u64::from(self.instance) * OGAM_STRIDE;
+        self.update(reg, 3, 0)?; // linux-lit: 3=MPCC_OGAM0_MPCC_OGAM_CONTROL__MPCC_OGAM_MODE_MASK
         let reg = self.mpcc(MPCC_TOP_SEL);
         self.update(reg, 0xf, dpp as u32)?; // linux-lit: 0xf=MPCC0_MPCC_TOP_SEL__MPCC_TOP_SEL_MASK
                                             // Nothing below this plane: a stale bottom select would blend against
@@ -372,7 +458,7 @@ impl Dpp {
                 base: profile.bank(
                     gpu,
                     2, // linux-lit: 2=mmDPP_TOP0_DPP_CONTROL_BASE_IDX
-                    (MPC_SIZE + u64::from(profile.pipes() - 1) * DPP_STRIDE) as u32,
+                    (CM_CONTROL + u64::from(profile.pipes() - 1) * DPP_STRIDE) as u32,
                 )?,
             },
             authority,
@@ -408,7 +494,11 @@ impl Mpc {
                 base: profile.bank(
                     gpu,
                     3, // linux-lit: 3=mmMPCC0_MPCC_TOP_SEL_BASE_IDX
-                    (MPC_OUT_MUX + u64::from(profile.pipes() - 1) * MPC_OUT_STRIDE) as u32,
+                    if profile.is_dcn30() {
+                        MPC_RMU_CONTROL as u32
+                    } else {
+                        (MPC_OUT_MUX + u64::from(profile.pipes() - 1) * MPC_OUT_STRIDE) as u32
+                    },
                 )?,
             },
             authority,

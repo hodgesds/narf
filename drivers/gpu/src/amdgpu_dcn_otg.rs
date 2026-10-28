@@ -29,7 +29,8 @@ const OTG_V_BLANK_START_END: u64 = 0x1b36; // linux: mmOTG0_OTG_V_BLANK_START_EN
 const OTG_V_SYNC_A: u64 = 0x1b37; // linux: mmOTG0_OTG_V_SYNC_A
 const OTG_V_SYNC_A_CNTL: u64 = 0x1b38; // linux: mmOTG0_OTG_V_SYNC_A_CNTL
 const OTG_CONTROL: u64 = 0x1b41; // linux: mmOTG0_OTG_CONTROL
-                                 // DCN 3.1.4 offsets; otg() adds 1 on Navi22, giving the DCN30 registers.
+const OTG_INTERLACE_CONTROL: u64 = 0x1b44; // linux: mmOTG0_OTG_INTERLACE_CONTROL
+                                           // DCN 3.1.4 offsets; otg() adds 1 on Navi22, giving the DCN30 registers.
 const OTG_CLOCK_CONTROL: u64 = 0x1b85; // linux: mmOTG0_OTG_CLOCK_CONTROL - 1
 const OTG_VSTARTUP_PARAM: u64 = 0x1b86; // linux: mmOTG0_OTG_VSTARTUP_PARAM - 1
 const OTG_VUPDATE_PARAM: u64 = 0x1b87; // linux: mmOTG0_OTG_VUPDATE_PARAM - 1
@@ -140,6 +141,9 @@ struct Engine<I: Io> {
     instance: u8,
     state: State,
     profile: Profile,
+    timing: Option<Timing>,
+    drr: Option<drr::Applied>,
+    drr_dirty: bool,
 }
 impl<I: Io> Engine<I> {
     fn otg(&self, reg: u64) -> u64 {
@@ -251,6 +255,10 @@ impl<I: Io> Engine<I> {
             1, // linux: OTG0_OTG_V_SYNC_A_CNTL__OTG_V_SYNC_A_POL_MASK
             u32::from(!timing.v_sync_positive),
         )?;
+        // This owner admits progressive modes only. Firmware may have left
+        // the generator in interlace even though the new counters are valid.
+        // linux: OTG0_OTG_INTERLACE_CONTROL__OTG_INTERLACE_ENABLE_MASK
+        self.update(self.otg(OTG_INTERLACE_CONTROL), 1, 0)?;
         // Park the vertical timing generator before moving its reference.
         self.update(self.otg_vtg(), 1 << 31, 0)?; // linux-lit: 31=VTG0_CONTROL__VTG0_ENABLE__SHIFT
                                                   // DisplayPort starts counting at the first line of the blank, and a
@@ -259,6 +267,17 @@ impl<I: Io> Engine<I> {
                                                   // linux-lit: 13=OTG0_OTG_CONTROL__OTG_FIELD_NUMBER_CNTL__SHIFT
         self.update(self.otg(OTG_CONTROL), 1 << 12 | 1 << 13, 1 << 12)?;
         self.program_global_sync(sync)?;
+        // optc1_program_timing -> optc1_set_vtg_params(program_fp2=true).
+        // VTG supplies HUBP's vertical timing in the DCFCLK domain: enabling
+        // it alone leaves prefetch aligned to the previous mode (or zero).
+        let fp2 = sync.v_startup_lines.saturating_sub(v_blank_end + 1);
+        self.update(
+            self.otg_vtg(),
+            // linux: VTG0_CONTROL__VTG0_FP2_MASK | VTG0_CONTROL__VTG0_VCOUNT_INIT_MASK
+            0x7fff_7fff,
+            // linux-lit: 16=VTG0_CONTROL__VTG0_VCOUNT_INIT__SHIFT
+            v_blank_start << 16 | fits(fp2, COUNT_BITS)?,
+        )?;
         // One OPP segment feeding this OTG: no ODM combine, no memory split,
         // and no horizontal timing division.
         self.set(
@@ -273,6 +292,8 @@ impl<I: Io> Engine<I> {
             0x1fff, // linux: ODM0_OPTC_WIDTH_CONTROL__OPTC_SEGMENT_WIDTH_MASK
             fits(timing.h_active, SEGMENT_WIDTH_BITS)?,
         )?;
+        self.reset_dcn30_drr()?;
+        self.timing = Some(*timing);
         self.state = State::Programmed;
         Ok(())
     }
@@ -318,6 +339,13 @@ impl<I: Io> Engine<I> {
     fn enable(&mut self) -> Result<(), Error> {
         if self.state != State::Programmed {
             return Err(Error::Busy);
+        }
+        if self.profile.is_dcn30() {
+            // link_set_dpms_on -> optc3_set_out_mux(OUT_MUX_DIO).
+            // These owners support the DIO HDMI/DP encoders. Select that
+            // destination explicitly instead of inheriting firmware routing.
+            // linux: OTG0_OTG_CONTROL__OTG_OUT_MUX_MASK
+            self.update(self.otg(OTG_CONTROL), 1 << 20, 0)?;
         }
         self.update(
             self.odm(OPTC_DATA_SOURCE_SELECT),
@@ -422,6 +450,9 @@ impl Otg {
             instance,
             state: State::Idle,
             profile,
+            timing: None,
+            drr: None,
+            drr_dirty: false,
         }))
     }
     pub fn state(&self) -> State {
@@ -453,3 +484,6 @@ impl Otg {
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_dcn_otg_tests.rs"]
 mod tests;
+
+#[path = "amdgpu_dcn_otg_drr.rs"]
+mod drr;

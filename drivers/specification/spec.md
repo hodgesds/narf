@@ -181,6 +181,17 @@ callback, and delivers copied RX frames through a cap-gated ingress export.
 Responsive MMIO/DMA wait exports keep reset and descriptor-completion polling
 inside the scheduler bridge rather than in module-local spin loops.
 
+### 3.5 CPU thermal probe admission
+
+The in-tree `hwmon::coretemp::register_msr_driver()` returns
+`narf_init::InitResult`: `Ok` after registering a sensor, `NotPresent` for
+unsupported CPUs, unreadable optional MSRs or implausible temperature targets.
+Its staged initcall forwards that result. Intel vendor identity, basic-leaf
+bounds, MSR support and the digital thermal sensor feature are checked before
+MSR access. Later sensor reads repeat admission on the executing CPU and
+return unavailable on recoverable MSR faults. Non-x86_64 probes return
+`NotPresent` without a hardware access.
+
 ## 4. ABI versioning
 
 Modelled directly on `userspace/syscall.rs`'s syscall versioning

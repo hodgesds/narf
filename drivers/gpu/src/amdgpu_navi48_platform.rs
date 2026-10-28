@@ -28,6 +28,7 @@ mod transfer;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Busy,
+    Clock,
     Authority,
     InvalidFramebuffer,
     Firmware(boot::Error),
@@ -265,6 +266,9 @@ fn training_clients(protected: &[vram::Protected]) -> Result<(), Error> {
 pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Error> {
     if !amdgpu::is_navi48() {
         return Ok(None);
+    }
+    if !amdgpu::boot_clock_ready() {
+        return Err(Error::Clock);
     }
     let mut owner = OWNER.try_lock().ok_or(Error::Busy)?;
     if owner.is_some() {

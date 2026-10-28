@@ -1,5 +1,7 @@
-//! DRM sysfs bridge — `/sys/devices/platform/narf-drm/{card<N>,renderD<N+128>}`
-//! with `/sys/class/drm/*` and `/sys/dev/char/*` symlinks pointing into it.
+//! DRM sysfs bridge — real PCI descendants at
+//! `/sys/devices/pci<domain>:<bus>/<BDF>/drm/{card<N>,renderD<N+128>}`.
+//! `/sys/class/drm/*` and `/sys/dev/char/*` resolve to those minors. The old
+//! platform paths remain aliases, not the canonical device ancestry.
 //!
 //! For each card registered in `drm_registry` this module creates the standard
 //! kobject subtree that userspace (libdrm, Mesa, Xorg, Wayland, systemd's
@@ -23,22 +25,21 @@
 //! ## Kobject layout per card (index N)
 //!
 //! ```text
-//! /sys/devices/platform/narf-drm/
+//! /sys/devices/pci<domain>:<bus>/<BDF>/drm/
 //!   card<N>/
 //!     name        → "card<N>\n"
 //!     dev         → "226:<N>\n"                        (major 226 = DRM)
 //!     uevent      → MAJOR/MINOR/DEVNAME/DEVTYPE/DRIVER (writable)
 //!     subsystem   → symlink → /sys/class/drm
-//!     device/     → vendor / device / subsystem_vendor / subsystem_device
+//!     device      → ../../../<BDF> (the enumerated PCI function)
 //!     power_dpm_state, power_dpm_force_performance_level (rw),
 //!     [pp_features (rw, RX 6000)], [vbios_version], …
 //!     (the two rw power controls also sit on the PCI device node)
 //!   renderD<N+128>/
 //!     name, dev, uevent (writable), subsystem → /sys/class/drm
-//! /sys/class/drm/card<N>       → ../../devices/platform/narf-drm/card<N>
-//! /sys/class/drm/renderD<N+128>→ ../../devices/platform/narf-drm/renderD<N+128>
-//! /sys/dev/char/226:<N>        → ../../devices/platform/narf-drm/card<N>
-//! /sys/dev/char/226:<N+128>    → ../../devices/platform/narf-drm/renderD<N+128>
+//! Class and devnum links name that canonical tree. A PCI-function ancestor
+//! lets udev and Xorg correlate a DRM minor with the primary PCI display;
+//! a card/device symlink alone does not establish a parent relationship.
 //! ```
 //!
 //! ## Linux references
@@ -250,9 +251,20 @@ fn populate_card_node(
     };
 
     let root = get_root();
-    // `/sys/devices/platform/narf-drm/` — the real device parent. Mirrors the
-    // input class's `/sys/devices/platform/narf-input/` container.
+    // Put the real minors below the PCI function, as drm_sysfs_minor_alloc
+    // does. udev walks canonical parents and does not follow card/device
+    // when finding the PCI ancestor of a platform-rooted node.
     let devices = get_or_create_child(&root, "devices");
+    let pci_addr = format!(
+        "{:04x}:{:02x}:{:02x}.{}",
+        pci_bdf.segment, pci_bdf.bus, pci_bdf.device, pci_bdf.function
+    );
+    let pci_host_name = format!("pci{:04x}:{:02x}", pci_bdf.segment, pci_bdf.bus);
+    let pci_root = get_or_create_child(&devices, &pci_host_name);
+    let dev_kobj = get_or_create_child(&pci_root, &pci_addr);
+    let dev_drm = get_or_create_child(&dev_kobj, "drm");
+    let minor_prefix = format!("../../devices/{pci_host_name}/{pci_addr}/drm");
+    // Preserve old paths as aliases; their canonical target has PCI ancestry.
     let platform = get_or_create_child(&devices, "platform");
     let narf_drm = get_or_create_child(&platform, "narf-drm");
 
@@ -260,7 +272,7 @@ fn populate_card_node(
 
     // ── card<N> device node under /sys/devices ──────────────────────────
     let card_name = format!("card{}", idx);
-    let kobj = Kobject::new_child(narf_drm.clone(), card_name.clone());
+    let kobj = Kobject::new_child(dev_drm.clone(), card_name.clone());
 
     {
         let name = format!("card{}\n", idx);
@@ -295,10 +307,10 @@ fn populate_card_node(
         },
     );
 
-    // `subsystem` → /sys/class/drm. From /sys/devices/platform/narf-drm/card<N>
-    // the class dir is four levels up. elogind only marks a seat graphical when
+    // `subsystem` → /sys/class/drm, five levels above the real minor.
+    // elogind only marks a seat graphical when
     // it can attach a device whose subsystem is "drm".
-    kobj.add_symlink("subsystem", "../../../../class/drm");
+    kobj.add_symlink("subsystem", "../../../../../class/drm");
 
     // ── the PCI device node, and card<N>/device as a SYMLINK to it ───────
     //
@@ -311,16 +323,8 @@ fn populate_card_node(
     // EGL's "failed to get compatible render device" — falls over regardless
     // of how correct the attributes are.
     //
-    let pci_addr = format!(
-        "{:04x}:{:02x}:{:02x}.{}",
-        pci_bdf.segment, pci_bdf.bus, pci_bdf.device, pci_bdf.function
-    );
-    let pci_host_name = format!("pci{:04x}:{:02x}", pci_bdf.segment, pci_bdf.bus);
-    let pci_root = get_or_create_child(&devices, &pci_host_name);
-    let dev_kobj = get_or_create_child(&pci_root, &pci_addr);
-    // From /sys/devices/platform/narf-drm/card<N>, three levels up is
-    // /sys/devices.
-    kobj.add_symlink("device", format!("../../../{pci_host_name}/{pci_addr}"));
+    // Keep the target's BDF basename: libdrm parses it directly.
+    kobj.add_symlink("device", format!("../../../{pci_addr}"));
     // From /sys/devices/pci0000:00/<addr>/, three levels up is /sys.
     dev_kobj.add_symlink("subsystem", "../../../bus/pci");
     // The PCI parent is already complete: uevent, IDs and `config` are owned
@@ -371,19 +375,13 @@ fn populate_card_node(
     add_power_controls(&dev_kobj, &card);
 
     // ── /sys/class/drm/card<N> + /sys/dev/char/226:<N> symlinks → the node ──
-    class_drm.add_symlink(
-        card_name.clone(),
-        format!("../../devices/platform/narf-drm/{}", card_name),
-    );
-    char_dev_link(
-        idx,
-        &format!("../../devices/platform/narf-drm/{}", card_name),
-    );
+    class_drm.add_symlink(card_name.clone(), format!("{minor_prefix}/{card_name}"));
+    char_dev_link(idx, &format!("{minor_prefix}/{card_name}"));
 
     // ── renderD<N+128> sibling device node ───────────────────────────────
     let render_idx = idx + 128;
     let render_name = format!("renderD{}", render_idx);
-    let render_kobj = Kobject::new_child(narf_drm.clone(), render_name.clone());
+    let render_kobj = Kobject::new_child(dev_drm, render_name.clone());
     {
         let rn = format!("renderD{}\n", render_idx);
         kobject_add_attr(&render_kobj, "name", move || rn.clone());
@@ -393,7 +391,7 @@ fn populate_card_node(
         kobject_add_attr(&render_kobj, "dev", move || rd.clone());
     }
     kobject_add_uevent_attr(&render_kobj, render_uevent(render_idx, &driver));
-    render_kobj.add_symlink("subsystem", "../../../../class/drm");
+    render_kobj.add_symlink("subsystem", "../../../../../class/drm");
 
     // `renderD<M>/device` → the SAME PCI node card<N>/device points at.
     //
@@ -420,8 +418,8 @@ fn populate_card_node(
     // `available_nodes` only across nodes whose parsed bus info compares
     // equal, so two different addresses would stay two one-node devices and
     // the render bit would still be absent. Same depth
-    // (devices/platform/narf-drm/<node>), so the same relative path.
-    render_kobj.add_symlink("device", format!("../../../{pci_host_name}/{pci_addr}"));
+    // (PCI function/drm/<node>), so the same relative path.
+    render_kobj.add_symlink("device", format!("../../../{pci_addr}"));
 
     // `card<N>/device/drm/{card<N>,renderD<M>}` — how a consumer walks from a
     // card to its RENDER node.
@@ -434,33 +432,21 @@ fn populate_card_node(
     // that replaced the earlier device-info failure once driver selection was
     // fixed. kwin then has no EGL and gives up.
     //
-    // Symlinks rather than a second real node: the canonical kobjects stay
-    // where they are (systemd's sd-device already resolves devnum through
-    // them), and this only adds the parent-relative view Mesa walks.
-    // Relative to card<N>/device/drm/, THREE levels up is narf-drm
-    // (drm → device → card<N> → narf-drm).
+    // These are now real children of the PCI function's drm directory.
+    // The former platform-rooted names remain compatibility aliases only.
     {
-        // From /sys/devices/pci0000:00/<addr>/drm/, four levels up is
-        // /sys/devices, then down into the platform container.
-        let dev_drm = get_or_create_child(&dev_kobj, "drm");
-        dev_drm.add_symlink(
+        narf_drm.add_symlink(
             card_name.clone(),
-            format!("../../../../platform/narf-drm/{}", card_name),
+            format!("../../{pci_host_name}/{pci_addr}/drm/{card_name}"),
         );
-        dev_drm.add_symlink(
+        narf_drm.add_symlink(
             render_name.clone(),
-            format!("../../../../platform/narf-drm/{}", render_name),
+            format!("../../{pci_host_name}/{pci_addr}/drm/{render_name}"),
         );
     }
 
-    class_drm.add_symlink(
-        render_name.clone(),
-        format!("../../devices/platform/narf-drm/{}", render_name),
-    );
-    char_dev_link(
-        render_idx,
-        &format!("../../devices/platform/narf-drm/{}", render_name),
-    );
+    class_drm.add_symlink(render_name.clone(), format!("{minor_prefix}/{render_name}"));
+    char_dev_link(render_idx, &format!("{minor_prefix}/{render_name}"));
 
     // Parent first, then the two DRM minors, matching Linux device
     // registration ordering. The card ADD is the load-bearing event for
@@ -475,6 +461,71 @@ fn populate_card_node(
 pub mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    #[derive(Debug)]
+    struct PciFixture;
+    impl crate::drm_registry::DrmCard for PciFixture {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+        fn driver(&self) -> &str {
+            "test"
+        }
+        fn vendor_id(&self) -> u16 {
+            0xf00d
+        }
+        fn device_id(&self) -> u16 {
+            0xcafe
+        }
+        fn subsystem_vendor(&self) -> u16 {
+            0
+        }
+        fn subsystem_device(&self) -> u16 {
+            0
+        }
+        fn vbios_version(&self) -> Option<&str> {
+            None
+        }
+        fn gpu_busy_percent(&self) -> Option<u32> {
+            None
+        }
+        fn power_state(&self) -> &str {
+            "D0"
+        }
+    }
+    fn smoke_drm_canonical_ancestry_reaches_pci() -> TestResult {
+        narf_filesystem::sysfs::__reset_for_test();
+        let class = class_register("drm");
+        populate_card_node(class.clone(), Arc::new(PciFixture), 0);
+        let root = get_root();
+        let Some(pci) = root
+            .get_child("devices")
+            .and_then(|devices| devices.get_child("pci0000:00"))
+            .and_then(|host| host.get_child("0000:00:10.0"))
+        else {
+            return TestResult::Fail("fixture PCI parent missing");
+        };
+        for (name, minor) in [("card0", 0), ("renderD128", 128)] {
+            let Some(node) = pci.get_child("drm").and_then(|drm| drm.get_child(name)) else {
+                return TestResult::Fail("minor has no real PCI ancestor");
+            };
+            if node.path() != format!("/sys/devices/pci0000:00/0000:00:10.0/drm/{name}")
+                || node.get_symlink("device").as_deref() != Some("../../../0000:00:10.0")
+                || node.get_symlink("subsystem").as_deref() != Some("../../../../../class/drm")
+                || node.attr_show("dev") != Some(format!("226:{minor}\n"))
+                || class.get_symlink(name)
+                    != Some(format!("../../devices/pci0000:00/0000:00:10.0/drm/{name}"))
+            {
+                return TestResult::Fail("minor identity or canonical link topology changed");
+            }
+        }
+        narf_filesystem::sysfs::__reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm_sysfs",
+        smoke_drm_canonical_ancestry_reaches_pci
+    );
 
     /// `card<N>/device/subsystem` must resolve to `/sys/bus/pci`.
     ///

@@ -411,6 +411,10 @@ optdepends=('grub: GRUB BIOS or UEFI menu integration'
             'limine-tool: CachyOS Limine menu integration'
             'refind: automatic EFI loader discovery'
             'sbctl: local Secure Boot signing and key management')
+# The kernel digest embedded in the Limine config authenticates the exact
+# image. makepkg's default strip step mutates that image after the digest is
+# generated, causing narf-uefi to reject the package payload.
+options=('!strip')
 source=('$payload.tar.gz')
 sha256sums=('$sum')
 install=narf-kernel.install

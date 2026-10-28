@@ -48,6 +48,7 @@ pub mod rw_gate;
 pub mod volume;
 pub mod write;
 
+mod orphans;
 mod raid56;
 #[cfg(feature = "kernel-test")]
 mod tests;

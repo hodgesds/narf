@@ -1,6 +1,7 @@
 use super::*;
 use crate::amdgpu_navi22_modeset_model::{self as m, d1, d2, d3, Bench, DpSink, Vram, MARK};
 use alloc::{vec, vec::Vec};
+use core::task::{Context, Waker};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn soc() -> dml30::Soc {
@@ -265,6 +266,74 @@ fn hdmi_enable_order(log: &[m::Write], r: Route, tx: u8) -> Result<usize, &'stat
         ],
     )
 }
+/// Firmware/reset residue must not select a different physical output or
+/// leave the DCN3 output rate policy dependent on its previous owner.
+fn inherited_hdmi_output_state(dword: u32, poison: u32, mask: u32, expected: u32) -> TestResult {
+    let bench = Bench::new();
+    bench.set(m::MP1 + 0x274, 1);
+    // Bit 24 is unrelated state which both Linux REG_UPDATEs preserve.
+    bench.set(dword, poison | (1 << 24));
+    let vram = Vram::new(VRAM_BYTES);
+    let image = m::vbios(7);
+    let tables = Tables::new(&image).unwrap();
+    let connector = m::connector(Signal::Hdmi, 3, 3);
+    let r = Resources::new().acquire(&connector).unwrap();
+    let mut p = pipeline(&bench, connector, r);
+    let sink = m::sink_audio(Signal::Hdmi, None, false);
+    if run(enable_with(&mut p, &vram, &tables, &sink, &mut NoAux)).is_err() {
+        return TestResult::Fail("poisoned HDMI output failed enable");
+    }
+    let value = bench.get(dword);
+    let log = bench.log();
+    let order = in_order(
+        &log,
+        0,
+        &[
+            (
+                "pixel clock before output initialization",
+                &table(m::SLOT_PIXEL_CLOCK, None, None),
+            ),
+            ("initialize inherited output state", &|w: &m::Write| {
+                w.dword == dword && w.value & mask == expected
+            }),
+            (
+                "output initialized before encoder attributes",
+                &table(m::SLOT_STREAM_SETUP, None, None),
+            ),
+        ],
+    );
+    let stopped = run(p.disable(&tables, &mut NoAux)).is_ok();
+    if value & mask != expected || value & (1 << 24) == 0 {
+        return TestResult::Fail("inherited HDMI output state was not normalized");
+    }
+    if let Err(name) = order {
+        return TestResult::Fail(name);
+    }
+    if !stopped {
+        return TestResult::Fail("poisoned HDMI output teardown");
+    }
+    TestResult::Pass
+}
+
+fn navi22_hdmi_routes_otg_to_dio_before_stream_attributes() -> TestResult {
+    // OTG_CONTROL.OTG_OUT_MUX: optc3_set_out_mux(OUT_MUX_DIO = 0).
+    inherited_hdmi_output_state(d2(0x1b41), 1 << 20, 1 << 20, 0)
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_hdmi_routes_otg_to_dio_before_stream_attributes
+);
+
+fn navi22_hdmi_disables_mpc_rate_control_before_stream_attributes() -> TestResult {
+    // MPC_OUT0_MUX: mpc3_set_out_rate_control always sets disable=1,
+    // rate=0. mpc3_mpc_init_single_inst alone does not clear rate bit 9.
+    inherited_hdmi_output_state(d3(0x580), 1 << 9, (1 << 8) | (1 << 9), 1 << 8)
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_hdmi_disables_mpc_rate_control_before_stream_attributes
+);
+
 fn hdmi_disable_order(
     log: &[m::Write],
     from: usize,
@@ -522,12 +591,25 @@ fn navi22_modeset_hdmi_end_to_end_follows_linux_order() -> TestResult {
         {
             return TestResult::Fail("audio stop order");
         }
-        // The PHY PLL is never "powered down" with a zero clock.
-        if log[enabled..]
+        // dcn20_reset_back_end's cs_power_down: one zero-clock SetPixelClock
+        // after the OTG stops (DC_LOG_BIOS: clock 0, tg 255, pll 20):
+        // CRTC invalid, no encoder, CRT mode, FORCE_PROG_PPLL.
+        let slot = |i: u32| MARK + 16 * m::SLOT_PIXEL_CLOCK + i;
+        let downs: Vec<usize> = log[enabled..]
             .iter()
-            .any(|w| w.dword == MARK + 16 * m::SLOT_PIXEL_CLOCK)
-        {
-            return TestResult::Fail("SetPixelClock(0) on disable");
+            .enumerate()
+            .filter(|(_, w)| w.dword == slot(0) && w.value == 0)
+            .map(|(i, _)| enabled + i)
+            .collect();
+        let shaped = downs.first().is_some_and(|&i| {
+            log.get(i + 1)
+                .is_some_and(|w| w.dword == slot(1) && w.value & 0xffff_ff00 == 0x010f_0000)
+                && log
+                    .get(i + 2)
+                    .is_some_and(|w| w.dword == slot(2) && w.value & 0xff == 0xff)
+        });
+        if downs.len() != 1 || !shaped {
+            return TestResult::Fail("PLL power-down on disable");
         }
         // The scanout stays excluded from reuse after the stop.
         if p.scanout().is_none_or(|s| s.reusable_for_test()) {
@@ -996,6 +1078,98 @@ fn navi22_modeset_models_every_pipe_and_dig_route() -> TestResult {
     }
     TestResult::Pass
 }
+
+fn navi22_plane_power_up_preserves_an_inherited_ip_request() -> TestResult {
+    for original in [0, 1, 0x100, 0x101] {
+        let bench = Bench::new();
+        bench.set(d2(0xb2), original);
+        let connector = m::connector(Signal::Hdmi, 3, 3);
+        let r = Resources::new().acquire(&connector).unwrap();
+        let mut p = pipeline(&bench, connector, r);
+        if run(p.power_on_plane()).is_err() || bench.get(d2(0xb2)) != original {
+            return TestResult::Fail("plane activation overwrote the previous IP request");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_plane_power_up_preserves_an_inherited_ip_request
+);
+
+fn navi22_plane_power_up_initializes_hubp_before_surface_fetch() -> TestResult {
+    let bench = Bench::new();
+    // GB_ADDR_CONFIG: eight pipes, 256-byte interleave, two compressed
+    // fragments, eight packers; the codes are the Linux GC10 fields.
+    bench.set(0x263e, 0x343);
+    bench.set(d2(0x5e6), 0x8007_30c7);
+    let connector = m::connector(Signal::Hdmi, 3, 3);
+    let r = Resources::new().acquire(&connector).unwrap();
+    let mut p = pipeline(&bench, connector, r);
+    if run(p.power_on_plane()).is_err() {
+        return TestResult::Fail("plane activation rejected");
+    }
+    if bench.get(d2(0x5f7)) != 1 << 26 {
+        return TestResult::Fail("hubp3_init ECO workaround was skipped");
+    }
+    if bench.get(d2(0x5e6)) != 0x8003_1003 {
+        return TestResult::Fail("HUBP fabric configuration was inherited from firmware");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_plane_power_up_initializes_hubp_before_surface_fetch
+);
+
+fn navi22_plane_power_request_is_released_on_error_and_cancellation() -> TestResult {
+    for original in [0x100, 0x101] {
+        for cancelled in [false, true] {
+            let bench = Bench::new();
+            bench.set(d2(0xb2), original);
+            bench.stall(
+                0,
+                d2(0x83),
+                u32::MAX,
+                if cancelled { 0xc000_0000 } else { u32::MAX },
+            );
+            let connector = m::connector(Signal::Hdmi, 3, 3);
+            let r = Resources::new().acquire(&connector).unwrap();
+            let mut p = pipeline(&bench, connector, r);
+            if cancelled {
+                {
+                    let mut future = core::pin::pin!(p.power_on_plane());
+                    if future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_ready()
+                    {
+                        return TestResult::Fail(
+                            "power transition did not suspend for cancellation",
+                        );
+                    }
+                    if bench.get(d2(0xb2)) != original | 1 {
+                        return TestResult::Fail("power transition did not hold its request");
+                    }
+                }
+            } else if run(p.power_on_plane())
+                != Err(Error::Block(crate::amdgpu_dcn_clk::Error::DeviceGone))
+            {
+                return TestResult::Fail("power status read error was lost");
+            }
+            if bench.get(d2(0xb2)) != original {
+                return TestResult::Fail(
+                    "interrupted power transition changed the previous request",
+                );
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_plane_power_request_is_released_on_error_and_cancellation
+);
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22-modeset",
     navi22_modeset_models_every_pipe_and_dig_route

@@ -7,6 +7,7 @@
 extern crate alloc;
 
 pub mod attach;
+mod boot_root;
 pub mod btusb;
 mod btusb_intel;
 mod btusb_mtk;
@@ -296,7 +297,7 @@ fn spawn_supervisor_task() {
     // Stackful: USB HID supervisor's enumeration loop polls xHCI
     // MMIO + per-port reset state. Preemption-capped at the
     // default 10 ms slice so a stuck port can't starve init.
-    narf_scheduler::spawn_stackful(async {
+    let mut supervisor = alloc::boxed::Box::pin(async {
         use crate::attach::{self, AttachOutcome, HUBS};
         const PUMP_CYCLES: u64 = 16_000_000;
         // Cap per-port enumeration attempts. After this many
@@ -720,4 +721,8 @@ fn spawn_supervisor_task() {
             narf_time::sleep_cycles(cyc).await;
         }
     });
+    // Root mounting runs before the executor. Prime this same future when
+    // the requested root has not appeared yet, then retain it for hot-plug.
+    boot_root::prepare(supervisor.as_mut());
+    narf_scheduler::spawn_stackful(supervisor);
 }

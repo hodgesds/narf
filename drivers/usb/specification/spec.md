@@ -120,6 +120,15 @@ also consult upstream Linux GPL sources.
 
 ## 3. Public interface
 
+- Before an installed `narf.disks=root-ro|root-rw` root is mounted, USB late
+  initialization primes its normal supervisor if the unique `root=UUID=` is
+  valid but not registered. This wait is bounded to 30 seconds and uses the
+  synchronous spin bridge outside the executor, without holding a lock.
+  The same pinned supervisor future is then spawned, preserving claimed
+  ports, pending transfers and hub state; enumeration is not restarted.
+  An already registered root incurs no wait. A missing or ambiguous root
+  still fails through the normal root selector and disk-policy checks.
+
 - `UsbHub::attach(xhci, slot_id, iface_num, device_protocol, speed)` binds an
   addressed hub and retains its negotiated speed plus Device Descriptor
   protocol so xHCI can set the multiple-TT bit correctly.
@@ -481,11 +490,16 @@ the USB download itself remains a target-silicon gate.
   mode) is accepted on the wire but discarded — vertical/horizontal
   wheel + multi-touch land with the Report-Descriptor parser.
 - **MSC** (`msc`): Bulk-Only Transport CBW/CSW codec, INQUIRY,
-  READ_CAPACITY(10), READ(10), WRITE(10) for single-block transfers.
-  The `BlockDeviceSync` adapter also performs SYNCHRONIZE
-  CACHE(10) for `flush()` and WRITE(10) with the FUA bit for
-  `write_fua()`, so the Flush/FUA capabilities it advertises are
-  issued on the wire, not merely promised (#829).
+  READ_CAPACITY(10), READ(10), WRITE(10). The `BlockDeviceSync` adapter
+  splits filesystem requests into sequential BOT commands of at most 4 KiB
+  (also at most eight logical blocks), with one per-device claim held for
+  the entire request. This supports 16 KiB btrfs metadata on both 512-byte
+  and 4 KiB logical-block media without exceeding the xHCI DMA buffer.
+  The adapter also performs SYNCHRONIZE CACHE(10) for `flush()` and
+  WRITE(10) with the FUA bit for `write_fua()`, so its advertised Flush/FUA
+  capabilities are issued on the wire (#829). FUA requests use the same
+  bounded chunks and whole-request range validation as ordinary writes;
+  every chunk carries FUA and the claim remains held until completion.
 - **Hub** (`hub`): hub class enumeration, multiple-TT detection from the
   Device Descriptor protocol, TT think-time propagation, and downstream
   route addressing so low/full-speed devices behind high-speed hubs are

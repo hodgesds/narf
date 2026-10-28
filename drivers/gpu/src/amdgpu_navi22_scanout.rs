@@ -116,6 +116,7 @@ pub struct Scanout {
     irq: Irq,
     state: State,
     flips: u64,
+    vrr: Option<crate::amdgpu_freesync::Drr>,
 }
 impl core::fmt::Debug for Scanout {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -138,23 +139,35 @@ impl Scanout {
     /// HUBP was programmed with), keeps it reserved for this owner's
     /// lifetime and serializes every access to the pipe's HUBP/DPP/OTG/MPC
     /// registers with this owner; permanent mappings and PCI authority.
+    /// `odm` is the pipeline's ODM 2:1 slices (pipe, `viewport_x`, width;
+    /// the first is `pipe`): flips and the cursor then drive both HUBPs.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn new(
         gpu: &AmdGpu,
         authority: Cap<BusDeviceCap, Write>,
         pipe: u8,
+        odm: Option<[(u8, u32, u32); 2]>,
         front: Surface,
         map: narf_bus::MmioRegion,
         timing: Timing,
         refclk_khz: u32,
     ) -> Result<Self, Error> {
-        // SAFETY: forwarded pipe ownership.
-        let mut flip = unsafe { Flip::new(gpu, authority, pipe) }?;
+        // SAFETY: forwarded pipe ownership, the ODM secondary's included.
+        let (mut flip, cursor) = unsafe {
+            let flip = Flip::new(gpu, authority, pipe)?;
+            let cursor = Cursor::new(gpu, authority, pipe)?;
+            match odm {
+                None => (flip, cursor),
+                Some(slices) => (
+                    flip.with_odm(gpu, slices[1].0)?,
+                    cursor.with_odm(gpu, slices)?,
+                ),
+            }
+        };
         flip.adopt(front.address);
         Ok(Self {
             flip,
-            // SAFETY: as above.
-            cursor: unsafe { Cursor::new(gpu, authority, pipe) }?,
+            cursor,
             timing,
             refclk_khz,
             buffers: Buffers::new(front),
@@ -167,6 +180,7 @@ impl Scanout {
             },
             state: State::Running,
             flips: 0,
+            vrr: None,
         })
     }
     pub fn state(&self) -> State {
@@ -300,6 +314,23 @@ impl Scanout {
         Ok(())
     }
 
+    /// The OTG owner has committed these bounds while holding the same
+    /// platform lock. Flip waits account for the longest admitted frame.
+    pub fn configure_vrr(
+        &mut self,
+        bounds: Option<crate::amdgpu_freesync::Drr>,
+    ) -> Result<(), Error> {
+        self.running()?;
+        if bounds.is_some_and(|b| {
+            b.v_total_min < self.timing.v_total
+                || b.v_total_min > b.v_total_max
+                || b.v_total_max > crate::amdgpu_freesync::MAX_V_TOTAL
+        }) {
+            return Err(Error::Invalid);
+        }
+        self.vrr = bounds;
+        Ok(())
+    }
     /// Present the back buffer at the next VUPDATE and wait (bounded) until
     /// the HUBP reports it the earliest surface in use. On success the old
     /// front becomes the back buffer. On timeout or device loss the owner
@@ -315,6 +346,12 @@ impl Scanout {
         flush()?;
         self.flip.program(back.address)?;
         self.state = State::Flipping;
+        if self.vrr.is_some() {
+            if let Err(error) = self.flip.manual_trigger() {
+                self.state = State::Failed(error);
+                return Err(error);
+            }
+        }
         let result = self.wait_latched().await;
         match result {
             Ok(()) => {
@@ -338,7 +375,11 @@ impl Scanout {
     /// (each acknowledged as `dal_irq_service_ack`) or the poll period.
     async fn wait_latched(&mut self) -> Result<(), Error> {
         use crate::amdgpu_dcn30_flip::POLL_US;
-        let deadline = narf_time::Deadline::after_us(flip_timeout_us(&self.timing));
+        let mut longest = self.timing;
+        if let Some(bounds) = self.vrr {
+            longest.v_total = bounds.v_total_max;
+        }
+        let deadline = narf_time::Deadline::after_us(flip_timeout_us(&longest));
         loop {
             if !self.flip.pending()? {
                 let _ = self.flip.ack(Interrupt::Flip);
@@ -370,6 +411,30 @@ impl Scanout {
                 }
             }
         }
+    }
+    pub fn vrr_active(&self) -> bool {
+        self.vrr.is_some()
+    }
+    /// A stretched blank can exceed the nominal total. Use the last
+    /// completed hardware total, bounded by the admitted range, and never
+    /// reject an in-range live beam just because the nominal frame ended.
+    pub fn vblank_phase(&mut self) -> Result<crate::amdgpu_dcn401_otg::VblankPhase, Error> {
+        if matches!(self.state, State::Stopped) {
+            return Err(Error::Busy);
+        }
+        let Some(bounds) = self.vrr else {
+            return vblank_phase(self.position()?, &self.timing).ok_or(Error::Invalid);
+        };
+        let (position, total) = self.flip.position_drr()?;
+        if position.vpos >= bounds.v_total_max {
+            return Err(Error::Invalid);
+        }
+        let mut timing = self.timing;
+        timing.v_total = total
+            .max(bounds.v_total_min)
+            .max(position.vpos + 1)
+            .min(bounds.v_total_max);
+        vblank_phase(position, &timing).ok_or(Error::Invalid)
     }
     /// The OTG position, for vblank counts and timestamps.
     pub fn position(&mut self) -> Result<Position, Error> {

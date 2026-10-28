@@ -19,7 +19,10 @@ layout so existing monitoring tools work unmodified.
 The crate ships concrete drivers spanning the common sensor sources on real
 x86 hardware. `k10temp` reads AMD Family 17h/19h (Zen 2 through Zen 4) CPU
 temperature (the SMN path does not expose voltages); `coretemp` reads Intel per-core thermal status through
-the thermal-status MSRs. `nct6775` and `it87` drive Nuvoton and ITE Super-I/O
+the thermal-status MSRs. Its probe and later sensor reads require the Intel
+vendor ID, MSR support and CPUID leaf 6's digital thermal sensor bit before
+any MSR access. Optional MSR faults return an unavailable sensor; unsupported
+CPUs skip driver registration. `nct6775` and `it87` drive Nuvoton and ITE Super-I/O
 "environment controller" chips found on desktop motherboards — the chips that
 carry most board-level fan and voltage sensing. `dell_smm` speaks the Dell
 System Management Mode interface over the i8042 path for fan and temperature

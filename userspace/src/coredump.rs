@@ -105,6 +105,16 @@ fn align_up(val: u64) -> u64 {
     (val + 4095) & !4095
 }
 
+fn metadata_offsets(headers: usize, notes: usize) -> (u64, u64, u64) {
+    // ELF permits notes before the program-header table. A real greeter
+    // dump stopped during that table (822/853 headers), losing every
+    // register and identity note. Keep those at the beginning instead.
+    let note_offset = core::mem::size_of::<Elf64_Ehdr>() as u64;
+    let phoff = (note_offset + notes as u64 + 7) & !7;
+    let end = phoff + core::mem::size_of::<Elf64_Phdr>() as u64 * headers as u64;
+    (phoff, note_offset, align_up(end))
+}
+
 unsafe fn slice_from_ref<T>(val: &T) -> &[u8] {
     // SAFETY: caller must ensure val is safe to read.
     unsafe { core::slice::from_raw_parts(val as *const T as *const u8, core::mem::size_of::<T>()) }
@@ -132,12 +142,37 @@ fn write_at(file: &dyn FileOps, limit: u64, offset: u64, buf: &[u8]) -> Result<(
             Some(Err(e)) => return Err(e),
             None => return Err(FsError::InvalidData),
         };
-        if n == 0 {
-            break;
+        if n == 0 || n > chunk.len() {
+            return Err(FsError::InvalidData);
         }
         written += n;
     }
     Ok(())
+}
+
+fn write_metadata(
+    file: &dyn FileOps,
+    limit: u64,
+    ehdr: &Elf64_Ehdr,
+    phdrs: &[Elf64_Phdr],
+    notes: &[u8],
+) -> Result<(), FsError> {
+    let stride = core::mem::size_of::<Elf64_Phdr>();
+    let end = ehdr.e_phoff as usize + core::mem::size_of_val(phdrs);
+    let mut bytes = alloc::vec![0; end];
+    // SAFETY: these initialized ELF records have their declared C layouts.
+    let header = unsafe { slice_from_ref(ehdr) };
+    bytes[..header.len()].copy_from_slice(header);
+    let note_at = phdrs[0].p_offset as usize;
+    bytes[note_at..note_at + notes.len()].copy_from_slice(notes);
+    for (i, phdr) in phdrs.iter().enumerate() {
+        let start = ehdr.e_phoff as usize + i * stride;
+        // SAFETY: same initialized ELF record layout.
+        bytes[start..start + stride].copy_from_slice(unsafe { slice_from_ref(phdr) });
+    }
+    // One sequential write rather than a small filesystem write per VMA.
+    // A short/interrupted write retains the notes before the large table.
+    write_at(file, limit, 0, &bytes)
 }
 
 /// `struct elf_prpsinfo` — the note that tells a debugger *which* process this
@@ -256,7 +291,27 @@ pub(crate) fn build_note_segment(
     buf
 }
 
-pub fn write_coredump(task: u64, _signum: u32, state: &UserState) {
+pub fn write_coredump(task: u64, signum: u32, state: &UserState) {
+    // Fatal path only: publish the cause before any optional dump-file I/O
+    // can fail or stall. This also covers RLIMIT_CORE=0. Do not put this
+    // diagnostic on the normal trap/syscall path.
+    let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task);
+    let exe = crate::handlers::proc_exe_path(pid);
+    use core::fmt::Write;
+    #[cfg(target_arch = "x86_64")]
+    let _ = writeln!(
+        narf_console::Writer,
+        "coredump: fatal pid={pid} tid={task} exe={} signal={signum} rip={:#x} rsp={:#x} rbp={:#x} rax={:#x} rdi={:#x} rsi={:#x} rdx={:#x}",
+        exe.as_deref().unwrap_or("?"), state.rip, state.rsp, state.rbp,
+        state.rax, state.rdi, state.rsi, state.rdx
+    );
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = writeln!(
+        narf_console::Writer,
+        "coredump: fatal pid={pid} tid={task} exe={} signal={signum} pc={:#x} sp={:#x} lr={:#x} x0={:#x} x1={:#x}",
+        exe.as_deref().unwrap_or("?"), state.pc, state.sp, state.x[30],
+        state.x[0], state.x[1]
+    );
     // `fs/coredump.c`: `cprm.limit = rlimit(RLIMIT_CORE)`, then
     // `if (cprm->limit < binfmt->min_coredump) return false;` — and
     // binfmt_elf sets `min_coredump = ELF_EXEC_PAGESIZE`. So a limit under
@@ -379,10 +434,8 @@ pub fn write_coredump(task: u64, _signum: u32, state: &UserState) {
     }
 
     let mut phdrs = Vec::new();
-    let note_offset = 64 + num_phdrs as u64 * 56;
     // Process identity for NT_PRPSINFO, from the same /proc bookkeeping that
     // serves `comm` and `cmdline`.
-    let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task);
     let mut prpsinfo = ElfPrpsinfo {
         pr_pid: pid as i32,
         ..ElfPrpsinfo::default()
@@ -417,6 +470,8 @@ pub fn write_coredump(task: u64, _signum: u32, state: &UserState) {
     let auxv = crate::handlers::proc_auxv_of(pid);
     let note_buf = build_note_segment(&user_regs, &prpsinfo, &auxv);
     let note_size = note_buf.len() as u64;
+    let (phoff, note_offset, data_offset) = metadata_offsets(num_phdrs, note_buf.len());
+    ehdr.e_phoff = phoff;
 
     phdrs.push(Elf64_Phdr {
         p_type: 4, // PT_NOTE
@@ -429,7 +484,7 @@ pub fn write_coredump(task: u64, _signum: u32, state: &UserState) {
         p_align: 0,
     });
 
-    let mut current_offset = align_up(note_offset + note_size);
+    let mut current_offset = data_offset;
 
     for r in &regions {
         let mut flags = 0;
@@ -456,24 +511,11 @@ pub fn write_coredump(task: u64, _signum: u32, state: &UserState) {
         current_offset = align_up(current_offset + r.len);
     }
 
-    // Write Elf64_Ehdr
-    // SAFETY: ehdr is valid reference, size matches.
-    let ehdr_slice = unsafe { slice_from_ref(&ehdr) };
-    if write_at(file.as_ref(), limit, 0, ehdr_slice).is_err() {
-        return;
-    }
-
-    // Write Elf64_Phdrs
-    for (i, ph) in phdrs.iter().enumerate() {
-        // SAFETY: ph is valid reference, size matches.
-        let ph_slice = unsafe { slice_from_ref(ph) };
-        if write_at(file.as_ref(), limit, 64 + i as u64 * 56, ph_slice).is_err() {
-            return;
-        }
-    }
-
-    // Write the notes built above.
-    if write_at(file.as_ref(), limit, note_offset, &note_buf).is_err() {
+    if let Err(error) = write_metadata(file.as_ref(), limit, &ehdr, &phdrs, &note_buf) {
+        let _ = writeln!(
+            narf_console::Writer,
+            "coredump: pid={pid} metadata write failed: {error:?}"
+        );
         return;
     }
 
@@ -485,6 +527,9 @@ pub fn write_coredump(task: u64, _signum: u32, state: &UserState) {
         let mut page_idx = 0;
 
         while bytes_left > 0 {
+            if offset >= limit {
+                return;
+            }
             let chunk_len = core::cmp::min(bytes_left, 4096);
             let phys = r.phys.get(page_idx).copied().unwrap_or(PhysAddr::new(0));
 
@@ -509,3 +554,7 @@ pub fn write_coredump(task: u64, _signum: u32, state: &UserState) {
         }
     }
 }
+
+#[cfg(feature = "kernel-test")]
+#[path = "coredump_tests.rs"]
+mod tests;

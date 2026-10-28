@@ -1451,6 +1451,10 @@ mod gpu_backend_tests {
             "-device",
             "virtio-gpu-pci,id=vgpu0",
             "-device",
+            "bochs-display,id=bochs0",
+            "-device",
+            "virtio-vga-gl,id=vgpu1",
+            "-device",
             "nvme,drive=nvm0",
         ]
         .iter()
@@ -1460,6 +1464,30 @@ mod gpu_backend_tests {
             without_emulated_display(args),
             ["-device", "nvme,drive=nvm0", "-vga", "none"]
         );
+    }
+
+    #[test]
+    fn host_cpu_keeps_q35_bars_inside_narf_mappings() {
+        for cpu in ["max", "host", "host,-x2apic", "host,host-phys-bits=on"] {
+            assert_eq!(
+                Arch::clamp_cpu_phys_bits(cpu.to_string()),
+                format!("{cpu},phys-bits=40,host-phys-bits-limit=40")
+            );
+        }
+        for (cpu, bits) in [("host,phys-bits=39", 39), ("max,phys-bits=40", 40)] {
+            assert_eq!(
+                Arch::clamp_cpu_phys_bits(cpu.to_string()),
+                format!("{cpu},host-phys-bits-limit={bits}")
+            );
+        }
+        for cpu in [
+            "host,host-phys-bits-limit=42",
+            "host,phys-bits=39,host-phys-bits-limit=39",
+            "max,phys-bits=40,host-phys-bits-limit=40",
+            "EPYC-Rome",
+        ] {
+            assert_eq!(Arch::clamp_cpu_phys_bits(cpu.to_string()), cpu);
+        }
     }
 
     #[test]
@@ -1651,24 +1679,26 @@ impl Arch {
         }
     }
 
-    /// Clamp a `max`-family QEMU CPU model's advertised physical-address
-    /// width to 40 bits (1 TiB) unless the caller already pinned
-    /// `phys-bits`. `-cpu max` otherwise reports the host's width (often
-    /// 46-52 bits), which makes QEMU park the q35 64-bit PCI hole — and
-    /// every 64-bit device BAR (NVMe, virtio) — up near the top of that
-    /// space (~14 TiB observed at -m 8192). NARF maps MMIO through the
-    /// identity window, whose high-MMIO range only covers phys
-    /// [512 GiB, 1 TiB), so a BAR above 1 TiB #PFs on first register
-    /// access once RAM is large enough to push the hole up. Capping to
-    /// 40 bits keeps the hole inside [~992 GiB, 1 TiB) — within the
-    /// mapped window — and mirrors real laptops, whose firmware already
-    /// parks BARs at 512 GiB-1016 GiB. Non-`max` explicit models
-    /// (EPYC-Rome/Genoa) are left untouched.
+    /// Keep q35's automatic high-MMIO placement within the intended 1 TiB
+    /// window for `max` and `host`. KVM's host physical-width passthrough can
+    /// override `phys-bits`, so it needs the matching host limit as well.
+    /// Without it, a live `host,phys-bits=40` VM reported 48 effective bits
+    /// and placed the GPU BAR near 14 TiB. Explicit `phys-bits` receives its
+    /// matching limit; an explicit host limit or named model stays unchanged.
     fn clamp_cpu_phys_bits(cpu: String) -> String {
-        if cpu.contains("max") && !cpu.contains("phys-bits") {
-            format!("{cpu},phys-bits=40")
-        } else {
-            cpu
+        if !matches!(cpu.split(',').next(), Some("max" | "host"))
+            || cpu
+                .split(',')
+                .any(|option| option.starts_with("host-phys-bits-limit="))
+        {
+            return cpu;
+        }
+        match cpu
+            .split(',')
+            .find_map(|option| option.strip_prefix("phys-bits="))
+        {
+            Some(bits) => format!("{cpu},host-phys-bits-limit={bits}"),
+            None => format!("{cpu},phys-bits=40,host-phys-bits-limit=40"),
         }
     }
 
@@ -4699,7 +4729,7 @@ fn qemu_boot_args(args: &BuildArgs, kernel: &Path) -> Result<Vec<String>> {
     Ok(qemu_args)
 }
 
-/// `qemu_args` without virtio-gpu devices and with `-vga none`.
+/// Remove explicit emulated displays as well as the default VGA adapter.
 fn without_emulated_display(qemu_args: Vec<String>) -> Vec<String> {
     let mut out = Vec::with_capacity(qemu_args.len() + 2);
     let mut it = qemu_args.into_iter().peekable();
@@ -4707,7 +4737,11 @@ fn without_emulated_display(qemu_args: Vec<String>) -> Vec<String> {
         let next_is = |it: &mut std::iter::Peekable<std::vec::IntoIter<String>>, p: &str| {
             it.peek().is_some_and(|n| n.starts_with(p))
         };
-        if arg == "-device" && next_is(&mut it, "virtio-gpu") {
+        if arg == "-device"
+            && (next_is(&mut it, "virtio-gpu")
+                || next_is(&mut it, "virtio-vga")
+                || next_is(&mut it, "bochs-display"))
+        {
             it.next();
             continue;
         }
@@ -13717,8 +13751,8 @@ interface_resolution: 1024x768
          \x20 probes.\n\
          \x20 -cpu max is required: the kernel uses RDTSCP / RDSEED / etc. that the\n\
          \x20 default qemu64 model doesn't expose.\n\
-         \x20 -m 1024M leaves room for the kernel image (~52 MiB at LOAD_BASE 32 MiB)\n\
-         \x20 + UEFI's reservations + the 32 MiB static heap arena."
+         \x20 -m 1024M leaves room for the complete kernel image at LOAD_BASE 256 MiB\n\
+         \x20 + UEFI's reservations + the bundled initramfs (raise RAM for large firmware sets)."
     );
     Ok(())
 }
@@ -15659,8 +15693,8 @@ fn passthrough_cmd(args: &PassthroughArgs) -> Result<()> {
         );
     }
 
-    // `phys-bits=40` is already applied to `-cpu max` by
-    // `Arch::clamp_cpu_phys_bits`, and it is what keeps the q35 64-bit PCI
+    // `phys-bits=40,host-phys-bits-limit=40` is applied to `max` and `host`
+    // by `Arch::clamp_cpu_phys_bits`. Both keep the q35 64-bit PCI
     // hole — and so the card's BARs — inside the window NARF maps. Do not
     // override `NARF_QEMU_CPU` with a wider width here.
     let cli_devices = args
@@ -15675,7 +15709,7 @@ fn passthrough_cmd(args: &PassthroughArgs) -> Result<()> {
         qemu_fragment(&args.devices)
     );
     println!(
-        "Leave NARF_QEMU_CPU unset: the default `max` is clamped to phys-bits=40,\n\
+        "The default `max` and KVM `host` CPU models use phys-bits=40,host-phys-bits-limit=40,\n\
          which parks the q35 64-bit PCI hole inside the phys range NARF maps.\n"
     );
     Ok(())

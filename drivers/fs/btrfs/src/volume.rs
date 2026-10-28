@@ -12,7 +12,7 @@
 //! address), drop the guard, then do I/O. Holding a spinlock across
 //! `poll_blocking` would wedge the volume under an IRQ-driven backend.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -339,11 +339,12 @@ impl<B: BlockDevice> VolCore<B> {
             .lock()
             .values
             .retain(|&(t, _), _| t != tree);
+        self.orphans.lock().retain(|&(t, _)| t != tree);
     }
 
     /// The live [`MmapAnchor`] of inode `ino` in fs tree `tree`, created on
     /// first use. Dead entries are pruned as the table grows.
-    pub(crate) fn mmap_anchor(&self, tree: u64, ino: u64) -> Arc<MmapAnchor> {
+    pub(crate) fn mmap_anchor(&self, tree: u64, ino: u64, inode: InodeItem) -> Arc<MmapAnchor> {
         let mut anchors = self.mmap_anchors.lock();
         if let Some(anchor) = anchors.get(&(tree, ino)).and_then(Weak::upgrade) {
             return anchor;
@@ -354,9 +355,38 @@ impl<B: BlockDevice> VolCore<B> {
         let anchor = Arc::new(MmapAnchor {
             _tree: tree,
             _ino: ino,
+            inode: IrqSafeSpinLock::new(inode),
+            live_size: core::sync::atomic::AtomicU64::new(inode.size),
         });
         anchors.insert((tree, ino), Arc::downgrade(&anchor));
         anchor
+    }
+
+    pub(crate) fn inode_is_open(&self, tree: u64, ino: u64) -> bool {
+        self.mmap_anchors
+            .lock()
+            .get(&(tree, ino))
+            .is_some_and(|inode| inode.strong_count() != 0)
+    }
+
+    pub(crate) fn note_orphan(&self, tree: u64, ino: u64) {
+        self.orphans.lock().insert((tree, ino));
+        let anchor = self
+            .mmap_anchors
+            .lock()
+            .get(&(tree, ino))
+            .and_then(Weak::upgrade);
+        if let Some(anchor) = anchor {
+            anchor.inode.lock().nlink = 0;
+        }
+    }
+
+    pub(crate) fn orphan_snapshot(&self) -> Vec<(u64, u64)> {
+        self.orphans.lock().iter().copied().collect()
+    }
+
+    pub(crate) fn forget_orphan(&self, tree: u64, ino: u64) {
+        self.orphans.lock().remove(&(tree, ino));
     }
 
     /// The transaction accumulating operations that have not committed yet.
@@ -400,6 +430,8 @@ impl<B: BlockDevice> VolCore<B> {
 pub(crate) struct MmapAnchor {
     _tree: u64,
     _ino: u64,
+    pub(crate) inode: IrqSafeSpinLock<InodeItem>,
+    pub(crate) live_size: core::sync::atomic::AtomicU64,
 }
 
 /// Content-generation counters for one filesystem instance, backing
@@ -453,6 +485,9 @@ impl CacheGenerations {
 pub struct VolCore<B: BlockDevice> {
     /// Live [`MmapAnchor`]s by `(fs tree id, inode number)`.
     mmap_anchors: IrqSafeSpinLock<BTreeMap<(u64, u64), Weak<MmapAnchor>>>,
+    /// Unlinked inode items are persisted with Linux ORPHAN_ITEM records.
+    /// Cleanup waits for every lookup/mapping anchor, then runs under op_lock.
+    orphans: IrqSafeSpinLock<BTreeSet<(u64, u64)>>,
     /// Per-inode content generations backing
     /// `FileOps::mmap_cache_generation`, keyed by the same
     /// `(fs tree id, inode number)` pair as `mmap_anchors`: the
@@ -645,6 +680,9 @@ fn commit_on_last_drop<B: BlockDevice + 'static>(core: &Arc<VolCore<B>>) {
     let mut commit: core::pin::Pin<
         alloc::boxed::Box<dyn core::future::Future<Output = ()> + Send>,
     > = alloc::boxed::Box::pin(async move {
+        // Drop makes accepted changes durable; it does not start a new
+        // eviction transaction. Unreaped ORPHAN_ITEMs remain recoverable at
+        // the next writable mount, even when no scheduler work can run.
         if let Err(error) = view.sync_to_disk().await {
             let _ = writeln!(
                     narf_console::Writer,
@@ -1520,6 +1558,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if let Some(sel) = subvol {
             volume.switch_to_subvol(&sel).await?;
         }
+        volume.recover_orphans().await?;
         Ok(volume)
     }
 
@@ -1534,6 +1573,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if let Some(sel) = subvol {
             volume.switch_to_subvol(&sel).await?;
         }
+        volume.recover_orphans().await?;
         Ok(volume)
     }
 
@@ -1863,6 +1903,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
         let core = Arc::new(VolCore {
             mmap_anchors: IrqSafeSpinLock::new(BTreeMap::new()),
+            orphans: IrqSafeSpinLock::new(BTreeSet::new()),
             cache_generations: IrqSafeSpinLock::new(CacheGenerations::new()),
             device: source_device,
             magic: superblock.magic,
@@ -1995,6 +2036,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if let Some(selector) = &subvol {
             volume.switch_to_subvol(selector).await?;
         }
+        volume.recover_orphans().await?;
         Ok(volume)
     }
 
@@ -2196,7 +2238,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             return self.select_default_root().await;
         }
         crate::write::replay_log(self).await?;
-        self.select_default_root().await
+        self.select_default_root().await?;
+        self.recover_orphans().await
     }
 
     /// Root this mount at the top-level tree, cache its root inode, then honour
@@ -2442,6 +2485,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// between another CPU's tree reads and its staging.
     pub async fn sync_to_disk_exclusive(&self) -> Result<(), FsError> {
         let _op = self.op_lock().lock().await;
+        self.reap_orphans().await?;
         self.sync_to_disk().await
     }
 

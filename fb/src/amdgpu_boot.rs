@@ -171,6 +171,14 @@ pub(super) fn start() -> InitResult {
         "amdgpu: {generation} framebuffer {}",
         if paused() { "quarantined" } else { "available" }
     );
+    // Both display owners select HDMI depth during their first modeset.
+    // Apply the setting before either owner can consume it.
+    if let Some(bpc) = narf_boot::args()
+        .value("amdgpu.max_bpc")
+        .and_then(|v| v.parse::<u8>().ok())
+    {
+        navi48::set_max_bpc(bpc);
+    }
     if ok && !navi48 {
         // Display detection programs the HPD, AUX and DDC engines. RDNA2
         // native display is on by default (`amdgpu.native_display=0` keeps
@@ -206,13 +214,6 @@ pub(super) fn start() -> InitResult {
         // Publish the sysfs power controls (`pp_features`,
         // `power_dpm_force_performance_level`) with the running PMFW mask.
         narf_scheduler::block_on_spin(narf_drivers_gpu::amdgpu_rdna2_power_controls::publish());
-    }
-    // `amdgpu.max_bpc=10|12`: allow HDMI deep colour, as DRM's max bpc.
-    if let Some(bpc) = narf_boot::args()
-        .value("amdgpu.max_bpc")
-        .and_then(|v| v.parse::<u8>().ok())
-    {
-        navi48::set_max_bpc(bpc);
     }
     // `amdgpu.dcfeaturemask`: bit 0x400 (Linux's DC_FRL_MASK)
     // enables HDMI FRL when TMDS cannot carry a mode. Decimal or 0x hex.
@@ -444,10 +445,11 @@ fn completed(generation: &str, result: impl core::fmt::Debug, status: impl core:
 /// unless `amdgpu.rdna2_hw_cursor=0`.
 fn navi22_native_display() {
     use core::fmt::Write;
-    platform::set_hw_cursor(
-        narf_drivers_gpu::amdgpu_rdna2::options::BootOptions::parse(narf_boot::args().raw())
-            .hw_cursor,
-    );
+    let options =
+        narf_drivers_gpu::amdgpu_rdna2::options::BootOptions::parse(narf_boot::args().raw());
+    platform::set_hw_cursor(options.hw_cursor);
+    narf_drivers_gpu::amdgpu_navi22_bios::set_dmub_tables(options.dmub_tables);
+    narf_drivers_gpu::amdgpu_navi22_bios::set_atom_pixclk(options.atom_pixclk);
     // SAFETY: final synchronous boot initcall after a successful firmware run;
     // no other display client exists and only the console writes scanout.
     let lit = narf_scheduler::block_on_spin(unsafe {

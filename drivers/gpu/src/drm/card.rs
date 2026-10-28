@@ -999,7 +999,9 @@ pub struct NativeOutput {
     pub connector: u32,
     /// The sink's base EDID block, reported verbatim; None when unplugged.
     pub edid: Option<[u8; 128]>,
-    /// Exact timings, parallel to the connector's `modes`.
+    /// Exact driver-admitted timings, authoritative for GETCONNECTOR.
+    /// Several may share a size and rounded refresh represented by only
+    /// one entry in the connector's simplified `modes` list.
     pub timings: Vec<crate::drm::ioctl::DrmModeModeInfo>,
     /// The connector's "Broadcast RGB" value (0 Automatic, 1 Full,
     /// 2 Limited 16:235), when it has the property.
@@ -1853,8 +1855,9 @@ impl Card {
     /// drm_gem_object_lookup): amdgpu's checks as for a dumb buffer, with
     /// the buffer's own size, `GEM_METADATA` tiling flags and
     /// AMDGPU_GEM_CREATE_GFX12_DCC (amdgpu_display_get_fb_info). The
-    /// framebuffer holds the buffer until it is removed. Other cards have
-    /// no amdgpu GEM handles (`BadGemHandle`).
+    /// framebuffer holds the buffer until it is removed. The DCN30 native
+    /// atomic card accepts only LINEAR 8888 without DCC; other cards without
+    /// a native amdgpu presenter have no GEM handles (`BadGemHandle`).
     #[cfg(feature = "amdgpu")]
     pub fn addfb2_bo(
         &mut self,
@@ -1863,7 +1866,8 @@ impl Card {
         owner: u64,
     ) -> Result<u32, CardError> {
         use crate::amdgpu_dm_modifiers as m;
-        if !self.gfx12_modifiers {
+        let linear = crate::amdgpu_native_kms::linear_gem_card(self);
+        if !self.gfx12_modifiers && !linear {
             return Err(CardError::BadGemHandle);
         }
         let info = m::check_fb_cmd(cmd).map_err(|_| CardError::InvalidDimensions)?;
@@ -1878,6 +1882,11 @@ impl Card {
             object.byte_len,
         )
         .map_err(|_| CardError::UnknownFormat)?;
+        if linear
+            && (modifier != 0 || dcc || !matches!(cmd.pixel_format, 0x3432_5258 | 0x3432_5241))
+        {
+            return Err(CardError::UnknownFormat);
+        }
         let format = PixelFormat::from_fourcc(cmd.pixel_format).ok_or(CardError::UnknownFormat)?;
         if self.framebuffers.len() >= 4096 {
             return Err(CardError::TooManyFbs);

@@ -272,6 +272,56 @@ fn firmware() -> Firmware {
         display: None,
     }
 }
+fn navi22_boot_retains_board_bios_for_reset_and_recovery() -> TestResult {
+    let mut original = gpu();
+    original.vbios = Some(crate::amdgpu_vbios::tests::fixture());
+    let bios = original.vbios.as_ref().unwrap();
+    let expected = bios.bytes().to_vec();
+    let source = bios.source();
+    let original_ptr = bios.bytes().as_ptr();
+    let pool = pool(16 << 20);
+    // SAFETY: construction only copies metadata and reserves owned storage;
+    // it performs no I/O through these intentionally unmapped addresses.
+    let first = unsafe { ColdBoot::new(&original, Cap::bootstrap(), &pool, firmware()) }.unwrap();
+    let Some(bios) = first.sequence.backend.gpu.vbios.as_ref() else {
+        return TestResult::Fail("cold boot discarded the board BIOS before reset/post");
+    };
+    if bios.bytes() != expected || bios.source() != source || bios.bytes().as_ptr() == original_ptr
+    {
+        return TestResult::Fail("cold-boot BIOS changed source/bytes or aliases the controller");
+    }
+    // Recovery rebuilds through new_rdna2 using the first owner's snapshot.
+    // Exercise that handoff too, without issuing a reset or publishing queues.
+    let retained_ptr = bios.bytes().as_ptr();
+    // SAFETY: same no-I/O construction contract; neither owner has been run.
+    let second = unsafe {
+        ColdBoot::new_rdna2(
+            &first.sequence.backend.gpu,
+            Cap::bootstrap(),
+            &pool,
+            firmware(),
+        )
+    }
+    .unwrap();
+    drop(first);
+    drop(original);
+    let Some(bios) = second.sequence.backend.gpu.vbios.as_ref() else {
+        return TestResult::Fail("recovery snapshot discarded the retained board BIOS");
+    };
+    if bios.bytes() != expected || bios.source() != source || bios.bytes().as_ptr() == retained_ptr
+    {
+        return TestResult::Fail("recovery BIOS does not own the original validated board image");
+    }
+    if snapshot(&gpu()).unwrap().vbios.is_some() {
+        return TestResult::Fail("snapshot fabricated a BIOS for a BIOS-less GPU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_boot_retains_board_bios_for_reset_and_recovery
+);
+
 fn navi22_runtime_commands_require_completed_boot_and_retained_tmr() -> TestResult {
     let pool = pool(16 << 20);
     let authority = Cap::bootstrap();
@@ -376,6 +426,7 @@ kernel_test_in!(
 );
 fn navi22_boot_training_failure_prevents_sos_publication() -> TestResult {
     let mut gpu = gpu();
+    gpu.vbios = Some(crate::amdgpu_vbios::tests::fixture());
     gpu.fb_bar.len = 64 << 20;
     gpu.vram.visible_size = 64 << 20;
     let mut regs = vec![0; gpu.regs.len as usize / 4];
@@ -397,8 +448,18 @@ fn navi22_boot_training_failure_prevents_sos_publication() -> TestResult {
     if regs != original
         || pool.available() != 16 << 20
         || boot.training_state() != Some(gddr6::State::Prepared)
+        || boot
+            .sequence
+            .backend
+            .gpu
+            .vbios
+            .as_ref()
+            .map(|bios| (bios.bytes(), bios.source()))
+            != gpu.vbios.as_ref().map(|bios| (bios.bytes(), bios.source()))
     {
-        return TestResult::Fail("training constructor changed MMIO or claimed the SOS mailbox");
+        return TestResult::Fail(
+            "training constructor changed MMIO, claimed SOS or discarded the board BIOS",
+        );
     }
     let error = Error::Training(gddr6::Error::DeviceGone);
     if run(boot.run()) != Err(error)

@@ -690,3 +690,36 @@ fn smoke_kernel_ioremap_ram_stays_writeback() -> TestResult {
     result
 }
 kernel_test_in!("memory/memtype", smoke_kernel_ioremap_ram_stays_writeback);
+
+/// A large prefetchable PCI BAR must fit the ioremap window and use huge
+/// leaves, so probing a 16 GiB GPU BAR does not allocate millions of PTEs.
+#[cfg(target_arch = "x86_64")]
+fn smoke_ioremap_16gib_bar() -> TestResult {
+    use crate::ioremap::{ioremap, iounmap, MmioAttrs};
+    const BAR: u64 = 0x10_0000_0000;
+    const LEN: u64 = 16 * 1024 * 1024 * 1024;
+    // SAFETY: this synthetic, non-RAM range is never dereferenced; the test
+    // only installs and removes page-table entries for the large-BAR path.
+    let mapping = unsafe { ioremap(BAR, LEN, MmioAttrs::WriteCombining) };
+    let Ok(mapping) = mapping else {
+        return TestResult::Fail("16 GiB BAR ioremap failed");
+    };
+    // SAFETY: this smoke runs in kernel context with an active page table.
+    let root = unsafe { crate::x86_64::paging::read_cr3() };
+    let all_huge = (0..LEN).step_by(2 * 1024 * 1024).all(|offset| {
+        // SAFETY: this address is inside the retained mapping.
+        unsafe {
+            crate::x86_64::paging::leaf_flags_at(root, VirtAddr::new(mapping.virt + offset))
+                .is_some_and(|(_, size)| size == 2 * 1024 * 1024)
+        }
+    });
+    // SAFETY: the synthetic mapping has no users or outstanding accesses.
+    unsafe { iounmap(mapping) };
+    if all_huge {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("16 GiB BAR did not use 2 MiB leaves throughout")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory/ioremap", smoke_ioremap_16gib_bar);

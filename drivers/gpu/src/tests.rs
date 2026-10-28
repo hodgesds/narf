@@ -6480,7 +6480,12 @@ fn smoke_drm_addfb2_rmfb_roundtrip() -> TestResult {
         Err(_) => return TestResult::Fail("fb lookup by id failed"),
     }
     let rmfb_arg = fb_id.to_le_bytes();
-    match dispatch(&mut card, 0xA8, &rmfb_arg, &ctx) {
+    match dispatch(
+        &mut card,
+        crate::drm_uapi::DRM_IOCTL_MODE_RMFB,
+        &rmfb_arg,
+        &ctx,
+    ) {
         Ok(DrmIoctlResult::RmFb) => {}
         Ok(_) => return TestResult::Fail("RMFB wrong type"),
         Err(_) => return TestResult::Fail("RMFB failed"),
@@ -8829,8 +8834,8 @@ fn smoke_amdgpu_gc_window_and_dword_conversion() -> TestResult {
     if GRBM_GFX_INDEX_REL != 0x2200 * 4 || GRBM_STATUS_REL_GFX11 != 0x0DA4 * 4 {
         return TestResult::Fail("the *_REL constants are byte offsets");
     }
-    // MM_INDEX takes the dword, so a caller must convert — adding the byte
-    // offset straight to a dword base lands four times further in.
+    // The helper API takes DWORD IDs; it scales to byte addresses only at
+    // MM_INDEX. Adding a byte offset to a DWORD base scales it twice.
     if mm_dword(GRBM_GFX_INDEX_REL) != 0x2200 || mm_dword(GRBM_STATUS_REL_GFX11) != 0x0DA4 {
         return TestResult::Fail("mm_dword must undo the byte scaling");
     }
@@ -13511,8 +13516,8 @@ kernel_test_in!(
 /// from the first register of its block, which is what the tables stored. That
 /// verified the offsets and left two things it structurally could not see: the
 /// per-block bases those offsets were added to, and the unit — `DcnWrite::addr`
-/// goes into MM_INDEX, which takes a dword address, while the tables were in
-/// bytes. The ids are absolute now and this checks them directly.
+/// goes into helpers that accept DWORD IDs, while the tables were in bytes.
+/// The IDs are absolute now; the hardware boundary converts them to bytes.
 fn smoke_amdgpu_dcn_offsets_match_headers() -> TestResult {
     use crate::amdgpu_dcn::*;
 

@@ -2227,6 +2227,10 @@ pub(crate) fn dispatch_card_for_file(
         // SETCRTC / PAGE_FLIP — blit dumb buffer into the active scanout.
         IoctlCmd::ModeSetCrtc => handle_setcrtc(card_index, &mode_state, arg, &ctx),
         IoctlCmd::ModePageFlip => handle_page_flip(card_index, &mode_state, arg, &ctx, events),
+        // DIRTYFB — the client wrote into a framebuffer on screen; a CRTC
+        // that copies (rather than scans the dumb buffer in place) presents
+        // it again. Xorg's modesetting driver relies on it for its shadow.
+        IoctlCmd::ModeDirtyFb => handle_dirty_fb(card_index, &mode_state, arg, &ctx),
         // CURSOR / CURSOR2 — a card with native cursor planes (Navi48)
         // updates the CRTC's cursor plane (drm_mode_cursor_universal).
         // Otherwise there is no hardware cursor plane: funnel the pointer
@@ -4504,7 +4508,7 @@ fn handle_obj_getproperties(
                 .map(|f| f.height)
                 .or_else(|| crtc.mode.map(|m| m.height))
                 .unwrap_or(0);
-            (
+            let (mut props, mut values) = (
                 vec![
                     PLANE_TYPE_PROP_ID,
                     PLANE_FB_ID_PROP_ID,
@@ -4539,7 +4543,17 @@ fn handle_obj_getproperties(
                     // matching drm_atomic_plane_get_property.
                     (-1i64) as u64,
                 ],
-            )
+            );
+            #[cfg(feature = "amdgpu")]
+            if crate::amdgpu_native_kms::linear_gem_card(&card) {
+                // GBM must choose LINEAR explicitly for the DCN30 copy
+                // presenter rather than infer an AMD tiled layout.
+                props.push(crate::drm_native_planes::IN_FORMATS_PROP_ID);
+                values.push(u64::from(crate::drm_native_planes::in_formats_blob_id(
+                    obj_id,
+                )));
+            }
+            (props, values)
         } else if obj_type == DRM_MODE_OBJECT_CRTC {
             let crtc = card.crtc(obj_id).map_err(|_| FsError::InvalidData)?;
             let mut props = vec![
@@ -5764,6 +5778,9 @@ fn atomic_commit(
                         card.dumb_backing(gem_handle).map(|backing| backing.phys),
                         (fb.pitch, fb.width, fb.height, fb.format as u32),
                         fb_id,
+                        fb.bo
+                            .as_ref()
+                            .and_then(|_| prepared_frame(&card, fb, &prepared)),
                         flip_tickets
                             .iter()
                             .find(|(id, _)| *id == crtc_id)
@@ -5815,11 +5832,20 @@ fn atomic_commit(
     }
     #[cfg(not(feature = "amdgpu"))]
     let _ = &native_presentation;
-    for (crtc_id, resource, src_phys, (pitch, width, height, format), fb_id, flip_ticket) in
-        presentation.into_iter().flatten()
+    for (
+        crtc_id,
+        resource,
+        src_phys,
+        (pitch, width, height, format),
+        fb_id,
+        gem_frame,
+        flip_ticket,
+    ) in presentation.into_iter().flatten()
     {
         if let Some(resource) = resource {
             present_virgl_frame(&resource, width, height)?;
+        } else if let Some(frame) = gem_frame {
+            present_frame(card_index, crtc_id, frame, flip_ticket);
         } else if let Some(src_phys) = src_phys {
             present_frame(
                 card_index,
@@ -6386,6 +6412,7 @@ pub(crate) fn release_dumb_backing_ref(card_index: u32, gem_handle: u32) {
 // every 512th — so a steady 60 fps costs a line every ~8 seconds.
 
 static SETCRTC_N: AtomicU64 = AtomicU64::new(0);
+static DIRTYFB_N: AtomicU64 = AtomicU64::new(0);
 static PAGEFLIP_N: AtomicU64 = AtomicU64::new(0);
 static ATOMIC_N: AtomicU64 = AtomicU64::new(0);
 static BLIT_N: AtomicU64 = AtomicU64::new(0);
@@ -6752,6 +6779,60 @@ fn note_missing_backing(op: &str, fb_id: u32) {
             "  drm: {op} fb={fb_id} has no dumb backing — nothing presented (#{n})"
         );
     }
+}
+
+/// DRM_IOCTL_MODE_DIRTYFB (`drm_mode_dirtyfb_ioctl`, DRM_MASTER): the
+/// contents of `fb_id` changed. Linux's dumb-buffer drivers flush them to
+/// the display (`drm_atomic_helper_dirtyfb`); here every CRTC showing the
+/// framebuffer presents it again through the same path as SETCRTC. Clip
+/// rectangles are accepted and the whole frame is presented. A GEM
+/// framebuffer is scanned out in place and needs nothing.
+fn handle_dirty_fb(
+    card_index: u32,
+    mode_state: &Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    ctx: &DrmFileCtx,
+) -> Result<u64, FsError> {
+    if !ctx.is_master {
+        return Err(FsError::PermissionDenied);
+    }
+    // struct drm_mode_fb_dirty_cmd { fb_id, flags, color, num_clips: u32;
+    // clips_ptr: u64 } is 24 bytes.
+    // SAFETY: `arg` is the user drm_mode_fb_dirty_cmd pointer.
+    let raw = unsafe { copy_in(arg, 24)? };
+    let fb_id = u32::from_le_bytes(raw[..4].try_into().map_err(|_| FsError::InvalidData)?);
+    let (crtcs, frame) = {
+        let card = mode_state.lock();
+        let fb = card.framebuffer(fb_id).map_err(|_| FsError::NotFound)?;
+        let crtcs: Vec<u32> = card
+            .crtcs
+            .iter()
+            .filter(|c| c.primary_fb == Some(fb_id))
+            .map(|c| c.id)
+            .collect();
+        let frame = if fb.bo.is_some() {
+            None
+        } else {
+            card.dumb_backing(fb.gem_handle)
+                .map(|b| fb_frame(fb, b.phys))
+        };
+        (crtcs, frame)
+    };
+    let (log, n) = should_log(&DIRTYFB_N);
+    if log {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  drm: DIRTYFB #{n} fb={fb_id} crtcs={} backing={}",
+            crtcs.len(),
+            if frame.is_some() { "yes" } else { "NONE" }
+        );
+    }
+    if let Some(f) = frame {
+        for crtc in crtcs {
+            present_frame(card_index, crtc, f.clone(), None);
+        }
+    }
+    Ok(0)
 }
 
 /// DRM_IOCTL_MODE_PAGE_FLIP — same blit as SETCRTC, no vblank event.
@@ -7593,9 +7674,9 @@ fn handle_generic(
             // SAFETY: `arg` is the validated user drm_get_cap pointer (16 bytes).
             unsafe { copy_out(arg, &out)? };
         }
-        // fb_id is the first __u32 of struct drm_mode_fb_cmd2.
+        // fb_id is the first __u32 of both drm_mode_fb_cmd and fb_cmd2.
         crate::drm::ioctl::DrmIoctlResult::AddFb2(fb_id) if arg != 0 => {
-            // SAFETY: `arg` is the validated user drm_mode_fb_cmd2 pointer.
+            // SAFETY: `arg` is the validated user framebuffer request pointer.
             unsafe { copy_out(arg, &fb_id.to_le_bytes())? };
         }
         _ => {}
@@ -7765,7 +7846,7 @@ pub fn amdgpu_dumb_metadata(card_index: u32, cmd: u32, arg: usize) -> Option<Res
     }
 }
 
-/// `DRM_IOCTL_MODE_ADDFB2` on the native amdgpu card naming an amdgpu GEM
+/// `DRM_IOCTL_MODE_ADDFB` / `ADDFB2` on the native amdgpu card naming an amdgpu GEM
 /// handle of the calling open (`gem`, owner `open_id`):
 /// amdgpu_display_user_framebuffer_create's drm_gem_object_lookup in the
 /// file's own handle table, then `Card::addfb2_bo`. `None` for another
@@ -7779,19 +7860,38 @@ pub fn amdgpu_addfb2_bo(
     arg: usize,
     gem: &crate::amdgpu_gem::GemState,
 ) -> Option<Result<u64, FsError>> {
-    if cmd != drm_uapi::DRM_IOCTL_MODE_ADDFB2 || arg == 0 {
+    let legacy = cmd == drm_uapi::DRM_IOCTL_MODE_ADDFB;
+    if (!legacy && cmd != drm_uapi::DRM_IOCTL_MODE_ADDFB2) || arg == 0 {
         return None;
     }
     let mode_state = crate::drm_registry::mode_state(card_index)?;
     if !mode_state.lock().gfx12_modifiers {
         return None;
     }
-    // SAFETY: `arg` is the ioctl pointer; drm_mode_fb_cmd2 is 104 bytes.
-    let b = match unsafe { copy_in(arg, 104) } {
+    let size = if legacy {
+        drm_uapi::SZ_DRM_MODE_FB_CMD
+    } else {
+        drm_uapi::SZ_DRM_MODE_FB_CMD2
+    };
+    // SAFETY: `arg` is the ioctl pointer; the selected Linux request size is
+    // 28 (fb_cmd) or 104 (fb_cmd2), checked by copy_in.
+    let b = match unsafe { copy_in(arg, size as usize) } {
         Ok(b) => b,
         Err(e) => return Some(Err(e)),
     };
-    let fb = crate::drm::fb_cmd::FbCmd::parse(&b)?;
+    let fb = if legacy {
+        // This helper is reached only from the primary node. Match the
+        // generic legacy handler's display-authority gate before allocating.
+        if !mode_state.lock().is_master(open_id) {
+            return Some(Err(FsError::PermissionDenied));
+        }
+        match crate::drm::ioctl::legacy_fb_cmd(&b) {
+            Ok(fb) => fb,
+            Err(e) => return Some(Err(map_err(e))),
+        }
+    } else {
+        crate::drm::fb_cmd::FbCmd::parse(&b)?
+    };
     if !gem.owns(fb.handles[0]) {
         return None;
     }

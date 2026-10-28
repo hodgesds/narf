@@ -70,6 +70,10 @@ and CI compiler-cache integration.
 - `cargo xtask run --arch=x86_64 [--release]` — build + QEMU boot. Optimized
   builds strip debug-only ELF sections by default while retaining ordinary
   symbols; `--debug` retains full debuginfo for GDB and crash diagnosis.
+- `cargo xtask cachyos-root-smoke --prebuilt ELF ...` boots an explicitly
+  selected regular kernel file without rebuilding the shared target artifact.
+  It reports the selected path and SHA-256. Firmware initramfs construction
+  still uses the build options; the caller must supply a compatible kernel.
 - `XTASK_STAGE_BIN=/host/path[:guest/path] cargo xtask run-interactive ...`
   adds one executable host file to the generated initramfs. With no guest path
   it is installed as `/usr/bin/<basename>`, and the boot shell searches
@@ -83,7 +87,14 @@ and CI compiler-cache integration.
   active host IOMMU groups, every requested endpoint bound to `vfio-pci`,
   complete IOMMU-group assignment, and BAR sizes compatible with NARF's mapped
   physical windows. It never unbinds or rebinds host hardware. PCI passthrough
-  is currently x86_64-only.
+  is currently x86_64-only. A passed-through display removes the explicit
+  Bochs and VirtIO display devices as well as the default VGA adapter.
+  The `max` and KVM `host` CPU models default to
+  `phys-bits=40,host-phys-bits-limit=40` so q35's automatic 64-bit PCI BAR
+  placements stay within the intended 1 TiB MMIO window. The host limit
+  prevents KVM physical-width passthrough from overriding `phys-bits`.
+  An explicit `phys-bits=N` receives `host-phys-bits-limit=N`; explicit
+  host limits and other named CPU models retain the caller's policy.
 - `cargo xtask run --arch=x86_64 --gpu-backend=virgl --display=gtk,gl=on`
   — opt into QEMU's OpenGL-backed virtio-gpu device. The default remains
   `--gpu-backend=auto`: graphical runs prefer VirGL when QEMU advertises the
@@ -322,9 +333,13 @@ and CI compiler-cache integration.
 - Kernel ELFs on both architectures carry a deterministic SHA-1 GNU build-ID;
   linker symbols `__build_id_note_start` and `__build_id_note_end` delimit the
   retained note for `/sys/kernel/notes`.
-- The x86_64 ELF uses a 32 MiB physical load base for both PVH and
-  Multiboot2. This keeps its fixed load span above the low-memory ACPI NVS and
-  SMM communication reservations exposed by Secure Boot OVMF.
+- The x86_64 ELF uses a 256 MiB physical load base for both PVH and
+  Multiboot2. The complete load span includes `.bss`; it must avoid firmware
+  reservations, not just place the entry point in free RAM. In particular,
+  the Gigabyte B650I AORUS ULTRA reserves `[0x099ff000, 0x0a000000)`, which
+  a production image at the former 32 MiB base overlapped. The fixed base
+  also clears Secure Boot OVMF's low ACPI NVS/SMM reservations; it does not
+  guarantee compatibility with every physical memory map.
 - Workspace: single Cargo workspace so Global LTO spans everything.
 
 ## 4. Invariants & safety properties

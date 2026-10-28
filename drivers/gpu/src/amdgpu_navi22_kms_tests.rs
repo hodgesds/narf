@@ -77,6 +77,179 @@ fn admitted(_: &Port, _: &[u8]) -> Option<Vec<Timing>> {
     Some(vec![hd(), xga()])
 }
 
+/// Distinct DCN30 timings can round to the same Mode (size and integer Hz).
+/// GETCONNECTOR must still offer the exact timings accepted by SETCRTC,
+/// rather than replacing the whole list with synthesized timings.
+fn navi22_kms_duplicate_geometry_keeps_exact_connector_timings() -> TestResult {
+    use crate::drm::ioctl::{dispatch, DrmIoctlResult};
+    use crate::drm::render_node::DrmFileCtx;
+    let mut card = Card::new("amdgpu", "DCN30 timing fixture", (3, 60, 0));
+    let preferred = Timing {
+        pixel_clock_khz: 533_250,
+        h_active: 3840,
+        h_total: 4000,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active: 2160,
+        v_total: 2222,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: false,
+    };
+    let alternate = Timing {
+        pixel_clock_khz: 594_000,
+        h_total: 4400,
+        h_front_porch: 176,
+        h_sync_width: 88,
+        v_total: 2250,
+        v_front_porch: 8,
+        v_sync_width: 10,
+        ..preferred
+    };
+    let offered = [preferred, alternate];
+    let edid = [1; 128];
+    let crtcs = [Some(crate::amdgpu_navi48_kms::Sink {
+        edid: &edid,
+        timing: &preferred,
+        offered: &offered,
+    })];
+    let connectors = [crate::amdgpu_navi48_kms::RoutedConnector {
+        index: 3,
+        kind: ConnectorType::HdmiA,
+        edid: Some(&edid),
+        offered: &offered,
+        crtc: Some(0),
+        possible_crtcs: 1,
+    }];
+    apply_card(&mut card, &crtcs, &connectors);
+    if card.connectors[0].modes.len() != 1 || card.native[0].timings.len() != 2 {
+        return TestResult::Fail("fixture does not reproduce rounded-mode deduplication");
+    }
+    let id = card.connectors[0].id;
+    let mut request = [0u8; 80];
+    request[48..52].copy_from_slice(&id.to_le_bytes());
+    let Ok(DrmIoctlResult::GetConnector(info, modes)) = dispatch(
+        &mut card,
+        0xc050_64a7,
+        &request,
+        &DrmFileCtx::primary_master(),
+    ) else {
+        return TestResult::Fail("GETCONNECTOR of the DCN30 fixture failed");
+    };
+    if info.count_modes != 2 || modes.len() != 2 {
+        return TestResult::Fail("GETCONNECTOR lost exact timings sharing rounded geometry");
+    }
+    for (wire, timing) in modes.iter().zip(offered) {
+        let expected = crate::amdgpu_navi48_kms::timing_wire(&timing);
+        if wire.clock != expected.clock
+            || wire.hdisplay != expected.hdisplay
+            || wire.hsync_start != expected.hsync_start
+            || wire.hsync_end != expected.hsync_end
+            || wire.htotal != expected.htotal
+            || wire.vdisplay != expected.vdisplay
+            || wire.vsync_start != expected.vsync_start
+            || wire.vsync_end != expected.vsync_end
+            || wire.vtotal != expected.vtotal
+            || wire.flags != expected.flags
+            || !card.accepts_mode(wire)
+        {
+            return TestResult::Fail("GETCONNECTOR offered a synthesized or rejected timing");
+        }
+    }
+    let synthesized = crate::drm::ioctl::mode_to_wire(&card.connectors[0].modes[0]);
+    if card.accepts_mode(&synthesized) {
+        return TestResult::Fail("fixture unexpectedly accepts the old synthesized timing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm/native_modes",
+    navi22_kms_duplicate_geometry_keeps_exact_connector_timings
+);
+
+fn navi22_kms_publication_excludes_rdna4_only_planes_and_modifiers() -> TestResult {
+    let mut card = Card::new("amdgpu", "DCN30 publication fixture", (3, 60, 0));
+    let edid = [1; 128];
+    let timing = hd();
+    let offered = [timing];
+    let crtcs = [Some(crate::amdgpu_navi48_kms::Sink {
+        edid: &edid,
+        timing: &timing,
+        offered: &offered,
+    })];
+    let connectors = [crate::amdgpu_navi48_kms::RoutedConnector {
+        index: 3,
+        kind: ConnectorType::HdmiA,
+        edid: Some(&edid),
+        offered: &offered,
+        crtc: Some(0),
+        possible_crtcs: 1,
+    }];
+    apply_card(&mut card, &crtcs, &connectors);
+    if card.gfx12_modifiers || !card.native_planes.is_empty() || card.overlay_formats.is_some() {
+        return TestResult::Fail("DCN30 advertised RDNA4-only KMS operations");
+    }
+    if !card.native_atomic
+        || card.plane_formats != Some(&PLANE_FORMATS[..])
+        || !crate::amdgpu_native_kms::linear_gem_card(&card)
+    {
+        return TestResult::Fail("DCN30 linear primary/atomic capability missing");
+    }
+    let Some(blob) = crate::drm_native_planes::in_formats_blob(
+        &card,
+        crate::drm_native_planes::in_formats_blob_id(0x40),
+    ) else {
+        return TestResult::Fail("DCN30 primary has no explicit LINEAR format blob");
+    };
+    let word = |i| u32::from_le_bytes(blob[i..i + 4].try_into().unwrap());
+    let modifiers = word(20) as usize;
+    if word(8) != 2 || word(16) != 1 || blob[modifiers + 16..modifiers + 24] != [0u8; 8] {
+        return TestResult::Fail("DCN30 format blob advertises a tiled layout");
+    }
+    let native = card
+        .native
+        .iter_mut()
+        .find(|n| n.connector == crate::amdgpu_navi48_kms::connector_id(3))
+        .unwrap();
+    if native.colorspace != Some(0)
+        || native.hdr_output_metadata != Some(0)
+        || native.max_bpc.is_none()
+        || native.color_format != Some(crate::amdgpu_hdr::ColorFormat::Auto)
+    {
+        return TestResult::Fail("HDMI output controls absent");
+    }
+    native.max_bpc = Some(10);
+    native.colorspace = Some(crate::amdgpu_hdr::DRM_MODE_COLORIMETRY_BT2020_RGB);
+    native.color_format = Some(crate::amdgpu_hdr::ColorFormat::Ycbcr422);
+    // Re-publishing keeps committed controls and excludes DCN401's planes.
+    apply_card(&mut card, &crtcs, &connectors);
+    if card.gfx12_modifiers
+        || !card.native_planes.is_empty()
+        || card.native[0].max_bpc != Some(10)
+        || card.native[0].colorspace != Some(crate::amdgpu_hdr::DRM_MODE_COLORIMETRY_BT2020_RGB)
+        || card.native[0].color_format != Some(crate::amdgpu_hdr::ColorFormat::Ycbcr422)
+    {
+        return TestResult::Fail(
+            "republication changed the DCN30 plane ABI or committed output state",
+        );
+    }
+    apply_card_vrr(&mut card, &crtcs, &connectors, Some(&[true]));
+    if card.native[0].vrr_capable != Some(true) || card.vrr_enabled != [(1, false)] {
+        return TestResult::Fail("VRR properties absent");
+    }
+    card.vrr_enabled[0].1 = true;
+    apply_card_vrr(&mut card, &crtcs, &connectors, Some(&[false]));
+    if card.native[0].vrr_capable != Some(false) || card.vrr_enabled != [(1, true)] {
+        return TestResult::Fail("VRR republication lost committed CRTC request");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_kms_publication_excludes_rdna4_only_planes_and_modifiers
+);
+
 fn navi22_kms_routes_the_hdmi_sink_and_offers_admitted_modes() -> TestResult {
     let mut k = Kms::new();
     k.reconcile(&reports(true, 1), admitted);
@@ -389,4 +562,116 @@ fn navi22_kms_secondary_crtcs_light_as_one_context() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     navi22_kms_secondary_crtcs_light_as_one_context
+);
+
+fn navi22_kms_connector_color_requests_converge_and_survive_reprobe() -> TestResult {
+    use crate::amdgpu_hdr::{ColorFormat, DRM_MODE_COLORIMETRY_BT2020_RGB};
+    use crate::amdgpu_native_kms::ConnectorColorRequest;
+    let mut k = Kms::new();
+    let r = reports(true, 1);
+    k.reconcile(&r, admitted);
+    k.assign_route();
+    let connector = crate::amdgpu_navi48_kms::connector_id(3);
+    let mut color = ConnectorColorRequest {
+        connector,
+        color_format: ColorFormat::Rgb,
+        colorspace: DRM_MODE_COLORIMETRY_BT2020_RGB,
+        hdr_output_metadata: Some(vec![0; 32]),
+    };
+    if !k.set_max_bpc(connector, 10)
+        || !k.set_color(&color)
+        || k.next(Some((3, hd()))) != Action::Unlight
+    {
+        return TestResult::Fail("color request never reached convergence");
+    }
+    k.connectors[3].shown_output = k.connectors[3].output;
+    if k.next(Some((3, hd()))) != Action::Nothing {
+        return TestResult::Fail("applied state keeps relighting");
+    }
+    color.hdr_output_metadata.as_mut().unwrap()[26] = 1;
+    if !k.set_color(&color)
+        || k.next(Some((3, hd()))) != Action::Nothing
+        || k.connectors[3].shown_output == k.connectors[3].output
+    {
+        return TestResult::Fail("metadata-only update causes a modeset or loses pending state");
+    }
+    let old = k.connectors[3].output;
+    k.reconcile(&r, admitted);
+    if k.connectors[3].output != old || k.connectors[3].shown_output == old {
+        return TestResult::Fail("reprobe erased requested or applied state");
+    }
+    color.hdr_output_metadata = None;
+    if !k.set_color(&color) || k.next(Some((3, hd()))) != Action::Unlight {
+        return TestResult::Fail("HDR exit did not relight");
+    }
+    let before = k.connectors[3].output;
+    color.hdr_output_metadata = Some(vec![0; 31]);
+    if k.set_color(&color) || k.set_max_bpc(connector, 7) || k.connectors[3].output != before {
+        return TestResult::Fail("invalid state mutated connector");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_kms_connector_color_requests_converge_and_survive_reprobe
+);
+
+fn navi22_kms_hdmi_format_check_is_exact_and_side_effect_free() -> TestResult {
+    use crate::amdgpu_dcn30_hdmi::tests::{edid, vsdb, DTD_1080P};
+    use crate::amdgpu_hdr::ColorFormat;
+    use crate::amdgpu_native_kms::{OutputFormatRequest, OutputRoute};
+    let mut r = reports(true, 1);
+    let Detection::Connected(sink) = &mut r[3].detection else {
+        return TestResult::Fail("fixture");
+    };
+    sink.edid = edid(DTD_1080P, &[vsdb(0, 68)]);
+    crate::amdgpu_dcn30_hdmi::tests::cta_byte(&mut sink.edid, 131, 0x10);
+    let mut k = Kms::new();
+    k.reconcile(&r, admitted);
+    k.assign_route();
+    let connector = crate::amdgpu_navi48_kms::connector_id(3);
+    let request = OutputFormatRequest {
+        display: 0,
+        connector,
+        color_format: ColorFormat::Ycbcr422,
+        mode: Some(crate::amdgpu_navi48_kms::timing_wire(&hd())),
+        max_bpc: Some(12),
+        planes: None,
+    };
+    let route = OutputRoute {
+        display: 0,
+        connector,
+        mode: request.mode,
+        planes: None,
+    };
+    let before = k.connectors[3].clone();
+    if !k.formats_supported(&[request], &[route]) || k.connectors[3] != before {
+        return TestResult::Fail("valid TEST_ONLY changed state or failed");
+    }
+    if k.formats_supported(
+        &[OutputFormatRequest {
+            color_format: ColorFormat::Ycbcr444,
+            ..request
+        }],
+        &[route],
+    ) || k.formats_supported(&[request], &[route, route])
+        || k.formats_supported(
+            &[OutputFormatRequest {
+                max_bpc: Some(7),
+                ..request
+            }],
+            &[route],
+        )
+    {
+        return TestResult::Fail("invalid explicit format/routing/depth admitted");
+    }
+    k.connectors[3].hdmi_limits.max_phy_khz = 100_000;
+    if k.formats_supported(&[request], &[route]) {
+        return TestResult::Fail("immutable board PHY bound ignored");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_kms_hdmi_format_check_is_exact_and_side_effect_free
 );

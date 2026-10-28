@@ -25,8 +25,10 @@
 //! 5. `dce110_power_down` when any DIG backend is enabled:
 //!    `power_down_encoders` (DP streams blanked, VBIOS transmitter DISABLE
 //!    with `SIGNAL_TYPE_NONE`), then `power_down_controllers` (every OTG's
-//!    `optc1_disable_crtc`). `power_down_clock_sources` is a no-op on DCN:
-//!    `set_pixel_clock_v7` rejects `CONTROLLER_ID_UNDEFINED`.
+//!    `optc1_disable_crtc`), then `power_down_clock_sources`: every combo
+//!    PHY PLL gets `dce110_clock_source_power_down`'s zero-clock
+//!    SetPixelClock (`CONTROLLER_ID_UNDEFINED` maps to ATOM_CRTC_INVALID;
+//!    Linux's DC_LOG_BIOS trace shows it executed), the DP DTO none.
 //!
 //! 6. `hubbub3_init_watermarks` (set A copied to B..D) when the VBIOS is not
 //!    in accelerated mode, called by the modeset owner after `retire`.
@@ -210,6 +212,41 @@ impl Regs {
     }
 }
 
+/// A display power-request lease. Linux preserves a request already raised
+/// by its caller; the async owner must also restore its own raise on error
+/// or cancellation. It owns a copy of the bounded, capability-checked bus.
+pub(crate) struct IpRequest {
+    regs: Regs,
+    offset: u64,
+    raised: bool,
+}
+impl IpRequest {
+    pub(crate) fn acquire(mut regs: Regs, offset: u64) -> Result<Self, Error> {
+        let original = regs.read(offset)?;
+        let raised = original & IP_REQUEST_EN == 0;
+        if raised {
+            regs.write(offset, original | IP_REQUEST_EN)?;
+        }
+        Ok(Self {
+            regs,
+            offset,
+            raised,
+        })
+    }
+    pub(crate) fn release(&mut self) -> Result<(), Error> {
+        if self.raised {
+            self.regs.update(self.offset, IP_REQUEST_EN, 0)?;
+            self.raised = false;
+        }
+        Ok(())
+    }
+}
+impl Drop for IpRequest {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
 /// What the firmware had left running.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Inherited {
@@ -261,11 +298,7 @@ impl Takeover<'_> {
         if !self.profile()?.has_plane_power_gating() {
             return Ok(());
         }
-        let request = self.d2(DC_IP_REQUEST_CNTL);
-        let original = self.regs.read(request)? & IP_REQUEST_EN;
-        if original == 0 {
-            self.regs.write(request, IP_REQUEST_EN)?;
-        }
+        let mut request = IpRequest::acquire(self.regs, self.d2(DC_IP_REQUEST_CNTL))?;
         // HUBP 0,2..10 then DPP 1,3..11, then the six DSC domains.
         for domain in (0..u64::from(self.profile()?.pipes()) * 2)
             .step_by(2)
@@ -285,10 +318,7 @@ impl Takeover<'_> {
             let reg = self.d2(DSC_DOMAIN16_PG_CONFIG + 2 * dsc);
             self.regs.update(reg, DOMAIN_POWER_FORCEON, 0)?;
         }
-        if original == 0 {
-            self.regs.write(request, 0)?;
-        }
-        Ok(())
+        request.release()
     }
     fn otg(&self, reg: u64, pipe: u8) -> u64 {
         self.d2(reg + u64::from(pipe) * OTG_STRIDE)
@@ -447,11 +477,10 @@ impl Takeover<'_> {
             return Ok(());
         }
         // dcn10_plane_atomic_power_down.
-        let request = self.d2(DC_IP_REQUEST_CNTL);
-        self.regs.write(request, IP_REQUEST_EN)?;
+        let mut request = IpRequest::acquire(self.regs, self.d2(DC_IP_REQUEST_CNTL))?;
         self.gate(2 * p + 1).await?;
         self.gate(2 * p).await?;
-        self.regs.write(request, 0)
+        request.release()
     }
     /// `optc3_tg_init`.
     fn tg_init(&mut self, pipe: u8) -> Result<(), Error> {
@@ -474,11 +503,7 @@ impl Takeover<'_> {
         if !self.profile()?.has_plane_power_gating() {
             return Ok(());
         }
-        let request = self.d2(DC_IP_REQUEST_CNTL);
-        let original = self.regs.read(request)? & IP_REQUEST_EN;
-        if original == 0 {
-            self.regs.write(request, IP_REQUEST_EN)?;
-        }
+        let mut request = IpRequest::acquire(self.regs, self.d2(DC_IP_REQUEST_CNTL))?;
         let config = self.d2(DSC_DOMAIN16_PG_CONFIG + 2 * u64::from(dsc));
         self.regs
             .update(config, DOMAIN_POWER_GATE, DOMAIN_POWER_GATE)?;
@@ -488,10 +513,7 @@ impl Takeover<'_> {
             // linux: n/a (2 = PGFSM_POWER_OFF, literal in)
             .wait(config + 4, DOMAIN_PGFSM_PWR_STATUS, 2 << 30, 1, 1000)
             .await?;
-        if original == 0 {
-            self.regs.write(request, 0)?;
-        }
-        Ok(())
+        request.release()
     }
     /// The tail of `dcn10_init_pipes`: power-gate every DSC except the one
     /// a running OTG drives (`optc2_get_dsc_status`, `dsc2_read_state`).
@@ -628,6 +650,11 @@ impl Takeover<'_> {
                 Ok(()) | Err(BlockError::Timeout) => {}
                 Err(error) => return Err(Error::Block(error)),
             }
+        }
+        // power_down_clock_sources: Linux only logs a failed power-down.
+        for pll in 0..self.profile()?.streams() {
+            let bus = crate::amdgpu_navi22_modeset::bios_bus(self.gpu, self.regs.authority);
+            let _ = tables.power_down_pixel_clock(bus, pll);
         }
         Ok(())
     }

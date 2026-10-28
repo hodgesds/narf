@@ -40,7 +40,7 @@ use crate::registry;
 pub const MSR_IA32_THERM_STATUS: u32 = 0x19C;
 
 /// MSR_TEMPERATURE_TARGET — target junction temperature.
-/// Bits 23:16: Tj_MAX (°C). Present on Intel Core 2 and later.
+/// Bits 23:16: Tj_MAX (°C). Model-dependent; reads must recover from #GP.
 pub const MSR_TEMPERATURE_TARGET: u32 = 0x1A2;
 
 /// Intel's digital thermal sensor is enumerated by CPUID.06H:EAX[0].
@@ -54,30 +54,53 @@ pub(crate) fn supports_coretemp(
     vendor == narf_arch::x86_64::microcode::Vendor::Intel && max_basic >= 6 && thermal_eax & 1 != 0
 }
 
-#[cfg(target_arch = "x86_64")]
-fn cpu_has_coretemp() -> bool {
-    use narf_arch::x86_64::{cpuid::cpuid, microcode};
-
-    let vendor = microcode::vendor();
-    // SAFETY: CPUID leaf 0 is defined on x86_64.
-    let (max_basic, _, _, _) = unsafe { cpuid(0, 0) };
-    if vendor != microcode::Vendor::Intel || max_basic < 6 {
-        return false;
+/// The driver probe and runtime reads share the same admission gate. CPUID
+/// thermal features alone do not guarantee that a model-specific MSR is
+/// readable, so the final operation is also fallible.
+#[cfg(any(target_arch = "x86_64", feature = "kernel-test"))]
+fn read_supported_msr(
+    index: u32,
+    mut cpuid: impl FnMut(u32) -> (u32, u32, u32, u32),
+    mut read: impl FnMut(u32) -> Option<u64>,
+) -> Option<u64> {
+    let (max, ebx, ecx, edx) = cpuid(0);
+    if max < 6
+        || ebx != u32::from_le_bytes(*b"Genu")
+        || edx != u32::from_le_bytes(*b"ineI")
+        || ecx != u32::from_le_bytes(*b"ntel")
+    {
+        return None;
     }
-    // SAFETY: leaf 0 advertised leaf 6.
-    let (thermal_eax, _, _, _) = unsafe { cpuid(6, 0) };
-    supports_coretemp(vendor, max_basic, thermal_eax)
+    if cpuid(1).3 & (1 << 5) == 0 {
+        return None;
+    }
+    let thermal_eax = cpuid(6).0;
+    #[cfg(target_arch = "x86_64")]
+    let thermal = supports_coretemp(
+        narf_arch::x86_64::microcode::Vendor::Intel,
+        max,
+        thermal_eax,
+    );
+    #[cfg(not(target_arch = "x86_64"))]
+    let thermal = thermal_eax & 1 != 0;
+    if !thermal {
+        return None;
+    }
+    read(index)
 }
 
-/// Probe state belongs to the current CPU. Keep the read pinned and exclude
-/// IRQ-side probes until the recoverable MSR access has disarmed it.
 #[cfg(target_arch = "x86_64")]
 fn read_thermal_msr(index: u32) -> Option<u64> {
+    // Keep this CPU pinned and prevent an IRQ path from overwriting its
+    // recoverable-probe state while an optional MSR access is armed.
     narf_lib::sync::without_interrupts(|| {
-        if !cpu_has_coretemp() {
-            return None;
-        }
-        narf_arch::x86_64::msr::rdmsr_or_gp(index).ok()
+        read_supported_msr(
+            index,
+            // SAFETY: CPUID is available on x86_64; the admission gate checks
+            // the maximum basic leaf before querying leaves 1 and 6.
+            |leaf| unsafe { narf_arch::x86_64::cpuid::cpuid(leaf, 0) },
+            |index| narf_arch::x86_64::msr::rdmsr_or_gp(index).ok(),
+        )
     })
 }
 
@@ -140,8 +163,8 @@ impl Coretemp {
 
     /// Read IA32_THERM_STATUS MSR on the bound CPU.
     ///
-    /// Returns the raw 64-bit MSR value, or `None` if the MSR read
-    /// is unavailable (NARF's arch crate gates `rdmsr` on x86_64).
+    /// Returns `None` on unsupported CPUs or an unreadable MSR. Admission
+    /// is checked on the executing CPU even for manually constructed devices.
     #[cfg(target_arch = "x86_64")]
     pub fn read_therm_status(&self) -> Option<u64> {
         read_thermal_msr(MSR_IA32_THERM_STATUS)
@@ -201,13 +224,18 @@ impl crate::HwmonDevice for Coretemp {
 // ── Driver registration ───────────────────────────────────────────────
 
 /// Register the coretemp MSR driver. Called from Stage::Subsys.
-/// Probe only Intel CPUs advertising a digital thermal sensor, then use a
-/// recoverable MSR read and require a plausible Tjmax (75–125 °C).
+/// Probe only an Intel CPU advertising MSRs and digital thermal sensors.
+/// An unreadable temperature-target MSR or implausible Tjmax skips registration.
+/// Returns `NotPresent` for a skipped probe and `Ok` after registration.
 #[cfg(target_arch = "x86_64")]
-pub fn register_msr_driver() {
+pub fn register_msr_driver() -> narf_init::InitResult {
     use core::fmt::Write as _;
     let Some(raw) = read_thermal_msr(MSR_TEMPERATURE_TARGET) else {
-        return;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  coretemp: unsupported CPU or unavailable thermal MSR, skipping"
+        );
+        return narf_init::InitResult::NotPresent;
     };
     let tjmax = decode_tjmax(raw);
     if !(75..=125).contains(&tjmax) {
@@ -216,7 +244,7 @@ pub fn register_msr_driver() {
             "  coretemp: Tjmax={} out of range [75,125], skipping",
             tjmax
         );
-        return;
+        return narf_init::InitResult::NotPresent;
     }
     let _ = writeln!(
         narf_console::Writer,
@@ -230,4 +258,14 @@ pub fn register_msr_driver() {
     });
     use alloc::sync::Arc;
     registry::register_device(Arc::new(Coretemp::new(tjmax, 0)));
+    narf_init::InitResult::Ok
 }
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn register_msr_driver() -> narf_init::InitResult {
+    narf_init::InitResult::NotPresent
+}
+
+#[cfg(feature = "kernel-test")]
+#[path = "coretemp_tests.rs"]
+mod probe_tests;

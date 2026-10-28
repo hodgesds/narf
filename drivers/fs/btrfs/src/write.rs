@@ -1430,6 +1430,7 @@ pub(crate) async fn commit_if_stale<B: BlockDevice + 'static>(
     // (a fresh root with no METADATA_ITEM yet, a closed batch), so it waits
     // for the operation to finish (`op_lock`).
     let _op = vol.op_lock().lock().await;
+    vol.reap_orphans().await?;
     let stale = {
         let guard = vol.fs_batch().lock().await;
         match guard.as_ref() {
@@ -7290,9 +7291,9 @@ fn inode_ref_remove(body: &[u8], name: &[u8]) -> Result<(u64, Vec<u8>), FsError>
 }
 
 /// Remove the entry `name` from directory `parent_ino` (mounted subvolume) via a
-/// COW mini-transaction. On the inode's **last** link the inode is freed (its
-/// `INODE_ITEM` + `EXTENT_DATA` removed, its regular data extents + checksums
-/// released); a still-linked inode keeps its data and just loses this name and one
+/// COW mini-transaction. On the inode's **last** link it becomes a persisted
+/// orphan, retaining its data until the final node/mapping reference goes away;
+/// a still-linked inode keeps its data and just loses this name and one
 /// `INODE_REF` entry, its `nlink` decremented.
 ///
 /// Directories (use `rmdir`) and subvolume mount points remain out of scope;
@@ -7351,55 +7352,18 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
         .ok_or(FsError::NotFound)?;
     let (dir_index, ref_remaining) = inode_ref_remove(&ref_body, name_bytes)?;
 
-    // On the last link, gather the inode's regular data extents (to free) and its
-    // EXTENT_DATA keys (to delete). A still-linked inode keeps its data; inline
-    // extents and holes own no separate disk block.
-    let mut dropped_data = Vec::new();
-    let mut ed_offsets: Vec<u64> = Vec::new();
-    let mut xattr_keys: Vec<BtrfsKey> = Vec::new();
-    if last_link {
-        for (k, body) in
-            btree::collect_for(vol, fs_root, child_ino, format::EXTENT_DATA_KEY).await?
-        {
-            ed_offsets.push(k.offset);
-            // type@20; disk_bytenr@21; disk_num_bytes@29.
-            if body.len() >= 53 && body[20] != format::FILE_EXTENT_INLINE {
-                let disk_bytenr = le64(&body, 21)?;
-                let disk_num = le64(&body, 29)?;
-                if disk_bytenr != 0 {
-                    dropped_data.push(DataRefId {
-                        bytenr: disk_bytenr,
-                        len: disk_num,
-                        ref_root: vol.fs_tree_id(),
-                        objectid: child_ino,
-                        offset: k
-                            .offset
-                            .checked_sub(le64(&body, 37)?)
-                            .ok_or(FsError::InvalidData)?,
-                    });
-                }
-            }
-        }
-        xattr_keys = btree::collect_for(vol, fs_root, child_ino, format::XATTR_ITEM_KEY)
-            .await?
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect();
-    }
-
     let gen = batch_gen(vol).await?;
-
     let mut edits = Vec::new();
-
-    // A surviving inode keeps its INODE_ITEM with `nlink` decremented.
-    if !last_link {
-        let mut ci = ci_body;
-        ci[8..16].copy_from_slice(&gen.to_le_bytes()); // transid
-        ci[40..44].copy_from_slice(&(cinode.nlink - 1).to_le_bytes());
-        edits.push(Edit::Upsert(
-            BtrfsKey::new(child_ino, format::INODE_ITEM_KEY, 0),
-            ci,
-        ));
+    let mut ci = ci_body;
+    ci[8..16].copy_from_slice(&gen.to_le_bytes());
+    ci[40..44].copy_from_slice(&cinode.nlink.saturating_sub(1).to_le_bytes());
+    edits.push(Edit::Upsert(
+        BtrfsKey::new(child_ino, format::INODE_ITEM_KEY, 0),
+        ci,
+    ));
+    if last_link {
+        // The directory entry disappears now; eviction owns data reclamation.
+        edits.push(Edit::Upsert(crate::orphans::key(child_ino), Vec::new()));
     }
 
     // Shrink the parent dir inode by this entry's name length; bump transid+seq.
@@ -7425,8 +7389,7 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
         pinode,
     ));
 
-    // Delete this name's DIR_ITEM + DIR_INDEX; on the last link also the
-    // INODE_ITEM + EXTENT_DATA. The INODE_REF is dropped when no entry for this
+    // Delete this name's DIR_ITEM + DIR_INDEX. The INODE_REF is dropped when no entry for this
     // parent survives, else re-written to just the surviving entries.
     edits.push(if di_remaining.is_empty() {
         Edit::Delete(dir_item_key)
@@ -7443,30 +7406,64 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
     } else {
         edits.push(Edit::Upsert(ref_key, ref_remaining));
     }
+    commit_fs_edits(vol, &edits, Vec::new(), Vec::new()).await?;
     if last_link {
-        edits.push(Edit::Delete(BtrfsKey::new(
-            child_ino,
-            format::INODE_ITEM_KEY,
-            0,
-        )));
-        for off in ed_offsets {
-            edits.push(Edit::Delete(BtrfsKey::new(
-                child_ino,
-                format::EXTENT_DATA_KEY,
-                off,
-            )));
-        }
-        edits.extend(xattr_keys.into_iter().map(Edit::Delete));
+        vol.note_orphan(vol.fs_tree_id(), child_ino);
     }
+    Ok(())
+}
 
-    commit_fs_edits(vol, &edits, dropped_data, Vec::new()).await?;
-    if last_link {
-        // The inode is gone: pages retained under it must not
-        // validate for a still-open node (its reads now fail), nor
-        // for a later file that recycles its inode number
-        // (`next_inode_number` issues max+1).
-        vol.bump_cache_generation(vol.fs_tree_id(), child_ino);
+/// Reclaim an orphan after the final node/mapping reference. Caller holds
+/// op_lock; the inode and its ORPHAN_ITEM disappear in the same COW edit.
+pub(crate) async fn reclaim_orphan<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    ino: u64,
+) -> Result<(), FsError> {
+    let (root, _) = vol.fs_tree_root();
+    let orphan = crate::orphans::key(ino);
+    if btree::find_item(vol, root, &orphan).await?.is_none() {
+        return Err(FsError::InvalidData);
     }
+    let inode = vol.load_inode_in(root, ino).await?;
+    if inode.nlink != 0 || inode.is_dir() {
+        return Err(FsError::InvalidData);
+    }
+    let mut edits = alloc::vec![Edit::Delete(orphan)];
+    let mut dropped_data = Vec::new();
+    let mut cursor = btree::Cursor::seek(vol, root, &BtrfsKey::new(ino, 0, 0)).await?;
+    while let Some((key, body)) = cursor.current()? {
+        if key.objectid != ino {
+            break;
+        }
+        match key.item_type {
+            format::INODE_ITEM_KEY | format::XATTR_ITEM_KEY => {}
+            format::EXTENT_DATA_KEY => {
+                if body.len() < 21 {
+                    return Err(FsError::InvalidData);
+                }
+                if body[20] != format::FILE_EXTENT_INLINE {
+                    let bytenr = le64(body, 21)?;
+                    if bytenr != 0 {
+                        dropped_data.push(DataRefId {
+                            bytenr,
+                            len: le64(body, 29)?,
+                            ref_root: vol.fs_tree_id(),
+                            objectid: ino,
+                            offset: key
+                                .offset
+                                .checked_sub(le64(body, 37)?)
+                                .ok_or(FsError::InvalidData)?,
+                        });
+                    }
+                }
+            }
+            _ => return Err(FsError::Unsupported),
+        }
+        edits.push(Edit::Delete(key));
+        cursor.advance().await?;
+    }
+    commit_fs_edits(vol, &edits, dropped_data, Vec::new()).await?;
+    vol.bump_cache_generation(vol.fs_tree_id(), ino);
     Ok(())
 }
 
@@ -7484,10 +7481,14 @@ struct RenameTarget {
     extent_offsets: Vec<u64>,
     xattr_keys: Vec<BtrfsKey>,
     dropped_data: Vec<DataRefId>,
+    orphan: bool,
 }
 
 impl RenameTarget {
     fn append_edits(self, edits: &mut Vec<Edit>) {
+        if self.orphan {
+            edits.push(Edit::Upsert(crate::orphans::key(self.ino), Vec::new()));
+        }
         edits.push(Edit::Delete(self.dir_index_key));
         edits.push(if self.ref_remaining.is_empty() {
             Edit::Delete(self.ref_key)
@@ -7552,7 +7553,12 @@ async fn prepare_rename_target<B: BlockDevice + 'static>(
     let mut extent_offsets = Vec::new();
     let mut xattr_keys = Vec::new();
     let mut dropped_data = Vec::new();
-    let inode_update = if last_link {
+    let orphan = last_link && !target_is_dir;
+    let inode_update = if orphan {
+        inode_body[8..16].copy_from_slice(&gen.to_le_bytes());
+        inode_body[40..44].copy_from_slice(&0u32.to_le_bytes());
+        Some(inode_body)
+    } else if last_link {
         let mut cursor = btree::Cursor::seek(vol, fs_root, &BtrfsKey::new(ino, 0, 0)).await?;
         while let Some((key, body)) = cursor.current()? {
             if key.objectid != ino {
@@ -7601,6 +7607,7 @@ async fn prepare_rename_target<B: BlockDevice + 'static>(
         extent_offsets,
         xattr_keys,
         dropped_data,
+        orphan,
     })
 }
 
@@ -7884,6 +7891,10 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
     // A destroyed destination (no surviving inode body) takes its
     // pages' validity with it; a surviving one keeps its bytes, and
     // only the name moved.
+    let orphaned_target = target
+        .as_ref()
+        .filter(|target| target.orphan)
+        .map(|target| target.ino);
     let destroyed_target = target
         .as_ref()
         .filter(|target| target.inode_update.is_none())
@@ -7895,6 +7906,9 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
     commit_fs_edits(vol, &edits, dropped_data, Vec::new()).await?;
     if let Some(ino) = destroyed_target {
         vol.bump_cache_generation(vol.fs_tree_id(), ino);
+    }
+    if let Some(ino) = orphaned_target {
+        vol.note_orphan(vol.fs_tree_id(), ino);
     }
     Ok(())
 }
@@ -8105,6 +8119,10 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
     // A destroyed destination (no surviving inode body) takes its
     // pages' validity with it; a surviving one keeps its bytes, and
     // only the name moved.
+    let orphaned_target = target
+        .as_ref()
+        .filter(|target| target.orphan)
+        .map(|target| target.ino);
     let destroyed_target = target
         .as_ref()
         .filter(|target| target.inode_update.is_none())
@@ -8116,6 +8134,9 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
     commit_fs_edits(vol, &edits, dropped_data, Vec::new()).await?;
     if let Some(ino) = destroyed_target {
         vol.bump_cache_generation(vol.fs_tree_id(), ino);
+    }
+    if let Some(ino) = orphaned_target {
+        vol.note_orphan(vol.fs_tree_id(), ino);
     }
     Ok(())
 }

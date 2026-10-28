@@ -899,16 +899,28 @@ fn smoke_drm_registry_register_one_card() -> TestResult {
 
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_registry_register_one_card);
 
-// Resolve the real DRM device kobject under /sys/devices/platform/narf-drm/.
-// The card lives there (not directly under /sys/class/drm); `/sys/class/drm/*`
-// is a symlink into it. get_child() walks real children only (not symlinks),
-// so tests navigate the /sys/devices tree the compositor's udev lookup lands on.
+// Follow the class link to its real kobject, as userspace canonicalization does.
 fn drm_device_node(name: &str) -> Option<alloc::sync::Arc<narf_filesystem::sysfs::Kobject>> {
-    narf_filesystem::sysfs::sysfs_root()
-        .get_child("devices")
-        .and_then(|d| d.get_child("platform"))
-        .and_then(|p| p.get_child("narf-drm"))
-        .and_then(|n| n.get_child(name))
+    let root = narf_filesystem::sysfs::sysfs_root();
+    let target = root
+        .get_child("class")?
+        .get_child("drm")?
+        .get_symlink(name)?;
+    let mut parts = alloc::vec!["class", "drm"];
+    for component in target.split('/') {
+        match component {
+            ".." => {
+                parts.pop()?;
+            }
+            "" | "." => {}
+            component => parts.push(component),
+        }
+    }
+    let mut node = root;
+    for component in parts {
+        node = node.get_child(component)?;
+    }
+    Some(node)
 }
 
 // The `/sys/class/drm/<name>` symlink must exist and point into /sys/devices —
@@ -919,9 +931,54 @@ fn drm_class_symlink_ok(name: &str) -> bool {
         .get_child("class")
         .and_then(|c| c.get_child("drm"))
         .and_then(|d| d.get_symlink(name))
-        .map(|t| t.contains("devices/platform/narf-drm/"))
+        .map(|t| t.contains("devices/pci") && t.contains("/drm/"))
         .unwrap_or(false)
 }
+
+fn smoke_drm_minors_have_a_real_pci_ancestor() -> TestResult {
+    use crate::drm_registry;
+    use narf_filesystem::sysfs;
+    let names = DrmFixtureNames::next();
+    sysfs::__reset_for_test();
+    drm_registry::register_drm_card(alloc::sync::Arc::new(FakeDrmCard {
+        name_str: names.primary.clone(),
+        driver_str: "amdgpu",
+        vid: 0x1002,
+        did: 0x1636,
+    }));
+    crate::drm_sysfs_bridge::populate_drm_class();
+    let Some(card) = drm_device_node(&names.primary) else {
+        return TestResult::Fail("registered primary minor is absent");
+    };
+    let Some(device) = card.get_symlink("device") else {
+        return TestResult::Fail("primary minor has no PCI device link");
+    };
+    let bdf = device.rsplit('/').next().unwrap_or("");
+    let Some(pci) = sysfs::get_root()
+        .get_child("devices")
+        .and_then(|devices| devices.get_child("pci0000:00"))
+        .and_then(|host| host.get_child(bdf))
+    else {
+        return TestResult::Fail("PCI function is absent");
+    };
+    // udev's parent walk follows canonical kobjects, not card/device links.
+    // A platform-rooted card with a good device symlink still fails this.
+    for name in [&names.primary, &names.render] {
+        let Some(minor) = pci.get_child("drm").and_then(|drm| drm.get_child(name)) else {
+            return TestResult::Fail("DRM minor is not a real descendant of its PCI function");
+        };
+        if minor.path() != alloc::format!("{}/drm/{name}", pci.path())
+            || minor.get_symlink("device").as_deref()
+                != Some(alloc::format!("../../../{bdf}").as_str())
+            || minor.get_symlink("subsystem").as_deref() != Some("../../../../../class/drm")
+        {
+            return TestResult::Fail("canonical minor/device/subsystem topology is wrong");
+        }
+    }
+    sysfs::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/e2e", smoke_drm_minors_have_a_real_pci_ancestor);
 
 // ── Smoke 12: /sys/class/drm/card0/name → "card0\n" ─────────────────────
 
@@ -1164,7 +1221,7 @@ fn smoke_drm_render_node_device_link_matches_card() -> TestResult {
         None => return TestResult::Fail("card0/device is not a symlink"),
     };
 
-    // Both minors sit at the same depth (devices/platform/narf-drm/<node>),
+    // Both minors sit at the same depth (PCI function/drm/<node>),
     // so an identical relative target is what makes drmParsePciBusInfo report
     // one bus address for both and merge them into a single drmDevice.
     if render_target != card_target {
@@ -1191,7 +1248,10 @@ fn smoke_drm_render_node_device_link_matches_card() -> TestResult {
         Some(d) => d,
         None => return TestResult::Fail("PCI node has no drm/ dir; drmNodeIsDRM would fail"),
     };
-    if drm_dir.get_symlink(&names.render).is_none() {
+    if !drm_dir
+        .get_child(&names.render)
+        .is_some_and(|node| alloc::sync::Arc::ptr_eq(&node, &render))
+    {
         return TestResult::Fail("device/drm/ does not list the render minor");
     }
 

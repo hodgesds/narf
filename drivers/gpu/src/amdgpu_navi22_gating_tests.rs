@@ -213,6 +213,45 @@ kernel_test_in!(
     navi22_clock_gating_matches_linux_order_and_values
 );
 
+fn navi22_clock_gating_distinguishes_override_data_from_device_loss() -> TestResult {
+    let mut e = engine();
+    e.io.regs.iter_mut().find(|(r, _)| *r == 0xec48).unwrap().1 = u32::MAX;
+    if run(e.set_clockgating(true, ALL)).is_err() {
+        return TestResult::Fail("all-set override data was classified as device loss");
+    }
+    // Linux's three RMWs clear the owned override bits and preserve every
+    // other bit. No change to IP order, safe mode or FSM programming.
+    let mut expected = GATE.to_vec();
+    let mut overrides = [0xfffe_fe99, 0xfffe_fe19, 0xfffe_fe01].into_iter();
+    for (reg, value) in &mut expected {
+        if *reg == 0xec48 {
+            *value = overrides.next().unwrap();
+        }
+    }
+    if e.io.writes != expected || e.io.unexpected {
+        return TestResult::Fail("all-set override handling differs from Linux RMW");
+    }
+    // Re-check the independent RLC control at the ambiguous read, rather
+    // than relying only on the earlier safe-mode entry check.
+    if e.io.reads.iter().filter(|r| **r == 0xec00).count() != 2 {
+        return TestResult::Fail("ambiguous override data lacked a fresh RLC probe");
+    }
+    for (control, error) in [(u32::MAX, Error::DeviceGone), (0, Error::RlcHalted)] {
+        let mut io = Fake::new();
+        io.regs.iter_mut().find(|(r, _)| *r == 0xec48).unwrap().1 = u32::MAX;
+        io.regs.iter_mut().find(|(r, _)| *r == 0xec00).unwrap().1 = control;
+        let mut seq = Seq { io: &mut io };
+        if seq.rd(RLC_CGTT_MGCG_OVERRIDE) != Err(error) || !io.writes.is_empty() {
+            return TestResult::Fail("unhealthy RLC accepted ambiguous override data");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-gating",
+    navi22_clock_gating_distinguishes_override_data_from_device_loss
+);
+
 /// Every CG enable is undone by UNGATE, a second GATE restores exactly the
 /// first GATE's register state, and repeated GATE writes only Linux's
 /// unconditional registers.

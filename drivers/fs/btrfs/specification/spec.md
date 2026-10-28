@@ -53,6 +53,22 @@ pub mod harness {                                               // test-workload
 BtrfsVolume::sync_fs(&self) -> Result<(), FsError>  // syncfs: commit + superblock + flush
 ```
 
+Every node for one `(filesystem core, fs-tree id, inode)` retains shared inode
+metadata, size, and mapping identity. Creation and lookup acquire that reference
+before releasing the operation mutex. `stat_async` and `statx_async` refresh
+metadata from the current tree; writes and size changes publish shared metadata
+before releasing the same mutex. Reads serialize with mutation and eviction.
+
+Last-link unlink and file replacement remove the name and persist `nlink=0`
+with a Linux `ORPHAN_ITEM` in the owning fs tree. Existing handles and private
+or shared mappings retain the original inode, data and xattrs. They remain
+readable/writable and their inode number cannot be reused. Reclamation runs
+after the final node/mapping reference, during a subsequent operation, explicit
+sync, timer pass, or writable-mount recovery; it removes the inode and orphan
+record together and releases data through the ordinary COW/backref transaction.
+Read-only mounts do not recover orphans. Final-view Drop only makes previously
+accepted changes durable, leaving any unreaped orphan record for recovery.
+
 ## 4. Invariants
 
 Filesystem constructors execute without the registry lock held. Missing

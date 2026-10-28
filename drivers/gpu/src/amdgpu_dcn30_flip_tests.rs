@@ -71,6 +71,7 @@ fn engine(pipe: u8) -> Engine<Fake> {
         io: Fake::new(),
         authority: Cap::bootstrap(),
         pipe,
+        odm: None,
         requested: None,
     }
 }
@@ -244,4 +245,119 @@ fn dcn30_position_samples_a_stable_frame_count() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     dcn30_position_samples_a_stable_frame_count
+);
+
+fn dcn30_flip_drr_trigger_follows_surface_address_publication() -> TestResult {
+    let mut e = engine(2);
+    if e.program_flip(0x1_2345_6700).is_err() || e.manual_trigger().is_err() {
+        return TestResult::Fail("DRR flip arm/trigger");
+    }
+    let last = e.io.writes.last().copied();
+    if last != Some((0x1c3a, 1))
+        || e.io
+            .writes
+            .iter()
+            .position(|w| w.0 == PRIMARY_SURFACE_ADDRESS + 2 * HUBP_STRIDE)
+            .is_none_or(|i| i + 1 != e.io.writes.len() - 1)
+    {
+        return TestResult::Fail("manual trigger preceded address or used another pipe");
+    }
+    let writes = e.io.writes.len();
+    e.authority.revoke();
+    if e.manual_trigger() != Err(Error::Revoked) || e.io.writes.len() != writes {
+        return TestResult::Fail("revoked authority triggered DRR");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    dcn30_flip_drr_trigger_follows_surface_address_publication
+);
+
+fn dcn30_flip_samples_last_drr_total_with_position() -> TestResult {
+    let mut e = engine(1);
+    let base = OTG_STRIDE;
+    e.io.values[(base + OTG_STATUS_FRAME_COUNT) as usize] = 7;
+    e.io.values[(base + OTG_STATUS_POSITION) as usize] = 1400;
+    e.io.values[(base + OTG_V_BLANK_START_END) as usize] = 1084 | 41 << 16;
+    e.io.values[(base + 0x1b9b) as usize] = 1688 << 16;
+    if e.position_drr().map_or(true, |(p, total)| {
+        p.vpos != 1400 || p.frame != 7 || total != 1688
+    }) {
+        return TestResult::Fail("stretched-frame sample lost hardware total");
+    }
+    // Physical 4K capture: programmed V_TOTAL=0x8ad (2221), but
+    // LAST_USED_BY_DRR=0x8ae (2222). The status field is already a count.
+    e.io.values[(base + 0x1b9b) as usize] = 0x08ae_0000;
+    if e.position_drr().map(|(_, total)| total) != Ok(2222) {
+        return TestResult::Fail("completed DRR line count was incremented");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    dcn30_flip_samples_last_drr_total_with_position
+);
+
+fn dcn30_flip_odm_arms_both_slices_under_one_otg_lock() -> TestResult {
+    let mut e = engine(0);
+    e.odm = Some(5);
+    let address = 0x0081_821a_4000;
+    if e.program_flip(address).is_err() {
+        return TestResult::Fail("ODM flip refused");
+    }
+    let writes = &e.io.writes;
+    let at = |reg: u64, value: Option<u32>| {
+        writes
+            .iter()
+            .position(|&(r, v)| r == reg && value.is_none_or(|x| x == v))
+    };
+    let lock = at(OTG_MASTER_UPDATE_LOCK, Some(1));
+    let unlock = at(OTG_MASTER_UPDATE_LOCK, Some(0));
+    let left = at(PRIMARY_SURFACE_ADDRESS, None);
+    let right = at(5 * HUBP_STRIDE + PRIMARY_SURFACE_ADDRESS, None);
+    match (lock, left, right, unlock) {
+        (Some(l), Some(a), Some(b), Some(u)) if l < a && a < b && b < u => {}
+        _ => return TestResult::Fail("ODM slices not armed inside the OTG lock"),
+    }
+    let v = &e.io.values;
+    for pipe in [0, 5] {
+        let base = pipe * HUBP_STRIDE;
+        if v[(base + PRIMARY_SURFACE_ADDRESS_HIGH) as usize] != 0x81
+            || v[(base + PRIMARY_SURFACE_ADDRESS) as usize] != 0x821a_4000
+        {
+            return TestResult::Fail("ODM slice address");
+        }
+    }
+    // Pending until every slice has latched the new surface.
+    for pipe in [0, 5] {
+        let base = pipe * HUBP_STRIDE;
+        e.io.values[(base + FLIP_CONTROL) as usize] &= !FLIP_PENDING;
+    }
+    e.io.values[EARLIEST_INUSE as usize] = 0x821a_4000;
+    e.io.values[EARLIEST_INUSE_HIGH as usize] = 0x81;
+    if e.pending() != Ok(true) {
+        return TestResult::Fail("right slice still on the old surface was not pending");
+    }
+    e.io.values[(5 * HUBP_STRIDE + EARLIEST_INUSE) as usize] = 0x821a_4000;
+    e.io.values[(5 * HUBP_STRIDE + EARLIEST_INUSE_HIGH) as usize] = 0x81;
+    if e.pending() != Ok(false) {
+        return TestResult::Fail("both slices latched but flip still pending");
+    }
+    // One pipe: the existing sequence, no OTG lock.
+    let mut single = engine(0);
+    if single.program_flip(address).is_err()
+        || single
+            .io
+            .writes
+            .iter()
+            .any(|&(r, _)| r == OTG_MASTER_UPDATE_LOCK)
+    {
+        return TestResult::Fail("single-pipe flip took the OTG lock");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    dcn30_flip_odm_arms_both_slices_under_one_otg_lock
 );

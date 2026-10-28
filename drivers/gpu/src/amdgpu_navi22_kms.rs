@@ -16,6 +16,7 @@
 //! what the hardware shows; `amdgpu_navi22_platform`'s display monitor
 //! converges the hardware to it. All state changes here are short and
 //! synchronous: DRM ioctls never wait for the display owner.
+use crate::amdgpu_dcn30_hdmi::{Limits, OutputSettings};
 use crate::amdgpu_dml::Timing;
 use crate::amdgpu_navi22_display::{Connector as Port, Detection, Report, Signal};
 use crate::amdgpu_navi22_power_policy::DisplayAdmission;
@@ -52,6 +53,11 @@ pub struct ConnectorState {
     /// No admission inputs existed at detection (nothing lit yet): the
     /// sink may still be lit at its preferred mode, which admits it.
     pub unadmitted: bool,
+    pub output: OutputSettings,
+    pub shown_output: OutputSettings,
+    pub hdmi_limits: Limits,
+    pub color_relight: bool,
+    pub vrr: Option<crate::amdgpu_freesync::AmdVsdb>,
 }
 impl ConnectorState {
     /// Whether the single-pipe owner can drive this connector (HDMI, or
@@ -74,6 +80,7 @@ pub struct CrtcState {
     pub route: Option<usize>,
     /// DRM chose the route; automatic routing leaves it.
     pub explicit: bool,
+    pub vrr_enabled: bool,
 }
 impl CrtcState {
     pub const fn new() -> Self {
@@ -83,6 +90,7 @@ impl CrtcState {
             shown: None,
             route: None,
             explicit: false,
+            vrr_enabled: false,
         }
     }
 }
@@ -185,9 +193,26 @@ impl Kms {
                 port: report.connector,
                 kind,
                 present,
-                edid,
+                edid: edid.clone(),
                 modes,
                 unadmitted,
+                output: old
+                    .iter()
+                    .find(|o| o.port == report.connector)
+                    .map_or_else(OutputSettings::default, |o| o.output),
+                shown_output: old
+                    .iter()
+                    .find(|o| o.port == report.connector && o.edid == edid)
+                    .map_or_else(OutputSettings::default, |o| o.shown_output),
+                vrr: None,
+                color_relight: old
+                    .iter()
+                    .find(|o| o.port == report.connector && o.edid == edid)
+                    .is_some_and(|o| o.color_relight),
+                hdmi_limits: old
+                    .iter()
+                    .find(|o| o.port == report.connector)
+                    .map_or(Limits::DEFAULT, |o| o.hdmi_limits),
             });
         }
         if self.crtc.route.is_some_and(|r| r >= self.connectors.len()) {
@@ -270,7 +295,13 @@ impl Kms {
         match (running, target) {
             (Some(_), None) => Action::Unlight,
             (Some((route, shown)), Some(t)) => {
-                if route != t || c.requested.is_some_and(|w| w != shown) {
+                if route != t
+                    || c.requested.is_some_and(|w| w != shown)
+                    || (self.connectors[t]
+                        .output
+                        .needs_modeset(self.connectors[t].shown_output)
+                        || self.connectors[t].color_relight)
+                {
                     Action::Unlight
                 } else {
                     Action::Nothing
@@ -393,10 +424,15 @@ impl Kms {
             (Some(_), false) => GroupAction::Unlight,
             (Some(lit), true) => {
                 let same = lit.len() == targets.len()
-                    && lit
-                        .iter()
-                        .zip(&targets)
-                        .all(|(l, t)| l.0 == t.0 && l.1 == t.1 && t.2.is_none_or(|w| w == l.2));
+                    && lit.iter().zip(&targets).all(|(l, t)| {
+                        l.0 == t.0
+                            && l.1 == t.1
+                            && t.2.is_none_or(|w| w == l.2)
+                            && !self.connectors[t.1]
+                                .output
+                                .needs_modeset(self.connectors[t.1].shown_output)
+                            && !self.connectors[t.1].color_relight
+                    });
                 if same {
                     GroupAction::Nothing
                 } else {
@@ -457,10 +493,27 @@ pub fn crtc_display(crtc_id: u32) -> Option<u8> {
 /// connector may drive every CRTC (one DIG per stream, any pipe), as DC's
 /// `possible_crtcs`.
 pub fn publish() {
-    let kms = KMS.lock();
-    let crtcs: Vec<Option<crate::amdgpu_navi48_kms::Sink>> = (0..MAX_CRTCS)
-        .map(|d| {
-            kms.published_at(d)
+    // DRM's atomic checks hold the card lock while inspecting KMS. Capture
+    // owned data here and release KMS before taking that lock: publication
+    // must not introduce the inverse KMS -> card order.
+    let (published, inventory, routes, off) = {
+        let kms = KMS.lock();
+        let published: Vec<_> = (0..MAX_CRTCS)
+            .map(|d| kms.published_at(d).cloned())
+            .collect();
+        let routes: Vec<_> = (0..kms.connectors.len()).map(|n| kms.crtc_of(n)).collect();
+        let off: Vec<_> = (0..MAX_CRTCS)
+            .filter(|&d| {
+                kms.crtc_at(d)
+                    .is_some_and(|c| c.shown.is_some() && !c.active)
+            })
+            .collect();
+        (published, kms.connectors.clone(), routes, off)
+    };
+    let crtcs: Vec<Option<crate::amdgpu_navi48_kms::Sink>> = published
+        .iter()
+        .map(|p| {
+            p.as_ref()
                 .map(|(edid, timing, offered)| crate::amdgpu_navi48_kms::Sink {
                     edid,
                     timing,
@@ -468,8 +521,7 @@ pub fn publish() {
                 })
         })
         .collect();
-    let connectors: Vec<crate::amdgpu_navi48_kms::RoutedConnector> = kms
-        .connectors
+    let connectors: Vec<crate::amdgpu_navi48_kms::RoutedConnector> = inventory
         .iter()
         .enumerate()
         .map(|(n, c)| crate::amdgpu_navi48_kms::RoutedConnector {
@@ -480,20 +532,31 @@ pub fn publish() {
                 .then(|| c.edid.get(..128).and_then(|e| e.try_into().ok()))
                 .flatten(),
             offered: if c.lightable() { &c.modes } else { &[] },
-            crtc: kms.crtc_of(n),
+            crtc: routes[n],
             possible_crtcs: (1 << MAX_CRTCS) - 1,
         })
         .collect();
-    let off: Vec<usize> = (0..MAX_CRTCS)
-        .filter(|&d| {
-            kms.crtc_at(d)
-                .is_some_and(|c| c.shown.is_some() && !c.active)
+    let vrr: Vec<bool> = inventory
+        .iter()
+        .map(|c| {
+            c.present
+                && c.vrr.is_some_and(|caps| {
+                    caps.range().is_some_and(|range| {
+                        c.modes.iter().any(|t| {
+                            crate::amdgpu_freesync::hdmi_info_packet(
+                                t,
+                                range,
+                                caps.version,
+                                crate::amdgpu_freesync::HdmiState::Disabled,
+                            )
+                            .is_some()
+                        })
+                    })
+                })
         })
         .collect();
     with_card(|card| {
-        crate::amdgpu_navi48_kms::apply_routed(card, &crtcs, &connectors);
-        card.vblank_source = Some(crate::amdgpu_navi22_platform::crtc_vblank);
-        card.plane_formats = Some(&PLANE_FORMATS);
+        apply_card_vrr(card, &crtcs, &connectors, Some(&vrr));
         for &d in &off {
             crate::amdgpu_navi48_kms::set_crtc_active(card, d, false);
         }
@@ -501,10 +564,52 @@ pub fn publish() {
     ACTIVE.store(true, Ordering::Release);
 }
 
+#[cfg(feature = "kernel-test")]
+fn apply_card(
+    card: &mut Card,
+    crtcs: &[Option<crate::amdgpu_navi48_kms::Sink<'_>>],
+    connectors: &[crate::amdgpu_navi48_kms::RoutedConnector<'_>],
+) {
+    apply_card_vrr(card, crtcs, connectors, None)
+}
+fn apply_card_vrr(
+    card: &mut Card,
+    crtcs: &[Option<crate::amdgpu_navi48_kms::Sink<'_>>],
+    connectors: &[crate::amdgpu_navi48_kms::RoutedConnector<'_>],
+    vrr: Option<&[bool]>,
+) {
+    // Preserve committed blob ids through hotplug/republication. Attaching
+    // connector controls must not import DCN401 CRTC/plane capabilities.
+    let previous = card.native.clone();
+    crate::amdgpu_navi48_kms::apply_routed_vrr(card, crtcs, connectors, vrr);
+    for (native, connector) in card.native.iter_mut().zip(connectors) {
+        if connector.kind != ConnectorType::HdmiA {
+            continue;
+        }
+        let kept = previous.iter().find(|n| n.connector == native.connector);
+        native.colorspace = Some(kept.and_then(|n| n.colorspace).unwrap_or(0));
+        native.hdr_output_metadata = Some(kept.and_then(|n| n.hdr_output_metadata).unwrap_or(0));
+        native.color_format = Some(kept.and_then(|n| n.color_format).unwrap_or_default());
+        native.max_bpc = Some(
+            kept.and_then(|n| n.max_bpc)
+                .unwrap_or_else(crate::amdgpu_navi48_boot::max_bpc),
+        );
+    }
+    card.collect_blobs();
+    card.vblank_source = Some(crate::amdgpu_navi22_platform::crtc_vblank);
+    card.plane_formats = Some(&PLANE_FORMATS);
+    // Share connector/CRTC bookkeeping, not DCN401's plane capabilities.
+    // This presenter copies one linear 8888 primary into its DCN30 back
+    // buffer; overlays, GFX12 tiling and native plane geometry have no
+    // implementation here. Keep the generic atomic primary/cursor ABI.
+    card.native_planes.clear();
+    card.overlay_formats = None;
+    card.gfx12_modifiers = false;
+}
+
 type CardState = alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<Card>>;
 fn amdgpu_card() -> Option<(u32, Option<CardState>)> {
-    let index = (0..crate::drm_registry::count() as u32)
-        .find(|&i| crate::drm_registry::driver_name(i) == Some("amdgpu"))?;
+    let index = crate::amdgpu_navi22_cs::drm_card()?;
     Some((index, crate::drm_registry::mode_state(index)))
 }
 fn with_card(update: impl FnOnce(&mut Card)) {
@@ -700,3 +805,24 @@ pub fn display_admission(
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi22_kms_tests.rs"]
 mod tests;
+
+#[path = "amdgpu_navi22_output.rs"]
+mod output;
+pub use output::{
+    connector_color_supported, output_formats_supported, request_connector_color,
+    request_connector_max_bpc,
+};
+
+/// Retain the CRTC's VRR request; unsupported modes/sinks stay fixed-rate.
+pub fn request_vrr_enabled(display: u8, enabled: bool) {
+    requested(|kms| {
+        let Some(c) = kms.crtc_at_mut(usize::from(display)) else {
+            return false;
+        };
+        if c.vrr_enabled == enabled {
+            return false;
+        }
+        c.vrr_enabled = enabled;
+        true
+    });
+}

@@ -58,7 +58,7 @@ pub(crate) use hdmi_link::audio::{
 };
 #[cfg(feature = "kernel-test")]
 pub(crate) use hdmi_link::audio::{mst_audio_info, uhbr_audio_info};
-pub(crate) use hdmi_link::{avi_infoframe, vendor_infoframe};
+pub(crate) use hdmi_link::{avi_infoframe_in, vendor_infoframe};
 pub use hdmi_link::{
     AudioInfo, AudioMode, Avi, DisplayAudio, HdmiLinkReady, HdmiLinkRequest, HdmiVideoRunning,
     TMDS_MAX_KHZ, TMDS_SCRAMBLE_KHZ,

@@ -176,7 +176,7 @@ fn navi22_rom_bank_is_selected_before_hardware_access() -> TestResult {
         })
         .collect(),
     };
-    if bank(&gpu, &device) != Ok(0x4000) {
+    if bank(&gpu, &device) != Ok(0x4000) || ports(&gpu) != Some((0xe4, 0xe5)) {
         return TestResult::Fail("ROM port is not SMUIO base index zero");
     }
     let cap = Cap::bootstrap();
@@ -186,10 +186,25 @@ fn navi22_rom_bank_is_selected_before_hardware_access() -> TestResult {
         return TestResult::Fail("ROM backend bypassed live PCI invocation");
     }
     gpu.ip_blocks[2].revision = 6;
+    // Captured board's 1 MiB register BAR.
+    gpu.regs.len = 0x100000;
+    // Captured MSI RX 6750 XT discovery: SMUIO 11.0.6, base 0x16800.
+    // smuio_v11_0_6 uses shifted ports at base index zero for this IP.
+    gpu.ip_blocks[2].base_addrs[0] = 0x16800;
+    if bank(&gpu, &device) != Ok(0x5a000) || ports(&gpu) != Some((0xe5, 0xe6)) {
+        return TestResult::Fail("captured RX 6750 XT SMUIO 11.0.6 ROM bank refused");
+    }
+    gpu.regs.len = 0x5a000 + 0xe6 * 4;
+    if bank(&gpu, &device).is_ok() {
+        return TestResult::Fail("SMUIO 11.0.6 ROM_DATA boundary used older offsets");
+    }
+    gpu.regs.len = 0x100000;
+    gpu.ip_blocks[2].revision = 9;
     if bank(&gpu, &device).is_ok() {
         return TestResult::Fail("different SMUIO generation inherited ROM offsets");
     }
     gpu.ip_blocks[2].revision = 7;
+    gpu.ip_blocks[2].base_addrs[0] = 0x1000;
     gpu.regs.len = 0x4000 + DATA as u64 * 4;
     if bank(&gpu, &device).is_ok() {
         return TestResult::Fail("ROM_DATA lies outside BAR5");
@@ -232,7 +247,7 @@ fn navi48_rom_profile_and_snapshot_are_independent_of_navi22() -> TestResult {
         ..template
     })
     .collect();
-    if bank(&gpu, &device) != Ok(0x4000) {
+    if bank(&gpu, &device) != Ok(0x4000) || ports(&gpu) != Some((0xe4, 0xe5)) {
         return TestResult::Fail("SMUIO14 ROM base index/offset");
     }
     cap.revoke();

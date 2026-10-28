@@ -7,6 +7,87 @@ use narf_memory::PhysAddr;
 const MIB: u64 = 1024 * 1024;
 const GPU_BASE: u64 = 0x2_0000_0000;
 const BAR_BASE: u64 = 0x6000_0000;
+/// Exercise the real inventory/MC translation for cross-module PSP/DMUB models.
+pub(crate) fn secure_plan(
+    base: u64,
+    size: u64,
+    offset: u64,
+    windows: [Option<Range<u64>>; 2],
+) -> Plan {
+    let mut regs = vec![0; 0x500];
+    for (index, window) in windows.into_iter().enumerate() {
+        if let Some(window) = window {
+            let physical = window.start - base + offset;
+            regs[0x1a5 + index] = (index as u32) << 24;
+            regs[0x1ad + index] =
+                ENABLE | ((index as u32) << 24) | (window.end - window.start - 1) as u32;
+            regs[0x1b5 + index * 2] = physical as u32;
+            regs[0x1b6 + index * 2] = (physical >> 32) as u32;
+        }
+    }
+    snapshot_with_layout(
+        mapping(size.min(256 * MIB)),
+        &bios(),
+        None,
+        &[],
+        SnapshotLayout {
+            fields: [
+                (base >> 24) as u32,
+                ((base + size - 1) >> 24) as u32,
+                (offset >> 24) as u32,
+            ],
+            region6: false,
+            dcn30: true,
+            size: Some(size),
+        },
+        |reg| regs[reg as usize],
+    )
+    .unwrap()
+}
+
+fn vram_secure_dmub_inventory_keeps_disjoint_windows_above_bar() -> TestResult {
+    let base = 0x8000000000;
+    let windows = [
+        Some(0x82fee00000..0x82feec0000),
+        Some(0x82fef00000..0x82fefa0000),
+    ];
+    let plan = secure_plan(base, 12 << 30, 1 << 32, windows.clone());
+    let secure = plan.secure_dmub();
+    if !secure.matches_aperture(base, 12 << 30)
+        || secure.matches_aperture(base, 16 << 30)
+        || !secure.contains(0, &(0x82fee00100..0x82fee00104))
+        || secure.contains(0, &(0x82fee00000..0x82fefa0000))
+        || secure.contains(0, &(0x82fef00100..0x82fef00104))
+        || secure.contains(1, &(0x82fef00100..0x82fef00100))
+    {
+        return TestResult::Fail("secure CW identity, aperture or range bounds lost");
+    }
+    for window in windows.into_iter().flatten() {
+        if !plan
+            .protected()
+            .iter()
+            .any(|p| p.owner == Owner::Dmub && p.range == (window.start - base..window.end - base))
+        {
+            return TestResult::Fail("authorized secure window not permanently excluded");
+        }
+    }
+    // SAFETY: model allocation bookkeeping only; the BAR is not dereferenced.
+    let unmapped = unsafe { plan.unmapped_pool() }.unwrap().unwrap();
+    let mut held = Vec::new();
+    while let Ok(r) = unmapped.reserve_aligned(MIB, MIB) {
+        if secure.contains(0, &(r.address()..r.address() + r.size()))
+            || r.address() < 0x82fefa0000 && r.address() + r.size() > 0x82fee00000
+        {
+            return TestResult::Fail("unmapped allocator reused secure memory");
+        }
+        held.push(r);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vram",
+    vram_secure_dmub_inventory_keeps_disjoint_windows_above_bar
+);
 fn navi22_plan(visible: u64, image: &[u8], clients: &[Range<u64>]) -> Result<Plan, Error> {
     let size = 12 << 30;
     let mut plan = snapshot_with_fields(

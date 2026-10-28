@@ -25,6 +25,15 @@ applications above NARF.
 
 ## 3. Public interface
 
+Blocking poll/ppoll and select/pselect distinguish providers with a durable
+readiness arm or broadcast notification from silent legacy providers (such
+as serial ttys). A set containing a silent provider sleeps to a recheck no
+later than 10 ms, clamped by any earlier provider deadline or application
+timeout. This is a scheduler wake deadline only: the application's absolute
+timeout survives syscall re-execution unchanged. Fully notifying sets keep
+their event-driven wait, including infinite waits without periodic retries.
+An empty or negative-only set waits only for its timeout or a signal.
+
 Device ioctl dispatch passes an `IoctlContext` with guarded process-memory
 copies, the open description's O_NONBLOCK state, retained descriptor lookup
 and the caller's thread-group ID to FileOps. The syscall layer also owns the
@@ -941,7 +950,7 @@ descriptor close; a peer parked in an infinite poll/epoll wait wakes to
 Connected unnamed AF_UNIX peers, including `socketpair(2)` endpoints, report a
 minimal `sockaddr_un` containing only `sa_family` from `getpeername(2)`;
 truncated output still reports the full address length.
-`open(2)`/`openat(2)` reject an empty pathname with `ENOENT` before cwd
+`open(2)`/`openat(2)`/`execve(2)` reject an empty pathname with `ENOENT` before cwd
 normalization; an empty path never aliases the current directory. Linux path
 and descriptor failures return their specific errno rather than a bare `-1`:
 in particular `openat(2)` reports `EFAULT`, `EMFILE`, and mapped filesystem
@@ -949,6 +958,11 @@ errors. Descriptor allocation precedes path lookup and creation, so `EMFILE`
 publishes neither a file descriptor nor an `O_CREAT` inode. `newfstatat(2)`
 distinguishes `EFAULT`, `ENOENT`, `EBADF`,
 `ENOTDIR`, and invalid flag `EINVAL`.
+`execve(2)`/`execveat(2)` reject directory images (including the installed-root
+mount itself) and other non-regular images with `EACCES`. Executable lookup
+preserves `ENOENT`, `ENOTDIR`, `ELOOP` and mapped filesystem errors; a directory
+reported as `InvalidPath` by the file-only resolver must not become `EIO`.
+`execveat(2)` retains its explicit `AT_EMPTY_PATH` descriptor semantics.
 The chmod/chown syscall families resolve relative `*at` paths through a real
 directory fd, reject invalid flags and dirfd shapes with Linux errnos, and
 follow the final symlink unless `AT_SYMLINK_NOFOLLOW` selects the link inode.
@@ -1756,6 +1770,19 @@ active pid namespace; a write requires `CAP_SYS_ADMIN` or
 checked before parsing) and a value in `[0, pid_max]` (`EINVAL`), and sets the
 cursor to `value + 1`. It is published in every build. `pid_max` is one global
 value shared by all namespaces (Linux 6.14+ keeps it per namespace).
+
+Userspace core dumps honor `RLIMIT_CORE` and emit ELF64 metadata with
+`PT_NOTE` data immediately after the ELF header, before the VMA program-header
+table. Metadata is written as one sequential buffer (retrying short writes),
+so a partial dump preserves process identity and raw register notes before a
+large table or memory payload. A nonempty write returning zero is a failure.
+`NT_PRSTATUS` currently contains the architecture's raw `user_regs_struct`,
+not Linux's full `elf_prstatus`; `NT_PRPSINFO` and optional `NT_AUXV` accompany
+it. Full Linux `NT_PRSTATUS`, `NT_SIGINFO`, and `NT_FILE` remain unsupported.
+Before optional core-file I/O, a fatal-path kernel record reports pid/tid,
+executable, signal, instruction/stack pointers and diagnostic registers even
+when `RLIMIT_CORE` disables the file. Ordinary traps and syscalls do not emit
+that record.
 
 ## 4. Invariants & safety properties
 

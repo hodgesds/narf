@@ -141,6 +141,103 @@ fn smoke_clock_ns_to_cycles_fixed_point_accuracy() -> TestResult {
 }
 kernel_test_in!("time", smoke_clock_ns_to_cycles_fixed_point_accuracy);
 
+/// An arch frequency cache may already exist before wall conversions are
+/// installed. Returning Cached must still make Deadline use that frequency.
+#[cfg(target_arch = "x86_64")]
+fn smoke_cached_calibration_installs_wall_scales() -> TestResult {
+    let hz = narf_arch::x86_64::tsc::frequency_hz();
+    if hz == 0 {
+        return TestResult::Skip("TSC not calibrated");
+    }
+    let (result, source, cycles, ns) = narf_lib::sync::without_interrupts(|| {
+        crate::set_clock_hz(1_000_000_000); // the pre-calibration identity scale
+        let (result, source) = crate::calibrate_clocks_with_source();
+        let cycles = crate::ns_to_cycles(1_000_000);
+        let ns = crate::cycles_to_ns(hz);
+        // Restore even when testing the old implementation, before assertions.
+        crate::set_clock_hz(hz);
+        (result, source, cycles, ns)
+    });
+    if result != hz || source != crate::CalibrationSource::Cached {
+        return TestResult::Fail("cached TSC frequency not reused");
+    }
+    if cycles.abs_diff(hz / 1000) > (hz / 1_000_000_000).max(1) || ns.abs_diff(1_000_000_000) > 1000
+    {
+        return TestResult::Fail("cached calibration left wall conversions uncalibrated");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "time/calibration",
+    smoke_cached_calibration_installs_wall_scales
+);
+
+fn smoke_hpet_calibration_samples_wrap_and_reject_stalled_counters() -> TestResult {
+    use core::cell::Cell;
+    let sample = |start: u64, end: u64, cycles: u64| {
+        let hpet_reads = Cell::new(0);
+        let tsc_reads = Cell::new(0);
+        crate::hpet::measure_tsc(
+            100_000_000,
+            200,
+            || {
+                let n = hpet_reads.get();
+                hpet_reads.set(n + 1);
+                if n == 0 {
+                    start
+                } else {
+                    end
+                }
+            },
+            || {
+                let n = tsc_reads.get();
+                tsc_reads.set(n + 1);
+                if n == 0 {
+                    100
+                } else {
+                    100 + cycles
+                }
+            },
+        )
+    };
+    if sample(1000, 1200, 10_000) != Some(5_000_000_000)
+        || sample(u64::MAX - 100, 99, 10_000) != Some(5_000_000_000)
+        || sample(1000, 1200, 0).is_some()
+        || sample(1000, 1200, u64::MAX / 2).is_some()
+    {
+        return TestResult::Fail("HPET/TSC ratio, wrap, zero or overflow handling");
+    }
+    let tsc_reads = Cell::new(0);
+    let stalled = crate::hpet::measure_tsc(
+        100_000_000,
+        200,
+        || 123,
+        || {
+            let n = tsc_reads.get();
+            tsc_reads.set(n + 1);
+            if n == 0 {
+                0
+            } else {
+                6_500_000_001
+            }
+        },
+    );
+    if stalled.is_some() || tsc_reads.get() != 2 {
+        return TestResult::Fail("stalled HPET calibration ignored its TSC safety bound");
+    }
+    for (frequency, window) in [(0, 200), (100_000_000, 0)] {
+        if crate::hpet::measure_tsc(frequency, window, || 0, || 0).is_some() {
+            return TestResult::Fail("invalid HPET sample parameters accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "time/calibration",
+    smoke_hpet_calibration_samples_wrap_and_reject_stalled_counters
+);
+
 // ── RTC backstops (CMOS / PL031 / Qualcomm PMIC) ──────────────────
 
 fn smoke_rtc_cmos_bcd_to_bin_and_back() -> TestResult {

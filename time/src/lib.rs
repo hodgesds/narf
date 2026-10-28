@@ -293,14 +293,11 @@ pub fn sleep_cycles(cycles: u64) -> SleepUntil {
 /// rather than an arbitrary spin budget that varies with CPU
 /// clock.
 ///
-/// Constructors round to `cycles_per_ns` granularity (set by
-/// `calibrate_clocks`); on a system where calibration failed
-/// (cycles_per_ns falls through to 1) the *_ms / *_us / *_ns
-/// helpers degrade to "1 cycle per ns" which means timeouts fire
-/// later in wall time than nominal — caller should either tune
-/// the cycle count directly or accept the longer-than-asked
-/// wait. `expired()` is monotonic w.r.t. wall time once the TSC
-/// is calibrated.
+/// Duration constructors use the calibrated fixed-point ns -> cycles scale.
+/// Before calibration they fall back to "1 cycle per ns". This is not wall
+/// time: on a >1 GHz TSC, both minimum delays and timeouts fire too early.
+/// Callers requiring hardware-specified delays must establish calibration
+/// before constructing them. `expired()` uses the raw monotonic counter.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Deadline(Instant);
 
@@ -318,7 +315,7 @@ impl Deadline {
     }
 
     /// Construct a deadline `ns` nanoseconds from now. Uses the
-    /// calibrated `cycles_per_ns`; falls back to 1 ns ≈ 1 cycle
+    /// calibrated fixed-point scale; falls back to 1 ns ≈ 1 cycle
     /// when calibration hasn't completed.
     #[inline]
     pub fn after_ns(ns: u64) -> Self {
@@ -525,11 +522,15 @@ pub fn calibrate_clocks() -> u64 {
 /// virtualised host that masks AMD MSRs, `(non-zero,
 /// CalibrationSource::HpetXcheck)`. `(0, CalibrationSource::None)`
 /// indicates total failure — `cycles_per_ns` stays at the default
-/// `1` and `Deadline::after_ms` will fire late rather than early.
+/// `1` and duration deadlines have no wall-time guarantee.
 #[cfg(target_arch = "x86_64")]
 pub fn calibrate_clocks_with_source() -> (u64, CalibrationSource) {
     let cached = narf_arch::x86_64::tsc::frequency_hz();
     if cached != 0 {
+        // The arch cache can be populated before the wall-clock conversion
+        // pairs (for example by an early driver). A cached frequency alone
+        // does not make Deadline's ns -> cycles conversion calibrated.
+        apply_cycles_per_ns(cached);
         return (cached, CalibrationSource::Cached);
     }
     // 1. Intel CPUID 0x15. When the leaf populates a non-zero

@@ -479,7 +479,20 @@ fn atomic_fbs(card: &crate::drm::card::Card, req: AtomicRequest<'_>) -> Result<V
             .checked_add(count as usize)
             .filter(|n| *n <= req.props.len() && *n <= req.values.len())
             .ok_or(FsError::InvalidData)?;
-        if let Some(mut p) = crate::drm_native_planes::plane_state(card, object) {
+        let primary = || {
+            if !card.native_planes.is_empty() {
+                return None;
+            }
+            let index = object.checked_sub(crate::drm_native_planes::PRIMARY_PLANE_ID_BASE)?;
+            let crtc = card.crtcs.get(index as usize)?;
+            Some(crate::drm::atomic::PlaneState {
+                id: object,
+                crtc_id: Some(crtc.id),
+                fb_id: crtc.primary_fb,
+                ..Default::default()
+            })
+        };
+        if let Some(mut p) = crate::drm_native_planes::plane_state(card, object).or_else(primary) {
             for (&prop, &value) in req.props[at..end].iter().zip(&req.values[at..end]) {
                 if prop == PLANE_FB_ID_PROP_ID {
                     p.fb_id = (value != 0).then_some(value as u32)
@@ -566,7 +579,12 @@ pub(crate) async fn dispatch(
     let mode = crate::drm_registry::mode_state(card)?;
     {
         let c = mode.lock();
-        if !c.gfx12_modifiers || c.native_planes.is_empty() || !atomic_card(&c) {
+        let linear = crate::amdgpu_native_kms::linear_gem_card(&c);
+        if (!linear && (!c.gfx12_modifiers || c.native_planes.is_empty())) || !atomic_card(&c) {
+            return None;
+        }
+        // The linear-primary card retains the generic legacy cursor path.
+        if linear && matches!(nr, 0xa3 | 0xbb) {
             return None;
         }
         // DRM_MASTER failure precedes user-pointer validation and relocation.

@@ -58,6 +58,27 @@ pub struct Plan {
     vram_size: u64,
     protected: Vec<Protected>,
     training: Option<Training>,
+    secure_dmub: SecureDmub,
+}
+/// Only inherited CW0/CW1 VRAM, permanently excluded by this Plan. Other
+/// protected clients and DMUB's nonsecure windows never authorize firmware.
+#[derive(Clone, Debug)]
+pub(crate) struct SecureDmub {
+    aperture: Range<u64>,
+    windows: [Option<Range<u64>>; 2],
+}
+impl SecureDmub {
+    pub(crate) fn matches_aperture(&self, base: u64, size: u64) -> bool {
+        self.aperture.start == base && base.checked_add(size) == Some(self.aperture.end)
+    }
+    pub(crate) fn contains(&self, index: usize, range: &Range<u64>) -> bool {
+        self.windows
+            .get(index)
+            .and_then(Option::as_ref)
+            .is_some_and(|window| {
+                range.start < range.end && range.start >= window.start && range.end <= window.end
+            })
+    }
 }
 /// Firmware's GDDR6 training exchange buffers, in VRAM-relative bytes.
 /// They are reservations, not evidence that memory training has completed.
@@ -68,6 +89,9 @@ pub struct Training {
     pub size: u64,
 }
 impl Plan {
+    pub(crate) fn secure_dmub(&self) -> SecureDmub {
+        self.secure_dmub.clone()
+    }
     /// Inventory a physical Navi22 using GMC10's full VRAM range and DCN3.0's
     /// inherited DMUB windows. `None` means this GPU has no boot framebuffer;
     /// all six supported linear scanouts/cursors are included automatically.
@@ -539,6 +563,10 @@ fn snapshot_with_layout(
         vram_size,
         protected: Vec::new(),
         training: None,
+        secure_dmub: SecureDmub {
+            aperture: gpu_base..gpu_end,
+            windows: [None, None],
+        },
     };
     // Retain the full prefix, including VGA emulation, firmware shadow and
     // the pre-OS framebuffer. Do not reclaim it while the boot console is live.
@@ -606,6 +634,11 @@ fn snapshot_with_layout(
                 .ok_or(Error::Invalid)?;
         }
         plan.protect_dmub(address, size)?;
+        // protect_dmub also permits wholly external GART mappings, which
+        // cannot authorize VRAM firmware. Only retained secure VRAM counts.
+        if index <= 1 && address >= gpu_base && address + size <= gpu_end {
+            plan.secure_dmub.windows[index as usize] = Some(address..address + size);
+        }
     }
     // Region5 is the trace alias. DCN4 additionally maps shared firmware state
     // into Region6, with a direct GPU offset and inclusive top (dmub_dcn401).
@@ -740,4 +773,4 @@ fn u32_at(bytes: &[u8], offset: usize) -> u32 {
 
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_vram_boot_tests.rs"]
-mod tests;
+pub(crate) mod tests;

@@ -85,10 +85,12 @@ struct Model {
     releases: [u32; 2],
     never_boot: [bool; 2],
     pgfsm_stuck: bool,
+    status_requires_power: bool,
     /// Rings that ignore doorbells: dec0, enc0.0, enc0.1, dec1, enc1.0, enc1.1, jpeg.
     stalled: [bool; 7],
     drop_fences: bool,
     gone: bool,
+    gone_on_vcpu: bool,
     work: Vec<Work>,
     traps: u32,
     rptr: [u32; 7],
@@ -104,6 +106,7 @@ impl Model {
     fn new() -> Self {
         let mut regs = BTreeMap::new();
         regs.insert(NBIO + u64::from(NBIO_DOORBELL_APER_EN) * 4, 1);
+        regs.insert(NBIO + u64::from(NBIO_CONFIG_MEMSIZE) * 4, 12288);
         regs.insert(GC + u64::from(GB_ADDR_CONFIG) * 4, GB_ADDR);
         for i in [0, 1] {
             // Tiles gated at reset, gates closed, LMI clean.
@@ -130,9 +133,11 @@ impl Model {
             releases: [0; 2],
             never_boot: [false; 2],
             pgfsm_stuck: false,
+            status_requires_power: false,
             stalled: [false; 7],
             drop_fences: false,
             gone: false,
+            gone_on_vcpu: false,
             work: Vec::new(),
             traps: 0,
             rptr: [0; 7],
@@ -375,7 +380,17 @@ impl Io for Model {
         Some(16)
     }
     fn read(&mut self, address: u64) -> u32 {
+        if self.gone_on_vcpu && (0..2).any(|i| address == v(i, VCPU_CNTL)) {
+            self.gone = true;
+        }
         if self.gone {
+            return u32::MAX;
+        }
+        if self.status_requires_power
+            && (0..2).any(|i| {
+                address == v(i, STATUS) && self.reg(v(i, PGFSM_STATUS)) & PGFSM_STATUS_MASK != 0
+            })
+        {
             return u32::MAX;
         }
         self.reg(address)
@@ -517,6 +532,120 @@ fn cancel_at<F: Future>(future: F, progress: &AtomicU32, goal: u32) -> bool {
         }
     }
 }
+
+fn vcn_navi22_powers_tiles_before_reading_vcpu_status() -> TestResult {
+    let mut model = Model::new();
+    model.status_requires_power = true;
+    let (_pool, mut e) = engine(model, 3);
+    if run(e.start(firmware(3), None)).is_err() || e.state != State::Running {
+        return TestResult::Fail("gated UVD_STATUS mistaken for device removal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22",
+    vcn_navi22_powers_tiles_before_reading_vcpu_status
+);
+
+fn vcn_navi22_all_ones_vcpu_control_preserves_linux_masked_updates() -> TestResult {
+    let mut model = Model::new();
+    for i in [0, 1] {
+        model.regs.insert(v(i, VCPU_CNTL), u32::MAX);
+    }
+    let (_pool, mut e) = engine(model, 3);
+    if run(e.start(firmware(3), None)).is_err() || e.state != State::Running {
+        return TestResult::Fail("all-ones VCPU control rejected on a live GPU");
+    }
+    for i in [0, 1] {
+        let writes: Vec<_> =
+            e.hw.io
+                .writes
+                .iter()
+                .filter(|&&(a, _)| a == v(i, VCPU_CNTL))
+                .collect();
+        // WREG32_P(VCPU_CNTL, CLK_EN, ~CLK_EN), then clear BLK_RST.
+        if writes.len() != 2
+            || writes[0].1 != u32::MAX
+            || writes[1].1 != u32::MAX & !VCPU_BLK_RST
+            || e.proof.booted[i] != 1
+            || !e.proof.dec_ring[i]
+            || !e.proof.enc_ring[i].iter().all(|tested| *tested)
+        {
+            return TestResult::Fail(
+                "VCPU masked writes changed unrelated bits or skipped ring tests",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22",
+    vcn_navi22_all_ones_vcpu_control_preserves_linux_masked_updates
+);
+
+fn vcn_navi22_all_ones_vcpu_control_checks_independent_device_presence() -> TestResult {
+    let mut model = Model::new();
+    model.gone_on_vcpu = true;
+    let (_pool, mut e) = engine(model, 1);
+    if run(e.start(firmware(1), None)) != Err(Error::DeviceGone)
+        || e.state != State::Failed
+        || e.hw.io.writes.iter().any(|&(a, _)| a == v(0, VCPU_CNTL))
+    {
+        return TestResult::Fail(
+            "VCPU control written after independent banks reported device loss",
+        );
+    }
+    // A gated GC bank is not evidence of removal. Linux's working GPU
+    // returned all ones for both GB_ADDR_CONFIG and UVD_VCPU_CNTL.
+    let mut model = Model::new();
+    model
+        .regs
+        .insert(GC + u64::from(GB_ADDR_CONFIG) * 4, u32::MAX);
+    model.regs.insert(v(0, VCPU_CNTL), u32::MAX);
+    if update_vcpu(&mut model, layout(1), 0, VCPU_CLK_EN, VCPU_CLK_EN).is_err()
+        || model.writes != [(v(0, VCPU_CNTL), u32::MAX)]
+    {
+        return TestResult::Fail("gated GC mistaken for removal during VCPU masked update");
+    }
+    // A live memory-size register is insufficient when the aperture is absent or closed.
+    for aperture in [0, u32::MAX] {
+        let mut model = Model::new();
+        model.regs.insert(v(0, VCPU_CNTL), u32::MAX);
+        model
+            .regs
+            .insert(layout(1).nbio(NBIO_DOORBELL_APER_EN), aperture);
+        let want = if aperture == 0 {
+            Error::Invalid
+        } else {
+            Error::DeviceGone
+        };
+        if update_vcpu(&mut model, layout(1), 0, VCPU_CLK_EN, VCPU_CLK_EN) != Err(want)
+            || !model.writes.is_empty()
+        {
+            return TestResult::Fail("VCPU control written without a live NBIO aperture");
+        }
+    }
+    for size in [0, u32::MAX] {
+        let mut model = Model::new();
+        model.regs.insert(v(0, VCPU_CNTL), u32::MAX);
+        model.regs.insert(layout(1).nbio(NBIO_CONFIG_MEMSIZE), size);
+        let want = if size == 0 {
+            Error::Invalid
+        } else {
+            Error::DeviceGone
+        };
+        if update_vcpu(&mut model, layout(1), 0, VCPU_CLK_EN, VCPU_CLK_EN) != Err(want)
+            || !model.writes.is_empty()
+        {
+            return TestResult::Fail("VCPU control written without NBIO memory-size presence");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22",
+    vcn_navi22_all_ones_vcpu_control_checks_independent_device_presence
+);
 
 fn vcn_navi22_resolves_both_discovered_instances() -> TestResult {
     let mut gpu = crate::amdgpu_gfx_navi22::tests::gpu();

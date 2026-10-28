@@ -2,13 +2,33 @@
 set -eu
 
 boot_dir=${NARF_BOOT_DIR:-/boot}
+state_dir=${NARF_STATE_DIR:-/var/lib/narf}
+esp_path=${NARF_ESP_PATH:-}
+if [ -z "$esp_path" ] && [ -r "$state_dir/esp-path" ]; then
+    IFS= read -r esp_path <"$state_dir/esp-path" || true
+fi
+esp_uuid=
+if [ -n "$esp_path" ] && [ -f "$esp_path/EFI/NARF/narf.efi" ] &&
+    command -v grub-probe >/dev/null 2>&1; then
+    esp_uuid=$(grub-probe --target=fs_uuid "$esp_path/EFI/NARF/narf.efi" 2>/dev/null || true)
+    case "$esp_uuid" in
+        ''|*[!A-Za-z0-9_-]*) esp_uuid= ;;
+    esac
+fi
+if [ -n "$esp_uuid" ]; then
+    esp_search="search --no-floppy --fs-uuid --set=narf_esp $esp_uuid"
+else
+    esp_search='search --no-floppy --file --set=narf_esp /EFI/NARF/narf.efi'
+fi
 for kernel in "$boot_dir"/narf-kernel-*; do
     [ -f "$kernel" ] || continue
     version=${kernel##*/narf-kernel-}
     cat <<EOF
 menuentry 'NARF $version' --class narf --class os {
     if [ "\${grub_platform}" = "efi" ]; then
-        if search --no-floppy --file --set=narf_esp /EFI/NARF/narf.efi; then
+        unset narf_esp
+        $esp_search
+        if [ -n "\$narf_esp" ]; then
             set root=\$narf_esp
             chainloader /EFI/NARF/narf.efi
         else
