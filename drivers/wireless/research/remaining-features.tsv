@@ -65,7 +65,6 @@ brcmfmac	monitor_mode	Monitor mode (incl. native 802.11 msgbuf RX with radiotap/
 brcmfmac	nonzero_descriptor_prefix	Nonzero native descriptor-prefix geometry	feature	drivers/wireless/specification/brcmfmac.md	561
 brcmfmac	optional_pmf	Optional PMF with MFPC AP omitting response RSNE: native negotiated-state proof missing	feature	drivers/wireless/specification/brcmfmac.md	308
 brcmfmac	p2p_mode	P2P mode	feature	drivers/wireless/specification/cyw43439.md	499
-brcmfmac	pcie_irq	PCIe interrupt-driven service	feature	drivers/wireless/specification/brcmfmac.md	565
 brcmfmac	post_reset_rejoin	Rejoin after native reset	feature	drivers/wireless/specification/cyw43439.md	500
 brcmfmac	system_resume	System resume	feature	drivers/wireless/specification/cyw43439.md	562
 brcmfmac	system_suspend	System suspend	feature	drivers/wireless/specification/cyw43439.md	562

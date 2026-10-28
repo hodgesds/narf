@@ -8,7 +8,11 @@ use super::{
     msgbuf::{self, BufAddr, CommonHdr, IoctlReq},
     shared::{RingInfo, RINGINFO_SIZE},
 };
-use alloc::{collections::VecDeque, vec, vec::Vec};
+use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
+
+#[path = "runtime/mailbox.rs"]
+pub mod mailbox;
+use super::irq::Signal;
 
 const INPUT: usize = 1518;
 const CONTROL: usize = 8192;
@@ -57,6 +61,22 @@ pub trait Bus: BootBus {
     fn park_dma(&mut self) -> Result<(), Error>;
     fn doorbell(&mut self) -> Result<(), Error>;
     fn host_ready(&mut self, db1: bool) -> Result<(), Error>;
+    /// PCIe2-core mailbox registers (Linux `devinfo->reginfo`). `None`
+    /// when no PCIe2 core is known: the owner then only services rings.
+    fn mailbox(&self) -> Option<mailbox::Reginfo> {
+        None
+    }
+    /// `pci_write_config_dword(BRCMF_PCIE_REG_SBMBX, 1)`, written twice on
+    /// PCIe2 core revisions <= 13 (`brcmf_pcie_send_mb_data`).
+    fn ring_mailbox(&mut self) -> Result<(), Error> {
+        Err(Error::Protocol)
+    }
+    /// Bind one MSI vector that raises `signal`; `false` keeps polling.
+    fn arm_interrupts(&mut self, _signal: &Arc<Signal>) -> bool {
+        false
+    }
+    /// Release a vector bound by [`Self::arm_interrupts`].
+    fn disarm_interrupts(&mut self) {}
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Kind {
@@ -160,6 +180,11 @@ pub struct Runtime<B: Bus> {
     h2d_read: u32,
     max_flows: u16,
     max_rx: u16,
+    mailbox: Option<mailbox::Mailbox>,
+    signal: Arc<Signal>,
+    delivered: bool,
+    /// Linux `BRCMFMAC_PCIE_STATE_DOWN`: no H2D posts or mailbox re-enable.
+    down: bool,
 }
 impl<B: Bus> core::fmt::Debug for Runtime<B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -172,6 +197,7 @@ impl<B: Bus> core::fmt::Debug for Runtime<B> {
 impl<B: Bus> Drop for Runtime<B> {
     fn drop(&mut self) {
         if self.published {
+            self.stop_interrupts();
             let _ = self.bus.park_dma();
             // BME readback cannot prove all old posted PCI writes drained.
             // No physical stop/IOMMU quiescence API exists yet. Leak this
@@ -314,11 +340,33 @@ impl<B: Bus> Runtime<B> {
             h2d_read: info.h2d_r_idx_ptr,
             max_flows: flows,
             max_rx: shared.max_rxbufpost,
+            mailbox: None,
+            signal: Signal::new(),
+            delivered: false,
+            down: false,
         };
+        if let Some(reg) = runtime.bus.mailbox() {
+            for address in [shared.htod_mb_data_addr, shared.dtoh_mb_data_addr] {
+                if address & 3 != 0 || !ram.contains(address, 4) {
+                    return Err(Error::Bounds);
+                }
+            }
+            runtime.mailbox = Some(mailbox::Mailbox {
+                reg,
+                htod: shared.htod_mb_data_addr,
+                dtoh: shared.dtoh_mb_data_addr,
+                d3_acked: false,
+                awaiting: false,
+                ds_ack: false,
+                services: 0,
+            });
+        }
         // Device may observe host addresses as soon as these fields change.
         // Ownership is retained across every later write/error/Drop.
         runtime.published = true;
         let result: Result<(), Error> = (|| {
+            // brcmf_pcie_request_irq: mailbox masked before any vector.
+            runtime.intr_disable()?;
             // Explicitly negotiate TCM index fallback (Linux also uses it
             // when optional host-index allocation is unavailable).
             runtime
@@ -351,6 +399,8 @@ impl<B: Bus> Runtime<B> {
                 &resources.ring_update.address().to_le_bytes(),
             )?;
             runtime.bus.enable_dma()?;
+            // brcmf_pcie_preinit: intr_enable then hostready.
+            runtime.start_interrupts()?;
             runtime.bus.host_ready(shared.hostrdy_db1())?;
             runtime.replenish()?;
             Ok(())
@@ -523,7 +573,11 @@ impl<B: Bus> Runtime<B> {
         }
         result
     }
+    fn link_up(&self) -> bool {
+        !self.down
+    }
     fn poll_inner(&mut self) -> Result<usize, Error> {
+        self.service_mailbox()?;
         if self
             .resources
             .as_ref()

@@ -154,6 +154,8 @@ pub(super) struct PcieBackplane {
     pub(super) device: BusDevice,
     pub(super) cap: Cap<BusDeviceCap, Write>,
     pub(super) pcie_core: Option<chip::Core>,
+    /// Retained MSI binding (`irq.rs`); `None` keeps polled service.
+    pub(super) msi: Option<super::irq::Msi>,
 }
 
 /// Keep the actual device operation within the capability invocation rather
@@ -405,6 +407,7 @@ pub unsafe fn bring_up(
         device,
         cap,
         pcie_core: None,
+        msi: None,
     };
     let chip = Chip::discover(&mut backplane).map_err(ProbeError::Discovery)?;
     backplane.pcie_core = chip.core(chip::CORE_PCIE2);
@@ -583,6 +586,7 @@ mod command_tests {
             device,
             cap,
             pcie_core: None,
+            msi: None,
         };
         let mut out = [0xa5; 7];
         if bus.read32(chip::ENUM_BASE) != Err(chip::Error::Access)

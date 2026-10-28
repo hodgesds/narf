@@ -49,6 +49,7 @@ pub mod connect;
 pub mod firmware;
 pub mod fweh;
 pub mod fwil;
+pub mod irq;
 pub mod msgbuf;
 pub mod native_runtime;
 pub mod pcie;

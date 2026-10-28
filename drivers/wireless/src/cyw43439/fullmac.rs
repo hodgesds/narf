@@ -68,6 +68,11 @@ pub trait Fullmac: Send {
     /// Current negotiated 802.1D-to-AC rank map (`brcmf_get_assoc_ies`).
     /// Transports whose queueing does not consume it ignore the update.
     fn set_ac_priority(&mut self, _ac_priority: [u8; 8]) {}
+    /// Interrupt wake source for the owner's service loop and whether a
+    /// vector actually delivers it. `None` keeps the 1 ms polled service.
+    fn wake_source(&self) -> Option<(alloc::sync::Arc<crate::brcmfmac::irq::Signal>, bool)> {
+        None
+    }
     /// Bus-match firmware vendor (Linux `bus_if->fwvid`).
     fn firmware_vendor(&self) -> FirmwareVendor {
         FirmwareVendor::Wcc

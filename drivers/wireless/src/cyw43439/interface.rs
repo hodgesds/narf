@@ -680,13 +680,34 @@ impl<R: Fullmac + 'static> Device<R> {
     }
 
     async fn receive_worker(self: Arc<Self>) {
+        let mut wake = None;
         loop {
+            // A transport generation may rebind its vector; re-read the wake
+            // source whenever the state is uncontended. The count is sampled
+            // before service so a vector raised during service re-runs it.
+            if let Some(state) = self.state.try_lock() {
+                wake = state.station.runtime.wake_source();
+            }
+            let seen = wake.as_ref().map(|(signal, _)| signal.count());
             self.deliver_received(self.step());
             self.apply_roam().await;
             self.apply_external().await;
             self.apply_power_save().await;
             self.apply_pmksa().await;
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+            match (&wake, seen) {
+                (Some((signal, delivered)), Some(seen)) => {
+                    // brcmf_pcie_isr_thread wakes msgbuf service; the timer
+                    // is a missed-edge backstop (or the poll without MSI).
+                    let ms = crate::brcmfmac::irq::fallback_ms(*delivered);
+                    let fallback = core::pin::pin!(narf_time::sleep_cycles(
+                        narf_time::wall::ns_to_cycles(ms * 1_000_000)
+                    ));
+                    signal.wait(seen, fallback).await;
+                }
+                _ => {
+                    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+                }
+            }
         }
     }
 }

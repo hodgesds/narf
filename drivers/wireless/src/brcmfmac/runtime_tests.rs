@@ -46,6 +46,17 @@ struct State {
     unreleased_read: bool,
     unsafe_free: usize,
     firmware: Option<Firmware>,
+    /// MSI binding offered by the platform model.
+    msi: bool,
+    armed: usize,
+    disarmed: usize,
+    /// H2D mailbox words observed at each SBMBX doorbell.
+    sbmbx: Vec<u32>,
+    /// Firmware answers D3_INFORM with D3_ACK on the FN0 mailbox.
+    d3_ack: bool,
+    /// Firmware answers D0_INFORM by restoring INTMASK (still powered).
+    d0_alive: bool,
+    signal: Option<Rc<super::irq::Signal>>,
 }
 pub(crate) struct Model(Rc<IrqSafeSpinLock<State>>);
 pub(crate) struct Mem {
@@ -105,6 +116,13 @@ impl chip::Backplane for Model {
     }
     fn write32(&mut self, at: u32, value: u32) -> Result<(), chip::Error> {
         let mut s = self.0.lock();
+        if at == PCIE + 0x48 {
+            // MAILBOXINT is write-one-to-clear.
+            let old = *s.registers.get(&at).unwrap_or(&0);
+            s.registers.insert(at, old & !value);
+            s.writes.push((at, value));
+            return Ok(());
+        }
         s.registers.insert(at, value);
         s.writes.push((at, value));
         if at == WRAP + 0x408
@@ -185,6 +203,68 @@ impl runtime::Bus for Model {
     }
     fn host_ready(&mut self, _: bool) -> Result<(), runtime::Error> {
         Ok(())
+    }
+    fn mailbox(&self) -> Option<runtime::mailbox::Reginfo> {
+        Some(runtime::mailbox::Reginfo::for_core(PCIE, 11))
+    }
+    fn ring_mailbox(&mut self) -> Result<(), runtime::Error> {
+        let mut s = self.0.lock();
+        let value = word(&s, HTOD_MB);
+        s.sbmbx.push(value);
+        mailbox_firmware(&mut s, value);
+        Ok(())
+    }
+    fn arm_interrupts(&mut self, signal: &Rc<super::irq::Signal>) -> bool {
+        let mut s = self.0.lock();
+        if !s.msi {
+            return false;
+        }
+        s.armed += 1;
+        s.signal = Some(signal.clone());
+        true
+    }
+    fn disarm_interrupts(&mut self) {
+        let mut s = self.0.lock();
+        s.disarmed += 1;
+        s.signal = None;
+    }
+}
+const PCIE: u32 = 0x18003000;
+const HTOD_MB: u32 = BASE + 0x500;
+const DTOH_MB: u32 = BASE + 0x504;
+/// Firmware half of the host<->dongle mailbox: consumes the H2D word and
+/// posts D2H mailbox data with an FN0 status (Linux `brcmf_pcie_send_mb_data`
+/// peer behaviour).
+fn mailbox_firmware(s: &mut State, value: u32) {
+    use runtime::mailbox::*;
+    let mut reply = 0;
+    if value & H2D_HOST_D3_INFORM != 0 && s.d3_ack {
+        reply |= D2H_DEV_D3_ACK;
+    }
+    if value & H2D_HOST_D0_INFORM != 0 && s.d0_alive {
+        s.registers.insert(PCIE + 0x24, 0x300);
+    }
+    if value & (H2D_HOST_D3_INFORM | H2D_HOST_D0_INFORM | H2D_HOST_DS_ACK) != 0 {
+        put(s, HTOD_MB, &0u32.to_le_bytes());
+    }
+    if reply != 0 {
+        raise_mailbox(s, reply);
+    }
+}
+/// Firmware posts D2H mailbox data and asserts FN0 (and the vector).
+fn raise_mailbox(s: &mut State, value: u32) {
+    let old = word(s, DTOH_MB);
+    put(s, DTOH_MB, &(old | value).to_le_bytes());
+    raise_status(s, 0x100);
+}
+/// Firmware asserts MAILBOXINT bits; an armed MSI raises the owner signal.
+fn raise_status(s: &mut State, bits: u32) {
+    let old = *s.registers.get(&(PCIE + 0x48)).unwrap_or(&0);
+    s.registers.insert(PCIE + 0x48, old | bits);
+    if let Some(signal) = s.signal.clone() {
+        if *s.registers.get(&(PCIE + 0x4c)).unwrap_or(&0) & bits != 0 {
+            signal.raise();
+        }
     }
 }
 /// Independent firmware fixture consumes the actual posted 40-byte control
@@ -1290,3 +1370,6 @@ kernel_test_in!(
     "drivers/wireless/brcmfmac",
     smoke_fullmac_station_initializes_over_actual_msgbuf
 );
+
+#[path = "mailbox_tests.rs"]
+mod mailbox_tests;

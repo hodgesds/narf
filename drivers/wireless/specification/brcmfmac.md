@@ -496,6 +496,50 @@ no uncertain DMA freed. This does not automatically follow revocation of a cache
 policy firmware capability or establish firmware RF quiescence; reset/reload and
 DMA reclamation remain separate gates. See `cyw43439.md` §3 and `wireless/` §3.5.
 
+### PCIe mailbox interrupt service
+
+The retained msgbuf owner services the PCIe2 mailbox the way Linux v7.2
+`pcie.c` does, with MSI delivery and a polled fallback:
+
+- Register layout: `brcmf_reginfo_default` (`INTMASK` 0x24, `MAILBOXINT`
+  0x48, `MAILBOXMASK` 0x4c, `MB_INT_D2H_DB` 0x00ff0000, `MB_INT_FN0` 0x300)
+  or `brcmf_reginfo_64` (0xc14/0xc30/0xc34, `D2H_DB` 0xffff, no FN0) when
+  the discovered PCIe2 core revision is >= 64 (`brcmf_pcie_probe`).
+  `runtime::mailbox::Reginfo::for_core` derives the backplane addresses
+  from the discovered core base.
+- Bring-up: `Runtime::attach` masks the mailbox (`brcmf_pcie_intr_disable`)
+  before publishing ring addresses, then after BME it binds one MSI vector
+  (`brcmf_pcie_request_irq`: `pci_enable_msi` + threaded IRQ; NARF
+  `irq.rs` programs the MSI capability, installs the handler before MSI
+  Enable and refuses a second binding), enables `D2H_DB | FN0`
+  (`brcmf_pcie_preinit` -> `brcmf_pcie_intr_enable`) and only then rings
+  host-ready.
+- Service: the vector handler only raises a `Signal`; the BAR window stays
+  with the async owner. Every owner service first runs the
+  `brcmf_pcie_quick_check_isr` + `brcmf_pcie_isr_thread` sequence:
+  read `MAILBOXINT`, mask, write the status back (W1C), consume D2H mailbox
+  data on FN0 (`brcmf_pcie_handle_mb_data`: `DS_ENTER_REQ` -> `H2D_HOST_DS_ACK`,
+  `D3_ACK` recorded, `FWHALT` fails this firmware generation), service the
+  D2H completion rings (`brcmf_proto_msgbuf_rx_trigger`) and re-enable the
+  mask while the link is up. An all-ones `MAILBOXINT` is device loss and
+  fails the owner. H2D mailbox words follow `brcmf_pcie_send_mb_data`
+  (TCM `htod_mb_data_addr`, config `SBMBX` 0x98, written twice on PCIe2
+  core revisions <= 13); a word still pending defers a DS ACK to the next
+  service instead of overwriting it.
+- Worker: the station service loop waits on the signal with a 10 ms
+  missed-edge backstop when a vector is bound, and keeps the 1 ms poll when
+  MSI is unavailable (INTx stays disabled; NARF has no shared level GSI
+  route that could clear `MAILBOXINT` from hard IRQ).
+- Teardown (`brcmf_pcie_release_irq`): mask, disable MSI and free the vector
+  (a failed disable quarantines it), then clear latched status.
+
+Smokes `drivers/wireless/brcmfmac`
+`smoke_brcmf_pcie_msi_mailbox_service_and_release`,
+`smoke_brcmf_pcie_polled_mailbox_fallback_and_gone_device` and
+`smoke_brcmf_pcie_signal_wait_and_reginfo` cover the mask ordering, vector
+wake, W1C acknowledge, DS ACK (immediate and deferred), FWHALT, all-ones
+loss, polled fallback and vector release.
+
 ## 4. Invariants
 
 - No bus mastering without owned DMA mappings, ring lifetimes, and a
@@ -567,7 +611,7 @@ Additional software outside that retained profile remains: nonzero descriptor
 prefixes, other CPU/RAM/chip/OTP selectors (including 160 MHz-capable
 chips), HE/EHT profiles, monitor mode (which owns native802.11 RX and its
 metadata), larger flow budgets, AP, replayed
-recovery/system PM, confirmed stop/IOMMU quiescence and DMA reclamation, and IRQ delivery.
+recovery/system PM, confirmed stop/IOMMU quiescence and DMA reclamation.
 These do not expand the initial polling/retained-failure acceptance claim.
 WPA3-SAE offload (WCC `WSEC_PMK` passphrase ABI), the PMKSA cache, firmware
 roaming/FT, per-AC telemetry and host-supplicant fallback are common FullMAC

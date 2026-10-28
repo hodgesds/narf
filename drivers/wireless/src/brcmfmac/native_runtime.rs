@@ -525,7 +525,40 @@ impl runtime::Bus for PcieBackplane {
         }
         Ok(())
     }
+    fn mailbox(&self) -> Option<runtime::mailbox::Reginfo> {
+        let core = self.pcie_core?;
+        Some(runtime::mailbox::Reginfo::for_core(
+            core.base,
+            core.revision,
+        ))
+    }
+    fn ring_mailbox(&mut self) -> Result<(), runtime::Error> {
+        let core = self.pcie_core.ok_or(runtime::Error::Protocol)?;
+        self.qualified().map_err(|_| runtime::Error::Access)?;
+        barrier();
+        // brcmf_pcie_send_mb_data: SBMBX, repeated as a hardware workaround
+        // on PCIe2 core revisions <= 13.
+        let writes = if core.revision <= 13 { 2 } else { 1 };
+        let cap = self.cap;
+        invoke_registers(&cap, || {
+            for _ in 0..writes {
+                narf_bus::pci::write_config32(&self.cap, &self.device, SBMBX, 1)
+                    .map_err(|_| runtime::Error::Access)?;
+            }
+            Ok(())
+        })
+        .map_err(|_| runtime::Error::Access)?
+    }
+    fn arm_interrupts(&mut self, signal: &Arc<super::irq::Signal>) -> bool {
+        self.qualified().is_ok() && self.arm_msi(signal)
+    }
+    fn disarm_interrupts(&mut self) {
+        self.disarm_msi();
+    }
 }
+/// Linux `BRCMF_PCIE_REG_SBMBX`: host-to-dongle mailbox doorbell in
+/// configuration space.
+const SBMBX: u16 = 0x98;
 
 /// Transport entry points for the station owner. These do not publish or
 /// authorize a network interface; that requires the station event/key lifecycle.
@@ -637,6 +670,7 @@ mod provision_tests {
                 },
                 cap,
                 pcie_core: None,
+                msi: None,
             })),
             state: AtomicU8::new(ProvisionState::Parked as u8),
             chip: 43602,

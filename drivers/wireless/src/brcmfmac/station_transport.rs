@@ -172,6 +172,9 @@ where
     async fn configure_bus(&mut self) -> Result<(), Error> {
         Ok(())
     }
+    fn wake_source(&self) -> Option<(alloc::sync::Arc<crate::brcmfmac::irq::Signal>, bool)> {
+        Some(self.inner.interrupt())
+    }
     fn poll(&mut self) -> Result<usize, Error> {
         let result = self.progress();
         if result.is_err() {
