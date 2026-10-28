@@ -161,7 +161,8 @@ fn probe_one(path: &str) -> Option<()> {
     let static_name: &'static str = Box::leak(path.to_string().into_boxed_str());
     crate::registry::register(crate::registry::UartInfo {
         io_base: (base & 0xFFFF) as u16, // Compatibility shim for old registry
-        irq: irq_vec,
+        mmio_base: base,
+        irq: irq_vec.map(u16::from),
         name: static_name,
         baud: 115_200,
     });

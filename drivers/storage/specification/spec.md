@@ -53,6 +53,18 @@ All driver code is derived strictly from the references below.
 ## Scope
 
 ### Landed
+- **MTD core + CFI NOR** (`mtd`, DT programme step 6):
+  `narf-drivers-storage-mtd` is the raw-flash device layer — an
+  `MtdDevice` record (size / erase_size / write_size) with
+  read / program (NOR AND semantics) / erase (erase-block
+  aligned) operations, a name-keyed registry, and
+  `fixed-partitions` support (partitions as first-class registry
+  devices with bounds + read-only enforced in a wrapper). The
+  CFI binding (`cfi-flash`) identifies each bank by the JEDEC
+  CFI query (command set, size, erase geometry from the chip)
+  and implements Intel + AMD command-set program/erase; QEMU
+  virt's two 64 MiB banks are the first binding. SPI-NOR
+  registers through the same core from the SPI crate.
 - **AHCI** (`ahci`): binds `8086:2922` / `8086:3a22` by ID and every
   `01:06:01` controller by class (Linux's generic `ahci_pci_tbl` entry; e.g.
   AMD 600-series `1022:43f6`, which Linux drives as `board_ahci` with no

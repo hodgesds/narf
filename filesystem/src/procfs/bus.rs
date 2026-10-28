@@ -114,6 +114,9 @@ impl ProcFile for PciDevicesFile {
             let pcie_addr = match d.kind {
                 BusKind::Pcie { addr, .. } => addr,
                 BusKind::VirtioMmio { .. } => continue,
+                // This file lists PCI devices only; a devicetree
+                // platform device has no PCI address to render.
+                BusKind::Platform(_) => continue,
             };
             let cfg_phys = match d.kind {
                 BusKind::Pcie { cfg_phys, .. } => cfg_phys.raw(),

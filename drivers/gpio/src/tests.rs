@@ -49,6 +49,34 @@ fn intel_cfg(
     }
 }
 
+/// Test-isolation guard that preserves live (boot-time) bindings:
+/// snapshots the registry, clears it for the test, and restores
+/// the snapshot on drop — including on early `Fail` returns.
+/// A bare `__reset_for_test` at a test's end wiped the DT-bound
+/// PL061 from the shared registry before `smoke_pl061_dt_bound_live`
+/// (in `tests_aarch64`) read it, while the probe's BOUND record
+/// still reported INTID 39 — a state-pollution failure, not a
+/// driver defect. Every synthetic smoke that used to bracket
+/// itself with `__reset_for_test` uses this guard instead, so
+/// the registry after each test is exactly what the test found.
+struct RegistryRestoreGuard {
+    saved: alloc::vec::Vec<Arc<dyn GpioController>>,
+}
+
+impl RegistryRestoreGuard {
+    fn isolated() -> Self {
+        let saved = registry::__snapshot_for_test();
+        registry::__reset_for_test();
+        Self { saved }
+    }
+}
+
+impl Drop for RegistryRestoreGuard {
+    fn drop(&mut self) {
+        registry::__restore_for_test(core::mem::take(&mut self.saved));
+    }
+}
+
 /// Allocate a 1 KiB zeroed MMIO backing buffer (256 pin registers).
 /// Leak it so the synthetic device outlives the smoke.
 fn make_synthetic_mmio() -> (PhysAddr, u64) {
@@ -66,7 +94,7 @@ fn smoke_gpio_recognises_amdi0030() -> TestResult {
 kernel_test_in!("drivers-gpio", smoke_gpio_recognises_amdi0030);
 
 fn smoke_gpio_registry_dedupes_by_name() -> TestResult {
-    registry::__reset_for_test();
+    let _guard = RegistryRestoreGuard::isolated();
     let (p, l) = make_synthetic_mmio();
     let a: Arc<dyn GpioController> = Arc::new(AmdFchGpio::new("dup".to_string(), p, l, None));
     let b: Arc<dyn GpioController> = Arc::new(AmdFchGpio::new("dup".to_string(), p, l, None));
@@ -78,7 +106,6 @@ fn smoke_gpio_registry_dedupes_by_name() -> TestResult {
     if registry::count() != 1 {
         return TestResult::Fail("dedupe should leave count at 1");
     }
-    registry::__reset_for_test();
     TestResult::Pass
 }
 kernel_test_in!("drivers-gpio", smoke_gpio_registry_dedupes_by_name);
@@ -281,7 +308,7 @@ fn fire_handler(pin: u16) {
 
 fn smoke_gpio_isr_dispatch_fires_handler_and_clears_status() -> TestResult {
     __reset_dispatch_for_test();
-    registry::__reset_for_test();
+    let _guard = RegistryRestoreGuard::isolated();
     FIRE_COUNT.store(0, Ordering::SeqCst);
     FIRE_PIN.store(u32::MAX, Ordering::SeqCst);
 
@@ -333,7 +360,6 @@ fn smoke_gpio_isr_dispatch_fires_handler_and_clears_status() -> TestResult {
     if FIRE_COUNT.load(Ordering::SeqCst) != 1 {
         return TestResult::Fail("handler fired again with no pending status");
     }
-    registry::__reset_for_test();
     __reset_dispatch_for_test();
     TestResult::Pass
 }
@@ -689,7 +715,7 @@ fn smoke_intel_pch_names_communities_uniquely() -> TestResult {
     // Two communities under the same ACPI path must get distinct
     // registry names so i2c-hid-bind can address them separately —
     // the per-community suffix (`.C<idx>`) keys the dedupe.
-    registry::__reset_for_test();
+    let _guard = RegistryRestoreGuard::isolated();
     let phys = PhysAddr::new(0xFFC0_0000);
     let a: Arc<dyn GpioController> = Arc::new(intel_new_for_test(intel_cfg(
         "\\_SB.PC00.GPI0".to_string(),
@@ -722,7 +748,6 @@ fn smoke_intel_pch_names_communities_uniquely() -> TestResult {
     if registry::find("\\_SB.PC00.GPI0.C1").is_none() {
         return TestResult::Fail("community C1 not in registry");
     }
-    registry::__reset_for_test();
     TestResult::Pass
 }
 kernel_test_in!("drivers-gpio", smoke_intel_pch_names_communities_uniquely);
@@ -733,7 +758,7 @@ fn smoke_intel_pch_registers_into_shared_registry() -> TestResult {
     // FCH driver uses — i2c-hid-bind looks up
     // `GpioInt::resource_source` against `registry::find` without
     // knowing or caring which backend populated the entry.
-    registry::__reset_for_test();
+    let _guard = RegistryRestoreGuard::isolated();
     let drv = intel_new_for_test(intel_cfg(
         "\\_SB.PC00.GPI3".to_string(),
         2,
@@ -759,7 +784,6 @@ fn smoke_intel_pch_registers_into_shared_registry() -> TestResult {
             return TestResult::Fail("registry lookup returned wrong controller");
         }
     }
-    registry::__reset_for_test();
     let _ = IntelPchGpio::new(intel_cfg(
         "smoke".to_string(),
         0,
@@ -776,3 +800,118 @@ kernel_test_in!(
     "drivers-gpio",
     smoke_intel_pch_registers_into_shared_registry
 );
+
+// ── PL061 (DT programme step 5) ─────────────────────────────────
+
+use crate::pl061::Pl061;
+
+/// Allocate a 4 KiB zeroed register file for a synthetic PL061.
+fn make_pl061_mmio() -> (PhysAddr, &'static mut [u32; 1024]) {
+    let buf: Box<[u32; 1024]> = Box::new([0u32; 1024]);
+    let raw = Box::leak(buf);
+    (PhysAddr::new(raw.as_ptr() as u64), raw)
+}
+
+static PL061_FIRE_COUNT: AtomicU32 = AtomicU32::new(0);
+static PL061_LAST_PIN: AtomicU32 = AtomicU32::new(u32::MAX);
+
+fn pl061_counting_handler(pin: u16) {
+    PL061_FIRE_COUNT.fetch_add(1, Ordering::SeqCst);
+    PL061_LAST_PIN.store(pin as u32, Ordering::SeqCst);
+}
+
+fn smoke_pl061_direction_and_masked_data() -> TestResult {
+    let (phys, regs) = make_pl061_mmio();
+    // SAFETY: leaked 4 KiB RAM window outlives the controller.
+    let ctrl = unsafe { Pl061::__new_for_test("pl061-test", phys, 0x1000) };
+    // Reset state: every pin is an input; set_pin refuses.
+    if ctrl.set_pin(3, true) != Err(GpioError::WrongDirection) {
+        return TestResult::Fail("PL061 set_pin on an input pin did not refuse");
+    }
+    if ctrl.set_direction(3, true).is_err() || ctrl.direction(3) != Ok(true) {
+        return TestResult::Fail("PL061 set_direction did not program GPIODIR");
+    }
+    if regs[0x400 / 4] & (1 << 3) == 0 {
+        return TestResult::Fail("GPIODIR bit 3 not set in the register file");
+    }
+    // Masked data write: only pin 3's cell (offset (1<<3)<<2)
+    // changes, and only its bit.
+    if ctrl.set_pin(3, true).is_err() {
+        return TestResult::Fail("PL061 set_pin on an output pin failed");
+    }
+    if regs[(0x20) / 4] != 1 << 3 {
+        return TestResult::Fail("PL061 masked DATA write landed wrong");
+    }
+    if ctrl.read_pin(3) != Ok(true) || ctrl.read_pin(2) != Ok(false) {
+        return TestResult::Fail("PL061 masked DATA read mismatch");
+    }
+    if ctrl.set_pin(3, false).is_err() || ctrl.read_pin(3) != Ok(false) {
+        return TestResult::Fail("PL061 masked DATA clear mismatch");
+    }
+    if ctrl.read_pin(8) != Err(GpioError::InvalidPin) {
+        return TestResult::Fail("PL061 accepted pin 8 (only 8 pins)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-gpio", smoke_pl061_direction_and_masked_data);
+
+fn smoke_pl061_irq_programming_and_dispatch() -> TestResult {
+    let (phys, regs) = make_pl061_mmio();
+    // SAFETY: leaked 4 KiB RAM window outlives the controller.
+    let ctrl = unsafe { Pl061::__new_for_test("pl061-irq-test", phys, 0x1000) };
+    PL061_FIRE_COUNT.store(0, Ordering::SeqCst);
+    // Rising-edge on pin 5: IS=0 (edge), IBE=0, IEV=1, IE=1.
+    let cfg = GpioIrqConfig {
+        level_triggered: false,
+        polarity: 0,
+    };
+    if ctrl
+        .register_irq(5, GpioPull::None, cfg, pl061_counting_handler)
+        .is_err()
+    {
+        return TestResult::Fail("PL061 register_irq (rising edge) failed");
+    }
+    let (is, ibe, iev, ie) = (
+        regs[0x404 / 4],
+        regs[0x408 / 4],
+        regs[0x40C / 4],
+        regs[0x410 / 4],
+    );
+    if is & (1 << 5) != 0 || ibe & (1 << 5) != 0 || iev & (1 << 5) == 0 || ie & (1 << 5) == 0 {
+        return TestResult::Fail("PL061 rising-edge programming mismatch (IS/IBE/IEV/IE)");
+    }
+    // A different handler on the same pin is refused.
+    fn other_handler(_pin: u16) {}
+    if ctrl.register_irq(5, GpioPull::None, cfg, other_handler) != Err(GpioError::AlreadyRegistered)
+    {
+        return TestResult::Fail("PL061 double-register with a new handler not refused");
+    }
+    // Level + ActiveBoth is the one inexpressible configuration.
+    let both_level = GpioIrqConfig {
+        level_triggered: true,
+        polarity: 2,
+    };
+    if ctrl.register_irq(6, GpioPull::None, both_level, pl061_counting_handler)
+        != Err(GpioError::BadHardware)
+    {
+        return TestResult::Fail("PL061 level+both-edges not refused");
+    }
+    // Dispatch: MIS poked as the hardware would raise it; the
+    // handler fires once with the right pin and IC records the
+    // clear.
+    regs[0x418 / 4] = 1 << 5;
+    if ctrl.dispatch_pending() != 1
+        || PL061_FIRE_COUNT.load(Ordering::SeqCst) != 1
+        || PL061_LAST_PIN.load(Ordering::SeqCst) != 5
+        || regs[0x41C / 4] != 1 << 5
+    {
+        return TestResult::Fail("PL061 dispatch did not fire/clear exactly pin 5");
+    }
+    // Unregister masks the pin again.
+    ctrl.unregister_irq(5);
+    if regs[0x410 / 4] & (1 << 5) != 0 {
+        return TestResult::Fail("PL061 unregister_irq did not mask the pin");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-gpio", smoke_pl061_irq_programming_and_dispatch);

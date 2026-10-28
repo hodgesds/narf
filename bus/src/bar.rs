@@ -150,6 +150,7 @@ pub unsafe fn read_bar(device: &BusDevice, idx: u8) -> Result<Bar, BarError> {
     let cfg_phys = match device.kind {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
         BusKind::VirtioMmio { .. } => return Err(BarError::NotPcie),
+        BusKind::Platform(_) => return Err(BarError::NotPcie),
     };
     read_bar_with(&mut EcamConfig(cfg_phys), idx)
 }

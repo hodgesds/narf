@@ -11,6 +11,8 @@ pub use narf_drivers_storage_core::*;
 mod module_probe;
 #[cfg(feature = "builtin")]
 pub mod sdhci;
+#[cfg(all(feature = "builtin", feature = "kernel-test"))]
+mod tests;
 narf_driver! {
     name: "sdhci",
     module: {
@@ -25,6 +27,9 @@ narf_driver! {
 #[cfg(feature = "builtin")]
 fn do_register() {
     sdhci::register_pci_driver();
+    // DT match-table registration (DT programme step 6): a plain
+    // bus-registry call, NOT an initcall — census-neutral.
+    sdhci::register_dt_driver();
 }
 #[cfg(feature = "module")]
 fn do_register() {

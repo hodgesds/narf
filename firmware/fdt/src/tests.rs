@@ -674,3 +674,424 @@ fn smoke_fdt_discover_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("firmware/fdt", smoke_fdt_discover_round_trip);
+
+// ───────────────────────────────────────────────────────────────────
+// Real-blob fixture smokes.
+//
+// The smokes above build synthetic blobs in code, which risks
+// mirroring the parser's own assumptions. The smokes below pin the
+// parser against a real DTB emitted by QEMU for its `virt` machine
+// (`tests/fixtures/qemu-virt.dtb`; see that directory's README for
+// provenance): GICv3 interrupt specifiers, a two-bank CFI flash
+// `reg`, root `#size-cells = 2`, a 32-slot virtio-mmio fleet, and a
+// `/chosen` with `stdout-path` but no `bootargs`.
+// ───────────────────────────────────────────────────────────────────
+
+const QEMU_VIRT_DTB: &[u8] = include_bytes!("../tests/fixtures/qemu-virt.dtb");
+
+/// Phandle of QEMU virt's GICv3 (`/intc@8000000`), also the root's
+/// `interrupt-parent`.
+const QEMU_VIRT_GIC_PHANDLE: u32 = 0x8005;
+
+fn smoke_fdt_real_qemu_virt_header() -> TestResult {
+    let hdr = match fdt::parse_header(QEMU_VIRT_DTB) {
+        Some(h) => h,
+        None => return TestResult::Fail("QEMU virt DTB did not validate"),
+    };
+    if hdr.magic != fdt::FDT_MAGIC {
+        return TestResult::Fail("magic");
+    }
+    if hdr.totalsize as usize != QEMU_VIRT_DTB.len() {
+        return TestResult::Fail("totalsize != fixture length");
+    }
+    if hdr.version != 17 || hdr.last_comp_version != 16 {
+        return TestResult::Fail("version");
+    }
+    if hdr.boot_cpuid_phys != 0 {
+        return TestResult::Fail("boot cpu");
+    }
+    if hdr.off_mem_rsvmap != 48 || hdr.off_dt_struct != 64 {
+        return TestResult::Fail("block offsets");
+    }
+    if hdr.size_dt_struct != 7464 || hdr.off_dt_strings != 7528 || hdr.size_dt_strings != 495 {
+        return TestResult::Fail("block sizes");
+    }
+    // The reserve map is a lone terminator pair in this blob.
+    let mut rsv = [Reservation::default(); 4];
+    if fdt::copy_reservations(QEMU_VIRT_DTB, &mut rsv) != 0 {
+        return TestResult::Fail("reserve map not empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/fdt", smoke_fdt_real_qemu_virt_header);
+
+fn smoke_fdt_real_qemu_virt_census() -> TestResult {
+    let mut count = 0usize;
+    let mut max_depth = 0u8;
+    fdt::walk_nodes(QEMU_VIRT_DTB, |path, _props| {
+        count += 1;
+        if path.depth() > max_depth {
+            max_depth = path.depth();
+        }
+    });
+    // 62 nodes total; the walker does not call back for the root.
+    if count != 61 {
+        return TestResult::Fail("node census != 61");
+    }
+    // /cpus/cpu-map/socket0/cluster0/coreN is the deepest chain.
+    if max_depth != 5 {
+        return TestResult::Fail("max depth != 5");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/fdt", smoke_fdt_real_qemu_virt_census);
+
+fn smoke_fdt_real_qemu_virt_memory() -> TestResult {
+    let mut out = [Reservation::default(); 4];
+    let n = fdt::copy_memory_ranges(QEMU_VIRT_DTB, &mut out);
+    if n != 1 {
+        return TestResult::Fail("memory range count != 1");
+    }
+    // -m 1024: 1 GiB at 0x4000_0000. Decoding this requires the
+    // root's #address-cells = 2 / #size-cells = 2.
+    if out[0].addr != 0x4000_0000 || out[0].size != 0x4000_0000 {
+        return TestResult::Fail("memory range mismatch");
+    }
+    // No /reserved-memory node in this blob.
+    let mut reserved = [fdt::ReservedRegion::default(); 4];
+    if fdt::copy_reserved_memory_ranges(QEMU_VIRT_DTB, &mut reserved) != 0 {
+        return TestResult::Fail("reserved-memory not empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/fdt", smoke_fdt_real_qemu_virt_memory);
+
+fn smoke_fdt_real_qemu_virt_chosen() -> TestResult {
+    let mut stdout = [0u8; 64];
+    let n = fdt::chosen_stdout_path(QEMU_VIRT_DTB, &mut stdout);
+    if &stdout[..n] != b"/pl011@9000000" {
+        return TestResult::Fail("stdout-path mismatch");
+    }
+    // The blob carries no bootargs and no initrd properties.
+    if fdt::chosen_bootargs(QEMU_VIRT_DTB).is_some() {
+        return TestResult::Fail("unexpected bootargs");
+    }
+    if fdt::chosen_initrd_range(QEMU_VIRT_DTB).is_some() {
+        return TestResult::Fail("unexpected initrd range");
+    }
+    // No /aliases node in this blob.
+    let mut alias = [0u8; 64];
+    if fdt::alias_path(QEMU_VIRT_DTB, "serial0", &mut alias) != 0 {
+        return TestResult::Fail("unexpected alias");
+    }
+    // stdout-path resolves to the PL011's reg window.
+    if fdt::chosen_stdout_reg(QEMU_VIRT_DTB) != Some((0x0900_0000, 0x1000)) {
+        return TestResult::Fail("stdout-path did not resolve to the PL011 reg");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/fdt", smoke_fdt_real_qemu_virt_chosen);
+
+fn smoke_fdt_real_qemu_virt_root_props() -> TestResult {
+    // The root carries the tree-wide interrupt parent (the GIC's
+    // phandle, 0x8005) and the 2/2 root cells every child inherits.
+    if fdt::root_prop_u32(QEMU_VIRT_DTB, "interrupt-parent") != Some(0x8005) {
+        return TestResult::Fail("root interrupt-parent is not the GIC phandle");
+    }
+    if fdt::root_prop_u32(QEMU_VIRT_DTB, "#address-cells") != Some(2) {
+        return TestResult::Fail("root #address-cells != 2");
+    }
+    if fdt::root_prop_u32(QEMU_VIRT_DTB, "#size-cells") != Some(2) {
+        return TestResult::Fail("root #size-cells != 2");
+    }
+    if fdt::root_prop_u32(QEMU_VIRT_DTB, "no-such-property").is_some() {
+        return TestResult::Fail("absent root property decoded as present");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/fdt", smoke_fdt_real_qemu_virt_root_props);
+
+fn smoke_fdt_chosen_stdout_reg_forms() -> TestResult {
+    // Root cells 1/1 so the fixture UARTs' `reg` decodes as
+    // (addr, size) u32 pairs.
+    let root_props: &[(&str, &[u8])] = &[
+        ("#address-cells", &[0, 0, 0, 1]),
+        ("#size-cells", &[0, 0, 0, 1]),
+    ];
+    // Alias label + ":params" suffix form.
+    let alias_form = &[
+        ("aliases", &[("serial0", b"/uart@1000\0" as &[u8])][..]),
+        (
+            "chosen",
+            &[("stdout-path", b"serial0:115200n8\0" as &[u8])][..],
+        ),
+        (
+            "uart@1000",
+            &[("reg", &[0u8, 0, 0x10, 0x00, 0, 0, 0x01, 0x00] as &[u8])][..],
+        ),
+    ];
+    let blob = build_blob(0, &[], root_props, alias_form);
+    if fdt::chosen_stdout_reg(&blob) != Some((0x1000, 0x100)) {
+        return TestResult::Fail("alias+params stdout-path did not resolve");
+    }
+    // Bare full-path form.
+    let path_form = &[
+        ("chosen", &[("stdout-path", b"/uart@2000\0" as &[u8])][..]),
+        (
+            "uart@2000",
+            &[("reg", &[0u8, 0, 0x20, 0x00, 0, 0, 0x00, 0x80] as &[u8])][..],
+        ),
+    ];
+    let blob = build_blob(0, &[], root_props, path_form);
+    if fdt::chosen_stdout_reg(&blob) != Some((0x2000, 0x80)) {
+        return TestResult::Fail("full-path stdout-path did not resolve");
+    }
+    // No /chosen at all.
+    let blob = build_blob(0, &[], root_props, &[]);
+    if fdt::chosen_stdout_reg(&blob).is_some() {
+        return TestResult::Fail("stdout reg without /chosen");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/fdt", smoke_fdt_chosen_stdout_reg_forms);
+
+fn smoke_fdt_real_qemu_virt_pl011() -> TestResult {
+    let mut hits = 0usize;
+    let mut failure: Option<&'static str> = None;
+    fdt::for_each_compatible(QEMU_VIRT_DTB, "arm,pl011", |path, props, parent_cells| {
+        hits += 1;
+        if path.last_segment() != "pl011@9000000" {
+            failure = Some("pl011 path");
+            return;
+        }
+        if fdt::node_status(props) != fdt::Status::Okay {
+            failure = Some("pl011 status");
+            return;
+        }
+        let mut reg = None;
+        for (name, value) in props {
+            if name == "reg" {
+                reg = parent_cells.read_one_reg(value, 0);
+            }
+        }
+        if reg != Some((0x0900_0000, 0x1000)) {
+            failure = Some("pl011 reg");
+            return;
+        }
+        // Legacy `interrupts`: parent inherited from the root's
+        // interrupt-parent; GIC 3-cell specifier (SPI, IRQ 1,
+        // level-high).
+        let mut n_specs = 0usize;
+        let mut spec: (u32, [u32; 3]) = (0, [0; 3]);
+        fdt::for_each_interrupt(
+            QEMU_VIRT_DTB,
+            props,
+            Some(QEMU_VIRT_GIC_PHANDLE),
+            |parent, cells| {
+                n_specs += 1;
+                if cells.len() == 3 {
+                    spec.0 = parent;
+                    spec.1.copy_from_slice(cells);
+                }
+            },
+        );
+        if n_specs != 1 || spec != (QEMU_VIRT_GIC_PHANDLE, [0, 1, 4]) {
+            failure = Some("pl011 interrupt spec");
+        }
+    });
+    if let Some(why) = failure {
+        return TestResult::Fail(why);
+    }
+    if hits != 1 {
+        return TestResult::Fail("pl011 hit count != 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/fdt", smoke_fdt_real_qemu_virt_pl011);
+
+fn smoke_fdt_real_qemu_virt_gic() -> TestResult {
+    let mut hits = 0usize;
+    let mut failure: Option<&'static str> = None;
+    fdt::for_phandle(
+        QEMU_VIRT_DTB,
+        QEMU_VIRT_GIC_PHANDLE,
+        |_path, props, _cells| {
+            hits += 1;
+            let mut gic_v3 = false;
+            for (name, value) in props {
+                if name == "compatible" {
+                    gic_v3 = fdt::compatible_matches(value, "arm,gic-v3");
+                }
+            }
+            if !gic_v3 {
+                failure = Some("phandle node is not the GICv3");
+                return;
+            }
+            if fdt::prop_interrupt_cells(props) != Some(3) {
+                failure = Some("gic #interrupt-cells != 3");
+            }
+        },
+    );
+    if let Some(why) = failure {
+        return TestResult::Fail(why);
+    }
+    if hits != 1 {
+        return TestResult::Fail("gic hit count != 1");
+    }
+    if fdt::interrupt_cells_for(QEMU_VIRT_DTB, QEMU_VIRT_GIC_PHANDLE) != Some(3) {
+        return TestResult::Fail("interrupt_cells_for != 3");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/fdt", smoke_fdt_real_qemu_virt_gic);
+
+fn smoke_fdt_real_qemu_virt_virtio_fleet() -> TestResult {
+    let mut count = 0usize;
+    let mut first = None;
+    let mut last = None;
+    fdt::for_each_compatible(
+        QEMU_VIRT_DTB,
+        "virtio,mmio",
+        |_path, props, parent_cells| {
+            count += 1;
+            for (name, value) in props {
+                if name == "reg" {
+                    let decoded = parent_cells.read_one_reg(value, 0);
+                    if first.is_none() {
+                        first = decoded;
+                    }
+                    last = decoded;
+                }
+            }
+        },
+    );
+    if count != 32 {
+        return TestResult::Fail("virtio-mmio count != 32");
+    }
+    if first != Some((0x0a00_0000, 0x200)) {
+        return TestResult::Fail("first virtio-mmio reg");
+    }
+    if last != Some((0x0a00_3e00, 0x200)) {
+        return TestResult::Fail("last virtio-mmio reg");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/fdt", smoke_fdt_real_qemu_virt_virtio_fleet);
+
+fn smoke_fdt_real_qemu_virt_cpus_psci() -> TestResult {
+    let mut cpus = 0usize;
+    let mut failure: Option<&'static str> = None;
+    fdt::walk_with_cells(QEMU_VIRT_DTB, |path, props, parent_cells| {
+        if path.depth() != 2 || path.segment(0) != Some("cpus") {
+            return;
+        }
+        let name = path.last_segment();
+        if !name.starts_with("cpu@") {
+            return;
+        }
+        cpus += 1;
+        if name == "cpu@0" {
+            if fdt::prop_str(props, "enable-method") != Some("psci") {
+                failure = Some("cpu@0 enable-method != psci");
+                return;
+            }
+            // /cpus declares #address-cells = 1, #size-cells = 0.
+            let mut reg = None;
+            for (pname, value) in props {
+                if pname == "reg" {
+                    reg = parent_cells.read_one_reg(value, 0);
+                }
+            }
+            if reg != Some((0, 0)) {
+                failure = Some("cpu@0 reg != (0, 0)");
+            }
+        }
+    });
+    if let Some(why) = failure {
+        return TestResult::Fail(why);
+    }
+    if cpus != 4 {
+        return TestResult::Fail("cpu count != 4");
+    }
+    let mut psci = 0usize;
+    fdt::for_each_compatible(QEMU_VIRT_DTB, "arm,psci-1.0", |_path, props, _cells| {
+        psci += 1;
+        if fdt::prop_str(props, "method") != Some("hvc") {
+            failure = Some("psci method != hvc");
+        }
+    });
+    if let Some(why) = failure {
+        return TestResult::Fail(why);
+    }
+    if psci != 1 {
+        return TestResult::Fail("psci hit count != 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/fdt", smoke_fdt_real_qemu_virt_cpus_psci);
+
+fn smoke_fdt_real_qemu_virt_flash() -> TestResult {
+    let mut hits = 0usize;
+    let mut failure: Option<&'static str> = None;
+    fdt::for_each_compatible(QEMU_VIRT_DTB, "cfi-flash", |_path, props, parent_cells| {
+        hits += 1;
+        let mut banks: [(u64, u64); 4] = [(0, 0); 4];
+        let mut n_banks = 0usize;
+        for (name, value) in props {
+            if name == "reg" {
+                let stride = parent_cells.entry_bytes();
+                let mut off = 0;
+                while off + stride <= value.len() && n_banks < banks.len() {
+                    match parent_cells.read_one_reg(value, off) {
+                        Some(entry) => {
+                            banks[n_banks] = entry;
+                            n_banks += 1;
+                        }
+                        None => {
+                            failure = Some("flash reg entry undecodable");
+                            return;
+                        }
+                    }
+                    off += stride;
+                }
+            }
+        }
+        if n_banks != 2 || banks[0] != (0x0, 0x400_0000) || banks[1] != (0x400_0000, 0x400_0000) {
+            failure = Some("flash banks mismatch");
+        }
+    });
+    if let Some(why) = failure {
+        return TestResult::Fail(why);
+    }
+    if hits != 1 {
+        return TestResult::Fail("flash hit count != 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/fdt", smoke_fdt_real_qemu_virt_flash);
+
+fn smoke_fdt_real_qemu_virt_rejects_corruption() -> TestResult {
+    // Truncated: totalsize (8023) exceeds the slice.
+    let truncated = &QEMU_VIRT_DTB[..100];
+    if fdt::parse_header(truncated).is_some() {
+        return TestResult::Fail("truncated blob accepted");
+    }
+    let mut ranges = [Reservation::default(); 2];
+    if fdt::copy_memory_ranges(truncated, &mut ranges) != 0 {
+        return TestResult::Fail("truncated blob yielded ranges");
+    }
+    // Bad magic.
+    let mut corrupt: Vec<u8> = Vec::new();
+    corrupt.extend_from_slice(QEMU_VIRT_DTB);
+    corrupt[0] ^= 0xff;
+    if fdt::parse_header(&corrupt).is_some() {
+        return TestResult::Fail("bad-magic blob accepted");
+    }
+    let mut count = 0usize;
+    fdt::walk_nodes(&corrupt, |_path, _props| count += 1);
+    if count != 0 {
+        return TestResult::Fail("bad-magic blob yielded nodes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/fdt", smoke_fdt_real_qemu_virt_rejects_corruption);

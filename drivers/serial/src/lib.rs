@@ -35,6 +35,10 @@ pub mod registry;
 pub mod uart_8250;
 
 mod tests;
+/// aarch64-only smokes (the crate's `tests` module is x86_64-gated
+/// wholesale, so DT-bound device smokes live here).
+#[cfg(target_arch = "aarch64")]
+mod tests_aarch64;
 
 /// Stage::Subsys initcalls for the serial crate.
 pub fn register_initcalls() {

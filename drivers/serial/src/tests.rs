@@ -175,6 +175,7 @@ fn smoke_serial_registry() -> TestResult {
     let before = crate::registry::count();
     crate::registry::register(crate::registry::UartInfo {
         io_base: 0x3F8,
+        mmio_base: 0,
         irq: Some(4),
         name: "test-COM1",
         baud: 115_200,

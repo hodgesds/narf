@@ -255,6 +255,7 @@ fn pcie_cfg_phys(device: &BusDevice) -> Result<PhysAddr, PcieCapError> {
     match device.kind {
         BusKind::Pcie { cfg_phys, .. } => Ok(cfg_phys),
         BusKind::VirtioMmio { .. } => Err(PcieCapError::NotPcie),
+        BusKind::Platform(_) => Err(PcieCapError::NotPcie),
     }
 }
 

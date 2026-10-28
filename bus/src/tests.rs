@@ -58,6 +58,406 @@ fn smoke_bus_enumerates_pcie() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("bus", smoke_bus_enumerates_pcie);
 
+fn smoke_bus_platform_device_record() -> TestResult {
+    // The devicetree device record: compatible-list specificity,
+    // reg/irq windows, and boundary-truncation of an over-long
+    // compatible list. Pure record semantics — no hardware.
+    use crate::{BusAddr, BusDevice, BusKind, DeviceId, DtIrq, PlatformDevice, RegWindow};
+    use narf_memory::PhysAddr;
+
+    let mut rec = PlatformDevice::new();
+    rec.set_compatible(b"arm,pl011\0arm,primecell\0");
+    if rec.compatible_position("arm,pl011") != Some(0) {
+        return TestResult::Fail("most-specific compatible not at position 0");
+    }
+    if rec.compatible_position("arm,primecell") != Some(1) {
+        return TestResult::Fail("fallback compatible not at position 1");
+    }
+    if rec.compatible_position("arm,pl022").is_some() {
+        return TestResult::Fail("absent compatible reported present");
+    }
+    if rec.first_compatible() != "arm,pl011" {
+        return TestResult::Fail("first_compatible mismatch");
+    }
+    if !rec.push_reg(RegWindow {
+        base: PhysAddr::new(0x0900_0000),
+        len: 0x1000,
+    }) {
+        return TestResult::Fail("first reg window rejected");
+    }
+    if !rec.push_irq(DtIrq {
+        intid: 33,
+        flags: 4,
+    }) {
+        return TestResult::Fail("first irq rejected");
+    }
+    if rec.reg_windows().len() != 1 || rec.irq_list().len() != 1 {
+        return TestResult::Fail("window counts wrong after push");
+    }
+    rec.irq_parent = 0x8005;
+    rec.phandle = 7;
+
+    // Over-long compatible list: whole strings only, in order, and
+    // the copy stops at the first string that does not fit.
+    let mut long = alloc::vec::Vec::new();
+    for i in 0..10 {
+        long.extend_from_slice(b"vendor,device-");
+        long.push(b'0' + i);
+        long.push(0);
+    }
+    let mut rec2 = PlatformDevice::new();
+    rec2.set_compatible(&long);
+    if rec2.compatible_bytes().len() > crate::PLATFORM_COMPATIBLE_CAP {
+        return TestResult::Fail("compatible copy exceeded capacity");
+    }
+    if rec2.compatible_bytes().last() != Some(&0) {
+        return TestResult::Fail("truncated compatible not NUL-terminated at a boundary");
+    }
+    if rec2.compatible_position("vendor,device-0") != Some(0) {
+        return TestResult::Fail("truncated list lost its head");
+    }
+    if rec2.compatible_position("vendor,device-9").is_some() {
+        return TestResult::Fail("truncated list claims its tail");
+    }
+
+    // The record rides through the registry keyed on window 0.
+    let _restore_registry = RegistryRestore::capture();
+    let dev = BusDevice {
+        addr: BusAddr::Mmio(PhysAddr::new(0x0900_0000)),
+        id: DeviceId {
+            vendor: 0,
+            device: 0,
+            class: 0,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: BusKind::Platform(rec),
+    };
+    crate::registry::install(alloc::vec![dev]);
+    let found = crate::devices();
+    if found.len() != 1 {
+        return TestResult::Fail("platform device did not round-trip the registry");
+    }
+    match &found[0].kind {
+        BusKind::Platform(p) if p.compatible_contains("arm,pl011") && p.irq_parent == 0x8005 => {}
+        _ => return TestResult::Fail("registry returned a mangled platform record"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_bus_platform_device_record);
+
+// ── Devicetree match table ─────────────────────────────────────
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+static DT_SPECIFIC_CALLS: AtomicU32 = AtomicU32::new(0);
+static DT_GENERIC_CALLS: AtomicU32 = AtomicU32::new(0);
+static DT_DECLINING_CALLS: AtomicU32 = AtomicU32::new(0);
+static DT_FALLBACK_CALLS: AtomicU32 = AtomicU32::new(0);
+
+fn dt_probe_specific(
+    _dev: crate::BusDevice,
+    _cap: narf_capabilities::Cap<crate::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), crate::ProbeError> {
+    DT_SPECIFIC_CALLS.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+fn dt_probe_generic(
+    _dev: crate::BusDevice,
+    _cap: narf_capabilities::Cap<crate::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), crate::ProbeError> {
+    DT_GENERIC_CALLS.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+fn dt_probe_declining(
+    _dev: crate::BusDevice,
+    _cap: narf_capabilities::Cap<crate::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), crate::ProbeError> {
+    DT_DECLINING_CALLS.fetch_add(1, Ordering::SeqCst);
+    Err(crate::ProbeError::NotForThisDriver)
+}
+
+fn dt_probe_fallback(
+    _dev: crate::BusDevice,
+    _cap: narf_capabilities::Cap<crate::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), crate::ProbeError> {
+    DT_FALLBACK_CALLS.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+fn smoke_bus_dt_match_binds_platform() -> TestResult {
+    // probe_all over platform devices: the candidate order is the
+    // matched string's position in the device's compatible list
+    // (most-specific first), NOT registration order; a
+    // NotForThisDriver decline falls through to the next candidate;
+    // bindings are recorded like PCI bindings. The compatible
+    // strings are fictional, so the registered test entries can
+    // never match a real device in a later smoke.
+    use crate::driver_match::{bound_count, probe_all, register_dt, DtMatch};
+    use crate::{BusAddr, BusDevice, BusKind, DeviceId, PlatformDevice, RegWindow};
+    use narf_memory::PhysAddr;
+
+    DT_SPECIFIC_CALLS.store(0, Ordering::SeqCst);
+    DT_GENERIC_CALLS.store(0, Ordering::SeqCst);
+    DT_DECLINING_CALLS.store(0, Ordering::SeqCst);
+    DT_FALLBACK_CALLS.store(0, Ordering::SeqCst);
+
+    // Generic registered FIRST — it must still lose to the
+    // more-specific string on device 1.
+    register_dt(DtMatch {
+        name: "dt-test-generic",
+        compatible: "narf,test-generic",
+        probe: dt_probe_generic,
+    });
+    register_dt(DtMatch {
+        name: "dt-test-specific",
+        compatible: "narf,test-device",
+        probe: dt_probe_specific,
+    });
+    register_dt(DtMatch {
+        name: "dt-test-declining",
+        compatible: "narf,test-device2",
+        probe: dt_probe_declining,
+    });
+    register_dt(DtMatch {
+        name: "dt-test-fallback",
+        compatible: "narf,test-fallback",
+        probe: dt_probe_fallback,
+    });
+
+    let mk = |base: u64, compat: &[u8]| {
+        let mut rec = PlatformDevice::new();
+        rec.set_compatible(compat);
+        let _ = rec.push_reg(RegWindow {
+            base: PhysAddr::new(base),
+            len: 0x1000,
+        });
+        BusDevice {
+            addr: BusAddr::Mmio(PhysAddr::new(base)),
+            id: DeviceId {
+                vendor: 0,
+                device: 0,
+                class: 0,
+                subsystem_vendor: 0,
+                subsystem_id: 0,
+            },
+            kind: BusKind::Platform(rec),
+        }
+    };
+    let _restore_registry = RegistryRestore::capture();
+    crate::registry::install(alloc::vec![
+        mk(0x0bad_1000, b"narf,test-device\0narf,test-generic\0"),
+        mk(0x0bad_2000, b"narf,test-device2\0narf,test-fallback\0"),
+    ]);
+
+    let authority = crate::bootstrap_registry_authority();
+    let bound_before = bound_count();
+    match probe_all(&authority) {
+        Ok(2) => {}
+        Ok(n) => {
+            return TestResult::Fail(match n {
+                0 => "probe_all bound no platform devices",
+                1 => "probe_all bound only one platform device",
+                _ => "probe_all bound an unexpected number of devices",
+            })
+        }
+        Err(_) => return TestResult::Fail("probe_all returned a cap error"),
+    }
+    if DT_SPECIFIC_CALLS.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail("most-specific DT match was not attempted first / not bound");
+    }
+    if DT_GENERIC_CALLS.load(Ordering::SeqCst) != 0 {
+        return TestResult::Fail("generic DT match attempted after the specific one bound");
+    }
+    if DT_DECLINING_CALLS.load(Ordering::SeqCst) != 1
+        || DT_FALLBACK_CALLS.load(Ordering::SeqCst) != 1
+    {
+        return TestResult::Fail("NotForThisDriver decline did not fall through to the fallback");
+    }
+    if bound_count() != bound_before + 2 {
+        return TestResult::Fail("platform bindings were not recorded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_bus_dt_match_binds_platform);
+
+// ── Devicetree enumeration ─────────────────────────────────────
+
+/// The real QEMU `virt` DTB fixture (copy of the firmware-fdt
+/// crate's fixture; provenance in tests/fixtures/README.md).
+const QEMU_VIRT_DTB: &[u8] = include_bytes!("../tests/fixtures/qemu-virt.dtb");
+
+fn smoke_bus_dt_decode_fixture_census() -> TestResult {
+    // The decoder's census over the real QEMU virt blob, derived
+    // from the blob itself (see the fixture README): 32 virtio-mmio
+    // slots + 8 platform-shaped nodes (fw-cfg, PL061, PCIe bridge,
+    // PL031, PL011, GIC, ITS, CFI flash). The /cpus subtree, and
+    // compatible-but-regless nodes (PSCI, timer, fixed clock), must
+    // NOT appear.
+    use crate::dt::decode_devices;
+    let devs = decode_devices(QEMU_VIRT_DTB);
+    if devs.len() != 40 {
+        return TestResult::Fail("DT decode census is not 40 devices");
+    }
+    let find = |needle: &str| devs.iter().find(|d| d.compatible_contains(needle));
+
+    let Some(pl011) = find("arm,pl011") else {
+        return TestResult::Fail("PL011 not decoded from DT");
+    };
+    if pl011.regs != [(0x0900_0000, 0x1000)] {
+        return TestResult::Fail("PL011 reg window mismatch");
+    }
+    if pl011.irqs != [(33, 4)] {
+        return TestResult::Fail("PL011 IRQ not resolved to SPI 1 (INTID 33)");
+    }
+    if pl011.irq_parent != 0x8005 {
+        return TestResult::Fail("PL011 did not inherit the root interrupt-parent (GIC)");
+    }
+    // The registry record built from the decode keys on window 0
+    // and carries the resolved IRQ.
+    let bus_dev = pl011.to_bus_device();
+    if bus_dev.addr != crate::BusAddr::Mmio(narf_memory::PhysAddr::new(0x0900_0000)) {
+        return TestResult::Fail("PL011 bus device not keyed on its reg base");
+    }
+    match &bus_dev.kind {
+        crate::BusKind::Platform(p)
+            if p.reg_windows().len() == 1
+                && p.irq_list()
+                    == [crate::DtIrq {
+                        intid: 33,
+                        flags: 4,
+                    }] => {}
+        _ => return TestResult::Fail("PL011 platform record mangled"),
+    }
+
+    let Some(gic) = find("arm,gic-v3") else {
+        return TestResult::Fail("GIC not decoded from DT");
+    };
+    if gic.phandle != 0x8005 || gic.regs.len() != 2 || gic.regs[0] != (0x0800_0000, 0x1_0000) {
+        return TestResult::Fail("GIC record mismatch (phandle / GICD window)");
+    }
+    let Some(flash) = find("cfi-flash") else {
+        return TestResult::Fail("CFI flash not decoded from DT");
+    };
+    if flash.regs != [(0, 0x400_0000), (0x400_0000, 0x400_0000)] {
+        return TestResult::Fail("flash bank windows mismatch");
+    }
+    let Some(bridge) = find("pci-host-ecam-generic") else {
+        return TestResult::Fail("PCIe host bridge not decoded from DT");
+    };
+    // The ECAM window is the bridge's `reg` under the root's 2/2
+    // cells — (0x40_1000_0000, 0x1000_0000) per the blob's cells
+    // 0x00000040 0x10000000 | 0x00000000 0x10000000 — not the
+    // node's @10000000 name suffix (that is its low MMIO base).
+    if bridge.regs != [(0x40_1000_0000, 0x1000_0000)] {
+        return TestResult::Fail("host bridge ECAM window mismatch");
+    }
+    let Some(pl061) = find("arm,pl061") else {
+        return TestResult::Fail("PL061 not decoded from DT");
+    };
+    if pl061.phandle != 0x8007 || pl061.irqs != [(39, 4)] {
+        return TestResult::Fail("PL061 record mismatch (phandle / IRQ)");
+    }
+
+    // The virtio fleet: 32 slots, ascending, each with its SPI
+    // resolved (slot i -> SPI 16+i -> INTID 48+i).
+    let fleet: alloc::vec::Vec<_> = devs
+        .iter()
+        .filter(|d| d.compatible_contains("virtio,mmio"))
+        .collect();
+    if fleet.len() != 32 {
+        return TestResult::Fail("virtio-mmio fleet is not 32 slots");
+    }
+    for (i, slot) in fleet.iter().enumerate() {
+        let base = 0x0a00_0000u64 + (i as u64) * 0x200;
+        if slot.regs != [(base, 0x200)] || slot.irqs != [(48 + (i as u32), 1)] {
+            return TestResult::Fail("virtio-mmio slot decode mismatch");
+        }
+    }
+
+    // Exclusions: CPUs (SMP input, not devices) and regless nodes.
+    for absent in [
+        "arm,cortex-a72",
+        "arm,psci-1.0",
+        "arm,armv8-timer",
+        "fixed-clock",
+    ] {
+        if find(absent).is_some() {
+            return TestResult::Fail("a node that is not a bus device was decoded as one");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_bus_dt_decode_fixture_census);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_bus_dt_enumeration_live() -> TestResult {
+    // Boot-path enumeration over the live DTB (xtask places QEMU
+    // virt's blob at 0x4F00_0000, the same pointer other bus
+    // smokes use): the registry gains platform records decoded
+    // from the tree — PL011 with its GIC-resolved IRQ above all —
+    // while virtio slots stay VirtioMmio-kind.
+    use crate::{devices, BusKind};
+    use narf_memory::PhysAddr;
+    let _restore_registry = RegistryRestore::capture();
+    // SAFETY: xtask loads the DTB at this identity-mapped address.
+    let _ = unsafe { crate::init(Some(PhysAddr::new(0x4F00_0000))) };
+    let devs = devices();
+
+    let pl011 = devs
+        .iter()
+        .find(|d| matches!(&d.kind, BusKind::Platform(p) if p.compatible_contains("arm,pl011")));
+    let Some(pl011) = pl011 else {
+        return TestResult::Fail("no PL011 platform device in the live registry");
+    };
+    match &pl011.kind {
+        BusKind::Platform(p) => {
+            if p.reg_windows()
+                != [crate::RegWindow {
+                    base: PhysAddr::new(0x0900_0000),
+                    len: 0x1000,
+                }]
+            {
+                return TestResult::Fail("live PL011 reg window mismatch");
+            }
+            if p.irq_list()
+                != [crate::DtIrq {
+                    intid: 33,
+                    flags: 4,
+                }]
+            {
+                return TestResult::Fail("live PL011 IRQ not resolved to INTID 33");
+            }
+        }
+        _ => unreachable!(),
+    }
+    if !devs
+        .iter()
+        .any(|d| matches!(&d.kind, BusKind::Platform(p) if p.compatible_contains("arm,gic-v3")))
+    {
+        return TestResult::Fail("no GIC platform device in the live registry");
+    }
+    if !devs
+        .iter()
+        .any(|d| matches!(&d.kind, BusKind::Platform(p) if p.compatible_contains("cfi-flash")))
+    {
+        return TestResult::Fail("no CFI flash platform device in the live registry");
+    }
+    // No platform record may carry the virtio-mmio identity —
+    // those nodes enumerate through the probe as VirtioMmio.
+    if devs
+        .iter()
+        .any(|d| matches!(&d.kind, BusKind::Platform(p) if p.compatible_contains("virtio,mmio")))
+    {
+        return TestResult::Fail("a virtio-mmio node was emitted as a platform device");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("bus", smoke_bus_dt_enumeration_live);
+
 #[cfg(target_arch = "aarch64")]
 fn smoke_bus_pcie_dtb_aarch64() -> TestResult {
     // The boot-time `bus::init` discovers the `pcie@10000000` node
@@ -3936,3 +4336,277 @@ fn smoke_vmd_irq_remap_legacy_msi() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bus", smoke_vmd_irq_remap_legacy_msi);
+
+// ── Probe-time child decode (DT programme step 5 prerequisite) ──
+
+use alloc::vec::Vec;
+
+/// One node of a synthetic test tree.
+struct TSpec<'a> {
+    name: &'a str,
+    props: &'a [(&'a str, &'a [u8])],
+    kids: &'a [TSpec<'a>],
+}
+
+fn be_cells(vals: &[u32]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for v in vals {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+fn be_str(s: &str) -> Vec<u8> {
+    let mut out = s.as_bytes().to_vec();
+    out.push(0);
+    out
+}
+
+fn intern_test_string(strings: &mut Vec<u8>, name: &str) -> u32 {
+    let target = name.as_bytes();
+    let mut i = 0;
+    while i + target.len() < strings.len() {
+        if &strings[i..i + target.len()] == target && strings[i + target.len()] == 0 {
+            return i as u32;
+        }
+        i += 1;
+    }
+    let off = strings.len() as u32;
+    strings.extend_from_slice(target);
+    strings.push(0);
+    off
+}
+
+fn emit_test_prop(s: &mut Vec<u8>, strings: &mut Vec<u8>, name: &str, val: &[u8]) {
+    let off = intern_test_string(strings, name);
+    s.extend_from_slice(&narf_firmware_fdt::FDT_PROP.to_be_bytes());
+    s.extend_from_slice(&(val.len() as u32).to_be_bytes());
+    s.extend_from_slice(&off.to_be_bytes());
+    s.extend_from_slice(val);
+    while s.len() % 4 != 0 {
+        s.push(0);
+    }
+}
+
+fn emit_test_node(s: &mut Vec<u8>, strings: &mut Vec<u8>, node: &TSpec) {
+    s.extend_from_slice(&narf_firmware_fdt::FDT_BEGIN_NODE.to_be_bytes());
+    s.extend_from_slice(node.name.as_bytes());
+    s.push(0);
+    while s.len() % 4 != 0 {
+        s.push(0);
+    }
+    for (name, val) in node.props {
+        emit_test_prop(s, strings, name, val);
+    }
+    for kid in node.kids {
+        emit_test_node(s, strings, kid);
+    }
+    s.extend_from_slice(&narf_firmware_fdt::FDT_END_NODE.to_be_bytes());
+}
+
+/// Build a minimal v17 DTB (root props + the given root children)
+/// — the same layout discipline as the firmware-fdt crate's test
+/// builder, with nesting.
+fn build_test_dtb(root_props: &[(&str, &[u8])], kids: &[TSpec]) -> Vec<u8> {
+    let mut strings: Vec<u8> = Vec::new();
+    let mut s: Vec<u8> = Vec::new();
+    s.extend_from_slice(&narf_firmware_fdt::FDT_BEGIN_NODE.to_be_bytes());
+    s.extend_from_slice(&[0, 0, 0, 0]); // root name: empty + pad
+    for (name, val) in root_props {
+        emit_test_prop(&mut s, &mut strings, name, val);
+    }
+    for kid in kids {
+        emit_test_node(&mut s, &mut strings, kid);
+    }
+    s.extend_from_slice(&narf_firmware_fdt::FDT_END_NODE.to_be_bytes());
+    s.extend_from_slice(&narf_firmware_fdt::FDT_END.to_be_bytes());
+
+    let off_rsvmap = 40u32;
+    let off_struct = off_rsvmap + 16;
+    let off_strings = off_struct + s.len() as u32;
+    let totalsize = off_strings + strings.len() as u32;
+    let mut out: Vec<u8> = Vec::with_capacity(totalsize as usize);
+    out.extend_from_slice(&narf_firmware_fdt::FDT_MAGIC.to_be_bytes());
+    out.extend_from_slice(&totalsize.to_be_bytes());
+    out.extend_from_slice(&off_struct.to_be_bytes());
+    out.extend_from_slice(&off_strings.to_be_bytes());
+    out.extend_from_slice(&off_rsvmap.to_be_bytes());
+    out.extend_from_slice(&17u32.to_be_bytes());
+    out.extend_from_slice(&16u32.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&(strings.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+    out.extend_from_slice(&[0u8; 16]); // reserve-map terminator
+    out.extend_from_slice(&s);
+    out.extend_from_slice(&strings);
+    out
+}
+
+fn smoke_bus_dt_children_real_fixture() -> TestResult {
+    // children_of over the real QEMU virt blob: the GIC's ITS
+    // child is the one real child subtree on virt; the flash and
+    // PL011 nodes are childless; a wrong base matches nothing.
+    use crate::dt::children_of;
+    let its = children_of(QEMU_VIRT_DTB, "arm,gic-v3", 0x0800_0000);
+    if its.len() != 1 || its[0].name != "its@8080000" {
+        return TestResult::Fail("GIC child decode did not yield exactly the ITS node");
+    }
+    if !its[0].compatible_contains("arm,gic-v3-its") {
+        return TestResult::Fail("ITS child compatible mismatch");
+    }
+    if its[0].reg != Some((0x0808_0000, 0x2_0000)) {
+        return TestResult::Fail("ITS child reg not decoded with the GIC node's cells");
+    }
+    if !children_of(QEMU_VIRT_DTB, "cfi-flash", 0).is_empty() {
+        return TestResult::Fail("virt flash unexpectedly has children");
+    }
+    if !children_of(QEMU_VIRT_DTB, "arm,pl011", 0x0900_0000).is_empty() {
+        return TestResult::Fail("PL011 unexpectedly has children");
+    }
+    if !children_of(QEMU_VIRT_DTB, "cfi-flash", 0x400_0000).is_empty() {
+        return TestResult::Fail("children_of matched on the flash's second bank base");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_bus_dt_children_real_fixture);
+
+fn smoke_bus_dt_children_synthetic() -> TestResult {
+    // A flash node with fixed-partitions grandchildren and an SPI
+    // controller with a NOR child: the two child shapes step 5/6
+    // bindings consume. Partition/child regs decode with the
+    // PARENT node's cells in the parent's local space.
+    use crate::dt::children_of;
+    let root_cells_a = be_cells(&[2]);
+    let root_cells_s = be_cells(&[1]);
+    let one = be_cells(&[1]);
+    let zero = be_cells(&[0]);
+    let flash_reg = be_cells(&[0, 0, 0x400_0000]);
+    let part0_reg = be_cells(&[0, 0x10_0000]);
+    let part1_reg = be_cells(&[0x10_0000, 0x3f0_0000]);
+    let spi_reg = be_cells(&[0, 0x8_0000, 0x1000]);
+    let nor_reg = be_cells(&[0]);
+    let nor_freq = be_cells(&[20_000_000]);
+    let spi_clocks = be_cells(&[42]);
+    let clk_phandle = be_cells(&[42]);
+    let clk_freq = be_cells(&[24_000_000]);
+    let empty: &[u8] = &[];
+    let blob = build_test_dtb(
+        &[
+            ("#address-cells", &root_cells_a),
+            ("#size-cells", &root_cells_s),
+        ],
+        &[
+            TSpec {
+                name: "flash@0",
+                props: &[
+                    ("compatible", &be_str("cfi-flash")),
+                    ("reg", &flash_reg),
+                    ("#address-cells", &one),
+                    ("#size-cells", &one),
+                ],
+                kids: &[TSpec {
+                    name: "partitions",
+                    props: &[
+                        ("compatible", &be_str("fixed-partitions")),
+                        ("#address-cells", &one),
+                        ("#size-cells", &one),
+                    ],
+                    kids: &[
+                        TSpec {
+                            name: "partition@0",
+                            props: &[
+                                ("label", &be_str("boot")),
+                                ("reg", &part0_reg),
+                                ("read-only", empty),
+                            ],
+                            kids: &[],
+                        },
+                        TSpec {
+                            name: "partition@100000",
+                            props: &[("label", &be_str("rootfs")), ("reg", &part1_reg)],
+                            kids: &[],
+                        },
+                    ],
+                }],
+            },
+            TSpec {
+                name: "spi@80000",
+                props: &[
+                    ("compatible", &be_str("arm,pl022")),
+                    ("reg", &spi_reg),
+                    ("clocks", &spi_clocks),
+                    ("#address-cells", &one),
+                    ("#size-cells", &zero),
+                ],
+                kids: &[TSpec {
+                    name: "flash@0",
+                    props: &[
+                        ("compatible", &be_str("jedec,spi-nor")),
+                        ("reg", &nor_reg),
+                        ("spi-max-frequency", &nor_freq),
+                    ],
+                    kids: &[],
+                }],
+            },
+            TSpec {
+                name: "apb-clock",
+                props: &[
+                    ("compatible", &be_str("fixed-clock")),
+                    ("phandle", &clk_phandle),
+                    ("clock-frequency", &clk_freq),
+                ],
+                kids: &[],
+            },
+        ],
+    );
+
+    let flash_kids = children_of(&blob, "cfi-flash", 0);
+    if flash_kids.len() != 1 || flash_kids[0].name != "partitions" {
+        return TestResult::Fail("flash children are not the partitions node");
+    }
+    let parts = &flash_kids[0].children;
+    if parts.len() != 2 {
+        return TestResult::Fail("fixed-partitions grandchildren not decoded");
+    }
+    if parts[0].prop_str("label") != Some("boot")
+        || parts[0].reg != Some((0, 0x10_0000))
+        || !parts[0].prop_present("read-only")
+    {
+        return TestResult::Fail("partition@0 decode mismatch (label/reg/read-only)");
+    }
+    if parts[1].prop_str("label") != Some("rootfs")
+        || parts[1].reg != Some((0x10_0000, 0x3f0_0000))
+        || parts[1].prop_present("read-only")
+    {
+        return TestResult::Fail("partition@100000 decode mismatch");
+    }
+
+    let spi_kids = children_of(&blob, "arm,pl022", 0x8_0000);
+    if spi_kids.len() != 1 || spi_kids[0].name != "flash@0" {
+        return TestResult::Fail("SPI children are not the NOR node");
+    }
+    if !spi_kids[0].compatible_contains("jedec,spi-nor")
+        || spi_kids[0].reg != Some((0, 0))
+        || spi_kids[0].prop_u32("spi-max-frequency") != Some(20_000_000)
+    {
+        return TestResult::Fail("NOR child decode mismatch (compatible/cs/max-frequency)");
+    }
+
+    // Probe-time node access: the SPI node's own `clocks` phandle
+    // reads back, a missing property is None, and the fixed-clock
+    // phandle resolves to its frequency.
+    use crate::dt::{clock_frequency_of_phandle, node_prop};
+    if node_prop(&blob, "arm,pl022", 0x8_0000, "clocks").as_deref() != Some(&spi_clocks[..]) {
+        return TestResult::Fail("node_prop did not return the SPI node's clocks phandle");
+    }
+    if node_prop(&blob, "arm,pl022", 0x8_0000, "no-such-prop").is_some() {
+        return TestResult::Fail("node_prop invented a missing property");
+    }
+    if clock_frequency_of_phandle(&blob, 42) != Some(24_000_000)
+        || clock_frequency_of_phandle(&blob, 99).is_some()
+    {
+        return TestResult::Fail("fixed-clock phandle resolution mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_bus_dt_children_synthetic);

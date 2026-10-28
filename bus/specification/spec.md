@@ -98,6 +98,32 @@ pub struct DeviceInfo {
 }
 ```
 
+As implemented, the registry descriptor is
+`BusDevice { addr: BusAddr, id: DeviceId, kind: BusKind }` with
+`BusKind::{Pcie, VirtioMmio, Platform}`. `Platform(PlatformDevice)`
+is the devicetree record (DT enumeration, §3.2 / §5):
+
+- `compatible`: the node's `compatible` list inline, most-specific
+  string first, capacity `PLATFORM_COMPATIBLE_CAP` (128) bytes,
+  truncated at a string boundary — the strings matching prefers are
+  the ones kept. A string's position in the list is the DT match
+  specificity measure (§9.2).
+- `regs`: up to `PLATFORM_MAX_REGS` (4) decoded `reg` windows,
+  translated through ancestor `ranges` at enumeration. Window 0's
+  base is the device's `BusAddr::Mmio` key; `DeviceId` is all-zero.
+- `irqs`: up to `PLATFORM_MAX_IRQS` (4) interrupts resolved at
+  enumeration to architectural INTIDs against the interrupt
+  parent's binding. Only the GIC 3-cell form is resolved today;
+  a device under another controller keeps `irq_parent` (the
+  parent's phandle) but carries no resolved entries.
+- `phandle` / `irq_parent`: the node's own phandle and its
+  interrupt parent's, for the framework layer. Further phandle
+  references (`clocks` / `resets` / `regulators`) are *not* decoded
+  at enumeration — their cell widths are properties of the target
+  controller, so the framework layer resolves them at probe time,
+  re-locating the node by (first compatible string, first `reg`
+  base) via `narf_firmware_fdt::for_each_compatible`.
+
 ### 3.2 Enumeration API
 
 ```rust
@@ -122,10 +148,75 @@ pub unsafe fn discover_pmu_ppi(dtb: PhysAddr) -> Option<u32>;
 three-cell PPI interrupt specifier and returns its architectural INTID. It has
 no platform-default fallback because the PMU interrupt is implementation-defined.
 
+Devicetree enumeration (`bus::dt`, aarch64) runs on
+`narf_firmware_fdt` — the tree's only FDT walker:
+
+```rust
+/// Pure decode of a DTB into device-shaped records: nodes with
+/// `status` absent-or-okay, a `compatible`, and a translatable
+/// `reg`, excluding the `/cpus` subtree. `reg` windows are
+/// translated through ancestor `ranges`; interrupts are resolved
+/// to architectural INTIDs against the (inherited) interrupt
+/// parent when it carries a GIC binding.
+pub fn decode_devices(blob: &[u8]) -> Vec<DtDevice>;
+```
+
+`enumerate_dt` (crate-internal, aarch64) turns the decode into
+registry devices: `Platform` records as decoded, virtio-mmio
+slots probed for a populated device-id (emitted as `VirtioMmio`,
+never `Platform`), and the `pci-host-ecam-generic` bridge's ECAM
+walked via the shared PCIe enumerator when its window falls in
+the low 4 GiB (the legacy guard — a highmem ECAM is described in
+the tree but not walked). With no DTB, or a blob that yields
+nothing, aarch64 enumeration falls back to the QEMU `virt`
+virtio-mmio slot scan.
+
 Appends made after enumeration (hot-plug arrivals, bridge-enumerated
 children) are visible to `devices()` immediately. The match-table
 dispatcher's binding walk (§9) additionally observes appends made
 *during* the walk itself — see §9.5.
+
+Probe-time tree access (DT programme step 5): enumeration retains
+the discovered blob, and bindings re-locate their node in it —
+matched by the same identity the record carries (first
+compatible string + first translated `reg` base) — to decode
+node-local data the fixed-size record cannot hold:
+
+```rust
+/// The boot DTB retained at enumeration (aarch64); `None` on
+/// x86_64 and DTB-less boots.
+pub fn dtb_blob() -> Option<&'static [u8]>;
+
+/// Decode the child subtree of the node identified by
+/// (`parent_compatible`, `parent_first_reg_base`). Child `reg`
+/// values are decoded with the parent node's cells and left
+/// untranslated — they live in the parent's local address space
+/// (partition offsets, chip-selects). Children ride recursively.
+pub fn children_of(
+    blob: &[u8],
+    parent_compatible: &str,
+    parent_first_reg_base: u64,
+) -> Vec<DtChild>;
+
+/// Read one property of the identified node itself (a `clocks`
+/// phandle list, a `clock-frequency` override).
+pub fn node_prop(
+    blob: &[u8],
+    parent_compatible: &str,
+    parent_first_reg_base: u64,
+    name: &str,
+) -> Option<Vec<u8>>;
+
+/// Resolve a clock phandle to the target node's
+/// `clock-frequency` when the target is a fixed-clock style
+/// provider. The #1052 clock framework generalises provider
+/// resolution; consumers name their fallback explicitly.
+pub fn clock_frequency_of_phandle(blob: &[u8], phandle: u32) -> Option<u32>;
+```
+
+This is the mechanism the §3.1 framework resolution (clocks /
+resets / regulators, and likewise `fixed-partitions` tables and
+bus child devices) is specified to use at probe time.
 
 ### 3.3 Device capability
 
@@ -434,11 +525,15 @@ ignores message data — MSI's only per-vector signal.
   the isolation claim is void.
 
 ### aarch64
-- PCIe: ECAM base from devicetree `reg` property or ACPI MCFG on
-  SystemReady platforms.
+- PCIe: ECAM base from the devicetree `pci-host-ecam-generic`
+  node's `reg` property (low-4-GiB windows only today) or ACPI
+  MCFG on SystemReady platforms.
 - MSI via GICv3 ITS; `msi-parent` devicetree node points to the ITS.
-- Platform-bus devices enumerated from devicetree's `/soc` subtree,
-  with `compatible` strings keyed against the driver registry.
+- Platform devices enumerated from the whole devicetree (minus
+  `/cpus`) in one `narf_firmware_fdt` walk: `compatible` strings
+  keyed against the DT match table (§9), `reg` windows decoded
+  through parent `ranges`, interrupts resolved through the
+  inherited interrupt parent to GIC INTIDs at enumeration time.
 
 ## 6. Dependencies
 
@@ -565,6 +660,17 @@ pub enum MatchEntry {
 }
 ```
 
+As implemented, the dispatcher carries two tables in
+`driver_match` — `PciMatch` (PCIe kinds above) and `DtMatch`
+(`{ name, compatible, probe }`) — feeding one shared walk:
+candidate selection is per-kind, everything after it (cap mint,
+§9.3 outcomes, §9.5 appended-device handling, §9.6 binding
+records + remove hooks keyed by match name) is common. A
+`DtMatch` probe receives the `BusKind::Platform` device with the
+same `Cap<BusDeviceCap, Write>` mint as a PCI probe.
+Virtio-MMIO devices have no table entries; they keep their own
+discovery shape.
+
 ### 9.2 Specificity ordering
 
 When multiple registrations could match a given device:
@@ -584,6 +690,12 @@ is linear in the number of entries matching the device's bus
 type. With hundreds of drivers this is still microseconds; the
 table can be promoted to a hash on (vendor, device) if it
 becomes hot.
+
+For devicetree matches, specificity is a property of the
+*device*: the matched string's position in the device's
+`compatible` list (position 0, the most-specific string, wins),
+with registration order as the tie-break — rules 2–3 above do
+not apply across the DT table today.
 
 ### 9.3 Probe outcomes
 

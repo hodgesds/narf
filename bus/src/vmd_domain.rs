@@ -183,6 +183,8 @@ pub fn domain_for_device(device: &BusDevice) -> Option<VmdDomainInfo> {
     match device.kind {
         BusKind::Pcie { addr, .. } => domain_info(addr.segment),
         BusKind::VirtioMmio { .. } => None,
+        // Devicetree platform devices are never behind a VMD bridge.
+        BusKind::Platform(_) => None,
     }
 }
 

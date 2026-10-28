@@ -16,6 +16,7 @@ narf-lib          = { path = "../lib" }
 narf-arch         = { path = "../arch" }
 narf-memory       = { path = "../memory" }
 narf-boot         = { path = "../boot" }
+narf-firmware-fdt = { path = "../firmware/fdt" }
 narf-capabilities = { path = "../capabilities" }
 narf-event-bus    = { path = "../event_bus" }
 narf-interrupts   = { path = "../interrupts" }

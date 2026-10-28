@@ -460,6 +460,37 @@ fn skip_props(blob: &[u8], mut cur: usize, end: usize) -> usize {
     cur
 }
 
+/// Read a `u32` property of the root node (`/`).
+///
+/// The walkers never report the root itself, but the root carries
+/// enumeration-relevant declarations — most importantly
+/// `interrupt-parent`, the tree-wide default interrupt parent that
+/// every node inherits unless it or an ancestor overrides it
+/// (Devicetree Specification §2.4). Returns `None` when the blob is
+/// malformed, the structure block does not open with the root node,
+/// or the property is absent / shorter than 4 bytes.
+pub fn root_prop_u32(blob: &[u8], name: &str) -> Option<u32> {
+    let hdr = parse_header(blob)?;
+    let struct_start = hdr.off_dt_struct as usize;
+    let strings_start = hdr.off_dt_strings as usize;
+    let strings_end = strings_start.checked_add(hdr.size_dt_strings as usize)?;
+    if strings_end > blob.len() {
+        return None;
+    }
+    // The structure block opens with the root's BEGIN_NODE token.
+    // The root's name is the empty string — one NUL byte padded to
+    // the 4-byte token grid — so its properties begin 8 bytes in.
+    if be_u32(blob, struct_start)? != FDT_BEGIN_NODE || blob.get(struct_start + 4) != Some(&0) {
+        return None;
+    }
+    let props = PropIter {
+        blob,
+        cur: struct_start + 8,
+        strings: &blob[strings_start..strings_end],
+    };
+    prop_u32(props, name)
+}
+
 // ───────────────────────────────────────────────────────────────────
 // Convenience helpers
 // ───────────────────────────────────────────────────────────────────
@@ -772,6 +803,64 @@ pub fn chosen_stdout_path(blob: &[u8], out: &mut [u8]) -> usize {
         }
     });
     n
+}
+
+/// Resolve `/chosen/stdout-path` to the `(base, size)` of the node
+/// it names — the early-console MMIO window the firmware points at.
+///
+/// All three forms firmware emits are handled: a full path
+/// (`"/pl011@9000000"`), an alias label (`"serial0"`, resolved
+/// through `/aliases`), and either form carrying output parameters
+/// after a `:` (`"serial0:115200n8"` — the parameters are not
+/// interpreted, only stripped). Returns `None` when the property
+/// is absent or empty, the target node does not exist, or it
+/// carries no decodable first `reg` entry.
+pub fn chosen_stdout_reg(blob: &[u8]) -> Option<(u64, u64)> {
+    let mut path_buf = [0u8; MAX_PATH_BYTES];
+    let n = chosen_stdout_path(blob, &mut path_buf);
+    if n == 0 {
+        return None;
+    }
+    let raw = core::str::from_utf8(&path_buf[..n]).ok()?;
+    let target = raw.split(':').next().unwrap_or("");
+    if target.is_empty() {
+        return None;
+    }
+    let mut alias_buf = [0u8; MAX_PATH_BYTES];
+    let resolved: &str = if target.starts_with('/') {
+        target
+    } else {
+        let m = alias_path(blob, target, &mut alias_buf);
+        if m == 0 {
+            return None;
+        }
+        core::str::from_utf8(&alias_buf[..m]).ok()?
+    };
+    let depth = resolved.split('/').filter(|s| !s.is_empty()).count();
+    if depth == 0 || depth > MAX_PATH_DEPTH {
+        return None;
+    }
+    let mut found = None;
+    walk_with_cells(blob, |path, props, parent_cells| {
+        if found.is_some() || path.depth() as usize != depth {
+            return;
+        }
+        let matches = resolved
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .enumerate()
+            .all(|(i, seg)| path.segment(i) == Some(seg));
+        if !matches {
+            return;
+        }
+        for (name, value) in props {
+            if name == "reg" {
+                found = parent_cells.read_one_reg(value, 0);
+                return;
+            }
+        }
+    });
+    found
 }
 
 // ───────────────────────────────────────────────────────────────────

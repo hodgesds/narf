@@ -147,6 +147,12 @@ from turning into a kernel-side memory-corruption primitive.
   initrd range from `/chosen`, and subtracts both `/memreserve/` and
   static `/reserved-memory/*/reg` ranges before exposing usable RAM.
   DTB and initrd storage are also excluded from the usable map.
+- Early console: `BootInfo.uart_phys` is the `reg` base of the node
+  `/chosen/stdout-path` names (`narf_firmware_fdt::chosen_stdout_reg`;
+  alias labels and `:params` suffixes resolved), falling back to the
+  QEMU `virt` PL011 base `0x0900_0000` when the blob, the property,
+  or a decodable `reg` is absent. On QEMU `virt` the resolved value
+  equals the fallback.
 
 ## 6. Dependencies
 

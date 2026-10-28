@@ -92,6 +92,7 @@ members = [
     "drivers/storage/ahci",
     "drivers/storage/megaraid",
     "drivers/storage/mpt3sas",
+    "drivers/storage/mtd",
     "drivers/storage/rtsx",
     "drivers/storage/sdhci",
     "drivers/storage/smartpqi",

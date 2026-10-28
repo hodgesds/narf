@@ -78,6 +78,7 @@ pub fn iter(cap: &Cap<BusDeviceCap, Read>, device: &BusDevice) -> Result<ExtCapI
     let cfg = match device.kind {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
         BusKind::VirtioMmio { .. } => return Err(ExtCapError::NotPcie),
+        BusKind::Platform(_) => return Err(ExtCapError::NotPcie),
     };
     Ok(ExtCapIter {
         cfg,
@@ -242,6 +243,7 @@ pub fn read_aer(
     let cfg = match device.kind {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
         BusKind::VirtioMmio { .. } => return Err(ExtCapError::NotPcie),
+        BusKind::Platform(_) => return Err(ExtCapError::NotPcie),
     };
     // AER register layout (PCIe §7.8.4):
     //   +0x04 Uncorrectable Status
@@ -406,6 +408,7 @@ pub fn clear_aer_status(
     let cfg = match device.kind {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
         BusKind::VirtioMmio { .. } => return Err(AerWriteError::NotPcie),
+        BusKind::Platform(_) => return Err(AerWriteError::NotPcie),
     };
     let read_cap: Cap<BusDeviceCap, Read> = cap
         .derive::<Read>()
@@ -442,6 +445,7 @@ pub fn set_aer_mask(
     let cfg = match device.kind {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
         BusKind::VirtioMmio { .. } => return Err(AerWriteError::NotPcie),
+        BusKind::Platform(_) => return Err(AerWriteError::NotPcie),
     };
     let read_cap: Cap<BusDeviceCap, Read> = cap
         .derive::<Read>()
@@ -474,6 +478,7 @@ pub fn set_aer_severity(
     let cfg = match device.kind {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
         BusKind::VirtioMmio { .. } => return Err(AerWriteError::NotPcie),
+        BusKind::Platform(_) => return Err(AerWriteError::NotPcie),
     };
     let read_cap: Cap<BusDeviceCap, Read> = cap
         .derive::<Read>()
@@ -649,6 +654,7 @@ pub fn read_dpc(
     let cfg = match device.kind {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
         BusKind::VirtioMmio { .. } => return Err(ExtCapError::NotPcie),
+        BusKind::Platform(_) => return Err(ExtCapError::NotPcie),
     };
     // CAP+CTRL share a 32-bit dword, as do STATUS+ERR_SOURCE_ID.
     // SAFETY: cfg page is identity-mapped; offsets in range.
@@ -744,6 +750,7 @@ pub fn read_ats(
     let cfg = match device.kind {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
         BusKind::VirtioMmio { .. } => return Err(ExtCapError::NotPcie),
+        BusKind::Platform(_) => return Err(ExtCapError::NotPcie),
     };
     // CAP+CTRL share a 32-bit dword.
     // SAFETY: cfg page is identity-mapped.
@@ -843,6 +850,7 @@ pub fn read_acs(
     let cfg = match device.kind {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
         BusKind::VirtioMmio { .. } => return Err(ExtCapError::NotPcie),
+        BusKind::Platform(_) => return Err(ExtCapError::NotPcie),
     };
     // SAFETY: cfg page is identity-mapped.
     let dword = unsafe { cfg_read32(cfg, h.offset + acs_off::CAP) };
@@ -920,6 +928,7 @@ pub fn read_pasid(
     let cfg = match device.kind {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
         BusKind::VirtioMmio { .. } => return Err(ExtCapError::NotPcie),
+        BusKind::Platform(_) => return Err(ExtCapError::NotPcie),
     };
     // SAFETY: cfg page is identity-mapped.
     let dword = unsafe { cfg_read32(cfg, h.offset + pasid_off::CAP) };

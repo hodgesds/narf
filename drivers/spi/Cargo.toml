@@ -25,6 +25,8 @@ narf-console      = { path = "../../console" }
 narf-interrupts   = { path = "../../interrupts" }
 narf-scheduler    = { path = "../../scheduler" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
+narf-firmware-fdt = { path = "../../firmware/fdt" }
+narf-drivers-storage-mtd = { path = "../storage/mtd" }
 
 [features]
 kernel-test = []

@@ -114,6 +114,7 @@ pub fn enable_msi(
     let cfg_phys = match device.kind {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
         BusKind::VirtioMmio { .. } => return Err(MsiError::NotPcie),
+        BusKind::Platform(_) => return Err(MsiError::NotPcie),
     };
     // SAFETY: bounded cap-list walk.
     let cap_off = unsafe { pci_cap::find_cap(device, MSI_CAP_ID) }

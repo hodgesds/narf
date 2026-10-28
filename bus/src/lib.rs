@@ -17,9 +17,9 @@
 //!   we fall back to the QEMU `q35` ECAM default (`0xb000_0000`, 256
 //!   buses × 4 KiB / function). Real MCFG parsing lands with boot/
 //!   ACPI work.
-//! - Full FDT property walk on aarch64 — we scan the flattened-devicetree
-//!   structure for the minimum set of nodes (`virtio_mmio@...`) needed to
-//!   produce the registry; a generic property getter is out of scope.
+//! - ACPI-based platform enumeration on aarch64 SystemReady — the
+//!   devicetree path (`crate::dt`, on `narf-firmware-fdt`) is the
+//!   enumeration story there today.
 //!
 //! The registry is populated once by `init` and is read-only thereafter.
 //! Wave 2 will swap the backing store for an RCU-protected list so
@@ -39,6 +39,7 @@ pub mod bar;
 pub mod cxl;
 pub mod device;
 pub mod driver_match;
+pub mod dt;
 pub mod ecam;
 pub mod hotplug;
 pub mod msi;
@@ -70,19 +71,23 @@ pub use bar::{
     allocate_pci_mmio, assign_unprogrammed_bars, init_mmio_pool, map_bar, map_bar_control,
     read_bar, AssignError, Bar, BarError, BarKind, MmioRegion, NUM_BARS,
 };
-pub use device::{BusDevice, BusKind, DeviceId};
+pub use device::{
+    BusDevice, BusKind, DeviceId, DtIrq, PlatformDevice, RegWindow, PLATFORM_COMPATIBLE_CAP,
+    PLATFORM_MAX_IRQS, PLATFORM_MAX_REGS,
+};
 pub use driver_match::{
     bound_count as bound_pci_devices, detach as detach_pci_device, module_bar_map, module_dma_addr,
     module_dma_alloc, module_dma_free, module_dma_read, module_dma_wait8, module_dma_write,
     module_irq_set_handler, module_mmio_read32, module_mmio_wait32, module_mmio_write32,
     module_msix_claim, module_msix_enable, module_netif_register, module_netif_rx,
     module_pci_enable, module_spawn_poller, probe_all as probe_all_pci,
-    register as register_pci_driver, register_module_pci_driver,
+    register as register_pci_driver, register_dt as register_dt_driver, register_module_pci_driver,
     register_remove as register_pci_remove, registered as registered_pci_drivers,
-    set_module_callback_call_gate, set_module_probe_call_gate, set_module_tx_call_gate,
-    set_probe_log, set_probe_log_hook, unregister_module_pci_drivers, MatchKind,
-    ModuleCallbackCallGate, ModuleCallbackFn, ModuleProbeCallGate, ModuleProbeFn, ModuleTxCallGate,
-    ModuleTxFn, PciMatch, PciProbeFn, PciRemoveFn, ProbeError,
+    registered_dt as registered_dt_drivers, set_module_callback_call_gate,
+    set_module_probe_call_gate, set_module_tx_call_gate, set_probe_log, set_probe_log_hook,
+    unregister_module_pci_drivers, DtMatch, DtProbeFn, MatchKind, ModuleCallbackCallGate,
+    ModuleCallbackFn, ModuleProbeCallGate, ModuleProbeFn, ModuleTxCallGate, ModuleTxFn, PciMatch,
+    PciProbeFn, PciRemoveFn, ProbeError,
 };
 pub use hotplug::{dispatch_event, register_listener, HotplugError, HotplugEvent, HotplugListener};
 pub use msix::{enable_msix, MsixError, MsixTable, MsixVector};

@@ -1462,3 +1462,283 @@ fn smoke_lpss_dw_speed_undeclared_keeps_defaults() -> TestResult {
     }
 }
 kernel_test_in!("drivers-i2c", smoke_lpss_dw_speed_undeclared_keeps_defaults);
+
+// ── BCM2835 BSC (DT programme step 5) ────────────────────────────
+//
+// A register-level model of the BSC behind the driver's BscIo
+// seam, with a register-file slave at a fixed address: the first
+// written byte sets the register pointer, further bytes store
+// at the pointer (auto-incrementing); reads return bytes from
+// the pointer (auto-incrementing) — the canonical EEPROM /
+// sensor register protocol. The model advances one step per
+// status read (the driver's poll), modelling FIFO movement
+// honestly: DONE asserts only when DLEN bytes have been clocked
+// in the current direction phase(s), a NACK'd address raises ERR.
+
+use crate::bcm2835::{divider_for, Bcm2835I2c, BscIo};
+use alloc::collections::VecDeque;
+use narf_lib::sync::IrqSafeSpinLock;
+
+const BSC_C: u32 = 0x00;
+const BSC_S: u32 = 0x04;
+const BSC_DLEN: u32 = 0x08;
+const BSC_A: u32 = 0x0C;
+const BSC_FIFO: u32 = 0x10;
+const BSC_DIV: u32 = 0x14;
+
+const BSC_C_ST: u32 = 1 << 7;
+const BSC_C_CLEAR: u32 = 1 << 4;
+const BSC_C_READ: u32 = 1 << 0;
+
+#[derive(Debug)]
+struct BscState {
+    addr: u32,
+    dlen: u32,
+    div: u32,
+    fifo: VecDeque<u8>,
+    ta: bool,
+    done: bool,
+    err: bool,
+    read_mode: bool,
+    moved: u32,
+    slave_addr: u8,
+    slave_present: bool,
+    regs: [u8; 256],
+    pointer: u8,
+    ptr_set: bool,
+}
+
+struct ModelBsc {
+    state: IrqSafeSpinLock<BscState>,
+}
+
+impl core::fmt::Debug for ModelBsc {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ModelBsc")
+    }
+}
+
+impl ModelBsc {
+    fn new(slave_addr: u8) -> Self {
+        Self {
+            state: IrqSafeSpinLock::new(BscState {
+                addr: 0,
+                dlen: 0,
+                div: 0,
+                fifo: VecDeque::new(),
+                ta: false,
+                done: false,
+                err: false,
+                read_mode: false,
+                moved: 0,
+                slave_addr,
+                slave_present: true,
+                regs: [0; 256],
+                pointer: 0,
+                ptr_set: false,
+            }),
+        }
+    }
+
+    fn preload(&self, reg: u8, bytes: &[u8]) {
+        let mut st = self.state.lock();
+        for (i, b) in bytes.iter().enumerate() {
+            st.regs[reg.wrapping_add(i as u8) as usize] = *b;
+        }
+    }
+
+    fn tick(st: &mut BscState) {
+        if !st.ta || st.done {
+            return;
+        }
+        if st.read_mode {
+            if st.moved < st.dlen && st.fifo.len() < 16 {
+                let b = st.regs[st.pointer as usize];
+                st.pointer = st.pointer.wrapping_add(1);
+                st.fifo.push_back(b);
+                st.moved += 1;
+                if st.moved == st.dlen {
+                    st.done = true;
+                    st.ta = false;
+                }
+            }
+        } else if let Some(b) = st.fifo.pop_front() {
+            if !st.ptr_set {
+                st.pointer = b;
+                st.ptr_set = true;
+            } else {
+                st.regs[st.pointer as usize] = b;
+                st.pointer = st.pointer.wrapping_add(1);
+            }
+            st.moved += 1;
+            if st.moved == st.dlen {
+                st.done = true;
+                st.ta = false;
+            }
+        }
+    }
+}
+
+impl BscIo for ModelBsc {
+    fn read(&self, reg: u32) -> u32 {
+        let mut st = self.state.lock();
+        match reg {
+            BSC_S => {
+                Self::tick(&mut st);
+                let mut s = 0u32;
+                if st.ta {
+                    s |= 1 << 0; // TA
+                }
+                if st.done {
+                    s |= 1 << 1; // DONE
+                }
+                if st.fifo.len() < 16 {
+                    s |= 1 << 4; // TXD
+                }
+                if !st.fifo.is_empty() {
+                    s |= 1 << 5; // RXD
+                }
+                if st.fifo.is_empty() {
+                    s |= 1 << 6; // TXE
+                }
+                if st.fifo.len() >= 16 {
+                    s |= 1 << 7; // RXF
+                }
+                if st.err {
+                    s |= 1 << 8; // ERR
+                }
+                s
+            }
+            BSC_FIFO => st.fifo.pop_front().map_or(0, |b| b as u32),
+            BSC_DIV => st.div,
+            _ => 0,
+        }
+    }
+
+    fn write(&self, reg: u32, val: u32) {
+        let mut st = self.state.lock();
+        match reg {
+            BSC_C => {
+                if val & BSC_C_CLEAR != 0 {
+                    st.fifo.clear();
+                }
+                if val & BSC_C_ST != 0 {
+                    // Transfer start.
+                    if !st.slave_present || st.addr as u8 != st.slave_addr {
+                        st.err = true;
+                        st.done = true;
+                        st.ta = false;
+                    } else {
+                        st.ta = true;
+                        st.done = false;
+                        st.err = false;
+                        st.moved = 0;
+                        st.read_mode = val & BSC_C_READ != 0;
+                        st.ptr_set = false;
+                    }
+                } else if val & BSC_C_READ != 0 && st.ta {
+                    // Direction flip mid-transfer: the repeated
+                    // START of a combined transaction.
+                    st.read_mode = true;
+                }
+            }
+            BSC_S => {
+                if val & (1 << 8) != 0 {
+                    st.err = false;
+                }
+                if val & (1 << 1) != 0 {
+                    st.done = false;
+                }
+            }
+            BSC_DLEN => st.dlen = val & 0xFFFF,
+            BSC_A => st.addr = val & 0x7F,
+            BSC_DIV => st.div = val & 0xFFFF,
+            BSC_FIFO => {
+                if st.fifo.len() < 16 {
+                    st.fifo.push_back(val as u8);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn smoke_bcm2835_divider_math() -> TestResult {
+    if divider_for(250_000_000, 100_000) != 2500
+        || divider_for(250_000_000, 400_000) != 625
+        || divider_for(250_000_000, 0) != 0xFFFF
+    {
+        return TestResult::Fail("BCM2835 divider math mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-i2c", smoke_bcm2835_divider_math);
+
+fn smoke_bcm2835_register_slave_round_trip() -> TestResult {
+    narf_scheduler::__reset_queues_for_test();
+    let model = ModelBsc::new(0x50);
+    model.preload(0x20, &[0x5A]);
+    let bus: Arc<dyn I2cBus> = Arc::new(Bcm2835I2c::new(
+        "bcm2835-test".to_string(),
+        model,
+        250_000_000,
+        100_000,
+    ));
+    let result = Arc::new(core::sync::atomic::AtomicI32::new(-1));
+    let r = result.clone();
+    narf_scheduler::spawn(async move {
+        let code = run_bsc_round_trip(bus).await;
+        r.store(code, core::sync::atomic::Ordering::SeqCst);
+    });
+    narf_scheduler::run_until_empty();
+    match result.load(core::sync::atomic::Ordering::SeqCst) {
+        0 => TestResult::Pass,
+        1 => TestResult::Fail("BSC write phase failed"),
+        2 => TestResult::Fail("BSC combined write->read returned wrong bytes"),
+        3 => TestResult::Fail("BSC bare read after combined returned the wrong byte"),
+        4 => TestResult::Fail("BSC transfer to an absent slave did not NACK"),
+        5 => TestResult::Fail("BSC accepted a 3-op chain instead of refusing it"),
+        _ => TestResult::Fail("BSC round-trip task didn't run"),
+    }
+}
+
+async fn run_bsc_round_trip(bus: Arc<dyn I2cBus>) -> i32 {
+    // Write two bytes at register 0x10.
+    let w = [0x10, 0xAB, 0xCD];
+    let mut ops = [I2cOp::Write(&w)];
+    if bus.transfer(0x50, &mut ops).await.is_err() {
+        return 1;
+    }
+    // Combined: set pointer to 0x10, repeated-start, read back.
+    let ptr = [0x10];
+    let mut buf = [0u8; 2];
+    let mut ops = [I2cOp::Write(&ptr), I2cOp::Read(&mut buf)];
+    if bus.transfer(0x50, &mut ops).await.is_err() || buf != [0xAB, 0xCD] {
+        return 2;
+    }
+    // The pointer auto-incremented past the two read bytes
+    // (0x10, 0x11) to 0x12; preload put 0x5A at 0x20 — a bare
+    // read now returns regs[0x12] (0x00), so re-point at 0x20
+    // with a write-only op and read the preloaded byte combined.
+    let ptr = [0x20];
+    let mut buf = [0u8; 1];
+    let mut ops = [I2cOp::Write(&ptr), I2cOp::Read(&mut buf)];
+    if bus.transfer(0x50, &mut ops).await.is_err() || buf != [0x5A] {
+        return 3;
+    }
+    // Absent slave NACKs.
+    let w = [0x00];
+    let mut ops = [I2cOp::Write(&w)];
+    if bus.transfer(0x51, &mut ops).await != Err(I2cError::Nack) {
+        return 4;
+    }
+    // A 3-op chain is refused with Abort, not split.
+    let w2 = [0x00];
+    let mut buf = [0u8; 1];
+    let mut ops = [I2cOp::Write(&w), I2cOp::Write(&w2), I2cOp::Read(&mut buf)];
+    match bus.transfer(0x50, &mut ops).await {
+        Err(I2cError::Abort(_)) => 0,
+        _ => 5,
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_bcm2835_register_slave_round_trip);

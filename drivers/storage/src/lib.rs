@@ -21,6 +21,8 @@ pub use narf_drivers_storage_ahci::ahci;
 pub use narf_drivers_storage_megaraid::megaraid;
 #[cfg(feature = "mpt3sas")]
 pub use narf_drivers_storage_mpt3sas::mpt3sas;
+#[cfg(feature = "mtd")]
+pub use narf_drivers_storage_mtd as mtd;
 #[cfg(feature = "rtsx")]
 pub use narf_drivers_storage_rtsx::rtsx;
 #[cfg(feature = "sdhci")]
@@ -58,6 +60,11 @@ mod tests;
 
 /// Stage::Subsys + Stage::Device initcalls for this driver crate.
 pub fn register_initcalls() {
+    // DT match-table registration for MTD (DT programme step 6):
+    // a plain bus-registry call at composition time, NOT an
+    // initcall — the desktop `all` census gains no initcalls.
+    #[cfg(feature = "mtd")]
+    narf_drivers_storage_mtd::register_dt_drivers();
     #[cfg(any(
         feature = "ahci",
         feature = "megaraid",

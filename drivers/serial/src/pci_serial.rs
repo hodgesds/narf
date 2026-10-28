@@ -305,6 +305,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     if let UartBase::Io(io_base) = port.base {
         registry::register(UartInfo {
             io_base,
+            mmio_base: 0,
             irq: None,
             name: "pci-serial",
             baud: DEFAULT_BAUD,
