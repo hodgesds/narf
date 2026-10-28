@@ -377,6 +377,7 @@ impl Owner {
             channel,
             self.power.phy.emission(),
         )?
+        .with_span(self.power.phy.span())
         .host_ceiling(&policy()?)?;
         self.prepare_channel_in_domain(channel, &policy()?).await?;
         self.prepare_peer_in_domain(bssid, &policy()?).await?;

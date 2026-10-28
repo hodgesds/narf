@@ -169,6 +169,10 @@ struct Actor {
     qos_tids: bool,
     /// Independent receiver view of Open QoS data: (TID, queue, Ethernet).
     tid_frames: Vec<(u8, u16, Vec<u8>)>,
+    /// NVM marks channels 1 and 5 NVM_CHANNEL_40MHZ (HT40 fixtures).
+    wide_nvm: bool,
+    /// Expected PHY_CONTEXT width and control position bytes.
+    phy_width: [u8; 2],
 }
 // SAFETY: fixture-only device-side pointers refer to the retained Owner's
 // posted coherent buffers. CURRENT retains both endpoints; every device-side
@@ -389,6 +393,13 @@ impl Actor {
                     if self.ht {
                         nvm[8] = 4;
                     }
+                    if self.wide_nvm {
+                        // Channels 1..=5 described; 1 and 5 VALID|IBSS|
+                        // ACTIVE|20MHZ|40MHZ (iwl-nvm-parse.h).
+                        nvm[24] = 5;
+                        nvm[28..32].copy_from_slice(&0x30bu32.to_le_bytes());
+                        nvm[44..48].copy_from_slice(&0x30bu32.to_le_bytes());
+                    }
                     nvm
                 }
                 (1, 0x98) => {
@@ -469,7 +480,11 @@ impl Actor {
                     vec![]
                 }
                 (1, 8) => {
-                    if b.len() != 36 || b[17] != 1 || !matches!(b[4], 1 | 3) {
+                    if b.len() != 36
+                        || b[17] != 1
+                        || b[18..20] != self.phy_width
+                        || !matches!(b[4], 1 | 3)
+                    {
                         return Err("MVM native PHY identity/extent");
                     }
                     vec![]
@@ -837,6 +852,30 @@ impl Harness {
         ml_baid: bool,
         features: u16,
     ) -> Result<Self, &'static str> {
+        Self::build_nvm(
+            protected,
+            ht,
+            emission,
+            tlc_version,
+            ba,
+            ml_baid,
+            features,
+            false,
+        )
+    }
+    /// [`Self::build_features`] with an NVM whose channels 1 and 5 carry
+    /// NVM_CHANNEL_40MHZ when `wide_nvm`.
+    #[allow(clippy::too_many_arguments)]
+    fn build_nvm(
+        protected: bool,
+        ht: bool,
+        emission: u8,
+        tlc_version: u8,
+        ba: bool,
+        ml_baid: bool,
+        features: u16,
+        wide_nvm: bool,
+    ) -> Result<Self, &'static str> {
         if CURRENT.lock().is_some() {
             return Err("MVM interface fixture already owned");
         }
@@ -906,6 +945,8 @@ impl Harness {
             hold_deauth: false,
             qos_tids: features & super::super::mvm_boot::feature_bits::QOS_TIDS != 0,
             tid_frames: Vec::new(),
+            wide_nvm,
+            phy_width: [0, 0],
         };
         {
             let mut configure = Box::pin(owner.model_configure());
@@ -1806,6 +1847,8 @@ kernel_test_in!(
 mod ba_tests;
 #[path = "mvm_coding_tests.rs"]
 mod coding_tests;
+#[path = "mvm_ht40_tests.rs"]
+mod ht40_tests;
 #[path = "mvm_ht_tests.rs"]
 mod ht_tests;
 #[path = "mvm_qos_tests.rs"]

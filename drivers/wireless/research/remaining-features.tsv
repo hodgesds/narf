@@ -90,31 +90,30 @@ cyw43439	system_suspend	System suspend	feature	drivers/wireless/specification/cy
 cyw43439	transport_reset	Confirmed native transport reset	feature	drivers/wireless/specification/cyw43439.md	500
 cyw43439	virtual_interfaces	Additional virtual interfaces	feature	drivers/wireless/specification/cyw43439.md	563
 cyw43439	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/cyw43439.md	500
-iwlwifi	active_scan_probes	Active scan probes	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	ap	AP role	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	ax210_station_enablement	AX210 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1553
-iwlwifi	ax211_station_enablement	AX211 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1553
-iwlwifi	ax411_station_enablement	AX411 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1553
-iwlwifi	be200_station_enablement	Bz/BE200 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1553
-iwlwifi	eht	EHT on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
-iwlwifi	gen2_vht	Gen2 VHT	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	he	HE	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	ht40	HT40	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	live_regulatory_owner	Gen3 and Sc live regulatory-policy owner	feature	drivers/wireless/specification/iwlwifi.md	1553
-iwlwifi	ml_baid	Alternate ML BAID profile	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	mlo	MLO on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
-iwlwifi	multiple_rx_queues	Multiple RX queues	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	nss2	NSS2	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	p2p	P2P role	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	persistent_key_history	Persistent key history	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	platform_power_owner	Gen3 and Sc live platform TX-power enforcement owner	feature	drivers/wireless/specification/iwlwifi.md	1553
-iwlwifi	rss	Receive-side scaling	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	sched_scan_offload	Scheduled-scan (PNO/net-detect) firmware offload	feature	drivers/wireless/specification/iwlwifi.md	1554
-iwlwifi	six_ghz	6GHz operation on applicable 6E/7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
-iwlwifi	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	width_160	160MHz operation on applicable profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
-iwlwifi	width_320	320MHz operation on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
-iwlwifi	wow	Wake on WLAN	feature	drivers/wireless/specification/iwlwifi.md	1552
+iwlwifi	active_scan_probes	Active scan probes	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	ap	AP role	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	ax210_station_enablement	AX210 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1556
+iwlwifi	ax211_station_enablement	AX211 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1556
+iwlwifi	ax411_station_enablement	AX411 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1556
+iwlwifi	be200_station_enablement	Bz/BE200 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1556
+iwlwifi	eht	EHT on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1557
+iwlwifi	gen2_vht	Gen2 VHT	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	he	HE	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	live_regulatory_owner	Gen3 and Sc live regulatory-policy owner	feature	drivers/wireless/specification/iwlwifi.md	1556
+iwlwifi	ml_baid	Alternate ML BAID profile	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	mlo	MLO on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1557
+iwlwifi	multiple_rx_queues	Multiple RX queues	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	nss2	NSS2	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	p2p	P2P role	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	persistent_key_history	Persistent key history	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	platform_power_owner	Gen3 and Sc live platform TX-power enforcement owner	feature	drivers/wireless/specification/iwlwifi.md	1556
+iwlwifi	rss	Receive-side scaling	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	sched_scan_offload	Scheduled-scan (PNO/net-detect) firmware offload	feature	drivers/wireless/specification/iwlwifi.md	1557
+iwlwifi	six_ghz	6GHz operation on applicable 6E/7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1557
+iwlwifi	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	width_160	160MHz operation on applicable profiles	feature	drivers/wireless/specification/iwlwifi.md	1557
+iwlwifi	width_320	320MHz operation on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1557
+iwlwifi	wow	Wake on WLAN	feature	drivers/wireless/specification/iwlwifi.md	1555
 mt76	ap_mode	Access Point mode (mt792x_init_wiphy NL80211_IFTYPE_AP)	feature	drivers/wireless/specification/mt7921.md	1315
 mt76	associated_active_scan	Active scanning while associated	feature	drivers/wireless/specification/mt7921.md	1322
 mt76	colocated_6ghz_scan	Colocated 6 GHz scanning	feature	drivers/wireless/specification/mt7921.md	1268

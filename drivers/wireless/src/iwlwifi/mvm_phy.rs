@@ -21,8 +21,18 @@ pub(super) struct Context {
     /// Extra tag5 bits the selected offer could use (`QOS_TIDS` on WMM,
     /// `TX_LDPC`/`TX_STBC` when the observed AP and NVM permit them).
     pub available: u16,
+    /// Secondary channel of the observed AP's 20/40MHz operation, when
+    /// `HT40` is available for this offer.
+    pub secondary: Option<u8>,
+    /// Primary channel of the selected offer.
+    pub primary: u8,
 }
 impl Context {
+    /// The 40MHz secondary channel once a signed `HT40` program is granted.
+    pub fn span(&self) -> Option<u8> {
+        self.secondary
+            .filter(|_| self.features & feature::HT40 != 0)
+    }
     pub fn emission(&self) -> Emission {
         if self.features != 0 {
             let mut bits = self.features;
@@ -61,6 +71,9 @@ impl Context {
             rx_stbc: false,
             tx_ldpc: false,
             tx_stbc: false,
+            width40: false,
+            tx_sgi40: false,
+            rx_sgi40: false,
             protection: 0,
             dynamic_smps: false,
             ampdu_exp: 0,
@@ -69,9 +82,25 @@ impl Context {
         };
         if let Some(phy) = plan.negotiated_phy() {
             let ht = phy.ht();
-            if phy.width() != narf_wireless::association::phy::Width::Twenty {
-                return Err("MVM HT20 response selected unsupported width");
+            // The PHY context was prepared with the BSS width before
+            // authentication; the response must select exactly that width.
+            let expected = match self.span() {
+                Some(secondary) => {
+                    let mut span = [ht.operation().primary(), secondary];
+                    span.sort_unstable();
+                    if phy.occupied_channels() != span {
+                        return Err("MVM HT40 response changed the prepared 40MHz span");
+                    }
+                    narf_wireless::association::phy::Width::Forty
+                }
+                None => narf_wireless::association::phy::Width::Twenty,
+            };
+            if phy.width() != expected {
+                return Err("MVM HT response selected a width other than the prepared PHY");
             }
+            profile.width40 = expected == narf_wireless::association::phy::Width::Forty;
+            profile.tx_sgi40 = profile.width40 && ht.tx_sgi40();
+            profile.rx_sgi40 = profile.width40 && ht.rx_sgi40();
             profile.ht = true;
             profile.tx_mcs = ht.tx_mcs()[0];
             profile.tx_sgi = ht.tx_sgi20();
@@ -110,6 +139,10 @@ pub(super) struct Profile {
     /// TX coding granted by a tag5 program and negotiated with the peer.
     pub tx_ldpc: bool,
     pub tx_stbc: bool,
+    /// Granted `HT40` operation on the negotiated 40MHz channel.
+    pub width40: bool,
+    pub tx_sgi40: bool,
+    pub rx_sgi40: bool,
     pub protection: u32,
     pub dynamic_smps: bool,
     pub ampdu_exp: u8,
@@ -129,8 +162,30 @@ pub(in crate::iwlwifi) fn local_ht() -> LocalHt {
 /// and TX STBC, which also sets the HT Tx STBC bit as Linux
 /// `iwl_init_ht_hw_capab` does for more than one TX chain.
 pub(in crate::iwlwifi) fn local_ht_for(features: u16) -> LocalHt {
-    LocalHt::siso20(true, true)
-        .with_ldpc(true, features & feature::TX_LDPC != 0)
+    let base = if features & feature::HT40 != 0 {
+        // iwl_init_ht_hw_capab for an ht40_bands band: SUP_WIDTH_20_40 and
+        // SGI_40 next to SGI_20.
+        let mut mcs = [0; 10];
+        mcs[0] = 255;
+        let gi = narf_wireless::association::phy::HtGi {
+            rx20: true,
+            tx20: true,
+            rx40: true,
+            tx40: true,
+        };
+        LocalHt::new(
+            mcs,
+            mcs,
+            narf_wireless::association::phy::HtWidth::TwentyForty,
+            gi,
+            0,
+            0,
+        )
+        .unwrap_or_else(|_| LocalHt::siso20(true, true))
+    } else {
+        LocalHt::siso20(true, true)
+    };
+    base.with_ldpc(true, features & feature::TX_LDPC != 0)
         .with_rx_stbc(true)
         .with_tx_stbc(features & feature::TX_STBC != 0)
 }
@@ -170,6 +225,8 @@ impl Profile {
             && ((u16::from_le_bytes([cap[0], cap[1]]) >> 2) & 3 == 1) == self.dynamic_smps
             && (!self.tx_ldpc || cap[0] & 1 != 0)
             && (!self.tx_stbc || cap[1] & 3 != 0)
+            && (!self.width40 || cap[0] & 2 != 0)
+            && (!self.tx_sgi40 || cap[0] & 64 != 0)
     }
     pub fn edca(&self, local: [u8; 6]) -> [u8; 208] {
         let mut out = [0; 208];
@@ -201,6 +258,7 @@ impl Profile {
             &mut out,
             20,
             (1 << 4)
+                | (u32::from(self.width40) << 26) // STA_FLG_FAT_EN_40MHZ
                 | if self.ht {
                     (u32::from(self.dynamic_smps) << 17)
                         | (u32::from(self.ampdu_exp) << 19)
@@ -218,6 +276,8 @@ impl Profile {
             _ => return Err("unsupported MVM PHY TLC API"),
         };
         let mut out = alloc::vec![0;length];
+        // rs_fw_bw_from_sta_bw: IWL_TLC_MNG_CH_WIDTH_40MHZ.
+        out[4] = u8::from(self.width40);
         out[5] = u8::from(self.ht);
         out[6] = chains;
         // rs_fw_get_config_flags: STBC bit0, LDPC bit1.
@@ -229,7 +289,9 @@ impl Profile {
         put16(&mut out, 10, rates);
         put16(&mut out, 12, u16::from(self.tx_mcs));
         // v2/3 SGI byte22; v4 byte7. A-MSDU and all NSS2/width>20 rates0.
-        out[if version == 4 { 7 } else { 22 }] = u8::from(self.tx_sgi);
+        // rs_fw_sgi_cw_support: BIT(20MHz) | BIT(40MHz).
+        out[if version == 4 { 7 } else { 22 }] =
+            u8::from(self.tx_sgi) | u8::from(self.tx_sgi40) << 1;
         Ok(out)
     }
     pub fn rx_rate(&self, payload: &[u8]) -> bool {
@@ -240,10 +302,19 @@ impl Profile {
         // rates-v2 (fw/api/rs.h RATE_MCS_LDPC_POS 16, RATE_MCS_STBC_POS 17):
         // accepted only as the receive coding this station advertised.
         let coding = (u32::from(self.rx_ldpc) << 16) | (u32::from(self.rx_stbc) << 17);
+        // RATE_MCS_CHAN_WIDTH (bits 11..13): 20MHz, or 40MHz on a granted
+        // HT40 channel; SGI is accepted per the advertised width.
+        let wide = (r >> 11) & 7;
+        let sgi = if wide == 1 {
+            self.rx_sgi40
+        } else {
+            self.rx_sgi
+        };
         self.ht
             && (r >> 8) & 7 == 2
-            && r & (0xf8 | (7 << 11) | ((15 << 16) & !coding) | (3 << 23)) == 0
-            && ((r >> 20) & 7 == 0 || self.rx_sgi && (r >> 20) & 7 == 1)
+            && (wide == 0 || self.width40 && wide == 1)
+            && r & (0xf8 | ((15 << 16) & !coding) | (3 << 23)) == 0
+            && ((r >> 20) & 7 == 0 || sgi && (r >> 20) & 7 == 1)
     }
 }
 impl super::Owner {
@@ -352,8 +423,13 @@ impl super::Owner {
         if !self.supports_native_ht20() {
             return Err("MVM native HT20 contract unavailable");
         }
-        LocalPhy::ht20(local_ht_for(self.power.phy.features))
-            .map_err(|_| "MVM local HT20 profile invalid")
+        let local = local_ht_for(self.power.phy.features);
+        if self.power.phy.features & feature::HT40 != 0 {
+            LocalPhy::ht40(local)
+        } else {
+            LocalPhy::ht20(local)
+        }
+        .map_err(|_| "MVM local HT profile invalid")
     }
     pub(super) fn station_plan(
         &self,
@@ -411,6 +487,14 @@ impl super::Owner {
             .and_then(|p| p.ht_capability());
         let chains = self.nvm.as_ref().map_or(0, |n| n.tx_chains);
         let mut available = 0;
+        let secondary = if selected {
+            self.ht40_secondary(&bss, ap_ht)
+        } else {
+            None
+        };
+        if secondary.is_some() {
+            available |= feature::HT40;
+        }
         if selected {
             available |= feature::QOS_TIDS;
             if let Some(cap) = ap_ht {
@@ -427,10 +511,61 @@ impl super::Owner {
         self.power.phy = Context {
             offered: if selected { wmm } else { None },
             available,
+            secondary,
+            primary: channel,
             ..Context::default()
         };
         self.power.phy.ba.selected = ba;
         Ok(())
+    }
+    /// The secondary channel of an observed 20/40MHz BSS this NVM can
+    /// operate (mac80211 `ieee80211_determine_ap_chan` from HT Operation;
+    /// AP Supported Channel Width Set; Linux 22000 `ht40_bands` cover 2.4
+    /// and 5GHz, and NVM_CHANNEL_40MHZ must mark both subchannels).
+    fn ht40_secondary(&self, bss: &Bss, ap_cap: Option<[u8; 26]>) -> Option<u8> {
+        let ap =
+            narf_wireless::association::phy::ApElements::parse(&bss.information_elements).ok()?;
+        let op = ap.ht_operation()?;
+        if ap_cap?[0] & 2 == 0 || op[0] != bss.channel || op[1] & 4 == 0 {
+            return None;
+        }
+        let secondary = match op[1] & 3 {
+            1 => bss.channel.checked_add(4)?,
+            3 => bss.channel.checked_sub(4)?,
+            _ => return None,
+        };
+        let nvm = self.nvm.as_ref()?;
+        let permissions = self
+            .scan
+            .permissions
+            .as_ref()
+            .or(self.power.nvm_permissions.as_ref())?;
+        let wide = |ch: u8| {
+            super::super::station_api::channel_index(ch)
+                .and_then(|index| permissions.get(index))
+                .is_some_and(|flags| flags & 0x201 == 0x201)
+        };
+        (nvm.channels.contains(&secondary)
+            && bss.channel != 14
+            && secondary != 14
+            && (bss.channel <= 14) == (secondary <= 14)
+            && wide(bss.channel)
+            && wide(secondary))
+        .then_some(secondary)
+    }
+    /// Drop `HT40` from the offer when the current host policy does not
+    /// permit the whole 40MHz span; mac80211 then keeps the 20MHz chandef
+    /// (`ieee80211_chandef_downgrade`).
+    pub(in crate::iwlwifi) fn restrict_offer(
+        &mut self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) {
+        if let Some(secondary) = self.power.phy.secondary {
+            if super::power::span_power(domain, self.power.phy.primary, Some(secondary)).is_none() {
+                self.power.phy.secondary = None;
+                self.power.phy.available &= !feature::HT40;
+            }
+        }
     }
     pub(in crate::iwlwifi) fn station_power_request(
         &mut self,

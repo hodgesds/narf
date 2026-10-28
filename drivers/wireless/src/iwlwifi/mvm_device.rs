@@ -625,6 +625,7 @@ impl Device {
                     &request.elements,
                     request.credential.mode(),
                 )?;
+                owner.restrict_offer(&(self.environment.policy)()?);
                 let (source, binding) = (self.environment.power)(owner)?;
                 owner
                     .station_join(

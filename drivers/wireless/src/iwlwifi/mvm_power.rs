@@ -49,8 +49,11 @@ pub(in crate::iwlwifi) mod feature {
     /// HT TX STBC from two transmit chains toward a peer with Rx STBC
     /// (`IWL_TLC_MNG_CFG_FLAGS_STBC_MSK`, HT Tx STBC advertised).
     pub const TX_STBC: u16 = 1 << 4;
+    /// HT 20/40MHz operation on the AP's secondary channel: a 40MHz PHY
+    /// context, `STA_FLG_FAT_EN_40MHZ` and TLC `max_ch_width` 40MHz.
+    pub const HT40: u16 = 1 << 5;
     /// Every bit this driver can emit; other bits are refused.
-    pub const KNOWN: u16 = BA | NESTED_BA | QOS_TIDS | TX_LDPC | TX_STBC;
+    pub const KNOWN: u16 = BA | NESTED_BA | QOS_TIDS | TX_LDPC | TX_STBC | HT40;
 }
 
 impl Emission {
@@ -112,18 +115,60 @@ pub(super) struct Prepared {
     maximum: i16,
     gain: i16,
     channel: u8,
+    /// The secondary channel of a granted 40MHz operation; every power
+    /// decision then covers the whole occupied span.
+    span: Option<u8>,
     applied: Option<i16>,
     pub(super) active_link: Option<super::link::ActiveLinkStatus>,
     pub(super) mlme: super::assoc::Context,
     pub(super) stop: Option<Arc<AtomicBool>>,
 }
 
+/// Host power for the primary channel, or for a 40MHz span: the lower of
+/// both 20MHz subchannels and of the rules covering the whole 40MHz
+/// interval, each of which must permit a 40MHz bandwidth and initiation
+/// (the conservative single-rule form of cfg80211 `reg_does_bw_fit`).
+pub(super) fn span_power(domain: &RegulatoryDomain, channel: u8, span: Option<u8>) -> Option<i8> {
+    use super::super::connection::host_channel_power;
+    let primary = host_channel_power(domain, channel, true)?;
+    let Some(secondary) = span else {
+        return Some(primary);
+    };
+    if channel.abs_diff(secondary) != 4 || (channel <= 14) != (secondary <= 14) {
+        return None;
+    }
+    let mut power = primary.min(host_channel_power(domain, secondary, true)?);
+    let base = if channel <= 14 { 2407 } else { 5000 };
+    let center = base + 5 * (u32::from(channel) + u32::from(secondary)) / 2;
+    let (low, high) = (center - 20, center + 20);
+    let mut covering = false;
+    for rule in &domain.rules {
+        if rule.freq_end_mhz <= low || rule.freq_start_mhz >= high {
+            continue;
+        }
+        if rule.freq_end_mhz <= rule.freq_start_mhz
+            || rule.max_bandwidth_mhz < 40
+            || rule.flags.contains(narf_wireless::reg::RegFlags::NO_IR)
+        {
+            return None;
+        }
+        covering |= rule.freq_start_mhz <= low && rule.freq_end_mhz >= high;
+        power = power.min(rule.max_power_dbm);
+    }
+    covering.then_some(power)
+}
+
 impl Prepared {
+    /// Bind the 40MHz span of a granted HT40 program.
+    pub(super) fn with_span(mut self, span: Option<u8>) -> Self {
+        self.span = span;
+        self
+    }
     pub(super) fn host_ceiling(&self, domain: &RegulatoryDomain) -> Result<i16, &'static str> {
         if !self.source.current() || !domain.country_code.iter().all(u8::is_ascii_uppercase) {
             return Err("MVM platform power authority or host policy is no longer valid");
         }
-        let power = super::super::connection::host_channel_power(domain, self.channel, true)
+        let power = span_power(domain, self.channel, self.span)
             .ok_or("MVM current host channel prohibits initial transmit-power preparation")?;
         let applied = (i16::from(power) * 8)
             .checked_sub(self.gain)
@@ -192,6 +237,7 @@ pub(super) fn parse_for(
         maximum: values.maximum,
         gain: values.gain,
         channel,
+        span: None,
         applied: None,
         active_link: None,
         mlme: super::assoc::Context::default(),
@@ -256,6 +302,7 @@ pub(in crate::iwlwifi) struct Fence {
     maximum: i16,
     gain: i16,
     channel: u8,
+    span: Option<u8>,
     applied: i16,
     stop: Option<Arc<AtomicBool>>,
 }
@@ -286,9 +333,8 @@ impl Fence {
                     {
                         return Err("MVM current station publication is closed");
                     }
-                    let power =
-                        super::super::connection::host_channel_power(self.domain, f.channel, true)
-                            .ok_or("MVM current publication channel prohibited")?;
+                    let power = span_power(self.domain, f.channel, f.span)
+                        .ok_or("MVM current publication channel prohibited")?;
                     let ceiling = (i16::from(power) * 8)
                         .checked_sub(f.gain)
                         .ok_or("MVM current publication power overflow")?
@@ -316,6 +362,7 @@ impl Prepared {
             maximum: self.maximum,
             gain: self.gain,
             channel: self.channel,
+            span: self.span,
             applied: self.applied.ok_or("MVM power not acknowledged")?,
             stop: self.stop.clone(),
         })
@@ -517,10 +564,11 @@ impl Owner {
                 channel,
                 self.power.phy.emission(),
             )?
-        };
+        }
+        .with_span(self.power.phy.span());
         let domain = policy()?;
         if !domain.country_code.iter().all(u8::is_ascii_uppercase)
-            || super::super::connection::host_channel_power(&domain, channel, true).is_none()
+            || span_power(&domain, channel, self.power.phy.span()).is_none()
         {
             return Err("MVM platform power prohibited by current host policy");
         }
@@ -574,6 +622,17 @@ impl Owner {
             return Err(
                 "MVM current firmware channel prohibits initial transmit-power preparation",
             );
+        }
+        if let Some(secondary) = prepared.span {
+            // NVM_CHANNEL_40MHZ (bit 9) on both subchannels, and the
+            // secondary carries the same transmit permissions.
+            let wide = super::super::station_api::channel_index(secondary)
+                .and_then(|index| permissions.get(index).copied())
+                .ok_or("MVM current 40MHz secondary absent from firmware")?;
+            let required = required | (1 << 9);
+            if flags & required != required || wide & required != required || wide & (1 << 4) != 0 {
+                return Err("MVM current firmware channel prohibits the 40MHz span");
+            }
         }
         prepared.host_ceiling(domain)
     }
