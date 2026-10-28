@@ -42,9 +42,20 @@
 //!   (#829)
 //!
 //! Multi-LUN devices bind one [`MscDevice`] per LUN after a
-//! GET MAX LUN probe at attach (#831). Reset Recovery (§5.3) is
-//! deferred to the error-recovery work (#830); UAS (USB Attached
-//! SCSI) remains deferred — no issue in the MSC family covers it.
+//! GET MAX LUN probe at attach (#831).
+//!
+//! ## Error recovery (#830)
+//!
+//! A failed command is not the end of the conversation. Within
+//! an exchange, a stalled bulk pipe is cleared (host Reset
+//! Endpoint + device CLEAR_FEATURE) and the status phase still
+//! runs. At the command level, a Command Failed status drains
+//! REQUEST SENSE and retries once for the transient conditions
+//! (UNIT ATTENTION, spin-up), a Phase Error or an unparseable
+//! CSW triggers Reset Recovery (§5.3) and one retry, and a
+//! durable failure surfaces with its sense data attached
+//! ([`MscError::Sense`]). UAS (USB Attached SCSI) remains
+//! deferred — no issue in the MSC family covers it.
 
 use alloc::vec::Vec;
 
@@ -154,6 +165,13 @@ pub enum MscError {
     BadCsw,
     /// CSW reported a non-success status (1 = Failed, 2 = Phase Error).
     CswStatus(u8),
+    /// The command failed with CHECK CONDITION and the follow-up
+    /// REQUEST SENSE returned this fixed-format sense data
+    /// (SPC-4 §4.5) — the device's own account of why: sense key,
+    /// additional sense code, and qualifier. Surfaced instead of
+    /// a bare status byte so a medium error, a write-protect, or
+    /// an absent medium is distinguishable upstream (#830).
+    Sense(narf_block::scsi::FixedSense),
     /// Underlying xHCI error.
     Xhci(xhci::XhciError),
     /// Caller-supplied buffer is the wrong size.
@@ -508,6 +526,50 @@ pub async fn attach_all_luns<T: BotTransport>(
     Ok(devs)
 }
 
+/// Which of the two bulk pipes a recovery step addresses.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BotPipe {
+    In,
+    Out,
+}
+
+/// xHCI completion code 6 — Stall Error (xHCI §6.4.5, the
+/// completion-code table): the device answered a bulk transfer
+/// with a STALL handshake and halted the endpoint. Bulk
+/// completions reach this driver as `XhciError::CmdFailed(code)`.
+const XHCI_CC_STALL: u8 = 6;
+
+/// Did this error come from a bulk endpoint STALL? That single
+/// fact drives the whole recovery shape (#830): a stall is
+/// cleared in-exchange and the conversation continues, where
+/// other transport errors end the command.
+fn is_stall(err: &MscError) -> bool {
+    matches!(
+        err,
+        MscError::Xhci(xhci::XhciError::CmdFailed(XHCI_CC_STALL))
+    )
+}
+
+/// Is this sense a transient condition the command should be
+/// retried after, having drained it by reading the sense?
+/// Exactly two cases (SPC-4 sense keys / ASC table):
+///
+/// - UNIT ATTENTION (key 0x6) — a power-on, reset, or
+///   media-change event; the sense read that reported it clears
+///   it, and the retried command runs against a settled unit.
+/// - NOT READY (key 0x2) with ASC 0x04 — "logical unit in
+///   process of becoming ready", i.e. a disk still spinning up.
+///
+/// Everything else — MEDIUM ERROR, DATA PROTECT, NOT READY with
+/// ASC 0x3A "medium not present" — is a durable answer about the
+/// medium, and retrying would just ask the same question again.
+fn sense_is_retryable(sense: &narf_block::scsi::FixedSense) -> bool {
+    sense.response_code == narf_block::scsi::FixedSense::RESPONSE_CODE_CURRENT
+        && (sense.sense_key == narf_block::scsi::SENSE_KEY_UNIT_ATTENTION
+            || (sense.sense_key == narf_block::scsi::SENSE_KEY_NOT_READY
+                && sense.additional_sense_code == 0x04))
+}
+
 impl MscDevice {
     /// Bind one LUN of an already addressed + configured slot.
     /// Issues READ CAPACITY(10) — escalating to READ CAPACITY(16)
@@ -590,21 +652,104 @@ impl MscDevice {
         Ok((status, resid))
     }
 
-    /// Run a SCSI command with no data stage. Used by TEST UNIT READY
-    /// and SYNCHRONIZE CACHE(10).
-    async fn cmd_no_data<T: BotTransport>(&self, t: &T, cb: &[u8]) -> Result<(), MscError> {
+    /// [`Self::read_csw`] with the status phase's own stall
+    /// recovery: a device that has no CSW to give yet stalls
+    /// bulk-IN instead; clearing the pipe (the full host + device
+    /// halt clear) is what makes it produce the CSW, so clear and
+    /// read once more before giving up on the status phase.
+    async fn read_csw_resilient<T: BotTransport>(
+        &self,
+        t: &T,
+        expect_tag: u32,
+    ) -> Result<(u8, u32), MscError> {
+        match self.read_csw(t, expect_tag).await {
+            Ok(v) => Ok(v),
+            Err(e) if is_stall(&e) => {
+                self.clear_endpoint_halt(t, BotPipe::In).await;
+                self.read_csw(t, expect_tag).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Clear a halted bulk endpoint end to end, the pairing
+    /// `USBDevice::clear_endpoint_halt` established in this
+    /// crate: host side first (Reset Endpoint + Set TR Dequeue,
+    /// via the transport), then CLEAR_FEATURE(ENDPOINT_HALT) to
+    /// clear the device-side halt and reset its data toggle, so
+    /// host and device toggles restart together. Both steps are
+    /// best-effort — recovery code runs when the device is
+    /// already misbehaving, and the transfer that follows is the
+    /// verdict on whether the pipe is usable again.
+    async fn clear_endpoint_halt<T: BotTransport>(&self, t: &T, pipe: BotPipe) {
+        let (dci, ep_addr) = match pipe {
+            // DCI of IN endpoint n is 2n+1; of OUT endpoint n, 2n.
+            BotPipe::In => (self.bulk_in, 0x80 | ((self.bulk_in - 1) / 2)),
+            BotPipe::Out => (self.bulk_out, self.bulk_out / 2),
+        };
+        let _ = t.reset_halted_endpoint(self.slot_id, dci).await;
+        let _ = t
+            .control_out(
+                self.slot_id,
+                crate::control::RT_RECIP_ENDPOINT,
+                crate::control::REQ_CLEAR_FEATURE,
+                crate::control::FEATURE_ENDPOINT_HALT,
+                u16::from(ep_addr),
+                &[],
+            )
+            .await;
+    }
+
+    /// Reset Recovery (§5.3): the Mass Storage Reset class
+    /// request, then a halt clear on both bulk endpoints. The
+    /// spec's prescribed answer to a Phase Error — and to a CSW
+    /// so desynchronised it cannot be parsed, which is a phase
+    /// desync by another name. Best-effort throughout, like
+    /// [`Self::clear_endpoint_halt`].
+    async fn reset_recovery<T: BotTransport>(&self, t: &T) {
+        let _ = t
+            .control_out(
+                self.slot_id,
+                crate::control::RT_TYPE_CLASS | crate::control::RT_RECIP_INTERFACE,
+                BOT_MASS_STORAGE_RESET,
+                0,
+                u16::from(self.interface),
+                &[],
+            )
+            .await;
+        self.clear_endpoint_halt(t, BotPipe::In).await;
+        self.clear_endpoint_halt(t, BotPipe::Out).await;
+    }
+
+    /// One raw BOT exchange with no data stage: CBW, then CSW.
+    /// Stall recovery *within* the exchange (a stalled phase is
+    /// cleared and the status phase still runs) lives here;
+    /// command-level recovery (sense drain, Reset Recovery,
+    /// retry) lives in the `cmd_*` wrappers (#830).
+    async fn bot_no_data<T: BotTransport>(&self, t: &T, cb: &[u8]) -> Result<(), MscError> {
         t.resume_hub_port(self.hub_port).await;
         let tag = self.next_tag();
         let cbw = self.build_cbw(tag, 0, false, cb);
-        t.bulk_out(self.slot_id, self.bulk_out, &cbw).await?;
-        let (status, _) = self.read_csw(t, tag).await?;
+        match t.bulk_out(self.slot_id, self.bulk_out, &cbw).await {
+            Ok(_) => {}
+            Err(e) if is_stall(&e) => {
+                // The device stalled the CBW itself. Clear the
+                // OUT pipe and still run the status phase: a
+                // device that refuses a wrapper this way owes a
+                // CSW saying so.
+                self.clear_endpoint_halt(t, BotPipe::Out).await;
+            }
+            Err(e) => return Err(e),
+        }
+        let (status, _) = self.read_csw_resilient(t, tag).await?;
         check_csw_status(status)?;
         t.note_hub_activity(self.hub_port);
         Ok(())
     }
 
-    /// Run a SCSI command with a host-bound (IN) data stage.
-    async fn cmd_data_in<T: BotTransport>(
+    /// One raw BOT exchange with a host-bound (IN) data stage:
+    /// CBW, data, CSW. See [`Self::bot_no_data`] for the layering.
+    async fn bot_data_in<T: BotTransport>(
         &self,
         t: &T,
         cb: &[u8],
@@ -613,16 +758,37 @@ impl MscDevice {
         t.resume_hub_port(self.hub_port).await;
         let tag = self.next_tag();
         let cbw = self.build_cbw(tag, out.len() as u32, true, cb);
-        t.bulk_out(self.slot_id, self.bulk_out, &cbw).await?;
-        let n = t.bulk_in(self.slot_id, self.bulk_in, out).await?;
-        let (status, _) = self.read_csw(t, tag).await?;
+        let cbw_stalled = match t.bulk_out(self.slot_id, self.bulk_out, &cbw).await {
+            Ok(_) => false,
+            Err(e) if is_stall(&e) => {
+                self.clear_endpoint_halt(t, BotPipe::Out).await;
+                true
+            }
+            Err(e) => return Err(e),
+        };
+        let mut n = 0usize;
+        if !cbw_stalled {
+            match t.bulk_in(self.slot_id, self.bulk_in, out).await {
+                Ok(m) => n = m,
+                Err(e) if is_stall(&e) => {
+                    // The classic BOT failure: the device stalls
+                    // the data pipe instead of moving data. Clear
+                    // the pipe; the status phase then reports the
+                    // command's real outcome (and its sense).
+                    self.clear_endpoint_halt(t, BotPipe::In).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let (status, _) = self.read_csw_resilient(t, tag).await?;
         check_csw_status(status)?;
         t.note_hub_activity(self.hub_port);
         Ok(n)
     }
 
-    /// Run a SCSI command with a device-bound (OUT) data stage.
-    async fn cmd_data_out<T: BotTransport>(
+    /// One raw BOT exchange with a device-bound (OUT) data
+    /// stage: CBW, data, CSW. See [`Self::bot_no_data`].
+    async fn bot_data_out<T: BotTransport>(
         &self,
         t: &T,
         cb: &[u8],
@@ -631,12 +797,139 @@ impl MscDevice {
         t.resume_hub_port(self.hub_port).await;
         let tag = self.next_tag();
         let cbw = self.build_cbw(tag, data.len() as u32, false, cb);
-        t.bulk_out(self.slot_id, self.bulk_out, &cbw).await?;
-        let n = t.bulk_out(self.slot_id, self.bulk_out, data).await?;
-        let (status, _) = self.read_csw(t, tag).await?;
+        let cbw_stalled = match t.bulk_out(self.slot_id, self.bulk_out, &cbw).await {
+            Ok(_) => false,
+            Err(e) if is_stall(&e) => {
+                self.clear_endpoint_halt(t, BotPipe::Out).await;
+                true
+            }
+            Err(e) => return Err(e),
+        };
+        let mut n = 0usize;
+        if !cbw_stalled {
+            match t.bulk_out(self.slot_id, self.bulk_out, data).await {
+                Ok(m) => n = m,
+                Err(e) if is_stall(&e) => {
+                    self.clear_endpoint_halt(t, BotPipe::Out).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let (status, _) = self.read_csw_resilient(t, tag).await?;
         check_csw_status(status)?;
         t.note_hub_activity(self.hub_port);
         Ok(n)
+    }
+
+    /// REQUEST SENSE as the recovery path uses it: one raw
+    /// exchange (no recursive recovery), parsed into fixed-format
+    /// sense. Reading the sense is itself the drain — a reported
+    /// UNIT ATTENTION condition is cleared by the device once
+    /// its sense data has been delivered.
+    async fn request_sense_raw<T: BotTransport>(
+        &self,
+        t: &T,
+    ) -> Result<narf_block::scsi::FixedSense, MscError> {
+        // ALLOCATION LENGTH = 18 (fixed-format sense, SPC-4 Table 26).
+        let cb = [SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0];
+        let mut out = [0u8; 18];
+        let n = self.bot_data_in(t, &cb, &mut out).await?;
+        if n < 18 {
+            return Err(MscError::BadLength);
+        }
+        narf_block::scsi::FixedSense::parse(&out).map_err(|_| MscError::BadLength)
+    }
+
+    /// Command-level recovery for one failed BOT attempt (#830).
+    /// `Ok(())` means "recovery performed — retry the attempt
+    /// once"; `Err` is the final error to surface. The policy,
+    /// per failure class:
+    ///
+    /// - **CSW status 1 (Command Failed):** fetch REQUEST SENSE.
+    ///   UNIT ATTENTION (the power-on / reset / media-change
+    ///   event every cheap bridge raises on first access) and
+    ///   NOT READY / "becoming ready" (a disk still spinning up)
+    ///   are transient by definition — the sense read drained
+    ///   the condition, so retry. Anything else (medium error,
+    ///   write-protect, absent medium, …) is the answer, not a
+    ///   retry cue: surface it as [`MscError::Sense`].
+    /// - **CSW status 2 (Phase Error) or an unparseable CSW:**
+    ///   Reset Recovery (§5.3), then retry.
+    /// - **Transport errors** (timeout, controller failure): no
+    ///   spec recovery exists; surface as-is.
+    ///
+    /// If the sense fetch itself fails, the *original* command
+    /// failure is surfaced — the recovery's failure must not
+    /// mask why the command died.
+    async fn recover_from_failure<T: BotTransport>(
+        &self,
+        t: &T,
+        err: MscError,
+    ) -> Result<(), MscError> {
+        match err {
+            MscError::CswStatus(1) => match self.request_sense_raw(t).await {
+                Ok(sense) => {
+                    if sense_is_retryable(&sense) {
+                        Ok(())
+                    } else {
+                        Err(MscError::Sense(sense))
+                    }
+                }
+                Err(_) => Err(err),
+            },
+            MscError::CswStatus(2) | MscError::BadCsw => {
+                self.reset_recovery(t).await;
+                Ok(())
+            }
+            other => Err(other),
+        }
+    }
+
+    /// Run a SCSI command with no data stage, with command-level
+    /// recovery (#830): one raw attempt, recovery, at most one
+    /// retry. Used by TEST UNIT READY and SYNCHRONIZE CACHE(10).
+    async fn cmd_no_data<T: BotTransport>(&self, t: &T, cb: &[u8]) -> Result<(), MscError> {
+        match self.bot_no_data(t, cb).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.recover_from_failure(t, e).await?;
+                self.bot_no_data(t, cb).await
+            }
+        }
+    }
+
+    /// Run a SCSI command with a host-bound (IN) data stage,
+    /// with recovery as in [`Self::cmd_no_data`].
+    async fn cmd_data_in<T: BotTransport>(
+        &self,
+        t: &T,
+        cb: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, MscError> {
+        match self.bot_data_in(t, cb, out).await {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                self.recover_from_failure(t, e).await?;
+                self.bot_data_in(t, cb, out).await
+            }
+        }
+    }
+
+    /// Run a SCSI command with a device-bound (OUT) data stage,
+    /// with recovery as in [`Self::cmd_no_data`].
+    async fn cmd_data_out<T: BotTransport>(
+        &self,
+        t: &T,
+        cb: &[u8],
+        data: &[u8],
+    ) -> Result<usize, MscError> {
+        match self.bot_data_out(t, cb, data).await {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                self.recover_from_failure(t, e).await?;
+                self.bot_data_out(t, cb, data).await
+            }
+        }
     }
 
     /// `TEST UNIT READY` (SBC-3 §5.34). 6-byte command, no data.
@@ -653,11 +946,14 @@ impl MscDevice {
     /// returns CSW status 1 (Failed) — the sense data carries the
     /// SENSE KEY, ASC, and ASCQ that describe the error. Callers
     /// interested in CHECK CONDITION detail should call this next.
+    /// This runs as one raw exchange: REQUEST SENSE *is* the
+    /// recovery tool, so it does not itself re-enter the
+    /// sense-drain recovery in the `cmd_*` funnels.
     pub async fn request_sense<T: BotTransport>(&self, t: &T) -> Result<[u8; 18], MscError> {
         // ALLOCATION LENGTH = 18 (fixed-format sense, SPC-4 Table 26).
         let cb = [SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0];
         let mut out = [0u8; 18];
-        let n = self.cmd_data_in(t, &cb, &mut out).await?;
+        let n = self.bot_data_in(t, &cb, &mut out).await?;
         if n < 18 {
             return Err(MscError::BadLength);
         }
