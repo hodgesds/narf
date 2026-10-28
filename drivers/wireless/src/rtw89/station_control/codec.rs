@@ -139,6 +139,23 @@ pub(super) fn edca(ac: u8, short: bool) -> [u8; 12] {
 /// bitmap in hardware order (CCK1,2,5.5,11, OFDM6..54). No calibrated RSSI
 /// exists, so the RSSI floor keeps every rate and `init_rate_lv` is 0, as
 /// Linux does for an RSSI of 0/1.
+/// `rtw89_fw_h2c_ba_cam` (BA CAM v0, RTL8852B): W0 VALID, INIT_REQ (hardware
+/// takes the SSN), ENTRY_IDX[3:2], TID[7:4], MACID[15:8], BMAP_SIZE[19:16]
+/// (0 for <=64), SSN[31:20]; W1 unused. An invalidation carries only MACID
+/// and ENTRY_IDX.
+pub(super) fn ba_cam(valid: bool, entry: u8, tid: u8, buf: u16, ssn: u16) -> [u8; 8] {
+    let mut bytes = [0; 8];
+    let mut w0 = u32::from(entry & 3) << 2; // MACID0
+    if valid {
+        w0 |= 1
+            | 1 << 1
+            | u32::from(tid & 0xf) << 4
+            | if buf > 64 { 4 << 16 } else { 0 }
+            | u32::from(ssn & 0xfff) << 20;
+    }
+    word(&mut bytes, 0, w0);
+    bytes
+}
 /// Negotiated HT facts consumed by `rtw89_phy_ra_sta_update`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::rtw89) struct HtRa {

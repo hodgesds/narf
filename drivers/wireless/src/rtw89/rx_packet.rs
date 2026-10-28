@@ -34,7 +34,10 @@ pub(super) struct Descriptor {
     pub crc_error: bool,
     pub icv_error: bool,
     pub hardware_decrypted: bool,
+    /// `AX_RXD_AMSDU` / `AX_RXD_AMSDU_CUT`: hardware A-MSDU handling.
     pub aggregate: bool,
+    /// `AX_RXD_AMPDU`: MPDU delivered from an A-MPDU.
+    pub ampdu: bool,
 }
 impl Descriptor {
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
@@ -65,7 +68,8 @@ impl Descriptor {
             crc_error: d3 & (1 << 9) != 0,
             icv_error: d3 & (1 << 10) != 0,
             hardware_decrypted: d3 & 4 != 0,
-            aggregate: d3 & ((1 << 3) | (1 << 5) | (1 << 6)) != 0,
+            aggregate: d3 & ((1 << 5) | (1 << 6)) != 0,
+            ampdu: d3 & (1 << 3) != 0,
         })
     }
 }

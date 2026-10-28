@@ -42,6 +42,17 @@ pub(super) unsafe trait Io: Send {
     ) -> Result<(), power::Error> {
         Err(power::Error::Unsupported)
     }
+    /// `rtw89_fw_h2c_ba_cam` for a recipient session start/stop.
+    async fn station_configure_ba(
+        &mut self,
+        _: bool,
+        _: u8,
+        _: u16,
+        _: u16,
+        _: &Admission,
+    ) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
     /// Signed HT20 program (`Program::Ht`).
     fn station_ht_allowed(&mut self) -> Result<bool, power::Error> {
         Ok(false)
@@ -195,6 +206,12 @@ enum Kind {
     Association,
     Security,
     Data,
+    /// Block Ack action frames: like data, a missing ACK is not fatal.
+    Action,
+}
+enum BaOp {
+    Start(super::block_ack::Request, u16),
+    Stop(u8),
 }
 struct Pending {
     id: u64,
@@ -244,6 +261,12 @@ pub(super) struct State {
     firmware_ra: bool,
     /// HT20 was negotiated for this association.
     ht: bool,
+    /// Recipient Block Ack sessions per TID.
+    ba: [Option<super::block_ack::Session<Mpdu>>; 8],
+    /// BA CAM programming awaiting the async owner.
+    ba_ops: VecDeque<BaOp>,
+    /// Queued ADDBA responses / DELBAs.
+    mgmt_out: VecDeque<Vec<u8>>,
     deadline: u64,
     last_peer: u64,
     last_now: u64,
@@ -286,6 +309,9 @@ impl State {
             qos_all: false,
             firmware_ra: false,
             ht: false,
+            ba: core::array::from_fn(|_| None),
+            ba_ops: VecDeque::new(),
+            mgmt_out: VecDeque::new(),
             deadline: 0,
             last_peer: 0,
             last_now: 0,
@@ -351,6 +377,7 @@ impl State {
         self.qos_all = false;
         self.firmware_ra = false;
         self.ht = false;
+        self.clear_block_ack();
         self.admission.close();
         self.established = false;
         self.phase = Phase::Stopped;
@@ -385,6 +412,7 @@ impl State {
         self.qos_all = false;
         self.firmware_ra = false;
         self.ht = false;
+        self.clear_block_ack();
         if let Some(security) = &mut self.security {
             security.fail();
         }
@@ -549,6 +577,194 @@ impl State {
         self.edca_pending = Some(offered);
         Ok(())
     }
+    fn clear_block_ack(&mut self) {
+        // Drop discards ownership only (shared Reorder contract).
+        self.ba = core::array::from_fn(|_| None);
+        self.ba_ops.clear();
+        self.mgmt_out.clear();
+    }
+    fn queue_incoming(&mut self, frames: Vec<Mpdu>) -> Result<(), Error> {
+        for frame in frames {
+            if self.incoming.len() == 64 {
+                return Err(Error::State);
+            }
+            self.incoming.push_back(frame);
+        }
+        Ok(())
+    }
+    /// mac80211 Block Ack receive steps for an open link: ADDBA/DELBA
+    /// actions, BlockAckReq and reorder admission of QoS DATA on a live
+    /// session. Returns the frame when it continues the ordinary path.
+    fn block_ack_rx(&mut self, frame: Mpdu, now: u64) -> Result<Option<Mpdu>, Error> {
+        use super::block_ack as ba;
+        let control = frame.bytes().first().is_some_and(|fc| fc & 0x0c == 0x04);
+        let Some(peer) = self.peer.as_ref().map(|p| p.bss.bssid) else {
+            return Ok((!control).then_some(frame));
+        };
+        if self.phase != Phase::Open {
+            return Ok((!control).then_some(frame));
+        }
+        let now_ns = now.saturating_mul(1_000_000);
+        if let Some(action) = ba::parse_action(frame.bytes(), self.own, peer) {
+            match action {
+                ba::Action::AddbaRequest(request) => {
+                    let (status, buf) = ba::decide(&request, self.ht);
+                    if status == ba::STATUS_SUCCESS {
+                        let tid = usize::from(request.tid);
+                        if self.ba[tid].take().is_some() {
+                            self.ba_ops.push_back(BaOp::Stop(request.tid));
+                        }
+                        self.ba_ops.push_back(BaOp::Start(request, buf));
+                    } else {
+                        self.mgmt_out.push_back(ba::addba_response(
+                            self.own,
+                            peer,
+                            &request,
+                            status,
+                            request.buf_size,
+                        ));
+                    }
+                }
+                ba::Action::Delba {
+                    tid,
+                    initiator: true,
+                    ..
+                } => {
+                    if self
+                        .ba
+                        .get_mut(usize::from(tid))
+                        .and_then(Option::take)
+                        .is_some()
+                    {
+                        self.ba_ops.push_back(BaOp::Stop(tid));
+                    }
+                }
+                _ => {}
+            }
+            return Ok(None);
+        }
+        if let Some((tid, ssn)) = ba::bar(frame.bytes(), self.own, peer) {
+            if let Some(session) = self.ba.get_mut(usize::from(tid)).and_then(Option::as_mut) {
+                session.last_ms = now;
+                let released = session.reorder.advance(ssn, now_ns).unwrap_or_default();
+                self.queue_incoming(released)?;
+            }
+            return Ok(None);
+        }
+        if control {
+            // Only BlockAckReq is consumed; other control frames carry no
+            // host state for this station.
+            return Ok(None);
+        }
+        if frame.bytes().get(10..16) == Some(&peer[..]) {
+            if let Some((tid, sequence)) = ba::qos_sequence(frame.bytes()) {
+                if let Some(session) = self.ba.get_mut(usize::from(tid)).and_then(Option::as_mut) {
+                    session.last_ms = now;
+                    // Old/duplicate sequence numbers are dropped (mac80211
+                    // ieee80211_sta_manage_reorder_buf).
+                    let released = session
+                        .reorder
+                        .push(sequence, now_ns, frame)
+                        .unwrap_or_default();
+                    self.queue_incoming(released)?;
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(frame))
+    }
+    /// Reorder release timer and session inactivity timeout
+    /// (`sta_rx_agg_reorder_timer_expired`, `sta_rx_agg_session_timer_expired`).
+    fn block_ack_tick(&mut self, now: u64) -> Result<(), Error> {
+        let now_ns = now.saturating_mul(1_000_000);
+        let peer = self.peer.as_ref().map(|p| p.bss.bssid);
+        for tid in 0..8u8 {
+            let Some(session) = self.ba[usize::from(tid)].as_mut() else {
+                continue;
+            };
+            let released = session.reorder.expire(now_ns).unwrap_or_default();
+            let idle_ms = (u64::from(session.timeout_tu) * 1024).div_ceil(1000);
+            let expired = session.timeout_tu != 0 && now.saturating_sub(session.last_ms) > idle_ms;
+            self.queue_incoming(released)?;
+            if expired {
+                self.ba[usize::from(tid)] = None;
+                self.ba_ops.push_back(BaOp::Stop(tid));
+                if let Some(peer) = peer {
+                    self.mgmt_out.push_back(super::block_ack::delba(
+                        self.own,
+                        peer,
+                        tid,
+                        super::block_ack::REASON_TIMEOUT,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Live Block Ack sessions (bitmap by TID).
+    pub(super) fn block_ack_sessions(&self) -> u8 {
+        self.ba
+            .iter()
+            .enumerate()
+            .fold(0, |m, (tid, s)| if s.is_some() { m | 1 << tid } else { m })
+    }
+    /// Work that needs awaited firmware receipts (EDCA, BA CAM).
+    pub(super) fn async_pending(&self) -> bool {
+        self.edca_pending() || self.phase == Phase::Open && !self.ba_ops.is_empty()
+    }
+    pub(super) async fn apply_async(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        if self.edca_pending() {
+            self.apply_edca(io).await?;
+        }
+        while let Some(op) = self.ba_ops.pop_front() {
+            if self.phase != Phase::Open {
+                return Err(Error::State);
+            }
+            let result = match op {
+                BaOp::Start(request, buf) => {
+                    let result = io
+                        .station_configure_ba(true, request.tid, buf, request.ssn, &self.admission)
+                        .await;
+                    if result.is_ok() {
+                        let mut reorder = narf_wireless::reorder::Reorder::new(
+                            buf as u8,
+                            super::block_ack::REORDER_TIMEOUT_NS,
+                        )
+                        .map_err(|_| Error::State)?;
+                        // mac80211 head_seq_num = start_seq_num.
+                        let now = self.now()?;
+                        let _ = reorder.advance(request.ssn, now.saturating_mul(1_000_000));
+                        self.ba[usize::from(request.tid)] = Some(super::block_ack::Session {
+                            reorder,
+                            timeout_tu: request.timeout,
+                            last_ms: now,
+                            ssn: request.ssn,
+                        });
+                        let peer = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                        self.mgmt_out.push_back(super::block_ack::addba_response(
+                            self.own,
+                            peer,
+                            &request,
+                            super::block_ack::STATUS_SUCCESS,
+                            buf,
+                        ));
+                    }
+                    result
+                }
+                BaOp::Stop(tid) => {
+                    io.station_configure_ba(false, tid, 0, 0, &self.admission)
+                        .await
+                }
+            };
+            if let Err(error) = result {
+                if !self.admission.teardown_pending() {
+                    self.fail(io);
+                }
+                return Err(Error::Native(error));
+            }
+        }
+        Ok(())
+    }
     pub(super) fn ht(&self) -> bool {
         self.ht
     }
@@ -600,7 +816,7 @@ impl State {
         if pending.id != delivery.id || pending.bytes != delivery.bytes {
             return Err(Error::State);
         }
-        if !delivery.radio_acknowledged && !matches!(pending.kind, Kind::Data) {
+        if !delivery.radio_acknowledged && !matches!(pending.kind, Kind::Data | Kind::Action) {
             return Err(Error::State);
         }
         if pending.kind == Kind::Security {
@@ -642,6 +858,10 @@ impl State {
                 if self.lost(&frame) {
                     return Err(Error::PeerLost);
                 }
+                let frame = match self.block_ack_rx(frame, now)? {
+                    Some(frame) => frame,
+                    None => continue,
+                };
                 self.cache(&frame, now);
                 if self.phase != Phase::Passive {
                     if self.incoming.len() == 64 {
@@ -758,6 +978,19 @@ impl State {
                     }
                 }
                 _ => {}
+            }
+        }
+        self.block_ack_tick(now)?;
+        if self.pending.is_none()
+            && self.delivered_reply.is_none()
+            && self.phase == Phase::Open
+            && self
+                .security
+                .as_ref()
+                .is_none_or(|s| s.pending_frame().is_none())
+        {
+            if let Some(frame) = self.mgmt_out.pop_front() {
+                self.transmit(io, frame, Kind::Action)?;
             }
         }
         if self.pending.is_none() && self.delivered_reply.is_none() {

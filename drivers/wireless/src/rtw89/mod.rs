@@ -48,6 +48,7 @@
 extern crate alloc;
 
 mod bdram;
+mod block_ack;
 mod bootstrap;
 pub mod btc;
 mod calibration_policy;

@@ -440,7 +440,25 @@ impl Core {
             Some(rx_packet::Event::Firmware(event)) => step.c2h = Some(event.bytes),
             // Without the signed HT program an HT PPDU is dropped exactly as
             // the assembler dropped every non-legacy rate before.
-            Some(rx_packet::Event::Wifi(meta, _)) if meta.rate > 11 && !self.ht => {}
+            Some(rx_packet::Event::Wifi(meta, _)) if (meta.rate > 11 || meta.ampdu) && !self.ht => {
+            }
+            // Linux forwards control frames to the host (RTW89_CTRL ->
+            // RTW89_FWD_TO_HOST). Those shorter than an ordinary header are
+            // surfaced from 16 bytes (PS-Poll/BAR); malformed ones are dropped.
+            Some(rx_packet::Event::Wifi(meta, bytes))
+                if bytes.first().is_some_and(|fc| fc & 0x0c == 0x04) =>
+            {
+                if !meta.crc_error
+                    && !meta.icv_error
+                    && !meta.hardware_decrypted
+                    && !meta.aggregate
+                    && meta.bandwidth == 0
+                    && (16..=format::MAX_MPDU).contains(&bytes.len())
+                    && meta.size == bytes.len() + 4
+                {
+                    step.frame = Some(Frame { bytes });
+                }
+            }
             Some(rx_packet::Event::Wifi(meta, bytes)) => {
                 if meta.crc_error
                     || meta.icv_error

@@ -99,6 +99,8 @@ pub(super) struct Peer {
     ht: Option<Vec<u8>>,
     /// Station association request carried an HT Capabilities element.
     pub(super) station_ht: bool,
+    /// Action frames sent by the station after authorization.
+    pub(super) actions: Vec<Vec<u8>>,
 }
 impl Peer {
     pub(super) fn new(protected: bool) -> Self {
@@ -134,6 +136,7 @@ impl Peer {
             tids: Vec::new(),
             ht: None,
             station_ht: false,
+            actions: Vec::new(),
         }
     }
     pub(super) fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
@@ -171,6 +174,10 @@ impl Peer {
     pub(super) fn react(&mut self, frame: &[u8]) -> Result<(Vec<Vec<u8>>, bool), &'static str> {
         if frame.len() < 24 || frame[4..10] != AP || frame[10..16] != self.plan.station {
             return Err("native AP peer identity");
+        }
+        if self.ap.phase() == ApPhase::Authorized && frame[0] == 0xd0 {
+            self.actions.push(frame.to_vec());
+            return Ok((Vec::new(), false));
         }
         if self.ap.phase() != ApPhase::Authorized || matches!(frame[0], 0 | 0xb0) {
             if frame[0] == 0 {
@@ -376,6 +383,21 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
     fn station_firmware_ra_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
         self.station_allowed()?;
         Ok(self.wmm && self.firmware_ra)
+    }
+    async fn station_configure_ba(
+        &mut self,
+        valid: bool,
+        tid: u8,
+        buf: u16,
+        ssn: u16,
+        admission: &crate::rtw89::station_control::Admission,
+    ) -> Result<(), crate::rtw89::power::Error> {
+        if valid && !self.ht {
+            return Err(crate::rtw89::power::Error::Unsupported);
+        }
+        self.controller
+            .configure_ba(&mut self.control, valid, tid, buf, ssn, admission)
+            .await
     }
     fn station_ht_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
         self.station_allowed()?;
@@ -1597,4 +1619,140 @@ fn smoke_rtw8852b_ht20_capability_ra_mcs_and_rx() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89/rates",
     smoke_rtw8852b_ht20_capability_ra_mcs_and_rx
+);
+
+fn ba_action(body: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0xd0, 0, 0, 0];
+    frame.extend_from_slice(&OWN);
+    frame.extend_from_slice(&AP);
+    frame.extend_from_slice(&AP);
+    frame.extend_from_slice(&[0x10, 0]);
+    frame.extend_from_slice(body);
+    frame
+}
+fn addba_request(tid: u8, buf: u16, ssn: u16) -> Vec<u8> {
+    let capab = 1u16 << 1 | u16::from(tid) << 2 | buf << 6;
+    let mut body = vec![3, 0, 5];
+    body.extend_from_slice(&capab.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&(ssn << 4).to_le_bytes());
+    ba_action(&body)
+}
+fn downlink_seq(h: &Harness, sequence: u16, tag: u8) -> Result<(Vec<u8>, Vec<u8>), &'static str> {
+    let reply = udp_ipv4(OWN, AP, h.plan.server_ip, h.plan.lease_ip, 9, 9, &[tag; 8]);
+    let mut wire = h.peer.lock().downlink(&reply)?;
+    wire[22..24].copy_from_slice(&(sequence << 4).to_le_bytes());
+    Ok((wire, reply))
+}
+fn smoke_rtw8852b_recipient_block_ack_reorders_and_tears_down() -> TestResult {
+    const RATES: [u8; 12] = [0x82, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+    let h = Harness::build(false, true, false, Some(&RATES), true);
+    if h.join().is_err() {
+        return TestResult::Fail("HT association failed");
+    }
+    let before = h.model(|io| io.control.packets().len());
+    if h.model(|io| io.packets.inject(&addba_request(0, 64, 100)))
+        .is_err()
+    {
+        return TestResult::Fail("fixture injection failed");
+    }
+    h.pump();
+    complete(h.device.apply_edca());
+    h.pump();
+    // rtw89_fw_h2c_ba_cam: VALID|INIT_REQ, entry0, TID0, MACID0, bmap 64, SSN100.
+    let cam = h.model(|io| io.control.packets()[before..].to_vec());
+    if !cam
+        .iter()
+        .any(|p| p.len() == 16 && p[8..12] == 0x0640_0003u32.to_le_bytes())
+    {
+        return TestResult::Fail("BA CAM H2C missing or differs");
+    }
+    let response = h.peer.lock().actions.last().cloned().unwrap_or_default();
+    // category3 action1 token5 status0, capab policy1|TID0|buf64, timeout0.
+    if response.get(24..) != Some(&[3, 1, 5, 0, 0, 0x02, 0x10, 0, 0][..]) {
+        return TestResult::Fail("ADDBA response differs");
+    }
+    // 101 is held until the hole at 100 fills, then both release in order.
+    let (Ok((w101, e101)), Ok((w100, e100))) = (downlink_seq(&h, 101, 1), downlink_seq(&h, 100, 0))
+    else {
+        return TestResult::Fail("fixture downlink failed");
+    };
+    if h.model(|io| io.packets.inject_rate(&w101, 0x87)).is_err() {
+        return TestResult::Fail("fixture injection failed");
+    }
+    h.pump();
+    if !h.received().is_empty() {
+        return TestResult::Fail("out-of-order MPDU delivered before the hole");
+    }
+    if h.model(|io| io.packets.inject_rate(&w100, 0x87)).is_err() {
+        return TestResult::Fail("fixture injection failed");
+    }
+    h.pump();
+    if h.received() != vec![e100, e101] {
+        return TestResult::Fail("reorder release order differs");
+    }
+    // 103 waits for 102; a BAR with SSN104 flushes it.
+    let Ok((w103, e103)) = downlink_seq(&h, 103, 3) else {
+        return TestResult::Fail("fixture downlink failed");
+    };
+    let _ = h.model(|io| io.packets.inject_rate(&w103, 0x87));
+    h.pump();
+    if !h.received().is_empty() {
+        return TestResult::Fail("MPDU after a hole delivered early");
+    }
+    let mut bar = vec![0x84, 0, 0, 0];
+    bar.extend_from_slice(&OWN);
+    bar.extend_from_slice(&AP);
+    bar.extend_from_slice(&(0b100u16).to_le_bytes());
+    bar.extend_from_slice(&(104u16 << 4).to_le_bytes());
+    let _ = h.model(|io| io.packets.inject(&bar));
+    h.pump();
+    if h.received() != vec![e103] {
+        return TestResult::Fail("BAR did not release the held MPDU");
+    }
+    // DELBA from the originator tears the session down (BA CAM invalidate).
+    let delba = ba_action(&[3, 2, 0x00, 0x08, 1, 0]); // TID0, initiator
+    let before = h.model(|io| io.control.packets().len());
+    let _ = h.model(|io| io.packets.inject(&delba));
+    h.pump();
+    complete(h.device.apply_edca());
+    let cam = h.model(|io| io.control.packets()[before..].to_vec());
+    if !cam
+        .iter()
+        .any(|p| p.len() == 16 && p[8..12] == [0, 0, 0, 0])
+        || h.closed()
+    {
+        return TestResult::Fail("DELBA did not invalidate the BA CAM entry");
+    }
+    // Without a session data is delivered directly again.
+    let Ok((w200, e200)) = downlink_seq(&h, 200, 4) else {
+        return TestResult::Fail("fixture downlink failed");
+    };
+    let _ = h.model(|io| io.packets.inject_rate(&w200, 0x87));
+    h.pump();
+    if h.received() != vec![e200] {
+        return TestResult::Fail("post-DELBA data not delivered");
+    }
+    drop(h);
+    // A non-HT link declines (status 37) without touching the BA CAM.
+    let h = Harness::rates_profile(false, true, Some(&RATES));
+    if h.join().is_err() {
+        return TestResult::Fail("legacy association failed");
+    }
+    let before = h.model(|io| io.control.packets().len());
+    let _ = h.model(|io| io.packets.inject(&addba_request(0, 64, 7)));
+    h.pump();
+    complete(h.device.apply_edca());
+    h.pump();
+    let response = h.peer.lock().actions.last().cloned().unwrap_or_default();
+    if response.get(27..29) != Some(&[37, 0][..])
+        || h.model(|io| io.control.packets().len()) != before
+    {
+        return TestResult::Fail("non-HT ADDBA not declined");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/block_ack",
+    smoke_rtw8852b_recipient_block_ack_reorders_and_tears_down
 );

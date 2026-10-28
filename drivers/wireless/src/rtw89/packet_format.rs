@@ -106,7 +106,9 @@ pub(super) fn classify(frame: &[u8], own: [u8; 6]) -> Result<Queue, Error> {
     }
     match frame[0] {
         // One non-QoS three-address station. Optional modes are not admitted.
-        0x00 | 0xb0 | 0xa0 | 0xc0 if frame[1] & (3 | 64) == 0 => Ok(Queue::Management),
+        // Association, authentication, disassociation, deauthentication and
+        // (Block Ack) action frames.
+        0x00 | 0xb0 | 0xa0 | 0xc0 | 0xd0 if frame[1] & (3 | 64) == 0 => Ok(Queue::Management),
         0x08 if frame[1] & 3 == 1 && unicast(&frame[4..10]) => Ok(Queue::Data),
         // QoS DATA: TID0..7, normal ack policy, no EOSP/A-MSDU/TXOP bits.
         0x88 if frame[1] & 3 == 1

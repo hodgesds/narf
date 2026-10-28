@@ -161,6 +161,8 @@ pub(super) struct Controller {
     phase: Phase,
     peer: Option<Peer>,
     admission: Option<Admission>,
+    /// Static BA CAM entries (`rtw8852b bacam_num = 2`): owning TID.
+    ba_cam: [Option<u8>; 2],
 }
 struct Attempt {
     admission: Admission,
@@ -189,6 +191,7 @@ impl Controller {
             phase: Phase::New,
             peer: None,
             admission: None,
+            ba_cam: [None; 2],
         })
     }
     pub(super) fn own(&self) -> [u8; 6] {
@@ -206,6 +209,7 @@ impl Controller {
     }
     pub(super) fn invalidate(&mut self) {
         self.phase = Phase::Failed;
+        self.ba_cam = [None; 2];
         if let Some(peer) = &self.peer {
             peer.invalidate();
         }
@@ -386,6 +390,59 @@ impl Controller {
             peer.current()?;
             peer.tids.store(1, Ordering::Release);
             peer.qos.store(true, Ordering::Release);
+            self.phase = Phase::Associated;
+            Ok(())
+        })?;
+        attempt.armed = false;
+        Ok(())
+    }
+    /// `rtw89_core_acquire_sta_ba_entry` / `rtw89_core_release_sta_ba_entry`
+    /// then `rtw89_fw_h2c_ba_cam` (DONE_ACK). When no static entry is
+    /// available (and the TID is not 0/5 for replacement) Linux sends
+    /// nothing: hardware creates a dynamic BA CAM entry itself.
+    pub(super) async fn configure_ba(
+        &mut self,
+        io: &mut impl Interface,
+        valid: bool,
+        tid: u8,
+        buf: u16,
+        ssn: u16,
+        admission: &Admission,
+    ) -> Result<(), Error> {
+        if tid > 7
+            || self.phase() != Phase::Associated
+            || self.admission.as_ref().is_none_or(|a| !a.same(admission))
+        {
+            return Err(Error::Terminal);
+        }
+        let peer = self.peer.clone().ok_or(Error::Terminal)?;
+        peer.current()?;
+        let entry = if valid {
+            match self.ba_cam.iter().position(Option::is_none) {
+                Some(index) => Some(index),
+                None if tid == 0 || tid == 5 => self
+                    .ba_cam
+                    .iter()
+                    .position(|owner| !matches!(owner, Some(0 | 5))),
+                None => None,
+            }
+        } else {
+            self.ba_cam.iter().position(|owner| *owner == Some(tid))
+        };
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        self.ba_cam[entry] = valid.then_some(tid);
+        self.phase = Phase::Failed;
+        let mut attempt = Attempt {
+            admission: admission.clone(),
+            peer: Some(peer.clone()),
+            armed: true,
+        };
+        let body = codec::ba_cam(valid, entry as u8, tid, buf, ssn);
+        command(io, 0xc, 0, &body, true, Some(admission)).await?;
+        admission.run(|| {
+            peer.current()?;
             self.phase = Phase::Associated;
             Ok(())
         })?;

@@ -1024,6 +1024,33 @@ HT program and otherwise drops them as before without closing the station.
 Smoke: `smoke_rtw8852b_ht20_capability_ra_mcs_and_rx` (HT element in the
 association request, HT RA mask, RA data TXWD, MCS7 RX, non-HT drop).
 
+### Recipient Block Ack and RX reordering
+
+On an open HT link the station acts as the mac80211 recipient for rtw89
+(`AMPDU_AGGREGATION` without `SUPPORTS_REORDERING_BUFFER`). `block_ack.rs`
+decodes unprotected Block Ack actions from the bound AP and admits ADDBA
+Requests like `__ieee80211_start_rx_ba_session`: non-HT links decline (37),
+delayed policy or a buffer above `max_rx_agg_num` 64 is invalid (38), a zero
+buffer means 64. A repeated request on a live TID replaces the session.
+The async owner then issues `rtw89_fw_h2c_ba_cam` through
+`Controller::configure_ba` (BA CAM v0: VALID, INIT_REQ, ENTRY_IDX, TID,
+MACID0, BMAP_SIZE, SSN; DONE_ACK) with the Linux static-entry policy (two
+entries, TID0/5 may replace another TID, otherwise no H2C because hardware
+creates a dynamic entry), creates the shared `Reorder` window with head SSN
+and 100ms release timeout (`HT_RX_REORDER_BUF_TIMEOUT`), and queues the
+ADDBA Response (immediate policy, no A-MSDU, request timeout). QoS DATA on a
+session TID is ordered before CCMP/replay; old or duplicate sequences are
+dropped; compressed single-TID BlockAckReq advances the window; DELBA from
+the originator drops the window and invalidates the CAM entry; a session
+timeout sends DELBA (reason 39) like `sta_rx_agg_session_timer_expired`.
+The RX assembler now surfaces `AX_RXD_AMPDU` subframes (hardware A-MSDU
+bits remain dropped); the packet owner admits them only under the HT
+program. Block Ack actions use a non-fatal ACK policy like data. Smokes:
+`drivers/wireless/rtw89/block_ack` (codecs, admission) and
+`smoke_rtw8852b_recipient_block_ack_reorders_and_tears_down` (BA CAM H2C,
+response, hole fill, BAR flush, DELBA, non-HT decline). Originator TX BA
+(CMAC AMPDU table) is tracked with TX A-MPDU as `block_ack_originator`.
+
 ### Live AP EDCA updates
 
 Bound peer beacons/probe responses on an open WMM link follow mac80211

@@ -98,14 +98,19 @@ impl<I: Io> Owner<I> {
     pub(super) fn station_edca_pending(&self) -> bool {
         self.station
             .as_ref()
-            .is_some_and(super::station::State::edca_pending)
+            .is_some_and(super::station::State::async_pending)
     }
     pub(super) async fn station_apply_edca(&mut self) -> Result<(), super::station::Error> {
         self.station
             .as_mut()
             .ok_or(super::station::Error::State)?
-            .apply_edca(&mut self.io)
+            .apply_async(&mut self.io)
             .await
+    }
+    pub(super) fn station_block_ack_sessions(&self) -> u8 {
+        self.station
+            .as_ref()
+            .map_or(0, super::station::State::block_ack_sessions)
     }
     /// Arm interrupt delivery for the started station.
     pub(super) fn station_irq(
