@@ -81,8 +81,8 @@ The supported software profile is a single station with Open/WPA2-PSK or
 WPA3-SAE security, 2.4/5 GHz, and legacy/HT/VHT operation up to 80 MHz.
 Gen2's separate §§3.17–3.19 profiles implement legacy20 and WMM/HT20/SISO
 Open/WPA2 station operation with distinct emitting-program qualifications.
-AP mode, 6 GHz/HE/EHT and system suspend/resume still require separate
-software implementations. They are not hardware-only
+AP mode and 6 GHz/HE/EHT still require separate software implementations;
+non-WoWLAN system suspend/resume is §3.29. They are not hardware-only
 acceptance gates and are not enabled by this profile's station tests.
 
 ## 3. Public interface and stage progression
@@ -91,7 +91,8 @@ acceptance gates and are not enabled by this profile's station tests.
 - **Stage 2**: CSR/PRPH mapping + APM init + ucode header parsing.
 - **Stage 3**: Owned Gen3 firmware loading and DMA ALIVE handshake. Gen2
   context-v1/RFH/TFH and retained API77 MVM boot ownership are implemented;
-  MVM station context/security/netdev ownership is integrated; recovery remains missing software.
+  MVM station context/security/netdev ownership is integrated; firmware recovery and
+  system suspend/resume are §3.29.
 - **Stage 4**: Interface traits, IPC ring integration, background
   RX/TX pumps, and the MLD station scan/association/data implementation.
 - **Stage 5 (In progress)**: First hardware boot/ALIVE, firmware init,
@@ -962,9 +963,9 @@ cached M4 and never re-add keys or reset replay. Pairwise rekey uses a fresh
 SNonce and keeps the old native PTK until the new M4 receipt. Unchanged GTKs
 retain their PN and take the maximum authenticated RSC. Old key IDs remain
 owned until replacement or close. Retired-material fingerprints survive data
-and association recreation. PTK reuse and active-exchange GTK rollback fail
-closed; §3.20 adds receipt-fenced same-peer/index RX-only GTK restoration at
-the maximum saved replay floor. Exhausting32 retained fingerprints fails closed.
+and association recreation. Active-exchange GTK rollback fails closed;
+§3.20 adds receipt-fenced RX-only GTK restoration at the maximum saved replay
+floor and §3.30 extends it to cross-peer/index GTKs and floor-safe PTK reuse. Exhausting32 retained fingerprints fails closed.
 
 `legacy_data_port_open()` now also admits a terminal protected RSNA owner.
 `transmit_legacy_ethernet()` submits protected native plaintext DMA for
@@ -1094,11 +1095,13 @@ retirement; it sends no over-air deauthentication and claims no RF quiescence.
 
 Native receive tracks valid bound AP beacons/data/EAPOL and closes admission
 after10 seconds without such evidence. A bound native AP disconnect is also
-terminal. The current profile has no automatic reset/recovery, suspend, roam
-or retry after a failed/ambiguous transaction. Existing retired-key fingerprint
+terminal. A failed station is restarted by §3.29 recovery before the next
+scan; system suspend/resume is also §3.29. There is no roam or in-place
+retry of a failed/ambiguous transaction. Existing retired-key fingerprint
 and32-entry-history restrictions remain. §3.20 adds the narrowly bound GTK
-reconnect path without resetting its PN; PTK reuse, cross-role/peer/index reuse
-and an ambiguous retirement are never authorized by a cached fingerprint.
+reconnect path without resetting its PN (§3.30 adds cross-peer/index GTK and
+floor-safe PTK reuse); cross-role reuse and an ambiguous retirement are never
+authorized by a cached fingerprint.
 
 Fourteen new registered native smokes cover twelve interface conversations
 and two discovered-profile/identity cases. The interface fixture begins after
@@ -1549,9 +1552,9 @@ each feature; a Linux chip name or helper structure does not grant a capability.
 
 | Profile | Implemented reachable software | Remaining software gates |
 |---|---|---|
-| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles (Linux Qu PCI IDs 0x02f0/0x06f0/0x34f0/0x3df0/0x4df0/0x43f0/0xa0f0, §3.26) | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO (with §3.28 RX LDPC/STBC1), signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement preceded by §3.25 over-air leaving deauthentication. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced same-peer/index reconnect restoration. Authored, execution pending: §3.24 tag4 negotiated unicast-local nested recipient A-MSDU-in-A-MPDU with complete bundles before sequence/PN ownership. | Active probes (scan firmware's emitter/power binding needs source proof); alternate ML BAID; group-addressed nested RX; other QoS AC/TID TX queues and TX A-MSDU; HT40/NSS2/VHT/HE/TX LDPC/TX STBC; PMF/WPA3; persistent/cross-owner key history, PTK reuse and cross-peer/index GTK restore; recovery and runtime/system PM. AP/P2P, WoW (with its D3 ARP/NS/GTK offloads), the §3.27 scheduled-scan offload and multiple RX/RSS remain unimplemented even where hardware supports them. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
-| AX210/AX211/AX411 and Bz/BE200 Gen3 transports | Context-v2, generation-selected completion layouts, firmware/PNVM/native boot and MLD helpers. Software-validated continuation: source-selected command-ID header0/explicit RLC2, receipt-fenced TVQM/BAID retirement, retained actual executable/PNVM/PCI authority and immutable DMA-copy receive/publication epochs. | Station admission remains dependent on the exact negotiated MAC/link/STA/TLC/key payload profile; no new payload profile is enabled by the header/source audit. Sc conversation tests do not establish another family's ABI, platform power/SAR program or hardware. Current live regulatory/power ownership and broader key-history/recovery/PM profiles remain separate. |
-| Sc c103/BE211 MLD station profile | Deferred retained native publication, actual station/management/data/Open-WPA2-SAE conversations, legacy/HT/VHT to80MHz, key/BA/reorder and userspace SME/port ownership in the existing profile. §§3.21–3.22 header/TVQM, positive BA response/RX-marker retirement, retained executable/PNVM/current-PCI publication and copy-time key epochs passed coordinated native tests on both architectures. | These source/epoch fences do not establish underlying RF quiescence or current live-regulatory/platform-power qualification. HE/EHT/6GHz and MLO,160/320MHz, AP/P2P, the §3.27 scheduled-scan offload, broader key-history and runtime/system PM remain separate implementations and must not be inferred from single-link Sc fixtures. |
+| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles (Linux Qu PCI IDs 0x02f0/0x06f0/0x34f0/0x3df0/0x4df0/0x43f0/0xa0f0, §3.26) | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO (with §3.28 RX LDPC/STBC1), signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement preceded by §3.25 over-air leaving deauthentication. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced reconnect restoration, extended in §3.30 to cross-peer/cross-index GTK restore and safe same-peer PTK reuse; §3.29 firmware/transport recovery and non-WoWLAN system suspend/resume. Authored, execution pending: §3.24 tag4 negotiated unicast-local nested recipient A-MSDU-in-A-MPDU with complete bundles before sequence/PN ownership. | Active probes (scan firmware's emitter/power binding needs source proof); alternate ML BAID; group-addressed nested RX; other QoS AC/TID TX queues and TX A-MSDU; HT40/NSS2/VHT/HE/TX LDPC/TX STBC; PMF/WPA3; persistent/cross-owner key history. AP/P2P, WoW (with its D3 ARP/NS/GTK offloads), the §3.27 scheduled-scan offload and multiple RX/RSS remain unimplemented even where hardware supports them. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
+| AX210/AX211/AX411 and Bz/BE200 Gen3 transports | Context-v2, generation-selected completion layouts, firmware/PNVM/native boot and MLD helpers. Software-validated continuation: source-selected command-ID header0/explicit RLC2, receipt-fenced TVQM/BAID retirement, retained actual executable/PNVM/PCI authority and immutable DMA-copy receive/publication epochs. | Station admission remains dependent on the exact negotiated MAC/link/STA/TLC/key payload profile; no new payload profile is enabled by the header/source audit. Sc conversation tests do not establish another family's ABI, platform power/SAR program or hardware. Current live regulatory/power ownership remains separate. |
+| Sc c103/BE211 MLD station profile | Deferred retained native publication, actual station/management/data/Open-WPA2-SAE conversations, legacy/HT/VHT to80MHz, key/BA/reorder and userspace SME/port ownership in the existing profile. §§3.21–3.22 header/TVQM, positive BA response/RX-marker retirement, retained executable/PNVM/current-PCI publication and copy-time key epochs passed coordinated native tests on both architectures. | These source/epoch fences do not establish underlying RF quiescence or current live-regulatory/platform-power qualification. HE/EHT/6GHz and MLO,160/320MHz, AP/P2P and the §3.27 scheduled-scan offload remain separate (non-WoWLAN system suspend/resume is §3.29) implementations and must not be inferred from single-link Sc fixtures. |
 | Other advertised PCI/firmware combinations | Identification/firmware selection where defined, including the Linux So/Ma/Bz IDs added in §3.26; 0x7df0 is identification-only (Linux 7.3 `pcie/drv.c` claims no 0x7DF0) and exact admission rejects it | No fallback admits an unknown command table, calibration profile, topology or PHY width. They need their exact source-backed authority/command/receipt/lifetime path. |
 
 MLO/EHT/320MHz is hardware-inapplicable to Wi-Fi6/6E AX2xx devices, while
@@ -1788,6 +1791,88 @@ does not alter emission, so the tag2–4 programs are unaffected.
 offer bits, unchanged TLC flags, admission of LDPC/STBC/both and rejection
 of HE dual-carrier (bit 18) and beamformed (bit 19, no TxBF capability
 is advertised) rates.
+
+### 3.29 Firmware recovery and system power management
+
+**Gen2 recovery.** Linux restarts a failed device from the error path
+(`mvm/ops.c::iwl_mvm_nic_error` -> `iwl_mvm_nic_restart` ->
+`iwl_mvm_restart_cleanup` -> `ieee80211_restart_hw` -> `iwl_mvm_up`).
+`mvm_station.rs::Owner::recover` performs the same transport restart on a
+failed owner: `Hardware::restart` acknowledges the DMA stop, clears bus
+mastering, replaces every RX/command/queue allocation and reloads the
+retained executable through ALIVE; the owner then retires installed keys
+into the PN history (the stop is stronger proof than key REMOVE plus the RX
+marker), rebuilds scan/channel/peer/queue/power contexts, and reruns unified
+NVM plus the BT/SoC/power defaults (`configure`). Unlike mac80211's in-place
+reconfiguration no association is replayed: the station returns to
+`Configured` and the SME must rejoin. The restarted device must report the
+same MAC and NVM channels/chains/PHY; the pre-failure identity remains the
+reference across rejected attempts, and any failure leaves the owner failed.
+The netdev (`mvm_device.rs`) runs `Operation::Recover` as retained control
+work before the next scan of a terminal station (polled under the
+non-master boot authority because BME is off until ALIVE); a dropped waiter
+cannot cancel it and a concurrent operation cannot start. A terminal
+publication with exhausted generation is never recovered.
+
+**System suspend/resume (Gen2 and Sc).** Linux `iwl_pci_suspend`/`resume`
+without WoWLAN: mac80211 quiesces the station (`ieee80211_mgd_quiesce`
+sends the leaving deauthentication), then `iwl_mvm_mac_stop` /
+`iwl_mld_mac80211_stop` stop the transport. Both netdevs register an
+`narf_power::system_pm::AsyncSystemPm` hook (it needs the scheduler and
+interrupts, so it is not a `DevicePmOps` callback). Suspend runs the ordinary
+close owner (Gen2 §3.25 deauthentication and receipt-fenced retirement; Sc
+`disassociate`), then `Hardware::stop_for_suspend` follows
+`_iwl_trans_pcie_gen2_stop_device`: mask interrupts, stop the bus master and
+wait for its acknowledgement, software-reset the NIC (CSR_RESET bit 7, or
+GP_CNTRL bit 31 on Bz+) and clear PCI bus mastering. The netdev stays down
+and refuses control while suspended; a repeated suspend is idempotent.
+Resume restarts firmware and replays runtime configuration through the
+recovery owners above (Gen2 `Owner::recover`, Sc `Device::recover`); the
+station starts unassociated. A failed resume stays suspended/terminal and
+may be retried. WoWLAN (firmware staying powered in D3) is the separate WoW
+row.
+
+**Runtime PM (inapplicable).** Upstream iwlwifi has no runtime-PM path for
+these devices: the D0i3 runtime-suspend implementation was removed from
+Linux (v5.4, "iwlwifi: remove all the d0i3 references" series) and
+`pcie/drv.c` `iwl_dev_pm_ops` provides only system-sleep and hibernation
+callbacks. Idle power is the firmware power-save program (`POWER_TABLE`),
+which this driver already programs. There is no Linux behaviour to follow.
+
+`drivers/wireless/iwlwifi/gen2/recovery` smokes cover AP-close failure
+followed by restart, rejoin and DHCP, changed-NVM rejection and retry,
+dropped-waiter retention, suspend with deauthentication before teardown,
+idle suspend, failed and successful resume, and resume-after-suspend
+rejoin with DHCP. `smoke_sc_system_suspend_leaves_bss_and_resume_restarts`
+covers the Sc path. RAM fixtures model the stop/ALIVE half of the restart
+(`runtime::model::restart`); the native stop/restart register sequences and
+D3 transitions need silicon validation.
+
+### 3.30 Key-history restore and PTK reuse
+
+The retained Gen2 key ledger (§3.20) keys PN floors by key material digest.
+`mvm_security.rs::restore_retired` decides what retired history permits for
+newly authenticated material with the same fingerprint:
+
+- **Cross-peer / cross-index GTK restore**: after an initial four-way
+  exchange a retired GTK may be reinstalled from another AP or at another key
+  index. Replay floors are per key material, so the maximum committed TID
+  floor carries over (Linux `sta.c` single install RSC); a higher fresh RSC
+  is kept. The ledger entry moves to the new peer/index so retirement finds
+  it. A group rekey may still not reinstall retired material.
+- **Safe PTK reuse**: a retired PTK may be reinstalled only from the same
+  peer at index 0. Host per-TID RX replay floors are restored instead of
+  reset, and the firmware TX PN (`transmit_seq_cnt`, key command bytes
+  68..76, as `iwl_mvm_send_sta_key` passes `tx_pn`) starts above an upper
+  bound of every PN the old installation could have used: its install PN
+  plus each protected MPDU the transport published while it was installed
+  (`Hardware::protected_transmits`; retries reuse their PN). No CCMP nonce
+  repeats. Live entries, role changes and cross-peer PTKs remain refused.
+  An identical active key is still not reinstalled (KRACK defence).
+
+`smoke_gen2_key_history_restore_policy_cross_peer_index_and_ptk_reuse`
+covers the policy table and key-command bytes; the existing reconnect
+smokes cover the native same-peer GTK conversation.
 
 ## 4. References
 
