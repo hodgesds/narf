@@ -1027,8 +1027,8 @@ pub fn init() {
 mod tests {
     use super::*;
     use alloc::vec;
-    use core::cell::RefCell;
     use narf_kernel_test::{kernel_test_in, TestResult};
+    use narf_lib::sync::IrqSafeSpinLock;
 
     macro_rules! check {
         ($cond:expr, $msg:expr) => {
@@ -1202,7 +1202,7 @@ mod tests {
 
     #[derive(Debug)]
     struct FakeBus {
-        inner: RefCell<FakeInner>,
+        inner: IrqSafeSpinLock<FakeInner>,
     }
 
     impl FakeBus {
@@ -1213,7 +1213,7 @@ mod tests {
             charger_spec_info: Option<u16>,
         ) -> Self {
             Self {
-                inner: RefCell::new(FakeInner {
+                inner: IrqSafeSpinLock::new(FakeInner {
                     batteries,
                     selector,
                     manager_state,
@@ -1224,11 +1224,11 @@ mod tests {
         }
 
         fn log(&self) -> Vec<LogEntry> {
-            self.inner.borrow().log.clone()
+            self.inner.lock().log.clone()
         }
 
         fn set_word(&self, slot: usize, cmd: u8, value: u16) {
-            let mut inner = self.inner.borrow_mut();
+            let mut inner = self.inner.lock();
             if let Some(Some(bat)) = inner.batteries.get_mut(slot) {
                 bat.set_word(cmd, value);
             }
@@ -1237,7 +1237,7 @@ mod tests {
 
     impl SbsTransport for FakeBus {
         fn read_word(&self, addr: u8, cmd: u8) -> Result<u16, SbsError> {
-            let mut inner = self.inner.borrow_mut();
+            let mut inner = self.inner.lock();
             let result = inner.read_word(addr, cmd);
             let value = result.as_ref().map(|v| *v as u32).unwrap_or(0);
             inner.log.push(LogEntry {
@@ -1251,7 +1251,7 @@ mod tests {
         }
 
         fn write_word(&self, addr: u8, cmd: u8, value: u16) -> Result<(), SbsError> {
-            let mut inner = self.inner.borrow_mut();
+            let mut inner = self.inner.lock();
             let result = inner.write_word(addr, cmd, value);
             inner.log.push(LogEntry {
                 op: Op::WriteWord,
@@ -1264,7 +1264,7 @@ mod tests {
         }
 
         fn read_block(&self, addr: u8, cmd: u8) -> Result<Vec<u8>, SbsError> {
-            let mut inner = self.inner.borrow_mut();
+            let mut inner = self.inner.lock();
             let result = inner.read_block(addr, cmd);
             let value = result.as_ref().map(|p| p.len() as u32).unwrap_or(0);
             inner.log.push(LogEntry {
