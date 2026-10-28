@@ -7933,7 +7933,7 @@ impl BotTransport for FakeBot {
         _w_index: u16,
         out: &mut [u8],
     ) -> Result<usize, MscError> {
-        let mut st = self.state.lock();
+        let st = self.state.lock();
         // GET MAX LUN (BOT §3.3): class/interface IN, 0xFE.
         if bm_request_type == 0xA1 && b_request == 0xFE {
             if !st.support_max_lun || out.is_empty() {
@@ -8163,9 +8163,12 @@ fn smoke_msc_fixture_multi_lun() -> TestResult {
         FakeLun::new(2048, 512),
         FakeLun::new(4096, 512)
     ]);
+    // Two scenarios gate this smoke: the two-LUN conversation and
+    // the GET MAX LUN-refusing device below. The first result must
+    // not be discarded — return its failure immediately.
     match narf_scheduler::block_on(msc_fixture_multi_lun(&fake)) {
-        Ok(()) => TestResult::Pass,
-        Err(m) => TestResult::Fail(m),
+        Ok(()) => {}
+        Err(m) => return TestResult::Fail(m),
     }
     let stubborn = FakeBot::without_max_lun(alloc::vec![FakeLun::new(64, 512)]);
     let outcome = narf_scheduler::block_on(async {
