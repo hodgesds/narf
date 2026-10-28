@@ -302,7 +302,7 @@ kernel_test_in!(
 fn windows() -> Result<(), &'static str> {
     // mac80211 agg-rx.c: an HE peer's max_buf_size is
     // IEEE80211_MAX_AMPDU_BUF_HE; requested 0 selects it.
-    for (requested, window) in [(0u16, 256u16), (256, 256), (300, 256), (100, 100), (65, 65)] {
+    for (requested, window) in [(0u16, 256u16), (256, 256), (100, 100), (65, 65)] {
         let (mut s, b, p) = prepared5_with(Some(5), false, false);
         if super::vht_tests::join(&mut s, &b, p, false) != Ok(42) {
             return Err("HE BA association");
@@ -349,20 +349,22 @@ fn windows() -> Result<(), &'static str> {
             return Err("HE BA teardown retained the agreement");
         }
     }
-    // A non-HE (VHT) peer stays at the HT bound.
+    // agg-rx.c:351: an HE peer above IEEE80211_MAX_AMPDU_BUF_HE is declined.
+    for requested in [257u16, 300, 1023] {
+        let (mut s, b, p) = prepared5_with(Some(5), false, false);
+        if super::vht_tests::join(&mut s, &b, p, false) != Ok(42) {
+            return Err("HE oversize BA association");
+        }
+        super::rx_ba_tests::decline_oversize(&mut s, 3, requested)?;
+        run(s.disassociate_station()).map_err(|_| "HE oversize BA teardown")?;
+    }
+    // A non-HE (VHT) peer is bounded by IEEE80211_MAX_AMPDU_BUF_HT.
     let (mut s, b, p) = super::vht_tests::prepared(2, false);
     if super::vht_tests::join(&mut s, &b, p, false) != Ok(42) {
         return Err("VHT BA association");
     }
-    let before = s.backend.frames.len();
-    super::rx_ba_tests::establish_window(&mut s, 3, 10, 0, 256)?;
-    if s.backend.frames[before..]
-        .first()
-        .and_then(|f| f.1.get(80..82))
-        != Some(64u16.to_le_bytes().as_slice())
-    {
-        return Err("non-HE peer exceeded IEEE80211_MAX_AMPDU_BUF_HT");
-    }
+    super::rx_ba_tests::decline_oversize(&mut s, 3, 65)?;
+    super::rx_ba_tests::establish_window(&mut s, 3, 10, 0, 64)?;
     Ok(())
 }
 fn mt76_rx_ba_he_peer_windows_up_to_256_reorder_and_teardown() -> TestResult {

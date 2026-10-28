@@ -59,9 +59,14 @@ impl<B: Backend> Session<B> {
             // agg-rx.c __ieee80211_start_rx_ba_session: a delayed policy needs
             // both HT DELAY_BA and the S1G HT_DELAYED_BA capability, so a
             // non-S1G CONNAC2 peer is always refused with INVALID_QOS_PARAM
-            // (38); other refusals are REQUEST_DECLINED (37). The response
-            // always carries the immediate policy (policy argument 1).
-            let status = if frame[27] & 2 == 0 { 38 } else { 37 };
+            // (38), as is a buffer size above max_buf_size (64 HT / 256 HE);
+            // other refusals are REQUEST_DECLINED (37). The response always
+            // carries the immediate policy (policy argument 1).
+            let status = if frame[27] & 2 == 0 || ba::Request::oversize(frame, limit) {
+                38
+            } else {
+                37
+            };
             if self.control_pending.len() < 4 {
                 let mut response = vec![0; 33];
                 response[0] = 0xd0;

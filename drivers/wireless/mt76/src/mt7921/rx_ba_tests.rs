@@ -123,6 +123,33 @@ pub(super) fn establish_window(
     }
     Ok(())
 }
+/// An oversize ADDBA is refused with INVALID_QOS_PARAM (38) and an
+/// immediate-policy response, with no WTBL/STA_REC_BA programming.
+pub(super) fn decline_oversize(
+    session: &mut Session<Model>,
+    tid: u8,
+    window: u16,
+) -> Result<(), &'static str> {
+    let State::Associated { channel, .. } = session.state else {
+        return Err("oversize ADDBA needs current association");
+    };
+    session
+        .backend
+        .packets
+        .push_back(request_packet(tid, 10, window, 0, channel));
+    consume(session, "declined oversize ADDBA delivered data")?;
+    let before = session.backend.frames.len();
+    run(session.service_keys()).map_err(|_| "oversize ADDBA decline")?;
+    let frames = &session.backend.frames[before..];
+    if session.rx_ba.active(tid)
+        || frames.len() != 1
+        || frames[0].1.get(24..29) != Some(&[3, 1, 9, 38, 0][..])
+        || frames[0].1[29] != (2 | tid << 2)
+    {
+        return Err("oversize ADDBA was not refused with INVALID_QOS_PARAM and no programming");
+    }
+    Ok(())
+}
 fn expected(value: u8) -> Option<Vec<u8>> {
     Some(super::amsdu_rx_tests::ethernet(value, 3))
 }
@@ -399,12 +426,17 @@ kernel_test_in!(
 
 fn arbitrary_windows() -> Result<(), &'static str> {
     for secured in [false, true] {
-        for requested in [0, 1, 3, 5, 31, 33, 48, 63, 64, 127] {
-            let window = if requested == 0 {
-                64
-            } else {
-                requested.min(64)
-            };
+        for requested in [0, 1, 3, 5, 31, 33, 48, 63, 64, 65, 127] {
+            if requested > 64 {
+                // agg-rx.c:351: a non-HE peer's buf_size above
+                // IEEE80211_MAX_AMPDU_BUF_HT is declined, never clamped.
+                let mut session = joined(6, false, secured)?;
+                decline_oversize(&mut session, 3, requested)?;
+                run(session.disassociate_station())
+                    .map_err(|_| "oversize ADDBA native teardown")?;
+                continue;
+            }
+            let window = if requested == 0 { 64 } else { requested };
             let mut session = joined(6, false, secured)?;
             let before = session.backend.frames.len();
             establish_window(&mut session, 3, 4090, 0, requested)?;

@@ -124,25 +124,25 @@ iwlwifi	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/iwlwifi.md	155
 iwlwifi	width_160	160MHz operation on applicable profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
 iwlwifi	width_320	320MHz operation on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
 iwlwifi	wow	Wake on WLAN	feature	drivers/wireless/specification/iwlwifi.md	1552
-mt76	ap_mode	Access Point mode (mt792x_init_wiphy NL80211_IFTYPE_AP)	feature	drivers/wireless/specification/mt7921.md	1308
-mt76	associated_active_scan	Active scanning while associated	feature	drivers/wireless/specification/mt7921.md	1315
-mt76	colocated_6ghz_scan	Colocated 6 GHz scanning	feature	drivers/wireless/specification/mt7921.md	1261
-mt76	country_wmm_constraints	Country-specific WMM constraints	feature	drivers/wireless/specification/mt7921.md	1191
-mt76	fragmentation	TX fragmentation under a configured wiphy fragmentation threshold (RX defragmentation implemented)	feature	drivers/wireless/specification/mt7921.md	1295
-mt76	loadable_packet_abi	Loadable wireless packet ABI	feature	drivers/wireless/specification/mt7921.md	1187
-mt76	midstream_tx_ba_restart	Midstream transmit BA restart	feature	drivers/wireless/specification/mt7921.md	1329
-mt76	monitor_mode	Monitor mode (mac80211 MONITOR + WANT_MONITOR_VIF)	feature	drivers/wireless/specification/mt7921.md	1308
-mt76	nan_mode	NAN / NAN_DATA roles (firmware CNM+NAN capability gated)	feature	drivers/wireless/specification/mt7921.md	1308
-mt76	native_key_pipeline_retirement	Native old-key firmware/MAC/FIFO pipeline retirement	feature	drivers/wireless/specification/mt7921.md	1335
-mt76	noncoherent_dma	Non-coherent platform DMA support	feature	drivers/wireless/specification/mt7921.md	1160
-mt76	off_channel_active_scan	Off-channel active scanning	feature	drivers/wireless/specification/mt7921.md	1315
-mt76	other_tx_ba_tids	Transmit BA on TIDs beyond retained TID0	feature	drivers/wireless/specification/mt7921.md	1329
-mt76	p2p_mode	P2P client / GO / device roles	feature	drivers/wireless/specification/mt7921.md	1308
-mt76	per_domain_iommu	Per-domain IOMMU mappings	feature	drivers/wireless/specification/mt7921.md	1160
-mt76	pmf	Protected management frames (PMF)	feature	drivers/wireless/specification/mt7921.md	1276
-mt76	six_ghz_operation	6 GHz radio operation	feature	drivers/wireless/specification/mt7921.md	1261
-mt76	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/mt7921.md	1302
-mt76	wpa3_sae	WPA3-Personal / SAE authentication	feature	drivers/wireless/specification/mt7921.md	1276
+mt76	ap_mode	Access Point mode (mt792x_init_wiphy NL80211_IFTYPE_AP)	feature	drivers/wireless/specification/mt7921.md	1315
+mt76	associated_active_scan	Active scanning while associated	feature	drivers/wireless/specification/mt7921.md	1322
+mt76	colocated_6ghz_scan	Colocated 6 GHz scanning	feature	drivers/wireless/specification/mt7921.md	1268
+mt76	country_wmm_constraints	Country-specific WMM constraints	feature	drivers/wireless/specification/mt7921.md	1198
+mt76	fragmentation	TX fragmentation under a configured wiphy fragmentation threshold (RX defragmentation implemented)	feature	drivers/wireless/specification/mt7921.md	1302
+mt76	loadable_packet_abi	Loadable wireless packet ABI	feature	drivers/wireless/specification/mt7921.md	1194
+mt76	midstream_tx_ba_restart	Midstream transmit BA restart	feature	drivers/wireless/specification/mt7921.md	1336
+mt76	monitor_mode	Monitor mode (mac80211 MONITOR + WANT_MONITOR_VIF)	feature	drivers/wireless/specification/mt7921.md	1315
+mt76	nan_mode	NAN / NAN_DATA roles (firmware CNM+NAN capability gated)	feature	drivers/wireless/specification/mt7921.md	1315
+mt76	native_key_pipeline_retirement	Native old-key firmware/MAC/FIFO pipeline retirement	feature	drivers/wireless/specification/mt7921.md	1342
+mt76	noncoherent_dma	Non-coherent platform DMA support	feature	drivers/wireless/specification/mt7921.md	1167
+mt76	off_channel_active_scan	Off-channel active scanning	feature	drivers/wireless/specification/mt7921.md	1322
+mt76	other_tx_ba_tids	Transmit BA on TIDs beyond retained TID0	feature	drivers/wireless/specification/mt7921.md	1336
+mt76	p2p_mode	P2P client / GO / device roles	feature	drivers/wireless/specification/mt7921.md	1315
+mt76	per_domain_iommu	Per-domain IOMMU mappings	feature	drivers/wireless/specification/mt7921.md	1167
+mt76	pmf	Protected management frames (PMF)	feature	drivers/wireless/specification/mt7921.md	1283
+mt76	six_ghz_operation	6 GHz radio operation	feature	drivers/wireless/specification/mt7921.md	1268
+mt76	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/mt7921.md	1309
+mt76	wpa3_sae	WPA3-Personal / SAE authentication	feature	drivers/wireless/specification/mt7921.md	1283
 rtl8xxxu	additional_operating_channels	Noninitial operating channels and safe FIFO retuning; blocked on per-channel signed N8PC envelope rows beyond channel1 and a FIFO-safe retune while bulk RX is posted, which needs endpoint_reset/slot reuse	feature	drivers/wireless/specification/rtl8xxxu.md	594
 rtl8xxxu	bt_coexistence	Bluetooth coexistence on RTL8723BU; blocked on the rtl8723bu chip runtime	feature	drivers/wireless/specification/rtl8xxxu.md	598
 rtl8xxxu	endpoint_reset	Controller-proven endpoint halt recovery; the shared USB API now exists (USBDevice::clear_endpoint_halt: xHCI Reset Endpoint + Set TR Dequeue + CLEAR_FEATURE(ENDPOINT_HALT)). Remaining family work: a halt-recovery path in packet_transport::Io/Owner (a Stall is currently terminal) and EP0/bulk reposting under the retained authority, with fakes covering halted bulk IN/OUT	feature	drivers/wireless/specification/rtl8xxxu.md	594
