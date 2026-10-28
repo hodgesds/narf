@@ -54,8 +54,17 @@ use crate::xhci::{self, EndpointConfig, EndpointKind, Xhci};
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// Maximum payload (in target blocks) we'll cram into a single
-/// READ(10) / WRITE(10). Bounded by the bulk transfer scratch.
+/// BOT command. Larger requests are chunked into a sequence of
+/// commands by the read/write paths (#828); the bound itself
+/// comes from the bulk transfer scratch (see
+/// `MSC_DMA_PAGE_BYTES`).
 pub const MSC_MAX_BLOCKS_PER_XFER: u16 = 8;
+
+/// Size of the xHCI endpoint DMA buffer a single bulk transfer
+/// moves. A BOT data stage larger than this cannot complete, so
+/// chunk sizes are the smaller of `MSC_MAX_BLOCKS_PER_XFER`
+/// blocks and however many whole blocks fit in one page.
+const MSC_DMA_PAGE_BYTES: u32 = 4096;
 
 // USB class triple identifying a Mass Storage device with the SCSI
 // transparent command set + Bulk-Only Transport (§4.0 of the BOT
@@ -810,54 +819,99 @@ impl MscDevice {
         Ok(())
     }
 
+    /// How many blocks one BOT command may carry for this LUN:
+    /// the per-command cap, further bounded so the data stage
+    /// fits the xHCI endpoint's single-page DMA buffer.
+    fn bot_chunk_blocks(&self) -> u32 {
+        (MSC_DMA_PAGE_BYTES / self.lba_bytes.max(1)).min(u32::from(MSC_MAX_BLOCKS_PER_XFER))
+    }
+
     /// Multi-block READ. Reads `nblocks` consecutive blocks
     /// starting at `lba`, in the LUN's 10- or 16-byte command
-    /// form. Bounded to `MSC_MAX_BLOCKS_PER_XFER` per call.
-    /// Returns the concatenated payload.
+    /// form. Requests of any size are chunked internally into
+    /// per-command pieces of at most `bot_chunk_blocks()` blocks
+    /// (#828) — the 8-block shape of one BOT command is a wire
+    /// detail, not a caller-visible limit. Returns the
+    /// concatenated payload.
     pub async fn read_blocks<T: BotTransport>(
         &self,
         t: &T,
         lba: u64,
-        nblocks: u16,
+        nblocks: u32,
     ) -> Result<Vec<u8>, MscError> {
-        if self.lba_bytes == 0 || nblocks == 0 || nblocks > MSC_MAX_BLOCKS_PER_XFER {
+        if self.lba_bytes == 0 || nblocks == 0 {
             return Err(MscError::BadLength);
         }
-        let total = self.lba_bytes as usize * nblocks as usize;
-        let (cb, cb_len) = self.read_cdb(lba, u32::from(nblocks))?;
+        let total = (self.lba_bytes as usize)
+            .checked_mul(nblocks as usize)
+            .ok_or(MscError::BadLength)?;
         let mut out: Vec<u8> = alloc::vec![0u8; total];
-        let n = self.cmd_data_in(t, &cb[..cb_len], &mut out[..]).await?;
-        if n != total {
-            return Err(MscError::BadLength);
-        }
+        self.read_blocks_into(t, lba, &mut out).await?;
         Ok(out)
     }
 
+    /// Buffer-filling form of [`Self::read_blocks`]: reads whole
+    /// blocks into `out` (whose length must be a non-zero multiple
+    /// of the block size), chunking as described there. The block
+    /// adapter uses this form so a large filesystem request never
+    /// materialises a second full-size buffer.
+    pub async fn read_blocks_into<T: BotTransport>(
+        &self,
+        t: &T,
+        lba: u64,
+        out: &mut [u8],
+    ) -> Result<(), MscError> {
+        if self.lba_bytes == 0 || out.is_empty() || out.len() % self.lba_bytes as usize != 0 {
+            return Err(MscError::BadLength);
+        }
+        let chunk = self.bot_chunk_blocks();
+        let mut done_blocks: u64 = 0;
+        let mut offset = 0usize;
+        while offset < out.len() {
+            let remaining = ((out.len() - offset) / self.lba_bytes as usize) as u64;
+            let count = remaining.min(u64::from(chunk));
+            let chunk_lba = lba.checked_add(done_blocks).ok_or(MscError::BadLength)?;
+            let (cb, cb_len) = self.read_cdb(chunk_lba, count as u32)?;
+            let bytes = (count as usize) * self.lba_bytes as usize;
+            let n = self
+                .cmd_data_in(t, &cb[..cb_len], &mut out[offset..offset + bytes])
+                .await?;
+            if n != bytes {
+                return Err(MscError::BadLength);
+            }
+            done_blocks += count;
+            offset += bytes;
+        }
+        Ok(())
+    }
+
     /// Multi-block WRITE. Writes `nblocks` blocks starting at
-    /// `lba`, in the LUN's 10- or 16-byte command form.
+    /// `lba`, in the LUN's 10- or 16-byte command form, chunked
+    /// internally exactly like [`Self::read_blocks`](#828).
     /// `data.len()` must equal `nblocks * lba_bytes`.
     pub async fn write_blocks<T: BotTransport>(
         &self,
         t: &T,
         lba: u64,
-        nblocks: u16,
+        nblocks: u32,
         data: &[u8],
     ) -> Result<(), MscError> {
         self.write_blocks_inner(t, lba, nblocks, data, false).await
     }
 
     /// Multi-block WRITE with Force Unit Access: identical to
-    /// [`Self::write_blocks`] except the CDB carries the FUA bit, so
-    /// the device must commit the data to the medium (not merely to
-    /// its volatile write cache) before the CSW reports completion.
-    /// FUA orders nothing written earlier — callers that need a
-    /// barrier issue [`Self::synchronize_cache`] first (the block
-    /// layer's `write_fua` contract, #829).
+    /// [`Self::write_blocks`] except every chunk's CDB carries
+    /// the FUA bit, so the device must commit the data to the
+    /// medium (not merely to its volatile write cache) before
+    /// each CSW reports completion. FUA orders nothing written
+    /// earlier — callers that need a barrier issue
+    /// [`Self::synchronize_cache`] first (the block layer's
+    /// `write_fua` contract, #829).
     pub async fn write_blocks_fua<T: BotTransport>(
         &self,
         t: &T,
         lba: u64,
-        nblocks: u16,
+        nblocks: u32,
         data: &[u8],
     ) -> Result<(), MscError> {
         self.write_blocks_inner(t, lba, nblocks, data, true).await
@@ -867,21 +921,36 @@ impl MscDevice {
         &self,
         t: &T,
         lba: u64,
-        nblocks: u16,
+        nblocks: u32,
         data: &[u8],
         fua: bool,
     ) -> Result<(), MscError> {
-        if self.lba_bytes == 0
-            || nblocks == 0
-            || nblocks > MSC_MAX_BLOCKS_PER_XFER
-            || data.len() != self.lba_bytes as usize * nblocks as usize
-        {
+        if self.lba_bytes == 0 || nblocks == 0 {
             return Err(MscError::BadLength);
         }
-        let (cb, cb_len) = self.write_cdb(lba, u32::from(nblocks), fua)?;
-        let n = self.cmd_data_out(t, &cb[..cb_len], data).await?;
-        if n != data.len() {
+        let total = (self.lba_bytes as usize)
+            .checked_mul(nblocks as usize)
+            .ok_or(MscError::BadLength)?;
+        if data.len() != total {
             return Err(MscError::BadLength);
+        }
+        let chunk = self.bot_chunk_blocks();
+        let mut done_blocks: u64 = 0;
+        let mut offset = 0usize;
+        while offset < data.len() {
+            let remaining = ((data.len() - offset) / self.lba_bytes as usize) as u64;
+            let count = remaining.min(u64::from(chunk));
+            let chunk_lba = lba.checked_add(done_blocks).ok_or(MscError::BadLength)?;
+            let (cb, cb_len) = self.write_cdb(chunk_lba, count as u32, fua)?;
+            let bytes = (count as usize) * self.lba_bytes as usize;
+            let n = self
+                .cmd_data_out(t, &cb[..cb_len], &data[offset..offset + bytes])
+                .await?;
+            if n != bytes {
+                return Err(MscError::BadLength);
+            }
+            done_blocks += count;
+            offset += bytes;
         }
         Ok(())
     }
@@ -1759,7 +1828,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         sync_bridge(async {
             for (start, count, bytes) in chunks {
                 dev_snapshot
-                    .write_blocks_fua(&*c, start, count, &data[bytes])
+                    .write_blocks_fua(&*c, start, u32::from(count), &data[bytes])
                     .await
                     .map_err(|_| narf_block::BlockIoError::DriverError)?;
             }
@@ -1849,7 +1918,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         sync_bridge(async {
             for (start, count, bytes) in chunks {
                 let data = dev_snapshot
-                    .read_blocks(&*c, start, count)
+                    .read_blocks(&*c, start, u32::from(count))
                     .await
                     .map_err(|_| narf_block::BlockIoError::DriverError)?;
                 out[bytes].copy_from_slice(&data);
@@ -1929,7 +1998,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         sync_bridge(async {
             for (start, count, bytes) in chunks {
                 dev_snapshot
-                    .write_blocks(&*c, start, count, &data[bytes])
+                    .write_blocks(&*c, start, u32::from(count), &data[bytes])
                     .await
                     .map_err(|_| narf_block::BlockIoError::DriverError)?;
             }
