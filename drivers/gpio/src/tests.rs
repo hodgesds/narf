@@ -49,6 +49,34 @@ fn intel_cfg(
     }
 }
 
+/// Test-isolation guard that preserves live (boot-time) bindings:
+/// snapshots the registry, clears it for the test, and restores
+/// the snapshot on drop — including on early `Fail` returns.
+/// A bare `__reset_for_test` at a test's end wiped the DT-bound
+/// PL061 from the shared registry before `smoke_pl061_dt_bound_live`
+/// (in `tests_aarch64`) read it, while the probe's BOUND record
+/// still reported INTID 39 — a state-pollution failure, not a
+/// driver defect. Every synthetic smoke that used to bracket
+/// itself with `__reset_for_test` uses this guard instead, so
+/// the registry after each test is exactly what the test found.
+struct RegistryRestoreGuard {
+    saved: alloc::vec::Vec<Arc<dyn GpioController>>,
+}
+
+impl RegistryRestoreGuard {
+    fn isolated() -> Self {
+        let saved = registry::__snapshot_for_test();
+        registry::__reset_for_test();
+        Self { saved }
+    }
+}
+
+impl Drop for RegistryRestoreGuard {
+    fn drop(&mut self) {
+        registry::__restore_for_test(core::mem::take(&mut self.saved));
+    }
+}
+
 /// Allocate a 1 KiB zeroed MMIO backing buffer (256 pin registers).
 /// Leak it so the synthetic device outlives the smoke.
 fn make_synthetic_mmio() -> (PhysAddr, u64) {
@@ -66,7 +94,7 @@ fn smoke_gpio_recognises_amdi0030() -> TestResult {
 kernel_test_in!("drivers-gpio", smoke_gpio_recognises_amdi0030);
 
 fn smoke_gpio_registry_dedupes_by_name() -> TestResult {
-    registry::__reset_for_test();
+    let _guard = RegistryRestoreGuard::isolated();
     let (p, l) = make_synthetic_mmio();
     let a: Arc<dyn GpioController> = Arc::new(AmdFchGpio::new("dup".to_string(), p, l, None));
     let b: Arc<dyn GpioController> = Arc::new(AmdFchGpio::new("dup".to_string(), p, l, None));
@@ -78,7 +106,6 @@ fn smoke_gpio_registry_dedupes_by_name() -> TestResult {
     if registry::count() != 1 {
         return TestResult::Fail("dedupe should leave count at 1");
     }
-    registry::__reset_for_test();
     TestResult::Pass
 }
 kernel_test_in!("drivers-gpio", smoke_gpio_registry_dedupes_by_name);
@@ -281,7 +308,7 @@ fn fire_handler(pin: u16) {
 
 fn smoke_gpio_isr_dispatch_fires_handler_and_clears_status() -> TestResult {
     __reset_dispatch_for_test();
-    registry::__reset_for_test();
+    let _guard = RegistryRestoreGuard::isolated();
     FIRE_COUNT.store(0, Ordering::SeqCst);
     FIRE_PIN.store(u32::MAX, Ordering::SeqCst);
 
@@ -333,7 +360,6 @@ fn smoke_gpio_isr_dispatch_fires_handler_and_clears_status() -> TestResult {
     if FIRE_COUNT.load(Ordering::SeqCst) != 1 {
         return TestResult::Fail("handler fired again with no pending status");
     }
-    registry::__reset_for_test();
     __reset_dispatch_for_test();
     TestResult::Pass
 }
@@ -689,7 +715,7 @@ fn smoke_intel_pch_names_communities_uniquely() -> TestResult {
     // Two communities under the same ACPI path must get distinct
     // registry names so i2c-hid-bind can address them separately —
     // the per-community suffix (`.C<idx>`) keys the dedupe.
-    registry::__reset_for_test();
+    let _guard = RegistryRestoreGuard::isolated();
     let phys = PhysAddr::new(0xFFC0_0000);
     let a: Arc<dyn GpioController> = Arc::new(intel_new_for_test(intel_cfg(
         "\\_SB.PC00.GPI0".to_string(),
@@ -722,7 +748,6 @@ fn smoke_intel_pch_names_communities_uniquely() -> TestResult {
     if registry::find("\\_SB.PC00.GPI0.C1").is_none() {
         return TestResult::Fail("community C1 not in registry");
     }
-    registry::__reset_for_test();
     TestResult::Pass
 }
 kernel_test_in!("drivers-gpio", smoke_intel_pch_names_communities_uniquely);
@@ -733,7 +758,7 @@ fn smoke_intel_pch_registers_into_shared_registry() -> TestResult {
     // FCH driver uses — i2c-hid-bind looks up
     // `GpioInt::resource_source` against `registry::find` without
     // knowing or caring which backend populated the entry.
-    registry::__reset_for_test();
+    let _guard = RegistryRestoreGuard::isolated();
     let drv = intel_new_for_test(intel_cfg(
         "\\_SB.PC00.GPI3".to_string(),
         2,
@@ -759,7 +784,6 @@ fn smoke_intel_pch_registers_into_shared_registry() -> TestResult {
             return TestResult::Fail("registry lookup returned wrong controller");
         }
     }
-    registry::__reset_for_test();
     let _ = IntelPchGpio::new(intel_cfg(
         "smoke".to_string(),
         0,

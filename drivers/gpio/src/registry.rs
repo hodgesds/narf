@@ -45,3 +45,25 @@ pub fn __reset_for_test() {
     CTRLS.lock().clear();
     REGISTERED_COUNT.store(0, Ordering::Release);
 }
+
+/// Snapshot the current registry contents. Pairs with
+/// `__restore_for_test`: the synthetic smokes in `tests` isolate
+/// themselves by resetting, but a bare reset wipes the boot-time
+/// DT bindings (the PL061 at 0x0903_0000) before the live DT
+/// smoke reads the registry — the registry check then fails
+/// while the probe's BOUND record still reports INTID 39.
+/// Snapshotting before the reset and restoring after keeps
+/// isolation without destroying live bindings.
+#[doc(hidden)]
+pub fn __snapshot_for_test() -> Vec<Arc<dyn GpioController>> {
+    CTRLS.lock().clone()
+}
+
+/// Restore a snapshot taken by `__snapshot_for_test`, replacing
+/// the current contents. Refreshes the lock-free count.
+#[doc(hidden)]
+pub fn __restore_for_test(entries: Vec<Arc<dyn GpioController>>) {
+    let mut g = CTRLS.lock();
+    *g = entries;
+    REGISTERED_COUNT.store(g.len() as u32, Ordering::Release);
+}
