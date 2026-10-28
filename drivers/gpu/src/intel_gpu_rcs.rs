@@ -10,7 +10,7 @@
 //!
 //! - **Contexts.** Each context owns a GGTT-backed logical ring
 //!   context (LRC) image whose register-state page is built from
-//!   the PRM template (a batch of `MI_LOAD_REGISTER_IMM` groups),
+//!   the PRM template (Gen12 engine-relative `MI_LOAD_REGISTER_IMM` groups),
 //!   a 128 KiB ring buffer, and a per-context hardware status
 //!   page (HWSP) carrying the breadcrumb sequence number.
 //! - **Submission.** `submit` appends `MI_BATCH_BUFFER_START`
@@ -33,7 +33,7 @@
 //! submitted with the GGTT address-space indicator. A context
 //! can additionally carry a PPGTT root from the walker in
 //! [`crate::intel_gpu_ppgtt`] (#1012): [`RcsEngine::attach_ppgtt`]
-//! programs the root into the image's PDP3 pair (the 4-level
+//! programs the root into the image's PDP0 pair (the 4-level
 //! root slot) so the hardware walk runs under the context.
 //! Batch *allocations* stay GGTT-backed even then. VA-batch
 //! submission ([`RcsEngine::submit_ppgtt`], the PPGTT form of
@@ -50,30 +50,19 @@
 //!
 //! - Tiger Lake PRM Vol. 2a / 2c — MI command encodings and the
 //!   execlists / logical-ring-context model; Vol. 5 — GTT.
-//! - Kaby Lake PRM Vol. 3 §"Register/State Context" — the
-//!   register-state image dword layout (identical group framing
-//!   on Gen12; cross-checked per-register below).
+//! - MIT i915 `gt/intel_lrc.c` Gen12 RCS/XCS register tables —
+//!   the generation-specific restore layout and relative-MMIO selector.
 //! - `intel_lrc.c` / `intel_engine` headers of the public i915
 //!   driver (MIT-licensed) — cross-check for the Gen11+ context
 //!   descriptor upper-dword format, the Gen12 CSB entry format,
 //!   and the HWSP CSB offsets (`I915_HWS_CSB_BUF0_INDEX`,
 //!   `CNL_HWS_CSB_WRITE_INDEX`).
 //!
-//! ## Values flagged for first-silicon verification
-//!
-//! Three constants are pinned by the fixtures but carry residual
-//! source risk; each is a single named constant so hardware
-//! bring-up can flip it in one place:
-//!
-//! - [`CSB_ENTRIES`] = 8 — the Gen11+ CSB depth (i915
-//!   `GEN11_CSB_ENTRIES`).
-//! - [`RCS_IMAGE_PAGES`] = 48 — an *allocation bound* strictly
-//!   above the Gen12 RCS hardware image (low-40s of pages in
-//!   i915's gen12 table). Oversizing is safe: hardware only
-//!   touches its own image span; undersizing would corrupt.
-//! - The descriptor addressing mode ([`DESC_MODE_LEGACY_64B`]):
-//!   chosen so batch pointers are 64-bit while the context
-//!   itself addresses via GGTT.
+//! The CSB depth is twelve (MIT intel_lrc_reg.h). The 48-page image
+//! allocation bounds the 14-page Gen12 render image. These model-checked
+//! encodings do not establish full GT setup, safe userspace execution,
+//! render-cache completion or reset/loss handling; the userspace gate in
+//! intel_gpu_render remains closed until those owners exist.
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
@@ -84,7 +73,7 @@ use alloc::vec::Vec;
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_forcewake::{Forcewake, FwDomain};
 use crate::intel_gpu_gtt::{
-    encode_engine_pte, encode_table_entry, ggtt_va_size, PatSlot, GGTT_ARRAY_BASE, GTT_PAGE_SIZE,
+    encode_scanout_pte, encode_table_entry, ggtt_va_size, PatSlot, GGTT_ARRAY_BASE, GTT_PAGE_SIZE,
 };
 
 // ── RCS0 engine register map (TGL PRM Vol. 2c; engine base 0x2000) ──
@@ -415,18 +404,12 @@ pub const CTX_BB_HEAD_U: usize = 0x0C;
 pub const CTX_BB_HEAD_L: usize = 0x0E;
 /// `CTX_BB_STATE` pair index.
 pub const CTX_BB_STATE: usize = 0x10;
-/// `CTX_SECOND_BB_HEAD_U` pair index.
-pub const CTX_SECOND_BB_HEAD_U: usize = 0x12;
-/// `CTX_SECOND_BB_HEAD_L` pair index.
-pub const CTX_SECOND_BB_HEAD_L: usize = 0x14;
-/// `CTX_SECOND_BB_STATE` pair index.
-pub const CTX_SECOND_BB_STATE: usize = 0x16;
 /// `CTX_BB_PER_CTX_PTR` pair index.
-pub const CTX_BB_PER_CTX_PTR: usize = 0x18;
+pub const CTX_BB_PER_CTX_PTR: usize = 0x12;
 /// `CTX_RCS_INDIRECT_CTX` pair index.
-pub const CTX_RCS_INDIRECT_CTX: usize = 0x1A;
+pub const CTX_RCS_INDIRECT_CTX: usize = 0x14;
 /// `CTX_RCS_INDIRECT_CTX_OFFSET` pair index.
-pub const CTX_RCS_INDIRECT_CTX_OFFSET: usize = 0x1C;
+pub const CTX_RCS_INDIRECT_CTX_OFFSET: usize = 0x16;
 /// `CTX_LRI_HEADER_1` dword index.
 pub const CTX_LRI_HEADER_1: usize = 0x21;
 /// `CTX_CTX_TIMESTAMP` pair index.
@@ -438,7 +421,9 @@ pub const CTX_LRI_HEADER_2: usize = 0x41;
 /// `CTX_R_PWR_CLK_STATE` pair index.
 pub const CTX_R_PWR_CLK_STATE: usize = 0x42;
 /// `CTX_END` dword index — the template's terminating dword.
-pub const CTX_END: usize = 0x44;
+pub const CTX_END: usize = 0xB9;
+/// Gen12 non-render context restore terminator.
+pub const CTX_XCS_END: usize = 0x34;
 /// Total template dwords (indices `0..CTX_END` inclusive).
 pub const REG_STATE_DWORDS: usize = CTX_END + 1;
 
@@ -454,10 +439,9 @@ pub const CTX_CONTROL_VALUE: u32 = {
 };
 
 /// `RING_CTL` value for a ring of `ring_bytes` (power of two,
-/// page multiple): bit 0 = enable, bits 11:1 = size in 4 KiB
-/// pages minus one.
+/// page multiple): bit 0 = enable, bits20:12 = byte size minus one page.
 pub const fn ring_ctl_value(ring_bytes: u32) -> u32 {
-    (((ring_bytes / 4096) - 1) << 1) | 1
+    (ring_bytes.wrapping_sub(4096) & 0x001f_f000) | 1
 }
 
 /// Build the register-state template for a fresh context on
@@ -472,11 +456,9 @@ pub const fn ring_ctl_value(ring_bytes: u32) -> u32 {
 /// The dword layout is engine-independent (the PRM ENGINE
 /// CONTEXT table); the register *addresses* in the pairs are
 /// the engine's own (`spec.base` + the shared offsets). The one
-/// structural difference between engines is group 2:
-/// `R_PWR_CLK_STATE` exists only in render-class templates
-/// (i915's Gen12 XCS offset table has no third group), so
-/// non-render templates leave those dwords zero — the restore
-/// stream reads them as NOOP padding before the terminator.
+/// structural difference is the extended render groups:
+/// `R_PWR_CLK_STATE` and the extended register state exist only in
+/// render-class templates. XCS terminates after the PDP group.
 pub fn build_reg_state_for(
     spec: &EngineSpec,
     ring_ggtt: u32,
@@ -484,47 +466,49 @@ pub fn build_reg_state_for(
 ) -> [u32; REG_STATE_DWORDS] {
     let b = spec.base;
     let mut r = [0u32; REG_STATE_DWORDS];
-    // Group 0: 14 pairs (11 common + BB_PER_CTX_PTR + the two
-    // indirect-context registers).
-    r[CTX_LRI_HEADER_0] = mi_load_register_imm(14, true);
-    r[CTX_CONTEXT_CONTROL] = (b + 0x244) as u32;
+    // Source-cited Gen12 layout (MIT intel_lrc.c gen12_{r,x}cs_offsets).
+    // These are engine-relative register offsets; the CS-MMIO selector
+    // makes hardware interpret them relative to the engine block.
+    const RELATIVE: u32 = 1 << 19;
+    let first = [
+        0x244, 0x34, 0x30, 0x38, 0x3c, 0x168, 0x140, 0x110, 0x1c0, 0x1c4, 0x1c8, 0x180, 0x2b4,
+    ];
+    r[CTX_LRI_HEADER_0] = mi_load_register_imm(13, true) | RELATIVE;
+    for (i, offset) in first.iter().enumerate() {
+        r[2 + i * 2] = b as u32 + offset;
+    }
     r[CTX_CONTEXT_CONTROL + 1] = CTX_CONTROL_VALUE;
-    r[CTX_RING_HEAD] = (b + 0x34) as u32;
-    r[CTX_RING_HEAD + 1] = 0;
-    r[CTX_RING_TAIL] = (b + 0x30) as u32;
-    r[CTX_RING_TAIL + 1] = 0;
-    r[CTX_RING_BUFFER_START] = (b + 0x38) as u32;
     r[CTX_RING_BUFFER_START + 1] = ring_ggtt;
-    r[CTX_RING_BUFFER_CONTROL] = (b + 0x3C) as u32;
     r[CTX_RING_BUFFER_CONTROL + 1] = ring_ctl_value(ring_bytes);
-    r[CTX_BB_HEAD_U] = (b + 0x168) as u32;
-    r[CTX_BB_HEAD_L] = (b + 0x140) as u32;
-    r[CTX_BB_STATE] = (b + 0x110) as u32;
-    // BB_STATE value 0: batches addressed via GGTT (the BB_START
-    // command's own indicator agrees).
-    r[CTX_SECOND_BB_HEAD_U] = (b + 0x11C) as u32;
-    r[CTX_SECOND_BB_HEAD_L] = (b + 0x114) as u32;
-    r[CTX_SECOND_BB_STATE] = (b + 0x118) as u32;
-    r[CTX_BB_PER_CTX_PTR] = (b + 0x1C0) as u32;
-    r[CTX_RCS_INDIRECT_CTX] = (b + 0x1C4) as u32;
-    r[CTX_RCS_INDIRECT_CTX_OFFSET] = (b + 0x1C8) as u32;
-    // Group 1: 9 pairs — context timestamp + PDP3..PDP0 (zero:
-    // GGTT contexts do not program PDPs).
-    r[CTX_LRI_HEADER_1] = mi_load_register_imm(9, true);
-    r[CTX_CTX_TIMESTAMP] = (b + 0x3A8) as u32;
+    r[CTX_LRI_HEADER_1] = mi_load_register_imm(9, true) | RELATIVE;
+    r[CTX_CTX_TIMESTAMP] = (b + 0x3a8) as u32;
     for i in 0..4u32 {
-        let udw_idx = CTX_PDP3_UDW + (i as usize) * 4;
-        r[udw_idx] = ring_pdp_udw_at(b, 3 - i) as u32;
-        r[udw_idx + 2] = ring_pdp_ldw_at(b, 3 - i) as u32;
+        let at = CTX_PDP3_UDW + i as usize * 4;
+        r[at] = ring_pdp_udw_at(b, 3 - i) as u32;
+        r[at + 2] = ring_pdp_ldw_at(b, 3 - i) as u32;
     }
-    // Group 2 (render only): R_PWR_CLK_STATE — zero selects the
-    // default SSEU power/clock configuration.
-    if spec.has_pwr_clk_state() {
-        r[CTX_LRI_HEADER_2] = mi_load_register_imm(1, false);
-        r[CTX_R_PWR_CLK_STATE] = R_PWR_CLK_STATE as u32;
+    if !spec.has_pwr_clk_state() {
+        r[CTX_XCS_END] = MI_BATCH_BUFFER_END | 1;
+        return r;
     }
-    // Gen10+ context images terminate the restore batch with
-    // MI_BATCH_BUFFER_END | 1.
+    r[0x34] = mi_load_register_imm(3, true) | RELATIVE;
+    for (i, offset) in [0x1b0, 0x5a8, 0x5ac].iter().enumerate() {
+        r[0x35 + i * 2] = b as u32 + offset;
+    }
+    r[CTX_LRI_HEADER_2] = mi_load_register_imm(1, false) | RELATIVE;
+    r[CTX_R_PWR_CLK_STATE] = R_PWR_CLK_STATE as u32;
+    // Six restore slots for CTX_WA_PTR repeat 0x588, followed by the
+    // remaining per-context register image. Values start zeroed.
+    const FINAL: [u32; 51] = [
+        0x588, 0x588, 0x588, 0x588, 0x588, 0x588, 0x28, 0x9c, 0xc0, 0x178, 0x17c, 0x358, 0x170,
+        0x150, 0x154, 0x158, 0x41c, 0x600, 0x604, 0x608, 0x60c, 0x610, 0x614, 0x618, 0x61c, 0x620,
+        0x624, 0x628, 0x62c, 0x630, 0x634, 0x638, 0x63c, 0x640, 0x644, 0x648, 0x64c, 0x650, 0x654,
+        0x658, 0x65c, 0x660, 0x664, 0x668, 0x66c, 0x670, 0x674, 0x678, 0x67c, 0x68, 0x84,
+    ];
+    r[0x51] = mi_load_register_imm(51, true) | RELATIVE;
+    for (i, offset) in FINAL.iter().enumerate() {
+        r[0x52 + i * 2] = b as u32 + offset;
+    }
     r[CTX_END] = MI_BATCH_BUFFER_END | 1;
     r
 }
@@ -545,7 +529,7 @@ pub const CSB_BUF0_DWORD: u64 = 0x10;
 pub const CSB_WRITE_DWORD: u64 = 0x2F;
 /// Number of CSB entries the Gen11+ hardware rotates through
 /// (i915 `GEN11_CSB_ENTRIES`).
-pub const CSB_ENTRIES: u8 = 8;
+pub const CSB_ENTRIES: u8 = 12;
 /// Byte offset of the CSB in the status page.
 pub const CSB_BUF_BYTE: u64 = CSB_BUF0_DWORD * 4;
 /// Byte offset of the CSB write pointer in the status page.
@@ -658,7 +642,7 @@ pub enum SubmitError {
     /// probed, or it is not a Gen12 part.
     NoEngine,
     /// A PPGTT root physical address failed validation
-    /// (unaligned, or outside the 39-bit GFX space) at
+    /// (unaligned, or outside the supported 46-bit address field) at
     /// [`RcsEngine::attach_ppgtt`].
     InvalidPpgttRoot,
     /// Production glue only: the render forcewake domain
@@ -920,7 +904,7 @@ impl GpuAllocator for GgttArena {
             frames,
         };
         for (p, frame) in backing.frames.iter().enumerate() {
-            let pte = encode_engine_pte(frame.start_address().raw(), PatSlot::Slot1, true)
+            let pte = encode_scanout_pte(frame.start_address().raw(), PatSlot::Slot0)
                 .map_err(|_| SubmitError::OutOfMemory)?;
             self.write_pte(off + (p as u32) * GTT_PAGE_SIZE as u32, pte);
         }
@@ -1146,7 +1130,7 @@ struct RcsContext<A: GpuAllocator> {
     ring: RingState,
     next_seqno: u32,
     last_completed_seqno: u32,
-    /// PPGTT root programmed into the image's PDP3 pair, when
+    /// PPGTT root programmed into the image's PDP0 pair, when
     /// one is attached (see [`RcsEngine::attach_ppgtt`]). The
     /// tables themselves are owned by the
     /// [`crate::intel_gpu_ppgtt::Ppgtt`] that produced the
@@ -1529,9 +1513,9 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
 
     /// Attach a PPGTT root (the PML4 physical address from
     /// [`crate::intel_gpu_ppgtt::Ppgtt::root_phys`]) to an idle
-    /// context: the register-state image's PDP3 pair is patched
-    /// to the root encoded as a table entry (`phys | PRESENT`),
-    /// and PDP0–PDP2 are zeroed. In the 4-level walk the PDP3
+    /// context: the register-state image's PDP0 pair is patched
+    /// to the raw root physical address in PDP0 (4-level mode),
+    /// and PDP1–PDP3 are zeroed. In the 4-level walk the PDP0
     /// pair is the root slot — the single patch site flagged in
     /// spec §9 for first-silicon verification.
     ///
@@ -1542,13 +1526,16 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// root to an idle context replaces the old one; the tables
     /// behind either root stay owned by their `Ppgtt`.
     pub fn attach_ppgtt(&mut self, id: ContextId, root_phys: u64) -> Result<(), SubmitError> {
-        let entry = encode_table_entry(root_phys).map_err(|_| SubmitError::InvalidPpgttRoot)?;
+        encode_table_entry(root_phys).map_err(|_| SubmitError::InvalidPpgttRoot)?;
+        if root_phys == 0 {
+            return Err(SubmitError::InvalidPpgttRoot);
+        }
         let slot = self.context(id)?.slot;
         if self.ctx_covered(slot) {
             return Err(SubmitError::ContextBusy);
         }
         let ctx = self.context_mut(id)?;
-        Self::patch_pdp_values(&ctx.image, Some(entry));
+        Self::patch_pdp_values(&ctx.image, Some(root_phys));
         ctx.ppgtt_root = Some(root_phys);
         Ok(())
     }
@@ -1572,15 +1559,15 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// register-state page. Template layout (group 1): the four
     /// PDP pairs run PDP3, PDP2, PDP1, PDP0 at a 4-dword stride
     /// from [`CTX_PDP3_UDW`], each pair holding its UDW value at
-    /// +1 and its LDW value at +3. `root` is the encoded PML4
-    /// table entry for PDP3; the other pairs are always zero in
+    /// +1 and its LDW value at +3. `root` is the raw PML4
+    /// physical address for PDP0; the other pairs are always zero in
     /// the 4-level model.
     fn patch_pdp_values<B: GpuBacking>(image: &B, root: Option<u64>) {
         for pair in 0..4u64 {
             let udw_val = CTX_PDP3_UDW as u64 + pair * 4 + 1;
             let ldw_val = udw_val + 2;
             let (hi, lo) = match (pair, root) {
-                (0, Some(entry)) => ((entry >> 32) as u32, entry as u32),
+                (3, Some(entry)) => ((entry >> 32) as u32, entry as u32),
                 _ => (0, 0),
             };
             image.write32(REG_STATE_PAGE_BYTE + udw_val * 4, hi);
@@ -1914,7 +1901,12 @@ pub fn production_idle() -> bool {
 
 fn attach_default() -> Result<(), SubmitError> {
     let (engine, fw_window) = crate::intel_gpu::with_controller(|gpu| {
-        gpu.chip_info().generation.region_generation()?;
+        if !matches!(
+            gpu.chip_info().generation,
+            crate::intel_gpu::Generation::TigerLake | crate::intel_gpu::Generation::AlderLake
+        ) {
+            return None;
+        }
         let arena = production_arena(gpu.gtt_mmadr);
         let engine = RcsEngine::new(BarWindow::new(gpu.gtt_mmadr), arena).ok()?;
         Some((engine, BarWindow::new(gpu.gtt_mmadr)))
@@ -2375,7 +2367,7 @@ pub mod tests {
         if mi_load_register_imm(1, false) != 0x1100_0001 {
             return TestResult::Fail("LRI header for 1 pair");
         }
-        if ring_ctl_value(RING_BYTES) != 0x3F {
+        if ring_ctl_value(RING_BYTES) != 0x1_f001 {
             return TestResult::Fail("RING_CTL for a 128 KiB ring");
         }
         if CTX_CONTROL_VALUE != 0x0009_0008 {
@@ -2387,7 +2379,10 @@ pub mod tests {
 
     fn smoke_reg_state_template() -> TestResult {
         let r = build_reg_state(0x1004_0000, RING_BYTES);
-        if r[0] != MI_NOOP || r[CTX_LRI_HEADER_0] != 0x1100_101B {
+        if CSB_ENTRIES != 12 || REG_STATE_DWORDS != 186 {
+            return TestResult::Fail("Gen12 CSB depth or context restore length");
+        }
+        if r[0] != MI_NOOP || r[CTX_LRI_HEADER_0] != 0x1108_1019 {
             return TestResult::Fail("group 0 header");
         }
         if r[CTX_CONTEXT_CONTROL] != RING_CONTEXT_CONTROL as u32
@@ -2403,10 +2398,10 @@ pub mod tests {
         {
             return TestResult::Fail("ring start pair");
         }
-        if r[CTX_RING_BUFFER_CONTROL + 1] != 0x3F {
+        if r[CTX_RING_BUFFER_CONTROL + 1] != 0x1_f001 {
             return TestResult::Fail("ring ctl value");
         }
-        if r[CTX_LRI_HEADER_1] != 0x1100_1011 {
+        if r[CTX_LRI_HEADER_1] != 0x1108_1011 {
             return TestResult::Fail("group 1 header");
         }
         // PDP pairs name descending PDPs and carry zero values.
@@ -2428,11 +2423,23 @@ pub mod tests {
         if r[CTX_PDP3_UDW + 12] != ring_pdp_udw(0) as u32 {
             return TestResult::Fail("PDP0 pair position");
         }
-        if r[CTX_LRI_HEADER_2] != 0x1100_0001 || r[CTX_R_PWR_CLK_STATE] != R_PWR_CLK_STATE as u32 {
+        if r[CTX_LRI_HEADER_2] != 0x1108_0001 || r[CTX_R_PWR_CLK_STATE] != R_PWR_CLK_STATE as u32 {
             return TestResult::Fail("group 2 (RCS power clock state)");
         }
         if r[CTX_END] != MI_BATCH_BUFFER_END | 1 {
             return TestResult::Fail("template terminator");
+        }
+        if r[0x34] != 0x1108_1005
+            || r[0x35] != 0x21b0
+            || r[0x37] != 0x25a8
+            || r[0x39] != 0x25ac
+            || r[0x51] != 0x1108_1065
+            || r[0x52] != 0x2588
+            || r[0x5e] != 0x2028
+            || r[0xb6] != 0x2084
+            || r[0xb8] != 0
+        {
+            return TestResult::Fail("Gen12 extended context restore groups");
         }
         TestResult::Pass
     }
@@ -2881,7 +2888,7 @@ pub mod tests {
         smoke_ppgtt_batch_start_encoding
     );
 
-    fn smoke_attach_ppgtt_programs_pdp3() -> TestResult {
+    fn smoke_attach_ppgtt_programs_pdp0() -> TestResult {
         let (mut engine, hw) = match make_engine() {
             Ok(p) => p,
             Err(f) => return f,
@@ -2914,22 +2921,22 @@ pub mod tests {
             Err(SubmitError::InvalidPpgttRoot) => {}
             _ => return TestResult::Fail("unaligned root must be refused"),
         }
-        match engine.attach_ppgtt(ctx, 1u64 << 39) {
+        match engine.attach_ppgtt(ctx, 1u64 << 46) {
             Err(SubmitError::InvalidPpgttRoot) => {}
-            _ => return TestResult::Fail(">39-bit root must be refused"),
+            _ => return TestResult::Fail(">46-bit root must be refused"),
         }
-        // Attach: PDP3 carries the root as a table entry
-        // (phys | PRESENT = 0x4000_0001 here); PDP0-2 stay zero.
+        // Attach: PDP0 carries the raw PML4 root address
+        // (raw phys = 0x4000_0000 here); PDP1-3 stay zero.
         engine.attach_ppgtt(ctx, 0x4000_0000).expect("attach");
         if engine.ppgtt_root(ctx) != Ok(Some(0x4000_0000)) {
             return TestResult::Fail("attached root not reported");
         }
-        if pdp_val(0, false) != 0x4000_0001 || pdp_val(0, true) != 0 {
-            return TestResult::Fail("PDP3 must carry root phys | PRESENT");
+        if pdp_val(3, false) != 0x4000_0000 || pdp_val(3, true) != 0 {
+            return TestResult::Fail("PDP0 must carry raw root physical address");
         }
-        for pair in 1..4 {
+        for pair in 0..3 {
             if pdp_val(pair, true) != 0 || pdp_val(pair, false) != 0 {
-                return TestResult::Fail("PDP0-2 must stay zero in 4-level mode");
+                return TestResult::Fail("PDP1-3 must stay zero in 4-level mode");
             }
         }
         // A loaded context refuses re-attach: submit covers the
@@ -2950,7 +2957,7 @@ pub mod tests {
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_rcs",
-        smoke_attach_ppgtt_programs_pdp3
+        smoke_attach_ppgtt_programs_pdp0
     );
 
     fn smoke_detach_ppgtt_zeroes_pdps() -> TestResult {

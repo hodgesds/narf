@@ -1,10 +1,8 @@
-//! GTT / PPGTT page-table entry codec — clean-room.
+//! Gen12 / Xe-LPG GPU page-table codecs.
 //!
-//! Reference: **Tiger Lake PRM Vol. 5 §"Memory Views"**.
-//! Cross-checked against ADL / RPL PRMs (same Gen12 PTE layout)
-//! and the Meteor Lake PRM Vol. 5 (extended cache-control bits
-//! noted but the legacy PTE encoding still works for KMS-grade
-//! scanout).
+//! References: Intel PRM Memory Views; the MIT-licensed i915
+//! `gt/intel_gtt.h`, `gt/gen8_ppgtt.c` and `gt/intel_ggtt.c` in Linux v6.12.
+//! These distinguish GPU encodings from CPU page-table encodings.
 //!
 //! ## GTT vs PPGTT
 //!
@@ -17,25 +15,20 @@
 //!   per command-streamer context. Used by the 3D / compute /
 //!   media engines.
 //!
-//! Both share the same **64-bit page-table-entry layout** — only
-//! the placement (single flat table vs 4-level walk) differs.
-//!
-//! ## PTE format (Gen12, 64-bit)
+//! Both use 64-bit entries, with different fields:
 //!
 //! ```text
-//!   bit 0     PRESENT       — entry is valid.
-//!   bit 1     RW            — read/write (display planes set 0; engines may set 1).
-//!   bits 2-3  PWT/PCD       — legacy x86 cache-control mirrors.
-//!   bit 6     LRU age       — 0=fresh, 1=aged.
-//!   bits 7-11 reserved
-//!   bits 12-38 phys[38:12]  — 4 KiB-aligned physical address.
-//!   bit 60    PAT[0]        — selects PAT (page-attribute table) entry.
-//!   bit 61    PAT[1]        — combined: 4 PAT slots → 4 cache modes.
-//!   bit 62    LRU bypass    — when set, this page bypasses LRU.
-//!   bit 63    NX            — no-execute (PPGTT only; GGTT ignores).
+//!                         Gen12                 Xe-LPG
+//! GGTT system memory      physical | PRESENT    + PAT[1:0] in bits53:52
+//! PPGTT 4KiB system       PRESENT, RW,           + PAT[3] in bit62
+//!                         PAT[2:0] in bits7,4,3
+//! PPGTT intermediate      physical | PRESENT | RW
 //! ```
 //!
-//! Source: TGL PRM Vol. 5 §"GFX PTE Definition".
+//! This implementation uses the common physical-address field 45:12 and
+//! 4KiB system pages. Local memory, large pages and later architectures are
+//! not admitted. There is no x86-style NX or LRU encoding in these entries.
+//! PAT indices name table entries whose policy the GT owner must establish.
 //!
 //! ## Scope
 //!
@@ -45,8 +38,7 @@
 //! actual GTTMMADR BAR length (never assumed), and every PTE
 //! write burst is followed by a readback flush so the writes are
 //! posted before the mapping is handed to hardware. The PPGTT
-//! walker lives in [`crate::intel_gpu_ppgtt`]; it shares this
-//! entry format through [`encode_table_entry`].
+//! walker lives in [`crate::intel_gpu_ppgtt`].
 
 // ── GGTT window layout (TGL PRM Vol. 5 §"GTTMMADR") ────────────
 
@@ -111,56 +103,89 @@ pub const PTE_PRESENT: u64 = 1 << 0;
 /// Read/write bit — display plane scanout sets this clear (RO);
 /// 3D/compute engines may set it.
 pub const PTE_RW: u64 = 1 << 1;
-/// PWT — legacy x86 PAT-bit-0 mirror.
-pub const PTE_PWT: u64 = 1 << 3;
-/// PCD — legacy x86 PAT-bit-1 mirror.
-pub const PTE_PCD: u64 = 1 << 4;
-/// LRU age bit — set on PTE eviction candidates.
-pub const PTE_LRU_AGE: u64 = 1 << 6;
-/// PAT bit 0 (selects PAT slot, low bit).
-pub const PTE_PAT0: u64 = 1 << 60;
-/// PAT bit 1 (selects PAT slot, high bit).
-pub const PTE_PAT1: u64 = 1 << 61;
-/// LRU-bypass — page never ages.
-pub const PTE_LRU_BYPASS: u64 = 1 << 62;
-/// NX — PPGTT no-execute.
-pub const PTE_NX: u64 = 1 << 63;
+/// PPGTT PAT index bit 0 (Gen12+).
+pub const PTE_PAT0: u64 = 1 << 3;
+/// PPGTT PAT index bit 1 (Gen12+).
+pub const PTE_PAT1: u64 = 1 << 4;
+/// PPGTT PAT index bit 2 (Gen12+).
+pub const PTE_PAT2: u64 = 1 << 7;
+/// PPGTT PAT index bit 3 (Meteor Lake / Xe-LPG).
+pub const PTE_PAT3: u64 = 1 << 62;
+/// Conservative common system-memory address field (bits 45:12).
+/// Source: MIT i915 gt/intel_gtt.h GEN12_GGTT_PTE_ADDR_MASK.
+pub const PTE_PHYS_MASK: u64 = 0x0000_3FFF_FFFF_F000;
 
-/// PRM-mandated phys mask: bits[38:12]. Higher bits are reserved
-/// — the GTT physical-address space is 39 bits wide.
-pub const PTE_PHYS_MASK: u64 = 0x0000_007F_FFFF_F000;
+/// Distinct GPU page-table formats. GGTT and PPGTT do not share a
+/// cache encoding; neither has the x86 NX bit previously emitted here.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PteFormat {
+    Gen12,
+    XeLpg,
+}
+
+impl PteFormat {
+    pub fn encode_ggtt(self, phys: u64, pat_index: u8) -> Result<u64, GttError> {
+        validate_phys(phys)?;
+        if pat_index > 3 {
+            return Err(GttError::InvalidPatIndex);
+        }
+        let pat = match self {
+            Self::Gen12 => 0, // Gen8/Gen12 GGTT has no PAT index fields.
+            Self::XeLpg => ((pat_index as u64 & 1) << 52) | ((pat_index as u64 & 2) << 52),
+        };
+        Ok(phys | PTE_PRESENT | pat)
+    }
+
+    pub fn encode_ppgtt(self, phys: u64, pat_index: u8, writable: bool) -> Result<u64, GttError> {
+        validate_phys(phys)?;
+        let max = match self {
+            Self::Gen12 => 7,
+            Self::XeLpg => 15,
+        };
+        if pat_index > max {
+            return Err(GttError::InvalidPatIndex);
+        }
+        let pat = ((pat_index as u64 & 1) << 3)
+            | ((pat_index as u64 & 2) << 3)
+            | ((pat_index as u64 & 4) << 5)
+            | ((pat_index as u64 & 8) << 59);
+        Ok(phys | PTE_PRESENT | if writable { PTE_RW } else { 0 } | pat)
+    }
+}
+
+fn validate_phys(phys: u64) -> Result<(), GttError> {
+    if phys & 0xfff != 0 {
+        return Err(GttError::UnalignedPhys);
+    }
+    if phys & !PTE_PHYS_MASK != 0 {
+        return Err(GttError::PhysOutOfRange);
+    }
+    Ok(())
+}
 
 /// Page size — every Gen12 GTT entry maps a 4 KiB page.
 pub const GTT_PAGE_SIZE: u64 = 0x1000;
 
-/// Documented PAT slots on Gen12. PRM Vol. 5 §"PAT Index Encoding".
-///
-/// The PAT (Page Attribute Table) is a 64-byte register block
-/// programmed by firmware / BIOS at boot. Each slot picks a
-/// (memory-type, cache-policy) combination; the GTT PTE selects
-/// one of four slots through `PAT0` + `PAT1`.
+/// A low-two-bit PAT index. Cache policy is defined by programmed PAT
+/// registers, not by this numeric slot; callers must initialize that table.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u64)]
 pub enum PatSlot {
-    /// Slot 0 — PAT default (typically Uncached).
     Slot0 = 0,
-    /// Slot 1 — usually LLC + eLLC cached, write-back.
     Slot1 = 1,
-    /// Slot 2 — write-combining (the typical scanout choice).
     Slot2 = 2,
-    /// Slot 3 — extended (Xe-LPG only).
     Slot3 = 3,
 }
 
 impl PatSlot {
-    /// Pack into the `PAT0` + `PAT1` PTE bits.
+    /// Pack the low two PPGTT PAT index bits.
     pub const fn encode(self) -> u64 {
         let v = self as u64;
-        ((v & 1) << 60) | (((v >> 1) & 1) << 61)
+        ((v & 1) << 3) | (((v >> 1) & 1) << 4)
     }
     pub const fn decode(pte: u64) -> Self {
-        let lo = (pte >> 60) & 1;
-        let hi = (pte >> 61) & 1;
+        let lo = (pte >> 3) & 1;
+        let hi = (pte >> 4) & 1;
         match (hi << 1) | lo {
             0 => PatSlot::Slot0,
             1 => PatSlot::Slot1,
@@ -174,62 +199,35 @@ impl PatSlot {
 pub enum GttError {
     /// Phys address isn't 4 KiB-aligned.
     UnalignedPhys,
-    /// Phys address has bits set outside the documented 39-bit
-    /// physical-address space.
+    /// Phys address has bits set outside the supported 46-bit
+    /// system-memory address field.
     PhysOutOfRange,
     /// Physical allocation failed.
     OutOfMemory,
     /// The requested GGTT range escapes the GGTT window implied
     /// by the actual GTTMMADR BAR length.
     OutOfBounds,
+    /// PAT index cannot be represented by this generation/table format.
+    InvalidPatIndex,
 }
 
-/// Build a present, read-only PTE for a scanout page.
-///
-/// `phys` must be 4 KiB-aligned and fit in 39 bits. `pat` picks
-/// the cache policy — `Slot2` (write-combining) is the standard
-/// choice for display-plane scanout.
-pub fn encode_scanout_pte(phys: u64, pat: PatSlot) -> Result<u64, GttError> {
-    if phys & 0xFFF != 0 {
-        return Err(GttError::UnalignedPhys);
-    }
-    if phys & !PTE_PHYS_MASK != 0 {
-        return Err(GttError::PhysOutOfRange);
-    }
-    Ok(PTE_PRESENT | (phys & PTE_PHYS_MASK) | pat.encode())
+/// Gen12 system-memory GGTT entry. `pat` is ignored because this format
+/// has no PAT bits; use PteFormat::XeLpg for Meteor/Arrow Lake GGTT entries.
+pub fn encode_scanout_pte(phys: u64, _pat: PatSlot) -> Result<u64, GttError> {
+    PteFormat::Gen12.encode_ggtt(phys, 0)
 }
 
-/// Build a present, read/write PTE for a 3D / compute engine
-/// (PPGTT). `pat` typically `Slot1` (LLC cached) for shader
-/// surfaces, `Slot2` for staging buffers.
-pub fn encode_engine_pte(phys: u64, pat: PatSlot, executable: bool) -> Result<u64, GttError> {
-    if phys & 0xFFF != 0 {
-        return Err(GttError::UnalignedPhys);
-    }
-    if phys & !PTE_PHYS_MASK != 0 {
-        return Err(GttError::PhysOutOfRange);
-    }
-    let mut v = PTE_PRESENT | PTE_RW | (phys & PTE_PHYS_MASK) | pat.encode();
-    if !executable {
-        v |= PTE_NX;
-    }
-    Ok(v)
+/// Gen12 PPGTT leaf. The boolean controls GPU write permission; Intel GPU
+/// page tables do not provide the CPU-style NX permission formerly claimed.
+pub fn encode_engine_pte(phys: u64, pat: PatSlot, writable: bool) -> Result<u64, GttError> {
+    PteFormat::Gen12.encode_ppgtt(phys, pat as u8, writable)
 }
 
-/// Build a page-*table* entry pointing at the next-level table
-/// at `next_level_phys`: the same 64-bit GFX PTE layout as a leaf
-/// entry with only `PRESENT` set. Intermediate PPGTT entries
-/// (PML4E / PDPTE / PDE) and GGTT entries share this encoding —
-/// TGL PRM Vol. 5 §"GFX PTE Definition" defines one entry format
-/// for every level of both walks.
+/// PPGTT intermediate entry: physical address, PRESENT and RW. The
+/// default page-directory cache policy is PAT index zero.
 pub fn encode_table_entry(next_level_phys: u64) -> Result<u64, GttError> {
-    if next_level_phys & 0xFFF != 0 {
-        return Err(GttError::UnalignedPhys);
-    }
-    if next_level_phys & !PTE_PHYS_MASK != 0 {
-        return Err(GttError::PhysOutOfRange);
-    }
-    Ok(PTE_PRESENT | (next_level_phys & PTE_PHYS_MASK))
+    validate_phys(next_level_phys)?;
+    Ok(PTE_PRESENT | PTE_RW | next_level_phys)
 }
 
 /// Decode the phys-address portion of an existing PTE.
@@ -402,6 +400,22 @@ pub fn alloc_contiguous_scanout_at(
     gtt_offset: u64,
     size_bytes: u64,
 ) -> Result<ContiguousScanout, GttError> {
+    alloc_contiguous_scanout_with_format(gtt_mmadr, gtt_offset, size_bytes, PteFormat::Gen12, 0)
+}
+
+/// Allocate a scanout using the generation's GGTT format and an already
+/// programmed PAT index (Xe-LPG only). No PAT policy is inferred from a slot.
+pub fn alloc_contiguous_scanout_with_format(
+    gtt_mmadr: &narf_bus::bar::MmioRegion,
+    gtt_offset: u64,
+    size_bytes: u64,
+    format: PteFormat,
+    pat_index: u8,
+) -> Result<ContiguousScanout, GttError> {
+    if size_bytes == 0 || gtt_offset % GTT_PAGE_SIZE != 0 || gtt_offset > u32::MAX as u64 {
+        return Err(GttError::OutOfBounds);
+    }
+    format.encode_ggtt(0, pat_index)?;
     let order = scanout_order_for(size_bytes).ok_or(GttError::OutOfMemory)?;
     let pages = size_bytes.div_ceil(GTT_PAGE_SIZE);
     check_ggtt_range(gtt_mmadr.len, gtt_offset, pages * GTT_PAGE_SIZE)?;
@@ -409,7 +423,7 @@ pub fn alloc_contiguous_scanout_at(
     let base = head.start_address().raw();
     for i in 0..pages {
         let phys = base + i * GTT_PAGE_SIZE;
-        let pte = match encode_scanout_pte(phys, PatSlot::Slot2) {
+        let pte = match format.encode_ggtt(phys, pat_index) {
             Ok(p) => p,
             Err(e) => {
                 narf_memory::frame::free_pages(head, order);
@@ -501,8 +515,8 @@ pub mod tests {
         if pte_phys(pte) != phys {
             return TestResult::Fail("phys round-trip");
         }
-        if PatSlot::decode(pte) != PatSlot::Slot2 {
-            return TestResult::Fail("PAT slot lost in encode");
+        if pte != 0x0000_0001_2345_6001 {
+            return TestResult::Fail("Gen12 GGTT has no PAT bits");
         }
         if pte & PTE_RW != 0 {
             return TestResult::Fail("scanout PTE must be RO");
@@ -511,20 +525,54 @@ pub mod tests {
     }
     kernel_test_in!("drivers/gpu/intel_gpu_gtt", smoke_scanout_pte_layout);
 
-    fn smoke_engine_pte_nx() -> TestResult {
-        let pte = match encode_engine_pte(0x1000, PatSlot::Slot1, false) {
-            Ok(p) => p,
-            Err(_) => return TestResult::Fail("clean inputs rejected"),
-        };
-        if pte & PTE_NX == 0 {
-            return TestResult::Fail("non-executable engine PTE must set NX");
-        }
-        if pte & PTE_RW == 0 {
-            return TestResult::Fail("engine PTE must be RW");
+    fn smoke_engine_pte_permissions() -> TestResult {
+        if encode_engine_pte(0x1000, PatSlot::Slot1, false) != Ok(0x1009)
+            || encode_engine_pte(0x1000, PatSlot::Slot1, true) != Ok(0x100b)
+        {
+            return TestResult::Fail("PPGTT PAT/RW fields must use GPU encoding");
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu/intel_gpu_gtt", smoke_engine_pte_nx);
+    kernel_test_in!("drivers/gpu/intel_gpu_gtt", smoke_engine_pte_permissions);
+
+    fn smoke_xelpg_and_gen12_page_table_vectors() -> TestResult {
+        // MIT i915 gt/intel_gtt.h + gen8_ppgtt.c + intel_ggtt.c:
+        // PPGTT PAT[2:0] = bits7,4,3; MTL adds PAT3 at62.
+        // MTL GGTT PAT[1:0] = bits53,52; Gen12 GGTT ignores PAT.
+        let phys = 0x0000_0123_4567_8000;
+        let cases = [
+            (PteFormat::Gen12.encode_ggtt(phys, 3), 0x0000_0123_4567_8001),
+            (PteFormat::XeLpg.encode_ggtt(phys, 3), 0x0030_0123_4567_8001),
+            (
+                PteFormat::Gen12.encode_ppgtt(phys, 7, true),
+                0x0000_0123_4567_809b,
+            ),
+            (
+                PteFormat::XeLpg.encode_ppgtt(phys, 15, true),
+                0x4000_0123_4567_809b,
+            ),
+            (
+                PteFormat::XeLpg.encode_ppgtt(phys, 8, false),
+                0x4000_0123_4567_8001,
+            ),
+        ];
+        for (actual, expected) in cases {
+            if actual != Ok(expected) {
+                return TestResult::Fail("GPU page-table reference vector");
+            }
+        }
+        if PteFormat::Gen12.encode_ppgtt(phys, 8, true) != Err(GttError::InvalidPatIndex)
+            || PteFormat::XeLpg.encode_ppgtt(phys, 16, true) != Err(GttError::InvalidPatIndex)
+            || PteFormat::XeLpg.encode_ggtt(phys, 4) != Err(GttError::InvalidPatIndex)
+        {
+            return TestResult::Fail("unrepresentable PAT index admitted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gtt",
+        smoke_xelpg_and_gen12_page_table_vectors
+    );
 
     fn smoke_pte_rejects_unaligned_phys() -> TestResult {
         match encode_scanout_pte(0x1234, PatSlot::Slot2) {
@@ -538,10 +586,10 @@ pub mod tests {
     );
 
     fn smoke_pte_rejects_out_of_range_phys() -> TestResult {
-        // Bit 39 set — outside the documented 39-bit phys window.
-        match encode_scanout_pte(1u64 << 39, PatSlot::Slot2) {
+        // Bit 46 set — outside the supported physical field.
+        match encode_scanout_pte(1u64 << 46, PatSlot::Slot2) {
             Err(GttError::PhysOutOfRange) => TestResult::Pass,
-            _ => TestResult::Fail(">39-bit phys must be rejected"),
+            _ => TestResult::Fail(">46-bit phys must be rejected"),
         }
     }
     kernel_test_in!(
@@ -550,19 +598,19 @@ pub mod tests {
     );
 
     fn smoke_table_entry_encoding() -> TestResult {
-        // Byte-for-byte pin: a table entry is PRESENT | phys, in
+        // Byte-for-byte pin: a table entry is PRESENT | RW | phys, in
         // the same GFX PTE layout as a leaf (PRM Vol. 5).
         match encode_table_entry(0x0000_0001_2345_6000) {
-            Ok(0x0000_0001_2345_6001) => {}
-            _ => return TestResult::Fail("table entry must be phys | PRESENT"),
+            Ok(0x0000_0001_2345_6003) => {}
+            _ => return TestResult::Fail("table entry must be phys | PRESENT | RW"),
         }
         match encode_table_entry(0x1234) {
             Err(GttError::UnalignedPhys) => {}
             _ => return TestResult::Fail("unaligned table phys must be rejected"),
         }
-        match encode_table_entry(1u64 << 39) {
+        match encode_table_entry(1u64 << 46) {
             Err(GttError::PhysOutOfRange) => {}
-            _ => return TestResult::Fail(">39-bit table phys must be rejected"),
+            _ => return TestResult::Fail(">46-bit table phys must be rejected"),
         }
         TestResult::Pass
     }
