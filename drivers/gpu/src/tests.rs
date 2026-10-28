@@ -1045,9 +1045,16 @@ fn smoke_dp_edid_over_aux_round_trip() -> TestResult {
                         data: &reply_buf[1..1],
                     })
                 }
-                AuxCommand::I2cReadMot => {
-                    // Return up to (reply_buf.len() - 1) bytes
-                    // starting at cursor.
+                AuxCommand::I2cRead | AuxCommand::I2cReadMot => {
+                    // Serve the read burst starting at cursor.
+                    // `read_edid_block` issues one I2C transaction
+                    // per block with MOT clear on every burst but
+                    // the last (DP 1.4a §2.7.6), so a stub that
+                    // only answers I2cReadMot rejects the very
+                    // first chunk; the MOT bit does not change
+                    // what bytes a read returns. Reply with
+                    // exactly the bytes copied, not the buffer's
+                    // capacity.
                     let n = reply_buf.len() - 1;
                     reply_buf[0] = 0;
                     let end = (self.cursor + n).min(self.edid.len());
@@ -1056,7 +1063,7 @@ fn smoke_dp_edid_over_aux_round_trip() -> TestResult {
                     self.cursor += slice.len();
                     Ok(AuxResponse {
                         status: AuxStatus::Ack,
-                        data: &reply_buf[1..1 + n],
+                        data: &reply_buf[1..1 + slice.len()],
                     })
                 }
                 _ => Err(AuxError::UnknownStatus),

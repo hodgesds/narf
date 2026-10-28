@@ -1382,9 +1382,13 @@ pub mod tests {
         {
             return TestResult::Fail("HDMI modeset must not program DP M/N");
         }
-        // The WRPLL rows for 148.5 MHz (19.2 MHz family):
-        // CFGCR0 = int 0x173 | frac 0x2000, CFGCR1 = 0xE87.
-        if mmio.writes_to(DPLL_CFGCR0_DPLL0) != alloc::vec![0x0080_0173] {
+        // The WRPLL rows for 148.5 MHz in the fixture's
+        // DSSM-strapped 19.2 MHz family (see HdmiSinkMmio::new):
+        // CFGCR0 = int 0x1D0 | frac 0x0800, CFGCR1 = 0xE87 —
+        // the rows `smoke_hdmi_wrpll_rows` pins for this family
+        // (the 0x173/0x2000 pair this assertion previously
+        // carried is the 24 MHz family's row).
+        if mmio.writes_to(DPLL_CFGCR0_DPLL0) != alloc::vec![0x0020_01D0] {
             return TestResult::Fail("CFGCR0 must carry the 148.5 MHz WRPLL solution");
         }
         if mmio.writes_to(dpll_cfgcr1(DPLL_CFGCR0_DPLL0)) != alloc::vec![0xE87] {
