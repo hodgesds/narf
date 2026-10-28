@@ -1684,11 +1684,19 @@ pub mod tests {
             }
             if off == self.port.port_clock_ctl() {
                 let s = self.stored(off);
-                // ACK bits mirror their REQUEST bits (bit n-1):
-                // refclk requests (bits 29/25) always ACK; the
-                // injection switch withholds the PLL ACKs
-                // (bits 31/27 → 30/26).
-                let mut v = s | ((s & 0x2200_0000) >> 1);
+                // ACK bits are read-only outputs mirroring their
+                // REQUEST bits (bit n-1): refclk requests (bits
+                // 29/25) always ACK; the injection switch withholds
+                // the PLL ACKs (bits 31/27 → 30/26). The ACK
+                // positions are masked out of the stored word
+                // first: production's read-modify-writes write the
+                // composed read value back, and on hardware the
+                // ACK bits ignore writes — if the model stored
+                // them, a dropped request would leave its ACK
+                // latched forever and the ACK-clear poll could
+                // never complete.
+                let mut v = s & !0x5500_0000;
+                v |= (s & 0x2200_0000) >> 1;
                 if !self.no_clock_ack.get() {
                     v |= (s & 0x8800_0000) >> 1;
                 }
@@ -1699,9 +1707,16 @@ pub mod tests {
             }
             if off == self.port.buf_ctl2() {
                 let s = self.stored(off);
-                // Powerdown-update bits self-clear; lane PHY status
-                // mirrors the pipe-reset bits (>>2).
-                return (s & !0x0300_0000) | ((s & 0xC000_0000) >> 2);
+                // Powerdown-update bits self-clear; lane PHY
+                // status bits are read-only outputs mirroring the
+                // pipe-reset bits (>>2). Both positions are masked
+                // out of the stored word: production's
+                // read-modify-writes write the composed read value
+                // back, and on hardware these bits ignore writes —
+                // if the model stored the mirrored status bits,
+                // the reset-end poll would see them set forever
+                // and every PLL enable would time out.
+                return (s & !0x3300_0000) | ((s & 0xC000_0000) >> 2);
             }
             self.stored(off)
         }
