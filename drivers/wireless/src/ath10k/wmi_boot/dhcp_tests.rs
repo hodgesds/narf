@@ -1166,10 +1166,14 @@ fn occupancy(htt_first: bool) -> Result<(), &'static str> {
         return Err("fixture release did not publish actual terminal CE source index");
     }
     if !htt_first {
+        // The terminal CE source index frees only the bounce slot. The first
+        // HTT ID stays owned while the queued frame takes its own ID
+        // (N-deep pipeline, Linux htt_tx.c::ath10k_htt_tx_alloc_msdu_id).
         h.pump();
         if !h.model(|m| {
-            m.ce.as_ref().unwrap().sent == sent
-                && m.inner.storage.as_ref().unwrap().tx.pending() == 1
+            m.ce.as_ref().unwrap().sent == sent + 1
+                && m.inner.storage.as_ref().unwrap().tx.pending() == 2
+                && m.data.as_ref().unwrap().held.len() == 2
         }) {
             return Err("CE receipt substituted for actual HTT completion");
         }
@@ -1185,7 +1189,7 @@ fn occupancy(htt_first: bool) -> Result<(), &'static str> {
             && m.data.as_ref().unwrap().held.len() == 1
             && m.data.as_ref().unwrap().uplink == [uplink.clone(), uplink]
     }) {
-        return Err("terminal HTT ID did not unlock exactly queued frame");
+        return Err("terminal HTT ID did not retire exactly its own frame");
     }
     Ok(())
 }

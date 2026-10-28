@@ -1022,6 +1022,8 @@ kernel_test_in!(
 
 #[path = "dhcp_tests.rs"]
 mod dhcp_tests;
+#[path = "tx_pipeline_tests.rs"]
+mod tx_pipeline_tests;
 
 pub(super) fn protection_handles(d: Dialect, b: &[u8]) -> bool {
     b.get(..4).is_some_and(|id| {

@@ -8,8 +8,12 @@ const RECEIVED_FRAMES: usize = 256;
 const INCOMING_FRAMES: usize = 1024;
 #[path = "rx_ba.rs"]
 mod rx_ba;
+#[path = "tx_pipeline.rs"]
+mod tx_pipeline;
 #[path = "tx_qos.rs"]
 mod tx_qos;
+pub use tx_pipeline::TidCounters;
+use tx_pipeline::{Completion, Outcome, Pipeline, Role};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Link {
@@ -43,16 +47,10 @@ impl RawFrame for Native {
     }
 }
 #[derive(Debug)]
-struct Pending {
-    id: u16,
-    reply: bool,
-    length: usize,
-    deadline: narf_time::Deadline,
-}
-#[derive(Debug)]
 pub(super) struct State {
     security: Option<Security>,
-    pending: Option<Pending>,
+    /// Every outstanding native HTT ID, keyed by MSDU ID (heap-owned).
+    pending: Pipeline,
     incoming: VecDeque<Incoming>,
     rx_ba: rx_ba::Owner,
     #[cfg(any(test, feature = "kernel-test"))]
@@ -71,23 +69,19 @@ pub(super) struct State {
 impl State {
     pub(super) fn protection_allowed(&self) -> bool {
         self.open()
-            && self.pending.as_ref().is_none_or(|p| !p.reply)
+            && !self.pending.reply_in_flight()
             && self.security.as_ref().is_none_or(|s| !s.handshake_active())
     }
     pub(super) fn protection_idle(&self) -> bool {
-        self.pending.is_none()
+        self.pending.is_empty()
     }
+    /// Protection programming drains data IDs; a reply cannot be in flight
+    /// (protection_allowed), so meeting one here is an ownership violation.
     pub(super) fn protection_receipt(&mut self, receipt: htt::TxReceipt) -> Result<(), Error> {
-        if self.pending.as_ref().is_some_and(|p| p.id == receipt.id) {
-            if self.pending.as_ref().unwrap().reply {
-                return Err(Error::Failed);
-            }
-            if receipt.status != 0 {
-                return Err(Error::Firmware(u32::from(receipt.status)));
-            }
-            self.pending = None;
+        match self.pending.complete(receipt) {
+            Completion::Reply { .. } => Err(Error::Failed),
+            Completion::Foreign | Completion::Data { .. } => Ok(()),
         }
-        Ok(())
     }
     pub(super) fn fail(&mut self) {
         self.failed = true;
@@ -294,6 +288,20 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             protected: associated.protected,
         })
     }
+    /// Native HTT data/reply IDs awaiting their terminal TX indication.
+    pub fn tx_in_flight(&self) -> usize {
+        self.data.as_ref().map_or(0, |d| d.pending.len())
+    }
+    /// Terminal HTT TX outcomes for one TID (16 = non-QoS).
+    pub fn tx_counters(&self, tid: u8) -> TidCounters {
+        self.data
+            .as_ref()
+            .map_or(TidCounters::default(), |d| d.pending.counters(tid))
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(in crate::ath10k) fn tx_in_flight_ids(&self) -> Vec<u16> {
+        self.data.as_ref().map_or(Vec::new(), |d| d.pending.ids())
+    }
     pub(in crate::ath10k) fn data_permission(&self) -> Option<Permission> {
         self.station_link()?;
         Some(self.peer.as_ref()?.permission)
@@ -448,7 +456,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         while self.htt.take_tx_receipt().is_some() {}
         self.data = Some(State {
             security,
-            pending: None,
+            pending: Pipeline::new()?,
             incoming,
             rx_ba,
             #[cfg(any(test, feature = "kernel-test"))]
@@ -504,7 +512,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.check_data_policy(domain)?;
         let own = self.ready.ok_or(Error::Failed)?.mac;
         let data = self.data.as_mut().ok_or(Error::Failed)?;
-        if data.pending.is_some() || data.security.as_ref().is_some_and(|s| !s.port_open()) {
+        if !data.pending.data_admissible() || data.security.as_ref().is_some_and(|s| !s.port_open())
+        {
             return Err(Error::Htt(htt::Error::Busy));
         }
         // ieee80211_select_queue + ieee80211_downgrade_queue (tx_qos.rs).
@@ -561,21 +570,21 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         let frame = self.ethernet_frame(domain, bytes)?;
         self.failed = true;
+        let tid = tx_qos::descriptor_tid(&frame);
         let id = self.htt.begin_transmit(
             htt::tx::Parameters {
                 kind: htt::tx::Kind::Raw,
                 vdev: 0,
-                tid: tx_qos::descriptor_tid(&frame),
+                tid,
                 hardware_crypto: false,
             },
             &frame,
         )?;
-        self.data.as_mut().ok_or(Error::Failed)?.pending = Some(Pending {
+        self.data.as_mut().ok_or(Error::Failed)?.pending.push(
             id,
-            reply: false,
-            length: frame.len(),
-            deadline: narf_time::Deadline::after_ms(3000),
-        });
+            Role::Data { tid },
+            frame.len(),
+        )?;
         self.failed = false;
         Ok(id)
     }
@@ -614,12 +623,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         },
                         &reply,
                     )?;
-                    self.data.as_mut().ok_or(Error::Failed)?.pending = Some(Pending {
+                    self.data.as_mut().ok_or(Error::Failed)?.pending.push(
                         id,
-                        reply: true,
-                        length: reply.len(),
-                        deadline: narf_time::Deadline::after_ms(3000),
-                    });
+                        Role::Reply,
+                        reply.len(),
+                    )?;
                 }
             }
             if idle {
@@ -638,24 +646,29 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         Ok(Vec::new())
     }
     async fn send_data(&mut self, frame: &[u8], reply: bool) -> Result<u16, Error> {
+        let tid = tx_qos::descriptor_tid(frame);
         let id = self
             .htt
             .transmit(
                 htt::tx::Parameters {
                     kind: htt::tx::Kind::Raw,
                     vdev: 0,
-                    tid: tx_qos::descriptor_tid(frame),
+                    tid,
                     hardware_crypto: false,
                 },
                 frame,
             )
             .await?;
-        self.data.as_mut().ok_or(Error::Failed)?.pending = Some(Pending {
-            id,
-            reply,
-            length: frame.len(),
-            deadline: narf_time::Deadline::after_ms(3000),
-        });
+        let role = if reply {
+            Role::Reply
+        } else {
+            Role::Data { tid }
+        };
+        self.data
+            .as_mut()
+            .ok_or(Error::Failed)?
+            .pending
+            .push(id, role, frame.len())?;
         Ok(id)
     }
     /// Consume the same retained HTC/HTT owner used for join/teardown. Receive
@@ -721,12 +734,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             return Err(Error::Failed);
         }
-        if self
-            .data
-            .as_ref()
-            .and_then(|d| d.pending.as_ref())
-            .is_some_and(|p| p.deadline.expired())
-        {
+        if self.data.as_ref().is_some_and(|d| d.pending.expired()) {
             if let Some(data) = &mut self.data {
                 data.fail();
             }
@@ -870,13 +878,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             _ => {}
         }
+        // Linux ath10k_htt_rx_tx_compl_ind -> ath10k_txrx_tx_unref: each ID
+        // in a (possibly multi-MSDU) indication retires independently.
         while let Some(receipt) = self.htt.take_tx_receipt() {
-            if data.pending.as_ref().is_some_and(|p| p.id == receipt.id) {
-                let pending = data.pending.take().ok_or(Error::Failed)?;
-                if receipt.status != 0 {
+            match data.pending.complete(receipt) {
+                Completion::Foreign | Completion::Data { .. } => {}
+                Completion::Reply { outcome, .. } if outcome != Outcome::Ack => {
                     return Err(Error::Firmware(u32::from(receipt.status)));
                 }
-                if pending.reply {
+                Completion::Reply { length, .. } => {
                     // Native reply completion is a receive-admission epoch
                     // boundary. Firmware BA agreements persist across rekey,
                     // but no retained PPDU PHY proof crosses this boundary.
@@ -884,7 +894,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     data.security
                         .as_mut()
                         .ok_or(Error::Failed)?
-                        .reply_delivered(pending.length)
+                        .reply_delivered(length)
                         .map_err(security_error)?;
                     if data.security.as_ref().is_some_and(Security::port_open) {
                         data.authorized = true;
@@ -892,7 +902,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 }
             }
         }
-        while data.pending.as_ref().is_none_or(|pending| !pending.reply)
+        while !data.pending.reply_in_flight()
             && data
                 .security
                 .as_ref()
@@ -970,7 +980,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 data.received.push_back(frame);
             }
         }
-        let reply = if data.pending.is_none() {
+        // Key-reply fence: the reply waits for every earlier data ID.
+        let reply = if data.pending.reply_admissible() {
             data.security
                 .as_ref()
                 .and_then(Security::pending_frame)

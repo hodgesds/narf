@@ -313,6 +313,30 @@ Host-bus/system power transitions remain separate profiles.
   16). RX binds QoS TID to the native descriptor before replay/PN
   commitment. TX aggregation, TSPEC and U-APSD remain separate features.
   APs without WMM retain the legacy packet/command profile.
+- N-deep native TX pipeline (`wmi_runtime/tx_pipeline.rs`): station data
+  keeps up to 32 native HTT IDs in flight, in a heap-owned table keyed by
+  MSDU ID (Linux v7.2 `htt_tx.c::ath10k_htt_tx_alloc_msdu_id`, the
+  `htt->pending_tx` IDR). Each ID's payload/fragment DMA stays owned by
+  `htt_runtime::tx::Pool` until an HTT TX completion indication names it;
+  the CE source receipt only frees the bounce slot, so the next frame may
+  be published under its own ID while earlier IDs are outstanding. One
+  indication may name several IDs in any order
+  (`htt_rx.c::ath10k_htt_rx_tx_compl_ind`); the whole batch is validated
+  before any ID is freed, and a duplicate or unknown ID fails the HTT owner
+  without partial release. Each ID then retires independently
+  (`txrx.c::ath10k_txrx_tx_unref`). Status maps as in Linux: OK is ACK,
+  NO_ACK is no-ACK, DISCARD/POSTPONE/unknown are discard. A data receipt
+  never fails the link; its outcome is counted per TID
+  (`Radio::tx_counters`, index 16 non-QoS). Key-reply fencing is explicit
+  and two-sided. A supplicant EAPOL reply (M2/M4, group 2/2) is published
+  only once every earlier data ID has reached its terminal indication.
+  While the reply is in flight no data ID is admitted and RX admission
+  stays paused. A non-OK reply receipt still fails the owner. A full table
+  or an in-flight reply returns `Htt(Busy)` before anything is published.
+  Station protection programming drains every data ID first; it refuses a
+  reply in flight. Teardown and failure close the owner but keep every
+  in-flight ID and its DMA until whole-device reset. A completion is never
+  invented. The per-ID deadline (3 s) fails the owner, as before.
 - The registered Device binds native preparation, authentication/association,
   WMM/peer/up commands and initial RSNA data to a chosen factory/frequency/power
   receipt. It samples current policy before and after each nested wait and
