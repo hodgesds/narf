@@ -409,6 +409,78 @@ area (`SlotArea`, design §10.2) — the secret-free mirror the
 resume environment finds slots through; its codec is strict and
 total (caps before allocation, trailing garbage refused).
 
+**TPM custody anchor (design §8.3, #1002).** `TpmAnchor`
+implements `KeyCustodyAnchor` over the TPM extension surface's
+transport seam (`narf-drivers-tpm::devfs_bridge::TpmTransport`;
+production construction reads the platform's registered
+transport, and no registered transport means the anchor does not
+exist — a TPM-less machine's other factors are unaffected, and
+the anchor's failures are `AnchorError::Unavailable`, never a
+service-wide refusal or a silent policy fallback). *Wrap* seals
+the SMS as caller-supplied data in a KEYEDHASH object
+(`sensitiveDataOrigin` CLEAR) under a regenerated owner storage
+primary; the object's `authPolicy` is a PolicyPCR digest over
+PCRs `[0,1,2,3,4,5,6,7,9,10]` in the SHA-256 bank, computed
+through a trial session from the TPM's own PCR_Read composite
+(TPM 2.0 Library Part 3 §23.7). *Unwrap* regenerates the primary,
+loads the object, and satisfies the policy in a fresh policy
+session whose Unseal carries `continueSession = 0`; PCR drift
+since sealing is the TPM's `TPM_RC_POLICY_FAIL`, surfaced as
+`AnchorError::Refused`, and every other failure — tampered blob
+parts, malformed params, wrong-epoch context — is the single
+no-oracle `AnchorError::Failed`. The slot `params` record the
+selection and the wrap-time SMS epoch; the anchor's monotonic
+epoch source is the NV counter index `0x0150_0003`, advanced
+only by `TPM2_NV_Increment`. Under a token+TPM policy the two
+factors' slots compose through the recorded slot set — each
+factor alone unwraps only its own wrapping of the SMS — and the
+TPM anchor is an alternative anchor under a TPM-only policy,
+never a requirement.
+
+**TPM lifecycle (design §8.3/§4.3, #1003).** `TpmLifecycle`
+is the anchor's lifecycle surface over the same transport
+seam. *Power sequencing:* a suspend that used the anchor ends
+its TPM conversation with `TPM2_Shutdown(TPM_SU_STATE)`,
+issued after the image is durable (design §4.3 step 6); if the
+state-saving shutdown fails, the lifecycle falls back to
+`TPM2_Shutdown(TPM_SU_CLEAR)` and reports the continuity loss
+rather than hiding it. The resume environment opens with
+`startup_for_resume`, which asks for the saved state and
+reports the outcome class — `Restored` (saved state restored,
+PCRs continuous with the suspend), `Fresh` (no saved state:
+dirty power loss or a CLEAR shutdown; the TPM starts with
+`TPM_SU_CLEAR` and slots sealed against the pre-suspend
+measurements refuse), or `AlreadyStarted` (an earlier boot
+stage started the TPM; the lifecycle never issues a second
+Startup against a running TPM). Classification follows the
+Part 3 §9.3 response policy by format-one base code, the same
+decode the production `narf_tpm` startup path folds on.
+*Clear invalidation:* `TPM2_Clear` (Part 3 §24.4) mints a new
+storage primary seed and flushes the owner hierarchy's NV
+indices, so every sealed slot dies at `Load` and the epoch
+counter reads `Absent` through the lifecycle's `epoch_state`
+(which distinguishes `Present` / `Uninitialized` / `Absent`
+where the anchor's `epoch()` collapses them). Nothing re-seals
+or resurrects: re-advancing the epoch after a Clear provisions
+a new counter under the new seed, and slots from before the
+Clear stay dead even when the new counter reaches the same
+number — the seed, not the number, was their life. NV
+undefine/re-define surgery alone moves only the accounting
+and is not an invalidation event. *DA lockout accounting*
+(Part 1 §19): the anchor's `Refused` bucket is unchanged, but
+the lifecycle attributes the anchor's recorded response code
+(`classify_refusal`: policy / lockout / auth), reads the TPM's
+own counters (`TPM_PT_LOCKOUT_COUNTER`, `TPM_PT_MAX_AUTH_FAIL`,
+and the recovery intervals), and exposes the lockout reset as
+an operator act. The resume rule the accounting supports: on
+a lockout refusal the TPM factor is not retried within the
+attempt — the TPM counts authValue failures, while policy
+failures are never counted, and the epoch counter is
+`TPMA_NV_NO_DA`, so neither the anchor's refusals nor its
+epoch traffic can deepen a lockout. Boot/resume-environment
+wiring of these two call points is the resume lane's
+remainder, as with the anchor itself.
+
 **Seams, deliberately minimal.** `parse_claims` / `OpenedImage`
 are the resume environment's entry surface (it also consumes
 `decode_hook_region` + `TrustedImage::read_hook_region` to stage

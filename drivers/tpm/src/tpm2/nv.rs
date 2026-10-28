@@ -83,6 +83,13 @@ pub const NV_IDX_DISK_KEY: u32 = 0x0150_0000;
 pub const NV_IDX_BOOT_LOG: u32 = 0x0150_0001;
 /// NV index for the TPM self-test result cache.
 pub const NV_IDX_SELFTEST: u32 = 0x0150_0002;
+/// NV index for the suspend epoch counter (#1002): the
+/// monotonic epoch source the TPM custody anchor reports
+/// through `KeyCustodyAnchor::epoch` / `advance_epoch`
+/// (power-suspend design §8.2/§9.2 — rollback evidence for
+/// TPM-composed policies). A `TPMA_NV_COUNTER` index: eight
+/// bytes, changed only by `TPM2_NV_Increment`.
+pub const NV_IDX_SUSPEND_EPOCH: u32 = 0x0150_0003;
 
 // ── NvIndex descriptor ────────────────────────────────────────────────
 
@@ -131,3 +138,19 @@ impl NvIndex {
 
 /// Pre-built NARF disk-key NV index descriptor (32-byte slot).
 pub const NARF_DISK_KEY_NV: NvIndex = NvIndex::new(NV_IDX_DISK_KEY, 32, NV_ATTR_AUTH_RW);
+
+/// Attribute set for the suspend epoch counter: a counter index
+/// the owner provisions and both owner and index-auth can read
+/// and increment; no dictionary-attack throttling (increments
+/// are not auth failures and must never lock out resume).
+pub const NV_ATTR_SUSPEND_EPOCH: u32 = NV_ATTR_TYPE_COUNTER
+    | NV_ATTR_OWNERWRITE
+    | NV_ATTR_AUTHWRITE
+    | NV_ATTR_OWNERREAD
+    | NV_ATTR_AUTHREAD
+    | NV_ATTR_NO_DA;
+
+/// Pre-built suspend-epoch counter descriptor (#1002): 8-byte
+/// `TPMA_NV_COUNTER` index at [`NV_IDX_SUSPEND_EPOCH`].
+pub const NARF_SUSPEND_EPOCH_NV: NvIndex =
+    NvIndex::new(NV_IDX_SUSPEND_EPOCH, 8, NV_ATTR_SUSPEND_EPOCH);

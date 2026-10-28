@@ -54,6 +54,13 @@
 //! outPublic) is the first caller that would have met the
 //! discrepancy on silicon.
 //!
+//! The sealing-minimum completion (#1002) adds the builders the
+//! suspend anchor's conversation stands on — `create_sealed_object`,
+//! `unseal_with_session`, `policy_get_digest`, `nv_increment` —
+//! plus `parse_policy_get_digest_response`,
+//! `parse_pcr_read_response`, and the `response_rc` failure-class
+//! reader.
+//!
 //! The hierarchy/session/object commands and the parsers are the
 //! #941 command-set completion: the audit found Clear without even
 //! a command-code constant, CreatePrimary / EvictControl /
@@ -74,12 +81,14 @@ extern crate alloc;
 
 use super::{
     begin_command, finalise, TPM_ALG_NULL, TPM_ALG_SHA256, TPM_CC_CLEAR, TPM_CC_CLEAR_CONTROL,
-    TPM_CC_CREATE, TPM_CC_CREATE_PRIMARY, TPM_CC_EVICT_CONTROL, TPM_CC_FLUSH_CONTEXT,
+    TPM_CC_CREATE, TPM_CC_CREATE_PRIMARY, TPM_CC_DICTIONARY_ATTACK_LOCK_RESET,
+    TPM_CC_DICTIONARY_ATTACK_PARAMETERS, TPM_CC_EVICT_CONTROL, TPM_CC_FLUSH_CONTEXT,
     TPM_CC_GET_CAPABILITY, TPM_CC_GET_RANDOM, TPM_CC_GET_TEST_RESULT, TPM_CC_LOAD,
-    TPM_CC_NV_DEFINE_SPACE, TPM_CC_NV_READ, TPM_CC_NV_UNDEFINE_SPACE, TPM_CC_NV_WRITE,
-    TPM_CC_PCR_EXTEND, TPM_CC_PCR_READ, TPM_CC_POLICY_PCR, TPM_CC_READ_PUBLIC, TPM_CC_SELF_TEST,
-    TPM_CC_SHUTDOWN, TPM_CC_STARTUP, TPM_CC_START_AUTH_SESSION, TPM_CC_STIR_RANDOM, TPM_CC_UNSEAL,
-    TPM_RH_OWNER, TPM_RH_PLATFORM, TPM_RS_PW, TPM_ST_NO_SESSIONS, TPM_ST_SESSIONS, TPM_SU_CLEAR,
+    TPM_CC_NV_DEFINE_SPACE, TPM_CC_NV_INCREMENT, TPM_CC_NV_READ, TPM_CC_NV_UNDEFINE_SPACE,
+    TPM_CC_NV_WRITE, TPM_CC_PCR_EXTEND, TPM_CC_PCR_READ, TPM_CC_POLICY_GET_DIGEST,
+    TPM_CC_POLICY_PCR, TPM_CC_READ_PUBLIC, TPM_CC_SELF_TEST, TPM_CC_SHUTDOWN, TPM_CC_STARTUP,
+    TPM_CC_START_AUTH_SESSION, TPM_CC_STIR_RANDOM, TPM_CC_UNSEAL, TPM_RH_LOCKOUT, TPM_RH_OWNER,
+    TPM_RH_PLATFORM, TPM_RS_PW, TPM_ST_NO_SESSIONS, TPM_ST_SESSIONS, TPM_SU_CLEAR,
 };
 use alloc::vec::Vec;
 
@@ -288,6 +297,35 @@ pub fn create_rsa2048_under_owner(auth_value: &[u8]) -> Vec<u8> {
     buf
 }
 
+/// Build `TPM2_Create` for a sealed data object under a loaded
+/// parent — Part 3 §12.1. The suspend anchor's wrap act (#1002):
+/// `data` becomes the object's sensitive contents and
+/// `in_public_inner` is its `TPMT_PUBLIC` template
+/// (`objects::keyedhash_seal_template`, carrying the PCR
+/// `authPolicy`). The parent is authorized with the empty
+/// password session; the new object gets an empty auth value —
+/// its only authorization is the policy in its public area.
+pub fn create_sealed_object(parent_handle: u32, data: &[u8], in_public_inner: &[u8]) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_CREATE);
+    buf.extend_from_slice(&parent_handle.to_be_bytes());
+    push_password_session(&mut buf);
+    // inSensitive (TPM2B_SENSITIVE_CREATE): userAuth (empty) + data
+    let inner_size: u16 = 2 + 2 + data.len() as u16;
+    buf.extend_from_slice(&inner_size.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes()); // userAuth size = 0
+    buf.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    buf.extend_from_slice(data);
+    // inPublic (TPM2B_PUBLIC)
+    buf.extend_from_slice(&(in_public_inner.len() as u16).to_be_bytes());
+    buf.extend_from_slice(in_public_inner);
+    // outsideInfo (TPM2B_DATA): size = 0
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    // creationPCR (TPML_PCR_SELECTION): count = 0
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    finalise(&mut buf);
+    buf
+}
+
 /// Build `TPM2_Load(parentHandle, inPrivate, inPublic)` — Part 3 §12.4.
 ///
 /// `private` and `public` are the TPM2B-wrapped blobs from a prior
@@ -321,6 +359,28 @@ pub fn unseal(item_handle: u32) -> Vec<u8> {
     buf.extend_from_slice(&0u16.to_be_bytes());
     buf.push(0u8);
     buf.extend_from_slice(&0u16.to_be_bytes());
+    finalise(&mut buf);
+    buf
+}
+
+/// Build `TPM2_Unseal(itemHandle)` authorized by a policy
+/// session — Part 3 §12.7, the suspend anchor's unwrap act
+/// (#1002). The authorization area carries the policy session
+/// itself with empty nonce/HMAC (an unbound, unsalted policy
+/// session has no session key to HMAC with) and
+/// `sessionAttributes = 0`: the session is flushed when the
+/// command completes, so a resume ceremony cannot replay it.
+/// Policy satisfaction is the TPM's check of the session's
+/// policyDigest against the object's `authPolicy` — a mismatch
+/// is `TPM_RC_POLICY_FAIL`, never a data return.
+pub fn unseal_with_session(item_handle: u32, session_handle: u32) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_UNSEAL);
+    buf.extend_from_slice(&item_handle.to_be_bytes());
+    buf.extend_from_slice(&9u32.to_be_bytes()); // authorizationSize
+    buf.extend_from_slice(&session_handle.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes()); // nonceSize
+    buf.push(0u8); // sessionAttributes = 0 (flush after use)
+    buf.extend_from_slice(&0u16.to_be_bytes()); // hmacSize
     finalise(&mut buf);
     buf
 }
@@ -457,6 +517,51 @@ pub fn clear_control(disable_clear: bool) -> Vec<u8> {
     buf.extend_from_slice(&TPM_RH_PLATFORM.to_be_bytes());
     push_password_session(&mut buf);
     buf.push(u8::from(disable_clear)); // TPMI_YES_NO
+    finalise(&mut buf);
+    buf
+}
+
+/// Build `TPM2_DictionaryAttackLockReset()` — Part 3,
+/// Dictionary Attack commands (#1003).
+///
+/// Authorized by the lockout hierarchy (`TPM_RH_LOCKOUT`, empty
+/// password session — the lockout auth this platform model
+/// carries). A properly authorized reset sets the DA
+/// `failedTries` counter to zero and cancels any active DA
+/// lockout; it is the recovery act the suspend lifecycle
+/// exposes, and the only one — there is no path that clears the
+/// counter without the lockout authorization.
+pub fn dictionary_attack_lock_reset() -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_DICTIONARY_ATTACK_LOCK_RESET);
+    buf.extend_from_slice(&TPM_RH_LOCKOUT.to_be_bytes());
+    push_password_session(&mut buf);
+    finalise(&mut buf);
+    buf
+}
+
+/// Build `TPM2_DictionaryAttackParameters(newMaxTries,
+/// newRecoveryTime, lockoutRecovery)` — Part 3, Dictionary
+/// Attack commands (#1003).
+///
+/// Lockout-hierarchy authorized (empty password session).
+/// Sets the DA parameters only: per the Part 3 errata the
+/// command leaves `failedTries` unchanged, so lowering
+/// `newMaxTries` to or below the current failure count puts the
+/// TPM into lockout rather than rescuing it — the lifecycle
+/// reads the accounting through `TPM_PT_*` properties instead
+/// of tuning it, and this builder exists so fixtures can stage
+/// a threshold.
+pub fn dictionary_attack_parameters(
+    new_max_tries: u32,
+    new_recovery_time: u32,
+    lockout_recovery: u32,
+) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_DICTIONARY_ATTACK_PARAMETERS);
+    buf.extend_from_slice(&TPM_RH_LOCKOUT.to_be_bytes());
+    push_password_session(&mut buf);
+    buf.extend_from_slice(&new_max_tries.to_be_bytes());
+    buf.extend_from_slice(&new_recovery_time.to_be_bytes());
+    buf.extend_from_slice(&lockout_recovery.to_be_bytes());
     finalise(&mut buf);
     buf
 }
@@ -616,7 +721,49 @@ pub fn policy_pcr(session_handle: u32, pcr_digest: &[u8], selections: &[(u16, &[
     buf
 }
 
+/// Build `TPM2_PolicyGetDigest(policySession)` — Part 3
+/// (PolicyGetDigest). Returns the session's current
+/// policyDigest. Run against a *trial* session it is how an
+/// `authPolicy` is computed before the object it will govern
+/// exists (the suspend anchor's seal flow, #1002). The command
+/// has no authorization area and no parameters — the session
+/// handle is its only operand — so it is `TPM_ST_NO_SESSIONS`
+/// framed despite naming a session.
+pub fn policy_get_digest(session_handle: u32) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_NO_SESSIONS, TPM_CC_POLICY_GET_DIGEST);
+    buf.extend_from_slice(&session_handle.to_be_bytes());
+    finalise(&mut buf);
+    buf
+}
+
+/// Build `TPM2_NV_Increment(authHandle, nvIndex)` — Part 3
+/// §31.11. The only way a `TPMA_NV_COUNTER` index changes: each
+/// successful call adds one and sets `TPMA_NV_WRITTEN` (so the
+/// first increment both initializes and advances the counter).
+/// `auth_handle` is the index itself (self-auth, empty password
+/// session), mirroring `nv_read` / `nv_write`.
+pub fn nv_increment(nv_index: u32) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_NV_INCREMENT);
+    buf.extend_from_slice(&nv_index.to_be_bytes()); // authHandle
+    buf.extend_from_slice(&nv_index.to_be_bytes()); // nvIndex
+    push_password_session(&mut buf);
+    finalise(&mut buf);
+    buf
+}
+
 // ── Response parsing ─────────────────────────────────────────────────
+
+/// The response code of a raw response frame, without
+/// validating anything else. Callers that must branch on the
+/// failure class (the suspend anchor maps `TPM_RC_POLICY_FAIL`
+/// to a factor refusal, distinct from a malfunction) read it
+/// here; `None` means the frame is too short to carry a code.
+pub fn response_rc(raw: &[u8]) -> Option<u32> {
+    if raw.len() < 10 {
+        return None;
+    }
+    Some(u32::from_be_bytes([raw[6], raw[7], raw[8], raw[9]]))
+}
 
 /// Validate a raw TPM 2.0 response buffer. Returns the body slice
 /// (everything after the 10-byte header) on success, or an error
@@ -831,6 +978,56 @@ pub fn parse_read_public_response(raw: &[u8]) -> Result<ReadPublicOutputs, &'sta
         out_public,
         name,
         qualified_name,
+    })
+}
+
+/// Parse a `TPM2_PolicyGetDigest` response: the session's
+/// current policyDigest (`TPM2B_DIGEST`). The response is
+/// no-sessions framed — its whole body is the one parameter.
+pub fn parse_policy_get_digest_response(raw: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let (_handle, params) = response_params(raw, false)?;
+    let mut r = Reader::new(params);
+    Ok(r.tpm2b()?.to_vec())
+}
+
+/// The outputs of `TPM2_PCR_Read` (Part 3 §22.6).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PcrReadOutputs {
+    /// TPMU_COUNTER_VALUE: increments on every PCR update.
+    pub pcr_update_counter: u32,
+    /// The selection list as returned (algorithm, mask) pairs.
+    pub selections: Vec<(u16, Vec<u8>)>,
+    /// One digest per selected PCR, in selection order.
+    pub digests: Vec<Vec<u8>>,
+}
+
+/// Parse a `TPM2_PCR_Read` response (Part 3 §22.6): a u32
+/// update counter, a `TPML_PCR_SELECTION`, then a `TPML_DIGEST`
+/// of size-prefixed digests — the structural framing of #1065.
+/// The extension surface previously had the builder with no
+/// parser, so the anchor conversation had no way to read
+/// current PCR values through this codec at all.
+pub fn parse_pcr_read_response(raw: &[u8]) -> Result<PcrReadOutputs, &'static str> {
+    let (_handle, params) = response_params(raw, false)?;
+    let mut r = Reader::new(params);
+    let pcr_update_counter = r.u32()?;
+    let sel_count = r.u32()? as usize;
+    let mut selections = Vec::with_capacity(sel_count);
+    for _ in 0..sel_count {
+        let alg = r.u16()?;
+        let size = r.take(1)?[0] as usize;
+        let mask = r.take(size)?.to_vec();
+        selections.push((alg, mask));
+    }
+    let digest_count = r.u32()? as usize;
+    let mut digests = Vec::with_capacity(digest_count);
+    for _ in 0..digest_count {
+        digests.push(r.tpm2b()?.to_vec());
+    }
+    Ok(PcrReadOutputs {
+        pcr_update_counter,
+        selections,
+        digests,
     })
 }
 
