@@ -44,6 +44,10 @@ pub struct BootOptions<'a> {
     /// PowerUpJpeg), as Linux's default Navi22 configuration does.
     /// Diagnostic.
     pub vcn_smu_pg: bool,
+    /// `amdgpu.rdna2_vcn_dpg=0` starts VCN on Linux's static path (power
+    /// gating off, every register written directly) instead of DPG with the
+    /// PSP-loaded register list. Diagnostic.
+    pub vcn_dpg: bool,
     /// `amdgpu.rdna2_connector=dp|hdmi`: the output the single-display boot
     /// modeset lights when both kinds have a sink (Linux's order, HDMI
     /// first, otherwise). Diagnostic: lets either output be tested with
@@ -103,6 +107,7 @@ impl<'a> BootOptions<'a> {
             dmub_tables: switch("amdgpu.rdna2_dmub_tables", None, true),
             atom_pixclk: switch("amdgpu.rdna2_atom_pixclk", None, false),
             vcn_smu_pg: switch("amdgpu.rdna2_vcn_smu_pg", None, false),
+            vcn_dpg: switch("amdgpu.rdna2_vcn_dpg", None, true),
             connector: match value("amdgpu.rdna2_connector") {
                 Some(Some("dp" | "DP" | "displayport")) => Connector::DisplayPort,
                 Some(Some("hdmi" | "HDMI")) => Connector::Hdmi,

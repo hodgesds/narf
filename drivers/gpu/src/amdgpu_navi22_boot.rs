@@ -874,10 +874,11 @@ impl Backend for Hardware {
                             power = None;
                         }
                     }
+                    let psp = self.psp.as_mut().ok_or(Error::Invalid)?;
                     // SAFETY: PSP loaded these VCN images into the retained
                     // TMR, both hubs and NBIF doorbells are up, and ColdBoot
-                    // owns the whole GPU. VCN's own power gating stays disabled.
-                    let result = unsafe { media.start(firmware, power).await };
+                    // owns the whole GPU.
+                    let result = unsafe { media.start(firmware, power, psp).await };
                     media_result(stage, result)?;
                 }
             }
