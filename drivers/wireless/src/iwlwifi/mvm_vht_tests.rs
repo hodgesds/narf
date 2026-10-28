@@ -65,7 +65,10 @@ fn last(h: &Harness, group: u8, command: u8, pick: impl Fn(&[u8]) -> bool) -> Op
 
 /// (PHY width, control position, ADD_STA FAT_EN, TLC max_ch_width, TLC
 /// mode, TLC SGI bitmap, TLC NSS1 map) of the latest join.
-fn profile(h: &Harness) -> Result<(u8, u8, u32, u8, u8, u8, u16), &'static str> {
+/// See [`profile`].
+type VhtProfile = (u8, u8, u32, u8, u8, u8, u16);
+
+fn profile(h: &Harness) -> Result<VhtProfile, &'static str> {
     let phy = last(h, 1, 8, |b| b[4] == 1).ok_or("PHY context absent")?;
     let sta = last(h, 1, 0x18, |b| {
         b.len() == 48 && u32::from_le_bytes([b[24], b[25], b[26], b[27]]) & (3 << 26) != 0

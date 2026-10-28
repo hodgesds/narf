@@ -2096,7 +2096,8 @@ Measured programs and air validation remain external inputs.
 ### 3.35 Remaining-row blocker audit
 
 This audit checks each remaining open row against the current tree, after
-§§3.33–3.34 landed. The blockers below are concrete.
+§§3.33–3.34 landed and was refreshed after §§3.36–3.39. The blockers
+below are concrete.
 
 **Not yet implemented; no shared API is missing.**
 
