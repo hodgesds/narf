@@ -38,7 +38,8 @@
 //!   ALLOCATE_PAYLOAD sideband message to the stream's end
 //!   branch — the two-part order Linux and the AMD MST session
 //!   in this crate both use).
-//! - The *first* stream on a link negotiates and trains it
+//! - The *first* stream on a link trains it at the mutual
+//!   maximum rate and lane count (as i915 does for MST)
 //!   through the shared link-training core, inside its
 //!   modeset (the orchestrator's MST-primary entry). Later
 //!   streams reuse the trained link verbatim: their modesets
@@ -79,7 +80,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use crate::dp_aux::AuxError;
-use crate::dp_link_training::{negotiate, stream_demand_kbps, DpcdCaps, TrainedLink};
+use crate::dp_link_training::{negotiate, DpcdCaps, TrainedLink};
 use crate::dp_mst;
 use crate::dp_mst_mgr::{Manager, MstError as MgrError, Sink, Topology};
 use crate::intel_gpu_aux::{IntelAux, MmioWindow};
@@ -475,8 +476,14 @@ impl MstLink {
         // secondary.
         let primary = self.trained.is_none();
         let plan = if primary {
-            let demand = stream_demand_kbps(mode.pixel_clock_khz, 24);
-            let negotiated = negotiate(&INTEL_SOURCE_CAPS, &caps, demand);
+            // An MST link is shared by every later stream, so it
+            // trains at the mutual maximum rate and lane count,
+            // not the lowest configuration this first stream
+            // fits in (i915 `mst_stream_compute_link_config`:
+            // `lane_count = limits->max_lane_count`,
+            // `port_clock = limits->max_rate`). An unbounded
+            // demand walks `negotiate` to that ceiling.
+            let negotiated = negotiate(&INTEL_SOURCE_CAPS, &caps, u64::MAX);
             Some(LinkPlan {
                 rate: negotiated.rate,
                 lanes: negotiated.lanes,
