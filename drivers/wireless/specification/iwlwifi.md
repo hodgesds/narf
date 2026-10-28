@@ -1552,7 +1552,7 @@ each feature; a Linux chip name or helper structure does not grant a capability.
 
 | Profile | Implemented reachable software | Remaining software gates |
 |---|---|---|
-| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles (Linux Qu PCI IDs 0x02f0/0x06f0/0x34f0/0x3df0/0x4df0/0x43f0/0xa0f0, §3.26) | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO (with §3.28 RX LDPC/STBC1), §3.33 host WPA3-SAE with PMF, §3.34 tag5 HT TX LDPC/TX STBC, §3.36 tag5 HT40, §3.37 tag5 NSS2, §3.38 tag5 VHT80, signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement preceded by §3.25 over-air leaving deauthentication. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced reconnect restoration, extended in §3.30 to cross-peer/cross-index GTK restore, safe same-peer PTK reuse and a radio-scoped ledger across native owners; §3.31 generic tag5 feature programs with per-TID QoS queues for all four ACs; §3.29 firmware/transport recovery and non-WoWLAN system suspend/resume. Authored, execution pending: §3.24 tag4 negotiated unicast-local nested recipient A-MSDU-in-A-MPDU with complete bundles before sequence/PN ownership. | Active probes (scan firmware's emitter/power binding needs source proof); alternate ML BAID; TX A-MSDU; VHT160/HE; SAE-EXT-KEY (AKM 24) and WPA2-PSK with PMF; persistent key history. AP/P2P, WoW (with its D3 ARP/NS/GTK offloads), the §3.27 scheduled-scan offload and multiple RX/RSS remain unimplemented even where hardware supports them. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
+| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles (Linux Qu PCI IDs 0x02f0/0x06f0/0x34f0/0x3df0/0x4df0/0x43f0/0xa0f0, §3.26) | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO (with §3.28 RX LDPC/STBC1), §3.33 host WPA3-SAE with PMF, §3.34 tag5 HT TX LDPC/TX STBC, §3.36 tag5 HT40, §3.37 tag5 NSS2, §3.38 tag5 VHT80, §3.39 tag5 VHT160, signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement preceded by §3.25 over-air leaving deauthentication. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced reconnect restoration, extended in §3.30 to cross-peer/cross-index GTK restore, safe same-peer PTK reuse and a radio-scoped ledger across native owners; §3.31 generic tag5 feature programs with per-TID QoS queues for all four ACs; §3.29 firmware/transport recovery and non-WoWLAN system suspend/resume. Authored, execution pending: §3.24 tag4 negotiated unicast-local nested recipient A-MSDU-in-A-MPDU with complete bundles before sequence/PN ownership. | Active probes (scan firmware's emitter/power binding needs source proof); alternate ML BAID; TX A-MSDU; HE; SAE-EXT-KEY (AKM 24) and WPA2-PSK with PMF; persistent key history. AP/P2P, WoW (with its D3 ARP/NS/GTK offloads), the §3.27 scheduled-scan offload and multiple RX/RSS remain unimplemented even where hardware supports them. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
 | AX210/AX211/AX411 and Bz/BE200 Gen3 transports | Context-v2, generation-selected completion layouts, firmware/PNVM/native boot and MLD helpers. Software-validated continuation: source-selected command-ID header0/explicit RLC2, receipt-fenced TVQM/BAID retirement, retained actual executable/PNVM/PCI authority and immutable DMA-copy receive/publication epochs. | Station admission remains dependent on the exact negotiated MAC/link/STA/TLC/key payload profile; no new payload profile is enabled by the header/source audit. Sc conversation tests do not establish another family's ABI, platform power/SAR program or hardware. Current live regulatory/power ownership remains separate. |
 | Sc c103/BE211 MLD station profile | Deferred retained native publication, actual station/management/data/Open-WPA2-SAE conversations, legacy/HT/VHT to80MHz, key/BA/reorder and userspace SME/port ownership in the existing profile. §§3.21–3.22 header/TVQM, positive BA response/RX-marker retirement, retained executable/PNVM/current-PCI publication and copy-time key epochs passed coordinated native tests on both architectures. | These source/epoch fences do not establish underlying RF quiescence or current live-regulatory/platform-power qualification. HE/EHT/6GHz and MLO,160/320MHz, AP/P2P and the §3.27 scheduled-scan offload remain separate (non-WoWLAN system suspend/resume is §3.29) implementations and must not be inferred from single-link Sc fixtures. |
 | Other advertised PCI/firmware combinations | Identification/firmware selection where defined, including the Linux So/Ma/Bz IDs added in §3.26; 0x7df0 is identification-only (Linux 7.3 `pcie/drv.c` claims no 0x7DF0) and exact admission rejects it | No fallback admits an unknown command table, calibration profile, topology or PHY width. They need their exact source-backed authority/command/receipt/lifetime path. |
@@ -2100,30 +2100,48 @@ This audit checks each remaining open row against the current tree, after
 
 **Not yet implemented; no shared API is missing.**
 
-- **width_160.** HT40, NSS2 and VHT80 landed in §§3.36–3.38. Gen2
-  `Span` stops at 80MHz, `confirm` refuses `Width::OneSixty`, and TLC
-  writes no `IWL_TLC_MCS_PER_BW_160` map.
-
-  Each row needs its own tag5 bit and a qualified program. The shared
-  JoinPlan HT40/VHT/160 negotiation (`LocalPhy::ht40`, `LocalVht`) and the
-  regulatory width rules exist; the native encoders (Linux
-  `iwl_mvm_phy_ctxt_cmd_data`, `iwl_mvm_sta_send_to_fw`,
-  `rs_fw_vht_set_enabled_rates`) do not.
+- HT40, NSS2, VHT80 and Gen2 160MHz landed in §§3.36–3.39.
+- **width_160** (row stays open for its Sc/Gen3 profiles). The Gen2
+  AX200/AX201 160MHz path is §3.39. The Sc c103 MLD station profile
+  negotiates at most VHT80. `ht_vht.rs` advertises no 160/80+80 and
+  uses only the primary 80MHz of a wider BSS, and
+  `connection.rs::channel_power_width` refuses width code 3. The row's "applicable profiles" also include the Gen3
+  AX210/AX211/AX411/BE200 families, whose station admission is itself
+  open (see the `*_station_enablement` rows).
 - **he, eht, six_ghz, width_320, mlo.** The Sc/Gen3 link, STA and TLC
   encoders (`connection.rs`, `mac_ctx.rs`, `sta.rs`) carry no HE/EHT
   fields: link HE/EHT flags, `iwl_he_pkt_ext`, STA HE/EHT flags and the TLC
   `ht_rates` HE/EHT maps. Six-GHz, 320MHz and MLO also need band-qualified
   regulatory and power admission. These rows are hardware-inapplicable to
   Gen2 AX200/AX201.
-- **tx_amsdu.** No native path builds an A-MSDU: TLC leaves `amsdu` and
-  `max_tx_op` at 0, and the queue owner sends single MSDUs. The shared
-  encoder (`amsdu::encode`/`Key::protect_amsdu`) is host-crypto only. The
-  native path needs a tag5 bit, the firmware A-MSDU length in TLC (Linux
-  `rs_fw_amsdu_len`/`iwl_mvm_max_amsdu_size`) and checksum assist with
-  `L3_EN`.
-- **active_scan_probes.** `mvm_scan.rs` issues only passive
-  `SCAN_REQ_UMAC`. A probe request emits before any link power is applied,
-  and no signed scan-emission program binds that emitter/channel/power.
+- **tx_amsdu.** No native path builds an A-MSDU; the Gen2 queue owner
+  sends one MSDU per TX command. Linux v7.2 sets `TX_AMSDU` for 22000
+  (`mvm/mac80211.c`). The A-MSDUs come from mac80211
+  `ieee80211_amsdu_aggregate` on fast-xmit/iTXQ frames, which requires
+  hardware crypto, or from `mvm/tx.c::iwl_mvm_tx_tso` for GSO skbs. Their
+  limits come from the firmware's `iwl_mvm_tlc_update_notif` per-TID
+  `amsdu_enabled`/`amsdu_size`, and each A-MSDU TX command sets
+  `TX_CMD_OFFLD_AMSDU`. With firmware CCMP the host builds plaintext
+  subframes, so the shared host-crypto-only `amsdu::encode` is not
+  required. Three pieces are missing:
+  - a native subframe batcher on the per-TID queues;
+  - a consumer for `TLC_MNG_UPDATE_NOTIF` (DATA_PATH 0xf7), which Gen2
+    currently uses only as a version gate;
+  - a tag5 bit with its signed program.
+
+  NARF's net stack also delivers single ≤MTU frames with no GSO, so only
+  the mac80211-style queue batching applies.
+- **active_scan_probes.** `mvm_scan.rs` issues only the passive 1940-byte
+  `SCAN_REQ_UMAC`. A probe-template builder exists for the Sc path
+  (`scan_api::active`, `SCAN_PROBE_PARAMS_API_S_VER_4`), but Gen2 applies
+  the signed SAR/link power (`REDUCE_TX_POWER` v5) only in station join,
+  after the PHY, peer and queue exist (`prepare_power_using` requires
+  `ManagementQueuePrepared`). A scan from `Configured` would emit probes
+  under firmware-default limits. Closing the row needs three things:
+  - a scan-emission program tag bound to MAC and channel set;
+  - SAR chain limits applied from `Configured` before `SCAN_REQ_UMAC`;
+  - per-channel probe admission (`connection::channel_power(.., probe =
+    true)` refuses NO_IR/DFS).
 - **multiple_rx_queues, rss.** The Gen2 transport configures one RFH
   queue. Linux `iwl_mvm_send_rss_cfg_cmd` and `RFH_QUEUE_CONFIG_CMD` (with
   per-queue RX epochs and markers) have no owner.
@@ -2339,6 +2357,64 @@ The 5GHz `FakeAp` uses its OFDM 6/12/24 rates.
 
 The `gen2/ht40` PHY smoke covers the 80MHz control positions. Measured
 programs and air validation remain external inputs.
+
+### 3.39 Tag5 Gen2 contiguous 160MHz
+
+Row width_160, Gen2 part. Tag5 bit `WIDTH_160` = bit 8 (§3.31) widens a
+VHT program to a contiguous 160MHz channel. A `WIDTH_160` program must
+also name `VHT` and `HT40`: `validate_record` refuses it otherwise and
+`feature_offers` never lists it.
+
+**Availability** (`vht160_center`). The bit is offered only when all of
+these hold:
+
+- VHT80 is available (§3.38);
+- the AP advertises 160MHz support (VHT Supported Channel Width Set 1 or
+  2);
+- the AP's VHT Operation has width 1, CCFS0 the selected 80MHz center
+  and CCFS1 a 160MHz center (50/114/163) eight channels away, the
+  contiguous 160MHz form of mac80211 `ieee80211_chandef_vht_oper`;
+- all eight subchannels are VALID | `NVM_CHANNEL_160MHZ` (bit 11). Linux
+  v7.2 `iwl-nvm-parse.c` sets `vht160_supported` from that flag;
+- `restrict_offer` finds the 160MHz span permitted.
+
+80+80 (`discontiguous()`) is refused. A 160MHz BSS still offers VHT80
+on its primary 80MHz block.
+
+**Effects of a granted bit.**
+
+- `Span` width 3 covers eight subchannels. The PHY context uses
+  `IWL_PHY_CHANNEL_MODE160` with `iwl_mvm_get_ctrl_pos`; primary 36 of
+  center 50 gives position 3.
+- Locally, VHT adds `SUPP_CHAN_WIDTH_160MHZ` | `SHORT_GI_160`
+  (`iwl_init_vht_hw_capab`), and the shared `LocalPhy::vht160`
+  negotiation selects 160MHz.
+- `confirm` requires exactly the prepared contiguous 160MHz span.
+- ADD_STA keeps the FAT field 3 that `iwl_mvm_sta_send_to_fw` produces
+  for `BW_160`.
+- TLC uses `max_ch_width` `IWL_TLC_MNG_CH_WIDTH_160MHZ` (3) and SGI bit
+  3. Per stream, it copies the 80MHz map into `IWL_TLC_MCS_PER_BW_160`
+  (offset +2), as `rs_fw_vht_set_enabled_rates` does when
+  `ieee80211_get_vht_max_nss` allows the stream at 160MHz. Without
+  Extended NSS BW that is every negotiated stream.
+- Received VHT rates may carry `RATE_MCS_CHAN_WIDTH_160` with SGI under
+  the SGI160 promise.
+- The retained beacon must keep the VHT Operation, 160MHz support and,
+  when used, SGI160.
+
+`drivers/wireless/iwlwifi/gen2/vht` smokes cover:
+
+- a complete join on the fixture's 160MHz profile (NVM channels 36..64
+  with 160MHz flags; a 5170..5330MHz policy rule allowing 160MHz): PHY
+  width 3/position 3, TLC width 3, SGI 15, BW80 and BW160 maps 0x3ff,
+  DORA over VHT MCS9 160MHz receive rates, an ordered close keeping the
+  160MHz removal info, and no retained resources;
+- a VHT80 program toward that BSS using its primary 80MHz;
+- refusal under an 80MHz policy and toward an 80MHz BSS.
+
+The fixture policy has no DFS flag on channels 52..64, so it does not
+show DFS behaviour. Measured programs and air validation remain external
+inputs. Gen3/Sc 160MHz remains open with HE (see §3.35).
 
 ## 4. References
 

@@ -409,14 +409,20 @@ impl Actor {
                     if self.ht {
                         nvm[8] = 4;
                     }
-                    if self.wide_nvm == 2 {
+                    if self.wide_nvm >= 2 {
                         // NVM_SKU_CAP_11N | 11AC; channels 36..=48 (indices
-                        // 14..=17) VALID|IBSS|ACTIVE|20|40|80MHZ.
+                        // 14..=17) VALID|IBSS|ACTIVE|20|40|80MHZ; profile 3
+                        // marks 36..=64 (14..=21) 160MHZ as well.
+                        let (count, flags) = if self.wide_nvm == 3 {
+                            (22, 0xf0bu32)
+                        } else {
+                            (18, 0x70b)
+                        };
                         nvm[8] = 12;
-                        nvm[24] = 18;
-                        for index in 14..18 {
+                        nvm[24] = count;
+                        for index in 14..usize::from(count) {
                             nvm[28 + 4 * index..32 + 4 * index]
-                                .copy_from_slice(&0x70bu32.to_le_bytes());
+                                .copy_from_slice(&flags.to_le_bytes());
                         }
                     }
                     if self.wide_nvm == 1 {

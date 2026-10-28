@@ -60,8 +60,12 @@ pub(in crate::iwlwifi) mod feature {
     /// VHT MCS 0..9 on an 80MHz 5GHz channel (requires `HT40`): an 80MHz
     /// PHY context, ADD_STA FAT_EN_80 and the TLC VHT mode and rate map.
     pub const VHT: u16 = 1 << 7;
+    /// Contiguous 160MHz VHT (requires `VHT`): a 160MHz PHY context, TLC
+    /// 160MHz width, SGI160 and the `IWL_TLC_MCS_PER_BW_160` map.
+    pub const WIDTH_160: u16 = 1 << 8;
     /// Every bit this driver can emit; other bits are refused.
-    pub const KNOWN: u16 = BA | NESTED_BA | QOS_TIDS | TX_LDPC | TX_STBC | HT40 | NSS2 | VHT;
+    pub const KNOWN: u16 =
+        BA | NESTED_BA | QOS_TIDS | TX_LDPC | TX_STBC | HT40 | NSS2 | VHT | WIDTH_160;
 }
 
 impl Emission {
@@ -273,6 +277,7 @@ pub(super) fn validate_record(
             || bits & !feature::KNOWN != 0
             || bits & feature::NESTED_BA != 0 && bits & feature::BA == 0
             || bits & feature::VHT != 0 && bits & feature::HT40 == 0
+            || bits & feature::WIDTH_160 != 0 && bits & feature::VHT == 0
         {
             return Err("MVM feature program names an unsupported emission set");
         }

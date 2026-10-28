@@ -29,6 +29,9 @@ pub(super) struct Context {
     /// Center channel of the observed AP's 80MHz VHT operation, when `VHT`
     /// is available for this offer.
     pub vht_center: Option<u8>,
+    /// Center channel of the observed AP's contiguous 160MHz operation,
+    /// when `WIDTH_160` is available for this offer.
+    pub vht160_center: Option<u8>,
 }
 /// An occupied 40MHz (`width` 1) or 80MHz (`width` 2) channel, by center
 /// channel number; the width code is `IWL_PHY_CHANNEL_MODE40/80`.
@@ -46,6 +49,7 @@ impl Span {
         let offsets: &[i16] = match self.width {
             1 => &[-2, 2],
             2 => &[-6, -2, 2, 6],
+            3 => &[-14, -10, -6, -2, 2, 6, 10, 14],
             _ => return None,
         };
         let mut out = Vec::new();
@@ -72,6 +76,11 @@ impl Context {
     /// The occupied span once a signed `HT40` (40MHz) or `VHT` (80MHz)
     /// program is granted.
     pub fn span(&self) -> Option<Span> {
+        if self.features & feature::WIDTH_160 != 0 {
+            if let Some(center) = self.vht160_center {
+                return Some(Span { center, width: 3 });
+            }
+        }
         if self.features & feature::VHT != 0 {
             if let Some(center) = self.vht_center {
                 return Some(Span { center, width: 2 });
@@ -133,6 +142,9 @@ impl Context {
             vht_tx_map: 0xffff,
             tx_sgi80: false,
             rx_sgi80: false,
+            width160: false,
+            tx_sgi160: false,
+            rx_sgi160: false,
             vht_operation: [0; 5],
             protection: 0,
             dynamic_smps: false,
@@ -150,19 +162,20 @@ impl Context {
                     if span.channels().as_deref() != Some(phy.occupied_channels()) {
                         return Err("MVM response changed the prepared wide span");
                     }
-                    if span.width == 2 {
-                        Width::Eighty
-                    } else {
-                        Width::Forty
+                    match span.width {
+                        3 => Width::OneSixty,
+                        2 => Width::Eighty,
+                        _ => Width::Forty,
                     }
                 }
                 None => Width::Twenty,
             };
-            if phy.width() != expected {
+            if phy.width() != expected || phy.discontiguous() {
                 return Err("MVM HT response selected a width other than the prepared PHY");
             }
             profile.width40 = expected != Width::Twenty;
-            profile.width80 = expected == Width::Eighty;
+            profile.width80 = matches!(expected, Width::Eighty | Width::OneSixty);
+            profile.width160 = expected == Width::OneSixty;
             if let Some(vht) = phy.vht() {
                 if !profile.width80 {
                     return Err("MVM VHT negotiated without its 80MHz program");
@@ -176,6 +189,8 @@ impl Context {
                 profile.vht_tx_map = map;
                 profile.tx_sgi80 = vht.tx_sgi80();
                 profile.rx_sgi80 = vht.rx_sgi80();
+                profile.tx_sgi160 = profile.width160 && vht.tx_sgi160();
+                profile.rx_sgi160 = profile.width160 && vht.rx_sgi160();
                 profile.vht_operation = vht.operation_body();
             } else if profile.width80 {
                 return Err("MVM 80MHz program without negotiated VHT");
@@ -244,6 +259,11 @@ pub(super) struct Profile {
     pub vht_tx_map: u16,
     pub tx_sgi80: bool,
     pub rx_sgi80: bool,
+    /// Granted `WIDTH_160` operation on the negotiated contiguous 160MHz
+    /// channel.
+    pub width160: bool,
+    pub tx_sgi160: bool,
+    pub rx_sgi160: bool,
     pub vht_operation: [u8; 5],
     pub protection: u32,
     pub dynamic_smps: bool,
@@ -298,9 +318,15 @@ pub(in crate::iwlwifi) fn local_vht_for(features: u16) -> LocalVht {
     } else {
         0xfffe
     };
-    LocalVht::new(map, map, true, true, 0)
-        .unwrap_or_else(|_| unreachable!())
-        .with_ldpc(true, features & feature::TX_LDPC != 0)
+    let vht = LocalVht::new(map, map, true, true, 0).unwrap_or_else(|_| unreachable!());
+    // iwl_init_vht_hw_capab: SUPP_CHAN_WIDTH_160MHZ | SHORT_GI_160 when an
+    // NVM channel carries NVM_CHANNEL_160MHZ (vht160_supported).
+    let vht = if features & feature::WIDTH_160 != 0 {
+        vht.with_160mhz(true, true)
+    } else {
+        vht
+    };
+    vht.with_ldpc(true, features & feature::TX_LDPC != 0)
         .with_rx_stbc(true)
         .with_tx_stbc(features & feature::TX_STBC != 0)
 }
@@ -351,6 +377,8 @@ impl Profile {
                         narf_wireless::association::phy::intersect_maps(self.vht_tx_map, rx)
                             == self.vht_tx_map
                             && (!self.tx_sgi80 || v[0] & 32 != 0)
+                            && (!self.width160 || matches!((v[0] >> 2) & 3, 1 | 2))
+                            && (!self.tx_sgi160 || v[0] & 64 != 0)
                     }))
     }
     pub fn edca(&self, local: [u8; 6]) -> [u8; 208] {
@@ -406,7 +434,9 @@ impl Profile {
         };
         let mut out = alloc::vec![0;length];
         // rs_fw_bw_from_sta_bw: IWL_TLC_MNG_CH_WIDTH_40MHZ.
-        out[4] = if self.width80 {
+        out[4] = if self.width160 {
+            3
+        } else if self.width80 {
             2
         } else {
             u8::from(self.width40)
@@ -431,14 +461,20 @@ impl Profile {
         );
         // v2/3 SGI byte22; v4 byte7. A-MSDU and all NSS2/width>20 rates0.
         // rs_fw_sgi_cw_support: BIT(20MHz) | BIT(40MHz).
-        out[if version == 4 { 7 } else { 22 }] =
-            u8::from(self.tx_sgi) | u8::from(self.tx_sgi40) << 1 | u8::from(self.tx_sgi80) << 2;
+        out[if version == 4 { 7 } else { 22 }] = u8::from(self.tx_sgi)
+            | u8::from(self.tx_sgi40) << 1
+            | u8::from(self.tx_sgi80) << 2
+            | u8::from(self.tx_sgi160) << 3;
         if self.vht {
             // rs_fw_vht_set_enabled_rates: per stream BIT(highest + 1) - 1,
             // from the (intersected) peer receive map; MCS9 is invalid at
             // 20MHz only, and this program is always 80MHz.
-            let nss2 = if version == 4 { 18 } else { 16 };
-            for (stream, at) in [(0, 12), (1, nss2)] {
+            // The 160MHz entry (IWL_TLC_MCS_PER_BW_160) repeats the 80MHz one
+            // when the peer supports 160MHz at that NSS (no Extended NSS BW
+            // here, so ieee80211_get_vht_max_nss gives every stream).
+            let row = if version == 4 { 6 } else { 4 };
+            for stream in 0..2 {
+                let at = 12 + row * stream;
                 let highest = match (self.vht_tx_map >> (2 * stream)) & 3 {
                     0 => 7,
                     1 => 8,
@@ -449,6 +485,9 @@ impl Profile {
                     }
                 };
                 put16(&mut out, at, (1u16 << (highest + 1)) - 1);
+                if self.width160 {
+                    put16(&mut out, at + 2, (1u16 << (highest + 1)) - 1);
+                }
             }
         }
         Ok(out)
@@ -467,11 +506,12 @@ impl Profile {
         let sgi = match wide {
             1 => self.rx_sgi40,
             2 => self.rx_sgi80,
+            3 => self.rx_sgi160,
             _ => self.rx_sgi,
         };
         if self.vht && (r >> 8) & 7 == 3 {
             // VHT: MCS 0..9 (bits 0..3), NSS2 only under the local promise.
-            return wide <= 2
+            return (wide <= 2 || self.width160 && wide == 3)
                 && r & 15 <= 9
                 && r & ((0xe0 | (u32::from(!self.rx_nss2) << 4))
                     | ((15 << 16) & !coding)
@@ -594,7 +634,9 @@ impl super::Owner {
             return Err("MVM native HT20 contract unavailable");
         }
         let local = local_ht_for(self.power.phy.features);
-        if self.power.phy.features & feature::VHT != 0 {
+        if self.power.phy.features & feature::WIDTH_160 != 0 {
+            LocalPhy::vht160(local, local_vht_for(self.power.phy.features))
+        } else if self.power.phy.features & feature::VHT != 0 {
             LocalPhy::vht80(local, local_vht_for(self.power.phy.features))
         } else if self.power.phy.features & feature::HT40 != 0 {
             LocalPhy::ht40(local)
@@ -674,6 +716,10 @@ impl super::Owner {
         if vht_center.is_some() {
             available |= feature::VHT;
         }
+        let vht160_center = vht_center.and_then(|c| self.vht160_center(&bss, c));
+        if vht160_center.is_some() {
+            available |= feature::WIDTH_160;
+        }
         if selected {
             available |= feature::QOS_TIDS;
             if let Some(cap) = ap_ht {
@@ -693,6 +739,7 @@ impl super::Owner {
             secondary,
             primary: channel,
             vht_center,
+            vht160_center,
             ..Context::default()
         };
         self.power.phy.ba.selected = ba;
@@ -757,7 +804,13 @@ impl super::Owner {
             return None;
         };
         let nvm = self.nvm.as_ref()?;
-        if bss.channel <= 14 || !nvm.phy.vht || op[0] != 1 || op[2] != 0 {
+        // A contiguous 160MHz BSS (CCFS1 the 160MHz center, eight
+        // channels from CCFS0) still offers its primary 80MHz.
+        if bss.channel <= 14
+            || !nvm.phy.vht
+            || op[0] != 1
+            || op[2] != 0 && (!matches!(op[2], 50 | 114 | 163) || op[1].abs_diff(op[2]) != 8)
+        {
             return None;
         }
         let span = Span {
@@ -786,6 +839,45 @@ impl super::Owner {
             })
             .then_some(op[1])
     }
+    /// The 160MHz center of an observed contiguous VHT160 BSS around the
+    /// selected 80MHz block (VHT Operation width 1, CCFS1 the 160MHz center
+    /// eight channels from CCFS0; mac80211 `ieee80211_chandef_vht_oper`).
+    /// The AP must advertise 160MHz support and every subchannel
+    /// VALID | NVM_CHANNEL_160MHZ (bit 11).
+    fn vht160_center(&self, bss: &Bss, center80: u8) -> Option<u8> {
+        let ap =
+            narf_wireless::association::phy::ApElements::parse(&bss.information_elements).ok()?;
+        let (Some(cap), Some(op)) = (ap.vht_capability(), ap.vht_operation()) else {
+            return None;
+        };
+        if !matches!((cap[0] >> 2) & 3, 1 | 2)
+            || op[0] != 1
+            || op[1] != center80
+            || !matches!(op[2], 50 | 114 | 163)
+            || op[1].abs_diff(op[2]) != 8
+        {
+            return None;
+        }
+        let nvm = self.nvm.as_ref()?;
+        let permissions = self
+            .scan
+            .permissions
+            .as_ref()
+            .or(self.power.nvm_permissions.as_ref())?;
+        Span {
+            center: op[2],
+            width: 3,
+        }
+        .channels()?
+        .iter()
+        .all(|&ch| {
+            nvm.channels.contains(&ch)
+                && super::super::station_api::channel_index(ch)
+                    .and_then(|index| permissions.get(index))
+                    .is_some_and(|flags| flags & 0x801 == 0x801)
+        })
+        .then_some(op[2])
+    }
     /// Drop `HT40` from the offer when the current host policy does not
     /// permit the whole 40MHz span; mac80211 then keeps the 20MHz chandef
     /// (`ieee80211_chandef_downgrade`).
@@ -794,11 +886,19 @@ impl super::Owner {
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) {
         let phy = &mut self.power.phy;
+        if let Some(center) = phy.vht160_center {
+            let span = Span { center, width: 3 };
+            if super::power::span_power(domain, phy.primary, Some(span)).is_none() {
+                phy.vht160_center = None;
+                phy.available &= !feature::WIDTH_160;
+            }
+        }
         if let Some(center) = phy.vht_center {
             let span = Span { center, width: 2 };
             if super::power::span_power(domain, phy.primary, Some(span)).is_none() {
                 phy.vht_center = None;
-                phy.available &= !feature::VHT;
+                phy.vht160_center = None;
+                phy.available &= !(feature::VHT | feature::WIDTH_160);
             }
         }
         if let Some(secondary) = phy.secondary {
@@ -810,7 +910,8 @@ impl super::Owner {
                 // VHT80 is built on the HT 20/40 profile and goes with it.
                 phy.secondary = None;
                 phy.vht_center = None;
-                phy.available &= !(feature::HT40 | feature::VHT);
+                phy.vht160_center = None;
+                phy.available &= !(feature::HT40 | feature::VHT | feature::WIDTH_160);
             }
         }
     }
@@ -869,6 +970,7 @@ impl super::Owner {
             .filter(|bits| bits & !available == 0)
             // VHT80 is built on the HT 20/40 profile.
             .filter(|bits| bits & feature::VHT == 0 || bits & feature::HT40 != 0)
+            .filter(|bits| bits & feature::WIDTH_160 == 0 || bits & feature::VHT != 0)
             .map(|bits| bits | ba)
             .collect();
         sets.sort_by_key(|bits| core::cmp::Reverse(bits.count_ones()));

@@ -179,3 +179,120 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2/vht",
     smoke_mvm_vht_refused_without_80mhz_authority
 );
+
+const VHT160: u16 = VHT80 | feature_bits::WIDTH_160;
+
+/// [`vht_ies`] for a contiguous 160MHz BSS: VHT Capabilities 160MHz +
+/// SGI160 and a VHT Operation with CCFS0 42 / CCFS1 50.
+fn vht160_ies() -> Vec<u8> {
+    let mut ies = vht_ies(1);
+    ies[80] |= 4 | 64;
+    ies[96] = 50;
+    ies
+}
+
+fn vht160_harness(features: u16, bandwidth: u32) -> Result<Harness, &'static str> {
+    let emission = if features == 0 { 2 } else { 5 };
+    let h = Harness::build_nvm(false, true, emission, 3, false, false, features, 3)?;
+    h.db.install(RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![RegRule {
+            freq_start_mhz: 5170,
+            freq_end_mhz: 5330,
+            max_bandwidth_mhz: bandwidth,
+            max_power_dbm: 10,
+            flags: RegFlags::empty(),
+        }],
+    });
+    {
+        let mut ap = h.actor.lock();
+        ap.security.ap =
+            FakeAp::open(NETWORK, b"net", 36, 7).map_err(|_| "5GHz fixture AP config")?;
+        ap.channel = 36;
+        ap.beacon_ies = Some(vht160_ies());
+        ap.response_ies = Some(vht160_ies());
+    }
+    Ok(h)
+}
+
+fn smoke_mvm_vht160_program_prepares_160mhz_and_closes() -> TestResult {
+    check(|| {
+        let h = vht160_harness(VHT160, 160)?;
+        {
+            let mut ap = h.actor.lock();
+            // Control 36 is 70MHz below center 50: iwl_mvm_get_ctrl_pos 3.
+            ap.phy_width = [3, 3];
+            // VHT MCS9, RATE_MCS_CHAN_WIDTH_160, SGI.
+            ap.rx_rate = 0x0010_1b09;
+        }
+        h.join()?;
+        if profile(&h)? != (3, 3, 3, 3, 2, 15, 0x3ff) {
+            return Err("VHT160 PHY/ADD_STA/TLC encoding");
+        }
+        let tlc = last(&h, 5, 15, |_| true).ok_or("TLC configuration absent")?;
+        if tlc[14..16] != 0x3ffu16.to_le_bytes() || tlc[16..20] != [0; 4] {
+            return Err("VHT160 TLC IWL_TLC_MCS_PER_BW_160 map");
+        }
+        let lease = narf_net::dhcp::dhcp_acquire(h.device.name(), 0)
+            .map_err(|_| "VHT160 DORA over 160MHz receive rates")?;
+        if !NETWORK.matches_lease(&lease) {
+            return Err("VHT160 DORA leased wrong address");
+        }
+        let start = {
+            let mut actor = h.actor.lock();
+            actor.closing = true;
+            actor.commands.len()
+        };
+        run(h.device.disassociate())?.map_err(|_| "VHT160 ordered close")?;
+        leaving_deauthentication_preceded_teardown(&h, start)?;
+        if last(&h, 1, 8, |b| b[4] == 3).is_none_or(|b| b[18..20] != [3, 3]) {
+            return Err("VHT160 PHY removal width");
+        }
+        if h.retained() != (0, 0, 0) || h.device.link_up() {
+            return Err("VHT160 close left native resources");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/vht",
+    smoke_mvm_vht160_program_prepares_160mhz_and_closes
+);
+
+fn smoke_mvm_vht160_not_granted_or_not_permitted_stays_80mhz() -> TestResult {
+    check(|| {
+        // VHT80 toward the 160MHz BSS: its primary 80MHz block only.
+        let h = vht160_harness(VHT80, 160)?;
+        h.actor.lock().phy_width = [2, 1];
+        h.join()?;
+        if profile(&h)? != (2, 1, 3, 2, 2, 7, 0x3ff) {
+            return Err("160MHz BSS widened a VHT80 program");
+        }
+        run(h.device.disassociate())?.map_err(|_| "VHT80 close")?;
+        if h.retained() != (0, 0, 0) {
+            return Err("VHT80 close left native resources");
+        }
+        drop(h);
+        // An 80MHz-limited policy drops WIDTH_160 from the offer.
+        let h = vht160_harness(VHT160, 80)?;
+        if h.join().is_ok() {
+            return Err("VHT160 accepted under an 80MHz policy");
+        }
+        drop(h);
+        // An 80MHz BSS (no CCFS1) never offers WIDTH_160.
+        let h = vht160_harness(VHT160, 160)?;
+        {
+            let mut ap = h.actor.lock();
+            ap.beacon_ies = Some(vht_ies(1));
+            ap.response_ies = Some(vht_ies(1));
+        }
+        if h.join().is_ok() {
+            return Err("VHT160 accepted toward an 80MHz BSS");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/vht",
+    smoke_mvm_vht160_not_granted_or_not_permitted_stays_80mhz
+);
