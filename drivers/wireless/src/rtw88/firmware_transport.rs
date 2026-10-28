@@ -409,6 +409,15 @@ pub(super) unsafe trait Io: Send {
     fn packet_stop(&mut self) -> Result<(), super::packet_core::Error> {
         Err(super::packet_core::Error::State)
     }
+    /// `rtw_pci_stop` plus the DMA idle proof (`dma_stop::prove`). Only
+    /// success lets Drop release the published rings and buffers.
+    async fn quiesce_dma(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// True once `quiesce_dma` proved every published mapping idle.
+    fn dma_reclaimable(&self) -> bool {
+        false
+    }
 
     async fn delay_us(&mut self, us: u64) {
         narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(us.saturating_mul(1000))).await;
@@ -631,11 +640,29 @@ impl<I: Io> Owner<I> {
             .stop(&mut self.io)
     }
     pub(super) async fn station_disconnect(&mut self) -> Result<(), super::station::Error> {
-        self.station
+        let result = self
+            .station
             .as_deref_mut()
             .ok_or(super::station::Error::State)?
             .disconnect(&mut self.io)
-            .await
+            .await;
+        // The stopped one-shot owner proves DMA idle so its mappings can be
+        // released. A missing proof keeps them retained and never turns a
+        // completed disconnect into a failure.
+        let _ = self.io.quiesce_dma().await;
+        result
+    }
+    /// `rtw_pci_stop` and DMA idle proof for any phase (removal, failure).
+    /// Closes the station first; success lets Drop free every mapping.
+    pub(super) async fn quiesce_dma(&mut self) -> Result<(), Error> {
+        if let Some(station) = self.station.as_deref_mut() {
+            let _ = station.stop(&mut self.io);
+        }
+        self.phase = Phase::Failed;
+        self.io.quiesce_dma().await
+    }
+    pub(super) fn dma_reclaimable(&self) -> bool {
+        self.io.dma_reclaimable()
     }
     pub(super) async fn station_scan(
         &mut self,

@@ -243,6 +243,13 @@ pub(super) unsafe trait Registers: Send {
     fn packet_stop(&mut self) -> Result<(), super::packet_core::Error> {
         Err(super::packet_core::Error::State)
     }
+    /// Native `rtw_pci_stop` and DMA idle proof over every non-beacon ring.
+    async fn quiesce_dma(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn dma_reclaimable(&self) -> bool {
+        false
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PageState {
@@ -261,6 +268,8 @@ pub(super) struct Backend<R: Registers, M: Memory> {
     published: bool,
     boundary: u16,
     completed: bool,
+    /// The completed beacon descriptor was zeroed under parked authority.
+    disarmed: bool,
 }
 impl<R: Registers, M: Memory> core::fmt::Debug for Backend<R, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -302,6 +311,7 @@ impl<R: Registers, M: Memory> Backend<R, M> {
             published: false,
             boundary,
             completed: false,
+            disarmed: false,
         })
     }
     fn word(memory: &mut M, offset: usize, value: u32) -> Result<(), Error> {
@@ -604,6 +614,7 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
         if self.io.read8(0x383)? & 0x10 != 0 || self.io.read8(0x550)? & 8 != 0 {
             return Err(Error::Prerequisite);
         }
+        self.disarmed = true;
         self.io.finish_station8821c(gate)
     }
     fn begin_commands(&mut self) -> Result<(), Error> {
@@ -649,6 +660,7 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
             return Err(Error::Prerequisite);
         }
         self.state = PageState::Terminal;
+        self.disarmed = true;
         self.io.finish_radio(gate)
     }
 
@@ -701,6 +713,22 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     }
     fn packet_stop(&mut self) -> Result<(), super::packet_core::Error> {
         self.io.packet_stop()
+    }
+    async fn quiesce_dma(&mut self) -> Result<(), Error> {
+        // The beacon page must have completed (fresh BCN_VALID) or been
+        // disarmed; a poisoned or cancelled transfer stays retained.
+        if !self.published
+            || !(matches!(self.state, PageState::Idle | PageState::Continued) || self.disarmed)
+        {
+            return Err(Error::State);
+        }
+        self.state = PageState::Terminal;
+        self.io.quiesce_dma().await?;
+        self.published = false;
+        Ok(())
+    }
+    fn dma_reclaimable(&self) -> bool {
+        !self.published && (self.state == PageState::Unclaimed || self.io.dma_reclaimable())
     }
     async fn delay_us(&mut self, us: u64) {
         self.io.delay_us(us).await;

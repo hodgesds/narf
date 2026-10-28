@@ -597,6 +597,10 @@ impl Harness {
         let mut retained = self.lifecycle.retained.try_lock().unwrap();
         operation(&mut retained.as_mut().unwrap().io)
     }
+    fn lifecycle_reclaimable(&self) -> bool {
+        let retained = self.lifecycle.retained.try_lock().unwrap();
+        retained.as_ref().unwrap().dma_reclaimable()
+    }
     fn pump(&self) {
         for _ in 0..16 {
             self.device.drain();
@@ -679,11 +683,33 @@ fn composition(protected: bool) -> TestResult {
     {
         return TestResult::Fail("RTL8822CE terminal disconnect not parked");
     }
+    // rtw_pci_stop + DMA idle proof ran once and released the mappings.
+    if !h.model(|io| io.reclaimed && io.quiesces == 1) || !h.lifecycle_reclaimable() {
+        return TestResult::Fail("RTL8822CE stopped idle owner kept its DMA retained");
+    }
     if h.device.enqueue(&uplink, TxMeta::default()).is_ok() {
         return TestResult::Fail("RTL8822CE disconnected packet publication reopened");
     }
     TestResult::Pass
 }
+/// A disconnect whose RXDMA never idles still completes, but every
+/// published mapping stays retained (no reclaim without the proof).
+fn smoke_rtw8822ce_disconnect_without_dma_idle_proof_retains_mappings() -> TestResult {
+    let h = Harness::new(false);
+    h.join();
+    h.model(|io| io.rx_dma_busy = true);
+    if complete(h.device.disassociate()).is_err() || !h.closed() {
+        return TestResult::Fail("RTL8822CE disconnect failed on a missing DMA proof");
+    }
+    if h.model(|io| io.reclaimed || io.quiesces != 1) || h.lifecycle_reclaimable() {
+        return TestResult::Fail("RTL8822CE busy RXDMA was released");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/station",
+    smoke_rtw8822ce_disconnect_without_dma_idle_proof_retains_mappings
+);
 fn smoke_rtw8822ce_earned_native_device_open_kernel_dhcp_ip() -> TestResult {
     composition(false)
 }

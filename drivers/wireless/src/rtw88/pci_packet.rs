@@ -161,6 +161,10 @@ impl Native {
         self.with_packet(|core, port| core.stop(port))
     }
 }
+/// `Port::stop` without a packet core (owner failed before packets).
+pub(super) fn stop_native(native: &mut Native) -> Result<(), packet::Error> {
+    Port::stop(native)
+}
 // SAFETY: this is the same retained, non-cloneable Native after sealed radio
 // qualification. CPU and register accesses invoke its actual current cap;
 // original rings and every published payload stay retained on every exit.

@@ -52,6 +52,7 @@ mod dm;
 mod dm_station_tests;
 #[cfg(feature = "kernel-test")]
 mod dm_tests;
+mod dma_stop;
 pub mod efuse;
 mod firmware_lifecycle;
 mod firmware_native;

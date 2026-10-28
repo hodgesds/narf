@@ -52,6 +52,10 @@ pub(super) struct RadioIo {
     pub(super) mailboxes: Vec<[u8; 8]>,
     mailbox_pending: bool,
     pub(super) mailbox_cursor: u8,
+    /// RXDMA never reports idle after RW_RELEASE.
+    pub(super) rx_dma_busy: bool,
+    pub(super) reclaimed: bool,
+    pub(super) quiesces: usize,
 }
 impl RadioIo {
     pub(super) fn new() -> Self {
@@ -95,6 +99,9 @@ impl RadioIo {
             mailboxes: Vec::new(),
             mailbox_pending: false,
             mailbox_cursor: 0,
+            rx_dma_busy: false,
+            reclaimed: false,
+            quiesces: 0,
         }
     }
     fn reference() -> Self {
@@ -714,6 +721,29 @@ unsafe impl Io for RadioIo {
             .map_err(|_| crate::rtw88::packet_core::Error::Access)?;
         self.packet_with(|core, port| core.poll(port))
     }
+    async fn quiesce_dma(&mut self) -> Result<(), Error> {
+        self.quiesces += 1;
+        // Native quiesce: rtw_pci_stop (HIMRs, TXPAUSE, CR, BME) first.
+        if self.core.is_some() {
+            Io::packet_stop(self).map_err(|_| Error::Access)?;
+        }
+        self.packets.active = false;
+        for reg in crate::rtw88::dma_stop::HIMR {
+            let at = usize::from(reg);
+            self.base.regs[at..at + 4].fill(0);
+        }
+        self.base.regs[0x522] = 0xff;
+        self.base.regs[0x100] &= !0xcf;
+        crate::rtw88::dma_stop::prove(&mut Teardown(self)).await?;
+        if let Some(core) = self.core.as_mut() {
+            core.release().map_err(|_| Error::State)?;
+        }
+        self.reclaimed = true;
+        Ok(())
+    }
+    fn dma_reclaimable(&self) -> bool {
+        self.reclaimed
+    }
     fn packet_stop(&mut self) -> Result<(), crate::rtw88::packet_core::Error> {
         self.packet_with(|core, port| {
             // Match the actual PCI-only safe shutdown after RF source loss.
@@ -1133,3 +1163,40 @@ kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw8822ce_staged_policy_preserves_phy_checkpoint_and_resumes_same_owner
 );
+
+/// Teardown view of the radio model (`dma_stop::Quiesce`).
+struct Teardown<'a>(&'a mut RadioIo);
+#[async_trait::async_trait]
+impl crate::rtw88::dma_stop::Quiesce for Teardown<'_> {
+    fn bus_master_closed(&mut self) -> Result<bool, Error> {
+        Ok(!self.0.packets.active)
+    }
+    fn read8(&mut self, reg: u16) -> Result<u8, Error> {
+        Ok(self.0.base.regs[usize::from(reg)])
+    }
+    fn read32(&mut self, reg: u16) -> Result<u32, Error> {
+        use crate::rtw88::dma_stop::{RW_RELEASE, RXDMA_IDLE, RXPKT_NUM};
+        if let Some(index) = self.0.packets.raw_index(reg) {
+            return Ok(index);
+        }
+        if reg == 0x132c || reg == 0x3b8 {
+            // H2C: one descriptor outstanding while a command is pending.
+            return Ok(u32::from(reg == 0x132c && self.0.pending));
+        }
+        let at = usize::from(reg);
+        let mut value = u32::from_le_bytes(self.0.base.regs[at..at + 4].try_into().unwrap());
+        if reg == RXPKT_NUM {
+            value &= !RXDMA_IDLE;
+            if value & RW_RELEASE != 0 && !self.0.rx_dma_busy {
+                value |= RXDMA_IDLE;
+            }
+        }
+        Ok(value)
+    }
+    fn write32(&mut self, reg: u16, value: u32) -> Result<(), Error> {
+        let at = usize::from(reg);
+        self.0.base.regs[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+    async fn delay_us(&mut self, _: u64) {}
+}

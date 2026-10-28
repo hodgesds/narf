@@ -522,6 +522,23 @@ impl Core {
         port.stop()
     }
 }
+impl Core {
+    /// After `dma_stop::prove` on the stopped owner: the device can no
+    /// longer read the frame or batch buffers, so Drop may free them.
+    pub(super) fn release(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Stopped {
+            return Err(Error::State);
+        }
+        self.pending = None;
+        self.batch_pending.clear();
+        self.published = false;
+        self.batch_published = false;
+        Ok(())
+    }
+    pub(super) fn reclaimable(&self) -> bool {
+        self.phase == Phase::Stopped && !self.published && !self.batch_published
+    }
+}
 impl Drop for Core {
     fn drop(&mut self) {
         if self.published {

@@ -101,6 +101,9 @@ struct Model {
     mailbox_hold: bool,
     ring: Arc<IrqSafeSpinLock<BlockState>>,
     frame: Arc<IrqSafeSpinLock<BlockState>>,
+    /// RXDMA never reports idle after RW_RELEASE.
+    rx_dma_busy: bool,
+    reclaimed: bool,
 }
 #[derive(Clone)]
 struct Port(Arc<IrqSafeSpinLock<Model>>);
@@ -234,6 +237,39 @@ impl Port {
         m.packet_core = Some(core);
         result
     }
+}
+/// Teardown view of the simulated register file (`dma_stop::Quiesce`).
+struct Teardown(Arc<IrqSafeSpinLock<Model>>);
+#[async_trait::async_trait]
+impl crate::rtw88::dma_stop::Quiesce for Teardown {
+    fn bus_master_closed(&mut self) -> Result<bool, Error> {
+        Ok(!self.0.lock().packet_model.active)
+    }
+    fn read8(&mut self, reg: u16) -> Result<u8, Error> {
+        Ok(self.0.lock().bytes[usize::from(reg)])
+    }
+    fn read32(&mut self, reg: u16) -> Result<u32, Error> {
+        use crate::rtw88::dma_stop::{RW_RELEASE, RXDMA_IDLE, RXPKT_NUM};
+        let m = self.0.lock();
+        if let Some(index) = m.packet_model.raw_index(reg) {
+            return Ok(index);
+        }
+        let at = usize::from(reg);
+        let mut value = u32::from_le_bytes(m.bytes[at..at + 4].try_into().unwrap());
+        if reg == RXPKT_NUM {
+            value &= !RXDMA_IDLE;
+            if value & RW_RELEASE != 0 && !m.rx_dma_busy {
+                value |= RXDMA_IDLE;
+            }
+        }
+        Ok(value)
+    }
+    fn write32(&mut self, reg: u16, value: u32) -> Result<(), Error> {
+        let at = usize::from(reg);
+        self.0.lock().bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+    async fn delay_us(&mut self, _: u64) {}
 }
 #[async_trait::async_trait]
 // SAFETY: no physical PCI/DMA. The simulator holds all synthetic device
@@ -916,6 +952,28 @@ unsafe impl Registers for Port {
             .map_err(|_| crate::rtw88::packet_core::Error::Access)?;
         self.packet_with(|core, port| core.poll(port))
     }
+    async fn quiesce_dma(&mut self) -> Result<(), Error> {
+        // Native quiesce runs rtw_pci_stop first, whatever the phase.
+        let stopped = if self.0.lock().packet_core.is_some() {
+            Registers::packet_stop(self)
+        } else {
+            let mut m = self.0.lock();
+            m.bytes[0x100] &= !0xcf;
+            m.bytes[0x522] = 255;
+            Ok(())
+        };
+        stopped.map_err(|_| Error::Access)?;
+        crate::rtw88::dma_stop::prove(&mut Teardown(self.0.clone())).await?;
+        if self.0.lock().packet_core.is_some() {
+            self.packet_with(|core, _| core.release())
+                .map_err(|_| Error::State)?;
+        }
+        self.0.lock().reclaimed = true;
+        Ok(())
+    }
+    fn dma_reclaimable(&self) -> bool {
+        self.0.lock().reclaimed
+    }
     fn packet_stop(&mut self) -> Result<(), crate::rtw88::packet_core::Error> {
         // Native stop encloses only PCI authority: closing RF/DMA must remain
         // possible after a measured-source or regulatory revocation.
@@ -998,6 +1056,8 @@ fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
         mailbox_hold: false,
         ring: ring.clone(),
         frame: frame.clone(),
+        rx_dma_busy: false,
+        reclaimed: false,
     })));
     let backend = Backend::new(
         port.clone(),
@@ -1360,3 +1420,80 @@ kernel_test_in!(
 
 #[path = "reserved_calibration8821c_tests.rs"]
 mod calibration8821c_tests;
+
+/// `rtw_pci_stop` + DMA idle proof through the actual beacon backend: only a
+/// completed (or never-armed) beacon page plus a proven idle controller lets
+/// Drop release the published ring and frame.
+fn smoke_rtw88_reserved_page_dma_stop_proof_reclaims_published_mappings() -> TestResult {
+    // Never claimed: nothing published, nothing to prove.
+    let (mut backend, _, drops) = allocated();
+    if narf_scheduler::block_on(backend.quiesce_dma()) != Err(Error::State)
+        || !backend.dma_reclaimable()
+    {
+        return TestResult::Fail("unclaimed backend ran a DMA-stop proof");
+    }
+    drop(backend);
+    if drops.load(Ordering::SeqCst) != 2 {
+        return TestResult::Fail("unpublished mappings were not freed");
+    }
+    // Success after a completed page.
+    let (mut backend, port, drops) = allocated();
+    backend.claim_pristine().unwrap();
+    narf_scheduler::block_on(backend.reserved_page(&[0x12; 80])).unwrap();
+    if narf_scheduler::block_on(backend.quiesce_dma()).is_err() || !backend.dma_reclaimable() {
+        return TestResult::Fail("idle stopped backend was not proven");
+    }
+    {
+        let m = port.0.lock();
+        if m.bytes[0x522] != 0xff || m.bytes[0x100] & 0xcf != 0 || m.bytes[0x286] & 4 == 0 {
+            return TestResult::Fail("proof skipped TXPAUSE/CR stop or RW_RELEASE");
+        }
+    }
+    if narf_scheduler::block_on(backend.reserved_page(&[0x34; 80])) != Err(Error::State)
+        || narf_scheduler::block_on(backend.quiesce_dma()) != Err(Error::State)
+    {
+        return TestResult::Fail("reclaimable backend reopened");
+    }
+    drop(backend);
+    if drops.load(Ordering::SeqCst) != 2 {
+        return TestResult::Fail("proven-idle backend retained its mappings");
+    }
+    // RXDMA never idle: the proof fails, everything stays retained.
+    let (mut backend, port, drops) = allocated();
+    backend.claim_pristine().unwrap();
+    port.0.lock().rx_dma_busy = true;
+    if narf_scheduler::block_on(backend.quiesce_dma()) != Err(Error::Timeout)
+        || backend.dma_reclaimable()
+    {
+        return TestResult::Fail("busy RXDMA was accepted as idle");
+    }
+    port.0.lock().rx_dma_busy = false;
+    if narf_scheduler::block_on(backend.quiesce_dma()) != Err(Error::State) {
+        return TestResult::Fail("failed proof was retried on a terminal backend");
+    }
+    drop(backend);
+    if drops.load(Ordering::SeqCst) != 0 {
+        return TestResult::Fail("unproven backend released its mappings");
+    }
+    // A timed-out (still possibly owned) beacon page is never proven.
+    let (mut backend, port, drops) = allocated();
+    backend.claim_pristine().unwrap();
+    port.0.lock().stall = true;
+    if narf_scheduler::block_on(backend.reserved_page(&[0; 80])) != Err(Error::Timeout) {
+        return TestResult::Fail("stalled beacon page fixture did not time out");
+    }
+    if narf_scheduler::block_on(backend.quiesce_dma()) != Err(Error::State)
+        || backend.dma_reclaimable()
+    {
+        return TestResult::Fail("pending beacon descriptor was reclaimed");
+    }
+    drop(backend);
+    if drops.load(Ordering::SeqCst) != 0 {
+        return TestResult::Fail("timed-out beacon mappings were released");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw88_reserved_page_dma_stop_proof_reclaims_published_mappings
+);

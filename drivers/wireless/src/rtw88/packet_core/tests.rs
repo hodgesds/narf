@@ -117,6 +117,10 @@ impl Model {
             controls: Arc::new(Controls::default()),
         }
     }
+    /// Current device index word without device progress (teardown view).
+    pub(in crate::rtw88) fn raw_index(&self, register: u16) -> Option<u32> {
+        Self::slot(register).ok().map(|slot| self.indices[slot])
+    }
     fn slot(register: u16) -> Result<usize, Error> {
         match register {
             0x3b0 => Ok(0),

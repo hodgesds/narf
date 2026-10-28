@@ -1527,6 +1527,57 @@ and composed C21/C22 Open/WPA2 cases in `drivers/wireless/rtw88/qos/*`
 unqualified station, a VI-only subset and refused records. A real signed
 N2xQ measurement and over-the-air acceptance remain external.
 
+### PCI DMA-stop proof and reclamation (`dma_stop.rs`)
+
+A stopped owner used to keep every published mapping forever: the seven TX
+rings, the 512-entry RX ring and its buffers, the H2C bounce buffer, the
+packet-core frame and batch buffers and the reserved-page ring/frame.
+Clearing BME alone is not a retirement proof. `Io::quiesce_dma` now follows
+Linux v7.2 `pci.c::rtw_pci_stop` (`rtw_pci_disable_interrupt` writes
+`RTK_PCI_HIMR0/1/3` = 0 at 0xb0/0xb8/0x10b8, then `rtw_pci_dma_release`)
+and adds the idle proof that Linux gets for free by powering the MAC off
+first. Native runs the packet stop (`Core::stop` or a bare `Port::stop`):
+HIMRs zero, `REG_TXPAUSE` 0x522 = 0xff, CR 0x100 low DMA gates
+(`MAC_TRX_ENABLE` bits 0..3/6/7) cleared and BME off. `dma_stop::prove`
+then requires, through a teardown view that needs only the current PCI cap
+and memory decode:
+
+1. a fresh PCI command read showing BME clear, INTx disabled and memory
+   decode on;
+2. all three HIMRs zero, TXPAUSE 0xff and the CR DMA gates clear;
+3. for each `rtw_pci_tx_queue_idx_addr` register (H2C 0x132c, BK 0x3ac,
+   BE 0x3a8, VO 0x3a0, VI 0x3a4, MGMT 0x3b0, HI0 0x3b8), hardware RP
+   (bits 16..27, `__pci_get_hw_tx_ring_rp`) equal to host WP (bits 0..11),
+   the drained test of `rtw_pci_dma_check`. Each ring gets 1000 polls
+   10 us apart (`util.c::check_hw_ready`);
+4. RX stopped the way `wow.c::rtw_wow_rx_dma_stop` does it:
+   `REG_RXPKT_NUM` 0x284 `BIT_RW_RELEASE` (18) set, then `BIT_RXDMA_IDLE`
+   (17) polled with the same budget;
+5. a second command read showing BME still clear.
+
+An all-ones read is surprise removal (`Gone`). Any timeout, readback
+mismatch or authority failure leaves every mapping retained. Success clears
+`Native::published` and calls `Core::release`, which needs a stopped core.
+The reserved-page backend releases its ring and frame only if its beacon
+page completed (`Idle`/`Continued`) or was disarmed after radio
+completion. A poisoned or timed-out page is never proven. The backend is
+then terminal and no page, packet or proof can reopen it.
+
+`Owner::station_disconnect` runs the proof after the station stop. Its
+result never turns a completed disconnect into a failure.
+`Owner::quiesce_dma` is the phase-independent entry for removal and
+failure paths: it stops the station first. Linux frees ring skbs in
+`rtw_pci_free_trx_ring` at `rtw_pci_destroy`. Here the release happens
+when the proven owner is dropped.
+
+Evidence: `drivers/wireless/rtw88/dma_stop` (proof success, BME open,
+armed HIMR, TX unpaused, TXDMA on, H2C not drained, RXDMA busy, surprise
+removal, BME reopened mid-drain), the reserved-page reclamation case in
+`drivers/wireless/rtw88` (unclaimed, success and drop count, busy RXDMA
+retained, a timed-out beacon page never proven) and the composed station
+cases (an Open DHCP disconnect proves and reclaims; a busy RXDMA disconnect
+still completes and keeps every mapping).
+
 ## 4. Invariants
 
 - Physical reads select Wi-Fi EFUSE bank zero and disable the programming
@@ -1744,13 +1795,12 @@ changes. None is a physical blocker unless stated.
 | `additional_operating_channels` | `station.rs::associate` refuses `candidate.bss.channel != 1` and `scan.rs::plan` admits 2412 MHz only. The C21/C22 radio programs (`radio.rs`, `radio8821c.rs`) write fixed channel1 RF/BB/TXAGC values. Needs ports of `rtw8822c_set_channel`/`rtw8821c_set_channel` plus a per-channel measured envelope. |
 | `beamforming` | Linux `bf.c::rtw_bf_assoc` acts only on a VHT peer (`vht_cap` SU beamformer/beamformee), so this is blocked on `vht`. |
 | `device_removal` | The retained owner is one-shot: terminal paths keep DMA mappings by design (§4). There is no `rtw_pci_remove` / `rtw_pci_dma_reset` port and `pci.rs` has no remove hook. Software work only (the ath9k DMA-stop pattern applies); not attempted this round. |
-| `dma_reclamation` | Same as `device_removal`: there is no controller-proven `rtw_pci_dma_release` / `rtw_pci_reset_buf_desc` stop proof, so published mappings stay retained. Software work only. |
 | `dpk_tracking` | `rtw8822c_dpk_track` needs a DPK result, and no `rtw8822c_do_dpk` calibration is ported (§3 dm section). |
 | `five_ghz_operation` | The same fixed channel1 programs, plus `scan.rs` 2412-only admission. Needs 5 GHz RF/BB/AGC table selection and a measured 5 GHz envelope. |
 | `ht40` | `station.rs` refuses any offered/negotiated width other than `Width::Twenty`, and the radio programs only BW20. Needs `rtw8822c_set_channel_bb` BW40 and DSSS/CCK40 programming, plus SGI40 in the measured HT gate. |
 | `multi_device` | Not attempted. Each `Rtw88Device` owns one retained lifecycle, and there is no multi-instance composition test. |
 | `multi_stream_ht` | `ht.rs::local` advertises and transmits MCS0..7 only, and `ht.rs::program` writes one-stream TXAGC words. 2SS TXAGC/RA mask programming and a measured 2SS envelope are missing. |
-| `operating_reset` | No `rtw_core_stop`/`rtw_core_start` restart over a retained owner. Blocked on the same DMA-stop proof as `dma_reclamation`. |
+| `operating_reset` | No `rtw_core_stop`/`rtw_core_start` restart over a retained owner. The DMA-stop proof (`dma_stop.rs`) now releases a stopped owner, but no generation reset re-runs power-on, firmware download and the retained stages over the same device. |
 | `radio_coexistence` | No `coex.c` state machine (BT scoreboard, TDMA tables, `rtw_coex_*` notifications) is ported. |
 | `rate_fallback` | `packet_format.rs::transmit_profile` sets W3 USE_RATE|DISDATAFB (bits 8/10) on every frame. Firmware RA fallback needs a qualified per-rate envelope over the RA mask; that is software work, not attempted this round. |
 | `rf_power_tracking` | `dm.rs` admits `PWR_TRACK` only on C22 (`C21_MECHANISMS` = DIG/CCK-PD/RA). The `rtw8821c_pwr_track` TXAGC/txscale port is missing. |

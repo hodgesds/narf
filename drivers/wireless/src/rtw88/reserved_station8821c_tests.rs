@@ -558,8 +558,9 @@ fn composition(protected: bool) -> TestResult {
     }
     let drops = h.drops.clone();
     drop(h);
-    if drops.load(Ordering::SeqCst) != 0 {
-        return TestResult::Fail("C21 composed station teardown freed original firmware DMA");
+    // The disconnect's DMA-stop proof released the beacon ring and frame.
+    if drops.load(Ordering::SeqCst) != 2 {
+        return TestResult::Fail("C21 proven-idle station teardown kept firmware DMA retained");
     }
     TestResult::Pass
 }

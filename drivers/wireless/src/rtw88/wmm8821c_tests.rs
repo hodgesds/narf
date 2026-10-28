@@ -253,8 +253,9 @@ fn composition(protected: bool, wmm: bool, narrow: bool) -> Result<(), &'static 
     }
     let drops = e.h.drops.clone();
     drop(e);
-    if drops.load(Ordering::SeqCst) != 0 {
-        return Err("C21 N21L lifecycle reclaimed original published firmware DMA");
+    // The disconnect's DMA-stop proof released the beacon ring and frame.
+    if drops.load(Ordering::SeqCst) != 2 {
+        return Err("C21 N21L proven-idle teardown kept firmware DMA retained");
     }
     Ok(())
 }
