@@ -30,6 +30,9 @@ pub(super) struct Permission {
     pub frequency: u16,
     pub center: u16,
     pub secondary: Option<u16>,
+    /// The occupied block is the 80 MHz segment containing the primary/
+    /// secondary pair (VHT80, VDEV_START `band_center_freq1` = `center`).
+    pub width80: bool,
     pub half_dbm: u8,
 }
 impl Permission {
@@ -47,11 +50,32 @@ impl Permission {
     ) -> Result<Self, Error> {
         Self::occupied(caps, domain, frequency, None)
     }
+    /// The 80 MHz segment center for a non-DFS profile primary (ch36-48,
+    /// ch149-161); cfg80211 chandef `center_freq1` for VHT80.
+    pub fn center80(frequency: u16) -> Option<u16> {
+        match frequency {
+            5180..=5240 => Some(5210),
+            5745..=5805 => Some(5775),
+            _ => None,
+        }
+    }
     pub fn occupied(
         caps: &super::wmi_boot::Capabilities,
         domain: &narf_wireless::reg::RegulatoryDomain,
         frequency: u16,
         secondary: Option<u16>,
+    ) -> Result<Self, Error> {
+        Self::occupied_width(caps, domain, frequency, secondary, false)
+    }
+    /// Occupied-bandwidth/power receipt for 20, 40 or (`width80`, with the
+    /// 40 MHz `secondary` naming the HT pair inside the segment) 80 MHz.
+    /// Every overlapping host rule must permit the whole occupied block.
+    pub fn occupied_width(
+        caps: &super::wmi_boot::Capabilities,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        frequency: u16,
+        secondary: Option<u16>,
+        width80: bool,
     ) -> Result<Self, Error> {
         // Linux's strict initial custom world domain admits 1..11 to
         // initiate radiation; channels requiring beacon-hint/DFS state
@@ -67,19 +91,27 @@ impl Permission {
         } else {
             (caps.low_5ghz, caps.high_5ghz)
         };
+        let segment = Self::center80(frequency)
+            .filter(|_| width80)
+            .map(|c| [c - 30, c + 30]);
         if !(low_band..=high_band).contains(&u32::from(frequency))
             || secondary.is_some_and(|s| !(low_band..=high_band).contains(&u32::from(s)))
+            || segment.is_some_and(|s| {
+                s.iter()
+                    .any(|f| !(low_band..=high_band).contains(&u32::from(*f)))
+            })
         {
             return Err(Error::Unsupported);
         }
         let factory = Factory::from_eeprom(caps.eeprom_domain).map_err(|_| Error::Unsupported)?;
-        Self::from_factory(factory, domain, frequency, secondary)
+        Self::from_factory_width(factory, domain, frequency, secondary, width80)
     }
-    fn from_factory(
+    fn from_factory_width(
         factory: Factory,
         domain: &narf_wireless::reg::RegulatoryDomain,
         frequency: u16,
         secondary: Option<u16>,
+        width80: bool,
     ) -> Result<Self, Error> {
         let two_ghz = frequency < 3000;
         use narf_wireless::reg::RegFlags;
@@ -101,8 +133,25 @@ impl Permission {
         }) {
             return Err(Error::Unsupported);
         }
-        let center = secondary.map_or(frequency, |s| (frequency + s) / 2);
-        let width = if secondary.is_some() { 40 } else { 20 };
+        let center80 = Self::center80(frequency);
+        if width80
+            && (secondary.is_none()
+                || center80.is_none()
+                || center80 != secondary.and_then(Self::center80))
+        {
+            return Err(Error::Unsupported);
+        }
+        let center = match (width80, center80) {
+            (true, Some(c)) => c,
+            _ => secondary.map_or(frequency, |s| (frequency + s) / 2),
+        };
+        let width = if width80 {
+            80
+        } else if secondary.is_some() {
+            40
+        } else {
+            20
+        };
         let low = u32::from(center) - width / 2;
         let high = u32::from(center) + width / 2;
         let mut covering = false;
@@ -141,13 +190,21 @@ impl Permission {
             frequency,
             center,
             secondary,
+            width80,
             half_dbm,
         })
     }
     /// Recheck the chosen immutable factory/frequency receipt against the
     /// current host policy without querying or inventing hardware facts.
     pub fn check(self, domain: &narf_wireless::reg::RegulatoryDomain) -> Result<(), Error> {
-        if Self::from_factory(self.factory, domain, self.frequency, self.secondary)? != self {
+        if Self::from_factory_width(
+            self.factory,
+            domain,
+            self.frequency,
+            self.secondary,
+            self.width80,
+        )? != self
+        {
             return Err(Error::Unsupported);
         }
         Ok(())

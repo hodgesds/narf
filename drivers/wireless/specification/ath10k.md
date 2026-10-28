@@ -366,6 +366,21 @@ Host-bus/system power transitions remain separate profiles.
   on all six dialects, an ignored ADDBA/DELBA exchange, mixed
   ACK/NO_ACK/DISCARD outcomes, malformed status, and teardown keeping the
   aggregate's DMA.
+- 80 MHz occupied-bandwidth receipt (`regulatory.rs`):
+  `Permission::occupied_width(.., width80)` admits the non-DFS VHT80
+  segments ch36-48 (center 5210) and ch149-161 (center 5775). This is the
+  cfg80211 chandef `center_freq1` that Linux puts in VDEV_START
+  `band_center_freq1` for `MODE_11AC_VHT80`
+  (`mac.c::ath10k_vdev_start_restart`, `wmi.c` `chan->band_center_freq1`).
+  The 40 MHz `secondary` must name the HT pair inside the same segment.
+  Every overlapping host rule must allow 80 MHz, and one rule must cover
+  the whole segment. DFS, NO_IR, indoor and unknown flags stay restrictive.
+  The factory/country binding and power ceiling are the same as for HT40.
+  `Permission::check` re-derives the width-tagged receipt, so a narrowed,
+  cleared, lower-power or different-country policy closes it. A 40 MHz
+  receipt over the same pair is a different receipt. Nothing selects
+  `width80` yet: the VHT station profile (VHT IE, VHT PEER_ASSOC rates,
+  `MODE_11AC_*`) is still open.
 - The registered Device binds native preparation, authentication/association,
   WMM/peer/up commands and initial RSNA data to a chosen factory/frequency/power
   receipt. It samples current policy before and after each nested wait and
@@ -1112,15 +1127,15 @@ Across the reached rows, concrete remaining software packages are 2.4-GHz HT40
 coexistence/occupied-power ownership;
 additional streams and TX STBC (which needs a second selected TX chain;
 LDPC and one-stream RX STBC are implemented above);
-response-bound VHT and wider geometry; native TX BA, independent
-multi-packet DMA/completion and aggregate retries; PFC fetch/queue ownership;
+response-bound VHT and wider geometry (the 80 MHz permission receipt is
+implemented); PFC fetch/queue ownership;
 dynamic WMM/protection updates and TSPEC/U-APSD; DFS/indoor/beacon-hint
 qualification; associated/off-channel scanning; hardware key/PMF/WPA3 profiles;
 AP/P2P roles; host-bus PM and wake offload (system suspend is implemented);
 pre-cal/cal-file and DT/NVMEM calibration sources (QCA9887 EEPROM is implemented)
 and automatic credential/stable-interface recovery.
-The existing bounded RX BA/reorder and complete RAW A-MSDU receiver must not be
-counted again as wholly missing TX aggregation. Unsupported role, width, stream,
+Firmware-owned TX BA, the N-deep HTT pipeline and aggregate retry accounting
+are implemented above, beside the bounded RX BA/reorder and RAW A-MSDU receiver. Unsupported role, width, stream,
 or security capability remains closed; this ledger makes no per-chip RF or
 board-power claim from a model or PCI ID.
 
