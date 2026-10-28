@@ -20,9 +20,10 @@
 //!
 //! QMI rides QRTR over GLINK ([`super::qrtr_glink`]); the WLFW AHB paths
 //! (`fixed_mem_region`, `fixed_bdf_addr`, DEVICE_INFO) take
-//! [`AhbChip::wlfw_hw_params`]. What is not here (ledger rows
-//! `ipq8074_enablement`, …): the AHB HIF (`CeHif<AhbIo>`), the
-//! multi-pdev core/DP runtime and the per-SoC `hw_ops`; see
+//! [`AhbChip::wlfw_hw_params`]. The HIF is [`super::ahb_hif`], the DT
+//! bring-up [`super::ahb_probe`], the per-SoC `hw_ops`
+//! [`super::hw_ops`]. Not here (ledger rows `ipq8074_enablement`, …):
+//! the multi-pdev core/DP runtime; see
 //! `drivers/wireless/specification/ath11k.md` §8.
 
 use alloc::string::String;
