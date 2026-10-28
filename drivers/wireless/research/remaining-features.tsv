@@ -106,7 +106,7 @@ iwlwifi	p2p	P2P role	feature	drivers/wireless/specification/iwlwifi.md	1555
 iwlwifi	persistent_key_history	Persistent key history	feature	drivers/wireless/specification/iwlwifi.md	1555
 iwlwifi	platform_power_owner	Gen3 and Sc live platform TX-power enforcement owner	feature	drivers/wireless/specification/iwlwifi.md	1556
 iwlwifi	rss	Receive-side scaling	feature	drivers/wireless/specification/iwlwifi.md	1555
-iwlwifi	sched_scan_offload	Scheduled-scan (PNO/net-detect) firmware offload	feature	drivers/wireless/specification/iwlwifi.md	1557
+iwlwifi	sched_scan_offload	Scheduled-scan (PNO/net-detect) firmware offload [API available: WirelessNetIface::{sched_scan_support, start_sched_scan, stop_sched_scan} with SchedScanSupport/SchedScanRequest, NL80211_CMD_START/STOP_SCHED_SCAN, nl80211::notify_sched_scan_results/stopped (wireless spec 3.4, Scheduled scan)]	feature	drivers/wireless/specification/iwlwifi.md	1557
 iwlwifi	six_ghz	6GHz operation on applicable 6E/7 profiles [API available: association::Bss.band / channel::Band::Ghz6 / frequency_in, he::HeOperation::six_ghz_operation, association::six_ghz::{admit, admit_with_rule, He6GhzCapability, He6GhzOperation}, reg::PowerType6Ghz + RegFlags::NO_6GHZ_{VLP,AFC}_CLIENT (wireless spec 3, 6 GHz band identity); a 6 GHz JoinPlan is not yet available]	feature	drivers/wireless/specification/iwlwifi.md	1557
 iwlwifi	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/iwlwifi.md	1555
 iwlwifi	width_160	160MHz operation on applicable profiles	feature	drivers/wireless/specification/iwlwifi.md	1557

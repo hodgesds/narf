@@ -344,6 +344,25 @@ pub trait WirelessNetIface: Interface {
         Err(EOPNOTSUPP)
     }
 
+    /// Scheduled-scan limits, or `None` (the default) when the wiphy has no
+    /// `sched_scan_start` (`NL80211_CMD_START_SCHED_SCAN` is EOPNOTSUPP).
+    fn sched_scan_support(&self) -> Option<SchedScanSupport> {
+        None
+    }
+
+    /// cfg80211 `rdev_sched_scan_start`: begin the parsed scheduled scan.
+    /// The driver reports matches with `nl80211::notify_sched_scan_results`
+    /// and a firmware-initiated end with `nl80211::notify_sched_scan_stopped`.
+    fn start_sched_scan(&self, _request: SchedScanRequest) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+
+    /// cfg80211 `rdev_sched_scan_stop`: end the running scheduled scan
+    /// (ENOENT when none runs).
+    fn stop_sched_scan(&self) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+
     /// Current `WIPHY_FRAG_THRESHOLD`, or `None` when the driver does not
     /// publish a fragmentation-threshold setting.
     fn fragmentation_threshold(&self) -> Option<u32> {
@@ -1188,6 +1207,50 @@ pub struct NetDetectMatch {
     pub ssid: Vec<u8>,
     pub rssi_threshold_dbm: Option<i32>,
 }
+
+/// Scheduled-scan (PNO) limits of a wiphy (cfg80211 `wiphy->max_sched_scan_*`
+/// / `max_match_sets`). Returning it from
+/// `WirelessIface::sched_scan_support` advertises
+/// `NL80211_CMD_START_SCHED_SCAN` / `STOP_SCHED_SCAN` and these limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SchedScanSupport {
+    /// `max_match_sets` (nonzero).
+    pub max_match_sets: u8,
+    /// `max_sched_scan_ssids`.
+    pub max_ssids: u8,
+    /// `max_sched_scan_ie_len`.
+    pub max_ie_len: u16,
+    /// `max_sched_scan_plans`.
+    pub max_scan_plans: u32,
+    /// `max_sched_scan_plan_interval`, seconds.
+    pub max_plan_interval_secs: u32,
+    /// `max_sched_scan_plan_iterations`.
+    pub max_plan_iterations: u32,
+    /// Frequencies one request may list.
+    pub max_frequencies: u16,
+    /// `NL80211_FEATURE_SCHED_SCAN_RANDOM_MAC_ADDR`.
+    pub random_mac: bool,
+}
+impl SchedScanSupport {
+    /// The limits the WoWLAN net-detect parser has always applied (ath11k
+    /// PNO: 16 SSIDs, 512-octet IEs, two plans of at most 7200 s / 100
+    /// iterations, 60 channels); `max_match_sets` and `random_mac` come from
+    /// `WowlanSupport`.
+    pub const NET_DETECT: Self = Self {
+        max_match_sets: 0,
+        max_ssids: 16,
+        max_ie_len: 512,
+        max_scan_plans: 2,
+        max_plan_interval_secs: 7200,
+        max_plan_iterations: 100,
+        max_frequencies: 60,
+        random_mac: false,
+    };
+}
+
+/// A parsed `NL80211_CMD_START_SCHED_SCAN` request: the same
+/// `nl80211_parse_sched_scan` result WoWLAN net-detect carries.
+pub type SchedScanRequest = NetDetectConfig;
 
 /// One `NL80211_SCHED_SCAN_PLAN`: after `iterations` scans at `interval`,
 /// firmware advances to the next plan.  The final plan has no iteration

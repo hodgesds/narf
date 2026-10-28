@@ -938,6 +938,29 @@ userspace over AUTHENTICATE as on Linux. The external mode is:
   preserves the associated firmware transport; absent WoW disconnects and
   cold-cycles the interface. `GET_WOWLAN` therefore reports configuration,
   not a promise that the platform is currently asleep.
+- **Scheduled scan.** A wiphy whose
+  `WirelessNetIface::sched_scan_support() -> Option<SchedScanSupport>` is
+  `Some` advertises `NL80211_CMD_START_SCHED_SCAN` / `STOP_SCHED_SCAN` (75 /
+  76, `GENL_UNS_ADMIN_PERM`). It also advertises its limits: MAX_NUM_SCHED_SCAN_SSIDS,
+  MAX_SCHED_SCAN_IE_LEN, MAX_MATCH_SETS, the three plan limits,
+  SCHED_SCAN_MAX_REQS = 1 and, with `random_mac`,
+  `NL80211_FEATURE_SCHED_SCAN_RANDOM_MAC_ADDR`. These replace the WoWLAN
+  net-detect defaults. `SchedScanSupport { max_match_sets, max_ssids,
+  max_ie_len, max_scan_plans, max_plan_interval_secs, max_plan_iterations,
+  max_frequencies, random_mac }` has `SchedScanSupport::NET_DETECT`, the
+  limits the net-detect parser has always applied.
+
+  START parses the request with the same `nl80211_parse_sched_scan` parser
+  that WoWLAN net-detect uses. IFINDEX, SOCKET_OWNER and SCHED_SCAN_MULTI are
+  also allowed. The result is passed to `start_sched_scan(SchedScanRequest)`
+  (`SchedScanRequest = NetDetectConfig`), and the START event is multicast on
+  "scan". STOP (an optional COOKIE must be the legacy request id 0, otherwise
+  -ENOENT) calls `stop_sched_scan()` and multicasts SCHED_SCAN_STOPPED. Both
+  driver hooks default to -EOPNOTSUPP.
+
+  The driver reports matches with `nl80211::notify_sched_scan_results(name)`
+  (`cfg80211_sched_scan_results`, CMD 77) and a firmware-initiated end with
+  `nl80211::notify_sched_scan_stopped(name)` (CMD 78).
 - **BIOS SAR.** A driver with `WirelessNetIface::sar_capability()` includes
   its fixed range table in the nested `NL80211_ATTR_SAR_SPEC` of GET_WIPHY
   and advertises `NL80211_CMD_SET_SAR_SPECS`. The command is wiphy-wide:

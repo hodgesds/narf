@@ -8,6 +8,8 @@ use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 mod permission;
 #[path = "pmf_tests.rs"]
 mod pmf;
+#[path = "wiphy_ops_tests.rs"]
+mod wiphy_ops;
 #[path = "supplicant_e2e_tests.rs"]
 mod supplicant_e2e;
 
