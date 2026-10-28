@@ -2004,8 +2004,12 @@ clock is the TMDS divide-by-four rate and its timing `Signal::Tmds`, and the
 link starts with `prepare_hdmi_link` (stream = pipe), `start_hdmi_video` and
 scanout. HDMI has no link status: `check_modeset` reports HPD and scanout
 only, `retrain_modeset` is `Unsupported`, and stop/unplug use
-`stop_hdmi_video` then `stop_hdmi_link`. The monitor enables HPD on every DP
-and HDMI port.
+`stop_hdmi_video` then `stop_hdmi_link`. A stopped link then powers its
+combo PHY PLL down (`hdmi_link::Firmware::power_down` ->
+`Dmub::power_down_pixel_clock`: SET_PIXEL_CLOCK v7 with no clock, no encoder,
+CRT mode, FORCE_PROG_PPLL and ATOM_CRTC_INVALID, as
+`dce110_clock_source_power_down`); a failure is ignored, as Linux only logs
+it. The monitor enables HPD on every DP and HDMI port.
 Training then walks narf's fallback ladder (`link_candidates`), trying only
 settings that carry the mode: the link rate drops first; below RBR the lanes
 halve and the rate restarts at this attempt's starting rate. Legacy DSC also
@@ -2678,9 +2682,18 @@ with `request_display_format`; a running display scanning another one is
 relit in it by the monitor, like a mode request, and a failed relight
 returns every display to XRGB8888 with its preferred mode, as does the last
 DRM file closing. `DRM_IOCTL_MODE_DIRTYFB` (DRM master) presents a dumb
-framebuffer again on every CRTC showing it, through the same `present_frame`
-path as SETCRTC (whole frame; clip rectangles are accepted, not used); a GEM
-framebuffer is scanned in place and needs nothing. Xorg's modesetting driver
+framebuffer again on every CRTC showing it; a GEM framebuffer is scanned in
+place and needs nothing. `drm::fb_cmd::DirtyCmd` decodes the request and
+refuses `drm_mode_dirtyfb_ioctl`'s -EINVAL cases (clip count without clips or
+the reverse, unknown flags, unpaired ANNOTATE_COPY, over 256 clips);
+`DirtyCmd::rows` reduces the clips to the rows they cover (copy annotations
+count destinations only) and a request covering none presents nothing. A
+native linear 8888 frame goes to `amdgpu_native_kms::present_damaged(display,
+frame, rows)`: Navi22 copies only those rows plus the rows its back buffer
+missed (the front frame's damage), tracked per dumb source, back buffer and
+flip count; another source, a GEM frame, a failed present or a coalesced
+frame of another source copies every row. Navi48 returns false there and the
+frame takes `present_frame`'s whole copy. Xorg's modesetting driver
 probes it once and relies on it for shadow updates to a copying CRTC.
 `amdgpu_native_kms::present_frame` takes the framebuffer's
 fourcc: a frame in the scanned format is copied as packed words into the back
