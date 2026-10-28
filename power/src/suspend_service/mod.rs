@@ -36,8 +36,8 @@
 //! (#1006) gets the authenticated [`RecordedPolicy`] record to
 //! enforce. Real anchors land per lane: the FIDO token anchor and
 //! its resume ceremony are here ([`token_anchor`], P3 #999 + P5
-//! #1001); TPM sealing is P6 (#1002) and the Argon2id passphrase
-//! floor is P7 (#1004).
+//! #1001); the Argon2id passphrase anchor is P7 (#1004,
+//! `passphrase`); TPM sealing is P6 (#1002).
 //!
 //! The state-hook registry (design §5) lives in [`hooks`]: drivers
 //! register [`SuspendStateHook`]s, the seal fan-out runs inside
@@ -58,6 +58,7 @@ mod entropy;
 mod format;
 mod hooks;
 mod image;
+mod passphrase;
 mod resume;
 mod slots;
 mod token_anchor;
@@ -76,6 +77,12 @@ pub use hooks::{
 };
 pub use image::{
     derive_hook_anchor_key, derive_hook_key, open_with_sms, parse_claims, OpenedImage, TrustedImage,
+};
+pub use passphrase::{
+    argon2id_kdf, backoff_millis, calibrate_time_cost, change_passphrase, resume_with_passphrase,
+    Argon2idParams, ConsolePassphraseSource, MonotonicDelay, PassphraseAnchor, PassphrasePolicy,
+    PassphraseSource, ResumeDelay, MAX_PASSPHRASE_LEN, MAX_RESUME_PASSPHRASE_FAILURES,
+    PASSPHRASE_SALT_LEN,
 };
 pub use resume::{attempt_resume, ConsolePrompt, ResumePrompt, ResumeRefusal, VerifiedResume};
 pub use slots::{EpochSlots, SlotArea, SlotRecord};

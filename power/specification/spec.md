@@ -533,6 +533,64 @@ environment drives for token-factor policies,
   unchanged). Resume-side anchors are unwrap-only: `wrap`
   without an enrolled credential fails.
 
+#### Passphrase anchor (S4 floor and recovery slot)
+
+The Argon2id passphrase factor of design §9
+(`power/src/suspend_service/passphrase.rs`, issue #1004),
+behind the same `KeyCustodyAnchor` seam (`AnchorKind::Passphrase`,
+code 5):
+
+- `PassphraseAnchor::wrap` records a slot whose params block is
+  `version ‖ flags ‖ memory ‖ time ‖ lanes ‖ salt[32]` and whose
+  blob is a ChaCha20-Poly1305 wrap of the SMS under
+  `Argon2id(passphrase, salt, params)` (version 0x13, 32-byte
+  output, via the workspace's `argon2` crate — the LUKS2
+  binding), with the SMS epoch and the full params block bound
+  as AAD. Salt and wrap nonce are drawn from the service's
+  seed-grade entropy seam; without it, wrap is
+  `AnchorError::Unavailable` — no degraded slot is ever minted.
+- `PassphraseAnchor::unwrap` derives at the slot's *recorded*
+  parameters (the floor is not hardware-bound, design §9.2) but
+  only inside the anchor's `PassphrasePolicy` window: caps
+  mirror the LUKS2 unlock policy (1 GiB / 16 passes / 64 lanes)
+  as a resume-environment exhaustion bound, floors are the
+  anti-downgrade bound. Out-of-window records refuse
+  (`Refused`) before the passphrase is requested and before any
+  KDF work runs. A wrong passphrase, a wrong combiner secret,
+  and a tampered blob or params block are the single class
+  `Failed` — no oracle.
+- The design §9.1 operating point is memory 512 MiB, lanes 4,
+  time cost calibrated at enrollment to the ~2 s target
+  (`calibrate_time_cost`); the calibrated set is what the slot
+  records. `argon2id_kdf` is the single derivation entry point,
+  validated byte-for-byte against the RFC 9106 §5.3 vector.
+- The §9.3 UEFI combiner is an anchor option, default off:
+  with a machine secret configured, the KEK is
+  `HKDF(KEK_pass ‖ machine_secret)`, the slot records a
+  combiner flag (never the secret), and a combiner slot
+  refuses where the secret is not presented. Provisioning and
+  reading the UEFI variable is platform integration, not part
+  of this surface.
+- `change_passphrase(service, old_anchor, old_params,
+  new_anchor)` replaces a slot in place: the old anchor must
+  unwrap the existing record (proof of the current
+  passphrase), the replacement enrolls, and only then is the
+  old record revoked — a failure leaves the old slot intact.
+- `resume_with_passphrase(store, anchors, prompt, delay)`
+  wraps `attempt_resume` with the §9.4 floor discipline:
+  retries only `FactorRefused`, exponential backoff
+  (`backoff_millis`: 1 s doubling, 60 s cap) between attempts
+  through the `ResumeDelay` seam (production: `MonotonicDelay`
+  on the monotonic clock), the attempt count held in RAM only,
+  and after `MAX_RESUME_PASSPHRASE_FAILURES` (10) refusals the
+  cold-boot offer is announced (image retained) and the
+  refusal returned. Other refusal classes return immediately —
+  a tampered image is never retried into an oracle.
+- Passphrase entry is the `PassphraseSource` seam (production:
+  `ConsolePassphraseSource`, early console, no echo,
+  1024-byte cap), called inside `unwrap` so the resume
+  prompt's attempt/fact ordering is preserved.
+
 ### 3.4 Thermal
 
 Two layers, one registration path.
