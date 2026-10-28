@@ -62,6 +62,7 @@ pub mod hal;
 pub mod htc;
 pub mod htt;
 pub mod hw;
+pub mod hw_ops;
 pub mod iface;
 pub mod ipq8074;
 pub mod mac;

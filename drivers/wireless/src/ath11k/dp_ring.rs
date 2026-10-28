@@ -1744,18 +1744,13 @@ impl Dp {
             sizes.reo_status,
         )?;
 
-        // hw_ops->reo_setup (wcn6855)
-        let r = hal.regs;
-        wcn6855_reo_setup(
-            io,
-            r.hal_reo1_misc_ctl,
-            [
-                r.hal_reo1_aging_thresh_ix_0,
-                r.hal_reo1_aging_thresh_ix_1,
-                r.hal_reo1_aging_thresh_ix_2,
-                r.hal_reo1_aging_thresh_ix_3,
-            ],
-        );
+        // hw_ops->reo_setup
+        let ops = cfg
+            .hw
+            .hw_rev
+            .hw_ops()
+            .unwrap_or(&super::hw_ops::WCN6855_OPS);
+        ops.reo_setup(io, hal.regs);
 
         for i in 0..HAL_DSCP_TID_MAP_TBL_NUM_ENTRIES_MAX {
             hal_tx_set_dscp_tid_map(io, i);

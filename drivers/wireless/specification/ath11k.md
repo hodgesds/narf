@@ -1925,6 +1925,23 @@ ready) and shuts the remoteproc down on a failure after it booted. The
 production `AhbBringUp` (MMIO mapping, `Q6Wcss` / `PasRproc` boot,
 `GlinkSmem` + `GlinkQrtr`, the WLFW task) is not written yet.
 
+Per-chip `hw_ops` (`hw_ops.rs`, Linux `hw.c` `*_ops`; the `rx_desc_*`
+members are `RxDescriptor`):
+
+```rust
+pub struct HwOps { name, mac_from_pdev: MacMap, wmi_init_config: WmiInitConfig, mac_id_ipq8074: bool,
+                   tx_mesh: TxMesh, reo_setup: ReoSetup, ring_selector: RingSelector }
+pub const IPQ8074_OPS, IPQ6018_OPS, QCA6390_OPS, QCN9074_OPS, WCN6855_OPS, WCN6750_OPS, IPQ5018_OPS: HwOps;
+impl HwRev { const fn hw_ops(self) -> Option<&'static HwOps>; }
+impl HwOps { hw_mac_from_pdev_id, mac_id_to_pdev_id, mac_id_to_srng_id, ring_selector(cpu, flow_hash),
+             reo_setup(io, &HalRegs) }   // ipq8074 / wcn6855 / ipq5018 flavours
+```
+
+`Dp::alloc` runs `hw_ops.reo_setup` (QCA6390 now takes Linux's
+`ath11k_hw_ipq8074_reo_setup`, not the WCN6855 one). The WMI
+`ath11k_init_wmi_config_ipq8074` resource config and the TCL mesh bit
+are selected but not yet consumed (multi-pdev `init_cmd` is §8).
+
 `HwRev`-keyed admission: `CoreConfig::for_hw` covers all four AHB parts
 (`num_rxdma_per_pdev = 1`; IPQ `single_pdev_only = false`, `num_vdevs =
 16 + 1`; WCN6750 single-pdev, three vdevs), `wlfw_hw_params(HwRev)`
