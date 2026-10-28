@@ -103,7 +103,6 @@ iwlwifi	live_regulatory_owner	Gen3 and Sc live regulatory-policy owner	feature	d
 iwlwifi	ml_baid	Alternate ML BAID profile	feature	drivers/wireless/specification/iwlwifi.md	1555
 iwlwifi	mlo	MLO on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1557
 iwlwifi	multiple_rx_queues	Multiple RX queues	feature	drivers/wireless/specification/iwlwifi.md	1555
-iwlwifi	nss2	NSS2	feature	drivers/wireless/specification/iwlwifi.md	1555
 iwlwifi	p2p	P2P role	feature	drivers/wireless/specification/iwlwifi.md	1555
 iwlwifi	persistent_key_history	Persistent key history	feature	drivers/wireless/specification/iwlwifi.md	1555
 iwlwifi	platform_power_owner	Gen3 and Sc live platform TX-power enforcement owner	feature	drivers/wireless/specification/iwlwifi.md	1556

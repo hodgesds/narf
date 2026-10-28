@@ -52,8 +52,12 @@ pub(in crate::iwlwifi) mod feature {
     /// HT 20/40MHz operation on the AP's secondary channel: a 40MHz PHY
     /// context, `STA_FLG_FAT_EN_40MHZ` and TLC `max_ch_width` 40MHz.
     pub const HT40: u16 = 1 << 5;
+    /// Two spatial streams: HT MCS 8..15 in both directions,
+    /// `STA_FLG_MIMO_EN_MIMO2` and the TLC NSS2 rate map on every valid TX
+    /// chain.
+    pub const NSS2: u16 = 1 << 6;
     /// Every bit this driver can emit; other bits are refused.
-    pub const KNOWN: u16 = BA | NESTED_BA | QOS_TIDS | TX_LDPC | TX_STBC | HT40;
+    pub const KNOWN: u16 = BA | NESTED_BA | QOS_TIDS | TX_LDPC | TX_STBC | HT40 | NSS2;
 }
 
 impl Emission {

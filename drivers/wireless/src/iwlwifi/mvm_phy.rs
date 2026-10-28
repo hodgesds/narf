@@ -65,6 +65,8 @@ impl Context {
             wmm,
             ht: false,
             tx_mcs: 0,
+            tx_mcs2: 0,
+            rx_nss2: false,
             tx_sgi: false,
             rx_sgi: false,
             rx_ldpc: false,
@@ -103,6 +105,15 @@ impl Context {
             profile.rx_sgi40 = profile.width40 && ht.rx_sgi40();
             profile.ht = true;
             profile.tx_mcs = ht.tx_mcs()[0];
+            // MCS 8..15 only with a granted NSS2 program (the local TX
+            // mask) toward a peer that receives them; a static-SMPS peer
+            // receives one stream (iwl_mvm_sta_send_to_fw SMPS_STATIC).
+            profile.rx_nss2 = self.features & feature::NSS2 != 0;
+            profile.tx_mcs2 = if (ht.peer_capability() >> 2) & 3 == 0 {
+                0
+            } else {
+                ht.tx_mcs()[1]
+            };
             profile.tx_sgi = ht.tx_sgi20();
             profile.rx_sgi = ht.rx_sgi20();
             profile.rx_ldpc = ht.rx_ldpc();
@@ -131,6 +142,10 @@ pub(super) struct Profile {
     pub wmm: Parameters,
     pub ht: bool,
     pub tx_mcs: u8,
+    /// Negotiated HT MCS 8..15 toward the peer (granted `NSS2` only).
+    pub tx_mcs2: u8,
+    /// The local MCS 8..15 receive promise of a granted `NSS2` program.
+    pub rx_nss2: bool,
     pub tx_sgi: bool,
     pub rx_sgi: bool,
     /// Local HT receive-coding promises from [`local_ht`].
@@ -162,29 +177,27 @@ pub(in crate::iwlwifi) fn local_ht() -> LocalHt {
 /// and TX STBC, which also sets the HT Tx STBC bit as Linux
 /// `iwl_init_ht_hw_capab` does for more than one TX chain.
 pub(in crate::iwlwifi) fn local_ht_for(features: u16) -> LocalHt {
-    let base = if features & feature::HT40 != 0 {
-        // iwl_init_ht_hw_capab for an ht40_bands band: SUP_WIDTH_20_40 and
-        // SGI_40 next to SGI_20.
-        let mut mcs = [0; 10];
-        mcs[0] = 255;
-        let gi = narf_wireless::association::phy::HtGi {
-            rx20: true,
-            tx20: true,
-            rx40: true,
-            tx40: true,
-        };
-        LocalHt::new(
-            mcs,
-            mcs,
-            narf_wireless::association::phy::HtWidth::TwentyForty,
-            gi,
-            0,
-            0,
-        )
-        .unwrap_or_else(|_| LocalHt::siso20(true, true))
-    } else {
-        LocalHt::siso20(true, true)
+    // iwl_init_ht_hw_capab: rx_mask[1] = 0xff with two RX chains (NSS2);
+    // an ht40_bands band adds SUP_WIDTH_20_40 and SGI_40 next to SGI_20.
+    let wide = features & feature::HT40 != 0;
+    let mut mcs = [0; 10];
+    mcs[0] = 255;
+    if features & feature::NSS2 != 0 {
+        mcs[1] = 255;
+    }
+    let gi = narf_wireless::association::phy::HtGi {
+        rx20: true,
+        tx20: true,
+        rx40: wide,
+        tx40: wide,
     };
+    let width = if wide {
+        narf_wireless::association::phy::HtWidth::TwentyForty
+    } else {
+        narf_wireless::association::phy::HtWidth::Twenty
+    };
+    let base =
+        LocalHt::new(mcs, mcs, width, gi, 0, 0).unwrap_or_else(|_| LocalHt::siso20(true, true));
     base.with_ldpc(true, features & feature::TX_LDPC != 0)
         .with_rx_stbc(true)
         .with_tx_stbc(features & feature::TX_STBC != 0)
@@ -219,6 +232,8 @@ impl Profile {
         };
         op == self.operation
             && cap[3] & self.tx_mcs == self.tx_mcs
+            && cap[4] & self.tx_mcs2 == self.tx_mcs2
+            && (self.tx_mcs2 == 0 || (u16::from_le_bytes([cap[0], cap[1]]) >> 2) & 3 != 0)
             && (!self.tx_sgi || cap[0] & 32 != 0)
             && cap[2] & 3 == self.ampdu_exp
             && (cap[2] >> 2) & 7 == self.density
@@ -259,6 +274,7 @@ impl Profile {
             20,
             (1 << 4)
                 | (u32::from(self.width40) << 26) // STA_FLG_FAT_EN_40MHZ
+                | (u32::from(self.tx_mcs2 != 0) << 28) // STA_FLG_MIMO_EN_MIMO2
                 | if self.ht {
                     (u32::from(self.dynamic_smps) << 17)
                         | (u32::from(self.ampdu_exp) << 19)
@@ -288,6 +304,13 @@ impl Profile {
         );
         put16(&mut out, 10, rates);
         put16(&mut out, 12, u16::from(self.tx_mcs));
+        // rs_fw_set_supp_rates: ht_rates[IWL_TLC_NSS_2][IWL_TLC_MCS_PER_BW_80]
+        // follows the NSS1 row of 2 (v2/v3) or 3 (v4) per-width entries.
+        put16(
+            &mut out,
+            if version == 4 { 18 } else { 16 },
+            u16::from(self.tx_mcs2),
+        );
         // v2/3 SGI byte22; v4 byte7. A-MSDU and all NSS2/width>20 rates0.
         // rs_fw_sgi_cw_support: BIT(20MHz) | BIT(40MHz).
         out[if version == 4 { 7 } else { 22 }] =
@@ -313,7 +336,8 @@ impl Profile {
         self.ht
             && (r >> 8) & 7 == 2
             && (wide == 0 || self.width40 && wide == 1)
-            && r & (0xf8 | ((15 << 16) & !coding) | (3 << 23)) == 0
+            && r & ((0xf8 & !(u32::from(self.rx_nss2) << 4)) | ((15 << 16) & !coding) | (3 << 23))
+                == 0
             && ((r >> 20) & 7 == 0 || sgi && (r >> 20) & 7 == 1)
     }
 }
@@ -495,6 +519,9 @@ impl super::Owner {
         if secondary.is_some() {
             available |= feature::HT40;
         }
+        if selected && self.nss2_available(ap_ht) {
+            available |= feature::NSS2;
+        }
         if selected {
             available |= feature::QOS_TIDS;
             if let Some(cap) = ap_ht {
@@ -552,6 +579,19 @@ impl super::Owner {
             && wide(bss.channel)
             && wide(secondary))
         .then_some(secondary)
+    }
+    /// Two streams need two NVM TX/RX streams and chains (no MIMO-disable
+    /// SKU), an AP receiving MCS 8..15 and an AP not in static SMPS.
+    fn nss2_available(&self, ap_cap: Option<[u8; 26]>) -> bool {
+        let (Some(nvm), Some(cap)) = (self.nvm.as_ref(), ap_cap) else {
+            return false;
+        };
+        nvm.phy.tx_streams >= 2
+            && nvm.phy.rx_streams >= 2
+            && nvm.tx_chains.count_ones() >= 2
+            && nvm.rx_chains.count_ones() >= 2
+            && cap[4] != 0
+            && (u16::from_le_bytes([cap[0], cap[1]]) >> 2) & 3 != 0
     }
     /// Drop `HT40` from the offer when the current host policy does not
     /// permit the whole 40MHz span; mac80211 then keeps the 20MHz chandef

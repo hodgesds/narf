@@ -189,3 +189,40 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2/ht40",
     smoke_mvm_ht40_response_narrowing_fails_closed
 );
+
+fn smoke_mvm_ht40_nss2_combined_program() -> TestResult {
+    check(|| {
+        // One signed HT40|NSS2 program: 40MHz PHY/STA/TLC plus MIMO2.
+        let h = ht40_harness(feature_bits::HT40 | feature_bits::NSS2, true)?;
+        {
+            let mut ap = h.actor.lock();
+            let mut ies = ht40_ies();
+            ies[6] = 0xff;
+            ap.beacon_ies = Some(ies.clone());
+            ap.response_ies = Some(ies);
+            ap.phy_width = [1, 0];
+        }
+        h.join()?;
+        let sta = last(&h, 1, 0x18, |b| {
+            b.len() == 48 && u32::from_le_bytes([b[24], b[25], b[26], b[27]]) & (3 << 26) != 0
+        })
+        .ok_or("ADD_STA PHY profile absent")?;
+        let tlc = last(&h, 5, 15, |_| true).ok_or("TLC configuration absent")?;
+        if widths(&h)? != (1, 0, 1, 1, 3)
+            || (u32::from_le_bytes([sta[20], sta[21], sta[22], sta[23]]) >> 28) & 3 != 1
+            || tlc[16..18] != [0xff, 0]
+            || tlc[6] != 3
+        {
+            return Err("HT40|NSS2 combined encodings");
+        }
+        run(h.device.disassociate())?.map_err(|_| "HT40|NSS2 close")?;
+        if h.retained() != (0, 0, 0) {
+            return Err("HT40|NSS2 close left native resources");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/ht40",
+    smoke_mvm_ht40_nss2_combined_program
+);

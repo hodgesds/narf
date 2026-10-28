@@ -276,9 +276,9 @@ impl Owner {
             return Err("MVM data association rates invalid");
         }
         let chains = self.nvm.as_ref().unwrap().tx_chains;
-        // SISO uses one antenna; TX STBC uses every valid TX chain
+        // SISO uses one antenna; TX STBC and MIMO2 use every valid TX chain
         // (rs_fw_set_active_chains of iwl_mvm_get_valid_tx_ant).
-        let chains = if phy.is_some_and(|p| p.tx_stbc) {
+        let chains = if phy.is_some_and(|p| p.tx_stbc || p.tx_mcs2 != 0) {
             chains as u8
         } else {
             (chains & chains.wrapping_neg()) as u8

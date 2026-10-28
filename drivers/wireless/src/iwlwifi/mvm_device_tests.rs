@@ -598,7 +598,12 @@ impl Actor {
                 }
                 (5, 15) => {
                     if b.len() != if self.tlc_version == 2 { 24 } else { 28 }
-                        || b[6] != if b[8] & 1 != 0 { 3 } else { 1 }
+                        || b[6]
+                            != if b[8] & 1 != 0 || b[16..20] != [0; 4] {
+                                3
+                            } else {
+                                1
+                            }
                         || b[10..12] != [1, 0]
                     {
                         return Err("MVM native response-bound TLC profile");
@@ -1851,6 +1856,8 @@ mod coding_tests;
 mod ht40_tests;
 #[path = "mvm_ht_tests.rs"]
 mod ht_tests;
+#[path = "mvm_nss2_tests.rs"]
+mod nss2_tests;
 #[path = "mvm_qos_tests.rs"]
 mod qos_tests;
 #[path = "mvm_reconnect_tests.rs"]

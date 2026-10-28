@@ -1552,7 +1552,7 @@ each feature; a Linux chip name or helper structure does not grant a capability.
 
 | Profile | Implemented reachable software | Remaining software gates |
 |---|---|---|
-| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles (Linux Qu PCI IDs 0x02f0/0x06f0/0x34f0/0x3df0/0x4df0/0x43f0/0xa0f0, §3.26) | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO (with §3.28 RX LDPC/STBC1), §3.33 host WPA3-SAE with PMF, §3.34 tag5 HT TX LDPC/TX STBC, §3.36 tag5 HT40, signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement preceded by §3.25 over-air leaving deauthentication. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced reconnect restoration, extended in §3.30 to cross-peer/cross-index GTK restore, safe same-peer PTK reuse and a radio-scoped ledger across native owners; §3.31 generic tag5 feature programs with per-TID QoS queues for all four ACs; §3.29 firmware/transport recovery and non-WoWLAN system suspend/resume. Authored, execution pending: §3.24 tag4 negotiated unicast-local nested recipient A-MSDU-in-A-MPDU with complete bundles before sequence/PN ownership. | Active probes (scan firmware's emitter/power binding needs source proof); alternate ML BAID; TX A-MSDU; NSS2/VHT/HE; SAE-EXT-KEY (AKM 24) and WPA2-PSK with PMF; persistent key history. AP/P2P, WoW (with its D3 ARP/NS/GTK offloads), the §3.27 scheduled-scan offload and multiple RX/RSS remain unimplemented even where hardware supports them. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
+| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles (Linux Qu PCI IDs 0x02f0/0x06f0/0x34f0/0x3df0/0x4df0/0x43f0/0xa0f0, §3.26) | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO (with §3.28 RX LDPC/STBC1), §3.33 host WPA3-SAE with PMF, §3.34 tag5 HT TX LDPC/TX STBC, §3.36 tag5 HT40, §3.37 tag5 NSS2, signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement preceded by §3.25 over-air leaving deauthentication. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced reconnect restoration, extended in §3.30 to cross-peer/cross-index GTK restore, safe same-peer PTK reuse and a radio-scoped ledger across native owners; §3.31 generic tag5 feature programs with per-TID QoS queues for all four ACs; §3.29 firmware/transport recovery and non-WoWLAN system suspend/resume. Authored, execution pending: §3.24 tag4 negotiated unicast-local nested recipient A-MSDU-in-A-MPDU with complete bundles before sequence/PN ownership. | Active probes (scan firmware's emitter/power binding needs source proof); alternate ML BAID; TX A-MSDU; VHT/HE; SAE-EXT-KEY (AKM 24) and WPA2-PSK with PMF; persistent key history. AP/P2P, WoW (with its D3 ARP/NS/GTK offloads), the §3.27 scheduled-scan offload and multiple RX/RSS remain unimplemented even where hardware supports them. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
 | AX210/AX211/AX411 and Bz/BE200 Gen3 transports | Context-v2, generation-selected completion layouts, firmware/PNVM/native boot and MLD helpers. Software-validated continuation: source-selected command-ID header0/explicit RLC2, receipt-fenced TVQM/BAID retirement, retained actual executable/PNVM/PCI authority and immutable DMA-copy receive/publication epochs. | Station admission remains dependent on the exact negotiated MAC/link/STA/TLC/key payload profile; no new payload profile is enabled by the header/source audit. Sc conversation tests do not establish another family's ABI, platform power/SAR program or hardware. Current live regulatory/power ownership remains separate. |
 | Sc c103/BE211 MLD station profile | Deferred retained native publication, actual station/management/data/Open-WPA2-SAE conversations, legacy/HT/VHT to80MHz, key/BA/reorder and userspace SME/port ownership in the existing profile. §§3.21–3.22 header/TVQM, positive BA response/RX-marker retirement, retained executable/PNVM/current-PCI publication and copy-time key epochs passed coordinated native tests on both architectures. | These source/epoch fences do not establish underlying RF quiescence or current live-regulatory/platform-power qualification. HE/EHT/6GHz and MLO,160/320MHz, AP/P2P and the §3.27 scheduled-scan offload remain separate (non-WoWLAN system suspend/resume is §3.29) implementations and must not be inferred from single-link Sc fixtures. |
 | Other advertised PCI/firmware combinations | Identification/firmware selection where defined, including the Linux So/Ma/Bz IDs added in §3.26; 0x7df0 is identification-only (Linux 7.3 `pcie/drv.c` claims no 0x7DF0) and exact admission rejects it | No fallback admits an unknown command table, calibration profile, topology or PHY width. They need their exact source-backed authority/command/receipt/lifetime path. |
@@ -2100,11 +2100,11 @@ This audit checks each remaining open row against the current tree, after
 
 **Not yet implemented; no shared API is missing.**
 
-- **nss2, gen2_vht, width_160.** HT40 landed in §3.36. Gen2 PHY_CONTEXT,
-  ADD_STA and TLC are otherwise SISO and at most 40MHz:
+- **gen2_vht, width_160.** HT40 and NSS2 landed in §§3.36–3.37. Gen2
+  PHY_CONTEXT, ADD_STA and TLC are otherwise HT-only and at most 40MHz:
   - `mvm_channel.rs` encodes 20/40MHz only.
-  - `Profile::peer` sets no `STA_FLG_MIMO_EN` and no 80/160 FAT_EN.
-  - `Profile::tlc` leaves the NSS2/VHT rate maps at 0.
+  - `Profile::peer` sets no 80/160 FAT_EN.
+  - `Profile::tlc` has no VHT mode or VHT rate map.
   - `mvm_phy.rs::confirm` refuses any width above 40MHz.
 
   Each row needs its own tag5 bit and a qualified program. The shared
@@ -2227,6 +2227,50 @@ no shared width helper was needed.
 - fail-closed refusal of a narrowing association response.
 
 Measured programs and air validation remain external inputs.
+
+### 3.37 Tag5 NSS2
+
+Row nss2. Tag5 bit `NSS2` = bit 6 (§3.31) selects two spatial streams.
+A signed program for exactly that bit set must be selected first; it
+combines with the other bits (for example `HT40|NSS2`).
+
+**Availability** (`nss2_available`). The bit is offered only for a
+selected WMM/HT offer when:
+
+- the NVM gives two TX and two RX streams (no MIMO-disable SKU) and two
+  valid TX and RX chains;
+- the AP's HT Capabilities receive MCS 8..15 (`rx_mask[1]`);
+- the AP is not in static SM power save, which Linux v7.2
+  `mvm/sta.c::iwl_mvm_sta_send_to_fw` maps to SISO.
+
+**Effects of a granted bit.**
+
+- The local HT profile advertises and selects MCS 0..15 in both
+  directions (`iwl_init_ht_hw_capab` `rx_mask[1] = 0xff` with two RX
+  chains). SM power save stays disabled.
+- `confirm` keeps the negotiated MCS 8..15 toward the peer, or none
+  toward a static-SMPS peer.
+- ADD_STA sets `STA_FLG_MIMO_EN_MIMO2` (bit 28) when two streams were
+  negotiated. Dynamic SMPS keeps `STA_FLG_RTS_MIMO_PROT` as before.
+- TLC writes `ht_rates[IWL_TLC_NSS_2][IWL_TLC_MCS_PER_BW_80]` from
+  Linux v7.2 `mvm/rs-fw.c::rs_fw_set_supp_rates`, at offset 16 (v2/v3,
+  two per-width entries) or 18 (v4, three entries). The chain mask is
+  every valid TX antenna (`rs_fw_set_active_chains`).
+- Received HT rates may carry `RATE_MCS_NSS_MSK_V2` (bit 4) only under
+  the local MCS 8..15 promise.
+- The retained beacon must still offer MCS 8..15 and a non-static SM
+  power save.
+
+`drivers/wireless/iwlwifi/gen2/nss2` smokes cover:
+
+- complete joins toward a two-stream AP with TLC v3 and v4: MIMO2, chain
+  mask 3, NSS2 map 0xff, DORA over MCS15 receive rates, an ordered close
+  and no retained resources;
+- the tag2 program toward the same AP staying SISO;
+- refusal toward a single-stream AP and toward a static-SMPS AP.
+
+The `gen2/ht40` combined smoke covers `HT40|NSS2`. Measured programs and
+air validation remain external inputs.
 
 ## 4. References
 
