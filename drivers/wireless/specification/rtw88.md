@@ -1733,3 +1733,33 @@ Refined feature rows: `wow` applies to RTL8822CE only (`wow_fw_name`/
 `ht_protection_modes`: upstream reads no `ht_operation_mode` and takes no
 protection action, so the remaining work is admitting APs that advertise
 nonzero HT protection in the shared HT JoinPlan instead of refusing them.
+
+### Open rtw88 ledger rows (2026-10-28)
+
+Each row below was checked against the tree after the N2xC/N2xQ/random-MAC
+changes. None is a physical blocker unless stated.
+
+| Row | Blocker |
+|---|---|
+| `additional_operating_channels` | `station.rs::associate` refuses `candidate.bss.channel != 1` and `scan.rs::plan` admits 2412 MHz only. The C21/C22 radio programs (`radio.rs`, `radio8821c.rs`) write fixed channel1 RF/BB/TXAGC values. Needs ports of `rtw8822c_set_channel`/`rtw8821c_set_channel` plus a per-channel measured envelope. |
+| `beamforming` | Linux `bf.c::rtw_bf_assoc` acts only on a VHT peer (`vht_cap` SU beamformer/beamformee), so this is blocked on `vht`. |
+| `device_removal` | The retained owner is one-shot: terminal paths keep DMA mappings by design (§4). There is no `rtw_pci_remove` / `rtw_pci_dma_reset` port and `pci.rs` has no remove hook. Software work only (the ath9k DMA-stop pattern applies); not attempted this round. |
+| `dma_reclamation` | Same as `device_removal`: there is no controller-proven `rtw_pci_dma_release` / `rtw_pci_reset_buf_desc` stop proof, so published mappings stay retained. Software work only. |
+| `dpk_tracking` | `rtw8822c_dpk_track` needs a DPK result, and no `rtw8822c_do_dpk` calibration is ported (§3 dm section). |
+| `five_ghz_operation` | The same fixed channel1 programs, plus `scan.rs` 2412-only admission. Needs 5 GHz RF/BB/AGC table selection and a measured 5 GHz envelope. |
+| `ht40` | `station.rs` refuses any offered/negotiated width other than `Width::Twenty`, and the radio programs only BW20. Needs `rtw8822c_set_channel_bb` BW40 and DSSS/CCK40 programming, plus SGI40 in the measured HT gate. |
+| `multi_device` | Not attempted. Each `Rtw88Device` owns one retained lifecycle, and there is no multi-instance composition test. |
+| `multi_stream_ht` | `ht.rs::local` advertises and transmits MCS0..7 only, and `ht.rs::program` writes one-stream TXAGC words. 2SS TXAGC/RA mask programming and a measured 2SS envelope are missing. |
+| `operating_reset` | No `rtw_core_stop`/`rtw_core_start` restart over a retained owner. Blocked on the same DMA-stop proof as `dma_reclamation`. |
+| `radio_coexistence` | No `coex.c` state machine (BT scoreboard, TDMA tables, `rtw_coex_*` notifications) is ported. |
+| `rate_fallback` | `packet_format.rs::transmit_profile` sets W3 USE_RATE|DISDATAFB (bits 8/10) on every frame. Firmware RA fallback needs a qualified per-rate envelope over the RA mask; that is software work, not attempted this round. |
+| `rf_power_tracking` | `dm.rs` admits `PWR_TRACK` only on C22 (`C21_MECHANISMS` = DIG/CCK-PD/RA). The `rtw8821c_pwr_track` TXAGC/txscale port is missing. |
+| `rtl8822be` | The firmware loader and every retained stage reject `10ec:b822`. RTL8822B firmware/MAC/PHY/RF tables are not ported. |
+| `runtime_sleep` | No `ps.c` LPS/IPS (`rtw_enter_lps`, `rtw_leave_ips`); the station stays awake/CAM. |
+| `safe_rejoin` | Rejoin needs a fresh lifecycle after terminal closure (§3) and is blocked on `operating_reset`. |
+| `smps_txrx_1ss` | Driven only by coexistence (`rtw_vif_smps_iter` on `hal.txrx_1ss`), so blocked on `radio_coexistence`. |
+| `system_suspend` | No `rtw_pci_suspend`/`resume` and no wowlan-less power-down/restore path. Blocked on the DMA-stop proof. |
+| `tx_amsdu_5ghz` | Blocked on `five_ghz_operation`. |
+| `tx_ba_all_tids` | `tx_ba.rs::Originator` holds one TID0 agreement, and `packet_core/batch.rs` aggregates only `Queue::Data`. With N2xQ in place, per-TID agreements and BK/VI/VO batches remain software work, not attempted this round. |
+| `vht` | The HT station builds `LocalPhy::ht20` only, and VHT80 needs ht40 channel/BW80 programming first; blocked on `ht40`. |
+| `wow` | No `rtw8822c` wowlan firmware swap (`wow_fw_name`) or `wow.c` pattern/RF-kill programming is ported. |
