@@ -263,12 +263,12 @@ pub trait BotTransport {
     /// idle-suspended it (#840). Production delegates to
     /// `attach::resume_port`; fixtures have no hub topology and
     /// take the no-op default.
-    fn resume_hub_port(&self, hub_port: Option<(usize, u8)>) -> impl Future<Output = ()> {
+    fn resume_hub_port(&self, _hub_port: Option<(usize, u8)>) -> impl Future<Output = ()> {
         async {}
     }
     /// Feed the hub idle-suspend activity timer after a completed
     /// transfer (#840). No-op by default, as above.
-    fn note_hub_activity(&self, hub_port: Option<(usize, u8)>) {}
+    fn note_hub_activity(&self, _hub_port: Option<(usize, u8)>) {}
 }
 
 impl BotTransport for Xhci {
@@ -1729,7 +1729,16 @@ pub fn encode_read10(lba: u32, nblocks: u16) -> [u8; 10] {
     let lba_be = lba.to_be_bytes();
     let nb = nblocks.to_be_bytes();
     [
-        0x28, 0, lba_be[0], lba_be[1], lba_be[2], lba_be[3], 0, nb[0], nb[1], 0,
+        SCSI_READ_10,
+        0,
+        lba_be[0],
+        lba_be[1],
+        lba_be[2],
+        lba_be[3],
+        0,
+        nb[0],
+        nb[1],
+        0,
     ]
 }
 
@@ -1739,7 +1748,16 @@ pub fn encode_write10(lba: u32, nblocks: u16) -> [u8; 10] {
     let lba_be = lba.to_be_bytes();
     let nb = nblocks.to_be_bytes();
     [
-        0x2A, 0, lba_be[0], lba_be[1], lba_be[2], lba_be[3], 0, nb[0], nb[1], 0,
+        SCSI_WRITE_10,
+        0,
+        lba_be[0],
+        lba_be[1],
+        lba_be[2],
+        lba_be[3],
+        0,
+        nb[0],
+        nb[1],
+        0,
     ]
 }
 
@@ -2325,7 +2343,8 @@ mod block_tests {
         let chunks: Vec<_> = block_chunks(u32::MAX as u64 - 1, 2, 4096, false)
             .unwrap()
             .collect();
-        if chunks != [(u32::MAX - 1, 1, 0..4096), (u32::MAX, 1, 4096..8192)] {
+        let top = u64::from(u32::MAX);
+        if chunks != [(top - 1, 1, 0..4096), (top, 1, 4096..8192)] {
             return TestResult::Fail("4K logical blocks exceeded the DMA buffer");
         }
         if block_chunks(u32::MAX as u64, 2, 512, false).is_ok()
