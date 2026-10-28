@@ -118,6 +118,9 @@ pub struct Device<R: Fullmac> {
     bssid: AtomicU64,
     epoch: AtomicU64,
     closing: AtomicBool,
+    /// A firmware roam holds the port closed; carrier loss is not reported
+    /// as a disconnect unless the roam fails.
+    roaming: AtomicBool,
     publication: IrqSafeSpinLock<()>,
     #[cfg(any(test, feature = "kernel-test"))]
     receive_hook: IrqSafeSpinLock<Option<ReceiveHook>>,
@@ -204,6 +207,7 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
         up: AtomicBool::new(false),
         power_save: AtomicU8::new(0),
         bssid: AtomicU64::new(0),
+        roaming: AtomicBool::new(false),
         epoch: AtomicU64::new(0),
         closing: AtomicBool::new(false),
         publication: IrqSafeSpinLock::new(()),
@@ -301,7 +305,9 @@ impl<R: Fullmac + 'static> Device<R> {
         narf_net::iface::set_link_metadata(&self.name, up, None, None);
         if was_up && !up {
             self.clear_rx();
-            narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
+            if !self.roaming.load(Ordering::Acquire) {
+                narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
+            }
         }
     }
 
@@ -331,6 +337,12 @@ impl<R: Fullmac + 'static> Device<R> {
                 state.progress()
             }
         };
+        let roaming = state.station.roam_pending().is_some();
+        if self.roaming.swap(roaming, Ordering::AcqRel) && !roaming && state.station.bssid.is_none()
+        {
+            // The firmware roam failed after its carrier loss was withheld.
+            narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
+        }
         if result.is_err() {
             self.power_save.store(2, Ordering::Release);
             self.link(None);
@@ -480,9 +492,52 @@ impl<R: Fullmac + 'static> Device<R> {
         }
     }
 
+    /// Confirm a pending firmware roam and report `cfg80211_roamed`.
+    async fn apply_roam(&self) {
+        let Some(mut state) = self.state.try_lock() else {
+            return;
+        };
+        if state.station.roam_pending().is_none() {
+            return;
+        }
+        match state.station.complete_roam().await {
+            Ok(Some(roamed)) => {
+                state.clear_transmit();
+                self.link(state.station.bssid);
+                self.roaming.store(false, Ordering::Release);
+                narf_wireless::nl80211::notify_roamed(
+                    &self.name,
+                    roamed.bssid,
+                    roamed.frequency_mhz,
+                    &roamed.request_ies,
+                    &roamed.response_ies,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                state.clear_transmit();
+                self.power_save.store(2, Ordering::Release);
+                self.link(None);
+                narf_console::klog!("{}: FullMAC firmware roam failed: {:?}\n", self.name, error);
+            }
+        }
+    }
+
+    /// Platform roaming policy (Linux brcmfmac `roamoff`): enable or
+    /// disable the firmware roaming engine while disconnected.
+    pub async fn set_firmware_roaming(&self, enabled: bool) -> Result<(), WirelessError> {
+        let mut state = self.state.lock().await;
+        state
+            .station
+            .set_firmware_roaming(enabled)
+            .await
+            .map_err(wireless_error)
+    }
+
     async fn receive_worker(self: Arc<Self>) {
         loop {
             self.deliver_received(self.step());
+            self.apply_roam().await;
             self.apply_power_save().await;
             self.apply_pmksa().await;
             narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;

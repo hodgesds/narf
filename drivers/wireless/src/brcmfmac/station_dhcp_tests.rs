@@ -298,6 +298,7 @@ impl Harness {
             up: AtomicBool::new(false),
             power_save: AtomicU8::new(0),
             bssid: AtomicU64::new(0),
+            roaming: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
             closing: AtomicBool::new(false),
             publication: IrqSafeSpinLock::new(()),

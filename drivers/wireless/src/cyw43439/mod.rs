@@ -240,4 +240,6 @@ pub(crate) mod mfp_fixture;
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod phy_fixture;
 #[cfg(any(test, feature = "kernel-test"))]
+mod roam_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod sae_tests;

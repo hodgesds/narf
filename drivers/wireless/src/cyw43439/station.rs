@@ -33,6 +33,12 @@ pub struct Station<R: Fullmac> {
     mfp_supported: bool,
     /// Firmware SAE offload: `cap` token `sae` with FWSUP and MFP.
     sae_offload: bool,
+    /// Firmware roaming engine enabled (`roam_off` 0).
+    firmware_roaming: bool,
+    /// Firmware roam awaiting confirmation; the host port is closed.
+    roam: Option<roam::Pending>,
+    /// Security profile of the authorized association (re-verified on roam).
+    protection: Option<mfp::Profile>,
     /// `BRCMF_FEAT_PMKID_V3` (`wlc_ver` major >= 13).
     pmkid_v3: bool,
     /// Firmware PMKID list known to be programmed; `None` after a refused
@@ -120,11 +126,7 @@ impl<R: Fullmac> Station<R> {
         if mac == [0; 6] || mac[0] & 1 != 0 {
             return Err(Error::Malformed);
         }
-        let mut mask = [0; 16];
-        for event in [0, 3, 5, 6, 7, 11, 12, 16, 46, 63, 69] {
-            mask[event / 8] |= 1 << (event % 8);
-        }
-        set_var(&mut runtime, "event_msgs", &mask).await?;
+        set_var(&mut runtime, "event_msgs", &roam::event_mask(false)).await?;
         let supplicant = match get_var(&mut runtime, "sup_wpa", 4).await {
             Ok(bytes) => bytes.len() == 4,
             Err(Error::Firmware(code)) if code as i32 == -23 => false,
@@ -194,6 +196,9 @@ impl<R: Fullmac> Station<R> {
             supplicant,
             mfp_supported,
             sae_offload,
+            firmware_roaming: false,
+            roam: None,
+            protection: None,
             pmkid_v3,
             pmksa: Some(pmksa::Cache::default()),
             mfp_verified: false,
@@ -535,7 +540,7 @@ impl<R: Fullmac> Station<R> {
     }
 
     async fn associate_inner(&mut self, request: AssociateRequest) -> Result<(), Error> {
-        if self.bssid.is_some() {
+        if self.bssid.is_some() || self.roam.is_some() {
             return Err(Error::Busy);
         }
         if request.ssid.is_empty()
@@ -572,7 +577,13 @@ impl<R: Fullmac> Station<R> {
             }
             _ => return Err(Error::Unsupported),
         };
+        // Fast BSS Transition is selected by the caller's RSNE AKM, as
+        // Linux brcmf_set_key_mgmt maps WLAN_AKM_SUITE_FT_PSK/FT_OVER_SAE.
+        let akm = akm.map(|base| ft::select(base, &request.ie)).transpose()?;
         if let Some(akm) = akm {
+            if ft::is_ft(akm) && !ft::has_mobility_domain(&bss.ies) {
+                return Err(Error::Unsupported);
+            }
             let rsn = rsn(&bss.ies).ok_or(Error::Unsupported)?;
             use narf_wireless::rsn::*;
             let ccmp = Suite::standard(CIPHER_CCMP_128);
@@ -584,7 +595,7 @@ impl<R: Fullmac> Station<R> {
             }
         }
         let secure = akm.is_some();
-        let sae = akm == Some(narf_wireless::rsn::AKM_SAE);
+        let sae = akm.is_some_and(ft::is_sae);
         let protection =
             mfp::Profile::negotiate_akm(&bss.ies, &request.ie, akm, self.mfp_supported)?;
         validate_association_ies(&request.ie, protection.akm(), protection.required())?;
@@ -636,13 +647,8 @@ impl<R: Fullmac> Station<R> {
             self.tx_var(
                 grant,
                 "wpa_auth",
-                // WPA2_AUTH_PSK / WPA3_AUTH_SAE_PSK (brcmu_wifi.h).
-                &match (secure, sae) {
-                    (_, true) => sae::WPA3_AUTH_SAE_PSK,
-                    (true, false) => 128u32,
-                    _ => 0,
-                }
-                .to_le_bytes(),
+                // WPA2_AUTH_PSK / WPA3_AUTH_SAE_PSK (| WPA2_AUTH_FT).
+                &akm.map_or(0, ft::wpa_auth).to_le_bytes(),
             )
             .await?;
             self.tx_int(grant, 134, if secure { 4 } else { 0 }).await?;
@@ -771,6 +777,7 @@ impl<R: Fullmac> Station<R> {
                         continue;
                     }
                     self.check_grants(core::slice::from_ref(&grant))?;
+                    self.protection = Some(protection);
                     self.connection = Some(grant);
                     self.runtime.set_ac_priority(self.ac_priority);
                     self.runtime.set_link(Some(request.bssid));
@@ -825,7 +832,12 @@ impl<R: Fullmac> Station<R> {
     async fn disconnect_inner(&mut self) -> Result<(), Error> {
         self.check_connection_policy()?;
         let grant = self.connection.take();
-        let peer = self.bssid.take();
+        // A firmware roam in progress is associated with its new peer.
+        let peer = self
+            .bssid
+            .take()
+            .or_else(|| self.roam.take().map(|r| r.peer));
+        self.protection = None;
         self.mfp_verified = false;
         self.ht_verified = false;
         self.vht_verified = false;
@@ -869,6 +881,7 @@ impl<R: Fullmac> Station<R> {
         if self.operation {
             self.runtime.fail();
             self.bssid = None;
+            self.roam = None;
             self.connection = None;
             self.runtime.set_link(None);
             return Err(Error::Failed);
@@ -876,12 +889,16 @@ impl<R: Fullmac> Station<R> {
         self.check_connection_policy()?;
         if let Err(error) = self.runtime.poll() {
             self.bssid = None;
+            self.roam = None;
             self.connection = None;
             self.runtime.set_link(None);
             return Err(error);
         }
         self.check_connection_policy()?;
         while let Some(event) = self.runtime.pop_event() {
+            if self.roam_event(&event) {
+                continue;
+            }
             if let Some(peer) = self.bssid {
                 // CHANNEL_ADOPTED is a firmware radio transition, not a new
                 // occupied grant. Source MAC can be absent for radio events.
@@ -915,12 +932,21 @@ impl<R: Fullmac> Station<R> {
 mod policy;
 pub use policy::{GlobalPolicy, PolicySource};
 
+#[path = "station_ft.rs"]
+pub mod ft;
 #[path = "station_mfp.rs"]
 mod mfp;
 #[path = "station_phy.rs"]
 mod phy;
 #[path = "station_pmksa.rs"]
 pub mod pmksa;
+#[path = "station_roam.rs"]
+pub mod roam;
+
+/// Firmware events consumed by the station (`brcmf_fweh` registrations):
+/// SET_SSID, AUTH, DEAUTH(_IND), DISASSOC(_IND), LINK, PSK_SUP,
+/// CHANNEL_ADOPTED (`63`) and ESCAN_RESULT.
+const EVENTS: [usize; 11] = [0, 3, 5, 6, 7, 11, 12, 16, 46, 63, 69];
 #[path = "station_probe_ies.rs"]
 mod probe_ies;
 #[path = "station_sae.rs"]

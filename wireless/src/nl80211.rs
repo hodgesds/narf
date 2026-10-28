@@ -188,6 +188,56 @@ pub fn notify_disconnect(name: &str, reason: u16, from_ap: bool) {
     );
 }
 
+/// Report a driver-completed roam (`cfg80211_roamed` →
+/// `nl80211_send_roamed`, NL80211_CMD_ROAM = 47): the new BSSID, its
+/// operating frequency and the (re)association request/response elements.
+/// FullMAC firmware roaming calls this after its own key/port confirmation.
+pub fn notify_roamed(
+    name: &str,
+    bssid: [u8; 6],
+    frequency_mhz: u32,
+    req_ie: &[u8],
+    resp_ie: &[u8],
+) {
+    let Some(index) = narf_net::netlink_route::ifindex_for_name(name) else {
+        return;
+    };
+    let Some(iface) = narf_net::iface::lookup(name) else {
+        return;
+    };
+    narf_net::netlink_generic::publish_event(
+        NL80211_FAMILY_ID,
+        19,
+        iface.net_ns_id,
+        GenlReply {
+            command: 47,
+            attrs: roamed_attrs(index, bssid, frequency_mhz, req_ie, resp_ie),
+        },
+    );
+}
+
+/// Attributes of `nl80211_send_roamed`: IFINDEX, MAC, WIPHY_FREQ and the
+/// non-empty REQ_IE / RESP_IE elements.
+pub fn roamed_attrs(
+    ifindex: u32,
+    bssid: [u8; 6],
+    frequency_mhz: u32,
+    req_ie: &[u8],
+    resp_ie: &[u8],
+) -> Vec<u8> {
+    let mut attrs = Vec::new();
+    push_attr(&mut attrs, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+    push_attr(&mut attrs, 6, &bssid); // NL80211_ATTR_MAC
+    push_attr(&mut attrs, 38, &frequency_mhz.to_ne_bytes()); // WIPHY_FREQ
+    if !req_ie.is_empty() {
+        push_attr(&mut attrs, 77, req_ie); // NL80211_ATTR_REQ_IE
+    }
+    if !resp_ie.is_empty() {
+        push_attr(&mut attrs, 78, resp_ie); // NL80211_ATTR_RESP_IE
+    }
+    attrs
+}
+
 /// `cfg80211_cqm_pktloss_notify`: firmware reported that `peer` did not
 /// acknowledge `packets` consecutive frames. The AP station remains present;
 /// userspace owns any resulting inactivity/disassociation decision.

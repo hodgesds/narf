@@ -114,7 +114,7 @@ impl Profile {
                 Err(Error::Unsupported)
             };
         };
-        let sae = akm == AKM_SAE;
+        let sae = super::ft::is_sae(akm);
         let ap = ap.ok_or(Error::Unsupported)?;
         for ie in core::iter::once(&ap).chain(sme.iter()) {
             let bits = ie.rsn_capabilities;
@@ -220,6 +220,12 @@ impl<R: Fullmac> Station<R> {
         if request.group_management_cipher.is_none() {
             request.group_management_cipher = Some(Suite::standard(CIPHER_BIP_CMAC_128));
         }
+        // An FT (re)association RSNE carries PMKR0Name/PMKR1Name in its
+        // PMKID list (IEEE 802.11-2020 13.8.2-13.8.4); it is not cached
+        // PMKSA state and is excluded from the profile comparison.
+        if super::ft::is_ft(profile.akm) {
+            request.pmkids.clear();
+        }
         if ies.len() != length || request != profile.rsn() {
             return Err(Error::Unsupported);
         }
@@ -240,7 +246,7 @@ impl<R: Fullmac> Station<R> {
             if actual.group_cipher != ccmp
                 || !actual.pairwise_ciphers.contains(&ccmp)
                 || !actual.akms.contains(&Suite::standard(profile.akm))
-                || !actual.pmkids.is_empty()
+                || !actual.pmkids.is_empty() && !super::ft::is_ft(profile.akm)
                 || actual.rsn_capabilities & (RSN_CAP_MFP_REQUIRED | RSN_CAP_MFP_CAPABLE)
                     != profile.ap_mfp
                 || actual
