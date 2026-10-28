@@ -552,7 +552,7 @@ fn smoke_pl022_divisor_math() -> TestResult {
         return TestResult::Fail("PL022 divisor found nothing for 7 MHz");
     };
     let actual = 24_000_000 / (cps as u32 * (1 + scr as u32));
-    if actual > 7_000_000 || actual < 6_000_000 {
+    if !(6_000_000..=7_000_000).contains(&actual) {
         return TestResult::Fail("PL022 divisor is not the closest rate at or below target");
     }
     TestResult::Pass
@@ -786,7 +786,6 @@ kernel_test_in!("drivers-spi", smoke_spi_dt_children_publish);
 // that forgets WREN fails its read-back), WIP counts down over
 // status polls, program ANDs, erase resets 64 KiB blocks.
 
-use narf_drivers_storage_mtd::MtdDevice;
 use narf_lib::sync::IrqSafeSpinLock;
 
 #[derive(Debug)]
