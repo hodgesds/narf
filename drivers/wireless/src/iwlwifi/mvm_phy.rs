@@ -427,14 +427,13 @@ impl super::Owner {
     /// The tag5 feature set this offer would emit with per-TID QoS queues:
     /// WMM/HT20 selected, plus the BA bit when the BA profile is selected.
     pub(in crate::iwlwifi) fn feature_offer(&self) -> Option<u16> {
-        (self.phase == super::Phase::Configured && self.power.phy.offered.is_some()).then(|| {
-            feature::QOS_TIDS
-                | if self.power.phy.ba.selected {
-                    feature::BA
-                } else {
-                    0
-                }
-        })
+        let ba = if self.power.phy.ba.selected {
+            feature::BA
+        } else {
+            0
+        };
+        (self.phase == super::Phase::Configured && self.power.phy.offered.is_some())
+            .then_some(feature::QOS_TIDS | ba)
     }
     /// Selection requires the actual signed tag5 asset for exactly `bits`.
     pub(in crate::iwlwifi) fn select_feature_power(
