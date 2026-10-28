@@ -116,7 +116,7 @@ mt76	ap_mode	Access Point mode (mt792x_init_wiphy NL80211_IFTYPE_AP)	feature	dri
 mt76	associated_active_scan	Active scanning while associated	feature	drivers/wireless/specification/mt7921.md	1322
 mt76	colocated_6ghz_scan	Colocated 6 GHz scanning [API available: association::Bss.band / channel::Band::Ghz6 / frequency_in, he::HeOperation::six_ghz_operation, association::six_ghz::{admit, admit_with_rule, He6GhzCapability, He6GhzOperation}, reg::PowerType6Ghz + RegFlags::NO_6GHZ_{VLP,AFC}_CLIENT (wireless spec 3, 6 GHz band identity); a 6 GHz JoinPlan is not yet available]	feature	drivers/wireless/specification/mt7921.md	1268
 mt76	country_wmm_constraints	Country-specific WMM constraints [API available: reg::RegRule::wmm_rule() / RegulatoryDomain::wmm_rule_for(mhz) with WmmRule::limit / limit_parameters (cfg80211 wmm_rule, ETSI EN 301 893; NRGD flag WMM_ETSI) (wireless spec 3.5)]	feature	drivers/wireless/specification/mt7921.md	1198
-mt76	fragmentation	TX fragmentation under a configured wiphy fragmentation threshold (RX defragmentation implemented)	feature	drivers/wireless/specification/mt7921.md	1302
+mt76	fragmentation	TX fragmentation under a configured wiphy fragmentation threshold (RX defragmentation implemented) [API available: WirelessNetIface::set_fragmentation_threshold (SET_WIPHY NL80211_ATTR_WIPHY_FRAG_THRESHOLD routed after cfg80211 validation; default EOPNOTSUPP) (wireless spec 3.1.1)]	feature	drivers/wireless/specification/mt7921.md	1302
 mt76	loadable_packet_abi	Loadable wireless packet ABI	feature	drivers/wireless/specification/mt7921.md	1194
 mt76	midstream_tx_ba_restart	Midstream transmit BA restart	feature	drivers/wireless/specification/mt7921.md	1336
 mt76	monitor_mode	Monitor mode (mac80211 MONITOR + WANT_MONITOR_VIF)	feature	drivers/wireless/specification/mt7921.md	1315
@@ -206,7 +206,7 @@ rtw89	dma_reclamation	Published DMA/map reclamation	feature	drivers/wireless/spe
 rtw89	edcca_tracking	Periodic EDCCA tracking	feature	drivers/wireless/specification/rtw89.md	715
 rtw89	eht	EHT operation on RTL8922A	feature	drivers/wireless/specification/rtw89.md	1277
 rtw89	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specification/rtw89.md	1012
-rtw89	fragmentation	Host fragmentation/defragmentation with native fragment MPDU admission	feature	drivers/wireless/specification/rtw89.md	1038
+rtw89	fragmentation	Host fragmentation/defragmentation with native fragment MPDU admission [API available: WirelessNetIface::set_fragmentation_threshold (SET_WIPHY NL80211_ATTR_WIPHY_FRAG_THRESHOLD routed after cfg80211 validation; default EOPNOTSUPP) (wireless spec 3.1.1)]	feature	drivers/wireless/specification/rtw89.md	1038
 rtw89	he_htc	HE +HTC insertion in QoS DATA	feature	drivers/wireless/specification/rtw89.md	1286
 rtw89	monitor_mode	Monitor radio mode with PHY-status RX metadata	feature	drivers/wireless/specification/rtw89.md	1039
 rtw89	multiple_live_functions	Multiple live PCI functions	feature	drivers/wireless/specification/rtw89.md	1009

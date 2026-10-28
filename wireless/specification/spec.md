@@ -672,10 +672,15 @@ TX/RX pair to those available masks, rejects zero or unavailable bits, and
 calls `set_antenna(tx, rx)` only when both halves are supplied. A driver that
 returns `rts_threshold()` also accepts `SET_WIPHY`'s u32 RTS value through
 `set_rts_threshold`; radio-wide policies must be retained for recovery and
-for later virtual-interface creation. Fragmentation threshold requests keep
-the underlying driver's errno: ath11k returns `-EOPNOTSUPP` after the common
-minimum-256 validation because its target firmware cannot transmit More
-Fragments frames.
+for later virtual-interface creation. `SET_WIPHY`'s
+`NL80211_ATTR_WIPHY_FRAG_THRESHOLD` goes to
+`WirelessNetIface::set_fragmentation_threshold(u32) -> Result<(), i32>` after
+`nl80211_set_wiphy`'s validation: values below 256 are `-EINVAL`, `u32::MAX`
+disables fragmentation, and other values are rounded down to an even length.
+The default is `-EOPNOTSUPP` (ath11k keeps it because its target firmware
+cannot transmit More Fragments frames). A driver that implements the setter
+reports the retained value through `fragmentation_threshold()`, and a wiphy
+that reports one also advertises `SET_WIPHY`.
 
 `TxBitrateMask` / `TxBitrateBand` carry the complete nested
 `NL80211_ATTR_TX_RATES` request: the `nl80211_band` ordinal selects one band,

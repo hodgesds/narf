@@ -1198,9 +1198,10 @@ fn sar_handle(bytes: &[u8], context: RequestContext<'_>) -> Result<Vec<GenlReply
 /// Linux accepts a request addressed by wiphy, WDEV, or a sibling ifindex,
 /// then applies the resulting pdev chain mask and per-vdev RTS policy across
 /// the whole physical radio.  An all-ones antenna request means "all
-/// available chains".  ath11k deliberately rejects fragmentation thresholds:
-/// target firmware clears the More-Fragments bit, so advertising a functional
-/// `set_frag_threshold` would be worse than the Linux-visible EOPNOTSUPP.
+/// available chains".  Fragmentation thresholds go to
+/// `WirelessNetIface::set_fragmentation_threshold`, whose default (ath11k's
+/// choice: target firmware clears the More-Fragments bit) is the
+/// Linux-visible EOPNOTSUPP.
 fn set_wiphy_handle(bytes: &[u8], context: RequestContext<'_>) -> Result<Vec<GenlReply>, i32> {
     const ATTR_WIPHY: u16 = 1;
     const ATTR_IFINDEX: u16 = 3;
@@ -1260,13 +1261,16 @@ fn set_wiphy_handle(bytes: &[u8], context: RequestContext<'_>) -> Result<Vec<Gen
         iface.set_rts_threshold(threshold)?;
     }
 
-    if let Some(threshold) = u32_attr(&attrs, ATTR_FRAG_THRESHOLD)? {
-        // cfg80211's common validity bound, before ath11k's explicitly
-        // unsupported mac80211 operation. `u32::MAX` is the disabled form.
+    if let Some(mut threshold) = u32_attr(&attrs, ATTR_FRAG_THRESHOLD)? {
+        // `nl80211_set_wiphy`: below 256 is invalid; `u32::MAX` disables;
+        // fragments other than the last have even length.
         if threshold < 256 {
             return Err(EINVAL);
         }
-        return Err(EOPNOTSUPP);
+        if threshold != u32::MAX {
+            threshold &= !1;
+        }
+        iface.set_fragmentation_threshold(threshold)?;
     }
     Ok(Vec::new())
 }

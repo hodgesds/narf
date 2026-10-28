@@ -999,8 +999,11 @@ fn wiphy_attrs(
         6,  // SET_INTERFACE
         17, // GET_STATION
     ];
-    if iface.is_some_and(|iface| iface.antenna_info().is_some() || iface.rts_threshold().is_some())
-    {
+    if iface.is_some_and(|iface| {
+        iface.antenna_info().is_some()
+            || iface.rts_threshold().is_some()
+            || iface.fragmentation_threshold().is_some()
+    }) {
         command_list.push(NL80211_CMD_SET_WIPHY as u32);
     }
     if iface.is_some_and(|iface| iface.supports_survey()) {

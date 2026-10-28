@@ -350,6 +350,17 @@ pub trait WirelessNetIface: Interface {
         None
     }
 
+    /// mac80211 `set_frag_threshold` / cfg80211 `rdev_set_wiphy_params`
+    /// with `WIPHY_PARAM_FRAG_THRESHOLD`: apply a physical-radio TX
+    /// fragmentation threshold in octets. The nl80211 layer has already
+    /// rejected values below 256 and rounded others down to an even length;
+    /// `u32::MAX` disables fragmentation. A driver that implements it also
+    /// reports the retained value from `fragmentation_threshold()`. The
+    /// default refuses, as drivers without the mac80211 op do.
+    fn set_fragmentation_threshold(&self, _threshold: u32) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+
     /// Current `WIPHY_RTS_THRESHOLD`, or `None` if this wiphy has no
     /// `set_rts_threshold` implementation.
     fn rts_threshold(&self) -> Option<u32> {
