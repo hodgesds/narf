@@ -692,6 +692,70 @@ fn composition(protected: bool) -> TestResult {
     }
     TestResult::Pass
 }
+/// Linux `rtw_pci_remove` over a joined station: the shell withdraws, the
+/// owner stops and proves DMA idle, and only then is it dropped with its
+/// mappings released. No stage or station can start afterwards.
+fn smoke_rtw8822ce_removal_withdraws_then_reclaims_after_dma_proof() -> TestResult {
+    use crate::rtw88::firmware_lifecycle::Stage;
+    let h = Harness::new(false);
+    h.join();
+    h.device.withdraw();
+    let detached = narf_net::iface::lookup(h.device.name()).is_none_or(|iface| !iface.carrier);
+    if !h.device.withdrawn()
+        || !h.device.closed()
+        || h.device.link_up()
+        || h.device.connected_bssid().is_some()
+        || !detached
+        || h.device.enqueue(&[0; 64], TxMeta::default()).is_ok()
+    {
+        return TestResult::Fail("RTL8822CE removal left the shell open");
+    }
+    if !complete(h.lifecycle.remove()) {
+        return TestResult::Fail("RTL8822CE idle removed owner kept DMA pinned");
+    }
+    let status = h.lifecycle.status();
+    if !h.lifecycle.removed()
+        || status.stage != Stage::Failed
+        || status.error != Some(crate::rtw88::FirmwareError::Gone)
+        || h.lifecycle.retained.try_lock().is_none_or(|o| o.is_some())
+    {
+        return TestResult::Fail("RTL8822CE removed lifecycle still retains an owner");
+    }
+    if complete(h.device.associate(h.request())).is_ok() || complete(h.lifecycle.remove()) != true {
+        return TestResult::Fail("RTL8822CE removed owner reopened");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/station",
+    smoke_rtw8822ce_removal_withdraws_then_reclaims_after_dma_proof
+);
+/// Removal whose RXDMA never idles still tears the owner down but keeps
+/// every published mapping pinned; a lifecycle removed before any owner
+/// existed refuses later initialization.
+fn smoke_rtw8822ce_removal_without_dma_proof_pins_and_blocks_initialize() -> TestResult {
+    let h = Harness::new(false);
+    h.join();
+    h.model(|io| io.rx_dma_busy = true);
+    h.device.withdraw();
+    if complete(h.lifecycle.remove()) {
+        return TestResult::Fail("RTL8822CE busy RXDMA removal reported reclaimed");
+    }
+    drop(h);
+    let lifecycle = Lifecycle::<RadioIo>::new(0xc822);
+    if !complete(lifecycle.remove())
+        || complete(lifecycle.initialize_bytes(|| Ok(RadioIo::new()), Vec::new()))
+            != Err(crate::rtw88::FirmwareError::State)
+        || lifecycle.retained.try_lock().is_none_or(|o| o.is_some())
+    {
+        return TestResult::Fail("RTL8822CE removed lifecycle initialized an owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/station",
+    smoke_rtw8822ce_removal_without_dma_proof_pins_and_blocks_initialize
+);
 /// A disconnect whose RXDMA never idles still completes, but every
 /// published mapping stays retained (no reclaim without the proof).
 fn smoke_rtw8822ce_disconnect_without_dma_idle_proof_retains_mappings() -> TestResult {

@@ -1578,6 +1578,38 @@ retained, a timed-out beacon page never proven) and the composed station
 cases (an Open DHCP disconnect proves and reclaims; a busy RXDMA disconnect
 still completes and keeps every mapping).
 
+### PCI device removal (`pci.rs::remove`)
+
+`register_pci_driver` registers a `narf_bus::register_pci_remove` hook
+for every match name. It follows Linux v7.2 `pci.c::rtw_pci_remove`:
+
+1. `rtw_unregister_hw`: `interface::Device::withdraw` closes admission,
+   drops the link, clears the stack rings and unregisters the wireless
+   registry, the net registry and the `wlan%d` interface. The 1 ms
+   drain/watchdog task exits once the shell is withdrawn. A diagnostic
+   RTL8822BE shell unregisters its static interface.
+2. `rtw_pci_disable_interrupt` + `rtw_pci_destroy`:
+   `Lifecycle::remove` marks the lifecycle removed, so no initialization
+   or stage can install an owner later. Under the owner mutex it records
+   `Failed`/`Gone`, takes the retained owner and runs
+   `Owner::quiesce_dma`, which stops the station, then runs `rtw_pci_stop`
+   and the DMA idle proof above. Then it drops the owner.
+3. Drop frees the rings and buffers only after a successful proof.
+   Otherwise they stay pinned and the bus address is quarantined: a later
+   probe of that address returns `BadDevice` without touching config space
+   or BARs. A proven removal clears the quarantine.
+
+The hook takes the controller slot only for the exact bound address, and
+the teardown runs on the executor because removal cannot fail or block
+the bus dispatcher.
+
+Evidence (`drivers/wireless/rtw88/station`): removal of a joined
+RTL8822CE station withdraws the shell, reclaims after the proof, leaves
+`Failed`/`Gone` with no retained owner, refuses association and finds
+no owner on a second removal. A removal whose RXDMA never idles reports the mappings
+pinned. A lifecycle removed before any owner existed refuses a later
+`initialize_bytes`.
+
 ## 4. Invariants
 
 - Physical reads select Wi-Fi EFUSE bank zero and disable the programming
@@ -1794,7 +1826,6 @@ changes. None is a physical blocker unless stated.
 |---|---|
 | `additional_operating_channels` | `station.rs::associate` refuses `candidate.bss.channel != 1` and `scan.rs::plan` admits 2412 MHz only. The C21/C22 radio programs (`radio.rs`, `radio8821c.rs`) write fixed channel1 RF/BB/TXAGC values. Needs ports of `rtw8822c_set_channel`/`rtw8821c_set_channel` plus a per-channel measured envelope. |
 | `beamforming` | Linux `bf.c::rtw_bf_assoc` acts only on a VHT peer (`vht_cap` SU beamformer/beamformee), so this is blocked on `vht`. |
-| `device_removal` | The retained owner is one-shot: terminal paths keep DMA mappings by design (§4). There is no `rtw_pci_remove` / `rtw_pci_dma_reset` port and `pci.rs` has no remove hook. Software work only (the ath9k DMA-stop pattern applies); not attempted this round. |
 | `dpk_tracking` | `rtw8822c_dpk_track` needs a DPK result, and no `rtw8822c_do_dpk` calibration is ported (§3 dm section). |
 | `five_ghz_operation` | The same fixed channel1 programs, plus `scan.rs` 2412-only admission. Needs 5 GHz RF/BB/AGC table selection and a measured 5 GHz envelope. |
 | `ht40` | `station.rs` refuses any offered/negotiated width other than `Width::Twenty`, and the radio programs only BW20. Needs `rtw8822c_set_channel_bb` BW40 and DSSS/CCK40 programming, plus SGI40 in the measured HT gate. |
@@ -1808,7 +1839,7 @@ changes. None is a physical blocker unless stated.
 | `runtime_sleep` | No `ps.c` LPS/IPS (`rtw_enter_lps`, `rtw_leave_ips`); the station stays awake/CAM. |
 | `safe_rejoin` | Rejoin needs a fresh lifecycle after terminal closure (§3) and is blocked on `operating_reset`. |
 | `smps_txrx_1ss` | Driven only by coexistence (`rtw_vif_smps_iter` on `hal.txrx_1ss`), so blocked on `radio_coexistence`. |
-| `system_suspend` | No `rtw_pci_suspend`/`resume` and no wowlan-less power-down/restore path. Blocked on the DMA-stop proof. |
+| `system_suspend` | Linux `rtw_pci_suspend`/`resume` only toggle the CLKREQ pad (8822C RFE 6); the stack stops the radio through mac80211 (`rtw_ops_stop` → `rtw_core_stop`) and restarts it (`rtw_ops_start` → `rtw_core_start`: power-on, firmware download, MAC/PHY init). The DMA-stop proof now covers the stop half, but the resume half is exactly the missing generation reset, so this is blocked on `operating_reset`. |
 | `tx_amsdu_5ghz` | Blocked on `five_ghz_operation`. |
 | `tx_ba_all_tids` | `tx_ba.rs::Originator` holds one TID0 agreement, and `packet_core/batch.rs` aggregates only `Queue::Data`. With N2xQ in place, per-TID agreements and BK/VI/VO batches remain software work, not attempted this round. |
 | `vht` | The HT station builds `LocalPhy::ht20` only, and VHT80 needs ht40 channel/BW80 programming first; blocked on `ht40`. |

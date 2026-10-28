@@ -33,6 +33,8 @@ pub struct Status {
 }
 pub(super) struct Lifecycle<I: Io> {
     started: AtomicBool,
+    /// Set by `remove`; no owner may be installed afterwards.
+    removed: AtomicBool,
     pub(super) retained: Mutex<Option<Owner<I>>>,
     status: IrqSafeSpinLock<Status>,
     did: u16,
@@ -77,6 +79,7 @@ impl<I: Io> Lifecycle<I> {
     pub(super) fn new(did: u16) -> Self {
         Self {
             started: AtomicBool::new(false),
+            removed: AtomicBool::new(false),
             retained: Mutex::new(None),
             status: IrqSafeSpinLock::new(Status {
                 stage: Stage::Detected,
@@ -88,6 +91,32 @@ impl<I: Io> Lifecycle<I> {
     }
     pub(super) fn status(&self) -> Status {
         *self.status.lock()
+    }
+    pub(super) fn removed(&self) -> bool {
+        self.removed.load(Ordering::Acquire)
+    }
+    /// Linux v7.2 `pci.c::rtw_pci_remove` for the retained owner: no later
+    /// stage or initialization may start, the owner runs `rtw_pci_stop` and
+    /// the DMA idle proof (`Owner::quiesce_dma`) under the owner mutex, and
+    /// is then dropped. Drop frees the published rings and buffers only
+    /// after a successful proof; otherwise they stay pinned. Returns true
+    /// when no mapping remains retained.
+    pub(super) async fn remove(&self) -> bool {
+        self.removed.store(true, Ordering::Release);
+        self.started.store(true, Ordering::Release);
+        let mut retained = self.retained.lock().await;
+        *self.status.lock() = Status {
+            stage: Stage::Failed,
+            info: None,
+            error: Some(Error::Gone),
+        };
+        let Some(mut owner) = retained.take() else {
+            return true;
+        };
+        let _ = owner.quiesce_dma().await;
+        let reclaimed = owner.dma_reclaimable();
+        drop(owner);
+        reclaimed
     }
     pub(super) fn device_id(&self) -> u16 {
         self.did
@@ -565,7 +594,7 @@ impl<I: Io> Lifecycle<I> {
         let result = async {
             let owner = Owner::new(allocate()?, self.did);
             let mut retained = self.retained.lock().await;
-            if retained.is_some() {
+            if retained.is_some() || self.removed.load(Ordering::Acquire) {
                 return Err(Error::State);
             }
             *retained = Some(owner); // before registry/MMIO/DMA claim can run

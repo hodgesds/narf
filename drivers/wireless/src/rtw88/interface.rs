@@ -45,6 +45,7 @@ pub(super) struct Device<I: Io> {
     name: String,
     local: [u8; 6],
     published: AtomicBool,
+    withdrawn: AtomicBool,
     activating: AtomicBool,
     admitted: AtomicBool,
     up: AtomicBool,
@@ -119,6 +120,7 @@ impl<I: Io + 'static> Device<I> {
             name: name.into(),
             local,
             published: AtomicBool::new(false),
+            withdrawn: AtomicBool::new(false),
             activating: AtomicBool::new(false),
             admitted: AtomicBool::new(false),
             up: AtomicBool::new(false),
@@ -135,6 +137,39 @@ impl<I: Io + 'static> Device<I> {
     }
     pub(super) fn closed(&self) -> bool {
         self.admission.closed()
+    }
+    /// Removal (`rtw_unregister_hw` in `rtw_pci_remove`): close every
+    /// control and packet path, drop the link and withdraw the registered
+    /// netdev, wireless and stack endpoints. The owner itself is torn down
+    /// by `Lifecycle::remove`.
+    pub(super) fn withdraw(self: &Arc<Self>) {
+        if self.withdrawn.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.close();
+        if let Some(mut rings) = self.rings.try_lock() {
+            rings.clear();
+        }
+        if !self.published.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        {
+            let mut active = ACTIVE.lock();
+            let this = Arc::as_ptr(self) as *const ();
+            if active
+                .as_ref()
+                .is_some_and(|a| Arc::as_ptr(a) as *const () == this)
+            {
+                *active = None;
+            }
+        }
+        narf_wireless::registry::unregister(&self.name);
+        narf_net::registry().unregister(&self.name);
+        narf_net::iface::unregister(&self.name);
+        CLAIMED.store(false, Ordering::Release);
+    }
+    pub(super) fn withdrawn(&self) -> bool {
+        self.withdrawn.load(Ordering::Acquire)
     }
     pub(super) fn admission(&self) -> Admission {
         self.admission.clone()
@@ -808,7 +843,7 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
     device.published.store(true, Ordering::Release);
     narf_scheduler::spawn(async move {
         let mut ticks = 0u32;
-        loop {
+        while !device.withdrawn() {
             device.drain();
             ticks = ticks.wrapping_add(1);
             // The station rate-limits itself to the source 2s period.
