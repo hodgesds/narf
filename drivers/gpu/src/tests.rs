@@ -1004,7 +1004,7 @@ kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_displayobj_iter_paths);
 
 fn smoke_dp_edid_over_aux_round_trip() -> TestResult {
     // StubAux that returns canned EDID bytes for I2C reads at
-    // address 0x50<<1 + read flag, and checks the Linux
+    // the 7-bit slave address 0x50, and checks the Linux
     // `drm_dp_i2c_xfer` shape: MOT on the offset write and every
     // read burst, then an address-only read without MOT (STOP).
     use crate::dp_aux::{AuxChannel, AuxCommand, AuxError, AuxRequest, AuxResponse, AuxStatus};
@@ -1043,6 +1043,9 @@ fn smoke_dp_edid_over_aux_round_trip() -> TestResult {
             req: &AuxRequest<'_>,
             reply_buf: &'a mut [u8],
         ) -> Result<AuxResponse<'a>, AuxError> {
+            if req.address != 0x50 {
+                return Err(AuxError::Nacked);
+            }
             match req.cmd {
                 AuxCommand::I2cWriteMot => {
                     // The driver writes the EDID offset (0) to

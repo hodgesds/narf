@@ -663,6 +663,11 @@ pub mod tests {
             }
             let cmd = wire[0] >> 4;
             let addr = (((wire[0] & 0x0F) as u32) << 16) | ((wire[1] as u32) << 8) | wire[2] as u32;
+            // I²C requests carry the 7-bit slave address; only
+            // the EDID EEPROM at 0x50 answers (I2C_NACK else).
+            if cmd & 0x8 == 0 && addr != 0x50 {
+                return alloc::vec![0x40];
+            }
             // An I²C address-only request is the bare 3-byte
             // header (no LEN byte); with MOT clear it is the STOP.
             if wire.len() == 3 {

@@ -2608,7 +2608,7 @@ pub mod tests {
                 0x0 | 0x4 => {
                     // I2C write: the EDID EEPROM latches its
                     // byte pointer from the payload.
-                    if addr == 0x50 << 1 {
+                    if addr == 0x50 {
                         *self.edid_ptr.borrow_mut() = wire[4] as usize;
                     }
                     1

@@ -9,12 +9,14 @@
 //! ## Wire shape
 //!
 //! Every DP sink exposes its EDID at I²C address `0x50` (the
-//! standard DDC/CI slave). The AUX I²C transport packs the I²C
-//! address into bits[19:0] of the AUX address field — bits[7:1]
-//! are the I²C address, bit 0 is the read/write flag. The
-//! source issues:
+//! standard DDC/CI slave). I²C-over-AUX carries the 7-bit I²C
+//! address itself in the AUX address field — `0x50`, not the
+//! `0xA0`/`0xA1` byte a bit-banged bus clocks out; direction is
+//! the command (Linux `drm_dp_i2c_xfer` sets `msg.address` to
+//! the 7-bit `i2c_msg.addr`, and `intel_dp_aux_header` writes
+//! its low byte to the wire). The source issues:
 //!
-//!   1. `I2C_WRITE_MOT` to `0x50 << 1` with one byte = the EDID
+//!   1. `I2C_WRITE_MOT` to `0x50` with one byte = the EDID
 //!      offset (typically 0).
 //!   2. `I2C_READ_MOT` to read the 128-byte block in 16-byte
 //!      chunks (AUX caps reads at 16 bytes).
@@ -28,9 +30,9 @@
 
 use crate::dp_aux::{AuxChannel, AuxCommand, AuxError, AuxRequest};
 
-/// Standard DDC/CI EDID slave address (left-shifted by 1 to
-/// match the AUX wire format).
-const EDID_I2C_ADDR_SHIFTED: u32 = 0x50 << 1;
+/// Standard DDC/CI EDID slave address — the 7-bit I²C address,
+/// as the AUX address field carries it (Linux `DDC_ADDR`).
+const EDID_I2C_ADDR: u32 = 0x50;
 
 /// AUX caps each read at 16 bytes (DP §2.7.4).
 const AUX_CHUNK: usize = 16;
@@ -80,7 +82,7 @@ fn read_edid_block<A: AuxChannel>(
     let result = read_edid_block_mot(aux, offset, block);
     let stop = AuxRequest {
         cmd: AuxCommand::I2cRead,
-        address: EDID_I2C_ADDR_SHIFTED | 1, // read flag
+        address: EDID_I2C_ADDR,
         data: &[],
     };
     let mut reply = [0u8; 1];
@@ -100,7 +102,7 @@ fn read_edid_block_mot<A: AuxChannel>(
     let offset_byte = [offset];
     let req = AuxRequest {
         cmd: AuxCommand::I2cWriteMot,
-        address: EDID_I2C_ADDR_SHIFTED,
+        address: EDID_I2C_ADDR,
         data: &offset_byte,
     };
     let mut reply = [0u8; 1];
@@ -111,7 +113,7 @@ fn read_edid_block_mot<A: AuxChannel>(
         let chunk_len = AUX_CHUNK.min(128 - read);
         let req = AuxRequest {
             cmd: AuxCommand::I2cReadMot,
-            address: EDID_I2C_ADDR_SHIFTED | 1, // read flag
+            address: EDID_I2C_ADDR,
             data: &ZERO_CHUNK[..chunk_len],
         };
         let mut reply = [0u8; AUX_CHUNK + 1];
