@@ -21,15 +21,16 @@
 //!
 //! The IRQ handler is the simple part: read 0x60, decode, push.
 //!
-//! Scancode-set-1 lookup. The controller delivers two byte sequences:
+//! Scancode-set-1 lookup. The controller delivers three byte shapes:
 //!   * Single byte: top bit = release (0x80), low bits = make code.
 //!   * Two-byte extended: 0xE0 prefix + make/release.
+//!   * The Pause key's six-byte 0xE1 sequence (see `process_byte`).
 //!
 //! The driver tracks a small bit of state across IRQs (the "expecting
 //! the second byte of an E0 escape" flag) and a bitset of currently
 //! pressed modifier keys to stamp on every event.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use narf_arch::x86_64::io_port::{inb, outb};
 use narf_input::{
@@ -74,12 +75,16 @@ const CONF_KBD_TRANSLATE: u8 = 1 << 6;
 
 /// Driver state. Only one i8042 controller per system — global static.
 /// Modifier tracking lives in `narf_input` (shared across all keyboard
-/// producers); we only keep the E0-prefix latch here.
+/// producers); we only keep the E0-prefix latch and the E1 (Pause)
+/// sequence matcher here.
 #[derive(Debug)]
 pub struct State {
     /// True after the next byte should be interpreted as the second
     /// half of an E0 escape sequence.
     extended: AtomicBool,
+    /// Stage of the 0xE1 (Pause) sequence matcher; one of the
+    /// `E1_*` constants below. `E1_IDLE` = no partial sequence.
+    e1_stage: AtomicU8,
     initialized: AtomicBool,
 }
 
@@ -87,10 +92,25 @@ impl State {
     pub const fn new() -> Self {
         Self {
             extended: AtomicBool::new(false),
+            e1_stage: AtomicU8::new(E1_IDLE),
             initialized: AtomicBool::new(false),
         }
     }
 }
+
+/// Stages of the 0xE1 (Pause key) sequence matcher; see
+/// `process_byte`. The set-1 Pause frame is `E1 1D 45 E1 9D C5`.
+const E1_IDLE: u8 = 0;
+/// Saw `E1`, expect `0x1D` (make half of the frame).
+const E1_GOT_PREFIX: u8 = 1;
+/// Saw `E1 1D`, expect `0x45` — completes the press.
+const E1_GOT_MAKE_1D: u8 = 2;
+/// Press emitted, expect the closing frame's `E1`.
+const E1_GOT_PRESS: u8 = 3;
+/// Saw the closing `E1`, expect `0x9D`.
+const E1_GOT_PREFIX2: u8 = 4;
+/// Saw `E1 9D`, expect `0xC5` — completes the release.
+const E1_GOT_REL_9D: u8 = 5;
 
 impl Default for State {
     fn default() -> Self {
@@ -618,15 +638,38 @@ pub fn __led_tx_idle_for_test() -> bool {
 /// Translate a single scancode-set-1 make/break byte (without the
 /// 0x80 release bit) into a `KeyCode`. `extended` indicates the byte
 /// followed an `0xE0` escape.
+///
+/// The E0 table is the extended-key block of scancode set 1 (IBM
+/// PS/2 Hardware Interface Technical Reference, scan code set 1;
+/// the same key assignments Linux's atkbd reports). The navigation
+/// cluster, keypad Enter / Divide, Print Screen, and the Meta /
+/// Menu keys all live behind the E0 prefix, sharing make-code
+/// values with unrelated keypad keys — the prefix is the only
+/// thing distinguishing e.g. Home (E0 0x47) from keypad 7 (0x47).
+/// One E0 byte is *not* a key and never reaches this function: the
+/// "fake shift" 0x2A the keyboard wraps around Print Screen (and
+/// inserts around some other E0 keys), consumed by `process_byte`.
 fn decode(byte: u8, extended: bool) -> KeyCode {
     if extended {
         return match byte {
+            0x1C => KeyCode::KpEnter,
             0x1D => KeyCode::RightCtrl,
+            0x35 => KeyCode::KpSlash,
+            0x37 => KeyCode::SysRq, // Print Screen
             0x38 => KeyCode::RightAlt,
+            0x47 => KeyCode::Home,
             0x48 => KeyCode::Up,
+            0x49 => KeyCode::PageUp,
             0x4B => KeyCode::Left,
             0x4D => KeyCode::Right,
+            0x4F => KeyCode::End,
             0x50 => KeyCode::Down,
+            0x51 => KeyCode::PageDown,
+            0x52 => KeyCode::Insert,
+            0x53 => KeyCode::Delete,
+            0x5B => KeyCode::LeftMeta,
+            0x5C => KeyCode::RightMeta,
+            0x5D => KeyCode::Menu,
             _ => KeyCode::Unknown,
         };
     }
@@ -636,8 +679,87 @@ fn decode(byte: u8, extended: bool) -> KeyCode {
     KeyCode::from_evdev(byte as u16)
 }
 
-/// IRQ-1 handler. Reads one byte from 0x60, decodes, pushes a
-/// `KeyEvent` to the global event ring.
+/// Emit one decoded key event: the legacy global ring (for the FB
+/// status panel / console consumer) and the evdev node, if
+/// registered.
+fn emit_key(code: KeyCode, pressed: bool) {
+    let _ = push_key(code, pressed);
+
+    let raw = KBD_NODE_PTR.load(Ordering::Acquire);
+    if !raw.is_null() {
+        // SAFETY: `raw` was written once in init() (before IRQs were
+        // armed) as `Arc::as_ptr` of the node, just null-checked, and
+        // the Arc is kept alive by KBD_EVDEV_NODE + ROUTER for the
+        // device's lifetime — so the borrow is valid and aligned.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        let node_ref: &DeviceNode = unsafe { &*raw };
+        dispatch_key_to_node(node_ref, code as u16, pressed);
+    }
+}
+
+/// Advance the Pause key's 0xE1 sequence matcher by one byte.
+///
+/// Scancode set 1 gives Pause no ordinary make/break pair: a press
+/// emits the whole six-byte frame `E1 1D 45 E1 9D C5` and a release
+/// emits nothing. We mirror Linux atkbd: report the press when the
+/// `45` lands and the release when the trailing `C5` lands, so
+/// userspace sees a normal momentary key. Any byte that doesn't
+/// fit the frame aborts it silently — in particular the frame's
+/// `1D` must never leak out as a RightCtrl press.
+fn e1_step(byte: u8) {
+    let stage = STATE.e1_stage.load(Ordering::Acquire);
+    let (next, emit) = match (stage, byte) {
+        (E1_GOT_PREFIX, 0x1D) => (E1_GOT_MAKE_1D, None),
+        (E1_GOT_MAKE_1D, 0x45) => (E1_GOT_PRESS, Some(true)),
+        (E1_GOT_PRESS, 0xE1) => (E1_GOT_PREFIX2, None),
+        (E1_GOT_PREFIX2, 0x9D) => (E1_GOT_REL_9D, None),
+        (E1_GOT_REL_9D, 0xC5) => (E1_IDLE, Some(false)),
+        _ => (E1_IDLE, None),
+    };
+    STATE.e1_stage.store(next, Ordering::Release);
+    if let Some(pressed) = emit {
+        emit_key(KeyCode::Pause, pressed);
+    }
+}
+
+/// Process one byte from the keyboard channel through the decode
+/// state machine (E1/Pause matcher, E0 latch, fake-shift filter)
+/// and emit the resulting key event, if any. Shared verbatim by
+/// the IRQ handler and the test-only synthetic byte stream, so
+/// fixtures exercise exactly the production pipeline.
+fn process_byte(byte: u8) {
+    // A byte belonging to an in-progress E1 frame is consumed by
+    // the matcher before anything else can see it.
+    if STATE.e1_stage.load(Ordering::Acquire) != E1_IDLE {
+        e1_step(byte);
+        return;
+    }
+    if byte == 0xE1 {
+        STATE.e1_stage.store(E1_GOT_PREFIX, Ordering::Release);
+        return;
+    }
+    if byte == 0xE0 {
+        STATE.extended.store(true, Ordering::Release);
+        return;
+    }
+
+    let pressed = byte & 0x80 == 0;
+    let make = byte & 0x7F;
+    let extended = STATE.extended.swap(false, Ordering::AcqRel);
+    // Fake shift: the keyboard wraps Print Screen's make in
+    // `E0 2A …` and its break in `… E0 AA`, and inserts the same
+    // pair around some other E0 keys. 0x2A behind an E0 prefix is
+    // not LeftShift (that is the un-prefixed 0x2A) — swallow it,
+    // as Linux atkbd does, or Print Screen would also toggle a
+    // phantom shift.
+    if extended && make == 0x2A {
+        return;
+    }
+    emit_key(decode(make, extended), pressed);
+}
+
+/// IRQ-1 handler. Reads one byte from 0x60 and runs it through the
+/// decode state machine.
 ///
 /// # Safety
 /// IRQ context only.
@@ -651,29 +773,7 @@ pub unsafe fn on_irq1() {
         return;
     }
 
-    if byte == 0xE0 {
-        STATE.extended.store(true, Ordering::Release);
-        return;
-    }
-
-    let pressed = byte & 0x80 == 0;
-    let make = byte & 0x7F;
-    let extended = STATE.extended.swap(false, Ordering::AcqRel);
-    let code = decode(make, extended);
-    // Legacy global ring (for FB status panel / console consumer).
-    let _ = push_key(code, pressed);
-
-    // Evdev routing — dispatch to the per-device node if registered.
-    let raw = KBD_NODE_PTR.load(Ordering::Acquire);
-    if !raw.is_null() {
-        // SAFETY: `raw` was written once in init() (before IRQs were
-        // armed) as `Arc::as_ptr` of the node, just null-checked, and
-        // the Arc is kept alive by KBD_EVDEV_NODE + ROUTER for the
-        // device's lifetime — so the borrow is valid and aligned.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let node_ref: &DeviceNode = unsafe { &*raw };
-        dispatch_key_to_node(node_ref, code as u16, pressed);
-    }
+    process_byte(byte);
 }
 
 /// Test-only: process a synthetic byte stream through the same
@@ -685,27 +785,14 @@ pub fn feed_bytes_for_test(bytes: &[u8]) {
         if led_route_byte(b) {
             continue;
         }
-        if b == 0xE0 {
-            STATE.extended.store(true, Ordering::Release);
-            continue;
-        }
-        let pressed = b & 0x80 == 0;
-        let make = b & 0x7F;
-        let extended = STATE.extended.swap(false, Ordering::AcqRel);
-        let code = decode(make, extended);
-        let _ = push_key(code, pressed);
-        let raw = KBD_NODE_PTR.load(Ordering::Acquire);
-        if !raw.is_null() {
-            // SAFETY: same as on_irq1.
-            let node_ref: &DeviceNode = unsafe { &*raw };
-            dispatch_key_to_node(node_ref, code as u16, pressed);
-        }
+        process_byte(b);
     }
 }
 
 #[doc(hidden)]
 pub fn __reset_for_test() {
     STATE.extended.store(false, Ordering::Release);
+    STATE.e1_stage.store(E1_IDLE, Ordering::Release);
     narf_input::__reset_modifiers_for_test();
     *LED_TX.lock() = LedTx::new();
     LED_TX_LOG.lock().clear();
