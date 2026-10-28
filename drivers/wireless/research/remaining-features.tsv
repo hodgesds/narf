@@ -215,11 +215,8 @@ rtl8xxxu	rtl8821cu	RTL8821CU retained runtime using its actual upstream transpor
 rtl8xxxu	rtl8822bu	RTL8822BU retained runtime using its actual upstream transport	chip	drivers/wireless/specification/rtl8xxxu.md	589
 rtl8xxxu	runtime_power_management	Runtime power management	feature	drivers/wireless/specification/rtl8xxxu.md	586
 rtl8xxxu	safe_rejoin	Safe reassociation/rejoin	feature	drivers/wireless/specification/rtl8xxxu.md	568
-rtl8xxxu	tspec	TSPEC admission	feature	drivers/wireless/specification/rtl8xxxu.md	310
 rtl8xxxu	tx_ampdu	TX A-MPDU	feature	drivers/wireless/specification/rtl8xxxu.md	573
-rtl8xxxu	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/rtl8xxxu.md	573
 rtl8xxxu	tx_block_ack	Originator TX Block Ack agreements	feature	drivers/wireless/specification/rtl8xxxu.md	573
-rtl8xxxu	uapsd	U-APSD	feature	drivers/wireless/specification/rtl8xxxu.md	310
 rtl8xxxu	usb_transfer_slot_reuse	Safe USB transfer-slot reclamation/reuse	feature	drivers/wireless/specification/rtl8xxxu.md	565
 rtl8xxxu	vht	VHT operation on RTL8821CU/RTL8822BU	feature	drivers/wireless/specification/rtl8xxxu.md	591
 rtlwifi	active_scanning	Active scanning	feature	drivers/wireless/specification/rtlwifi.md	303
@@ -232,12 +229,12 @@ rtlwifi	dma_reclamation	Published DMA reclamation	feature	drivers/wireless/speci
 rtlwifi	dynamic_antenna_selection	Dynamic antenna selection/tracking	feature	drivers/wireless/specification/rtlwifi.md	158
 rtlwifi	five_ghz_operation	5GHz band operation on RTL8192DE/RTL8821AE	feature	drivers/wireless/specification/rtlwifi.md	656
 rtlwifi	ht40	HT40	feature	drivers/wireless/specification/rtlwifi.md	654
-rtlwifi	inactive_power_save	Inactive power save (IPS, inactiveps default on)	feature	drivers/wireless/specification/rtlwifi.md	712
+rtlwifi	inactive_power_save	Inactive power save (IPS, inactiveps default on)	feature	drivers/wireless/specification/rtlwifi.md	724
 rtlwifi	irq_delivery	Interrupt-driven runtime service	feature	drivers/wireless/specification/rtlwifi.md	644
-rtlwifi	leisure_power_save	Leisure power save (firmware/software LPS)	feature	drivers/wireless/specification/rtlwifi.md	713
+rtlwifi	leisure_power_save	Leisure power save (firmware/software LPS)	feature	drivers/wireless/specification/rtlwifi.md	725
 rtlwifi	multi_radio	Multiple live radios	feature	drivers/wireless/specification/rtlwifi.md	648
 rtlwifi	operating_reset	Reset of an operating retained owner	feature	drivers/wireless/specification/rtlwifi.md	648
-rtlwifi	pcie_aspm	PCIe ASPM link power management	feature	drivers/wireless/specification/rtlwifi.md	714
+rtlwifi	pcie_aspm	PCIe ASPM link power management	feature	drivers/wireless/specification/rtlwifi.md	726
 rtlwifi	randomized_scan_mac	Randomized scan MAC addresses	feature	drivers/wireless/specification/rtlwifi.md	303
 rtlwifi	rate_fallback	DATA rate fallback	feature	drivers/wireless/specification/rtlwifi.md	457
 rtlwifi	rf_gain_tracking	RF gain/power tracking	feature	drivers/wireless/specification/rtlwifi.md	654
@@ -254,12 +251,10 @@ rtlwifi	rx_reordering	RX sequence reordering	feature	drivers/wireless/specificat
 rtlwifi	safe_rejoin	Safe reassociation/rejoin	feature	drivers/wireless/specification/rtlwifi.md	654
 rtlwifi	sgi20	SGI20	feature	drivers/wireless/specification/rtlwifi.md	654
 rtlwifi	system_suspend	System suspend	feature	drivers/wireless/specification/rtlwifi.md	648
-rtlwifi	tspec	TSPEC admission	feature	drivers/wireless/specification/rtlwifi.md	379
 rtlwifi	tx_aggregation	TX aggregation	feature	drivers/wireless/specification/rtlwifi.md	475
 rtlwifi	tx_block_ack	Originator TX Block Ack	feature	drivers/wireless/specification/rtlwifi.md	654
-rtlwifi	uapsd	U-APSD	feature	drivers/wireless/specification/rtlwifi.md	379
 rtlwifi	vht	VHT operation including TX/RX STBC on RTL8821AE	feature	drivers/wireless/specification/rtlwifi.md	707
-rtlwifi	wowlan	WoWLAN magic-packet/pattern wake on RTL8821AE/8812AE	feature	drivers/wireless/specification/rtlwifi.md	716
+rtlwifi	wowlan	WoWLAN magic-packet/pattern wake on RTL8821AE/8812AE	feature	drivers/wireless/specification/rtlwifi.md	728
 rtw88	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw88.md	1468
 rtw88	beamforming	Beamforming	feature	drivers/wireless/specification/rtw88.md	264
 rtw88	cck_pd_tracking	Periodic CCK packet-detection threshold tracking on RTL8821C/RTL8822C	feature	drivers/wireless/specification/rtw88.md	1565

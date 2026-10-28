@@ -706,6 +706,18 @@ Source-proven inapplicability (rows removed from the remaining inventory):
   RTL8821AE VHT capability (`IEEE80211_VHT_CAP_TXSTBC | RXSTBC_1`) and is part
   of the remaining `vht` work.
 
+- **TSPEC admission.** `nl80211.c` exposes `NL80211_CMD_ADD_TX_TS` (and
+  `nl80211_add_tx_ts` returns `-EOPNOTSUPP` otherwise) only when the driver sets
+  `NL80211_FEATURE_SUPPORTS_WMM_ADMISSION`; mac80211 `ieee80211_add_tx_ts`
+  never originates ADDTS itself. rtlwifi (`base.c::_rtl_init_mac80211`, `core.c`) never sets that wiphy feature, so no TSPEC
+  can be admitted; the implemented ACM downgrade (`ieee80211_downgrade_queue`)
+  is the complete upstream behaviour for ACM ACs.
+- **U-APSD.** mac80211 `mlme.c::ieee80211_mgd_assoc` sets
+  `assoc_data->uapsd` only when the vif has `IEEE80211_VIF_SUPPORTS_UAPSD`,
+  otherwise the WMM Information element carries QoS Info 0 and U-APSD is never
+  enabled. rtlwifi never sets that flag (`core.c::rtl_op_add_interface` sets only `IEEE80211_VIF_BEACON_FILTER`), so U-APSD is inapplicable; the
+  driver-owned Information IE requesting no U-APSD is the complete behaviour.
+
 Power management beyond named suspend, enumerated from per-chip `sw.c`
 module parameters (`rtl88ee_mod_params`, `rtl8821ae_mod_params`) and
 `base.c` hw flags: inactive power save (`inactiveps = true` on both),

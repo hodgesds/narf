@@ -508,7 +508,7 @@ responses, actual held ADDBA/M4 receipts, closed captures, each current source,
 policy loss and reentrant key/ordinary-credit publication. These cases pass
 both-architecture native QEMU and coordinated build/Clippy gates. Physical
 USB/RF/HT interoperability and exact-device measured qualification remain external.
-SGI20, HT40, TX A-MPDU, TX A-MSDU, originator BA, adaptive rates, broader scans/channels, coexistence
+SGI20, HT40, TX A-MPDU, originator BA, adaptive rates, broader scans/channels, coexistence
 and reset/rejoin remain software work.
 
 ## 4. Invariants
@@ -570,7 +570,7 @@ channels/rates, reset/rejoin and PM still need software implementation.
 Chip inventory is source-specific: Linux `rtl8xxxu/8188e.c` identifies1TX/1RX;
 `8192e.c` identifies actual1/2TX and2RX; `8723b.c` identifies1TX/1RX and optional
 BT/S0S1. EU's separately qualified HT20/LGI continuation is software-validated above;
-SGI20/HT40, TX A-MPDU/TX A-MSDU, originator BA,
+SGI20/HT40, TX A-MPDU, originator BA,
 adaptive rates, broader active/passive scanning, runtime PM and
 reset/rejoin remain software work. Full WMM AC/TID routing is implemented.
 
@@ -590,6 +590,25 @@ The repository's matched8821CU/8822BU profiles need the actual upstream
 `rtw88/rtw8821cu.c`/`rtw8822bu.c` USB transport and C21/C22B radio semantics;
 EU descriptor/register helpers cannot establish those VHT runtimes. No
 unsupported initial profile is marked hardware-inapplicable here.
+
+Source-proven inapplicability (rows removed from the remaining inventory):
+
+- **TX A-MSDU.** mac80211 `tx.c::ieee80211_amsdu_aggregate` returns early
+  unless the hardware sets `TX_AMSDU`; `rtl8xxxu_probe` sets only SIGNAL_DBM,
+  HAS_RATE_CONTROL, SUPPORT_FAST_XMIT, AMPDU_AGGREGATION and MFP_CAPABLE, so
+  mac80211 never builds an A-MSDU for this family. (RX of standalone A-MSDUs
+  is implemented above.)
+- **TSPEC admission.** `nl80211.c` exposes `NL80211_CMD_ADD_TX_TS` (and
+  `nl80211_add_tx_ts` returns `-EOPNOTSUPP` otherwise) only when the driver sets
+  `NL80211_FEATURE_SUPPORTS_WMM_ADMISSION`; mac80211 `ieee80211_add_tx_ts`
+  never originates ADDTS itself. `rtl8xxxu/core.c` never sets that wiphy feature, so no TSPEC
+  can be admitted; the implemented ACM downgrade (`ieee80211_downgrade_queue`)
+  is the complete upstream behaviour for ACM ACs.
+- **U-APSD.** mac80211 `mlme.c::ieee80211_mgd_assoc` sets
+  `assoc_data->uapsd` only when the vif has `IEEE80211_VIF_SUPPORTS_UAPSD`,
+  otherwise the WMM Information element carries QoS Info 0 and U-APSD is never
+  enabled. `rtl8xxxu/core.c` never sets that flag (no `driver_flags` assignment, no SUPPORTS_PS), so U-APSD is inapplicable; the
+  driver-owned Information IE requesting no U-APSD is the complete behaviour.
 
 Linux references: `rtl8xxxu/8188e.c` power/reset, IQK and fops;
 `rtl8xxxu/core.c` firmware, post-table init, HSSI, LC and IQ matrix functions;
