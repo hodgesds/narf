@@ -35,12 +35,12 @@ ath10k	vht80	VHT 80 MHz operation	feature	drivers/wireless/specification/ath10k.
 ath10k	vht80p80	VHT 80+80 on QCA9984/QCA9888	feature	drivers/wireless/specification/ath10k.md	961
 ath10k	wake_offload	Wake offload	feature	drivers/wireless/specification/ath10k.md	947
 ath10k	wpa3	WPA3	feature	drivers/wireless/specification/ath10k.md	946
-ath11k	aarch64_composition	Native aarch64 composed startup/PCI/IRQ/board-discovery fixtures; integration fixtures are x86-only and aarch64 lacks DTB/PCI-node plumbing	unknown	drivers/wireless/specification/ath11k.md	1891
-ath11k	ipq5018_enablement	IPQ5018 native SoC/AHB profile enablement	chip	drivers/wireless/specification/ath11k.md	1894
-ath11k	ipq6018_enablement	IPQ6018 native SoC/AHB profile enablement	chip	drivers/wireless/specification/ath11k.md	1894
-ath11k	ipq8074_enablement	IPQ8074 native SoC/AHB profile enablement	chip	drivers/wireless/specification/ath11k.md	1894
-ath11k	qcn9074_enablement	QCN9074 native HAL/core/DP/runtime enablement	chip	drivers/wireless/specification/ath11k.md	1893
-ath11k	wcn6750_enablement	WCN6750 native platform profile enablement	chip	drivers/wireless/specification/ath11k.md	1894
+ath11k	aarch64_composition	Native aarch64 composed startup/PCI/IRQ/board-discovery fixtures: DT board discovery now exists (board::dt_facts), and the x86-gated composed fixtures compile on aarch64, but enabling them kills the aarch64 test kernel inside the composed DHCP/integration fixture with no summary (consistent with kernel-stack overflow from by-value fixture state); needs a fixture stack-footprint rework before un-gating	unknown	drivers/wireless/specification/ath11k.md	1891
+ath11k	ipq5018_enablement	IPQ5018 native SoC/AHB profile enablement; blocked on Qualcomm SoC platform support absent from NARF: AHB platform device, Q6 WCSS remoteproc/PIL loading with SCM (TrustZone) authentication, reset/clock controllers, SMP2P/SMEM (Linux ath11k/ahb.c, remoteproc qcom_q6v5_wcss)	chip	drivers/wireless/specification/ath11k.md	1894
+ath11k	ipq6018_enablement	IPQ6018 native SoC/AHB profile enablement; blocked on Qualcomm SoC platform support absent from NARF: AHB platform device, Q6 WCSS remoteproc/PIL loading with SCM (TrustZone) authentication, reset/clock controllers, SMP2P/SMEM (Linux ath11k/ahb.c, remoteproc qcom_q6v5_wcss)	chip	drivers/wireless/specification/ath11k.md	1894
+ath11k	ipq8074_enablement	IPQ8074 native SoC/AHB profile enablement; blocked on Qualcomm SoC platform support absent from NARF: AHB platform device, Q6 WCSS remoteproc/PIL loading with SCM (TrustZone) authentication, reset/clock controllers, SMP2P/SMEM (Linux ath11k/ahb.c, remoteproc qcom_q6v5_wcss)	chip	drivers/wireless/specification/ath11k.md	1894
+ath11k	qcn9074_enablement	QCN9074 native HAL/core/DP/runtime enablement; unported Linux hw.c/hal.c qcn9074 profile: register map and hw_ops (hal_rx_desc_qcn9074), static BAR windows, non-shadow SRNG setup, per-pdev core and HTT peer-map-v2 RX/REO/DP runtime	chip	drivers/wireless/specification/ath11k.md	1893
+ath11k	wcn6750_enablement	WCN6750 native platform profile enablement; blocked on the hybrid AHB/PCIe WPSS platform absent from NARF: WPSS remoteproc (qcom_q6v5_adsp), SMP2P, and the QMI device-info register mapping of hybrid_bus_type (Linux ath11k/ahb.c)	chip	drivers/wireless/specification/ath11k.md	1894
 ath9k	additional_ac_scheduling	Additional AC scheduling	feature	drivers/wireless/specification/ath9k.md	589
 ath9k	additional_channels	Live operation on additional channels	feature	drivers/wireless/specification/ath9k.md	587
 ath9k	additional_tid_scheduling	Additional TID scheduling	feature	drivers/wireless/specification/ath9k.md	589
