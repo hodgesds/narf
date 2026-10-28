@@ -172,7 +172,8 @@ fn drive(a: &Side, b: &Side, rounds: usize) {
 }
 
 fn stack_frame(payload: &[u8]) -> Option<narf_net::Frame> {
-    let buf = narf_io::alloc_coherent(payload.len().max(1), narf_io::DomainId::DRIVER_0).ok()?;
+    let buf =
+        narf_io::alloc_coherent(payload.len().max(1), narf_lib::id::DomainId::DRIVER_0).ok()?;
     // SAFETY: the buffer was just allocated for at least
     // `payload.len()` bytes and is exclusively owned here.
     unsafe {

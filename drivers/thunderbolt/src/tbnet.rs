@@ -31,8 +31,8 @@ use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_capabilities::{Cap, Write};
-use narf_io::DomainId;
 use narf_ipc::{channel, Consumer, Producer};
+use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, Interface, NetIface, RX_RING_N, TX_RING_N};
 
@@ -108,27 +108,28 @@ impl Interface for TbNetInterface {
     }
 }
 
-/// The registry holds one handle and the CM side keeps another, so
-/// the pump and the fixtures can reach the rings after
-/// registration.
-impl Interface for Arc<TbNetInterface> {
+/// Registry-owned adapter that retains the shared interface while the CM
+/// side continues to pump the same rings.
+struct RegisteredTbNetInterface(Arc<TbNetInterface>);
+
+impl Interface for RegisteredTbNetInterface {
     fn name(&self) -> &str {
-        (**self).name()
+        self.0.name()
     }
     fn mac(&self) -> [u8; 6] {
-        (**self).mac()
+        self.0.mac()
     }
     fn mtu(&self) -> u32 {
-        (**self).mtu()
+        self.0.mtu()
     }
     fn link_up(&self) -> bool {
-        (**self).link_up()
+        self.0.link_up()
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        (**self).rx_ring()
+        self.0.rx_ring()
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        (**self).tx_ring()
+        self.0.tx_ring()
     }
 }
 
@@ -330,7 +331,9 @@ impl NetLink {
         let Some(authority) = narf_net::trusted_net_authority() else {
             return;
         };
-        match narf_net::registry().register(&authority, self.iface.clone()) {
+        match narf_net::registry()
+            .register(&authority, RegisteredTbNetInterface(self.iface.clone()))
+        {
             Ok(handle) => {
                 self.handle = Some(handle);
                 self.registered = true;
@@ -347,10 +350,11 @@ impl NetLink {
     /// into the RX ring.
     pub(crate) fn pump(&mut self) {
         self.ensure_registered();
+        let link_flag = self.link_flag.clone();
         let Some(data) = self.data.as_mut() else {
             return;
         };
-        if self.link_up() {
+        if link_flag.load(Ordering::SeqCst) {
             while let Ok(Some(frame)) = self.tx_cons.try_recv() {
                 let packet = frame.payload().to_vec();
                 if packet.is_empty() || packet.len() > MAX_PACKET {
@@ -373,7 +377,7 @@ impl NetLink {
             // Frames arriving while the session is down are
             // drained and dropped: the peer must not send before
             // mutual login, and a half-open link must not deliver.
-            if !self.link_up() {
+            if !link_flag.load(Ordering::SeqCst) {
                 continue;
             }
             if let Some(packet) = self.reasm.push(&bytes) {

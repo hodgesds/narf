@@ -1813,6 +1813,9 @@ impl Engine {
             let network = network_service(&root);
             Some((identity, services, network))
         });
+        let mut next_net_counter = self.net_counter;
+        let domain = self.domain;
+        let local_uuid = self.local_uuid;
         let Some(peer) = self.peer_mut(route) else {
             return;
         };
@@ -1831,13 +1834,11 @@ impl Engine {
                 peer.session = Session::default();
                 peer.login_retries = 0;
                 if peer.has_network && peer.net.is_none() {
-                    let index = self.net_counter;
-                    self.net_counter += 1;
-                    let name = format!("tbnet{}-{}", self.domain, index);
-                    let mac = crate::tbnet::generate_mac(
-                        self.local_uuid.unwrap_or(Uuid([0; 16])),
-                        peer.route,
-                    );
+                    let index = next_net_counter;
+                    next_net_counter = next_net_counter.wrapping_add(1);
+                    let name = format!("tbnet{}-{}", domain, index);
+                    let mac =
+                        crate::tbnet::generate_mac(local_uuid.unwrap_or(Uuid([0; 16])), peer.route);
                     let match_frags = peer.net_match_frags;
                     peer.net = Some(crate::tbnet::NetLink::new(name, mac, match_frags));
                 }
@@ -1846,6 +1847,7 @@ impl Engine {
                 peer.state = PeerState::Rejected;
             }
         }
+        self.net_counter = next_net_counter;
     }
 
     fn login_done(&mut self, route: u64, result: Result<Vec<u32>, Error>) {
