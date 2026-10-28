@@ -304,7 +304,7 @@ impl Io for PacketPort {
             // caller's source buffer. All extension lanes are observed too.
             let command = self.radio.hardware_read8(reg);
             let length = match command {
-                0 | 0x20 => 5,
+                0 | 0x20 | 0x84 => 5,
                 1 => 1,
                 3 => 2,
                 _ => return Err(AccessError::Unsupported),
@@ -1132,4 +1132,120 @@ pub(crate) fn smoke_rtl8188ee_native_card_disable_quiescence_reclaims_dma() -> T
 kernel_test_in!(
     "drivers/wireless/rtlwifi/packet",
     smoke_rtl8188ee_native_card_disable_quiescence_reclaims_dma
+);
+
+/// Linux `rtl88ee_update_hal_rate_mask` + `rtl88ee_tx_fill_desc`: the RA
+/// mask is H2C 0x84, and only DATA after it clears DISDATAFB with the
+/// mask's RATE_ID. RX PHY status yields `_rtl88ee_query_rxphystatus` PWDB.
+pub(crate) fn smoke_rtl8188ee_native_rate_mask_enables_data_fallback() -> TestResult {
+    let (mut owner, port) = self::owner();
+    let mask = [0x05, 0xf0, 0x0f, 0x00, 0x80];
+    if run(owner.install_rate_mask(mask, None)) != Err(Error::State) {
+        return TestResult::Fail("EE RA mask installed before packet service");
+    }
+    owner.start_packets().unwrap();
+    port.radio.hardware_word(0x6c, 1 << 31);
+    // Before the mask: DATA keeps USE_RATE|DISDATAFB and RATE_ID 0.
+    let slot = owner.packet.next[4];
+    owner
+        .submit_aggregate(&frame(true), 11, None, true)
+        .unwrap();
+    let before = port.descriptor(4, slot);
+    if word(&before, 16) & (1 << 10) == 0 || word(&before, 4) & (15 << 16) != 0 {
+        return TestResult::Fail("DATA fallback enabled without a firmware RA mask");
+    }
+    owner.poll_delivery().unwrap().unwrap();
+    port.model.lock().commands.clear();
+    let beacon = port.radio.read8(0x550).unwrap();
+    if run(owner.install_rate_mask([0xf5, 0x0f, 0x00, 0x40, 0x80], None)).is_err()
+        || owner.rate_mask() != Some(4)
+        || port.model.lock().commands != [(0x84, vec![0xf5, 0x0f, 0x00, 0x40, 0x80])]
+        || port.radio.read8(0x550).unwrap() != beacon | 8
+    {
+        return TestResult::Fail("EE RA mask differs from H2C_88E_RA_MASK + BCN_CTRL BIT3");
+    }
+    // DATA: RATE_ID = ratr_index, DISDATAFB clear, USE_RATE kept.
+    let slot = owner.packet.next[4];
+    owner
+        .submit_aggregate(&frame(true), 11, None, true)
+        .unwrap();
+    let data = port.descriptor(4, slot);
+    if word(&data, 16) & (1 << 10) != 0
+        || word(&data, 16) & (1 << 8) == 0
+        || (word(&data, 4) >> 16) & 15 != 4
+        || word(&data, 20) & 63 != 11
+    {
+        return TestResult::Fail("DATA TXD differs from rtl88ee_tx_fill_desc with useramask");
+    }
+    owner.poll_delivery().unwrap().unwrap();
+    // Management and non-adaptive (special) frames keep the forced rate.
+    for (data, adaptive) in [(false, true), (true, false)] {
+        let queue = if data { 4 } else { 1 };
+        let slot = owner.packet.next[queue];
+        owner
+            .submit_aggregate(&frame(data), 0, None, adaptive)
+            .unwrap();
+        let other = port.descriptor(queue, slot);
+        if word(&other, 16) & (1 << 10) == 0 || word(&other, 4) & (15 << 16) != 0 {
+            return TestResult::Fail("non-adaptive frame lost DISDATAFB");
+        }
+        owner.poll_delivery().unwrap().unwrap();
+    }
+    // RX: OFDM PHY status (pwdb_all 0x8c -> 60) and CCK (BB 0x824 BIT9).
+    let mut phy = [0u8; 28];
+    phy[4] = 0x8c;
+    let mut beacon_frame = frame(false);
+    beacon_frame[0] = 0x80;
+    port.emit_native(&beacon_frame, 11, 0, Some(&phy)).unwrap();
+    if owner.poll_receive().unwrap().and_then(|p| p.pwdb()) != Some(60) {
+        return TestResult::Fail("OFDM RX PWDB differs from _rtl88ee_query_rxphystatus");
+    }
+    phy[5] = (4 << 5) | 7;
+    port.radio.hardware_word(0x824, 1 << 9);
+    port.emit_native(&beacon_frame, 0, 0, Some(&phy)).unwrap();
+    // LNA4 VGA7 high power: -30 -> 70+6 = 76 (no low-power expansion).
+    if owner.poll_receive().unwrap().and_then(|p| p.pwdb()) != Some(76) {
+        return TestResult::Fail("CCK high-power RX PWDB differs");
+    }
+    port.radio.hardware_word(0x824, 0);
+    port.emit_native(&beacon_frame, 0, 0, Some(&phy)).unwrap();
+    // Low power: 76 -> +3 = 79.
+    if owner.poll_receive().unwrap().and_then(|p| p.pwdb()) != Some(79) {
+        return TestResult::Fail("CCK low-power RX PWDB differs");
+    }
+    port.emit(&beacon_frame).unwrap();
+    if owner.poll_receive().unwrap().map(|p| p.pwdb()) != Some(None) {
+        return TestResult::Fail("RX without PHYST reported a PWDB");
+    }
+    // Teardown: a terminal stop withdraws the mask (fallback off again).
+    owner.stop_packets().unwrap();
+    if owner.rate_mask().is_some() {
+        return TestResult::Fail("RA mask survived terminal stop");
+    }
+    // Failure: a firmware that never consumes the mask is terminal and
+    // never enables fallback; radio off never reaches the mailbox.
+    let (mut owner, port) = self::owner();
+    owner.start_packets().unwrap();
+    port.radio.hardware_word(0x6c, 1 << 31);
+    port.model.lock().hold_command = Some(0x84);
+    if run(owner.install_rate_mask(mask, None)) != Err(Error::CommandTimeout)
+        || owner.phase() != Phase::Failed
+        || owner.rate_mask().is_some()
+    {
+        return TestResult::Fail("stuck RA mask H2C was accepted");
+    }
+    let (mut owner, port) = self::owner();
+    owner.start_packets().unwrap();
+    port.radio.hardware_word(0x6c, 0);
+    port.model.lock().commands.clear();
+    if run(owner.install_rate_mask(mask, None)) != Err(Error::RadioOff)
+        || !port.model.lock().commands.is_empty()
+    {
+        return TestResult::Fail("radio-off RA mask reached firmware");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/packet",
+    smoke_rtl8188ee_native_rate_mask_enables_data_fallback
 );

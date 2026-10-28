@@ -399,8 +399,12 @@ fn smoke_rtl8188ee_negotiated_legacy_data_rate_uses_native_descriptor_and_ccmp()
                 return TestResult::Fail("EE actual richer-rate native data/CCMP");
             }
             let descriptor = port.descriptor(4, slot);
+            // The level-0 RA mask is installed at association: DATA keeps
+            // USE_RATE at the highest rate, clears DISDATAFB and carries
+            // the mask's RATE_ID (B: 6 for CCK-only, else G: 4).
             if word(&descriptor, 20) & 63 != expected
-                || word(&descriptor, 16) & ((1 << 8) | (1 << 10)) != ((1 << 8) | (1 << 10))
+                || word(&descriptor, 16) & ((1 << 8) | (1 << 10)) != (1 << 8)
+                || (word(&descriptor, 4) >> 16) & 15 != if expected <= 3 { 6 } else { 4 }
             {
                 return TestResult::Fail("EE response intersection or native forced rate differs");
             }

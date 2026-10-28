@@ -305,6 +305,8 @@ pub(super) struct State {
     tx_ba_stuck: u8,
     /// Time the association completed (`MAC80211_LINKED`).
     linked_at: Option<u64>,
+    /// `dm.undec_sm_pwdb` and `ra.pre_ratr_state` (driver RA mask).
+    ra: super::super::rate_adaptive::State,
 }
 impl State {
     pub(super) fn new() -> Self {
@@ -343,6 +345,7 @@ impl State {
             tx_token: 0,
             addba_req_num: [0; 8],
             last_addba_req: [0; 8],
+            ra: super::super::rate_adaptive::State::new(),
             tx_ba_stuck: 0,
             linked_at: None,
         }
@@ -1069,7 +1072,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             let op = || {
                 self.check_station_policy(environment)
                     .map_err(|_| RadioError::Power(super::super::channel_power::Error::Policy))?;
-                self.submit_aggregate(&bytes, rate, aggregate)
+                self.submit_aggregate(&bytes, rate, aggregate, matches!(kind, Kind::Data))
             };
             if let Some(ht) = &ht {
                 ht.invoke(op)
@@ -1243,6 +1246,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     .await?;
                     self.check_station_policy(environment)?;
                     self.station.native_associated = true;
+                    // core.c BSS_CHANGED_ASSOC: update_rate_tbl(sta, 0).
+                    self.install_station_rate_mask(
+                        super::super::rate_adaptive::STA_INIT,
+                        environment,
+                    )
+                    .await?;
                     if mode.is_wpa2() {
                         let candidate = self.station.candidate.as_ref().ok_or(Error::State)?;
                         let body = self
@@ -1397,6 +1406,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             let Some(frame) = step.packet else {
                 continue;
             };
+            // _rtl88ee_translate_rx_signal_stuff → rtl_process_phyinfo.
+            if let (Some(pwdb), Some(bssid)) = (frame.pwdb(), peer) {
+                if super::super::rate_adaptive::matches_bssid(frame.bytes(), bssid) {
+                    self.station.ra.sample(pwdb);
+                }
+            }
             if let Ok(candidate) = Candidate::receive(&frame, own, self.station.ht.is_some()) {
                 if self.station.phase == Phase::Passive {
                     self.cache_candidate(candidate, now);
@@ -1757,6 +1772,72 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             }
         }
         Ok(idle)
+    }
+    /// `rtl88ee_update_hal_rate_mask` for the bound AP at `level`, from
+    /// the association's legacy intersection (`supp_rates[0]`) and HT
+    /// TX MCS set (`ht_cap.mcs.rx_mask[0]`). SGI is never offered: the
+    /// LGI-only profile refuses an AP SGI20 join.
+    async fn install_station_rate_mask(
+        &mut self,
+        level: u8,
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        let (rates, _) = self
+            .station
+            .plan
+            .as_ref()
+            .ok_or(Error::State)?
+            .legacy_rates();
+        let mcs = self.station.ht_profile.map(|profile| profile.tx_mcs()[0]);
+        let payload = super::super::rate_adaptive::rate_mask(rates, mcs, level, false);
+        let base = self
+            .station
+            .calibration
+            .as_ref()
+            .ok_or(Error::State)?
+            .clone();
+        let ht = self.station.ht.clone();
+        let permission = self.permission.ok_or(Error::State)?;
+        super::super::ht::wait(
+            base,
+            ht,
+            permission,
+            environment,
+            self.install_rate_mask(payload, environment.admission().map(Arc::as_ref)),
+        )
+        .await?;
+        self.check_station_policy(environment)
+    }
+    /// `rtl88e_dm_watchdog` → `rtl88e_dm_refresh_rate_adaptive_mask`: every
+    /// `RTL_WATCHDOG_TIME`, outside firmware LPS, a linked station whose
+    /// smoothed PWDB crossed its hysteresis re-sends the mask at the new
+    /// level. Returns whether a mask was sent. Failure is terminal.
+    pub(crate) async fn refresh_station_rate_mask(
+        &mut self,
+        environment: &impl Environment,
+    ) -> Result<bool, Error> {
+        if !self.station_linked()
+            || self.leisure()
+            || !self.transmit_ready()
+            || self.rate_mask().is_none()
+            || !self.station.ra.due(environment.now_ms())
+        {
+            return Ok(false);
+        }
+        let Some(level) = self.station.ra.refresh() else {
+            return Ok(false);
+        };
+        let result = self.install_station_rate_mask(level, environment).await;
+        if result.is_err() {
+            self.abort_station();
+        }
+        result?;
+        self.station.ra.commit(level);
+        Ok(true)
+    }
+    /// Smoothed station PWDB (`dm.undec_sm_pwdb`) and RA level.
+    pub(crate) fn station_rate_state(&self) -> (i64, u8) {
+        (self.station.ra.smoothed(), self.station.ra.level())
     }
     /// Linux `rtl_lps_enter_core` link gate: associated, not
     /// `being_setkey` (RSNA port open, no handshake frame outstanding).

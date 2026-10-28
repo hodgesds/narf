@@ -457,8 +457,10 @@ retained EE submit path programs actual TXD5 rate0..11 with USE_RATE and
 DISDATAFB; management, association and EAPOL retain CCK1. Basic1Mbps remains
 required for those transmissions. Signed NEPC class envelopes already cover
 all four CCK and all eight OFDM rates; each selected rate keeps its checked
-factory/PG gain and current power/source admission. No MCS, rate fallback,
-retry adaptation or additional response rate is inferred.
+factory/PG gain and current power/source admission. The submit path is the
+highest rate (`rtl_get_tcb_desc` hw_rate); once the firmware owns an RA mask
+(below) ordinary DATA may fall back to lower rates of that same mask. No
+additional response rate is inferred.
 The exact retained signed calibration invocation encloses allocation,
 descriptor/body publication and doorbell, with fresh host policy inside it.
 
@@ -789,6 +791,78 @@ never restarts.
 Test: `smoke_rtl8188ee_native_card_disable_quiescence_reclaims_dma`
 (non-stopped refusal, busy TX buffer, busy RXDMA, reopened DMA gate,
 successful proof releases every region, unproven stop retains all).
+
+### RTL8188EE driver rate adaptation and DATA fallback (implemented)
+
+Linux v7.2 RTL8188EE runs `dm_type = DM_TYPE_BYDRIVER`, so
+`rtl88e_dm_init_rate_adaptive_mask` sets `useramask` and the driver owns
+the firmware RA mask. `rate_adaptive.rs` ports it:
+
+* RX PWDB (`rtl8188ee/trx.c::_rtl88ee_query_rxphystatus`): when RXD PHYST
+  carries the 28-byte EE PHY status, CCK frames (`RX_HAL_IS_CCK_RATE`,
+  rate 1–11 Mbps) map `cck_agc_rpt` LNA/VGA through the 8-row table with
+  BB `RFPGA0_XA_HSSIPARAMETER2` (0x824) BIT(9) `cck_highpwr`, +6 dB, the
+  CCK/OFDM gain offset (+6, the 4/14/26/34/42 bands) and the low-power
+  expansion; OFDM/HT frames use `((pwdb_all >> 1) & 0x7f) - 110`. Both go
+  through `stats.c::rtl_query_rxpwrpercentage`. `Mpdu::pwdb` carries it.
+* Smoothing (`stats.c::rtl_process_phyinfo` → `rtl_process_pwdb`): only
+  frames whose ToDS/FromDS-selected BSSID equals the bound AP and that are
+  not control frames (`_rtl88ee_translate_rx_signal_stuff`
+  `packet_matchbssid`; CRC/ICV/HW errors never reach the station) update
+  the zero-initialised `dm.undec_sm_pwdb` with `RX_SMOOTH_FACTOR` 20 and
+  the +1 on a rising sample.
+* Mask (`rtl8188ee/hw.c::rtl88ee_update_hal_rate_mask`, RF_1T1R, HT20 so
+  `curtxbw_40mhz = mac->bw_40 = 0`, station MACID 0): `supp_rates[0]`
+  (the association legacy intersection) `| rx_mask[0] << 12` (the HT TX
+  MCS set) masked per `wireless_mode` (`core.c::rtl_op_sta_add`: N_24G →
+  `RATR_INX_WIRELESS_NGB` 0 with 0x000f0000/0x000ff000/0x000ff005; G →
+  `GB` 4 with 0xf00/0xff0/0xff5; B (`supp_rates <= 0xf`) → `B` 6 with
+  0xd/0xf) and level. The 5-byte `H2C_88E_RA_MASK` (0x84, the entry after
+  `H2C_88E_AOAC_RSVDPAGE` 0x83 in `fw.h`) is `(bitmap & 0x0fffffff) |
+  ratr_index << 28` then `macid | SGI << 5 | 0x80`; SGI is never set (the
+  LGI-only profile refuses an SGI20 AP). The existing mailbox writer's
+  two-extension-byte form is admitted for (0x84, 5) only. After the box is
+  consumed, `_rtl88ee_set_bcn_ctrl_reg(BIT(3), 0)` sets REG_BCN_CTRL
+  (0x550) BIT(3) with readback.
+* Install: `core.c::rtl_op_bss_info_changed(BSS_CHANGED_ASSOC)` calls
+  `update_rate_tbl(sta, 0, true)`; `connect_station` installs the level-0
+  mask right after the JOIN completes, inside the same signed-calibration
+  (or HT grant) invocation and admission as the join mailbox.
+* Refresh (`rtl8188ee/dm.c::rtl88e_dm_refresh_rate_adaptive_mask`, from
+  `rtl88e_dm_watchdog` every `RTL_WATCHDOG_TIME` 2 s, skipped while
+  `fw_current_inpsmode`): the publisher worker's `Device::rate_adaptive`
+  step picks DM_RATR_STA_HIGH/MIDDLE/LOW from `undec_sm_pwdb` with the
+  `pre_ratr_state` thresholds (HIGH/INIT 50/20, MIDDLE 55/20, LOW 50/25) and
+  re-sends the mask only when the level changes, then commits
+  `pre_ratr_state`. A linked station outside LPS with a mask is required.
+* TXD (`rtl8188ee/trx.c::rtl88ee_tx_fill_desc` with `useramask`, and
+  `base.c::_rtl_txrate_selectmode`): ordinary DATA (`Kind::Data`) after the
+  mask carries DW1 RATE_ID = `ratr_index` (MACID 0) and DW4 DISDATAFB
+  clear; USE_RATE stays set because 88EE forces `use_driver_rate`, so the
+  highest negotiated rate is the initial rate and the firmware falls back
+  within the mask (`set_tx_desc_disable_fb(disable_ratefallback = 0)`).
+  Management, EAPOL and every frame before the mask keep RATE_ID 0 and
+  DISDATAFB (`rtl_get_tcb_desc` rix 0 / `disable_ratefallback = 1`); only
+  their RATE_ID differs from Linux's `RATR_INX_WIRELESS_MC`, which the
+  hardware ignores with fallback disabled. Every fallback rate is one of
+  the CCK/OFDM/MCS0–7 rates whose conducted peaks the signed NEPC/NEHT
+  envelopes already bound.
+* Teardown and failure: `stop_packets` (disconnect, abort) withdraws the
+  mask, so a later owner starts with fallback disabled; a mailbox that is
+  never consumed or radio-off is terminal for the owner and never enables
+  fallback; a failed refresh aborts the station.
+
+Tests: `smoke_rtl8188ee_rx_pwdb_and_smoothing_match_linux` and
+`smoke_rtl8188ee_rate_mask_levels_match_linux` (hand-computed Linux CCK/
+OFDM PWDB values, smoothing, BSSID selection, every mode/level mask,
+hysteresis and the 2 s period), `smoke_rtl8188ee_native_rate_mask_enables_data_fallback`
+(owner gates, exact H2C and BCN_CTRL, DATA/management/special TXD before
+and after the mask, OFDM/CCK RX PWDB through the real RX ring, terminal
+stop withdraws the mask, stuck mailbox and radio-off) and
+`smoke_rtl8188ee_native_device_rate_mask_follows_rx_pwdb` (composed
+Device: level-0 mask at association, fallback DATA descriptor, strong and
+weak beacon PWDB moving HIGH → MIDDLE → LOW, no re-send at an unchanged
+level, no refresh after disassociate).
 
 ## 4. Invariants
 

@@ -72,6 +72,7 @@ pub mod power;
 pub mod prepare;
 mod prepare_native;
 pub mod radio;
+mod rate_adaptive;
 pub mod regs;
 pub mod rf;
 pub mod rx;

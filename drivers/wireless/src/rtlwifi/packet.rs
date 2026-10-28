@@ -93,6 +93,9 @@ pub(super) struct State<M: Memory> {
     interrupts: bool,
     /// Firmware leisure power save (fw_current_inpsmode) is active.
     leisure: bool,
+    /// `sta_entry->ratr_index` of the installed `H2C_88E_RA_MASK`: DATA
+    /// rate fallback is only enabled while the firmware owns this mask.
+    rate_mask: Option<u8>,
 }
 impl<M: Memory> State<M> {
     pub(super) fn new() -> Self {
@@ -108,6 +111,7 @@ impl<M: Memory> State<M> {
             ht: false,
             interrupts: false,
             leisure: false,
+            rate_mask: None,
         }
     }
     pub(super) fn retain(&mut self) {
@@ -138,6 +142,9 @@ pub struct Mpdu {
     ht: bool,
     /// Native RXD DW1 PAGGR/FAGGR: this MPDU arrived inside an A-MPDU.
     aggregated: bool,
+    /// `_rtl88ee_query_rxphystatus` `rx_pwdb_all` when RXD PHYST carried
+    /// the 28-byte EE PHY status.
+    pwdb: Option<u8>,
 }
 /// Consuming a rejected packet/report is progress, never a receive-idle
 /// proof. Station output waits for a genuine OWN-owned next descriptor.
@@ -156,6 +163,9 @@ impl Mpdu {
         self.ht
     }
     /// Only the station's recipient BA owner may admit such an MPDU.
+    pub(super) fn pwdb(&self) -> Option<u8> {
+        self.pwdb
+    }
     pub(super) fn aggregated(&self) -> bool {
         self.aggregated
     }
@@ -404,6 +414,42 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         {
             return Err(Error::State);
         }
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    /// `sta_entry->ratr_index` of the installed RA mask, if any.
+    pub(crate) fn rate_mask(&self) -> Option<u8> {
+        self.packet.rate_mask
+    }
+    /// Linux `rtl88ee_update_hal_rate_mask`: `H2C_88E_RA_MASK` (0x84) with
+    /// the 5-byte mask, then `_rtl88ee_set_bcn_ctrl_reg(BIT(3), 0)`. Only a
+    /// running, awake owner (the watchdog skips the refresh in LPS) may
+    /// hand rate selection to the firmware; a mailbox failure is terminal.
+    pub(crate) async fn install_rate_mask(
+        &mut self,
+        payload: [u8; 5],
+        admission: Option<&super::station::Admission>,
+    ) -> Result<(), Error> {
+        if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        super::super::station_control::radio_on(&self.io)?;
+        self.packet
+            .mailbox
+            .send_admitted(
+                &self.io,
+                super::super::rate_adaptive::H2C_RA_MASK,
+                &payload,
+                admission,
+            )
+            .await?;
+        let beacon = self.io.read8(0x550)?;
+        self.io.write8(0x550, beacon | 8)?;
+        if self.io.read8(0x550)? != beacon | 8 {
+            return Err(Error::Readback);
+        }
+        self.packet.rate_mask = Some(payload[3] >> 4);
         self.phase = Phase::Running;
         Ok(())
     }
@@ -660,17 +706,22 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// One outstanding native frame is retained across all active queues.
     /// A free descriptor alone cannot substitute a different pending payload.
     pub(crate) fn submit(&mut self, frame: &[u8], rate: u8) -> Result<u64, Error> {
-        self.submit_aggregate(frame, rate, None)
+        self.submit_aggregate(frame, rate, None, false)
     }
     /// `submit` with `rtl8188ee_tx_fill_desc` aggregation fields for QoS
     /// DATA to an HT station: `aggregate = (ampdu_density, ampdu)` sets
     /// TXD DW2 AMPDU_DENSITY and, for an `IEEE80211_TX_CTL_AMPDU` frame,
-    /// DW2 AGG_EN + DW6 MAX_AGG_NUM 0x14.
+    /// DW2 AGG_EN + DW6 MAX_AGG_NUM 0x14. `adaptive` marks ordinary DATA
+    /// (Linux `rtl_get_tcb_desc` with a non-zero rix): once the firmware
+    /// owns an RA mask, TXD DW1 RATE_ID = `ratr_index` and DW4 DISDATAFB
+    /// is clear (`rtl88ee_tx_fill_desc`), so the firmware falls back from
+    /// the highest rate (USE_RATE stays set: 88EE forces use_driver_rate).
     pub(crate) fn submit_aggregate(
         &mut self,
         frame: &[u8],
         rate: u8,
         aggregate: Option<(u8, bool)>,
+        adaptive: bool,
     ) -> Result<u64, Error> {
         if self.phase != Phase::Running || self.packet.pending.is_some() {
             return Err(Error::State);
@@ -719,6 +770,14 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         prefix[1] = u32::from(selector) << 8; // MACID0, rateID0, security0.
         prefix[3] = u32::from(u16::from_le_bytes([frame[22], frame[23]]) >> 4) << 16;
         prefix[4] = (1 << 8) | (1 << 10); // forced checked rate, no fallback/BW/SGI/AGG.
+        if let Some(index) = self
+            .packet
+            .rate_mask
+            .filter(|_| adaptive && frame[0] & 0x0c == 8)
+        {
+            prefix[1] |= u32::from(index) << 16;
+            prefix[4] &= !(1 << 10);
+        }
         if frame[0] == 0x88 {
             prefix[4] |= 1 << 6;
         } // EE TXD.QOS; host SSN retained.
@@ -900,6 +959,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 buffer.sync();
                 // EE's PHY info is its own28-byte structure inside drvinfo,
                 // not rtw88 page1. RXD owns rate/BW; no channel field exists.
+                let mut pwdb = None;
                 if status & (1 << 26) != 0 {
                     let info = (((status >> 16) & 15) * 8) as usize;
                     if info < 28 {
@@ -918,6 +978,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         ring.sync();
                         return Ok((true, None));
                     }
+                    // RX_HAL_IS_CCK_RATE(rxmcs): DESC92C_RATE1M..11M.
+                    let cck = !ht && report & 63 < 4;
+                    // trx.c reads RFPGA0_XA_HSSIPARAMETER2 BIT(9) with RF on.
+                    let high = cck && self.io.read32(0x824)? & (1 << 9) != 0;
+                    pwdb = Some(super::super::rate_adaptive::rx_pwdb(&phy, cck, high));
                 }
                 let mut bytes = Vec::new();
                 bytes
@@ -937,6 +1002,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             channel,
                             ht,
                             aggregated,
+                            pwdb,
                         });
                     }
                 } else if bytes.len() >= 24
@@ -951,6 +1017,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         channel,
                         ht,
                         aggregated,
+                        pwdb,
                     });
                 }
             }
@@ -982,6 +1049,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.phase = Phase::Stopping;
         self.packet.interrupts = false;
         self.packet.leisure = false;
+        self.packet.rate_mask = None;
         let mut result = Ok(());
         for operation in [
             self.io.write32(0xb0, 0).map_err(Error::from),

@@ -1221,3 +1221,122 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/device",
     smoke_rtl8188ee_native_device_cancelled_disconnect_wait_stops_owner
 );
+
+/// Linux `rtl88e_dm_watchdog` RA: the association installs the level-0
+/// mask (`update_rate_tbl(sta, 0)`), BSSID-matching RX PHY status feeds
+/// `undec_sm_pwdb`, and each 2 s refresh re-sends the mask only when the
+/// hysteresis level changes. DATA after the mask carries fallback.
+pub(crate) fn smoke_rtl8188ee_native_device_rate_mask_follows_rx_pwdb() -> TestResult {
+    let h = Harness::new(false);
+    {
+        // All 12 legacy rates: WIRELESS_MODE_G (supp_rates > 0xf).
+        let mut p = h.peer.lock();
+        let ap = core::mem::replace(&mut p.ap, Peer::new(false).ap);
+        p.ap = ap.with_legacy_rates(&LEGACY_RATES).unwrap();
+    }
+    h.join();
+    h.pump();
+    let masks = |h: &Harness| -> Vec<Vec<u8>> {
+        h.packet
+            .model
+            .lock()
+            .commands
+            .iter()
+            .filter(|(id, _)| *id == 0x84)
+            .map(|(_, payload)| payload.clone())
+            .collect()
+    };
+    let state = |h: &Harness| {
+        h.device.prepared.try_lock().and_then(|owner| {
+            owner
+                .as_ref()
+                .map(|o| (o.station_rate_state(), o.rate_mask()))
+        })
+    };
+    let initial = masks(&h);
+    // A legacy (non-HT) AP: WIRELESS_MODE_G, ratr_index 4, level 0 &0xff5.
+    if initial != [vec![0xf5, 0x0f, 0x00, 0x40, 0x80]] || state(&h).map(|s| s.1) != Some(Some(4)) {
+        return TestResult::Fail("association did not install the level-0 RA mask");
+    }
+    // Ordinary DATA after the mask: RATE_ID 4 and DISDATAFB clear.
+    let downlink = {
+        let plan = h.peer.lock().plan;
+        udp_ipv4(
+            PEER,
+            plan.station,
+            plan.lease_ip,
+            plan.server_ip,
+            49152,
+            7,
+            b"ee-ra-data",
+        )
+    };
+    let sent = h.packet.model.lock().descriptors.len();
+    if narf_net::iface::send_on(h.device.name(), &downlink).is_err() {
+        return TestResult::Fail("EE refused ordinary DATA");
+    }
+    h.pump();
+    let data = {
+        let model = h.packet.model.lock();
+        (sent..model.descriptors.len())
+            .find(|&n| model.observed[n][0] & 0x0c == 8 && model.observed[n].len() > 32)
+            .map(|n| model.descriptors[n].clone())
+    };
+    let Some(data) = data else {
+        return TestResult::Fail("EE ordinary DATA never reached a descriptor");
+    };
+    if word(&data, 16) & (1 << 10) != 0 || (word(&data, 4) >> 16) & 15 != 4 {
+        return TestResult::Fail("DATA TXD kept DISDATAFB after the RA mask");
+    }
+    // Strong beacons: OFDM pwdb_all 0xa0 -> -30 dBm -> 70%.
+    let period = |h: &Harness, pwdb_all: u8, count: usize| {
+        let mut phy = [0u8; 28];
+        phy[4] = pwdb_all;
+        for _ in 0..count {
+            let beacon = { h.peer.lock().ap.beacon() };
+            h.packet.emit_native(&beacon, 11, 0, Some(&phy)).unwrap();
+            h.device.drain();
+        }
+        h.env.now.fetch_add(2_000, Ordering::AcqRel);
+        complete(h.device.rate_adaptive());
+    };
+    period(&h, 0xa0, 60);
+    let high = masks(&h);
+    if high.len() != 2
+        || high[1] != [0, initial[0][1] & 0x0f, 0, 0x40, 0x80]
+        || state(&h).map(|s| s.0 .1) != Some(1)
+        || state(&h).map(|s| s.0 .0 > 50) != Some(true)
+    {
+        return TestResult::Fail("strong RX PWDB did not move the RA mask to HIGH");
+    }
+    // Same level: no new H2C; within the 2 s period: no refresh at all.
+    period(&h, 0xa0, 4);
+    complete(h.device.rate_adaptive());
+    if masks(&h).len() != 2 {
+        return TestResult::Fail("unchanged RA level re-sent the mask");
+    }
+    // Weak beacons: 0x28 -> -90 dBm -> 10%. HIGH -> MIDDLE -> LOW.
+    let mut levels = Vec::new();
+    for _ in 0..6 {
+        period(&h, 0x28, 30);
+        levels.push(state(&h).map(|s| s.0 .1).unwrap_or(0));
+    }
+    // LOW and level 0 share the G default branch (& 0xff5).
+    if levels.last() != Some(&3) || masks(&h).len() < 3 || masks(&h).last() != initial.first() {
+        return TestResult::Fail("weak RX PWDB did not reach the LOW RA mask");
+    }
+    // Teardown: disassociate withdraws the mask with the stopped owner.
+    if complete(h.device.disassociate()).is_err() || !h.closed() {
+        return TestResult::Fail("EE RA disassociate failed");
+    }
+    let count = masks(&h).len();
+    complete(h.device.rate_adaptive());
+    if masks(&h).len() != count || state(&h).map(|s| s.1).flatten().is_some() {
+        return TestResult::Fail("RA refresh ran on a closed station");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/device",
+    smoke_rtl8188ee_native_device_rate_mask_follows_rx_pwdb
+);

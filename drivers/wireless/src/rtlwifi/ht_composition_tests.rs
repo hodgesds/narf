@@ -98,8 +98,10 @@ fn composition(protected: bool) -> Result<(), &'static str> {
         return Err("HT actual software-CCMP uplink mismatch");
     }
     let d = h.packet.model.lock().descriptors.last().unwrap().clone();
+    // RA mask (NGB, RATE_ID 0) installed: USE_RATE kept, DISDATAFB clear.
     if word(&d, 20) & 127 != 19
-        || word(&d, 16) & ((1 << 6) | (1 << 8) | (1 << 10)) != 0x540
+        || word(&d, 16) & ((1 << 6) | (1 << 8) | (1 << 10)) != 0x140
+        || (word(&d, 4) >> 16) & 15 != 0
         || word(&d, 16) & ((1 << 25) | (3 << 20)) != 0
         || word(&d, 8) & (1 << 12) != 0
     {

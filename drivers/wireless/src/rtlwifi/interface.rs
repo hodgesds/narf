@@ -483,6 +483,19 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             let _ = owner.enter_leisure().await;
         }
     }
+    /// `rtl88e_dm_watchdog` RA step: refresh the firmware rate mask from
+    /// the smoothed RX PWDB. A failed H2C aborts the station (the next
+    /// service pass reports it like every other terminal hardware error).
+    pub(super) async fn rate_adaptive(&self) {
+        let mut storage = self.prepared.lock().await;
+        let Some(owner) = storage.as_mut() else {
+            return;
+        };
+        if self.admission.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let _ = owner.refresh_station_rate_mask(&self.environment).await;
+    }
     /// Bind the running owner to its vector on first service, then run one
     /// Linux `_rtl_pci_interrupt` recognition pass per wake. A failed bind
     /// withdraws the vector and leaves the masks clear (polling fallback).
@@ -1039,6 +1052,7 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
             let seen = signal.as_ref().map(|s| s.count());
             device.drain();
             device.power_save(FW_LPS.load(Ordering::Acquire)).await;
+            device.rate_adaptive().await;
             match (signal, seen) {
                 (Some(signal), Some(seen)) => {
                     // Station deadlines are millisecond timers; a slow

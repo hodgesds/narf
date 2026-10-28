@@ -61,7 +61,12 @@ impl Mailbox {
         payload: &[u8],
         admission: Option<&super::prepare::station::Admission>,
     ) -> Result<(), Error> {
-        if self.failed || !matches!((id, payload.len()), (0, 5) | (1, 1) | (3, 2) | (0x20, 5)) {
+        if self.failed
+            || !matches!(
+                (id, payload.len()),
+                (0, 5) | (1, 1) | (3, 2) | (0x20, 5) | (0x84, 5)
+            )
+        {
             return Err(Error::State);
         }
         self.failed = true;
