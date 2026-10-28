@@ -1573,8 +1573,8 @@ impl<B: Backend> Session<B> {
                 })
                 .await?;
             match step {
-                Ok(next) => frame = next,
-                Err(request) => {
+                crate::mt7921::association::SaeOutcome::Transmit(next) => frame = next,
+                crate::mt7921::association::SaeOutcome::Associate(request) => {
                     let pmk = Zeroizing::new(*session.pmk().ok_or(Error::MalformedEvent)?);
                     return Ok((request, pmk));
                 }

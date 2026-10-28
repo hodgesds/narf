@@ -127,6 +127,14 @@ impl Security {
         }
     }
 }
+/// One accepted SAE Authentication receipt.
+#[derive(Debug)]
+pub enum SaeOutcome {
+    /// Transmit a Commit retry or our Confirm.
+    Transmit(Vec<u8>),
+    /// SAE accepted: transmit this (extended) association request.
+    Associate(Vec<u8>),
+}
 /// Retains MT76 record inputs; all IEEE frame preparation/transitions are
 /// delegated to the common plan, which stores no firmware/hardware state.
 #[derive(Debug)]
@@ -414,31 +422,31 @@ impl JoinPlan {
     ) -> Result<&[u8], Error> {
         self.common.start_sae_authentication(session)
     }
-    /// One SAE Authentication receipt. `Some(Ok(frame))` transmits a Commit
-    /// retry or our Confirm; `Some(Err(request))` is the accepted SAE's
+    /// One SAE Authentication receipt. `SaeOutcome::Transmit` sends a Commit
+    /// retry or our Confirm; `SaeOutcome::Associate` is the accepted SAE's
     /// association request, extended exactly like the open/PSK request
     /// (WMM Information, untyped HT Capabilities).
     pub fn sae_authentication_response(
         &mut self,
         bytes: &[u8],
         session: &mut narf_wireless::sae::SaeSession,
-    ) -> Result<Option<Result<Vec<u8>, Vec<u8>>>, Error> {
+    ) -> Result<Option<SaeOutcome>, Error> {
         use narf_wireless::association::SaeStep;
         let typed_phy = self.common.offered_phy().is_some();
         let request = match self.common.sae_authentication_response(bytes, session)? {
             SaeStep::Ignored => return Ok(None),
-            SaeStep::Transmit(frame) => return Ok(Some(Ok(frame.to_vec()))),
+            SaeStep::Transmit(frame) => return Ok(Some(SaeOutcome::Transmit(frame.to_vec()))),
             SaeStep::Associate(request) => request.to_vec(),
         };
         if self.wmm.is_none() {
-            return Ok(Some(Err(request)));
+            return Ok(Some(SaeOutcome::Associate(request)));
         }
         let mut out = request;
         if let Some(profile) = self.ht20.filter(|_| !typed_phy) {
             out.extend_from_slice(&profile.request_ie());
         }
         out.extend_from_slice(&wmm::INFORMATION);
-        Ok(Some(Err(out)))
+        Ok(Some(SaeOutcome::Associate(out)))
     }
     pub fn association_response(&mut self, bytes: &[u8]) -> Result<Option<u16>, Error> {
         let Some(aid) = self.common.association_response(bytes)? else {
