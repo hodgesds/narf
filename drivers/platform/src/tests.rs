@@ -31,6 +31,91 @@ fn smoke_smbus_class_match_registered() -> TestResult {
 }
 kernel_test_in!("drivers/platform/smbus", smoke_smbus_class_match_registered);
 
+fn smoke_smbus_probe_declines_wrong_subclass() -> TestResult {
+    // #842: the smbus entry is a base-class match (0x0C, Serial Bus
+    // Controller), so `probe` is offered every 0x0C function — USB
+    // (subclass 0x03), FireWire (0x00), IPMI (0x07), … A wrong
+    // subclass is an identity mismatch, not a broken device: the
+    // ProbeError contract (bus spec §9.3) requires the
+    // `NotForThisDriver` decline so `probe_all` falls through to
+    // the next candidate. Pre-fix this returned `BadDevice`, a
+    // terminal error that stops the walk, so this smoke fails on
+    // the unfixed tree. The decline precedes any device access, so
+    // a synthetic device suffices.
+    use crate::smbus;
+    use narf_bus::{BusAddr, BusDevice, BusDeviceCap, BusKind, DeviceId, PcieAddr, ProbeError};
+    use narf_capabilities::Cap;
+    use narf_memory::PhysAddr;
+    let addr = PcieAddr::new(0, 0, 0x1F, 3);
+    let dev = BusDevice {
+        addr: BusAddr::Pcie(addr),
+        id: DeviceId {
+            vendor: smbus::SMBUS_VENDOR,
+            device: smbus::SMBUS_ICH9_DEV,
+            // The ICH9 SMBus function's slot and IDs, one subclass
+            // byte different: class 0x0C, subclass 0x03 (USB).
+            class: 0x0C0300,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: BusKind::Pcie {
+            addr,
+            cfg_phys: PhysAddr::new(0),
+        },
+    };
+    let cap = Cap::<BusDeviceCap, narf_capabilities::Write>::bootstrap();
+    match smbus::probe(dev, cap) {
+        Err(ProbeError::NotForThisDriver) => TestResult::Pass,
+        Err(ProbeError::BadDevice) => {
+            TestResult::Fail("smbus: wrong subclass declined as BadDevice, not NotForThisDriver")
+        }
+        Err(_) => TestResult::Fail("smbus: wrong subclass rejected with the wrong error"),
+        Ok(_) => TestResult::Fail("smbus: probe must not claim a wrong-subclass device"),
+    }
+}
+kernel_test_in!(
+    "drivers/platform/smbus",
+    smoke_smbus_probe_declines_wrong_subclass
+);
+
+fn smoke_smbus_probe_accepts_smbus_device() -> TestResult {
+    // Positive half of #842: a device whose subclass IS 0x05 must
+    // not be declined — the probe proceeds to bring-up and binds.
+    // Runs against the machine's real SMBus function (on QEMU q35
+    // the ICH9 SMBus, 8086:2930 at 00:1f.3 — the function the boot
+    // walk binds); Skips where no 0x0C/0x05 function is enumerated.
+    use crate::smbus;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{devices, BusDeviceCap, ProbeError};
+    use narf_capabilities::Cap;
+    // SAFETY: the kernel-test harness runs post-boot, so the
+    // allocator is online and the bootloader handoff is complete;
+    // `ECAM_DEFAULT_BASE` is QEMU q35's known-good ECAM window and
+    // the enumerator only reads config space (rejecting all-1s),
+    // so re-running init here is sound. (Same pattern as the VMD
+    // enumeration smoke in drivers/storage.)
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let Some(dev) = devs.iter().find(|d| {
+        ((d.id.class >> 16) & 0xFF) as u8 == smbus::SMBUS_PCI_CLASS
+            && ((d.id.class >> 8) & 0xFF) as u8 == smbus::SMBUS_PCI_SUBCLASS
+    }) else {
+        return TestResult::Skip("no SMBus controller enumerated on this machine");
+    };
+    let cap = Cap::<BusDeviceCap, narf_capabilities::Write>::bootstrap();
+    match smbus::probe(*dev, cap) {
+        Ok(()) => TestResult::Pass,
+        Err(ProbeError::NotForThisDriver) => {
+            TestResult::Fail("smbus: probe declined a real SMBus device")
+        }
+        Err(_) => TestResult::Fail("smbus: probe of a real SMBus device failed"),
+    }
+}
+kernel_test_in!(
+    "drivers/platform/smbus",
+    smoke_smbus_probe_accepts_smbus_device
+);
+
 fn smoke_asus_wmi_fan_curve_interpolate() -> TestResult {
     let curve = crate::asus_wmi::FanCurve::new((40, 20), (60, 40), (75, 70), (90, 100));
     if curve.interpolate(30) != 20 {
