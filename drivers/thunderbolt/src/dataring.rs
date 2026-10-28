@@ -180,18 +180,6 @@ impl DataRingPair {
         self.authority = cap;
     }
 
-    pub(crate) fn tx_hop(&self) -> u16 {
-        self.tx_hop
-    }
-
-    pub(crate) fn rx_hop(&self) -> u16 {
-        self.rx_hop
-    }
-
-    pub(crate) fn running(&self) -> bool {
-        self.running
-    }
-
     fn tx_ring(&self) -> u64 {
         TX_RING_BASE + self.tx_hop as u64 * 16
     }
@@ -553,7 +541,7 @@ mod tests {
         }
     }
 
-    fn pair(fake: &mut FakeNhi, tx_hop: u16, rx_hop: u16) -> Option<DataRingPair> {
+    fn make_pair(fake: &mut FakeNhi, tx_hop: u16, rx_hop: u16) -> Option<DataRingPair> {
         // SAFETY: the model owns the backing array; all DMA
         // buffers are real coherent allocations only this test
         // and the pair touch.
@@ -574,14 +562,14 @@ mod tests {
 
     fn usb4_data_ring_start_programs_frame_mode() -> TestResult {
         let mut fake = FakeNhi::new();
-        let Some(mut pair) = pair(&mut fake, 8, 9) else {
+        let Some(mut pair) = make_pair(&mut fake, 8, 9) else {
             return TestResult::Fail("pair allocation");
         };
         // Hop validation: reserved and out-of-range HopIDs are
         // refused like tb_ring_alloc refuses them.
-        if pair(&mut fake, 0, 9).is_some()
-            || pair(&mut fake, 8, 32).is_some()
-            || pair(&mut fake, 2, 9).is_some()
+        if make_pair(&mut fake, 0, 9).is_some()
+            || make_pair(&mut fake, 8, 32).is_some()
+            || make_pair(&mut fake, 2, 9).is_some()
         {
             return TestResult::Fail("reserved/out-of-range HopID accepted");
         }
@@ -646,7 +634,7 @@ mod tests {
 
     fn usb4_data_ring_tx_byte_for_byte_and_refusals() -> TestResult {
         let mut fake = FakeNhi::new();
-        let Some(mut pair) = pair(&mut fake, 8, 8) else {
+        let Some(mut pair) = make_pair(&mut fake, 8, 8) else {
             return TestResult::Fail("pair allocation");
         };
         // Refusal before start: counted, nothing posted.
@@ -687,7 +675,7 @@ mod tests {
         for _ in 1..RING_SIZE - 1 {
             pair.submit(3, &[9u8; 16]);
         }
-        if pair.tx_frames != RING_SIZE - 1 as u64 {
+        if pair.tx_frames != (RING_SIZE - 1) as u64 {
             return TestResult::Fail("ring did not fill to capacity");
         }
         pair.submit(3, &[9u8; 16]);
@@ -719,7 +707,7 @@ mod tests {
 
     fn usb4_data_ring_rx_completion_harvest() -> TestResult {
         let mut fake = FakeNhi::new();
-        let Some(mut pair) = pair(&mut fake, 8, 8) else {
+        let Some(mut pair) = make_pair(&mut fake, 8, 8) else {
             return TestResult::Fail("pair allocation");
         };
         pair.start();
@@ -786,10 +774,10 @@ mod tests {
 
     fn usb4_data_ring_pairs_are_independent() -> TestResult {
         let mut fake = FakeNhi::new();
-        let Some(mut a) = pair(&mut fake, 8, 8) else {
+        let Some(mut a) = make_pair(&mut fake, 8, 8) else {
             return TestResult::Fail("pair A allocation");
         };
-        let Some(mut b) = pair(&mut fake, 9, 9) else {
+        let Some(mut b) = make_pair(&mut fake, 9, 9) else {
             return TestResult::Fail("pair B allocation");
         };
         a.start();

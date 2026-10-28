@@ -1276,7 +1276,24 @@ pub(crate) struct Engine {
     /// taken out of their netdevs before the peer state drops so
     /// the channel can release their in-router paths (the rings
     /// stop when the transport drops at the end of the release).
-    retired: Vec<(u64, Box<dyn crate::tbnet::DataLink>)>,
+    retired: Vec<RetiredLink>,
+}
+
+/// A data transport extracted from a removed peer's netdev,
+/// awaiting its channel release in the next service pass. The
+/// transport itself is opaque (a trait object), hence the manual
+/// `Debug`.
+struct RetiredLink {
+    route: u64,
+    link: Box<dyn crate::tbnet::DataLink>,
+}
+
+impl core::fmt::Debug for RetiredLink {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RetiredLink")
+            .field("route", &self.route)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Engine {
@@ -1361,8 +1378,8 @@ impl Engine {
     /// the NHI rings behind it are live. Manually bound
     /// transports (the fixtures') are not managed here.
     async fn service_data_links(&mut self, ch: &mut impl XdChannel, domain: &Domain) {
-        for (route, link) in core::mem::take(&mut self.retired) {
-            ch.release_data_link(route, link).await;
+        for retired in core::mem::take(&mut self.retired) {
+            ch.release_data_link(retired.route, retired.link).await;
         }
         for peer in &mut self.peers {
             if peer.data_auto && !peer.connected() {
@@ -1418,7 +1435,10 @@ impl Engine {
                 kept.push(peer);
             } else if let Some(net) = &mut peer.net {
                 if let Some(link) = net.unbind() {
-                    self.retired.push((peer.route, link));
+                    self.retired.push(RetiredLink {
+                        route: peer.route,
+                        link,
+                    });
                 }
             }
         }
