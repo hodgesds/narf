@@ -51,8 +51,8 @@ pub struct ReservedRegion {
     pub reusable: bool,
 }
 
-mod tests;
 pub mod pci;
+mod tests;
 pub use pci::{for_pci_function, memory_region_phandle, reserved_memory_region};
 
 fn be_u32(b: &[u8], off: usize) -> Option<u32> {

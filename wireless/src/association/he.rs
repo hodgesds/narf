@@ -438,13 +438,18 @@ impl HeNegotiation {
             && self.peer.mac[0] & MAC0_TWT_RES != 0
     }
     fn flags(&self) -> u8 {
-        u8::from(self.tx_ldpc()) * FLAG_LDPC
-            | u8::from(self.tx_stbc()) * FLAG_STBC
-            | u8::from(self.su_beamformee()) * FLAG_SU_BFEE
-            | u8::from(self.su_beamformer()) * FLAG_SU_BFER
-            | u8::from(self.mu_beamformee()) * FLAG_MU_BFEE
-            | u8::from(self.htc_he()) * FLAG_HTC
-            | u8::from(self.twt_requester()) * FLAG_TWT
+        [
+            (self.tx_ldpc(), FLAG_LDPC),
+            (self.tx_stbc(), FLAG_STBC),
+            (self.su_beamformee(), FLAG_SU_BFEE),
+            (self.su_beamformer(), FLAG_SU_BFER),
+            (self.mu_beamformee(), FLAG_MU_BFEE),
+            (self.htc_he(), FLAG_HTC),
+            (self.twt_requester(), FLAG_TWT),
+        ]
+        .iter()
+        .filter(|(on, _)| *on)
+        .fold(0, |flags, (_, flag)| flags | flag)
     }
     /// Bound a response by the original offer: no wider HE width, no TX map
     /// entry or directional feature the scan offer did not already allow.

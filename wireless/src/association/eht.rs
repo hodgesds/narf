@@ -354,8 +354,8 @@ impl EhtNegotiation {
         for (new, old) in self.tx.iter_mut().zip(old.tx) {
             *new = (*new).min(old);
         }
-        self.allowed =
-            u8::from(old.su_beamformee()) * FLAG_BFEE | u8::from(old.su_beamformer()) * FLAG_BFER;
+        self.allowed = (u8::from(old.su_beamformee()) * FLAG_BFEE)
+            | (u8::from(old.su_beamformer()) * FLAG_BFER);
         if self.tx[0] == 0 || !local_covers(&self.local, old.operation.basic) {
             return Err(Error::UnsupportedRates);
         }
