@@ -1,4 +1,5 @@
 use super::super::super::{gen2_profile, runtime, rx_rfh};
+use super::super::phy::Span;
 use super::*;
 use alloc::vec;
 use core::{
@@ -291,6 +292,9 @@ kernel_test_in!(
 /// Linux v7.2 `mvm/phy-ctxt.c::iwl_mvm_get_ctrl_pos`: a 40MHz context
 /// carries IWL_PHY_CHANNEL_MODE40 and control position 0 (control below the
 /// center) or IWL_PHY_CTRL_POS_ABOVE (4) in both channel-info layouts.
+fn span(center: u8) -> Span {
+    Span { center, width: 1 }
+}
 fn smoke_iwl_mvm_ht40_phy_width_and_control_position() -> TestResult {
     let mut raw = vec![0; 28 + 110 * 4];
     raw[12..16].copy_from_slice(&3u32.to_le_bytes());
@@ -301,21 +305,41 @@ fn smoke_iwl_mvm_ht40_phy_width_and_control_position() -> TestResult {
     }
     let nvm = Nvm::parse(4, &raw).unwrap();
     let mut context = ChannelContext::new(&api());
-    let above = context.command(1, 1, Some(5), &nvm).unwrap();
-    let below = context.command(1, 9, Some(5), &nvm).unwrap();
+    let above = context.command(1, 1, Some(span(3)), &nvm).unwrap();
+    let below = context.command(1, 9, Some(span(7)), &nvm).unwrap();
     if above[16..24] != [1, 0, 0, 0, 1, 1, 0, 0] || below[16..24] != [9, 0, 0, 0, 1, 1, 4, 0] {
         return TestResult::Fail("MVM ultra-channel HT40 width/control position");
     }
     context.ultra_channels = false;
-    let above = context.command(3, 1, Some(5), &nvm).unwrap();
-    let below = context.command(1, 9, Some(5), &nvm).unwrap();
+    let above = context.command(3, 1, Some(span(3)), &nvm).unwrap();
+    let below = context.command(1, 9, Some(span(7)), &nvm).unwrap();
     if above[16..20] != [1, 1, 1, 0] || below[16..20] != [1, 9, 1, 4] {
         return TestResult::Fail("MVM channel-v1 HT40 width/control position");
     }
-    // The secondary must be a +-4 neighbour the NVM describes.
-    if context.command(1, 1, Some(9), &nvm).is_ok()
-        || context.command(1, 1, Some(1), &nvm).is_ok()
-        || context.command(1, 13, Some(17), &nvm).is_ok()
+    // Linux v7.2 iwl_mvm_get_ctrl_pos for each 80MHz primary of center 42:
+    // 1 (36), 0 (40), 4 (44), 5 (48), with IWL_PHY_CHANNEL_MODE80.
+    let vht = Span {
+        center: 42,
+        width: 2,
+    };
+    for (primary, position) in [(36, 1), (40, 0), (44, 4), (48, 5)] {
+        if vht.control_position(primary) != position {
+            return TestResult::Fail("MVM VHT80 control position differs from Linux");
+        }
+    }
+    let upper = Span {
+        center: 155,
+        width: 2,
+    };
+    if upper.channels() != Some(vec![149, 153, 157, 161])
+        || context.command(1, 36, Some(vht), &nvm).is_ok()
+    {
+        return TestResult::Fail("MVM VHT80 span channels/NVM description");
+    }
+    // The span must contain the control channel and lie in the NVM.
+    if context.command(1, 1, Some(span(7)), &nvm).is_ok()
+        || context.command(1, 1, Some(span(1)), &nvm).is_ok()
+        || context.command(1, 13, Some(span(15)), &nvm).is_ok()
     {
         return TestResult::Fail("MVM HT40 PHY accepted a foreign secondary channel");
     }

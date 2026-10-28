@@ -4,7 +4,7 @@ use super::super::boot_context::{put16, put32};
 use super::power::{feature, Emission};
 use alloc::{collections::VecDeque, vec::Vec};
 use narf_wireless::association::{
-    phy::{LocalHt, LocalPhy},
+    phy::{LocalHt, LocalPhy, LocalVht},
     Bss, JoinPlan, SecurityMode,
 };
 use narf_wireless::wmm::Parameters;
@@ -26,12 +26,64 @@ pub(super) struct Context {
     pub secondary: Option<u8>,
     /// Primary channel of the selected offer.
     pub primary: u8,
+    /// Center channel of the observed AP's 80MHz VHT operation, when `VHT`
+    /// is available for this offer.
+    pub vht_center: Option<u8>,
+}
+/// An occupied 40MHz (`width` 1) or 80MHz (`width` 2) channel, by center
+/// channel number; the width code is `IWL_PHY_CHANNEL_MODE40/80`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::iwlwifi) struct Span {
+    pub center: u8,
+    pub width: u8,
+}
+impl Span {
+    pub fn mhz(self) -> u32 {
+        20 << self.width
+    }
+    /// Every 20MHz subchannel, ascending.
+    pub fn channels(self) -> Option<Vec<u8>> {
+        let offsets: &[i16] = match self.width {
+            1 => &[-2, 2],
+            2 => &[-6, -2, 2, 6],
+            _ => return None,
+        };
+        let mut out = Vec::new();
+        for offset in offsets {
+            let channel = u8::try_from(i16::from(self.center) + offset).ok()?;
+            if channel == 0 || channel == 14 || (channel <= 14) != (self.center <= 14) {
+                return None;
+            }
+            out.push(channel);
+        }
+        Some(out)
+    }
+    /// `iwl_mvm_get_ctrl_pos` (Linux v7.2 `mvm/phy-ctxt.c`) for `primary`.
+    pub fn control_position(self, primary: u8) -> u8 {
+        let offset = 5 * (i32::from(primary) - i32::from(self.center));
+        if offset == 0 {
+            return 0;
+        }
+        let distance = ((offset.unsigned_abs() - 10) / 20) as u8;
+        (distance & 3) | ((distance & 4) << 1) | if offset > 0 { 4 } else { 0 }
+    }
 }
 impl Context {
-    /// The 40MHz secondary channel once a signed `HT40` program is granted.
-    pub fn span(&self) -> Option<u8> {
-        self.secondary
-            .filter(|_| self.features & feature::HT40 != 0)
+    /// The occupied span once a signed `HT40` (40MHz) or `VHT` (80MHz)
+    /// program is granted.
+    pub fn span(&self) -> Option<Span> {
+        if self.features & feature::VHT != 0 {
+            if let Some(center) = self.vht_center {
+                return Some(Span { center, width: 2 });
+            }
+        }
+        let secondary = self
+            .secondary
+            .filter(|_| self.features & feature::HT40 != 0)?;
+        Some(Span {
+            center: ((u16::from(self.primary) + u16::from(secondary)) / 2) as u8,
+            width: 1,
+        })
     }
     pub fn emission(&self) -> Emission {
         if self.features != 0 {
@@ -76,6 +128,12 @@ impl Context {
             width40: false,
             tx_sgi40: false,
             rx_sgi40: false,
+            width80: false,
+            vht: false,
+            vht_tx_map: 0xffff,
+            tx_sgi80: false,
+            rx_sgi80: false,
+            vht_operation: [0; 5],
             protection: 0,
             dynamic_smps: false,
             ampdu_exp: 0,
@@ -86,21 +144,42 @@ impl Context {
             let ht = phy.ht();
             // The PHY context was prepared with the BSS width before
             // authentication; the response must select exactly that width.
+            use narf_wireless::association::phy::Width;
             let expected = match self.span() {
-                Some(secondary) => {
-                    let mut span = [ht.operation().primary(), secondary];
-                    span.sort_unstable();
-                    if phy.occupied_channels() != span {
-                        return Err("MVM HT40 response changed the prepared 40MHz span");
+                Some(span) => {
+                    if span.channels().as_deref() != Some(phy.occupied_channels()) {
+                        return Err("MVM response changed the prepared wide span");
                     }
-                    narf_wireless::association::phy::Width::Forty
+                    if span.width == 2 {
+                        Width::Eighty
+                    } else {
+                        Width::Forty
+                    }
                 }
-                None => narf_wireless::association::phy::Width::Twenty,
+                None => Width::Twenty,
             };
             if phy.width() != expected {
                 return Err("MVM HT response selected a width other than the prepared PHY");
             }
-            profile.width40 = expected == narf_wireless::association::phy::Width::Forty;
+            profile.width40 = expected != Width::Twenty;
+            profile.width80 = expected == Width::Eighty;
+            if let Some(vht) = phy.vht() {
+                if !profile.width80 {
+                    return Err("MVM VHT negotiated without its 80MHz program");
+                }
+                // A static-SMPS peer receives one stream (max_nss = 1).
+                let mut map = vht.tx_mcs_map();
+                if (ht.peer_capability() >> 2) & 3 == 0 {
+                    map |= 0xfffc;
+                }
+                profile.vht = true;
+                profile.vht_tx_map = map;
+                profile.tx_sgi80 = vht.tx_sgi80();
+                profile.rx_sgi80 = vht.rx_sgi80();
+                profile.vht_operation = vht.operation_body();
+            } else if profile.width80 {
+                return Err("MVM 80MHz program without negotiated VHT");
+            }
             profile.tx_sgi40 = profile.width40 && ht.tx_sgi40();
             profile.rx_sgi40 = profile.width40 && ht.rx_sgi40();
             profile.ht = true;
@@ -158,6 +237,14 @@ pub(super) struct Profile {
     pub width40: bool,
     pub tx_sgi40: bool,
     pub rx_sgi40: bool,
+    /// Granted `VHT` operation on the negotiated 80MHz channel.
+    pub width80: bool,
+    pub vht: bool,
+    /// Negotiated VHT TX MCS map (two bits per stream, 3 = none).
+    pub vht_tx_map: u16,
+    pub tx_sgi80: bool,
+    pub rx_sgi80: bool,
+    pub vht_operation: [u8; 5],
     pub protection: u32,
     pub dynamic_smps: bool,
     pub ampdu_exp: u8,
@@ -202,6 +289,21 @@ pub(in crate::iwlwifi) fn local_ht_for(features: u16) -> LocalHt {
         .with_rx_stbc(true)
         .with_tx_stbc(features & feature::TX_STBC != 0)
 }
+/// The native Gen2 VHT capability of a granted `VHT` program
+/// (`iwl_init_vht_hw_capab`): SGI80, RX LDPC, one RX STBC stream and MCS
+/// 0..9 on one stream, or two with `NSS2`. TX LDPC/STBC follow their bits.
+pub(in crate::iwlwifi) fn local_vht_for(features: u16) -> LocalVht {
+    let map = if features & feature::NSS2 != 0 {
+        0xfffa
+    } else {
+        0xfffe
+    };
+    LocalVht::new(map, map, true, true, 0)
+        .unwrap_or_else(|_| unreachable!())
+        .with_ldpc(true, features & feature::TX_LDPC != 0)
+        .with_rx_stbc(true)
+        .with_tx_stbc(features & feature::TX_STBC != 0)
+}
 pub(super) fn parameters(ies: &[u8]) -> Result<Option<Parameters>, &'static str> {
     let parsed = Parameters::parse(ies).map_err(|_| "MVM malformed WMM parameters")?;
     if let Some(p) = parsed {
@@ -242,6 +344,14 @@ impl Profile {
             && (!self.tx_stbc || cap[1] & 3 != 0)
             && (!self.width40 || cap[0] & 2 != 0)
             && (!self.tx_sgi40 || cap[0] & 64 != 0)
+            && (!self.vht
+                || ap.vht_operation() == Some(self.vht_operation)
+                    && ap.vht_capability().is_some_and(|v| {
+                        let rx = u16::from_le_bytes([v[4], v[5]]);
+                        narf_wireless::association::phy::intersect_maps(self.vht_tx_map, rx)
+                            == self.vht_tx_map
+                            && (!self.tx_sgi80 || v[0] & 32 != 0)
+                    }))
     }
     pub fn edca(&self, local: [u8; 6]) -> [u8; 208] {
         let mut out = [0; 208];
@@ -273,7 +383,10 @@ impl Profile {
             &mut out,
             20,
             (1 << 4)
-                | (u32::from(self.width40) << 26) // STA_FLG_FAT_EN_40MHZ
+                // STA_FLG_FAT_EN_40MHZ; iwl_mvm_sta_send_to_fw ORs FAT_EN_80
+                // and falls through to FAT_EN_40 for an 80MHz peer (3 << 26).
+                | (u32::from(self.width40) << 26)
+                | (u32::from(self.width80) << 27)
                 | (u32::from(self.tx_mcs2 != 0) << 28) // STA_FLG_MIMO_EN_MIMO2
                 | if self.ht {
                     (u32::from(self.dynamic_smps) << 17)
@@ -293,8 +406,13 @@ impl Profile {
         };
         let mut out = alloc::vec![0;length];
         // rs_fw_bw_from_sta_bw: IWL_TLC_MNG_CH_WIDTH_40MHZ.
-        out[4] = u8::from(self.width40);
-        out[5] = u8::from(self.ht);
+        out[4] = if self.width80 {
+            2
+        } else {
+            u8::from(self.width40)
+        };
+        // IWL_TLC_MNG_MODE_HT (1) / IWL_TLC_MNG_MODE_VHT (2).
+        out[5] = if self.vht { 2 } else { u8::from(self.ht) };
         out[6] = chains;
         // rs_fw_get_config_flags: STBC bit0, LDPC bit1.
         put16(
@@ -314,7 +432,25 @@ impl Profile {
         // v2/3 SGI byte22; v4 byte7. A-MSDU and all NSS2/width>20 rates0.
         // rs_fw_sgi_cw_support: BIT(20MHz) | BIT(40MHz).
         out[if version == 4 { 7 } else { 22 }] =
-            u8::from(self.tx_sgi) | u8::from(self.tx_sgi40) << 1;
+            u8::from(self.tx_sgi) | u8::from(self.tx_sgi40) << 1 | u8::from(self.tx_sgi80) << 2;
+        if self.vht {
+            // rs_fw_vht_set_enabled_rates: per stream BIT(highest + 1) - 1,
+            // from the (intersected) peer receive map; MCS9 is invalid at
+            // 20MHz only, and this program is always 80MHz.
+            let nss2 = if version == 4 { 18 } else { 16 };
+            for (stream, at) in [(0, 12), (1, nss2)] {
+                let highest = match (self.vht_tx_map >> (2 * stream)) & 3 {
+                    0 => 7,
+                    1 => 8,
+                    2 => 9,
+                    _ => {
+                        put16(&mut out, at, 0);
+                        continue;
+                    }
+                };
+                put16(&mut out, at, (1u16 << (highest + 1)) - 1);
+            }
+        }
         Ok(out)
     }
     pub fn rx_rate(&self, payload: &[u8]) -> bool {
@@ -328,11 +464,21 @@ impl Profile {
         // RATE_MCS_CHAN_WIDTH (bits 11..13): 20MHz, or 40MHz on a granted
         // HT40 channel; SGI is accepted per the advertised width.
         let wide = (r >> 11) & 7;
-        let sgi = if wide == 1 {
-            self.rx_sgi40
-        } else {
-            self.rx_sgi
+        let sgi = match wide {
+            1 => self.rx_sgi40,
+            2 => self.rx_sgi80,
+            _ => self.rx_sgi,
         };
+        if self.vht && (r >> 8) & 7 == 3 {
+            // VHT: MCS 0..9 (bits 0..3), NSS2 only under the local promise.
+            return wide <= 2
+                && r & 15 <= 9
+                && r & ((0xe0 | (u32::from(!self.rx_nss2) << 4))
+                    | ((15 << 16) & !coding)
+                    | (3 << 23))
+                    == 0
+                && ((r >> 20) & 7 == 0 || sgi && (r >> 20) & 7 == 1);
+        }
         self.ht
             && (r >> 8) & 7 == 2
             && (wide == 0 || self.width40 && wide == 1)
@@ -448,7 +594,9 @@ impl super::Owner {
             return Err("MVM native HT20 contract unavailable");
         }
         let local = local_ht_for(self.power.phy.features);
-        if self.power.phy.features & feature::HT40 != 0 {
+        if self.power.phy.features & feature::VHT != 0 {
+            LocalPhy::vht80(local, local_vht_for(self.power.phy.features))
+        } else if self.power.phy.features & feature::HT40 != 0 {
             LocalPhy::ht40(local)
         } else {
             LocalPhy::ht20(local)
@@ -522,6 +670,10 @@ impl super::Owner {
         if selected && self.nss2_available(ap_ht) {
             available |= feature::NSS2;
         }
+        let vht_center = secondary.and_then(|s| self.vht80_center(&bss, s));
+        if vht_center.is_some() {
+            available |= feature::VHT;
+        }
         if selected {
             available |= feature::QOS_TIDS;
             if let Some(cap) = ap_ht {
@@ -540,6 +692,7 @@ impl super::Owner {
             available,
             secondary,
             primary: channel,
+            vht_center,
             ..Context::default()
         };
         self.power.phy.ba.selected = ba;
@@ -593,6 +746,46 @@ impl super::Owner {
             && cap[4] != 0
             && (u16::from_le_bytes([cap[0], cap[1]]) >> 2) & 3 != 0
     }
+    /// The center of an observed 80MHz VHT BSS on 5GHz this NVM can operate
+    /// (mac80211 `ieee80211_chandef_vht_oper`: VHT Operation width 1 with
+    /// CCFS0 the 80MHz center and no second segment). The NVM must report
+    /// VHT and mark all four subchannels VALID | NVM_CHANNEL_80MHZ.
+    fn vht80_center(&self, bss: &Bss, secondary: u8) -> Option<u8> {
+        let ap =
+            narf_wireless::association::phy::ApElements::parse(&bss.information_elements).ok()?;
+        let (Some(_), Some(op)) = (ap.vht_capability(), ap.vht_operation()) else {
+            return None;
+        };
+        let nvm = self.nvm.as_ref()?;
+        if bss.channel <= 14 || !nvm.phy.vht || op[0] != 1 || op[2] != 0 {
+            return None;
+        }
+        let span = Span {
+            center: op[1],
+            width: 2,
+        };
+        let channels = span.channels()?;
+        if ![42, 58, 106, 122, 138, 155].contains(&op[1])
+            || !channels.contains(&bss.channel)
+            || !channels.contains(&secondary)
+        {
+            return None;
+        }
+        let permissions = self
+            .scan
+            .permissions
+            .as_ref()
+            .or(self.power.nvm_permissions.as_ref())?;
+        channels
+            .iter()
+            .all(|&ch| {
+                nvm.channels.contains(&ch)
+                    && super::super::station_api::channel_index(ch)
+                        .and_then(|index| permissions.get(index))
+                        .is_some_and(|flags| flags & 0x401 == 0x401)
+            })
+            .then_some(op[1])
+    }
     /// Drop `HT40` from the offer when the current host policy does not
     /// permit the whole 40MHz span; mac80211 then keeps the 20MHz chandef
     /// (`ieee80211_chandef_downgrade`).
@@ -600,10 +793,24 @@ impl super::Owner {
         &mut self,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) {
-        if let Some(secondary) = self.power.phy.secondary {
-            if super::power::span_power(domain, self.power.phy.primary, Some(secondary)).is_none() {
-                self.power.phy.secondary = None;
-                self.power.phy.available &= !feature::HT40;
+        let phy = &mut self.power.phy;
+        if let Some(center) = phy.vht_center {
+            let span = Span { center, width: 2 };
+            if super::power::span_power(domain, phy.primary, Some(span)).is_none() {
+                phy.vht_center = None;
+                phy.available &= !feature::VHT;
+            }
+        }
+        if let Some(secondary) = phy.secondary {
+            let span = Span {
+                center: ((u16::from(phy.primary) + u16::from(secondary)) / 2) as u8,
+                width: 1,
+            };
+            if super::power::span_power(domain, phy.primary, Some(span)).is_none() {
+                // VHT80 is built on the HT 20/40 profile and goes with it.
+                phy.secondary = None;
+                phy.vht_center = None;
+                phy.available &= !(feature::HT40 | feature::VHT);
             }
         }
     }
@@ -660,6 +867,8 @@ impl super::Owner {
         let available = self.power.phy.available;
         let mut sets: Vec<u16> = (1..=available)
             .filter(|bits| bits & !available == 0)
+            // VHT80 is built on the HT 20/40 profile.
+            .filter(|bits| bits & feature::VHT == 0 || bits & feature::HT40 != 0)
             .map(|bits| bits | ba)
             .collect();
         sets.sort_by_key(|bits| core::cmp::Reverse(bits.count_ones()));

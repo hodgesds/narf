@@ -97,7 +97,6 @@ iwlwifi	ax211_station_enablement	AX211 exact native station profile enablement	c
 iwlwifi	ax411_station_enablement	AX411 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1556
 iwlwifi	be200_station_enablement	Bz/BE200 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1556
 iwlwifi	eht	EHT on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1557
-iwlwifi	gen2_vht	Gen2 VHT	feature	drivers/wireless/specification/iwlwifi.md	1555
 iwlwifi	he	HE	feature	drivers/wireless/specification/iwlwifi.md	1555
 iwlwifi	live_regulatory_owner	Gen3 and Sc live regulatory-policy owner	feature	drivers/wireless/specification/iwlwifi.md	1556
 iwlwifi	ml_baid	Alternate ML BAID profile	feature	drivers/wireless/specification/iwlwifi.md	1555

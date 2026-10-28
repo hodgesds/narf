@@ -30,6 +30,13 @@ fn domain() -> RegulatoryDomain {
         }],
     }
 }
+fn frequency(channel: u8) -> u32 {
+    if channel <= 14 {
+        2407 + 5 * u32::from(channel)
+    } else {
+        5000 + 5 * u32::from(channel)
+    }
+}
 fn tlv(bytes: &mut Vec<u8>, tag: u32, body: &[u8]) {
     bytes.extend_from_slice(&tag.to_le_bytes());
     bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -169,8 +176,11 @@ struct Actor {
     qos_tids: bool,
     /// Independent receiver view of Open QoS data: (TID, queue, Ethernet).
     tid_frames: Vec<(u8, u16, Vec<u8>)>,
-    /// NVM marks channels 1 and 5 NVM_CHANNEL_40MHZ (HT40 fixtures).
-    wide_nvm: bool,
+    /// NVM profile: 1 marks channels 1 and 5 NVM_CHANNEL_40MHZ (HT40
+    /// fixtures); 2 reports VHT and marks 36..=48 40/80MHz (VHT fixtures).
+    wide_nvm: u8,
+    /// Operating channel of the fixture BSS (RX descriptor, PHY, scan).
+    channel: u8,
     /// Expected PHY_CONTEXT width and control position bytes.
     phy_width: [u8; 2],
 }
@@ -183,6 +193,12 @@ struct Actor {
 unsafe impl Send for Actor {}
 impl Actor {
     fn inject(&mut self, command: u8, group: u8, sequence: u16, body: &[u8]) {
+        if command == 0xc1 && group == 0 && body.len() >= 48 && self.channel != 1 {
+            // The API77 MPDU descriptor channel (energy offset + 2).
+            let mut body = body.to_vec();
+            body[34] = self.channel;
+            return self.firmware.inject(command, group, sequence, &body);
+        }
         self.firmware.inject(command, group, sequence, body)
     }
     fn reply(&mut self, command: u8, group: u8, sequence: u16, mut body: Vec<u8>) {
@@ -393,7 +409,17 @@ impl Actor {
                     if self.ht {
                         nvm[8] = 4;
                     }
-                    if self.wide_nvm {
+                    if self.wide_nvm == 2 {
+                        // NVM_SKU_CAP_11N | 11AC; channels 36..=48 (indices
+                        // 14..=17) VALID|IBSS|ACTIVE|20|40|80MHZ.
+                        nvm[8] = 12;
+                        nvm[24] = 18;
+                        for index in 14..18 {
+                            nvm[28 + 4 * index..32 + 4 * index]
+                                .copy_from_slice(&0x70bu32.to_le_bytes());
+                        }
+                    }
+                    if self.wide_nvm == 1 {
                         // Channels 1..=5 described; 1 and 5 VALID|IBSS|
                         // ACTIVE|20MHZ|40MHZ (iwl-nvm-parse.h).
                         nvm[24] = 5;
@@ -481,7 +507,7 @@ impl Actor {
                 }
                 (1, 8) => {
                     if b.len() != 36
-                        || b[17] != 1
+                        || b[17] != self.channel
                         || b[18..20] != self.phy_width
                         || !matches!(b[4], 1 | 3)
                     {
@@ -604,7 +630,7 @@ impl Actor {
                             } else {
                                 1
                             }
-                        || b[10..12] != [1, 0]
+                        || self.channel <= 14 && b[10..12] != [1, 0]
                     {
                         return Err("MVM native response-bound TLC profile");
                     }
@@ -865,11 +891,11 @@ impl Harness {
             ba,
             ml_baid,
             features,
-            false,
+            0,
         )
     }
-    /// [`Self::build_features`] with an NVM whose channels 1 and 5 carry
-    /// NVM_CHANNEL_40MHZ when `wide_nvm`.
+    /// [`Self::build_features`] with the `wide_nvm` NVM profile (see
+    /// `Actor::wide_nvm`).
     #[allow(clippy::too_many_arguments)]
     fn build_nvm(
         protected: bool,
@@ -879,7 +905,7 @@ impl Harness {
         ba: bool,
         ml_baid: bool,
         features: u16,
-        wide_nvm: bool,
+        wide_nvm: u8,
     ) -> Result<Self, &'static str> {
         if CURRENT.lock().is_some() {
             return Err("MVM interface fixture already owned");
@@ -951,6 +977,7 @@ impl Harness {
             qos_tids: features & super::super::mvm_boot::feature_bits::QOS_TIDS != 0,
             tid_frames: Vec::new(),
             wide_nvm,
+            channel: 1,
             phy_width: [0, 0],
         };
         {
@@ -1051,10 +1078,11 @@ impl Harness {
         })
     }
     fn scan(&self) -> Result<(), &'static str> {
+        let channel = self.actor.lock().channel;
         let results = run(self.device.scan(ScanRequest {
             ssids: vec![],
-            frequencies_mhz: vec![2412],
-            channels: vec![1],
+            frequencies_mhz: vec![frequency(channel)],
+            channels: vec![channel.into()],
             active: false,
             random_mac: None,
             colocated_6ghz: false,
@@ -1069,11 +1097,12 @@ impl Harness {
         Ok(())
     }
     fn request(&self) -> AssociateRequest {
+        let channel = self.actor.lock().channel;
         AssociateRequest {
             bssid: AP,
             ssid: b"net".to_vec(),
-            frequency_mhz: 2412,
-            channel: 1,
+            frequency_mhz: frequency(channel),
+            channel: channel.into(),
             security: if self.actor.lock().protected {
                 narf_wireless::SecurityConfig::Wpa2 { psk: PMK }
             } else {
@@ -1864,3 +1893,5 @@ mod qos_tests;
 mod reconnect_tests;
 #[path = "mvm_recovery_tests.rs"]
 mod recovery_tests;
+#[path = "mvm_vht_tests.rs"]
+mod vht_tests;

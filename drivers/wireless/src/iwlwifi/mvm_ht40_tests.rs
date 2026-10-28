@@ -55,7 +55,16 @@ fn widths(h: &Harness) -> Result<(u8, u8, u32, u8, u8), &'static str> {
 
 fn ht40_harness(features: u16, wide_nvm: bool) -> Result<Harness, &'static str> {
     let emission = if features == 0 { 2 } else { 5 };
-    let h = Harness::build_nvm(false, true, emission, 3, false, false, features, wide_nvm)?;
+    let h = Harness::build_nvm(
+        false,
+        true,
+        emission,
+        3,
+        false,
+        false,
+        features,
+        u8::from(wide_nvm),
+    )?;
     h.db.install(wide_domain(40));
     {
         let mut ap = h.actor.lock();

@@ -7,6 +7,7 @@ use super::super::{
     boot_context::{put16, put32},
     firmware_api::FirmwareApi,
 };
+use super::phy::Span;
 use super::{Owner, Phase};
 use crate::firmware_asset::Asset;
 use alloc::{format, string::String, sync::Arc, vec::Vec};
@@ -56,8 +57,11 @@ pub(in crate::iwlwifi) mod feature {
     /// `STA_FLG_MIMO_EN_MIMO2` and the TLC NSS2 rate map on every valid TX
     /// chain.
     pub const NSS2: u16 = 1 << 6;
+    /// VHT MCS 0..9 on an 80MHz 5GHz channel (requires `HT40`): an 80MHz
+    /// PHY context, ADD_STA FAT_EN_80 and the TLC VHT mode and rate map.
+    pub const VHT: u16 = 1 << 7;
     /// Every bit this driver can emit; other bits are refused.
-    pub const KNOWN: u16 = BA | NESTED_BA | QOS_TIDS | TX_LDPC | TX_STBC | HT40 | NSS2;
+    pub const KNOWN: u16 = BA | NESTED_BA | QOS_TIDS | TX_LDPC | TX_STBC | HT40 | NSS2 | VHT;
 }
 
 impl Emission {
@@ -119,39 +123,42 @@ pub(super) struct Prepared {
     maximum: i16,
     gain: i16,
     channel: u8,
-    /// The secondary channel of a granted 40MHz operation; every power
-    /// decision then covers the whole occupied span.
-    span: Option<u8>,
+    /// The occupied span of a granted 40/80MHz operation; every power
+    /// decision then covers each of its subchannels.
+    span: Option<Span>,
     applied: Option<i16>,
     pub(super) active_link: Option<super::link::ActiveLinkStatus>,
     pub(super) mlme: super::assoc::Context,
     pub(super) stop: Option<Arc<AtomicBool>>,
 }
 
-/// Host power for the primary channel, or for a 40MHz span: the lower of
-/// both 20MHz subchannels and of the rules covering the whole 40MHz
-/// interval, each of which must permit a 40MHz bandwidth and initiation
-/// (the conservative single-rule form of cfg80211 `reg_does_bw_fit`).
-pub(super) fn span_power(domain: &RegulatoryDomain, channel: u8, span: Option<u8>) -> Option<i8> {
+/// Host power for the primary channel, or for a wide span: the lower of
+/// every 20MHz subchannel and of the rules covering the whole interval,
+/// each of which must permit the span's bandwidth and initiation (the
+/// conservative single-rule form of cfg80211 `reg_does_bw_fit`).
+pub(super) fn span_power(domain: &RegulatoryDomain, channel: u8, span: Option<Span>) -> Option<i8> {
     use super::super::connection::host_channel_power;
-    let primary = host_channel_power(domain, channel, true)?;
-    let Some(secondary) = span else {
-        return Some(primary);
+    let mut power = host_channel_power(domain, channel, true)?;
+    let Some(span) = span else {
+        return Some(power);
     };
-    if channel.abs_diff(secondary) != 4 || (channel <= 14) != (secondary <= 14) {
+    let channels = span.channels()?;
+    if !channels.contains(&channel) {
         return None;
     }
-    let mut power = primary.min(host_channel_power(domain, secondary, true)?);
+    for sub in channels {
+        power = power.min(host_channel_power(domain, sub, true)?);
+    }
     let base = if channel <= 14 { 2407 } else { 5000 };
-    let center = base + 5 * (u32::from(channel) + u32::from(secondary)) / 2;
-    let (low, high) = (center - 20, center + 20);
+    let center = base + 5 * u32::from(span.center);
+    let (low, high) = (center - span.mhz() / 2, center + span.mhz() / 2);
     let mut covering = false;
     for rule in &domain.rules {
         if rule.freq_end_mhz <= low || rule.freq_start_mhz >= high {
             continue;
         }
         if rule.freq_end_mhz <= rule.freq_start_mhz
-            || rule.max_bandwidth_mhz < 40
+            || rule.max_bandwidth_mhz < span.mhz()
             || rule.flags.contains(narf_wireless::reg::RegFlags::NO_IR)
         {
             return None;
@@ -163,8 +170,8 @@ pub(super) fn span_power(domain: &RegulatoryDomain, channel: u8, span: Option<u8
 }
 
 impl Prepared {
-    /// Bind the 40MHz span of a granted HT40 program.
-    pub(super) fn with_span(mut self, span: Option<u8>) -> Self {
+    /// Bind the span of a granted HT40/VHT program.
+    pub(super) fn with_span(mut self, span: Option<Span>) -> Self {
         self.span = span;
         self
     }
@@ -265,6 +272,7 @@ pub(super) fn validate_record(
         if bits == 0
             || bits & !feature::KNOWN != 0
             || bits & feature::NESTED_BA != 0 && bits & feature::BA == 0
+            || bits & feature::VHT != 0 && bits & feature::HT40 == 0
         {
             return Err("MVM feature program names an unsupported emission set");
         }
@@ -306,7 +314,7 @@ pub(in crate::iwlwifi) struct Fence {
     maximum: i16,
     gain: i16,
     channel: u8,
-    span: Option<u8>,
+    span: Option<Span>,
     applied: i16,
     stop: Option<Arc<AtomicBool>>,
 }
@@ -627,15 +635,17 @@ impl Owner {
                 "MVM current firmware channel prohibits initial transmit-power preparation",
             );
         }
-        if let Some(secondary) = prepared.span {
-            // NVM_CHANNEL_40MHZ (bit 9) on both subchannels, and the
-            // secondary carries the same transmit permissions.
-            let wide = super::super::station_api::channel_index(secondary)
-                .and_then(|index| permissions.get(index).copied())
-                .ok_or("MVM current 40MHz secondary absent from firmware")?;
-            let required = required | (1 << 9);
-            if flags & required != required || wide & required != required || wide & (1 << 4) != 0 {
-                return Err("MVM current firmware channel prohibits the 40MHz span");
+        if let Some(span) = prepared.span {
+            // NVM_CHANNEL_40MHZ (bit 9) / 80MHZ (bit 10) on every
+            // subchannel, each with the same transmit permissions.
+            let required = required | (1 << (8 + span.width));
+            for sub in span.channels().ok_or("MVM current span is malformed")? {
+                let wide = super::super::station_api::channel_index(sub)
+                    .and_then(|index| permissions.get(index).copied())
+                    .ok_or("MVM current span subchannel absent from firmware")?;
+                if wide & required != required || wide & (1 << 4) != 0 {
+                    return Err("MVM current firmware channel prohibits the wide span");
+                }
             }
         }
         prepared.host_ceiling(domain)

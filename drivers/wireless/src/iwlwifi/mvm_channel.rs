@@ -12,7 +12,7 @@ pub(super) struct ChannelContext {
     ultra_channels: bool,
     pub(super) current: Option<u8>,
     /// Secondary channel of a prepared 40MHz context.
-    pub(super) span: Option<u8>,
+    pub(super) span: Option<super::phy::Span>,
 }
 impl ChannelContext {
     pub(super) fn new(api: &FirmwareApi<'_>) -> Self {
@@ -48,13 +48,17 @@ impl ChannelContext {
         &self,
         action: u32,
         channel: u8,
-        span: Option<u8>,
+        span: Option<super::phy::Span>,
         nvm: &Nvm,
     ) -> Result<Vec<u8>, &'static str> {
         if !matches!(self.version, 1 | 2)
             || !matches!(action, 1 | 3)
             || !nvm.channels.contains(&channel)
-            || span.is_some_and(|s| !nvm.channels.contains(&s) || s.abs_diff(channel) != 4)
+            || span.is_some_and(|s| {
+                s.channels().is_none_or(|c| {
+                    !c.contains(&channel) || c.iter().any(|x| !nvm.channels.contains(x))
+                })
+            })
             || !matches!(nvm.rx_chains, 1..=3)
             || !matches!(nvm.tx_chains, 1..=3)
         {
@@ -69,8 +73,7 @@ impl ChannelContext {
         // (4) when the control channel lies above the center.
         let (width, position) = match span {
             None => (0, 0),
-            Some(secondary) if secondary > channel => (1, 0),
-            Some(_) => (1, 4),
+            Some(span) => (span.width, span.control_position(channel)),
         };
         let tail = if self.ultra_channels { 24 } else { 20 };
         let mut body = alloc::vec![0; tail + 16];
@@ -128,7 +131,12 @@ impl Owner {
         // (mac80211 creates the chanctx with the BSS chandef before auth).
         let span = self.power.phy.span();
         if !super::scan::passive_permitted(domain, channel)
-            || span.is_some_and(|s| !super::scan::passive_permitted(domain, s))
+            || span.is_some_and(|s| {
+                s.channels().is_none_or(|c| {
+                    c.iter()
+                        .any(|&x| !super::scan::passive_permitted(domain, x))
+                })
+            })
         {
             return Err("MVM inactive PHY channel prohibited by receive policy");
         }
@@ -167,7 +175,7 @@ impl Owner {
     async fn prepare_channel_inner(
         &mut self,
         channel: u8,
-        span: Option<u8>,
+        span: Option<super::phy::Span>,
         local: [u8; 6],
         phy: &[u8],
         rlc: Option<&[u8; 32]>,
@@ -180,23 +188,24 @@ impl Owner {
                 return Err("MVM inactive PHY absent from current MCC");
             }
         }
-        if let Some(secondary) = span {
-            // NVM_CHANNEL_VALID and NVM_CHANNEL_40MHZ on both subchannels
+        if let Some(span) = span {
+            // NVM_CHANNEL_VALID and NVM_CHANNEL_40MHZ/80MHZ on every subchannel
             // of the current MCC (or, without LAR, the NVM) profile.
             let permissions = self
                 .scan
                 .permissions
                 .as_ref()
                 .or(self.power.nvm_permissions.as_ref())
-                .ok_or("MVM 40MHz PHY has no firmware channel profile")?;
-            for ch in [channel, secondary] {
+                .ok_or("MVM wide PHY has no firmware channel profile")?;
+            let required = 1 | (1u32 << (8 + span.width));
+            for ch in span.channels().ok_or("MVM wide PHY span malformed")? {
                 let index = super::super::station_api::channel_index(ch)
                     .ok_or("invalid MVM PHY band/channel")?;
                 if permissions
                     .get(index)
-                    .is_none_or(|flags| flags & 0x201 != 0x201)
+                    .is_none_or(|flags| flags & required != required)
                 {
-                    return Err("MVM 40MHz PHY span absent from firmware profile");
+                    return Err("MVM wide PHY span absent from firmware profile");
                 }
             }
         }
