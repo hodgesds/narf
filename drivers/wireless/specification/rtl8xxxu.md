@@ -438,7 +438,7 @@ bind the original peer/primary1 offer,20MHz, supported protection mode and WMM.
 No mandatory membership selector is stripped. DATA chooses the highest actual
 response-bound MCS; source TXDESC32/v3 uses rate12..19, USE_DRIVER_RATE,
 DISABLE_DATA_FB, raw26-byte QoS with the classified TID and software CCMP, with SGI/BW40/AGG/RTS
-disabled. Management and EAPOL keep legacy1Mbps. EU rate selection is host-owned;
+disabled (AGG/RTS now follow the originator BA rules below). Management and EAPOL keep legacy1Mbps. EU rate selection is host-owned;
 no C21/C22 H2C rate-mask callback or invented firmware-applied ACK is added.
 
 Native `rxdesc16` rate/HT/BW, fragment, aggregate, QoS/TID and A-MSDU facts are
@@ -485,8 +485,34 @@ the session. Failure/disconnect purge every session. Smokes
 response receipt, literal response, out-of-order release, duplicate, timeout
 release, A-MSDU-in-A-MPDU refusal, standalone A-MSDU on a BA TID, DELBA) and
 `smoke_rtl8188eu_ht20_rx_ba_policy_and_inactivity_delba` cover the paths.
-TX aggregation stays disabled. Cancellation, source loss or an uncertain
-transfer retains outstanding USB resources and cannot reopen them.
+Cancellation, source loss or an uncertain transfer retains outstanding USB
+resources and cannot reopen them.
+
+#### Originator Block Ack and TX A-MPDU (implemented)
+
+`rtl8xxxu_tx` marks every QoS DATA to an HT peer `ampdu_enable`:
+`rtl8xxxu_fill_txdesc_v3` then carries the peer MPDU density in txdw2,
+RTS/CTS + HW RTS at DESC_RATE_24M in txdw4, and TXDESC40_AGG_ENABLE instead of
+AGG_BREAK only on an operational TID (`packet_codec::aggregate_fields`, applied
+by the packet owner after the checksummed descriptor is built). The first such
+frame on an idle TID starts a session (`ieee80211_start_tx_ba_session`, gated
+by mac80211's HT_AGG_MAX_RETRIES15 / HT_AGG_BURST_RETRIES3 within 15s). The
+async `Station::maintain`/`step` path performs `rtl8xxxu_ampdu_action` TX_START
+(`rtl8xxxu_set_ampdu_factor` REG_AGGLEN_LMT 0x458..0x45b from the fixed
+0x41/a8/72/b9 table clamped to 1<<(factor+2), and `rtl8xxxu_set_ampdu_min_space`
+read-modify-write of 0x45c, each with readback) before queueing the ADDBA
+Request: immediate policy, A-MSDU clear, window64, timeout0, SSN = the TID's
+next sequence (Open counter or shared `Security::next_qos_sequence`). A matching
+response with status0 and nonzero window makes the TID operational; any other
+status stops it without DELBA; no response within `ADDBA_RESP_INTERVAL` (1s) or
+an operational session timeout stops it as a local request with an initiator
+DELBA `WLAN_REASON_QSTA_NOT_USE`; a recipient DELBA stops it silently. Every
+stop performs TX_STOP (factor0/density0) over EP0 first, as Linux does. The
+sync network path never awaits EP0. Smoke
+`smoke_rtl8188eu_ht20_originator_ba_and_tx_ampdu` (Open/WPA2) covers literal
+descriptor bits before/after operation, TX_START/TX_STOP EP0 writes, the
+literal request, peer DELBA, response timeout DELBA, restart token and decline.
+The HT program binding records the new RTS/aggregation emission profile.
 
 RX copies record controlled-port admission and a receive/key generation before
 processing. Native terminal M2/M4/Group2 plus actual receive-idle precede shared
@@ -508,7 +534,7 @@ responses, actual held ADDBA/M4 receipts, closed captures, each current source,
 policy loss and reentrant key/ordinary-credit publication. These cases pass
 both-architecture native QEMU and coordinated build/Clippy gates. Physical
 USB/RF/HT interoperability and exact-device measured qualification remain external.
-SGI20, HT40, TX A-MPDU, originator BA, adaptive rates, broader scans/channels, coexistence
+SGI20, HT40, adaptive rates, broader scans/channels, coexistence
 and reset/rejoin remain software work.
 
 ## 4. Invariants
@@ -570,7 +596,7 @@ channels/rates, reset/rejoin and PM still need software implementation.
 Chip inventory is source-specific: Linux `rtl8xxxu/8188e.c` identifies1TX/1RX;
 `8192e.c` identifies actual1/2TX and2RX; `8723b.c` identifies1TX/1RX and optional
 BT/S0S1. EU's separately qualified HT20/LGI continuation is software-validated above;
-SGI20/HT40, TX A-MPDU, originator BA,
+SGI20/HT40,
 adaptive rates, broader active/passive scanning, runtime PM and
 reset/rejoin remain software work. Full WMM AC/TID routing is implemented.
 

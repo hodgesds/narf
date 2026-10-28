@@ -262,6 +262,12 @@ impl Join {
     pub fn candidate(&self) -> &Candidate {
         &self.candidate
     }
+    /// Negotiated AP HT A-MPDU parameters: (maximum length exponent, density).
+    pub(super) fn peer_ampdu(&self) -> Option<(u8, u8)> {
+        self.plan
+            .negotiated_phy()
+            .map(|phy| (phy.ht().peer_ampdu_factor(), phy.ht().peer_mpdu_density()))
+    }
     pub(super) fn ht_selected(&self) -> bool {
         self.plan.negotiated_phy().is_some()
     }

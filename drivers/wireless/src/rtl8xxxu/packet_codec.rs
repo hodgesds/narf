@@ -286,6 +286,26 @@ pub(super) fn transmit_rate(frame: &[u8], kind: Kind, rate: u8) -> Result<Vec<u8
     Ok(out)
 }
 
+/// `rtl8xxxu_tx` + `rtl8xxxu_fill_txdesc_v3` for QoS DATA to an HT peer
+/// (`ampdu_enable`): the peer's MPDU density in txdw2, RTS/CTS + HW RTS at
+/// DESC_RATE_24M in txdw4, and TXDESC40_AGG_ENABLE instead of AGG_BREAK only
+/// on a TID whose originator BA session is operational. The descriptor
+/// checksum is recomputed.
+pub(super) fn aggregate_fields(packet: &mut [u8], density: u8, operational: bool) {
+    let mut dw2 = word(packet, 8) | u32::from(density & 7) << 20;
+    if operational {
+        dw2 = (dw2 & !(1 << 16)) | 1 << 12;
+    }
+    packet[8..12].copy_from_slice(&dw2.to_le_bytes());
+    let dw4 = word(packet, 16) | 0x08 | 1 << 12 | 1 << 13;
+    packet[16..20].copy_from_slice(&dw4.to_le_bytes());
+    packet[28..30].fill(0);
+    let checksum = packet[..TX_DESC]
+        .chunks_exact(2)
+        .fold(0u16, |v, b| v ^ u16::from_le_bytes([b[0], b[1]]));
+    packet[28..30].copy_from_slice(&checksum.to_le_bytes());
+}
+
 /// QoS TID of a DATA frame; non-QoS DATA uses mac80211's BE priority0.
 pub(super) fn data_tid(frame: &[u8]) -> u8 {
     if frame.first() == Some(&0x88) {

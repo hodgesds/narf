@@ -293,6 +293,71 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         }
         result
     }
+    /// Host aggregation facts for the packet owner; no device access.
+    pub(super) fn set_ampdu_tx(&mut self, value: Option<(u8, u8)>) {
+        self.packets.ampdu = value.filter(|_| self.ht_enabled());
+    }
+    /// `rtl8xxxu_set_ampdu_factor` + `rtl8xxxu_set_ampdu_min_space`, issued
+    /// by `rtl8xxxu_ampdu_action` TX_START (peer factor/density) and
+    /// TX_STOP (both 0). Every EP0 write has an exact readback; failure or
+    /// cancellation is terminal like every other EP0 configuration.
+    pub(super) async fn configure_ampdu(&mut self, factor: u8, density: u8) -> Result<(), Error> {
+        if self.phase() != Phase::Active || !self.ht_enabled() || factor > 3 || density > 7 {
+            return Err(Error::State);
+        }
+        let limit = (1u8 << (factor + 2)).min(0xf);
+        let values = [0x41u8, 0xa8, 0x72, 0xb9].map(|mut v| {
+            if v & 0xf0 > limit << 4 {
+                v = (v & 0x0f) | limit << 4;
+            }
+            if v & 0x0f > limit {
+                v = (v & 0xf0) | limit;
+            }
+            v
+        });
+        self.phase = Phase::Configuring;
+        let mut attempt = Attempt {
+            firmware: self.firmware.clone(),
+            armed: true,
+        };
+        let result = async {
+            // REG_AGGLEN_LMT 0x458..0x45b, REG_AMPDU_MIN_SPACE 0x45c.
+            for (i, value) in values.into_iter().enumerate() {
+                let register = 0x458 + i as u16;
+                self.firmware
+                    .write8(register, value)
+                    .await
+                    .map_err(Error::Control)?;
+                if self
+                    .firmware
+                    .read8(register)
+                    .await
+                    .map_err(Error::Control)?
+                    != value
+                {
+                    return Err(Error::State);
+                }
+            }
+            let space =
+                (self.firmware.read8(0x45c).await.map_err(Error::Control)? & 0xf8) | density;
+            self.firmware
+                .write8(0x45c, space)
+                .await
+                .map_err(Error::Control)?;
+            if self.firmware.read8(0x45c).await.map_err(Error::Control)? != space {
+                return Err(Error::State);
+            }
+            Ok(())
+        }
+        .await;
+        attempt.armed = false;
+        if result.is_ok() {
+            self.phase = Phase::Active;
+        } else {
+            self.fail();
+        }
+        result
+    }
     pub fn channel(&self) -> u8 {
         self.packets.channel()
     }

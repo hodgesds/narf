@@ -63,6 +63,35 @@ const REASON_TIMEOUT: u16 = 39;
 /// One accepted recipient BA session (mac80211 `tid_ampdu_rx`). The RTL8188EU
 /// MAC acknowledges A-MPDUs autonomously; `rtl8xxxu_ampdu_action` RX_START/
 /// RX_STOP program nothing, so the session is host state only.
+/// mac80211 `sta_info.h` originator retry policy and `ADDBA_RESP_INTERVAL`.
+const HT_AGG_MAX_RETRIES: u8 = 15;
+const HT_AGG_BURST_RETRIES: u8 = 3;
+const HT_AGG_RETRIES_PERIOD_MS: u64 = 15_000;
+const ADDBA_RESP_INTERVAL_MS: u64 = 1000;
+/// `WLAN_REASON_QSTA_NOT_USE`: DELBA for a local originator stop.
+const REASON_NOT_USE: u16 = 37;
+/// One originator BA session (mac80211 `tid_ampdu_tx`); `rtl8xxxu_tx`
+/// starts it on the first classified QoS DATA to an HT peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TxBa {
+    /// TX_START pending: EP0 aggregation limits precede the ADDBA Request.
+    Starting {
+        token: u8,
+    },
+    /// ADDBA Request queued; `ADDBA_RESP_INTERVAL` runs to `deadline`.
+    Requested {
+        token: u8,
+        deadline: u64,
+    },
+    Operational {
+        timeout_tu: u16,
+        last_tx: u64,
+    },
+    /// TX_STOP pending: EP0 limits reset, then optional initiator DELBA.
+    Stopping {
+        delba: bool,
+    },
+}
 struct RxBa {
     reorder: narf_wireless::reorder::Reorder<Captured>,
     token: u8,
@@ -112,6 +141,11 @@ pub struct Station<C: ControlIo, B: packet_transport::Io> {
     edca_pending: Option<narf_wireless::wmm::Parameters>,
     /// Recipient BA sessions by TID.
     rx_ba: [Option<RxBa>; 8],
+    /// Originator BA sessions by TID and mac80211 retry bookkeeping.
+    tx_ba: [Option<TxBa>; 8],
+    tx_token: u8,
+    addba_req_num: [u8; 8],
+    last_addba_req: [u64; 8],
 }
 impl<C: ControlIo, B: packet_transport::Io> core::fmt::Debug for Station<C, B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -167,6 +201,10 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             edca: None,
             edca_pending: None,
             rx_ba: Default::default(),
+            tx_ba: [None; 8],
+            tx_token: 0,
+            addba_req_num: [0; 8],
+            last_addba_req: [0; 8],
         })
     }
     pub fn append_sme_ies(&mut self, bytes: &[u8]) -> Result<(), Error> {
@@ -337,6 +375,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
     ) -> Result<(), Error> {
         if matches!(self.phase, Phase::FourWay | Phase::Open) {
             self.apply_edca().await?;
+            self.apply_tx_ba().await?;
         }
         if self.phase == Phase::Open {
             return self.network_inner(now, nonce);
@@ -397,6 +436,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                                 .await
                                 .map_err(Error::Radio)?;
                             self.edca = Some(p);
+                            self.update_ampdu_tx();
                         }
                         self.radio
                             .association(aid, true)
@@ -445,8 +485,12 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
     fn installed_wmm(&self) -> Option<narf_wireless::wmm::Parameters> {
         self.edca.or_else(|| self.plan.wmm())
     }
-    pub(super) fn edca_pending(&self) -> bool {
+    pub(super) fn maintenance_pending(&self) -> bool {
         self.edca_pending.is_some()
+            || self
+                .tx_ba
+                .iter()
+                .any(|s| matches!(s, Some(TxBa::Starting { .. } | TxBa::Stopping { .. })))
     }
     /// mac80211 `ieee80211_sta_wmm_params`: only a bound-AP beacon whose WMM
     /// Parameter Set Count differs from the last accepted one carries new
@@ -504,12 +548,20 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         if !matches!(self.phase(), Phase::FourWay | Phase::Open) {
             return Err(Error::State);
         }
-        if self.edca_pending.is_none() {
+        if !self.maintenance_pending() {
             return Ok(());
         }
         let mut attempt = self.attempt();
         let proof = self.radio.authority();
-        let result = proof.fence(self.apply_edca(), Error::Radio).await;
+        let result = proof
+            .fence(
+                async {
+                    self.apply_edca().await?;
+                    self.apply_tx_ba().await
+                },
+                Error::Radio,
+            )
+            .await;
         attempt.armed = false;
         if result.is_err() {
             self.fail();
@@ -640,14 +692,27 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                 response.extend_from_slice(&timeout.to_le_bytes());
                 self.controls.push_back(response);
             }
+            1 if b.len() >= 33 => {
+                let token = b[26];
+                let status = u16::from_le_bytes([b[27], b[28]]);
+                let p = u16::from_le_bytes([b[29], b[30]]);
+                let timeout = u16::from_le_bytes([b[31], b[32]]);
+                self.addba_response(token, status, p, timeout, now);
+            }
             2 if b.len() >= 30 => {
                 let p = u16::from_le_bytes([b[26], b[27]]);
+                let tid = usize::from(p >> 12) & 7;
                 // Initiator bit set: the AP originator tears down our
-                // recipient session; buffered MPDUs are purged.
+                // recipient session; buffered MPDUs are purged. Clear: the AP
+                // recipient ends our originator session (AGG_STOP_PEER_REQUEST,
+                // no DELBA of our own).
                 if p & (1 << 11) != 0 {
-                    if let Some(session) = self.rx_ba[usize::from(p >> 12) & 7].take() {
+                    if let Some(session) = self.rx_ba[tid].take() {
                         session.reorder.retire();
                     }
+                } else if !matches!(self.tx_ba[tid], None | Some(TxBa::Stopping { .. })) {
+                    self.tx_ba[tid] = Some(TxBa::Stopping { delba: false });
+                    self.update_ampdu_tx();
                 }
             }
             _ => (),
@@ -761,6 +826,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
     /// pass BlockAckReq control frames (REG_RXFLTMAP1 PS-Poll only, no
     /// RCR_ACCEPT_CTRL_FRAME), so holes advance only by window or timeout.
     fn service_ba(&mut self, now: u64) -> Result<(), Error> {
+        self.service_tx_ba(now);
         for tid in 0..8u16 {
             let Some(session) = self.rx_ba[usize::from(tid)].as_mut() else {
                 continue;
@@ -798,6 +864,159 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                 session.reorder.retire();
             }
         }
+        self.tx_ba = [None; 8];
+    }
+    /// Operational originator TIDs and the peer density for the packet owner.
+    fn update_ampdu_tx(&mut self) {
+        let operational = (0..8).fold(0u8, |bits, tid| {
+            if matches!(self.tx_ba[tid], Some(TxBa::Operational { .. })) {
+                bits | 1 << tid
+            } else {
+                bits
+            }
+        });
+        let facts = self
+            .plan
+            .peer_ampdu()
+            .map(|(_, density)| (density, operational));
+        self.radio.set_ampdu_tx(facts);
+    }
+    /// `rtl8xxxu_tx` -> `ieee80211_start_tx_ba_session` gated by mac80211's
+    /// HT_AGG_MAX_RETRIES / HT_AGG_BURST_RETRIES within HT_AGG_RETRIES_PERIOD;
+    /// an operational session records activity for its timeout.
+    fn note_tx_ba(&mut self, tid: usize, now: u64) {
+        match &mut self.tx_ba[tid] {
+            Some(TxBa::Operational { last_tx, .. }) => *last_tx = now,
+            Some(_) => {}
+            None => {
+                let tries = self.addba_req_num[tid];
+                if tries > HT_AGG_MAX_RETRIES
+                    || tries > HT_AGG_BURST_RETRIES
+                        && now < self.last_addba_req[tid].saturating_add(HT_AGG_RETRIES_PERIOD_MS)
+                {
+                    return;
+                }
+                self.tx_token = self.tx_token.wrapping_add(1);
+                self.tx_ba[tid] = Some(TxBa::Starting {
+                    token: self.tx_token,
+                });
+            }
+        }
+    }
+    /// `ieee80211_process_addba_resp`: only the outstanding dialog token is
+    /// matched; success with a nonzero window makes the TID operational,
+    /// anything else stops the session without a DELBA (AGG_STOP_DECLINED).
+    fn addba_response(&mut self, token: u8, status: u16, p: u16, timeout: u16, now: u64) {
+        let tid = usize::from((p >> 2) & 15);
+        if tid >= 8 {
+            return;
+        }
+        let Some(TxBa::Requested {
+            token: outstanding, ..
+        }) = self.tx_ba[tid]
+        else {
+            return;
+        };
+        if outstanding != token {
+            return;
+        }
+        self.tx_ba[tid] = Some(if status == 0 && p >> 6 != 0 {
+            self.addba_req_num[tid] = 0;
+            TxBa::Operational {
+                timeout_tu: timeout,
+                last_tx: now,
+            }
+        } else {
+            TxBa::Stopping { delba: false }
+        });
+        self.update_ampdu_tx();
+    }
+    /// `sta_addba_resp_timer_expired` and `sta_tx_agg_session_timer_expired`
+    /// both stop as a local request, which sends an initiator DELBA.
+    fn service_tx_ba(&mut self, now: u64) {
+        let mut changed = false;
+        for slot in &mut self.tx_ba {
+            let expired = match *slot {
+                Some(TxBa::Requested { deadline, .. }) => now >= deadline,
+                Some(TxBa::Operational {
+                    timeout_tu,
+                    last_tx,
+                }) => {
+                    timeout_tu != 0
+                        && now.saturating_sub(last_tx) >= u64::from(timeout_tu) * 1024 / 1000
+                }
+                _ => false,
+            };
+            if expired {
+                *slot = Some(TxBa::Stopping { delba: true });
+                changed = true;
+            }
+        }
+        if changed {
+            self.update_ampdu_tx();
+        }
+    }
+    /// `rtl8xxxu_ampdu_action` TX_START/TX_STOP EP0 work, then the ADDBA
+    /// Request (`ieee80211_send_addba_request`: immediate policy, A-MSDU
+    /// clear without SUPPORTS_AMSDU_IN_AMPDU, window IEEE80211_MAX_AMPDU_BUF_HT,
+    /// timeout0, SSN = the TID's next sequence) or the initiator DELBA.
+    async fn apply_tx_ba(&mut self) -> Result<(), Error> {
+        let now = self.last_now;
+        for tid in 0..8u8 {
+            match self.tx_ba[usize::from(tid)] {
+                Some(TxBa::Starting { token }) => {
+                    let (factor, density) = self.plan.peer_ampdu().ok_or(Error::State)?;
+                    self.radio
+                        .configure_ampdu(factor, density)
+                        .await
+                        .map_err(Error::Radio)?;
+                    if self.controls.len() == 8 {
+                        return Err(Error::State);
+                    }
+                    let ssn = match &self.security {
+                        Some(security) => {
+                            security.next_qos_sequence(tid).map_err(Error::Security)?
+                        }
+                        None => self.qos_sequence[usize::from(tid)],
+                    };
+                    let mut request = self.action_header()?;
+                    request.extend_from_slice(&[3, 0, token]);
+                    request.extend_from_slice(
+                        &(2 | u16::from(tid) << 2 | BA_MAX_WINDOW << 6).to_le_bytes(),
+                    );
+                    request.extend_from_slice(&0u16.to_le_bytes());
+                    request.extend_from_slice(&((ssn & 4095) << 4).to_le_bytes());
+                    self.controls.push_back(request);
+                    let i = usize::from(tid);
+                    self.last_addba_req[i] = now;
+                    self.addba_req_num[i] = self.addba_req_num[i].saturating_add(1);
+                    self.tx_ba[i] = Some(TxBa::Requested {
+                        token,
+                        deadline: now.saturating_add(ADDBA_RESP_INTERVAL_MS),
+                    });
+                }
+                Some(TxBa::Stopping { delba }) => {
+                    self.radio
+                        .configure_ampdu(0, 0)
+                        .await
+                        .map_err(Error::Radio)?;
+                    self.tx_ba[usize::from(tid)] = None;
+                    self.update_ampdu_tx();
+                    if delba {
+                        if self.controls.len() == 8 {
+                            return Err(Error::State);
+                        }
+                        let mut frame = self.action_header()?;
+                        frame.extend_from_slice(&[3, 2]);
+                        frame.extend_from_slice(&(u16::from(tid) << 12 | 1 << 11).to_le_bytes());
+                        frame.extend_from_slice(&REASON_NOT_USE.to_le_bytes());
+                        self.controls.push_back(frame);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
     fn data_frame(
         &mut self,
@@ -1094,6 +1313,9 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         if let Err(error) = self.radio.submit_native_data_rate(&native, rate) {
             self.fail();
             return Err(Error::Radio(error));
+        }
+        if let Some(tid) = tid.filter(|_| self.plan.ht_selected()) {
+            self.note_tx_ba(usize::from(tid), now);
         }
         self.pending = Some(Pending {
             kind: Tx::Data,

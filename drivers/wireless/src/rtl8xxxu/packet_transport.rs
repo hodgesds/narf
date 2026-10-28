@@ -85,6 +85,8 @@ pub struct Owner<I: Io> {
     failed: bool,
     pub(super) qos: bool,
     pub(super) ht: bool,
+    /// HT peer MPDU density and operational originator-BA TID bitmap.
+    pub(super) ampdu: Option<(u8, u8)>,
     receive: Option<I::Receipt>,
     transmit: Option<Transmit<I::Receipt>>,
     scratch: Vec<u8>,
@@ -118,6 +120,7 @@ impl<I: Io> Owner<I> {
             failed: false,
             qos: false,
             ht: false,
+            ampdu: None,
             receive: None,
             transmit: None,
             scratch: alloc::vec![0;MAX_TRANSFER],
@@ -208,7 +211,13 @@ impl<I: Io> Owner<I> {
         if self.transmit.is_some() {
             return Err(Error::Busy);
         }
-        let packet = packet_codec::transmit_rate(frame, kind, rate).map_err(Error::Packet)?;
+        let mut packet = packet_codec::transmit_rate(frame, kind, rate).map_err(Error::Packet)?;
+        if let (Kind::Data, Some(0x88), true, Some((density, tids))) =
+            (kind, frame.first().copied(), self.ht, self.ampdu)
+        {
+            let tid = packet_codec::data_tid(frame);
+            packet_codec::aggregate_fields(&mut packet, density, tids & (1 << tid) != 0);
+        }
         let index = match kind {
             Kind::Management => 0,
             Kind::Data => packet_codec::data_endpoint(

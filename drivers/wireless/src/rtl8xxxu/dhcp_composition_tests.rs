@@ -210,7 +210,7 @@ impl Peer {
             // Driver-owned BA actions: ADDBA Response (33) or DELBA (30).
             ensure!(
                 self.ht
-                    && (frame.len() == 33 && frame[24..26] == [3, 1]
+                    && (frame.len() == 33 && matches!(frame[24..26], [3, 0] | [3, 1])
                         || frame.len() == 30 && frame[24..26] == [3, 2]),
                 "EU wrong native BA action"
             );
@@ -1709,6 +1709,165 @@ fn smoke_rtl8188eu_ht20_rx_ba_policy_and_inactivity_delba() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtl8xxxu/ht20",
     smoke_rtl8188eu_ht20_rx_ba_policy_and_inactivity_delba
+);
+fn ba_action(h: &Harness, body: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0xd0, 0, 0, 0];
+    frame.extend_from_slice(&h.device.mac());
+    frame.extend_from_slice(&AP);
+    frame.extend_from_slice(&AP);
+    frame.extend_from_slice(&[0, 0]);
+    frame.extend_from_slice(body);
+    frame
+}
+fn ht_tx_ba() -> Result<(), &'static str> {
+    use super::super::super::firmware_transport_tests::Op;
+    for protected in [false, true] {
+        let h = Harness::new_profile(protected, true)?;
+        h.scan()?;
+        h.join()?;
+        let tx = udp_ipv4(
+            AP,
+            h.device.mac(),
+            [10, 88, 0, 42],
+            [10, 88, 0, 1],
+            7,
+            8,
+            b"EU originator BA",
+        );
+        let send = |h: &Harness| -> Result<[u32; 2], &'static str> {
+            ensure!(
+                h.device.enqueue(&tx, Default::default()).is_ok(),
+                "EU TX BA enqueue"
+            );
+            h.pump();
+            let p = h.link.0.lock();
+            let d = p
+                .native_tx
+                .iter()
+                .rev()
+                .find(|x| x.get(TX_DESC) == Some(&0x88))
+                .ok_or("EU TX BA QoS data")?;
+            let w = |at: usize| u32::from_le_bytes(d[at..at + 4].try_into().unwrap());
+            Ok([w(8), w(16)])
+        };
+        let ampdu_writes = |h: &Harness, from: usize| {
+            let ops = &h.control.0.lock().ops;
+            [0x458u16, 0x459, 0x45a, 0x45b, 0x45c].iter().all(|r| {
+                ops[from..]
+                    .iter()
+                    .any(|o| matches!(o, Op::Write(a, _) if a == r))
+            })
+        };
+        let maintain = |h: &Harness| complete(h.device.maintain());
+        // First QoS DATA to the HT peer: density/RTS24M, AGG_BREAK, and a
+        // session start that only the async path may program.
+        let [dw2, dw4] = send(&h)?;
+        ensure!(
+            dw2 & (1 << 16) != 0
+                && dw2 & (1 << 12) == 0
+                && dw4 & 31 == 8
+                && dw4 & (3 << 12) == 3 << 12,
+            "EU HT QoS DATA lacked ampdu_enable RTS/density/AGG_BREAK"
+        );
+        let ops = h.control.0.lock().ops.len();
+        maintain(&h)?;
+        ensure!(
+            ampdu_writes(&h, ops),
+            "EU TX_START AGGLEN/MIN_SPACE EP0 writes"
+        );
+        h.pump();
+        let token = {
+            let p = h.link.0.lock();
+            let r = p.actions.last().ok_or("EU ADDBA Request missing")?;
+            ensure!(
+                r.len() == 33
+                    && r[24..26] == [3, 0]
+                    && r[27..29] == (2u16 | 64 << 6).to_le_bytes()
+                    && r[29..31] == [0, 0]
+                    && r[31] & 15 == 0,
+                "EU ADDBA Request policy/A-MSDU/window/timeout/SSN"
+            );
+            r[26]
+        };
+        // Accepted: the TID becomes operational and DATA aggregates.
+        h.link
+            .0
+            .lock()
+            .queue
+            .push_back(ba_action(&h, &[3, 1, token, 0, 0, 0x02, 0x08, 0, 0]));
+        h.pump();
+        let [dw2, _] = send(&h)?;
+        ensure!(
+            dw2 & (1 << 12) != 0 && dw2 & (1 << 16) == 0,
+            "EU operational TID lacked AGG_ENABLE"
+        );
+        // Recipient DELBA: TX_STOP EP0 writes, no DELBA of our own.
+        let actions = h.link.0.lock().actions.len();
+        h.link
+            .0
+            .lock()
+            .queue
+            .push_back(ba_action(&h, &[3, 2, 0, 0, 1, 0]));
+        h.pump();
+        let ops = h.control.0.lock().ops.len();
+        maintain(&h)?;
+        ensure!(
+            ampdu_writes(&h, ops) && h.link.0.lock().actions.len() == actions,
+            "EU peer DELBA TX_STOP"
+        );
+        // The next DATA restarts; no response within 1s sends initiator DELBA.
+        let [dw2, _] = send(&h)?;
+        ensure!(dw2 & (1 << 16) != 0, "EU stopped TID still aggregated");
+        maintain(&h)?;
+        h.pump();
+        let second = h.link.0.lock().actions.last().map(|r| r[26]);
+        ensure!(
+            second == Some(token.wrapping_add(1)),
+            "EU restarted ADDBA token"
+        );
+        h.env.0.fetch_add(1001, Ordering::AcqRel);
+        h.pump();
+        maintain(&h)?;
+        h.pump();
+        {
+            let p = h.link.0.lock();
+            let d = p.actions.last().ok_or("EU initiator DELBA")?;
+            ensure!(
+                d.len() == 30
+                    && d[24..26] == [3, 2]
+                    && d[26..28] == (1u16 << 11).to_le_bytes()
+                    && d[28..30] == [37, 0],
+                "EU ADDBA response timeout initiator DELBA"
+            );
+        }
+        // A declined request stops without DELBA.
+        send(&h)?;
+        maintain(&h)?;
+        h.pump();
+        let third = h.link.0.lock().actions.last().map(|r| r[26]).unwrap_or(0);
+        h.link
+            .0
+            .lock()
+            .queue
+            .push_back(ba_action(&h, &[3, 1, third, 37, 0, 0x02, 0x08, 0, 0]));
+        h.pump();
+        let actions = h.link.0.lock().actions.len();
+        maintain(&h)?;
+        h.pump();
+        let [dw2, _] = send(&h)?;
+        ensure!(
+            dw2 & (1 << 16) != 0 && h.link.0.lock().actions.len() == actions && h.device.link_up(),
+            "EU declined ADDBA aggregated or sent DELBA"
+        );
+    }
+    Ok(())
+}
+fn smoke_rtl8188eu_ht20_originator_ba_and_tx_ampdu() -> TestResult {
+    ht_result(ht_tx_ba())
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/ht20",
+    smoke_rtl8188eu_ht20_originator_ba_and_tx_ampdu
 );
 fn ht_m4() -> Result<(), &'static str> {
     for cancelled in [false, true] {
