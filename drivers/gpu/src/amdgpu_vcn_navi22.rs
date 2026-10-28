@@ -1135,9 +1135,55 @@ impl<I: Io> Engine<I> {
             update_vcpu(io, l, i, VCPU_BLK_RST, 0)?;
             Ok(())
         })?;
-        let attempt = self.boot_vcpu(i).await?;
+        let attempt = match self.boot_vcpu(i).await {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                self.report_boot_failure(i, firmware);
+                return Err(error);
+            }
+        };
         self.proof.booted[i] = attempt;
         self.program_rings(i)
+    }
+    /// One line of what a VCPU that never reported left behind: the
+    /// power, PGFSM, reset, clock-gating and cache-window registers the
+    /// static start programmed, for comparison with a Linux register dump.
+    fn report_boot_failure(&mut self, i: usize, firmware: u64) {
+        use core::fmt::Write;
+        let regs = [
+            ("STATUS", STATUS),
+            ("POWER_STATUS", POWER_STATUS),
+            ("PGFSM_STATUS", PGFSM_STATUS),
+            ("SOFT_RESET", SOFT_RESET),
+            ("VCPU_CNTL", VCPU_CNTL),
+            ("RB_ARB_CTRL", RB_ARB_CTRL),
+            ("CGC_GATE", CGC_GATE),
+            ("CGC_CTRL", CGC_CTRL),
+            ("CACHE_BAR_LO", LMI_VCPU_CACHE_BAR_LOW),
+            ("CACHE_BAR_HI", LMI_VCPU_CACHE_BAR_HIGH),
+            ("CACHE_SIZE0", VCPU_CACHE_SIZE0),
+            ("ADDR_CONFIG", GFX10_ADDR_CONFIG),
+            ("HARVESTING", CC_UVD_HARVESTING),
+        ];
+        let mut values = [0u32; 13];
+        let read = self.hw.access(|io, l| {
+            for (value, (_, reg)) in values.iter_mut().zip(regs) {
+                *value = io.read(l.reg(i, reg));
+            }
+            Ok(())
+        });
+        let mut w = narf_console::Writer;
+        let _ = write!(
+            w,
+            "amdgpu: VCN{i} VCPU never booted: firmware {firmware:#x} ({} bytes)",
+            self.firmware_bytes
+        );
+        if read.is_ok() {
+            for ((name, _), value) in regs.iter().zip(values) {
+                let _ = write!(w, " {name}={value:#x}");
+            }
+        }
+        let _ = writeln!(w);
     }
     /// The `for (j = 0; j < 10; ++j)` boot loop of `vcn_v3_0_start`.
     async fn boot_vcpu(&mut self, i: usize) -> Result<u8, Error> {
@@ -1626,6 +1672,10 @@ pub struct Media {
     client: Option<Client>,
 }
 impl Media {
+    /// The unharvested VCN instances this owner programs.
+    pub fn active_instances(&self) -> [bool; 2] {
+        [self.engine.vcn[0].is_some(), self.engine.vcn[1].is_some()]
+    }
     /// Reserve per-instance VCPU/ring/IB storage without device I/O.
     /// `instances` is the unharvested VCN mask whose firmware PSP loads;
     /// JPEG exists when instance 0 does (`num_jpeg_inst = 1`).

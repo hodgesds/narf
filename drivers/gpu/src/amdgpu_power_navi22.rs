@@ -76,6 +76,17 @@ const DISPLAY_REQUIRED: u64 = (1 << 3) | (1 << 4) | (1 << 5) | (1 << 8);
 // linux-lit: 10=FEATURE_MEM_VDDCI_SCALING_BIT; 11=FEATURE_MEM_MVDD_SCALING_BIT
 const DISPLAY_ALLOWED: u64 = DISPLAY_REQUIRED | (1 << 10) | (1 << 11);
 
+// linux-lit: 22=FEATURE_MM_DPM_PG_BIT
+const MM_DPM_PG: u64 = 1 << 22;
+/// `amdgpu.rdna2_vcn_smu_pg`: allow the board's MM_DPM_PG, so PMFW owns the
+/// VCN/JPEG power islands and the media start sends PowerUpVcn and
+/// PowerUpJpeg, as Linux's default Navi22 configuration does. Diagnostic.
+static VCN_SMU_PG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Set once from the boot options, before the SMU is configured.
+pub fn set_vcn_smu_pg(enabled: bool) {
+    VCN_SMU_PG.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Board-supported GFX DPM and autonomous power/fan/thermal protection only.
 /// Memory, link and display clock transitions require a later DCN policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,8 +102,13 @@ impl BootPolicy {
         if features & BOOT_REQUIRED != BOOT_REQUIRED {
             return Err(Error::Unsupported);
         }
+        let media = if VCN_SMU_PG.load(core::sync::atomic::Ordering::Relaxed) {
+            MM_DPM_PG
+        } else {
+            0
+        };
         Ok(Self {
-            allowed: features & BOOT_ALLOWED,
+            allowed: features & (BOOT_ALLOWED | media),
             board_features: features,
         })
     }

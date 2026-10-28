@@ -39,6 +39,11 @@ pub struct BootOptions<'a> {
     /// (DMCUB implements the tables itself; its golden init does more than
     /// the bytecode). Diagnostic.
     pub atom_pixclk: bool,
+    /// `amdgpu.rdna2_vcn_smu_pg=1` allows the board's MM_DPM_PG, and the VCN
+    /// start powers the media islands up through PMFW (PowerUpVcn,
+    /// PowerUpJpeg), as Linux's default Navi22 configuration does.
+    /// Diagnostic.
+    pub vcn_smu_pg: bool,
     /// `amdgpu.rdna2_connector=dp|hdmi`: the output the single-display boot
     /// modeset lights when both kinds have a sink (Linux's order, HDMI
     /// first, otherwise). Diagnostic: lets either output be tested with
@@ -97,6 +102,7 @@ impl<'a> BootOptions<'a> {
             power_saving,
             dmub_tables: switch("amdgpu.rdna2_dmub_tables", None, true),
             atom_pixclk: switch("amdgpu.rdna2_atom_pixclk", None, false),
+            vcn_smu_pg: switch("amdgpu.rdna2_vcn_smu_pg", None, false),
             connector: match value("amdgpu.rdna2_connector") {
                 Some(Some("dp" | "DP" | "displayport")) => Connector::DisplayPort,
                 Some(Some("hdmi" | "HDMI")) => Connector::Hdmi,

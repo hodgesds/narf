@@ -37,6 +37,8 @@ pub(super) fn start() -> InitResult {
     }
     let options =
         narf_drivers_gpu::amdgpu_rdna2::options::BootOptions::parse(narf_boot::args().raw());
+    // Before the firmware run builds the SMU's allowed-feature policy.
+    narf_drivers_gpu::amdgpu_power_navi22::set_vcn_smu_pg(options.vcn_smu_pg);
     let framebuffer = *super::BOOT_GENERIC.lock();
     // Any RDNA4 die (Navi48 or Navi44, by discovered GC) takes the
     // `amdgpu_navi48_platform` path; the log names the die.

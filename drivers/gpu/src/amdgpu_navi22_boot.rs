@@ -860,10 +860,24 @@ impl Backend for Hardware {
             Stage::Media => {
                 if let Some(media) = self.media.as_mut() {
                     let firmware = self.psp.as_ref().ok_or(Error::Invalid)?.media_firmware();
+                    // vcn_v3_0_start's amdgpu_dpm_enable_vcn: with MM_DPM_PG
+                    // running (amdgpu.rdna2_vcn_smu_pg), PMFW owns the media
+                    // islands and powers them up before the tiles are touched.
+                    let mut power = self.power_status;
+                    if power.is_some_and(|p| p.enabled & (1 << 22) != 0) {
+                        let smu = self.smu.as_mut().ok_or(Error::Invalid)?;
+                        if smu
+                            .power_up_media(media.active_instances())
+                            .await
+                            .map_err(Error::Smu)?
+                        {
+                            power = None;
+                        }
+                    }
                     // SAFETY: PSP loaded these VCN images into the retained
                     // TMR, both hubs and NBIF doorbells are up, and ColdBoot
-                    // owns the whole GPU. Power gating stays disabled.
-                    let result = unsafe { media.start(firmware, self.power_status).await };
+                    // owns the whole GPU. VCN's own power gating stays disabled.
+                    let result = unsafe { media.start(firmware, power).await };
                     media_result(stage, result)?;
                 }
             }

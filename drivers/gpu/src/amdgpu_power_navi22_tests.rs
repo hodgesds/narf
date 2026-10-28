@@ -357,3 +357,27 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_power_tables_preserve_profile_and_board_overlay
 );
+
+fn navi22_vcn_smu_pg_option_allows_only_the_board_mm_dpm_pg() -> TestResult {
+    const MM_DPM_PG: u64 = 1 << 22;
+    let board = 0x3767_a37f_fdff_u64; // RX 6750 XT PMFW feature mask
+    crate::amdgpu_power_navi22::set_vcn_smu_pg(true);
+    let on = BootPolicy::from_features(board).unwrap();
+    let absent = BootPolicy::from_features(board & !MM_DPM_PG).unwrap();
+    crate::amdgpu_power_navi22::set_vcn_smu_pg(false);
+    let off = BootPolicy::from_features(board).unwrap();
+    // The option adds MM_DPM_PG alone, and only where the board has it;
+    // its running bit is then no hazard.
+    if on.allowed() != off.allowed() | MM_DPM_PG
+        || absent.allowed() & MM_DPM_PG != 0
+        || !on.validate_enabled(on.allowed())
+        || off.validate_enabled(off.allowed() | MM_DPM_PG)
+    {
+        return TestResult::Fail("amdgpu.rdna2_vcn_smu_pg policy");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/power-navi22",
+    navi22_vcn_smu_pg_option_allows_only_the_board_mm_dpm_pg
+);
