@@ -3792,6 +3792,7 @@ kernel_test_in!(
 /// shows each full screen, PAGE_FLIP keeps the format (EINVAL across
 /// formats, as drm_mode_page_flip_ioctl) and the atomic plane check takes
 /// them. A card without native planes keeps its three legacy formats.
+#[cfg(feature = "amdgpu")]
 fn smoke_drm_navi48_plane_formats_end_to_end() -> TestResult {
     use crate::drm::atomic::{AtomicState, PlaneState};
     use crate::drm::card::{CardError, DumbBacking, PixelFormat};
@@ -3960,6 +3961,7 @@ fn smoke_drm_navi48_plane_formats_end_to_end() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_navi48_plane_formats_end_to_end
@@ -3976,6 +3978,7 @@ kernel_test_in!(
 /// buffer is never evicted, outlives RMFB and GEM_CLOSE, and is unpinned
 /// (and freed) only once the HUBPs report the flip that replaced it
 /// latched; drm_fb_release removes an open's GEM framebuffers on close.
+#[cfg(feature = "amdgpu")]
 fn smoke_drm_navi48_gem_framebuffers_scan_out_in_place() -> TestResult {
     use crate::amdgpu_dm_modifiers::{DccBlock, Swizzle, Tiling};
     use crate::amdgpu_gem::{GemState, VramHeap};
@@ -4202,6 +4205,7 @@ fn smoke_drm_navi48_gem_framebuffers_scan_out_in_place() -> TestResult {
     crate::amdgpu_gem::unregister_vram_heap(idx);
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_navi48_gem_framebuffers_scan_out_in_place
@@ -4217,6 +4221,7 @@ kernel_test_in!(
 /// eviction moves an unpinned dumb buffer to system memory and the next
 /// flip's prepare_fb brings it back. Before the card's VRAM heap is up the
 /// card keeps its system-memory dumb buffers.
+#[cfg(feature = "amdgpu")]
 fn smoke_drm_navi48_dumb_buffers_scan_out_of_vram() -> TestResult {
     use crate::amdgpu_gem::{GemState, VramHeap};
     use crate::drm_uapi::{
@@ -4473,6 +4478,7 @@ fn smoke_drm_navi48_dumb_buffers_scan_out_of_vram() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_navi48_dumb_buffers_scan_out_of_vram
@@ -4555,6 +4561,7 @@ kernel_test_in!(
 /// `AMDGPU_INFO.return_pointer` is the client's: aimed at kernel memory it is
 /// EFAULT and the kernel bytes stay untouched, while the same request with
 /// the pointer standing in for user memory answers.
+#[cfg(feature = "amdgpu")]
 fn smoke_drm_user_copies_info_return_pointer() -> TestResult {
     use crate::amdgpu_uapi as u;
     use crate::drm_ioctl_bridge::kernel_test_buffers::StrictUserCopies;
@@ -4578,6 +4585,7 @@ fn smoke_drm_user_copies_info_return_pointer() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_user_copies_info_return_pointer
@@ -4616,6 +4624,7 @@ kernel_test_in!(
 // and runs amdgpu_dm's plane checks on ATOMIC (TEST_ONLY included) and
 // SETPLANE. DML admission and presentation are the native display's
 // (exercised by the navi48 tests); this card has none.
+#[cfg(feature = "amdgpu")]
 fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
     use crate::drm::card::DumbBacking;
     use crate::drm_native_planes as planes;
@@ -5143,6 +5152,7 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_ioctl_native_overlay_planes
@@ -5155,6 +5165,7 @@ kernel_test_in!(
 // the legacy CURSOR/CURSOR2 ioctls (drm_mode_cursor_universal) update it
 // through amdgpu_dm's cursor checks; the hardware cursor it drives is the
 // native display's (this card has none).
+#[cfg(feature = "amdgpu")]
 fn smoke_drm_ioctl_native_cursor_plane() -> TestResult {
     use crate::amdgpu_dm_modifiers::{FbCmd, FB_MODIFIERS};
     use crate::drm::card::DumbBacking;
@@ -5613,8 +5624,10 @@ fn smoke_drm_ioctl_native_cursor_plane() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_native_cursor_plane);
 
+#[cfg(feature = "amdgpu")]
 fn smoke_drm_ioctl_hdmi_color_format_property() -> TestResult {
     use crate::amdgpu_hdr::ColorFormat as F;
     let Some(idx) = color_card() else {
@@ -5684,6 +5697,7 @@ fn smoke_drm_ioctl_hdmi_color_format_property() -> TestResult {
     assert_eq!(atomic(0x400, 0), Err(FsError::InvalidData));
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_ioctl_hdmi_color_format_property

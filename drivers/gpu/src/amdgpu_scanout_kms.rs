@@ -4,16 +4,14 @@
 use super::*;
 #[cfg(feature = "amdgpu")]
 use crate::amdgpu_gem::{GemObject, GemState};
-/// Without the amdgpu driver there are no GEM objects to admit; the
-/// admission types still name the object type, so it is uninhabited
-/// and every target resolves to `None`.
-#[cfg(not(feature = "amdgpu"))]
-type GemObject = core::convert::Infallible;
-
+#[cfg(feature = "amdgpu")]
 type ModeState = Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>;
+#[cfg(feature = "amdgpu")]
 type Events = narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>;
+#[cfg(feature = "amdgpu")]
 type OutFences = narf_lib::sync::IrqSafeSpinLock<Vec<(u64, u64)>>;
 
+#[cfg(feature = "amdgpu")]
 #[derive(Debug)]
 struct OwnedAtomic {
     flags: u32,
@@ -23,6 +21,7 @@ struct OwnedAtomic {
     props: Vec<u32>,
     values: Vec<u64>,
 }
+#[cfg(feature = "amdgpu")]
 impl OwnedAtomic {
     fn request(&self) -> AtomicRequest<'_> {
         AtomicRequest {
@@ -38,6 +37,7 @@ impl OwnedAtomic {
 
 // User pointers are copied only here, before acquiring placement admission.
 // All later target selection and commit use these owned bytes, never arg.
+#[cfg(feature = "amdgpu")]
 enum Request {
     Atomic(OwnedAtomic),
     SetCrtc(DrmModeCrtcUapi, Option<u32>),
@@ -144,6 +144,7 @@ fn copy_atomic(arg: usize) -> Result<OwnedAtomic, FsError> {
             .collect(),
     })
 }
+#[cfg(feature = "amdgpu")]
 impl Request {
     #[cfg(feature = "amdgpu")]
     fn copy(nr: u32, arg: usize, gem: &GemState) -> Result<Self, FsError> {
@@ -471,6 +472,7 @@ impl Request {
 }
 /// The same plane state inheritance atomic_commit uses. Only FB/CRTC ids
 /// affect prepare_fb's targets; the commit still checks every property.
+#[cfg(feature = "amdgpu")]
 fn atomic_fbs(card: &crate::drm::card::Card, req: AtomicRequest<'_>) -> Result<Vec<u32>, FsError> {
     let mut out = Vec::new();
     let mut at = 0usize;
@@ -509,10 +511,12 @@ fn atomic_fbs(card: &crate::drm::card::Card, req: AtomicRequest<'_>) -> Result<V
     }
     Ok(out)
 }
+#[cfg(feature = "amdgpu")]
 struct Targets {
     fbs: Vec<(u32, Option<Arc<GemObject>>)>,
     cursor: Option<Arc<GemObject>>,
 }
+#[cfg(feature = "amdgpu")]
 impl Targets {
     fn objects(&self) -> Vec<Arc<GemObject>> {
         self.fbs
@@ -541,14 +545,20 @@ impl Targets {
 /// lookup permission for an authorized DRM master.
 pub(super) struct CommitAdmission<'a> {
     open: u64,
+    #[cfg(feature = "amdgpu")]
     request: &'a Request,
+    #[cfg(feature = "amdgpu")]
     targets: Option<&'a Targets>,
+    /// No native placement admission can be constructed without its owner.
+    #[cfg(not(feature = "amdgpu"))]
+    _uninhabited: (core::convert::Infallible, core::marker::PhantomData<&'a ()>),
 }
 impl CommitAdmission<'_> {
     pub(super) fn check(&self, card: &crate::drm::card::Card) -> Result<(), FsError> {
         if !card.is_master(self.open) {
             return Err(FsError::PermissionDenied);
         }
+        #[cfg(feature = "amdgpu")]
         if let Some(targets) = self.targets {
             let current = self.request.targets(card).map_err(|_| FsError::Busy)?;
             if !targets.same(&current) {
@@ -627,6 +637,6 @@ pub(crate) async fn dispatch(
     Some(result)
 }
 
-#[cfg(feature = "kernel-test")]
+#[cfg(all(feature = "kernel-test", feature = "amdgpu"))]
 #[path = "amdgpu_scanout_kms_tests.rs"]
 mod tests;

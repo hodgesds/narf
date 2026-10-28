@@ -275,6 +275,7 @@ kernel_test_in!("drivers/gpu/e2e", smoke_bochs_unprobe_cleanup);
 // PCI ID 1002:1636 to the Renoir family and the correct firmware blobs.
 // Verify the family + ASIC name + FW entry list is populated correctly.
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_renoir_probe_identifies_family() -> TestResult {
     use crate::amdgpu::{Family, AMD_VENDOR, RENOIR};
 
@@ -313,6 +314,7 @@ fn smoke_amdgpu_renoir_probe_identifies_family() -> TestResult {
 
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/e2e",
     smoke_amdgpu_renoir_probe_identifies_family
@@ -329,6 +331,7 @@ kernel_test_in!(
 // Uses gc_base = 0 so absolute addresses equal the published register
 // offsets directly.
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gfx9_ring_init_sequence() -> TestResult {
     use crate::amdgpu_gfx::{
         build_gfx9_ring_init, CP_ME_CNTL_HALT_ALL, CP_ME_CNTL_REL, CP_RB0_WPTR_HI_REL,
@@ -414,6 +417,7 @@ fn smoke_amdgpu_gfx9_ring_init_sequence() -> TestResult {
 
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu/e2e", smoke_amdgpu_gfx9_ring_init_sequence);
 
 // ── Smoke 7: fb-console glyph lands at the correct scanline ──────────────
@@ -660,6 +664,7 @@ kernel_test_in!("drivers/gpu/e2e", smoke_edid_parse_640x480_preferred_timing);
 // different CRTCs, then plan an independent modeset per connector and
 // confirm the plans reference distinct CRTCs.
 
+#[cfg(feature = "amdgpu")]
 fn smoke_drm_multi_monitor_enumerate_independent_modesets() -> TestResult {
     use crate::amdgpu::Family;
     use crate::amdgpu_atom_displayobj::ConnectorKind;
@@ -784,6 +789,7 @@ fn smoke_drm_multi_monitor_enumerate_independent_modesets() -> TestResult {
 
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/e2e",
     smoke_drm_multi_monitor_enumerate_independent_modesets
@@ -856,7 +862,9 @@ struct DrmFixtureNames {
     index: u32,
     primary: alloc::string::String,
     render: alloc::string::String,
+    #[cfg(feature = "amdgpu")]
     secondary: alloc::string::String,
+    #[cfg(feature = "amdgpu")]
     secondary_render: alloc::string::String,
 }
 impl DrmFixtureNames {
@@ -866,7 +874,9 @@ impl DrmFixtureNames {
             index,
             primary: alloc::format!("card{index}"),
             render: alloc::format!("renderD{}", index + 128),
+            #[cfg(feature = "amdgpu")]
             secondary: alloc::format!("card{}", index + 1),
+            #[cfg(feature = "amdgpu")]
             secondary_render: alloc::format!("renderD{}", index + 129),
         }
     }
@@ -1626,6 +1636,7 @@ kernel_test_in!("drivers/gpu/e2e", smoke_bochs_probe_registers_drm_card);
 
 // ── Smoke 21: AMDGPU Renoir probe → AmdgpuCard with correct vendor/device ─
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_renoir_registers_drm_card() -> TestResult {
     use crate::amdgpu::{AMD_VENDOR, RENOIR};
     use crate::drm_devfs_bridge::AmdgpuCard;
@@ -1656,10 +1667,12 @@ fn smoke_amdgpu_renoir_registers_drm_card() -> TestResult {
 
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu/e2e", smoke_amdgpu_renoir_registers_drm_card);
 
 // ── Smoke 22: two cards → card0+card1 + renderD128+renderD129 in DriDir ───
 
+#[cfg(feature = "amdgpu")]
 fn smoke_drm_two_cards_enumerate() -> TestResult {
     let names = DrmFixtureNames::next();
     use crate::amdgpu::{AMD_VENDOR, RENOIR};
@@ -1713,6 +1726,7 @@ fn smoke_drm_two_cards_enumerate() -> TestResult {
 
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_two_cards_enumerate);
 
 extern crate alloc;
@@ -1880,6 +1894,7 @@ kernel_test_in!(
     smoke_drm_sys_dev_char_symlink_resolves_nofollow
 );
 
+#[cfg(feature = "amdgpu")]
 fn smoke_drm_registry_append_preserves_lost_identity_and_existing_cards() -> TestResult {
     use crate::{amdgpu_gem as gem, drm_registry};
     let prior = drm_registry::cards();
@@ -1922,6 +1937,7 @@ fn smoke_drm_registry_append_preserves_lost_identity_and_existing_cards() -> Tes
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/e2e",
     smoke_drm_registry_append_preserves_lost_identity_and_existing_cards

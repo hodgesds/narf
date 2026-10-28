@@ -109,8 +109,8 @@ the canonical bit definition without re-deriving it.
   rates, the DDI ↔ transcoder route latch (`TRANS_DDI_FUNC_CTL`).
   Source: TGL PRM Vol. 12 "Display DDI".
 - **`intel_gpu_gtt`** — 64-bit GTT page-table entry layout: phys
-  address bits, PRESENT, level-of-cache (LLC eLLC), age policy,
-  TC bits. Source: TGL PRM Vol. 5 "Memory Views".
+  separate GGTT / PPGTT address, permission and PAT fields;
+  Gen12 / Xe-LPG system-memory formats. Source: TGL PRM Vol. 5 "Memory Views".
 
 Codec layer is transport-agnostic — it produces the wire
 register values without performing the MMIO write. The
@@ -118,15 +118,14 @@ Stage-3 driver core consumes these codecs through the
 `Transport`-equivalent indirection used elsewhere in narf
 (direct MMIO in kernel mode, cap-mediated MMIO in userspace).
 
-### Stage 3 (future) — Display-only driver core
-- Wire GMBUS to `narf-graphics::edid::Edid::parse` for EDID
-  read-out on whatever DDI the firmware left active.
-  (The GMBUS transport itself landed in #1018; the session
-  wiring into the driver core is the remaining step.)
-- Compute pipe / transcoder timing from EDID detailed-timing
+### Stage 3 (partially landed) — Display-only driver core
+- Internal-panel takeover uses Pipe A / DDI A and reads EDID
+  over AUX. External HDMI sessions use GMBUS (§15).
+- Compute pipe / transcoder timing from an EDID detailed-timing
   block; program PIPE / TRANS / PLANE through the Stage-2 codec.
-- Take over scanout from UEFI GOP without re-training the link
-  (modeset to firmware-supplied mode).
+- Take over an enabled firmware Pipe A surface with link
+  retraining. Arbitrary firmware pipe / DDI routing and a
+  takeover preserving the trained link remain open.
 
 ### Stage 4 (partially landed) — Frame buffer + KMS
 - GTT entry table population from the Stage-2 codec.
@@ -136,9 +135,14 @@ Stage-3 driver core consumes these codecs through the
 
 ### Stage 5+ (partially landed) — 3D / compute (TGL only)
 - Command streamer (RCS0) ring submission — **landed** as the
-  execlists path in `intel_gpu_rcs` (§8). GGTT addressing only.
-- Remaining: PPGTT per-context page tables, media engines,
-  full 3D pipeline state. Out of scope for v1; the
+  execlists path in `intel_gpu_rcs` (§8), with GGTT batches and
+  attached-context PPGTT batches (§18).
+- PPGTT per-context page tables and media submission — **landed**
+  (§9, §18).
+- Remaining: GT initialization, complete context/completion/reset ownership,
+  Xe-LPG GuC submission and Mesa interoperability. The storage/context/query
+  UAPI and immutable residency admission are described in §19.
+  Out of scope for v1; the
   kernel-resident driver only needs a display surface plus
   batch submission.
 
@@ -270,6 +274,29 @@ DDI A / eDP, single pipe):
   carries real KMS mode state (CRTC 1, encoder 2 TMDS,
   connector 3 eDP) instead of the identity stub.
 
+Scanout handoff requires an enabled firmware Pipe A and a successful
+takeover mode. Panel power with no admitted mode allocates no internal
+surface and publishes no synthetic 1024×768 display. The owned scanout
+becomes active only after its primary-plane register program is armed.
+
+Takeover and relight share generation dispatch (Gen12 versus Xe-LPG),
+with Panther Lake refused before MMIO. Restore uses `modeset_fixed` on
+the selected orchestrator, preserving the saved timing used to size the
+new allocation even if EDID now advertises a different preferred mode.
+Plane geometry, pitch and the complete 32-bit GGTT surface extent are
+validated before pipeline teardown. This does not enable Xe-LPG PM or
+establish physical display/suspend acceptance.
+The external-session gate is separate: combo HPD enable/poll, DP, HDMI,
+MST and USB-C DP Alt Mode remain Gen12-only until their Xe-LPG port
+sequences exist. Unsupported generations return before HPD register
+access; enabling the Xe-LPG internal panel must not enable Gen12 ports.
+
+Intel-only crate builds (`--no-default-features --features intel`) and
+their `kernel-test` fixtures use vendor feature guards throughout shared
+DRM hooks and tests. AMD native placement admission cannot be constructed
+without its backend; generic DRM/DP fixtures and the registration census
+remain enabled. Intel media and MST modules likewise require `intel`.
+
 ### Lane Q6 (#1024) — display follow-ons
 
 - **DBUF_CTL power sequencing** — the modeset requests power
@@ -320,8 +347,14 @@ DDI A / eDP, single pipe):
 
 ## 8. Command submission (Stage 5 — `intel_gpu_rcs`)
 
-The RCS0 execlists engine for Gen12. Compiled only under the
-gpu crate's `intel` feature. Public interface:
+The RCS0 execlists engine model and kernel submission helper for Gen12.
+Compiled only under the GPU crate's `intel` feature. This is not a complete
+userspace render backend (see §19). The corrected Gen12 restore template has
+13 initial register pairs, engine-relative LRI selectors and extended render
+state groups, ending at dword 0xb9; XCS ends at 0x34. RING_CTL uses byte size
+minus one page (128 KiB encodes 0x1f001) and the CSB has 12 entries. Fixed
+source-cited vectors pin these values separately from the hardware model.
+Public interface:
 
 - `RcsEngine::new(mmio, alloc)` — allocate the engine status
   page, program `RING_HWS_PGA`, adopt the hardware CSB write
@@ -353,9 +386,9 @@ gpu crate's `intel` feature. Public interface:
   controller on a default context.
 - `attach_ppgtt(ctx, root_phys)` / `detach_ppgtt(ctx)` /
   `ppgtt_root(ctx)` — program a PPGTT root (§9) into the
-  context image's PDP3 pair. Idle-context discipline, like
+  context image's PDP0 pair. Idle-context discipline, like
   every image patch here: a loaded or covered context refuses
-  with `ContextBusy`; an unaligned or >39-bit root is
+  with `ContextBusy`; an unaligned or >46-bit root is
   `InvalidPpgttRoot`.
 
 Invariants:
@@ -365,7 +398,7 @@ Invariants:
   descriptor marks an empty port.
 - Contexts address via GGTT by default: descriptor mode
   Legacy-64B, PDP image fields zero, batch ASI = GGTT. With
-  a PPGTT root attached (§9) the PDP3 pair carries the root
+  a PPGTT root attached (§9) the PDP0 pair carries the raw root address
   and the hardware walk runs under the context; batch
   allocations remain GGTT-backed and batch ASI stays GGTT
   until a VA-batch consumer lands.
@@ -439,11 +472,11 @@ Invariants:
   (§8); the media lane (#1022) is the named consumer that
   builds on per-context PPGTT.
 
-Flagged for first-silicon verification: in 4-level mode the
-execlists context's PDP3 pair carries the PML4 root (as a
-table entry, `phys | PRESENT`) and PDP0–PDP2 stay zero — the
-encoding `attach_ppgtt` writes (§8). It is a single patch
-site in `intel_gpu_rcs` if bring-up shows otherwise.
+In 4-level mode the context's **PDP0** pair carries the raw PML4
+physical address; PDP1–PDP3 remain zero. This is a register value,
+not a PTE. Source: MIT i915 `gt/intel_lrc_reg.h` ASSIGN_CTX_PML4
+and `gt/intel_lrc.c` lrc_update_regs (Linux v6.12). Native fixtures
+check the literal register image. Hardware acceptance remains open.
 
 
 ## 10. eDP panel power sequencing + PSR (Stage 5 — `intel_gpu_edp`, #1020)
@@ -1423,3 +1456,49 @@ governs here). BCS0 (copy, base `0x22000`) is one more
 `EngineSpec` away and deliberately out of this lane's
 scope; MTL media belongs to the Xe-LPG GT generation and is
 not claimed.
+
+
+## 19. Render UAPI and 3D admission (in progress)
+
+The public contract is `spec.md` §3, "Intel render UAPI and address-space
+admission". The modules are `intel_gpu_uapi` (wire definitions),
+`intel_gpu_gem` (owned system memory), `intel_gpu_render` (per-open dispatcher,
+contexts, VM handles and queries) and `intel_gpu_exec` (softpin admission and
+immutable PPGTT residency). Same-card PRIME shares owned objects and stable,
+globally distinct mmap offsets; foreign attachments/sync-file imports are
+unavailable. Both primary and render nodes route these requests
+before shared DRM/KMS dispatch and acquire mmap backing atomically.
+
+This is **not a working Mesa 3D backend**. Validated execbuffer requests still
+return NotImplemented. No userspace engines or acceleration capabilities are
+advertised. Gen12 production execlists helpers no longer admit Meteor/Arrow
+Lake merely because those devices have a region map. Xe-LPG needs its own GT
+and GuC owner, including firmware acquisition/authentication, CT transport,
+context registration, scheduling, completion and reset/loss lifetime handling.
+`intel_gpu_guc` now supplies validated CSS component ranges and coherent CTB
+send/receive primitives; neither is a boot/authentication or scheduling claim.
+Full context setup, topology, cache/fence protocol, accelerated PRIME/presentation and real
+Mesa OpenGL/Vulkan acceptance are also outstanding for Gen12.
+
+The memory audit corrected previous x86-like GPU PTE assumptions. Gen12
+PPGTT PAT bits are 3,4,7 and Xe-LPG adds bit62; Xe-LPG GGTT uses bits52,53.
+Gen12 system GGTT has no PAT bits. Intermediate PPGTT entries include RW;
+context PDP0 holds a raw physical address. No GPU NX/LRU permission is claimed.
+The common physical range is conservatively bounded to 46 bits. PAT numeric
+indices do not define cache policy: the eventual GT owner must program it.
+
+Native Rust fixtures use literal ABI/PTE vectors, fault-contained user-memory
+models, cross-open ownership failures, copy-failure rollback, extension cycles,
+query sizing/item errors, hostile residency placement and actual production
+PPGTT ownership after GEM/fd close. They do not establish silicon or Mesa
+interoperability.
+
+Primary references:
+
+- [Linux DRM i915 uAPI](https://docs.kernel.org/gpu/driver-uapi.html#drm-i915-uapi),
+  and the MIT `include/uapi/drm/i915_drm.h` wire definitions.
+- [Intel GPU page-table fields](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/i915/gt/intel_gtt.h),
+  MIT; fixed encoding vectors also follow `gen8_ppgtt.c` and `intel_ggtt.c`.
+- [Logical context root registers](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/i915/gt/intel_lrc_reg.h), MIT.
+- [GuC/HuC firmware layout](https://docs.kernel.org/gpu/xe/xe_firmware.html),
+  required background for the Xe-LPG firmware owner; no loader is claimed here.

@@ -940,6 +940,21 @@ interfaces and limits.
 
 ## Current work
 
+Intel render work on `codex/intel-gpu-support` now includes per-open i915-wire
+GEM storage, CPU copies/WB mmap, same-card PRIME sharing, context and VM
+namespaces, two-pass memory and
+engine queries, and bounded softpin execbuffer admission. Immutable Gen12 and
+Xe-LPG PPGTT residency retains referenced buffers after handle/fd close. The
+memory audit corrected GPU PAT fields, intermediate permissions and the raw
+PML4 root's PDP0 placement; the Gen12 engine audit corrected ring-size encoding,
+12-entry CSB depth and the extended engine-relative context restore groups.
+GuC CSS parsing and coherent CTB send/receive primitives cover the Xe-LPG
+firmware layout and transport boundary, without claiming firmware boot. These are native model/ownership paths, not working Mesa acceleration.
+EXECBUFFER2 still refuses submission and queries expose no userspace engines.
+Full GT/context setup, cache/completion/reset ownership, topology, accelerated PRIME/KMS,
+Mesa OpenGL/Vulkan acceptance and Xe-LPG GuC firmware/submission remain open.
+Existing Gen12 RCS/media helpers refuse Xe-LPG before MMIO.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

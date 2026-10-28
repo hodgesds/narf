@@ -55,13 +55,9 @@ type ConnectorColorRequest = core::convert::Infallible;
 /// The GEM buffer a legacy cursor request names (amdgpu only).
 #[cfg(feature = "amdgpu")]
 type CursorBo = Arc<crate::amdgpu_gem::GemObject>;
-#[cfg(not(feature = "amdgpu"))]
-type CursorBo = Arc<core::convert::Infallible>;
 /// A native hardware cursor's image (amdgpu only).
 #[cfg(feature = "amdgpu")]
 type CursorImage = crate::amdgpu_navi48_platform::CursorContent;
-#[cfg(not(feature = "amdgpu"))]
-type CursorImage = ();
 /// One display's planes in an atomic commit, as the native
 /// presenter consumes them (amdgpu only; the collection is empty
 /// by construction without the driver).
@@ -1126,6 +1122,7 @@ fn handle_transfer_3d(
 /// against the open's own table, for a kernel caller (no descriptor table).
 /// `timeline`: the driver has `DRIVER_SYNCOBJ_TIMELINE` (amdgpu does,
 /// virtio-gpu does not). User opens go through [`dispatch_syncobj_user`].
+#[cfg(feature = "amdgpu")]
 pub(crate) fn dispatch_syncobj(
     cmd: u32,
     arg: usize,
@@ -1165,6 +1162,7 @@ pub(crate) async fn dispatch_syncobj_user(
 
 impl VirtGpuRenderState {
     /// This open's syncobj table.
+    #[cfg(feature = "amdgpu")]
     pub(crate) fn syncobjs(
         &self,
     ) -> &narf_lib::sync::IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable> {
@@ -2246,7 +2244,9 @@ pub(crate) fn dispatch_card_for_file(
         // display follows.
         IoctlCmd::ModeRmFb => {
             // SAFETY: `arg` is the user drm_mode_rmfb pointer (a u32 fb id).
+            #[cfg(feature = "amdgpu")]
             let fb_id = u32::from_le_bytes(unsafe { copy_in(arg, 4)? }[..4].try_into().unwrap());
+            #[cfg(feature = "amdgpu")]
             let shown: Vec<u32> = mode_state
                 .lock()
                 .crtcs
@@ -2254,6 +2254,7 @@ pub(crate) fn dispatch_card_for_file(
                 .filter(|c| c.primary_fb == Some(fb_id))
                 .map(|c| c.id)
                 .collect();
+            #[cfg(feature = "amdgpu")]
             let overlaid: Vec<u32> = mode_state
                 .lock()
                 .native_planes
@@ -2261,6 +2262,7 @@ pub(crate) fn dispatch_card_for_file(
                 .filter(|p| p.is_overlay() && p.fb_id == Some(fb_id))
                 .filter_map(|p| p.crtc_id)
                 .collect();
+            #[cfg(feature = "amdgpu")]
             let cursors: Vec<u32> = mode_state
                 .lock()
                 .native_planes
@@ -3093,6 +3095,7 @@ const DRM_MODE_PROP_RANGE: u32 = 1 << 1;
 const DRM_MODE_PROP_IMMUTABLE: u32 = 1 << 2;
 const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
 const DRM_MODE_PROP_BLOB: u32 = 1 << 4;
+#[cfg(feature = "amdgpu")]
 const DRM_MODE_PROP_BITMASK: u32 = 1 << 5;
 const DRM_MODE_PROP_OBJECT: u32 = 1 << 6;
 const DRM_MODE_PROP_SIGNED_RANGE: u32 = 1 << 7;
@@ -3170,12 +3173,14 @@ fn handle_getplane_res(
     // The primaries, then a native card's overlay and cursor planes.
     let planes: Vec<u32> = {
         let card = mode_state.lock();
-        synth_planes(&card)
+        let planes: Vec<_> = synth_planes(&card).into_iter().map(|(id, _)| id).collect();
+        #[cfg(feature = "amdgpu")]
+        let planes = planes
             .into_iter()
-            .map(|(id, _)| id)
             .chain(crate::drm_native_planes::overlay_ids(&card))
             .chain(crate::drm_native_planes::cursor_ids(&card))
-            .collect()
+            .collect();
+        planes
     };
     if plane_id_ptr != 0 && user_count as usize >= planes.len() {
         let mut buf: Vec<u8> = Vec::with_capacity(planes.len() * 4);
@@ -3229,7 +3234,7 @@ fn handle_getplane(
                         .iter()
                         .position(|c| Some(c.id) == p.cursor_of)
                         .map_or(0, |i| 1u32 << i),
-                    &crate::drm_native_planes::CURSOR_FORMATS[..],
+                    &[DRM_FORMAT_ARGB8888][..],
                     (p.crtc_id.unwrap_or(0), p.fb_id.unwrap_or(0)),
                 ),
                 Some(p) => (
@@ -3280,17 +3285,17 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
     // The connector "EDID" property: an immutable blob. It carries no enum /
     // range values, so both counts stay 0; the bytes are fetched separately via
     // GETPROPBLOB using the blob id GETCONNECTOR reported as this prop's value.
-    if prop_id == EDID_PROP_ID
-        || prop_id == crate::drm_native_planes::IN_FORMATS_PROP_ID
-        || prop_id == crate::drm_native_planes::IN_FORMATS_ASYNC_PROP_ID
-    {
+    let blob_name: Option<&[u8]> = match prop_id {
+        EDID_PROP_ID => Some(b"EDID"),
+        #[cfg(feature = "amdgpu")]
+        crate::drm_native_planes::IN_FORMATS_PROP_ID => Some(b"IN_FORMATS"),
+        #[cfg(feature = "amdgpu")]
+        crate::drm_native_planes::IN_FORMATS_ASYNC_PROP_ID => Some(b"IN_FORMATS_ASYNC"),
+        _ => None,
+    };
+    if let Some(name) = blob_name {
         out[20..24].copy_from_slice(&(DRM_MODE_PROP_BLOB | DRM_MODE_PROP_IMMUTABLE).to_le_bytes());
         out[24..56].fill(0);
-        let name: &[u8] = match prop_id {
-            EDID_PROP_ID => b"EDID",
-            crate::drm_native_planes::IN_FORMATS_PROP_ID => b"IN_FORMATS",
-            _ => b"IN_FORMATS_ASYNC",
-        };
         out[24..24 + name.len()].copy_from_slice(name);
         out[56..60].copy_from_slice(&0u32.to_le_bytes()); // count_values
         out[60..64].copy_from_slice(&0u32.to_le_bytes()); // count_enum_blobs
@@ -3423,6 +3428,7 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
         )),
         // amdgpu_dm's plane "alpha" and "zpos" ranges (the primary's zpos
         // immutable).
+        #[cfg(feature = "amdgpu")]
         p => crate::drm_native_planes::range_property(p).map(|(name, immutable, range)| {
             let flags = if immutable {
                 DRM_MODE_PROP_RANGE | DRM_MODE_PROP_IMMUTABLE
@@ -3431,6 +3437,8 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
             };
             (name, flags, range)
         }),
+        #[cfg(not(feature = "amdgpu"))]
+        _ => None,
     };
     if let Some((name, flags, values)) = simple {
         // Linux object properties expose one value: the accepted DRM object
@@ -3459,26 +3467,31 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
         BROADCAST_RGB_PROP_ID => (b"Broadcast RGB", DRM_MODE_PROP_ENUM, &BROADCAST_RGB_ENUMS),
         COLORSPACE_PROP_ID => (b"Colorspace", DRM_MODE_PROP_ENUM, &COLORSPACE_ENUMS),
         COLOR_FORMAT_PROP_ID => (b"color format", DRM_MODE_PROP_ENUM, &COLOR_FORMAT_ENUMS),
+        #[cfg(feature = "amdgpu")]
         crate::drm_native_planes::BLEND_PROP_ID => (
             b"pixel blend mode",
             DRM_MODE_PROP_ENUM,
             &crate::drm_native_planes::BLEND_ENUMS,
         ),
+        #[cfg(feature = "amdgpu")]
         crate::drm_native_planes::CURSOR_BLEND_PROP_ID => (
             b"pixel blend mode",
             DRM_MODE_PROP_ENUM,
             &crate::drm_native_planes::CURSOR_BLEND_ENUMS,
         ),
+        #[cfg(feature = "amdgpu")]
         crate::drm_native_planes::ROTATION_PROP_ID => (
             b"rotation",
             DRM_MODE_PROP_BITMASK,
             &crate::drm_native_planes::ROTATION_ENUMS,
         ),
+        #[cfg(feature = "amdgpu")]
         crate::drm_native_planes::COLOR_ENCODING_PROP_ID => (
             b"COLOR_ENCODING",
             DRM_MODE_PROP_ENUM,
             &crate::drm_native_planes::COLOR_ENCODING_ENUMS,
         ),
+        #[cfg(feature = "amdgpu")]
         crate::drm_native_planes::COLOR_RANGE_PROP_ID => (
             b"COLOR_RANGE",
             DRM_MODE_PROP_ENUM,
@@ -3688,6 +3701,7 @@ fn apply_crtc_color(
     }
 }
 
+#[cfg(feature = "amdgpu")]
 fn native_output_on_crtc(
     card: &crate::drm::card::Card,
     crtc: u32,
@@ -4063,6 +4077,8 @@ fn apply_broadcast_rgb(
     connector: u32,
     value: u8,
 ) {
+    #[cfg(not(feature = "amdgpu"))]
+    let _ = card_index;
     if let Some(native) = card.native.iter_mut().find(|n| n.connector == connector) {
         native.broadcast_rgb = Some(value);
     }
@@ -4383,10 +4399,10 @@ fn handle_getpropblob(
         let native_blob = crate::drm_native_planes::in_formats_blob(&card, blob_id);
         #[cfg(not(feature = "amdgpu"))]
         let native_blob: Option<Vec<u8>> = None;
-        match card.property_blob(blob_id) {
-            Some(data) => data.to_vec(),
-            None if native_blob.is_some() => native_blob.unwrap(),
-            None => {
+        match (card.property_blob(blob_id), native_blob) {
+            (Some(data), _) => data.to_vec(),
+            (None, Some(data)) => data,
+            (None, None) => {
                 let connector_id =
                     connector_id_from_edid_blob(blob_id).ok_or(FsError::InvalidData)?;
                 connector_edid(&card, connector_id)
@@ -4433,18 +4449,12 @@ fn handle_obj_getproperties(
         let card = mode_state.lock();
         // A native card's plane (primary or overlay): the core plane
         // properties from its state, then amdgpu_dm's.
-        let native: Option<crate::drm::atomic::PlaneState> = (obj_type == DRM_MODE_OBJECT_PLANE)
-            .then(|| {
-                #[cfg(feature = "amdgpu")]
-                {
-                    crate::drm_native_planes::plane_state(&card, obj_id)
-                }
-                #[cfg(not(feature = "amdgpu"))]
-                {
-                    None
-                }
-            })
+        #[cfg(feature = "amdgpu")]
+        let native = (obj_type == DRM_MODE_OBJECT_PLANE)
+            .then(|| crate::drm_native_planes::plane_state(&card, obj_id))
             .flatten();
+        #[cfg(not(feature = "amdgpu"))]
+        let native: Option<crate::drm::atomic::PlaneState> = None;
         if let Some(p) = native {
             let plane_type = card
                 .native_plane(obj_id)
@@ -4457,7 +4467,7 @@ fn handle_obj_getproperties(
                         DRM_PLANE_TYPE_PRIMARY
                     }
                 });
-            let mut props = vec![
+            let props = vec![
                 PLANE_TYPE_PROP_ID,
                 PLANE_FB_ID_PROP_ID,
                 PLANE_CRTC_ID_PROP_ID,
@@ -4471,7 +4481,7 @@ fn handle_obj_getproperties(
                 PLANE_CRTC_H_PROP_ID,
                 PLANE_IN_FENCE_FD_PROP_ID,
             ];
-            let mut values = vec![
+            let values = vec![
                 plane_type,
                 u64::from(p.fb_id.unwrap_or(0)),
                 u64::from(p.crtc_id.unwrap_or(0)),
@@ -4485,6 +4495,8 @@ fn handle_obj_getproperties(
                 u64::from(p.crtc_h),
                 (-1i64) as u64,
             ];
+            #[cfg(feature = "amdgpu")]
+            let (mut props, mut values) = (props, values);
             #[cfg(feature = "amdgpu")]
             if let Some((ids, vals)) = crate::drm_native_planes::object_properties(&card, obj_id) {
                 props.extend(ids);
@@ -4508,7 +4520,7 @@ fn handle_obj_getproperties(
                 .map(|f| f.height)
                 .or_else(|| crtc.mode.map(|m| m.height))
                 .unwrap_or(0);
-            let (mut props, mut values) = (
+            let (props, values) = (
                 vec![
                     PLANE_TYPE_PROP_ID,
                     PLANE_FB_ID_PROP_ID,
@@ -4544,6 +4556,8 @@ fn handle_obj_getproperties(
                     (-1i64) as u64,
                 ],
             );
+            #[cfg(feature = "amdgpu")]
+            let (mut props, mut values) = (props, values);
             #[cfg(feature = "amdgpu")]
             if crate::amdgpu_native_kms::linear_gem_card(&card) {
                 // GBM must choose LINEAR explicitly for the DCN30 copy
@@ -4967,7 +4981,10 @@ fn atomic_commit(
     let mut color_requests: Vec<(u8, CrtcColorRequest)> = Vec::new();
     let mut connector_requests: Vec<ConnectorColorRequest> = Vec::new();
     // Native cursor planes' hardware cursors, likewise.
+    #[cfg(feature = "amdgpu")]
     let mut cursor_requests: Vec<CursorRequest> = Vec::new();
+    #[cfg(not(feature = "amdgpu"))]
+    let cursor_requests: Vec<CursorRequest> = Vec::new();
     // Native connector "max bpc" changes, likewise.
     let mut max_bpc_requests: Vec<(u32, u8)> = Vec::new();
     let presentation = {
@@ -5430,8 +5447,6 @@ fn atomic_commit(
                             .is_some_and(|current| current.connector == n.connector)
                     })
             });
-        #[cfg(not(feature = "amdgpu"))]
-        let hdmi_touched = false;
         #[cfg(feature = "amdgpu")]
         if hdmi_touched && crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
             let mut outputs = Vec::new();
@@ -5556,7 +5571,6 @@ fn atomic_commit(
             // drm_atomic_helper_prepare_planes (amdgpu_dm's prepare_fb) for
             // every plane the commit shows, before any state changes: a pin
             // that fails fails the commit with its errno.
-            #[cfg(feature = "amdgpu")]
             let prepared = PreparedFbs::prepare(
                 &card,
                 state
@@ -5879,6 +5893,8 @@ fn handle_cursor(
     with_hotspot: bool,
     ctx: &DrmFileCtx,
 ) -> Result<u64, FsError> {
+    #[cfg(not(feature = "amdgpu"))]
+    let _ = (card_index, ctx);
     const DRM_MODE_CURSOR_BO: u32 = 0x01;
     const DRM_MODE_CURSOR_MOVE: u32 = 0x02;
     let want = if with_hotspot { 36 } else { 28 };
@@ -5894,6 +5910,7 @@ fn handle_cursor(
     let y = rd_i32(12);
     let handle = rd_u32(24);
     if !mode_state.lock().native_planes.is_empty() {
+        #[cfg(feature = "amdgpu")]
         return cursor_universal(
             card_index,
             mode_state,
@@ -5908,6 +5925,8 @@ fn handle_cursor(
             None,
             None,
         );
+        #[cfg(not(feature = "amdgpu"))]
+        return Err(FsError::Unsupported);
     }
     // CURSOR2 reports the hotspot — the active point inside the BO. Our
     // sprite's tip is at its own top-left, so shift the draw position by the
@@ -5936,6 +5955,7 @@ fn handle_cursor(
 /// One DRM_IOCTL_MODE_CURSOR{,2} request. CURSOR2's hotspot is not kept:
 /// amdgpu is not DRIVER_CURSOR_HOTSPOT, so its cursor planes carry no
 /// HOTSPOT_X/Y (drm_mode_cursor_universal drops it).
+#[cfg(feature = "amdgpu")]
 struct LegacyCursor {
     flags: u32,
     crtc_id: u32,
@@ -5952,6 +5972,7 @@ struct LegacyCursor {
 /// `bo` is the amdgpu GEM buffer `req.handle` names in the caller's own
 /// table (`amdgpu_cursor_bo`), wrapped by `Card::addfb2_bo`; without it the
 /// handle is one of the card's dumb buffers.
+#[cfg(feature = "amdgpu")]
 fn cursor_universal(
     card_index: u32,
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
@@ -5962,15 +5983,7 @@ fn cursor_universal(
 ) -> Result<u64, FsError> {
     // Only a card with native cursor planes has any of this to do;
     // those exist only on the amdgpu native card.
-    #[cfg(feature = "amdgpu")]
-    {
-        cursor_universal_native(card_index, mode_state, ctx, req, bo, admission)
-    }
-    #[cfg(not(feature = "amdgpu"))]
-    {
-        let _ = (card_index, mode_state, ctx, req, bo, admission);
-        Err(FsError::Unsupported)
-    }
+    cursor_universal_native(card_index, mode_state, ctx, req, bo, admission)
 }
 
 #[cfg(feature = "amdgpu")]
@@ -6078,11 +6091,14 @@ fn cursor_universal_native(
 /// One native cursor plane's commit for the CRTC's hardware cursor: what
 /// it shows (a dumb buffer's image, or a pinned GEM buffer whose rows the
 /// cursor task reads once its writes landed) and where.
+#[cfg(feature = "amdgpu")]
 struct CursorRequest {
     crtc_id: u32,
     image: Option<CursorImage>,
     position: (i32, i32),
 }
+#[cfg(not(feature = "amdgpu"))]
+type CursorRequest = core::convert::Infallible;
 
 /// Whether native plane state `plane` is a cursor plane shown on a CRTC.
 fn cursor_plane_shown(
@@ -6179,6 +6195,7 @@ fn send_cursor_requests(requests: Vec<CursorRequest>) {
 
 /// Drop a kernel-held framebuffer (a legacy-wrapped cursor one), freeing
 /// its backing when that was the last reference, as RMFB does.
+#[cfg(feature = "amdgpu")]
 fn release_framebuffer(card: &mut crate::drm::card::Card, fb_id: u32) {
     if let Ok(Some((phys, order))) = card.rmfb(fb_id) {
         let frame = narf_memory::frame::PhysFrame::new(narf_memory::addr::PhysAddr::new(phys));
@@ -6525,6 +6542,8 @@ fn handle_setcrtc_decoded(
     admission: Option<&scanout_kms::CommitAdmission<'_>>,
     validate_only: bool,
 ) -> Result<u64, FsError> {
+    #[cfg(not(feature = "amdgpu"))]
+    let _ = setcrtc_connector;
     // Look up the framebuffer → GEM handle → dumb backing phys.
     let src_phys: Option<u64>;
     let virgl_resource: Option<Arc<VirtGpuResource>>;
@@ -6546,10 +6565,9 @@ fn handle_setcrtc_decoded(
         let native_display = (crate::drm_registry::driver_name(card_index) == Some("amdgpu"))
             .then(|| crate::amdgpu_native_kms::crtc_display(req.crtc_id))
             .flatten();
-        #[cfg(not(feature = "amdgpu"))]
-        let native_display: Option<u8> = None;
         // The connector SETCRTC routes the native CRTC to: one at most (no
         // cloning); none keeps the current routing.
+        #[cfg(feature = "amdgpu")]
         let native_connector = if native_display.is_some() && req.count_connectors != 0 {
             if req.count_connectors != 1 || req.set_connectors_ptr == 0 {
                 return Err(FsError::InvalidData);
@@ -6562,6 +6580,7 @@ fn handle_setcrtc_decoded(
         } else {
             None
         };
+        #[cfg(feature = "amdgpu")]
         let mut native_wire = None;
         if req.mode_valid != 0 {
             let m = req.mode;
@@ -6594,7 +6613,10 @@ fn handle_setcrtc_decoded(
             {
                 return Err(FsError::InvalidData);
             }
-            native_wire = Some(wire);
+            #[cfg(feature = "amdgpu")]
+            {
+                native_wire = Some(wire);
+            }
         }
 
         let requested = (req.mode_valid != 0).then(|| crate::Mode {
@@ -6844,6 +6866,8 @@ fn present_dirty(
     f: crate::drm::card::PlaneFrame,
     rows: core::ops::Range<u32>,
 ) {
+    #[cfg(not(feature = "amdgpu"))]
+    let _ = rows;
     #[cfg(feature = "amdgpu")]
     if crate::drm_registry::driver_name(card_index) == Some("amdgpu")
         && f.bo.is_none()
@@ -7304,7 +7328,10 @@ impl PreparedFbs {
         card: &crate::drm::card::Card,
         fb_ids: impl IntoIterator<Item = u32>,
     ) -> Result<Self, FsError> {
+        #[cfg(feature = "amdgpu")]
         let mut pins: Vec<(u32, crate::drm::card::ScanoutPin)> = Vec::new();
+        #[cfg(not(feature = "amdgpu"))]
+        let pins: Vec<(u32, crate::drm::card::ScanoutPin)> = Vec::new();
         for id in fb_ids {
             if pins.iter().any(|(f, _)| *f == id) {
                 continue;
@@ -7343,6 +7370,7 @@ impl PreparedFbs {
 /// A native plane's framebuffer as the presenter shows it: its dumb
 /// backing (which the presenter copies), or its amdgpu GEM buffer pinned
 /// for scanout in place (`prepared_frame`); pitch, size and fourcc.
+#[cfg(feature = "amdgpu")]
 fn native_plane_frame(
     card: &crate::drm::card::Card,
     plane: &crate::drm::atomic::PlaneState,
@@ -7371,7 +7399,7 @@ fn prepared_frame(
 
 /// `prepared_frame` of framebuffer `fb` after preparing it alone (None
 /// when its GEM buffer cannot be pinned).
-#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+#[cfg(all(feature = "kernel-test", feature = "amdgpu", target_arch = "x86_64"))]
 pub(crate) fn scanout_frame(
     card: &crate::drm::card::Card,
     fb: &crate::drm::card::Framebuffer,
@@ -7439,6 +7467,8 @@ fn present_frame(
 ) {
     let (src_phys, src_pitch, src_w, src_h, src_format) =
         (f.phys, f.pitch, f.width, f.height, f.format);
+    #[cfg(not(feature = "amdgpu"))]
+    let _ = (crtc_id, flip_ticket, src_format);
     let driver = crate::drm_registry::driver_name(card_index);
     // A native amdgpu display presents tear-free through its back buffer
     // and a VUPDATE-latched flip instead of copying onto the visible front.
@@ -7983,6 +8013,7 @@ fn finish_amdgpu_dumb(
 }
 
 /// `struct drm_mode_create_dumb` at `arg`.
+#[cfg(feature = "amdgpu")]
 fn read_create_dumb(arg: usize) -> Result<DrmModeCreateDumbUapi, FsError> {
     // SAFETY: `arg` is the ioctl pointer; copy_in bounds-checks.
     let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmModeCreateDumbUapi>())? };

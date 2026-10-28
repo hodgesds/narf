@@ -998,7 +998,8 @@ pub mod tests {
     fn test_fb() -> Framebuffer {
         Framebuffer {
             phys_addr: 0x40_0000,
-            stride_bytes: 8192,
+            // The conversation suite includes a 3840-pixel 32-bpp mode.
+            stride_bytes: 15360,
             format: PixelFormat::Xrgb8888,
         }
     }

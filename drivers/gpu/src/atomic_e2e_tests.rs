@@ -1136,6 +1136,7 @@ kernel_test_in!(
 // AmdgpuCard::subsystem_vendor() returns the value; sysfs formats it as
 // "0x<hex4>\n". Verify the formatting function produces the right string.
 
+#[cfg(feature = "amdgpu")]
 fn smoke_subsystem_id_sysfs_vendor_format() -> TestResult {
     use crate::drm_devfs_bridge::AmdgpuCard;
     use crate::drm_registry::DrmCard;
@@ -1160,6 +1161,7 @@ fn smoke_subsystem_id_sysfs_vendor_format() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/atomic_e2e",
     smoke_subsystem_id_sysfs_vendor_format
@@ -1167,6 +1169,7 @@ kernel_test_in!(
 
 // ── Smoke 20: sysfs subsystem_device attr format ──────────────────────────
 
+#[cfg(feature = "amdgpu")]
 fn smoke_subsystem_id_sysfs_device_format() -> TestResult {
     use crate::drm_devfs_bridge::AmdgpuCard;
     use crate::drm_registry::DrmCard;
@@ -1190,6 +1193,7 @@ fn smoke_subsystem_id_sysfs_device_format() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/atomic_e2e",
     smoke_subsystem_id_sysfs_device_format
@@ -1232,6 +1236,7 @@ kernel_test_in!(
 // Verify that an AmdgpuCard constructed with real subsystem IDs doesn't
 // accidentally return 0 (which was the pre-fix stub behaviour).
 
+#[cfg(feature = "amdgpu")]
 fn smoke_subsystem_id_amdgpu_nonzero_when_set() -> TestResult {
     use crate::drm_devfs_bridge::AmdgpuCard;
     use crate::drm_registry::DrmCard;
@@ -1257,6 +1262,7 @@ fn smoke_subsystem_id_amdgpu_nonzero_when_set() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/atomic_e2e",
     smoke_subsystem_id_amdgpu_nonzero_when_set

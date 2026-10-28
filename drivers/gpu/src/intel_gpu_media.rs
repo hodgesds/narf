@@ -467,6 +467,12 @@ static MEDIA_STATE: narf_lib::sync::IrqSafeSpinLock<Option<MediaState>> =
 
 fn attach_media() -> Result<(), MediaError> {
     let built = crate::intel_gpu::with_controller(|gpu| {
+        if !matches!(
+            gpu.chip_info().generation,
+            crate::intel_gpu::Generation::TigerLake | crate::intel_gpu::Generation::AlderLake
+        ) {
+            return None;
+        }
         let rg = gpu.chip_info().generation.region_generation()?;
         let specs = media_engines_for(rg);
         if specs.is_empty() {
@@ -580,12 +586,11 @@ pub mod tests {
 
     use crate::intel_gpu_rcs::{
         build_reg_state, build_reg_state_for, context_descriptor, context_descriptor_for,
-        descriptor_class, descriptor_instance, descriptor_lrca, descriptor_sw_id,
-        mi_load_register_imm, GpuAllocator, GpuBacking, BB_START_ASI_PPGTT, CSB_BUF_BYTE,
-        CSB_ENTRIES, CSB_WRITE_BYTE, CTX_CONTEXT_CONTROL, CTX_END, CTX_LRI_HEADER_0,
-        CTX_LRI_HEADER_2, CTX_PDP3_UDW, CTX_RING_BUFFER_START, CTX_R_PWR_CLK_STATE,
-        GGTT_ARENA_BASE, GGTT_ARENA_PAGES, IDLE_SW_ID, MI_BATCH_BUFFER_END, RCS0_SPEC,
-        REG_STATE_PAGE_BYTE, RING_BYTES,
+        descriptor_class, descriptor_instance, descriptor_lrca, descriptor_sw_id, GpuAllocator,
+        GpuBacking, BB_START_ASI_PPGTT, CSB_BUF_BYTE, CSB_ENTRIES, CSB_WRITE_BYTE,
+        CTX_CONTEXT_CONTROL, CTX_LRI_HEADER_0, CTX_LRI_HEADER_2, CTX_PDP3_UDW,
+        CTX_RING_BUFFER_START, CTX_R_PWR_CLK_STATE, GGTT_ARENA_BASE, GGTT_ARENA_PAGES, IDLE_SW_ID,
+        MI_BATCH_BUFFER_END, RCS0_SPEC, REG_STATE_PAGE_BYTE, RING_BYTES,
     };
 
     // ── Fake MMIO (with forcewake ack modelling) ────────────
@@ -1098,7 +1103,7 @@ pub mod tests {
 
     fn smoke_media_reg_state_xcs() -> TestResult {
         let t = build_reg_state_for(&VECS0_SPEC, 0x1000_5000, RING_BYTES);
-        if t[CTX_LRI_HEADER_0] != mi_load_register_imm(14, true) {
+        if t[CTX_LRI_HEADER_0] != 0x1108_1019 {
             return TestResult::Fail("XCS group 0 header");
         }
         // Register addresses are the engine's own.
@@ -1119,7 +1124,7 @@ pub mod tests {
         {
             return TestResult::Fail("XCS template carries render group");
         }
-        if t[CTX_END] != MI_BATCH_BUFFER_END | 1 {
+        if t[crate::intel_gpu_rcs::CTX_XCS_END] != MI_BATCH_BUFFER_END | 1 {
             return TestResult::Fail("XCS template terminator");
         }
         // The RCS template is byte-identical through the
@@ -1130,7 +1135,7 @@ pub mod tests {
             return TestResult::Fail("RCS template drifted");
         }
         let rcs = build_reg_state(0x1000_5000, RING_BYTES);
-        if rcs[CTX_LRI_HEADER_2] != mi_load_register_imm(1, false) {
+        if rcs[CTX_LRI_HEADER_2] != 0x1108_0001 {
             return TestResult::Fail("RCS render group lost");
         }
         TestResult::Pass

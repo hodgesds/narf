@@ -63,6 +63,125 @@ AMD-only configs do not. Neither vendor is offered as a loadable
 module: the module loader exists, but there is no GPU-class
 datapath ABI yet, so the feature gate is the selection mechanism.
 
+The feature split applies to the shared DRM render-node hooks, native AMD
+plane metadata and placement admission, and vendor-specific test helpers
+and registrations. Without AMD, native placement admission is uninhabited;
+generic KMS request decoding, primary planes, EDID and software cursors
+remain available. Intel media and MST modules require `intel`, like the
+rest of that backend. Generic DRM/DP fixtures stay enabled with either or
+both vendors disabled. The registration census has its own test subsystem,
+`drivers/gpu/vendor_features`, for focused boot checks.
+
+### Intel scanout takeover and restore
+
+`intel_gpu_modeset::Modeset::modeset_fixed` and
+`intel_gpu_modeset_xelpg::XeLpgModeset::modeset_fixed` program the
+caller's exact timing without replacing it with an EDID preferred mode.
+Probe takeover and `intel_gpu::relight_display` share generation dispatch:
+Tiger/Alder/Raptor Lake use Gen12; Meteor/Arrow Lake use Xe-LPG; Panther
+Lake refuses programming with `ModesetError::UnsupportedGeneration`.
+This dispatch does not enable Xe-LPG power management, which remains gated.
+`Generation::external_display_supported` admits only Gen12: external
+DP/HDMI/MST sessions, combo HPD enable/poll and the USB-C DP bridge use
+that gate before register access. Meteor/Arrow Lake internal-panel support
+does not admit the Gen12 external port sequence.
+
+The framebuffer's historical `phys_addr` field is a page-aligned 32-bit
+GGTT byte offset. Both display paths reject invalid plane dimensions,
+zero/unaligned/short pitch and surfaces extending past the 32-bit GGTT
+window before changing a live pipeline. An explicit restore uses the
+timing for which its backing allocation was sized.
+Probe allocates an owned internal-panel surface only after takeover of
+an enabled firmware pipe returns a mode. It publishes the owned surface
+to DRM and the framebuffer console only after primary-plane programming;
+panel power alone cannot produce a synthetic active 1024×768 display.
+Native register-model smokes cover these paths; physical scanout and
+suspend/resume acceptance remain separate hardware work.
+
+### Intel render UAPI and address-space admission
+
+`intel_gpu_uapi` defines the Linux i915 ioctl wire numbers on both supported
+64-bit architectures. `intel_gpu_render::RenderFile` is per open on both the
+primary and render nodes; nested pointers use `IoctlContext`. Driver-private
+requests require the complete ioctl encoding (including direction and size).
+Generic DRM/KMS requests retain their existing dispatcher. The driver continues
+to identify as `intel-gpu`; it does not yet advertise Mesa-ready acceleration.
+
+Implemented storage operations are GEM_CREATE/CREATE_EXT (system region only),
+CLOSE, PREAD/PWRITE, MMAP_OFFSET (WB system RAM only), linear GET/SET_TILING,
+cached GET/SET_CACHING, MADVISE, CPU SET_DOMAIN and idle BUSY/WAIT/SW_FINISH.
+GEM_MMAP_GTT, legacy GEM_MMAP and GET_APERTURE are unavailable. Handles are local
+to an open. Each object owns zeroed scattered frames; a mapping atomically
+acquires frames and an Arc retaining their owner. Close removes only the handle.
+Limits are 4096 handles / 256 MiB per open and at most min(512 MiB, half RAM)
+of live objects globally, including retained objects after handle close.
+Creation-copy failure publishes no handle and releases its pages/accounting.
+Same-card PRIME export/import shares the existing object and deduplicates
+reimports on an open. Globally unique stable fake mmap offsets avoid collisions
+with the importer's existing objects. Exported fd mappings retain the same
+pages after all GEM handles and fds close. DMA_BUF_IOCTL_SYNC validates CPU
+access flags and orders coherent RAM access; foreign attachments and external
+sync-file imports are unavailable while the render backend is closed.
+
+Context/VM create, destroy and scalar GET/SETPARAM have per-open namespaces,
+bounded extension chains and retained VM identity after VM-handle destruction.
+Context zero is implicit. Only normal priority is admitted, disabling banning
+is refused, and no privilege follows from context creation. QUERY has Linux's
+two-pass/per-item signed-length protocol: system memory reports actual RAM;
+engine info reports zero available userspace engines. Unavailable topology,
+HWCONFIG and GuC-version queries return per-item errors instead of synthetic
+hardware data. Submission capabilities and HAS_ALIASING_PPGTT remain zero.
+
+`intel_gpu_exec::ExecRequest::read` admits a bounded softpin/no-relocation
+residency plan: this file's unique handles, valid canonical GPU addresses,
+alignment, non-overlap, first/last batch selection and in-object batch extent.
+Secure execution, relocations, sync/fence extensions and unsupported flags are
+refused. `address_space(format, pat_index)` constructs immutable private PPGTT
+tables retaining every referenced object; failed construction tears down all
+tables. An existing VM/engine is never changed by admission. The plan's WRITE
+bit selects writable leaves in this restricted path. EXECBUFFER2 currently
+returns NotImplemented even for a valid plan: a resident address space does not
+establish GT initialization, nonsecure execution, fence completion or reset.
+
+`SubmissionProfile::for_generation` selects Gen12 execlists for Tiger/Alder/
+Raptor Lake and a separate Xe-LPG GuC path for Meteor/Arrow Lake. Panther Lake
+has no submission profile. Existing default RCS/media production attach paths
+admit only Gen12 before any MMIO. A display gate cannot admit a render engine.
+GuC boot/registration/scheduling, render topology, full context setup, terminal
+fences, reset/loss retention, accelerated PRIME/KMS integration and Mesa interoperability
+remain required before exposing acceleration. Graphics APIs and shader/state
+generation belong in userspace.
+
+`intel_gpu_gtt::PteFormat` distinguishes Gen12 and Xe-LPG GPU encodings:
+PPGTT PAT[2:0] occupy bits 7,4,3; Xe-LPG adds PAT3 at bit62. Gen12 system GGTT
+entries have no PAT bits; Xe-LPG GGTT PAT[1:0] occupy bits53:52. Intermediate
+PPGTT entries carry PRESENT|RW. There is no CPU-style NX/LRU encoding. The
+common supported physical field is bits45:12, with 4-KiB system pages only.
+`encode_engine_pte` and `Ppgtt::map` now take **writable**, replacing the previous
+incorrect executable/NX contract. `Ppgtt::with_format`/`map_with_pat` expose
+the generation and full PAT index; the GT owner establishes each PAT policy.
+`alloc_contiguous_scanout_with_format` accepts an explicit GGTT format/index.
+The Gen12 wrappers use its PAT-free GGTT encoding. Context attachment writes
+the raw PML4 physical address to PDP0, leaving PDP1–3 zero.
+The Gen12 context codec uses engine-relative LRI selectors, thirteen initial
+register pairs, the extended render restore groups and an RCS terminator at
+dword 0xb9 (XCS at 0x34). RING_CTL encodes bytes minus one page in bits20:12;
+the Gen11/Gen12 CSB has twelve entries. These register-model corrections do
+not establish a fully initialized, isolated or recoverable userspace engine.
+
+`intel_gpu_guc::CssImage::parse` validates CSS, uCode and RSA component ranges,
+required firmware major version, optional complete/truncated key suffix and
+bounded private-data size. It grants no asset authority or signature validity.
+`CtSender`/`CtReceiver` operate through `CtMemory` over coherent shared memory:
+host/GuC own distinct head/tail fields, with hardware release/acquire barriers
+on every publication. Requests have bounded HXG lengths and source-defined
+wire headers. Full buffers leave memory unchanged. Invalid descriptor status,
+foreign cursor modification, malformed/truncated messages or invalid origin
+poison the owner without advancing a receive head or releasing pending work.
+The platform owner must retain CT memory until confirmed deregistration/reset;
+these primitives do not load/authenticate firmware, register transport or wake
+an engine. Fixtures pin CSS/CTB wire cases and ownership failure behavior.
+
 ### Legacy framebuffers and native mode timing
 
 DCN3.0 DIO scanout explicitly selects `OTG_OUT_MUX = OUT_MUX_DIO` before

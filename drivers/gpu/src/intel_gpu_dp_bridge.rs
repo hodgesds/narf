@@ -155,6 +155,9 @@ impl IntelDpBridge {
         ddi: Ddi,
         cfg: &DpLinkConfig,
     ) -> Result<(), DpBridgeError> {
+        if !gpu.chip.generation.external_display_supported() {
+            return Err(DpBridgeError::NoSuchConnector);
+        }
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,

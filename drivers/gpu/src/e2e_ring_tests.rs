@@ -70,6 +70,7 @@ fn pm4_decode(hdr: u32) -> Option<(u8, usize)> {
 // the test can assert.
 
 struct FakeAmdgpuMmio {
+    #[cfg(feature = "amdgpu")]
     bar0: Vec<u8>,
     bar2: Vec<u8>,
     /// Number of doorbell writes the test observed. The fake CP polls
@@ -85,6 +86,7 @@ impl FakeAmdgpuMmio {
         // friendly to the kernel-test heap. Register windows we touch
         // (CP_ME_CNTL / CP_RB0_*) all sit under 0x6000.
         Self {
+            #[cfg(feature = "amdgpu")]
             bar0: alloc::vec![0u8; 64 * 1024],
             bar2: alloc::vec![0u8; 64 * 1024],
             doorbell_writes: 0,
@@ -92,6 +94,7 @@ impl FakeAmdgpuMmio {
         }
     }
 
+    #[cfg(feature = "amdgpu")]
     fn bar0_w32(&mut self, off: usize, v: u32) {
         if off + 4 > self.bar0.len() {
             return;
@@ -99,6 +102,7 @@ impl FakeAmdgpuMmio {
         self.bar0[off..off + 4].copy_from_slice(&v.to_le_bytes());
     }
 
+    #[cfg(feature = "amdgpu")]
     fn bar0_r32(&self, off: usize) -> u32 {
         if off + 4 > self.bar0.len() {
             return 0;
@@ -412,6 +416,7 @@ fn ring_submit(state: &mut FakeRingState, vram: &mut FakeVRAM, packet: &[u32]) -
 // Smoke 1: Ring allocation — RING_BASE programmed into fake MMIO
 // ─────────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_ring_allocation_programs_base_register() -> TestResult {
     use crate::amdgpu_gfx::{CP_RB0_BASE_HI_REL, CP_RB0_BASE_REL};
 
@@ -439,6 +444,7 @@ fn smoke_amdgpu_ring_allocation_programs_base_register() -> TestResult {
 
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/e2e",
     smoke_amdgpu_ring_allocation_programs_base_register
@@ -449,6 +455,7 @@ kernel_test_in!(
 // CP_RB0_RPTR ends == 0
 // ─────────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gfx9_ring_init_executes_and_rptr_zero() -> TestResult {
     use crate::amdgpu_gfx::{
         build_gfx9_ring_init, CP_RB0_BASE_HI_REL, CP_RB0_BASE_REL, CP_RB0_WPTR_REL,
@@ -495,6 +502,7 @@ fn smoke_amdgpu_gfx9_ring_init_executes_and_rptr_zero() -> TestResult {
 
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/e2e",
     smoke_amdgpu_gfx9_ring_init_executes_and_rptr_zero
@@ -822,6 +830,7 @@ kernel_test_in!(
 /// the CP engines is `gfx_v11_0_cp_gfx_enable`, called separately around it —
 /// so the framing was invented, and asserting it kept a sequence that did not
 /// match Linux looking correct.
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_gfx11_ring_init_sequence() -> TestResult {
     use crate::amdgpu_gfx::{build_gfx11_ring_init, GfxStep};
 
@@ -897,6 +906,7 @@ fn smoke_amdgpu_gfx11_ring_init_sequence() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu/e2e", smoke_amdgpu_gfx11_ring_init_sequence);
 
 // ─────────────────────────────────────────────────────────────────────
@@ -953,6 +963,7 @@ kernel_test_in!(
 // `fake_state` tracks the simulated FW state machine; the intermediate
 // writes are overwritten before the final assertion reads it.
 #[allow(unused_assignments)]
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_mes_startup_set_hw_resources() -> TestResult {
     use crate::amdgpu_mes::{
         build_set_hw_resources, decode_api_header, hw_rsrc_flags, MesApiOpcode, MesHwResources,
@@ -1007,6 +1018,7 @@ fn smoke_amdgpu_mes_startup_set_hw_resources() -> TestResult {
 
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu/e2e", smoke_amdgpu_mes_startup_set_hw_resources);
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1108,6 +1120,7 @@ kernel_test_in!("drivers/gpu/e2e", smoke_amdgpu_pm4_wait_reg_mem_encoding);
 // Smoke 15: PM4 header bit layout — type=3 at [31:30], opcode at [15:8]
 // ─────────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_pm4_header_bit_layout() -> TestResult {
     // The "PACKET3 type = bits 30:31" gotcha called out in the task — verify
     // both the builder side (driver `Pm4Builder` produces it) and our
@@ -1141,4 +1154,5 @@ fn smoke_amdgpu_pm4_header_bit_layout() -> TestResult {
 
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu/e2e", smoke_amdgpu_pm4_header_bit_layout);
