@@ -42,6 +42,11 @@ const FIONREAD: u32 = 0x541B;
 use narf_filesystem::{pipe_buffer::PipeBufs, pipe_queue as queue};
 
 fn lock_queue(queue: &queue::Queue) -> queue::Guard<'_> {
+    // The common uncontended case needs no task waker or future bridge.
+    // Contention still takes the same sleepable mutex through lock_async.
+    if let Some(guard) = queue.try_lock() {
+        return guard;
+    }
     crate::handlers::poll_blocking(queue.lock_async())
         .expect("pipe mutex acquisition requires a runnable task context")
 }

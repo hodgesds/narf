@@ -112,8 +112,9 @@ subsystem synchronization; per-pipe locking is not a claim of an entirely
 lock-free syscall path.
 
 The buffer model removes eager 64-KiB payload allocation per empty pipe and
-payload copies from pipe-to-pipe splice/tee. One exclusively owned drained page
-can be reused for subsequent writes. Vector reads operate on page fragments
+payload copies from pipe-to-pipe splice/tee. Up to two exclusively owned drained
+pages can be reused for subsequent writes, matching Linux's `tmp_page` cache.
+Vector reads operate on page fragments
 without a payload-sized staging allocation. Ordinary and packet pipes share
 the same bounded ring implementation as named FIFOs.
 

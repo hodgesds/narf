@@ -133,8 +133,9 @@ pub struct PipeBufs {
     frames: VecDeque<PipeFrame>,
     slots: usize,
     bytes: usize,
-    // Like Linux's tmp_page cache, retain one exclusively owned drained page.
-    spare: Option<Arc<OwnedPage>>,
+    // Match Linux's two-entry tmp_page cache. Only exclusively owned drained
+    // pages may be reused; tee/splice references must retain their contents.
+    spare: [Option<Arc<OwnedPage>>; 2],
 }
 
 impl Default for PipeBufs {
@@ -150,7 +151,7 @@ impl PipeBufs {
             frames: VecDeque::with_capacity(slots),
             slots,
             bytes: 0,
-            spare: None,
+            spare: [None, None],
         }
     }
     pub fn len(&self) -> usize {
@@ -162,7 +163,7 @@ impl PipeBufs {
     }
     pub fn reset(&mut self) {
         self.frames.clear();
-        self.spare = None;
+        self.spare = [None, None];
         self.bytes = 0;
         self.slots = PIPE_DEFAULT_BYTES / PIPE_BUF;
     }
@@ -174,6 +175,18 @@ impl PipeBufs {
     }
     pub fn is_full(&self) -> bool {
         self.frames.len() >= self.slots
+    }
+
+    fn take_spare(&mut self) -> Option<Arc<OwnedPage>> {
+        self.spare.iter_mut().find_map(Option::take)
+    }
+
+    fn cache_page(&mut self, page: Arc<OwnedPage>) {
+        if Arc::strong_count(&page) == 1 {
+            if let Some(slot) = self.spare.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(page);
+            }
+        }
     }
 
     pub fn resize(&mut self, slots: usize) -> Result<(), u64> {
@@ -228,7 +241,7 @@ impl PipeBufs {
         let mut total = 0;
         while total < len && !self.is_full() {
             let count = (len - total).min(PIPE_BUF);
-            let page = match self.spare.take() {
+            let page = match self.take_spare() {
                 Some(page) => page,
                 None => match OwnedPage::allocate() {
                     Ok(page) => page,
@@ -253,7 +266,7 @@ impl PipeBufs {
             });
             if result.is_err() || accepted == 0 {
                 if let Page::Owned(page) = frame.page {
-                    self.spare = Some(page);
+                    self.cache_page(page);
                 }
                 if total == 0 {
                     result?;
@@ -289,7 +302,7 @@ impl PipeBufs {
         }
         while written < len && !self.is_full() {
             let count = (len - written).min(PIPE_BUF);
-            let page = match self.spare.take() {
+            let page = match self.take_spare() {
                 Some(page) => page,
                 None => match OwnedPage::allocate() {
                     Ok(page) => page,
@@ -306,7 +319,7 @@ impl PipeBufs {
             };
             if let Err(errno) = frame.append(count, |dst| copy(written, dst)) {
                 if let Page::Owned(page) = frame.page {
-                    self.spare = Some(page);
+                    self.cache_page(page);
                 }
                 if written != 0 {
                     break;
@@ -422,9 +435,7 @@ impl PipeBufs {
             count -= front.len;
             let retired = self.frames.pop_front().unwrap();
             if let Page::Owned(page) = retired.page {
-                if self.spare.is_none() && Arc::strong_count(&page) == 1 {
-                    self.spare = Some(page);
-                }
+                self.cache_page(page);
             }
         }
     }
@@ -463,4 +474,59 @@ impl PipeBufs {
         }
         moved
     }
+}
+
+mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_pipe_page_cache_preserves_tee_contents() -> TestResult {
+        let mut source = PipeBufs::new();
+        if source.write_with(3 * PIPE_BUF, false, |offset, bytes| {
+            bytes.fill((offset / PIPE_BUF + 1) as u8);
+            Ok(())
+        }) != Ok(3 * PIPE_BUF)
+        {
+            return TestResult::Fail("pipe cache fixture write failed");
+        }
+        let owned_pointer = |frame: &PipeFrame| match &frame.page {
+            Page::Owned(page) => page.pointer() as usize,
+            Page::Pinned(_) => 0,
+        };
+        let reusable = [
+            owned_pointer(&source.frames[1]),
+            owned_pointer(&source.frames[2]),
+        ];
+        let mut duplicate = PipeBufs::new();
+        if source.copy_prefix_to(&mut duplicate, PIPE_BUF) != PIPE_BUF {
+            return TestResult::Fail("pipe cache fixture tee failed");
+        }
+        source.commit(3 * PIPE_BUF);
+        if source.spare.iter().flatten().count() != 2 {
+            return TestResult::Fail("pipe did not retain two exclusive drained pages");
+        }
+        if source.write_with(2 * PIPE_BUF, false, |_, bytes| {
+            bytes.fill(0xa5);
+            Ok(())
+        }) != Ok(2 * PIPE_BUF)
+            || source
+                .frames
+                .iter()
+                .any(|frame| !reusable.contains(&owned_pointer(frame)))
+        {
+            return TestResult::Fail("pipe did not reuse its two cached pages");
+        }
+        if !duplicate.with_front(PIPE_BUF, |bytes| bytes.iter().all(|&byte| byte == 1)) {
+            return TestResult::Fail("pipe page reuse overwrote a live tee reference");
+        }
+        source.reset();
+        if source.spare.iter().any(Option::is_some) || !source.is_empty() {
+            return TestResult::Fail("pipe reset retained cached pages");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "filesystem/pipe",
+        smoke_pipe_page_cache_preserves_tee_contents
+    );
 }

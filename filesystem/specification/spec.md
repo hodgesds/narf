@@ -550,7 +550,8 @@ new opener can observe the inode. `FifoShared::queue` and `notify_transfer`
 allow anonymous/named transfers to use one ordered transaction.
 
 `PipeBufs` owns a bounded descriptor ring; owned payloads use allocator pages
-with reference-counted descriptors and one reusable drained page. Imported
+with reference-counted descriptors and up to two reusable, exclusively owned
+drained pages, matching Linux's bounded `tmp_page` cache. Imported
 buffers carry `UserPagePin` references and cannot acquire append rights.
 `fill_from` implements the single-copy buffered-provider fallback into fresh
 pipe pages. `with_front_raw` exposes a retained pointer only for a callback's
