@@ -439,7 +439,10 @@ pub(super) struct Owner<I: Io> {
     power: Option<alloc::sync::Arc<super::power_policy::Calibration>>,
     radio: Option<super::radio::Info>,
     radio_gate: Option<super::power_policy::Gate>,
-    station: Option<super::station::State>,
+    /// Boxed: the station owner carries the shared join plan, PHY and
+    /// security state, and `Owner` is moved by value through lifecycle
+    /// construction; inline it would land on small (aarch64) stacks.
+    station: Option<alloc::boxed::Box<super::station::State>>,
     tracking_facts: Option<super::dm::Facts>,
 }
 impl<I: Io> core::fmt::Debug for Owner<I> {
@@ -490,15 +493,22 @@ impl<I: Io> Owner<I> {
         }
         let own = self.io.station_own()?;
         self.phase = Phase::Failed; // poison before the first awaited prerequisite
-        self.station = Some(super::station::State::new(own, environment, admission));
-        let station = self.station.as_mut().ok_or(super::station::Error::State)?;
+        self.station = Some(alloc::boxed::Box::new(super::station::State::new(
+            own,
+            environment,
+            admission,
+        )));
+        let station = self
+            .station
+            .as_deref_mut()
+            .ok_or(super::station::Error::State)?;
         station.set_tracking_facts(self.tracking_facts);
         station.start(&mut self.io).await?;
         self.phase = Phase::Station;
         Ok(station.admission())
     }
     pub(super) fn station_local(&self) -> Option<[u8; 6]> {
-        self.station.as_ref().map(super::station::State::local)
+        self.station.as_deref().map(super::station::State::local)
     }
     pub(super) fn station_ht_capability(&self) -> Option<[u8; 26]> {
         self.io
@@ -506,20 +516,25 @@ impl<I: Io> Owner<I> {
             .and_then(super::ht::Facts::capability)
     }
     pub(super) fn station_peer(&self) -> Option<[u8; 6]> {
-        self.station.as_ref().and_then(super::station::State::peer)
+        self.station
+            .as_deref()
+            .and_then(super::station::State::peer)
     }
     pub(super) fn station_ready(&self) -> bool {
         self.station
-            .as_ref()
+            .as_deref()
             .is_some_and(super::station::State::ready)
     }
     pub(super) fn station_receive_open(&self) -> bool {
         self.station
-            .as_ref()
+            .as_deref()
             .is_some_and(super::station::State::receive_open)
     }
     pub(super) fn station_check(&mut self) -> Result<(), super::station::Error> {
-        let station = self.station.as_ref().ok_or(super::station::Error::State)?;
+        let station = self
+            .station
+            .as_deref()
+            .ok_or(super::station::Error::State)?;
         if self.phase != Phase::Station
             || matches!(
                 station.phase(),
@@ -540,7 +555,7 @@ impl<I: Io> Owner<I> {
         self.station_check()?;
         let epoch = self
             .station
-            .as_ref()
+            .as_deref()
             .ok_or(super::station::Error::State)?
             .admission()
             .epoch();
@@ -550,43 +565,43 @@ impl<I: Io> Owner<I> {
             .map_err(super::station::Error::Native)
     }
     pub(super) fn station_phase(&self) -> Option<super::station::Phase> {
-        self.station.as_ref().map(super::station::State::phase)
+        self.station.as_deref().map(super::station::State::phase)
     }
     pub(super) fn station_candidates(
         &self,
     ) -> alloc::vec::Vec<narf_wireless::association::ObservedBss> {
         self.station
-            .as_ref()
+            .as_deref()
             .map_or_else(alloc::vec::Vec::new, super::station::State::candidates)
     }
     pub(super) fn station_information_elements(
         &self,
         peer: [u8; 6],
     ) -> Option<alloc::vec::Vec<u8>> {
-        self.station.as_ref()?.information_elements(peer)
+        self.station.as_deref()?.information_elements(peer)
     }
     pub(super) fn station_poll(
         &mut self,
     ) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, super::station::Error> {
         self.station
-            .as_mut()
+            .as_deref_mut()
             .ok_or(super::station::Error::State)?
             .poll(&mut self.io)
     }
     pub(super) fn station_send(&mut self, frame: &[u8]) -> Result<(), super::station::Error> {
         self.station
-            .as_mut()
+            .as_deref_mut()
             .ok_or(super::station::Error::State)?
             .send(&mut self.io, frame)
     }
     pub(super) fn station_batch_capacity(&self) -> usize {
         self.station
-            .as_ref()
+            .as_deref()
             .map_or(0, super::station::State::batch_capacity)
     }
     pub(super) fn station_batch_active(&self) -> bool {
         self.station
-            .as_ref()
+            .as_deref()
             .is_some_and(super::station::State::batch_active)
     }
     pub(super) fn station_send_batch(
@@ -594,19 +609,19 @@ impl<I: Io> Owner<I> {
         frames: &[&[u8]],
     ) -> Result<usize, super::station::Error> {
         self.station
-            .as_mut()
+            .as_deref_mut()
             .ok_or(super::station::Error::State)?
             .send_batch(&mut self.io, frames)
     }
     pub(super) fn station_stop(&mut self) -> Result<(), super::station::Error> {
         self.station
-            .as_mut()
+            .as_deref_mut()
             .ok_or(super::station::Error::State)?
             .stop(&mut self.io)
     }
     pub(super) async fn station_disconnect(&mut self) -> Result<(), super::station::Error> {
         self.station
-            .as_mut()
+            .as_deref_mut()
             .ok_or(super::station::Error::State)?
             .disconnect(&mut self.io)
             .await
@@ -618,7 +633,7 @@ impl<I: Io> Owner<I> {
     ) -> Result<alloc::vec::Vec<narf_wireless::association::ObservedBss>, super::station::Error>
     {
         self.station
-            .as_mut()
+            .as_deref_mut()
             .ok_or(super::station::Error::State)?
             .scan_for(&mut self.io, dwell_ms, probes)
             .await
@@ -631,7 +646,7 @@ impl<I: Io> Owner<I> {
         ies: &[u8],
     ) -> Result<(), super::station::Error> {
         self.station
-            .as_mut()
+            .as_deref_mut()
             .ok_or(super::station::Error::State)?
             .associate(&mut self.io, bssid, ssid, pmk, ies)
             .await
@@ -922,17 +937,17 @@ impl<I: Io> Owner<I> {
     /// One periodic dynamic-mechanism watchdog step (Linux
     /// `rtw_watch_dog_work`, run with the retained owner held).
     pub(super) async fn station_watchdog(&mut self) -> Result<bool, super::station::Error> {
-        match self.station.as_mut() {
+        match self.station.as_deref_mut() {
             Some(s) if self.phase == Phase::Station => s.watchdog(&mut self.io).await,
             _ => Ok(false),
         }
     }
     pub(super) fn station_tracking(&self) -> Option<&super::station::State> {
-        self.station.as_ref().filter(|s| s.tracking_active())
+        self.station.as_deref().filter(|s| s.tracking_active())
     }
     pub(super) fn station_rts_threshold(&self) -> Option<u32> {
         self.station
-            .as_ref()
+            .as_deref()
             .and_then(super::station::State::rts_threshold)
     }
     pub(super) fn station_set_rts_threshold(
@@ -940,7 +955,7 @@ impl<I: Io> Owner<I> {
         value: u32,
     ) -> Result<(), super::station::Error> {
         self.station
-            .as_mut()
+            .as_deref_mut()
             .ok_or(super::station::Error::State)?
             .set_rts_threshold(&mut self.io, value)
     }
