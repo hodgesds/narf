@@ -1576,6 +1576,22 @@ overlapping restriction because another rule grants a wider channel span;
 future relaxation needs an explicit firmware/regulatory proof. nl80211
 GET_REG maps this flag to Linux `NL80211_RRF_NO_IR` (bit7). Older readers that
 do not recognize NRGD bit3 reject the policy rather than ignore it.
+Bits 4 and 5 are NO_6GHZ_VLP_CLIENT and NO_6GHZ_AFC_CLIENT (GET_REG bits 22
+and 23). Bit 6, WMM_ETSI, attaches wireless-regdb's `wmmrule=ETSI` (ETSI EN
+301 893), the only WMM rule in `db.txt`. The 6 GHz bits are described with
+6 GHz band identity in §3.
+
+**Regulatory WMM rule (`reg::{WmmRule, WmmAcRule}`).** `RegRule::wmm_rule()
+-> Option<WmmRule>` is cfg80211 `ieee80211_reg_rule.wmm_rule` with
+`has_wmm`. `RegulatoryDomain::rule_for(mhz)` (`freq_reg_info`) and
+`wmm_rule_for(mhz)` (`reg_query_regdb_wmm`) look it up by channel.
+`WmmRule { client, ap }` holds `[WmmAcRule { cw_min, cw_max, cot_us,
+aifsn }; 4]` in mac80211 AC order (VO, VI, BE, BK). `WmmRule::ETSI` copies
+the `db.txt` values. `WmmRule::limit(ac, ap, wmm::Ac) -> wmm::Ac` is mac80211
+`ieee80211_regulatory_limit_wmm_params`: it raises ECWmin, ECWmax and AIFSN to
+the floor and caps TXOP at COT/32 us. `limit_parameters(ap, wmm::Parameters)`
+applies it in the parser's ACI order (BE, BK, VI, VO). A driver applies it to
+every EDCA set it programs on a channel whose rule carries the WMM rule.
 The driver intersects the selected host rule with firmware MCC permission
 and applies its power ceiling before transmitting association frames.
 

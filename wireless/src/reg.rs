@@ -10,6 +10,17 @@ pub struct RegulatoryDomain {
     pub rules: Vec<RegRule>,
 }
 
+impl RegulatoryDomain {
+    /// cfg80211 `freq_reg_info`: the rule covering `mhz`, if any.
+    pub fn rule_for(&self, mhz: u32) -> Option<&RegRule> {
+        self.rules.iter().find(|rule| rule.covers_mhz(mhz))
+    }
+    /// The WMM floor (`reg_query_regdb_wmm`) for a channel at `mhz`.
+    pub fn wmm_rule_for(&self, mhz: u32) -> Option<WmmRule> {
+        self.rule_for(mhz).and_then(RegRule::wmm_rule)
+    }
+}
+
 #[derive(Clone)]
 pub struct RegRule {
     pub freq_start_mhz: u32,
@@ -34,6 +45,91 @@ bitflags::bitflags! {
         /// cfg80211 `NL80211_RRF_NO_6GHZ_AFC_CLIENT`: a client may not
         /// connect to a 6 GHz Standard Power (AFC) AP under this rule.
         const NO_6GHZ_AFC_CLIENT = 1 << 5;
+        /// The rule carries wireless-regdb's `wmmrule=ETSI` (ETSI EN 301 893
+        /// channel-access limits): `RegRule::wmm_rule()`.
+        const WMM_ETSI = 1 << 6;
+    }
+}
+
+/// cfg80211 `struct ieee80211_wmm_ac`: the regulatory floor for one access
+/// category. `cot_us` is the Channel Occupancy Time limit in microseconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WmmAcRule {
+    pub cw_min: u16,
+    pub cw_max: u16,
+    pub cot_us: u16,
+    pub aifsn: u8,
+}
+
+/// cfg80211 `struct ieee80211_wmm_rule`, indexed by access category in
+/// mac80211 order: 0 = VO, 1 = VI, 2 = BE, 3 = BK.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WmmRule {
+    pub client: [WmmAcRule; 4],
+    pub ap: [WmmAcRule; 4],
+}
+
+const fn wmm_ac(cw_min: u16, cw_max: u16, aifsn: u8, cot_ms: u16) -> WmmAcRule {
+    WmmAcRule {
+        cw_min,
+        cw_max,
+        cot_us: cot_ms * 1000,
+        aifsn,
+    }
+}
+
+impl WmmRule {
+    /// wireless-regdb `db.txt` `wmmrule ETSI` (ETSI EN 301 893), the only
+    /// WMM rule the regulatory database defines.
+    pub const ETSI: Self = Self {
+        client: [
+            wmm_ac(3, 7, 2, 2),
+            wmm_ac(7, 15, 2, 4),
+            wmm_ac(15, 1023, 3, 6),
+            wmm_ac(15, 1023, 7, 6),
+        ],
+        ap: [
+            wmm_ac(3, 7, 1, 2),
+            wmm_ac(7, 15, 1, 4),
+            wmm_ac(15, 63, 3, 6),
+            wmm_ac(15, 1023, 7, 6),
+        ],
+    };
+
+    /// mac80211 `ieee80211_regulatory_limit_wmm_params` for access category
+    /// `ac` (0 = VO .. 3 = BK): raise CWmin, CWmax and AIFSN to the rule's
+    /// floor and cap the TXOP limit (32 us units) at its COT. `ap` selects
+    /// the AP table. An out-of-range category leaves `params` unchanged.
+    pub fn limit(&self, ac: usize, ap: bool, params: crate::wmm::Ac) -> crate::wmm::Ac {
+        let table = if ap { &self.ap } else { &self.client };
+        let Some(rule) = table.get(ac) else {
+            return params;
+        };
+        // CW = 2^ECW - 1.
+        let ecw = |cw: u16| (u16::BITS - cw.leading_zeros()) as u8;
+        let ecw_min = params.ecw_min.max(ecw(rule.cw_min));
+        crate::wmm::Ac {
+            aifsn: params.aifsn.max(rule.aifsn),
+            ecw_min,
+            ecw_max: params.ecw_max.max(ecw(rule.cw_max)).max(ecw_min),
+            txop: params.txop.min(rule.cot_us / 32),
+            admission_control: params.admission_control,
+        }
+    }
+
+    /// `limit` over a parsed `wmm::Parameters` (canonical ACI order BE, BK,
+    /// VI, VO), the form drivers program from.
+    pub fn limit_parameters(
+        &self,
+        ap: bool,
+        params: crate::wmm::Parameters,
+    ) -> crate::wmm::Parameters {
+        let mut out = params;
+        // ACI -> mac80211 AC index (VO = 0, VI = 1, BE = 2, BK = 3).
+        for (aci, ac) in [2usize, 3, 1, 0].into_iter().enumerate() {
+            out.ac[aci] = self.limit(ac, ap, params.ac[aci]);
+        }
+        out
     }
 }
 
@@ -59,6 +155,12 @@ impl RegRule {
     /// cfg80211 `cfg80211_6ghz_power_type_valid`: whether a station may
     /// associate with a 6 GHz AP of `power` under this rule. LPI is always
     /// permitted by the rule itself (INDOOR_ONLY still applies).
+    /// cfg80211 `ieee80211_reg_rule.wmm_rule` when `has_wmm`: the WMM
+    /// channel-access floor a driver applies to every EDCA parameter set it
+    /// programs on a channel this rule covers (`WmmRule::limit`).
+    pub fn wmm_rule(&self) -> Option<WmmRule> {
+        self.flags.contains(RegFlags::WMM_ETSI).then_some(WmmRule::ETSI)
+    }
     pub fn allows_6ghz_client(&self, power: PowerType6Ghz) -> bool {
         match power {
             PowerType6Ghz::Lpi => true,
@@ -268,3 +370,7 @@ mod tests {
     }
     kernel_test_in!("wireless/regulatory", smoke_regulatory_policy_boundaries);
 }
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "reg/wmm_rule_tests.rs"]
+mod wmm_rule_tests;
