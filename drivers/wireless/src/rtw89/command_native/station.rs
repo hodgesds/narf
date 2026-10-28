@@ -235,6 +235,9 @@ impl Native {
         {
             return Err(packet::Error::Access);
         }
+        // Teardown frees published DMA only behind the idle proof; an
+        // unproven stop keeps every ring and packet pinned for the boot.
+        let _ = self.reclaim_dma();
         Ok(())
     }
 }

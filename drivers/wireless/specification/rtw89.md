@@ -59,8 +59,8 @@ Disconnect reserves and closes admission before awaiting ownership; drain and
 bootstrap workers preserve its media-down operation while pending. Cancellation
 releases only that reservation, never reopens the station. A post-reset close
 while waiting for assets also stops private CH12/RX before asynchronous analog
-shutdown. Published storage remains retained: stop bits, revoked authority and
-successful source RF shutdown are not DMA-reclamation receipts.
+shutdown. Stop bits, revoked authority and successful source RF shutdown are
+not DMA-reclamation receipts; only the DMA-stop proof below frees storage.
 
 `pci::bring_up(device, cap)` first parks inherited PCI DMA through the shared
 Realtek command policy: clear `BUS_MASTER`, enable `MEM_SPACE | INTX_DISABLE`,
@@ -1199,6 +1199,43 @@ ordering, error propagation, lost-wake freedom, vector release/quarantine)
 and `smoke_rtw8852b_irq_driven_worker_services_rearms_and_halts` (armed
 association, RX service/rearm, TX kick, halt teardown).
 
+### DMA-stop proof and reclamation (RTL8852B)
+
+`dma_stop.rs` ports the AX stop/idle sequence of Linux v7.2
+`pci.c::rtw89_pci_ops_mac_pre_init_ax`: `B_AX_STOP_WPDMA`, then
+`rtw89_pci_ctrl_dma_all(false)` (`B_AX_STOP_PCIEIO` in
+`R_AX_PCIE_DMA_STOP1`, `B_AX_TXHCI_EN`/`B_AX_RXHCI_EN` clear in
+`R_AX_PCIE_INIT_CFG1`), then `rtw89_pci_poll_dma_all_idle`:
+`rtw89_pci_poll_txdma_ch_idle_ax` polls `dma_busy1` (`R_AX_PCIE_DMA_BUSY1`,
+`DMA_BUSY1_CHECK_V1` on RTL8852BE) and `rtw89_pci_poll_rxdma_ch_idle_ax`
+polls `dma_busy3_reg` (`B_AX_RXQ_BUSY | B_AX_RPQ_BUSY`), each
+`read_poll_timeout(.., 10, 100, ..)`. The terminal closure also sets the
+full `B_AX_TX_STOP1_MASK_V1` (`rtw89_pci_ctrl_txdma_ch_ax(false)`), RXQ/RPQ
+stop and clears `R_AX_HCI_FUNC_EN` DMA (`rtw89_mac_ctrl_hci_dma_trx`). All
+of this runs with bus mastering still on so in-flight descriptors finish;
+BME is then cleared (always, even after a busy timeout), read back off, and
+a flushing BAR re-read must still show every stop bit set, HCI disabled and
+all engines idle. PCIe completions cannot pass posted requests, so idle
+engines observed behind verified BME-off prove no outstanding access. Only
+that constructs the non-`Clone` `dma_stop::Idle`.
+
+`Native::fail` runs this proof on RTL8852B in place of the old blind
+stop/BME write (other AX chips keep the previous closure and retention).
+`Native::reclaim_dma` repeats the verification under current authority and
+then frees the CH12 ring and queued commands, both RXQ/RPQ rings and their
+buffers (`rx_dma::Rx::reclaim_fenced`), and every BE/MGMT/AC descriptor ring
+plus reserved, published or unretired packet (`packet_core::Core::reclaim_fenced`,
+`tx_transport::TxQueue::reclaim_fenced`). `stop_packets` (station teardown)
+and `Native::drop` call it, so normal teardown frees published DMA instead of
+`mem::forget`. A busy timeout, ignored stop write, unreadable or still-set
+BME, revoked authority or all-ones read keeps everything pinned exactly as
+before. Smokes: `drivers/wireless/rtw89/dma_stop` (Linux order, 100us
+budget, BME-off flush read, TX/RX busy, ignored stop, ignored BME, busy after
+BME, gone device, verify re-checks) plus native/packet/RX reclamation smokes
+(`smoke_rtw89_native_dma_reclaim_requires_verified_stop_proof`,
+`smoke_rtw89_b_packet_reclaim_releases_rings_and_unretired_packets`,
+`smoke_rtw89_rx_reclaim_releases_both_rings_once_and_stays_terminal`).
+
 ## 4. Invariants
 
 Physical reads write the address and wait for the hardware ready flag before
@@ -1241,7 +1278,7 @@ or physical hardware acceptance.
 | AX DDV factory identity and cleanup | Implemented; shared-path regressions |
 | Initial B power/PCIe initialization | Retained actual cold/firmware/MAC/RX/full-radio/ordinary BE/MGMT startup and probe integration implemented; selective source PCI setup is bounded to this awake polled profile |
 | Firmware container/profile selection, CH12 DMA, WCPU handshakes | Checked AX selection, native fuse reads, coupled secure plans, native CH12 ownership and retained WCPU loading implemented; owned cold-to-CH12/WCPU composition and TX-only BME activation implemented; initial B packet/RF startup is implemented; A/51 secure-policy loading remains outside the initial profile |
-| Initial B reset, rings and ownership | Actual temporal FLR or explicit trusted platform reset contract; retained BDRAM/CH12/RX/RPQ plus fresh BE/MGMT rings and terminal storage ownership implemented. AX v0 MSI delivery implemented; recovery and reclamation remain separate |
+| Initial B reset, rings and ownership | Actual temporal FLR or explicit trusted platform reset contract; retained BDRAM/CH12/RX/RPQ plus fresh BE/MGMT rings and terminal storage ownership implemented. AX v0 MSI delivery and proven DMA reclamation implemented; recovery remains separate |
 | Initial B native TX and bounded completion | Exact source TXWD/BD/WP/address-info and joint TXBD/RPQ retirement are activated by the same retained station owner;512 nonreused identities per queue |
 | RPQ release handling, RX assembly/validation and frame delivery | B retained native RXQ/RPQ publication/polling, checked segmented RX/FCS, RPQ records and bounded C2H/ACK decoding implemented; same-owner packet completion dispatch, raw station frame delivery and kernel DHCP/IP are implemented |
 | RF/BB calibration, regulatory channel/power and coexistence | Initial B actual factory + firmware PHY_CAP, static PHY operating/XTAL, WLAN-only coexistence, NCTL/basic RFK, channel MAC/BB/RF/scheduler/ADC, actual trims/RXAB, IQK/TSSI/DPK and real source power-table composition implemented. Separate signed measured v2 binds all calibration/packet/autonomous-response peaks and actual source recipes; native publication uses current signed/device invocations. Broader AX/BE profiles, host periodic RF tracking/retuning and physical measured qualification remain outside this initial profile |
@@ -1277,7 +1314,6 @@ Each blocker below was re-checked against this tree.
 | `eht` | Needs the RTL8922A chip row first. `efuse.rs` returns `UnsupportedChip` for 8922A, `irq::Mask::config` rejects the `_v2` layout, there is no BE TXD/RXD (`txrx.h` `BE_TXD_*`) or BE RA H2C (`rtw89_h2c_ra_v1`, `RTW89_H2C_RA_V1_W4_MODE_EHT`), and `station_control::Controller::new` plus the `N52B` qualification record are RTL8852B-only. The shared `association::eht` API is not the gap. |
 | `aggregation`, `block_ack_originator` | `packet_core::Core` keeps one `pending: Option<Pending>` and `ready()` is false while a frame is in flight. `station::State::pending` and the RPQ retirement are also single-frame. TX A-MPDU needs per-slot header/body DMA ownership for N in-flight tickets, `RTW89_TXWD_BODY3_AGG_EN`/`INFO1_MAX_AGGNUM`/`INFO2_AMPDU_DENSITY`, an originator ADDBA state machine (mac80211 `agg-tx.c`), `rtw89_chip_h2c_ampdu_cmac_tbl` on `TX_OPERATIONAL`/`TX_STOP_*`, and a new signed `Program` for the aggregate emitter. |
 | `operating_reset` | `HALT_C2H`/`WDT_TIMEOUT` close the station terminally (`station::Error::Halted`). SER L1 (`ser.c` `ser_l1_reset_pre_st_hdl` -> `rtw89_hci_reset` -> `pci.c::rtw89_pci_reset_trx_rings`) needs a proven HCI DMA stop and ring-index reset so retained rings can be republished, and this tree has neither. |
-| `dma_reclamation` | Teardown deliberately retains published DMA: `packet_core::Ring::drop` and `rx_dma::retain` `mem::forget` armed descriptors and buffers, and `TxQueue` retains published packets. Freeing them needs an idle proof, i.e. `R_AX_PCIE_DMA_STOP1` read-back with `rtw89_pci_poll_txdma_ch_idle`/`rtw89_pci_poll_rxdma_ch_idle` before BME clear. No such proof exists. |
 | `safe_rejoin` | `station_control::Controller::disconnect` ends in `Phase::Stopped` and `initialize` accepts only `Phase::New`. `station::State::{stop,disconnect}` end in `Phase::Stopped`, and `bootstrap.rs` terminalizes the radio once the shell closes. Rejoin needs a controller Stopped->Passive path (`rtw89_ops_sta_state` NOTEXIST -> `rtw89_core_sta_remove`, CAM back to own/`[0;6]`) and a non-terminal station reset. |
 | `device_removal` | rtw89 registers no `narf_bus::register_remove` callback, and `bootstrap::probe` keeps the static `OWNER` for the boot. A remove path depends on `dma_reclamation`'s DMA-stop proof; without it the device can only be parked. |
 | `system_suspend` | `narf_power::device_pm::DevicePmOps` callbacks are synchronous and IRQ-gated and may not schedule. Linux suspend without WoW (`drv_stop` -> `rtw89_core_stop`) and resume (`rtw89_core_start`, firmware download, awaited H2C DONE_ACKs) are async here. Resume also needs a second temporal FLR (`pci_reset.rs` makes one attempt) and a new identity, because `radio_policy::Board` binds "one fresh PCI lifecycle". The non-terminal teardown above is a prerequisite. |

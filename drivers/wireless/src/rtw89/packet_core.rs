@@ -597,6 +597,37 @@ impl Core {
         }
         result
     }
+    /// Release every descriptor ring and every reserved, published or
+    /// unretired packet. Returns the storage so the caller decides when it
+    /// is freed; the owner is permanently stopped afterwards.
+    ///
+    /// # Safety
+    /// The caller holds a current `dma_stop::Idle` proof for this function:
+    /// every TX channel is stopped and idle with bus mastering off.
+    pub(super) unsafe fn reclaim_fenced(&mut self) -> Vec<DmaBuffer> {
+        self.phase = Phase::Stopped;
+        self.pending = None;
+        self.completions.clear();
+        let mut storage = Vec::new();
+        for ring in &mut self.rings {
+            ring.armed = false;
+            storage.extend(ring.descriptors.take());
+            // SAFETY: the caller's idle proof covers this ring's channel.
+            for packet in unsafe { ring.queue.reclaim_fenced() } {
+                storage.push(packet.header);
+                storage.push(packet.body);
+            }
+        }
+        storage
+    }
+    /// True once `reclaim_fenced` released the rings.
+    pub(super) fn reclaimed(&self) -> bool {
+        self.phase == Phase::Stopped
+            && self
+                .rings
+                .iter()
+                .all(|ring| !ring.armed && ring.descriptors.is_none())
+    }
     pub(super) fn stop(&mut self, port: &mut impl Port) -> Result<(), Error> {
         self.phase = Phase::Stopped;
         // Keep published descriptors AND packets regardless of stop readback.

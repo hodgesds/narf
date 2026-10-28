@@ -107,6 +107,8 @@ impl Fixture {
             irq: None,
             phycap: None,
             phycap_attempted: false,
+            dma_idle: None,
+            dma_reclaimed: false,
         };
         Ok(Self { native, words })
     }
@@ -935,4 +937,55 @@ fn smoke_rtw89_native_qualification_requests_are_exact_current_and_read_only() -
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_native_qualification_requests_are_exact_current_and_read_only
+);
+
+fn smoke_rtw89_native_dma_reclaim_requires_verified_stop_proof() -> TestResult {
+    use super::super::dma_stop;
+    let mut f = Fixture::aperture(ChipId::Rtl8852B, 0x20000).unwrap();
+    if f.activate().is_err() || ready(f.native.send(Kind::Header, &[0x5a; 16])) != Some(Ok(())) {
+        return TestResult::Fail("reclaim baseline");
+    }
+    f.native.armed = true;
+    f.words[dma_stop::INIT_CFG1 as usize / 4] |= dma_stop::HCI_EN;
+    f.native.fail();
+    // Linux stop/poll order ran with all stop, PCIEIO and HCI closures.
+    if f.words[dma_stop::STOP1 as usize / 4] & dma_stop::STOPPED != dma_stop::STOPPED
+        || f.words[dma_stop::INIT_CFG1 as usize / 4] & dma_stop::HCI_EN != 0
+    {
+        return TestResult::Fail("terminal closure skipped the Linux DMA stop sequence");
+    }
+    // Unreadable config cannot prove BME off: nothing is released.
+    if f.native.dma_idle.is_some()
+        || f.native.reclaim_dma() != Err(dma_stop::Error::Unproven)
+        || f.native.ring.is_none()
+        || f.native.queue.model_resource(0).is_none()
+        || f.native.dma_reclaimed()
+    {
+        return TestResult::Fail("unproven stop released published CH12 storage");
+    }
+    // A proof alone is re-verified under current authority before release.
+    f.native.dma_idle = Some(dma_stop::Idle::inert());
+    if f.native.reclaim_dma() != Err(dma_stop::Error::Register(super::super::power::Error::Gone))
+        || f.native.ring.is_none()
+        || f.native.queue.model_resource(0).is_none()
+    {
+        return TestResult::Fail("stale proof released storage without BME/idle re-verification");
+    }
+    // Teardown path: the verified proof frees ring, queued command and RX.
+    let released = f.native.release_proven(dma_stop::Idle::inert());
+    if released != 1
+        || f.native.ring.is_some()
+        || f.native.queue.model_resource(0).is_some()
+        || f.native.armed
+        || !f.native.dma_reclaimed()
+        || f.native.reclaim_dma() != Ok(0)
+        || ready(f.native.send(Kind::Header, &[0x5a; 16])) == Some(Ok(()))
+    {
+        return TestResult::Fail("verified stop did not release published storage exactly once");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_native_dma_reclaim_requires_verified_stop_proof
 );

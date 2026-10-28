@@ -233,6 +233,24 @@ impl<T> TxQueue<T> {
         Ok(self.retire(index))
     }
 }
+impl<T> TxQueue<T> {
+    /// Hand back every reserved or published resource and empty the queue.
+    ///
+    /// # Safety
+    /// The owner proved its DMA engines stopped and idle with bus mastering
+    /// off (`dma_stop::Idle`); no descriptor, prefetch or firmware release
+    /// can still reference any slot.
+    pub unsafe fn reclaim_fenced(&mut self) -> Vec<T> {
+        let resources = self
+            .slots
+            .iter_mut()
+            .filter_map(|slot| slot.take().and_then(|entry| entry.resource))
+            .collect();
+        self.wp = 0;
+        self.rp = 0;
+        resources
+    }
+}
 impl<T> Drop for TxQueue<T> {
     fn drop(&mut self) {
         for entry in self.slots.iter_mut().flatten() {

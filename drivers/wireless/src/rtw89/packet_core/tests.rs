@@ -798,3 +798,38 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_packet_rechecks_peer_rf_before_bd_and_retains_uncertain_doorbell
 );
+
+fn smoke_rtw89_b_packet_reclaim_releases_rings_and_unretired_packets() -> TestResult {
+    let (mut core, mut model) = match fixture() {
+        Ok(value) => value,
+        Err(error) => return TestResult::Fail(error),
+    };
+    if core.submit(&mut model, &frame(), true).is_err() || core.stop(&mut model).is_err() {
+        return TestResult::Fail("packet reclaim baseline");
+    }
+    let rings = core.rings.len();
+    if core.reclaimed() {
+        return TestResult::Fail("bounded stop alone counted as reclamation");
+    }
+    // SAFETY: inert RAM model; there is no device or DMA producer.
+    let storage = unsafe { core.reclaim_fenced() };
+    // Every descriptor ring plus the in-flight header and body.
+    if storage.len() != rings + 2
+        || !core.reclaimed()
+        || core.pending.is_some()
+        || core.ready()
+        || core.submit(&mut model, &frame(), true) != Err(Error::State)
+        || core.poll(&mut model).is_ok()
+    {
+        return TestResult::Fail("packet reclamation kept, duplicated or reopened DMA storage");
+    }
+    // SAFETY: same inert model; nothing remains to release.
+    if !unsafe { core.reclaim_fenced() }.is_empty() {
+        return TestResult::Fail("packet reclamation released storage twice");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_packet_reclaim_releases_rings_and_unretired_packets
+);

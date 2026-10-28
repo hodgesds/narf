@@ -64,6 +64,7 @@ mod command_queue;
 pub mod datapath;
 mod ddv;
 pub mod dma;
+mod dma_stop;
 mod download_dma;
 mod download_plan;
 mod dpk;
