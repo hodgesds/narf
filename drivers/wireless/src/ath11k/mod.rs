@@ -70,6 +70,7 @@ pub mod mhi;
 pub mod mhi_host;
 pub mod pci;
 pub mod power;
+pub mod qcn9074;
 pub mod qmi;
 pub mod qmi_client;
 pub mod qmi_wlfw;

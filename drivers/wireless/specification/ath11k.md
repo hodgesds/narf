@@ -526,6 +526,11 @@ through the real DMA32 ring memory; `smoke_ath11k_ce_cleanup_and_reinit`
 runs cleanup → device reset → `init_pipes` over the same memory with
 data in both directions after it.
 
+`qcn9074.rs`: `HalRxDescQcn9074` (`struct hal_rx_desc_qcn9074`, 384 bytes;
+QCN9074, IPQ5018, WCN6750) with the `ath11k_hw_qcn9074_rx_desc_*` getters;
+`rx_descriptor::RxDescriptor::Qcn9074` decodes it for `HwRev::Qcn9074Hw10`
+(`mpdu_info1` = `mpdu_start.info11`, same bits as the WCN6855 word).
+
 ### 3.6 Core bring-up (`core.rs`, Linux `core.c`)
 
 `Ath11kCore<H: Hif, Q: QmiFw>` = `struct ath11k_base` for the bring-up:
