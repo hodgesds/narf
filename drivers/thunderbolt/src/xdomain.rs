@@ -1062,6 +1062,32 @@ pub(crate) trait XdChannel {
     /// Take the unsolicited XDomain frames buffered since the last
     /// pass (requests from peers, unmatched packets).
     fn drain(&mut self) -> Vec<(u8, Vec<u32>)>;
+    /// Create and bind the production data transport for one
+    /// peer whose mutual login has completed: allocate the NHI
+    /// data rings, start and prime them, and approve the
+    /// in-router DMA paths for the peer's announced transmit
+    /// path — paths last, so no frame can arrive at an unprimed
+    /// ring (the reference CM's ordering). `None` leaves the
+    /// session logged in with the link down; the engine retries
+    /// on the next pass. The default channel binds nothing (the
+    /// fixtures bind their in-memory pairs directly, and their
+    /// channels use this default).
+    async fn bind_data_link(
+        &mut self,
+        _domain: &Domain,
+        _route: u64,
+        _transmit_path: u32,
+    ) -> Option<Box<dyn crate::tbnet::DataLink>> {
+        None
+    }
+    /// Release a data transport previously produced by
+    /// `bind_data_link`: disconnect its in-router DMA paths
+    /// (hop drain before the saved entries are restored), then
+    /// drop the transport, which stops its rings. The default
+    /// just drops the transport.
+    async fn release_data_link(&mut self, _route: u64, link: Box<dyn crate::tbnet::DataLink>) {
+        drop(link);
+    }
 }
 
 /// What the engine wants the channel to exchange with a peer, and
@@ -1172,6 +1198,12 @@ struct Peer {
     has_network: bool,
     net_match_frags: bool,
     net: Option<crate::tbnet::NetLink>,
+    /// The bound data transport came from the channel (the
+    /// production NHI binding) rather than a fixture's manual
+    /// bind, so the engine manages its lifetime with the
+    /// session: bound when the mutual login completes, released
+    /// when the session ends.
+    data_auto: bool,
     command_id: u32,
     login_retries: u8,
     logout_retries: u8,
@@ -1197,6 +1229,7 @@ impl Peer {
             has_network: false,
             net_match_frags: false,
             net: None,
+            data_auto: false,
             command_id: 0,
             login_retries: 0,
             logout_retries: 0,
@@ -1239,6 +1272,28 @@ pub(crate) struct Engine {
     peers: Vec<Peer>,
     topology_key: Vec<u64>,
     net_counter: u32,
+    /// Data transports of peers removed by topology reconcile,
+    /// taken out of their netdevs before the peer state drops so
+    /// the channel can release their in-router paths (the rings
+    /// stop when the transport drops at the end of the release).
+    retired: Vec<RetiredLink>,
+}
+
+/// A data transport extracted from a removed peer's netdev,
+/// awaiting its channel release in the next service pass. The
+/// transport itself is opaque (a trait object), hence the manual
+/// `Debug`.
+struct RetiredLink {
+    route: u64,
+    link: Box<dyn crate::tbnet::DataLink>,
+}
+
+impl core::fmt::Debug for RetiredLink {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RetiredLink")
+            .field("route", &self.route)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Engine {
@@ -1252,6 +1307,7 @@ impl Engine {
             peers: Vec::new(),
             topology_key: Vec::new(),
             net_counter: 0,
+            retired: Vec::new(),
         }
     }
 
@@ -1302,6 +1358,7 @@ impl Engine {
                 }
             }
         }
+        self.service_data_links(ch, domain).await;
         for peer in &mut self.peers {
             if let Some(net) = &mut peer.net {
                 net.pump();
@@ -1309,6 +1366,43 @@ impl Engine {
         }
         self.sync_links();
         self.publish();
+    }
+
+    /// Bind and release production data transports with the
+    /// session lifecycle, through the channel. Releases run
+    /// first (removed peers, then sessions that ended), so a
+    /// route's paths and HopIDs are free before a same-pass bind
+    /// reuses them. A transport is bound exactly when the mutual
+    /// login stands and released exactly when it falls, which is
+    /// what makes the published link state honest: link up means
+    /// the NHI rings behind it are live. Manually bound
+    /// transports (the fixtures') are not managed here.
+    async fn service_data_links(&mut self, ch: &mut impl XdChannel, domain: &Domain) {
+        for retired in core::mem::take(&mut self.retired) {
+            ch.release_data_link(retired.route, retired.link).await;
+        }
+        for peer in &mut self.peers {
+            if peer.data_auto && !peer.connected() {
+                if let Some(net) = &mut peer.net {
+                    if let Some(link) = net.unbind() {
+                        ch.release_data_link(peer.route, link).await;
+                    }
+                }
+                peer.data_auto = false;
+            }
+            if peer.connected() && !peer.data_auto {
+                let unbound = peer.net.as_ref().is_some_and(|net| !net.bound());
+                if unbound {
+                    let transmit_path = peer.session.transmit_path;
+                    if let Some(link) = ch.bind_data_link(domain, peer.route, transmit_path).await {
+                        if let Some(net) = &mut peer.net {
+                            net.bind(link);
+                            peer.data_auto = true;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Reconcile the peer set against the enumerated topology:
@@ -1331,7 +1425,24 @@ impl Engine {
             }
             self.topology_key = routes.clone();
         }
-        self.peers.retain(|peer| routes.contains(&peer.route));
+        // Vanished peers lose their session on the spot; a bound
+        // data transport is taken out first so the channel can
+        // release its in-router paths during this pass (the peer
+        // state itself, and the netdev registration, drop here).
+        let mut kept = Vec::with_capacity(self.peers.len());
+        for mut peer in core::mem::take(&mut self.peers) {
+            if routes.contains(&peer.route) {
+                kept.push(peer);
+            } else if let Some(net) = &mut peer.net {
+                if let Some(link) = net.unbind() {
+                    self.retired.push(RetiredLink {
+                        route: peer.route,
+                        link,
+                    });
+                }
+            }
+        }
+        self.peers = kept;
         for route in routes {
             if !self.peers.iter().any(|p| p.route == route) {
                 self.peers.push(Peer::new(route));
@@ -1916,7 +2027,8 @@ impl Engine {
     /// peer, and the fixtures' link-down step). The LOGOUT exchange
     /// runs on the next service pass; an unanswering peer is torn
     /// down locally after the retry budget.
-    // Used by the fixtures; production binding lands with the data transport.
+    // Used by the fixtures; no production caller initiates a
+    // graceful logout yet (peer removal tears down directly).
     #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) fn initiate_logout(&mut self, route: u64) {
         if let Some(peer) = self.peer_mut(route) {
@@ -1927,11 +2039,14 @@ impl Engine {
         }
     }
 
-    /// Bind a data transport to a peer's netdev (the NHI data-ring
-    /// binding on hardware; the in-memory pair in fixtures). Until
-    /// a transport is bound the session still completes its login,
-    /// but the netdev reports link down and no frames flow.
-    // Used by the fixtures; production binding lands with the data transport.
+    /// Bind a data transport to a peer's netdev directly (the
+    /// fixtures' in-memory pair). Production binds through the
+    /// channel in `service_data_links` instead, which also owns
+    /// the in-router path approval; a transport bound here is
+    /// not session-managed. Until a transport is bound the
+    /// session still completes its login, but the netdev reports
+    /// link down and no frames flow.
+    // Used by the fixtures; production binds through the channel seam.
     #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) fn bind_data_link(&mut self, route: u64, link: Box<dyn crate::tbnet::DataLink>) {
         if let Some(peer) = self.peer_mut(route) {

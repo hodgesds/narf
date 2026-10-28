@@ -975,3 +975,180 @@ fn xdomain_service_matching() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/thunderbolt/xdomain", xdomain_service_matching);
+
+// -----------------------------------------------------------------
+// Session-managed binding: the engine binds the data transport
+// through the channel when the mutual login completes, and
+// releases it when the session ends — no manual bind anywhere.
+// -----------------------------------------------------------------
+
+/// What the production control channel does with the NHI, the
+/// fixture channel does with in-memory queues: `bind_data_link`
+/// manufactures a MemLink pair endpoint and records the call
+/// (and the transmit path it was handed); `release_data_link`
+/// records and drops. Events are `true` for a bind, `false` for
+/// a release, in call order.
+struct FactoryState {
+    out: FrameQueue,
+    inc: FrameQueue,
+    events: Rc<RefCell<Vec<bool>>>,
+    paths: Rc<RefCell<Vec<u32>>>,
+}
+
+struct FactoryChannel {
+    inner: TestChannel,
+    state: Rc<FactoryState>,
+}
+
+impl XdChannel for FactoryChannel {
+    async fn exchange(&mut self, kind: u8, words: &[u32]) -> Result<Vec<u32>, Error> {
+        self.inner.exchange(kind, words).await
+    }
+
+    async fn send(&mut self, kind: u8, words: &[u32]) -> Result<(), Error> {
+        self.inner.send(kind, words).await
+    }
+
+    fn drain(&mut self) -> Vec<(u8, Vec<u32>)> {
+        self.inner.drain()
+    }
+
+    async fn bind_data_link(
+        &mut self,
+        _domain: &Domain,
+        _route: u64,
+        transmit_path: u32,
+    ) -> Option<Box<dyn DataLink>> {
+        self.state.events.borrow_mut().push(true);
+        self.state.paths.borrow_mut().push(transmit_path);
+        Some(Box::new(MemLink {
+            out: self.state.out.clone(),
+            inc: self.state.inc.clone(),
+        }))
+    }
+
+    async fn release_data_link(&mut self, _route: u64, link: Box<dyn DataLink>) {
+        self.state.events.borrow_mut().push(false);
+        drop(link);
+    }
+}
+
+/// One service pass through the factory channel.
+fn pass_auto(side: &Side, peer: &Side, state: &Rc<FactoryState>) {
+    let mut chan = FactoryChannel {
+        inner: side.channel(peer),
+        state: state.clone(),
+    };
+    let mut engine = side.engine.borrow_mut();
+    narf_scheduler::block_on_spin(engine.service(&mut chan, &side.domain));
+}
+
+fn drive_auto(a: &Side, b: &Side, fa: &Rc<FactoryState>, fb: &Rc<FactoryState>, rounds: usize) {
+    for _ in 0..rounds {
+        pass_auto(a, b, fa);
+        pass_auto(b, a, fb);
+    }
+}
+
+fn xdomain_auto_data_binding() -> TestResult {
+    let a = Side::new(
+        98,
+        uuid_a(),
+        local_root(0x8086, "Intel Corp.", 0x1111, "host-a"),
+    );
+    let b = Side::new(99, uuid_b(), local_root(0x1022, "AMD", 0x2222, "host-b"));
+    let ab = Arc::new(narf_lib::sync::IrqSafeSpinLock::new(Vec::new()));
+    let ba = Arc::new(narf_lib::sync::IrqSafeSpinLock::new(Vec::new()));
+    let fa = Rc::new(FactoryState {
+        out: ab.clone(),
+        inc: ba.clone(),
+        events: Rc::new(RefCell::new(Vec::new())),
+        paths: Rc::new(RefCell::new(Vec::new())),
+    });
+    let fb = Rc::new(FactoryState {
+        out: ba.clone(),
+        inc: ab.clone(),
+        events: Rc::new(RefCell::new(Vec::new())),
+        paths: Rc::new(RefCell::new(Vec::new())),
+    });
+
+    // Login completes with no manual bind anywhere: each engine
+    // must have bound exactly one transport through its channel,
+    // handed the peer's announced transmit path (the announced
+    // local path constant), and the links report up.
+    drive_auto(&a, &b, &fa, &fb, 8);
+    let up = match (a.peer_info(), b.peer_info()) {
+        (Some(x), Some(y)) => x.login_connected && y.login_connected && x.link_up && y.link_up,
+        _ => false,
+    };
+    if !up
+        || fa.events.borrow().as_slice() != [true]
+        || fb.events.borrow().as_slice() != [true]
+        || fa.paths.borrow().as_slice() != [TBIP_LOCAL_PATH]
+        || fb.paths.borrow().as_slice() != [TBIP_LOCAL_PATH]
+        || live_link_count() != 2
+    {
+        return TestResult::Fail("login did not auto-bind both data transports");
+    }
+
+    // A frame crosses on the auto-bound transport.
+    let small = pattern(60, 0x10);
+    if !push_tx(&a, &small) {
+        return TestResult::Fail("could not queue TX frame on A");
+    }
+    drive_auto(&a, &b, &fa, &fb, 3);
+    if pop_rx(&b) != Some(small.clone()) {
+        return TestResult::Fail("frame did not cross the auto-bound transport");
+    }
+
+    // Logout from A: A's pass releases A's transport; B's
+    // session is cleared by the logout handler synchronously,
+    // and B's own next pass releases B's transport (asserted
+    // before any further driving can re-login either side).
+    a.engine.borrow_mut().initiate_logout(1);
+    pass_auto(&a, &b, &fa);
+    pass_auto(&b, &a, &fb);
+    let down = match (a.peer_info(), b.peer_info()) {
+        (Some(x), Some(y)) => !x.login_connected && !y.login_connected && !x.link_up && !y.link_up,
+        _ => false,
+    };
+    if !down
+        || fa.events.borrow().as_slice() != [true, false]
+        || fb.events.borrow().as_slice() != [true, false]
+        || live_link_count() != 0
+    {
+        return TestResult::Fail("logout did not release both data transports");
+    }
+
+    // Re-login rebinds through the channel, and frames flow on
+    // the new transports.
+    drive_auto(&a, &b, &fa, &fb, 8);
+    let rebound = match (a.peer_info(), b.peer_info()) {
+        (Some(x), Some(y)) => x.login_connected && y.login_connected && x.link_up && y.link_up,
+        _ => false,
+    };
+    if !rebound
+        || fa.events.borrow().as_slice() != [true, false, true]
+        || fb.events.borrow().as_slice() != [true, false, true]
+        || live_link_count() != 2
+    {
+        return TestResult::Fail("re-login did not rebind both data transports");
+    }
+    if !push_tx(&b, &small) {
+        return TestResult::Fail("could not queue TX frame on B after rebind");
+    }
+    drive_auto(&a, &b, &fa, &fb, 3);
+    if pop_rx(&a) != Some(small) {
+        return TestResult::Fail("frame did not cross after rebind");
+    }
+
+    drop(a);
+    drop(b);
+    forget_domain(98);
+    forget_domain(99);
+    if live_link_count() != 0 || peers().iter().any(|p| p.domain == 98 || p.domain == 99) {
+        return TestResult::Fail("auto-binding fixture left published XDomain state behind");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/thunderbolt/xdomain", xdomain_auto_data_binding);

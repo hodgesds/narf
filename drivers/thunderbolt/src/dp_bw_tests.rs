@@ -121,6 +121,8 @@ fn port(number: u8, kind: u32, cap: u16, secondary: bool) -> Port {
         max_out_hop: 15,
         total_credits: 64,
         secondary,
+        retimers: alloc::vec![],
+        retimer_fault: None,
     }
 }
 
