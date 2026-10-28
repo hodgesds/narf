@@ -24,6 +24,7 @@ struct State<R: Fullmac> {
     rx: Producer<Frame, RX_RING_N>,
     tx: Consumer<Frame, TX_RING_N>,
     pending: Option<PendingTx>,
+    telemetry: Arc<super::telemetry::Counters>,
 }
 struct PendingTx {
     frame: Frame,
@@ -33,6 +34,14 @@ struct Received {
     epoch: u64,
     peer: [u8; 6],
     bytes: Vec<u8>,
+    /// EAPOL for the host supplicant's control port.
+    control: bool,
+}
+/// Ordered host-supplicant control operations, applied by the worker.
+enum ExternalOp {
+    Key(narf_wireless::KeyParams),
+    DeleteKey(u8),
+    Authorize([u8; 6], bool),
 }
 #[cfg(any(test, feature = "kernel-test"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,14 +53,32 @@ enum ReceivePoint {
 type ReceiveHook = Arc<dyn Fn(ReceivePoint) + Send + Sync>;
 impl<R: Fullmac> State<R> {
     fn clear_transmit(&mut self) {
-        self.pending = None;
+        if let Some(pending) = self.pending.take() {
+            self.drop_frame(&pending.frame);
+        }
         // A ring has finite capacity. Bound cleanup even if its producer
         // runs concurrently; a disconnected interface admits no new TX.
         for _ in 0..TX_RING_N {
-            if !matches!(self.tx.try_recv(), Ok(Some(_))) {
-                break;
+            match self.tx.try_recv() {
+                Ok(Some(frame)) => self.drop_frame(&frame),
+                _ => break,
             }
         }
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    fn tx_queue_for_test(&mut self, bytes: Vec<u8>) {
+        let buffer = narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
+            .expect("test frame");
+        let mut frame = Frame::new(buffer, bytes.len() as u32);
+        frame.payload_mut().copy_from_slice(&bytes);
+        self.pending = Some(PendingTx {
+            frame,
+            deadline: narf_time::Deadline::after_ms(2000),
+        });
+    }
+    fn drop_frame(&self, frame: &Frame) {
+        self.telemetry
+            .dropped(crate::ath11k::tx_hdr::classify8021d(frame.payload()));
     }
 
     /// One synchronous progress step, shared by the timer and kernel
@@ -61,7 +88,9 @@ impl<R: Fullmac> State<R> {
             self.clear_transmit();
             return Err(error);
         }
-        if self.station.bssid.is_none() {
+        if self.station.bssid.is_none() || self.station.external_port() == Some(false) {
+            // An unauthorized host-supplicant port passes only EAPOL, which
+            // uses the control-port path, never the netdev rings.
             self.clear_transmit();
             return Ok(());
         }
@@ -78,15 +107,19 @@ impl<R: Fullmac> State<R> {
         let Some(pending) = self.pending.as_ref() else {
             return Ok(());
         };
+        // Linux brcmf_netdev_start_xmit: cfg80211_classify8021d.
+        let priority = crate::ath11k::tx_hdr::classify8021d(pending.frame.payload());
+        let length = pending.frame.payload().len();
         let result = if pending.deadline.expired() {
             Err(Error::Timeout)
         } else {
-            // Linux brcmf_netdev_start_xmit: cfg80211_classify8021d.
-            let priority = crate::ath11k::tx_hdr::classify8021d(pending.frame.payload());
             self.station.send_data(pending.frame.payload(), priority)
         };
         match result {
-            Ok(()) => self.pending = None,
+            Ok(()) => {
+                self.pending = None;
+                self.telemetry.transmitted(priority, length);
+            }
             Err(Error::Busy) => {}
             Err(error) => {
                 self.station.runtime.fail();
@@ -106,6 +139,8 @@ pub struct Device<R: Fullmac> {
     supplicant: bool,
     mfp_supported: bool,
     sae_offload: bool,
+    telemetry: Arc<super::telemetry::Counters>,
+    external_ops: IrqSafeSpinLock<alloc::collections::VecDeque<ExternalOp>>,
     /// Desired firmware PMKID list (nl80211 SET/DEL/FLUSH_PMKSA); the
     /// worker and each association reconcile firmware with it.
     pmksa: IrqSafeSpinLock<super::station::pmksa::Cache>,
@@ -186,6 +221,7 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
     narf_wireless::reg::db::ensure_snapshot().map_err(|_| Error::Authority)?;
     let station =
         Station::initialize_live(runtime, clm, Arc::new(super::station::GlobalPolicy)).await?;
+    let telemetry = Arc::new(super::telemetry::Counters::default());
     let (rx_producer, rx_consumer) = narf_ipc::channel();
     let (tx_producer, tx_consumer) = narf_ipc::channel();
     let device = Arc::new(Device {
@@ -195,6 +231,8 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
         supplicant: station.supplicant,
         mfp_supported: station.supports_management_protection(),
         sae_offload: station.supports_sae_offload(),
+        telemetry: telemetry.clone(),
+        external_ops: IrqSafeSpinLock::new(Default::default()),
         pmksa: IrqSafeSpinLock::new(Default::default()),
         ht_capabilities: station.ht_capabilities(),
         vht_capabilities: station.vht_capabilities(),
@@ -203,6 +241,7 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
             rx: rx_producer,
             tx: tx_consumer,
             pending: None,
+            telemetry,
         }),
         up: AtomicBool::new(false),
         power_save: AtomicU8::new(0),
@@ -364,10 +403,27 @@ impl<R: Fullmac + 'static> Device<R> {
             let Some(bytes) = state.station.runtime.pop_data() else {
                 break;
             };
-            if !self.up.load(Ordering::Acquire) || !receive_admitted(&bytes, self.mac) {
+            if state.station.external_port().is_some() && eapol_admitted(&bytes, self.mac, peer) {
+                output.push(Received {
+                    epoch,
+                    peer,
+                    bytes,
+                    control: true,
+                });
                 continue;
             }
-            output.push(Received { epoch, peer, bytes });
+            if !self.up.load(Ordering::Acquire)
+                || state.station.external_port() == Some(false)
+                || !receive_admitted(&bytes, self.mac)
+            {
+                continue;
+            }
+            output.push(Received {
+                epoch,
+                peer,
+                bytes,
+                control: false,
+            });
         }
         output
     }
@@ -434,14 +490,98 @@ impl<R: Fullmac + 'static> Device<R> {
     fn deliver_received(&self, frames: Vec<Received>) -> bool {
         let mut progress = false;
         for mut frame in frames {
+            if frame.control {
+                self.deliver_control(&frame);
+                progress = true;
+                continue;
+            }
             if !self.publish_received(&frame) {
                 break;
             }
+            self.telemetry.received(
+                crate::ath11k::tx_hdr::classify8021d(&frame.bytes),
+                frame.bytes.len(),
+            );
             // No state/publication/ring guard survives the final admission.
             narf_net::iface::on_rx_frame_from(&self.name, &mut frame.bytes);
             progress = true;
         }
         progress
+    }
+
+    /// `cfg80211_rx_control_port` for the current host-supplicant peer, or
+    /// the netdev when the owner did not request control port over nl80211.
+    fn deliver_control(&self, received: &Received) {
+        let authorized = {
+            let Some(state) = self.state.try_lock() else {
+                return;
+            };
+            if self.epoch.load(Ordering::Acquire) != received.epoch
+                || state.station.bssid != Some(received.peer)
+            {
+                return;
+            }
+            state.station.external_port() == Some(true)
+        };
+        if narf_wireless::nl80211::control_port_over_nl80211(&self.name) {
+            narf_wireless::nl80211::rx_control_port(
+                &self.name,
+                received.peer,
+                0x888e,
+                &received.bytes[14..],
+                !authorized,
+            );
+        } else {
+            let mut bytes = received.bytes.clone();
+            narf_net::iface::on_rx_frame_from(&self.name, &mut bytes);
+        }
+    }
+
+    /// Apply queued host-supplicant key/port operations in order.
+    async fn apply_external(&self) {
+        if self.external_ops.lock().is_empty() {
+            return;
+        }
+        let Some(mut state) = self.state.try_lock() else {
+            return;
+        };
+        loop {
+            let Some(op) = self.external_ops.lock().pop_front() else {
+                break;
+            };
+            let result = match op {
+                ExternalOp::Key(key) => {
+                    state
+                        .station
+                        .install_key(
+                            key.idx,
+                            key.pairwise,
+                            key.peer,
+                            key.cipher,
+                            &key.key,
+                            &key.seq,
+                        )
+                        .await
+                }
+                ExternalOp::DeleteKey(index) => state.station.delete_key(index).await,
+                ExternalOp::Authorize(peer, authorized) => {
+                    state.station.authorize_port(peer, authorized)
+                }
+            };
+            if let Err(error) = result {
+                self.external_ops.lock().clear();
+                state.clear_transmit();
+                if state.station.bssid.is_none() {
+                    self.link(None);
+                }
+                narf_console::klog!(
+                    "{}: FullMAC host-supplicant operation failed: {:?}\n",
+                    self.name,
+                    error
+                );
+                break;
+            }
+        }
     }
 
     async fn apply_power_save(&self) {
@@ -523,6 +663,11 @@ impl<R: Fullmac + 'static> Device<R> {
         }
     }
 
+    /// Per-AC host queue/traffic counters (VO, VI, BE, BK).
+    pub fn ac_statistics(&self) -> [super::telemetry::AcStats; 4] {
+        self.telemetry.snapshot()
+    }
+
     /// Platform roaming policy (Linux brcmfmac `roamoff`): enable or
     /// disable the firmware roaming engine while disconnected.
     pub async fn set_firmware_roaming(&self, enabled: bool) -> Result<(), WirelessError> {
@@ -538,6 +683,7 @@ impl<R: Fullmac + 'static> Device<R> {
         loop {
             self.deliver_received(self.step());
             self.apply_roam().await;
+            self.apply_external().await;
             self.apply_power_save().await;
             self.apply_pmksa().await;
             narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
@@ -667,6 +813,86 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
     }
     fn supports_sae_offload(&self) -> bool {
         self.sae_offload
+    }
+    fn supports_external_supplicant(&self) -> bool {
+        true
+    }
+    fn add_key(&self, key: narf_wireless::KeyParams) -> Result<(), i32> {
+        // brcmf_cfg80211_add_key: index < BRCMF_MAX_DEFAULT_KEYS; this
+        // profile installs CCMP-128 only.
+        if key.idx >= super::station::external::MAX_DEFAULT_KEYS
+            || key.cipher != narf_wireless::CIPHER_SUITE_CCMP
+            || key.key.len() != 16
+            || !(key.seq.is_empty() || key.seq.len() == 6)
+        {
+            return Err(22);
+        }
+        let current = self.connected_bssid().ok_or(2)?;
+        if key.pairwise && key.peer != Some(current) {
+            return Err(2); // ENOENT: not the associated AP.
+        }
+        self.external_ops.lock().push_back(ExternalOp::Key(key));
+        Ok(())
+    }
+    fn del_key(&self, idx: u8, _pairwise: bool, _peer: Option<[u8; 6]>) -> Result<(), i32> {
+        if idx >= super::station::external::MAX_DEFAULT_KEYS {
+            return Err(22);
+        }
+        self.connected_bssid().ok_or(2)?;
+        self.external_ops
+            .lock()
+            .push_back(ExternalOp::DeleteKey(idx));
+        Ok(())
+    }
+    fn set_port_authorized(&self, peer: [u8; 6], authorized: bool) -> Result<(), i32> {
+        if self.connected_bssid() != Some(peer) {
+            return Err(if authorized { 22 } else { 2 });
+        }
+        self.external_ops
+            .lock()
+            .push_back(ExternalOp::Authorize(peer, authorized));
+        Ok(())
+    }
+    fn tx_control_port(
+        &self,
+        dest: [u8; 6],
+        proto: u16,
+        frame: Vec<u8>,
+        _no_encrypt: bool,
+    ) -> Result<(), i32> {
+        // EAPOL (and RSN pre-authentication) to the associated AP only.
+        if !matches!(proto, 0x888e | 0x88c7) || frame.len() > 1500 {
+            return Err(22);
+        }
+        let peer = self.connected_bssid().ok_or(107)?; // ENOTCONN
+        if dest != peer {
+            return Err(22);
+        }
+        let mut state = self.state.try_lock().ok_or(16)?; // EBUSY
+        if state.station.external_port().is_none() {
+            return Err(95);
+        }
+        let mut bytes = Vec::with_capacity(14 + frame.len());
+        bytes.extend_from_slice(&dest);
+        bytes.extend_from_slice(&self.mac);
+        bytes.extend_from_slice(&proto.to_be_bytes());
+        bytes.extend_from_slice(&frame);
+        // mac80211 sends control-port frames as VO (802.1D 7).
+        match state.station.send_data(&bytes, 7) {
+            Ok(()) => Ok(()),
+            Err(Error::Busy) => Err(16),
+            Err(_) => Err(5),
+        }
+    }
+    fn station_info(&self) -> Option<narf_wireless::StationInfo> {
+        self.connected_bssid()?;
+        let (tx, rx, failed) = self.telemetry.totals();
+        Some(narf_wireless::StationInfo {
+            tx_packets: Some(tx),
+            rx_packets: Some(rx),
+            tx_failed: Some(failed),
+            ..Default::default()
+        })
     }
     fn set_pmksa(&self, entry: narf_wireless::PmksaEntry) -> Result<(), i32> {
         // Linux v1 list rows are {bssid, pmkid}; FILS/SSID-only caching is
@@ -811,6 +1037,13 @@ fn receive_admitted(bytes: &[u8], local: [u8; 6]) -> bool {
         && bytes[6] & 1 == 0
         && bytes[6..12] != [0; 6]
 }
+/// EAPOL from the associated AP to this station (host-supplicant mode).
+fn eapol_admitted(bytes: &[u8], local: [u8; 6], peer: [u8; 6]) -> bool {
+    (18..=1514).contains(&bytes.len())
+        && bytes[12..14] == [0x88, 0x8e]
+        && bytes[..6] == local
+        && bytes[6..12] == peer
+}
 fn transmit_admitted(bytes: &[u8], local: [u8; 6]) -> bool {
     (14..=1514).contains(&bytes.len())
         && u16::from_be_bytes([bytes[12], bytes[13]]) >= 0x600
@@ -897,6 +1130,7 @@ mod tests {
             rx,
             tx,
             pending: None,
+            telemetry: Default::default(),
         };
         let mut bytes = vec![0; 14];
         bytes[..6].copy_from_slice(&[2, 1, 2, 3, 4, 5]);

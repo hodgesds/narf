@@ -948,6 +948,7 @@ fn smoke_cyw_station_rejects_inconsistent_association_ies() -> TestResult {
                 0
             },
             false,
+            false,
         ) != Err(expected)
         {
             return TestResult::Fail(

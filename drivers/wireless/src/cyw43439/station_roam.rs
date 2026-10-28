@@ -164,6 +164,13 @@ impl<R: Fullmac> Station<R> {
         if peer == [0; 6] || peer[0] & 1 != 0 || peer == old {
             return false;
         }
+        if self.external.is_some() {
+            // A host supplicant must re-key the new AP itself; this profile
+            // does not hand it a roamed link (Linux reports cfg80211_roamed
+            // and the supplicant restarts its handshake). Treat it as loss.
+            self.close_link();
+            return true;
+        }
         self.bssid = None;
         self.connection = None;
         self.ht_verified = false;
@@ -183,6 +190,7 @@ impl<R: Fullmac> Station<R> {
         self.bssid = None;
         self.connection = None;
         self.protection = None;
+        self.external = None;
         self.reset_wmm();
         self.runtime.set_link(None);
     }

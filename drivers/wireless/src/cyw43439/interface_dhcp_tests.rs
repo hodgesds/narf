@@ -38,6 +38,8 @@ mod optional_mfp_tests;
 mod pmksa_tests;
 #[path = "probe_ies_tests.rs"]
 mod probe_ies_tests;
+#[path = "telemetry_tests.rs"]
+mod telemetry_tests;
 #[path = "wmm_tests.rs"]
 mod wmm_tests;
 
@@ -254,6 +256,7 @@ impl Harness {
         let supplicant = station.supplicant;
         let mfp_supported = station.supports_management_protection();
         let sae_offload = station.supports_sae_offload();
+        let telemetry = Arc::new(crate::cyw43439::telemetry::Counters::default());
         let ht_capabilities = station.ht_capabilities();
         let vht_capabilities = station.vht_capabilities();
         let (rx, rx_consumer) = narf_ipc::channel();
@@ -265,6 +268,7 @@ impl Harness {
                 rx,
                 tx,
                 pending: None,
+                telemetry: telemetry.clone(),
             }),
             name: name.clone(),
             mac: OWN,
@@ -272,6 +276,8 @@ impl Harness {
             supplicant,
             mfp_supported,
             sae_offload,
+            external_ops: narf_lib::sync::IrqSafeSpinLock::new(Default::default()),
+            telemetry,
             pmksa: IrqSafeSpinLock::new(Default::default()),
             ht_capabilities,
             vht_capabilities,

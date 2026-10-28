@@ -82,6 +82,7 @@ pub mod sdio;
 pub mod sdio_bridge;
 pub mod sdpcm;
 pub mod station;
+pub mod telemetry;
 pub mod transport;
 
 pub use firmware::{build_nvram_blob, FirmwareLoader, LoadError, LoadStep};
@@ -233,6 +234,8 @@ pub mod tests {
         smoke_cyw43439_sdpcm_region_cmd_encode
     );
 }
+#[cfg(any(test, feature = "kernel-test"))]
+mod external_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod fullmac_fixture;
 #[cfg(any(test, feature = "kernel-test"))]

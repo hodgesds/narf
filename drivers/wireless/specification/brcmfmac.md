@@ -561,9 +561,12 @@ different FIFO is a protocol error. Smoke: `drivers/wireless/brcmfmac/wmm`.
 Additional software outside that retained profile remains: nonzero descriptor
 prefixes/shared 7, other CPU/RAM/chip/OTP selectors (including 160 MHz-capable
 chips), HE/EHT profiles, monitor mode (which owns native802.11 RX and its
-metadata), larger flow budgets, host-supplicant fallback, WPA3/AP, replayed
+metadata), larger flow budgets, AP, replayed
 recovery/system PM, confirmed stop/IOMMU quiescence and DMA reclamation, and IRQ delivery.
 These do not expand the initial polling/retained-failure acceptance claim.
+WPA3-SAE offload (WCC `WSEC_PMK` passphrase ABI), the PMKSA cache, firmware
+roaming/FT, per-AC telemetry and host-supplicant fallback are common FullMAC
+work shared with CYW; see [CYW §3](cyw43439.md).
 
 Native802.11 receive is not a separate station feature: Linux
 `msgbuf.c::brcmf_msgbuf_process_rx_complete` hands a completion flagged

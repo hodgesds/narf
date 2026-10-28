@@ -37,6 +37,8 @@ pub struct Station<R: Fullmac> {
     firmware_roaming: bool,
     /// Firmware roam awaiting confirmation; the host port is closed.
     roam: Option<roam::Pending>,
+    /// Host-supplicant connection: `Some(port authorized)`.
+    external: Option<bool>,
     /// Security profile of the authorized association (re-verified on roam).
     protection: Option<mfp::Profile>,
     /// `BRCMF_FEAT_PMKID_V3` (`wlc_ver` major >= 13).
@@ -198,6 +200,7 @@ impl<R: Fullmac> Station<R> {
             sae_offload,
             firmware_roaming: false,
             roam: None,
+            external: None,
             protection: None,
             pmkid_v3,
             pmksa: Some(pmksa::Cache::default()),
@@ -575,11 +578,20 @@ impl<R: Fullmac> Station<R> {
                 }
                 Some(narf_wireless::rsn::AKM_SAE)
             }
+            // Host-supplicant fallback: the caller's RSNE selects the AKM.
+            SecurityConfig::External(_) if !self.firmware_roaming => {
+                Some(external::akm(&request.ie)?)
+            }
             _ => return Err(Error::Unsupported),
         };
+        let host_supplicant = matches!(request.security, SecurityConfig::External(_));
         // Fast BSS Transition is selected by the caller's RSNE AKM, as
         // Linux brcmf_set_key_mgmt maps WLAN_AKM_SUITE_FT_PSK/FT_OVER_SAE.
-        let akm = akm.map(|base| ft::select(base, &request.ie)).transpose()?;
+        let akm = if host_supplicant {
+            akm
+        } else {
+            akm.map(|base| ft::select(base, &request.ie)).transpose()?
+        };
         if let Some(akm) = akm {
             if ft::is_ft(akm) && !ft::has_mobility_domain(&bss.ies) {
                 return Err(Error::Unsupported);
@@ -598,7 +610,12 @@ impl<R: Fullmac> Station<R> {
         let sae = akm.is_some_and(ft::is_sae);
         let protection =
             mfp::Profile::negotiate_akm(&bss.ies, &request.ie, akm, self.mfp_supported)?;
-        validate_association_ies(&request.ie, protection.akm(), protection.required())?;
+        validate_association_ies(
+            &request.ie,
+            protection.akm(),
+            protection.required(),
+            host_supplicant,
+        )?;
         let mut ht = self
             .phy
             .as_ref()
@@ -638,7 +655,10 @@ impl<R: Fullmac> Station<R> {
             // before joining. Pin the firmware offload to this driver's
             // single negotiated PSK/CCMP profile even on a mixed-mode AP.
             let mut wpa_ie = Vec::new();
-            if secure {
+            if host_supplicant {
+                // The supplicant's own RSNE (PMKIDs included), as Linux.
+                wpa_ie.extend_from_slice(external::rsne(&request.ie).ok_or(Error::Unsupported)?);
+            } else if secure {
                 let body = protection.rsn().encode_body();
                 wpa_ie.extend_from_slice(&[48, body.len() as u8]);
                 wpa_ie.extend_from_slice(&body);
@@ -648,7 +668,14 @@ impl<R: Fullmac> Station<R> {
                 grant,
                 "wpa_auth",
                 // WPA2_AUTH_PSK / WPA3_AUTH_SAE_PSK (| WPA2_AUTH_FT).
-                &akm.map_or(0, ft::wpa_auth).to_le_bytes(),
+                &akm.map_or(0, |akm| {
+                    if host_supplicant {
+                        external::wpa_auth(akm).unwrap_or(0)
+                    } else {
+                        ft::wpa_auth(akm)
+                    }
+                })
+                .to_le_bytes(),
             )
             .await?;
             self.tx_int(grant, 134, if secure { 4 } else { 0 }).await?;
@@ -663,8 +690,12 @@ impl<R: Fullmac> Station<R> {
                 }
             }
             if self.supplicant {
-                self.tx_var(grant, "sup_wpa", &u32::from(secure).to_le_bytes())
-                    .await?;
+                self.tx_var(
+                    grant,
+                    "sup_wpa",
+                    &u32::from(secure && !host_supplicant).to_le_bytes(),
+                )
+                .await?;
             }
             if let SecurityConfig::Wpa3 { password } = &request.security {
                 // Linux: "clean up user-space RSNE" so firmware builds the
@@ -697,7 +728,8 @@ impl<R: Fullmac> Station<R> {
             join[48..50].copy_from_slice(&occupied.chanspec().to_le_bytes());
             self.tx_command(grant, 26, &join).await?;
             let deadline = narf_time::Deadline::after_ms(15000);
-            let (mut associated, mut keys) = (false, !secure);
+            // A host supplicant runs the 4-way after link-up: SET_SSID alone.
+            let (mut associated, mut keys) = (false, !secure || host_supplicant);
             let mut protection_verified = false;
             let mut wmm_verified = false;
             let mut drain_batches = 0;
@@ -754,7 +786,7 @@ impl<R: Fullmac> Station<R> {
                         // Re-observe a current FIFO/ring idle sample first.
                         continue;
                     }
-                    if protection.verify() && !protection_verified {
+                    if protection.verify() && !protection_verified && !host_supplicant {
                         self.mfp_verified = self
                             .verify_management_protection(grant, request.bssid, protection)
                             .await?;
@@ -778,6 +810,7 @@ impl<R: Fullmac> Station<R> {
                     }
                     self.check_grants(core::slice::from_ref(&grant))?;
                     self.protection = Some(protection);
+                    self.external = host_supplicant.then_some(false);
                     self.connection = Some(grant);
                     self.runtime.set_ac_priority(self.ac_priority);
                     self.runtime.set_link(Some(request.bssid));
@@ -802,6 +835,7 @@ impl<R: Fullmac> Station<R> {
             self.mfp_verified = false;
             self.ht_verified = false;
             self.vht_verified = false;
+            self.external = None;
             self.reset_wmm();
             self.bssid = None;
             self.connection = None;
@@ -838,6 +872,7 @@ impl<R: Fullmac> Station<R> {
             .take()
             .or_else(|| self.roam.take().map(|r| r.peer));
         self.protection = None;
+        self.external = None;
         self.mfp_verified = false;
         self.ht_verified = false;
         self.vht_verified = false;
@@ -932,6 +967,8 @@ impl<R: Fullmac> Station<R> {
 mod policy;
 pub use policy::{GlobalPolicy, PolicySource};
 
+#[path = "station_external.rs"]
+pub mod external;
 #[path = "station_ft.rs"]
 pub mod ft;
 #[path = "station_mfp.rs"]
@@ -960,7 +997,12 @@ const MAX_REPLY: usize = 1502;
 /// nl80211 PSK-offload contract: validate the requested RSNE, consume a
 /// bounded well-formed IE list, and leave firmware-generated capabilities
 /// and RSNXE to the firmware. External-key profiles remain unsupported.
-fn validate_association_ies(mut ies: &[u8], akm: u8, mfp: bool) -> Result<(), Error> {
+fn validate_association_ies(
+    mut ies: &[u8],
+    akm: u8,
+    mfp: bool,
+    host_supplicant: bool,
+) -> Result<(), Error> {
     let secure = akm != 0;
     use narf_wireless::rsn::*;
     if ies.len() > 2048 {
@@ -981,7 +1023,7 @@ fn validate_association_ies(mut ies: &[u8], akm: u8, mfp: bool) -> Result<(), Er
                 || rsn.pairwise_ciphers != [ccmp]
                 || rsn.akms != [Suite::standard(akm)]
                 || rsn.rsn_capabilities & RSN_CAP_MFP_REQUIRED != 0 && !mfp
-                || !rsn.pmkids.is_empty()
+                || !rsn.pmkids.is_empty() && !host_supplicant
                 || rsn
                     .group_management_cipher
                     .is_some_and(|cipher| cipher != Suite::standard(CIPHER_BIP_CMAC_128))
