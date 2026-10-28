@@ -472,7 +472,7 @@ struct Hop {
     next: u16,
 }
 #[derive(Debug)]
-struct Undo {
+pub(crate) struct Undo {
     endpoint: Endpoint,
     space: CfgSpace,
     offset: u16,

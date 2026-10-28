@@ -663,17 +663,17 @@ fn usb4_dp_bw_codecs() -> TestResult {
         || DpRate::Hbr3.payload_mbps(4) != 25_920
         || DpRate::from_cap_code(0) != Some(DpRate::Rbr)
         || DpRate::from_cap_code(3) != Some(DpRate::Hbr3)
-        || DpRate::from_cap_code(4) != None
+        || DpRate::from_cap_code(4).is_some()
     {
         return TestResult::Fail("payload table / rate codes");
     }
     if decode_lane_count(0) != Some(1)
         || decode_lane_count(1) != Some(2)
         || decode_lane_count(2) != Some(4)
-        || decode_lane_count(3) != None
+        || decode_lane_count(3).is_some()
         || encode_lane_count(1) != Some(0)
         || encode_lane_count(4) != Some(2)
-        || encode_lane_count(3) != None
+        || encode_lane_count(3).is_some()
     {
         return TestResult::Fail("lane encodings");
     }
@@ -683,7 +683,7 @@ fn usb4_dp_bw_codecs() -> TestResult {
         || fit_link(DpRate::Hbr3, 4, 9_000) != Some((DpRate::Hbr, 4))
         || fit_link(DpRate::Hbr3, 4, 5_000) != Some((DpRate::Hbr, 2))
         || fit_link(DpRate::Hbr2, 4, 17_279) != Some((DpRate::Hbr, 4))
-        || fit_link(DpRate::Rbr, 1, 1_000) != None
+        || fit_link(DpRate::Rbr, 1, 1_000).is_some()
     {
         return TestResult::Fail("fit_link ladder");
     }
@@ -693,14 +693,14 @@ fn usb4_dp_bw_codecs() -> TestResult {
         || g250.map(|g| g.to_mbps(69)) != Some(17_250)
         || g1000.map(|g| g.units_floor(8_640)) != Some(8)
         || g250.map(|g| g.units_floor(1_000_000)) != Some(255)
-        || Granularity::decode(3 << 11) != None
+        || Granularity::decode(3 << 11).is_some()
     {
         return TestResult::Fail("granularity denominations");
     }
     if lane_speed_mbps(0x8) != Some(10_000)
         || lane_speed_mbps(0x4) != Some(20_000)
         || lane_speed_mbps(0x2) != Some(40_000)
-        || lane_speed_mbps(0xc) != None
+        || lane_speed_mbps(0xc).is_some()
         || link_budget_mbps(20_000, 2) != 36_000
         || link_budget_mbps(10_000, 1) != 9_000
     {

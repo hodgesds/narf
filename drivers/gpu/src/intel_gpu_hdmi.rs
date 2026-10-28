@@ -833,7 +833,7 @@ pub mod tests {
 
     use super::*;
     use crate::intel_gpu_ddi::DDI_BUF_CTL_OFFSET;
-    use crate::intel_gpu_gmbus::{GMBUS2_ACTIVE, GMBUS2_HW_RDY, GMBUS2_NACK};
+    use crate::intel_gpu_gmbus::{GMBUS2_ACTIVE, GMBUS2_HW_RDY, GMBUS2_SATOER};
     use crate::intel_gpu_modeset::PixelFormat;
     use crate::intel_gpu_pipes::{Pipe as PipeIdx, PIPECONF_OFFSET, TRANS_DDI_FUNC_CTL_OFFSET};
     use crate::intel_gpu_pll::{dpll_cfgcr1, DPLL_CFGCR0_DPLL0};
@@ -946,7 +946,7 @@ pub mod tests {
 
         fn gmbus2(&self) -> u32 {
             if self.nack {
-                return GMBUS2_NACK | GMBUS2_ACTIVE;
+                return GMBUS2_SATOER | GMBUS2_ACTIVE;
             }
             if self.reading && !self.read_queue.is_empty() {
                 return GMBUS2_HW_RDY | GMBUS2_ACTIVE;

@@ -386,7 +386,7 @@ impl I2cHidIdentity {
 
 /// One probed sensor collection on an I2C-HID device: its decode
 /// profile plus the descriptor unit exponent its reports carry.
-struct SensorRoute {
+pub(crate) struct SensorRoute {
     profile: crate::hid_sensor::HidSensorProfile,
     unit_exp: i32,
 }
