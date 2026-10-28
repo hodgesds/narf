@@ -54,11 +54,11 @@ fn ies(six: [u8; 5], with_6ghz_cap: bool) -> Vec<u8> {
 fn band_identity() -> Result<(), &'static str> {
     if channel::frequency_in(Band::Ghz6, 37) != Some(6135)
         || channel::frequency_in(Band::Ghz6, 2) != Some(5935)
-        || channel::frequency_in(Band::Ghz6, 235) != None
-        || channel::frequency_in(Band::Ghz5, 37) != None
+        || channel::frequency_in(Band::Ghz6, 235).is_some()
+        || channel::frequency_in(Band::Ghz5, 37).is_some()
         || channel::frequency_in(Band::Ghz5, 36) != Some(5180)
         || channel::frequency(36) != Some(5180)
-        || channel::band(37) != None
+        || channel::band(37).is_some()
     {
         return Err("6 GHz channel-to-frequency mapping");
     }

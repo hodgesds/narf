@@ -60,7 +60,6 @@ pub(crate) struct SaeAp {
     /// station's H2E Commit selects SAE-EXT-KEY (`sae_write_commit`).
     pub ssid: Vec<u8>,
     pub password: Vec<u8>,
-    pub seed: [u8; 64],
     pub addresses: ([u8; 6], [u8; 6]),
 }
 
@@ -192,11 +191,9 @@ impl SaeAp {
                 // element after group, scalar and element; ours must match.
                 if let Some(selector) = akm_suite_selector(body) {
                     let (own, peer) = self.addresses;
-                    self.session =
-                        SaeSession::new_h2e_bytes(&self.ssid, &self.password, own, peer)
-                            .with_test_seed(self.seed)
-                            .with_akm_suite_selector(selector)
-                            .ok()?;
+                    self.session = SaeSession::new_h2e_bytes(&self.ssid, &self.password, own, peer)
+                        .with_akm_suite_selector(selector)
+                        .ok()?;
                 }
                 let commit = self.session.try_build_commit().ok()?;
                 self.session.on_commit(body).ok()?;

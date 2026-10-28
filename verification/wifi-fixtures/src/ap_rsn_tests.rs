@@ -143,8 +143,7 @@ fn sae_join(pwe: ApSaePwe, ap_akms: &[u8], options: JoinOptions) -> Result<KeyMg
         SaeSession::new_h2e_bytes(SSID, PASSWORD, PLAN.station, PLAN.bssid)
     } else {
         SaeSession::new_hunt_and_peck(PASSWORD, PLAN.station, PLAN.bssid)
-    }
-    .with_test_seed([0x31; 64]);
+    };
     if let Some(selector) = join.akm_suite_selector() {
         session = session
             .with_akm_suite_selector(selector)

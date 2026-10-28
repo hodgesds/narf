@@ -128,7 +128,7 @@ impl FakeAp {
 
     /// A WPA3-Personal AP: SAE (AKM 8) with `password`, MFPC|MFPR, and the
     /// RSNXE SAE-H2E bit for `ApSaePwe::HashToElement`. The SAE scalar/mask
-    /// come from `anonce` so a run is deterministic.
+    /// come from the kernel CSPRNG; `anonce` is the message-1 ANonce.
     pub fn wpa3_sae(
         plan: NetworkPlan,
         ssid: &[u8],
@@ -142,10 +142,6 @@ impl FakeAp {
             return Err(ApError::Configuration);
         }
         let mut ap = Self::new(plan, ssid, channel, aid, None, anonce)?;
-        let mut seed = [0; 64];
-        seed[..32].copy_from_slice(&anonce);
-        seed[32..].copy_from_slice(&anonce);
-        seed[63] ^= 0x5a;
         let session = match pwe {
             ApSaePwe::HuntAndPeck => {
                 SaeSession::new_hunt_and_peck(password, plan.bssid, plan.station)
@@ -153,8 +149,7 @@ impl FakeAp {
             ApSaePwe::HashToElement => {
                 SaeSession::new_h2e_bytes(ssid, password, plan.bssid, plan.station)
             }
-        }
-        .with_test_seed(seed);
+        };
         ap.rsn = Some(alloc::boxed::Box::new(RsnProfile {
             akms: vec![narf_wireless::rsn::AKM_SAE],
             caps: narf_wireless::rsn::RSN_CAP_MFP_CAPABLE
@@ -166,7 +161,6 @@ impl FakeAp {
                 accepted: false,
                 ssid: ssid.to_vec(),
                 password: password.to_vec(),
-                seed,
                 addresses: (plan.bssid, plan.station),
             }),
             igtk: [0x6b; 16],

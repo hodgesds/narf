@@ -81,8 +81,9 @@ grant no device, calibration or regulatory authority.
 password, ApSaePwe::{HuntAndPeck, HashToElement}, anonce)` builds a
 WPA3-Personal AP. It offers AKM 8 with MFPC|MFPR, plus the RSNXE SAE-H2E
 bit under H2E, and runs the AP side of SAE with the shared `SaeSession`
-(seeded from `anonce`). It answers a station Commit with its own Commit
-(status 0 or 126) and a verified Confirm with its Confirm.
+and draws its Commit scalar from the kernel CSPRNG. It answers a station
+Commit with its own Commit (status 0 or 126) and a verified Confirm with its
+Confirm.
 `FakeAp::with_pmf(ApPmf::{Optional, Required})` adds MFPC or MFPC|MFPR to a
 WPA2-PSK AP. `with_akms(&[u8])` changes the offered AKMs, for example
 `[8, 24]` or `[6]`. `with_igtk(key, key_id, ipn)` selects the IGTK.
