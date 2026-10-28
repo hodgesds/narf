@@ -31,8 +31,12 @@ macro_rules! delegate {
 impl RxDescriptor {
     pub fn decode(rev: HwRev, bytes: &[u8]) -> Option<Self> {
         match rev {
-            HwRev::Qca6390Hw20 => HalRxDescIpq8074::from_bytes(bytes).map(Self::Ipq8074),
-            HwRev::Qcn9074Hw10 => HalRxDescQcn9074::from_bytes(bytes).map(Self::Qcn9074),
+            HwRev::Qca6390Hw20 | HwRev::Ipq8074 | HwRev::Ipq6018Hw10 => {
+                HalRxDescIpq8074::from_bytes(bytes).map(Self::Ipq8074)
+            }
+            HwRev::Qcn9074Hw10 | HwRev::Ipq5018Hw10 | HwRev::Wcn6750Hw10 => {
+                HalRxDescQcn9074::from_bytes(bytes).map(Self::Qcn9074)
+            }
             HwRev::Wcn6855Hw20 | HwRev::Wcn6855Hw21 | HwRev::Qca2066Hw21 | HwRev::Qca6698aqHw21 => {
                 HalRxDescWcn6855::from_bytes(bytes).map(Self::Wcn6855)
             }
@@ -41,8 +45,12 @@ impl RxDescriptor {
     }
     pub fn msdu_len_offset(rev: HwRev) -> Option<usize> {
         match rev {
-            HwRev::Qca6390Hw20 => Some(core::mem::offset_of!(HalRxDescIpq8074, msdu_start) + 4),
-            HwRev::Qcn9074Hw10 => Some(core::mem::offset_of!(HalRxDescQcn9074, msdu_start) + 4),
+            HwRev::Qca6390Hw20 | HwRev::Ipq8074 | HwRev::Ipq6018Hw10 => {
+                Some(core::mem::offset_of!(HalRxDescIpq8074, msdu_start) + 4)
+            }
+            HwRev::Qcn9074Hw10 | HwRev::Ipq5018Hw10 | HwRev::Wcn6750Hw10 => {
+                Some(core::mem::offset_of!(HalRxDescQcn9074, msdu_start) + 4)
+            }
             HwRev::Wcn6855Hw20 | HwRev::Wcn6855Hw21 | HwRev::Qca2066Hw21 | HwRev::Qca6698aqHw21 => {
                 Some(core::mem::offset_of!(HalRxDescWcn6855, msdu_start) + 4)
             }

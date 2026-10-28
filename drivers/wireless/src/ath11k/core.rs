@@ -471,7 +471,7 @@ pub struct CoreConfig {
 }
 
 impl CoreConfig {
-    /// `ath11k_hw_params[]` for the PCI parts the core supports:
+    /// `ath11k_hw_params[]` for the parts the core supports:
     /// QCA6390 and WCN6855-layout families share Linux's single-pdev,
     /// two-RXDMA, four-vdev resource configuration and HTC service map.
     /// QCN9074 still requires its independent HAL/DP/core profile.
@@ -495,6 +495,26 @@ impl CoreConfig {
                 service_ready_ms: 5000,
                 wmi_send_ms: 3000,
             }),
+            // The AHB / hybrid-bus entries: one RXDMA per pdev; IPQ
+            // parts are multi-pdev (`single_pdev_only = false`,
+            // `num_vdevs = 16 + 1`), WCN6750 single-pdev with three.
+            HwRev::Ipq8074 | HwRev::Ipq6018Hw10 | HwRev::Ipq5018Hw10 | HwRev::Wcn6750Hw10 => {
+                let a = params.hw_rev.ahb_chip()?.params();
+                Some(CoreConfig {
+                    fw_mode: ATH11K_FIRMWARE_MODE_NORMAL,
+                    credit_flow: params.credit_flow,
+                    supports_shadow_regs: params.supports_shadow_regs,
+                    single_pdev_only: a.single_pdev_only,
+                    num_rxdma_per_pdev: 1,
+                    max_radios: a.max_radios as u8,
+                    num_vdevs: if a.single_pdev_only { 3 } else { 16 + 1 },
+                    svc_to_ce_map: a.svc_to_ce_map,
+                    htc_wait_ms: 1000,
+                    htc_conn_ms: 1000,
+                    service_ready_ms: 5000,
+                    wmi_send_ms: 3000,
+                })
+            }
             _ => None,
         }
     }

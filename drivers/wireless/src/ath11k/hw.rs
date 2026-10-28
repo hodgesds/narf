@@ -32,8 +32,10 @@ pub const ATH11K_DEV_WCN6855: u16 = 0x1103;
 pub const ATH11K_DEV_QCN9074: u16 = 0x1104;
 
 /// Hardware revision tag — drives per-chip register/MHI/DP config.
-/// The PCI-attached subset of Linux `enum ath11k_hw_rev`, plus
-/// `Unknown` for a stepping `ath11k_pci_probe` rejects.
+/// Linux `enum ath11k_hw_rev`: the PCI parts, the AHB / hybrid-bus
+/// SoC parts (`Ipq8074`, `Ipq6018Hw10`, `Ipq5018Hw10`, `Wcn6750Hw10`,
+/// bound through [`super::ahb`]), plus `Unknown` for a stepping
+/// `ath11k_pci_probe` rejects.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HwRev {
     Qca6390Hw20,
@@ -42,6 +44,14 @@ pub enum HwRev {
     Wcn6855Hw21,
     Qca2066Hw21,
     Qca6698aqHw21,
+    /// `ATH11K_HW_IPQ8074` (AHB).
+    Ipq8074,
+    /// `ATH11K_HW_IPQ6018_HW10` (AHB).
+    Ipq6018Hw10,
+    /// `ATH11K_HW_IPQ5018_HW10` (AHB, remapped CE window).
+    Ipq5018Hw10,
+    /// `ATH11K_HW_WCN6750_HW10` (hybrid bus: AHB glue, PCIe-style MSI).
+    Wcn6750Hw10,
     Unknown,
 }
 
@@ -54,6 +64,10 @@ impl HwRev {
             HwRev::Wcn6855Hw21 => "WCN6855 HW2.1",
             HwRev::Qca2066Hw21 => "QCA2066 HW2.1",
             HwRev::Qca6698aqHw21 => "QCA6698AQ HW2.1",
+            HwRev::Ipq8074 => "IPQ8074 HW2.0",
+            HwRev::Ipq6018Hw10 => "IPQ6018 HW1.0",
+            HwRev::Ipq5018Hw10 => "IPQ5018 HW1.0",
+            HwRev::Wcn6750Hw10 => "WCN6750 HW1.0",
             HwRev::Unknown => "ath11k unknown",
         }
     }
@@ -68,18 +82,48 @@ impl HwRev {
             HwRev::Wcn6855Hw21 => "WCN6855/hw2.1",
             HwRev::Qca2066Hw21 => "QCA2066/hw2.1",
             HwRev::Qca6698aqHw21 => "QCA6698AQ/hw2.1",
+            HwRev::Ipq8074 | HwRev::Ipq6018Hw10 | HwRev::Ipq5018Hw10 | HwRev::Wcn6750Hw10 => {
+                return self.ahb_chip().map(|c| c.params().fw_dir)
+            }
             HwRev::Unknown => return None,
         })
     }
 
-    /// `hw_params.spectral` from Linux `core.c::ath11k_hw_params`. Every
-    /// PCI WLAN profile NARF admits (QCA6390, WCN6855, QCA2066, QCA6698AQ)
-    /// has an all-zero block; only QCN9074 among the PCI parts (and the
-    /// IPQ8074/IPQ6018/IPQ5018 AHB SoCs NARF does not admit) defines an FFT
-    /// report format.
+    /// The AHB / hybrid-bus chip this revision names (`None` for PCI).
+    pub const fn ahb_chip(self) -> Option<super::ahb::AhbChip> {
+        use super::ahb::AhbChip;
+        match self {
+            HwRev::Ipq8074 => Some(AhbChip::Ipq8074),
+            HwRev::Ipq6018Hw10 => Some(AhbChip::Ipq6018Hw10),
+            HwRev::Ipq5018Hw10 => Some(AhbChip::Ipq5018Hw10),
+            HwRev::Wcn6750Hw10 => Some(AhbChip::Wcn6750Hw10),
+            _ => None,
+        }
+    }
+
+    /// `hw_params.spectral` from Linux `core.c::ath11k_hw_params`.
+    /// QCA6390, WCN6855, QCA2066, QCA6698AQ and WCN6750 have an all-zero
+    /// block; QCN9074 / IPQ5018 and IPQ8074 / IPQ6018 define FFT report
+    /// formats.
     pub const fn spectral(self) -> SpectralParams {
         match self {
-            HwRev::Qcn9074Hw10 => SpectralParams {
+            HwRev::Ipq8074 => SpectralParams {
+                fft_sz: 2,
+                fft_pad_sz: 2,
+                summary_pad_sz: 0,
+                fft_hdr_len: 16,
+                max_fft_bins: 512,
+                fragment_160mhz: true,
+            },
+            HwRev::Ipq6018Hw10 => SpectralParams {
+                fft_sz: 4,
+                fft_pad_sz: 0,
+                summary_pad_sz: 0,
+                fft_hdr_len: 16,
+                max_fft_bins: 512,
+                fragment_160mhz: true,
+            },
+            HwRev::Qcn9074Hw10 | HwRev::Ipq5018Hw10 => SpectralParams {
                 fft_sz: 2,
                 fft_pad_sz: 0,
                 summary_pad_sz: 16,
@@ -209,6 +253,15 @@ impl MsiConfig {
     }
 }
 
+/// No MSI users: the AHB IPQ parts, whose CE and DP rings interrupt on
+/// dedicated GIC lines (`ath11k_ahb_hif_ops_ipq8074` has no
+/// `get_user_msi_vector`, so `ath11k_ce_srng_msi_ring_params_setup`
+/// leaves every ring without MSI).
+pub const MSI_CONFIG_NONE: MsiConfig = MsiConfig {
+    total_vectors: 0,
+    users: &[],
+};
+
 /// 32 vectors: QCA6390 / WCN6855 / QCA2066 / QCA6698AQ.
 pub const MSI_CONFIG_QCA6390: MsiConfig = MsiConfig {
     total_vectors: 32,
@@ -316,6 +369,11 @@ pub struct HwParams {
     pub credit_flow: bool,
     /// `hw_params.ring_mask` (DP interrupt groups).
     pub ring_mask: &'static RingMask,
+    /// `ATH11K_CE_OFFSET(ab)`: added to CE register offsets
+    /// (`ath11k_hal_srng_create_config`, `ath11k_ahb_ce_irq_enable`). 0
+    /// except where the CE space is remapped (IPQ5018:
+    /// [`super::ahb::AHB_CE_WINDOW_OFFSET`]).
+    pub ce_offset: u32,
 }
 
 impl HwParams {
@@ -341,6 +399,9 @@ impl HwRev {
             HwRev::Wcn6855Hw20 | HwRev::Wcn6855Hw21 | HwRev::Qca2066Hw21 | HwRev::Qca6698aqHw21 => {
                 (Some(&WCN6855_REGS), &HOST_CE_CONFIG_QCA6390, true, true)
             }
+            HwRev::Ipq8074 | HwRev::Ipq6018Hw10 | HwRev::Ipq5018Hw10 | HwRev::Wcn6750Hw10 => {
+                return self.ahb_chip().map(|c| c.params().hw_params(self))
+            }
             HwRev::Unknown => return None,
         };
         let (msi, fix_l1ss, static_window_map) = match self {
@@ -365,7 +426,7 @@ impl HwRev {
             HwRev::Wcn6855Hw20 | HwRev::Wcn6855Hw21 | HwRev::Qca2066Hw21 | HwRev::Qca6698aqHw21 => {
                 (&MSI_CONFIG_QCA6390, None, false)
             }
-            HwRev::Unknown => return None,
+            _ => return None,
         };
         Some(HwParams {
             hw_rev: self,
@@ -378,6 +439,7 @@ impl HwRev {
             supports_shadow_regs,
             credit_flow,
             ring_mask: &RING_MASK_QCA6390,
+            ce_offset: 0,
         })
     }
 }
@@ -826,6 +888,52 @@ pub const HW_HAL_PARAMS_QCA6390: HwHalParams = HwHalParams {
         wbm_ring_num: 0,
         rbm_id: rbm::SW0_BM,
     }],
+};
+
+/// Linux `ath11k_hw_hal_params_ipq8074` (IPQ8074 / IPQ6018 / QCN9074 /
+/// IPQ5018): three TCL data rings, RX buffers on SW3_BM.
+pub const HW_HAL_PARAMS_IPQ8074: HwHalParams = HwHalParams {
+    rx_buf_rbm: rbm::SW3_BM,
+    tcl2wbm_rbm_map: &[
+        Tcl2WbmRbmMap {
+            tcl_ring_num: 0,
+            wbm_ring_num: 0,
+            rbm_id: rbm::SW0_BM,
+        },
+        Tcl2WbmRbmMap {
+            tcl_ring_num: 1,
+            wbm_ring_num: 1,
+            rbm_id: rbm::SW1_BM,
+        },
+        Tcl2WbmRbmMap {
+            tcl_ring_num: 2,
+            wbm_ring_num: 2,
+            rbm_id: rbm::SW2_BM,
+        },
+    ],
+};
+
+/// Linux `ath11k_hw_hal_params_wcn6750`: three TCL data rings, the
+/// second completing on WBM ring 4 (SW4_BM).
+pub const HW_HAL_PARAMS_WCN6750: HwHalParams = HwHalParams {
+    rx_buf_rbm: rbm::SW1_BM,
+    tcl2wbm_rbm_map: &[
+        Tcl2WbmRbmMap {
+            tcl_ring_num: 0,
+            wbm_ring_num: 0,
+            rbm_id: rbm::SW0_BM,
+        },
+        Tcl2WbmRbmMap {
+            tcl_ring_num: 1,
+            wbm_ring_num: 4,
+            rbm_id: rbm::SW4_BM,
+        },
+        Tcl2WbmRbmMap {
+            tcl_ring_num: 2,
+            wbm_ring_num: 2,
+            rbm_id: rbm::SW2_BM,
+        },
+    ],
 };
 
 // ── BAR0 register-window constants ─────────────────────────────────

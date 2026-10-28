@@ -71,7 +71,9 @@ use super::hal::{
     HAL_SRNG_INT_TIMER_THRESHOLD_TX,
 };
 use super::htt::{self, HttPpduStats, HttT2h, HttTarget, RxRingTlvFilter};
-use super::hw::{rbm, HwHalParams, HwParams, HwRev, RingMask, HW_HAL_PARAMS_QCA6390};
+use super::hw::{
+    rbm, HwHalParams, HwParams, HwRev, RingMask, HW_HAL_PARAMS_QCA6390, HW_HAL_PARAMS_WCN6750,
+};
 use super::power::ChipIo;
 use super::rx_descriptor::RxDescriptor;
 
@@ -412,6 +414,27 @@ impl DpHwParams {
                 alloc_cacheable_memory: false,
                 single_pdev_only: true,
             }),
+            // WCN6750 (`core.c`): the WCN6855 single-pdev shape with one
+            // RXDMA, the QCN9074 RX descriptor, three TCL rings
+            // (`ath11k_hw_hal_params_wcn6750`), 2048-entry TCL data rings
+            // and no TCL ring retry.
+            HwRev::Wcn6750Hw10 => Some(DpHwParams {
+                hw: rev.params()?,
+                hal_params: &HW_HAL_PARAMS_WCN6750,
+                num_rxdma_per_pdev: 1,
+                rx_mac_buf_ring: true,
+                rxdma1_enable: false,
+                supports_monitor: false,
+                full_monitor_mode: false,
+                htt_peer_map_v2: false,
+                tcl_ring_retry: false,
+                tx_ring_size: DP_TCL_DATA_RING_SIZE_WCN6750,
+                hal_desc_sz: super::qcn9074::HalRxDescQcn9074::SIZE,
+                alloc_cacheable_memory: false,
+                single_pdev_only: true,
+            }),
+            // IPQ8074 / IPQ6018 / IPQ5018 / QCN9074: multi-pdev with
+            // rxdma1 monitor rings and HTT peer-map v2 (not ported).
             _ => None,
         }
     }

@@ -295,6 +295,9 @@ pub fn wlfw_hw_params(rev: HwRev) -> Option<WlfwHwParams> {
             bdf_addr: 0,
             cal_offset: 128 * 1024,
         },
+        HwRev::Ipq8074 | HwRev::Ipq6018Hw10 | HwRev::Ipq5018Hw10 | HwRev::Wcn6750Hw10 => {
+            return rev.ahb_chip().map(|c| c.wlfw_hw_params())
+        }
         HwRev::Unknown => return None,
     })
 }

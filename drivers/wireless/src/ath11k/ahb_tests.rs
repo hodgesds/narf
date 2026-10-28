@@ -361,3 +361,89 @@ fn smoke_ath11k_ahb_register_access() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_ahb_register_access);
+
+/// The AHB chips enter the `HwRev`-keyed tables the CE / HAL / core /
+/// DP layers read (`core.c::ath11k_hw_params`).
+fn smoke_ath11k_ahb_hwrev_admission() -> TestResult {
+    use super::super::core::CoreConfig;
+    use super::super::dp_ring::DpHwParams;
+    use super::super::hal::{Hal, HalRingType};
+    use super::super::rx_descriptor::RxDescriptor;
+    for (_, chip) in AHB_OF_MATCH {
+        let rev = chip.hw_rev();
+        kt_assert_eq!(rev.ahb_chip(), Some(chip));
+        let a = chip.params();
+        let Some(hw) = rev.params() else {
+            return TestResult::Fail("AHB rev has no HwParams");
+        };
+        kt_assert_eq!(hw.fw_dir, a.fw_dir);
+        kt_assert_eq!(rev.fw_dir(), Some(a.fw_dir));
+        kt_assert_eq!(hw.ce_count(), a.ce_count());
+        kt_assert!(hw.regs == Some(a.regs), "regs");
+        kt_assert_eq!(hw.supports_shadow_regs, a.supports_shadow_regs);
+        kt_assert_eq!(hw.ce_offset, a.ce_offset());
+        kt_assert_eq!(hw.msi.users.is_empty(), !a.hybrid_bus_type);
+        kt_assert_eq!(
+            super::super::qmi_wlfw::wlfw_hw_params(rev),
+            Some(chip.wlfw_hw_params())
+        );
+        kt_assert!(
+            super::super::mhi::config_for(rev).is_none(),
+            "AHB parts have no MHI"
+        );
+        let Some(cfg) = CoreConfig::for_hw(&hw) else {
+            return TestResult::Fail("AHB rev has no CoreConfig");
+        };
+        kt_assert_eq!(cfg.single_pdev_only, a.single_pdev_only);
+        kt_assert_eq!(cfg.max_radios as u32, a.max_radios);
+        kt_assert_eq!(cfg.num_rxdma_per_pdev, 1);
+        kt_assert_eq!(cfg.svc_to_ce_map.len(), a.svc_to_ce_map.len());
+    }
+    let ipq = CoreConfig::for_hw(&HwRev::Ipq8074.params().unwrap()).unwrap();
+    kt_assert_eq!((ipq.num_vdevs, ipq.max_radios), (17, 3));
+    let w = CoreConfig::for_hw(&HwRev::Wcn6750Hw10.params().unwrap()).unwrap();
+    kt_assert_eq!((w.num_vdevs, w.max_radios), (3, 1));
+    // Spectral (core.c).
+    kt_assert_eq!(HwRev::Ipq8074.spectral().max_fft_bins, 512);
+    kt_assert_eq!(HwRev::Ipq6018Hw10.spectral().fft_sz, 4);
+    kt_assert_eq!(HwRev::Ipq5018Hw10.spectral().fft_hdr_len, 24);
+    kt_assert_eq!(HwRev::Wcn6750Hw10.spectral().max_fft_bins, 0);
+    // RX descriptor per hw_ops.
+    kt_assert_eq!(
+        RxDescriptor::msdu_len_offset(HwRev::Ipq6018Hw10),
+        RxDescriptor::msdu_len_offset(HwRev::Qca6390Hw20)
+    );
+    kt_assert_eq!(
+        RxDescriptor::msdu_len_offset(HwRev::Wcn6750Hw10),
+        RxDescriptor::msdu_len_offset(HwRev::Qcn9074Hw10)
+    );
+    // DP: WCN6750 is the single-pdev shape; the IPQ parts are not yet.
+    let Some(dp) = DpHwParams::for_rev(HwRev::Wcn6750Hw10) else {
+        return TestResult::Fail("WCN6750 DP params");
+    };
+    kt_assert_eq!(
+        (dp.num_tx_rings(), dp.tx_ring_size, dp.tcl_ring_retry),
+        (3, 2048, false)
+    );
+    kt_assert_eq!(dp.hal_params.tcl2wbm_rbm_map[1].wbm_ring_num, 4);
+    kt_assert!(
+        DpHwParams::for_rev(HwRev::Ipq8074).is_none(),
+        "IPQ8074 multi-pdev DP is not admitted"
+    );
+    // IPQ5018: CE ring registers move into the remapped CE window.
+    let h5 = match Hal::new(&HwRev::Ipq5018Hw10.params().unwrap()) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("Hal::new IPQ5018"),
+    };
+    let ce0 = IPQ5018_REGS.hal_seq_wcss_umac_ce0_src_reg;
+    kt_assert!(
+        h5.config[HalRingType::CeSrc.idx()].reg_start[0] >= AHB_CE_WINDOW_OFFSET + ce0,
+        "CE SRC R0 routed to mem_ce"
+    );
+    kt_assert!(
+        h5.config[HalRingType::ReoDst.idx()].reg_start[0] < AHB_CE_WINDOW_OFFSET,
+        "non-CE rings stay in mem"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_ahb_hwrev_admission);

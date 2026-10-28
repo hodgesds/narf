@@ -55,6 +55,14 @@ resolve to `HwRev` exactly as Linux `ath11k_pci_probe`: WCN6855
 HW2.0 / HW2.1, QCA2066 HW2.1, QCA6698AQ HW2.1. Unsupported steppings
 fail probe. `HwRev::fw_dir()` = Linux `hw_params.fw.dir`.
 
+The AHB / hybrid-bus SoC parts take their `HwRev` from the DT match
+(`ath11k_ahb_probe`: `of_device_get_match_data`): `HwRev::{Ipq8074,
+Ipq6018Hw10, Ipq5018Hw10, Wcn6750Hw10}` = `AhbChip::hw_rev()`,
+`HwRev::ahb_chip()` the reverse. `HwRev::params()` for them is
+`AhbHwParams::hw_params(rev)` (no MSI users on IPQ = `MSI_CONFIG_NONE`;
+`HwParams::ce_offset` = `ATH11K_CE_OFFSET`, `AHB_CE_WINDOW_OFFSET` on
+IPQ5018, which `Hal::new` passes to `hal::create_config_ce`).
+
 ### 2.3 MHI host (`mhi.rs`, `mhi_host.rs`)
 
 `mhi.rs` holds the wire definitions (`drivers/bus/mhi/common.h`,
@@ -1836,7 +1844,12 @@ SCM/PAS, MDT loader, SMEM, SMP2P, GCC resets, Q6 WCSS and PAS remoteprocs.
 pub enum AhbChip { Ipq8074, Ipq6018Hw10, Ipq5018Hw10, Wcn6750Hw10 }
 pub const AHB_OF_MATCH: [(&str, AhbChip); 4];          // ath11k_ahb_of_match
 impl AhbChip { fn from_compatible(&[String]) -> Option<Self>; const fn params(self) -> AhbHwParams;
-               const fn wlfw_hw_params(self) -> WlfwHwParams; }
+               const fn wlfw_hw_params(self) -> WlfwHwParams; const fn hw_rev(self) -> HwRev; }
+impl AhbHwParams { const fn ce_offset(&self) -> u32; const fn hw_params(&self, HwRev) -> HwParams; }
+impl HwRev { const fn ahb_chip(self) -> Option<AhbChip>; }   // + Ipq8074/Ipq6018Hw10/Ipq5018Hw10/Wcn6750Hw10
+pub struct HwParams { .., ce_offset: u32 }                  // ATH11K_CE_OFFSET
+pub const MSI_CONFIG_NONE, HW_HAL_PARAMS_IPQ8074, HW_HAL_PARAMS_WCN6750;
+pub fn hal::create_config_ce(&HalRegs, ce_off) -> [SrngConfig; N];
 pub struct AhbHwParams { chip, name, fw_dir, max_radios, bdf_addr, regs, ring_mask,
     qmi_service_ins_id, host_ce_config, target_ce_config, svc_to_ce_map, ce_ie_addr,
     ce_remap, single_pdev_only, rxdma1_enable, htt_peer_map_v2, supports_shadow_regs,
@@ -1862,8 +1875,17 @@ impl AhbRemote { fn resolve(blob, &AhbResources) -> Result<Self, AhbError>; fn l
 `hw.c`; IPQ5018 CE offsets relative to the remapped CE window) and
 `RING_MASK_IPQ8074` / `RING_MASK_WCN6750`. `power_up`/`power_down` are
 `Q6Wcss::{load,start,stop}` (IPQ) or `PasRproc::{start,stop}` (WCN6750)
-driven with the resources `AhbRemote` resolves. The AHB profiles are not
-admitted into `HwRev`/the PCI runtime; see §8.
+driven with the resources `AhbRemote` resolves.
+
+`HwRev`-keyed admission: `CoreConfig::for_hw` covers all four AHB parts
+(`num_rxdma_per_pdev = 1`; IPQ `single_pdev_only = false`, `num_vdevs =
+16 + 1`; WCN6750 single-pdev, three vdevs), `wlfw_hw_params(HwRev)`
+returns `AhbChip::wlfw_hw_params`, `RxDescriptor` decodes
+`hal_rx_desc_ipq8074` for IPQ8074/IPQ6018 and `hal_rx_desc_qcn9074` for
+IPQ5018/WCN6750, and `DpHwParams::for_rev` admits WCN6750 (the
+single-pdev shape: one RXDMA, `ath11k_hw_hal_params_wcn6750`, 2048-entry
+TCL rings, no TCL retry). The IPQ DP (multi-pdev, rxdma1, peer-map v2)
+is `None`; see §8.
 
 ## 4. Invariants
 

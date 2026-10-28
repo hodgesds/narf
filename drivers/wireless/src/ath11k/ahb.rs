@@ -37,8 +37,9 @@ use super::htc::{
     TARGET_SERVICE_TO_CE_MAP_WLAN_QCA6390,
 };
 use super::hw::{
-    HalRegs, MsiConfig, MsiUser, RingMask, ATH11K_EXT_IRQ_GRP_NUM_MAX, IPQ5018_REGS, IPQ8074_REGS,
-    RING_MASK_IPQ8074, RING_MASK_WCN6750, WCN6750_REGS,
+    HalRegs, HwParams, HwRev, MsiConfig, MsiUser, RingMask, ATH11K_EXT_IRQ_GRP_NUM_MAX,
+    IPQ5018_REGS, IPQ8074_REGS, MSI_CONFIG_NONE, RING_MASK_IPQ8074, RING_MASK_WCN6750,
+    WCN6750_REGS,
 };
 use super::qmi_wlfw::{
     CeTgtPipeCfg, WlfwHwParams, ATH11K_QMI_WLFW_SERVICE_INS_ID_V01_IPQ8074,
@@ -167,6 +168,38 @@ pub struct AhbHwParams {
 impl AhbHwParams {
     pub fn ce_count(&self) -> usize {
         self.host_ce_config.len()
+    }
+
+    /// `ATH11K_CE_OFFSET(ab)`: [`AHB_CE_WINDOW_OFFSET`] where the CE
+    /// space is remapped (IPQ5018), else 0.
+    pub const fn ce_offset(&self) -> u32 {
+        if self.ce_remap.is_some() {
+            AHB_CE_WINDOW_OFFSET
+        } else {
+            0
+        }
+    }
+
+    /// The same entry as the `HwRev`-keyed [`HwParams`] the CE / HAL /
+    /// DP layers take (`rev` = [`AhbChip::hw_rev`]). IPQ parts have no
+    /// MSI ([`MSI_CONFIG_NONE`]); WCN6750 uses its hybrid-bus layout.
+    pub const fn hw_params(&self, rev: HwRev) -> HwParams {
+        HwParams {
+            hw_rev: rev,
+            fw_dir: self.fw_dir,
+            msi: match self.msi {
+                Some(m) => m,
+                None => &MSI_CONFIG_NONE,
+            },
+            fix_l1ss: None,
+            static_window_map: self.static_window_map,
+            regs: Some(self.regs),
+            host_ce_config: self.host_ce_config,
+            supports_shadow_regs: self.supports_shadow_regs,
+            credit_flow: self.credit_flow,
+            ring_mask: self.ring_mask,
+            ce_offset: self.ce_offset(),
+        }
     }
 }
 
@@ -350,6 +383,17 @@ pub const MSI_CONFIG_WCN6750: MsiConfig = MsiConfig {
 };
 
 impl AhbChip {
+    /// The `enum ath11k_hw_rev` value (`ath11k_ahb_probe`:
+    /// `ab->hw_rev = (enum ath11k_hw_rev)of_device_get_match_data()`).
+    pub const fn hw_rev(self) -> HwRev {
+        match self {
+            AhbChip::Ipq8074 => HwRev::Ipq8074,
+            AhbChip::Ipq6018Hw10 => HwRev::Ipq6018Hw10,
+            AhbChip::Ipq5018Hw10 => HwRev::Ipq5018Hw10,
+            AhbChip::Wcn6750Hw10 => HwRev::Wcn6750Hw10,
+        }
+    }
+
     /// `ath11k_ahb_of_match` lookup over a node's compatible list.
     pub fn from_compatible(compat: &[String]) -> Option<Self> {
         AHB_OF_MATCH
