@@ -271,9 +271,29 @@ fn fx_zone99_fan9() -> alloc::vec::Vec<u8> {
     fan.push(0x00);
     fan.extend_from_slice(&fx_name_byte(b"FANL", 0xFF));
     fan.extend_from_slice(&fx_name_zero(b"FONS"));
-    // Method(_FIF, 0) { Return(1) } — evaluates, so probe sees
-    // fine-grained control; AcpiFan's ladder is then 10 steps.
-    fan.extend_from_slice(&fx_method(b"_FIF", 0, &[0xA4, 0x01]));
+    // Method(_FIF, 0) { Return(Package { 0, 1, 0, 0 }) } — the
+    // spec _FIF shape (ACPI 6.5 §11.3.1.1): Revision 0,
+    // FineGrainControl 1 (so _FSL takes a Level in 0..=100, a
+    // percentage of maximum speed, §11.3.1.3), StepSize 0 (no
+    // recommended step declared), LowSpeedNotificationSupport 0.
+    // (The previous body returned the Integer 1 — not a well-formed
+    // _FIF result; only the retired probe's "any _FIF that evaluates
+    // counts as fine-grained, on an invented 10-step ladder" fiction
+    // ever read a ladder into it.)
+    fan.extend_from_slice(&fx_method(
+        b"_FIF",
+        0,
+        &[
+            0xA4, // ReturnOp
+            0x12, // PackageOp
+            0x06, // PkgLength (counts the PkgLength byte itself)
+            0x04, // NumElements
+            0x00, // Revision = 0
+            0x01, // FineGrainControl = 1
+            0x00, // StepSize = 0
+            0x00, // LowSpeedNotificationSupport = 0
+        ],
+    ));
     // Method(_ON, 0) { Store(1, \FAN9.FONS) }
     let mut on = Vec::new();
     on.push(0x70);
@@ -412,8 +432,10 @@ fn smoke_thermal_loop_end_to_end() -> TestResult {
     // retired duplicate's _CRT − 10 C warn (90.05 C) it would stay
     // Normal and the fan would never move — this step pins the
     // unification (#910), not just the loop.
-    // StepPolicy Warm → level 128; AcpiFan maps that to _ON plus
-    // _FSL step ceil(128 * 10 / 255) = 6 on its 10-step ladder.
+    // StepPolicy Warm → level 128; the fixture fan is fine-grained
+    // (§11.3.1.1), so AcpiFan maps that to _ON plus _FSL with the
+    // percentage ceil(128 * 100 / 255) = 51 (§11.3.1.3). The _FIF
+    // declares no StepSize, so no quantisation applies.
     if narf_aml::eval::evaluate_method("\\TZ99.SETT", &[narf_aml::Value::Integer(3432)]).is_err() {
         return TestResult::Fail("fixture SETT method failed");
     }
@@ -425,12 +447,12 @@ fn smoke_thermal_loop_end_to_end() -> TestResult {
     if fx_name_int("\\FAN9.FONS") != Some(1) {
         return TestResult::Fail("Warm crossing did not turn the fan on (_ON)");
     }
-    if fx_name_int("\\FAN9.FANL") != Some(6) {
-        return TestResult::Fail("Warm crossing drove wrong _FSL step (want 6 for level 128)");
+    if fx_name_int("\\FAN9.FANL") != Some(51) {
+        return TestResult::Fail("Warm crossing drove wrong _FSL level (want 51% for level 128)");
     }
 
     // (5) Critical crossing: 3832 deciK = 110.05 C ≥ _CRT.
-    // StepPolicy Critical → level 255 → _FSL step 10 (ladder max).
+    // StepPolicy Critical → level 255 → _FSL 100 (percentage max).
     if narf_aml::eval::evaluate_method("\\TZ99.SETT", &[narf_aml::Value::Integer(3832)]).is_err() {
         return TestResult::Fail("fixture SETT method failed");
     }
@@ -439,8 +461,10 @@ fn smoke_thermal_loop_end_to_end() -> TestResult {
         Some((110_050, ThermalState::Critical)) => {}
         _ => return TestResult::Fail("110.05 C did not classify Critical"),
     }
-    if fx_name_int("\\FAN9.FANL") != Some(10) {
-        return TestResult::Fail("Critical crossing drove wrong _FSL step (want 10 for level 255)");
+    if fx_name_int("\\FAN9.FANL") != Some(100) {
+        return TestResult::Fail(
+            "Critical crossing drove wrong _FSL level (want 100% for level 255)",
+        );
     }
 
     // (6) Back to Normal: 3132 deciK = 40.05 C. Level 0 → _OFF.
