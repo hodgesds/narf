@@ -1273,7 +1273,7 @@ pub mod tests {
         }
         let mut got2 = [0u8; KERNEL_TERMIOS2_LEN];
         ctx.load(0, &mut got2);
-        if &got2[..KERNEL_TERMIOS_LEN] != &default_termios_image()[..] {
+        if got2[..KERNEL_TERMIOS_LEN] != default_termios_image()[..] {
             return TestResult::Fail("TCGETS2 prefix must be the termios image");
         }
         if ctx.load_u32(36) != 115200 || ctx.load_u32(40) != 115200 {

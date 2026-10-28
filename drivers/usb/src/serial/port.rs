@@ -1950,7 +1950,16 @@ pub mod tests {
         // embedded in each family's full configure plan — two
         // independent derivations of the same wire bytes, compared.
         // FTDI: MODEM_CTRL is transfer index 2 of configure_plan.
-        let full = match configure_plan(ChipFamily::Ftdi, 0x6001, 0, &LineSettings::default()) {
+        // The configure settings must carry the same (dtr, rts)
+        // the modem plan is asked for below — the default asserts
+        // both lines, which encodes a different MODEM_CTRL word
+        // (0x0303, not 0x0301) and is not the same derivation.
+        let s = LineSettings {
+            dtr: true,
+            rts: false,
+            ..LineSettings::default()
+        };
+        let full = match configure_plan(ChipFamily::Ftdi, 0x6001, 0, &s) {
             Ok(p) => p,
             Err(_) => return TestResult::Fail("FTDI configure plan should build"),
         };
