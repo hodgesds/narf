@@ -284,6 +284,8 @@ tables.
   (or after the remote closed it) is `-ENOTCONN`, an oversize frame
   `-EMSGSIZE`; `wait(ms)` = `GlinkBus::wait_irq` (the edge SPI) then
   `Glink::process_rx`; `take_closed` reports a remote CLOSE once.
+  `GicGlinkBus { line: irq::GicSpi, clock }` is the production
+  `GlinkBus` (the `glink-edge` SPI).
 - `wlfw` — `Wlfw<P, F: FirmwareLoader, A: DmaAllocator>`, whose
   `A::Mem: CoherentMem` supplies DMA address, length, write and immutable
   CPU bytes (the latter for pre-reset device-coredump collection), the

@@ -17,6 +17,7 @@ narf-arch         = { path = "../../../arch" }
 narf-memory       = { path = "../../../memory" }
 narf-io           = { path = "../../../io" }
 narf-time         = { path = "../../../time" }
+narf-interrupts   = { path = "../../../interrupts" }
 narf-firmware-fdt = { path = "../../../firmware/fdt" }
 narf-kernel-test  = { path = "../../../verification/kernel-test" }
 

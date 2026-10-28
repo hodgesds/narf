@@ -124,6 +124,137 @@ pub fn gicd_typer() -> u32 {
 // Distributor register offsets (SDM of GICv3: IHI0069H).
 const GICD_CTLR: usize = 0x0000;
 
+// SPI configuration (GICv3 IHI0069H §12.9).
+const GICD_IGROUPR: usize = 0x0080;
+const GICD_ISENABLER: usize = 0x0100;
+const GICD_ICENABLER: usize = 0x0180;
+const GICD_ISPENDR: usize = 0x0200;
+const GICD_ICPENDR: usize = 0x0280;
+const GICD_IPRIORITYR: usize = 0x0400;
+const GICD_ICFGR: usize = 0x0C00;
+const GICD_IROUTER: usize = 0x6000;
+/// First SPI INTID; devicetree `<GIC_SPI n ..>` is INTID `32 + n`.
+pub const SPI_BASE: u32 = 32;
+/// Highest SPI INTID the architecture allows (1020..1023 are special).
+pub const SPI_MAX: u32 = 1019;
+/// Priority given to every configured SPI (matches the timer PPI and
+/// SGIs; below the `ICC_PMR_EL1` mask of 0xFF).
+const SPI_PRIORITY: u8 = 0xA0;
+
+/// Trigger mode of a shared peripheral interrupt (`GICD_ICFGR`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SpiTrigger {
+    /// `IRQ_TYPE_LEVEL_HIGH`.
+    Level,
+    /// `IRQ_TYPE_EDGE_RISING`.
+    Edge,
+}
+
+/// Why an SPI could not be configured.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SpiError {
+    /// Not an SPI INTID, or above `GICD_TYPER.ITLinesNumber`.
+    OutOfRange(u32),
+}
+
+/// Number of INTIDs the distributor implements: `32 * (ITLinesNumber + 1)`,
+/// capped at 1020.
+pub fn spi_limit() -> u32 {
+    ((gicd_typer() & 0x1f) + 1)
+        .saturating_mul(32)
+        .min(SPI_MAX + 1)
+}
+
+fn spi_check(intid: u32) -> Result<(), SpiError> {
+    if !(SPI_BASE..=SPI_MAX).contains(&intid) || intid >= spi_limit() {
+        return Err(SpiError::OutOfRange(intid));
+    }
+    Ok(())
+}
+
+/// Dispatch-table slot the aarch64 trap uses for `intid` (its low byte;
+/// `frame/` passes `intid & 0xFF` to `on_irq`).
+pub const fn spi_vector(intid: u32) -> u8 {
+    (intid & 0xff) as u8
+}
+
+/// Configure SPI `intid` for Group 1 NS delivery to the calling CPU:
+/// disable, clear pending, set trigger and priority, route
+/// (`GICD_IROUTER` = this CPU's affinity, ARE_NS is on), then enable.
+pub fn configure_spi(intid: u32, trigger: SpiTrigger) -> Result<(), SpiError> {
+    spi_check(intid)?;
+    let base = gicd_base();
+    let word = (intid / 32) as usize * 4;
+    let bit = 1u32 << (intid % 32);
+    let aff = narf_arch::aarch64::cpu::mpidr_aff() as u64;
+    // IROUTER: Aff0 [7:0], Aff1 [15:8], Aff2 [23:16], Aff3 [39:32]; IRM = 0.
+    let route = (aff & 0x00ff_ffff) | ((aff >> 24) << 32);
+    // SAFETY: distributor window mapped by `init_bsp` / `remap_mmio`;
+    // every offset is inside the 64 KiB frame for an INTID < 1020.
+    unsafe {
+        write_u32((base + GICD_ICENABLER + word) as *mut u32, bit);
+        write_u32((base + GICD_ICPENDR + word) as *mut u32, bit);
+        let grp = (base + GICD_IGROUPR + word) as *mut u32;
+        write_u32(grp, read_u32(grp) | bit);
+        core::ptr::write_volatile(
+            (base + GICD_IPRIORITYR + intid as usize) as *mut u8,
+            SPI_PRIORITY,
+        );
+        let cfg = (base + GICD_ICFGR + (intid / 16) as usize * 4) as *mut u32;
+        let shift = (intid % 16) * 2 + 1;
+        let v = match trigger {
+            SpiTrigger::Edge => read_u32(cfg) | (1 << shift),
+            SpiTrigger::Level => read_u32(cfg) & !(1 << shift),
+        };
+        write_u32(cfg, v);
+        let r = (base + GICD_IROUTER + intid as usize * 8) as *mut u32;
+        write_u32(r, route as u32);
+        write_u32(r.add(1), (route >> 32) as u32);
+        write_u32((base + GICD_ISENABLER + word) as *mut u32, bit);
+    }
+    Ok(())
+}
+
+/// `disable_irq` at the distributor (`GICD_ICENABLER`).
+pub fn mask_spi(intid: u32) -> Result<(), SpiError> {
+    spi_check(intid)?;
+    // SAFETY: as in `configure_spi`.
+    unsafe {
+        write_u32(
+            (gicd_base() + GICD_ICENABLER + (intid / 32) as usize * 4) as *mut u32,
+            1 << (intid % 32),
+        );
+    }
+    Ok(())
+}
+
+/// `enable_irq` at the distributor (`GICD_ISENABLER`).
+pub fn unmask_spi(intid: u32) -> Result<(), SpiError> {
+    spi_check(intid)?;
+    // SAFETY: as in `configure_spi`.
+    unsafe {
+        write_u32(
+            (gicd_base() + GICD_ISENABLER + (intid / 32) as usize * 4) as *mut u32,
+            1 << (intid % 32),
+        );
+    }
+    Ok(())
+}
+
+/// Software-pend SPI `intid` (`GICD_ISPENDR`): self-test and
+/// diagnostics; the interrupt is then delivered like a device one.
+pub fn pend_spi(intid: u32) -> Result<(), SpiError> {
+    spi_check(intid)?;
+    // SAFETY: as in `configure_spi`.
+    unsafe {
+        write_u32(
+            (gicd_base() + GICD_ISPENDR + (intid / 32) as usize * 4) as *mut u32,
+            1 << (intid % 32),
+        );
+    }
+    Ok(())
+}
+
 // Redistributor register offsets.
 const GICR_WAKER: usize = 0x0014;
 // SGI_base is at GICR_BASE + 0x1_0000.

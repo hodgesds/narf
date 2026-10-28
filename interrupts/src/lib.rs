@@ -22,6 +22,7 @@ pub mod its_fw;
 pub mod vector;
 pub mod wait;
 
+mod gic_spi_tests;
 #[path = "its_tests.rs"]
 mod its_tests;
 mod tests;

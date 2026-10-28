@@ -465,7 +465,7 @@ impl Kick for &CountKick {
 }
 
 /// Play the remote: allocate and fill its outbound (our inbound) item.
-fn remote_item(
+pub(crate) fn remote_item(
     smem: &Smem<&FakeRegs>,
     lock: &impl HwSpinlock,
     cfg: Smp2pConfig,

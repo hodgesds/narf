@@ -2059,6 +2059,7 @@ version = "0.0.0"
 dependencies = [
  "narf-arch",
  "narf-firmware-fdt",
+ "narf-interrupts",
  "narf-io",
  "narf-kernel-test",
  "narf-lib",

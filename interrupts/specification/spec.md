@@ -95,11 +95,36 @@ pub mod its_core; // GITS_BASER / CBASER / PROPBASER / PENDBASER negotiation,
                   // ITT sizing, command encodings, queue wrap + stall
 pub mod its_fw;   // FDT / MADT / IORT parsing, RID → DeviceID
 
+// GICv3 SPIs (aarch64): devicetree platform devices (Qualcomm SoCs).
+#[cfg(target_arch = "aarch64")]
+pub fn gic::configure_spi(intid: u32, trigger: gic::SpiTrigger) -> Result<(), gic::SpiError>;
+#[cfg(target_arch = "aarch64")]
+pub fn gic::{mask_spi, unmask_spi, pend_spi}(intid: u32) -> Result<(), gic::SpiError>;
+#[cfg(target_arch = "aarch64")]
+pub fn gic::spi_limit() -> u32;              // 32 * (ITLinesNumber + 1), <= 1020
+#[cfg(target_arch = "aarch64")]
+pub const fn gic::spi_vector(intid: u32) -> u8; // intid & 0xFF (the trap's dispatch slot)
+pub enum gic::SpiTrigger { Level, Edge }
+pub enum gic::SpiError { OutOfRange(u32) }
+
+pub fn vector::reserve(vector: u8) -> Result<(), VectorError>; // claim one fixed slot
 pub fn vector::alloc() -> Result<u8, VectorError>;
 pub fn vector::alloc_block(n: u8) -> Result<u8, VectorError>;
 pub fn vector::alloc_block_aligned(n: u8, align: u8) -> Result<u8, VectorError>;
 pub fn vector::free(vector: u8) -> Result<(), VectorError>;
 ```
+
+SPI contract (aarch64). `configure_spi` disables the INTID, clears its
+pending state, puts it in Group 1 NS at priority 0xA0, programs
+`GICD_ICFGR` (edge/level), routes it with `GICD_IROUTER` to the calling
+CPU's affinity (IRM = 0) and enables it; INTIDs outside
+`32..spi_limit()` are refused. The trap dispatches SPIs on
+`intid & 0xFF`, so a driver binding a fixed SPI first claims that slot
+with `vector::reserve` (refused with `Exhausted` when an MSI/LPI or
+another SPI owns it, `OutOfRange` above `ALLOC_MAX`). `pend_spi`
+(`GICD_ISPENDR`) is a self-test aid. The distributor base is still the
+QEMU virt constant; firmware-described GIC bases (SC7280 silicon) are
+an open question (§13).
 
 `alloc_block_aligned` returns a contiguous run whose base is a multiple of
 `align` (a power of two). Multi-message MSI requires it: the function writes
@@ -383,5 +408,14 @@ mints them at BIND time (drivers/spec §7.2 step 6) along with
 the rest of the cap bundle.
 
 ## 13. Open questions
+
+- **GIC base discovery (aarch64).** `gic.rs` maps the QEMU virt
+  distributor/redistributor constants; Qualcomm IPQ8074/IPQ6018/IPQ5018
+  (`0x0b000000`) and SC7280 (`0x17a00000`) need the DT `arm,gic-v3` /
+  `qcom,msm-qgic2` reg windows (IPQ8074/IPQ6018/IPQ5018 are GICv2: no
+  `GICD_IROUTER`, `ITARGETSR` routing) before `configure_spi` reaches
+  real silicon. GICv2 also has no `ICC_*` system registers: the IAR/EOI
+  pair moves to the `GICC` MMIO frame, which the aarch64 trap entry
+  (`frame/src/aarch64/trap.rs`, TCB) reads today through `ICC_IAR1_EL1`.
 
 (none — all v0.1 questions resolved in §12)

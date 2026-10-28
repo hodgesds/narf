@@ -25,8 +25,9 @@
 **Does NOT own:**
 - The SMC trap itself (`arch/` `aarch64::smccc`).
 - MMIO mapping (`memory/` `ioremap`) or DMA allocation (`io/`).
-- IRQ delivery: callers route GIC/SMP2P interrupts into `Q6v5::signal`
-  and `Smp2p::handle_interrupt`.
+- The GIC distributor itself (`interrupts/` `aarch64::gic`); `irq` binds
+  DT SPIs through it and routes GIC/SMP2P/IPCC interrupts into
+  `Q6v5::signal` and `Smp2p::handle_interrupt`.
 - QRTR framing over GLINK (ath11k `qrtr_glink.rs`), RPMh/AOSS-QMP power votes, SMMU/IOMMU
   programming, sysmon/SSR notifications (not implemented; §8).
 - A general clock/reset framework.
@@ -149,6 +150,27 @@ to a remote `RX_INTENT_REQ`). Remote-initiated channels follow the rpmsg
 probe order: `OPEN_ACK` + `OPEN` once claimed, base intents after the
 remote's `OPEN_ACK`. Linux's deferred commands (`VERSION`, `OPEN`,
 `CLOSE`, …) are processed inline in FIFO order.
+
+### 3.9 Interrupt delivery (`irq`)
+```rust
+pub trait IrqLine { fn wait(&self, ms) -> impl Future<Output = bool> + Send; }
+pub struct GicSpi;   impl GicSpi { bind(intid, edge) -> Result<Self, IrqBindError>, intid, vector,
+                                   install(name, cookie, SyncHandler), release(name, cookie) }  // impl IrqLine
+pub enum IrqBindError { OutOfRange(u32), SlotTaken(u8), NotSupported }
+pub const fn dt_flags_edge(flags) -> bool;
+pub enum Q6Route { Gic { intid, event }, Smp2p { edge, entry, bit, event } }
+pub struct Q6Irqs { routes }  impl Q6Irqs { from_platform(&Q6Platform), gic_lines, attach_smp2p(edge, &mut Smp2p),
+                                route_smp2p(edge, handles, fired, &Q6v5), bind_gic(&'static Q6v5) }
+pub fn q6v5_cookie(&'static Q6v5, Q6Event) -> u64;  pub fn q6v5_gic_handler(cookie) -> IrqStatus;
+pub fn smp2p_dispatch(smp2p, smem, edge, handles, routes, q6) -> usize;   // one qcom_smp2p_intr pass
+pub async fn service_smp2p(smp2p, smem, line, edge, handles, routes, q6, poll_ms, keep_going);
+pub fn ipcc_pending(regs, max) -> Vec<(client, signal)>;  pub fn ipcc_set_enabled(regs, client, signal, on);
+```
+GIC lines run `q6v5_gic_handler` in hard-IRQ context (atomics only). SMP2P
+is threaded: the edge's interrupt only wakes the task running
+`service_smp2p`, which calls `Smp2p::handle_interrupt` (SMEM reads,
+allocation) and signals each routed rising edge. On x86_64 `GicSpi::bind`
+is `NotSupported`.
 
 `pump` is called on every wait iteration; production passes a no-op (IRQ
 handlers call `Q6v5::signal`), fixtures use it to play the remote.

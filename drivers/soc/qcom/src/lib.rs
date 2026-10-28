@@ -40,6 +40,7 @@ pub mod glink;
 pub mod hwlock;
 pub mod io;
 pub mod ipc;
+pub mod irq;
 pub mod mdt;
 pub mod pas;
 pub mod platform;
@@ -54,5 +55,7 @@ pub mod wcss;
 pub mod fixtures;
 #[cfg(any(test, feature = "kernel-test"))]
 mod glink_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+mod irq_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;

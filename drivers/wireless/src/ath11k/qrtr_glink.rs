@@ -50,6 +50,28 @@ pub trait GlinkBus {
     fn log(&self, _args: fmt::Arguments<'_>) {}
 }
 
+/// The edge interrupt bound from the `glink-edge` node's
+/// `interrupts = <GIC_SPI n IRQ_TYPE_EDGE_RISING>`
+/// (`qcom_glink_smem_intr`), with a millisecond clock.
+#[allow(missing_debug_implementations)]
+pub struct GicGlinkBus<C: Fn() -> u64 + Send + Sync> {
+    pub line: narf_drivers_qcom_soc::irq::GicSpi,
+    pub clock: C,
+}
+
+impl<C: Fn() -> u64 + Send + Sync> GlinkBus for GicGlinkBus<C> {
+    fn wait_irq(&self, ms: u32) -> impl Future<Output = ()> + Send {
+        use narf_drivers_qcom_soc::irq::IrqLine;
+        let w = self.line.wait(ms);
+        async move {
+            let _ = w.await;
+        }
+    }
+    fn now_ms(&self) -> u64 {
+        (self.clock)()
+    }
+}
+
 /// `struct qrtr_smd_dev`.
 #[allow(missing_debug_implementations)]
 pub struct GlinkQrtr<P: GlinkPipe, B: GlinkBus> {
