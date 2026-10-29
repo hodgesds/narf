@@ -2353,6 +2353,8 @@ dependencies = [
  "narf-console",
  "narf-driver-macros",
  "narf-drivers",
+ "narf-drivers-usb",
+ "narf-drivers-usbpd",
  "narf-init",
  "narf-interrupts",
  "narf-io",
@@ -2364,6 +2366,7 @@ dependencies = [
  "narf-power",
  "narf-scheduler",
  "narf-time",
+ "narf-usbpd",
 ]
 
 [[package]]
