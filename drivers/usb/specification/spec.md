@@ -623,6 +623,22 @@ the USB download itself remains a target-silicon gate.
   signatures + bounds and yields a borrow per datagram.
   `NCM_NTB_PARAMETERS_STRUCTURE` decoder for the device-reported
   size limits.
+- **CDC-ECM** (`cdc_ecm`): Ethernet Control Model 1.2 live driver
+  for USB-Ethernet. One raw Ethernet frame per bulk transfer, no
+  framing — no NTB wrap, no sequence, no CRC, no
+  `GET_NTB_PARAMETERS`, no `GET_NET_ADDRESS` (NCM-only). Bind:
+  SET_CONFIGURATION, Data alt-setting activation, bulk-pair (+
+  notification endpoint when present) configuration, station
+  address from the iMACAddress string descriptor only,
+  best-effort `SET_ETHERNET_PACKET_FILTER`, netdev publication
+  as `usb-ecm{N}` with per-device TX routing, RX pump (one
+  transfer = one frame) + notification pump
+  (`NETWORK_CONNECTION` link state, `CONNECTION_SPEED_CHANGE`
+  speeds). Detach tombstones the record and unregisters the
+  iface, so TX cookies never retarget another device. Shares
+  the NCM module's Ethernet Networking descriptor parser, MAC
+  string parser, and packet-filter encode — the CDC-common
+  layer — and nothing NTB-shaped.
 
 ### Out of scope (deferred)
 - UAC3 (protocol byte 0x30; descriptor layouts differ again).
