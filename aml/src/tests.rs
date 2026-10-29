@@ -2605,3 +2605,218 @@ fn smoke_aml_evaluate_object_name_and_method_shapes() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("aml", smoke_aml_evaluate_object_name_and_method_shapes);
+
+// ── EC transaction-gate proof (#913) ─────────────────────────────
+//
+// Fake EC command-state machine, spec-shaped (ACPI 6.5 §12.3):
+// ONE command register + ONE data register, one in-flight command.
+// Command bytes RD_EC 0x80, WR_EC 0x81, QR_EC 0x84. A command byte
+// arriving mid-sequence aborts the in-flight sequence and starts a
+// new one — the EC cannot hold two commands, so bytes from stream B
+// are necessarily interpreted in stream A's partial-command context.
+// That single-state-machine property is the spec-derived fact; the
+// exact garbage a real firmware returns varies, but no
+// single-state-machine EC can produce two correct results from an
+// interleaved stream. The sequential control below proves the fake
+// is not vacuous: well-formed traffic passes through it correctly.
+const FAKE_RD_EC: u8 = 0x80;
+const FAKE_WR_EC: u8 = 0x81;
+const FAKE_QR_EC: u8 = 0x84;
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum FakeEcState {
+    Idle,
+    AwaitAddrRead,
+    AwaitAddrWrite,
+    AwaitDataWrite(u8),
+    DataReady(u8),
+    QueryReady(u8),
+}
+
+struct FakeEc {
+    mem: [u8; 256],
+    next_query: u8,
+    state: FakeEcState,
+    violations: u32,
+}
+
+impl FakeEc {
+    fn new() -> Self {
+        let mut mem = [0u8; 256];
+        mem[0x10] = 0xAB;
+        FakeEc {
+            mem,
+            next_query: 0x42,
+            state: FakeEcState::Idle,
+            violations: 0,
+        }
+    }
+
+    /// Host write to the command port.
+    fn cmd(&mut self, b: u8) {
+        if self.state != FakeEcState::Idle {
+            // Mid-sequence command byte: in-flight sequence aborted.
+            self.violations += 1;
+        }
+        self.state = match b {
+            FAKE_RD_EC => FakeEcState::AwaitAddrRead,
+            FAKE_WR_EC => FakeEcState::AwaitAddrWrite,
+            FAKE_QR_EC => FakeEcState::QueryReady(self.next_query),
+            _ => FakeEcState::Idle,
+        };
+    }
+
+    /// Host write to the data port.
+    fn data_write(&mut self, b: u8) {
+        match self.state {
+            FakeEcState::AwaitAddrRead => {
+                self.state = FakeEcState::DataReady(self.mem[b as usize]);
+            }
+            FakeEcState::AwaitAddrWrite => {
+                self.state = FakeEcState::AwaitDataWrite(b);
+            }
+            FakeEcState::AwaitDataWrite(addr) => {
+                self.mem[addr as usize] = b;
+                self.state = FakeEcState::Idle;
+            }
+            _ => {
+                self.violations += 1;
+                self.state = FakeEcState::Idle;
+            }
+        }
+    }
+
+    /// Host read from the data port.
+    fn data_read(&mut self) -> u8 {
+        match self.state {
+            FakeEcState::DataReady(v) => {
+                self.state = FakeEcState::Idle;
+                v
+            }
+            FakeEcState::QueryReady(idx) => {
+                self.state = FakeEcState::Idle;
+                idx
+            }
+            _ => {
+                self.violations += 1;
+                0xFF
+            }
+        }
+    }
+}
+
+/// Control: sequential transactions through the fake are correct.
+/// Guards against a vacuous fake that corrupts everything.
+fn smoke_ec_sequential_transactions_correct() -> TestResult {
+    let mut ec = FakeEc::new();
+    // Platform-style query: cmd 0x84 → data read.
+    ec.cmd(FAKE_QR_EC);
+    if ec.data_read() != 0x42 {
+        return TestResult::Fail("sequential query must return 0x42");
+    }
+    // AML-style field read: cmd 0x80 → addr → data read.
+    ec.cmd(FAKE_RD_EC);
+    ec.data_write(0x10);
+    if ec.data_read() != 0xAB {
+        return TestResult::Fail("sequential read must return mem[0x10] = 0xAB");
+    }
+    if ec.mem[0x10] != 0xAB || ec.violations != 0 {
+        return TestResult::Fail("sequential traffic must not corrupt memory or violate protocol");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_ec_sequential_transactions_correct);
+
+/// PROOF, live production pair: the platform SCI drain's query
+/// (0x84) interleaved with an AML field read (0x80) at the command
+/// boundary. The query's data read lands on the read's latched byte:
+/// the drain dispatches a spurious _QAB instead of _Q42, and the
+/// real 0x42 event is lost.
+fn smoke_ec_interleave_query_vs_read_corrupts() -> TestResult {
+    let mut ec = FakeEc::new();
+    ec.cmd(FAKE_QR_EC); // platform drain: query starts
+    ec.cmd(FAKE_RD_EC); // AML field read starts mid-query: abort
+    ec.data_write(0x10); // read's address byte
+    let query_result = ec.data_read(); // drain's data read: gets read's byte
+    let read_result = ec.data_read(); // read's data read: nothing left
+    if query_result == 0x42 {
+        return TestResult::Fail("interleaved query must NOT return the true index 0x42");
+    }
+    if query_result != 0xAB {
+        return TestResult::Fail("interleaved query must cross-talk the read's byte 0xAB");
+    }
+    if read_result == 0xAB {
+        return TestResult::Fail("interleaved read must NOT return its byte");
+    }
+    if ec.violations == 0 {
+        return TestResult::Fail("interleave must register a protocol violation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_ec_interleave_query_vs_read_corrupts);
+
+/// PROOF, read vs write: the read's address byte is reinterpreted
+/// as the write's address, so the write clobbers the cell the read
+/// targeted and the read returns garbage.
+fn smoke_ec_interleave_read_vs_write_corrupts() -> TestResult {
+    let mut ec = FakeEc::new();
+    ec.cmd(FAKE_RD_EC); // AML field read starts
+    ec.cmd(FAKE_WR_EC); // platform write starts mid-read: abort
+    ec.data_write(0x10); // read's address byte → write's address
+    ec.data_write(0x55); // write's data byte → lands in mem[0x10]
+    let read_result = ec.data_read(); // read's data read: nothing left
+    if ec.mem[0x10] != 0x55 {
+        return TestResult::Fail("interleaved write must clobber mem[0x10] with 0x55");
+    }
+    if read_result == 0xAB {
+        return TestResult::Fail("interleaved read must NOT return mem[0x10]'s old value");
+    }
+    if ec.violations == 0 {
+        return TestResult::Fail("interleave must register a protocol violation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_ec_interleave_read_vs_write_corrupts);
+
+/// Masking-defeating variant: interleave AFTER the address byte, not
+/// just after the command byte. The write still lands correctly —
+/// the harm is to the reader, whose latched byte is discarded.
+/// Defeats "the write succeeding means no harm" readings.
+fn smoke_ec_interleave_after_address_corrupts() -> TestResult {
+    let mut ec = FakeEc::new();
+    ec.cmd(FAKE_RD_EC);
+    ec.data_write(0x10); // read's address latched: DataReady(0xAB)
+    ec.cmd(FAKE_WR_EC); // write starts mid-read: latched byte discarded
+    ec.data_write(0x20);
+    ec.data_write(0x55); // write lands correctly in mem[0x20]
+    let read_result = ec.data_read(); // read's data read: nothing left
+    if ec.mem[0x20] != 0x55 {
+        return TestResult::Fail("write half of the interleave must still land");
+    }
+    if read_result == 0xAB {
+        return TestResult::Fail("read half must NOT return its latched byte");
+    }
+    if ec.violations == 0 {
+        return TestResult::Fail("interleave must register a protocol violation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_ec_interleave_after_address_corrupts);
+
+/// The shared gate itself: held → second acquisition fails;
+/// dropped → acquisition succeeds again.
+fn smoke_ec_shared_gate_try_acquire() -> TestResult {
+    let g = match crate::oregion::try_acquire_ec_txn_gate() {
+        Some(g) => g,
+        None => return TestResult::Fail("gate must be free at test start"),
+    };
+    if crate::oregion::try_acquire_ec_txn_gate().is_some() {
+        return TestResult::Fail("second try_acquire must fail while gate is held");
+    }
+    drop(g);
+    if crate::oregion::try_acquire_ec_txn_gate().is_none() {
+        return TestResult::Fail("gate must be free after guard drop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_ec_shared_gate_try_acquire);
