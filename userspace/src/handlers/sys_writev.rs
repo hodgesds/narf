@@ -53,11 +53,11 @@ pub(crate) fn sys_writev(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    if crate::pipe::is_pipe(endpoint.ops.as_ref()) {
+    if let Some(pipe) = crate::pipe::Endpoint::from_file(endpoint.ops.as_ref()) {
         // SAFETY: each segment is guarded-copied without forming a reference
         // over uninitialized RAM. Ok is returned only after the entire supplied
         // range was initialized; a fault leaves that page unpublished.
-        unsafe { write_pipe_user(ctx, &endpoint, count, |mut offset, mut dst, mut count| {
+        unsafe { write_pipe_user(ctx, &endpoint, &pipe, count, |mut offset, mut dst, mut count| {
             for iov in &iovecs {
                 if offset >= iov.len { offset -= iov.len; continue; }
                 let n = count.min(iov.len - offset);

@@ -5035,10 +5035,11 @@ const LINUX_IOV_MAX: usize = 1024;
 fn read_pipe_user(
     ctx: &mut dyn TrapContext,
     endpoint: &CopyFdEndpoint,
+    pipe: &crate::pipe::Endpoint<'_>,
     count: usize,
     copy: impl FnMut(usize, *const u8, usize) -> Result<(), u64>,
 ) {
-    match crate::pipe::read_to_iter(endpoint.ops.as_ref(), count, true, copy) {
+    match crate::pipe::read_endpoint(pipe, count, true, copy) {
         Ok(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
         Err(errno) if errno == EAGAIN as u64 && !endpoint.nonblocking() => {
             if has_interrupting_signal(current_task_id()) {
@@ -5061,6 +5062,7 @@ fn read_pipe_user(
 unsafe fn write_pipe_user(
     ctx: &mut dyn TrapContext,
     endpoint: &CopyFdEndpoint,
+    pipe: &crate::pipe::Endpoint<'_>,
     count: usize,
     mut copy: impl FnMut(usize, *mut u8, usize) -> Result<(), u64>,
 ) {
@@ -5068,7 +5070,7 @@ unsafe fn write_pipe_user(
     let mut total = 0;
     loop {
         // SAFETY: the syscall adapter guarantees full initialization on Ok.
-        match unsafe { crate::pipe::write_from_raw_iter(endpoint.ops.as_ref(), count - total, |offset, ptr, len| copy(total + offset, ptr, len)) } {
+        match unsafe { crate::pipe::write_from_raw_iter(pipe, count - total, |offset, ptr, len| copy(total + offset, ptr, len)) } {
             Ok((n, full)) => {
                 total += n;
                 if total == count || (n != 0 && !full) { break; }

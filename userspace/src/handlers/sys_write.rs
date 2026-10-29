@@ -29,6 +29,18 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // Resolve the pipe once, before socket-family probes and Arc cloning.
+    if let Some(pipe) = crate::pipe::Endpoint::from_file(endpoint.ops.as_ref()) {
+        // SAFETY: guarded copy initializes every destination byte on Ok and
+        // retains no pointer. A failed page copy remains unpublished.
+        unsafe {
+            write_pipe_user(ctx, &endpoint, &pipe, count, |offset, dst, len| {
+                copy_raw_from_user(dst, user_ptr + offset as u64, len)
+            });
+        }
+        return;
+    }
+
     // Preserve AF_PACKET's packet_snd errnos and datagram atomicity instead
     // of translating them through the narrower FileOps error enum/chunk loop.
     if let Some(packet) = crate::socket::packet::packet_socket_of(endpoint.ops.as_ref()) {
@@ -70,17 +82,6 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
                 }
             }
         }
-    }
-
-    if crate::pipe::is_pipe(endpoint.ops.as_ref()) {
-        // SAFETY: guarded copy initializes every destination byte on Ok and
-        // retains no pointer. A failed page copy remains unpublished.
-        unsafe {
-            write_pipe_user(ctx, &endpoint, count, |offset, dst, len| {
-                copy_raw_from_user(dst, user_ptr + offset as u64, len)
-            });
-        }
-        return;
     }
 
     // Linux `fdget_pos`: only FMODE_ATOMIC_POS files lock their position.

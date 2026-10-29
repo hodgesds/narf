@@ -51,14 +51,14 @@ fn lock_queue(queue: &queue::Queue) -> queue::Guard<'_> {
         .expect("pipe mutex acquisition requires a runnable task context")
 }
 
-enum Endpoint<'a> {
+pub(crate) enum Endpoint<'a> {
     Read(&'a PipeRead),
     Write(&'a PipeWrite),
     Named(&'a narf_filesystem::fifo::FifoHandle),
 }
 
 impl<'a> Endpoint<'a> {
-    fn from_file(ops: &'a dyn FileOps) -> Option<Self> {
+    pub(crate) fn from_file(ops: &'a dyn FileOps) -> Option<Self> {
         let any = ops.as_any()?;
         if let Some(read) = any.downcast_ref::<PipeRead>() {
             return Some(Self::Read(read));
@@ -120,11 +120,10 @@ impl<'a> Endpoint<'a> {
 /// accesses only that range, without reading uninitialized bytes or retaining
 /// a pointer beyond the call. Errors leave that callback's range unpublished.
 pub(crate) unsafe fn write_from_raw_iter(
-    ops: &dyn FileOps,
+    output: &Endpoint<'_>,
     len: usize,
     copy: impl FnMut(usize, *mut u8, usize) -> Result<(), u64>,
 ) -> Result<(usize, bool), u64> {
-    let output = Endpoint::from_file(ops).ok_or(EBADF as u64)?;
     let mut q = lock_queue(output.queue());
     if output.reader_closed() {
         return Err(EPIPE as u64);
@@ -143,9 +142,18 @@ pub(crate) fn read_to_iter(
     ops: &dyn FileOps,
     len: usize,
     discard_packets: bool,
-    mut copy: impl FnMut(usize, *const u8, usize) -> Result<(), u64>,
+    copy: impl FnMut(usize, *const u8, usize) -> Result<(), u64>,
 ) -> Result<usize, u64> {
     let input = Endpoint::from_file(ops).ok_or(EBADF as u64)?;
+    read_endpoint(&input, len, discard_packets, copy)
+}
+
+pub(crate) fn read_endpoint(
+    input: &Endpoint<'_>,
+    len: usize,
+    discard_packets: bool,
+    mut copy: impl FnMut(usize, *const u8, usize) -> Result<(), u64>,
+) -> Result<usize, u64> {
     let mut q = lock_queue(input.queue());
     if q.is_empty() {
         return if input.writer_closed() {

@@ -739,6 +739,9 @@ full pages skip pre-zeroing; they become readable only after every byte was
 initialized. Faulted incomplete pages are discarded, while earlier complete
 page buffers remain committed. Partial pages retain initialized backing and
 the user-copy trap fixups, packet atomicity, and error ordering are preserved.
+Scalar/vector syscalls resolve the concrete pipe endpoint once from the retained
+file reference and reuse it across capacity waits. Scalar pipe dispatch follows
+the common access/range/zero-count checks and precedes socket-family probes.
 Both operations acquire per-pipe sleepable mutexes in address order. Payload
 copies and allocations hold no pipe IRQ spinlock. Poll, FIONREAD, and endpoint
 closure use atomic queue snapshots; a per-pipe short publication lock orders
