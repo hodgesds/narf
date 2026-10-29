@@ -22,7 +22,10 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use narf_filesystem::{FileOps, FsError, FsFuture, MmapLifetime, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_memory::{AddressSpaceError, FileFaultError, MappingReceipt, PhysAddr, ZapOutcome};
+use narf_memory::{
+    AddressSpace, AddressSpaceError, FileFaultError, MappingReceipt, PhysAddr, RegionPerms,
+    VirtAddr, ZapOutcome,
+};
 
 const ANON_SHARED_INLINE_PAGES: usize = 4;
 
@@ -1703,6 +1706,262 @@ pub(crate) fn populate_mapped_range(address_space_id: u64, base: u64, len: u64) 
         if start < stop {
             populate_file_cache(&ops, file_offset + (start - owner_base), stop - start);
         }
+    }
+}
+
+/// Why a strict population — `MADV_POPULATE_READ` /
+/// `MADV_POPULATE_WRITE` — did not complete. The variants carry the
+/// syscall's errno mapping: `Invalid` is Linux's `EINVAL`,
+/// `NoMemory` its `ENOMEM`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PopulateError {
+    Invalid,
+    NoMemory,
+}
+
+fn note_populate_error(slot: &mut Option<PopulateError>, error: PopulateError) {
+    if slot.is_none() {
+        *slot = Some(error);
+    }
+}
+
+/// The owner-table class of one page, for the strict populate walk.
+/// Only three shapes can appear behind a `FILE_DEMAND` region: a
+/// generic-fallback or private-copy file (a fault fills it from the
+/// file), a direct provider whose backing is RAM (a fault fills it
+/// through the provider), and a direct provider aliasing device
+/// memory — the `VM_IO` / `VM_PFNMAP` analogue, which Linux refuses
+/// to populate with `EINVAL`.
+enum OwnerClass {
+    /// No file owner covers the page (anonymous, or an ownerless
+    /// region whose pages the batch claim will simply refuse).
+    None,
+    File,
+    Provider,
+    Device,
+}
+
+fn classify_owner(address_space_id: u64, page: u64) -> OwnerClass {
+    let Some(bucket) = existing_mapping_owners(address_space_id) else {
+        return OwnerClass::None;
+    };
+    // Snapshot under the lock; the one trait call happens after it
+    // drops, as everywhere else in this file (`mmap_is_ram` is a
+    // constant leaf getter, but the discipline costs nothing).
+    let snapshot = {
+        let owners = bucket.lock();
+        owners
+            .iter()
+            .find(|mapping| page >= mapping.base && page < mapping.base.saturating_add(mapping.len))
+            .map(|owner| {
+                (
+                    owner.private_copy,
+                    owner.writeback.is_some(),
+                    Arc::clone(&owner.ops),
+                )
+            })
+    };
+    let Some((private_copy, has_writeback, ops)) = snapshot else {
+        return OwnerClass::None;
+    };
+    if private_copy || has_writeback {
+        return OwnerClass::File;
+    }
+    // A direct provider: its fault path serves pages itself. RAM
+    // backing (memfs-class) is populatable exactly like a file;
+    // device backing is not page-table populatable at all.
+    if ops.mmap_is_ram() {
+        OwnerClass::Provider
+    } else {
+        OwnerClass::Device
+    }
+}
+
+/// The man page's permission rule for one segment: `POPULATE_READ`
+/// cannot be applied to a mapping without read permission,
+/// `POPULATE_WRITE` not to one without write permission, and a
+/// `PROT_NONE` segment has neither.
+fn populate_perm_error(perms: RegionPerms, write: bool) -> Option<PopulateError> {
+    if perms.prot_only().0 == 0 {
+        return Some(PopulateError::Invalid);
+    }
+    if write {
+        if !perms.contains(RegionPerms::WRITE) {
+            return Some(PopulateError::Invalid);
+        }
+    } else if !perms.contains(RegionPerms::READ) {
+        return Some(PopulateError::Invalid);
+    }
+    None
+}
+
+/// Resolve one backed COW page to its private writable copy — the
+/// populate-write half of the COW contract. The batch claim skips
+/// backed pages by design (a peer's leaf is that peer fault's
+/// business), so a page left COW-shared by fork is *present* after
+/// the batch yet not *writable*, and Linux's guarantee for
+/// `MADV_POPULATE_WRITE` — if it succeeds, the pages were populated
+/// writable once — is only met once the split has happened. This is
+/// the same resolve the supervisor-write path uses
+/// (`AddressSpace::user_page_writable_or_resolve`): split in place,
+/// rewrite the leaf, report `false` only for a genuinely read-only
+/// mapping, which a `WRITE` region never is.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn resolve_cow_page(aspace: &AddressSpace, va: u64) -> bool {
+    // SAFETY: `aspace` is the caller's own space, live on this CPU in
+    // syscall context (the `populate_range` contract); `va` is a
+    // backed page of a COW region in it.
+    unsafe { aspace.user_page_writable_or_resolve(VirtAddr::new(va)) }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn resolve_cow_page(_aspace: &AddressSpace, _va: u64) -> bool {
+    // No kernel target outside x86_64/aarch64 exists today; report
+    // the page unresolved (the caller fails the range with ENOMEM)
+    // rather than claim a writability this build cannot establish.
+    false
+}
+
+/// Populate `[base, base + len)` of the caller's own address space —
+/// the strict walk behind `MADV_POPULATE_READ` (`write == false`) and
+/// `MADV_POPULATE_WRITE` (`write == true`), #741.
+///
+/// Where `MADV_WILLNEED` populates the *cache* and stops, POPULATE
+/// must leave the pages *installed*: the successful return is the
+/// caller's guarantee that the whole range can be touched without a
+/// major fault. The walk is Linux-shaped (`mm/madvise.c::
+/// madvise_populate` over `madvise_walk_vmas`): segments are
+/// processed per VMA in address order, the first error in that order
+/// is the one returned, and processing continues past a failed
+/// segment — pages populated before (or after) a failure stay
+/// populated, which the man page states outright ("if population
+/// fails, some page tables might have been populated").
+///
+/// Per segment, in order:
+///
+/// 1. **Validate** — the permission rule ([`populate_perm_error`])
+///    and, for a `FILE_DEMAND` segment, the device refusal
+///    ([`classify_owner`]).
+/// 2. **Install** — one [`AddressSpace::demand_alloc_range`] batch
+///    for the segment's missing pages. The batch is advisory (it
+///    reports a count, never an error, and skips backed / in-flight /
+///    guarded / swap-owned pages), so its count is *not* the
+///    success criterion — step 4 is.
+/// 3. **Resolve** (`write` only) — every backed page of a `COW`
+///    segment is split to its private writable copy
+///    ([`resolve_cow_page`]); `POPULATE_READ` deliberately leaves
+///    COW sharing intact, as a read fault would.
+/// 4. **Verify** — every page of the segment must report resident
+///    backing through `AddressSpace::page_backing`. This single
+///    check is what turns the advisory batch into the all-or-nothing
+///    return: a hole in coverage, a fill the hook refused (a page at
+///    or past `i_size` — the batch hook answers it exactly as a
+///    fault does, with `Bus`, so a range extending past EOF fails
+///    here with `ENOMEM`; `madvise` itself never raises the
+///    `SIGBUS` a touch would), a swap-owned page, and a guard page
+///    all leave the slot empty and fail the range the same way.
+///
+/// Known limits, all deliberate: swap-owned pages are *not* swapped
+/// in by the walk (the single-fault path owns that transaction; a
+/// later touch faults them in), so a range containing one reports
+/// `ENOMEM` where Linux — which swaps in on populate — would
+/// succeed. Guard markers are checked separately from backing: a shared
+/// page can retain its frame while its leaf is deliberately inaccessible.
+///
+/// # Safety contract
+/// `aspace` must be the caller's own address space with its root live
+/// on this CPU — the ordinary syscall context, the same contract
+/// `sys_mmap`'s eager population and `mlock`'s population already
+/// rely on when they drive the demand paths. It must never be a
+/// ptrace tracee's space (that path keeps single-page service).
+pub(crate) fn populate_range(
+    aspace: &AddressSpace,
+    base: u64,
+    len: u64,
+    write: bool,
+) -> Result<(), PopulateError> {
+    let address_space_id = aspace.identity();
+    // Pre-warm the shared cache for the generic owners in the range,
+    // exactly as MADV_WILLNEED does, so the batch fills below find
+    // their pages already canonical instead of re-reading them
+    // through the hook one by one. Advisory only — installation,
+    // not the cache, is this walk's guarantee.
+    populate_mapped_range(address_space_id, base, len);
+    let end = base.saturating_add(len);
+    let mut first_error: Option<PopulateError> = None;
+    let mut cur = base;
+    while cur < end {
+        let Some(region) = aspace.lookup(VirtAddr::new(cur)) else {
+            // No ordinary region covers this page. A hardware-huge
+            // region is installed whole at mmap time, so a page it
+            // backs is populated by construction (its perms still
+            // take the permission rule); anything else is a hole.
+            match aspace.page_backing(VirtAddr::new(cur)) {
+                Some((perms, phys)) if phys.raw() != 0 => {
+                    if let Some(error) = populate_perm_error(perms, write) {
+                        note_populate_error(&mut first_error, error);
+                    }
+                }
+                _ => note_populate_error(&mut first_error, PopulateError::NoMemory),
+            }
+            cur = cur.saturating_add(4096);
+            continue;
+        };
+        let seg_end = end.min(region.base.as_u64().saturating_add(region.len));
+        let perms = region.perms;
+        if let Some(error) = populate_perm_error(perms, write) {
+            note_populate_error(&mut first_error, error);
+            cur = seg_end;
+            continue;
+        }
+        if perms.contains(RegionPerms::FILE_DEMAND)
+            && matches!(classify_owner(address_space_id, cur), OwnerClass::Device)
+        {
+            note_populate_error(&mut first_error, PopulateError::Invalid);
+            cur = seg_end;
+            continue;
+        }
+        // Install the segment's missing pages as one batch (#737):
+        // claim set taken atomically, fills outside the lock, each
+        // page published through the single fault's own transaction,
+        // so an installed page is indistinguishable from a faulted
+        // one. The count is deliberately discarded — step 4 decides.
+        // SAFETY: the caller's own space, live on this CPU in
+        // syscall context (see the contract above); the batch never
+        // serves a faulting page and cannot fail the caller.
+        let _ = unsafe { aspace.demand_alloc_range(VirtAddr::new(cur), (seg_end - cur) / 4096) };
+        if write && perms.contains(RegionPerms::COW) {
+            let mut va = cur;
+            while va < seg_end {
+                if !aspace.is_guard_page(VirtAddr::new(va))
+                    && aspace
+                        .page_backing(VirtAddr::new(va))
+                        .is_some_and(|(_, phys)| phys.raw() != 0)
+                    && !resolve_cow_page(aspace, va)
+                {
+                    note_populate_error(&mut first_error, PopulateError::NoMemory);
+                }
+                va = va.saturating_add(4096);
+            }
+        }
+        let mut va = cur;
+        while va < seg_end {
+            if aspace.is_guard_page(VirtAddr::new(va)) {
+                note_populate_error(&mut first_error, PopulateError::NoMemory);
+                va = va.saturating_add(4096);
+                continue;
+            }
+            match aspace.page_backing(VirtAddr::new(va)) {
+                Some((_, phys)) if phys.raw() != 0 => {}
+                _ => note_populate_error(&mut first_error, PopulateError::NoMemory),
+            }
+            va = va.saturating_add(4096);
+        }
+        cur = seg_end;
+    }
+    match first_error {
+        None => Ok(()),
+        Some(error) => Err(error),
     }
 }
 
