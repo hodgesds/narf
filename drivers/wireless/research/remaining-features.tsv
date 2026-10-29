@@ -47,7 +47,6 @@ ath9k	larger_tx_aggregates	TX aggregates larger than the implemented two-MPDU se
 ath9k	periodic_calibration	Periodic calibration	feature	drivers/wireless/specification/ath9k.md	700
 ath9k	sgi40	SGI40	feature	drivers/wireless/specification/ath9k.md	689
 ath9k	station_network_sleep	Station NETWORK_SLEEP power save with beacon timers	feature	drivers/wireless/specification/ath9k.md	730
-ath9k	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/ath9k.md	716
 brcmfmac	additional_chip_profiles	Additional CPU/RAM/chip/OTP profiles (incl. 160 MHz-capable chips; retained BCM43602 is 80 MHz)	chip	drivers/wireless/specification/cyw43439.md	521
 brcmfmac	ap_mode	Access Point mode	feature	drivers/wireless/specification/cyw43439.md	519
 brcmfmac	confirmed_stop_quiescence	Confirmed transport/device stop and quiescence (CYW43439 SDIO only; BCM43602 PCIe closed in brcmfmac.md: SDIO needs a host WL_REG_ON/card power cycle)	feature	drivers/wireless/specification/cyw43439.md	515
@@ -194,5 +193,4 @@ rtw89	tspec	TSPEC/WMM admission control (mac80211-owned host MLME)	feature	drive
 rtw89	uapsd	U-APSD	feature	drivers/wireless/specification/rtw89.md	933
 rtw89	wide_channels	HT40/80MHz widths on all AX chips and 160MHz on RTL8852C/RTL8922A	feature	drivers/wireless/specification/rtw89.md	1035
 rtw89	wow	Wake on Wireless	feature	drivers/wireless/specification/rtw89.md	1043
-shared	glk_membership_selector	GLK mandatory membership-selector admission; needs IEEE802.11-2020 General Link (802.11ak) bridged-link operation, which has no open reference implementation (mac80211 also refuses it)	feature	wireless/specification/spec.md	158
 shared	mlo_station_association	Single-link MLD (Basic Multi-Link) station association in JoinPlan with MLD addressing and MLO key delivery; required before JoinPlan can negotiate UHR (P802.11bn) [Assessed round 3: not feasible as an additive change yet. It needs (1) a Basic Multi-Link element (MLD MAC, common info) in the JoinPlan request and response parsing, (2) PTK derivation over MLD addresses, (3) MLO GTK/IGTK/Link KDE handling in the eapol supplicant (wpa_supplicant MLO 3/4 path) and (4) per-link key installation in station_security; JoinPlan size must be boxed for it]	feature	wireless/specification/spec.md	249
