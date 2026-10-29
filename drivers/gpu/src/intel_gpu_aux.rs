@@ -580,6 +580,46 @@ pub mod tests {
         smoke_aux_msgsize_field_is_five_bits
     );
 
+    fn smoke_aux_full_burst_read_round_trips() -> TestResult {
+        // A full-burst read — 16 payload bytes, the DP AUX cap
+        // and exactly the burst `dp_edid` uses per EDID chunk —
+        // completes with a 17-byte reply (status + payload).
+        // The controller publishes that count in MSGSIZE; 17
+        // needs the field's fifth bit ([24:20]). With a 4-bit
+        // field the count truncated to 1 and bit 24 read back
+        // as a spurious error flag, so every full-burst read
+        // failed after the hardware-retry budget — the defect
+        // that took down the modeset full-run smokes (#1131).
+        use crate::dp_aux::AuxChannel as _;
+        let mmio = MockMmio::default();
+        mmio.set_read(ctl_off(), AUX_CTL_DONE | (17 << AUX_CTL_MSGSIZE_SHIFT));
+        // Reply bytes: status 0x00 (ACK), then payload
+        // 0x10..=0x1F, packed big-endian into the DATA dwords.
+        for i in 0..DDI_AUX_DATA_DWORDS {
+            let mut v = 0u32;
+            for b in 0..4 {
+                let idx = i * 4 + b;
+                let byte = if idx == 0 { 0x00 } else { 0x0F + idx as u8 };
+                v |= (byte as u32) << (24 - 8 * b);
+            }
+            mmio.set_read(Ddi::A.base() + DDI_AUX_DATA_OFFSET + (i as u64) * 4, v);
+        }
+        let mut aux = IntelAux::new(&mmio, Ddi::A);
+        let mut buf = [0u8; 16];
+        match aux.dpcd_read(0x000, &mut buf) {
+            Ok(()) => {}
+            Err(_) => return TestResult::Fail("16-byte dpcd_read must succeed over the transport"),
+        }
+        if buf != core::array::from_fn::<u8, 16, _>(|i| 0x10 + i as u8) {
+            return TestResult::Fail("full-burst payload must round-trip intact");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_aux",
+        smoke_aux_full_burst_read_round_trips
+    );
+
     fn smoke_aux_timeout_retries_exactly_three_times() -> TestResult {
         let mmio = MockMmio::default();
         // Every completion read reports TIMEOUT_ERROR (SEND_BUSY clear).
