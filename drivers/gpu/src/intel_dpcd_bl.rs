@@ -154,10 +154,14 @@ impl<C: AuxChannel> DpcdBacklightDevice<C> {
     /// Write `level` (already clamped) at exactly the field width.
     fn write_level(&self, level: u32) {
         let bytes = [(level >> 8) as u8, level as u8];
-        let payload = if self.lsb_used {
+        // For a 16-bit panel the payload is MSB-first [hi, lo]. For
+        // an 8-bit panel the single byte IS the level: taking
+        // bytes[..1] here would write level >> 8, which is 0 for
+        // every clamped 8-bit level, pinning brightness at 0.
+        let payload: &[u8] = if self.lsb_used {
             &bytes[..2]
         } else {
-            &bytes[..1]
+            &bytes[1..2]
         };
         // The trait returns `()` and sysfs stores cannot surface an
         // AUX error; a failed write is a silent no-op, like the PWM
