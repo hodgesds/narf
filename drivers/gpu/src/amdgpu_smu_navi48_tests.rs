@@ -750,6 +750,7 @@ fn metrics(gfx_activity: u16, uclk_activity: u16) -> Vec<u8> {
         (54, 1250),    // mem pre-DS
         (56, 96),      // mem post-DS
         (108, 1050),   // AvgVoltage[VDD_GFX]
+        (110, 950),    // AvgVoltage[VDD_SOC], distinct from GFX
         (124, gfx_activity),
         (126, uclk_activity),
         (136, 287), // AverageSocketPower
@@ -852,6 +853,7 @@ fn smu14_telemetry_decodes_metrics_limits_and_protection() -> TestResult {
     assert_eq!((m.vr_gfx_milli, m.vr_soc_milli), (58_000, 55_000));
     assert_eq!((m.fan_rpm, m.fan_pwm, m.vddgfx_mv), (1620, 127, 1050));
     assert_eq!((m.socket_power_w, m.board_power_w), (287, 301));
+    assert_eq!(m.vddsoc_mv, Some(950));
     // Busy: Linux reports pre-deep-sleep averages.
     assert_eq!((m.gfx_mhz, m.fclk_mhz, m.mem_mhz), (2450, 1900, 1250));
     assert_eq!(
@@ -860,6 +862,13 @@ fn smu14_telemetry_decodes_metrics_limits_and_protection() -> TestResult {
     );
     assert_eq!(m.throttlers, (1 << 1) | (1 << 14));
     assert_eq!((m.pcie_rate, m.pcie_width), (4, 16));
+    // Unknown SOC voltage must not alias GFX or become a bogus 65 V value.
+    put16(&mut e.io.metrics, 110, u16::MAX);
+    let missing = run(e.read_telemetry()).unwrap().metrics;
+    assert_eq!(missing.vddsoc_mv, None);
+    assert_eq!(missing.vddgfx_mv, 1050);
+    put16(&mut e.io.metrics, 110, 0);
+    assert_eq!(run(e.read_telemetry()).unwrap().metrics.vddsoc_mv, Some(0));
     // Idle (at the busy threshold) selects post-deep-sleep averages, and a
     // negative-overflow UCLK activity reads as zero (smu_safe_u16_nn).
     e.io.metrics = metrics(5, 0xfff0);

@@ -72,6 +72,7 @@ fn telemetry(hotspot_c: i32, throttlers: u32) -> Telemetry {
             fan_pwm: 127,
             socket_power_w: 287,
             vddgfx_mv: 1050,
+            vddsoc_mv: Some(950),
             gfx_mhz: 2450,
             uclk_mhz: 1258,
             throttlers,
@@ -137,7 +138,7 @@ kernel_test_in!(
 
 fn navi48_hwmon_follows_linux_amdgpu_units_and_visibility() -> TestResult {
     let names = attributes(true);
-    assert_eq!(names.len(), 34); // plus power1_cap_{min,max}
+    assert_eq!(names.len(), 37); // includes SOC voltage/input power and cap bounds
     assert!(names.contains(&"pwm1") && names.contains(&"fan1_max"));
     let fanless = attributes(false);
     assert!(!fanless
@@ -184,7 +185,10 @@ fn navi48_hwmon_follows_linux_amdgpu_units_and_visibility() -> TestResult {
         ("fan1_max", "3300\n"),
         ("in0_input", "1050\n"),
         ("in0_label", "vddgfx\n"),
+        ("in1_input", "950\n"),
+        ("in1_label", "vddsoc\n"),
         ("power1_average", "287000000\n"),
+        ("power1_input", "287000000\n"),
         ("power1_cap", "304000000\n"),
         ("power1_cap_default", "304000000\n"),
         ("power1_label", "PPT\n"),
@@ -199,6 +203,11 @@ fn navi48_hwmon_follows_linux_amdgpu_units_and_visibility() -> TestResult {
     for name in &names {
         assert!(!show(Some(&s), name).is_empty(), "{name}");
     }
+    let t = s.telemetry.as_mut().unwrap();
+    t.metrics.vddsoc_mv = None;
+    t.metrics.socket_power_w = u16::MAX;
+    assert_eq!(show(Some(&s), "in1_input"), "");
+    assert_eq!(show(Some(&s), "power1_input"), "");
     TestResult::Pass
 }
 kernel_test_in!(

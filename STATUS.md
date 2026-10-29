@@ -1911,6 +1911,13 @@ only completed backing changes, and recovery counters expose native full
 GPU recoveries. These additions require physical Mesa validation; unsupported
 Linux dGPU sensor selectors remain explicit errors.
 
+VDDNB and GPU_INPUT_POWER now extend these native statistics on both RX 6000
+and RX 9000. VDDNB exposes VDD_SOC using SMU11's live VID or SMU14's average
+SOC voltage. Input power uses the latest firmware-averaged socket-power
+sample and can match average power; there is no separate instantaneous
+measurement. Hwmon also exposes in1_input/in1_label (vddsoc) and power1_input.
+Missing/invalid data stays unavailable. Physical validation remains pending.
+
 Ordinary VRAM-preferred creation now permits Linux's GTT fallback when VRAM
 is unavailable, preserving reported preferences and discardable-domain rules.
 Visible client VRAM now supports pressure eviction to GTT and promotion back

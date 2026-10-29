@@ -26,6 +26,8 @@ const UCLK_POST_DS: usize = 62;
 const GFX_ACTIVITY: usize = 64;
 // linux: offsetof(SmuMetrics_t, AverageUclkActivity)
 const UCLK_ACTIVITY: usize = 66;
+// linux: offsetof(SmuMetrics_t, CurrSocVoltageOffset)
+const SOC_VID: usize = 68;
 // linux: offsetof(SmuMetrics_t, AverageSocketPower)
 const SOCKET_POWER: usize = 72;
 // linux: offsetof(SmuMetrics_t, TemperatureEdge)
@@ -162,6 +164,9 @@ pub struct Metrics {
     pub fan_rpm: u16,
     /// `AverageSocketPower`, in watts.
     pub socket_power_w: u16,
+    /// Live VDD_SOC VID decoded as Linux gpu_metrics.voltage_soc, in mV.
+    /// A zero VID is unreported; invalid encodings do not wrap the voltage.
+    pub vddsoc_mv: Option<u16>,
     /// Effective average GFXCLK (`METRICS_AVERAGE_GFXCLK`), in MHz.
     pub gfx_mhz: u16,
     /// `AverageFclkFrequencyPostDs` / `AverageUclkFrequencyPostDs`, in MHz.
@@ -210,6 +215,7 @@ impl Metrics {
             vr_soc_milli: temperature(TEMP_VR_SOC),
             fan_rpm: u16_at(b, fan),
             socket_power_w: u16_at(b, SOCKET_POWER),
+            vddsoc_mv: soc_voltage_mv(b[SOC_VID]),
             gfx_mhz: u16_at(
                 b,
                 if gfx_activity <= BUSY_THRESHOLD {
@@ -232,6 +238,17 @@ impl Metrics {
             pcie_width: b[pcie + 1],
         }
     }
+}
+
+/// sienna_cichlid_get_gpu_metrics converts CurrSocVoltageOffset as a VID,
+/// despite the field name: (155000 - 625 * VID) / 100, truncating to mV.
+fn soc_voltage_mv(vid: u8) -> Option<u16> {
+    if vid == 0 {
+        return None;
+    }
+    155_000u32
+        .checked_sub(625 * u32::from(vid))
+        .map(|value| (value / 100) as u16)
 }
 
 /// `convert_to_vddc` of `SMUSVI0_TEL_PLANE0.SVI0_PLANE0_VDDCOR`, in mV. Linux

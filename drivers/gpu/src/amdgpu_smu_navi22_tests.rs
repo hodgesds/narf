@@ -1062,6 +1062,7 @@ fn powered_engine(firmware: u32) -> (Engine<Fake>, crate::amdgpu_vram::Pool) {
         dc_by_gpio: false,
     });
     let mut metrics = vec![0u8; METRICS_BYTES];
+    metrics[68] = 88; // CurrSocVoltageOffset: 1000 mV, distinct from GFX
     metrics[76..78].copy_from_slice(&63u16.to_le_bytes()); // TemperatureHotspot
     metrics[122..124].copy_from_slice(&1350u16.to_le_bytes()); // V2 CurrFanSpeed
     metrics[102..104].copy_from_slice(&900u16.to_le_bytes()); // V1 CurrFanSpeed
@@ -1197,6 +1198,7 @@ fn smu_navi22_telemetry_transfers_metrics_through_retained_buffer() -> TestResul
         || t.metrics.fan_rpm != 1350
         || t.ppt_limit_w != 186
         || t.vddgfx_mv != 1150
+        || t.metrics.vddsoc_mv != Some(1000)
         || t.fan_pwm != Some(128)
         || engine.state != State::PowerReady
         || !engine.protected(t.enabled)
@@ -1653,6 +1655,7 @@ fn rdna2_runtime_banks_metrics_and_thermal_alerts() -> TestResult {
             || t.metrics.fan_rpm != 1350
             || t.metrics.pcie_rate != 3
             || t.metrics.pcie_width != 8
+            || t.metrics.vddsoc_mv != Some(1000)
             || !run(e.enable_thermal_alert()).unwrap().armed
         {
             return TestResult::Fail("family telemetry/thermal alert");

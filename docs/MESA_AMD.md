@@ -394,12 +394,18 @@ ownership and bounded copies. Mesa hardware validation remains outstanding.
 
 Both RX 6000 and RX 9000 expose native TIMESTAMP and Linux dGPU SENSOR
 statistics on primary/render nodes: effective SCLK, current MCLK, edge
-temperature, load, average socket power, VDDGFX, and stable/peak GFX/MCLK.
+temperature, load, average socket power, VDDGFX, VDDNB and stable/peak GFX/MCLK.
 Each query takes the retained owner; RX 9000 resumes runtime PM first.
 P-state endpoints come from SMU DPM tables with boot-clock fallback when DPM
 is disabled; standard GFX/MCLK follow Linux's ASIC rules on RDNA2 and the
-board's Base/Game clocks plus UCLK maximum on RDNA4. Neither backend has
-Linux VDDNB/GPU_INPUT_POWER sensors. Errors/cancellation publish no reply.
+board's Base/Game clocks plus UCLK maximum on RDNA4. VDDNB uses live VDD_SOC
+(SMU11 VID decoding; SMU14 average SOC voltage). GPU_INPUT_POWER uses the
+latest AverageSocketPower and can equal GPU_AVG_POWER: both are
+firmware-averaged, with no distinct instantaneous sensor claimed. These two
+selectors extend the Linux dGPU sensor switches. Hwmon adds in1_input with
+the vddsoc label and power1_input in microWatts. Missing/invalid readings
+remain errors for INFO and empty hwmon values. INFO errors/cancellation
+publish no reply.
 GEM reports per-card bytes moved and successful evictions after backing
 commits, plus the native recovery count as VRAM_LOST_COUNTER. CPU VRAM-fault
 migrations remain zero because invisible VRAM mappings are refused. Physical

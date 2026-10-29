@@ -26,6 +26,7 @@ fn telemetry(hotspot_c: i32, throttlers: u32) -> Telemetry {
             mem_milli: 60_000,
             fan_rpm: 1450,
             socket_power_w: 171,
+            vddsoc_mv: Some(1000),
             gfx_mhz: 2554,
             uclk_mhz: 1000,
             throttlers,
@@ -88,7 +89,7 @@ kernel_test_in!(
 
 fn navi22_hwmon_follows_linux_amdgpu_units_and_visibility() -> TestResult {
     let names = attributes(true);
-    if names.len() != 34 || !names.contains(&"fan1_target") || !names.contains(&"fan1_enable") {
+    if names.len() != 37 || !names.contains(&"fan1_target") || !names.contains(&"fan1_enable") {
         return TestResult::Fail("SMU11 fan attributes");
     }
     if attributes(false)
@@ -138,12 +139,14 @@ fn navi22_hwmon_follows_linux_amdgpu_units_and_visibility() -> TestResult {
         ("fan1_enable", "0\n"),
         ("fan1_max", "3300\n"),
         ("in0_input", "1150\n"),
+        ("in1_input", "1000\n"),
+        ("in1_label", "vddsoc\n"),
         ("power1_average", "171000000\n"),
+        ("power1_input", "171000000\n"),
         ("power1_cap", "186000000\n"),
         ("power1_cap_default", "186000000\n"),
         ("freq1_input", "2554000000\n"),
         ("freq2_input", "1000000000\n"),
-        ("power1_input", ""),
     ] {
         if show(Some(&s), name) != value {
             return TestResult::Fail("hwmon value or unit");
@@ -154,6 +157,11 @@ fn navi22_hwmon_follows_linux_amdgpu_units_and_visibility() -> TestResult {
             return TestResult::Fail("visible attribute without a value");
         }
     }
+    let t = s.telemetry.as_mut().unwrap();
+    t.metrics.vddsoc_mv = None;
+    t.metrics.socket_power_w = u16::MAX;
+    assert_eq!(show(Some(&s), "in1_input"), "");
+    assert_eq!(show(Some(&s), "power1_input"), "");
     TestResult::Pass
 }
 kernel_test_in!(
