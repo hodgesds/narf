@@ -146,13 +146,13 @@ pub struct BootKeyboard {
     pub slot_id: u8,
     pub interrupt_in_ep: u8, // DCI of the interrupt-IN endpoint
     pub interface_num: u8,
-    /// Hub context — (index into `attach::HUBS`, downstream
+    /// Hub context — (parent hub slot id, downstream
     /// port) — when the keyboard sits behind a hub; `None` on a
     /// root port, whose ports are never idle-suspended. The
     /// pump feeds `attach::mark_port_activity` with it whenever
     /// a report completes, so an in-use keyboard's port never
     /// idle-suspends mid-typing (#840).
-    pub hub_port: Option<(usize, u8)>,
+    pub hub_port: Option<(u8, u8)>,
     /// Last report seen, used for press/release diffing in
     /// `pump_once`. Initialised to the all-zero report so the
     /// first non-empty poll fires presses for every key in it.
@@ -236,7 +236,7 @@ impl BootKeyboard {
         slot_id: u8,
         interface_num: u8,
         interrupt_in_ep: u8,
-        hub_port: Option<(usize, u8)>,
+        hub_port: Option<(u8, u8)>,
     ) -> Result<Self, HidError> {
         // Set Protocol class request (§7.2.6):
         //   bmRequestType: 0x21 (Class | Interface | Host-to-Device)
@@ -331,8 +331,8 @@ impl BootKeyboard {
         // proves the device is in use. No-op for root-attached
         // keyboards (`hub_port` is `None`).
         if reports > 0 {
-            if let Some((hub_idx, port)) = self.hub_port {
-                crate::attach::mark_port_activity(hub_idx, port);
+            if let Some((hub_slot, port)) = self.hub_port {
+                crate::attach::mark_port_activity(hub_slot, port);
             }
         }
         Ok(total)
@@ -630,7 +630,7 @@ pub async fn try_bind_kbd_already_addressed(
     slot_id: u8,
     port: u8,
     speed: xhci::PortSpeed,
-    hub_port: Option<(usize, u8)>,
+    hub_port: Option<(u8, u8)>,
 ) -> Result<(), HidError> {
     let r = bind_kbd_addressed_slot(xhci_dev, slot_id, port, speed, hub_port).await;
     if r.is_ok() {
@@ -688,7 +688,7 @@ async fn bind_kbd_addressed_slot(
     slot_id: u8,
     port: u8,
     speed: xhci::PortSpeed,
-    hub_port: Option<(usize, u8)>,
+    hub_port: Option<(u8, u8)>,
 ) -> Result<(), HidError> {
     // GET_DESCRIPTOR(DEVICE) and refresh EP0 MaxPacketSize via
     // Evaluate Context if the device's real bMaxPacketSize0
@@ -853,8 +853,8 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
 /// device can bind two classes on the same hub port.
 /// Root-attached bindings (`hub_port` is `None`) are omitted:
 /// root ports are never idle-suspended.
-pub fn hub_ports() -> alloc::vec::Vec<(usize, u8)> {
-    let mut v: alloc::vec::Vec<(usize, u8)> = {
+pub fn hub_ports() -> alloc::vec::Vec<(u8, u8)> {
+    let mut v: alloc::vec::Vec<(u8, u8)> = {
         let g = KEYBOARDS.lock();
         g.iter().filter_map(|k| k.hub_port).collect()
     };
@@ -893,10 +893,10 @@ pub async fn resume_suspended_hub_ports(xhci_dev: &Xhci) {
         let g = crate::attach::HUBS.lock();
         crate::attach::suspended_ports_among(&g[..], &ports)
     };
-    for (hub_idx, port) in targets {
-        crate::attach::resume_port(xhci_dev, hub_idx, port).await;
-        if !crate::attach::hub_port_is_suspended(hub_idx, port) {
-            crate::attach::mark_port_activity(hub_idx, port);
+    for (hub_slot, port) in targets {
+        crate::attach::resume_port(xhci_dev, hub_slot, port).await;
+        if !crate::attach::hub_port_is_suspended(hub_slot, port) {
+            crate::attach::mark_port_activity(hub_slot, port);
         }
     }
 }

@@ -422,6 +422,14 @@ impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
         self.write_byte(Function::Bus, CCCR_IO_ENABLE, 6)?;
         self.poll_byte(Function::Bus, CCCR_IO_READY, 4)
     }
+    /// The SDIO device core revision (KSO exists from rev 12).
+    pub fn packet_core_revision(&self) -> Option<u8> {
+        if self.failed || self.next_step != LOAD_SEQUENCE.len() {
+            None
+        } else {
+            self.layout.map(|(_, c)| c.revision)
+        }
+    }
     pub fn packet_core(&self) -> Option<u32> {
         if self.failed || self.next_step != LOAD_SEQUENCE.len() {
             None

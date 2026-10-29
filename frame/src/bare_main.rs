@@ -2604,6 +2604,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // accepted by `parse_ecdt` just above.
                         // SAFETY: Valid memory or trusted environment
                         let _ = unsafe { narf_acpi::parse_gpe_blocks(p) };
+                        // SAFETY: same RSDP, validated above. Best
+                        // effort like the ECDT/GPE parses: a missing
+                        // WDDT simply leaves wddt_info() empty and
+                        // the watchdog probe reports NotPresent.
+                        let _ = unsafe { narf_acpi::parse_wddt(p) };
                         let n = narf_aml::gpe::install_aml_handlers();
                         let _ = writeln!(
                             console::Writer,
@@ -3226,6 +3231,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_drivers_fs_btrfs::register_initcalls();
             narf_drivers_platform::register_initcalls();
             narf_drivers_hwmon::register_initcalls();
+            narf_drivers_watchdog::register_initcalls();
             narf_drivers_serial::register_initcalls();
             narf_drivers_spi::register_initcalls();
             // Bridge: ACPI power-button events (delivered by the

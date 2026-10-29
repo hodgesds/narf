@@ -143,6 +143,43 @@ pub fn set_fan_curve(curve: FanCurve) {
     *FAN_CURVE.lock() = curve;
 }
 
+// ── Fan boost mode ────────────────────────────────────────────────
+
+/// ASUS fan boost mode — the vendor's discrete fan actuator.
+/// Reference: `asus-wmi.c::fan_boost_mode_set()` — writes the mode
+/// via `asus_wmi_set_devstate(DEVID_FAN_BOOST, mode)`; the mode
+/// values are the sysfs `fan_boost_mode` ABI (0/1/2).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FanBoostMode {
+    /// Firmware default fan behaviour.
+    Normal = 0,
+    /// Fans driven harder than the default curve.
+    Overboost = 1,
+    /// Fans held to the quiet profile.
+    Silent = 2,
+}
+
+static FAN_BOOST_MODE: AtomicU32 = AtomicU32::new(0);
+
+/// Get the current fan boost mode (last value set; `DEVID_FAN_BOOST`
+/// is write-only, mirroring the throttle policy's readback shape).
+pub fn fan_boost_mode() -> FanBoostMode {
+    match FAN_BOOST_MODE.load(Ordering::Relaxed) {
+        1 => FanBoostMode::Overboost,
+        2 => FanBoostMode::Silent,
+        _ => FanBoostMode::Normal,
+    }
+}
+
+/// Set the fan boost mode by writing `DEVID_FAN_BOOST`.
+///
+/// Reference: `asus-wmi.c::fan_boost_mode_set()` — calls
+/// `asus_wmi_set_devstate(ASUS_WMI_DEVID_FAN_BOOST_MODE, value)`.
+pub fn set_fan_boost_mode(mode: FanBoostMode) {
+    FAN_BOOST_MODE.store(mode as u32, Ordering::Release);
+    set_devstate(DEVID_FAN_BOOST, mode as u32);
+}
+
 // ── Optimus GPU power ─────────────────────────────────────────────────
 
 static DGPU_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -326,6 +363,10 @@ pub fn init() {
                         set: profile_set,
                     },
                 );
+                // The GUID's presence is also the fan probe: expose
+                // the fan boost mode as a CoolingDevice so the
+                // thermal governor can drive it (#911).
+                crate::fan::register_asus_fan();
             }
         }
     }
@@ -338,6 +379,7 @@ pub fn init() {
 pub fn __test_reset() {
     EVENT_COUNT.store(0, Ordering::Relaxed);
     THROTTLE_POLICY.store(1, Ordering::Relaxed);
+    FAN_BOOST_MODE.store(0, Ordering::Relaxed);
     DGPU_ENABLED.store(true, Ordering::Relaxed);
     *FAN_CURVE.lock() = FanCurve {
         points: [(40, 20), (60, 40), (75, 70), (90, 100)],

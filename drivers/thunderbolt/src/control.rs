@@ -376,8 +376,12 @@ impl Control {
 }
 
 /// Config-space transport used by both the native ring and device-model tests.
-/// `pub` only so the public retimer operations may name it; `control` stays
-/// private, and every implementer is in this crate.
+///
+/// Public because the published retimer sideband API ([`super::retimer`])
+/// is generic over this seam — an implementor outside the crate must be
+/// able to name the trait to call it. The transaction machinery in this
+/// module (`Control`, `Event`) stays crate-private; only the seam is
+/// exported.
 #[allow(async_fn_in_trait)]
 pub trait Config {
     async fn read(

@@ -121,6 +121,50 @@ pub enum SbTarget {
     Retimer = 2,
 }
 
+/// Address of one sideband channel: the router port whose USB4
+/// adapter hosts the transactions, and the target on the link
+/// beyond it. The five fields are the `PORT_CS_1` addressing of a
+/// single transaction (route, port, capability, target, index)
+/// and are never meaningful apart, so the sideband primitives
+/// take the channel as one value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SbChannel {
+    /// Route string of the router that owns the port.
+    pub route: u64,
+    /// Port number on that router.
+    pub port: u8,
+    /// Offset of the port's USB4 adapter capability.
+    pub usb4_cap: u16,
+    /// Which SB register space the transaction targets.
+    pub target: SbTarget,
+    /// Retimer Index field (for [`SbTarget::Retimer`]).
+    pub index: u8,
+}
+
+impl SbChannel {
+    /// The channel to retimer `index` on the link off `port`.
+    pub fn retimer(route: u64, port: &super::topology::Port, index: u8) -> Self {
+        Self {
+            route,
+            port: port.number,
+            usb4_cap: port.usb4_cap,
+            target: SbTarget::Retimer,
+            index,
+        }
+    }
+
+    /// The channel to the router's own SB space on `port`.
+    pub fn router(route: u64, port: &super::topology::Port) -> Self {
+        Self {
+            route,
+            port: port.number,
+            usb4_cap: port.usb4_cap,
+            target: SbTarget::Router,
+            index: 0,
+        }
+    }
+}
+
 /// Typed failure of a sideband access, Port Operation, enumeration,
 /// link verification or NVM step. Every variant is a distinct,
 /// diagnosable condition; nothing in this module degrades a failed
@@ -273,19 +317,15 @@ async fn sb_command(
 #[allow(clippy::too_many_arguments)] // the USB4 sideband request's fields
 pub async fn sb_read(
     ctl: &mut impl Config,
-    route: u64,
-    port: u8,
-    usb4_cap: u16,
-    target: SbTarget,
-    index: u8,
+    ch: SbChannel,
     reg: u8,
     len: u8,
 ) -> Result<Vec<u32>, Error> {
-    if usb4_cap == 0 || len == 0 || len as usize > SB_DATA_DWORDS * 4 {
+    if ch.usb4_cap == 0 || len == 0 || len as usize > SB_DATA_DWORDS * 4 {
         return Err(Error::InvalidArgument);
     }
-    let command = cs1_command(reg, len, target, index, false);
-    let done = sb_command(ctl, route, port, usb4_cap, command).await?;
+    let command = cs1_command(reg, len, ch.target, ch.index, false);
+    let done = sb_command(ctl, ch.route, ch.port, ch.usb4_cap, command).await?;
     if done & CS1_RC != 0 {
         // Per Table 8-13 a read sets RC exactly when the response
         // carried zero length: the target refused the read.
@@ -296,7 +336,7 @@ pub async fn sb_read(
     }
     let dwords = (len as usize).div_ceil(4) as u8;
     Ok(ctl
-        .read(route, port, CfgSpace::Port, usb4_cap + 2, dwords)
+        .read(ch.route, ch.port, CfgSpace::Port, ch.usb4_cap + 2, dwords)
         .await?)
 }
 
@@ -305,22 +345,18 @@ pub async fn sb_read(
 #[allow(clippy::too_many_arguments)] // the USB4 sideband request's fields
 pub async fn sb_write(
     ctl: &mut impl Config,
-    route: u64,
-    port: u8,
-    usb4_cap: u16,
-    target: SbTarget,
-    index: u8,
+    ch: SbChannel,
     reg: u8,
     data: &[u32],
 ) -> Result<(), Error> {
-    if usb4_cap == 0 || data.is_empty() || data.len() > SB_DATA_DWORDS {
+    if ch.usb4_cap == 0 || data.is_empty() || data.len() > SB_DATA_DWORDS {
         return Err(Error::InvalidArgument);
     }
-    ctl.write(route, port, CfgSpace::Port, usb4_cap + 2, data)
+    ctl.write(ch.route, ch.port, CfgSpace::Port, ch.usb4_cap + 2, data)
         .await?;
     let len = (data.len() * 4) as u8;
-    let command = cs1_command(reg, len, target, index, true);
-    let done = sb_command(ctl, route, port, usb4_cap, command).await?;
+    let command = cs1_command(reg, len, ch.target, ch.index, true);
+    let done = sb_command(ctl, ch.route, ch.port, ch.usb4_cap, command).await?;
     if done & CS1_RC != 0 {
         return Err(Error::Refused);
     }
@@ -338,33 +374,17 @@ pub async fn sb_write(
 #[allow(clippy::too_many_arguments)] // the USB4 sideband request's fields
 pub async fn port_op(
     ctl: &mut impl Config,
-    route: u64,
-    port: u8,
-    usb4_cap: u16,
-    target: SbTarget,
-    index: u8,
+    ch: SbChannel,
     opcode: u32,
     timeout_ms: u64,
 ) -> Result<u32, Error> {
-    sb_write(
-        ctl,
-        route,
-        port,
-        usb4_cap,
-        target,
-        index,
-        SB_OPCODE,
-        &[opcode],
-    )
-    .await?;
+    sb_write(ctl, ch, SB_OPCODE, &[opcode]).await?;
     let deadline = narf_time::Deadline::after_ms(timeout_ms);
     loop {
-        let value = sb_read(ctl, route, port, usb4_cap, target, index, SB_OPCODE, 4).await?[0];
+        let value = sb_read(ctl, ch, SB_OPCODE, 4).await?[0];
         if value != opcode {
             return match value {
-                0 => Ok(
-                    sb_read(ctl, route, port, usb4_cap, target, index, SB_METADATA, 4).await?[0],
-                ),
+                0 => Ok(sb_read(ctl, ch, SB_METADATA, 4).await?[0]),
                 OP_ERR => Err(Error::OpFailed),
                 OP_ONS => Err(Error::NotSupported),
                 _ => Err(Error::Malformed),
@@ -388,11 +408,7 @@ pub async fn enumerate_retimers(
 ) -> Result<(), Error> {
     sb_write(
         ctl,
-        route,
-        port.number,
-        port.usb4_cap,
-        SbTarget::Router,
-        0,
+        SbChannel::router(route, port),
         SB_OPCODE,
         &[OP_ENUMERATE_RETIMERS],
     )
@@ -410,30 +426,10 @@ pub async fn set_inbound_sbtx(
     port: &super::topology::Port,
     index: u8,
 ) -> Result<(), Error> {
-    match port_op(
-        ctl,
-        route,
-        port.number,
-        port.usb4_cap,
-        SbTarget::Retimer,
-        index,
-        OP_SET_INBOUND_SBTX,
-        OP_TIMEOUT_MS,
-    )
-    .await
-    {
+    let ch = SbChannel::retimer(route, port, index);
+    match port_op(ctl, ch, OP_SET_INBOUND_SBTX, OP_TIMEOUT_MS).await {
         Err(Error::NoResponse) => {
-            port_op(
-                ctl,
-                route,
-                port.number,
-                port.usb4_cap,
-                SbTarget::Retimer,
-                index,
-                OP_SET_INBOUND_SBTX,
-                OP_TIMEOUT_MS,
-            )
-            .await?;
+            port_op(ctl, ch, OP_SET_INBOUND_SBTX, OP_TIMEOUT_MS).await?;
             Ok(())
         }
         other => other.map(|_| ()),
@@ -452,11 +448,7 @@ pub async fn unset_inbound_sbtx(
 ) -> Result<(), Error> {
     port_op(
         ctl,
-        route,
-        port.number,
-        port.usb4_cap,
-        SbTarget::Retimer,
-        index,
+        SbChannel::retimer(route, port, index),
         OP_UNSET_INBOUND_SBTX,
         OP_TIMEOUT_MS,
     )
@@ -475,31 +467,12 @@ pub async fn auth_status(
     port: &super::topology::Port,
     index: u8,
 ) -> Result<u32, Error> {
-    let value = sb_read(
-        ctl,
-        route,
-        port.number,
-        port.usb4_cap,
-        SbTarget::Retimer,
-        index,
-        SB_OPCODE,
-        4,
-    )
-    .await?[0];
+    let ch = SbChannel::retimer(route, port, index);
+    let value = sb_read(ctl, ch, SB_OPCODE, 4).await?[0];
     match value {
         0 => Ok(0),
         OP_ERR => {
-            let metadata = sb_read(
-                ctl,
-                route,
-                port.number,
-                port.usb4_cap,
-                SbTarget::Retimer,
-                index,
-                SB_METADATA,
-                4,
-            )
-            .await?[0];
+            let metadata = sb_read(ctl, ch, SB_METADATA, 4).await?[0];
             Ok(metadata & 0x3f)
         }
         OP_ONS => Err(Error::NotSupported),
@@ -553,96 +526,21 @@ pub async fn scan_link(
     if port.usb4_cap == 0 {
         return Err(Error::InvalidArgument);
     }
-    let router_conf = sb_read(
-        ctl,
-        route,
-        port.number,
-        port.usb4_cap,
-        SbTarget::Router,
-        0,
-        SB_LINK_CONF,
-        4,
-    )
-    .await?[0];
+    let router_conf = sb_read(ctl, SbChannel::router(route, port), SB_LINK_CONF, 4).await?[0];
     enumerate_retimers(ctl, route, port).await?;
     let mut chain = Vec::new();
     for index in 1..=MAX_RETIMERS {
-        let vendor_id = match sb_read(
-            ctl,
-            route,
-            port.number,
-            port.usb4_cap,
-            SbTarget::Retimer,
-            index,
-            SB_VENDOR_ID,
-            4,
-        )
-        .await
-        {
+        let ch = SbChannel::retimer(route, port, index);
+        let vendor_id = match sb_read(ctl, ch, SB_VENDOR_ID, 4).await {
             Ok(value) => value[0],
             Err(Error::NoResponse) => break,
             Err(error) => return Err(error),
         };
-        let product_id = sb_read(
-            ctl,
-            route,
-            port.number,
-            port.usb4_cap,
-            SbTarget::Retimer,
-            index,
-            SB_PRODUCT_ID,
-            4,
-        )
-        .await?[0];
-        let fw_version = sb_read(
-            ctl,
-            route,
-            port.number,
-            port.usb4_cap,
-            SbTarget::Retimer,
-            index,
-            SB_FW_VERSION,
-            4,
-        )
-        .await?[0];
-        let conf = sb_read(
-            ctl,
-            route,
-            port.number,
-            port.usb4_cap,
-            SbTarget::Retimer,
-            index,
-            SB_LINK_CONF,
-            4,
-        )
-        .await?[0]
-            .to_le_bytes();
-        let last = port_op(
-            ctl,
-            route,
-            port.number,
-            port.usb4_cap,
-            SbTarget::Retimer,
-            index,
-            OP_QUERY_LAST_RETIMER,
-            OP_TIMEOUT_MS,
-        )
-        .await?
-            & 1
-            != 0;
-        let cable = port_op(
-            ctl,
-            route,
-            port.number,
-            port.usb4_cap,
-            SbTarget::Retimer,
-            index,
-            OP_QUERY_CABLE_RETIMER,
-            OP_TIMEOUT_MS,
-        )
-        .await?
-            & 1
-            != 0;
+        let product_id = sb_read(ctl, ch, SB_PRODUCT_ID, 4).await?[0];
+        let fw_version = sb_read(ctl, ch, SB_FW_VERSION, 4).await?[0];
+        let conf = sb_read(ctl, ch, SB_LINK_CONF, 4).await?[0].to_le_bytes();
+        let last = port_op(ctl, ch, OP_QUERY_LAST_RETIMER, OP_TIMEOUT_MS).await? & 1 != 0;
+        let cable = port_op(ctl, ch, OP_QUERY_CABLE_RETIMER, OP_TIMEOUT_MS).await? & 1 != 0;
         let auth = auth_status(ctl, route, port, index).await.ok();
         chain.push(Retimer {
             index,
@@ -673,11 +571,7 @@ pub async fn nvm_sector_size(
 ) -> Result<u32, Error> {
     let metadata = port_op(
         ctl,
-        route,
-        port.number,
-        port.usb4_cap,
-        SbTarget::Retimer,
-        retimer.index,
+        SbChannel::retimer(route, port, retimer.index),
         OP_GET_NVM_SECTOR_SIZE,
         OP_TIMEOUT_MS,
     )
@@ -698,28 +592,9 @@ pub async fn nvm_set_offset(
         return Err(Error::CableRetimer);
     }
     let metadata = ((address / 4) << 2) & 0x00ff_fffc;
-    sb_write(
-        ctl,
-        route,
-        port.number,
-        port.usb4_cap,
-        SbTarget::Retimer,
-        retimer.index,
-        SB_METADATA,
-        &[metadata],
-    )
-    .await?;
-    port_op(
-        ctl,
-        route,
-        port.number,
-        port.usb4_cap,
-        SbTarget::Retimer,
-        retimer.index,
-        OP_NVM_SET_OFFSET,
-        OP_TIMEOUT_MS,
-    )
-    .await?;
+    let ch = SbChannel::retimer(route, port, retimer.index);
+    sb_write(ctl, ch, SB_METADATA, &[metadata]).await?;
+    port_op(ctl, ch, OP_NVM_SET_OFFSET, OP_TIMEOUT_MS).await?;
     Ok(())
 }
 
@@ -753,6 +628,7 @@ pub async fn nvm_write(
         return Err(Error::InvalidArgument);
     }
     nvm_set_offset(ctl, route, port, retimer, address).await?;
+    let ch = SbChannel::retimer(route, port, retimer.index);
     for block in data.chunks(SB_DATA_DWORDS * 4) {
         // Stage the whole Data register each block: BLKW writes
         // all 64 bytes, so a partial final block must be padded
@@ -761,28 +637,8 @@ pub async fn nvm_write(
         let packed = pack_dwords(block);
         let mut staged = [0u32; SB_DATA_DWORDS];
         staged[..packed.len()].copy_from_slice(&packed);
-        sb_write(
-            ctl,
-            route,
-            port.number,
-            port.usb4_cap,
-            SbTarget::Retimer,
-            retimer.index,
-            SB_DATA,
-            &staged,
-        )
-        .await?;
-        port_op(
-            ctl,
-            route,
-            port.number,
-            port.usb4_cap,
-            SbTarget::Retimer,
-            retimer.index,
-            OP_NVM_BLOCK_WRITE,
-            BLOCK_WRITE_TIMEOUT_MS,
-        )
-        .await?;
+        sb_write(ctl, ch, SB_DATA, &staged).await?;
+        port_op(ctl, ch, OP_NVM_BLOCK_WRITE, BLOCK_WRITE_TIMEOUT_MS).await?;
     }
     Ok(())
 }
@@ -803,6 +659,7 @@ pub async fn nvm_read(
     if out.is_empty() {
         return Err(Error::InvalidArgument);
     }
+    let ch = SbChannel::retimer(route, port, retimer.index);
     let mut done = 0usize;
     while done < out.len() {
         let take = (out.len() - done).min(SB_DATA_DWORDS * 4);
@@ -812,39 +669,9 @@ pub async fn nvm_read(
         if dwords < SB_DATA_DWORDS {
             metadata |= (dwords as u32) << 24;
         }
-        sb_write(
-            ctl,
-            route,
-            port.number,
-            port.usb4_cap,
-            SbTarget::Retimer,
-            retimer.index,
-            SB_METADATA,
-            &[metadata],
-        )
-        .await?;
-        port_op(
-            ctl,
-            route,
-            port.number,
-            port.usb4_cap,
-            SbTarget::Retimer,
-            retimer.index,
-            OP_NVM_READ,
-            OP_TIMEOUT_MS,
-        )
-        .await?;
-        let data = sb_read(
-            ctl,
-            route,
-            port.number,
-            port.usb4_cap,
-            SbTarget::Retimer,
-            retimer.index,
-            SB_DATA,
-            (dwords * 4) as u8,
-        )
-        .await?;
+        sb_write(ctl, ch, SB_METADATA, &[metadata]).await?;
+        port_op(ctl, ch, OP_NVM_READ, OP_TIMEOUT_MS).await?;
+        let data = sb_read(ctl, ch, SB_DATA, (dwords * 4) as u8).await?;
         for (i, word) in data.iter().enumerate() {
             let bytes = word.to_le_bytes();
             for (j, byte) in bytes.iter().enumerate() {
@@ -876,11 +703,7 @@ pub async fn nvm_authenticate(
     }
     sb_write(
         ctl,
-        route,
-        port.number,
-        port.usb4_cap,
-        SbTarget::Retimer,
-        retimer.index,
+        SbChannel::retimer(route, port, retimer.index),
         SB_OPCODE,
         &[OP_NVM_AUTH_WRITE],
     )

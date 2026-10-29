@@ -418,7 +418,7 @@ fn smoke_e2e_smp_pairing_request_response_sc_flag() -> TestResult {
     }
     .encode(SMP_PAIRING_REQUEST);
     let rsp: Pdu = match r.feed(&req) {
-        Ok(Some(p)) => p,
+        Ok(mut v) if v.len() == 1 => v.remove(0),
         _ => return TestResult::Fail("responder did not emit Pairing Response"),
     };
     let decoded = match PairingFeatureExchange::decode(&rsp) {
@@ -467,7 +467,7 @@ fn smoke_e2e_smp_public_key_exchange() -> TestResult {
         payload: pk_payload,
     };
     let our_pk: Pdu = match r.feed(&pk) {
-        Ok(Some(p)) => p,
+        Ok(mut v) if v.len() == 1 => v.remove(0),
         _ => return TestResult::Fail("responder did not emit own Public Key"),
     };
     if our_pk.code != SMP_PAIRING_PUBLIC_KEY {
@@ -483,13 +483,13 @@ fn smoke_e2e_smp_public_key_exchange() -> TestResult {
 }
 kernel_test_in!("bluetooth/e2e", smoke_e2e_smp_public_key_exchange);
 
-// ── 9. SMP Phase-2 random + LTK derivation ─────────────────────────
+// ── 9. SMP Phase-2 confirm + random + LTK derivation ───────────────
 
 fn smoke_e2e_smp_phase2_ltk_derivation() -> TestResult {
     use smp::{
         IoCapability, PairingFeatureExchange, Pdu, Responder, ResponderState, AUTH_BONDING,
-        AUTH_SC, SMP_PAIRING_DHKEY_CHECK, SMP_PAIRING_PUBLIC_KEY, SMP_PAIRING_RANDOM,
-        SMP_PAIRING_REQUEST,
+        AUTH_SC, SMP_PAIRING_CONFIRM, SMP_PAIRING_DHKEY_CHECK, SMP_PAIRING_PUBLIC_KEY,
+        SMP_PAIRING_RANDOM, SMP_PAIRING_REQUEST,
     };
 
     let mut r = Responder::new(E2eCrypto, [0u8; 7], [0u8; 7]);
@@ -518,33 +518,77 @@ fn smoke_e2e_smp_phase2_ltk_derivation() -> TestResult {
         payload: pk_payload,
     });
 
-    // 3) Peer Pairing Random (Na). Drives Nb out + LTK via f5.
-    let nb: Pdu = match r.feed(&Pdu {
-        code: SMP_PAIRING_RANDOM,
-        payload: vec![0x77u8; 16],
+    // 3) Peer Pairing Confirm: Ca commits the peer to Na (0x77×16)
+    // before it is revealed (§2.3.5.6.2), computed with the
+    // peer's key X (0xAA×32) first per §2.2.6 table 2.1; the
+    // E2eCrypto keygen gives the responder pub_x = 0x22×32. The
+    // responder answers [Cb, Nb]; Cb must be the responder's own
+    // f4 over Nb (0x55×16 from E2eCrypto's rand128).
+    let na = [0x77u8; 16];
+    let ca = smp::confirm_value(&E2eCrypto, &[0xAA; 32], &[0x22; 32], &na, 0);
+    let out = match r.feed(&Pdu {
+        code: SMP_PAIRING_CONFIRM,
+        payload: ca.to_vec(),
     }) {
-        Ok(Some(p)) => p,
-        _ => return TestResult::Fail("responder did not emit Pairing_Random"),
+        Ok(v) => v,
+        _ => return TestResult::Fail("responder rejected Pairing Confirm"),
     };
-    if nb.code != SMP_PAIRING_RANDOM || nb.payload.len() != 16 {
-        return TestResult::Fail("Pairing_Random shape wrong");
+    if out.len() != 2 || out[1].code != SMP_PAIRING_RANDOM || out[1].payload.len() != 16 {
+        return TestResult::Fail("responder did not answer Confirm with [Confirm, Random]");
     }
-    if r.ltk == [0u8; 16] {
-        return TestResult::Fail("LTK should be derived (non-zero) by f5");
+    let want_cb = smp::confirm_value(&E2eCrypto, &[0x22; 32], &[0xAA; 32], &r.nb, 0);
+    if out[0].code != SMP_PAIRING_CONFIRM || out[0].payload != want_cb {
+        return TestResult::Fail("responder's Cb is not the f4 confirm value");
     }
     if r.state != ResponderState::SentRandom {
         return TestResult::Fail("state did not advance to SentRandom");
     }
 
-    // 4) Peer DHKey Check.
-    let our_check: Pdu = match r.feed(&Pdu {
-        code: SMP_PAIRING_DHKEY_CHECK,
-        payload: vec![0x99u8; 16],
+    // 4) Peer Pairing Random (Na): Ca verifies, f5 derives the LTK.
+    let out = match r.feed(&Pdu {
+        code: SMP_PAIRING_RANDOM,
+        payload: na.to_vec(),
     }) {
-        Ok(Some(p)) => p,
-        _ => return TestResult::Fail("responder did not emit DHKey check"),
+        Ok(v) => v,
+        _ => return TestResult::Fail("responder rejected Pairing Random"),
     };
-    if our_check.code != SMP_PAIRING_DHKEY_CHECK || our_check.payload.len() != 16 {
+    if !out.is_empty() {
+        return TestResult::Fail("responder emitted a PDU on the Na step");
+    }
+    if r.ltk == [0u8; 16] {
+        return TestResult::Fail("LTK should be derived (non-zero) by f5");
+    }
+    if r.state != ResponderState::WaitDhKeyCheck {
+        return TestResult::Fail("state did not advance to WaitDhKeyCheck");
+    }
+
+    // 5) Peer DHKey Check (Ea per §2.2.8 table 2.2, IOcapA =
+    // [AuthReq, OOB, IO cap] of the Pairing Request). The answer
+    // is the responder's Eb.
+    let ea = smp::dhkey_check_value(
+        &E2eCrypto,
+        &r.mac_key,
+        &smp::DhKeyCheckInputs {
+            n1: &na,
+            n2: &r.nb,
+            r: &[0u8; 16],
+            iocap: &[
+                AUTH_BONDING | AUTH_SC,
+                0,
+                IoCapability::NoInputNoOutput as u8,
+            ],
+            a1: &[0u8; 7],
+            a2: &[0u8; 7],
+        },
+    );
+    let out = match r.feed(&Pdu {
+        code: SMP_PAIRING_DHKEY_CHECK,
+        payload: ea.to_vec(),
+    }) {
+        Ok(v) => v,
+        _ => return TestResult::Fail("responder rejected DHKey check"),
+    };
+    if out.len() != 1 || out[0].code != SMP_PAIRING_DHKEY_CHECK || out[0].payload.len() != 16 {
         return TestResult::Fail("DHKey check shape wrong");
     }
     if r.state != ResponderState::Done {

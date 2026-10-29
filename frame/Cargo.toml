@@ -49,6 +49,9 @@ narf-drivers-platform = { path = "../drivers/platform" }
 # probes as initcalls, so it has to be linked for any hwmon device
 # to probe or publish at all.
 narf-drivers-hwmon    = { path = "../drivers/hwmon" }
+# Watchdog class + iTCO driver: the crate registers its probe as
+# an initcall, so it has to be linked for any watchdog to probe.
+narf-drivers-watchdog = { path = "../drivers/watchdog" }
 # The PCH SPI flash controller and the class-matched PCI serial ports
 # live here. Both register Stage::Subsys PCI drivers, so the crates
 # have to be linked for those probes to exist at all.
@@ -305,6 +308,7 @@ kernel-test  = [
     "narf-pwm/kernel-test",
     "narf-drivers-leds/kernel-test",
     "narf-drivers-backlight/kernel-test",
+    "narf-drivers-watchdog/kernel-test",
     "narf-drivers-fs-btrfs/kernel-test",
     "narf-pmbus/kernel-test",
     "narf-spdm/kernel-test",

@@ -551,7 +551,9 @@ pub fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
 }
 
 /// Class-registry unbind hook: drop the binding for `slot_id`.
-pub fn unbind(slot_id: u8) {
+/// Infallible: the detach path cannot fail, so it reports `Ok(())`
+/// unconditionally, matching the UsbUnbindFn contract.
+pub fn unbind(slot_id: u8) -> Result<(), ()> {
     let rec = {
         let mut g = USB_MBIM_DEVICES.lock();
         let pos = g.iter().position(|d| d.slot_id == slot_id);
@@ -562,6 +564,7 @@ pub fn unbind(slot_id: u8) {
     }
     let mut claimed = MBIM_CLAIMED_SLOTS.lock();
     claimed.retain(|s| *s != slot_id);
+    Ok(())
 }
 
 /// Derive the locally administered MAC for a modem's netdevs. MBIM

@@ -149,6 +149,9 @@ impl<T: PacketTransport> Runtime<T> {
             // The SDIO IRQ thread re-enables the card interrupt after its
             // function handlers ran; a still-asserted line fires again.
             self.transport.interrupt_serviced();
+            if result == Ok(0) {
+                self.transport.idle();
+            }
         }
         result
     }

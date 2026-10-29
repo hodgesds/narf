@@ -20,6 +20,10 @@ struct Host {
     claimed: Option<u8>,
     notify: Option<alloc::sync::Arc<dyn Fn() + Send + Sync>>,
     rearmed: u32,
+    /// CMD52 register model for save-restore sleep (SLEEPCSR mirrors DEVON
+    /// from KSO; CHIPCLKCSR reports HT/ALP available).
+    sleep_model: bool,
+    regs: BTreeMap<(u8, u32), u8>,
 }
 impl SdioFunction for Host {
     fn enable_card_interrupt(
@@ -39,10 +43,26 @@ impl SdioFunction for Host {
     }
     fn cmd52_read(&mut self, f: u8, a: u32) -> Result<u8, SdioError> {
         self.ops.push((52, f, a, 0));
-        Ok(0)
+        if !self.sleep_model {
+            return Ok(0);
+        }
+        let value = self.regs.get(&(f, a)).copied().unwrap_or(0);
+        Ok(if (f, a) == (1, 0x1000e) {
+            value | 0xc0
+        } else {
+            value
+        })
     }
     fn cmd52_write(&mut self, f: u8, a: u32, v: u8) -> Result<(), SdioError> {
         self.ops.push((52, f, a, 1));
+        if self.sleep_model {
+            let stored = if (f, a) == (1, 0x1001f) {
+                v | ((v & 1) << 1)
+            } else {
+                v
+            };
+            self.regs.insert((f, a), stored);
+        }
         let shift = match a {
             0x1000a => Some(8),
             0x1000b => Some(16),
@@ -289,4 +309,102 @@ fn smoke_cyw_sdio_claims_f1_f2_interrupts_and_rearms_after_service() -> TestResu
 kernel_test_in!(
     "drivers/wireless/cyw43439/sdio_bridge",
     smoke_cyw_sdio_claims_f1_f2_interrupts_and_rearms_after_service
+);
+
+fn sleep_host(sr_control1: u32) -> Host {
+    let mut host = Host {
+        line: true,
+        sleep_model: true,
+        ..Host::default()
+    };
+    host.words.insert(0x1800_0604, 0x14); // PMU rev 20
+    host.words.insert(0x1800_0508, sr_control1);
+    host
+}
+fn spin_ms(ms: u64) {
+    narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ms(ms));
+}
+fn smoke_cyw_sdio_save_restore_idle_sleep_matches_linux() -> TestResult {
+    // Not SR-capable (sr_control1 0), KSO-less core, or no card interrupt.
+    let mut plain = SdioTransport::new(sleep_host(0));
+    if plain.prepare().is_err()
+        || plain.initialize_packets(CORE).is_err()
+        || plain.initialize_sleep(13) != Ok(false)
+    {
+        return TestResult::Fail("non-SR chip enabled idle sleep");
+    }
+    let mut old = SdioTransport::new(sleep_host(1));
+    if old.prepare().is_err()
+        || old.initialize_packets(CORE).is_err()
+        || old.initialize_sleep(11) != Ok(false)
+    {
+        return TestResult::Fail("pre-KSO SDIO core enabled idle sleep");
+    }
+    let mut polled = SdioTransport::new(Host {
+        line: false,
+        ..sleep_host(1)
+    });
+    if polled.prepare().is_err()
+        || polled.initialize_packets(CORE).is_err()
+        || polled.initialize_sleep(13) != Ok(false)
+    {
+        return TestResult::Fail("polled bus enabled idle sleep");
+    }
+    // brcmf_sdio_kso_init + brcmf_sdio_sr_init.
+    let mut transport = SdioTransport::new(sleep_host(1));
+    if transport.prepare().is_err()
+        || transport.initialize_packets(CORE).is_err()
+        || transport.initialize_sleep(13) != Ok(true)
+    {
+        return TestResult::Fail("SR-capable chip did not enable idle sleep");
+    }
+    let reg =
+        |t: &SdioTransport<Host>, f: u8, a: u32| t.func.regs.get(&(f, a)).copied().unwrap_or(0);
+    if reg(&transport, 1, 0x1001f) & 1 == 0
+        || reg(&transport, 1, 0x1001e) & 2 == 0
+        || reg(&transport, 0, 0xf0) != 6
+        || reg(&transport, 1, 0x1000e) != 2
+    {
+        return TestResult::Fail("KSO/WAKEUPCTRL/CMD14/FORCE_HT setup differs from Linux");
+    }
+    // Not yet idle for BRCMF_WD_POLL x 2.
+    transport.idle();
+    if transport.asleep() {
+        return TestResult::Fail("dongle slept before the idle timeout");
+    }
+    spin_ms(25);
+    transport.idle();
+    if !transport.asleep() || reg(&transport, 1, 0x1001f) & 1 != 0 {
+        return TestResult::Fail("idle bus did not clear KSO");
+    }
+    // A backstop poll without a card interrupt must not wake the dongle.
+    let mut bytes = vec![0; super::super::runtime::MAX_PACKET];
+    let before = transport.func.ops.len();
+    if transport.receive_packet(&mut bytes) != Ok(0)
+        || !transport.asleep()
+        || transport.func.ops.len() != before
+    {
+        return TestResult::Fail("backstop poll woke a sleeping dongle");
+    }
+    // A card interrupt wakes it (KSO + DEVON, HT available).
+    (transport.func.notify.as_ref().unwrap())();
+    if transport.receive_packet(&mut bytes) != Ok(0)
+        || transport.asleep()
+        || reg(&transport, 1, 0x1001f) & 3 != 3
+    {
+        return TestResult::Fail("card interrupt did not wake the dongle");
+    }
+    // Transmit always wakes.
+    spin_ms(25);
+    transport.idle();
+    let mut frame = vec![0; 64];
+    frame[..4].copy_from_slice(&[64, 0, !64u8, 0xff]);
+    if !transport.asleep() || transport.transmit_packet(&frame).is_err() || transport.asleep() {
+        return TestResult::Fail("transmit did not wake the dongle");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/sdio_bridge",
+    smoke_cyw_sdio_save_restore_idle_sleep_matches_linux
 );

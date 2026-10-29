@@ -263,12 +263,12 @@ pub trait BotTransport {
     /// idle-suspended it (#840). Production delegates to
     /// `attach::resume_port`; fixtures have no hub topology and
     /// take the no-op default.
-    fn resume_hub_port(&self, _hub_port: Option<(usize, u8)>) -> impl Future<Output = ()> {
+    fn resume_hub_port(&self, _hub_port: Option<(u8, u8)>) -> impl Future<Output = ()> {
         async {}
     }
     /// Feed the hub idle-suspend activity timer after a completed
     /// transfer (#840). No-op by default, as above.
-    fn note_hub_activity(&self, _hub_port: Option<(usize, u8)>) {}
+    fn note_hub_activity(&self, _hub_port: Option<(u8, u8)>) {}
 }
 
 impl BotTransport for Xhci {
@@ -324,15 +324,15 @@ impl BotTransport for Xhci {
             .map_err(MscError::Xhci)
     }
 
-    async fn resume_hub_port(&self, hub_port: Option<(usize, u8)>) {
-        if let Some((hub_idx, port)) = hub_port {
-            crate::attach::resume_port(self, hub_idx, port).await;
+    async fn resume_hub_port(&self, hub_port: Option<(u8, u8)>) {
+        if let Some((hub_slot, port)) = hub_port {
+            crate::attach::resume_port(self, hub_slot, port).await;
         }
     }
 
-    fn note_hub_activity(&self, hub_port: Option<(usize, u8)>) {
-        if let Some((hub_idx, port)) = hub_port {
-            crate::attach::mark_port_activity(hub_idx, port);
+    fn note_hub_activity(&self, hub_port: Option<(u8, u8)>) {
+        if let Some((hub_slot, port)) = hub_port {
+            crate::attach::mark_port_activity(hub_slot, port);
         }
     }
 }
@@ -380,7 +380,9 @@ pub struct MscDevice {
     /// Sequence counter for `dCBWTag` (matched by the device in CSW).
     tag: IrqSafeSpinLock<u32>,
     /// Hub context when this device sits behind a USB hub:
-    /// (index into `crate::attach::HUBS`, downstream port).
+    /// (parent hub slot id, downstream port). Slot id, not
+    /// [`HUBS`] index: hub detach shifts every later index,
+    /// so a cached index can name the wrong hub (#892).
     /// `None` for root-hub-attached devices (root ports are never
     /// idle-suspended) and for the legacy root enumerate path.
     /// The BOT funnels resume the port before a transfer and feed
@@ -388,7 +390,7 @@ pub struct MscDevice {
     /// is `Some` — without it a hub-attached device wedges ~30 s
     /// after bind: the supervisor idle-suspends its port and
     /// nothing ever resumes it (#840).
-    pub hub_port: Option<(usize, u8)>,
+    pub hub_port: Option<(u8, u8)>,
 }
 
 /// Walk a Configuration Descriptor (§9.6.3) tree looking for the
@@ -1305,15 +1307,15 @@ fn insert_device(mut dev: MscDevice) -> usize {
 /// and `cfg` is the full GET_DESCRIPTOR(CONFIG) blob (so we don't
 /// re-issue the control transfer).
 ///
-/// `hub_port` is the device's hub context — (index into
-/// `crate::attach::HUBS`, downstream port) — when it sits behind
+/// `hub_port` is the device's hub context — (parent hub slot
+/// id, downstream port) — when it sits behind
 /// a hub, `None` on a root port. Recorded on the device so its
 /// BOT transfers can resume / feed its port (#840).
 pub async fn try_bind_msc_already_addressed(
     xhci_dev: &Xhci,
     slot_id: u8,
     cfg: &[u8],
-    hub_port: Option<(usize, u8)>,
+    hub_port: Option<(u8, u8)>,
 ) -> Result<usize, MscError> {
     let (ep_in, ep_out, interface) = find_bot_endpoints(cfg)?;
     // SET_CONFIGURATION before any class-specific request (USB 2.0
@@ -1512,12 +1514,20 @@ fn msc_registry_probe(
 
 /// Register MSC's unbind hook with the class registry. Called from
 /// the crate's Stage::Subsys initcalls (`lib.rs`).
+/// [`detach_msc`] is infallible bookkeeping (tombstone +
+/// unregister), so the hook adapts it to the fallible
+/// [`UsbUnbindFn`] contract with an unconditional `Ok(())`
+/// (#893: a hook reports failure with `Err(())`, never by
+/// panicking).
 pub fn register_initcalls() {
     let _ = crate::class_registry::register_class_driver_with_unbind(
         "usb-msc",
         &MSC_CLASS_MATCH,
         msc_registry_probe,
-        detach_msc,
+        |slot| {
+            detach_msc(slot);
+            Ok(())
+        },
     );
 }
 

@@ -292,7 +292,7 @@ pub struct AcmDevice {
     /// behind, when bound through a hub — the wake target for
     /// runtime hub-port resume (#763, mirroring #840 for HID).
     /// `None` for root-hub devices.
-    pub hub_port: Option<(usize, u8)>,
+    pub hub_port: Option<(u8, u8)>,
 }
 
 /// Global registry of bound CDC-ACM devices. Populated by
@@ -541,7 +541,7 @@ pub async fn try_bind_cdc_acm_already_addressed(
     slot_id: u8,
     cfg: &[u8],
     speed: PortSpeed,
-    hub_port: Option<(usize, u8)>,
+    hub_port: Option<(u8, u8)>,
 ) -> Result<(), CdcError> {
     let _ = speed; // reserved for future MaxPacketSize-aware setup
     let (comm_iface, data_iface, bulk_in, bulk_out) =
@@ -771,8 +771,8 @@ pub fn register_pm() {
 
 /// (hub index, port) pairs with a live ACM binding — the
 /// pure-filter input for the supervisor's hub-port wake step.
-pub fn hub_ports() -> Vec<(usize, u8)> {
-    let mut v: Vec<(usize, u8)> = {
+pub fn hub_ports() -> Vec<(u8, u8)> {
+    let mut v: Vec<(u8, u8)> = {
         let g = ACM_DEVICES.lock();
         g.iter().filter_map(|d| d.hub_port).collect()
     };
@@ -797,10 +797,10 @@ pub async fn resume_suspended_hub_ports(xhci_dev: &Xhci) {
         let g = crate::attach::HUBS.lock();
         crate::attach::suspended_ports_among(&g[..], &ports)
     };
-    for (hub_idx, port) in targets {
-        crate::attach::resume_port(xhci_dev, hub_idx, port).await;
-        if !crate::attach::hub_port_is_suspended(hub_idx, port) {
-            crate::attach::mark_port_activity(hub_idx, port);
+    for (hub_slot, port) in targets {
+        crate::attach::resume_port(xhci_dev, hub_slot, port).await;
+        if !crate::attach::hub_port_is_suspended(hub_slot, port) {
+            crate::attach::mark_port_activity(hub_slot, port);
         }
     }
 }

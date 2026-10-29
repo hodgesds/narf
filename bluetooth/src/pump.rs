@@ -593,11 +593,11 @@ impl PumpCore {
         }
         let responder = self.connections[conn_idx].smp.as_mut().unwrap();
         match responder.feed(pdu) {
-            Ok(out) => {
+            Ok(outs) => {
                 if responder.state == smp::ResponderState::Done {
                     self.connections[conn_idx].ltk = Some(responder.ltk);
                 }
-                if let Some(out) = out {
+                for out in outs {
                     self.queue_frame(handle, le, &BFrame::new(CID_SMP, out.encode()));
                 }
             }
@@ -606,10 +606,12 @@ impl PumpCore {
             }
             Err(err) => {
                 // SMP failure reasons (Vol 3 Part H §3.5.5):
-                // 0x04 Confirm Value Failed, 0x08 Unspecified.
+                // 0x04 Confirm Value Failed, 0x0B DHKey Check
+                // Failed, 0x08 Unspecified otherwise.
                 let reason = match err {
-                    PairingError::BadConfirm => 0x04,
-                    _ => 0x08,
+                    PairingError::BadConfirm => smp::SMP_FAILED_CONFIRM_VALUE,
+                    PairingError::BadDhKeyCheck => smp::SMP_FAILED_DHKEY_CHECK_FAILED,
+                    _ => smp::SMP_FAILED_UNSPECIFIED,
                 };
                 self.connections[conn_idx].smp = None;
                 let failed = smp::Pdu {
@@ -1315,8 +1317,8 @@ mod tests {
     // model, which re-implements — from the public specifications
     // only — everything a real peer performs: P-256 field/curve
     // arithmetic (FIPS 186-4 / SEC 2), AES-128 (FIPS 197), AES-CMAC
-    // (RFC 4493), and the SMP f5 / g2 derivations (Core 5.3 Vol 3
-    // Part H §2.2), all in SMP wire (little-endian) order.
+    // (RFC 4493), and the SMP f4 / f5 / f6 / g2 derivations (Core
+    // 5.3 Vol 3 Part H §2.2), all in SMP wire (little-endian) order.
     //
     // INDEPENDENCE: the model shares no code with narf-crypto, with
     // the `NarfSmpCrypto` adapter, or with the SMP state machine —
@@ -1330,15 +1332,20 @@ mod tests {
     // distinct message, so a model bug cannot masquerade as a
     // production failure.
     //
-    // SCOPE NOTE: this state machine's Just-Works flow has no
-    // Pairing Confirm PDU (smp.rs: Just Works skips the confirm
-    // exchange) and its DHKey Check PDU carries the zero value by
-    // design — no f4/f6 value ever crosses the wire. The byte-exact
-    // crypto assertions therefore target the values that actually
-    // carry the cryptography: the ECDH DHKey, the f5-derived LTK,
-    // and the g2 numeric-comparison value (computed by the
-    // responder when Numeric Comparison is negotiated). The DHKey
-    // Check PDU's exact wire bytes are pinned as emitted.
+    // NOTE: the Just-Works flow runs the full §2.3.5.6 sequence —
+    // Pairing Confirm values (f4, §2.2.6) are committed in stage 1
+    // and verified when the nonces are revealed, and the DHKey
+    // Check values (f6, §2.2.8) are computed from the f5 MacKey
+    // and verified in stage 2 before the exchange completes. A
+    // mismatch aborts with BadConfirm / BadDhKeyCheck (Pairing
+    // Failed 0x04 / 0x0B on the wire — see route_smp). The
+    // byte-exact assertions therefore cover the ECDH DHKey, the
+    // f5 MacKey + LTK, the responder's confirm Cb, its DHKey
+    // check Eb, and the g2 numeric-comparison value; the f4/f5/f6
+    // helpers are additionally pinned against the published
+    // Appendix D sample data (smoke_pump_smp_spec_appendix_vectors),
+    // and the tampered-value fixtures prove the verifications
+    // actually reject.
 
     /// Field element mod the P-256 prime, little-endian limbs.
     type Fe = [u64; 4];
@@ -1795,12 +1802,26 @@ mod tests {
         aes128_encrypt(sbox, key, &x)
     }
 
-    /// f5 (Core 5.3 Vol 3 Part H §2.2.7): the LTK half, keyed on
-    /// the DHKey in SMP wire order, exactly as the machine derives
-    /// it — but computed with the fixture CMAC.
-    fn peer_f5_ltk(
+    /// f4 (Core 5.3 Vol 3 Part H §2.2.6): AES-CMAC keyed on the
+    /// nonce `x` over `u ‖ v ‖ z`, computed with the fixture
+    /// CMAC. The caller supplies u/v in the table 2.1 orientation
+    /// for the side being modelled (each side's own key first).
+    fn peer_f4(sbox: &[u8; 256], u: &[u8; 32], v: &[u8; 32], x: &[u8; 16], z: u8) -> [u8; 16] {
+        let mut msg = [0u8; 65];
+        msg[0..32].copy_from_slice(u);
+        msg[32..64].copy_from_slice(v);
+        msg[64] = z;
+        peer_cmac(sbox, x, &msg)
+    }
+
+    /// f5 (Core 5.3 Vol 3 Part H §2.2.7) at one counter value:
+    /// counter 0 yields the MacKey, counter 1 the LTK. Keyed on
+    /// the DHKey in SMP wire order, exactly as the machine
+    /// derives it — but computed with the fixture CMAC.
+    fn peer_f5_half(
         sbox: &[u8; 256],
         dhkey_wire: &[u8; 32],
+        counter: u8,
         na: &[u8; 16],
         nb: &[u8; 16],
         a1: &[u8; 7],
@@ -1812,7 +1833,7 @@ mod tests {
         ];
         let t = peer_cmac(sbox, &SALT, dhkey_wire);
         let mut buf = [0u8; 53];
-        buf[0] = 0x01; // counter 1 → LTK (counter 0 is the MacKey)
+        buf[0] = counter;
         buf[1..5].copy_from_slice(b"btle");
         buf[5..21].copy_from_slice(na);
         buf[21..37].copy_from_slice(nb);
@@ -1823,7 +1844,73 @@ mod tests {
         peer_cmac(sbox, &t, &buf)
     }
 
-    /// g2 (Core 5.3 Vol 3 Part H §2.2.8), mirroring the formula the
+    /// f5 MacKey half (counter 0).
+    fn peer_f5_mac_key(
+        sbox: &[u8; 256],
+        dhkey_wire: &[u8; 32],
+        na: &[u8; 16],
+        nb: &[u8; 16],
+        a1: &[u8; 7],
+        a2: &[u8; 7],
+    ) -> [u8; 16] {
+        peer_f5_half(sbox, dhkey_wire, 0, na, nb, a1, a2)
+    }
+
+    /// f5 LTK half (counter 1).
+    fn peer_f5_ltk(
+        sbox: &[u8; 256],
+        dhkey_wire: &[u8; 32],
+        na: &[u8; 16],
+        nb: &[u8; 16],
+        a1: &[u8; 7],
+        a2: &[u8; 7],
+    ) -> [u8; 16] {
+        peer_f5_half(sbox, dhkey_wire, 1, na, nb, a1, a2)
+    }
+
+    /// The §2.2.8 f6 message block, in formula order — the
+    /// peer-model mirror of production's DhKeyCheckInputs.
+    /// Deliberately a separate type, not the production struct:
+    /// the peer model shares no code with the SMP state machine,
+    /// so a production-side field change cannot silently move
+    /// the model's message layout. The caller picks the table
+    /// 2.2 orientation by which values it places in `n1`/`n2`
+    /// and `a1`/`a2`.
+    #[derive(Debug)]
+    struct F6Inputs<'a> {
+        /// First nonce (Na for Ea, Nb for Eb).
+        n1: &'a [u8; 16],
+        /// Second nonce (Nb for Ea, Na for Eb).
+        n2: &'a [u8; 16],
+        /// The 128-bit random (zero for Just Works / Numeric
+        /// Comparison).
+        r: &'a [u8; 16],
+        /// IO capabilities.
+        iocap: &'a [u8; 3],
+        /// First address (A for Ea, B for Eb): type byte + BD_ADDR.
+        a1: &'a [u8; 7],
+        /// Second address (B for Ea, A for Eb).
+        a2: &'a [u8; 7],
+    }
+
+    /// f6 (Core 5.3 Vol 3 Part H §2.2.8): AES-CMAC keyed on the
+    /// MacKey over `n1 ‖ n2 ‖ r ‖ iocap ‖ a1 ‖ a2`, computed with
+    /// the fixture CMAC. `inputs` carries the message block in
+    /// formula order; the caller supplies the table 2.2
+    /// orientation for the side being modelled — the responder's
+    /// check swaps both the nonce order and the address order.
+    fn peer_f6(sbox: &[u8; 256], mac_key: &[u8; 16], inputs: &F6Inputs<'_>) -> [u8; 16] {
+        let mut msg = [0u8; 65];
+        msg[0..16].copy_from_slice(inputs.n1);
+        msg[16..32].copy_from_slice(inputs.n2);
+        msg[32..48].copy_from_slice(inputs.r);
+        msg[48..51].copy_from_slice(inputs.iocap);
+        msg[51..58].copy_from_slice(inputs.a1);
+        msg[58..65].copy_from_slice(inputs.a2);
+        peer_cmac(sbox, mac_key, &msg)
+    }
+
+    /// g2 (Core 5.3 Vol 3 Part H §2.2.9), mirroring the formula the
     /// state machine's `numeric_comparison_value` documents, with
     /// the fixture CMAC.
     fn peer_g2(
@@ -1916,28 +2003,35 @@ mod tests {
         0xAF,
     ];
 
-    /// What one driven exchange produced: the responder (LTK and
-    /// DHKey already asserted against the peer model inside
-    /// `run_production_exchange`), the two public-key X coordinates
-    /// as they crossed the wire, and the responder's nonce.
+    /// What one driven exchange produced: the responder (DHKey,
+    /// MacKey and LTK already asserted against the peer model
+    /// inside `run_production_exchange`), the two public-key X
+    /// coordinates as they crossed the wire, the responder's
+    /// nonce, and the peer-model MacKey (for the stage-2 f6
+    /// values the fixtures compute).
     struct ExchangeOutcome {
         responder: Responder<NarfSmpCrypto>,
         peer_pk_x: [u8; 32],
         resp_pk_x: [u8; 32],
         nb: [u8; 16],
+        mac_key: [u8; 16],
     }
 
-    /// Drive one full exchange against `Responder<NarfSmpCrypto>`
-    /// (the production construction `route_smp` uses) with the
-    /// deterministic entropy stream installed. Returns the
-    /// responder plus its emitted public-key wire bytes so each
-    /// fixture asserts the phase it owns.
-    fn run_production_exchange(
-        sbox: &[u8; 256],
+    /// (responder, initiator wire X, responder wire X): the
+    /// drive_to_public_key outcome, aliased so the return type
+    /// stays under clippy's type-complexity threshold.
+    type PublicKeyOutcome = (Responder<NarfSmpCrypto>, [u8; 32], [u8; 32]);
+
+    /// Drive the production responder through the feature
+    /// exchange and the public-key exchange, asserting the ECDH
+    /// DHKey against the peer model. Returns the responder in
+    /// SentPublicKey plus the two wire public-key X coordinates.
+    /// Negative fixtures take the exchange off-script from here.
+    fn drive_to_public_key(
         initiator_io: u8,
         initiator_auth: u8,
         peer_priv: &Fe,
-    ) -> Result<ExchangeOutcome, &'static str> {
+    ) -> Result<PublicKeyOutcome, &'static str> {
         let mut r = Responder::new(NarfSmpCrypto, SMP_IAT, SMP_RAT);
         let req = smp::PairingFeatureExchange {
             io_capability: initiator_io,
@@ -1948,11 +2042,13 @@ mod tests {
             responder_key_distribution: 0,
         }
         .encode(smp::SMP_PAIRING_REQUEST);
-        let rsp = r
+        let out = r
             .feed(&req)
-            .map_err(|_| "responder rejected the pairing request")?
-            .ok_or("responder emitted no pairing response")?;
-        if rsp.code != smp::SMP_PAIRING_RESPONSE || rsp.payload != [0x01, 0x00, 0x0D, 16, 0, 0] {
+            .map_err(|_| "responder rejected the pairing request")?;
+        if out.len() != 1
+            || out[0].code != smp::SMP_PAIRING_RESPONSE
+            || out[0].payload != [0x01, 0x00, 0x0D, 16, 0, 0]
+        {
             return Err("pairing response payload is not the responder feature set");
         }
         // Public Key exchange: the peer's key comes from the
@@ -1963,16 +2059,19 @@ mod tests {
         let mut pk_payload = Vec::with_capacity(64);
         pk_payload.extend_from_slice(&peer_pk_x_wire);
         pk_payload.extend_from_slice(&fe_to_wire(&ppy));
-        let our_pk = r
+        let out = r
             .feed(&smp::Pdu {
                 code: smp::SMP_PAIRING_PUBLIC_KEY,
                 payload: pk_payload,
             })
-            .map_err(|_| "responder rejected the peer public key")?
-            .ok_or("responder emitted no public key")?;
-        if our_pk.code != smp::SMP_PAIRING_PUBLIC_KEY || our_pk.payload.len() != 64 {
+            .map_err(|_| "responder rejected the peer public key")?;
+        if out.len() != 1
+            || out[0].code != smp::SMP_PAIRING_PUBLIC_KEY
+            || out[0].payload.len() != 64
+        {
             return Err("responder public key PDU shape wrong");
         }
+        let our_pk = &out[0];
         let mut resp_pk_x = [0u8; 32];
         let mut resp_pk_y = [0u8; 32];
         resp_pk_x.copy_from_slice(&our_pk.payload[0..32]);
@@ -1993,24 +2092,75 @@ mod tests {
         if r.state != smp::ResponderState::SentPublicKey {
             return Err("responder did not advance to SentPublicKey");
         }
-        // Pairing Random: Na in, Nb out; LTK is derived here.
-        let nb_pdu = r
+        Ok((r, peer_pk_x_wire, resp_pk_x))
+    }
+
+    /// Drive one full exchange against `Responder<NarfSmpCrypto>`
+    /// (the production construction `route_smp` uses) with the
+    /// deterministic entropy stream installed: feature exchange,
+    /// public keys, the f4 confirm commitment (Cb pinned
+    /// byte-for-byte), and the nonce reveal that verifies Ca and
+    /// derives MacKey + LTK. Returns the responder in
+    /// WaitDhKeyCheck plus the wire values each fixture asserts
+    /// its own phase against.
+    fn run_production_exchange(
+        sbox: &[u8; 256],
+        initiator_io: u8,
+        initiator_auth: u8,
+        peer_priv: &Fe,
+    ) -> Result<ExchangeOutcome, &'static str> {
+        let (mut r, peer_pk_x_wire, resp_pk_x) =
+            drive_to_public_key(initiator_io, initiator_auth, peer_priv)?;
+        // Authentication stage 1 (§2.3.5.6.2): the peer commits
+        // Ca = f4(PKax, PKbx, Na, 0) (§2.2.6 table 2.1 — the
+        // committing side's own key first). The responder answers
+        // with its own commitment Cb plus Nb. Cb is pinned
+        // byte-for-byte against the model — note the table 2.1
+        // orientation: Cb takes the responder's key first.
+        let ca = peer_f4(sbox, &peer_pk_x_wire, &resp_pk_x, &SMP_NA, 0);
+        let out = r
             .feed(&smp::Pdu {
-                code: smp::SMP_PAIRING_RANDOM,
-                payload: SMP_NA.to_vec(),
+                code: smp::SMP_PAIRING_CONFIRM,
+                payload: ca.to_vec(),
             })
-            .map_err(|_| "responder rejected the pairing random")?
-            .ok_or("responder emitted no pairing random")?;
-        if nb_pdu.code != smp::SMP_PAIRING_RANDOM || nb_pdu.payload.len() != 16 {
-            return Err("pairing random PDU shape wrong");
+            .map_err(|_| "responder rejected the pairing confirm")?;
+        if out.len() != 2
+            || out[0].code != smp::SMP_PAIRING_CONFIRM
+            || out[1].code != smp::SMP_PAIRING_RANDOM
+            || out[1].payload.len() != 16
+        {
+            return Err("responder did not answer Confirm with [Confirm, Random]");
         }
         let mut nb = [0u8; 16];
-        nb.copy_from_slice(&nb_pdu.payload);
+        nb.copy_from_slice(&out[1].payload);
         if nb != r.nb {
             return Err("pairing random PDU does not carry the responder nonce");
         }
         if nb == [0u8; 16] {
             return Err("responder nonce is zero (entropy seam not live)");
+        }
+        let want_cb = peer_f4(sbox, &resp_pk_x, &peer_pk_x_wire, &nb, 0);
+        if out[0].payload != want_cb {
+            return Err("Cb mismatch: production f4 disagrees with the independent peer");
+        }
+        if r.state != smp::ResponderState::SentRandom {
+            return Err("responder did not advance to SentRandom");
+        }
+        // Pairing Random: Na is revealed; the responder verifies
+        // Ca against it and derives MacKey + LTK via f5.
+        let out = r
+            .feed(&smp::Pdu {
+                code: smp::SMP_PAIRING_RANDOM,
+                payload: SMP_NA.to_vec(),
+            })
+            .map_err(|_| "responder rejected the pairing random")?;
+        if !out.is_empty() {
+            return Err("responder emitted a PDU on the Na step");
+        }
+        let peer_dh = r.dh_key;
+        let mac_key = peer_f5_mac_key(sbox, &peer_dh, &SMP_NA, &nb, &SMP_IAT, &SMP_RAT);
+        if r.mac_key != mac_key {
+            return Err("MacKey mismatch: production f5 disagrees with the independent peer");
         }
         let want_ltk = peer_f5_ltk(sbox, &peer_dh, &SMP_NA, &nb, &SMP_IAT, &SMP_RAT);
         if r.ltk != want_ltk {
@@ -2019,11 +2169,15 @@ mod tests {
         if r.ltk == [0u8; 16] {
             return Err("derived LTK is zero");
         }
+        if r.state != smp::ResponderState::WaitDhKeyCheck {
+            return Err("responder did not advance to WaitDhKeyCheck");
+        }
         Ok(ExchangeOutcome {
             responder: r,
             peer_pk_x: peer_pk_x_wire,
             resp_pk_x,
             nb,
+            mac_key,
         })
     }
 
@@ -2044,22 +2198,62 @@ mod tests {
             &[0x5A5A_5A5A_5A5A_5A5A; 4],
         )
         .and_then(|mut out| {
+            let mac_key = out.mac_key;
+            let nb = out.nb;
             let r = &mut out.responder;
             if r.method != smp::PairingMethod::JustWorks {
                 return Err("negotiated method is not Just Works");
             }
-            // DHKey Check: this machine's Just-Works check value is
-            // the zero placeholder (see the model note above); pin
-            // its exact wire bytes and the terminal state.
+            // Authentication stage 2 (§2.3.5.6.5): the peer's
+            // DHKey Check Ea = f6(MacKey, Na, Nb, 0, IOcapA, A, B)
+            // (§2.2.8 table 2.2), with IOcapA in §2.2.8 octet
+            // order [AuthReq, OOB, IO capability] taken from this
+            // fixture's Pairing Request.
+            let iocap_a: [u8; 3] = [
+                smp::AUTH_BONDING | smp::AUTH_SC,
+                0,
+                smp::IoCapability::NoInputNoOutput as u8,
+            ];
+            let ea = peer_f6(
+                &sbox,
+                &mac_key,
+                &F6Inputs {
+                    n1: &SMP_NA,
+                    n2: &nb,
+                    r: &[0u8; 16],
+                    iocap: &iocap_a,
+                    a1: &SMP_IAT,
+                    a2: &SMP_RAT,
+                },
+            );
             let check = r
                 .feed(&smp::Pdu {
                     code: smp::SMP_PAIRING_DHKEY_CHECK,
-                    payload: alloc::vec![0x99; 16],
+                    payload: ea.to_vec(),
                 })
-                .map_err(|_| "responder rejected the DHKey check")?
-                .ok_or("responder emitted no DHKey check")?;
-            if check.code != smp::SMP_PAIRING_DHKEY_CHECK || check.payload != [0u8; 16] {
-                return Err("DHKey check PDU is not the machine's zero check value");
+                .map_err(|_| "responder rejected the DHKey check")?;
+            if check.len() != 1 || check[0].code != smp::SMP_PAIRING_DHKEY_CHECK {
+                return Err("responder did not answer with its DHKey check");
+            }
+            // Eb pinned byte-for-byte: the table 2.2 responder
+            // form swaps the nonce order and the address order
+            // and uses IOcapB (the responder's own feature set:
+            // AuthReq 0x0D, OOB 0, DisplayYesNo).
+            let iocap_b: [u8; 3] = [0x0D, 0, smp::IoCapability::DisplayYesNo as u8];
+            let want_eb = peer_f6(
+                &sbox,
+                &mac_key,
+                &F6Inputs {
+                    n1: &nb,
+                    n2: &SMP_NA,
+                    r: &[0u8; 16],
+                    iocap: &iocap_b,
+                    a1: &SMP_RAT,
+                    a2: &SMP_IAT,
+                },
+            );
+            if check[0].payload != want_eb {
+                return Err("Eb mismatch: production f6 disagrees with the independent peer");
             }
             if r.state != smp::ResponderState::Done {
                 return Err("responder did not reach Done");
@@ -2075,6 +2269,278 @@ mod tests {
     kernel_test_in!(
         "bluetooth/pump",
         smoke_pump_smp_production_crypto_full_exchange
+    );
+
+    /// Published sample data (Core 5.4 Vol 3 Part H Appendix D):
+    /// the production f4/f5/f6 helpers and the independent peer
+    /// model must both reproduce D.2 / D.3 / D.4 byte-for-byte.
+    /// This pins the helpers against the specification itself,
+    /// not merely against each other — including the f6 IOcap
+    /// octet order (D.4's IOcap is 01 01 02 = AuthReq ‖ OOB ‖ IO
+    /// capability, §2.2.8).
+    fn smoke_pump_smp_spec_appendix_vectors() -> TestResult {
+        reset_all();
+        let sbox = build_sbox();
+        if let Err(m) = peer_model_self_check(&sbox) {
+            return TestResult::Fail(m);
+        }
+        // D.2 — f4(U, V, X, Z = 0).
+        let u: [u8; 32] = [
+            0x20, 0xB0, 0x03, 0xD2, 0xF2, 0x97, 0xBE, 0x2C, 0x5E, 0x2C, 0x83, 0xA7, 0xE9, 0xF9,
+            0xA5, 0xB9, 0xEF, 0xF4, 0x91, 0x11, 0xAC, 0xF4, 0xFD, 0xDB, 0xCC, 0x03, 0x01, 0x48,
+            0x0E, 0x35, 0x9D, 0xE6,
+        ];
+        let v: [u8; 32] = [
+            0x55, 0x18, 0x8B, 0x3D, 0x32, 0xF6, 0xBB, 0x9A, 0x90, 0x0A, 0xFC, 0xFB, 0xEE, 0xD4,
+            0xE7, 0x2A, 0x59, 0xCB, 0x9A, 0xC2, 0xF1, 0x9D, 0x7C, 0xFB, 0x6B, 0x4F, 0xDD, 0x49,
+            0xF4, 0x7F, 0xC5, 0xFD,
+        ];
+        let n1: [u8; 16] = [
+            0xD5, 0xCB, 0x84, 0x54, 0xD1, 0x77, 0x73, 0x3E, 0xFF, 0xFF, 0xB2, 0xEC, 0x71, 0x2B,
+            0xAE, 0xAB,
+        ];
+        let want_f4: [u8; 16] = [
+            0xF2, 0xC9, 0x16, 0xF1, 0x07, 0xA9, 0xBD, 0x1C, 0xF1, 0xED, 0xA1, 0xBE, 0xA9, 0x74,
+            0x87, 0x2D,
+        ];
+        if peer_f4(&sbox, &u, &v, &n1, 0) != want_f4 {
+            return TestResult::Fail("peer model f4 disagrees with Appendix D.2");
+        }
+        if smp::confirm_value(&NarfSmpCrypto, &u, &v, &n1, 0) != want_f4 {
+            return TestResult::Fail("production f4 disagrees with Appendix D.2");
+        }
+        // D.3 — f5(W = DHKey, N1, N2, A1, A2) → MacKey ‖ LTK.
+        let w: [u8; 32] = [
+            0xEC, 0x02, 0x34, 0xA3, 0x57, 0xC8, 0xAD, 0x05, 0x34, 0x10, 0x10, 0xA6, 0x0A, 0x39,
+            0x7D, 0x9B, 0x99, 0x79, 0x6B, 0x13, 0xB4, 0xF8, 0x66, 0xF1, 0x86, 0x8D, 0x34, 0xF3,
+            0x73, 0xBF, 0xA6, 0x98,
+        ];
+        let n2: [u8; 16] = [
+            0xA6, 0xE8, 0xE7, 0xCC, 0x25, 0xA7, 0x5F, 0x6E, 0x21, 0x65, 0x83, 0xF7, 0xFF, 0x3D,
+            0xC4, 0xCF,
+        ];
+        let a1: [u8; 7] = [0x00, 0x56, 0x12, 0x37, 0x37, 0xBF, 0xCE];
+        let a2: [u8; 7] = [0x00, 0xA7, 0x13, 0x70, 0x2D, 0xCF, 0xC1];
+        let want_mac_key: [u8; 16] = [
+            0x29, 0x65, 0xF1, 0x76, 0xA1, 0x08, 0x4A, 0x02, 0xFD, 0x3F, 0x6A, 0x20, 0xCE, 0x63,
+            0x6E, 0x20,
+        ];
+        let want_ltk: [u8; 16] = [
+            0x69, 0x86, 0x79, 0x11, 0x69, 0xD7, 0xCD, 0x23, 0x98, 0x05, 0x22, 0xB5, 0x94, 0x75,
+            0x0A, 0x38,
+        ];
+        let (mac_key, ltk) = smp::derive_mac_key_and_ltk(&NarfSmpCrypto, &w, &n1, &n2, &a1, &a2);
+        if mac_key != want_mac_key || ltk != want_ltk {
+            return TestResult::Fail("production f5 disagrees with Appendix D.3");
+        }
+        if peer_f5_mac_key(&sbox, &w, &n1, &n2, &a1, &a2) != want_mac_key
+            || peer_f5_ltk(&sbox, &w, &n1, &n2, &a1, &a2) != want_ltk
+        {
+            return TestResult::Fail("peer model f5 disagrees with Appendix D.3");
+        }
+        // D.4 — f6(MacKey, N1, N2, R, IOcap, A1, A2).
+        let r: [u8; 16] = [
+            0x12, 0xA3, 0x34, 0x3B, 0xB4, 0x53, 0xBB, 0x54, 0x08, 0xDA, 0x42, 0xD2, 0x0C, 0x2D,
+            0x0F, 0xC8,
+        ];
+        let iocap: [u8; 3] = [0x01, 0x01, 0x02];
+        let want_f6: [u8; 16] = [
+            0xE3, 0xC4, 0x73, 0x98, 0x9C, 0xD0, 0xE8, 0xC5, 0xD2, 0x6C, 0x0B, 0x09, 0xDA, 0x95,
+            0x8F, 0x61,
+        ];
+        if peer_f6(
+            &sbox,
+            &want_mac_key,
+            &F6Inputs {
+                n1: &n1,
+                n2: &n2,
+                r: &r,
+                iocap: &iocap,
+                a1: &a1,
+                a2: &a2,
+            },
+        ) != want_f6
+        {
+            return TestResult::Fail("peer model f6 disagrees with Appendix D.4");
+        }
+        if smp::dhkey_check_value(
+            &NarfSmpCrypto,
+            &want_mac_key,
+            &smp::DhKeyCheckInputs {
+                n1: &n1,
+                n2: &n2,
+                r: &r,
+                iocap: &iocap,
+                a1: &a1,
+                a2: &a2,
+            },
+        ) != want_f6
+        {
+            return TestResult::Fail("production f6 disagrees with Appendix D.4");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_smp_spec_appendix_vectors);
+
+    /// Tampered confirm: one flipped bit in Ca must abort the
+    /// exchange with BadConfirm when Na is revealed. The
+    /// commitment is verified, not merely carried — a build that
+    /// accepts any confirm value fails this fixture.
+    fn smoke_pump_smp_tampered_confirm_rejected() -> TestResult {
+        reset_all();
+        let sbox = build_sbox();
+        if let Err(m) = peer_model_self_check(&sbox) {
+            return TestResult::Fail(m);
+        }
+        test_entropy::install_stream(0x1111_2222_3333_4444);
+        let result = drive_to_public_key(
+            smp::IoCapability::NoInputNoOutput as u8,
+            smp::AUTH_BONDING | smp::AUTH_SC,
+            &[0x5A5A_5A5A_5A5A_5A5A; 4],
+        )
+        .and_then(|(mut r, peer_pk_x, resp_pk_x)| {
+            let mut ca = peer_f4(&sbox, &peer_pk_x, &resp_pk_x, &SMP_NA, 0);
+            ca[0] ^= 0x01;
+            // The responder cannot reject yet — it commits Cb and
+            // reveals Nb first; rejection lands at the Na reveal.
+            let out = r
+                .feed(&smp::Pdu {
+                    code: smp::SMP_PAIRING_CONFIRM,
+                    payload: ca.to_vec(),
+                })
+                .map_err(|_| "responder failed before the Na reveal")?;
+            if out.len() != 2 {
+                return Err("responder did not commit Cb + Nb");
+            }
+            match r.feed(&smp::Pdu {
+                code: smp::SMP_PAIRING_RANDOM,
+                payload: SMP_NA.to_vec(),
+            }) {
+                Err(PairingError::BadConfirm) => {}
+                _ => return Err("tampered Ca was not rejected with BadConfirm"),
+            }
+            if r.state != smp::ResponderState::Failed {
+                return Err("responder not in Failed after a bad confirm");
+            }
+            Ok(())
+        });
+        test_entropy::clear();
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(m) => TestResult::Fail(m),
+        }
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_smp_tampered_confirm_rejected);
+
+    /// Wrong-nonce confirm: a Ca honestly computed over a
+    /// *different* nonce than the Na the peer then reveals must
+    /// fail verification — the confirm binds the exact nonce.
+    fn smoke_pump_smp_wrong_nonce_confirm_rejected() -> TestResult {
+        reset_all();
+        let sbox = build_sbox();
+        if let Err(m) = peer_model_self_check(&sbox) {
+            return TestResult::Fail(m);
+        }
+        test_entropy::install_stream(0x2222_3333_4444_5555);
+        let wrong_na: [u8; 16] = [
+            0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xBB, 0xBC, 0xBD,
+            0xBE, 0xBF,
+        ];
+        let result = drive_to_public_key(
+            smp::IoCapability::NoInputNoOutput as u8,
+            smp::AUTH_BONDING | smp::AUTH_SC,
+            &[0x5A5A_5A5A_5A5A_5A5A; 4],
+        )
+        .and_then(|(mut r, peer_pk_x, resp_pk_x)| {
+            let ca = peer_f4(&sbox, &peer_pk_x, &resp_pk_x, &wrong_na, 0);
+            let out = r
+                .feed(&smp::Pdu {
+                    code: smp::SMP_PAIRING_CONFIRM,
+                    payload: ca.to_vec(),
+                })
+                .map_err(|_| "responder failed before the Na reveal")?;
+            if out.len() != 2 {
+                return Err("responder did not commit Cb + Nb");
+            }
+            match r.feed(&smp::Pdu {
+                code: smp::SMP_PAIRING_RANDOM,
+                payload: SMP_NA.to_vec(),
+            }) {
+                Err(PairingError::BadConfirm) => {}
+                _ => return Err("wrong-nonce Ca was not rejected with BadConfirm"),
+            }
+            if r.state != smp::ResponderState::Failed {
+                return Err("responder not in Failed after a wrong-nonce confirm");
+            }
+            Ok(())
+        });
+        test_entropy::clear();
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(m) => TestResult::Fail(m),
+        }
+    }
+    kernel_test_in!(
+        "bluetooth/pump",
+        smoke_pump_smp_wrong_nonce_confirm_rejected
+    );
+
+    /// Tampered DHKey check: one flipped bit in Ea must abort
+    /// the completed stage-1 exchange with BadDhKeyCheck — the
+    /// responder emits no Eb and never reaches Done.
+    fn smoke_pump_smp_tampered_dhkey_check_rejected() -> TestResult {
+        reset_all();
+        let sbox = build_sbox();
+        if let Err(m) = peer_model_self_check(&sbox) {
+            return TestResult::Fail(m);
+        }
+        test_entropy::install_stream(0x3333_4444_5555_6666);
+        let result = run_production_exchange(
+            &sbox,
+            smp::IoCapability::NoInputNoOutput as u8,
+            smp::AUTH_BONDING | smp::AUTH_SC,
+            &[0x5A5A_5A5A_5A5A_5A5A; 4],
+        )
+        .and_then(|mut out| {
+            let iocap_a: [u8; 3] = [
+                smp::AUTH_BONDING | smp::AUTH_SC,
+                0,
+                smp::IoCapability::NoInputNoOutput as u8,
+            ];
+            let mut ea = peer_f6(
+                &sbox,
+                &out.mac_key,
+                &F6Inputs {
+                    n1: &SMP_NA,
+                    n2: &out.nb,
+                    r: &[0u8; 16],
+                    iocap: &iocap_a,
+                    a1: &SMP_IAT,
+                    a2: &SMP_RAT,
+                },
+            );
+            ea[15] ^= 0x80;
+            match out.responder.feed(&smp::Pdu {
+                code: smp::SMP_PAIRING_DHKEY_CHECK,
+                payload: ea.to_vec(),
+            }) {
+                Err(PairingError::BadDhKeyCheck) => {}
+                _ => return Err("tampered Ea was not rejected with BadDhKeyCheck"),
+            }
+            if out.responder.state != smp::ResponderState::Failed {
+                return Err("responder not in Failed after a bad DHKey check");
+            }
+            Ok(())
+        });
+        test_entropy::clear();
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(m) => TestResult::Fail(m),
+        }
+    }
+    kernel_test_in!(
+        "bluetooth/pump",
+        smoke_pump_smp_tampered_dhkey_check_rejected
     );
 
     /// Numeric Comparison run: the responder computes the g2 value
@@ -2118,8 +2584,9 @@ mod tests {
     /// Fail-closed entropy: with the source dead, the adapter must
     /// emit NO key material — keygen collapses to the all-zero
     /// point-at-infinity encoding, the nonce is zero, and a
-    /// responder built on it puts zeros on the wire, so no peer
-    /// could ever accept the pairing. Nothing is fabricated.
+    /// responder built on it puts zero key material on the wire,
+    /// so no peer could ever accept the pairing. Nothing is
+    /// fabricated.
     fn smoke_pump_smp_entropy_failure_emits_no_key_material() -> TestResult {
         reset_all();
         test_entropy::install_fail();
@@ -2163,27 +2630,34 @@ mod tests {
         let mut pk_payload = Vec::with_capacity(64);
         pk_payload.extend_from_slice(&fe_to_wire(&GEN_X));
         pk_payload.extend_from_slice(&fe_to_wire(&GEN_Y));
-        let our_pk = r
+        let out = r
             .feed(&smp::Pdu {
                 code: smp::SMP_PAIRING_PUBLIC_KEY,
                 payload: pk_payload,
             })
-            .map_err(|_| "responder rejected the peer public key")?
-            .ok_or("responder emitted no public key")?;
-        if our_pk.payload != [0u8; 64] {
+            .map_err(|_| "responder rejected the peer public key")?;
+        if out.len() != 1 {
+            return Err("responder emitted no public key");
+        }
+        if out[0].payload != [0u8; 64] {
             return Err("responder emitted key material with a dead entropy source");
         }
         if r.dh_key != [0u8; 32] {
             return Err("DHKey is non-zero with a dead entropy source");
         }
-        let nb_pdu = r
+        // The confirm step answers [Cb, Nb]: Cb is a deterministic
+        // commitment over public (here all-zero) values, but Nb —
+        // the secret nonce — must be zero with a dead source.
+        let out = r
             .feed(&smp::Pdu {
-                code: smp::SMP_PAIRING_RANDOM,
-                payload: SMP_NA.to_vec(),
+                code: smp::SMP_PAIRING_CONFIRM,
+                payload: alloc::vec![0u8; 16],
             })
-            .map_err(|_| "responder rejected the pairing random")?
-            .ok_or("responder emitted no pairing random")?;
-        if nb_pdu.payload != [0u8; 16] {
+            .map_err(|_| "responder rejected the pairing confirm")?;
+        if out.len() != 2 || out[1].code != smp::SMP_PAIRING_RANDOM {
+            return Err("responder did not answer Confirm with [Confirm, Random]");
+        }
+        if out[1].payload != [0u8; 16] {
             return Err("responder emitted a non-zero nonce with a dead entropy source");
         }
         Ok(())

@@ -16,6 +16,7 @@ pub mod bulk;
 pub mod ccid;
 pub mod cdc;
 pub mod cdc_acm;
+pub mod cdc_ecm;
 pub mod cdc_ncm;
 pub mod class_registry;
 pub mod control;
@@ -89,6 +90,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "usb-cdc-ncm", || {
         cdc_ncm::register_initcalls();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "usb-cdc-ecm", || {
+        cdc_ecm::register_initcalls();
         InitResult::Ok
     });
     // MSC binds through the attach cascade, not the class registry;
@@ -679,7 +684,7 @@ fn spawn_supervisor_task() {
                     // bound port's activity tick — a port's idle
                     // window runs from bind, not from the boot
                     // epoch its tick initialised to (#840).
-                    attach::mark_ports_bound(idx, new_bound_bits);
+                    attach::mark_ports_bound(*hub_slot, new_bound_bits);
                 }
             }
 

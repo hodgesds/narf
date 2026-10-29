@@ -841,15 +841,51 @@ impl FakeAhciMmio {
         // VS: 0x0001_0301 → AHCI 1.3.1.
         m.write32(AHCI_HBA_VS, 0x0001_0301);
 
-        let p = port_off(0);
+        // CMD: FRE=1, FR=1, ST=1, CR=0 (idle, FIS receive active).
+        m.set_sata_port(0, PORT_CMD_FRE | PORT_CMD_FR | PORT_CMD_ST);
+        m
+    }
+
+    /// Configure one port as a SATA device (DET=3, IPM=1,
+    /// SIG=0x00000101, TFD ready) with the given CMD value.
+    fn set_sata_port(&mut self, port: u8, cmd: u32) {
+        let p = port_off(port);
         // SSTS: DET=3 (device present + PHY ready), IPM=1 (active).
-        m.write32(p + PORT_SSTS, 0x0000_0103);
+        self.write32(p + PORT_SSTS, 0x0000_0103);
         // SIG: ATA SATA signature.
-        m.write32(p + PORT_SIG, SIG_SATA);
+        self.write32(p + PORT_SIG, SIG_SATA);
         // TFD: BSY=0, DRQ=0, ERR=0 — ready.
-        m.write32(p + PORT_TFD, 0x0000_0050); // DRDY bit set
-                                              // CMD: FRE=1, FR=1, ST=1, CR=0 (idle, FIS receive active).
-        m.write32(p + PORT_CMD, PORT_CMD_FRE | PORT_CMD_FR | PORT_CMD_ST);
+        self.write32(p + PORT_TFD, 0x0000_0050); // DRDY bit set
+        self.write32(p + PORT_CMD, cmd);
+    }
+
+    /// Create a fake ABAR with the given ports pre-configured as SATA
+    /// devices (#980: multi-port model). CAP.NP covers the highest
+    /// port; PI marks exactly the given ports. CMD carries ST only:
+    /// port_deinit's FR wait is then a fast pass, and classification
+    /// reads SIG/SSTS only, so this does not weaken the smoke.
+    fn new_with_sata_ports(ports: &[u8]) -> Self {
+        let mut m = Self {
+            mem: [0u8; 64 * 1024],
+        };
+        let max = ports.iter().copied().max().unwrap_or(0);
+        // CAP: NCS (num cmd slots) at bits[12:8] = 31, NP (num ports-1)
+        // at bits[4:0] = highest port.
+        let cap: u32 = (31 << 8) | max as u32;
+        m.write32(AHCI_HBA_CAP, cap);
+        // GHC: AE set, HR clear.
+        m.write32(AHCI_HBA_GHC, AHCI_GHC_AE);
+        // PI: one bit per given port.
+        let mut pi: u32 = 0;
+        for p in ports {
+            pi |= 1u32 << p;
+        }
+        m.write32(AHCI_HBA_PI, pi);
+        // VS: 0x0001_0301 → AHCI 1.3.1.
+        m.write32(AHCI_HBA_VS, 0x0001_0301);
+        for p in ports {
+            m.set_sata_port(*p, PORT_CMD_ST);
+        }
         m
     }
 
@@ -883,6 +919,70 @@ impl FakeAhciMmio {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// ── Smoke 17: AHCI multi-port bring-up + two-HBA models ─────────────
+// ═══════════════════════════════════════════════════════════════════
+
+/// #980: the FakeAhciMmio model drives multi-port and two-HBA
+/// configurations deterministically. Production bring_up_ports (with
+/// no DMA areas, so passive classification) must classify every
+/// configured SATA port and no unconfigured one, on each HBA
+/// independently.
+/// AhciRegs::write32 takes `&self` (production ABAR writes go
+/// through a mapped pointer), so the wrapper carries the model
+/// behind a RefCell instead of rewriting the existing fake.
+struct AhciRegsFake(core::cell::RefCell<FakeAhciMmio>);
+
+impl crate::ahci::AhciRegs for AhciRegsFake {
+    fn read32(&self, off: u64) -> u32 {
+        self.0.borrow().read32(off as usize)
+    }
+
+    fn write32(&self, off: u64, val: u32) {
+        self.0.borrow_mut().write32(off as usize, val);
+    }
+}
+
+fn smoke_ahci_multi_port_bring_up_two_hba() -> TestResult {
+    use crate::ahci::{bring_up_ports, PortKind};
+    // HBA-A: two SATA ports.
+    let hba_a = AhciRegsFake(core::cell::RefCell::new(FakeAhciMmio::new_with_sata_ports(
+        &[0, 1],
+    )));
+    let ports_a = bring_up_ports(&hba_a, 0, 0b11, None, 5_000);
+    if ports_a.len() != 2 || ports_a[0].kind != PortKind::Sata || ports_a[1].kind != PortKind::Sata
+    {
+        return TestResult::Fail("HBA-A must classify both SATA ports");
+    }
+    // HBA-B: three SATA ports; port 3 in the map but unconfigured.
+    let hba_b = AhciRegsFake(core::cell::RefCell::new(FakeAhciMmio::new_with_sata_ports(
+        &[0, 1, 2],
+    )));
+    let ports_b = bring_up_ports(&hba_b, 0, 0b1111, None, 5_000);
+    if ports_b.len() != 4
+        || ports_b[0].kind != PortKind::Sata
+        || ports_b[1].kind != PortKind::Sata
+        || ports_b[2].kind != PortKind::Sata
+        || ports_b[3].kind != PortKind::None
+    {
+        return TestResult::Fail("HBA-B must classify three SATA ports and one empty port");
+    }
+    // Two-HBA isolation: writing HBA-A's registers must not move HBA-B's.
+    let before = hba_b.0.borrow().read32(port_off(0) + PORT_CMD);
+    hba_a
+        .0
+        .borrow_mut()
+        .write32(port_off(0) + PORT_CMD, 0xDEAD_BEEF);
+    if hba_b.0.borrow().read32(port_off(0) + PORT_CMD) != before {
+        return TestResult::Fail("HBA models must not alias registers");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/storage/ahci-e2e",
+    smoke_ahci_multi_port_bring_up_two_hba
+);
+
+// ═══════════════════════════════════════════════════════════════════
 // ── Smoke 9: AHCI controller reset + port detect ─────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════
 

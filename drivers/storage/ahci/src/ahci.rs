@@ -369,6 +369,18 @@ pub struct DiskInfo {
     pub firmware: alloc::string::String,
 }
 
+/// Whether a freshly IDENTIFYed disk is the same device the published
+/// record describes (#981): user-addressable sectors, model string,
+/// and serial number must all match. Firmware and feature set are
+/// refreshed from the new IDENTIFY, not compared — they describe the
+/// device's current capabilities, not which device it is. The
+/// suspend/resume revalidation calls this; a mismatch keeps the
+/// controller suspended rather than serving a stranger's disk under
+/// the old name.
+pub fn disk_identity_matches(old: &DiskInfo, sectors: u64, model: &str, serial: &str) -> bool {
+    sectors == old.sectors && model == old.model && serial == old.serial
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AhciError {
     BarMapFailed,
@@ -4416,8 +4428,8 @@ fn ahci_resume_controller(ctrl: &Ahci) -> Result<(), narf_power::device_pm::Devi
     }
     // Revalidate every published disk before trusting it again:
     // after resume the device behind a port must be the device
-    // that was there before — same class, same capacity, same
-    // model. Anything else means the medium changed under a
+    // that was there before — same capacity, same model, same
+    // serial (#981). Anything else means the medium changed under a
     // suspended system; keep the controller suspended and fail
     // rather than serve a stranger's disk under the old name.
     // (`Ahci::ports` keeps the probe-time classification; the
@@ -4434,7 +4446,8 @@ fn ahci_resume_controller(ctrl: &Ahci) -> Result<(), narf_power::device_pm::Devi
             .map_err(|_| DeviceSuspendError::DriverError)?;
         let sectors = identify_n_sectors(&id);
         let model = identify_model_string(&id);
-        if sectors != disk.sectors || model != disk.model {
+        let serial = identify_serial(&id);
+        if !disk_identity_matches(&disk, sectors, &model, &serial) {
             return Err(DeviceSuspendError::DriverError);
         }
         fresh.push(DiskInfo {
@@ -4442,7 +4455,7 @@ fn ahci_resume_controller(ctrl: &Ahci) -> Result<(), narf_power::device_pm::Devi
             sectors,
             features: identify_ata_features(&id),
             model,
-            serial: identify_serial(&id),
+            serial,
             firmware: identify_firmware(&id),
         });
     }
@@ -4451,13 +4464,59 @@ fn ahci_resume_controller(ctrl: &Ahci) -> Result<(), narf_power::device_pm::Devi
     Ok(())
 }
 
-/// Next `sata<n>` registry name. Names are never reused within a
-/// boot: hot-removed disks are out of scope, and reuse would alias
-/// a new disk onto a name a filesystem may still hold open.
-fn next_sata_name() -> &'static str {
-    static NEXT_SATA: AtomicUsize = AtomicUsize::new(0);
-    let n = NEXT_SATA.fetch_add(1, Ordering::Relaxed);
-    alloc::boxed::Box::leak(alloc::format!("sata{n}").into_boxed_str())
+/// One planned publication entry: the registry name, the hardware
+/// identity, and the port the block surface addresses.
+#[derive(Clone, Debug)]
+pub struct PlannedPublication {
+    /// `sata<n>` name, dense from the caller's start index.
+    pub name: alloc::string::String,
+    /// Hardware identity for the registry entry.
+    pub identity: narf_block::DiskIdentity,
+    /// Port on the owning controller.
+    pub port: u8,
+}
+
+/// Pure publication plan for one controller's disks (#980): names are
+/// dense `sata<n>` from `start`, in disk order, and each identity
+/// carries the disk's own model / serial / firmware. Probe assigns
+/// names from the boot-global counter (never reused within a boot:
+/// hot-removed disks are out of scope, and reuse would alias a new
+/// disk onto a name a filesystem may still hold open) and registers
+/// each entry; the model-level smoke asserts density, identity, and
+/// agreement of the plan for multi-port and multi-HBA inputs without
+/// touching the global registries.
+pub fn plan_publication(
+    disks: &[DiskInfo],
+    bus_path: &str,
+    vendor_id: u16,
+    start: usize,
+) -> alloc::vec::Vec<PlannedPublication> {
+    disks
+        .iter()
+        .enumerate()
+        .map(|(i, disk)| {
+            let name = alloc::format!("sata{}", start + i);
+            PlannedPublication {
+                identity: narf_block::DiskIdentity {
+                    transport: "ata",
+                    bus_path: alloc::string::String::from(bus_path),
+                    controller: name.clone(),
+                    model: disk.model.clone(),
+                    serial: disk.serial.clone(),
+                    firmware: disk.firmware.clone(),
+                    vendor_id,
+                    nsid: 0,
+                    // NVMe-namespace identifiers; ATA has no
+                    // equivalents in this identity shape.
+                    eui64: None,
+                    nguid: None,
+                    uuid: None,
+                },
+                name,
+                port: disk.port,
+            }
+        })
+        .collect()
 }
 
 /// `0000:00:1f.2`-style bus path for a controller's
@@ -4582,29 +4641,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // partition scan, and its bound-driver record — as the NVMe,
     // virtio-blk and USB drivers do per device.
     let bus_path = bus_path_of(device.addr);
-    for disk in &disks {
-        let name = next_sata_name();
-        let surface = alloc::sync::Arc::new(AhciBlockSync::new(ctrl, disk.port))
+    // Names are never reused within a boot: reserve this
+    // controller's run up front so the plan below is dense.
+    static NEXT_SATA: AtomicUsize = AtomicUsize::new(0);
+    let start = NEXT_SATA.fetch_add(disks.len(), Ordering::Relaxed);
+    for planned in plan_publication(&disks, &bus_path, device.id.vendor, start) {
+        let name: &'static str = alloc::boxed::Box::leak(planned.name.into_boxed_str());
+        let surface = alloc::sync::Arc::new(AhciBlockSync::new(ctrl, planned.port))
             as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>;
-        narf_block::register_block_device_with_identity(
-            name,
-            surface.clone(),
-            narf_block::DiskIdentity {
-                transport: "ata",
-                bus_path: bus_path.clone(),
-                controller: alloc::string::String::from(name),
-                model: disk.model.clone(),
-                serial: disk.serial.clone(),
-                firmware: disk.firmware.clone(),
-                vendor_id: device.id.vendor,
-                nsid: 0,
-                // NVMe-namespace identifiers; ATA has no
-                // equivalents in this identity shape.
-                eui64: None,
-                nguid: None,
-                uuid: None,
-            },
-        );
+        narf_block::register_block_device_with_identity(name, surface.clone(), planned.identity);
         // Register `<name>p<n>` for each MBR / GPT partition.
         // Reads only; an unpartitioned disk just keeps the
         // whole-disk entry. Every partition goes through the

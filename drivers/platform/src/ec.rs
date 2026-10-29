@@ -22,7 +22,7 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Poll, Waker};
 use narf_drivers::{Driver, DriverEnv, DriverFuture};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -52,62 +52,30 @@ const EC_STS_SCI: u8 = 1 << 5; // SCI event pending
 pub struct AcpiEc {
     control_port: u16,
     data_port: u16,
-    /// Serialises multi-step EC port transactions (command byte,
-    /// address byte, data byte are separate port writes that must not
-    /// interleave between callers) — spun on with **interrupts
-    /// enabled**.
-    ///
-    /// This is what the transaction methods hold instead of the caller
-    /// keeping `GLOBAL_EC` locked around them. `GLOBAL_EC` is an
-    /// `IrqSafeSpinLock`, so holding it across `query`/`read_byte` —
-    /// each of which waits on IBF/OBF for up to 100 ms per step —
-    /// masked interrupts on the waiting CPU for the whole EC
-    /// round-trip, and an SCI pass drains up to 16 queued events
-    /// back-to-back. Same class as the virtio-blk CONTROLLER herd.
-    ///
-    /// **Task-context only.** No IRQ handler may enter an EC
-    /// transaction: `dispatch_sci` (the SCI ISR) only records pending
-    /// bits and wakes `sci_drain_task`, which runs the actual EC
-    /// queries from the async executor. An IRQ-context caller spinning
-    /// here while the interrupted task held the gate would deadlock a
-    /// single CPU — keep deferring, as `dispatch_sci` does.
-    txn_gate: AtomicBool,
 }
 
-/// RAII holder for [`AcpiEc::txn_gate`].
-struct EcTxnGate<'a> {
-    ec: &'a AcpiEc,
-}
-
-impl<'a> EcTxnGate<'a> {
-    /// Spin until the gate is ours. Interrupts keep their
-    /// caller-supplied state — the whole point — so timer ticks, RCU
-    /// quiescent states and the sleep pumps continue to run on this
-    /// CPU while we wait for another CPU's EC transaction to finish.
-    fn acquire(ec: &'a AcpiEc) -> Self {
-        while ec
-            .txn_gate
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        EcTxnGate { ec }
-    }
-}
-
-impl Drop for EcTxnGate<'_> {
-    fn drop(&mut self) {
-        self.ec.txn_gate.store(false, Ordering::Release);
-    }
-}
-
+/// EC transactions (`read_byte` / `write_byte` / `query`) take the
+/// shared gate in `narf_aml::oregion` (issue #913): one gate for
+/// every EC command stream in the tree, spinning with interrupts
+/// enabled. This is what the transaction methods hold instead of the
+/// caller keeping `GLOBAL_EC` locked around them. `GLOBAL_EC` is an
+/// `IrqSafeSpinLock`, so holding it across `query`/`read_byte` —
+/// each of which waits on IBF/OBF for up to 100 ms per step —
+/// masked interrupts on the waiting CPU for the whole EC
+/// round-trip, and an SCI pass drains up to 16 queued events
+/// back-to-back. Same class as the virtio-blk CONTROLLER herd.
+///
+/// **Task-context only.** No IRQ handler may enter an EC
+/// transaction: `dispatch_sci` (the SCI ISR) only records pending
+/// bits and wakes `sci_drain_task`, which runs the actual EC
+/// queries from the async executor. An IRQ-context caller spinning
+/// on the shared gate while the interrupted task held it would
+/// deadlock a single CPU — keep deferring, as `dispatch_sci` does.
 impl AcpiEc {
     pub const fn new(control_port: u16, data_port: u16) -> Self {
         Self {
             control_port,
             data_port,
-            txn_gate: AtomicBool::new(false),
         }
     }
 
@@ -147,7 +115,11 @@ impl AcpiEc {
     }
 
     pub fn read_byte(&self, addr: u8) -> Result<u8, DriverError> {
-        let _gate = EcTxnGate::acquire(self);
+        // Shared gate (#913): the whole command → address → data
+        // sequence must not interleave with any other EC transaction
+        // (AML field access, AML-side SCI drain, or another CPU's
+        // platform transaction).
+        let _gate = narf_aml::oregion::acquire_ec_txn_gate();
         self.wait_ibf_empty()?;
         // SAFETY: control_port is the EC command register (ECDT-provided or
         // the ACPI standard 0x66). Writing EC_CMD_READ after IBF is clear is
@@ -174,7 +146,8 @@ impl AcpiEc {
     }
 
     pub fn write_byte(&self, addr: u8, val: u8) -> Result<(), DriverError> {
-        let _gate = EcTxnGate::acquire(self);
+        // Shared gate (#913): see read_byte.
+        let _gate = narf_aml::oregion::acquire_ec_txn_gate();
         self.wait_ibf_empty()?;
         // SAFETY: control_port is the EC command register. Writing EC_CMD_WRITE
         // once IBF is clear begins the EC write protocol (ACPI §12.3); the port
@@ -290,8 +263,9 @@ fn read_ec_gpe(ec_path: &str) -> Option<u32> {
 /// address, then released — so an EC transaction (up to ~200 ms of
 /// IBF/OBF waiting per event, 16 events per SCI pass) runs with
 /// interrupts enabled instead of masking them for the whole wait.
-/// Serialisation of the port protocol moved onto the device:
-/// [`AcpiEc::txn_gate`], acquired inside each transaction method.
+/// Serialisation of the port protocol is the shared gate in
+/// `narf_aml::oregion` (issue #913), acquired inside each
+/// transaction method.
 ///
 /// # Why the reference stays valid
 ///
@@ -626,7 +600,8 @@ impl AcpiEc {
     /// Issue `EC_QUERY` and read the returned query byte. `Ok(None)`
     /// means SCI fired but the EC reported no event (query byte 0).
     pub fn query(&self) -> Option<u8> {
-        let _gate = EcTxnGate::acquire(self);
+        // Shared gate (#913): see read_byte.
+        let _gate = narf_aml::oregion::acquire_ec_txn_gate();
         if self.wait_ibf_empty().is_err() {
             return None;
         }

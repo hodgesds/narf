@@ -139,6 +139,9 @@ pub trait PacketTransport: Transport + Send {
 
     /// Every pending F1/F2 source has been serviced: re-enable delivery.
     fn interrupt_serviced(&mut self) {}
+
+    /// A service pass found no work (`brcmf_sdio_bus_watchdog` idle path).
+    fn idle(&mut self) {}
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

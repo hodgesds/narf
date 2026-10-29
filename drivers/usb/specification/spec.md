@@ -144,10 +144,14 @@ also consult upstream Linux GPL sources.
   drivers feed `attach::mark_port_activity` on each completed
   transfer and call `attach::resume_port` before a transfer to a
   port that may be suspended. `msc::try_bind_msc_already_addressed`
-  takes the device's hub context — (index into `attach::HUBS`,
+  takes the device's hub context — (parent hub slot id,
   downstream port), `None` on a root port — and `MscDevice` records
   it as `hub_port`; its BOT funnels resume-then-feed on every
-  transaction. The pumped HID classes (boot keyboard, boot mouse,
+  transaction. The slot id, not a `HUBS` index, is the context key:
+  hub detach removes a `HUBS` entry with `retain`, shifting every
+  later index, so a cached index silently retargets after a detach
+  (#892); every use resolves the hub by slot id under one lock
+  hold. The pumped HID classes (boot keyboard, boot mouse,
   PTP touchpad, consumer control) record the same `hub_port`
   context through their `try_bind_*_already_addressed` binders;
   their pumps feed on each completed interrupt-IN report, and the
@@ -300,7 +304,12 @@ also consult upstream Linux GPL sources.
   connected set is detached via `attach::detach_slot`: class bindings are
   dropped first (evdev nodes unregister; registered drivers are reached
   through `class_registry::dispatch_unbind`, a broadcast of the optional
-  hook from `register_class_driver_with_unbind`), a hub's bound subtree
+  hook from `register_class_driver_with_unbind`; a hook reports
+  failure with `Err(())` and dispatch continues past it, so one
+  hook's failure never aborts detach for every class (#893) —
+  a hook that panics cannot be contained (panic is fatal by
+  kernel policy), so hooks must be panic-free and idempotent),
+  a hub's bound subtree
   is detached recursively and its `HUBS` entry removed, then the slot is
   disabled and reclaimed (`Xhci::reclaim_slot`) so a replug re-runs
   attach from scratch. A controller recovery epoch change drops every
@@ -416,6 +425,23 @@ also consult upstream Linux GPL sources.
   (#840). Plan execution goes through the `ControlTransport` seam
   (production: `Xhci`; fixtures: a recording fake), which
   `cdc_acm`'s replay shares.
+- `serial::devfs_bridge` implements the ttyUSB termios + modem ioctl
+  surface (#756) via `FileOps::ioctl_user`, at parity with ttyS0's
+  devfs contract: TCGETS / TCSETS(W)(F) and the termios2 forms
+  (BOTHER rates ride `c_ospeed`), TIOCMGET / TIOCMSET / TIOCMBIS /
+  TIOCMBIC, TCSBRK, TIOCSBRK / TIOCCBRK, TCFLSH, TCXONC, FIONREAD,
+  TIOCGWINSZ / TIOCSWINSZ; anything else returns `Unsupported`
+  (ENOTTY). The node keeps the 36-byte kernel termios image verbatim
+  (line-discipline bits round-trip; this pipe has no ldisc) and
+  decodes its hardware-facing subset — baud, data bits, parity,
+  stop bits, CRTSCTS — into `port::LineSettings`, actuated on the
+  bound device via `serial::port::set_line_settings` /
+  `set_modem_lines` / `set_break_state`; B0 drops DTR/RTS as a
+  hangup without reprogramming the baud. Break is grounded for FTDI
+  (SET_DATA bit 14) and CP210x (AN571 `SET_BREAK`); PL2303 and
+  CH341 break encodings are not modelled and return a typed
+  `PortError::Unsupported`. TCXONC's TCOOFF parks the pump's TX
+  drain via the node's `tx_stopped` flag.
 - `ccid::devfs_bridge` publishes each bound CCID reader as `/dev/ccid<N>`
   (provider hooks installed by the `usb-ccid-devfs` Stage::Subsys
   initcall; node index = `CCID_READERS` index, assigned at bind). The
@@ -551,7 +577,9 @@ the USB download itself remains a target-silicon gate.
   FORMAT_UNCOMPRESSED with 16-byte Format-GUIDs (YUY2, NV12), VS
   FRAME_UNCOMPRESSED with both discrete and continuous frame-
   interval forms, VS FORMAT_MJPEG. Bind retains each VideoStreaming alternate's
-  endpoint and bandwidth metadata; the negotiation path performs PROBE/COMMIT,
+  endpoint and bandwidth metadata; the negotiation path performs version-aware
+  PROBE/COMMIT — 26-byte UVC 1.0 for bcdUVC < 0x0110, 34-byte UVC 1.1+
+  (VC HEADER device clock + 1.0 payload-version declaration) otherwise —
   configures the smallest fitting isochronous alternate, and issues
   SET_INTERFACE. Its capture task reassembles UVC payloads and delivers complete
   frames to the registered `/dev/video<N>` queue. STREAMOFF/cancellation and
@@ -606,6 +634,22 @@ the USB download itself remains a target-silicon gate.
   signatures + bounds and yields a borrow per datagram.
   `NCM_NTB_PARAMETERS_STRUCTURE` decoder for the device-reported
   size limits.
+- **CDC-ECM** (`cdc_ecm`): Ethernet Control Model 1.2 live driver
+  for USB-Ethernet. One raw Ethernet frame per bulk transfer, no
+  framing — no NTB wrap, no sequence, no CRC, no
+  `GET_NTB_PARAMETERS`, no `GET_NET_ADDRESS` (NCM-only). Bind:
+  SET_CONFIGURATION, Data alt-setting activation, bulk-pair (+
+  notification endpoint when present) configuration, station
+  address from the iMACAddress string descriptor only,
+  best-effort `SET_ETHERNET_PACKET_FILTER`, netdev publication
+  as `usb-ecm{N}` with per-device TX routing, RX pump (one
+  transfer = one frame) + notification pump
+  (`NETWORK_CONNECTION` link state, `CONNECTION_SPEED_CHANGE`
+  speeds). Detach tombstones the record and unregisters the
+  iface, so TX cookies never retarget another device. Shares
+  the NCM module's Ethernet Networking descriptor parser, MAC
+  string parser, and packet-filter encode — the CDC-common
+  layer — and nothing NTB-shaped.
 
 ### Out of scope (deferred)
 - UAC3 (protocol byte 0x30; descriptor layouts differ again).
