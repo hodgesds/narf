@@ -368,6 +368,27 @@ pub fn register_initcalls() {
     narf_init::register(Stage::Late, "cpufreq-init", || match cpufreq::enable() {
         Ok(()) => {
             cpufreq::start_workers();
+            // Passive cooling (#914): with a real backend live,
+            // register the cpufreq cooling device with the thermal
+            // registry so a zone's warn-band (_PSV) crossing
+            // throttles the CPU as well as driving the fans. The
+            // registry has existed since Stage::PostCore. A failure
+            // is logged, not fatal — active (fan) cooling is
+            // unaffected by it.
+            match cpufreq::install_passive_cooling() {
+                Ok(()) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  cpufreq: passive (thermal) cooling device registered"
+                    );
+                }
+                Err(e) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  cpufreq: passive cooling registration failed: {e:?}"
+                    );
+                }
+            }
             InitResult::Ok
         }
         Err(cpufreq::CpuFreqError::NoBackend) => InitResult::NotPresent,

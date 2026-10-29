@@ -785,6 +785,147 @@ kernel_test_in!(
     smoke_cooling_registration_reaches_governor
 );
 
+// ── Power-service temperature provider (#914) ───────────────────────
+
+/// Minimal `HwmonDevice` whose temperature reads come from fixed
+/// per-label values — the fake the provider fixtures resolve
+/// against in the shared registry.
+#[derive(Debug)]
+struct FakeTempDevice {
+    name: &'static str,
+    tdie: Option<i32>,
+    tpackage: Option<i32>,
+}
+
+impl crate::HwmonDevice for FakeTempDevice {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn read_temp(&self, label: &str) -> Option<i32> {
+        match label {
+            "Tdie" => self.tdie,
+            "Tpackage" => self.tpackage,
+            _ => None,
+        }
+    }
+
+    fn read_fan(&self, _label: &str) -> Option<u32> {
+        None
+    }
+
+    fn read_voltage(&self, _label: &str) -> Option<i32> {
+        None
+    }
+
+    fn set_fan(&self, _label: &str, _level: u8) -> bool {
+        false
+    }
+
+    fn list_labels(&self) -> alloc::vec::Vec<&str> {
+        let mut labels = alloc::vec::Vec::new();
+        if self.tdie.is_some() {
+            labels.push("Tdie");
+        }
+        if self.tpackage.is_some() {
+            labels.push("Tpackage");
+        }
+        labels
+    }
+}
+
+/// Restore the power service's CPU temperature provider to a
+/// None-returning one, so a fixture's registration cannot leak a
+/// live provider into other tests sharing the boot.
+fn restore_none_cpu_provider() {
+    use alloc::sync::Arc;
+    let cap = narf_power::bootstrap_power_authority();
+    let providers = narf_power::service::StateProviders {
+        ac_adapter: None,
+        lid: None,
+        battery: None,
+        cpu_temp_mc: Some(Arc::new(|| None)),
+        gpu_temp_mc: None,
+    };
+    let _ = narf_power::service::register_state_providers(&cap, providers);
+}
+
+/// With both CPU temperature drivers present, the provider reads
+/// k10temp's `Tdie` — and the fused snapshot the power service
+/// produces carries it in `cpu_tdie_mc`.
+fn smoke_power_provider_prefers_k10temp_tdie() -> TestResult {
+    use alloc::sync::Arc;
+    crate::registry::__reset_devices_for_test();
+    crate::registry::register_device(Arc::new(FakeTempDevice {
+        name: "coretemp",
+        tdie: None,
+        tpackage: Some(55_000),
+    }));
+    crate::registry::register_device(Arc::new(FakeTempDevice {
+        name: "k10temp",
+        tdie: Some(67_500),
+        tpackage: None,
+    }));
+    if crate::power_providers::cpu_temp_mc() != Some(67_500) {
+        crate::registry::__reset_devices_for_test();
+        return TestResult::Fail("provider must prefer k10temp Tdie");
+    }
+    crate::power_providers::register_temp_providers();
+    let got = narf_power::service::snapshot().cpu_tdie_mc;
+    restore_none_cpu_provider();
+    crate::registry::__reset_devices_for_test();
+    if got != Some(67_500) {
+        return TestResult::Fail("snapshot cpu_tdie_mc must carry the Tdie reading");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/hwmon/power-providers",
+    smoke_power_provider_prefers_k10temp_tdie
+);
+
+/// Intel fallback: with no k10temp device, coretemp's package
+/// sensor feeds the provider.
+fn smoke_power_provider_coretemp_fallback() -> TestResult {
+    use alloc::sync::Arc;
+    crate::registry::__reset_devices_for_test();
+    crate::registry::register_device(Arc::new(FakeTempDevice {
+        name: "coretemp",
+        tdie: None,
+        tpackage: Some(55_000),
+    }));
+    let got = crate::power_providers::cpu_temp_mc();
+    crate::registry::__reset_devices_for_test();
+    if got != Some(55_000) {
+        return TestResult::Fail("provider must fall back to coretemp Tpackage");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/hwmon/power-providers",
+    smoke_power_provider_coretemp_fallback
+);
+
+/// No CPU temperature driver probed: the provider yields `None`
+/// and the snapshot field stays unknown — never a fabricated zero.
+fn smoke_power_provider_absent_is_none() -> TestResult {
+    crate::registry::__reset_devices_for_test();
+    if crate::power_providers::cpu_temp_mc().is_some() {
+        return TestResult::Fail("provider must be None with an empty registry");
+    }
+    crate::power_providers::register_temp_providers();
+    let got = narf_power::service::snapshot().cpu_tdie_mc;
+    restore_none_cpu_provider();
+    if got.is_some() {
+        return TestResult::Fail("snapshot cpu_tdie_mc must stay None without a source");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/hwmon/power-providers",
+    smoke_power_provider_absent_is_none
+);
+
 /// `temp1_label` returns the label string with a newline.
 fn smoke_bridge_temp1_label_returns_tctl() -> TestResult {
     use crate::k10temp::{chip_info, K10temp, AMD_RENOIR_NB};
