@@ -32,7 +32,7 @@
 //!    the USB4 path configuration layout (lane HopIDs are
 //!    allocated first-free, so composed they are not the
 //!    single-tunnel fixture's 8).
-//! 3b. **USB class cascade** — from the published USB3 tunnel's
+//!    **USB class cascade** — from the published USB3 tunnel's
 //!    dock endpoint, the dock hub parses through the production
 //!    hub descriptor/interface walkers and its downstream
 //!    devices classify through the production class-registry
