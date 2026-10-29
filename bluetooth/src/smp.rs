@@ -331,6 +331,7 @@ pub fn derive_mac_key_and_ltk(
 /// spec-shaped block instead of six loose slices: the caller
 /// picks the initiator or the table-2.2 responder ordering by
 /// which values it places in `n1`/`n2` and `a1`/`a2`.
+#[derive(Debug)]
 pub struct DhKeyCheckInputs<'a> {
     /// First nonce (Na for Ea, Nb for Eb).
     pub n1: &'a [u8; 16],
