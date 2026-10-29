@@ -49,6 +49,7 @@ const LCR_H: u64 = 0x02C;
 const CR: u64 = 0x030;
 const ICR: u64 = 0x044;
 
+const FR_TXFE: u32 = 1 << 7;
 const FR_TXFF: u32 = 1 << 5;
 const FR_RXFE: u32 = 1 << 4;
 const FR_BUSY: u32 = 1 << 3;
@@ -75,16 +76,42 @@ pub struct Pl011 {
     irq: Option<u32>,
 }
 
+/// Outcome of the PL011 register-level config proof (the QEMU
+/// smoke's UART-health check). It proves the mapped window is
+/// the live, correctly programmed device without asserting RX
+/// loopback, which QEMU 8.2's `virt` model does not deliver
+/// (see [`LoopbackOutcome`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigOutcome {
+    Pass,
+    /// CR.LBE did not stick when read back (CR value shown).
+    LbeNotSet(u32),
+    /// The UART was not fully enabled at selftest time
+    /// (UARTEN|TXE|RXE bits missing; CR value shown).
+    NotEnabled(u32),
+    /// Line control is not the programmed FEN|WLEN_8
+    /// (LCR_H value shown).
+    BadLineControl(u32),
+    /// Pattern bytes were accepted but the TX FIFO never
+    /// drained within the poll budget.
+    TxStuck,
+}
+
 /// Outcome of the PL011 loopback self-test, with the failure
 /// mode named. The CI log's single "mismatch" string could not
-/// distinguish an empty RX FIFO from a wrong byte, and the fix
-/// round's FR.BUSY theory misread QEMU's model: QEMU delivers
-/// loopback synchronously at DR-write time (its
-/// `pl011_write_txdata` calls `pl011_loopback_tx` before
-/// queueing the byte for the backend) AND still sends the byte
-/// to the backend — pattern bytes on the console are expected
-/// QEMU loopback behavior (QEMU commit f576e0733cc), not
-/// evidence that bytes escaped instead of looping back.
+/// distinguish an empty RX FIFO from a wrong byte.
+/// NOTE on QEMU: measured on QEMU 8.2 `virt`, the model does
+/// NOT deliver loopback bytes to RX — the driver programs the
+/// UART exactly per DDI 0183 (UARTEN|TXE|RXE, LBE stuck, FIFOs
+/// on) and the pattern bytes still reach the backend console,
+/// but RX stays empty across the full poll budget, under every
+/// guest-side precondition tried (FIFOs on/off, LBE set before
+/// or after UARTEN, RX interrupt masked in). The earlier claim
+/// that the model loops back synchronously at DR-write time
+/// does not hold for this model version. This self-test is
+/// therefore hardware validation; the QEMU smoke gates on the
+/// register-level config proof instead (see
+/// [`Pl011::config_selftest_diag`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopbackOutcome {
     Pass,
@@ -175,21 +202,23 @@ impl Pl011 {
 
     /// Hardware loopback round-trip (CR.LBE): the TX path drives
     /// the RX path internally. Proves the mapped window is the
-    /// live device — the step-4 binding proof the boot smoke
-    /// asserts. NOTE on QEMU: the model loops TX back into RX
-    /// and still sends it to the backend, so pattern bytes on
-    /// the console are expected, not a failure sign.
+    /// live device. HARDWARE ONLY: QEMU 8.2's `virt` model does
+    /// not deliver loopback bytes to RX (measured; see the
+    /// [`LoopbackOutcome`] note), so this fails on QEMU runs
+    /// even with a correct driver — the QEMU smoke gates on
+    /// [`Self::config_selftest_diag`] instead. Pattern bytes on
+    /// the console are the TX half escaping to the backend, not
+    /// a failure sign on their own.
     ///
     /// Failure modes are named, not collapsed into one
     /// "mismatch": the loopback bit is verified stuck via a CR
     /// read-back; the transmitter-drain wait is advisory only
-    /// (on QEMU the loopback bytes are already in the RX FIFO
-    /// when the DR writes land, and FR.BUSY's model semantics
-    /// are not the real-hardware bit-time contract — a BUSY
-    /// wait that never clears must never skip the read-back,
-    /// as the old code did); the read-back poll budget is
-    /// generous so host-scheduling delays in the model cannot
-    /// masquerade as a device failure.
+    /// (FR.BUSY's model semantics are not the real-hardware
+    /// bit-time contract — a BUSY wait that never clears must
+    /// never skip the read-back, as the old code did); the
+    /// read-back poll budget is generous so host-scheduling
+    /// delays in the model cannot masquerade as a device
+    /// failure.
     pub fn loopback_selftest_diag(&mut self) -> LoopbackOutcome {
         while self.try_read_byte().is_some() {} // drain stale RX
         let cr = self.read(CR);
@@ -248,6 +277,59 @@ impl Pl011 {
     pub fn loopback_selftest(&mut self) -> bool {
         self.loopback_selftest_diag() == LoopbackOutcome::Pass
     }
+
+    /// Register-level config proof for model runs: the mapped
+    /// window returns the programmed line/control state, LBE
+    /// sticks, and TX drains. Does NOT assert RX loopback (see
+    /// [`LoopbackOutcome`]): QEMU 8.2's `virt` model never
+    /// delivers loopback bytes to RX, so gating the QEMU smoke
+    /// on loopback would fail a correct driver. The pattern
+    /// bytes still reach the backend console, which is the
+    /// TX half of the proof; RX loopback stays hardware-only
+    /// validation via [`Self::loopback_selftest_diag`].
+    pub fn config_selftest_diag(&mut self) -> ConfigOutcome {
+        while self.try_read_byte().is_some() {} // drain stale RX
+        let cr = self.read(CR);
+        if cr & (CR_UARTEN | CR_TXE | CR_RXE) != (CR_UARTEN | CR_TXE | CR_RXE) {
+            return ConfigOutcome::NotEnabled(cr);
+        }
+        let lcr = self.read(LCR_H);
+        if lcr & (LCR_H_FEN | LCR_H_WLEN_8) != (LCR_H_FEN | LCR_H_WLEN_8) {
+            return ConfigOutcome::BadLineControl(lcr);
+        }
+        self.write(CR, cr | CR_LBE);
+        // Verify the loopback bit actually stuck: a CR write
+        // that does not land must fail loudly here, not as a
+        // downstream "mismatch".
+        let cr_after = self.read(CR);
+        if cr_after & CR_LBE == 0 {
+            self.write(CR, cr);
+            return ConfigOutcome::LbeNotSet(cr_after);
+        }
+        const PATTERN: [u8; 3] = [0xA5, 0x3C, 0x55];
+        for &b in &PATTERN {
+            self.write_byte(b);
+        }
+        // TX-drain proof: the pattern bytes must leave the TX
+        // FIFO within the budget. On QEMU this is immediate
+        // (synchronous TX to the backend); on hardware it takes
+        // ~3 byte times at the programmed baud.
+        let mut drained = false;
+        for _ in 0..10_000_000 {
+            if self.read(FR) & FR_TXFE != 0 {
+                drained = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        self.write(CR, cr & !CR_LBE);
+        while self.try_read_byte().is_some() {} // drain any residue
+        if drained {
+            ConfigOutcome::Pass
+        } else {
+            ConfigOutcome::TxStuck
+        }
+    }
 }
 
 /// The bound port, stashed at probe (the `probe_all` pattern —
@@ -270,6 +352,12 @@ pub fn selftest_loopback() -> Option<bool> {
 /// not just pass/fail.
 pub fn selftest_loopback_diag() -> Option<LoopbackOutcome> {
     BOUND.lock().as_mut().map(|p| p.loopback_selftest_diag())
+}
+
+/// Register-level config proof on the bound port; `None` when
+/// no PL011 is bound.
+pub fn selftest_config_diag() -> Option<ConfigOutcome> {
+    BOUND.lock().as_mut().map(|p| p.config_selftest_diag())
 }
 
 fn probe_pl011(
