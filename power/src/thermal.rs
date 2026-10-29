@@ -119,6 +119,15 @@ struct Registry {
     /// device under the same lock that fired the event — no lock
     /// reentry from a subscriber callback is required.
     policy: Option<Box<dyn CoolingPolicy>>,
+    /// Last cooling level actually driven to the devices, by either
+    /// the governor (on a band crossing) or an explicit
+    /// `set_cooling_level` call. `None` until the first drive.
+    /// The platform suspend/resume lifecycle reads this back on
+    /// resume to re-assert the level firmware forgot across S3
+    /// (#916): the governor only drives on crossings, so without a
+    /// re-assert a level asserted before suspend is never
+    /// re-applied after resume.
+    last_level: Option<u8>,
 }
 
 impl core::fmt::Debug for Registry {
@@ -128,6 +137,7 @@ impl core::fmt::Debug for Registry {
             .field("publisher", &self.publisher.is_some())
             .field("cooling_devices", &self.cooling_devices.len())
             .field("policy", &self.policy.is_some())
+            .field("last_level", &self.last_level)
             .finish()
     }
 }
@@ -166,6 +176,7 @@ pub fn init() {
         publisher,
         cooling_devices: Vec::new(),
         policy: Some(Box::new(StepPolicy)),
+        last_level: None,
     });
 }
 
@@ -183,12 +194,23 @@ pub fn register_cooling_device(
 
 /// Set cooling level for all registered devices.
 pub fn set_cooling_level(level: u8) -> Result<(), ThermalError> {
-    let r = REG.lock();
-    let reg = r.as_ref().ok_or(ThermalError::NotInitialised)?;
+    let mut r = REG.lock();
+    let reg = r.as_mut().ok_or(ThermalError::NotInitialised)?;
     for dev in &reg.cooling_devices {
         dev.set_level(level);
     }
+    reg.last_level = Some(level);
     Ok(())
+}
+
+/// Last cooling level driven to the devices, or `None` if the
+/// registry is uninitialised or no level has ever been driven.
+/// The platform suspend/resume lifecycle (#916) re-asserts this
+/// level on resume: the governor only drives on band crossings,
+/// so a level asserted before S3 would otherwise never be
+/// re-applied after resume.
+pub fn current_cooling_level() -> Option<u8> {
+    REG.lock().as_ref().and_then(|reg| reg.last_level)
 }
 
 /// Register a new zone. Returns its id.
@@ -228,8 +250,8 @@ pub fn subscribe(
 /// non-blocking when the new reading stays in the same band as the
 /// previous one.
 pub fn record_temp(zone: u32, milli_c: i32) -> Result<ThermalState, ThermalError> {
-    let r = REG.lock();
-    let reg = r.as_ref().ok_or(ThermalError::NotInitialised)?;
+    let mut r = REG.lock();
+    let reg = r.as_mut().ok_or(ThermalError::NotInitialised)?;
     let z = reg
         .zones
         .get(zone as usize)
@@ -261,6 +283,7 @@ pub fn record_temp(zone: u32, milli_c: i32) -> Result<ThermalState, ThermalError
             for dev in &reg.cooling_devices {
                 dev.set_level(level);
             }
+            reg.last_level = Some(level);
         }
     }
 
