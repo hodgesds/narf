@@ -440,48 +440,35 @@ impl DockModel {
         ]
     }
 
-    /// Walk the composed PCIe tunnel's forward hop chain:
-    /// PCIe-DOWN adapter (fixed endpoint HopID 8) → allocated
-    /// lane hop on the host's dock link → allocated lane hop on
-    /// the dock's upstream link → PCIe-UP adapter (fixed HopID
-    /// 8). Lane HopIDs are allocated first-free from 8 (USB4
-    /// path setup), so with three tunnels composed they are not
-    /// 8 — the chain is followed by its Next-HopID fields
-    /// instead of pinning the IDs. The invariant fields are
-    /// pinned: valid bits, the PCIe protocol/counter encoding in
-    /// word 1's low half, and the buffer-allocation credit (2,
-    /// from the Switch-space allocation table) in the lane hops'
-    /// credit field.
+    /// Follow each directional PCIe path from protocol ingress HopID 8
+    /// through the remote lane HopID to protocol egress HopID 8. A path
+    /// has two programmed ingress entries: the source protocol adapter
+    /// and the destination lane. The opposite direction has its own
+    /// allocated lane ID; it is not another hop of the forward path.
     fn pcie_chain_ok(&self) -> bool {
-        let down = self.hop(0, 7, 8);
-        if down[0] & (1 << 31) == 0 || down[1] != 0x0200_0201 {
-            return false;
+        for (source, destination) in [(0, DOCK_ROUTE), (DOCK_ROUTE, 0)] {
+            let ingress = self.hop(source, 7, 8);
+            if ingress[0] & (1 << 31) == 0
+                || (ingress[0] >> 11) & 127 != 1
+                || ingress[1] != 0x0200_0201
+            {
+                return false;
+            }
+            let lane_id = (ingress[0] & 0x7ff) as u16;
+            if lane_id < 8 {
+                return false;
+            }
+            let lane = self.hop(destination, 1, lane_id);
+            if lane[0] & (1 << 31) == 0
+                || (lane[0] >> 11) & 127 != 7
+                || lane[0] & 0x7ff != 8
+                || (lane[0] >> 17) & 127 != 2
+                || lane[1] != 0x0100_0201
+            {
+                return false;
+            }
         }
-        let n1 = (down[0] & 0x7ff) as u16;
-        if n1 < 8 {
-            return false;
-        }
-        let lane_host = self.hop(0, 1, n1);
-        if lane_host[0] & (1 << 31) == 0
-            || lane_host[1] & 0xffff != 0x0201
-            || (lane_host[0] >> 17) & 127 != 2
-        {
-            return false;
-        }
-        let n2 = (lane_host[0] & 0x7ff) as u16;
-        if n2 < 8 {
-            return false;
-        }
-        let lane_dock = self.hop(DOCK_ROUTE, 1, n2);
-        if lane_dock[0] & (1 << 31) == 0
-            || lane_dock[1] & 0xffff != 0x0201
-            || (lane_dock[0] >> 17) & 127 != 2
-            || lane_dock[0] & 0x7ff != 8
-        {
-            return false;
-        }
-        let up = self.hop(DOCK_ROUTE, 7, 8);
-        up[0] & (1 << 31) != 0 && up[1] == 0x0200_0201
+        true
     }
 }
 
