@@ -34,7 +34,9 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+#[cfg(target_arch = "x86_64")]
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use narf_aml::eval::evaluate_method;
 use narf_aml::{find_node, for_each_node_of_kind, NameValue, NodeKind, Value};
@@ -197,6 +199,7 @@ pub fn init() {
 /// setting — its 0 is firmware auto control — so 0 hands the fan
 /// back to the firmware. Non-zero levels scale onto the eight
 /// explicit states L1..=L7 + FullSpeed.
+#[cfg(target_arch = "x86_64")]
 pub fn thinkpad_level_for(level: u8) -> crate::thinkpad_acpi::FanLevel {
     use crate::thinkpad_acpi::FanLevel;
     if level == 0 {
@@ -216,6 +219,7 @@ pub fn thinkpad_level_for(level: u8) -> crate::thinkpad_acpi::FanLevel {
 
 /// ThinkPad EC fan as a [`CoolingDevice`], driving
 /// `thinkpad_acpi::set_fan_level` (the `\HFNF` AML write).
+#[cfg(target_arch = "x86_64")]
 #[derive(Debug)]
 pub struct ThinkpadFan {
     /// Last applied vendor level (`FanLevel as u32`); `u32::MAX`
@@ -223,6 +227,7 @@ pub struct ThinkpadFan {
     last: AtomicU32,
 }
 
+#[cfg(target_arch = "x86_64")]
 impl ThinkpadFan {
     pub fn new() -> Self {
         Self {
@@ -231,12 +236,14 @@ impl ThinkpadFan {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 impl Default for ThinkpadFan {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 impl CoolingDevice for ThinkpadFan {
     fn name(&self) -> &'static str {
         "thinkpad-fan"
@@ -258,6 +265,7 @@ impl CoolingDevice for ThinkpadFan {
 /// the fan lives behind the same EC surface. Registration failure
 /// is logged, never swallowed silently (the #907 rule fan::init
 /// follows for ACPI fans).
+#[cfg(target_arch = "x86_64")]
 pub fn register_thinkpad_fan() {
     let cap = bootstrap_thermal_authority();
     match register_cooling_device(&cap, Arc::new(ThinkpadFan::new())) {
@@ -287,6 +295,7 @@ pub fn register_thinkpad_fan() {
 /// range splits between Normal and Overboost at 2/3, so the
 /// governor's three StepPolicy outputs (0 / 128 / 255) land on
 /// Silent / Normal / Overboost respectively.
+#[cfg(target_arch = "x86_64")]
 pub fn asus_mode_for(level: u8) -> crate::asus_wmi::FanBoostMode {
     use crate::asus_wmi::FanBoostMode;
     match level {
@@ -299,6 +308,7 @@ pub fn asus_mode_for(level: u8) -> crate::asus_wmi::FanBoostMode {
 /// ASUS fan boost mode as a [`CoolingDevice`], driving
 /// `asus_wmi::set_fan_boost_mode` (the `DEVID_FAN_BOOST` WMI
 /// devstate write).
+#[cfg(target_arch = "x86_64")]
 #[derive(Debug)]
 pub struct AsusFan {
     /// Last applied vendor mode (`FanBoostMode as u32`); `u32::MAX`
@@ -306,6 +316,7 @@ pub struct AsusFan {
     last: AtomicU32,
 }
 
+#[cfg(target_arch = "x86_64")]
 impl AsusFan {
     pub fn new() -> Self {
         Self {
@@ -314,12 +325,14 @@ impl AsusFan {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 impl Default for AsusFan {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 impl CoolingDevice for AsusFan {
     fn name(&self) -> &'static str {
         "asus-fan"
@@ -339,6 +352,7 @@ impl CoolingDevice for AsusFan {
 /// `asus_wmi::init()` when the ASUS WMI GUID is present (the
 /// driver's probe). Registration failure is logged, never
 /// swallowed silently.
+#[cfg(target_arch = "x86_64")]
 pub fn register_asus_fan() {
     let cap = bootstrap_thermal_authority();
     match register_cooling_device(&cap, Arc::new(AsusFan::new())) {
@@ -531,6 +545,7 @@ mod tests {
     }
     kernel_test_in!("drivers-platform-fan", smoke_pwm_fan_set_level_dispatches);
 
+    #[cfg(target_arch = "x86_64")]
     fn smoke_thinkpad_level_mapping() -> TestResult {
         use crate::thinkpad_acpi::FanLevel;
         // Boundary table for thinkpad_level_for: 0 hands the fan
@@ -567,8 +582,10 @@ mod tests {
         }
         TestResult::Pass
     }
+    #[cfg(target_arch = "x86_64")]
     kernel_test_in!("drivers-platform-fan", smoke_thinkpad_level_mapping);
 
+    #[cfg(target_arch = "x86_64")]
     fn smoke_asus_mode_mapping() -> TestResult {
         use crate::asus_wmi::FanBoostMode;
         // Boundary table for asus_mode_for: 0 → Silent (no demand),
@@ -599,8 +616,10 @@ mod tests {
         }
         TestResult::Pass
     }
+    #[cfg(target_arch = "x86_64")]
     kernel_test_in!("drivers-platform-fan", smoke_asus_mode_mapping);
 
+    #[cfg(target_arch = "x86_64")]
     fn smoke_vendor_fan_wrappers_drive_vendor_state() -> TestResult {
         use crate::asus_wmi::FanBoostMode;
         use crate::thinkpad_acpi::FanLevel;
@@ -643,6 +662,7 @@ mod tests {
         }
         TestResult::Pass
     }
+    #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
         "drivers-platform-fan",
         smoke_vendor_fan_wrappers_drive_vendor_state
