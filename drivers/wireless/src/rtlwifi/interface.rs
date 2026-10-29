@@ -52,6 +52,60 @@ pub(crate) struct Device<I: Port<Buffer = M>, M: Memory, E: Environment> {
     ht: AtomicBool,
     rx: Arc<IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
+    leisure: IrqSafeSpinLock<Leisure>,
+    /// `rtl_pci_remove` ran: the publisher worker exits.
+    removed: AtomicBool,
+}
+/// Linux `rtl_watchdog_wq_callback` LPS bookkeeping (`link_info`
+/// num_rx/tx_inperiod, `mac->cnt_after_linked`) plus a pending
+/// `rtl_lps_leave` request raised by the data path.
+#[derive(Default)]
+struct Leisure {
+    rx: u32,
+    tx: u32,
+    last_ms: Option<u64>,
+    linked: u8,
+    leave: bool,
+}
+/// `RTL_WATCHDOG_TIME` (base.h): 2 s LPS decision period.
+const WATCHDOG_MS: u64 = 2_000;
+/// Linux `rtl88ee_mod_params.fwctrl_lps` (module parameter `fwlps`),
+/// default off exactly like the upstream RTL8188EE driver.
+static FW_LPS: AtomicBool = AtomicBool::new(false);
+/// Module-parameter equivalent of `rtl8188ee fwlps=`.
+pub fn set_leisure_power_save(enabled: bool) {
+    FW_LPS.store(enabled, Ordering::Release);
+}
+/// Linux `rtl_watchdog_wq_callback`/`_rtl_pci_rx_interrupt` busy test:
+/// `num_rx + num_tx > 8 || num_rx > 2` leaves LPS.
+fn busy(rx: u32, tx: u32) -> bool {
+    rx + tx > 8 || rx > 2
+}
+/// Linux `rtl_is_special_data` (TX): EAPOL, ARP and DHCP (UDP 67/68)
+/// leave LPS before transmission.
+fn special(frame: &[u8]) -> bool {
+    match frame.get(12..14) {
+        Some([0x88, 0x8e]) | Some([0x08, 0x06]) => true,
+        Some([0x08, 0x00]) => {
+            let Some(&version) = frame.get(14) else {
+                return false;
+            };
+            let ihl = usize::from(version & 15) * 4;
+            if version >> 4 != 4 || ihl < 20 || frame.get(23) != Some(&17) {
+                return false;
+            }
+            let at = 14 + ihl;
+            match (frame.get(at..at + 2), frame.get(at + 2..at + 4)) {
+                (Some(src), Some(dst)) => {
+                    let src = u16::from_be_bytes([src[0], src[1]]);
+                    let dst = u16::from_be_bytes([dst[0], dst[1]]);
+                    matches!((src, dst), (68, 67) | (67, 68))
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 impl<I: Port<Buffer = M>, M: Memory, E: Environment> core::fmt::Debug for Device<I, M, E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -128,6 +182,8 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             ht: AtomicBool::new(false),
             rx: Arc::new(IrqSafeSpinLock::new(Some(consumer))),
             tx: IrqSafeSpinLock::new(Some(producer)),
+            leisure: IrqSafeSpinLock::new(Leisure::default()),
+            removed: AtomicBool::new(false),
         }
     }
     fn update_link(&self, peer: Option<[u8; 6]>) {
@@ -231,6 +287,11 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                     .and_then(|tx| tx.try_send(frame).map_err(|_| ())))
             })
         });
+        if let Some(signal) = self.environment.interrupt() {
+            // Interrupt-driven service sleeps until a vector fires; stack
+            // TX is the other wake source.
+            signal.raise();
+        }
         match result {
             Ok(Some(result)) => result,
             Ok(None) => Err(()),
@@ -252,6 +313,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         };
         if self.admission.closed.load(Ordering::Acquire) {
             state.clear();
+            self.withdraw_interrupts(owner);
             if self.admission.abort.load(Ordering::Acquire)
                 || owner.station_phase() == station::Phase::Failed
             {
@@ -266,6 +328,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             return Vec::new();
         }
         let result: Result<Vec<Received>, Error> = (|| {
+            self.service_interrupts(owner)?;
             let frames = owner.progress_station(&self.environment)?;
             owner.station_publication(&self.environment, || {
                 self.link(owner.station_peer());
@@ -297,10 +360,27 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                     }
                 }
             }
+            let mut sent = 0;
             if owner.station_transmit_ready() && !self.admission.closed.load(Ordering::Acquire) {
                 if let Some(frame) = state.pending.take() {
-                    owner.send_station_ethernet(frame.payload(), &self.environment)?;
+                    if owner.leisure() && special(frame.payload()) {
+                        // rtl_is_special_data: wake before EAPOL/ARP/DHCP.
+                        state.pending = Some(frame);
+                        self.request_leave();
+                    } else {
+                        owner.send_station_ethernet(frame.payload(), &self.environment)?;
+                        sent = 1;
+                    }
                 }
+            }
+            let busy = {
+                let mut leisure = self.leisure.lock();
+                leisure.rx = leisure.rx.saturating_add(frames.len() as u32);
+                leisure.tx = leisure.tx.saturating_add(sent);
+                busy(leisure.rx, leisure.tx)
+            };
+            if busy && owner.leisure() {
+                self.request_leave();
             }
             if self.admission.closed.load(Ordering::Acquire) {
                 state.clear();
@@ -333,11 +413,182 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         match result {
             Ok(frames) => frames,
             Err(_) => {
+                self.withdraw_interrupts(owner);
                 owner.abort_station();
                 state.clear();
                 self.close();
                 Vec::new()
             }
+        }
+    }
+    fn request_leave(&self) {
+        self.leisure.lock().leave = true;
+        if let Some(signal) = self.environment.interrupt() {
+            signal.raise();
+        }
+    }
+    /// One Linux LPS decision step (`rtl_watchdog_wq_callback` →
+    /// `rtl_lps_enter`/`rtl_lps_leave`, plus data-path leave requests).
+    /// Enter requires the `rtl_lps_enter_core` gates: fwctrl_lps, linked
+    /// for at least 5 watchdog periods, RSNA port open, and an idle
+    /// period. Any failed H2C/RPWM step leaves the owner Failed; the next
+    /// service pass aborts it like every other terminal hardware error.
+    pub(super) async fn power_save(&self, enabled: bool) {
+        let mut storage = self.prepared.lock().await;
+        let Some(owner) = storage.as_mut() else {
+            return;
+        };
+        if self.admission.closed.load(Ordering::Acquire) {
+            // disconnect_station_peer leaves PS itself before the report.
+            return;
+        }
+        let now = self.environment.now_ms();
+        let (leave, sample) = {
+            let mut leisure = self.leisure.lock();
+            let leave = core::mem::take(&mut leisure.leave);
+            let due = leisure
+                .last_ms
+                .is_none_or(|last| now.saturating_sub(last) >= WATCHDOG_MS);
+            let sample = due.then(|| {
+                leisure.last_ms = Some(now);
+                (
+                    core::mem::take(&mut leisure.rx),
+                    core::mem::take(&mut leisure.tx),
+                )
+            });
+            (leave, sample)
+        };
+        let linked = owner.phase() == Phase::Running && owner.station_linked();
+        if owner.leisure() && (leave || !enabled || !linked) {
+            let _ = owner.leave_leisure().await;
+            return;
+        }
+        let Some((rx, tx)) = sample else {
+            return;
+        };
+        let periods = {
+            let mut leisure = self.leisure.lock();
+            leisure.linked = if linked {
+                leisure.linked.saturating_add(1).min(20)
+            } else {
+                0
+            };
+            leisure.linked
+        };
+        if !enabled || !linked {
+            return;
+        }
+        if busy(rx, tx) {
+            if owner.leisure() {
+                let _ = owner.leave_leisure().await;
+            }
+        } else if periods >= 5 && !owner.leisure() && owner.transmit_ready() {
+            let _ = owner.enter_leisure().await;
+        }
+    }
+    /// Linux `rtl_pci_remove` for the native owner. `ieee80211_unregister_hw`
+    /// closes every control/packet path and withdraws the netdev, wireless
+    /// and stack registrations; `rtl_op_stop` → `rtl_pci_stop` masks the chip
+    /// (`disable_interrupt`) before `rtl_pci_deinit` releases the MSI vector;
+    /// a linked station first sends its JOINBSSRPT disconnect. The retained
+    /// owner is then stopped and must pass the card-disable quiescence proof
+    /// (`Prepared::quiesce`) before it is dropped and its rings released.
+    /// Returns whether the DMA mappings were reclaimed; otherwise they stay
+    /// pinned for the kernel's lifetime. Idempotent.
+    pub(super) async fn remove(self: &Arc<Self>) -> bool {
+        self.removed.store(true, Ordering::Release);
+        self.close();
+        if let Some(signal) = self.environment.interrupt() {
+            signal.raise();
+        }
+        self.withdraw();
+        let mut storage = self.prepared.lock().await;
+        self.state.lock().await.clear();
+        let Some(owner) = storage.as_mut() else {
+            return true;
+        };
+        self.withdraw_interrupts(owner);
+        if owner.station_peer().is_some() {
+            // Report the disconnect, then stop and prove the engines idle.
+            let _ = owner.disconnect_station_peer().await;
+        }
+        let reclaimed = owner.retire().await;
+        if reclaimed {
+            // Proven idle (or never published): Drop releases every ring.
+            storage.take();
+        }
+        reclaimed
+    }
+    /// Withdraw this device from every registry `publish` entered.
+    fn withdraw(self: &Arc<Self>) {
+        if !self.published.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let was_active = {
+            let mut active = ACTIVE.lock();
+            let this = Arc::as_ptr(self) as *const ();
+            let matches = active
+                .as_ref()
+                .is_some_and(|a| Arc::as_ptr(a) as *const () == this);
+            if matches {
+                *active = None;
+            }
+            matches
+        };
+        narf_wireless::registry::unregister(&self.name);
+        narf_net::registry().unregister(&self.name);
+        narf_net::iface::unregister(&self.name);
+        if was_active {
+            CLAIMED.store(false, Ordering::Release);
+        }
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn removed_for_test(&self) -> bool {
+        self.removed.load(Ordering::Acquire)
+    }
+    /// `rtl88e_dm_watchdog` RA step: refresh the firmware rate mask from
+    /// the smoothed RX PWDB. A failed H2C aborts the station (the next
+    /// service pass reports it like every other terminal hardware error).
+    pub(super) async fn rate_adaptive(&self) {
+        let mut storage = self.prepared.lock().await;
+        let Some(owner) = storage.as_mut() else {
+            return;
+        };
+        if self.admission.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let _ = owner.refresh_station_rate_mask(&self.environment).await;
+    }
+    /// Bind the running owner to its vector on first service, then run one
+    /// Linux `_rtl_pci_interrupt` recognition pass per wake. A failed bind
+    /// withdraws the vector and leaves the masks clear (polling fallback).
+    fn service_interrupts(&self, owner: &mut Prepared<I, M>) -> Result<(), Error> {
+        if !owner.interrupts_enabled()
+            && owner.phase() == Phase::Running
+            && self.environment.interrupt().is_some()
+        {
+            if owner.enable_interrupts().is_err() {
+                // A readback/authority failure is terminal for the owner.
+                self.environment.deliver(false);
+                return Err(Error::State);
+            }
+            if !self.environment.deliver(true) {
+                owner.disable_interrupts().map_err(|_| Error::State)?;
+            }
+        }
+        if owner.interrupts_enabled() {
+            owner.recognize_interrupts().map_err(|_| Error::State)?;
+        }
+        Ok(())
+    }
+    /// Mask the chip before releasing the vector (Linux `rtl_pci_stop`
+    /// disable_interrupt, then `rtl_pci_deinit` free_irq/pci_disable_msi).
+    fn withdraw_interrupts(&self, owner: &mut Prepared<I, M>) {
+        if owner.interrupts_enabled() {
+            let _ = owner.disable_interrupts();
+        }
+        if self.environment.interrupt().is_some() {
+            self.environment.deliver(false);
         }
     }
     pub(super) fn drain(&self) -> bool {
@@ -377,6 +628,16 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             }
         }
         progressed
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn fallback_for_test(&self) -> Option<bool> {
+        self.prepared
+            .try_lock()
+            .map(|storage| storage.as_ref().is_some_and(|o| o.station_fallback()))
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn pending_for_test(&self) -> Option<bool> {
+        self.state.try_lock().map(|state| state.pending.is_some())
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn admit_for_test(&self) {
@@ -622,6 +883,20 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         let owner = storage.as_mut().ok_or(WirelessError::Busy)?;
         let result = owner.disconnect_station().await.map_err(error);
         attempt.armed = false;
+        // Safe rejoin: a completed disassociation leaves a Passive station
+        // on the same live owner. Reopen admission under the owner and
+        // publication locks; the advanced receive epoch fences every stale
+        // publisher and the next station gets a new RX Narf-Ring.
+        if result.is_ok()
+            && owner.station_phase() == station::Phase::Passive
+            && !self.removed.load(Ordering::Acquire)
+        {
+            let _publication = self.admission.publication.lock();
+            self.admission.abort.store(false, Ordering::Release);
+            self.admission.closed.store(false, Ordering::Release);
+            self.ht
+                .store(owner.station_ht_capability().is_some(), Ordering::Release);
+        }
         result
     }
     async fn set_config(&self, config: WirelessConfig) -> Result<(), WirelessError> {
@@ -777,6 +1052,13 @@ impl Environment for NativeEnvironment {
         super::ht::Grant::registered(base, self.firmware.identity().ok_or(Error::State)?)
             .map_err(Error::Radio)
     }
+    fn fallback(
+        &self,
+        base: Arc<super::channel_power::Calibration>,
+    ) -> Result<Option<Arc<super::fallback::Grant>>, Error> {
+        super::fallback::Grant::registered(base, self.firmware.identity().ok_or(Error::State)?)
+            .map_err(Error::Radio)
+    }
     fn admission(&self) -> Option<&Arc<station::Admission>> {
         Some(&self.admission)
     }
@@ -797,6 +1079,12 @@ impl Environment for NativeEnvironment {
     }
     fn preparation_failed(&self) -> bool {
         self.firmware.status().stage == super::firmware_transport::Stage::Failed
+    }
+    fn interrupt(&self) -> Option<Arc<super::irq::Signal>> {
+        self.firmware.native().interrupt()
+    }
+    fn deliver(&self, enabled: bool) -> bool {
+        self.firmware.native().deliver(enabled)
     }
 }
 pub(super) type Native = Device<
@@ -844,14 +1132,37 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
     device.published.store(true, Ordering::Release);
     narf_net::iface::install_rx_drain(drain);
     narf_wireless::registry::register(device.clone());
+    // Linux `rtl_pci_intr_mode_decide`: MSI first. Without a vector the
+    // owner keeps every IMR clear and this worker polls at 1 ms.
+    device.environment.firmware.native().arm_msi();
     narf_scheduler::spawn(async move {
         loop {
+            if device.removed.load(Ordering::Acquire) {
+                break;
+            }
+            // Snapshot before servicing so a vector raised mid-pass is seen.
+            let signal = device.environment.interrupt();
+            let seen = signal.as_ref().map(|s| s.count());
             device.drain();
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+            device.power_save(FW_LPS.load(Ordering::Acquire)).await;
+            device.rate_adaptive().await;
+            match (signal, seen) {
+                (Some(signal), Some(seen)) => {
+                    // Station deadlines are millisecond timers; a slow
+                    // housekeeping tick replaces 1 ms polling.
+                    let tick = Box::pin(narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(
+                        HOUSEKEEPING_NS,
+                    )));
+                    signal.wait(seen, tick).await;
+                }
+                _ => narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await,
+            }
         }
     });
     Ok(())
 }
+/// Housekeeping tick while a bound vector drives RX/TX service.
+const HOUSEKEEPING_NS: u64 = 20_000_000;
 struct Registered(Arc<Native>);
 impl Interface for Registered {
     fn name(&self) -> &str {

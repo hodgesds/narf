@@ -16,6 +16,21 @@ pub(super) struct Env {
     policy: Option<Arc<narf_wireless::reg::db::Database>>,
     qualification:
         Option<narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>>,
+    /// `NEFB` fixture: (source cap, firmware identity, admissible body).
+    pub(super) fallback: IrqSafeSpinLock<Option<FallbackSource>>,
+}
+pub(super) type FallbackSource = (
+    narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+    super::super::super::super::firmware_transport::Identity,
+    bool,
+);
+/// A fresh `NEFB` fixture source over an unsourced firmware identity.
+pub(super) fn fallback_source(valid: bool) -> FallbackSource {
+    (
+        narf_capabilities::Cap::bootstrap(),
+        super::super::super::super::firmware_transport::Identity::fixture(b"ee fallback fw"),
+        valid,
+    )
 }
 impl Env {
     fn new() -> Self {
@@ -25,10 +40,32 @@ impl Env {
             entropy: AtomicBool::new(true),
             policy: None,
             qualification: None,
+            fallback: IrqSafeSpinLock::new(None),
         }
     }
 }
 impl Environment for Env {
+    fn fallback(
+        &self,
+        base: Arc<super::super::super::super::channel_power::Calibration>,
+    ) -> Result<Option<Arc<super::super::super::super::fallback::Grant>>, StationError> {
+        let Some((cap, firmware, valid)) = *self.fallback.lock() else {
+            return Ok(None);
+        };
+        let mut body = super::super::super::super::fallback::tests::artifact(&base, firmware);
+        if !valid {
+            body[119] = 1; // Any payload byte beyond byte0 is inadmissible.
+        }
+        super::super::super::super::fallback::Grant::parse(
+            base,
+            firmware,
+            &body,
+            Some([0x77; 32]),
+            cap,
+        )
+        .map(|g| Some(Arc::new(g)))
+        .map_err(StationError::Radio)
+    }
     fn now_ms(&self) -> u64 {
         self.now.load(Ordering::Acquire)
     }
@@ -94,6 +131,7 @@ pub(super) struct Peer {
     ht: Option<Vec<u8>>,
     controls: Vec<Vec<u8>>,
     hold_control: bool,
+    tids: Vec<u8>,
 }
 impl Peer {
     fn new(protected: bool) -> Self {
@@ -127,6 +165,7 @@ impl Peer {
             ht: None,
             controls: Vec::new(),
             hold_control: false,
+            tids: Vec::new(),
         }
     }
     fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
@@ -166,12 +205,11 @@ impl Peer {
             return Err("native AP peer identity");
         }
         if frame[0] == 0xd0 && self.ht.is_some() {
-            if frame.len() != 33
-                || frame[24..26] != [3, 1]
-                || frame[27..29] != [37, 0]
-                || frame[29] & 1 != 0
+            // Driver-owned BA actions: ADDBA Request/Response (33) or DELBA (30).
+            if !(frame.len() == 33 && matches!(frame[24..26], [3, 0] | [3, 1])
+                || frame.len() == 30 && frame[24..26] == [3, 2])
             {
-                return Err("AP native ADDBA refusal identity/status");
+                return Err("AP native BA action identity");
             }
             self.controls.push(frame.to_vec());
             return Ok((Vec::new(), self.hold_control));
@@ -214,14 +252,15 @@ impl Peer {
         {
             return Err("native AP data protection/direction");
         }
-        let header = if frame[0] == 0x88 {
-            if frame.get(24..26) != Some(&[0, 0]) {
-                return Err("AP BE/TID0 QoS control");
+        let (header, tid) = if frame[0] == 0x88 {
+            match frame.get(24..26) {
+                Some(&[tid, 0]) if tid < 8 => (26, tid),
+                _ => return Err("AP QoS control TID/ack policy"),
             }
-            26
         } else {
-            24
+            (24, 0)
         };
+        self.tids.push(tid);
         let mut body = frame[header..].to_vec();
         if self.ap.protected() {
             let key: &[u8; 16] = self
@@ -236,7 +275,7 @@ impl Peer {
                 &Ccm,
                 &frame[..header],
                 key,
-                0,
+                tid,
                 false,
                 &mut self.replay,
                 &mut body,
@@ -397,8 +436,13 @@ fn smoke_rtl8188ee_negotiated_legacy_data_rate_uses_native_descriptor_and_ccmp()
                 return TestResult::Fail("EE actual richer-rate native data/CCMP");
             }
             let descriptor = port.descriptor(4, slot);
+            // The level-0 RA mask is installed at association, but without
+            // a separate NEFB grant DATA keeps the signed fixed-rate
+            // profile: USE_RATE + DISDATAFB at the highest rate, RATE_ID 0.
             if word(&descriptor, 20) & 63 != expected
-                || word(&descriptor, 16) & ((1 << 8) | (1 << 10)) != ((1 << 8) | (1 << 10))
+                || word(&descriptor, 16) & ((1 << 8) | (1 << 10)) != (1 << 8) | (1 << 10)
+                || (word(&descriptor, 4) >> 16) & 15 != 0
+                || owner.rate_mask() != Some(if expected <= 3 { 6 } else { 4 })
             {
                 return TestResult::Fail("EE response intersection or native forced rate differs");
             }
@@ -424,6 +468,116 @@ fn smoke_rtl8188ee_negotiated_legacy_data_rate_uses_native_descriptor_and_ccmp()
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rates",
     smoke_rtl8188ee_negotiated_legacy_data_rate_uses_native_descriptor_and_ccmp
+);
+/// One legacy DATA frame: (DISDATAFB set, TXD RATE_ID, forced rate).
+fn data_profile(
+    owner: &mut Prepared<PacketPort, Block>,
+    port: &PacketPort,
+    peer: &Arc<IrqSafeSpinLock<Peer>>,
+    env: &Env,
+    n: u8,
+) -> Result<(bool, u32, u32), &'static str> {
+    let plan = peer.lock().plan;
+    let ethernet = udp_ipv4(
+        PEER,
+        plan.station,
+        plan.lease_ip,
+        plan.server_ip,
+        44000,
+        44001,
+        &[n; 24],
+    );
+    let slot = port.model.lock().slots[4];
+    if owner.send_station_ethernet(&ethernet, env).is_err()
+        || owner.progress_station(env).is_err()
+        || peer.lock().uplink.last() != Some(&ethernet)
+    {
+        return Err("EE fallback-profile DATA was not delivered");
+    }
+    let d = port.descriptor(4, slot);
+    if word(&d, 16) & (1 << 8) == 0 {
+        return Err("EE DATA lost the forced USE_RATE (88EE use_driver_rate)");
+    }
+    Ok((
+        word(&d, 16) & (1 << 10) != 0,
+        (word(&d, 4) >> 16) & 15,
+        word(&d, 20) & 63,
+    ))
+}
+fn smoke_rtl8188ee_data_fallback_requires_separate_signed_grant() -> TestResult {
+    for protected in [false, true] {
+        // Granted at association: DATA clears DISDATAFB and carries the
+        // RA mask's RATE_ID (G: 4) at the highest negotiated rate.
+        let (mut owner, port, peer, env) =
+            started_rates(protected, Some(WMM.to_vec()), Some(&LEGACY_RATES));
+        *env.fallback.lock() = Some(fallback_source(true));
+        let fallback = (*env.fallback.lock()).unwrap().0;
+        if complete(owner.connect_station(
+            PEER,
+            SSID,
+            if protected {
+                SecurityMode::Wpa2Psk
+            } else {
+                SecurityMode::Open
+            },
+            protected.then(|| Zeroizing::new(PMK)),
+            &[],
+            &env,
+        ))
+        .is_err()
+            || !owner.station_fallback()
+            || owner.rate_mask() != Some(4)
+        {
+            return TestResult::Fail("EE granted association did not hold the NEFB grant");
+        }
+        match data_profile(&mut owner, &port, &peer, &env, 1) {
+            Ok((false, 4, 11)) => {}
+            Ok(_) => return TestResult::Fail("EE granted DATA did not enable firmware fallback"),
+            Err(e) => return TestResult::Fail(e),
+        }
+        // Revoked mid-link: the next DATA returns to USE_RATE + DISFB at
+        // the same rate; the link, keys and the RA mask stay.
+        fallback.revoke();
+        match data_profile(&mut owner, &port, &peer, &env, 2) {
+            Ok((true, 0, 11)) => {}
+            Ok(_) => return TestResult::Fail("EE revoked NEFB grant kept firmware fallback"),
+            Err(e) => return TestResult::Fail(e),
+        }
+        if owner.station_fallback()
+            || owner.station_peer().is_none()
+            || !owner.station_linked()
+            || owner.rate_mask() != Some(4)
+        {
+            return TestResult::Fail("EE NEFB revocation dropped the link or kept the grant");
+        }
+        // The watchdog pass re-proves the grant and never re-enables it.
+        if complete(owner.refresh_station_rate_mask(&env)).is_err() || owner.station_fallback() {
+            return TestResult::Fail("EE watchdog pass resurrected a revoked NEFB grant");
+        }
+        match data_profile(&mut owner, &port, &peer, &env, 3) {
+            Ok((true, 0, 11)) => {}
+            _ => return TestResult::Fail("EE post-revocation DATA changed"),
+        }
+        // Teardown: disassociation forgets the association's grant.
+        if complete(owner.disconnect_station()).is_err() || owner.station_fallback() {
+            return TestResult::Fail("EE disassociation kept the NEFB grant");
+        }
+    }
+    // An inadmissible (non-zero reserved payload) signed record refuses
+    // the association instead of silently changing the emission profile.
+    let (mut owner, _port, _peer, env) =
+        started_rates(false, Some(WMM.to_vec()), Some(&LEGACY_RATES));
+    *env.fallback.lock() = Some(fallback_source(false));
+    if complete(owner.connect_station(PEER, SSID, SecurityMode::Open, None, &[], &env)).is_ok()
+        || owner.station_fallback()
+    {
+        return TestResult::Fail("EE inadmissible NEFB record changed DATA fallback");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rates",
+    smoke_rtl8188ee_data_fallback_requires_separate_signed_grant
 );
 fn smoke_rtl8188ee_wmm_real_dma_edca_and_open_wpa2_qos_data() -> TestResult {
     for protected in [false, true] {
@@ -529,6 +683,222 @@ fn smoke_rtl8188ee_wmm_real_dma_edca_and_open_wpa2_qos_data() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtlwifi/wmm",
     smoke_rtl8188ee_wmm_real_dma_edca_and_open_wpa2_qos_data
+);
+/// Rewrite the IPv4 TOS byte and its header checksum (RFC 791).
+fn with_tos(mut ethernet: Vec<u8>, tos: u8) -> Vec<u8> {
+    ethernet[15] = tos;
+    ethernet[24..26].copy_from_slice(&[0, 0]);
+    let mut sum = 0u32;
+    for pair in ethernet[14..34].chunks(2) {
+        sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+    }
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    ethernet[24..26].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    ethernet
+}
+fn smoke_rtl8188ee_wmm_classifies_dscp_to_all_tids_and_access_category_rings() -> TestResult {
+    // (ACM mask over BE8/BK4/VI2/VO1 rows, TOS, TID, TX_BASES vector, doorbell):
+    // cfg80211_classify8021d (RFC 8325), then ieee80211_downgrade_queue.
+    const CASES: [(u8, u8, u8, usize, u16); 9] = [
+        (0, 0x00, 0, 4, 2), // DF -> BE
+        (0, 0x20, 1, 5, 1), // CS1 -> BK
+        (0, 0x30, 0, 4, 2), // AF12 -> 0 (RFC 8325 section 4.8)
+        (0, 0x50, 3, 4, 2), // AF22 -> 3 (BE)
+        (0, 0x88, 4, 3, 4), // AF41 -> VI
+        (0, 0xb8, 6, 2, 8), // EF -> VO
+        (0, 0xc0, 7, 2, 8), // CS6 -> VO
+        (1, 0xb8, 5, 3, 4), // VO ACM: EF downgraded to VI
+        (3, 0xb8, 3, 4, 2), // VO+VI ACM: EF downgraded to BE
+    ];
+    for protected in [false, true] {
+        for (acm, tos, tid, vector, doorbell) in CASES {
+            let mut parameters = WMM.to_vec();
+            // WMM row ACI/AIFSN bytes: VO at10, VI at18; ACM is bit4.
+            if acm & 1 != 0 {
+                parameters[10] |= 16;
+            }
+            if acm & 2 != 0 {
+                parameters[18] |= 16;
+            }
+            let (mut owner, port, peer, env) = started_profile(protected, Some(parameters));
+            if complete(owner.connect_station(
+                PEER,
+                SSID,
+                if protected {
+                    SecurityMode::Wpa2Psk
+                } else {
+                    SecurityMode::Open
+                },
+                protected.then(|| Zeroizing::new(PMK)),
+                &[],
+                &env,
+            ))
+            .is_err()
+            {
+                return TestResult::Fail("EE WMM ACM profile native association failed");
+            }
+            let plan = peer.lock().plan;
+            // Two frames per TID prove the per-TID SN and CCMP priority.
+            let mut first: Option<u16> = None;
+            for round in 0..2u16 {
+                let ethernet = with_tos(
+                    udp_ipv4(
+                        PEER,
+                        plan.station,
+                        plan.lease_ip,
+                        plan.server_ip,
+                        46000 + round,
+                        46001,
+                        b"EE classified QoS",
+                    ),
+                    tos,
+                );
+                let slot = port.model.lock().slots[vector];
+                if owner.send_station_ethernet(&ethernet, &env).is_err()
+                    || owner.progress_station(&env).is_err()
+                {
+                    return TestResult::Fail("EE classified QoS publication/receipt failed");
+                }
+                {
+                    let p = peer.lock();
+                    if p.uplink.last() != Some(&ethernet) || p.tids.last() != Some(&tid) {
+                        return TestResult::Fail("EE AP did not receive exact classified TID/CCMP");
+                    }
+                }
+                let model = port.model.lock();
+                let sequence = model
+                    .observed
+                    .last()
+                    .and_then(|f| f.get(22..24))
+                    .map(|s| u16::from_le_bytes([s[0], s[1]]) >> 4);
+                // Open starts each TID at SN0; shared Security seeds every
+                // TID from its supplicant SN. Either way the TID advances alone.
+                let expected = match (first, protected) {
+                    (Some(first), _) => Some((first + 1) & 4095),
+                    (None, false) => Some(0),
+                    (None, true) => sequence,
+                };
+                first = sequence;
+                if sequence.is_none()
+                    || sequence != expected
+                    || model.kicks.last() != Some(&doorbell)
+                {
+                    return TestResult::Fail("EE per-TID SN or AC doorbell differs");
+                }
+                drop(model);
+                let descriptor = port.descriptor(vector, slot);
+                if (word(&descriptor, 4) >> 8) & 31 != u32::from(tid)
+                    || word(&descriptor, 16) & 64 == 0
+                    || word(&descriptor, 0) & OWN != 0
+                {
+                    return TestResult::Fail("EE AC ring descriptor QSEL/QOS/receipt differs");
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/wmm",
+    smoke_rtl8188ee_wmm_classifies_dscp_to_all_tids_and_access_category_rings
+);
+fn smoke_rtl8188ee_wmm_beacon_parameter_set_count_updates_live_edca() -> TestResult {
+    const BASE: [u32; 4] = [0xa546, 0xa496, 0x005e4332, 0x002f3232];
+    for protected in [false, true] {
+        let (mut owner, port, peer, env) = started_profile(protected, Some(WMM.to_vec()));
+        if complete(owner.connect_station(
+            PEER,
+            SSID,
+            if protected {
+                SecurityMode::Wpa2Psk
+            } else {
+                SecurityMode::Open
+            },
+            protected.then(|| Zeroizing::new(PMK)),
+            &[],
+            &env,
+        ))
+        .is_err()
+        {
+            return TestResult::Fail("EE WMM native association failed");
+        }
+        let edca = || [0x508, 0x50c, 0x504, 0x500].map(|r| port.radio.word(r));
+        if edca() != BASE {
+            return TestResult::Fail("EE initial EDCA literals differ");
+        }
+        let beacon = |parameters: &[u8]| {
+            let mut b = peer.lock().ap.beacon();
+            b.extend_from_slice(parameters);
+            b
+        };
+        // Same Parameter Set Count: mac80211 ignores the changed rows.
+        let mut same = WMM;
+        same[20] = 100;
+        if port.emit(&beacon(&same)).is_err()
+            || owner.progress_station(&env).is_err()
+            || edca() != BASE
+            || owner.station_peer().is_none()
+        {
+            return TestResult::Fail("EE unchanged WMM count reprogrammed or closed EDCA");
+        }
+        // New count: VI TXOP94->100, VO AIFSN2->3, BK ECW narrowed.
+        let mut fresh = WMM;
+        fresh[8] = 0x82;
+        fresh[20] = 100;
+        fresh[10] = 0x63;
+        fresh[23] = 0x94;
+        if port.emit(&beacon(&fresh)).is_err() || owner.progress_station(&env).is_err() {
+            return TestResult::Fail("EE live WMM update failed");
+        }
+        if edca() != [0xa546, 0x9496, 0x00644332, 0x002f3246] || owner.station_peer().is_none() {
+            return TestResult::Fail("EE live EDCA rows differ from the new parameter set");
+        }
+        // Data continues on the updated profile.
+        let plan = peer.lock().plan;
+        let ethernet = udp_ipv4(
+            PEER,
+            plan.station,
+            plan.lease_ip,
+            plan.server_ip,
+            47000,
+            47001,
+            b"EE after EDCA update",
+        );
+        if owner.send_station_ethernet(&ethernet, &env).is_err()
+            || owner.progress_station(&env).is_err()
+            || peer.lock().uplink.last() != Some(&ethernet)
+        {
+            return TestResult::Fail("EE data after live EDCA update failed");
+        }
+        // A later set that this profile cannot admit (BE ACM) is terminal
+        // before any EDCA write.
+        let mut refused = fresh;
+        refused[8] = 0x83;
+        refused[14] |= 16;
+        refused[20] = 120;
+        let retained = port.live_regions();
+        if port.emit(&beacon(&refused)).is_err() {
+            return TestResult::Fail("EE refused WMM beacon fixture");
+        }
+        let _ = owner.progress_station(&env);
+        if owner.station_peer().is_some()
+            || owner.send_station_ethernet(&ethernet, &env).is_ok()
+            || edca() != [0xa546, 0x9496, 0x00644332, 0x002f3246]
+        {
+            return TestResult::Fail("EE inadmissible live WMM set was written or kept carrier");
+        }
+        drop(owner);
+        if retained.iter().any(|r| !r.live.load(Ordering::Acquire)) {
+            return TestResult::Fail("EE refused live WMM update freed native DMA");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/wmm",
+    smoke_rtl8188ee_wmm_beacon_parameter_set_count_updates_live_edca
 );
 fn smoke_rtl8188ee_wmm_malformed_response_and_native_readback_are_terminal() -> TestResult {
     for case in 0..4 {
@@ -672,11 +1042,17 @@ pub(crate) fn smoke_rtl8188ee_real_station_open_wpa2_native_exact_ip() -> TestRe
             return TestResult::Fail("native station downlink exact Ethernet/IP mismatch");
         }
         complete(owner.disconnect_station()).unwrap();
-        if owner.station_peer().is_some() || port.model.lock().master {
-            return TestResult::Fail("native station disconnect retained carrier/BME");
+        // Safe rejoin: the live owner (BME on) is Passive with no peer.
+        if owner.station_peer().is_some()
+            || !port.model.lock().master
+            || owner.station_phase() != Logical::Passive
+            || owner.rate_mask().is_some()
+            || port.radio.read8(0x618).unwrap() != 0
+        {
+            return TestResult::Fail("native station disconnect kept the peer or stopped DMA");
         }
         if owner.station_transmit_ready() {
-            return TestResult::Fail("native stopped station reopened transmit");
+            return TestResult::Fail("native disconnected station reopened transmit");
         }
     }
     TestResult::Pass

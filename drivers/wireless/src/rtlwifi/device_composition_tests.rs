@@ -89,7 +89,23 @@ type HtFixtureSource = (
     narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
     super::super::super::super::super::firmware_transport::Identity,
 );
+/// Inert MSI binding: the vector "fires" only when a test raises it.
+struct IrqFixture {
+    signal: IrqSafeSpinLock<Option<Arc<super::super::super::super::super::irq::Signal>>>,
+    refuse: AtomicBool,
+    delivered: IrqSafeSpinLock<Vec<bool>>,
+}
+impl Default for IrqFixture {
+    fn default() -> Self {
+        Self {
+            signal: IrqSafeSpinLock::new(None),
+            refuse: AtomicBool::new(false),
+            delivered: IrqSafeSpinLock::new(Vec::new()),
+        }
+    }
+}
 struct DeviceEnvironment {
+    irq: Arc<IrqFixture>,
     admission: Arc<Admission>,
     base: Arc<Env>,
     packet: PacketPort,
@@ -97,6 +113,12 @@ struct DeviceEnvironment {
     ht: Option<HtFixtureSource>,
 }
 impl Environment for DeviceEnvironment {
+    fn fallback(
+        &self,
+        base: Arc<super::super::super::super::super::channel_power::Calibration>,
+    ) -> Result<Option<Arc<super::super::super::super::super::fallback::Grant>>, StationError> {
+        self.base.fallback(base)
+    }
     fn ht20(
         &self,
         base: Arc<super::super::super::super::super::channel_power::Calibration>,
@@ -118,6 +140,17 @@ impl Environment for DeviceEnvironment {
     }
     fn admission(&self) -> Option<&Arc<Admission>> {
         Some(&self.admission)
+    }
+    fn interrupt(&self) -> Option<Arc<super::super::super::super::super::irq::Signal>> {
+        self.irq.signal.lock().clone()
+    }
+    fn deliver(&self, enabled: bool) -> bool {
+        self.irq.delivered.lock().push(enabled);
+        if enabled && !self.irq.refuse.load(Ordering::Acquire) {
+            return true;
+        }
+        *self.irq.signal.lock() = None;
+        false
     }
     fn now_ms(&self) -> u64 {
         self.base.now_ms()
@@ -169,6 +202,7 @@ struct Harness {
     firmware: Arc<Firmware<BootPort>>,
     base_cap: Option<narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>>,
     ht_source: Option<HtFixtureSource>,
+    irq: Arc<IrqFixture>,
 }
 impl Harness {
     fn new(protected: bool) -> Self {
@@ -264,11 +298,13 @@ impl Harness {
         }
         packet.model.lock().peer = Some(peer.clone());
         let name = narf_net::iface::reserve_name("ee-native%d");
+        let irq = Arc::new(IrqFixture::default());
         let device = Arc::new(Device::new(
             name,
             Arc::new(Mutex::new(Some(owner))),
             factory,
             DeviceEnvironment {
+                irq: irq.clone(),
                 admission: Arc::new(Admission::new()),
                 base: env.clone(),
                 packet: packet.clone(),
@@ -291,6 +327,7 @@ impl Harness {
             firmware,
             base_cap,
             ht_source,
+            irq,
         }
     }
     fn request(&self) -> AssociateRequest {
@@ -340,6 +377,17 @@ impl Harness {
         for _ in 0..16 {
             self.device.drain();
         }
+    }
+    /// The live owner returned to Passive scanning (safe rejoin).
+    fn passive(&self) -> bool {
+        self.packet.model.lock().master
+            && self.device.prepared.try_lock().is_some_and(|owner| {
+                owner.as_ref().is_some_and(|owner| {
+                    owner.phase() == Phase::Running
+                        && owner.station_phase()
+                            == super::super::super::super::station::Phase::Passive
+                })
+            })
     }
     fn closed(&self) -> bool {
         !self.device.link_up()
@@ -429,13 +477,51 @@ fn composition(protected: bool) -> TestResult {
     if h.packet.model.lock().error.is_some() || h.firmware.claim_packet_io().is_ok() {
         return TestResult::Fail("EE device failed native wire or reopened firmware owner");
     }
-    if complete(h.device.disassociate()).is_err() || !h.closed() || h.packet.model.lock().master {
-        return TestResult::Fail("EE disconnect retained carrier or bus mastering");
+    let reports = h.packet.model.lock().commands.len();
+    if complete(h.device.disassociate()).is_err() || !h.closed() || !h.passive() {
+        return TestResult::Fail("EE disconnect retained carrier or left Passive");
     }
-    if complete(h.device.associate(h.request())).is_ok()
+    if h.packet.model.lock().commands[reports..] != [(1, vec![0])]
         || narf_net::iface::send_on(h.device.name(), &uplink).is_ok()
     {
-        return TestResult::Fail("EE terminal native station reopened");
+        return TestResult::Fail("EE disconnect skipped JOINBSSRPT or kept data admission");
+    }
+    // Safe rejoin on the same live owner: a fresh AP session, a new
+    // reserved-page upload on the reused beacon descriptor, and data.
+    {
+        let mut p = h.peer.lock();
+        let fresh = Peer::new(protected);
+        p.ap = fresh.ap;
+        p.ptk = fresh.ptk;
+        p.replay = fresh.replay;
+        p.pn = fresh.pn;
+    }
+    let uploads = h.packet.model.lock().reserved.len();
+    h.scan();
+    if complete(h.device.associate(h.request())).is_err()
+        || !h.device.link_up()
+        || h.packet.model.lock().reserved.len() != uploads + 1
+    {
+        return TestResult::Fail("EE Passive owner refused a second association");
+    }
+    let again = udp_ipv4(
+        PEER,
+        plan.station,
+        plan.lease_ip,
+        plan.server_ip,
+        49153,
+        7,
+        b"native-ee-device-rejoin",
+    );
+    if narf_net::iface::send_on(h.device.name(), &again).is_err() {
+        return TestResult::Fail("EE rejoined Device rejected IP uplink");
+    }
+    h.pump();
+    if h.peer.lock().uplink.last() != Some(&again) {
+        return TestResult::Fail("EE rejoined Device uplink/MIC differs");
+    }
+    if complete(h.device.disassociate()).is_err() || !h.passive() {
+        return TestResult::Fail("EE second disconnect did not return to Passive");
     }
     let before = h.packet.drops.load(Ordering::SeqCst);
     let packet = h.packet.clone();
@@ -447,6 +533,225 @@ fn composition(protected: bool) -> TestResult {
     }
     TestResult::Pass
 }
+/// The publisher binds the running owner to its vector, recognizes W1C
+/// causes per wake, wakes on stack TX, and masks before releasing the
+/// vector at close. A refused bind falls back to masked polling.
+pub(crate) fn smoke_rtl8188ee_native_device_irq_worker_binds_and_releases_vector() -> TestResult {
+    use super::super::super::super::super::irq::{Signal, IRQ_MASK0_88E, IRQ_MASK1_88E};
+    let h = Harness::new(false);
+    let signal = Signal::new();
+    *h.irq.signal.lock() = Some(signal.clone());
+    h.join();
+    h.pump();
+    if h.packet.radio.word(0xb0) != IRQ_MASK0_88E
+        || h.packet.radio.word(0xb8) != IRQ_MASK1_88E
+        || *h.irq.delivered.lock() != [true]
+    {
+        return TestResult::Fail("EE publisher did not bind the running owner to its vector");
+    }
+    // A pending ROK is recognized (W1C) by the next woken pass.
+    h.packet.radio.hardware_word(0xb4, 1);
+    signal.raise();
+    h.device.drain();
+    if h.packet.radio.word(0xb4) != 0 || h.packet.radio.word(0xb0) != IRQ_MASK0_88E {
+        return TestResult::Fail("EE woken pass skipped _rtl_pci_interrupt recognition");
+    }
+    let plan = h.peer.lock().plan;
+    let uplink = udp_ipv4(
+        PEER,
+        plan.station,
+        plan.lease_ip,
+        plan.server_ip,
+        49152,
+        7,
+        b"ee-irq-wake",
+    );
+    let seen = signal.count();
+    let _ = narf_net::iface::send_on(h.device.name(), &uplink);
+    if signal.count() == seen {
+        return TestResult::Fail("EE stack TX did not wake the interrupt worker");
+    }
+    if complete(h.device.disassociate()).is_err() {
+        return TestResult::Fail("EE IRQ-bound disassociate failed");
+    }
+    // Disassociation keeps the live owner (Linux keeps interrupts on);
+    // removal masks the chip before releasing the vector.
+    let _ = complete(h.device.remove());
+    h.pump();
+    if h.packet.radio.word(0xb0) != 0
+        || h.packet.radio.word(0xb8) != 0
+        || h.irq.delivered.lock().last() != Some(&false)
+        || h.irq.signal.lock().is_some()
+    {
+        return TestResult::Fail("EE close released the vector before masking HIMR");
+    }
+    drop(h);
+    // Refused delivery: masks return to zero and service keeps polling.
+    let h = Harness::new(false);
+    *h.irq.signal.lock() = Some(Signal::new());
+    h.irq.refuse.store(true, Ordering::Release);
+    h.join();
+    h.pump();
+    if h.packet.radio.word(0xb0) != 0
+        || h.packet.radio.word(0xb8) != 0
+        || h.irq.signal.lock().is_some()
+        || !h.device.link_up()
+    {
+        return TestResult::Fail("EE refused vector did not fall back to masked polling");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/device",
+    smoke_rtl8188ee_native_device_irq_worker_binds_and_releases_vector
+);
+/// Linux watchdog LPS policy on the composed device: enter after five
+/// idle linked periods, wake before special (DHCP) TX, leave on busy
+/// traffic, stay awake while fwlps is off, and leave before disconnect.
+pub(crate) fn smoke_rtl8188ee_native_device_leisure_policy_follows_linux_watchdog() -> TestResult {
+    let h = Harness::new(false);
+    h.join();
+    h.pump();
+    let leisure = |h: &Harness| {
+        h.device
+            .prepared
+            .try_lock()
+            .is_some_and(|owner| owner.as_ref().is_some_and(|owner| owner.leisure()))
+    };
+    // One watchdog period: the AP keeps beaconing (the firmware wakes for
+    // DTIM beacons in LPS), so the station's peer-loss timer stays fed.
+    let period = |h: &Harness, enabled: bool| {
+        h.env.now.fetch_add(2_000, Ordering::AcqRel);
+        let beacon = { h.peer.lock().ap.beacon() };
+        h.packet.emit(&beacon).unwrap();
+        h.device.drain();
+        complete(h.device.power_save(enabled));
+    };
+    h.packet.model.lock().commands.clear();
+    for _ in 0..4 {
+        period(&h, true);
+    }
+    if leisure(&h) {
+        return TestResult::Fail("EE dozed before cnt_after_linked reached five");
+    }
+    period(&h, true);
+    if !leisure(&h)
+        || !h
+            .packet
+            .model
+            .lock()
+            .commands
+            .contains(&(0x20, vec![1, 0x10, 5, 0, 0]))
+    {
+        return TestResult::Fail("EE idle linked station did not enter firmware LPS");
+    }
+    // fwlps off (upstream default): leave at once and never re-enter.
+    complete(h.device.power_save(false));
+    for _ in 0..4 {
+        period(&h, false);
+    }
+    if leisure(&h) {
+        return TestResult::Fail("EE dozed with fwctrl_lps disabled");
+    }
+    period(&h, true);
+    if !leisure(&h) {
+        return TestResult::Fail("EE did not re-enter LPS when fwlps was enabled");
+    }
+    // DHCP (UDP 68->67) is rtl_is_special_data: held until awake.
+    let arp = {
+        let plan = h.peer.lock().plan;
+        udp_ipv4(
+            PEER,
+            plan.station,
+            plan.lease_ip,
+            plan.server_ip,
+            68,
+            67,
+            b"ee-lps-special",
+        )
+    };
+    let before = h.peer.lock().uplink.len();
+    if narf_net::iface::send_on(h.device.name(), &arp).is_err() {
+        return TestResult::Fail("EE rejected DHCP while dozing");
+    }
+    h.device.drain();
+    if h.peer.lock().uplink.len() != before {
+        return TestResult::Fail("EE sent special data before leaving LPS");
+    }
+    complete(h.device.power_save(true));
+    if leisure(&h) {
+        return TestResult::Fail("EE did not wake for the held DHCP frame");
+    }
+    h.pump();
+    // The stack pads short frames to the Ethernet minimum.
+    if !h.peer.lock().uplink[before..].contains(&arp) {
+        let ready = h.device.prepared.try_lock().map(|o| {
+            o.as_ref().map(|o| {
+                (
+                    o.station_transmit_ready(),
+                    o.transmit_ready(),
+                    o.station_linked(),
+                )
+            })
+        });
+        return TestResult::Fail(match (h.device.pending_for_test(), ready) {
+            (Some(false), _) if h.closed() => "EE held DHCP frame closed the station",
+            (Some(false), _) => "EE held DHCP frame vanished (not pending, not sent)",
+            (Some(true), Some(Some((false, true, _)))) => "EE held DHCP: station not ready",
+            (Some(true), Some(Some((false, false, _)))) => "EE held DHCP: packet not ready",
+            (Some(true), Some(Some((true, _, _)))) => "EE held DHCP: ready but unsent",
+            _ => "EE did not send the held DHCP frame after waking",
+        });
+    }
+    // Busy RX in a period (num_rx > 2) leaves, idle periods re-enter.
+    period(&h, true);
+    period(&h, true);
+    if !leisure(&h) {
+        return TestResult::Fail("EE did not re-enter LPS after an idle period");
+    }
+    for _ in 0..3 {
+        let downlink = {
+            let plan = h.peer.lock().plan;
+            udp_ipv4(
+                plan.station,
+                PEER,
+                plan.server_ip,
+                plan.lease_ip,
+                7,
+                49152,
+                b"ee-lps-busy",
+            )
+        };
+        let frame = { h.peer.lock().downlink(&downlink).unwrap() };
+        h.packet.emit(&frame).unwrap();
+        h.device.drain();
+    }
+    complete(h.device.power_save(true));
+    if leisure(&h) {
+        return TestResult::Fail("EE stayed in LPS through busy RX");
+    }
+    period(&h, true);
+    period(&h, true);
+    if !leisure(&h) {
+        return TestResult::Fail("EE did not re-enter LPS after busy traffic");
+    }
+    h.packet.model.lock().commands.clear();
+    if complete(h.device.disassociate()).is_err() || !h.closed() {
+        return TestResult::Fail("EE dozing disassociate failed");
+    }
+    let woke = {
+        let model = h.packet.model.lock();
+        model.commands.first() == Some(&(0x20, vec![0, 0x10, 5, 0, 0x0c]))
+    };
+    if !woke || leisure(&h) {
+        return TestResult::Fail("EE disconnect left the firmware dozing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/device",
+    smoke_rtl8188ee_native_device_leisure_policy_follows_linux_watchdog
+);
 pub(crate) fn smoke_rtl8188ee_native_device_open_kernel_dhcp_exact_ip() -> TestResult {
     composition(false)
 }
@@ -863,8 +1168,9 @@ pub(crate) fn smoke_rtl8188ee_native_device_paused_publisher_cannot_outlive_clos
         return TestResult::Fail("EE paused publisher final native teardown failed");
     }
     h.pump();
-    if !h.closed() || h.packet.model.lock().master {
-        return TestResult::Fail("EE paused publisher failed to stop retained native DMA");
+    // Safe rejoin: carrier closed, owner live and Passive (DMA not stopped).
+    if !h.closed() || !h.passive() {
+        return TestResult::Fail("EE paused publisher teardown did not return to Passive");
     }
     TestResult::Pass
 }
@@ -973,4 +1279,213 @@ pub(crate) fn smoke_rtl8188ee_native_device_cancelled_disconnect_wait_stops_owne
 kernel_test_in!(
     "drivers/wireless/rtlwifi/device",
     smoke_rtl8188ee_native_device_cancelled_disconnect_wait_stops_owner
+);
+
+/// Linux `rtl88e_dm_watchdog` RA: the association installs the level-0
+/// mask (`update_rate_tbl(sta, 0)`), BSSID-matching RX PHY status feeds
+/// `undec_sm_pwdb`, and each 2 s refresh re-sends the mask only when the
+/// hysteresis level changes. DATA after the mask carries fallback under
+/// the separately signed NEFB grant.
+pub(crate) fn smoke_rtl8188ee_native_device_rate_mask_follows_rx_pwdb() -> TestResult {
+    let h = Harness::new(false);
+    *h.env.fallback.lock() = Some((
+        narf_capabilities::Cap::bootstrap(),
+        h.firmware.identity().unwrap(),
+        true,
+    ));
+    {
+        // All 12 legacy rates: WIRELESS_MODE_G (supp_rates > 0xf).
+        let mut p = h.peer.lock();
+        let ap = core::mem::replace(&mut p.ap, Peer::new(false).ap);
+        p.ap = ap.with_legacy_rates(&LEGACY_RATES).unwrap();
+    }
+    h.join();
+    h.pump();
+    let masks = |h: &Harness| -> Vec<Vec<u8>> {
+        h.packet
+            .model
+            .lock()
+            .commands
+            .iter()
+            .filter(|(id, _)| *id == 0x84)
+            .map(|(_, payload)| payload.clone())
+            .collect()
+    };
+    let state = |h: &Harness| {
+        h.device.prepared.try_lock().and_then(|owner| {
+            owner
+                .as_ref()
+                .map(|o| (o.station_rate_state(), o.rate_mask()))
+        })
+    };
+    let initial = masks(&h);
+    // A legacy (non-HT) AP: WIRELESS_MODE_G, ratr_index 4, level 0 &0xff5.
+    if initial != [vec![0xf5, 0x0f, 0x00, 0x40, 0x80]] || state(&h).map(|s| s.1) != Some(Some(4)) {
+        return TestResult::Fail("association did not install the level-0 RA mask");
+    }
+    // Ordinary DATA after the mask: RATE_ID 4 and DISDATAFB clear.
+    let downlink = {
+        let plan = h.peer.lock().plan;
+        udp_ipv4(
+            PEER,
+            plan.station,
+            plan.lease_ip,
+            plan.server_ip,
+            49152,
+            7,
+            b"ee-ra-data",
+        )
+    };
+    let sent = h.packet.model.lock().descriptors.len();
+    if narf_net::iface::send_on(h.device.name(), &downlink).is_err() {
+        return TestResult::Fail("EE refused ordinary DATA");
+    }
+    h.pump();
+    let data = {
+        let model = h.packet.model.lock();
+        (sent..model.descriptors.len())
+            .find(|&n| model.observed[n][0] & 0x0c == 8 && model.observed[n].len() > 32)
+            .map(|n| model.descriptors[n].clone())
+    };
+    let Some(data) = data else {
+        return TestResult::Fail("EE ordinary DATA never reached a descriptor");
+    };
+    if word(&data, 16) & (1 << 10) != 0 || (word(&data, 4) >> 16) & 15 != 4 {
+        return TestResult::Fail("DATA TXD kept DISDATAFB after the RA mask");
+    }
+    // Strong beacons: OFDM pwdb_all 0xa0 -> -30 dBm -> 70%.
+    let period = |h: &Harness, pwdb_all: u8, count: usize| {
+        let mut phy = [0u8; 28];
+        phy[4] = pwdb_all;
+        for _ in 0..count {
+            let beacon = { h.peer.lock().ap.beacon() };
+            h.packet.emit_native(&beacon, 11, 0, Some(&phy)).unwrap();
+            h.device.drain();
+        }
+        h.env.now.fetch_add(2_000, Ordering::AcqRel);
+        complete(h.device.rate_adaptive());
+    };
+    period(&h, 0xa0, 60);
+    let high = masks(&h);
+    if high.len() != 2
+        || high[1] != [0, initial[0][1] & 0x0f, 0, 0x40, 0x80]
+        || state(&h).map(|s| s.0 .1) != Some(1)
+        || state(&h).map(|s| s.0 .0 > 50) != Some(true)
+    {
+        return TestResult::Fail("strong RX PWDB did not move the RA mask to HIGH");
+    }
+    // Same level: no new H2C; within the 2 s period: no refresh at all.
+    period(&h, 0xa0, 4);
+    complete(h.device.rate_adaptive());
+    if masks(&h).len() != 2 {
+        return TestResult::Fail("unchanged RA level re-sent the mask");
+    }
+    // Weak beacons: 0x28 -> -90 dBm -> 10%. HIGH -> MIDDLE -> LOW.
+    let mut levels = Vec::new();
+    for _ in 0..6 {
+        period(&h, 0x28, 30);
+        levels.push(state(&h).map(|s| s.0 .1).unwrap_or(0));
+    }
+    // LOW and level 0 share the G default branch (& 0xff5).
+    if levels.last() != Some(&3) || masks(&h).len() < 3 || masks(&h).last() != initial.first() {
+        return TestResult::Fail("weak RX PWDB did not reach the LOW RA mask");
+    }
+    // Teardown: disassociate withdraws the mask with the stopped owner.
+    if complete(h.device.disassociate()).is_err() || !h.closed() {
+        return TestResult::Fail("EE RA disassociate failed");
+    }
+    let count = masks(&h).len();
+    complete(h.device.rate_adaptive());
+    if masks(&h).len() != count || state(&h).and_then(|s| s.1).is_some() {
+        return TestResult::Fail("RA refresh ran on a closed station");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/device",
+    smoke_rtl8188ee_native_device_rate_mask_follows_rx_pwdb
+);
+
+/// Linux `rtl_pci_remove` on the composed Device: the linked station sends
+/// its disconnect report, the chip is masked before the vector is released,
+/// and the rings are freed only after the card-disable quiescence proof.
+pub(crate) fn smoke_rtl8188ee_native_device_remove_releases_after_quiescence() -> TestResult {
+    use super::super::super::super::super::irq::{Signal, IRQ_MASK0_88E};
+    let owner_present = |h: &Harness| {
+        h.device
+            .prepared
+            .try_lock()
+            .map(|storage| storage.is_some())
+    };
+    // Success: bound vector, linked station, idle TX buffer and RXDMA.
+    let h = Harness::new(false);
+    let signal = Signal::new();
+    *h.irq.signal.lock() = Some(signal.clone());
+    h.join();
+    h.pump();
+    if h.packet.radio.word(0xb0) != IRQ_MASK0_88E {
+        return TestResult::Fail("EE removal fixture did not bind its vector");
+    }
+    h.packet.radio.hardware_byte(0x286, 2);
+    h.packet.model.lock().commands.clear();
+    if !complete(h.device.remove()) || !h.device.removed_for_test() {
+        return TestResult::Fail("EE idle removal did not reclaim DMA");
+    }
+    {
+        let model = h.packet.model.lock();
+        if model.commands.first() != Some(&(1, vec![0])) || model.master {
+            return TestResult::Fail("EE removal skipped the disconnect report or kept BME");
+        }
+    }
+    if h.packet.radio.word(0xb0) != 0
+        || h.irq.delivered.lock().last() != Some(&false)
+        || h.irq.signal.lock().is_some()
+    {
+        return TestResult::Fail("EE removal released the vector before masking");
+    }
+    if owner_present(&h) != Some(false)
+        || !h.packet.live_regions().is_empty()
+        || h.device.link_up()
+        || h.device.connected_bssid().is_some()
+        || narf_net::iface::lookup(h.device.name()).is_some()
+    {
+        return TestResult::Fail("EE removal kept the owner, DMA, carrier or netdev");
+    }
+    if !complete(h.device.remove()) || complete(h.device.associate(h.request())).is_ok() {
+        return TestResult::Fail("EE removed Device was not idempotent or reopened");
+    }
+    drop(h);
+    // Failure: RXDMA never idles -> the owner and every mapping stay pinned.
+    let h = Harness::new(false);
+    h.join();
+    h.pump();
+    h.packet.radio.hardware_byte(0x286, 0);
+    if complete(h.device.remove()) || owner_present(&h) != Some(true) {
+        return TestResult::Fail("EE busy RXDMA removal released the owner");
+    }
+    let regions = h.packet.live_regions();
+    let drops = h.packet.drops.load(Ordering::SeqCst);
+    let packet = h.packet.clone();
+    drop(h);
+    if regions.iter().any(|r| !r.live.load(Ordering::Acquire))
+        || packet.drops.load(Ordering::SeqCst) != drops
+    {
+        return TestResult::Fail("EE unproven removal freed pinned DMA");
+    }
+    // Teardown before any association: the never-started owner is stopped
+    // and proven idle, without a disconnect report.
+    let h = Harness::new(false);
+    h.packet.radio.hardware_byte(0x286, 2);
+    h.packet.model.lock().commands.clear();
+    if !complete(h.device.remove())
+        || owner_present(&h) != Some(false)
+        || !h.packet.model.lock().commands.is_empty()
+    {
+        return TestResult::Fail("EE never-associated removal differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/device",
+    smoke_rtl8188ee_native_device_remove_releases_after_quiescence
 );

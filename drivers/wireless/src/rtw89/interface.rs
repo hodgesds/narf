@@ -21,10 +21,41 @@ struct Rings {
     rx: narf_ipc::Producer<Frame, RX_RING_N>,
     tx: narf_ipc::Consumer<Frame, TX_RING_N>,
     pending: Option<Frame>,
+    /// Per-AC host backlog in `qos::Ac` order (VO, VI, BE, BK).
+    backlog: [alloc::collections::VecDeque<Frame>; 4],
 }
+/// Frames pulled from the stack ring into the per-AC backlog per pass.
+const BACKLOG: usize = 16;
 impl Rings {
+    /// Strict-priority service (all-AC program): refill the bounded backlog
+    /// from the stack ring, then hand out the oldest frame of the highest
+    /// non-empty AC. Without the program every frame is BE (FIFO).
+    fn next(&mut self, local: [u8; 6], qos_all: bool) -> Option<Frame> {
+        let mut queued: usize = self.backlog.iter().map(|q| q.len()).sum();
+        while queued < BACKLOG {
+            let Ok(Some(frame)) = self.tx.try_recv() else {
+                break;
+            };
+            if !station::admitted(frame.payload(), local) || !offloads(frame.tx_meta()) {
+                continue;
+            }
+            let ac = if qos_all {
+                super::qos::Ac::of(super::qos::classify(frame.payload()))
+            } else {
+                super::qos::Ac::BestEffort
+            };
+            self.backlog[ac as usize].push_back(frame);
+            queued += 1;
+        }
+        super::qos::Ac::ORDER
+            .iter()
+            .find_map(|ac| self.backlog[*ac as usize].pop_front())
+    }
     fn clear(&mut self) {
         self.pending = None;
+        for queue in &mut self.backlog {
+            queue.clear();
+        }
         for _ in 0..TX_RING_N {
             if !matches!(self.tx.try_recv(), Ok(Some(_))) {
                 break;
@@ -48,7 +79,16 @@ pub(super) struct Device<I: Io> {
     metadata: IrqSafeSpinLock<()>,
     rx: IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
+    /// MSI deliveries and TX kicks wake the drain worker through this line.
+    line: Arc<super::irq::Line>,
+    interrupts: AtomicBool,
 }
+/// Polled-mode worker period (no MSI binding).
+const POLL_MS: u64 = 1;
+/// Interrupt-mode safety period. Station timers (authentication/association
+/// retries, EAPOL timeouts) are millisecond-granular host state; RX/RPQ
+/// progress itself is interrupt-driven.
+const IRQ_FALLBACK_MS: u64 = 10;
 impl<I: Io> core::fmt::Debug for Device<I> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Rtw8852bDevice")
@@ -79,6 +119,73 @@ impl<I: Io + 'static> Close for Device<I> {
     }
 }
 impl<I: Io + 'static> Device<I> {
+    /// Triggered scan with its `NL80211_ATTR_SCAN_FLAGS`.
+    async fn scan_flagged(
+        &self,
+        request: ScanRequest,
+        flags: narf_wireless::scan::ScanFlags,
+    ) -> Result<Vec<BssInfo>, WirelessError> {
+        let dwell = scan_dwell(&request)?;
+        self.control_ready()?;
+        let mut attempt = Attempt {
+            device: self,
+            armed: true,
+        };
+        let mut storage = self.lifecycle.retained.lock().await;
+        self.control_ready()?;
+        let owner = storage.as_mut().ok_or(WirelessError::Busy)?;
+        if owner.station_phase() != Some(station::Phase::Passive) {
+            attempt.armed = false;
+            return Err(WirelessError::Busy);
+        }
+        let address = match (&request.random_mac, request.active) {
+            (Some(random), true) => Some(random_scan_address(random)?),
+            _ => None,
+        };
+        let probe = request.active.then(|| station::Probe {
+            ssids: request.ssids.clone(),
+            ies: request.extra_ies.clone(),
+            address,
+            random_sn: flags.random_sn,
+        });
+        let result = owner.station_scan(dwell, probe).await;
+        attempt.armed = false;
+        if result.is_err() {
+            self.close();
+            if !self.admission.teardown_pending() {
+                let _ = owner.station_stop();
+            }
+        }
+        let result = result.map_err(error)?;
+        if self.closed() {
+            self.link(None, false);
+            return Err(WirelessError::HardwareError);
+        }
+        Ok(result
+            .into_iter()
+            .filter(|c| {
+                request.ssids.is_empty()
+                    || request
+                        .ssids
+                        .iter()
+                        .any(|s| s.is_empty() || *s == c.bss.ssid)
+            })
+            .map(|c| BssInfo {
+                bssid: c.bss.bssid,
+                ssid: c.bss.ssid,
+                channel: 1,
+                frequency_mhz: 2412,
+                rssi: i8::MIN,
+                security: if c.ap_rsne.is_some() {
+                    narf_wireless::scan::BssSecurity::Wpa2
+                } else if c.bss.capability & 16 != 0 {
+                    narf_wireless::scan::BssSecurity::Wep
+                } else {
+                    narf_wireless::scan::BssSecurity::Open
+                },
+            })
+            .collect())
+    }
     pub(super) fn new(
         name: &str,
         local: [u8; 6],
@@ -95,6 +202,7 @@ impl<I: Io + 'static> Device<I> {
                 rx,
                 tx,
                 pending: None,
+                backlog: Default::default(),
             }),
             name: name.into(),
             local,
@@ -107,7 +215,65 @@ impl<I: Io + 'static> Device<I> {
             metadata: IrqSafeSpinLock::new(()),
             rx: IrqSafeSpinLock::new(Some(consumer)),
             tx: IrqSafeSpinLock::new(Some(producer)),
+            line: super::irq::Line::new(),
+            interrupts: AtomicBool::new(false),
         }
+    }
+    /// Bind MSI delivery to this shell's worker after the station started.
+    /// On failure the worker keeps its polled period.
+    pub(super) async fn arm_interrupts(&self) -> Result<u8, Error> {
+        let mut storage = self.lifecycle.retained.lock().await;
+        if self.closed() {
+            return Err(Error::State);
+        }
+        let owner = storage.as_mut().ok_or(Error::State)?;
+        let vector = owner.station_irq(&self.line)?;
+        self.interrupts.store(true, Ordering::Release);
+        self.line.raise();
+        Ok(vector)
+    }
+    /// Live AP EDCA updates need awaited H2C receipts, so the worker applies
+    /// them outside the synchronous drain.
+    pub(super) async fn apply_edca(&self) {
+        let pending = self
+            .lifecycle
+            .retained
+            .try_lock()
+            .and_then(|owner| owner.as_ref().map(|o| o.station_edca_pending()))
+            .unwrap_or(false);
+        if !pending || self.closed() {
+            return;
+        }
+        let mut storage = self.lifecycle.retained.lock().await;
+        let Some(owner) = storage.as_mut() else {
+            return;
+        };
+        if owner.station_apply_edca().await.is_err() {
+            self.close();
+            if !self.admission.teardown_pending() {
+                let _ = owner.station_stop();
+            }
+        }
+    }
+    pub(super) fn interrupts(&self) -> bool {
+        self.interrupts.load(Ordering::Acquire) && !self.closed()
+    }
+    pub(super) fn line(&self) -> &Arc<super::irq::Line> {
+        &self.line
+    }
+    /// One worker period: drain, then sleep until an MSI/TX kick or the
+    /// mode's fallback period.
+    pub(super) async fn service_once(&self) {
+        let seen = self.line.raised();
+        self.drain();
+        self.apply_edca().await;
+        let period = if self.interrupts() {
+            IRQ_FALLBACK_MS
+        } else {
+            POLL_MS
+        };
+        let _ =
+            narf_time::timeout(narf_time::Deadline::after_ms(period), self.line.wait(seen)).await;
     }
     pub(super) fn closed(&self) -> bool {
         self.admission.closed()
@@ -207,6 +373,9 @@ impl<I: Io + 'static> Device<I> {
                 .try_send(frame)
                 .map_err(|_| super::power::Error::Terminal)
         });
+        if result.is_ok() {
+            self.line.raise();
+        }
         if result == Err(super::power::Error::Access) {
             self.close();
             if !self.admission.teardown_pending() {
@@ -226,6 +395,7 @@ impl<I: Io + 'static> Device<I> {
             return Vec::new();
         };
         if self.closed() {
+            self.interrupts.store(false, Ordering::Release);
             rings.clear();
             self.link(None, false);
             if !self.admission.teardown_pending() {
@@ -248,15 +418,7 @@ impl<I: Io + 'static> Device<I> {
                 return Ok(frames);
             }
             if rings.pending.is_none() {
-                for _ in 0..16 {
-                    let Ok(Some(frame)) = rings.tx.try_recv() else {
-                        break;
-                    };
-                    if station::admitted(frame.payload(), self.local) && offloads(frame.tx_meta()) {
-                        rings.pending = Some(frame);
-                        break;
-                    }
-                }
+                rings.pending = rings.next(self.local, owner.station_qos_all());
             }
             if owner.station_ready() {
                 if let Some(frame) = rings.pending.as_ref() {
@@ -363,6 +525,22 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
     fn supports_scan_dwell(&self) -> bool {
         true
     }
+    /// `NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR` (`rtw89_core_register_hw`).
+    fn supports_scan_random_mac(&self) -> bool {
+        true
+    }
+    /// `NL80211_EXT_FEATURE_SCAN_RANDOM_SN` (`rtw89_core_register_hw`).
+    fn supports_scan_random_sn(&self) -> bool {
+        true
+    }
+    /// `RTW89_SCANOFLD_MAX_SSID`.
+    fn max_scan_ssids(&self) -> u8 {
+        8
+    }
+    /// `RTW89_SCANOFLD_MAX_IE_LEN`.
+    fn max_scan_ie_len(&self) -> u16 {
+        512
+    }
     fn connected_bssid(&self) -> Option<[u8; 6]> {
         if !self.link_up() {
             return None;
@@ -370,9 +548,11 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         let bytes = self.bssid.load(Ordering::Acquire).to_le_bytes();
         (bytes[7] != 0).then(|| bytes[..6].try_into().unwrap())
     }
+    /// CCMP-128 data plus host BIP-CMAC-128 for PMF group management.
     fn cipher_suites(&self) -> &'static [u32] {
-        &[0x000fac04]
+        &[0x000fac04, 0x000fac06]
     }
+
     fn scan_information_elements(&self, bssid: [u8; 6]) -> Option<Vec<u8>> {
         self.lifecycle
             .retained
@@ -399,65 +579,28 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         }
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        let dwell = scan_dwell(&request)?;
-        self.control_ready()?;
-        let mut attempt = Attempt {
-            device: self,
-            armed: true,
-        };
-        let mut storage = self.lifecycle.retained.lock().await;
-        self.control_ready()?;
-        let owner = storage.as_mut().ok_or(WirelessError::Busy)?;
-        if owner.station_phase() != Some(station::Phase::Passive) {
-            attempt.armed = false;
-            return Err(WirelessError::Busy);
-        }
-        let result = owner.station_scan(dwell).await;
-        attempt.armed = false;
-        if result.is_err() {
-            self.close();
-            if !self.admission.teardown_pending() {
-                let _ = owner.station_stop();
-            }
-        }
-        let result = result.map_err(error)?;
-        if self.closed() {
-            self.link(None, false);
-            return Err(WirelessError::HardwareError);
-        }
-        Ok(result
-            .into_iter()
-            .filter(|c| {
-                request.ssids.is_empty()
-                    || request
-                        .ssids
-                        .iter()
-                        .any(|s| s.is_empty() || *s == c.bss.ssid)
-            })
-            .map(|c| BssInfo {
-                bssid: c.bss.bssid,
-                ssid: c.bss.ssid,
-                channel: 1,
-                frequency_mhz: 2412,
-                rssi: i8::MIN,
-                security: if c.ap_rsne.is_some() {
-                    narf_wireless::scan::BssSecurity::Wpa2
-                } else if c.bss.capability & 16 != 0 {
-                    narf_wireless::scan::BssSecurity::Wep
-                } else {
-                    narf_wireless::scan::BssSecurity::Open
-                },
-            })
-            .collect())
+        self.scan_flagged(request, narf_wireless::scan::ScanFlags::default())
+            .await
+    }
+    async fn scan_with_flags(
+        &self,
+        request: ScanRequest,
+        flags: narf_wireless::scan::ScanFlags,
+    ) -> Result<Vec<BssInfo>, WirelessError> {
+        self.scan_flagged(request, flags).await
     }
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
         self.control_ready()?;
         if request.channel != 1 || request.frequency_mhz != 2412 {
             return Err(WirelessError::NotSupported);
         }
-        let pmk = match request.security {
-            SecurityConfig::Open => None,
-            SecurityConfig::Wpa2 { psk } => Some(Zeroizing::new(psk)),
+        let credential = match request.security {
+            SecurityConfig::Open => station::Credential::Open,
+            SecurityConfig::Wpa2 { psk } => station::Credential::Psk(Zeroizing::new(psk)),
+            // SAE password limits as wpa_supplicant/cfg80211 (1..=128).
+            SecurityConfig::Wpa3 { password } if (1..=128).contains(&password.len()) => {
+                station::Credential::Sae(Zeroizing::new(password))
+            }
             _ => return Err(WirelessError::NotSupported),
         };
         let mut attempt = Attempt {
@@ -475,7 +618,7 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             self.rings.lock().await.clear();
         }
         let result = owner
-            .station_associate(request.bssid, &request.ssid, pmk, &request.ie)
+            .station_associate(request.bssid, &request.ssid, credential, &request.ie)
             .await;
         attempt.armed = false;
         if self.closed() {
@@ -522,11 +665,45 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         result.map_err(error)
     }
 }
+/// Caller probe IEs: well-formed TLVs within `max_scan_ie_len`
+/// (`RTW89_SCANOFLD_MAX_IE_LEN`), not duplicating driver-generated IEs.
+fn probe_ies_valid(mut ies: &[u8]) -> bool {
+    if ies.len() > 512 {
+        return false;
+    }
+    while !ies.is_empty() {
+        let Some(&[id, length]) = ies.get(..2) else {
+            return false;
+        };
+        if matches!(id, 0 | 1 | 3 | 50) || ies.len() < 2 + usize::from(length) {
+            return false;
+        }
+        ies = &ies[2 + usize::from(length)..];
+    }
+    true
+}
+/// `get_random_mask_addr`: random bits outside `mask`, `addr` bits inside.
+fn random_scan_address(
+    random: &narf_wireless::scan::ScanRandomMac,
+) -> Result<[u8; 6], WirelessError> {
+    let mut bytes = [0u8; 6];
+    narf_crypto::try_fill_random_bytes(&mut bytes).map_err(|_| WirelessError::HardwareError)?;
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = *byte & !random.mask[i] | random.addr[i] & random.mask[i];
+    }
+    Ok(bytes)
+}
 fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
-    if request.active
-        || request.random_mac.is_some()
+    // cfg80211 `nl80211_parse_random_mac`: the mask must keep the group bit
+    // from a unicast base address.
+    if request
+        .random_mac
+        .as_ref()
+        .is_some_and(|r| r.mask[0] & 1 == 0 || r.addr[0] & 1 != 0)
         || request.colocated_6ghz
-        || !request.extra_ies.is_empty()
+        || (!request.active && !request.extra_ies.is_empty())
+        || !probe_ies_valid(&request.extra_ies)
+        || request.active && request.ssids.len() > 8
         || request.frequencies_mhz.iter().any(|f| *f != 2412)
         || request.channels.iter().any(|ch| *ch != 1)
         || request.ssids.len() > 32
@@ -582,12 +759,51 @@ pub(super) fn publish<I: Io + 'static>(device: Arc<Device<I>>) -> Result<(), Err
     narf_wireless::registry::register(device.clone());
     device.published.store(true, Ordering::Release);
     narf_scheduler::spawn(async move {
-        loop {
-            device.drain();
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+        while device.published.load(Ordering::Acquire) {
+            device.service_once().await;
         }
     });
     Ok(())
+}
+/// Linux `rtw89_core_unregister` for removal: close admission and carrier,
+/// unregister from the wireless/net registries and release the singleton
+/// endpoint claim. Idempotent; the drain worker exits after its pass.
+pub(super) fn withdraw<I: Io + 'static>(device: &Device<I>) {
+    withdraw_inner(device, false);
+}
+/// Generation reset: as [`withdraw`], but the netdev is retired for rebind
+/// (`narf_net::iface::retire_for_rebind`) so the next generation's shell
+/// re-registers the same interface.
+pub(super) fn withdraw_keep_name<I: Io + 'static>(device: &Device<I>) -> String {
+    withdraw_inner(device, true);
+    device.name.clone()
+}
+fn withdraw_inner<I: Io + 'static>(device: &Device<I>, keep: bool) {
+    device.close();
+    if !device.published.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    narf_wireless::registry::unregister(&device.name);
+    narf_net::registry().unregister(&device.name);
+    // `ieee80211_restart_hw` keeps the net_device: retire it for rebind so
+    // the next generation restores its ifindex, addresses and sockets.
+    if !keep || !narf_net::iface::retire_for_rebind(&device.name) {
+        narf_net::iface::unregister(&device.name);
+    }
+    let endpoint = device as *const Device<I> as *const ();
+    let mut active = ACTIVE.lock();
+    if active
+        .as_ref()
+        .is_some_and(|current| Arc::as_ptr(current) as *const () == endpoint)
+    {
+        *active = None;
+        CLAIMED.store(false, Ordering::Release);
+    }
+    device.line.raise();
+}
+/// Whether the shell is still registered.
+pub(super) fn published<I: Io + 'static>(device: &Device<I>) -> bool {
+    device.published.load(Ordering::Acquire)
 }
 struct Registered<I: Io>(Arc<Device<I>>);
 impl<I: Io + 'static> Interface for Registered<I> {

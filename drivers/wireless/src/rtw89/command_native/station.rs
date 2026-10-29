@@ -82,7 +82,18 @@ impl Native {
             return Err(packet::Error::State);
         }
         self.ordinary_current()?;
-        let core = packet::Core::prepare(&mut self.station_access(), own, macid);
+        let qos_all = self.station_qos_all_allowed().unwrap_or(false);
+        let ht = self.station_ht_allowed().unwrap_or(false);
+        let he = self.station_he_allowed().unwrap_or(false);
+        let rx = packet::RxPhy::from_programs(ht, he);
+        let ampdu = ht && self.station_ampdu_allowed().unwrap_or(false);
+        let core = packet::Core::prepare_with(&mut self.station_access(), own, macid, qos_all, rx)
+            .and_then(|mut core| {
+                if ampdu {
+                    core.enable_aggregation()?;
+                }
+                Ok(core)
+            });
         match core {
             Ok(core) => {
                 self.station_runtime.core = Some(core);
@@ -113,6 +124,12 @@ impl Native {
     pub(in crate::rtw89) fn start_packets(&mut self) -> Result<(), packet::Error> {
         self.packet_operation(|core, port| core.start(port))
     }
+    pub(in crate::rtw89) fn scan_address_packets(
+        &mut self,
+        scan: Option<[u8; 6]>,
+    ) -> Result<(), packet::Error> {
+        self.packet_operation(|core, _| core.set_scan_address(scan))
+    }
     pub(in crate::rtw89) fn packets_ready(&self) -> bool {
         self.state == State::Active
             && self
@@ -120,6 +137,26 @@ impl Native {
                 .core
                 .as_ref()
                 .is_some_and(packet::Core::ready)
+    }
+    pub(in crate::rtw89) fn packets_ready_aggregate(&self) -> bool {
+        self.state == State::Active
+            && self
+                .station_runtime
+                .core
+                .as_ref()
+                .is_some_and(packet::Core::ready_aggregate)
+    }
+    pub(in crate::rtw89) fn submit_packet_agg(
+        &mut self,
+        bytes: &[u8],
+        report: bool,
+        rate: u8,
+        agg: crate::rtw89::packet_format::Agg,
+    ) -> Result<u64, packet::Error> {
+        if !self.station_ampdu_allowed()? || !self.station_firmware_ra_allowed()? {
+            return Err(packet::Error::Access);
+        }
+        self.packet_operation(|core, port| core.submit_agg(port, bytes, report, rate, Some(agg)))
     }
     pub(in crate::rtw89) fn submit_packet(
         &mut self,
@@ -137,7 +174,73 @@ impl Native {
         if rate != 0 && !self.station_wmm_allowed()? {
             return Err(packet::Error::Access);
         }
+        if rate & crate::rtw89::packet_format::FIRMWARE_RA != 0
+            && !self.station_firmware_ra_allowed()?
+        {
+            return Err(packet::Error::Access);
+        }
         self.packet_operation(|core, port| core.submit_rate(port, bytes, report, rate))
+    }
+    /// `rtw89_pci_request_irq` + `rtw89_pci_ops_start`: bind one MSI vector
+    /// to `line` and enable the AX interrupt mask once the packet runtime is
+    /// started. Returns the CPU vector.
+    pub(in crate::rtw89) fn irq_start(
+        &mut self,
+        line: &alloc::sync::Arc<crate::rtw89::irq::Line>,
+    ) -> Result<u8, power::Error> {
+        if self.irq.is_some() || self.state != State::Active || !self.station_runtime.started {
+            return Err(power::Error::Terminal);
+        }
+        let binding =
+            crate::rtw89::irq::Binding::bind(self.chip, &self.device, &self.authority, line)
+                .map_err(|error| match error {
+                    crate::rtw89::irq::Error::Unsupported => power::Error::Unsupported,
+                    _ => power::Error::Access,
+                })?;
+        if binding.start(&mut self.io).is_err() {
+            binding.release(&mut self.io, &self.authority);
+            return Err(power::Error::Access);
+        }
+        let vector = binding.vector();
+        self.irq = Some(binding);
+        Ok(vector)
+    }
+    pub(in crate::rtw89) fn irq_armed(&self) -> bool {
+        self.irq.is_some()
+    }
+    /// Worker half of the Linux hard/threaded handlers: mask, then
+    /// recognize and acknowledge enabled sources. Without a binding the
+    /// worker is in polled mode and nothing is reported.
+    pub(in crate::rtw89) fn irq_service(
+        &mut self,
+    ) -> Result<crate::rtw89::irq::Events, power::Error> {
+        let Some(binding) = self.irq.as_ref() else {
+            return Ok(crate::rtw89::irq::Events::default());
+        };
+        let result = binding.service(&mut self.io).map(|isrs| isrs.events());
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+    /// NAPI-completion re-enable after RPQ/RXQ were drained.
+    pub(in crate::rtw89) fn irq_rearm(&mut self) -> Result<(), power::Error> {
+        let Some(binding) = self.irq.as_ref() else {
+            return Ok(());
+        };
+        if self.state != State::Active {
+            return Err(power::Error::Terminal);
+        }
+        let result = binding.rearm(&mut self.io);
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+    pub(super) fn irq_release(&mut self) {
+        if let Some(binding) = self.irq.take() {
+            binding.release(&mut self.io, &self.authority);
+        }
     }
     pub(in crate::rtw89) fn poll_packets(&mut self) -> Result<packet::Step, packet::Error> {
         self.packet_operation(|core, port| core.poll(port))
@@ -159,6 +262,9 @@ impl Native {
         {
             return Err(packet::Error::Access);
         }
+        // Teardown frees published DMA only behind the idle proof; an
+        // unproven stop keeps every ring and packet pinned for the boot.
+        let _ = self.reclaim_dma();
         Ok(())
     }
 }
@@ -326,7 +432,12 @@ unsafe impl packet::Port for Access<'_> {
             event: self.native.station_runtime.backlog.pop_front(),
         })
     }
-    fn start(&mut self) -> Result<(), packet::Error> {
+    fn start(&mut self, open: u32) -> Result<(), packet::Error> {
+        if open & !crate::rtw89::packet_format::STOP_ALL != 0
+            || open & ORDINARY_STOP != ORDINARY_STOP
+        {
+            return Err(packet::Error::State);
+        }
         self.native
             .with_ordinary_current(|native| {
                 native.ordinary_current()?;
@@ -342,10 +453,10 @@ unsafe impl packet::Port for Access<'_> {
                     return Err(power::Error::Access);
                 }
                 let stopped = native.io.read32(0x1010)?;
-                if stopped == u32::MAX || stopped & ORDINARY_STOP != ORDINARY_STOP {
+                if stopped == u32::MAX || stopped & open != open {
                     return Err(power::Error::Access);
                 }
-                native.io.write32(0x1010, stopped & !ORDINARY_STOP)?;
+                native.io.write32(0x1010, stopped & !open)?;
                 native.ordinary_current()?;
                 let functions = native.io.read32(0xc000)?;
                 if functions == u32::MAX {
@@ -371,13 +482,16 @@ unsafe impl packet::Port for Access<'_> {
             if v == u32::MAX {
                 return Err(power::Error::Gone);
             }
-            self.native.io.write32(0x1010, v | ORDINARY_STOP)
+            self.native
+                .io
+                .write32(0x1010, v | crate::rtw89::packet_format::STOP_ALL)
         });
         self.native.station_runtime.started = false;
         cmac?;
         dma?;
         if self.native.io.read32(0xc000)? & (1 << 29) != 0
-            || self.native.io.read32(0x1010)? & ORDINARY_STOP != ORDINARY_STOP
+            || self.native.io.read32(0x1010)? & crate::rtw89::packet_format::STOP_ALL
+                != crate::rtw89::packet_format::STOP_ALL
         {
             return Err(packet::Error::Access);
         }

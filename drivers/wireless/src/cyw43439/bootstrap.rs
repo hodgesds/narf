@@ -113,6 +113,7 @@ impl<R: narf_drivers_sdio::pio::Registers + Send + 'static> Provisioner<R> {
             .host_identity()
             .ok_or("explicit SDIO host/board identity required")?;
         let function = card.function(1).ok_or("CYW43439 F1 identity unavailable")?;
+        let vendor = super::fullmac::FirmwareVendor::sdio(function.vendor);
         let selection = select_using(
             authority,
             manifest,
@@ -154,7 +155,8 @@ impl<R: narf_drivers_sdio::pio::Registers + Send + 'static> Provisioner<R> {
             .map_err(|_| "F2/mailbox setup failed")?;
         drop(slot);
         let name = narf_net::iface::reserve_name("wlan%d");
-        interface::attach(name, transport, &assets.clm)
+        let runtime = super::runtime::Runtime::new(transport).with_firmware_vendor(vendor);
+        interface::attach_runtime(name, runtime, &assets.clm)
             .await
             .map_err(|_| "station initialization failed")?;
         self.state

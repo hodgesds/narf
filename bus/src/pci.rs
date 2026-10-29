@@ -365,6 +365,31 @@ pub fn upstream_bridge(device: &BusDevice) -> Option<BusDevice> {
     })
 }
 
+/// The devfn of every hop from the root bus down to `device`: the root
+/// port (or root-bus function) first, `device` last, each
+/// `device << 3 | function`. This is the chain Linux `pci_set_of_node`
+/// follows through `of_pci_find_child_device` under the host bridge's
+/// Devicetree node. `None` for a non-PCIe device or a broken chain.
+pub fn devfn_path(device: &BusDevice) -> Option<alloc::vec::Vec<u8>> {
+    let mut hops = alloc::vec::Vec::new();
+    let mut current = *device;
+    loop {
+        let BusKind::Pcie { addr, .. } = current.kind else {
+            return None;
+        };
+        hops.push(addr.device << 3 | addr.function);
+        if hops.len() > 256 {
+            return None;
+        }
+        match upstream_bridge(&current) {
+            Some(bridge) => current = bridge,
+            None => break,
+        }
+    }
+    hops.reverse();
+    Some(hops)
+}
+
 /// Another function of the same PCI device (Linux
 /// `pci_get_domain_bus_and_slot(domain, bus, PCI_DEVFN(slot, function))`).
 pub fn sibling_function(device: &BusDevice, function: u8) -> Option<BusDevice> {

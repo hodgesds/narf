@@ -110,17 +110,33 @@ impl ProbeError {
     }
 }
 
-/// A PCI ID and firmware directory alone are not a runtime implementation.
-/// Keep probe admission tied to the profiles the live core and RX/TX path
-/// actually use, before any MSI allocation, reset or DMA activation.
-pub(super) fn validate_runtime_profile(hw_rev: HwRev) -> Result<(), ProbeError> {
-    let complete = hw_rev.params().is_some_and(|params| {
+/// Families whose tables are complete (`runtime_profile_complete`) but whose
+/// live PCI start-up has never run end to end, not even against a composed
+/// fixture. Probe refuses them so a real card does not enter an unexercised
+/// runtime; remove an entry only together with a composed start-up smoke.
+/// QCN9074: no composed PCI start-up fixture; full-monitor DP missing.
+pub(super) const UNVERIFIED_RUNTIME: &[HwRev] = &[HwRev::Qcn9074Hw10];
+
+/// Table-level completeness only: register map, core config, DP params and
+/// MHI config all exist for `hw_rev`. Probe additionally requires the family
+/// to be absent from [`UNVERIFIED_RUNTIME`].
+pub(super) fn runtime_profile_complete(hw_rev: HwRev) -> bool {
+    hw_rev.params().is_some_and(|params| {
         params.regs.is_some()
             && super::core::CoreConfig::for_hw(&params).is_some()
             && super::dp_ring::DpHwParams::for_rev(hw_rev).is_some()
             && mhi::config_for(hw_rev).is_some()
-    });
-    if complete {
+    })
+}
+
+/// A PCI ID and firmware directory alone are not a runtime implementation.
+/// Keep probe admission tied to the profiles the live core and RX/TX path
+/// actually use, before any MSI allocation, reset or DMA activation.
+pub(super) fn validate_runtime_profile(hw_rev: HwRev) -> Result<(), ProbeError> {
+    if UNVERIFIED_RUNTIME.contains(&hw_rev) {
+        return Err(ProbeError::UnsupportedRuntime { hw_rev });
+    }
+    if runtime_profile_complete(hw_rev) {
         Ok(())
     } else {
         Err(ProbeError::UnsupportedRuntime { hw_rev })
@@ -169,14 +185,27 @@ pub struct NativeIo {
     mmio: MmioRegion,
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
+    /// `static_window_map` parts (QCN9074): the register map whose CE
+    /// range takes window 2 (UMAC/DP: window 3).
+    static_window: Option<&'static super::hw::HalRegs>,
 }
 impl NativeIo {
     fn invoke<T>(&self, operation: impl FnOnce() -> T) -> Result<T, narf_capabilities::CapError> {
         crate::qualcomm_pci::invoke(&self.cap, operation)
     }
+    /// The static-window BAR0 offset of `offset`, if it has one.
+    fn static_at(&self, offset: u32, direct: bool) -> Option<u32> {
+        if direct || offset < hw::ATH11K_PCI_WINDOW_START {
+            return None;
+        }
+        self.static_window
+            .and_then(|r| super::qcn9074::static_bar_offset(r, offset))
+    }
     fn valid(&self, offset: u32, direct: bool) -> bool {
         let at = if direct || offset < hw::ATH11K_PCI_WINDOW_START {
             offset
+        } else if let Some(at) = self.static_at(offset, direct) {
+            at
         } else {
             windowed_bar_offset(offset)
         };
@@ -187,6 +216,13 @@ impl NativeIo {
     fn read(&self, offset: u32, direct: bool) -> u32 {
         if !self.valid(offset, direct) {
             return u32::MAX;
+        }
+        if let Some(at) = self.static_at(offset, direct) {
+            // SAFETY: bound-checked by `valid`; static windows need no
+            // selector transaction.
+            return self
+                .invoke(|| unsafe { self.mmio.read32(u64::from(at)) })
+                .unwrap_or(u32::MAX);
         }
         self.invoke(|| {
             // SAFETY: full exact-width bound and current retained PCI invocation;
@@ -203,6 +239,11 @@ impl NativeIo {
     }
     fn write(&self, offset: u32, value: u32, direct: bool) {
         if !self.valid(offset, direct) {
+            return;
+        }
+        if let Some(at) = self.static_at(offset, direct) {
+            // SAFETY: as `read`.
+            let _ = self.invoke(|| unsafe { self.mmio.write32(u64::from(at), value) });
             return;
         }
         let _ = self.invoke(|| {
@@ -830,6 +871,14 @@ async fn mhi_bring_up(s: MhiStart) -> Result<(MhiController<Bar0Mhi>, FwApi), Mh
         );
         ctrl.set_firmware(fw);
         ctrl.sync_power_up().await?;
+        // ath11k_pci_start → ath11k_pci_select_static_window.
+        if s.io.static_window.is_some() {
+            s.io.write(
+                hw::ATH11K_PCI_WINDOW_REG_ADDRESS,
+                super::qcn9074::static_window_select_value(),
+                true,
+            );
+        }
         ctrl.prepare_for_transfer("IPCR").await
     }
     .await;
@@ -942,7 +991,20 @@ async fn wlfw_bring_up(ctrl: MhiController<Bar0Mhi>, s: MhiStart, api: FwApi) {
         ));
     };
     // `ath11k_core_check_smbios`: the type-0xF8 `BDF_<variant>` string
-    // from the table the boot-time DMI scan kept (empty = no variant).
+    // from the table the boot-time DMI scan kept (empty = no variant);
+    // then `ath11k_core_check_dt` on the function's Devicetree node
+    // (`pci_set_of_node`), whose variant replaces it. The same node's
+    // `memory-region` sets `ATH11K_FLAG_FIXED_MEM_RGN` (`ath11k_pci_probe`).
+    let (domain, bus, slot, function) = s.pci_addr;
+    let dt = narf_bus::devices()
+        .into_iter()
+        .find(|d| {
+            matches!(d.kind, narf_bus::BusKind::Pcie { addr, .. }
+                if (addr.segment, addr.bus, addr.device, addr.function)
+                    == (domain, bus, slot, function))
+        })
+        .and_then(|d| super::board::dt_facts(&d));
+    let bdf_ext = super::board::bdf_ext(super::board::check_smbios().bdf_ext, dt.as_ref());
     let Some(cfg) = WlfwConfig::pci(
         s.hw_rev,
         s.vendor,
@@ -950,8 +1012,12 @@ async fn wlfw_bring_up(ctrl: MhiController<Bar0Mhi>, s: MhiStart, api: FwApi) {
         s.subsystem_vendor,
         s.subsystem_device,
         pci_dev_name(s.pci_addr),
-        super::board::check_smbios().bdf_ext,
-    ) else {
+        bdf_ext,
+    )
+    .map(|cfg| match dt.as_ref().filter(|d| d.memory_region) {
+        Some(d) => cfg.with_fixed_mem_region(d.reserved),
+        None => cfg,
+    }) else {
         let mut ctrl = ctrl;
         abort_mhi_bring_up(&mut ctrl).await;
         return wlfw_fail(wlfw::WlfwError::new(
@@ -1042,7 +1108,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     };
 
     // Quiesce an inherited function before identifying or resetting it.
-    // Unsupported families such as QCN9074 are rejected before mapping,
+    // Unsupported families (an incomplete runtime profile) are rejected before mapping,
     // MMIO/MSI setup, or DMA. Accepted profiles retain decode off for sizing.
     let owner = CONTROLLER
         .lock()
@@ -1242,10 +1308,11 @@ fn bring_up_current(
         return Err(ProbeError::Bar0MapFailed);
     }
 
-    let native = NativeIo {
+    let mut native = NativeIo {
         mmio: mmio_bar0,
         device: *device,
         cap: *cap,
+        static_window: None,
     };
     // SAFETY: BAR0 mapped + owned; TCSR_SOC_HW_VERSION is a readable
     // chip register.
@@ -1269,6 +1336,9 @@ fn bring_up_current(
         .params()
         .ok_or(ProbeError::UnsupportedSoc { major, minor })?;
     validate_runtime_profile(hw_rev)?;
+    if params.static_window_map {
+        native.static_window = params.regs;
+    }
     diag::set_wifi_stage(WifiStage::Probe);
 
     // SAFETY: caller owns cfg space exclusively.
@@ -1544,6 +1614,7 @@ mod native_authority_tests {
         };
         let cap = Cap::<BusDeviceCap, Write>::bootstrap();
         let io = NativeIo {
+            static_window: None,
             device,
             cap,
             mmio: MmioRegion {

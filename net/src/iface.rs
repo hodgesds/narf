@@ -450,6 +450,62 @@ pub fn reserve_name(pattern: &str) -> &'static str {
     alloc::boxed::Box::leak(name.into_boxed_str())
 }
 
+/// Interfaces retired by [`retire_for_rebind`]: their exact names stay
+/// reserved and their entries (ifindex, userspace configuration, counters)
+/// are restored when the same name registers again.
+static RETIRED: IrqSafeSpinLock<Vec<NetIfaceEntry>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Retire a registered interface so a later driver generation can rebind
+/// the same netdev (a firmware/driver recovery that Linux performs without
+/// unregistering the `net_device`, e.g. mac80211 `ieee80211_restart_hw`).
+/// Atomically with the removal, the exact name is reserved (no `wlan%d`
+/// allocation can take it) and the entry is kept; the next [`register`] /
+/// [`register_with_context`] of that name restores its ifindex, admin
+/// state, addresses, MTU, namespace and counters, exactly as an in-place
+/// re-registration does; IPv4 bindings, UDP sockets and ARP work are kept.
+/// The old generation's send hook and cookie are dropped with the entry.
+/// Returns false when `name` is not registered.
+pub fn retire_for_rebind(name: &str) -> bool {
+    let mut g = IFACES.lock();
+    let Some(entries) = g.as_mut() else {
+        return false;
+    };
+    let Some(at) = entries.iter().position(|entry| entry.name == name) else {
+        return false;
+    };
+    let entry = entries.remove(at);
+    {
+        let mut reserved = RESERVED.lock();
+        if !reserved.iter().any(|held| held == name) {
+            reserved.push(String::from(name));
+        }
+    }
+    let mut retired = RETIRED.lock();
+    retired.retain(|old| old.name != name);
+    retired.push(entry);
+    drop(retired);
+    drop(g);
+    // The netdev persists across the rebind, so its IPv4 binding, UDP
+    // sockets and ARP work are kept (unlike `unregister`).
+    true
+}
+
+/// Claim the name of an interface retired by [`retire_for_rebind`] for a new
+/// driver generation: returns it (still reserved until registered) when it
+/// is retired and not registered, else `None` (the caller then allocates a
+/// fresh name, e.g. `reserve_name("wlan%d")`).
+pub fn rebind_name(name: &str) -> Option<&'static str> {
+    let g = IFACES.lock();
+    let registered = g
+        .as_deref()
+        .is_some_and(|entries| entries.iter().any(|entry| entry.name == name));
+    let retired = RETIRED.lock().iter().any(|entry| entry.name == name);
+    let reserved = RESERVED.lock().iter().any(|held| held == name);
+    drop(g);
+    (!registered && retired && reserved)
+        .then(|| &*alloc::boxed::Box::leak(String::from(name).into_boxed_str()))
+}
+
 /// [`register`] for a driver that keeps its device name for the kernel's
 /// lifetime: returns it as a `&'static str`.
 pub fn register_static(pattern: &str, mac: [u8; 6], send: SendFn) -> &'static str {
@@ -589,8 +645,13 @@ fn register_inner(
         name
     };
     // De-dup: a same-named iface is replaced, keeping its ifindex and the
-    // configuration userspace gave it (admin state, addresses).
-    let old = v.iter().find(|i| i.name == name).cloned();
+    // configuration userspace gave it (admin state, addresses). A name
+    // retired for rebind restores its retired entry the same way.
+    let old = v.iter().find(|i| i.name == name).cloned().or_else(|| {
+        let mut retired = RETIRED.lock();
+        let at = retired.iter().position(|entry| entry.name == name)?;
+        Some(retired.remove(at))
+    });
     let ifindex = if name == "lo" {
         1
     } else if let Some(old) = old.as_ref() {
@@ -1978,4 +2039,43 @@ mod zc_tx_tests {
         TestResult::Pass
     }
     kernel_test_in!("net/iface", smoke_iface_software_gro_is_per_device);
+
+    fn smoke_iface_retire_for_rebind_keeps_name_and_ifindex() -> TestResult {
+        fn send(_frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+            Ok(())
+        }
+        let name = register("rbnd%d", [2, 0, 0, 0, 0x7b, 1], send);
+        let ifindex = ifindex_of(&name).unwrap_or(0);
+        set_mtu(&name, 1400);
+        if !retire_for_rebind(&name) || lookup(&name).is_some() {
+            return TestResult::Fail("retired interface still registered");
+        }
+        // The retired name is reserved: an enumerated allocation skips it.
+        let other = reserve_name("rbnd%d");
+        if other == name {
+            return TestResult::Fail("retired name reallocated");
+        }
+        let Some(claimed) = rebind_name(&name) else {
+            return TestResult::Fail("retired name could not be claimed");
+        };
+        let again = register(claimed, [2, 0, 0, 0, 0x7b, 2], send);
+        let entry = lookup(&again);
+        if again != name
+            || ifindex_of(&again) != Some(ifindex)
+            || entry.map(|e| e.mtu) != Some(1400)
+            || rebind_name(&name).is_some()
+            || rebind_name("rbnd-none").is_some()
+            || retire_for_rebind("rbnd-none")
+        {
+            return TestResult::Fail("rebind did not restore the name, ifindex and MTU");
+        }
+        unregister(&again);
+        let _ = register(other, [2, 0, 0, 0, 0x7b, 3], send);
+        unregister(other);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "net/iface",
+        smoke_iface_retire_for_rebind_keeps_name_and_ifindex
+    );
 }

@@ -154,6 +154,8 @@ pub(super) struct PcieBackplane {
     pub(super) device: BusDevice,
     pub(super) cap: Cap<BusDeviceCap, Write>,
     pub(super) pcie_core: Option<chip::Core>,
+    /// Retained MSI binding (`irq.rs`); `None` keeps polled service.
+    pub(super) msi: Option<super::irq::Msi>,
 }
 
 /// Keep the actual device operation within the capability invocation rather
@@ -266,6 +268,9 @@ pub enum ProbeError {
 /// data-path follow-up.
 static CONTROLLER: IrqSafeSpinLock<Option<BrcmfmacDevice>> = IrqSafeSpinLock::new(None);
 static OWNED: IrqSafeSpinLock<Option<narf_bus::BusAddr>> = IrqSafeSpinLock::new(None);
+/// A removed function whose DMA could not be proven stopped: its published
+/// mappings stay pinned and the address is never brought up again.
+static QUARANTINE: IrqSafeSpinLock<Option<narf_bus::BusAddr>> = IrqSafeSpinLock::new(None);
 
 /// PCI driver match registration. Mirrors the Linux `brcmf_pcie_devices`
 /// array (~L2724..L2754 in `pcie.c`).
@@ -279,7 +284,40 @@ pub fn register_pci_driver() {
             },
             probe,
         });
+        narf_bus::register_pci_remove(name_for(did), remove);
     }
+}
+
+/// Linux v7.2 `pcie.c::brcmf_pcie_remove`: withdraw the published station
+/// and stop the device behind the confirmed-stop proof before any ring or
+/// buffer is released (`native_runtime::remove`). Only a proven (or never
+/// started) owner releases the BDF claim; otherwise the function stays
+/// quarantined with its mappings pinned.
+fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
+    if *OWNED.lock() != Some(device.addr) {
+        return;
+    }
+    *QUARANTINE.lock() = Some(device.addr);
+    narf_scheduler::spawn(async move {
+        let released = super::native_runtime::remove().await;
+        // Discovery-only state; any retained bus went to the bootstrap.
+        drop(CONTROLLER.lock().take());
+        if released {
+            release_bdf(&mut OWNED.lock(), device.addr);
+            let mut quarantine = QUARANTINE.lock();
+            if *quarantine == Some(device.addr) {
+                *quarantine = None;
+            }
+        }
+        narf_console::klog!(
+            "brcmfmac: removed; DMA {}\n",
+            if released {
+                "reclaimed"
+            } else {
+                "pinned, address quarantined"
+            }
+        );
+    });
 }
 
 /// BDF ownership decision for `probe`, kept pure for fixture coverage.
@@ -319,6 +357,10 @@ pub(super) fn release_bdf(owner: &mut Option<narf_bus::BusAddr>, address: narf_b
 /// Probe entry — called by `narf-bus::driver_match` when a Broadcom
 /// vendor/device pair we registered for surfaces.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+    if *QUARANTINE.lock() == Some(device.addr) {
+        // Removal in progress or pinned DMA from a removed owner.
+        return Err(narf_bus::ProbeError::BadDevice);
+    }
     match claim_bdf(&mut OWNED.lock(), device.addr) {
         Ownership::Existing => return Ok(()),
         Ownership::Extra => {
@@ -405,6 +447,7 @@ pub unsafe fn bring_up(
         device,
         cap,
         pcie_core: None,
+        msi: None,
     };
     let chip = Chip::discover(&mut backplane).map_err(ProbeError::Discovery)?;
     backplane.pcie_core = chip.core(chip::CORE_PCIE2);
@@ -583,6 +626,7 @@ mod command_tests {
             device,
             cap,
             pcie_core: None,
+            msi: None,
         };
         let mut out = [0xa5; 7];
         if bus.read32(chip::ENUM_BASE) != Err(chip::Error::Access)

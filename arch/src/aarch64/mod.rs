@@ -29,6 +29,7 @@ pub mod psci;
 pub mod rme;
 pub mod rndr;
 pub mod sctlr2;
+pub mod smccc;
 pub mod sme;
 pub mod smmuv3;
 pub mod spe;

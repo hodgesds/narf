@@ -10,6 +10,7 @@
 //
 // `ath10k/hw.h`:
 //   #define QCA988X_2_0_DEVICE_ID        (0x003c)
+//   #define QCA9887_1_0_DEVICE_ID        (0x0050)
 //   #define QCA6164_2_1_DEVICE_ID        (0x0041)
 //   #define QCA6174_2_1_DEVICE_ID        (0x003e)
 //   #define QCA99X0_2_0_DEVICE_ID        (0x0040)
@@ -28,6 +29,10 @@ pub const UBNT_VENDOR: u16 = 0x0777;
 
 /// QCA988X v2.0 — Wave 1 802.11ac 2x2 (cited in `hw.h`).
 pub const QCA988X_DEVICE_ID: u16 = 0x003c;
+/// QCA9887 v1.0 — single-chain QCA988X-family part. Linux `pci.c` selects
+/// `ATH10K_HW_QCA9887` with the QCA988X register map, warm/chip reset and
+/// target-address translation; `core.c` adds an SI EEPROM calibration source.
+pub const QCA9887_DEVICE_ID: u16 = 0x0050;
 /// Ubiquiti rebadge of QCA988X v2.0.
 pub const QCA988X_UBNT_DEVICE_ID: u16 = 0x11ac;
 /// QCA6174 v2.1 — Wave 2 802.11ac 2x2, common laptop SKU.
@@ -54,6 +59,7 @@ pub const AR9462_DEVICE_ID: u16 = 0x0034;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HwRev {
     Qca988x,
+    Qca9887,
     Qca6174,
     Qca99x0,
     Qca9888,
@@ -67,7 +73,7 @@ impl HwRev {
     /// is the 32-bit `qcax_ce_regs` format for these PCIe parts.
     pub const fn registers(self) -> Option<Registers> {
         Some(match self {
-            Self::Qca988x => Registers {
+            Self::Qca988x | Self::Qca9887 => Registers {
                 rtc_soc: 0x4000,
                 pcie_local: 0x80000,
                 soc_core: 0x9000,
@@ -107,6 +113,7 @@ impl HwRev {
     pub const fn short_name(self) -> &'static str {
         match self {
             HwRev::Qca988x => "QCA988X",
+            HwRev::Qca9887 => "QCA9887",
             HwRev::Qca6174 => "QCA6174",
             HwRev::Qca99x0 => "QCA99X0",
             HwRev::Qca9888 => "QCA9888",
@@ -122,6 +129,7 @@ impl HwRev {
         match (vendor, device) {
             (ATHEROS_VENDOR, QCA988X_DEVICE_ID) => Some(HwRev::Qca988x),
             (UBNT_VENDOR, QCA988X_UBNT_DEVICE_ID) => Some(HwRev::Qca988x),
+            (ATHEROS_VENDOR, QCA9887_DEVICE_ID) => Some(HwRev::Qca9887),
             (ATHEROS_VENDOR, QCA6174_DEVICE_ID) => Some(HwRev::Qca6174),
             (ATHEROS_VENDOR, QCA6164_DEVICE_ID) => Some(HwRev::Qca6174),
             (ATHEROS_VENDOR, QCA99X0_DEVICE_ID) => Some(HwRev::Qca99x0),
@@ -166,6 +174,7 @@ impl Registers {
 pub const ALL_PCI_MATCHES: &[(u16, u16)] = &[
     (ATHEROS_VENDOR, QCA988X_DEVICE_ID),
     (UBNT_VENDOR, QCA988X_UBNT_DEVICE_ID),
+    (ATHEROS_VENDOR, QCA9887_DEVICE_ID),
     (ATHEROS_VENDOR, QCA6174_DEVICE_ID),
     (ATHEROS_VENDOR, QCA6164_DEVICE_ID),
     (ATHEROS_VENDOR, QCA99X0_DEVICE_ID),

@@ -8,11 +8,15 @@
 > acceptance remains pending. Wider channels, recovery and other chips are separate.
 > The additional bounded two-MPDU sender BA/A-MPDU continuation below is
 > implemented with ten new native smokes passing the coordinated validation
-> on both architectures.
+> on both architectures. AR2427 (`168c:002c`, AR9285 silicon with HT bonded
+> out) shares the legacy owner with every HT/BA source closed.
+> The optional measured `N85Q` continuation (§3.4) adds four-AC EDCA on
+> QCU0..3 and eight-TID classification/scheduling on the same owner.
 
 ## 1. Purpose & scope
 
-The currently matched PCIe part is AR9285 (`168c:002b`). Broader ath9k
+The currently matched PCIe parts are AR9285 (`168c:002b`) and AR2427
+(`168c:002c`), Linux's AR9285 silicon with 802.11n bonded out. Broader ath9k
 families are not implemented merely because Linux supports them.
 This is a soft-MAC radio: unlike ath10k it does not use a downloadable
 WLAN firmware to supply MLME and hardware programming.
@@ -28,7 +32,17 @@ AR9285-specific writes follow a checked silicon revision.
 
 ## 3. Public interface
 
-- `register()` installs the AR9285 PCI match.
+- `register()` installs the AR9285 (`ath9k`) and AR2427 (`ath9k-ar2427`)
+  PCI matches; `ar9285_silicon()` is the shared exact vendor/device gate.
+  Linux `hw.c::ath9k_hw_init` accepts `AR2427_DEVID_PCIE` with the same
+  AR9285 silicon revision, `eeprom_4k.c` map and AR9002 reset/INI path, and
+  `hw.c::ath9k_hw_fill_cap_info` clears `ATH9K_HW_CAP_HT` for that ID only.
+  AR2427 therefore runs the identical probe, calibration, legacy packet and
+  station owner, while `ht::Facts::new` (and thus every HT20, RX STBC, RX BA
+  and sender BA grant) admits only `0x002b`. The bound-driver record names
+  `ath9k-ar2427`. Smokes `smoke_ar2427_bonded_out_ht_never_reaches_measured_facts`
+  and the two-ID `smoke_ar9285_native_packet_revocation_precedes_config_dma_and_mmio`
+  cover the gate. Physical AR2427 acceptance is pending like AR9285.
 - `probe()` reads the complete factory calibration image after Linux's
   bounded power-on/warm-reset sequence. It retains the controller instead
   of constructing and immediately discarding an `Arc`.
@@ -420,6 +434,75 @@ The ten new cases passed in the coordinated scoped Wi-Fi suites: x86_64
 2360 pass,0 fail,9 skip; aarch64 1890 pass,0 fail,3 skip. Production boots and
 all btrfs postflights were clean. Physical N85T/BAR qualification remains open.
 
+### 3.4 Optional measured four-AC EDCA and eight-TID scheduling
+
+`Ath9k::qos_qualification_request()` returns factual `identity`, `mac` and
+external `filename` (`ath9k/ar9285-qos-v1-<twelve lowercase MAC hex
+digits>.bin`) derived from the retained `N85H` grant; it grants nothing and
+no asset or measurement is checked in. The request hashes the exact `N85H`
+identity and signed-body digest, the classification/downgrade rules, the
+QCU/DCU recipe, the single-in-flight host scheduler and the full static
+envelope including every AC's contention, retry and automatic-response peak.
+
+The little-endian 96-byte v1 body has `N85Q`, version:u16=1, header:u16=96,
+length:u32=96 at 0; vendor:u16=0x168c/device:u16=0x002b at 12; request
+identity[32] at 16; MAC[6] at 48; primary1/width20/chain1/AC count4 at 54;
+measured all-AC conducted peak:i16 half-dBm at 58; TID count:u8=8 at 60;
+starvation bound:u8=8 at 61; board ceiling:i16 half-dBm at 62; reserved[32]=0
+at 64. The peak plus the base antenna bound must fit this ceiling, the base
+ceiling and every current overlapping host rule at every native access
+(`qos::Grant::invoke` nests inside the `N85H`/BA invocations).
+
+Linux behaviour followed:
+
+- Classification: `net/wireless/util.c::cfg80211_classify8021d` (RFC 8325
+  DSCP table, IPv6 traffic class, MPLS TC, 802.21 = 7; no QoS Map/VLAN input
+  exists natively) and `net/mac80211/wme.c::ieee80211_downgrade_queue`
+  (ACM-marked ACs step VO->VI->BE->BK without an admitted TSPEC).
+- Queues: `init.c::ath9k_init_queues` sets up one DATA QCU per AC and
+  `hw.c::ath9k_hw_init_queues` writes `AR_DQCUMASK(q) = 1 << q`;
+  `main.c::ath9k_conf_tx` -> `xmit.c::ath_txq_update` ->
+  `mac.c::ath9k_hw_resettxqueue` programs `AR_DLCL_IFS` (CWmin/CWmax/AIFS),
+  `AR_DRETRY_LIMIT`, `AR_QMISC` (DCU early termination) and `AR_DMISC`
+  (CW backoff, frag wait, threshold 2) from the AP's WMM parameters.
+  NARF keeps BE on its original QCU0 owner, uses Linux's VI=1 and BK=3
+  indices and places VO on the free QCU2. Retry limits match queue0.
+  `AR_DCHNTIME` stays 0: Linux programs `txop * 32` us, but each NARF QCU
+  holds one MPDU per access, which stays within any advertised TXOP limit.
+- Scheduling: Linux `xmit.c::ath_tx_queue_tid`/`ath_txq_schedule` keep
+  per-TID software queues drained per hardware queue and let the DCUs
+  contend. The NARF owner keeps exactly one native PPDU in flight across all
+  QCUs (the existing terminal TxDone + queue-idle proof), so the host
+  `qos::Scheduler` serves the highest backlogged AC (VO, VI, BE, BK), serves
+  any AC passed over 8 consecutive times first, and alternates the two TIDs of
+  an AC. Its total backlog stays within one TID's 16-frame bound, so the IPC
+  ring retains backpressure and nothing is dropped. Without the grant every
+  frame is TID0 and the scheduler is the original FIFO.
+
+The successful association response must carry a complete WMM Parameter
+element: BE keeps the §3.1 rules (no ACM, TXOP 0, no U-APSD) and must equal
+the programmed queue0 word; every AC needs AIFSN 2..15 and CWmin<=CWmax<=1023.
+An invalid non-BE AC leaves the qualified BE-only owner unchanged (no queue
+is programmed). `Packet::enable_qos` programs QCU1..3, opens IMR_S0/S1
+TXDESC/TXEOL for QCU0..3 when MSI is armed and reads every data DCU back;
+the same readback gates each later transmit. A later beacon whose WMM
+parameters differ closes the owner, as BE changes already did.
+
+Open QoS DATA uses the existing independent per-TID sequence counters;
+secured QoS uses the shared per-TID sequence owner, and the QoS control TID
+is the classified user priority. The two-MPDU sender BA (§3.3) still owns
+BE/TID0 only: the interface pairs only TID0 frames and `send_pair` refuses any
+other TID. Management, EAPOL, BA control and BAR stay on queue0.
+Teardown is the §4 stop proof, which already aborts and polls all ten QCUs;
+a frame held on QCU2 is reclaimed and a wedged DCU pins every mapping.
+Covered by `smoke_ar9285_qos_classify_downgrade_and_scheduler_order`,
+`smoke_ar9285_qos_signed_contract_and_missing_source_keeps_be_queue0`,
+`smoke_ar9285_qos_native_four_ac_program_tids_and_queues` and
+`smoke_ar9285_qos_teardown_revocation_and_invalid_ac_fallback`; the
+filtered `drivers/wireless/ath9k` kernel-test suites report 112 pass, 0 fail,
+0 skip on both x86_64 and aarch64. Physical N85Q qualification and over-air
+EDCA behaviour are unmeasured.
+
 The former reset-only `Ath9k::new` constructor is removed. Construction
 goes through the PCI authority and identification path. Successful probe
 records hardware identity and then programs Linux's AR9285 2GHz HT20
@@ -482,8 +565,21 @@ current capability invocation, including the actual configuration accesses.
   programming before BME activation. TX status is terminal only after descriptor
   completion and queue idle; RX completion is acquired before status/payload.
   A null-terminated RX list retains its last consumed descriptor until a
-  successor completes. Stop parks all queues, MAC RX and BME but does not
-  prove memory reclaimable; published mappings remain retained on drop.
+  successor completes. Stop follows Linux `recv.c::ath_stoprecv` and
+  `mac.c::{ath9k_hw_stopdmarecv,ath9k_hw_abort_tx_dma}` with bus mastering
+  still on: DIAG RX abort/disable, RX filter clear, MACMISC observation bus,
+  AR_CR_RXD with 1000 x 10 us RXE polls and the pre-AR9300 DMADBG_7 `0x1c0`
+  hang signature, then AR_Q_TXD for all ten QCUs with forced quiet collision,
+  idle-high channel and ignored backoff while each QCU's pending count and
+  TXE bit are polled up to 1000 times 5 us apart. IER is cleared and BME is
+  disabled with readback. Only if every step succeeded and post-BME-off BAR
+  reads (which order behind earlier device-posted DMA writes; the native port
+  requires PCIe Device Control Relaxed Ordering disabled, otherwise the proof
+  is refused) still show RXE,
+  TXE and pending counts clear, RX parked and IER off, are the rings and
+  buffers released (`Packet::reclaimed`). Any timeout, hang signature or
+  access failure keeps every mapping pinned for the rest of the boot. The
+  terminal owner leaves AR_Q_TXD set rather than Linux's final re-enable.
 - Hardware key-cache entries remain invalid. Protected KeyMiss frames with no
   other errors may lack FrameOK and reach software CCMP authentication;
   unprotected frames require FrameOK. Neither path bypasses MIC/replay checks.
@@ -573,14 +669,212 @@ profile are implemented. Hardware testing requires an exact EEPROM-bearing
 device, authenticated deployment policy and measured RF/calibration acceptance.
 No RF or AP interoperability has been demonstrated by the model tests.
 
-Broader live channels/retuning, factory profiles, periodic calibration,
-interrupt-driven operation, HT40/SGI40, larger TX aggregates, TX A-MSDU, additional AC/TID
-scheduling and power transitions
-require separate continuations. Reset/rejoin, removal and DMA reclamation need
-an independently proved generation/reset owner; the initial profile retains
-storage and requires a fresh lifecycle after terminal closure.
+Additional AC/TID scheduling is implemented in §3.4. The remaining software
+rows and the tree facts that keep each open:
+
+- `additional_channels`, `channel_retuning`: every live owner is bound to
+  2412 MHz. `packet_native.rs::Native::new` and `ht::Facts::new` reject any
+  calibration report whose frequency is not 2412; `phy/channel.rs` is invoked
+  only for the inactive reference; the one-shot calibration receipt cannot be
+  replayed without the full generation reset; and the `N85H/N85B/N85T/N85Q`
+  bodies fix primary channel 1 at offset 54 while each `invoke` intersects
+  only host rules overlapping 2402-2422 MHz. Linux retunes through
+  `main.c::ath9k_config` -> `channel.c::ath_chanctx_set_channel` ->
+  `main.c::ath_reset_internal` -> `hw.c::ath9k_hw_reset` (per-channel INI,
+  `ar9002_phy.c::ar9002_hw_set_channel`, spur mitigation, calibration and
+  `ath9k_hw_do_fastcc`). Closing these needs a per-channel calibration
+  report/permission and a channel-set field in every signed record (a v2 of
+  all four formats), plus multi-channel scan. Signed HT40 has the same
+  dependency.
+- `ht40`, `sgi40`: Linux `common-init.c::ath9k_cmn_setup_ht_cap` advertises
+  `SUP_WIDTH_20_40 | SGI_40` for AR9285, but HT40 needs a secondary channel
+  (rejected by `ht::response` and `Profile::observe`), the extension
+  channel/`AR_PHY_TURBO` dynamic 20/40 programming, HT40 CTL/target-power
+  planning (`phy/rates.rs` plans only CCK/OFDM/HT20) and the multi-channel
+  record above; SGI40 depends on HT40 (`N85H` byte 57 fixes GI 0).
+- `factory_profile_selection`: the production owner accepts only the AR9285
+  `eeprom_4k.c` 376-byte map, version 14.1+, chain masks 1/1 and the
+  channel1 plan (`identity.rs::decode_identity`, `phy/`). The spec line names
+  no further Linux variant to select; the enumerated variants are the chip
+  rows below.
+- `periodic_calibration`: Linux `link.c::ath_ani_calibrate` runs a short IQ
+  calibration (`ATH_STA_SHORT_CALINTERVAL` 1 s) until done and a 30 s
+  (`ATH_LONG_CALINTERVAL`) long calibration
+  (`ar9002_calib.c::ar9002_hw_calibrate`: `ar9285_hw_pa_cal(ah, false)`
+  incremental PA tracking, `calib.c::ath9k_hw_getnf/loadnf/start_nfcal`),
+  plus ANI. `calibration.rs` is a one-shot `New -> Running -> Ready` owner
+  that runs before packet preparation and cannot be re-entered while the
+  rings run; PA tracking changes live transmit gain, which the `N85H`
+  envelope explicitly excludes ("Periodic tracking is not inferred"). It needs
+  a live-owner calibration hook and its own measured tracking record.
+- `larger_tx_aggregates`: the sender owns exactly two maps/descriptors
+  (`packet.rs` `TX_DEPTH = 2`, `submit_pair(&[Vec<u8>; 2])`,
+  `tx_ba/protocol.rs` pair state and two-bit BA accounting) and `N85T` v1
+  fixes member count 2 and 4095 air bytes. Linux `xmit.c::ath_tx_form_aggr`
+  builds up to the BAW/`ATH_AMPDU_LIMIT_MAX`/4 ms limit. It needs N-slot TX
+  storage, an N-member chain/retry/bitmap owner and an `N85T` v2 member count.
+- `tx_amsdu`: Linux ath9k never sets `IEEE80211_HW_TX_AMSDU`
+  (`init.c::ath9k_set_hw_capab`), so mac80211 forms no TX A-MSDU for this
+  driver and there is no Linux reference path. Natively the TX maps are
+  `descriptor::MAX_MPDU + 2` (2306) bytes and `descriptor::transmit_ht`
+  rejects longer frames; `N85H` hashes "noTXAMSDU". The shared
+  `station_security::transmit_amsdu_qos` encoder exists but needs larger maps
+  and a separate measured record.
+- `idle_full_sleep`: Linux `main.c::ath_ps_full_sleep` aborts RX and enters
+  FULL_SLEEP only while mac80211 reports `IEEE80211_CONF_IDLE`, and leaving
+  idle reprograms the channel through `ath_reset`. Natively the only
+  FULL_SLEEP entry is the suspend path (`identity::disable_and_sleep`); every
+  `Port` register access assumes AWAKE and no use-counted wake wraps the
+  packet/irq/station owners, and the station has no idle notion distinct from
+  its passive scan cache, which keeps RX running.
+- `station_network_sleep`: Linux sets `SUPPORTS_PS` only with
+  `ps_enable=1` (`init.c`, default off). Natively there is no beacon-timer
+  programming (`ath9k_hw_set_sta_beacon_timers`), TIM parsing, PS-Poll or
+  NULL-data PM signalling, and IMR_S5 TIM_TIMER stays cleared (`irq.rs`).
+- `host_bus_pm`: `narf_bus::pci::upstream_bridge` now finds the parent
+  bridge, but no API lets a function driver read it: `pci_express::read_status`
+  needs a `Cap<BusDeviceCap, Read>` for the bridge itself (only the TCB
+  registry authority can mint one, by claiming the bridge) and omits Link
+  Control. The missing shared API is a read-only parent `PCI_EXP_LNKCTL`
+  accessor derived from the child's capability. The AR9285 power-off half
+  cannot land alone: `hw-ops.h::ath9k_hw_configpcipowersave` returns unless
+  `ah->aspm_enabled`, which only `pci.c::ath_pci_aspm_init` sets from that
+  parent read.
+
+Interrupt-driven service (`irq.rs`) follows Linux `pci.c` with
+`ath9k_use_msi`: one MSI vector is discovered, programmed and installed with
+delivery disabled after MAC preparation (`Native::arm_msi`); failure leaves
+the owner on 1 ms scheduled polling, since no INTx route is claimed. After the
+rings start, `Packet::enable_interrupts` writes the
+`hw.c::ath9k_hw_init_interrupt_masks` + `mac.c::ath9k_hw_set_interrupts`
+station mask for imask TX|RX|RXEOL|RXORN|FATAL|GLOBAL (CST on HT silicon):
+IMR `0x910004b0` (RX mitigation RXINTM/RXMINTR with RIMT 700/250 us, TXDESC
+and TXEOL for QCU0 via IMR_S0/S1, GENTMR because AR9285 lacks AUTOSLEEP),
+SYNC_DEFAULT, AR_INTCFG MSI RX-mitigation routing, then
+`__ath9k_hw_enable_interrupts` (IER, async MAC_IRQ, sync default, MSI priority
+mask and the 200-try AR_PCIE_MSI re-arm). The vector handler only counts and
+wakes; the station task brackets each service pass with
+`ar9002_mac.c::ar9002_hw_get_isr` (RAC read-clear of ISR/S0_S/S1_S/S5_S, sync
+cause clear, AR_RC_HOSTIF pulse on completion timeout) plus
+`ath9k_hw_kill_interrupts`, and resumes afterwards as `ath9k_tasklet` does.
+RXEOL drops RXEOL|RXORN from IMR until the RX pass completes. FATAL (HOST1
+fatal/PERR, completion timeout) fails and terminally stops the owner. The
+worker sleeps until the vector, a stack TX enqueue or a 20 ms housekeeping
+tick for millisecond MLME/RSNA deadlines. Stop kills IER/async/sync/MSI
+priority enables and disables MSI before the vector is drained and freed; a
+failed MSI disable quarantines the vector. Covered by
+`smoke_ar9285_packet_msi_cause_kill_resume_and_fatal`. Physical MSI delivery
+on AR9285 is unmeasured.
+
+Power transitions are enumerated from Linux `hw.h::ath9k_power_mode`
+(`AWAKE`, `FULL_SLEEP`, `NETWORK_SLEEP`) and their callers. The current owner
+forces `AR_RTC_FORCE_WAKE` during reset and stays `AWAKE`; AR9285 lacks
+`ATH9K_HW_CAP_AUTOSLEEP` (`hw.c::ath9k_hw_fill_cap_info`), so every sleep entry
+must be software-forced. Remaining named operations:
+
+- `idle_full_sleep`: `main.c::{ath9k_ps_wakeup,ath9k_ps_restore,ath_ps_full_sleep}`
+  use-counted wake, 100 ms idle timer, RX abort/DMA stop and `FULL_SLEEP`,
+  with `hw.c::ath9k_hw_setpower` restoring `AWAKE` before register access.
+- `station_network_sleep`: `NETWORK_SLEEP` station power save with
+  `beacon.c::ath9k_beacon_config_sta`/`hw.c::ath9k_hw_set_sta_beacon_timers`
+  TIM/DTIM timers and beacon/CAB/PS-Poll/TX-ACK wake conditions. Linux leaves
+  `SUPPORTS_PS` behind the `ps_enable` module parameter (default off).
+- `host_bus_pm`: `pci.c::ath_pci_aspm_init` parent-link ASPM L0s/L1 discovery
+  and `aspm_l1_fix` (config 0x70c) handling.
+
+System suspend is implemented through `narf_power::device_pm` ("ath9k"):
+`pm_suspend` (Linux `pci.c::ath_pci_suspend`, with mac80211's prior
+interface stop) retires the station generation and requires its DMA-stop
+proof, then `identity::disable_and_sleep` performs `ath9k_hw_disable` (AWAKE
++ cold reset; PLL not reprogrammed since the chip sleeps immediately) and the
+forced `hw.c::ath9k_set_power_sleep` FULL_SLEEP entry (STA_ID1 PWR_SAV, RTC
+force-wake clear, AR_RC AHB|HOSTIF, active-low RTC reset asserted). A held
+owner lock returns Busy so the orchestrator aborts; unproven DMA pins the
+owner and fails suspend. `pm_resume` (`ath_pci_resume`) re-disables PCI
+RETRY_TIMEOUT (config 0x41) and spawns a generation reset (power-on reset,
+identical EEPROM, INI/PLL/RF, calibration, republication). ASPM
+re-initialization belongs to the open `host_bus_pm` row. Covered by
+`smoke_ath9k_ar9285_suspend_disable_then_forced_full_sleep` plus the
+retirement smokes; physical S3 is unmeasured.
+
+Wake-on-WLAN is not applicable to the matched parts: `wow.c::ath9k_init_wow`
+requires PCI `driver_data` `ATH9K_PCI_WOW`, which `pci.c` sets only for
+`0x0034` (AR9462) subsystems, and the hardware programming lives in
+`ar9003_wow.c` (AR9003 family only). It belongs to AR9462 enablement.
+
+DMA reclamation is implemented by the terminal stop described in §4 and
+covered by `smoke_ar9285_packet_dma_stop_proof_reclaims_storage` (held TX
+abort, never-started owner, wedged DCU and RX DMA with exact Linux poll
+budgets, DMADBG_7 hang and revoked authority), and by the ownership smoke,
+whose model device faults on any access to a released mapping.
+
+Generation reset, rejoin and removal build on that proof:
+
+- `reset`: `ath9k::reset_radio` (Linux `main.c::ath_reset` /
+  `hw.c::ath9k_hw_reset`) retires the current generation — host interface
+  withdrawn (`interface::retire`), station stopped, DMA-stop proof required
+  (`Radio::retire`). An unproven stop pins the owner forever (`pinned`), so no
+  successor can start while the function might still master. After verified
+  BME-off it re-runs the probe's AR_RTC power-on + warm reset and EEPROM read
+  on the same function, requires the identical identity and 376-byte factory
+  image, reprograms INI/PLL/RF (`phy::program`), discards the old calibration
+  receipt, bumps `generation` and re-enters the one-shot calibration, packet
+  preparation (fresh rings, fresh MSI vector) and station publication.
+- `rejoin`: after publication a supervisor watches the station; once it is
+  terminal (disassociation, peer loss, FATAL interrupt, failed DMA) it resets
+  into a fresh generation so the radio can be joined again. Three consecutive
+  failed resets, a removed owner or a pinned generation end supervision. Each
+  generation publishes a new `wlan%d` name; retired names stay reserved
+  (stable names are not claimed).
+- `removal`: `narf_bus::register_pci_remove` for both AR9285 and AR2427 match
+  names (Linux `pci.c::ath_pci_remove`). The hook marks the owner removed
+  before waiting (blocking any initialization, reset or supervisor), retires
+  the generation, drops the controller and releases the singleton address
+  only when DMA was reclaimed; otherwise the address stays quarantined.
+  `narf_drivers` has no bound-driver unrecord API, so the bound record is left.
+
+Covered by `smoke_ar9285_station_retirement_reports_exact_dma_reclamation`
+(reclaimed vs wedged DCU, idempotent retire) and
+`smoke_ar9285_native_device_retire_host_withdraws_generation` (carrier,
+interface table, reserved name, late TX, DMA stop). Physical chip reset and
+re-association after reset are unmeasured.
 
 Other ath9k devices need their own EEPROM maps, reset/PHY tables and
-descriptor/runtime variants before they can be claimed supported.
+descriptor/runtime variants before they can be claimed supported. The Linux
+`pci.c::ath_pci_id_table`/`hw.h` PCI inventory beyond AR9285/AR2427 is:
+
+- `ar5416_enablement`: AR5416 PCI `0x0023` / AR5418 PCIe `0x0024`
+  (AR5008 PHY ops, `eeprom_def.c`, `ar5008_initvals.h`).
+- `ar9160_enablement`: AR9160 PCI `0x0027` (AR9001, `eeprom_def.c`).
+- `ar9280_enablement`: AR9280 PCI `0x0029` / PCIe `0x002a` (AR9002 dual-band,
+  `eeprom_def.c`, AR9280 INI).
+- `ar9287_enablement`: AR9287 PCI `0x002d` / PCIe `0x002e` (AR9002,
+  `eeprom_9287.c`).
+- `ar9300_enablement`: AR9380/AR9390 PCIe `0x0030` (AR9003 EDMA descriptors,
+  `eeprom_9003.c`, `ar9003_2p2_initvals.h`).
+- `ar9485_enablement`: AR9485 `0x0032` and AR1111 `0x0037` (AR9003).
+- `ar9580_enablement`: AR9580 `0x0033` (AR9003).
+- `ar9462_enablement`: AR9462 `0x0034` (AR9003, BT coexistence MCI, WoW);
+  ath10k currently rejects this ID as wrong-driver.
+- `ar9565_enablement`: AR9565 `0x0036` (AR9003, MCI).
+
+Every chip row shares these tree blockers: `identity.rs::identify` rejects
+any `AR_SREV` macro version other than 0xC0 (AR9285) before the first write;
+`decode_identity` accepts only the 376-byte `ar5416_eeprom_4k` map with chain
+masks 1/1; `initvals.rs` carries only the AR9285_1_2 tables; `phy/` and
+`calibration.rs` implement only the single-chain AR9285 recipe
+(`ar9002_calib.c` AR9285 CL/PA paths); `descriptor.rs` is the AR9002
+non-EDMA format; and every signed record names device `0x002b`. Per row the
+Linux pieces still to port are: AR9287 (closest relative: AR9002, 2.4 GHz
+only) `eeprom_9287.c`, `ar9287_initvals.h` modes/common/TX-gain tables, the
+AR9287 calibration branches and two-chain masks; AR9280 `eeprom_def.c`,
+`ar9280_initvals` (AR9280_2) and 5 GHz; AR5416/AR9160 the AR5008 PHY
+(`ar5008_phy.c` analog RF banks) and `eeprom_def.c`; AR9380/AR9485/AR9580/
+AR9462/AR9565 the AR9003 EDMA TX-status/RX-FIFO path (`ar9003_mac.c`),
+`eeprom_9003.c`, per-chip `ar9003_*_initvals.h`, `ar9003_calib.c`, plus MCI
+for AR9462/AR9565.
+
+SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
+`ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
 Physical acceptance for the initial profile covers EEPROM, RF calibration,
 polled channel/DMA, scan/association/IP traffic and terminal link loss/stop.

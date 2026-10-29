@@ -106,6 +106,16 @@ impl Mt76Iface {
                     .collect(),
             });
         }
+        // mt7921_set_stream_he_caps: the 6 GHz sband exists only with
+        // MT_NIC_CAP_6G (and inside has_5ghz).
+        if crate::mt7921::six_ghz::qualified(self.radio) {
+            bands.push(WirelessBand {
+                freq_mhz: 6000,
+                channels: crate::mt7921::channel::channels_6ghz()
+                    .map(u32::from)
+                    .collect(),
+            });
+        }
         bands
     }
 
@@ -349,6 +359,32 @@ impl Mt76Iface {
         Ok(())
     }
 
+    /// cfg80211 `wiphy_suspend` without WoWLAN: leave the BSS (locally
+    /// generated DEAUTH_LEAVING), then the PCIe low-power handoff.
+    async fn prepare_suspend(&self) -> Result<(), WirelessError> {
+        let _control = self.control.lock().await;
+        let connected = self.associated_bssid.lock().is_some();
+        if connected {
+            self.teardown_needed.store(true, Ordering::Release);
+        }
+        self.clear_link();
+        self.scan_cache.lock().clear();
+        if connected {
+            narf_wireless::nl80211::notify_disconnect(&self.name, 3, false);
+        }
+        suspend_result(crate::mt7921::firmware_transport::suspend_boot_radio().await)?;
+        self.teardown_needed.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    async fn resume_from_suspend(&self) -> Result<(), WirelessError> {
+        let _control = self.control.lock().await;
+        suspend_result(crate::mt7921::firmware_transport::resume_boot_radio(self.mac()).await)?;
+        self.recovery_attempts.store(0, Ordering::Release);
+        self.recovery_after_ns.store(0, Ordering::Release);
+        Ok(())
+    }
+
     fn enqueue(&self, bytes: &[u8]) -> Result<(), ()> {
         if !self.link_up() || !transmit_admitted(bytes, self.mac()) {
             return Err(());
@@ -362,6 +398,50 @@ impl Mt76Iface {
             .ok_or(())?
             .try_send(Frame::new(buffer, bytes.len() as u32))
             .map_err(|_| ())
+    }
+}
+
+fn suspend_result(
+    result: Result<(), crate::mt7921::firmware_transport::Error>,
+) -> Result<(), WirelessError> {
+    use crate::mt7921::firmware_transport::Error;
+    result.map_err(|error| match error {
+        Error::Busy => WirelessError::Busy,
+        Error::Timeout => WirelessError::Timeout,
+        Error::Authority => WirelessError::Denied,
+        _ => WirelessError::HardwareError,
+    })
+}
+
+/// System-PM prepare phase (Linux `mt7921_pci_suspend` after cfg80211 and
+/// mac80211 suspend). Runs in executor context with no IRQ lock held; the
+/// started transition is retained across caller cancellation.
+pub async fn system_prepare_suspend() -> Result<(), WirelessError> {
+    let iface = ACTIVE.lock().clone();
+    match iface {
+        Some(iface) => iface.prepare_suspend().await,
+        None => suspend_result(crate::mt7921::firmware_transport::suspend_boot_radio().await),
+    }
+}
+
+/// System-PM resume phase, after synchronous device resume restored config
+/// space. The station is idle afterwards; userspace re-scans/reconnects.
+pub async fn system_resume() -> Result<(), WirelessError> {
+    let iface = ACTIVE.lock().clone();
+    match iface {
+        Some(iface) => iface.resume_from_suspend().await,
+        // A radio suspended before interface publication resumes against
+        // the identity its own owner validated at initialization.
+        None => {
+            use crate::mt7921::firmware_transport::{boot_status, BootStatus, State};
+            match boot_status() {
+                BootStatus::Retained(State::Suspended(info)) => suspend_result(
+                    crate::mt7921::firmware_transport::resume_boot_radio(info.capabilities.mac)
+                        .await,
+                ),
+                _ => Ok(()),
+            }
+        }
     }
 }
 
@@ -448,8 +528,14 @@ impl WirelessNetIface for Mt76Iface {
     }
 
     async fn scan(&self, req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        let mut channels = scan_channels(&req, self.radio.capabilities.phy.bands)?;
-        let ssids = if req.active {
+        let six = crate::mt7921::six_ghz::qualified(self.radio);
+        let mut channels = scan_channels(&req, self.radio.capabilities.phy.bands, six)?;
+        // WIPHY_FLAG_SPLIT_SCAN_6GHZ (mt792x_core.c:711): the 2.4/5 GHz
+        // channels are scanned first, then the 6 GHz channels that
+        // cfg80211_scan_6ghz selects from their Reduced Neighbor Reports.
+        let requested_6ghz: Vec<u8> = channels.iter().copied().filter(|&id| id > 180).collect();
+        channels.retain(|&id| id <= 180);
+        let ssids = if req.active && !channels.is_empty() {
             let domain =
                 narf_wireless::reg::db::ensure_domain().map_err(|_| WirelessError::Denied)?;
             channels = active_channels(&req, channels, &domain)?;
@@ -468,35 +554,54 @@ impl WirelessNetIface for Mt76Iface {
         self.finish_teardown(true).await?;
         {
             use crate::mt7921::firmware_transport::{scan_boot_with_options, Error, ScanOptions};
-            let result = scan_boot_with_options(
-                &channels,
-                &ssids,
-                ScanOptions {
-                    extra_ies: &req.extra_ies,
-                    random_mac: req.random_mac,
-                },
-            )
-            .await;
-            let report = result.map_err(|error| match error {
+            let map_error = |error| match error {
                 Error::Bounds => WirelessError::InvalidArgs,
                 Error::Busy => WirelessError::Busy,
                 Error::Timeout => WirelessError::Timeout,
                 Error::Authority => WirelessError::Denied,
                 _ => WirelessError::HardwareError,
-            })?;
-            let results = report
-                .bss
+            };
+            let mut found = Vec::new();
+            if !channels.is_empty() {
+                let report = scan_boot_with_options(
+                    &channels,
+                    &ssids,
+                    ScanOptions {
+                        extra_ies: &req.extra_ies,
+                        random_mac: req.random_mac,
+                    },
+                )
+                .await
+                .map_err(map_error)?;
+                found = report.bss;
+            }
+            let six_ids = six_ghz_scan_ids(&req, &requested_6ghz, &found);
+            if !six_ids.is_empty() {
+                // 6 GHz channels are scanned passively under a NO_IR domain.
+                let report = scan_boot_with_options(
+                    &six_ids,
+                    &[],
+                    ScanOptions {
+                        extra_ies: &[],
+                        random_mac: req.random_mac,
+                    },
+                )
+                .await
+                .map_err(map_error)?;
+                found.extend(report.bss);
+            }
+            let results = found
                 .iter()
                 .map(|bss| BssInfo {
                     bssid: bss.bssid,
                     ssid: bss.ssid.clone(),
-                    frequency_mhz: crate::mt7921::channel::frequency(bss.channel).unwrap_or(0),
+                    frequency_mhz: scan_frequency(bss).unwrap_or(0),
                     channel: u32::from(bss.channel),
                     rssi: bss.signal_dbm.unwrap_or(-128),
                     security: scan_security(bss),
                 })
                 .collect();
-            *self.scan_cache.lock() = report.bss;
+            *self.scan_cache.lock() = found;
             Ok(results)
         }
     }
@@ -505,11 +610,39 @@ impl WirelessNetIface for Mt76Iface {
         *self.associated_bssid.lock()
     }
 
+    /// The radio-wide threshold the native station fragments under.
+    fn fragmentation_threshold(&self) -> Option<u32> {
+        Some(
+            crate::mt7921::firmware_transport::BOOT_FRAG_THRESHOLD
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// mac80211 `ieee80211_set_wiphy_params(WIPHY_PARAM_FRAG_THRESHOLD)`:
+    /// mt7921 has no `set_frag_threshold` op, so `drv_set_frag_threshold`
+    /// succeeds and mac80211 itself fragments (with 802.3 encap offload off)
+    /// from the next frame. nl80211 already validated the value.
+    fn set_fragmentation_threshold(&self, threshold: u32) -> Result<(), i32> {
+        if threshold != u32::MAX && (threshold < 256 || threshold & 1 != 0) {
+            return Err(22); // EINVAL
+        }
+        crate::mt7921::firmware_transport::BOOT_FRAG_THRESHOLD
+            .store(threshold, core::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     async fn associate(&self, req: AssociateRequest) -> Result<(), WirelessError> {
         let _control = self.control.lock().await;
         let channel = u8::try_from(req.channel).map_err(|_| WirelessError::InvalidArgs)?;
-        if crate::mt7921::channel::frequency(channel) != Some(req.frequency_mhz) {
+        // A 6 GHz request is identified by its frequency: channel numbers
+        // alone collide with 2.4/5 GHz.
+        let six = narf_wireless::association::channel::from_frequency_band(req.frequency_mhz)
+            == Some((narf_wireless::association::channel::Band::Ghz6, channel));
+        if !six && crate::mt7921::channel::frequency(channel) != Some(req.frequency_mhz) {
             return Err(WirelessError::InvalidArgs);
+        }
+        if six && !crate::mt7921::six_ghz::qualified(self.radio) {
+            return Err(WirelessError::NotSupported);
         }
         if req.ssid.is_empty()
             || req.ssid.len() > 32
@@ -520,7 +653,8 @@ impl WirelessNetIface for Mt76Iface {
         }
         let protected = match &req.security {
             narf_wireless::SecurityConfig::Open => false,
-            narf_wireless::SecurityConfig::Wpa2 { .. } => true,
+            narf_wireless::SecurityConfig::Wpa2 { .. }
+            | narf_wireless::SecurityConfig::Wpa3 { .. } => true,
             _ => return Err(WirelessError::NotSupported),
         };
         crate::mt7921::association::validate_sme_ies(&req.ie, protected).map_err(|error| {
@@ -538,7 +672,13 @@ impl WirelessNetIface for Mt76Iface {
             narf_wireless::SecurityConfig::Wpa2 { psk } => {
                 crate::mt7921::association::Security::Wpa2Psk { psk }
             }
-            narf_wireless::SecurityConfig::Wpa3 { .. } => return Err(WirelessError::NotSupported),
+            // WPA3-Personal: the driver runs SAE (sae_pwe=2) and PMF itself.
+            narf_wireless::SecurityConfig::Wpa3 { password } => {
+                crate::mt7921::association::Security::Wpa3Sae {
+                    password: crate::mt7921::association::SaePassword::new(&password)
+                        .ok_or(WirelessError::InvalidArgs)?,
+                }
+            }
             // No external-supplicant mode: mt7921's firmware path runs the
             // handshake from the PMK (nl80211 never builds this for it).
             narf_wireless::SecurityConfig::External(_) => return Err(WirelessError::NotSupported),
@@ -548,14 +688,21 @@ impl WirelessNetIface for Mt76Iface {
             .lock()
             .iter()
             .find(|b| {
-                b.bssid == req.bssid && b.ssid == req.ssid && u32::from(b.channel) == req.channel
+                b.bssid == req.bssid
+                    && b.ssid == req.ssid
+                    && u32::from(b.channel) == req.channel
+                    && crate::mt7921::association::is_six_ghz(b) == six
             })
             .cloned()
             .ok_or(WirelessError::InvalidArgs)?;
 
         let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| WirelessError::Denied)?;
-        crate::mt7921::association::TxPermission::from_domain(&domain, bss.channel)
-            .ok_or(WirelessError::Denied)?;
+        if six {
+            crate::mt7921::association::TxPermission::from_ap(&domain, self.radio, &bss)
+        } else {
+            crate::mt7921::association::TxPermission::from_domain(&domain, bss.channel)
+        }
+        .ok_or(WirelessError::Denied)?;
 
         {
             use crate::mt7921::firmware_transport::{associate_boot_station, Error};
@@ -618,9 +765,16 @@ impl WirelessNetIface for Mt76Iface {
         Err(WirelessError::NotSupported)
     }
 }
-fn scan_channels(req: &ScanRequest, bands: u8) -> Result<Vec<u8>, WirelessError> {
+/// Scan channel ids (`channel::rx_channel`: 2.4/5 GHz channel numbers, 6 GHz
+/// RXD CH_FREQ values 181..=239). 6 GHz entries come only from 6 GHz
+/// frequencies (or, for a default colocated scan, the whole 6 GHz sband):
+/// a bare channel number never selects 6 GHz.
+fn scan_channels(req: &ScanRequest, bands: u8, six: bool) -> Result<Vec<u8>, WirelessError> {
     use crate::mt7921::channel;
-    if req.colocated_6ghz || req.duration_mandatory || req.duration_tu.is_some() {
+    if req.duration_mandatory || req.duration_tu.is_some() {
+        return Err(WirelessError::NotSupported);
+    }
+    if req.colocated_6ghz && !six {
         return Err(WirelessError::NotSupported);
     }
     crate::mt7921::firmware_transport::validate_scan_options(
@@ -646,31 +800,58 @@ fn scan_channels(req: &ScanRequest, bands: u8) -> Result<Vec<u8>, WirelessError>
             .frequencies_mhz
             .iter()
             .map(|&freq| {
+                if let Some((narf_wireless::association::channel::Band::Ghz6, number)) =
+                    narf_wireless::association::channel::from_frequency_band(freq)
+                {
+                    if !six {
+                        return Err(WirelessError::NotSupported);
+                    }
+                    return channel::rx_channel(channel::Band::Ghz6, number)
+                        .map(u32::from)
+                        .ok_or(WirelessError::NotSupported);
+                }
                 channel::from_frequency(freq)
                     .map(u32::from)
                     .ok_or(WirelessError::NotSupported)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // The legacy selector names channel numbers, not scan ids.
+        let numbers: Vec<u32> = channels
+            .iter()
+            .filter_map(|&id| {
+                channel::from_rx_channel(u8::try_from(id).ok()?).map(|(_, n)| u32::from(n))
+            })
+            .collect();
         if !req.channels.is_empty()
-            && (req.channels.len() != channels.len()
-                || !req
-                    .channels
-                    .iter()
-                    .all(|channel| channels.contains(channel)))
+            && (req.channels.len() != numbers.len()
+                || !req.channels.iter().all(|channel| numbers.contains(channel)))
         {
             return Err(WirelessError::InvalidArgs);
         }
         channels
     };
     if requested.is_empty() {
-        return Ok(channel::channels(bands));
+        let mut channels = channel::channels(bands);
+        // cfg80211 includes every 6 GHz channel; the colocated plan below
+        // narrows them (cfg80211_scan_6ghz). Without the flag a default
+        // scan keeps its 2.4/5 GHz profile.
+        if req.colocated_6ghz {
+            channels.extend(
+                channel::channels_6ghz()
+                    .filter_map(|number| channel::rx_channel(channel::Band::Ghz6, number)),
+            );
+        }
+        return Ok(channels);
     }
     let mut channels = Vec::new();
     for requested in requested {
         let value = u8::try_from(requested).map_err(|_| WirelessError::InvalidArgs)?;
-        let band = channel::band(value).ok_or(WirelessError::InvalidArgs)?;
-        if bands & band.capability() == 0 {
+        let (band, _) = channel::from_rx_channel(value).ok_or(WirelessError::InvalidArgs)?;
+        if band != channel::Band::Ghz6 && bands & band.capability() == 0 {
             return Err(WirelessError::NotSupported);
+        }
+        if band == channel::Band::Ghz6 && req.frequencies_mhz.is_empty() {
+            return Err(WirelessError::InvalidArgs);
         }
         if channels.contains(&value) {
             return Err(WirelessError::InvalidArgs);
@@ -678,6 +859,69 @@ fn scan_channels(req: &ScanRequest, bands: u8) -> Result<Vec<u8>, WirelessError>
         channels.push(value);
     }
     Ok(channels)
+}
+
+/// A scan result's centre frequency in its own band.
+fn scan_frequency(bss: &crate::mt7921::firmware_transport::ScanBss) -> Option<u32> {
+    use crate::mt7921::channel;
+    if crate::mt7921::association::is_six_ghz(bss) {
+        channel::frequency_in(channel::Band::Ghz6, bss.channel)
+    } else {
+        channel::frequency(bss.channel)
+    }
+}
+
+/// cfg80211 `cfg80211_scan_6ghz` for the split 6 GHz phase: the colocated
+/// APs of the 2.4/5 GHz results' Reduced Neighbor Reports
+/// (`parse_colocated_aps`) select the requested 6 GHz channels through the
+/// shared `plan_6ghz_scan`. Without `colocated_6ghz` every requested 6 GHz
+/// channel is scanned. The result is in scan-id form, deduplicated.
+///
+/// Linux v7.2 mt7921 programs no per-target fields: `mt76_connac_mcu_hw_scan`
+/// sends only the 6 GHz channel list (band 3), and the RNR BSSID table of
+/// `mt76_connac_mcu_build_rnr_scan_param` is consumed by mt7925 alone.
+pub(crate) fn six_ghz_scan_ids(
+    req: &ScanRequest,
+    requested: &[u8],
+    found: &[crate::mt7921::firmware_transport::ScanBss],
+) -> Vec<u8> {
+    use crate::mt7921::channel;
+    use narf_wireless::association::channel::{from_frequency_band, Band};
+    if requested.is_empty() {
+        return Vec::new();
+    }
+    let colocated: Vec<narf_wireless::scan::ColocatedAp> = found
+        .iter()
+        .filter(|bss| !crate::mt7921::association::is_six_ghz(bss))
+        .flat_map(|bss| narf_wireless::scan::parse_colocated_aps(&bss.information_elements))
+        .collect();
+    let six_request = ScanRequest {
+        ssids: req.ssids.clone(),
+        frequencies_mhz: requested
+            .iter()
+            .filter_map(|&id| channel::from_rx_channel(id))
+            .filter_map(|(band, number)| channel::frequency_in(band, number))
+            .collect(),
+        channels: Vec::new(),
+        active: req.active,
+        random_mac: req.random_mac,
+        colocated_6ghz: req.colocated_6ghz,
+        duration_tu: None,
+        duration_mandatory: false,
+        extra_ies: Vec::new(),
+    };
+    let plan = narf_wireless::scan::plan_6ghz_scan(&six_request, &colocated, None);
+    let mut ids = Vec::new();
+    for mhz in plan.frequencies_mhz {
+        if let Some((Band::Ghz6, number)) = from_frequency_band(mhz) {
+            if let Some(id) = channel::rx_channel(channel::Band::Ghz6, number) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    ids
 }
 
 fn active_channels(
@@ -773,7 +1017,9 @@ pub(crate) fn register_scan_iface(info: RadioInfo) -> Result<Arc<Mt76Iface>, Wir
     narf_net::iface::install_rx_drain(drain_network);
     let worker = iface.clone();
     narf_scheduler::spawn(async move {
-        loop {
+        // Removal withdraws ACTIVE; a removed generation's worker never
+        // touches a reprobed radio.
+        while is_active(&worker) {
             let _ = worker.poll_data().await;
             narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
         }
@@ -782,6 +1028,28 @@ pub(crate) fn register_scan_iface(info: RadioInfo) -> Result<Arc<Mt76Iface>, Wir
 }
 
 static ACTIVE: IrqSafeSpinLock<Option<Arc<Mt76Iface>>> = IrqSafeSpinLock::new(None);
+
+/// PCI removal (Linux `mt76_unregister_device` → `ieee80211_unregister_hw`):
+/// close carrier, report the lost link, and withdraw every publication of
+/// this generation's interface. Its service worker exits on its next turn.
+/// A later probe registers a fresh interface from a fresh identity query.
+pub(crate) fn remove_scan_iface() {
+    let Some(iface) = ACTIVE.lock().take() else {
+        return;
+    };
+    iface.lose_link();
+    iface.scan_cache.lock().clear();
+    narf_wireless::registry::unregister(&iface.name);
+    narf_net::registry().unregister(&iface.name);
+    narf_net::iface::unregister(&iface.name);
+}
+
+fn is_active(iface: &Arc<Mt76Iface>) -> bool {
+    ACTIVE
+        .lock()
+        .as_ref()
+        .is_some_and(|active| Arc::ptr_eq(active, iface))
+}
 
 fn send_frame(bytes: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     let iface = ACTIVE.lock().clone().ok_or(())?;
@@ -1065,17 +1333,20 @@ mod tests {
             || iface.rx_ring().lock().is_some()
             || iface.tx_ring().lock().is_some()
             || info.base_name != "wlan7"
-            || info.bands.len() != 2
+            // MT_NIC_CAP_6G is reported: the 6 GHz band (1, 5, ..., 233).
+            || info.bands.len() != 3
+            || info.bands[2].freq_mhz != 6000
+            || info.bands[2].channels != (1..=233).step_by(4).collect::<Vec<_>>()
             || info.bands[0].channels != (1..=11).collect::<Vec<_>>()
             || !info.hw_caps.ht_supported
             || iface
                 .phy_capabilities(2400)
-                .is_none_or(|caps| caps.ht[..5] != [127, 1, 28, 255, 255] || caps.vht.is_some())
+                .is_none_or(|caps| caps.ht[..5] != [255, 1, 28, 255, 255] || caps.vht.is_some())
             || iface.phy_capabilities(6000).is_some()
             || !info.hw_caps.vht_supported
-            || iface
-                .phy_capabilities(5000)
-                .is_none_or(|caps| caps.vht != Some([48, 1, 0, 0, 250, 255, 0, 0, 250, 255, 0, 0]))
+            || iface.phy_capabilities(5000).is_none_or(|caps| {
+                caps.vht != Some([176, 113, 16, 0, 250, 255, 0, 0, 250, 255, 0, 32])
+            })
             || info.hw_caps.he_supported
             || info.hw_caps.eht_supported
             || !iface.supports_handshake_offload()
@@ -1188,19 +1459,19 @@ mod tests {
             duration_mandatory: false,
             extra_ies: Vec::new(),
         };
-        if scan_channels(&req, 3) != Ok(vec![1, 6, 11]) {
+        if scan_channels(&req, 3, false) != Ok(vec![1, 6, 11]) {
             return TestResult::Fail("valid passive request");
         }
         req.active = true;
-        if scan_channels(&req, 3) != Ok(vec![1, 6, 11]) {
+        if scan_channels(&req, 3, false) != Ok(vec![1, 6, 11]) {
             return TestResult::Fail("active wildcard geometry rejected");
         }
         req.extra_ies = vec![221, 3, 0x50, 0x6f, 0x9a];
-        if scan_channels(&req, 3) != Ok(vec![1, 6, 11]) {
+        if scan_channels(&req, 3, false) != Ok(vec![1, 6, 11]) {
             return TestResult::Fail("native active probe IE profile rejected");
         }
         req.active = false;
-        if scan_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
+        if scan_channels(&req, 3, false) != Err(WirelessError::InvalidArgs) {
             return TestResult::Fail("passive scan accepted probe IEs");
         }
         req.extra_ies.clear();
@@ -1208,29 +1479,31 @@ mod tests {
             addr: [2, 0, 0, 0, 0, 0],
             mask: [3, 0, 0, 0, 0, 0],
         });
-        if scan_channels(&req, 3) != Ok(vec![1, 6, 11]) {
+        if scan_channels(&req, 3, false) != Ok(vec![1, 6, 11]) {
             return TestResult::Fail("native passive random scan geometry rejected");
         }
         req.random_mac.as_mut().unwrap().mask[0] = 0;
-        if scan_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
+        if scan_channels(&req, 3, false) != Err(WirelessError::InvalidArgs) {
             return TestResult::Fail("unbounded multicast random address mask accepted");
         }
         req.random_mac = None;
         req.ssids.push(Vec::new());
-        if scan_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
+        if scan_channels(&req, 3, false) != Err(WirelessError::InvalidArgs) {
             return TestResult::Fail("inconsistent passive request with probe SSIDs accepted");
         }
         req.ssids.clear();
         req.channels = vec![35];
-        if scan_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
+        if scan_channels(&req, 3, false) != Err(WirelessError::InvalidArgs) {
             return TestResult::Fail("unimplemented band exposed");
         }
         req.channels = vec![1, 1];
-        if scan_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
+        if scan_channels(&req, 3, false) != Err(WirelessError::InvalidArgs) {
             return TestResult::Fail("duplicate channel");
         }
         req.channels.clear();
-        if scan_channels(&req, 3) != Ok(crate::mt7921::channel::channels(3)) {
+        if scan_channels(&req, 3, false) != Ok(crate::mt7921::channel::channels(3))
+            || scan_channels(&req, 3, true) != Ok(crate::mt7921::channel::channels(3))
+        {
             return TestResult::Fail("default scan channels");
         }
         TestResult::Pass
@@ -1238,6 +1511,96 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/mt7921/scan",
         mt76_scan_policy_validates_active_ssids_and_channel_geometry
+    );
+
+    /// cfg80211_scan_6ghz / WIPHY_FLAG_SPLIT_SCAN_6GHZ policy: 6 GHz scan
+    /// ids, the colocated flag and the RNR-selected 6 GHz phase.
+    fn mt76_colocated_6ghz_scan_selects_rnr_and_psc_channels() -> TestResult {
+        use crate::mt7921::firmware_transport::ScanBss;
+        let mut req = ScanRequest {
+            ssids: Vec::new(),
+            frequencies_mhz: Vec::new(),
+            channels: Vec::new(),
+            active: false,
+            random_mac: None,
+            colocated_6ghz: true,
+            duration_tu: None,
+            duration_mandatory: false,
+            extra_ies: Vec::new(),
+        };
+        // A default colocated scan adds the whole 6 GHz sband (ids 181..).
+        let Ok(all) = scan_channels(&req, 3, true) else {
+            return TestResult::Fail("default colocated scan refused");
+        };
+        if all.len() != 39 + 59 || all[39] != 181 || all[97] != 239 {
+            return TestResult::Fail("colocated default 6 GHz sband");
+        }
+        if scan_channels(&req, 3, false) != Err(WirelessError::NotSupported) {
+            return TestResult::Fail("colocated scan without MT_NIC_CAP_6G");
+        }
+        // 6 GHz is selected by frequency (6 GHz channel 37 = 6135 MHz) only.
+        req.colocated_6ghz = false;
+        req.frequencies_mhz = vec![2437, 6135];
+        if scan_channels(&req, 3, true) != Ok(vec![6, 190])
+            || scan_channels(&req, 3, false) != Err(WirelessError::NotSupported)
+        {
+            return TestResult::Fail("6 GHz frequency to scan id");
+        }
+        req.channels = vec![6, 37];
+        if scan_channels(&req, 3, true) != Ok(vec![6, 190]) {
+            return TestResult::Fail("legacy selector names 6 GHz channel numbers");
+        }
+        req.frequencies_mhz.clear();
+        req.channels = vec![190];
+        if scan_channels(&req, 3, true) != Err(WirelessError::InvalidArgs) {
+            return TestResult::Fail("a bare number selected a 6 GHz scan id");
+        }
+        // A 2.4 GHz beacon whose RNR names a colocated AP on 6 GHz channel 33
+        // (operating class 131, TBTT length 13, colocated + same SSID).
+        let mut ies = vec![0, 4];
+        ies.extend_from_slice(b"narf");
+        ies.extend_from_slice(&[201, 17, 0x00, 13, 131, 33, 0]);
+        ies.extend_from_slice(&[2, 9, 8, 7, 6, 5]);
+        ies.extend_from_slice(&[0, 0, 0, 0, 0x42, 0xfe]);
+        let found = [ScanBss {
+            bssid: [2, 1, 2, 3, 4, 5],
+            ssid: b"narf".to_vec(),
+            channel: 6,
+            band: None,
+            signal_dbm: Some(-40),
+            capability: 0x11,
+            beacon_interval: 100,
+            information_elements: ies,
+        }];
+        let six: Vec<u8> = crate::mt7921::channel::channels_6ghz()
+            .filter_map(|n| {
+                crate::mt7921::channel::rx_channel(crate::mt7921::channel::Band::Ghz6, n)
+            })
+            .collect();
+        req.channels.clear();
+        req.colocated_6ghz = true;
+        let ids = six_ghz_scan_ids(&req, &six, &found);
+        // PSC channels (5, 21, ..., 229) are scanned blind, plus the RNR's non-PSC 33.
+        let psc: Vec<u8> = (0..15u8).map(|k| 181 + (5 + 16 * k - 1) / 4).collect();
+        if !ids.contains(&189)
+            || !psc.iter().all(|id| ids.contains(id))
+            || ids.len() != psc.len() + 1
+        {
+            return TestResult::Fail("cfg80211_scan_6ghz colocated selection");
+        }
+        // Without the flag every requested 6 GHz channel is scanned, and
+        // nothing is scanned when no 6 GHz channel was requested.
+        req.colocated_6ghz = false;
+        if six_ghz_scan_ids(&req, &six, &found) != six
+            || !six_ghz_scan_ids(&req, &[], &found).is_empty()
+        {
+            return TestResult::Fail("non-colocated 6 GHz phase");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/mt7921/scan",
+        mt76_colocated_6ghz_scan_selects_rnr_and_psc_channels
     );
 
     fn mt76_active_scan_default_filters_policy_and_explicit_denial_is_closed() -> TestResult {
@@ -1279,7 +1642,7 @@ mod tests {
                 },
             ],
         };
-        let hardware = scan_channels(&request, 3).unwrap();
+        let hardware = scan_channels(&request, 3, false).unwrap();
         let channels = active_channels(&request, hardware, &domain).unwrap();
         if channels.len() != 23
             || !channels.contains(&6)
@@ -1308,18 +1671,18 @@ mod tests {
         }
         request.active = false;
         request.ssids.clear();
-        if scan_channels(&request, 3) != Ok(vec![6]) {
+        if scan_channels(&request, 3, false) != Ok(vec![6]) {
             return TestResult::Fail(
                 "NO_IR deployment restriction disabled passive receive geometry",
             );
         }
         request.active = true;
         request.ssids = vec![Vec::new(); 5];
-        if scan_channels(&request, 3) != Err(WirelessError::InvalidArgs) {
+        if scan_channels(&request, 3, false) != Err(WirelessError::InvalidArgs) {
             return TestResult::Fail("active scan accepted more than Linux's four SSIDs");
         }
         request.ssids = vec![vec![0; 33]];
-        if scan_channels(&request, 3) != Err(WirelessError::InvalidArgs) {
+        if scan_channels(&request, 3, false) != Err(WirelessError::InvalidArgs) {
             return TestResult::Fail("oversized active scan SSID accepted");
         }
         TestResult::Pass

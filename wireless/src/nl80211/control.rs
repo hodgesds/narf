@@ -60,6 +60,10 @@ const SET_CQM: u8 = 63;
 /// `NL80211_CMD_GET_WOWLAN` / `NL80211_CMD_SET_WOWLAN`.
 const GET_WOWLAN: u8 = 73;
 const SET_WOWLAN: u8 = 74;
+/// `NL80211_CMD_START_SCHED_SCAN` .. `NL80211_CMD_SCHED_SCAN_STOPPED`.
+const START_SCHED_SCAN: u8 = 75;
+const STOP_SCHED_SCAN: u8 = 76;
+const SCHED_SCAN_STOPPED: u8 = 78;
 /// `NL80211_CMD_SET_SAR_SPECS` is wiphy-wide, not per-link.
 const SET_SAR_SPECS: u8 = 140;
 // Userspace-SME MLME command numbers (nl80211_commands).
@@ -160,6 +164,8 @@ fn begin_operation(name: &str, namespace: u64, index: u32) -> Result<OperationGu
 
 enum Operation {
     Scan(crate::ScanRequest),
+    /// A scan whose `NL80211_ATTR_SCAN_FLAGS` set a `ScanFlags` bit.
+    ScanFlagged(crate::ScanRequest, crate::ScanFlags),
     Connect {
         ssid: Vec<u8>,
         bssid: Option<[u8; 6]>,
@@ -649,11 +655,28 @@ fn elements(mut ie: &[u8]) -> Result<Vec<(u8, &[u8])>, i32> {
 /// FREQ_KHZ is refused because the frequency list would then be in kHz,
 /// which this handler does not decode.
 fn scan_flags(flags: u32, random_mac_supported: bool, connected: bool) -> Result<(), i32> {
+    scan_flags_sn(flags, random_mac_supported, connected, false)
+}
+
+/// `scan_flags` plus `NL80211_SCAN_FLAG_RANDOM_SN` (bit 11), which
+/// `nl80211_check_scan_flags` gates on `NL80211_EXT_FEATURE_SCAN_RANDOM_SN`.
+fn scan_flags_sn(
+    flags: u32,
+    random_mac_supported: bool,
+    connected: bool,
+    random_sn_supported: bool,
+) -> Result<(), i32> {
     const LOW_PRIORITY: u32 = 1 << 0;
     const RANDOM_ADDR: u32 = 1 << 3;
+    const RANDOM_SN: u32 = 1 << 11;
     const FEATURE_GATED: u32 = 0x1ff0; // bits 4..=12
     const FREQ_KHZ: u32 = 1 << 13;
-    if flags & (LOW_PRIORITY | FEATURE_GATED | FREQ_KHZ) != 0 {
+    let gated = if random_sn_supported {
+        FEATURE_GATED & !RANDOM_SN
+    } else {
+        FEATURE_GATED
+    };
+    if flags & (LOW_PRIORITY | gated | FREQ_KHZ) != 0 {
         return Err(EOPNOTSUPP);
     }
     if flags & RANDOM_ADDR != 0 && (!random_mac_supported || connected) {
@@ -710,6 +733,7 @@ struct ConnectCaps {
     connected: bool,
     max_scan_ssids: u8,
     max_scan_ie_len: u16,
+    scan_random_sn: bool,
 }
 
 impl ConnectCaps {
@@ -725,6 +749,7 @@ impl ConnectCaps {
             connected: iface.connected_bssid().is_some(),
             max_scan_ssids: iface.max_scan_ssids(),
             max_scan_ie_len: iface.max_scan_ie_len(),
+            scan_random_sn: iface.supports_scan_random_sn(),
         }
     }
 }
@@ -750,6 +775,7 @@ fn parse_operation(
             connected: false,
             max_scan_ssids: 16,
             max_scan_ie_len: 512,
+            scan_random_sn: false,
         },
         0,
     )
@@ -764,10 +790,10 @@ fn parse_operation_caps(
     let (psk_offload, sae_offload) = (caps.psk_offload, caps.sae_offload);
     let allowed: &[u16] = match command {
         // 158 = NL80211_ATTR_SCAN_FLAGS, 42 = NL80211_ATTR_IE (probe IEs),
-        // 221/222 = MEASUREMENT_DURATION / _MANDATORY.
+        // 235/236 = MEASUREMENT_DURATION / _MANDATORY.
         // 6 = MAC, 215 = MAC_MASK.  They are accepted only together with
         // RANDOM_ADDR, where they configure the randomized probe source.
-        SCAN => &[3, 6, 42, 44, 45, 158, 215, 221, 222],
+        SCAN => &[3, 6, 42, 44, 45, 158, 215, 235, 236],
         CONNECT => CONNECT_ATTRS,
         DISCONNECT => &[3, 54],
         _ => return Err(EOPNOTSUPP),
@@ -781,7 +807,12 @@ fn parse_operation_caps(
                 return Err(EINVAL);
             }
             let flags = u32_attr(attrs, 158)?.unwrap_or(0);
-            scan_flags(flags, caps.scan_random_mac, caps.connected)?;
+            scan_flags_sn(
+                flags,
+                caps.scan_random_mac,
+                caps.connected,
+                caps.scan_random_sn,
+            )?;
             let random_mac = scan_random_mac(attrs, flags)?;
             let ssids = attr(attrs, 45)
                 .map(attributes)
@@ -810,8 +841,8 @@ fn parse_operation_caps(
             if ssids.len() > usize::from(caps.max_scan_ssids) || frequencies_mhz.len() > 68 {
                 return Err(EINVAL);
             }
-            let duration_tu = u16_attr(attrs, 221)?;
-            if let Some(mandatory) = attr(attrs, 222) {
+            let duration_tu = u16_attr(attrs, 235)?;
+            if let Some(mandatory) = attr(attrs, 236) {
                 // `NLA_FLAG`: unlike a u8 boolean, the payload is empty.
                 if !mandatory.is_empty() {
                     return Err(EINVAL);
@@ -821,7 +852,7 @@ fn parse_operation_caps(
             // requests active scanning. Preserve directed entries even when
             // a wildcard is also present, for hidden-network discovery.
             let active = !ssids.is_empty();
-            Ok(Operation::Scan(crate::ScanRequest {
+            let request = crate::ScanRequest {
                 ssids,
                 frequencies_mhz,
                 channels: Vec::new(),
@@ -829,9 +860,17 @@ fn parse_operation_caps(
                 random_mac,
                 colocated_6ghz: flags & (1 << 14) != 0,
                 duration_tu,
-                duration_mandatory: duration_tu.is_some() && attr(attrs, 222).is_some(),
+                duration_mandatory: duration_tu.is_some() && attr(attrs, 236).is_some(),
                 extra_ies: attr(attrs, 42).unwrap_or(&[]).to_vec(),
-            }))
+            };
+            let scan_flags = crate::ScanFlags {
+                random_sn: flags & (1 << 11) != 0,
+            };
+            Ok(if scan_flags == crate::ScanFlags::default() {
+                Operation::Scan(request)
+            } else {
+                Operation::ScanFlagged(request, scan_flags)
+            })
         }
         CONNECT => {
             connect_side_attrs(attrs)?;
@@ -998,6 +1037,9 @@ pub(super) fn handle(
     if matches!(command, GET_WOWLAN | SET_WOWLAN) {
         return wowlan_handle(command, bytes, context);
     }
+    if matches!(command, START_SCHED_SCAN | STOP_SCHED_SCAN) {
+        return sched_scan_handle(command, bytes, context);
+    }
     if command == SET_SAR_SPECS {
         return sar_handle(bytes, context);
     }
@@ -1120,7 +1162,7 @@ pub(super) fn handle(
         }
         // cfg80211_disconnect: the owner goes first.
         Operation::Disconnect => station::clear_owner_for_link(iface.name(), namespace, index)?,
-        Operation::Scan(_) => {}
+        Operation::Scan(_) | Operation::ScanFlagged(..) => {}
     }
     narf_scheduler::spawn(async move {
         let _guard = guard;
@@ -1198,9 +1240,10 @@ fn sar_handle(bytes: &[u8], context: RequestContext<'_>) -> Result<Vec<GenlReply
 /// Linux accepts a request addressed by wiphy, WDEV, or a sibling ifindex,
 /// then applies the resulting pdev chain mask and per-vdev RTS policy across
 /// the whole physical radio.  An all-ones antenna request means "all
-/// available chains".  ath11k deliberately rejects fragmentation thresholds:
-/// target firmware clears the More-Fragments bit, so advertising a functional
-/// `set_frag_threshold` would be worse than the Linux-visible EOPNOTSUPP.
+/// available chains".  Fragmentation thresholds go to
+/// `WirelessNetIface::set_fragmentation_threshold`, whose default (ath11k's
+/// choice: target firmware clears the More-Fragments bit) is the
+/// Linux-visible EOPNOTSUPP.
 fn set_wiphy_handle(bytes: &[u8], context: RequestContext<'_>) -> Result<Vec<GenlReply>, i32> {
     const ATTR_WIPHY: u16 = 1;
     const ATTR_IFINDEX: u16 = 3;
@@ -1260,13 +1303,16 @@ fn set_wiphy_handle(bytes: &[u8], context: RequestContext<'_>) -> Result<Vec<Gen
         iface.set_rts_threshold(threshold)?;
     }
 
-    if let Some(threshold) = u32_attr(&attrs, ATTR_FRAG_THRESHOLD)? {
-        // cfg80211's common validity bound, before ath11k's explicitly
-        // unsupported mac80211 operation. `u32::MAX` is the disabled form.
+    if let Some(mut threshold) = u32_attr(&attrs, ATTR_FRAG_THRESHOLD)? {
+        // `nl80211_set_wiphy`: below 256 is invalid; `u32::MAX` disables;
+        // fragments other than the last have even length.
         if threshold < 256 {
             return Err(EINVAL);
         }
-        return Err(EOPNOTSUPP);
+        if threshold != u32::MAX {
+            threshold &= !1;
+        }
+        iface.set_fragmentation_threshold(threshold)?;
     }
     Ok(Vec::new())
 }
@@ -1615,6 +1661,50 @@ fn station_handle(
     }
 }
 
+/// `NL80211_CMD_START_SCHED_SCAN` / `NL80211_CMD_STOP_SCHED_SCAN`
+/// (`nl80211_start_sched_scan` / `nl80211_stop_sched_scan`). One legacy
+/// request (request id 0) per wiphy: START parses the request against the
+/// driver's `sched_scan_support()` limits with the WoWLAN net-detect parser
+/// and hands it to `start_sched_scan`; on success the START event is
+/// multicast on "scan". STOP calls `stop_sched_scan` and multicasts
+/// SCHED_SCAN_STOPPED. A wiphy without support gets EOPNOTSUPP.
+fn sched_scan_handle(
+    command: u8,
+    bytes: &[u8],
+    context: RequestContext<'_>,
+) -> Result<Vec<GenlReply>, i32> {
+    const ATTR_IFINDEX: u16 = 3;
+    const ATTR_COOKIE: u16 = 88;
+    const ATTR_SOCKET_OWNER: u16 = 204;
+    const ATTR_SCHED_SCAN_MULTI: u16 = 255;
+    let attrs = attributes(bytes)?;
+    let (index, iface) = netdev_from_attrs(&attrs, context.net_ns_id)?;
+    let _admin = authority(&context, iface.as_ref())?;
+    let support = iface.sched_scan_support().ok_or(EOPNOTSUPP)?;
+    match command {
+        START_SCHED_SCAN => {
+            let request = parse_sched_scan(
+                &attrs,
+                support,
+                &[ATTR_IFINDEX, ATTR_SOCKET_OWNER, ATTR_SCHED_SCAN_MULTI],
+            )?;
+            iface.start_sched_scan(request)?;
+            super::notify_sched_scan(iface.name(), index, START_SCHED_SCAN);
+        }
+        _ => {
+            reject_unknown(&attrs, &[ATTR_IFINDEX, ATTR_COOKIE])?;
+            // The single legacy request has id 0 (`reqid` stays zero
+            // without multi-request support).
+            if u64_attr(&attrs, ATTR_COOKIE)?.is_some_and(|cookie| cookie != 0) {
+                return Err(ENOENT);
+            }
+            iface.stop_sched_scan()?;
+            super::notify_sched_scan(iface.name(), index, SCHED_SCAN_STOPPED);
+        }
+    }
+    Ok(Vec::new())
+}
+
 /// `NL80211_CMD_GET_WOWLAN` / `NL80211_CMD_SET_WOWLAN`.  Linux owns this
 /// configuration per wiphy (not per transient link); NARF's currently
 /// single-interface radios map that to their registered station interface.
@@ -1740,16 +1830,37 @@ fn parse_wowlan(raw: &[u8], support: crate::WowlanSupport) -> Result<crate::Wowl
 
 /// Decode the scheduled-scan-shaped payload nested in
 /// `NL80211_WOWLAN_TRIG_NET_DETECT`.  ath11k consumes it only as the
-/// low-power network-list offload configured at suspend time; it deliberately
-/// does not expose a general `START_SCHED_SCAN` command.
+/// low-power network-list offload configured at suspend time. The same
+/// parser serves `NL80211_CMD_START_SCHED_SCAN` (`sched_scan_handle`).
 fn parse_net_detect(
     raw: &[u8],
     support: crate::WowlanSupport,
 ) -> Result<crate::NetDetectConfig, i32> {
-    // These are the nested NL80211_ATTR_* values accepted by
-    // nl80211_parse_sched_scan for WoW net-detect. Linux ath11k advertises
-    // the PNO 512-byte probe-IE limit even though this WMI layout only has
-    // an IE bitmap; retain the bytes for GET_WOWLAN like cfg80211 does.
+    if support.net_detect_max_match_sets == 0 {
+        return Err(EOPNOTSUPP);
+    }
+    // Linux ath11k advertises the PNO 512-byte probe-IE limit even though
+    // this WMI layout only has an IE bitmap; retain the bytes for
+    // GET_WOWLAN like cfg80211 does.
+    let limits = crate::SchedScanSupport {
+        max_match_sets: support.net_detect_max_match_sets,
+        random_mac: support.net_detect_random_mac,
+        ..crate::SchedScanSupport::NET_DETECT
+    };
+    parse_sched_scan(&attributes(raw)?, limits, &[])
+}
+
+/// cfg80211 `nl80211_parse_sched_scan` over already-split attributes, with
+/// the wiphy's scheduled-scan `limits`. `extra` lists the additional
+/// top-level attributes a command carries (ifindex, socket owner) that this
+/// parser ignores.
+fn parse_sched_scan(
+    fields: &[(u16, &[u8])],
+    limits: crate::SchedScanSupport,
+    extra: &[u16],
+) -> Result<crate::NetDetectConfig, i32> {
+    // These are the NL80211_ATTR_* values accepted by
+    // nl80211_parse_sched_scan.
     const ATTR_MAC: u16 = 6;
     const ATTR_IE: u16 = 42;
     const ATTR_SCAN_FREQUENCIES: u16 = 44;
@@ -1760,51 +1871,51 @@ fn parse_net_detect(
     const ATTR_MAC_MASK: u16 = 215;
     const ATTR_SCHED_SCAN_DELAY: u16 = 220;
     const ATTR_SCHED_SCAN_PLANS: u16 = 225;
-    const MAX_CHANNELS: usize = 60; // WMI_PNO_MAX_NETW_CHANNELS_EX
-    const MAX_SSIDS: usize = 16; // WMI_NLO_MAX_SSIDS
-    const MAX_PLAN_INTERVAL_SECS: u32 = 7200;
-    const MAX_PLAN_ITERATIONS: u32 = 100;
+    let max_channels = usize::from(limits.max_frequencies);
+    let max_ssids = usize::from(limits.max_ssids);
+    let max_plan_interval_secs = limits.max_plan_interval_secs;
+    let max_plan_iterations = limits.max_plan_iterations;
 
-    if support.net_detect_max_match_sets == 0 {
+    if limits.max_match_sets == 0 {
         return Err(EOPNOTSUPP);
     }
-    let fields = attributes(raw)?;
     if fields.iter().any(|(kind, _)| {
-        ![
-            ATTR_MAC,
-            ATTR_IE,
-            ATTR_SCAN_FREQUENCIES,
-            ATTR_SCAN_SSIDS,
-            ATTR_SCHED_SCAN_INTERVAL,
-            ATTR_SCHED_SCAN_MATCH,
-            ATTR_SCAN_FLAGS,
-            ATTR_MAC_MASK,
-            ATTR_SCHED_SCAN_DELAY,
-            ATTR_SCHED_SCAN_PLANS,
-        ]
-        .contains(kind)
+        !extra.contains(kind)
+            && ![
+                ATTR_MAC,
+                ATTR_IE,
+                ATTR_SCAN_FREQUENCIES,
+                ATTR_SCAN_SSIDS,
+                ATTR_SCHED_SCAN_INTERVAL,
+                ATTR_SCHED_SCAN_MATCH,
+                ATTR_SCAN_FLAGS,
+                ATTR_MAC_MASK,
+                ATTR_SCHED_SCAN_DELAY,
+                ATTR_SCHED_SCAN_PLANS,
+            ]
+            .contains(kind)
     }) {
         return Err(EOPNOTSUPP);
     }
-    let probe_ies = attr(&fields, ATTR_IE).unwrap_or_default();
-    if probe_ies.len() > 512 {
+    let probe_ies = attr(fields, ATTR_IE).unwrap_or_default();
+    if probe_ies.len() > usize::from(limits.max_ie_len) {
         return Err(EINVAL);
     }
-    let flags = u32_attr(&fields, ATTR_SCAN_FLAGS)?.unwrap_or(0);
-    scan_flags(flags, support.net_detect_random_mac, false)?;
-    let random_mac = scan_random_mac(&fields, flags)?;
+    let flags = u32_attr(fields, ATTR_SCAN_FLAGS)?.unwrap_or(0);
+    scan_flags(flags, limits.random_mac, false)?;
+    let random_mac = scan_random_mac(fields, flags)?;
 
-    let probe_ssids = attr(&fields, ATTR_SCAN_SSIDS)
+    let probe_ssids = attr(fields, ATTR_SCAN_SSIDS)
         .map(attributes)
         .transpose()?
         .unwrap_or_default()
         .into_iter()
         .map(|(_, ssid)| (ssid.len() <= 32).then(|| ssid.to_vec()).ok_or(EINVAL))
         .collect::<Result<Vec<_>, _>>()?;
-    if probe_ssids.len() > MAX_SSIDS {
+    if probe_ssids.len() > max_ssids {
         return Err(EINVAL);
     }
-    let frequencies_mhz = attr(&fields, ATTR_SCAN_FREQUENCIES)
+    let frequencies_mhz = attr(fields, ATTR_SCAN_FREQUENCIES)
         .map(attributes)
         .transpose()?
         .unwrap_or_default()
@@ -1815,15 +1926,15 @@ fn parse_net_detect(
             Ok::<u32, i32>(frequency)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if frequencies_mhz.len() > MAX_CHANNELS {
+    if frequencies_mhz.len() > max_channels {
         return Err(EINVAL);
     }
 
-    let raw_matches = attr(&fields, ATTR_SCHED_SCAN_MATCH)
+    let raw_matches = attr(fields, ATTR_SCHED_SCAN_MATCH)
         .map(attributes)
         .transpose()?
         .ok_or(EINVAL)?;
-    if raw_matches.is_empty() || raw_matches.len() > support.net_detect_max_match_sets as usize {
+    if raw_matches.is_empty() || raw_matches.len() > usize::from(limits.max_match_sets) {
         return Err(EINVAL);
     }
     let mut matches = Vec::with_capacity(raw_matches.len());
@@ -1850,13 +1961,13 @@ fn parse_net_detect(
     }
 
     let plans = match (
-        attr(&fields, ATTR_SCHED_SCAN_PLANS),
-        attr(&fields, ATTR_SCHED_SCAN_INTERVAL),
+        attr(fields, ATTR_SCHED_SCAN_PLANS),
+        attr(fields, ATTR_SCHED_SCAN_INTERVAL),
     ) {
         (Some(_), Some(_)) => return Err(EINVAL),
         (Some(raw_plans), None) => {
             let raw_plans = attributes(raw_plans)?;
-            if raw_plans.is_empty() || raw_plans.len() > 2 {
+            if raw_plans.is_empty() || raw_plans.len() > limits.max_scan_plans as usize {
                 return Err(EINVAL);
             }
             let last = raw_plans.len() - 1;
@@ -1867,7 +1978,7 @@ fn parse_net_detect(
                     return Err(EOPNOTSUPP);
                 }
                 let interval_secs = u32_attr(&plan, 1)?.ok_or(EINVAL)?;
-                if interval_secs == 0 || interval_secs > MAX_PLAN_INTERVAL_SECS {
+                if interval_secs == 0 || interval_secs > max_plan_interval_secs {
                     return Err(EINVAL);
                 }
                 let iterations = u32_attr(&plan, 2)?;
@@ -1875,7 +1986,7 @@ fn parse_net_detect(
                     if iterations.is_some() {
                         return Err(EINVAL);
                     }
-                } else if !matches!(iterations, Some(1..=MAX_PLAN_ITERATIONS)) {
+                } else if !iterations.is_some_and(|n| (1..=max_plan_iterations).contains(&n)) {
                     return Err(EINVAL);
                 }
                 plans.push(crate::NetDetectScanPlan {
@@ -1892,7 +2003,7 @@ fn parse_net_detect(
             }
             // cfg80211 rounds this legacy milliseconds value up to whole
             // seconds before passing it to ath11k's PNO converter.
-            let interval_secs = interval_ms.div_ceil(1000).min(MAX_PLAN_INTERVAL_SECS);
+            let interval_secs = interval_ms.div_ceil(1000).min(max_plan_interval_secs);
             alloc::vec![crate::NetDetectScanPlan {
                 interval_secs,
                 iterations: None,
@@ -1900,7 +2011,7 @@ fn parse_net_detect(
         }
         (None, None) => return Err(EINVAL),
     };
-    let delay_secs = u32_attr(&fields, ATTR_SCHED_SCAN_DELAY)?.unwrap_or(0);
+    let delay_secs = u32_attr(fields, ATTR_SCHED_SCAN_DELAY)?.unwrap_or(0);
     Ok(crate::NetDetectConfig {
         probe_ssids,
         frequencies_mhz,
@@ -3673,10 +3784,18 @@ async fn execute(
     let live = authorized_link(&admin, iface.as_ref(), ns, index);
     // The peer whose controlled port opened with this connect.
     let mut port_authorized = None;
+    let (operation, scan_flags) = match operation {
+        Operation::ScanFlagged(request, flags) => (Operation::Scan(request), Some(flags)),
+        other => (other, None),
+    };
     let (command, group) = match operation {
+        Operation::ScanFlagged(..) => return,
         Operation::Scan(request) => {
             let result = if live {
-                iface.scan(request).await
+                match scan_flags {
+                    Some(flags) => iface.scan_with_flags(request, flags).await,
+                    None => iface.scan(request).await,
+                }
             } else {
                 Err(crate::WirelessError::HardwareError)
             };

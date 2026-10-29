@@ -684,3 +684,70 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2",
     smoke_iwl_mvm_power_native_receipts_are_correlated_and_extent_checked
 );
+
+fn smoke_mvm_feature_power_tag5_is_exact_bit_set_and_identity_bound() -> TestResult {
+    (|| {
+        let qos = Emission::Features(feature::QOS_TIDS);
+        let qos_ba = Emission::Features(feature::QOS_TIDS | feature::BA);
+        let name = request(BINDING, [2; 6], qos).name;
+        if name != "iwlwifi/mvm-api77-ht20-siso-wmm-features-0004-power-v5-020202020202.bin"
+            || name == request(BINDING, [2; 6], qos_ba).name
+            || name == request(BINDING, [2; 6], Emission::Ht20).name
+        {
+            return Err("feature program did not request a distinct exact program");
+        }
+        if qos.tag() != 5
+            || qos_ba.features() & feature::BA == 0
+            || Emission::Ht20NestedBa.features() != feature::BA | feature::NESTED_BA
+            || Emission::Ht20.features() != 0
+        {
+            return Err("emission tag/feature mapping differs");
+        }
+        let mut bytes = record();
+        bytes[46] = 5;
+        bytes[62..64].copy_from_slice(&feature::QOS_TIDS.to_le_bytes());
+        let signed = source(&bytes, true)?;
+        if parse_for(copy(&signed), BINDING, [2; 6], 1, qos).is_err()
+            || parse_for(copy(&signed), BINDING, [2; 6], 1, qos_ba).is_ok()
+            || parse_for(copy(&signed), BINDING, [2; 6], 1, Emission::Ht20).is_ok()
+            || parse_for(copy(&signed), [0; 32], [2; 6], 1, qos).is_ok()
+        {
+            return Err("tag5 bit set/identity binding weakened");
+        }
+        // A tag2 record never authorizes a feature program.
+        let mut tag2 = record();
+        tag2[46] = 2;
+        if parse_for(source(&tag2, true)?, BINDING, [2; 6], 1, qos).is_ok() {
+            return Err("tag2 measurement authorized feature program");
+        }
+        // Unknown bits, empty sets and NESTED without BA are refused even
+        // when a signed record names them.
+        for bits in [0u16, 1 << 15, feature::NESTED_BA] {
+            let mut odd = record();
+            odd[46] = 5;
+            odd[62..64].copy_from_slice(&bits.to_le_bytes());
+            if parse_for(
+                source(&odd, true)?,
+                BINDING,
+                [2; 6],
+                1,
+                Emission::Features(bits),
+            )
+            .is_ok()
+            {
+                return Err("unsupported feature set authorized");
+            }
+        }
+        let revoked = source(&bytes, true)?;
+        revoked.cap.revoke();
+        if parse_for(revoked, BINDING, [2; 6], 1, qos).is_ok() {
+            return Err("revoked feature program authorized");
+        }
+        Ok(())
+    })()
+    .map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/qos",
+    smoke_mvm_feature_power_tag5_is_exact_bit_set_and_identity_bound
+);

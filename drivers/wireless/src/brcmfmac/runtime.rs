@@ -8,7 +8,17 @@ use super::{
     msgbuf::{self, BufAddr, CommonHdr, IoctlReq},
     shared::{RingInfo, RINGINFO_SIZE},
 };
-use alloc::{collections::VecDeque, vec, vec::Vec};
+use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
+
+#[path = "runtime/mailbox.rs"]
+pub mod mailbox;
+#[path = "runtime/quiesce.rs"]
+mod quiesce;
+#[path = "runtime/reset.rs"]
+mod reset;
+use super::irq::Signal;
+pub use quiesce::StopProof;
+pub use reset::DeadStop;
 
 const INPUT: usize = 1518;
 const CONTROL: usize = 8192;
@@ -57,6 +67,30 @@ pub trait Bus: BootBus {
     fn park_dma(&mut self) -> Result<(), Error>;
     fn doorbell(&mut self) -> Result<(), Error>;
     fn host_ready(&mut self, db1: bool) -> Result<(), Error>;
+    /// PCIe2-core mailbox registers (Linux `devinfo->reginfo`). `None`
+    /// when no PCIe2 core is known: the owner then only services rings.
+    fn mailbox(&self) -> Option<mailbox::Reginfo> {
+        None
+    }
+    /// `pci_write_config_dword(BRCMF_PCIE_REG_SBMBX, 1)`, written twice on
+    /// PCIe2 core revisions <= 13 (`brcmf_pcie_send_mb_data`).
+    fn ring_mailbox(&mut self) -> Result<(), Error> {
+        Err(Error::Protocol)
+    }
+    /// Bind one MSI vector that raises `signal`; `false` keeps polling.
+    fn arm_interrupts(&mut self, _signal: &Arc<Signal>) -> bool {
+        false
+    }
+    /// Release a vector bound by [`Self::arm_interrupts`].
+    fn disarm_interrupts(&mut self) {}
+    /// Config dword `BRCMF_PCIE_REG_LINK_STATUS_CTRL` (0xBC).
+    fn link_control(&mut self) -> Result<u32, Error> {
+        Err(Error::Protocol)
+    }
+    /// Write config dword `BRCMF_PCIE_REG_LINK_STATUS_CTRL` (0xBC).
+    fn set_link_control(&mut self, _value: u32) -> Result<(), Error> {
+        Err(Error::Protocol)
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Kind {
@@ -90,7 +124,10 @@ struct Resources<M: Memory> {
 const RX_BYTES: usize = 2048;
 const RX_POOL: usize = 32;
 const TX_PENDING: usize = 64;
-const FLOW_LIMIT: usize = 8;
+/// Linux v7.2 `msgbuf.c::brcmf_proto_msgbuf_attach` caps the firmware
+/// `max_flowrings` (`pcie.c::brcmf_pcie_init_ringbuffers`) at
+/// `BRCMF_FLOWRING_HASHSIZE - 1`; flow rings are allocated on create.
+const FLOW_LIMIT: usize = 511;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FlowState {
     Creating,
@@ -160,6 +197,17 @@ pub struct Runtime<B: Bus> {
     h2d_read: u32,
     max_flows: u16,
     max_rx: u16,
+    mailbox: Option<mailbox::Mailbox>,
+    signal: Arc<Signal>,
+    delivered: bool,
+    /// Linux `BRCMFMAC_PCIE_STATE_DOWN`: no H2D posts or mailbox re-enable.
+    down: bool,
+    /// Set only by a complete confirmed-stop proof (`quiesce.rs`).
+    reclaimable: bool,
+    hostrdy_db1: bool,
+    /// Discovered AI cores of the booted chip (ChipCommon watchdog, PCIe2
+    /// config shadow and ARM CR4 halt for `brcmf_pcie_reset_device`).
+    cores: Vec<super::chip::Core>,
 }
 impl<B: Bus> core::fmt::Debug for Runtime<B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -171,15 +219,19 @@ impl<B: Bus> core::fmt::Debug for Runtime<B> {
 }
 impl<B: Bus> Drop for Runtime<B> {
     fn drop(&mut self) {
-        if self.published {
+        if self.published && !self.reclaimable {
+            self.stop_interrupts();
             let _ = self.bus.park_dma();
-            // BME readback cannot prove all old posted PCI writes drained.
-            // No physical stop/IOMMU quiescence API exists yet. Leak this
-            // bounded per-device owner rather than returning live DMA pages.
+            // Without a confirmed stop (D3 ack, drained completions, verified
+            // BME clear and post-clear flush reads) BME readback alone cannot
+            // prove old posted PCI writes drained. Leak this bounded owner
+            // rather than returning live DMA pages.
             if let Some(resources) = self.resources.take() {
                 core::mem::forget(resources);
             }
         }
+        // A reclaimable owner drops its resources normally: the device can no
+        // longer master any of them.
     }
 }
 impl<B: Bus> Runtime<B> {
@@ -189,9 +241,12 @@ impl<B: Bus> Runtime<B> {
             ram,
             shared_address,
             shared,
-            ..
+            chip,
         } = boot;
-        if bus.dma_enabled()? || !(5..=6).contains(&shared.version) || shared.rx_dataoffset != 0 {
+        // Shared 7 (BRCMF_PCIE_SHARED_VERSION_7) keeps the v6 ring-info
+        // layout and only widens the D2H TX/RX completion items to 24/40
+        // bytes (pcie.c brcmf_ring_itemsize vs brcmf_ring_itemsize_pre_v7).
+        if bus.dma_enabled()? || !(5..=7).contains(&shared.version) || shared.rx_dataoffset != 0 {
             return Err(Error::Protocol);
         }
         let mut bytes = [0; RINGINFO_SIZE];
@@ -240,7 +295,7 @@ impl<B: Bus> Runtime<B> {
         }
         let mut rings = Vec::new();
         for id in 0..5u8 {
-            let layout = msgbuf::ring_layout(id, true).ok_or(Error::Protocol)?;
+            let layout = msgbuf::ring_layout(id, shared.version < 7).ok_or(Error::Protocol)?;
             let mut memory =
                 bus.allocate(usize::from(layout.depth) * usize::from(layout.item_len))?;
             if memory.len() < usize::from(layout.depth) * usize::from(layout.item_len) {
@@ -311,11 +366,36 @@ impl<B: Bus> Runtime<B> {
             h2d_read: info.h2d_r_idx_ptr,
             max_flows: flows,
             max_rx: shared.max_rxbufpost,
+            mailbox: None,
+            signal: Signal::new(),
+            delivered: false,
+            down: false,
+            reclaimable: false,
+            hostrdy_db1: shared.hostrdy_db1(),
+            cores: chip.cores,
         };
+        if let Some(reg) = runtime.bus.mailbox() {
+            for address in [shared.htod_mb_data_addr, shared.dtoh_mb_data_addr] {
+                if address & 3 != 0 || !ram.contains(address, 4) {
+                    return Err(Error::Bounds);
+                }
+            }
+            runtime.mailbox = Some(mailbox::Mailbox {
+                reg,
+                htod: shared.htod_mb_data_addr,
+                dtoh: shared.dtoh_mb_data_addr,
+                d3_acked: false,
+                awaiting: false,
+                ds_ack: false,
+                services: 0,
+            });
+        }
         // Device may observe host addresses as soon as these fields change.
         // Ownership is retained across every later write/error/Drop.
         runtime.published = true;
         let result: Result<(), Error> = (|| {
+            // brcmf_pcie_request_irq: mailbox masked before any vector.
+            runtime.intr_disable()?;
             // Explicitly negotiate TCM index fallback (Linux also uses it
             // when optional host-index allocation is unavailable).
             runtime
@@ -348,6 +428,8 @@ impl<B: Bus> Runtime<B> {
                 &resources.ring_update.address().to_le_bytes(),
             )?;
             runtime.bus.enable_dma()?;
+            // brcmf_pcie_preinit: intr_enable then hostready.
+            runtime.start_interrupts()?;
             runtime.bus.host_ready(shared.hostrdy_db1())?;
             runtime.replenish()?;
             Ok(())
@@ -443,6 +525,9 @@ impl<B: Bus> Runtime<B> {
         if self.failed {
             return Err(Error::Failed);
         }
+        if self.down {
+            return Err(Error::Busy);
+        }
         if self.pending.is_some() {
             return Err(Error::Busy);
         }
@@ -520,7 +605,11 @@ impl<B: Bus> Runtime<B> {
         }
         result
     }
+    fn link_up(&self) -> bool {
+        !self.down
+    }
     fn poll_inner(&mut self) -> Result<usize, Error> {
+        self.service_mailbox()?;
         if self
             .resources
             .as_ref()
@@ -535,6 +624,15 @@ impl<B: Bus> Runtime<B> {
         {
             return Err(Error::Timeout);
         }
+        let processed = self.service_rings()?;
+        if !self.down {
+            self.replenish()?;
+            self.replenish_rx()?;
+        }
+        Ok(processed)
+    }
+    /// One bounded fair pass over the three D2H completion rings.
+    fn service_rings(&mut self) -> Result<usize, Error> {
         let mut processed = 0;
         for ring_id in 2..5 {
             let mut ring_budget = 0;
@@ -572,8 +670,6 @@ impl<B: Bus> Runtime<B> {
                 ring_budget += 1;
             }
         }
-        self.replenish()?;
-        self.replenish_rx()?;
         Ok(processed)
     }
     fn control_completion(&mut self, entry: &[u8]) -> Result<(), Error> {
@@ -789,6 +885,9 @@ impl<B: Bus> Runtime<B> {
         if self.failed {
             return Err(Error::Failed);
         }
+        if self.down {
+            return Err(Error::Busy);
+        }
         if source == [0; 6] || source[0] & 1 != 0 || destination == [0; 6] || priority > 7 {
             return Err(Error::Protocol);
         }
@@ -941,6 +1040,9 @@ impl<B: Bus> Runtime<B> {
         if self.failed {
             return Err(Error::Failed);
         }
+        if self.down {
+            return Err(Error::Busy);
+        }
         self.control_available()?;
         let data = self
             .resources
@@ -1006,8 +1108,30 @@ impl<B: Bus> Runtime<B> {
         Ok(())
     }
     pub fn send(&mut self, token: FlowToken, frame: &[u8]) -> Result<u32, Error> {
+        self.send_prioritized(token, frame, None)
+    }
+    /// Post a frame on its FIFO flow with its own 802.1D priority in the TX
+    /// descriptor flags, as Linux msgbuf uses `skb->priority` per packet.
+    /// The priority must belong to the flow's `brcmf_flowring_prio2fifo` FIFO.
+    pub fn send_with_priority(
+        &mut self,
+        token: FlowToken,
+        frame: &[u8],
+        priority: u8,
+    ) -> Result<u32, Error> {
+        self.send_prioritized(token, frame, Some(priority))
+    }
+    fn send_prioritized(
+        &mut self,
+        token: FlowToken,
+        frame: &[u8],
+        packet_priority: Option<u8>,
+    ) -> Result<u32, Error> {
         if self.failed {
             return Err(Error::Failed);
+        }
+        if self.down {
+            return Err(Error::Busy);
         }
         if !(15..=1514).contains(&frame.len()) || u16::from_be_bytes([frame[12], frame[13]]) < 0x600
         {
@@ -1034,7 +1158,12 @@ impl<B: Bus> Runtime<B> {
         if frame[..6] != flow.destination || frame[6..12] != flow.source {
             return Err(Error::Protocol);
         }
-        let priority = flow.priority;
+        let fifo = crate::cyw43439::station::wmm::fifo;
+        let priority = match packet_priority {
+            None => flow.priority,
+            Some(p) if p <= 7 && fifo(p) == fifo(flow.priority) => p,
+            Some(_) => return Err(Error::Protocol),
+        };
         let id = self.next_id()?;
         let mut memory = allocate(&mut self.bus, frame.len() - 14)?;
         memory.write(0, &frame[14..])?;

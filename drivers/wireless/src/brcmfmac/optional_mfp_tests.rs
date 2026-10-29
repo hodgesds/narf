@@ -120,6 +120,8 @@ fn network(native: &mut Native) -> Result<(), &'static str> {
         caps: [3, 7],
         mode: Some(1),
         txstreams: Some(3),
+        txbf: [None, None],
+        txbf_request: 0,
         inventory: vec![0xd826, 0xe02a],
         center: 42,
         fault: crate::cyw43439::phy_fixture::VhtFault::None,

@@ -207,6 +207,25 @@ fn warn_cmdline_truncated(received: usize, kept: usize) {
     }
 }
 
+/// Physical address of the boot devicetree: the bootloader's `x0` when
+/// non-null, else the result of scanning low RAM for the FDT magic (the
+/// same lookup [`parse_raw`] uses). Exposed so the GIC can be discovered
+/// from the devicetree before `parse_raw` runs. The blob's header is not
+/// validated here; callers go through `narf_firmware_fdt::discover`.
+///
+/// # Safety
+/// Pre-MMU boot environment: low RAM identity-mapped, as for
+/// [`parse_raw`].
+pub unsafe fn locate_dtb(raw: &RawBootInfo) -> Option<PhysAddr> {
+    if raw.payload.raw() != 0 {
+        Some(raw.payload)
+    } else {
+        // SAFETY: scanning 0x4000_0000 + 0..256 MiB only reads
+        // identity-mapped Normal memory in lo_L1[1].
+        unsafe { scan_for_dtb() }
+    }
+}
+
 /// Parse a Linux-compatible U-Boot-style FDT handoff.
 ///
 /// Tolerates a null or bogus DTB pointer: when QEMU's `-kernel` path
@@ -241,16 +260,8 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
     // few MiB of RAM for the FDT magic at 4-byte-aligned offsets.
     // QEMU loads the DTB just past the kernel image, well within
     // this window.
-    let dtb_phys = if raw.payload.raw() != 0 {
-        // SAFETY: non-null caller-provided pointer; we already
-        // confirmed magic above, so dereferencing is defined.
-        Some(raw.payload)
-    } else {
-        // SAFETY: scanning 0x4000_0000 + 0..32 MiB only reads
-        // identity-mapped Normal memory in lo_L1[1].
-        // SAFETY: Valid memory or trusted environment
-        unsafe { scan_for_dtb() }
-    };
+    // SAFETY: caller contract; magic of a non-null pointer checked above.
+    let dtb_phys = unsafe { locate_dtb(raw) };
 
     const MAX_DTB_SIZE: usize = 2 * 1024 * 1024;
     let dtb = match dtb_phys {

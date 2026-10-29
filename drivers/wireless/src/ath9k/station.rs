@@ -233,11 +233,31 @@ impl<P: Port, E: Environment> Radio<P, E> {
     pub(super) fn receive_open(&self) -> bool {
         self.peer().is_some() && self.security.as_ref().is_none_or(Security::port_open)
     }
+    pub(super) fn interrupt(&self) -> Option<Arc<super::irq::Signal>> {
+        self.packet.interrupt()
+    }
+    /// Stop (if still running) and report whether the packet owner proved
+    /// DMA quiescence and released its storage.
+    pub(super) fn retire(&mut self) -> bool {
+        let _ = self.stop();
+        self.packet.reclaimed()
+    }
+    pub(super) fn terminal(&self) -> bool {
+        matches!(self.phase(), Phase::Stopped | Phase::Failed)
+    }
     pub(super) fn receive_epoch(&self) -> u64 {
         self.epoch
     }
     pub(super) fn rx_ba_request(&self) -> Option<super::rx_ba::Request> {
         self.packet.ht_grant().map(|g| super::rx_ba::request(&g))
+    }
+    pub(super) fn qos_request(&self) -> Option<super::qos::Request> {
+        self.packet.ht_grant().map(|g| super::qos::request(&g))
+    }
+    /// Transmit TID the native owner will use for one 802.3 frame: TID0
+    /// unless the measured N85Q program is active.
+    pub(super) fn transmit_tid(&self, frame: &[u8]) -> u8 {
+        self.packet.qos().map_or(0, |p| p.tid(frame))
     }
     pub(super) fn tx_ba_request(&self) -> Option<super::tx_ba::Request> {
         self.packet.ht_grant().map(|g| super::tx_ba::request(&g))
@@ -271,6 +291,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
         }
         self.phase = Phase::Failed;
         self.packet.start()?;
+        self.packet.enable_interrupts()?;
         self.last_now = self.environment.now_ms();
         self.phase = Phase::Passive;
         Ok(())
@@ -560,7 +581,16 @@ impl<P: Port, E: Environment> Radio<P, E> {
         let result = {
             let publication = self.publication.clone();
             let _publication = publication.lock();
-            self.progress()
+            // Interrupt bottom half brackets one service pass: causes are
+            // read and IER killed first, then resumed after RX/TX work.
+            self.packet
+                .service_begin()
+                .map_err(Error::from)
+                .and_then(|_| self.progress())
+                .and_then(|frames| {
+                    self.packet.service_end()?;
+                    Ok(frames)
+                })
         };
         if result.is_err() {
             self.fail();
@@ -835,6 +865,13 @@ impl<P: Port, E: Environment> Radio<P, E> {
                             )?;
                             self.packet.set_ht(profile)?;
                             self.ht = Some(profile.mcs());
+                            // A malformed non-BE AC keeps the qualified
+                            // BE-only profile; no new queue was programmed.
+                            if let Some(grant) = self.packet.qos_grant() {
+                                if let Ok(qos) = super::qos::Profile::parse(&frame.bytes()[30..]) {
+                                    self.packet.enable_qos(&grant, qos)?;
+                                }
+                            }
                         }
                         self.last_peer = now;
                         self.phase = Phase::FourWay;
@@ -1296,9 +1333,10 @@ impl<P: Port, E: Environment> Radio<P, E> {
     }
     fn native_data(&mut self, frame: &[u8]) -> Result<Vec<u8>, Error> {
         let peer = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+        let tid = self.transmit_tid(frame);
         let native = if let Some(security) = &mut self.security {
             if self.ht.is_some() {
-                security.transmit_ethernet_qos(frame, 0)?
+                security.transmit_ethernet_qos(frame, tid)?
             } else {
                 security.transmit_ethernet(frame)?
             }
@@ -1311,24 +1349,24 @@ impl<P: Port, E: Environment> Radio<P, E> {
             bytes.extend_from_slice(&self.own);
             bytes.extend_from_slice(&frame[..6]);
             let sequence = if self.ht.is_some() {
-                self.qos_sequence[0]
+                self.qos_sequence[usize::from(tid)]
             } else {
                 self.sequence
             };
             bytes.extend_from_slice(&(sequence << 4).to_le_bytes());
             if self.ht.is_some() {
-                self.qos_sequence[0] = (sequence + 1) & 4095;
+                self.qos_sequence[usize::from(tid)] = (sequence + 1) & 4095;
             } else {
                 self.sequence = (sequence + 1) & 4095;
             }
             if self.ht.is_some() {
-                bytes.extend_from_slice(&[0, 0]);
+                bytes.extend_from_slice(&[tid, 0]);
             }
             bytes.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
             bytes.extend_from_slice(&frame[12..]);
             bytes
         };
-        if self.ht.is_some() {
+        if self.ht.is_some() && tid == 0 {
             self.tx_sequence =
                 Some(((u16::from_le_bytes([native[22], native[23]]) >> 4) + 1) & 4095);
         }
@@ -1344,6 +1382,10 @@ impl<P: Port, E: Environment> Radio<P, E> {
                 }
                 self.packet.check_transmit()?;
                 if !admitted(a, self.own) || !admitted(b, self.own) {
+                    return Err(Error::Profile);
+                }
+                // The measured sender agreement owns BE/TID0 only.
+                if self.transmit_tid(a) != 0 || self.transmit_tid(b) != 0 {
                     return Err(Error::Profile);
                 }
                 let frames = [self.native_data(a)?, self.native_data(b)?];

@@ -1062,6 +1062,19 @@ fn smoke_mhi_config_matches_ath11k() -> TestResult {
         e1.data_type == ErDataType::Data && e1.priority == 1,
         "ring 1 is data"
     );
+    // ath11k_mhi_events_{qca6390,qcn9074}: no client-managed, offload or
+    // hardware event ring, and no offload channel, in any ath11k profile.
+    check!(
+        c.event_cfg
+            .iter()
+            .chain(ATH11K_MHI_CONFIG_QCN9074.event_cfg.iter())
+            .all(|e| !e.client_managed && !e.offload_channel && !e.hardware_event)
+            && ATH11K_MHI_CONFIG_QCN9074
+                .ch_cfg
+                .iter()
+                .all(|ch| !ch.offload_channel),
+        "no client-managed / offload / hardware MHI rings"
+    );
     check!(
         ATH11K_MHI_CONFIG_QCN9074.ch_cfg[0].ee_mask == 0x14,
         "qcn9074 ee_mask"

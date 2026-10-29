@@ -82,6 +82,22 @@ impl Rtw88Device {
                 .await
         }
     }
+    /// Separately signed N2xD dynamic-mechanism (watchdog/tracking)
+    /// measurement metadata over the exact current base. No grant.
+    pub async fn tracking_request(
+        &self,
+    ) -> Result<super::ContinuationRequest, super::FirmwareError> {
+        if let Some(s) = &self.sibling {
+            s.lifecycle().tracking_request().await
+        } else {
+            self.firmware
+                .as_ref()
+                .ok_or(super::FirmwareError::Unsupported)?
+                .lifecycle()
+                .tracking_request()
+                .await
+        }
+    }
     /// Distinct exact-H recipient BA emission measurement metadata. No grant.
     pub async fn rx_ba_request(&self) -> Result<super::RxBaRequest, super::FirmwareError> {
         if let Some(s) = &self.sibling {
@@ -342,6 +358,9 @@ pub enum ProbeError {
 /// RTW88; the follow-up will switch to a `Vec` keyed by domain id.
 static CONTROLLER: IrqSafeSpinLock<Option<Arc<Rtw88Device>>> = IrqSafeSpinLock::new(None);
 static PROBING: AtomicBool = AtomicBool::new(false);
+/// A removed function whose DMA could not be proven idle: its published
+/// mappings stay pinned, so the address is never re-initialized.
+static QUARANTINE: IrqSafeSpinLock<Option<narf_bus::BusAddr>> = IrqSafeSpinLock::new(None);
 
 /// PCI driver match registration. One entry per supported device id —
 /// mirrors the `rtw88/pci.c::rtw_pci_id_table` shape.
@@ -355,6 +374,65 @@ pub fn register_pci_driver() {
             },
             probe,
         });
+        narf_bus::register_pci_remove(name_for(did), remove);
+    }
+}
+
+/// Linux v7.2 `pci.c::rtw_pci_remove`: withdraw the netdev
+/// (`rtw_unregister_hw`), then stop and prove the DMA engines idle before
+/// the retained owner is dropped. Unproven mappings stay pinned and the
+/// address is quarantined against re-initialization.
+fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
+    let owner = {
+        let mut controller = CONTROLLER.lock();
+        if controller
+            .as_ref()
+            .is_some_and(|owner| owner.bus_addr == device.addr)
+        {
+            controller.take()
+        } else {
+            None
+        }
+    };
+    let Some(owner) = owner else {
+        return;
+    };
+    *QUARANTINE.lock() = Some(device.addr);
+    narf_scheduler::spawn(async move {
+        let reclaimed = remove_owner(&owner).await;
+        if reclaimed {
+            let mut quarantine = QUARANTINE.lock();
+            if *quarantine == Some(device.addr) {
+                *quarantine = None;
+            }
+        }
+        narf_console::klog!(
+            "rtw88: removed; DMA {}\n",
+            if reclaimed {
+                "reclaimed"
+            } else {
+                "pinned, address quarantined"
+            }
+        );
+    });
+}
+async fn remove_owner(owner: &Rtw88Device) -> bool {
+    match &owner.interface {
+        Some(interface) => interface.withdraw(),
+        None => {
+            let name = *IFNAME.lock();
+            narf_wireless::registry::unregister(name);
+            narf_net::iface::unregister(name);
+        }
+    }
+    let lifecycle = owner
+        .firmware
+        .as_ref()
+        .map(|firmware| firmware.lifecycle())
+        .or_else(|| owner.sibling.as_ref().map(|sibling| sibling.lifecycle()));
+    match lifecycle {
+        Some(lifecycle) => lifecycle.remove().await,
+        None => true,
     }
 }
 
@@ -371,6 +449,10 @@ fn probe_exclusive(
 ) -> Result<(), narf_bus::ProbeError> {
     // Skip if a device is already bound. Real laptops only ship one
     // RTW88; a second probe is a re-enumeration race.
+    if *QUARANTINE.lock() == Some(device.addr) {
+        // Pinned DMA from a removed generation: never power-cycle it again.
+        return Err(narf_bus::ProbeError::BadDevice);
+    }
     let bound = CONTROLLER.lock().as_ref().map(|owner| owner.bus_addr);
     match crate::rtw88::pci_park::admission(bound, device.addr) {
         crate::rtw88::pci_park::Admission::Bound => return Ok(()),

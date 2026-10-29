@@ -118,9 +118,42 @@ pub fn watch() -> impl Stream<Item = BusEvent>;       // hot-plug arrivals / rem
 pub unsafe fn discover_pmu_ppi(dtb: PhysAddr) -> Option<u32>;
 ```
 
+`boot_dtb() -> Option<PhysAddr>` returns the firmware Devicetree blob the
+aarch64 `init` received (`None` on x86_64 or a DTB-less boot); the blob lies
+in boot-reserved RAM under the direct map and drivers read it with
+`narf_firmware_fdt::discover`. `pci::devfn_path(&BusDevice) ->
+Option<Vec<u8>>` returns each hop's `device << 3 | function` from the root
+bus down to the function (via `upstream_bridge`), the chain Linux
+`pci_set_of_node` / `of_pci_find_child_device` follows; drivers pass it to
+`narf_firmware_fdt::for_pci_function` to reach the function's `of_node`
+(ath11k `qcom,calibration-variant` / `memory-region`).
+
 `discover_pmu_ppi` accepts only an `arm,armv8-pmuv3` node with a GIC
 three-cell PPI interrupt specifier and returns its architectural INTID. It has
 no platform-default fallback because the PMU interrupt is implementation-defined.
+
+**DT platform drivers (`dt_match`).** The Devicetree counterpart of the
+PCI match table (Linux `platform_driver_register` + `of_match_table`):
+
+```rust
+pub type DtProbeFn = fn(blob: &'static [u8], path: &str) -> Result<(), ProbeError>;
+pub struct DtMatch { pub name: &'static str, pub compatible: &'static [&'static str], pub probe: DtProbeFn }
+pub fn register_dt_driver(m: DtMatch);        // replace by name
+pub fn unregister_dt_driver(name: &str);      // also drops its bindings
+pub fn registered_dt_drivers() -> Vec<DtMatch>;
+pub fn probe_dt_blob(blob: &'static [u8]) -> usize;   // nodes bound by this walk
+pub fn probe_all_dt() -> usize;                      // probe_dt_blob(boot_dtb)
+pub fn bound_dt_nodes() -> Vec<(String /* path */, &'static str /* driver */)>;
+```
+
+A walk visits every enabled node (`status` absent / `okay` / `ok`), tries
+the node's `compatible` strings in order (most specific first) against
+every registered table and calls the first hit's probe with the full node
+path. A node binds once (recorded by path); a probe error leaves it unbound
+for a later walk. Walks are idempotent, so each DT driver's
+`Stage::Device` initcall may call `probe_all_dt` (the TCB boot path is not
+involved). No `Cap<BusDeviceCap>` is minted: DT nodes are not registry
+`BusDevice`s; the probe reads its resources from the blob.
 
 Appends made after enumeration (hot-plug arrivals, bridge-enumerated
 children) are visible to `devices()` immediately. The match-table

@@ -66,7 +66,10 @@ pub(super) unsafe trait Port: power::Io {
     fn peer_allowed(&mut self, frame: &[u8]) -> Result<(), Error>;
     fn allocate(&mut self, length: usize) -> Result<DmaBuffer, Error>;
     fn receive(&mut self) -> Result<RxStep, Error>;
-    fn start(&mut self) -> Result<(), Error>;
+    /// Clear exactly the `open` DMA stop bits (BE/MGMT/WPDMA, plus BK/VI/VO
+    /// for the all-AC program) and enable CMAC TX.
+    fn start(&mut self, open: u32) -> Result<(), Error>;
+    /// Close every ordinary stop bit (`format::STOP_ALL`) and CMAC TX.
     fn stop(&mut self) -> Result<(), Error>;
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,11 +102,17 @@ impl Drop for Ring {
     }
 }
 struct Pending {
+    id: u64,
     ticket: tx_transport::Ticket,
     queue: format::Queue,
     started: u64,
     report: bool,
+    /// Published with TXWD AGG_EN (an operational originator session).
+    agg: bool,
 }
+/// Most data MPDUs the aggregate emitter keeps in flight at once
+/// (`radio_policy::Program::Ampdu`). Every other frame is alone in flight.
+pub(super) const AGG_WINDOW: usize = 32;
 #[derive(Debug)]
 pub(super) struct Receipt {
     pub(super) id: u64,
@@ -115,6 +124,12 @@ pub(super) struct Receipt {
 #[derive(Debug)]
 pub(super) struct Frame {
     bytes: Vec<u8>,
+}
+impl Frame {
+    /// A host-admitted copy (PMF management with CCMP/BIP removed).
+    pub(super) fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
 }
 impl narf_wireless::station_security::RawFrame for Frame {
     fn bytes(&self) -> &[u8] {
@@ -135,12 +150,46 @@ pub(super) struct Core {
     phase: Phase,
     own: [u8; 6],
     mac_id: u8,
-    rings: [Ring; 2],
+    rings: Vec<Ring>,
+    /// Stop bits of exactly the rings this owner published.
+    stop: u32,
+    /// Highest signed RX PHY program admitted for this owner.
+    rx: RxPhy,
+    /// Random scan source address the controller put in the address CAM.
+    scan: Option<[u8; 6]>,
     next_id: u64,
-    pending: Option<Pending>,
+    /// In-flight frames, each owning its own TxQueue slot and DMA maps.
+    pending: Vec<Pending>,
     completions: VecDeque<Receipt>,
+    /// Signed aggregate emitter granted (`Program::Ampdu`).
+    aggregate: bool,
 }
 const STOP: u32 = 1 << 8 | 1 << 16 | 1 << 19;
+/// Receive PHY admission granted by the signed operating programs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum RxPhy {
+    /// CCK1..OFDM54 only.
+    Legacy,
+    /// `Program::Ht`: plus 20MHz HT MCS0..15 and A-MPDU subframes.
+    Ht,
+    /// `Program::He`: plus 20MHz HE NSS1/NSS2 MCS0..11 on any GI/LTF.
+    He,
+}
+impl RxPhy {
+    pub(super) fn from_programs(ht: bool, he: bool) -> Self {
+        match (ht, he) {
+            (true, true) => Self::He,
+            (true, false) => Self::Ht,
+            _ => Self::Legacy,
+        }
+    }
+    /// Whether a received `RX_DATARATE` is inside this admission.
+    pub(super) fn admits(self, rate: u16) -> bool {
+        rate <= 11
+            || self >= Self::Ht && (0x80..=0x8f).contains(&rate)
+            || self >= Self::He && rx_packet::he_rate(rate)
+    }
+}
 fn barrier() {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     #[cfg(target_arch = "aarch64")]
@@ -195,11 +244,26 @@ fn allocate(port: &mut impl Port, length: usize) -> Result<DmaBuffer, Error> {
 }
 impl Core {
     pub(super) fn prepare(port: &mut impl Port, own: [u8; 6], mac_id: u8) -> Result<Self, Error> {
+        Self::prepare_with(port, own, mac_id, false, RxPhy::Legacy)
+    }
+    /// `qos_all` additionally publishes ACH1..3 (BK/VI/VO) for the separately
+    /// qualified all-AC QoS program.
+    pub(super) fn prepare_with(
+        port: &mut impl Port,
+        own: [u8; 6],
+        mac_id: u8,
+        qos_all: bool,
+        rx: RxPhy,
+    ) -> Result<Self, Error> {
         if own == [0; 6] || own[0] & 1 != 0 || mac_id != 0 {
             return Err(Error::Packet);
         }
+        let queues = format::Queue::ordinary(qos_all);
+        let stop = queues
+            .iter()
+            .fold(format::STOP_WPDMA, |mask, queue| mask | queue.stop_bit());
         port.current(|port| {
-            if port.read32(0x1010)? & STOP != STOP || port.read32(0xc000)? & (1 << 29) != 0 {
+            if port.read32(0x1010)? & stop != stop || port.read32(0xc000)? & (1 << 29) != 0 {
                 return Err(Error::State);
             }
             let mut make = |kind: format::Queue| -> Result<Ring, Error> {
@@ -216,10 +280,20 @@ impl Core {
                 phase: Phase::Prepared,
                 own,
                 mac_id,
-                rings: [make(format::Queue::Data)?, make(format::Queue::Management)?],
+                rings: {
+                    let mut rings = Vec::new();
+                    for queue in queues {
+                        rings.push(make(*queue)?);
+                    }
+                    rings
+                },
+                stop,
+                rx,
+                scan: None,
                 next_id: 1,
-                pending: None,
+                pending: Vec::new(),
                 completions: VecDeque::new(),
+                aggregate: false,
             };
             for ring in &mut owner.rings {
                 let regs = ring.kind.regs();
@@ -243,28 +317,59 @@ impl Core {
             Ok(owner)
         })
     }
+    /// Admit up to `AGG_WINDOW` aggregated data frames in flight. Only the
+    /// signed aggregate program (`Program::Ampdu`, which requires HT20)
+    /// enables this, before `start`.
+    pub(super) fn enable_aggregation(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Prepared || self.rx < RxPhy::Ht {
+            return Err(Error::State);
+        }
+        self.aggregate = true;
+        Ok(())
+    }
     pub(super) fn start(&mut self, port: &mut impl Port) -> Result<(), Error> {
         if self.phase != Phase::Prepared {
             return Err(Error::State);
         }
         self.phase = Phase::Failed;
+        let stop = self.stop;
         let result = port.current(|port| {
             port.ordinary_allowed()?;
-            port.start()?;
-            if port.read32(0x1010)? & STOP != 0 || port.read32(0xc000)? & (1 << 29) == 0 {
+            port.start(stop)?;
+            if port.read32(0x1010)? & stop != 0 || port.read32(0xc000)? & (1 << 29) == 0 {
                 return Err(Error::State);
             }
             port.ordinary_allowed()
         });
         if let Err(error) = result {
-            let _ = Self::close_dma(port);
+            let _ = Self::close_dma(port, stop);
             return Err(error);
         }
         self.phase = Phase::Running;
         Ok(())
     }
+    /// Mirror the controller's scan address CAM update (`None` restores the
+    /// own address). Only between frames: a probe in flight keeps its source.
+    pub(super) fn set_scan_address(&mut self, scan: Option<[u8; 6]>) -> Result<(), Error> {
+        if self.phase != Phase::Running
+            || !self.pending.is_empty()
+            || scan.is_some_and(|a| a[0] & 1 != 0 || a == [0; 6] || a == self.own)
+        {
+            return Err(Error::State);
+        }
+        self.scan = scan;
+        Ok(())
+    }
     pub(super) fn ready(&self) -> bool {
-        self.phase == Phase::Running && self.pending.is_none() && self.completions.is_empty()
+        self.phase == Phase::Running && self.pending.is_empty() && self.completions.is_empty()
+    }
+    /// Room for one more aggregated data frame: every frame in flight is
+    /// itself aggregated and the window (including unread receipts) is open.
+    pub(super) fn ready_aggregate(&self) -> bool {
+        self.phase == Phase::Running
+            && self.aggregate
+            && self.pending.iter().all(|pending| pending.agg)
+            && self.pending.len() + self.completions.len() < AGG_WINDOW
     }
     pub(super) fn submit(
         &mut self,
@@ -281,25 +386,62 @@ impl Core {
         radio_report: bool,
         rate: u8,
     ) -> Result<u64, Error> {
+        self.submit_agg(port, bytes, radio_report, rate, None)
+    }
+    /// `submit_rate` with TXWD A-MPDU fields. An aggregated frame may join
+    /// other aggregated frames in flight (`ready_aggregate`).
+    pub(super) fn submit_agg(
+        &mut self,
+        port: &mut impl Port,
+        bytes: &[u8],
+        radio_report: bool,
+        rate: u8,
+        agg: Option<format::Agg>,
+    ) -> Result<u64, Error> {
         if self.phase != Phase::Running {
             return Err(Error::State);
         }
-        if !self.ready() {
+        if agg.is_some() && !self.aggregate {
+            return Err(Error::Packet);
+        }
+        // HE extended-range SU TX belongs to the signed HE program only.
+        if rate & format::DATA_ER != 0 && self.rx < RxPhy::He {
+            return Err(Error::Packet);
+        }
+        if if agg.is_some() {
+            !self.ready_aggregate()
+        } else {
+            !self.ready()
+        } {
             return Err(Error::Busy);
         }
-        let kind = format::classify(bytes, self.own)?;
+        // A probe request from the current random scan address is the only
+        // frame with a source other than the own address.
+        let source = match self.scan {
+            Some(scan) if format::probe_request(bytes, scan) => scan,
+            _ => self.own,
+        };
+        let kind = format::classify(bytes, source)?;
         let id = self.next_id;
         let next_id = id.checked_add(1).ok_or(Error::State)?;
         let result = port.current(|port| {
             port.ordinary_allowed()?;
-            port.peer_allowed(bytes)?;
+            // An active-scan probe request has no peer; everything else
+            // needs the current peer token.
+            if !format::probe_request(bytes, source) {
+                port.peer_allowed(bytes)?;
+            }
             let packet = Packet {
                 header: allocate(port, format::HEADER)?,
                 body: allocate(port, bytes.len())?,
                 id,
                 length: bytes.len(),
             };
-            let ring = &mut self.rings[kind.slot()];
+            let ring = self
+                .rings
+                .iter_mut()
+                .find(|ring| ring.kind == kind)
+                .ok_or(Error::Packet)?;
             let ticket = ring
                 .queue
                 .reserve(packet, self.mac_id, kind.qsel())
@@ -310,26 +452,16 @@ impl Core {
             }
             let packet = ring.queue.reserved_mut(ticket)?;
             let preparation = (|| {
-                let (header, actual) = if rate == 0 {
-                    format::transmit(
-                        bytes,
-                        self.own,
-                        self.mac_id,
-                        ticket.sequence,
-                        packet.body.dma_addr().raw(),
-                        radio_report,
-                    )
-                } else {
-                    format::transmit_rate(
-                        bytes,
-                        self.own,
-                        self.mac_id,
-                        ticket.sequence,
-                        packet.body.dma_addr().raw(),
-                        radio_report,
-                        rate,
-                    )
-                }?;
+                let (header, actual) = format::transmit_agg(
+                    bytes,
+                    source,
+                    self.mac_id,
+                    ticket.sequence,
+                    packet.body.dma_addr().raw(),
+                    radio_report,
+                    rate,
+                    agg,
+                )?;
                 if actual != kind {
                     return Err(Error::Packet);
                 }
@@ -345,15 +477,19 @@ impl Core {
                 }
             };
             port.ordinary_allowed()?;
-            port.peer_allowed(bytes)?;
+            if !format::probe_request(bytes, source) {
+                port.peer_allowed(bytes)?;
+            }
             // Before the FIRST descriptor write, the queue holds both DMA maps
             // as published; every uncertain failure retains them permanently.
             ring.queue.publish(ticket)?;
-            self.pending = Some(Pending {
+            self.pending.push(Pending {
+                id,
                 ticket,
                 queue: kind,
                 started: port.now_us(),
                 report: false,
+                agg: agg.is_some(),
             });
             copy_to(
                 ring.descriptors.as_ref().ok_or(Error::State)?,
@@ -370,9 +506,13 @@ impl Core {
         });
         if result.is_err() {
             self.phase = Phase::Failed;
-            let _ = Self::close_dma(port);
+            let _ = Self::close_dma(port, self.stop);
         }
         result
+    }
+    /// Whether this owner published the ring for `queue`.
+    pub(super) fn has_queue(&self, queue: format::Queue) -> bool {
+        self.rings.iter().any(|ring| ring.kind == queue)
     }
     fn completed(&mut self, completion: tx_transport::Completion<Packet>) -> Result<(), Error> {
         // All non-success release statuses are terminal; ownership is no longer
@@ -381,13 +521,18 @@ impl Core {
             return Err(Error::Packet);
         }
         let packet = completion.resource;
+        let index = self
+            .pending
+            .iter()
+            .position(|pending| pending.id == packet.id)
+            .ok_or(Error::Packet)?;
         let bytes = copy_from(&packet.body, packet.length)?;
         self.completions.push_back(Receipt {
             id: packet.id,
             bytes,
             radio_acknowledged: true,
         });
-        self.pending = None;
+        self.pending.remove(index);
         Ok(())
     }
     fn receive(&mut self, port: &mut impl Port, step: &mut Step) -> Result<(), Error> {
@@ -399,13 +544,35 @@ impl Core {
         match received.event {
             None | Some(rx_packet::Event::Dropped) => {}
             Some(rx_packet::Event::Firmware(event)) => step.c2h = Some(event.bytes),
+            // A PPDU above the signed RX PHY program (HT without `Ht`, HE
+            // without `He`) is dropped exactly as the assembler dropped every
+            // non-legacy rate before, without closing the station.
+            Some(rx_packet::Event::Wifi(meta, _))
+                if !self.rx.admits(meta.rate) || meta.ampdu && self.rx < RxPhy::Ht => {}
+            // Linux forwards control frames to the host (RTW89_CTRL ->
+            // RTW89_FWD_TO_HOST). Those shorter than an ordinary header are
+            // surfaced from 16 bytes (PS-Poll/BAR); malformed ones are dropped.
+            Some(rx_packet::Event::Wifi(meta, bytes))
+                if bytes.first().is_some_and(|fc| fc & 0x0c == 0x04) =>
+            {
+                if !meta.crc_error
+                    && !meta.icv_error
+                    && !meta.hardware_decrypted
+                    && !meta.aggregate
+                    && meta.bandwidth == 0
+                    && (16..=format::MAX_MPDU).contains(&bytes.len())
+                    && meta.size == bytes.len() + 4
+                {
+                    step.frame = Some(Frame { bytes });
+                }
+            }
             Some(rx_packet::Event::Wifi(meta, bytes)) => {
                 if meta.crc_error
                     || meta.icv_error
                     || meta.hardware_decrypted
                     || meta.aggregate
                     || meta.bandwidth != 0
-                    || meta.rate > 11
+                    || !self.rx.admits(meta.rate)
                     || bytes.len() < 24
                     || bytes.len() > format::MAX_MPDU
                     || meta.size != bytes.len() + 4
@@ -419,17 +586,29 @@ impl Core {
                     return Err(Error::Packet);
                 }
                 for report in reports {
-                    let pending = self.pending.as_mut().ok_or(Error::Packet)?;
-                    if pending.report
-                        || report.sequence != pending.ticket.sequence
-                        || report.channel != pending.queue.channel()
-                        || report.qsel != pending.queue.qsel()
-                        || report.mac_id != self.mac_id
-                    {
+                    // Multi-entry RPQ retirement: each report names exactly
+                    // one unreported in-flight frame by WD sequence, queue
+                    // and MACID; anything else is a stale/forged release.
+                    if report.mac_id != self.mac_id {
                         return Err(Error::Packet);
                     }
+                    let pending = self
+                        .pending
+                        .iter_mut()
+                        .find(|pending| {
+                            !pending.report
+                                && report.sequence == pending.ticket.sequence
+                                && report.channel == pending.queue.channel()
+                                && report.qsel == pending.queue.qsel()
+                        })
+                        .ok_or(Error::Packet)?;
                     pending.report = true;
-                    let ring = &mut self.rings[pending.queue.slot()];
+                    let queue = pending.queue;
+                    let ring = self
+                        .rings
+                        .iter_mut()
+                        .find(|ring| ring.kind == queue)
+                        .ok_or(Error::Packet)?;
                     if let Some(completion) = ring.queue.observe_report(report)? {
                         self.completed(completion)?;
                     }
@@ -442,48 +621,81 @@ impl Core {
         if self.phase != Phase::Running {
             return Err(Error::State);
         }
-        let result =
-            port.current(|port| {
-                port.ordinary_allowed()?;
-                let mut step = Step::default();
-                self.receive(port, &mut step)?;
-                for slot in 0..self.rings.len() {
-                    let ring = &mut self.rings[slot];
-                    let index = port.read32(ring.kind.regs().idx as u32)?;
-                    if index & 0x0fff != u32::from(ring.queue.write_pointer()) {
-                        return Err(Error::Packet);
-                    }
-                    let completions = ring
-                        .queue
-                        .observe_read_pointer(((index >> 16) & 0x0fff) as u16)?;
-                    barrier();
-                    for completion in completions {
-                        self.completed(completion)?;
-                    }
+        let result = port.current(|port| {
+            port.ordinary_allowed()?;
+            let mut step = Step::default();
+            self.receive(port, &mut step)?;
+            for slot in 0..self.rings.len() {
+                let ring = &mut self.rings[slot];
+                let index = port.read32(ring.kind.regs().idx as u32)?;
+                if index & 0x0fff != u32::from(ring.queue.write_pointer()) {
+                    return Err(Error::Packet);
                 }
-                if self.pending.as_ref().is_some_and(|pending| {
-                    port.now_us().saturating_sub(pending.started) >= 1_000_000
-                }) {
-                    return Err(Error::Timeout);
+                let completions = ring
+                    .queue
+                    .observe_read_pointer(((index >> 16) & 0x0fff) as u16)?;
+                barrier();
+                for completion in completions {
+                    self.completed(completion)?;
                 }
-                step.receipt = self.completions.pop_front();
-                Ok(step)
-            });
+            }
+            let now = port.now_us();
+            if self
+                .pending
+                .iter()
+                .any(|pending| now.saturating_sub(pending.started) >= 1_000_000)
+            {
+                return Err(Error::Timeout);
+            }
+            step.receipt = self.completions.pop_front();
+            Ok(step)
+        });
         if result.is_err() {
             self.phase = Phase::Failed;
-            let _ = Self::close_dma(port);
+            let _ = Self::close_dma(port, self.stop);
         }
         result
+    }
+    /// Release every descriptor ring and every reserved, published or
+    /// unretired packet. Returns the storage so the caller decides when it
+    /// is freed; the owner is permanently stopped afterwards.
+    ///
+    /// # Safety
+    /// The caller holds a current `dma_stop::Idle` proof for this function:
+    /// every TX channel is stopped and idle with bus mastering off.
+    pub(super) unsafe fn reclaim_fenced(&mut self) -> Vec<DmaBuffer> {
+        self.phase = Phase::Stopped;
+        self.pending.clear();
+        self.completions.clear();
+        let mut storage = Vec::new();
+        for ring in &mut self.rings {
+            ring.armed = false;
+            storage.extend(ring.descriptors.take());
+            // SAFETY: the caller's idle proof covers this ring's channel.
+            for packet in unsafe { ring.queue.reclaim_fenced() } {
+                storage.push(packet.header);
+                storage.push(packet.body);
+            }
+        }
+        storage
+    }
+    /// True once `reclaim_fenced` released the rings.
+    pub(super) fn reclaimed(&self) -> bool {
+        self.phase == Phase::Stopped
+            && self
+                .rings
+                .iter()
+                .all(|ring| !ring.armed && ring.descriptors.is_none())
     }
     pub(super) fn stop(&mut self, port: &mut impl Port) -> Result<(), Error> {
         self.phase = Phase::Stopped;
         // Keep published descriptors AND packets regardless of stop readback.
-        Self::close_dma(port)
+        Self::close_dma(port, self.stop)
     }
-    fn close_dma(port: &mut impl Port) -> Result<(), Error> {
+    fn close_dma(port: &mut impl Port, stop: u32) -> Result<(), Error> {
         port.current(|port| {
             port.stop()?;
-            if port.read32(0x1010)? & STOP != STOP || port.read32(0xc000)? & (1 << 29) != 0 {
+            if port.read32(0x1010)? & stop != stop || port.read32(0xc000)? & (1 << 29) != 0 {
                 return Err(Error::Access);
             }
             Ok(())

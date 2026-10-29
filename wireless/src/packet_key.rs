@@ -9,6 +9,9 @@ use zeroize::{Zeroize, Zeroizing};
 pub const MAX_PN: u64 = (1u64 << 48) - 1;
 const MAX_BODY: usize = 4096;
 const NON_QOS: usize = 16;
+/// Robust management frames keep their own replay counter (IEEE802.11-2020
+/// 12.5.3.4.4; mac80211 uses `IEEE80211_NUM_TIDS` for management).
+const MGMT: usize = 17;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -19,6 +22,93 @@ pub enum Error {
     Crypto(CcmpError),
     Aggregate(crate::amsdu::Error),
 }
+/// QoS Control Ack Policy of an original aggregate (IEEE802.11-2020
+/// 9.2.4.5.4, Table 9-11): Normal Ack/implicit BAR (00), No Ack (01),
+/// No Explicit Acknowledgment/PSMP Ack/HTP Ack (10) and Block Ack (11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AckPolicy {
+    Normal,
+    NoAck,
+    NoExplicitAck,
+    BlockAck,
+}
+impl AckPolicy {
+    const fn from_qos(qos: u8) -> Self {
+        match (qos >> 5) & 3 {
+            0 => Self::Normal,
+            1 => Self::NoAck,
+            2 => Self::NoExplicitAck,
+            _ => Self::BlockAck,
+        }
+    }
+}
+
+/// Explicit receive opt-ins for `Key::unprotect_amsdu_with`. The default is
+/// the original `unprotect_amsdu` profile: unicast/group Normal Ack, no EOSP,
+/// the HT3839 limit. Each opt-in states a fact the driver's native receive
+/// path has proved, never an authority the helper grants:
+/// - `block_ack`: a live unicast BA agreement released this MPDU in SN order.
+/// - `no_ack`: No Ack policy, as Linux mac80211 ieee80211_set_qos_hdr sets for
+///   every group-addressed QoS DATA frame and for TIDs in a peer's noack map.
+///   Admitted for unicast and group receivers.
+/// - `no_explicit_ack`: PSMP/HTP Ack policy; unicast only, since the
+///   policy names an addressed recipient (9.2.4.5.4).
+/// - `eosp`: the AP's End Of Service Period bit (9.2.4.5.3). Its value is
+///   returned in `AmsduReceive::eosp` for the driver's U-APSD owner.
+/// - `limit`: the larger HT/VHT size the station actually advertised.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct AmsduAdmission {
+    block_ack: bool,
+    no_ack: bool,
+    no_explicit_ack: bool,
+    eosp: bool,
+    limit: crate::amsdu::Limit,
+}
+impl AmsduAdmission {
+    pub const fn new() -> Self {
+        Self {
+            block_ack: false,
+            no_ack: false,
+            no_explicit_ack: false,
+            eosp: false,
+            limit: crate::amsdu::Limit::Ht3839,
+        }
+    }
+    pub const fn with_block_ack(mut self, enabled: bool) -> Self {
+        self.block_ack = enabled;
+        self
+    }
+    pub const fn with_no_ack(mut self, enabled: bool) -> Self {
+        self.no_ack = enabled;
+        self
+    }
+    pub const fn with_no_explicit_ack(mut self, enabled: bool) -> Self {
+        self.no_explicit_ack = enabled;
+        self
+    }
+    pub const fn with_eosp(mut self, enabled: bool) -> Self {
+        self.eosp = enabled;
+        self
+    }
+    pub const fn with_limit(mut self, limit: crate::amsdu::Limit) -> Self {
+        self.limit = limit;
+        self
+    }
+    pub const fn limit(self) -> crate::amsdu::Limit {
+        self.limit
+    }
+}
+
+/// One authenticated aggregate's Ethernet-II frames and its original QoS
+/// facts. `eosp`/`ack_policy` are wire facts for the driver, not grants.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AmsduReceive {
+    pub frames: Vec<Vec<u8>>,
+    pub tid: u8,
+    pub ack_policy: AckPolicy,
+    pub eosp: bool,
+}
+
 /// Pairwise and group keys have different station address/packet ownership.
 /// GTK KeyID zero is legal and must never be confused with a transmit PTK.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,7 +160,8 @@ pub struct Key {
     local: [u8; 6],
     peer: [u8; 6],
     tx_pn: u64,
-    receive: [ReplayWindow; 17],
+    receive: [ReplayWindow; 18],
+    spp_amsdu: bool,
 }
 impl core::fmt::Debug for Key {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -105,8 +196,25 @@ impl Key {
             local,
             peer,
             tx_pn: 0,
-            receive: [ReplayWindow { last_seen_pn: rsc }; 17],
+            receive: [ReplayWindow { last_seen_pn: rsc }; 18],
+            spp_amsdu: false,
         })
+    }
+    /// Bind this pairwise key to a negotiated SPP A-MSDU association: both
+    /// station and AP RSNEs set RSN Capabilities bit10 (IEEE802.11-2020
+    /// 9.4.2.24.4, 12.5.3.3.3). Its CCMP AAD then authenticates the A-MSDU
+    /// Present bit. Group keys keep the ordinary AAD: a group-addressed
+    /// aggregate cannot depend on every receiver's SPP capability. Set it once at
+    /// construction; reinstall preserves it.
+    pub fn with_spp_amsdu(mut self, enabled: bool) -> Result<Self, Error> {
+        if enabled && self.role != Role::Pairwise {
+            return Err(Error::Key);
+        }
+        self.spp_amsdu = enabled;
+        Ok(self)
+    }
+    pub fn spp_amsdu(&self) -> bool {
+        self.spp_amsdu
     }
     /// Return true when material changed. An identical-key retry must not
     /// roll TX/RX state back, even if the peer repeats a smaller receive RSC.
@@ -120,7 +228,7 @@ impl Key {
         self.tk.zeroize();
         self.tk.copy_from_slice(tk);
         self.tx_pn = 0;
-        self.receive = [ReplayWindow { last_seen_pn: rsc }; 17];
+        self.receive = [ReplayWindow { last_seen_pn: rsc }; 18];
         Ok(true)
     }
     /// Protect a validated native data header/body. Increment before handing
@@ -154,6 +262,65 @@ impl Key {
             &mut ciphertext,
         )
         .map_err(Error::Crypto)
+    }
+    /// Protect one unicast robust management frame (IEEE802.11-2020 12.5.3,
+    /// 11.13) to the bound peer: a 24-octet management header with the
+    /// Protected bit and no fragmentation, the management nonce flag and
+    /// the unmasked management subtype in the AAD (mac80211 wpa.c
+    /// `ccmp_special_blocks`). It shares the pairwise TX PN space.
+    pub fn protect_management(&mut self, header: &[u8], body: &[u8]) -> Result<Vec<u8>, Error> {
+        if !management_header(header)
+            || self.role != Role::Pairwise
+            || header[4..10] != self.peer
+            || header[10..16] != self.local
+        {
+            return Err(Error::Key);
+        }
+        if body.len() > MAX_BODY {
+            return Err(Error::Length);
+        }
+        if self.tx_pn == MAX_PN {
+            return Err(Error::Exhausted);
+        }
+        self.tx_pn += 1;
+        let mut ciphertext = Zeroizing::new(body.to_vec());
+        ccmp::protect(
+            &Ccm,
+            header,
+            &self.tk,
+            self.tx_pn,
+            self.key_id,
+            0,
+            true,
+            &mut ciphertext,
+        )
+        .map_err(Error::Crypto)
+    }
+    /// Authenticate one unicast robust management frame from the peer
+    /// against the separate management replay counter.
+    pub fn unprotect_management(
+        &mut self,
+        header: &[u8],
+        wire: &mut [u8],
+    ) -> Result<Vec<u8>, Error> {
+        if !management_header(header)
+            || self.role != Role::Pairwise
+            || header[4..10] != self.local
+            || header[10..16] != self.peer
+        {
+            return Err(Error::Key);
+        }
+        if !(16..=MAX_BODY + 16).contains(&wire.len()) {
+            return Err(Error::Length);
+        }
+        if wire[2] != 0 || wire[3] & 0x3f != 0x20 || wire[3] >> 6 != self.key_id {
+            return Err(Error::Key);
+        }
+        let mut candidate = self.receive[MGMT];
+        let plaintext = ccmp::unprotect(&Ccm, header, &self.tk, 0, true, &mut candidate, wire)
+            .map_err(Error::Crypto)?;
+        self.receive[MGMT] = candidate;
+        Ok(plaintext)
     }
     /// Authenticate before committing this key/TID's replay tracker. All
     /// admission/MIC/replay failures leave the entire wire buffer unchanged.
@@ -197,7 +364,8 @@ impl Key {
     /// The caller's ciphertext is immutable even on successful admission.
     /// Existing `unprotect` keeps rejecting A-MSDU headers.
     pub fn unprotect_amsdu(&mut self, header: &[u8], wire: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
-        self.unprotect_amsdu_inner(header, wire, false)
+        self.unprotect_amsdu_with(header, wire, AmsduAdmission::new())
+            .map(|r| r.frames)
     }
     /// Additional BlockAck-policy admission for an original whole MPDU
     /// already released by the caller's live native BA/reorder owner. This
@@ -207,15 +375,21 @@ impl Key {
         header: &[u8],
         wire: &[u8],
     ) -> Result<Vec<Vec<u8>>, Error> {
-        self.unprotect_amsdu_inner(header, wire, true)
+        self.unprotect_amsdu_with(header, wire, AmsduAdmission::new().with_block_ack(true))
+            .map(|r| r.frames)
     }
-    fn unprotect_amsdu_inner(
+    /// Receive an original protected QoS A-MSDU under explicit `admission`.
+    /// Header, key, length, MIC, every subframe and the result allocation are
+    /// validated before this key/TID's single replay update commits; failures
+    /// keep the ciphertext and replay state unchanged. With SPP A-MSDU the
+    /// A-MSDU Present bit is authenticated, otherwise masked as before.
+    pub fn unprotect_amsdu_with(
         &mut self,
         header: &[u8],
         wire: &[u8],
-        block_ack: bool,
-    ) -> Result<Vec<Vec<u8>>, Error> {
-        let priority = aggregate_header_inner(header, block_ack)?;
+        admission: AmsduAdmission,
+    ) -> Result<AmsduReceive, Error> {
+        let priority = aggregate_header_with(header, admission)?;
         if header[10..16] != self.peer
             || !unicast(header[16..22].try_into().unwrap())
             || match self.role {
@@ -225,7 +399,7 @@ impl Key {
         {
             return Err(Error::Key);
         }
-        if !(16 + 22..=16 + crate::amsdu::MAX_BYTES).contains(&wire.len()) {
+        if !(16 + 22..=16 + admission.limit.bytes()).contains(&wire.len()) {
             return Err(Error::Length);
         }
         if wire[2] != 0 || wire[3] & 0x3f != 0x20 || wire[3] >> 6 != self.key_id {
@@ -237,7 +411,16 @@ impl Key {
             .map_err(|_| Error::Aggregate(crate::amsdu::Error::Allocation))?;
         scratch.extend_from_slice(wire);
         let mut candidate = self.receive[usize::from(priority)];
-        let plaintext = Zeroizing::new(
+        let opened = if self.spp_amsdu {
+            ccmp::unprotect_spp_amsdu(
+                &Ccm,
+                header,
+                &self.tk,
+                priority,
+                &mut candidate,
+                &mut scratch,
+            )
+        } else {
             ccmp::unprotect(
                 &Ccm,
                 header,
@@ -247,39 +430,125 @@ impl Key {
                 &mut candidate,
                 &mut scratch,
             )
-            .map_err(Error::Crypto)?,
-        );
-        let frames =
-            crate::amsdu::decode(&plaintext, self.local, header[4..10].try_into().unwrap())
-                .map_err(Error::Aggregate)?;
+        };
+        let plaintext = Zeroizing::new(opened.map_err(Error::Crypto)?);
+        let frames = crate::amsdu::decode_with_limit(
+            &plaintext,
+            self.local,
+            header[4..10].try_into().unwrap(),
+            admission.limit,
+        )
+        .map_err(Error::Aggregate)?;
         self.receive[usize::from(priority)] = candidate;
-        Ok(frames)
+        Ok(AmsduReceive {
+            frames,
+            tid: priority,
+            ack_policy: AckPolicy::from_qos(header[24]),
+            eosp: header[24] & 0x10 != 0,
+        })
+    }
+    /// Protect one station-originated A-MSDU body, normally from
+    /// `amsdu::encode`. The header is the original26-byte ToDS protected QoS
+    /// DATA header with A-MSDU Present, Normal Ack, no EOSP/fragments/Order
+    /// and Address3 equal to the BSSID (IEEE802.11-2020 Table 9-30, as Linux
+    /// ieee80211_amsdu_prepare_head rewrites it). Like `protect`, a PN is
+    /// consumed before the transport sees the bytes. `limit` is the peer's
+    /// advertised receive size; the caller owns PHY/BA/queue admission.
+    pub fn protect_amsdu(
+        &mut self,
+        header: &[u8],
+        body: &[u8],
+        limit: crate::amsdu::Limit,
+    ) -> Result<Vec<u8>, Error> {
+        if header.len() != 26
+            || header[0] != 0x88
+            || header[1] & 0xc7 != 0x41
+            || header[22] & 15 != 0
+            || header[24] & 0xf0 != 0x80
+            || header[25] != 0
+        {
+            return Err(Error::Header);
+        }
+        if self.role != Role::Pairwise
+            || header[4..10] != self.peer
+            || header[10..16] != self.local
+            || header[16..22] != self.peer
+        {
+            return Err(Error::Key);
+        }
+        if !(22..=limit.bytes()).contains(&body.len()) {
+            return Err(Error::Length);
+        }
+        if self.tx_pn == MAX_PN {
+            return Err(Error::Exhausted);
+        }
+        let mut ciphertext = Zeroizing::new(Vec::new());
+        ciphertext
+            .try_reserve_exact(body.len())
+            .map_err(|_| Error::Aggregate(crate::amsdu::Error::Allocation))?;
+        ciphertext.extend_from_slice(body);
+        self.tx_pn += 1;
+        let priority = header[24] & 15;
+        if self.spp_amsdu {
+            ccmp::protect_spp_amsdu(
+                &Ccm,
+                header,
+                &self.tk,
+                self.tx_pn,
+                self.key_id,
+                priority,
+                &mut ciphertext,
+            )
+        } else {
+            ccmp::protect(
+                &Ccm,
+                header,
+                &self.tk,
+                self.tx_pn,
+                self.key_id,
+                priority,
+                false,
+                &mut ciphertext,
+            )
+        }
+        .map_err(Error::Crypto)
     }
 }
-pub(crate) fn aggregate_header(header: &[u8]) -> Result<u8, Error> {
-    aggregate_header_inner(header, false)
-}
-pub(crate) fn aggregate_header_block_ack(header: &[u8]) -> Result<u8, Error> {
-    aggregate_header_inner(header, true)
-}
-fn aggregate_header_inner(header: &[u8], block_ack: bool) -> Result<u8, Error> {
-    // FromDS, protected QoS DATA, no fragments/Address4/HT control/EOSP or
-    // unimplemented ACK policy. The explicit BA entry also permits unicast
-    // BlockAck; this is always the original26-byte station header.
+pub(crate) fn aggregate_header_with(header: &[u8], admission: AmsduAdmission) -> Result<u8, Error> {
+    // FromDS, protected QoS DATA, no fragments/Address4/HT control. Ack policy
+    // and EOSP follow the explicit admission; the original26-byte station
+    // header is never rewritten.
     if header.len() != 26
         || header[0] != 0x88
         || header[1] & 0xc7 != 0x42
         || header[22] & 15 != 0
-        || !(header[24] & 0xf0 == 0x80
-            || block_ack && header[24] & 0xf0 == 0xe0 && header[4] & 1 == 0)
+        || header[24] & 0x80 == 0
         || header[25] != 0
     {
+        return Err(Error::Header);
+    }
+    let group = header[4] & 1 != 0;
+    let policy = match AckPolicy::from_qos(header[24]) {
+        AckPolicy::Normal => true,
+        AckPolicy::NoAck => admission.no_ack,
+        AckPolicy::NoExplicitAck => admission.no_explicit_ack && !group,
+        AckPolicy::BlockAck => admission.block_ack && !group,
+    };
+    if !policy || header[24] & 0x10 != 0 && !admission.eosp {
         return Err(Error::Header);
     }
     Ok(header[24] & 15)
 }
 fn unicast(mac: [u8; 6]) -> bool {
     mac != [0; 6] && mac[0] & 1 == 0
+}
+/// A protected, unfragmented 24-octet management header (no DS bits).
+fn management_header(header: &[u8]) -> bool {
+    header.len() == 24
+        && header[0] & 0x0c == 0
+        && header[1] & 0x40 != 0
+        && header[1] & 0x07 == 0
+        && header[22] & 15 == 0
 }
 struct Shape {
     index: usize,

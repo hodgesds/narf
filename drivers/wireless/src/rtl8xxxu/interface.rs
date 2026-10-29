@@ -286,6 +286,25 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
             })
             .map_err(|_| self.close())?
     }
+    /// Worker-only async maintenance. The owner is taken without waiting so
+    /// a synchronous network drain is never blocked behind this task; the
+    /// guard is held across the EP0 writes so no publication interleaves.
+    pub(super) async fn maintain(&self) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(mut state) = self.state.try_lock() else {
+            return;
+        };
+        if !state.service.maintenance_pending() {
+            return;
+        }
+        if state.service.maintain().await.is_err() {
+            state.clear_transmit();
+            drop(state);
+            self.close();
+        }
+    }
     pub(super) fn drain(&self) -> bool {
         self.dispatch_with(|frame| narf_net::iface::on_rx_frame_from(&self.name, frame))
     }
@@ -483,6 +502,7 @@ pub async fn attach(
     narf_scheduler::spawn(async move {
         loop {
             worker.drain();
+            worker.maintain().await;
             narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
         }
     });
@@ -644,7 +664,19 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
         // this caller waited. Serialize the final close with those publishers.
         self.link(None);
         state.clear_transmit();
-        state.service.disconnect().await.map_err(wireless_error)
+        let result = state.service.disconnect().await.map_err(wireless_error);
+        // Safe rejoin: a completed disconnect leaves a Passive service with a
+        // fresh receive owner. Reopen admission under the same state guard;
+        // any stale publisher re-reads the (absent) peer and the next station
+        // gets a new RX Narf-Ring generation. A failed teardown stays closed.
+        if result.is_ok()
+            && state.service.phase() == service_runtime::Phase::Passive
+            && !self.failed.load(Ordering::Acquire)
+        {
+            state.epoch = 0;
+            self.closed.store(false, Ordering::Release);
+        }
+        result
     }
     async fn set_config(&self, cfg: WirelessConfig) -> Result<(), WirelessError> {
         if cfg.channel == 1 && cfg.tx_power_dbm.is_none() {

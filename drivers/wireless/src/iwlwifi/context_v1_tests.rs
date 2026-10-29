@@ -95,6 +95,28 @@ fn smoke_iwl_gen2_profile_exact_mac_rf_and_pci_latency() -> TestResult {
             return TestResult::Fail("MVM firmware stepping/RF selector");
         }
     }
+    // Linux pcie/drv.c Qu PCI IDs and their cfg/22000.c latency classes.
+    for (did, latency) in [
+        (0x02f0, (500, 200)),
+        (0x06f0, (500, 200)),
+        (0x34f0, (1820, 1820)),
+        (0x3df0, (1820, 1820)),
+        (0x4df0, (1820, 1820)),
+        (0x43f0, (12000, 2500)),
+        (0xa0f0, (12000, 2500)),
+    ] {
+        let Ok(profile) = p::select(did, 0x351, 0x10c000) else {
+            return TestResult::Fail("Linux Qu PCI ID not admitted");
+        };
+        if profile.prefix != "iwlwifi-QuZ-a0-hr-b0"
+            || !profile.integrated
+            || (profile.xtal_latency_us, profile.ltr_delay_us) != latency
+            || super::super::chip_config_for_pci_id(0x8086, did)
+                .is_none_or(|c| c.generation != super::super::Generation::Gen2)
+        {
+            return TestResult::Fail("Qu PCI latency class/match table");
+        }
+    }
     for (did, hw, rf) in [
         (0x2723, 0x351, 0x10c000),
         (0x02f0, 0x330, 0x10c000),

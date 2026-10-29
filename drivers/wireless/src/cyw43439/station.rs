@@ -4,7 +4,7 @@
 
 use super::{
     channel, events,
-    fullmac::Fullmac,
+    fullmac::{FirmwareVendor, Fullmac},
     ioctl::{self, Direction},
     runtime::Error,
 };
@@ -31,12 +31,31 @@ pub struct Station<R: Fullmac> {
     scan_id: u16,
     pub supplicant: bool,
     mfp_supported: bool,
+    /// Firmware SAE offload: `cap` token `sae` with FWSUP and MFP.
+    sae_offload: bool,
+    /// Firmware roaming engine enabled (`roam_off` 0).
+    firmware_roaming: bool,
+    /// Firmware roam awaiting confirmation; the host port is closed.
+    roam: Option<roam::Pending>,
+    /// Host-supplicant connection: `Some(port authorized)`.
+    external: Option<bool>,
+    /// Security profile of the authorized association (re-verified on roam).
+    protection: Option<mfp::Profile>,
+    /// `BRCMF_FEAT_PMKID_V3` (`wlc_ver` major >= 13).
+    pmkid_v3: bool,
+    /// Firmware PMKID list known to be programmed; `None` after a refused
+    /// or interrupted `pmkid_info` update until it is rewritten.
+    pmksa: Option<pmksa::Cache>,
     mfp_verified: bool,
     phy: Option<phy::Capabilities>,
     ht_verified: bool,
     vht_verified: bool,
     power_save: bool,
     operation: bool,
+    /// Probe Request vendor elements currently installed in firmware.
+    probe_ies: Vec<u8>,
+    /// Negotiated firmware WMM rank map for the authorized peer.
+    ac_priority: [u8; 8],
 }
 impl<R: Fullmac> core::fmt::Debug for Station<R> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -109,11 +128,7 @@ impl<R: Fullmac> Station<R> {
         if mac == [0; 6] || mac[0] & 1 != 0 {
             return Err(Error::Malformed);
         }
-        let mut mask = [0; 16];
-        for event in [0, 3, 5, 6, 7, 11, 12, 16, 46, 63, 69] {
-            mask[event / 8] |= 1 << (event % 8);
-        }
-        set_var(&mut runtime, "event_msgs", &mask).await?;
+        set_var(&mut runtime, "event_msgs", &roam::event_mask(false)).await?;
         let supplicant = match get_var(&mut runtime, "sup_wpa", 4).await {
             Ok(bytes) => bytes.len() == 4,
             Err(Error::Firmware(code)) if code as i32 == -23 => false,
@@ -124,6 +139,24 @@ impl<R: Fullmac> Station<R> {
         let mfp_supported = match get_var(&mut runtime, "mfp", 4).await {
             Ok(bytes) if bytes.len() == 4 && le32(&bytes, 0)? <= 2 => true,
             Ok(_) => return Err(Error::Malformed),
+            Err(Error::Firmware(_)) => false,
+            Err(error) => return Err(error),
+        };
+        // Linux feature.c brcmf_feat_firmware_capabilities: BRCMF_FEAT_SAE
+        // is the exact `cap` token "sae " (distinct from "sae_ext"). Linux
+        // cfg80211.c only offloads SAE with BRCMF_FEAT_FWSUP; WPA3 also needs
+        // native MFP, so all three firmware features are required.
+        let sae_offload = supplicant
+            && mfp_supported
+            && match get_var(&mut runtime, "cap", sae::CAP_LEN).await {
+                Ok(caps) => sae::has_capability(&caps, b"sae"),
+                Err(Error::Firmware(_)) => false,
+                Err(error) => return Err(error),
+            };
+        let pmkid_v3 = match get_var(&mut runtime, "wlc_ver", pmksa::WLC_VERSION_LEN).await {
+            // A reply shorter than brcmf_wlc_version_le carries no WLC
+            // major version: keep the v1 list.
+            Ok(reply) => pmksa::v3_from_wlc_version(&reply).unwrap_or(false),
             Err(Error::Firmware(_)) => false,
             Err(error) => return Err(error),
         };
@@ -166,16 +199,75 @@ impl<R: Fullmac> Station<R> {
             scan_id: 0,
             supplicant,
             mfp_supported,
+            sae_offload,
+            firmware_roaming: false,
+            roam: None,
+            external: None,
+            protection: None,
+            pmkid_v3,
+            pmksa: Some(pmksa::Cache::default()),
             mfp_verified: false,
             phy,
             ht_verified: false,
             vht_verified: false,
             power_save: false,
             operation: false,
+            probe_ies: Vec::new(),
+            ac_priority: wmm::DEFAULT_AC_PRIORITY,
         })
     }
 
+    /// Current negotiated firmware WMM rank map (`wme_ac_sta`) for the
+    /// authorized peer; absent without a connection.
+    pub fn ac_priority(&self) -> Option<[u8; 8]> {
+        self.bssid.map(|_| self.ac_priority)
+    }
+
+    fn reset_wmm(&mut self) {
+        self.ac_priority = wmm::DEFAULT_AC_PRIORITY;
+        self.runtime.set_ac_priority(self.ac_priority);
+    }
+
     /// Last firmware-acknowledged ordinary station power-save policy.
+    /// Firmware WPA3-Personal SAE offload (`NL80211_EXT_FEATURE_SAE_OFFLOAD`).
+    pub fn supports_sae_offload(&self) -> bool {
+        self.sae_offload
+    }
+
+    /// Firmware PMKID cache revision (`BRCMF_FEAT_PMKID_V3`).
+    pub fn pmkid_v3(&self) -> bool {
+        self.pmkid_v3
+    }
+    /// Firmware PMKID list last programmed, if known.
+    pub fn programmed_pmksa(&self) -> Option<&pmksa::Cache> {
+        self.pmksa.as_ref()
+    }
+
+    /// Reconcile the firmware `pmkid_info` list with `desired`
+    /// (Linux `brcmf_update_pmklist` / `brcmf_pmksa_v3_op`). A firmware
+    /// refusal leaves the list unknown, so the next call rewrites it.
+    pub async fn sync_pmksa(&mut self, desired: &pmksa::Cache) -> Result<(), Error> {
+        if self.pmksa.as_ref() == Some(desired) {
+            return Ok(());
+        }
+        self.poll()?;
+        self.operation = true;
+        self.pmksa = None;
+        let result = pmksa::program(&mut self.runtime, self.pmkid_v3, desired).await;
+        self.operation = false;
+        match result {
+            Ok(()) => self.pmksa = Some(desired.clone()),
+            Err(Error::Firmware(_)) => {}
+            Err(_) => {
+                self.bssid = None;
+                self.connection = None;
+                self.runtime.fail();
+                self.runtime.set_link(None);
+            }
+        }
+        result
+    }
+
     pub fn power_save(&self) -> bool {
         self.power_save
     }
@@ -280,10 +372,10 @@ impl<R: Fullmac> Station<R> {
             || request.colocated_6ghz
             || request.duration_tu.is_some()
             || request.duration_mandatory
-            || !request.extra_ies.is_empty()
         {
             return Err(Error::Unsupported);
         }
+        let probe_ies = probe_ies::parse(&request.extra_ies)?;
         let mut channels = Vec::new();
         for channel in if !request.frequencies_mhz.is_empty() {
             let mut selected = Vec::new();
@@ -340,6 +432,21 @@ impl<R: Fullmac> Station<R> {
         }
         self.check_receive_policy(&channels)?;
         self.check_grants(&grants)?;
+        if let Some(update) = probe_ies::update(&self.probe_ies, &probe_ies) {
+            // Firmware applies the del/add records in order; a refused or
+            // cancelled update leaves the installed set unknown, so no later
+            // Probe Request may be claimed to carry exactly a caller's IEs.
+            if let Err(error) = self
+                .checked_var(&grants, &channels, "vndr_ie", &update)
+                .await
+            {
+                self.runtime.fail();
+                return Err(error);
+            }
+            self.probe_ies = probe_ies;
+            self.check_receive_policy(&channels)?;
+            self.check_grants(&grants)?;
+        }
         self.cache.clear();
         self.checked_var(&grants, &channels, "escan", &command)
             .await?;
@@ -438,7 +545,7 @@ impl<R: Fullmac> Station<R> {
     }
 
     async fn associate_inner(&mut self, request: AssociateRequest) -> Result<(), Error> {
-        if self.bssid.is_some() {
+        if self.bssid.is_some() || self.roam.is_some() {
             return Err(Error::Busy);
         }
         if request.ssid.is_empty()
@@ -460,29 +567,57 @@ impl<R: Fullmac> Station<R> {
             .ok_or(Error::Malformed)?
             .clone();
         self.refresh_policy()?;
-        let secure = match &request.security {
+        let akm = match &request.security {
             SecurityConfig::Open
                 if matches!(bss.info.security, narf_wireless::scan::BssSecurity::Open) =>
             {
-                false
+                None
             }
-            SecurityConfig::Wpa2 { .. } if self.supplicant => {
-                let rsn = rsn(&bss.ies).ok_or(Error::Unsupported)?;
-                use narf_wireless::rsn::*;
-                let ccmp = Suite::standard(CIPHER_CCMP_128);
-                if rsn.group_cipher != ccmp
-                    || !rsn.pairwise_ciphers.contains(&ccmp)
-                    || !rsn.akms.contains(&Suite::standard(AKM_PSK))
-                {
-                    return Err(Error::Unsupported);
+            SecurityConfig::Wpa2 { .. } if self.supplicant => Some(narf_wireless::rsn::AKM_PSK),
+            SecurityConfig::Wpa3 { password } if self.sae_offload => {
+                if password.is_empty() || password.len() > sae::PASSWORD_MAX {
+                    return Err(Error::Malformed);
                 }
-                true
+                Some(narf_wireless::rsn::AKM_SAE)
+            }
+            // Host-supplicant fallback: the caller's RSNE selects the AKM.
+            SecurityConfig::External(_) if !self.firmware_roaming => {
+                Some(external::akm(&request.ie)?)
             }
             _ => return Err(Error::Unsupported),
         };
+        let host_supplicant = matches!(request.security, SecurityConfig::External(_));
+        // Fast BSS Transition is selected by the caller's RSNE AKM, as
+        // Linux brcmf_set_key_mgmt maps WLAN_AKM_SUITE_FT_PSK/FT_OVER_SAE.
+        let akm = if host_supplicant {
+            akm
+        } else {
+            akm.map(|base| ft::select(base, &request.ie)).transpose()?
+        };
+        if let Some(akm) = akm {
+            if ft::is_ft(akm) && !ft::has_mobility_domain(&bss.ies) {
+                return Err(Error::Unsupported);
+            }
+            let rsn = rsn(&bss.ies).ok_or(Error::Unsupported)?;
+            use narf_wireless::rsn::*;
+            let ccmp = Suite::standard(CIPHER_CCMP_128);
+            if rsn.group_cipher != ccmp
+                || !rsn.pairwise_ciphers.contains(&ccmp)
+                || !rsn.akms.contains(&Suite::standard(akm))
+            {
+                return Err(Error::Unsupported);
+            }
+        }
+        let secure = akm.is_some();
+        let sae = akm.is_some_and(ft::is_sae);
         let protection =
-            mfp::Profile::negotiate(&bss.ies, &request.ie, secure, self.mfp_supported)?;
-        validate_association_ies(&request.ie, secure, protection.required())?;
+            mfp::Profile::negotiate_akm(&bss.ies, &request.ie, akm, self.mfp_supported)?;
+        validate_association_ies(
+            &request.ie,
+            protection.akm(),
+            protection.required(),
+            host_supplicant,
+        )?;
         let mut ht = self
             .phy
             .as_ref()
@@ -516,12 +651,16 @@ impl<R: Fullmac> Station<R> {
             if self.phy.is_some() || R::BAND_5GHZ {
                 self.configure_width(grant, occupied).await?;
             }
-            self.tx_int(grant, 22, 0).await?;
+            // brcmf_set_auth_type: NL80211_AUTHTYPE_SAE is 3, Open 0.
+            self.tx_int(grant, 22, if sae { 3 } else { 0 }).await?;
             // Linux configures (and clears for Open) the association RSNE
             // before joining. Pin the firmware offload to this driver's
             // single negotiated PSK/CCMP profile even on a mixed-mode AP.
             let mut wpa_ie = Vec::new();
-            if secure {
+            if host_supplicant {
+                // The supplicant's own RSNE (PMKIDs included), as Linux.
+                wpa_ie.extend_from_slice(external::rsne(&request.ie).ok_or(Error::Unsupported)?);
+            } else if secure {
                 let body = protection.rsn().encode_body();
                 wpa_ie.extend_from_slice(&[48, body.len() as u8]);
                 wpa_ie.extend_from_slice(&body);
@@ -530,7 +669,15 @@ impl<R: Fullmac> Station<R> {
             self.tx_var(
                 grant,
                 "wpa_auth",
-                &if secure { 128u32 } else { 0 }.to_le_bytes(),
+                // WPA2_AUTH_PSK / WPA3_AUTH_SAE_PSK (| WPA2_AUTH_FT).
+                &akm.map_or(0, |akm| {
+                    if host_supplicant {
+                        external::wpa_auth(akm).unwrap_or(0)
+                    } else {
+                        ft::wpa_auth(akm)
+                    }
+                })
+                .to_le_bytes(),
             )
             .await?;
             self.tx_int(grant, 134, if secure { 4 } else { 0 }).await?;
@@ -545,8 +692,28 @@ impl<R: Fullmac> Station<R> {
                 }
             }
             if self.supplicant {
-                self.tx_var(grant, "sup_wpa", &u32::from(secure).to_le_bytes())
-                    .await?;
+                self.tx_var(
+                    grant,
+                    "sup_wpa",
+                    &u32::from(secure && !host_supplicant).to_le_bytes(),
+                )
+                .await?;
+            }
+            if let SecurityConfig::Wpa3 { password } = &request.security {
+                // Linux: "clean up user-space RSNE" so firmware builds the
+                // SAE RSNE itself, then the fwvid password ABI.
+                self.tx_var(grant, "wpaie", &[]).await?;
+                match self.runtime.firmware_vendor() {
+                    FirmwareVendor::Cyw => {
+                        let body = sae::cyw_password(password)?;
+                        self.tx_var(grant, "sae_password", &body[..]).await?;
+                    }
+                    FirmwareVendor::Wcc => {
+                        let body = sae::wcc_passphrase(password)?;
+                        self.tx_command(grant, ioctl::WLC_SET_WSEC_PMK, &body[..])
+                            .await?;
+                    }
+                }
             }
             if let SecurityConfig::Wpa2 { psk } = &request.security {
                 // CYW legacy wsec_pmk: length/flags + 64-byte key buffer.
@@ -563,8 +730,10 @@ impl<R: Fullmac> Station<R> {
             join[48..50].copy_from_slice(&occupied.chanspec().to_le_bytes());
             self.tx_command(grant, 26, &join).await?;
             let deadline = narf_time::Deadline::after_ms(15000);
-            let (mut associated, mut keys) = (false, !secure);
+            // A host supplicant runs the 4-way after link-up: SET_SSID alone.
+            let (mut associated, mut keys) = (false, !secure || host_supplicant);
             let mut protection_verified = false;
+            let mut wmm_verified = false;
             let mut drain_batches = 0;
             loop {
                 self.check_grants(core::slice::from_ref(&grant))?;
@@ -619,7 +788,7 @@ impl<R: Fullmac> Station<R> {
                         // Re-observe a current FIFO/ring idle sample first.
                         continue;
                     }
-                    if protection.verify() && !protection_verified {
+                    if protection.verify() && !protection_verified && !host_supplicant {
                         self.mfp_verified = self
                             .verify_management_protection(grant, request.bssid, protection)
                             .await?;
@@ -628,8 +797,24 @@ impl<R: Fullmac> Station<R> {
                         // genuine idle fence before publishing the host port.
                         continue;
                     }
+                    if !wmm_verified {
+                        // Linux brcmf_get_assoc_ies ranks the current firmware
+                        // EDCA rows; a refused query keeps the default map.
+                        self.ac_priority =
+                            match self.tx_query(grant, "wme_ac_sta", wmm::ACPARAM_LEN).await {
+                                Ok(rows) => wmm::prioritize(&rows)?,
+                                Err(Error::Firmware(_)) => wmm::DEFAULT_AC_PRIORITY,
+                                Err(error) => return Err(error),
+                            };
+                        wmm_verified = true;
+                        // Another genuine idle fence follows this query.
+                        continue;
+                    }
                     self.check_grants(core::slice::from_ref(&grant))?;
+                    self.protection = Some(protection);
+                    self.external = host_supplicant.then_some(false);
                     self.connection = Some(grant);
+                    self.runtime.set_ac_priority(self.ac_priority);
                     self.runtime.set_link(Some(request.bssid));
                     self.bssid = Some(request.bssid);
                     return Ok(());
@@ -652,6 +837,8 @@ impl<R: Fullmac> Station<R> {
             self.mfp_verified = false;
             self.ht_verified = false;
             self.vht_verified = false;
+            self.external = None;
+            self.reset_wmm();
             self.bssid = None;
             self.connection = None;
             self.runtime.set_link(None);
@@ -681,10 +868,17 @@ impl<R: Fullmac> Station<R> {
     async fn disconnect_inner(&mut self) -> Result<(), Error> {
         self.check_connection_policy()?;
         let grant = self.connection.take();
-        let peer = self.bssid.take();
+        // A firmware roam in progress is associated with its new peer.
+        let peer = self
+            .bssid
+            .take()
+            .or_else(|| self.roam.take().map(|r| r.peer));
+        self.protection = None;
+        self.external = None;
         self.mfp_verified = false;
         self.ht_verified = false;
         self.vht_verified = false;
+        self.reset_wmm();
         self.runtime.set_link(None);
         if let Some(grant) = grant {
             self.tx_command(grant, 52, &[]).await?;
@@ -724,6 +918,7 @@ impl<R: Fullmac> Station<R> {
         if self.operation {
             self.runtime.fail();
             self.bssid = None;
+            self.roam = None;
             self.connection = None;
             self.runtime.set_link(None);
             return Err(Error::Failed);
@@ -731,12 +926,16 @@ impl<R: Fullmac> Station<R> {
         self.check_connection_policy()?;
         if let Err(error) = self.runtime.poll() {
             self.bssid = None;
+            self.roam = None;
             self.connection = None;
             self.runtime.set_link(None);
             return Err(error);
         }
         self.check_connection_policy()?;
         while let Some(event) = self.runtime.pop_event() {
+            if self.roam_event(&event) {
+                continue;
+            }
             if let Some(peer) = self.bssid {
                 // CHANNEL_ADOPTED is a firmware radio transition, not a new
                 // occupied grant. Source MAC can be absent for radio events.
@@ -770,10 +969,29 @@ impl<R: Fullmac> Station<R> {
 mod policy;
 pub use policy::{GlobalPolicy, PolicySource};
 
+#[path = "station_external.rs"]
+pub mod external;
+#[path = "station_ft.rs"]
+pub mod ft;
 #[path = "station_mfp.rs"]
 mod mfp;
 #[path = "station_phy.rs"]
 mod phy;
+#[path = "station_pmksa.rs"]
+pub mod pmksa;
+#[path = "station_roam.rs"]
+pub mod roam;
+
+/// Firmware events consumed by the station (`brcmf_fweh` registrations):
+/// SET_SSID, AUTH, DEAUTH(_IND), DISASSOC(_IND), LINK, PSK_SUP,
+/// CHANNEL_ADOPTED (`63`) and ESCAN_RESULT.
+const EVENTS: [usize; 11] = [0, 3, 5, 6, 7, 11, 12, 16, 46, 63, 69];
+#[path = "station_probe_ies.rs"]
+mod probe_ies;
+#[path = "station_sae.rs"]
+pub mod sae;
+#[path = "station_wmm.rs"]
+pub mod wmm;
 
 const MAX_REPLY: usize = 1502;
 
@@ -781,7 +999,13 @@ const MAX_REPLY: usize = 1502;
 /// nl80211 PSK-offload contract: validate the requested RSNE, consume a
 /// bounded well-formed IE list, and leave firmware-generated capabilities
 /// and RSNXE to the firmware. External-key profiles remain unsupported.
-fn validate_association_ies(mut ies: &[u8], secure: bool, mfp: bool) -> Result<(), Error> {
+fn validate_association_ies(
+    mut ies: &[u8],
+    akm: u8,
+    mfp: bool,
+    host_supplicant: bool,
+) -> Result<(), Error> {
+    let secure = akm != 0;
     use narf_wireless::rsn::*;
     if ies.len() > 2048 {
         return Err(Error::Malformed);
@@ -799,9 +1023,9 @@ fn validate_association_ies(mut ies: &[u8], secure: bool, mfp: bool) -> Result<(
             let ccmp = Suite::standard(CIPHER_CCMP_128);
             if rsn.group_cipher != ccmp
                 || rsn.pairwise_ciphers != [ccmp]
-                || rsn.akms != [Suite::standard(AKM_PSK)]
+                || rsn.akms != [Suite::standard(akm)]
                 || rsn.rsn_capabilities & RSN_CAP_MFP_REQUIRED != 0 && !mfp
-                || !rsn.pmkids.is_empty()
+                || !rsn.pmkids.is_empty() && !host_supplicant
                 || rsn
                     .group_management_cipher
                     .is_some_and(|cipher| cipher != Suite::standard(CIPHER_BIP_CMAC_128))

@@ -3,11 +3,22 @@
 //! Extracted from MT76 association; no firmware command/rate index, PMK,
 //! regulatory authority, key installation or controlled-port state is stored.
 use crate::rsn::{self, RsnIe, Suite};
-use alloc::{vec, vec::Vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 #[path = "association/channel.rs"]
 pub mod channel;
+#[path = "association/eht.rs"]
+pub mod eht;
+#[path = "association/he.rs"]
+pub mod he;
 #[path = "association/phy.rs"]
 pub mod phy;
+#[path = "association/sae_join.rs"]
+mod sae_join;
+#[path = "association/six_ghz.rs"]
+pub mod six_ghz;
+#[path = "association/uhr.rs"]
+pub mod uhr;
+pub use sae_join::{SaeJoin, SaePwe, SaeStep};
 
 /// One validated beacon/probe response, retaining original IEs for the SME.
 #[derive(Clone, Debug)]
@@ -15,10 +26,26 @@ pub struct Bss {
     pub bssid: [u8; 6],
     pub ssid: Vec<u8>,
     pub channel: u8,
+    /// The band `channel` is numbered in. `None` is the 2.4/5 GHz legacy
+    /// numbering (`channel::band(channel)`); 6 GHz channel numbers collide
+    /// with 2.4/5 GHz ones and must say `Some(Band::Ghz6)`.
+    pub band: Option<channel::Band>,
     pub signal_dbm: Option<i8>,
     pub capability: u16,
     pub beacon_interval: u16,
     pub information_elements: Vec<u8>,
+}
+impl Bss {
+    /// The band of `channel`: the explicit `band`, else the 2.4/5 GHz
+    /// legacy numbering. `None` for an unknown channel.
+    pub fn band(&self) -> Option<channel::Band> {
+        self.band.or_else(|| channel::band(self.channel))
+    }
+    /// Centre frequency of the primary channel in MHz (cfg80211
+    /// `ieee80211_channel_to_freq_khz`).
+    pub fn frequency_mhz(&self) -> Option<u32> {
+        channel::frequency_in(self.band()?, self.channel)
+    }
 }
 /// Decoded raw beacon/probe facts. These carry no channel, transmit, key or
 /// association authority; the driver supplies its immutable receive channel.
@@ -37,11 +64,27 @@ const RATES: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
 pub enum SecurityMode {
     Open,
     Wpa2Psk,
+    /// WPA3-Personal: SAE authentication (AKM 8, or AKM 24 under H2E),
+    /// CCMP-128 and PMF required. `pwe` is wpa_supplicant's `sae_pwe`
+    /// policy; the plan resolves the actual PWE method and AKM from the
+    /// AP's RSNE/RSNXE and SAE-H2E membership selector.
+    Wpa3Sae {
+        pwe: SaePwe,
+    },
 }
 
 impl SecurityMode {
+    /// WPA2-Personal (PSK) only.
     pub fn is_wpa2(self) -> bool {
         matches!(self, Self::Wpa2Psk)
+    }
+    /// SAE (WPA3-Personal).
+    pub fn is_sae(self) -> bool {
+        matches!(self, Self::Wpa3Sae { .. })
+    }
+    /// Any RSN-protected mode (Privacy bit, RSNE in the request).
+    pub fn is_rsn(self) -> bool {
+        !matches!(self, Self::Open)
     }
 }
 
@@ -78,6 +121,200 @@ pub struct JoinPlan {
     phy_enabled: bool,
     offered_phy: Option<phy::Offer>,
     negotiated_phy: Option<phy::Negotiated>,
+    spp_amsdu: bool,
+    /// SAE authentication state and the negotiated AKM/PWE.
+    sae: Option<SaeJoin>,
+    /// EPD-mandatory BSS joined with the EPD opt-in.
+    epd: bool,
+    /// The negotiated WPA2 AKM/MFP profile (`Wpa2Profile::LEGACY` otherwise).
+    wpa2: Wpa2Profile,
+    /// 6 GHz state of a `prepare_6ghz` plan (boxed: `JoinPlan` stays small
+    /// for the 2.4/5 GHz callers' stacks).
+    six_ghz: Option<Box<six_ghz::SixGhzPlan>>,
+}
+
+/// Capability Information EPD subfield (bit13, IEEE802.11-2020 9.4.1.4).
+const CAP_EPD: u16 = 0x2000;
+
+/// AKM suites (IEEE802.11-2020 Table 9-151, OUI 00-0F-AC) whose key
+/// hierarchy the owner's EAPOL/key path implements. JoinPlan negotiates
+/// the AKM as wpa_supplicant `wpa_pick_key_mgmt` intersected with the
+/// driver's cfg80211 `wiphy->akm_suites`: the most preferred AKM offered by
+/// both the AP and this set wins, so a driver that lacks AKM 24's
+/// HMAC-SHA-256 group-19 MIC falls back to SAE AKM 8.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AkmSet(u32);
+impl AkmSet {
+    /// No AKM.
+    pub const NONE: Self = Self(0);
+    /// PSK (AKM 2).
+    pub const PSK: Self = Self(1 << rsn::AKM_PSK);
+    /// PSK-SHA256 (AKM 6): AES-128-CMAC EAPOL MIC, SHA-256 KDF.
+    pub const PSK_SHA256: Self = Self(1 << rsn::AKM_PSK_SHA256);
+    /// SAE (AKM 8).
+    pub const SAE: Self = Self(1 << rsn::AKM_SAE);
+    /// SAE-EXT-KEY (AKM 24, group-dependent HMAC-SHA-2 EAPOL MIC).
+    pub const SAE_EXT_KEY: Self = Self(1 << rsn::AKM_SAE_EXT_KEY);
+    /// The AKMs JoinPlan negotiated before `JoinOptions::akms` existed:
+    /// PSK, SAE and SAE-EXT-KEY. This is the default.
+    pub const LEGACY: Self = Self(Self::PSK.0 | Self::SAE.0 | Self::SAE_EXT_KEY.0);
+    /// Every AKM JoinPlan can negotiate.
+    pub const ALL: Self = Self(Self::LEGACY.0 | Self::PSK_SHA256.0);
+    /// Union.
+    pub const fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+    /// This set without `other`.
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+    /// True when the standard (00-0F-AC) suite type is in the set.
+    pub const fn contains_suite(self, suite_type: u8) -> bool {
+        suite_type < 32 && self.0 & (1 << suite_type) != 0
+    }
+}
+impl Default for AkmSet {
+    fn default() -> Self {
+        Self::LEGACY
+    }
+}
+
+/// wpa_supplicant `ieee80211w` policy for a `SecurityMode::Wpa2Psk` plan.
+/// SAE always requires PMF and ignores it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pmf {
+    /// `ieee80211w=0`: no MFPC; an MFPR AP is refused (the default).
+    #[default]
+    Disabled,
+    /// `ieee80211w=1`: advertise MFPC; PMF is in force when the AP sets MFPC.
+    Optional,
+    /// `ieee80211w=2`: advertise MFPC|MFPR; an AP without MFPC is refused.
+    Required,
+}
+
+/// Native framing and key-path opt-ins for `JoinPlan::prepare_with_options`.
+/// Construct with `JoinOptions::default()` and the `with_*` builders (or
+/// `..Default::default()`): new fields are added with behaviour-preserving
+/// defaults.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JoinOptions {
+    /// The owner's data path implements EtherType Protocol Discrimination
+    /// (`station_security::Security::with_epd`). The request then sets the
+    /// Capability EPD subfield and an EPD-mandatory BSS (selector 124) is
+    /// admitted.
+    pub epd: bool,
+    /// AKMs the owner's key path implements (default `AkmSet::LEGACY`).
+    pub akms: AkmSet,
+    /// WPA2-PSK management-frame protection policy (default disabled).
+    pub pmf: Pmf,
+}
+impl JoinOptions {
+    pub fn with_epd(mut self, epd: bool) -> Self {
+        self.epd = epd;
+        self
+    }
+    pub fn with_akms(mut self, akms: AkmSet) -> Self {
+        self.akms = akms;
+        self
+    }
+    pub fn with_pmf(mut self, pmf: Pmf) -> Self {
+        self.pmf = pmf;
+        self
+    }
+}
+
+/// The negotiated WPA2-Personal profile: AKM 2 or 6 and the RSN
+/// Capabilities MFPC/MFPR bits of the station RSNE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Wpa2Profile {
+    akm: u8,
+    mfp: u16,
+    /// Both RSNEs set MFPC: PMF is in force.
+    pmf: bool,
+}
+impl Wpa2Profile {
+    const LEGACY: Self = Self {
+        akm: rsn::AKM_PSK,
+        mfp: 0,
+        pmf: false,
+    };
+    fn rsne(self, spp_amsdu: bool) -> RsnIe {
+        let mut rsne = RsnIe::wpa2_psk_ccmp();
+        rsne.akms = vec![Suite::standard(self.akm)];
+        rsne.rsn_capabilities = self.mfp
+            | if spp_amsdu {
+                rsn::RSN_CAP_SPP_AMSDU_CAPABLE
+            } else {
+                0
+            };
+        rsne
+    }
+    /// wpa_supplicant `wpa_supplicant_set_suites` for WPA-PSK /
+    /// WPA-PSK-SHA256 with `ieee80211w` = `pmf`.
+    fn negotiate(ap: &RsnIe, akms: AkmSet, pmf: Pmf) -> Result<Self, Error> {
+        let ccmp = Suite::standard(rsn::CIPHER_CCMP_128);
+        let ap_mfpc = ap.rsn_capabilities & rsn::RSN_CAP_MFP_CAPABLE != 0;
+        let ap_mfpr = ap.rsn_capabilities & rsn::RSN_CAP_MFP_REQUIRED != 0;
+        if ap.group_cipher != ccmp
+            || !ap.pairwise_ciphers.contains(&ccmp)
+            || ap.rsn_capabilities & rsn::RSN_CAP_NO_PAIRWISE != 0
+            // "MFP required by AP but disabled locally".
+            || (ap_mfpr && pmf == Pmf::Disabled)
+            // "PMF required but AP not MFP capable".
+            || (pmf == Pmf::Required && !ap_mfpc)
+            // Only the default BIP-CMAC-128 is implemented (Security IGTK).
+            || (pmf != Pmf::Disabled
+                && ap_mfpc
+                && ap
+                    .group_management_cipher
+                    .is_some_and(|c| c != Suite::standard(rsn::CIPHER_BIP_CMAC_128)))
+        {
+            return Err(Error::UnsupportedSecurity);
+        }
+        // wpa_pick_key_mgmt: PSK-SHA256 before PSK.
+        let akm = [rsn::AKM_PSK_SHA256, rsn::AKM_PSK]
+            .into_iter()
+            .find(|akm| akms.contains_suite(*akm) && ap.akms.contains(&Suite::standard(*akm)))
+            .ok_or(Error::UnsupportedSecurity)?;
+        let mfp = match pmf {
+            Pmf::Disabled => 0,
+            Pmf::Optional => rsn::RSN_CAP_MFP_CAPABLE,
+            Pmf::Required => rsn::RSN_CAP_MFP_CAPABLE | rsn::RSN_CAP_MFP_REQUIRED,
+        };
+        Ok(Self {
+            akm,
+            mfp,
+            pmf: mfp != 0 && ap_mfpc,
+        })
+    }
+}
+
+/// BSS membership selectors (IEEE802.11-2020 Table 9-80 as amended;
+/// Linux include/linux/ieee80211.h `BSS_MEMBERSHIP_SELECTOR_*`), recorded
+/// as bits of `RateElements::selectors`.
+pub(crate) const SEL_HT: u8 = 1; // 127
+pub(crate) const SEL_VHT: u8 = 2; // 126
+pub(crate) const SEL_SAE_H2E: u8 = 4; // 123
+pub(crate) const SEL_HE: u8 = 8; // 122
+pub(crate) const SEL_EHT: u8 = 16; // 121
+pub(crate) const SEL_UHR: u8 = 32; // 120
+pub(crate) const SEL_GLK: u8 = 64; // 125
+pub(crate) const SEL_EPD: u8 = 128; // 124
+/// PHY selectors recognized by the opt-in PHY path; each is admitted only
+/// when the corresponding PHY is actually negotiated.
+pub(crate) const SEL_PHY: u8 = SEL_HT | SEL_VHT | SEL_HE | SEL_EHT | SEL_UHR;
+fn selector_bit(value: u8) -> u8 {
+    match value {
+        127 => SEL_HT,
+        126 => SEL_VHT,
+        125 => SEL_GLK,
+        124 => SEL_EPD,
+        123 => SEL_SAE_H2E,
+        122 => SEL_HE,
+        121 => SEL_EHT,
+        120 => SEL_UHR,
+        _ => 0,
+    }
 }
 
 #[derive(Default)]
@@ -86,7 +323,9 @@ struct RateElements {
     extended: bool,
     rates: u16,
     basic: u16,
-    phy: bool,
+    /// Membership selectors this context can evaluate; others fail closed
+    /// while the element is parsed.
+    allowed: u8,
     selectors: u8,
 }
 impl RateElements {
@@ -107,11 +346,12 @@ impl RateElements {
                 if rate & 128 != 0 {
                     self.basic |= 1 << index;
                 }
-            } else if self.phy && matches!(*rate, 0xff | 0xfe) {
-                self.selectors |= if *rate == 0xff { 1 } else { 2 };
+            } else if rate & 128 != 0 && self.allowed & selector_bit(rate & 127) != 0 {
+                self.selectors |= selector_bit(rate & 127);
             } else if rate & 128 != 0 {
-                // This legacy profile has no HT/VHT/HE membership-selector
-                // negotiation. Unknown optional rates do not become offers.
+                // Unknown basic rates and selectors this context cannot
+                // negotiate fail closed. Unknown optional rates do not
+                // become offers.
                 return Err(Error::UnsupportedRates);
             }
         }
@@ -187,8 +427,10 @@ fn observe_inner(
     }
     let (mut ssid, mut ap_rsne, mut ap_rsnxe) = (None, None, None);
     let mut ds_seen = false;
+    // A scan observation also records an SAE-H2E-only BSS; JoinPlan admits
+    // it only for an SAE H2E security mode.
     let mut rates = RateElements {
-        phy: local.is_some(),
+        allowed: if local.is_some() { SEL_PHY } else { 0 } | SEL_SAE_H2E,
         ..Default::default()
     };
     ies(&bytes[36..], |id, body| {
@@ -233,6 +475,7 @@ fn observe_inner(
             bssid: bytes[10..16].try_into().map_err(|_| Error::InvalidBss)?,
             ssid: ssid.ok_or(Error::InvalidBss)?,
             channel,
+            band: channel::band(channel),
             signal_dbm,
             capability,
             beacon_interval,
@@ -298,6 +541,38 @@ impl JoinPlan {
 
     /// Append validated optional SME elements before the first transmission.
     /// Its RSNE is checked above and replaced by the driver's negotiated one.
+    /// Advertise SPP A-MSDU Capable (RSN Capabilities bit10, IEEE802.11-2020
+    /// 9.4.2.24.4) in the WPA2 association-request RSNE before first
+    /// transmission. Only a native owner whose CCMP path keeps A-MSDU Present
+    /// in the AAD (`station_security::Security` with this `rsn_body()`) may
+    /// opt in; SPP is in force only if the AP RSNE also sets the bit.
+    pub fn enable_spp_amsdu(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Prepared {
+            return Err(Error::Busy);
+        }
+        if !self.security.is_wpa2() {
+            return Err(Error::UnsupportedSecurity);
+        }
+        // Fixed fields: 24-byte header, Capability and Listen Interval.
+        let mut at = 28;
+        while at + 2 <= self.assoc.len() {
+            let len = usize::from(self.assoc[at + 1]);
+            if self.assoc[at] == 48 {
+                let body = self
+                    .assoc
+                    .get_mut(at + 2..at + 2 + len)
+                    .ok_or(Error::Protocol)?;
+                let caps = body.len().checked_sub(2).ok_or(Error::Protocol)?;
+                let value = u16::from_le_bytes([body[caps], body[caps + 1]])
+                    | rsn::RSN_CAP_SPP_AMSDU_CAPABLE;
+                body[caps..].copy_from_slice(&value.to_le_bytes());
+                self.spp_amsdu = true;
+                return Ok(());
+            }
+            at += 2 + len;
+        }
+        Err(Error::Protocol)
+    }
     pub fn append_sme_ies(&mut self, bytes: &[u8]) -> Result<(), Error> {
         if self.phase != Phase::Prepared {
             return Err(Error::Busy);
@@ -306,6 +581,17 @@ impl JoinPlan {
             return Err(Error::InvalidBss);
         }
         validate_sme_ies(bytes, self.security.is_wpa2())?;
+        if self.six_ghz.is_some() {
+            // HT and VHT are not allowed on 6 GHz (mac80211 never adds HT
+            // or VHT Capabilities to a 6 GHz association request).
+            ies(bytes, |id, _| {
+                if matches!(id, 45 | 61 | 191 | 192) {
+                    Err(Error::UnsupportedRates)
+                } else {
+                    Ok(())
+                }
+            })?;
+        }
         if self.phy_enabled {
             ies(bytes, |id, _| {
                 if matches!(id, 61 | 192) {
@@ -329,7 +615,7 @@ impl JoinPlan {
         ssid: &[u8],
         security: SecurityMode,
     ) -> Result<Self, Error> {
-        Self::prepare_inner(bss, own, ssid, security, None)
+        Self::prepare_inner(bss, own, ssid, security, None, JoinOptions::default(), None)
     }
     /// Prepare using an implementation profile derived by the native owner.
     /// AP facts are reparsed and bound here, never accepted as an external grant.
@@ -340,7 +626,15 @@ impl JoinPlan {
         security: SecurityMode,
         local: phy::LocalPhy,
     ) -> Result<Self, Error> {
-        Self::prepare_inner(bss, own, ssid, security, Some(local))
+        Self::prepare_inner(
+            bss,
+            own,
+            ssid,
+            security,
+            Some(local),
+            JoinOptions::default(),
+            None,
+        )
     }
     pub fn offered_phy(&self) -> Option<&phy::Offer> {
         self.offered_phy.as_ref()
@@ -348,17 +642,106 @@ impl JoinPlan {
     pub fn negotiated_phy(&self) -> Option<&phy::Negotiated> {
         self.negotiated_phy.as_ref()
     }
+    /// Prepare with optional PHY and the explicit native framing opt-ins of
+    /// `JoinOptions`. `prepare`/`prepare_with_phy` use the defaults.
+    pub fn prepare_with_options(
+        bss: &Bss,
+        own: [u8; 6],
+        ssid: &[u8],
+        security: SecurityMode,
+        local: Option<phy::LocalPhy>,
+        options: JoinOptions,
+    ) -> Result<Self, Error> {
+        Self::prepare_inner(bss, own, ssid, security, local, options, None)
+    }
+    /// Prepare a 6 GHz station plan. `bss.band` must be `Some(Band::Ghz6)`
+    /// and its HE Operation must carry 6 GHz Operation Information;
+    /// `six_ghz::plan` admits it against `local`'s regulatory rule and
+    /// derives the channel, width and HE/EHT facts (`six_ghz()`).
+    ///
+    /// The 802.11ax 6 GHz security rule (IEEE802.11-2024 12.13.2: no open,
+    /// WEP, TKIP or PSK AKM, PMF required; WPA3 SAE must use H2E) is not
+    /// enforced by Linux v7.2 mac80211/cfg80211 on the station side; it is
+    /// wpa_supplicant's 6 GHz BSS filter. NARF has no separate BSS filter,
+    /// so the plan applies it: `Open` and `Wpa2Psk` are
+    /// `UnsupportedSecurity`, and `Wpa3Sae` must resolve to hash-to-element
+    /// (an AP or policy that only allows hunting-and-pecking is refused).
+    /// SAE already requires an MFP-capable AP and sends MFPC|MFPR.
+    /// OWE is not a `SecurityMode` and so cannot be joined either.
+    ///
+    /// The request carries no HT/VHT Capabilities; after RSNE/RSNXE it
+    /// sends HE Capabilities, HE 6 GHz Band Capabilities, Non-AP STA
+    /// Regulatory Connectivity and (if negotiated) EHT Capabilities.
+    pub fn prepare_6ghz(
+        bss: &Bss,
+        own: [u8; 6],
+        ssid: &[u8],
+        security: SecurityMode,
+        local: &six_ghz::SixGhzLocal,
+        options: JoinOptions,
+    ) -> Result<Self, Error> {
+        Self::prepare_inner(bss, own, ssid, security, None, options, Some(local))
+    }
+    /// The negotiated 6 GHz operation, power type, channel/width and HE
+    /// (and EHT) facts of a `prepare_6ghz` plan; `None` on 2.4/5 GHz.
+    pub fn six_ghz(&self) -> Option<&six_ghz::SixGhzPlan> {
+        self.six_ghz.as_deref()
+    }
+    /// True when this BSS mandates EtherType Protocol Discrimination (EPD
+    /// membership selector 124) and both the AP and this station advertise
+    /// the Capability Information EPD subfield: every MSDU of the
+    /// association, including EAPOL, uses EPD framing
+    /// (`station_security::Security::with_epd`).
+    pub fn epd(&self) -> bool {
+        self.epd
+    }
+    /// The negotiated AKM: PSK/PSK-SHA256 for `Wpa2Psk`, SAE/SAE-EXT-KEY
+    /// for `Wpa3Sae`, `None` for an open plan.
+    pub fn akm(&self) -> Option<crate::eapol::KeyMgmt> {
+        if let Some(sae) = self.sae.as_ref() {
+            return Some(sae.akm());
+        }
+        self.security
+            .is_wpa2()
+            .then(|| crate::eapol::KeyMgmt::from_suite_type(self.wpa2.akm))
+            .flatten()
+    }
+    /// True when the station RSNE advertises MFPC and the AP's RSNE does
+    /// too: robust management frames are protected (always for SAE).
+    pub fn pmf(&self) -> bool {
+        self.sae.is_some() || (self.security.is_wpa2() && self.wpa2.pmf)
+    }
     fn prepare_inner(
         bss: &Bss,
         own: [u8; 6],
         ssid: &[u8],
         security: SecurityMode,
         local: Option<phy::LocalPhy>,
+        options: JoinOptions,
+        six: Option<&six_ghz::SixGhzLocal>,
     ) -> Result<Self, Error> {
+        let band = match six {
+            // A 6 GHz plan needs the explicit band and a 6 GHz channel.
+            Some(_) if bss.band == Some(channel::Band::Ghz6) => {
+                channel::frequency_in(channel::Band::Ghz6, bss.channel).map(|_| channel::Band::Ghz6)
+            }
+            Some(_) => None,
+            // Otherwise a 2.4/5 GHz plan; an explicit band must agree.
+            None if bss
+                .band
+                .is_some_and(|band| Some(band) != channel::band(bss.channel)) =>
+            {
+                None
+            }
+            None => channel::band(bss.channel),
+        };
+        let six_ghz_band = band == Some(channel::Band::Ghz6);
         if !unicast(own)
             || !unicast(bss.bssid)
             || own == bss.bssid
-            || channel::band(bss.channel).is_none()
+            || band.is_none()
+            // A 6 GHz plan has no HT/VHT PHY profile.
+            || (six_ghz_band && local.is_some())
             || bss.information_elements.len() > 2048
             || ssid.is_empty()
             || ssid.len() > 32
@@ -367,11 +750,19 @@ impl JoinPlan {
         {
             return Err(Error::InvalidBss);
         }
+        if six_ghz_band && !security.is_sae() {
+            // 6 GHz security rule (see `prepare_6ghz`).
+            return Err(Error::UnsupportedSecurity);
+        }
         let mut rate_elements = RateElements {
-            phy: local.is_some(),
+            allowed: if local.is_some() { SEL_PHY } else { 0 }
+                | if six_ghz_band { SEL_HE | SEL_EHT } else { 0 }
+                | if security.is_sae() { SEL_SAE_H2E } else { 0 }
+                | if options.epd { SEL_EPD } else { 0 },
             ..Default::default()
         };
         let mut rsn = None;
+        let mut rsnxe: Option<Vec<u8>> = None;
         let mut wpa = false;
         let mut seen_ssid = false;
         ies(&bss.information_elements, |id, body| {
@@ -391,6 +782,12 @@ impl JoinPlan {
                     }
                     rsn = Some(RsnIe::decode_body(body).ok_or(Error::InvalidBss)?);
                 }
+                244 => {
+                    if rsnxe.is_some() || body.is_empty() {
+                        return Err(Error::InvalidBss);
+                    }
+                    rsnxe = Some(body.to_vec());
+                }
                 221 => wpa |= body.starts_with(&[0, 0x50, 0xf2, 1]),
                 _ => {}
             }
@@ -398,7 +795,8 @@ impl JoinPlan {
         })?;
         let mut rates = rate_elements.rates;
         let basic = rate_elements.basic;
-        if channel::band(bss.channel) == Some(channel::Band::Ghz5) {
+        // 5 and 6 GHz are OFDM-only (no DSSS/CCK rates).
+        if band != Some(channel::Band::Ghz2) {
             if basic & 15 != 0 {
                 return Err(Error::UnsupportedRates);
             }
@@ -416,6 +814,25 @@ impl JoinPlan {
             )?,
             None => None,
         };
+        let six_ghz = match six {
+            Some(six) if six_ghz_band => {
+                let plan = six_ghz::plan(&bss.information_elements, bss.channel, six)?;
+                // An EHT membership selector needs negotiated EHT.
+                if rate_elements.selectors & SEL_EHT != 0 && plan.eht().is_none() {
+                    return Err(Error::UnsupportedRates);
+                }
+                Some(Box::new(plan))
+            }
+            _ => None,
+        };
+        // IEEE802.11-2020 9.4.1.4: an EPD-mandatory BSS advertises the EPD
+        // capability subfield (bit13); an inconsistent beacon is malformed.
+        let epd = rate_elements.selectors & SEL_EPD != 0;
+        if epd && bss.capability & CAP_EPD == 0 {
+            return Err(Error::InvalidBss);
+        }
+        let mut sae = None;
+        let mut wpa2 = Wpa2Profile::LEGACY;
         let negotiated = match security {
             SecurityMode::Open => {
                 if bss.capability & 0x10 != 0 || rsn.is_some() || wpa {
@@ -425,31 +842,44 @@ impl JoinPlan {
             }
             SecurityMode::Wpa2Psk => {
                 let rsn = rsn.ok_or(Error::UnsupportedSecurity)?;
-                if bss.capability & 0x10 == 0
-                    || rsn.group_cipher != Suite::standard(rsn::CIPHER_CCMP_128)
-                    || !rsn
-                        .pairwise_ciphers
-                        .contains(&Suite::standard(rsn::CIPHER_CCMP_128))
-                    || !rsn.akms.contains(&Suite::standard(rsn::AKM_PSK))
-                    || rsn.rsn_capabilities & (rsn::RSN_CAP_MFP_REQUIRED | rsn::RSN_CAP_NO_PAIRWISE)
-                        != 0
-                {
+                if bss.capability & 0x10 == 0 {
                     return Err(Error::UnsupportedSecurity);
                 }
-                Some(RsnIe::wpa2_psk_ccmp().encode_body())
+                wpa2 = Wpa2Profile::negotiate(&rsn, options.akms, options.pmf)?;
+                Some(wpa2.rsne(false).encode_body())
+            }
+            SecurityMode::Wpa3Sae { pwe } => {
+                let rsn = rsn.as_ref().ok_or(Error::UnsupportedSecurity)?;
+                let join = SaeJoin::negotiate(
+                    pwe,
+                    bss.capability,
+                    rsn,
+                    rsnxe.as_deref(),
+                    rate_elements.selectors & SEL_SAE_H2E != 0,
+                    options.akms,
+                )?;
+                if six_ghz_band && !join.h2e() {
+                    // SAE on 6 GHz uses hash-to-element only.
+                    return Err(Error::UnsupportedSecurity);
+                }
+                let body = join.station_rsne(None);
+                sae = Some(join);
+                Some(body)
             }
         };
         let mut auth = management(0xb0, own, bss.bssid);
         auth.extend_from_slice(&[0, 0, 1, 0, 0, 0]);
         let mut assoc = management(0, own, bss.bssid);
         // ESS, negotiated privacy, and only AP-supported short preamble/slot.
-        let optional = if channel::band(bss.channel) == Some(channel::Band::Ghz5) {
-            0x0400
-        } else {
+        let optional = if band == Some(channel::Band::Ghz2) {
             0x0420
+        } else {
+            0x0400
         };
-        let capability =
-            1 | (bss.capability & optional) | if security.is_wpa2() { 0x10 } else { 0 };
+        let capability = 1
+            | (bss.capability & optional)
+            | if security.is_rsn() { 0x10 } else { 0 }
+            | if options.epd { CAP_EPD } else { 0 };
         assoc.extend_from_slice(&capability.to_le_bytes());
         assoc.extend_from_slice(&5u16.to_le_bytes());
         assoc.extend_from_slice(&[0, ssid.len() as u8]);
@@ -473,18 +903,21 @@ impl JoinPlan {
             assoc.extend_from_slice(&[48, rsn.len() as u8]);
             assoc.extend_from_slice(&rsn);
         }
+        if let Some(rsnxe) = sae.as_ref().and_then(SaeJoin::station_rsnxe) {
+            assoc.extend_from_slice(&[244, rsnxe.len() as u8]);
+            assoc.extend_from_slice(&rsnxe);
+        }
         if let Some(offer) = offered_phy.as_ref() {
             offer.append_capabilities(&mut assoc);
+        }
+        if let Some(plan) = six_ghz.as_ref() {
+            plan.append_capabilities(&mut assoc);
         }
         Ok(Self {
             own,
             peer: bss.bssid,
             channel: bss.channel,
-            security: if security.is_wpa2() {
-                SecurityMode::Wpa2Psk
-            } else {
-                SecurityMode::Open
-            },
+            security,
             rates,
             basic,
             auth,
@@ -493,9 +926,18 @@ impl JoinPlan {
             phy_enabled: local.is_some(),
             offered_phy,
             negotiated_phy: None,
+            spp_amsdu: false,
+            sae,
+            epd,
+            wpa2,
+            six_ghz,
         })
     }
     pub fn start_authentication(&mut self) -> Result<&[u8], Error> {
+        if self.sae.is_some() {
+            // SAE uses `start_sae_authentication`; open auth is refused.
+            return Err(Error::UnsupportedSecurity);
+        }
         if self.phase != Phase::Prepared {
             return Err(Error::Busy);
         }
@@ -513,7 +955,7 @@ impl JoinPlan {
     }
     /// Ignore other peers/subtypes; a matching rejection is terminal.
     pub fn authentication_response(&mut self, bytes: &[u8]) -> Result<Option<&[u8]>, Error> {
-        if self.phase != Phase::AwaitAuthentication {
+        if self.phase != Phase::AwaitAuthentication || self.sae.is_some() {
             return Err(Error::Busy);
         }
         if !self.response(bytes, 0xb0) {
@@ -553,7 +995,10 @@ impl JoinPlan {
             return Err(Error::Rejected(status));
         }
         let capability = u16::from_le_bytes([bytes[24], bytes[25]]);
-        if capability & 3 != 1 || (capability & 0x10 != 0) != self.security.is_wpa2() {
+        if capability & 3 != 1
+            || (capability & 0x10 != 0) != self.security.is_rsn()
+            || self.epd && capability & CAP_EPD == 0
+        {
             self.phase = Phase::Failed;
             return Err(Error::Protocol);
         }
@@ -564,7 +1009,20 @@ impl JoinPlan {
             return Err(Error::Protocol);
         }
         let mut response = RateElements {
-            phy: self.offered_phy.is_some(),
+            allowed: if self.offered_phy.is_some() {
+                SEL_PHY
+            } else {
+                0
+            } | if self.sae.as_ref().is_some_and(SaeJoin::h2e) {
+                SEL_SAE_H2E
+            } else {
+                0
+            } | if self.epd { SEL_EPD } else { 0 }
+                | if self.six_ghz.is_some() {
+                    SEL_HE | SEL_EHT
+                } else {
+                    0
+                },
             ..Default::default()
         };
         if let Err(error) = ies(&bytes[30..], |id, body| response.observe(id, body)) {
@@ -581,6 +1039,12 @@ impl JoinPlan {
             self.phase = Phase::Failed;
             return Err(Error::UnsupportedRates);
         }
+        if self.six_ghz.is_some() {
+            if let Err(error) = self.six_ghz_response(&bytes[30..]) {
+                self.phase = Phase::Failed;
+                return Err(error);
+            }
+        }
         let negotiated_phy = if self.phy_enabled {
             // Validate every relevant element before committing any AID/rate/PHY.
             let result = (|| {
@@ -588,10 +1052,7 @@ impl JoinPlan {
                 let mut rsn_seen = false;
                 ies(&bytes[30..], |id, body| {
                     if id == 48 {
-                        if rsn_seen
-                            || !self.security.is_wpa2()
-                            || RsnIe::decode_body(body) != Some(RsnIe::wpa2_psk_ccmp())
-                        {
+                        if rsn_seen || !self.response_rsne_matches(body) {
                             return Err(Error::UnsupportedSecurity);
                         }
                         rsn_seen = true;
@@ -620,9 +1081,50 @@ impl JoinPlan {
         self.phase = Phase::Associated { aid };
         Ok(Some(aid))
     }
+    /// 6 GHz response checks (mac80211 `ieee80211_assoc_config_link`): no
+    /// HT/VHT element, exactly one HE Capabilities and HE Operation (an HE
+    /// connection whose response lacks them is refused) and an RSNE that
+    /// repeats the request's.
+    fn six_ghz_response(&self, bytes: &[u8]) -> Result<(), Error> {
+        let (mut cap, mut op, mut rsn_seen) = (false, false, false);
+        ies(bytes, |id, body| {
+            match (id, body.split_first()) {
+                (45 | 61 | 191 | 192, _) => return Err(Error::UnsupportedRates),
+                (48, _) => {
+                    if rsn_seen || !self.response_rsne_matches(body) {
+                        return Err(Error::UnsupportedSecurity);
+                    }
+                    rsn_seen = true;
+                }
+                (255, Some((&he::EXT_HE_CAPABILITIES, b))) => {
+                    if cap {
+                        return Err(Error::Protocol);
+                    }
+                    he::HeCapability::parse(b).map_err(|_| Error::Protocol)?;
+                    cap = true;
+                }
+                (255, Some((&he::EXT_HE_OPERATION, b))) => {
+                    if op {
+                        return Err(Error::Protocol);
+                    }
+                    he::HeOperation::parse(b).map_err(|_| Error::Protocol)?;
+                    op = true;
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        if !cap || !op {
+            return Err(Error::UnsupportedRates);
+        }
+        Ok(())
+    }
     pub fn cancel(&mut self) {
         self.phase = Phase::Failed;
         self.negotiated_phy = None;
+        if let Some(sae) = self.sae.as_mut() {
+            sae.cancel();
+        }
     }
 
     /// Before association: the validated request offer. After association:
@@ -633,8 +1135,11 @@ impl JoinPlan {
         (self.rates, self.basic)
     }
     pub fn rsn_body(&self) -> Option<Vec<u8>> {
+        if let Some(sae) = self.sae.as_ref() {
+            return Some(sae.station_rsne(sae.pmkid()));
+        }
         if self.security.is_wpa2() {
-            Some(RsnIe::wpa2_psk_ccmp().encode_body())
+            Some(self.wpa2.rsne(self.spp_amsdu).encode_body())
         } else {
             None
         }
@@ -648,3 +1153,11 @@ mod tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "association/observe_tests.rs"]
 mod observe_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "association/epd_tests.rs"]
+mod epd_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "association/akm_tests.rs"]
+mod akm_tests;

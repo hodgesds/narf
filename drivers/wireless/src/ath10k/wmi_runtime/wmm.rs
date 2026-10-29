@@ -6,8 +6,9 @@ use alloc::vec::Vec;
 use narf_wireless::wmm::{Parameters, INFORMATION};
 
 fn admit(parameters: Parameters) -> Result<Parameters, Error> {
-    // Ordinary Ethernet uses BE/TID0. No TSPEC admission or U-APSD is
-    // negotiated; an ACM-only BE queue cannot silently become usable.
+    // No TSPEC admission or U-APSD is negotiated. VO/VI/BK ACM is served by
+    // `tx_qos` downgrade (`ieee80211_downgrade_queue`); an ACM-only BE queue
+    // would push all ordinary traffic onto BK, so that BSS stays refused.
     if parameters.ac[0].admission_control {
         return Err(Error::Unsupported);
     }

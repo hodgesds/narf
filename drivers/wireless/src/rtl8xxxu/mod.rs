@@ -54,6 +54,7 @@ pub mod phy_tables;
 pub mod power_policy;
 mod radio_init;
 pub mod rate;
+pub mod rate_adaptation;
 pub mod receive_runtime;
 pub mod regs;
 pub mod rtl8188e;
@@ -305,3 +306,6 @@ mod firmware_transport_tests;
 
 #[cfg(feature = "kernel-test")]
 mod management_tests;
+
+#[cfg(feature = "kernel-test")]
+mod rate_adaptation_tests;

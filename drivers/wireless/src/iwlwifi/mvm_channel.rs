@@ -11,6 +11,8 @@ pub(super) struct ChannelContext {
     rlc_version: u8,
     ultra_channels: bool,
     pub(super) current: Option<u8>,
+    /// Secondary channel of a prepared 40MHz context.
+    pub(super) span: Option<super::phy::Span>,
 }
 impl ChannelContext {
     pub(super) fn new(api: &FirmwareApi<'_>) -> Self {
@@ -29,6 +31,7 @@ impl ChannelContext {
                 .unwrap_or(0),
             ultra_channels: api.has_capability(48),
             current: None,
+            span: None,
         }
     }
     fn rlc_command(&self, nvm: &Nvm) -> Option<[u8; 32]> {
@@ -41,10 +44,21 @@ impl ChannelContext {
         put32(&mut body, 4, receive_chains(nvm));
         Some(body)
     }
-    fn command(&self, action: u32, channel: u8, nvm: &Nvm) -> Result<Vec<u8>, &'static str> {
+    fn command(
+        &self,
+        action: u32,
+        channel: u8,
+        span: Option<super::phy::Span>,
+        nvm: &Nvm,
+    ) -> Result<Vec<u8>, &'static str> {
         if !matches!(self.version, 1 | 2)
             || !matches!(action, 1 | 3)
             || !nvm.channels.contains(&channel)
+            || span.is_some_and(|s| {
+                s.channels().is_none_or(|c| {
+                    !c.contains(&channel) || c.iter().any(|x| !nvm.channels.contains(x))
+                })
+            })
             || !matches!(nvm.rx_chains, 1..=3)
             || !matches!(nvm.tx_chains, 1..=3)
         {
@@ -53,15 +67,27 @@ impl ChannelContext {
         // Linux mvm/phy-ctxt.c uses the old 16-byte prefix and a
         // capability-sized channel field followed immediately by its tail.
         // The Gen3 32-byte PHY_CONTEXT command has a different prefix.
+        // iwl_mvm_phy_ctxt_cmd_data: channel is the control channel;
+        // width IWL_PHY_CHANNEL_MODE40 (1) and iwl_mvm_get_ctrl_pos, which
+        // for a 40MHz offset of +-10MHz is 0 below or IWL_PHY_CTRL_POS_ABOVE
+        // (4) when the control channel lies above the center.
+        let (width, position) = match span {
+            None => (0, 0),
+            Some(span) => (span.width, span.control_position(channel)),
+        };
         let tail = if self.ultra_channels { 24 } else { 20 };
         let mut body = alloc::vec![0; tail + 16];
         put32(&mut body, 4, action);
         if self.ultra_channels {
             put32(&mut body, 16, u32::from(channel));
             body[20] = u8::from(channel <= 14);
+            body[21] = width;
+            body[22] = position;
         } else {
             body[16] = u8::from(channel <= 14);
             body[17] = channel;
+            body[18] = width;
+            body[19] = position;
         }
         put32(&mut body, tail, nvm.tx_chains);
         put32(&mut body, tail + 4, receive_chains(nvm));
@@ -101,13 +127,24 @@ impl Owner {
         if self.phase != Phase::Configured || self.hardware.is_failed() {
             return Err("MVM owner is not ready for inactive PHY");
         }
-        if !super::scan::passive_permitted(domain, channel) {
+        // A granted HT40 program prepares the 40MHz context directly
+        // (mac80211 creates the chanctx with the BSS chandef before auth).
+        let span = self.power.phy.span();
+        if !super::scan::passive_permitted(domain, channel)
+            || span.is_some_and(|s| {
+                s.channels().is_none_or(|c| {
+                    c.iter()
+                        .any(|&x| !super::scan::passive_permitted(domain, x))
+                })
+            })
+        {
             return Err("MVM inactive PHY channel prohibited by receive policy");
         }
         let local = self.mac.ok_or("missing MVM PHY identity")?;
         let phy = self.channel.command(
             1,
             channel,
+            span,
             self.nvm.as_ref().ok_or("missing retained MVM NVM")?,
         )?;
         let rlc = self
@@ -119,11 +156,12 @@ impl Owner {
         self.validate_scan_profile()?;
         self.phase = Phase::PreparingChannel;
         let result = self
-            .prepare_channel_inner(channel, local, &phy, rlc.as_ref())
+            .prepare_channel_inner(channel, span, local, &phy, rlc.as_ref())
             .await;
         match result {
             Ok(()) => {
                 self.channel.current = Some(channel);
+                self.channel.span = span;
                 self.phase = Phase::ChannelPrepared;
                 Ok(())
             }
@@ -137,6 +175,7 @@ impl Owner {
     async fn prepare_channel_inner(
         &mut self,
         channel: u8,
+        span: Option<super::phy::Span>,
         local: [u8; 6],
         phy: &[u8],
         rlc: Option<&[u8; 32]>,
@@ -147,6 +186,27 @@ impl Owner {
                 .ok_or("invalid MVM PHY band/channel")?;
             if permissions.get(index).is_none_or(|flags| flags & 1 == 0) {
                 return Err("MVM inactive PHY absent from current MCC");
+            }
+        }
+        if let Some(span) = span {
+            // NVM_CHANNEL_VALID and NVM_CHANNEL_40MHZ/80MHZ on every subchannel
+            // of the current MCC (or, without LAR, the NVM) profile.
+            let permissions = self
+                .scan
+                .permissions
+                .as_ref()
+                .or(self.power.nvm_permissions.as_ref())
+                .ok_or("MVM wide PHY has no firmware channel profile")?;
+            let required = 1 | (1u32 << (8 + span.width));
+            for ch in span.channels().ok_or("MVM wide PHY span malformed")? {
+                let index = super::super::station_api::channel_index(ch)
+                    .ok_or("invalid MVM PHY band/channel")?;
+                if permissions
+                    .get(index)
+                    .is_none_or(|flags| flags & required != required)
+                {
+                    return Err("MVM wide PHY span absent from firmware profile");
+                }
             }
         }
         self.hardware.command(1, 8, phy).await?;
@@ -176,6 +236,7 @@ impl Owner {
         let remove = self.channel.command(
             3,
             channel,
+            self.channel.span,
             self.nvm.as_ref().ok_or("missing retained MVM NVM")?,
         )?;
         self.phase = Phase::ReleasingChannel;
@@ -183,6 +244,7 @@ impl Owner {
         match result {
             Ok(()) => {
                 self.channel.current = None;
+                self.channel.span = None;
                 self.phase = Phase::Configured;
                 Ok(())
             }

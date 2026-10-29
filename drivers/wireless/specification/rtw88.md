@@ -496,8 +496,41 @@ exactly once; C2H bytes are never treated as Wi-Fi payload. Current PCI authorit
 the retained signed calibration cap and fresh authenticated policy are checked
 before every native packet publication and progress step.
 
-Passive scan admits channel1/2412 MHz only, bounded dwell and SSID filters.
-Active/random-MAC/6 GHz scanning and probe extra IEs are refused. The shared
+Scan admits channel1/2412 MHz only, bounded dwell and SSID filters.
+Active scanning and driver-admitted extra probe IEs are implemented on that
+channel (`src/rtw88/scan.rs`, `station.rs::scan_for`) as Linux's software
+scan: this profile has no `FW_FEATURE_SCAN_OFFLOAD`, so `rtw_ops_hw_scan`
+returns 1 and mac80211 sends one broadcast-DA/wildcard-BSSID Probe Request
+per SSID (empty list = one wildcard; at most `RTW_SCAN_MAX_SSIDS`=4) with
+SSID, all twelve legacy rates (Supported/Extended, no basic flags), DS
+Parameter Set channel1, then the caller's IEs. `max_scan_ie_len` is
+`IEEE80211_MAX_DATA_LEN` less those driver elements (2227 bytes), so every
+probe fits the retained2304-byte TX MPDU. Caller IEs must be well formed and
+may not repeat SSID/rates/DS; extra IEs on a passive scan are refused. Each
+probe uses the ordinary management queue (QSEL18, W0 BMC, rate ID8/CCK1,
+no CCX report) under the same current PCI/calibration/regulatory checks as
+authentication, so a NO_IR or otherwise disallowed policy prevents the first
+probe DMA. Probes are published one at a time and retired on DMA consumption
+before the dwell; unicast Probe Responses feed the same shared observer as
+beacons. Random-MAC scanning follows Linux v6.12: `main.c::rtw_register_hw`
+sets `NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR` (`supports_scan_random_mac`),
+and `rtw_core_scan_start` points port0 `REG_MACID` (0x610) at the
+mac80211 `get_random_mask_addr` address (random bits outside the mask, base
+bits inside; cfg80211 `nl80211_parse_random_mac` requires the mask to keep
+the group bit of a unicast base). Every probe uses that SA, packet core
+admits a broadcast Probe Request from exactly the current scan address,
+and Probe Responses to it feed the observer. `rtw_core_scan_complete`
+restores the own address and clears the packet scan address on every
+exit. Passive requests transmit nothing and bind no address; association
+always uses the own address. Evidence: `drivers/wireless/rtw88/narrow/scan`
+(mask/variation/probe SA) and `drivers/wireless/rtw88/random_scan`
+(actual DMA probe SA, 0x610 follows and is restored, joining afterwards
+uses the own address); a mask clearing the group bit is refused.
+6 GHz scanning stays refused. HT capability elements
+are not added to probes. Native smokes: `scan_tests.rs` (exact preq bytes,
+SSID/IE budget, malformed/unsupported requests, BMC/MGMT/no-report
+descriptor) and `station_composition_tests.rs` (actual DMA probes, probe-
+response-only BSS joined, NO_IR refusal without TX publication). The shared
 association parser validates actual beacons, authentication and association
 responses, including mandatory supported rates. Open and WPA2-PSK use that same
 retained peer transition. WPA2 uses shared host RSNA and packet-key owners for
@@ -850,7 +883,7 @@ responses or native register/RF/IQK loss, held/modified/late M4 and actual
 descriptor/final-RX publication revocation. Firmware bounce bytes and native
 packet allocation identity stay unchanged; ambiguous exits retain DMA.
 These are inert software models, not physical RF acceptance. Real full-envelope
-signed assets, HT/VHT widths/aggregation, other bands/channels, full AC/TID,
+signed assets, HT/VHT widths/aggregation, other bands/channels, full AC/TID (now N2xQ),
 dynamic tracking/coexistence, recovery and PM remain explicit gates/work.
 
 
@@ -1350,6 +1383,273 @@ this channel1 owner therefore does not add a TX A-MSDU producer. That source
 policy is not a claim that the silicon lacks broader-band A-MSDU capability.
 
 
+### Separately signed continuation contracts and the dm watchdog
+
+`qualification.rs` is the single reusable loader for every new RTW88 program
+that needs its own measured authority. A static `Kind { tag, stem, source,
+admit }` describes the program; the generic code supplies the 128-byte
+layout (`N21<tag>`/`N22<tag>`, `[1,0,128,0]`, length, `ec 10` + PCI id,
+identity, exact factory MAC, `[tag, 1]`, 64-byte kind payload, zero tail),
+signer and capability checks, and `Grant::invoke(gate, op)`, which re-enters
+the continuation capability and then the current base `Gate` (regulatory
+policy and every bound base capability). The identity binds the chip, the
+MAC, the exact retained board/calibration base (`Gate::extension_request`,
+i.e. N22Cv2 or N21S) and the hashed upstream source contract. Requests are
+filed as `rtw88/rtw882{1,2}ce-<stem>-v1-<mac>.bin`;
+`Rtw88Device::tracking_request()` returns the `ContinuationRequest` for the
+dm kind. New programs add a `Kind` instead of another bespoke loader.
+
+`dm.rs` (tag `D`, stem `dm`) ports Linux `main.c::rtw_watch_dog_work`
+(2 s period, run with the retained owner mutex held) and
+`phy.c::rtw_phy_dynamic_mechanism`:
+
+| Mechanism (payload bit) | Source | Chips |
+|---|---|---|
+| statistics | `rtw_phy_statistics`: RSSI EWMA(10,16) from peer PHY status, `rtw_phy_get_rssi_level`, H2C 0x42; `false_alarm_statistics` counters and reset pulses | both |
+| DIG (0) | `rtw_phy_dig` thresholds/steps/damping/boundaries; signed `dig_max` caps `DIG_PERF_MAX` | C21 `0xc50`, C22 `0x1d70` both paths |
+| CCK PD (1) | `rtw_phy_cck_pd` + `cck_pd_set` (8822c PD/CS deltas, 8821c `0xa08`/`0xaa8`), level capped by payload | both |
+| RA (2) | `rtw_phy_ra_track`: H2C 0x58 WL-PHY info, every fourth period RA_INFO 0x40 with RSSI-level mask and NO_UPDATE, C2H 0x0c RA report, RRSR = retained qualified RRSR & report mask | both |
+| TX path diversity (3) | `rtw_phy_tx_path_diversity` + `rtw8822c_config_{cck,ofdm}_tx_path` | C22 |
+| CFO (4) | `rtw8822c_cfo_track`, crystal `0x1040[23:10]`, BT scoreboard reset, window bounded by payload | C22 |
+| thermal power tracking (5) | `rtw8822c_pwr_track` type 0: RF42 trigger, EWMA(10,4), 2G/CCK swing tables, LCK at 8 steps, `0x18a0`/`0x41a0[6:0]` delta clamped to the signed up/down bound; samples outside the signed thermal window refuse | C22 |
+| EDCCA adaptivity (6) | `rtw8822c_adaptivity` normal/ETSI(45)/JP(60) from the regulatory country (wireless-regdb DFS region), `0x84c` bytes 2/3 | C22 |
+
+The continuation binds at association and the watchdog runs only on an
+established station. Each register group runs inside admission + continuation
++ base gate; H2C goes through the retained mailbox after a fresh grant check.
+Revocation, policy loss or an out-of-envelope sample restores the base program
+(initial IGI/EDCCA, factory crystal, path A, zero power delta, qualified RRSR,
+level-0 CCK PD) under the base gate only and stops tracking for that
+association. Deviations from Linux, each a qualification bound: the RRSR base
+is the qualified mask rather than `RRSR_INIT_2G`; DIG/CCK-PD/crystal/power
+deltas are capped by the signed payload; there is no unlinked DIG because the
+continuation binds at association. DPK tracking is not offered: Linux
+`rtw8822c_dpk_track` returns without a DPK result, and this profile runs no
+DPK calibration.
+
+Linux rtw88 reads no `ht_operation_mode` and takes no protection action
+(`mac80211.c`, `tx.c`), so the retained station now admits APs that advertise
+HT protection modes 1..3 unchanged. The check was local to rtw88; no shared
+`JoinPlan` change was needed.
+
+Evidence: nine `drivers/wireless/rtw88/dm_engine` register-model cases
+(`dm_tests.rs`), and composed C21/C22 Open/WPA2 watchdog, revocation-restore
+and refusal cases (`dm_station_tests.rs`, `drivers/wireless/rtw88/dm/rtl882{1,2}c`)
+plus HT protection modes 1..3 (`drivers/wireless/rtw88/ht_protection/*`).
+These are software/model results. A real signed N2xD measurement and physical
+acceptance remain external deployment gates.
+
+### C21/C22 HT TX coding: LDPC and STBC (`N2xC`)
+
+`coding.rs` (tag `C`, stem `coding`) is the first TX/PHY feature qualified
+through the generic continuation contract. Linux v6.12 sources:
+
+- `main.c::rtw_init_ht_cap` (~L1540): every chip advertises one-stream RX
+  STBC (`1 << IEEE80211_HT_CAP_RX_STBC_SHIFT`); HT `LDPC_CODING` only with
+  `chip->rx_ldpc` (`rtw8822c.c` `.rx_ldpc = true`, `rtw8821c.c` false);
+  HT `TX_STBC` only with `chip->tx_stbc` (`rtw8822c.c`).
+- `main.c::rtw_update_sta_info` (~L1200): `si->ldpc_en` from the peer's HT
+  `LDPC_CODING`, `si->stbc_en` from the peer's nonzero HT `RX_STBC`.
+- `tx.c::rtw_tx_pkt_info_update` (~L375): `stbc = hal.txrx_1ss ? false :
+  si->stbc_en`, `ldpc = si->ldpc_en`; `tx.c::rtw_tx_fill_tx_desc` encodes
+  `tx.h` `RTW_TX_DESC_W5_DATA_LDPC` (BIT 7) and `W5_DATA_STBC` (bits 9:8).
+- `fw.c::rtw_fw_send_ra_info` / `fw.h` `SET_RA_INFO_LDPC` (H2C word0 bit 26).
+
+RX advertisement is a local decode promise and belongs to the base HT
+station: with a bound N2xH every HT association request now carries RX
+STBC1, and C22 also carries LDPC. Emitting coded PPDUs changes the waveform,
+so it needs a separate `N2xC` continuation over the exact retained base.
+Payload byte 0 requests TX LDPC (bit 0) and TX STBC (bit 1); every other
+byte is zero. C21 is one-path and may request LDPC only, matching Linux,
+which gates no TX LDPC on the chip. The grant loads, identity-matched, before
+`JoinPlan` preparation, so the offer advertises `TX_STBC` only when a
+matching N2xC exists. Its live check runs when it binds into the retained
+`Gate` (`with_continuation`), right after the HT program. A grant that is
+not current at that point leaves TX uncoded.
+At the association response the data profile takes LDPC/STBC only where the
+qualified flags and the shared `HtNegotiation::tx_ldpc`/`tx_stbc` (peer
+capability) agree. `wmm::ra_info` sets RA_INFO bit 26 and the native
+descriptor sets W5 bit 7 and W5 bits 9:8 = 1. `Gate::allows_profile` admits a
+coded profile only with a current bound grant whose flags permit it.
+
+`hal.txrx_1ss` is never set because coexistence-driven SMPS is not
+implemented (`smps_txrx_1ss` stays open), so STBC is not forced off. The
+coding grant is not part of `Gate::current`. Every DATA send and every
+watchdog pass call `coding_live`. If the grant is revoked or no longer
+matches, the station drops to the uncoded HT profile under the base gate.
+The next watchdog then resends RA_INFO without LDPC, and the link stays up.
+Teardown clears the bound coding.
+
+Evidence: two `drivers/wireless/rtw88/narrow/coding` cases (descriptor W5
+bits, payload bounds, peer/flag intersection) and composed C21/C22 cases in
+`drivers/wireless/rtw88/coding/rtl882{1,2}c` (`coding_tests.rs`):
+advertisement, coded descriptor and RA_INFO, revocation downgrade, an
+unqualified station, a peer without coding, refused records and teardown.
+A real signed N2xC measurement and over-the-air acceptance remain external.
+
+### C21/C22 all-AC WMM and all-TID QoS routing (`N2xQ`)
+
+`qos.rs` (tag `Q`, stem `qos`) lifts the base N2xL single BE/TID0 producer
+to every TID and all four EDCA rings. Sources:
+
+- `net/wireless/util.c::cfg80211_classify8021d` (RFC 8325 DSCP to 802.1d,
+  IPv4/IPv6/MPLS/802.21, no QoS map) picks the TID of each Ethernet frame.
+- `net/mac80211/wme.c::{ieee802_1d_to_ac,wme_downgrade_ac,
+  ieee80211_downgrade_queue}`: with no admitted TSPEC, ACs whose AP WMM
+  parameter has ACM set are stepped down (BK when every lower AC needs
+  admission).
+- `rtw88/tx.c::rtw_tx_ac_to_hwq` maps VO/VI/BE/BK to the hardware rings
+  and `rtw_tx_pkt_info_update` sets `qsel = skb->priority` (the TID).
+- `rtw88/pci.h` `RTK_PCI_TXBD_IDX_{VO,VI,BE,BK}Q` (0x3a0/0x3a4/0x3a8/0x3ac)
+  and `pci.c::max_num_of_tx_queue` (BE 256, others 128). The original
+  retained owner already maps all seven rings; packet core now drives
+  BE/BK/VI/VO.
+
+Payload byte 0 is the qualified set of extra ACs (bit 0 BK, bit 1 VI,
+bit 2 VO); every other byte is zero. The continuation binds into the
+retained `Gate` right after the WMM extension, and only when the AP
+advertised WMM. `DataProfile::acs` carries the set and
+`Gate::allows_profile` admits it only with a current bound grant.
+Classification is followed by the ACM downgrade. A TID whose AC is not
+qualified then steps further down; an unqualified BK falls back to
+BE/TID0. QoS Control carries the TID with normal ack and no
+EOSP/A-MSDU bit, and the descriptor QSEL is the TID. EDCA for all four
+ACs is already programmed from the bound AP parameters (`wmm.rs`). RX
+accepts QoS DATA on any TID while `acs` is set. Originator BA still
+aggregates only its TID0 agreement, so other TIDs use single-MPDU
+publication. Revocation is checked on every send and every watchdog pass,
+like N2xC; it returns every frame to BE/TID0 without dropping the link.
+
+Evidence: two `drivers/wireless/rtw88/narrow/qos` cases (DSCP mapping,
+ACM downgrade, qualified-AC fallback, ring/index/QSEL and payload bounds)
+and composed C21/C22 Open/WPA2 cases in `drivers/wireless/rtw88/qos/*`
+(`qos_tests.rs`): per-TID routing to the AP, revocation and teardown, an
+unqualified station, a VI-only subset and refused records. A real signed
+N2xQ measurement and over-the-air acceptance remain external.
+
+### C21/C22 DATA rate fallback (`N2xF`)
+
+`fallback.rs` (tag `F`, stem `fallback`) lets firmware rate adaptation
+step DATA down instead of transmitting every frame at one fixed rate.
+Sources (Linux v7.2 rtw88):
+
+- `tx.c::rtw_tx_data_pkt_info_update` leaves `use_rate` and
+  `dis_rate_fallback` false for a station DATA frame. Only
+  `dm_info->fix_rate` forces both on. The descriptor rate is the highest
+  negotiated rate, which the base profile already carries.
+  `rtw_tx_mgmt_pkt_info_update` keeps management frames fixed with both
+  bits set.
+- `tx.c::rtw_tx_fill_tx_desc`: `RTW_TX_DESC_W3_USE_RATE` (bit 8) and
+  `RTW_TX_DESC_W3_DISDATAFB` (bit 10).
+- `fw.c::rtw_fw_send_ra_info`: rate ID, `SET_RA_INFO_RA_MASK0..3` and a
+  clear `DIS_RA`. `wmm.rs::ra_info` already sends this with the bound rate
+  and MCS mask at peer commit, so firmware RA is running and falls back
+  within the mask.
+
+Payload byte 0 is 1; every other byte is zero. The continuation binds into
+the retained `Gate` right after the base N2xL extension. It needs no WMM
+or HT program. `DataProfile::fallback` carries it, and
+`Gate::allows_profile` admits it only with a current bound grant. With the
+grant, ordinary DATA (including QoS DATA and the HT profile) clears both
+W3 bits. Management, EAPOL/radio-report frames and BAR keep
+USE_RATE|DISDATAFB, and so do originator BA bursts: the N2xT burst
+envelope is qualified as fixed-rate/no-fallback, unlike Linux, which
+lets firmware RA run on A-MPDUs too. Revocation is checked on every send and every watchdog
+pass (`Station::fallback_live`). It returns DATA to the fixed rate without
+dropping the link.
+
+Evidence: `drivers/wireless/rtw88/narrow/fallback` (payload and chip
+bounds; W3 bits for QoS/non-QoS DATA with and without the profile; a
+Probe Request staying fixed) and composed C21/C22 cases in
+`drivers/wireless/rtw88/fallback/*` (`fallback_tests.rs`): Open and WPA2
+joins with fallback DATA, then revocation back to fixed rate and teardown;
+an unqualified station staying fixed; unsigned, altered, foreign and
+revoked records refused. A real signed N2xF measurement and over-the-air
+rate behaviour remain external.
+
+### PCI DMA-stop proof and reclamation (`dma_stop.rs`)
+
+A stopped owner used to keep every published mapping forever: the seven TX
+rings, the 512-entry RX ring and its buffers, the H2C bounce buffer, the
+packet-core frame and batch buffers and the reserved-page ring/frame.
+Clearing BME alone is not a retirement proof. `Io::quiesce_dma` now follows
+Linux v7.2 `pci.c::rtw_pci_stop` (`rtw_pci_disable_interrupt` writes
+`RTK_PCI_HIMR0/1/3` = 0 at 0xb0/0xb8/0x10b8, then `rtw_pci_dma_release`)
+and adds the idle proof that Linux gets for free by powering the MAC off
+first. Native runs the packet stop (`Core::stop` or a bare `Port::stop`):
+HIMRs zero, `REG_TXPAUSE` 0x522 = 0xff, CR 0x100 low DMA gates
+(`MAC_TRX_ENABLE` bits 0..3/6/7) cleared and BME off. `dma_stop::prove`
+then requires, through a teardown view that needs only the current PCI cap
+and memory decode:
+
+1. a fresh PCI command read showing BME clear, INTx disabled and memory
+   decode on;
+2. all three HIMRs zero, TXPAUSE 0xff and the CR DMA gates clear;
+3. for each `rtw_pci_tx_queue_idx_addr` register (H2C 0x132c, BK 0x3ac,
+   BE 0x3a8, VO 0x3a0, VI 0x3a4, MGMT 0x3b0, HI0 0x3b8), hardware RP
+   (bits 16..27, `__pci_get_hw_tx_ring_rp`) equal to host WP (bits 0..11),
+   the drained test of `rtw_pci_dma_check`. Each ring gets 1000 polls
+   10 us apart (`util.c::check_hw_ready`);
+4. RX stopped the way `wow.c::rtw_wow_rx_dma_stop` does it:
+   `REG_RXPKT_NUM` 0x284 `BIT_RW_RELEASE` (18) set, then `BIT_RXDMA_IDLE`
+   (17) polled with the same budget;
+5. a second command read showing BME still clear.
+
+An all-ones read is surprise removal (`Gone`). Any timeout, readback
+mismatch or authority failure leaves every mapping retained. Success clears
+`Native::published` and calls `Core::release`, which needs a stopped core.
+The reserved-page backend releases its ring and frame only if its beacon
+page completed (`Idle`/`Continued`) or was disarmed after radio
+completion. A poisoned or timed-out page is never proven. The backend is
+then terminal and no page, packet or proof can reopen it.
+
+`Owner::station_disconnect` runs the proof after the station stop. Its
+result never turns a completed disconnect into a failure.
+`Owner::quiesce_dma` is the phase-independent entry for removal and
+failure paths: it stops the station first. Linux frees ring skbs in
+`rtw_pci_free_trx_ring` at `rtw_pci_destroy`. Here the release happens
+when the proven owner is dropped.
+
+Evidence: `drivers/wireless/rtw88/dma_stop` (proof success, BME open,
+armed HIMR, TX unpaused, TXDMA on, H2C not drained, RXDMA busy, surprise
+removal, BME reopened mid-drain), the reserved-page reclamation case in
+`drivers/wireless/rtw88` (unclaimed, success and drop count, busy RXDMA
+retained, a timed-out beacon page never proven) and the composed station
+cases (an Open DHCP disconnect proves and reclaims; a busy RXDMA disconnect
+still completes and keeps every mapping).
+
+### PCI device removal (`pci.rs::remove`)
+
+`register_pci_driver` registers a `narf_bus::register_pci_remove` hook
+for every match name. It follows Linux v7.2 `pci.c::rtw_pci_remove`:
+
+1. `rtw_unregister_hw`: `interface::Device::withdraw` closes admission,
+   drops the link, clears the stack rings and unregisters the wireless
+   registry, the net registry and the `wlan%d` interface. The 1 ms
+   drain/watchdog task exits once the shell is withdrawn. A diagnostic
+   RTL8822BE shell unregisters its static interface.
+2. `rtw_pci_disable_interrupt` + `rtw_pci_destroy`:
+   `Lifecycle::remove` marks the lifecycle removed, so no initialization
+   or stage can install an owner later. Under the owner mutex it records
+   `Failed`/`Gone`, takes the retained owner and runs
+   `Owner::quiesce_dma`, which stops the station, then runs `rtw_pci_stop`
+   and the DMA idle proof above. Then it drops the owner.
+3. Drop frees the rings and buffers only after a successful proof.
+   Otherwise they stay pinned and the bus address is quarantined: a later
+   probe of that address returns `BadDevice` without touching config space
+   or BARs. A proven removal clears the quarantine.
+
+The hook takes the controller slot only for the exact bound address, and
+the teardown runs on the executor because removal cannot fail or block
+the bus dispatcher.
+
+Evidence (`drivers/wireless/rtw88/station`): removal of a joined
+RTL8822CE station withdraws the shell, reclaims after the proof, leaves
+`Failed`/`Gone` with no retained owner, refuses association and finds
+no owner on a second removal. A removal whose RXDMA never idles reports the mappings
+pinned. A lifecycle removed before any owner existed refuses a later
+`initialize_bytes`.
+
 ## 4. Invariants
 
 - Physical reads select Wi-Fi EFUSE bank zero and disable the programming
@@ -1431,13 +1731,16 @@ Remaining software ledger:
 | C21 awake radio/packet/port0/station | Exact N21S identity/current triple signed-source authority and live policy, C21 gain/channel/thermal and real wake/CAM receipts, parked same-owner beacon disarm and native Open/WPA2 DHCP/IP composition implemented; measured assets/physical acceptance remain external |
 | Current signed per-board gain/operating-envelope qualification | Implemented loader, exact identity/source ceilings, cap revocation and current-policy checks; real measured signed artifact is an external deployment gate |
 | Fixed awake ch1 radio/DACK/IQK/OTP/qualified power | Implemented for the explicit version2 CCK/control-response profile; real signed measured envelope remains a deployment gate |
-| C21/C22 legacy12 DATA/WMM BE-TID0 | Separate N21L/N22L exact-chip identities/current signed measurements and host-policy gates; bound response rates/parameters, source EDCA/RA/RRSR, each chip's actual gain readbacks, native fixed legacy DATA, raw QoS/CCMP and Open/WPA2 DHCP/IP composition implemented. Base N21S/N22Cv2 alone retain CCK1; full AC/TID scheduling remains work |
+| C21/C22 legacy12 DATA/WMM BE-TID0 | Separate N21L/N22L exact-chip identities/current signed measurements and host-policy gates; bound response rates/parameters, source EDCA/RA/RRSR, each chip's actual gain readbacks, native fixed legacy DATA, raw QoS/CCMP and Open/WPA2 DHCP/IP composition implemented. Base N21S/N22Cv2 alone retain CCK1; full AC/TID scheduling is the separate N2xQ program |
 | C21/C22 HT20/one stream/SGI20 | Distinct N21H/N22H static measured contracts/current source gates; source-native absolute/reference-difference MCS gains, typed original offer/request/response, actual RA/TXD/RXD, authenticated whole3839-byte A-MSDU, native ADDBA-decline/CCX and Open/WPA2 DHCP/IP. Real assets/physical acceptance remain external; richer PHY remains work |
 | C21/C22 recipient RX BA | Distinct exact-H N21R/N22R contract; actual bound ADDBA success/CCX/idle, explicit SSN, TIDs0..7/window<=64 with A-MSDU permission, source RAW/PHY admission, opaque originals before CCMP/PN, BAR20/DELBA/hole/TU timers and key/publication epochs implemented; native tests passed the coordinated x86_64/aarch64 software suites. Real measured assets/automatic BA/over-air acceptance remain external |
 | C21/C22 originator TX BA | Distinct exact-H or R-over-H N21T/N22T contract; bound on-air request/response/current SSN, genuine CCX/RX-idle/MAC-FIFO proof, four independent native DMA originals, source AGGEN/density/MAXAGG and per-MPDU status, current-SSN BAR20/DELBA/key drains implemented; native tests passed the coordinated x86_64/aarch64 software suites. Measured assets/real MAC aggregation and over-air behavior remain external |
 | C21/C22 RTS threshold | Separate N21X/N22X over exact current H/R/T; native24Mbps RTS descriptor/control program, actual response-rate admission, drained current-authority setting, CCX/immutable-DMA/FIFO completion and EAPOL exclusion implemented. Twelve native cases pass on both architectures; real measured X assets/RTS-CTS/physical acceptance remain external |
+| C21/C22 HT TX coding (LDPC/STBC) | N2xC continuation: base RX STBC1 (+C22 RX LDPC) advertisement, qualified TX LDPC (both) / TX STBC (C22) intersected with the peer, W5 bit7/bits9:8, RA_INFO bit26, revocation downgrade. Real N2xC measurement external |
+| C21/C22 all-AC WMM / all-TID QoS | N2xQ continuation: cfg80211_classify8021d + ACM downgrade, BK/VI/VO/BE rings with QSEL=TID, any-TID RX, revocation to BE/TID0. Real N2xQ measurement external |
+| Generic continuation contract + dm watchdog | Reusable signed N2x<tag> loader; N2xD rtw_watch_dog_work/rtw_phy_dynamic_mechanism port: DIG/CCK-PD/RA on both chips, path diversity/CFO/thermal power tracking/EDCCA on C22; base restore on revocation. Real N2xD measurement external; no DPK tracking |
 | Port0 peer/AID/media/RA/default-port control | Implemented bounded source mailbox, long-slot initial MLME, same-owner station integration and close/cancel behavior |
-| Passive scan, authentication/association, WPA2 controlled port | Retained channel1 shared MLME/RSNA/CCMP through actual native DMA and CCX, including held/altered/cancelled M4 and queued peer-loss closure |
+| Passive/active channel1 scan with probe IEs, authentication/association, WPA2 controlled port | Retained channel1 shared MLME/RSNA/CCMP through actual native DMA and CCX, including held/altered/cancelled M4 and queued peer-loss closure |
 | Native management/data TX, RX, completion and ring ownership | Implemented original rings, source descriptors, exact DMA plus CCX security receipt and current-authority publication |
 | Device/frame/kernel IP integration | One shell before activation, same Arc lifecycle, bounded synchronous progress; Open/WPA2 real kernel DHCP and exact bidirectional IP pass composed model tests |
 | Reset/suspend/removal, retained-map reclamation and multi-device lifetime | Outside the one-shot awake profile; published mappings remain retained |
@@ -1446,7 +1749,7 @@ Per-chip hardware backlog follows original `rtw8821c.c`, `rtw8822b.c` and
 `rtw8822c.c` chip-info/ops. C21 is1SS and C22B/C22C are2SS; all declare2.4/5GHz,
 HT and VHT. A separately qualified HT20/1SS/SGI20/A-MSDU station subset now has
 a complete software path on C21/C22C. Broader HT streams and widths, VHT,
-Broader TX aggregation and recipient negotiation, full WMM AC/TID scheduling, noninitial channels/active scan,
+Broader TX aggregation and recipient negotiation, noninitial channels (channel1 active scan is implemented),
 RF tracking, coexistence, sleep/WoW and controller-proven reset/rejoin. C22B needs
 retained firmware, MAC/PHY/RF/power and packet composition. C21/C22C supply
 separate qualified legacy station chains. None of these initial-profile exclusions are hardware
@@ -1519,3 +1822,64 @@ calibration epoch between descriptor write and doorbell, remove current power
 policy and serialize disconnect against synchronous workers. Administrative
 IFF_UP remains independent of physical carrier. These are software/model
 results; no fixture creates deployable board measurements or physical evidence.
+
+### Upstream applicability triage (2026-10-27)
+
+This subsection resolves the former `unknown` inventory rows against Linux
+v6.12 `rtw88/{main.c,mac80211.c,tx.c,phy.c,rtw8821c.c,rtw8822b.c,rtw8822c.c}`.
+It records applicability only; nothing below is implemented by this change.
+
+Inapplicable on upstream rtw88 (rows removed):
+
+| Former row | Evidence |
+|---|---|
+| `checksum_offload_applicability` | `main.c::rtw_register_hw` assigns no `hw->netdev_features`; `tx.c::rtw_tx_fill_tx_desc` has no checksum descriptor field. Host checksums remain authoritative. |
+| `tso_offload_applicability` | Same: no `NETIF_F_TSO*` and no segmentation descriptor; mac80211 delivers single MSDUs/A-MSDUs. |
+| `vlan_offload_applicability` | Same: no VLAN insertion/stripping field or netdev feature. |
+| `greenfield_applicability` | `main.c::rtw_init_ht_cap` never sets `IEEE80211_HT_CAP_GRN_FLD` on any chip. |
+| `ht_control_scope` (HT +HTC) | `rtw_init_ht_cap` advertises no HT-control capability. VHT +HTC (`IEEE80211_VHT_CAP_HTC_VHT` in `rtw_init_vht_cap`) belongs to the `vht` row. |
+| `cts_to_self` | `tx.c` maps only `info->control.use_rts` or `len > rts_threshold` to `W3_USE_RTS`/RTS24M; neither `tx.c` nor `mac80211.c` reads `use_cts_prot` or programs a CTS-to-self descriptor bit. The implemented RTS threshold is the complete upstream protection mechanism. |
+
+Resolved into named feature rows (applicability proven, work remains):
+
+| Former row | Named rows and evidence |
+|---|---|
+| `additional_ht_widths` | `ht40`: `rtw_init_ht_cap` adds `SUP_WIDTH_20_40`, `DSSSCCK40` and `SGI_40` when EFUSE `hw_cap.bw` has 40MHz (all three chips). VHT80 stays in `vht`. |
+| `broader_ba_variants` | `tx_ba_all_tids`: `tx.c::rtw_txq_check_agg` requests originator BA for every non-VO TID (never EAPOL). `tx_amsdu_5ghz`: `TX_AMSDU`/`SUPPORTS_AMSDU_IN_AMPDU` with `rtw_ops_can_aggregate_in_amsdu` declining only on 2.4GHz. Recipient negotiation is mac80211-owned (`RX_START`/`RX_STOP` are driver no-ops) and already covered by the R contract. |
+| `dynamic_phy_thermal_scope` | `phy.c::rtw_phy_dynamic_mechanism` runs statistics, `dig_tracking` (all chips), `cck_pd_tracking` (C21/C22C `cck_pd_set`, 2.4GHz only), `ra_tracking` (firmware RA info and RRSR update), `tx_path_diversity` (C22C `path_div_supported`), `cfo_tracking` and `dpk_tracking` (C22C only), `rf_power_tracking` (all chips, existing row) and `edcca_adaptivity` (C22B/C22C `adaptivity`, or firmware `FW_FEATURE_ADAPTIVITY`). |
+| `ldpc_applicability` | `ldpc`: `rx_ldpc = true` on 8822B/8822C (false on 8821C) gates HT `LDPC_CODING` and VHT `RXLDPC`; TX sets `W5_DATA_LDPC` from the peer's `si->ldpc_en`. |
+| `stbc_applicability` | `stbc`: one-stream RX STBC is advertised on every chip (HT `RX_STBC`=1, VHT `RXSTBC_1`); HT TX STBC only with `tx_stbc` (8822C) and VHT `TXSTBC` when `rf_path_num > 1`; `W5_DATA_STBC` is forced off while `hal.txrx_1ss`. |
+| `smps_scope` | `smps_txrx_1ss`: only 8822C has `config_txrx_mode`; `main.c::rtw_vif_smps_iter` requests static SMPS while coexistence forces 1SS and SMPS off otherwise. No `NL80211_FEATURE_{STATIC,DYNAMIC}_SMPS` is set, so user-driven local SMPS is inapplicable. |
+
+Refined feature rows: `wow` applies to RTL8822CE only (`wow_fw_name`/
+`wowlan_stub` exist only in `rtw8822c.c`; 8821C/8822B declare neither).
+`ht_protection_modes`: upstream reads no `ht_operation_mode` and takes no
+protection action, so the remaining work is admitting APs that advertise
+nonzero HT protection in the shared HT JoinPlan instead of refusing them.
+
+### Open rtw88 ledger rows (2026-10-28)
+
+Each row below was checked against the tree after the N2xC/N2xQ/random-MAC
+changes. None is a physical blocker unless stated.
+
+| Row | Blocker |
+|---|---|
+| `additional_operating_channels` | `station.rs::associate` refuses `candidate.bss.channel != 1` and `scan.rs::plan` admits 2412 MHz only. The C21/C22 radio programs (`radio.rs`, `radio8821c.rs`) write fixed channel1 RF/BB/TXAGC values. Needs ports of `rtw8822c_set_channel`/`rtw8821c_set_channel` plus a per-channel measured envelope. |
+| `beamforming` | Linux `bf.c::rtw_bf_assoc` acts only on a VHT peer (`vht_cap` SU beamformer/beamformee), so this is blocked on `vht`. |
+| `dpk_tracking` | `rtw8822c_dpk_track` needs a DPK result, and no `rtw8822c_do_dpk` calibration is ported (§3 dm section). |
+| `five_ghz_operation` | The same fixed channel1 programs, plus `scan.rs` 2412-only admission. Needs 5 GHz RF/BB/AGC table selection and a measured 5 GHz envelope. |
+| `ht40` | `station.rs` refuses any offered/negotiated width other than `Width::Twenty`, and the radio programs only BW20. Needs `rtw8822c_set_channel_bb` BW40 and DSSS/CCK40 programming, plus SGI40 in the measured HT gate. |
+| `multi_device` | Not attempted. Each `Rtw88Device` owns one retained lifecycle, and there is no multi-instance composition test. |
+| `multi_stream_ht` | `ht.rs::local` advertises and transmits MCS0..7 only, and `ht.rs::program` writes one-stream TXAGC words. 2SS TXAGC/RA mask programming and a measured 2SS envelope are missing. |
+| `operating_reset` | No `rtw_core_stop`/`rtw_core_start` generation reset over a retained owner. `dma_stop.rs` now proves a stopped owner idle and releases it, and `Lifecycle::remove` tears one down, but the lifecycle is one-shot. Its `started` latch, the `pci_firmware::allocate` cold-power precondition (`power::power_on` card-disable to enable runs only in `pci::bring_up`) and the interface `Admission`, which never reopens after `close`, all forbid re-running power-on, firmware download, MAC/PHY/radio and station start on the same function and shell. Needs a generation counter across `Lifecycle`/`Firmware`/`Sibling`/`interface::Device`, a re-entrant cold-power path and admission reopen, plus re-qualification of every continuation against the new generation (patterns: ath9k `reset_owner`, iwlwifi `Owner::recover`). |
+| `radio_coexistence` | No `coex.c` state machine (BT scoreboard, TDMA tables, `rtw_coex_*` notifications) is ported. |
+| `rf_power_tracking` | `dm.rs` admits `PWR_TRACK` only on C22 (`C21_MECHANISMS` = DIG/CCK-PD/RA). The `rtw8821c_pwr_track` TXAGC/txscale port is missing. |
+| `rtl8822be` | The firmware loader and every retained stage reject `10ec:b822`. RTL8822B firmware/MAC/PHY/RF tables are not ported. |
+| `runtime_sleep` | No `ps.c` port. LPS needs `H2C_CMD_SET_PWR_MODE` (0x20) in an LPS mode plus the `rtw_leave_lps_core` path; `station_control.rs` only ever sends the ACTIVE/awake form. IPS (`rtw_enter_ips` = `rtw_core_stop` + `rtw_hci_link_ps`, `rtw_leave_ips` = `rtw_ips_pwr_up`) is a full stop/start, so it is blocked on `operating_reset`. |
+| `safe_rejoin` | Rejoin after a terminal disconnect needs a fresh owner generation (§3: one-shot station, closed `Admission`). It is blocked on `operating_reset`; `narf_net::iface::retire_for_rebind`/`rebind_name` now exist for keeping the `wlan` name across generations. |
+| `smps_txrx_1ss` | Driven only by coexistence (`rtw_vif_smps_iter` on `hal.txrx_1ss`), so blocked on `radio_coexistence`. |
+| `system_suspend` | Linux `rtw_pci_suspend`/`resume` only toggle the CLKREQ pad (8822C RFE 6); the stack stops the radio through mac80211 (`rtw_ops_stop` → `rtw_core_stop`) and restarts it (`rtw_ops_start` → `rtw_core_start`: power-on, firmware download, MAC/PHY init). The DMA-stop proof now covers the stop half, but the resume half is exactly the missing generation reset, so this is blocked on `operating_reset`. |
+| `tx_amsdu_5ghz` | Blocked on `five_ghz_operation`. |
+| `tx_ba_all_tids` | `tx_ba.rs::Originator` holds one TID0 dialog and builds TID0 ADDBA/BAR/DELBA; `station.rs` aggregates and assigns BA sequence numbers only for `tid == 0`; `packet_core/batch.rs` publishes bursts only on `Queue::Data` (BE, host index slot 1); and the signed N2xT identity in `tx_ba_power.rs` is bound to `"originator HT20 BE/TID0 BA/burst v1"`. Per-TID agreements need a per-TID originator table, BK/VI/VO burst publication, and a new or extended signed burst envelope covering those rings. |
+| `vht` | The HT station builds `LocalPhy::ht20` only, and VHT80 needs ht40 channel/BW80 programming first; blocked on `ht40`. |
+| `wow` | No `rtw8822c` wowlan firmware swap (`wow_fw_name`) or `wow.c` pattern/RF-kill programming is ported. |

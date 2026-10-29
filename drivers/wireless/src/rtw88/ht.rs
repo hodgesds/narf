@@ -44,11 +44,13 @@ impl Facts {
         // Source chips implement HT; the actual report may only narrow paths.
         // The initial implementation owns a single stream even on C22 RX-AB.
         (self.hardware.antennas != 0 && self.hardware.streams != 0 && self.hardware.protocol == 3)
-            .then(|| local(255, true))
+            .then(|| local(255, true, 0, 0))
             .flatten()
     }
 }
-fn local(tx: u8, sgi: bool) -> Option<LocalPhy> {
+/// `did`/`coding` select the RX/TX coding of `main.c::rtw_init_ht_cap`;
+/// did 0 (beacon observation only) advertises no coding.
+fn local(tx: u8, sgi: bool, did: u16, coding: u8) -> Option<LocalPhy> {
     let mut rx = [0; 10];
     rx[0] = 255;
     let mut transmit = [0; 10];
@@ -66,6 +68,14 @@ fn local(tx: u8, sgi: bool) -> Option<LocalPhy> {
         0,
         4,
     )
+    .map(|h| {
+        h.with_ldpc(
+            super::coding::rx_ldpc(did),
+            coding & super::coding::LDPC != 0,
+        )
+        .with_rx_stbc(did != 0)
+        .with_tx_stbc(coding & super::coding::STBC != 0)
+    })
     .and_then(|h| h.with_tx_selection(transmit))
     .ok()
     .and_then(|h| LocalPhy::ht20(h).ok())
@@ -257,7 +267,11 @@ impl Grant {
         Ok(g)
     }
     pub(super) fn local(&self) -> LocalPhy {
-        local(self.mcs, self.sgi).expect("validated native HT facts")
+        self.local_coded(0)
+    }
+    /// Base RX coding plus the separately qualified N2xC TX `coding` flags.
+    pub(super) fn local_coded(&self, coding: u8) -> LocalPhy {
+        local(self.mcs, self.sgi, self.base.did(), coding).expect("validated native HT facts")
     }
     pub(super) fn profile(&self, rates: u16, mcs: u8, sgi: bool) -> Result<DataProfile, Error> {
         let p = DataProfile {
@@ -265,6 +279,10 @@ impl Grant {
             qos: true,
             mcs,
             sgi,
+            ldpc: false,
+            stbc: false,
+            acs: 0,
+            fallback: false,
         };
         if !self.allows(p) {
             return Err(Error::Unsupported);
@@ -272,8 +290,11 @@ impl Grant {
         Ok(p)
     }
     pub(super) fn allows(&self, p: DataProfile) -> bool {
+        // TX coding is admitted separately by the bound N2xC continuation.
         p.valid()
             && p.qos
+            && !p.ldpc
+            && !p.stbc
             && p.rates & !self.base.rates() == 0
             && p.mcs != 0
             && p.mcs & !self.mcs == 0

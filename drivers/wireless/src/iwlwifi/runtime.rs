@@ -549,6 +549,10 @@ impl super::gen2_prepare::Io for Gen2PrepareIo<'_> {
     }
 }
 
+/// A validated terminal TX_CMD response without acknowledgement. The frame
+/// and its DMA are already retired; only the peer's receipt is absent.
+pub const TX_FAILED: &str = "frame transmission failed";
+
 pub struct Hardware {
     mmio: super::IwlMmioImpl,
     resources: core::mem::ManuallyDrop<Resources>,
@@ -564,6 +568,10 @@ pub struct Hardware {
     armed: bool,
     failed: bool,
     station_stop: Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>,
+    /// Protected MPDUs published to data/management queues. Each consumes
+    /// at most one fresh firmware TX PN (retries reuse it), so differences
+    /// bound the PN range a pairwise key can have used.
+    protected_tx: u64,
     rx_epoch: rx_epoch::State,
     sources: Option<source::Assets>,
 }
@@ -660,6 +668,7 @@ impl Hardware {
             armed: false,
             failed: false,
             station_stop: None,
+            protected_tx: 0,
             rx_epoch: rx_epoch::State::default(),
             sources: None,
         })
@@ -1167,7 +1176,7 @@ impl Hardware {
     pub(super) async fn transmit_gen2_batch(
         &mut self,
         id: u16,
-        frames: &[Vec<u8>],
+        frames: &[(Vec<u8>, u32)],
     ) -> Result<(), &'static str> {
         if frames.is_empty()
             || frames.len() > 8
@@ -1181,7 +1190,7 @@ impl Hardware {
             return Err("invalid Gen2 aggregate batch owner");
         }
         self.tx_completed.retain(|entry| entry.0 != id);
-        for frame in frames {
+        for (frame, assist) in frames {
             if self
                 .station_stop
                 .as_ref()
@@ -1189,7 +1198,7 @@ impl Hardware {
             {
                 return Err("MVM batch closed before native publication");
             }
-            self.enqueue_transmit(id, frame, 26, None)?;
+            self.enqueue_transmit_assisted(id, frame, 26, None, *assist)?;
         }
         let deadline = narf_time::Deadline::after_ms(2000);
         loop {
@@ -1266,6 +1275,27 @@ impl Hardware {
         Ok(())
     }
 
+    /// Bz and later hardware include the SNAP header in the RX
+    /// `CHECKSUM_COMPLETE` raw sum (`iwl_mvm_create_skb`); AX210 does not.
+    pub(super) fn rx_checksum_includes_snap(&self) -> Option<bool> {
+        match self.format {
+            rx_rfh::CompletionFormat::Qu => None,
+            rx_rfh::CompletionFormat::Ax210 => Some(false),
+            rx_rfh::CompletionFormat::Bz => Some(true),
+        }
+    }
+
+    fn count_protected(&mut self, frame: &[u8]) {
+        if frame.get(1).is_some_and(|fc| fc & 0x40 != 0) {
+            self.protected_tx = self.protected_tx.saturating_add(1);
+        }
+    }
+
+    /// Monotonic count of published protected MPDUs (see `protected_tx`).
+    pub(super) fn protected_transmits(&self) -> u64 {
+        self.protected_tx
+    }
+
     pub fn fail(&mut self) {
         self.failed = true;
         self.rx_epoch.deny();
@@ -1277,6 +1307,47 @@ impl Hardware {
     /// Reinitialize after a cancelled control operation or firmware
     /// failure. Old allocations are freed only after DMA stop and BME
     /// disable, exactly as on final teardown.
+    /// System-suspend transport stop, following Linux
+    /// `pcie/gen1_2/trans-gen2.c::_iwl_trans_pcie_gen2_stop_device`:
+    /// mask interrupts, stop the bus master and wait for its acknowledgement
+    /// (`iwl_pcie_apm_stop_master`), software-reset the NIC
+    /// (`iwl_trans_pcie_sw_reset`) and clear PCI bus mastering. Allocations
+    /// are retained (DMA is provably stopped) until the resume restart
+    /// replaces them, or final teardown frees them.
+    pub async fn stop_for_suspend(&mut self) -> Result<(), &'static str> {
+        self.fail();
+        if let Some(interrupts) = &mut self.interrupts {
+            interrupts.mask();
+        }
+        self.mmio.write(super::regs::CSR_INT_MASK, 0);
+        let bz = self.format == rx_rfh::CompletionFormat::Bz;
+        if self.armed {
+            let (register, request, done) = if bz {
+                (super::regs::CSR_GP_CNTRL, 1 << 29, 1 << 28)
+            } else {
+                (super::regs::CSR_RESET, 1 << 9, 1 << 8)
+            };
+            let value = self.mmio.read(register);
+            self.mmio.write(register, value | request);
+            self.poll_register(register, done, done, 100).await?;
+        }
+        // CSR_GP_CNTRL_REG_FLAG_SW_RESET (bit 31) on Bz+, else
+        // CSR_RESET_REG_FLAG_SW_RESET (bit 7).
+        let (register, reset) = if bz {
+            (super::regs::CSR_GP_CNTRL, 1 << 31)
+        } else {
+            (super::regs::CSR_RESET, 1 << 7)
+        };
+        let value = self.mmio.read(register);
+        self.mmio.write(register, value | reset);
+        super::mmio::set_master(&self.device, &self.cap, false)?;
+        self.armed = false;
+        self.notifications.clear();
+        self.responses.clear();
+        self.tx_completed.clear();
+        Ok(())
+    }
+
     pub async fn restart(&mut self, parsed: &ParsedUcode<'_>) -> Result<[u8; 6], &'static str> {
         self.fail();
         if let Some(interrupts) = &mut self.interrupts {
@@ -1384,6 +1455,17 @@ impl Hardware {
         header_len: usize,
         rate: Option<u32>,
     ) -> Result<(), &'static str> {
+        self.enqueue_transmit_assisted(id, frame, header_len, rate, 0)
+    }
+
+    pub fn enqueue_transmit_assisted(
+        &mut self,
+        id: u16,
+        frame: &[u8],
+        header_len: usize,
+        rate: Option<u32>,
+        assist: u32,
+    ) -> Result<(), &'static str> {
         if self.failed {
             return Err("Wi-Fi transport failed");
         }
@@ -1394,7 +1476,8 @@ impl Hardware {
             .iter_mut()
             .find(|q| q.id() == Some(id))
             .ok_or("unknown TX queue")?;
-        sources.invoke(|| queue.send(&mut self.mmio, frame, header_len, rate))?;
+        sources.invoke(|| queue.send_assisted(&mut self.mmio, frame, header_len, rate, assist))?;
+        self.count_protected(frame);
         Ok(())
     }
 
@@ -1447,11 +1530,53 @@ impl Hardware {
         header_len: usize,
         rate: Option<u32>,
     ) -> Result<(), &'static str> {
+        self.transmit_owned(id, frame, header_len, rate, false, 0)
+            .await
+    }
+
+    /// Data transmission with checksum `offload_assist` bits prepared by
+    /// [`super::csum::prepare_tx`].
+    pub async fn transmit_assisted(
+        &mut self,
+        id: u16,
+        frame: &[u8],
+        header_len: usize,
+        rate: Option<u32>,
+        assist: u32,
+    ) -> Result<(), &'static str> {
+        self.transmit_owned(id, frame, header_len, rate, false, assist)
+            .await
+    }
+
+    /// The close owner's own final management frame (Linux mac80211
+    /// `ieee80211_set_disassoc(tx=true)`). Host stop forbids every other
+    /// publication; it cannot forbid the frame which implements that stop.
+    pub async fn transmit_closing(
+        &mut self,
+        id: u16,
+        frame: &[u8],
+        header_len: usize,
+        rate: Option<u32>,
+    ) -> Result<(), &'static str> {
+        self.transmit_owned(id, frame, header_len, rate, true, 0)
+            .await
+    }
+
+    async fn transmit_owned(
+        &mut self,
+        id: u16,
+        frame: &[u8],
+        header_len: usize,
+        rate: Option<u32>,
+        closing: bool,
+        assist: u32,
+    ) -> Result<(), &'static str> {
         self.wait_tx_space(id).await?;
-        if self
-            .station_stop
-            .as_ref()
-            .is_some_and(|stop| stop.load(Ordering::Acquire))
+        if !closing
+            && self
+                .station_stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(Ordering::Acquire))
         {
             return Err("MVM station closed before native packet publication");
         }
@@ -1462,7 +1587,9 @@ impl Hardware {
             .iter_mut()
             .find(|q| q.id() == Some(id))
             .ok_or("unknown TX queue")?;
-        let ssn = sources.invoke(|| queue.send(&mut self.mmio, frame, header_len, rate))?;
+        let ssn = sources
+            .invoke(|| queue.send_assisted(&mut self.mmio, frame, header_len, rate, assist))?;
+        self.count_protected(frame);
         let deadline = narf_time::Deadline::after_ms(2000);
         loop {
             let activity = self.activity();
@@ -1475,7 +1602,7 @@ impl Hardware {
                 return if self.tx_completed.remove(index).unwrap().2 {
                     Ok(())
                 } else {
-                    Err("frame transmission failed")
+                    Err(TX_FAILED)
                 };
             }
             // A compressed BA cumulatively retires successful frames. A

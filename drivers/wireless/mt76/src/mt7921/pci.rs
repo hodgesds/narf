@@ -21,7 +21,7 @@
 #![allow(dead_code)]
 
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use narf_bus::{map_bar_control, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
@@ -116,6 +116,26 @@ static CONTROLLER: IrqSafeSpinLock<Option<Mt7921Device>> = IrqSafeSpinLock::new(
 static FIRMWARE_BINDING: IrqSafeSpinLock<Option<(BusDevice, Cap<BusDeviceCap, Write>)>> =
     IrqSafeSpinLock::new(None);
 static TRANSPORT_CLAIMED: AtomicBool = AtomicBool::new(false);
+/// Binding generation (Linux: one `mt792x_dev` per `pci_dev` probe). Every
+/// probe and removal advances it; a transport carries the generation it was
+/// claimed under, and a stale one can never be republished as the owner.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Generation whose transport still holds `TRANSPORT_CLAIMED`.
+static CLAIM_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Current binding generation; odd while a function is bound.
+pub(super) fn generation() -> u64 {
+    GENERATION.load(Ordering::Acquire)
+}
+
+/// A retired transport of `generation` returns its claim. A claim already
+/// held by a newer generation is untouched.
+pub(super) fn release_transport_claim(generation: u64) {
+    let _controller = CONTROLLER.lock();
+    if CLAIM_GENERATION.load(Ordering::Acquire) == generation {
+        TRANSPORT_CLAIMED.store(false, Ordering::Release);
+    }
+}
 
 /// Register the PCI match table. One entry per supported device id —
 /// names must be unique (the bus match registry is keyed by `name`)
@@ -130,6 +150,7 @@ pub fn register_pci_driver() {
             },
             probe,
         });
+        narf_bus::register_pci_remove(name_for(did), remove);
     }
     // Also register the ITTIM-vendor MT7922 SKU. Linux's table
     // includes `{ PCI_DEVICE(PCI_VENDOR_ID_ITTIM, 0x7922), ... }` at
@@ -142,6 +163,52 @@ pub fn register_pci_driver() {
         },
         probe,
     });
+    narf_bus::register_pci_remove("mt7921-ittim-7922", remove);
+}
+
+/// Bus detach hook (Linux `mt7921_pci_remove` → `mt7921e_unregister_device`):
+/// withdraw the interface, stop and retire the retained transport (or keep
+/// its uncertain DMA forever), end the binding generation and stop PCI
+/// decoding. Synchronous and never awaits: the caller context is unknown.
+fn remove(device: BusDevice, cap: Cap<BusDeviceCap, Write>) {
+    let bound = FIRMWARE_BINDING
+        .lock()
+        .as_ref()
+        .is_some_and(|(bound, _)| bound.addr == device.addr);
+    if !bound {
+        return;
+    }
+    // Close discovery first: no claim or probe of this generation may race
+    // the teardown, and every stale owner now fails its generation check.
+    let retired_generation = {
+        let mut controller = CONTROLLER.lock();
+        *FIRMWARE_BINDING.lock() = None;
+        *controller = None;
+        GENERATION.fetch_add(1, Ordering::AcqRel)
+    };
+    crate::iface::remove_scan_iface();
+    let retired = super::firmware_transport::retire_for_removal(retired_generation);
+    let _ = invoke(&cap, || {
+        use narf_bus::pci::cmd;
+        // Bus mastering always stops; memory decoding only after the
+        // transport proved its DMA retired (or never existed).
+        let bits = if retired {
+            cmd::BUS_MASTER | cmd::MEM_SPACE
+        } else {
+            cmd::BUS_MASTER
+        };
+        narf_bus::pci::clear_command(&cap, &device, bits)
+    });
+    if retired {
+        release_transport_claim(retired_generation);
+    }
+    let _ = writeln!(
+        narf_console::Writer,
+        "  mt7921: removed {:04x}:{:04x} (generation {retired_generation}, transport {})",
+        device.id.vendor,
+        device.id.device,
+        if retired { "retired" } else { "retained" },
+    );
 }
 
 /// PCI probe entry. Called by the bus dispatch layer when one of our
@@ -223,9 +290,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     let did = dev.effective_did;
     {
+        let mut controller = CONTROLLER.lock();
         *FIRMWARE_BINDING.lock() = Some((device, cap));
+        *controller = Some(dev);
+        GENERATION.fetch_add(1, Ordering::AcqRel);
     }
-    *CONTROLLER.lock() = Some(dev);
+    // A reprobe after the boot-time firmware initcall starts provisioning
+    // itself (Linux queues mt7921_init_work from every probe).
+    super::firmware_transport::provision_after_reprobe();
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(did)),
@@ -440,10 +512,14 @@ pub(super) fn claim_firmware_transport(
     if TRANSPORT_CLAIMED.load(Ordering::Acquire) {
         return Err(Error::Busy);
     }
-    let (mmio, did) = {
+    let (mmio, did, generation) = {
         let guard = CONTROLLER.lock();
         let controller = guard.as_ref().ok_or(Error::Busy)?;
-        (controller.mmio_bar0, controller.effective_did)
+        (
+            controller.mmio_bar0,
+            controller.effective_did,
+            self::generation(),
+        )
     };
     let registry = narf_firmware::trusted_loader_authority()
         .ok_or(Error::Authority)?
@@ -453,19 +529,25 @@ pub(super) fn claim_firmware_transport(
     {
         // Match with_controller's lock so a reader which observed an earlier
         // unclaimed value cannot enter after the runtime handoff.
-        let _controller = CONTROLLER.lock();
+        let controller = CONTROLLER.lock();
+        // The binding may have been removed (and reprobed) since the
+        // snapshot: never claim a transport for a retired generation.
+        if controller.is_none() || self::generation() != generation {
+            return Err(Error::DeviceGone);
+        }
         TRANSPORT_CLAIMED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| Error::Busy)?;
+        CLAIM_GENERATION.store(generation, Ordering::Release);
     }
     // SAFETY: the boot provisioning mutex and owner/work locks serialize this
     // handoff with later provisioning callers. Discovery has parked BME; no
     // transport has been claimed and no MT76 rings have been published.
-    let transport = unsafe { Transport::new(mmio, device, authority, firmware) };
+    let transport = unsafe { Transport::new(mmio, device, authority, firmware, generation) };
     if transport.is_err() {
         // Construction only validates/read-checks and allocates unpublished
         // rings. No hardware references exist, so discovery may be retried.
-        TRANSPORT_CLAIMED.store(false, Ordering::Release);
+        release_transport_claim(generation);
     }
     transport.map(Some)
 }
@@ -479,4 +561,22 @@ pub fn __reset_for_test() {
         *FIRMWARE_BINDING.lock() = None;
     }
     TRANSPORT_CLAIMED.store(false, Ordering::Release);
+    CLAIM_GENERATION.store(0, Ordering::Release);
+}
+
+/// Test-only swap of the claim/generation state; returns the previous
+/// `(claimed, claim_generation, generation)` so a smoke can restore it.
+#[cfg(any(test, feature = "builtin"))]
+pub(super) fn __swap_claim_for_test(state: (bool, u64, u64)) -> (bool, u64, u64) {
+    let _controller = CONTROLLER.lock();
+    (
+        TRANSPORT_CLAIMED.swap(state.0, Ordering::AcqRel),
+        CLAIM_GENERATION.swap(state.1, Ordering::AcqRel),
+        GENERATION.swap(state.2, Ordering::AcqRel),
+    )
+}
+
+#[cfg(any(test, feature = "builtin"))]
+pub(super) fn __claimed_for_test() -> bool {
+    TRANSPORT_CLAIMED.load(Ordering::Acquire)
 }

@@ -34,6 +34,14 @@ mod lifetime_tests;
 mod mfp_tests;
 #[path = "optional_mfp_tests.rs"]
 mod optional_mfp_tests;
+#[path = "pmksa_tests.rs"]
+mod pmksa_tests;
+#[path = "probe_ies_tests.rs"]
+mod probe_ies_tests;
+#[path = "telemetry_tests.rs"]
+mod telemetry_tests;
+#[path = "wmm_tests.rs"]
+mod wmm_tests;
 
 const OWN: [u8; 6] = [2, 6, 7, 8, 9, 10];
 const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];
@@ -247,6 +255,8 @@ impl Harness {
         let channels = station.channels.iter().map(|&ch| u32::from(ch)).collect();
         let supplicant = station.supplicant;
         let mfp_supported = station.supports_management_protection();
+        let sae_offload = station.supports_sae_offload();
+        let telemetry = Arc::new(crate::cyw43439::telemetry::Counters::default());
         let ht_capabilities = station.ht_capabilities();
         let vht_capabilities = station.vht_capabilities();
         let (rx, rx_consumer) = narf_ipc::channel();
@@ -258,23 +268,30 @@ impl Harness {
                 rx,
                 tx,
                 pending: None,
+                telemetry: telemetry.clone(),
             }),
             name: name.clone(),
             mac: OWN,
             channels,
             supplicant,
             mfp_supported,
+            sae_offload,
+            external_ops: narf_lib::sync::IrqSafeSpinLock::new(Default::default()),
+            telemetry,
+            pmksa: IrqSafeSpinLock::new(Default::default()),
             ht_capabilities,
             vht_capabilities,
             up: AtomicBool::new(false),
             power_save: AtomicU8::new(0),
             bssid: AtomicU64::new(0),
+            roaming: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
             closing: AtomicBool::new(false),
             publication: IrqSafeSpinLock::new(()),
             receive_hook: IrqSafeSpinLock::new(None),
             rx: IrqSafeSpinLock::new(Some(rx_consumer)),
             tx: IrqSafeSpinLock::new(Some(tx_producer)),
+            lifecycle: Default::default(),
         });
         *ACTIVE_TEST.lock() = Some(device.clone());
         narf_net::iface::set_link_state(&name, true); // operator IFF_UP

@@ -155,6 +155,15 @@ impl Owner {
         );
         self.mac = Some(mac);
         self.nvm = Some(nvm);
+        // Private RAM fixtures share one MAC and must not leak key history
+        // into each other; native owners adopt their radio's ledger.
+        #[cfg(any(test, feature = "kernel-test"))]
+        let adopt = !super::runtime::model::is_model(&self.hardware);
+        #[cfg(not(any(test, feature = "kernel-test")))]
+        let adopt = true;
+        if adopt {
+            self.security.adopt_ledger(mac);
+        }
         self.phase = Phase::Configured;
         Ok(())
     }
@@ -176,8 +185,11 @@ fn configuration(profile: Profile) -> Configuration {
         } else {
             0
         }) | match profile.ltr_delay_us {
+            // fw/api/system.h SOC_FLAGS_LTR_APPLY_DELAY_{200,2500,1820}
+            // in bits 2..3 (fw/init.c::iwl_set_soc_latency).
             200 => 4,
             2500 => 8,
+            1820 => 12,
             _ => 0,
         }
     };
@@ -207,10 +219,13 @@ mod amsdu;
 mod ba;
 #[path = "mvm_phy.rs"]
 mod phy;
+pub(super) use phy::local_ht;
 #[path = "mvm_power.rs"]
 mod power;
 pub type PowerRequest = power::PowerRequest;
 pub type PowerStatus = power::PowerStatus;
+#[cfg(any(test, feature = "kernel-test"))]
+pub(super) use power::feature as feature_bits;
 pub(super) use power::Emission as PowerEmission;
 
 #[path = "mvm_link.rs"]
@@ -230,7 +245,13 @@ pub type AssociationSecurity = narf_wireless::association::SecurityMode;
 mod data;
 pub type LegacyDataStatus = data::LegacyDataStatus;
 pub type LegacyReceive = data::LegacyReceive;
+#[cfg(any(test, feature = "kernel-test"))]
+pub(super) mod data_priority {
+    pub(in crate::iwlwifi) use super::data::{admitted_priority, user_priority};
+}
 
+#[path = "mvm_pmf.rs"]
+mod pmf;
 #[path = "mvm_security.rs"]
 mod rsna;
 pub(super) type PowerFence = power::Fence;
@@ -241,3 +262,4 @@ pub(super) fn passive_channel(domain: &narf_wireless::reg::RegulatoryDomain, cha
 mod station;
 #[cfg(any(test, feature = "kernel-test"))]
 pub(super) use rsna::tests::Device as SecurityModel;
+pub(in crate::iwlwifi) use station::Credential;

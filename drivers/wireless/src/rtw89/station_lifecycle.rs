@@ -73,13 +73,56 @@ impl<I: Io> Owner<I> {
     ) -> Option<alloc::vec::Vec<u8>> {
         self.station.as_ref()?.information_elements(peer)
     }
+    /// One worker pass: recognize interrupts (when armed), drain RPQ/RXQ
+    /// through the station, then re-enable the mask (`rtw89_pci_napi_poll`).
     pub(super) fn station_poll(
         &mut self,
     ) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, super::station::Error> {
+        let station = self.station.as_mut().ok_or(super::station::Error::State)?;
+        let events = self
+            .io
+            .irq_service()
+            .map_err(super::station::Error::Native)?;
+        if events.fatal() {
+            return Err(super::station::Error::Halted);
+        }
+        let frames = station.poll(&mut self.io)?;
+        self.io.irq_rearm().map_err(super::station::Error::Native)?;
+        Ok(frames)
+    }
+    pub(super) fn station_qos_all(&self) -> bool {
+        self.station
+            .as_ref()
+            .is_some_and(super::station::State::qos_all)
+    }
+    pub(super) fn station_edca_pending(&self) -> bool {
+        self.station
+            .as_ref()
+            .is_some_and(super::station::State::async_pending)
+    }
+    pub(super) async fn station_apply_edca(&mut self) -> Result<(), super::station::Error> {
         self.station
             .as_mut()
             .ok_or(super::station::Error::State)?
-            .poll(&mut self.io)
+            .apply_async(&mut self.io)
+            .await
+    }
+    pub(super) fn station_block_ack_sessions(&self) -> u8 {
+        self.station
+            .as_ref()
+            .map_or(0, super::station::State::block_ack_sessions)
+    }
+    /// Arm interrupt delivery for the started station.
+    pub(super) fn station_irq(
+        &mut self,
+        line: &Arc<super::irq::Line>,
+    ) -> Result<u8, super::station::Error> {
+        if !self.active || self.station.is_none() {
+            return Err(super::station::Error::State);
+        }
+        self.io
+            .irq_start(line)
+            .map_err(super::station::Error::Native)
     }
     pub(super) fn station_send(&mut self, frame: &[u8]) -> Result<(), super::station::Error> {
         self.station
@@ -96,6 +139,14 @@ impl<I: Io> Owner<I> {
                 .map_err(super::station::Error::Transport),
         }
     }
+    /// Device removal: stop the station (or private CH12/RX), close the
+    /// owner and release published DMA behind the stop proof. Returns true
+    /// only when nothing remains pinned. The owner never restarts.
+    pub(super) fn retire(&mut self) -> bool {
+        let _ = self.station_stop();
+        self.active = false;
+        self.io.retire_dma()
+    }
     pub(super) async fn station_disconnect(&mut self) -> Result<(), super::station::Error> {
         self.station
             .as_mut()
@@ -106,25 +157,26 @@ impl<I: Io> Owner<I> {
     pub(super) async fn station_scan(
         &mut self,
         dwell_ms: u64,
+        probe: Option<super::station::Probe>,
     ) -> Result<alloc::vec::Vec<narf_wireless::association::ObservedBss>, super::station::Error>
     {
         self.station
             .as_mut()
             .ok_or(super::station::Error::State)?
-            .scan_for(&mut self.io, dwell_ms)
+            .scan_with(&mut self.io, dwell_ms, probe)
             .await
     }
     pub(super) async fn station_associate(
         &mut self,
         bssid: [u8; 6],
         ssid: &[u8],
-        pmk: Option<zeroize::Zeroizing<[u8; 32]>>,
+        credential: super::station::Credential,
         ies: &[u8],
     ) -> Result<(), super::station::Error> {
         self.station
             .as_mut()
             .ok_or(super::station::Error::State)?
-            .associate(&mut self.io, bssid, ssid, pmk, ies)
+            .associate(&mut self.io, bssid, ssid, credential, ies)
             .await
     }
 }

@@ -86,6 +86,8 @@ pub(super) struct Frame {
     bytes: Vec<u8>,
     pub(super) rate: u8,
     pub(super) phy: Option<super::packet_phy::Evidence>,
+    /// Original32-byte PHY-status record for dynamic-mechanism statistics.
+    pub(super) status: Option<alloc::boxed::Box<[u8; 32]>>,
 }
 impl narf_wireless::station_security::RawFrame for Frame {
     fn bytes(&self) -> &[u8] {
@@ -111,11 +113,13 @@ pub(super) struct Core {
     aggregation: Option<format::Aggregation>,
     batch_published: bool,
     own: [u8; 6],
+    /// Current random scan SA (`rtw_core_scan_start`), probes only.
+    scan: Option<[u8; 6]>,
     mac_id: u8,
     data_profile: format::DataProfile,
     receive_chip: super::packet_phy::Chip,
-    tx_host: [u16; 2],
-    tx_device: [u16; 2],
+    tx_host: [u16; 5],
+    tx_device: [u16; 5],
     rx: u16,
     tag: u16,
     next_id: u64,
@@ -128,6 +132,9 @@ fn queue_slot(queue: Queue) -> usize {
     match queue {
         Queue::Management => 0,
         Queue::Data => 1,
+        Queue::Background => 2,
+        Queue::Video => 3,
+        Queue::Voice => 4,
     }
 }
 fn barrier() {
@@ -184,7 +191,13 @@ impl Core {
         }
         port.transmit_allowed()?;
         let receive_chip = port.receive_chip()?;
-        for queue in [Queue::Management, Queue::Data] {
+        for queue in [
+            Queue::Management,
+            Queue::Data,
+            Queue::Background,
+            Queue::Video,
+            Queue::Voice,
+        ] {
             if port.index(queue.index())? & 0x0fff_0fff != 0 {
                 return Err(Error::State);
             }
@@ -228,8 +241,9 @@ impl Core {
             mac_id,
             data_profile: format::DataProfile::LEGACY,
             receive_chip,
-            tx_host: [0; 2],
-            tx_device: [0; 2],
+            scan: None,
+            tx_host: [0; 5],
+            tx_device: [0; 5],
             rx: 0,
             tag: 0,
             next_id: 1,
@@ -251,6 +265,16 @@ impl Core {
     }
     pub(super) fn ready(&self) -> bool {
         self.phase == Phase::Running && self.pending.is_none() && self.batch_pending.is_empty()
+    }
+    /// Admit broadcast Probe Requests from a unicast random scan address.
+    pub(super) fn set_scan(&mut self, address: Option<[u8; 6]>) -> Result<(), Error> {
+        if address.is_some_and(|a| a == [0; 6] || a[0] & 1 != 0 || a == self.own)
+            || address.is_some() == self.scan.is_some()
+        {
+            return Err(Error::State);
+        }
+        self.scan = address;
+        Ok(())
     }
     pub(super) fn configure_data(&mut self, profile: format::DataProfile) -> Result<(), Error> {
         if !self.ready() || !profile.valid() {
@@ -292,9 +316,22 @@ impl Core {
         if format::originator_control(frame) && !port.originator_ba_allowed() {
             return Err(Error::Access);
         }
+        // A Probe Request from the current random scan address is the only
+        // frame whose source is not the own address.
+        let source = match self.scan {
+            Some(scan)
+                if frame.len() >= 24
+                    && frame[..4] == [0x40, 0, 0, 0]
+                    && frame[4..10] == [255; 6]
+                    && frame[10..16] == scan =>
+            {
+                scan
+            }
+            _ => self.own,
+        };
         let (mut descriptor, queue) =
-            format::transmit_profile(frame, self.own, self.mac_id, sequence, self.data_profile)?;
-        if queue == Queue::Data && (!radio_report || frame[0] == 0x88) {
+            format::transmit_profile(frame, source, self.mac_id, sequence, self.data_profile)?;
+        if queue.data() && (!radio_report || frame[0] == 0x88) {
             super::protection::descriptor(&mut descriptor, frame.len(), port.rts_threshold());
         }
         let memory = self.frame.as_ref().ok_or(Error::State)?;
@@ -385,9 +422,13 @@ impl Core {
                     }
                     step.c2h = Some(body);
                 } else {
+                    let mut status = None;
                     let phy = match format::phy_status(descriptor) {
                         Some(range) => {
                             let bytes = port.rx_bytes(slot, range.start, range.len())?;
+                            status = <[u8; 32]>::try_from(bytes.as_slice())
+                                .ok()
+                                .map(alloc::boxed::Box::new);
                             super::packet_phy::parse(self.receive_chip, metadata.rate, &bytes)
                                 .ok()
                                 .filter(|p| p.initial_channel())
@@ -402,6 +443,7 @@ impl Core {
                                 bytes: body,
                                 rate: metadata.rate,
                                 phy,
+                                status,
                             });
                         }
                     }
@@ -478,6 +520,23 @@ impl Core {
         self.rx_idle = false;
         // BME-off/stop bits do not release published allocations.
         port.stop()
+    }
+}
+impl Core {
+    /// After `dma_stop::prove` on the stopped owner: the device can no
+    /// longer read the frame or batch buffers, so Drop may free them.
+    pub(super) fn release(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Stopped {
+            return Err(Error::State);
+        }
+        self.pending = None;
+        self.batch_pending.clear();
+        self.published = false;
+        self.batch_published = false;
+        Ok(())
+    }
+    pub(super) fn reclaimable(&self) -> bool {
+        self.phase == Phase::Stopped && !self.published && !self.batch_published
     }
 }
 impl Drop for Core {

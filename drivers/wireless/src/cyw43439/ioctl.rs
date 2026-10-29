@@ -93,6 +93,9 @@ pub const WLC_GET_VAR: u32 = 262;
 /// payload begins with the NUL-terminated variable name followed by
 /// the variable's value bytes.
 pub const WLC_SET_VAR: u32 = 263;
+/// `BRCMF_C_SET_WSEC_PMK` — install PSK/PMK (or a WCC SAE passphrase)
+/// material for the firmware supplicant (`struct brcmf_wsec_pmk_le`).
+pub const WLC_SET_WSEC_PMK: u32 = 268;
 
 // ── Request / response builders ────────────────────────────────────
 

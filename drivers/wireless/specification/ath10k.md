@@ -17,8 +17,8 @@
 
 ## 1. Purpose & scope
 
-PCIe Qualcomm/Atheros QCA988X, QCA6174/6164, QCA9377, QCA99X0, QCA9888
-and QCA9984. AR9462 belongs to ath9k and is rejected before MMIO.
+PCIe Qualcomm/Atheros QCA988X, QCA9887, QCA6174/6164, QCA9377, QCA99X0,
+QCA9888 and QCA9984. AR9462 belongs to ath9k and is rejected before MMIO.
 Linux `drivers/net/wireless/ath/ath10k/` is the reference implementation.
 
 ## 2. Assumptions
@@ -26,11 +26,12 @@ Linux `drivers/net/wireless/ath/ath10k/` is the reference implementation.
 Probe owns the PCI function exclusively. BAR0 is mapped with device
 attributes and must cover the selected RTC, core, PCI-local and CE
 windows. Boot uses coherent DMA32 storage and keeps the target awake.
-Boot messages are serialized and polled asynchronously. The initial native
-packet service polls with CE interrupts masked; synchronous network drains
-and the periodic worker drive the same bounded state without waiting on
-another executor task. IRQ throughput and host-bus/system power transitions
-remain separate profiles.
+Boot messages are serialized and polled asynchronously. After BMI_DONE the
+runtime owner arms one MSI vector when the function has one (see
+"Interrupt service" in §3); otherwise it keeps 1 ms polling with CE
+interrupts masked. Synchronous network drains and the service worker drive
+the same bounded state without waiting on another executor task.
+Host-bus/system power transitions remain separate profiles.
 
 ## 3. Public interface
 
@@ -127,7 +128,8 @@ remain separate profiles.
   observed primary channel. SGI20 transmit requires the actual firmware capability
   and both beacon/response support; receive follows the local advertised promise.
   A driver-owned HT IE advertises the selected width, one
-  stream, SMPS disabled and no GF/STBC/LDPC; caller SME IEs cannot supply it.
+  stream, SMPS disabled, no GF and only the firmware-backed LDPC/RX-STBC
+  coding described below; caller SME IEs cannot supply it.
   VDEV_START programs native 11NG/11NA HT20 plus ALLOW_HT, retaining the same
   20 MHz factory/host power receipt. The actual association response intersects
   MCS/SGI before native PEER_ASSOC carries HT/QoS, peer HT capabilities,
@@ -152,7 +154,7 @@ remain separate profiles.
   is discarded before later receipts can authorize it. Native RAW transmit
   aggregation is explicitly capped at one MPDU/one MSDU; firmware offload is
   not inferred to be disabled by absence of host ADDBA. TX A-MPDU/A-MSDU,
-  widths beyond the selected bounded HT40 profile, more streams and VHT remain separate work.
+  widths beyond the selected HT40/VHT80 profile and more streams remain separate work.
   Complete first/last native RAW receive MPDUs can carry a default-size A-MSDU
   up to 3839 bytes. The shared opt-in receiver authenticates the original
   QoS header and complete ciphertext before validating every subframe and
@@ -175,7 +177,8 @@ remain separate profiles.
   `WMI_HT_CAP_ENABLED`; the independent HT40-SGI capability is not inferred from
   SGI20. This profile advertises MCS0..7, LGI40, optional qualified SGI20 and
   separately gated SGI40 as described below,
-  without GF, LDPC, STBC or an extra spatial stream. Only the pairs
+  without GF, TX STBC or an extra spatial stream (LDPC/RX STBC follow the
+  coding bullet below). Only the pairs
   5180/5200, 5220/5240, 5745/5765 and 5785/5805 MHz, in either primary order,
   are selected. The actual board/OTP calibration path, immutable EEPROM
   pair/CTL, fixed-country factory/host match, firmware band limits and current
@@ -234,6 +237,29 @@ remain separate profiles.
   when exposing SGI40; ath10k has no Intel-style legacy-only measured-emitter
   record to relabel. These source-backed gates grant no physical RF or board
   interoperability claim.
+- HT LDPC and one-stream RX STBC (`wmi_runtime::ht::{ldpc,rx_stbc,Profile}`)
+  follow Linux `mac.c::ath10k_get_ht_cap`: IEEE LDPC_CODING (0x0001) is
+  advertised only for SERVICE_READY `WMI_HT_CAP_LDPC` (0x0040) or the pair
+  `WMI_HT_CAP_RX_LDPC|WMI_HT_CAP_TX_LDPC` (0x1000|0x2000); a lone directional
+  bit is not. A nonzero `WMI_HT_CAP_RX_STBC` field (0x0030) advertises one RX
+  STBC stream (IEEE 0x0100), bounded by this one-stream profile. Both reach the
+  per-band capability body, the driver-owned request IE and the HT20/HT40
+  `LocalPhy` through the shared `LocalHt::{with_ldpc,with_rx_stbc}` builder.
+  PEER_ASSOC `peer_ht_caps` applies `mac80211/ht.c::ieee80211_ht_cap_ie_to_sta_ht_cap`
+  masking: peer LDPC survives only with local LDPC, the peer's RX STBC field
+  (0x0300) is cleared because no local TX STBC exists, and the peer's TX STBC
+  (0x0080) survives only with our RX STBC promise. `ath10k_peer_assoc_h_ht`
+  then sets `WMI_PEER_LDPC` (0x10000), `WMI_PEER_STBC` (0x8000) and
+  `WMI_RC_TX_STBC_FLAG` (0x20); these values are identical in all six dialect
+  peer-flag maps. The firmware owns LDPC encoding toward a capable peer and
+  STBC/LDPC decoding. Native RX additionally rejects, before BA sequence or
+  CCMP replay commitment, an HT-SIG2 FEC-coding bit (bit6) without our LDPC
+  promise, a one-stream STBC field (bits4..5 = 1) without our RX STBC promise
+  and any larger/reserved STBC value. TX STBC stays absent: Linux requires
+  `cfg_tx_chainmask > 1`, and this SISO profile never selects a second TX
+  chain. Native smokes `drivers/wireless/ath10k/coding` cover the service-bit
+  advertisement, masked peer record/flags on all six dialects with DHCP-backed
+  CCMP traffic and pre-replay PPDU coding checks. No RF coding gain is claimed.
 - `wmi_runtime::StationProtection { rts_threshold: Option<u16>,
   cts_protection: bool }` and `pci::set_station_protection` submit native VDEV
   protection intent. None encodes the disabled threshold `u32::MAX`; finite
@@ -261,17 +287,174 @@ remain separate profiles.
 - The single-vdev RAW station can negotiate WMM from an actual AP Parameter IE.
   It appends its own Information IE with U-APSD disabled; caller-supplied WMM
   cannot duplicate or replace that negotiation. The bound successful association
-  response supplies the final contention values. Missing, duplicate, malformed
-  or BE-admission-controlled response parameters fail before peer/data admission.
+  response supplies the final contention values. Missing, duplicate or malformed
+  response parameters fail before peer/data admission, as does BE ACM. With
+  no TSPEC owner, that would leave ordinary traffic only BK. VO/VI/BK ACM is
+  accepted, and transmit downgrades past ACM ACs (below).
   Native per-dialect PDEV WMM records program BE/BK/VI/VO contention, converting
   IEEE TXOP32-us units to native microseconds; PEER_ASSOC carries the real QoS
   flag only after those transport receipts. This one-radio profile has no
   per-vdev concurrency and makes no firmware ACK claim for these commands.
-  Ordinary Ethernet uses QoS BE/TID0 through actual RAW HTT metadata and the
-  shared host CCMP formatter; EAPOL/key replies remain legacy non-QoS. RX binds
-  QoS TID to the native descriptor before replay/PN commitment. BA/TX
-  aggregation, TSPEC, U-APSD and non-BE transmit classification remain separate
-  features. APs without WMM retain the legacy packet/command profile.
+  Non-BE transmit classification (`wmi_runtime/tx_qos.rs`): on a WMM
+  association each host Ethernet frame gets the user priority from Linux
+  `net/mac80211/wme.c::ieee80211_select_queue`. That is priority 7 for
+  EAPOL; otherwise `net/wireless/util.c::cfg80211_classify8021d` (IPv4 TOS,
+  IPv6 traffic class, MPLS TC, RFC 8325 exceptions; the ath11k
+  `tx_hdr::classify8021d` port is reused). `ieee80211_downgrade_queue` /
+  `wme_downgrade_ac` then step VO to VI (UP 5), VI to BE (UP 3) and BE to
+  BK (UP 2) while the AP's WMM Parameter ACM bit covers the AC, using BK
+  even when BK also requires admission (no TSPEC is admitted). The TID goes
+  into the QoS Control field (open path, or the shared CCMP formatter's
+  `transmit_ethernet_qos`, which keeps per-TID sequence and PN) and into
+  the HTT descriptor TID (`htt_tx.c::ath10k_htt_tx`
+  `HTT_DATA_TX_DESC_FLAGS1_EXT_TID`). The open path also keeps per-TID
+  sequence counters. Firmware schedules the four AC queues from the PDEV
+  WMM records. EAPOL/key replies remain legacy non-QoS (descriptor TID
+  16). RX binds QoS TID to the native descriptor before replay/PN
+  commitment. TX aggregation, TSPEC and U-APSD remain separate features.
+  APs without WMM retain the legacy packet/command profile.
+- N-deep native TX pipeline (`wmi_runtime/tx_pipeline.rs`): station data
+  keeps up to 32 native HTT IDs in flight, in a heap-owned table keyed by
+  MSDU ID (Linux v7.2 `htt_tx.c::ath10k_htt_tx_alloc_msdu_id`, the
+  `htt->pending_tx` IDR). Each ID's payload/fragment DMA stays owned by
+  `htt_runtime::tx::Pool` until an HTT TX completion indication names it;
+  the CE source receipt only frees the bounce slot, so the next frame may
+  be published under its own ID while earlier IDs are outstanding. One
+  indication may name several IDs in any order
+  (`htt_rx.c::ath10k_htt_rx_tx_compl_ind`); the whole batch is validated
+  before any ID is freed, and a duplicate or unknown ID fails the HTT owner
+  without partial release. Each ID then retires independently
+  (`txrx.c::ath10k_txrx_tx_unref`). Status maps as in Linux: OK is ACK,
+  NO_ACK is no-ACK, DISCARD/POSTPONE/unknown are discard. A data receipt
+  never fails the link; its outcome is counted per TID
+  (`Radio::tx_counters`, index 16 non-QoS). Key-reply fencing is explicit
+  and two-sided. A supplicant EAPOL reply (M2/M4, group 2/2) is published
+  only once every earlier data ID has reached its terminal indication.
+  While the reply is in flight no data ID is admitted and RX admission
+  stays paused. A non-OK reply receipt still fails the owner. A full table
+  or an in-flight reply returns `Htt(Busy)` before anything is published.
+  Station protection programming drains every data ID first; it refuses a
+  reply in flight. Teardown and failure close the owner but keep every
+  in-flight ID and its DMA until whole-device reset. A completion is never
+  invented. The per-ID deadline (3 s) fails the owner, as before.
+- Firmware-owned TX Block Ack and aggregate retransmission. Linux v7.2
+  sets `TX_AMPDU_SETUP_IN_HW` and `mac.c::ath10k_ampdu_action` returns
+  -EOPNOTSUPP for every mac80211 TX action (TX_START, TX_OPERATIONAL,
+  TX_STOP_*). Firmware originates ADDBA, keeps the BA window, builds the
+  A-MPDU and retransmits unacknowledged subframes. The host's
+  `WMI_ADDBA_SEND_CMDID` path exists only for the debugfs manual
+  `aggr_mode` (`debugfs_sta.c`), so this tree never sends ADDBA or
+  DELBA itself. The host obligations are all met:
+  1. an HT peer with the QoS flag and A-MPDU length/density in PEER_ASSOC
+     (`ath10k_peer_assoc_h_ht` `peer_max_mpdu`/`peer_mpdu_density`);
+  2. the 802.11 TID in each QoS descriptor (`tx_qos.rs`);
+  3. several MPDUs of one TID owned at once (the N-deep pipeline above).
+  The AP's ADDBA Response and DELBA action frames belong to firmware's
+  session. The station owner ignores them: no WMI command, no state change.
+  Firmware performs the retries while each MPDU's ID and DMA stay owned. A
+  completion indication is terminal after its retry budget. One indication
+  may name a whole BA window. ACK, NO_ACK (retries exhausted) and
+  DISCARD/POSTPONE are counted per TID (`Radio::tx_counters`). None of these
+  outcomes fails the link. A status above POSTPONE is malformed and is
+  rejected before any ID is freed. The LL completion carries no
+  per-attempt retry count. Linux reports one only through 10.4
+  `HTT_10_4_T2H_MSG_TYPE_PEER_STATS` (`htt_rx.c::ath10k_htt_fetch_peer_stats`
+  `retry_pkts`), which firmware emits only after `WMI_EXT_RESOURCE_CFG`
+  enables `WMI_10_4_PEER_STATS` (`core.c::ath10k_core_start`). This tree
+  sends no EXT_RESOURCE_CFG, so per-attempt counts are not claimed.
+  Smokes under `drivers/wireless/ath10k/ht` cover eight TID-0 MPDUs in flight
+  on all six dialects, an ignored ADDBA/DELBA exchange, mixed
+  ACK/NO_ACK/DISCARD outcomes, malformed status, and teardown keeping the
+  aggregate's DMA.
+- 80 MHz occupied-bandwidth receipt (`regulatory.rs`):
+  `Permission::occupied_width(.., width80)` admits the non-DFS VHT80
+  segments ch36-48 (center 5210) and ch149-161 (center 5775). This is the
+  cfg80211 chandef `center_freq1` that Linux puts in VDEV_START
+  `band_center_freq1` for `MODE_11AC_VHT80`
+  (`mac.c::ath10k_vdev_start_restart`, `wmi.c` `chan->band_center_freq1`).
+  The 40 MHz `secondary` must name the HT pair inside the same segment.
+  Every overlapping host rule must allow 80 MHz, and one rule must cover
+  the whole segment. DFS, NO_IR, indoor and unknown flags stay restrictive.
+  The factory/country binding and power ceiling are the same as for HT40.
+  `Permission::check` re-derives the width-tagged receipt, so a narrowed,
+  cleared, lower-power or different-country policy closes it. A 40 MHz
+  receipt over the same pair is a different receipt. The VHT station
+  profile below is the only selector of `width80`.
+- SISO VHT station profile (`wmi_runtime/ht.rs`, `station.rs`, `mlme.rs`;
+  smokes under `drivers/wireless/ath10k/vht`). A nonzero SERVICE_READY
+  `vht_cap_info` builds the local element through the shared
+  `LocalPhy::vht80`/`LocalVht` exactly as Linux v7.2
+  `mac.c::ath10k_create_vht_cap` does for one chain: MCS0-9 for one stream
+  in both maps, SGI80 (0x20), RX LDPC (0x10), RX STBC (0x300) and the A-MPDU
+  exponent; TX STBC is cleared (`cfg_tx_chainmask <= 1`), beamforming roles
+  need a sounding owner and are not advertised, and 160/80+80 are not offered.
+  `Device::phy_capabilities(5000)` and `hw_caps.vht_supported` report it.
+  Because the element promises 80 MHz support, VHT is offered only on a
+  qualified 5-GHz primary whose whole 80 MHz segment
+  `Permission::occupied_width(.., width80)` grants; the occupied receipt is
+  then the AP-selected 20/40/80 geometry (a contiguous160 or 80+80 BSS is used
+  through its primary80). A refused segment, an HT-only AP, a zero
+  `vht_cap_info` or an unusable VHT offer falls back to the HT40/HT20
+  selection above, which sends no VHT element. PEER_ASSOC follows
+  `ath10k_peer_assoc_h_vht`: `WMI_PEER_VHT` (0x0200_0000) and, at 80 MHz,
+  `WMI_PEER_80MHZ` (0x0400_0000) in all six dialect maps; `peer_vht_caps` is
+  the AP's VHT information masked as mac80211
+  `vht.c::ieee80211_vht_cap_ie_to_sta_vht_cap` does (RX LDPC, TXOP PS, +HTC,
+  exponent, link adaptation and antenna bits kept; SGI80 symmetric; peer TX
+  STBC only with our RX STBC); `peer_max_mpdu` is `max(HT, 2^(13+exp)-1)`;
+  the `wmi_vht_rate_set` (TLV tag 102, or the common-command tail at +332) is
+  the AP's RX map narrowed by our TX map and its TX map narrowed by our RX
+  map, with the AP's highest-rate fields; `peer_phymode` is
+  `ath10k_peer_assoc_h_phymode` `MODE_11AC_VHT20/40/80` (8/9/10). VDEV_START
+  follows `chan_to_phymode`, which maps the chandef width only: 20/40 stay
+  `MODE_11NA_HT20/HT40` and 80 MHz is `MODE_11AC_VHT80` with
+  `band_center_freq1` 5210/5775; a VHT profile adds `WMI_CHAN_FLAG_ALLOW_VHT`
+  (bit12) beside ALLOW_HT, and the station inventory lists all four segment
+  rows (HT40_PLUS on the lower channel of each pair) as
+  `ath10k_update_channel_list` does. The association response must keep VHT
+  and the 80 MHz geometry, and a later beacon changing the bound VHT
+  Capabilities/Operation closes the link like an HT change. RX admits
+  `HTT_RX_VHT` (0x0c) PPDUs only when VHT is bound, decoding VHT-SIG-A1/A2 as
+  `htt_rx.c::ath10k_htt_rx_h_rates`: an SU group id (0/63), one space-time
+  stream (two only with STBC and our RX STBC), LDPC only with our RX LDPC,
+  MCS within our map, and a bandwidth/SGI the profile promised. TXBF (0x0d)
+  and MU PPDUs are refused before CCMP/PN.
+- WPA2-PMF and WPA3-SAE (`wmi_runtime/station_pmf.rs`, `data.rs`,
+  `management.rs`; smokes under `drivers/wireless/ath10k/pmf` and
+  `drivers/wireless/ath10k/wpa3`). Linux v7.2 sets `MFP_CAPABLE`
+  (`mac.c::ath10k_mac_register`) and leaves SAE to wpa_supplicant
+  `sme_sae_auth` over mac80211 `ieee80211_auth`; here the shared
+  `JoinPlan`/`SaeSession` run on the host. A WPA2 join advertises MFPC
+  (`JoinOptions::with_pmf(Pmf::Optional)`, wpa_supplicant `ieee80211w=1`, with
+  PSK-SHA256 admitted) only toward an AP whose scanned RSNE sets MFPC, so the
+  request to any other AP is byte-for-byte unchanged. `SecurityConfig::Wpa3`
+  selects SAE (`sae_pwe=2`): a Commit from the kernel CSPRNG, up to three
+  anti-clogging retries and Confirm cross the initial management transport
+  (algorithm3 frames of any status go to the plan; nothing else advances), and
+  the SAE association request carries the PMKID. The association's station
+  RSNE/RSNXE (`JoinPlan::rsn_body`, SAE `station_rsnxe`) and the SAE PMK are
+  retained, boxed, and build `Security::new` or `Security::new_sae`; the IGTK
+  arrives in message 3. `management::validate` admits only SAE Commit
+  (status 0/126) and Confirm (status 0) besides Open-System auth and
+  association, and Protected Deauthentication/Disassociation (42 bytes) and
+  SA Query Response (44 bytes) already CCMP-protected by the host. Under PMF,
+  WMI management RX from the bound AP goes through `Security::receive_management`
+  (mac80211 `ieee80211_drop_unencrypted_mgmt`): unprotected unicast robust
+  frames, broadcast frames without a valid BIP-CMAC-128 MMIE, replays and bad
+  MICs are dropped; an admitted Deauthentication/Disassociation closes the
+  link, and an admitted SA Query Request queues a protected Response with the
+  same transaction id (`ieee80211_process_sa_query_req`), published by the
+  Device service worker after the synchronous drain (the WMI management path
+  cannot be awaited there). A local disconnect under PMF first sends one
+  Deauthentication (reason 3, `ieee80211_set_disassoc`) protected with the
+  still-installed PTK; non-PMF teardown still sends none. Because this RAW
+  image disables firmware crypto (`ATH10K_CRYPT_MODE_SW`), the host expects
+  robust unicast frames still encrypted on WMI management RX, whereas Linux
+  `wmi.c::ath10k_wmi_rx_is_decrypted` assumes firmware decryption in
+  hardware-crypto mode; that firmware behaviour needs physical confirmation.
+  PEER_ASSOC carries no `WMI_PEER_PMF`: Linux `mac.c::ath10k_peer_assoc_h_crypto`
+  sets it only with `ATH10K_FW_FEATURE_MFP_SUPPORT`, for firmware-side
+  management crypto that this software-crypto image does not use.
 - The registered Device binds native preparation, authentication/association,
   WMM/peer/up commands and initial RSNA data to a chosen factory/frequency/power
   receipt. It samples current policy before and after each nested wait and
@@ -401,12 +584,122 @@ remain separate profiles.
   PCI bus-master disable. A failed halt still attempts master disable but cannot
   start a successor. The retired physical owner is terminal before hardware
   access, and its late Drop performs no MMIO, BME or ASPM operation against a
-  successor. All old boot/firmware/WMI/management/HTT allocations remain pinned,
-  even after successful reset scheduling: no posted-DMA drain, reclamation or
-  RF-quiescence proof is claimed. The attempt limit bounds these retained DMA
-  generations. This is manual replacement/rejoin support, not automatic recovery,
-  stable-netdev reconnection, system suspend or reclaimed DMA. Physical reset,
+  successor. DMA reclamation (`boot.rs::PciBoot::flushed`,
+  `boot/recovery.rs`): after every CE is halted and PCI bus mastering reads
+  back clear, the retiring owner checks PCIe Device Control Relaxed Ordering
+  is disabled and completes a non-posted BAR read, which then orders behind
+  every earlier device-posted write. Only then is it `reclaimable`, and its
+  late Drop frees the boot/firmware/WMI/management/HTT allocations (still with
+  no hardware access). With BME off no CE or firmware-directed write can start;
+  every successor performs the Linux `ath10k_pci_safe_chip_reset` warm CE/CPU
+  or cold SoC reset and reprograms the CE rings before it re-enables bus
+  mastering. Any halt, BME, ordering or flush failure keeps every mapping
+  pinned. A non-retired terminal Drop uses the same proof after firmware
+  DONE. No RF-quiescence proof is claimed. The attempt limit bounds pinned
+  generations. It is also the restart step of automatic recovery (below). It is
+  not stable-netdev reconnection. Physical reset,
   ROM/firmware restart and repeated RF association still need hardware acceptance.
+- Automatic recovery (`restart.rs`, `pci::firmware_crashed`). Linux
+  `pci.c::ath10k_pci_napi_poll` checks `ath10k_pci_has_fw_crashed`
+  (`FW_INDICATOR & FW_IND_EVENT_PENDING`) before any CE service. It clears
+  the bit and queues `ath10k_pci_fw_dump_work`, which counts
+  `fw_crash_counter` and calls `core.c::ath10k_core_start_recovery`. That
+  function deduplicates with `ATH10K_FLAG_RESTARTING` and queues
+  `ath10k_core_restart`. Here every runtime service (`hif_poll`,
+  `hif_poll_now`, interrupt-driven or polled) checks the indicator first. On
+  a crash it clears only EVENT_PENDING, poisons the generation (all later
+  sends/polls fail) and returns `BmiError::FirmwareCrashed`. A
+  non-retired owner then calls `pci::firmware_crashed`. A `restart::Gate`
+  counts the crash (`pci::firmware_crash_count`). Only the request that
+  sets RESTARTING spawns a supervisor; later crashes while restarting are
+  counted, never spawned again. The supervisor calls `pci::recover()`.
+  `Busy` (the crashed stage has not yet stored its owner) backs off 50 ms,
+  up to 100 times, then gives up as `Outcome::Abandoned`. `Exhausted` is
+  `Outcome::Wedged`, the `ATH10K_STATE_WEDGED` analogue for the three
+  attempts per boot. A failed retirement is `Outcome::Failed` and keeps
+  the old DMA pinned. Success is `Outcome::Scheduled { attempt }`. The
+  outcome is published through `pci::last_automatic_recovery`, and
+  RESTARTING is cleared so a successor's crash can recover again. The
+  fresh generation rebinds the same station interface (smokes under
+  `drivers/wireless/ath10k/recovery`): as mac80211 `ieee80211_restart_hw`
+  keeps the `net_device`, `interface::retire` (recovery and suspend) retires
+  it with `narf_net::iface::retire_for_rebind`, which reserves the name
+  atomically with removal and keeps its entry, and remembers the name; the
+  next `publish_with_mac` claims it with `rebind_name`, so the `wlan%d`
+  name, ifindex, addresses, counters and the operator's IFF_UP survive while
+  carrier stays down until a new association. The old generation's send
+  hook is dropped. A registered or never-retired name is never handed out;
+  publication then allocates a fresh `wlan%d`. Rejoin goes through the
+  interface's normal scan/associate path; Linux replay of keys and
+  association is the separate `automatic_credential_replay` work. WMI
+  command timeouts do not yet trigger recovery: Linux `wmi.c` does that in
+  `ath10k_wmi_cmd_send` on `-EAGAIN`, and here those timeouts stay
+  fail-stop errors for the caller.
+- System suspend (`pm.rs`, `pci::{suspend, resume}`, registered as the
+  `ath10k` `narf_power::system_pm::AsyncSystemPm` hook). This follows the
+  Linux v6.10 non-WoWLAN path. mac80211 `ieee80211_suspend` calls
+  `drv_stop`, which reaches `mac.c::ath10k_stop` (`ath10k_halt`,
+  `ath10k_hif_power_down`). `pci.c::ath10k_pci_pm_suspend` then puts the
+  target to sleep. `ath10k_pci_pm_resume` -> `ath10k_pci_resume`
+  re-disables the RETRY_TIMEOUT byte (config 0x41, lost in D3). mac80211
+  `ieee80211_reconfig` -> `ath10k_start` -> `ath10k_hif_power_up` then
+  performs a full chip reset and firmware boot. Here `prepare_suspend`
+  plans under the session lock (`pm::plan`). With no bound function it
+  returns success. Boot or automatic recovery in progress (no retained
+  session, or RESTARTING) returns `Busy`, which aborts the system suspend
+  with the generation intact. `Pinned` is returned once three earlier
+  suspends left unreclaimable DMA, keeping the generation usable. Otherwise
+  it retires the live generation exactly as recovery does: host interface
+  and radio quarantine first, interrupt teardown, every CE masked and
+  halted, bus mastering verified off, ordered flush proof. It then parks
+  the function identity. A failed retirement leaves that generation
+  terminal (`DriverError`), as a failed `ath10k_stop` would. Resume clears
+  config 0x41 if set, then schedules the ordinary fresh-ROM `boot_task`
+  (reset, BMI, current authenticated firmware/BDF, HTC/WMI/HTT, interface
+  registration). Resume without a parked generation does nothing. As in
+  Linux without WoWLAN, the association is not preserved, and rejoin goes
+  through the new interface. Suspend does not use the recovery attempt
+  budget. WoWLAN (`wow.c`) and PCIe runtime PM/ASPM transitions are not
+  provided (`wake_offload`, `host_bus_pm`).
+- Interrupt service (`irq.rs`, `boot/interrupts.rs`). Linux v6.10
+  `pci.c::ath10k_pci_init_irq` tries MSI first; `ath10k_pci_hif_start`
+  calls `ath10k_pci_irq_enable`. Here `PciBoot::done_complete` (BMI_DONE
+  accepted) first runs `Program::disable` (`ath10k_pci_irq_disable`: every
+  CE's copy-complete/watermark HOST_IE and MISC_IE error bits, then
+  `ath10k_pci_disable_and_clear_intx_irq` and `ath10k_pci_irq_msi_fw_mask`).
+  It then discovers the MSI capability, allocates and programs one vector,
+  installs the handler and sets MSI Enable. Only after that does it run
+  `Program::enable`. This is `ath10k_ce_per_engine_handler_adjust`:
+  copy-complete for engines with a Linux host callback (CE0/CE3 send,
+  CE1/CE2/CE5/CE8 receive when present). CE4 (`CE_ATTR_DIS_INTR`) and CE7
+  (diagnostics) stay off, and watermark is always off. It also writes
+  `PCIE_INTR_ENABLE = FIRMWARE_MASK | CE_MASK_ALL` and sets the
+  CORE_CTRL `PCIE_REG_31` firmware MSI gate (QCA988X/QCA9887/QCA6174/QCA9377
+  only; Linux leaves QCA99X0-class as TODO). Register constants come from
+  `hw.c::{qca988x,qca6174,qca99x0}_regs` and `qcax_{wm,misc}_reg`.
+  The vector handler only raises an edge-latched `irq::Signal`; it never
+  touches the BAR. The owner's next service runs the hard-handler and
+  `ath10k_pci_napi_poll` sequence. First comes `ath10k_pci_has_fw_crashed`
+  (see automatic recovery). Next come the line/firmware mask and
+  `ath10k_ce_per_engine_service_any`'s HOST_IS clear for every summarized
+  engine, both before the rings are polled. Last, the epilogue re-enables
+  only when `ath10k_ce_interrupt_summary` reads empty. Otherwise it keeps
+  the line masked and re-raises the signal, which is the `napi_schedule`
+  path. The data worker waits on that signal, a host TX/power-save kick or
+  a 10 ms missed-edge backstop. It re-runs at once while a drain made
+  progress. Protocol waits in `hif_poll` use the same wait, clamped to
+  their budget. Without MSI (no capability, no vector, a non-PCI function,
+  or an aarch64 host whose MSI programming fails) chip interrupts stay
+  masked and service keeps the previous 1 ms period. The INTx program is
+  limited to the `ath10k_pci_irq_pending` cause check. Blocker for a
+  line-interrupt mode: NARF has no ath10k INTx route, meaning a
+  level-triggered GSI handler allowed to write `PCIE_INTR_CLR` from the
+  hard IRQ. Teardown (`stop_interrupts`) runs on retirement before the
+  park and on non-retired Drop. It disables every source, clears MSI
+  Enable and frees the vector. A failed cfg-space disable keeps the vector
+  quarantined (masked, no waker, never reallocated). All-ones reads from
+  surprise removal are never decoded as a cause, crash or summary. No
+  interrupt-rate or throughput claim is made without hardware.
 - `pci::start_station_data(pmk)` starts the retained packet owner after native
   association, with `None` for Open or the caller's WPA2 PMK. It requires
   firmware `RAW_MODE_SUPPORT` (bit10), RAW RX selected during WMI INIT, and a
@@ -449,9 +742,9 @@ remain separate profiles.
   images and invalid/unsigned regulatory policy fail immediately without waiting.
   `RadioSession` retains an `Arc<Mutex<Radio<PciBoot>>>` with the selected image
   and board profile; native PCI APIs and the Device share this single owner.
-  The Device exposes passive/active scan and Open/WPA2-PSK/CCMP on configured
-  channels1–11 and the admitted fixed-country non-DFS 5-GHz centres above,
-  legacy/HT20 or the bounded HT40 pairs above. Unsupported scan options, PHY modes, external EAPOL and
+  The Device exposes passive/active scan and Open/WPA2-PSK/WPA2-PMF/WPA3-SAE
+  CCMP on configured channels1–11 and the admitted fixed-country non-DFS
+  5-GHz centres above, legacy/HT20, the bounded HT40 pairs or VHT above. Unsupported scan options, PHY modes, external EAPOL and
   checksum/TSO/VLAN requests are rejected, including direct frame-ring clients.
   Native control and each bounded packet-progress pass sample the current
   trusted regulatory database rather than an attachment-time clone. Passive
@@ -481,7 +774,7 @@ remain separate profiles.
   native command-future poll, including a coalesced no-op request. Failure
   or cancellation closes station admission and retains uncertain DMA;
   reinstalling policy or late receipts cannot reopen it. This profile
-  enables neither U-APSD nor host-bus/system suspend or wake offload.
+  enables neither U-APSD nor host-bus PM or wake offload.
 - Physical packet HIF supplies bounded source-ready, begin-send and poll-now
   operations. Each source pipe retains its bounce occupancy/deadline before
   publication. An occupied source is rejected before any buffer copy; its CE
@@ -493,8 +786,8 @@ remain separate profiles.
 - The Device's synchronous drain uses try-locks, bounded poll/submit and Narf
   frame rings, and releases its Radio/ring state before stack callbacks. It
   never uses block_on and can complete the actual kernel DHCP conversation
-  without a scheduled worker. A masked-interrupt periodic poll also supplies
-  idle RX/security progress. A five-second no-peer deadline is refreshed by
+  without a scheduled worker. The interrupt-driven service worker (or the
+  1 ms poll without MSI) also supplies idle RX/security progress. A five-second no-peer deadline is refreshed by
   bound BSS beacons or admitted native peer traffic; stale/replayed/forged
   CCMP cannot refresh it. Expiry closes the port and carrier while retaining
   uncertain CE/HTT DMA. The owner deliberately does not reset/reclaim firmware,
@@ -502,8 +795,33 @@ remain separate profiles.
 - `profile::Profile::select(device, version)` binds the PCI device ID and
   exact BMI target version to Linux's PCI firmware directory, board sizes,
   OTP parameters and clock operation. The Ubiquiti ID and QCA6164 have
-  separate exact entries; SDIO tuples are excluded. A QCA9887 tuple does
-  not add a PCI match or runtime support for that part.
+  separate exact entries; SDIO tuples are excluded. QCA9887
+  (`168c:0050`, BMI `4100016d`, `QCA9887/hw1.0`, 7168-byte board, 2116-byte
+  calibration) is routed by `hw::HwRev::Qca9887`: Linux `pci.c::ath10k_pci_probe`
+  gives `ATH10K_HW_QCA9887` the QCA988X register map, warm soft reset and
+  target-address translation, and `core.c::ath10k_core_create` the
+  `qca988x_regs`/`qcax_ce_regs`/`qca988x_values` family, so every QCA988X boot,
+  CE, HTC/WMI/HTT and station path applies unchanged.
+- QCA9887 alternate calibration (`eeprom::fetch`, `bmi::Transport::calibration_eeprom`)
+  follows `core.c::ath10k_download_cal_data` → `ath10k_download_cal_eeprom` and
+  `pci.c::{ath10k_pci_enable_eeprom,ath10k_pci_read_eeprom,ath10k_pci_validate_cal}`.
+  After the board-ID OTP run and signed board lookup, the physical QCA9887
+  transport (only, while still in BMI and under the current PCI capability)
+  enables the SI clock (RTC SoC +0x28), muxes GPIO5/17 as I2C SDA/clock with
+  pull-up, sets SI_CONFIG `0x000d00b8` and reads 2116 bytes one at a time
+  (`0xa10000a0` select with address bytes, SI_CS `0x114`, DONE_INT poll bounded
+  to 1 s with 20 us sleeps, write-one clear, DONE_ERR check, RX_DATA0 low byte).
+  Only a complete image whose 16-bit LE XOR is 0xffff is downloaded to
+  `hi_board_data` with `hi_board_data_initialized`, and the OTP calibration
+  execution is then skipped (Linux's `done` path). A nonzero `hi_board_ext_data`
+  (Linux `ath10k_push_board_ext_data` rejects the 2116-byte length), SI
+  timeout/DONE_ERR or a bad checksum fall back to the board file plus OTP.
+  An absent device or revoked authority fails the boot. Smokes
+  `drivers/wireless/ath10k/eeprom` and
+  `smoke_ath10k_qca9887_eeprom_calibration_replaces_board_data_and_skips_otp`
+  cover the register sequence, fallbacks and non-QCA9887 isolation. Pre-cal/cal
+  files and DT/NVMEM sources remain unimplemented. The EEPROM bytes are factory
+  calibration only; regulatory and transmit-power authority are unchanged.
 - `firmware::Image::{parse, load}` own the API 2–6 container and expose
   bounded image/OTP/code-swap slices, feature bits and WMI/HTT operation
   versions. `Files` supplies owned immutable bytes and `Files::wait_missing`
@@ -884,22 +1202,35 @@ not inferred from this PCI table. `profile::PROFILES`, `hw::HwRev::from_pci_id`,
 | QCA9888,168c:0056 |01000000 / QCA9888/hw2.0 | R; H conditional; distinct board/OTP identity is required despite shared CE family. |
 | QCA9377,168c:0042 |05020000 / QCA9377/hw1.0 | R; H conditional; actual RAW/non-PFC image and CE1 routing required. |
 | QCA9377,168c:0042 |05020001 / QCA9377/hw1.0 | R; H conditional; existing revision-specific PLL path and exact board data retained. |
-| QCA9887,168c:0050 |4100016d / QCA9887/hw1.0 | Profile table/parser entry only. No PCI match/HwRev route, therefore no automatic boot or station support; cannot count this row as R/H. |
+| QCA9887,168c:0050 |4100016d / QCA9887/hw1.0 | R; H conditional. QCA988X-family register/reset route plus SI EEPROM calibration with board-file/OTP fallback; single-chain board facts and actual RAW/non-PFC image required. |
 | AR9462,168c:0034 | none | Explicit pre-MMIO rejection; ath9k ownership, not a missing ath10k station implementation. |
 
 Across the reached rows, concrete remaining software packages are 2.4-GHz HT40
 coexistence/occupied-power ownership;
-additional streams and directional LDPC/STBC where actual hardware/firmware
-supports them; response-bound VHT and wider geometry; native TX BA, independent
-multi-packet DMA/completion and aggregate retries; PFC fetch/queue ownership;
-dynamic WMM/protection updates and non-BE TX/TSPEC/U-APSD; DFS/indoor/beacon-hint
-qualification; associated/off-channel scanning; hardware key/PMF/WPA3 profiles;
-AP/P2P roles; interrupt-driven throughput; host-bus/system PM and wake offload;
-broader calibration sources and automatic credential/stable-interface recovery.
-The existing bounded RX BA/reorder and complete RAW A-MSDU receiver must not be
-counted again as wholly missing TX aggregation. Unsupported role, width, stream,
+additional streams and TX STBC (which needs a second selected TX chain;
+LDPC and one-stream RX STBC are implemented above);
+VHT160/80+80 (SISO VHT20/40/80 is implemented); PFC fetch/queue ownership;
+dynamic WMM/protection updates and TSPEC/U-APSD; DFS/indoor/beacon-hint
+qualification; associated/off-channel scanning; hardware key offload;
+AP/P2P roles; host-bus PM and wake offload (system suspend is implemented);
+pre-cal/cal-file and DT/NVMEM calibration sources (QCA9887 EEPROM is implemented)
+and automatic credential replay after recovery.
+Firmware-owned TX BA, the N-deep HTT pipeline and aggregate retry accounting
+are implemented above, beside the bounded RX BA/reorder and RAW A-MSDU receiver. Unsupported role, width, stream,
 or security capability remains closed; this ledger makes no per-chip RF or
 board-power claim from a model or PCI ID.
+
+Wider VHT geometry is enumerated from Linux `mac.c::ath10k_mac_get_phymode_vht`
+and `ath10k_create_vht_cap`; each width depends on the base VHT row (VHT20/40
+with actual SERVICE_READY `vht_cap_info`/`vht_supp_mcs`):
+`vht80` is MODE_11AC_VHT80 (with `WMI_PEER_80MHZ`) on every reached 5-GHz VHT
+image; `vht160` (MODE_11AC_VHT160, `WMI_PEER_160MHZ`) and `vht80p80`
+(MODE_11AC_VHT80_80) require `vht_cap_info` SUPP_CHAN_WIDTH 160 or
+160/80+80 and the `peer_bw_rxnss_override` NSS map bounded by the per-chip
+`vht160_mcs_{rx,tx}_highest` in `core.c::ath10k_hw_params_list`, nonzero only
+for QCA9984 (1560) and QCA9888 (780). Other reached tuples cannot claim 160 or
+80+80 from a PCI ID. 80+80 additionally needs a second, discontiguous 80-MHz
+occupied-power receipt and center2 in VDEV_START.
 
 Physical acceptance still must validate exact PCI/BMI identity, trusted firmware
 and board calibration, ROM/OTP/PLL/code-swap, native CE/HTC/WMI/HTT progress,

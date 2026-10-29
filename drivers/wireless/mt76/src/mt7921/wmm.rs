@@ -19,6 +19,8 @@ pub(crate) struct Parameters {
     // set_tx's to_aci permutation compose to this exact command order.
     ac: [Ac; 4],
     parameter_set_count: u8,
+    /// mac80211 `wmm_acm`: user priorities whose AC requires admission.
+    acm: u8,
 }
 
 impl Parameters {
@@ -37,6 +39,7 @@ impl Parameters {
         }
         Ok(Some(Self {
             parameter_set_count: parameters.parameter_set_count,
+            acm: super::super::tx_priority::acm_mask(parameters.ac.map(|ac| ac.admission_control)),
             ac: parameters.ac.map(|ac| Ac {
                 cw_min: ac.cw_min(),
                 cw_max: ac.cw_max(),
@@ -53,17 +56,43 @@ impl Parameters {
         self.parameter_set_count == other.parameter_set_count
     }
 
-    /// Native CE SET_EDCA_PARMS (0x1d), one BSS and WMM set zero.
-    /// The host has no country-specific WMM rule interface yet. Its sole
-    /// selected AC therefore contends at least as conservatively as legacy
-    /// DCF, with no TXOP burst. Unused ACs never receive a TX descriptor.
+    /// Native CE SET_EDCA_PARMS (0x1d), one BSS and WMM set zero, carrying
+    /// the AP's parameters for every AC exactly as mt7921_mcu_set_tx does
+    /// (to_aci order; the ACM bit is not part of the firmware row).
     pub(crate) fn edca(self) -> [u8; 44] {
-        let mut ac = self.ac;
-        ac[0].cw_min = ac[0].cw_min.max(31);
-        ac[0].cw_max = ac[0].cw_max.max(1023);
-        ac[0].aifs = ac[0].aifs.max(3);
-        ac[0].txop = 0;
-        Self { ac, ..self }.encode(true)
+        self.encode(true)
+    }
+
+    /// The EDCA command after Linux v7.2 net/mac80211/util.c
+    /// `ieee80211_regulatory_limit_wmm_params` (called per AC from mlme.c
+    /// `_ieee80211_sta_wmm_params`): for a station on a channel whose
+    /// regulatory rule carries a `wmm_rule`, `cw_min`/`cw_max`/`aifs` are
+    /// raised to the rule's client values and `txop` is capped at its
+    /// channel occupancy time / 32 us. No rule leaves the AP's parameters.
+    pub(crate) fn edca_limited(self, rule: Option<narf_wireless::reg::WmmRule>) -> [u8; 44] {
+        self.limited(rule).encode(true)
+    }
+
+    pub(crate) fn limited(mut self, rule: Option<narf_wireless::reg::WmmRule>) -> Self {
+        let Some(rule) = rule else {
+            return self;
+        };
+        // Canonical ACI order BE, BK, VI, VO -> mac80211 AC (VO 0, VI 1,
+        // BE 2, BK 3), the index of `wmm_rule.client[]`.
+        for (aci, ac) in [2usize, 3, 1, 0].into_iter().enumerate() {
+            let limit = rule.client[ac];
+            let params = &mut self.ac[aci];
+            params.cw_min = params.cw_min.max(limit.cw_min);
+            params.cw_max = params.cw_max.max(limit.cw_max);
+            params.aifs = params.aifs.max(u16::from(limit.aifsn));
+            params.txop = params.txop.min(limit.cot_us / 32);
+        }
+        self
+    }
+
+    /// User priorities that require admission control (downgraded on TX).
+    pub(crate) fn acm(self) -> u8 {
+        self.acm
     }
 
     fn encode(self, qos: bool) -> [u8; 44] {
@@ -85,6 +114,7 @@ impl Parameters {
 pub(crate) fn legacy_edca() -> [u8; 44] {
     Parameters {
         parameter_set_count: 0,
+        acm: 0,
         ac: [Ac {
             cw_min: 31,
             cw_max: 1023,

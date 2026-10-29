@@ -74,6 +74,8 @@ pub fn register_with_context(
     send: SendCtxFn,
 ) -> String;
 pub fn unregister(name: &str) -> bool;
+pub fn retire_for_rebind(name: &str) -> bool;
+pub fn rebind_name(name: &str) -> Option<&'static str>;
 ```
 
 `register_with_context` stores only an opaque cookie and a permanent in-tree
@@ -87,6 +89,17 @@ Removing an interface also discards its IPv4 address, mask, gateway and DNS
 binding, along with its UDP socket state and pending ARP work. Re-registering
 the same name starts without the removed device's binding; another
 interface's configuration is unaffected.
+
+`retire_for_rebind(name)` handles a driver recovery that Linux performs
+without unregistering the `net_device` (mac80211 `ieee80211_restart_hw`). It
+removes the interface and drops its send hook and cookie, like `unregister`,
+and at the same moment it reserves the exact name and keeps the entry. No
+`%d` allocation can take the name in the meantime. A new driver generation
+calls `rebind_name(name)`, which returns the name while it is retired and
+unregistered and `None` otherwise. The new generation then registers it. That
+registration restores the retired entry's ifindex, admin state, addresses,
+MTU, namespace and counters, as an in-place same-name re-registration does,
+so the interface keeps its `wlan%d` name and ifindex across generations.
 
 ### 3.2 Frame rings
 

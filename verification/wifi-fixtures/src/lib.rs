@@ -9,10 +9,14 @@
 extern crate alloc;
 
 mod ap;
+mod ap_rsn;
 pub mod firmware;
 mod network;
 
 pub use ap::{ApError, ApPhase, FakeAp};
+pub use ap_rsn::{ApPmf, ApSaePwe};
 pub use network::{dhcp_message_type, udp_ipv4, DhcpObservations, DhcpServer, NetworkPlan};
 
 mod tests;
+
+mod ap_rsn_tests;

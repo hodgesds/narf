@@ -6,16 +6,24 @@ use alloc::{string::String, sync::Arc};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::Interface;
 use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessError};
+#[path = "coding_conversation_tests.rs"]
+mod coding_conversation_tests;
 #[path = "ht40_conversation_tests.rs"]
 mod ht40_conversation_tests;
 #[path = "ht_conversation_tests.rs"]
 mod ht_conversation_tests;
+#[path = "pmf_conversation_tests.rs"]
+mod pmf_conversation_tests;
+#[path = "rebind_conversation_tests.rs"]
+mod rebind_conversation_tests;
 #[path = "protection_conversation_tests.rs"]
 mod protection_conversation_tests;
 #[path = "sgi40_conversation_tests.rs"]
 mod sgi40_conversation_tests;
 #[path = "source_conversation_tests.rs"]
 mod source_conversation_tests;
+#[path = "vht_conversation_tests.rs"]
+mod vht_conversation_tests;
 #[path = "wmm_conversation_tests.rs"]
 mod wmm_conversation_tests;
 fn five_ghz_policy() -> narf_wireless::reg::RegulatoryDomain {
@@ -33,6 +41,9 @@ fn five_ghz_policy() -> narf_wireless::reg::RegulatoryDomain {
 }
 type ModelDevice = Device<RadioModel>;
 static ACTIVE_TEST: IrqSafeSpinLock<Option<Arc<ModelDevice>>> = IrqSafeSpinLock::new(None);
+/// A rebound generation name (`interface::generation_name`) for the next
+/// Harness, in place of a fresh `wlan%d`.
+static NEXT_NAME: IrqSafeSpinLock<Option<&'static str>> = IrqSafeSpinLock::new(None);
 fn send(generation: u64, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     let device = ACTIVE_TEST.lock().clone().ok_or(())?;
     device.enqueue_generation(generation, bytes, meta)
@@ -127,7 +138,12 @@ impl Harness {
             HwRev::Qca988x
         };
         m.ce = Some(crate::ath10k::boot::CeFixture::new(hardware));
-        let name = String::from(narf_net::iface::reserve_name("wlan%d"));
+        let name = String::from(
+            NEXT_NAME
+                .lock()
+                .take()
+                .unwrap_or_else(|| narf_net::iface::reserve_name("wlan%d")),
+        );
         let policy = Arc::new(IrqSafeSpinLock::new(Some(if frequency < 3000 {
             station_tests::policy()
         } else {
@@ -915,6 +931,7 @@ enum TestPhy {
     Ht,
     Ht40,
     Sgi40,
+    Vht80,
 }
 fn composition_radio(
     version: u32,
@@ -951,6 +968,9 @@ fn composition_radio(
     }
     if phy == TestPhy::Sgi40 {
         sgi40_conversation_tests::enable(&h)?;
+    }
+    if phy == TestPhy::Vht80 {
+        vht_conversation_tests::enable(&h, 2)?;
     }
     if power_save {
         h.model(|model| {
@@ -1164,10 +1184,14 @@ fn occupancy(htt_first: bool) -> Result<(), &'static str> {
         return Err("fixture release did not publish actual terminal CE source index");
     }
     if !htt_first {
+        // The terminal CE source index frees only the bounce slot. The first
+        // HTT ID stays owned while the queued frame takes its own ID
+        // (N-deep pipeline, Linux htt_tx.c::ath10k_htt_tx_alloc_msdu_id).
         h.pump();
         if !h.model(|m| {
-            m.ce.as_ref().unwrap().sent == sent
-                && m.inner.storage.as_ref().unwrap().tx.pending() == 1
+            m.ce.as_ref().unwrap().sent == sent + 1
+                && m.inner.storage.as_ref().unwrap().tx.pending() == 2
+                && m.data.as_ref().unwrap().held.len() == 2
         }) {
             return Err("CE receipt substituted for actual HTT completion");
         }
@@ -1183,7 +1207,7 @@ fn occupancy(htt_first: bool) -> Result<(), &'static str> {
             && m.data.as_ref().unwrap().held.len() == 1
             && m.data.as_ref().unwrap().uplink == [uplink.clone(), uplink]
     }) {
-        return Err("terminal HTT ID did not unlock exactly queued frame");
+        return Err("terminal HTT ID did not retire exactly its own frame");
     }
     Ok(())
 }

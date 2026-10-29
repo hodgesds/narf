@@ -444,6 +444,15 @@ pub(super) async fn prepare<T: Transport>(
     bmi.write_u32(HI + 0x104, 0).await?;
     bmi.write_u32(HI + 0xbc, u32::from(identity.device)).await?;
     let extra = bmi.read_u32(HI + 0xac).await?;
+    // Linux `core.c::ath10k_download_cal_data` tries the QCA9887 SI EEPROM
+    // before OTP. Its 2116-byte image replaces board data only when
+    // `ath10k_push_board_ext_data` accepts that length (no extension region);
+    // otherwise, or on any EEPROM failure, the board file plus OTP is used.
+    let eeprom = if profile.device == super::hw::QCA9887_DEVICE_ID && extra == 0 {
+        bmi.calibration_eeprom(profile.calibration).await?
+    } else {
+        None
+    };
     if extra != 0 {
         if extra & 3 != 0 {
             return Err(Error::Calibration);
@@ -456,7 +465,13 @@ pub(super) async fn prepare<T: Transport>(
     if base == 0 || base & 3 != 0 {
         return Err(Error::Address);
     }
-    bmi.write_memory(base, &board[..profile.board]).await?;
+    match &eeprom {
+        Some(calibration) => {
+            let length = calibration.len().min(profile.board);
+            bmi.write_memory(base, &calibration[..length]).await?
+        }
+        None => bmi.write_memory(base, &board[..profile.board]).await?,
+    }
     bmi.write_u32(HI + 0x58, 1).await?;
     if otp.is_some_and(|identity| identity.extended) {
         bmi.fast_download(profile.patch, otp_bytes).await?;
@@ -473,10 +488,14 @@ pub(super) async fn prepare<T: Transport>(
             bmi.write_memory(address, &data).await?;
         }
     }
-    bmi.fast_download(profile.patch, otp_bytes).await?;
-    let result = bmi.execute(profile.patch, profile.otp_parameter).await?;
-    if result != 0 && image.features & (1 << 7) == 0 {
-        return Err(Error::Calibration);
+    // A successful EEPROM download is Linux's `done` calibration mode: the
+    // OTP calibration execution is skipped.
+    if eeprom.is_none() {
+        bmi.fast_download(profile.patch, otp_bytes).await?;
+        let result = bmi.execute(profile.patch, profile.otp_parameter).await?;
+        if result != 0 && image.features & (1 << 7) == 0 {
+            return Err(Error::Calibration);
+        }
     }
     if image.features & (1 << 9) != 0 {
         bmi.write_u32(HI + 0x20, 1).await?;

@@ -88,3 +88,121 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_packet_raw_ccmp_extents_and_36bit_limits
 );
+
+fn smoke_rtw89_b_packet_qos_tid_selects_ach_qsel_and_tid_indicate() -> TestResult {
+    // (TID, channel, QSEL, TID_INDICATE) per rtw89_core_get_qsel,
+    // rtw89_core_get_ch_dma and rtw89_core_get_tid_indicate.
+    let table: [(u8, u8, u8, bool); 8] = [
+        (0, 0, 0, false),
+        (1, 1, 1, false),
+        (2, 1, 1, true),
+        (3, 0, 0, true),
+        (4, 2, 2, false),
+        (5, 2, 2, true),
+        (6, 3, 3, false),
+        (7, 3, 3, true),
+    ];
+    for (tid, channel, qsel, indicate) in table {
+        let mut bytes = frame(100, false);
+        bytes[0] = 0x88;
+        bytes[24] = tid;
+        let Ok((header, queue)) = transmit_rate(&bytes, OWN, 0, 1, 0x1000, false, 11) else {
+            return TestResult::Fail("QoS TID frame rejected");
+        };
+        let body0 = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let body2 = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+        if queue.channel() != channel
+            || queue.qsel() != qsel
+            || (body0 >> 16) & 0x3f != u32::from(channel)
+            || (body2 >> 17) & 0x3f != u32::from(qsel)
+            || (body2 >> 23 & 1 == 1) != indicate
+            || Queue::for_tid(tid) != queue
+        {
+            return TestResult::Fail("TID queue/QSEL/TID_INDICATE mapping differs");
+        }
+    }
+    // TID0 keeps the frozen flags7 descriptor bit-for-bit (no indicate bit).
+    let mut bytes = frame(100, false);
+    bytes[0] = 0x88;
+    let Ok((header, _)) = transmit(&bytes, OWN, 0, 1, 0x1000, false) else {
+        return TestResult::Fail("BE/TID0 frame rejected");
+    };
+    if header[11] & 0x80 != 0 {
+        return TestResult::Fail("TID0 gained TID_INDICATE");
+    }
+    // TID8..15, EOSP, ack policy and A-MSDU-present bits stay rejected.
+    for control in [8u8, 0x10, 0x20, 0x80] {
+        let mut bad = bytes.clone();
+        bad[24] = control;
+        if transmit(&bad, OWN, 0, 1, 0x1000, false).is_ok() {
+            return TestResult::Fail("optional QoS control bits accepted");
+        }
+    }
+    let mut bad = bytes.clone();
+    bad[25] = 1;
+    if transmit(&bad, OWN, 0, 1, 0x1000, false).is_ok() {
+        return TestResult::Fail("QoS control high byte accepted");
+    }
+    if Queue::ordinary(false).len() != 2
+        || Queue::ordinary(true)
+            .iter()
+            .fold(STOP_WPDMA, |m, q| m | q.stop_bit())
+            != STOP_ALL
+    {
+        return TestResult::Fail("ordinary ring set or DMA stop mask differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_packet_qos_tid_selects_ach_qsel_and_tid_indicate
+);
+
+fn smoke_rtw89_b_packet_txwd_ampdu_fields() -> TestResult {
+    let mut qos = frame(100, false);
+    qos[0] = 0x88;
+    qos[24..26].fill(0);
+    let agg = Agg {
+        num: 63,
+        density: 5,
+    };
+    let address = 0x1234_5000;
+    let word = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+    let Ok((plain, _)) = transmit_rate(&qos, OWN, 0, 3, address, false, FIRMWARE_RA | 2) else {
+        return TestResult::Fail("plain RA QoS TXWD");
+    };
+    let Ok((bytes, queue)) =
+        transmit_agg(&qos, OWN, 0, 3, address, false, FIRMWARE_RA | 2, Some(agg))
+    else {
+        return TestResult::Fail("aggregated TXWD refused");
+    };
+    // BODY3 AGG_EN(12), INFO1 MAX_AGGNUM[7:0] beside DATA_RTY_LOWEST_RATE,
+    // INFO2 AMPDU_DENSITY[20:18]; every other byte unchanged.
+    let mut expected = plain.clone();
+    expected[12..16].copy_from_slice(&(word(&plain, 12) | 1 << 12).to_le_bytes());
+    expected[28..32].copy_from_slice(&(2u32 << 16 | 63).to_le_bytes());
+    expected[32..36].copy_from_slice(&(5u32 << 18).to_le_bytes());
+    if queue != Queue::Data
+        || bytes != expected
+        || word(&plain, 12) & 1 << 12 != 0
+        || word(&plain, 32) != 0
+    {
+        return TestResult::Fail("TXWD A-MPDU fields differ");
+    }
+    // Only firmware-RA QoS DATA with a 3-bit density is aggregated.
+    let wide = Agg { num: 1, density: 8 };
+    let data = frame(100, false);
+    let management = frame(100, true);
+    if transmit_agg(&data, OWN, 0, 3, address, false, FIRMWARE_RA, Some(agg)).is_ok()
+        || transmit_agg(&qos, OWN, 0, 3, address, false, 2, Some(agg)).is_ok()
+        || transmit_agg(&qos, OWN, 0, 3, address, false, FIRMWARE_RA, Some(wide)).is_ok()
+        || transmit_agg(&management, OWN, 0, 3, address, false, 0, Some(agg)).is_ok()
+    {
+        return TestResult::Fail("aggregation admitted outside firmware-RA QoS DATA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_packet_txwd_ampdu_fields
+);

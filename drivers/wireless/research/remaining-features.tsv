@@ -1,391 +1,198 @@
 family	feature_id	capability	kind	evidence_path	evidence_line
-ath10k	aggregate_retries	Aggregate retransmission	feature	drivers/wireless/specification/ath10k.md	894
-ath10k	alternate_calibration_loading	Alternative calibration-source loading	feature	drivers/wireless/specification/ath10k.md	898
-ath10k	ap	AP role	feature	drivers/wireless/specification/ath10k.md	897
-ath10k	associated_scan	Associated scanning	feature	drivers/wireless/specification/ath10k.md	896
-ath10k	automatic_credential_replay	Automatic credential replay after recovery	feature	drivers/wireless/specification/ath10k.md	898
-ath10k	automatic_protection	Automatic AP protection-mode updates	feature	drivers/wireless/specification/ath10k.md	895
-ath10k	automatic_recovery	Automatic firmware recovery	feature	drivers/wireless/specification/ath10k.md	407
-ath10k	beacon_hints	Beacon-hint regulatory updates	feature	drivers/wireless/specification/ath10k.md	896
-ath10k	dfs	DFS	feature	drivers/wireless/specification/ath10k.md	895
-ath10k	dma_reclamation	DMA reclamation after terminal/reset ownership	feature	drivers/wireless/specification/ath10k.md	405
-ath10k	dynamic_wmm	Dynamic WMM/EDCA updates	feature	drivers/wireless/specification/ath10k.md	895
-ath10k	hardware_keys	Hardware key and crypto offload	feature	drivers/wireless/specification/ath10k.md	896
-ath10k	host_bus_pm	Host-bus power management	feature	drivers/wireless/specification/ath10k.md	897
-ath10k	ht2040_coexistence	HT20/40 coexistence control	feature	drivers/wireless/specification/ath10k.md	891
-ath10k	ht40_2ghz	2.4GHz HT40	feature	drivers/wireless/specification/ath10k.md	890
-ath10k	indoor_regulatory	Indoor-only channel admission	feature	drivers/wireless/specification/ath10k.md	896
-ath10k	interrupt_service	Interrupt-driven packet service	feature	drivers/wireless/specification/ath10k.md	897
-ath10k	multiple_spatial_streams	Additional spatial streams	feature	drivers/wireless/specification/ath10k.md	892
-ath10k	non_be_tx	Non-BE TX classification and scheduling	feature	drivers/wireless/specification/ath10k.md	895
-ath10k	offchannel_scan	Off-channel scanning	feature	drivers/wireless/specification/ath10k.md	896
-ath10k	p2p	P2P role	feature	drivers/wireless/specification/ath10k.md	897
-ath10k	pfc	PFC fetch and queue protocol ownership	feature	drivers/wireless/specification/ath10k.md	894
-ath10k	pmf	PMF	feature	drivers/wireless/specification/ath10k.md	896
-ath10k	qca9887_enablement	QCA9887 native PCI and station enablement	chip	drivers/wireless/specification/ath10k.md	887
-ath10k	rx_ldpc	RX LDPC	feature	drivers/wireless/specification/ath10k.md	892
-ath10k	rx_stbc	RX STBC	feature	drivers/wireless/specification/ath10k.md	892
-ath10k	stable_interface_recovery	Stable-interface recovery	feature	drivers/wireless/specification/ath10k.md	898
-ath10k	system_suspend	System suspend	feature	drivers/wireless/specification/ath10k.md	897
-ath10k	tspec	TSPEC	feature	drivers/wireless/specification/ath10k.md	895
-ath10k	tx_ba	Native TX Block Ack	feature	drivers/wireless/specification/ath10k.md	893
-ath10k	tx_ldpc	TX LDPC	feature	drivers/wireless/specification/ath10k.md	892
-ath10k	tx_pipeline	Independent multi-packet native TX pipeline	feature	drivers/wireless/specification/ath10k.md	894
-ath10k	tx_stbc	TX STBC	feature	drivers/wireless/specification/ath10k.md	892
-ath10k	uapsd	U-APSD	feature	drivers/wireless/specification/ath10k.md	895
-ath10k	unexpanded_wider_geometry	Wider-channel geometry is not enumerated into individual widths	unknown	drivers/wireless/specification/ath10k.md	893
-ath10k	vht	VHT	feature	drivers/wireless/specification/ath10k.md	893
-ath10k	wake_offload	Wake offload	feature	drivers/wireless/specification/ath10k.md	897
-ath10k	wpa3	WPA3	feature	drivers/wireless/specification/ath10k.md	896
-ath11k	aarch64_composition	Native aarch64 startup/PCI/IRQ/board-discovery composition gap; not a proven missing PHY feature	unknown	drivers/wireless/specification/ath11k.md	1824
-ath11k	dt_board_variant	Device-tree board-variant discovery	feature	drivers/wireless/specification/ath11k.md	1824
-ath11k	host_multicast_pn	Host multicast PN checking absent; firmware-versus-host responsibility needs proof	unknown	drivers/wireless/specification/ath11k.md	1975
-ath11k	ipq5018_enablement	IPQ5018 native SoC/AHB profile enablement	chip	drivers/wireless/specification/ath11k.md	1827
-ath11k	ipq6018_enablement	IPQ6018 native SoC/AHB profile enablement	chip	drivers/wireless/specification/ath11k.md	1827
-ath11k	ipq8074_enablement	IPQ8074 native SoC/AHB profile enablement	chip	drivers/wireless/specification/ath11k.md	1827
-ath11k	mhi_bandwidth_scaling	MHI bandwidth scaling; admitted-device applicability unproven	unknown	drivers/wireless/specification/ath11k.md	113
-ath11k	mhi_client_rings	MHI client-managed rings; admitted-device applicability unproven	unknown	drivers/wireless/specification/ath11k.md	113
-ath11k	mhi_edl	MHI EDL mode; admitted-device applicability unproven	unknown	drivers/wireless/specification/ath11k.md	113
-ath11k	mhi_offload_rings	MHI offload rings; admitted-device applicability unproven	unknown	drivers/wireless/specification/ath11k.md	113
-ath11k	mhi_rsc_rings	MHI RSC rings; admitted-device applicability unproven	unknown	drivers/wireless/specification/ath11k.md	113
-ath11k	noncontiguous_ratemask	Non-contiguous RATEMASK firmware programming	feature	drivers/wireless/specification/ath11k.md	1824
-ath11k	other_qmi_platform_contracts	Unreached fixed-memory/DEVICE_INFO/fixed-BDF platform contracts	unknown	drivers/wireless/specification/ath11k.md	1890
-ath11k	qcn9074_enablement	QCN9074 native HAL/core/DP/runtime enablement	chip	drivers/wireless/specification/ath11k.md	1826
-ath11k	qmi_factory_test	QMI FTM factory-test mode; unreached on WCN6855 PCIe	unknown	drivers/wireless/specification/ath11k.md	1890
-ath11k	radar_diagnostics	Radar-detector diagnostics	feature	drivers/wireless/specification/ath11k.md	1824
-ath11k	spectral_diagnostics	Spectral diagnostics	feature	drivers/wireless/specification/ath11k.md	1824
-ath11k	twt_dialogs	Per-dialog TWT control	feature	drivers/wireless/specification/ath11k.md	1824
-ath11k	wcn6750_enablement	WCN6750 native platform profile enablement	chip	drivers/wireless/specification/ath11k.md	1827
-ath9k	additional_ac_scheduling	Additional AC scheduling	feature	drivers/wireless/specification/ath9k.md	577
-ath9k	additional_channels	Live operation on additional channels	feature	drivers/wireless/specification/ath9k.md	576
-ath9k	additional_tid_scheduling	Additional TID scheduling	feature	drivers/wireless/specification/ath9k.md	577
-ath9k	channel_retuning	Channel retuning	feature	drivers/wireless/specification/ath9k.md	576
-ath9k	dma_reclamation	DMA reclamation	feature	drivers/wireless/specification/ath9k.md	579
-ath9k	factory_profile_selection	Additional factory-profile selection	feature	drivers/wireless/specification/ath9k.md	576
-ath9k	ht40	HT40	feature	drivers/wireless/specification/ath9k.md	577
-ath9k	interrupt_service	Interrupt-driven packet service	feature	drivers/wireless/specification/ath9k.md	577
-ath9k	larger_tx_aggregates	TX aggregates larger than the implemented two-MPDU sender	feature	drivers/wireless/specification/ath9k.md	577
-ath9k	other_chip_enablement	Other ath9k chip profiles are not enumerated in this ledger	unknown	drivers/wireless/specification/ath9k.md	583
-ath9k	periodic_calibration	Periodic calibration	feature	drivers/wireless/specification/ath9k.md	576
-ath9k	rejoin	Rejoin after terminal closure	feature	drivers/wireless/specification/ath9k.md	579
-ath9k	removal	Device removal	feature	drivers/wireless/specification/ath9k.md	579
-ath9k	reset	Native generation-safe reset	feature	drivers/wireless/specification/ath9k.md	579
-ath9k	sgi40	SGI40	feature	drivers/wireless/specification/ath9k.md	577
-ath9k	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/ath9k.md	577
-ath9k	unexpanded_power_transitions	Power transitions lack individually enumerated states or operations	unknown	drivers/wireless/specification/ath9k.md	578
-brcmfmac	additional_chip_profiles	Additional CPU/RAM/chip/OTP profiles	chip	drivers/wireless/specification/brcmfmac.md	515
-brcmfmac	all_priority_queues	All-priority packet queues	feature	drivers/wireless/specification/cyw43439.md	502
-brcmfmac	ap_mode	Access Point mode	feature	drivers/wireless/specification/cyw43439.md	499
-brcmfmac	beamforming	Beamforming: native direction/capability unproven	unknown	drivers/wireless/specification/brcmfmac.md	360
-brcmfmac	confirmed_stop_quiescence	Confirmed transport/device stop and quiescence	feature	drivers/wireless/specification/cyw43439.md	500
-brcmfmac	dma_reclamation	Safe reclamation of published native DMA	feature	drivers/wireless/specification/brcmfmac.md	518
-brcmfmac	extended_nss_bw	Extended NSS/BW: actual retained-chip applicability unproven	unknown	drivers/wireless/specification/brcmfmac.md	360
-brcmfmac	extra_scan_ies	Extra scan Probe Request IEs	feature	drivers/wireless/specification/cyw43439.md	562
-brcmfmac	fast_bss_transition	Fast BSS Transition (FT)	feature	drivers/wireless/specification/cyw43439.md	501
-brcmfmac	gtk_rekey_offload	GTK rekey offload with host-owned key/event lifecycle	feature	drivers/wireless/specification/cyw43439.md	501
-brcmfmac	host_bus_runtime_pm	Host-bus runtime power management	feature	drivers/wireless/specification/cyw43439.md	272
-brcmfmac	host_supplicant_fallback	Host-supplicant fallback	feature	drivers/wireless/specification/brcmfmac.md	517
-brcmfmac	iommu_quiescence	IOMMU-backed device quiescence	feature	drivers/wireless/specification/brcmfmac.md	518
-brcmfmac	larger_flow_budget	Larger native flow budgets	feature	drivers/wireless/specification/brcmfmac.md	517
-brcmfmac	ldpc	LDPC: actual retained firmware capability unproven	unknown	drivers/wireless/specification/brcmfmac.md	360
-brcmfmac	monitor_mode	Monitor mode	feature	drivers/wireless/specification/cyw43439.md	499
-brcmfmac	native_80211_rx	Native 802.11 receive	feature	drivers/wireless/specification/brcmfmac.md	516
-brcmfmac	native_rx_metadata	Native receive metadata	feature	drivers/wireless/specification/brcmfmac.md	517
-brcmfmac	negotiated_wmm_reporting	Current negotiated firmware WMM-state reporting	feature	drivers/wireless/specification/cyw43439.md	502
-brcmfmac	nonzero_descriptor_prefix	Nonzero native descriptor-prefix geometry	feature	drivers/wireless/specification/brcmfmac.md	514
-brcmfmac	optional_pmf	Optional PMF with MFPC AP omitting response RSNE: native negotiated-state proof missing	feature	drivers/wireless/specification/brcmfmac.md	308
-brcmfmac	p2p_mode	P2P mode	feature	drivers/wireless/specification/cyw43439.md	499
-brcmfmac	pcie_irq	PCIe interrupt-driven service	feature	drivers/wireless/specification/brcmfmac.md	518
-brcmfmac	pmksa_pmkid_cache	PMKSA / PMKID caching	feature	drivers/wireless/specification/cyw43439.md	501
-brcmfmac	post_reset_rejoin	Rejoin after native reset	feature	drivers/wireless/specification/cyw43439.md	500
-brcmfmac	qos_telemetry	QoS queue/traffic telemetry	feature	drivers/wireless/specification/cyw43439.md	502
-brcmfmac	random_scan_mac	Randomized scan MAC addresses	feature	drivers/wireless/specification/cyw43439.md	563
-brcmfmac	roaming	Roaming	feature	drivers/wireless/specification/cyw43439.md	501
-brcmfmac	shared_v7	Firmware shared ABI version 7	feature	drivers/wireless/specification/brcmfmac.md	515
-brcmfmac	stbc	STBC: actual retained firmware capability unproven	unknown	drivers/wireless/specification/brcmfmac.md	360
-brcmfmac	system_resume	System resume	feature	drivers/wireless/specification/cyw43439.md	562
-brcmfmac	system_suspend	System suspend	feature	drivers/wireless/specification/cyw43439.md	562
-brcmfmac	transport_reset	Confirmed native transport reset	feature	drivers/wireless/specification/cyw43439.md	500
-brcmfmac	vht160	160 MHz operation: actual retained-chip applicability unproven	unknown	drivers/wireless/specification/brcmfmac.md	360
-brcmfmac	vht_80p80	VHT 80+80: actual retained-chip applicability unproven	unknown	drivers/wireless/specification/brcmfmac.md	360
-brcmfmac	virtual_interfaces	Additional virtual interfaces	feature	drivers/wireless/specification/cyw43439.md	563
-brcmfmac	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/cyw43439.md	500
-brcmfmac	wpa3_sae_offload	WPA3-Personal / SAE firmware offload	feature	drivers/wireless/specification/cyw43439.md	498
-cyw43439	additional_host_ports	Additional SDIO/gSPI platform or host ports	chip	drivers/wireless/specification/cyw43439.md	555
-cyw43439	all_priority_queues	All-priority packet queues	feature	drivers/wireless/specification/cyw43439.md	502
-cyw43439	ap_mode	Access Point mode	feature	drivers/wireless/specification/cyw43439.md	499
-cyw43439	confirmed_stop_quiescence	Confirmed transport/device stop and quiescence	feature	drivers/wireless/specification/cyw43439.md	500
-cyw43439	extra_scan_ies	Extra scan Probe Request IEs	feature	drivers/wireless/specification/cyw43439.md	562
-cyw43439	fast_bss_transition	Fast BSS Transition (FT)	feature	drivers/wireless/specification/cyw43439.md	501
-cyw43439	gtk_rekey_offload	GTK rekey offload with host-owned key/event lifecycle	feature	drivers/wireless/specification/cyw43439.md	501
-cyw43439	host_bus_runtime_pm	Host-bus runtime power management	feature	drivers/wireless/specification/cyw43439.md	272
-cyw43439	monitor_mode	Monitor mode	feature	drivers/wireless/specification/cyw43439.md	499
-cyw43439	negotiated_wmm_reporting	Current negotiated firmware WMM-state reporting	feature	drivers/wireless/specification/cyw43439.md	502
-cyw43439	optional_pmf	Optional PMF with MFPC AP omitting response RSNE: native negotiated-state proof missing	feature	drivers/wireless/specification/cyw43439.md	503
-cyw43439	p2p_mode	P2P mode	feature	drivers/wireless/specification/cyw43439.md	499
-cyw43439	pmksa_pmkid_cache	PMKSA / PMKID caching	feature	drivers/wireless/specification/cyw43439.md	501
-cyw43439	post_reset_rejoin	Rejoin after native reset	feature	drivers/wireless/specification/cyw43439.md	500
-cyw43439	qos_telemetry	QoS queue/traffic telemetry	feature	drivers/wireless/specification/cyw43439.md	502
-cyw43439	random_scan_mac	Randomized scan MAC addresses	feature	drivers/wireless/specification/cyw43439.md	563
-cyw43439	roaming	Roaming	feature	drivers/wireless/specification/cyw43439.md	501
-cyw43439	sdio_4bit	4-bit SDIO operation	feature	drivers/wireless/specification/cyw43439.md	608
-cyw43439	sdio_high_speed	High-speed SDIO operation	feature	drivers/wireless/specification/cyw43439.md	608
-cyw43439	sdio_host_dma	SDIO host DMA operation	feature	drivers/wireless/specification/cyw43439.md	608
-cyw43439	sdio_irq	SDIO interrupt-driven service	feature	drivers/wireless/specification/cyw43439.md	608
-cyw43439	system_resume	System resume	feature	drivers/wireless/specification/cyw43439.md	562
-cyw43439	system_suspend	System suspend	feature	drivers/wireless/specification/cyw43439.md	562
-cyw43439	transport_reset	Confirmed native transport reset	feature	drivers/wireless/specification/cyw43439.md	500
-cyw43439	virtual_interfaces	Additional virtual interfaces	feature	drivers/wireless/specification/cyw43439.md	563
-cyw43439	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/cyw43439.md	500
-cyw43439	wpa3_sae_offload	WPA3-Personal / SAE firmware offload	feature	drivers/wireless/specification/cyw43439.md	498
-iwlwifi	active_scan_probes	Active scan probes	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	air_deauthentication	Over-air deauthentication	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	ap	AP role	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	ax210_station_enablement	AX210 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1553
-iwlwifi	ax211_station_enablement	AX211 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1553
-iwlwifi	ax411_station_enablement	AX411 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1553
-iwlwifi	be200_station_enablement	Bz/BE200 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1553
-iwlwifi	cross_index_gtk_restore	Cross-index GTK restoration	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	cross_owner_key_history	Cross-owner key history	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	cross_peer_gtk_restore	Cross-peer GTK restoration	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	eht	EHT on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
-iwlwifi	gen2_pmf	Gen2 PMF	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	gen2_recovery	Gen2 recovery	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	gen2_vht	Gen2 VHT	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	gen2_wpa3	Gen2 WPA3	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	group_nested_rx	Group-addressed nested A-MSDU-in-A-MPDU RX	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	he	HE	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	ht40	HT40	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	ldpc	LDPC	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	live_regulatory_owner	Gen3 and Sc live regulatory-policy owner	feature	drivers/wireless/specification/iwlwifi.md	1553
-iwlwifi	ml_baid	Alternate ML BAID profile	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	mlo	MLO on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
-iwlwifi	multiple_rx_queues	Multiple RX queues	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	nss2	NSS2	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	other_profile_combinations	Other PCI/firmware combinations lack an enumerated exact admission profile	unknown	drivers/wireless/specification/iwlwifi.md	1555
-iwlwifi	other_qos_ac_tx	Additional QoS AC TX queues	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	other_qos_tid_tx	Additional QoS TID TX queues	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	p2p	P2P role	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	persistent_key_history	Persistent key history	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	platform_power_owner	Gen3 and Sc live platform TX-power enforcement owner	feature	drivers/wireless/specification/iwlwifi.md	1553
-iwlwifi	ptk_reuse	Safe PTK reuse	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	rss	Receive-side scaling	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	runtime_pm	Runtime power management	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	six_ghz	6GHz operation on applicable 6E/7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
-iwlwifi	stbc	STBC (directions not enumerated in ledger)	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	system_resume	System resume	feature	drivers/wireless/specification/iwlwifi.md	84
-iwlwifi	system_suspend	System suspend	feature	drivers/wireless/specification/iwlwifi.md	84
-iwlwifi	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/iwlwifi.md	1552
-iwlwifi	unspecified_advanced_offloads	Advanced offloads are not individually enumerated	unknown	drivers/wireless/specification/iwlwifi.md	1554
-iwlwifi	width_160	160MHz operation on applicable profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
-iwlwifi	width_320	320MHz operation on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1554
-iwlwifi	wow	Wake on WLAN	feature	drivers/wireless/specification/iwlwifi.md	1552
-mt76	additional_roles	Additional interface roles: ledger does not identify individual roles	unknown	drivers/wireless/specification/mt7921.md	963
-mt76	all_tid_data_security	All-TID data and security support	feature	drivers/wireless/specification/mt7921.md	959
-mt76	associated_active_scan	Active scanning while associated	feature	drivers/wireless/specification/mt7921.md	940
-mt76	beamforming	Beamforming with source-advertised beamformee support	feature	drivers/wireless/specification/mt7921.md	400
-mt76	colocated_6ghz_scan	Colocated 6 GHz scanning	feature	drivers/wireless/specification/mt7921.md	132
-mt76	country_wmm_constraints	Country-specific WMM constraints	feature	drivers/wireless/specification/mt7921.md	948
-mt76	extended_nss_bw	Extended NSS/BW operation: native applicability unproven	unknown	drivers/wireless/specification/mt7921.md	960
-mt76	fragmentation	802.11 fragmentation support	feature	drivers/wireless/specification/mt7921.md	950
-mt76	he_phy	HE PHY operation	feature	drivers/wireless/specification/mt7921.md	941
-mt76	ht_protection_modes	HT operation protection modes beyond protection0	feature	drivers/wireless/specification/mt7921.md	418
-mt76	loadable_packet_abi	Loadable wireless packet ABI	feature	drivers/wireless/specification/mt7921.md	944
-mt76	midstream_tx_ba_restart	Midstream transmit BA restart	feature	drivers/wireless/specification/mt7921.md	949
-mt76	native_key_pipeline_retirement	Native old-key firmware/MAC/FIFO pipeline retirement	feature	drivers/wireless/specification/mt7921.md	964
-mt76	non_rfc1042_llc	Non-RFC1042 LLC receive support	feature	drivers/wireless/specification/mt7921.md	881
-mt76	noncoherent_dma	Non-coherent platform DMA support	feature	drivers/wireless/specification/mt7921.md	943
-mt76	off_channel_active_scan	Off-channel active scanning	feature	drivers/wireless/specification/mt7921.md	940
-mt76	other_tx_ba_tids	Transmit BA on TIDs beyond retained TID0	feature	drivers/wireless/specification/mt7921.md	949
-mt76	pci_removal	PCI removal lifecycle	feature	drivers/wireless/specification/mt7921.md	942
-mt76	pci_reprobe_generation	PCI reprobe with generation isolation	feature	drivers/wireless/specification/mt7921.md	942
-mt76	per_domain_iommu	Per-domain IOMMU mappings	feature	drivers/wireless/specification/mt7921.md	942
-mt76	pmf	Protected management frames (PMF)	feature	drivers/wireless/specification/mt7921.md	941
-mt76	rx_ba_tids_8_15	Recipient BA TIDs beyond 8-bit bitmap: native ABI applicability unproven	unknown	drivers/wireless/specification/mt7921.md	957
-mt76	rx_ba_windows_above_64	Recipient BA windows above 64	feature	drivers/wireless/specification/mt7921.md	957
-mt76	rx_delayed_ba	Recipient delayed BA agreements	feature	drivers/wireless/specification/mt7921.md	957
-mt76	rx_multi_tid_ba	Recipient multi-TID BA agreements	feature	drivers/wireless/specification/mt7921.md	957
-mt76	scan_dwell_control	Requested scan dwell control: CONNAC2 nonzero timing contract unproven	unknown	drivers/wireless/specification/mt7921.md	135
-mt76	six_ghz_operation	6 GHz radio operation	feature	drivers/wireless/specification/mt7921.md	941
-mt76	system_resume	System resume	feature	drivers/wireless/specification/mt7921.md	942
-mt76	system_suspend	System suspend	feature	drivers/wireless/specification/mt7921.md	942
-mt76	tspec	TSPEC admission	feature	drivers/wireless/specification/mt7921.md	948
-mt76	tx_amsdu	Transmit A-MSDU	feature	drivers/wireless/specification/mt7921.md	958
-mt76	tx_delayed_ba	Originator delayed BA agreements	feature	drivers/wireless/specification/mt7921.md	958
-mt76	tx_multi_tid_ba	Originator multi-TID BA agreements	feature	drivers/wireless/specification/mt7921.md	958
-mt76	tx_stbc	Transmit STBC	feature	drivers/wireless/specification/mt7921.md	961
-mt76	uapsd	U-APSD	feature	drivers/wireless/specification/mt7921.md	948
-mt76	vht_80p80	VHT 80+80 operation: native hardware applicability unproven	unknown	drivers/wireless/specification/mt7921.md	960
-mt76	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/mt7921.md	962
-mt76	wmm_all_ac_priority	All WMM access categories and priority selection	feature	drivers/wireless/specification/mt7921.md	947
-mt76	wpa3_sae	WPA3-Personal / SAE authentication	feature	drivers/wireless/specification/mt7921.md	963
-rtl8xxxu	adaptive_rate_selection	Adaptive DATA rate selection	feature	drivers/wireless/specification/rtl8xxxu.md	503
-rtl8xxxu	additional_operating_channels	Noninitial operating channels and safe FIFO retuning	feature	drivers/wireless/specification/rtl8xxxu.md	497
-rtl8xxxu	additional_pm_modes	PM submodes beyond runtime PM are not enumerated	unknown	drivers/wireless/specification/rtl8xxxu.md	503
-rtl8xxxu	bt_coexistence	Bluetooth coexistence on RTL8723BU	feature	drivers/wireless/specification/rtl8xxxu.md	500
-rtl8xxxu	endpoint_reset	Controller-proven EP0/Halted endpoint reset	feature	drivers/wireless/specification/rtl8xxxu.md	497
-rtl8xxxu	expanded_active_scanning	Active scanning beyond the initial profile	feature	drivers/wireless/specification/rtl8xxxu.md	503
-rtl8xxxu	expanded_passive_scanning	Passive scanning beyond the initial channel	feature	drivers/wireless/specification/rtl8xxxu.md	503
-rtl8xxxu	five_ghz_operation	Broader band operation including VHT-profile 5GHz	feature	drivers/wireless/specification/rtl8xxxu.md	493
-rtl8xxxu	ht40	HT40	feature	drivers/wireless/specification/rtl8xxxu.md	501
-rtl8xxxu	live_edca_updates	Fresh-lifecycle requirement does not explicitly schedule live EDCA update support	unknown	drivers/wireless/specification/rtl8xxxu.md	322
-rtl8xxxu	qos_all_tid_routing	QoS packet routing across all supported TIDs	feature	drivers/wireless/specification/rtl8xxxu.md	503
-rtl8xxxu	qos_null	QoS Null frames	feature	drivers/wireless/specification/rtl8xxxu.md	309
-rtl8xxxu	rate_fallback	DATA rate fallback	feature	drivers/wireless/specification/rtl8xxxu.md	336
-rtl8xxxu	rtl8192eu	RTL8192EU retained runtime	chip	drivers/wireless/specification/rtl8xxxu.md	481
-rtl8xxxu	rtl8723bu	RTL8723BU retained runtime	chip	drivers/wireless/specification/rtl8xxxu.md	481
-rtl8xxxu	rtl8821cu	RTL8821CU retained runtime using its actual upstream transport	chip	drivers/wireless/specification/rtl8xxxu.md	506
-rtl8xxxu	rtl8822bu	RTL8822BU retained runtime using its actual upstream transport	chip	drivers/wireless/specification/rtl8xxxu.md	506
-rtl8xxxu	runtime_power_management	Runtime power management	feature	drivers/wireless/specification/rtl8xxxu.md	503
-rtl8xxxu	rx_ampdu	RX A-MPDU	feature	drivers/wireless/specification/rtl8xxxu.md	439
-rtl8xxxu	rx_block_ack	Recipient RX Block Ack agreements	feature	drivers/wireless/specification/rtl8xxxu.md	439
-rtl8xxxu	rx_reordering	RX sequence reordering	feature	drivers/wireless/specification/rtl8xxxu.md	439
-rtl8xxxu	safe_rejoin	Safe reassociation/rejoin	feature	drivers/wireless/specification/rtl8xxxu.md	497
-rtl8xxxu	tspec	TSPEC admission	feature	drivers/wireless/specification/rtl8xxxu.md	309
-rtl8xxxu	tx_ampdu	TX A-MPDU	feature	drivers/wireless/specification/rtl8xxxu.md	439
-rtl8xxxu	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/rtl8xxxu.md	439
-rtl8xxxu	tx_block_ack	Originator TX Block Ack agreements	feature	drivers/wireless/specification/rtl8xxxu.md	439
-rtl8xxxu	uapsd	U-APSD	feature	drivers/wireless/specification/rtl8xxxu.md	309
-rtl8xxxu	usb_transfer_slot_reuse	Safe USB transfer-slot reclamation/reuse	feature	drivers/wireless/specification/rtl8xxxu.md	494
-rtl8xxxu	vht	VHT operation on RTL8821CU/RTL8822BU	feature	drivers/wireless/specification/rtl8xxxu.md	508
-rtl8xxxu	wmm_all_access_categories	Packet routing across all WMM access categories	feature	drivers/wireless/specification/rtl8xxxu.md	501
-rtlwifi	active_scanning	Active scanning	feature	drivers/wireless/specification/rtlwifi.md	303
-rtlwifi	adaptive_rate_selection	Adaptive DATA rate selection	feature	drivers/wireless/specification/rtlwifi.md	615
-rtlwifi	adaptive_retry_control	Adaptive retry control	feature	drivers/wireless/specification/rtlwifi.md	419
-rtlwifi	additional_c2h_events	Additional runtime C2H event coverage is not enumerated	unknown	drivers/wireless/specification/rtlwifi.md	605
-rtlwifi	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtlwifi.md	615
-rtlwifi	bt_coexistence	Bluetooth coexistence on RTL8723AE/BE	feature	drivers/wireless/specification/rtlwifi.md	618
-rtlwifi	checksum_offload_applicability	Checksum offload hardware applicability is not established	unknown	drivers/wireless/specification/rtlwifi.md	338
-rtlwifi	device_removal	Device removal	feature	drivers/wireless/specification/rtlwifi.md	609
-rtlwifi	dma_reclamation	Published DMA reclamation	feature	drivers/wireless/specification/rtlwifi.md	605
-rtlwifi	dynamic_antenna_selection	Dynamic antenna selection/tracking	feature	drivers/wireless/specification/rtlwifi.md	158
-rtlwifi	dynamic_edca	Live AP WMM/EDCA parameter updates	feature	drivers/wireless/specification/rtlwifi.md	407
-rtlwifi	five_ghz_operation	5GHz band operation on RTL8192DE/RTL8821AE	feature	drivers/wireless/specification/rtlwifi.md	617
-rtlwifi	ht40	HT40	feature	drivers/wireless/specification/rtlwifi.md	615
-rtlwifi	irq_delivery	Interrupt-driven runtime service	feature	drivers/wireless/specification/rtlwifi.md	605
-rtlwifi	ldpc_applicability	LDPC applicability and direction not established for the EE slice	unknown	drivers/wireless/specification/rtlwifi.md	436
-rtlwifi	multi_radio	Multiple live radios	feature	drivers/wireless/specification/rtlwifi.md	609
-rtlwifi	operating_reset	Reset of an operating retained owner	feature	drivers/wireless/specification/rtlwifi.md	609
-rtlwifi	other_chip_phy_variants	Remaining per-chip HT/QoS variants are not enumerated	unknown	drivers/wireless/specification/rtlwifi.md	616
-rtlwifi	pm_submodes	PM beyond named suspend is not enumerated	unknown	drivers/wireless/specification/rtlwifi.md	615
-rtlwifi	qos_all_tid_routing	QoS packet routing across all supported TIDs	feature	drivers/wireless/specification/rtlwifi.md	615
-rtlwifi	randomized_scan_mac	Randomized scan MAC addresses	feature	drivers/wireless/specification/rtlwifi.md	303
-rtlwifi	rate_fallback	DATA rate fallback	feature	drivers/wireless/specification/rtlwifi.md	418
-rtlwifi	rf_gain_tracking	RF gain/power tracking	feature	drivers/wireless/specification/rtlwifi.md	615
-rtlwifi	rtl8192ce_family	RTL8192CE retained runtime including exact RTL8188CE RF variant	chip	drivers/wireless/specification/rtlwifi.md	616
-rtlwifi	rtl8192de	RTL8192DE per-function retained runtime	chip	drivers/wireless/specification/rtlwifi.md	617
-rtlwifi	rtl8192ee	RTL8192EE retained runtime	chip	drivers/wireless/specification/rtlwifi.md	616
-rtlwifi	rtl8723ae	RTL8723AE retained runtime	chip	drivers/wireless/specification/rtlwifi.md	618
-rtlwifi	rtl8723be	RTL8723BE retained runtime	chip	drivers/wireless/specification/rtlwifi.md	618
-rtlwifi	rtl8821ae	RTL8821AE retained runtime	chip	drivers/wireless/specification/rtlwifi.md	619
-rtlwifi	rts_cts_protection	RTS/CTS protection	feature	drivers/wireless/specification/rtlwifi.md	436
-rtlwifi	rx_block_ack	Recipient RX Block Ack	feature	drivers/wireless/specification/rtlwifi.md	615
-rtlwifi	rx_reordering	RX sequence reordering	feature	drivers/wireless/specification/rtlwifi.md	615
-rtlwifi	safe_rejoin	Safe reassociation/rejoin	feature	drivers/wireless/specification/rtlwifi.md	615
-rtlwifi	sgi20	SGI20	feature	drivers/wireless/specification/rtlwifi.md	615
-rtlwifi	stbc_applicability	STBC applicability and direction not established for the EE slice	unknown	drivers/wireless/specification/rtlwifi.md	436
-rtlwifi	system_suspend	System suspend	feature	drivers/wireless/specification/rtlwifi.md	609
-rtlwifi	traffic_priority_classification	Traffic priority classification	feature	drivers/wireless/specification/rtlwifi.md	379
-rtlwifi	tso_offload_applicability	TSO offload hardware applicability is not established	unknown	drivers/wireless/specification/rtlwifi.md	338
-rtlwifi	tspec	TSPEC admission	feature	drivers/wireless/specification/rtlwifi.md	379
-rtlwifi	tx_aggregation	TX aggregation	feature	drivers/wireless/specification/rtlwifi.md	436
-rtlwifi	tx_block_ack	Originator TX Block Ack	feature	drivers/wireless/specification/rtlwifi.md	615
-rtlwifi	uapsd	U-APSD	feature	drivers/wireless/specification/rtlwifi.md	379
-rtlwifi	vht	VHT operation on RTL8821AE	feature	drivers/wireless/specification/rtlwifi.md	619
-rtlwifi	vlan_offload_applicability	VLAN offload hardware applicability is not established	unknown	drivers/wireless/specification/rtlwifi.md	338
-rtlwifi	wmm_all_access_categories	Packet routing across all WMM access categories	feature	drivers/wireless/specification/rtlwifi.md	615
-rtw88	active_scanning	Active scanning	feature	drivers/wireless/specification/rtw88.md	1449
-rtw88	additional_ht_widths	Additional HT widths are not individually enumerated	unknown	drivers/wireless/specification/rtw88.md	1448
-rtw88	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw88.md	1449
-rtw88	beamforming	Beamforming	feature	drivers/wireless/specification/rtw88.md	264
-rtw88	broader_ba_variants	Additional TX aggregation/recipient-negotiation variants are not enumerated	unknown	drivers/wireless/specification/rtw88.md	1449
-rtw88	checksum_offload_applicability	Checksum offload hardware applicability is not established	unknown	drivers/wireless/specification/rtw88.md	506
-rtw88	cts_to_self	CTS-to-self protection	feature	drivers/wireless/specification/rtw88.md	1346
-rtw88	device_removal	Device removal	feature	drivers/wireless/specification/rtw88.md	1443
-rtw88	dma_reclamation	Published DMA/map reclamation	feature	drivers/wireless/specification/rtw88.md	1443
-rtw88	dynamic_phy_thermal_scope	Remaining dynamic PHY/thermal algorithms are not enumerated	unknown	drivers/wireless/specification/rtw88.md	264
-rtw88	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specification/rtw88.md	1446
-rtw88	greenfield_applicability	HT greenfield applicability is not established by the backlog	unknown	drivers/wireless/specification/rtw88.md	934
-rtw88	ht_control_scope	HT-control header variants/applicability are not established by the backlog	unknown	drivers/wireless/specification/rtw88.md	934
-rtw88	ht_protection_modes	Additional AP-negotiated HT protection modes	feature	drivers/wireless/specification/rtw88.md	1346
-rtw88	ldpc_applicability	LDPC direction and per-chip applicability are not established by the backlog	unknown	drivers/wireless/specification/rtw88.md	934
-rtw88	multi_device	Multiple live device lifetimes	feature	drivers/wireless/specification/rtw88.md	1443
-rtw88	multi_stream_ht	Multi-stream HT on RTL8822B/RTL8822C	feature	drivers/wireless/specification/rtw88.md	1448
-rtw88	operating_reset	Reset of an operating retained owner	feature	drivers/wireless/specification/rtw88.md	1443
-rtw88	qos_all_tid_routing	QoS packet scheduling across all supported TIDs	feature	drivers/wireless/specification/rtw88.md	1449
-rtw88	radio_coexistence	Complete radio coexistence state machine	feature	drivers/wireless/specification/rtw88.md	1450
-rtw88	randomized_scan_mac	Randomized scan MAC addresses	feature	drivers/wireless/specification/rtw88.md	500
-rtw88	rate_fallback	DATA rate fallback	feature	drivers/wireless/specification/rtw88.md	949
-rtw88	rf_power_tracking	Thermal RF power tracking/compensation	feature	drivers/wireless/specification/rtw88.md	795
-rtw88	rtl8822be	RTL8822BE retained firmware/radio/packet/station runtime	chip	drivers/wireless/specification/rtw88.md	1450
-rtw88	runtime_sleep	Runtime sleep	feature	drivers/wireless/specification/rtw88.md	1450
-rtw88	safe_rejoin	Safe reassociation/rejoin	feature	drivers/wireless/specification/rtw88.md	1450
-rtw88	scan_probe_extra_ies	Driver-admitted extra probe-request IEs	feature	drivers/wireless/specification/rtw88.md	500
-rtw88	smps_scope	SMPS modes/applicability are not established by the backlog	unknown	drivers/wireless/specification/rtw88.md	933
-rtw88	stbc_applicability	STBC direction and per-chip applicability are not established by the backlog	unknown	drivers/wireless/specification/rtw88.md	934
-rtw88	system_suspend	System suspend	feature	drivers/wireless/specification/rtw88.md	1443
-rtw88	tso_offload_applicability	TSO offload hardware applicability is not established	unknown	drivers/wireless/specification/rtw88.md	506
-rtw88	vht	VHT operation	feature	drivers/wireless/specification/rtw88.md	1448
-rtw88	vlan_offload_applicability	VLAN offload hardware applicability is not established	unknown	drivers/wireless/specification/rtw88.md	506
-rtw88	wmm_all_access_categories	Packet scheduling across all WMM access categories	feature	drivers/wireless/specification/rtw88.md	1449
-rtw88	wow	Wake on Wireless	feature	drivers/wireless/specification/rtw88.md	1450
-rtw89	adaptive_rate_fallback	Adaptive rate fallback	feature	drivers/wireless/specification/rtw89.md	957
+ath10k	alternate_calibration_loading	Pre-cal/cal-file and DT/NVMEM calibration-source loading; blocked on missing sources: firmware.rs/firmware_source.rs only load board-2.bin/board.bin/otp and the QCA9887 SI EEPROM, no pre-cal-pci-<bus>.bin / cal-pci-<bus>.bin registry naming exists (Linux core.c::ath10k_fetch_cal_file, ath10k_download_cal_file), and NARF has no devicetree qcom,ath10k-calibration-data / NVMEM cell provider for PCIe functions (ath10k_download_cal_dt, ath10k_download_cal_nvmem)	feature	drivers/wireless/specification/ath10k.md	1135
+ath10k	ap	AP role; blocked on an AP owner: wmi_runtime/wire.rs only creates VDEV_TYPE_STA (vdev_create writes type 2), there are no WMI BCN_TMPL/PRB_TMPL, vdev_up-as-AP, beacon/TIM/DTIM ownership, station peer table or group-key TX, and the shared narf_wireless iface exposes no AP-mode start/stop API (Linux mac.c::ath10k_add_interface NL80211_IFTYPE_AP, ath10k_mac_setup_bcn_tmpl)	feature	drivers/wireless/specification/ath10k.md	1134
+ath10k	associated_scan	Associated scanning; blocked in wmi_runtime.rs::scan_run, which refuses any scan while a peer exists (self.peer.is_some()), and the RAW data owner has no power-save/NULL-frame fencing or HTT pause around WMI_START_SCAN dwell (Linux mac.c::ath10k_hw_scan on an associated vdev relies on firmware off-channel PS handling)	feature	drivers/wireless/specification/ath10k.md	1133
+ath10k	automatic_credential_replay	Automatic credential replay after recovery; blocked on a shared API: automatic recovery (restart.rs) reboots a fresh generation but neither pci::recover nor narf_wireless keeps the caller's SME/credential state (SSID, PMK/SAE password, BSS) across the rebound interface generation (the wlan%d netdev itself now survives via retire_for_rebind/rebind_name); needs a shared reconnect/replay contract equivalent to mac80211 ieee80211_reconfig re-adding keys and stations	feature	drivers/wireless/specification/ath10k.md	1136
+ath10k	automatic_protection	Automatic AP protection-mode updates; blocked on beacon tracking: after association the RAW owner does not parse later beacons' ERP/HT Operation changes (protection.rs only applies a caller StationProtection request), so firmware VDEV_PARAM_PROTECTION_MODE/USE_CTS_PROT are never re-programmed from AP changes (Linux mac80211 BSS_CHANGED_ERP_CTS_PROT -> mac.c::ath10k_bss_info_changed)	feature	drivers/wireless/specification/ath10k.md	1132
+ath10k	beacon_hints	Beacon-hint regulatory updates; blocked on regulatory.rs::Permission, which has no beacon-hint state: World/NO_IR 5 GHz channels stay passive and no cfg80211 reg_process_beacons equivalent exists in the shared narf_wireless reg module to lift NO_IR from a received beacon	feature	drivers/wireless/specification/ath10k.md	1133
+ath10k	dfs	DFS; blocked on missing radar handling: regulatory.rs refuses DFS channels for this STA profile, there is no WMI_PDEV_DFS_ENABLE / phyerr radar pulse decode / CAC or NOP timer owner (Linux ath10k mac.c + wmi.c ath10k_wmi_event_dfs, drivers/net/wireless/ath/dfs_pattern_detector.c), and the shared reg module has no DFS state machine	feature	drivers/wireless/specification/ath10k.md	1132
+ath10k	dynamic_wmm	Dynamic WMM/EDCA updates; blocked on beacon tracking: WMM parameters are programmed once from the association response (wmi_runtime/wmm.rs::command) and later beacon WMM Parameter Set Count changes are not observed or re-sent (Linux mac80211 ieee80211_sta_wmm_params -> mac.c::ath10k_conf_tx)	feature	drivers/wireless/specification/ath10k.md	1132
+ath10k	hardware_keys	Hardware key and crypto offload; blocked on the key owner: the data path (data.rs transmit_ethernet*/receive_with_nonce/receive_amsdu/receive_management, software CCMP/BIP and per-key replay) is built on narf_wireless::station_security::Security, which keeps TK/GTK/IGTK private and exposes no key-install event, header-only CCMP TX formatting or decrypted-RX PN check, and the WMI INIT image runs RAW with firmware crypto disabled (Linux core.c ATH10K_CRYPT_MODE_SW). Plan: (1) move ath10k to the lower eapol::Supplicant key owner as ath11k mac/sec.rs does, retaining the station RSNE/RSNXE/SAE PMK already kept in station_pmf.rs::Rsn; (2) add a per-dialect WMI_VDEV_INSTALL_KEY builder (none exists): wmi.h struct wmi_vdev_install_key_cmd vdev_id, peer_macaddr, key_idx, key_flags WMI_KEY_PAIRWISE/WMI_KEY_GROUP|TX_USAGE, key_cipher WMI_CIPHER_AES_CCM (BIP: WMI_CIPHER_AES_CMAC), rsc/tsc counters, key_len and key_data, plus the wmi-tlv.c ath10k_wmi_tlv_op_gen_vdev_install_key TLV form and the install-complete event (Linux mac.c::ath10k_install_key/ath10k_send_key/ath10k_install_peer_wep_keys pattern, PEER_ASSOC WMI_PEER_PMF per map: 0x10000000 main/10.2, 0x08000000 TLV, none in 10.1); (3) select the RX decap: RAW+HW crypto (rawmode=1 cryptmode=0, IEEE80211_KEY_FLAG_GENERATE_IV, htt_rx.c::ath10k_htt_rx_h_undecap_raw is_decrypted with the CCMP header kept for a host PN check) keeps data.rs raw_frame_inner and only flips its undecrypted-descriptor requirement, whereas native-wifi decap needs a new RX normalizer; RAW+HW is the smaller step; (4) WMI mgmt RX then arrives firmware-decrypted with Protected set (wmi.c::ath10k_wmi_rx_is_decrypted), so receive_management needs a decrypted-frame PN-only path	feature	drivers/wireless/specification/ath10k.md	1133
+ath10k	host_bus_pm	Host-bus power management; not done: boot.rs::power_up clears PCIe ASPM (saved_aspm) and only restores it on Drop, and there is no QCA6174/QCA9377 pci_ps SoC sleep/wake refcount (Linux pci.c::ath10k_pci_sleep/ath10k_pci_wake, pci_ps, ath10k_pci_hif_start ASPM restore); needs a wake-refcounted MMIO owner before ASPM can be restored while firmware runs	feature	drivers/wireless/specification/ath10k.md	1134
+ath10k	ht2040_coexistence	HT20/40 coexistence control; blocked on missing OBSS handling: no 20/40 BSS Coexistence action frames, OBSS scan or 40 MHz intolerant tracking exist in the ath10k station owner or the shared narf_wireless crate (Linux mac80211 ieee80211_ht_cap_ie_to_sta_ht_cap/OBSS, ath10k WMI_PEER_40MHZ updates)	feature	drivers/wireless/specification/ath10k.md	1127
+ath10k	ht40_2ghz	2.4GHz HT40; blocked on ht2040_coexistence and occupied-power: ht.rs only offers HT40 on 5 GHz (Profile::offer) and regulatory.rs has no 2.4 GHz 40 MHz occupied-bandwidth permission; 2.4 GHz HT40 additionally requires 20/40 coexistence (IEEE 802.11 11.16) which is absent	feature	drivers/wireless/specification/ath10k.md	1126
+ath10k	indoor_regulatory	Indoor-only channel admission; blocked on regulatory.rs::Permission and the shared reg rules carrying no indoor/installation-location fact (no NL80211_RRF_NO_OUTDOOR / user indoor hint source in NARF), so indoor-only channels stay refused	feature	drivers/wireless/specification/ath10k.md	1133
+ath10k	multiple_spatial_streams	Additional spatial streams; blocked on chain selection: the station profile is SISO (mlme.rs peer assoc writes one spatial stream, ht.rs Profile carries only the first HT MCS byte (MCS 0-7)) and WMI INIT/PDEV never selects cfg_tx/rx_chainmask > 1 from per-board facts; needs board/OTP chain facts plus 2x2 HT/VHT rate sets (Linux mac.c::ath10k_peer_assoc_h_ht, ath10k_mac_get_max_nss)	feature	drivers/wireless/specification/ath10k.md	1128
+ath10k	offchannel_scan	Off-channel scanning; blocked like associated_scan: scan_run refuses scans while associated and there is no remain-on-channel owner (Linux mac.c::ath10k_remain_on_channel, WMI_SCAN with ROC)	feature	drivers/wireless/specification/ath10k.md	1133
+ath10k	p2p	P2P role; blocked on ap plus P2P state: no P2P device/GO/client vdev subtypes (wire.rs writes subtype NONE), no NoA/opportunistic PS, action-frame or ROC owner, and no shared P2P API (Linux mac.c P2P vdev subtypes, wmi P2P_NOA events)	feature	drivers/wireless/specification/ath10k.md	1134
+ath10k	pfc	PFC fetch and queue protocol ownership; blocked on HTT pull/push: PFC images are detected (wmi_boot.rs feature bit 13) but kept diagnostic-only; implementing them needs HTT TX fetch indication/confirm, tx queue state and per-peer/TID host queues (Linux htt_rx.c::ath10k_htt_rx_tx_fetch_ind, htt_tx.c::ath10k_htt_tx_fetch_resp, txrx.c), none of which exist	feature	drivers/wireless/specification/ath10k.md	1131
+ath10k	tspec	TSPEC; blocked on missing ADDTS/DELTS: no WMM TSPEC action-frame exchange or admitted-time accounting exists (tx_qos.rs downgrades every ACM AC), and no shared narf_wireless TSPEC API (Linux mac80211 ieee80211_sta_handle_tspec_ac_params, nl80211 add_tx_ts)	feature	drivers/wireless/specification/ath10k.md	1132
+ath10k	tx_stbc	TX STBC; blocked on chain selection: ht.rs states TX STBC needs cfg_tx_chainmask > 1, which the SISO profile never selects (see multiple_spatial_streams)	feature	drivers/wireless/specification/ath10k.md	1128
+ath10k	uapsd	U-APSD; blocked on queue ownership: the WMM Information IE is sent with U-APSD disabled (wmm.rs::information) and there is no trigger-frame/service-period owner or WMI_STA_PS U-APSD param path (Linux mac.c::ath10k_conf_tx_uapsd)	feature	drivers/wireless/specification/ath10k.md	1132
+ath10k	vht160	VHT 160 MHz on QCA9984/QCA9888; blocked on a 160 MHz occupied-power receipt: SISO VHT20/40/80 is implemented (ht.rs local_vht via LocalPhy::vht80), but regulatory.rs::Permission::occupied_width only grants 20/40/80 (no 160 segment ch36-64 includes DFS ch52-64, which this STA profile refuses), the local profile never calls LocalVht::with_160mhz, and PEER_ASSOC has no WMI_PEER_160MHZ/peer_bw_rxnss_override NSS map (Linux core.c vht160_mcs_*_highest, mac.c::ath10k_peer_assoc_h_vht MODE_11AC_VHT160)	feature	drivers/wireless/specification/ath10k.md	1146
+ath10k	vht80p80	VHT 80+80 on QCA9984/QCA9888; blocked on vht160 plus a second discontiguous 80 MHz occupied-power receipt and center2 in VDEV_START	feature	drivers/wireless/specification/ath10k.md	1146
+ath10k	wake_offload	Wake offload; blocked on WoWLAN: no WMI WOW_ENABLE/WOW_ADD_WAKE_PATTERN/WOW_HOSTWAKEUP builders or wake-event decode exist, and narf_power system PM has no wake-source configuration hook for a WLAN device (Linux wow.c::ath10k_wow_op_suspend)	feature	drivers/wireless/specification/ath10k.md	1134
+ath11k	aarch64_composition	Native aarch64 composed startup/PCI/IRQ/board-discovery fixtures: DT board discovery now exists (board::dt_facts), and the x86-gated composed fixtures compile on aarch64, but enabling them kills the aarch64 test kernel inside the composed DHCP/integration fixture with no summary (consistent with kernel-stack overflow from by-value fixture state); needs a fixture stack-footprint rework before un-gating	unknown	drivers/wireless/specification/ath11k.md	1891
+ath11k	ipq5018_enablement	IPQ5018 native SoC/AHB profile enablement; Qualcomm SoC layer (drivers/soc/qcom), ath11k AHB glue (ahb.rs), GLINK-SMEM + QRTR over GLINK, DT interrupt delivery, the WLFW AHB paths, HwRev admission, the AHB HIF (ahb_hif), per-chip hw_ops, the bus DT driver match (narf_bus::register_dt_driver / probe_all_dt; ath11k_ahb registers at Subsys, walks the boot DTB at Device) and the production bring-up ahb_live::LiveAhb are implemented and fixture-tested (QEMU only, no silicon run): LiveAhb maps the DT windows into AhbIo, boots the remote with live SMEM/SMP2P (Q6Wcss with DT GCC resets, or PasRproc over SCM), registers GlinkSmem + GlinkQrtr on the glink-edge interrupt, binds the CE/DP and Q6 lines, runs WLFW to FW_READY and ath11k_core_qmi_firmware_ready with DpHooks, and the spawned WLFW task hands a ready core to runtime::start_ahb (Rt + Shared); multi-pdev DP/WMI are in (Dp::pdev_alloc per radio with the rxdma1 monitor buf/dst/desc rings, their HTT SRING_SETUP and monitor link descriptors; HTT peer-map v2; init_cmd with ath11k_init_wmi_config_ipq8074 + band-to-mac; per-pdev WMI endpoints incl. CE7/CE9; DpHwParams::for_rev admits the IPQ parts) (IPQ5018 CE SRNGs through the remapped CE window; ath11k_hw_hal_params_ipq5018); residual: no AHB netdev (iface registration is PCI-typed), no post-boot SMP2P crash monitoring/recovery, the path after WLFW FW_READY (core start, WCN6750 DEVICE_INFO BAR mapping) has no fixture (no fake WLFW server over GLINK); multi-pdev residual: the RX service pass (refill replenish, RXDMA error, monitor-status reap) covers pdev 0 only, the mac layer registers one radio on pdev 0 (MacConfig::wcn6855), WMI commands go to wmi[0], monitor mode unsupported; permanent: no upstream IPQ5018 WCSS remoteproc binding (Linux v7.2)	chip	drivers/wireless/specification/ath11k.md	1933
+ath11k	ipq6018_enablement	IPQ6018 native SoC/AHB profile enablement; Qualcomm SoC layer (drivers/soc/qcom), ath11k AHB glue (ahb.rs), GLINK-SMEM + QRTR over GLINK, DT interrupt delivery, the WLFW AHB paths, HwRev admission, the AHB HIF (ahb_hif), per-chip hw_ops, the bus DT driver match (narf_bus::register_dt_driver / probe_all_dt; ath11k_ahb registers at Subsys, walks the boot DTB at Device) and the production bring-up ahb_live::LiveAhb are implemented and fixture-tested (QEMU only, no silicon run): LiveAhb maps the DT windows into AhbIo, boots the remote with live SMEM/SMP2P (Q6Wcss with DT GCC resets, or PasRproc over SCM), registers GlinkSmem + GlinkQrtr on the glink-edge interrupt, binds the CE/DP and Q6 lines, runs WLFW to FW_READY and ath11k_core_qmi_firmware_ready with DpHooks, and the spawned WLFW task hands a ready core to runtime::start_ahb (Rt + Shared); multi-pdev DP/WMI are in (Dp::pdev_alloc per radio with the rxdma1 monitor buf/dst/desc rings, their HTT SRING_SETUP and monitor link descriptors; HTT peer-map v2; init_cmd with ath11k_init_wmi_config_ipq8074 + band-to-mac; per-pdev WMI endpoints incl. CE7/CE9; DpHwParams::for_rev admits the IPQ parts); residual: no AHB netdev (iface registration is PCI-typed), no post-boot SMP2P crash monitoring/recovery, the path after WLFW FW_READY (core start, WCN6750 DEVICE_INFO BAR mapping) has no fixture (no fake WLFW server over GLINK); multi-pdev residual: the RX service pass (refill replenish, RXDMA error, monitor-status reap) covers pdev 0 only, the mac layer registers one radio on pdev 0 (MacConfig::wcn6855), WMI commands go to wmi[0], monitor mode unsupported	chip	drivers/wireless/specification/ath11k.md	1933
+ath11k	ipq8074_enablement	IPQ8074 native SoC/AHB profile enablement; Qualcomm SoC layer (drivers/soc/qcom), ath11k AHB glue (ahb.rs), GLINK-SMEM + QRTR over GLINK, DT interrupt delivery, the WLFW AHB paths, HwRev admission, the AHB HIF (ahb_hif), per-chip hw_ops, the bus DT driver match (narf_bus::register_dt_driver / probe_all_dt; ath11k_ahb registers at Subsys, walks the boot DTB at Device) and the production bring-up ahb_live::LiveAhb are implemented and fixture-tested (QEMU only, no silicon run): LiveAhb maps the DT windows into AhbIo, boots the remote with live SMEM/SMP2P (Q6Wcss with DT GCC resets, or PasRproc over SCM), registers GlinkSmem + GlinkQrtr on the glink-edge interrupt, binds the CE/DP and Q6 lines, runs WLFW to FW_READY and ath11k_core_qmi_firmware_ready with DpHooks, and the spawned WLFW task hands a ready core to runtime::start_ahb (Rt + Shared); multi-pdev DP/WMI are in (Dp::pdev_alloc per radio with the rxdma1 monitor buf/dst/desc rings, their HTT SRING_SETUP and monitor link descriptors; HTT peer-map v2; init_cmd with ath11k_init_wmi_config_ipq8074 + band-to-mac; per-pdev WMI endpoints incl. CE7/CE9; DpHwParams::for_rev admits the IPQ parts); residual: no AHB netdev (iface registration is PCI-typed), no post-boot SMP2P crash monitoring/recovery, the path after WLFW FW_READY (core start, WCN6750 DEVICE_INFO BAR mapping) has no fixture (no fake WLFW server over GLINK); multi-pdev residual: the RX service pass (refill replenish, RXDMA error, monitor-status reap) covers pdev 0 only, the mac layer registers one radio on pdev 0 (MacConfig::wcn6855), WMI commands go to wmi[0], monitor mode unsupported; permanent: mainline ipq8074.dtsi has no WCSS remoteproc node and gcc-ipq8074.c no GCC_WCSSAON_RESET (Linux v7.2)	chip	drivers/wireless/specification/ath11k.md	1933
+ath11k	qcn9074_enablement	QCN9074 native HAL/core/DP/runtime enablement; hal_rx_desc_qcn9074, qcn9074_ops, the qcn9074_regs HAL map (HwParams.regs), static BAR windows (qcn9074::static_bar_offset routed in NativeIo, ath11k_pci_select_static_window after MHI start), CoreConfig (1 radio, 8 vdevs, 128 peers, IPQ5018 service map) and multi-pdev DpHwParams (rxdma1, peer-map v2, full_monitor_mode flag) are implemented and fixture-tested; tables pass runtime_profile_complete but probe refuses QCN9074 via pci::UNVERIFIED_RUNTIME until a composed PCI startup smoke exists; the shared multi-pdev DP/WMI (per-radio pdev_alloc + SRING_SETUP, ath11k_init_wmi_config_ipq8074 init_cmd) is in; multi-pdev residual: the RX service pass (refill replenish, RXDMA error, monitor-status reap) covers pdev 0 only, the mac layer registers one radio on pdev 0 (MacConfig::wcn6855), WMI commands go to wmi[0], monitor mode unsupported (incl. full monitor mode); no composed QCN9074 PCI startup fixture and nothing run on hardware	chip	drivers/wireless/specification/ath11k.md	1893
+ath11k	wcn6750_enablement	WCN6750 native platform profile enablement; Qualcomm SoC layer (drivers/soc/qcom), ath11k AHB glue (ahb.rs), GLINK-SMEM + QRTR over GLINK, DT interrupt delivery, the WLFW AHB paths, HwRev admission, the AHB HIF (ahb_hif), per-chip hw_ops, the bus DT driver match (narf_bus::register_dt_driver / probe_all_dt; ath11k_ahb registers at Subsys, walks the boot DTB at Device) and the production bring-up ahb_live::LiveAhb are implemented and fixture-tested (QEMU only, no silicon run): LiveAhb maps the DT windows into AhbIo, boots the remote with live SMEM/SMP2P (Q6Wcss with DT GCC resets, or PasRproc over SCM), registers GlinkSmem + GlinkQrtr on the glink-edge interrupt, binds the CE/DP and Q6 lines, runs WLFW to FW_READY and ath11k_core_qmi_firmware_ready with DpHooks, and the spawned WLFW task hands a ready core to runtime::start_ahb (Rt + Shared); multi-pdev DP/WMI are in (Dp::pdev_alloc per radio with the rxdma1 monitor buf/dst/desc rings, their HTT SRING_SETUP and monitor link descriptors; HTT peer-map v2; init_cmd with ath11k_init_wmi_config_ipq8074 + band-to-mac; per-pdev WMI endpoints incl. CE7/CE9; DpHwParams::for_rev admits the IPQ parts); WCN6750-specific done: DEVICE_INFO BAR mapped into AhbIo static windows at runtime (LiveAhb::qmi_ready), the TCL ring selector fed txq::flow_hash (runtime::tx_ring_selector, skb_get_hash) instead of the CPU id, the GLINK edge interrupt routed through IPCC (AhbGlinkBus::Ipcc: ipcc_set_enabled + ipcc_pending), SMP2P edges serviced on every remoteproc wait iteration regardless of interrupt parent; residual: no AHB netdev (iface registration is PCI-typed), no post-boot SMP2P crash monitoring/recovery, the path after WLFW FW_READY (core start, WCN6750 DEVICE_INFO BAR mapping) has no fixture (no fake WLFW server over GLINK); RPMh xo and cx/mx proxy votes need an RPMh RSC + cmd-db driver that drivers/soc/qcom does not have; AOSS QMP load_state could be built from the existing io::RegIo + ipc::Ipcc pieces but is not implemented	chip	drivers/wireless/specification/ath11k.md	1933
+ath9k	additional_channels	Live operation on additional channels	feature	drivers/wireless/specification/ath9k.md	675
+ath9k	ar5416_enablement	AR5416/AR5418 (168c:0023/0024) native enablement	chip	drivers/wireless/specification/ath9k.md	846
+ath9k	ar9160_enablement	AR9160 (168c:0027) native enablement	chip	drivers/wireless/specification/ath9k.md	848
+ath9k	ar9280_enablement	AR9280 (168c:0029/002a) native enablement	chip	drivers/wireless/specification/ath9k.md	849
+ath9k	ar9287_enablement	AR9287 (168c:002d/002e) native enablement	chip	drivers/wireless/specification/ath9k.md	851
+ath9k	ar9300_enablement	AR9380/AR9390 (168c:0030) native enablement	chip	drivers/wireless/specification/ath9k.md	853
+ath9k	ar9462_enablement	AR9462 (168c:0034) native enablement	chip	drivers/wireless/specification/ath9k.md	857
+ath9k	ar9485_enablement	AR9485/AR1111 (168c:0032/0037) native enablement	chip	drivers/wireless/specification/ath9k.md	855
+ath9k	ar9565_enablement	AR9565 (168c:0036) native enablement	chip	drivers/wireless/specification/ath9k.md	859
+ath9k	ar9580_enablement	AR9580 (168c:0033) native enablement	chip	drivers/wireless/specification/ath9k.md	856
+ath9k	channel_retuning	Channel retuning	feature	drivers/wireless/specification/ath9k.md	675
+ath9k	factory_profile_selection	Additional factory-profile selection	feature	drivers/wireless/specification/ath9k.md	695
+ath9k	host_bus_pm	PCIe ASPM host-bus power management	feature	drivers/wireless/specification/ath9k.md	734
+ath9k	ht40	HT40	feature	drivers/wireless/specification/ath9k.md	689
+ath9k	idle_full_sleep	Idle FULL_SLEEP with use-counted wake and AWAKE restore	feature	drivers/wireless/specification/ath9k.md	723
+ath9k	larger_tx_aggregates	TX aggregates larger than the implemented two-MPDU sender	feature	drivers/wireless/specification/ath9k.md	710
+ath9k	periodic_calibration	Periodic calibration	feature	drivers/wireless/specification/ath9k.md	700
+ath9k	sgi40	SGI40	feature	drivers/wireless/specification/ath9k.md	689
+ath9k	station_network_sleep	Station NETWORK_SLEEP power save with beacon timers	feature	drivers/wireless/specification/ath9k.md	730
+ath9k	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/ath9k.md	716
+brcmfmac	additional_chip_profiles	Additional CPU/RAM/chip/OTP profiles (incl. 160 MHz-capable chips; retained BCM43602 is 80 MHz)	chip	drivers/wireless/specification/cyw43439.md	521
+brcmfmac	ap_mode	Access Point mode	feature	drivers/wireless/specification/cyw43439.md	519
+brcmfmac	confirmed_stop_quiescence	Confirmed transport/device stop and quiescence (CYW43439 SDIO only; BCM43602 PCIe closed in brcmfmac.md: SDIO needs a host WL_REG_ON/card power cycle)	feature	drivers/wireless/specification/cyw43439.md	515
+brcmfmac	gtk_rekey_offload	GTK rekey offload (gtk_key_info; needs host-supplicant KCK/KEK + WOWL_GTK)	feature	drivers/wireless/specification/cyw43439.md	518
+brcmfmac	host_bus_runtime_pm	Host-bus runtime power management	feature	drivers/wireless/specification/cyw43439.md	517
+brcmfmac	iommu_quiescence	IOMMU-backed device quiescence	feature	drivers/wireless/specification/cyw43439.md	516
+brcmfmac	monitor_mode	Monitor mode (incl. native 802.11 msgbuf RX with radiotap/HW RX-header metadata)	feature	drivers/wireless/specification/cyw43439.md	519
+brcmfmac	nonzero_descriptor_prefix	Nonzero native descriptor-prefix geometry	feature	drivers/wireless/specification/cyw43439.md	521
+brcmfmac	p2p_mode	P2P mode	feature	drivers/wireless/specification/cyw43439.md	519
+brcmfmac	post_reset_rejoin	Rejoin after native reset (CYW43439 SDIO only; BCM43602 PCIe closed in brcmfmac.md: SDIO needs a host WL_REG_ON/card power cycle)	feature	drivers/wireless/specification/cyw43439.md	515
+brcmfmac	system_resume	System resume (CYW43439 SDIO only; BCM43602 PCIe hot and cold resume closed in brcmfmac.md: SDIO needs MMC_PM_KEEP_POWER or a host WL_REG_ON/card power cycle)	feature	drivers/wireless/specification/cyw43439.md	517
+brcmfmac	transport_reset	Confirmed native transport reset (CYW43439 SDIO only; BCM43602 PCIe closed in brcmfmac.md: SDIO needs a host WL_REG_ON/card power cycle)	feature	drivers/wireless/specification/cyw43439.md	515
+brcmfmac	virtual_interfaces	Additional virtual interfaces	feature	drivers/wireless/specification/cyw43439.md	519
+brcmfmac	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/cyw43439.md	518
+cyw43439	additional_host_ports	Additional SDIO/gSPI platform or host ports	chip	drivers/wireless/specification/cyw43439.md	522
+cyw43439	ap_mode	Access Point mode	feature	drivers/wireless/specification/cyw43439.md	519
+cyw43439	confirmed_stop_quiescence	Confirmed transport/device stop and quiescence	feature	drivers/wireless/specification/cyw43439.md	515
+cyw43439	gtk_rekey_offload	GTK rekey offload (gtk_key_info; needs host-supplicant KCK/KEK + WOWL_GTK)	feature	drivers/wireless/specification/cyw43439.md	518
+cyw43439	host_bus_runtime_pm	Host-bus runtime power management	feature	drivers/wireless/specification/cyw43439.md	517
+cyw43439	monitor_mode	Monitor mode	feature	drivers/wireless/specification/cyw43439.md	519
+cyw43439	p2p_mode	P2P mode	feature	drivers/wireless/specification/cyw43439.md	519
+cyw43439	post_reset_rejoin	Rejoin after native reset	feature	drivers/wireless/specification/cyw43439.md	515
+cyw43439	sdio_4bit	4-bit SDIO operation	feature	drivers/wireless/specification/cyw43439.md	520
+cyw43439	sdio_high_speed	High-speed SDIO operation	feature	drivers/wireless/specification/cyw43439.md	520
+cyw43439	sdio_host_dma	SDIO host DMA operation	feature	drivers/wireless/specification/cyw43439.md	520
+cyw43439	sdio_irq	SDIO interrupt-driven service	feature	drivers/wireless/specification/cyw43439.md	520
+cyw43439	system_resume	System resume	feature	drivers/wireless/specification/cyw43439.md	517
+cyw43439	system_suspend	System suspend	feature	drivers/wireless/specification/cyw43439.md	517
+cyw43439	transport_reset	Confirmed native transport reset	feature	drivers/wireless/specification/cyw43439.md	515
+cyw43439	virtual_interfaces	Additional virtual interfaces	feature	drivers/wireless/specification/cyw43439.md	519
+cyw43439	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/cyw43439.md	518
+iwlwifi	active_scan_probes	Active scan probes	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	ap	AP role	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	ax210_station_enablement	AX210 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1556
+iwlwifi	ax211_station_enablement	AX211 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1556
+iwlwifi	ax411_station_enablement	AX411 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1556
+iwlwifi	be200_station_enablement	Bz/BE200 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	1556
+iwlwifi	eht	EHT on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1557
+iwlwifi	he	HE	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	live_regulatory_owner	Gen3 and Sc live regulatory-policy owner	feature	drivers/wireless/specification/iwlwifi.md	1556
+iwlwifi	ml_baid	Alternate ML BAID profile	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	mlo	MLO on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1557
+iwlwifi	multiple_rx_queues	Multiple RX queues	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	p2p	P2P role	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	persistent_key_history	Persistent key history	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	platform_power_owner	Gen3 and Sc live platform TX-power enforcement owner	feature	drivers/wireless/specification/iwlwifi.md	1556
+iwlwifi	rss	Receive-side scaling	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	sched_scan_offload	Scheduled-scan (PNO/net-detect) firmware offload [API available: WirelessNetIface::{sched_scan_support, start_sched_scan, stop_sched_scan} with SchedScanSupport/SchedScanRequest, NL80211_CMD_START/STOP_SCHED_SCAN, nl80211::notify_sched_scan_results/stopped (wireless spec 3.4, Scheduled scan)]	feature	drivers/wireless/specification/iwlwifi.md	1557
+iwlwifi	six_ghz	6GHz operation on applicable 6E/7 profiles [API available: association::Bss.band / channel::Band::Ghz6 / frequency_in, he::HeOperation::six_ghz_operation, association::six_ghz::{admit, admit_with_rule, He6GhzCapability, He6GhzOperation}, reg::PowerType6Ghz + RegFlags::NO_6GHZ_{VLP,AFC}_CLIENT (wireless spec 3, 6 GHz band identity); a 6 GHz JoinPlan is not yet available] [API available: 6 GHz JoinPlan - association::JoinPlan::prepare_6ghz + six_ghz()/SixGhzPlan {operation, power_type, channel/width (SixGhzWidth incl. 320 with EHT), peer/local He6GhzCapability for STA_REC_HE_6G, he/eht}, six_ghz::{SixGhzLocal, plan}, eht::LocalEht::with_320mhz (wireless spec 3, 6 GHz JoinPlan)]	feature	drivers/wireless/specification/iwlwifi.md	1557
+iwlwifi	tx_amsdu	TX A-MSDU	feature	drivers/wireless/specification/iwlwifi.md	1555
+iwlwifi	width_160	160MHz operation on applicable profiles	feature	drivers/wireless/specification/iwlwifi.md	1557
+iwlwifi	width_320	320MHz operation on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	1557
+iwlwifi	wow	Wake on WLAN	feature	drivers/wireless/specification/iwlwifi.md	1555
+mt76	ap_mode	Access Point mode (mt792x_init_wiphy NL80211_IFTYPE_AP)	feature	drivers/wireless/specification/mt7921.md	1576
+mt76	associated_active_scan	Active scanning while associated [mt76 round 4: native work, no shared gap - scan owner is Busy in State::Associated (passive_scan.rs:544-546)] [mt76 round 5: native work, no shared gap - the scan wait loop drops non-beacon MPDUs (no hand-off to the station RX owner), and an active scan's per-channel SET_RATE_TX_POWER rows and closing all-NO_IR channel domain would clobber the associated grant; see spec 8]	feature	drivers/wireless/specification/mt7921.md	1583
+mt76	loadable_packet_abi	Loadable wireless packet ABI	feature	drivers/wireless/specification/mt7921.md	1465
+mt76	midstream_tx_ba_restart	Midstream transmit BA restart	feature	drivers/wireless/specification/mt7921.md	1612
+mt76	monitor_mode	Monitor mode (mac80211 MONITOR + WANT_MONITOR_VIF)	feature	drivers/wireless/specification/mt7921.md	1576
+mt76	nan_mode	NAN / NAN_DATA roles (firmware CNM+NAN capability gated)	feature	drivers/wireless/specification/mt7921.md	1576
+mt76	native_key_pipeline_retirement	Native old-key firmware/MAC/FIFO pipeline retirement	feature	drivers/wireless/specification/mt7921.md	1618
+mt76	noncoherent_dma	Non-coherent platform DMA support	feature	drivers/wireless/specification/mt7921.md	1438
+mt76	off_channel_active_scan	Off-channel active scanning [mt76 round 4: native work, no shared gap - scan owner is Busy in State::Associated (passive_scan.rs:544-546)] [mt76 round 5: native work, no shared gap - same scan-loop RX hand-off and grant re-post as associated_active_scan; Linux mt7921_hw_scan adds no BA/port fencing, but native RX BA reorder ticks are not serviced during the 15 s scan wait]	feature	drivers/wireless/specification/mt7921.md	1583
+mt76	other_tx_ba_tids	Transmit BA on TIDs beyond retained TID0	feature	drivers/wireless/specification/mt7921.md	1612
+mt76	p2p_mode	P2P client / GO / device roles	feature	drivers/wireless/specification/mt7921.md	1576
+mt76	per_domain_iommu	Per-domain IOMMU mappings	feature	drivers/wireless/specification/mt7921.md	1438
+mt76	wake_on_wireless	Wake on Wireless (WoW) [mt76 round 4: native work, no shared gap - system_pm::suspend always disassociates; set_wow_ctrl/set_suspend_iter/update_gtk_rekey owners and wowlan_support not yet implemented] [mt76 round 5: native design work - State::Suspended(RadioInfo) and Mt76Iface::prepare_suspend retain no association, and firmware GTK-rekey offload replaces the group key with no Linux v7.2 mt76 read-back while the native StationSecurity admits only host-installed group key ids/replay counters; see spec 8]	feature	drivers/wireless/specification/mt7921.md	1542
+rtl8xxxu	additional_operating_channels	Noninitial operating channels and safe FIFO retuning; blocked on per-channel signed N8PC envelope rows beyond channel1 and a FIFO-safe retune while bulk RX is posted, which needs endpoint_reset/slot reuse	feature	drivers/wireless/specification/rtl8xxxu.md	594
+rtl8xxxu	bt_coexistence	Bluetooth coexistence on RTL8723BU; blocked on the rtl8723bu chip runtime	feature	drivers/wireless/specification/rtl8xxxu.md	598
+rtl8xxxu	expanded_active_scanning	Active scanning beyond the initial profile; blocked on additional_operating_channels (retune) and a per-channel probe-request emission envelope	feature	drivers/wireless/specification/rtl8xxxu.md	600
+rtl8xxxu	expanded_passive_scanning	Passive scanning beyond the initial channel; blocked on additional_operating_channels (retune of the retained RX owner)	feature	drivers/wireless/specification/rtl8xxxu.md	600
+rtl8xxxu	five_ghz_operation	Broader band operation including VHT-profile 5GHz; RTL8188EU is 2.4GHz-only; 5GHz exists only on RTL8821CU/RTL8822BU, blocked on those chip rows	feature	drivers/wireless/specification/rtl8xxxu.md	590
+rtl8xxxu	ht40	HT40; blocked on a signed HT40 qualification record (N8HT v1 binds 20MHz/LGI) and 40MHz BW/secondary-channel programming in the retained channel owner	feature	drivers/wireless/specification/rtl8xxxu.md	537
+rtl8xxxu	qos_null	QoS Null frames; only emitted by mac80211 off-channel power-save nullfunc during an associated scan (rtl8xxxu has no PS/REPORTS_TX_ACK_STATUS); blocked on expanded scanning while associated	feature	drivers/wireless/specification/rtl8xxxu.md	310
+rtl8xxxu	rtl8192eu	RTL8192EU retained runtime; not an external blocker, unported: the 8192e.c chip runtime (power sequence, gen2 firmware/H2C, MAC/BB/RF tables, 2T IQK, TX desc v2/gen2 rate adaptation via H2C) following the 8188e retained owner, plus per-device signed power artifacts	chip	drivers/wireless/specification/rtl8xxxu.md	578
+rtl8xxxu	rtl8723bu	RTL8723BU retained runtime; not an external blocker, unported: the 8723b.c chip runtime (power sequence, gen2 firmware/H2C, tables, S0/S1 antenna path, BT mailbox) following the 8188e retained owner, plus per-device signed power artifacts	chip	drivers/wireless/specification/rtl8xxxu.md	578
+rtl8xxxu	rtl8821cu	RTL8821CU retained runtime using its actual upstream transport; verified blocker: the tree has no rtw88 USB transport (drivers/wireless/src/rtw88 has pci*.rs only, no usb.c port) and C21 radio semantics belong to rtw88 infrastructure rather than EU helpers	chip	drivers/wireless/specification/rtl8xxxu.md	615
+rtl8xxxu	rtl8822bu	RTL8822BU retained runtime using its actual upstream transport; verified blocker: the tree has no rtw88 USB transport (drivers/wireless/src/rtw88 has pci*.rs only, no usb.c port) and C22B radio semantics belong to rtw88 infrastructure rather than EU helpers	chip	drivers/wireless/specification/rtl8xxxu.md	615
+rtl8xxxu	runtime_power_management	Runtime power management; halt recovery and slot reuse now exist (packet_transport::Owner recover/stop/start, Receiver Stopped->start). safe rejoin now reopens a disassociated interface (Device::closed is non-terminal). Remaining family work: rtl8xxxu_stop/start (ieee80211_ops stop/start) disable_rf/enable_rf sequencing and power-off/power-on of the retained Receiver/firmware claim on an administrative interface down/up: rtl8xxxu registers no narf_net::iface::set_open_stop (ndo_open/ndo_stop) hook	feature	drivers/wireless/specification/rtl8xxxu.md	612
+rtl8xxxu	vht	VHT operation on RTL8821CU/RTL8822BU; blocked on the rtl8821cu/rtl8822bu runtimes	feature	drivers/wireless/specification/rtl8xxxu.md	617
+rtlwifi	active_scanning	Active scanning; blocked on probe-request emission within a signed NEPC envelope plus per-channel retune (additional_operating_channels)	feature	drivers/wireless/specification/rtlwifi.md	303
+rtlwifi	adaptive_retry_control	Adaptive retry control; RA mask and DATA fallback now exist (firmware RA owns per-rate retry). Remaining family work: Linux rtl_op_add_interface HW_VAR_RETRY_LIMIT writes REG_RL (0x42a) = retry_limit 0x30 short|long, which the EE operational MAC (packet_mac.rs/mac.rs) never programs, so the firmware fallback chain runs on the reset retry limits	feature	drivers/wireless/specification/rtlwifi.md	459
+rtlwifi	additional_operating_channels	Noninitial operating channels and retuning; blocked on live retune (RF18/BW with paused DMA) and per-channel permission re-derivation from signed NEPC rows	feature	drivers/wireless/specification/rtlwifi.md	685
+rtlwifi	bt_coexistence	Bluetooth coexistence on RTL8723AE/BE; blocked on the rtl8723ae/rtl8723be chip runtimes	feature	drivers/wireless/specification/rtlwifi.md	688
+rtlwifi	dynamic_antenna_selection	Dynamic antenna selection/tracking; blocked on per-antenna signed board measurements (NEPC binds one static factory antenna)	feature	drivers/wireless/specification/rtlwifi.md	158
+rtlwifi	five_ghz_operation	5GHz band operation on RTL8192DE/RTL8821AE; blocked on the rtl8192de/rtl8821ae chip runtimes (RTL8188EE is 2.4GHz-only)	feature	drivers/wireless/specification/rtlwifi.md	687
+rtlwifi	ht40	HT40; blocked on a signed NEHT v2 record covering 40MHz emissions (NEHT v1 binds width20) and 40MHz BW programming	feature	drivers/wireless/specification/rtlwifi.md	685
+rtlwifi	inactive_power_save	Inactive power save (IPS, inactiveps default on); blocked on operating_reset: IPS powers RF/BB off and re-runs radio configuration on the retained owner	feature	drivers/wireless/specification/rtlwifi.md	760
+rtlwifi	multi_radio	Multiple live radios; blocked on per-device owners replacing the singleton controller (interface ACTIVE/CLAIMED and firmware_native MSI SIGNAL statics)	feature	drivers/wireless/specification/rtlwifi.md	679
+rtlwifi	operating_reset	Reset of an operating retained owner; the stop + card-disable quiescence teardown now exists as Prepared::retire (used by the PCI remove hook) and disassociation keeps the live owner (safe rejoin). Remaining family work: no generation supervisor detects a Failed owner and rebuilds it; firmware_transport::Owner::begin/claim_packet_io stay one-shot (started/native_claimed never re-armed after the previous PacketIo is retired), bring_up's power::power_on card-enable flow is not re-runnable on the parked function, and interface::Device has no path to swap a fresh prepare_native::initialize_registered owner into its retained storage	feature	drivers/wireless/specification/rtlwifi.md	679
+rtlwifi	pcie_aspm	PCIe ASPM link power management; blocked on bus/ PCIe link-control ASPM programming coordinated with the upstream bridge (outside family scope)	feature	drivers/wireless/specification/rtlwifi.md	762
+rtlwifi	rf_gain_tracking	RF gain/power tracking; blocked on a thermal-indexed signed gain envelope (thermal power tracking moves gains outside the fixed NEPC/NEHT envelope)	feature	drivers/wireless/specification/rtlwifi.md	685
+rtlwifi	rtl8192ce_family	RTL8192CE retained runtime including exact RTL8188CE RF variant; blocked on porting the rtl8192ce/rtl8192c-common chip runtime (power, firmware, tables, RF-type qualification incl. 8188CE) plus signed per-board envelopes	chip	drivers/wireless/specification/rtlwifi.md	686
+rtlwifi	rtl8192de	RTL8192DE per-function retained runtime; blocked on porting rtl8192de dual-MAC per-function runtime (shared MAC/PHY ownership, dual-band tables) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	687
+rtlwifi	rtl8192ee	RTL8192EE retained runtime; blocked on porting the rtl8192ee runtime (new TRX flow buffer descriptors, 2T2R tables/IQK, C2H packets) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	686
+rtlwifi	rtl8723ae	RTL8723AE retained runtime; blocked on porting the rtl8723ae runtime (firmware event mailbox, BT coexistence) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	688
+rtlwifi	rtl8723be	RTL8723BE retained runtime; blocked on porting the rtl8723be runtime (C2H packets, BT coexistence, antenna path) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	688
+rtlwifi	rtl8821ae	RTL8821AE retained runtime; blocked on porting the rtl8821ae/8812ae VHT dual-band runtime (C2H RA/TX reports, WoWLAN firmware) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	689
+rtlwifi	rts_cts_protection	RTS/CTS protection; blocked on signed qualification of RTS/CTS-to-self emissions (NEPC/NEHT exclude them) and TXD RTS fields driven by bss use_cts_prot/use_rts	feature	drivers/wireless/specification/rtlwifi.md	476
+rtlwifi	rx_amsdu_7935	7935-byte (MAX_AMSDU) RX A-MSDU with 9100-byte RX buffers; blocked on 9100-byte RX buffers (packet RX_BUFFER is 4096) and a signed NEHT program advertising MAX_AMSDU	feature	drivers/wireless/specification/rtlwifi.md	719
+rtlwifi	sgi20	SGI20; blocked on a signed NEHT record covering SGI emissions (NEHT v1 binds LGI) and SGI RX admission	feature	drivers/wireless/specification/rtlwifi.md	685
+rtlwifi	system_suspend	System suspend; blocked on operating_reset: resume must re-run card enable, firmware download, LLT and radio/MAC configuration on a fresh owner (no supervisor/rebuild path yet). Suspend itself can reuse Prepared::retire (stop + quiescence) and Device::remove-style interrupt withdrawal; no narf_power::system_pm::register_async_system_pm registration exists for rtlwifi	feature	drivers/wireless/specification/rtlwifi.md	679
+rtlwifi	vht	VHT operation including TX/RX STBC on RTL8821AE; blocked on the rtl8821ae runtime	feature	drivers/wireless/specification/rtlwifi.md	738
+rtlwifi	wowlan	WoWLAN magic-packet/pattern wake on RTL8821AE/8812AE; blocked on the rtl8821ae runtime and system_suspend	feature	drivers/wireless/specification/rtlwifi.md	764
+rtw88	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw88.md	1867
+rtw88	beamforming	Beamforming	feature	drivers/wireless/specification/rtw88.md	1868
+rtw88	dpk_tracking	DPK calibration (rtw8822c_do_dpk) and thermal DPK tracking on RTL8822C	feature	drivers/wireless/specification/rtw88.md	1869
+rtw88	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specification/rtw88.md	1870
+rtw88	ht40	HT40 operation (40MHz width, DSSS/CCK40, SGI40)	feature	drivers/wireless/specification/rtw88.md	1871
+rtw88	multi_device	Multiple live device lifetimes	feature	drivers/wireless/specification/rtw88.md	1872
+rtw88	multi_stream_ht	Multi-stream HT on RTL8822B/RTL8822C	feature	drivers/wireless/specification/rtw88.md	1873
+rtw88	operating_reset	Reset of an operating retained owner	feature	drivers/wireless/specification/rtw88.md	1874
+rtw88	radio_coexistence	Complete radio coexistence state machine	feature	drivers/wireless/specification/rtw88.md	1875
+rtw88	rf_power_tracking	Thermal RF power tracking on RTL8821CE (TXAGC/txscale swing; RTL8822C done by dm)	feature	drivers/wireless/specification/rtw88.md	1876
+rtw88	rtl8822be	RTL8822BE retained firmware/radio/packet/station runtime	chip	drivers/wireless/specification/rtw88.md	1877
+rtw88	runtime_sleep	Runtime sleep	feature	drivers/wireless/specification/rtw88.md	1878
+rtw88	safe_rejoin	Safe reassociation/rejoin	feature	drivers/wireless/specification/rtw88.md	1879
+rtw88	smps_txrx_1ss	Coexistence-driven static SMPS on RTL8822C	feature	drivers/wireless/specification/rtw88.md	1880
+rtw88	system_suspend	System suspend	feature	drivers/wireless/specification/rtw88.md	1881
+rtw88	tx_amsdu_5ghz	TX A-MSDU and A-MSDU-in-A-MPDU outside 2.4GHz	feature	drivers/wireless/specification/rtw88.md	1882
+rtw88	tx_ba_all_tids	Originator TX Block Ack on every non-VO TID	feature	drivers/wireless/specification/rtw88.md	1883
+rtw88	vht	VHT operation	feature	drivers/wireless/specification/rtw88.md	1884
+rtw88	wow	Wake on Wireless on RTL8822CE	feature	drivers/wireless/specification/rtw88.md	1885
 rtw89	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw89.md	1006
-rtw89	additional_phy_widths	Additional HT/HE/EHT widths and GI variants are not individually enumerated	unknown	drivers/wireless/specification/rtw89.md	1014
-rtw89	aggregation	802.11 aggregation with direction not enumerated	feature	drivers/wireless/specification/rtw89.md	1015
-rtw89	aggregation_directions	RX/TX BA directions and individual aggregation formats are not enumerated	unknown	drivers/wireless/specification/rtw89.md	1015
+rtw89	aggregation	TX A-MSDU/A-MSDU-in-A-MPDU aggregation (TX A-MPDU implemented)	feature	drivers/wireless/specification/rtw89.md	1582
 rtw89	antenna_diversity_tracking	Dynamic antenna diversity/tracking	feature	drivers/wireless/specification/rtw89.md	713
-rtw89	block_ack	Block Ack agreements with direction not enumerated	feature	drivers/wireless/specification/rtw89.md	1015
-rtw89	broader_scan_policy	Broader scan-policy modes are not individually enumerated	unknown	drivers/wireless/specification/rtw89.md	1015
 rtw89	carrier_frequency_tracking	Periodic carrier-frequency offset tracking	feature	drivers/wireless/specification/rtw89.md	715
-rtw89	device_removal	Device removal	feature	drivers/wireless/specification/rtw89.md	1009
 rtw89	digital_initial_gain_tracking	Periodic digital initial gain control	feature	drivers/wireless/specification/rtw89.md	715
-rtw89	dma_reclamation	Published DMA/map reclamation	feature	drivers/wireless/specification/rtw89.md	1003
-rtw89	dynamic_edca	Live AP WMM/EDCA parameter updates	feature	drivers/wireless/specification/rtw89.md	933
 rtw89	edcca_tracking	Periodic EDCCA tracking	feature	drivers/wireless/specification/rtw89.md	715
-rtw89	eht	EHT operation on RTL8922A	feature	drivers/wireless/specification/rtw89.md	1018
+rtw89	eht	EHT operation on RTL8922A	feature	drivers/wireless/specification/rtw89.md	1581
 rtw89	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specification/rtw89.md	1012
-rtw89	fragmentation_scope	Rejected fragmentation has no explicit remaining protocol lifecycle	unknown	drivers/wireless/specification/rtw89.md	835
-rtw89	he	HE station operation	feature	drivers/wireless/specification/rtw89.md	1014
-rtw89	ht	HT station operation	feature	drivers/wireless/specification/rtw89.md	1014
-rtw89	irq_delivery	Interrupt-driven runtime service	feature	drivers/wireless/specification/rtw89.md	1003
-rtw89	monitor_diagnostics_scope	Monitor diagnostics are not defined as a separate radio mode	unknown	drivers/wireless/specification/rtw89.md	714
-rtw89	multi_rate_retry	Multi-rate retry	feature	drivers/wireless/specification/rtw89.md	957
+rtw89	fragmentation	Host fragmentation/defragmentation with native fragment MPDU admission [API available: WirelessNetIface::set_fragmentation_threshold (SET_WIPHY NL80211_ATTR_WIPHY_FRAG_THRESHOLD routed after cfg80211 validation; default EOPNOTSUPP) (wireless spec 3.1.1)]	feature	drivers/wireless/specification/rtw89.md	1038
+rtw89	he_htc	HE +HTC insertion in QoS DATA [API available: station_security::Security receives +HTC QoS DATA (HT Control skipped, Order masked from the CCMP AAD) on the MSDU and A-MSDU paths, so advertising HTC_HE loses no AP traffic (wireless spec 3.4.1)]	feature	drivers/wireless/specification/rtw89.md	1584
+rtw89	monitor_mode	Monitor radio mode with PHY-status RX metadata	feature	drivers/wireless/specification/rtw89.md	1039
 rtw89	multiple_live_functions	Multiple live PCI functions	feature	drivers/wireless/specification/rtw89.md	1009
-rtw89	nhm_diagnostics	Noise-histogram PHY diagnostics	feature	drivers/wireless/specification/rtw89.md	714
-rtw89	operating_reset	Automatic reset of an operating retained owner	feature	drivers/wireless/specification/rtw89.md	1009
-rtw89	optional_header_scope	Rejected optional header variants are not enumerated	unknown	drivers/wireless/specification/rtw89.md	835
-rtw89	protected_management_scope	Rejected protected-management formatting has no explicit remaining PMF contract	unknown	drivers/wireless/specification/rtw89.md	834
-rtw89	qos_all_tid_routing	QoS packet scheduling across all supported TIDs	feature	drivers/wireless/specification/rtw89.md	1015
+rtw89	nhm_diagnostics	Noise-histogram/CLM/FAHM environment monitoring	feature	drivers/wireless/specification/rtw89.md	1039
 rtw89	rf_power_tracking	Periodic RF calibration/power tracking	feature	drivers/wireless/specification/rtw89.md	1006
 rtw89	rtl8851b	RTL8851B retained runtime including exact secure-policy loading	chip	drivers/wireless/specification/rtw89.md	1017
 rtw89	rtl8852a	RTL8852A retained runtime including exact secure-policy loading	chip	drivers/wireless/specification/rtw89.md	1002
 rtw89	rtl8852c	RTL8852C retained runtime	chip	drivers/wireless/specification/rtw89.md	1017
 rtw89	rtl8922a	RTL8922A BE EFUSE/container/descriptor/transport/runtime	chip	drivers/wireless/specification/rtw89.md	1018
 rtw89	runtime_sleep	Runtime sleep/LPS	feature	drivers/wireless/specification/rtw89.md	1016
-rtw89	rx_reordering	RX sequence reordering	feature	drivers/wireless/specification/rtw89.md	1015
-rtw89	safe_rejoin	Safe reassociation/rejoin	feature	drivers/wireless/specification/rtw89.md	1016
-rtw89	six_ghz_operation	6GHz band operation on RTL8852C/RTL8922A	feature	drivers/wireless/specification/rtw89.md	1013
-rtw89	system_suspend	System suspend	feature	drivers/wireless/specification/rtw89.md	1009
-rtw89	traffic_priority_scheduling	Traffic priority scheduling	feature	drivers/wireless/specification/rtw89.md	933
-rtw89	tspec	TSPEC admission	feature	drivers/wireless/specification/rtw89.md	933
+rtw89	six_ghz_operation	6GHz band operation on RTL8852C/RTL8922A [API available: association::Bss.band / channel::Band::Ghz6 / frequency_in, he::HeOperation::six_ghz_operation, association::six_ghz::{admit, admit_with_rule, He6GhzCapability, He6GhzOperation}, reg::PowerType6Ghz + RegFlags::NO_6GHZ_{VLP,AFC}_CLIENT (wireless spec 3, 6 GHz band identity); a 6 GHz JoinPlan is not yet available] [API available: 6 GHz JoinPlan - association::JoinPlan::prepare_6ghz + six_ghz()/SixGhzPlan {operation, power_type, channel/width (SixGhzWidth incl. 320 with EHT), peer/local He6GhzCapability for STA_REC_HE_6G, he/eht}, six_ghz::{SixGhzLocal, plan}, eht::LocalEht::with_320mhz (wireless spec 3, 6 GHz JoinPlan)]	feature	drivers/wireless/specification/rtw89.md	1013
+rtw89	tspec	TSPEC/WMM admission control (mac80211-owned host MLME)	feature	drivers/wireless/specification/rtw89.md	1044
 rtw89	uapsd	U-APSD	feature	drivers/wireless/specification/rtw89.md	933
-rtw89	wmm_all_access_categories	Packet scheduling across all WMM access categories	feature	drivers/wireless/specification/rtw89.md	1015
-rtw89	wow	Wake on Wireless	feature	drivers/wireless/specification/rtw89.md	1016
-shared	amsdu_eosp	EOSP aggregate receive	feature	wireless/specification/spec.md	1027
-shared	amsdu_no_explicit_ack	NoExplicitAck-policy aggregate receive	feature	wireless/specification/spec.md	1027
-shared	amsdu_noack	NoAck-policy aggregate receive	feature	wireless/specification/spec.md	1027
-shared	beamforming	Shared typed PHY beamforming support	feature	wireless/specification/spec.md	92
-shared	eht_phy_admission	EHT PHY and mandatory membership admission	feature	wireless/specification/spec.md	141
-shared	epd_membership_selector	EPD mandatory membership-selector admission	feature	wireless/specification/spec.md	141
-shared	extended_nss_bw	Shared extended NSS/BW PHY admission	feature	wireless/specification/spec.md	92
-shared	fragmented_management	Fragmented management-frame reassembly/admission	feature	wireless/specification/spec.md	188
-shared	glk_membership_selector	GLK mandatory membership-selector admission	feature	wireless/specification/spec.md	141
-shared	he_phy_admission	HE PHY and mandatory membership admission	feature	wireless/specification/spec.md	141
-shared	large_rx_amsdu	Receive A-MSDU above retained bounded size	feature	wireless/specification/spec.md	93
-shared	sae_h2e_membership_selector	SAE-H2E mandatory membership-selector admission	feature	wireless/specification/spec.md	141
-shared	spp_amsdu	SPP A-MSDU authentication support	feature	wireless/specification/spec.md	1018
-shared	tx_amsdu	Shared original A-MSDU transmit protection support	feature	wireless/specification/spec.md	1019
-shared	tx_stbc	Shared typed PHY transmit STBC support	feature	wireless/specification/spec.md	92
-shared	uhr_membership_selector	UHR mandatory membership-selector admission	feature	wireless/specification/spec.md	141
-shared	vht_80p80	Shared discontiguous 80+80 PHY admission	feature	wireless/specification/spec.md	161
+rtw89	wide_channels	HT40/80MHz widths on all AX chips and 160MHz on RTL8852C/RTL8922A	feature	drivers/wireless/specification/rtw89.md	1035
+rtw89	wow	Wake on Wireless	feature	drivers/wireless/specification/rtw89.md	1043
+shared	glk_membership_selector	GLK mandatory membership-selector admission; needs IEEE802.11-2020 General Link (802.11ak) bridged-link operation, which has no open reference implementation (mac80211 also refuses it)	feature	wireless/specification/spec.md	158
+shared	mlo_station_association	Single-link MLD (Basic Multi-Link) station association in JoinPlan with MLD addressing and MLO key delivery; required before JoinPlan can negotiate UHR (P802.11bn) [Assessed round 3: not feasible as an additive change yet. It needs (1) a Basic Multi-Link element (MLD MAC, common info) in the JoinPlan request and response parsing, (2) PTK derivation over MLD addresses, (3) MLO GTK/IGTK/Link KDE handling in the eapol supplicant (wpa_supplicant MLO 3/4 path) and (4) per-link key installation in station_security; JoinPlan size must be boxed for it]	feature	wireless/specification/spec.md	249

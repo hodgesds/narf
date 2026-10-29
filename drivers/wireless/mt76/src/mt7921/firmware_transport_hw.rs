@@ -41,6 +41,9 @@ const RX_PRE: u32 = 0xd4500;
 const RX_POST: u32 = 0xd4540;
 const RX_DATA: u32 = 0xd4520;
 const TX_DATA: u32 = 0xd4300;
+/// `MT_WFDMA_DUMMY_CR` / `MT_WFDMA_NEED_REINIT`, set by every DMA enable.
+const WFDMA_DUMMY_CR: u32 = 0x54000120;
+const WFDMA_NEED_REINIT: u32 = 1 << 1;
 
 #[derive(Debug)]
 struct Ring {
@@ -180,6 +183,8 @@ struct Hardware {
     device: BusDevice,
     authority: Cap<BusDeviceCap, Write>,
     owner: Retained<Storage>,
+    /// Linux `wcid->amsdu` for the station peer (TXD7 HW_AMSDU).
+    hw_amsdu: bool,
 }
 impl Hardware {
     fn receive_ring(&mut self, which: usize) -> Result<Option<Vec<u8>>, Error> {
@@ -340,6 +345,22 @@ impl Hardware {
         wcid: u16,
         rate: crate::mt7921::association::LegacyRate,
     ) -> Result<(), Error> {
+        self.submit_80211(frame, |payload, token| {
+            packet_tx::management(frame, payload, token, wcid, rate)
+        })
+    }
+    fn submit_fragment(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error> {
+        self.submit_80211(frame, |payload, token| {
+            packet_tx::fragment(frame, payload, token, wcid)
+        })
+    }
+    /// Publish one native 802.11 MPDU with the TXD `encode` builds for its
+    /// DMA payload address and token.
+    fn submit_80211(
+        &mut self,
+        frame: &[u8],
+        encode: impl FnOnce(u64, u16) -> Result<[u8; packet_tx::HEADER], Error>,
+    ) -> Result<(), Error> {
         self.check()?;
         if !self.owner.published {
             return Err(Error::Busy);
@@ -355,7 +376,7 @@ impl Hardware {
         let payload = address
             .checked_add(packet_tx::HEADER as u64)
             .ok_or(Error::DmaAddress)?;
-        let header = packet_tx::management(frame, payload, token, wcid, rate)?;
+        let header = encode(payload, token)?;
         // SAFETY: fully validated lengths; this slot has neither DMA nor
         // firmware ownership until the publication below.
         unsafe {
@@ -403,6 +424,20 @@ impl Hardware {
         pipelined: bool,
         aggregated: bool,
     ) -> Result<(), Error> {
+        self.submit_data_txd(frame, protected, qos, pipelined, aggregated, 0)
+    }
+    fn submit_data_txd(
+        &mut self,
+        frame: &[u8],
+        protected: bool,
+        qos: bool,
+        pipelined: bool,
+        aggregated: bool,
+        tid: u8,
+    ) -> Result<(), Error> {
+        if tid >= 8 || tid != 0 && (aggregated || !qos) {
+            return Err(Error::Bounds);
+        }
         if aggregated && (!qos || !pipelined) {
             return Err(Error::Bounds);
         }
@@ -428,13 +463,16 @@ impl Hardware {
         let payload = address
             .checked_add(packet_tx::HEADER as u64)
             .ok_or(Error::DmaAddress)?;
-        let header = if aggregated {
+        let mut header = if aggregated {
             packet_tx::ethernet_aggregated(frame, payload, token, protected)?
         } else if qos {
-            packet_tx::ethernet_qos(frame, payload, token, 1, protected, true)?
+            packet_tx::ethernet_tid(frame, payload, token, 1, protected, tid)?
         } else {
             packet_tx::ethernet(frame, payload, token, 1, protected)?
         };
+        if qos && self.hw_amsdu {
+            packet_tx::set_hw_amsdu(&mut header);
+        }
         // SAFETY: fully validated lengths; this slot has neither DMA nor
         // firmware ownership until the publication below.
         unsafe {
@@ -594,6 +632,57 @@ impl Backend for Hardware {
         self.check()?;
         super::current_station_permission(permission, narf_wireless::reg::db::snapshot())
     }
+    fn suspend_dma(&mut self) -> Result<(), Error> {
+        self.update(GLOBAL, ENABLE, 0)?;
+        self.write(MT_WFDMA0_HOST_INT_ENA, 0)?;
+        self.write(MT_PCIE_MAC_INT_ENABLE, 0)?;
+        let _ = self.read(GLOBAL)?; // push the disable before the idle poll
+        Ok(())
+    }
+    fn request_firmware_own(&mut self) -> Result<(), Error> {
+        self.write(MT_CONN_ON_LPCTL, PCIE_LPCR_HOST_SET_OWN)
+    }
+    fn firmware_owned(&mut self) -> Result<bool, Error> {
+        Ok(self.read(MT_CONN_ON_LPCTL)? & PCIE_LPCR_HOST_OWN_SYNC != 0)
+    }
+    fn restore_bus(&mut self) -> Result<(), Error> {
+        use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+        // Bus mastering returns only once retained rings are proven current.
+        let command = self.command(BUS_MASTER, MEM_SPACE | INTX_DISABLE)?;
+        if command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) != MEM_SPACE | INTX_DISABLE {
+            return Err(Error::Authority);
+        }
+        Ok(())
+    }
+    fn dma_needs_reinit(&mut self) -> Result<bool, Error> {
+        Ok(self.read(WFDMA_DUMMY_CR)? & WFDMA_NEED_REINIT == 0)
+    }
+    fn reinit_dma(&mut self) -> Result<(), Error> {
+        if !self.idle()? || self.read(GLOBAL)? & ENABLE != 0 {
+            return Err(Error::Busy);
+        }
+        // Same verified ownership sequence as reset recovery, minus WFSYS
+        // reset: unpublish, retire every slot/token, then reprogram.
+        self.release()?;
+        self.recycle()?;
+        self.initialize()
+    }
+    fn resume_dma(&mut self) -> Result<(), Error> {
+        if !self.owner.published {
+            return Err(Error::Busy);
+        }
+        use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+        if self.command(0, BUS_MASTER)? & (BUS_MASTER | MEM_SPACE | INTX_DISABLE)
+            != BUS_MASTER | MEM_SPACE | INTX_DISABLE
+        {
+            return Err(Error::Authority);
+        }
+        // The native owner is polled: host interrupt enables stay masked,
+        // exactly as initialize() leaves them.
+        self.update(GLOBAL, 0, ENABLE)?;
+        let _ = self.read(GLOBAL)?;
+        Ok(())
+    }
     fn park_bus_master(&mut self) -> Result<(), Error> {
         if self.command(narf_bus::pci::cmd::BUS_MASTER, 0)? & narf_bus::pci::cmd::BUS_MASTER != 0 {
             return Err(Error::Busy);
@@ -695,7 +784,7 @@ impl Backend for Hardware {
                 | (1 << 28)
                 | (1 << 30),
         )?;
-        self.update(0x54000120, 0, 2)?;
+        self.update(WFDMA_DUMMY_CR, 0, WFDMA_NEED_REINIT)?;
         self.update(MT_PCIE_MAC_PM, 0, MT_PCIE_MAC_PM_L0S_DIS)?;
         // All published addresses are owned and bounded before enabling DMA.
         use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
@@ -841,6 +930,9 @@ impl Backend for Hardware {
     ) -> Result<(), Error> {
         self.submit_management(frame, wcid, rate)
     }
+    fn submit_fragment(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error> {
+        self.submit_fragment(frame, wcid)
+    }
     fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error> {
         self.submit_data(frame, protected, qos)
     }
@@ -857,6 +949,21 @@ impl Backend for Hardware {
     }
     fn submit_data_aggregated(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {
         self.submit_data_profile(frame, protected, true, true, true)
+    }
+    fn submit_data_tid(
+        &mut self,
+        frame: &[u8],
+        protected: bool,
+        tid: u8,
+        pipelined: bool,
+    ) -> Result<(), Error> {
+        if tid == 0 {
+            return Err(Error::Bounds);
+        }
+        self.submit_data_txd(frame, protected, true, pipelined, false, tid)
+    }
+    fn set_hw_amsdu(&mut self, enabled: bool) {
+        self.hw_amsdu = enabled;
     }
     fn receive_idle(&self) -> Result<bool, Error> {
         self.check()?;
@@ -878,6 +985,8 @@ impl Backend for Hardware {
 #[derive(Debug)]
 pub struct Transport {
     session: Session<Hardware>,
+    /// PCI binding generation this transport was claimed under.
+    generation: u64,
 }
 
 #[path = "firmware_transport_hw_tests.rs"]
@@ -897,6 +1006,7 @@ impl Transport {
         device: BusDevice,
         authority: Cap<BusDeviceCap, Write>,
         firmware: Firmware,
+        generation: u64,
     ) -> Result<Self, Error> {
         crate::mt7921::pci::invoke(&authority, || {
             authority.check_live().map_err(|_| Error::Authority)?;
@@ -946,9 +1056,11 @@ impl Transport {
                             storage: Some(storage),
                             published: false,
                         },
+                        hw_amsdu: false,
                     },
                     firmware,
                 ),
+                generation,
             })
         })
         .map_err(|_| Error::Authority)?
@@ -1075,6 +1187,22 @@ impl Transport {
     pub async fn shutdown(&mut self) -> Result<(), Error> {
         self.session.shutdown().await
     }
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+    /// Synchronous removal teardown; true only when DMA retirement was
+    /// proven and the ring memory may be returned.
+    pub(super) fn retire_removed(&mut self) -> bool {
+        self.session.retire_removed()
+    }
+    /// PCIe low-power handoff for system suspend; leaves any association.
+    pub async fn suspend(&mut self) -> Result<(), Error> {
+        self.session.suspend().await
+    }
+    /// Leave the low-power handoff, or reset with the same identity.
+    pub async fn resume(&mut self, expected_mac: [u8; 6]) -> Result<RadioInfo, Error> {
+        self.session.resume(expected_mac).await
+    }
     /// Park DMA, reset WFSYS, retire old ring ownership, and reload firmware.
     /// The caller closes carrier before awaiting. No association/key replay is
     /// attempted; a fresh scan/association is required after successful recovery.
@@ -1102,6 +1230,8 @@ impl Transport {
     }
 
     pub(super) fn step_network(&mut self, tx: Option<&[u8]>) -> Result<super::PacketStep, Error> {
+        self.session.frag_threshold =
+            super::BOOT_FRAG_THRESHOLD.load(core::sync::atomic::Ordering::Relaxed);
         self.session.step_network(tx)
     }
     pub(super) fn receive_current(&self, epoch: u64) -> Result<bool, Error> {

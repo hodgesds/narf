@@ -28,6 +28,34 @@ mod e2e_tests;
 
 use narf_init::{InitResult, Stage};
 
+/// Async system-PM bridge for the mt76 crate (`mt7921_pci_suspend` /
+/// `mt7921_pci_resume` firmware exchanges run before/after the
+/// interrupt-gated device fan-out).
+struct Mt76SystemPm;
+
+impl narf_power::system_pm::AsyncSystemPm for Mt76SystemPm {
+    fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            mt76::iface::system_prepare_suspend()
+                .await
+                .map_err(|error| match error {
+                    narf_wireless::WirelessError::Busy | narf_wireless::WirelessError::Timeout => {
+                        narf_power::device_pm::DevicePmError::Busy
+                    }
+                    _ => narf_power::device_pm::DevicePmError::DriverError,
+                })
+        })
+    }
+
+    fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            mt76::iface::system_resume()
+                .await
+                .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+        })
+    }
+}
+
 pub fn register_initcalls() {
     // Register wireless drivers with the bus dispatcher.
     narf_init::register(Stage::Subsys, "iwlwifi", || {
@@ -36,6 +64,12 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "mt76", || {
         mt76::register();
+        // The mt76 crate does not depend on narf-power; its async system-PM
+        // phases are bridged here (Linux mt7921_pm_ops).
+        narf_power::system_pm::register_async_system_pm(
+            "mt76",
+            alloc::sync::Arc::new(Mt76SystemPm),
+        );
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "cyw43439", || {
@@ -65,6 +99,15 @@ pub fn register_initcalls() {
     narf_init::register(Stage::Subsys, "ath11k", || {
         ath11k::register();
         InitResult::Ok
+    });
+    // ath11k AHB (IPQ8074/6018/5018, WCN6750): bind the DT nodes the
+    // Subsys initcall's `register_dt_driver` claims.
+    narf_init::register(Stage::Device, "ath11k-ahb", || {
+        if narf_bus::probe_all_dt() == 0 {
+            InitResult::NotPresent
+        } else {
+            InitResult::Ok
+        }
     });
     narf_init::register(Stage::Subsys, "ath10k", || {
         ath10k::register();

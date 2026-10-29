@@ -43,6 +43,9 @@ fn delba(tid: u8) -> Vec<u8> {
     wrap(&frame, 6)
 }
 fn data(tid: u8, sequence: u16, pn: Option<u64>, value: u8) -> Vec<u8> {
+    data_on(6, tid, sequence, pn, value)
+}
+pub(super) fn data_on(channel: u8, tid: u8, sequence: u16, pn: Option<u64>, value: u8) -> Vec<u8> {
     let ethernet = super::amsdu_rx_tests::ethernet(value, 3);
     let mut frame = vec![0; 26];
     frame[..2].copy_from_slice(&[0x88, if pn.is_some() { 0x42 } else { 2 }]);
@@ -63,7 +66,7 @@ fn data(tid: u8, sequence: u16, pn: Option<u64>, value: u8) -> Vec<u8> {
     };
     packet[4..8].copy_from_slice(&r1.to_le_bytes());
     packet[8..12].copy_from_slice(&(u32::from(tid) << 16).to_le_bytes()); // AMPDU; native TID.
-    packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
+    packet[12..16].copy_from_slice(&(u32::from(channel) << 8).to_le_bytes());
     if let Some(pn) = pn {
         packet[24..30].copy_from_slice(&pn.to_le_bytes()[..6]);
     }
@@ -94,7 +97,7 @@ fn establish(
 ) -> Result<(), &'static str> {
     establish_window(session, tid, ssn, timeout, 32)
 }
-fn establish_window(
+pub(super) fn establish_window(
     session: &mut Session<Model>,
     tid: u8,
     ssn: u16,
@@ -117,6 +120,33 @@ fn establish_window(
     run(session.service_keys()).map_err(|_| "native BA setup receipts/response")?;
     if !session.rx_ba.active(tid) {
         return Err("terminal BA response did not activate recipient");
+    }
+    Ok(())
+}
+/// An oversize ADDBA is refused with INVALID_QOS_PARAM (38) and an
+/// immediate-policy response, with no WTBL/STA_REC_BA programming.
+pub(super) fn decline_oversize(
+    session: &mut Session<Model>,
+    tid: u8,
+    window: u16,
+) -> Result<(), &'static str> {
+    let State::Associated { channel, .. } = session.state else {
+        return Err("oversize ADDBA needs current association");
+    };
+    session
+        .backend
+        .packets
+        .push_back(request_packet(tid, 10, window, 0, channel));
+    consume(session, "declined oversize ADDBA delivered data")?;
+    let before = session.backend.frames.len();
+    run(session.service_keys()).map_err(|_| "oversize ADDBA decline")?;
+    let frames = &session.backend.frames[before..];
+    if session.rx_ba.active(tid)
+        || frames.len() != 1
+        || frames[0].1.get(24..29) != Some(&[3, 1, 9, 38, 0][..])
+        || frames[0].1[29] != (2 | tid << 2)
+    {
+        return Err("oversize ADDBA was not refused with INVALID_QOS_PARAM and no programming");
     }
     Ok(())
 }
@@ -396,12 +426,17 @@ kernel_test_in!(
 
 fn arbitrary_windows() -> Result<(), &'static str> {
     for secured in [false, true] {
-        for requested in [0, 1, 3, 5, 31, 33, 48, 63, 64, 127] {
-            let window = if requested == 0 {
-                64
-            } else {
-                requested.min(64)
-            };
+        for requested in [0, 1, 3, 5, 31, 33, 48, 63, 64, 65, 127] {
+            if requested > 64 {
+                // agg-rx.c:351: a non-HE peer's buf_size above
+                // IEEE80211_MAX_AMPDU_BUF_HT is declined, never clamped.
+                let mut session = joined(6, false, secured)?;
+                decline_oversize(&mut session, 3, requested)?;
+                run(session.disassociate_station())
+                    .map_err(|_| "oversize ADDBA native teardown")?;
+                continue;
+            }
+            let window = if requested == 0 { 64 } else { requested };
             let mut session = joined(6, false, secured)?;
             let before = session.backend.frames.len();
             establish_window(&mut session, 3, 4090, 0, requested)?;
@@ -739,7 +774,7 @@ fn rekey() -> Result<(), &'static str> {
                 && f[34..36] == [3, 0]
                 && f[48..68]
                     == [
-                        0, 1, 1, 0, 1, 0, 0, 0, 17, 0, 44, 0, 0, 1, 0, 0, 6, 36, 0, 16,
+                        0, 1, 1, 0, 1, 0, 0, 0, 17, 0, 44, 0, 0, 1, 0, 0, 5, 36, 0, 16,
                     ]
         })
         .ok_or("native PTK publication missing")?;
@@ -932,4 +967,55 @@ fn mt76_rx_ba_setup_response_and_teardown_cancel_retain_native_ownership() -> Te
 kernel_test_in!(
     "drivers/wireless/mt7921/rx_ba",
     mt76_rx_ba_setup_response_and_teardown_cancel_retain_native_ownership
+);
+
+/// Set IEEE80211_HT_CAP_DELAY_BA in every HT Capabilities element.
+fn with_delayed_ba(elements: &mut [u8]) {
+    let mut offset = 0;
+    while offset + 2 <= elements.len() {
+        let length = usize::from(elements[offset + 1]);
+        if elements[offset] == 45 && length >= 2 {
+            elements[offset + 3] |= 0x04;
+        }
+        offset += 2 + length;
+    }
+}
+
+fn delayed() -> Result<(), &'static str> {
+    // agg-rx.c requires HT DELAY_BA *and* the S1G HT_DELAYED_BA capability
+    // for a delayed policy; a non-S1G peer is refused with INVALID_QOS_PARAM
+    // and an immediate-policy response even when it advertises DELAY_BA.
+    for advertise in [false, true] {
+        let (mut session, mut bss) = super::ht20_tests::prepared(6, false);
+        if advertise {
+            with_delayed_ba(&mut bss.information_elements);
+            if let Some(reply) = session.backend.ht_reply.as_mut() {
+                with_delayed_ba(reply);
+            }
+        }
+        run(session.associate_station(&bss, b"narf", Security::Open, test_permission_for(6), &[]))
+            .map_err(|_| "delayed-BA HT station")?;
+        let mut packet = request_packet(2, 10, 32, 0, 6);
+        packet[24 + 27] &= !2;
+        session.backend.packets.push_back(packet);
+        consume(&mut session, "declined delayed ADDBA delivered data")?;
+        let before = session.backend.frames.len();
+        run(session.service_keys()).map_err(|_| "delayed ADDBA decline")?;
+        let frames = &session.backend.frames[before..];
+        if session.rx_ba.active(2)
+            || frames.len() != 1
+            || frames[0].1.get(24..29) != Some(&[3, 1, 9, 38, 0][..])
+            || frames[0].1[29] != (2 | 2 << 2)
+        {
+            return Err("delayed ADDBA was not refused with INVALID_QOS_PARAM/immediate policy");
+        }
+    }
+    Ok(())
+}
+fn mt76_rx_ba_delayed_policy_is_refused_invalid_qos_for_non_s1g_peer() -> TestResult {
+    delayed().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx_ba",
+    mt76_rx_ba_delayed_policy_is_refused_invalid_qos_for_non_s1g_peer
 );

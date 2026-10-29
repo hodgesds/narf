@@ -162,7 +162,7 @@ kernel_test_in!(
 
 fn smoke_ath11k_probe_requires_complete_runtime_profile() -> TestResult {
     use super::pci::{validate_runtime_profile, ProbeError};
-    for revision in [HwRev::Qcn9074Hw10, HwRev::Unknown] {
+    for revision in [HwRev::Unknown, HwRev::Qcn9074Hw10] {
         if validate_runtime_profile(revision)
             != Err(ProbeError::UnsupportedRuntime { hw_rev: revision })
         {
@@ -653,6 +653,8 @@ fn smoke_ath11k_step_codes_unique_and_in_range() -> TestResult {
                 super::wlfw::step::COLDBOOT_MODE,
                 super::wlfw::step::FW_RESTART,
                 super::wlfw::step::UNSUPPORTED,
+                super::wlfw::step::DEVICE_INFO,
+                super::wlfw::step::BDF_IOREMAP,
             ],
         ),
         (

@@ -374,6 +374,8 @@ pub(super) struct Ap {
 #[derive(Default)]
 pub(super) struct World {
     pub(super) now: u64,
+    /// The radio-wide `dfs_block_radar_events` switch the FakeDp reports.
+    pub(super) radar_blocked: bool,
     pub(super) cfg: Option<FwCfg>,
     pub(super) sent: Vec<WmiCmd>,
     pub(super) mgmt: Vec<Vec<u8>>,
@@ -808,6 +810,9 @@ impl WmiPort for FakeWmi {
 }
 
 impl DataPort for FakeDp {
+    fn radar_events_blocked(&self) -> bool {
+        self.0.lock().radar_blocked
+    }
     fn ppdu_stats_req(&self) -> impl Future<Output = Result<(), i32>> + Send {
         self.0.lock().dp_calls.push("ppdu_stats");
         core::future::ready(Ok(()))
@@ -4172,4 +4177,350 @@ fn smoke_ath11k_rekey_entropy_failure_closes_port_without_reply() -> TestResult 
 kernel_test_in!(
     "drivers/wireless/ath11k",
     smoke_ath11k_rekey_entropy_failure_closes_port_without_reply
+);
+
+// ── Debugfs-class firmware diagnostics (TWT dialogs, radar) ─────────
+
+/// A beaconing 5180 MHz AP on a radio that advertises the AP TWT service,
+/// started with hostapd's `twt_responder` so ath11k's `BSS_CHANGED_TWT`
+/// enabled the pdev TWT engine.
+fn twt_ap_mac(twt_responder: bool) -> Result<(TestMac, Shared), &'static str> {
+    let c = caps(
+        false,
+        &[
+            WMI_TLV_SERVICE_SPOOF_MAC_SUPPORT,
+            WMI_TLV_SERVICE_11D_OFFLOAD,
+            WMI_TLV_SERVICE_AP_TWT,
+        ],
+    );
+    let (mut m, w) = new_mac(c, Some(&us_reg(false)), FwCfg::default());
+    block(m.start()).map_err(|_| "start")?;
+    block(m.add_ap_interface()).map_err(|_| "add AP interface")?;
+    let mut head = vec![0x80, 0, 0, 0];
+    head.extend_from_slice(&[255; 6]);
+    head.extend_from_slice(&OWN);
+    head.extend_from_slice(&OWN);
+    head.extend_from_slice(&[0; 10]);
+    head.extend_from_slice(&100u16.to_le_bytes());
+    head.extend_from_slice(&1u16.to_le_bytes());
+    head.extend_from_slice(&[
+        0, 3, b'a', b'p', b'1', 1, 8, 0x8c, 18, 0x98, 36, 0xb0, 72, 96, 108,
+    ]);
+    let cfg = narf_wireless::ApConfig {
+        ssid: b"ap1".to_vec(),
+        beacon_head: head,
+        beacon_tail: vec![],
+        probe_resp: None,
+        beacon_interval: 100,
+        dtim_period: 1,
+        frequency_mhz: 5180,
+        channel_width: 0,
+        center_freq1_mhz: None,
+        center_freq2_mhz: None,
+        hidden_ssid: 0,
+        privacy: false,
+        mbssid: None,
+        mbssid_elems: vec![],
+        ema_rnr_elems: vec![],
+        fils_discovery: None,
+        unsol_bcast_probe_resp: None,
+        ftm_responder: None,
+        twt_responder,
+        he_obss_pd: None,
+        he_bss_color: None,
+    };
+    block(m.start_ap(cfg, MbssidParams::standalone(), None)).map_err(|_| "start AP")?;
+    Ok((m, w))
+}
+
+fn smoke_ath11k_mac_twt_dialog_control() -> TestResult {
+    run(|| {
+        const PEER: [u8; 6] = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        // Without the TWT engine the debugfs writes are -EOPNOTSUPP.
+        let (mut m, w) = twt_ap_mac(false)?;
+        take_sent(&w);
+        ensure!(
+            block(m.twt_del_dialog(PEER, 1)) == Err(mac::errno::EOPNOTSUPP),
+            "TWT engine off refuses"
+        );
+        ensure!(take_sent(&w).is_empty(), "nothing sent while refused");
+
+        let (mut m, w) = twt_ap_mac(true)?;
+        ensure!(
+            w.lock()
+                .sent
+                .contains(&twt_enable_cmd(PDEV, &TwtEnableParams::default())),
+            "START_AP twt_responder enabled the pdev engine"
+        );
+        take_sent(&w);
+        // AP: add is sent as-is (no station re-arm); vdev_id is forced to
+        // this vif's; the flag bits sit above the u8 TWT setup command.
+        let p = TwtAddDialogParams {
+            vdev_id: 7,
+            peer_macaddr: PEER,
+            dialog_id: 3,
+            wake_intvl_us: 102_400,
+            wake_intvl_mantis: 100,
+            wake_dura_us: 8_192,
+            sp_offset_us: 0,
+            twt_cmd: 1, // SUGGEST_TWT
+            flag_trigger: true,
+            flag_protection: true,
+            ..Default::default()
+        };
+        ensure!(block(m.twt_add_dialog(p)).is_ok(), "add dialog");
+        let sent = take_sent(&w);
+        ensure!(sent.len() == 1, "one add command");
+        // struct wmi_twt_add_dialog_params_cmd, from Linux wmi.h.
+        let mw = mac_words(&PEER);
+        let want = le(&[
+            ((WMI_TAG_TWT_ADD_DIALOG_CMD as u32) << 16) | 36,
+            0, // this AP's vdev
+            mw[0],
+            mw[1],
+            3,
+            102_400,
+            100,
+            8_192,
+            0,
+            1 | 1 << 9 | 1 << 11,
+        ]);
+        ensure!(
+            sent[0].cmd_id == WMI_TWT_ADD_DIALOG_CMDID && sent[0].buf == want,
+            "add dialog bytes"
+        );
+        ensure!(block(m.twt_pause_dialog(PEER, 3)).is_ok(), "pause");
+        ensure!(
+            block(m.twt_resume_dialog(PEER, 3, 2048, 1)).is_ok(),
+            "resume"
+        );
+        ensure!(block(m.twt_del_dialog(PEER, 3)).is_ok(), "delete");
+        let sent = take_sent(&w);
+        ensure!(
+            sent == [
+                twt_pause_dialog_cmd(0, &PEER, 3),
+                twt_resume_dialog_cmd(0, &PEER, 3, 2048, 1),
+                twt_del_dialog_cmd(0, &PEER, 3),
+            ],
+            "pause / resume / delete without a station re-arm"
+        );
+        ensure!(
+            sent[0].buf
+                == le(&[
+                    ((WMI_TAG_TWT_PAUSE_DIALOG_CMD as u32) << 16) | 16,
+                    0,
+                    mw[0],
+                    mw[1],
+                    3,
+                ])
+                && sent[1].buf
+                    == le(&[
+                        ((WMI_TAG_TWT_RESUME_DIALOG_CMD as u32) << 16) | 24,
+                        0,
+                        mw[0],
+                        mw[1],
+                        3,
+                        2048,
+                        1,
+                    ]),
+            "pause / resume dialog bytes"
+        );
+        // The completion event: a failure status is retained for the vif.
+        w.lock().events.push_back(event(
+            WMI_TWT_ADD_DIALOG_EVENTID,
+            &[tlv(
+                WMI_TAG_TWT_ADD_DIALOG_COMPLETE_EVENT,
+                &le(&[0, mw[0], mw[1], 3, twt_add_status::USED_DIALOG_ID]),
+            )],
+        ));
+        // Another vdev's completion is not this vif's.
+        w.lock().events.push_back(event(
+            WMI_TWT_ADD_DIALOG_EVENTID,
+            &[tlv(
+                WMI_TAG_TWT_ADD_DIALOG_COMPLETE_EVENT,
+                &le(&[1, mw[0], mw[1], 4, 0]),
+            )],
+        ));
+        let _ = block(m.poll());
+        let got = m.take_twt_add_dialog_events();
+        ensure!(
+            got == [TwtAddDialogEvent {
+                vdev_id: 0,
+                peer_macaddr: PEER,
+                dialog_id: 3,
+                status: twt_add_status::USED_DIALOG_ID,
+            }],
+            "add-dialog completion retained per vif"
+        );
+        ensure!(
+            twt_add_dialog_status_str(twt_add_status::USED_DIALOG_ID) == "dialog id in use"
+                && twt_add_dialog_status_str(42) == "unknown error",
+            "Linux status strings"
+        );
+        // A missing TLV is an error (the policy table's tb[] lookup).
+        ensure!(decode_twt_add_dialog_event(&[]).is_err(), "missing TLV");
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_mac_twt_dialog_control
+);
+
+fn smoke_ath11k_mac_radar_diagnostics() -> TestResult {
+    run(|| {
+        // No started AP vdev: ath11k_wmi_simulate_radar is -EINVAL.
+        let (mut s, sw) = started_mac(default_caps(), Some(&us_reg(false)), FwCfg::default());
+        ensure!(
+            block(s.simulate_radar()) == Err(mac::errno::EINVAL),
+            "simulate radar needs a started AP"
+        );
+        ensure!(take_sent(&sw).is_empty(), "nothing sent");
+
+        let (mut m, w) = twt_ap_mac(false)?;
+        take_sent(&w);
+        ensure!(block(m.simulate_radar()).is_ok(), "simulate radar");
+        let sent = take_sent(&w);
+        // struct wmi_unit_test_cmd + WMI_TAG_ARRAY_UINT32 of DFS args.
+        let want = le(&[
+            ((WMI_TAG_UNIT_TEST_CMD as u32) << 16) | 16,
+            0,    // vdev
+            0x2b, // DFS_UNIT_TEST_MODULE
+            3,    // DFS_MAX_TEST_ARGS
+            0xAA, // DFS_UNIT_TEST_TOKEN
+            ((WMI_TAG_ARRAY_UINT32 as u32) << 16) | 12,
+            0,    // DFS_TEST_CMDID
+            PDEV, // DFS_TEST_PDEV_ID
+            0,    // DFS_TEST_RADAR_PARAM
+        ]);
+        ensure!(
+            sent.len() == 1 && sent[0].cmd_id == WMI_UNIT_TEST_CMDID && sent[0].buf == want,
+            "unit test command bytes"
+        );
+
+        // RadarDiagnostics: the runtime's per-report record.
+        let ev = DfsRadarDetected {
+            pdev_id: PDEV,
+            detection_mode: 1,
+            chan_freq: 5180,
+            chan_width: 20,
+            detector_id: 0,
+            segment_id: 0,
+            timestamp: 1234,
+            is_chirp: true,
+            freq_offset: -5,
+            sidx: 17,
+        };
+        let mut d = diag::RadarDiagnostics::default();
+        ensure!(d.record(&ev, Some(PDEV)), "acted on");
+        ensure!(
+            !d.record(&DfsRadarDetected { pdev_id: 3, ..ev }, Some(PDEV)),
+            "invalid pdev"
+        );
+        ensure!(!d.record(&ev, None), "no radio yet");
+        d.block_radar_events = true;
+        ensure!(!d.record(&ev, Some(PDEV)), "blocked");
+        ensure!(
+            d.detected == 1 && d.invalid_pdev == 2 && d.ignored == 1 && d.last == Some(ev),
+            "counts + latest detector report"
+        );
+
+        // The radar event moves the AP channel to NOP unless the radio
+        // blocks radar events.
+        let radar_ev = event(
+            WMI_PDEV_DFS_RADAR_DETECTION_EVENTID,
+            &[tlv(
+                WMI_TAG_PDEV_DFS_RADAR_DETECTION_EVENT,
+                &le(&[PDEV, 1, 5180, 20, 0, 0, 1234, 1, (-5i32) as u32, 17]),
+            )],
+        );
+        ensure!(
+            decode_dfs_radar_detected(&radar_ev[4..]) == Ok(ev),
+            "detector fields decoded"
+        );
+        w.lock().radar_blocked = true;
+        w.lock().events.push_back(radar_ev.clone());
+        let _ = block(m.poll());
+        ensure!(
+            m.take_dfs_events().is_empty(),
+            "blocked: no cfg80211 radar event"
+        );
+        w.lock().radar_blocked = false;
+        w.lock().events.push_back(radar_ev);
+        let _ = block(m.poll());
+        ensure!(
+            m.take_dfs_events().iter().any(|e| e.event == 0),
+            "unblocked: NL80211_RADAR_DETECTED"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_mac_radar_diagnostics
+);
+
+fn smoke_ath11k_mac_bitrate_mask_ranges() -> TestResult {
+    run(|| {
+        use narf_wireless::TxBitrateBand;
+        let vht = |m: [u16; 8]| TxBitrateBand {
+            vht_mcs: Some(m),
+            ..Default::default()
+        };
+        let he = |m: [u16; 8]| TxBitrateBand {
+            he_mcs: Some(m),
+            ..Default::default()
+        };
+        let one = |v: u16| [v, 0, 0, 0, 0, 0, 0, 0];
+        // ath11k_mac_vht_mcs_range_present: 0-7 / 0-8 / 0-9 per NSS.
+        for ok in [0x00ff, 0x01ff, 0x03ff] {
+            ensure!(
+                peer::validate_tx_bitrate_band(&vht(one(ok))).is_ok(),
+                "VHT range"
+            );
+        }
+        // ath11k_mac_he_mcs_range_present: 0-7 / 0-9 / 0-11 only.
+        for ok in [0x00ff, 0x03ff, 0x0fff] {
+            ensure!(
+                peer::validate_tx_bitrate_band(&he(one(ok))).is_ok(),
+                "HE range"
+            );
+        }
+        // HE has no 0-8 / 0-10 MCS-map encoding: Linux refuses both.
+        for bad in [0x01ff, 0x07ff] {
+            ensure!(
+                peer::validate_tx_bitrate_band(&he(one(bad))).is_err(),
+                "HE 0-8 / 0-10"
+            );
+        }
+        // Non-contiguous multi-rate sets need the RATEMASK command Linux
+        // never sends: -EINVAL.
+        ensure!(
+            peer::validate_tx_bitrate_band(&vht(one(0x0005))).is_err(),
+            "VHT MCS 0+2"
+        );
+        ensure!(
+            peer::validate_tx_bitrate_band(&he(one(0x0300))).is_err(),
+            "HE MCS 8+9"
+        );
+        // A single rate is the peer fixed-rate path, accepted.
+        ensure!(
+            peer::validate_tx_bitrate_band(&vht(one(0x0010))).is_ok(),
+            "single VHT"
+        );
+        ensure!(
+            peer::validate_tx_bitrate_band(&he(one(0x0800))).is_ok(),
+            "single HE"
+        );
+        ensure!(
+            peer::vht_mcs_range_present(&[0x03ff, 0x01ff, 0, 0, 0, 0, 0, 0])
+                && !peer::he_mcs_range_present(&[0x03ff, 0x01ff, 0, 0, 0, 0, 0, 0]),
+            "per-NSS range predicates"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_mac_bitrate_mask_ranges
 );

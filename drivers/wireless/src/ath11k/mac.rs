@@ -45,6 +45,7 @@ use narf_wireless::{
 use super::mac_frame::{self as frame, capab, eid, freq_band, Band, ParsedIes};
 use super::mac_peer::{self as peer, ApSta, ChanDef, ConnMode, OwnCaps, SmpsMode, Width};
 use super::mac_reg::{chan_flag, DfsState, RegState, RegUpdate, VdevKind, Wiphy};
+pub mod diag;
 pub mod ext;
 pub mod he;
 pub mod sae;
@@ -158,6 +159,12 @@ pub trait DataPort {
     /// virtual interface from selecting the channel while the vdev that
     /// received radar is down or has been deleted.
     fn record_dfs_nop(&self, _def: ChanDef, _deadline: u64) {}
+    /// ath11k's radio-wide `dfs_block_radar_events` debug switch: radar
+    /// reports are recorded but not acted on. Ports without a physical
+    /// radio never block.
+    fn radar_events_blocked(&self) -> bool {
+        false
+    }
     /// An AP peer has completed WMI association and may receive EAPOL. `wme`
     /// selects QoS headers and AC classification for that client.
     fn ap_station_added(&self, vdev_id: u32, addr: [u8; 6], wme: bool);
@@ -195,6 +202,20 @@ pub trait DataPort {
         pairwise: bool,
         install: bool,
     ) -> impl Future<Output = Result<(), i32>> + Send;
+    /// `ieee80211_key_alloc(seq)` for a received group key: seed its
+    /// replay counters with the RSC (`seq`, 48-bit little-endian) the
+    /// supplicant took from the GTK KDE's EAPOL-Key frame. Called after the
+    /// key's `rx_pn_replay_config(install)`. A default no-op keeps pure
+    /// codec ports independent of the live DP.
+    fn group_rx_seq(
+        &self,
+        _vdev_id: u32,
+        _addr: [u8; 6],
+        _key_idx: u8,
+        _seq: u64,
+    ) -> impl Future<Output = ()> + Send {
+        core::future::ready(())
+    }
     /// Supply or clear the eight-byte receive Michael direction of a
     /// pairwise TKIP key. WCN6855 decrypts TKIP itself, but its fragmented
     /// receive path leaves the one MSDU-level Michael MIC for host
@@ -410,6 +431,7 @@ pub mod errno {
     pub const ENOLINK: i32 = 67;
     pub const EPROTO: i32 = 71;
     pub const ENOTCONN: i32 = 107;
+    pub const ENODEV: i32 = 19;
 }
 
 /// A mac-layer failure.
@@ -1273,6 +1295,9 @@ struct Pending {
     ap_color_change_events: VecDeque<ApColorChangeEvent>,
     /// CFG80211 DFS radar / CAC / NOP notifications.
     dfs_events: VecDeque<DfsEvent>,
+    /// `WMI_TWT_ADD_DIALOG_EVENTID` completions for this vif (bounded by
+    /// [`diag::TWT_ADD_DIALOG_EVENTS_MAX`]).
+    twt_add_dialog: VecDeque<TwtAddDialogEvent>,
     /// One target collision indication awaiting mac80211's 500-ms rate
     /// limiter, followed by the events ready for the netlink publisher.
     obss_color_collision: Option<ObssColorCollisionPending>,
@@ -3984,7 +4009,14 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                     time_tx_ms: info.tx_ticks / COUNTER_TICKS_PER_MS,
                 });
             }
-            WmiEvent::DfsRadarDetected(radar) => self.dfs_radar_detected(&radar),
+            // `ar->dfs_block_radar_events` is radio-wide debug state; the
+            // runtime records every report once in its `RadarDiagnostics`.
+            WmiEvent::DfsRadarDetected(radar) if !self.dp.radar_events_blocked() => {
+                self.dfs_radar_detected(&radar)
+            }
+            WmiEvent::TwtAddDialog(ev) if Some(ev.vdev_id) == our_vdev => {
+                self.twt_add_dialog_event(ev)
+            }
             WmiEvent::ObssColorCollision(collision)
                 if Some(collision.vdev_id) == our_vdev
                     && collision.event_type == WMI_BSS_COLOR_COLLISION_DETECTION =>

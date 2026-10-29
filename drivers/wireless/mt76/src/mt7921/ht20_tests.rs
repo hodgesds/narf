@@ -77,7 +77,9 @@ fn mt76_ht20_native_peer_rlm_rates_and_bound_association() -> TestResult {
                     && frame.get(10..16) == Some(super::amsdu_rx_tests::OWN.as_slice())
             });
             let mut expected = [0; 26];
-            expected[0] = 61;
+            // LDPC, SMPS disabled, greenfield, SGI20 and (two TX streams,
+            // mt76_init_stream_cap) TX_STBC.
+            expected[0] = 61 | 128;
             expected[1] = 1;
             expected[2] = 28;
             expected[3] = 255;
@@ -400,7 +402,7 @@ fn mt76_ht20_addba_is_bound_bounded_and_explicitly_declined_without_ba_state() -
         );
     }
     for (_, frame) in &session.backend.frames[before..] {
-        if frame.len() != 33 || frame[0] != 0xd0 || frame[24..] != [3, 1, 9, 37, 0, 12, 0, 0, 0] {
+        if frame.len() != 33 || frame[0] != 0xd0 || frame[24..] != [3, 1, 9, 38, 0, 14, 0, 0, 0] {
             return TestResult::Fail(
                 "ADDBA response enabled BA/AMSDU or changed dialog/TID/status",
             );

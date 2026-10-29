@@ -2,6 +2,8 @@
 use super::*;
 #[path = "rx_ba_conversation_tests.rs"]
 mod rx_ba_conversation_tests;
+#[path = "tx_ba_conversation_tests.rs"]
+mod tx_ba_conversation_tests;
 
 fn elements(primary: u8) -> Vec<u8> {
     // HT20/SGI20, SMPS disabled,64KiB/8us peer A-MPDU limit, MCS0..7.

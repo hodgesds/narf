@@ -149,6 +149,9 @@ fn tx() -> Vec<u8> {
     b[..6].copy_from_slice(&AP);
     b[6..12].copy_from_slice(&OWN);
     b[12..14].copy_from_slice(&[8, 0]);
+    // IPv4 DSCP 0 (best effort): classified to TID 0, the BA TID.
+    b[14] = 0x45;
+    b[15] = 0;
     b
 }
 pub(super) fn data(secure: bool, width: u8, rate: u8, nss: u8, pn: u64) -> Vec<u8> {
@@ -307,7 +310,8 @@ fn native() -> Result<(), &'static str> {
                 f.windows(14).filter(|ie| ie[..2] == [191, 12]).count() != 1
                     || !f
                         .windows(14)
-                        .any(|ie| ie == [191, 12, 48, 1, 0, 0, 250, 255, 0, 0, 250, 255, 0, 0])
+                        // Two TX streams: TXSTBC (mt76_init_stream_cap) and EXT_NSS_BW capable.
+                        .any(|ie| ie == [191, 12, 176, 1, 0, 0, 250, 255, 0, 0, 250, 255, 0, 0x20])
             }) {
                 return Err("actual local2SS VHT request encoding");
             }
@@ -867,14 +871,18 @@ fn receive_stbc() -> Result<(), &'static str> {
                     .1
                     .windows(14)
                     .find(|ie| ie[..2] == [191, 12])
-                    .is_none_or(|ie| ie[3] & 7 != u8::from(enabled) || ie[2] & 128 != 0)
+                    .is_none_or(|ie| {
+                        ie[3] & 7 != u8::from(enabled) || (ie[2] & 128 != 0) != (streams > 1)
+                    })
                     || request
                         .1
                         .windows(28)
                         .find(|ie| ie[..2] == [45, 26])
-                        .is_none_or(|ie| ie[3] & 3 != u8::from(enabled) || ie[2] & 128 != 0)
+                        .is_none_or(|ie| {
+                            ie[3] & 3 != u8::from(enabled) || (ie[2] & 128 != 0) != (streams > 1)
+                        })
                 {
-                    return Err("RXSTBC1 promise promoted TX STBC or more receive data streams");
+                    return Err("RXSTBC1 promise or TX STBC did not follow actual NIC streams");
                 }
                 let mut packet = data(true, width, rate, nsts, 9);
                 let mut rxv = u32::from_le_bytes(packet[40..44].try_into().unwrap());

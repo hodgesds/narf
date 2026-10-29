@@ -903,6 +903,40 @@ unsafe impl Registers for Native {
         );
         Ok(())
     }
+    fn station_bind_continuation(
+        &mut self,
+        g: alloc::sync::Arc<super::qualification::Grant>,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        self.packet_gate = Some(
+            self.packet_gate
+                .as_ref()
+                .ok_or(Error::State)?
+                .with_continuation(g)?,
+        );
+        Ok(())
+    }
+    fn station_continuation(
+        &mut self,
+        kind: &'static super::qualification::Kind,
+    ) -> Result<Option<alloc::sync::Arc<super::qualification::Grant>>, Error> {
+        self.station_allowed()?;
+        let gate = self.packet_gate.as_ref().ok_or(Error::State)?;
+        Ok(super::qualification::Source::Registered
+            .load(kind, gate)
+            .ok())
+    }
+    fn station_continuation_request(
+        &mut self,
+        kind: &'static super::qualification::Kind,
+    ) -> Result<super::ContinuationRequest, Error> {
+        self.station_allowed()?;
+        super::qualification::request(kind, self.packet_gate.as_ref().ok_or(Error::State)?)
+    }
+    fn station_gate(&mut self) -> Result<super::power_policy::Gate, Error> {
+        self.station_allowed()?;
+        self.packet_gate.clone().ok_or(Error::State)
+    }
     fn station_rts_request(&mut self) -> Result<super::RtsRequest, Error> {
         self.station_allowed()?;
         let gate = self.packet_gate.as_ref().ok_or(Error::State)?;
@@ -1082,11 +1116,23 @@ unsafe impl Registers for Native {
     ) -> Result<u64, super::packet_core::Error> {
         self.submit_packet(frame, report)
     }
+    fn packet_scan_address(
+        &mut self,
+        address: Option<[u8; 6]>,
+    ) -> Result<(), super::packet_core::Error> {
+        self.scan_packet_address(address)
+    }
     fn packet_poll(&mut self) -> Result<super::packet_core::Step, super::packet_core::Error> {
         self.poll_packets()
     }
     fn packet_stop(&mut self) -> Result<(), super::packet_core::Error> {
         self.stop_packets()
+    }
+    async fn quiesce_dma(&mut self) -> Result<(), Error> {
+        self.quiesce().await
+    }
+    fn dma_reclaimable(&self) -> bool {
+        !self.published
     }
     fn parked_cpu<T>(&mut self, operation: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
         if self.state != State::Configuring {
@@ -1099,7 +1145,85 @@ unsafe impl Registers for Native {
         .map_err(|_| Error::Access)?
     }
 }
+/// Teardown register view over the exact BAR under current PCI authority;
+/// usable after `Port::stop` made the owner Terminal.
+struct Teardown<'a>(&'a mut Native);
+#[async_trait::async_trait]
+impl super::dma_stop::Quiesce for Teardown<'_> {
+    fn bus_master_closed(&mut self) -> Result<bool, Error> {
+        use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+        let native = &*self.0;
+        let command = crate::rtw88::pci_park::invoke(&native.cap, || {
+            narf_bus::pci::read_command(&native.cap, &native.device).map_err(|_| Error::Access)
+        })
+        .map_err(|_| Error::Access)??;
+        if command == u16::MAX {
+            return Err(Error::Gone);
+        }
+        Ok(command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) == MEM_SPACE | INTX_DISABLE)
+    }
+    fn read8(&mut self, reg: u16) -> Result<u8, Error> {
+        self.0.teardown(reg, 1, |mmio| {
+            // SAFETY: complete byte within the retained BAR, inside invoke.
+            unsafe { mmio.read8(u64::from(reg)) }
+        })
+    }
+    fn read32(&mut self, reg: u16) -> Result<u32, Error> {
+        self.0.teardown(reg, 4, |mmio| {
+            // SAFETY: complete aligned dword within the retained BAR.
+            unsafe { mmio.read32(u64::from(reg)) }
+        })
+    }
+    fn write32(&mut self, reg: u16, value: u32) -> Result<(), Error> {
+        self.0.teardown(reg, 4, |mmio| {
+            // SAFETY: complete aligned dword within the retained BAR.
+            unsafe { mmio.write32(u64::from(reg), value) }
+        })
+    }
+    async fn delay_us(&mut self, us: u64) {
+        narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(us.saturating_mul(1000))).await;
+    }
+}
 impl Native {
+    fn teardown<T>(
+        &self,
+        reg: u16,
+        width: usize,
+        operation: impl FnOnce(MmioRegion) -> T,
+    ) -> Result<T, Error> {
+        if self.state != State::Terminal
+            || usize::from(reg) % width != 0
+            || u64::from(reg) + width as u64 > self.mmio.len
+        {
+            return Err(Error::State);
+        }
+        crate::rtw88::pci_park::invoke(&self.cap, || operation(self.mmio))
+            .map_err(|_| Error::Access)
+    }
+    /// Linux `rtw_pci_stop` (HIMRs zero, TXPAUSE, CR DMA gates, BME off)
+    /// followed by the DMA idle proof. Every exit before success leaves
+    /// all rings, RX buffers, H2C and packet buffers retained.
+    async fn quiesce(&mut self) -> Result<(), Error> {
+        if !self.published {
+            return Err(Error::State);
+        }
+        let stopped = match self.packet.take() {
+            Some(mut core) => {
+                let result = core.stop(self);
+                self.packet = Some(core);
+                result
+            }
+            None => packet::stop_native(self),
+        };
+        self.state = State::Terminal;
+        stopped.map_err(|_| Error::Access)?;
+        super::dma_stop::prove(&mut Teardown(self)).await?;
+        if let Some(core) = self.packet.as_mut() {
+            core.release().map_err(|_| Error::State)?;
+        }
+        self.published = false;
+        Ok(())
+    }
     fn check_packet_permission(&self) -> Result<(), Error> {
         self.packet_gate
             .as_ref()

@@ -105,6 +105,9 @@ pub(super) struct Peer {
     valid: Arc<AtomicBool>,
     admission: Admission,
     qos: Arc<AtomicBool>,
+    /// QoS DATA TIDs admitted after WMM setup: bit0 (BE/TID0) for the WMM
+    /// recipe, all eight for the signed all-AC program.
+    tids: Arc<core::sync::atomic::AtomicU8>,
 }
 impl Peer {
     pub(super) fn own(&self) -> [u8; 6] {
@@ -130,9 +133,15 @@ impl Peer {
             && frame[4..10] == self.peer
             && frame[10..16] == self.own
             && (frame[0] != 0x88
-                || self.qos.load(Ordering::Acquire) && frame.get(24..26) == Some(&[0, 0]))
+                || self.qos.load(Ordering::Acquire)
+                    && frame.get(25) == Some(&0)
+                    && frame.get(24).is_some_and(|control| {
+                        control & 0xf8 == 0
+                            && self.tids.load(Ordering::Acquire) & (1 << control) != 0
+                    }))
     }
     fn invalidate(&self) {
+        self.tids.store(0, Ordering::Release);
         self.qos.store(false, Ordering::Release);
         self.valid.store(false, Ordering::Release);
     }
@@ -152,6 +161,10 @@ pub(super) struct Controller {
     phase: Phase,
     peer: Option<Peer>,
     admission: Option<Admission>,
+    /// Static BA CAM entries (`rtw8852b bacam_num = 2`): owning TID.
+    ba_cam: [Option<u8>; 2],
+    /// Random scan address currently in the address CAM SMA.
+    scan: Option<[u8; 6]>,
 }
 struct Attempt {
     admission: Admission,
@@ -180,6 +193,8 @@ impl Controller {
             phase: Phase::New,
             peer: None,
             admission: None,
+            ba_cam: [None; 2],
+            scan: None,
         })
     }
     pub(super) fn own(&self) -> [u8; 6] {
@@ -197,6 +212,7 @@ impl Controller {
     }
     pub(super) fn invalidate(&mut self) {
         self.phase = Phase::Failed;
+        self.ba_cam = [None; 2];
         if let Some(peer) = &self.peer {
             peer.invalidate();
         }
@@ -261,6 +277,7 @@ impl Controller {
         if self.phase() != Phase::Passive
             || self.admission.as_ref().is_none_or(|a| !a.same(admission))
             || self.peer.is_some()
+            || self.scan.is_some()
             || !unicast(bssid)
             || bssid == self.own
         {
@@ -273,6 +290,7 @@ impl Controller {
             valid: Arc::new(AtomicBool::new(false)),
             admission: admission.clone(),
             qos: Arc::new(AtomicBool::new(false)),
+            tids: Arc::new(core::sync::atomic::AtomicU8::new(0)),
         };
         self.peer = Some(peer.clone());
         let mut attempt = Attempt {
@@ -296,6 +314,48 @@ impl Controller {
         })?;
         attempt.armed = false;
         Ok(peer)
+    }
+    /// `rtw89_core_scan_start` / `rtw89_core_scan_complete` ->
+    /// `rtw89_fw_h2c_cam`: point the passive address CAM SMA at a random
+    /// scan address, or (`None`) back at the own address. A failed or
+    /// cancelled update closes admission like every other controller step.
+    pub(super) async fn scan_address(
+        &mut self,
+        io: &mut impl Interface,
+        address: Option<[u8; 6]>,
+        admission: &Admission,
+    ) -> Result<(), Error> {
+        let sma = address.unwrap_or(self.own);
+        if self.phase() != Phase::Passive
+            || self.admission.as_ref().is_none_or(|a| !a.same(admission))
+            || self.peer.is_some()
+            || address.is_some() == self.scan.is_some()
+            || !unicast(sma)
+        {
+            return Err(Error::Unsupported);
+        }
+        self.phase = Phase::Failed;
+        let mut attempt = Attempt {
+            admission: admission.clone(),
+            peer: None,
+            armed: true,
+        };
+        command(
+            io,
+            6,
+            0,
+            &codec::cam(sma, [0; 6], 0, false, true),
+            true,
+            Some(admission),
+        )
+        .await?;
+        admission.run(|| {
+            self.scan = address;
+            self.phase = Phase::Passive;
+            Ok(())
+        })?;
+        attempt.armed = false;
+        Ok(())
     }
     pub(super) async fn commit_peer(
         &mut self,
@@ -374,7 +434,185 @@ impl Controller {
         }
         admission.run(|| {
             peer.current()?;
+            peer.tids.store(1, Ordering::Release);
             peer.qos.store(true, Ordering::Release);
+            self.phase = Phase::Associated;
+            Ok(())
+        })?;
+        attempt.armed = false;
+        Ok(())
+    }
+    /// `rtw89_core_acquire_sta_ba_entry` / `rtw89_core_release_sta_ba_entry`
+    /// then `rtw89_fw_h2c_ba_cam` (DONE_ACK). When no static entry is
+    /// available (and the TID is not 0/5 for replacement) Linux sends
+    /// nothing: hardware creates a dynamic BA CAM entry itself.
+    pub(super) async fn configure_ba(
+        &mut self,
+        io: &mut impl Interface,
+        valid: bool,
+        tid: u8,
+        buf: u16,
+        ssn: u16,
+        admission: &Admission,
+    ) -> Result<(), Error> {
+        if tid > 7
+            || self.phase() != Phase::Associated
+            || self.admission.as_ref().is_none_or(|a| !a.same(admission))
+        {
+            return Err(Error::Terminal);
+        }
+        let peer = self.peer.clone().ok_or(Error::Terminal)?;
+        peer.current()?;
+        let entry = if valid {
+            match self.ba_cam.iter().position(Option::is_none) {
+                Some(index) => Some(index),
+                None if tid == 0 || tid == 5 => self
+                    .ba_cam
+                    .iter()
+                    .position(|owner| !matches!(owner, Some(0 | 5))),
+                None => None,
+            }
+        } else {
+            self.ba_cam.iter().position(|owner| *owner == Some(tid))
+        };
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        self.ba_cam[entry] = valid.then_some(tid);
+        self.phase = Phase::Failed;
+        let mut attempt = Attempt {
+            admission: admission.clone(),
+            peer: Some(peer.clone()),
+            armed: true,
+        };
+        let body = codec::ba_cam(valid, entry as u8, tid, buf, ssn);
+        command(io, 0xc, 0, &body, true, Some(admission)).await?;
+        admission.run(|| {
+            peer.current()?;
+            self.phase = Phase::Associated;
+            Ok(())
+        })?;
+        attempt.armed = false;
+        Ok(())
+    }
+    /// `rtw89_phy_ra_assoc` -> `rtw89_fw_h2c_ra`: hand rate selection for
+    /// the WMM-configured peer to firmware RA. Linux requests neither
+    /// receive nor done ACK for this H2C.
+    pub(super) async fn configure_ra(
+        &mut self,
+        io: &mut impl Interface,
+        rates: u16,
+        ht: Option<codec::HtRa>,
+        he: Option<codec::HeRa>,
+        admission: &Admission,
+    ) -> Result<(), Error> {
+        let body = match (ht, he) {
+            (Some(ht), Some(he)) => codec::ra_he(rates, ht, he),
+            (_, Some(_)) => None,
+            (ht, None) => codec::ra_ht(rates, ht),
+        }
+        .ok_or(Error::Unsupported)?;
+        if self.phase() != Phase::Associated
+            || self.admission.as_ref().is_none_or(|a| !a.same(admission))
+        {
+            return Err(Error::Terminal);
+        }
+        let peer = self.peer.clone().ok_or(Error::Terminal)?;
+        peer.current()?;
+        if !peer.qos.load(Ordering::Acquire) {
+            return Err(Error::Terminal);
+        }
+        self.phase = Phase::Failed;
+        let mut attempt = Attempt {
+            admission: admission.clone(),
+            peer: Some(peer.clone()),
+            armed: true,
+        };
+        admission.check()?;
+        io.command(2, 1, 0, &body, false, Some(admission)).await?;
+        admission.run(|| {
+            peer.current()?;
+            self.phase = Phase::Associated;
+            Ok(())
+        })?;
+        attempt.armed = false;
+        Ok(())
+    }
+    /// mac80211 `IEEE80211_AMPDU_TX_OPERATIONAL`/`TX_STOP_*` ->
+    /// `rtw89_ops_ampdu_action`: `rtw89_chip_h2c_ampdu_cmac_tbl` is NULL in
+    /// `rtw8852b_chip_ops` (no H2C), then `rtw89_phy_ra_recalc_agg_limit`
+    /// writes `R_AX_AMPDU_AGG_LIMIT` (0xc610) `B_AX_RA_TRY_RATE_AGG_LMT_MASK`
+    /// [23:16] = clamp(min agg_num, 1, 256) - 1, or 0x3f with no TX session.
+    pub(super) fn configure_agg_limit(
+        &mut self,
+        io: &mut impl Interface,
+        agg_num: Option<u16>,
+        admission: &Admission,
+    ) -> Result<(), Error> {
+        if self.phase() != Phase::Associated
+            || self.admission.as_ref().is_none_or(|a| !a.same(admission))
+        {
+            return Err(Error::Terminal);
+        }
+        let peer = self.peer.clone().ok_or(Error::Terminal)?;
+        let limit = agg_num.map_or(0x3f, |n| u32::from(n.clamp(1, 256) - 1));
+        checked(io, Some(admission), |io| {
+            peer.current()?;
+            modify(io, 0xc610, 0xff << 16, limit << 16)
+        })
+    }
+    /// Admit TID0..7 on an already WMM-configured peer. Callers grant this
+    /// only under the signed all-AC QoS operating program.
+    pub(super) fn admit_all_tids(&self, admission: &Admission) -> Result<(), Error> {
+        if self.phase() != Phase::Associated
+            || self.admission.as_ref().is_none_or(|a| !a.same(admission))
+        {
+            return Err(Error::Terminal);
+        }
+        let peer = self.peer.as_ref().ok_or(Error::Terminal)?;
+        admission.run(|| {
+            peer.current()?;
+            if !peer.qos.load(Ordering::Acquire) {
+                return Err(Error::Terminal);
+            }
+            peer.tids.store(0xff, Ordering::Release);
+            Ok(())
+        })
+    }
+    /// Live AP EDCA change on an admitted QoS peer (mac80211
+    /// `ieee80211_sta_wmm_params` -> `rtw89_ops_conf_tx` ->
+    /// `__rtw89_conf_tx` -> `rtw89_fw_h2c_set_edca` per AC). The QoS token
+    /// stays valid while the four rows are reprogrammed, as in Linux; a
+    /// failed/cancelled update invalidates the peer and closes admission.
+    pub(super) async fn update_wmm(
+        &mut self,
+        io: &mut impl Interface,
+        p: narf_wireless::wmm::Parameters,
+        short: bool,
+        admission: &Admission,
+    ) -> Result<(), Error> {
+        let rows = codec::wmm_edca(p, short).ok_or(Error::Unsupported)?;
+        if self.phase() != Phase::Associated
+            || self.admission.as_ref().is_none_or(|a| !a.same(admission))
+        {
+            return Err(Error::Terminal);
+        }
+        let peer = self.peer.clone().ok_or(Error::Terminal)?;
+        peer.current()?;
+        if !peer.qos.load(Ordering::Acquire) {
+            return Err(Error::Terminal);
+        }
+        self.phase = Phase::Failed;
+        let mut attempt = Attempt {
+            admission: admission.clone(),
+            peer: Some(peer.clone()),
+            armed: true,
+        };
+        for row in rows {
+            command(io, 9, 15, &row, true, Some(admission)).await?;
+        }
+        admission.run(|| {
+            peer.current()?;
             self.phase = Phase::Associated;
             Ok(())
         })?;
@@ -547,6 +785,7 @@ async fn edca(
 }
 #[path = "station_control/codec.rs"]
 mod codec;
+pub(super) use codec::{HeRa, HtRa};
 
 pub(super) fn profile_fingerprint() -> [u8; 32] {
     let mut hash = narf_crypto::sha256::Sha256::new();
@@ -564,6 +803,87 @@ pub(super) fn wmm_fingerprint() -> [u8; 32] {
     hash.update(b"TXWD_INFO0 DATA_RATE[24:16] USE_RATE DISDATAFB; common response rate intersection; management/EAPOL CCK1");
     hash.update(&[11, 10, 9, 8, 7, 6, 3, 5, 4, 2, 1, 0]);
     hash.update(&narf_wireless::wmm::INFORMATION);
+    hash.finalize()
+}
+/// Emitter program added by `radio_policy::Program::Ht`.
+pub(super) fn ht_fingerprint() -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"B HT20 v1; HT cap SGI20 LDPC RXSTBC1 ampdu64K density0 RX MCS0..15 TX MCS0..7; no HT40/greenfield/TXSTBC/A-MPDU");
+    hash.update(b"RA mode CCK|OFDM|HT mask HT1SS|SUBOFDM|SUBCCK, SGI20/LDPC from negotiation, STBC0, SS1; RX 20MHz MCS0..15 admitted");
+    hash.update(&super::station_control::local_ht().capability_body());
+    hash.finalize()
+}
+/// Emitter program added by `radio_policy::Program::He`.
+pub(super) fn he_fingerprint() -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"B HE20 v1; rtw89_init_he_cap 2.4GHz STA restricted: no 40MHz/HTC-HE/BSR/OPS/A-MSDU-in-A-MPDU/STBC-TX/DCM-NSS2/beamformee/NG16/codebook/MaxNc; RX 2SS TX 1SS HE-MCS0..11");
+    hash.update(b"RA mode HE|CCK|OFDM mask HE1SS|SUBOFDM|SUBCCK from peer RX map, SGI20 from HT, LDPC/DCM from peer HE PHY, STBC0, SS1, ER0, no fixed GI/LTF");
+    hash.update(b"data TXWD INFO0 DATA_ER when HE operation allows ER SU; RX HE NSS1/NSS2 MCS0..11 20MHz GI/LTF 0..5; HE TB/ER SU autonomous responses measured");
+    hash.update(
+        &local_he()
+            .map(|he| he.capability_body())
+            .unwrap_or_default(),
+    );
+    hash.finalize()
+}
+/// Emitter program added by `radio_policy::Program::Ampdu`.
+pub(super) fn ampdu_fingerprint() -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"B originator BA v1; mac80211 agg-tx ADDBA request immediate policy A-MSDU-capable buf64 HT / buf128+ADDBA-ext HE timeout0 SSN=next QoS SN; ADDBA_RESP_INTERVAL 1s; HT_AGG_MAX_RETRIES 15; DELBA initiator on teardown/EAPOL");
+    hash.update(b"data TXWD BODY3 AGG_EN, INFO1 MAX_AGGNUM=agg_num-1, INFO2 AMPDU_DENSITY=peer HT MPDU density; R_AX_AMPDU_AGG_LIMIT 0xc610[23:16]=min agg_num-1 else 0x3f; h2c_ampdu_cmac_tbl NULL on 8852B");
+    hash.update(&[super::packet_core::AGG_WINDOW as u8]);
+    hash.finalize()
+}
+/// Local HE capability: Linux `rtw89_init_he_cap` for a 2.4GHz station,
+/// restricted to the retained TX-A/RX-AB 20MHz profile. Bits needing
+/// 40MHz (`wide_channels`), a second TX path (STBC TX, DCM TX NSS2), HE
+/// +HTC (`he_htc`: BSR, HTC_HE), power save (OPS), RX A-MSDU (`aggregation`)
+/// or beamforming feedback (`rtw89_mac_bf_assoc` sounding: SU beamformee,
+/// NG16, codebook, triggered SU feedback, MaxNc) are clear.
+pub(super) fn local_he() -> Option<narf_wireless::association::he::LocalHe> {
+    const MAC: [u8; 6] = [
+        0x00, // no HTC_HE (he_htc)
+        0x08, // TF_MAC_PAD_DUR_16US
+        0x02, // ALL_ACK
+        0x10, // MAX_AMPDU_LEN_EXP_EXT_2
+        0x00, // no OPS / AMSDU_IN_AMPDU
+        0x80, // HT_VHT_TRIG_FRAME_RX
+    ];
+    const PHY: [u8; 11] = [
+        0x00, // 20MHz only in 2.4GHz
+        0x70, // DEVICE_CLASS_A | LDPC_CODING_IN_PAYLOAD | HE_LTF_AND_GI_0_8US
+        0x1a, // NDP_4x_LTF_AND_3_2US | STBC_RX_UNDER_80MHZ | DOPPLER_TX
+        0x1b, // DCM_MAX_CONST_RX_16_QAM | DCM_MAX_CONST_TX_16_QAM (NSS1)
+        0x00, 0x00, 0x20, // PARTIAL_BW_EXT_RANGE
+        0x06, // POWER_BOOST_FACTOR_SUPP | HE_SU_MU_PPDU_4XLTF_AND_08_US_GI
+        0x91, // ER_SU_4XLTF_08 | ER_SU_1XLTF_08 | DCM_MAX_RU_996
+        0xbd, // >16 SIGB | TX/RX 1024QAM <242 RU | full-BW SU in MU | 16us padding
+        0x00,
+    ];
+    // RX MCS0..11 on both RX paths, TX MCS0..11 on the single TX path.
+    narf_wireless::association::he::LocalHe::new(MAC, PHY, 0xfffa, 0xfffe).ok()
+}
+/// Local HT20 capability (Linux `rtw89_init_ht_cap` restricted to the
+/// retained TX-A/RX-AB 20MHz profile).
+pub(super) fn local_ht() -> narf_wireless::association::phy::LocalHt {
+    narf_wireless::association::phy::LocalHt::siso20(true, true)
+        .with_ldpc(true, true)
+        .with_rx_stbc(true)
+}
+/// Emitter program added by `radio_policy::Program::FirmwareRa`.
+pub(super) fn firmware_ra_fingerprint() -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"B firmware RA v1; H2C OUTSRC cat2 class1 func0 RA_MACIDCFG AX no-CSI; rtw89_phy_ra_sta_update legacy CCK|OFDM mask &= OFDM|SUBCCK, recover; 20MHz SS1 MACID0 UPD_ALL init_rate_lv0");
+    hash.update(b"data TXWD INFO0 USE_RATE=0 DISDATAFB=0; INFO1 DATA_RTY_LOWEST_RATE=lowest negotiated; management/EAPOL CCK1 fixed");
+    hash.finalize()
+}
+/// Emitter program added by `radio_policy::Program::QosAll`.
+pub(super) fn qos_all_fingerprint() -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"B WMM all-AC v1; cfg80211_classify8021d RFC8325 DSCP; mac80211 ieee802_1d_to_ac + ACM downgrade; TID0..7 QoS raw26");
+    hash.update(b"rtw89_core_get_qsel BE0=0 BK0=1 VI0=2 VO0=3; rtw89_core_get_ch_dma ACH0..3; TXWD_BODY2 TID_INDICATE tids2,3,5,7; DMA_STOP1 ACH0..3+CH8+WPDMA");
+    hash.update(b"single in-flight host strict priority VO>VI>BE>BK; per-AC EDCA rows unchanged from WMM v2; no BA/A-MPDU");
+    hash.update(&[0, 1, 1, 0, 2, 2, 3, 3]);
     hash.finalize()
 }
 pub(super) fn wmm_admit(p: narf_wireless::wmm::Parameters, short: bool) -> Result<(), Error> {

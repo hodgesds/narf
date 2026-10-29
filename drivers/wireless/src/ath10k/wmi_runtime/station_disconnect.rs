@@ -24,6 +24,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let down = self.wire.down_station()?;
         let delete = self.wire.delete_peer(prepared.bssid)?;
         let stop = self.wire.stop_station()?;
+        // Protected with the still-installed PTK before the owner fails.
+        let deauthentication = self.pmf_deauthentication()?;
         // This happens before any await, including receive quiescence. A
         // cancelled waiter can never restore association or replay DELETE.
         self.failed = true;
@@ -31,6 +33,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             data.fail();
         }
         self.peer.as_mut().ok_or(Error::Failed)?.associated = None;
+        if let Some(frame) = deauthentication {
+            // Best effort, as mac80211 proceeds with teardown regardless; the
+            // frame is already encrypted, so no key outlives `fail()`.
+            management::validate(&frame, self.ready.ok_or(Error::Failed)?.mac, prepared.bssid)?;
+            let _ = self.send_management_frame(&frame).await;
+        }
 
         // Drain events received before DELETE. In particular, a stale STOPPED
         // or TLV delete response must never satisfy this new transaction.

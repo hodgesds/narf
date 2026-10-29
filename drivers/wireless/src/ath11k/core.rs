@@ -459,6 +459,8 @@ pub struct CoreConfig {
     /// NARF's requested vdev resources (currently limited to three).
     /// Local Linux's WCN6855-family hardware profile uses four.
     pub num_vdevs: u32,
+    /// `hw_params.num_peers` (the multi-pdev WMI resource config).
+    pub num_peers: u32,
     pub svc_to_ce_map: &'static [htc::ServiceToPipe],
     /// `ATH11K_HTC_WAIT_TIMEOUT_HZ`.
     pub htc_wait_ms: u64,
@@ -471,7 +473,7 @@ pub struct CoreConfig {
 }
 
 impl CoreConfig {
-    /// `ath11k_hw_params[]` for the PCI parts the core supports:
+    /// `ath11k_hw_params[]` for the parts the core supports:
     /// QCA6390 and WCN6855-layout families share Linux's single-pdev,
     /// two-RXDMA, four-vdev resource configuration and HTC service map.
     /// QCN9074 still requires its independent HAL/DP/core profile.
@@ -489,7 +491,46 @@ impl CoreConfig {
                 num_rxdma_per_pdev: 2,
                 max_radios: 3,
                 num_vdevs: 4,
+                num_peers: 512,
                 svc_to_ce_map: &htc::TARGET_SERVICE_TO_CE_MAP_WLAN_QCA6390,
+                htc_wait_ms: 1000,
+                htc_conn_ms: 1000,
+                service_ready_ms: 5000,
+                wmi_send_ms: 3000,
+            }),
+            // The AHB / hybrid-bus entries: one RXDMA per pdev; IPQ
+            // parts are multi-pdev (`single_pdev_only = false`,
+            // `num_vdevs = 16 + 1`), WCN6750 single-pdev with three.
+            HwRev::Ipq8074 | HwRev::Ipq6018Hw10 | HwRev::Ipq5018Hw10 | HwRev::Wcn6750Hw10 => {
+                let a = params.hw_rev.ahb_chip()?.params();
+                Some(CoreConfig {
+                    fw_mode: ATH11K_FIRMWARE_MODE_NORMAL,
+                    credit_flow: params.credit_flow,
+                    supports_shadow_regs: params.supports_shadow_regs,
+                    single_pdev_only: a.single_pdev_only,
+                    num_rxdma_per_pdev: 1,
+                    max_radios: a.max_radios as u8,
+                    num_vdevs: if a.single_pdev_only { 3 } else { 16 + 1 },
+                    num_peers: 512,
+                    svc_to_ce_map: a.svc_to_ce_map,
+                    htc_wait_ms: 1000,
+                    htc_conn_ms: 1000,
+                    service_ready_ms: 5000,
+                    wmi_send_ms: 3000,
+                })
+            }
+            // QCN9074 (`core.c`): one radio, multi-pdev shape, eight vdevs,
+            // 128 peers, the IPQ5018 service map.
+            HwRev::Qcn9074Hw10 => Some(CoreConfig {
+                fw_mode: ATH11K_FIRMWARE_MODE_NORMAL,
+                credit_flow: params.credit_flow,
+                supports_shadow_regs: params.supports_shadow_regs,
+                single_pdev_only: false,
+                num_rxdma_per_pdev: 1,
+                max_radios: 1,
+                num_vdevs: 8,
+                num_peers: 128,
+                svc_to_ce_map: &super::ahb::TARGET_SERVICE_TO_CE_MAP_WLAN_QCN9074,
                 htc_wait_ms: 1000,
                 htc_conn_ms: 1000,
                 service_ready_ms: 5000,
@@ -575,6 +616,9 @@ pub struct Ath11kCore<H: Hif, Q: QmiFw> {
     pub htt_ep: Option<HtcConnected>,
     /// `wmi_ab.wmi[0]` endpoint (`eid`, `max_msg_len`).
     pub wmi_ep: Option<HtcConnected>,
+    /// `wmi_ab.wmi[pdev]`: every connected WMI endpoint (WMI_CONTROL,
+    /// _MAC1, _MAC2 — CE7 / CE9 on IPQ8074), pdev order.
+    pub wmi_pdev_eps: Vec<HtcConnected>,
     /// `wmi_ab.preferred_hw_mode`.
     pub preferred_hw_mode: u32,
     /// `ab->target_caps`.
@@ -672,6 +716,7 @@ impl<H: Hif, Q: QmiFw> Ath11kCore<H, Q> {
             htc_ready: None,
             htt_ep: None,
             wmi_ep: None,
+            wmi_pdev_eps: Vec::new(),
             preferred_hw_mode: cfg.initial_hw_mode(),
             target_caps: TargetCaps::default(),
             fw_build_vers: 0,
@@ -1041,11 +1086,12 @@ impl<H: Hif, Q: QmiFw> Ath11kCore<H, Q> {
             let c = self
                 .connect_service(s, step::WMI_CONNECT, step::WMI_CONNECT_TIMEOUT)
                 .await?;
-            // wmi_ab.wmi[0] is the only pdev handle used on
-            // single-pdev parts.
+            // wmi_ab.wmi[0] is the soc / pdev-0 handle; the others are
+            // kept per pdev.
             if self.wmi_ep.is_none() {
                 self.wmi_ep = Some(c);
             }
+            self.wmi_pdev_eps.push(c);
         }
         Ok(())
     }
@@ -1278,13 +1324,45 @@ impl<H: Hif, Q: QmiFw> Ath11kCore<H, Q> {
         Ok(())
     }
 
-    /// `ath11k_wmi_cmd_init` for a `single_pdev_only` chip:
+    /// `ab->num_radios`: SERVICE_READY_EXT's radio count (1 for a
+    /// single-pdev part), capped at `max_radios`.
+    pub fn num_radios(&self) -> u32 {
+        if self.cfg.single_pdev_only {
+            return 1;
+        }
+        self.svc_ext
+            .as_ref()
+            .map_or(1, |e| e.num_radios)
+            .clamp(1, self.cfg.max_radios.max(1) as u32)
+    }
+
+    /// `ath11k_wmi_cmd_init`. Single-pdev chips:
     /// `ath11k_init_wmi_config_qca6390` with `num_rf_chains` from
     /// SERVICE_READY, `is_reg_cc_ext_event_supported` from the service
     /// map, no host memory chunks, `hw_mode_id = WMI_HOST_HW_MODE_MAX`.
+    /// Multi-pdev chips: `ath11k_init_wmi_config_ipq8074` over
+    /// `num_radios`, `hw_mode_id = preferred_hw_mode` and the
+    /// band-to-mac map (`ath11k_fill_band_to_mac_param`).
     pub fn init_cmd(&self) -> Result<WmiCmd, TransportError> {
+        let reg_cc_ext = self
+            .svc_map
+            .test(wmi::WMI_TLV_SERVICE_REG_CC_EXT_EVENT_SUPPORT);
         if !self.cfg.single_pdev_only {
-            return Err(TransportError::new(step::WMI_INIT, 1, EOPNOTSUPP));
+            let ext =
+                self.svc_ext
+                    .as_ref()
+                    .ok_or(TransportError::new(step::WMI_INIT, 1, EOPNOTSUPP))?;
+            let n = self.num_radios();
+            let res = TargetResourceConfig::ipq8074(
+                self.cfg.num_vdevs,
+                self.cfg.num_peers,
+                n,
+                self.target_caps.num_rf_chains,
+                reg_cc_ext,
+            );
+            let p = InitCmdParam::multi_pdev(res, self.preferred_hw_mode, wmi::band_to_mac(ext, n));
+            return wmi::init_cmd(&p)
+                .map_err(|e| TransportError::new(step::WMI_INIT, 3, e.errno()));
         }
         let res = TargetResourceConfig::qca6390(
             self.cfg.num_vdevs,
@@ -1422,9 +1500,11 @@ impl<Io: ChipIo, Irq: CeIrq> Hif for CeHif<Io, Irq> {
     }
     fn start(&mut self) {
         (self.on_start)();
+        self.irq.hif_start(&self.io);
         self.ce.start(&self.io);
     }
     fn stop(&mut self) {
+        self.irq.hif_stop(&self.io, self.ce.crash_flush);
         self.ce.stop();
     }
     fn send(&mut self, pipe: u8, frame: &[u8], transfer_id: u16) -> Result<(), TransportError> {

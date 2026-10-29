@@ -49,6 +49,7 @@ pub mod connect;
 pub mod firmware;
 pub mod fweh;
 pub mod fwil;
+pub mod irq;
 pub mod msgbuf;
 pub mod native_runtime;
 pub mod pcie;
@@ -67,6 +68,38 @@ pub mod tests;
 /// (one level up in `drivers/wireless/src/lib.rs`).
 pub fn register() {
     register_pci_driver();
+    // Linux `brcmf_pciedrvr_pm` suspend/resume: the D3_INFORM/D0_INFORM
+    // mailbox exchange is interrupt/poll driven, so it runs in the async
+    // phase before the interrupt-gated device fan-out.
+    narf_power::system_pm::register_async_system_pm("brcmfmac", alloc::sync::Arc::new(SystemPm));
+}
+
+struct SystemPm;
+impl narf_power::system_pm::AsyncSystemPm for SystemPm {
+    fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            crate::cyw43439::interface::suspend_pcie()
+                .await
+                .map_err(pm_error)
+        })
+    }
+    fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            // brcmf_pcie_pm_leave_D3: hot resume, or remove + probe again
+            // (a generation swap keeping the netdev) when power was lost.
+            let result = match native_runtime::resume().await {
+                Some(result) => result,
+                None => crate::cyw43439::interface::resume_pcie().await,
+            };
+            result.map_err(pm_error)
+        })
+    }
+}
+fn pm_error(error: crate::cyw43439::runtime::Error) -> narf_power::device_pm::DevicePmError {
+    match error {
+        crate::cyw43439::runtime::Error::Busy => narf_power::device_pm::DevicePmError::Busy,
+        _ => narf_power::device_pm::DevicePmError::DriverError,
+    }
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

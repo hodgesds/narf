@@ -169,7 +169,16 @@ fn smoke_rtw89_rx_malformed_extent_and_profile_never_publish_frames() -> TestRes
             return TestResult::Fail("unsupported RXD shift/PHY/driver extent accepted");
         }
     }
-    for flag in [4, 1 << 3, 1 << 5, 1 << 6, 1 << 9, 1 << 10] {
+    // A-MPDU subframes are ordinary MPDUs for the packet owner to admit.
+    let mut ampdu = base.clone();
+    ampdu[16..20].copy_from_slice(&(1u32 << 3).to_le_bytes());
+    if !matches!(
+        Assembler::default().segment(&ampdu, false),
+        Ok(Some(Event::Wifi(meta, _))) if meta.ampdu && !meta.aggregate
+    ) {
+        return TestResult::Fail("A-MPDU subframe not surfaced with its flag");
+    }
+    for flag in [4, 1 << 5, 1 << 6, 1 << 9, 1 << 10] {
         let mut bytes = base.clone();
         bytes[16..20].copy_from_slice(&(flag as u32).to_le_bytes());
         if Assembler::default().segment(&bytes, false) != Ok(Some(Event::Dropped)) {

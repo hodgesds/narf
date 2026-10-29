@@ -827,3 +827,54 @@ kernel_test_in!(
     "drivers/wireless/rtw89/station",
     smoke_rtw8852b_peer_binding_cancellation_and_close_fence_late_completion
 );
+
+fn smoke_rtw8852b_he_capability_and_ra_codec_match_linux_profile() -> TestResult {
+    let Some(he) = local_he() else {
+        return TestResult::Fail("restricted HE capability rejected by the shared API");
+    };
+    let body = he.capability_body();
+    // ext35 + MAC6 + PHY11 + rx80/tx80 only (20MHz, no PPE).
+    if body.len() != 1 + 6 + 11 + 4
+        || body[0] != 35
+        || body[1] & 0x01 != 0
+        || body[7] & 0x0e != 0
+        || body[11] & 0x01 != 0
+        || body[18..22] != [0xfa, 0xff, 0xfe, 0xff]
+    {
+        return TestResult::Fail("HE capability is not the restricted Linux profile");
+    }
+    // get_mcs_ra_mask(map, 11, 2): MCS0..11 / 0..9 / 0..7 per NSS.
+    if codec::he_mcs_mask(0xfffe) != 0xfff000
+        || codec::he_mcs_mask(0xfffd) != 0x3ff000
+        || codec::he_mcs_mask(0xfff0) != 0x0ff_0ff000
+        || codec::he_mcs_mask(0xffff) != 0
+    {
+        return TestResult::Fail("HE MCS mask differs from get_mcs_ra_mask");
+    }
+    let ht = HtRa {
+        peer_rx_mcs: [0xff, 0, 0, 0],
+        sgi20: false,
+        ldpc: false,
+    };
+    let he_ra = HeRa {
+        peer_rx_mcs: 0xfffd,
+        ldpc: true,
+        dcm: false,
+    };
+    // OFDM-only legacy (0xff0): mode HE|OFDM, mask HE1SS MCS0..9 | SUBOFDM.
+    let Some(bytes) = codec::ra_he(0xff0, ht, he_ra) else {
+        return TestResult::Fail("HE RA refused");
+    };
+    let w = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+    if w(0) != (0x12 << 1 | 1 << 20 | 1 << 22) || w(1) != 0x3ff010 || w(2) != 0 || w(3) != 0 {
+        return TestResult::Fail("HE RA H2C fields differ");
+    }
+    if codec::ra_he(0, ht, he_ra).is_some() {
+        return TestResult::Fail("HE RA accepted an empty legacy set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_he_capability_and_ra_codec_match_linux_profile
+);

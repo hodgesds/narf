@@ -147,9 +147,14 @@ metadata. Firmware RAM hints may shrink, never enlarge discovered RAM.
 
 `runtime::Runtime<B: runtime::Bus>::attach(Booted<B>)` owns five common rings,
 eight IOCTL-response buffers, eight event buffers, request input, scratch and
-ring-update memory. Shared versions5/6 use checked disjoint TCM metadata and
-16-bit indices at 4-byte strides. Nonzero rx_dataoffset descriptor-prefix
-geometries and v7 remain gated before any DMA allocation/publication. Optional host DMA-index
+ring-update memory. Shared versions5/6/7 use checked disjoint TCM metadata and
+16-bit indices at 4-byte strides. Shared 7 keeps the v6 ring-info layout and
+selects Linux `brcmf_ring_itemsize` (24-byte TX status, 40-byte RX complete)
+instead of `brcmf_ring_itemsize_pre_v7` for the D2H rings; the completion
+fields consumed here are unchanged (smokes `drivers/wireless/brcmfmac/station`
+Open/WPA2 DHCP/IP and `drivers/wireless/brcmfmac/wmm` run on shared 5/6/7
+with the firmware model writing v7-stride completions). Nonzero rx_dataoffset descriptor-prefix
+geometries remain gated before any DMA allocation/publication. Optional host DMA-index
 fields are cleared to select the supported TCM fallback. All DMA allocations
 and host addresses are retained before publication and before enabling BME.
 
@@ -288,8 +293,10 @@ native BSSID/mode and complete bounded actual association request/response
 RSN snapshots under its current source and full occupied-power grant. An
 exact-consumption local check rejects partial/trailing RSN fields before any
 BIP default normalization; valid legacy18/default20/22/explicit26 extents remain.
-An MFPC AP requires matching actual response MFPC/MFPR and PSK/CCMP/BIP-CMAC128
-facts; missing, malformed or changed proof closes that submitted lifecycle.
+A present response RSNE from an MFPC AP must match its MFPC/MFPR and
+PSK/CCMP/BIP-CMAC128 facts; malformed or changed proof closes that submitted
+lifecycle. An omitted (non-FT) response RSNE is admitted as protected, per
+IEEE 802.11-2020 12.6.3 negotiation and Linux `brcmf_configure_wpaie`.
 An AP without MFPC can complete unprotected, including an absent response
 RSNE, without falsely setting protected metadata. Another real native ring
 idle precedes port publication. Current policy, cancellation, host close and
@@ -305,10 +312,10 @@ real Open/WPA2 protected/unprotected DHCP/IP, including occupied VHT80.
 Existing required-PMF coverage remains. These additions pass coordinated
 software gates and do not establish firmware-internal BIP or physical PMF.
 
-Broad optional-PMF interoperability remains open: MFPC APs omitting response
-RSNE require a source-proven native negotiated-MFP indication. The local
-Linux ABI supplies no such `sta_info` flag. Configured1 or IOCTL success
-cannot replace that proof. This residual is not closed by the bounded profile.
+MFPC APs omitting the response RSNE now complete as protected associations
+(Linux v7.2 `cfg80211.c::brcmf_configure_wpaie` trusts firmware's `mfp`; see
+[CYW §3](cyw43439.md) for the IEEE 802.11-2020 9.3.3.6/12.6.3 argument). The
+shared `optional_pmf` smokes cover that admission on both families.
 
 ### Firmware-qualified HT20/HT40 and short GI admission
 
@@ -357,8 +364,39 @@ native nonzero `nmode`/`vhtmode`, valid `rxchain`, the original5GHz `bw_cap`
 additionally requires native `txstreams` in1..3; absent VHT/stream capability
 preserves qualified HT, while malformed replies fail closed. RX and TX
 MCS0..9 capability maps use their independently reported stream counts.
-Only SGI80 is offered;160/80+80, optional LDPC/STBC/beamforming/extended NSS
-remain unqualified. Initial WLC_UP/scan operation remains20MHz.
+Only SGI80 is offered. Initial WLC_UP/scan operation remains20MHz.
+
+VHT beamforming capability (implemented): under nonzero `vhtmode`, after
+`txstreams`, the probe queries native `txbf_bfe_cap` and `txbf_bfr_cap` as
+Linux `brcmf_setup_wiphybands` does (an unsupported query is zero) and adds
+`brcmf_update_vht_cap`'s bits: SU/MU beamformee from `BRCMF_TXBF_{SU,MU}_BFE_CAP`
+(bits0/1), SU/MU beamformer from `..._BFR_CAP`, and, when either is nonzero
+with more than one TX stream, beamformee STS2, sounding dimensions
+`txstreams-1` and VHT MRQ/MFB link adaptation. Bits outside SU/MU are
+ignored. Code: `drivers/wireless/src/cyw43439/station_phy.rs::beamforming_capability`.
+Firmware owns sounding, steering and its own association request; the host
+reports the capability on5GHz and the existing actual `assoc_req_ies` check
+now requires those same bits, so a request lacking them is a changed request
+and terminates that owner. Smoke `drivers/wireless/brcmfmac/vht80`
+`..._native_beamforming_capability_and_request` (shared5/6) checks five
+literal capability words including unsupported/unknown-bit replies and the
+mismatched-request refusal. CYW43439 never reaches this VHT probe.
+
+Remaining VHT options are not host features of this FullMAC family:
+
+- LDPC, STBC and extended NSS/BW: Linux brcmfmac (`brcmf_update_ht_cap`,
+  `brcmf_update_vht_cap`) neither advertises nor programs them, and the
+  firmware ABI exposes no host control; firmware builds its own association
+  capability. A host-reported bit would be fabricated. Open question: the
+  exact actual-request comparison (first six VHT capability bytes) would
+  refuse firmware that sets its own RX LDPC/STBC bits; physical BCM43602
+  firmware requests must be checked before deployment.
+- 80+80: Linux brcmfmac never advertises `SUPP_CHAN_WIDTH_160_80PLUS80`; it
+  only decodes `BRCMU_CHAN_BW_80P80` chanspecs in reports.
+- 160 MHz: Linux advertises it only from a firmware `bw_cap` 160 bit. The
+  retained BCM43602 is an 802.11ac Wave-1 3x3 80 MHz part, so this profile
+  ignores that bit; 160 MHz belongs to enabling a 160-capable chip under the
+  remaining additional-chip-profile work.
 
 The actual selected BSS's complete original HT/VHT/WMM/rate IEs pass shared
 `Offer::from_elements`; complete known basic/legacy rates, membership
@@ -460,6 +498,270 @@ no uncertain DMA freed. This does not automatically follow revocation of a cache
 policy firmware capability or establish firmware RF quiescence; reset/reload and
 DMA reclamation remain separate gates. See `cyw43439.md` §3 and `wireless/` §3.5.
 
+### PCIe mailbox interrupt service
+
+The retained msgbuf owner services the PCIe2 mailbox the way Linux v7.2
+`pcie.c` does, with MSI delivery and a polled fallback:
+
+- Register layout: `brcmf_reginfo_default` (`INTMASK` 0x24, `MAILBOXINT`
+  0x48, `MAILBOXMASK` 0x4c, `MB_INT_D2H_DB` 0x00ff0000, `MB_INT_FN0` 0x300)
+  or `brcmf_reginfo_64` (0xc14/0xc30/0xc34, `D2H_DB` 0xffff, no FN0) when
+  the discovered PCIe2 core revision is >= 64 (`brcmf_pcie_probe`).
+  `runtime::mailbox::Reginfo::for_core` derives the backplane addresses
+  from the discovered core base.
+- Bring-up: `Runtime::attach` masks the mailbox (`brcmf_pcie_intr_disable`)
+  before publishing ring addresses, then after BME it binds one MSI vector
+  (`brcmf_pcie_request_irq`: `pci_enable_msi` + threaded IRQ; NARF
+  `irq.rs` programs the MSI capability, installs the handler before MSI
+  Enable and refuses a second binding), enables `D2H_DB | FN0`
+  (`brcmf_pcie_preinit` -> `brcmf_pcie_intr_enable`) and only then rings
+  host-ready.
+- Service: the vector handler only raises a `Signal`; the BAR window stays
+  with the async owner. Every owner service first runs the
+  `brcmf_pcie_quick_check_isr` + `brcmf_pcie_isr_thread` sequence:
+  read `MAILBOXINT`, mask, write the status back (W1C), consume D2H mailbox
+  data on FN0 (`brcmf_pcie_handle_mb_data`: `DS_ENTER_REQ` -> `H2D_HOST_DS_ACK`,
+  `D3_ACK` recorded, `FWHALT` fails this firmware generation), service the
+  D2H completion rings (`brcmf_proto_msgbuf_rx_trigger`) and re-enable the
+  mask while the link is up. An all-ones `MAILBOXINT` is device loss and
+  fails the owner. H2D mailbox words follow `brcmf_pcie_send_mb_data`
+  (TCM `htod_mb_data_addr`, config `SBMBX` 0x98, written twice on PCIe2
+  core revisions <= 13); a word still pending defers a DS ACK to the next
+  service instead of overwriting it.
+- Worker: the station service loop waits on the signal with a 10 ms
+  missed-edge backstop when a vector is bound, and keeps the 1 ms poll when
+  MSI is unavailable (INTx stays disabled; NARF has no shared level GSI
+  route that could clear `MAILBOXINT` from hard IRQ).
+- Teardown (`brcmf_pcie_release_irq`): mask, disable MSI and free the vector
+  (a failed disable quarantines it), then clear latched status.
+
+Smokes `drivers/wireless/brcmfmac`
+`smoke_brcmf_pcie_msi_mailbox_service_and_release`,
+`smoke_brcmf_pcie_polled_mailbox_fallback_and_gone_device` and
+`smoke_brcmf_pcie_signal_wait_and_reginfo` cover the mask ordering, vector
+wake, W1C acknowledge, DS ACK (immediate and deferred), FWHALT, all-ones
+loss, polled fallback and vector release.
+
+### Confirmed stop and DMA reclamation
+
+`Runtime::quiesce` is the only path that makes published msgbuf memory
+(common rings, flow rings, control/event/RX buffers, IOCTL input, scratch and
+ring-update buffers, pending TX payloads) reclaimable:
+
+1. `enter_d3` (Linux v7.2 `brcmf_pcie_pm_enter_D3`): refuse while an IOCTL
+   is pending, set the bus down (`BRCMF_BUS_DOWN`: every H2D post — IOCTL,
+   flow create/delete, TX — now returns `Busy`, and RX/control buffers are
+   no longer reposted), send `BRCMF_H2D_HOST_D3_INFORM`
+   (`brcmf_pcie_send_mb_data`, 100 x 10 ms pending-word wait) and wait
+   `BRCMF_PCIE_MBDATA_TIMEOUT` (2 s) for `BRCMF_D2H_DEV_D3_ACK` through the
+   mailbox service. On timeout the bus returns to UP with the mailbox
+   re-enabled, exactly as Linux, and nothing is reclaimed; `FWHALT` fails
+   the owner.
+2. Consume every D2H completion published before the ack, without
+   reposting, and require each completion ring's firmware write index to
+   equal the host read index.
+3. `brcmf_pcie_release_irq` (mask, free vector, clear status), then clear
+   BME with a verified readback (`park_dma` + `dma_enabled`).
+4. Flush: non-posted BAR2/BAR0 reads issued after the BME clear must
+   still observe the same D2H write indices and a present function
+   (`MAILBOXINT` not all-ones). PCIe ordering forbids a read completion
+   passing the function's earlier posted writes, so a write issued before
+   the clear has landed by then, and any later index change voids the proof.
+
+Only a complete proof sets `reclaimable`; `Drop` then releases every
+mapping. Any failure (timeout, FWHALT, access fault, a changed index) fails
+the owner and keeps the published memory leaked by design. Linux frees the
+rings after `brcmf_pcie_release_irq` (`brcmf_pcie_reset`,
+`brcmf_pcie_remove`) without device-side evidence; this proof is the
+stricter NARF reclaim gate. It assumes the function does not set Relaxed
+Ordering on its DMA writes (Linux brcmfmac never enables RO for it; NARF
+`narf_bus::pci_express` exposes only an OR-in `set_device_control`, so it
+cannot clear `DEVCTL.RO` either).
+
+Production caller (PCI removal). `register_pci_driver` registers a
+`narf_bus::register_pci_remove` hook for every BCM43602 id (Linux v7.2
+`pcie.c::brcmf_pcie_remove`: `BRCMFMAC_PCIE_STATE_DOWN`,
+`brcmf_bus_cancel_reset_work`, `brcmf_detach`, `brcmf_pcie_release_irq`,
+then `brcmf_pcie_release_{scratch,ring}buffers`). The hook quarantines the
+BDF and runs `native_runtime::remove`: it marks the bootstrap removed (no
+later provisioning attempt), waits out an in-flight attempt (the parked
+slot is held from boot through station publication), then
+`Generation::remove` withdraws the shell — `Device::withdraw` clears the
+active endpoint, unregisters the wireless and network-registry entries,
+retires the netdev with `narf_net::iface::retire_for_rebind` (a later probe
+of the function reclaims the name via `rebind_name`) and stops the worker —
+and `Device::teardown` runs `Fullmac::stop_transport` (the confirmed stop
+above) and `release_transport` under the station mutex. Only a complete
+proof frees the mappings and releases the BDF claim; otherwise the
+generation is dropped with its mappings pinned and the address stays
+quarantined (`probe` refuses it). A never-booted owner has nothing to
+release. Linux disconnect (`brcmf_cfg80211_disconnect`) does not stop the
+bus, so disconnect keeps the transport running here too.
+
+Smokes: `smoke_brcmf_confirmed_stop_reclaims_published_dma` (drain, IRQ
+release, BME, H2D gating, every mapping freed),
+`smoke_brcmf_remove_withdraws_then_reclaims_after_stop_proof` (joined
+station: withdrawn, netdev retired for rebind, admission closed, every
+mapping freed, a second removal is absent),
+`smoke_brcmf_remove_without_stop_proof_keeps_mappings_pinned`,
+`smoke_brcmf_unacknowledged_d3_reverts_and_retains_dma` (2 s timeout, UP
+again, nothing freed) and `smoke_brcmf_late_dma_or_halt_fails_stop_proof`
+(post-clear index change and FWHALT keep memory retained).
+
+### Dead-firmware stop (FWHALT, lost power)
+
+A generation whose firmware halted (`BRCMF_D2H_DEV_FWHALT`, Linux v7.2
+`pcie.c::brcmf_pcie_handle_mb_data` -> `core.c::brcmf_fw_crashed`), lost
+power across suspend (`brcmf_pcie_pm_leave_D3` reads `INTMASK` == 0) or
+never answered D3_INFORM cannot complete the confirmed stop above.
+`Runtime::stop_dead` (`runtime/reset.rs`) is its proof:
+
+1. Bus down and terminal; `brcmf_pcie_release_irq`; BME cleared with a
+   verified readback.
+2. Two non-posted flush reads after the clear (D2H write indices, then
+   `MAILBOXINT`, then the indices again): the function must be present
+   (not all-ones) and the indices unchanged.
+3. `Runtime::reset_device`, exactly Linux `brcmf_pcie_reset_device`: clear
+   `BRCMF_PCIE_LINK_STATUS_CTRL_ASPM_ENAB` in config `0xBC`, write 4 to the
+   ChipCommon `watchdog` (0x80), sleep 100 ms, restore the link-control
+   word and, on PCIe2 core revision <= 13, rewrite the eleven
+   `BRCMF_PCIE_CFGREG_*` words through `CONFIGADDR`/`CONFIGDATA`. BME must
+   still read clear after that shadow restore (re-parked once if not).
+4. The ARM CR4 is halted (`brcmf_chip_set_passive`: CR4 reset with
+   `ARMCR4_BCMA_IOCTL_CPUHALT`, D11 cores disabled) and its wrapper
+   `ioctrl` must read back `CPUHALT` with `resetctrl` out of reset.
+
+Only then is the owner reclaimable. `Adapter::stop_transport` takes this
+path when the generation is already terminal or `quiesce` failed with
+`Failed` (FWHALT during the wait) or `Timeout` (no ack); a confirmed-stop
+proof that observed device activity after the BME clear (`Protocol`)
+never falls back and stays pinned. A vanished function (all-ones reads)
+or a revoked firmware proof (every BAR0 access is gated on it) keeps the
+mappings pinned. Smokes: `smoke_brcmf_dead_firmware_stop_resets_and_reclaims`,
+`smoke_brcmf_dead_stop_without_device_keeps_dma_pinned`,
+`smoke_brcmf_remove_after_fwhalt_takes_dead_stop_and_reclaims`.
+
+### Transport reset, generation swap and rejoin
+
+Linux v7.2 `core.c::brcmf_fw_crashed` (FWHALT) schedules
+`brcmf_core_bus_reset` -> `pcie.c::brcmf_pcie_reset`: `brcmf_detach`,
+`brcmf_pcie_release_irq`, scratch/ring release, `brcmf_pcie_reset_device`,
+`brcmf_fw_get_firmwares` -> `brcmf_pcie_setup` (fresh download) and
+`brcmf_attach`, which registers a new netdev. `brcmf_bus_cancel_reset_work`
+(from `brcmf_pcie_remove`) sets `bus_if->removing` so no reset runs after
+removal starts. NARF performs the same sequence as a generation swap:
+
+- `Adapter.inner` is `Option<Runtime>`; `Fullmac::reset_transport`
+  requires a proven stop (confirmed or dead), runs
+  `Runtime::reset_device`, frees the old generation
+  (`Runtime::into_bus`) and boots a fresh one through the retained
+  `station_transport::Reboot` authority, then posts RX buffers.
+- `boot::Cr4::claim`/`claim_selected`/`boot` return `Refused { error, bus }`
+  instead of consuming the bus, so a refused download keeps the reset
+  function in the adapter (`parked`) for a retry.
+- The production authority (`native_runtime::Reprovision`) retains the
+  firmware-registry capability, manifest, explicit board (if any) and
+  discovered chip/revision; every reboot re-runs `select_using` +
+  `load_using` (or `trusted_assets_using`), so revoked or replaced assets
+  refuse the reboot. Every BAR0 access stays gated on the new proof.
+- `Generation::recover` (shared `cyw43439/generation.rs`), serialized with
+  `remove` on the generation mutex: withdraw the old shell (netdev retired),
+  `stop_transport`, `reset_transport`, `take_generation`, re-check removal
+  (a removal that arrived meanwhile wins: the fresh generation is stopped
+  behind its own proof and released, never published), republish under
+  `narf_net::iface::rebind_name` through the publisher (production:
+  `attach_runtime`, i.e. `Station::initialize_live` replay plus the normal
+  registration), then rejoin: the last completed operator association is
+  retained per shell (`Open`/`Wpa2`/`Wpa3`; host-supplicant associations
+  are not, their keys live in userspace; a disconnect clears it), the exact
+  BSS is rescanned on its channel and associated again. An unproven stop,
+  a refused reset or publication leaves the function terminal with no shell
+  (`pinned` recorded for removal when mappings were leaked).
+- `Generation::supervise`, spawned after the first publication, checks
+  every 100 ms for `Fullmac::transport_failed` (FWHALT, lost power, any
+  fatal protocol/access error; broader than Linux, which resets only on
+  FWHALT or a debugfs request) and recovers, up to `MAX_RESETS` (64).
+
+Smokes: `smoke_brcmf_fwhalt_reset_reboots_replays_and_rejoins_same_netdev`,
+`smoke_brcmf_remove_racing_reset_never_republishes`,
+`smoke_brcmf_reset_failures_stay_terminal_or_pinned`.
+
+### Cold resume
+
+Linux v7.2 `pcie.c::brcmf_pcie_pm_leave_D3` resumes hot when `INTMASK`
+reads nonzero (D0_INFORM, below); otherwise the dongle lost power or
+firmware across suspend and Linux calls `brcmf_pcie_remove` followed by
+`brcmf_pcie_probe` on the same function. The `brcmfmac` system-PM resume
+hook now calls `native_runtime::resume` -> `Generation::resume`: the hot
+path is unchanged, and a `Failed` (cold) resume runs `Generation::recover`
+under the generation mutex, i.e. the dead-firmware stop (no D3 ack can
+come from lost firmware), `brcmf_pcie_reset_device`, a fresh signed
+download, `Station::initialize_live` replay and republication under the
+same netdev name. Suspend disconnected the station (Linux
+`brcmf_cfg80211_suspend` without WoWL), so nothing is rejoined. A
+concurrent supervisor recovery is not repeated: `recover` returns early
+when the current generation is no longer terminal. Smoke:
+`smoke_brcmf_cold_resume_swaps_generation_and_keeps_netdev` (cold resume
+swaps the generation; the next suspend/resume of the rebooted firmware is
+hot; removal frees both generations).
+
+### Flow-ring budget
+
+The host flow budget follows the firmware ring info: `max_flowrings`
+(shared >= 6) or `max_submissionrings - 2` (shared 5), validated <= 512
+by `Runtime::attach` exactly as Linux v7.2 `pcie.c::brcmf_pcie_init_ringbuffers`,
+then capped at `BRCMF_FLOWRING_HASHSIZE - 1` (511) as
+`msgbuf.c::brcmf_proto_msgbuf_attach` does. Flow ring ids are
+`index + BRCMF_H2D_MSGRING_FLOWRING_IDSTART` (2) with TCM index slots
+`h2d_{w,r}_idx_ptr + id * 4`, and each 512 x 48-byte ring is allocated on
+create and recycled only after a delete completion. The former fixed host
+cap of eight flows is gone. Smoke:
+`smoke_brcmf_flow_budget_follows_firmware_max_flowrings` (12 firmware
+rings open ids 2..13 and refuse a 13th without failing the owner; a
+2-ring firmware still bounds at 2).
+
+### System suspend (D3_INFORM) and hot resume (D0_INFORM)
+
+`brcmfmac::register` installs an `AsyncSystemPm` hook ("brcmfmac") — the
+async phase that runs while interrupts still service futures, before the
+interrupt-gated device fan-out — mirroring Linux v7.2 `brcmf_pciedrvr_pm`
+(`.suspend = brcmf_pcie_pm_enter_D3`, `.resume = brcmf_pcie_pm_leave_D3`):
+
+- Prepare: `cyw43439::interface::suspend_pcie` runs Linux
+  `brcmf_cfg80211_suspend` without WoWL — a connected station is brought
+  down (`brcmf_link_down`: DISASSOC and carrier off) and queued TX dropped —
+  then `Fullmac::suspend_transport`. The msgbuf adapter retires every flow
+  (delete completions) and outstanding TX within 2 s and calls
+  `Runtime::enter_d3` (D3_INFORM / D3_ACK, bus down). A D3 timeout or a
+  flow/TX that does not retire returns an error with the transport still UP,
+  so the coordinator unwinds the earlier hooks; nothing is lost.
+- Resume: `resume_pcie` -> `Runtime::leave_d3`: `INTMASK` nonzero (the
+  dongle kept power and firmware) sends `H2D_HOST_D0_INFORM`, re-enables the
+  mailbox and rings host-ready over the retained rings; the station may
+  then associate again (Linux likewise leaves cfg80211 disconnected). A
+  transport that was never suspended refuses resume without failing.
+
+Smokes: `smoke_brcmf_system_suspend_resume_d3_d0_handshake` (D3/D0 words,
+mask state, rings retained, second cycle with a lost dongle fails the
+owner without freeing DMA, vector released on teardown) and
+`smoke_brcmf_system_suspend_timeout_unwinds_usable`.
+
+Cold resume (Linux `cleanup:` -> `brcmf_pcie_remove` + `brcmf_pcie_probe`
+when `INTMASK` reads 0) is not replayed: the owner becomes terminal and the
+carrier stays down. See the `system_resume`/`transport_reset` rows.
+
+IOMMU-backed quiescence remains open: the proof above holds with the
+IOMMU in identity/disabled mode (the only modes the native allocator
+accepts; `PerDomain` is refused in `native_runtime.rs::allocate`).
+`narf-io` would need a per-device detach that confirms completion — e.g.
+`narf_io::iommu::IommuDomain::detach_and_flush(&self, bdf: Bdf) ->
+Result<FlushReceipt, IoError>` that clears the DTE/context entry, issues
+the device IOTLB invalidation and waits for its completion (AMD-Vi
+`COMPLETION_WAIT`, VT-d invalidation-wait descriptor, SMMUv3 `CMD_SYNC`)
+before returning — plus a `PerDomain` `alloc_coherent` that maps into that
+device's domain. Today `IommuDomain::detach`/`unmap` only adjust counters
+and `PerDomain` map/unmap return `NotMapped`.
+
 ## 4. Invariants
 
 - No bus mastering without owned DMA mappings, ring lifetimes, and a
@@ -495,9 +797,9 @@ shared 5/6 TCM indices, retained common/control/flow/RX/TX DMA, bounded correlat
 IOCTL/events/data ownership, generation-safe retained flow recycling, shared
 station/control-port lifecycle and native probe-to-interface dispatch.
 
-The retained initial profile is shared 5/6, zero descriptor prefix, polling,
+The retained initial profile is shared 5/6, zero descriptor prefix, MSI or polled mailbox service,
 2.4/5 GHz Open or firmware-supplicant WPA2-PSK/CCMP, with one-shot terminal failure
-and permanent retention of published DMA. Its remaining deployment requirements
+and retention of published DMA unless a confirmed stop proves it reclaimable. Its remaining deployment requirements
 are real target identity/calibration/firmware assets, a verified selection manifest
 (or trusted platform registration), authenticated regulatory policy and physical
 station acceptance. No deployment board is manufactured by these tests.
@@ -511,12 +813,39 @@ duplicate policy, authorized-peer preservation and firmware refusal at either
 step; Open/WPA2 DHCP/IP conversations run while PS is enabled. This implements
 firmware station PS only; host-bus PM, suspend/WoW and reset replay remain open.
 
+The common FullMAC scan also installs caller Probe Request vendor IEs with
+the native `vndr_ie` iovar before escan (Linux `brcmf_vif_set_mgmt_ie`,
+`BRCMF_VNDR_IE_PRBREQ_FLAG`), and refuses triggered random-MAC scans because
+brcmfmac randomizes only PNO `pfn_macaddr`; see [CYW §3](cyw43439.md)
+"Caller Probe Request IEs" and "Random scan source address". The shared5/6
+msgbuf smoke `drivers/wireless/brcmfmac/scan_ies` checks literal add/del
+records before each changed escan.
+
+Negotiated `wme_ac_sta` WMM state and all-priority data are common FullMAC
+work ([CYW §3](cyw43439.md) "Negotiated WMM state and all-priority data").
+On msgbuf the station keeps one flow per `brcmf_flowring_prio2fifo` FIFO,
+created with the first frame's priority as TID, and
+`Runtime::send_with_priority` posts each frame's own priority in the TX
+descriptor flags (`BRCMF_MSGBUF_PKT_FLAGS_PRIO_SHIFT`); a priority from a
+different FIFO is a protocol error. Smoke: `drivers/wireless/brcmfmac/wmm`.
+
 Additional software outside that retained profile remains: nonzero descriptor
-prefixes/shared 7, other CPU/RAM/chip/OTP selectors,160/80+80 and optional VHT
-coding/beamforming/HE/EHT profiles, native802.11
-RX/metadata, larger flow budgets, host-supplicant fallback, WPA3/AP, replayed
-recovery/system PM, confirmed stop/IOMMU quiescence and DMA reclamation, and IRQ delivery.
-These do not expand the initial polling/retained-failure acceptance claim.
+prefixes, other CPU/RAM/chip/OTP selectors (including 160 MHz-capable
+chips), HE/EHT profiles, monitor mode (which owns native802.11 RX and its
+metadata), AP, replayed
+recovery/system PM, IOMMU-backed quiescence.
+These do not expand the initial retained-failure acceptance claim.
+WPA3-SAE offload (WCC `WSEC_PMK` passphrase ABI), the PMKSA cache, firmware
+roaming/FT, per-AC telemetry and host-supplicant fallback are common FullMAC
+work shared with CYW; see [CYW §3](cyw43439.md).
+
+Native802.11 receive is not a separate station feature: Linux
+`msgbuf.c::brcmf_msgbuf_process_rx_complete` hands a completion flagged
+`BRCMF_MSGBUF_PKT_FLAGS_FRAME_802_11` only to `brcmf_netif_mon_rx`
+(`core.c`), which strips or converts its metadata according to
+`BRCMF_FEAT_MONITOR_FMT_RADIOTAP`/`_HW_RX_HDR` after `BRCMF_C_SET_MONITOR`.
+Station firmware delivers802.3 frames. Native802.11 RX and RX metadata are
+therefore tracked under the monitor-mode feature.
 
 ## 7. Stage assignment
 

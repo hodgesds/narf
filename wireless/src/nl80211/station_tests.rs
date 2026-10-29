@@ -993,6 +993,7 @@ fn smoke_nl80211_ext_connect_owner_release() -> TestResult {
         connected: false,
         max_scan_ssids: 0,
         max_scan_ie_len: 512,
+        scan_random_sn: false,
     };
     let parse = |a: &[u8]| parse_operation_caps(CONNECT, &attributes(a).unwrap(), caps, OWNER);
     let ok = matches!(

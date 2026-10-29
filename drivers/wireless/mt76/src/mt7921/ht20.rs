@@ -3,6 +3,32 @@
 use super::firmware_transport::{Error, RadioInfo, ScanBss};
 use alloc::{vec, vec::Vec};
 
+/// HT Operation subset-2 bits a BSS updates while stations stay associated
+/// (IEEE 802.11-2020 9.4.2.56: HT Protection b0-1, Nongreenfield HT STAs
+/// Present b2, OBSS Non-HT STAs Present b4). Linux mt7921 programs none of
+/// them: `mt7921_bss_info_changed` ignores BSS_CHANGED_HT/ERP_CTS_PROT and the
+/// CONNAC2 BSS/STA records carry no HT protection field, so protection is
+/// firmware-owned. Beacon tracking therefore compares the HT Operation without
+/// these bits, while any width/secondary/basic-MCS change still ends the link.
+pub(crate) const DYNAMIC_OPERATION: u8 = 0b1_0111;
+
+pub(crate) fn static_operation(mut operation: [u8; 22]) -> [u8; 22] {
+    operation[2] &= !DYNAMIC_OPERATION;
+    operation
+}
+
+/// Bound AP PHY facts are unchanged apart from dynamic HT protection state.
+pub(crate) fn same_ap_phy(
+    bound: &narf_wireless::association::phy::ApElements,
+    current: &narf_wireless::association::phy::ApElements,
+) -> bool {
+    bound.ht_capability() == current.ht_capability()
+        && bound.vht_capability() == current.vht_capability()
+        && bound.vht_operation() == current.vht_operation()
+        && bound.ht_operation().map(static_operation)
+            == current.ht_operation().map(static_operation)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Profile {
     capability: [u8; 26],
@@ -12,9 +38,12 @@ pub(crate) struct Profile {
     tx_streams: u8,
     rx_ldpc: bool,
     rx_stbc: bool,
+    tx_stbc: bool,
     tx_ldpc: bool,
     rx_greenfield: bool,
     tx_greenfield: bool,
+    /// Peer HT Capabilities Maximum A-MSDU Length (7935 instead of 3839).
+    peer_amsdu_7935: bool,
 }
 
 /// One RX/TX stream, HT20 with optional short GI, no LDPC/STBC/greenfield, 3839-byte
@@ -39,7 +68,14 @@ impl Profile {
         width: u8,
     ) -> Self {
         let mut capability = [0; 26];
+        // mac80211 ieee80211_ht_cap_ie_to_sta_ht_cap keeps the peer's RX
+        // STBC field only when the local radio advertises TX_STBC.
         let cap = (n.peer_capability() & 12)
+            | if n.tx_stbc() {
+                n.peer_capability() & 0x0300
+            } else {
+                0
+            }
             | u16::from(n.tx_ldpc())
             | (u16::from(n.tx_greenfield()) << 4)
             | (u16::from(n.tx_sgi20()) << 5)
@@ -72,9 +108,11 @@ impl Profile {
             tx_streams,
             rx_ldpc: n.rx_ldpc(),
             rx_stbc: n.rx_stbc(),
+            tx_stbc: n.tx_stbc(),
             tx_ldpc: n.tx_ldpc(),
             rx_greenfield: n.rx_greenfield(),
             tx_greenfield: n.tx_greenfield(),
+            peer_amsdu_7935: n.peer_capability() & 0x0800 != 0,
         }
     }
     pub(crate) fn prepare(info: RadioInfo, bss: &ScanBss) -> Result<Self, Error> {
@@ -86,6 +124,16 @@ impl Profile {
             return Err(Error::UnsupportedFirmware);
         }
         Self::parse(&bss.information_elements, bss.channel)
+    }
+    /// Equality apart from the dynamic HT protection bits of the operation.
+    pub(crate) fn same_static(self, other: Self) -> bool {
+        Self {
+            operation: static_operation(self.operation),
+            ..self
+        } == Self {
+            operation: static_operation(other.operation),
+            ..other
+        }
     }
     pub(crate) fn parse(mut ies: &[u8], channel: u8) -> Result<Self, Error> {
         if ies.len() > 2048 {
@@ -133,9 +181,11 @@ impl Profile {
             tx_streams: 1,
             rx_ldpc: false,
             rx_stbc: false,
+            tx_stbc: false,
             tx_ldpc: false,
             rx_greenfield: false,
             tx_greenfield: false,
+            peer_amsdu_7935: cap & 0x0800 != 0,
         })
     }
     pub(crate) fn transmit_mcs_mask(self) -> [u8; 10] {
@@ -156,6 +206,17 @@ impl Profile {
     pub(crate) fn receive_stbc(self) -> bool {
         self.rx_stbc
     }
+    /// mac80211 ht.c `agg.max_amsdu_len` for this HT peer.
+    pub(crate) fn max_amsdu_len(self) -> u16 {
+        if self.peer_amsdu_7935 {
+            7935
+        } else {
+            3839
+        }
+    }
+    pub(crate) fn transmit_stbc(self) -> bool {
+        self.tx_stbc
+    }
     pub(crate) fn transmit_ldpc(self) -> bool {
         self.tx_ldpc
     }
@@ -171,6 +232,7 @@ impl Profile {
         // wider-width bit survives this local HT20 capability intersection.
         let cap = u16::from_le_bytes(self.capability[..2].try_into().unwrap());
         (cap & (12 | 32))
+            | if self.tx_stbc { cap & 0x0300 } else { 0 }
             | u16::from(self.tx_ldpc)
             | (u16::from(self.tx_greenfield) << 4)
             | if self.secondary.is_some() {

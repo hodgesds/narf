@@ -242,6 +242,18 @@ fn smoke_cyw_f2_credit_wrap_and_priority_flow_control() -> TestResult {
     if runtime.send_data(&ethernet(), 5) != Err(Error::Busy) {
         return TestResult::Fail("TX ignored per-priority stop");
     }
+    // fc_mask bits are brcmf_map_prio_to_prec precedences: 802.1D BE(0)
+    // is precedence2 by default, and an ACM-demoted VO(6) shares it.
+    runtime.flow_control = 1 << 2;
+    runtime.set_ac_priority([1, 0, 0, 1, 3, 3, 1, 1]);
+    if runtime.send_data(&ethernet(), 0) != Err(Error::Busy)
+        || runtime.send_data(&ethernet(), 6) != Err(Error::Busy)
+        || !runtime.transport.tx.is_empty()
+    {
+        return TestResult::Fail("TX ignored the precedence-mapped flow stop");
+    }
+    runtime.set_ac_priority(crate::cyw43439::station::wmm::DEFAULT_AC_PRIORITY);
+    runtime.flow_control = 0;
     for expected in [255, 0, 1] {
         if runtime.send_data(&ethernet(), 0).is_err() || runtime.tx_sequence != expected {
             return TestResult::Fail("TX credit sequence wrap");

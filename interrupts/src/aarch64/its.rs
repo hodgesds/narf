@@ -136,6 +136,9 @@ pub enum ItsError {
     UnknownDevice,
     /// An existing ITT is smaller than the requested vector count.
     IttTooSmall,
+    /// The active GIC is GICv2, which has no ITS / LPIs (MSIs would need
+    /// GICv2m, not implemented).
+    NotGicV3,
 }
 
 impl From<SetupError> for ItsError {
@@ -304,6 +307,11 @@ fn map(pa: u64, len: u64) -> Option<usize> {
 /// windows. Runs at the MMU handoff, before firmware discovery; `init_bsp`
 /// remaps if discovery later finds different frames.
 pub fn remap_mmio() {
+    // GICv2 has no ITS; the QEMU ITS / GICR constants below would map
+    // whatever sits there instead (GICv2m on `virt,gic-version=2`).
+    if super::gic::is_v2() {
+        return;
+    }
     if ITS_VA.load(Ordering::Acquire) == 0 {
         if let Some(va) = map(ITS_PA.load(Ordering::Acquire), reg::ITS_FRAME_LEN) {
             ITS_VA.store(va, Ordering::Release);
@@ -510,6 +518,9 @@ fn bsp_redistributor() -> Result<(u64, usize, u64), ItsError> {
 /// - [`discover_firmware`] should have run; without it the QEMU virt
 ///   layout is assumed.
 pub unsafe fn init_bsp() -> Result<(), ItsError> {
+    if super::gic::is_v2() {
+        return Err(ItsError::NotGicV3);
+    }
     if INIT_DONE.load(Ordering::Acquire) {
         return Ok(());
     }
@@ -951,6 +962,7 @@ impl fmt::Display for ItsError {
             ItsError::LpiOutOfRange => f.write_str("ITS: LPI out of range"),
             ItsError::UnknownDevice => f.write_str("ITS: unknown device or event"),
             ItsError::IttTooSmall => f.write_str("ITS: existing ITT too small"),
+            ItsError::NotGicV3 => f.write_str("ITS: GICv2 has no ITS"),
         }
     }
 }

@@ -168,3 +168,113 @@ pub unsafe fn drain_isr(mmio: &MmioRegion) -> IsrStatus {
         IsrStatus { hisr, hisre }
     }
 }
+
+// ── RTL8188EE retained-owner interrupt profile ───────────────────────────
+//
+// Linux `rtl8188ee/sw.c::rtl88e_init_sw_vars` (irq_mask[0], irq_mask[1],
+// sys_irq_mask) with the bit values of `rtl8188ee/reg.h`. These are the
+// exact masks `rtl88ee_enable_interrupt` writes; they differ from the
+// 8192EE defaults above in IMR_HSISR_IND_ON_INT (BIT 15).
+
+/// `IMR_HSISR_IND_ON_INT` — HSISR indication (`rtl8188ee/reg.h`).
+pub const IMR_HSISR_IND_ON_INT: u32 = 1 << 15;
+/// `HSIMR_RON_INT_EN` (`rtl8188ee/reg.h`, REG_HSIMR 0x58).
+pub const HSIMR_RON_INT_EN: u32 = 1 << 6;
+/// `HSIMR_PDN_INT_EN` (`rtl8188ee/reg.h`).
+pub const HSIMR_PDN_INT_EN: u32 = 1 << 7;
+/// `REG_HSIMR` (`rtl8188ee/reg.h`).
+pub const REG_HSIMR_88E: u16 = 0x0058;
+/// `REG_HSISR` (`rtl8188ee/reg.h`).
+pub const REG_HSISR_88E: u16 = 0x005c;
+/// `REG_C2HEVT_CLEAR` (`rtl8188ee/reg.h`).
+pub const REG_C2HEVT_CLEAR_88E: u16 = 0x01af;
+/// `rtlpci->irq_mask[0]` for RTL8188EE.
+pub const IRQ_MASK0_88E: u32 = IMR_PSTIMEOUT
+    | IMR_HSISR_IND_ON_INT
+    | IMR_C2HCMD
+    | IMR_HIGHDOK
+    | IMR_MGNTDOK
+    | IMR_BKDOK
+    | IMR_BEDOK
+    | IMR_VIDOK
+    | IMR_VODOK
+    | IMR_RDU
+    | IMR_ROK;
+/// `rtlpci->irq_mask[1]` for RTL8188EE (`IMR_RXFOVW`).
+pub const IRQ_MASK1_88E: u32 = IMRE_RXFOVW;
+/// `rtlpci->sys_irq_mask` for RTL8188EE.
+pub const SYS_IRQ_MASK_88E: u32 = HSIMR_PDN_INT_EN | HSIMR_RON_INT_EN;
+
+/// One `rtl88ee_interrupt_recognized` pass: masked, already W1C-acked.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Recognized {
+    /// `intvec.inta` = HISR & irq_mask[0].
+    pub inta: u32,
+    /// `intvec.intb` = HISRE & irq_mask[1].
+    pub intb: u32,
+}
+
+/// Edge-latched wake shared by the MSI top half and the station worker.
+/// The top half never touches BAR2; recognition happens in the worker.
+pub(crate) struct Signal {
+    count: core::sync::atomic::AtomicU64,
+    waker: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>>,
+}
+impl Signal {
+    pub(crate) fn new() -> alloc::sync::Arc<Self> {
+        alloc::sync::Arc::new(Self {
+            count: core::sync::atomic::AtomicU64::new(0),
+            waker: narf_lib::sync::IrqSafeSpinLock::new(None),
+        })
+    }
+    /// Vector top half (or explicit stack-TX wake): count and wake.
+    pub(crate) fn raise(&self) {
+        self.count
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        if let Some(waker) = self.waker.lock().take() {
+            waker.wake();
+        }
+    }
+    pub(crate) fn count(&self) -> u64 {
+        self.count.load(core::sync::atomic::Ordering::Acquire)
+    }
+    /// Resolve once the count moves past `seen`, or when `fallback` ends.
+    pub(crate) fn wait<F: core::future::Future<Output = ()> + Unpin>(
+        &self,
+        seen: u64,
+        fallback: F,
+    ) -> Wait<'_, F> {
+        Wait {
+            signal: self,
+            seen,
+            fallback,
+        }
+    }
+}
+pub(crate) struct Wait<'a, F> {
+    signal: &'a Signal,
+    seen: u64,
+    fallback: F,
+}
+impl<F: core::future::Future<Output = ()> + Unpin> core::future::Future for Wait<'_, F> {
+    /// `true` when a vector (or explicit wake) ended the wait.
+    type Output = bool;
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<bool> {
+        if self.signal.count() != self.seen {
+            return core::task::Poll::Ready(true);
+        }
+        *self.signal.waker.lock() = Some(cx.waker().clone());
+        // A raise between the two loads either saw the waker or left the
+        // count for this re-check.
+        if self.signal.count() != self.seen {
+            return core::task::Poll::Ready(true);
+        }
+        match core::pin::Pin::new(&mut self.fallback).poll(cx) {
+            core::task::Poll::Ready(()) => core::task::Poll::Ready(false),
+            core::task::Poll::Pending => core::task::Poll::Pending,
+        }
+    }
+}

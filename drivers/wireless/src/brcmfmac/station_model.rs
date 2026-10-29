@@ -79,6 +79,9 @@ pub(super) struct Firmware {
     server: DhcpServer,
     uplink: Vec<Vec<u8>>,
     creates: usize,
+    tids: Vec<u8>,
+    tx_priorities: Vec<(u16, u8)>,
+    wme_ac_sta: [u8; 16],
     deletes: usize,
     statuses: usize,
 }
@@ -126,9 +129,28 @@ impl Firmware {
             server: DhcpServer::new(network_plan()),
             uplink: Vec::new(),
             creates: 0,
+            tids: Vec::new(),
+            tx_priorities: Vec::new(),
+            wme_ac_sta: [0; 16],
             deletes: 0,
             statuses: 0,
         }
+    }
+    /// Watchdog reset: the session (rings, flows, association, keys)
+    /// is lost; the configured profile of this fixture is kept.
+    pub(super) fn reboot(&mut self) {
+        let mut fresh = Self::new(self.secured);
+        fresh.keys_first = self.keys_first;
+        fresh.mfp_supported = self.mfp_supported;
+        fresh.pmf_required = self.pmf_required;
+        fresh.mfp_fault = self.mfp_fault;
+        fresh.mfp_missing = self.mfp_missing;
+        fresh.phy_profile = self.phy_profile;
+        fresh.wide = self.wide.take();
+        fresh.vht = self.vht.take();
+        fresh.channel = self.channel;
+        fresh.wme_ac_sta = self.wme_ac_sta;
+        *self = fresh;
     }
     pub(super) fn post_event(&mut self, descriptor: &[u8]) {
         self.event_posts.push_back((
@@ -153,6 +175,7 @@ impl Firmware {
                 },
             );
             self.creates += 1;
+            self.tids.push(descriptor[20]);
         } else {
             let id = u16::from_le_bytes(descriptor[8..10].try_into().unwrap());
             assert!(self.flows.remove(&id).is_some());
@@ -229,7 +252,11 @@ impl Firmware {
                 || input.starts_with(b"vhtmode\0")
                     && self.vht.as_ref().is_some_and(|p| p.mode.is_none())
                 || input.starts_with(b"txstreams\0")
-                    && self.vht.as_ref().is_some_and(|p| p.txstreams.is_none()));
+                    && self.vht.as_ref().is_some_and(|p| p.txstreams.is_none())
+                || input.starts_with(b"txbf_bfe_cap\0")
+                    && self.vht.as_ref().is_some_and(|p| p.txbf[0].is_none())
+                || input.starts_with(b"txbf_bfr_cap\0")
+                    && self.vht.as_ref().is_some_and(|p| p.txbf[1].is_none()));
         match command {
             1 => 2u32.to_le_bytes().to_vec(),
             23 => {
@@ -285,6 +312,20 @@ impl Firmware {
                             .unwrap_or(0)
                             .to_le_bytes(),
                     );
+                } else if let Some(index) = [&b"txbf_bfe_cap\0"[..], b"txbf_bfr_cap\0"]
+                    .iter()
+                    .position(|name| input.starts_with(name))
+                {
+                    out[..4].copy_from_slice(
+                        &self
+                            .vht
+                            .as_ref()
+                            .and_then(|p| p.txbf[index])
+                            .unwrap_or(0)
+                            .to_le_bytes(),
+                    );
+                } else if input.starts_with(b"wme_ac_sta\0") {
+                    out[..16].copy_from_slice(&self.wme_ac_sta);
                 } else if input.starts_with(b"chanspecs\0") {
                     let list = self.vht.as_ref().map(|v| v.list()).unwrap_or_else(|| {
                         self.wide
@@ -658,6 +699,7 @@ impl Firmware {
                 let mut ethernet = tx[8..22].to_vec();
                 ethernet.extend_from_slice(&state.dma[&body][..length]);
                 self.uplink.push(ethernet.clone());
+                self.tx_priorities.push((id, tx[22] >> 5));
                 if let Some(reply) = self.server.receive(&ethernet) {
                     self.downlink.push_back(reply);
                 }
@@ -670,8 +712,14 @@ impl Firmware {
         if !self.hold_tx {
             while let Some((id, flow)) = self.completions.pop_front() {
                 let ring = pointer(state, RINGS + 3 * 16 + 8);
-                let at = usize::from(self.tx_write) * 16;
-                let entry = &mut state.dma.get_mut(&ring).unwrap()[at..at + 16];
+                // Shared 7 TX status items are 24 bytes (msgbuf.h).
+                let size = if word(state, SHARED) & 0xff >= 7 {
+                    24
+                } else {
+                    16
+                };
+                let at = usize::from(self.tx_write) * size;
+                let entry = &mut state.dma.get_mut(&ring).unwrap()[at..at + size];
                 entry.fill(0);
                 entry[0] = 0x10;
                 entry[4..8].copy_from_slice(&id.to_le_bytes());
@@ -686,8 +734,14 @@ impl Firmware {
             let (id, address) = self.rx_posts.pop_front().unwrap();
             state.dma.get_mut(&address).unwrap()[256..256 + bytes.len()].copy_from_slice(&bytes);
             let ring = pointer(state, RINGS + 4 * 16 + 8);
-            let at = usize::from(self.rx_write) * 32;
-            let entry = &mut state.dma.get_mut(&ring).unwrap()[at..at + 32];
+            // Shared 7 RX completion items are 40 bytes (msgbuf.h).
+            let size = if word(state, SHARED) & 0xff >= 7 {
+                40
+            } else {
+                32
+            };
+            let at = usize::from(self.rx_write) * size;
+            let entry = &mut state.dma.get_mut(&ring).unwrap()[at..at + size];
             entry.fill(0);
             entry[0] = 0x12;
             entry[4..8].copy_from_slice(&id.to_le_bytes());
@@ -765,6 +819,56 @@ impl Handle {
         let mut state = self.0.lock();
         operation(state.firmware.as_mut().unwrap().station.as_mut().unwrap());
         firmware_step(&mut state);
+    }
+    /// Firmware answers D3_INFORM with D3_ACK (confirmed stop).
+    pub(crate) fn d3_ack(&self, value: bool) {
+        self.0.lock().d3_ack = value;
+    }
+    /// A device posted write lands after the BME clear.
+    pub(crate) fn late_dma(&self, value: bool) {
+        self.0.lock().late_dma = value;
+    }
+    /// (allocated, dropped) host DMA mappings.
+    pub(crate) fn mappings(&self) -> (usize, usize) {
+        let s = self.0.lock();
+        (s.allocated, s.dropped)
+    }
+    /// Firmware posts `BRCMF_D2H_DEV_FWHALT` (Linux `brcmf_fw_crashed`).
+    pub(crate) fn fwhalt(&self) {
+        raise_mailbox(&mut self.0.lock(), runtime::mailbox::D2H_DEV_FWHALT);
+    }
+    /// The dongle lost power across suspend: `INTMASK` reads zero.
+    pub(crate) fn power_lost(&self) {
+        self.0.lock().registers.insert(PCIE + 0x24, 0);
+    }
+    /// Every TCM write fails (a refused firmware download).
+    pub(crate) fn fail_tcm(&self, value: bool) {
+        self.0.lock().fail_tcm = value;
+    }
+    /// A still-powered dongle answers D0_INFORM (INTMASK stays nonzero).
+    pub(crate) fn d0_alive(&self) {
+        let mut s = self.0.lock();
+        s.d0_alive = true;
+        s.registers.insert(PCIE + 0x24, 0x300);
+    }
+    /// The function fell off the bus.
+    pub(crate) fn gone(&self, value: bool) {
+        self.0.lock().gone = value;
+    }
+    /// (watchdog resets, config-shadow rewrites, link-control writes).
+    pub(crate) fn resets(&self) -> (usize, usize, Vec<u32>) {
+        let s = self.0.lock();
+        (s.watchdogs, s.shadow_restores, s.lsc_writes.clone())
+    }
+    /// ARM CR4 wrapper `ioctrl` (bit 5 = `CPUHALT`).
+    pub(crate) fn cr4_ioctrl(&self) -> u32 {
+        *self.0.lock().registers.get(&(WRAP + 0x408)).unwrap_or(&0)
+    }
+    pub(crate) fn dma_enabled(&self) -> bool {
+        self.0.lock().dma_enable
+    }
+    pub(crate) fn wme_ac_sta(&self, rows: [u8; 16]) {
+        self.change(|f| f.wme_ac_sta = rows);
     }
     pub(crate) fn keys_first(&self, value: bool) {
         self.change(|f| f.keys_first = value);
@@ -913,6 +1017,12 @@ impl Handle {
             state.unsafe_free,
         )
     }
+    /// Flow-create TIDs and per-packet (flow id, descriptor priority).
+    pub(crate) fn flow_priorities(&self) -> (Vec<u8>, Vec<(u16, u8)>) {
+        let state = self.0.lock();
+        let firmware = state.firmware.as_ref().unwrap().station.as_ref().unwrap();
+        (firmware.tids.clone(), firmware.tx_priorities.clone())
+    }
     pub(crate) fn last_tx_alive(&self) -> bool {
         let state = self.0.lock();
         let f = state.firmware.as_ref().unwrap().station.as_ref().unwrap();
@@ -963,7 +1073,7 @@ fn create_inner(
         &crate::brcmfmac::provision::Assets,
     )>,
 ) -> Result<(TestAdapter, Handle), runtime::Error> {
-    assert!(matches!(version, 5 | 6));
+    assert!(matches!(version, 5..=7));
     let (bus, state) = model();
     {
         let mut s = state.lock();
@@ -980,14 +1090,36 @@ fn create_inner(
     // these fixture bytes are never registered as deployable firmware/NVRAM.
     let boot = if let Some((selection, assets)) = selected {
         let nvram = boot::pack_nvram(&assets.nvram)?;
-        boot::Cr4::claim_selected(bus, pci(), selection)?.boot(&assets.firmware, &nvram)?
+        boot::Cr4::claim_selected(bus, pci(), selection)
+            .and_then(|cr4| cr4.boot(&assets.firmware, &nvram))
+            .map_err(|refused| refused.error)?
     } else {
-        let nvram = boot::pack_nvram(b"boardrev=1\n").unwrap();
-        boot::Cr4::claim(bus, pci(), profile())?
-            .boot(&[0x44, 0x33, 0x22, 0x11, 9, 8, 7, 6], &nvram)?
+        boot_fixture(bus).map_err(|refused| refused.error)?
     };
     let runtime = runtime::Runtime::attach(boot)?;
     Adapter::new(runtime)
-        .map(|adapter| (adapter, Handle(state)))
+        .map(|adapter| {
+            (
+                adapter.with_reboot(alloc::boxed::Box::new(Reboot)),
+                Handle(state),
+            )
+        })
         .map_err(|_| runtime::Error::Protocol)
+}
+fn boot_fixture(bus: Model) -> Result<boot::Booted<Model>, boot::Refused<Model>> {
+    let nvram = boot::pack_nvram(b"boardrev=1\n").unwrap();
+    boot::Cr4::claim(bus, pci(), profile())?.boot(&[0x44, 0x33, 0x22, 0x11, 9, 8, 7, 6], &nvram)
+}
+/// Retained fixture firmware authority: a transport reset downloads the
+/// same synthetic image through the actual CR4 boot owner again.
+struct Reboot;
+impl crate::brcmfmac::station_transport::Reboot<Model> for Reboot {
+    fn boot(
+        &mut self,
+        bus: Model,
+    ) -> Result<runtime::Runtime<Model>, (runtime::Error, Option<Model>)> {
+        let booted =
+            boot_fixture(bus).map_err(|refused| (refused.error.into(), Some(refused.bus)))?;
+        runtime::Runtime::attach(booted).map_err(|error| (error, None))
+    }
 }

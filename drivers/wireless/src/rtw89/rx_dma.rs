@@ -291,13 +291,27 @@ impl Rx {
     pub fn fail(&mut self) {
         self.state = State::Terminal;
     }
+    /// Release both RXQ/RPQ descriptor rings and all their buffers. The
+    /// owner stays terminal; storage is returned for the caller to free.
+    ///
     /// # Safety
-    /// Actual DMA/prefetch/posted transactions are independently fenced; BME
-    /// off, stop bits, revocation and a missing IRQ are not sufficient proof.
-    #[cfg(any(test, feature = "kernel-test"))]
-    unsafe fn reclaim_fenced(&mut self) {
+    /// Actual DMA/prefetch/posted transactions are fenced: the caller holds a
+    /// current `dma_stop::Idle` proof (RXQ/RPQ stopped and idle, BME off and
+    /// flushed). BME off, stop bits or revocation alone are not that proof.
+    pub(super) unsafe fn reclaim_fenced(&mut self) -> Vec<DmaBuffer> {
         self.state = State::Terminal;
         self.armed = false;
+        let mut storage = Vec::new();
+        for ring in self.rings.take().into_iter().flatten() {
+            let Ring {
+                descriptors,
+                buffers,
+                ..
+            } = ring;
+            storage.extend(descriptors);
+            storage.extend(buffers);
+        }
+        storage
     }
 }
 impl Drop for Rx {

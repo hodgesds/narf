@@ -16,6 +16,9 @@ struct Model {
     polls: usize,
     stops: Vec<u64>,
     pause_stop: bool,
+    clears: Vec<u8>,
+    clear_result: Option<UsbError>,
+    pause_clear: bool,
 }
 #[derive(Clone)]
 struct Fake(Arc<IrqSafeSpinLock<Model>>);
@@ -99,6 +102,27 @@ impl Io for Fake {
             Err(UsbError::Stall)
         }
     }
+    async fn clear_halt(&self, endpoint: u8) -> Result<(), UsbError> {
+        let pause = {
+            let mut m = self.0.lock();
+            m.clears.push(endpoint);
+            m.pause_clear
+        };
+        if pause {
+            core::future::pending::<()>().await;
+        }
+        let mut m = self.0.lock();
+        if let Some(error) = m.clear_result {
+            return Err(error);
+        }
+        // Reset Endpoint + Set TR Dequeue retires the halted TD.
+        if endpoint & 0x80 != 0 {
+            m.rx = None;
+        } else {
+            m.tx = None;
+        }
+        Ok(())
+    }
 }
 fn endpoints(n: u8) -> Endpoints {
     Endpoints {
@@ -148,7 +172,7 @@ fn smoke_rtl8188eu_native_rx_24byte_shift_report_and_128_alignment() -> TestResu
     let got = packet_codec::receive(&bytes).unwrap();
     if got.len() != 3
         || !matches!(&got[0],Record::Frame(f)if f.bytes==mpdu&&f.phy==[0x55;32]&&f.timestamp==0x12345678&&f.rate==3&&f.tid==7&&!f.decrypted)
-        || !matches!(&got[1],Record::Report{kind:1,bytes}if bytes==&[0xb0;16])
+        || !matches!(&got[1],Record::Report{kind:1,bytes,..}if bytes==&[0xb0;16])
         || !matches!(&got[2],Record::Frame(f)if f.bytes==mpdu)
     {
         return TestResult::Fail(
@@ -157,7 +181,7 @@ fn smoke_rtl8188eu_native_rx_24byte_shift_report_and_128_alignment() -> TestResu
     }
     let report = descriptor(&[0xb0; 16], 2, 8, 2, 1);
     if !matches!(&packet_codec::receive(&report).unwrap()[0],
-        Record::Report { kind:2, bytes } if bytes.len()==26
+        Record::Report { kind:2, bytes, .. } if bytes.len()==26
             && bytes[..8]==[0x55;8] && bytes[10..]==[0xb0;16])
     {
         return TestResult::Fail("report path incorrectly removed MPDU-only PHY/shift prefix");
@@ -266,16 +290,16 @@ fn smoke_rtl8188eu_packet_error_and_drop_retain_td() -> TestResult {
         let mut owner = Owner::new(io.clone(), endpoints(3), 1).unwrap();
         owner.start().unwrap();
         if receive {
-            io.0.lock().rx_result = Some(Err(UsbError::Stall));
-            if owner.poll_receive() != Err(Error::Usb(UsbError::Stall)) {
+            io.0.lock().rx_result = Some(Err(UsbError::HardwareError(0x20)));
+            if owner.poll_receive() != Err(Error::Usb(UsbError::HardwareError(0x20))) {
                 return TestResult::Fail("RX transport error ignored");
             }
         } else {
             owner
                 .submit(Kind::Management, &frame(Kind::Management))
                 .unwrap();
-            io.0.lock().tx_result = Some(Err(UsbError::Stall));
-            if owner.poll_transmit() != Err(Error::Usb(UsbError::Stall)) {
+            io.0.lock().tx_result = Some(Err(UsbError::Timeout));
+            if owner.poll_transmit() != Err(Error::Usb(UsbError::Timeout)) {
                 return TestResult::Fail("TX transport error ignored");
             }
         }
@@ -375,4 +399,142 @@ fn smoke_rtl8188eu_packet_stop_allows_only_after_terminal_quiescence() -> TestRe
 kernel_test_in!(
     "drivers/wireless/rtl8xxxu/packet",
     smoke_rtl8188eu_packet_stop_allows_only_after_terminal_quiescence
+);
+
+/// Stall/Babble/Transaction Error halt one pipe; `recover` resets exactly
+/// that endpoint (Reset Endpoint + Set TR Dequeue + CLEAR_FEATURE) before
+/// reposting RX or reopening the TX slot. The other pipe keeps working.
+fn smoke_rtl8188eu_packet_halted_pipes_recover_and_reuse_slots() -> TestResult {
+    use core::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+    for error in [
+        UsbError::Stall,
+        UsbError::Babble,
+        UsbError::TransactionError,
+    ] {
+        let io = Fake::new();
+        let mut owner = Owner::new(io.clone(), endpoints(3), 1).unwrap();
+        owner.start().unwrap();
+        io.0.lock().rx_result = Some(Err(error));
+        if owner.poll_receive() != Err(Error::Halted) || !owner.is_halted() || owner.is_failed() {
+            return TestResult::Fail("halted bulk IN was not held for recovery");
+        }
+        // Bulk OUT is an independent endpoint context.
+        if owner
+            .submit(Kind::Management, &frame(Kind::Management))
+            .is_err()
+            || owner.poll_receive() != Err(Error::Halted)
+            || owner.start() != Err(Error::Halted)
+        {
+            return TestResult::Fail("RX halt blocked TX or allowed a repost");
+        }
+        let sent = io.0.lock().sent.last().unwrap().1.len();
+        io.0.lock().tx_result = Some(Ok(sent));
+        if owner.poll_transmit().ok().flatten().is_none() {
+            return TestResult::Fail("RX halt blocked TX completion");
+        }
+        let recovery = narf_scheduler::block_on(owner.recover());
+        {
+            let m = io.0.lock();
+            if recovery
+                != Ok(Recovery {
+                    receive: true,
+                    transmit_lost: false,
+                })
+                || m.clears != [0x81]
+                || m.posted != [(3, MAX_TRANSFER), (3, MAX_TRANSFER)]
+                || m.rx.is_none()
+                || m.unsafe_reuse != 0
+            {
+                return TestResult::Fail("RX halt recovery did not reset and repost bulk IN");
+            }
+        }
+        io.0.lock().rx_result = Some(Ok(descriptor(&frame(Kind::Data), 0, 0, 0, 0)));
+        if !matches!(owner.poll_receive(), Ok(Some(_))) || owner.is_halted() {
+            return TestResult::Fail("recovered bulk IN lost receive service");
+        }
+    }
+    // TX halt: the stalled packet is discarded; the slot is reused.
+    let io = Fake::new();
+    let mut owner = Owner::new(io.clone(), endpoints(3), 1).unwrap();
+    owner.start().unwrap();
+    owner.submit(Kind::Data, &frame(Kind::Data)).unwrap();
+    io.0.lock().tx_result = Some(Err(UsbError::Stall));
+    if owner.poll_transmit() != Err(Error::Halted)
+        || owner.submit(Kind::Management, &frame(Kind::Management)) != Err(Error::Halted)
+        || owner.poll_receive() != Ok(None)
+    {
+        return TestResult::Fail("TX halt was not isolated to bulk OUT");
+    }
+    let endpoint = io.0.lock().sent[0].0 / 2;
+    if narf_scheduler::block_on(owner.recover())
+        != Ok(Recovery {
+            receive: false,
+            transmit_lost: true,
+        })
+        || io.0.lock().clears != [endpoint]
+        || owner
+            .submit(Kind::Management, &frame(Kind::Management))
+            .is_err()
+        || io.0.lock().unsafe_reuse != 0
+    {
+        return TestResult::Fail("TX halt recovery did not reopen the bulk OUT slot");
+    }
+    // Teardown: stopping a halted owner recovers before draining.
+    let sent = io.0.lock().sent.last().unwrap().1.len();
+    io.0.lock().tx_result = Some(Ok(sent));
+    owner.poll_transmit().unwrap();
+    io.0.lock().rx_result = Some(Err(UsbError::Stall));
+    let _ = owner.poll_receive();
+    if narf_scheduler::block_on(owner.stop()).is_err()
+        || owner.is_halted()
+        || owner.is_failed()
+        || io.0.lock().rx.is_some()
+    {
+        return TestResult::Fail("halted owner could not be stopped");
+    }
+    owner.start().unwrap();
+    // Failure: an endpoint reset error is terminal and retains the TD.
+    let io = Fake::new();
+    let mut owner = Owner::new(io.clone(), endpoints(1), 1).unwrap();
+    owner.start().unwrap();
+    io.0.lock().rx_result = Some(Err(UsbError::Stall));
+    let _ = owner.poll_receive();
+    io.0.lock().clear_result = Some(UsbError::Timeout);
+    if narf_scheduler::block_on(owner.recover()) != Err(Error::Usb(UsbError::Timeout))
+        || !owner.is_failed()
+        || owner.poll_receive() != Err(Error::Failed)
+        || io.0.lock().rx.is_none()
+        || io.0.lock().posted.len() != 1
+    {
+        return TestResult::Fail("failed endpoint reset reposted or reopened the owner");
+    }
+    // Cancellation: a dropped recovery future is terminal.
+    let io = Fake::new();
+    let mut owner = Owner::new(io.clone(), endpoints(1), 1).unwrap();
+    owner.start().unwrap();
+    io.0.lock().rx_result = Some(Err(UsbError::Stall));
+    let _ = owner.poll_receive();
+    io.0.lock().pause_clear = true;
+    {
+        let mut future = Box::pin(owner.recover());
+        if !matches!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ) {
+            return TestResult::Fail("endpoint reset did not reach pending ownership");
+        }
+    }
+    if !owner.is_failed() || owner.start() != Err(Error::Failed) || io.0.lock().posted.len() != 1 {
+        return TestResult::Fail("cancelled endpoint reset reopened the owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/packet",
+    smoke_rtl8188eu_packet_halted_pipes_recover_and_reuse_slots
 );
