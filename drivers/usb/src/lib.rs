@@ -684,7 +684,7 @@ fn spawn_supervisor_task() {
                     // bound port's activity tick — a port's idle
                     // window runs from bind, not from the boot
                     // epoch its tick initialised to (#840).
-                    attach::mark_ports_bound(idx, new_bound_bits);
+                    attach::mark_ports_bound(*hub_slot, new_bound_bits);
                 }
             }
 

@@ -85,13 +85,13 @@ pub struct BootMouse {
     pub slot_id: u8,
     pub interrupt_in_ep: u8,
     pub interface_num: u8,
-    /// Hub context — (index into `attach::HUBS`, downstream
+    /// Hub context — (parent hub slot id, downstream
     /// port) — when the mouse sits behind a hub; `None` on a
     /// root port, whose ports are never idle-suspended. The
     /// pump feeds `attach::mark_port_activity` with it whenever
     /// a report completes, so an in-use mouse's port never
     /// idle-suspends mid-motion (#840).
-    pub hub_port: Option<(usize, u8)>,
+    pub hub_port: Option<(u8, u8)>,
     /// Last button mask, used to diff press / release on `pump_once`.
     /// Movement deltas are accumulator-free — the device sends a
     /// fresh dx/dy every report, so each report is a self-contained
@@ -185,7 +185,7 @@ impl BootMouse {
         slot_id: u8,
         interface_num: u8,
         interrupt_in_ep: u8,
-        hub_port: Option<(usize, u8)>,
+        hub_port: Option<(u8, u8)>,
     ) -> Result<Self, HidError> {
         xhci_dev
             .control_out(
@@ -259,8 +259,8 @@ impl BootMouse {
         // idle report diffs to zero events but still proves
         // the device is in use). No-op when root-attached.
         if reports > 0 {
-            if let Some((hub_idx, port)) = self.hub_port {
-                crate::attach::mark_port_activity(hub_idx, port);
+            if let Some((hub_slot, port)) = self.hub_port {
+                crate::attach::mark_port_activity(hub_slot, port);
             }
         }
         Ok(total)
@@ -390,7 +390,7 @@ pub async fn try_bind_mouse_already_addressed(
     xhci_dev: &Xhci,
     slot_id: u8,
     speed: crate::xhci::PortSpeed,
-    hub_port: Option<(usize, u8)>,
+    hub_port: Option<(u8, u8)>,
 ) -> Result<(), HidError> {
     bind_mouse_addressed_slot(xhci_dev, slot_id, speed, hub_port).await
 }
@@ -423,7 +423,7 @@ async fn bind_mouse_addressed_slot(
     xhci_dev: &Xhci,
     slot_id: u8,
     speed: crate::xhci::PortSpeed,
-    hub_port: Option<(usize, u8)>,
+    hub_port: Option<(u8, u8)>,
 ) -> Result<(), HidError> {
     // Refresh EP0 MPS via Evaluate Context once the device tells
     // us its real bMaxPacketSize0. Same logic as kbd path
@@ -524,7 +524,7 @@ pub fn attached_mouse_count() -> usize {
 /// Hub contexts of all live mouse bindings (root-attached
 /// bindings omitted). Aggregated by `hid::hub_ports` for the
 /// supervisor's HID wake step.
-pub fn hub_ports() -> alloc::vec::Vec<(usize, u8)> {
+pub fn hub_ports() -> alloc::vec::Vec<(u8, u8)> {
     let g = MICE.lock();
     g.iter().filter_map(|m| m.hub_port).collect()
 }

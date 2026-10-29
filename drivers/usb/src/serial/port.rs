@@ -664,7 +664,7 @@ pub struct BoundPort {
     /// runtime hub-port resume (#763, mirroring #840 for HID).
     /// `None` for root-hub devices, which have no downstream
     /// port to suspend.
-    pub hub_port: Option<(usize, u8)>,
+    pub hub_port: Option<(u8, u8)>,
 }
 
 /// Global registry of bound vendor-serial ports, mirroring
@@ -759,7 +759,7 @@ pub async fn try_bind_serial_already_addressed(
     vid: u16,
     pid: u16,
     cfg: &[u8],
-    hub_port: Option<(usize, u8)>,
+    hub_port: Option<(u8, u8)>,
 ) -> Result<usize, PortError> {
     let family = super::identify(vid, pid).ok_or(PortError::UnknownDevice)?;
     let eps = find_serial_endpoints(cfg).ok_or(PortError::NoSerialInterface)?;
@@ -1116,8 +1116,8 @@ pub fn register_pm() {
 /// (hub index, port) pairs with a live vendor-serial binding —
 /// the pure-filter input for the supervisor's hub-port wake
 /// step.
-pub fn hub_ports() -> Vec<(usize, u8)> {
-    let mut v: Vec<(usize, u8)> = {
+pub fn hub_ports() -> Vec<(u8, u8)> {
+    let mut v: Vec<(u8, u8)> = {
         let g = SERIAL_PORTS.lock();
         g.iter().filter_map(|p| p.hub_port).collect()
     };
@@ -1143,10 +1143,10 @@ pub async fn resume_suspended_hub_ports(xhci_dev: &Xhci) {
         let g = crate::attach::HUBS.lock();
         crate::attach::suspended_ports_among(&g[..], &ports)
     };
-    for (hub_idx, port) in targets {
-        crate::attach::resume_port(xhci_dev, hub_idx, port).await;
-        if !crate::attach::hub_port_is_suspended(hub_idx, port) {
-            crate::attach::mark_port_activity(hub_idx, port);
+    for (hub_slot, port) in targets {
+        crate::attach::resume_port(xhci_dev, hub_slot, port).await;
+        if !crate::attach::hub_port_is_suspended(hub_slot, port) {
+            crate::attach::mark_port_activity(hub_slot, port);
         }
     }
 }
@@ -1739,7 +1739,7 @@ pub mod tests {
         family: ChipFamily,
         pid: u16,
         settings: LineSettings,
-        hub_port: Option<(usize, u8)>,
+        hub_port: Option<(u8, u8)>,
     ) -> usize {
         let idx = devfs_bridge::register_tty_usb(family);
         SERIAL_PORTS.lock().push(BoundPort {
@@ -1919,7 +1919,7 @@ pub mod tests {
             LineSettings::default(),
             Some((1, 4)),
         );
-        if hub_ports() != alloc::vec![(1usize, 3u8), (1usize, 4u8)] {
+        if hub_ports() != alloc::vec![(1u8, 3u8), (1u8, 4u8)] {
             return TestResult::Fail("hub_ports must list only hub-bound ports, sorted");
         }
         clear_serial();

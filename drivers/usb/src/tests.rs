@@ -692,14 +692,14 @@ fn smoke_hub_idle_suspend_decision() -> TestResult {
     h.bound_downstream |= 1 << 5;
     h.last_activity_tick[5] = 0;
     let cands = idle_suspend_candidates(&alloc::vec![h], now);
-    if cands != alloc::vec![(0usize, 1u8)] {
+    if cands != alloc::vec![(7u8, 1u8)] {
         return TestResult::Fail("expected only the unstamped bound port");
     }
     // Exactly at the threshold the port is expired (>=).
     let mut h2 = fake_hub_binding(8, 1);
     h2.bound_downstream |= 1 << 1;
     h2.last_activity_tick[1] = now - IDLE_SUSPEND_NS;
-    if idle_suspend_candidates(&alloc::vec![h2], now) != alloc::vec![(0usize, 1u8)] {
+    if idle_suspend_candidates(&alloc::vec![h2], now) != alloc::vec![(8u8, 1u8)] {
         return TestResult::Fail("threshold boundary not expired");
     }
     // The post-resume sentinel never expires.
@@ -739,13 +739,19 @@ fn smoke_hub_bind_stamps_activity() -> TestResult {
             return TestResult::Fail("phantom hub index");
         }
         // Bind port 1 the way the supervisor now does.
-        mark_ports_bound(idx, 1 << 1);
+        // Hub context is keyed by slot id (#892), so the bind
+        // call takes the slot, not the registry index.
+        mark_ports_bound(0xC0, 1 << 1);
         let tick = {
             let g = HUBS.lock();
-            if g[idx].bound_downstream & (1 << 1) == 0 {
+            let h = match g.iter().find(|h| h.hub.slot_id == 0xC0) {
+                Some(h) => h,
+                None => return TestResult::Fail("pushed hub missing"),
+            };
+            if h.bound_downstream & (1 << 1) == 0 {
                 return TestResult::Fail("mark_ports_bound didn't set bound bit");
             }
-            g[idx].last_activity_tick[1]
+            h.last_activity_tick[1]
         };
         if tick == 0 {
             return TestResult::Fail("mark_ports_bound didn't stamp activity");
@@ -756,22 +762,25 @@ fn smoke_hub_bind_stamps_activity() -> TestResult {
         {
             let g = HUBS.lock();
             if idle_suspend_candidates(&g[..], tick + IDLE_SUSPEND_NS - 1_000_000_000)
-                .contains(&(idx, 1u8))
+                .contains(&(0xC0, 1u8))
             {
                 return TestResult::Fail("freshly bound port selected for suspend");
             }
             if !idle_suspend_candidates(&g[..], tick + IDLE_SUSPEND_NS + 1_000_000_000)
-                .contains(&(idx, 1u8))
+                .contains(&(0xC0, 1u8))
             {
                 return TestResult::Fail("idle-expired bound port not selected");
             }
         }
         // A completed transfer feeds activity: tick moves to the
         // feed instant and the deadline moves with it.
-        mark_port_activity(idx, 1);
+        mark_port_activity(0xC0, 1);
         let tick2 = {
             let g = HUBS.lock();
-            g[idx].last_activity_tick[1]
+            match g.iter().find(|h| h.hub.slot_id == 0xC0) {
+                Some(h) => h.last_activity_tick[1],
+                None => return TestResult::Fail("pushed hub missing"),
+            }
         };
         if tick2 < tick {
             return TestResult::Fail("activity feed moved the tick backwards");
@@ -779,7 +788,7 @@ fn smoke_hub_bind_stamps_activity() -> TestResult {
         {
             let g = HUBS.lock();
             if idle_suspend_candidates(&g[..], tick2 + IDLE_SUSPEND_NS - 1_000_000_000)
-                .contains(&(idx, 1u8))
+                .contains(&(0xC0, 1u8))
             {
                 return TestResult::Fail("activity feed didn't push the deadline out");
             }
@@ -790,6 +799,82 @@ fn smoke_hub_bind_stamps_activity() -> TestResult {
     result
 }
 kernel_test_in!("drivers/usb/hub_pm", smoke_hub_bind_stamps_activity);
+
+/// #892 regression: hub detach must not retarget a surviving
+/// device's activity feed. Three hubs (slots 0xC0/0xC1/0xC2);
+/// port 1 of the middle hub is bound (tick stamped). Detaching
+/// the FIRST hub removes its `HUBS` entry with `retain`, which
+/// shifts every later index down by one — under the old
+/// index-keyed context, a cached index 1 would then stamp the
+/// third hub's tick. With slot-keyed context the feed must
+/// still land on the middle hub, and feeding a detached hub's
+/// slot must stamp nothing anywhere (no wrong-hub write, no
+/// panic on a missing entry).
+fn smoke_hub_detach_shift_keeps_activity() -> TestResult {
+    use crate::attach::{mark_port_activity, mark_ports_bound, HUBS};
+    let base = HUBS.lock().len();
+    HUBS.lock().push(fake_hub_binding(0xC0, 2));
+    HUBS.lock().push(fake_hub_binding(0xC1, 2));
+    HUBS.lock().push(fake_hub_binding(0xC2, 2));
+    let result = (|| {
+        mark_ports_bound(0xC1, 1 << 1);
+        let bound_tick = {
+            let g = HUBS.lock();
+            match g.iter().find(|h| h.hub.slot_id == 0xC1) {
+                Some(h) => h.last_activity_tick[1],
+                None => return TestResult::Fail("middle hub missing"),
+            }
+        };
+        if bound_tick == 0 {
+            return TestResult::Fail("bind did not stamp middle hub tick");
+        }
+        // Detach the first hub exactly as `detach_slot` does.
+        HUBS.lock().retain(|h| h.hub.slot_id != 0xC0);
+        // Feed activity for the middle hub: must land on it even
+        // though its registry index moved 1 -> 0, and must not
+        // touch the third hub's tick.
+        mark_port_activity(0xC1, 1);
+        let (mid_tick, third_tick) = {
+            let g = HUBS.lock();
+            let mid = match g.iter().find(|h| h.hub.slot_id == 0xC1) {
+                Some(h) => h.last_activity_tick[1],
+                None => return TestResult::Fail("middle hub lost on detach"),
+            };
+            let third = match g.iter().find(|h| h.hub.slot_id == 0xC2) {
+                Some(h) => h.last_activity_tick[1],
+                None => return TestResult::Fail("third hub lost on detach"),
+            };
+            (mid, third)
+        };
+        if mid_tick < bound_tick {
+            return TestResult::Fail("activity feed moved middle hub tick backwards");
+        }
+        if third_tick != 0 {
+            return TestResult::Fail("activity feed stamped the wrong hub after detach shift");
+        }
+        // Feeding the detached hub's slot must stamp nothing.
+        mark_port_activity(0xC0, 1);
+        let (mid_tick2, third_tick2) = {
+            let g = HUBS.lock();
+            let mid = match g.iter().find(|h| h.hub.slot_id == 0xC1) {
+                Some(h) => h.last_activity_tick[1],
+                None => return TestResult::Fail("middle hub lost on detached feed"),
+            };
+            let third = match g.iter().find(|h| h.hub.slot_id == 0xC2) {
+                Some(h) => h.last_activity_tick[1],
+                None => return TestResult::Fail("third hub lost on detached feed"),
+            };
+            (mid, third)
+        };
+        if mid_tick2 != mid_tick || third_tick2 != 0 {
+            return TestResult::Fail("detached-slot feed wrote to a live hub");
+        }
+        TestResult::Pass
+    })();
+    HUBS.lock().truncate(base);
+    result
+}
+kernel_test_in!("drivers/usb/hub_pm", smoke_hub_detach_shift_keeps_activity);
 
 /// Wake-step selection matrix for `suspended_ports_among`, the
 /// pure filter behind `hid::resume_suspended_hub_ports`: only
@@ -810,24 +895,26 @@ fn smoke_hub_hid_wake_selection() -> TestResult {
     // Hub 1 port 2: bound + suspended → selected.
     h1.bound_downstream |= 1 << 2;
     h1.suspended_downstream |= 1 << 2;
+    // Bindings are (parent hub slot id, port) (#892): hub 0 is
+    // slot 7, hub 1 is slot 8, slot 9 is unknown.
     let hubs = alloc::vec![h0, h1];
     let bindings = alloc::vec![
-        (0usize, 1u8),
-        (0usize, 2u8),
-        (0usize, 3u8),
-        (1usize, 2u8),
-        (0usize, 1u8), // duplicate — collapses
-        (9usize, 1u8), // unknown hub
+        (7u8, 1u8),
+        (7u8, 2u8),
+        (7u8, 3u8),
+        (8u8, 2u8),
+        (7u8, 1u8), // duplicate — collapses
+        (9u8, 1u8), // unknown hub
     ];
     let got = suspended_ports_among(&hubs, &bindings);
-    if got != alloc::vec![(0usize, 1u8), (1usize, 2u8)] {
+    if got != alloc::vec![(7u8, 1u8), (8u8, 2u8)] {
         return TestResult::Fail("wake selection mismatch");
     }
     // Nothing suspended → nothing woken (the wake step must
     // never touch an awake port).
     let mut h2 = fake_hub_binding(9, 1);
     h2.bound_downstream |= 1 << 1;
-    if !suspended_ports_among(&alloc::vec![h2], &alloc::vec![(0usize, 1u8)]).is_empty() {
+    if !suspended_ports_among(&alloc::vec![h2], &alloc::vec![(9u8, 1u8)]).is_empty() {
         return TestResult::Fail("awake bound port selected for wake");
     }
     TestResult::Pass
@@ -849,7 +936,7 @@ fn smoke_hub_hid_context_collection() -> TestResult {
             slot_id: 11,
             interrupt_in_ep: 3,
             interface_num: 0,
-            hub_port: Some((0, 1)),
+            hub_port: Some((7, 1)),
             last_report: KbdReport::default(),
         });
         // A second binding on the same port — must collapse.
@@ -857,7 +944,7 @@ fn smoke_hub_hid_context_collection() -> TestResult {
             slot_id: 12,
             interrupt_in_ep: 3,
             interface_num: 0,
-            hub_port: Some((0, 1)),
+            hub_port: Some((7, 1)),
             last_report: KbdReport::default(),
         });
         // Root-attached keyboard — omitted.
@@ -869,9 +956,9 @@ fn smoke_hub_hid_context_collection() -> TestResult {
             last_report: KbdReport::default(),
         });
         // A second class on a different hub's port.
-        hid::consumer::__push_consumer_for_test(14, Some((1, 2)));
+        hid::consumer::__push_consumer_for_test(14, Some((8, 2)));
         let got = hid::hub_ports();
-        if got != alloc::vec![(0usize, 1u8), (1usize, 2u8)] {
+        if got != alloc::vec![(7u8, 1u8), (8u8, 2u8)] {
             return TestResult::Fail("hub_ports aggregation mismatch");
         }
         TestResult::Pass
@@ -2568,9 +2655,10 @@ static UNBIND_TEST_MATCHES: [crate::class_registry::UsbClassMatch; 1] =
         0xFFFE, 0xFFFE,
     )];
 
-fn unbind_hook_record(slot: u8) {
+fn unbind_hook_record(slot: u8) -> Result<(), ()> {
     UNBIND_HOOK_LAST_SLOT.store(slot, core::sync::atomic::Ordering::SeqCst);
     UNBIND_HOOK_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    Ok(())
 }
 
 fn unbind_test_probe(
@@ -2592,8 +2680,8 @@ fn smoke_usb_class_registry_unbind_dispatch() -> TestResult {
         return TestResult::Fail("hooked driver registration failed");
     }
     let before = UNBIND_HOOK_CALLS.load(core::sync::atomic::Ordering::SeqCst);
-    let invoked = dispatch_unbind(9);
-    if invoked == 0 {
+    let report = dispatch_unbind(9);
+    if report.invoked == 0 {
         return TestResult::Fail("dispatch_unbind invoked no hooks");
     }
     if UNBIND_HOOK_LAST_SLOT.load(core::sync::atomic::Ordering::SeqCst) != 9 {
@@ -2607,6 +2695,77 @@ fn smoke_usb_class_registry_unbind_dispatch() -> TestResult {
 kernel_test_in!(
     "drivers/usb/class-registry",
     smoke_usb_class_registry_unbind_dispatch
+);
+
+static UNBIND_FAIL_HOOK_CALLS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+static UNBIND_OK_HOOK_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Failing hook for the isolation test: fails ONLY for the
+/// sentinel slot 0xEE, so other dispatches (and other tests'
+/// hooks) are unaffected and the failure count is exact.
+fn unbind_hook_fail_sentinel(slot: u8) -> Result<(), ()> {
+    UNBIND_FAIL_HOOK_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    if slot == 0xEE {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+fn unbind_hook_ok_record(slot: u8) -> Result<(), ()> {
+    let _ = slot;
+    UNBIND_OK_HOOK_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+/// #893 regression: one failing unbind hook must not abort
+/// dispatch for the remaining hooks. The failing hook is
+/// registered BEFORE the ok hook; after `dispatch_unbind(0xEE)`
+/// both must have run exactly once more and the report must
+/// count exactly one failure. (A panicking hook cannot be
+/// tested this way — panic is fatal by kernel policy, see
+/// `UsbUnbindFn` — so the contract under test is the
+/// reported-failure path.)
+fn smoke_usb_class_registry_unbind_isolation() -> TestResult {
+    use crate::class_registry::{dispatch_unbind, register_class_driver_with_unbind};
+    if register_class_driver_with_unbind(
+        "test-unbind-fail",
+        &UNBIND_TEST_MATCHES,
+        unbind_test_probe,
+        unbind_hook_fail_sentinel,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("failing-hook registration failed");
+    }
+    if register_class_driver_with_unbind(
+        "test-unbind-ok",
+        &UNBIND_TEST_MATCHES,
+        unbind_test_probe,
+        unbind_hook_ok_record,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("ok-hook registration failed");
+    }
+    let fail_before = UNBIND_FAIL_HOOK_CALLS.load(core::sync::atomic::Ordering::SeqCst);
+    let ok_before = UNBIND_OK_HOOK_CALLS.load(core::sync::atomic::Ordering::SeqCst);
+    let report = dispatch_unbind(0xEE);
+    if UNBIND_FAIL_HOOK_CALLS.load(core::sync::atomic::Ordering::SeqCst) != fail_before + 1 {
+        return TestResult::Fail("failing hook was not called exactly once");
+    }
+    if UNBIND_OK_HOOK_CALLS.load(core::sync::atomic::Ordering::SeqCst) != ok_before + 1 {
+        return TestResult::Fail("dispatch stopped after the failing hook");
+    }
+    if report.failed != 1 {
+        return TestResult::Fail("dispatch did not count exactly one failure");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/class-registry",
+    smoke_usb_class_registry_unbind_isolation
 );
 
 fn smoke_usb_uac_finder_picks_audiocontrol_interface() -> TestResult {
