@@ -29,6 +29,7 @@ narf-input        = { path = "../../input" }
 narf-net          = { path = "../../net" }
 narf-graphics     = { path = "../../graphics" }
 narf-init         = { path = "../../init" }
+narf-filesystem   = { path = "../../filesystem" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 
 [lints]

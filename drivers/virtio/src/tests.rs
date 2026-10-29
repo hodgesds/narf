@@ -1224,6 +1224,55 @@ fn smoke_virtio_rng_pci_probe() -> TestResult {
 }
 kernel_test_in!("drivers/virtio/rng-pci", smoke_virtio_rng_pci_probe);
 
+fn smoke_virtio_rng_seed_fill_loop() -> TestResult {
+    use crate::pci::VirtioPciError;
+    use crate::rng_pci::fill_seed_from_reads;
+
+    // Partial completions concatenate in order: a device that
+    // writes 5 bytes, then the remaining 27, fills the seed with
+    // the first chunk's bytes first. Distinct per-chunk patterns
+    // prove order, not just length.
+    let script = [(5usize, 0xA1u8), (27usize, 0xB2u8)];
+    let mut step = 0usize;
+    let mut read = |out: &mut [u8]| -> Result<usize, VirtioPciError> {
+        if step >= script.len() {
+            return Err(VirtioPciError::NoQueues);
+        }
+        let (n, tag) = script[step];
+        step += 1;
+        let n = n.min(out.len());
+        out[..n].fill(tag);
+        Ok(n)
+    };
+    let mut seed = [0u8; 32];
+    if fill_seed_from_reads(&mut seed, &mut read).is_err() {
+        return TestResult::Fail("partial-read seed fill refused");
+    }
+    if seed[..5].iter().any(|&b| b != 0xA1) || seed[5..].iter().any(|&b| b != 0xB2) {
+        return TestResult::Fail("partial-read seed bytes out of order");
+    }
+
+    // A zero-progress completion is a stalled device, not a
+    // retryable short read: it must fail, never spin.
+    let mut stalled = |_out: &mut [u8]| -> Result<usize, VirtioPciError> { Ok(0) };
+    let mut seed = [0u8; 32];
+    match fill_seed_from_reads(&mut seed, &mut stalled) {
+        Err(VirtioPciError::CompletionTimeout) => {}
+        _ => return TestResult::Fail("zero-progress completion did not fail as stalled"),
+    }
+
+    // A device error propagates instead of being papered over.
+    let mut failing =
+        |_out: &mut [u8]| -> Result<usize, VirtioPciError> { Err(VirtioPciError::NoQueues) };
+    let mut seed = [0u8; 32];
+    match fill_seed_from_reads(&mut seed, &mut failing) {
+        Err(VirtioPciError::NoQueues) => {}
+        _ => return TestResult::Fail("device error did not fail the seed fill"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/virtio/rng-pci", smoke_virtio_rng_seed_fill_loop);
+
 fn smoke_virtio_snd_pci_probe() -> TestResult {
     use crate::snd_pci;
     use narf_bus::driver_match::__reset_for_test;

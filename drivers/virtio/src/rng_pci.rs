@@ -264,6 +264,48 @@ impl VirtioRngPci {
     }
 }
 
+/// Fill a full 32-byte seed from a read closure, looping over
+/// partial completions the way a virtio-rng device is allowed to
+/// produce them (VirtIO 1.2 §5.4: the device fills the offered
+/// buffer and reports how much it wrote; a short completion is
+/// normal, not an error). The closure is the seam the smokes drive
+/// without hardware; production passes `|b| ctrl.read_bytes(b)`.
+/// `pub(crate)` so the crate's smoke tests can drive it directly.
+///
+/// A zero-progress completion — the device completes a request
+/// having written nothing — can never satisfy a 32-byte seed, so
+/// it fails as a stalled device (`CompletionTimeout`) instead of
+/// spinning forever on a device that will never make progress.
+pub(crate) fn fill_seed_from_reads(
+    buf: &mut [u8; 32],
+    read: &mut dyn FnMut(&mut [u8]) -> Result<usize, VirtioPciError>,
+) -> Result<(), VirtioPciError> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match read(&mut buf[filled..])? {
+            0 => return Err(VirtioPciError::CompletionTimeout),
+            n => filled += n,
+        }
+    }
+    Ok(())
+}
+
+/// The csprng seed draw for a probed virtio-rng controller: loop
+/// `read_bytes` until a full 32-byte seed is filled, mapping every
+/// virtio failure — including "no controller" — to the pool's
+/// `EntropyUnavailable` at the boundary. Registered with the pool
+/// by [`probe`]; see `narf_filesystem::csprng::VirtioRng` for the
+/// class semantics (degraded, host-provided, never key-generation).
+fn fill_seed_from_controller(
+    buf: &mut [u8; 32],
+) -> Result<(), narf_filesystem::csprng::CsprngError> {
+    let filled = with_controller(|ctrl| fill_seed_from_reads(buf, &mut |b| ctrl.read_bytes(b)));
+    match filled {
+        Some(Ok(())) => Ok(()),
+        _ => Err(narf_filesystem::csprng::CsprngError::EntropyUnavailable),
+    }
+}
+
 static CONTROLLER: IrqSafeSpinLock<Option<VirtioRngPci>> = IrqSafeSpinLock::new(None);
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
@@ -284,6 +326,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     *CONTROLLER.lock() = Some(dev);
+    // Wire the probed device into the csprng ladder as the
+    // explicitly-labelled VirtioRng class (issue #1074): the pool
+    // seeds from this draw only when no architectural source exists,
+    // and the next fill after probe is what seeds (see
+    // `narf_filesystem::csprng::register_virtio_rng_source`).
+    narf_filesystem::csprng::register_virtio_rng_source(fill_seed_from_controller);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("vrng0"),
         kind: narf_drivers::BoundKind::Rng,
