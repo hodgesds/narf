@@ -124,9 +124,13 @@ unsafe impl Io for Startup {
         self.station_allowed()?;
         self.station_native()?.station_track_write(address, value)
     }
-    fn station_track_cck_pd(&mut self) -> Result<bool, power::Error> {
+    fn station_track_profile(&mut self) -> Result<crate::rtw89::track::Profile, power::Error> {
         self.station_allowed()?;
-        self.station_native()?.station_track_cck_pd()
+        self.station_native()?.station_track_profile()
+    }
+    async fn station_track_crystal(&mut self, cap: u8) -> Result<u8, power::Error> {
+        self.station_allowed()?;
+        self.station_native()?.station_track_crystal(cap).await
     }
     fn station_he_allowed(&mut self) -> Result<bool, power::Error> {
         self.station_allowed()?;

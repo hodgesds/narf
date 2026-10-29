@@ -1,6 +1,19 @@
 use super::*;
-use alloc::collections::BTreeMap;
+use alloc::{collections::BTreeMap, vec::Vec};
+use core::task::{Context, Poll, Waker};
 use narf_kernel_test::{kernel_test_in, TestResult};
+
+/// The fake completes every await immediately.
+fn ready<T>(future: impl core::future::Future<Output = T>) -> T {
+    let mut future = core::pin::pin!(future);
+    match future
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+    {
+        Poll::Ready(value) => value,
+        Poll::Pending => panic!("track fake future pending"),
+    }
+}
 
 /// Register file that refuses anything outside `REGISTERS`.
 #[derive(Default)]
@@ -8,6 +21,8 @@ struct Fake {
     regs: BTreeMap<u32, u32>,
     unsupported: bool,
     cck_pd: bool,
+    profile: Option<Profile>,
+    crystal: Vec<u8>,
 }
 impl Hw for Fake {
     fn read(&mut self, address: u32) -> Result<u32, power::Error> {
@@ -26,11 +41,20 @@ impl Hw for Fake {
         self.regs.insert(address, value);
         Ok(())
     }
-    fn cck_pd(&mut self) -> Result<bool, power::Error> {
+    fn profile(&mut self) -> Result<Profile, power::Error> {
         if self.unsupported {
             return Err(power::Error::Unsupported);
         }
-        Ok(self.cck_pd)
+        Ok(self.profile.unwrap_or(Profile {
+            cck_pd: self.cck_pd,
+            crystal_cap: 40,
+            crystal_lower: 1,
+            crystal_upper: 104,
+        }))
+    }
+    async fn crystal(&mut self, cap: u8) -> Result<u8, power::Error> {
+        self.crystal.push(cap);
+        Ok(cap)
     }
 }
 impl Fake {
@@ -173,7 +197,7 @@ fn smoke_rtw89_track_work_programs_registers_like_linux() -> TestResult {
         ..Fake::default()
     };
     let mut track = Tracker::default();
-    if track.run(&mut hw, 0, None, false).is_err() {
+    if ready(track.run(&mut hw, 0, None, false)).is_err() {
         return TestResult::Fail("first track period failed");
     }
     // rtw89_core_start half: PPDU status to host, CCX and IFS-CLM init.
@@ -205,16 +229,20 @@ fn smoke_rtw89_track_work_programs_registers_like_linux() -> TestResult {
     }
     // Not due yet; scanning skips; then a linked, noisy period.
     hw.regs.insert(R_SEG0R_EDCCA_LVL_V1, 0);
-    if track.run(&mut hw, 1999, peer, false).is_err() || hw.get(R_SEG0R_EDCCA_LVL_V1, 0xff) != 0 {
+    if ready(track.run(&mut hw, 1999, peer, false)).is_err()
+        || hw.get(R_SEG0R_EDCCA_LVL_V1, 0xff) != 0
+    {
         return TestResult::Fail("track work ran before its period");
     }
     track.sample(peer, 160);
-    if track.run(&mut hw, 2000, peer, true).is_err() || hw.get(R_SEG0R_EDCCA_LVL_V1, 0xff) != 0 {
+    if ready(track.run(&mut hw, 2000, peer, true)).is_err()
+        || hw.get(R_SEG0R_EDCCA_LVL_V1, 0xff) != 0
+    {
         return TestResult::Fail("track work ran while scanning");
     }
     hw.regs.insert(R_IFSCNT, B_IFSCNT_DONE_MSK);
     hw.regs.insert(R_IFS_CLM_FA, (2969 << 16) | 2969);
-    if track.run(&mut hw, 2000, peer, false).is_err() {
+    if ready(track.run(&mut hw, 2000, peer, false)).is_err() {
         return TestResult::Fail("linked track period failed");
     }
     if hw.get(R_SEG0R_PD_V1, B_SEG0R_PD_LOWER_BOUND_MSK) != 24
@@ -233,12 +261,12 @@ fn smoke_rtw89_track_work_programs_registers_like_linux() -> TestResult {
         unsupported: true,
         ..Fake::default()
     };
-    if Tracker::default().run(&mut none, 0, None, false) != Err(power::Error::Unsupported) {
+    if ready(Tracker::default().run(&mut none, 0, None, false)) != Err(power::Error::Unsupported) {
         return TestResult::Fail("missing owner hook not reported as Unsupported");
     }
     track.disable();
     hw.regs.clear();
-    if track.run(&mut hw, 100_000, None, false).is_err() || !hw.regs.is_empty() {
+    if ready(track.run(&mut hw, 100_000, None, false)).is_err() || !hw.regs.is_empty() {
         return TestResult::Fail("disabled tracking still programs hardware");
     }
     TestResult::Pass
@@ -246,4 +274,98 @@ fn smoke_rtw89_track_work_programs_registers_like_linux() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_track_work_programs_registers_like_linux
+);
+
+fn smoke_rtw89_track_cfo_crystal_and_dcfo_match_linux() -> TestResult {
+    let mut hw = Fake::default();
+    let mut cfo = Cfo::default();
+    cfo.init(hw.profile().unwrap());
+    // Unlinked at the default capacitor: rtw89_phy_cfo_reset writes nothing.
+    if ready(cfo.dm(&mut hw, false)).is_err() || !hw.crystal.is_empty() {
+        return TestResult::Fail("unlinked CFO reset touched the crystal");
+    }
+    // Linked, +100 average: enable adjust, step +3, DCFO fine-tuned.
+    for _ in 0..10 {
+        cfo.sample(100);
+    }
+    if ready(cfo.dm(&mut hw, true)).is_err()
+        || hw.crystal != [43]
+        || hw.get(R_DCFO_COMP_S0, B_DCFO_COMP_S0_MSK) != 150
+    {
+        return TestResult::Fail("CFO +100 differs from rtw89_phy_cfo_dm");
+    }
+    // No new packets: nothing happens.
+    if ready(cfo.dm(&mut hw, true)).is_err() || hw.crystal.len() != 1 {
+        return TestResult::Fail("CFO dm acted without packets");
+    }
+    // -20 average while adjusting: step -1, DCFO -19 (12-bit).
+    for _ in 0..5 {
+        cfo.sample(-20);
+    }
+    if ready(cfo.dm(&mut hw, true)).is_err()
+        || hw.crystal != [43, 42]
+        || hw.get(R_DCFO_COMP_S0, B_DCFO_COMP_S0_MSK) != (-19i32 as u32) & 0xfff
+    {
+        return TestResult::Fail("CFO -20 differs from rtw89_phy_cfo_dm");
+    }
+    // Disconnected: one step back toward the default.
+    if ready(cfo.dm(&mut hw, false)).is_err() || hw.crystal != [43, 42, 41] {
+        return TestResult::Fail("CFO reset does not step toward the default");
+    }
+    // Divergence lock at the bound: reset instead of adjusting.
+    let mut hw = Fake {
+        profile: Some(Profile {
+            cck_pd: false,
+            crystal_cap: 40,
+            crystal_lower: 39,
+            crystal_upper: 41,
+        }),
+        ..Fake::default()
+    };
+    let mut cfo = Cfo::default();
+    cfo.init(hw.profile().unwrap());
+    cfo.sample(400);
+    let _ = ready(cfo.dm(&mut hw, true));
+    cfo.sample(400);
+    if ready(cfo.dm(&mut hw, true)).is_err() || hw.crystal != [43, 42] || !cfo.lock {
+        return TestResult::Fail("CFO divergence lock differs from Linux");
+    }
+    // Throughput state machine: enhance at >= 100 Mbps arms the timer.
+    let mut cfo = Cfo::default();
+    if cfo.track(150) || cfo.state != CfoState::Enhance || !cfo.timer {
+        return TestResult::Fail("CFO enhance state not entered");
+    }
+    if cfo.track(60) || !cfo.track(40) || cfo.state != CfoState::Normal {
+        return TestResult::Fail("CFO enhance state does not fall back");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_track_cfo_crystal_and_dcfo_match_linux
+);
+
+fn smoke_rtw89_track_cfo_timer_follows_tx_throughput() -> TestResult {
+    let peer = Some([2, 0, 0, 0, 0, 1]);
+    let mut hw = Fake::default();
+    let mut track = Tracker::default();
+    // 100 Mbps over 2 s (rtw89_bytes_to_mbps: bytes >> 18).
+    track.transmitted(100 << 18);
+    if ready(track.run(&mut hw, 0, peer, false)).is_err() || track.tx_throughput() != 100 {
+        return TestResult::Fail("TX throughput differs from rtw89_traffic_stats_calc");
+    }
+    if !track.cfo().timer || !track.due(250) || track.due(249) {
+        return TestResult::Fail("enhanced CFO timer not armed at 250 ms");
+    }
+    for _ in 0..4 {
+        track.sample_cfo(peer, 100);
+    }
+    if ready(track.run(&mut hw, 250, peer, false)).is_err() || hw.crystal != [43] {
+        return TestResult::Fail("enhanced CFO work did not run rtw89_phy_cfo_dm");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_track_cfo_timer_follows_tx_throughput
 );

@@ -252,6 +252,7 @@ fn smoke_rtw89_rx_ppdu_status_yields_rssi_only_when_linux_accepts() -> TestResul
         != Ok(Some(Event::PhyStatus(PhyStatus {
             mac_id: 0,
             rssi: 150,
+            cfo: None,
         })))
     {
         return TestResult::Fail("valid PPDU status did not yield RSSI_AVG");
@@ -301,6 +302,7 @@ fn smoke_rtw89_rx_ppdu_status_yields_rssi_only_when_linux_accepts() -> TestResul
         != Ok(Some(Event::PhyStatus(PhyStatus {
             mac_id: 3,
             rssi: 90,
+            cfo: None,
         })))
     {
         return TestResult::Fail("PPDU status MAC ID not taken from RXD dword5");
@@ -310,4 +312,46 @@ fn smoke_rtw89_rx_ppdu_status_yields_rssi_only_when_linux_accepts() -> TestResul
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_rx_ppdu_status_yields_rssi_only_when_linux_accepts
+);
+
+fn smoke_rtw89_rx_ppdu_status_ie01_cfo_matches_linux() -> TestResult {
+    // One IE01 (32 bytes) carrying FD_CFO -3 (S(12,2)) in w1 [19:8].
+    let mut body = vec![0u8; 24];
+    body[0..4].copy_from_slice(&1u32.to_le_bytes());
+    body[4..8].copy_from_slice(&(1u32 << 16).to_le_bytes());
+    let w0 = 11 | (1 << 7) | (5 << 8) | (120 << 24);
+    let mut status = vec![0u8; 40];
+    status[0..4].copy_from_slice(&(w0 as u32).to_le_bytes());
+    status[8..12].copy_from_slice(&1u32.to_le_bytes());
+    status[12..16].copy_from_slice(&((0xffdu32) << 8).to_le_bytes());
+    body.extend_from_slice(&status);
+    let mut ofdm = ppdu_packet(&body, true, 0);
+    let d1 = 4u32 << 16; // RTW89_HW_RATE_OFDM6
+    ofdm[8..12].copy_from_slice(&d1.to_le_bytes());
+    let mut assembler = Assembler::default();
+    if assembler.segment(&ofdm, false)
+        != Ok(Some(Event::PhyStatus(PhyStatus {
+            mac_id: 0,
+            rssi: 120,
+            cfo: Some(-3),
+        })))
+    {
+        return TestResult::Fail("IE01 FD_CFO not sign-extended from S(12,2)");
+    }
+    // CCK PPDUs carry no CFO sample (rate below RTW89_HW_RATE_OFDM6).
+    let cck = ppdu_packet(&body, true, 0);
+    if assembler.segment(&cck, false)
+        != Ok(Some(Event::PhyStatus(PhyStatus {
+            mac_id: 0,
+            rssi: 120,
+            cfo: None,
+        })))
+    {
+        return TestResult::Fail("CCK PPDU produced a CFO sample");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_rx_ppdu_status_ie01_cfo_matches_linux
 );

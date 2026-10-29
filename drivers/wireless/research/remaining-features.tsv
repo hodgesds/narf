@@ -171,7 +171,6 @@ rtw88	vht	VHT operation	feature	drivers/wireless/specification/rtw88.md	1884
 rtw88	wow	Wake on Wireless on RTL8822CE	feature	drivers/wireless/specification/rtw88.md	1885
 rtw89	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw89.md	1006
 rtw89	aggregation	TX A-MSDU/A-MSDU-in-A-MPDU aggregation (TX A-MPDU implemented)	feature	drivers/wireless/specification/rtw89.md	1582
-rtw89	carrier_frequency_tracking	Periodic carrier-frequency offset tracking	feature	drivers/wireless/specification/rtw89.md	715
 rtw89	eht	EHT operation on RTL8922A	feature	drivers/wireless/specification/rtw89.md	1581
 rtw89	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specification/rtw89.md	1012
 rtw89	fragmentation	Host fragmentation/defragmentation with native fragment MPDU admission [API available: WirelessNetIface::set_fragmentation_threshold (SET_WIPHY NL80211_ATTR_WIPHY_FRAG_THRESHOLD routed after cfg80211 validation; default EOPNOTSUPP) (wireless spec 3.1.1)]	feature	drivers/wireless/specification/rtw89.md	1038

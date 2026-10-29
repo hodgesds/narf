@@ -95,8 +95,12 @@ pub(super) unsafe trait Io: Send {
     fn station_track_write(&mut self, _: u32, _: u32) -> Result<(), power::Error> {
         Err(power::Error::Unsupported)
     }
-    /// `hal.support_cckpd` of the prepared operating PHY.
-    fn station_track_cck_pd(&mut self) -> Result<bool, power::Error> {
+    /// Prepared operating-PHY facts (`track::Profile`).
+    fn station_track_profile(&mut self) -> Result<super::track::Profile, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    /// CFO crystal-capacitor write through XTAL SI; returns the SC_XI readback.
+    async fn station_track_crystal(&mut self, _: u8) -> Result<u8, power::Error> {
         Err(power::Error::Unsupported)
     }
     /// Signed HE20 program (`Program::He`).
@@ -613,8 +617,8 @@ impl State {
             .then(|| self.peer.as_ref().map(|peer| peer.bss.bssid))
             .flatten()
     }
-    /// `rtw89_track_work` once per `RTW89_TRACK_WORK_PERIOD` (`track.rs`).
-    fn track(&mut self, io: &mut impl Io, now: u64) -> Result<(), Error> {
+    /// `rtw89_track_work` (and the enhanced CFO timer) when due (`track.rs`).
+    async fn track(&mut self, io: &mut impl Io) -> Result<(), Error> {
         struct Hw<'a, I>(&'a mut I);
         impl<I: Io> super::track::Hw for Hw<'_, I> {
             fn read(&mut self, address: u32) -> Result<u32, power::Error> {
@@ -623,12 +627,16 @@ impl State {
             fn write(&mut self, address: u32, value: u32) -> Result<(), power::Error> {
                 self.0.station_track_write(address, value)
             }
-            fn cck_pd(&mut self) -> Result<bool, power::Error> {
-                self.0.station_track_cck_pd()
+            fn profile(&mut self) -> Result<super::track::Profile, power::Error> {
+                self.0.station_track_profile()
+            }
+            async fn crystal(&mut self, cap: u8) -> Result<u8, power::Error> {
+                self.0.station_track_crystal(cap).await
             }
         }
+        let now = self.now()?;
         let (peer, scanning) = (self.linked(), self.scanning);
-        match self.track.run(&mut Hw(io), now, peer, scanning) {
+        match self.track.run(&mut Hw(io), now, peer, scanning).await {
             Ok(()) => Ok(()),
             Err(power::Error::Unsupported) => {
                 self.track.disable();
@@ -1032,11 +1040,17 @@ impl State {
     }
     /// Work that needs awaited firmware receipts (EDCA, BA CAM).
     pub(super) fn async_pending(&self) -> bool {
-        self.edca_pending() || self.phase == Phase::Open && !self.ba_ops.is_empty()
+        self.edca_pending()
+            || self.phase == Phase::Open && !self.ba_ops.is_empty()
+            || !matches!(self.phase, Phase::Prepared | Phase::Failed | Phase::Stopped)
+                && self.track.due(self.environment.now_ms())
     }
     pub(super) async fn apply_async(&mut self, io: &mut impl Io) -> Result<(), Error> {
         if self.edca_pending() {
             self.apply_edca(io).await?;
+        }
+        if !matches!(self.phase, Phase::Prepared | Phase::Failed | Phase::Stopped) {
+            self.track(io).await?;
         }
         while let Some(op) = self.ba_ops.pop_front() {
             if self.phase != Phase::Open {
@@ -1201,6 +1215,9 @@ impl State {
             if let Some(rssi) = step.rssi {
                 self.track.sample(self.linked(), rssi);
             }
+            if let Some(cfo) = step.cfo {
+                self.track.sample_cfo(self.linked(), cfo);
+            }
             if let Some(receipt) = step.receipt {
                 self.delivery(receipt)?;
             }
@@ -1236,7 +1253,6 @@ impl State {
                 }
             }
         }
-        self.track(io, now)?;
         // A CRC/report descriptor is consumed input, never an RX-idle fence.
         // Inspect all queued peer loss before committing an exact M4 receipt.
         if idle {
@@ -1817,6 +1833,10 @@ impl State {
             })
         {
             self.fail(io);
+        }
+        // __rtw89_traffic_stats_accu: unicast data only (Ethernet bytes here).
+        if result.is_ok() && frame.first().is_some_and(|byte| byte & 1 == 0) {
+            self.track.transmitted(frame.len());
         }
         result
     }

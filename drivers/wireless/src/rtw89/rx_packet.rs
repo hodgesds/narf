@@ -156,6 +156,8 @@ const IE_LENGTH: [u8; 32] = [
     16, 32, 24, 24, 8, 8, 8, 8, VAR, 8, VAR, 176, VAR, VAR, VAR, VAR, VAR, VAR, 16, 24, VAR, VAR,
     VAR, 0, 24, 24, 24, 24, 32, 32, 32, 32,
 ];
+/// `RTW89_HW_RATE_OFDM6`.
+const OFDM6: u16 = 0x4;
 /// RTL8852B `ppdu_max_usr`.
 const MAX_USERS: usize = 4;
 /// `RTW89_CCK_PKT`: lower IE maps are invalid in normal (non-monitor) mode.
@@ -165,7 +167,7 @@ const CCK_PKT: u32 = 11;
 /// PHY status header (`rtw89_core_rx_process_phy_ppdu`) and its IE walk
 /// (`rtw89_core_rx_parse_phy_sts`). Returns the header `RSSI_AVG` only when
 /// every step Linux checks succeeds, since Linux updates `avg_rssi` only then.
-pub(super) fn phy_status(descriptor: &Descriptor, bytes: &[u8]) -> Option<u8> {
+pub(super) fn phy_status(descriptor: &Descriptor, bytes: &[u8]) -> Option<(u8, Option<i16>)> {
     let mut start = 0;
     if descriptor.mac_info {
         let w0 = word(bytes, 0).ok()?;
@@ -191,18 +193,26 @@ pub(super) fn phy_status(descriptor: &Descriptor, bytes: &[u8]) -> Option<u8> {
         return None;
     }
     let mut position = if w0 & (1 << 5) != 0 { 16 } else { 8 };
+    let mut cfo = None;
     while position < status.len() {
         let header = word(status, position).ok()?;
-        let length = match IE_LENGTH[(header & 0x1f) as usize] {
+        let kind = header & 0x1f;
+        let length = match IE_LENGTH[kind as usize] {
             VAR => ((header >> 5) & 0x7f) as usize * 8,
             fixed => fixed as usize,
         };
-        position += length;
-        if length == 0 || position > status.len() {
+        if length == 0 || position + length > status.len() {
             return None;
         }
+        // rtw89_core_parse_phy_status_ie01: OFDM-or-faster PPDUs addressed
+        // to this station carry FD_CFO (cfo_src_fd on B), S(12,2).
+        if kind == 1 && descriptor.rate >= OFDM6 && descriptor.to_self {
+            let w1 = word(status, position + 4).ok()?;
+            cfo = Some((((w1 >> 8) & 0xfff) as i16) << 4 >> 4);
+        }
+        position += length;
     }
-    Some((w0 >> 24) as u8)
+    Some(((w0 >> 24) as u8, cfo))
 }
 /// One accepted PPDU status report (`struct rtw89_rx_phy_ppdu`) for the
 /// addressed `mac_id`.
@@ -211,6 +221,8 @@ pub(super) struct PhyStatus {
     pub mac_id: u8,
     /// `RTW89_PHY_STS_HDR_W0_RSSI_AVG`, half-dB units (`RSSI_FACTOR` 1).
     pub rssi: u8,
+    /// IE01 `FD_CFO` for an OFDM-or-faster PPDU.
+    pub cfo: Option<i16>,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Event {
@@ -329,9 +341,10 @@ impl Assembler {
                 }
             }
             1 => match phy_status(&descriptor, &bytes) {
-                Some(rssi) if descriptor.to_self => Event::PhyStatus(PhyStatus {
+                Some((rssi, cfo)) if descriptor.to_self => Event::PhyStatus(PhyStatus {
                     mac_id: descriptor.mac_id,
                     rssi,
+                    cfo,
                 }),
                 _ => Event::Dropped,
             },

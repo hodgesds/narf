@@ -176,14 +176,47 @@ impl Native {
         use power::Io as _;
         self.track_port(address)?.write32(address, value)
     }
-    pub(in crate::rtw89) fn station_track_cck_pd(&self) -> Result<bool, power::Error> {
+    pub(in crate::rtw89) fn station_track_profile(
+        &self,
+    ) -> Result<crate::rtw89::track::Profile, power::Error> {
         self.operating_current()?;
-        Ok(self
+        let working = self
             .operating
             .as_ref()
             .and_then(|owner| owner.working())
-            .ok_or(power::Error::Unsupported)?
-            .cck_pd)
+            .ok_or(power::Error::Unsupported)?;
+        Ok(crate::rtw89::track::Profile {
+            cck_pd: working.cck_pd,
+            crystal_cap: working.crystal_cap,
+            crystal_lower: working.crystal_lower,
+            crystal_upper: working.crystal_upper,
+        })
+    }
+    /// `rtw89_phy_cfo_set_crystal_cap` (B: `xtal_info` NULL): XTAL SI SC_XO
+    /// (0x05) then SC_XI (0x04), full byte masks, then read both back.
+    pub(in crate::rtw89) async fn station_track_crystal(
+        &mut self,
+        cap: u8,
+    ) -> Result<u8, power::Error> {
+        // Linux clamps to 0..=127; the divergence lock bounds the excursion.
+        self.station_track_profile()?;
+        if cap > 0x7f {
+            return Err(power::Error::Access);
+        }
+        let mut port = self.radio_io()?;
+        // SAFETY: the retained exclusive B owner serializes every XTAL SI
+        // transaction (track work runs under the station's retained lock);
+        // Port encloses each access in current ordinary/device authority.
+        unsafe {
+            crate::rtw89::radio_shutdown::xtal_write(&mut port, 0x05, cap, 0xff).await?;
+            crate::rtw89::radio_shutdown::xtal_write(&mut port, 0x04, cap, 0xff).await?;
+            let xo = crate::rtw89::radio_shutdown::xtal_read(&mut port, 0x05).await?;
+            let xi = crate::rtw89::radio_shutdown::xtal_read(&mut port, 0x04).await?;
+            if xo != cap || xi != cap {
+                return Err(power::Error::Terminal);
+            }
+            Ok(xi)
+        }
     }
     pub(in crate::rtw89) fn station_ampdu_allowed(&self) -> Result<bool, power::Error> {
         self.full_radio_scope()

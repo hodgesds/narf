@@ -711,12 +711,14 @@ or XO/XI writes and cancellation at an actual analog request.
 
 B has no source `rfe_gpio` or AX BB-wrap callback, and the admitted two-path
 profile does not enable antenna diversity. Unsupported-IGI gain-table writes
-are skipped by the actual B source branch. Monitor/NHM diagnostics and periodic
-CFO/antenna tracking are separate from this static working owner; they
+are skipped by the actual B source branch. Monitor diagnostics and periodic
+antenna tracking (RTL8851B only) are separate from this static working owner; they
 are not reported as completed by its successful state.
 
 **Periodic track work** (`track.rs`) follows `rtw89_track_work` in Linux
-order: environment monitor, DIG, EDCCA. Its first period performs the
+order: traffic statistics, environment monitor, DIG, CFO, EDCCA. It runs in
+the station's async worker pass (`apply_async`) so XTAL SI writes can await.
+Its first period performs the
 `rtw89_core_start` half: PPDU status reports (`rtw89_mac_cfg_ppdu_status_ax`:
 `R_AX_PPDU_STAT` RPT_EN/MAC_INFO/PLCP/CRC32, `R_AX_HW_RPT_FWD` to host) and
 `rtw89_phy_env_monitor_init` (CCX enable/trigger option, EDCCA BW20 option,
@@ -735,7 +737,25 @@ lower bound with spatial reuse, the CCK PD limit/lower bound when
 owner admits track reads/writes only for `track::REGISTERS`, under current
 ordinary authority and the prepared operating PHY. Debug-only
 `rtw89_phy_dig_diag`, NHM and the EDCCA-CLM utility are not ported; MCC,
-paused/bypassed DIG and fixed-PD debug overrides do not exist natively. The RX
+paused/bypassed DIG and fixed-PD debug overrides do not exist natively.
+
+CFO tracking follows `rtw89_phy_cfo_track`/`rtw89_phy_cfo_dm` for the single
+linked station (`rtw89_phy_average_cfo_calc`). PPDU status IE01 of an
+OFDM-or-faster PPDU addressed to the station yields `FD_CFO` (`cfo_src_fd`,
+S(12,2), `rtw89_core_parse_phy_status_ie01`), accumulated per period. The
+operating owner already wrote and verified the default capacitor and B's
+DCFO/hardware-CFO setup (`rtw89_dcfo_comp_init`, `cfo_hw_comp`), so
+`rtw89_phy_cfo_init` only seeds state from it (`x_cap_lb`/`x_cap_ub` = ±64).
+Each decision applies the enable/stop hysteresis and ±3/±1 steps, writes the
+capacitor through XTAL SI SC_XO then SC_XI with readback (B has no
+`xtal_info`), applies the divergence lock (15 periods) at the bounds, steps
+back toward the default while unlinked, and programs `R_DCFO_COMP_S0` from the
+shifted average with `CFO_SW_COMP_FINE_TUNE` after a capacitor change. TX
+throughput (`rtw89_traffic_stats_calc`: unicast data bytes >> 18 per 2 s,
+`DECLARE_EWMA(tp, 10, 2)`) drives NORMAL ⇄ ENHANCE at 100/50 Mbps; ENHANCE runs
+the decision on the 250 ms `cfo_track_work` timer instead. Native counts the
+Ethernet bytes of accepted unicast frames (Linux counts the 802.11 skb). No
+UL-OFDMA trigger-frame statistic exists natively, so HOLD is never entered. The RX
 assembler parses `RTW89_CORE_RX_TYPE_PPDU_STAT` exactly as
 `rtw89_core_rx_process_ppdu_sts` accepts it (MAC-info users ≤ `ppdu_max_usr`
 4, PHY-status VALID, header length equal to the report, IE map ≥
@@ -752,7 +772,8 @@ bytes 0, 1 and 3 with readback. An owner without the track hooks reports
 `rtw89_phy_edcca_log`/`_diag` and the scan-time `rtw89_phy_config_edcca`
 backup are not used: track work skips scans and native scans do not change
 the level. Smokes: `smoke_rtw89_track_*` (including a register-file model
-of the full first and linked periods),
+of the full first and linked periods and the CFO crystal/DCFO decisions),
+`smoke_rtw89_rx_ppdu_status_ie01_cfo_matches_linux`,
 `smoke_rtw89_rx_ppdu_status_yields_rssi_only_when_linux_accepts`. QEMU-only
 software evidence; no silicon run.
 
