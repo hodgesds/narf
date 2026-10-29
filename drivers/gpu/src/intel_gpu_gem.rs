@@ -70,6 +70,10 @@ impl GemObject {
         self.frames.iter().map(|frame| frame.start_address().raw())
     }
 
+    pub(crate) fn publish_for_device(&self) -> bool {
+        crate::intel_gpu_gtt::publish_system_pages(self.frames.iter())
+    }
+
     pub fn range(&self, offset: u64, len: usize) -> Result<(), FsError> {
         if offset
             .checked_add(len as u64)

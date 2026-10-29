@@ -1079,6 +1079,30 @@ Clippy passes all three contexts on both targets; host default, Intel-only,
 AMD-only and no-vendor all-target checks, Intel-only debug builds and formatting
 pass. Both architectures pass production boot and btrfs interoperability.
 
+The same Intel branch now adds owned GuC PPGTT kernel submission on MTL/Arrow,
+DG2 and BMG. Independently selected non-leaf PAT bits reach every table level
+and PDP0/PTBP; MTL installs UC PAT2 for table reads while data uses coherent
+WB PAT3. Immutable tables and BOs are explicitly cache-cleaned before GPU
+publication. Rings include source-defined PPGTT start, invalidation and render
+cache drain, with MTL AuxCCS and DG2 depth-flush differences. Residency survives
+wait cancellation, timeout and missing retirement evidence until proven full
+reset; terminal fences publish only after release. Startup now also requires
+a private high-address PPGTT store probe and checks its entire result and code
+pages. This is trusted kernel execution, with an unsafe contract for arbitrary
+kernel batches. Default 3D LRC state/workarounds, isolated userspace scheduling,
+full engine inventory, Arc VRAM/display and silicon/Mesa acceptance remain open.
+Four new native smokes cover independent table/root PAT vectors, real-page
+PPGTT stores on all three profiles, cancellation/reset ownership, profile
+rejection and lost retirement proof. The final x86_64 full GPU selection passes
+2698 GPU tests plus 13 CDC-ECM tests, with zero failures and five existing AMD
+skips (unprobed hardware or masked interrupts). Three final aarch64 groups
+pass 343 Intel/DRM tests without failures/skips; all 13 CDC-ECM tests also pass.
+GPU CI Clippy passes three resolved feature contexts on each architecture;
+host default/Intel-only/AMD-only/no-vendor all-target Clippy, Intel-only debug
+builds, formatting, both production boots and both btrfs checks per architecture
+pass. The upstream USB Result fix is retained; its routing smoke now checks
+detach success instead of ignoring the returned Result.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

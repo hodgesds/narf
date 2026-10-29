@@ -1,12 +1,13 @@
-//! Owned single-LRC GuC scheduling, with a kernel execution probe.
+//! Owned single-LRC GuC scheduling for trusted kernel GGTT/PPGTT work.
 //!
 //! Linux reference: ~/git/linux b90c984d615e8ce2af96f5b1411a962d83fed2ad,
 //! MIT xe_guc_submit.c, xe_lrc.c, xe_guc_ads.c and their ABI headers.
 //! Scheduling acknowledgments are not job completion. Retirement additionally
-//! requires the probe's GPU breadcrumb and saved ring head after deregistration.
+//! requires the GPU breadcrumb and exact saved ring head after deregistration.
 
 use crate::{
     intel_gpu_aux::MmioWindow,
+    intel_gpu_exec::ResidentBatch,
     intel_gpu_fence::{CompletionFence, JobError},
     intel_gpu_gt::GtPlatform,
     intel_gpu_guc::GuCMessage,
@@ -32,6 +33,7 @@ pub enum SchedulingError {
     Allocation(SubmitError),
     Address,
     Cache,
+    Residency(narf_filesystem::FsError),
     Protocol,
     Timeout,
     Transport(TransportError),
@@ -68,6 +70,8 @@ struct Context<B: GpuBacking> {
     phase: Phase,
     deadline: u64,
     fence: Arc<CompletionFence>,
+    resident: Option<ResidentBatch>,
+    tail: u32,
 }
 
 struct Resources<A: BootAllocator> {
@@ -174,6 +178,32 @@ impl<A: BootAllocator> GuCScheduler<A> {
         &mut self,
         now: u64,
     ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
+        self.submit(now, None)
+    }
+
+    /// # Safety
+    /// The batch and every nested command stream must be trusted kernel code.
+    /// It must access only resident mappings, return with BB_END and leave
+    /// global/transport/context/ring state and completion evidence untouched.
+    /// No CPU, userspace mapping or peer may modify any leaf until the fence
+    /// completes or full-engine reset is proven. This does not grant isolated
+    /// user 3D execution; default LRC state and engine workarounds are pending.
+    pub(crate) unsafe fn submit_resident(
+        &mut self,
+        now: u64,
+        batch: ResidentBatch,
+    ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
+        if batch.platform() != Some(self.platform) {
+            return Err(SchedulingError::Address);
+        }
+        self.submit(now, Some(batch))
+    }
+
+    fn submit(
+        &mut self,
+        now: u64,
+        resident: Option<ResidentBatch>,
+    ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
         if !self.published || self.lost {
             return Err(SchedulingError::State);
         }
@@ -225,22 +255,39 @@ impl<A: BootAllocator> GuCScheduler<A> {
         ring.zero_fill();
         let id = self.next_id as u16;
         context_image(&image, self.platform, ring.ggtt_offset());
-        let words = [
-            0x04000001,
-            0,
-            0x10400002,
-            image.ggtt_offset() + BREADCRUMB as u32,
-            0,
-            u32::from(id),
-            0x01000000,
-            0,
-        ];
+        let words: Vec<u32> = if let Some(batch) = &resident {
+            let root = batch.space().root_descriptor();
+            // xe_lrc.c::xe_lrc_set_ppgtt: PDP0 on DG2/MTL, PTBP on Xe2.
+            image.write32(REGS + 0x31 * 4, (root >> 32) as u32);
+            image.write32(REGS + 0x33 * 4, root as u32);
+            resident_ring(
+                self.platform,
+                batch.address(),
+                image.ggtt_offset(),
+                u32::from(id),
+            )
+        } else {
+            alloc::vec![
+                0x04000001,
+                0,
+                0x10400002,
+                image.ggtt_offset() + BREADCRUMB as u32,
+                0,
+                u32::from(id),
+                0x01000000,
+                0,
+            ]
+        };
+        let tail = words.len() as u32 * 4;
         for (i, word) in words.into_iter().enumerate() {
             ring.write32(i as u64 * 4, word);
         }
-        image.write32(REGS + 7 * 4, 32);
+        image.write32(REGS + 7 * 4, tail);
         if r.allocator.sync_for_device(&image).is_err()
             || r.allocator.sync_for_device(&ring).is_err()
+            || resident
+                .as_ref()
+                .is_some_and(|batch| !batch.publish_for_device())
         {
             r.allocator.free(ring);
             r.allocator.free(image);
@@ -254,6 +301,8 @@ impl<A: BootAllocator> GuCScheduler<A> {
             phase: Phase::Invalidate,
             deadline,
             fence: completion.clone(),
+            resident,
+            tail,
         });
         self.next_id += 1;
         Ok((id, completion))
@@ -320,7 +369,12 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         0,
                         0,
                         0,
-                        context.image.ggtt_offset() | 0x19,
+                        context.image.ggtt_offset()
+                            | if context.resident.is_some() {
+                                0x119
+                            } else {
+                                0x19
+                            },
                         0
                     ],
                     Phase::Policy,
@@ -376,7 +430,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             (0x7001, Phase::RetireInvalidating, None) if cookie == (u32::from(c.id) | 0x10000) => {
                 fence(Ordering::Acquire);
                 if c.image.read32(BREADCRUMB) != u32::from(c.id)
-                    || c.image.read32(REGS + 5 * 4) & 0x1ffffc != 32
+                    || c.image.read32(REGS + 5 * 4) & 0x1ffffc != c.tail
                 {
                     return Err(SchedulingError::Protocol);
                 }
@@ -384,6 +438,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 let r = &mut *self.resources;
                 r.allocator.free(c.ring);
                 r.allocator.free(c.image);
+                // Drop all PPGTT tables and BO references before terminal
+                // publication. Deregistration and the final TLB ACK are proven.
+                drop(c.resident);
                 c.fence.signal(Ok(()));
             }
             (0x1002, Phase::Enabling, Some(1)) => c.phase = Phase::Running,
@@ -391,7 +448,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             (0x4600, Phase::Deregistering, None) => {
                 fence(Ordering::Acquire);
                 if c.image.read32(BREADCRUMB) != u32::from(c.id)
-                    || c.image.read32(REGS + 5 * 4) & 0x1ffffc != 32
+                    || c.image.read32(REGS + 5 * 4) & 0x1ffffc != c.tail
                 {
                     return Err(SchedulingError::Protocol);
                 }
@@ -407,9 +464,6 @@ impl<A: BootAllocator> GuCScheduler<A> {
     /// No other host owner can re-arm the retired HWS/LRC/GGTT addresses.
     pub(crate) unsafe fn release_after_reset(mut self) {
         self.published = false;
-        for c in &self.resources.contexts {
-            c.fence.signal(Err(JobError::Reset));
-        }
         self.free();
     }
 
@@ -423,6 +477,8 @@ impl<A: BootAllocator> GuCScheduler<A> {
         for c in r.contexts.drain(..) {
             r.allocator.free(c.ring);
             r.allocator.free(c.image);
+            drop(c.resident);
+            c.fence.signal(Err(JobError::Reset));
         }
         r.allocator.free(r.golden);
         r.allocator.free(r.hwsp);
@@ -446,6 +502,49 @@ fn valid(b: &impl GpuBacking) -> bool {
 fn overlap(a: &impl GpuBacking, b: &impl GpuBacking) -> bool {
     (a.ggtt_offset() as u64) < b.ggtt_offset() as u64 + b.size_pages() as u64 * 4096
         && (b.ggtt_offset() as u64) < a.ggtt_offset() as u64 + a.size_pages() as u64 * 4096
+}
+
+/// Single render-engine kernel job, following xe_ring_ops.c. Preparser/TLB
+/// invalidation precedes the PPGTT batch; HDC/render/depth/data cache drain
+/// precedes the separate GGTT post-sync completion write. No compression or
+/// user state is enabled. MTL needs AuxCCS invalidation; DG2 needs the extra
+/// depth flush (Wa_14016712196). All tails are qword aligned.
+fn resident_ring(platform: GtPlatform, batch: u64, image: u32, seq: u32) -> Vec<u32> {
+    let mut words = alloc::vec![0x04000001, 0x02800101, 0x7a000404, 0x20344c1c, 0xd0, 0, 0, 0,];
+    if matches!(platform, GtPlatform::Integrated(_)) {
+        words.extend_from_slice(&[0x11020001, 0x4208, 1, 0]);
+    }
+    words.extend_from_slice(&[
+        0x02800100,
+        0x18800101,
+        batch as u32,
+        (batch >> 32) as u32,
+        0x04000000,
+    ]);
+    if platform == GtPlatform::Alchemist {
+        words.extend_from_slice(&[0x7a000004, 1, 0xd0, 0, 0, 0]);
+    }
+    words.extend_from_slice(&[
+        0x7a000204,
+        0x101010a1,
+        0,
+        0,
+        0,
+        0,
+        0x7a000004,
+        0x01104080,
+        image + BREADCRUMB as u32,
+        0,
+        seq,
+        0,
+        0x01000000,
+        0x04000001,
+        0x02800000,
+    ]);
+    if words.len() % 2 != 0 {
+        words.push(0);
+    }
+    words
 }
 
 fn context_image(image: &impl GpuBacking, platform: GtPlatform, ring: u32) {

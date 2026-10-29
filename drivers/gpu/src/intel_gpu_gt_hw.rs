@@ -241,6 +241,9 @@ impl HardwareInit {
                 // Xe-LPG PAT3: WB L4, one-way coherent. PAT0, used by the
                 // inherited display, is deliberately not redefined.
                 mmio.write32(0x480c, 2);
+                // xe_pat.c: PAT2 is UC. Non-snooping Xe-LPG PPGTT walks
+                // use this policy independently of coherent WB leaf BOs.
+                mmio.write32(0x4808, 0xc);
                 let global = [
                     0, 0x100, 0x100, 0x10c, 0x100, 0x10c, 0x100, 0x10c, 0x100, 0x10c, 0x100, 0x100,
                     0x100, 0x100, 0x104, 0x100,

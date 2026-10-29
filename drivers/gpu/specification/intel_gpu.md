@@ -1529,7 +1529,8 @@ the physical service retains its runtime-PM references.
 `intel_gpu_gt_hw` adds capability-invoked MMIO, render-well wake and bounded
 initial GuC/full-engine quiescence before PAT/MOCS programming. Staged physical
 allocations reserve frames/VA without writing inherited GGTT entries. Installed
-policies use MTL PAT3, DG2 PAT0 and BMG PAT2; MTL display PAT0 is preserved.
+policies use MTL PAT3, DG2 PAT0 and BMG PAT2; MTL also installs UC PAT2 for
+non-leaf PPGTT reads. MTL display PAT0 is preserved.
 MCR steering is serialized and restored, and BMG PTE writes drain the G-unit.
 
 `intel_gpu_gt_runtime` starts a persistent per-function owner from Stage::Late,
@@ -1548,8 +1549,9 @@ reloads/authenticates with LiteRestore, and enables coherent CT. Autonomous
 engine reset is disabled while the golden image is unprimed. The scheduler
 owns HWS plus a distinct LRC and 8-KiB ring for each of at most 64 kernel probe
 contexts. MTL/DG2 use 14-page LRCs, BMG four pages, with Xe register-state groups.
-Only fixed owned breadcrumb commands are admitted; no user commands or PPGTT
-enter this interface.
+The original safe submission entry admits a fixed owned GGTT breadcrumb.
+The resident interface below adds trusted kernel PPGTT work; user commands
+remain unavailable.
 
 `intel_gpu_guc_sched` sends GGTT invalidation, context registration, policy,
 enable, disable and deregistration through real CT rings. Full rings retry
@@ -1561,6 +1563,29 @@ leaves the context owned. Uncertain jobs survive until GuC reset/DMA idle plus
 GRDOM_FULL; then fences report Reset and render/GT wake releases are acknowledged.
 The service logs startup success only after its hardware probe retires. The
 async `kernel_probe(card)` API queues another owned context on that function.
+
+The same owner now accepts trusted kernel resident PPGTT batches through
+unsafe `submit_kernel_batch`; user commands remain gated. `prepare_for_gt`
+selects the installed WB leaf policy (MTL/Arrow PAT3, DG2 PAT0, BMG PAT2).
+MTL/Arrow non-leaf entries and PDP0/PTBP use a separately installed UC PAT2;
+DG2/BMG retain their WB policy for those entries. Every immutable table
+and BO is cache-cleaned before context registration; Xe-LPG's non-coherent
+table walker cannot observe dirty CPU cache lines. Registration sets PPGTT
+mode and the kernel ring uses PPGTT batch start, preparser/TLB/cache
+invalidation, MTL AuxCCS invalidation, DG2 depth-flush workaround, render-cache
+drain and a separate GGTT post-sync fence. The submitted tail, deregistration
+and final invalidation must all agree before tables and BOs are released and
+the terminal fence is published. Uncertain residency survives until full reset.
+
+`submit_ppgtt_probe` / async `kernel_ppgtt_probe(card)` provide a safe fixed
+kernel diagnostic with unexported code/result BOs at two separate 48-bit
+addresses. After completion `PpgttProbeResult::verify` checks the stored value,
+every guard byte and the unchanged code page. Startup runs this after the
+original GGTT probe before reporting readiness. Native Rust models walk the
+real production tables, check literal command/PAT vectors, execute the store
+through translated physical pages and verify retirement/reset ownership.
+Golden/default 3D state, engine workarounds and isolated userspace scheduling
+remain prerequisites for EXECBUFFER2 and Mesa acceptance.
 
 `intel_gpu_topology::GtTopology` reads main-GT geometry/compute DSS and EU fuses
 after initial quiescence, with two matching samples and current wake checks
@@ -1621,8 +1646,10 @@ and real Mesa acceptance remain outstanding.
 
 The memory audit corrected previous x86-like GPU PTE assumptions. Gen12
 PPGTT PAT bits are 3,4,7 and Xe-LPG adds bit62; Xe-LPG GGTT uses bits52,53.
-Gen12 system GGTT has no PAT bits. Intermediate PPGTT entries include RW;
-context PDP0 holds a raw physical address. No GPU NX/LRU permission is claimed.
+Gen12 system GGTT has no PAT bits. Intermediate PPGTT entries include RW and
+their independent two-bit PAT policy. The legacy Gen12 attachment keeps its
+raw-root contract; GuC PDP0/PTBP uses a complete encoded descriptor.
+No GPU NX/LRU permission is claimed.
 The common physical range is conservatively bounded to 46 bits. PAT numeric
 indices do not define cache policy: physical startup now programs the owned
 GGTT policy; userspace PPGTT policy/state admission remains separate work.
@@ -1654,12 +1681,32 @@ checkout at `b90c984d615e8ce2af96f5b1411a962d83fed2ad`: MIT-licensed
 `include/drm/intel/pciids.h`, `drivers/gpu/drm/xe/{xe_uc_fw.c,xe_guc.c,xe_wopcm.c,
 xe_guc_ads.c,xe_guc_fwif.h,xe_guc_tlb_inval.c,xe_ggtt.c,xe_force_wake.c,
 xe_guc_hwconfig.c,xe_mocs.c,xe_pat.c,xe_gt_mcr.c,xe_bo.c,xe_lrc.c,
-xe_hw_engine.c,xe_guc_submit.c,xe_gt_topology.c}`,
+xe_hw_engine.c,xe_guc_submit.c,xe_gt_topology.c,xe_vm.c,xe_ring_ops.c}`,
 `drivers/gpu/drm/i915/gt/{uc/intel_guc_hwconfig.c,intel_sseu.c}`,
 `drivers/gpu/drm/i915/i915_query.c`, `include/uapi/drm/i915_drm.h` and
-`drivers/gpu/drm/xe/regs/{xe_guc_regs.h,xe_gt_regs.h,xe_irq_regs.h}` and the
+`drivers/gpu/drm/xe/regs/{xe_guc_regs.h,xe_gt_regs.h,xe_irq_regs.h,xe_lrc_layout.h}`,
+`drivers/gpu/drm/xe/instructions/{xe_mi_commands.h,xe_gpu_commands.h}` and the
 GuC actions/KLV/CSS ABI headers. Native Rust models pin register/ADS values,
 reset/DMA/full-engine stop proofs, cache-policy publication, current authority,
 two-context execution, 64-context pressure/CT backpressure, context retirement,
 allocation rollback, coherence refusal and per-card query lifetime. These tests
 do not establish firmware boot or context execution on Intel silicon.
+
+### Remaining accelerated-driver completion work
+
+Continue these dependencies on the current Intel branch. Existing native
+models and kernel diagnostics are implementation checkpoints, not physical
+acceptance or a claim of complete acceleration.
+
+| Area | Current checkpoint | Still required |
+| --- | --- | --- |
+| GuC execution | Owned RCS0 GGTT and private PPGTT kernel jobs on MTL/Arrow, DG2 and BMG | Primed default/golden contexts, complete GT/engine/context workarounds and isolated user state |
+| Render UAPI | Per-open GEM, VM/context namespaces, topology/HWCONFIG and softpin admission | EXECBUFFER2 dispatch, busy/wait/domain synchronization, implicit and explicit fences, context loss/banning and recovery |
+| Engines and platforms | Main-GT DSS/EU discovery and RCS0 kernel scheduling; separate Gen12 foundations | Fused engine/cache/media inventory, compute/copy/media submission and independently sourced profiles for other IP |
+| Memory and presentation | Owned system RAM, private tables and same-card CPU PRIME mappings | Local VRAM, accelerated PRIME/presentation and GPU/KMS synchronization |
+| Display | Gen12 paths and owned Xe-LPG internal-panel modeset | Xe-LPG external-display admission, Arc display and platform-specific feature qualification |
+| Power and faults | Bounded polling, D0/wake ownership and verified full-reset teardown | IRQ delivery, recoverable engine faults/resubmission and safe runtime autosuspend |
+| Acceptance | Native register/CT/page-walk and ownership models on both kernel architectures | Intel silicon execution, suspend/resume and Mesa OpenGL/Vulkan interoperability |
+
+Graphics APIs, shader compilation and application state generation belong in
+userspace; the kernel must supply the supported execution and memory contracts.

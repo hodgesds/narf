@@ -166,6 +166,18 @@ submitted root and all leaf objects stay pinned across fd/handle close,
 preemption and wait cancellation. A completed resident context's image root
 is cleared before releasing its page tables.
 
+`ExecRequest::prepare_for_gt(platform)` selects the physical GT's established
+system-memory WB PAT for leaves: MTL/Arrow uses 3, DG2 uses 0 and BMG uses 2.
+MTL/Arrow non-leaf entries and PDP0/PTBP use the separately installed UC PAT2;
+DG2 and BMG use their WB policy for non-leaves too. `Ppgtt::with_table_pat` admits only the two-bit
+non-leaf PAT field; `root_descriptor` includes PRESENT|RW and PAT, independently
+of the raw root physical address. Invalid policy fails before allocation.
+The immutable table pages and all resident BOs are explicitly cache-cleaned
+before hardware publication, including the legacy Gen12 resident path. This
+is required for Xe-LPG's non-snooping page-table reads. The CPU must not modify
+published pages until terminal completion; one-time cleaning is not live
+coherence for mutable tables.
+
 Gen12 render breadcrumbs drain HDC, tile, render, depth and data caches with
 CS/depth stalls, then publish a separate GGTT QW post-sync breadcrumb. XCS uses
 MI_FLUSH_DW instead of render-only PIPE_CONTROL. Ring tails stay qword aligned;
@@ -197,7 +209,7 @@ generation belong in userspace.
 `intel_gpu_gtt::PteFormat` distinguishes Gen12 and Xe-LPG GPU encodings:
 PPGTT PAT[2:0] occupy bits 7,4,3; Xe-LPG adds PAT3 at bit62. Gen12 system GGTT
 entries have no PAT bits; Xe-LPG GGTT PAT[1:0] occupy bits53:52. Intermediate
-PPGTT entries carry PRESENT|RW. There is no CPU-style NX/LRU encoding. The
+PPGTT entries carry PRESENT|RW and PAT[1:0] in bits4:3. There is no CPU-style NX/LRU encoding. The
 common supported physical field is bits45:12, with 4-KiB system pages only.
 `encode_engine_pte` and `Ppgtt::map` now take **writable**, replacing the previous
 incorrect executable/NX contract. `Ppgtt::with_format`/`map_with_pat` expose
@@ -336,7 +348,8 @@ initialization succeeds. The physical owner acquires render kernel wake at
 GRDOM_FULL before changing cache policy or publishing new mappings.
 
 The owned system-memory policies are MTL PAT3=2, DG2 PAT0=3 and BMG PAT2=0xf,
-with their source-defined MOCS/LNCF tables. MTL leaves inherited display PAT0
+with their source-defined MOCS/LNCF tables. MTL additionally installs UC PAT2=0xc
+for non-leaf PPGTT reads, and leaves inherited display PAT0
 unchanged. MCR multicast writes preserve the selector and use the hardware
 steering semaphore where required; no await occurs while holding it. Only
 successful installation creates `CachePolicy`, which authorizes staged PTEs
@@ -363,8 +376,32 @@ contexts, each with its own coherent 8-KiB ring and 14-page MTL/DG2 or 4-page
 BMG LRC. Literal register-state groups follow the platform's Xe LRC layout.
 `GuCGt::submit_kernel_probe` and async `intel_gpu_gt_runtime::kernel_probe(card)`
 return a completion fence for a fixed owned command stream that writes its
-context ID to its own breadcrumb. They accept no user GPU instructions,
-external addresses or PPGTT. IDs are never reused within a GT lifetime.
+context ID to its own breadcrumb. They accept no user GPU instructions or
+external addresses. IDs are never reused within a GT lifetime.
+
+`GuCGt::submit_kernel_batch` consumes a `ResidentBatch` prepared for that exact
+GT profile. This is an unsafe trusted-kernel interface: all instructions and
+nested batches must be trusted, access only resident mappings, return with
+BB_END and leave global/transport/context/ring state and completion evidence
+untouched, with no CPU/user/peer writes to any resident
+BO before terminal completion. It does not establish userspace 3D state or
+isolation. Each context retains its private tables and objects through stop,
+waiter cancellation and failures. Registration selects PPGTT (descriptor bit8),
+PDP0/PTBP receives the full root descriptor, and MI_BATCH_BUFFER_START selects
+PPGTT. The ring brackets execution with preparser/TLB/cache invalidation,
+MTL AuxCCS invalidation or DG2's extra depth flush as applicable, and a full
+render-cache drain before the separate GGTT post-sync breadcrumb. Retirement
+checks the submitted tail, not a fixed probe size; all residency is dropped
+before the terminal fence is signalled.
+
+`GuCGt::submit_ppgtt_probe` and async `kernel_ppgtt_probe(card)` construct a
+fixed store batch with private, unexported read-only code and writable result
+BOs at separate 48-bit GPU addresses. `PpgttProbeSubmission` returns its context
+ID, completion fence and read-only `PpgttProbeResult`; `verify()` checks the
+entire result and unchanged code pages after successful completion. Physical
+startup requires both the original GGTT probe and this PPGTT probe to retire
+and validate before logging readiness. User EXECBUFFER2 remains unavailable
+pending default LRC state, workarounds, isolation and synchronization.
 
 Before context registration and after deregistration, a heavy GuC GGTT TLB
 invalidation (0x7000, operation 0x80000003) requires its matching 0x7001 cookie.

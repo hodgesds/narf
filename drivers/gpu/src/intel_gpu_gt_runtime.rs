@@ -40,6 +40,7 @@ enum Phase {
     Reloading,
     Ct,
     Probe,
+    PpgttProbe,
     Running,
     Stopped,
     Failed,
@@ -50,6 +51,7 @@ struct State {
     gt: Option<ProductionGt>,
     firmware: Option<GuCFirmware>,
     probe: Option<Arc<CompletionFence>>,
+    probe_result: Option<crate::intel_gpu_exec::PpgttProbeResult>,
     phase: Phase,
     saved: Option<narf_bus::pci::SavedPciConfig>,
     power_ready: u64,
@@ -137,6 +139,7 @@ pub(crate) fn start_pending() {
                 gt: None,
                 firmware: None,
                 probe: None,
+                probe_result: None,
                 phase: Phase::Cold,
                 saved: None,
                 power_ready: 0,
@@ -345,10 +348,26 @@ impl Owner {
             (Phase::Probe, GtState::SchedulingReady) => {
                 if let Some(result) = state.probe.as_ref().expect("owned probe").result() {
                     result.map_err(|_| RuntimeError::State)?;
+                    let probe = gt.submit_ppgtt_probe(now).map_err(RuntimeError::Gt)?;
+                    state.probe = Some(probe.completion);
+                    state.probe_result = Some(probe.result);
+                    state.phase = Phase::PpgttProbe;
+                }
+            }
+            (Phase::PpgttProbe, GtState::SchedulingReady) => {
+                if let Some(result) = state.probe.as_ref().expect("owned PPGTT probe").result() {
+                    result.map_err(|_| RuntimeError::State)?;
+                    state
+                        .probe_result
+                        .as_ref()
+                        .expect("owned result")
+                        .verify()
+                        .map_err(|_| RuntimeError::State)?;
+                    state.probe_result = None;
                     state.phase = Phase::Running;
                     log(
                         self.pending.index,
-                        "GuC ready; kernel context execution and deregistration verified",
+                        "GuC ready; kernel context, private PPGTT store and retirement verified",
                     );
                 }
             }
@@ -483,6 +502,7 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             }
             state.phase = Phase::Cold;
             state.probe = None;
+            state.probe_result = None;
             state.saved = None;
             self.suspended.store(false, Ordering::Release);
             Ok(())
@@ -510,6 +530,30 @@ pub async fn kernel_probe(index: u32) -> Result<Arc<CompletionFence>, RuntimeErr
         .ok_or(RuntimeError::State)?
         .submit_kernel_probe(narf_time::monotonic_ns())
         .map(|(_, completion)| completion)
+        .map_err(RuntimeError::Gt)
+}
+
+/// Queue the fixed private-address-space store probe on this PCI function.
+/// Wait for completion before checking `result.verify()`. Cancelling the
+/// waiter or dropping the result retains the scheduler's complete residency.
+pub async fn kernel_ppgtt_probe(
+    index: u32,
+) -> Result<crate::intel_gpu_exec::PpgttProbeSubmission, RuntimeError> {
+    let owner = OWNERS
+        .lock()
+        .iter()
+        .find(|o| o.pending.index == index)
+        .cloned()
+        .ok_or(RuntimeError::Device)?;
+    let mut state = owner.state.lock().await;
+    if state.phase != Phase::Running || owner.suspended.load(Ordering::Acquire) {
+        return Err(RuntimeError::State);
+    }
+    state
+        .gt
+        .as_mut()
+        .ok_or(RuntimeError::State)?
+        .submit_ppgtt_probe(narf_time::monotonic_ns())
         .map_err(RuntimeError::Gt)
 }
 

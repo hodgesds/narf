@@ -22,7 +22,7 @@
 //! GGTT system memory      physical | PRESENT    + PAT[1:0] in bits53:52
 //! PPGTT 4KiB system       PRESENT, RW,           + PAT[3] in bit62
 //!                         PAT[2:0] in bits7,4,3
-//! PPGTT intermediate      physical | PRESENT | RW
+//! PPGTT intermediate      physical | PRESENT | RW | PAT[1:0] in bits4:3
 //! ```
 //!
 //! This implementation uses the common physical-address field 45:12 and
@@ -226,8 +226,56 @@ pub fn encode_engine_pte(phys: u64, pat: PatSlot, writable: bool) -> Result<u64,
 /// PPGTT intermediate entry: physical address, PRESENT and RW. The
 /// default page-directory cache policy is PAT index zero.
 pub fn encode_table_entry(next_level_phys: u64) -> Result<u64, GttError> {
+    encode_table_entry_with_pat(next_level_phys, 0)
+}
+
+/// Linux xe_vm.c::xelp_pde_encode_bo: non-leaf nodes and the context's
+/// PDP4 descriptor have only two PAT bits, independently of leaf policy.
+pub fn encode_table_entry_with_pat(next_level_phys: u64, pat: u8) -> Result<u64, GttError> {
     validate_phys(next_level_phys)?;
-    Ok(PTE_PRESENT | PTE_RW | next_level_phys)
+    if pat > 3 {
+        return Err(GttError::InvalidPatIndex);
+    }
+    Ok(PTE_PRESENT | PTE_RW | next_level_phys | ((pat as u64 & 3) << 3))
+}
+
+/// Publish immutable system pages before a GPU page walk or batch fetch.
+/// In particular, Xe-LPG table reads do not snoop CPU caches (xe_bo.c).
+/// Callers must keep all pages owned and prevent CPU writes until retirement.
+pub(crate) fn publish_system_pages<'a>(
+    pages: impl Iterator<Item = &'a narf_memory::frame::PhysFrame>,
+) -> bool {
+    use core::sync::atomic::{compiler_fence, fence, Ordering};
+    compiler_fence(Ordering::SeqCst);
+    #[cfg(target_arch = "x86_64")]
+    let line = {
+        let caps = narf_arch::x86_64::cache::caps();
+        let line = caps.line_bytes as usize;
+        if !caps.clflush || !line.is_power_of_two() || line > 4096 {
+            return false;
+        }
+        line
+    };
+    for frame in pages {
+        let base = frame.start_address().kernel_ptr::<u8>();
+        #[cfg(target_arch = "x86_64")]
+        for offset in (0..4096usize).step_by(line) {
+            compiler_fence(Ordering::SeqCst);
+            // SAFETY: callers supply their owned, direct-mapped physical pages;
+            // CLFLUSH support and the cache-line stride were checked above.
+            unsafe { narf_arch::x86_64::cache::clflush(base.add(offset)) };
+            compiler_fence(Ordering::SeqCst);
+        }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: the caller owns the entire mapped page.
+        unsafe {
+            narf_arch::aarch64::cache::clean_inval_to_poc(base as usize, 4096);
+        }
+        narf_scheduler::sleep_pumps::run();
+    }
+    fence(Ordering::SeqCst);
+    compiler_fence(Ordering::SeqCst);
+    true
 }
 
 /// Decode the phys-address portion of an existing PTE.

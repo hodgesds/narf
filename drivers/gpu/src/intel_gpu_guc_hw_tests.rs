@@ -322,7 +322,9 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
             0x4502 => {
                 assert_eq!(&request[1..10], &[1, request[2], 0, 1, 0, 0, 0, 0, 0]);
                 assert_eq!(request.len(), 12);
-                assert_eq!(request[10] & 0xfff, 0x19);
+                assert!(matches!(request[10] & 0xfff, 0x19 | 0x119));
+                let image = w.0.borrow().memory[&(request[10] & !0xfff)].clone();
+                assert_eq!(image.borrow()[1024 + 0x33] != 0, request[10] & 0x100 != 0);
                 assert_eq!(request[11], 0);
                 assert!(registered
                     .insert(request[2], request[10] & !0xfff)
@@ -343,9 +345,10 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                     {
                         let data = image.borrow();
                         assert_eq!(
-                            &data[1024..1033],
-                            &[0, 0x1108101d, 0x2244, 0x00090009, 0x2034, 0, 0x2030, 32, 0x2038]
+                            &data[1024..1031],
+                            &[0, 0x1108101d, 0x2244, 0x00090009, 0x2034, 0, 0x2030]
                         );
+                        assert_eq!(data[1032], 0x2038);
                         assert_eq!(data[1024 + 33], 0x11081011);
                         assert_eq!(data[1024 + 65], 0x11080001);
                         assert_eq!(data[1024 + 68], 0x05000001);
@@ -355,22 +358,27 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                     }
                     assert!(d.synced.contains(&ring_base));
                     let ring = d.memory[&ring_base].borrow();
-                    assert_eq!(
-                        &ring[..8],
-                        &[
-                            0x04000001,
-                            0,
-                            0x10400002,
-                            base + 0x800,
-                            0,
-                            id,
-                            0x01000000,
-                            0
-                        ]
-                    );
-                    assert_eq!(image.borrow()[1024 + 7], 32);
+                    let tail = image.borrow()[1024 + 7];
+                    if image.borrow()[1024 + 0x33] != 0 {
+                        execute_ppgtt_probe(w, &image.borrow(), &ring, id, base);
+                    } else {
+                        assert_eq!(
+                            &ring[..8],
+                            &[
+                                0x04000001,
+                                0,
+                                0x10400002,
+                                base + 0x800,
+                                0,
+                                id,
+                                0x01000000,
+                                0
+                            ]
+                        );
+                        assert_eq!(tail, 32);
+                    }
                     image.borrow_mut()[0x800 / 4] = id;
-                    image.borrow_mut()[1024 + 5] = 32;
+                    image.borrow_mut()[1024 + 5] = tail;
                 }
                 event(&memory, 0x1002, &[id, request[2]]);
             }
@@ -383,6 +391,255 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
     }
     actions
 }
+
+// Independent fixed-command device model. It follows the actual production
+// table pages, verifies their PAT/permissions, fetches the private batch via
+// four hardware-style reads and writes the translated destination page.
+fn execute_ppgtt_probe(w: &Window, image: &[u32], ring: &[u32], id: u32, base: u32) {
+    let pat = if w.0.borrow().regs.get(&0x480c) == Some(&2) {
+        3
+    } else if w.0.borrow().regs.get(&0x4808) == Some(&0xf) {
+        2
+    } else {
+        0
+    };
+    let table_pat = if pat == 3 {
+        assert_eq!(w.0.borrow().regs.get(&0x4808), Some(&0xc));
+        2
+    } else {
+        pat
+    };
+    let root = (u64::from(image[1024 + 0x31]) << 32) | u64::from(image[1024 + 0x33]);
+    assert_eq!(root & 0xfff, 3 | table_pat << 3);
+    let walk = |va: u64, writable: bool| -> u64 {
+        let mut page = root & 0x0000_3fff_ffff_f000;
+        for shift in [39, 30, 21, 12] {
+            let address = narf_memory::PhysAddr::new(page).kernel_ptr::<u64>();
+            // SAFETY: this fixture built and retains all four physical tables;
+            // the independent walk never uses an external/raw user pointer.
+            let entry =
+                unsafe { core::ptr::read_volatile(address.add(((va >> shift) & 511) as usize)) };
+            assert_eq!(entry & 1, 1);
+            assert_eq!(
+                entry & 0x18,
+                (if shift == 12 { pat } else { table_pat }) << 3
+            );
+            assert_eq!(entry & 2 != 0, shift != 12 || writable);
+            page = entry & 0x0000_3fff_ffff_f000;
+        }
+        page | (va & 4095)
+    };
+    let mut expected = alloc::vec![0x04000001, 0x02800101, 0x7a000404, 0x20344c1c, 0xd0, 0, 0, 0,];
+    if pat == 3 {
+        expected.extend_from_slice(&[0x11020001, 0x4208, 1, 0]);
+    }
+    expected.extend_from_slice(&[0x02800100, 0x18800101, 0, 0x1234, 0x04000000]);
+    if pat == 0 {
+        expected.extend_from_slice(&[0x7a000004, 1, 0xd0, 0, 0, 0]);
+    }
+    expected.extend_from_slice(&[
+        0x7a000204,
+        0x101010a1,
+        0,
+        0,
+        0,
+        0,
+        0x7a000004,
+        0x01104080,
+        base + 0x800,
+        0,
+        id,
+        0,
+        0x01000000,
+        0x04000001,
+        0x02800000,
+    ]);
+    assert_eq!(image[1031] as usize, expected.len() * 4);
+    assert_eq!(&ring[..expected.len()], expected.as_slice());
+    // Literal batch from xe_mi_commands.h, independent of the producer's codec.
+    let code = narf_memory::PhysAddr::new(walk(0x1234_0000_0000, false)).kernel_ptr::<u32>();
+    for (i, word) in [0x10000002, 0x80, 0x2345, 0x4e415246, 0x05000000, 0]
+        .into_iter()
+        .enumerate()
+    {
+        // SAFETY: translated page is owned by the resident fixture.
+        assert_eq!(unsafe { core::ptr::read_volatile(code.add(i)) }, word);
+    }
+    let target = narf_memory::PhysAddr::new(walk(0x2345_0000_0080, true)).kernel_mut_ptr::<u32>();
+    // SAFETY: the validated writable leaf is an owned private result page.
+    unsafe { core::ptr::write_volatile(target, 0x4e415246) };
+}
+
+fn smoke_hardware_ppgtt_store_and_retirement() -> TestResult {
+    for (platform, ack) in [
+        (
+            GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
+            0xdfc,
+        ),
+        (GtPlatform::Alchemist, 0x130044),
+        (GtPlatform::Battlemage, 0xdfc),
+    ] {
+        let (w, arena, mut gt) = hardware_model(platform, ack);
+        hardware_discovery(&mut gt, &w, ack);
+        hardware_scheduling(&mut gt, &w);
+        let count = arena.live_allocations();
+        let probe = gt.submit_ppgtt_probe(26).unwrap();
+        assert!(probe.result.verify().is_err());
+        let weak = probe.result.weak_objects();
+        assert!(weak.iter().all(|o| o.strong_count() == 2));
+        let mut registered = BTreeMap::new();
+        for now in 27..48 {
+            assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+            service_contexts(&w, &mut registered, true);
+            if probe.completion.result().is_some() {
+                break;
+            }
+        }
+        assert_eq!(probe.completion.result(), Some(Ok(())));
+        assert_eq!(probe.result.verify(), Ok(()));
+        assert_eq!(arena.live_allocations(), count);
+        assert!(weak.iter().all(|o| o.strong_count() == 1));
+        drop(probe);
+        assert!(weak.iter().all(|o| o.upgrade().is_none()));
+        hardware_stop(&mut gt, &w, ack);
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_ppgtt_store_and_retirement
+);
+
+fn smoke_hardware_ppgtt_cancel_and_reset() -> TestResult {
+    let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
+    hardware_discovery(&mut gt, &w, 0xdfc);
+    hardware_scheduling(&mut gt, &w);
+    let probe = gt.submit_ppgtt_probe(26).unwrap();
+    let weak = probe.result.weak_objects();
+    let completion = probe.completion.clone();
+    // Dropping the result and cancelling a waiter never abandons DMA owners.
+    {
+        use core::{
+            future::Future,
+            task::{Context, Waker},
+        };
+        let mut wait = core::pin::pin!(completion.wait());
+        assert!(wait
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    drop(probe);
+    let mut registered = BTreeMap::new();
+    for now in 27..32 {
+        assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+        service_contexts(&w, &mut registered, false);
+    }
+    let count = arena.live_allocations();
+    assert!(weak.iter().all(|o| o.strong_count() == 1));
+    assert!(matches!(
+        gt.poll(5_000_000_026),
+        Poll::Ready(Err(GtError::Scheduling(_)))
+    ));
+    assert!(completion.result().is_none());
+    gt.begin_stop(10_000_000_000).unwrap();
+    reset_done(&w);
+    w.0.borrow_mut().regs.insert(0xc314, 0);
+    assert!(gt.poll(10_000_000_001).is_pending());
+    assert_eq!(gt.state(), GtState::ResettingEngines);
+    assert_eq!(arena.live_allocations(), count);
+    assert!(weak.iter().all(|o| o.strong_count() == 1));
+    assert!(gt.poll(10_000_000_002).is_pending());
+    reset_done(&w);
+    assert!(gt.poll(10_000_000_003).is_pending());
+    assert_eq!(
+        completion.result(),
+        Some(Err(crate::intel_gpu_fence::JobError::Reset))
+    );
+    assert!(weak.iter().all(|o| o.upgrade().is_none()));
+    w.0.borrow_mut().regs.insert(0xd84, 0);
+    assert!(gt.poll(10_000_000_004).is_pending());
+    w.0.borrow_mut().regs.insert(0xdfc, 0);
+    assert_eq!(gt.poll(10_000_000_005), Poll::Ready(Ok(GtState::Stopped)));
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_ppgtt_cancel_and_reset
+);
+
+fn smoke_hardware_ppgtt_admission_and_lost_proof() -> TestResult {
+    use crate::{intel_gpu_exec::PpgttProbeResult, intel_gpu_guc_sched::SchedulingError};
+    let (w, arena, mut gt) = hardware_model(GtPlatform::Alchemist, 0x130044);
+    hardware_discovery(&mut gt, &w, 0x130044);
+    hardware_scheduling(&mut gt, &w);
+    let count = arena.live_allocations();
+    let (batch, result) = PpgttProbeResult::prepare(GtPlatform::Battlemage).unwrap();
+    let foreign = result.weak_objects();
+    // SAFETY: this is the fixed, private kernel probe; the mismatch must fail
+    // before publication and release its private page-table residency.
+    let admission = unsafe { gt.submit_kernel_batch(26, batch) };
+    assert!(matches!(
+        admission,
+        Err(GtError::Scheduling(SchedulingError::Address))
+    ));
+    assert_eq!(arena.live_allocations(), count);
+    assert!(foreign.iter().all(|o| o.strong_count() == 1));
+    drop(result);
+    assert!(foreign.iter().all(|o| o.upgrade().is_none()));
+    let probe = gt.submit_ppgtt_probe(26).unwrap();
+    let weak = probe.result.weak_objects();
+    let completion = probe.completion.clone();
+    drop(probe);
+    let mut registered = BTreeMap::new();
+    // Reach disable acknowledgment, before consuming deregistration.
+    for now in 27..34 {
+        assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+        service_contexts(&w, &mut registered, true);
+        if let Some(base) = registered.values().next() {
+            let image = w.0.borrow().memory[base].clone();
+            if image.borrow()[0x800 / 4] != 0 {
+                // Corrupt only the saved head after device completion. The
+                // breadcrumb and GuC ACK still cannot authorize retirement.
+                image.borrow_mut()[1024 + 5] = 0;
+                break;
+            }
+        }
+    }
+    let mut lost = false;
+    for now in 34..45 {
+        match gt.poll(now) {
+            Poll::Ready(Err(GtError::Scheduling(SchedulingError::Protocol))) => {
+                lost = true;
+                break;
+            }
+            Poll::Ready(Ok(GtState::SchedulingReady)) => {
+                service_contexts(&w, &mut registered, false);
+            }
+            other => panic!("unexpected retirement state {other:?}"),
+        }
+    }
+    assert!(lost);
+    assert!(completion.result().is_none());
+    assert!(weak.iter().all(|o| o.strong_count() == 1));
+    hardware_stop(&mut gt, &w, 0x130044);
+    assert_eq!(
+        completion.result(),
+        Some(Err(crate::intel_gpu_fence::JobError::Reset))
+    );
+    assert!(weak.iter().all(|o| o.upgrade().is_none()));
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_ppgtt_admission_and_lost_proof
+);
 
 fn smoke_hardware_gt_reload_and_context_execution() -> TestResult {
     for (platform, ack) in [

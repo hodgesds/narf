@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 use narf_filesystem::{FsError, IoctlContext};
 
 use crate::intel_gpu_gem::{GemObject, GemState};
+use crate::intel_gpu_gt::GtPlatform;
 use crate::intel_gpu_gtt::PteFormat;
 use crate::intel_gpu_ppgtt::{FramePtMemory, Ppgtt, PpgttError, WalkOutcome};
 use crate::intel_gpu_uapi::{self as abi, u32_at, u64_at};
@@ -39,6 +40,30 @@ impl ExecRequest {
     /// Freeze a validated request into one owned batch. Revalidate even when
     /// the request was constructed by a kernel caller rather than `read`.
     pub fn prepare(&self, format: PteFormat, pat_index: u8) -> Result<ResidentBatch, FsError> {
+        self.prepare_inner(format, pat_index, 0, None)
+    }
+
+    /// System-memory WB leaves with the independently installed non-leaf
+    /// policy, also used by PDP0/PTBP (xe_vm.c, xe_pat.c).
+    pub fn prepare_for_gt(&self, platform: GtPlatform) -> Result<ResidentBatch, FsError> {
+        let (format, pat, table_pat) = match platform {
+            GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => {
+                (PteFormat::XeLpg, 3, 2)
+            }
+            GtPlatform::Alchemist => (PteFormat::Gen12, 0, 0),
+            GtPlatform::Battlemage => (PteFormat::XeLpg, 2, 2),
+            _ => return Err(FsError::NotImplemented),
+        };
+        self.prepare_inner(format, pat, table_pat, Some(platform))
+    }
+
+    fn prepare_inner(
+        &self,
+        format: PteFormat,
+        pat_index: u8,
+        table_pat: u8,
+        platform: Option<GtPlatform>,
+    ) -> Result<ResidentBatch, FsError> {
         if self.objects.is_empty()
             || self.objects.len() > MAX_OBJECTS
             || self.objects.iter().any(|entry| {
@@ -71,8 +96,9 @@ impl ExecRequest {
             return Err(FsError::InvalidData);
         }
         Ok(ResidentBatch {
-            space: self.address_space(format, pat_index)?,
+            space: self.address_space_inner(format, pat_index, table_pat)?,
             format,
+            platform,
             address: self.batch_va,
             length: self.batch_len,
         })
@@ -189,8 +215,17 @@ impl ExecRequest {
     /// failed build drops all table pages; successful ownership includes all
     /// leaf objects and survives GEM_CLOSE or the submitting fd's destruction.
     pub fn address_space(&self, format: PteFormat, pat_index: u8) -> Result<AddressSpace, FsError> {
+        self.address_space_inner(format, pat_index, 0)
+    }
+
+    fn address_space_inner(
+        &self,
+        format: PteFormat,
+        pat_index: u8,
+        table_pat: u8,
+    ) -> Result<AddressSpace, FsError> {
         let mut memory = FramePtMemory::new();
-        let tables = Ppgtt::with_format(&mut memory, format).map_err(map_error)?;
+        let tables = Ppgtt::with_table_pat(&mut memory, format, table_pat).map_err(map_error)?;
         let mut space = AddressSpace {
             tables: Some(tables),
             memory,
@@ -223,6 +258,7 @@ impl ExecRequest {
 pub struct ResidentBatch {
     space: AddressSpace,
     format: PteFormat,
+    platform: Option<GtPlatform>,
     address: u64,
     length: u64,
 }
@@ -239,6 +275,110 @@ impl ResidentBatch {
     }
     pub fn space(&self) -> &AddressSpace {
         &self.space
+    }
+
+    pub(crate) fn platform(&self) -> Option<GtPlatform> {
+        self.platform
+    }
+
+    /// Tables are private and immutable; CPU WB mappings therefore need a
+    /// one-time clean, even on Xe-LPG's non-snooping table walker. The caller
+    /// must also prevent writes to the leaf objects until terminal completion.
+    pub(crate) fn publish_for_device(&self) -> bool {
+        self.space.memory.publish_for_device()
+            && self
+                .space
+                .objects
+                .iter()
+                .all(|object| object.publish_for_device())
+    }
+}
+
+/// Read-only ownership of the private kernel probe's code and result. Neither
+/// object is installed in a GEM namespace, exported or mapped to userspace.
+#[derive(Debug)]
+pub struct PpgttProbeResult {
+    code: Arc<GemObject>,
+    data: Arc<GemObject>,
+}
+
+#[derive(Debug)]
+pub struct PpgttProbeSubmission {
+    pub context_id: u16,
+    pub completion: Arc<crate::intel_gpu_fence::CompletionFence>,
+    pub result: PpgttProbeResult,
+}
+
+const PROBE_CODE: u64 = 0x1234_0000_0000;
+const PROBE_DATA: u64 = 0x2345_0000_0000;
+const PROBE_VALUE: u32 = 0x4e41_5246;
+const PROBE_WORDS: [u32; 6] = [
+    0x10000002, // MI_STORE_DATA_IMM, PPGTT, one dword (xe_mi_commands.h)
+    (PROBE_DATA + 0x80) as u32,
+    ((PROBE_DATA + 0x80) >> 32) as u32,
+    PROBE_VALUE,
+    0x05000000, // MI_BATCH_BUFFER_END
+    0,
+];
+
+impl PpgttProbeResult {
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn weak_objects(&self) -> [alloc::sync::Weak<GemObject>; 2] {
+        [Arc::downgrade(&self.code), Arc::downgrade(&self.data)]
+    }
+
+    pub(crate) fn prepare(platform: GtPlatform) -> Result<(ResidentBatch, Self), FsError> {
+        let gem = GemState::new();
+        let code = gem.object(gem.create(PAGE, |_, _| Ok(()))?)?;
+        let data = gem.object(gem.create(PAGE, |_, _| Ok(()))?)?;
+        for (i, word) in PROBE_WORDS.into_iter().enumerate() {
+            code.write(i as u64 * 4, &word.to_le_bytes())?;
+        }
+        let batch = ExecRequest {
+            context_id: 0,
+            batch_va: PROBE_CODE,
+            batch_len: PROBE_WORDS.len() as u64 * 4,
+            objects: alloc::vec![
+                ExecObject {
+                    object: code.clone(),
+                    va: PROBE_CODE,
+                    writable: false
+                },
+                ExecObject {
+                    object: data.clone(),
+                    va: PROBE_DATA,
+                    writable: true
+                },
+            ],
+        }
+        .prepare_for_gt(platform)?;
+        Ok((batch, Self { code, data }))
+    }
+
+    /// Call after a successful terminal fence. Check the complete destination
+    /// and unchanged code page, including all bytes outside the written word.
+    pub fn verify(&self) -> Result<(), FsError> {
+        let mut bytes = [0; 4096];
+        self.data.read(0, &mut bytes)?;
+        for (i, byte) in bytes.iter().enumerate() {
+            let expected = if (0x80..0x84).contains(&i) {
+                PROBE_VALUE.to_le_bytes()[i - 0x80]
+            } else {
+                0
+            };
+            if *byte != expected {
+                return Err(FsError::InvalidData);
+            }
+        }
+        self.code.read(0, &mut bytes)?;
+        for (i, word) in bytes.chunks_exact(4).enumerate() {
+            if u32::from_le_bytes(word.try_into().expect("dword"))
+                != PROBE_WORDS.get(i).copied().unwrap_or(0)
+            {
+                return Err(FsError::InvalidData);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -270,6 +410,12 @@ pub struct AddressSpace {
 impl AddressSpace {
     pub fn root_phys(&self) -> u64 {
         self.tables.as_ref().expect("owned tables").root_phys()
+    }
+    pub fn root_descriptor(&self) -> u64 {
+        self.tables
+            .as_ref()
+            .expect("owned tables")
+            .root_descriptor()
     }
     pub fn translate(&self, address: u64) -> Result<WalkOutcome, PpgttError> {
         self.tables

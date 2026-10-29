@@ -685,6 +685,8 @@ pub enum SubmitError {
     /// A completion lacked its breadcrumb or saved ring head. Published
     /// objects remain pinned until a hardware owner proves reset complete.
     CompletionLost,
+    /// Owned system pages could not be published to the device cache domain.
+    CacheUnavailable,
 }
 
 // ── GPU-memory backing seam ─────────────────────────────────────
@@ -775,42 +777,7 @@ impl FrameBacking {
     /// After a device write this is valid only if the CPU has not dirtied any
     /// line since the pre-DMA clean. It does not make live CT memory coherent.
     pub(crate) fn publish_for_device(&self) -> bool {
-        compiler_fence(Ordering::SeqCst);
-        #[cfg(target_arch = "x86_64")]
-        {
-            let caps = narf_arch::x86_64::cache::caps();
-            let line = caps.line_bytes as usize;
-            if !caps.clflush || !line.is_power_of_two() || line > 4096 {
-                return false;
-            }
-            for frame in &self.frames {
-                let base = frame.start_address().kernel_ptr::<u8>();
-                for offset in (0..4096usize).step_by(line) {
-                    compiler_fence(Ordering::SeqCst);
-                    // SAFETY: CLFLUSH was checked and this backing owns every
-                    // mapped page; each address stays within its page.
-                    unsafe {
-                        narf_arch::x86_64::cache::clflush(base.add(offset));
-                    }
-                    compiler_fence(Ordering::SeqCst);
-                }
-                narf_scheduler::sleep_pumps::run();
-            }
-        }
-        #[cfg(target_arch = "aarch64")]
-        for frame in &self.frames {
-            // SAFETY: each range is one mapped frame owned by this backing.
-            unsafe {
-                narf_arch::aarch64::cache::clean_inval_to_poc(
-                    frame.start_address().kernel_ptr::<u8>() as usize,
-                    4096,
-                );
-            }
-            narf_scheduler::sleep_pumps::run();
-        }
-        fence(Ordering::SeqCst);
-        compiler_fence(Ordering::SeqCst);
-        true
+        crate::intel_gpu_gtt::publish_system_pages(self.frames.iter())
     }
 
     /// Raw pointer to the dword at `byte_off` inside the backing.
@@ -1672,6 +1639,9 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         let previous = ctx.ppgtt_root;
         if self.ctx_covered(slot) || self.queue.iter().any(|r| r.ctx_slot == slot) {
             return Err(SubmitError::ContextBusy);
+        }
+        if !batch.publish_for_device() {
+            return Err(SubmitError::CacheUnavailable);
         }
         self.attach_ppgtt(id, batch.space().root_phys())?;
         let result = self.submit_inner(id, RequestBatch::Resident(ManuallyDrop::new(batch)), true);

@@ -411,6 +411,60 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             .map_err(GtError::Scheduling)
     }
 
+    /// Queue a trusted kernel PPGTT batch, retaining its tables and every BO
+    /// through verified retirement or full-engine reset.
+    ///
+    /// # Safety
+    /// Every instruction (including nested batches) must be trusted kernel
+    /// code, access only its resident mappings and return with BB_END. It must
+    /// not alter GGTT, page tables, rings, context/transport state or completion
+    /// evidence. No CPU mapping or peer may write the objects before terminal
+    /// completion. Default 3D state/isolation is not established by this API.
+    pub unsafe fn submit_kernel_batch(
+        &mut self,
+        now: u64,
+        batch: crate::intel_gpu_exec::ResidentBatch,
+    ) -> Result<(u16, Arc<crate::intel_gpu_fence::CompletionFence>), GtError> {
+        if self.state != GtState::SchedulingReady {
+            return Err(GtError::State);
+        }
+        if let Err(error) = self.awake() {
+            self.state = GtState::Lost;
+            return Err(error);
+        }
+        // SAFETY: forwarded caller contract; the exclusive GT owns CT/reset.
+        unsafe {
+            self.parts
+                .scheduler
+                .as_mut()
+                .expect("owned scheduler")
+                .submit_resident(now, batch)
+                .map_err(GtError::Scheduling)
+        }
+    }
+
+    /// Exercise two private PPGTT BOs with an owned, fixed kernel store batch.
+    /// The returned result can be checked after its terminal fence succeeds.
+    pub fn submit_ppgtt_probe(
+        &mut self,
+        now: u64,
+    ) -> Result<crate::intel_gpu_exec::PpgttProbeSubmission, GtError> {
+        if self.state != GtState::SchedulingReady {
+            return Err(GtError::State);
+        }
+        let (batch, result) =
+            crate::intel_gpu_exec::PpgttProbeResult::prepare(self.parts.boot.platform())
+                .map_err(|error| GtError::Scheduling(SchedulingError::Residency(error)))?;
+        // SAFETY: both BOs are private, unexported and inaccessible for writes;
+        // only the fixed MI_STORE_DATA_IMM/BB_END stream is executable.
+        let (id, completion) = unsafe { self.submit_kernel_batch(now, batch)? };
+        Ok(crate::intel_gpu_exec::PpgttProbeSubmission {
+            context_id: id,
+            completion,
+            result,
+        })
+    }
+
     /// Full physical-GT startup. The caller retains this owner across every
     /// await, including cancellation or failure; no IRQ-safe guard is held.
     pub async fn start_hardware(&mut self) -> Result<(), GtError>
