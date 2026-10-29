@@ -133,8 +133,8 @@ firmware KLV bytes only after this card's GT publishes a validated snapshot;
 absence returns per-item -ENODEV. Size-only queries never access the data pointer;
 short capacity returns -EINVAL, failed data copies return -EFAULT and later
 items still run. Only the item length is written back. Topology remains
-unavailable. GuC submission-version returns -ENODEV until a scheduling interface
-is installed; the loaded firmware release cannot substitute for that interface
+unavailable. GuC submission-version returns -ENODEV until the userspace scheduling
+interface is admitted; the loaded firmware release cannot substitute for that interface
 version. Submission capabilities and HAS_ALIASING_PPGTT remain zero.
 
 `drm_registry::driver_name` recognizes `intel-gpu` so both primary and render
@@ -187,9 +187,10 @@ owns or cancels the request's residency.
 Raptor Lake and a separate Xe-LPG GuC path for Meteor/Arrow Lake. Panther Lake
 has no submission profile. Existing default RCS/media production attach paths
 admit only Gen12 before any MMIO. A display gate cannot admit a render engine.
-Per-card GuC boot integration/context registration/scheduling, render topology, full context setup,
-hardware reset ownership, accelerated PRIME/KMS integration and Mesa interoperability
-remain required before exposing acceleration. Graphics APIs and shader/state
+The physical GuC path below starts an owned RCS0 kernel context on MTL/Arrow,
+DG2 and BMG. Active render topology, userspace context isolation/state,
+accelerated PRIME/KMS integration and Mesa interoperability remain required
+before exposing acceleration. Graphics APIs and shader/state
 generation belong in userspace.
 
 `intel_gpu_gtt::PteFormat` distinguishes Gen12 and Xe-LPG GPU encodings:
@@ -211,7 +212,10 @@ not establish a fully initialized, isolated or recoverable userspace engine.
 
 `intel_gpu_guc::CssImage::parse` validates CSS, uCode and RSA component ranges,
 required firmware major version, optional complete/truncated key suffix and
-bounded private-data size. It grants no asset authority or signature validity.
+bounded private-data size. It preserves separate release (CSS byte 64) and
+submission-interface (byte 68) versions; scheduling requires interface major 1
+and rejects unknown/unsupported interfaces before engine publication. Parsing
+grants no asset authority or signature validity.
 `CtSender`/`CtReceiver` operate through `CtMemory` over coherent shared memory:
 host/GuC own distinct head/tail fields, with hardware release/acquire barriers
 on every publication. Requests have bounded HXG lengths and source-defined
@@ -279,9 +283,11 @@ concurrent CT coherence. `GpuBacking::coherent_for_device` defaults false.
 `allocate_transport` requires authenticated boot and clones the shared arena/
 MMIO owner into the CT transport; discrete transport construction additionally
 requires a backing that explicitly guarantees coherent shared cache lines.
-The existing WB FrameBacking cannot admit discrete CT. A coherent discrete
-mapping/VRAM allocator, full GT/MOCS/IRQ ownership, active topology and
-submission contexts remain integration requirements.
+Legacy FrameBacking makes no coherence claim. The physical-GT arena below
+admits x86_64 system memory only after installing its platform PAT/MOCS policy;
+Linux's DG2/BMG system-memory contract is CPU-coherent. ARM PCI host-bridge
+coherence is unproven and physical scheduling refuses that backing. Local VRAM
+allocation and active topology remain separate work.
 
 `intel_gpu_guc_gt::GuCGt::stage` owns the staged firmware bootstrap and its
 optional CT transport together. It is an exclusive graphics-GT owner, not a
@@ -304,17 +310,90 @@ or stop. `begin_stop` closes admission first, reasserts a lost wake request
 when registers remain readable, then resets GuC and requires MIA-in-reset
 plus firmware DMA idle. Only that proof retires even partial/poisoned CT
 registrations. It then clears the kernel request and awaits ACK deassertion.
-The stopped owner is terminal; no stale child can restart CT. This proof is
-limited to its GuC bootstrap/CT buffers and does not retire RCS jobs.
+The stopped owner is terminal; no stale child can restart CT. For minimal
+bootstrap/CT owners this proof covers only GuC allocations. A physical owner
+with a scheduler additionally requires the full-engine reset described below
+before releasing contexts or CT.
 
 Drop frees only unpublished or fully stopped GT owners. All other states
 retain the entire allocator/MMIO/bootstrap/CT object graph, preserving the
 wake request while DMA lifetime is uncertain. `release_after_gt_reset` is an
 unsafe escape requiring the PCI owner's external full-reset proof covering
-all owned DMA addresses and the wake request. Runtime idle, per-card probe
-installation, MOCS programming, active topology and GuC context
-scheduling remain separate integration work; this owner does not publish
-userspace engines or enable EXECBUFFER2.
+all owned DMA addresses, engine HWS/LRC references and both graphics-GT and
+render-well kernel wake requests. This owner does not publish userspace engines
+or enable EXECBUFFER2.
+
+`GuCGt::stage_hardware` composes the minimal owner with render-well startup and
+an owned kernel scheduler. `start_hardware().await` performs wake, bootstrap,
+HWCONFIG, scheduling reload and CT enablement; cancellation retains the whole
+transaction with its caller. `intel_gpu_gt_hw::AuthorizedWindow` invokes the
+PCI write capability for every bounded, aligned BAR access. Revocation yields
+unavailable reads and closes admission. A per-function `GgttArena::for_gt`
+reserves CPU frames and GGTT addresses without publishing PTEs until hardware
+initialization succeeds. The physical owner acquires render kernel wake at
+0xa278/ACK 0xd84, proves inherited GuC reset plus DMA idle, then completes
+GRDOM_FULL before changing cache policy or publishing new mappings.
+
+The owned system-memory policies are MTL PAT3=2, DG2 PAT0=3 and BMG PAT2=0xf,
+with their source-defined MOCS/LNCF tables. MTL leaves inherited display PAT0
+unchanged. MCR multicast writes preserve the selector and use the hardware
+steering semaphore where required; no await occurs while holding it. Only
+successful installation creates `CachePolicy`, which authorizes staged PTEs
+and coherent x86_64 backing. `BootAllocator::configure_cache` defaults to
+refusal and applies that proof to each staged backing before publication.
+BMG GGTT writes include Wa_22019338487's G-unit
+drain. GuC host and RCS interrupts are masked for the bounded polling service;
+this path does not install a GuC IRQ handler. Wake/reset/semaphore waits have
+deadlines and async timer/yield progression.
+
+`GuCGt::begin_scheduling` requires awake authenticated Ready, validated HWCONFIG,
+supported submission ABI and no CT. It allocates owned HWS and golden-LRC
+storage, enables RCS0 under both wake holds, then stops GuC before rewriting
+ADS. The reload enables only RCS0, installs engine mapping, HWS/register saves
+and source-defined context sizes, selects LiteRestore and disables autonomous
+engine resets because the golden image is not primed. Firmware is then uploaded
+and authenticated again; ADS is never rewritten while live. GuC GGTT TLB
+invalidation precedes CT registration. `SchedulingReady` gives the scheduler
+exclusive CT receive ownership; raw `send`/`receive` remain limited to CtReady.
+
+`intel_gpu_guc_sched::GuCScheduler` admits at most 64 independent kernel probe
+contexts, each with its own coherent 8-KiB ring and 14-page MTL/DG2 or 4-page
+BMG LRC. Literal register-state groups follow the platform's Xe LRC layout.
+`GuCGt::submit_kernel_probe` and async `intel_gpu_gt_runtime::kernel_probe(card)`
+return a completion fence for a fixed owned command stream that writes its
+context ID to its own breadcrumb. They accept no user GPU instructions,
+external addresses or PPGTT. IDs are never reused within a GT lifetime.
+
+Before context registration and after deregistration, a heavy GuC GGTT TLB
+invalidation (0x7000, operation 0x80000003) requires its matching 0x7001 cookie.
+Scheduling advances REGISTER_CONTEXT, scheduling policy, enable/ACK, execution,
+disable/ACK and deregister/ACK. CT-full leaves the current phase intact for
+retry. An enable ACK cannot signal completion: retirement also requires the
+GPU breadcrumb, saved ring head, matching deregistration ACK and final TLB
+completion. Cancellation removes only fence waiters. Malformed/stale/foreign
+events, timeout or wake loss close admission and retain every uncertain
+context. Stop cancels an in-flight reload, proves GuC reset and firmware DMA
+idle, then completes GRDOM_FULL and rechecks both proofs before releasing
+scheduler/CT storage or signaling pending fences Reset. Render-well sleep ACK
+precedes graphics-GT sleep ACK. A failed stop retains the complete owner.
+
+`intel_gpu_gt_runtime` binds persistent owners to the actual registered card,
+PCI function, current authority, immutable firmware and dedicated arena. The
+Late service validates exact live PCI identity, D0, readable PF registers and
+a bounded acyclic extended-capability chain; enabled SR-IOV VFs are refused.
+Each restart creates a fresh arena/cache-policy proof. MTL/Arrow starts only
+after owned scanout takeover. DG2/BMG register GT-only devices and start only
+when all inherited display planes are disabled; they do not gain display or
+VRAM support. The runtime-PM probe/forbid references hold this function and its
+upstream bridge active; autosuspend is not implemented. Async system-PM
+preparation closes admission, proves stop, saves PCI configuration and reclaims
+stopped mappings in D0. The synchronous device callback only verifies that
+preparation completed and refuses legacy
+synchronous suspend while live. Paired async resume restores D0, configuration
+and any owned display mode, then rebuilds GT state using the retained firmware
+asset. No synchronous bridge waits run inside executor polls. A failed cleanup
+is not retried forever.
+The worker logs execution success only after its kernel probe retires.
 
 `GuCGt::begin_hwconfig` retrieves the firmware HWCONFIG table while GuC is
 `Ready`, before CT owns the graphics MMIO mailbox. It sends GET_HWCONFIG
@@ -348,17 +427,17 @@ not active/fused topology.
 
 `DrmCard::intel_hwconfig` defaults to absence. `IntelGpuCard` owns a private,
 single-publication slot; `publish_gt_hwconfig(&mut GuCGt)` acquires an immutable
-CPU snapshot only from a Ready/CtReady owner with a valid forcewake request/ACK
-and matching PCI device ID. Wake loss poisons the GT, and missing or pending
+CPU snapshot only from a Ready/CtReady/SchedulingReady owner with a valid
+forcewake request/ACK and matching PCI device ID. Wake loss poisons the GT, and missing or pending
 discovery cannot publish. The PCI owner must bind this card and GT to the same
 physical function; equal device IDs do not establish that identity. Another
 card, even with the same device ID, has an independent slot. A second successful
 publication is refused. The registered card retains only CPU bytes, so verified
 GT shutdown may reclaim all DMA backing while queries continue to describe this
 card's static capabilities. Previously captured DeviceInfo snapshots do not
-change. The integrated probe retains the same IntelGpuCard Arc it registers for
-future GT attachment. Actual PCI/runtime-PM/MOCS setup and GT startup remain
-separate work; normal probe leaves HWCONFIG absent. Publication does not
+change. The hardware service retains the same IntelGpuCard Arc it registers
+and publishes discovery before the scheduling reload. Failed or ineligible
+startup leaves HWCONFIG absent. Publication does not
 advertise userspace engines or admit EXECBUFFER2.
 
 `intel_gpu_guc_transport::XeLpgTransport` owns one six-page coherent GGTT
@@ -377,10 +456,10 @@ graphics-GuC notification; `receive` owns the opposite head cursor. Transport
 errors stop admission. `release` returns a live owner intact until either
 publication never began or MMIO DISABLE completed successfully; timeouts and
 partial registration retain memory for the unsafe, proven-reset release path.
-A CT response acknowledges an action, never render completion. Per-card
-boot/forcewake/IRQ ownership, GuC context scheduling and hardware validation
-remain open; transport readiness
-does not enable EXECBUFFER or advertise acceleration.
+A CT response acknowledges an action, never render completion. The physical
+owner adds kernel scheduling above this transport; Intel silicon validation
+remains outstanding. Transport readiness does not enable EXECBUFFER or
+advertise acceleration.
 
 ### Legacy framebuffers and native mode timing
 

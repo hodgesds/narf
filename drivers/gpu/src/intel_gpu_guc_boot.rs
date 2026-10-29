@@ -57,6 +57,7 @@ pub enum BootError {
     Firmware { status: u32 },
     Transport(TransportError),
     Hwconfig(HwconfigError),
+    Scheduling(crate::intel_gpu_guc_sched::SchedulingError),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -74,6 +75,13 @@ pub enum BootState {
 /// Memory publication must clean dirty CPU cache lines as well as order
 /// stores. Discrete GPUs cannot inherit an integrated-GPU LLC assumption.
 pub trait BootAllocator: GpuAllocator {
+    fn configure_cache(
+        &mut self,
+        _backing: &mut Self::Backing,
+        _policy: crate::intel_gpu_gt_hw::CachePolicy,
+    ) -> Result<(), BootError> {
+        Err(BootError::Cache)
+    }
     fn sync_for_device(&mut self, backing: &Self::Backing) -> Result<(), BootError>;
 
     /// Invalidate possible clean speculative CPU fills after exclusive device
@@ -85,6 +93,14 @@ pub trait BootAllocator: GpuAllocator {
 }
 
 impl BootAllocator for crate::intel_gpu_rcs::SharedArena {
+    fn configure_cache(
+        &mut self,
+        backing: &mut Self::Backing,
+        policy: crate::intel_gpu_gt_hw::CachePolicy,
+    ) -> Result<(), BootError> {
+        crate::intel_gpu_rcs::SharedArena::configure_cache(self, backing, policy)
+            .map_err(BootError::Allocation)
+    }
     fn sync_for_device(&mut self, backing: &Self::Backing) -> Result<(), BootError> {
         if backing.publish_for_device() {
             Ok(())
@@ -178,6 +194,9 @@ pub struct GuCBoot<M: MmioWindow, A: BootAllocator> {
     deadline: u64,
     released: bool,
     hwconfig: Option<Arc<HardwareConfig>>,
+    scheduling: Option<crate::intel_gpu_guc_sched::SchedulingAds>,
+    reload: bool,
+    submission_version: (u8, u8, u8),
 }
 
 impl<M: MmioWindow, A: BootAllocator> core::fmt::Debug for GuCBoot<M, A> {
@@ -324,6 +343,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             deadline: 0,
             released: false,
             hwconfig: None,
+            scheduling: None,
+            reload: false,
+            submission_version: image.submission_version,
         })
     }
 
@@ -333,6 +355,64 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
 
     pub(crate) fn platform(&self) -> GtPlatform {
         self.platform
+    }
+
+    pub(crate) fn configure_cache(
+        &mut self,
+        policy: crate::intel_gpu_gt_hw::CachePolicy,
+    ) -> Result<(), BootError> {
+        if self.state != BootState::Staged || policy.platform() != self.platform {
+            return Err(BootError::State);
+        }
+        let r = &mut *self.resources;
+        r.allocator.configure_cache(&mut r.image, policy)?;
+        r.allocator.configure_cache(&mut r.ads, policy)?;
+        r.allocator.configure_cache(&mut r.logs, policy)?;
+        Ok(())
+    }
+
+    pub(crate) fn scheduler(&self) -> Result<crate::intel_gpu_guc_sched::GuCScheduler<A>, BootError>
+    where
+        A: Clone,
+    {
+        if self.state != BootState::Ready
+            || self.hwconfig.is_none()
+            || self.submission_version.0 != 1
+        {
+            return Err(BootError::Unsupported);
+        }
+        crate::intel_gpu_guc_sched::GuCScheduler::allocate(
+            self.resources.allocator.clone(),
+            self.platform,
+        )
+        .map_err(BootError::Scheduling)
+    }
+
+    pub(crate) fn begin_scheduling(
+        &mut self,
+        ads: crate::intel_gpu_guc_sched::SchedulingAds,
+        now: u64,
+    ) -> Result<(), BootError> {
+        if self.state != BootState::Ready || self.hwconfig.is_none() || self.scheduling.is_some() {
+            return Err(BootError::State);
+        }
+        if self.submission_version.0 != 1 {
+            return Err(BootError::Unsupported);
+        }
+        self.begin_stop(now)?;
+        self.scheduling = Some(ads);
+        self.reload = true;
+        Ok(())
+    }
+
+    pub(crate) fn cancel_reload(&mut self) {
+        self.reload = false;
+    }
+
+    pub(crate) fn invalidate_ggtt_before_ct(&self) -> Result<(), BootError> {
+        self.awake()?;
+        invalidate_guc_tlb(&self.mmio, self.platform);
+        Ok(())
     }
 
     pub(crate) fn window(&self) -> &M {
@@ -511,7 +591,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         r.allocator.sync_for_device(&r.logs)?;
         let mut params = [0u32; 14];
         params[0] = r.logs.ggtt_offset() | 0x3f5;
-        params[2] = 1 << 14; // scheduler disabled during HWCONFIG bootstrap
+        params[2] = if self.scheduling.is_some() {
+            1 << 4
+        } else {
+            1 << 14
+        };
         params[3] = 1 << 6; // verbose logging disabled
         params[4] = (r.ads.ggtt_offset() >> 12) << 1;
         params[5] = ((self.config.device_id as u32) << 16) | self.config.revision as u32;
@@ -608,6 +692,32 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                         return Poll::Pending;
                     }
                     fence(Ordering::Acquire);
+                    if self.reload {
+                        self.reload = false;
+                        let config = self.scheduling.expect("scheduling reload");
+                        let ads = &self.resources.ads;
+                        let base = ads.ggtt_offset();
+                        // Populate only while GuC is proven stopped. RCS0 is
+                        // the only engine enabled by this kernel bring-up path.
+                        ads.write32(SYSINFO, 0x20202000);
+                        ads.write32(SYSINFO + 512, 1);
+                        ads.write32(0x1014, config.golden);
+                        ads.write32(0x1054, config.bytes - 4096 - 96 * 4);
+                        ads.write32(POLICIES + 76, 1); // no autonomous engine reset
+                        ads.write32(0, base + 0x2000);
+                        ads.write32(4, 3);
+                        ads.write32(0x2014, config.hwsp);
+                        for (i, (reg, flags)) in [(0x229c, 1), (0x2080, 0), (0x20a8, 0)]
+                            .into_iter()
+                            .enumerate()
+                        {
+                            ads.write32(0x2000 + i as u64 * 16, reg);
+                            ads.write32(0x2008 + i as u64 * 16, flags);
+                        }
+                        self.state = BootState::Staged;
+                        self.begin(now)?;
+                        return Poll::Pending;
+                    }
                     self.state = BootState::Stopped;
                     return Poll::Ready(Ok(self.state));
                 }
@@ -722,13 +832,13 @@ mod tests {
             device.writes.push((offset, value));
             let actual = match offset {
                 0xc050 | 0xc340 if !device.reject_wopcm => value | 1,
-                0xc314 | 0xa188 => {
+                0xc314 | 0xa188 | 0xa278 => {
                     let mask = value >> 16;
                     let old = *device.regs.get(&offset).unwrap_or(&0);
                     if value == 0x00110011 {
                         // Hardware only learns the image/ADS/log addresses
                         // after their CPU cache contents have been published.
-                        assert_eq!(device.synced.len(), 3);
+                        assert!(device.synced.len() >= 3);
                     }
                     (old & !mask) | (value & mask)
                 }
@@ -809,6 +919,17 @@ mod tests {
         }
     }
     impl BootAllocator for Arena {
+        fn configure_cache(
+            &mut self,
+            _backing: &mut Backing,
+            _policy: crate::intel_gpu_gt_hw::CachePolicy,
+        ) -> Result<(), BootError> {
+            if self.0.borrow().fail_sync {
+                Err(BootError::Cache)
+            } else {
+                Ok(())
+            }
+        }
         fn sync_for_device(&mut self, backing: &Backing) -> Result<(), BootError> {
             let mut device = self.0.borrow_mut();
             if device.fail_sync {
@@ -851,6 +972,7 @@ mod tests {
             (32, 96),
             (36, 1),
             (64, 0x00463600),
+            (68, 0x00010000),
             (120, 4096),
         ] {
             crate::intel_gpu_uapi::put32(&mut bytes, at, value);
@@ -1811,4 +1933,9 @@ mod tests {
         "drivers/gpu/intel_gpu_hwconfig",
         smoke_hwconfig_card_refuses_wake_loss
     );
+
+    mod hardware_tests {
+        use super::*;
+        include!("intel_gpu_guc_hw_tests.rs");
+    }
 }

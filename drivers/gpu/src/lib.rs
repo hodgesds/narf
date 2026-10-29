@@ -716,6 +716,10 @@ pub mod intel_gpu_gmbus;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gt;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_gt_hw;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_gt_runtime;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_gtt;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_guc;
@@ -725,6 +729,8 @@ pub mod intel_gpu_guc_boot;
 pub mod intel_gpu_guc_firmware;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_guc_gt;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_guc_sched;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_guc_transport;
 #[cfg(feature = "intel")]
@@ -827,6 +833,11 @@ pub fn register_initcalls() {
     #[cfg(feature = "intel")]
     narf_init::register(Stage::Late, "intel-gpu-dp-bridge", || {
         intel_gpu_dp_bridge::register_bridge();
+        InitResult::Ok
+    });
+    #[cfg(feature = "intel")]
+    narf_init::register(Stage::Late, "intel-gpu-gt", || {
+        intel_gpu_gt_runtime::start_pending();
         InitResult::Ok
     });
     #[cfg(feature = "amdgpu")]

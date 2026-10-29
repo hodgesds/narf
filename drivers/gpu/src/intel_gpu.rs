@@ -981,6 +981,11 @@ fn log_probe(msg: &str, device: &BusDevice) {
 }
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+    if crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
+        .is_some_and(crate::intel_gpu_gt::GtPlatform::is_discrete)
+    {
+        return crate::intel_gpu_gt_runtime::probe_discrete(device, cap);
+    }
     if CONTROLLER.lock().is_some() {
         return Ok(());
     }
@@ -1229,8 +1234,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let scanout_mode = dev.current_mode();
     // Power management (Q9, #1015) covers the Gen12 register
     // map only. Xe-LPG now has a region map and a display
-    // engine (#1016), but its forcewake/RC6/DMC programming is
-    // not modelled, so MTL still gets no PM.
+    // engine (#1016); its separate GT owner handles system PM below.
+    // The legacy forcewake/RC6/DMC PM owner remains Gen12-only.
     let pm_supported = matches!(
         dev.chip.generation.region_generation(),
         Some(RegionGeneration::Gen12)
@@ -1251,8 +1256,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         device.id.subsystem_id,
     ));
     dev.drm_card = Some(intel_card.clone());
+    let gt_card = intel_card.clone();
+    let gt_bar = dev.gtt_mmadr;
     *CONTROLLER.lock() = Some(dev);
-    match scanout_mode {
+    let owns_scanout = scanout_mode.is_some();
+    let card_index = match scanout_mode {
         Some(mode) => {
             use crate::drm::card::{
                 Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType,
@@ -1288,7 +1296,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                 encoder_id: Some(2),
                 modes: alloc::vec![kms_mode],
             });
-            crate::drm_registry::register_drm_card_with_state(intel_card, kms);
+            let index = crate::drm_registry::register_drm_card_with_state(intel_card, kms);
             publish_scanout(Some(narf_graphics_driver::generic::GenericFb::new(
                 mode.phys_base,
                 mode.width,
@@ -1296,10 +1304,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                 mode.stride_bytes,
                 32,
             )));
+            index
         }
-        None => {
-            crate::drm_registry::register_drm_card(intel_card);
-        }
+        None => crate::drm_registry::register_drm_card(intel_card),
+    };
+    // A retained firmware scanout has not granted us its GGTT reservation.
+    // Start automatically only after this driver owns the integrated scanout.
+    if owns_scanout {
+        crate::intel_gpu_gt_runtime::install(card_index, gt_card, device, cap, gt_bar, panel_mode);
     }
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
@@ -1410,6 +1422,21 @@ pub fn relight_display(mode: &crate::intel_gpu_modeset::Mode) -> Option<ActiveSc
 /// Register one exact-match PCI driver per row of the canonical
 /// device table, plus the class-match backstop.
 pub fn register_pci_driver() {
+    for (name, ids) in [
+        ("intel-gpu-dg2", crate::intel_gpu_gt::DG2_IDS),
+        ("intel-gpu-bmg", crate::intel_gpu_gt::BMG_IDS),
+    ] {
+        for &device in ids {
+            narf_bus::register_pci_driver(narf_bus::PciMatch {
+                name,
+                kind: narf_bus::MatchKind::VendorDevice {
+                    vendor: INTEL_VENDOR,
+                    device,
+                },
+                probe,
+            });
+        }
+    }
     for entry in DEVICE_TABLE.iter() {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
             name: entry.name,

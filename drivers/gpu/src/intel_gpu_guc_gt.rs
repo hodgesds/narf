@@ -7,9 +7,11 @@
 //! other reset/firmware users. No userspace submission is admitted here.
 
 use crate::intel_gpu_aux::MmioWindow;
+use crate::intel_gpu_gt_hw::{HardwareError, HardwareInit};
 use crate::intel_gpu_guc::GuCMessage;
 use crate::intel_gpu_guc_boot::{BootAllocator, BootConfig, BootError, BootState, GuCBoot};
 use crate::intel_gpu_guc_firmware::GuCFirmware;
+use crate::intel_gpu_guc_sched::{GuCScheduler, SchedulingError};
 use crate::intel_gpu_guc_transport::{Mailbox, TransportError, TransportState, XeLpgTransport};
 use crate::intel_gpu_hwconfig::HardwareConfig;
 use alloc::sync::Arc;
@@ -23,14 +25,20 @@ const WAKE_NS: u64 = 50_000_000;
 pub enum GtState {
     Staged,
     Waking,
+    PreparingHardware,
     Booting,
     Ready,
     SizingHwconfig,
     CopyingHwconfig,
     EnablingCt,
     CtReady,
+    StartingScheduling,
+    SchedulingReady,
     Recovering,
+    RecoveringRender,
     Stopping,
+    ResettingEngines,
+    ReleasingRender,
     Releasing,
     Stopped,
     Lost,
@@ -46,12 +54,15 @@ pub enum GtError {
     Boot(BootError),
     Transport(TransportError),
     Poisoned,
+    Hardware(HardwareError),
+    Scheduling(SchedulingError),
 }
 
 struct Parts<M: MmioWindow, A: BootAllocator> {
     boot: GuCBoot<M, A>,
     ct: Option<XeLpgTransport<M, A>>,
     discovery_mailbox: Option<Mailbox<M>>,
+    scheduler: Option<GuCScheduler<A>>,
 }
 
 /// The sole owner of the GT kernel-request bit and graphics-GuC mailbox.
@@ -63,6 +74,7 @@ pub struct GuCGt<M: MmioWindow, A: BootAllocator> {
     deadline: u64,
     requested: bool,
     released: bool,
+    hardware: Option<HardwareInit>,
 }
 
 impl<M: MmioWindow, A: BootAllocator> core::fmt::Debug for GuCGt<M, A> {
@@ -86,6 +98,32 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             .map_err(GtError::Boot)
     }
 
+    /// Physical-function startup. In addition to `stage`'s contract, this
+    /// owner exclusively controls render forcewake and MCR steering. PCI power
+    /// and the allocator remain owned through verified full GT shutdown.
+    pub fn stage_hardware(
+        mmio: M,
+        allocator: A,
+        firmware: &GuCFirmware,
+        config: BootConfig,
+    ) -> Result<Self, GtError> {
+        if firmware.platform() == crate::intel_gpu_gt::GtPlatform::Battlemage
+            && config.uncached_mocs != Some(3)
+        {
+            return Err(GtError::Boot(BootError::Device));
+        }
+        Self::from_staged_hardware(
+            GuCBoot::stage(mmio, allocator, firmware, config).map_err(GtError::Boot)?,
+        )
+    }
+
+    pub(crate) fn from_staged_hardware(boot: GuCBoot<M, A>) -> Result<Self, GtError> {
+        let hardware = HardwareInit::new(boot.platform()).map_err(GtError::Hardware)?;
+        let mut gt = Self::from_staged(boot);
+        gt.hardware = Some(hardware);
+        Ok(gt)
+    }
+
     pub(crate) fn from_staged(boot: GuCBoot<M, A>) -> Self {
         assert_eq!(boot.state(), BootState::Staged);
         Self {
@@ -93,11 +131,13 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 boot,
                 ct: None,
                 discovery_mailbox: None,
+                scheduler: None,
             }),
             state: GtState::Staged,
             deadline: 0,
             requested: false,
             released: false,
+            hardware: None,
         }
     }
 
@@ -118,7 +158,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         &mut self,
         device_id: u16,
     ) -> Result<Arc<HardwareConfig>, GtError> {
-        if !matches!(self.state, GtState::Ready | GtState::CtReady) {
+        if !matches!(
+            self.state,
+            GtState::Ready | GtState::CtReady | GtState::SchedulingReady
+        ) {
             return Err(GtError::State);
         }
         if let Err(error) = self.awake() {
@@ -186,6 +229,18 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         if !self.requested || request & 1 == 0 || self.read_ack()? == 0 {
             return Err(GtError::WakeLost);
         }
+        if !matches!(
+            self.state,
+            GtState::Recovering
+                | GtState::RecoveringRender
+                | GtState::PreparingHardware
+                | GtState::ReleasingRender
+        ) {
+            if let Some(hw) = self.hardware.as_ref().filter(|hw| hw.ready()) {
+                hw.awake(self.parts.boot.window())
+                    .map_err(GtError::Hardware)?;
+            }
+        }
         Ok(())
     }
 
@@ -228,6 +283,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 .map_err(GtError::Boot)?,
         );
         self.state = GtState::EnablingCt;
+        if let Err(error) = self.parts.boot.invalidate_ggtt_before_ct() {
+            self.state = GtState::Lost;
+            return Err(GtError::Boot(error));
+        }
         if let Err(error) = self.parts.ct.as_mut().expect("owned CT").begin_enable(now) {
             self.state = GtState::Lost;
             return Err(GtError::Transport(error));
@@ -252,30 +311,137 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             GtState::Staged
                 | GtState::Stopped
                 | GtState::Recovering
+                | GtState::RecoveringRender
                 | GtState::Stopping
+                | GtState::ResettingEngines
+                | GtState::ReleasingRender
                 | GtState::Releasing
         ) {
             return Err(GtError::State);
         }
         // Close admission before any fallible reset/recovery operation.
         self.state = GtState::Lost;
+        self.parts.boot.cancel_reload();
         if matches!(
             self.parts.boot.state(),
             BootState::Staged | BootState::Stopped
         ) {
-            self.request(false, now)?;
-            self.state = GtState::Releasing;
-            return Ok(());
+            return self.after_boot_stop(now);
         }
         match self.awake() {
             Ok(()) => return self.start_reset(now),
-            Err(GtError::WakeLost) => {}
+            Err(GtError::WakeLost | GtError::Hardware(HardwareError::WakeLost)) => {}
             Err(error) => return Err(error),
         }
         // No DMA memory is reclaimed while recovering a dropped wake ACK.
         self.request(true, now)?;
         self.state = GtState::Recovering;
         Ok(())
+    }
+
+    pub fn begin_scheduling(&mut self, now: u64) -> Result<(), GtError>
+    where
+        A: Clone,
+    {
+        if self.state != GtState::Ready
+            || self.parts.ct.is_some()
+            || self.hardware.is_none()
+            || self.hwconfig().is_none()
+        {
+            return Err(GtError::State);
+        }
+        if let Err(error) = self.awake() {
+            self.state = GtState::Lost;
+            return Err(error);
+        }
+        let scheduler = self.parts.boot.scheduler().map_err(GtError::Boot)?;
+        self.parts.scheduler = Some(scheduler);
+        self.state = GtState::Lost;
+        let parts = &mut *self.parts;
+        let scheduler = parts.scheduler.as_mut().expect("owned scheduler");
+        scheduler
+            .enable_engine(parts.boot.window())
+            .map_err(GtError::Scheduling)?;
+        let ads = scheduler.ads();
+        self.parts
+            .boot
+            .begin_scheduling(ads, now)
+            .map_err(GtError::Boot)?;
+        self.state = GtState::StartingScheduling;
+        Ok(())
+    }
+
+    pub fn submit_kernel_probe(
+        &mut self,
+        now: u64,
+    ) -> Result<(u16, Arc<crate::intel_gpu_fence::CompletionFence>), GtError> {
+        if self.state != GtState::SchedulingReady {
+            return Err(GtError::State);
+        }
+        if let Err(error) = self.awake() {
+            self.state = GtState::Lost;
+            return Err(error);
+        }
+        self.parts
+            .scheduler
+            .as_mut()
+            .expect("owned scheduler")
+            .submit_probe(now)
+            .map_err(GtError::Scheduling)
+    }
+
+    /// Full physical-GT startup. The caller retains this owner across every
+    /// await, including cancellation or failure; no IRQ-safe guard is held.
+    pub async fn start_hardware(&mut self) -> Result<(), GtError>
+    where
+        M: Clone,
+        A: Clone,
+    {
+        if self.hardware.is_none() {
+            return Err(GtError::State);
+        }
+        self.begin(narf_time::monotonic_ns())?;
+        self.wait().await?;
+        self.begin_hwconfig(narf_time::monotonic_ns())?;
+        self.wait().await?;
+        self.begin_scheduling(narf_time::monotonic_ns())?;
+        self.wait().await?;
+        self.begin_ct(narf_time::monotonic_ns())?;
+        if self.wait().await? != GtState::SchedulingReady {
+            return Err(GtError::State);
+        }
+        Ok(())
+    }
+
+    fn release_wake(&mut self, now: u64) -> Result<(), GtError> {
+        if let Some(hw) = &mut self.hardware {
+            hw.begin_release(self.parts.boot.window(), now)
+                .map_err(GtError::Hardware)?;
+            self.state = GtState::ReleasingRender;
+        } else {
+            self.request(false, now)?;
+            self.state = GtState::Releasing;
+        }
+        Ok(())
+    }
+
+    fn retire_ct(&mut self) {
+        if let Some(ct) = self.parts.ct.take() {
+            // SAFETY: GuCBoot proved MIA in reset and firmware DMA idle.
+            unsafe { ct.release_after_reset() };
+        }
+    }
+
+    fn after_boot_stop(&mut self, now: u64) -> Result<(), GtError> {
+        if self.parts.scheduler.is_some() {
+            self.deadline = now.checked_add(5_000_000).ok_or(GtError::State)?;
+            self.parts.boot.window().write32(0x941c, 1);
+            let _ = self.parts.boot.window().read32(0x941c);
+            self.state = GtState::ResettingEngines;
+            return Ok(());
+        }
+        self.retire_ct();
+        self.release_wake(now)
     }
 
     pub fn poll(&mut self, now: u64) -> Poll<Result<GtState, GtError>> {
@@ -305,7 +471,19 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 }
                 self.awake()?;
                 if self.state == GtState::Recovering {
+                    if let Some(hw) = &mut self.hardware {
+                        if hw.awake(self.parts.boot.window()).is_err() {
+                            hw.recover(self.parts.boot.window(), now)
+                                .map_err(GtError::Hardware)?;
+                            self.state = GtState::RecoveringRender;
+                            return Poll::Pending;
+                        }
+                    }
                     self.start_reset(now)?;
+                } else if let Some(hw) = &mut self.hardware {
+                    hw.begin(self.parts.boot.window(), now)
+                        .map_err(GtError::Hardware)?;
+                    self.state = GtState::PreparingHardware;
                 } else {
                     self.parts.boot.begin(now).map_err(GtError::Boot)?;
                     self.state = GtState::Booting;
@@ -316,6 +494,70 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         }
         self.awake()?;
         match self.state {
+            GtState::PreparingHardware | GtState::RecoveringRender => {
+                let policy = match self
+                    .hardware
+                    .as_mut()
+                    .expect("hardware owner")
+                    .poll(self.parts.boot.window(), now)
+                {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => result.map_err(GtError::Hardware)?,
+                };
+                if self.state == GtState::RecoveringRender {
+                    self.start_reset(now)?;
+                } else {
+                    self.parts
+                        .boot
+                        .configure_cache(policy)
+                        .map_err(GtError::Boot)?;
+                    self.parts.boot.begin(now).map_err(GtError::Boot)?;
+                    self.state = GtState::Booting;
+                }
+                return Poll::Pending;
+            }
+            GtState::ReleasingRender => {
+                match self
+                    .hardware
+                    .as_mut()
+                    .expect("hardware owner")
+                    .poll_release(self.parts.boot.window(), now)
+                {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => result.map_err(GtError::Hardware)?,
+                }
+                self.request(false, now)?;
+                self.state = GtState::Releasing;
+                return Poll::Pending;
+            }
+            GtState::ResettingEngines => {
+                let reset = self.parts.boot.window().read32(0x941c);
+                if reset == u32::MAX {
+                    return Poll::Ready(Err(GtError::Unavailable));
+                }
+                if now >= self.deadline {
+                    return Poll::Ready(Err(GtError::Boot(BootError::Timeout)));
+                }
+                if reset & 1 != 0 {
+                    return Poll::Pending;
+                }
+                let status = self.parts.boot.window().read32(0xc000);
+                let dma = self.parts.boot.window().read32(0xc314);
+                if status == u32::MAX || dma == u32::MAX {
+                    return Poll::Ready(Err(GtError::Unavailable));
+                }
+                if status & 1 == 0 || dma & 1 != 0 {
+                    return Poll::Pending;
+                }
+                if let Some(scheduler) = self.parts.scheduler.take() {
+                    // SAFETY: GuC reset/DMA idle preceded GRDOM_FULL self-clear.
+                    // Admission is closed and no child scheduler escapes.
+                    unsafe { scheduler.release_after_reset() };
+                }
+                self.retire_ct();
+                self.release_wake(now)?;
+                return Poll::Pending;
+            }
             GtState::SizingHwconfig | GtState::CopyingHwconfig => {
                 let response = match self
                     .parts
@@ -348,7 +590,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 self.parts.boot.finish_hwconfig().map_err(GtError::Boot)?;
                 self.state = GtState::Ready;
             }
-            GtState::Booting => match self.parts.boot.poll(now) {
+            GtState::Booting | GtState::StartingScheduling => match self.parts.boot.poll(now) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(GtError::Boot(error))),
                 Poll::Ready(Ok(BootState::Ready)) => self.state = GtState::Ready,
@@ -364,7 +606,13 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(error)) => return Poll::Ready(Err(GtError::Transport(error))),
-                    Poll::Ready(Ok(TransportState::Enabled)) => self.state = GtState::CtReady,
+                    Poll::Ready(Ok(TransportState::Enabled)) => {
+                        self.state = if self.parts.scheduler.is_some() {
+                            GtState::SchedulingReady
+                        } else {
+                            GtState::CtReady
+                        }
+                    }
                     _ => return Poll::Ready(Err(GtError::State)),
                 }
             }
@@ -372,20 +620,21 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(GtError::Boot(error))),
                 Poll::Ready(Ok(BootState::Stopped)) => {
-                    if let Some(ct) = self.parts.ct.take() {
-                        // SAFETY: this owner is the sole CT publisher. GuCBoot
-                        // proved MIA in reset and firmware DMA idle. No child
-                        // escapes this owner, and the terminal GT cannot
-                        // re-enable CT or run stale registrations afterwards.
-                        unsafe { ct.release_after_reset() };
-                    }
-                    self.request(false, now)?;
-                    self.state = GtState::Releasing;
+                    self.after_boot_stop(now)?;
                     return Poll::Pending;
                 }
                 _ => return Poll::Ready(Err(GtError::State)),
             },
             GtState::Ready | GtState::CtReady => {}
+            GtState::SchedulingReady => {
+                let parts = &mut *self.parts;
+                parts
+                    .scheduler
+                    .as_mut()
+                    .expect("owned scheduler")
+                    .poll(parts.ct.as_mut().expect("owned CT"), now)
+                    .map_err(GtError::Scheduling)?;
+            }
             _ => return Poll::Ready(Err(GtError::State)),
         }
         Poll::Ready(Ok(self.state))
@@ -441,13 +690,23 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     /// # Safety
-    /// The PCI owner proved a full GT reset stopped all GuC/firmware DMA,
-    /// invalidated stale addresses and released/reset the kernel wake request.
+    /// The PCI owner proved a full GT reset stopped all engines and GuC/firmware
+    /// DMA, invalidated stale HWS/LRC/GGTT addresses and released/reset both the
+    /// render-well and graphics-GT kernel wake requests.
     /// Neither unreadable registers nor elapsed time supplies that proof.
     pub unsafe fn release_after_gt_reset(mut self) {
         self.released = true;
         // SAFETY: consumed once under the caller's full-reset proof.
-        let Parts { boot, ct, .. } = unsafe { ManuallyDrop::take(&mut self.parts) };
+        let Parts {
+            boot,
+            ct,
+            scheduler,
+            ..
+        } = unsafe { ManuallyDrop::take(&mut self.parts) };
+        if let Some(scheduler) = scheduler {
+            // SAFETY: the external full-reset proof covers HWS and engines too.
+            unsafe { scheduler.release_after_reset() };
+        }
         if let Some(ct) = ct {
             // SAFETY: the caller's proof covers this owned CT allocation.
             unsafe { ct.release_after_reset() };
