@@ -15,6 +15,13 @@ before invoking a backend; an Arc keeps it alive during the operation.
 
 ## 3. Public interface
 
+The sound-card registry, PCM/mixer APIs and ALSA/filesystem bridges remain
+the public card-level surface. The unused `codec`, `hda::controller`,
+`hda::corb`, `hda::rirb`, `hda::widget`, `intel8x0`, `max98357a`, `rt5645`
+and `snd_sof` model modules are retired. `hda::streams` still supplies the
+shared stream/BDL types; native HDA and ACP hardware engines live in
+`narf-audio` and register backends here.
+
 `register_hardware_card(CardInfo, Arc<dyn hardware::PcmDevice>) -> u32`
 assigns a card index. `unregister_hardware_card(index)` prevents new opens
 without invalidating outstanding stream leases. `default_hw_params(card,
