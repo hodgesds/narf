@@ -501,14 +501,108 @@ epoch traffic can deepen a lockout. Boot/resume-environment
 wiring of these two call points is the resume lane's
 remainder, as with the anchor itself.
 
+**Policy (design §10; lane P8, #1006).** The policy engine lives
+in `suspend_service::policy` and administers the `RecordedPolicy`
+record above. It names anchor *kinds* only — the token, TPM, and
+passphrase anchors register into its rules by kind as their lanes
+land — and it owns five things: the policy store, the level
+algebra and floor, the enrollment / re-enrollment flows, the
+composition rules, and recorded-policy enforcement at resume.
+
+```rust
+// suspend_service::policy (design §10).
+pub enum TokenVerification { TouchOnly, TouchAndPin }  // §4.5 / decision 1
+pub enum TokenAbsent { Defer, AbandonImage }          // §4.9
+pub struct PolicyConfig {
+    pub level: PolicyLevel, pub floor: PolicyLevel, pub policy_epoch: u64,
+    pub token_verification: TokenVerification,
+    pub recovery_slot_default: bool, pub token_absent: TokenAbsent,
+}
+pub struct PolicyStore { /* the running system's current PolicyConfig */ }
+impl PolicyStore {
+    pub fn provision_fresh_install(&mut self, svc: &mut SuspendService<E>,
+        install: FreshInstall) -> Result<RecordedPolicy, PolicyError>;
+    pub fn change_level(&mut self, svc: &mut SuspendService<E>,
+        change: PolicyChange) -> Result<RecordedPolicy, PolicyError>;
+    pub fn reenroll(&mut self, svc: &mut SuspendService<E>,
+        factors: FactorSet) -> Result<RecordedPolicy, PolicyError>;
+    pub fn enroll_recovery(&mut self, svc: &mut SuspendService<E>,
+        anchor: &dyn KeyCustodyAnchor) -> Result<SlotRecord, PolicyError>;
+    pub fn seal(&self, svc: &mut SuspendService<E>,
+        store: &mut dyn ImageStore, image: &[u8])
+        -> Result<[u8; 16], PolicyError>;
+    pub fn validate_current(&self, svc: &SuspendService<E>)
+        -> Result<(), PolicyError>;
+}
+pub fn validate_slot_set(level: PolicyLevel, slots: &[SlotRecord])
+    -> Result<(), PolicyError>;
+pub fn factor_plan(recorded: &RecordedPolicy, slots: &[SlotRecord])
+    -> FactorPlan;   // PublishedOff | AnyOf{kind, recovery} | Composition{recovery}
+pub fn open_with_policy(store: &dyn ImageStore,
+                        anchors: &[&dyn KeyCustodyAnchor])
+    -> Result<OpenedImage, ServiceError>;
+// Composition primitive on the service itself (design §8.5): the
+// SMS is XOR-split across two factor groups — every anchor in a
+// group wraps that group's share, one slot record per factor —
+// inside custody, so the secret never leaves Secret32.
+impl<E: KeyEntropy> SuspendService<E> {
+    pub fn enroll_composition(&mut self, group_a: &[&dyn KeyCustodyAnchor],
+        group_b: &[&dyn KeyCustodyAnchor])
+        -> Result<Vec<SlotRecord>, ServiceError>;
+    pub fn rotate_epoch_composition(&mut self,
+        group_a: &[&dyn KeyCustodyAnchor],
+        group_b: &[&dyn KeyCustodyAnchor]) -> Result<u64, ServiceError>;
+}
+```
+
+The decided rules are structural, not advisory (decision sheet,
+2026-10-26). **Levels and floor:** ranks are OFF < PASSPHRASE <
+TOKEN = TPM (peer single-hardware-factor levels: presence on a
+carried token vs binding to the measured boot chain) < TOKEN+TPM;
+no flow may set a level below the admin floor, and a floor the
+current level violates cannot be provisioned. **Defaults:** the
+fresh-install level is TOKEN when at least two tokens enroll,
+else PASSPHRASE — OFF is never a default, and the only path into
+OFF is a `PolicyChange` carrying an explicit `OffConfirmation`
+(the UI shows §10.1's OFF sentence verbatim first). A token level
+requires **two distinct tokens** (the §4.2 backup mandate;
+distinctness is judged on slot params, in which every anchor
+embeds its credential identity); the default token verification
+for a token-only machine is touch+PIN, touch-only being an
+explicit choice and the default under TOKEN+TPM. A passphrase
+recovery slot is offered at enrollment and defaults ON for the
+first epoch. **Composition:** TOKEN+TPM slots are XOR *shares*
+of the SMS, one per factor (the §8.5 shape P6a proved at the
+anchor layer; chained-slot storage is this record set plus the
+recorded level) — resume must recover one share from each group
+and recombine; either group alone yields nothing, and P1's raw
+single-anchor open fails its header seal on a share. **Slot-set
+shape** (`validate_slot_set`, applied before sealing and before
+any resume unwrap): each level's primary kinds must be present
+at their mandated counts, a passphrase slot is the one permitted
+addition to a hardware-factor level (the any-of recovery slot),
+any other foreign kind is a violation, and a duplicated
+(kind, params) record is not a second factor. **Recorded policy
+governs:** `open_with_policy` first checks that the image's own
+slot set realizes its recorded level — an image whose only
+satisfiable path is weaker than its record refuses
+(`PolicyMismatch`) *before any anchor is invoked* — then
+satisfies the level's factor plan in full; the machine's current
+configuration is never consulted, and an enrolled recovery slot
+is the only alternate path (a slot recorded at seal time, not a
+runtime fallback). S3/s2idle remain permitted at every level
+(decision 5): they write nothing to disk; the RAM exposure is
+documented in `S3_RAM_EXPOSURE_NOTE`, and the restrict toggle is
+deferred (#1008), not built.
+
 **Seams, deliberately minimal.** `parse_claims` / `OpenedImage`
 are the resume environment's entry surface (it also consumes
 `decode_hook_region` + `TrustedImage::read_hook_region` to stage
 hook blobs); `RecordedPolicy` is what the policy engine
-administers. Policy levels and floors are a separate lane (design
-§12); this section specifies the service, the format, the custody
-contract, and the state-hook contract. The resume environment
-that consumes the reader pipeline is specified next.
+administers. This section specifies the service, the format, the
+custody contract, the state-hook contract, and the policy
+engine. The resume environment that consumes the reader pipeline
+is specified next.
 
 #### Resume environment (S4 resume)
 

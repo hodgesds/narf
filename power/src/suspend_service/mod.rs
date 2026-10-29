@@ -31,10 +31,15 @@
 //!   anchor seam → whole-image verification → the `VerifiedResume`
 //!   handoff — reading the image through a polled, read-only
 //!   virtio-blk reader built for the pre-scheduler environment.
+//! - **Policy** (`policy`, design §10, P8 #1006): the policy
+//!   store, floors, enrollment / re-enrollment flows, slot-set
+//!   validation, and recorded-policy enforcement at resume,
+//!   including the §8.5 composition (an XOR split of the SMS
+//!   across two factor groups, performed inside this service so
+//!   the secret never leaves custody) — enforcing the
+//!   authenticated [`RecordedPolicy`] record.
 //!
-//! Seams left for the follow-on lanes, deliberately minimal: P8
-//! (#1006) gets the authenticated [`RecordedPolicy`] record to
-//! enforce. Real anchors land per lane: the FIDO token anchor and
+//! Real anchors land per lane: the FIDO token anchor and
 //! its resume ceremony are here ([`token_anchor`], P3 #999 + P5
 //! #1001); the Argon2id passphrase anchor is P7 (#1004,
 //! `passphrase`); TPM sealing is P6 (#1002 — [`TpmAnchor`], in
@@ -63,6 +68,7 @@ mod format;
 mod hooks;
 mod image;
 mod passphrase;
+mod policy;
 mod resume;
 mod slots;
 mod token_anchor;
@@ -89,6 +95,12 @@ pub use passphrase::{
     Argon2idParams, ConsolePassphraseSource, MonotonicDelay, PassphraseAnchor, PassphrasePolicy,
     PassphraseSource, ResumeDelay, MAX_PASSPHRASE_LEN, MAX_RESUME_PASSPHRASE_FAILURES,
     PASSPHRASE_SALT_LEN,
+};
+pub use policy::{
+    default_token_verification, factor_plan, floor_satisfied, fresh_install_default, level_rank,
+    open_with_policy, ram_suspend_permitted, validate_slot_set, FactorPlan, FactorSet,
+    FreshInstall, OffConfirmation, PolicyChange, PolicyConfig, PolicyError, PolicyStore,
+    TokenAbsent, TokenVerification, OFF_POLICY_WARNING, S3_RAM_EXPOSURE_NOTE,
 };
 pub use resume::{attempt_resume, ConsolePrompt, ResumePrompt, ResumeRefusal, VerifiedResume};
 pub use slots::{EpochSlots, SlotArea, SlotRecord};
@@ -529,6 +541,118 @@ fn run_hooks(
     let (blobs, report) = hooks::run_seal_fanout(hooks, smk, sms, image_id)
         .map_err(|_| ServiceError::HookSealAborted)?;
     Ok((hooks::encode_hook_region(&blobs), report))
+}
+
+impl<E: KeyEntropy> SuspendService<E> {
+    /// Split `sms` into two XOR shares and wrap one share under
+    /// every anchor of each group (design §8.5, as built by lane
+    /// P6a at the anchor layer and given storage here): share A is
+    /// drawn from the entropy seam; share B is `sms XOR share A`,
+    /// computed inside custody closures so the SMS never leaves
+    /// [`Secret32`]. Every anchor in a group wraps the *same* share
+    /// (backup factors are alternatives within their group); a
+    /// resume must recover one share from *each* group and XOR
+    /// them — neither share is, or reveals, the SMS. Nothing is
+    /// committed by this helper: callers insert the returned
+    /// records only after every wrap has succeeded, so composition
+    /// enrollment is all-or-nothing like [`Self::rotate_epoch`].
+    fn wrap_split(
+        &self,
+        sms: &Secret32,
+        epoch: u64,
+        group_a: &[&dyn KeyCustodyAnchor],
+        group_b: &[&dyn KeyCustodyAnchor],
+    ) -> Result<Vec<SlotRecord>, ServiceError> {
+        if group_a.is_empty() || group_b.is_empty() {
+            return Err(ServiceError::NoSlotsEnrolled);
+        }
+        let share_a = Secret32::mint(self.draw::<32>()?);
+        let share_b = share_a.with_bytes(|a| {
+            sms.with_bytes(|s| {
+                let mut out = [0u8; 32];
+                for i in 0..32 {
+                    out[i] = s[i] ^ a[i];
+                }
+                Secret32::mint(out)
+            })
+        });
+        let ctx = WrapCtx { sms_epoch: epoch };
+        let mut records = Vec::with_capacity(group_a.len() + group_b.len());
+        for anchor in group_a {
+            let wrapped = anchor.wrap(&ctx, &share_a)?;
+            records.push(SlotRecord {
+                kind: anchor.kind(),
+                epoch,
+                params: wrapped.params,
+                blob: wrapped.blob,
+            });
+        }
+        for anchor in group_b {
+            let wrapped = anchor.wrap(&ctx, &share_b)?;
+            records.push(SlotRecord {
+                kind: anchor.kind(),
+                epoch,
+                params: wrapped.params,
+                blob: wrapped.blob,
+            });
+        }
+        Ok(records)
+    }
+
+    /// Enroll an AND-composition over the current epoch's SMS
+    /// (design §8.5): the SMS is XOR-split across two factor groups
+    /// (see [`Self::wrap_split`]) and the share slots are retained
+    /// alongside any slots the epoch already holds. The records are
+    /// ordinary slot records — one per factor, per P6a's deferral —
+    /// and their composition meaning comes from the epoch's
+    /// recorded policy level, which the policy layer (policy.rs)
+    /// validates and enforces.
+    pub fn enroll_composition(
+        &mut self,
+        group_a: &[&dyn KeyCustodyAnchor],
+        group_b: &[&dyn KeyCustodyAnchor],
+    ) -> Result<Vec<SlotRecord>, ServiceError> {
+        let epoch = self.store.current_epoch().ok_or(ServiceError::NoEpoch)?;
+        let records = {
+            let custody = self.store.get(epoch).ok_or(ServiceError::UnknownEpoch)?;
+            self.wrap_split(&custody.sms, epoch, group_a, group_b)?
+        };
+        self.store
+            .get_mut(epoch)
+            .ok_or(ServiceError::UnknownEpoch)?
+            .slots
+            .extend(records.iter().cloned());
+        Ok(records)
+    }
+
+    /// Rotate to a fresh SMS epoch whose SMS is XOR-split across
+    /// two factor groups (design §8.5 + §10.4) — the composition
+    /// counterpart of [`Self::rotate_epoch`], with the same
+    /// all-or-nothing discipline: if any anchor fails, the old
+    /// epoch stays current and both shares are dropped (zeroized).
+    pub fn rotate_epoch_composition(
+        &mut self,
+        group_a: &[&dyn KeyCustodyAnchor],
+        group_b: &[&dyn KeyCustodyAnchor],
+    ) -> Result<u64, ServiceError> {
+        if self.store.current_epoch().is_none() {
+            return Err(ServiceError::NoEpoch);
+        }
+        if group_a.is_empty() || group_b.is_empty() {
+            return Err(ServiceError::NoSlotsEnrolled);
+        }
+        let sms = self.mint_sms()?;
+        let epoch = self.next_epoch();
+        let records = self.wrap_split(&sms, epoch, group_a, group_b)?;
+        self.store.insert(EpochCustody {
+            epoch,
+            sms,
+            slots: records,
+            images_outstanding: Vec::new(),
+        });
+        self.store.current = Some(epoch);
+        Ok(epoch)
+    }
 }
 
 impl<E: KeyEntropy> fmt::Debug for SuspendService<E> {

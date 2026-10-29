@@ -74,6 +74,7 @@ mod passphrase_tests;
 mod resume_env_tests;
 mod runtime_pm_tests;
 mod suspend_service_hooks_tests;
+mod suspend_service_policy_tests;
 mod suspend_service_tests;
 mod tests;
 #[cfg(feature = "kernel-test")]
