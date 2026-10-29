@@ -170,3 +170,114 @@ kernel_test_in!(
     "firmware/fdt",
     smoke_fdt_pci_function_node_and_reserved_memory
 );
+
+fn be(cells: &[u32]) -> Vec<u8> {
+    cells.iter().flat_map(|c| c.to_be_bytes()).collect()
+}
+/// QEMU virt `create_pcie_irq_map`: slot s, pin p (1-based) -> SPI
+/// 3 + (s + p - 1) % 4, level-high, through `&intc` (2 address cells).
+fn virt_irq_map(parent: u32, controller_flags: u32) -> Vec<u32> {
+    let mut map = Vec::new();
+    for slot in 0..4u32 {
+        for pin in 1..=4u32 {
+            map.extend_from_slice(&[slot << 11, 0, 0, pin, parent, 0, 0]);
+            map.extend_from_slice(&[0, 3 + (slot + pin - 1) % 4, controller_flags]);
+        }
+    }
+    map
+}
+fn smoke_fdt_pci_intx_interrupt_map_matches_linux() -> TestResult {
+    let map = be(&virt_irq_map(0x8003, 4));
+    let mask = be(&[0x1800, 0, 0, 7]);
+    let gic = TreeNode {
+        name: "intc@8000000",
+        props: &[
+            ("phandle", &[0, 0, 0x80, 3]),
+            ("#address-cells", &[0, 0, 0, 2]),
+            ("#interrupt-cells", &[0, 0, 0, 3]),
+            ("interrupt-controller", &[]),
+        ],
+        children: &[],
+    };
+    let pcie = TreeNode {
+        name: "pcie@10000000",
+        props: &[
+            ("device_type", b"pci\0"),
+            ("#address-cells", &[0, 0, 0, 3]),
+            ("#interrupt-cells", &[0, 0, 0, 1]),
+            ("linux,pci-domain", &[0, 0, 0, 0]),
+            ("interrupt-map-mask", &mask),
+            ("interrupt-map", &map),
+        ],
+        children: &[],
+    };
+    let blob = build_tree(&[gic, pcie]);
+    // Slot 2 function 1, INTB: SPI 3 + (2 + 1) % 4 = 6 -> INTID 38, level.
+    let devfn = (2 << 3) | 1;
+    let Some(route) = fdt::pci::intx_route(&blob, 0, 0, devfn, 2) else {
+        return TestResult::Fail("virt interrupt-map entry not resolved");
+    };
+    if route.parent != 0x8003
+        || route.cells != 3
+        || route.specifier[..3] != [0, 6, 4]
+        || fdt::pci::gic_spi(&route) != Some((38, true))
+    {
+        return TestResult::Fail("interrupt-map specifier/GIC INTID differs from of_irq_parse_raw");
+    }
+    for (slot, pin, spi) in [(0u8, 1u8, 3u32), (1, 4, 3), (3, 3, 4)] {
+        let route = fdt::pci::intx_route(&blob, 0, 0, slot << 3, pin);
+        if route.and_then(|r| fdt::pci::gic_spi(&r)) != Some((32 + spi, true)) {
+            return TestResult::Fail("interrupt-map rotation differs from QEMU virt");
+        }
+    }
+    if fdt::pci::intx_route(&blob, 0, 0, 0, 0).is_some()
+        || fdt::pci::intx_route(&blob, 1, 0, 0, 1).is_some()
+    {
+        return TestResult::Fail("pin 0 or a foreign domain resolved");
+    }
+    // The mask keeps two slot bits, so slot 4 wraps to slot 0 as in Linux.
+    if fdt::pci::intx_route(&blob, 0, 0, 4 << 3, 1).and_then(|r| fdt::pci::gic_spi(&r))
+        != Some((35, true))
+    {
+        return TestResult::Fail("interrupt-map-mask not applied to the slot bits");
+    }
+    // Unsupported sense (level-low) is refused by the GIC translation.
+    let low = fdt::pci::IntxRoute {
+        parent: 0x8003,
+        specifier: [0, 3, 8, 0],
+        cells: 3,
+    };
+    if fdt::pci::gic_spi(&low).is_some() {
+        return TestResult::Fail("level-low SPI accepted");
+    }
+    // A parent that is not an interrupt controller (nested nexus) is refused.
+    let nexus = TreeNode {
+        name: "nexus",
+        props: &[
+            ("phandle", &[0, 0, 0x80, 3]),
+            ("#address-cells", &[0, 0, 0, 2]),
+            ("#interrupt-cells", &[0, 0, 0, 3]),
+        ],
+        children: &[],
+    };
+    let pcie = TreeNode {
+        name: "pcie@10000000",
+        props: &[
+            ("device_type", b"pci\0"),
+            ("#address-cells", &[0, 0, 0, 3]),
+            ("#interrupt-cells", &[0, 0, 0, 1]),
+            ("interrupt-map-mask", &mask),
+            ("interrupt-map", &map),
+        ],
+        children: &[],
+    };
+    let blob = build_tree(&[nexus, pcie]);
+    if fdt::pci::intx_route(&blob, 0, 0, 0, 1).is_some() {
+        return TestResult::Fail("nested interrupt nexus resolved as a controller");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "firmware/fdt/pci",
+    smoke_fdt_pci_intx_interrupt_map_matches_linux
+);

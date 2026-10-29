@@ -148,6 +148,20 @@ pub fn memory_region_phandle(props: PropIter<'_>, index: usize) -> Option<u32>;
 /// `of_reserved_mem_region_to_resource`: the static (base, size) `reg`
 /// of the `/reserved-memory` child with `phandle`.
 pub fn reserved_memory_region(blob: &[u8], phandle: u32) -> Option<(u64, u64)>;
+
+/// `of_irq_parse_raw` for a root-bus function's INTx `pin` (1..=4): the
+/// unique host bridge of `domain` (same rules as `for_pci_function`, with
+/// `#address-cells = 3`, `#interrupt-cells = 1`) masks the child unit
+/// address `<bus << 16 | devfn << 8, 0, 0>` and pin with
+/// `interrupt-map-mask` and matches `interrupt-map`; parent
+/// `#address-cells` defaults to 0. Only one nexus hop to an
+/// `interrupt-controller` parent is resolved; no bridge swizzle.
+pub struct IntxRoute { pub parent: u32, pub specifier: [u32; 4], pub cells: usize }
+pub fn intx_route(blob: &[u8], domain: u16, bus: u8, devfn: u8, pin: u8) -> Option<IntxRoute>;
+
+/// GIC 3-cell specifier -> (INTID, level): SPI type 0 only, INTID 32+n,
+/// flags 1 = edge rising, 4 = level high; other senses refuse.
+pub fn gic_spi(route: &IntxRoute) -> Option<(u32, bool)>;
 ```
 
 ## 5. Test surface
@@ -163,6 +177,7 @@ pub fn reserved_memory_region(blob: &[u8], phandle: u32) -> Option<(u64, u64)>;
 | `smoke_fdt_reservations`           | reserve-map decoded                |
 | `smoke_fdt_reserved_memory_static_ranges` | `/reserved-memory` static range + flags |
 | `smoke_fdt_interrupts_extended_multiple_domains` | mixed interrupt domains decoded |
+| `smoke_fdt_pci_intx_interrupt_map_matches_linux` | QEMU virt slot/pin rotation, mask wrap, domain/pin refusal, nested nexus and level-low refusal |
 
 ## 6. Out of scope (v0.1)
 
