@@ -129,6 +129,37 @@ pub fn capture() {
 // other stage diverged, and no delta name is unaccounted for.
 // The entries below are updated to the verified set; the
 // fixture still asserts exact-set, exact-order equality.
+//
+// CORRECTION (2026-10-28, rebase onto origin/main 58642a0ed):
+// the baseline again predates merges that landed on main after
+// the 2026-10-28 refresh — Subsys recorded 154 where the snapshot
+// composes 155, and Device recorded 20 where the snapshot
+// composes 21. Each delta name is accounted for by a named,
+// already-merged PR, verified against the registration sites on
+// main and the crate call order in frame's boot sequence: PR
+// #1191 (serial suspend/resume replay, #763; commit 3b46a243a)
+// added `usb-serial-pm` at Subsys (directly after
+// `usb-serial-devfs`, its registration order in
+// `drivers/usb/src/lib.rs`, where it sits between
+// `usb-serial-devfs` and `usb-ccid-devfs`); PR #1195 (wifi
+// remaining-features; commit b117a2fb2) added `ath11k-ahb` at
+// Device (snapshot index 0, directly before `amd-fch-gpio`:
+// the wireless crate's `register_initcalls` is called by frame
+// unconditionally before the gpio crate's, and no crate called
+// earlier registers a Device name, so the wireless Device entry
+// opens the stage). The delta was verified three ways: a
+// full-tree multiset diff of `narf_init::register` sites between
+// the old base and the new tip (exactly these two additions, no
+// removals or renames), a register-line diff over every
+// registration-site file that changed in the merge range (only
+// the same two added lines), and a bare_main call-order diff
+// (identical). No other stage diverged, and no delta name is
+// unaccounted for. The entries below are updated to the
+// verified set; the fixture still asserts exact-set,
+// exact-order equality. CI on the rebased head is the judge:
+// if the census smoke fails there, this correction is wrong,
+// not the snapshot.
+//
 // The recording is reality, not an ideal: on x86_64 the `arch` stage
 // is empty and `ipmi`, `itco_wdt`, and `usb-r8152` each register
 // twice at Subsys (pre-existing duplicate registrations; the census
@@ -209,6 +240,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "sdhci",
         "rtsx",
         "usb-serial-devfs",
+        "usb-serial-pm",
         "usb-ccid-devfs",
         "usb-uac",
         "usb-uvc",
@@ -303,7 +335,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "itco_wdt",
         "pl011",
         "psmouse",
-    ], // subsys: 154
+    ], // subsys: 155
     &[
         "modules-sysfs",
         "devfs-mount",
@@ -313,6 +345,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "proc-pressure",
     ], // fs: 6
     &[
+        "ath11k-ahb",
         "amd-fch-gpio",
         "intel-pch-gpio",
         "amd-fch-i2c",
@@ -333,7 +366,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "psmouse-extensions",
         "pci-probe-all",
         "jc42",
-    ], // device: 20
+    ], // device: 21
     &[
         "bpf-leds/worker",
         "virtio-input-pump",
