@@ -1120,6 +1120,18 @@ functions, production hardware-channel selection, two scans with distinct
 IDs, stale/wrong-requestor responses, malformed beacons, management header
 variants, concurrent terminal HTT completion and dropped/failed ownership.
 
+**Beacon WMM updates** (closes `dynamic_wmm`). After association, a beacon
+from the associated BSS whose WMM Parameter element carries a different
+Parameter Set Count than the programmed set queues that set
+(`wmm::beacon`, mac80211 `ieee80211_sta_wmm_params`). An absent or
+unparsable element changes nothing; a new set with BE ACM is refused and
+closes the station, as the association response would. The Device worker's
+await point (`flush_station_management`, beside the protected-management
+flush) re-sends the per-dialect `WMI_PDEV_SET_WMM_PARAMS` command
+(`ath10k_conf_tx` for every AC), then updates the peer's parameters and ACM
+downgrade. Smoke: `smoke_ath10k_wmm_beacon_parameter_set_change_reprograms_contention`
+(all six dialects).
+
 ## 8. Remaining software and hardware acceptance
 
 The retained validation profile is calibrated BMI boot with a signed board

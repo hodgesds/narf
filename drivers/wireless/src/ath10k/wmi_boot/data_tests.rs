@@ -370,18 +370,21 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
     let word = |at: usize| u32::from_le_bytes(command[at..at + 4].try_into().unwrap());
     let native_phase = m.data.as_ref().unwrap().control_phase;
     let qos = m.data.as_ref().unwrap().qos();
-    let is_wmm = qos && native_phase == 2;
+    let wmm_id: u32 = match dialect {
+        Dialect::Main | Dialect::Tlv => 0x4006,
+        Dialect::TenOne | Dialect::TenTwo | Dialect::TenTwoFour => 0x9009,
+        Dialect::TenFour => 0x900b,
+    };
+    // After VDEV_UP (qos phase 5), only a beacon-driven ath10k_conf_tx
+    // reprogramming is accepted, without advancing the association script.
+    let late_wmm = qos && native_phase >= 5 && word(0) == wmm_id;
+    let is_wmm = qos && native_phase == 2 || late_wmm;
     let phase = native_phase - u8::from(qos && native_phase > 2);
     let mut replies = Vec::new();
-    let mut advance = true;
+    let mut advance = !late_wmm;
     if is_wmm {
-        let expected_id: u32 = match dialect {
-            Dialect::Main | Dialect::Tlv => 0x4006,
-            Dialect::TenOne | Dialect::TenTwo | Dialect::TenTwoFour => 0x9009,
-            Dialect::TenFour => 0x900b,
-        };
         let f = m.data.as_mut().unwrap();
-        let mut expected = expected_id.to_le_bytes().to_vec();
+        let mut expected = wmm_id.to_le_bytes().to_vec();
         if dialect == Dialect::Tlv {
             expected.extend_from_slice(&[8, 0, 83, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         }
