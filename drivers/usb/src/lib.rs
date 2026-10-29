@@ -114,6 +114,17 @@ pub fn register_initcalls() {
         msc::register_initcalls();
         InitResult::Ok
     });
+    // Fingerprint binds through the attach cascade, not the class
+    // registry; this registration exists so the registry's unbind
+    // dispatch (detach path) can reach fingerprint::detach_fp and
+    // wbdi::detach_wbdi, and so the async system-PM hook can
+    // re-arm ELAN devices on resume (#922).
+    narf_init::register(Stage::Subsys, "usb-fp-lifecycle", || {
+        fingerprint::register_initcalls();
+        wbdi::register_initcalls();
+        fingerprint::register_pm();
+        InitResult::Ok
+    });
     narf_init::register(Stage::Subsys, "usb-xpad", || {
         xpad::register_initcalls();
         InitResult::Ok
