@@ -68,7 +68,10 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
 - **Bluetooth Core Specification, version 5.3, Vol 3 Part H** —
   Security Manager Protocol. §3.3 (PDU layout), §2.3.5 (LE Secure
   Connections pairing), §2.3.5.1 (pairing-method selection table 2.8),
-  §2.2.5 (AES-CMAC), §2.2.6 (DHKey), §2.2.7 (f5 LTK derivation).
+  §2.3.5.6 (pairing phase 2), §2.2.5 (AES-CMAC), §2.2.6 (f4 confirm
+  values, table 2.1), §2.2.7 (f5 MacKey / LTK derivation), §2.2.8
+  (f6 DHKey checks, table 2.2), §2.2.9 (g2), Appendix D (sample
+  data pinning the f4/f5/f6 helpers byte-for-byte).
 
 ### HFP (Hands-Free Profile)
 
@@ -217,9 +220,15 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   By Type for Characteristics, Find Information for Descriptors).
 - **SMP** (`smp`): Pairing PDU codec, IO-Capability + AuthReq
   bitfields, pairing-method selector (table 2.8), LE Secure
-  Connections **Just Works** initiator + responder state machines.
-  Numeric Comparison g2 helper (§2.2.8). Crypto primitives injected
-  through `SmpCrypto` trait (P-256 keygen + DH, AES-CMAC, RNG).
+  Connections **Just Works** initiator + responder state machines
+  running the full §2.3.5.6 sequence: f4 Pairing Confirm values
+  generated and verified on both roles (§2.2.6, table 2.1), f5
+  MacKey + LTK derivation (§2.2.7), and f6 DHKey Check values
+  generated and verified on both roles (§2.2.8, table 2.2);
+  confirm / DHKey mismatches abort the exchange (Pairing Failed
+  0x04 / 0x0B via the pump). Numeric Comparison g2 helper
+  (§2.2.9). Crypto primitives injected through `SmpCrypto` trait
+  (P-256 keygen + DH, AES-CMAC, RNG).
 - **GATT server** (`gatt_server`): in-memory attribute database
   with handle assignment + permission flags, request handler that
   answers Read / Write / Read By Type / Read By Group Type / Find
