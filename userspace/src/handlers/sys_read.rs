@@ -63,6 +63,57 @@ fn try_zeroed_staging(len: usize) -> Result<alloc::vec::Vec<u8>, ()> {
     Ok(staging)
 }
 
+/// Read(2)-path readahead (#743): after a successful regular-file
+/// read, let the open file description's sequential-pattern state
+/// decide whether to populate the shared page cache ahead of the
+/// stream, through #735's [`crate::mapped_file::populate_file_cache`].
+///
+/// This is populate-ahead only: the bytes the caller just received
+/// came through the ordinary authoritative `FileOps::read` path, and
+/// nothing here changes what any read returns. The win is for what
+/// comes next — a later read whose filesystem consults the cache, a
+/// later mmap fault (which finds the page already present and does no
+/// device I/O), and the clustered fills `populate_file_cache` itself
+/// performs page by page through the fault path's machinery.
+///
+/// Exclusions mirror the cache's own retention rules: streams and
+/// non-regular files have no page-cache stream to feed; an `O_DIRECT`
+/// description bypasses the cache by contract (and forgets any
+/// pattern it had, since its reads say nothing about cached access);
+/// files that cannot retain idle cache pages — no cache generation,
+/// or a direct `mmap_fault` provider whose pages never consult this
+/// cache — are no-ops inside `populate_file_cache`, so the pattern is
+/// not even tracked for them.
+pub(super) fn note_read_for_readahead(
+    endpoint: &super::CopyFdEndpoint,
+    start: u64,
+    read: usize,
+) {
+    if read == 0 || endpoint.ops.is_stream() {
+        return;
+    }
+    if endpoint.status_flags & crate::fd::O_DIRECT != 0 {
+        endpoint.description.reset_readahead();
+        return;
+    }
+    if endpoint.ops.stat().mode.file_type != narf_filesystem::FileType::File {
+        return;
+    }
+    // Populate through the pinned file — the same object a mapping of
+    // this fd faults through — so the pages land under the identity
+    // later faults look up (the `sys_readahead` discipline).
+    let pinned = endpoint
+        .ops
+        .mmap_pinned_file(alloc::sync::Arc::clone(&endpoint.ops));
+    if pinned.supports_mmap_fault() || pinned.mmap_cache_generation().is_none() {
+        return;
+    }
+    let Some((offset, len)) = endpoint.description.note_readahead_read(start, read as u64) else {
+        return;
+    };
+    crate::mapped_file::populate_file_cache(&pinned, offset, len);
+}
+
 /// Pipe/FIFO reads must not dequeue bytes before the guarded user copy. A
 /// prior range check cannot exclude a concurrent unmap; these concrete stream
 /// surfaces hold the prefix stable and commit consumption only after copy.
@@ -260,6 +311,7 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
     const CHUNK: usize = 64 * 1024;
     let mut total = 0usize;
     let mut offset = endpoint.description.offset();
+    let read_start = offset;
     // rw_verify_area(READ, file, &f_pos, count): f_pos + count past
     // LLONG_MAX is -EINVAL (streams pass ppos == NULL and skip this).
     if !endpoint.ops.is_stream() {
@@ -429,10 +481,15 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
     if !endpoint.ops.is_stream() {
         endpoint.description.set_offset(offset);
     }
+    // Readahead population does device I/O of its own; it must not run
+    // while this description's position lock is held, or a peer reader
+    // sharing the description waits out the whole window fill.
+    drop(_position_guard);
     // Mirror of the fifo wake in sys_write: draining a FIFO makes room, so a
     // writer parked on a full buffer must be re-enqueued now (see the helper).
     if total != 0 {
         wake_fifo_io_waiters(endpoint.ops.as_ref());
     }
+    note_read_for_readahead(&endpoint, read_start, total);
     ctx.set_return(SyscallReturn::ok(total as u64));
 }
