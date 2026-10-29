@@ -148,6 +148,7 @@ members = [
     "drivers/sound",
     "drivers/tpm",
     "drivers/hwmon",
+    "drivers/watchdog",
     "drivers/media",
     "drivers/serial",
     "modules",
