@@ -67,6 +67,8 @@ pub(super) struct State {
     last_peer: narf_time::Deadline,
     /// Newer AP WMM parameter set from a beacon, awaiting `ath10k_conf_tx`.
     wmm_update: Option<narf_wireless::wmm::Parameters>,
+    /// Changed beacon ERP `use_cts_prot`, awaiting `BSS_CHANGED_ERP_CTS_PROT`.
+    protection_update: Option<bool>,
     /// A CCMP-protected SA Query Response awaiting the native management
     /// path (one outstanding; a second request before it is sent is
     /// dropped, as mac80211 answers each request independently).
@@ -289,14 +291,32 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     ) -> Result<bool, Error> {
         if self.failed
             || self.station_link().is_none()
-            || self
-                .data
-                .as_ref()
-                .is_none_or(|d| d.management.is_none() && d.wmm_update.is_none())
+            || self.data.as_ref().is_none_or(|d| {
+                d.management.is_none() && d.wmm_update.is_none() && d.protection_update.is_none()
+            })
         {
             return Ok(false);
         }
         self.check_data_policy(domain)?;
+        // ath10k_bss_info_changed(BSS_CHANGED_ERP_CTS_PROT): recalc RTS/CTS
+        // and set use_cts_prot, keeping the configured RTS threshold. It waits
+        // for an open, reply-free data path rather than failing the owner.
+        if let Some(cts_protection) = self
+            .data
+            .as_ref()
+            .filter(|d| d.protection_allowed())
+            .and_then(|d| d.protection_update)
+        {
+            let request = super::protection::Request {
+                rts_threshold: self.protection.and_then(|r| r.rts_threshold),
+                cts_protection,
+            };
+            self.set_station_protection(request, || Ok(domain.clone()))
+                .await?;
+            if let Some(data) = self.data.as_mut() {
+                data.protection_update = None;
+            }
+        }
         self.failed = true;
         let sent = self.send_station_management().await?;
         let wmm = self.send_station_wmm(&|| Ok(())).await?;
@@ -577,6 +597,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             authorized: !associated.protected,
             last_peer: narf_time::Deadline::after_ms(5000),
             wmm_update: None,
+            protection_update: None,
             management: None,
         });
         self.failed = true;
@@ -959,6 +980,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                             return Err(Error::Unsupported);
                         }
                         data.last_peer = narf_time::Deadline::after_ms(5000);
+                        // mac80211 ieee80211_handle_bss_capability (2.4 GHz):
+                        // use_cts_prot = ERP present && Use_Protection; a
+                        // change raises BSS_CHANGED_ERP_CTS_PROT.
+                        if peer.permission.frequency < 3000 {
+                            let erp = element(&beacon.information_elements, 42)?;
+                            let wanted = erp.and_then(|b| b.first()).is_some_and(|v| v & 2 != 0);
+                            let programmed = self.protection.is_some_and(|r| r.cts_protection);
+                            data.protection_update = (wanted != programmed).then_some(wanted);
+                        }
                         // mac80211 ieee80211_sta_wmm_params: a changed
                         // Parameter Set Count reprograms every AC.
                         if let Some(current) = peer.wmm {

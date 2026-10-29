@@ -1132,6 +1132,19 @@ flush) re-sends the per-dialect `WMI_PDEV_SET_WMM_PARAMS` command
 downgrade. Smoke: `smoke_ath10k_wmm_beacon_parameter_set_change_reprograms_contention`
 (all six dialects).
 
+**Beacon ERP protection** (closes `automatic_protection`). On 2.4 GHz, each
+beacon from the associated BSS yields mac80211's `use_cts_prot` (ERP element
+present with Use_Protection, `ieee80211_handle_bss_capability`). A value that
+differs from the programmed one is queued as `BSS_CHANGED_ERP_CTS_PROT`; the
+Device worker's await point then runs `set_station_protection` (Linux
+`ath10k_recalc_rtscts_prot` + `ath10k_mac_set_cts_prot`: RTS/CTS enable,
+`use_cts_prot`, RTS threshold), keeping the configured threshold (HT40 keeps
+its forced RTS). It waits for an open, reply-free data path instead of
+failing the owner. Linux `ath10k_bss_info_changed` handles no HT Operation
+protection change; a changed HT Operation still closes the station
+(`matches_beacon`). Smoke:
+`smoke_ath10k_beacon_erp_protection_reprograms_cts_all_six_dialects`.
+
 ## 8. Remaining software and hardware acceptance
 
 The retained validation profile is calibrated BMI boot with a signed board
