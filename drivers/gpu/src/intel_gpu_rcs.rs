@@ -699,6 +699,11 @@ pub enum SubmitError {
 
 /// A CPU-addressable, GGTT-mapped allocation.
 pub trait GpuBacking {
+    /// True only for a CPU mapping whose concurrent shared cache lines are
+    /// coherent with the device. One-shot cache cleaning is insufficient.
+    fn coherent_for_device(&self) -> bool {
+        false
+    }
     /// GGTT offset of the allocation's first page.
     fn ggtt_offset(&self) -> u32;
     /// Size in 4 KiB pages.
@@ -751,6 +756,8 @@ pub struct FrameBacking {
     ggtt: u32,
     pages: u32,
     frames: Vec<narf_memory::frame::PhysFrame>,
+    coherent: bool,
+    mapped: bool,
 }
 
 impl core::fmt::Debug for FrameBacking {
@@ -764,6 +771,48 @@ impl core::fmt::Debug for FrameBacking {
 }
 
 impl FrameBacking {
+    /// Clean/invalidate exclusive WB backing for one-shot firmware DMA.
+    /// After a device write this is valid only if the CPU has not dirtied any
+    /// line since the pre-DMA clean. It does not make live CT memory coherent.
+    pub(crate) fn publish_for_device(&self) -> bool {
+        compiler_fence(Ordering::SeqCst);
+        #[cfg(target_arch = "x86_64")]
+        {
+            let caps = narf_arch::x86_64::cache::caps();
+            let line = caps.line_bytes as usize;
+            if !caps.clflush || !line.is_power_of_two() || line > 4096 {
+                return false;
+            }
+            for frame in &self.frames {
+                let base = frame.start_address().kernel_ptr::<u8>();
+                for offset in (0..4096usize).step_by(line) {
+                    compiler_fence(Ordering::SeqCst);
+                    // SAFETY: CLFLUSH was checked and this backing owns every
+                    // mapped page; each address stays within its page.
+                    unsafe {
+                        narf_arch::x86_64::cache::clflush(base.add(offset));
+                    }
+                    compiler_fence(Ordering::SeqCst);
+                }
+                narf_scheduler::sleep_pumps::run();
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        for frame in &self.frames {
+            // SAFETY: each range is one mapped frame owned by this backing.
+            unsafe {
+                narf_arch::aarch64::cache::clean_inval_to_poc(
+                    frame.start_address().kernel_ptr::<u8>() as usize,
+                    4096,
+                );
+            }
+            narf_scheduler::sleep_pumps::run();
+        }
+        fence(Ordering::SeqCst);
+        compiler_fence(Ordering::SeqCst);
+        true
+    }
+
     /// Raw pointer to the dword at `byte_off` inside the backing.
     ///
     /// # Safety
@@ -784,6 +833,9 @@ impl FrameBacking {
 }
 
 impl GpuBacking for FrameBacking {
+    fn coherent_for_device(&self) -> bool {
+        self.coherent
+    }
     fn ggtt_offset(&self) -> u32 {
         self.ggtt
     }
@@ -817,6 +869,9 @@ pub struct GgttArena {
     /// BAR length is unknown to this handle, checks skipped —
     /// production always constructs over the probed BAR).
     ggtt_va_size: u64,
+    policy: Option<crate::intel_gpu_gt_hw::CachePolicy>,
+    authority: Option<crate::intel_gpu_gt_hw::AuthorizedWindow>,
+    gt_platform: Option<crate::intel_gpu_gt::GtPlatform>,
 }
 
 impl core::fmt::Debug for GgttArena {
@@ -830,6 +885,19 @@ impl core::fmt::Debug for GgttArena {
 }
 
 impl GgttArena {
+    fn encode_pte(&self, phys: u64) -> Result<u64, crate::intel_gpu_gtt::GttError> {
+        match self.policy {
+            None => encode_scanout_pte(phys, PatSlot::Slot0),
+            Some(policy) => {
+                let format = if policy.platform() == crate::intel_gpu_gt::GtPlatform::Alchemist {
+                    crate::intel_gpu_gtt::PteFormat::Gen12
+                } else {
+                    crate::intel_gpu_gtt::PteFormat::XeLpg
+                };
+                format.encode_ggtt(phys, policy.ggtt_pat())
+            }
+        }
+    }
     /// Create an arena covering [`GGTT_ARENA_BASE`] for
     /// [`GGTT_ARENA_PAGES`] pages over the BAR0 window `bar`.
     pub fn new(bar: narf_bus::bar::MmioRegion) -> Self {
@@ -849,12 +917,36 @@ impl GgttArena {
             live: 0,
             live_pages: 0,
             ggtt_va_size,
+            policy: None,
+            authority: None,
+            gt_platform: None,
         }
+    }
+
+    pub(crate) fn for_gt(
+        bar: narf_bus::bar::MmioRegion,
+        cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+        platform: crate::intel_gpu_gt::GtPlatform,
+    ) -> Self {
+        let mut arena = Self::new(bar);
+        arena.authority = Some(crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap));
+        arena.gt_platform = Some(platform);
+        arena
     }
 
     /// Write one GGTT PTE (or zero to invalidate) at `ggtt_off`.
     fn write_pte(&self, ggtt_off: u32, pte: u64) {
         let pte_byte = GGTT_ARRAY_BASE + (ggtt_off as u64 / GTT_PAGE_SIZE) * 8;
+        if let Some(window) = &self.authority {
+            window.write32(pte_byte, pte as u32);
+            window.write32(pte_byte + 4, (pte >> 32) as u32);
+            // Wa_22019338487: RO GMD_ID write drains G-unit PTE writes.
+            // Every BMG PTE is conservative relative to the 1100-PTE limit.
+            if self.gt_platform == Some(crate::intel_gpu_gt::GtPlatform::Battlemage) {
+                window.write32(0xd8c, 0);
+            }
+            return;
+        }
         // SAFETY: `self.bar` is the probe-mapped BAR0 owned by
         // this driver; `pte_byte` is an 8-byte-aligned slot inside
         // the GGTT array half of BAR0 for any in-arena offset —
@@ -873,6 +965,11 @@ impl GgttArena {
     fn flush_pte_writes(&self, last_ggtt_off: u32) {
         compiler_fence(Ordering::SeqCst);
         let pte_byte = GGTT_ARRAY_BASE + (last_ggtt_off as u64 / GTT_PAGE_SIZE) * 8;
+        if let Some(window) = &self.authority {
+            let _ = window.read32(pte_byte);
+            let _ = window.read32(0x1901f8);
+            return;
+        }
         // SAFETY: same BAR ownership and in-arena argument as
         // `write_pte`; a GGTT array read has no side effect.
         // SAFETY: Valid MMIO bounds or trusted driver environment
@@ -920,6 +1017,15 @@ impl GpuAllocator for GgttArena {
                 }
             }
         }
+        if frames
+            .iter()
+            .any(|f| self.encode_pte(f.start_address().raw()).is_err())
+        {
+            for frame in frames {
+                narf_memory::frame::free_frame(frame);
+            }
+            return Err(SubmitError::OutOfMemory);
+        }
         if len == pages {
             self.free_list.remove(i);
         } else {
@@ -929,13 +1035,16 @@ impl GpuAllocator for GgttArena {
             ggtt: off,
             pages,
             frames,
+            coherent: self.policy.is_some() && cfg!(target_arch = "x86_64"),
+            mapped: self.authority.is_none() || self.policy.is_some(),
         };
-        for (p, frame) in backing.frames.iter().enumerate() {
-            let pte = encode_scanout_pte(frame.start_address().raw(), PatSlot::Slot0)
-                .map_err(|_| SubmitError::OutOfMemory)?;
-            self.write_pte(off + (p as u32) * GTT_PAGE_SIZE as u32, pte);
-        }
-        if pages > 0 {
+        if backing.mapped {
+            for (p, frame) in backing.frames.iter().enumerate() {
+                let pte = self
+                    .encode_pte(frame.start_address().raw())
+                    .expect("validated frame extent");
+                self.write_pte(off + (p as u32) * GTT_PAGE_SIZE as u32, pte);
+            }
             self.flush_pte_writes(off + (pages - 1) * GTT_PAGE_SIZE as u32);
         }
         backing.zero_fill();
@@ -945,10 +1054,10 @@ impl GpuAllocator for GgttArena {
     }
 
     fn free(&mut self, backing: FrameBacking) {
-        for p in 0..backing.pages {
-            self.write_pte(backing.ggtt + p * GTT_PAGE_SIZE as u32, 0);
-        }
-        if backing.pages > 0 {
+        if backing.mapped {
+            for p in 0..backing.pages {
+                self.write_pte(backing.ggtt + p * GTT_PAGE_SIZE as u32, 0);
+            }
             self.flush_pte_writes(backing.ggtt + (backing.pages - 1) * GTT_PAGE_SIZE as u32);
         }
         for f in backing.frames {
@@ -1005,6 +1114,38 @@ impl SharedArena {
         Self {
             inner: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(arena)),
         }
+    }
+
+    pub(crate) fn configure_cache(
+        &self,
+        backing: &mut FrameBacking,
+        policy: crate::intel_gpu_gt_hw::CachePolicy,
+    ) -> Result<(), SubmitError> {
+        let mut arena = self.inner.lock();
+        if arena
+            .gt_platform
+            .is_some_and(|platform| platform != policy.platform())
+        {
+            return Err(SubmitError::NoEngine);
+        }
+        if arena.policy.is_some_and(|old| {
+            old.platform() != policy.platform() || old.ggtt_pat() != policy.ggtt_pat()
+        }) {
+            return Err(SubmitError::NoEngine);
+        }
+        arena.policy = Some(policy);
+        for (i, frame) in backing.frames.iter().enumerate() {
+            let pte = arena
+                .encode_pte(frame.start_address().raw())
+                .map_err(|_| SubmitError::OutOfMemory)?;
+            arena.write_pte(backing.ggtt + i as u32 * 4096, pte);
+        }
+        arena.flush_pte_writes(backing.ggtt + (backing.pages - 1) * 4096);
+        // The hardware policy requests snooped system-memory access. The ARM
+        // PCI host-bridge coherency contract is not established by this driver.
+        backing.coherent = cfg!(target_arch = "x86_64");
+        backing.mapped = true;
+        Ok(())
     }
 }
 
@@ -2024,6 +2165,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
 // ABI exists above it; nothing else in the tree calls it yet.
 
 /// `MmioWindow` over the controller's BAR0 mapping.
+#[derive(Clone)]
 pub struct BarWindow {
     bar: narf_bus::bar::MmioRegion,
 }

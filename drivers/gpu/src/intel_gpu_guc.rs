@@ -29,6 +29,7 @@ pub struct CssImage<'a> {
     pub upload: &'a [u8],
     pub signature: &'a [u8],
     pub version: (u8, u8, u8),
+    pub submission_version: (u8, u8, u8),
     pub private_data_bytes: u32,
 }
 
@@ -71,6 +72,10 @@ impl<'a> CssImage<'a> {
             return Err(GuCError::FirmwareVersion);
         }
         let private_data_bytes = u32_at(blob, 120);
+        let submission = u32_at(blob, 68);
+        if submission >> 24 != 0 {
+            return Err(GuCError::FirmwareVersion);
+        }
         if private_data_bytes > 64 * 1024 * 1024 || private_data_bytes % 4096 != 0 {
             return Err(GuCError::FirmwareLayout);
         }
@@ -78,6 +83,11 @@ impl<'a> CssImage<'a> {
             upload: &blob[..upload_end],
             signature: &blob[upload_end..signature_end],
             version: ((version >> 16) as u8, (version >> 8) as u8, version as u8),
+            submission_version: (
+                (submission >> 16) as u8,
+                (submission >> 8) as u8,
+                submission as u8,
+            ),
             private_data_bytes,
         })
     }

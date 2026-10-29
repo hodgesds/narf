@@ -134,6 +134,7 @@ impl Topology {
     /// Every connected output hop, from the end port back to the root.
     /// Reject missing, cyclic or ambiguous parentage instead of omitting a
     /// bandwidth constraint. Probe-created trees have at most 64 branches.
+    #[cfg(any(feature = "intel", feature = "amdgpu", feature = "kernel-test"))]
     pub(crate) fn path(&self, mut sink: Sink) -> Option<Vec<Sink>> {
         let mut out = Vec::new();
         for _ in 0..self.branches.len().min(64) {

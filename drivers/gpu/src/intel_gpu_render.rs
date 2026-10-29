@@ -4,6 +4,7 @@
 //! independent of display admission: a working panel is not an initialized GT.
 //! Unsupported acceleration is reported as such, never as a completed job.
 
+use alloc::borrow::Cow;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -13,6 +14,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::intel_gpu::Generation;
 use crate::intel_gpu_gem::GemState;
+use crate::intel_gpu_gt::GtPlatform;
+use crate::intel_gpu_hwconfig::HardwareConfig;
 use crate::intel_gpu_uapi::{self as abi, put32, put64, u32_at, u64_at};
 
 const MAX_COPY: usize = 1024 * 1024;
@@ -40,27 +43,27 @@ impl SubmissionProfile {
 }
 
 /// Probe-owned facts. No topology, memory size or firmware version is guessed.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct DeviceInfo {
     pub device_id: u16,
-    pub generation: Generation,
+    pub platform: GtPlatform,
     pub memory_bytes: u64,
+    pub hwconfig: Option<Arc<HardwareConfig>>,
 }
 
 impl DeviceInfo {
     pub fn for_card(card: u32) -> Option<Self> {
-        let (vendor, device_id) = crate::drm_registry::pci_id(card)?;
-        if vendor != 0x8086 {
+        let card = crate::drm_registry::card(card)?;
+        if card.driver() != "intel-gpu" {
             return None;
         }
-        let generation = crate::intel_gpu::DEVICE_TABLE
-            .iter()
-            .find(|entry| entry.did == device_id)?
-            .generation;
+        let device_id = card.device_id();
+        let platform = GtPlatform::from_pci(card.vendor_id(), device_id)?;
         Some(Self {
             device_id,
-            generation,
+            platform,
             memory_bytes: narf_memory::frame::stats().total as u64 * 4096,
+            hwconfig: card.intel_hwconfig(),
         })
     }
 
@@ -642,15 +645,21 @@ fn query(info: &DeviceInfo, arg: u64, user: &dyn IoctlContext) -> Result<(), FsE
             if flags != 0 || capacity < 0 {
                 return Err(FsError::InvalidData);
             }
-            let reply = match id {
-                abi::QUERY_ENGINES => vec![0; 16], // no userspace queues admitted
+            let reply: Cow<'_, [u8]> = match id {
+                abi::QUERY_ENGINES => Cow::Owned(vec![0; 16]), // no userspace queues admitted
                 abi::QUERY_MEMORY_REGIONS if info.memory_bytes != 0 => {
                     let mut reply = vec![0; 104]; // header16 + memory_region_info88
                     put32(&mut reply, 0, 1);
                     put64(&mut reply, 24, info.memory_bytes);
                     put64(&mut reply, 32, info.memory_bytes);
-                    reply
+                    Cow::Owned(reply)
                 }
+                abi::QUERY_HWCONFIG => {
+                    Cow::Borrowed(info.hwconfig.as_ref().ok_or(FsError::NoDevice)?.as_bytes())
+                }
+                // Linux reports the GuC scheduling interface, not the loaded
+                // firmware's release. No submission interface is installed yet.
+                abi::QUERY_GUC_SUBMISSION_VERSION => return Err(FsError::NoDevice),
                 _ => return Err(FsError::InvalidData),
             };
             let required = reply.len() as i32;
@@ -665,6 +674,7 @@ fn query(info: &DeviceInfo, arg: u64, user: &dyn IoctlContext) -> Result<(), FsE
         let length = match result {
             Ok(size) => size,
             Err(FsError::BadAddress) => -14,
+            Err(FsError::NoDevice) => -19,
             Err(_) => -22,
         };
         // Only length is an output field. Preserve item flags, pointer and id.
@@ -677,7 +687,7 @@ fn query(info: &DeviceInfo, arg: u64, user: &dyn IoctlContext) -> Result<(), FsE
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -732,8 +742,9 @@ mod tests {
     fn info(generation: Generation) -> DeviceInfo {
         DeviceInfo {
             device_id: 0x7d55,
-            generation,
+            platform: GtPlatform::Integrated(generation),
             memory_bytes: 0x8000_0000,
+            hwconfig: None,
         }
     }
     fn invoke(file: &RenderFile, user: &User, cmd: u32) -> Result<u64, FsError> {
@@ -746,6 +757,181 @@ mod tests {
             Err(why) => TestResult::Fail(why),
         }
     }
+
+    /// Exercise the actual primary/render file dispatchers against one card's
+    /// immutable snapshot, including when its firmware owner has been dropped.
+    pub(crate) fn check_card_hwconfig(
+        card: u32,
+        expected: Option<&[u8]>,
+    ) -> Result<(), &'static str> {
+        use narf_filesystem::DirOps;
+        for name in [
+            alloc::format!("card{card}"),
+            alloc::format!("renderD{}", card + 128),
+        ] {
+            let file = crate::drm_devfs_bridge::DriDir
+                .lookup(&name)
+                .ok_or("DRM node")?;
+            let user = User::new();
+            let mut request = [0; 16];
+            put32(&mut request, 0, 5);
+            put64(&mut request, 8, 256);
+            user.store(64, &request);
+            let mut items = [0; 120];
+            for (item, id) in items.chunks_exact_mut(24).zip([5, 7, 2, 1, 4]) {
+                put64(item, 0, id);
+            }
+            user.store(256, &items);
+            narf_scheduler::block_on_spin(file.ioctl_user(abi::QUERY, 64, &user))
+                .map_err(|_| "node query")?;
+            let lengths = user.load(256, 120);
+            if u32_at(&lengths, 8) as i32 != expected.map_or(-19, |bytes| bytes.len() as i32)
+                || u32_at(&lengths, 32) as i32 != -19 // no GuC submission interface
+                || u32_at(&lengths, 56) != 16 // no admitted engines
+                || u32_at(&lengths, 80) as i32 != -22 // no active topology
+                || u32_at(&lengths, 104) != 104
+            // system RAM only
+            {
+                return Err("card query availability/length");
+            }
+            if let Some(bytes) = expected {
+                put32(&mut items, 8, bytes.len() as u32 + 8);
+                put64(&mut items, 16, 1024);
+                put32(&mut items, 56, 16);
+                put64(&mut items, 64, 2048);
+                put32(&mut items, 104, 104);
+                put64(&mut items, 112, 4096);
+                user.store(256, &items);
+                user.store(1024 + bytes.len() as u64, &[0xaa; 8]);
+                narf_scheduler::block_on_spin(file.ioctl_user(abi::QUERY, 64, &user))
+                    .map_err(|_| "node data query")?;
+                if user.load(1024, bytes.len()) != bytes
+                    || user.load(1024 + bytes.len() as u64, 8) != [0xaa; 8]
+                    || user.load(2048, 16) != [0; 16]
+                {
+                    return Err("exact HWCONFIG bytes/extent or invented engine");
+                }
+                let memory = user.load(4096, 104);
+                if u32_at(&memory, 0) != 1 || u32_at(&memory, 16) != 0 {
+                    return Err("system memory misreported as VRAM");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn smoke_intel_registry_routes_primary_and_render_nodes() -> TestResult {
+        use narf_filesystem::DirOps;
+        check(|| {
+            for device_id in [0x9a49, 0x7d55, 0x56a0, 0xe20b] {
+                let card = Arc::new(crate::drm_devfs_bridge::IntelGpuCard::new(
+                    alloc::string::String::from("Intel routing fixture"),
+                    0x8086,
+                    device_id,
+                    0,
+                    0,
+                ));
+                let index = crate::drm_registry::register_drm_card(card);
+                if crate::drm_registry::driver_name(index) != Some("intel-gpu") {
+                    return Err("Intel driver identity missing from registry dispatch");
+                }
+                let info = DeviceInfo::for_card(index).ok_or("registered Intel profile")?;
+                if info.device_id != device_id
+                    || Some(info.platform) != GtPlatform::from_pci(0x8086, device_id)
+                    || info.submission_ready()
+                {
+                    return Err("registered card facts or unproven submission");
+                }
+                check_card_hwconfig(index, None)?;
+                for name in [
+                    alloc::format!("card{index}"),
+                    alloc::format!("renderD{}", index + 128),
+                ] {
+                    let file = crate::drm_devfs_bridge::DriDir
+                        .lookup(&name)
+                        .ok_or("DRM node")?;
+                    let other = crate::drm_devfs_bridge::DriDir
+                        .lookup(&name)
+                        .ok_or("second open")?;
+                    let user = User::new();
+                    let mut request = [0; 16];
+                    put32(&mut request, 0, 4); // actual PCI device ID
+                    put64(&mut request, 8, 256);
+                    user.store(64, &request);
+                    narf_scheduler::block_on_spin(file.ioctl_user(abi::GETPARAM, 64, &user))
+                        .map_err(|_| "GETPARAM through node")?;
+                    if u32_at(&user.load(256, 4), 0) != u32::from(device_id) {
+                        return Err("GETPARAM from another card");
+                    }
+                    put64(&mut request, 0, 4096);
+                    put64(&mut request, 8, 0);
+                    user.store(64, &request);
+                    narf_scheduler::block_on_spin(file.ioctl_user(abi::GEM_CREATE, 64, &user))
+                        .map_err(|_| "GEM_CREATE through node")?;
+                    let handle = u32_at(&user.load(64, 16), 8);
+                    let mut mmap = [0; 32];
+                    put32(&mut mmap, 0, handle);
+                    put64(&mut mmap, 16, 2); // I915_MMAP_OFFSET_WB
+                    user.store(64, &mmap);
+                    if narf_scheduler::block_on_spin(other.ioctl_user(
+                        abi::GEM_MMAP_OFFSET,
+                        64,
+                        &user,
+                    )) != Err(FsError::NotFound)
+                    {
+                        return Err("node opens shared GEM handles");
+                    }
+                    narf_scheduler::block_on_spin(file.ioctl_user(abi::GEM_MMAP_OFFSET, 64, &user))
+                        .map_err(|_| "MMAP_OFFSET through node")?;
+                    let offset = u64_at(&user.load(64, 32), 8);
+                    let backing = file.mmap_backing(offset, 4096).map_err(|_| "node mmap")?;
+                    if backing.frames.len() != 1 || backing.lifetime.is_none() {
+                        return Err("node mmap did not retain GEM backing");
+                    }
+                    let mut close = [0; 8];
+                    put32(&mut close, 0, handle);
+                    user.store(64, &close);
+                    narf_scheduler::block_on_spin(file.ioctl_user(abi::GEM_CLOSE, 64, &user))
+                        .map_err(|_| "GEM_CLOSE through node")?;
+                    if file.mmap_backing(offset, 4096).is_ok() {
+                        return Err("closed handle still maps through node");
+                    }
+                }
+            }
+            for (vendor, device) in [(0x8086, 0xffff), (0x1002, 0x7d55)] {
+                let index = crate::drm_registry::register_drm_card(Arc::new(
+                    crate::drm_devfs_bridge::IntelGpuCard::new(
+                        alloc::string::String::new(),
+                        vendor,
+                        device,
+                        0,
+                        0,
+                    ),
+                ));
+                if DeviceInfo::for_card(index).is_some()
+                    || RenderFile::new().dispatch_card(index, abi::GETPARAM, 0, &User::new())
+                        != Some(Err(FsError::NoDevice))
+                {
+                    return Err("unknown/non-Intel identity admitted");
+                }
+            }
+            let index = crate::drm_registry::register_drm_card(Arc::new(
+                crate::drm_devfs_bridge::BochsCard::new(alloc::string::String::new()),
+            ));
+            if DeviceInfo::for_card(index).is_some()
+                || RenderFile::new()
+                    .dispatch_card(index, abi::GETPARAM, 0, &User::new())
+                    .is_some()
+            {
+                return Err("another driver's ioctl intercepted");
+            }
+            Ok(())
+        })
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_render",
+        smoke_intel_registry_routes_primary_and_render_nodes
+    );
 
     fn smoke_intel_gem_namespace_mapping_and_close() -> TestResult {
         check(|| {
@@ -901,6 +1087,72 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_render",
         smoke_intel_query_two_pass_and_item_errors
+    );
+
+    fn smoke_intel_hwconfig_query_faults_and_copy_extent() -> TestResult {
+        // Local Linux i915_query.c::query_hwconfig_blob: size-only does not
+        // dereference data_ptr; short buffers are EINVAL and copies are exact.
+        check(|| {
+            let bytes: Vec<u8> = [0x9000u32, 2, 0xffffffff, 0x01020304, 7, 1, 8]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            let mut info = info(Generation::MeteorLake);
+            info.hwconfig = Some(Arc::new(HardwareConfig::parse(bytes.clone()).unwrap()));
+            let user = User::new();
+            let file = RenderFile::new();
+            let mut request = [0; 16];
+            put32(&mut request, 0, 2);
+            put64(&mut request, 8, 256);
+            user.store(64, &request);
+            for (capacity, flags, pointer, expected) in [
+                (0, 0, u64::MAX, 28),
+                (27, 0, 1024, -22),
+                (-1, 0, 1024, -22),
+                (28, 1, 1024, -22),
+                (28, 0, 0, -14),
+                (28, 0, u64::MAX - 8, -14),
+                (28, 0, 1024, 28),
+                (36, 0, 1024, 28),
+            ] {
+                let mut items = [0; 48];
+                put64(&mut items, 0, 5);
+                put32(&mut items, 8, capacity as u32);
+                put32(&mut items, 12, flags);
+                put64(&mut items, 16, pointer);
+                put64(&mut items, 24, 2); // a later valid item still runs
+                user.store(256, &items);
+                user.store(1024, &[0xaa; 36]);
+                file.dispatch(&info, abi::QUERY, 64, &user)
+                    .unwrap()
+                    .map_err(|_| "HWCONFIG item query")?;
+                let result = user.load(256, 48);
+                if u32_at(&result, 8) as i32 != expected
+                    || result[..8] != items[..8]
+                    || result[12..32] != items[12..32]
+                    || u32_at(&result, 32) != 16
+                {
+                    return Err("HWCONFIG per-item length/isolation or input fields changed");
+                }
+                let output = user.load(1024, 36);
+                if capacity >= 28 && flags == 0 && pointer == 1024 {
+                    if output[..28] != bytes || output[28..] != [0xaa; 8] {
+                        return Err("HWCONFIG output extent/order");
+                    }
+                } else if output != [0xaa; 36] {
+                    return Err("failed/size-only item wrote output");
+                }
+            }
+            *user.fail_write.lock() = Some(264); // item length itself faults
+            if file.dispatch(&info, abi::QUERY, 64, &user) != Some(Err(FsError::BadAddress)) {
+                return Err("length copy fault did not fail ioctl");
+            }
+            Ok(())
+        })
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_render",
+        smoke_intel_hwconfig_query_faults_and_copy_extent
     );
 
     fn smoke_intel_context_vm_lifetime_and_foreign_ids() -> TestResult {

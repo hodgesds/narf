@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.11** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.16** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -10,7 +10,8 @@
 > full single-stream landed — see §14; multi-pipe
 > display + DP MST landed — see §16).
 >
-> Driver for Intel integrated graphics from Tiger Lake through Meteor Lake.
+> Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
+> render foundations also cover Arc Alchemist and Battlemage.
 > References include Intel PRMs and the cited MIT-licensed Linux i915 ABI,
 > command and register definitions.
 
@@ -1481,30 +1482,128 @@ globally distinct mmap offsets; foreign attachments/sync-file imports are
 unavailable. Both primary and render nodes route these requests
 before shared DRM/KMS dispatch and acquire mmap backing atomically.
 
-This is **not a working Mesa 3D backend**. Validated execbuffer requests still
-return NotImplemented. No userspace engines or acceleration capabilities are
-advertised. Gen12 production execlists helpers no longer admit Meteor/Arrow
-Lake merely because those devices have a region map. The Xe-LPG GT/GuC owner
-still needs firmware upload/authentication, context registration, scheduling,
-completion and hardware reset integration.
+Validated execbuffer requests still return NotImplemented. No userspace engines
+or acceleration capabilities are advertised. Gen12 production execlists helpers
+refuse Meteor/Arrow Lake before MMIO. The physical GuC owner now supplies
+per-card startup, kernel context scheduling, completion and full-engine reset
+ownership; userspace state/isolation, active topology and Mesa 3D remain open.
+
 `intel_gpu_guc` now supplies validated CSS component ranges and coherent CTB
 send/receive primitives. `intel_gpu_guc_firmware` acquires a bounded immutable
-MTL/Arrow GuC-70 image through invoked registry/blob capabilities, preserving
-its identity. `intel_gpu_guc_transport` owns coherent GGTT CT memory and the
+MTL/Arrow, DG2 or BMG GuC-70 image through invoked registry/blob capabilities,
+preserving its identity. `intel_gpu_guc_transport` owns coherent GGTT CT memory and the
 graphics-GuC MMIO registration/enable/disable state machine. Its partial
 registration, timeout and broken-CT paths retain allocations until disable
-acknowledgment or proven reset. These do not upload/authenticate or schedule
-firmware by themselves. Gen12 owned resident submission, cache-flushed
-post-sync breadcrumbs, terminal fences and loss retention now have native
-hardware models; full GT/context setup, topology, hardware reset, accelerated
-PRIME/presentation and real Mesa acceptance remain outstanding.
+acknowledgment or proven reset. `intel_gpu_gt` provides exact DG2/BMG PCI identity
+and firmware profiles, separate from the integrated display table.
+
+`intel_gpu_guc_boot` owns the GuC reset, WOPCM layout, minimal ADS/log allocation,
+cache publication, firmware DMA and authentication state machine for these three
+profiles. Minimal bootstrap disables scheduling and advertises no engines. The
+physical owner holds forcewake/runtime-PM, serializes resets/DMA and programs
+PAT/MOCS before exposing mappings. All allocations stay above the largest
+admitted WOPCM window and below the GuC GGTT ceiling. A timeout or failed authentication retains every
+potentially live allocation; release requires verified GuC reset plus firmware
+DMA idle, or an explicit unsafe proof from the GT owner. One-shot DMA publication
+does not make shared CT cursor lines coherent: CT requires an allocator that
+explicitly supplies coherent memory. Physical x86_64 system allocations gain
+that proof after platform cache-policy installation; ARM host-bridge coherency
+remains unproven. Arc has GT-only binding without display admission or local
+VRAM allocation.
+
+`intel_gpu_guc_gt::GuCGt` joins the bootstrap, one CT transport and the GT
+kernel forcewake request under one owner. The correct ACK is 0x130044 on DG2
+and 0xdfc on MTL/Arrow/BMG (graphics IP 12.70+); a high value at the other
+address cannot authorize GT access. Wake acquisition refuses another kernel
+owner and preserves other requestors with masked writes. Ready/CT operations
+validate request and ACK; wake loss closes admission. Shutdown recovers wake,
+proves GuC reset and firmware DMA idle before retiring CT, then clears the
+request and waits for sleep ACK. Cancelled waiters preserve the transaction;
+unverified drop retains the whole allocator/MMIO object graph. The owner is
+terminal after stop. A physical owner with a scheduler additionally proves full
+graphics-engine reset before retiring RCS references. Autosuspend remains open;
+the physical service retains its runtime-PM references.
+
+`intel_gpu_gt_hw` adds capability-invoked MMIO, render-well wake and bounded
+initial GuC/full-engine quiescence before PAT/MOCS programming. Staged physical
+allocations reserve frames/VA without writing inherited GGTT entries. Installed
+policies use MTL PAT3, DG2 PAT0 and BMG PAT2; MTL display PAT0 is preserved.
+MCR steering is serialized and restored, and BMG PTE writes drain the G-unit.
+
+`intel_gpu_gt_runtime` starts a persistent per-function owner from Stage::Late,
+validating D0, live PCI identity, PF registers and disabled SR-IOV VFs. MTL/Arrow
+requires owned scanout takeover; DG2/BMG requires disabled inherited display
+planes. Each owner retains the registered card, current PCI authority, dedicated
+arena and immutable firmware asset. Async system-PM preparation proves stop
+before saving configuration; the synchronous callback only verifies readiness.
+Async resume restores D0/configuration and any owned display, then
+rebuilds using a fresh arena/cache-policy proof. Failed cleanup retains uncertain
+resources without an unbounded reset retry.
+
+Scheduling requires CSS submission-interface major 1 (byte 68), separately from
+the firmware release. After HWCONFIG, the owner stops GuC, updates ADS for RCS0,
+reloads/authenticates with LiteRestore, and enables coherent CT. Autonomous
+engine reset is disabled while the golden image is unprimed. The scheduler
+owns HWS plus a distinct LRC and 8-KiB ring for each of at most 64 kernel probe
+contexts. MTL/DG2 use 14-page LRCs, BMG four pages, with Xe register-state groups.
+Only fixed owned breadcrumb commands are admitted; no user commands or PPGTT
+enter this interface.
+
+`intel_gpu_guc_sched` sends GGTT invalidation, context registration, policy,
+enable, disable and deregistration through real CT rings. Full rings retry
+without losing phase; stale/foreign events and deadlines close admission.
+Context IDs are never reused within the GT lifetime. Fences require the GPU
+breadcrumb, saved ring head, deregistration ACK and correlated final TLB
+completion; scheduling ACKs alone cannot complete a job. A canceled waiter
+leaves the context owned. Uncertain jobs survive until GuC reset/DMA idle plus
+GRDOM_FULL; then fences report Reset and render/GT wake releases are acknowledged.
+The service logs startup success only after its hardware probe retires. The
+async `kernel_probe(card)` API queues another owned context on that function.
+
+Before CT enablement, `GuCGt::begin_hwconfig` performs the source-defined
+GET_HWCONFIG size query and GGTT copy through the same bounded MMIO mailbox
+protocol. The destination is zeroed, cache-cleaned and GuC-TLB-invalidated
+before publication, then synchronized for CPU reads after the copy reply.
+All-ones scratch reads are rejected as unavailable hardware. A validated
+immutable `intel_gpu_hwconfig::HardwareConfig` preserves exact KLV bytes,
+unknown keys and vector values; scalar lookups reject vectors and duplicate
+keys/invalid extents fail acquisition. The DMA destination remains owned
+until verified stop, including on timeout, cancellation or cache failure.
+The snapshot is capability data, not an active engine/fuse inventory, and
+does not open the userspace submission gate.
+
+The DRM registry now recognizes `intel-gpu`, fixing private ioctl/mmap routing
+on both primary and render nodes. Per-card `DeviceInfo` retains an immutable
+snapshot from that card instance, with exact integrated/DG2/BMG profile lookup.
+`IntelGpuCard::publish_gt_hwconfig` accepts one snapshot from an awake Ready,
+CtReady or SchedulingReady GT with matching device ID. The PCI owner must supply
+the GT belonging to that physical function, including with duplicate PCI IDs. Static CPU bytes
+survive GT shutdown; DMA allocations stay with the GT and can all be reclaimed
+after verified stop. Another card's slot remains absent. The integrated probe
+retains its registered card Arc for the physical service. Eligible startup
+publishes HWCONFIG before the scheduling reload; failed/ineligible discovery
+continues to report it unavailable.
+
+HWCONFIG queries follow local Linux `i915_query.c::query_hwconfig_blob`: exact
+bytes/order, two-pass lengths, -ENODEV for absence, -EINVAL for a short buffer,
+and per-item -EFAULT for a bad copy. GuC submission-version remains -ENODEV until
+the userspace scheduling interface is admitted. Native tests traverse both DRM
+node types, GEM/mmap ownership, the GT discovery/publication chain and snapshot
+queries after all GT DMA is freed.
+Arc identity still adds no display binding, local VRAM or userspace engines.
+
+Gen12 owned resident submission, cache-flushed
+post-sync breadcrumbs, terminal fences and loss retention have native hardware
+models. Active topology, userspace context setup, accelerated PRIME/presentation
+and real Mesa acceptance remain outstanding.
 
 The memory audit corrected previous x86-like GPU PTE assumptions. Gen12
 PPGTT PAT bits are 3,4,7 and Xe-LPG adds bit62; Xe-LPG GGTT uses bits52,53.
 Gen12 system GGTT has no PAT bits. Intermediate PPGTT entries include RW;
 context PDP0 holds a raw physical address. No GPU NX/LRU permission is claimed.
 The common physical range is conservatively bounded to 46 bits. PAT numeric
-indices do not define cache policy: the eventual GT owner must program it.
+indices do not define cache policy: physical startup now programs the owned
+GGTT policy; userspace PPGTT policy/state admission remains separate work.
 
 Native Rust fixtures use literal ABI/PTE vectors, fault-contained user-memory
 models, cross-open ownership failures, copy-failure rollback, extension cycles,
@@ -1520,10 +1619,24 @@ Primary references:
   MIT; fixed encoding vectors also follow `gen8_ppgtt.c` and `intel_ggtt.c`.
 - [Logical context root registers](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/i915/gt/intel_lrc_reg.h), MIT.
 - [GuC/HuC firmware layout](https://docs.kernel.org/gpu/xe/xe_firmware.html),
-  required background for the Xe-LPG firmware owner; no loader is claimed here.
+  background for the GuC firmware owner.
 - [Gen12 render and XCS completion streams](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/i915/gt/gen8_engine_cs.c),
   MIT command ordering and generation workarounds, with `gen8_engine_cs.h` and
   `intel_gpu_commands.h` bitfields.
 - [GuC CT registration](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/i915/gt/uc/intel_guc_ct.c),
   MIT; `intel_guc.c` and the actions/KLV/message ABI headers specify the MMIO
   mailbox, receive-first registration and CONTROL_CTB acknowledgment protocol.
+
+GuC bootstrap and discrete identity were cross-checked against the local Linux
+checkout at `b90c984d615e8ce2af96f5b1411a962d83fed2ad`: MIT-licensed
+`include/drm/intel/pciids.h`, `drivers/gpu/drm/xe/{xe_uc_fw.c,xe_guc.c,xe_wopcm.c,
+xe_guc_ads.c,xe_guc_fwif.h,xe_guc_tlb_inval.c,xe_ggtt.c,xe_force_wake.c,
+xe_guc_hwconfig.c,xe_mocs.c,xe_pat.c,xe_gt_mcr.c,xe_bo.c,xe_lrc.c,
+xe_hw_engine.c,xe_guc_submit.c}`, `drivers/gpu/drm/i915/gt/uc/intel_guc_hwconfig.c`,
+`drivers/gpu/drm/i915/i915_query.c`, `include/uapi/drm/i915_drm.h` and
+`drivers/gpu/drm/xe/regs/{xe_guc_regs.h,xe_gt_regs.h,xe_irq_regs.h}` and the
+GuC actions/KLV/CSS ABI headers. Native Rust models pin register/ADS values,
+reset/DMA/full-engine stop proofs, cache-policy publication, current authority,
+two-context execution, 64-context pressure/CT backpressure, context retirement,
+allocation rollback, coherence refusal and per-card query lifetime. These tests
+do not establish firmware boot or context execution on Intel silicon.

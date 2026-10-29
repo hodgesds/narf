@@ -1,0 +1,501 @@
+//! Owned single-LRC GuC scheduling, with a kernel execution probe.
+//!
+//! Linux reference: ~/git/linux b90c984d615e8ce2af96f5b1411a962d83fed2ad,
+//! MIT xe_guc_submit.c, xe_lrc.c, xe_guc_ads.c and their ABI headers.
+//! Scheduling acknowledgments are not job completion. Retirement additionally
+//! requires the probe's GPU breadcrumb and saved ring head after deregistration.
+
+use crate::{
+    intel_gpu_aux::MmioWindow,
+    intel_gpu_fence::{CompletionFence, JobError},
+    intel_gpu_gt::GtPlatform,
+    intel_gpu_guc::GuCMessage,
+    intel_gpu_guc_boot::BootAllocator,
+    intel_gpu_guc_transport::{TransportError, XeLpgTransport},
+    intel_gpu_rcs::{GpuBacking, SubmitError},
+};
+use alloc::{sync::Arc, vec::Vec};
+use core::{
+    mem::ManuallyDrop,
+    sync::atomic::{fence, Ordering},
+};
+
+const REGS: u64 = 4096;
+const BREADCRUMB: u64 = 0x800;
+const TIMEOUT: u64 = 5_000_000_000;
+const MAX_CONTEXTS: usize = 64;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SchedulingError {
+    State,
+    Full,
+    Allocation(SubmitError),
+    Address,
+    Cache,
+    Protocol,
+    Timeout,
+    Transport(TransportError),
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct SchedulingAds {
+    pub golden: u32,
+    pub bytes: u32,
+    pub hwsp: u32,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Phase {
+    Invalidate,
+    Invalidating,
+    Register,
+    Policy,
+    Enable,
+    Enabling,
+    Running,
+    Disable,
+    Disabling,
+    Deregister,
+    Deregistering,
+    RetireInvalidate,
+    RetireInvalidating,
+}
+
+struct Context<B: GpuBacking> {
+    id: u16,
+    image: B,
+    ring: B,
+    phase: Phase,
+    deadline: u64,
+    fence: Arc<CompletionFence>,
+}
+
+struct Resources<A: BootAllocator> {
+    allocator: A,
+    hwsp: A::Backing,
+    golden: A::Backing,
+    contexts: Vec<Context<A::Backing>>,
+}
+
+pub(crate) struct GuCScheduler<A: BootAllocator> {
+    resources: ManuallyDrop<Resources<A>>,
+    platform: GtPlatform,
+    next_id: u32,
+    published: bool,
+    lost: bool,
+    released: bool,
+}
+
+impl<A: BootAllocator> GuCScheduler<A> {
+    pub(crate) fn allocate(
+        mut allocator: A,
+        platform: GtPlatform,
+    ) -> Result<Self, SchedulingError> {
+        let hwsp = allocator.alloc(1).map_err(SchedulingError::Allocation)?;
+        if !valid(&hwsp) || !hwsp.coherent_for_device() {
+            allocator.free(hwsp);
+            return Err(SchedulingError::Cache);
+        }
+        let pages = if platform == GtPlatform::Battlemage {
+            4
+        } else {
+            14
+        };
+        let golden = match allocator.alloc(pages) {
+            Ok(b) => b,
+            Err(e) => {
+                allocator.free(hwsp);
+                return Err(SchedulingError::Allocation(e));
+            }
+        };
+        if !valid(&golden) || !golden.coherent_for_device() || overlap(&hwsp, &golden) {
+            allocator.free(golden);
+            allocator.free(hwsp);
+            return Err(SchedulingError::Address);
+        }
+        hwsp.zero_fill();
+        golden.zero_fill();
+        if allocator.sync_for_device(&hwsp).is_err() || allocator.sync_for_device(&golden).is_err()
+        {
+            allocator.free(golden);
+            allocator.free(hwsp);
+            return Err(SchedulingError::Cache);
+        }
+        Ok(Self {
+            resources: ManuallyDrop::new(Resources {
+                allocator,
+                hwsp,
+                golden,
+                contexts: Vec::new(),
+            }),
+            platform,
+            next_id: 1,
+            published: false,
+            lost: false,
+            released: false,
+        })
+    }
+
+    pub(crate) fn ads(&self) -> SchedulingAds {
+        SchedulingAds {
+            golden: self.resources.golden.ggtt_offset(),
+            bytes: self.resources.golden.size_pages() * 4096,
+            hwsp: self.resources.hwsp.ggtt_offset(),
+        }
+    }
+
+    pub(crate) fn enable_engine(&mut self, mmio: &impl MmioWindow) -> Result<(), SchedulingError> {
+        if self.published || self.lost {
+            return Err(SchedulingError::State);
+        }
+        if mmio.read32(0x208c) == u32::MAX {
+            return Err(SchedulingError::Protocol);
+        }
+        // xe_hw_engine_enable_ring: render-well and GT wake are held by GuCGt.
+        self.published = true;
+        let uc = match self.platform {
+            GtPlatform::Integrated(_) => 9,
+            GtPlatform::Alchemist => 1,
+            GtPlatform::Battlemage => 3,
+        };
+        mmio.write32(0x20c4, 0x3f7e0000 | uc << 8 | uc << 1);
+        mmio.write32(0x20a8, u32::MAX); // polling owner masks RCS interrupts
+        mmio.write32(0x2098, u32::MAX);
+        mmio.write32(0x2080, self.resources.hwsp.ggtt_offset());
+        mmio.write32(0x229c, 0x00080008);
+        mmio.write32(0x209c, 0x01000000);
+        let _ = mmio.read32(0x209c);
+        Ok(())
+    }
+
+    /// Execute only an owned kernel probe. No user commands, PPGTT, external
+    /// addresses or arbitrary instructions enter this bring-up API.
+    pub(crate) fn submit_probe(
+        &mut self,
+        now: u64,
+    ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
+        if !self.published || self.lost {
+            return Err(SchedulingError::State);
+        }
+        if self.resources.contexts.len() == MAX_CONTEXTS || self.next_id >= 65535 {
+            return Err(SchedulingError::Full);
+        }
+        let deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
+        let r = &mut *self.resources;
+        r.contexts
+            .try_reserve(1)
+            .map_err(|_| SchedulingError::Full)?;
+        let pages = if self.platform == GtPlatform::Battlemage {
+            4
+        } else {
+            14
+        };
+        let image = r
+            .allocator
+            .alloc(pages)
+            .map_err(SchedulingError::Allocation)?;
+        let ring = match r.allocator.alloc(2) {
+            Ok(b) => b,
+            Err(e) => {
+                r.allocator.free(image);
+                return Err(SchedulingError::Allocation(e));
+            }
+        };
+        let invalid = !valid(&image)
+            || !valid(&ring)
+            || image.size_pages() != pages
+            || ring.size_pages() != 2
+            || !image.coherent_for_device()
+            || !ring.coherent_for_device()
+            || overlap(&image, &ring)
+            || [&r.hwsp, &r.golden]
+                .into_iter()
+                .any(|old| overlap(old, &image) || overlap(old, &ring))
+            || r.contexts.iter().any(|c| {
+                [&c.image, &c.ring]
+                    .into_iter()
+                    .any(|old| overlap(old, &image) || overlap(old, &ring))
+            });
+        if invalid {
+            r.allocator.free(ring);
+            r.allocator.free(image);
+            return Err(SchedulingError::Address);
+        }
+        image.zero_fill();
+        ring.zero_fill();
+        let id = self.next_id as u16;
+        context_image(&image, self.platform, ring.ggtt_offset());
+        let words = [
+            0x04000001,
+            0,
+            0x10400002,
+            image.ggtt_offset() + BREADCRUMB as u32,
+            0,
+            u32::from(id),
+            0x01000000,
+            0,
+        ];
+        for (i, word) in words.into_iter().enumerate() {
+            ring.write32(i as u64 * 4, word);
+        }
+        image.write32(REGS + 7 * 4, 32);
+        if r.allocator.sync_for_device(&image).is_err()
+            || r.allocator.sync_for_device(&ring).is_err()
+        {
+            r.allocator.free(ring);
+            r.allocator.free(image);
+            return Err(SchedulingError::Cache);
+        }
+        let completion = Arc::new(CompletionFence::new());
+        r.contexts.push(Context {
+            id,
+            image,
+            ring,
+            phase: Phase::Invalidate,
+            deadline,
+            fence: completion.clone(),
+        });
+        self.next_id += 1;
+        Ok((id, completion))
+    }
+
+    pub(crate) fn poll<M: MmioWindow>(
+        &mut self,
+        ct: &mut XeLpgTransport<M, A>,
+        now: u64,
+    ) -> Result<(), SchedulingError> {
+        if self.lost {
+            return Err(SchedulingError::State);
+        }
+        let result = self.progress(ct, now);
+        if result.is_err() {
+            self.lost = true;
+        }
+        result
+    }
+
+    fn progress<M: MmioWindow>(
+        &mut self,
+        ct: &mut XeLpgTransport<M, A>,
+        now: u64,
+    ) -> Result<(), SchedulingError> {
+        // Bound one poll even if firmware continuously emits events.
+        for _ in 0..64 {
+            let Some(message) = ct.receive().map_err(SchedulingError::Transport)? else {
+                break;
+            };
+            self.event(message)?;
+        }
+        for context in &mut self.resources.contexts {
+            if now >= context.deadline {
+                return Err(SchedulingError::Timeout);
+            }
+            if context.phase == Phase::Running {
+                fence(Ordering::Acquire);
+                let seq = context.image.read32(BREADCRUMB);
+                if seq != 0 && seq != u32::from(context.id) {
+                    return Err(SchedulingError::Protocol);
+                }
+                if seq != 0 {
+                    context.phase = Phase::Disable;
+                }
+            }
+            let id = u32::from(context.id);
+            let (action, payload, next): (u16, Vec<u32>, Phase) = match context.phase {
+                Phase::Invalidate => (0x7000, alloc::vec![id, 0x80000003], Phase::Invalidating),
+                Phase::RetireInvalidate => (
+                    0x7000,
+                    alloc::vec![id | 0x10000, 0x80000003],
+                    Phase::RetireInvalidating,
+                ),
+                Phase::Register => (
+                    0x4502,
+                    alloc::vec![
+                        1,
+                        id,
+                        0,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        context.image.ggtt_offset() | 0x19,
+                        0
+                    ],
+                    Phase::Policy,
+                ),
+                Phase::Policy => (
+                    0x100b,
+                    alloc::vec![id, 0x20030001, 3, 0x20010001, 1000, 0x20020001, 500000],
+                    Phase::Enable,
+                ),
+                Phase::Enable => (0x1001, alloc::vec![id, 1], Phase::Enabling),
+                Phase::Disable => (0x1001, alloc::vec![id, 0], Phase::Disabling),
+                Phase::Deregister => (0x4503, alloc::vec![id], Phase::Deregistering),
+                _ => continue,
+            };
+            match ct.send(context.id, action, 0, &payload, true) {
+                Ok(()) => context.phase = next,
+                Err(TransportError::Ct(crate::intel_gpu_guc::GuCError::Full)) => {}
+                Err(error) => return Err(SchedulingError::Transport(error)),
+            }
+        }
+        Ok(())
+    }
+
+    fn event(&mut self, message: GuCMessage) -> Result<(), SchedulingError> {
+        if message.kind != 1 || message.auxiliary >> 16 != 0 {
+            return Err(SchedulingError::Protocol);
+        }
+        let action = message.auxiliary as u16;
+        if !matches!(action, 0x1002 | 0x4600 | 0x7001) {
+            return Err(SchedulingError::Protocol);
+        }
+        let len = if action == 0x1002 { 2 } else { 1 };
+        if message.payload.len() != len {
+            return Err(SchedulingError::Protocol);
+        }
+        let cookie = message.payload[0];
+        let context_id = if action == 0x7001 {
+            cookie & 0xffff
+        } else {
+            cookie
+        };
+        let index = self
+            .resources
+            .contexts
+            .iter()
+            .position(|c| u32::from(c.id) == context_id)
+            .ok_or(SchedulingError::Protocol)?;
+        let c = &mut self.resources.contexts[index];
+        match (action, c.phase, message.payload.get(1).copied()) {
+            (0x7001, Phase::Invalidating, None) if cookie == u32::from(c.id) => {
+                c.phase = Phase::Register
+            }
+            (0x7001, Phase::RetireInvalidating, None) if cookie == (u32::from(c.id) | 0x10000) => {
+                fence(Ordering::Acquire);
+                if c.image.read32(BREADCRUMB) != u32::from(c.id)
+                    || c.image.read32(REGS + 5 * 4) & 0x1ffffc != 32
+                {
+                    return Err(SchedulingError::Protocol);
+                }
+                let c = self.resources.contexts.remove(index);
+                let r = &mut *self.resources;
+                r.allocator.free(c.ring);
+                r.allocator.free(c.image);
+                c.fence.signal(Ok(()));
+            }
+            (0x1002, Phase::Enabling, Some(1)) => c.phase = Phase::Running,
+            (0x1002, Phase::Disabling, Some(0)) => c.phase = Phase::Deregister,
+            (0x4600, Phase::Deregistering, None) => {
+                fence(Ordering::Acquire);
+                if c.image.read32(BREADCRUMB) != u32::from(c.id)
+                    || c.image.read32(REGS + 5 * 4) & 0x1ffffc != 32
+                {
+                    return Err(SchedulingError::Protocol);
+                }
+                c.phase = Phase::RetireInvalidate;
+            }
+            _ => return Err(SchedulingError::Protocol),
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    /// GuC is in reset with firmware DMA idle AND GRDOM_FULL has completed.
+    /// No other host owner can re-arm the retired HWS/LRC/GGTT addresses.
+    pub(crate) unsafe fn release_after_reset(mut self) {
+        self.published = false;
+        for c in &self.resources.contexts {
+            c.fence.signal(Err(JobError::Reset));
+        }
+        self.free();
+    }
+
+    fn free(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        // SAFETY: called once by Drop before publication, or proven reset.
+        let mut r = unsafe { ManuallyDrop::take(&mut self.resources) };
+        for c in r.contexts.drain(..) {
+            r.allocator.free(c.ring);
+            r.allocator.free(c.image);
+        }
+        r.allocator.free(r.golden);
+        r.allocator.free(r.hwsp);
+    }
+}
+
+impl<A: BootAllocator> Drop for GuCScheduler<A> {
+    fn drop(&mut self) {
+        if !self.published {
+            self.free();
+        }
+    }
+}
+
+fn valid(b: &impl GpuBacking) -> bool {
+    b.ggtt_offset() >= 0x800000
+        && b.ggtt_offset() % 4096 == 0
+        && b.size_pages() != 0
+        && (b.ggtt_offset() as u64 + b.size_pages() as u64 * 4096) <= 0xfee00000
+}
+fn overlap(a: &impl GpuBacking, b: &impl GpuBacking) -> bool {
+    (a.ggtt_offset() as u64) < b.ggtt_offset() as u64 + b.size_pages() as u64 * 4096
+        && (b.ggtt_offset() as u64) < a.ggtt_offset() as u64 + a.size_pages() as u64 * 4096
+}
+
+fn context_image(image: &impl GpuBacking, platform: GtPlatform, ring: u32) {
+    // Literal register groups from xe_lrc.c's DG2/MTL/Xe2 RCS tables;
+    // lengths and command placement differ from the Gen12 execlists codec.
+    let groups: &[&[u32]] = &[
+        &[
+            0x244, 0x034, 0x030, 0x038, 0x03c, 0x168, 0x140, 0x110, 0x1c0, 0x1c4, 0x1c8, 0x180,
+            0x2b4, 0x120, 0x124,
+        ],
+        if platform == GtPlatform::Battlemage {
+            &[
+                0x3a8, 0x3ac, 0x108, 0x284, 0x280, 0x27c, 0x278, 0x274, 0x270,
+            ]
+        } else {
+            &[
+                0x3a8, 0x28c, 0x288, 0x284, 0x280, 0x27c, 0x278, 0x274, 0x270,
+            ]
+        },
+    ];
+    let mut cursor = 0u64;
+    for group in groups {
+        cursor += 1;
+        image.write32(REGS + cursor * 4, 0x11081000 | (group.len() as u32 * 2 - 1));
+        cursor += 1;
+        for offset in *group {
+            image.write32(REGS + cursor * 4, 0x2000 + offset);
+            cursor += 2;
+        }
+    }
+    let extra: &[u32] = if platform == GtPlatform::Alchemist {
+        &[0x1b0, 0x5a8, 0x5ac]
+    } else {
+        cursor += 2;
+        &[0x5a8, 0x5ac]
+    };
+    image.write32(REGS + cursor * 4, 0x11081000 | (extra.len() as u32 * 2 - 1));
+    cursor += 1;
+    for offset in extra {
+        image.write32(REGS + cursor * 4, 0x2000 + offset);
+        cursor += 2;
+    }
+    cursor += 6;
+    image.write32(REGS + cursor * 4, 0x11080001);
+    image.write32(REGS + (cursor + 1) * 4, 0x20c8);
+    image.write32(REGS + (cursor + 3) * 4, 0x05000001);
+    image.write32(REGS + 3 * 4, 0x00090009); // inhibit restore and synchronous switch
+    image.write32(REGS + 9 * 4, ring);
+    image.write32(REGS + 11 * 4, 0x1001); // 8 KiB ring
+                                          // reset_stop_ring() sets the masked STOP_RING disable in value slot
+                                          // 0x71 of the later register block; the initial inhibited restore skips it.
+    image.write32(REGS + 0x71 * 4, 0x01000000);
+}
