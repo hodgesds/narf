@@ -86,6 +86,12 @@ pub(super) unsafe trait Io: Send {
     ) -> Result<u64, packet::Error> {
         Err(packet::Error::State)
     }
+    /// `rtw89_phy_edcca_thre_calc` hardware write: program the EDCCA, P20 and
+    /// PPDU levels. The first call also enables PPDU status reports
+    /// (`rtw89_mac_cfg_ppdu_status`). `Unsupported` disables tracking.
+    fn station_edcca(&mut self, _: u8) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
     /// Signed HE20 program (`Program::He`).
     fn station_he_allowed(&mut self) -> Result<bool, power::Error> {
         Ok(false)
@@ -403,6 +409,9 @@ pub(super) struct State {
     deadline: u64,
     last_peer: u64,
     last_now: u64,
+    /// `rtw89_track_work` RSSI statistics and dynamic EDCCA.
+    track: super::track::Tracker,
+    scanning: bool,
 }
 impl core::fmt::Debug for State {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -455,6 +464,8 @@ impl State {
             deadline: 0,
             last_peer: 0,
             last_now: 0,
+            track: super::track::Tracker::default(),
+            scanning: false,
         }
     }
     pub(super) fn admission(&self) -> Admission {
@@ -586,6 +597,27 @@ impl State {
         }
         self.last_now = now;
         Ok(now)
+    }
+    /// `total_sta_assoc > 0`: the associated AP, as `rtw89_track_work` sees it.
+    /// mac80211 adds the station at association (`total_sta_assoc`), so the
+    /// four-way handshake already counts as linked.
+    fn linked(&self) -> Option<[u8; 6]> {
+        matches!(self.phase, Phase::FourWay | Phase::Open)
+            .then(|| self.peer.as_ref().map(|peer| peer.bss.bssid))
+            .flatten()
+    }
+    /// `rtw89_phy_edcca_track` once per `RTW89_TRACK_WORK_PERIOD`. An owner
+    /// without the PHY hook disables tracking, as `disabled_dm_bitmap` does.
+    fn track(&mut self, io: &mut impl Io, now: u64) -> Result<(), Error> {
+        let Some(threshold) = self.track.due(now, self.linked(), self.scanning) else {
+            return Ok(());
+        };
+        match io.station_edcca(threshold) {
+            Ok(()) => self.track.written(threshold),
+            Err(power::Error::Unsupported) => self.track.disable(),
+            Err(error) => return Err(Error::Native(error)),
+        }
+        Ok(())
     }
     pub(super) fn candidates(&self) -> Vec<ObservedBss> {
         let now = self.environment.now_ms();
@@ -1148,6 +1180,9 @@ impl State {
         let mut idle = false;
         for _ in 0..32 {
             let step = io.packet_poll()?;
+            if let Some(rssi) = step.rssi {
+                self.track.sample(self.linked(), rssi);
+            }
             if let Some(receipt) = step.receipt {
                 self.delivery(receipt)?;
             }
@@ -1183,6 +1218,7 @@ impl State {
                 }
             }
         }
+        self.track(io, now)?;
         // A CRC/report descriptor is consumed input, never an RX-idle fence.
         // Inspect all queued peer loss before committing an exact M4 receipt.
         if idle {
@@ -1475,7 +1511,9 @@ impl State {
             admission.run(|| Ok(io.packet_scan_address(Some(address))))??;
             self.scan = Some(address);
         }
+        self.scanning = true;
         let result = self.scan_dwell(io, until, probe, random_sn).await;
+        self.scanning = false;
         // A failed dwell is terminal: the interface stops the station.
         if address.is_some() && result.is_ok() {
             // rtw89_core_scan_complete: restore the own address once the last

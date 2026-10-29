@@ -216,3 +216,98 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_rx_malformed_extent_and_profile_never_publish_frames
 );
+
+/// PPDU status report: MAC info (one user, odd count padded), PLCP, then a
+/// PHY status header with one fixed-length IE.
+fn ppdu(rssi: u8, ie_map: u32, valid: bool, extra: usize) -> Vec<u8> {
+    let mut body = vec![0u8; 8 + 8 + 8];
+    body[0..4].copy_from_slice(&1u32.to_le_bytes()); // USR_NUM 1
+    body[4..8].copy_from_slice(&(1u32 << 16).to_le_bytes()); // PLCP 8 bytes
+                                                             // IE 4 is 8 bytes fixed; header 8 + IE 8 = 16 bytes.
+    let w0 = ie_map
+        | if valid { 1 << 7 } else { 0 }
+        | ((2 + extra as u32) << 8)
+        | (u32::from(rssi) << 24);
+    let mut status = vec![0u8; 16 + extra * 8];
+    status[0..4].copy_from_slice(&w0.to_le_bytes());
+    status[8..12].copy_from_slice(&4u32.to_le_bytes());
+    for i in 0..extra {
+        status[16 + i * 8..20 + i * 8].copy_from_slice(&4u32.to_le_bytes());
+    }
+    body.extend_from_slice(&status);
+    body
+}
+fn ppdu_packet(body: &[u8], to_self: bool, mac_id: u8) -> Vec<u8> {
+    let mut bytes = packet(1, body, true, 0);
+    let d0 = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) | (1 << 23);
+    bytes[4..8].copy_from_slice(&d0.to_le_bytes());
+    bytes[16..20].copy_from_slice(&u32::from(to_self).to_le_bytes());
+    bytes[24..28].copy_from_slice(&(u32::from(mac_id) << 16).to_le_bytes());
+    bytes
+}
+fn smoke_rtw89_rx_ppdu_status_yields_rssi_only_when_linux_accepts() -> TestResult {
+    let mut assembler = Assembler::default();
+    let accepted = ppdu_packet(&ppdu(150, 11, true, 1), true, 0);
+    if assembler.segment(&accepted, false)
+        != Ok(Some(Event::PhyStatus(PhyStatus {
+            mac_id: 0,
+            rssi: 150,
+        })))
+    {
+        return TestResult::Fail("valid PPDU status did not yield RSSI_AVG");
+    }
+    for (bytes, why) in [
+        (
+            ppdu_packet(&ppdu(150, 11, true, 1), false, 0),
+            "not A1-matched",
+        ),
+        (
+            ppdu_packet(&ppdu(150, 10, true, 1), true, 0),
+            "IE map below RTW89_CCK_PKT",
+        ),
+        (
+            ppdu_packet(&ppdu(150, 11, false, 1), true, 0),
+            "PHY status not valid",
+        ),
+    ] {
+        if assembler.segment(&bytes, false) != Ok(Some(Event::Dropped)) {
+            return TestResult::Fail(why);
+        }
+    }
+    // Header length disagreeing with the report, or an IE overrunning it.
+    let mut short = ppdu(150, 11, true, 1);
+    short.truncate(short.len() - 8);
+    if phy_status(
+        &Descriptor::parse(&ppdu_packet(&short, true, 0)).unwrap(),
+        &short,
+    )
+    .is_some()
+    {
+        return TestResult::Fail("PHY status length mismatch accepted");
+    }
+    let mut overrun = ppdu(150, 11, true, 1);
+    overrun[16 + 16..16 + 20].copy_from_slice(&1u32.to_le_bytes()); // IE1 is 32 bytes
+    if phy_status(
+        &Descriptor::parse(&ppdu_packet(&overrun, true, 0)).unwrap(),
+        &overrun,
+    )
+    .is_some()
+    {
+        return TestResult::Fail("IE overrunning the PHY status accepted");
+    }
+    // MAC ID comes from long RXD dword5.
+    let other = ppdu_packet(&ppdu(90, 11, true, 0), true, 3);
+    if assembler.segment(&other, false)
+        != Ok(Some(Event::PhyStatus(PhyStatus {
+            mac_id: 3,
+            rssi: 90,
+        })))
+    {
+        return TestResult::Fail("PPDU status MAC ID not taken from RXD dword5");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_rx_ppdu_status_yields_rssi_only_when_linux_accepts
+);

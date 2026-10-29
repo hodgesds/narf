@@ -116,6 +116,10 @@ unsafe impl Io for Startup {
             .scan_address(&mut native.station_access(), address, admission)
             .await
     }
+    fn station_edcca(&mut self, threshold: u8) -> Result<(), power::Error> {
+        self.station_allowed()?;
+        self.station_native()?.station_edcca(threshold)
+    }
     fn station_he_allowed(&mut self) -> Result<bool, power::Error> {
         self.station_allowed()?;
         self.station_native()?.station_he_allowed()

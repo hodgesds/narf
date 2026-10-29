@@ -151,6 +151,16 @@ impl Native {
             .allows(radio_policy::Program::He)
             .map_err(denied)
     }
+    /// Dynamic EDCCA level for the live station (`track.rs`), on the prepared
+    /// operating PHY and current ordinary authority only.
+    pub(in crate::rtw89) fn station_edcca(&mut self, threshold: u8) -> Result<(), power::Error> {
+        self.operating_current()?;
+        let ppdu_status = !self.ppdu_status;
+        let mut port = self.radio_io()?;
+        crate::rtw89::phy_operating::edcca(&mut port, threshold, ppdu_status)?;
+        self.ppdu_status = true;
+        Ok(())
+    }
     pub(in crate::rtw89) fn station_ampdu_allowed(&self) -> Result<bool, power::Error> {
         self.full_radio_scope()
             .ok_or(power::Error::Unsupported)?

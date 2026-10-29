@@ -45,6 +45,12 @@ pub(super) struct Descriptor {
     pub aggregate: bool,
     /// `AX_RXD_AMPDU`: MPDU delivered from an A-MPDU.
     pub ampdu: bool,
+    /// `AX_RXD_A1_MATCH`: addressed to this station.
+    pub to_self: bool,
+    /// `AX_RXD_MAC_INFO_VLD`: a PPDU status report leads with MAC info.
+    pub mac_info: bool,
+    /// `AX_RXD_MAC_ID_MASK` (long RXD dword5); zero for a short RXD.
+    pub mac_id: u8,
 }
 impl Descriptor {
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
@@ -78,6 +84,13 @@ impl Descriptor {
             hardware_decrypted: d3 & 4 != 0,
             aggregate: d3 & ((1 << 5) | (1 << 6)) != 0,
             ampdu: d3 & (1 << 3) != 0,
+            to_self: d3 & 1 != 0,
+            mac_info: d0 & (1 << 23) != 0,
+            mac_id: if length == 32 {
+                (word(bytes, 24)? >> 16) as u8
+            } else {
+                0
+            },
         })
     }
 }
@@ -137,12 +150,76 @@ impl C2h {
         }))
     }
 }
+/// `rtw89_phy_gen_ax.physt_ie_len`; `VAR` lengths come from the IE header.
+const VAR: u8 = 0xff;
+const IE_LENGTH: [u8; 32] = [
+    16, 32, 24, 24, 8, 8, 8, 8, VAR, 8, VAR, 176, VAR, VAR, VAR, VAR, VAR, VAR, 16, 24, VAR, VAR,
+    VAR, 0, 24, 24, 24, 24, 32, 32, 32, 32,
+];
+/// RTL8852B `ppdu_max_usr`.
+const MAX_USERS: usize = 4;
+/// `RTW89_CCK_PKT`: lower IE maps are invalid in normal (non-monitor) mode.
+const CCK_PKT: u32 = 11;
+/// Linux `rtw89_core_rx_process_ppdu_sts` for an AX PPDU status report:
+/// MAC info and user records (`rtw89_core_rx_process_mac_ppdu`), then the
+/// PHY status header (`rtw89_core_rx_process_phy_ppdu`) and its IE walk
+/// (`rtw89_core_rx_parse_phy_sts`). Returns the header `RSSI_AVG` only when
+/// every step Linux checks succeeds, since Linux updates `avg_rssi` only then.
+pub(super) fn phy_status(descriptor: &Descriptor, bytes: &[u8]) -> Option<u8> {
+    let mut start = 0;
+    if descriptor.mac_info {
+        let w0 = word(bytes, 0).ok()?;
+        let w1 = word(bytes, 4).ok()?;
+        let users = (w0 & 0xf) as usize;
+        if users > MAX_USERS {
+            return None;
+        }
+        // RTW89_PPDU_MAC_INFO_SIZE, 8-byte aligned user records,
+        // RTW89_PPDU_MAC_RX_CNT_SIZE and RTW89_RXINFO_W1_PLCP_LEN.
+        start = 8 + (users + (users & 1)) * 4;
+        if w0 & (1 << 29) != 0 {
+            start += 96;
+        }
+        start += ((w1 >> 16) & 0xff) as usize * 8;
+    }
+    let status = bytes.get(start..)?;
+    let w0 = word(status, 0).ok()?;
+    if w0 & (1 << 7) == 0 || ((w0 >> 8) & 0xff) as usize * 8 != status.len() {
+        return None;
+    }
+    if w0 & 0x1f < CCK_PKT {
+        return None;
+    }
+    let mut position = if w0 & (1 << 5) != 0 { 16 } else { 8 };
+    while position < status.len() {
+        let header = word(status, position).ok()?;
+        let length = match IE_LENGTH[(header & 0x1f) as usize] {
+            VAR => ((header >> 5) & 0x7f) as usize * 8,
+            fixed => fixed as usize,
+        };
+        position += length;
+        if length == 0 || position > status.len() {
+            return None;
+        }
+    }
+    Some((w0 >> 24) as u8)
+}
+/// One accepted PPDU status report (`struct rtw89_rx_phy_ppdu`) for the
+/// addressed `mac_id`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PhyStatus {
+    pub mac_id: u8,
+    /// `RTW89_PHY_STS_HDR_W0_RSSI_AVG`, half-dB units (`RSSI_FACTOR` 1).
+    pub rssi: u8,
+}
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Event {
     /// Exactly the native MPDU, after removing only its four-byte FCS.
     Wifi(Descriptor, Vec<u8>),
     Firmware(C2h),
     Releases(Vec<Report>),
+    /// `RTW89_CORE_RX_TYPE_PPDU_STAT` addressed to this station.
+    PhyStatus(PhyStatus),
     /// Bad FCS/ICV, unsupported aggregation/decryption/profile, PPDU or an
     /// unhandled bounded report does not become an ordinary station frame.
     Dropped,
@@ -251,6 +328,13 @@ impl Assembler {
                     Event::Wifi(descriptor, bytes)
                 }
             }
+            1 => match phy_status(&descriptor, &bytes) {
+                Some(rssi) if descriptor.to_self => Event::PhyStatus(PhyStatus {
+                    mac_id: descriptor.mac_id,
+                    rssi,
+                }),
+                _ => Event::Dropped,
+            },
             10 => Event::Firmware(C2h::parse(bytes)?),
             _ => Event::Dropped,
         }))

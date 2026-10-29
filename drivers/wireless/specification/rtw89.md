@@ -712,8 +712,33 @@ or XO/XI writes and cancellation at an actual analog request.
 B has no source `rfe_gpio` or AX BB-wrap callback, and the admitted two-path
 profile does not enable antenna diversity. Unsupported-IGI gain-table writes
 are skipped by the actual B source branch. Monitor/NHM diagnostics and periodic
-DIG/CFO/EDCCA/antenna tracking are separate from this static working owner; they
+DIG/CFO/antenna tracking are separate from this static working owner; they
 are not reported as completed by its successful state.
+
+**Periodic EDCCA tracking** (`track.rs`, `phy_operating::edcca`) follows
+`rtw89_track_work` → `rtw89_phy_edcca_track`. PPDU status reports
+(`rtw89_mac_cfg_ppdu_status_ax`: `R_AX_PPDU_STAT` RPT_EN/MAC_INFO/PLCP/CRC32,
+`R_AX_HW_RPT_FWD` to host) are enabled by the first track write. The RX
+assembler parses `RTW89_CORE_RX_TYPE_PPDU_STAT` exactly as
+`rtw89_core_rx_process_ppdu_sts` accepts it (MAC-info users ≤ `ppdu_max_usr`
+4, PHY-status VALID, header length equal to the report, IE map ≥
+`RTW89_CCK_PKT`, the AX `physt_ie_len` walk, A1 match) and yields
+`RSSI_AVG` for the RXD dword5 MACID. The packet owner forwards only its own
+MACID; the station keeps `DECLARE_EWMA(rssi, 10, 16)`, counted only from
+association (four-way or open) and restarted for a new peer
+(`ewma_rssi_init`). Every 2 s (`RTW89_TRACK_WORK_PERIOD`), and never while
+scanning, the station computes `rtw89_phy_edcca_get_thre_by_rssi` (unlinked
+`EDCCA_MAX` 249; linked `rssi/2 − 110 + 128 − 3`, floored at 66) and, when it
+differs from the last written level (`th_old`), writes `R_SEG0R_EDCCA_LVL_V1`
+bytes 0, 1 and 3 with readback under the current ordinary authority and
+prepared operating PHY. An owner without that hook reports `Unsupported`,
+which disables tracking (`RTW89_DM_DYNAMIC_EDCCA`). Debug-only
+`rtw89_phy_edcca_log`/`_diag` and the scan-time `rtw89_phy_config_edcca`
+backup are not used: track work skips scans and native scans do not change
+the level. The single-link RSSI average is the input DIG tracking still needs.
+Smokes: `smoke_rtw89_track_*`,
+`smoke_rtw89_rx_ppdu_status_yields_rssi_only_when_linux_accepts`. QEMU-only
+software evidence; no silicon run.
 
 `firmware_phycap::Receipt` records actual firmware GET_FEATURE PHY capabilities,
 separately from EFUSE PHY calibration bytes. RTL8852B follows the AX source

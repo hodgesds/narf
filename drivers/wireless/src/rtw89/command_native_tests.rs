@@ -104,6 +104,7 @@ impl Fixture {
             ordinary: None,
             full_qualification: None,
             operating: Some(super::super::phy_operating::Operating::default()),
+            ppdu_status: false,
             irq: None,
             phycap: None,
             phycap_attempted: false,

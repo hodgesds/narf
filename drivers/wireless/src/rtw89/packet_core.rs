@@ -145,6 +145,8 @@ pub(super) struct Step {
     pub(super) frame: Option<Frame>,
     pub(super) c2h: Option<Vec<u8>>,
     pub(super) receipt: Option<Receipt>,
+    /// PPDU status `RSSI_AVG` for this owner's MACID (`rtw89_core_rx_process_phy_ppdu_iter`).
+    pub(super) rssi: Option<u8>,
 }
 pub(super) struct Core {
     phase: Phase,
@@ -544,6 +546,11 @@ impl Core {
         match received.event {
             None | Some(rx_packet::Event::Dropped) => {}
             Some(rx_packet::Event::Firmware(event)) => step.c2h = Some(event.bytes),
+            Some(rx_packet::Event::PhyStatus(status)) => {
+                if status.mac_id == self.mac_id {
+                    step.rssi = Some(status.rssi);
+                }
+            }
             // A PPDU above the signed RX PHY program (HT without `Ht`, HE
             // without `He`) is dropped exactly as the assembler dropped every
             // non-legacy rate before, without closing the station.
