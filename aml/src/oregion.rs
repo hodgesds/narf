@@ -5,6 +5,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -398,6 +399,82 @@ pub fn ec_ports() -> Option<(u16, u16)> {
     *EC_PORTS.lock()
 }
 
+// ── Shared EC transaction gate (issue #913) ───────────────────────
+//
+// ONE gate for every multi-step EC command stream in the tree:
+//   - this module's `ec_read_byte` / `ec_write_byte` / `ec_query`
+//     (AML EmbeddedControl field access + the AML-side SCI drain),
+//   - the `ec` facade's `read_byte` / `write_byte` / `query` /
+//     `burst_enable` / `burst_disable`,
+//   - the platform driver's `AcpiEc::{read_byte, write_byte, query}`
+//     (which used to carry its own per-instance gate).
+//
+// Why shared: the EC has ONE command register and ONE data register
+// (ACPI 6.5 §12.3) — there is no per-caller transaction context, so
+// two command streams interleaved mid-sequence are necessarily
+// interpreted against one state machine and corrupt each other.
+// The platform gate alone could never exclude the AML paths, and
+// the AML paths had no gate at all. On SMP the interleave is real:
+// both paths spin (they never yield mid-transaction), so two CPUs
+// can run two transactions concurrently.
+//
+// Semantics mirror the old platform gate: spin with interrupts
+// ENABLED (transactions wait up to 100 ms per IBF/OBF step, and
+// masking interrupts for a whole EC round-trip is what the old
+// GLOBAL_EC lock did wrong). TASK CONTEXT ONLY — no IRQ handler
+// may acquire it: an IRQ-context acquirer spinning while the
+// interrupted task held the gate would deadlock a single CPU.
+// That invariant already holds: the SCI ISR only records bits and
+// wakes the drain task, and every EC transaction in-tree runs
+// from task context.
+//
+// Scope notes:
+// - Single port reads (`ec_status`, facade `status`) are NOT gated:
+//   one read is already atomic; there is no sequence to interleave.
+// - Burst-mode SPANNING sequences (BE_EC → N transactions → BD_EC)
+//   are NOT atomic under this gate: each transaction takes the gate
+//   separately. Burst has zero in-tree callers today; a future burst
+//   caller must hold the guard returned here across its whole
+//   sequence instead of acquiring per transaction.
+// - The gate is held for exactly one byte-transaction. Nothing that
+//   can re-enter EC runs while it is held: query-drain handlers and
+//   `_Qxx` methods run only after the query transaction returns.
+static EC_TXN_GATE: AtomicBool = AtomicBool::new(false);
+
+/// RAII holder for [`EC_TXN_GATE`]. Only constructible via
+/// [`acquire_ec_txn_gate`] / [`try_acquire_ec_txn_gate`].
+#[derive(Debug)]
+pub struct EcTxnGate {
+    _private: (),
+}
+
+impl Drop for EcTxnGate {
+    fn drop(&mut self) {
+        EC_TXN_GATE.store(false, Ordering::Release);
+    }
+}
+
+/// Spin until the shared EC transaction gate is ours.
+pub fn acquire_ec_txn_gate() -> EcTxnGate {
+    while EC_TXN_GATE
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    EcTxnGate { _private: () }
+}
+
+/// Non-blocking attempt on the shared EC transaction gate. `None`
+/// when another transaction holds it. Test hook; production
+/// transactions use the blocking [`acquire_ec_txn_gate`].
+pub fn try_acquire_ec_txn_gate() -> Option<EcTxnGate> {
+    EC_TXN_GATE
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .ok()
+        .map(|_| EcTxnGate { _private: () })
+}
+
 #[cfg(target_arch = "x86_64")]
 fn ec_wait_ibf_clear() -> Result<(), FieldAccessError> {
     let (_data, cmd) = match *EC_PORTS.lock() {
@@ -442,6 +519,9 @@ fn ec_wait_obf_set() -> Result<(), FieldAccessError> {
 
 #[cfg(target_arch = "x86_64")]
 fn ec_read_byte(offset: u8) -> Result<u8, FieldAccessError> {
+    // Shared gate (#913): the whole command → address → data
+    // sequence must not interleave with any other EC transaction.
+    let _gate = acquire_ec_txn_gate();
     let (data, cmd) = match *EC_PORTS.lock() {
         Some(p) => p,
         None => return Err(FieldAccessError::Unsupported),
@@ -463,6 +543,8 @@ fn ec_read_byte(offset: u8) -> Result<u8, FieldAccessError> {
 
 #[cfg(target_arch = "x86_64")]
 fn ec_write_byte(offset: u8, val: u8) -> Result<(), FieldAccessError> {
+    // Shared gate (#913): see ec_read_byte.
+    let _gate = acquire_ec_txn_gate();
     let (data, cmd) = match *EC_PORTS.lock() {
         Some(p) => p,
         None => return Err(FieldAccessError::Unsupported),
@@ -526,6 +608,8 @@ pub fn ec_status() -> Result<u8, FieldAccessError> {
 /// "no more events"; the SCI handler stops draining at that point.
 #[cfg(target_arch = "x86_64")]
 pub fn ec_query() -> Result<u8, FieldAccessError> {
+    // Shared gate (#913): see ec_read_byte.
+    let _gate = acquire_ec_txn_gate();
     let (data, cmd) = match *EC_PORTS.lock() {
         Some(p) => p,
         None => return Err(FieldAccessError::Unsupported),

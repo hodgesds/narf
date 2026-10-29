@@ -226,6 +226,10 @@ pub fn ports() -> Option<(u16, u16)> {
 /// Returns `NotBound` when no EC is bound, `Timeout` on a wedged
 /// EC.
 pub fn read_byte(offset: u8) -> Result<u8, EcError> {
+    // Shared gate (#913): the whole command → address → data
+    // sequence must not interleave with any other EC transaction
+    // (platform driver, AML field access, SCI drain).
+    let _gate = oregion::acquire_ec_txn_gate();
     let (data, cmd) = ports().ok_or(EcError::NotBound)?;
     wait_ibf_clear(cmd)?;
     // SAFETY: ports validated by `init()`.
@@ -248,6 +252,8 @@ pub fn read_byte(offset: u8) -> Result<u8, EcError> {
 /// write `offset` to data port → wait IBF=0 → write `value` to
 /// data port → wait IBF=0. Returns `NotBound` when no EC is bound.
 pub fn write_byte(offset: u8, value: u8) -> Result<(), EcError> {
+    // Shared gate (#913): see read_byte.
+    let _gate = oregion::acquire_ec_txn_gate();
     let (data, cmd) = ports().ok_or(EcError::NotBound)?;
     wait_ibf_clear(cmd)?;
     // SAFETY: ports validated by `init()`.
@@ -274,6 +280,12 @@ pub fn write_byte(offset: u8, value: u8) -> Result<(), EcError> {
 /// works fine without burst mode for one-byte transactions, so
 /// this is supplied for completeness.
 pub fn burst_enable() -> Result<(), EcError> {
+    // Shared gate (#913): this transaction alone is serialised.
+    // A BE_EC → N transactions → BD_EC burst SPAN is not atomic
+    // under per-transaction acquisition (see the gate docs); burst
+    // has zero in-tree callers, so no spanning sequence exists
+    // today.
+    let _gate = oregion::acquire_ec_txn_gate();
     let (_data, cmd) = ports().ok_or(EcError::NotBound)?;
     wait_ibf_clear(cmd)?;
     // SAFETY: ports validated by `init()`.
@@ -287,6 +299,8 @@ pub fn burst_enable() -> Result<(), EcError> {
 
 /// Issue burst-disable (BD_EC, 0x83). Pair with [`burst_enable`].
 pub fn burst_disable() -> Result<(), EcError> {
+    // Shared gate (#913): see burst_enable.
+    let _gate = oregion::acquire_ec_txn_gate();
     let (_data, cmd) = ports().ok_or(EcError::NotBound)?;
     wait_ibf_clear(cmd)?;
     // SAFETY: ports validated by `init()`.
@@ -301,6 +315,8 @@ pub fn burst_disable() -> Result<(), EcError> {
 /// called from [`notify_query_event`]; exposed publicly so the
 /// SCI bottom-half can call it directly when convenient.
 pub fn query() -> Result<u8, EcError> {
+    // Shared gate (#913): see read_byte.
+    let _gate = oregion::acquire_ec_txn_gate();
     let (data, cmd) = ports().ok_or(EcError::NotBound)?;
     wait_ibf_clear(cmd)?;
     // SAFETY: ports validated by `init()`.
@@ -317,6 +333,9 @@ pub fn query() -> Result<u8, EcError> {
 ///
 /// Returns `NotBound` when no EC is bound. The SCI bottom-half
 /// uses this to decide whether to invoke [`notify_query_event`].
+///
+/// Deliberately NOT covered by the shared transaction gate (#913):
+/// a single port read has no multi-step sequence to interleave.
 pub fn status() -> Result<u8, EcError> {
     let (_data, cmd) = ports().ok_or(EcError::NotBound)?;
     // SAFETY: ports validated by `init()`.
