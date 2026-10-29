@@ -87,13 +87,13 @@ pub struct PtpTouchpad {
     /// DCI of the interrupt-IN endpoint that carries reports.
     pub interrupt_in_dci: u8,
     pub interface_num: u8,
-    /// Hub context — (index into `attach::HUBS`, downstream
+    /// Hub context — (parent hub slot id, downstream
     /// port) — when the touchpad sits behind a hub; `None` on
     /// a root port, whose ports are never idle-suspended. The
     /// pump feeds `attach::mark_port_activity` with it whenever
     /// a report completes, so an in-use touchpad's port never
     /// idle-suspends mid-gesture (#840).
-    pub hub_port: Option<(usize, u8)>,
+    pub hub_port: Option<(u8, u8)>,
     /// Cached profile — the report-byte → field mapping derived
     /// from the device's Report Descriptor.
     pub profile: PtpProfile,
@@ -203,7 +203,7 @@ pub async fn try_bind_touchpad_already_addressed(
     hid_desc_off: usize,
     cfg: &[u8],
     ep: EndpointConfig,
-    hub_port: Option<(usize, u8)>,
+    hub_port: Option<(u8, u8)>,
 ) -> Result<(), HidError> {
     let report_len = report_descriptor_length(cfg, hid_desc_off).ok_or(HidError::NoInterruptIn)?;
     if report_len == 0 || report_len > 4096 {
@@ -368,7 +368,7 @@ pub fn unregister_all_touchpads() {
 /// Hub contexts of all live touchpad bindings (root-attached
 /// bindings omitted). Aggregated by `hid::hub_ports` for the
 /// supervisor's HID wake step.
-pub fn hub_ports() -> alloc::vec::Vec<(usize, u8)> {
+pub fn hub_ports() -> alloc::vec::Vec<(u8, u8)> {
     let g = TOUCHPADS.lock();
     g.iter().filter_map(|p| p.hub_port).collect()
 }
@@ -407,8 +407,8 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
         // decoded to zero emitted events. No-op when
         // root-attached.
         if reports > 0 {
-            if let Some((hub_idx, port)) = pad.hub_port {
-                crate::attach::mark_port_activity(hub_idx, port);
+            if let Some((hub_slot, port)) = pad.hub_port {
+                crate::attach::mark_port_activity(hub_slot, port);
             }
         }
     }

@@ -111,7 +111,31 @@ pub type UsbProbeFn = fn(device: Arc<USBDevice>) -> Result<(), UsbProbeError>;
 /// [`register_class_driver_with_unbind`]; without one, detach
 /// cannot reach the driver's private state (its slot is still
 /// disabled and reclaimed by the dispatcher).
-pub type UsbUnbindFn = fn(slot_id: u8);
+///
+/// Failure contract (#893): a hook reports failure with `Err(())`
+/// instead of panicking, and [`dispatch_unbind`] continues past
+/// failed hooks — one hook's failure must never abort detach for
+/// every class. A hook that PANICS cannot be contained: the
+/// kernel builds with `panic = "abort"` and no unwinding, so a
+/// panicking hook is fatal by policy, exactly like a panic
+/// anywhere else in the kernel. Hooks must therefore be written
+/// panic-free (no indexing, no `unwrap`/`expect` on fallible
+/// paths) and idempotent: registration tolerates duplicates
+/// (defensive test initcalls re-register), so a hook may run
+/// twice for one dispatch and must still leave state consistent.
+pub type UsbUnbindFn = fn(slot_id: u8) -> Result<(), ()>;
+
+/// Outcome of [`dispatch_unbind`]: how many hooks ran, and how
+/// many reported failure. Detach proceeds regardless of the
+/// failure count; the report exists so tests and the supervisor
+/// can observe hook health without a hook failure wedging detach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnbindReport {
+    /// Hooks invoked for this slot (including failed ones).
+    pub invoked: usize,
+    /// Hooks that returned `Err(())`.
+    pub failed: usize,
+}
 
 // ── Registry internals ──────────────────────────────────────────────
 
@@ -154,7 +178,9 @@ pub fn register_class_driver(
 
 /// Register a USB class driver together with its detach hook. The
 /// hook is called by [`dispatch_unbind`] whenever any device is
-/// detached, with that device's slot id.
+/// detached, with that device's slot id. The hook contract is on
+/// [`UsbUnbindFn`]: report failure with `Err(())`, never panic,
+/// and be idempotent (registration tolerates duplicates).
 pub fn register_class_driver_with_unbind(
     name: &'static str,
     matches: &'static [UsbClassMatch],
@@ -185,19 +211,30 @@ fn register_class_driver_inner(
 
 /// Invoke every registered driver's unbind hook for `slot_id`
 /// (broadcast: hooks self-filter, since the registry does not track
-/// which driver claimed which slot). Returns the number of hooks
-/// invoked. Hooks run after the registry lock is released, so a
-/// hook may itself touch the registry or class state.
-pub fn dispatch_unbind(slot_id: u8) -> usize {
+/// which driver claimed which slot). Hooks run after the registry
+/// lock is released, so a hook may itself touch the registry or
+/// class state. A hook that returns `Err(())` is counted and
+/// dispatch CONTINUES with the remaining hooks (#893): one
+/// hook's failure must never abort detach for every class, and
+/// `detach_slot` proceeds to disable/reclaim the slot
+/// regardless of this report. (A hook that panics cannot be
+/// contained — see [`UsbUnbindFn`]: panic is fatal by policy.)
+pub fn dispatch_unbind(slot_id: u8) -> UnbindReport {
     let hooks: alloc::vec::Vec<UsbUnbindFn> = {
         let g = REGISTRY.lock();
         g.iter().filter_map(|entry| entry.unbind).collect()
     };
-    let count = hooks.len();
+    let mut report = UnbindReport {
+        invoked: 0,
+        failed: 0,
+    };
     for hook in hooks {
-        hook(slot_id);
+        report.invoked += 1;
+        if hook(slot_id).is_err() {
+            report.failed += 1;
+        }
     }
-    count
+    report
 }
 
 /// Return whether one match entry accepts this device. A non-zero

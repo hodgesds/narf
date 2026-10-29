@@ -144,10 +144,14 @@ also consult upstream Linux GPL sources.
   drivers feed `attach::mark_port_activity` on each completed
   transfer and call `attach::resume_port` before a transfer to a
   port that may be suspended. `msc::try_bind_msc_already_addressed`
-  takes the device's hub context — (index into `attach::HUBS`,
+  takes the device's hub context — (parent hub slot id,
   downstream port), `None` on a root port — and `MscDevice` records
   it as `hub_port`; its BOT funnels resume-then-feed on every
-  transaction. The pumped HID classes (boot keyboard, boot mouse,
+  transaction. The slot id, not a `HUBS` index, is the context key:
+  hub detach removes a `HUBS` entry with `retain`, shifting every
+  later index, so a cached index silently retargets after a detach
+  (#892); every use resolves the hub by slot id under one lock
+  hold. The pumped HID classes (boot keyboard, boot mouse,
   PTP touchpad, consumer control) record the same `hub_port`
   context through their `try_bind_*_already_addressed` binders;
   their pumps feed on each completed interrupt-IN report, and the
@@ -300,7 +304,12 @@ also consult upstream Linux GPL sources.
   connected set is detached via `attach::detach_slot`: class bindings are
   dropped first (evdev nodes unregister; registered drivers are reached
   through `class_registry::dispatch_unbind`, a broadcast of the optional
-  hook from `register_class_driver_with_unbind`), a hub's bound subtree
+  hook from `register_class_driver_with_unbind`; a hook reports
+  failure with `Err(())` and dispatch continues past it, so one
+  hook's failure never aborts detach for every class (#893) —
+  a hook that panics cannot be contained (panic is fatal by
+  kernel policy), so hooks must be panic-free and idempotent),
+  a hub's bound subtree
   is detached recursively and its `HUBS` entry removed, then the slot is
   disabled and reclaimed (`Xhci::reclaim_slot`) so a replug re-runs
   attach from scratch. A controller recovery epoch change drops every

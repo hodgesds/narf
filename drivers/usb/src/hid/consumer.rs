@@ -132,12 +132,12 @@ pub struct ConsumerDevice {
     /// item, every report starts with that byte and we strip it
     /// before parsing the usage-code bytes. `None` = no report ID.
     pub report_id: Option<u8>,
-    /// Hub context — (index into `attach::HUBS`, downstream
+    /// Hub context — (parent hub slot id, downstream
     /// port) — when the device sits behind a hub; `None` on a
     /// root port, whose ports are never idle-suspended. The
     /// pump feeds `attach::mark_port_activity` with it whenever
     /// a report completes (#840).
-    pub hub_port: Option<(usize, u8)>,
+    pub hub_port: Option<(u8, u8)>,
     /// Previous report payload (up to 8 usage codes, list-encoded).
     /// Diffed against each new report to synthesise press/release
     /// events. Stored in `[u16; 8]` to handle 2-byte usage codes.
@@ -590,7 +590,7 @@ pub async fn try_bind_consumer_already_addressed(
     slot_id: u8,
     _interface_num: u8,
     desc: &[u8],
-    hub_port: Option<(usize, u8)>,
+    hub_port: Option<(u8, u8)>,
 ) -> Result<(), HidError> {
     // Step 1: find the HID interface with its HID Descriptor offset +
     // interrupt-IN endpoint. The `interface_num` argument is the
@@ -721,7 +721,7 @@ pub async fn try_bind_consumer_already_addressed(
 /// Hub contexts of all live consumer bindings (root-attached
 /// bindings omitted). Aggregated by `hid::hub_ports` for the
 /// supervisor's HID wake step.
-pub fn hub_ports() -> alloc::vec::Vec<(usize, u8)> {
+pub fn hub_ports() -> alloc::vec::Vec<(u8, u8)> {
     let g = CONSUMER_DEVICES.lock();
     g.iter().filter_map(|d| d.hub_port).collect()
 }
@@ -789,8 +789,8 @@ fn pump_one(xhci_dev: &Xhci, idx: usize) -> usize {
     // device's hub port (#840) — feed even when the reports
     // diffed to zero emitted events. No-op when root-attached.
     if reports > 0 {
-        if let Some((hub_idx, port)) = hub_port {
-            crate::attach::mark_port_activity(hub_idx, port);
+        if let Some((hub_slot, port)) = hub_port {
+            crate::attach::mark_port_activity(hub_slot, port);
         }
     }
     total
@@ -836,7 +836,7 @@ pub fn __reset_consumers_for_test() {
 }
 
 #[doc(hidden)]
-pub fn __push_consumer_for_test(slot_id: u8, hub_port: Option<(usize, u8)>) {
+pub fn __push_consumer_for_test(slot_id: u8, hub_port: Option<(u8, u8)>) {
     CONSUMER_DEVICES.lock().push(ConsumerDevice {
         slot_id,
         interrupt_in_dci: 0,
