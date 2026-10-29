@@ -17,6 +17,18 @@
 //!
 //! Both implement [`narf_power::thermal::CoolingDevice`] so the active-
 //! cooling governor in `power/` can drive them uniformly.
+//!
+//! The vendor laptop fan controls are wrapped the same way
+//! (#911): [`ThinkpadFan`] drives `thinkpad_acpi::set_fan_level`
+//! (`\HFNF`) and [`AsusFan`] drives `asus_wmi::set_fan_boost_mode`
+//! (`DEVID_FAN_BOOST`). Each wrapper maps the governor's 0..=255
+//! level onto the vendor driver's own discrete ladder.
+//!
+//! `PwmFan` remains unconstructed in production: nothing in the
+//! tree can supply it a `PwmDevice` — `narf_pwm` has no controller
+//! registry and no production `PwmDevice` implementor, and no
+//! ACPI/DT description of a PWM fan is parsed anywhere. Wiring it
+//! waits on a board description source (the DT/embedded stack).
 
 extern crate alloc;
 
@@ -25,6 +37,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
+#[cfg(target_arch = "x86_64")]
+use core::sync::atomic::AtomicU32;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use narf_aml::eval::{evaluate_method, evaluate_object};
@@ -321,6 +335,189 @@ pub fn init() {
     }
 }
 
+// ── ThinkPad vendor fan ───────────────────────────────────────────
+
+/// Map a governor cooling level (0..=255) onto the ThinkPad fan
+/// ladder — the vendor driver's own levels
+/// (`thinkpad_acpi::FanLevel`).
+///
+/// Level 0 is "no active-cooling demand": `\HFNF` has no fan-off
+/// setting — its 0 is firmware auto control — so 0 hands the fan
+/// back to the firmware. Non-zero levels scale onto the eight
+/// explicit states L1..=L7 + FullSpeed.
+#[cfg(target_arch = "x86_64")]
+pub fn thinkpad_level_for(level: u8) -> crate::thinkpad_acpi::FanLevel {
+    use crate::thinkpad_acpi::FanLevel;
+    if level == 0 {
+        return FanLevel::Auto;
+    }
+    match (level as u64 * 8).div_ceil(255) {
+        1 => FanLevel::L1,
+        2 => FanLevel::L2,
+        3 => FanLevel::L3,
+        4 => FanLevel::L4,
+        5 => FanLevel::L5,
+        6 => FanLevel::L6,
+        7 => FanLevel::L7,
+        _ => FanLevel::FullSpeed,
+    }
+}
+
+/// ThinkPad EC fan as a [`CoolingDevice`], driving
+/// `thinkpad_acpi::set_fan_level` (the `\HFNF` AML write).
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug)]
+pub struct ThinkpadFan {
+    /// Last applied vendor level (`FanLevel as u32`); `u32::MAX`
+    /// until the first `set_level`, so the first call always writes.
+    last: AtomicU32,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl ThinkpadFan {
+    pub fn new() -> Self {
+        Self {
+            last: AtomicU32::new(u32::MAX),
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Default for ThinkpadFan {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl CoolingDevice for ThinkpadFan {
+    fn name(&self) -> &'static str {
+        "thinkpad-fan"
+    }
+
+    fn set_level(&self, level: u8) {
+        let want = thinkpad_level_for(level);
+        // Coalesce: the governor re-asserts levels on every thermal
+        // crossing, and each change is an AML evaluation — only
+        // write when the vendor level actually changes.
+        if self.last.swap(want as u32, Ordering::AcqRel) != want as u32 {
+            crate::thinkpad_acpi::set_fan_level(want);
+        }
+    }
+}
+
+/// Register the ThinkPad fan as a cooling device. Called from
+/// `thinkpad_acpi::init()` once an HKEY device has been found —
+/// the fan lives behind the same EC surface. Registration failure
+/// is logged, never swallowed silently (the #907 rule fan::init
+/// follows for ACPI fans).
+#[cfg(target_arch = "x86_64")]
+pub fn register_thinkpad_fan() {
+    let cap = bootstrap_thermal_authority();
+    match register_cooling_device(&cap, Arc::new(ThinkpadFan::new())) {
+        Ok(()) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  thinkpad-fan: registered as cooling device"
+            );
+        }
+        Err(e) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  thinkpad-fan: cooling-device registration failed: {:?}",
+                e
+            );
+        }
+    }
+}
+
+// ── ASUS vendor fan ───────────────────────────────────────────────
+
+/// Map a governor cooling level (0..=255) onto the ASUS fan boost
+/// ladder — the vendor driver's own modes
+/// (`asus_wmi::FanBoostMode`).
+///
+/// Level 0 is "no active-cooling demand" → Silent. The remaining
+/// range splits between Normal and Overboost at 2/3, so the
+/// governor's three StepPolicy outputs (0 / 128 / 255) land on
+/// Silent / Normal / Overboost respectively.
+#[cfg(target_arch = "x86_64")]
+pub fn asus_mode_for(level: u8) -> crate::asus_wmi::FanBoostMode {
+    use crate::asus_wmi::FanBoostMode;
+    match level {
+        0 => FanBoostMode::Silent,
+        1..=170 => FanBoostMode::Normal,
+        _ => FanBoostMode::Overboost,
+    }
+}
+
+/// ASUS fan boost mode as a [`CoolingDevice`], driving
+/// `asus_wmi::set_fan_boost_mode` (the `DEVID_FAN_BOOST` WMI
+/// devstate write).
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug)]
+pub struct AsusFan {
+    /// Last applied vendor mode (`FanBoostMode as u32`); `u32::MAX`
+    /// until the first `set_level`, so the first call always writes.
+    last: AtomicU32,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl AsusFan {
+    pub fn new() -> Self {
+        Self {
+            last: AtomicU32::new(u32::MAX),
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Default for AsusFan {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl CoolingDevice for AsusFan {
+    fn name(&self) -> &'static str {
+        "asus-fan"
+    }
+
+    fn set_level(&self, level: u8) {
+        let want = asus_mode_for(level);
+        // Coalesce, as in ThinkpadFan::set_level — each change is a
+        // WMI method invocation.
+        if self.last.swap(want as u32, Ordering::AcqRel) != want as u32 {
+            crate::asus_wmi::set_fan_boost_mode(want);
+        }
+    }
+}
+
+/// Register the ASUS fan as a cooling device. Called from
+/// `asus_wmi::init()` when the ASUS WMI GUID is present (the
+/// driver's probe). Registration failure is logged, never
+/// swallowed silently.
+#[cfg(target_arch = "x86_64")]
+pub fn register_asus_fan() {
+    let cap = bootstrap_thermal_authority();
+    match register_cooling_device(&cap, Arc::new(AsusFan::new())) {
+        Ok(()) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  asus-fan: registered as cooling device"
+            );
+        }
+        Err(e) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  asus-fan: cooling-device registration failed: {:?}",
+                e
+            );
+        }
+    }
+}
+
 // ── PWM Fan ─────────────────────────────────────────────────────────
 
 /// Generic PWM-controlled fan. Used on platforms that expose the fan
@@ -494,6 +691,128 @@ mod tests {
     }
     kernel_test_in!("drivers-platform-fan", smoke_pwm_fan_set_level_dispatches);
 
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_thinkpad_level_mapping() -> TestResult {
+        use crate::thinkpad_acpi::FanLevel;
+        // Boundary table for thinkpad_level_for: 0 hands the fan
+        // back to firmware auto; non-zero levels scale onto the
+        // eight explicit states L1..=L7 + FullSpeed by
+        // ceil(level * 8 / 255). The StepPolicy outputs must land
+        // mid-ladder and at the top: 128 → L5, 255 → FullSpeed.
+        let table: [(u8, FanLevel); 8] = [
+            (0, FanLevel::Auto),
+            (1, FanLevel::L1),
+            (31, FanLevel::L1),
+            (32, FanLevel::L2),
+            (128, FanLevel::L5),
+            (223, FanLevel::L7),
+            (224, FanLevel::FullSpeed),
+            (255, FanLevel::FullSpeed),
+        ];
+        for (level, want) in table {
+            if thinkpad_level_for(level) != want {
+                return TestResult::Fail("thinkpad_level_for boundary mismatch");
+            }
+        }
+        // The mapping must be monotonic non-decreasing across the
+        // whole range (rank: Auto < L1 < .. < L7 < FullSpeed) — a
+        // hotter demand must never slow the fan down.
+        let rank = |l: FanLevel| match l {
+            FanLevel::FullSpeed => 8,
+            other => other as u32,
+        };
+        for level in 0..255u8 {
+            if rank(thinkpad_level_for(level + 1)) < rank(thinkpad_level_for(level)) {
+                return TestResult::Fail("thinkpad_level_for is not monotonic");
+            }
+        }
+        TestResult::Pass
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("drivers-platform-fan", smoke_thinkpad_level_mapping);
+
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_asus_mode_mapping() -> TestResult {
+        use crate::asus_wmi::FanBoostMode;
+        // Boundary table for asus_mode_for: 0 → Silent (no demand),
+        // 1..=170 → Normal, 171..=255 → Overboost. The StepPolicy
+        // outputs land one per mode: 0 / 128 / 255.
+        let table: [(u8, FanBoostMode); 6] = [
+            (0, FanBoostMode::Silent),
+            (1, FanBoostMode::Normal),
+            (128, FanBoostMode::Normal),
+            (170, FanBoostMode::Normal),
+            (171, FanBoostMode::Overboost),
+            (255, FanBoostMode::Overboost),
+        ];
+        for (level, want) in table {
+            if asus_mode_for(level) != want {
+                return TestResult::Fail("asus_mode_for boundary mismatch");
+            }
+        }
+        let rank = |m: FanBoostMode| match m {
+            FanBoostMode::Silent => 0,
+            FanBoostMode::Normal => 1,
+            FanBoostMode::Overboost => 2,
+        };
+        for level in 0..255u8 {
+            if rank(asus_mode_for(level + 1)) < rank(asus_mode_for(level)) {
+                return TestResult::Fail("asus_mode_for is not monotonic");
+            }
+        }
+        TestResult::Pass
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("drivers-platform-fan", smoke_asus_mode_mapping);
+
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_vendor_fan_wrappers_drive_vendor_state() -> TestResult {
+        use crate::asus_wmi::FanBoostMode;
+        use crate::thinkpad_acpi::FanLevel;
+        // The wrappers must reach the vendor drivers' own state:
+        // ThinkpadFan → thinkpad_acpi::set_fan_level (records into
+        // fan_level()), AsusFan → asus_wmi::set_fan_boost_mode
+        // (records into fan_boost_mode()). The AML/WMI transports
+        // are best-effort in these drivers, so the recorded state
+        // is the observable seam below the governor fixtures in
+        // the crate test suite, which assert the wire writes.
+        crate::thinkpad_acpi::__test_reset();
+        crate::asus_wmi::__test_reset();
+
+        let tp = ThinkpadFan::new();
+        tp.set_level(128);
+        if crate::thinkpad_acpi::fan_level() != FanLevel::L5 {
+            return TestResult::Fail("ThinkpadFan(128) did not set fan level L5");
+        }
+        tp.set_level(255);
+        if crate::thinkpad_acpi::fan_level() != FanLevel::FullSpeed {
+            return TestResult::Fail("ThinkpadFan(255) did not set FullSpeed");
+        }
+        tp.set_level(0);
+        if crate::thinkpad_acpi::fan_level() != FanLevel::Auto {
+            return TestResult::Fail("ThinkpadFan(0) did not return fan to Auto");
+        }
+
+        let asus = AsusFan::new();
+        asus.set_level(0);
+        if crate::asus_wmi::fan_boost_mode() != FanBoostMode::Silent {
+            return TestResult::Fail("AsusFan(0) did not set Silent");
+        }
+        asus.set_level(128);
+        if crate::asus_wmi::fan_boost_mode() != FanBoostMode::Normal {
+            return TestResult::Fail("AsusFan(128) did not set Normal");
+        }
+        asus.set_level(255);
+        if crate::asus_wmi::fan_boost_mode() != FanBoostMode::Overboost {
+            return TestResult::Fail("AsusFan(255) did not set Overboost");
+        }
+        TestResult::Pass
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "drivers-platform-fan",
+        smoke_vendor_fan_wrappers_drive_vendor_state
+    );
     // ── Hand-encoded AML fan fixtures ─────────────────────────────
     //
     // The fixtures below are hand-encoded AML byte streams in the
