@@ -2984,6 +2984,125 @@ fn smoke_ahci_device_pm_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/storage/ahci", smoke_ahci_device_pm_round_trip);
 
+/// #981: resume revalidation compares the IDENTIFY serial, not just
+/// capacity + model. A same-model, same-capacity disk with a
+/// different serial must fail revalidation — pre-fix the inline
+/// condition accepted it, because the serial was computed into the
+/// fresh record but never compared.
+fn smoke_ahci_resume_revalidation_compares_serial() -> TestResult {
+    use crate::ahci::{disk_identity_matches, AtaFeatures, DiskInfo};
+    let old = DiskInfo {
+        port: 0,
+        sectors: 1_000_000,
+        features: AtaFeatures::default(),
+        model: alloc::string::String::from("TESTDISK-1"),
+        serial: alloc::string::String::from("SN-AAAA"),
+        firmware: alloc::string::String::from("1.0"),
+    };
+    if !disk_identity_matches(&old, 1_000_000, "TESTDISK-1", "SN-AAAA") {
+        return TestResult::Fail("identical IDENTIFY must revalidate");
+    }
+    // The #981 case: same model, same capacity, swapped serial.
+    if disk_identity_matches(&old, 1_000_000, "TESTDISK-1", "SN-BBBB") {
+        return TestResult::Fail("a serial swap must fail revalidation");
+    }
+    if disk_identity_matches(&old, 1_000_000, "OTHERDISK", "SN-AAAA") {
+        return TestResult::Fail("a model change must fail revalidation");
+    }
+    if disk_identity_matches(&old, 2_000_000, "TESTDISK-1", "SN-AAAA") {
+        return TestResult::Fail("a capacity change must fail revalidation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/storage/ahci",
+    smoke_ahci_resume_revalidation_compares_serial
+);
+
+/// #980: the publication plan is dense, identity-faithful, and
+/// complete for multi-port and multi-HBA inputs, without depending
+/// on the QEMU device profile. Two controllers' disk tables are
+/// planned in probe order, the second plan starting where the first
+/// ended — as the boot-global counter provides.
+fn smoke_ahci_publication_plan_multi_disk() -> TestResult {
+    use crate::ahci::{plan_publication, AtaFeatures, DiskInfo};
+    fn disk(port: u8, sectors: u64, model: &str, serial: &str) -> DiskInfo {
+        DiskInfo {
+            port,
+            sectors,
+            features: AtaFeatures::default(),
+            model: alloc::string::String::from(model),
+            serial: alloc::string::String::from(serial),
+            firmware: alloc::string::String::from("9.9"),
+        }
+    }
+    // HBA-A: two ports. Same model + same capacity, different
+    // serials — the masking case: identity must still distinguish.
+    let hba_a = alloc::vec![
+        disk(0, 1_000_000, "TESTDISK", "SN-A0"),
+        disk(1, 1_000_000, "TESTDISK", "SN-A1"),
+    ];
+    // HBA-B: three ports, distinct models.
+    let hba_b = alloc::vec![
+        disk(0, 2_000_000, "DISK-B0", "SN-B0"),
+        disk(1, 3_000_000, "DISK-B1", "SN-B1"),
+        disk(2, 2_000_000, "DISK-B2", "SN-B2"),
+    ];
+    let plan_a = plan_publication(&hba_a, "0000:00:1f.2", 0x8086, 0);
+    let plan_b = plan_publication(&hba_b, "0000:00:1f.3", 0x8086, plan_a.len());
+    // Density: names sata0..sata4 in probe order, no gaps, no dups.
+    let mut total = 0usize;
+    for entry in plan_a.iter().chain(plan_b.iter()) {
+        let want = alloc::format!("sata{total}");
+        if entry.name != want {
+            return TestResult::Fail("plan names must be dense sata<n> in probe order");
+        }
+        if entry.identity.controller != want {
+            return TestResult::Fail("identity controller must equal the registry name");
+        }
+        total += 1;
+    }
+    // Agreement: one plan entry per disk, nothing missing, nothing extra.
+    if total != hba_a.len() + hba_b.len() {
+        return TestResult::Fail("plan length must equal the disk count");
+    }
+    // Identity: every entry carries its own disk's model/serial/firmware.
+    for (entry, d) in plan_a
+        .iter()
+        .zip(hba_a.iter())
+        .chain(plan_b.iter().zip(hba_b.iter()))
+    {
+        if entry.identity.model != d.model
+            || entry.identity.serial != d.serial
+            || entry.identity.firmware != d.firmware
+        {
+            return TestResult::Fail("identity must carry the disk's own model/serial/firmware");
+        }
+        if entry.identity.transport != "ata" || entry.identity.vendor_id != 0x8086 {
+            return TestResult::Fail("identity transport/vendor must match the controller");
+        }
+        if entry.port != d.port {
+            return TestResult::Fail("plan entry must address its disk's port");
+        }
+    }
+    // Masking: the two same-model, same-capacity HBA-A disks differ
+    // by serial — and by name.
+    if plan_a[0].identity.serial == plan_a[1].identity.serial || plan_a[0].name == plan_a[1].name {
+        return TestResult::Fail("same-model disks must still differ by serial and name");
+    }
+    // Bus paths ride per-controller, not per-disk.
+    if plan_a.iter().any(|e| e.identity.bus_path != "0000:00:1f.2")
+        || plan_b.iter().any(|e| e.identity.bus_path != "0000:00:1f.3")
+    {
+        return TestResult::Fail("bus path must be the owning controller's");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/storage/ahci",
+    smoke_ahci_publication_plan_multi_disk
+);
+
 /// GHC.IE is the HBA's master interrupt gate and must stay clear until the
 /// ISR is installed and routed (it was set at the end of bring-up, before
 /// `probe` had any vector).

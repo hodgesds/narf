@@ -69,6 +69,10 @@ All driver code is derived strictly from the references below.
   every ATA-disk port is IDENTIFYed and published as its own `sata<n>`
   block device with a `DiskIdentity` (transport `ata`, PCI bus path,
   model / serial / firmware) and a partition scan (`sata<n>p<m>`) (#931).
+  The name + identity mapping is the pure `plan_publication` helper
+  (names dense `sata<n>` from the boot-global counter run); the
+  model-level smoke asserts its density, identity, and agreement for
+  multi-port and multi-HBA inputs (#980).
   `AhciBlockSync` is per-disk (controller + port); its transfers chunk
   at the per-controller 128 KiB DMA transfer buffer, so the block
   surface takes any request size the registry contract allows (#930).
@@ -79,7 +83,9 @@ All driver code is derived strictly from the references below.
   The driver registers `ahci` with the `power` device_pm fan-out:
   suspend flushes + idles every published disk (failure aborts the
   suspend), resume re-runs the HBA init sequence and revalidates each
-  disk's capacity + model before serving I/O again (#932). Only the
+  disk's capacity + model + serial (`disk_identity_matches`) before
+  serving I/O again; a mismatch keeps the controller suspended
+  rather than serving a stranger's disk under the old name (#932, #981). Only the
   first installed HBA owns an IRQ (the ISR is a single-controller
   design); later HBAs poll. An HBA without CAP.S64A gets its DMA
   buffers below 4 GiB via the masked allocator. New
