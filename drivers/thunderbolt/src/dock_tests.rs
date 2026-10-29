@@ -3,6 +3,13 @@
 //! production paths in a single flow, with assertions at every
 //! stage boundary:
 //!
+//! P. **PD contract** — two production `TcpmPort`s negotiate a
+//!    5 V / 3 A contract over a fixture cable (the usbpd/TCPM
+//!    stage, #1188); the link-training state the scan consumes
+//!    is derived from that live contract, not hardcoded. The
+//!    detach/reattach half of the PD story — engines reset, a
+//!    new partner renegotiates fresh — is proven by drivers/
+//!    usbpd's own back-to-back test, which owns it.
 //! 0. **ICM gate** — three controllers' firmware-status sample
 //!    worlds go through `icm::classify` + `icm::record`, the exact
 //!    decision `runtime::start` acts on: native proceeds,
@@ -25,6 +32,13 @@
 //!    the USB4 path configuration layout (lane HopIDs are
 //!    allocated first-free, so composed they are not the
 //!    single-tunnel fixture's 8).
+//! 3b. **USB class cascade** — from the published USB3 tunnel's
+//!    dock endpoint, the dock hub parses through the production
+//!    hub descriptor/interface walkers and its downstream
+//!    devices classify through the production class-registry
+//!    matching and interface walkers (HID, audio-control, CDC-
+//!    ACM), keyed off the tunnel publication itself (spec §3's
+//!    handoff surface), not a second fixture copy of it.
 //! 4. **Suspend/replay** — the device-PM fan-out
 //!    (`suspend_all_devices` / `resume_all_devices`, the pair the
 //!    system sleep paths gate on) refuses, the CM quiesces the
@@ -51,22 +65,25 @@
 //! the PM verdicts come from the production fan-out (lane 2's
 //! harness shape).
 //!
-//! Two stages of the dock story belong to other crates and have
-//! no in-tree composition seam — no crate depends on both sides,
-//! and this crate neither reads PD state nor hands the USB3
-//! tunnel to a USB host model — so they are asserted at the
-//! CM's observable edge and named, not faked:
-//! - **USB PD contract (usbpd/TCPM):** on hardware, a negotiated
-//!   contract and USB4 alt-mode entry are what train the link;
-//!   at the CM's edge that precondition *is* the PHY link state.
-//!   `usb4_dock_untrained_link_is_no_fabric` pins the negative
-//!   side of that edge: untrained links enumerate as no fabric
-//!   and reconcile programs nothing.
-//! - **USB class cascades (drivers/usb):** the handoff surface
-//!   the CM owns is tunnel publication (`usb3_tunnels()` /
-//!   `pcie_tunnels()`, spec §3); Ethernet/audio/storage binding
-//!   behind the tunnelled hub is the USB programme's surface,
-//!   exercised by its own fixtures.
+//! One hop of the dock story is still a named boundary, not a
+//! driven stage: **USB4 alt-mode entry (EnterUSB, #1194)** —
+//! no production code carries a port from "explicit contract
+//! live" to "USB4 alt mode entered", so this fixture derives
+//! link training from the live contract explicitly instead of
+//! driving that hop. Everything else the two cross-crate stages
+//! need is composed here through test-only optional deps
+//! (kernel-test feature) on the crates that own them — no
+//! production dependency of the CM changes:
+//! - **USB PD contract (usbpd/TCPM):** stage P drives the
+//!   negotiation live; `usb4_dock_untrained_link_is_no_fabric`
+//!   pins the negative side (untrained links enumerate as no
+//!   fabric and reconcile programs nothing).
+//! - **USB class cascades (drivers/usb):** stage 3b runs the
+//!   hub parse and class matching from the published tunnel;
+//!   probe execution itself (control/bulk transfers) stays the
+//!   USB programme's xHCI-bound surface, exercised by its own
+//!   fixtures, as is the interface-triple dispatch inside
+//!   `match_entry`.
 
 use super::cm::CfgSpace;
 use super::control::Config;
@@ -83,7 +100,16 @@ use super::xdomain::{Engine, PeerInfo, XdChannel, PKG_XDOMAIN_RESP, ROUTE_REPLY_
 use alloc::collections::BTreeMap;
 use alloc::{boxed::Box, rc::Rc, sync::Arc, vec::Vec};
 use core::cell::RefCell;
+use narf_drivers_usb::class_registry::{
+    register_class_driver, reset_for_test as usb_class_reset_for_test, would_match, UsbClassMatch,
+    UsbProbeError,
+};
+use narf_drivers_usb::hub::{find_hub_interface, HubDescriptor};
+use narf_drivers_usbpd::policy::{SinkPolicy, SourcePolicy};
+use narf_drivers_usbpd::tcpm::TcpmPort;
 use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_lib::sync::IrqSafeSpinLock;
+use narf_usbpd::tcpc::{CcState, CcStatus, PortRole, Tcpc, TcpcError};
 
 /// The composed scenario's domain (the native CM's NHI) and the
 /// peer host's domain, as published in the tunnel / peer
@@ -860,14 +886,259 @@ fn run<T>(future: impl core::future::Future<Output = T>) -> T {
     narf_scheduler::block_on_spin(future)
 }
 
+// ── Stage P helpers: fixture Type-C cable ────────────────────
+// Same lossless store-and-forward shape as drivers/usbpd's own
+// back-to-back test (which owns the detach/reattach proof):
+// end A's transmit lands in end B's receive queue and vice
+// versa, and each end's CC status reports the partner's
+// termination, so the two production TcpmPorts classify into
+// complementary roles.
+#[derive(Debug)]
+struct Cable {
+    a_rx: IrqSafeSpinLock<Vec<Vec<u8>>>,
+    b_rx: IrqSafeSpinLock<Vec<Vec<u8>>>,
+    a_cc: IrqSafeSpinLock<CcStatus>,
+    b_cc: IrqSafeSpinLock<CcStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CableSide {
+    A,
+    B,
+}
+
+#[derive(Debug)]
+struct CableEnd {
+    cable: Arc<Cable>,
+    side: CableSide,
+}
+
+impl Cable {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            a_rx: IrqSafeSpinLock::new(Vec::new()),
+            b_rx: IrqSafeSpinLock::new(Vec::new()),
+            a_cc: IrqSafeSpinLock::new(CcStatus {
+                cc1: CcState::Rd,
+                cc2: CcState::Open,
+            }),
+            b_cc: IrqSafeSpinLock::new(CcStatus {
+                cc1: CcState::Rp3A0,
+                cc2: CcState::Open,
+            }),
+        })
+    }
+
+    fn end(self: &Arc<Self>, side: CableSide) -> CableEnd {
+        CableEnd {
+            cable: Arc::clone(self),
+            side,
+        }
+    }
+}
+
+impl Tcpc for CableEnd {
+    fn name(&self) -> &'static str {
+        "cable"
+    }
+
+    fn set_role(&self, _role: PortRole) -> Result<(), TcpcError> {
+        Ok(())
+    }
+
+    fn cc_status(&self) -> Result<CcStatus, TcpcError> {
+        Ok(match self.side {
+            CableSide::A => *self.cable.a_cc.lock(),
+            CableSide::B => *self.cable.b_cc.lock(),
+        })
+    }
+
+    fn transmit(&self, m: &[u8]) -> Result<(), TcpcError> {
+        match self.side {
+            CableSide::A => self.cable.b_rx.lock().push(m.to_vec()),
+            CableSide::B => self.cable.a_rx.lock().push(m.to_vec()),
+        }
+        Ok(())
+    }
+
+    fn receive(&self) -> Result<Vec<u8>, TcpcError> {
+        let mut q = match self.side {
+            CableSide::A => self.cable.a_rx.lock(),
+            CableSide::B => self.cable.b_rx.lock(),
+        };
+        if q.is_empty() {
+            return Err(TcpcError::NoMessage);
+        }
+        Ok(q.remove(0))
+    }
+
+    fn hard_reset(&self) -> Result<(), TcpcError> {
+        self.cable.a_rx.lock().clear();
+        self.cable.b_rx.lock().clear();
+        Ok(())
+    }
+}
+
+/// Stage P: negotiate a 5 V / 3 A contract between two production
+/// TcpmPorts over the fixture cable; returns the sink's
+/// negotiated (voltage_mv, op_current_ma), or `None` if no live
+/// contract results. This is the contract the dock scenario's
+/// link training derives from.
+fn pd_contract_terms() -> Option<(u32, u32)> {
+    let cap = narf_usbpd::bootstrap_usbpd_authority();
+    let cable = Cable::new();
+    let src = Arc::new(TcpmPort::new(
+        Arc::new(cable.end(CableSide::A)),
+        SinkPolicy::default(),
+        SourcePolicy::default(),
+        alloc::string::String::from("dock-host"),
+    ));
+    let snk = Arc::new(TcpmPort::new(
+        Arc::new(cable.end(CableSide::B)),
+        SinkPolicy::default(),
+        SourcePolicy::default(),
+        alloc::string::String::from("dock"),
+    ));
+    for _ in 0..100 {
+        let _ = src.step(&cap);
+        let _ = snk.step(&cap);
+        if src.contract_live() && snk.contract_live() {
+            break;
+        }
+    }
+    if !src.contract_live() || !snk.contract_live() {
+        return None;
+    }
+    snk.sink()
+        .contract()
+        .map(|c| (c.voltage_mv, c.op_current_ma))
+}
+
+/// Registry probe for the cascade stage's fixture entries. Never
+/// runs here — `would_match` answers the binding question
+/// without a live `Arc<USBDevice>` — so it declines.
+fn cascade_probe_unused(
+    _dev: Arc<narf_drivers_usb::device::USBDevice>,
+) -> Result<(), UsbProbeError> {
+    Err(UsbProbeError::BindFailed)
+}
+
+static CASCADE_STORAGE_MATCH: &[UsbClassMatch] = &[UsbClassMatch::vid_pid(0xFF00, 0x0001)];
+static CASCADE_HID_MATCH: &[UsbClassMatch] = &[UsbClassMatch::vid_pid(0xFF00, 0x0002)];
+static CASCADE_AUDIO_MATCH: &[UsbClassMatch] = &[UsbClassMatch::vid_pid(0xFF00, 0x0003)];
+static CASCADE_ACM_MATCH: &[UsbClassMatch] = &[UsbClassMatch::vid_pid(0xFF00, 0x0004)];
+
+/// Stage 3b: the USB class cascade behind the USB3 tunnel.
+/// `endpoint` is the published tunnel's dock-side endpoint; the
+/// hub and devices below are declared behind it (fixture-only
+/// VID/PIDs in the 0xFF00 range, away from every real driver
+/// table). Returns false on any mismatch. The class registry is
+/// reset on entry — so verdicts reflect only the entries below,
+/// never leaked state — and on exit, so later tests see a clean
+/// registry.
+fn cascade_behind_tunnel(endpoint: super::tunnel::Endpoint) -> bool {
+    use narf_drivers_usb::cdc_acm::find_acm_interfaces;
+    use narf_drivers_usb::ctap::find_hid_interface;
+    use narf_drivers_usb::uac::find_audio_control_interface;
+
+    if endpoint.route != DOCK_ROUTE || endpoint.port != 3 {
+        return false;
+    }
+    usb_class_reset_for_test();
+    let mut ok = true;
+    ok &=
+        register_class_driver("dock-storage", CASCADE_STORAGE_MATCH, cascade_probe_unused).is_ok();
+    ok &= register_class_driver("dock-hid", CASCADE_HID_MATCH, cascade_probe_unused).is_ok();
+    ok &= register_class_driver("dock-audio", CASCADE_AUDIO_MATCH, cascade_probe_unused).is_ok();
+    ok &= register_class_driver("dock-acm", CASCADE_ACM_MATCH, cascade_probe_unused).is_ok();
+    // Binding decisions through the production registry: every
+    // downstream device matches, an unknown VID/PID and the
+    // (0, 0) wildcard pair do not.
+    ok &= would_match(0xFF00, 0x0001);
+    ok &= would_match(0xFF00, 0x0002);
+    ok &= would_match(0xFF00, 0x0003);
+    ok &= would_match(0xFF00, 0x0004);
+    ok &= !would_match(0xFF00, 0x0009);
+    ok &= !would_match(0x0000, 0x0000);
+    // The dock hub itself: a 4-port hub (USB 2.0 §11.23.2.1)
+    // behind the tunnel, found through the production interface
+    // walker on its spec-shaped config blob.
+    let hub_cfg: &[u8] = &[
+        9, 0x02, 25, 0, 1, 1, 0, 0x80, 50, // config, 1 interface
+        9, 0x04, 0, 0, 1, 0x09, 0, 0, 0, // hub interface 0
+        7, 0x05, 0x81, 0x03, 8, 0, 10, // interrupt-IN endpoint
+    ];
+    ok &= find_hub_interface(hub_cfg) == Some(0);
+    let hub_desc: &[u8] = &[9, 0x29, 4, 0x40, 0x00, 0x32, 0x64, 0, 0];
+    ok &= match HubDescriptor::decode(hub_desc) {
+        Some(d) => d.num_ports == 4 && d.tt_think_time() == 2,
+        None => false,
+    };
+    ok &= HubDescriptor::decode(&[9, 0x28, 4, 0x40, 0x00, 0x32, 0x64, 0, 0]).is_none();
+    ok &= HubDescriptor::decode(&[9, 0x29, 4, 0x40, 0x00, 0x32, 0x64]).is_none();
+    // Downstream devices, classified through the production
+    // interface walkers on their spec-shaped config blobs
+    // (USB 2.0 §9.6.5 interface triples).
+    let hid_cfg: &[u8] = &[
+        9, 0x02, 34, 0, 1, 1, 0, 0x80, 50, // config
+        9, 0x04, 0, 0, 1, 0x03, 0, 0, 0, // HID interface 0
+        9, 0x21, 0x11, 0x01, 0, 1, 0x22, 0x34, 0, // HID descriptor
+        7, 0x05, 0x81, 0x03, 8, 0, 10, // interrupt-IN endpoint
+    ];
+    ok &= find_hid_interface(hid_cfg) == Some((0, 9));
+    let audio_cfg: &[u8] = &[
+        9, 0x02, 18, 0, 1, 1, 0, 0x80, 50, // config
+        9, 0x04, 0, 0, 0, 0x01, 0x01, 0, 0, // audio-control interface 0
+    ];
+    ok &= find_audio_control_interface(audio_cfg) == Some(0);
+    let acm_cfg: &[u8] = &[
+        9, 0x02, 48, 0, 2, 1, 0, 0x80, 50, // config, 2 interfaces
+        9, 0x04, 0, 0, 1, 0x02, 0x02, 0x01, 0, // comm interface 0 (ACM)
+        7, 0x05, 0x83, 0x03, 8, 0, 10, // notification endpoint
+        9, 0x04, 1, 0, 2, 0x0A, 0, 0, 0, // data interface 1
+        7, 0x05, 0x81, 0x02, 0x40, 0, 0, // bulk-IN endpoint
+        7, 0x05, 0x02, 0x02, 0x40, 0, 0, // bulk-OUT endpoint
+    ];
+    ok &= match find_acm_interfaces(acm_cfg) {
+        Some((comm, data, bulk_in, bulk_out)) => {
+            comm == 0
+                && data == 1
+                && bulk_in.ep_addr == 0x81
+                && bulk_in.max_packet == 0x40
+                && bulk_out.ep_addr == 0x02
+                && bulk_out.max_packet == 0x40
+        }
+        None => false,
+    };
+    // A data interface that is not CDC-Data must not bind as ACM.
+    let mut acm_broken = acm_cfg.to_vec();
+    acm_broken[30] = 0x0B;
+    ok &= find_acm_interfaces(&acm_broken).is_none();
+    usb_class_reset_for_test();
+    ok
+}
+
 /// The composed dock scenario. See this module's documentation
-/// for the stage list and the two named cross-crate boundaries.
+/// for the stage list and the one remaining cross-crate boundary
+/// (EnterUSB, #1194).
 fn usb4_dock_composed_end_to_end() -> TestResult {
     use super::icm::{classify, CmMode, FW_STS_ICM_EN, FW_STS_NVM_AUTH_DONE};
     use super::tunnel::{displays, pcie_tunnels, usb3_tunnels, Endpoint, Protocol};
     use narf_power::device_pm::{suspend_all_devices, DeviceSuspendError};
 
     reset_world();
+
+    // ── Stage P: the PD contract that trains the link ────────
+    // On hardware, a negotiated contract and USB4 alt-mode
+    // entry are what train the link. The alt-mode hop is still
+    // unbuilt (#1194), so the fixture drives the contract live
+    // through production TcpmPorts and derives link training
+    // from it explicitly below: contract live => trained links.
+    let pd_live = pd_contract_terms()
+        .is_some_and(|(voltage_mv, op_current_ma)| voltage_mv == 5000 && op_current_ma == 3000);
+    if !pd_live {
+        return TestResult::Fail("dock: PD negotiation did not reach a live 5V/3A contract");
+    }
 
     // ── Stage 0: the ICM gate ────────────────────────────────
     // The decision runtime::start acts on, over four sample
@@ -907,7 +1178,10 @@ fn usb4_dock_composed_end_to_end() -> TestResult {
     super::icm::__reset_for_test();
 
     // ── Stage 1: enumeration of the native domain ────────────
-    let mut m = dock_model(2);
+    // Link training follows Stage P's contract: live => trained
+    // links (2); the dead-contract half is the untrained model
+    // (0) pinned by usb4_dock_untrained_link_is_no_fabric.
+    let mut m = dock_model(if pd_live { 2 } else { 0 });
     let previous = Domain {
         id: LOCAL_DOMAIN,
         routers: Vec::new(),
@@ -1083,6 +1357,14 @@ fn usb4_dock_composed_end_to_end() -> TestResult {
         || m.get(DOCK_ROUTE, 5, CfgSpace::Port, 32) & (3 << 30) != 3 << 30
     {
         return TestResult::Fail("dock: USB3 handshake or DP enables missing");
+    }
+
+    // ── Stage 3b: the USB class cascade behind the USB3 tunnel ─
+    // The USB3 tunnel proven above ends at the dock's port 3;
+    // the hub and devices behind that endpoint classify through
+    // the production walkers and registry matching.
+    if !cascade_behind_tunnel(usb3[0].output) {
+        return TestResult::Fail("dock: USB class cascade behind the USB3 tunnel is wrong");
     }
 
     // ── Stage 4: suspend quiesce + resume replay ─────────────

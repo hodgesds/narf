@@ -340,17 +340,24 @@ Detect state, and a runtime PCI rescan of the NHI's companion bridge so
 tunnelled devices enumerate without a reboot (the CM publishes tunnels;
 registering newly appeared PCI devices is a bus-subsystem surface).
 AMD source encoder setup, firmware loading and link training belong to GPU.
-Composed-fixture boundary (issue #1098, `dock_tests`): the end-to-end
-dock scenario composes every stage this CM owns — ICM gate,
-enumeration with retimer chains, the retimer NVM path, USB3 + DP +
-PCIe tunnels under the full `_OSC` grant, the device-PM
-suspend/replay cycle, XDomain discovery/login/Ethernet, and the
-logged-in-link suspend veto. Two stages of the dock story live in
-other crates and have no in-tree composition seam — no crate may
-host a test that drives both sides — so the fixture asserts them at
-the CM's observable edge instead of faking them: the USB PD contract
-(usbpd/TCPM) appears here as PHY link training (an untrained fabric
-enumerates as no fabric and programs nothing), and the USB
-class-device cascade (drivers/usb) consumes tunnel publication,
-which §3 defines as the handoff surface. A fixture-composition seam
-for those two stages is tracked in the issue filed from #1098.
+Composed-fixture boundary (issue #1098, `dock_tests`, seam #1188):
+the end-to-end dock scenario composes every stage this CM owns —
+ICM gate, enumeration with retimer chains, the retimer NVM path,
+USB3 + DP + PCIe tunnels under the full `_OSC` grant, the
+device-PM suspend/replay cycle, XDomain discovery/login/Ethernet,
+and the logged-in-link suspend veto — plus the two cross-crate
+stages through test-only optional deps (kernel-test feature) on
+the crates that own them, which change no production dependency
+of the CM: the USB PD contract is negotiated live by two
+production `TcpmPort`s over a fixture cable (stage P; the
+detach/reattach proof lives in drivers/usbpd's own back-to-back
+test, with the detach-reset fix #1193), and the USB class-device
+cascade runs from the published USB3 tunnel through the
+production hub walkers and class-registry matching (stage 3b).
+One hop remains a named boundary, not a driven stage: USB4
+alt-mode entry (EnterUSB, #1194) — no production code carries a
+port from "explicit contract live" to "USB4 alt mode entered",
+so the fixture derives link training from the live contract
+explicitly; probe execution itself (control/bulk transfers)
+stays the USB programme's xHCI-bound surface, as does the
+interface-triple dispatch inside drivers/usb's `match_entry`.
