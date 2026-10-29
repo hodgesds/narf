@@ -1036,11 +1036,23 @@ mod tests {
 
     /// A recording [`AcmTransport`] fake: captures every
     /// actuation, fails on script.
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct FakeTransport {
         calls: IrqSafeSpinLock<Vec<FakeCall>>,
         fail_line_coding: IrqSafeSpinLock<bool>,
         break_unsupported: IrqSafeSpinLock<bool>,
+    }
+
+    // Manual Default: IrqSafeSpinLock has no Default impl (its inner
+    // SpinLock does not), so the locks are constructed explicitly.
+    impl Default for FakeTransport {
+        fn default() -> Self {
+            Self {
+                calls: IrqSafeSpinLock::new(Vec::new()),
+                fail_line_coding: IrqSafeSpinLock::new(false),
+                break_unsupported: IrqSafeSpinLock::new(false),
+            }
+        }
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1399,7 +1411,7 @@ mod tests {
         }
         // SET with input bits set must only drive outputs:
         // value asks RTS on + DTR off (inputs CAR/DSR also set).
-        ctx.write_bytes(0, &(0x040 | 0x100 | 0x004).to_le_bytes());
+        ctx.write_bytes(0, &(0x040i32 | 0x100 | 0x004).to_le_bytes());
         if ioctl(&fd, TIOCMSET, FakeCtx::BASE, &ctx).is_err() {
             return TestResult::Fail("TIOCMSET failed");
         }

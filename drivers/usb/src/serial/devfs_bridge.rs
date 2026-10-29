@@ -151,6 +151,11 @@ impl SerialRing {
     pub fn len(&self) -> usize {
         self.count
     }
+
+    /// `true` when no byte is queued.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
 }
 
 impl Default for SerialRing {
