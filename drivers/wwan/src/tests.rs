@@ -751,7 +751,11 @@ impl MbimTransport for FakeModem {
 
 /// Build an NTB with the fixture's own writers (NTH16 + one NDP16
 /// whose signature byte 3 is `session`), independent of the
-/// production builder it exercises on the receive path.
+/// production builder it exercises on the receive path. The NDP
+/// signature spells "IPS" (Linux `USB_CDC_MBIM_NDP16_IPS_SIGN`):
+/// an earlier revision of this fixture spelled "NCM" here, agreeing
+/// with production's wrong constant while real hardware would fail
+/// both. Corrected with production in the #1143 prerequisite.
 fn fake_ntb(session: u8, payload: &[u8]) -> Vec<u8> {
     let total = 28 + payload.len();
     let mut v = Vec::new();
@@ -760,7 +764,7 @@ fn fake_ntb(session: u8, payload: &[u8]) -> Vec<u8> {
     fw16(&mut v, 1); // sequence
     fw16(&mut v, total as u16); // block length
     fw16(&mut v, 12); // NDP index
-    v.extend_from_slice(&[0x4E, 0x43, 0x4D, session]); // "NCM" + session
+    v.extend_from_slice(&[0x49, 0x50, 0x53, session]); // "IPS" + session
     fw16(&mut v, 16); // NDP length
     fw16(&mut v, 0); // next NDP: none
     fw16(&mut v, 28); // datagram offset
@@ -958,14 +962,15 @@ fn smoke_mbim_ntb_session_signing() -> TestResult {
     ];
     let ntb = bearer::build_mbim_ntb(3, 1, payload);
     // NTH16 + NDP16 per NCM 1.0 §3.2 with the MBIM session-signed
-    // NDP signature (Linux cdc_mbim): "NCM" + SessionId in byte 3.
+    // NDP signature (Linux cdc_mbim): "IPS" + SessionId in byte 3
+    // (USB_CDC_MBIM_NDP16_IPS_SIGN = 0x00535049).
     let expected: &[u8] = &[
         0x4E, 0x43, 0x4D, 0x48, // NTH signature "NCMH"
         0x0C, 0x00, // header length 12
         0x03, 0x00, // sequence 3
         0x30, 0x00, // block length 48
         0x0C, 0x00, // NDP index 12
-        0x4E, 0x43, 0x4D, 0x01, // NDP signature: session 1
+        0x49, 0x50, 0x53, 0x01, // NDP signature: "IPS", session 1
         0x10, 0x00, // NDP length 16
         0x00, 0x00, // next NDP: none
         0x1C, 0x00, // datagram offset 28
@@ -981,24 +986,160 @@ fn smoke_mbim_ntb_session_signing() -> TestResult {
         Ok(d) => d,
         Err(_) => return TestResult::Fail("pinned NTB did not parse"),
     };
-    if dgrams.len() != 1 || dgrams[0].session != 1 || dgrams[0].data != payload {
+    if dgrams.len() != 1
+        || dgrams[0].stream != bearer::NdpStream::Ips(1)
+        || dgrams[0].data != payload
+    {
         return TestResult::Fail("pinned NTB datagram wrong");
     }
-    // Signature decode follows the Linux cdc_mbim demux exactly:
-    // "NCM0" (an NCM function's NDP) is IPS session 0x30, and a value
-    // with garbage in the low three bytes is not an MBIM NDP at all.
-    if bearer::ndp_signature_session(0x304D_434E) != Some(0x30) {
-        return TestResult::Fail("NCM0 signature did not decode as session 0x30");
+    // Signature decode follows the Linux cdc_mbim demux: "IPS" and
+    // "DSS" bases from include/uapi/linux/usb/cdc.h, session in
+    // byte 3. An NCM "NCM0" signature is NOT an MBIM NDP at all —
+    // the earlier revision's decode of it as IPS session 0x30 was
+    // the NCM/MBIM conflation, and a value with garbage in the low
+    // three bytes is likewise not an MBIM NDP.
+    if bearer::ndp_signature_stream(0x304D_434E).is_some() {
+        return TestResult::Fail("NCM0 signature decoded as an MBIM stream");
     }
-    if bearer::ndp_signature_session(bearer::ndp_signature_ips(5)) != Some(5) {
+    if bearer::ndp_signature_stream(bearer::ndp_signature_ips(5)) != Some(bearer::NdpStream::Ips(5))
+    {
         return TestResult::Fail("IPS signature round trip failed");
     }
-    if bearer::ndp_signature_session(0xDEAD_BEEF).is_some() {
-        return TestResult::Fail("garbage signature decoded as a session");
+    if bearer::ndp_signature_stream(bearer::ndp_signature_dss(7)) != Some(bearer::NdpStream::Dss(7))
+    {
+        return TestResult::Fail("DSS signature round trip failed");
+    }
+    // DSS signature pinned byte-for-byte: "DSS" + session 7.
+    if bearer::ndp_signature_dss(7).to_le_bytes() != [0x44, 0x53, 0x53, 0x07] {
+        return TestResult::Fail("DSS signature bytes are not DSS+session");
+    }
+    if bearer::ndp_signature_stream(0xDEAD_BEEF).is_some() {
+        return TestResult::Fail("garbage signature decoded as a stream");
     }
     TestResult::Pass
 }
 kernel_test_in!("drivers/wwan", smoke_mbim_ntb_session_signing);
+
+// ─── Fixture: DSS datapath — demux, routing, never-misroute ─────────────────
+//
+// DSS signature base pinned from Linux include/uapi/linux/usb/cdc.h
+// (USB_CDC_MBIM_NDP16_DSS_SIGN = 0x00535344, "DSS<sessionID>").
+// Routing rules pinned here:
+//   - a DSS datagram lands ONLY in its session's registered DSS
+//     stream port, never on an IP netdev;
+//   - an IPS datagram never lands in a DSS queue — even at the SAME
+//     numeric session id (the namespaces are separate);
+//   - a DSS datagram for an unregistered session is dropped +
+//     counted, never misrouted;
+//   - a DSS port's TX leaves DSS-signed.
+// No modem is involved: the datapath is exercised directly against
+// a registered bearer, the way the RX pump drives deliver_ntb.
+
+fn smoke_mbim_dss_datapath() -> TestResult {
+    struct Sink {
+        sent: Arc<IrqSafeSpinLock<Vec<Vec<u8>>>>,
+    }
+    impl BearerTxSink for Sink {
+        fn send_ntb(&self, ntb: &[u8]) -> Result<(), WwanError> {
+            self.sent.lock().push(ntb.to_vec());
+            Ok(())
+        }
+    }
+    let sent = Arc::new(IrqSafeSpinLock::new(Vec::new()));
+    let bearer_idx = bearer::register_bearer(
+        Arc::new(Sink { sent: sent.clone() }),
+        [0x02, 0x4D, 0x42, 0x49, 0x4D, 0x02],
+    );
+
+    // DSS-signed build + parse: signature bytes "DSS" + session.
+    let payload: &[u8] = b"AT+CSQ\r\n";
+    let dss_ntb = bearer::build_mbim_dss_ntb(9, 3, payload);
+    if dss_ntb[12..16] != [0x44, 0x53, 0x53, 0x03] {
+        return TestResult::Fail("DSS NTB signature bytes are not DSS+session");
+    }
+    let dgrams = match bearer::parse_mbim_ntb(&dss_ntb) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("DSS NTB did not parse"),
+    };
+    if dgrams.len() != 1
+        || dgrams[0].stream != bearer::NdpStream::Dss(3)
+        || dgrams[0].data != payload
+    {
+        return TestResult::Fail("DSS NTB datagram wrong");
+    }
+
+    // Register the DSS stream; re-registration is idempotent.
+    let name = match bearer::register_dss_stream(bearer_idx, 3) {
+        Ok(n) => n,
+        Err(_) => return TestResult::Fail("DSS stream registration failed"),
+    };
+    if name != alloc::format!("wwan{}dss3", bearer_idx) {
+        return TestResult::Fail("DSS port name wrong");
+    }
+    match bearer::register_dss_stream(bearer_idx, 3) {
+        Ok(n) if n == name => {}
+        _ => return TestResult::Fail("DSS stream re-registration not idempotent"),
+    }
+    let port = match crate::port_by_name(&name) {
+        Some(p) if p.kind() == WwanPortKind::Dss => p,
+        _ => return TestResult::Fail("DSS port not findable in registry"),
+    };
+
+    // RX: DSS datagram for session 3 lands in the DSS queue, and
+    // partial reads preserve the datagram remainder in order.
+    bearer::deliver_ntb(bearer_idx, &dss_ntb).map_err(|_| "deliver DSS NTB failed")?;
+    let mut buf = [0u8; 32];
+    match port.recv(&mut buf[..3]) {
+        Ok(3) if &buf[..3] == b"AT+" => {}
+        _ => return TestResult::Fail("DSS partial read wrong"),
+    }
+    match port.recv(&mut buf) {
+        Ok(5) if &buf[..5] == b"CSQ\r\n" => {}
+        _ => return TestResult::Fail("DSS remainder read wrong"),
+    }
+    match port.recv(&mut buf) {
+        Ok(0) => {}
+        _ => return TestResult::Fail("DSS queue not drained"),
+    }
+
+    // An IPS datagram at the SAME numeric session id does not land
+    // in the DSS queue: separate namespaces, no cross-delivery.
+    bearer::deliver_ntb(bearer_idx, &fake_ntb(3, b"10.0.0.1"))
+        .map_err(|_| "deliver IPS NTB failed")?;
+    match port.recv(&mut buf) {
+        Ok(0) => {}
+        _ => return TestResult::Fail("IPS datagram leaked into the DSS queue"),
+    }
+
+    // DSS for an unregistered session is dropped + counted, never
+    // misrouted into the session-3 queue.
+    let dss4 = bearer::build_mbim_dss_ntb(10, 4, b"noise");
+    bearer::deliver_ntb(bearer_idx, &dss4).map_err(|_| "deliver unregistered DSS NTB failed")?;
+    if bearer::bearer_dss_drop_counters(bearer_idx) != Some(1) {
+        return TestResult::Fail("unregistered DSS drop not counted");
+    }
+    match port.recv(&mut buf) {
+        Ok(0) => {}
+        _ => return TestResult::Fail("unregistered DSS datagram leaked into session 3"),
+    }
+
+    // TX: the port's payload leaves DSS-signed on the data channel.
+    port.send(b"hello-dss")
+        .map_err(|_| "DSS port send failed")?;
+    let sent = sent.lock();
+    if sent.len() != 1 {
+        return TestResult::Fail("DSS TX produced no NTB");
+    }
+    let tx = match bearer::parse_mbim_ntb(&sent[0]) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("DSS TX NTB unparseable"),
+    };
+    if tx.len() != 1 || tx[0].stream != bearer::NdpStream::Dss(3) || tx[0].data != b"hello-dss" {
+        return TestResult::Fail("DSS TX NTB not DSS-signed for session 3");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wwan", smoke_mbim_dss_datapath);
 
 // ─── Fixture: end-to-end two-session conversation ────────────────────────────
 
@@ -1119,11 +1260,11 @@ fn smoke_mbim_end_to_end_two_sessions() -> TestResult {
             return Err("expected exactly two NTBs on the data channel");
         }
         let d0 = bearer::parse_mbim_ntb(&sent[0]).map_err(|_| "TX NTB 0 unparseable")?;
-        if d0.len() != 1 || d0[0].session != 0 || d0[0].data != p0 {
+        if d0.len() != 1 || d0[0].stream.session() != 0 || d0[0].data != p0 {
             return Err("session 0 frame cross-wired or mangled");
         }
         let d1 = bearer::parse_mbim_ntb(&sent[1]).map_err(|_| "TX NTB 1 unparseable")?;
-        if d1.len() != 1 || d1[0].session != 1 || d1[0].data != p1 {
+        if d1.len() != 1 || d1[0].stream.session() != 1 || d1[0].data != p1 {
             return Err("session 1 frame cross-wired or mangled");
         }
 
@@ -1172,15 +1313,23 @@ fn smoke_mbim_end_to_end_two_sessions() -> TestResult {
             return Err("session 1 RX cross-delivered to session 0");
         }
 
-        // RX for an unactivated session, and an NCM-signed NTB
-        // (decodes as session 0x30), are dropped + counted.
+        // RX for an unactivated session is dropped + counted.
         bearer::deliver_ntb(bearer_idx, &fake_ntb(5, rx1))
             .map_err(|_| "deliver unknown-session NTB failed")?;
+        // An NCM-signed NTB is NOT an MBIM NDP at all: it is
+        // rejected whole (parse error), not decoded as IPS session
+        // 0x30 as the earlier revision did, and not counted as an
+        // unknown-session drop — it never reaches delivery.
         let mut ncm = fake_ntb(0, rx1);
-        ncm[15] = 0x30; // NDP signature byte 3: '0' → session 0x30
-        bearer::deliver_ntb(bearer_idx, &ncm).map_err(|_| "deliver NCM-signed NTB failed")?;
+        ncm[12] = 0x4E; // NDP signature: "NCM0", not "IPS"+session
+        ncm[13] = 0x43;
+        ncm[14] = 0x4D;
+        ncm[15] = 0x30;
+        if bearer::deliver_ntb(bearer_idx, &ncm).is_ok() {
+            return Err("NCM-signed NTB was accepted as an MBIM datagram");
+        }
         let drops = bearer::bearer_drop_counters(bearer_idx).ok_or("bearer vanished")?;
-        if drops.1 != 2 {
+        if drops.1 != 1 {
             return Err("unknown-session RX drops not counted");
         }
 
