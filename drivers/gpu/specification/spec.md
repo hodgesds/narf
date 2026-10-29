@@ -143,12 +143,39 @@ bit selects writable leaves in this restricted path. EXECBUFFER2 currently
 returns NotImplemented even for a valid plan: a resident address space does not
 establish GT initialization, nonsecure execution, fence completion or reset.
 
+`ExecRequest::prepare(format, pat_index)` produces a `ResidentBatch` retaining
+its private tables, BOs and arbitrary batch VA/extent. The internal Gen12
+`RcsEngine::submit_resident` consumes this owner on an idle render context and
+returns a request ID plus `CompletionFence`. Resident admission refuses queued
+work as well as loaded work; root attach/detach also refuse queued work. The
+submitted root and all leaf objects stay pinned across fd/handle close,
+preemption and wait cancellation. A completed resident context's image root
+is cleared before releasing its page tables.
+
+Gen12 render breadcrumbs drain HDC, tile, render, depth and data caches with
+CS/depth stalls, then publish a separate GGTT QW post-sync breadcrumb. XCS uses
+MI_FLUSH_DW instead of render-only PIPE_CONTROL. Ring tails stay qword aligned;
+wrap admission accounts for NOOP padding before writing. CSB publication uses
+hardware release/acquire barriers. Retirement requires the active context's
+exact final breadcrumb and saved head at the submitted tail. Missing proof
+quarantines the engine (`CompletionLost`), refuses further submission and
+leaves fences pending. CSB software identities are not reused within an engine
+lifetime, including after slot reuse. The unsafe `release_after_reset` consumes
+the engine only after its GT owner proves all DMA agents stopped; outstanding
+fences then report `JobError::Reset`. Dropping an owner is not reset proof and
+deliberately retains published resident address spaces. `CompletionFence::wait`
+registers wakers; dropping that future removes only its waiter. First terminal
+result wins. This internal primitive is not yet a published DRM sync-file API.
+`wait_seqno_async` samples completion through timer awaits; the sync wrapper
+uses `block_on_spin` for lock/IRQ callers outside executor polls. Neither wait
+owns or cancels the request's residency.
+
 `SubmissionProfile::for_generation` selects Gen12 execlists for Tiger/Alder/
 Raptor Lake and a separate Xe-LPG GuC path for Meteor/Arrow Lake. Panther Lake
 has no submission profile. Existing default RCS/media production attach paths
 admit only Gen12 before any MMIO. A display gate cannot admit a render engine.
-GuC boot/registration/scheduling, render topology, full context setup, terminal
-fences, reset/loss retention, accelerated PRIME/KMS integration and Mesa interoperability
+GuC boot/context registration/scheduling, render topology, full context setup,
+hardware reset ownership, accelerated PRIME/KMS integration and Mesa interoperability
 remain required before exposing acceleration. Graphics APIs and shader/state
 generation belong in userspace.
 
@@ -181,6 +208,32 @@ poison the owner without advancing a receive head or releasing pending work.
 The platform owner must retain CT memory until confirmed deregistration/reset;
 these primitives do not load/authenticate firmware, register transport or wake
 an engine. Fixtures pin CSS/CTB wire cases and ownership failure behavior.
+
+`intel_gpu_guc_firmware::GuCFirmware::open` accepts Meteor/Arrow Lake and an
+existing `Cap<FirmwareRegistry, Read>`. Both registry open and immutable blob
+copy run through `Cap::invoke`. It selects `i915/mtl_guc_70.bin`, bounds and
+validates CSS before copying, requires the selected 70.53.0-or-newer ABI-70
+baseline and a 384-byte RSA signature, and retains the registry digest/signer.
+No ambient firmware authority or direct filesystem access is introduced.
+Registry authorization does not establish GuC boot-ROM authentication.
+
+`intel_gpu_guc_transport::XeLpgTransport` owns one six-page coherent GGTT
+allocation (H2G descriptor at 0, G2H at 0x800, 4-KiB send ring at 0x1000,
+16-KiB receive ring at 0x2000). Allocation gates Xe-LPG before MMIO and checks
+the GuC GGTT ceiling. `begin_enable` requires authenticated/ready firmware;
+MMIO SELF_CFG registers receive before send using 64-bit address KLVs and byte
+sizes, then CONTROL_CTB enables communication. Each bounded mailbox poll
+advances one state; BUSY/RETRY cannot extend its deadline and retries are
+bounded. `wait_transition` uses timer awaits without an IRQ lock. Cancellation
+preserves the transaction. Enabled `send` publishes CT memory before the
+graphics-GuC notification; `receive` owns the opposite head cursor. Transport
+errors stop admission. `release` returns a live owner intact until either
+publication never began or MMIO DISABLE completed successfully; timeouts and
+partial registration retain memory for the unsafe, proven-reset release path.
+A CT response acknowledges an action, never render completion. Production
+firmware upload/WOPCM setup, forcewake/IRQ ownership, GuC context scheduling
+and integration with the per-card GT owner remain open; transport readiness
+does not enable EXECBUFFER or advertise acceleration.
 
 ### Legacy framebuffers and native mode timing
 

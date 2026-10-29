@@ -706,6 +706,8 @@ pub mod intel_gpu_edp;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_exec;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_fence;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_forcewake;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gem;
@@ -715,6 +717,10 @@ pub mod intel_gpu_gmbus;
 pub mod intel_gpu_gtt;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_guc;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_guc_firmware;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_guc_transport;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_hdmi;
 #[cfg(feature = "intel")]

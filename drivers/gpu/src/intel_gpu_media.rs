@@ -910,6 +910,13 @@ pub mod tests {
                 guard += 4;
                 let dw = mem_rd(&ring, pos as u64);
                 match dw >> 23 {
+                    0x26 => {
+                        let lo = mem_rd(&ring, ((pos + 4) & mask) as u64) as u64;
+                        let hi = mem_rd(&ring, ((pos + 8) & mask) as u64) as u64;
+                        let data = mem_rd(&ring, ((pos + 12) & mask) as u64);
+                        self.write_ggtt((lo & !7) | (hi << 32), data);
+                        pos = (pos + 16) & mask;
+                    }
                     0x31 => {
                         let lo = mem_rd(&ring, ((pos + 4) & mask) as u64) as u64;
                         let hi = mem_rd(&ring, ((pos + 8) & mask) as u64) as u64;

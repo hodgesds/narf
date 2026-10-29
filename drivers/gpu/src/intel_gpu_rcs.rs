@@ -14,7 +14,7 @@
 //!   a 128 KiB ring buffer, and a per-context hardware status
 //!   page (HWSP) carrying the breadcrumb sequence number.
 //! - **Submission.** `submit` appends `MI_BATCH_BUFFER_START`
-//!   (GGTT) + a `MI_STORE_DWORD_IMM` breadcrumb to the context's
+//!   (GGTT), cache drain/stall and a post-sync breadcrumb to the context's
 //!   ring, advances the image tail, and — when an execlist port
 //!   is free — writes the context descriptors to the ELSP in the
 //!   hardware order (port 1 high/low, then port 0 high/low; the
@@ -22,7 +22,7 @@
 //! - **Completion.** The engine status page (programmed into
 //!   `RING_HWS_PGA` at engine init) receives Gen12-format context
 //!   status buffer (CSB) entries; `poll_completions` drains them
-//!   (promote / preempt / complete), retires requests, frees
+//!   (promote / preempt / complete), verifies breadcrumb/head, retires requests, frees
 //!   batch allocations and pumps the next ports.
 //!
 //! ## Addressing scope
@@ -61,16 +61,19 @@
 //! The CSB depth is twelve (MIT intel_lrc_reg.h). The 48-page image
 //! allocation bounds the 14-page Gen12 render image. These model-checked
 //! encodings do not establish full GT setup, safe userspace execution,
-//! render-cache completion or reset/loss handling; the userspace gate in
+//! silicon cache completion or hardware reset; the userspace gate in
 //! intel_gpu_render remains closed until those owners exist.
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::mem::ManuallyDrop;
+use core::sync::atomic::{compiler_fence, fence, Ordering};
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::intel_gpu_aux::MmioWindow;
+use crate::intel_gpu_exec::ResidentBatch;
+use crate::intel_gpu_fence::{CompletionFence, JobError};
 use crate::intel_gpu_forcewake::{Forcewake, FwDomain};
 use crate::intel_gpu_gtt::{
     encode_scanout_pte, encode_table_entry, ggtt_va_size, PatSlot, GGTT_ARRAY_BASE, GTT_PAGE_SIZE,
@@ -292,6 +295,27 @@ pub fn mi_store_dword_imm_ggtt(ggtt_addr: u64, data: u32) -> [u32; 4] {
         (ggtt_addr & 0xFFFF_FFFF) as u32,
         (ggtt_addr >> 32) as u32,
         data,
+    ]
+}
+
+/// Gen12 render retirement: drain HDC, tile, render, depth and data caches
+/// before a separate GGTT post-sync write. Includes Wa_1409600907 depth
+/// stall for TGL/ADL. MIT i915 v6.12 gen8_engine_cs.c/h and
+/// intel_gpu_commands.h define these fields; this is not an Xe-LPG stream.
+fn render_breadcrumb(address: u64, seqno: u32) -> [u32; 12] {
+    [
+        0x7a00_0204, // PIPE_CONTROL(6), HDC pipeline flush
+        0x1814_30a1, // CS/depth stall, TLB invalidate, cache flushes
+        0,
+        0,
+        0,
+        0,
+        0x7a00_0004,
+        0x0110_4080, // CS stall, flush, QW post-sync write through GGTT
+        address as u32,
+        (address >> 32) as u32,
+        seqno,
+        0,
     ]
 }
 
@@ -658,6 +682,9 @@ pub enum SubmitError {
     /// A VA batch was submitted to a context with no PPGTT root
     /// attached ([`RcsEngine::submit_ppgtt`]).
     PpgttNotAttached,
+    /// A completion lacked its breadcrumb or saved ring head. Published
+    /// objects remain pinned until a hardware owner proves reset complete.
+    CompletionLost,
 }
 
 // ── GPU-memory backing seam ─────────────────────────────────────
@@ -780,7 +807,7 @@ impl GpuBacking for FrameBacking {
 /// [`GpuAllocator`]). Owns the BAR0 handle for GGTT PTE writes;
 /// PTE programming follows [`crate::intel_gpu_gtt`]'s pattern
 /// (64-bit PTE as two 32-bit writes into the array at BAR0 +
-/// 8 MiB), with engine PTEs (RW, LLC-cached).
+/// 8 MiB), using the Gen12 system-memory GGTT encoding (no PPGTT RW/PAT bits).
 pub struct GgttArena {
     bar: narf_bus::bar::MmioRegion,
     free_list: Vec<(u32, u32)>,
@@ -1097,9 +1124,20 @@ fn ring_emit<B: GpuBacking>(
     ring: &mut RingState,
     dwords: &[u32],
 ) -> Result<(), SubmitError> {
-    let need = (dwords.len() as u32) * 4;
+    let need = u32::try_from(dwords.len())
+        .ok()
+        .and_then(|n| n.checked_mul(4))
+        .ok_or(SubmitError::RingFull)?;
     let used = ring.tail.wrapping_sub(ring.head) & (RING_BYTES - 1);
-    if need > RING_BYTES - used - 8 {
+    let padding = if need > RING_BYTES - ring.tail {
+        RING_BYTES - ring.tail
+    } else {
+        0
+    };
+    if need
+        .checked_add(padding)
+        .is_none_or(|total| total > RING_BYTES.saturating_sub(used).saturating_sub(8))
+    {
         return Err(SubmitError::RingFull);
     }
     if ring.tail + need > RING_BYTES {
@@ -1132,9 +1170,8 @@ struct RcsContext<A: GpuAllocator> {
     last_completed_seqno: u32,
     /// PPGTT root programmed into the image's PDP0 pair, when
     /// one is attached (see [`RcsEngine::attach_ppgtt`]). The
-    /// tables themselves are owned by the
-    /// [`crate::intel_gpu_ppgtt::Ppgtt`] that produced the
-    /// root; the engine only carries the address.
+    /// raw attachment's caller owns its tables; `submit_resident` instead
+    /// retains their owner in the request through verified retirement.
     ppgtt_root: Option<u64>,
 }
 
@@ -1157,7 +1194,37 @@ struct Request<A: GpuAllocator> {
     ctx_gen: u32,
     seqno: u32,
     id: u64,
-    batch: BatchBuf<A>,
+    batch: RequestBatch<A>,
+    fence: Arc<CompletionFence>,
+}
+
+enum RequestBatch<A: GpuAllocator> {
+    Ggtt(BatchBuf<A>),
+    // Dropping an engine is not proof that DMA stopped. Deliberately retain
+    // the full address space on unconfirmed teardown, including preempted
+    // requests that were returned to the software queue.
+    Resident(ManuallyDrop<ResidentBatch>),
+}
+
+impl<A: GpuAllocator> RequestBatch<A> {
+    fn address(&self) -> u64 {
+        match self {
+            Self::Ggtt(batch) => batch.ggtt_offset() as u64,
+            Self::Resident(batch) => batch.address(),
+        }
+    }
+    fn release(self, alloc: &mut A) {
+        match self {
+            Self::Ggtt(batch) => alloc.free(batch.backing),
+            Self::Resident(batch) => drop(ManuallyDrop::into_inner(batch)),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ResidentSubmission {
+    pub request: u64,
+    pub fence: Arc<CompletionFence>,
 }
 
 /// An execlists engine: context table, two submission ports,
@@ -1181,6 +1248,8 @@ pub struct RcsEngine<M: MmioWindow, A: GpuAllocator> {
     active: [Option<u32>; 2],
     next_request_id: u64,
     spurious_csb: u32,
+    next_sw_id: u16,
+    completion_lost: bool,
 }
 
 impl<M: MmioWindow, A: GpuAllocator> core::fmt::Debug for RcsEngine<M, A> {
@@ -1224,6 +1293,8 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             active: [None, None],
             next_request_id: 1,
             spurious_csb: 0,
+            next_sw_id: 1,
+            completion_lost: false,
         })
     }
 
@@ -1275,6 +1346,14 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// page, build the register-state template, and mint its
     /// descriptor. The context starts idle with an empty ring.
     pub fn create_context(&mut self) -> Result<ContextId, SubmitError> {
+        if self.completion_lost {
+            return Err(SubmitError::CompletionLost);
+        }
+        // Never reuse a CSB software identity within an engine lifetime: a
+        // delayed event from a destroyed context must not match a new job.
+        if self.next_sw_id >= IDLE_SW_ID {
+            return Err(SubmitError::TooManyContexts);
+        }
         let slot = match self.contexts.iter().position(|c| c.is_none()) {
             Some(i) => i,
             None => {
@@ -1307,7 +1386,8 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             image.write32(REG_STATE_PAGE_BYTE + (i as u64) * 4, *dw);
         }
         let generation = self.generations[slot];
-        let sw_id = (slot as u16) + 1;
+        let sw_id = self.next_sw_id;
+        self.next_sw_id += 1;
         let descriptor = context_descriptor_for(&self.spec, image.ggtt_offset(), sw_id);
         self.contexts[slot] = Some(RcsContext {
             slot: slot as u32,
@@ -1362,14 +1442,15 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         if dwords.is_empty() || dwords[dwords.len() - 1] != MI_BATCH_BUFFER_END {
             return Err(SubmitError::BatchInvalid);
         }
-        let pages = (dwords.len() as u32).div_ceil(1024);
+        let length = u32::try_from(dwords.len()).map_err(|_| SubmitError::BatchInvalid)?;
+        let pages = length.div_ceil(1024);
         let backing = self.alloc.alloc(pages)?;
         for (i, dw) in dwords.iter().enumerate() {
             backing.write32((i as u64) * 4, *dw);
         }
         Ok(BatchBuf {
             backing,
-            dwords: dwords.len() as u32,
+            dwords: length,
         })
     }
 
@@ -1382,8 +1463,8 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             || self.inflight.iter().any(|r| r.ctx_slot == slot)
     }
 
-    /// Submit a batch on a context: emit the batch-start +
-    /// breadcrumb prologue into its ring, advance the image
+    /// Submit a batch on a context: emit batch-start, cache drain/stall and
+    /// a post-sync breadcrumb into its ring, advance the image
     /// tail, and queue the request for the next free port. The
     /// batch is addressed through the GGTT.
     ///
@@ -1394,7 +1475,8 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// covered together when the context is next loaded.
     /// Returns the engine-wide request id.
     pub fn submit(&mut self, id: ContextId, batch: BatchBuf<A>) -> Result<u64, SubmitError> {
-        self.submit_inner(id, batch, false)
+        self.submit_inner(id, RequestBatch::Ggtt(batch), false)
+            .map(|s| s.request)
     }
 
     /// Submit a batch addressed through the context's PPGTT
@@ -1422,52 +1504,103 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
                 return Err(e);
             }
         }
-        self.submit_inner(id, batch, true)
+        self.submit_inner(id, RequestBatch::Ggtt(batch), true)
+            .map(|s| s.request)
+    }
+
+    /// Submit an arbitrary PPGTT batch VA with its complete residency owner.
+    /// This internal engine API does not publish an untrusted userspace queue.
+    /// One resident request per idle context; roots cannot change underneath
+    /// queued, pending, active or preempted work. Failed admission releases the
+    /// batch immediately; published residency survives fd close and timeout.
+    pub fn submit_resident(
+        &mut self,
+        id: ContextId,
+        batch: ResidentBatch,
+    ) -> Result<ResidentSubmission, SubmitError> {
+        if self.completion_lost {
+            return Err(SubmitError::CompletionLost);
+        }
+        if batch.format() != crate::intel_gpu_gtt::PteFormat::Gen12
+            || self.spec.class != EngineClass::Render
+        {
+            return Err(SubmitError::NoEngine);
+        }
+        let ctx = self.context(id)?;
+        let slot = ctx.slot;
+        let previous = ctx.ppgtt_root;
+        if self.ctx_covered(slot) || self.queue.iter().any(|r| r.ctx_slot == slot) {
+            return Err(SubmitError::ContextBusy);
+        }
+        self.attach_ppgtt(id, batch.space().root_phys())?;
+        let result = self.submit_inner(id, RequestBatch::Resident(ManuallyDrop::new(batch)), true);
+        if result.is_err() {
+            let ctx = self.context_mut(id)?;
+            Self::patch_pdp_values(&ctx.image, previous);
+            ctx.ppgtt_root = previous;
+        }
+        result
     }
 
     fn submit_inner(
         &mut self,
         id: ContextId,
-        batch: BatchBuf<A>,
+        batch: RequestBatch<A>,
         ppgtt_form: bool,
-    ) -> Result<u64, SubmitError> {
+    ) -> Result<ResidentSubmission, SubmitError> {
+        if self.completion_lost {
+            batch.release(&mut self.alloc);
+            return Err(SubmitError::CompletionLost);
+        }
         let (slot, generation) = match self.context(id) {
             Ok(c) => (c.slot, c.generation),
             Err(e) => {
-                self.alloc.free(batch.backing);
+                batch.release(&mut self.alloc);
                 return Err(e);
             }
         };
         if self.ctx_covered(slot) {
-            self.alloc.free(batch.backing);
+            batch.release(&mut self.alloc);
             return Err(SubmitError::ContextBusy);
         }
         if self.queue.len() >= MAX_QUEUED_REQUESTS {
-            self.alloc.free(batch.backing);
+            batch.release(&mut self.alloc);
             return Err(SubmitError::QueueFull);
         }
         let request_id = self.next_request_id;
+        let render = self.spec.class == EngineClass::Render;
         let seqno = {
             let ctx = self.context_mut(id)?;
             let seqno = ctx.next_seqno;
             let start = if ppgtt_form {
-                mi_batch_buffer_start_ppgtt(batch.backing.ggtt_offset() as u64)
+                mi_batch_buffer_start_ppgtt(batch.address())
             } else {
-                mi_batch_buffer_start_ggtt(batch.backing.ggtt_offset() as u64)
+                mi_batch_buffer_start_ggtt(batch.address())
             };
-            let store =
-                mi_store_dword_imm_ggtt(ctx.hwsp.ggtt_offset() as u64 + HWSP_SEQNO_BYTE, seqno);
-            let mut prologue = [0u32; 7];
+            let address = ctx.hwsp.ggtt_offset() as u64 + HWSP_SEQNO_BYTE;
+            let mut prologue = [MI_NOOP; 16];
             prologue[..3].copy_from_slice(&start);
-            prologue[3..].copy_from_slice(&store);
-            if let Err(e) = ring_emit(&ctx.ring_mem, &mut ctx.ring, &prologue) {
+            let length = if render {
+                prologue[3..15].copy_from_slice(&render_breadcrumb(address, seqno));
+                16
+            } else {
+                // XCS has no 3D pipeline: MI_FLUSH_DW is its write barrier.
+                prologue[3..7].copy_from_slice(&[
+                    0x1300_4002,
+                    address as u32 | 4,
+                    (address >> 32) as u32,
+                    seqno,
+                ]);
+                8
+            };
+            if let Err(e) = ring_emit(&ctx.ring_mem, &mut ctx.ring, &prologue[..length]) {
                 // End the mutable borrow of `self` held through
                 // `ctx` so `self.alloc` is usable on this error
                 // path. `ctx` is a reference, so nothing is (or
                 // could be) dropped — consuming the binding is
                 // what ends the borrow.
                 let _ = ctx;
-                self.alloc.free(batch.backing);
+                batch.release(&mut self.alloc);
                 return Err(e);
             }
             ctx.next_seqno = if seqno == u32::MAX { 1 } else { seqno + 1 };
@@ -1482,15 +1615,20 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             seqno
         };
         self.next_request_id += 1;
+        let completion = Arc::new(CompletionFence::new());
         self.queue.push_back(Request {
             ctx_slot: slot,
             ctx_gen: generation,
             seqno,
             id: request_id,
             batch,
+            fence: completion.clone(),
         });
         self.pump();
-        Ok(request_id)
+        Ok(ResidentSubmission {
+            request: request_id,
+            fence: completion,
+        })
     }
 
     /// The last breadcrumb sequence number retired for a
@@ -1531,7 +1669,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             return Err(SubmitError::InvalidPpgttRoot);
         }
         let slot = self.context(id)?.slot;
-        if self.ctx_covered(slot) {
+        if self.ctx_covered(slot) || self.queue.iter().any(|r| r.ctx_slot == slot) {
             return Err(SubmitError::ContextBusy);
         }
         let ctx = self.context_mut(id)?;
@@ -1546,7 +1684,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// [`Self::attach_ppgtt`].
     pub fn detach_ppgtt(&mut self, id: ContextId) -> Result<(), SubmitError> {
         let slot = self.context(id)?.slot;
-        if self.ctx_covered(slot) {
+        if self.ctx_covered(slot) || self.queue.iter().any(|r| r.ctx_slot == slot) {
             return Err(SubmitError::ContextBusy);
         }
         let ctx = self.context_mut(id)?;
@@ -1581,7 +1719,8 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// ride the image tail already written), then the ELSP
     /// doorbell is rung.
     fn pump(&mut self) {
-        if self.pending.iter().any(|p| p.is_some()) || self.queue.is_empty() {
+        if self.completion_lost || self.pending.iter().any(|p| p.is_some()) || self.queue.is_empty()
+        {
             return;
         }
         let first = self.queue[0].ctx_slot;
@@ -1620,7 +1759,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// prescribes (ELSP is write-only, so a neighbouring status
     /// register is read instead).
     fn elsp_write(&mut self, port0: u64, port1: u64) {
-        compiler_fence(Ordering::SeqCst);
+        fence(Ordering::Release);
         self.mmio.write32(self.spec.elsp(), (port1 >> 32) as u32);
         self.mmio.write32(self.spec.elsp(), port1 as u32);
         self.mmio.write32(self.spec.elsp(), (port0 >> 32) as u32);
@@ -1639,7 +1778,8 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// quiesced engine (power management, #1015) drain via
     /// [`Self::poll_completions`] until this holds.
     pub fn is_idle(&self) -> bool {
-        self.queue.is_empty()
+        !self.completion_lost
+            && self.queue.is_empty()
             && self.inflight.is_empty()
             && self.pending.iter().all(|p| p.is_none())
             && self.active.iter().all(|a| a.is_none())
@@ -1647,7 +1787,16 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
 
     pub fn poll_completions(&mut self) -> Vec<CompletedRequest> {
         let mut done = Vec::new();
-        let tail = ((self.status.read32(CSB_WRITE_BYTE) & 0xFF) as u8) % CSB_ENTRIES;
+        if self.completion_lost {
+            return done;
+        }
+        let tail = (self.status.read32(CSB_WRITE_BYTE) & 0xFF) as u8;
+        if tail >= CSB_ENTRIES {
+            self.completion_lost = true;
+            return done;
+        }
+        // GPU publishes the cursor after the CSB entries and saved state.
+        fence(Ordering::Acquire);
         let mut head = self.csb_head;
         while head != tail {
             head = (head + 1) % CSB_ENTRIES;
@@ -1657,6 +1806,9 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
                 upper: self.status.read32(base + 4),
             };
             self.process_csb(entry, &mut done);
+            if self.completion_lost {
+                break;
+            }
         }
         self.csb_head = head;
         self.pump();
@@ -1729,6 +1881,30 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// batches, and sync the driver's ring head from the image
     /// the hardware saved.
     fn retire(&mut self, slot: u32, done: &mut Vec<CompletedRequest>) {
+        if !self.active.contains(&Some(slot)) {
+            self.spurious_csb += 1;
+            return;
+        }
+        let Some(expected) = self.inflight.iter().rev().find(|r| r.ctx_slot == slot) else {
+            self.spurious_csb += 1;
+            return;
+        };
+        let ctx = self.contexts[slot as usize]
+            .as_ref()
+            .expect("inflight context");
+        let saved_head = ctx
+            .image
+            .read32(REG_STATE_PAGE_BYTE + ((CTX_RING_HEAD + 1) as u64) * 4);
+        if ctx.generation != expected.ctx_gen
+            || ctx.hwsp.read32(HWSP_SEQNO_BYTE) != expected.seqno
+            || saved_head & (RING_BYTES - 1) != ctx.ring.tail
+        {
+            // A context-switch notification alone is not completion proof.
+            // Stop publishing and retain everything for a proven reset.
+            self.completion_lost = true;
+            return;
+        }
+        fence(Ordering::Acquire);
         for a in self.active.iter_mut() {
             if *a == Some(slot) {
                 *a = None;
@@ -1752,6 +1928,15 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             for r in &batches {
                 ctx.last_completed_seqno = r.seqno;
             }
+            if batches
+                .iter()
+                .any(|r| matches!(r.batch, RequestBatch::Resident(_)))
+            {
+                // This image must not retain a root whose pages are about to
+                // be released. Resident admission permits only one idle job.
+                Self::patch_pdp_values(&ctx.image, None);
+                ctx.ppgtt_root = None;
+            }
         }
         for r in batches {
             done.push(CompletedRequest {
@@ -1759,32 +1944,74 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
                 seqno: r.seqno,
                 request: r.id,
             });
-            self.alloc.free(r.batch.backing);
+            r.batch.release(&mut self.alloc);
+            r.fence.signal(Ok(()));
         }
     }
 
-    /// Poll until the context's breadcrumb reaches `seqno` (in
-    /// wrap-aware order) or the budget expires. Drives
-    /// [`Self::poll_completions`] while waiting, like the other
-    /// bounded register polls in this driver.
+    pub fn completion_lost(&self) -> bool {
+        self.completion_lost
+    }
+
+    /// Release all pinned requests with a terminal reset error and reclaim
+    /// the engine's allocations. A timeout or an unreadable BAR cannot call
+    /// this; dropping the owner without proof retains published residency.
+    ///
+    /// # Safety
+    /// The owning GT must have completed a hardware reset or removal that
+    /// prevents every engine/GuC/DMA agent from accessing these allocations,
+    /// and must not reuse old descriptors or status-page addresses afterwards.
+    pub unsafe fn release_after_reset(mut self) {
+        fence(Ordering::Acquire);
+        for r in self.queue.drain(..).chain(self.inflight.drain(..)) {
+            r.batch.release(&mut self.alloc);
+            r.fence.signal(Err(JobError::Reset));
+        }
+        for ctx in self.contexts.drain(..).flatten() {
+            self.alloc.free(ctx.image);
+            self.alloc.free(ctx.ring_mem);
+            self.alloc.free(ctx.hwsp);
+        }
+        self.alloc.free(self.status);
+    }
+
+    /// Sync bridge for callers outside executor polls, including lock/IRQ
+    /// contexts. The async form sleeps between completion samples.
     pub fn wait_seqno(
         &mut self,
         id: ContextId,
         seqno: u32,
         timeout_ns: u64,
     ) -> Result<(), SubmitError> {
-        let budget = narf_time::wall::ns_to_cycles(timeout_ns);
-        let start = narf_time::now_cycles();
+        narf_scheduler::block_on_spin(self.wait_seqno_async(id, seqno, timeout_ns))
+    }
+
+    /// Timer-driven completion sampling. Cancellation drops only this wait;
+    /// pending requests keep all residency until completion or proven reset.
+    pub async fn wait_seqno_async(
+        &mut self,
+        id: ContextId,
+        seqno: u32,
+        timeout_ns: u64,
+    ) -> Result<(), SubmitError> {
+        let deadline = narf_time::Deadline::after_ns(timeout_ns);
         loop {
             let _ = self.poll_completions();
+            if self.completion_lost {
+                return Err(SubmitError::CompletionLost);
+            }
             let last = self.last_completed_seqno(id)?;
             if seqno != 0 && (last.wrapping_sub(seqno) as i32) >= 0 && last != 0 {
                 return Ok(());
             }
-            if narf_time::now_cycles().wrapping_sub(start) > budget {
+            if deadline.expired() {
                 return Err(SubmitError::Timeout);
             }
-            core::hint::spin_loop();
+            let wake = core::cmp::min(
+                narf_time::Deadline::after_us(50).as_instant(),
+                deadline.as_instant(),
+            );
+            narf_time::SleepUntil::new(wake).await;
         }
     }
 }
@@ -2162,6 +2389,7 @@ pub mod tests {
         status_ggtt: u32,
         write_ptr: u8,
         consumed_elsp: usize,
+        user_batches: BTreeMap<(u64, u64), alloc::sync::Weak<crate::intel_gpu_gem::GemObject>>,
     }
 
     impl FakeHw {
@@ -2172,6 +2400,7 @@ pub mod tests {
                 status_ggtt,
                 write_ptr: 0,
                 consumed_elsp: 0,
+                user_batches: BTreeMap::new(),
             }
         }
 
@@ -2237,10 +2466,48 @@ pub mod tests {
                 guard += 4;
                 let dw = mem_rd(&ring, pos as u64);
                 match dw >> 23 {
+                    0xf4 => {
+                        // PIPE_CONTROL is six dwords. The post-sync QW write
+                        // follows a separate cache drain/stall command.
+                        assert_eq!(dw & 0xff, 4, "PIPE_CONTROL length");
+                        let flags = mem_rd(&ring, ((pos + 4) & mask) as u64);
+                        if flags & (1 << 14) != 0 {
+                            assert_ne!(flags & (1 << 24), 0, "post-sync must use GGTT");
+                            let lo = mem_rd(&ring, ((pos + 8) & mask) as u64) as u64;
+                            let hi = mem_rd(&ring, ((pos + 12) & mask) as u64) as u64;
+                            let data = mem_rd(&ring, ((pos + 16) & mask) as u64);
+                            self.write_ggtt(lo | (hi << 32), data);
+                            self.write_ggtt((lo | (hi << 32)) + 4, 0);
+                        }
+                        pos = (pos + 24) & mask;
+                    }
+                    0x26 => {
+                        let lo = mem_rd(&ring, ((pos + 4) & mask) as u64) as u64;
+                        let hi = mem_rd(&ring, ((pos + 8) & mask) as u64) as u64;
+                        let data = mem_rd(&ring, ((pos + 12) & mask) as u64);
+                        self.write_ggtt((lo & !7) | (hi << 32), data);
+                        pos = (pos + 16) & mask;
+                    }
                     0x31 => {
                         let lo = mem_rd(&ring, ((pos + 4) & mask) as u64) as u64;
                         let hi = mem_rd(&ring, ((pos + 8) & mask) as u64) as u64;
-                        self.execute_batch((lo | (hi << 32)) as u32);
+                        let address = lo | (hi << 32);
+                        if let Ok(ggtt) = u32::try_from(address) {
+                            self.execute_batch(ggtt);
+                        } else {
+                            assert_ne!(dw & 0x100, 0, "user batch needs PPGTT");
+                            let root = mem_rd(&image, rs + ((CTX_PDP3_UDW + 15) as u64) * 4) as u64
+                                | ((mem_rd(&image, rs + ((CTX_PDP3_UDW + 13) as u64) * 4) as u64)
+                                    << 32);
+                            let object = self
+                                .user_batches
+                                .get(&(root, address))
+                                .and_then(alloc::sync::Weak::upgrade)
+                                .expect("resident PPGTT batch");
+                            let mut bytes = [0; 8];
+                            object.read(0, &mut bytes).expect("batch bytes");
+                            assert_eq!(bytes, [0, 0, 0, 0, 0, 0, 0, 5]);
+                        }
                         pos = (pos + 12) & mask;
                     }
                     0x20 => {
@@ -2319,6 +2586,267 @@ pub mod tests {
     }
 
     // ── Codec fixtures ──────────────────────────────────────
+
+    fn smoke_render_cache_barrier() -> TestResult {
+        // Linux v6.12 MIT gen8_engine_cs.c gen12_emit_fini_breadcrumb_rcs:
+        // CS/TLB/tile/RT/depth/DC/LLC + Gen12 L3 and depth-stall workaround;
+        // a distinct GGTT QW post-sync follows the cache drain.
+        let words = render_breadcrumb(0x1234_0080, 7);
+        if words
+            != [
+                0x7a00_0204,
+                0x1814_30a1,
+                0,
+                0,
+                0,
+                0,
+                0x7a00_0004,
+                0x0110_4080,
+                0x1234_0080,
+                0,
+                7,
+                0,
+            ]
+        {
+            return TestResult::Fail("Gen12 render barrier wire vector");
+        }
+        let (mut engine, _) = make_engine().unwrap();
+        let ctx = engine.create_context().unwrap();
+        let batch = engine.write_batch(&[MI_BATCH_BUFFER_END]).unwrap();
+        engine.submit(ctx, batch).unwrap();
+        if engine.context(ctx).unwrap().ring.tail % 8 != 0 {
+            return TestResult::Fail("submitted ring tail is not qword aligned");
+        }
+        // SAFETY: this model has no running hardware or outstanding peer.
+        unsafe {
+            engine.release_after_reset();
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_rcs", smoke_render_cache_barrier);
+
+    fn resident_fixture(
+        hw: &mut FakeHw,
+    ) -> (
+        ResidentBatch,
+        alloc::sync::Weak<crate::intel_gpu_gem::GemObject>,
+    ) {
+        use crate::intel_gpu_exec::{ExecObject, ExecRequest};
+        let gem = crate::intel_gpu_gem::GemState::new();
+        let handle = gem.create(4096, |_, _| Ok(())).unwrap();
+        let object = gem.object(handle).unwrap();
+        object.write(0, &[0, 0, 0, 0, 0, 0, 0, 5]).unwrap();
+        let weak = Arc::downgrade(&object);
+        let va = 0x1234_0000_0000;
+        let request = ExecRequest {
+            context_id: 0,
+            batch_va: va,
+            batch_len: 8,
+            objects: alloc::vec![ExecObject {
+                object,
+                va,
+                writable: false
+            }],
+        };
+        let batch = request
+            .prepare(crate::intel_gpu_gtt::PteFormat::Gen12, 0)
+            .unwrap();
+        let translated = batch.space().translate(va).unwrap();
+        assert!(
+            matches!(translated, crate::intel_gpu_ppgtt::WalkOutcome::Mapped(phys)
+            if phys == request.objects[0].object.pages().next().unwrap())
+        );
+        hw.user_batches
+            .insert((batch.space().root_phys(), va), weak.clone());
+        gem.close(handle).unwrap();
+        (batch, weak)
+    }
+
+    fn smoke_owned_resident_completion() -> TestResult {
+        let (mut engine, mut hw) = make_engine().unwrap();
+        let ctx = engine.create_context().unwrap();
+        let (batch, weak) = resident_fixture(&mut hw);
+        let submission = engine.submit_resident(ctx, batch).unwrap();
+        if weak.strong_count() != 1 || submission.fence.result().is_some() {
+            return TestResult::Fail("job must own residency after fd close");
+        }
+        hw.step();
+        let done = engine.poll_completions();
+        if done.len() != 1
+            || done[0].request != submission.request
+            || weak.upgrade().is_some()
+            || submission.fence.result() != Some(Ok(()))
+            || engine.ppgtt_root(ctx) != Ok(None)
+        {
+            return TestResult::Fail("terminal completion did not release root and residency");
+        }
+        // SAFETY: all modelled requests completed; no peer runs afterwards.
+        unsafe {
+            engine.release_after_reset();
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_rcs", smoke_owned_resident_completion);
+
+    fn smoke_completion_without_breadcrumb_retains() -> TestResult {
+        let (mut engine, mut hw) = make_engine().unwrap();
+        let ctx = engine.create_context().unwrap();
+        let (batch, weak) = resident_fixture(&mut hw);
+        let submission = engine.submit_resident(ctx, batch).unwrap();
+        hw.inject_csb(csb_promote(1));
+        hw.inject_csb(csb_complete(1, IDLE_SW_ID));
+        if !engine.poll_completions().is_empty()
+            || !engine.completion_lost()
+            || submission.fence.result().is_some()
+            || weak.strong_count() != 1
+            || engine.is_idle()
+        {
+            return TestResult::Fail("unverified CSB event released a published job");
+        }
+        if engine.create_context() != Err(SubmitError::CompletionLost) {
+            return TestResult::Fail("lost engine admitted new work");
+        }
+        drop(hw);
+        // SAFETY: modelled GPU was never stepped and is now discarded. Reset
+        // is terminal; neither a timeout nor the bogus CSB established this.
+        unsafe {
+            engine.release_after_reset();
+        }
+        if weak.upgrade().is_some() || submission.fence.result() != Some(Err(JobError::Reset)) {
+            return TestResult::Fail("confirmed reset did not end residency with error");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_completion_without_breadcrumb_retains
+    );
+
+    fn smoke_completion_evidence_independent() -> TestResult {
+        for corrupt in 0..3 {
+            let (mut engine, mut hw) = make_engine().unwrap();
+            let ctx = engine.create_context().unwrap();
+            let (batch, weak) = resident_fixture(&mut hw);
+            let submission = engine.submit_resident(ctx, batch).unwrap();
+            hw.step();
+            let context = engine.context(ctx).unwrap();
+            match corrupt {
+                0 => context.hwsp.write32(HWSP_SEQNO_BYTE, 0),
+                1 => context
+                    .image
+                    .write32(REG_STATE_PAGE_BYTE + ((CTX_RING_HEAD + 1) as u64) * 4, 0),
+                _ => engine.status.write32(CSB_WRITE_BYTE, 0xff),
+            }
+            if !engine.poll_completions().is_empty()
+                || !engine.completion_lost()
+                || weak.strong_count() != 1
+                || submission.fence.result().is_some()
+            {
+                return TestResult::Fail("incomplete breadcrumb/head/cursor proof retired work");
+            }
+            drop(hw);
+            // SAFETY: the modelled peer has stopped; no descriptor can run.
+            unsafe {
+                engine.release_after_reset();
+            }
+            if weak.upgrade().is_some() {
+                return TestResult::Fail("reset retained rejected completion");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_completion_evidence_independent
+    );
+
+    fn smoke_queued_context_root_is_frozen() -> TestResult {
+        let (mut engine, _) = make_engine().unwrap();
+        let first = engine.create_context().unwrap();
+        let queued = engine.create_context().unwrap();
+        for ctx in [first, queued] {
+            let batch = engine.write_batch(&[MI_BATCH_BUFFER_END]).unwrap();
+            engine.submit(ctx, batch).unwrap();
+        }
+        if engine.attach_ppgtt(queued, 0x400000) != Err(SubmitError::ContextBusy)
+            || engine.detach_ppgtt(queued) != Err(SubmitError::ContextBusy)
+            || engine.ppgtt_root(queued) != Ok(None)
+        {
+            return TestResult::Fail("queued request's root could be replaced");
+        }
+        // SAFETY: the model has no running hardware or outstanding peer.
+        unsafe {
+            engine.release_after_reset();
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_queued_context_root_is_frozen
+    );
+
+    fn smoke_preempted_residency_survives() -> TestResult {
+        let (mut engine, mut hw) = make_engine().unwrap();
+        let ctx = engine.create_context().unwrap();
+        let (batch, weak) = resident_fixture(&mut hw);
+        let submission = engine.submit_resident(ctx, batch).unwrap();
+        hw.inject_csb(csb_promote(1));
+        hw.inject_csb(csb_preempt(1, IDLE_SW_ID));
+        if !engine.poll_completions().is_empty()
+            || weak.strong_count() != 1
+            || submission.fence.result().is_some()
+        {
+            return TestResult::Fail("preemption released resident work");
+        }
+        // Discard the superseded initial ELSP burst; model the resubmission.
+        hw.consumed_elsp = 4;
+        hw.step();
+        if engine.poll_completions().len() != 1
+            || weak.upgrade().is_some()
+            || submission.fence.result() != Some(Ok(()))
+        {
+            return TestResult::Fail("preempted resident job did not resume");
+        }
+        // SAFETY: the model has completed and no peer runs afterwards.
+        unsafe {
+            engine.release_after_reset();
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_preempted_residency_survives
+    );
+
+    fn smoke_context_csb_identity_not_reused() -> TestResult {
+        let (mut engine, mut hw) = make_engine().unwrap();
+        let old = engine.create_context().unwrap();
+        engine.destroy_context(old).unwrap();
+        let new = engine.create_context().unwrap();
+        if new.slot() != old.slot() || engine.context(new).unwrap().sw_id != 2 {
+            return TestResult::Fail("CSB identity reused after context slot reuse");
+        }
+        let batch = engine.write_batch(&[MI_BATCH_BUFFER_END]).unwrap();
+        engine.submit(new, batch).unwrap();
+        hw.inject_csb(csb_promote(2));
+        hw.inject_csb(csb_complete(1, IDLE_SW_ID));
+        if !engine.poll_completions().is_empty() || engine.completion_lost() {
+            return TestResult::Fail("old context event matched a replacement job");
+        }
+        hw.step();
+        if engine.poll_completions().len() != 1 {
+            return TestResult::Fail("replacement context completion lost");
+        }
+        // SAFETY: the model has completed and no peer runs afterwards.
+        unsafe {
+            engine.release_after_reset();
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_context_csb_identity_not_reused
+    );
 
     fn smoke_descriptor_layout() -> TestResult {
         let desc = context_descriptor(0x1000_0000, 5);
@@ -2502,6 +3030,19 @@ pub mod tests {
         }
         if ring.tail != 28 {
             return TestResult::Fail("tail after wrap");
+        }
+        // Only 40 bytes free, but wrapping 28 bytes also consumes 16 bytes
+        // of padding. Reject before writing either padding or command data.
+        let mut tight = RingState {
+            head: 32,
+            tail: RING_BYTES - 16,
+        };
+        let previous = mem.read32(0);
+        if ring_emit(&mem, &mut tight, &prog) != Err(SubmitError::RingFull)
+            || tight.tail != RING_BYTES - 16
+            || mem.read32(0) != previous
+        {
+            return TestResult::Fail("wrap padding overran unread ring contents");
         }
         // A command larger than the ring's usable span is full.
         let mut empty = RingState { head: 0, tail: 0 };
