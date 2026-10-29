@@ -73,6 +73,7 @@ pub(crate) const STD_REQ_SET_CONFIGURATION: u8 = 0x09;
 pub mod apple;
 pub mod consumer;
 pub mod generic;
+pub mod identity;
 pub mod keyboard;
 pub mod logitech_dj;
 pub mod logitech_hidpp;

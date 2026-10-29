@@ -28,6 +28,7 @@
 //!      report, push `PointerEvent`s onto the global input ring.
 
 use super::{
+    identity::{apply_identity, resolve_usb_identity},
     HidError, HID_BOOT_PROTOCOL, HID_INTERFACE_CLASS, HID_REQ_SET_PROTOCOL, HID_SUBCLASS_BOOT,
 };
 use crate::xhci::{EndpointConfig, EndpointKind, Xhci};
@@ -185,6 +186,7 @@ impl BootMouse {
         slot_id: u8,
         interface_num: u8,
         interrupt_in_ep: u8,
+        port: u8,
         hub_port: Option<(usize, u8)>,
     ) -> Result<Self, HidError> {
         xhci_dev
@@ -206,7 +208,15 @@ impl BootMouse {
             .map_err(HidError::Xhci)?;
 
         // Register with the evdev ROUTER. Mirrors i8042_mouse.rs::init().
-        let (evdev_id, evdev_node) = ROUTER.register_device(boot_mouse_evdev_caps());
+        // Identity (#874) is best-effort: on descriptor-fetch failure
+        // the synthetic caps below stand and the bind proceeds.
+        let mut caps = boot_mouse_evdev_caps();
+        if let Some(id) =
+            resolve_usb_identity(xhci_dev, slot_id, port, hub_port, "USB HID Mouse").await
+        {
+            apply_identity(&mut caps, &id);
+        }
+        let (evdev_id, evdev_node) = ROUTER.register_device(caps);
 
         Ok(BootMouse {
             slot_id,
@@ -390,9 +400,10 @@ pub async fn try_bind_mouse_already_addressed(
     xhci_dev: &Xhci,
     slot_id: u8,
     speed: crate::xhci::PortSpeed,
+    port: u8,
     hub_port: Option<(usize, u8)>,
 ) -> Result<(), HidError> {
-    bind_mouse_addressed_slot(xhci_dev, slot_id, speed, hub_port).await
+    bind_mouse_addressed_slot(xhci_dev, slot_id, speed, port, hub_port).await
 }
 
 async fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
@@ -404,7 +415,7 @@ async fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
             .address_device(slot_id, port, speed)
             .await
             .map_err(HidError::Xhci)?;
-        bind_mouse_addressed_slot(xhci_dev, slot_id, speed, None).await
+        bind_mouse_addressed_slot(xhci_dev, slot_id, speed, port, None).await
     }
     .await;
     if res.is_err() {
@@ -423,6 +434,7 @@ async fn bind_mouse_addressed_slot(
     xhci_dev: &Xhci,
     slot_id: u8,
     speed: crate::xhci::PortSpeed,
+    port: u8,
     hub_port: Option<(usize, u8)>,
 ) -> Result<(), HidError> {
     // Refresh EP0 MPS via Evaluate Context once the device tells
@@ -500,7 +512,7 @@ async fn bind_mouse_addressed_slot(
         .map_err(HidError::Xhci)?;
 
     let dci = ((ep.ep_addr & 0x0F) * 2) + 1;
-    let m = BootMouse::attach(xhci_dev, slot_id, iface, dci, hub_port).await?;
+    let m = BootMouse::attach(xhci_dev, slot_id, iface, dci, port, hub_port).await?;
     {
         let mut g = MICE.lock();
         g.push(m);

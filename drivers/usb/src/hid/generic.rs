@@ -55,6 +55,7 @@ use narf_input::{
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::consumer::usage_to_keycode as consumer_usage_to_keycode;
+use super::identity::{apply_identity, resolve_usb_identity};
 use super::report_descriptor::{
     parse, Field, FieldFlags, FieldKind, ReportDescriptor, USAGE_PAGE_BUTTON, USAGE_PAGE_CONSUMER,
     USAGE_PAGE_GENERIC_DESKTOP, USAGE_PAGE_KEYBOARD,
@@ -169,6 +170,8 @@ pub async fn try_bind_generic(
     interface_num: u8,
     interrupt_in_dci: u8,
     descriptor_blob: &[u8],
+    port: u8,
+    hub_port: Option<(usize, u8)>,
 ) -> Result<(), HidError> {
     let descriptor = parse(descriptor_blob).map_err(|_| HidError::NotBootKeyboard)?;
 
@@ -178,7 +181,16 @@ pub async fn try_bind_generic(
         .map_err(HidError::Xhci)?;
 
     // Register with the evdev ROUTER.
-    let caps = generic_evdev_caps(&descriptor);
+    // Identity (#874) is best-effort: on descriptor-fetch failure
+    // the synthetic caps below stand and the bind proceeds. Note
+    // this binder currently has no production caller; it is wired
+    // so a future caller publishes identity from the first bind.
+    let mut caps = generic_evdev_caps(&descriptor);
+    if let Some(id) =
+        resolve_usb_identity(xhci_dev, slot_id, port, hub_port, "USB HID Device").await
+    {
+        apply_identity(&mut caps, &id);
+    }
     let (evdev_id, evdev_node) = ROUTER.register_device(caps);
 
     let dev = GenericDevice {
