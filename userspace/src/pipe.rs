@@ -47,6 +47,11 @@ fn lock_queue(queue: &queue::Queue) -> queue::Guard<'_> {
     if let Some(guard) = queue.try_lock() {
         return guard;
     }
+    // Avoid parking for a short resident-page copy on a peer CPU. The queue
+    // limits this to one spinner and 32 pauses, respecting queued sleepers.
+    if let Some(guard) = queue.try_lock_optimistic() {
+        return guard;
+    }
     crate::handlers::poll_blocking(queue.lock_async())
         .expect("pipe mutex acquisition requires a runnable task context")
 }

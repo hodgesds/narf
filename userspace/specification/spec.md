@@ -742,7 +742,10 @@ the user-copy trap fixups, packet atomicity, and error ordering are preserved.
 Scalar/vector syscalls resolve the concrete pipe endpoint once from the retained
 file reference and reuse it across capacity waits. Scalar pipe dispatch follows
 the common access/range/zero-count checks and precedes socket-family probes.
-Both operations acquire per-pipe sleepable mutexes in address order. Payload
+Two-pipe operations acquire their sleepable mutexes in address order. Payload
+ownership first tries the mutex directly, then a single bounded optimistic
+wait before normal sleepable acquisition. Optimistic admission defers to queued
+waiters and never trusts the queue's busy hint as proof of ownership. Payload
 copies and allocations hold no pipe IRQ spinlock. Poll, FIONREAD, and endpoint
 closure use atomic queue snapshots; a per-pipe short publication lock orders
 readiness updates. First readiness activation and the inactive-publication

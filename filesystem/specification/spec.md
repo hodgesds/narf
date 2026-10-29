@@ -537,7 +537,14 @@ blocking `open`. A read-only handle opened before any writer suppresses
 `POLLHUP` until its own writer-presence snapshot changes, matching Linux's
 per-file `f_pipe`/`w_counter` rule. Data reads/writes arm the per-file readiness cell. Anonymous pipes and named
 FIFOs use `pipe_buffer::PipeBufs` and `pipe_queue::Queue`: a bounded buffer-slot
-ring with retained page references and a sleepable mutex. Queue guards publish
+ring with retained page references and a sleepable mutex. `Queue::try_lock_optimistic`
+permits one optional spinner per pipe for at most 32 pauses, then one authoritative
+mutex attempt only if the advisory busy hint clears. That attempt refuses queued
+waiters; failure returns to normal sleepable acquisition. The reservation is
+released on every return, before any sleep. No owner-running query is assumed,
+so preempted or faulting owners cannot extend the fixed spin bound. Busy hints
+never grant ownership, and guard release clears its hint before mutex release
+so it cannot clear a successor's hint. Queue guards publish
 atomic length/fullness/capacity snapshots before releasing the mutex. Pipe
 payload copies never hold the readiness publication spinlock.
 `FifoHandle::{read_to_user,vmsplice_to_user,write_from_user}` are async operations

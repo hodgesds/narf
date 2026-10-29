@@ -111,6 +111,14 @@ allocation, shared-memory ownership and scheduler wakeups retain their own
 subsystem synchronization; per-pipe locking is not a claim of an entirely
 lock-free syscall path.
 
+Anonymous/named syscall pipe paths optionally wait up to 32 pauses for short
+mutex ownership before parking. One spinner per queue avoids a stampede;
+its retry refuses queued waiters and still acquires the authoritative sleepable
+mutex. The advisory busy bit never permits payload access. This borrows the
+purpose of Linux's optimistic mutex spinning, with a fixed bound in place of
+Linux's running-owner checks and MCS spinner queue. A preempted or faulting
+owner therefore retains the normal sleepable fallback.
+
 The buffer model removes eager 64-KiB payload allocation per empty pipe and
 payload copies from pipe-to-pipe splice/tee. Up to two exclusively owned drained
 pages can be reused for subsequent writes, matching Linux's `tmp_page` cache.
