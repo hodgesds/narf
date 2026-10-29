@@ -128,9 +128,22 @@ bounded extension chains and retained VM identity after VM-handle destruction.
 Context zero is implicit. Only normal priority is admitted, disabling banning
 is refused, and no privilege follows from context creation. QUERY has Linux's
 two-pass/per-item signed-length protocol: system memory reports actual RAM;
-engine info reports zero available userspace engines. Unavailable topology,
-HWCONFIG and GuC-version queries return per-item errors instead of synthetic
-hardware data. Submission capabilities and HAS_ALIASING_PPGTT remain zero.
+engine info reports zero available userspace engines. HWCONFIG returns the exact
+firmware KLV bytes only after this card's GT publishes a validated snapshot;
+absence returns per-item -ENODEV. Size-only queries never access the data pointer;
+short capacity returns -EINVAL, failed data copies return -EFAULT and later
+items still run. Only the item length is written back. Topology remains
+unavailable. GuC submission-version returns -ENODEV until a scheduling interface
+is installed; the loaded firmware release cannot substitute for that interface
+version. Submission capabilities and HAS_ALIASING_PPGTT remain zero.
+
+`drm_registry::driver_name` recognizes `intel-gpu` so both primary and render
+nodes reach Intel dispatch and retain their GEM mmap/PRIME namespaces.
+`drm_registry::card(index)` retains that card's Arc; DeviceInfo reads driver state
+after the registry lock is released. `DeviceInfo::for_card` validates the
+driver/vendor and exact integrated/Alchemist/Battlemage PCI profile and captures
+that instance's optional immutable HWCONFIG Arc. Discrete profiles report system
+RAM as system RAM; no local-memory region or Arc display binding is inferred.
 
 `intel_gpu_exec::ExecRequest::read` admits a bounded softpin/no-relocation
 residency plan: this file's unique handles, valid canonical GPU addresses,
@@ -331,8 +344,22 @@ not hardware ABI maxima. `as_bytes` preserves firmware order and unknown
 keys/vector values; the separate lookup index is sorted. `value_bytes`
 returns the exact value span, and `lookup_u32` returns only scalar values,
 distinguishing absent and nonscalar entries. Maximum capability values are
-not active/fused topology. HWCONFIG is not yet installed into per-card DRM
-queries, and its availability does not advertise userspace engines.
+not active/fused topology.
+
+`DrmCard::intel_hwconfig` defaults to absence. `IntelGpuCard` owns a private,
+single-publication slot; `publish_gt_hwconfig(&mut GuCGt)` acquires an immutable
+CPU snapshot only from a Ready/CtReady owner with a valid forcewake request/ACK
+and matching PCI device ID. Wake loss poisons the GT, and missing or pending
+discovery cannot publish. The PCI owner must bind this card and GT to the same
+physical function; equal device IDs do not establish that identity. Another
+card, even with the same device ID, has an independent slot. A second successful
+publication is refused. The registered card retains only CPU bytes, so verified
+GT shutdown may reclaim all DMA backing while queries continue to describe this
+card's static capabilities. Previously captured DeviceInfo snapshots do not
+change. The integrated probe retains the same IntelGpuCard Arc it registers for
+future GT attachment. Actual PCI/runtime-PM/MOCS setup and GT startup remain
+separate work; normal probe leaves HWCONFIG absent. Publication does not
+advertise userspace engines or admit EXECBUFFER2.
 
 `intel_gpu_guc_transport::XeLpgTransport` owns one six-page coherent GGTT
 allocation (H2G descriptor at 0, G2H at 0x800, 4-KiB send ring at 0x1000,

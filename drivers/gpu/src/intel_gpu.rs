@@ -852,6 +852,9 @@ pub struct IntelGpu {
     /// and plane programming succeed. `None` on PTL (display
     /// gated off) or when allocation failed (logged at probe).
     pub scanout: Option<ScanoutAllocation>,
+    /// The same card instance installed in the DRM registry. A future PCI GT
+    /// owner publishes discovery here instead of through a global device-ID map.
+    pub drm_card: Option<alloc::sync::Arc<crate::drm_devfs_bridge::IntelGpuCard>>,
 }
 
 #[derive(Clone, Debug)]
@@ -919,6 +922,7 @@ impl IntelGpu {
             gmd_id,
             active_scanout: narf_lib::sync::IrqSafeSpinLock::new(None),
             scanout: None,
+            drm_card: None,
         })
     }
 
@@ -1231,8 +1235,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         dev.chip.generation.region_generation(),
         Some(RegionGeneration::Gen12)
     );
-    *CONTROLLER.lock() = Some(dev);
-
     // Register with drm_registry. With a live scanout the card
     // carries real KMS mode state (CRTC 1 + mode, encoder 2,
     // eDP connector 3 — the virtio/bochs pattern in lib.rs) and
@@ -1241,13 +1243,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // stays identity-only, as before lane 1.
     let drm_count = crate::drm_registry::count() as u32;
     let card_name = alloc::format!("card{}", drm_count);
-    let intel_card = crate::drm_devfs_bridge::IntelGpuCard::new(
+    let intel_card = alloc::sync::Arc::new(crate::drm_devfs_bridge::IntelGpuCard::new(
         card_name,
         device.id.vendor,
         device.id.device,
         device.id.subsystem_vendor,
         device.id.subsystem_id,
-    );
+    ));
+    dev.drm_card = Some(intel_card.clone());
+    *CONTROLLER.lock() = Some(dev);
     match scanout_mode {
         Some(mode) => {
             use crate::drm::card::{
@@ -1284,10 +1288,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                 encoder_id: Some(2),
                 modes: alloc::vec![kms_mode],
             });
-            crate::drm_registry::register_drm_card_with_state(
-                alloc::sync::Arc::new(intel_card),
-                kms,
-            );
+            crate::drm_registry::register_drm_card_with_state(intel_card, kms);
             publish_scanout(Some(narf_graphics_driver::generic::GenericFb::new(
                 mode.phys_base,
                 mode.width,
@@ -1297,7 +1298,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             )));
         }
         None => {
-            crate::drm_registry::register_drm_card(alloc::sync::Arc::new(intel_card));
+            crate::drm_registry::register_drm_card(intel_card);
         }
     }
 

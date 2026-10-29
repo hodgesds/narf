@@ -12,6 +12,7 @@ use crate::intel_gpu_guc_firmware::GuCFirmware;
 use crate::intel_gpu_guc_transport::{TransportError, XeLpgTransport};
 use crate::intel_gpu_hwconfig::{HardwareConfig, HwconfigError};
 use crate::intel_gpu_rcs::{GpuAllocator, GpuBacking, SubmitError};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{fence, Ordering};
@@ -176,7 +177,7 @@ pub struct GuCBoot<M: MmioWindow, A: BootAllocator> {
     state: BootState,
     deadline: u64,
     released: bool,
-    hwconfig: Option<HardwareConfig>,
+    hwconfig: Option<Arc<HardwareConfig>>,
 }
 
 impl<M: MmioWindow, A: BootAllocator> core::fmt::Debug for GuCBoot<M, A> {
@@ -339,7 +340,13 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
     }
 
     pub(crate) fn hwconfig(&self) -> Option<&HardwareConfig> {
-        self.hwconfig.as_ref()
+        self.hwconfig.as_deref()
+    }
+
+    pub(crate) fn hwconfig_for_device(&self, device_id: u16) -> Option<Arc<HardwareConfig>> {
+        (self.config.device_id == device_id)
+            .then(|| self.hwconfig.clone())
+            .flatten()
     }
 
     pub(crate) fn prepare_hwconfig(&mut self, bytes: u32) -> Result<u32, BootError> {
@@ -393,7 +400,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         for offset in (0..u64::from(output.bytes)).step_by(4) {
             bytes.extend_from_slice(&output.backing.read32(offset).to_le_bytes());
         }
-        self.hwconfig = Some(HardwareConfig::parse(bytes).map_err(BootError::Hwconfig)?);
+        self.hwconfig = Some(Arc::new(
+            HardwareConfig::parse(bytes).map_err(BootError::Hwconfig)?,
+        ));
         Ok(())
     }
 
@@ -1702,5 +1711,104 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_hwconfig",
         smoke_hwconfig_cancelled_wait_and_last_owner
+    );
+
+    fn smoke_hwconfig_card_publication_and_gt_lifetime() -> TestResult {
+        use crate::drm_devfs_bridge::IntelGpuCard;
+        use crate::intel_gpu_render::{tests::check_card_hwconfig, DeviceInfo};
+        use alloc::string::String;
+        for (platform, ack, did, wrong_did) in [
+            (
+                GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
+                0xdfc,
+                0x7d55,
+                0x7d51,
+            ),
+            (GtPlatform::Alchemist, 0x130044, 0x56a0, 0x56a1),
+            (GtPlatform::Battlemage, 0xdfc, 0xe20b, 0xe202),
+        ] {
+            let (window, arena, mut gt) = gt_model(platform, ack);
+            let card = Arc::new(IntelGpuCard::new(String::new(), 0x8086, did, 0, 0));
+            let index = crate::drm_registry::register_drm_card(card.clone());
+            let other = Arc::new(IntelGpuCard::new(String::new(), 0x8086, did, 0, 0));
+            let other_index = crate::drm_registry::register_drm_card(other.clone());
+            let wrong = IntelGpuCard::new(String::new(), 0x8086, wrong_did, 0, 0);
+            let before = DeviceInfo::for_card(index).unwrap();
+            assert_eq!(card.publish_gt_hwconfig(&mut gt), Err(GtError::State));
+            gt_ready(&mut gt, &window, ack);
+            assert!(card.publish_gt_hwconfig(&mut gt).is_err());
+            gt.begin_hwconfig(6).unwrap();
+            assert_eq!(card.publish_gt_hwconfig(&mut gt), Err(GtError::State));
+            window.0.borrow_mut().regs.insert(0x190240, 0xf0000020);
+            assert!(gt.poll(7).is_pending());
+            let words = [0x9000, 3, 0x00ffffff, 0xffffffff, 0xff000000, 7, 1, 8];
+            let expected: Vec<u8> = words
+                .iter()
+                .flat_map(|word: &u32| word.to_le_bytes())
+                .collect();
+            let base = hwconfig_device_write(&window, &words);
+            assert_eq!(card.publish_gt_hwconfig(&mut gt), Err(GtError::State));
+            window.0.borrow_mut().regs.insert(0x190240, 0xf0000000);
+            assert_eq!(gt.poll(8), Poll::Ready(Ok(GtState::Ready)));
+            assert_eq!(
+                wrong.publish_gt_hwconfig(&mut gt),
+                Err(GtError::Boot(BootError::Device))
+            );
+            let wrong_vendor = IntelGpuCard::new(String::new(), 0x1002, did, 0, 0);
+            assert_eq!(
+                wrong_vendor.publish_gt_hwconfig(&mut gt),
+                Err(GtError::Boot(BootError::Device))
+            );
+            card.publish_gt_hwconfig(&mut gt).unwrap();
+            assert_eq!(card.publish_gt_hwconfig(&mut gt), Err(GtError::Busy));
+            let after = DeviceInfo::for_card(index).unwrap();
+            assert!(before.hwconfig.is_none());
+            assert_eq!(after.hwconfig.as_ref().unwrap().as_bytes(), expected);
+            window.0.borrow().memory.get(&base).unwrap().borrow_mut()[7] = 99;
+            check_card_hwconfig(index, Some(&expected)).unwrap();
+            // Two PCI functions with the same DID cannot share publication by
+            // accident: the other card's slot remains absent.
+            check_card_hwconfig(other_index, None).unwrap();
+            hwconfig_stop(&mut gt, &window, ack);
+            assert_eq!(other.publish_gt_hwconfig(&mut gt), Err(GtError::State));
+            drop(gt);
+            assert_eq!(arena.live_allocations(), 0);
+            assert_eq!(after.hwconfig.as_ref().unwrap().as_bytes(), expected);
+            check_card_hwconfig(index, Some(&expected)).unwrap();
+            check_card_hwconfig(other_index, None).unwrap();
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_hwconfig",
+        smoke_hwconfig_card_publication_and_gt_lifetime
+    );
+
+    fn smoke_hwconfig_card_refuses_wake_loss() -> TestResult {
+        use crate::drm_devfs_bridge::IntelGpuCard;
+        use crate::drm_registry::DrmCard;
+        let (window, arena, mut gt) = gt_model(GtPlatform::Battlemage, 0xdfc);
+        gt_ready(&mut gt, &window, 0xdfc);
+        gt.begin_hwconfig(6).unwrap();
+        window.0.borrow_mut().regs.insert(0x190240, 0xf000000c);
+        assert!(gt.poll(7).is_pending());
+        hwconfig_device_write(&window, &[7, 1, 8]);
+        window.0.borrow_mut().regs.insert(0x190240, 0xf0000000);
+        assert_eq!(gt.poll(8), Poll::Ready(Ok(GtState::Ready)));
+        let card = IntelGpuCard::new(alloc::string::String::new(), 0x8086, 0xe20b, 0, 0);
+        window.0.borrow_mut().regs.insert(0xdfc, 0);
+        assert_eq!(card.publish_gt_hwconfig(&mut gt), Err(GtError::WakeLost));
+        assert_eq!(gt.state(), GtState::Lost);
+        assert!(card.intel_hwconfig().is_none());
+        window.0.borrow_mut().regs.insert(0xdfc, 1);
+        assert_eq!(card.publish_gt_hwconfig(&mut gt), Err(GtError::State));
+        hwconfig_stop(&mut gt, &window, 0xdfc);
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_hwconfig",
+        smoke_hwconfig_card_refuses_wake_loss
     );
 }

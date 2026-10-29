@@ -90,6 +90,13 @@ pub trait DrmCard: Send + Sync {
     fn set_pp_features(&self, _mask: &str) -> Result<(), narf_filesystem::FsError> {
         Err(narf_filesystem::FsError::Unsupported)
     }
+
+    /// Immutable, firmware-derived Intel capabilities for this card instance.
+    /// This is neither an engine inventory nor a submission-readiness claim.
+    #[cfg(feature = "intel")]
+    fn intel_hwconfig(&self) -> Option<Arc<crate::intel_gpu_hwconfig::HardwareConfig>> {
+        None
+    }
 }
 
 // ── Global registry ────────────────────────────────────────────────────────
@@ -251,13 +258,23 @@ pub fn mode_state(index: u32) -> Option<Arc<IrqSafeSpinLock<crate::drm::card::Ca
 pub fn driver_name(index: u32) -> Option<&'static str> {
     let g = REGISTRY.lock();
     // Every current driver name is a static literal. Avoid returning a borrow
-    // through the registry lock by maping the known virtio name explicitly;
-    // other names do not have a private render UAPI yet.
+    // through the registry lock by mapping the known private UAPI names.
     match g.cards.get(index as usize).map(|entry| entry.card.driver()) {
         Some("virtio_gpu") => Some("virtio_gpu"),
         Some("amdgpu") => Some("amdgpu"),
+        Some("intel-gpu") => Some("intel-gpu"),
         _ => None,
     }
+}
+
+/// Retain one card instance without holding the registry lock while consulting
+/// driver-owned state. Snapshots stay tied to that instance across test resets.
+pub fn card(index: u32) -> Option<Arc<dyn DrmCard>> {
+    REGISTRY
+        .lock()
+        .cards
+        .get(index as usize)
+        .map(|entry| entry.card.clone())
 }
 
 /// A registered card's PCI vendor and device id.

@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.14** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.15** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -1534,8 +1534,26 @@ unknown keys and vector values; scalar lookups reject vectors and duplicate
 keys/invalid extents fail acquisition. The DMA destination remains owned
 until verified stop, including on timeout, cancellation or cache failure.
 The snapshot is capability data, not an active engine/fuse inventory, and
-does not open the userspace submission gate. Per-card DRM query publication
-still requires probe integration.
+does not open the userspace submission gate.
+
+The DRM registry now recognizes `intel-gpu`, fixing private ioctl/mmap routing
+on both primary and render nodes. Per-card `DeviceInfo` retains an immutable
+snapshot from that card instance, with exact integrated/DG2/BMG profile lookup.
+`IntelGpuCard::publish_gt_hwconfig` accepts one snapshot from an awake Ready or
+CtReady GT with matching device ID. The PCI owner must supply the GT belonging
+to that physical function, including with duplicate PCI IDs. Static CPU bytes
+survive GT shutdown; DMA allocations stay with the GT and can all be reclaimed
+after verified stop. Another card's slot remains absent. The integrated probe
+retains its registered card Arc for subsequent GT attachment, but does not yet
+start GuC, so normal hardware probe still reports HWCONFIG unavailable.
+
+HWCONFIG queries follow local Linux `i915_query.c::query_hwconfig_blob`: exact
+bytes/order, two-pass lengths, -ENODEV for absence, -EINVAL for a short buffer,
+and per-item -EFAULT for a bad copy. GuC submission-version remains -ENODEV:
+Linux queries the scheduling interface, which is distinct from the CSS firmware
+release. Native tests traverse both DRM node types, GEM/mmap ownership, the
+GT discovery/publication chain and snapshot queries after all GT DMA is freed.
+Arc identity still adds no display binding, local VRAM or userspace engines.
 
 Gen12 owned resident submission, cache-flushed
 post-sync breadcrumbs, terminal fences and loss retention now have native
@@ -1575,8 +1593,10 @@ GuC bootstrap and discrete identity were cross-checked against the local Linux
 checkout at `b90c984d615e8ce2af96f5b1411a962d83fed2ad`: MIT-licensed
 `include/drm/intel/pciids.h`, `drivers/gpu/drm/xe/{xe_uc_fw.c,xe_guc.c,xe_wopcm.c,
 xe_guc_ads.c,xe_guc_fwif.h,xe_guc_tlb_inval.c,xe_ggtt.c,xe_force_wake.c,
-xe_guc_hwconfig.c}`, `drivers/gpu/drm/i915/gt/uc/intel_guc_hwconfig.c` and
+xe_guc_hwconfig.c}`, `drivers/gpu/drm/i915/gt/uc/intel_guc_hwconfig.c`,
+`drivers/gpu/drm/i915/i915_query.c`, `include/uapi/drm/i915_drm.h` and
 `drivers/gpu/drm/xe/regs/{xe_guc_regs.h,xe_gt_regs.h}`. Native Rust models pin
 the register/ADS values, reset and DMA stop proofs, cache publication failures,
-allocation rollback and discrete CT coherence refusal. They do not establish
+allocation rollback, discrete CT coherence refusal and per-card query lifetime.
+They do not establish
 firmware boot on Intel silicon.

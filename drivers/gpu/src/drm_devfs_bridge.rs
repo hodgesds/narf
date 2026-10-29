@@ -2078,6 +2078,8 @@ pub struct IntelGpuCard {
     pub did: u16,
     pub subsystem_vid: u16,
     pub subsystem_did: u16,
+    hwconfig:
+        narf_lib::sync::IrqSafeSpinLock<Option<Arc<crate::intel_gpu_hwconfig::HardwareConfig>>>,
 }
 
 #[cfg(feature = "intel")]
@@ -2095,7 +2097,33 @@ impl IntelGpuCard {
             did,
             subsystem_vid,
             subsystem_did,
+            hwconfig: narf_lib::sync::IrqSafeSpinLock::new(None),
         }
+    }
+
+    /// Publish static capabilities once, after this function's GT acquired and
+    /// validated HWCONFIG. The PCI owner must supply this card's own GT, including
+    /// when several functions have identical device IDs. No DMA backing escapes.
+    /// The immutable CPU snapshot remains valid across shutdown of that GT.
+    pub fn publish_gt_hwconfig<M, A>(
+        &self,
+        gt: &mut crate::intel_gpu_guc_gt::GuCGt<M, A>,
+    ) -> Result<(), crate::intel_gpu_guc_gt::GtError>
+    where
+        M: crate::intel_gpu_aux::MmioWindow,
+        A: crate::intel_gpu_guc_boot::BootAllocator,
+    {
+        use crate::intel_gpu_guc_gt::GtError;
+        if self.vid != 0x8086 {
+            return Err(GtError::Boot(crate::intel_gpu_guc_boot::BootError::Device));
+        }
+        let snapshot = gt.hwconfig_for_device(self.did)?;
+        let mut slot = self.hwconfig.lock();
+        if slot.is_some() {
+            return Err(GtError::Busy);
+        }
+        *slot = Some(snapshot);
+        Ok(())
     }
 }
 
@@ -2112,6 +2140,9 @@ impl crate::drm_registry::DrmCard for IntelGpuCard {
     }
     fn device_id(&self) -> u16 {
         self.did
+    }
+    fn intel_hwconfig(&self) -> Option<Arc<crate::intel_gpu_hwconfig::HardwareConfig>> {
+        self.hwconfig.lock().clone()
     }
     fn subsystem_vendor(&self) -> u16 {
         self.subsystem_vid

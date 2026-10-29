@@ -988,13 +988,28 @@ the DMA backing stays owned through verified stop. Malformed lengths,
 duplicate keys, cache failures, wake loss, timeouts and all-ones register
 reads fail acquisition without releasing uncertain DMA resources. Unknown
 keys and vectors are retained; capability maxima are not active topology.
-Per-card DRM query publication remains part of probe integration.
+Per-card DRM query publication now retains that immutable snapshot separately
+from GT DMA lifetime. The DRM registry recognizes `intel-gpu`, fixing private
+ioctl and GEM mmap routing on both primary and render nodes. Each Intel card
+has an independent, single-publication slot, including cards with identical
+PCI IDs. Publication requires an awake Ready/CtReady GT and matching device
+ID; the PCI owner must pair the correct physical function. Exact HWCONFIG
+bytes remain queryable after verified GT stop and backing reclamation.
+Unavailable tables return per-item -ENODEV. GuC submission-version remains
+unavailable because it describes the unimplemented scheduling interface,
+not the loaded firmware release. The integrated probe retains its registered
+card Arc; automatic PCI/runtime-PM/MOCS/GT startup remains open and normal
+probe leaves discovery absent. Arc display and userspace submission gates
+remain closed.
 
-The GuC bootstrap/GT/HWCONFIG follow-up passes 235 selected native GPU/DRM
-tests on x86_64 and 118 on aarch64, with zero failures/skips, including five
-bootstrap, five GT-owner and five HWCONFIG smokes covering platform ACKs,
+The GuC bootstrap/GT/HWCONFIG follow-up passes 239 selected native GPU/DRM
+tests on x86_64 and 122 on aarch64, with zero failures/skips, including five
+bootstrap, five GT-owner and seven HWCONFIG smokes covering platform ACKs,
 wake ownership, DMA stop, CT faults, KLV bounds, cache synchronization,
-allocation rollback, wait cancellation and last-owner quarantine.
+allocation rollback, wait cancellation, last-owner quarantine and independent
+card publication/query lifetime after all GT DMA is freed. New render smokes
+exercise real primary/render-node routing, per-open GEM/mmap ownership and
+HWCONFIG wire failures. Another 44 x86_64 DRM integration tests pass.
 GT/firmware-profile identity coverage, the existing 25 RCS and six CT-owner
 smokes also pass.
 GPU CI Clippy passes all three

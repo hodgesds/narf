@@ -12,6 +12,7 @@ use crate::intel_gpu_guc_boot::{BootAllocator, BootConfig, BootError, BootState,
 use crate::intel_gpu_guc_firmware::GuCFirmware;
 use crate::intel_gpu_guc_transport::{Mailbox, TransportError, TransportState, XeLpgTransport};
 use crate::intel_gpu_hwconfig::HardwareConfig;
+use alloc::sync::Arc;
 use core::mem::ManuallyDrop;
 use core::task::Poll;
 
@@ -108,6 +109,26 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     /// active engine/fuse masks or permission to admit userspace submissions.
     pub fn hwconfig(&self) -> Option<&HardwareConfig> {
         self.parts.boot.hwconfig()
+    }
+
+    /// Only a live, awake owner may supply a card's first discovery snapshot.
+    /// The PCI owner still binds the card and GT to the same physical function;
+    /// matching a device ID alone cannot distinguish identical PCI functions.
+    pub(crate) fn hwconfig_for_device(
+        &mut self,
+        device_id: u16,
+    ) -> Result<Arc<HardwareConfig>, GtError> {
+        if !matches!(self.state, GtState::Ready | GtState::CtReady) {
+            return Err(GtError::State);
+        }
+        if let Err(error) = self.awake() {
+            self.state = GtState::Lost;
+            return Err(error);
+        }
+        self.parts
+            .boot
+            .hwconfig_for_device(device_id)
+            .ok_or(GtError::Boot(BootError::Device))
     }
 
     /// Issue the zero-address size query before CT owns the MMIO mailbox.
