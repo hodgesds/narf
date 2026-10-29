@@ -496,16 +496,19 @@ pub fn find_acm_interfaces(cfg: &[u8]) -> Option<AcmInterfaces> {
                             }
                         }
                     }
-                } else if current_iface == comm_iface && comm_iface.is_some() {
-                    if xfer_t == 3 && is_in && notify.is_none() {
-                        // Interrupt-IN — notification endpoint.
-                        notify = Some(EndpointConfig {
-                            ep_addr,
-                            max_packet: mps,
-                            kind: EndpointKind::InterruptIn,
-                            interval,
-                        });
-                    }
+                } else if current_iface == comm_iface
+                    && comm_iface.is_some()
+                    && xfer_t == 3
+                    && is_in
+                    && notify.is_none()
+                {
+                    // Interrupt-IN — notification endpoint.
+                    notify = Some(EndpointConfig {
+                        ep_addr,
+                        max_packet: mps,
+                        kind: EndpointKind::InterruptIn,
+                        interval,
+                    });
                 }
             }
             _ => {}
