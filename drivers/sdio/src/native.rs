@@ -450,7 +450,49 @@ fn bind_intx(device: &BusDevice, authority: &Cap<BusDeviceCap, Write>) -> Option
     .ok()?;
     Some((alloc::boxed::Box::new(line), subscriber))
 }
-#[cfg(not(target_arch = "x86_64"))]
+/// aarch64: the root-bus function's INTx pin resolved through the PCIe host
+/// bridge's devicetree `interrupt-map` (Linux `of_irq_parse_and_map_pci`
+/// without bridge swizzle) to a level-high GIC SPI, bound as a masked
+/// oneshot line. Bridged functions, edge or non-SPI parents keep polling.
+#[cfg(target_arch = "aarch64")]
+fn bind_intx(device: &BusDevice, authority: &Cap<BusDeviceCap, Write>) -> Option<Bound> {
+    /// Same bound the bus devicetree matcher applies to the boot DTB.
+    const MAX_DTB_SIZE: usize = 2 * 1024 * 1024;
+    let pin = invoke(authority, || {
+        narf_bus::pci::read_intx_pin(authority, device)
+    })
+    .ok()?
+    .ok()?;
+    let narf_bus::BusKind::Pcie { addr, .. } = device.kind else {
+        return None;
+    };
+    if addr.bus != 0 {
+        return None;
+    }
+    let dtb = narf_bus::registry::boot_dtb()?;
+    // SAFETY: the boot DTB is identity/direct-mapped for the kernel lifetime.
+    let blob = unsafe { narf_firmware_fdt::discover(dtb.raw() as usize, MAX_DTB_SIZE) }?;
+    let devfn = (addr.device << 3) | addr.function;
+    let route = narf_firmware_fdt::pci::intx_route(blob, addr.segment, addr.bus, devfn, pin)?;
+    let (intid, level) = narf_firmware_fdt::pci::gic_spi(&route)?;
+    if !level {
+        return None;
+    }
+    let subscriber = alloc::sync::Arc::new(crate::card::Subscriber::default());
+    let notified = subscriber.clone();
+    // SAFETY: the GIC is initialized before PCI probe, and this probe
+    // exclusively owns the claimed host function whose INTx resolves here.
+    let line = unsafe {
+        narf_interrupts::oneshot::Line::bind_spi(
+            intid,
+            "sdhci-card",
+            alloc::sync::Arc::new(move || notified.notify()),
+        )
+    }
+    .ok()?;
+    Some((alloc::boxed::Box::new(line), subscriber))
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn bind_intx(_: &BusDevice, _: &Cap<BusDeviceCap, Write>) -> Option<Bound> {
     None
 }

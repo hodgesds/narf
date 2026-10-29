@@ -93,7 +93,10 @@ this does not configure platform clocks, pin muxes or power GPIOs.
   before MMIO. `probe` binds the host function's INTx pin through the root
   `_PRT` (`\_SB.PCI0`, as e1000/xHCI; bridged functions and named link
   entries keep polling) to an exclusive GSI as a masked `oneshot::Line`
-  (x86_64 only), and clears INTx-disable only after the card initialized
+  on x86_64; on aarch64 it resolves the root-bus function's pin through the
+  boot DTB host bridge `interrupt-map` (`narf_firmware_fdt::pci::intx_route`,
+  level-high GIC SPI only) and binds `Line::bind_spi`. It clears INTx-disable
+  only after the card initialized
   (`Mmio::enable_intx` with readback), so a failed probe leaves it parked. Range/alignment failure, revoked authority or invalid
   decode permanently closes the adapter. The private handle cannot be cloned.
 - `native::register_function_driver(FunctionDriver)` registers up to 16
@@ -146,7 +149,7 @@ They validate software contracts, not electrical/controller compatibility.
 
 Platform ACPI/devicetree enumeration, regulators/pin mux/clock/reset GPIOs,
 vendor SDHCI quirks, multiple slots/card removal/reprobe, UHS-I,
-interrupt-driven command/data completion, aarch64 PCI INTx (no
-INTx-to-SPI map) and DMA remain software work.
+interrupt-driven command/data completion, INTx for bridged hosts and DMA
+remain software work.
 Physical PCI/SDIO acceptance, real card timing and cancellation/power-down
 behavior require a target test after these software profiles are reviewed.
