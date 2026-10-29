@@ -72,6 +72,59 @@ fn smoke_virtio_blk_pci_read_sector() -> TestResult {
 }
 kernel_test_in!("drivers/virtio/blk-pci", smoke_virtio_blk_pci_read_sector);
 
+fn smoke_virtio_blk_pci_flush() -> TestResult {
+    // End-to-end virtio-blk-pci cache-flush smoke (#841): same probe
+    // preamble as the read smoke (skipped when another smoke already
+    // probed), then flush through the sync wrapper and check the
+    // advertisement matches the negotiated state — the #841 property
+    // itself. On a QEMU device offering F_FLUSH (the default
+    // writeback configuration) this round-trips a real T_FLUSH
+    // request to S_OK; on a device that does not offer it, flush
+    // is the documented write-through no-op and the capabilities
+    // claim matches that.
+    use crate::blk_pci;
+    use narf_block::BlockDeviceSync;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE is the identity-mapped QEMU ECAM region; safe to call once per test.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has_vblk = devs.iter().any(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. })
+            && d.id.vendor == blk_pci::VIRTIO_BLK_PCI_VENDOR
+            && d.id.device == blk_pci::VIRTIO_BLK_PCI_DEVICE
+    });
+    if !has_vblk {
+        return TestResult::Skip("no virtio-blk-pci device");
+    }
+    if !blk_pci::is_probed() {
+        __reset_for_test();
+        blk_pci::register_pci_driver();
+        let authority = bootstrap_registry_authority();
+        if probe_all_pci(&authority).is_err() {
+            return TestResult::Fail("probe_all_pci failed");
+        }
+        if !blk_pci::is_probed() {
+            return TestResult::Fail("virtio-blk-pci not probed");
+        }
+    }
+    let dev = blk_pci::VirtioBlkBlockSync;
+    if dev.flush().is_err() {
+        return TestResult::Fail("virtio-blk-pci flush failed");
+    }
+    let negotiated = blk_pci::with_controller(|c| c.flush_supported()).unwrap_or(false);
+    let caps = dev.capabilities();
+    if caps.volatile_cache != negotiated {
+        return TestResult::Fail("virtio-blk-pci capabilities volatile_cache != negotiated flush");
+    }
+    if caps.fua {
+        return TestResult::Fail("virtio-blk-pci capabilities claims native fua");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/virtio/blk-pci", smoke_virtio_blk_pci_flush);
+
 /// The installed controller must never move, be replaced, or be dropped.
 ///
 /// `blk_pci::with_device_unlocked` reads the device's address under the

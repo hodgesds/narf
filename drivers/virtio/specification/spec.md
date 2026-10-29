@@ -95,6 +95,13 @@ memory-window ownership and do not use this control-register path.
   request slot and completion wakes it after removing the request from the
   used ring. Unsupported/no-op flush, discard, and cancel paths resolve
   immediately rather than returning a permanently pending future.
+- The virtio-blk-pci sync driver negotiates VIRTIO_BLK_F_FLUSH when the
+  device offers it and drains the device write cache with a T_FLUSH
+  request; its `BlockDeviceSync::capabilities` reports `volatile_cache`
+  exactly when flush was negotiated, so the SyncBlock Flush/Fua
+  advertisement is honest (#841). A device that does not offer flush is
+  treated as write-through, and a non-S_OK flush status surfaces as an
+  error rather than silent success.
 - VirtIO sound PCI queries PCM_INFO and registers its implemented stream-0
   playback endpoint with `drivers/sound`, including the actual PCI parent.
   `PcmDevice::capabilities` derives its format/rate/channel sets from PCM_INFO
