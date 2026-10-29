@@ -378,13 +378,12 @@ pub fn find_acm_interfaces(cfg: &[u8]) -> Option<AcmInterfaces> {
     let mut current_class: u8 = 0;
 
     // Close out the Data interface being walked, if it completed
-    // a bulk pair.
+    // a bulk pair. `take()` leaves `None` behind either way, so an
+    // incomplete pair is dropped without a further assignment.
     macro_rules! finish_data {
         () => {
             if let Some((num, Some(bi), Some(bo))) = cur_data.take() {
                 data_pairs.push((num, bi, bo));
-            } else {
-                cur_data = None;
             }
         };
     }
@@ -633,7 +632,8 @@ impl CdcAcmPort {
                 )
                 .await
         });
-        res.map_err(|_| CdcError::Transfer)
+        res.map_err(|_| CdcError::Transfer)?;
+        Ok(())
     }
 
     /// Send `SEND_BREAK` (PSTN 1.2 §6.3, request `0x23`):
@@ -662,7 +662,8 @@ impl CdcAcmPort {
                 )
                 .await
         });
-        res.map_err(|_| CdcError::Transfer)
+        res.map_err(|_| CdcError::Transfer)?;
+        Ok(())
     }
 
     /// Receive up to `buf.len()` bytes from the device's bulk-IN
