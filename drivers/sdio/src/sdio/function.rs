@@ -101,6 +101,23 @@ pub trait SdioFunction {
     fn set_block_size(&mut self, _func: u8, _size: u16) -> Result<(), SdioError> {
         Err(SdioError::Unsupported)
     }
+
+    /// Linux `sdio_claim_irq` for the functions in `functions` (bit N =
+    /// function N): enable the CCCR master and function interrupt bits and
+    /// host card-interrupt delivery, calling `notify` (wake only, hard-IRQ
+    /// context) on each card interrupt. `Ok(false)`: no interrupt line, the
+    /// caller keeps polling.
+    fn enable_card_interrupt(
+        &mut self,
+        _functions: u8,
+        _notify: alloc::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<bool, SdioError> {
+        Ok(false)
+    }
+
+    /// The owner serviced every function interrupt source; re-enable
+    /// delivery (Linux's SDIO IRQ thread re-enabling the card interrupt).
+    fn rearm_card_interrupt(&mut self) {}
 }
 
 /// Encode a CMD52 argument for a read and validate fields.

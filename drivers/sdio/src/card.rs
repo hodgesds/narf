@@ -59,6 +59,50 @@ pub struct FunctionInfo {
     pub enable_timeout_ms: u16,
 }
 
+/// A oneshot card-interrupt line attached by the platform: delivery masks it,
+/// [`InterruptLine::unmask`] re-enables it after service.
+pub trait InterruptLine: Send {
+    fn unmask(&self);
+}
+impl InterruptLine for narf_interrupts::oneshot::Line {
+    fn unmask(&self) {
+        narf_interrupts::oneshot::Line::unmask(self)
+    }
+}
+type Notify = alloc::sync::Arc<dyn Fn() + Send + Sync>;
+/// The function driver's wake, installed after the line is bound.
+pub struct Subscriber(narf_lib::sync::IrqSafeSpinLock<Option<Notify>>);
+impl Default for Subscriber {
+    fn default() -> Self {
+        Self(narf_lib::sync::IrqSafeSpinLock::new(None))
+    }
+}
+impl Subscriber {
+    /// Hard-IRQ half: wake the subscribed owner, if any.
+    pub fn notify(&self) {
+        if let Some(notify) = self.0.lock().as_ref() {
+            notify();
+        }
+    }
+    fn set(&self, notify: Notify) {
+        *self.0.lock() = Some(notify);
+    }
+}
+impl core::fmt::Debug for Subscriber {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SdioSubscriber").finish_non_exhaustive()
+    }
+}
+struct Interrupt {
+    line: alloc::boxed::Box<dyn InterruptLine>,
+    subscriber: alloc::sync::Arc<Subscriber>,
+}
+impl core::fmt::Debug for Interrupt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SdioInterrupt").finish_non_exhaustive()
+    }
+}
+
 /// Exclusively owns the controller and selected card. PIO copies finish
 /// before return; no task or device retains a caller's transfer buffer.
 #[derive(Debug)]
@@ -68,6 +112,9 @@ pub struct Card<R: Registers> {
     functions: [FunctionInfo; 8],
     block_sizes: [u16; 8],
     enabled: u8,
+    /// Platform card-interrupt line; dropped (masked) after the host's
+    /// signal enables are cleared.
+    interrupt: Option<Interrupt>,
 }
 impl<R: Registers> Drop for Card<R> {
     fn drop(&mut self) {
@@ -88,12 +135,31 @@ impl<R: Registers> Card<R> {
             functions: [FunctionInfo::default(); 8],
             block_sizes: [0; 8],
             enabled: 0,
+            interrupt: None,
         };
         card.start(config)?;
         Ok(card)
     }
     pub fn host(&self) -> &SdhciHost {
         &self.host
+    }
+    /// Attach the platform's oneshot line and the subscriber its hard half
+    /// notifies, after the registers let the function assert INTx. Delivery
+    /// stays off until a function driver claims it. `false` drops (masks)
+    /// the line and keeps polling.
+    pub fn attach_interrupt(
+        &mut self,
+        line: alloc::boxed::Box<dyn InterruptLine>,
+        subscriber: alloc::sync::Arc<Subscriber>,
+    ) -> bool {
+        if !self.controller.registers().enable_intx() {
+            return false;
+        }
+        self.interrupt = Some(Interrupt { line, subscriber });
+        true
+    }
+    pub fn has_interrupt(&self) -> bool {
+        self.interrupt.is_some()
     }
     pub fn host_identity(&self) -> Option<crate::pio::HostIdentity> {
         self.controller.host_identity()
@@ -518,6 +584,36 @@ impl<R: Registers> SdioFunction for Card<R> {
                 block_size: size,
             },
         )
+    }
+    fn enable_card_interrupt(&mut self, functions: u8, notify: Notify) -> Result<bool, SdioError> {
+        let Some(interrupt) = self.interrupt.as_ref() else {
+            return Ok(false);
+        };
+        // Bit 0 is the CCCR master enable, not a function.
+        let valid = ((1u16 << (self.host.func_count + 1)) - 2) as u8;
+        if functions == 0 || functions & !valid != 0 {
+            return Err(SdioError::BadFunction);
+        }
+        let subscriber = interrupt.subscriber.clone();
+        subscriber.set(notify);
+        // sdio_claim_irq -> sdio_card_irq_get: CCCR IENx | IENM.
+        let enabled = self.direct(false, 0, CCCR_INT_ENABLE, 0)?;
+        self.direct(true, 0, CCCR_INT_ENABLE, enabled | functions | 1)?;
+        // sdhci_enable_sdio_irq: card interrupt status and signal enable only.
+        let io = self.controller.registers();
+        let status = io.read32(INT_ENABLE);
+        io.write32(INT_ENABLE, status | INT_CARD_INT);
+        let signal = io.read32(SIGNAL_ENABLE);
+        io.write32(SIGNAL_ENABLE, signal | INT_CARD_INT);
+        if let Some(interrupt) = self.interrupt.as_ref() {
+            interrupt.line.unmask();
+        }
+        Ok(true)
+    }
+    fn rearm_card_interrupt(&mut self) {
+        if let Some(interrupt) = self.interrupt.as_ref() {
+            interrupt.line.unmask();
+        }
     }
     fn set_block_size(&mut self, func: u8, size: u16) -> Result<(), SdioError> {
         if func == 0 || func > self.host.func_count {

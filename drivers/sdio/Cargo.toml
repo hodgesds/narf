@@ -17,6 +17,7 @@ narf-capabilities = { path = "../../capabilities" }
 narf-io           = { path = "../../io" }
 narf-bus          = { path = "../../bus" }
 narf-interrupts   = { path = "../../interrupts" }
+narf-aml          = { path = "../../aml" }
 narf-memory       = { path = "../../memory" }
 narf-drivers      = { path = "../" }
 narf-driver-runtime = { path = "../runtime", default-features = false, features = ["kernel"] }

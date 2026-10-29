@@ -21,6 +21,8 @@ pub struct Mmio {
     device: BusDevice,
     gone: bool,
     identity: crate::pio::HostIdentity,
+    /// This owner bound the oneshot INTx line and cleared INTx-disable.
+    intx: bool,
 }
 impl core::fmt::Debug for Mmio {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -55,12 +57,10 @@ impl Mmio {
             self.gone = true;
             return None;
         }
+        let intx = self.intx;
         match invoke(&self.authority, || {
-            use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
             let command = narf_bus::pci::read_command(&self.authority, &self.device).ok()?;
-            if command == u16::MAX
-                || command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) != MEM_SPACE | INTX_DISABLE
-            {
+            if !command_live(command, intx) {
                 return None;
             }
             Some(operation(&self.region))
@@ -74,6 +74,26 @@ impl Mmio {
     }
 }
 impl Registers for Mmio {
+    fn enable_intx(&mut self) -> bool {
+        if self.gone || self.intx {
+            return false;
+        }
+        let cleared = invoke(&self.authority, || {
+            use narf_bus::pci::cmd::INTX_DISABLE;
+            narf_bus::pci::clear_command(&self.authority, &self.device, INTX_DISABLE).ok()?;
+            narf_bus::pci::read_command(&self.authority, &self.device).ok()
+        });
+        match cleared {
+            Ok(Some(command)) if command_live(command, true) => {
+                self.intx = true;
+                true
+            }
+            _ => {
+                self.gone = true;
+                false
+            }
+        }
+    }
     fn host_identity(&self) -> Option<crate::pio::HostIdentity> {
         Some(self.identity)
     }
@@ -159,6 +179,18 @@ fn release_claim(claims: &mut Vec<narf_bus::BusAddr>, address: narf_bus::BusAddr
         }
         None => false,
     }
+}
+
+/// Live owner command state: decode on, DMA off, and INTx-disable set
+/// unless this owner bound its oneshot INTx line (then it must be clear).
+fn command_live(command: u16, intx: bool) -> bool {
+    use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+    let expected = if intx {
+        MEM_SPACE
+    } else {
+        MEM_SPACE | INTX_DISABLE
+    };
+    command != u16::MAX && command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) == expected
 }
 
 /// Disable inherited DMA and decode before enabling the owned register
@@ -340,7 +372,11 @@ fn probe_claimed(
     })
     .map_err(|_| narf_bus::ProbeError::BadDevice)?
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
-    let card = match Card::initialize(
+    // Oneshot INTx for the card interrupt (x86_64 `_PRT`/IOAPIC), routed
+    // masked. INTx-disable is cleared only after the card initialized, so
+    // a failed probe leaves the function parked; polling is the fallback.
+    let interrupt = bind_intx(&device, &authority);
+    let mut card = match Card::initialize(
         Mmio {
             region,
             authority,
@@ -350,6 +386,7 @@ fn probe_claimed(
                 address: device.addr,
                 id: device.id,
             },
+            intx: false,
         },
         Config::default(),
     ) {
@@ -363,10 +400,59 @@ fn probe_claimed(
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Other.default_domain(),
     });
+    if let Some((line, subscriber)) = interrupt {
+        let _ = card.attach_interrupt(line, subscriber);
+    }
     if let Some(driver) = matching_driver(&card) {
         (driver.probe)(card);
     }
     Ok(())
+}
+
+type Bound = (
+    alloc::boxed::Box<dyn crate::card::InterruptLine>,
+    alloc::sync::Arc<crate::card::Subscriber>,
+);
+/// The host function's INTx pin routed through the root `_PRT` (as e1000 and
+/// xHCI do) to an exclusive GSI, bound as a masked oneshot line. A bridged
+/// function, a named link entry or a shared/live GSI keeps polling.
+#[cfg(target_arch = "x86_64")]
+fn bind_intx(device: &BusDevice, authority: &Cap<BusDeviceCap, Write>) -> Option<Bound> {
+    let pin = invoke(authority, || {
+        narf_bus::pci::read_intx_pin(authority, device)
+    })
+    .ok()?
+    .ok()?;
+    if !(1..=4).contains(&pin) {
+        return None;
+    }
+    let narf_bus::BusKind::Pcie { addr, .. } = device.kind else {
+        return None;
+    };
+    if addr.bus != 0 {
+        return None;
+    }
+    let route = narf_aml::irq_routing::route_for("\\_SB.PCI0", addr.device, pin - 1)?;
+    if route.entry.source.is_some() {
+        return None;
+    }
+    let subscriber = alloc::sync::Arc::new(crate::card::Subscriber::default());
+    let notified = subscriber.clone();
+    // SAFETY: MADT/IOAPIC initialization precedes PCI probe, and this probe
+    // exclusively owns the claimed host function whose pin routes here.
+    let line = unsafe {
+        narf_interrupts::oneshot::Line::bind_exclusive(
+            route.entry.source_index,
+            "sdhci-card",
+            alloc::sync::Arc::new(move || notified.notify()),
+        )
+    }
+    .ok()?;
+    Some((alloc::boxed::Box::new(line), subscriber))
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn bind_intx(_: &BusDevice, _: &Cap<BusDeviceCap, Write>) -> Option<Bound> {
+    None
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -409,6 +495,7 @@ mod tests {
             device,
             gone: false,
             identity,
+            intx: false,
         };
         let mut entered = false;
         if io
@@ -454,6 +541,16 @@ mod tests {
                 ]
         {
             return TestResult::Fail("PIO decode enabled before DMA/decode parking readback");
+        }
+        // Per-access liveness follows the owner's INTx binding exactly.
+        if !command_live(MEM_SPACE | INTX_DISABLE, false)
+            || command_live(MEM_SPACE, false)
+            || !command_live(MEM_SPACE, true)
+            || command_live(MEM_SPACE | INTX_DISABLE, true)
+            || command_live(MEM_SPACE | BUS_MASTER, true)
+            || command_live(u16::MAX, true)
+        {
+            return TestResult::Fail("MMIO liveness ignores the owner's INTx binding");
         }
         for stale in [BUS_MASTER | INTX_DISABLE, MEM_SPACE | INTX_DISABLE, 0] {
             let mut calls = 0;

@@ -88,6 +88,9 @@ impl Model {
     }
 }
 impl Registers for Model {
+    fn enable_intx(&mut self) -> bool {
+        true
+    }
     fn host_identity(&self) -> Option<crate::pio::HostIdentity> {
         self.1
     }
@@ -387,4 +390,77 @@ fn smoke_sdio_card_negotiates_four_bit_and_high_speed_like_linux() -> TestResult
 kernel_test_in!(
     "drivers/sdio/card",
     smoke_sdio_card_negotiates_four_bit_and_high_speed_like_linux
+);
+
+#[derive(Clone, Default)]
+struct FakeLine(alloc::sync::Arc<core::sync::atomic::AtomicU32>);
+impl crate::card::InterruptLine for FakeLine {
+    fn unmask(&self) {
+        self.0.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    }
+}
+fn smoke_sdio_card_interrupt_claim_enables_cccr_and_sdhci_like_linux() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    let model = Model::new();
+    let shared = model.0.clone();
+    let mut card = match Card::initialize(model, Config::default()) {
+        Ok(card) => card,
+        Err(_) => return TestResult::Fail("card initialization failed"),
+    };
+    // No platform line: claim reports polling and touches nothing.
+    if card.enable_card_interrupt(0b110, alloc::sync::Arc::new(|| {})) != Ok(false)
+        || shared.lock().common[CCCR_INT_ENABLE as usize] != 0
+    {
+        return TestResult::Fail("claim without a line changed the card");
+    }
+    let line = FakeLine::default();
+    let subscriber = alloc::sync::Arc::new(crate::card::Subscriber::default());
+    if !card.attach_interrupt(alloc::boxed::Box::new(line.clone()), subscriber.clone()) {
+        return TestResult::Fail("model registers refused INTx");
+    }
+    // Bit 0 is the master enable; function 3 does not exist on this card.
+    if card.enable_card_interrupt(0b1, alloc::sync::Arc::new(|| {})) != Err(SdioError::BadFunction)
+        || card.enable_card_interrupt(0b1000, alloc::sync::Arc::new(|| {}))
+            != Err(SdioError::BadFunction)
+    {
+        return TestResult::Fail("invalid function interrupt claim accepted");
+    }
+    static WAKES: AtomicU32 = AtomicU32::new(0);
+    let notify = alloc::sync::Arc::new(|| {
+        WAKES.fetch_add(1, Ordering::AcqRel);
+    });
+    if card.enable_card_interrupt(0b110, notify) != Ok(true) {
+        return TestResult::Fail("card interrupt claim failed");
+    }
+    {
+        let s = shared.lock();
+        // sdio_claim_irq: IENM | IEN1 | IEN2; sdhci_enable_sdio_irq.
+        if s.common[CCCR_INT_ENABLE as usize] != 0b111
+            || s.get32(INT_ENABLE) & INT_CARD_INT == 0
+            || s.get32(SIGNAL_ENABLE) != INT_CARD_INT
+        {
+            return TestResult::Fail("CCCR/SDHCI card-interrupt enables differ from Linux");
+        }
+    }
+    if line.0.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("claim did not unmask the line");
+    }
+    subscriber.notify();
+    if WAKES.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("line delivery did not reach the function driver");
+    }
+    card.rearm_card_interrupt();
+    if line.0.load(Ordering::Acquire) != 2 {
+        return TestResult::Fail("rearm did not unmask the line");
+    }
+    drop(card);
+    let s = shared.lock();
+    if s.get32(SIGNAL_ENABLE) != 0 || s.get32(INT_ENABLE) != 0 {
+        return TestResult::Fail("dropped card left interrupt signalling enabled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sdio/card",
+    smoke_sdio_card_interrupt_claim_enables_cccr_and_sdhci_like_linux
 );
