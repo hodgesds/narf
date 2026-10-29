@@ -45,6 +45,20 @@ pub(super) fn response(
     }
 }
 
+/// mac80211 `ieee80211_sta_wmm_params` for a beacon from the associated AP:
+/// `Some` only for a WMM Parameter element whose Parameter Set Count differs
+/// from the programmed set. An absent or unparsable element changes nothing
+/// (mac80211 sees no `wmm_param`); a new set this owner cannot serve (BE ACM)
+/// is refused like the association response.
+pub(super) fn beacon(current: Parameters, ies: &[u8]) -> Result<Option<Parameters>, Error> {
+    match Parameters::parse(ies) {
+        Ok(Some(parameters)) if parameters.parameter_set_count != current.parameter_set_count => {
+            admit(parameters).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
 pub(super) fn information() -> &'static [u8] {
     &INFORMATION
 }

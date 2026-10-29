@@ -1120,6 +1120,46 @@ functions, production hardware-channel selection, two scans with distinct
 IDs, stale/wrong-requestor responses, malformed beacons, management header
 variants, concurrent terminal HTT completion and dropped/failed ownership.
 
+**Beacon WMM updates** (closes `dynamic_wmm`). After association, a beacon
+from the associated BSS whose WMM Parameter element carries a different
+Parameter Set Count than the programmed set queues that set
+(`wmm::beacon`, mac80211 `ieee80211_sta_wmm_params`). An absent or
+unparsable element changes nothing; a new set with BE ACM is refused and
+closes the station, as the association response would. The Device worker's
+await point (`flush_station_management`, beside the protected-management
+flush) re-sends the per-dialect `WMI_PDEV_SET_WMM_PARAMS` command
+(`ath10k_conf_tx` for every AC), then updates the peer's parameters and ACM
+downgrade. Smoke: `smoke_ath10k_wmm_beacon_parameter_set_change_reprograms_contention`
+(all six dialects).
+
+**Beacon ERP protection** (closes `automatic_protection`). On 2.4 GHz, each
+beacon from the associated BSS yields mac80211's `use_cts_prot` (ERP element
+present with Use_Protection, `ieee80211_handle_bss_capability`). A value that
+differs from the programmed one is queued as `BSS_CHANGED_ERP_CTS_PROT`; the
+Device worker's await point then runs `set_station_protection` (Linux
+`ath10k_recalc_rtscts_prot` + `ath10k_mac_set_cts_prot`: RTS/CTS enable,
+`use_cts_prot`, RTS threshold), keeping the configured threshold (HT40 keeps
+its forced RTS). It waits for an open, reply-free data path instead of
+failing the owner. Linux `ath10k_bss_info_changed` handles no HT Operation
+protection change; a changed HT Operation still closes the station
+(`matches_beacon`). Smoke:
+`smoke_ath10k_beacon_erp_protection_reprograms_cts_all_six_dialects`.
+
+**TSPEC is inapplicable** (row removed 2026-10-28): ath10k never sets
+`NL80211_FEATURE_SUPPORTS_WMM_ADMISSION`, so `nl80211_add_tx_ts` refuses
+ADD_TX_TS and mac80211 never originates ADDTS; ACM ACs keep the
+`ieee80211_downgrade_queue` behaviour in `tx_qos.rs`. (Of the upstream
+wireless drivers only iwlwifi mvm/mld set that feature.)
+
+**Station U-APSD is not reachable upstream** (row folded into `ap`
+2026-10-28): mac80211 starts every station with
+`IEEE80211_DEFAULT_UAPSD_QUEUES` 0, no driver sets `hw.uapsd_queues`, and
+only the mac80211 debugfs `uapsd_queues` file changes it, so
+`IEEE80211_STA_UAPSD_ENABLED` is never set and `ath10k_conf_tx_uapsd` only
+ever programs U-APSD off. Every nl80211 U-APSD control
+(`NL80211_STA_WME_UAPSD_QUEUES`, `WIPHY_FLAG_AP_UAPSD`) is AP-side, which
+belongs to the `ap` row.
+
 ## 8. Remaining software and hardware acceptance
 
 The retained validation profile is calibrated BMI boot with a signed board

@@ -934,12 +934,15 @@ pub(crate) fn smoke_rtl8188ee_station_native_mailbox_pages_match_original_linux(
         || owner.packet.reserved.is_none()
         || port.radio.word(0x608) != super::super::super::packet_mac::RCR | 0xc0
         || port.radio.word(0x508) != 0xa41c
+        // rtl_op_add_interface station HW_VAR_RETRY_LIMIT (0x30 short/long).
+        || port.radio.read8(0x42a).unwrap() != 0x30
+        || port.radio.read8(0x42b).unwrap() != 0x30
         || port.radio.read8(0x102).unwrap() & 3 != 2
         || port.radio.word(0x6a8) & 0x3fff != 42
         || port.radio.read8(0x20a).unwrap() & 1 != 0
     {
         return TestResult::Fail(
-            "native EE reserved body/legacy timing/media/peer commit mismatch",
+            "native EE reserved body/legacy timing/retry/media/peer commit mismatch",
         );
     }
     if run(owner.disconnect_station_peer()).is_err() {

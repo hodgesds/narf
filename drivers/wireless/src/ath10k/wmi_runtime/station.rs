@@ -101,7 +101,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) fn vht_capabilities(&self) -> Option<[u8; 12]> {
         self.htt.wmi.caps.as_ref().and_then(ht::vht_capability)
     }
-    async fn send_station_command(
+    pub(super) async fn send_station_command(
         &mut self,
         command: &[u8],
         validate: &impl Fn() -> Result<(), Error>,

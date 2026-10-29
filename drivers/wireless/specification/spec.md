@@ -135,8 +135,8 @@ RTL8188EE live EDCA; rtw88 channel1 active scan with extra probe IEs. AR2427 and
 Intel Qu PCI identities are also admitted. Family specs carry the evidence.
 
 **Recount 2026-10-28** (ledger after the round-5 merges, PR#1195): the
-[inventory](../research/remaining-features.tsv) now holds **153 `feature`**
-rows (152 driver, 1 `shared`), **35 `chip`** and **1 `unknown`**; the table
+[inventory](../research/remaining-features.tsv) now holds **148 `feature`**
+rows (147 driver, 1 `shared`), **35 `chip`** and **1 `unknown`**; the table
 below counts `feature` rows per family. This recount also removes two rows as
 inapplicable: ath9k `tx_amsdu` (Linux ath9k never sets
 `IEEE80211_HW_TX_AMSDU`; `ath9k.md`) and shared `glk_membership_selector`
@@ -154,9 +154,9 @@ inapplicable or folded into chip rows, and `uapsd` narrowed to AP-side
 | iwlwifi | 18 | Gen2 active probes, broader rejoin/key history, PMF/richer PHY/QoS/BA/TX LDPC/STBC/recovery; remaining Gen3 command profiles and unlisted PCI IDs; 6 GHz/HE/EHT, additional roles, checksum/scheduled-scan offload, RX/RSS and system PM |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles; device-tree board variants and aarch64 composition |
 | mt76 | 13 | Associated/off-channel and richer scans, 6 GHz/HE and broader VHT beyond the retained20/40/80/actual7922-160 profile, richer TX/RX BA and TX A-MSDU, PMF/WPA3, TX fragmentation, QoS beyond BE/TID0 and U-APSD/TSPEC, PM/removal/reprobe, IOMMU/non-coherent DMA and loadable packet ABI |
-| ath10k | 23 | Broader HT40 pairs/bands, multiple streams/VHT/TX aggregation and richer RX profiles, PFC, alternate calibration sources, associated/off-channel scanning, IRQ operation, automatic/stable-interface recovery, DMA reclamation and host-bus/system PM |
+| ath10k | 19 | Broader HT40 pairs/bands, multiple streams/VHT/TX aggregation and richer RX profiles, PFC, alternate calibration sources, associated/off-channel scanning, IRQ operation, automatic/stable-interface recovery, DMA reclamation and host-bus/system PM |
 | ath9k | 10 | Other chip/EEPROM/descriptor variants, channel retune, periodic calibration, HT/BA/aggregation and richer rates, IRQs, reset/rejoin, removal and PM |
-| rtlwifi | 18 | Other matched chips; wider channel/rate profiles, IRQ/C2H expansion, multiple radios, reset/recovery, removal and suspend |
+| rtlwifi | 17 | Other matched chips; wider channel/rate profiles, IRQ/C2H expansion, multiple radios, reset/recovery, removal and suspend |
 | rtl8xxxu | 9 | Other matched USB chips, SGI20/HT40 and wider channels/rates, RX/TX A-MPDU, TX A-MSDU, both BA directions and RX reorder, coexistence, EP0/halted reset, safe rejoin, FIFO retune and PM |
 | rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
 | rtw89 | 14 | Other AX/BE profiles and BE transport/EFUSE, wider PHY/channel/rate/role/security profiles, periodic RF tracking, IRQs, reset/rejoin/removal/suspend and multiple functions |
