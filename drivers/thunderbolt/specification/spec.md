@@ -340,3 +340,17 @@ Detect state, and a runtime PCI rescan of the NHI's companion bridge so
 tunnelled devices enumerate without a reboot (the CM publishes tunnels;
 registering newly appeared PCI devices is a bus-subsystem surface).
 AMD source encoder setup, firmware loading and link training belong to GPU.
+Composed-fixture boundary (issue #1098, `dock_tests`): the end-to-end
+dock scenario composes every stage this CM owns — ICM gate,
+enumeration with retimer chains, the retimer NVM path, USB3 + DP +
+PCIe tunnels under the full `_OSC` grant, the device-PM
+suspend/replay cycle, XDomain discovery/login/Ethernet, and the
+logged-in-link suspend veto. Two stages of the dock story live in
+other crates and have no in-tree composition seam — no crate may
+host a test that drives both sides — so the fixture asserts them at
+the CM's observable edge instead of faking them: the USB PD contract
+(usbpd/TCPM) appears here as PHY link training (an untrained fabric
+enumerates as no fabric and programs nothing), and the USB
+class-device cascade (drivers/usb) consumes tunnel publication,
+which §3 defines as the handoff surface. A fixture-composition seam
+for those two stages is tracked in the issue filed from #1098.

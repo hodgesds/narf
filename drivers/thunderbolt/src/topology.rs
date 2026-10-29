@@ -213,7 +213,7 @@ async fn router(
         ports,
     })
 }
-async fn scan(
+pub(crate) async fn scan(
     ctl: &mut impl Config,
     id: u32,
     controls: u32,
