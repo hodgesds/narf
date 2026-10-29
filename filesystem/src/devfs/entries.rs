@@ -203,19 +203,6 @@ pub(super) const ENTRIES: &[Entry] = &[
         visible: || true,
     },
     Entry {
-        name: "fp0",
-        file_type: FileType::Special,
-        file: || {
-            if FP_NODE.lock().is_some() {
-                Some(Arc::new(DevFp))
-            } else {
-                None
-            }
-        },
-        directory: || None,
-        visible: || FP_NODE.lock().is_some(),
-    },
-    Entry {
         name: "fb0",
         file_type: FileType::Special,
         file: || {

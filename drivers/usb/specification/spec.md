@@ -171,6 +171,49 @@ also consult upstream Linux GPL sources.
   direction bit set; `Xhci::control_out` accepts only host-to-device requests.
   Payload-bearing class requests (including HID `SET_REPORT`) must use the
   matching method so the xHCI Data Stage has the correct direction.
+- Fingerprint readers publish one `/dev/fp<N>` node per bound reader
+  through the devfs provider registry (`fingerprint::lookup_fp` /
+  `enumerate_fp`, installed by the `usb-fp-devfs` initcall). The
+  node index is the `FP_DEVICES` registry index: the first bound
+  reader is `fp0`, the second `fp1`, and so on; lookup and
+  enumeration agree by construction, so readdir never advertises a
+  phantom node. There is no static `fp0` entry and no separate
+  node global anymore (#920).
+- The `/dev/fp<N>` control surface is two NARF-local ioctls
+  (Linux `_IOC` encoding, type `'P'`, 0x50):
+  `FP_IOC_CTRL_TRANSFER` (nr 0) issues one EP0 vendor control
+  transfer, and `FP_IOC_GET_INFO` (nr 1) returns a packed `u64`
+  (slot id bits 0..8, vendor code bits 8..16 — Synaptics 0, Goodix
+  1, ELAN 2 — IN DCI bits 16..24, OUT DCI bits 24..32) so a daemon
+  enumerating nodes can tell readers apart. The control-transfer
+  argument is a 24-byte little-endian struct: `bm_request_type`
+  `[0]`, `b_request` `[1]`, `w_value` `[2..4]`, `w_index`
+  `[4..6]`, `data_len` `[8..12]` (in: requested length; out:
+  actual length), `data_ptr` `[16..24]` (userspace buffer).
+  Only vendor-type requests to the device recipient are issuable:
+  standard requests (including `SET_CONFIGURATION` /
+  `SET_INTERFACE`, which the driver owns) and class or
+  other-recipient requests are rejected before any transfer, and
+  `data_len` is capped at 4096 (the xHCI control data-stage cap).
+  IN short reads are normal and return the actual count (also
+  written back into `data_len`); OUT short transfers are errors,
+  mirroring `send_command`'s full-transfer rule. A zero-length
+  transfer has no data stage, so `data_ptr` is never dereferenced
+  for one. The synchronous `ioctl` stays `Unsupported`: control
+  transfers await USB transfers, so only the async `ioctl_user`
+  dispatches them.
+- Opening a `/dev/fp<N>` node requires the caller to hold
+  `CAP_SYS_RAWIO` (Linux capability 17), checked in
+  `open_instance_checked` after DAC checks, for reads as well as
+  writes: reads return biometric images and writes issue sensor
+  commands. The check fails closed while userspace has not
+  installed the capability hook. The capability choice is a
+  design decision, not a spec claim: no Linux capability names
+  fingerprint sensors, and the raw sensor command channel is
+  raw-hardware access. (Merge interaction: #1237's WBDI bridge
+  registers `fp0` via the deleted `register_fp` API and must
+  rebase onto the provider — its first device then gets `fp0`
+  automatically.)
 - `Xhci::get_device_descriptor(slot_id)` first reads the mandatory 8-byte
   descriptor prefix, validates and applies `bMaxPacketSize0` through Evaluate
   Context, then returns only a complete 18-byte Device Descriptor. Callers may
