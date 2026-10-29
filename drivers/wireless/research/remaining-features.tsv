@@ -47,7 +47,6 @@ brcmfmac	additional_chip_profiles	Additional CPU/RAM/chip/OTP profiles (incl. 16
 brcmfmac	ap_mode	Access Point mode	feature	drivers/wireless/specification/cyw43439.md	519
 brcmfmac	confirmed_stop_quiescence	Confirmed transport/device stop and quiescence (CYW43439 SDIO only; BCM43602 PCIe closed in brcmfmac.md: SDIO needs a host WL_REG_ON/card power cycle)	feature	drivers/wireless/specification/cyw43439.md	515
 brcmfmac	gtk_rekey_offload	GTK rekey offload (gtk_key_info; needs host-supplicant KCK/KEK + WOWL_GTK)	feature	drivers/wireless/specification/cyw43439.md	518
-brcmfmac	host_bus_runtime_pm	Host-bus runtime power management	feature	drivers/wireless/specification/cyw43439.md	517
 brcmfmac	iommu_quiescence	IOMMU-backed device quiescence	feature	drivers/wireless/specification/cyw43439.md	516
 brcmfmac	monitor_mode	Monitor mode (incl. native 802.11 msgbuf RX with radiotap/HW RX-header metadata)	feature	drivers/wireless/specification/cyw43439.md	519
 brcmfmac	nonzero_descriptor_prefix	Nonzero native descriptor-prefix geometry	feature	drivers/wireless/specification/cyw43439.md	521
@@ -61,7 +60,7 @@ cyw43439	additional_host_ports	Additional SDIO/gSPI platform or host ports	chip	
 cyw43439	ap_mode	Access Point mode	feature	drivers/wireless/specification/cyw43439.md	519
 cyw43439	confirmed_stop_quiescence	Confirmed transport/device stop and quiescence	feature	drivers/wireless/specification/cyw43439.md	515
 cyw43439	gtk_rekey_offload	GTK rekey offload (gtk_key_info; needs host-supplicant KCK/KEK + WOWL_GTK)	feature	drivers/wireless/specification/cyw43439.md	518
-cyw43439	host_bus_runtime_pm	Host-bus runtime power management	feature	drivers/wireless/specification/cyw43439.md	517
+cyw43439	sdio_idle_sleep	Idle dongle sleep on the SDIO bus (brcmf_sdio_bus_watchdog idletime -> brcmf_sdio_bus_sleep: KSO clear on save-restore chips, clock request drop otherwise; wake before every bus access); host runtime PM itself is inapplicable (brcmf_sdiod_host_fixup pm_runtime_forbid)	feature	drivers/wireless/specification/cyw43439.md	517
 cyw43439	monitor_mode	Monitor mode	feature	drivers/wireless/specification/cyw43439.md	519
 cyw43439	p2p_mode	P2P mode	feature	drivers/wireless/specification/cyw43439.md	519
 cyw43439	post_reset_rejoin	Rejoin after native reset	feature	drivers/wireless/specification/cyw43439.md	515
