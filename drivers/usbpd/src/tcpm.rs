@@ -194,6 +194,21 @@ impl SourcePort {
         *self.contract.lock()
     }
 
+    /// Return the port to its freshly-constructed state: `Startup`
+    /// (whose first step re-runs the power-on clearing), pending
+    /// requests and any contract dropped, message counter reset.
+    /// `TcpmPort` calls this when it observes a detach so a later
+    /// re-attach re-offers capabilities and negotiates fresh
+    /// instead of reporting the previous partner's contract as
+    /// live (#1193).
+    pub fn reset(&self) {
+        *self.pending_request.lock() = None;
+        *self.pending_pps_request.lock() = None;
+        *self.contract.lock() = None;
+        self.next_msg_id.store(0, Ordering::Release);
+        self.set_state(SourceState::Startup);
+    }
+
     /// True when this port is currently the DFP (Downstream-Facing
     /// Port = USB host). Flips on every successful DR_Swap.
     pub fn is_dfp(&self) -> bool {
@@ -875,6 +890,10 @@ impl TcpmPort {
             }
             PortState::AttachedSnk => {
                 if !cc.attached() {
+                    // Detach (#1193): reset the sink engine so the
+                    // previous partner's contract stops reading as
+                    // live and a re-attach renegotiates fresh.
+                    self.sink.reset();
                     self.set_state(PortState::Unattached);
                     return Ok(PortStepOutcome::Advanced(PortState::Unattached));
                 }
@@ -887,6 +906,9 @@ impl TcpmPort {
             }
             PortState::AttachedSrc => {
                 if !cc.attached() {
+                    // Detach (#1193): reset the source engine, the
+                    // mirror of the AttachedSnk branch above.
+                    self.source.reset();
                     self.set_state(PortState::Unattached);
                     return Ok(PortStepOutcome::Advanced(PortState::Unattached));
                 }
@@ -919,7 +941,12 @@ impl TcpmPort {
             }
             PortState::ErrorRecovery => {
                 // §8.3.3.7: drop the rail and re-enter Unattached.
+                // The engines reset too (#1193): error recovery can
+                // be entered from an attached state, and the same
+                // stale-contract argument applies.
                 let _ = self.tcpc.hard_reset();
+                self.sink.reset();
+                self.source.reset();
                 self.set_state(PortState::Unattached);
                 Ok(PortStepOutcome::Advanced(PortState::Unattached))
             }

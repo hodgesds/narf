@@ -134,6 +134,19 @@ impl SinkPort {
         *self.contract.lock()
     }
 
+    /// Return the port to its freshly-constructed state:
+    /// `Unattached`, received capabilities and any contract dropped,
+    /// message counter reset. A driving task that observes a detach
+    /// (CC lost) calls this so a later re-attach runs a fresh
+    /// negotiation instead of reporting the previous partner's
+    /// contract as live (#1193).
+    pub fn reset(&self) {
+        *self.last_source_caps.lock() = Vec::new();
+        *self.contract.lock() = None;
+        self.next_msg_id.store(0, Ordering::Release);
+        self.set_state(SinkState::Unattached);
+    }
+
     /// Run one step of the sink state machine. Caller should arm
     /// this from a timer or TCPC interrupt — the state machine
     /// pulls one event per call.
