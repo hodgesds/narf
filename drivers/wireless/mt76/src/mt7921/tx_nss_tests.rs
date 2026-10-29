@@ -539,3 +539,70 @@ kernel_test_in!(
     "drivers/wireless/mt7921/nss",
     mt76_typed_ht_native_cck_band_and_metadata_bounds_precede_ccmp_pn
 );
+
+/// Set the AP's HT RX STBC (bits 8..9) and VHT RXSTBC (bits 8..10) to one
+/// stream in every capability element.
+fn peer_rx_stbc(b: &mut [u8]) {
+    let mut o = 0;
+    while o + 4 <= b.len() {
+        if matches!(b[o], 45 | 191) {
+            b[o + 3] = (b[o + 3] & !7) | 1;
+        }
+        o += 2 + usize::from(b[o + 1]);
+    }
+}
+
+fn mt76_tx_stbc_follows_stream_count_and_peer_rx_stbc_into_sta_records() -> TestResult {
+    for nss in [1, 2] {
+        for mode in [Mode::Ht20, Mode::Vht(2)] {
+            for peer in [false, true] {
+                let (mut s, mut b, p) = prepared(mode, nss, false);
+                let State::RadioReady(info) = s.state else {
+                    unreachable!()
+                };
+                // mt76_init_stream_cap: TX_STBC (HT bit7) / TXSTBC (VHT bit7)
+                // exactly when more than one TX stream exists.
+                let local_ht = crate::mt7921::vht::ht_capability(info);
+                if (local_ht[0] & 0x80 != 0) != (nss == 2)
+                    || crate::mt7921::vht::capability(info)
+                        .is_some_and(|vht| (vht[0] & 0x80 != 0) != (nss == 2))
+                {
+                    return TestResult::Fail("local TX STBC advertisement ignores TX streams");
+                }
+                if peer {
+                    peer_rx_stbc(&mut b.information_elements);
+                    if let Some(reply) = s.backend.ht_reply.as_mut() {
+                        peer_rx_stbc(reply);
+                    }
+                    if let Some(reply) = s.backend.vht_reply.as_mut() {
+                        peer_rx_stbc(reply);
+                    }
+                }
+                if join(&mut s, &b, p, false) != Ok(42) {
+                    return TestResult::Fail("TX STBC fixture association");
+                }
+                let record = associated(&s);
+                let expected = nss == 2 && peer;
+                let ht = vht_tests::record(record, 9).unwrap();
+                if (u16::from_le_bytes([ht[4], ht[5]]) & 0x0300 == 0x0100) != expected
+                    || u16::from_le_bytes([ht[4], ht[5]]) & 0x0300 & !0x0100 != 0
+                    || s.ht20_profile.unwrap().transmit_stbc() != expected
+                {
+                    return TestResult::Fail("STA_REC_HT RX STBC not masked by local TX STBC");
+                }
+                if matches!(mode, Mode::Vht(_)) {
+                    let vht = vht_tests::record(record, 10).unwrap();
+                    let cap = u32::from_le_bytes(vht[4..8].try_into().unwrap());
+                    if (cap & 0x0700 == 0x0100) != expected || cap & 0x0700 & !0x0100 != 0 {
+                        return TestResult::Fail("STA_REC_VHT RXSTBC not masked by local TXSTBC");
+                    }
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/nss",
+    mt76_tx_stbc_follows_stream_count_and_peer_rx_stbc_into_sta_records
+);

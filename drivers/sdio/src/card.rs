@@ -18,14 +18,22 @@ const MAX_CIS_BYTES: u32 = 1024;
 pub struct Config {
     /// Platform has a soldered card and no valid card-detect input.
     pub non_removable: bool,
-    /// Upper bound; this profile never exceeds legacy 25 MHz/1-bit.
+    /// Board clock ceiling. Legacy timing stays at or below 25 MHz;
+    /// negotiated SDIO high speed raises the card limit to 50 MHz.
     pub max_clock_hz: u32,
+    /// Board wiring permits a 4-bit data bus (sdhci-pci `MMC_CAP_4_BIT_DATA`).
+    pub four_bit: bool,
+    /// Board permits SD high-speed timing (`MMC_CAP_SD_HIGHSPEED`, still
+    /// gated by the controller's `CAN_DO_HISPD` capability).
+    pub high_speed: bool,
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
             non_removable: false,
             max_clock_hz: 25_000_000,
+            four_bit: true,
+            high_speed: true,
         }
     }
 }
@@ -51,6 +59,50 @@ pub struct FunctionInfo {
     pub enable_timeout_ms: u16,
 }
 
+/// A oneshot card-interrupt line attached by the platform: delivery masks it,
+/// [`InterruptLine::unmask`] re-enables it after service.
+pub trait InterruptLine: Send {
+    fn unmask(&self);
+}
+impl InterruptLine for narf_interrupts::oneshot::Line {
+    fn unmask(&self) {
+        narf_interrupts::oneshot::Line::unmask(self)
+    }
+}
+type Notify = alloc::sync::Arc<dyn Fn() + Send + Sync>;
+/// The function driver's wake, installed after the line is bound.
+pub struct Subscriber(narf_lib::sync::IrqSafeSpinLock<Option<Notify>>);
+impl Default for Subscriber {
+    fn default() -> Self {
+        Self(narf_lib::sync::IrqSafeSpinLock::new(None))
+    }
+}
+impl Subscriber {
+    /// Hard-IRQ half: wake the subscribed owner, if any.
+    pub fn notify(&self) {
+        if let Some(notify) = self.0.lock().as_ref() {
+            notify();
+        }
+    }
+    fn set(&self, notify: Notify) {
+        *self.0.lock() = Some(notify);
+    }
+}
+impl core::fmt::Debug for Subscriber {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SdioSubscriber").finish_non_exhaustive()
+    }
+}
+struct Interrupt {
+    line: alloc::boxed::Box<dyn InterruptLine>,
+    subscriber: alloc::sync::Arc<Subscriber>,
+}
+impl core::fmt::Debug for Interrupt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SdioInterrupt").finish_non_exhaustive()
+    }
+}
+
 /// Exclusively owns the controller and selected card. PIO copies finish
 /// before return; no task or device retains a caller's transfer buffer.
 #[derive(Debug)]
@@ -60,6 +112,9 @@ pub struct Card<R: Registers> {
     functions: [FunctionInfo; 8],
     block_sizes: [u16; 8],
     enabled: u8,
+    /// Platform card-interrupt line; dropped (masked) after the host's
+    /// signal enables are cleared.
+    interrupt: Option<Interrupt>,
 }
 impl<R: Registers> Drop for Card<R> {
     fn drop(&mut self) {
@@ -80,12 +135,31 @@ impl<R: Registers> Card<R> {
             functions: [FunctionInfo::default(); 8],
             block_sizes: [0; 8],
             enabled: 0,
+            interrupt: None,
         };
         card.start(config)?;
         Ok(card)
     }
     pub fn host(&self) -> &SdhciHost {
         &self.host
+    }
+    /// Attach the platform's oneshot line and the subscriber its hard half
+    /// notifies, after the registers let the function assert INTx. Delivery
+    /// stays off until a function driver claims it. `false` drops (masks)
+    /// the line and keeps polling.
+    pub fn attach_interrupt(
+        &mut self,
+        line: alloc::boxed::Box<dyn InterruptLine>,
+        subscriber: alloc::sync::Arc<Subscriber>,
+    ) -> bool {
+        if !self.controller.registers().enable_intx() {
+            return false;
+        }
+        self.interrupt = Some(Interrupt { line, subscriber });
+        true
+    }
+    pub fn has_interrupt(&self) -> bool {
+        self.interrupt.is_some()
     }
     pub fn host_identity(&self) -> Option<crate::pio::HostIdentity> {
         self.controller.host_identity()
@@ -236,7 +310,53 @@ impl<R: Registers> Card<R> {
             }
             self.functions[function as usize] = info;
         }
-        self.set_clock(config.max_clock_hz.min(25_000_000).min(max_rate))?;
+        // mmc_sdio_init_card after the CIS: sdio_read_cccr capability bits,
+        // sdio_enable_hs, mmc_sdio_get_max_clock, sdio_enable_4bit_bus.
+        let capability = self
+            .direct(false, 0, CCCR_CARD_CAPABILITY, 0)
+            .map_err(|_| Error::Response)?;
+        let mut high_speed = false;
+        if config.high_speed
+            && self.host.can_do_hispeed()
+            && revision & SDIO_REV_MASK >= SDIO_REV_1_20
+        {
+            let speed = self
+                .direct(false, 0, CCCR_HIGH_SPEED, 0)
+                .map_err(|_| Error::Response)?;
+            if speed & HIGH_SPEED_SHS != 0 {
+                self.direct(true, 0, CCCR_HIGH_SPEED, speed | HIGH_SPEED_EHS)
+                    .map_err(|_| Error::Response)?;
+                let io = self.controller.registers();
+                let control = io.read8(HOST_CONTROL);
+                io.write8(HOST_CONTROL, control | CTRL_HISPD);
+                high_speed = true;
+            }
+        }
+        // High speed makes 50 MHz mandatory; legacy timing keeps the CIS rate.
+        let card_limit = if high_speed {
+            50_000_000
+        } else {
+            max_rate.min(25_000_000)
+        };
+        self.set_clock(config.max_clock_hz.min(card_limit))?;
+        // sdio_enable_wide: not for a low-speed card without 4BLS.
+        if config.four_bit && (capability & CARD_CAP_LSC == 0 || capability & CARD_CAP_4BLS != 0) {
+            let ctrl = self
+                .direct(false, 0, CCCR_BUS_IFACE, 0)
+                .map_err(|_| Error::Response)?;
+            self.direct(
+                true,
+                0,
+                CCCR_BUS_IFACE,
+                (ctrl & !BUS_IFACE_BW_MASK) | BUS_IFACE_BW_4BIT,
+            )
+            .map_err(|_| Error::Response)?;
+            let io = self.controller.registers();
+            let control = io.read8(HOST_CONTROL);
+            io.write8(HOST_CONTROL, control | CTRL_4BITBUS);
+            self.host.bus_width = 4;
+        }
+        self.host.high_speed = high_speed;
         Ok(())
     }
     fn direct(&mut self, write: bool, func: u8, addr: u32, value: u8) -> Result<u8, SdioError> {
@@ -464,6 +584,36 @@ impl<R: Registers> SdioFunction for Card<R> {
                 block_size: size,
             },
         )
+    }
+    fn enable_card_interrupt(&mut self, functions: u8, notify: Notify) -> Result<bool, SdioError> {
+        let Some(interrupt) = self.interrupt.as_ref() else {
+            return Ok(false);
+        };
+        // Bit 0 is the CCCR master enable, not a function.
+        let valid = ((1u16 << (self.host.func_count + 1)) - 2) as u8;
+        if functions == 0 || functions & !valid != 0 {
+            return Err(SdioError::BadFunction);
+        }
+        let subscriber = interrupt.subscriber.clone();
+        subscriber.set(notify);
+        // sdio_claim_irq -> sdio_card_irq_get: CCCR IENx | IENM.
+        let enabled = self.direct(false, 0, CCCR_INT_ENABLE, 0)?;
+        self.direct(true, 0, CCCR_INT_ENABLE, enabled | functions | 1)?;
+        // sdhci_enable_sdio_irq: card interrupt status and signal enable only.
+        let io = self.controller.registers();
+        let status = io.read32(INT_ENABLE);
+        io.write32(INT_ENABLE, status | INT_CARD_INT);
+        let signal = io.read32(SIGNAL_ENABLE);
+        io.write32(SIGNAL_ENABLE, signal | INT_CARD_INT);
+        if let Some(interrupt) = self.interrupt.as_ref() {
+            interrupt.line.unmask();
+        }
+        Ok(true)
+    }
+    fn rearm_card_interrupt(&mut self) {
+        if let Some(interrupt) = self.interrupt.as_ref() {
+            interrupt.line.unmask();
+        }
     }
     fn set_block_size(&mut self, func: u8, size: u16) -> Result<(), SdioError> {
         if func == 0 || func > self.host.func_count {

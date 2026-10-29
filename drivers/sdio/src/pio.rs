@@ -40,6 +40,11 @@ pub trait Registers {
     fn write8(&mut self, offset: u32, value: u8);
     fn write16(&mut self, offset: u32, value: u16);
     fn write32(&mut self, offset: u32, value: u32);
+    /// Let the function assert legacy INTx (clear PCI INTx-disable) once a
+    /// oneshot line is bound. `false`: the platform cannot; keep polling.
+    fn enable_intx(&mut self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

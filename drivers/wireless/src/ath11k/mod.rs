@@ -44,12 +44,17 @@
 
 extern crate alloc;
 
+pub mod ahb;
+pub mod ahb_hif;
+pub mod ahb_live;
+pub mod ahb_probe;
 pub mod autoconnect;
 pub mod board;
 pub mod ce;
 pub mod core;
 pub mod dp;
 pub mod dp_frag;
+pub mod dp_group_pn;
 pub mod dp_peer;
 pub mod dp_ring;
 pub mod fw;
@@ -58,6 +63,7 @@ pub mod hal;
 pub mod htc;
 pub mod htt;
 pub mod hw;
+pub mod hw_ops;
 pub mod iface;
 pub mod ipq8074;
 pub mod mac;
@@ -68,10 +74,12 @@ pub mod mhi;
 pub mod mhi_host;
 pub mod pci;
 pub mod power;
+pub mod qcn9074;
 pub mod qmi;
 pub mod qmi_client;
 pub mod qmi_wlfw;
 pub mod qrtr;
+pub mod qrtr_glink;
 pub mod runtime;
 pub mod rx_descriptor;
 pub mod tx_hdr;
@@ -92,6 +100,7 @@ pub use pci::{probe, register_pci_driver, Ath11kDevice, ProbeError};
 /// `drivers/wireless/src/lib.rs`).
 pub fn register() {
     register_pci_driver();
+    ahb_probe::register_dt_driver();
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -105,6 +114,8 @@ pub mod dp_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod fw_tests;
 #[cfg(any(test, feature = "kernel-test"))]
+pub mod group_pn_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 pub mod hal_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod htt_tests;
@@ -114,6 +125,8 @@ pub mod integration_tests;
 pub mod mac_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod mhi_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+pub mod multi_pdev_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod qmi_handshake_tests;
 #[cfg(any(test, feature = "kernel-test"))]

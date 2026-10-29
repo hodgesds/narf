@@ -160,6 +160,20 @@ pub fn build_nonce(priority: u8, mgmt: bool, a2: &[u8; 6], pn: u64) -> [u8; CCMP
 /// CCMP header / frame body). Returns the AAD (length 22..=30
 /// depending on Address4 / QoS presence).
 pub fn build_aad(mac_header: &[u8]) -> Vec<u8> {
+    build_aad_inner(mac_header, false)
+}
+
+/// `build_aad` for a pairwise association that negotiated SPP A-MSDU
+/// (both RSNEs set RSN Capabilities bit10, IEEE802.11-2020 9.4.2.24.4).
+/// Then 12.5.3.3.3 keeps the QoS Control A-MSDU Present bit (bit7) in the
+/// AAD alongside the TID, as Linux mac80211/wpa.c::ccmp_gcmp_aad does with
+/// `spp_amsdu`. Frames without A-MSDU Present produce the same AAD as
+/// `build_aad`.
+pub fn build_aad_spp_amsdu(mac_header: &[u8]) -> Vec<u8> {
+    build_aad_inner(mac_header, true)
+}
+
+fn build_aad_inner(mac_header: &[u8], spp_amsdu: bool) -> Vec<u8> {
     if mac_header.len() < 24 {
         return Vec::new();
     }
@@ -202,7 +216,8 @@ pub fn build_aad(mac_header: &[u8]) -> Vec<u8> {
     // Type=Data (FC[0] bits 2..3 == 0b10) and bit 7 of FC[0] is the
     // QoS-data subtype indicator (subtype 0x8..=0xF for QoS data).
     if qos && mac_header.len() >= header_offset + 2 {
-        let qos_lo = mac_header[header_offset] & 0x0F; // TID
+        let mask = if spp_amsdu { 0x8F } else { 0x0F };
+        let qos_lo = mac_header[header_offset] & mask; // TID (+ SPP A-MSDU Present)
         out.push(qos_lo);
         out.push(0);
     }
@@ -256,9 +271,42 @@ pub fn protect(
     mgmt: bool,
     body: &mut [u8],
 ) -> Result<Vec<u8>, CcmpError> {
+    protect_inner(
+        aes, mac_header, key, pn, key_id, priority, mgmt, false, body,
+    )
+}
+
+/// `protect` for a DATA frame of an SPP A-MSDU association; the AAD comes
+/// from `build_aad_spp_amsdu`.
+pub fn protect_spp_amsdu(
+    aes: &dyn AesCcm,
+    mac_header: &[u8],
+    key: &[u8; 16],
+    pn: u64,
+    key_id: u8,
+    priority: u8,
+    body: &mut [u8],
+) -> Result<Vec<u8>, CcmpError> {
+    protect_inner(
+        aes, mac_header, key, pn, key_id, priority, false, true, body,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // `protect` plus the SPP AAD selector
+fn protect_inner(
+    aes: &dyn AesCcm,
+    mac_header: &[u8],
+    key: &[u8; 16],
+    pn: u64,
+    key_id: u8,
+    priority: u8,
+    mgmt: bool,
+    spp_amsdu: bool,
+    body: &mut [u8],
+) -> Result<Vec<u8>, CcmpError> {
     let hdr = build_ccmp_header(pn, key_id);
     let nonce = build_nonce(priority, mgmt, mac_header_a2(mac_header), pn);
-    let aad = build_aad(mac_header);
+    let aad = build_aad_inner(mac_header, spp_amsdu);
     let mic = aes.encrypt(key, &nonce, &aad, body)?;
     let mut out = Vec::with_capacity(CCMP_HDR_LEN + body.len() + CCMP_MIC_LEN);
     out.extend_from_slice(&hdr);
@@ -282,6 +330,36 @@ pub fn unprotect(
     replay: &mut ReplayWindow,
     protected: &mut [u8],
 ) -> Result<Vec<u8>, CcmpError> {
+    unprotect_inner(
+        aes, mac_header, key, priority, mgmt, false, replay, protected,
+    )
+}
+
+/// `unprotect` for a DATA frame of an SPP A-MSDU association.
+pub fn unprotect_spp_amsdu(
+    aes: &dyn AesCcm,
+    mac_header: &[u8],
+    key: &[u8; 16],
+    priority: u8,
+    replay: &mut ReplayWindow,
+    protected: &mut [u8],
+) -> Result<Vec<u8>, CcmpError> {
+    unprotect_inner(
+        aes, mac_header, key, priority, false, true, replay, protected,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // `unprotect` plus the SPP AAD selector
+fn unprotect_inner(
+    aes: &dyn AesCcm,
+    mac_header: &[u8],
+    key: &[u8; 16],
+    priority: u8,
+    mgmt: bool,
+    spp_amsdu: bool,
+    replay: &mut ReplayWindow,
+    protected: &mut [u8],
+) -> Result<Vec<u8>, CcmpError> {
     if protected.len() < CCMP_HDR_LEN + CCMP_MIC_LEN {
         return Err(CcmpError::TooShort);
     }
@@ -294,7 +372,7 @@ pub fn unprotect(
     candidate.check(pn)?;
 
     let nonce = build_nonce(priority, mgmt, mac_header_a2(mac_header), pn);
-    let aad = build_aad(mac_header);
+    let aad = build_aad_inner(mac_header, spp_amsdu);
     let body_len = protected.len() - CCMP_HDR_LEN - CCMP_MIC_LEN;
     let mut tag = [0u8; CCMP_MIC_LEN];
     tag.copy_from_slice(&protected[CCMP_HDR_LEN + body_len..]);

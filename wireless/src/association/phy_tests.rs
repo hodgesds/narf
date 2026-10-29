@@ -237,6 +237,7 @@ fn bss(cap: [u8; 26], op: [u8; 22], vht: Option<([u8; 12], [u8; 5])>, selector: 
         bssid: AP,
         ssid: b"narf".to_vec(),
         channel: op[0],
+        band: None,
         signal_dbm: None,
         capability: 1,
         beacon_interval: 100,
@@ -1513,4 +1514,416 @@ fn greenfield_directional_bounds() -> Result<(), &'static str> {
 smoke!(
     smoke_phy_greenfield_directional_local_offer_and_response_bounds,
     greenfield_directional_bounds
+);
+
+/// VHT80 AP on primary36 with explicit HT/VHT capability edits.
+fn ap_with(ht_rx_stbc: bool, vht_cap: impl Fn(&mut [u8; 12])) -> Bss {
+    let original = ap(true, true, None);
+    let facts = bodies(&original);
+    let ht = ht40().with_rx_stbc(ht_rx_stbc).capability_body();
+    let mut vht = facts.vht_cap.unwrap();
+    vht_cap(&mut vht);
+    bss(
+        ht,
+        facts.ht_op.unwrap(),
+        Some((vht, facts.vht_op.unwrap())),
+        None,
+    )
+}
+
+fn tx_stbc_directionality() -> Result<(), &'static str> {
+    let ht = ht40().with_tx_stbc(true);
+    let vht = LocalVht::new(0xfffc, 0xfffc, true, true, 0)
+        .unwrap()
+        .with_tx_stbc(true);
+    check!(
+        ht.capability_body()[0] & 0x80 != 0
+            && ht.capability_body()[1] & 3 == 0
+            && vht.capability_body()[0] & 0x80 != 0
+            && vht.capability_body()[1] & 7 == 0
+            && ht40().capability_body()[0] & 0x80 == 0,
+        "Tx STBC encoding differs or implied Rx STBC"
+    );
+    let local = LocalPhy::vht80(ht, vht).unwrap();
+    for scan in [false, true] {
+        for reply in [false, true] {
+            let stbc = |on: bool| ap_with(on, move |c| c[1] = (c[1] & !7) | u8::from(on));
+            let mut plan = ready(&stbc(scan), local);
+            let offer = plan.offered_phy().unwrap();
+            check!(
+                offer.ht().tx_stbc() == scan
+                    && offer.vht().unwrap().tx_stbc() == scan
+                    && offer.ht().peer_rx_stbc_streams() == u8::from(scan),
+                "offer Tx STBC ignored peer Rx STBC"
+            );
+            check!(
+                plan.association_response(&response(&stbc(reply))) == Ok(Some(7)),
+                "Tx STBC prevented a compatible response"
+            );
+            let negotiated = plan.negotiated_phy().unwrap();
+            check!(
+                negotiated.ht().tx_stbc() == (scan && reply)
+                    && negotiated.vht().unwrap().tx_stbc() == (scan && reply),
+                "response restored or lost Tx STBC"
+            );
+        }
+    }
+    let plain = ready(&ap_with(true, |c| c[1] |= 1), local_vht());
+    check!(
+        !plain.offered_phy().unwrap().ht().tx_stbc()
+            && !plain.offered_phy().unwrap().vht().unwrap().tx_stbc(),
+        "Tx STBC enabled without the local opt-in"
+    );
+    Ok(())
+}
+smoke!(
+    smoke_phy_tx_stbc_requires_local_opt_in_and_peer_rx_in_offer_and_response,
+    tx_stbc_directionality
+);
+
+fn beamforming_roles() -> Result<(), &'static str> {
+    let base = LocalVht::new(0xfffc, 0xfffc, true, true, 0).unwrap();
+    let full = VhtBeamforming {
+        su_beamformee_sts: Some(4),
+        su_beamformer_sounding: Some(2),
+        mu_beamformee: true,
+    };
+    for bad in [
+        VhtBeamforming {
+            su_beamformee_sts: Some(1),
+            ..Default::default()
+        },
+        VhtBeamforming {
+            su_beamformee_sts: Some(9),
+            ..Default::default()
+        },
+        VhtBeamforming {
+            su_beamformer_sounding: Some(1),
+            ..Default::default()
+        },
+        VhtBeamforming {
+            mu_beamformee: true,
+            ..Default::default()
+        },
+    ] {
+        check!(
+            base.with_beamforming(bad).is_err(),
+            "invalid beamforming role accepted"
+        );
+    }
+    let vht = base.with_beamforming(full).unwrap();
+    let cap = le32(&vht.capability_body()[..4]);
+    check!(
+        cap & (1 << 11 | 1 << 12 | 1 << 20) == (1 << 11 | 1 << 12 | 1 << 20)
+            && cap >> 13 & 7 == 3
+            && cap >> 16 & 7 == 1
+            && cap & 1 << 19 == 0
+            && le32(&base.capability_body()[..4]) & 0x1f_f800 == 0,
+        "beamforming capability bits differ or station claimed MU beamformer"
+    );
+    let local = LocalPhy::vht80(ht40(), vht).unwrap();
+    // AP: SU beamformer (4 sounding dimensions), MU beamformer, SU beamformee.
+    let roles = |bfer: bool, mu: bool, bfee: bool| {
+        ap_with(false, move |c| {
+            let mut info = le32(&c[..4]) & !(0x1f_f800);
+            if bfer {
+                info |= 1 << 11 | 3 << 16;
+            }
+            if mu {
+                info |= 1 << 19;
+            }
+            if bfee {
+                info |= 1 << 12 | 2 << 13;
+            }
+            c[..4].copy_from_slice(&info.to_le_bytes());
+        })
+    };
+    let mut plan = ready(&roles(true, true, true), local);
+    let offer = plan.offered_phy().unwrap();
+    let vht_offer = offer.vht().unwrap();
+    check!(
+        vht_offer.su_beamformee()
+            && vht_offer.mu_beamformee()
+            && vht_offer.su_beamformer()
+            && vht_offer.peer_sounding_dimensions() == Some(4)
+            && vht_offer.peer_beamformee_sts() == Some(3)
+            && offer.advertised_vht_capability() == vht.capability_body(),
+        "complementary AP roles did not enable local beamforming facts"
+    );
+    check!(
+        plan.association_response(&response(&roles(true, false, false))) == Ok(Some(7)),
+        "beamforming prevented a compatible response"
+    );
+    let negotiated = plan.negotiated_phy().unwrap().vht().unwrap();
+    check!(
+        negotiated.su_beamformee() && !negotiated.mu_beamformee() && !negotiated.su_beamformer(),
+        "response beamforming roles were not intersected"
+    );
+    // Without an AP SU beamformer the request drops SU/MU beamformee
+    // (mac80211 ieee80211_add_vht_ie); without MU beamformer only MU.
+    let plan = prepare(&roles(false, false, true), local).unwrap();
+    let advertised = le32(&plan.offered_phy().unwrap().advertised_vht_capability()[..4]);
+    check!(
+        advertised & (1 << 12 | 7 << 13 | 1 << 20) == 0 && advertised & 1 << 11 != 0,
+        "beamformee advertised to an AP that cannot sound"
+    );
+    let mut request = plan.assoc.clone();
+    let tail = request.split_off(request.len() - 12);
+    check!(
+        tail[..4] == advertised.to_le_bytes() && request[request.len() - 2..] == [191, 12],
+        "association request VHT IE is not the narrowed advertisement"
+    );
+    let plan = prepare(&roles(true, false, false), local).unwrap();
+    let advertised = le32(&plan.offered_phy().unwrap().advertised_vht_capability()[..4]);
+    check!(
+        advertised & 1 << 20 == 0 && advertised & 1 << 12 != 0,
+        "MU beamformee advertised to an AP without MU beamformer"
+    );
+    let mut later = ready(&roles(false, false, false), local);
+    check!(
+        later.association_response(&response(&roles(true, true, true))) == Ok(Some(7))
+            && !later
+                .negotiated_phy()
+                .unwrap()
+                .vht()
+                .unwrap()
+                .su_beamformee()
+            && !later
+                .negotiated_phy()
+                .unwrap()
+                .vht()
+                .unwrap()
+                .su_beamformer(),
+        "response restored beamforming roles absent from the scan offer"
+    );
+    Ok(())
+}
+smoke!(
+    smoke_phy_vht_beamforming_roles_are_complementary_and_narrowed,
+    beamforming_roles
+);
+
+/// VHT80 operation on primary36 (seg0 42) with a selectable AP width/ext
+/// NSS field, RX map and HT Operation CCFS2.
+fn ext_ap(supp: u32, ext: u32, capable: bool, ccfs1: u8, ccfs2: u8) -> Bss {
+    let mut op = [0; 22];
+    op[0] = 36;
+    op[1] = 5;
+    let mode = u16::from(ccfs2) << 5;
+    op[2..4].copy_from_slice(&mode.to_le_bytes());
+    let mut vht = LocalVht::new(0xfffa, 0xfffa, true, true, 0)
+        .unwrap()
+        .capability_body();
+    let info = le32(&vht[..4]) & !(3 << 2) | supp << 2 | ext << 30;
+    vht[..4].copy_from_slice(&info.to_le_bytes());
+    if capable {
+        vht[11] |= 0x20;
+    }
+    bss(
+        ht40().capability_body(),
+        op,
+        Some((vht, [1, 42, ccfs1, 0xfc, 0xff])),
+        None,
+    )
+}
+fn local_two_stream_160(ext: bool) -> LocalPhy {
+    LocalPhy::vht160(
+        ht40(),
+        LocalVht::new(0xfffa, 0xfffa, true, true, 0)
+            .unwrap()
+            .with_160mhz(true, true)
+            .with_extended_nss_bw(ext),
+    )
+    .unwrap()
+}
+
+fn extended_nss_bw() -> Result<(), &'static str> {
+    check!(
+        local_two_stream_160(true).vht.unwrap().capability_body()[11] & 0x20 != 0
+            && local_two_stream_160(false).vht.unwrap().capability_body()[11] & 0x20 == 0,
+        "Extended NSS BW Capable bit differs"
+    );
+    // Table 9-272: supp0 + ext1/2 = 160 at half NSS, ext3 = 3/4, signalled
+    // through HT Operation CCFS2 (mac80211 ieee80211_chandef_vht_oper).
+    for (ext, nss_map) in [(1, 0xfffe), (2, 0xfffe), (3, 0xfffe)] {
+        let ap = ext_ap(0, ext, true, 0, 50);
+        let plan = prepare(&ap, local_two_stream_160(true)).map_err(|_| "ext NSS AP refused")?;
+        let offer = plan.offered_phy().unwrap();
+        check!(
+            offer.width() == Width::OneSixty
+                && offer.center_channel() == 50
+                && !offer.discontiguous()
+                && offer.vht().unwrap().tx_mcs_map() == nss_map,
+            "ext NSS 160 geometry or reduced NSS differs"
+        );
+        // A station that does not interpret the field reads it as0: VHT80.
+        let legacy =
+            prepare(&ap, local_two_stream_160(false)).map_err(|_| "ext NSS AP rejected")?;
+        let offer = legacy.offered_phy().unwrap();
+        check!(
+            offer.width() == Width::Eighty
+                && offer.center_channel() == 42
+                && offer.vht().unwrap().tx_mcs_map() == 0xfffa,
+            "non-capable station used Extended NSS BW"
+        );
+    }
+    // supp1 + ext3 keeps full NSS at 160 via CCFS1; supp1 + ext1 uses CCFS2
+    // only when CCFS1 is zero.
+    let full = prepare(&ext_ap(1, 3, true, 50, 0), local_two_stream_160(true))
+        .map_err(|_| "supp1/ext3 refused")?;
+    check!(
+        full.offered_phy().unwrap().width() == Width::OneSixty
+            && full.offered_phy().unwrap().vht().unwrap().tx_mcs_map() == 0xfffa,
+        "supp1/ext3 160 was NSS-limited"
+    );
+    let via_ccfs2 = prepare(&ext_ap(1, 1, true, 0, 50), local_two_stream_160(true))
+        .map_err(|_| "supp1/ext1 CCFS2 refused")?;
+    check!(
+        via_ccfs2.offered_phy().unwrap().center_channel() == 50,
+        "supp1/ext1 ignored CCFS2"
+    );
+    // The AP's field is ignored unless it also sets Extended NSS BW Capable.
+    let unflagged = prepare(&ext_ap(0, 1, false, 0, 50), local_two_stream_160(true))
+        .map_err(|_| "unflagged ext AP refused")?;
+    check!(
+        unflagged.offered_phy().unwrap().width() == Width::Eighty,
+        "AP Extended NSS BW field used without its capable bit"
+    );
+    // Reserved supp2 + ext1/2 combinations fail closed for a capable station.
+    for ext in [1, 2] {
+        check!(
+            prepare(&ext_ap(2, ext, true, 0, 0), local_two_stream_160(true)).is_err()
+                && prepare(&ext_ap(2, ext, true, 0, 0), local_two_stream_160(false)).is_ok(),
+            "reserved Extended NSS BW combination handled incorrectly"
+        );
+    }
+    Ok(())
+}
+smoke!(
+    smoke_phy_extended_nss_bw_table_and_ccfs2_follow_local_capability,
+    extended_nss_bw
+);
+
+fn ap80p80(primary: u8, seg0: u8, seg1: u8, deprecated: bool, supp: u32) -> Bss {
+    let channels = [seg0 - 6, seg0 - 2, seg0 + 2, seg0 + 6];
+    let index = channels.iter().position(|c| *c == primary).unwrap();
+    let mut op = [0; 22];
+    op[0] = primary;
+    op[1] = if index & 1 == 0 { 5 } else { 7 };
+    let mut vht = LocalVht::new(0xfffe, 0xfffe, true, true, 0)
+        .unwrap()
+        .capability_body();
+    vht[0] = (vht[0] & !12) | (supp << 2) as u8 | 0x40;
+    bss(
+        ht40().capability_body(),
+        op,
+        Some((
+            vht,
+            [if deprecated { 3 } else { 1 }, seg0, seg1, 0xfc, 0xff],
+        )),
+        None,
+    )
+}
+fn local_80p80() -> LocalPhy {
+    LocalPhy::vht160(
+        ht40(),
+        LocalVht::new(0xfffe, 0xfffe, true, true, 0)
+            .unwrap()
+            .with_80p80(true, true),
+    )
+    .unwrap()
+}
+
+fn discontiguous_80p80() -> Result<(), &'static str> {
+    check!(
+        local_80p80().vht.unwrap().capability_body()[0] & 0x4c == 0x48,
+        "local 80+80 did not advertise Supported Channel Width Set2"
+    );
+    for (primary, seg0, seg1) in [(36, 42, 106), (104, 106, 42), (149, 155, 58)] {
+        for deprecated in [false, true] {
+            let ap = ap80p80(primary, seg0, seg1, deprecated, 2);
+            let plan = prepare(&ap, local_80p80()).map_err(|_| "valid 80+80 refused")?;
+            let offer = plan.offered_phy().unwrap();
+            let low = seg0.min(seg1);
+            let high = seg0.max(seg1);
+            let expected = [
+                low - 6,
+                low - 2,
+                low + 2,
+                low + 6,
+                high - 6,
+                high - 2,
+                high + 2,
+                high + 6,
+            ];
+            check!(
+                offer.width() == Width::OneSixty
+                    && offer.discontiguous()
+                    && offer.center_channel() == seg0
+                    && offer.secondary_center_channel() == Some(seg1)
+                    && offer.occupied_channels() == expected,
+                "80+80 segments/occupied channels differ"
+            );
+            // Local 160-only or 80 stations use the primary80 segment.
+            for narrow in [local_vht160(), local_vht()] {
+                let plan = prepare(&ap, narrow).map_err(|_| "80+80 BSS refused narrow station")?;
+                let offer = plan.offered_phy().unwrap();
+                check!(
+                    offer.width() == Width::Eighty
+                        && !offer.discontiguous()
+                        && offer.center_channel() == seg0
+                        && offer.occupied_channels() == [seg0 - 6, seg0 - 2, seg0 + 2, seg0 + 6],
+                    "narrow station did not fall back to primary80"
+                );
+            }
+        }
+    }
+    // Adjacent (a contiguous160), overlapping, noncanonical, AP without
+    // 80+80 support or primary outside seg0 all fail closed.
+    for ap in [
+        ap80p80(36, 42, 58, false, 2),
+        ap80p80(36, 42, 50, true, 2),
+        ap80p80(36, 42, 107, false, 2),
+        ap80p80(36, 42, 106, false, 1),
+        ap80p80(36, 42, 0, true, 2),
+    ] {
+        check!(
+            prepare(&ap, local_80p80()).is_err(),
+            "invalid 80+80 geometry admitted"
+        );
+    }
+    let mut wrong_primary = ap80p80(36, 42, 106, false, 2);
+    let facts = bodies(&wrong_primary);
+    let mut vht_op = facts.vht_op.unwrap();
+    vht_op[1] = 106;
+    vht_op[2] = 42;
+    wrong_primary = bss(
+        facts.ht_cap.unwrap(),
+        facts.ht_op.unwrap(),
+        Some((facts.vht_cap.unwrap(), vht_op)),
+        None,
+    );
+    check!(
+        prepare(&wrong_primary, local_80p80()).is_err(),
+        "primary outside the seg0 80MHz segment admitted"
+    );
+    // A response may narrow 80+80 to its primary80, never widen to it.
+    let original = ap80p80(36, 42, 106, false, 2);
+    let mut plan = ready(&original, local_80p80());
+    check!(
+        plan.association_response(&response(&ap(true, true, None))) == Ok(Some(7))
+            && plan.negotiated_phy().unwrap().width() == Width::Eighty
+            && !plan.negotiated_phy().unwrap().discontiguous(),
+        "80+80 response could not narrow to primary80"
+    );
+    let mut plan = ready(&ap(true, true, None), local_80p80());
+    check!(
+        plan.association_response(&response(&original)).is_err(),
+        "response widened an 80 offer to 80+80"
+    );
+    Ok(())
+}
+smoke!(
+    smoke_phy_vht_80p80_segments_fallback_and_invalid_geometry,
+    discontiguous_80p80
 );

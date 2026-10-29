@@ -10,6 +10,8 @@ mod permission;
 mod pmf;
 #[path = "supplicant_e2e_tests.rs"]
 mod supplicant_e2e;
+#[path = "wiphy_ops_tests.rs"]
+mod wiphy_ops;
 
 struct InterfaceStub {
     name: &'static str,

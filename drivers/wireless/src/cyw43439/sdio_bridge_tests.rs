@@ -15,8 +15,28 @@ struct Host {
     enabled: u8,
     fail_write: bool,
     reassert_change: bool,
+    /// Host has a card-interrupt line; records the claim and rearms.
+    line: bool,
+    claimed: Option<u8>,
+    notify: Option<alloc::sync::Arc<dyn Fn() + Send + Sync>>,
+    rearmed: u32,
 }
 impl SdioFunction for Host {
+    fn enable_card_interrupt(
+        &mut self,
+        functions: u8,
+        notify: alloc::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<bool, SdioError> {
+        if !self.line {
+            return Ok(false);
+        }
+        self.claimed = Some(functions);
+        self.notify = Some(notify);
+        Ok(true)
+    }
+    fn rearm_card_interrupt(&mut self) {
+        self.rearmed += 1;
+    }
     fn cmd52_read(&mut self, f: u8, a: u32) -> Result<u8, SdioError> {
         self.ops.push((52, f, a, 0));
         Ok(0)
@@ -225,4 +245,48 @@ fn smoke_cyw_sdio_fifo_readiness_padding_and_flow() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/cyw43439/sdio_bridge",
     smoke_cyw_sdio_fifo_readiness_padding_and_flow
+);
+
+fn smoke_cyw_sdio_claims_f1_f2_interrupts_and_rearms_after_service() -> TestResult {
+    // No host line: the transport keeps polling.
+    let mut polled = SdioTransport::new(Host::default());
+    if polled.prepare().is_err()
+        || polled.initialize_packets(CORE).is_err()
+        || polled.interrupt().is_some()
+    {
+        return TestResult::Fail("interrupt wake without a host line");
+    }
+    // brcmf_sdiod_intr_register: claim F1 and F2 after hostintmask.
+    let mut transport = SdioTransport::new(Host {
+        line: true,
+        ..Host::default()
+    });
+    if transport.prepare().is_err() || transport.initialize_packets(CORE).is_err() {
+        return TestResult::Fail("packet init");
+    }
+    let Some(signal) = transport.interrupt() else {
+        return TestResult::Fail("host line did not produce a wake source");
+    };
+    if transport.func.claimed != Some(0b110) {
+        return TestResult::Fail("F1/F2 card interrupts not claimed");
+    }
+    let seen = signal.count();
+    (transport.func.notify.as_ref().unwrap())();
+    if signal.count() != seen + 1 {
+        return TestResult::Fail("card interrupt did not raise the owner wake");
+    }
+    transport.interrupt_serviced();
+    if transport.func.rearmed != 1 {
+        return TestResult::Fail("serviced interrupt was not rearmed");
+    }
+    transport.failed = true;
+    transport.interrupt_serviced();
+    if transport.func.rearmed != 1 {
+        return TestResult::Fail("failed transport rearmed its line");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/sdio_bridge",
+    smoke_cyw_sdio_claims_f1_f2_interrupts_and_rearms_after_service
 );

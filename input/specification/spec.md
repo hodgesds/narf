@@ -62,6 +62,22 @@ All code is derived strictly from the references below.
   Producers fill the identity from their discovering transport;
   `DeviceCaps::default()` keeps the historical synthetic identity
   (`narf-input`, `BUS_VIRTUAL`, ids 0) for producers not yet plumbed.
+- `evdev` LED output surface: `DeviceCaps::ledbit` (declared via
+  `add_led`) advertises `EV_LED` codes. The input core owns the
+  per-device LED state (`DeviceNode::led_state`, the bitmap
+  `EVIOCGLED` returns, indexed by Linux `EV_LED` code):
+  `DeviceNode::dispatch` sets/clears bits for `EV_LED` events and
+  toggles the matching bit on a lock-key (Caps/Num/Scroll) press.
+  On every change the core invokes the producer's registered LED
+  sink (`DeviceNode::set_led_sink`, a plain `fn(u16)`) — or the
+  producer polls `led_state` from its own pump (I2C-HID). evdev
+  `write()` on a hardware device accepts *only* a pure `EV_LED`
+  buffer of codes the device declares (validated whole before any
+  dispatch) — the blanket denial of hardware writes otherwise
+  stands, so arbitrary input injection stays impossible. Wire
+  encodings are producer-local and differ from the core order:
+  i8042's Set-LEDs data byte is Scroll/Num/Caps at bits 0/1/2;
+  a HID LED Output report follows descriptor usage order.
   The filesystem layer answers `EVIOCGID` / `EVIOCGNAME` /
   `EVIOCGPHYS` / `EVIOCGUNIQ` / `EVIOCGPROP` from these fields and
   synthesises `/dev/input/by-id` / `/dev/input/by-path` aliases and

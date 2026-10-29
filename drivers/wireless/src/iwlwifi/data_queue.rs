@@ -199,6 +199,24 @@ impl DataQueue {
         header_len: usize,
         rate: Option<u32>,
     ) -> Result<u16, &'static str> {
+        self.send_assisted(mmio, frame, header_len, rate, 0)
+    }
+
+    /// `assist` carries the checksum `offload_assist` bits prepared by
+    /// [`super::csum::prepare_tx`]; the MAC-header size and pad bits are
+    /// always derived here from the actual header geometry.
+    pub fn send_assisted(
+        &mut self,
+        mmio: &mut impl IwlMmio,
+        frame: &[u8],
+        header_len: usize,
+        rate: Option<u32>,
+        assist: u32,
+    ) -> Result<u16, &'static str> {
+        use super::csum::{OFFLD_IP_HDR, OFFLD_L4_EN};
+        if assist & !(1 << OFFLD_L4_EN | 0x3f << OFFLD_IP_HDR) != 0 {
+            return Err("unsupported TX offload_assist request");
+        }
         if !mmio.authorized() {
             return Err("Wi-Fi authority revoked");
         }
@@ -229,7 +247,13 @@ impl DataQueue {
         // Protected frames use the station's firmware CCMP key. The
         // firmware inserts IV/MIC and advances its TX packet number.
         let flags = u16::from(rate.is_some()) | if frame[1] & 0x40 != 0 { 0 } else { 2 };
-        let offload = ((header_len / 2) as u32) << 8 | if padding != 0 { 1 << 13 } else { 0 };
+        let offload = assist
+            | ((header_len / 2) as u32) << super::csum::OFFLD_MH_SIZE
+            | if padding != 0 {
+                1 << super::csum::OFFLD_PAD
+            } else {
+                0
+            };
         if self.pre_ax210 {
             put16(&mut bytes, 6, offload as u16);
             put32(&mut bytes, 8, u32::from(flags));

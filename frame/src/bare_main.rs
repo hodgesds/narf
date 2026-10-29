@@ -1422,31 +1422,54 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             "  vbar_el1: loaded — 16 EL1 vectors routed"
         );
 
-        // GICv3 bring-up (only if the sysreg interface is there).
-        if feats.gicv3_sysreg {
-            // SAFETY: CPUID confirmed GICv3; still at EL1 with IRQs
-            // masked.
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                narf_interrupts::aarch64::init_bsp();
+        // GIC bring-up. Version (v2 / v3) and register windows come from
+        // the devicetree; `probe` falls back to the QEMU virt GICv3 bases
+        // only when the tree has no GIC node and the v3 sysreg interface
+        // exists. Selecting the backend here, once, before any IRQ is
+        // unmasked, is what lets the trap path branch on a boot constant.
+        // SAFETY: pre-MMU, low RAM identity-mapped (the same environment
+        // `parse_raw` below reads the DTB in).
+        let dtb = unsafe { narf_boot::aarch64::locate_dtb(&raw) };
+        // SAFETY: BSP, IRQs masked, before init_bsp; the DTB pointer is
+        // identity-reachable and header-validated inside `probe`.
+        let gic = unsafe {
+            narf_interrupts::aarch64::gic::probe(dtb.map(|p| p.raw()), feats.gicv3_sysreg)
+        };
+        match gic {
+            Ok((desc, source)) => {
+                // SAFETY: probe selected a backend; still at EL1 with IRQs
+                // masked.
+                unsafe {
+                    narf_interrupts::aarch64::init_bsp();
+                }
+                let _ = writeln!(
+                    console::Writer,
+                    "  gic: {:?} enabled (dist {:#x}, {} {:#x}, {:?}), timer PPI {} unmasked",
+                    desc.version,
+                    desc.dist.base,
+                    if narf_interrupts::aarch64::gic::is_v2() {
+                        "cpu-if"
+                    } else {
+                        "redist"
+                    },
+                    desc.cpu.base,
+                    source,
+                    narf_interrupts::aarch64::TIMER_PPI
+                );
+                // Install the unified `narf_memory::tlb_shootdown::shootdown`
+                // → SGI fan-out hook on aarch64 too.
+                narf_interrupts::install_tlb_shootdown_bridge();
+                // membarrier(2)'s cross-CPU barrier SGI. Unlike the shootdown
+                // SGI this one is load-bearing on aarch64: inner-shareable TLBI
+                // broadcasts in hardware, a peer's memory barrier does not.
+                narf_interrupts::install_membarrier_ipi();
             }
-            let _ = writeln!(
-                console::Writer,
-                "  gic: v3 enabled, timer PPI {} unmasked",
-                narf_interrupts::aarch64::TIMER_PPI
-            );
-            // Install the unified `narf_memory::tlb_shootdown::shootdown`
-            // → SGI fan-out hook on aarch64 too.
-            narf_interrupts::install_tlb_shootdown_bridge();
-            // membarrier(2)'s cross-CPU barrier SGI. Unlike the shootdown
-            // SGI this one is load-bearing on aarch64: inner-shareable TLBI
-            // broadcasts in hardware, a peer's memory barrier does not.
-            narf_interrupts::install_membarrier_ipi();
-        } else {
-            let _ = writeln!(
-                console::Writer,
-                "  gic: v3 sysreg interface unavailable — IRQs stay masked"
-            );
+            Err(e) => {
+                let _ = writeln!(
+                    console::Writer,
+                    "  gic: no usable interrupt controller ({e:?}) — IRQs stay masked"
+                );
+            }
         }
     }
 

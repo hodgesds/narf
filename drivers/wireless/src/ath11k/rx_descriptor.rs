@@ -5,6 +5,7 @@ use super::{
     dp::{HalRxDescWcn6855, RxAttention},
     hw::HwRev,
     ipq8074::HalRxDescIpq8074,
+    qcn9074::HalRxDescQcn9074,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,18 +15,28 @@ pub struct DescriptorFormatMismatch;
 pub enum RxDescriptor {
     Wcn6855(HalRxDescWcn6855),
     Ipq8074(HalRxDescIpq8074),
+    Qcn9074(HalRxDescQcn9074),
 }
 macro_rules! delegate {
     ($($name:ident -> $ty:ty),* $(,)?) => {$(
         pub fn $name(&self) -> $ty {
-            match self { Self::Wcn6855(d) => d.$name(), Self::Ipq8074(d) => d.$name() }
+            match self {
+                Self::Wcn6855(d) => d.$name(),
+                Self::Ipq8074(d) => d.$name(),
+                Self::Qcn9074(d) => d.$name(),
+            }
         }
     )*};
 }
 impl RxDescriptor {
     pub fn decode(rev: HwRev, bytes: &[u8]) -> Option<Self> {
         match rev {
-            HwRev::Qca6390Hw20 => HalRxDescIpq8074::from_bytes(bytes).map(Self::Ipq8074),
+            HwRev::Qca6390Hw20 | HwRev::Ipq8074 | HwRev::Ipq6018Hw10 => {
+                HalRxDescIpq8074::from_bytes(bytes).map(Self::Ipq8074)
+            }
+            HwRev::Qcn9074Hw10 | HwRev::Ipq5018Hw10 | HwRev::Wcn6750Hw10 => {
+                HalRxDescQcn9074::from_bytes(bytes).map(Self::Qcn9074)
+            }
             HwRev::Wcn6855Hw20 | HwRev::Wcn6855Hw21 | HwRev::Qca2066Hw21 | HwRev::Qca6698aqHw21 => {
                 HalRxDescWcn6855::from_bytes(bytes).map(Self::Wcn6855)
             }
@@ -34,7 +45,12 @@ impl RxDescriptor {
     }
     pub fn msdu_len_offset(rev: HwRev) -> Option<usize> {
         match rev {
-            HwRev::Qca6390Hw20 => Some(core::mem::offset_of!(HalRxDescIpq8074, msdu_start) + 4),
+            HwRev::Qca6390Hw20 | HwRev::Ipq8074 | HwRev::Ipq6018Hw10 => {
+                Some(core::mem::offset_of!(HalRxDescIpq8074, msdu_start) + 4)
+            }
+            HwRev::Qcn9074Hw10 | HwRev::Ipq5018Hw10 | HwRev::Wcn6750Hw10 => {
+                Some(core::mem::offset_of!(HalRxDescQcn9074, msdu_start) + 4)
+            }
             HwRev::Wcn6855Hw20 | HwRev::Wcn6855Hw21 | HwRev::Qca2066Hw21 | HwRev::Qca6698aqHw21 => {
                 Some(core::mem::offset_of!(HalRxDescWcn6855, msdu_start) + 4)
             }
@@ -48,24 +64,38 @@ impl RxDescriptor {
         match self {
             Self::Wcn6855(d) => d.attention,
             Self::Ipq8074(d) => d.attention,
+            Self::Qcn9074(d) => d.attention,
         }
     }
     pub fn mpdu_info1(&self) -> u32 {
         match self {
             Self::Wcn6855(d) => d.mpdu_start.info1,
             Self::Ipq8074(d) => d.mpdu_start.info1,
+            // Same bits (seq/fctrl valid, encrypt valid, seq num).
+            Self::Qcn9074(d) => d.mpdu_start.info11,
         }
     }
     pub fn addr2(&self) -> [u8; 6] {
         match self {
             Self::Wcn6855(d) => d.mpdu_start.addr2,
             Self::Ipq8074(d) => d.mpdu_start.addr2,
+            Self::Qcn9074(d) => d.mpdu_start.addr2,
+        }
+    }
+    /// `ath11k_dp_rx_h_80211_hdr`: the received 802.11 header (and, for a
+    /// protected frame, its IV/Key ID) the RXDMA copied into `hdr_status`.
+    pub fn hdr_status(&self) -> &[u8] {
+        match self {
+            Self::Wcn6855(d) => &d.hdr_status,
+            Self::Ipq8074(d) => &d.hdr_status,
+            Self::Qcn9074(d) => &d.hdr_status,
         }
     }
     pub fn rate_info(&self) -> u32 {
         match self {
             Self::Wcn6855(d) => d.msdu_start.info3,
             Self::Ipq8074(d) => d.msdu_start.info3,
+            Self::Qcn9074(d) => d.msdu_start.info3,
         }
     }
     pub fn copy_attention_end(&mut self, last: &Self) -> Result<(), DescriptorFormatMismatch> {
@@ -76,6 +106,11 @@ impl RxDescriptor {
                 first.mpdu_end = last.mpdu_end;
             }
             (Self::Ipq8074(first), Self::Ipq8074(last)) => {
+                first.msdu_end = last.msdu_end;
+                first.attention = last.attention;
+                first.mpdu_end = last.mpdu_end;
+            }
+            (Self::Qcn9074(first), Self::Qcn9074(last)) => {
                 first.msdu_end = last.msdu_end;
                 first.attention = last.attention;
                 first.mpdu_end = last.mpdu_end;

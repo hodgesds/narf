@@ -39,6 +39,8 @@ pub(in crate::cyw43439) struct Bus {
     current_chanspec: u16,
     wide_started: bool,
     bandwidth: u32,
+    refuse_vndr_ie: bool,
+    wme_ac_sta: Option<[u8; 16]>,
 }
 impl Bus {
     pub(in crate::cyw43439) fn new() -> Self {
@@ -71,6 +73,8 @@ impl Bus {
             current_chanspec: 0x1006,
             wide_started: false,
             bandwidth: 1,
+            refuse_vndr_ie: false,
+            wme_ac_sta: Some([0; 16]),
         }
     }
     pub(in crate::cyw43439) fn set_secured(&mut self, secured: bool) {
@@ -172,6 +176,39 @@ impl Bus {
             })
             .collect()
     }
+    /// Current firmware EDCA rows; `None` refuses the native query.
+    pub(in crate::cyw43439) fn wme_ac_sta(&mut self, rows: Option<[u8; 16]>) {
+        self.wme_ac_sta = rows;
+    }
+    pub(in crate::cyw43439) fn refuse_vndr_ie(&mut self, refuse: bool) {
+        self.refuse_vndr_ie = refuse;
+    }
+    /// Bodies of every `WLC_SET_VAR` control request, in transmit order.
+    pub(in crate::cyw43439) fn set_vars(&self) -> Vec<Vec<u8>> {
+        self.tx
+            .iter()
+            .filter(|bytes| bytes[5] & 15 == 0)
+            .filter_map(|bytes| {
+                let size = usize::from(HwHeader::decode(bytes).unwrap().length);
+                (BcdcHeader::decode(&bytes[12..]).unwrap().cmd == 263)
+                    .then(|| bytes[28..size].to_vec())
+            })
+            .collect()
+    }
+    /// Every control request `(command, body)` in transmit order.
+    pub(in crate::cyw43439) fn control_log(&self) -> Vec<(u32, Vec<u8>)> {
+        self.tx
+            .iter()
+            .filter(|bytes| bytes[5] & 15 == 0)
+            .map(|bytes| {
+                let size = usize::from(HwHeader::decode(bytes).unwrap().length);
+                (
+                    BcdcHeader::decode(&bytes[12..]).unwrap().cmd,
+                    bytes[28..size].to_vec(),
+                )
+            })
+            .collect()
+    }
     pub(in crate::cyw43439) fn control_count(&self) -> usize {
         self.tx
             .iter()
@@ -210,6 +247,13 @@ impl Bus {
         (self.tx.len() as u8).wrapping_add(credits)
     }
 
+    pub(in crate::cyw43439) fn data_packets(&self) -> Vec<Vec<u8>> {
+        self.tx
+            .iter()
+            .filter(|packet| packet[5] & 15 == 2)
+            .cloned()
+            .collect()
+    }
     pub(in crate::cyw43439) fn sent_data(&self) -> usize {
         self.tx.iter().filter(|packet| packet[5] & 15 == 2).count()
     }
@@ -408,6 +452,8 @@ impl PacketTransport for Bus {
                     {
                         self.mfp_held = true;
                     }
+                } else if body.starts_with(b"wme_ac_sta\0") {
+                    response.extend_from_slice(&self.wme_ac_sta.unwrap_or([0; 16]));
                 } else if body.starts_with(b"assoc_info\0") {
                     response.extend_from_slice(
                         &(if self.mfp_fault == 4 {
@@ -569,6 +615,14 @@ impl PacketTransport for Bus {
         {
             header.flags |= bcdc_flag::ERROR;
             header.status = 1;
+        }
+        if request.cmd == 262 && body.starts_with(b"wme_ac_sta\0") && self.wme_ac_sta.is_none() {
+            header.flags |= bcdc_flag::ERROR;
+            header.status = (-23i32) as u32;
+        }
+        if request.cmd == 263 && body.starts_with(b"vndr_ie\0") && self.refuse_vndr_ie {
+            header.flags |= bcdc_flag::ERROR;
+            header.status = (-23i32) as u32;
         }
         if request.cmd == 262 && body.starts_with(b"mfp\0") && !self.mfp_supported {
             header.flags |= bcdc_flag::ERROR;
@@ -886,7 +940,17 @@ fn smoke_cyw_station_rejects_inconsistent_association_ies() -> TestResult {
         (vec![48, 20, 1], true, Error::Malformed),
         (vec![127], true, Error::Malformed),
     ] {
-        if validate_association_ies(&ies, secure, false) != Err(expected) {
+        if validate_association_ies(
+            &ies,
+            if secure {
+                narf_wireless::rsn::AKM_PSK
+            } else {
+                0
+            },
+            false,
+            false,
+        ) != Err(expected)
+        {
             return TestResult::Fail(
                 "association IE policy admitted malformed or unsupported security",
             );

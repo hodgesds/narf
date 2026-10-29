@@ -48,6 +48,12 @@ pub enum KeyMgmt {
     PskSha256,
     /// AKM 00-0F-AC:8 (`WPA_KEY_MGMT_SAE`).
     Sae,
+    /// AKM 00-0F-AC:24 (`WPA_KEY_MGMT_SAE_EXT_KEY`, SAE with a
+    /// group-dependent hash). NARF's only SAE group is 19, whose hash is
+    /// SHA-256, so the PMK is 32 octets and hostap `wpa_kck_len` /
+    /// `wpa_kek_len` / `wpa_mic_len` give 16 / 16 / 16; the AKM-defined
+    /// MIC is HMAC-SHA-256 truncated to the KCK length (`wpa_eapol_key_mic`).
+    SaeExtKey,
 }
 
 impl KeyMgmt {
@@ -57,6 +63,7 @@ impl KeyMgmt {
             KeyMgmt::Psk => 2,
             KeyMgmt::PskSha256 => 6,
             KeyMgmt::Sae => 8,
+            KeyMgmt::SaeExtKey => 24,
         }
     }
 
@@ -66,6 +73,7 @@ impl KeyMgmt {
             2 => Some(KeyMgmt::Psk),
             6 => Some(KeyMgmt::PskSha256),
             8 => Some(KeyMgmt::Sae),
+            24 => Some(KeyMgmt::SaeExtKey),
             _ => None,
         }
     }
@@ -77,7 +85,12 @@ impl KeyMgmt {
 
     /// `wpa_use_akm_defined`: Key Descriptor Version 0.
     pub const fn akm_defined(self) -> bool {
-        matches!(self, KeyMgmt::Sae)
+        matches!(self, KeyMgmt::Sae | KeyMgmt::SaeExtKey)
+    }
+
+    /// Either SAE AKM (`wpa_key_mgmt_sae`).
+    pub const fn sae(self) -> bool {
+        matches!(self, KeyMgmt::Sae | KeyMgmt::SaeExtKey)
     }
 
     /// `wpa_mic_len` (16 for all three; IEEE 802.11-2020 Table 12-11).
@@ -98,7 +111,7 @@ impl KeyMgmt {
     /// AKM-defined suite, 3 for the SHA-256 AKMs, 2 for PSK.
     pub const fn key_info_version(self) -> u16 {
         match self {
-            KeyMgmt::Sae => KI_VERSION_AKM_DEFINED,
+            KeyMgmt::Sae | KeyMgmt::SaeExtKey => KI_VERSION_AKM_DEFINED,
             KeyMgmt::PskSha256 => KI_VERSION_AES_128_CMAC,
             KeyMgmt::Psk => KI_VERSION_HMAC_SHA1_AES,
         }
@@ -134,11 +147,15 @@ pub fn key_ver_allowed(km: KeyMgmt, ver: u16) -> bool {
 }
 
 /// `wpa_eapol_key_mic` for `km`: version 2 = HMAC-SHA1-128, 3 =
-/// AES-128-CMAC, 0 (AKM-defined) with SAE = AES-128-CMAC.
+/// AES-128-CMAC, 0 (AKM-defined) with SAE = AES-128-CMAC and with
+/// SAE-EXT-KEY = HMAC-SHA-256 over a 16-octet KCK, truncated to 16.
 pub fn wpa_eapol_key_mic(km: KeyMgmt, ver: u16, kck: &[u8], pdu: &[u8]) -> Option<Vec<u8>> {
     match ver {
         KI_VERSION_AKM_DEFINED if km == KeyMgmt::Sae => {
             eapol_key_mic(KI_VERSION_AES_128_CMAC, kck, pdu, km.mic_len())
+        }
+        KI_VERSION_AKM_DEFINED if km == KeyMgmt::SaeExtKey && kck.len() == 16 => {
+            Some(narf_crypto::hkdf::hmac_sha256(kck, pdu)[..kck.len()].to_vec())
         }
         KI_VERSION_HMAC_SHA1_AES | KI_VERSION_AES_128_CMAC => {
             eapol_key_mic(ver, kck, pdu, km.mic_len())
@@ -1179,4 +1196,93 @@ mod rsna_tests {
         "wireless/eapol",
         smoke_eapol_nonce_failure_does_not_commit_m1_state
     );
+
+    /// AKM 24 (SAE-EXT-KEY) over group 19: the same SHA-256 PTK split as
+    /// AKM 8 (hostap `wpa_kck_len`/`wpa_kek_len` = pmk_len / 2 = 16), a
+    /// version-0 key descriptor and an HMAC-SHA-256-128 MIC
+    /// (`wpa_eapol_key_mic` SAE-EXT-KEY branch) on M2, M3 and M4.
+    fn smoke_eapol_sae_ext_key_4way() -> TestResult {
+        let ext_rsne: [u8; 22] = {
+            let mut r = AP_RSNE;
+            r[19] = 24;
+            r
+        };
+        let mut assoc = ext_rsne.to_vec();
+        assoc.extend_from_slice(&RSNXE);
+        let mut s = Supplicant::new(AA, SA, [0; 32]).with_rsna(RsnaParams {
+            key_mgmt: KeyMgmt::SaeExtKey,
+            assoc_ie: assoc.clone(),
+            ap_rsn_ie: ext_rsne.to_vec(),
+            ..params()
+        });
+        if KeyMgmt::from_suite_type(24) != Some(KeyMgmt::SaeExtKey)
+            || KeyMgmt::SaeExtKey.suite_type() != 24
+            || !key_ver_allowed(KeyMgmt::SaeExtKey, 0)
+            || key_ver_allowed(KeyMgmt::SaeExtKey, 3)
+            || key_ver_allowed(KeyMgmt::SaeExtKey, 2)
+        {
+            return TestResult::Fail("AKM 24 suite / descriptor rules");
+        }
+        let hmac = |kck: &[u8], b: &[u8]| narf_crypto::hkdf::hmac_sha256(kck, b)[..16].to_vec();
+        let p = wpa_pmk_to_ptk(KeyMgmt::SaeExtKey, &SAE_PMK, &AA, &SA, &ANONCE, &SNONCE, 16);
+        let q = ptk_of(ANONCE, SNONCE);
+        if (&p.kck, &p.kek, &p.tk) != (&q.kck, &q.kek, &q.tk)
+            || wpa_eapol_key_mic(KeyMgmt::SaeExtKey, 0, &p.kck, b"x") != Some(hmac(&p.kck, b"x"))
+            || wpa_eapol_key_mic(KeyMgmt::SaeExtKey, 0, &[0; 24], b"x").is_some()
+        {
+            return TestResult::Fail("AKM 24 PTK / MIC");
+        }
+        let m1 = ap_frame(M1_KI, 1, ANONCE, &[], None);
+        let r = match s.rx_eapol(&m1, false, SNONCE) {
+            Ok(EapolRx::Pairwise1(r)) => r,
+            _ => return TestResult::Fail("AKM 24 M1"),
+        };
+        let mut zeroed = r.reply.clone();
+        zeroed[81..97].fill(0);
+        if r.reply[81..97] != hmac(&p.kck, &zeroed)[..] || r.reply[5..7] != [0x01, 0x08] {
+            return TestResult::Fail("AKM 24 M2 MIC");
+        }
+        // hostapd side: M3 with an HMAC-SHA-256-128 MIC.
+        let mut m3 = ap_frame(
+            M3_KI,
+            2,
+            ANONCE,
+            &m3_kd(&ext_rsne, Some(&RSNXE), true),
+            Some(&p),
+        );
+        m3[81..97].fill(0);
+        let mic = hmac(&p.kck, &m3);
+        m3[81..97].copy_from_slice(&mic);
+        let r = match s.rx_eapol(&m3, false, [0x33; 32]) {
+            Ok(EapolRx::Pairwise3(r)) => r,
+            _ => return TestResult::Fail("AKM 24 M3"),
+        };
+        let mut zeroed = r.reply.clone();
+        zeroed[81..97].fill(0);
+        if r.reply[81..97] != hmac(&p.kck, &zeroed)[..] || r.tk.as_deref() != Some(&p.tk[..]) {
+            return TestResult::Fail("AKM 24 M4 / TK");
+        }
+        // An AES-CMAC (AKM 8) MIC must not verify under AKM 24.
+        let mut t = Supplicant::new(AA, SA, [0; 32]).with_rsna(RsnaParams {
+            key_mgmt: KeyMgmt::SaeExtKey,
+            assoc_ie: assoc,
+            ap_rsn_ie: ext_rsne.to_vec(),
+            ..params()
+        });
+        if t.rx_eapol(&m1, false, SNONCE).is_err() {
+            return TestResult::Fail("AKM 24 second M1");
+        }
+        let cmac = ap_frame(
+            M3_KI,
+            2,
+            ANONCE,
+            &m3_kd(&ext_rsne, Some(&RSNXE), true),
+            Some(&p),
+        );
+        if t.rx_eapol(&cmac, false, [0x33; 32]).is_ok() {
+            return TestResult::Fail("AKM 24 accepted an AES-CMAC MIC");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/eapol", smoke_eapol_sae_ext_key_4way);
 }

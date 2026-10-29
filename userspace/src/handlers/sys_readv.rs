@@ -107,8 +107,8 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
         }
         return;
     }
-    if crate::pipe::is_pipe(endpoint.ops.as_ref()) {
-        read_pipe_user(ctx, &endpoint, count, |mut offset, mut src, mut len| {
+    if let Some(pipe) = crate::pipe::Endpoint::from_file(endpoint.ops.as_ref()) {
+        read_pipe_user(ctx, &endpoint, &pipe, count, |mut offset, mut src, mut len| {
             for iov in &iovecs {
                 if offset >= iov.len { offset -= iov.len; continue; }
                 let n = len.min(iov.len - offset);

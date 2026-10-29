@@ -143,6 +143,7 @@ impl Candidate {
                 bssid: bytes[10..16].try_into().unwrap(),
                 ssid: ssid.ok_or(Error::Frame)?,
                 channel,
+                band: None,
                 signal_dbm: None,
                 capability,
                 beacon_interval,
@@ -261,6 +262,22 @@ impl Join {
     }
     pub fn candidate(&self) -> &Candidate {
         &self.candidate
+    }
+    /// Negotiated AP HT A-MPDU parameters: (maximum length exponent, density).
+    pub(super) fn peer_ampdu(&self) -> Option<(u8, u8)> {
+        self.plan
+            .negotiated_phy()
+            .map(|phy| (phy.ht().peer_ampdu_factor(), phy.ht().peer_mpdu_density()))
+    }
+    /// `rtl8xxxu_refresh_rate_mask` inputs: `supp_rates[0]` (negotiated
+    /// legacy bitmap in DESC rate order), `ht_cap.mcs.rx_mask[0]` (MCS the
+    /// peer receives and this 1T1R profile may send) and `ht_supported`.
+    pub(super) fn rate_mask_inputs(&self) -> (u16, u8, bool) {
+        let mcs = self
+            .plan
+            .negotiated_phy()
+            .map_or(0, |phy| phy.ht().tx_mcs()[0]);
+        (self.plan.legacy_rates().0, mcs, self.ht_selected())
     }
     pub(super) fn ht_selected(&self) -> bool {
         self.plan.negotiated_phy().is_some()

@@ -89,8 +89,22 @@ resets peer, control-port and cached power-save state.
 `association::phy::{LocalHt, LocalVht, LocalPhy}` describes a native driver's
 implemented directional RX/TX limits. Checked HT20/HT40/VHT80/VHT160 constructors
 encode only local equal-modulation HT MCS0..31, directional VHT MCS/NSS maps,
-GI and aggregation limits; TX STBC/beamforming, extended NSS/BW and
-large A-MSDU remain absent. Local HT RX/TX include mandatory MCS0..7.
+GI and aggregation limits. Local HT RX/TX include mandatory MCS0..7.
+`with_tx_stbc(enabled)` on both local types advertises HT/VHT Tx STBC (bit7);
+negotiated `tx_stbc()` additionally needs the bound peer's Rx STBC field in
+the original offer and the response, as mac80211/ht.c and vht.c copy peer
+Rx STBC only for a local Tx STBC transmitter (`HtNegotiation::
+peer_rx_stbc_streams`). `LocalVht::with_beamforming(VhtBeamforming)`
+advertises checked SU beamformee (2..8 STS), SU beamformer (2..8 sounding
+dimensions) and MU beamformee roles; MU beamformer is AP-only and never
+emitted. `su_beamformee`/`su_beamformer`/`mu_beamformee` require the
+complementary AP role in offer and response (vht.c
+ieee80211_vht_cap_ie_to_sta_vht_cap), and `Offer::advertised_vht_capability`
+(the request IE) drops beamformee roles the AP cannot sound, as
+mlme.c ieee80211_add_vht_ie does. HT TxBF stays zero, as in mac80211.
+Native NDPA/NDP feedback, steering, STBC encoding and the single MU-MIMO
+owner are backend responsibilities. Large A-MSDU limits are described with
+the shared A-MSDU owner below.
 `LocalVht::with_160mhz(rx_sgi160, tx_sgi160)` opts into contiguous160 and
 directional SGI160. Existing constructors retain their80MHz ceiling;
 `LocalPhy::vht160` requires both this explicit promise and an HT40 companion,
@@ -138,12 +152,330 @@ The FullMAC owner must retain and check those independent native facts.
 
 The opt-in path admits mandatory HT127/VHT126 membership selectors only with
 the corresponding complete compatible PHY, while preserving actual legacy
-basic rates for management frames. GLK/EPD/SAE-H2E/HE/EHT/UHR and unknown
-mandatory selectors remain unsupported. Optional unflagged values grant no
+basic rates for management frames. HE (122), EHT (121) and UHR (120) are
+admitted only with that PHY negotiated, SAE-H2E (123) only for an H2E
+`SecurityMode::Wpa3Sae` plan and EPD (124) only with the `JoinOptions::epd`
+opt-in (see the HE, EHT, UHR, SAE and EPD paragraphs below). GLK (125) and
+unknown mandatory values fail closed: Linux mac80211 also never adds GLK
+("We do not support EPD or GLK", mlme.c), and the IEEE802.11-2020 General
+Link (802.11ak) bridged-link operation has no open reference implementation
+in this tree, so GLK admission is inapplicable and its ledger row was
+removed (2026-10-28). Optional unflagged values grant no
 membership. Present malformed or orphan PHY elements fail instead of becoming
 legacy fallback. Missing optional PHY can retain legacy operation. Generated
 local capability IEs are protocol-owned; caller HT/VHT capabilities and, on
 this path, HT/VHT Operation IEs are rejected before first transmission.
+
+**HE admission (`association::he`).** `LocalHe::new(mac_cap: [u8; 6],
+phy_cap: [u8; 11], rx80: u16, tx80: u16) -> Result<LocalHe, Error>` takes a
+driver's station-iftype HE Capabilities (IEEE802.11ax-2021 9.4.2.248; the
+same octets mt76/rtw89/iwlwifi/ath11k already keep per band). Maps use the
+VHT 2-bit encoding and must include single-stream HE-MCS0..7. PHY B0/B7
+(reserved), B3/B4 (owned by `with_160mhz(rx, tx)` / `with_80p80(rx, tx)`,
+which add the matching MCS/NSS maps) and B55 (owned by
+`with_ppe_thresholds(&[u8])`, length checked with
+`ieee80211_he_ppe_size`) must be clear, as must the non-AP-reserved MU
+Beamformer bit. `LocalPhy::with_he(LocalHe) -> Result<LocalPhy, Error>` opts
+any existing HT/VHT profile into HE (HE160 needs the VHT160 opt-in);
+`LocalPhy::he()` returns it. `HeCapability::parse` / `HeOperation::parse`
+(element-ID-extension 35/36, exposed through `ApElements::he_capability()`
+and `he_operation()`) apply the exact `ieee80211_he_mcs_nss_size`,
+`ieee80211_he_ppe_size` and `ieee80211_he_oper_size` extents; trailing or
+missing octets, duplicates, an HE capability without HE operation or HT, and
+six-GHz Operation Information (this plan admits only 2.4/5GHz) are malformed.
+Reserved Operation bits are ignored on reception (IEEE802.11-2020 9.2.2).
+Negotiation mirrors mac80211: HE is skipped (VHT/HT retained) when the AP
+lacks HE, a 5GHz BSS has no negotiated VHT, the AP's own maps lack HE-MCS0..7
+or its Basic HE-MCS/NSS set (`ieee80211_verify_peer_he_mcs_support`), or no
+local RX/TX map pair covers that set (`ieee80211_verify_sta_he_mcs_support`,
+STRICT, so the iPhone all-zero quirk is not accepted). Embedded VHT Operation
+Information must agree with the VHT Operation element and is refused on
+2.4GHz. `Offer/Negotiated::he() -> Option<&HeNegotiation>` reports
+`width()` (the HT/VHT selection narrowed to both Channel Width Sets: B1 for
+2.4GHz40, B2/B3/B4 for 5GHz40-80/160/80+80), `discontiguous()`,
+`tx_mcs_map()` (local TX ∩ AP RX at that width,
+`ieee80211_he_mcs_intersection`), `rx_mcs_map()`, `peer_mcs_maps()`,
+`peer_capability()`, `operation()` (BSS color/partial/disabled, default PE
+duration, TWT required, TXOP RTS threshold, ER SU disable, basic set,
+co-hosted indicator), `local_capability()` and directional
+`tx_ldpc/rx_ldpc/tx_stbc/rx_stbc/su_beamformee/su_beamformer/mu_beamformee/
+htc_he/twt_requester`. The association request carries the local HE
+Capabilities element only when HE was negotiated (`ieee80211_add_he_ie`);
+an HE offer requires HE in the response and vice versa, and a response can
+neither widen the HE width nor enable a TX map entry or directional feature
+the scan offer did not allow. Drivers still program HE peer records, BSS
+color, PPE/OFDMA/TWT state and regulatory/power authority themselves.
+
+**EHT admission (`association::eht`, IEEE Std 802.11be-2024).**
+`LocalEht::new(mac_cap: [u8; 2], phy_cap: [u8; 9], le80: [u8; 3])`,
+`LocalEht::twenty_only(mac, phy, [u8; 4])`, `with_160mhz([u8; 3])` and
+`with_ppe_thresholds(&[u8])` describe the station's EHT Capabilities
+(9.4.2.323; each MCS/NSS octet is RX max NSS | TX max NSS << 4, single-stream
+MCS0-7 required, 6GHz 320MHz and reserved B0 refused).
+`LocalPhy::with_eht(LocalEht)` requires `with_he` and the set form
+`ieee80211_eht_mcs_nss_size` derives from the local HE Channel Width Set.
+`EhtCapability::parse(body, he_phy0, from_ap)` / `EhtOperation::parse`
+(extension 108/106; `ApElements::eht_capability()/eht_operation()`) use the
+exact Linux extents, refuse PPE fields above `IEEE80211_EHT_PPE_THRES_MAX_LEN`,
+and an EHT element without HE, or a capability without operation, is
+malformed. EHT is negotiated only on top of HE (mac80211
+`ieee80211_determine_ap_chan`) when the Basic EHT-MCS/NSS set fits the local
+<=80 and (with HE160) 160MHz sets (`ieee80211_verify_sta_eht_mcs_support`);
+otherwise HE is kept. EHT Operation Information must equal the HT/VHT-selected
+channel (CCFS0 = channel or primary80 centre, CCFS1 = 160 centre) without
+punctured subchannels: wider, punctured or 80+80 EHT operation, which this
+2.4/5GHz plan cannot represent, also falls back to HE.
+`Offer/Negotiated::eht() -> Option<&EhtNegotiation>` reports `width()` (the HE
+width), `tx_max_nss()`/`rx_max_nss()` per MCS0-7/8-9/10-11/12-13 range (local
+TX limited by AP RX, eht.c `ieee80211_eht_cap_ie_to_sta_eht_cap`),
+`su_beamformee()/su_beamformer()`, `peer_capability()`, `operation()` and
+`local_capability()`. The request carries EHT Capabilities only when EHT
+was negotiated; responses must keep EHT and cannot raise TX NSS or roles.
+Multi-link (MLO) association is not part of `JoinPlan`.
+
+**UHR admission (`association::uhr`, IEEE P802.11bn D1.3 draft).**
+`UhrCapability::parse(body, from_ap)` / `UhrOperation::parse` implement the
+draft UHR Capabilities/Operation (extension 152/151) layouts exactly as Linux
+`ieee80211_uhr_capa_size_ok` / `ieee80211_uhr_oper_size_ok` (DBE capability
+maps for APs only; DPS, NPCA (+bitmap), P-EDCA, DBE (+bitmap) operation
+fields); `ApElements::basic_multi_link()` records a Basic Multi-Link element.
+`LocalUhr::new(mac_cap: [u8; 6], phy_cap: u32)` and
+`LocalPhy::with_uhr(LocalUhr)` (needs EHT) describe the station.
+Admission mirrors mac80211 `check_uhr`: EHT negotiated, UHR Operation plus a
+Basic Multi-Link element, the AP UHR Capabilities outside beacons, NPCA only
+when the AP supports it on an80/160MHz channel with the NPCA primary in the
+opposite half and unpunctured (`cfg80211_chandef_add_npca` /
+`cfg80211_chandef_npca_valid`), and DBE operation consistent with the DBE
+bandwidth field and the AP's DBE capability (DBE widening is not applied).
+Because UHR operation is an MLD association, `JoinPlan` (single-link) never
+negotiates UHR and its UHR selector stays fail-closed; a native owner whose
+firmware associates as a non-AP MLD asserts
+`LocalUhr::for_mld_association()` and uses `Offer::from_elements`, whose
+`Offer/Negotiated::uhr() -> Option<&UhrNegotiation>` reports the peer
+capability, operation and the usable `npca_channel()` (only when the local
+STA supports NPCA). A response must keep or omit UHR consistently.
+
+**EPD (`association::JoinOptions`).** `JoinPlan::prepare_with_options(bss,
+own, ssid, security, Option<LocalPhy>, JoinOptions { epd })` is the
+additive entry point for native framing opt-ins. With `epd` the request sets
+the Capability Information EPD subfield (bit13, IEEE802.11-2020 9.4.1.4) and
+an EPD-mandatory BSS (selector 124, which must also advertise bit13) is
+admitted; the response must keep bit13. `JoinPlan::epd()` is true only for
+such a BSS, and the owner then builds `station_security::Security` with
+`with_epd(true)`: every MSDU, EAPOL included, carries a bare two-octet
+EtherType (5.1.4 EtherType Protocol Discrimination) instead of RFC1042,
+length values and RFC1042 MSDUs are ignored, RFC1042 A-MSDU transmit/receive
+is refused, and `Security::ethernet(frame)` converts admitted data in either
+discrimination. A BSS that does not mandate EPD keeps LPD framing.
+`JoinOptions` is built from `JoinOptions::default()` with the
+`with_epd(bool)`, `with_akms(AkmSet)` and `with_pmf(Pmf)` builders (or
+`..Default::default()`); every field defaults to the earlier behaviour.
+
+**AKM capability and WPA2 PMF (`association::{AkmSet, Pmf}`).**
+`JoinOptions::akms: AkmSet` declares the AKM suites the owner's key path
+implements (cfg80211 `wiphy->akm_suites`): `AkmSet::{NONE, PSK, PSK_SHA256,
+SAE, SAE_EXT_KEY, LEGACY, ALL}` with `with`, `without` and
+`contains_suite(u8)`. The default `AkmSet::LEGACY` (PSK, SAE, SAE-EXT-KEY)
+keeps the earlier selection. The plan picks the most preferred AKM the AP and
+the set share, in wpa_supplicant `wpa_pick_key_mgmt` order (SAE-EXT-KEY under
+H2E, SAE, PSK-SHA256, PSK). A driver without AKM 24's group-19 HMAC-SHA-256
+EAPOL MIC passes `AkmSet::LEGACY.without(AkmSet::SAE_EXT_KEY)` and an AP that
+offers AKM 8 and 24 joins with AKM 8. If no AKM is shared, the result is
+`UnsupportedSecurity`. `JoinOptions::pmf: Pmf` is wpa_supplicant `ieee80211w`
+for `SecurityMode::Wpa2Psk`:
+- `Disabled` is the default and keeps the earlier no-MFPC body, refusing an
+  MFPR AP.
+- `Optional` advertises MFPC.
+- `Required` advertises MFPC|MFPR and refuses an AP without MFPC.
+
+PMF is in force when both RSNEs set MFPC; the AP's group management cipher
+must then be the default BIP-CMAC-128. With `AkmSet::PSK_SHA256` the plan
+also negotiates AKM 6 (PSK-SHA256), so PMF-required WPA2 APs that offer only
+AKM 6 can be joined as Linux does. `JoinPlan::akm() -> Option<KeyMgmt>` and
+`JoinPlan::pmf() -> bool` (always true for SAE) report the outcome.
+`rsn_body()` returns the negotiated RSNE, and an association-response RSNE
+must repeat it. `Security::new` accepts that RSNE (AKM 2/6, MFPC,
+MFPC|MFPR, SPP) and `Security::pmf()` is then true when both sides set
+MFPC: the IGTK is required in M3, BIP and unicast robust-frame CCMP apply as
+for SAE. `Security::new_sae` refuses non-SAE AKMs.
+
+**6 GHz band identity (`association::{channel, six_ghz}`, `reg`).**
+`channel::Band` gains `Ghz6`. `channel::band(u8)` still classifies only the
+2.4/5 GHz legacy numbering and never returns it.
+- `channel::frequency_in(Band, u8) -> Option<u32>` is cfg80211
+  `ieee80211_channel_to_freq_khz` in MHz (6 GHz: 5950 + 5n MHz, channel 2 =
+  5935 MHz).
+- `channel::from_frequency_band(mhz) -> Option<(Band, u8)>` is the inverse.
+- `channel::valid_6ghz(u8)` tests a 6 GHz channel number.
+
+`association::Bss` gains `band: Option<Band>`. `None` means the 2.4/5 GHz
+numbering, so existing literals add `band: None`. `Bss::band()` returns the
+explicit band or the derived one, and `Bss::frequency_mhz()` returns the
+primary frequency. `observe` records the explicit band. `prepare`,
+`prepare_with_phy` and `prepare_with_options` stay 2.4/5 GHz plans and
+refuse a BSS whose explicit band disagrees with `channel::band(channel)`,
+so a 6 GHz channel 1 is never joined as 2412 MHz. Only `prepare_6ghz`
+(below) joins a 6 GHz BSS.
+The `scan::BssInfo.frequency_mhz` scan identity is unchanged.
+
+`he::HeOperation::parse` accepts 6 GHz Operation Information and exposes it
+as `six_ghz_operation() -> Option<six_ghz::He6GhzOperation>`. The 2.4/5 GHz
+`phy::ApElements` parser still refuses an HE Operation that carries it.
+
+`six_ghz::He6GhzOperation { primary, control, ccfs0, ccfs1, min_rate }`
+provides:
+- `channel() -> Result<SixGhzChannel, Error>`: mac80211
+  `ieee80211_chandef_he_6ghz_oper`, HE-only path. It returns 20/40/80/160 or
+  80+80 MHz, `center_mhz` and `center2_mhz`, with the primary validated
+  inside an aligned span.
+- `regulatory_info()`.
+- `power_type(no_afc_client) -> Option<reg::PowerType6Ghz>`: cfg80211
+  `cfg80211_6ghz_power_type`, Linux v7.2 four-bit REG_INFO, where Indoor SP
+  falls back to LPI under NO_6GHZ_AFC_CLIENT.
+- `duplicate_beacon()`.
+
+`six_ghz::He6GhzCapability` (element ID extension 59,
+`EXT_HE_6GHZ_CAPABILITIES`; `parse`, `new`, `bits`, `min_mpdu_start`,
+`max_ampdu_len_exp`, `max_mpdu_len`, `sm_ps`, `rd_responder`, `element()`)
+is the band capability. `ieee80211_put_he_6ghz_cap` builds it from the
+station's own values.
+
+`six_ghz::admit(ies, primary) -> Result<SixGhzBss, Error>` is mac80211
+`ieee80211_determine_chan_mode` for 6 GHz. HE Capabilities, HE 6 GHz Band
+Capabilities and an HE Operation with 6 GHz information whose primary equals
+the receive channel are all required, there is no legacy fallback, and every
+element appears once. A missing capability is `UnsupportedRates`. The result
+`SixGhzBss` carries both HE elements, the band capability, the 6 GHz
+operation, the channel and the power type.
+`six_ghz::admit_with_rule(ies, primary, &RegRule)` also applies cfg80211
+`cfg80211_6ghz_power_type_valid` (`UnsupportedRates` on a power mismatch).
+
+`reg::RegFlags` gains `NO_6GHZ_VLP_CLIENT` and `NO_6GHZ_AFC_CLIENT` (NRGD flag
+bits 4 and 5; nl80211 `NL80211_RRF_NO_6GHZ_*_CLIENT`). It is joined by
+`reg::PowerType6Ghz { Lpi, Sp, Vlp }` and the `RegRule` methods
+`covers_mhz`, `no_6ghz_afc_client` and `allows_6ghz_client(PowerType6Ghz)`.
+`RegRule` also derives `Debug`, `PartialEq` and `Eq`.
+
+**6 GHz JoinPlan (`JoinPlan::prepare_6ghz`, `six_ghz::{SixGhzLocal,
+SixGhzPlan, SixGhzOperatingChannel, SixGhzWidth, plan}`).** Drivers that
+associate through firmware can still use `six_ghz::admit` alone for the
+station-side admission facts.
+- `six_ghz::SixGhzLocal::new(LocalHe, He6GhzCapability, RegRule)` holds the
+  station's 6 GHz HE profile, its band capability (`sband_iftype_data.
+  he_6ghz_capa`; zero is refused) and the regulatory rule covering the BSS
+  primary. `with_eht(LocalEht)` adds EHT. `transmitted_capability()` is
+  mac80211 `ieee80211_put_he_6ghz_cap` with SMPS off (SM PS = disabled).
+  `regulatory_connectivity()` is `ieee80211_put_reg_conn` (LPI valid/set, SP
+  valid, SP set unless `NO_6GHZ_AFC_CLIENT`).
+- `eht::LocalEht::with_320mhz([u8; 3])` adds the 6 GHz 320 MHz set and PHY
+  B1 (it needs the 160 MHz set). `width320()` reports it, and
+  `phy::LocalPhy::with_eht` (2.4/5 GHz) refuses such a profile.
+  `eht::EhtNegotiation::width320()` is true for a 320 MHz selection, whose
+  `width()` reports `OneSixty`.
+- `JoinPlan::prepare_6ghz(bss, own, ssid, security, &SixGhzLocal,
+  JoinOptions)` needs `bss.band == Some(Band::Ghz6)` and a 6 GHz channel. It
+  calls `six_ghz::plan`, which is mac80211 `ieee80211_determine_chan_mode`
+  for `NL80211_BAND_6GHZ`. That applies `admit_with_rule` against the rule,
+  covering power types LPI/SP/VLP, where SP needs AFC and is refused under
+  `NO_6GHZ_AFC_CLIENT` (Indoor SP then falls back to LPI). The channel comes
+  from the 6 GHz Operation Information (`ieee80211_chandef_he_6ghz_oper`),
+  or from EHT Operation Information when local EHT and both AP EHT elements
+  are present. The EHT channel must contain the HE channel (STRICT "HE/EHT
+  incompatible", `InvalidBss`), and a punctured or 80+80 EHT BSS is joined
+  as HE. The channel is then narrowed to both stations' Channel Width Set:
+  HE B2 (40/80), B3 (160), B4 (80+80), and EHT B1 for 320 MHz, which needs
+  negotiated EHT. HE is mandatory, so no usable HE is `UnsupportedRates`.
+  Rates are OFDM-only, as on 5 GHz.
+- 6 GHz security: Linux v7.2 mac80211/cfg80211 do not enforce the
+  802.11ax 6 GHz security rule on the station side; wpa_supplicant's 6 GHz
+  BSS filter does. NARF has no separate BSS filter, so `prepare_6ghz`
+  refuses `Open` and `Wpa2Psk` (`UnsupportedSecurity`) and requires
+  `Wpa3Sae` to resolve to hash-to-element. SAE already requires an
+  MFP-capable AP and sends MFPC|MFPR (PMF required). OWE is not a
+  `SecurityMode`.
+- The association request carries no HT or VHT element. After RSNE/RSNXE
+  it sends HE Capabilities, HE 6 GHz Band Capabilities (ext 59), Non-AP STA
+  Regulatory Connectivity (ext 137, `six_ghz::EXT_NON_AP_STA_REG_CON`) and,
+  when negotiated, EHT Capabilities. `append_sme_ies` refuses HT/VHT
+  Capabilities/Operation on a 6 GHz plan. The association response must
+  carry no HT/VHT element, exactly one HE Capabilities and one HE
+  Operation, and an RSNE that repeats the request's.
+- `JoinPlan::six_ghz() -> Option<&SixGhzPlan>` is `None` for 2.4/5 GHz
+  plans. The state is boxed, adding 8 bytes to `JoinPlan`. `SixGhzPlan`
+  exposes `operation()` (`He6GhzOperation`), `power_type()`,
+  `channel() -> &SixGhzOperatingChannel` (`primary`, `primary_mhz`,
+  `width: SixGhzWidth { Twenty, Forty, Eighty, OneSixty, ThreeTwenty }`,
+  `discontiguous`, `center`/`center_mhz`, `center2`/`center2_mhz`),
+  `width()`, `peer_capability()` and `local_capability()` (the AP's and the
+  transmitted `He6GhzCapability`, for STA_REC_HE_6G), `regulatory_
+  connectivity()`, `he() -> &HeNegotiation` (at most 160 MHz) and
+  `eht() -> Option<&EhtNegotiation>`.
+
+2.4/5 GHz plans are byte-for-byte unchanged.
+
+**Colocated 6 GHz scan (`scan::{parse_colocated_aps, plan_6ghz_scan,
+ColocatedAp, Scan6GhzPlan, Scan6GhzTarget, short_ssid, is_psc_6ghz}`).**
+- `parse_colocated_aps(ies) -> Vec<ColocatedAp>` is cfg80211
+  `cfg80211_parse_colocated_ap` (Linux v7.2 net/wireless/scan.c). It reads
+  the Reduced Neighbor Report elements (`EID_REDUCED_NEIGHBOR_REPORT` = 201)
+  of one 2.4/5 GHz beacon or probe response and keeps only TBTT-type entries
+  with a 6 GHz operating class (131..=135, 137), a TBTT length of 8, 9 or at
+  least 12, a valid unicast BSSID and the colocated-AP bit. Disabled MLD
+  links and repeated BSSID/channel pairs are dropped. A malformed RNR, or a
+  missing or oversized SSID element, yields nothing.
+- `ColocatedAp` carries `bssid`, `channel`/`frequency_mhz`, `short_ssid`
+  (reported, or the reporter's when `same_ssid`), `ssid` (when
+  `same_ssid`), the BSS-parameter flags (`oct_recommended`, `same_ssid`,
+  `multi_bss`, `transmitted_bssid`, `unsolicited_probe`, `colocated_ess`)
+  and `psd_20` (`PSD_RESERVED` when absent).
+- `plan_6ghz_scan(&ScanRequest, &[ColocatedAp], bssid) -> Scan6GhzPlan` is
+  `cfg80211_scan_6ghz`. Without `ScanRequest::colocated_6ghz` it scans
+  every requested 6 GHz frequency and produces no targets. With it, PSC
+  channels (`is_psc_6ghz`: channel % 16 == 5) are scanned blind unless a
+  directed one-SSID scan found a colocated-ESS AP with that SSID. Each
+  colocated AP on a requested channel that matches the SSIDs
+  (`cfg80211_find_ssid_match`, by SSID or `short_ssid()` CRC-32) and the
+  optional BSSID becomes a `Scan6GhzTarget` (`frequency_mhz`, `channel`,
+  `bssid`, `short_ssid`, `unsolicited_probe`, `psd_20`, `psc_no_listen`).
+  Channel usability stays with the driver.
+- `ScanResult` gains `colocated_6ghz: Vec<ColocatedAp>`, so a driver that
+  honours `colocated_6ghz` can return the APs it collected. `BssInfo` and
+  `ScanRequest` are unchanged.
+
+**WPA3-SAE JoinPlan (`association::{SaePwe, SaeJoin, SaeStep}`).**
+`SecurityMode::Wpa3Sae { pwe: SaePwe }` (`HuntAndPeck` / `HashToElement` /
+`Both` = wpa_supplicant `sae_pwe` 0/1/2; `is_sae()`, `is_rsn()`; `is_wpa2()`
+stays PSK-only) admits APs as wpa_supplicant with `ieee80211w=2`: Privacy,
+CCMP-128 group/pairwise, no No-Pairwise, AP MFPC, default or BIP-CMAC-128
+group management cipher, and AKM 24 (SAE-EXT-KEY) preferred under H2E, else
+AKM 8. The AP RSNXE (one checked element) supplies SAE H2E; the SAE-H2E
+membership selector requires it and an H2E PWE (`UnsupportedRates`
+otherwise, like mac80211's selector subset check). `JoinPlan::sae() ->
+Option<&SaeJoin>` exposes `akm()`, `h2e()`, `akm_suite_selector()`,
+`pmkid()`, `station_rsne(pmkid)` and `station_rsnxe()` (H2E for sae_pwe 1/2,
+`wpa_gen_rsnxe`). The driver builds the `SaeSession` (H2E or
+hunting-and-pecking per `h2e()`, `with_akm_suite_selector` for AKM 24) and
+its Commit from its own entropy, then calls
+`start_sae_authentication(&SaeSession) -> Result<&[u8], Error>` (binds the
+MAC pair, PWE method and AKM selector; SAE-PK sessions are refused because
+KeyAuth verification needs the caller's password) and feeds frames to
+`sae_authentication_response(&[u8], &mut SaeSession) ->
+Result<SaeStep, Error>`: `Transmit` (Confirm, or a Commit carrying an
+anti-clogging token, at most `MAX_ANTI_CLOGGING` = 3 rounds, group 19 only),
+`Ignored` (other peers, a reflected Commit, a retransmitted peer Commit) or
+`Associate` (the association request with the SAE PMKID spliced into its
+RSNE). Status codes other than 0/126/76 are terminal `Rejected`; a Commit
+status that disagrees with the PWE method or a Confirm before the peer
+Commit is `Protocol`. `sae_pending_frame()` supplies retransmissions;
+`start_authentication`/`authentication_response` refuse SAE plans. The PMK
+never enters the plan. `rsn_body()` returns the PMKID-bearing RSNE for the
+supplicant; an association-response RSNE must repeat it.
+`station_security::Security::new_sae(own, peer, pmk, station_rsne,
+station_rsnxe, ap_rsne, ap_rsnxe, sequence)` is the matching PMF owner (see
+3.4.2). AKM 24 uses `eapol::KeyMgmt::SaeExtKey` (group 19: KCK/KEK/MIC 16,
+HMAC-SHA-256-128 version-0 MIC, hostap `wpa_eapol_key_mic`), and
+`SaeSession::with_akm_suite_selector([u8; 4])` adds/validates the AKM Suite
+Selector element (hostap `sae_write_commit` / `sae_parse_commit`; H2E only).
 
 `offered_phy()` and `negotiated_phy()` expose read-only directional HT/VHT
 facts, the selected width/center and complete occupied20MHz channel set.
@@ -158,9 +490,25 @@ the actual HT40 pair and a valid peer160-width capability. Both deprecated
 width2/seg0 and revised width1/primary80-seg0/full160-seg1 encodings are
 checked. An80MHz local station may select the actual primary80 half while
 advertising only80MHz support. `Width::OneSixty` exposes the eight-channel
-selection to the native owner. Discontiguous80+80, reserved width encodings
-and extended NSS/BW remain unsupported. SGI160 transmit use cannot gain a
-peer capability omitted from the original scan offer.
+selection to the native owner. Reserved width encodings remain unsupported.
+`LocalVht::with_80p80` opts into discontiguous80+80 (Supported Channel Width
+Set2). The revised width1 encoding with a non-adjacent second CCFS, or
+deprecated width3, selects two canonical80 segments with the primary in
+seg0; adjacent/overlapping/noncanonical segments, or an AP without 80+80
+support, fail closed. The selection reports `Width::OneSixty` (VHT-SIG-A
+CBW160/80+80), `discontiguous()`, `center_channel()` = seg0 and
+`secondary_center_channel()`; `occupied_channels()` lists all eight. A
+local station without the opt-in uses the primary80 segment.
+`LocalVht::with_extended_nss_bw(true)` declares VHT Extended NSS BW Capable
+(Linux IEEE80211_HW_SUPPORTS_VHT_EXT_NSS_BW): the AP's Extended NSS BW
+Support is then interpreted per IEEE802.11-2020 Table 9-272, including the
+HT Operation CCFS2 second segment where mac80211 ieee80211_chandef_vht_oper
+uses it, and the 160/80+80 TX map is truncated to the AP's reduced NSS
+(cfg80211 ieee80211_get_vht_max_nss); reserved supported-width/ext
+combinations fail closed. A non-capable station reads the AP field as0, so
+APs advertising Extended NSS BW are admitted with their legacy width.
+SGI160 transmit use cannot gain a peer capability omitted from the original
+scan offer.
 A response may narrow the original occupied set but cannot expand it. All
 address/status/AID/security/rate/membership/PHY checks precede one atomic
 rate/PHY/Associated transition; failure leaves old rates and no partial PHY
@@ -187,6 +535,16 @@ open-authentication and association requests, and binds responses to the
 local/AP addresses, transaction phase, status and AID. `SecurityMode` carries
 no PMK. Fragmented responses (including a final fragment with nonzero
 SequenceControl fragment number) leave the phase unchanged.
+`mgmt_defrag::Reassembler` is the admission path for them: it reassembles
+unprotected unicast management MPDUs per IEEE802.11-2020 10.6/10.7 with
+mac80211 ieee80211_rx_h_defragment's four-entry round-robin cache,
+two-second lifetime and consecutive fragment numbers within one TA/SN/frame
+type. Gaps, duplicates and foreign fragments are dropped without disturbing
+buffered sequences; group-addressed or protected fragments and results above
+4096 bytes are refused. The result is the first fragment's header with More
+Fragments cleared plus the concatenated bodies, which the plan admits like an
+unfragmented response. The native owner still binds channel/peer, CRC and
+Retry duplicate detection before pushing.
 `append_sme_ies` accepts checked optional elements before first TX;
 `legacy_rates()` returns IEEE-rate bitmaps rather than hardware indices.
 Before association those bitmaps describe the offered scan-time set. A
@@ -400,10 +758,15 @@ TX/RX pair to those available masks, rejects zero or unavailable bits, and
 calls `set_antenna(tx, rx)` only when both halves are supplied. A driver that
 returns `rts_threshold()` also accepts `SET_WIPHY`'s u32 RTS value through
 `set_rts_threshold`; radio-wide policies must be retained for recovery and
-for later virtual-interface creation. Fragmentation threshold requests keep
-the underlying driver's errno: ath11k returns `-EOPNOTSUPP` after the common
-minimum-256 validation because its target firmware cannot transmit More
-Fragments frames.
+for later virtual-interface creation. `SET_WIPHY`'s
+`NL80211_ATTR_WIPHY_FRAG_THRESHOLD` goes to
+`WirelessNetIface::set_fragmentation_threshold(u32) -> Result<(), i32>` after
+`nl80211_set_wiphy`'s validation: values below 256 are `-EINVAL`, `u32::MAX`
+disables fragmentation, and other values are rounded down to an even length.
+The default is `-EOPNOTSUPP` (ath11k keeps it because its target firmware
+cannot transmit More Fragments frames). A driver that implements the setter
+reports the retained value through `fragmentation_threshold()`, and a wiphy
+that reports one also advertises `SET_WIPHY`.
 
 `TxBitrateMask` / `TxBitrateBand` carry the complete nested
 `NL80211_ATTR_TX_RATES` request: the `nl80211_band` ordinal selects one band,
@@ -550,7 +913,14 @@ outside station mode is harmless.
 `TRIGGER_SCAN` accepts `SCAN_FLAGS` FLUSH / AP / COLOCATED_6GHZ (a NARF scan
 always replaces the cached results) and refuses feature-gated flags and
 FREQ_KHZ with -EOPNOTSUPP, probe IEs past the advertised maximum of 0 with
--EINVAL. `CONNECT` accepts the attributes wpa_supplicant and NetworkManager
+-EINVAL. The exception is `NL80211_SCAN_FLAG_RANDOM_SN` (bit 11), which is
+accepted when `WirelessNetIface::supports_scan_random_sn()` is true. Such a
+wiphy advertises `NL80211_EXT_FEATURE_SCAN_RANDOM_SN` (extended bit 29), and
+the request reaches the driver as
+`scan_with_flags(ScanRequest, scan::ScanFlags { random_sn })`. The default
+implementation forwards to `scan`. Requests without a flag still call `scan`.
+`ScanFlags` sits beside `ScanRequest` rather than inside it, so the many
+existing request literals stay valid. `CONNECT` accepts the attributes wpa_supplicant and NetworkManager
 always send (`MAC_HINT`, `WIPHY_FREQ_HINT`, `BG_SCAN_PERIOD`, `PREV_BSSID`,
 HT/VHT capability + mask, `CONTROL_PORT`, `CONTROL_PORT_ETHERTYPE` = ETH_P_PAE,
 `CONTROL_PORT_NO_ENCRYPT`, `SOCKET_OWNER`, `EXTERNAL_AUTH_SUPPORT`, `SAE_PWE`,
@@ -654,6 +1024,29 @@ userspace over AUTHENTICATE as on Linux. The external mode is:
   preserves the associated firmware transport; absent WoW disconnects and
   cold-cycles the interface. `GET_WOWLAN` therefore reports configuration,
   not a promise that the platform is currently asleep.
+- **Scheduled scan.** A wiphy whose
+  `WirelessNetIface::sched_scan_support() -> Option<SchedScanSupport>` is
+  `Some` advertises `NL80211_CMD_START_SCHED_SCAN` / `STOP_SCHED_SCAN` (75 /
+  76, `GENL_UNS_ADMIN_PERM`). It also advertises its limits: MAX_NUM_SCHED_SCAN_SSIDS,
+  MAX_SCHED_SCAN_IE_LEN, MAX_MATCH_SETS, the three plan limits,
+  SCHED_SCAN_MAX_REQS = 1 and, with `random_mac`,
+  `NL80211_FEATURE_SCHED_SCAN_RANDOM_MAC_ADDR`. These replace the WoWLAN
+  net-detect defaults. `SchedScanSupport { max_match_sets, max_ssids,
+  max_ie_len, max_scan_plans, max_plan_interval_secs, max_plan_iterations,
+  max_frequencies, random_mac }` has `SchedScanSupport::NET_DETECT`, the
+  limits the net-detect parser has always applied.
+
+  START parses the request with the same `nl80211_parse_sched_scan` parser
+  that WoWLAN net-detect uses. IFINDEX, SOCKET_OWNER and SCHED_SCAN_MULTI are
+  also allowed. The result is passed to `start_sched_scan(SchedScanRequest)`
+  (`SchedScanRequest = NetDetectConfig`), and the START event is multicast on
+  "scan". STOP (an optional COOKIE must be the legacy request id 0, otherwise
+  -ENOENT) calls `stop_sched_scan()` and multicasts SCHED_SCAN_STOPPED. Both
+  driver hooks default to -EOPNOTSUPP.
+
+  The driver reports matches with `nl80211::notify_sched_scan_results(name)`
+  (`cfg80211_sched_scan_results`, CMD 77) and a firmware-initiated end with
+  `nl80211::notify_sched_scan_stopped(name)` (CMD 78).
 - **BIOS SAR.** A driver with `WirelessNetIface::sar_capability()` includes
   its fixed range table in the nested `NL80211_ATTR_SAR_SPEC` of GET_WIPHY
   and advertises `NL80211_CMD_SET_SAR_SPECS`. The command is wiphy-wide:
@@ -968,6 +1361,13 @@ second local-disconnect event.
 Address4 / QoS TID. It excludes Duration/HT Control, mutes data subtype bits
 4–6 (preserving the QoS indicator), Retry/PM/MoreData and QoS Order, and
 forces Protected. Management subtype and non-QoS Order remain authenticated.
+`station_security::Security` receives +HTC QoS DATA (Order set; the
+four-octet HT Control field follows QoS Control, mac80211
+`ieee80211_hdrlen`) on both the MSDU and the A-MSDU path. It authenticates
+the MPDU as the equivalent 26-octet header with Order clear, which gives the
+same AAD and nonce, and drops the HT Control field. The `RawFrame` contract
+therefore keeps HT Control and Order unmodified, and advertising HTC_HE
+loses no AP traffic. Order on non-QoS DATA is still refused.
 `build_nonce` includes the transmitter address and big-endian 48-bit PN.
 `protect` / `unprotect` take an `AesCcm` backend and are both fallible: a
 backend seal/open refusal propagates as `CcmpError` (`TooLong` for a body
@@ -983,8 +1383,8 @@ a separate non-QoS tracker). These helpers do not grant controlled-port access.
 ### 3.4.2 Retained native station security
 
 `packet_key::{Key, Role}` owns a software CCMP key's immutable peer/KeyID
-binding, non-wrapping 48-bit transmit PN and seventeen receive replay trackers
-(sixteen QoS TIDs plus non-QoS). Pairwise keys transmit only local ToDS data;
+binding, non-wrapping 48-bit transmit PN and eighteen receive replay trackers
+(sixteen QoS TIDs, non-QoS and robust management). Pairwise keys transmit only local ToDS data;
 group keys are receive-only. Full header, fragment, A-MSDU and CCMP extents
 are checked before crypto; identical-key reinstall preserves counters, and
 authentication failure changes neither replay state nor ciphertext.
@@ -1015,19 +1415,62 @@ key/TID replay update. All failures preserve caller ciphertext and replay
 state. Aggregates and standalone QoS MPDUs share the same sixteen replay
 trackers, key epochs and GTK RSC floors. Ordinary CCMP masks A-MSDU-present
 in AAD; the parser's RFC1042 DA check supplies the Linux aggregation-injection
-mitigation without changing interoperable AAD. No SPP A-MSDU support is claimed.
-The original `protect`/`unprotect` continue rejecting A-MSDU headers; TX
-aggregation, hardware-deaggregated RX, BA/reordering and larger VHT limits are
+mitigation without changing interoperable AAD.
+SPP A-MSDU (RSN Capabilities bit10, IEEE802.11-2020 9.4.2.24.4) is negotiated
+only when both RSNEs advertise it: `JoinPlan::enable_spp_amsdu` patches the
+request RSNE before first TX, `station_security::Security::new` accepts that
+station RSNE and reports `spp_amsdu()`, and its pairwise `Key::with_spp_amsdu`
+keeps A-MSDU Present in the CCMP AAD (12.5.3.3.3; mac80211 wpa.c
+ccmp_gcmp_aad with `spp_amsdu`, `ccmp::build_aad_spp_amsdu`). Group keys keep
+the ordinary AAD. A flipped A-MSDU Present bit then fails the MIC.
+WPA3-SAE/PMF: `Security::new_sae(own, peer, pmk, station_rsne,
+station_rsnxe, ap_rsne, ap_rsnxe, sequence)` accepts exactly the JoinPlan SAE
+station RSNE (CCMP-128, AKM 8 or 24, MFPC|MFPR, at most one PMKID, default
+BIP-CMAC-128) against an AP RSNE offering that AKM with MFPC, and runs the
+shared supplicant with `pmf`, a16-octet IGTK and the station RSNXE repeated in
+M2 (`Security::new` refuses SAE profiles; `new_sae` refuses PSK). The first
+M3 must carry an IGTK KDE (IEEE802.11-2020 12.7.6.4); Group Key messages may
+rotate it. IGTKs pass the same key-reuse history and are installed into an
+`mfp::MfpKeyStore` with `rx_pn` = KDE IPN only after exact reply delivery.
+`pmf()` reports the mode. `receive_management(&impl RawFrame) ->
+Result<MgmtRx, Error>` applies mac80211 `ieee80211_drop_unencrypted_mgmt`
+once the PTK is installed: unicast robust frames (Deauthentication,
+Disassociation, Action except the Linux `_ieee80211_is_robust_mgmt_frame`
+non-robust categories) must be CCMP-protected with the pairwise key and pass
+a dedicated management replay counter (`Key::protect_management` /
+`unprotect_management`: management nonce flag and unmasked subtype AAD);
+group robust frames must carry a valid BIP-CMAC-128 MMIE with an IPN above the
+installed one. Failures and unprotected robust frames are `Ignored`;
+non-robust and pre-key frames pass unchanged. `protect_management(&[u8])`
+CCMP-protects a station Deauthentication/Disassociation/robust Action to the
+AP after the PMF port opens. SA Query and deauthentication policy remain the
+MLME owner's.
+The original `protect`/`unprotect` continue rejecting A-MSDU headers.
+`amsdu::Limit` names the HT3839/HT7935 A-MSDU and VHT3895/7991/11454 MPDU
+sizes (body bound = MPDU minus the46-byte protected QoS/CCMP/FCS overhead);
+`decode_with_limit` and `AmsduAdmission::with_limit` admit a larger aggregate
+only under the size the station actually advertised. Transmit uses
+`amsdu::encode` (zero inter-subframe padding, the receive-side DA/SA/protocol
+rules, peer limit), `Key::protect_amsdu` (ToDS, Normal Ack, Address3 = BSSID
+per Table 9-30 as mac80211 ieee80211_amsdu_prepare_head writes it) and
+`Security::transmit_amsdu_qos`, which consumes one QoS SN and one PN and never
+aggregates the control port. Hardware-deaggregated RX and BA sessions remain
 separate native ownership contracts.
 
 `Key::unprotect_amsdu_block_ack` is an additional opt-in after a driver proves
 a live unicast BA agreement and releases the whole original MPDU in SN order.
 It accepts both normal ACK and BlockAck QoS policy (`0x80`/`0xe0` aggregate
 high nibbles), retaining the original header, TID, CCMP key/PN and atomic
-whole-aggregate validation. Multicast BlockAck, NoAck, NoExplicitAck and EOSP
-remain absent. The existing aggregate method stays normal-ACK-only and ordinary
-packet methods keep rejecting aggregates. The helper supplies no BA session,
-native completion or ordering proof.
+whole-aggregate validation. `Key::unprotect_amsdu_with`/
+`Security::receive_amsdu_with` take an explicit `AmsduAdmission`: No Ack
+(unicast and group, as mac80211 ieee80211_set_qos_hdr marks group QoS data),
+No Explicit Ack and BlockAck (unicast only) and EOSP (IEEE802.11-2020
+9.2.4.5.3/9.2.4.5.4) are each separate opt-ins, and `AmsduReceive` returns
+the frames with the original TID, `AckPolicy` and EOSP bit for the driver's
+U-APSD owner. Multicast BlockAck stays refused. The existing aggregate
+methods keep their normal-ACK/BlockAck-only profiles and ordinary packet
+methods keep rejecting aggregates. The helper supplies no BA session, native
+completion or ordering proof.
 
 `reorder::Reorder<T>` supplies a bounded opaque native-MPDU sequence owner,
 independent of crypto, radio, policy and controlled-port authority. Construction
@@ -1261,6 +1704,22 @@ overlapping restriction because another rule grants a wider channel span;
 future relaxation needs an explicit firmware/regulatory proof. nl80211
 GET_REG maps this flag to Linux `NL80211_RRF_NO_IR` (bit7). Older readers that
 do not recognize NRGD bit3 reject the policy rather than ignore it.
+Bits 4 and 5 are NO_6GHZ_VLP_CLIENT and NO_6GHZ_AFC_CLIENT (GET_REG bits 22
+and 23). Bit 6, WMM_ETSI, attaches wireless-regdb's `wmmrule=ETSI` (ETSI EN
+301 893), the only WMM rule in `db.txt`. The 6 GHz bits are described with
+6 GHz band identity in §3.
+
+**Regulatory WMM rule (`reg::{WmmRule, WmmAcRule}`).** `RegRule::wmm_rule()
+-> Option<WmmRule>` is cfg80211 `ieee80211_reg_rule.wmm_rule` with
+`has_wmm`. `RegulatoryDomain::rule_for(mhz)` (`freq_reg_info`) and
+`wmm_rule_for(mhz)` (`reg_query_regdb_wmm`) look it up by channel.
+`WmmRule { client, ap }` holds `[WmmAcRule { cw_min, cw_max, cot_us,
+aifsn }; 4]` in mac80211 AC order (VO, VI, BE, BK). `WmmRule::ETSI` copies
+the `db.txt` values. `WmmRule::limit(ac, ap, wmm::Ac) -> wmm::Ac` is mac80211
+`ieee80211_regulatory_limit_wmm_params`: it raises ECWmin, ECWmax and AIFSN to
+the floor and caps TXOP at COT/32 us. `limit_parameters(ap, wmm::Parameters)`
+applies it in the parser's ACI order (BE, BK, VI, VO). A driver applies it to
+every EDCA set it programs on a channel whose rule carries the WMM rule.
 The driver intersects the selected host rule with firmware MCC permission
 and applies its power ceiling before transmitting association frames.
 

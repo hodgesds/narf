@@ -50,6 +50,21 @@ impl Environment {
                 let authority = narf_firmware::trusted_loader_authority()
                     .and_then(|c| c.derive().ok())
                     .ok_or("MVM power loader authority unavailable")?;
+                for bits in owner.feature_offers() {
+                    let request = owner.transmit_power_request_for(
+                        super::mvm_boot::PowerEmission::Features(bits),
+                    )?;
+                    match crate::firmware_asset::load(&authority, &request.name, 64, true) {
+                        Ok(source) => {
+                            owner.select_feature_power(&source, request.binding, bits)?;
+                            return Ok((source, request.binding));
+                        }
+                        // An absent optional program keeps the narrower
+                        // BE-only program; an invalid one never downgrades.
+                        Err(narf_firmware::FirmwareError::NotFound) => {}
+                        Err(_) => return Err("MVM signed feature power source invalid"),
+                    }
+                }
                 if owner.nested_ba_offer() {
                     let request = owner
                         .transmit_power_request_for(super::mvm_boot::PowerEmission::Ht20NestedBa)?;
@@ -85,13 +100,17 @@ enum Operation {
     Maintain,
     Transmit,
     Close,
+    /// Firmware/transport restart of a failed owner (`Owner::recover`).
+    Recover,
+    /// System-suspend transport stop (`Owner::suspend_transport`).
+    Suspend,
 }
 struct Join {
     bssid: [u8; 6],
     ssid: Vec<u8>,
     channel: u8,
     elements: Vec<u8>,
-    pmk: Option<Zeroizing<[u8; 32]>>,
+    credential: super::mvm_boot::Credential,
 }
 enum Outcome {
     Scan(Vec<BssInfo>),
@@ -113,10 +132,13 @@ pub(super) struct Device {
     mac: [u8; 6],
     channels: Vec<u8>,
     wpa2: bool,
+    sae: bool,
     ht20: bool,
     irq: Option<u8>,
     publication: AtomicBool,
     terminal: AtomicBool,
+    /// Set by a completed system-suspend stop until resume restarts it.
+    suspended: AtomicBool,
     stopping: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
     up: AtomicBool,
@@ -216,6 +238,7 @@ impl Device {
         let channels = nvm.channels.clone();
         let irq = owner.station_irq();
         let wpa2 = owner.station_wpa2_supported();
+        let sae = owner.station_sae_supported();
         let ht20 = owner.supports_native_ht20();
         let stopping = Arc::new(AtomicBool::new(false));
         owner.bind_station_stop(stopping.clone());
@@ -234,10 +257,12 @@ impl Device {
             mac,
             channels,
             wpa2,
+            sae,
             ht20,
             irq,
             publication: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
+            suspended: AtomicBool::new(false),
             stopping,
             generation: Arc::new(AtomicU64::new(0)),
             up: AtomicBool::new(false),
@@ -327,31 +352,43 @@ impl Device {
         if !self.publication.load(Ordering::Acquire) {
             return Err("MVM native interface is not published");
         }
-        if self.terminal.load(Ordering::Acquire) {
+        let recovering = matches!(operation, Operation::Recover);
+        let suspending = matches!(operation, Operation::Suspend);
+        let terminal = self.terminal.load(Ordering::Acquire);
+        if recovering && !terminal {
+            return Err("MVM recovery requires a terminal station");
+        }
+        if terminal && !recovering && !suspending {
             return Err("MVM station is terminal");
         }
         if self.stopping.load(Ordering::Acquire) && !matches!(operation, Operation::Close) {
             return Err("MVM station is closing");
         }
+        // Generation exhaustion is terminal for the publication itself.
+        if recovering && self.generation.load(Ordering::Acquire) == u64::MAX {
+            return Err("MVM publication generation exhausted");
+        }
         let mut slot = self.control.try_lock().ok_or("MVM control busy")?;
         if slot.is_some() {
             return Err("MVM control busy");
         }
-        {
+        let restart = {
             let state = self.state.try_lock().ok_or("MVM control busy")?;
-            let phase = state
-                .owner
-                .as_ref()
-                .ok_or("MVM native owner absent")?
-                .phase();
+            let owner = state.owner.as_ref().ok_or("MVM native owner absent")?;
+            let phase = owner.phase();
             if (matches!(operation, Operation::Scan(..) | Operation::Join(_))
                 && phase != Phase::Configured)
                 || (matches!(operation, Operation::Maintain | Operation::Transmit)
                     && phase != Phase::DataPrepared)
+                || (recovering && !owner.station_failed())
+                || (suspending && phase != Phase::Configured && !owner.station_failed())
             {
                 return Err("MVM control busy");
             }
-        }
+            // The restart clears bus mastering before ALIVE re-enables it,
+            // so it is polled under the boot (non-master) authority.
+            recovering.then(|| owner.station_source(self.source.firmware, false))
+        };
         let device = self.me.upgrade().ok_or("MVM native owner disappeared")?;
         let reply = Arc::new(IrqSafeSpinLock::new(Completion {
             result: None,
@@ -376,8 +413,14 @@ impl Device {
             let result = {
                 let mut future = pin!(device.execute(&mut state, operation));
                 poll_fn(|cx| {
+                    if let Some(boot) = restart.as_ref() {
+                        return match boot.invoke(|| Ok(future.as_mut().poll(cx))) {
+                            Ok(result) => result,
+                            Err(error) => Poll::Ready(Err(error)),
+                        };
+                    }
                     match device.source.invoke(|| {
-                        if closing {
+                        if closing || suspending {
                             return Ok(future.as_mut().poll(cx));
                         }
                         let domain = (device.environment.policy)()?;
@@ -438,6 +481,25 @@ impl Device {
             } else if closing {
                 let _publication = device.admission.lock();
                 device.stopping.store(false, Ordering::Release);
+            } else if suspending {
+                owner.station_fail();
+                device.down(true);
+                state.pending = None;
+                state.scan_time = None;
+                device.suspended.store(true, Ordering::Release);
+            } else if restart.is_some() {
+                // The restarted owner is Configured with no port; reopen
+                // control only while the publication itself stays current.
+                let _publication = device.admission.lock();
+                if owner.phase() == Phase::Configured
+                    && !owner.station_failed()
+                    && device.source.invoke(|| Ok(())).is_ok()
+                    && !device.stopping.load(Ordering::Acquire)
+                {
+                    state.pending = None;
+                    state.scan_time = None;
+                    device.terminal.store(false, Ordering::Release);
+                }
             }
             let wake = {
                 let mut completion = result_slot.lock();
@@ -449,6 +511,54 @@ impl Device {
             }
         }));
         Ok(reply)
+    }
+    /// A terminal station whose native owner failed is restarted before the
+    /// next scan (Linux restarts from the error path; NARF defers it to the
+    /// next control request so the retained worker owns it). The restart
+    /// runs as retained control work: dropping this waiter cannot cancel it.
+    async fn recover_failed(&self) -> Result<(), &'static str> {
+        if !self.terminal.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let reply = self.begin(Operation::Recover)?;
+        self.wait(reply).await?;
+        if self.terminal.load(Ordering::Acquire) {
+            return Err("MVM recovery did not reopen the station");
+        }
+        Ok(())
+    }
+    /// Linux non-WoWLAN system suspend: mac80211 `ieee80211_mgd_quiesce`
+    /// leaves the BSS with a deauthentication (the ordinary close owner),
+    /// then `iwl_mvm_mac_stop` stops the transport. Idempotent while
+    /// suspended.
+    pub(super) async fn system_suspend(&self) -> Result<(), &'static str> {
+        if self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if !self.terminal.load(Ordering::Acquire) {
+            WirelessNetIface::disassociate(self)
+                .await
+                .map_err(|_| "MVM suspend could not leave the BSS")?;
+        }
+        let reply = self.begin(Operation::Suspend)?;
+        self.wait(reply).await?;
+        if !self.suspended.load(Ordering::Acquire) {
+            return Err("MVM suspend did not stop the transport");
+        }
+        Ok(())
+    }
+    /// Resume: `ieee80211_reconfig` -> `iwl_mvm_up` on the stopped device,
+    /// through the same retained restart as firmware recovery. The station
+    /// starts unassociated; the SME rejoins after a new scan.
+    pub(super) async fn system_resume(&self) -> Result<(), &'static str> {
+        if !self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let result = self.recover_failed().await;
+        if result.is_ok() {
+            self.suspended.store(false, Ordering::Release);
+        }
+        result
     }
     async fn wait(&self, reply: Reply) -> Result<Outcome, &'static str> {
         poll_fn(|cx| {
@@ -513,8 +623,9 @@ impl Device {
                     &request.ssid,
                     request.channel,
                     &request.elements,
-                    request.pmk.is_some(),
+                    request.credential.mode(),
                 )?;
+                owner.restrict_offer(&(self.environment.policy)()?);
                 let (source, binding) = (self.environment.power)(owner)?;
                 owner
                     .station_join(
@@ -522,7 +633,7 @@ impl Device {
                         &request.ssid,
                         request.channel,
                         &request.elements,
-                        request.pmk,
+                        request.credential,
                         source,
                         binding,
                         self.stopping.clone(),
@@ -546,8 +657,15 @@ impl Device {
                 if self.stopping.load(Ordering::Acquire) {
                     return Err("MVM data stopped before native publication");
                 }
-                if owner.station_can_pipeline() {
-                    let mut packets = alloc::vec![frame.payload().to_vec()];
+                let prepare = |frame: &Frame| {
+                    let mut bytes = frame.payload().to_vec();
+                    super::csum::prepare_tx(&mut bytes, frame.tx_meta().csum_l4)
+                        .map(|assist| (bytes, assist))
+                };
+                // The BA pipeline carries only BE/TID0; other QoS TIDs use
+                // their own DQA queue singly.
+                if owner.station_can_pipeline() && owner.data_tid(frame.payload()) == 0 {
+                    let mut packets = alloc::vec![prepare(&frame)?];
                     if let Some(tx) = transmit.as_mut() {
                         for _ in 1..8 {
                             let Some(next) =
@@ -555,17 +673,25 @@ impl Device {
                             else {
                                 break;
                             };
-                            if admitted(next.payload(), self.mac, next.tx_meta()) {
-                                packets.push(next.payload().to_vec());
+                            if !admitted(next.payload(), self.mac, next.tx_meta()) {
+                                continue;
                             }
+                            if owner.data_tid(next.payload()) != 0 {
+                                // Keep order within this TID: it is the next
+                                // single send.
+                                *pending = Some(next);
+                                break;
+                            }
+                            packets.push(prepare(&next)?);
                         }
                     }
                     owner
                         .transmit_data_batch_using(&packets, || (self.environment.policy)())
                         .await?;
                 } else {
+                    let (bytes, assist) = prepare(&frame)?;
                     owner
-                        .station_send(frame.payload(), || (self.environment.policy)())
+                        .station_send(&bytes, assist, || (self.environment.policy)())
                         .await?;
                 }
                 Ok(Outcome::Done)
@@ -579,7 +705,35 @@ impl Device {
                         }
                     }
                 }
-                owner.station_close().await?;
+                owner.station_close(|| (self.environment.policy)()).await?;
+                Ok(Outcome::Done)
+            }
+            Operation::Recover => {
+                // Host frames queued for the failed station never reach the
+                // restarted instance (mac80211 drops them on restart).
+                *pending = None;
+                *scan_time = None;
+                if let Some(tx) = transmit.as_mut() {
+                    for _ in 0..TX_RING_N {
+                        if !matches!(tx.try_recv(), Ok(Some(_))) {
+                            break;
+                        }
+                    }
+                }
+                owner.recover().await?;
+                Ok(Outcome::Done)
+            }
+            Operation::Suspend => {
+                *pending = None;
+                *scan_time = None;
+                if let Some(tx) = transmit.as_mut() {
+                    for _ in 0..TX_RING_N {
+                        if !matches!(tx.try_recv(), Ok(Some(_))) {
+                            break;
+                        }
+                    }
+                }
+                owner.suspend_transport().await?;
                 Ok(Outcome::Done)
             }
         }
@@ -617,7 +771,10 @@ impl Device {
             let mut output = Vec::new();
             for _ in 0..64 {
                 match owner.station_receive(|| (self.environment.policy)())? {
-                    Some(LegacyReceive::Ethernet(frame)) => output.push(frame),
+                    Some(LegacyReceive::Ethernet(frame)) => {
+                        output.push((frame, narf_net::RxMeta::default()))
+                    }
+                    Some(LegacyReceive::Checked(frame, meta)) => output.push((frame, meta)),
                     Some(LegacyReceive::Eapol(_)) => {
                         return Err("MVM secured station lost its native RSNA owner")
                     }
@@ -625,7 +782,7 @@ impl Device {
                 }
             }
             if owner.station_needs_security() {
-                for frame in output.into_iter().rev() {
+                for (frame, _) in output.into_iter().rev() {
                     owner.station_defer_packet(frame);
                 }
                 let _publication = self.admission.lock();
@@ -643,12 +800,13 @@ impl Device {
                     self.generation.load(Ordering::Acquire),
                 ),
             };
-            for bytes in &output {
+            for (bytes, meta) in &output {
                 if let (Some(rx), Ok(memory)) =
                     (&mut state.receive, super::runtime::dma_alloc(bytes.len()))
                 {
                     let mut frame = Frame::new(memory, bytes.len() as u32);
                     frame.payload_mut().copy_from_slice(bytes);
+                    frame.set_rx_meta(*meta);
                     let _publication = self.admission.lock();
                     authority.invoke(&(self.environment.policy)()?, || {
                         if !self.port.load(Ordering::Acquire)
@@ -680,7 +838,7 @@ impl Device {
             Ok((
                 output
                     .into_iter()
-                    .map(|frame| (frame, authority.clone()))
+                    .map(|(frame, _)| (frame, authority.clone()))
                     .collect(),
                 false,
                 send,
@@ -814,6 +972,7 @@ impl Device {
             drop(active);
             narf_net::iface::register(self.name(), self.mac, send_frame);
             narf_net::iface::set_link_metadata(self.name(), false, None, None);
+            narf_net::iface::set_offloads(self.name(), super::csum::OFFLOADS);
             narf_net::iface::set_driver_info(
                 self.name(),
                 "iwlwifi-mvm",
@@ -825,6 +984,10 @@ impl Device {
             Ok(())
         })?;
         if worker {
+            narf_power::system_pm::register_async_system_pm(
+                "iwlwifi-mvm",
+                Arc::new(SystemPm(self.clone())),
+            );
             let device = self.clone();
             narf_scheduler::spawn(async move {
                 device.pump().await;
@@ -886,13 +1049,17 @@ impl WirelessNetIface for Device {
     fn supports_handshake_offload(&self) -> bool {
         self.wpa2
     }
+    /// Host SAE plus the native PMF key owner (§3.33).
+    fn supports_sae_offload(&self) -> bool {
+        self.sae
+    }
     fn reports_disconnect_events(&self) -> bool {
         true
     }
     fn phy_capabilities(&self, band_mhz: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
         (self.ht20 && matches!(band_mhz, 2400 | 5000)).then(|| {
             narf_wireless::iface::PhyCapabilities {
-                ht: narf_wireless::association::phy::LocalHt::siso20(true, true).capability_body(),
+                ht: super::mvm_boot::local_ht().capability_body(),
                 vht: None,
             }
         })
@@ -980,6 +1147,7 @@ impl WirelessNetIface for Device {
             }
             channels
         };
+        self.recover_failed().await.map_err(error)?;
         let reply = self
             .begin(Operation::Scan(channels, request.ssids))
             .map_err(error)?;
@@ -1000,21 +1168,17 @@ impl WirelessNetIface for Device {
         {
             return Err(WirelessError::InvalidArgs);
         }
-        if !matches!(
-            request.security,
-            narf_wireless::SecurityConfig::Open | narf_wireless::SecurityConfig::Wpa2 { .. }
-        ) {
-            return Err(WirelessError::NotSupported);
-        }
-        if matches!(request.security, narf_wireless::SecurityConfig::Wpa2 { .. }) && !self.wpa2 {
-            return Err(WirelessError::NotSupported);
-        }
-        let pmk = match &mut request.security {
-            narf_wireless::SecurityConfig::Open => None,
-            narf_wireless::SecurityConfig::Wpa2 { psk } => {
+        use super::mvm_boot::Credential;
+        let credential = match &mut request.security {
+            narf_wireless::SecurityConfig::Open => Credential::Open,
+            narf_wireless::SecurityConfig::Wpa2 { psk } if self.wpa2 => {
                 let key = Zeroizing::new(*psk);
                 psk.zeroize();
-                Some(key)
+                Credential::Psk(key)
+            }
+            narf_wireless::SecurityConfig::Wpa3 { password } if self.sae => {
+                let secret = Zeroizing::new(core::mem::take(password));
+                Credential::Sae(secret)
             }
             _ => return Err(WirelessError::NotSupported),
         };
@@ -1023,7 +1187,7 @@ impl WirelessNetIface for Device {
             ssid: request.ssid,
             channel,
             elements: request.ie,
-            pmk,
+            credential,
         };
         let reply = self.begin(Operation::Join(join)).map_err(error)?;
         self.wait(reply).await.map_err(error).map(|_| ())
@@ -1056,6 +1220,26 @@ impl WirelessNetIface for Device {
     }
 }
 struct Registered(Arc<Device>);
+/// Interrupt-driven half of Linux `iwl_pci_suspend`/`iwl_pci_resume`
+/// (`mvm/d3.c` without WoWLAN): it needs the scheduler and device
+/// interrupts, so it runs in the asynchronous system-PM phase rather than
+/// the interrupt-gated `DevicePmOps` fan-out.
+struct SystemPm(Arc<Device>);
+fn pm_error(error: &'static str) -> narf_power::device_pm::DevicePmError {
+    if error == "MVM control busy" || error == "MVM station is closing" {
+        narf_power::device_pm::DevicePmError::Busy
+    } else {
+        narf_power::device_pm::DevicePmError::DriverError
+    }
+}
+impl narf_power::system_pm::AsyncSystemPm for SystemPm {
+    fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        Box::pin(async move { self.0.system_suspend().await.map_err(pm_error) })
+    }
+    fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        Box::pin(async move { self.0.system_resume().await.map_err(pm_error) })
+    }
+}
 fn admitted(bytes: &[u8], mac: [u8; 6], meta: narf_net::TxMeta) -> bool {
     (14..=1514).contains(&bytes.len())
         && bytes[6..12] == mac
@@ -1064,9 +1248,7 @@ fn admitted(bytes: &[u8], mac: [u8; 6], meta: narf_net::TxMeta) -> bool {
             u16::from_be_bytes([bytes[12], bytes[13]]),
             0x888e | 0x80f3 | 0x8137
         )
-        && meta.csum_l4.is_none()
-        && meta.tso_mss.is_none()
-        && meta.vlan_tag.is_none()
+        && super::csum::tx_admissible(bytes, meta)
 }
 fn channel_frequency(channel: u8) -> u32 {
     if channel == 14 {
@@ -1080,6 +1262,9 @@ fn channel_frequency(channel: u8) -> u32 {
 impl Interface for Registered {
     fn name(&self) -> &str {
         self.0.name()
+    }
+    fn offloads(&self) -> narf_net::OffloadCapabilities {
+        super::csum::OFFLOADS
     }
     fn mac(&self) -> [u8; 6] {
         self.0.mac()

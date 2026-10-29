@@ -52,8 +52,10 @@ pub struct Completion {
     pub status: u32,
 }
 pub(super) fn validate(frame: &[u8], own: [u8; 6], bssid: [u8; 6]) -> Result<(), Error> {
+    // Only the CCMP-protected robust frames below may set Protected.
+    let protected = frame.get(1) == Some(&0x40) && matches!(frame[0], 0xa0 | 0xc0 | 0xd0);
     if !(24..=2304).contains(&frame.len())
-        || frame[1] != 0
+        || frame[1] != 0 && !protected
         || frame[22] & 15 != 0
         || frame[4..10] != bssid
         || frame[10..16] != own
@@ -64,6 +66,24 @@ pub(super) fn validate(frame: &[u8], own: [u8; 6], bssid: [u8; 6]) -> Result<(),
     match frame[0] {
         // Initial unprotected Open-System Authentication, transaction1 only.
         0xb0 if frame.len() == 30 && frame[24..30] == [0, 0, 1, 0, 0, 0] => Ok(()),
+        // SAE Commit (transaction1, status0 or 126 SAE_HASH_TO_ELEMENT) and
+        // Confirm (transaction2, status0): IEEE 802.11-2020 9.3.3.12,
+        // wpa_supplicant `sme_send_authentication` algorithm3.
+        0xb0 if frame.len() > 30
+            && frame[24..26] == [3, 0]
+            && matches!(
+                (frame[26], frame[27], frame[28], frame[29]),
+                (1, 0, 0 | 126, 0) | (2, 0, 0, 0)
+            ) =>
+        {
+            Ok(())
+        }
+        // PMF robust frames to the AP, already CCMP-protected by the host
+        // (8-byte CCMP header, 8-byte MIC): Disassociation/Deauthentication
+        // (2-byte reason) and the SA Query Response (category8, action1,
+        // 2-byte transaction id; mac80211 ieee80211_process_sa_query_req).
+        0xa0 | 0xc0 if protected && frame.len() == 24 + 8 + 2 + 8 => Ok(()),
+        0xd0 if protected && frame.len() == 24 + 8 + 4 + 8 => Ok(()),
         // Association Request fixed capability/listen interval followed by IEs.
         0 if frame.len() >= 28 => {
             let mut ies = &frame[28..];

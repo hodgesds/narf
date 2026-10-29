@@ -22,6 +22,7 @@ pub(super) fn ht_bss() -> ScanBss {
         bssid: AP,
         ssid: b"narf".to_vec(),
         channel: 6,
+        band: None,
         signal_dbm: Some(-45),
         capability: 1,
         beacon_interval: 100,

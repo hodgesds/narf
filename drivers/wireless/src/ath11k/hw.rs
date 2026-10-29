@@ -32,8 +32,10 @@ pub const ATH11K_DEV_WCN6855: u16 = 0x1103;
 pub const ATH11K_DEV_QCN9074: u16 = 0x1104;
 
 /// Hardware revision tag — drives per-chip register/MHI/DP config.
-/// The PCI-attached subset of Linux `enum ath11k_hw_rev`, plus
-/// `Unknown` for a stepping `ath11k_pci_probe` rejects.
+/// Linux `enum ath11k_hw_rev`: the PCI parts, the AHB / hybrid-bus
+/// SoC parts (`Ipq8074`, `Ipq6018Hw10`, `Ipq5018Hw10`, `Wcn6750Hw10`,
+/// bound through [`super::ahb`]), plus `Unknown` for a stepping
+/// `ath11k_pci_probe` rejects.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HwRev {
     Qca6390Hw20,
@@ -42,6 +44,14 @@ pub enum HwRev {
     Wcn6855Hw21,
     Qca2066Hw21,
     Qca6698aqHw21,
+    /// `ATH11K_HW_IPQ8074` (AHB).
+    Ipq8074,
+    /// `ATH11K_HW_IPQ6018_HW10` (AHB).
+    Ipq6018Hw10,
+    /// `ATH11K_HW_IPQ5018_HW10` (AHB, remapped CE window).
+    Ipq5018Hw10,
+    /// `ATH11K_HW_WCN6750_HW10` (hybrid bus: AHB glue, PCIe-style MSI).
+    Wcn6750Hw10,
     Unknown,
 }
 
@@ -54,6 +64,10 @@ impl HwRev {
             HwRev::Wcn6855Hw21 => "WCN6855 HW2.1",
             HwRev::Qca2066Hw21 => "QCA2066 HW2.1",
             HwRev::Qca6698aqHw21 => "QCA6698AQ HW2.1",
+            HwRev::Ipq8074 => "IPQ8074 HW2.0",
+            HwRev::Ipq6018Hw10 => "IPQ6018 HW1.0",
+            HwRev::Ipq5018Hw10 => "IPQ5018 HW1.0",
+            HwRev::Wcn6750Hw10 => "WCN6750 HW1.0",
             HwRev::Unknown => "ath11k unknown",
         }
     }
@@ -68,9 +82,87 @@ impl HwRev {
             HwRev::Wcn6855Hw21 => "WCN6855/hw2.1",
             HwRev::Qca2066Hw21 => "QCA2066/hw2.1",
             HwRev::Qca6698aqHw21 => "QCA6698AQ/hw2.1",
+            HwRev::Ipq8074 | HwRev::Ipq6018Hw10 | HwRev::Ipq5018Hw10 | HwRev::Wcn6750Hw10 => {
+                return self.ahb_chip().map(|c| c.params().fw_dir)
+            }
             HwRev::Unknown => return None,
         })
     }
+
+    /// The AHB / hybrid-bus chip this revision names (`None` for PCI).
+    pub const fn ahb_chip(self) -> Option<super::ahb::AhbChip> {
+        use super::ahb::AhbChip;
+        match self {
+            HwRev::Ipq8074 => Some(AhbChip::Ipq8074),
+            HwRev::Ipq6018Hw10 => Some(AhbChip::Ipq6018Hw10),
+            HwRev::Ipq5018Hw10 => Some(AhbChip::Ipq5018Hw10),
+            HwRev::Wcn6750Hw10 => Some(AhbChip::Wcn6750Hw10),
+            _ => None,
+        }
+    }
+
+    /// `hw_params.spectral` from Linux `core.c::ath11k_hw_params`.
+    /// QCA6390, WCN6855, QCA2066, QCA6698AQ and WCN6750 have an all-zero
+    /// block; QCN9074 / IPQ5018 and IPQ8074 / IPQ6018 define FFT report
+    /// formats.
+    pub const fn spectral(self) -> SpectralParams {
+        match self {
+            HwRev::Ipq8074 => SpectralParams {
+                fft_sz: 2,
+                fft_pad_sz: 2,
+                summary_pad_sz: 0,
+                fft_hdr_len: 16,
+                max_fft_bins: 512,
+                fragment_160mhz: true,
+            },
+            HwRev::Ipq6018Hw10 => SpectralParams {
+                fft_sz: 4,
+                fft_pad_sz: 0,
+                summary_pad_sz: 0,
+                fft_hdr_len: 16,
+                max_fft_bins: 512,
+                fragment_160mhz: true,
+            },
+            HwRev::Qcn9074Hw10 | HwRev::Ipq5018Hw10 => SpectralParams {
+                fft_sz: 2,
+                fft_pad_sz: 0,
+                summary_pad_sz: 16,
+                fft_hdr_len: 24,
+                max_fft_bins: 1024,
+                fragment_160mhz: false,
+            },
+            _ => SpectralParams {
+                fft_sz: 0,
+                fft_pad_sz: 0,
+                summary_pad_sz: 0,
+                fft_hdr_len: 0,
+                max_fft_bins: 0,
+                fragment_160mhz: false,
+            },
+        }
+    }
+}
+
+/// `struct ath11k_hw_params::spectral`: the direct-buffer FFT report
+/// geometry `spectral.c` parses.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SpectralParams {
+    pub fft_sz: u32,
+    pub fft_pad_sz: u32,
+    pub summary_pad_sz: u32,
+    pub fft_hdr_len: u32,
+    pub max_fft_bins: u32,
+    pub fragment_160mhz: bool,
+}
+
+/// The two gates at the top of Linux `ath11k_spectral_init`: the target
+/// must advertise `WMI_TLV_SERVICE_FREQINFO_IN_METADATA` and the hardware
+/// profile must define an FFT sample size. When either is absent Linux
+/// returns 0 without allocating the spectral DBRing, registering the relay
+/// channel or creating the debugfs controls, so no spectral WMI
+/// (`WMI_VDEV_SPECTRAL_SCAN_{CONFIGURE,ENABLE}_CMDID`) is ever sent.
+pub const fn spectral_supported(rev: HwRev, freqinfo_in_metadata: bool) -> bool {
+    freqinfo_in_metadata && rev.spectral().fft_sz != 0
 }
 
 /// Per-PCI-ID descriptor — display name + default `HwRev` (used
@@ -160,6 +252,15 @@ impl MsiConfig {
             .map(|u| (u.num_vectors, u.base_vector + ep_base_data, u.base_vector))
     }
 }
+
+/// No MSI users: the AHB IPQ parts, whose CE and DP rings interrupt on
+/// dedicated GIC lines (`ath11k_ahb_hif_ops_ipq8074` has no
+/// `get_user_msi_vector`, so `ath11k_ce_srng_msi_ring_params_setup`
+/// leaves every ring without MSI).
+pub const MSI_CONFIG_NONE: MsiConfig = MsiConfig {
+    total_vectors: 0,
+    users: &[],
+};
 
 /// 32 vectors: QCA6390 / WCN6855 / QCA2066 / QCA6698AQ.
 pub const MSI_CONFIG_QCA6390: MsiConfig = MsiConfig {
@@ -268,6 +369,11 @@ pub struct HwParams {
     pub credit_flow: bool,
     /// `hw_params.ring_mask` (DP interrupt groups).
     pub ring_mask: &'static RingMask,
+    /// `ATH11K_CE_OFFSET(ab)`: added to CE register offsets
+    /// (`ath11k_hal_srng_create_config`, `ath11k_ahb_ce_irq_enable`). 0
+    /// except where the CE space is remapped (IPQ5018:
+    /// [`super::ahb::AHB_CE_WINDOW_OFFSET`]).
+    pub ce_offset: u32,
 }
 
 impl HwParams {
@@ -289,9 +395,12 @@ impl HwRev {
             bool,
         ) = match self {
             HwRev::Qca6390Hw20 => (Some(&QCA6390_REGS), &HOST_CE_CONFIG_QCA6390, true, true),
-            HwRev::Qcn9074Hw10 => (None, &HOST_CE_CONFIG_QCN9074, false, false),
+            HwRev::Qcn9074Hw10 => (Some(&QCN9074_REGS), &HOST_CE_CONFIG_QCN9074, false, false),
             HwRev::Wcn6855Hw20 | HwRev::Wcn6855Hw21 | HwRev::Qca2066Hw21 | HwRev::Qca6698aqHw21 => {
                 (Some(&WCN6855_REGS), &HOST_CE_CONFIG_QCA6390, true, true)
+            }
+            HwRev::Ipq8074 | HwRev::Ipq6018Hw10 | HwRev::Ipq5018Hw10 | HwRev::Wcn6750Hw10 => {
+                return self.ahb_chip().map(|c| c.params().hw_params(self))
             }
             HwRev::Unknown => return None,
         };
@@ -317,7 +426,7 @@ impl HwRev {
             HwRev::Wcn6855Hw20 | HwRev::Wcn6855Hw21 | HwRev::Qca2066Hw21 | HwRev::Qca6698aqHw21 => {
                 (&MSI_CONFIG_QCA6390, None, false)
             }
-            HwRev::Unknown => return None,
+            _ => return None,
         };
         Some(HwParams {
             hw_rev: self,
@@ -330,6 +439,7 @@ impl HwRev {
             supports_shadow_regs,
             credit_flow,
             ring_mask: &RING_MASK_QCA6390,
+            ce_offset: 0,
         })
     }
 }
@@ -520,6 +630,227 @@ pub const WCN6855_REGS: HalRegs = HalRegs {
     hal_reo1_misc_ctl: 0x0000_0630,
 };
 
+// AHB SoC maps (`ipq8074_regs` also serves IPQ6018; `ipq5018_regs` CE
+// offsets are relative to the remapped `HAL_IPQ5018_CE_WFSS_REG_BASE`
+// window, as Linux computes them). Generated verbatim from Linux hw.c;
+// fields Linux leaves unset are 0.
+/// Linux `ipq8074_regs` (hw.c).
+pub const IPQ8074_REGS: HalRegs = HalRegs {
+    hal_tcl1_ring_base_lsb: 0x0000_0510,
+    hal_tcl1_ring_base_msb: 0x0000_0514,
+    hal_tcl1_ring_id: 0x0000_0518,
+    hal_tcl1_ring_misc: 0x0000_0520,
+    hal_tcl1_ring_tp_addr_lsb: 0x0000_052c,
+    hal_tcl1_ring_tp_addr_msb: 0x0000_0530,
+    hal_tcl1_ring_consumer_int_setup_ix0: 0x0000_0540,
+    hal_tcl1_ring_consumer_int_setup_ix1: 0x0000_0544,
+    hal_tcl1_ring_msi1_base_lsb: 0x0000_0558,
+    hal_tcl1_ring_msi1_base_msb: 0x0000_055c,
+    hal_tcl1_ring_msi1_data: 0x0000_0560,
+    hal_tcl2_ring_base_lsb: 0x0000_0568,
+    hal_tcl_ring_base_lsb: 0x0000_0618,
+    hal_tcl_status_ring_base_lsb: 0x0000_0720,
+    hal_reo1_ring_base_lsb: 0x0000_029c,
+    hal_reo1_ring_base_msb: 0x0000_02a0,
+    hal_reo1_ring_id: 0x0000_02a4,
+    hal_reo1_ring_misc: 0x0000_02ac,
+    hal_reo1_ring_hp_addr_lsb: 0x0000_02b0,
+    hal_reo1_ring_hp_addr_msb: 0x0000_02b4,
+    hal_reo1_ring_producer_int_setup: 0x0000_02c0,
+    hal_reo1_ring_msi1_base_lsb: 0x0000_02e4,
+    hal_reo1_ring_msi1_base_msb: 0x0000_02e8,
+    hal_reo1_ring_msi1_data: 0x0000_02ec,
+    hal_reo2_ring_base_lsb: 0x0000_02f4,
+    hal_reo1_aging_thresh_ix_0: 0x0000_0564,
+    hal_reo1_aging_thresh_ix_1: 0x0000_0568,
+    hal_reo1_aging_thresh_ix_2: 0x0000_056c,
+    hal_reo1_aging_thresh_ix_3: 0x0000_0570,
+    hal_reo1_ring_hp: 0x0000_3038,
+    hal_reo1_ring_tp: 0x0000_303c,
+    hal_reo2_ring_hp: 0x0000_3040,
+    hal_reo_tcl_ring_base_lsb: 0x0000_03fc,
+    hal_reo_tcl_ring_hp: 0x0000_3058,
+    hal_reo_cmd_ring_base_lsb: 0x0000_0194,
+    hal_reo_cmd_ring_hp: 0x0000_3020,
+    hal_reo_status_ring_base_lsb: 0x0000_0504,
+    hal_reo_status_hp: 0x0000_3070,
+    hal_sw2reo_ring_base_lsb: 0x0000_01ec,
+    hal_sw2reo_ring_hp: 0x0000_3028,
+    hal_seq_wcss_umac_ce0_src_reg: 0x00a0_0000,
+    hal_seq_wcss_umac_ce0_dst_reg: 0x00a0_1000,
+    hal_seq_wcss_umac_ce1_src_reg: 0x00a0_2000,
+    hal_seq_wcss_umac_ce1_dst_reg: 0x00a0_3000,
+    hal_wbm_idle_link_ring_base_lsb: 0x0000_0860,
+    hal_wbm_idle_link_ring_misc: 0x0000_0870,
+    hal_wbm_release_ring_base_lsb: 0x0000_01d8,
+    hal_wbm0_release_ring_base_lsb: 0x0000_0910,
+    hal_wbm1_release_ring_base_lsb: 0x0000_0968,
+    hal_shadow_base_addr: 0x0000_0000,
+    hal_reo1_misc_ctl: 0x0000_0000,
+};
+/// Linux `qcn9074_regs` (hw.c).
+pub const QCN9074_REGS: HalRegs = HalRegs {
+    hal_tcl1_ring_base_lsb: 0x0000_04f0,
+    hal_tcl1_ring_base_msb: 0x0000_04f4,
+    hal_tcl1_ring_id: 0x0000_04f8,
+    hal_tcl1_ring_misc: 0x0000_0500,
+    hal_tcl1_ring_tp_addr_lsb: 0x0000_050c,
+    hal_tcl1_ring_tp_addr_msb: 0x0000_0510,
+    hal_tcl1_ring_consumer_int_setup_ix0: 0x0000_0520,
+    hal_tcl1_ring_consumer_int_setup_ix1: 0x0000_0524,
+    hal_tcl1_ring_msi1_base_lsb: 0x0000_0538,
+    hal_tcl1_ring_msi1_base_msb: 0x0000_053c,
+    hal_tcl1_ring_msi1_data: 0x0000_0540,
+    hal_tcl2_ring_base_lsb: 0x0000_0548,
+    hal_tcl_ring_base_lsb: 0x0000_05f8,
+    hal_tcl_status_ring_base_lsb: 0x0000_0700,
+    hal_reo1_ring_base_lsb: 0x0000_029c,
+    hal_reo1_ring_base_msb: 0x0000_02a0,
+    hal_reo1_ring_id: 0x0000_02a4,
+    hal_reo1_ring_misc: 0x0000_02ac,
+    hal_reo1_ring_hp_addr_lsb: 0x0000_02b0,
+    hal_reo1_ring_hp_addr_msb: 0x0000_02b4,
+    hal_reo1_ring_producer_int_setup: 0x0000_02c0,
+    hal_reo1_ring_msi1_base_lsb: 0x0000_02e4,
+    hal_reo1_ring_msi1_base_msb: 0x0000_02e8,
+    hal_reo1_ring_msi1_data: 0x0000_02ec,
+    hal_reo2_ring_base_lsb: 0x0000_02f4,
+    hal_reo1_aging_thresh_ix_0: 0x0000_0564,
+    hal_reo1_aging_thresh_ix_1: 0x0000_0568,
+    hal_reo1_aging_thresh_ix_2: 0x0000_056c,
+    hal_reo1_aging_thresh_ix_3: 0x0000_0570,
+    hal_reo1_ring_hp: 0x0000_3038,
+    hal_reo1_ring_tp: 0x0000_303c,
+    hal_reo2_ring_hp: 0x0000_3040,
+    hal_reo_tcl_ring_base_lsb: 0x0000_03fc,
+    hal_reo_tcl_ring_hp: 0x0000_3058,
+    hal_reo_cmd_ring_base_lsb: 0x0000_0194,
+    hal_reo_cmd_ring_hp: 0x0000_3020,
+    hal_reo_status_ring_base_lsb: 0x0000_0504,
+    hal_reo_status_hp: 0x0000_3070,
+    hal_sw2reo_ring_base_lsb: 0x0000_01ec,
+    hal_sw2reo_ring_hp: 0x0000_3028,
+    hal_seq_wcss_umac_ce0_src_reg: 0x01b8_0000,
+    hal_seq_wcss_umac_ce0_dst_reg: 0x01b8_1000,
+    hal_seq_wcss_umac_ce1_src_reg: 0x01b8_2000,
+    hal_seq_wcss_umac_ce1_dst_reg: 0x01b8_3000,
+    hal_wbm_idle_link_ring_base_lsb: 0x0000_0874,
+    hal_wbm_idle_link_ring_misc: 0x0000_0884,
+    hal_wbm_release_ring_base_lsb: 0x0000_01ec,
+    hal_wbm0_release_ring_base_lsb: 0x0000_0924,
+    hal_wbm1_release_ring_base_lsb: 0x0000_097c,
+    hal_shadow_base_addr: 0x0000_0000,
+    hal_reo1_misc_ctl: 0x0000_0000,
+};
+/// Linux `ipq5018_regs` (hw.c).
+pub const IPQ5018_REGS: HalRegs = HalRegs {
+    hal_tcl1_ring_base_lsb: 0x0000_0694,
+    hal_tcl1_ring_base_msb: 0x0000_0698,
+    hal_tcl1_ring_id: 0x0000_069c,
+    hal_tcl1_ring_misc: 0x0000_06a4,
+    hal_tcl1_ring_tp_addr_lsb: 0x0000_06b0,
+    hal_tcl1_ring_tp_addr_msb: 0x0000_06b4,
+    hal_tcl1_ring_consumer_int_setup_ix0: 0x0000_06c4,
+    hal_tcl1_ring_consumer_int_setup_ix1: 0x0000_06c8,
+    hal_tcl1_ring_msi1_base_lsb: 0x0000_06dc,
+    hal_tcl1_ring_msi1_base_msb: 0x0000_06e0,
+    hal_tcl1_ring_msi1_data: 0x0000_06e4,
+    hal_tcl2_ring_base_lsb: 0x0000_06ec,
+    hal_tcl_ring_base_lsb: 0x0000_079c,
+    hal_tcl_status_ring_base_lsb: 0x0000_08a4,
+    hal_reo1_ring_base_lsb: 0x0000_01ec,
+    hal_reo1_ring_base_msb: 0x0000_01f0,
+    hal_reo1_ring_id: 0x0000_01f4,
+    hal_reo1_ring_misc: 0x0000_01fc,
+    hal_reo1_ring_hp_addr_lsb: 0x0000_0200,
+    hal_reo1_ring_hp_addr_msb: 0x0000_0204,
+    hal_reo1_ring_producer_int_setup: 0x0000_0210,
+    hal_reo1_ring_msi1_base_lsb: 0x0000_0234,
+    hal_reo1_ring_msi1_base_msb: 0x0000_0238,
+    hal_reo1_ring_msi1_data: 0x0000_023c,
+    hal_reo2_ring_base_lsb: 0x0000_0244,
+    hal_reo1_aging_thresh_ix_0: 0x0000_0564,
+    hal_reo1_aging_thresh_ix_1: 0x0000_0568,
+    hal_reo1_aging_thresh_ix_2: 0x0000_056c,
+    hal_reo1_aging_thresh_ix_3: 0x0000_0570,
+    hal_reo1_ring_hp: 0x0000_3028,
+    hal_reo1_ring_tp: 0x0000_302c,
+    hal_reo2_ring_hp: 0x0000_3030,
+    hal_reo_tcl_ring_base_lsb: 0x0000_03fc,
+    hal_reo_tcl_ring_hp: 0x0000_3058,
+    hal_reo_cmd_ring_base_lsb: 0x0000_00e4,
+    hal_reo_cmd_ring_hp: 0x0000_3010,
+    hal_reo_status_ring_base_lsb: 0x0000_0504,
+    hal_reo_status_hp: 0x0000_3070,
+    hal_sw2reo_ring_base_lsb: 0x0000_013c,
+    hal_sw2reo_ring_hp: 0x0000_3018,
+    hal_seq_wcss_umac_ce0_src_reg: 0x0000_0000, // 0x08400000 - HAL_IPQ5018_CE_WFSS_REG_BASE
+    hal_seq_wcss_umac_ce0_dst_reg: 0x0000_1000, // 0x08401000 - HAL_IPQ5018_CE_WFSS_REG_BASE
+    hal_seq_wcss_umac_ce1_src_reg: 0x0000_2000, // 0x08402000 - HAL_IPQ5018_CE_WFSS_REG_BASE
+    hal_seq_wcss_umac_ce1_dst_reg: 0x0000_3000, // 0x08403000 - HAL_IPQ5018_CE_WFSS_REG_BASE
+    hal_wbm_idle_link_ring_base_lsb: 0x0000_0874,
+    hal_wbm_idle_link_ring_misc: 0x0000_0884,
+    hal_wbm_release_ring_base_lsb: 0x0000_01ec,
+    hal_wbm0_release_ring_base_lsb: 0x0000_0924,
+    hal_wbm1_release_ring_base_lsb: 0x0000_097c,
+    hal_shadow_base_addr: 0x0000_0000,
+    hal_reo1_misc_ctl: 0x0000_0000,
+};
+/// Linux `wcn6750_regs` (hw.c).
+pub const WCN6750_REGS: HalRegs = HalRegs {
+    hal_tcl1_ring_base_lsb: 0x0000_0694,
+    hal_tcl1_ring_base_msb: 0x0000_0698,
+    hal_tcl1_ring_id: 0x0000_069c,
+    hal_tcl1_ring_misc: 0x0000_06a4,
+    hal_tcl1_ring_tp_addr_lsb: 0x0000_06b0,
+    hal_tcl1_ring_tp_addr_msb: 0x0000_06b4,
+    hal_tcl1_ring_consumer_int_setup_ix0: 0x0000_06c4,
+    hal_tcl1_ring_consumer_int_setup_ix1: 0x0000_06c8,
+    hal_tcl1_ring_msi1_base_lsb: 0x0000_06dc,
+    hal_tcl1_ring_msi1_base_msb: 0x0000_06e0,
+    hal_tcl1_ring_msi1_data: 0x0000_06e4,
+    hal_tcl2_ring_base_lsb: 0x0000_06ec,
+    hal_tcl_ring_base_lsb: 0x0000_079c,
+    hal_tcl_status_ring_base_lsb: 0x0000_08a4,
+    hal_reo1_ring_base_lsb: 0x0000_01ec,
+    hal_reo1_ring_base_msb: 0x0000_01f0,
+    hal_reo1_ring_id: 0x0000_01f4,
+    hal_reo1_ring_misc: 0x0000_01fc,
+    hal_reo1_ring_hp_addr_lsb: 0x0000_0200,
+    hal_reo1_ring_hp_addr_msb: 0x0000_0204,
+    hal_reo1_ring_producer_int_setup: 0x0000_0210,
+    hal_reo1_ring_msi1_base_lsb: 0x0000_0234,
+    hal_reo1_ring_msi1_base_msb: 0x0000_0238,
+    hal_reo1_ring_msi1_data: 0x0000_023c,
+    hal_reo2_ring_base_lsb: 0x0000_0244,
+    hal_reo1_aging_thresh_ix_0: 0x0000_0564,
+    hal_reo1_aging_thresh_ix_1: 0x0000_0568,
+    hal_reo1_aging_thresh_ix_2: 0x0000_056c,
+    hal_reo1_aging_thresh_ix_3: 0x0000_0570,
+    hal_reo1_ring_hp: 0x0000_3028,
+    hal_reo1_ring_tp: 0x0000_302c,
+    hal_reo2_ring_hp: 0x0000_3030,
+    hal_reo_tcl_ring_base_lsb: 0x0000_03fc,
+    hal_reo_tcl_ring_hp: 0x0000_3058,
+    hal_reo_cmd_ring_base_lsb: 0x0000_00e4,
+    hal_reo_cmd_ring_hp: 0x0000_3010,
+    hal_reo_status_ring_base_lsb: 0x0000_0504,
+    hal_reo_status_hp: 0x0000_3070,
+    hal_sw2reo_ring_base_lsb: 0x0000_013c,
+    hal_sw2reo_ring_hp: 0x0000_3018,
+    hal_seq_wcss_umac_ce0_src_reg: 0x01b8_0000,
+    hal_seq_wcss_umac_ce0_dst_reg: 0x01b8_1000,
+    hal_seq_wcss_umac_ce1_src_reg: 0x01b8_2000,
+    hal_seq_wcss_umac_ce1_dst_reg: 0x01b8_3000,
+    hal_wbm_idle_link_ring_base_lsb: 0x0000_0874,
+    hal_wbm_idle_link_ring_misc: 0x0000_0884,
+    hal_wbm_release_ring_base_lsb: 0x0000_01ec,
+    hal_wbm0_release_ring_base_lsb: 0x0000_0924,
+    hal_wbm1_release_ring_base_lsb: 0x0000_097c,
+    hal_shadow_base_addr: 0x0000_0504,
+    hal_reo1_misc_ctl: 0x0000_05d8,
+};
+
 // ── DP interrupt groups (`struct ath11k_hw_ring_mask`) ─────────────
 
 /// hw.h `ATH11K_EXT_IRQ_GRP_NUM_MAX`.
@@ -547,6 +878,30 @@ pub const RING_MASK_QCA6390: RingMask = RingMask {
     rx_err: [0x1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
     rx_wbm_rel: [0x1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
     reo_status: [0x1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    rxdma2host: [0x1, 0x2, 0x4, 0, 0, 0, 0, 0, 0, 0, 0],
+    host2rxdma: [0; ATH11K_EXT_IRQ_GRP_NUM_MAX],
+};
+
+/// Linux `ath11k_hw_ring_mask_ipq8074` (IPQ8074, IPQ6018, IPQ5018).
+pub const RING_MASK_IPQ8074: RingMask = RingMask {
+    tx: [0x1, 0x2, 0x4, 0, 0, 0, 0, 0, 0, 0, 0],
+    rx_mon_status: [0, 0, 0, 0, 0x1, 0x2, 0x4, 0, 0, 0, 0],
+    rx: [0, 0, 0, 0, 0, 0, 0, 0x1, 0x2, 0x4, 0x8],
+    rx_err: [0x1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    rx_wbm_rel: [0x1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    reo_status: [0, 0, 0, 0x1, 0, 0, 0, 0, 0, 0, 0],
+    rxdma2host: [0x1, 0x2, 0x4, 0, 0, 0, 0, 0, 0, 0, 0],
+    host2rxdma: [0x1, 0x2, 0x4, 0, 0, 0, 0, 0, 0, 0, 0],
+};
+
+/// Linux `ath11k_hw_ring_mask_wcn6750`.
+pub const RING_MASK_WCN6750: RingMask = RingMask {
+    tx: [0x1, 0, 0x4, 0, 0x10, 0, 0, 0, 0, 0, 0],
+    rx_mon_status: [0, 0, 0, 0, 0, 0, 0x1, 0, 0, 0, 0],
+    rx: [0, 0, 0, 0, 0, 0, 0, 0x1, 0x2, 0x4, 0x8],
+    rx_err: [0, 0x1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    rx_wbm_rel: [0, 0x1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    reo_status: [0, 0x1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
     rxdma2host: [0x1, 0x2, 0x4, 0, 0, 0, 0, 0, 0, 0, 0],
     host2rxdma: [0; ATH11K_EXT_IRQ_GRP_NUM_MAX],
 };
@@ -587,6 +942,63 @@ pub const HW_HAL_PARAMS_QCA6390: HwHalParams = HwHalParams {
         wbm_ring_num: 0,
         rbm_id: rbm::SW0_BM,
     }],
+};
+
+/// Linux `ath11k_hw_hal_params_ipq8074` (IPQ8074 / IPQ6018 / QCN9074 /
+/// IPQ5018): three TCL data rings, RX buffers on SW3_BM.
+pub const HW_HAL_PARAMS_IPQ8074: HwHalParams = HwHalParams {
+    rx_buf_rbm: rbm::SW3_BM,
+    tcl2wbm_rbm_map: &[
+        Tcl2WbmRbmMap {
+            tcl_ring_num: 0,
+            wbm_ring_num: 0,
+            rbm_id: rbm::SW0_BM,
+        },
+        Tcl2WbmRbmMap {
+            tcl_ring_num: 1,
+            wbm_ring_num: 1,
+            rbm_id: rbm::SW1_BM,
+        },
+        Tcl2WbmRbmMap {
+            tcl_ring_num: 2,
+            wbm_ring_num: 2,
+            rbm_id: rbm::SW2_BM,
+        },
+    ],
+};
+
+/// Linux `ath11k_hw_hal_params_ipq5018` (`ath11k_hw_tcl2wbm_rbm_map_ipq5018`:
+/// one TX ring, SW0_BM; RX buffers on SW3_BM).
+pub const HW_HAL_PARAMS_IPQ5018: HwHalParams = HwHalParams {
+    rx_buf_rbm: rbm::SW3_BM,
+    tcl2wbm_rbm_map: &[Tcl2WbmRbmMap {
+        tcl_ring_num: 0,
+        wbm_ring_num: 0,
+        rbm_id: rbm::SW0_BM,
+    }],
+};
+
+/// Linux `ath11k_hw_hal_params_wcn6750`: three TCL data rings, the
+/// second completing on WBM ring 4 (SW4_BM).
+pub const HW_HAL_PARAMS_WCN6750: HwHalParams = HwHalParams {
+    rx_buf_rbm: rbm::SW1_BM,
+    tcl2wbm_rbm_map: &[
+        Tcl2WbmRbmMap {
+            tcl_ring_num: 0,
+            wbm_ring_num: 0,
+            rbm_id: rbm::SW0_BM,
+        },
+        Tcl2WbmRbmMap {
+            tcl_ring_num: 1,
+            wbm_ring_num: 4,
+            rbm_id: rbm::SW4_BM,
+        },
+        Tcl2WbmRbmMap {
+            tcl_ring_num: 2,
+            wbm_ring_num: 2,
+            rbm_id: rbm::SW2_BM,
+        },
+    ],
 };
 
 // ── BAR0 register-window constants ─────────────────────────────────

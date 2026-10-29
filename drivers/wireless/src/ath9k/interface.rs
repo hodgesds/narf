@@ -26,11 +26,12 @@ type ReceiveHook = Arc<dyn Fn(ReceivePoint) + Send + Sync>;
 struct State {
     rx: narf_ipc::Producer<Frame, RX_RING_N>,
     tx: narf_ipc::Consumer<Frame, TX_RING_N>,
-    pending: Option<Frame>,
+    /// Per-TID software queues (`ath_tx_queue_tid`); TID0 FIFO without N85Q.
+    pending: super::qos::Scheduler<Frame>,
 }
 impl State {
     fn clear(&mut self) {
-        self.pending = None;
+        self.pending.clear();
         for _ in 0..TX_RING_N {
             if !matches!(self.tx.try_recv(), Ok(Some(_))) {
                 break;
@@ -97,7 +98,7 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
             state: Mutex::new(State {
                 rx,
                 tx,
-                pending: None,
+                pending: super::qos::Scheduler::default(),
             }),
             name: name.into(),
             own,
@@ -176,7 +177,13 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
             .as_mut()
             .ok_or(())?
             .try_send(frame)
-            .map_err(|_| ())
+            .map_err(|_| ())?;
+        // Interrupt-driven service sleeps until a vector fires; stack TX is
+        // the other wake source.
+        if let Some(signal) = self.radio.try_lock().and_then(|r| r.interrupt()) {
+            signal.raise();
+        }
+        Ok(())
     }
     fn clear_rx(&self) {
         if let Some(rx) = self.rx.lock().as_mut() {
@@ -239,30 +246,33 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
                 self.clear_rx();
                 return Ok(Vec::new());
             }
-            if state.pending.is_none() {
-                for _ in 0..16 {
-                    let Ok(Some(frame)) = state.tx.try_recv() else {
-                        break;
-                    };
-                    if station::admitted(frame.payload(), self.own) && offloads(frame.tx_meta()) {
-                        state.pending = Some(frame);
-                        break;
-                    }
+            // Classify into per-TID queues; the total stays within one TID's
+            // bound, so the IPC ring keeps backpressure and nothing drops.
+            for _ in 0..16 {
+                if state.pending.len() >= super::qos::PER_TID {
+                    break;
+                }
+                let Ok(Some(frame)) = state.tx.try_recv() else {
+                    break;
+                };
+                if station::admitted(frame.payload(), self.own) && offloads(frame.tx_meta()) {
+                    let tid = radio.transmit_tid(frame.payload());
+                    let _ = state.pending.push(tid, frame);
                 }
             }
             if radio.ready() {
-                if let Some(frame) = state.pending.take() {
+                if let Some((tid, frame)) = state.pending.pop() {
+                    // The measured two-MPDU sender aggregates BE/TID0 only.
+                    // Frames queued before N85Q activation are re-classified.
                     let mut second = None;
-                    if radio.can_aggregate() {
-                        for _ in 0..16 {
-                            let Ok(Some(next)) = state.tx.try_recv() else {
-                                break;
-                            };
-                            if station::admitted(next.payload(), self.own)
-                                && offloads(next.tx_meta())
-                            {
+                    if tid == 0 && radio.can_aggregate() && radio.transmit_tid(frame.payload()) == 0
+                    {
+                        if let Some(next) = state.pending.pop_tid(0) {
+                            let now = radio.transmit_tid(next.payload());
+                            if now == 0 {
                                 second = Some(next);
-                                break;
+                            } else {
+                                let _ = state.pending.push(now, next);
                             }
                         }
                     }
@@ -308,6 +318,19 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
                 (0, Vec::new())
             }
         }
+    }
+    /// Host-side retirement of this generation (see [`retire`]).
+    pub(super) fn retire_host(&self) {
+        self.close();
+        if let Some(mut state) = self.state.try_lock() {
+            state.clear();
+        }
+        narf_wireless::registry::unregister(&self.name);
+        narf_net::registry().unregister(&self.name);
+        // Reserve while still registered so no other wlan%d allocation can
+        // take the name between unregister and reservation.
+        narf_net::iface::reserve_name(&self.name);
+        narf_net::iface::unregister(&self.name);
     }
     pub(super) fn drain(&self) -> bool {
         let (epoch, frames) = self.progress();
@@ -538,6 +561,8 @@ fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
         None => Ok(300),
     }
 }
+/// Housekeeping period while MSI delivery drives RX/TX completion.
+const HOUSEKEEPING_NS: u64 = 20_000_000;
 pub(super) type Native = Device<super::packet_native::Native, station::NativeEnvironment>;
 trait Endpoint: Send + Sync {
     fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()>;
@@ -552,6 +577,8 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Endpoint for Device<P, 
     }
 }
 static ACTIVE: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
+/// The concrete published generation, for retirement by radio identity.
+static CURRENT: IrqSafeSpinLock<Option<Arc<Native>>> = IrqSafeSpinLock::new(None);
 static CLAIMED: AtomicBool = AtomicBool::new(false);
 fn send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     let device = ACTIVE.lock().clone().ok_or(())?;
@@ -574,6 +601,7 @@ pub(super) fn publish(radio: super::RetainedRadio) -> Result<Arc<Native>, Error>
         .register(&authority, Registered(device.clone()))
         .map_err(|_| Error::Profile)?;
     *ACTIVE.lock() = Some(device.clone());
+    *CURRENT.lock() = Some(device.clone());
     narf_net::iface::register(device.name(), device.own, send);
     device.link(None);
     device.admitted.store(true, Ordering::Release);
@@ -586,11 +614,50 @@ pub(super) fn publish(radio: super::RetainedRadio) -> Result<Arc<Native>, Error>
     let worker = device.clone();
     narf_scheduler::spawn(async move {
         loop {
+            // Snapshot before servicing so a vector raised mid-pass is seen.
+            let signal = worker.radio.try_lock().and_then(|r| r.interrupt());
+            let seen = signal.as_ref().map(|s| s.count());
             worker.drain();
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+            if worker.closed.load(Ordering::Acquire) {
+                // One more pass already stopped and parked the radio.
+                worker.drain();
+                break;
+            }
+            match (signal, seen) {
+                (Some(signal), Some(seen)) => {
+                    // MLME/RSNA deadlines are millisecond timers; the slow
+                    // housekeeping tick replaces 1 ms polling.
+                    let tick = Box::pin(narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(
+                        HOUSEKEEPING_NS,
+                    )));
+                    signal.wait(seen, tick).await;
+                }
+                _ => {
+                    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+                }
+            }
         }
     });
     Ok(device)
+}
+/// Withdraw only the generation that owns `radio`: close carrier and rings,
+/// leave every registry, and keep the retired name reserved so a late old
+/// publisher cannot address a successor. Returns whether it was published.
+pub(super) fn retire(radio: &super::RetainedRadio) -> bool {
+    let device = {
+        let mut current = CURRENT.lock();
+        match current.as_ref() {
+            Some(device) if Arc::ptr_eq(&device.radio, radio) => current.take(),
+            _ => None,
+        }
+    };
+    let Some(device) = device else {
+        return false;
+    };
+    *ACTIVE.lock() = None;
+    device.retire_host();
+    CLAIMED.store(false, Ordering::Release);
+    true
 }
 struct Registered(Arc<Native>);
 impl Interface for Registered {

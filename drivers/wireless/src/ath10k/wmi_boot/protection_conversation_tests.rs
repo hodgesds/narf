@@ -290,3 +290,73 @@ kernel_test_in!(
     "drivers/wireless/ath10k/protection",
     smoke_ath10k_protection_invalid_threshold_is_retryable_before_native_program
 );
+
+/// One Device worker pass: the synchronous drain, then its await point.
+fn service(h: &Harness) {
+    h.pump();
+    let _ = drive(h.device.flush_management());
+}
+fn expect(h: &Harness, request: Request) {
+    h.model(|m| m.data.as_mut().unwrap().protection_request = Some(request));
+}
+fn erp_beacon(h: &Harness, erp: Option<u8>) {
+    h.model(|m| {
+        let mut beacon = m.data.as_ref().unwrap().beacon();
+        if let Some(value) = erp {
+            beacon.extend_from_slice(&[42, 1, value]);
+        }
+        management_frame(m, beacon);
+    });
+}
+fn smoke_ath10k_beacon_erp_protection_reprograms_cts_all_six_dialects() -> TestResult {
+    (|| {
+        for (version, dialect) in BAND_DIALECTS {
+            for secured in [false, true] {
+                let h = Harness::new(version, dialect, secured);
+                h.join()?;
+                // mac80211 ieee80211_handle_bss_capability: ERP Use_Protection
+                // raises BSS_CHANGED_ERP_CTS_PROT -> ath10k_bss_info_changed.
+                let on = Request {
+                    rts_threshold: None,
+                    cts_protection: true,
+                };
+                expect(&h, on);
+                erp_beacon(&h, Some(0x02));
+                service(&h);
+                if h.closed()
+                    || !h.model(|m| {
+                        let t = &m.data.as_ref().unwrap().protection_trace;
+                        t.len() == 3 && t[0].1 == 0x21 && t[1].1 == 1 && t[2] == (1, u32::MAX)
+                    })
+                    || h.device.radio.try_lock().unwrap().submitted_station_protection() != Some(on)
+                {
+                    return Err("beacon ERP Use_Protection did not program use_cts_prot");
+                }
+                // The same ERP state again is not a change.
+                erp_beacon(&h, Some(0x02));
+                service(&h);
+                if h.model(|m| m.data.as_ref().unwrap().protection_trace.len()) != 3 {
+                    return Err("unchanged ERP protection was reprogrammed");
+                }
+                // ERP absent: use_cts_prot falls back to false.
+                expect(&h, Request::default());
+                erp_beacon(&h, None);
+                service(&h);
+                if h.closed()
+                    || !h.model(|m| {
+                        let t = &m.data.as_ref().unwrap().protection_trace;
+                        t.len() == 6 && t[4].1 == 0
+                    })
+                {
+                    return Err("cleared ERP protection did not reprogram use_cts_prot");
+                }
+            }
+        }
+        Ok(())
+    })()
+    .map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/protection",
+    smoke_ath10k_beacon_erp_protection_reprograms_cts_all_six_dialects
+);

@@ -360,6 +360,8 @@ pub mod amdgpu_rdna2_ih;
 pub use amdgpu_rdna2_ih as amdgpu_ih_navi22;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_info;
+#[cfg(feature = "amdgpu")]
+pub(crate) mod amdgpu_info_stats;
 #[path = "amdgpu_info_navi22.rs"]
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_info;
@@ -706,6 +708,8 @@ pub mod intel_gpu_edp;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_exec;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_fence;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_forcewake;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gem;
@@ -715,6 +719,10 @@ pub mod intel_gpu_gmbus;
 pub mod intel_gpu_gtt;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_guc;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_guc_firmware;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_guc_transport;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_hdmi;
 #[cfg(feature = "intel")]

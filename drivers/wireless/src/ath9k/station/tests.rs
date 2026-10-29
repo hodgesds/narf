@@ -100,6 +100,8 @@ pub(in crate::ath9k) struct Peer {
     pub(in crate::ath9k) sender_delbas: Vec<Vec<u8>>,
     sender_reorder: Option<narf_wireless::reorder::Reorder<Vec<u8>>>,
     rx_sequence: u16,
+    /// Accept uplink QoS TIDs 0..7 (N85Q); otherwise only TID0.
+    pub(in crate::ath9k) qos_tids: bool,
 }
 impl Peer {
     pub(in crate::ath9k) fn new_rates(protected: bool, rates: Option<&[u8]>) -> Self {
@@ -159,6 +161,7 @@ impl Peer {
             sender_delbas: Vec::new(),
             sender_reorder: None,
             rx_sequence: 0,
+            qos_tids: false,
         }
     }
     pub(in crate::ath9k) fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
@@ -420,7 +423,7 @@ impl Peer {
             return Err("native AP data protection/direction");
         }
         let h = if frame[0] == 0x88 { 26 } else { 24 };
-        if h == 26 && frame[24..26] != [0, 0] {
+        if h == 26 && (frame[25] != 0 || frame[24] > if self.qos_tids { 7 } else { 0 }) {
             return Err("native AP QoS TID/header");
         }
         let mut body = frame[h..].to_vec();
@@ -437,7 +440,7 @@ impl Peer {
                 &Ccm,
                 &frame[..h],
                 key,
-                0,
+                if h == 26 { frame[24] & 15 } else { 0 },
                 false,
                 if h == 26 {
                     &mut self.qos_replay[usize::from(frame[24] & 15)]
@@ -1048,4 +1051,53 @@ fn smoke_ar9285_open_ht_native_qos_sequence_wrap_is_independent_of_legacy_contro
 kernel_test_in!(
     "drivers/wireless/ath9k/ht",
     smoke_ar9285_open_ht_native_qos_sequence_wrap_is_independent_of_legacy_control
+);
+/// Generation retirement (reset/rejoin/removal precondition): a joined
+/// station with a held TX descriptor is stopped with the Linux DMA-stop
+/// sequence and reports reclamation; a wedged DCU reports pinned storage.
+fn retirement() -> Result<(), &'static str> {
+    for wedged in [false, true] {
+        let mut f = fixture(true)?;
+        complete(f.radio.associate(AP, SSID, Some(Zeroizing::new(PMK)), &[]))
+            .map_err(|_| "native association")?;
+        f.peer.lock().hold_data = true;
+        let outbound = udp_ipv4(
+            f.plan.bssid,
+            f.plan.station,
+            f.plan.lease_ip,
+            f.plan.server_ip,
+            4001,
+            4002,
+            b"AR9285 held before reset",
+        );
+        f.radio.send(&outbound).map_err(|_| "held send")?;
+        if f.model.tx.get().is_none() || f.radio.terminal() {
+            return Err("fixture lacks pending native DMA");
+        }
+        f.model.stuck_tx.set(wedged);
+        let reclaimed = f.radio.retire();
+        if reclaimed == wedged
+            || !f.radio.terminal()
+            || f.radio.peer().is_some()
+            || f.model.master.get()
+            || f.model.released.borrow().is_empty() != wedged
+        {
+            return Err("retirement misreported DMA reclamation");
+        }
+        // Retiring again is idempotent and never re-claims or frees.
+        if f.radio.retire() != reclaimed || f.radio.poll().is_ok() {
+            return Err("retired generation reopened");
+        }
+    }
+    Ok(())
+}
+fn smoke_ar9285_station_retirement_reports_exact_dma_reclamation() -> TestResult {
+    match retirement() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/station",
+    smoke_ar9285_station_retirement_reports_exact_dma_reclamation
 );

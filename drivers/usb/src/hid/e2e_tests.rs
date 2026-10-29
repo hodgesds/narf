@@ -715,11 +715,14 @@ kernel_test_in!("drivers/usb/hid/e2e", smoke_e2e_uinput_write_injection);
 
 // ── Smoke 9: hardware-device write rejection ─────────────────────────────────
 //
-// Writing to a hardware-backed /dev/input/event<N> must return
-// FsError::PermissionDenied.  Only UserDevice fds accept writes.
-//
-// Ref: Linux `evdev.c` — writes are only accepted on uinput fds, not
-// on evdev fds opened for hardware devices.
+// Writing to a hardware-backed /dev/input/event<N>: NARF's
+// contract is a blanket FsError::PermissionDenied with ONE narrow
+// exception — a pure EV_LED buffer of declared codes on an
+// LED-capable device (the keyboard lock-LED output path, #768).
+// This bridged keyboard declares no LED capability, so even an
+// EV_LED write is denied here; an EV_KEY write (arbitrary input
+// injection) is denied on every hardware device. Only UserDevice
+// (uinput) fds accept general writes.
 
 fn smoke_e2e_hw_device_write_rejected() -> TestResult {
     use narf_filesystem::FileOps;
@@ -744,7 +747,15 @@ fn smoke_e2e_hw_device_write_rejected() -> TestResult {
     buf[18..20].copy_from_slice(&KEY_A_CODE.to_le_bytes());
     buf[20..24].copy_from_slice(&1i32.to_le_bytes());
 
-    // Write must be rejected with PermissionDenied.
+    // Second payload: an EV_LED / LED_CAPSL record. The narrow LED
+    // exception does not apply — this device declares no LED
+    // capability — so it must be denied too.
+    let mut led_buf = [0u8; LINUX_EV_SZ];
+    led_buf[16..18].copy_from_slice(&(EventType::Led as u16).to_le_bytes());
+    led_buf[18..20].copy_from_slice(&narf_input::evdev::led::LED_CAPSL.to_le_bytes());
+    led_buf[20..24].copy_from_slice(&1i32.to_le_bytes());
+
+    // Both writes must be rejected with PermissionDenied.
     {
         use core::future::Future;
         use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -765,18 +776,40 @@ fn smoke_e2e_hw_device_write_rejected() -> TestResult {
         let mut write_fut = file.write(0, &buf);
         // SAFETY: Valid MMIO bounds or trusted driver environment
         let pinned = unsafe { core::pin::Pin::new_unchecked(&mut write_fut) };
-        let result = pinned.poll(&mut cx);
+        let key_result = pinned.poll(&mut cx);
+
+        let mut led_write_fut = file.write(0, &led_buf);
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        let led_pinned = unsafe { core::pin::Pin::new_unchecked(&mut led_write_fut) };
+        let led_result = led_pinned.poll(&mut cx);
 
         bk.unregister();
 
-        match result {
-            Poll::Ready(Err(FsError::PermissionDenied)) => TestResult::Pass,
+        match key_result {
+            Poll::Ready(Err(FsError::PermissionDenied)) => {}
             Poll::Ready(Ok(_)) => {
-                TestResult::Fail("write to hardware evdev should have been rejected")
+                return TestResult::Fail(
+                    "EV_KEY write to hardware evdev should have been rejected",
+                );
             }
             Poll::Ready(Err(e)) => {
                 let _ = e;
-                TestResult::Fail("write to hardware evdev returned wrong error kind")
+                return TestResult::Fail(
+                    "EV_KEY write to hardware evdev returned wrong error kind",
+                );
+            }
+            Poll::Pending => {
+                return TestResult::Fail("write future returned Pending for hardware device");
+            }
+        }
+        match led_result {
+            Poll::Ready(Err(FsError::PermissionDenied)) => TestResult::Pass,
+            Poll::Ready(Ok(_)) => TestResult::Fail(
+                "EV_LED write to an LED-incapable hardware device should have been rejected",
+            ),
+            Poll::Ready(Err(e)) => {
+                let _ = e;
+                TestResult::Fail("EV_LED write to hardware evdev returned wrong error kind")
             }
             Poll::Pending => TestResult::Fail("write future returned Pending for hardware device"),
         }

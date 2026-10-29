@@ -101,40 +101,67 @@ This is software evidence; exact qualification assets and physical acceptance
 remain external. Optional PMF with MFPC APs omitting response RSNE remains open.
 
 The 2026-10-27 [documented capability inventory](../research/remaining-features.tsv)
-at implementation checkpoint `caa2cd785` contains **293 driver-feature gaps**.
+at implementation checkpoint `ac8641b6f` contains **307 driver-feature gaps**.
 Each `feature` row names one missing capability in one driver family;
 repeated mentions within a family are deduplicated, and a capability missing
-from several families has a row for each. FullMAC shares22 such capabilities
+from several families has a row for each. FullMAC shares18 such capabilities
 between BCM43602 and CYW43439, so these counts do not measure independent
-coding effort. The17 `shared` API/admission entries overlap driver work and
+coding effort. The6 remaining `shared` API/admission entries overlap driver work and
 include unsupported generic extensions; they are reported separately.
-The inventory also separates27 chip/host/profile enablement entries (`chip`)
-and53 unknown, unexpanded or unproven-applicability records (`unknown`).
+The inventory also separates36 chip/host/profile enablement entries (`chip`)
+and3 unknown, unexpanded or unproven-applicability records (`unknown`).
 Implemented features, hardware-inapplicable capabilities and external
-measurement/physical acceptance gates are excluded from the293. Every row
+measurement/physical acceptance gates are excluded from the307. Every row
 links to family-spec evidence. This is a count of documented gaps, not an
 exhaustive hardware census, completion fraction or duration/LOC forecast.
 
-Compared with `ab061d01f`, three driver-feature entries and the shared optional-PMF
-API entry are implemented. Requested CONNAC2 scan dwell control moves to unknown
-applicability because its nonzero native timing contract is unproven. Resolving
-RTL8188EU aggregation directions replaces two generic gaps with five named gaps
-and removes one unknown; standalone RX A-MSDU is implemented. Thus the count
-reflects both implementation and more precise enumeration, not simply closures.
+Compared with `caa2cd785` (293 feature,17 shared,27 chip,53 unknown), the
+parallel all-family continuation removes40 feature rows (shared and driver)
+and one chip row as implemented, proven inapplicable, or narrowed into a
+renamed residual row, and resolves50 of the53 unknown records against the
+upstream drivers. Resolution mostly *adds* rows: an unknown that proves
+applicable becomes one or more named `feature` rows (for example rtw88
+dynamic-PHY scope became seven tracking rows, and ath9k chip scope became nine
+named chip rows), while one that proves inapplicable is removed with evidence
+in its family spec. The higher feature count therefore reflects more precise
+enumeration, not regression. Implemented in this continuation: shared A-MSDU
+ack-policy/EOSP/large receive, TX and SPP A-MSDU, VHT TX STBC, beamforming
+roles, Extended NSS BW, 80+80 and fragmented-management reassembly; Gen2 air
+deauthentication; MT76 non-RFC1042 LLC receive, RX defragmentation and dynamic
+HT protection; ath10k LDPC/RX STBC and QCA9887; ath11k host group PN, TWT
+dialogs and radar diagnostics; FullMAC scan extra IEs, all-priority WMM and
+BCM43602 VHT beamforming; RTL8188EE/RTL8188EU all-AC/TID routing and
+RTL8188EE live EDCA; rtw88 channel1 active scan with extra probe IEs. AR2427 and
+Intel Qu PCI identities are also admitted. Family specs carry the evidence.
+
+**Recount 2026-10-28** (ledger after the round-5 merges, PR#1195): the
+[inventory](../research/remaining-features.tsv) now holds **145 `feature`**
+rows (144 driver, 1 `shared`), **35 `chip`** and **1 `unknown`**; the table
+below counts `feature` rows per family. This recount also removes two rows as
+inapplicable: ath9k `tx_amsdu` (Linux ath9k never sets
+`IEEE80211_HW_TX_AMSDU`; `ath9k.md`) and shared `glk_membership_selector`
+(no open 802.11ak General Link reference; mac80211 refuses GLK;
+[shared wireless spec](../../../wireless/specification/spec.md)). ath11k's
+remaining scope is the five `chip` platform-profile rows. rtw89 periodic
+EDCCA, DIG and CFO tracking (PPDU-status RSSI averaging and the IFS-CLM
+environment monitor) are implemented and their rows closed; rtw89 `tspec`,
+`nhm_diagnostics` and `antenna_diversity_tracking` are resolved as
+inapplicable or folded into chip rows, and `uapsd` narrowed to AP-side
+(`rtw89.md`).
 
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 36 | Gen2 active probes, broader rejoin/key history, PMF/richer PHY/QoS/BA/air teardown/recovery; remaining Gen3 command profiles; 6 GHz/HE/EHT, additional roles, RX/RSS and system PM |
-| ath11k | 5 | QCN9074 static windows/HAL/DP and firmware profile; complete per-chip optional-feature inventory, remaining platform/BW-scaling paths and architecture coverage |
-| mt76 | 34 | Associated/off-channel and richer scans, 6 GHz/HE and broader VHT beyond the retained20/40/80/actual7922-160 profile, richer TX/RX BA and TX A-MSDU, PMF/WPA3, fragmentation, QoS beyond BE/TID0 and U-APSD/TSPEC, PM/removal/reprobe, IOMMU/non-coherent DMA and loadable packet ABI |
-| ath10k | 36 | Broader HT40 pairs/bands, multiple streams/VHT/TX aggregation and richer RX profiles, PFC, alternate calibration sources, associated/off-channel scanning, IRQ operation, automatic/stable-interface recovery, DMA reclamation and host-bus/system PM |
-| ath9k | 15 | Other chip/EEPROM/descriptor variants, channel retune, periodic calibration, HT/BA/aggregation and richer rates, IRQs, reset/rejoin, removal and PM |
-| rtlwifi | 31 | Other matched chips; wider channel/rate profiles, IRQ/C2H expansion, multiple radios, reset/recovery, removal and suspend |
-| rtl8xxxu | 24 | Other matched USB chips, SGI20/HT40 and wider channels/rates, RX/TX A-MPDU, TX A-MSDU, both BA directions and RX reorder, coexistence, EP0/halted reset, safe rejoin, FIFO retune and PM |
-| rtw88 | 23 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
-| rtw89 | 32 | Other AX/BE profiles and BE transport/EFUSE, wider PHY/channel/rate/role/security profiles, periodic RF tracking, IRQs, reset/rejoin/removal/suspend and multiple functions |
-| brcmfmac | 31 | Other chip/CPU/RAM/OTP/shared-ring profiles, PHY beyond the scoped43602 VHT80 owner where supported, WPA3/AP and other roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation |
-| cyw43439 | 26 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions |
+| iwlwifi | 18 | Gen2 active probes, broader rejoin/key history, PMF/richer PHY/QoS/BA/TX LDPC/STBC/recovery; remaining Gen3 command profiles and unlisted PCI IDs; 6 GHz/HE/EHT, additional roles, checksum/scheduled-scan offload, RX/RSS and system PM |
+| ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles; device-tree board variants and aarch64 composition |
+| mt76 | 13 | Associated/off-channel and richer scans, 6 GHz/HE and broader VHT beyond the retained20/40/80/actual7922-160 profile, richer TX/RX BA and TX A-MSDU, PMF/WPA3, TX fragmentation, QoS beyond BE/TID0 and U-APSD/TSPEC, PM/removal/reprobe, IOMMU/non-coherent DMA and loadable packet ABI |
+| ath10k | 19 | Broader HT40 pairs/bands, multiple streams/VHT/TX aggregation and richer RX profiles, PFC, alternate calibration sources, associated/off-channel scanning, IRQ operation, automatic/stable-interface recovery, DMA reclamation and host-bus/system PM |
+| ath9k | 10 | Other chip/EEPROM/descriptor variants, channel retune, periodic calibration, HT/BA/aggregation and richer rates, IRQs, reset/rejoin, removal and PM |
+| rtlwifi | 17 | Other matched chips; wider channel/rate profiles, IRQ/C2H expansion, multiple radios, reset/recovery, removal and suspend |
+| rtl8xxxu | 9 | Other matched USB chips, SGI20/HT40 and wider channels/rates, RX/TX A-MPDU, TX A-MSDU, both BA directions and RX reorder, coexistence, EP0/halted reset, safe rejoin, FIFO retune and PM |
+| rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
+| rtw89 | 14 | Other AX/BE profiles and BE transport/EFUSE, wider PHY/channel/rate/role/security profiles, periodic RF tracking, IRQs, reset/rejoin/removal/suspend and multiple functions |
+| brcmfmac | 13 | Other chip/CPU/RAM/OTP/shared-ring profiles, PHY beyond the scoped43602 VHT80 owner where supported, WPA3/AP and other roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation |
+| cyw43439 | 13 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions |
 
 Ordinary firmware station power save is implemented for CYW43439 and BCM43602
 through the common retained FullMAC owner; system suspend, wake offload and

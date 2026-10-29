@@ -194,6 +194,21 @@ impl SourcePort {
         *self.contract.lock()
     }
 
+    /// Return the port to its freshly-constructed state: `Startup`
+    /// (whose first step re-runs the power-on clearing), pending
+    /// requests and any contract dropped, message counter reset.
+    /// `TcpmPort` calls this when it observes a detach so a later
+    /// re-attach re-offers capabilities and negotiates fresh
+    /// instead of reporting the previous partner's contract as
+    /// live (#1193).
+    pub fn reset(&self) {
+        *self.pending_request.lock() = None;
+        *self.pending_pps_request.lock() = None;
+        *self.contract.lock() = None;
+        self.next_msg_id.store(0, Ordering::Release);
+        self.set_state(SourceState::Startup);
+    }
+
     /// True when this port is currently the DFP (Downstream-Facing
     /// Port = USB host). Flips on every successful DR_Swap.
     pub fn is_dfp(&self) -> bool {
@@ -875,6 +890,10 @@ impl TcpmPort {
             }
             PortState::AttachedSnk => {
                 if !cc.attached() {
+                    // Detach (#1193): reset the sink engine so the
+                    // previous partner's contract stops reading as
+                    // live and a re-attach renegotiates fresh.
+                    self.sink.reset();
                     self.set_state(PortState::Unattached);
                     return Ok(PortStepOutcome::Advanced(PortState::Unattached));
                 }
@@ -887,6 +906,9 @@ impl TcpmPort {
             }
             PortState::AttachedSrc => {
                 if !cc.attached() {
+                    // Detach (#1193): reset the source engine, the
+                    // mirror of the AttachedSnk branch above.
+                    self.source.reset();
                     self.set_state(PortState::Unattached);
                     return Ok(PortStepOutcome::Advanced(PortState::Unattached));
                 }
@@ -919,7 +941,12 @@ impl TcpmPort {
             }
             PortState::ErrorRecovery => {
                 // §8.3.3.7: drop the rail and re-enter Unattached.
+                // The engines reset too (#1193): error recovery can
+                // be entered from an attached state, and the same
+                // stale-contract argument applies.
                 let _ = self.tcpc.hard_reset();
+                self.sink.reset();
+                self.source.reset();
                 self.set_state(PortState::Unattached);
                 Ok(PortStepOutcome::Advanced(PortState::Unattached))
             }
@@ -1362,6 +1389,252 @@ pub(crate) mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usbpd/tcpm", smoke_tcpm_port_registry_round_trip);
+
+    /// A lossless store-and-forward Type-C cable between two
+    /// `TcpmPort`s: end A's transmit lands in end B's receive
+    /// queue and vice versa, and each end's CC status reports the
+    /// partner's termination (A sees the sink's Rd, B sees the
+    /// source's Rp). `detach` severs the wire — CC open on both
+    /// ends and in-flight bytes dropped, as a physical unplug
+    /// would — and `reattach` restores the terminations for a new
+    /// partner on the same cable ends.
+    #[derive(Debug)]
+    struct Cable {
+        a_rx: IrqSafeSpinLock<Vec<Vec<u8>>>,
+        b_rx: IrqSafeSpinLock<Vec<Vec<u8>>>,
+        a_cc: IrqSafeSpinLock<CcStatus>,
+        b_cc: IrqSafeSpinLock<CcStatus>,
+        a_role: IrqSafeSpinLock<PortRole>,
+        b_role: IrqSafeSpinLock<PortRole>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CableSide {
+        A,
+        B,
+    }
+
+    #[derive(Debug)]
+    struct CableEnd {
+        cable: Arc<Cable>,
+        side: CableSide,
+    }
+
+    impl Cable {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                a_rx: IrqSafeSpinLock::new(Vec::new()),
+                b_rx: IrqSafeSpinLock::new(Vec::new()),
+                a_cc: IrqSafeSpinLock::new(CcStatus {
+                    cc1: CcState::Rd,
+                    cc2: CcState::Open,
+                }),
+                b_cc: IrqSafeSpinLock::new(CcStatus {
+                    cc1: CcState::Rp3A0,
+                    cc2: CcState::Open,
+                }),
+                a_role: IrqSafeSpinLock::new(PortRole::Drp),
+                b_role: IrqSafeSpinLock::new(PortRole::Drp),
+            })
+        }
+
+        fn end(self: &Arc<Self>, side: CableSide) -> CableEnd {
+            CableEnd {
+                cable: Arc::clone(self),
+                side,
+            }
+        }
+
+        fn detach(&self) {
+            let open = CcStatus {
+                cc1: CcState::Open,
+                cc2: CcState::Open,
+            };
+            *self.a_cc.lock() = open;
+            *self.b_cc.lock() = open;
+            self.a_rx.lock().clear();
+            self.b_rx.lock().clear();
+        }
+
+        fn reattach(&self) {
+            *self.a_cc.lock() = CcStatus {
+                cc1: CcState::Rd,
+                cc2: CcState::Open,
+            };
+            *self.b_cc.lock() = CcStatus {
+                cc1: CcState::Rp3A0,
+                cc2: CcState::Open,
+            };
+        }
+    }
+
+    impl Tcpc for CableEnd {
+        fn name(&self) -> &'static str {
+            "cable"
+        }
+
+        fn set_role(&self, role: PortRole) -> Result<(), TcpcError> {
+            match self.side {
+                CableSide::A => *self.cable.a_role.lock() = role,
+                CableSide::B => *self.cable.b_role.lock() = role,
+            }
+            Ok(())
+        }
+
+        fn cc_status(&self) -> Result<CcStatus, TcpcError> {
+            Ok(match self.side {
+                CableSide::A => *self.cable.a_cc.lock(),
+                CableSide::B => *self.cable.b_cc.lock(),
+            })
+        }
+
+        fn transmit(&self, m: &[u8]) -> Result<(), TcpcError> {
+            match self.side {
+                CableSide::A => self.cable.b_rx.lock().push(m.to_vec()),
+                CableSide::B => self.cable.a_rx.lock().push(m.to_vec()),
+            }
+            Ok(())
+        }
+
+        fn receive(&self) -> Result<Vec<u8>, TcpcError> {
+            let mut q = match self.side {
+                CableSide::A => self.cable.a_rx.lock(),
+                CableSide::B => self.cable.b_rx.lock(),
+            };
+            if q.is_empty() {
+                return Err(TcpcError::NoMessage);
+            }
+            Ok(q.remove(0))
+        }
+
+        fn hard_reset(&self) -> Result<(), TcpcError> {
+            self.cable.a_rx.lock().clear();
+            self.cable.b_rx.lock().clear();
+            Ok(())
+        }
+    }
+
+    /// #1193 at the `TcpmPort` level, over a fixture cable: two
+    /// production ports negotiate a 5 V / 3 A contract, the cable
+    /// is unplugged (both engines must reset — no live contract,
+    /// no stale terms), and the long-lived sink port re-attaches
+    /// to a *different* source offering 5 V / 1 A and negotiates
+    /// a fresh 1 A contract. If the stale caps leaked through,
+    /// the second contract would still read 3 A.
+    fn smoke_tcpm_back_to_back_negotiate_detach_renegotiate() -> TestResult {
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        let cable = Cable::new();
+        let src = Arc::new(TcpmPort::new(
+            Arc::new(cable.end(CableSide::A)),
+            SinkPolicy::default(),
+            SourcePolicy::default(),
+            alloc::string::String::from("host"),
+        ));
+        let snk = Arc::new(TcpmPort::new(
+            Arc::new(cable.end(CableSide::B)),
+            SinkPolicy::default(),
+            SourcePolicy::default(),
+            alloc::string::String::from("dock"),
+        ));
+        for _ in 0..100 {
+            let _ = src.step(&cap);
+            let _ = snk.step(&cap);
+            if src.contract_live() && snk.contract_live() {
+                break;
+            }
+        }
+        if !src.contract_live() || !snk.contract_live() {
+            return TestResult::Fail(
+                "back-to-back: first negotiation never reached live contracts",
+            );
+        }
+        if *cable.a_role.lock() != PortRole::Source || *cable.b_role.lock() != PortRole::Sink {
+            return TestResult::Fail("back-to-back: engines did not program source/sink roles");
+        }
+        let src_terms = match src.source().contract() {
+            Some(c) => c,
+            None => return TestResult::Fail("back-to-back: source has no contract while live"),
+        };
+        let snk_terms = match snk.sink().contract() {
+            Some(c) => c,
+            None => return TestResult::Fail("back-to-back: sink has no contract while live"),
+        };
+        if src_terms.voltage_mv != 5000
+            || src_terms.op_current_ma != 3000
+            || snk_terms.voltage_mv != 5000
+            || snk_terms.op_current_ma != 3000
+        {
+            return TestResult::Fail(
+                "back-to-back: first contract terms differ from the 5V/3A offer",
+            );
+        }
+
+        // Detach: stepping must drop both ports to Unattached
+        // with the contracts gone, not merely unannounced.
+        cable.detach();
+        for _ in 0..10 {
+            let _ = src.step(&cap);
+            let _ = snk.step(&cap);
+        }
+        if src.state() != PortState::Unattached
+            || snk.state() != PortState::Unattached
+            || src.contract_live()
+            || snk.contract_live()
+            || src.source().contract().is_some()
+            || snk.sink().contract().is_some()
+        {
+            return TestResult::Fail("back-to-back: detach left a live or stale contract");
+        }
+
+        // Re-attach the same sink port to a new 5 V / 1 A source
+        // on the same cable end and negotiate fresh.
+        cable.reattach();
+        let src2 = Arc::new(TcpmPort::new(
+            Arc::new(cable.end(CableSide::A)),
+            SinkPolicy::default(),
+            SourcePolicy::from_pdos(alloc::vec![narf_usbpd::message::SourcePdo::Fixed {
+                voltage_mv: 5000,
+                max_current_ma: 1000,
+            }]),
+            alloc::string::String::from("host-1a"),
+        ));
+        for _ in 0..100 {
+            let _ = src2.step(&cap);
+            let _ = snk.step(&cap);
+            if src2.contract_live() && snk.contract_live() {
+                break;
+            }
+        }
+        if !src2.contract_live() || !snk.contract_live() {
+            return TestResult::Fail("back-to-back: renegotiation never reached live contracts");
+        }
+        let src2_terms = match src2.source().contract() {
+            Some(c) => c,
+            None => {
+                return TestResult::Fail("back-to-back: second source has no contract while live")
+            }
+        };
+        let snk2_terms = match snk.sink().contract() {
+            Some(c) => c,
+            None => {
+                return TestResult::Fail("back-to-back: second sink has no contract while live")
+            }
+        };
+        if src2_terms.voltage_mv != 5000
+            || src2_terms.op_current_ma != 1000
+            || snk2_terms.voltage_mv != 5000
+            || snk2_terms.op_current_ma != 1000
+        {
+            return TestResult::Fail(
+                "back-to-back: renegotiated terms did not follow the new 5V/1A offer",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_tcpm_back_to_back_negotiate_detach_renegotiate
+    );
 
     // ── Helpers shared across Stage-2 swap/BIST tests ─────────────
 

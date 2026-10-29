@@ -292,6 +292,40 @@ pub unsafe fn route_gsi_to_vector(gsi: u32, vector: u8, dest_apic: u8, flags: u3
     false
 }
 
+/// Set or clear the redirection-entry mask of `gsi` in whichever MADT
+/// IOAPIC owns it, leaving vector, destination, polarity and trigger
+/// unchanged. Returns `false` outside every MADT range. Safe to call from
+/// hard-IRQ context: `IOAPIC_LOCK` is IRQ-safe and no allocation occurs.
+///
+/// A level-triggered line masked here stays asserted at the pin; after
+/// the local-APIC EOI clears Remote IRR, unmasking a still-asserted line
+/// delivers it again (Linux `mask_ioapic_irq`/`unmask_ioapic_irq` used by
+/// `handle_fasteoi_irq` for `IRQF_ONESHOT`).
+///
+/// # Safety
+/// MADT IOAPIC mappings must be initialized and live; the caller owns the
+/// route's mask state.
+pub unsafe fn set_gsi_masked(gsi: u32, masked: bool) -> bool {
+    let mut ioapics = [crate::IoApic::default(); crate::MAX_IOAPICS];
+    let n = crate::copy_ioapics(&mut ioapics);
+    for io in &ioapics[..n] {
+        // SAFETY: IOAPIC base comes from the validated MADT.
+        let h = unsafe { probe(io.address as u64, io.gsi_base) };
+        if gsi >= h.gsi_base && gsi <= h.gsi_end {
+            let index = IDX_IOREDTBL_BASE + 2 * (gsi - h.gsi_base);
+            let _guard = IOAPIC_LOCK.lock();
+            // SAFETY: in-range redirection entry, selector/window pair locked.
+            unsafe {
+                let low = read_reg_locked(h.base_phys, index);
+                let low = if masked { low | MASKED } else { low & !MASKED };
+                write_reg_locked(h.base_phys, index, low);
+            }
+            return true;
+        }
+    }
+    false
+}
+
 /// Read the existing routing of a GSI without reprogramming it. Drivers use
 /// this to join a shared level-triggered line instead of stealing its vector.
 /// Returns `(vector, destination_apic, low_dword)` or None outside MADT ranges.

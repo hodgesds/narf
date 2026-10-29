@@ -16,8 +16,10 @@
 >
 > Qualcomm ath11k Wi-Fi 6 / 6E driver for PCIe host-attached
 > silicon. QCA6390 and WCN6855-layout parts have native receive/runtime
-> profiles; recognized QCN9074 remains rejected before DMA because its
-> software is incomplete. Adapted from Linux
+> profiles; QCN9074 has its register map, static BAR windows and
+> multi-pdev core/DP configuration, but probe refuses it
+> (`pci::UNVERIFIED_RUNTIME`) until a composed start-up has run.
+> Adapted from Linux
 > `drivers/net/wireless/ath/ath11k/` (BSD-3-Clause-Clear) and
 > `drivers/bus/mhi/host/`, `net/qrtr/`, `drivers/soc/qcom/qmi_*`.
 
@@ -45,7 +47,13 @@ accesses. Higher offsets go through the sliding window: write
 it back, then access BAR0 + `0x80000` + `(off & GENMASK(18,0))`.
 Select + access are serialised under one lock with the current
 window cached (Linux `ath11k_pci_select_window`). WCN6855 / QCA6390
-use the dynamic window; QCN9074 uses a static map (not implemented).
+use the dynamic window. QCN9074 (`static_window_map`) uses static
+windows (`qcn9074::static_window_start` / `static_bar_offset`, Linux
+`ath11k_pci_get_window_start`): the UMAC/DP range at BAR0 + 3 x
+`0x80000`, the CE range (`HAL_SEQ_WCSS_UMAC_CE0_SRC_REG` = `0x1b80000`) at
+2 x `0x80000`, everything else through the dynamic window; `NativeIo`
+routes by the map, and MHI start writes `static_window_select_value()`
+(`ath11k_pci_select_static_window`).
 
 ### 2.2 hw_rev (`hw.rs`)
 
@@ -54,6 +62,14 @@ use the dynamic window; QCN9074 uses a static map (not implemented).
 resolve to `HwRev` exactly as Linux `ath11k_pci_probe`: WCN6855
 HW2.0 / HW2.1, QCA2066 HW2.1, QCA6698AQ HW2.1. Unsupported steppings
 fail probe. `HwRev::fw_dir()` = Linux `hw_params.fw.dir`.
+
+The AHB / hybrid-bus SoC parts take their `HwRev` from the DT match
+(`ath11k_ahb_probe`: `of_device_get_match_data`): `HwRev::{Ipq8074,
+Ipq6018Hw10, Ipq5018Hw10, Wcn6750Hw10}` = `AhbChip::hw_rev()`,
+`HwRev::ahb_chip()` the reverse. `HwRev::params()` for them is
+`AhbHwParams::hw_params(rev)` (no MSI users on IPQ = `MSI_CONFIG_NONE`;
+`HwParams::ce_offset` = `ATH11K_CE_OFFSET`, `AHB_CE_WINDOW_OFFSET` on
+IPQ5018, which `Hal::new` passes to `hal::create_config_ce`).
 
 ### 2.3 MHI host (`mhi.rs`, `mhi_host.rs`)
 
@@ -110,8 +126,37 @@ implement the WCN6855 M3 WoW transport transition; ordinary system suspend
 uses `power_down_for_system_suspend` then the existing QMI/DP reconstruction
 after resume. The generic no-RDDM MHI-core SYS_ERR recovery
 (`mhi_pm_sys_error_transition`) is not used for WCN6855, whose allocated
-RDDM image takes the ath11k reset path. Still not ported: BW scaling,
-RSC/offload/client-managed rings, EDL.
+RDDM image takes the ath11k reset path.
+
+MHI scope proven inapplicable to every admitted profile (QCA6390 HW2.0,
+WCN6855 HW2.0/2.1, QCA2066 HW2.1, QCA6698AQ HW2.1), from Linux
+`ath11k/mhi.c` and `drivers/bus/mhi/host`:
+- *Client-managed, offload and hardware event rings*: `ath11k_mhi_register`
+  selects `ath11k_mhi_config_qca6390` for all five revisions; its two event
+  rings set `.client_managed = false`, `.offload_channel = false`,
+  `.hardware_event = false`, and its only channels (20/21 "IPCR") set
+  `.offload_channel = false`. No ath11k configuration (QCN9074 included)
+  declares such a ring, so `mhi_init_dev_ctxt`'s client/offload branches are
+  never taken. NARF's `mhi::config_for` selects `ATH11K_MHI_CONFIG_QCA6390`
+  for the same five revisions and mirrors those values (`mhi_tests.rs`
+  "no client-managed / offload / hardware MHI rings") and `mhi_host` keeps the corresponding
+  `offload_ev` / `hw_ring` skips only as the faithful MHI-core shape.
+- *RSC (coalesced) rings*: RSC is an MHI channel `xfer_type` of
+  `DMA_TYPE_RSC` that only a channel config can request (pci_generic's
+  modem IP_HW channels); ath11k's IPCR channels are plain `MHI_BUF_RAW`
+  transfer rings, so no RSC TRE is ever posted or completed.
+- *Bandwidth scaling*: upstream `struct mhi_controller` has no host
+  bandwidth-scaling callback; a device `MHI_PKT_TYPE_BW_REQ_EVENT` only
+  records `mhi_link_info` and calls `status_cb(MHI_CB_BW_REQ)`, which
+  `ath11k_mhi_op_status_cb` ignores (`default: break`). NARF decodes the
+  event, delivers `MhiNotify::BwReq` and ignores it the same way
+  (`mhi_tests.rs` "MHI_CB_BW_REQ for each").
+- *EDL*: ath11k sets no `edl_image` and no `edl_trigger`
+  (`mhi_controller` fields left NULL); a device found in `MHI_EE_EDL` is
+  handled as `MHI_CB_FATAL_ERROR` + `mhi_pm_sys_err_handler`, and
+  `mhi_fw_load_handler` with a NULL EDL image fails the load. NARF
+  rejects the same EE (`MhiEe::EDL` in `in_pbl`, no EDL image) instead
+  of emulating a flash-programmer download ath11k never performs.
 
 ## 3. Public interface
 
@@ -130,7 +175,7 @@ MHI/QMI support for another revision do not imply a registered WLAN:
 |---|---|---|
 | WCN6855 / QCA2066 / QCA6698AQ | MHI/QMI, CE/HTC/WMI, DP and STA/AP/P2P interfaces | Target-card and AP interoperability validation remains; optional Linux features outside this profile are not implied |
 | QCA6390 HW2.0 | Native IPQ8074 RX/error/fragment DP and production core/CE profile; resource and host vdev capacity four | Native DMA fixtures pass both architectures; composed production-profile CE startup, WPA2 station/data and four-slot tests pass on x86_64; those integration fixtures are x86-only; physical interoperability remains |
-| QCN9074 HW1.0 | Recognized PCI ID; configuration definitions; probe rejects before MMIO/MSI/firmware activation | Static BAR windows, QCN9074 HAL register map/operations, core configuration, per-pdev/REO/HTT-v2 and RX descriptor runtime are not ported |
+| QCN9074 HW1.0 | Recognized PCI ID; `qcn9074_regs`, static BAR windows, multi-pdev `CoreConfig` / `DpHwParams` admission; tables pass `runtime_profile_complete`, but probe refuses it (`pci::UNVERIFIED_RUNTIME`) until a composed start-up smoke exists (fixture-tested only) | Multi-pdev runtime residuals: the RX service pass (refill replenish, RXDMA error and monitor-status reaping) covers pdev 0 only, the mac layer registers one radio on pdev 0 (`MacConfig::wcn6855`) and WMI commands go to `wmi[0]` although every per-pdev endpoint is connected, and monitor mode (incl. QCN9074 `full_monitor_mode`) is not supported; composed PCI bring-up never run (no hardware, no composed fixture) |
 
 Probe first verifies inherited bus mastering and memory decode are off,
 with INTx masked, using command-register readback. Rejected family/singleton
@@ -247,6 +292,16 @@ tables.
   flow control) + `qmi_txn_wait` (match by `txn_id` only, decode with
   the transaction's decoder), `wait_inbound`, `take_inbound`
   (`ServerArrive` / `ServerExit` / indication bytes).
+- `qrtr_glink` — the AHB transport (`net/qrtr/smd.c`):
+  `GlinkQrtr<P: GlinkPipe, B: GlinkBus>` implements `QrtrPipe` over a
+  `narf_drivers_qcom_soc::glink::Glink` edge. `new` claims the
+  remote-initiated `IPCRTR` channel with the default 5 × 1 KiB intents;
+  one rpmsg message = one QRTR packet; `send` before the channel is open
+  (or after the remote closed it) is `-ENOTCONN`, an oversize frame
+  `-EMSGSIZE`; `wait(ms)` = `GlinkBus::wait_irq` (the edge SPI) then
+  `Glink::process_rx`; `take_closed` reports a remote CLOSE once.
+  `GicGlinkBus { line: irq::GicSpi, clock }` is the production
+  `GlinkBus` (the `glink-edge` SPI).
 - `wlfw` — `Wlfw<P, F: FirmwareLoader, A: DmaAllocator>`, whose
   `A::Mem: CoherentMem` supplies DMA address, length, write and immutable
   CPU bytes (the latter for pre-reset device-coredump collection), the
@@ -259,7 +314,20 @@ tables.
   `FwReadyInfo`), and `firmware_start(mode, shadow_reg_v2)` =
   wlan_ini (`fw_wmi_diag_event`) → wlan_cfg (QCA6390 CE + service
   maps, shadow v2 clamped to 36) → wlan_mode. `WlfwConfig::pci(..)`
-  carries `ab->id`, `dev_name` (caldata name) and the timeouts.
+  carries `ab->id`, `dev_name` (caldata name) and the timeouts;
+  `WlfwConfig::ahb(chip, dev_name, host_ddr)` the AHB values
+  (`AhbChip::wlfw_hw_params()`, `bus=ahb` board names, `cal-ahb-<dev>.bin`,
+  DT `memory-region[0]` as the HOST_DDR region). AHB paths:
+  `fixed_mem_region` → `assign_fixed_target_mem` (HOST_DDR = region,
+  BDF = `hw.bdf_addr`, CALDB after HOST_DDR / `ATH11K_QMI_CALDB_ADDRESS` /
+  0); `fixed_bdf_addr` → `DmaAllocator::iomem_write(bdf_addr, board_size,
+  off, file)` (caldata at `cal_offset`; a file past `board_size` is
+  refused with `BDF_IOREMAP`, where Linux would overrun its mapping) and
+  one `bdf_fixed_addr_request` (no data TLV, `end = 1`, `total_size` =
+  length); `hybrid_bus_type` → `request_device_info` after target_cap
+  (BAR must be non-zero and `ATH11K_QMI_DEVICE_BAR_SIZE`; `device_bar()`
+  hands it to the HIF). `Dma32::iomem_write` maps the window with
+  `narf_drivers_qcom_soc::io::MmioRegs`.
   After FW_READY (REGISTERED): `late_event()` pumps the link, runs the
   QMI handlers (COLD_BOOT_CAL_DONE / FW_READY set `cal_done`, REQUEST_MEM
   allocates) and classifies what `ath11k_qmi_driver_event_work` would
@@ -455,6 +523,10 @@ Linux's: entry size / ring size / HP / TP in 32-bit words.
   CE vectors, no `pci.rs` change), `set_ce_irqs_enabled`
   (`ATH11K_FLAG_CE_IRQ_ENABLED`). On PCI there is no CE interrupt
   enable register (`CE_HOST_IE_*` is AHB-only).
+- `CeIrq` also has default-no-op bus hooks `hif_start(io)` /
+  `hif_stop(io, crash_flush)`, which `CeHif::start` / `stop` run around
+  `Ce::start` / `Ce::stop` (the AHB `CE_HOST_IE_*` gating,
+  [`ahb_hif`]).
 
 ### 3.5 DP descriptor layouts (`dp.rs`)
 
@@ -473,6 +545,11 @@ tests drive a fake chip that only knows what the host programmed
 through the real DMA32 ring memory; `smoke_ath11k_ce_cleanup_and_reinit`
 runs cleanup → device reset → `init_pipes` over the same memory with
 data in both directions after it.
+
+`qcn9074.rs`: `HalRxDescQcn9074` (`struct hal_rx_desc_qcn9074`, 384 bytes;
+QCN9074, IPQ5018, WCN6750) with the `ath11k_hw_qcn9074_rx_desc_*` getters;
+`rx_descriptor::RxDescriptor::Qcn9074` decodes it for `HwRev::Qcn9074Hw10`
+(`mpdu_info1` = `mpdu_start.info11`, same bits as the WCN6855 word).
 
 ### 3.6 Core bring-up (`core.rs`, Linux `core.c`)
 
@@ -498,8 +575,9 @@ HE caps for the mac layer, HAL reg caps), `dma_ring_caps`, `ready` +
   `pdev_reo_setup` (after service ready, before INIT), async
   `htt_ver_req` (last step of `ath11k_core_start`), async `pdev_create`,
   `irq_enable`.
-- `CoreConfig::for_hw(&HwParams)` (QCA6390 and WCN6855 family; QCN9074
-  `None`): `single_pdev_only`, `num_rxdma_per_pdev = 2`, `max_radios =
+- `CoreConfig::for_hw(&HwParams)` (QCA6390, WCN6855 family, the AHB
+  parts and QCN9074 — one radio, 8 vdevs, 128 peers, multi-pdev shape;
+  `num_peers` feeds the multi-pdev resource config). WCN6855 family: `single_pdev_only`, `num_rxdma_per_pdev = 2`, `max_radios =
   3`, `num_vdevs = 4`, credit flow, shadow regs, Linux timeouts (HTC
   1 s, connect 1 s, service / unified ready 5 s, WMI send 3 s).
   Firmware requests and retained host slot arrays both use four, matching
@@ -782,8 +860,18 @@ ath11k: target firmware cannot transmit More-Fragments frames.
 `NL80211_CMD_SET_TX_BITRATE_MASK` is retained per WCN6855 vdev, not per
 physical radio. The generic nl80211 layer preserves each active-band legacy,
 HT, VHT and HE MCS mask plus GI/LTF choices. ath11k rejects FORCE_LGI and
-the same non-contiguous multi-MCS VHT/HE masks Linux rejects until a
-RATEMASK WMI implementation exists. It limits every WMI peer-association
+the same non-contiguous multi-MCS VHT/HE masks Linux rejects
+(`mac_peer::validate_tx_bitrate_band` with `vht_mcs_range_present` /
+`he_mcs_range_present`, the ports of `ath11k_mac_{vht,he}_mcs_range_present`:
+VHT 0-7/0-8/0-9, HE 0-7/0-9/0-11 only; an earlier NARF HE predicate that
+also accepted 0-8/0-10 — which `he_limit` would have widened to 0-9/0-11 —
+is fixed). Non-contiguous RATEMASK programming is inapplicable rather than
+missing: upstream `ath11k_mac_op_set_bitrate_mask` returns `-EINVAL`
+("setting %d mcs values in bitrate mask not supported", "TODO: Handle
+multiple VHT MCS values setting using RATEMASK CMD"), and neither ath11k nor
+ath12k defines a `WMI_TAG_VDEV_CONFIG_RATEMASK` payload or ever sends
+`WMI_VDEV_RATEMASK_CMDID`; there is no firmware layout to port
+(`mac_tests.rs::smoke_ath11k_mac_bitrate_mask_ranges`). It limits every WMI peer-association
 rate set by the requested mask, programs VDEV NSS/LDPC/SGI and HE fixed or
 autorate GI/LTF parameters, then sends a peer-association update with
 `is_assoc = false` for every already-associated station or AP client. A
@@ -791,6 +879,34 @@ single compatible VHT, HE or HT MCS becomes `WMI_PEER_PARAM_FIXED_RATE`; an
 unrestricted/multi-rate policy clears that override. The policy is retained
 by `Ath11kNetdev` across `Mac::new` during reset and is installed before
 future STA/AP peer association, matching `ath11k_vif::bitrate_mask`.
+Debugfs-class firmware diagnostics (`mac/diag.rs`). Linux ath11k exposes
+these only through debugfs, never nl80211, so NARF provides them as driver
+APIs: `Mac::twt_add_dialog` / `twt_del_dialog` / `twt_pause_dialog` /
+`twt_resume_dialog` port `ath11k_write_twt_*_dialog` (refuse with
+`-EOPNOTSUPP` while `ar->twt_enabled` is off; for a station vif the add
+re-arms the pdev engine with `sta_cong_timer_ms = 0` — disable + enable —
+and the delete or a failed add restores the defaults; `vdev_id` is always
+the vif's) over the byte-exact `wmi::twt_{add,del,pause,resume}_dialog_cmd`
+(`struct wmi_twt_*_dialog_params_cmd`; flag bits 8–11 above the u8 TWT setup
+command). `WMI_TWT_ADD_DIALOG_EVENTID` is decoded
+(`decode_twt_add_dialog_event`, routed to its vdev), a nonzero status is
+logged with `ath11k_wmi_twt_add_dialog_event_status`'s strings and kept for
+`Mac::take_twt_add_dialog_events` (bounded 16). Linux parses no DEL / PAUSE /
+RESUME completion event (they fall to "Unknown eventid"); NARF likewise
+leaves them `WmiEvent::Unhandled`. Radar-detector diagnostics: the runtime
+records every `WMI_PDEV_DFS_RADAR_DETECTION_EVENTID` once, before any vdev
+sees it, in a radio-wide `RadarDiagnostics` (latest detector report — mode,
+frequency, width, detector/segment id, timestamp, chirp, frequency offset,
+sidx —, acted-on / ignored / invalid-pdev counts) read with
+`Shared::radar_diagnostics`; `Shared::set_dfs_block_radar_events` is
+`dfs_block_radar_events` (reports recorded, `DataPort::radar_events_blocked`
+keeps `ieee80211_radar_detected` from running), and `Mac::simulate_radar`
+is `ath11k_wmi_simulate_radar` (`WMI_UNIT_TEST_CMDID`, DFS module 0x2b,
+token 0xAA, args `{0, pdev_id, 0}`; `-EINVAL` without a started AP vdev,
+offered only on a 5 GHz radio). Tests:
+`mac_tests.rs::smoke_ath11k_mac_twt_dialog_control`,
+`smoke_ath11k_mac_radar_diagnostics`. Userspace reachability needs a
+driver-diagnostics surface in the shared `narf_wireless` crate.
 `Ath11kNetdev::tx_power_dbm` returns the latest complete physical-pdev firmware
 power sample, falling back to the active vdev's retained `bss_conf.txpower`
 equivalent when no sample is current. `GET_INTERFACE` publishes that dBm value
@@ -1731,6 +1847,190 @@ semantics + a SERVER_EXIT recovery without power cycle (queues stopped
 then woken); firmware / restart failures (latched, dead, control
 operations refused) and the reset gate.
 
+### 3.12 AHB / platform glue (`ahb.rs`, Linux `ahb.c`)
+
+Built on the Qualcomm SoC layer `narf-drivers-qcom-soc`
+(`drivers/soc/qcom/specification/spec.md`): devicetree platform devices,
+SCM/PAS, MDT loader, SMEM, SMP2P, GCC resets, Q6 WCSS and PAS remoteprocs.
+
+```rust
+pub enum AhbChip { Ipq8074, Ipq6018Hw10, Ipq5018Hw10, Wcn6750Hw10 }
+pub const AHB_OF_MATCH: [(&str, AhbChip); 4];          // ath11k_ahb_of_match
+impl AhbChip { fn from_compatible(&[String]) -> Option<Self>; const fn params(self) -> AhbHwParams;
+               const fn wlfw_hw_params(self) -> WlfwHwParams; const fn hw_rev(self) -> HwRev; }
+impl AhbHwParams { const fn ce_offset(&self) -> u32; const fn hw_params(&self, HwRev) -> HwParams; }
+impl HwRev { const fn ahb_chip(self) -> Option<AhbChip>; }   // + Ipq8074/Ipq6018Hw10/Ipq5018Hw10/Wcn6750Hw10
+pub struct HwParams { .., ce_offset: u32 }                  // ATH11K_CE_OFFSET
+pub const MSI_CONFIG_NONE, HW_HAL_PARAMS_IPQ8074, HW_HAL_PARAMS_WCN6750;
+pub fn hal::create_config_ce(&HalRegs, ce_off) -> [SrngConfig; N];
+pub struct AhbHwParams { chip, name, fw_dir, max_radios, bdf_addr, regs, ring_mask,
+    qmi_service_ins_id, host_ce_config, target_ce_config, svc_to_ce_map, ce_ie_addr,
+    ce_remap, single_pdev_only, rxdma1_enable, htt_peer_map_v2, supports_shadow_regs,
+    credit_flow, hal_desc, hybrid_bus_type, static_window_map, fixed_fw_mem,
+    fixed_bdf_addr, smp2p_wow_exit, mac_map, msi }
+pub const IRQ_NAMES: [&str; 52];                           // ahb.c irq_name[]
+pub fn ce_irqs(&AhbHwParams) -> Vec<(ce_id, irq_idx)>;      // ath11k_ahb_config_irq
+pub fn ext_irq_groups(&AhbHwParams) -> [Vec<u8>; 11];      // ath11k_ahb_config_ext_irq
+pub fn ce_irq_enable_bits(&AhbHwParams, ce_id, ce_offset) -> Vec<(reg, bit)>;
+pub fn wcn6750_window_offset(&HalRegs, offset) -> u32;    // static windows
+pub fn smp2p_power_save_value(seq_no, PowerSaveMsg) -> u32;
+pub const AHB_CE_WINDOW_OFFSET: u32;                       // ATH11K_CE_OFFSET for a CE remap
+pub struct AhbIo<R: RegIo> { mem, ce: Option<R>, window: Option<&HalRegs> } // impl ChipIo
+pub fn ce_irq_set(&impl ChipIo, &AhbHwParams, ce_id, ce_offset, enable);    // ath11k_ahb_ce_irq_{en,dis}able
+pub fn ce_irqs_set(&impl ChipIo, &AhbHwParams, ce_offset, enable);
+pub fn find_ahb_devices(blob) -> Vec<(PlatformDevice, AhbChip)>;
+pub fn probe_resources(blob, &PlatformDevice) -> Result<AhbResources, AhbError>;
+pub struct AhbRemote { platform: Q6Platform }             // ath11k_core_get_rproc
+impl AhbRemote { fn resolve(blob, &AhbResources) -> Result<Self, AhbError>; fn loader_matches(&self, AhbChip) -> bool; }
+```
+
+`hw.rs` adds `IPQ8074_REGS`, `IPQ5018_REGS`, `WCN6750_REGS` (verbatim
+`hw.c`; IPQ5018 CE offsets relative to the remapped CE window) and
+`RING_MASK_IPQ8074` / `RING_MASK_WCN6750`. `power_up`/`power_down` are
+`Q6Wcss::{load,start,stop}` (IPQ) or `PasRproc::{start,stop}` (WCN6750)
+driven with the resources `AhbRemote` resolves.
+
+AHB HIF (`ahb_hif.rs`, Linux `ahb.c` IRQ / start / stop paths):
+
+```rust
+pub enum AhbLineKind { Ce(u32 /* CE mask */), Dp(u32 /* ext-group mask */) }
+pub struct AhbLine { intid: u32, kind: AhbLineKind }
+pub fn ahb_lines(&AhbResources) -> Vec<AhbLine>;    // ath11k_ahb_config_irq / _config_ext_irq; hybrid: pcic over DT MSI
+pub type LineCtl = fn(intid, on);                   // enable_irq / disable_irq_nosync
+#[derive(Clone)] pub struct AhbIrq;                 // impl CeIrq + DpIrq
+impl AhbIrq { new(lines, AhbHwParams, LineCtl), bind_gic(lines, AhbHwParams) -> Result<Self, IrqBindError>,
+              release(), line_fired(i) /* hard-IRQ body */, lines(), masked(), fires() }
+pub fn ahb_ce_hif<R: RegIo>(&AhbResources, AhbIo<R>, AhbIrq, clock) -> Result<CeHif<AhbIo<R>, AhbIrq>, TransportError>;
+```
+
+A line's hard-IRQ body masks it at the distributor (DP: every line of the
+group, `ath11k_ahb_ext_grp_disable`) and records the CE / group bits in
+the state the PCI MSI handlers feed (`ce::raise_ce`, `runtime::raise_dp`),
+so `Rt::service` services AHB and PCI alike; `take_pending` /
+`take_dp_pending` unmask the taken lines before the service pass (Linux
+unmasks after it; an edge during the pass stays pending in the
+distributor). `hif_start` / `hif_stop` set / clear the `CE_HOST_IE_*`
+bits (`ath11k_ahb_ce_irqs_{enable,disable}`; kept under crash flush).
+Lines bind through `narf_drivers_qcom_soc::irq::GicSpi`, so the GIC
+backend underneath can change (the IPQ SoCs are GICv2).
+
+DT bring-up (`ahb_probe.rs`):
+
+```rust
+pub struct AhbPlatform { res: AhbResources, remote: AhbRemote, q6_irqs: Q6Irqs, glink: GlinkEdgeDt, lines: Vec<AhbLine> }
+impl AhbPlatform { fn probe(blob, &PlatformDevice) -> Result<Self, AhbError>; fn smp2p_edges(&self) -> Vec<String>; }
+pub enum BringUpStep { HalCeAlloc, QmiInit, RprocIrqs, RprocBoot, GlinkStart, ConfigIrq, QmiReady }
+pub trait AhbBringUp { hal_ce_alloc, qmi_init_service, async rproc_irqs, async rproc_boot, async glink_start,
+                       config_irq, async qmi_ready, async rproc_shutdown }
+pub async fn bring_up<B: AhbBringUp>(&AhbPlatform, &mut B) -> Result<(), (BringUpStep, AhbError)>;
+pub enum AhbError { .., LoaderMismatch, Failed(errno) }
+```
+
+`bring_up` runs Linux's order (`ath11k_ahb_probe`: HAL/CE alloc →
+`ath11k_core_init`: QMI service, `hif_power_up` = `rproc_boot` with the
+remoteproc's Q6 lines / SMP2P edges bound first and the glink subdev
+started after → `ath11k_ahb_config_irq` → QMI server arrival / firmware
+ready) and shuts the remoteproc down on a failure after it booted.
+
+DT driver: `ahb_probe::register_dt_driver()` registers `ath11k_ahb`
+(`AHB_DT_COMPATIBLE` = `ath11k_ahb_of_match`) with the bus DT match table
+(`narf_bus::register_dt_driver`, bus spec §3.2) at `Stage::Subsys`; a
+`Stage::Device` initcall walks the boot DTB (`narf_bus::probe_all_dt`).
+`ahb_dt_probe(blob, path)` = `probe_node` (→ `AhbPlatform::probe`) +
+`ahb_live::spawn_bring_up`.
+
+Production bring-up (`ahb_live.rs`):
+
+```rust
+pub trait AhbEnv: Send + Sync + 'static {
+    type Regs: RegIo; type Delay: Delay; type Smc: SmcConduit; type ScmAlloc: ScmAlloc;
+    type Fw: FirmwareLoader; type Dma: DmaAllocator; type Bus: GlinkBus;
+    fn map(&mut self, phys, len) -> Result<&'static Regs, AhbError>;          // devm_ioremap
+    fn carveout(&mut self, phys, len) -> Result<&'static mut [u8], AhbError>; // memory-region
+    fn delay, firmware, scm, dma, clock;
+    fn bind_lines(&mut self, Vec<AhbLine>, AhbHwParams) -> Result<AhbIrq, AhbError>;
+    fn bind_q6_gic(&mut self, &Q6Irqs, &'static Q6v5) -> Result<(), AhbError>;
+    fn glink_bus(&mut self, blob, &GlinkEdgeDt) -> Result<Bus, AhbError>;
+    fn remote_tick(&self) {}                                                  // fixtures play the remote
+}
+pub struct LiveAhb<E: AhbEnv> { pub env: E, pub outcome: Option<LiveOutcome<E>>, pub failure, .. } // impl AhbBringUp
+impl LiveAhb { new(env, blob), hif(), rproc_state(), qrtr_open(), glink_negotiated(), set_wlan_smp2p(v) }
+pub enum LiveOutcome<E> { Ready(Box<AhbCore<E>>, Box<Dp>), Stranded(Box<AhbCore<E>>, Option<Box<Dp>>) }
+pub type AhbWlfw<E> = Wlfw<GlinkQrtr<GlinkSmem<&Regs, DtKick<&Regs>>, Bus>, Fw, Dma>;
+pub struct NarfAhbEnv;      // MmioRegs, NarfDelay, ArchSmc, CoherentAlloc, NarfFirmware, Dma32, AhbGlinkBus
+pub enum AhbGlinkBus { Gic(GicSpi), Ipcc { line: GicSpi, regs } }   // impl GlinkBus
+pub async fn bring_up_task(blob, AhbPlatform);  pub fn spawn_bring_up(blob, AhbPlatform);
+pub fn ahb_runtimes() -> Vec<Arc<NarfAhbShared>>;
+pub fn runtime::start_ahb(core, dp) -> (Arc<Shared<..>>, Result<[u8; 6], TransportError>);
+```
+
+`hal_ce_alloc` maps `reg[0]` (+ the IPQ5018 CE remap) into `AhbIo` and
+builds the HIF (`ahb_ce_hif`); WCN6750 allocates the CE pipes only.
+`rproc_irqs` maps SMEM and the TCSR mutex, creates one `Smp2p` per edge
+(`qcom_smp2p_probe`) with the Q6 inbound bits, the `stop` and
+`wlan-smp2p-out` outbound entries, the remoteproc object and its `wdog`
+GIC line. `rproc_boot` loads the MDT from the firmware registry into the
+carve-out and runs `Q6Wcss::start` (GCC resets from the DT) or
+`PasRproc::start`; every wait iteration runs one `qcom_smp2p_intr` pass
+per edge (so GIC- and IPCC-parented edges behave alike).
+`glink_start` registers `GlinkSmem` and claims `IPCRTR` (`GlinkQrtr`)
+over the `glink-edge` interrupt: a GIC SPI, or on WCN6750 the IPCC
+(client, signal) behind the IPCC block's SPI, unmasked with
+`ipcc_set_enabled` and drained with `ipcc_pending`. `config_irq` binds
+the CE / DP lines. `qmi_ready` runs WLFW to FW_READY; WCN6750 then maps
+the DEVICE_INFO BAR as `AhbIo { window: Some(WCN6750_REGS) }` (static
+windows) and builds the HIF; then `CoreConfig::for_hw` +
+`qmi_firmware_ready` with `DpHooks` (`DpHwParams::for_rev`). The WLFW
+task hands a ready core to `runtime::start_ahb` (`Rt` + `Shared`, MAC
+from `device_caps`); a failed core is kept. Not done: the AHB netdev
+(`iface` registration is PCI-typed), post-boot SMP2P crash monitoring
+(`fatal` / `wdog` → recovery), and RPMh / AOSS QMP votes (§8).
+
+Per-chip `hw_ops` (`hw_ops.rs`, Linux `hw.c` `*_ops`; the `rx_desc_*`
+members are `RxDescriptor`):
+
+```rust
+pub struct HwOps { name, mac_from_pdev: MacMap, wmi_init_config: WmiInitConfig, mac_id_ipq8074: bool,
+                   tx_mesh: TxMesh, reo_setup: ReoSetup, ring_selector: RingSelector }
+pub const IPQ8074_OPS, IPQ6018_OPS, QCA6390_OPS, QCN9074_OPS, WCN6855_OPS, WCN6750_OPS, IPQ5018_OPS: HwOps;
+impl HwRev { const fn hw_ops(self) -> Option<&'static HwOps>; }
+impl HwOps { hw_mac_from_pdev_id, mac_id_to_pdev_id, mac_id_to_srng_id, ring_selector(cpu, flow_hash),
+             reo_setup(io, &HalRegs) }   // ipq8074 / wcn6855 / ipq5018 flavours
+```
+
+`Dp::alloc` runs `hw_ops.reo_setup` (QCA6390 now takes Linux's
+`ath11k_hw_ipq8074_reo_setup`, not the WCN6855 one). Multi-pdev parts
+(`single_pdev_only = false`) send `init_cmd` with
+`TargetResourceConfig::ipq8074(hw_num_vdevs, hw_num_peers, num_radios,
+num_rf_chains, reg_cc_ext)` (`ath11k_init_wmi_config_ipq8074`),
+`hw_mode_id = preferred_hw_mode` and `wmi::band_to_mac(ext, num_radios)`
+(`ath11k_fill_band_to_mac_param`) via `InitCmdParam::multi_pdev`;
+`Ath11kCore::num_radios()` is SERVICE_READY_EXT's radio count capped at
+`max_radios`, and `wmi_pdev_eps` keeps every connected WMI endpoint
+(WMI_CONTROL / _MAC1 / _MAC2: CE3, CE7, CE9 on IPQ8074). `DpHooks::
+pdev_create` runs `Dp::pdev_alloc` + its SRING_SETUP batch once per radio.
+The TX ring selector input is `runtime::tx_ring_selector(rev, flow_hash)`:
+the current CPU, or `txq::flow_hash(eth)` (`skb_get_hash`) on WCN6750.
+
+`HwRev`-keyed admission: `CoreConfig::for_hw` covers all four AHB parts
+(`num_rxdma_per_pdev = 1`; IPQ `single_pdev_only = false`, `num_vdevs =
+16 + 1`; WCN6750 single-pdev, three vdevs), `wlfw_hw_params(HwRev)`
+returns `AhbChip::wlfw_hw_params`, `RxDescriptor` decodes
+`hal_rx_desc_ipq8074` for IPQ8074/IPQ6018 and `hal_rx_desc_qcn9074` for
+IPQ5018/WCN6750, and `DpHwParams::for_rev` admits WCN6750 (the
+single-pdev shape: one RXDMA, `ath11k_hw_hal_params_wcn6750`, 2048-entry
+TCL rings, no TCL retry) and IPQ8074 / IPQ6018 / IPQ5018 / QCN9074 (multi-
+pdev, one RXDMA per pdev, `rxdma1_enable`, HTT peer-map v2, TCL retry,
+`ath11k_hw_hal_params_ipq8074` / `_ipq5018`, QCN9074 `full_monitor_mode`).
+`Dp::pdev_alloc(.., mac_id)` allocates pdevs in order (`Dp::pdev` +
+`Dp::extra_pdevs`, iterated by `Dp::pdevs()`): with rxdma1 each pdev also
+gets `rxdma_mon_buf_ring` (buffered like the refill ring),
+`rxdma_mon_dst_ring` and `rxdma_mon_desc_ring` with their HTT SRING_SETUP
+messages (after RXDMA_DST, before MONITOR_STATUS, as
+`ath11k_dp_rx_pdev_alloc`) and the monitor link descriptors posted to the
+desc ring (`ath11k_dp_rx_pdev_mon_attach`); `pdev_free` releases every
+pdev. `DpRingSizes` gains `rxdma_mon_{buf,dst,desc}` (4096 / 2048 / 4096).
+
 ## 4. Invariants
 
 - Failure-step codes (`wifi: <stage> FAILED step=N` on the panel) are
@@ -1798,7 +2098,8 @@ card (QEMU emulates none) is exercised once, after phase 8.
 
 ## 6. Dependencies
 
-`narf-bus` (BAR, MSI), `narf-io` (coherent DMA), `narf-firmware`
+`narf-bus` (BAR, MSI), `narf-drivers-qcom-soc` (AHB: DT platform devices,
+SCM/PAS, MDT, SMEM/SMP2P, GCC, Q6 WCSS/PAS remoteprocs), `narf-io` (coherent DMA), `narf-firmware`
 (`firmware-2.bin` or `amss.bin` + `m3.bin`, `board-2.bin`, `regdb.bin`
 — distro packages ship them `.zst`-compressed), `narf-wireless` (iface
 trait, EAPOL /
@@ -1821,15 +2122,16 @@ from physical RF, board, firmware and userspace interoperability acceptance.
 
 | Profile | Implemented reachable software | Remaining or inapplicable scope |
 |---|---|---|
-| WCN6855 HW2.0/HW2.1 | Native dynamic-window PCI/MHI/QMI/CE/HTC/WMI/DP; advertised-band legacy/HT/VHT/HE station/AP/P2P, security/keys/PMF, four-vdev/two-channel ownership, scan/ROC, recovery and PS/WoW/cold suspend; firmware power readback and retained recovery channel reservations | Native composed hardware fixtures remain x86-only; real aarch64 startup/PCI/IRQ/board discovery has no equivalent composed configuration. Per-dialog TWT control, non-contiguous RATEMASK firmware programming, DT board-variant discovery and spectral/radar detector diagnostics are not complete exposed software paths. Their absence is not a blanket assertion that firmware cannot support them. |
+| WCN6855 HW2.0/HW2.1 | Native dynamic-window PCI/MHI/QMI/CE/HTC/WMI/DP; advertised-band legacy/HT/VHT/HE station/AP/P2P, security/keys/PMF, four-vdev/two-channel ownership, scan/ROC, recovery and PS/WoW/cold suspend; firmware power readback and retained recovery channel reservations | Native composed hardware fixtures remain x86-only: they compile on aarch64, but un-gating them (2026-10-27) killed the aarch64 test kernel inside the composed DHCP/integration fixture before the suite summary, consistent with kernel-stack overflow from by-value fixture state, so they stay gated until that footprint is reworked. DT board-variant and `memory-region` fixed-memory discovery are implemented (`board::dt_facts`, `wlfw::assign_fixed_target_mem`). Per-dialog TWT control and radar-detector diagnostics are implemented as the Linux debugfs-equivalent `Mac`/`Shared` APIs (`mac/diag.rs`; no nl80211 surface exists in Linux either). Non-contiguous RATEMASK programming and spectral diagnostics are inapplicable: Linux refuses the former with `-EINVAL` and initialises spectral only when `hw_params.spectral.fft_sz != 0`, which is false for every admitted profile (`hw::HwRev::spectral`, `hw::spectral_supported`; `group_pn_tests.rs::smoke_ath11k_spectral_inapplicable_on_admitted_pci`). |
 | QCA6390 HW2.0 | Independent IPQ8074 RX descriptor/DP profile and core dispatch, shared supported MAC/runtime capabilities, native normal/error/coalescing/fragment ownership and composed station/recovery path | The same explicit optional/control and architecture gaps above apply only when target services advertise them. Six-GHz/HE160/80+80/extended security are admitted only from actual band, peer and firmware capabilities, not inferred from WCN6855. |
-| QCN9074 | PCI identity/configuration definitions only; rejected with BME disabled before MMIO/MSI/firmware activation | Missing native static BAR windows, QCN9074 HAL register/operation tables, non-shadow rings, independent core/per-pdev/HTT peer-map-v2 configuration, QCN RX/REO/DP runtime and composed ownership tests. This is missing software for a recognized profile. WCN6855/QCA6390 tests cannot establish it. |
-| Other Linux ath11k SoC/AHB profiles | No native NARF admission | IPQ8074/IPQ6018/IPQ5018/WCN6750 platform IRQ, reset, reserved-memory/board and HAL profiles require their own bus/firmware lifetime contracts. Their helper constants/layouts do not provide an admitted runtime. |
+| QCN9074 | `qcn9074_regs`, static CE/UMAC BAR windows (`NativeIo` routing + `ath11k_pci_select_static_window` after MHI start), `CoreConfig` (1 radio, 8 vdevs, 128 peers) and multi-pdev `DpHwParams` (rxdma1, peer-map v2, full monitor flag); passes `validate_runtime_profile`; per-pdev rings + SRING_SETUP, `ath11k_init_wmi_config_ipq8074` init_cmd with band-to-mac (`multi_pdev_tests.rs`) | The RX service pass (refill replenish, RXDMA error and monitor-status reaping) covers pdev 0 only, the mac layer registers one radio on pdev 0 (`MacConfig::wcn6855`) and WMI commands go to `wmi[0]` although every per-pdev endpoint is connected, and monitor mode (incl. QCN9074 `full_monitor_mode`) is not supported. Nothing beyond fixtures; no composed QCN9074 startup fixture. |
+| Other Linux ath11k SoC/AHB profiles (IPQ8074, IPQ6018, IPQ5018, WCN6750) | Qualcomm SoC platform layer (`drivers/soc/qcom`, `narf-drivers-qcom-soc`): DT platform devices and remoteproc resource resolution, SCM over SMCCC (PAS init/mem-setup/auth-and-reset/shutdown), MDT/MBN split loader, SMEM v11/v12, TCSR mutex, SMP2P, APCS/IPCC kicks, GCC reset/branch tables, Q6 WCSS host-reset start/stop (IPQ) and PAS WPSS start/stop (WCN6750). ath11k AHB glue (§3.12, `ahb.rs`): `ath11k_ahb_of_match`, the four AHB `hw_params` entries (CE/target-CE/service maps, QMI instance ids, ring masks, `ipq8074_regs`/`ipq5018_regs`/`wcn6750_regs`, CE remap/IE addresses, BDF address, firmware dir), the 52 named IRQs with CE and DP-group mapping, WCN6750 static windows and hybrid MSI resources, MSA/CE `memory-region`s, `qcom,rproc` resolution and boot through the matching loader; fixture-tested only (`ahb_tests.rs`, `drivers/soc/qcom/src/tests.rs`) | Admitted into the `HwRev`-keyed tables (§2.2, §3.12) and implemented in software, fixture/QEMU-tested only (nothing run on silicon): GLINK-SMEM + QRTR over GLINK, DT interrupt delivery, WLFW AHB paths, the AHB HIF, the bus DT driver match (`ath11k_ahb`), the production bring-up `ahb_live::LiveAhb` (MMIO mapping, live `Q6Wcss` / `PasRproc` boot with SMEM/SMP2P, GlinkSmem + GlinkQrtr, WLFW task handing a ready core to `runtime::start_ahb`), multi-pdev DP (rxdma1 rings, per-pdev SRING_SETUP, peer-map v2) and WMI (`init_cmd` with `ath11k_init_wmi_config_ipq8074`, per-pdev WMI endpoints). Residual, all chips: no AHB netdev (`iface` registration is PCI-typed), no post-boot SMP2P crash monitoring / recovery, and the path after WLFW FW_READY (DEVICE_INFO BAR mapping, core start) has no fixture (no fake WLFW server over GLINK). IPQ8074/IPQ6018/IPQ5018 multi-pdev: the RX service pass (refill replenish, RXDMA error and monitor-status reaping) covers pdev 0 only, the mac layer registers one radio on pdev 0 (`MacConfig::wcn6855`) and WMI commands go to `wmi[0]` although every per-pdev endpoint is connected, and monitor mode (incl. QCN9074 `full_monitor_mode`) is not supported. IPQ8074: mainline has no WCSS DT node and no `GCC_WCSSAON_RESET`. IPQ5018: no upstream `ipq5018` WCSS remoteproc binding. WCN6750: RPMh `xo` / `cx` / `mx` proxy votes need an RPMh RSC + cmd-db driver (not in `drivers/soc/qcom`); AOSS QMP `load_state` could be built from the existing `io::RegIo` + `ipc::Ipcc` pieces but is not implemented. |
 
 802.11be/MLO/EHT is not an ath11k Wi-Fi6/6E contract; it belongs to newer
 hardware/driver families. Firmware-owned HT/HE BA, OFDMA/TWT behavior is distinct
-from a NARF user control API. The existing firmware requester engine does not
-claim a separate host TWT-dialog manager. Native fragmentation-threshold TX is
+from a NARF user control API. The per-dialog controls are Linux's debugfs
+commands sent to that firmware engine (`mac/diag.rs`), not a host TWT
+negotiation state machine. Native fragmentation-threshold TX is
 inapplicable to the Linux ath11k firmware contract, which cannot transmit
 More-Fragments frames; it remains explicitly unsupported. SAR/board values and
 RF acceptance must come from real platform inputs, never this inventory.
@@ -1841,8 +2143,9 @@ RF acceptance must come from real platform inputs, never this inventory.
   four-vdev firmware/host capacity and production core dispatch. Its
   normal/error/coalescing/CCMP fragment fixtures pass both architectures;
   the composed production startup/station fixture passes on x86_64 and is
-  not included in the ARM integration configuration. QCN9074 remains rejected with BME disabled before
-  MMIO/MSI/firmware activation. It needs the
+  not included in the ARM integration configuration. QCN9074 now passes
+  the runtime-profile check (register map, static windows, core/DP
+  admission); its composed bring-up is unverified beyond fixtures. It needs the
   static CE/UMAC BAR windows, HAL register/operation tables, non-shadow
   ring setup and its independent core/peer-map/RX/runtime profile. Tests
   of the common transport or WCN6855 cannot validate those missing paths.
@@ -1881,14 +2184,48 @@ RF acceptance must come from real platform inputs, never this inventory.
   printable ASCII, `strscpy` into 32 bytes (an over-long suffix is kept
   truncated to 31, as Linux leaves it), first structure that sets a
   non-empty `bdf_ext` wins. No 0xF8 / none valid = no variant (QEMU).
-  DT variant (`ath11k_core_check_dt`) is not ported (x86 only).
+  DT variant (`ath11k_core_check_dt`, `board::dt_facts`): the probe finds
+  the function's Devicetree node like Linux `pci_set_of_node` — the boot
+  DTB from `narf_bus::boot_dtb()`, the root-bus-first devfn chain from
+  `narf_bus::pci::devfn_path` and `narf_firmware_fdt::for_pci_function`
+  (host bridge by `linux,pci-domain`, one `reg`-devfn child per hop, unique
+  match only). `qcom,calibration-variant`, else the legacy
+  `qcom,ath11k-calibration-variant`, is read with `of_property_read_string`
+  semantics (NUL required) and `strscpy`-truncated to 31 bytes; it replaces
+  the SMBIOS value as Linux's later call in `ath11k_qmi_request_target_cap`
+  does (`board::bdf_ext`). Without a DTB (x86/ACPI, QEMU `-kernel` without
+  `-dtb`) or a node the SMBIOS value stands
+  (`qmi_handshake_tests.rs::smoke_wlfw_dt_board_variant`).
 - NARF-only bounds: Linux waits forever for the WLFW server and for
   REQUEST_MEM / FW_MEM_READY / FW_READY and for QRTR RESUME_TX, and
   silently stalls when the memory-request callback cannot allocate;
   here each wait is bounded (30 s, the 10 s transaction budget for
   flow control) and fails with its own step.
-- Not ported (unreached on WCN6855 PCIe): fixed memory regions,
-  DEVICE_INFO, `fixed_bdf_addr`, FTM. During the first bring-up a
+- QMI platform contracts proven unreached on the admitted PCI profiles
+  (Linux `core.c::ath11k_hw_params`, `qmi.c`, `pci.c`):
+  `ath11k_qmi_request_device_info` returns 0 unless
+  `hw_params.hybrid_bus_type` (WCN6750 only); `fixed_bdf_addr` and
+  `fixed_mem_region` are true only for the IPQ8074/IPQ6018/IPQ5018 AHB
+  SoCs (`qmi_wlfw::QmiHwParams` mirrors both false for QCA6390/WCN6855).
+  The one PCI route to fixed memory is `ATH11K_FLAG_FIXED_MEM_RGN`, set by
+  `ath11k_pci_probe` only when the device's DT node has `memory-region`:
+  `WlfwConfig::with_fixed_mem_region` then makes the REQUEST_MEM handler run
+  `wlfw::assign_fixed_target_mem` (`ath11k_qmi_assign_target_mem_chunk`:
+  HOST_DDR at the first `memory-region` `/reserved-memory` resource, which
+  must hold it; BDF at the PCI `bdf_addr` 0; CALDB after HOST_DDR with
+  cold-boot calibration, `ATH11K_QMI_CALDB_ADDRESS` without a region, else
+  0; other types dropped) instead of DMA allocation, and RESPOND_MEM is never
+  "delayed". An unresolvable region fails with `TARGET_MEM_ALLOC` where Linux
+  stalls (`smoke_wlfw_fixed_mem_region`). The region is boot-reserved
+  (`no-map`) memory the firmware owns; NARF never maps it.
+  FTM (`ATH11K_FIRMWARE_MODE_FTM`) is selected only by the `ftm_mode=1`
+  module parameter; it then skips mac80211 registration and exposes
+  `NL80211_CMD_TESTMODE` passthrough of opaque, vendor-defined WMI FTM
+  segments (`testmode.c`) for factory calibration tools. It is not part of
+  the station/AP contract, and NARF deliberately boots only
+  `ATH11K_FIRMWARE_MODE_NORMAL` (as `ath11k_pci_probe` does by default);
+  a factory-test port would need an nl80211 TESTMODE surface in the shared
+  wireless crate first. During the first bring-up a
   SERVER_EXIT still ends the handshake (Linux waits for the server).
 - Late QMI events (decided): after REGISTERED, FW_READY takes the restart
   path like FW_INIT_DONE (Linux re-runs `ath11k_core_qmi_firmware_ready`
@@ -1972,8 +2309,23 @@ A SYS_ERR during bring-up still fails the bring-up (Linux's `reset_work`
   TKIP-MIC or decrypt errors are dropped in the DP; each locally detected
   TKIP-MIC error retains its peer/key identity and is multicast as
   NL80211_CMD_MICHAEL_MIC_FAILURE, as mac80211 reports it to userspace
-  (KEY_SEQ is absent when WCN6855 stripped the IV). Multicast PN is not
-  checked by the host (Linux leaves it to mac80211); the defrag
+  (KEY_SEQ is absent when WCN6855 stripped the IV). Multicast PN is checked by
+  the host as mac80211 does it (`dp_group_pn`): Linux REO PN offload is
+  unicast-only (`ath11k_dp_peer_rx_pn_replay_config` returns early for a
+  group key) and `ath11k_dp_rx_h_mpdu` sets no `RX_FLAG_PN_VALIDATED` for a
+  decrypted group-addressed first MSDU, so `ieee80211_rx_h_decrypt` owns
+  it. `DpRing::h_mpdu` reads the IV from `hdr_status` (the bytes Linux's
+  `ath11k_dp_rx_h_undecap_{nwifi,eth}` copy into the rebuilt header),
+  selects the GTK by Key ID and drops a PN/TSC not above the key's per-TID
+  counter (`rx_group_replay`; CCMP/GCMP `memcmp <= 0`, TKIP's zero-RSC
+  first-frame exception; IEEE 802.11-2020 12.5.3.4.4). Group-key install /
+  disable (`rx_pn_replay_config`, pairwise = false) allocates / frees the
+  counters, and `DataPort::group_rx_seq` seeds them from the GTK KDE RSC or
+  `NL80211_ATTR_KEY_SEQ` (`ieee80211_key_alloc(seq)`); tests
+  `group_pn_tests.rs` and `dp_tests.rs::smoke_ath11k_dp_rx_decrypted_mcbc_peer`.
+  Deviation: the
+  counters live in the DP, so a firmware recovery restarts them at the
+  reinstalled key's zero RSC instead of mac80211's retained values; the defrag
   reinjection allocates its buffer id from 1 (Linux `idr_alloc(.., 0,
   ..)` returns id 0, which `ath11k_dp_process_rx` skips as invalid: the
   first reassembled MPDU would be lost); a pairwise TKIP fragment set is

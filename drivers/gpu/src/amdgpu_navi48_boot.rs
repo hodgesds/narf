@@ -21,6 +21,7 @@ use crate::{amdgpu_dcn_inventory as inventory, amdgpu_navi48_display as display}
 use alloc::vec::Vec;
 use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, Read, Write};
+use narf_filesystem::FsError;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     MemoryTraining,
@@ -1653,6 +1654,34 @@ impl ColdBoot {
                 result
             }))
             .map_err(|_| FsError::NoDevice)?
+    }
+    pub(crate) fn read_timestamp(&self) -> Result<u64, FsError> {
+        if self.state() != State::MemoryReady {
+            return Err(FsError::NoDevice);
+        }
+        let h = &self.sequence.backend;
+        crate::amdgpu_smuio14::ClockReader::new(&h.gpu, h.authority)
+            .map_err(|_| FsError::InvalidData)?
+            .read()
+            .ok_or(FsError::NoDevice)
+    }
+    pub(crate) fn sensor_dpm_enabled(&self) -> Result<bool, FsError> {
+        if self.state() != State::MemoryReady {
+            return Err(FsError::NoDevice);
+        }
+        Ok(self.power_info().is_some())
+    }
+    pub(crate) async fn sensor_pstates(
+        &mut self,
+    ) -> Result<crate::amdgpu_info_stats::Pstates, FsError> {
+        if !self.sensor_dpm_enabled()? {
+            return Err(FsError::NotFound);
+        }
+        self.power_owner()
+            .map_err(|_| FsError::NoDevice)?
+            .read_pstates()
+            .await
+            .map_err(crate::amdgpu_info_stats::smu14_error)
     }
     pub(crate) fn power_info(&self) -> Option<(Option<smu::Limits>, smu::GfxLevel)> {
         let smu = self.sequence.backend.smu.as_ref()?;

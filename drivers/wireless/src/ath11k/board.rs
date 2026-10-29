@@ -85,6 +85,8 @@ pub const ATH11K_SMBIOS_CC_WW: u8 = 2;
 
 /// `ath11k_bus_str(ATH11K_BUS_PCI)`.
 pub const BUS_PCI: &str = "pci";
+/// `ath11k_bus_str(ATH11K_BUS_AHB)`.
+pub const BUS_AHB: &str = "ahb";
 
 const fn align4(n: usize) -> usize {
     (n + 3) & !3
@@ -118,6 +120,8 @@ pub struct BoardId {
     pub board_id: u32,
     /// `target.bdf_ext` without its NUL (empty = no variant).
     pub bdf_ext: Vec<u8>,
+    /// `ab->hif.bus == ATH11K_BUS_AHB` (`bus=ahb` in board names).
+    pub ahb: bool,
 }
 
 /// `scnprintf` into a `BOARD_NAME_SIZE` buffer: at most 199 bytes.
@@ -145,6 +149,7 @@ pub fn board_name(id: &BoardId, with_variant: bool, name_type: BdfNameType) -> S
     }
     let chip = id.chip_id as i32;
     let board = id.board_id as i32;
+    let bus = if id.ahb { BUS_AHB } else { BUS_PCI };
     let mut s = String::new();
     if id.search_bus_and_board {
         match name_type {
@@ -153,7 +158,7 @@ pub fn board_name(id: &BoardId, with_variant: bool, name_type: BdfNameType) -> S
                     s,
                     "bus={},vendor={:04x},device={:04x},subsystem-vendor={:04x},\
                      subsystem-device={:04x},qmi-chip-id={},qmi-board-id={}{}",
-                    BUS_PCI,
+                    bus,
                     id.vendor,
                     id.device,
                     id.subsystem_vendor,
@@ -164,17 +169,17 @@ pub fn board_name(id: &BoardId, with_variant: bool, name_type: BdfNameType) -> S
                 );
             }
             BdfNameType::BusName => {
-                let _ = write!(s, "bus={}", BUS_PCI);
+                let _ = write!(s, "bus={}", bus);
             }
             BdfNameType::ChipId => {
-                let _ = write!(s, "bus={},qmi-chip-id={}", BUS_PCI, chip);
+                let _ = write!(s, "bus={},qmi-chip-id={}", bus, chip);
             }
         }
     } else {
         let _ = write!(
             s,
             "bus={},qmi-chip-id={},qmi-board-id={}{}",
-            BUS_PCI, chip, board, variant
+            bus, chip, board, variant
         );
     }
     truncate(s, BOARD_NAME_SIZE)
@@ -462,4 +467,89 @@ pub fn check_smbios_in(table: &narf_firmware_smbios::RawTable) -> SmbiosBdf {
 /// set") when the firmware gave no table or no valid `BDF_` string.
 pub fn check_smbios() -> SmbiosBdf {
     narf_firmware_smbios::boot_table().map_or_else(SmbiosBdf::default, check_smbios_in)
+}
+
+// ── Devicetree variant / fixed memory ─────────────────────────────
+
+/// What `ath11k_core_check_dt` and `ath11k_pci_probe` take from the PCI
+/// function's Devicetree node (`pci_set_of_node`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DtFacts {
+    /// `qcom,calibration-variant`, else `qcom,ath11k-calibration-variant`,
+    /// as `strscpy` copies it into `target.bdf_ext` (at most 31 bytes);
+    /// `None` = neither property (Linux `-ENODATA`).
+    pub variant: Option<Vec<u8>>,
+    /// `of_property_present(node, "memory-region")`
+    /// (`ATH11K_FLAG_FIXED_MEM_RGN`).
+    pub memory_region: bool,
+    /// The first `memory-region` entry resolved to its `/reserved-memory`
+    /// (base, size) (`of_reserved_mem_region_to_resource(np, 0)`).
+    pub reserved: Option<(u64, u64)>,
+}
+
+/// `of_property_read_string`: the bytes before the first NUL; a value
+/// without a terminating NUL is `-EILSEQ` (ignored).
+fn dt_string(value: &[u8]) -> Option<&[u8]> {
+    value.iter().position(|b| *b == 0).map(|end| &value[..end])
+}
+
+/// `ath11k_core_check_dt` + the `memory-region` probe over one node.
+pub fn dt_facts_from_props(blob: &[u8], props: narf_firmware_fdt::PropIter<'_>) -> DtFacts {
+    let (mut primary, mut legacy, mut region) = (None, None, None);
+    for (name, value) in props {
+        match name {
+            "qcom,calibration-variant" => primary = dt_string(value),
+            "qcom,ath11k-calibration-variant" => legacy = dt_string(value),
+            "memory-region" => region = Some(value),
+            _ => {}
+        }
+    }
+    let variant = primary.or(legacy).map(|v| {
+        // strscpy(bdf_ext, variant, 32): truncation keeps 31 bytes.
+        v[..v.len().min(ATH11K_QMI_BDF_EXT_STR_LENGTH - 1)].to_vec()
+    });
+    let reserved = region
+        .and_then(|_| narf_firmware_fdt::memory_region_phandle(props, 0))
+        .and_then(|phandle| narf_firmware_fdt::reserved_memory_region(blob, phandle));
+    DtFacts {
+        variant,
+        memory_region: region.is_some(),
+        reserved,
+    }
+}
+
+/// The node of PCI function `devfns` (root-bus hop first) under PCI
+/// `domain` in `blob`; `None` = no unique node (`-ENOENT`).
+pub fn dt_facts_in(blob: &[u8], domain: u16, devfns: &[u8]) -> Option<DtFacts> {
+    let mut facts = None;
+    narf_firmware_fdt::for_pci_function(blob, domain, devfns, |_, props, _| {
+        facts = Some(dt_facts_from_props(blob, props));
+    });
+    facts
+}
+
+/// `DtFacts` for a probed PCI function from the boot Devicetree
+/// (`narf_bus::boot_dtb`); `None` without a DTB (x86_64, QEMU `-kernel`
+/// without `-dtb`) or without a node for this function.
+pub fn dt_facts(device: &narf_bus::BusDevice) -> Option<DtFacts> {
+    const MAX_DTB_SIZE: usize = 2 * 1024 * 1024;
+    let narf_bus::BusKind::Pcie { addr, .. } = device.kind else {
+        return None;
+    };
+    let devfns = narf_bus::pci::devfn_path(device)?;
+    let phys = narf_bus::boot_dtb()?;
+    // SAFETY: the boot path reserved the firmware DTB in RAM covered by
+    // the kernel direct map; `discover` validates the header and bounds
+    // every slice by the blob's own `totalsize` (capped here).
+    let blob = unsafe { narf_firmware_fdt::discover(phys.raw() as usize, MAX_DTB_SIZE) }?;
+    dt_facts_in(blob, addr.segment, &devfns)
+}
+
+/// `ath11k_qmi_request_target_cap`: `ath11k_core_check_smbios` first, then
+/// `ath11k_core_check_dt`, whose variant (when present) replaces it.
+pub fn bdf_ext(smbios: Vec<u8>, dt: Option<&DtFacts>) -> Vec<u8> {
+    match dt.and_then(|d| d.variant.clone()) {
+        Some(variant) => variant,
+        None => smbios,
+    }
 }

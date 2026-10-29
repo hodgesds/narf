@@ -30,6 +30,8 @@ narf-scheduler    = { path = "../../scheduler" }
 narf-console      = { path = "../../console" }
 narf-firmware     = { path = "../../firmware" }
 narf-firmware-smbios = { path = "../../firmware/smbios" }
+narf-firmware-fdt = { path = "../../firmware/fdt" }
+narf-drivers-qcom-soc = { path = "../soc/qcom" }
 narf-crypto      = { path = "../../crypto" }
 narf-boot         = { path = "../../boot" }
 narf-init         = { path = "../../init" }
@@ -44,7 +46,7 @@ async-trait = "0.1"
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [features]
-kernel-test = ["narf-drivers-sdio/kernel-test", "narf-wireless/kernel-test"]
+kernel-test = ["narf-drivers-sdio/kernel-test", "narf-wireless/kernel-test", "narf-drivers-qcom-soc/kernel-test"]
 
 [lints]
 workspace = true

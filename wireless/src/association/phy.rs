@@ -2,6 +2,9 @@
 //! Bounded HT/VHT facts and directional station negotiation. These profiles
 //! describe implementation limits; they grant no radio, key, BA or port rights.
 //! Wire definitions: Linux include/linux/ieee80211-{ht,vht}.h, mac80211/{ht,vht}.c.
+use super::eht::{self, EhtCapability, EhtNegotiation, EhtOperation, LocalEht};
+use super::he::{self, HeCapability, HeNegotiation, HeOperation, LocalHe};
+use super::uhr::{self, LocalUhr, UhrCapability, UhrNegotiation, UhrOperation};
 use super::{channel, ies, Error};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +46,7 @@ pub struct LocalHt {
     rx_stbc: bool,
     rx_greenfield: bool,
     tx_greenfield: bool,
+    tx_stbc: bool,
 }
 impl LocalHt {
     pub fn new(
@@ -75,6 +79,7 @@ impl LocalHt {
             rx_stbc: false,
             rx_greenfield: false,
             tx_greenfield: false,
+            tx_stbc: false,
         })
     }
     pub fn siso20(rx_sgi20: bool, tx_sgi20: bool) -> Self {
@@ -96,6 +101,7 @@ impl LocalHt {
             rx_stbc: false,
             rx_greenfield: false,
             tx_greenfield: false,
+            tx_stbc: false,
         }
     }
     /// Advertised LDPC is a local RX promise. TX coding additionally needs
@@ -115,6 +121,15 @@ impl LocalHt {
     pub fn with_greenfield(mut self, rx: bool, tx: bool) -> Self {
         self.rx_greenfield = rx;
         self.tx_greenfield = tx;
+        self
+    }
+    /// Advertise HT Capability Information bit7 (Tx STBC, IEEE802.11-2020
+    /// 9.4.2.55.2): the native transmitter can send STBC PPDUs (19.3.11.9.2).
+    /// Use additionally requires the bound peer's Rx STBC field in both the
+    /// original offer and the response, as Linux mac80211/ht.c copies peer
+    /// Rx STBC only when the local Tx STBC bit is set. Defaults off.
+    pub fn with_tx_stbc(mut self, enabled: bool) -> Self {
+        self.tx_stbc = enabled;
         self
     }
     /// Bound TX rate selection to a subset of actual implemented TX support.
@@ -137,6 +152,7 @@ impl LocalHt {
         let cap: u16 = 0x000c // SMPS disabled; optional features are explicit below.
             | u16::from(self.rx_ldpc)
             | (u16::from(self.rx_greenfield) << 4)
+            | (u16::from(self.tx_stbc) << 7)
             | (u16::from(self.rx_stbc) << 8)
             | if self.width == HtWidth::TwentyForty { 2 } else { 0 }
             | if self.gi.rx20 { 0x20 } else { 0 }
@@ -166,6 +182,42 @@ pub struct LocalVht {
     width160: bool,
     rx_sgi160: bool,
     tx_sgi160: bool,
+    tx_stbc: bool,
+    width80p80: bool,
+    ext_nss_bw: bool,
+    beamforming: VhtBeamforming,
+}
+
+/// Local VHT beamforming roles (IEEE802.11-2020 9.4.2.157.2, 21.3.11.11;
+/// Linux include/linux/ieee80211-vht.h). Each value is a native sounding
+/// feedback/steering implementation fact; it grants no radio authority.
+/// - `su_beamformee_sts`: SU beamformee, maximum NDP space-time streams the
+///   receiver can estimate (2..=8); advertised as bits12 and13..15.
+/// - `su_beamformer_sounding`: SU beamformer, number of sounding dimensions
+///   (2..=8); advertised as bits11 and16..18.
+/// - `mu_beamformee`: MU beamformee (bit20); requires SU beamformee.
+///
+/// MU beamformer (bit19) is AP-only and is never advertised by a station.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VhtBeamforming {
+    pub su_beamformee_sts: Option<u8>,
+    pub su_beamformer_sounding: Option<u8>,
+    pub mu_beamformee: bool,
+}
+impl VhtBeamforming {
+    fn bits(self) -> u32 {
+        let mut cap = 0;
+        if let Some(sts) = self.su_beamformee_sts {
+            cap |= 1 << 12 | u32::from(sts - 1) << 13;
+        }
+        if let Some(dims) = self.su_beamformer_sounding {
+            cap |= 1 << 11 | u32::from(dims - 1) << 16;
+        }
+        if self.mu_beamformee {
+            cap |= 1 << 20;
+        }
+        cap
+    }
 }
 impl LocalVht {
     pub fn new(
@@ -190,7 +242,57 @@ impl LocalVht {
             width160: false,
             rx_sgi160: false,
             tx_sgi160: false,
+            tx_stbc: false,
+            width80p80: false,
+            ext_nss_bw: false,
+            beamforming: VhtBeamforming::default(),
         })
+    }
+    /// VHT Capabilities Information bit7 (Tx STBC). Use also needs the peer's
+    /// Rx STBC field (bits8..10) in the offer and response. Defaults off.
+    pub fn with_tx_stbc(mut self, enabled: bool) -> Self {
+        self.tx_stbc = enabled;
+        self
+    }
+    /// Advertise the checked local beamforming roles. Negotiated use needs
+    /// the complementary peer role (mac80211/vht.c
+    /// ieee80211_vht_cap_ie_to_sta_vht_cap) and the request advertisement is
+    /// narrowed to the AP's roles as mac80211/mlme.c ieee80211_add_vht_ie
+    /// does. The native owner must answer NDPA/NDP sounding with compressed
+    /// feedback (beamformee) or steer with received feedback (beamformer),
+    /// and must keep at most one MU-MIMO association.
+    pub fn with_beamforming(mut self, beamforming: VhtBeamforming) -> Result<Self, Error> {
+        let range = |v: Option<u8>| v.is_none_or(|v| (2..=8).contains(&v));
+        if !range(beamforming.su_beamformee_sts)
+            || !range(beamforming.su_beamformer_sounding)
+            || beamforming.mu_beamformee && beamforming.su_beamformee_sts.is_none()
+        {
+            return Err(Error::UnsupportedRates);
+        }
+        self.beamforming = beamforming;
+        Ok(self)
+    }
+    /// Opt into discontiguous 80+80 in addition to contiguous160 (Supported
+    /// Channel Width Set2, IEEE802.11-2020 Table 9-272). Selected 80+80
+    /// reports `Width::OneSixty` (the VHT-SIG-A CBW160/80+80 value) with
+    /// `Offer/Negotiated::discontiguous()` and both segment centers; only an
+    /// owner that programs two frequency segments may opt in.
+    pub fn with_80p80(mut self, rx_sgi160: bool, tx_sgi160: bool) -> Self {
+        self = self.with_160mhz(rx_sgi160, tx_sgi160);
+        self.width80p80 = true;
+        self
+    }
+    /// Declare VHT Extended NSS BW Capable (VHT Supported MCS and NSS Set
+    /// bit61, IEEE802.11-2020 9.4.2.157.3), Linux's
+    /// IEEE80211_HW_SUPPORTS_VHT_EXT_NSS_BW. The station then interprets the
+    /// AP's Extended NSS BW Support field (Table 9-272) for160/80+80 support
+    /// and NSS limits, and the HT Operation CCFS2 where that table directs,
+    /// exactly as cfg80211 ieee80211_get_vht_max_nss and mac80211
+    /// ieee80211_chandef_vht_oper do. Without it the AP's field is read as0.
+    /// Local Extended NSS BW Support stays0 (full NSS at every width).
+    pub fn with_extended_nss_bw(mut self, enabled: bool) -> Self {
+        self.ext_nss_bw = enabled;
+        self
     }
     pub fn with_ldpc(mut self, rx: bool, tx: bool) -> Self {
         self.rx_ldpc = rx;
@@ -201,7 +303,7 @@ impl LocalVht {
         self.rx_stbc = enabled;
         self
     }
-    /// Enable contiguous160 only; 80+80 and extended NSS/BW remain absent.
+    /// Enable contiguous160; 80+80 and Extended NSS BW need their own opt-ins.
     pub fn with_160mhz(mut self, rx_sgi160: bool, tx_sgi160: bool) -> Self {
         self.width160 = true;
         self.rx_sgi160 = rx_sgi160;
@@ -213,12 +315,18 @@ impl LocalVht {
         let cap = (u32::from(self.factor) << 23)
             | (u32::from(self.rx_ldpc) << 4)
             | (u32::from(self.rx_stbc) << 8)
-            | (u32::from(self.width160) << 2)
+            | (u32::from(self.width160 && !self.width80p80) << 2)
+            | (u32::from(self.width80p80) << 3)
             | (u32::from(self.rx_sgi160) << 6)
+            | (u32::from(self.tx_stbc) << 7)
+            | self.beamforming.bits()
             | if self.rx_sgi { 1 << 5 } else { 0 };
         body[..4].copy_from_slice(&cap.to_le_bytes());
         body[4..6].copy_from_slice(&self.rx.to_le_bytes());
         body[8..10].copy_from_slice(&self.tx.to_le_bytes());
+        if self.ext_nss_bw {
+            body[11] |= 0x20; // VHT Extended NSS BW Capable (bit13).
+        }
         body
     }
 }
@@ -226,6 +334,9 @@ impl LocalVht {
 pub struct LocalPhy {
     ht: LocalHt,
     vht: Option<LocalVht>,
+    he: Option<LocalHe>,
+    eht: Option<LocalEht>,
+    uhr: Option<LocalUhr>,
 }
 impl LocalPhy {
     pub fn ht20(local: LocalHt) -> Result<Self, Error> {
@@ -235,6 +346,9 @@ impl LocalPhy {
         Ok(Self {
             ht: local,
             vht: None,
+            he: None,
+            eht: None,
+            uhr: None,
         })
     }
     pub fn ht40(local: LocalHt) -> Result<Self, Error> {
@@ -244,19 +358,77 @@ impl LocalPhy {
         Ok(Self {
             ht: local,
             vht: None,
+            he: None,
+            eht: None,
+            uhr: None,
         })
     }
     pub fn vht80(ht: LocalHt, vht: LocalVht) -> Result<Self, Error> {
         if ht.width != HtWidth::TwentyForty || vht.width160 {
             return Err(Error::UnsupportedRates);
         }
-        Ok(Self { ht, vht: Some(vht) })
+        Ok(Self {
+            ht,
+            vht: Some(vht),
+            he: None,
+            eht: None,
+            uhr: None,
+        })
     }
     pub fn vht160(ht: LocalHt, vht: LocalVht) -> Result<Self, Error> {
         if ht.width != HtWidth::TwentyForty || !vht.width160 {
             return Err(Error::UnsupportedRates);
         }
-        Ok(Self { ht, vht: Some(vht) })
+        Ok(Self {
+            ht,
+            vht: Some(vht),
+            he: None,
+            eht: None,
+            uhr: None,
+        })
+    }
+    /// Opt into HE (IEEE802.11ax) on top of this HT/VHT profile. On 5GHz
+    /// HE is negotiated only together with VHT (an HE STA in 5GHz is a VHT
+    /// STA, IEEE802.11ax-2021 26.17.1; mac80211 ieee80211_determine_ap_chan).
+    /// An HE160 promise needs the VHT160 opt-in, since the HE width never
+    /// exceeds the HT/VHT-selected channel.
+    pub fn with_he(mut self, he: LocalHe) -> Result<Self, Error> {
+        if he.width160() && !self.vht.is_some_and(|v| v.width160) {
+            return Err(Error::UnsupportedRates);
+        }
+        self.he = Some(he);
+        Ok(self)
+    }
+    pub fn he(&self) -> Option<&LocalHe> {
+        self.he.as_ref()
+    }
+    /// Opt into non-MLO EHT (IEEE802.11be-2024) on top of `with_he`. The
+    /// EHT-MCS/NSS set form must match the local HE Channel Width Set
+    /// (`ieee80211_eht_mcs_nss_size`), and a160MHz set requires HE160.
+    pub fn with_eht(mut self, eht: LocalEht) -> Result<Self, Error> {
+        let he = self.he.ok_or(Error::UnsupportedRates)?;
+        // 320MHz is a 6 GHz capability (`six_ghz::SixGhzLocal::with_eht`).
+        if eht.width320() || !eht.matches_he(he.capability().phy_capability()[0]) {
+            return Err(Error::UnsupportedRates);
+        }
+        self.eht = Some(eht);
+        Ok(self)
+    }
+    pub fn eht(&self) -> Option<&LocalEht> {
+        self.eht.as_ref()
+    }
+    /// Opt into UHR (IEEE P802.11bn D1.3) on top of `with_eht`. UHR is only
+    /// admitted for `LocalUhr::for_mld_association` on the
+    /// `Offer::from_elements` path (see `association::uhr`).
+    pub fn with_uhr(mut self, uhr: LocalUhr) -> Result<Self, Error> {
+        if self.eht.is_none() {
+            return Err(Error::UnsupportedRates);
+        }
+        self.uhr = Some(uhr);
+        Ok(self)
+    }
+    pub fn uhr(&self) -> Option<&LocalUhr> {
+        self.uhr.as_ref()
     }
 }
 
@@ -267,6 +439,13 @@ pub struct ApElements {
     ht_op: Option<[u8; 22]>,
     vht_cap: Option<[u8; 12]>,
     vht_op: Option<[u8; 5]>,
+    he_cap: Option<HeCapability>,
+    he_op: Option<HeOperation>,
+    eht_cap: Option<EhtCapability>,
+    eht_op: Option<EhtOperation>,
+    uhr_cap: Option<UhrCapability>,
+    uhr_op: Option<UhrOperation>,
+    ml_basic: bool,
 }
 impl ApElements {
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
@@ -275,12 +454,70 @@ impl ApElements {
         }
         let mut value = Self::default();
         let mut rates = [false; 2];
+        // The EHT Capabilities extent depends on the HE Capabilities.
+        let mut eht_cap: Option<([u8; 64], usize)> = None;
         ies(bytes, |id, body| {
             match id {
                 45 => singleton(&mut value.ht_cap, body)?,
                 61 => singleton(&mut value.ht_op, body)?,
                 191 => singleton(&mut value.vht_cap, body)?,
                 192 => singleton(&mut value.vht_op, body)?,
+                255 => match body.split_first() {
+                    None => return Err(Error::InvalidBss),
+                    Some((&he::EXT_HE_CAPABILITIES, rest)) => {
+                        if value.he_cap.is_some() {
+                            return Err(Error::InvalidBss);
+                        }
+                        value.he_cap = Some(HeCapability::parse(rest)?);
+                    }
+                    Some((&he::EXT_HE_OPERATION, rest)) => {
+                        if value.he_op.is_some() {
+                            return Err(Error::InvalidBss);
+                        }
+                        let op = HeOperation::parse(rest)?;
+                        // 6 GHz Operation Information belongs to a 6 GHz
+                        // BSS (`six_ghz::admit`), never this 2.4/5 GHz path.
+                        if op.six_ghz_operation().is_some() {
+                            return Err(Error::InvalidBss);
+                        }
+                        value.he_op = Some(op);
+                    }
+                    Some((&eht::EXT_EHT_CAPABILITIES, rest)) => {
+                        if eht_cap.is_some() || rest.len() > 64 {
+                            return Err(Error::InvalidBss);
+                        }
+                        let mut copy = [0; 64];
+                        copy[..rest.len()].copy_from_slice(rest);
+                        eht_cap = Some((copy, rest.len()));
+                    }
+                    Some((&eht::EXT_EHT_OPERATION, rest)) => {
+                        if value.eht_op.is_some() {
+                            return Err(Error::InvalidBss);
+                        }
+                        value.eht_op = Some(EhtOperation::parse(rest)?);
+                    }
+                    Some((&uhr::EXT_UHR_CAPABILITIES, rest)) => {
+                        if value.uhr_cap.is_some() {
+                            return Err(Error::InvalidBss);
+                        }
+                        value.uhr_cap = Some(UhrCapability::parse(rest, true)?);
+                    }
+                    Some((&uhr::EXT_UHR_OPERATION, rest)) => {
+                        if value.uhr_op.is_some() {
+                            return Err(Error::InvalidBss);
+                        }
+                        value.uhr_op = Some(UhrOperation::parse(rest)?);
+                    }
+                    Some((&uhr::EXT_MULTI_LINK, rest)) => {
+                        if uhr::basic_multi_link(rest)? {
+                            if value.ml_basic {
+                                return Err(Error::InvalidBss);
+                            }
+                            value.ml_basic = true;
+                        }
+                    }
+                    _ => {}
+                },
                 1 | 50 => {
                     let index = usize::from(id == 50);
                     if rates[index] || body.is_empty() || id == 1 && body.len() > 8 {
@@ -295,8 +532,20 @@ impl ApElements {
         if value.ht_cap.is_some() != value.ht_op.is_some()
             || value.vht_cap.is_some() != value.vht_op.is_some()
             || value.vht_cap.is_some() && value.ht_cap.is_none()
+            || value.he_cap.is_some() != value.he_op.is_some()
+            || value.he_cap.is_some() && value.ht_cap.is_none()
+            || eht_cap.is_some() != value.eht_op.is_some()
+            || eht_cap.is_some() && value.he_cap.is_none()
+            || (value.uhr_cap.is_some() || value.uhr_op.is_some()) && eht_cap.is_none()
         {
             return Err(Error::InvalidBss);
+        }
+        if let (Some((body, len)), Some(he)) = (eht_cap, value.he_cap) {
+            value.eht_cap = Some(EhtCapability::parse(
+                &body[..len],
+                he.phy_capability()[0],
+                true,
+            )?);
         }
         if let Some(cap) = value.ht_cap {
             if le16(&cap[..2]) & 0x2000 != 0
@@ -334,6 +583,28 @@ impl ApElements {
     }
     pub fn vht_operation(&self) -> Option<[u8; 5]> {
         self.vht_op
+    }
+    pub fn he_capability(&self) -> Option<&HeCapability> {
+        self.he_cap.as_ref()
+    }
+    pub fn he_operation(&self) -> Option<&HeOperation> {
+        self.he_op.as_ref()
+    }
+    pub fn eht_capability(&self) -> Option<&EhtCapability> {
+        self.eht_cap.as_ref()
+    }
+    pub fn eht_operation(&self) -> Option<&EhtOperation> {
+        self.eht_op.as_ref()
+    }
+    pub fn uhr_capability(&self) -> Option<&UhrCapability> {
+        self.uhr_cap.as_ref()
+    }
+    pub fn uhr_operation(&self) -> Option<&UhrOperation> {
+        self.uhr_op.as_ref()
+    }
+    /// A Basic Multi-Link element is present.
+    pub fn basic_multi_link(&self) -> bool {
+        self.ml_basic
     }
 }
 fn singleton<const N: usize>(slot: &mut Option<[u8; N]>, body: &[u8]) -> Result<(), Error> {
@@ -386,7 +657,8 @@ impl HtOperation {
                     38, 46, 54, 62, 102, 110, 118, 126, 134, 142, 151, 159, 167, 175,
                 ]
                 .contains(&center),
-                None => false,
+                // HT Operation never describes a 6 GHz channel.
+                Some(channel::Band::Ghz6) | None => false,
             };
             if !valid || body[1] & 4 == 0 {
                 return Err(Error::InvalidBss);
@@ -415,6 +687,15 @@ impl HtNegotiation {
     }
     pub fn rx_stbc(&self) -> bool {
         self.local.rx_stbc
+    }
+    /// Local Tx STBC and the bound peer's nonzero Rx STBC field (bits8..9).
+    pub fn tx_stbc(&self) -> bool {
+        self.local.tx_stbc && self.peer_rx_stbc_streams() != 0
+    }
+    /// Peer Rx STBC field: the number of spatial streams it can receive
+    /// with STBC (0 = none, 1..3).
+    pub fn peer_rx_stbc_streams(&self) -> u8 {
+        (self.peer_capability() >> 8 & 3) as u8
     }
     pub fn rx_ldpc(&self) -> bool {
         self.local.rx_ldpc
@@ -489,6 +770,36 @@ impl VhtNegotiation {
     pub fn tx_ldpc(&self) -> bool {
         self.local.tx_ldpc && self.peer_capability() & (1 << 4) != 0
     }
+    /// Local Tx STBC and the peer's nonzero Rx STBC field (bits8..10).
+    pub fn tx_stbc(&self) -> bool {
+        self.local.tx_stbc && self.peer_capability() >> 8 & 7 != 0
+    }
+    /// Local SU beamformee and the AP's SU Beamformer Capable bit11: the AP
+    /// may sound this station and steer with its feedback.
+    pub fn su_beamformee(&self) -> bool {
+        self.local.beamforming.su_beamformee_sts.is_some() && self.peer_capability() & 1 << 11 != 0
+    }
+    /// Local SU beamformer and the AP's SU Beamformee Capable bit12.
+    pub fn su_beamformer(&self) -> bool {
+        self.local.beamforming.su_beamformer_sounding.is_some()
+            && self.peer_capability() & 1 << 12 != 0
+    }
+    /// SU beamformee plus local MU beamformee and the AP's MU Beamformer bit19.
+    pub fn mu_beamformee(&self) -> bool {
+        self.su_beamformee()
+            && self.local.beamforming.mu_beamformee
+            && self.peer_capability() & 1 << 19 != 0
+    }
+    /// The AP's sounding dimensions when it is an SU beamformer.
+    pub fn peer_sounding_dimensions(&self) -> Option<u8> {
+        (self.peer_capability() & 1 << 11 != 0)
+            .then_some((self.peer_capability() >> 16 & 7) as u8 + 1)
+    }
+    /// The AP's beamformee STS when it is an SU beamformee.
+    pub fn peer_beamformee_sts(&self) -> Option<u8> {
+        (self.peer_capability() & 1 << 12 != 0)
+            .then_some((self.peer_capability() >> 13 & 7) as u8 + 1)
+    }
     pub fn rx_mcs_map(&self) -> u16 {
         self.local.rx
     }
@@ -526,10 +837,17 @@ struct Selection {
     local: LocalPhy,
     ht: HtNegotiation,
     vht: Option<VhtNegotiation>,
+    he: Option<HeNegotiation>,
+    eht: Option<EhtNegotiation>,
+    uhr: Option<UhrNegotiation>,
+    /// Built from a native owner's element snapshot (`from_elements`).
+    native: bool,
     width: Width,
     center: u8,
     channels: [u8; 8],
     count: usize,
+    /// Second 80MHz segment center of a discontiguous 80+80 selection.
+    center2: u8,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Offer(Selection);
@@ -543,6 +861,18 @@ macro_rules! selection_accessors {
         pub fn vht(&self) -> Option<&VhtNegotiation> {
             self.0.vht.as_ref()
         }
+        /// HE facts when both sides negotiated HE on this channel.
+        pub fn he(&self) -> Option<&HeNegotiation> {
+            self.0.he.as_ref()
+        }
+        /// Non-MLO EHT facts when negotiated on top of HE.
+        pub fn eht(&self) -> Option<&EhtNegotiation> {
+            self.0.eht.as_ref()
+        }
+        /// UHR facts for a native MLD association (never for `JoinPlan`).
+        pub fn uhr(&self) -> Option<&UhrNegotiation> {
+            self.0.uhr.as_ref()
+        }
         pub fn width(&self) -> Width {
             self.0.width
         }
@@ -551,6 +881,16 @@ macro_rules! selection_accessors {
         }
         pub fn occupied_channels(&self) -> &[u8] {
             &self.0.channels[..self.0.count]
+        }
+        /// True for an opted-in 80+80 selection. `width()` then reports
+        /// `OneSixty` (VHT-SIG-A CBW160/80+80), `center_channel()` is the
+        /// primary80 segment center and `secondary_center_channel()` the
+        /// other segment; `occupied_channels()` lists all eight channels.
+        pub fn discontiguous(&self) -> bool {
+            self.0.center2 != 0
+        }
+        pub fn secondary_center_channel(&self) -> Option<u8> {
+            (self.0.center2 != 0).then_some(self.0.center2)
         }
     };
 }
@@ -565,7 +905,13 @@ impl Offer {
         bytes: &[u8],
         primary: u8,
     ) -> Result<Option<Self>, Error> {
-        Self::prepare(local, bytes, primary, element_selectors(bytes, primary)?)
+        Self::prepare_from(
+            local,
+            bytes,
+            primary,
+            element_selectors(bytes, primary)?,
+            true,
+        )
     }
     /// Intersect a native association-response IE snapshot with this offer.
     /// The caller must already prove the actual response's peer/status and
@@ -582,15 +928,24 @@ impl Offer {
         primary: u8,
         selectors: u8,
     ) -> Result<Option<Self>, Error> {
+        Self::prepare_from(local, bytes, primary, selectors, false)
+    }
+    fn prepare_from(
+        local: LocalPhy,
+        bytes: &[u8],
+        primary: u8,
+        selectors: u8,
+        native: bool,
+    ) -> Result<Option<Self>, Error> {
         let ap = ApElements::parse(bytes)?;
         if ap.ht_cap.is_none() {
-            if selectors != 0 {
+            if selectors & super::SEL_PHY != 0 {
                 return Err(Error::UnsupportedRates);
             }
             return Ok(None);
         }
-        let selected = select(local, ap, primary)?;
-        check_selectors(selectors, selected.vht.is_some())?;
+        let selected = select(local, ap, primary, native)?;
+        check_selectors(selectors, &selected)?;
         Ok(Some(Self(selected)))
     }
     pub(super) fn response(&self, bytes: &[u8], selectors: u8) -> Result<Negotiated, Error> {
@@ -598,8 +953,24 @@ impl Offer {
             self.0.local,
             ApElements::parse(bytes)?,
             self.0.ht.operation.primary(),
+            self.0.native,
         )?;
-        check_selectors(selectors, next.vht.is_some())?;
+        if self.0.uhr.is_some() != next.uhr.is_some() {
+            return Err(Error::UnsupportedRates);
+        }
+        check_selectors(selectors, &next)?;
+        // An HE offer requires HE in the response and vice versa (mac80211
+        // ieee80211_assoc_config_link: "HE AP is missing HE capability/operation").
+        match (self.0.he.as_ref(), next.he.as_mut()) {
+            (Some(old), Some(new)) => new.narrow_to(old)?,
+            (None, None) => {}
+            _ => return Err(Error::UnsupportedRates),
+        }
+        match (self.0.eht.as_ref(), next.eht.as_mut()) {
+            (Some(old), Some(new)) => new.narrow_to(old)?,
+            (None, None) => {}
+            _ => return Err(Error::UnsupportedRates),
+        }
         if self.0.vht.is_some() != next.vht.is_some()
             || next.channels[..next.count]
                 .iter()
@@ -619,11 +990,21 @@ impl Offer {
         next.ht.local.gi.tx40 &= self.0.ht.tx_sgi40();
         next.ht.local.tx_ldpc &= self.0.ht.tx_ldpc();
         next.ht.local.tx_greenfield &= self.0.ht.tx_greenfield();
+        next.ht.local.tx_stbc &= self.0.ht.tx_stbc();
         if let (Some(old), Some(new)) = (self.0.vht, next.vht.as_mut()) {
             new.tx = intersect_maps(new.tx, old.tx);
             new.local.tx_sgi &= old.tx_sgi80();
             new.local.tx_sgi160 &= old.tx_sgi160();
             new.local.tx_ldpc &= old.tx_ldpc();
+            new.local.tx_stbc &= old.tx_stbc();
+            if !old.su_beamformee() {
+                new.local.beamforming.su_beamformee_sts = None;
+                new.local.beamforming.mu_beamformee = false;
+            }
+            new.local.beamforming.mu_beamformee &= old.mu_beamformee();
+            if !old.su_beamformer() {
+                new.local.beamforming.su_beamformer_sounding = None;
+            }
             if !map_has_rates(new.tx)
                 || !supports_map(new.tx, old.basic)
                 || !supports_map(new.local.rx, old.basic)
@@ -638,8 +1019,46 @@ impl Offer {
         bytes.extend_from_slice(&self.0.local.ht.capability_body());
         if self.0.vht.is_some() {
             bytes.extend_from_slice(&[191, 12]);
-            bytes.extend_from_slice(&self.0.local.vht.unwrap().capability_body());
+            bytes.extend_from_slice(&self.advertised_vht_capability());
         }
+        if let (Some(_), Some(local)) = (self.0.he, self.0.local.he) {
+            // mac80211 ieee80211_add_he_ie: only when HE was negotiated.
+            let body = local.capability_body();
+            bytes.extend_from_slice(&[255, body.len() as u8]);
+            bytes.extend_from_slice(&body);
+        }
+        if let (Some(_), Some(local)) = (self.0.eht, self.0.local.eht) {
+            // mac80211 ieee80211_put_eht_cap: only when EHT was negotiated.
+            let body = local.capability_body();
+            bytes.extend_from_slice(&[255, body.len() as u8]);
+            bytes.extend_from_slice(&body);
+        }
+    }
+}
+impl Offer {
+    /// The VHT Capabilities body actually sent in the association request:
+    /// the local body narrowed to the scanned AP's beamforming roles, as
+    /// Linux mac80211/mlme.c ieee80211_add_vht_ie does ("some APs get
+    /// confused if our capabilities are better than theirs"): no SU/MU
+    /// beamformee without an AP SU beamformer and no MU beamformee without
+    /// an AP MU beamformer.
+    pub fn advertised_vht_capability(&self) -> [u8; 12] {
+        let Some(local) = self.0.local.vht else {
+            return [0; 12];
+        };
+        let mut body = local.capability_body();
+        let Some(vht) = self.0.vht else {
+            return body;
+        };
+        let ap = vht.peer_capability();
+        let mut cap = le32(&body[..4]);
+        if ap & 1 << 11 == 0 {
+            cap &= !(1 << 12 | 7 << 13 | 1 << 20);
+        } else if ap & 1 << 19 == 0 {
+            cap &= !(1 << 20);
+        }
+        body[..4].copy_from_slice(&cap.to_le_bytes());
+        body
     }
 }
 impl Negotiated {
@@ -652,7 +1071,7 @@ fn element_selectors(bytes: &[u8], primary: u8) -> Result<u8, Error> {
         return Err(Error::InvalidBss);
     }
     let mut rates = super::RateElements {
-        phy: true,
+        allowed: super::SEL_PHY,
         ..Default::default()
     };
     super::ies(bytes, |id, body| rates.observe(id, body))?;
@@ -666,13 +1085,29 @@ fn element_selectors(bytes: &[u8], primary: u8) -> Result<u8, Error> {
     Ok(rates.selectors)
 }
 
-pub(super) fn check_selectors(selectors: u8, vht: bool) -> Result<(), Error> {
-    if selectors & 2 != 0 && !vht {
+/// Every mandatory PHY membership selector needs that PHY negotiated
+/// (mac80211 ieee80211_determine_chan_mode `sta_selectors` subset check).
+/// HT is implied by any selection; EHT/UHR stay unsupported here.
+fn check_selectors(selectors: u8, selection: &Selection) -> Result<(), Error> {
+    let mut supported = super::SEL_HT;
+    if selection.vht.is_some() {
+        supported |= super::SEL_VHT;
+    }
+    if selection.he.is_some() {
+        supported |= super::SEL_HE;
+    }
+    if selection.eht.is_some() {
+        supported |= super::SEL_EHT;
+    }
+    if selection.uhr.is_some() {
+        supported |= super::SEL_UHR;
+    }
+    if selectors & super::SEL_PHY & !supported != 0 {
         return Err(Error::UnsupportedRates);
     }
     Ok(())
 }
-fn select(local: LocalPhy, ap: ApElements, primary: u8) -> Result<Selection, Error> {
+fn select(local: LocalPhy, ap: ApElements, primary: u8, native: bool) -> Result<Selection, Error> {
     let cap = ap.ht_cap.ok_or(Error::UnsupportedRates)?;
     let op = HtOperation::parse(ap.ht_op.ok_or(Error::UnsupportedRates)?, primary)?;
     if op.secondary.is_some() && le16(&cap[..2]) & 2 == 0 {
@@ -700,10 +1135,16 @@ fn select(local: LocalPhy, ap: ApElements, primary: u8) -> Result<Selection, Err
             basic,
         },
         vht: None,
+        he: None,
+        eht: None,
+        uhr: None,
+        // Only an MLD-asserting native owner differs from a JoinPlan offer.
+        native: native && local.uhr.is_some_and(|u| u.mld_association()),
         width: Width::Twenty,
         center: primary,
         channels: [primary, 0, 0, 0, 0, 0, 0, 0],
         count: 1,
+        center2: 0,
     };
     if local.ht.width == HtWidth::TwentyForty && le16(&cap[..2]) & 2 != 0 {
         if let Some(second) = op.secondary {
@@ -718,54 +1159,67 @@ fn select(local: LocalPhy, ap: ApElements, primary: u8) -> Result<Selection, Err
             return Err(Error::UnsupportedRates);
         }
         let peer_info = le32(&peer[..4]);
-        // Extended NSS/BW requires a separate implementation of its tables.
-        if peer_info >> 30 != 0 || le16(&peer[10..12]) & (1 << 13) != 0 || (peer_info >> 2) & 3 == 3
-        {
+        let supp = (peer_info >> 2) & 3;
+        // IEEE802.11-2020 Table 9-272: only an Extended-NSS-BW-capable
+        // station interprets a capable AP's Extended NSS BW Support field;
+        // otherwise it reads as0 (cfg80211 ieee80211_get_vht_max_nss).
+        let ext = if local_vht.ext_nss_bw && le16(&peer[10..12]) & (1 << 13) != 0 {
+            peer_info >> 30
+        } else {
+            0
+        };
+        if supp == 2 && matches!(ext, 1 | 2) {
+            // Reserved Table 9-272 combination.
             return Err(Error::UnsupportedRates);
         }
-        let tx = intersect_maps(local_vht.tx, le16(&peer[4..6]));
+        let support_160 = matches!(supp, 1 | 2) || supp == 0 && ext != 0;
+        let support_80p80 = supp == 2 || supp == 1 && ext != 0 || supp == 0 && ext >= 2;
+        let mut tx = intersect_maps(local_vht.tx, le16(&peer[4..6]));
         let basic = le16(&operation[3..5]);
         if !map_has_rates(tx) || !supports_map(tx, basic) || !supports_map(local_vht.rx, basic) {
             return Err(Error::UnsupportedRates);
         }
-        match operation[0] {
+        let ccfs0 = operation[1];
+        // mac80211 ieee80211_chandef_vht_oper: with Extended NSS BW the
+        // second segment may be carried in HT Operation CCFS2 (operation
+        // mode bits5..12, IEEE802.11-2020 9.4.2.56).
+        let ccfs2 = (le16(&op.body[2..4]) >> 5) as u8;
+        let ccf1 = match (supp, ext) {
+            (_, 0) => operation[2],
+            (0, _) => ccfs2,
+            (1, 1 | 2) if operation[2] == 0 => ccfs2,
+            _ => operation[2],
+        };
+        let discontiguous = match operation[0] {
             0 => {
                 if operation[2] != 0 || operation[1] != 0 && operation[1] != selected.center {
                     return Err(Error::InvalidBss);
                 }
+                None
             }
-            1 if operation[2] == 0 => {
-                let center = operation[1];
-                if ![42, 58, 106, 122, 138, 155, 171].contains(&center)
-                    || selected.width != Width::Forty
-                {
-                    return Err(Error::UnsupportedRates);
-                }
-                let channels = [center - 6, center - 2, center + 2, center + 6];
-                let index = channels
-                    .iter()
-                    .position(|ch| *ch == primary)
-                    .ok_or(Error::InvalidBss)?;
-                if op.secondary != Some(channels[index ^ 1]) {
-                    return Err(Error::InvalidBss);
-                }
+            1 if ccf1 == 0 => {
+                let (channels, _) = eighty(ccfs0, primary, selected.width, op.secondary)?;
                 selected.width = Width::Eighty;
-                selected.center = center;
+                selected.center = ccfs0;
                 selected.channels[..4].copy_from_slice(&channels);
                 selected.count = 4;
+                None
             }
+            1 if ccf1.abs_diff(ccfs0) > 8 => Some(ccf1),
+            3 => Some(operation[2]),
             1 | 2 => {
                 // Deprecated width2 uses the contiguous160 center in seg0;
-                // revised width1 uses primary80 seg0 and full160 seg1.
+                // revised width1 uses primary80 seg0 and full160 seg1 (or,
+                // with Extended NSS BW, CCFS2).
                 let center = if operation[0] == 2 {
                     if operation[2] != 0 {
                         return Err(Error::UnsupportedRates);
                     }
                     operation[1]
                 } else {
-                    operation[2]
+                    ccf1
                 };
-                if ![1, 2].contains(&((peer_info >> 2) & 3))
+                if !support_160
                     || selected.width != Width::Forty
                     || ![50, 114, 163].contains(&center)
                 {
@@ -791,6 +1245,7 @@ fn select(local: LocalPhy, ap: ApElements, primary: u8) -> Result<Selection, Err
                     selected.center = center;
                     selected.channels = channels;
                     selected.count = 8;
+                    tx = limit_nss(tx, peer_max_nss(&peer, true, supp, ext));
                 } else {
                     // A narrower local station may use the primary80 half
                     // of a real contiguous160 BSS, without advertising160.
@@ -800,8 +1255,42 @@ fn select(local: LocalPhy, ap: ApElements, primary: u8) -> Result<Selection, Err
                     selected.channels[..4].copy_from_slice(&channels[start..start + 4]);
                     selected.count = 4;
                 }
+                None
             }
             _ => return Err(Error::UnsupportedRates),
+        };
+        if let Some(second) = discontiguous {
+            // 80+80 (Table 9-274): seg0 is the primary80 center, seg1 another
+            // canonical80 center that is neither overlapping nor adjacent
+            // (adjacent segments form a contiguous160, cfg80211_chandef_valid).
+            let (channels, _) = eighty(ccfs0, primary, selected.width, op.secondary)?;
+            if !support_80p80
+                || ![42, 58, 106, 122, 138, 155, 171].contains(&second)
+                || second.abs_diff(ccfs0) <= 16
+            {
+                return Err(Error::UnsupportedRates);
+            }
+            selected.center = ccfs0;
+            selected.channels[..4].copy_from_slice(&channels);
+            selected.count = 4;
+            if local_vht.width80p80 {
+                let low = ccfs0.min(second);
+                let high = ccfs0.max(second);
+                selected.width = Width::OneSixty;
+                selected.center2 = second;
+                selected.channels = core::array::from_fn(|i| {
+                    let center = if i < 4 { low } else { high };
+                    center - 6 + (i % 4) as u8 * 4
+                });
+                selected.count = 8;
+                tx = limit_nss(tx, peer_max_nss(&peer, false, supp, ext));
+            } else {
+                // Like a narrower station on a160 BSS, use the primary80.
+                selected.width = Width::Eighty;
+            }
+        }
+        if !map_has_rates(tx) || !supports_map(tx, basic) {
+            return Err(Error::UnsupportedRates);
         }
         selected.vht = Some(VhtNegotiation {
             local: local_vht,
@@ -811,7 +1300,91 @@ fn select(local: LocalPhy, ap: ApElements, primary: u8) -> Result<Selection, Err
             basic,
         });
     }
+    selected.he = he::negotiate(
+        local.he,
+        ap.he_cap,
+        ap.he_op,
+        primary,
+        ap.vht_op,
+        selected.vht.is_some(),
+        selected.width,
+        selected.center2 != 0,
+    )?;
+    let primary80 = if selected.width == Width::OneSixty && selected.center2 == 0 {
+        if primary < selected.center {
+            selected.center - 8
+        } else {
+            selected.center + 8
+        }
+    } else {
+        selected.center
+    };
+    selected.eht = eht::negotiate(
+        local.eht,
+        ap.eht_cap,
+        ap.eht_op,
+        selected.he.as_ref(),
+        selected.width,
+        selected.center,
+        primary80,
+        selected.center2 != 0,
+    )?;
+    selected.uhr = uhr::negotiate(
+        local.uhr.filter(|_| native),
+        ap.uhr_cap,
+        ap.uhr_op,
+        ap.ml_basic,
+        selected.eht.as_ref(),
+        selected.width,
+        selected.center2 != 0,
+        primary,
+        &selected.channels[..selected.count],
+        false,
+    );
     Ok(selected)
+}
+/// Primary80 constituents of a canonical80 center and the primary's index.
+fn eighty(
+    center: u8,
+    primary: u8,
+    width: Width,
+    secondary: Option<u8>,
+) -> Result<([u8; 4], usize), Error> {
+    if ![42, 58, 106, 122, 138, 155, 171].contains(&center) || width != Width::Forty {
+        return Err(Error::UnsupportedRates);
+    }
+    let channels = [center - 6, center - 2, center + 2, center + 6];
+    let index = channels
+        .iter()
+        .position(|ch| *ch == primary)
+        .ok_or(Error::InvalidBss)?;
+    if secondary != Some(channels[index ^ 1]) {
+        return Err(Error::InvalidBss);
+    }
+    Ok((channels, index))
+}
+/// The AP's maximum receive NSS at160 (`contiguous`) or 80+80, from its RX
+/// MCS map and Table 9-272, as cfg80211 ieee80211_get_vht_max_nss computes
+/// it for MCS0..7. `ext` is already0 unless both sides are capable. Values
+/// above the map maximum are irrelevant here: the result only truncates.
+fn peer_max_nss(peer: &[u8; 12], contiguous: bool, supp: u32, ext: u32) -> u8 {
+    let map = le16(&peer[4..6]);
+    let max = (0..8u8)
+        .rev()
+        .find(|n| map >> (n * 2) & 3 != 3)
+        .map_or(0, |n| n + 1);
+    match (contiguous, supp, ext) {
+        (true, 0, 1 | 2) => max / 2,
+        (true, 0, 3) => 3 * max / 4,
+        (false, 0, 1) | (false, 1, 0) => 0,
+        (false, 0, 2) | (false, 1, 1) => max / 2,
+        (false, 0, 3) | (false, 1, 2) => 3 * max / 4,
+        _ => max,
+    }
+}
+/// Mark every NSS above `nss` unsupported (encoding3).
+fn limit_nss(map: u16, nss: u8) -> u16 {
+    (nss..8).fold(map, |map, n| map | 3 << (n * 2))
 }
 fn map_has_rates(map: u16) -> bool {
     map & 3 != 3

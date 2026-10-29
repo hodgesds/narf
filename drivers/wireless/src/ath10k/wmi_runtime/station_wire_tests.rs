@@ -5,6 +5,7 @@ fn smoke_ath10k_wmi_station_prepare_all_native_dialects() -> TestResult {
     let p = Permission {
         center: 2412,
         secondary: None,
+        width80: false,
         factory: crate::ath10k::regulatory::Factory::from_eeprom(0x64).unwrap(),
         country: *b"US",
         frequency: 2412,

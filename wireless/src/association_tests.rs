@@ -7,6 +7,7 @@ fn bss() -> Bss {
         bssid: AP,
         ssid: b"narf".to_vec(),
         channel: 1,
+        band: None,
         signal_dbm: None,
         capability: 1,
         beacon_interval: 100,
@@ -261,4 +262,58 @@ fn smoke_shared_join_response_keeps_five_ghz_rates_in_band() -> TestResult {
 kernel_test_in!(
     "wireless/association",
     smoke_shared_join_response_keeps_five_ghz_rates_in_band
+);
+
+fn smoke_shared_join_spp_amsdu_opt_in_patches_request_rsne_before_tx() -> TestResult {
+    let mut ap = bss();
+    ap.capability |= 0x10;
+    let mut rsne = RsnIe::wpa2_psk_ccmp();
+    rsne.rsn_capabilities = rsn::RSN_CAP_SPP_AMSDU_CAPABLE;
+    let body = rsne.encode_body();
+    ap.information_elements
+        .extend_from_slice(&[48, body.len() as u8]);
+    ap.information_elements.extend_from_slice(&body);
+    let mut plan = JoinPlan::prepare(&ap, OWN, b"narf", SecurityMode::Wpa2Psk).unwrap();
+    let canonical = RsnIe::wpa2_psk_ccmp().encode_body();
+    let before = plan.assoc.clone();
+    if plan.rsn_body() != Some(canonical.clone()) || plan.enable_spp_amsdu() != Ok(()) {
+        return TestResult::Fail("WPA2 plan refused the SPP A-MSDU opt-in");
+    }
+    let mut expected = before.clone();
+    let at = expected.len() - 1;
+    expected[at] |= 0x04; // bit10 lives in the second capability octet.
+    if plan.rsn_body() != Some(body.clone())
+        || plan.assoc != expected
+        || crate::station_security::Security::new(
+            OWN,
+            AP,
+            &[1; 32],
+            &plan.rsn_body().unwrap(),
+            &body,
+            None,
+            0,
+        )
+        .map(|s| s.spp_amsdu())
+            != Ok(true)
+    {
+        return TestResult::Fail("SPP opt-in did not patch only RSN Capabilities bit10");
+    }
+    // Idempotent; then frozen once the first frame is emitted.
+    plan.enable_spp_amsdu().unwrap();
+    if plan.assoc != expected {
+        return TestResult::Fail("repeated SPP opt-in changed the request");
+    }
+    plan.start_authentication().unwrap();
+    if plan.enable_spp_amsdu() != Err(Error::Busy) {
+        return TestResult::Fail("SPP opt-in changed a transmitted plan");
+    }
+    let mut open = JoinPlan::prepare(&bss(), OWN, b"narf", SecurityMode::Open).unwrap();
+    if open.enable_spp_amsdu() != Err(Error::UnsupportedSecurity) || open.rsn_body().is_some() {
+        return TestResult::Fail("Open plan gained an RSNE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/association",
+    smoke_shared_join_spp_amsdu_opt_in_patches_request_rsne_before_tx
 );

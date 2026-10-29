@@ -375,3 +375,65 @@ kernel_test_in!(
     "drivers/wireless/ath10k/wmm",
     smoke_ath10k_wmm_held_m4_policy_loss_cannot_commit_keys_or_carrier
 );
+
+/// One Device worker pass: the synchronous drain, then its await point.
+fn service(h: &Harness) {
+    h.pump();
+    let _ = drive(h.device.flush_management());
+}
+
+fn smoke_ath10k_wmm_beacon_parameter_set_change_reprograms_contention() -> TestResult {
+    for (version, dialect) in BAND_DIALECTS {
+        let h = Harness::new(version, dialect, true);
+        enable(&h);
+        if let Err(error) = h.join() {
+            return TestResult::Fail(error);
+        }
+        // mac80211 ieee80211_sta_wmm_params: a new Parameter Set Count in a
+        // beacon reaches ath10k_conf_tx for every AC.
+        h.model(|m| {
+            let f = m.data.as_mut().unwrap();
+            let offer = f.wmm_offer.as_mut().unwrap();
+            offer[8] = 1;
+            offer[10] = 4;
+            offer[11] = 0x93; // BE CWmin7, CWmax511, AIFSN4.
+            f.wmm_words[0] = 7;
+            f.wmm_words[1] = 511;
+            f.wmm_words[2] = 4;
+            let beacon = f.beacon();
+            management_frame(m, beacon);
+        });
+        service(&h);
+        if h.closed() || !h.model(|m| m.data.as_ref().unwrap().wmm_sent == 2) {
+            return TestResult::Fail("beacon WMM parameter-set change was not reprogrammed");
+        }
+        // The same count again is not a change.
+        h.model(|m| {
+            let beacon = m.data.as_ref().unwrap().beacon();
+            management_frame(m, beacon);
+        });
+        service(&h);
+        if h.closed() || !h.model(|m| m.data.as_ref().unwrap().wmm_sent == 2) {
+            return TestResult::Fail("unchanged WMM parameter-set count was resent");
+        }
+        // A new set requiring BE admission control is refused like the
+        // association response: the owner closes instead of programming it.
+        h.model(|m| {
+            let f = m.data.as_mut().unwrap();
+            let offer = f.wmm_offer.as_mut().unwrap();
+            offer[8] = 2;
+            offer[10] |= 0x10;
+            let beacon = f.beacon();
+            management_frame(m, beacon);
+        });
+        service(&h);
+        if !h.closed() || !h.model(|m| m.data.as_ref().unwrap().wmm_sent == 2) {
+            return TestResult::Fail("BE-ACM beacon parameter set was programmed");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/wmm",
+    smoke_ath10k_wmm_beacon_parameter_set_change_reprograms_contention
+);

@@ -277,6 +277,42 @@ kernel_test_in!(
     "drivers/wireless/ath9k/ht",
     smoke_ar9285_ht20_factory_disable_flags_and_exact_new_measured_identity
 );
+fn smoke_ar2427_bonded_out_ht_never_reaches_measured_facts() -> TestResult {
+    // Linux hw.c::ath9k_hw_fill_cap_info clears ATH9K_HW_CAP_HT for
+    // AR2427_DEVID_PCIE (0x002c) although it is AR9285 silicon; the shared
+    // probe/legacy owner admits it while every HT/BA source stays closed.
+    let _policy = Policy::install();
+    let (d, i, p, r) = inputs();
+    let mut ar2427 = d;
+    ar2427.id.device = 0x002c;
+    if !crate::ath9k::ar9285_silicon(&d.id) || !crate::ath9k::ar9285_silicon(&ar2427.id) {
+        return TestResult::Fail("AR9285-silicon PCI functions were not admitted");
+    }
+    for (vendor, device) in [
+        (0x168c, 0x0029),
+        (0x168c, 0x002d),
+        (0x168c, 0x0034),
+        (0x1234, 0x002c),
+    ] {
+        let mut other = d;
+        other.id.vendor = vendor;
+        other.id.device = device;
+        if crate::ath9k::ar9285_silicon(&other.id) {
+            return TestResult::Fail("non-AR9285 silicon reached the AR9285 owner");
+        }
+    }
+    if Facts::new(ar2427, i, p, r, &image()).is_ok() {
+        return TestResult::Fail("AR2427 bonded-out HT reached a measured HT request");
+    }
+    if Facts::new(d, i, p, r, &image()).is_err() {
+        return TestResult::Fail("AR9285 HT facts regressed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ht",
+    smoke_ar2427_bonded_out_ht_never_reaches_measured_facts
+);
 fn smoke_ar9285_ht20_all_mcs_native_qos_dma_pad_fcs_duration_and_original_ccmp() -> TestResult {
     let _policy = Policy::install();
     for protected in [false, true] {

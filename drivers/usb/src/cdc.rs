@@ -232,6 +232,13 @@ pub enum CdcError {
     BadSubtype(u8),
     /// Field-specific malformation (e.g. version BCD out of range).
     MalformedField,
+    /// A control transfer to the device failed (controller error
+    /// or no response) — the request never took effect on the
+    /// device. Distinct from the parse failures above so callers
+    /// that commit state on success (line-coding setters, the
+    /// suspend/resume replay) can tell a refused request from a
+    /// malformed one.
+    Transfer,
 }
 
 // ── Header functional descriptor (CDC 1.2 §5.2.3.1) ──────────────

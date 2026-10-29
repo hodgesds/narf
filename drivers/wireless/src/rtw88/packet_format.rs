@@ -72,22 +72,58 @@ pub(super) enum Error {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Queue {
     Management,
+    /// Best effort (`RTW_TX_QUEUE_BE`, TIDs 0 and 3).
     Data,
+    /// Background (`RTW_TX_QUEUE_BK`, TIDs 1 and 2).
+    Background,
+    /// Video (`RTW_TX_QUEUE_VI`, TIDs 4 and 5).
+    Video,
+    /// Voice (`RTW_TX_QUEUE_VO`, TIDs 6 and 7).
+    Voice,
 }
 impl Queue {
+    /// Source `pci.h` `RTK_PCI_TXBD_IDX_*`.
     pub(super) fn index(self) -> u16 {
         match self {
             Self::Management => 0x3b0,
             Self::Data => 0x3a8,
+            Self::Background => 0x3ac,
+            Self::Video => 0x3a4,
+            Self::Voice => 0x3a0,
         }
     }
+    /// Retained ring depths set up by `pci_firmware.rs` (source `pci.c::max_num_of_tx_queue`).
     pub(super) fn depth(self) -> usize {
         match self {
-            Self::Management => 128,
             Self::Data => 256,
+            _ => 128,
+        }
+    }
+    pub(super) fn data(self) -> bool {
+        self != Self::Management
+    }
+    /// `mac80211 ieee802_1d_to_ac` then `tx.c::rtw_tx_ac_to_hwq`.
+    pub(super) fn of_tid(tid: u8) -> Self {
+        match tid & 7 {
+            1 | 2 => Self::Background,
+            0 | 3 => Self::Data,
+            4 | 5 => Self::Video,
+            _ => Self::Voice,
+        }
+    }
+    /// Separately qualified extra-AC bit in `DataProfile::acs`.
+    pub(super) fn ac_bit(self) -> u8 {
+        match self {
+            Self::Background => ACS_BK,
+            Self::Video => ACS_VI,
+            Self::Voice => ACS_VO,
+            _ => 0,
         }
     }
 }
+pub(super) const ACS_BK: u8 = 1 << 0;
+pub(super) const ACS_VI: u8 = 1 << 1;
+pub(super) const ACS_VO: u8 = 1 << 2;
 fn word(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
@@ -106,6 +142,16 @@ pub(super) struct DataProfile {
     pub qos: bool,
     pub mcs: u8,
     pub sgi: bool,
+    /// Source `tx.c::rtw_tx_pkt_info_update`: `si->ldpc_en` (W5 bit7).
+    pub ldpc: bool,
+    /// Source `si->stbc_en` unless `hal.txrx_1ss` (W5 bits9:8 = 1).
+    pub stbc: bool,
+    /// Separately qualified (N2xQ) QoS routing: nonzero admits every TID,
+    /// with BK/VI/VO TIDs limited to these `ACS_*` rings.
+    pub acs: u8,
+    /// Separately qualified (N2xF) firmware RA fallback: DATA clears
+    /// W3 USE_RATE/DISDATAFB.
+    pub fallback: bool,
 }
 impl DataProfile {
     pub(super) const LEGACY: Self = Self {
@@ -113,11 +159,34 @@ impl DataProfile {
         qos: false,
         mcs: 0,
         sgi: false,
+        ldpc: false,
+        stbc: false,
+        acs: 0,
+        fallback: false,
     };
     pub(super) fn valid(self) -> bool {
         self.rates != 0
             && self.rates & !0xfff == 0
             && (self.mcs == 0 && !self.sgi || self.mcs != 0 && self.qos)
+            && (self.mcs != 0 || !self.ldpc && !self.stbc)
+            && self.acs & !(ACS_BK | ACS_VI | ACS_VO) == 0
+            && (self.acs == 0 || self.qos)
+    }
+    /// The QoS ring for `tid`, if this profile admits it.
+    pub(super) fn tid_queue(self, tid: u8) -> Option<Queue> {
+        if tid > 7 || !self.qos || tid != 0 && self.acs == 0 {
+            return None;
+        }
+        let q = Queue::of_tid(tid);
+        (q == Queue::Data || self.acs & q.ac_bit() != 0).then_some(q)
+    }
+    /// The same profile without separately qualified TX coding.
+    pub(super) fn uncoded(self) -> Self {
+        Self {
+            ldpc: false,
+            stbc: false,
+            ..self
+        }
     }
     pub(super) fn rate_id(self) -> u8 {
         if self.mcs != 0 {
@@ -179,6 +248,11 @@ fn classify_profile(frame: &[u8], own: [u8; 6], profile: DataProfile) -> Result<
         // Management stays legacy. The separate qualified branch below may
         // admit only BE/TID0 QoS, without aggregation or fragmentation.
         0x00 | 0xb0 | 0xa0 | 0xc0 if frame[1] & (3 | 64) == 0 => Ok(Queue::Management),
+        // mac80211 software-scan Probe Request: broadcast DA (W0 BMC) and
+        // wildcard BSSID only; the caller requests no CCX report.
+        0x40 if frame[1] == 0 && frame[4..10] == [255; 6] && frame[16..22] == [255; 6] => {
+            Ok(Queue::Management)
+        }
         0xd0 if profile.mcs != 0
             && frame.len() == 33
             && frame[1] == 0
@@ -190,13 +264,15 @@ fn classify_profile(frame: &[u8], own: [u8; 6], profile: DataProfile) -> Result<
         0xd0 if profile.mcs != 0 && recipient_control(frame) => Ok(Queue::Management),
         0xd0 if profile.mcs != 0 && originator_control(frame) => Ok(Queue::Management),
         0x08 if frame[1] & 3 == 1 && unicast(&frame[4..10]) => Ok(Queue::Data),
+        // QoS Control: TID only (normal ack, no EOSP/A-MSDU), byte1 zero.
         0x88 if profile.qos
             && frame.len() >= 26
-            && frame[24..26] == [0, 0]
+            && frame[24] & 0xf0 == 0
+            && frame[25] == 0
             && frame[1] & 3 == 1
             && unicast(&frame[4..10]) =>
         {
-            Ok(Queue::Data)
+            profile.tid_queue(frame[24]).ok_or(Error::Frame)
         }
         _ => Err(Error::Frame),
     }
@@ -275,11 +351,13 @@ pub(super) fn transmit_profile(
             | 1 << 26
             | 1 << 31,
     );
+    // Source tx.c: QSEL_MGMT 18; QoS DATA uses `skb->priority` (the TID).
     let qsel = match queue {
         Queue::Management => 18,
-        Queue::Data => 0,
+        _ if frame[0] == 0x88 => u32::from(frame[24] & 7),
+        _ => 0,
     };
-    let ordinary = queue == Queue::Data && (report.is_none() || frame[0] == 0x88);
+    let ordinary = queue.data() && (report.is_none() || frame[0] == 0x88);
     if frame[0] == 0x88 && !ordinary {
         return Err(Error::Frame);
     }
@@ -292,7 +370,11 @@ pub(super) fn transmit_profile(
         u32::from(mac_id) | qsel << 8 | u32::from(rate_id) << 16,
     );
     put(&mut bytes, 8, u32::from(report.is_some()) << 19);
-    put(&mut bytes, 12, 1 << 8 | 1 << 10);
+    // Source rtw_tx_pkt_info_update: firmware RA chooses and falls back for
+    // station DATA; everything else keeps USE_RATE|DISDATAFB.
+    if !(ordinary && profile.fallback) {
+        put(&mut bytes, 12, 1 << 8 | 1 << 10);
+    }
     put(
         &mut bytes,
         16,
@@ -304,7 +386,14 @@ pub(super) fn transmit_profile(
     );
     put(&mut bytes, 24, u32::from(report.unwrap_or(0)));
     if ordinary && profile.mcs != 0 {
-        put(&mut bytes, 20, u32::from(profile.sgi) << 4);
+        // Source W5_DATA_SHORT bit4, W5_DATA_LDPC bit7, W5_DATA_STBC bits9:8.
+        put(
+            &mut bytes,
+            20,
+            u32::from(profile.sgi) << 4
+                | u32::from(profile.ldpc) << 7
+                | u32::from(profile.stbc) << 8,
+        );
     }
     let sequence = if frame.len() == 20 {
         0

@@ -95,17 +95,30 @@ impl<B: Bus> core::fmt::Debug for Cr4<B> {
             .finish_non_exhaustive()
     }
 }
+/// A refused claim or boot hands the bus back, so the retained owner can
+/// reset and retry (or release) it instead of losing the function.
+pub struct Refused<B: Bus> {
+    pub error: Error,
+    pub bus: B,
+}
+impl<B: Bus> core::fmt::Debug for Refused<B> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BrcmRefused")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
 impl<B: Bus> Cr4<B> {
     /// Policy/identity admission precedes writes; actual cores come from
     /// EROM. Missing calibration policy is a software gate, not a fallback.
-    pub fn claim(bus: B, pci: PciIdentity, profile: BoardProfile) -> Result<Self, Error> {
+    pub fn claim(bus: B, pci: PciIdentity, profile: BoardProfile) -> Result<Self, Refused<B>> {
         Self::claim_checked(bus, |chip| profile.admits(chip, pci))
     }
     pub(super) fn claim_selected(
         bus: B,
         pci: PciIdentity,
         selection: &super::provision::Selection,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Refused<B>> {
         let expected = selection.host().id;
         Self::claim_checked(bus, |chip| {
             selection.family() == super::provision::Family::Pcie43602
@@ -116,11 +129,26 @@ impl<B: Bus> Cr4<B> {
                 && selection.admits_chip(chip.id, chip.revision)
         })
     }
-    fn claim_checked(mut bus: B, admitted: impl FnOnce(&Chip) -> bool) -> Result<Self, Error> {
+    fn claim_checked(mut bus: B, admitted: impl FnOnce(&Chip) -> bool) -> Result<Self, Refused<B>> {
+        match Self::discover(&mut bus, admitted) {
+            Ok((chip, arm, ram)) => Ok(Self {
+                bus,
+                chip,
+                arm,
+                ram,
+                used: false,
+            }),
+            Err(error) => Err(Refused { error, bus }),
+        }
+    }
+    fn discover(
+        bus: &mut B,
+        admitted: impl FnOnce(&Chip) -> bool,
+    ) -> Result<(Chip, Core, Ram), Error> {
         if bus.dma_enabled()? {
             return Err(Error::State);
         }
-        let chip = Chip::discover(&mut bus).map_err(Error::Chip)?;
+        let chip = Chip::discover(bus).map_err(Error::Chip)?;
         if !admitted(&chip) {
             return Err(Error::Board);
         }
@@ -138,14 +166,14 @@ impl<B: Bus> Cr4<B> {
         if previous == u32::MAX {
             return Err(Error::Gone);
         }
-        Chip::reset_core(&mut bus, arm, previous & 0x20, 0x20, 0x20).map_err(Error::Chip)?;
+        Chip::reset_core(bus, arm, previous & 0x20, 0x20, 0x20).map_err(Error::Chip)?;
         for core in chip
             .cores
             .iter()
             .copied()
             .filter(|c| c.id == chip::CORE_D11)
         {
-            Chip::disable_core(&mut bus, core, 12, 4).map_err(Error::Chip)?;
+            Chip::disable_core(bus, core, 12, 4).map_err(Error::Chip)?;
         }
         let capability = bus.read32(arm.base + 4).map_err(Error::Chip)?;
         if capability == u32::MAX {
@@ -180,17 +208,30 @@ impl<B: Bus> Cr4<B> {
         {
             return Err(Error::Extent);
         }
-        Ok(Self {
-            bus,
-            chip,
-            arm,
-            ram,
-            used: false,
-        })
+        Ok((chip, arm, ram))
     }
     /// NVRAM is already board-selected single-device packed data, with
     /// Linux's final list NUL, alignment and token excluding token bytes.
-    pub fn boot(mut self, firmware: &[u8], nvram: &[u8]) -> Result<Booted<B>, Error> {
+    /// The bus that a successful claim retained, returned without booting.
+    pub fn into_bus(self) -> B {
+        self.bus
+    }
+    pub fn boot(mut self, firmware: &[u8], nvram: &[u8]) -> Result<Booted<B>, Refused<B>> {
+        match self.download(firmware, nvram) {
+            Ok((shared_address, shared)) => Ok(Booted {
+                bus: self.bus,
+                ram: self.ram,
+                shared_address,
+                shared,
+                chip: self.chip,
+            }),
+            Err(error) => Err(Refused {
+                error,
+                bus: self.bus,
+            }),
+        }
+    }
+    fn download(&mut self, firmware: &[u8], nvram: &[u8]) -> Result<(u32, SharedInfo), Error> {
         if self.used {
             return Err(Error::State);
         }
@@ -264,9 +305,9 @@ impl<B: Bus> Cr4<B> {
         let mut bytes = [0; 76];
         self.bus.read_tcm(shared, &mut bytes)?;
         let info = SharedInfo::parse(&bytes).ok_or(Error::Metadata)?;
-        // First runtime handles v5/v6 classic msgbuf and TCM indices. No v7
-        // admission until its completion geometry has a real runtime owner.
-        if !(5..=6).contains(&info.version)
+        // The runtime handles v5/v6 classic msgbuf and v7's wider D2H
+        // completion items (Linux brcmf_ring_itemsize) over TCM indices.
+        if !(5..=7).contains(&info.version)
             || info.rx_dataoffset != 0
             || !self.ram.contains(info.ring_info_addr, 58)
             || !self.ram.contains(info.htod_mb_data_addr, 4)
@@ -274,13 +315,7 @@ impl<B: Bus> Cr4<B> {
         {
             return Err(Error::Metadata);
         }
-        Ok(Booted {
-            bus: self.bus,
-            ram: self.ram,
-            shared_address: shared,
-            shared: info,
-            chip: self.chip,
-        })
+        Ok((shared, info))
     }
 }
 fn read32(bus: &mut impl Bus, address: u32) -> Result<u32, Error> {

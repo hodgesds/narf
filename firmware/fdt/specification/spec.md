@@ -131,6 +131,23 @@ pub fn for_each_interrupt<F>(
     inherited_parent: Option<u32>,
     f: F,
 ) where F: FnMut(u32, &[u32]);
+
+/// Linux `pci_set_of_node` for one PCI function: call `f` with the
+/// unique node reached from the host bridge of `domain` (a
+/// `device_type = "pci"` node without a PCI ancestor; `linux,pci-domain`
+/// must match when present, an untagged bridge is trusted only when it is
+/// the only one) through one child per `devfns` hop (`reg` phys.hi bits
+/// 8..15, `of_pci_get_devfn`). False, without calling `f`, when zero or
+/// several nodes match.
+pub fn for_pci_function<F>(blob: &[u8], domain: u16, devfns: &[u8], f: F) -> bool
+where F: FnMut(&Path<'_>, PropIter<'_>, Cells);
+
+/// The `index`th phandle of `memory-region`.
+pub fn memory_region_phandle(props: PropIter<'_>, index: usize) -> Option<u32>;
+
+/// `of_reserved_mem_region_to_resource`: the static (base, size) `reg`
+/// of the `/reserved-memory` child with `phandle`.
+pub fn reserved_memory_region(blob: &[u8], phandle: u32) -> Option<(u64, u64)>;
 ```
 
 ## 5. Test surface

@@ -56,8 +56,29 @@ pub(super) trait Fixture: Sized {
     ) -> Result<(), firmware_transport::Error>;
     fn descriptors(&self) -> Vec<[u8; 48]>;
     fn rts_request(&self) -> Result<super::RtsRequest, firmware_transport::Error>;
+    fn dm_request(&self) -> Result<super::ContinuationRequest, firmware_transport::Error>;
+    fn stage_dm(
+        &self,
+        bytes: Vec<u8>,
+        cap: Cap<FirmwareBlob, Read>,
+        signed: bool,
+    ) -> Result<(), firmware_transport::Error>;
     fn stage_rts(
         &self,
+        bytes: Vec<u8>,
+        cap: Cap<FirmwareBlob, Read>,
+        signed: bool,
+    ) -> Result<(), firmware_transport::Error>;
+    /// Every firmware H2C mailbox command issued so far.
+    fn mailboxes(&self) -> Vec<[u8; 8]>;
+    /// Generic N2x<tag> continuation request over the exact current base.
+    fn kind_request(
+        &self,
+        kind: &'static qualification::Kind,
+    ) -> Result<super::ContinuationRequest, firmware_transport::Error>;
+    fn stage_kind(
+        &self,
+        kind: &'static qualification::Kind,
         bytes: Vec<u8>,
         cap: Cap<FirmwareBlob, Read>,
         signed: bool,
@@ -103,7 +124,7 @@ pub(super) fn record(r: &ht::Request, mcs: u8, sgi: bool, c21: bool) -> Vec<u8> 
     }
     b
 }
-fn run<T>(future: impl Future<Output = T>) -> Result<T, &'static str> {
+pub(super) fn run<T>(future: impl Future<Output = T>) -> Result<T, &'static str> {
     let mut f = core::pin::pin!(future);
     let mut cx = Context::from_waker(Waker::noop());
     for _ in 0..16384 {
@@ -672,6 +693,13 @@ pub(super) fn responses<F: Fixture>() -> Result<(), &'static str> {
         }
         scan(&f)?;
         let result = run(f.device().associate(request(&f)))?;
+        // fault4 changes only the dynamic HT protection mode between offer
+        // and response; upstream rtw88 takes no protection action, so the
+        // response is admitted (ht_protection_modes).
+        if fault == 4 {
+            result.map_err(|_| "response HT protection-mode change refused")?;
+            continue;
+        }
         if fault < 5 {
             if result.is_ok() || !f.device().closed() {
                 return Err("native selected HT response mismatch admitted port");

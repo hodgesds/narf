@@ -24,17 +24,33 @@ fn word(bytes: &[u8], offset: usize) -> Result<u32, Error> {
             .map_err(|_| Error::Extent)?,
     ))
 }
+/// `RTW89_HW_RATE_HE_NSS1_MCS0..MCS11` or `RTW89_HW_RATE_HE_NSS2_MCS0..MCS11`:
+/// the HE rates this two-RX-path station can receive.
+pub(super) fn he_rate(rate: u16) -> bool {
+    (0x180..=0x18b).contains(&rate) || (0x190..=0x19b).contains(&rate)
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Descriptor {
     pub size: usize,
     pub offset: usize,
     pub kind: u8,
     pub rate: u16,
+    /// `AX_RXD_RX_GI_LTF_MASK` (`enum rtw89_gi_ltf` for HE PPDUs).
+    pub gi_ltf: u8,
     pub bandwidth: u8,
     pub crc_error: bool,
     pub icv_error: bool,
     pub hardware_decrypted: bool,
+    /// `AX_RXD_AMSDU` / `AX_RXD_AMSDU_CUT`: hardware A-MSDU handling.
     pub aggregate: bool,
+    /// `AX_RXD_AMPDU`: MPDU delivered from an A-MPDU.
+    pub ampdu: bool,
+    /// `AX_RXD_A1_MATCH`: addressed to this station.
+    pub to_self: bool,
+    /// `AX_RXD_MAC_INFO_VLD`: a PPDU status report leads with MAC info.
+    pub mac_info: bool,
+    /// `AX_RXD_MAC_ID_MASK` (long RXD dword5); zero for a short RXD.
+    pub mac_id: u8,
 }
 impl Descriptor {
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
@@ -61,11 +77,20 @@ impl Descriptor {
             offset,
             kind: ((d0 >> 24) & 15) as u8,
             rate: ((d1 >> 16) & 0x1ff) as u16,
+            gi_ltf: ((d1 >> 25) & 7) as u8,
             bandwidth: (d1 >> 30) as u8,
             crc_error: d3 & (1 << 9) != 0,
             icv_error: d3 & (1 << 10) != 0,
             hardware_decrypted: d3 & 4 != 0,
-            aggregate: d3 & ((1 << 3) | (1 << 5) | (1 << 6)) != 0,
+            aggregate: d3 & ((1 << 5) | (1 << 6)) != 0,
+            ampdu: d3 & (1 << 3) != 0,
+            to_self: d3 & 1 != 0,
+            mac_info: d0 & (1 << 23) != 0,
+            mac_id: if length == 32 {
+                (word(bytes, 24)? >> 16) as u8
+            } else {
+                0
+            },
         })
     }
 }
@@ -125,12 +150,88 @@ impl C2h {
         }))
     }
 }
+/// `rtw89_phy_gen_ax.physt_ie_len`; `VAR` lengths come from the IE header.
+const VAR: u8 = 0xff;
+const IE_LENGTH: [u8; 32] = [
+    16, 32, 24, 24, 8, 8, 8, 8, VAR, 8, VAR, 176, VAR, VAR, VAR, VAR, VAR, VAR, 16, 24, VAR, VAR,
+    VAR, 0, 24, 24, 24, 24, 32, 32, 32, 32,
+];
+/// `RTW89_HW_RATE_OFDM6`.
+const OFDM6: u16 = 0x4;
+/// RTL8852B `ppdu_max_usr`.
+const MAX_USERS: usize = 4;
+/// `RTW89_CCK_PKT`: lower IE maps are invalid in normal (non-monitor) mode.
+const CCK_PKT: u32 = 11;
+/// Linux `rtw89_core_rx_process_ppdu_sts` for an AX PPDU status report:
+/// MAC info and user records (`rtw89_core_rx_process_mac_ppdu`), then the
+/// PHY status header (`rtw89_core_rx_process_phy_ppdu`) and its IE walk
+/// (`rtw89_core_rx_parse_phy_sts`). Returns the header `RSSI_AVG` only when
+/// every step Linux checks succeeds, since Linux updates `avg_rssi` only then.
+pub(super) fn phy_status(descriptor: &Descriptor, bytes: &[u8]) -> Option<(u8, Option<i16>)> {
+    let mut start = 0;
+    if descriptor.mac_info {
+        let w0 = word(bytes, 0).ok()?;
+        let w1 = word(bytes, 4).ok()?;
+        let users = (w0 & 0xf) as usize;
+        if users > MAX_USERS {
+            return None;
+        }
+        // RTW89_PPDU_MAC_INFO_SIZE, 8-byte aligned user records,
+        // RTW89_PPDU_MAC_RX_CNT_SIZE and RTW89_RXINFO_W1_PLCP_LEN.
+        start = 8 + (users + (users & 1)) * 4;
+        if w0 & (1 << 29) != 0 {
+            start += 96;
+        }
+        start += ((w1 >> 16) & 0xff) as usize * 8;
+    }
+    let status = bytes.get(start..)?;
+    let w0 = word(status, 0).ok()?;
+    if w0 & (1 << 7) == 0 || ((w0 >> 8) & 0xff) as usize * 8 != status.len() {
+        return None;
+    }
+    if w0 & 0x1f < CCK_PKT {
+        return None;
+    }
+    let mut position = if w0 & (1 << 5) != 0 { 16 } else { 8 };
+    let mut cfo = None;
+    while position < status.len() {
+        let header = word(status, position).ok()?;
+        let kind = header & 0x1f;
+        let length = match IE_LENGTH[kind as usize] {
+            VAR => ((header >> 5) & 0x7f) as usize * 8,
+            fixed => fixed as usize,
+        };
+        if length == 0 || position + length > status.len() {
+            return None;
+        }
+        // rtw89_core_parse_phy_status_ie01: OFDM-or-faster PPDUs addressed
+        // to this station carry FD_CFO (cfo_src_fd on B), S(12,2).
+        if kind == 1 && descriptor.rate >= OFDM6 && descriptor.to_self {
+            let w1 = word(status, position + 4).ok()?;
+            cfo = Some((((w1 >> 8) & 0xfff) as i16) << 4 >> 4);
+        }
+        position += length;
+    }
+    Some(((w0 >> 24) as u8, cfo))
+}
+/// One accepted PPDU status report (`struct rtw89_rx_phy_ppdu`) for the
+/// addressed `mac_id`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PhyStatus {
+    pub mac_id: u8,
+    /// `RTW89_PHY_STS_HDR_W0_RSSI_AVG`, half-dB units (`RSSI_FACTOR` 1).
+    pub rssi: u8,
+    /// IE01 `FD_CFO` for an OFDM-or-faster PPDU.
+    pub cfo: Option<i16>,
+}
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Event {
     /// Exactly the native MPDU, after removing only its four-byte FCS.
     Wifi(Descriptor, Vec<u8>),
     Firmware(C2h),
     Releases(Vec<Report>),
+    /// `RTW89_CORE_RX_TYPE_PPDU_STAT` addressed to this station.
+    PhyStatus(PhyStatus),
     /// Bad FCS/ICV, unsupported aggregation/decryption/profile, PPDU or an
     /// unhandled bounded report does not become an ordinary station frame.
     Dropped,
@@ -222,7 +323,12 @@ impl Assembler {
                     || descriptor.hardware_decrypted
                     || descriptor.aggregate
                     || descriptor.bandwidth != 0
-                    || descriptor.rate > 11
+                    // Legacy CCK1..OFDM54, 20MHz HT MCS0..15 (RTW89_HW_RATE_MCS0)
+                    // or HE NSS1/NSS2 MCS0..11 with a defined GI/LTF
+                    // (RTW89_HW_RATE_HE_NSS1_MCS0, RTW89_GILTF_1XHE08 = 5).
+                    || !(descriptor.rate <= 11
+                        || (0x80..=0x8f).contains(&descriptor.rate)
+                        || he_rate(descriptor.rate) && descriptor.gi_ltf <= 5)
                 {
                     Event::Dropped
                 } else {
@@ -234,6 +340,14 @@ impl Assembler {
                     Event::Wifi(descriptor, bytes)
                 }
             }
+            1 => match phy_status(&descriptor, &bytes) {
+                Some((rssi, cfo)) if descriptor.to_self => Event::PhyStatus(PhyStatus {
+                    mac_id: descriptor.mac_id,
+                    rssi,
+                    cfo,
+                }),
+                _ => Event::Dropped,
+            },
             10 => Event::Firmware(C2h::parse(bytes)?),
             _ => Event::Dropped,
         }))

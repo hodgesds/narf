@@ -550,8 +550,12 @@ fn smoke_ar9285_native_device_disconnect_cancellation_and_stale_publication_stay
     drop(disconnect);
     drop(owner);
     h.pump();
-    if !h.closed() || h.model.master.get() || h.model.tx.get().is_none() {
-        return TestResult::Fail("AR9285 cancelled disconnect failed safe retained-DMA stop");
+    if !h.closed()
+        || h.model.master.get()
+        || h.model.tx.get().is_some()
+        || h.model.released.borrow().is_empty()
+    {
+        return TestResult::Fail("AR9285 cancelled disconnect did not abort and reclaim DMA");
     }
     TestResult::Pass
 }
@@ -1206,4 +1210,38 @@ fn smoke_ar9285_native_ht_rx_ba_receive_runs_during_held_data_then_waits_for_rek
 kernel_test_in!(
     "drivers/wireless/ath9k/rx-ba",
     smoke_ar9285_native_ht_rx_ba_receive_runs_during_held_data_then_waits_for_rekey_receipt
+);
+/// Host retirement of one generation: carrier/rings close, the name leaves
+/// the interface table and stays reserved, and late TX cannot re-enter.
+fn smoke_ar9285_native_device_retire_host_withdraws_generation() -> TestResult {
+    let h = Harness::new(false);
+    h.join();
+    let name = h.device.name();
+    h.device.retire_host();
+    let bytes = udp_ipv4(
+        AP,
+        h.plan.station,
+        h.plan.lease_ip,
+        h.plan.server_ip,
+        49152,
+        7,
+        b"ar9285-after-retire",
+    );
+    if h.device.link_up()
+        || h.device.connected_bssid().is_some()
+        || narf_net::iface::lookup(name).is_some()
+        || h.device.enqueue(&bytes, Default::default()).is_ok()
+        || narf_net::iface::reserve_name("ar9-native%d") == name
+    {
+        return TestResult::Fail("retired AR9285 generation stayed reachable");
+    }
+    h.pump();
+    if h.model.master.get() || h.model.released.borrow().is_empty() {
+        return TestResult::Fail("retired generation did not stop and reclaim DMA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/device",
+    smoke_ar9285_native_device_retire_host_withdraws_generation
 );

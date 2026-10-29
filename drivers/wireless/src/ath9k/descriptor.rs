@@ -167,6 +167,19 @@ pub(super) fn transmit_ht(
     basic: usize,
     profile: super::ht::Profile,
 ) -> Result<[u32; WORDS], Error> {
+    transmit_ht_tid(frame, local, address, mcs, basic, profile, 0)
+}
+/// HT QoS DATA whose QoS control names TID `0..=max_tid`, normal ACK, no
+/// EOSP/A-MSDU. `max_tid` exceeds zero only under the N85Q program.
+pub(super) fn transmit_ht_tid(
+    frame: &[u8],
+    local: [u8; 6],
+    address: u64,
+    mcs: u8,
+    basic: usize,
+    profile: super::ht::Profile,
+    max_tid: u8,
+) -> Result<[u32; WORDS], Error> {
     if !(26..=MAX_MPDU).contains(&frame.len())
         || frame[0] != 0x88
         || frame[1] & !8 != if frame[1] & 0x40 != 0 { 0x41 } else { 1 }
@@ -174,7 +187,8 @@ pub(super) fn transmit_ht(
         || local[0] & 1 != 0
         || local == [0; 6]
         || frame[22] & 15 != 0
-        || frame[24..26] != [0, 0]
+        || frame[24] > max_tid.min(7)
+        || frame[25] != 0
         || mcs > 7
         || profile.mcs() & (1 << mcs) == 0
         || basic >= 12

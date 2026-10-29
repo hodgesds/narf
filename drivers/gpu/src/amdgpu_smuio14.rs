@@ -9,6 +9,9 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 /// `regGOLDEN_TSC_COUNT_UPPER` / `_LOWER`, SMUIO bank 1.
 const UPPER: u64 = 0x2d;
 const LOWER: u64 = 0x2e;
+// HDP6 removed HDP5's READ_CACHE_INVALIDATE register. HOST_PATH_CNTL is
+// readable, has reserved zero bits, and shares this offset on HDP6 revisions.
+const HDP_LIVE: u32 = 0xcc; // regHDP_HOST_PATH_CNTL, HDP6 base 0
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -22,6 +25,7 @@ pub struct ClockReader {
     regs: MmioRegion,
     authority: Cap<BusDeviceCap, Write>,
     base: u64,
+    live: u64,
 }
 
 trait Io {
@@ -30,8 +34,8 @@ trait Io {
 struct Mmio(MmioRegion);
 impl Io for Mmio {
     fn read(&mut self, at: u64) -> u32 {
-        // SAFETY: `ClockReader::new` bounds both registers inside the
-        // discovered SMUIO bank of this mapping; reads have no side effect.
+        // SAFETY: `ClockReader::new` bounds the SMUIO halves and HDP probe
+        // inside this permanent mapping; reads have no side effect.
         unsafe { self.0.read32(at) }
     }
 }
@@ -44,21 +48,19 @@ impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for Op<F> {
 }
 
 /// The 64-bit counter from its halves: the upper half before and after the
-/// lower, and the lower again if the upper moved meanwhile. All-ones reads
-/// mean the device is gone.
-fn sample(io: &mut impl Io, base: u64) -> Option<u64> {
-    let read = |io: &mut dyn FnMut(u64) -> u32, reg: u64| {
-        let v = io(base + reg * 4);
-        (v != u32::MAX).then_some(u64::from(v))
-    };
-    let mut io = |at| io.read(at);
-    let before = read(&mut io, UPPER)?;
-    let mut lower = read(&mut io, LOWER)?;
-    let after = read(&mut io, UPPER)?;
-    if before != after {
-        lower = read(&mut io, LOWER)?;
+/// lower, and the lower again if the upper moved meanwhile. HDP probes
+/// detect loss independently; every counter bit pattern is valid.
+fn sample(io: &mut impl Io, base: u64, live: u64) -> Option<u64> {
+    if io.read(live) == u32::MAX {
+        return None;
     }
-    Some(after << 32 | lower)
+    let before = io.read(base + UPPER * 4);
+    let mut lower = io.read(base + LOWER * 4);
+    let after = io.read(base + UPPER * 4);
+    if before != after {
+        lower = io.read(base + LOWER * 4);
+    }
+    (io.read(live) != u32::MAX).then_some(u64::from(after) << 32 | u64::from(lower))
 }
 
 impl ClockReader {
@@ -66,17 +68,29 @@ impl ClockReader {
     pub fn new(gpu: &AmdGpu, authority: Cap<BusDeviceCap, Write>) -> Result<Self, Error> {
         let base = bank(gpu, ip::HW_ID_SMUIO, &[(14, 0, 2)], 1, LOWER as u32)
             .map_err(|_| Error::Unsupported)?;
+        let live = bank(
+            gpu,
+            ip::HW_ID_HDP,
+            &[(6, 0, 0), (6, 0, 1), (6, 1, 0), (6, 1, 1), (6, 4, 0)],
+            0,
+            HDP_LIVE,
+        )
+        .map_err(|_| Error::Unsupported)?
+            + u64::from(HDP_LIVE) * 4;
         Ok(Self {
             regs: gpu.regs,
             authority,
             base,
+            live,
         })
     }
     /// The counter now; None once the device or the capability is gone.
     pub fn read(&self) -> Option<u64> {
-        let (regs, base) = (self.regs, self.base);
+        let (regs, base, live) = (self.regs, self.base, self.live);
         self.authority
-            .invoke(Op(|| sample(&mut Mmio(regs), base)))
+            .invoke(Op(|| {
+                narf_lib::sync::without_interrupts(|| sample(&mut Mmio(regs), base, live))
+            }))
             .ok()
             .flatten()
     }
@@ -91,22 +105,26 @@ mod tests {
     struct Fake(Vec<u32>, usize);
     impl Io for Fake {
         fn read(&mut self, at: u64) -> u32 {
-            assert!(at == 0x100 + UPPER * 4 || at == 0x100 + LOWER * 4);
+            assert!(at == 0x100 + UPPER * 4 || at == 0x100 + LOWER * 4 || at == 0x80);
             self.1 += 1;
             self.0.remove(0)
         }
     }
     /// The halves combine high-low-high, re-reading the low half when the
-    /// high one moved; an all-ones read is a vanished device.
+    /// high one moved; an all-ones HDP probe is a vanished device.
     fn smuio14_clock_reads_both_halves_consistently() -> TestResult {
-        let mut steady = Fake(alloc::vec![2, 0x10, 2], 0);
-        let mut carried = Fake(alloc::vec![2, 0xffff_fff0, 3, 0x4], 0);
+        let mut steady = Fake(alloc::vec![0, 2, 0x10, 2, 0], 0);
+        let mut carried = Fake(alloc::vec![0, 2, 0xffff_fff0, 3, 0x4, 0], 0);
         let mut gone = Fake(alloc::vec![u32::MAX], 0);
-        if sample(&mut steady, 0x100) != Some(0x2_0000_0010)
-            || steady.1 != 3
-            || sample(&mut carried, 0x100) != Some(0x3_0000_0004)
-            || carried.1 != 4
-            || sample(&mut gone, 0x100).is_some()
+        let mut max = Fake(alloc::vec![0, u32::MAX, u32::MAX, u32::MAX, 0], 0);
+        let mut late_loss = Fake(alloc::vec![0, 2, 0x10, 2, u32::MAX], 0);
+        if sample(&mut steady, 0x100, 0x80) != Some(0x2_0000_0010)
+            || steady.1 != 5
+            || sample(&mut carried, 0x100, 0x80) != Some(0x3_0000_0004)
+            || carried.1 != 6
+            || sample(&mut gone, 0x100, 0x80).is_some()
+            || sample(&mut max, 0x100, 0x80) != Some(u64::MAX)
+            || sample(&mut late_loss, 0x100, 0x80).is_some()
         {
             return TestResult::Fail("GOLDEN_TSC sampling");
         }

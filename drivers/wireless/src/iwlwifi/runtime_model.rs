@@ -249,6 +249,7 @@ pub(in crate::iwlwifi) fn create_for_format(
         armed: false,
         failed: false,
         station_stop: None,
+        protected_tx: 0,
         // This RAM constructor models an already admitted post-INIT owner.
         // Real association immediately closes/reserves its own generation.
         rx_epoch: rx_epoch::State::model(),
@@ -299,6 +300,34 @@ pub(in crate::iwlwifi) fn station_model_for_format(
     )));
     hardware.resources.commands.trace = Some(trace.clone());
     (hardware, firmware, trace)
+}
+
+/// Fixture counterpart of `Hardware::restart` for a RAM transport: the
+/// private device has no PCI function or embedded CPU, so the stop/BME/ALIVE
+/// steps are represented by discarding every queue/command owner exactly as
+/// the native path does after its acknowledged DMA stop. The posted RX ring
+/// stays the fixture's device-side endpoint; every firmware-object owner
+/// (station data queues, pending commands, notifications, RX epoch) restarts.
+pub(in crate::iwlwifi) fn restart(hardware: &mut Hardware) -> Result<(), &'static str> {
+    if hardware.device.id.vendor != 0xffff || hardware.armed || hardware.interrupts.is_some() {
+        return Err("model restart on a native transport");
+    }
+    hardware.fail();
+    let trace = hardware.resources.commands.trace.take();
+    let mut commands = CommandQueue::new()?;
+    commands.trace = trace;
+    hardware.resources.commands = commands;
+    hardware.resources.data.clear();
+    hardware.rx_epoch.reset_after_dma_stop();
+    hardware.failed = false;
+    hardware.notifications.clear();
+    hardware.responses.clear();
+    hardware.tx_completed.clear();
+    Ok(())
+}
+
+pub(in crate::iwlwifi) fn is_model(hardware: &Hardware) -> bool {
+    hardware.device.id.vendor == 0xffff
 }
 
 pub(in crate::iwlwifi) fn retained(hardware: &Hardware) -> (usize, usize, usize) {

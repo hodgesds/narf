@@ -29,7 +29,8 @@ pub struct KeyUpdate {
     pub group_rx_pn: u64,
     /// 802.11w Integrity GTK (BIP-CMAC-128) + its key index, present only
     /// when management-frame protection was negotiated (WPA3-SAE).
-    pub igtk: Option<([u8; 16], u16)>,
+    /// IGTK material, key index and the KDE IPN (receive replay floor).
+    pub igtk: Option<([u8; 16], u16, u64)>,
 }
 
 impl core::fmt::Debug for KeyUpdate {
@@ -47,7 +48,7 @@ impl Drop for KeyUpdate {
             key.zeroize();
         }
         self.group.zeroize();
-        if let Some((igtk, _)) = &mut self.igtk {
+        if let Some((igtk, _, _)) = &mut self.igtk {
             igtk.zeroize();
         }
     }
@@ -455,6 +456,9 @@ pub struct Session {
     ptk: Option<Ptk>,
     replay: u64,
     ap_rsn: Vec<u8>,
+    /// Exact station RSNE body sent in the association request (SAE: with
+    /// its PMKID). `None` keeps the AKM's default body.
+    sta_rsn: Option<Vec<u8>>,
     last_request: Vec<u8>,
     last_response: Vec<u8>,
     initial_key_data: Vec<u8>,
@@ -501,6 +505,7 @@ impl Session {
             ptk: None,
             replay: 0,
             ap_rsn,
+            sta_rsn: None,
             last_request: Vec::new(),
             last_response: Vec::new(),
             initial_key_data: Vec::new(),
@@ -511,6 +516,14 @@ impl Session {
 
     pub fn complete(&self) -> bool {
         self.complete
+    }
+
+    /// Echo `rsn` (the exact association-request RSNE body) in message 2
+    /// instead of the AKM default, as wpa_supplicant echoes `assoc_wpa_ie`
+    /// (IEEE 802.11-2020 12.7.6.3). Pairwise rekeys keep the same body.
+    pub fn with_station_rsn(mut self, rsn: Vec<u8>) -> Self {
+        self.sta_rsn = Some(rsn);
+        self
     }
 
     pub fn process(&mut self, pdu: &[u8]) -> Result<Response, &'static str> {
@@ -551,6 +564,7 @@ impl Session {
                     nonce()?,
                     self.ap_rsn.clone(),
                 ));
+                candidate.sta_rsn = self.sta_rsn.clone();
                 let reply = candidate.process_inner(pdu)?;
                 self.pending_rekey = Some(candidate);
                 return Ok(reply);
@@ -616,7 +630,10 @@ impl Session {
             reply.key_information = self.akm.ki_version() | KI_KEY_TYPE_PAIRWISE | KI_KEY_MIC;
             reply.replay_counter = key.replay_counter;
             reply.key_nonce = self.snonce;
-            let rsn = self.akm.sta_rsn_ie();
+            let rsn = self
+                .sta_rsn
+                .clone()
+                .unwrap_or_else(|| self.akm.sta_rsn_ie());
             reply.key_data.extend_from_slice(&[48, rsn.len() as u8]);
             reply.key_data.extend_from_slice(&rsn);
             self.ptk = Some(ptk);
@@ -694,7 +711,7 @@ impl Session {
             // it. WPA2 never installs an IGTK.
             let igtk = if self.akm == Akm::Wpa3Sae {
                 match rekey::parse_igtk_kde(&clear) {
-                    Some(kde) => Some((kde.igtk, kde.key_id)),
+                    Some(kde) => Some((kde.igtk, kde.key_id, kde.ipn)),
                     None if pairwise_message && !self.complete => {
                         return Err("WPA3 message 3 lacks IGTK")
                     }

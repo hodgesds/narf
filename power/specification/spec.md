@@ -106,6 +106,12 @@ pub fn set_policy_current(policy: Policy) -> Result<(), CpuFreqError>;
 pub fn set_epp_current(epp: u8) -> Result<(), CpuFreqError>;
 pub fn current_perf(cpu: CpuId) -> Option<PerfState>;
 
+// Thermal limit (passive cooling, §3.4): a ceiling in permille of
+// each CPU's policy window — 1000 = uncapped, 0 = window floor.
+pub fn set_thermal_limit_permille(permille: u16);
+pub fn thermal_limit_permille() -> u16;
+pub fn install_passive_cooling() -> Result<(), ThermalError>;
+
 pub trait Governor {
     fn tick(&mut self, load: LoadSnapshot) -> Opp;
     fn name(&self) -> &'static str;
@@ -114,6 +120,20 @@ pub trait Governor {
 
 Built-in governors: `Performance`, `Powersave`, `EnergyAware`
 (scheduler-informed). Pluggability is opt-in via `Cap<Governor, Install>`.
+
+The governor also carries the thermal limit used for passive
+cooling (ACPI 6.5 §11.3). The thermal registry's cooling level
+maps linearly onto a ceiling in permille of the policy window
+(level 0 → 1000 uncapped, level 255 → 0, the window floor). The
+ceiling binds both the tick's target computation and the max
+field programmed into the HWP / CPPC request, so autonomous
+hardware selection is capped as well; a previously written
+desired above a newly tightened ceiling is rewritten even when
+the new target sits inside the hysteresis band.
+`install_passive_cooling()` registers the governor as a
+`thermal::CoolingDevice` and is called by the `cpufreq-init`
+initcall only after `enable()` succeeds — with no live backend
+there is nothing to throttle and no device is published.
 
 On x86_64, `Balanced` is the default schedutil-style policy over Intel
 HWP or AMD CPPC. One hard-pinned worker per online CPU samples that CPU's
@@ -481,14 +501,108 @@ epoch traffic can deepen a lockout. Boot/resume-environment
 wiring of these two call points is the resume lane's
 remainder, as with the anchor itself.
 
+**Policy (design §10; lane P8, #1006).** The policy engine lives
+in `suspend_service::policy` and administers the `RecordedPolicy`
+record above. It names anchor *kinds* only — the token, TPM, and
+passphrase anchors register into its rules by kind as their lanes
+land — and it owns five things: the policy store, the level
+algebra and floor, the enrollment / re-enrollment flows, the
+composition rules, and recorded-policy enforcement at resume.
+
+```rust
+// suspend_service::policy (design §10).
+pub enum TokenVerification { TouchOnly, TouchAndPin }  // §4.5 / decision 1
+pub enum TokenAbsent { Defer, AbandonImage }          // §4.9
+pub struct PolicyConfig {
+    pub level: PolicyLevel, pub floor: PolicyLevel, pub policy_epoch: u64,
+    pub token_verification: TokenVerification,
+    pub recovery_slot_default: bool, pub token_absent: TokenAbsent,
+}
+pub struct PolicyStore { /* the running system's current PolicyConfig */ }
+impl PolicyStore {
+    pub fn provision_fresh_install(&mut self, svc: &mut SuspendService<E>,
+        install: FreshInstall) -> Result<RecordedPolicy, PolicyError>;
+    pub fn change_level(&mut self, svc: &mut SuspendService<E>,
+        change: PolicyChange) -> Result<RecordedPolicy, PolicyError>;
+    pub fn reenroll(&mut self, svc: &mut SuspendService<E>,
+        factors: FactorSet) -> Result<RecordedPolicy, PolicyError>;
+    pub fn enroll_recovery(&mut self, svc: &mut SuspendService<E>,
+        anchor: &dyn KeyCustodyAnchor) -> Result<SlotRecord, PolicyError>;
+    pub fn seal(&self, svc: &mut SuspendService<E>,
+        store: &mut dyn ImageStore, image: &[u8])
+        -> Result<[u8; 16], PolicyError>;
+    pub fn validate_current(&self, svc: &SuspendService<E>)
+        -> Result<(), PolicyError>;
+}
+pub fn validate_slot_set(level: PolicyLevel, slots: &[SlotRecord])
+    -> Result<(), PolicyError>;
+pub fn factor_plan(recorded: &RecordedPolicy, slots: &[SlotRecord])
+    -> FactorPlan;   // PublishedOff | AnyOf{kind, recovery} | Composition{recovery}
+pub fn open_with_policy(store: &dyn ImageStore,
+                        anchors: &[&dyn KeyCustodyAnchor])
+    -> Result<OpenedImage, ServiceError>;
+// Composition primitive on the service itself (design §8.5): the
+// SMS is XOR-split across two factor groups — every anchor in a
+// group wraps that group's share, one slot record per factor —
+// inside custody, so the secret never leaves Secret32.
+impl<E: KeyEntropy> SuspendService<E> {
+    pub fn enroll_composition(&mut self, group_a: &[&dyn KeyCustodyAnchor],
+        group_b: &[&dyn KeyCustodyAnchor])
+        -> Result<Vec<SlotRecord>, ServiceError>;
+    pub fn rotate_epoch_composition(&mut self,
+        group_a: &[&dyn KeyCustodyAnchor],
+        group_b: &[&dyn KeyCustodyAnchor]) -> Result<u64, ServiceError>;
+}
+```
+
+The decided rules are structural, not advisory (decision sheet,
+2026-10-26). **Levels and floor:** ranks are OFF < PASSPHRASE <
+TOKEN = TPM (peer single-hardware-factor levels: presence on a
+carried token vs binding to the measured boot chain) < TOKEN+TPM;
+no flow may set a level below the admin floor, and a floor the
+current level violates cannot be provisioned. **Defaults:** the
+fresh-install level is TOKEN when at least two tokens enroll,
+else PASSPHRASE — OFF is never a default, and the only path into
+OFF is a `PolicyChange` carrying an explicit `OffConfirmation`
+(the UI shows §10.1's OFF sentence verbatim first). A token level
+requires **two distinct tokens** (the §4.2 backup mandate;
+distinctness is judged on slot params, in which every anchor
+embeds its credential identity); the default token verification
+for a token-only machine is touch+PIN, touch-only being an
+explicit choice and the default under TOKEN+TPM. A passphrase
+recovery slot is offered at enrollment and defaults ON for the
+first epoch. **Composition:** TOKEN+TPM slots are XOR *shares*
+of the SMS, one per factor (the §8.5 shape P6a proved at the
+anchor layer; chained-slot storage is this record set plus the
+recorded level) — resume must recover one share from each group
+and recombine; either group alone yields nothing, and P1's raw
+single-anchor open fails its header seal on a share. **Slot-set
+shape** (`validate_slot_set`, applied before sealing and before
+any resume unwrap): each level's primary kinds must be present
+at their mandated counts, a passphrase slot is the one permitted
+addition to a hardware-factor level (the any-of recovery slot),
+any other foreign kind is a violation, and a duplicated
+(kind, params) record is not a second factor. **Recorded policy
+governs:** `open_with_policy` first checks that the image's own
+slot set realizes its recorded level — an image whose only
+satisfiable path is weaker than its record refuses
+(`PolicyMismatch`) *before any anchor is invoked* — then
+satisfies the level's factor plan in full; the machine's current
+configuration is never consulted, and an enrolled recovery slot
+is the only alternate path (a slot recorded at seal time, not a
+runtime fallback). S3/s2idle remain permitted at every level
+(decision 5): they write nothing to disk; the RAM exposure is
+documented in `S3_RAM_EXPOSURE_NOTE`, and the restrict toggle is
+deferred (#1008), not built.
+
 **Seams, deliberately minimal.** `parse_claims` / `OpenedImage`
 are the resume environment's entry surface (it also consumes
 `decode_hook_region` + `TrustedImage::read_hook_region` to stage
 hook blobs); `RecordedPolicy` is what the policy engine
-administers. Policy levels and floors are a separate lane (design
-§12); this section specifies the service, the format, the custody
-contract, and the state-hook contract. The resume environment
-that consumes the reader pipeline is specified next.
+administers. This section specifies the service, the format, the
+custody contract, the state-hook contract, and the policy
+engine. The resume environment that consumes the reader pipeline
+is specified next.
 
 #### Resume environment (S4 resume)
 
@@ -728,6 +842,15 @@ initcall registers `AcpiFan` cooling devices. Both producers log
 registration failures; the fan log prints "no PNP0C0B fans
 discovered" only when discovery genuinely found none.
 
+The passive half of the same loop is the cpufreq governor
+(§3.2): because the bridge maps the zone warn band from `_PSV`,
+the governor's inline drive on a warn crossing raises the fans
+*and* lowers the cpufreq thermal ceiling — one crossing, both
+actuator classes. `cpufreq-init` (Stage::Late) registers the
+`CpufreqCoolingDevice` once a backend has enabled; before it,
+and on machines with no cpufreq backend, the registry's
+actuators are the fans alone.
+
 ### 3.5 Runtime PM for devices
 
 ```rust
@@ -966,6 +1089,21 @@ warning hook on a transition into `LaptopStateSnapshot::
 is_running_low_on_battery()` when policy enables it. The §3.3
 production-S3 arm/validated gates are unchanged: the service
 requests suspend, the core still decides.
+
+The temperature providers are registered by the hwmon crate,
+not the platform composition: `narf-drivers-hwmon`'s
+`hwmon-power-providers` initcall (Stage::Late) fills
+`StateProviders.cpu_temp_mc` with a live read of the hwmon
+registry — k10temp `Tdie` preferred, coretemp `Tpackage` as the
+fallback, `None` when neither driver has probed (the field
+stays unknown, never a fabricated zero). The dependency cannot
+run the other way (hwmon already depends on platform), and the
+merge semantics of `register_state_providers` make the order
+between the two compositions immaterial. `gpu_temp_mc` has no
+provider yet: the amdgpu SMU temperature exists only as a
+decode of a metrics-table snapshot with no live in-kernel
+handle, so the field remains `None` in production (#914
+remainder).
 
 The platform battery provider behind `StateProviders.battery`
 is itself multi-source. The composition root

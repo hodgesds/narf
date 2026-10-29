@@ -11,6 +11,8 @@ fn profile(center: u8, fault: VhtFault) -> Vht80 {
         caps: [3, 7],
         mode: Some(1),
         txstreams: Some(3),
+        txbf: [None, None],
+        txbf_request: 0,
         // Independent brcmu_d11.c D11AC40/80 literals, both sideband sets.
         inventory: vec![
             0xd826, 0xd926, 0xd82e, 0xd92e, 0xe02a, 0xe12a, 0xe22a, 0xe32a, 0xd897, 0xd997, 0xd89f,
@@ -656,4 +658,66 @@ fn smoke_brcmf_vht80_reentrant_stack_close_and_same_peer_receive_epoch() -> Test
 kernel_test_in!(
     "drivers/wireless/brcmfmac/vht80",
     smoke_brcmf_vht80_reentrant_stack_close_and_same_peer_receive_epoch
+);
+
+fn beamforming() -> Result<(), &'static str> {
+    // (bfe, bfr, txstreams, literal IEEE80211_VHT_CAP_* info incl. SGI80).
+    // 0x0c1a5820 = SGI80|SU_BFR|SU_BFE|STS(2)|SOUND(2)|MU_BFR|MU_BFE|MRQ_MFB.
+    let cases: [(Option<u32>, Option<u32>, u32, u32); 5] = [
+        (Some(3), Some(3), 3, 0x0c1a_5820),
+        (Some(1), Some(0), 1, 0x0000_1020),
+        (Some(0), Some(2), 2, 0x0c09_4020),
+        // Bits outside BRCMF_TXBF_{SU,MU} do not add capability.
+        (Some(4), Some(0), 3, 0x0000_0020),
+        (None, Some(1), 2, 0x0c01_4820),
+    ];
+    for version in [5, 6] {
+        for (bfe, bfr, tx, literal) in cases {
+            let mut native = profile(42, VhtFault::None);
+            native.txstreams = Some(tx);
+            native.txbf = [bfe, bfr];
+            native.txbf_request = literal & !0x20;
+            let h = Harness::new_vht(version, true, 36, None, false, 7, native)?;
+            let vht = h
+                .device
+                .phy_capabilities(5000)
+                .and_then(|caps| caps.vht)
+                .ok_or("native VHT capability missing")?;
+            if vht[..4] != literal.to_le_bytes() {
+                return Err("VHT beamforming bits differ from Linux brcmf_update_vht_cap");
+            }
+            let queried = h
+                .bus
+                .commands()
+                .iter()
+                .filter(|(id, b, _)| {
+                    *id == 262
+                        && (b.starts_with(b"txbf_bfe_cap\0") || b.starts_with(b"txbf_bfr_cap\0"))
+                })
+                .count();
+            if queried != 2 {
+                return Err("both native beamforming capabilities were not queried");
+            }
+            h.associate(true)?;
+            if !h.device.state.try_lock().unwrap().station.vht_connection() {
+                return Err("beamforming-capable firmware request did not bind VHT");
+            }
+        }
+        // Native capability without the matching firmware request bits is a
+        // changed actual association request, not a successful VHT join.
+        let mut native = profile(42, VhtFault::None);
+        native.txbf = [Some(1), Some(1)];
+        let h = Harness::new_vht(version, true, 36, None, false, 7, native)?;
+        if h.associate(true).is_ok() || h.device.link_up() || h.bus.stats().5 != 0 {
+            return Err("request without probed beamforming capability opened the port");
+        }
+    }
+    Ok(())
+}
+fn smoke_brcmf_vht80_native_beamforming_capability_and_request() -> TestResult {
+    beamforming().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/vht80",
+    smoke_brcmf_vht80_native_beamforming_capability_and_request
 );

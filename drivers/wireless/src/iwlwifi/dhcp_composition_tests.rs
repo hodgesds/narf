@@ -648,6 +648,7 @@ impl Guard {
             source,
             generation: Arc::new(AtomicU64::new(0)),
             quarantined: AtomicBool::new(false),
+            suspended: AtomicBool::new(false),
             admission: IrqSafeSpinLock::new(()),
             mac: OWN,
             irq_vector: None,
@@ -983,6 +984,101 @@ fn smoke_sc_open_native_association_dhcp_ip() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/iwlwifi/dhcp",
     smoke_sc_open_native_association_dhcp_ip
+);
+/// Non-WoWLAN system suspend leaves the BSS through the ordinary
+/// disconnect owner, stops the transport and keeps the netdev closed until
+/// resume restarts firmware and replays the runtime configuration.
+fn suspend_resume() -> R {
+    let guard = Guard::new(false, Fault::None)?;
+    let device = guard.device();
+    scan(device)?;
+    run(
+        device.associate_in_domain(request(false), &policy()),
+        service,
+    )?
+    .map_err(|_| "Sc suspend setup association")?;
+    carrier(device, true)?;
+    run(device.system_resume(), service)?.map_err(|_| "Sc resume without suspend")?;
+    carrier(device, true)?;
+    run(device.system_suspend(), service)?.map_err(|_| "Sc system suspend failed")?;
+    carrier(device, false)?;
+    {
+        let state = device.state.try_lock().ok_or("Sc suspend retained state")?;
+        require(
+            state.needs_reset
+                && state.connection.is_none()
+                && state.hardware.is_failed()
+                && model::retained(&state.hardware) == (0, 0, 0)
+                && device.suspended.load(Ordering::Acquire),
+            "Sc suspend did not retire the station and stop the transport",
+        )?;
+    }
+    let uplink = udp_ipv4(
+        AP,
+        OWN,
+        NETWORK.lease_ip,
+        NETWORK.server_ip,
+        49152,
+        7,
+        b"suspended",
+    );
+    require(
+        narf_net::iface::send_on(device.name(), &uplink).is_err(),
+        "Sc suspended netdev admitted data",
+    )?;
+    run(device.system_suspend(), service)?.map_err(|_| "Sc repeated suspend")?;
+    let before = HARNESS
+        .lock()
+        .as_ref()
+        .unwrap()
+        .1
+        .commands
+        .iter()
+        .filter(|(g, c, _)| *g == 0xc && *c == 2)
+        .count();
+    run(device.system_resume(), service)?.map_err(|_| "Sc system resume failed")?;
+    {
+        let state = device.state.try_lock().ok_or("Sc resume retained state")?;
+        require(
+            !state.needs_reset
+                && !state.hardware.is_failed()
+                && !device.suspended.load(Ordering::Acquire),
+            "Sc resume did not restart the transport",
+        )?;
+    }
+    {
+        let mut slot = HARNESS.lock();
+        let wire = &mut slot.as_mut().unwrap().1;
+        require(
+            wire.commands
+                .iter()
+                .filter(|(g, c, _)| *g == 0xc && *c == 2)
+                .count()
+                == before + 1,
+            "Sc resume did not replay actual NVM",
+        )?;
+        wire.ap = FakeAp::open(NETWORK, SSID, 6, 7).map_err(|_| "Sc AP restart")?;
+        wire.server = DhcpServer::new(NETWORK);
+    }
+    scan(device)?;
+    run(
+        device.associate_in_domain(request(false), &policy()),
+        service,
+    )?
+    .map_err(|_| "Sc association after resume failed")?;
+    carrier(device, true)?;
+    let lease = narf_net::dhcp::dhcp_acquire(device.name(), 0)
+        .map_err(|_| "Sc DHCP after resume failed")?;
+    require(NETWORK.matches_lease(&lease), "Sc lease after resume")?;
+    run(device.disassociate(), service)?.map_err(|_| "Sc disconnect after resume")?;
+    Ok(())
+}
+fn smoke_sc_system_suspend_leaves_bss_and_resume_restarts() -> TestResult {
+    check(suspend_resume)
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/dhcp",
+    smoke_sc_system_suspend_leaves_bss_and_resume_restarts
 );
 fn smoke_sc_wpa2_native_association_dhcp_ip() -> TestResult {
     check(|| composition(true))

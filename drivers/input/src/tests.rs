@@ -71,6 +71,258 @@ fn smoke_i8042_modifier_tracking() -> TestResult {
 }
 kernel_test_in!("drivers/input", smoke_i8042_modifier_tracking);
 
+/// Pop the next global-ring event, expecting a key event for
+/// `want` with pressed state `pressed`. Shared by the i8042 E0/E1
+/// smokes below.
+fn i8042_expect_key(want: narf_input::KeyCode, pressed: bool) -> bool {
+    use narf_input::{pop_global, InputEvent};
+    matches!(
+        pop_global(),
+        Some(InputEvent::Key(k)) if k.code == want && k.pressed == pressed
+    )
+}
+
+fn smoke_i8042_e0_navigation_cluster() -> TestResult {
+    // E0-prefixed navigation cluster, scancode set 1 (IBM PS/2
+    // set-1 table): Home E0 47, Insert E0 52, Delete E0 53,
+    // End E0 4F, PageUp E0 49, PageDown E0 51. Break = the make
+    // code | 0x80 behind a fresh E0 prefix. All of these decoded
+    // to Unknown before the E0 table was completed.
+    use crate::i8042;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, KeyCode};
+
+    init_global_ring(32);
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+
+    let cases: [(u8, KeyCode); 6] = [
+        (0x47, KeyCode::Home),
+        (0x52, KeyCode::Insert),
+        (0x53, KeyCode::Delete),
+        (0x4F, KeyCode::End),
+        (0x49, KeyCode::PageUp),
+        (0x51, KeyCode::PageDown),
+    ];
+    for (make, want) in cases {
+        i8042::feed_bytes_for_test(&[0xE0, make, 0xE0, make | 0x80]);
+        if !i8042_expect_key(want, true) {
+            return TestResult::Fail("E0 navigation press decoded wrong");
+        }
+        if !i8042_expect_key(want, false) {
+            return TestResult::Fail("E0 navigation release decoded wrong");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_e0_navigation_cluster);
+
+fn smoke_i8042_e0_original_six_regression() -> TestResult {
+    // The six E0 keys that already decoded before the table was
+    // completed must not regress: RightCtrl E0 1D, RightAlt E0 38,
+    // Up E0 48, Left E0 4B, Right E0 4D, Down E0 50.
+    use crate::i8042;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, KeyCode};
+
+    init_global_ring(32);
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+
+    let cases: [(u8, KeyCode); 6] = [
+        (0x1D, KeyCode::RightCtrl),
+        (0x38, KeyCode::RightAlt),
+        (0x48, KeyCode::Up),
+        (0x4B, KeyCode::Left),
+        (0x4D, KeyCode::Right),
+        (0x50, KeyCode::Down),
+    ];
+    for (make, want) in cases {
+        i8042::feed_bytes_for_test(&[0xE0, make, 0xE0, make | 0x80]);
+        if !i8042_expect_key(want, true) {
+            return TestResult::Fail("original E0 press regressed");
+        }
+        if !i8042_expect_key(want, false) {
+            return TestResult::Fail("original E0 release regressed");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_e0_original_six_regression);
+
+fn smoke_i8042_e0_keypad_and_meta_keys() -> TestResult {
+    // Remaining set-1 E0 keys: keypad Enter E0 1C, keypad Divide
+    // E0 35, LeftMeta E0 5B, RightMeta E0 5C, Menu E0 5D.
+    use crate::i8042;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, KeyCode};
+
+    init_global_ring(32);
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+
+    let cases: [(u8, KeyCode); 5] = [
+        (0x1C, KeyCode::KpEnter),
+        (0x35, KeyCode::KpSlash),
+        (0x5B, KeyCode::LeftMeta),
+        (0x5C, KeyCode::RightMeta),
+        (0x5D, KeyCode::Menu),
+    ];
+    for (make, want) in cases {
+        i8042::feed_bytes_for_test(&[0xE0, make, 0xE0, make | 0x80]);
+        if !i8042_expect_key(want, true) {
+            return TestResult::Fail("E0 keypad/meta press decoded wrong");
+        }
+        if !i8042_expect_key(want, false) {
+            return TestResult::Fail("E0 keypad/meta release decoded wrong");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_e0_keypad_and_meta_keys);
+
+fn smoke_i8042_print_screen_wire_frame() -> TestResult {
+    // Print Screen's set-1 wire frame, byte-for-byte per the IBM
+    // set-1 table: make = E0 2A E0 37, break = E0 B7 E0 AA. The
+    // 2A/AA pair is the keyboard's "fake shift" wrapper, NOT a
+    // LeftShift keystroke: the whole frame must yield exactly one
+    // SysRq press and one SysRq release, nothing else.
+    use crate::i8042;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global, KeyCode};
+
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+
+    i8042::feed_bytes_for_test(&[0xE0, 0x2A, 0xE0, 0x37]);
+    if !i8042_expect_key(KeyCode::SysRq, true) {
+        return TestResult::Fail("Print Screen make did not yield SysRq press");
+    }
+    if pop_global().is_some() {
+        return TestResult::Fail("Print Screen make leaked extra events (fake shift)");
+    }
+    i8042::feed_bytes_for_test(&[0xE0, 0xB7, 0xE0, 0xAA]);
+    if !i8042_expect_key(KeyCode::SysRq, false) {
+        return TestResult::Fail("Print Screen break did not yield SysRq release");
+    }
+    if pop_global().is_some() {
+        return TestResult::Fail("Print Screen break leaked extra events (fake shift)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_print_screen_wire_frame);
+
+fn smoke_i8042_e0_prefix_changes_meaning() -> TestResult {
+    // Masking-defeating: these make codes mean one key plain and a
+    // different key behind E0. A decoder that consumes the prefix
+    // but then decodes the byte through the plain table (or masks
+    // the prefix away) fails every pair:
+    //   0x47 = Kp7        vs E0 47 = Home
+    //   0x52 = Kp0        vs E0 52 = Insert
+    //   0x37 = KpAsterisk vs E0 37 = Print Screen (SysRq)
+    //   0x1C = Enter      vs E0 1C = keypad Enter
+    //   0x35 = Slash      vs E0 35 = keypad Slash
+    use crate::i8042;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, KeyCode};
+
+    init_global_ring(64);
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+
+    let cases: [(u8, KeyCode, KeyCode); 5] = [
+        (0x47, KeyCode::Kp7, KeyCode::Home),
+        (0x52, KeyCode::Kp0, KeyCode::Insert),
+        (0x37, KeyCode::KpAsterisk, KeyCode::SysRq),
+        (0x1C, KeyCode::Enter, KeyCode::KpEnter),
+        (0x35, KeyCode::Slash, KeyCode::KpSlash),
+    ];
+    for (make, plain, extended) in cases {
+        i8042::feed_bytes_for_test(&[make, make | 0x80, 0xE0, make, 0xE0, make | 0x80]);
+        if !i8042_expect_key(plain, true) || !i8042_expect_key(plain, false) {
+            return TestResult::Fail("plain keypad decode changed by E0 work");
+        }
+        if !i8042_expect_key(extended, true) || !i8042_expect_key(extended, false) {
+            return TestResult::Fail("E0 decode fell through to the plain table");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_e0_prefix_changes_meaning);
+
+fn smoke_i8042_e1_pause_frame() -> TestResult {
+    // Pause's set-1 frame is a single six-byte sequence with no
+    // separate break code: E1 1D 45 E1 9D C5 (IBM set-1 table).
+    // Expect exactly a Pause press (when the 45 lands) and a Pause
+    // release (when the C5 lands) — and in particular no RightCtrl
+    // event from the frame's 1D byte, which is what the old
+    // E1-unaware path emitted.
+    use crate::i8042;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global, KeyCode};
+
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+
+    i8042::feed_bytes_for_test(&[0xE1, 0x1D, 0x45, 0xE1, 0x9D, 0xC5]);
+    if !i8042_expect_key(KeyCode::Pause, true) {
+        return TestResult::Fail("Pause frame did not yield Pause press");
+    }
+    if !i8042_expect_key(KeyCode::Pause, false) {
+        return TestResult::Fail("Pause frame did not yield Pause release");
+    }
+    if pop_global().is_some() {
+        return TestResult::Fail("Pause frame leaked extra events");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_e1_pause_frame);
+
+fn smoke_i8042_e1_resynchronizes_without_stuck_keys() -> TestResult {
+    use crate::i8042;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global, KeyCode};
+
+    init_global_ring(16);
+    // An aborted prefix must not swallow the following A make/break.
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+    i8042::feed_bytes_for_test(&[0xE1, 0x1D, 0x1E, 0x9E]);
+    if !i8042_expect_key(KeyCode::A, true)
+        || !i8042_expect_key(KeyCode::A, false)
+        || pop_global().is_some()
+    {
+        return TestResult::Fail("aborted E1 prefix swallowed or contaminated the next key");
+    }
+
+    // If Pause was already reported, a malformed tail must release it
+    // before retrying the mismatching byte as an ordinary key.
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+    i8042::feed_bytes_for_test(&[0xE1, 0x1D, 0x45, 0x1E, 0x9E]);
+    if !i8042_expect_key(KeyCode::Pause, true)
+        || !i8042_expect_key(KeyCode::Pause, false)
+        || !i8042_expect_key(KeyCode::A, true)
+        || !i8042_expect_key(KeyCode::A, false)
+        || pop_global().is_some()
+    {
+        return TestResult::Fail("aborted E1 tail left Pause pressed or swallowed the next key");
+    }
+
+    // A prior incomplete E0 prefix must not survive a complete E1 frame.
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+    i8042::feed_bytes_for_test(&[0xE0, 0xE1, 0x1D, 0x45, 0xE1, 0x9D, 0xC5, 0x1E, 0x9E]);
+    if !i8042_expect_key(KeyCode::Pause, true)
+        || !i8042_expect_key(KeyCode::Pause, false)
+        || !i8042_expect_key(KeyCode::A, true)
+        || !i8042_expect_key(KeyCode::A, false)
+        || pop_global().is_some()
+    {
+        return TestResult::Fail("E0 latch leaked across an E1 Pause frame");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_e1_resynchronizes_without_stuck_keys
+);
+
 fn smoke_i8042_mouse_packet_decode() -> TestResult {
     use crate::i8042_mouse;
     use narf_input::{
@@ -952,6 +1204,51 @@ mod i2c_hid_smokes {
     kernel_test_in!(
         "drivers/input/i2c-hid",
         smoke_i2c_hid_read_descriptor_emits_register_then_read
+    );
+
+    fn smoke_i2c_hid_set_output_report_framing() -> TestResult {
+        let bus = Arc::new(MockBus::new());
+        bus.stage_read(make_descriptor_bytes());
+        let bus_dyn: Arc<dyn I2cBus> = bus.clone();
+        let mut drv = I2cHidDriver::new(bus_dyn, 0x2c, 0x0001);
+        let bus_for_check = bus.clone();
+        run_async(async move {
+            if drv.read_descriptor().await.is_err() {
+                return TestResult::Fail("descriptor read failed");
+            }
+            // Keyboard LED body: Num+Scroll lit = 0x05 (HID usage
+            // order), report ID 0.
+            if drv.set_output_report(0, &[0x05]).await.is_err() {
+                return TestResult::Fail("set_output_report errored");
+            }
+            // The Feature form shares the framing (refactor guard).
+            if drv.set_feature_report(0, &[0x05]).await.is_err() {
+                return TestResult::Fail("set_feature_report errored");
+            }
+            let writes = bus_for_check.writes();
+            if writes.len() != 3 {
+                return TestResult::Fail("expected desc-pointer + 2 report writes");
+            }
+            // SET_REPORT framing (Microsoft HID-over-I2C §7.2):
+            // [cmd reg 0x0005 LE][(type<<4)|report id][opcode 0x03]
+            // [data reg 0x0006 LE][total len = 2+1+1 = 4 LE]
+            // [report id][payload]. Output type = 0x02, Feature = 0x03.
+            let expect_output: Vec<u8> =
+                alloc::vec![0x05, 0x00, 0x20, 0x03, 0x06, 0x00, 0x04, 0x00, 0x00, 0x05];
+            let expect_feature: Vec<u8> =
+                alloc::vec![0x05, 0x00, 0x30, 0x03, 0x06, 0x00, 0x04, 0x00, 0x00, 0x05];
+            if writes[1] != expect_output {
+                return TestResult::Fail("SET_REPORT (Output) frame bytes wrong");
+            }
+            if writes[2] != expect_feature {
+                return TestResult::Fail("SET_REPORT (Feature) frame bytes wrong");
+            }
+            TestResult::Pass
+        })
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_i2c_hid_set_output_report_framing
     );
 
     fn smoke_i2c_hid_reset_writes_command_then_polls_input() -> TestResult {
@@ -3429,3 +3726,236 @@ mod i2c_hid_keyboard_smokes {
     }
     kernel_test_in!("drivers/input/i2c-hid-kbd", smoke_keyboard_consumer_diff);
 }
+
+// ── i8042 keyboard LED output (issue #768) ────────────────────────
+// The Set-LEDs exchange (0xED + data byte, ACK after each) is
+// driven through `feed_bytes_for_test`, the same byte path the IRQ
+// handler uses; `__led_tx_log_for_test` records every byte the
+// driver wrote, so the wire conversation is pinned byte-for-byte
+// with no port I/O (init() never runs in the harness, so
+// `led_write_byte` records without touching 0x60).
+
+fn smoke_i8042_ps2_led_byte_mapping() -> TestResult {
+    use crate::i8042::ps2_led_byte;
+    use narf_input::evdev::led;
+    // Core bitmap is Linux EV_LED order (Num=bit0, Caps=bit1,
+    // Scroll=bit2); the PS/2 data byte is Scroll=bit0, Num=bit1,
+    // Caps=bit2 (IBM PS/2 Tech Ref; Linux atkbd_set_leds).
+    if ps2_led_byte(0) != 0x00 {
+        return TestResult::Fail("no LEDs must encode as 0x00");
+    }
+    if ps2_led_byte(1 << led::LED_NUML) != 0x02 {
+        return TestResult::Fail("Num Lock must map to PS/2 bit1 (0x02)");
+    }
+    if ps2_led_byte(1 << led::LED_CAPSL) != 0x04 {
+        return TestResult::Fail("Caps Lock must map to PS/2 bit2 (0x04)");
+    }
+    if ps2_led_byte(1 << led::LED_SCROLLL) != 0x01 {
+        return TestResult::Fail("Scroll Lock must map to PS/2 bit0 (0x01)");
+    }
+    if ps2_led_byte(0b111) != 0x07 {
+        return TestResult::Fail("all three locks must encode as 0x07");
+    }
+    // Masking-defeating: LEDs with no PS/2 representation (and every
+    // other core bit) must not leak into the data byte.
+    if ps2_led_byte(u16::MAX) != 0x07 {
+        return TestResult::Fail("unrelated core bits leaked into the PS/2 byte");
+    }
+    if ps2_led_byte((1 << led::LED_MAIL) | (1 << led::LED_CAPSL)) != 0x04 {
+        return TestResult::Fail("LED_MAIL must be masked out, CAPSL kept");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_ps2_led_byte_mapping);
+
+fn smoke_i8042_led_exchange_ack_flow() -> TestResult {
+    use crate::i8042;
+    use narf_input::evdev::led;
+    i8042::__reset_for_test();
+
+    // Sink fires (core state: Caps Lock on) → command byte only.
+    i8042::on_led_state(1 << led::LED_CAPSL);
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED] {
+        return TestResult::Fail("exchange must start with exactly [0xED]");
+    }
+    if i8042::__led_tx_idle_for_test() {
+        return TestResult::Fail("exchange must be in flight after 0xED");
+    }
+    // Keyboard ACKs the command → data byte for CAPSL (PS/2 bit2).
+    i8042::feed_bytes_for_test(&[0xFA]);
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED, 0x04] {
+        return TestResult::Fail("ACK of 0xED must produce data byte 0x04");
+    }
+    // Keyboard ACKs the data byte → exchange complete, no more writes.
+    i8042::feed_bytes_for_test(&[0xFA]);
+    if !i8042::__led_tx_idle_for_test() {
+        return TestResult::Fail("exchange must be idle after the data ACK");
+    }
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED, 0x04] {
+        return TestResult::Fail("no further bytes may be written after completion");
+    }
+    i8042::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_led_exchange_ack_flow);
+
+fn smoke_i8042_led_exchange_resend_paths() -> TestResult {
+    use crate::i8042;
+    use narf_input::evdev::led;
+    i8042::__reset_for_test();
+
+    // RESEND of the command byte: 0xED is retransmitted.
+    i8042::on_led_state(1 << led::LED_NUML);
+    i8042::feed_bytes_for_test(&[0xFE]);
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED, 0xED] {
+        return TestResult::Fail("RESEND of 0xED must retransmit 0xED");
+    }
+    i8042::feed_bytes_for_test(&[0xFA]);
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED, 0xED, 0x02] {
+        return TestResult::Fail("ACK after RESEND must produce the data byte 0x02");
+    }
+    // RESEND of the data byte: the data byte is retransmitted.
+    i8042::feed_bytes_for_test(&[0xFE]);
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED, 0xED, 0x02, 0x02] {
+        return TestResult::Fail("RESEND of the data byte must retransmit it");
+    }
+    i8042::feed_bytes_for_test(&[0xFA]);
+    if !i8042::__led_tx_idle_for_test() {
+        return TestResult::Fail("exchange must complete after the final ACK");
+    }
+
+    // RESEND exhaustion: after 3 retransmissions the next RESEND
+    // aborts the exchange (no fourth retransmit, machine idle).
+    i8042::__reset_for_test();
+    i8042::on_led_state(1 << led::LED_CAPSL);
+    i8042::feed_bytes_for_test(&[0xFE, 0xFE, 0xFE]);
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED, 0xED, 0xED, 0xED] {
+        return TestResult::Fail("expected 1 + 3 retransmissions of 0xED");
+    }
+    i8042::feed_bytes_for_test(&[0xFE]);
+    if !i8042::__led_tx_idle_for_test() {
+        return TestResult::Fail("exhausted RESEND budget must abort the exchange");
+    }
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED, 0xED, 0xED, 0xED] {
+        return TestResult::Fail("no byte may be written after the abort");
+    }
+    i8042::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_led_exchange_resend_paths);
+
+fn smoke_i8042_led_exchange_aborts_on_scancode() -> TestResult {
+    use crate::i8042;
+    use narf_input::evdev::led;
+    use narf_input::{
+        __reset_global_ring_for_test, init_global_ring, pop_global, InputEvent, KeyCode,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+
+    // Mid-exchange, a real scancode arrives (keyboard never ACKed).
+    // The byte must NOT be consumed by the LED protocol: it decodes
+    // as a key, and the exchange aborts.
+    i8042::on_led_state(1 << led::LED_CAPSL);
+    i8042::feed_bytes_for_test(&[0x1E]); // 'A' make
+    if !i8042::__led_tx_idle_for_test() {
+        return TestResult::Fail("a scancode mid-exchange must abort the exchange");
+    }
+    match pop_global() {
+        Some(InputEvent::Key(k)) if k.code == KeyCode::A && k.pressed => {}
+        _ => return TestResult::Fail("the scancode byte was swallowed by the LED exchange"),
+    }
+    // A fresh state change starts a clean new exchange afterwards.
+    i8042::on_led_state(1 << led::LED_NUML);
+    i8042::feed_bytes_for_test(&[0xFA, 0xFA]);
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED, 0xED, 0x02] {
+        return TestResult::Fail("post-abort exchange must run cleanly");
+    }
+    if !i8042::__led_tx_idle_for_test() {
+        return TestResult::Fail("post-abort exchange must complete");
+    }
+    i8042::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_led_exchange_aborts_on_scancode);
+
+fn smoke_i8042_led_exchange_tracks_midflight_change() -> TestResult {
+    use crate::i8042;
+    use narf_input::evdev::led;
+    i8042::__reset_for_test();
+
+    let caps_only = 1 << led::LED_CAPSL;
+    let caps_num = caps_only | (1 << led::LED_NUML);
+    let num_only = 1 << led::LED_NUML;
+
+    i8042::on_led_state(caps_only);
+    // State moves before the command is even ACKed: the data byte
+    // must carry the NEWEST bitmap (Num+Caps → PS/2 0x06).
+    i8042::on_led_state(caps_num);
+    i8042::feed_bytes_for_test(&[0xFA]);
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED, 0x06] {
+        return TestResult::Fail("data byte must encode the newest bitmap (0x06)");
+    }
+    // State moves again while the data byte is in flight: on
+    // completion a follow-up exchange starts automatically and
+    // delivers Num-only (PS/2 0x02).
+    i8042::on_led_state(num_only);
+    i8042::feed_bytes_for_test(&[0xFA]);
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED, 0x06, 0xED] {
+        return TestResult::Fail("mid-flight change must queue a follow-up exchange");
+    }
+    i8042::feed_bytes_for_test(&[0xFA, 0xFA]);
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED, 0x06, 0xED, 0x02] {
+        return TestResult::Fail("follow-up exchange must deliver 0x02");
+    }
+    if !i8042::__led_tx_idle_for_test() {
+        return TestResult::Fail("all exchanges must be complete at the end");
+    }
+    i8042::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_led_exchange_tracks_midflight_change
+);
+
+fn smoke_i8042_led_sink_wired_from_core_dispatch() -> TestResult {
+    use crate::i8042;
+    use narf_input::evdev::{key, led, DeviceCaps, EvdevEvent, EventType, ROUTER};
+    i8042::__reset_for_test();
+
+    // A node wired exactly as init() wires the real keyboard:
+    // LED caps + the i8042 sink. A CapsLock press dispatched at the
+    // node must start the wire exchange end-to-end.
+    let mut caps = DeviceCaps::new();
+    caps.add_key(key::KEY_CAPSLOCK);
+    caps.add_led(led::LED_NUML);
+    caps.add_led(led::LED_CAPSL);
+    caps.add_led(led::LED_SCROLLL);
+    let (id, node) = ROUTER.register_device(caps);
+    node.set_led_sink(i8042::on_led_state);
+    node.dispatch(EvdevEvent {
+        time: 0,
+        type_: EventType::Key,
+        code: key::KEY_CAPSLOCK,
+        value: 1,
+    });
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED] {
+        return TestResult::Fail("core dispatch did not start the LED exchange");
+    }
+    i8042::feed_bytes_for_test(&[0xFA, 0xFA]);
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED, 0x04] {
+        return TestResult::Fail("end-to-end exchange must deliver CAPSL byte 0x04");
+    }
+    if !i8042::__led_tx_idle_for_test() {
+        return TestResult::Fail("end-to-end exchange must complete");
+    }
+    ROUTER.unregister_device(id);
+    i8042::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_led_sink_wired_from_core_dispatch
+);

@@ -56,12 +56,23 @@ pub enum ProvisionState {
     Ready = 2,
     Failed = 3,
 }
+/// The published station generation of the retained BCM43602 owner.
+pub(super) type PcieGeneration = crate::cyw43439::interface::generation::Generation<
+    super::station_transport::Adapter<PcieBackplane>,
+>;
 struct Bootstrap {
+    /// Held across the whole provisioning attempt (boot through station
+    /// publication) so removal waits for it and then sees its result.
     parked: Mutex<Option<PcieBackplane>>,
     state: AtomicU8,
     chip: u16,
     revision: u8,
+    /// `bus_if->removing`: set by [`remove`]; no later attempt may start.
+    removed: core::sync::atomic::AtomicBool,
+    generation: IrqSafeSpinLock<Option<Arc<PcieGeneration>>>,
 }
+/// Interface name of the last published generation, kept for a rebind.
+static LAST_NAME: IrqSafeSpinLock<Option<&'static str>> = IrqSafeSpinLock::new(None);
 static BOOTSTRAP: IrqSafeSpinLock<Option<Arc<Bootstrap>>> = IrqSafeSpinLock::new(None);
 struct Attempt<'a>(&'a AtomicU8);
 impl Drop for Attempt<'_> {
@@ -129,6 +140,8 @@ pub(super) fn start(device: &mut BrcmfmacDevice) {
         state: AtomicU8::new(ProvisionState::Parked as u8),
         chip: device.chip.id,
         revision: device.chip.revision,
+        removed: core::sync::atomic::AtomicBool::new(false),
+        generation: IrqSafeSpinLock::new(None),
     });
     *BOOTSTRAP.lock() = Some(owner);
     narf_scheduler::spawn(async {
@@ -179,46 +192,20 @@ async fn provision_checked(
     if owner.state.load(Ordering::Acquire) != ProvisionState::Parked as u8 {
         return Err("BCM43602 provisioning already attempted");
     }
+    if owner.removed.load(Ordering::Acquire) {
+        return Err("BCM43602 owner removed");
+    }
     let bus = slot.as_ref().ok_or("parked BCM43602 owner unavailable")?;
     let pci = identity(&bus.device);
     let explicit = selected_profile(&bus.device);
-    let selection = if explicit.is_none() {
-        let host = narf_drivers_sdio::pio::HostIdentity {
-            address: bus.device.addr,
-            id: bus.device.id,
-        };
-        Some(
-            super::provision::select_using(
-                authority,
-                manifest,
-                super::provision::Family::Pcie43602,
-                host,
-                None,
-            )
-            .map_err(|_| "signed BCM43602 board selection unavailable or mismatched")?,
-        )
-    } else {
-        None
+    let retained = Reprovision {
+        authority: *authority,
+        manifest: alloc::string::String::from(manifest),
+        explicit,
+        chip: owner.chip,
+        revision: owner.revision,
     };
-    let assets = if let Some(profile) = explicit {
-        if profile.chip != owner.chip
-            || owner.revision >= 16
-            || profile.revision_mask & (1 << owner.revision) == 0
-        {
-            return Err("explicit BCM43602 chip/revision mismatch");
-        }
-        super::provision::trusted_assets_using(authority, profile.firmware, profile.nvram)
-            .map_err(|_| "board-selected firmware/signed NVRAM unavailable")?
-    } else {
-        let selection = selection.as_ref().unwrap();
-        if !selection.admits_chip(owner.chip, owner.revision) {
-            return Err("BCM43602 discovered chip/revision mismatch");
-        }
-        selection
-            .load_using(authority)
-            .map_err(|_| "selected BCM43602 asset signature/key/length/hash mismatch")?
-    };
-    let nvram = boot::pack_nvram(&assets.nvram).map_err(|_| "invalid selected BCM43602 NVRAM")?;
+    let (assets, selection, nvram) = retained.load(&bus.device)?;
     policy()?;
     assets
         .proof
@@ -247,16 +234,165 @@ async fn provision_checked(
         .enable_data()
         .map_err(|_| "RX buffer posting failed")?;
     let adapter = super::station_transport::Adapter::new(runtime)
-        .map_err(|_| "station transport setup failed")?;
-    drop(slot);
-    let name = narf_net::iface::reserve_name("wlan%d");
-    crate::cyw43439::interface::attach_runtime(name, adapter, &[])
+        .map_err(|_| "station transport setup failed")?
+        .with_reboot(alloc::boxed::Box::new(retained));
+    // A function removed and probed again reclaims its retired netdev.
+    let name = LAST_NAME
+        .lock()
+        .and_then(narf_net::iface::rebind_name)
+        .unwrap_or_else(|| narf_net::iface::reserve_name("wlan%d"));
+    let device = crate::cyw43439::interface::attach_runtime(name, adapter, &[])
         .await
         .map_err(|_| "BCM43602 station attachment failed")?;
+    *LAST_NAME.lock() = Some(name);
+    let generation = Arc::new(PcieGeneration::with_publisher(
+        device,
+        alloc::boxed::Box::new(|name, adapter| {
+            alloc::boxed::Box::pin(crate::cyw43439::interface::attach_runtime(
+                name,
+                adapter,
+                &[],
+            ))
+        }),
+    ));
+    *owner.generation.lock() = Some(generation.clone());
+    // brcmf_fw_crashed -> brcmf_pcie_reset, as a supervised generation swap.
+    narf_scheduler::spawn(generation.supervise());
     owner
         .state
         .store(ProvisionState::Ready as u8, Ordering::Release);
+    // The parked slot stays locked until the generation is installed, so a
+    // concurrent `remove` tears down exactly this published shell.
+    drop(slot);
     Ok(())
+}
+/// System resume for the published BCM43602 generation, if any: hot
+/// D0_INFORM resume or, when the dongle lost power, the cold-resume
+/// generation swap (`Generation::resume`). `None` when no generation exists.
+pub(super) async fn resume() -> Option<Result<(), crate::cyw43439::runtime::Error>> {
+    let generation = BOOTSTRAP
+        .lock()
+        .clone()
+        .and_then(|owner| owner.generation.lock().clone())?;
+    Some(generation.resume().await)
+}
+/// Retained signed firmware/NVRAM selection authority of the owner. Every
+/// (re)boot re-runs `select_using`/`load_using` (or the explicit board's
+/// `trusted_assets_using`), so a revoked or replaced asset refuses the
+/// reboot instead of reusing stale bytes.
+struct Reprovision {
+    authority: narf_capabilities::Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
+    manifest: alloc::string::String,
+    explicit: Option<BoardProfile>,
+    chip: u16,
+    revision: u8,
+}
+impl Reprovision {
+    fn load(
+        &self,
+        device: &narf_bus::BusDevice,
+    ) -> Result<
+        (
+            super::provision::Assets,
+            Option<super::provision::Selection>,
+            Vec<u8>,
+        ),
+        &'static str,
+    > {
+        let authority = &self.authority;
+        let selection = if self.explicit.is_none() {
+            let host = narf_drivers_sdio::pio::HostIdentity {
+                address: device.addr,
+                id: device.id,
+            };
+            Some(
+                super::provision::select_using(
+                    authority,
+                    &self.manifest,
+                    super::provision::Family::Pcie43602,
+                    host,
+                    None,
+                )
+                .map_err(|_| "signed BCM43602 board selection unavailable or mismatched")?,
+            )
+        } else {
+            None
+        };
+        let assets = if let Some(profile) = self.explicit {
+            if profile.chip != self.chip
+                || self.revision >= 16
+                || profile.revision_mask & (1 << self.revision) == 0
+            {
+                return Err("explicit BCM43602 chip/revision mismatch");
+            }
+            super::provision::trusted_assets_using(authority, profile.firmware, profile.nvram)
+                .map_err(|_| "board-selected firmware/signed NVRAM unavailable")?
+        } else {
+            let selection = selection.as_ref().unwrap();
+            if !selection.admits_chip(self.chip, self.revision) {
+                return Err("BCM43602 discovered chip/revision mismatch");
+            }
+            selection
+                .load_using(authority)
+                .map_err(|_| "selected BCM43602 asset signature/key/length/hash mismatch")?
+        };
+        let nvram =
+            boot::pack_nvram(&assets.nvram).map_err(|_| "invalid selected BCM43602 NVRAM")?;
+        Ok((assets, selection, nvram))
+    }
+}
+impl super::station_transport::Reboot<PcieBackplane> for Reprovision {
+    fn boot(
+        &mut self,
+        mut bus: PcieBackplane,
+    ) -> Result<runtime::Runtime<PcieBackplane>, (runtime::Error, Option<PcieBackplane>)> {
+        let pci = identity(&bus.device);
+        let (assets, selection, nvram) = match self.load(&bus.device) {
+            Ok(loaded) => loaded,
+            Err(_) => return Err((runtime::Error::Access, Some(bus))),
+        };
+        if assets.proof.validate().is_err() {
+            return Err((runtime::Error::Access, Some(bus)));
+        }
+        bus.proof = Some(assets.proof.clone());
+        let claimed = match (self.explicit, selection.as_ref()) {
+            (Some(profile), _) => boot::Cr4::claim(bus, pci, profile),
+            (None, Some(selection)) => boot::Cr4::claim_selected(bus, pci, selection),
+            (None, None) => unreachable!("selection exists without an explicit board"),
+        };
+        let booted = claimed
+            .and_then(|cr4| cr4.boot(&assets.firmware, &nvram))
+            .map_err(|refused| (refused.error.into(), Some(refused.bus)))?;
+        runtime::Runtime::attach(booted).map_err(|error| (error, None))
+    }
+}
+/// Linux v7.2 `pcie.c::brcmf_pcie_remove` for the retained BCM43602 owner:
+/// no later provisioning attempt may start, an in-flight attempt is waited
+/// out, and the published generation is withdrawn, stopped and released.
+/// Returns true when nothing remains mapped: no attempt published DMA, or
+/// the confirmed stop proved it reclaimable. A failed boot attempt or an
+/// unproven stop keeps its mappings pinned.
+pub(super) async fn remove() -> bool {
+    let Some(owner) = BOOTSTRAP.lock().take() else {
+        return true;
+    };
+    owner.removed.store(true, Ordering::Release);
+    let mut parked = owner.parked.lock().await;
+    // Never booted: nothing was published; the bus authority drops here.
+    drop(parked.take());
+    let state = owner.state.load(Ordering::Acquire);
+    let generation = owner.generation.lock().take();
+    let released = match generation {
+        Some(generation) => generation.remove().await.released(),
+        // Starting/Failed without a published generation leaked whatever
+        // the attempt had published (Runtime drop without a proof).
+        None => state == ProvisionState::Parked as u8,
+    };
+    owner
+        .state
+        .store(ProvisionState::Failed as u8, Ordering::Release);
+    drop(parked);
+    released
 }
 /// One serialized production control request. Cancellation makes the owner
 /// terminal while retaining all device-visible addresses and request bytes.
@@ -525,7 +661,60 @@ impl runtime::Bus for PcieBackplane {
         }
         Ok(())
     }
+    fn mailbox(&self) -> Option<runtime::mailbox::Reginfo> {
+        let core = self.pcie_core?;
+        Some(runtime::mailbox::Reginfo::for_core(
+            core.base,
+            core.revision,
+        ))
+    }
+    fn ring_mailbox(&mut self) -> Result<(), runtime::Error> {
+        let core = self.pcie_core.ok_or(runtime::Error::Protocol)?;
+        self.qualified().map_err(|_| runtime::Error::Access)?;
+        barrier();
+        // brcmf_pcie_send_mb_data: SBMBX, repeated as a hardware workaround
+        // on PCIe2 core revisions <= 13.
+        let writes = if core.revision <= 13 { 2 } else { 1 };
+        let cap = self.cap;
+        invoke_registers(&cap, || {
+            for _ in 0..writes {
+                narf_bus::pci::write_config32(&self.cap, &self.device, SBMBX, 1)
+                    .map_err(|_| runtime::Error::Access)?;
+            }
+            Ok(())
+        })
+        .map_err(|_| runtime::Error::Access)?
+    }
+    fn arm_interrupts(&mut self, signal: &Arc<super::irq::Signal>) -> bool {
+        self.qualified().is_ok() && self.arm_msi(signal)
+    }
+    fn disarm_interrupts(&mut self) {
+        self.disarm_msi();
+    }
+    fn link_control(&mut self) -> Result<u32, runtime::Error> {
+        self.qualified().map_err(|_| runtime::Error::Access)?;
+        let cap = self.cap;
+        invoke_registers(&cap, || {
+            narf_bus::pci::read_config32(&self.cap, &self.device, LINK_STATUS_CTRL)
+                .map_err(|_| runtime::Error::Access)
+        })
+        .map_err(|_| runtime::Error::Access)?
+    }
+    fn set_link_control(&mut self, value: u32) -> Result<(), runtime::Error> {
+        self.qualified().map_err(|_| runtime::Error::Access)?;
+        let cap = self.cap;
+        invoke_registers(&cap, || {
+            narf_bus::pci::write_config32(&self.cap, &self.device, LINK_STATUS_CTRL, value)
+                .map_err(|_| runtime::Error::Access)
+        })
+        .map_err(|_| runtime::Error::Access)?
+    }
 }
+/// Linux `BRCMF_PCIE_REG_LINK_STATUS_CTRL`.
+const LINK_STATUS_CTRL: u16 = 0xbc;
+/// Linux `BRCMF_PCIE_REG_SBMBX`: host-to-dongle mailbox doorbell in
+/// configuration space.
+const SBMBX: u16 = 0x98;
 
 /// Transport entry points for the station owner. These do not publish or
 /// authorize a network interface; that requires the station event/key lifecycle.
@@ -637,10 +826,13 @@ mod provision_tests {
                 },
                 cap,
                 pcie_core: None,
+                msi: None,
             })),
             state: AtomicU8::new(ProvisionState::Parked as u8),
             chip: 43602,
             revision: 3,
+            removed: core::sync::atomic::AtomicBool::new(false),
+            generation: IrqSafeSpinLock::new(None),
         };
         for _ in 0..2 {
             if !matches!(

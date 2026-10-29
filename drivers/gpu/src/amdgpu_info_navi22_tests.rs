@@ -403,6 +403,11 @@ kernel_test_in!(
 
 fn navi22_memory_matches_linux_heaps() -> TestResult {
     let usable = VRAM - (8 << 20);
+    let gtt = crate::amdgpu_gem::gtt_limit();
+    let used = crate::amdgpu_gem::gtt_used();
+    if gtt == 0 {
+        return TestResult::Fail("GEM system-memory capacity unavailable");
+    }
     let check = |visible: u64| -> bool {
         let s = Snapshot {
             visible_vram_size: visible,
@@ -419,8 +424,11 @@ fn navi22_memory_matches_linux_heaps() -> TestResult {
             && m.cpu_accessible_vram.total_heap_size == visible
             && m.cpu_accessible_vram.usable_heap_size == cpu
             && m.cpu_accessible_vram.max_allocation == cpu * 3 / 4
-            && m.gtt.total_heap_size == 0
-            && (g.vram_size, g.vram_cpu_accessible_size, g.gtt_size) == (usable, cpu, 0)
+            && m.gtt.total_heap_size == gtt
+            && m.gtt.usable_heap_size == gtt
+            && m.gtt.heap_usage == used
+            && m.gtt.max_allocation == gtt * 3 / 4
+            && (g.vram_size, g.vram_cpu_accessible_size, g.gtt_size) == (usable, cpu, gtt)
     };
     // ReBAR (all 12 GiB visible) and the 256 MiB fallback aperture.
     if !check(VRAM) || !check(256 << 20) {

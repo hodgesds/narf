@@ -1,10 +1,12 @@
 //! aarch64 Software-Generated Interrupts (SGIs).
 //!
-//! GICv3 reserves INTID 0..15 for software-generated IRQs the
-//! kernel uses for inter-processor signalling. The sender writes
-//! `ICC_SGI1R_EL1` with the target affinity + INTID; the receiving
-//! CPU sees the SGI through its normal IRQ entry, ack'd via
-//! `ICC_IAR1_EL1` and EOI'd via `ICC_EOIR1_EL1`.
+//! The GIC reserves INTID 0..15 for software-generated IRQs the
+//! kernel uses for inter-processor signalling. On GICv3 the sender
+//! writes `ICC_SGI1R_EL1` with the target affinity + INTID; on GICv2 it
+//! writes `GICD_SGIR` with a CPU-interface target list. The receiving
+//! CPU sees the SGI through its normal IRQ entry, ack'd and EOI'd via
+//! `super::ack_irq` / `super::eoi_for` (whichever backend
+//! `gic::probe` selected).
 //!
 //! NARF's IPI vector assignments:
 //!
@@ -112,7 +114,7 @@ pub fn install_defaults() {
 /// Caller is in panic state — already accepts that we're tearing
 /// down. The IPI handler on receiving CPUs masks IRQs + halts.
 pub unsafe fn broadcast_panic_halt() {
-    // SAFETY: GICv3 sysreg interface up.
+    // SAFETY: GIC up (caller contract of the panic path).
     unsafe {
         broadcast_others(SGI_PANIC_HALT);
     }
@@ -124,7 +126,7 @@ static RX_COUNT: [[AtomicU64; 16]; narf_lib::percpu::MAX_CPUS] =
     [const { [const { AtomicU64::new(0) }; 16] }; narf_lib::percpu::MAX_CPUS];
 
 /// Per-INTID SGI handler. The handler runs in IRQ context on the
-/// receiving CPU after the trap path has read ICC_IAR1_EL1; it
+/// receiving CPU after the trap path has acknowledged it; it
 /// runs *before* the EOI write so handler-side fences land while
 /// the IRQ is still active.
 pub type SgiHandler = fn();
@@ -176,9 +178,17 @@ pub fn on_sgi(intid: u8) {
 /// Send an SGI to a single CPU identified by its MPIDR affinity.
 ///
 /// # Safety
-/// GICv3 system-register interface must be enabled (it is, post
-/// `gic::init_per_cpu`).
+/// The GIC must be initialised (`gic::init_bsp`) on the sending CPU.
 pub unsafe fn send_to_cpu_aff(intid: u8, target_aff: u32) {
+    if super::gic::is_v2() {
+        // GICv2: target-list filter (0) with the target's interface bit.
+        let mask = super::gic::v2_cpu_mask_for_aff(target_aff);
+        if mask != 0 {
+            // SAFETY: caller contract; GICv2 backend active.
+            unsafe { super::gic::v2_send_sgi(intid, 0, mask) };
+        }
+        return;
+    }
     let intid = (intid as u64) & 0xF;
     // Decompose target affinity bytes.
     let aff0 = (target_aff & 0xFF) as u64;
@@ -203,6 +213,12 @@ pub unsafe fn send_to_cpu_aff(intid: u8, target_aff: u32) {
 /// # Safety
 /// As `send_to_cpu_aff`.
 pub unsafe fn broadcast_others(intid: u8) {
+    if super::gic::is_v2() {
+        // GICv2 TargetListFilter 1: every CPU interface but the sender's.
+        // SAFETY: caller contract; GICv2 backend active.
+        unsafe { super::gic::v2_send_sgi(intid, 1, 0) };
+        return;
+    }
     let intid = (intid as u64) & 0xF;
     // IRM (bit 40) = 1 → all-but-self routing; affinity ignored.
     let val = (intid << 24) | (1u64 << 40);

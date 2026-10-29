@@ -20,6 +20,7 @@ pub(in crate::rtw89) struct QualificationRequest {
     mac: [u8; 6],
     digest: [u8; 32],
     wmm_digest: Option<[u8; 32]>,
+    qos_digest: Option<[u8; 32]>,
 }
 impl QualificationRequest {
     pub(in crate::rtw89) fn version(&self) -> u8 {
@@ -33,6 +34,10 @@ impl QualificationRequest {
     }
     pub(in crate::rtw89) fn wmm_digest(&self) -> Option<[u8; 32]> {
         self.wmm_digest
+    }
+    /// Identity for flags15 (all-AC QoS on top of WMM).
+    pub(in crate::rtw89) fn qos_digest(&self) -> Option<[u8; 32]> {
+        self.qos_digest
     }
     pub(in crate::rtw89) fn name(&self) -> alloc::string::String {
         let m = self.mac;
@@ -71,7 +76,8 @@ impl Native {
             let digest = if full {
                 let power = radio_power::Plan::from_assets(assets, identity.calibration().rfe_type)
                     .map_err(denied)?;
-                radio_policy::Board::new(
+                radio_policy::Board::new_for(
+                    self.lifecycle,
                     factory,
                     self.device.id,
                     assets,
@@ -94,7 +100,8 @@ impl Native {
                         radio_power::Plan::from_assets(assets, identity.calibration().rfe_type)
                             .map_err(denied)?;
                     Some(
-                        radio_policy::Board::new(
+                        radio_policy::Board::new_for(
+                            self.lifecycle,
                             factory,
                             self.device.id,
                             assets,
@@ -108,9 +115,126 @@ impl Native {
                 } else {
                     None
                 },
+                qos_digest: if full {
+                    let power =
+                        radio_power::Plan::from_assets(assets, identity.calibration().rfe_type)
+                            .map_err(denied)?;
+                    Some(
+                        radio_policy::Board::new_for(
+                            self.lifecycle,
+                            factory,
+                            self.device.id,
+                            assets,
+                            &power,
+                            self.firmware_phycap().ok_or(power::Error::Unsupported)?,
+                        )
+                        .map_err(denied)?
+                        .with_programs(radio_policy::Program::QosAll.flags())
+                        .identity(),
+                    )
+                } else {
+                    None
+                },
             })
         })
         .map_err(denied)?
+    }
+    pub(in crate::rtw89) fn station_ht_allowed(&self) -> Result<bool, power::Error> {
+        self.full_radio_scope()
+            .ok_or(power::Error::Unsupported)?
+            .allows(radio_policy::Program::Ht)
+            .map_err(denied)
+    }
+    pub(in crate::rtw89) fn station_he_allowed(&self) -> Result<bool, power::Error> {
+        self.full_radio_scope()
+            .ok_or(power::Error::Unsupported)?
+            .allows(radio_policy::Program::He)
+            .map_err(denied)
+    }
+    /// Track-work register access for the live station (`track.rs`): only
+    /// the listed CCX/DIG/EDCCA/PPDU-status registers, on the prepared
+    /// operating PHY and current ordinary authority.
+    fn track_port(&mut self, address: u32) -> Result<Port<'_>, power::Error> {
+        if !crate::rtw89::track::REGISTERS.contains(&address) {
+            return Err(power::Error::Access);
+        }
+        self.operating_current()?;
+        self.radio_io()
+    }
+    pub(in crate::rtw89) fn station_track_read(
+        &mut self,
+        address: u32,
+    ) -> Result<u32, power::Error> {
+        use power::Io as _;
+        self.track_port(address)?.read32(address)
+    }
+    pub(in crate::rtw89) fn station_track_write(
+        &mut self,
+        address: u32,
+        value: u32,
+    ) -> Result<(), power::Error> {
+        use power::Io as _;
+        self.track_port(address)?.write32(address, value)
+    }
+    pub(in crate::rtw89) fn station_track_profile(
+        &self,
+    ) -> Result<crate::rtw89::track::Profile, power::Error> {
+        self.operating_current()?;
+        let working = self
+            .operating
+            .as_ref()
+            .and_then(|owner| owner.working())
+            .ok_or(power::Error::Unsupported)?;
+        Ok(crate::rtw89::track::Profile {
+            cck_pd: working.cck_pd,
+            crystal_cap: working.crystal_cap,
+            crystal_lower: working.crystal_lower,
+            crystal_upper: working.crystal_upper,
+        })
+    }
+    /// `rtw89_phy_cfo_set_crystal_cap` (B: `xtal_info` NULL): XTAL SI SC_XO
+    /// (0x05) then SC_XI (0x04), full byte masks, then read both back.
+    pub(in crate::rtw89) async fn station_track_crystal(
+        &mut self,
+        cap: u8,
+    ) -> Result<u8, power::Error> {
+        // Linux clamps to 0..=127; the divergence lock bounds the excursion.
+        self.station_track_profile()?;
+        if cap > 0x7f {
+            return Err(power::Error::Access);
+        }
+        let mut port = self.radio_io()?;
+        // SAFETY: the retained exclusive B owner serializes every XTAL SI
+        // transaction (track work runs under the station's retained lock);
+        // Port encloses each access in current ordinary/device authority.
+        unsafe {
+            crate::rtw89::radio_shutdown::xtal_write(&mut port, 0x05, cap, 0xff).await?;
+            crate::rtw89::radio_shutdown::xtal_write(&mut port, 0x04, cap, 0xff).await?;
+            let xo = crate::rtw89::radio_shutdown::xtal_read(&mut port, 0x05).await?;
+            let xi = crate::rtw89::radio_shutdown::xtal_read(&mut port, 0x04).await?;
+            if xo != cap || xi != cap {
+                return Err(power::Error::Terminal);
+            }
+            Ok(xi)
+        }
+    }
+    pub(in crate::rtw89) fn station_ampdu_allowed(&self) -> Result<bool, power::Error> {
+        self.full_radio_scope()
+            .ok_or(power::Error::Unsupported)?
+            .allows(radio_policy::Program::Ampdu)
+            .map_err(denied)
+    }
+    pub(in crate::rtw89) fn station_firmware_ra_allowed(&self) -> Result<bool, power::Error> {
+        self.full_radio_scope()
+            .ok_or(power::Error::Unsupported)?
+            .allows(radio_policy::Program::FirmwareRa)
+            .map_err(denied)
+    }
+    pub(in crate::rtw89) fn station_qos_all_allowed(&self) -> Result<bool, power::Error> {
+        self.full_radio_scope()
+            .ok_or(power::Error::Unsupported)?
+            .allows(radio_policy::Program::QosAll)
+            .map_err(denied)
     }
     pub(in crate::rtw89) fn station_wmm_allowed(&self) -> Result<bool, power::Error> {
         self.full_radio_scope()
@@ -170,7 +294,8 @@ impl Native {
             let plan = radio_power::Plan::from_assets(assets, identity.calibration().rfe_type)
                 .map_err(denied)?;
             let tracking = tssi::Tracking::from_assets(assets).map_err(denied)?;
-            let board = radio_policy::Board::new(
+            let board = radio_policy::Board::new_for(
+                self.lifecycle,
                 factory,
                 self.device.id,
                 assets,
@@ -218,7 +343,8 @@ impl Native {
         let plan = radio_power::Plan::from_assets(assets, identity.calibration().rfe_type)
             .map_err(denied)?;
         let tracking = tssi::Tracking::from_assets(assets).map_err(denied)?;
-        let board = radio_policy::Board::new(
+        let board = radio_policy::Board::new_for(
+            self.lifecycle,
             factory,
             self.device.id,
             assets,

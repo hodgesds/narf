@@ -104,6 +104,7 @@ members = [
     "drivers/input",
     "drivers/graphics",
     "drivers/platform",
+    "drivers/soc/qcom",
     "input",
     "graphics",
     "init",

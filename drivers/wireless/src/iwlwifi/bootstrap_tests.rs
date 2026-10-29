@@ -224,6 +224,18 @@ fn smoke_iwlwifi_mvm_native_discovery_selects_one_exact_api77_image() -> TestRes
             0x10a000,
             "iwlwifi/iwlwifi-QuZ-a0-hr-b0-77.ucode",
         ),
+        (
+            0x3df0,
+            0x351,
+            0x10c000,
+            "iwlwifi/iwlwifi-QuZ-a0-hr-b0-77.ucode",
+        ),
+        (
+            0x06f0,
+            0x332,
+            0x105000,
+            "iwlwifi/iwlwifi-Qu-c0-jf-b0-77.ucode",
+        ),
     ] {
         let mut startup = owner();
         startup.device.id.device = did;

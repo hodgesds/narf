@@ -188,8 +188,65 @@ pub struct SdCard {
     pub capacity_blocks: u64,
 }
 
+/// Register-access seam for the SDHCI register file.
+///
+/// All hardware access goes through this trait: production uses
+/// [`MmioTransport`] over the BAR0 [`MmioRegion`]; kernel-test
+/// fixtures model the register file + card behind the same seam
+/// (the `RtsxTransport` pattern from the sibling RTSX driver), so
+/// the whole identify → publish conversation runs without silicon.
+pub trait SdhciTransport: Send + Sync + core::fmt::Debug {
+    /// Read the 8-bit register at BAR0 `offset`.
+    fn read8(&self, offset: u64) -> u8;
+    /// Read the 16-bit register at BAR0 `offset`.
+    fn read16(&self, offset: u64) -> u16;
+    /// Read the 32-bit register at BAR0 `offset`.
+    fn read32(&self, offset: u64) -> u32;
+    /// Write the 8-bit register at BAR0 `offset`.
+    fn write8(&self, offset: u64, value: u8);
+    /// Write the 16-bit register at BAR0 `offset`.
+    fn write16(&self, offset: u64, value: u16);
+    /// Write the 32-bit register at BAR0 `offset`.
+    fn write32(&self, offset: u64, value: u32);
+}
+
+/// Production [`SdhciTransport`]: the controller's BAR0 MMIO window.
+#[derive(Debug)]
+struct MmioTransport {
+    region: MmioRegion,
+}
+
+impl SdhciTransport for MmioTransport {
+    fn read8(&self, offset: u64) -> u8 {
+        // SAFETY: offsets are the SDHCI register block (§2) inside
+        // the BAR0 window `bring_up` mapped; the controller is
+        // exclusively owned by this driver.
+        unsafe { self.region.read8(offset) }
+    }
+    fn read16(&self, offset: u64) -> u16 {
+        // SAFETY: same as `read8`.
+        unsafe { self.region.read16(offset) }
+    }
+    fn read32(&self, offset: u64) -> u32 {
+        // SAFETY: same as `read8`.
+        unsafe { self.region.read32(offset) }
+    }
+    fn write8(&self, offset: u64, value: u8) {
+        // SAFETY: same as `read8`.
+        unsafe { self.region.write8(offset, value) }
+    }
+    fn write16(&self, offset: u64, value: u16) {
+        // SAFETY: same as `read8`.
+        unsafe { self.region.write16(offset, value) }
+    }
+    fn write32(&self, offset: u64, value: u32) {
+        // SAFETY: same as `read8`.
+        unsafe { self.region.write32(offset, value) }
+    }
+}
+
 pub struct Sdhci {
-    mmio: MmioRegion,
+    io: alloc::sync::Arc<dyn SdhciTransport>,
     pub card: IrqSafeSpinLock<Option<SdCard>>,
     /// Serialises polled SD transfers across callers. Spun on WITHOUT
     /// masking interrupts — see [`crate::req_gate::ReqGate`] for why
@@ -221,7 +278,7 @@ impl Sdhci {
         // SAFETY: caller-asserted.
         let mmio = unsafe { map_bar(device, 0) }.map_err(|_| SdhciError::BarMapFailed)?;
         let me = Sdhci {
-            mmio,
+            io: alloc::sync::Arc::new(MmioTransport { region: mmio }),
             card: IrqSafeSpinLock::new(None),
             req_gate: AtomicBool::new(false),
         };
@@ -256,17 +313,13 @@ impl Sdhci {
         }
 
         // 1. Software reset — Reset All (§3.6).
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            me.mmio.write8(REG_SOFT_RESET, SRST_ALL);
-        }
+        me.io.write8(REG_SOFT_RESET, SRST_ALL);
         // responsive_spin_until ticks sleep_pumps every ~4096 iters
         // so the FB cursor / serial drain stay alive during the
         // reset. SDHCI 4.20 §3.6 says SRST_ALL self-clears within
         // 100 ms on a healthy controller.
         let done = narf_scheduler::responsive_spin_until(
-            // SAFETY: identity-mapped MMIO.
-            || unsafe { me.mmio.read8(REG_SOFT_RESET) } & SRST_ALL == 0,
+            || me.io.read8(REG_SOFT_RESET) & SRST_ALL == 0,
             narf_time::Deadline::after_ms(100),
         );
         if !done {
@@ -274,16 +327,11 @@ impl Sdhci {
         }
 
         // 2. Capabilities snapshot — informational only at this stage.
-        // SAFETY: same.
-        let _caps_lo = unsafe { me.mmio.read32(REG_CAPABILITIES) };
-        // SAFETY: same.
-        let _caps_hi = unsafe { me.mmio.read32(REG_CAPABILITIES + 4) };
+        let _caps_lo = me.io.read32(REG_CAPABILITIES);
+        let _caps_hi = me.io.read32(REG_CAPABILITIES + 4);
 
         // 3. Power-on at 3.3V.
-        // SAFETY: same.
-        unsafe {
-            me.mmio.write8(REG_POWER_CONTROL, POWER_3V3 | POWER_ON);
-        }
+        me.io.write8(REG_POWER_CONTROL, POWER_3V3 | POWER_ON);
 
         // 4. Internal clock enable + supply 400 kHz init clock.
         //    Base clock comes from caps[15:8]; we use a divider that
@@ -292,52 +340,36 @@ impl Sdhci {
         //    for a generous safety margin.
         let div = 0x80u16;
         let clk = ((div & 0xFF) << 8) | ((div >> 8) & 0x3) << 6 | CLK_INTERNAL_EN;
-        // SAFETY: same.
-        unsafe {
-            me.mmio.write16(REG_CLOCK_CONTROL, clk);
-        }
+        me.io.write16(REG_CLOCK_CONTROL, clk);
         // responsive_spin_until keeps cursor/FB/serial alive while
         // waiting for the internal clock to stabilise. SDHCI 4.20
         // §2.2.14 caps stable-bit assertion at 150 ms. Timeout
         // ignored — original code fell through to SD_EN regardless.
         let _ = narf_scheduler::responsive_spin_until(
-            // SAFETY: identity-mapped MMIO.
-            || unsafe { me.mmio.read16(REG_CLOCK_CONTROL) } & CLK_INTERNAL_STABLE != 0,
+            || me.io.read16(REG_CLOCK_CONTROL) & CLK_INTERNAL_STABLE != 0,
             narf_time::Deadline::after_ms(150),
         );
-        // SAFETY: same.
-        let v = unsafe { me.mmio.read16(REG_CLOCK_CONTROL) };
-        // SAFETY: same.
-        unsafe {
-            me.mmio.write16(REG_CLOCK_CONTROL, v | CLK_SD_EN);
-        }
+        let v = me.io.read16(REG_CLOCK_CONTROL);
+        me.io.write16(REG_CLOCK_CONTROL, v | CLK_SD_EN);
 
         // 5. Default DTOCV = 0xE (max timeout).
-        // SAFETY: same.
-        unsafe {
-            me.mmio.write8(REG_TIMEOUT_CTRL, 0x0E);
-        }
+        me.io.write8(REG_TIMEOUT_CTRL, 0x0E);
 
         // 6. Enable normal + error interrupt status reporting (we
         //    poll, but the status bits only set when enabled).
-        // SAFETY: same.
-        unsafe {
-            me.mmio.write16(REG_NORMAL_INT_EN, 0xFFFF);
-            me.mmio.write16(REG_ERROR_INT_EN, 0xFFFF);
-        }
+        me.io.write16(REG_NORMAL_INT_EN, 0xFFFF);
+        me.io.write16(REG_ERROR_INT_EN, 0xFFFF);
 
         // 7. Card-present check.
-        // SAFETY: same.
-        let pstate = unsafe { me.mmio.read32(REG_PRESENT_STATE) };
+        let pstate = me.io.read32(REG_PRESENT_STATE);
         if pstate & PSTATE_CARD_INSERTED == 0 {
             return Err(SdhciError::NoCard);
         }
 
         // 8. Run the SD identification sequence.
-        // SAFETY: `me.mmio` is the identity-mapped SDHCI register window set
-        // up above and `identify_sequence` runs exactly once here at
+        // SAFETY: `me.io` is the SDHCI register window set up above
+        // and `identify_sequence` runs exactly once here at
         // bring-up, satisfying its single-call ownership precondition.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
         let card = unsafe { me.identify_sequence() }?;
         *me.card.lock() = Some(card);
         Ok(me)
@@ -357,8 +389,7 @@ impl Sdhci {
         // in REG_TIMEOUT_CTRL. 1 s is a comfortable upper bound for
         // the longest plausible card response.
         let done = narf_scheduler::responsive_spin_until(
-            // SAFETY: identity-mapped MMIO.
-            || unsafe { self.mmio.read32(REG_PRESENT_STATE) } & mask == 0,
+            || self.io.read32(REG_PRESENT_STATE) & mask == 0,
             narf_time::Deadline::after_ms(1_000),
         );
         if done {
@@ -387,52 +418,36 @@ impl Sdhci {
     ) -> Result<u32, SdhciError> {
         self.wait_idle(has_data)?;
         // Clear status bits (write-1-clear).
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            self.mmio.write16(REG_NORMAL_INT_STS, 0xFFFF);
-            self.mmio.write16(REG_ERROR_INT_STS, 0xFFFF);
-        }
+        self.io.write16(REG_NORMAL_INT_STS, 0xFFFF);
+        self.io.write16(REG_ERROR_INT_STS, 0xFFFF);
         // Program block size / count first when there's data.
         if has_data {
-            // SAFETY: same.
-            unsafe {
-                self.mmio.write16(REG_BLOCK_SIZE, block_size);
-                self.mmio.write16(REG_BLOCK_COUNT, block_cnt);
-                self.mmio.write16(REG_TRANSFER_MODE, transfer);
-            }
+            self.io.write16(REG_BLOCK_SIZE, block_size);
+            self.io.write16(REG_BLOCK_COUNT, block_cnt);
+            self.io.write16(REG_TRANSFER_MODE, transfer);
         }
-        // SAFETY: same.
-        unsafe {
-            self.mmio.write32(REG_ARGUMENT, arg);
-            self.mmio
-                .write16(REG_COMMAND, make_cmd(idx, resp_kind, has_data));
-        }
+        self.io.write32(REG_ARGUMENT, arg);
+        self.io
+            .write16(REG_COMMAND, make_cmd(idx, resp_kind, has_data));
         // Poll for command-complete (or error). responsive_spin_until
         // ticks sleep_pumps so cursor/FB/serial stay alive. 1 s
         // wall-clock budget is comfortably above the longest
         // plausible single-command latency.
         let done = narf_scheduler::responsive_spin_until(
-            // SAFETY: identity-mapped MMIO.
-            || unsafe { self.mmio.read16(REG_NORMAL_INT_STS) } & (NIS_CMD_COMPLETE | NIS_ERROR) != 0,
+            || self.io.read16(REG_NORMAL_INT_STS) & (NIS_CMD_COMPLETE | NIS_ERROR) != 0,
             narf_time::Deadline::after_ms(1_000),
         );
         if !done {
             return Err(SdhciError::CmdTimeout);
         }
-        // SAFETY: identity-mapped MMIO.
-        let nis = unsafe { self.mmio.read16(REG_NORMAL_INT_STS) };
+        let nis = self.io.read16(REG_NORMAL_INT_STS);
         if nis & NIS_ERROR != 0 {
-            // SAFETY: same.
-            let eis = unsafe { self.mmio.read16(REG_ERROR_INT_STS) };
+            let eis = self.io.read16(REG_ERROR_INT_STS);
             return Err(SdhciError::DeviceError(eis));
         }
         // Clear cmd-complete; preserve other bits for the data path.
-        // SAFETY: same.
-        unsafe {
-            self.mmio.write16(REG_NORMAL_INT_STS, NIS_CMD_COMPLETE);
-        }
-        // SAFETY: same.
-        let r0 = unsafe { self.mmio.read32(REG_RESPONSE_0) };
+        self.io.write16(REG_NORMAL_INT_STS, NIS_CMD_COMPLETE);
+        let r0 = self.io.read32(REG_RESPONSE_0);
         Ok(r0)
     }
 
@@ -440,11 +455,9 @@ impl Sdhci {
     fn read_response_136(&self) -> [u32; 4] {
         let mut r = [0u32; 4];
         for (i, slot) in r.iter_mut().enumerate() {
-            // SAFETY: identity-mapped MMIO; `REG_RESPONSE_0 + i*4` for
-            // `i` in 0..4 covers the four contiguous 32-bit response
-            // registers (`R2`/CID/CSD).
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            *slot = unsafe { self.mmio.read32(REG_RESPONSE_0 + (i as u64) * 4) };
+            // `REG_RESPONSE_0 + i*4` for `i` in 0..4 covers the four
+            // contiguous 32-bit response registers (R2 / CID / CSD).
+            *slot = self.io.read32(REG_RESPONSE_0 + (i as u64) * 4);
         }
         r
     }
@@ -536,43 +549,32 @@ impl Sdhci {
         // the FB cursor / serial drain alive on a slow controller.
         // 1 s budget covers the worst plausible read latency.
         let done = narf_scheduler::responsive_spin_until(
-            // SAFETY: identity-mapped MMIO.
-            || unsafe { self.mmio.read16(REG_NORMAL_INT_STS) } & (NIS_BUFFER_READ_READY | NIS_ERROR) != 0,
+            || self.io.read16(REG_NORMAL_INT_STS) & (NIS_BUFFER_READ_READY | NIS_ERROR) != 0,
             narf_time::Deadline::after_ms(1_000),
         );
         if !done {
             return Err(SdhciError::PioStall);
         }
-        // SAFETY: identity-mapped MMIO.
-        let nis = unsafe { self.mmio.read16(REG_NORMAL_INT_STS) };
+        let nis = self.io.read16(REG_NORMAL_INT_STS);
         if nis & NIS_ERROR != 0 {
-            // SAFETY: same.
-            let eis = unsafe { self.mmio.read16(REG_ERROR_INT_STS) };
+            let eis = self.io.read16(REG_ERROR_INT_STS);
             return Err(SdhciError::DeviceError(eis));
         }
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            self.mmio.write16(REG_NORMAL_INT_STS, NIS_BUFFER_READ_READY);
-        }
+        self.io.write16(REG_NORMAL_INT_STS, NIS_BUFFER_READ_READY);
         for i in 0..128usize {
-            // SAFETY: same.
-            let w = unsafe { self.mmio.read32(REG_BUFFER_PORT) };
+            let w = self.io.read32(REG_BUFFER_PORT);
             let bytes = w.to_le_bytes();
             out[i * 4..i * 4 + 4].copy_from_slice(&bytes);
         }
         // Wait for transfer-complete. 1 s wall-clock budget.
         let done = narf_scheduler::responsive_spin_until(
-            // SAFETY: identity-mapped MMIO.
-            || unsafe { self.mmio.read16(REG_NORMAL_INT_STS) } & NIS_TRANSFER_COMPLETE != 0,
+            || self.io.read16(REG_NORMAL_INT_STS) & NIS_TRANSFER_COMPLETE != 0,
             narf_time::Deadline::after_ms(1_000),
         );
         if !done {
             return Err(SdhciError::PioStall);
         }
-        // SAFETY: same.
-        unsafe {
-            self.mmio.write16(REG_NORMAL_INT_STS, NIS_TRANSFER_COMPLETE);
-        }
+        self.io.write16(REG_NORMAL_INT_STS, NIS_TRANSFER_COMPLETE);
         Ok(())
     }
 
@@ -586,25 +588,18 @@ impl Sdhci {
         // responsive_spin_until ticks sleep_pumps so cursor/FB stay
         // alive. 1 s wall-clock budget.
         let done = narf_scheduler::responsive_spin_until(
-            // SAFETY: identity-mapped MMIO.
-            || unsafe { self.mmio.read16(REG_NORMAL_INT_STS) } & (NIS_BUFFER_WRITE_READY | NIS_ERROR) != 0,
+            || self.io.read16(REG_NORMAL_INT_STS) & (NIS_BUFFER_WRITE_READY | NIS_ERROR) != 0,
             narf_time::Deadline::after_ms(1_000),
         );
         if !done {
             return Err(SdhciError::PioStall);
         }
-        // SAFETY: identity-mapped MMIO.
-        let nis = unsafe { self.mmio.read16(REG_NORMAL_INT_STS) };
+        let nis = self.io.read16(REG_NORMAL_INT_STS);
         if nis & NIS_ERROR != 0 {
-            // SAFETY: same.
-            let eis = unsafe { self.mmio.read16(REG_ERROR_INT_STS) };
+            let eis = self.io.read16(REG_ERROR_INT_STS);
             return Err(SdhciError::DeviceError(eis));
         }
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            self.mmio
-                .write16(REG_NORMAL_INT_STS, NIS_BUFFER_WRITE_READY);
-        }
+        self.io.write16(REG_NORMAL_INT_STS, NIS_BUFFER_WRITE_READY);
         for i in 0..128usize {
             let bytes: [u8; 4] = [
                 data[i * 4],
@@ -613,23 +608,16 @@ impl Sdhci {
                 data[i * 4 + 3],
             ];
             let w = u32::from_le_bytes(bytes);
-            // SAFETY: identity-mapped MMIO.
-            unsafe {
-                self.mmio.write32(REG_BUFFER_PORT, w);
-            }
+            self.io.write32(REG_BUFFER_PORT, w);
         }
         let done = narf_scheduler::responsive_spin_until(
-            // SAFETY: identity-mapped MMIO.
-            || unsafe { self.mmio.read16(REG_NORMAL_INT_STS) } & NIS_TRANSFER_COMPLETE != 0,
+            || self.io.read16(REG_NORMAL_INT_STS) & NIS_TRANSFER_COMPLETE != 0,
             narf_time::Deadline::after_ms(1_000),
         );
         if !done {
             return Err(SdhciError::PioStall);
         }
-        // SAFETY: same.
-        unsafe {
-            self.mmio.write16(REG_NORMAL_INT_STS, NIS_TRANSFER_COMPLETE);
-        }
+        self.io.write16(REG_NORMAL_INT_STS, NIS_TRANSFER_COMPLETE);
         Ok(())
     }
 }
@@ -725,13 +713,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     *CONTROLLER.lock() = Some(dev);
 
     if let Some(card) = CONTROLLER.lock().as_ref().unwrap().card.lock().as_ref() {
-        if card.capacity_blocks > 0 {
-            let block_dev = alloc::sync::Arc::new(SdhciBlockDevice {
-                capacity_blocks: card.capacity_blocks,
-                ccs: card.ccs,
-            });
-            narf_block::registry::register_block_device("sdhci0", block_dev);
-        }
+        publish_card(card.capacity_blocks, card.ccs);
     }
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
@@ -742,6 +724,26 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Block.default_domain(),
     });
     Ok(())
+}
+
+/// Publish an identified card as the `sdhci0` block device and scan
+/// it for partitions, registering `sdhci0p<N>` children — the same
+/// publication contract MSC / AHCI / NVMe follow (#834). A card
+/// whose CSD decoded to zero blocks is never published; a card with
+/// no readable partition table (blank card, superfloppy layout)
+/// just keeps its bare whole-disk entry, so the scan is
+/// best-effort and its error is dropped, exactly as at the other
+/// call sites.
+fn publish_card(capacity_blocks: u64, ccs: bool) {
+    if capacity_blocks == 0 {
+        return;
+    }
+    let block_dev = alloc::sync::Arc::new(SdhciBlockDevice {
+        capacity_blocks,
+        ccs,
+    });
+    narf_block::registry::register_block_device("sdhci0", block_dev.clone());
+    let _ = narf_block::partition::scan_and_register_partitions(block_dev, "sdhci0");
 }
 
 struct SdhciBlockDevice {
@@ -862,3 +864,26 @@ pub fn with_controller<R>(f: impl FnOnce(&Sdhci) -> R) -> Option<R> {
     let _gate = ReqGate::acquire(&ctrl.req_gate);
     Some(f(ctrl))
 }
+
+/// Test hook: install a controller built on a fixture
+/// [`SdhciTransport`], with no card identified yet — the fixture
+/// then runs the real `identify_sequence` against its modelled
+/// register file. Mirrors the RTSX driver's `__install_for_test`.
+#[cfg(any(test, feature = "kernel-test"))]
+pub fn __install_for_test(transport: alloc::sync::Arc<dyn SdhciTransport>) {
+    *CONTROLLER.lock() = Some(Sdhci {
+        io: transport,
+        card: IrqSafeSpinLock::new(None),
+        req_gate: AtomicBool::new(false),
+    });
+}
+
+/// Test hook: drop the installed controller (fixture teardown), so
+/// a fixture's controller never leaks into later suites.
+#[cfg(any(test, feature = "kernel-test"))]
+pub fn __reset_for_test() {
+    *CONTROLLER.lock() = None;
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod fixture_tests;

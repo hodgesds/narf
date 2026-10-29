@@ -148,12 +148,22 @@ impl Native {
     ) -> Result<u64, packet::Error> {
         self.with_packet(|core, port| core.submit(port, frame, radio_report))
     }
+    pub(in crate::rtw88) fn scan_packet_address(
+        &mut self,
+        address: Option<[u8; 6]>,
+    ) -> Result<(), packet::Error> {
+        self.with_packet(|core, _| core.set_scan(address))
+    }
     pub(in crate::rtw88) fn poll_packets(&mut self) -> Result<packet::Step, packet::Error> {
         self.with_packet(|core, port| core.poll(port))
     }
     pub(in crate::rtw88) fn stop_packets(&mut self) -> Result<(), packet::Error> {
         self.with_packet(|core, port| core.stop(port))
     }
+}
+/// `Port::stop` without a packet core (owner failed before packets).
+pub(super) fn stop_native(native: &mut Native) -> Result<(), packet::Error> {
+    Port::stop(native)
 }
 // SAFETY: this is the same retained, non-cloneable Native after sealed radio
 // qualification. CPU and register accesses invoke its actual current cap;
@@ -197,7 +207,7 @@ unsafe impl Port for Native {
         Native::allocate(self, length).map_err(access_error)
     }
     fn index(&mut self, register: u16) -> Result<u32, packet::Error> {
-        if !matches!(register, 0x3a8 | 0x3b0 | 0x3b4) {
+        if !matches!(register, 0x3a0 | 0x3a4 | 0x3a8 | 0x3ac | 0x3b0 | 0x3b4) {
             return Err(packet::Error::Address);
         }
         let value = self.read32(register).map_err(access_error)?;
@@ -207,7 +217,7 @@ unsafe impl Port for Native {
         Ok(value)
     }
     fn publish(&mut self, register: u16, host: u16) -> Result<(), packet::Error> {
-        if !matches!(register, 0x3a8 | 0x3b0 | 0x3b4) {
+        if !matches!(register, 0x3a0 | 0x3a4 | 0x3a8 | 0x3ac | 0x3b0 | 0x3b4) {
             return Err(packet::Error::Address);
         }
         self.check_packet_permission().map_err(access_error)?;
@@ -229,6 +239,9 @@ unsafe impl Port for Native {
             let index = match queue {
                 Queue::Management => 5,
                 Queue::Data => 2,
+                Queue::Background => 1,
+                Queue::Voice => 3,
+                Queue::Video => 4,
             };
             let ring = owner.tx.get(index).ok_or(packet::Error::State)?;
             if ring.index != queue.index() || ring.depth != queue.depth() || slot >= ring.depth {

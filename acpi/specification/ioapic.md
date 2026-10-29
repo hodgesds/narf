@@ -19,6 +19,14 @@ It does not allocate a vector or grant ownership of an existing route.
 `route_gsi_to_vector` programs a route. `program_entry` and `mask` operate on
 an explicitly probed `IoApicHandle`.
 
+`unsafe set_gsi_masked(gsi: u32, masked: bool) -> bool` sets or clears only
+the mask bit of the MADT entry owning `gsi` (vector, destination, polarity and
+trigger unchanged); `false` outside every range. It takes the IRQ-safe
+`IOAPIC_LOCK` and allocates nothing, so a hard-IRQ handler may call it. A
+masked level line stays asserted at the pin; after the local-APIC EOI retires
+Remote IRR, unmasking a still-asserted line delivers it again (the
+`interrupts::oneshot` contract).
+
 ## 4. Invariants
 
 The global IOAPIC lock serializes selector/window access. Inspection never

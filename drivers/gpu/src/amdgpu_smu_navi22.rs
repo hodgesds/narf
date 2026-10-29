@@ -38,6 +38,7 @@ const SET_SOFT_MIN_BY_FREQ: u32 = 0x19; // linux: PPSMC_MSG_SetSoftMinByFreq
 const SET_SOFT_MAX_BY_FREQ: u32 = 0x1a; // linux: PPSMC_MSG_SetSoftMaxByFreq
 const MIN_DPM_FREQ: u32 = 0x1d; // linux: PPSMC_MSG_GetMinDpmFreq
 const MAX_DPM_FREQ: u32 = 0x1e; // linux: PPSMC_MSG_GetMaxDpmFreq
+const DPM_FREQ_BY_INDEX: u32 = 0x1f; // linux: PPSMC_MSG_GetDpmFreqByIndex
 const TRANSFER_TO_DRIVER: u32 = 0x12; // linux: PPSMC_MSG_TransferTableSmu2Dram
 const GET_PPT_LIMIT: u32 = 0x33; // linux: PPSMC_MSG_GetPptLimit
 const REENABLE_ACDC_INTERRUPT: u32 = 0x34; // linux: PPSMC_MSG_ReenableAcDcInterrupt
@@ -823,6 +824,63 @@ impl<I: Io> Engine<I> {
         }
         result
     }
+    async fn pstate_max(&mut self, clock: u32, fallback: Option<u32>) -> Result<u32, Error> {
+        if let Some(mhz) = fallback {
+            return crate::amdgpu_info_stats::dpm_mhz(mhz).ok_or(Error::Invalid);
+        }
+        let raw = self.command(DPM_FREQ_BY_INDEX, clock << 16 | 0xff).await?;
+        let last = crate::amdgpu_info_stats::last_dpm_index(raw).ok_or(Error::Invalid)?;
+        let raw = self.command(DPM_FREQ_BY_INDEX, clock << 16 | last).await?;
+        crate::amdgpu_info_stats::dpm_mhz(raw).ok_or(Error::Invalid)
+    }
+    /// Linux's UMD profiling clocks and the actual last GFX/UCLK DPM levels.
+    /// Disabled clock DPM uses firmware_info boot values, as set_default_dpm_table.
+    async fn read_pstates(
+        &mut self,
+        boot_gfx: Option<u32>,
+        boot_memory: Option<u32>,
+    ) -> Result<crate::amdgpu_info_stats::Pstates, Error> {
+        let resume = self.begin_runtime()?;
+        let result = async {
+            let enabled = self.running().await?;
+            let gfx_fallback = if enabled & (1 << 1) == 0 {
+                // FEATURE_DPM_GFXCLK_BIT
+                Some(boot_gfx.ok_or(Error::Invalid)?)
+            } else {
+                None
+            };
+            let memory_fallback = if enabled & (1 << 3) == 0 {
+                // FEATURE_DPM_UCLK_BIT
+                Some(boot_memory.ok_or(Error::Invalid)?)
+            } else {
+                None
+            };
+            let gfx_peak = self.pstate_max(0, gfx_fallback).await?;
+            let memory_peak = self.pstate_max(2, memory_fallback).await?;
+            // sienna_cichlid_populate_umd_state_clk; *_UMD_PSTATE_PROFILING_*
+            // in sienna_cichlid_ppt.h, in MHz, not instantaneous clocks.
+            let (gfx_standard, memory_standard) = match self.profile.psp_version {
+                (11, 0, 7 | 11) => (1825, 1000),
+                (11, 0, 12) => (1950, 676),
+                (11, 0, 13) => (2200, 1000),
+                _ => return Err(Error::Unsupported),
+            };
+            Ok(crate::amdgpu_info_stats::Pstates {
+                gfx_standard,
+                memory_standard,
+                gfx_peak,
+                memory_peak,
+            })
+        }
+        .await;
+        if matches!(result, Err(Error::Invalid | Error::Unsupported)) {
+            // A malformed read-only table is not an unfinished mailbox command.
+            self.state = resume;
+        } else {
+            self.end_runtime(resume, &result);
+        }
+        result
+    }
     /// Linux `smu_cmn_get_metrics_table` (SMU -> DRAM of TABLE_SMU_METRICS
     /// into the retained driver table), the running features,
     /// `sienna_cichlid_get_power_limit` (AC, PPT0) and the register sensors
@@ -1315,6 +1373,13 @@ impl Smu {
     /// owner reusable, timeouts/device loss are terminal.
     pub async fn read_telemetry(&mut self) -> Result<Telemetry, Error> {
         self.engine.read_telemetry().await
+    }
+    pub(crate) async fn read_pstates(
+        &mut self,
+        boot_gfx: Option<u32>,
+        boot_memory: Option<u32>,
+    ) -> Result<crate::amdgpu_info_stats::Pstates, Error> {
+        self.engine.read_pstates(boot_gfx, boot_memory).await
     }
     /// Arm the THM/MP1 alert sources once IH routes them (Linux enables them
     /// in smu_smc_hw_setup, after IH hw_init). Fan control stays automatic.

@@ -620,13 +620,21 @@ pub static DP_MSI_FIRES: AtomicU64 = AtomicU64::new(0);
 /// so there is no per-group mask to set (Linux `disable_irq_nosync` →
 /// NAPI → `enable_irq`).
 fn dp_msi_irq(cookie: u64) -> narf_interrupts::IrqStatus {
+    raise_dp(cookie as u32);
+    narf_interrupts::IrqStatus::Handled
+}
+
+/// Record that the ext groups in `mask` interrupted and wake the device
+/// owner (the MSI handler above and the AHB per-ring GIC lines,
+/// [`super::ahb_hif`]). `false` while ext interrupts are disabled.
+pub(crate) fn raise_dp(mask: u32) -> bool {
     if !DP_IRQ_ENABLED.load(Ordering::Acquire) {
-        return narf_interrupts::IrqStatus::Handled;
+        return false;
     }
     DP_MSI_FIRES.fetch_add(1, Ordering::Relaxed);
-    DP_IRQ_PENDING.fetch_or(cookie as u32, Ordering::AcqRel);
+    DP_IRQ_PENDING.fetch_or(mask, Ordering::AcqRel);
     ce::wake_waiters();
-    narf_interrupts::IrqStatus::Handled
+    true
 }
 
 /// `true` while DP groups are pending (the CE wait future resolves on it).
@@ -804,20 +812,25 @@ impl<Io: ChipIo, Irq: CeIrq, Q: QmiFw> CoreHooks<CeHif<Io, Irq>, Q> for DpHooks 
         &mut self,
         core: &mut Ath11kCore<CeHif<Io, Irq>, Q>,
     ) -> Result<(), TransportError> {
-        let dp = self.dp.as_mut().ok_or(missing(3))?;
-        let hif = &mut core.hif;
-        // ath11k_dp_pdev_alloc (pdev 0; latches + prints its failures).
-        let msgs = dp.pdev_alloc(&mut hif.ce.hal, &hif.io, 0)?;
-        // ath11k_dp_tx_htt_srng_setup per ring, in Linux's order; the
-        // first failure ends the pdev alloc.
-        for (i, m) in msgs.iter().enumerate() {
-            core.htt_send(m).map_err(|e| {
-                TransportError::new(
-                    step::SRING_SETUP_SEND,
-                    (i as u32) << 16 | (e.step & 0xffff),
-                    e.errno,
-                )
-            })?;
+        // ath11k_dp_pdev_alloc: one pdev per radio (`ab->num_radios`).
+        let radios = core.num_radios();
+        for mac_id in 0..radios {
+            let dp = self.dp.as_mut().ok_or(missing(3))?;
+            let hif = &mut core.hif;
+            // ath11k_dp_rx_pdev_alloc + _mon_attach (latches + prints its
+            // failures).
+            let msgs = dp.pdev_alloc(&mut hif.ce.hal, &hif.io, mac_id)?;
+            // ath11k_dp_tx_htt_srng_setup per ring, in Linux's order; the
+            // first failure ends the pdev alloc.
+            for (i, m) in msgs.iter().enumerate() {
+                core.htt_send(m).map_err(|e| {
+                    TransportError::new(
+                        step::SRING_SETUP_SEND,
+                        mac_id << 24 | (i as u32) << 16 | (e.step & 0xffff),
+                        e.errno,
+                    )
+                })?;
+            }
         }
         // ath11k_mac_register is the caller's (the mac layer is built on
         // the runtime once the core is ready).
@@ -1064,6 +1077,9 @@ pub struct Rt<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     /// currently waiting on vdev 0.
     events: Vec<VecDeque<Vec<u8>>>,
     tx_power_stats: Arc<IrqSafeSpinLock<super::fw_stats::State>>,
+    /// Radio-wide radar-detector record (shared with [`Shared`] so it and
+    /// its `dfs_block_radar_events` switch survive recovery).
+    radar: Arc<IrqSafeSpinLock<super::mac::diag::RadarDiagnostics>>,
 }
 
 /// A synchronous port call, applied at the next locked step.
@@ -1169,6 +1185,9 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
             reset: ResetState::default(),
             events,
             tx_power_stats: Arc::new(IrqSafeSpinLock::new(super::fw_stats::State::default())),
+            radar: Arc::new(IrqSafeSpinLock::new(
+                super::mac::diag::RadarDiagnostics::default(),
+            )),
         }
     }
 
@@ -1883,10 +1902,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
             encap: TxEncap::NativeWifi,
             priority: built.tid as u32,
             queue: built.ac,
-            // hw_ops->get_ring_selector (ath11k_hw_ipq8074_get_tcl_ring_selector:
-            // smp_processor_id()); WCN6855 has one TCL data ring
+            // hw_ops->get_ring_selector: smp_processor_id() (ipq8074 ops)
+            // or skb_get_hash() (WCN6750); WCN6855 has one TCL data ring
             // (tcl2wbm_rbm_map_ipq5018), so `% num_tx_rings` picks ring 0.
-            ring_selector: narf_lib::percpu::current_cpu() as u32,
+            ring_selector: tx_ring_selector(self.dp.cfg.hw.hw_rev, || super::txq::flow_hash(eth)),
             // NETIF_F_HW_CSUM (`tx_offload::OFFLOADS`).
             csum_partial,
             pdev_idx: 0,
@@ -1947,7 +1966,8 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
             encap: TxEncap::NativeWifi,
             priority: built.tid as u32,
             queue: built.ac,
-            ring_selector: narf_lib::percpu::current_cpu() as u32,
+            // A Null frame has no flow: skb_get_hash() is 0.
+            ring_selector: tx_ring_selector(self.dp.cfg.hw.hw_rev, || 0),
             csum_partial: false,
             pdev_idx: 0,
             lmac_id: 0,
@@ -2348,7 +2368,14 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
                 }
                 continue;
             }
-            let target = match wmi::decode_event(&frame) {
+            let decoded = wmi::decode_event(&frame);
+            if let Ok(wmi::WmiEvent::DfsRadarDetected(ev)) = &decoded {
+                // `ath11k_wmi_pdev_dfs_radar_detected_event` runs once per
+                // report, before mac80211 sees it on any vdev.
+                let pdev_id = device_caps(&self.core).ok().map(|caps| caps.pdev_id);
+                self.radar.lock().record(ev, pdev_id);
+            }
+            let target = match decoded {
                 Ok(wmi::WmiEvent::VdevStartResp(event)) => Some(event.vdev_id),
                 Ok(wmi::WmiEvent::VdevStopped(vdev_id)) => Some(vdev_id),
                 Ok(wmi::WmiEvent::VdevDeleteResp(vdev_id)) => Some(vdev_id),
@@ -2359,6 +2386,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
                 Ok(wmi::WmiEvent::WowWakeup(event)) => Some(event.vdev_id),
                 Ok(wmi::WmiEvent::Scan(event)) => Some(event.vdev_id),
                 Ok(wmi::WmiEvent::Roam(event)) => Some(event.vdev_id),
+                Ok(wmi::WmiEvent::TwtAddDialog(event)) => Some(event.vdev_id),
                 Ok(wmi::WmiEvent::MgmtTxCompl(event)) => self
                     .mgmt
                     .bufs
@@ -2559,6 +2587,7 @@ pub struct Shared<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     bss_survey_requested: AtomicBool,
     tx_power_requested: AtomicBool,
     tx_power_stats: Arc<IrqSafeSpinLock<super::fw_stats::State>>,
+    radar: Arc<IrqSafeSpinLock<super::mac::diag::RadarDiagnostics>>,
     /// Desired pdev chain masks selected through `NL80211_CMD_SET_WIPHY`.
     /// They outlive WMI restart so every freshly-created MAC derives the
     /// same HT/VHT/HE NSS policy before it adds a vdev.
@@ -2613,6 +2642,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         let max_msg_len = rt.core.wmi_ep.map_or(0, |e| e.max_msg_len);
         let wmi_send_ms = rt.core.cfg.wmi_send_ms;
         let tx_power_stats = rt.tx_power_stats.clone();
+        let radar = rt.radar.clone();
         Arc::new(Shared {
             rt: Mutex::new(Some(rt)),
             irq,
@@ -2637,6 +2667,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
             bss_survey_requested: AtomicBool::new(false),
             tx_power_requested: AtomicBool::new(false),
             tx_power_stats,
+            radar,
             antenna_config: IrqSafeSpinLock::new(None),
             antenna_programmed_generation: AtomicU32::new(0),
             rts_config: IrqSafeSpinLock::new((RTS_THRESHOLD_OFF, 0)),
@@ -3147,6 +3178,18 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         }
     }
 
+    /// The radio's radar-detector diagnostics (latest report, counts, and
+    /// the `dfs_block_radar_events` switch).
+    pub fn radar_diagnostics(&self) -> super::mac::diag::RadarDiagnostics {
+        *self.radar.lock()
+    }
+
+    /// ath11k debugfs `dfs_block_radar_events`: keep recording radar
+    /// reports but stop handing them to the DFS state machine.
+    pub fn set_dfs_block_radar_events(&self, block: bool) {
+        self.radar.lock().block_radar_events = block;
+    }
+
     /// Take the latest RDDM-backed device coredump. The dump is independent
     /// of firmware lifetime and is therefore still valid after recovery;
     /// taking it transfers ownership to the diagnostic/export consumer.
@@ -3334,6 +3377,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         // statistics transactions; reuse the physical cache identity.
         self.tx_power_stats.lock().reset();
         rt.tx_power_stats = self.tx_power_stats.clone();
+        rt.radar = self.radar.clone();
         // mac80211's queues (still stopped for the driver) and the
         // statuses not yet reported survive the restart.  Keep that state
         // per vdev so a restart cannot deliver vdev 1's requested-TX
@@ -3896,6 +3940,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> DataPort for Port<Io, Irq, Q> {
         self.0.record_dfs_nop(def, deadline);
     }
 
+    fn radar_events_blocked(&self) -> bool {
+        self.0.radar.lock().block_radar_events
+    }
+
     fn ap_station_added(&self, vdev_id: u32, addr: [u8; 6], wme: bool) {
         self.0
             .push_op(SyncOp::ApStationAdded { vdev_id, addr, wme });
@@ -4074,6 +4122,11 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> DataPort for Port<Io, Irq, Q> {
                 g.dp.set_peer_sec_type(p.peer_id, u, m);
             }
             g.dp.set_peer_key_index(p.peer_id, pairwise, install.then_some(key_idx));
+            if !pairwise {
+                // mac80211 owns a GTK's replay counters (ath11k's REO PN
+                // offload is unicast-only); the DP holds them here.
+                g.dp.group_rx_key_config(p.peer_id, key_idx, cipher == wmi::cipher::TKIP, install);
+            }
         }
         if pairwise {
             if let Some(vdev) = g.vdev_mut(vdev_id) {
@@ -4088,6 +4141,18 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> DataPort for Port<Io, Irq, Q> {
             }
         }
         Ok(())
+    }
+
+    async fn group_rx_seq(&self, vdev_id: u32, addr: [u8; 6], key_idx: u8, seq: u64) {
+        let mut g = self.0.lock().await;
+        if let Some(peer_id) =
+            g.dp.peers
+                .iter()
+                .find(|p| p.vdev_id as u32 == vdev_id && p.addr == addr)
+                .map(|p| p.peer_id)
+        {
+            g.dp.group_rx_key_seq(peer_id, key_idx, seq);
+        }
     }
 
     async fn tkip_rx_mic_config(
@@ -4379,6 +4444,36 @@ pub async fn start_pci(core: super::core::PciCore, dp: Dp) {
         "{}: registered, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (data path up; starts on IFF_UP)",
         name, m[0], m[1], m[2], m[3], m[4], m[5]
     ));
+}
+
+/// `hw_ops->get_ring_selector` input for a TX frame: the current CPU
+/// (`ath11k_hw_ipq8074_get_tcl_ring_selector`) or the frame's flow hash
+/// (`ath11k_hw_wcn6750_get_tcl_ring_selector`, `skb_get_hash`), computed
+/// only when the chip uses it.
+pub fn tx_ring_selector(rev: super::hw::HwRev, flow_hash: impl FnOnce() -> u32) -> u32 {
+    let cpu = narf_lib::percpu::current_cpu() as u32;
+    match rev.hw_ops().map(|o| o.ring_selector) {
+        Some(super::hw_ops::RingSelector::FlowHash) => flow_hash(),
+        _ => cpu,
+    }
+}
+
+/// [`start_ahb`]'s result: the runtime and the MAC (or the
+/// `device_caps` failure).
+pub type AhbStart<Io, Irq, Q> = (Arc<Shared<Io, Irq, Q>>, Result<[u8; 6], TransportError>);
+
+/// The AHB counterpart of [`start_pci`]'s runtime half, after
+/// `ath11k_core_qmi_firmware_ready`: the runtime over the ready core and
+/// its DP ([`Rt`] + [`Shared`]) and the MAC `device_caps` reports
+/// (`ath11k_mac_register`'s input). The netdev registration
+/// ([`super::iface::register_pci`]) is PCI-typed and not done here.
+pub fn start_ahb<Io: RtIo, Irq: DpIrq, Q: RtQmi>(
+    core: Ath11kCore<CeHif<Io, Irq>, Q>,
+    dp: Dp,
+) -> AhbStart<Io, Irq, Q> {
+    let rt = Rt::new(core, dp);
+    let mac = rt.device_caps().map(|c| c.mac_addr);
+    (Shared::new(rt, secure_random), mac)
 }
 
 fn secure_random(out: &mut [u8]) -> Result<(), i32> {

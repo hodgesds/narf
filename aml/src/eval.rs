@@ -200,6 +200,35 @@ pub fn evaluate_method(path: &str, args: &[Value]) -> Result<Value, AmlError> {
     }
 }
 
+/// Evaluate an ACPI data object in whichever of the two shapes
+/// firmware uses for it: a control Method that returns the value,
+/// or a `Name` holding it. Fan `_FIF` / `_FPS` (ACPI 6.5 §11.3.1),
+/// processor `_PSS`, power-resource `_PR0` and many other data
+/// objects are declared as `Name(Package(...))` in most DSDTs and
+/// as zero-argument Methods in the rest.
+///
+/// [`evaluate_method`] alone rejects Name nodes with
+/// `MethodNotFound`, and the namespace builder stores a static
+/// Package body as `NameValue::Unparsed` (only runtime `Store`s
+/// land as live `NameValue::Package`s), so before this helper a
+/// caller outside this crate had no way to read a Name-held
+/// Package at all. Method nodes delegate to `evaluate_method`;
+/// Name nodes convert their stored value, decoding an `Unparsed`
+/// body from the AML store (the same path `eval_term_arg` takes
+/// when AML code reads the name). `args` are only meaningful for
+/// the Method shape and are ignored for Names.
+pub fn evaluate_object(path: &str, args: &[Value]) -> Result<Value, AmlError> {
+    let node = crate::find_node(path).ok_or(AmlError::MethodNotFound)?;
+    match node.kind {
+        crate::NodeKind::Method => evaluate_method(path, args),
+        crate::NodeKind::Name => match node.value {
+            Some(nv) => Ok(name_value_to_value(nv)),
+            None => Err(AmlError::MethodNotFound),
+        },
+        _ => Err(AmlError::MethodNotFound),
+    }
+}
+
 /// Resolve a NameString against the current eval scope per ACPI
 /// §5.3: try `scope.name`, then walk parents up to root, finally
 /// the bare name. Returns the first matching node.

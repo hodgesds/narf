@@ -136,6 +136,16 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // Resolve the pipe once, before socket-family probes and Arc cloning.
+    if let Some(pipe) = crate::pipe::Endpoint::from_file(endpoint.ops.as_ref()) {
+        read_pipe_user(ctx, &endpoint, &pipe, count, |offset, src, len| {
+            // SAFETY: the queue retains this raw source and the scalar
+            // destination range was validated before pipe lookup.
+            unsafe { copy_raw_to_user(user_ptr + offset as u64, src, len) }
+        });
+        return;
+    }
+
     // AF_PACKET's read path can return protocol-specific errnos such as a
     // pending ENETDOWN. FileOps::read has no errno-preserving error carrier,
     // so run packet_recvmsg directly, as sock_read_iter does in Linux.
@@ -200,15 +210,6 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
             }
             return;
         }
-    }
-
-    if crate::pipe::is_pipe(endpoint.ops.as_ref()) {
-        read_pipe_user(ctx, &endpoint, count, |offset, src, len| {
-            // SAFETY: the queue retains this raw source and the scalar
-            // destination range was validated before pipe lookup.
-            unsafe { copy_raw_to_user(user_ptr + offset as u64, src, len) }
-        });
-        return;
     }
 
     if let Some(ret) = tty_background_access(task, endpoint.ops.as_ref(), false) {

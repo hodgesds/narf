@@ -42,9 +42,21 @@
 extern crate alloc;
 
 mod calibration8821c;
+mod coding;
+#[cfg(feature = "kernel-test")]
+mod coding_tests;
 mod command;
 mod dack;
+mod dm;
+#[cfg(feature = "kernel-test")]
+mod dm_station_tests;
+#[cfg(feature = "kernel-test")]
+mod dm_tests;
+mod dma_stop;
 pub mod efuse;
+mod fallback;
+#[cfg(feature = "kernel-test")]
+mod fallback_tests;
 mod firmware_lifecycle;
 mod firmware_native;
 mod firmware_transport;
@@ -78,11 +90,19 @@ mod probe_guard;
 mod protection;
 #[cfg(feature = "kernel-test")]
 mod protection_tests;
+mod qos;
+#[cfg(feature = "kernel-test")]
+mod qos_tests;
 pub use protection::Request as RtsRequest;
 mod publication;
+mod qualification;
+pub use qualification::Request as ContinuationRequest;
 mod radio;
 mod radio8821c;
 mod reserved_page;
+mod scan;
+#[cfg(feature = "kernel-test")]
+mod scan_tests;
 mod sibling;
 mod station;
 pub(super) mod station_control;

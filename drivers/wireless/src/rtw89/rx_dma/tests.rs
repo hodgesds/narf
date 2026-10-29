@@ -573,3 +573,30 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_rx_current_native_authority_precedes_allocation_and_dma_reads
 );
+
+fn smoke_rtw89_rx_reclaim_releases_both_rings_once_and_stays_terminal() -> TestResult {
+    let mut f = Fixture::new();
+    if f.prepare() != Some(Ok(())) || f.rx.state() != State::Polling {
+        return TestResult::Fail("RX reclaim baseline");
+    }
+    // SAFETY: inert RAM model; no device, prefetch or IRQ producer exists.
+    let storage = unsafe { f.rx.reclaim_fenced() };
+    // Two rings: one descriptor array plus depth (4) buffers each.
+    if storage.len() != 2 * (1 + 4)
+        || f.rx.armed
+        || f.rx.rings.is_some()
+        || f.rx.state() != State::Terminal
+        || f.rx.poll(&mut f.model, 1).is_ok()
+    {
+        return TestResult::Fail("RX reclamation kept, duplicated or reopened ring storage");
+    }
+    // SAFETY: same inert model; a second reclaim has nothing to release.
+    if !unsafe { f.rx.reclaim_fenced() }.is_empty() {
+        return TestResult::Fail("RX reclamation released storage twice");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_rx_reclaim_releases_both_rings_once_and_stays_terminal
+);

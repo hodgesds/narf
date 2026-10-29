@@ -7,6 +7,7 @@ use super::super::{
     boot_context::{put16, put32},
     firmware_api::FirmwareApi,
 };
+use super::phy::Span;
 use super::{Owner, Phase};
 use crate::firmware_asset::Asset;
 use alloc::{format, string::String, sync::Arc, vec::Vec};
@@ -22,12 +23,71 @@ const REDUCE_TX_POWER: u8 = 0x9f;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(in crate::iwlwifi) enum Emission {
     #[default]
-    Legacy = 1,
-    Ht20 = 2,
+    Legacy,
+    Ht20,
     /// Firmware-managed TID0 aggregation and recipient autonomous Block Ack.
-    Ht20Ba = 3,
+    Ht20Ba,
     /// The tag3 program plus negotiated nested recipient A-MSDU-in-A-MPDU.
-    Ht20NestedBa = 4,
+    Ht20NestedBa,
+    /// Generic feature program (tag5): the tag2 HT20/SISO/WMM base plus
+    /// exactly the [`feature`] bits it names. Each distinct bit set is its
+    /// own externally qualified program, bound by name, binding domain and
+    /// record bytes 62..64; one set never authorizes another.
+    Features(u16),
+}
+
+/// Emitting-feature bits of a tag5 program.
+pub(in crate::iwlwifi) mod feature {
+    /// Firmware-managed TID0 TX BA pipeline and recipient BA (tag3 set).
+    pub const BA: u16 = 1 << 0;
+    /// Negotiated nested recipient A-MSDU-in-A-MPDU (tag4 set).
+    pub const NESTED_BA: u16 = 1 << 1;
+    /// Per-TID QoS data queues for all eight TIDs / four access categories.
+    pub const QOS_TIDS: u16 = 1 << 2;
+    /// HT TX LDPC coding toward an LDPC-capable peer
+    /// (`IWL_TLC_MNG_CFG_FLAGS_LDPC_MSK`).
+    pub const TX_LDPC: u16 = 1 << 3;
+    /// HT TX STBC from two transmit chains toward a peer with Rx STBC
+    /// (`IWL_TLC_MNG_CFG_FLAGS_STBC_MSK`, HT Tx STBC advertised).
+    pub const TX_STBC: u16 = 1 << 4;
+    /// HT 20/40MHz operation on the AP's secondary channel: a 40MHz PHY
+    /// context, `STA_FLG_FAT_EN_40MHZ` and TLC `max_ch_width` 40MHz.
+    pub const HT40: u16 = 1 << 5;
+    /// Two spatial streams: HT MCS 8..15 in both directions,
+    /// `STA_FLG_MIMO_EN_MIMO2` and the TLC NSS2 rate map on every valid TX
+    /// chain.
+    pub const NSS2: u16 = 1 << 6;
+    /// VHT MCS 0..9 on an 80MHz 5GHz channel (requires `HT40`): an 80MHz
+    /// PHY context, ADD_STA FAT_EN_80 and the TLC VHT mode and rate map.
+    pub const VHT: u16 = 1 << 7;
+    /// Contiguous 160MHz VHT (requires `VHT`): a 160MHz PHY context, TLC
+    /// 160MHz width, SGI160 and the `IWL_TLC_MCS_PER_BW_160` map.
+    pub const WIDTH_160: u16 = 1 << 8;
+    /// Every bit this driver can emit; other bits are refused.
+    pub const KNOWN: u16 =
+        BA | NESTED_BA | QOS_TIDS | TX_LDPC | TX_STBC | HT40 | NSS2 | VHT | WIDTH_160;
+}
+
+impl Emission {
+    /// NIPW record byte 46.
+    pub(in crate::iwlwifi) fn tag(self) -> u8 {
+        match self {
+            Emission::Legacy => 1,
+            Emission::Ht20 => 2,
+            Emission::Ht20Ba => 3,
+            Emission::Ht20NestedBa => 4,
+            Emission::Features(_) => 5,
+        }
+    }
+    /// Feature bits granted by this program (tag3/4 imply their BA bits).
+    pub(in crate::iwlwifi) fn features(self) -> u16 {
+        match self {
+            Emission::Legacy | Emission::Ht20 => 0,
+            Emission::Ht20Ba => feature::BA,
+            Emission::Ht20NestedBa => feature::BA | feature::NESTED_BA,
+            Emission::Features(bits) => bits,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,18 +127,63 @@ pub(super) struct Prepared {
     maximum: i16,
     gain: i16,
     channel: u8,
+    /// The occupied span of a granted 40/80MHz operation; every power
+    /// decision then covers each of its subchannels.
+    span: Option<Span>,
     applied: Option<i16>,
     pub(super) active_link: Option<super::link::ActiveLinkStatus>,
     pub(super) mlme: super::assoc::Context,
     pub(super) stop: Option<Arc<AtomicBool>>,
 }
 
+/// Host power for the primary channel, or for a wide span: the lower of
+/// every 20MHz subchannel and of the rules covering the whole interval,
+/// each of which must permit the span's bandwidth and initiation (the
+/// conservative single-rule form of cfg80211 `reg_does_bw_fit`).
+pub(super) fn span_power(domain: &RegulatoryDomain, channel: u8, span: Option<Span>) -> Option<i8> {
+    use super::super::connection::host_channel_power;
+    let mut power = host_channel_power(domain, channel, true)?;
+    let Some(span) = span else {
+        return Some(power);
+    };
+    let channels = span.channels()?;
+    if !channels.contains(&channel) {
+        return None;
+    }
+    for sub in channels {
+        power = power.min(host_channel_power(domain, sub, true)?);
+    }
+    let base = if channel <= 14 { 2407 } else { 5000 };
+    let center = base + 5 * u32::from(span.center);
+    let (low, high) = (center - span.mhz() / 2, center + span.mhz() / 2);
+    let mut covering = false;
+    for rule in &domain.rules {
+        if rule.freq_end_mhz <= low || rule.freq_start_mhz >= high {
+            continue;
+        }
+        if rule.freq_end_mhz <= rule.freq_start_mhz
+            || rule.max_bandwidth_mhz < span.mhz()
+            || rule.flags.contains(narf_wireless::reg::RegFlags::NO_IR)
+        {
+            return None;
+        }
+        covering |= rule.freq_start_mhz <= low && rule.freq_end_mhz >= high;
+        power = power.min(rule.max_power_dbm);
+    }
+    covering.then_some(power)
+}
+
 impl Prepared {
+    /// Bind the span of a granted HT40/VHT program.
+    pub(super) fn with_span(mut self, span: Option<Span>) -> Self {
+        self.span = span;
+        self
+    }
     pub(super) fn host_ceiling(&self, domain: &RegulatoryDomain) -> Result<i16, &'static str> {
         if !self.source.current() || !domain.country_code.iter().all(u8::is_ascii_uppercase) {
             return Err("MVM platform power authority or host policy is no longer valid");
         }
-        let power = super::super::connection::host_channel_power(domain, self.channel, true)
+        let power = span_power(domain, self.channel, self.span)
             .ok_or("MVM current host channel prohibits initial transmit-power preparation")?;
         let applied = (i16::from(power) * 8)
             .checked_sub(self.gain)
@@ -104,11 +209,16 @@ impl Prepared {
 }
 
 fn request(binding: [u8; 32], mac: [u8; 6], emission: Emission) -> PowerRequest {
+    let features;
     let program = match emission {
         Emission::Legacy => "mvm-api77-power-v1",
         Emission::Ht20 => "mvm-api77-ht20-siso-wmm-power-v2",
         Emission::Ht20Ba => "mvm-api77-ht20-siso-wmm-ba-power-v3",
         Emission::Ht20NestedBa => "mvm-api77-ht20-siso-wmm-nested-ba-power-v4",
+        Emission::Features(bits) => {
+            features = format!("mvm-api77-ht20-siso-wmm-features-{bits:04x}-power-v5");
+            &features
+        }
     };
     PowerRequest {
         name: format!(
@@ -142,6 +252,7 @@ pub(super) fn parse_for(
         maximum: values.maximum,
         gain: values.gain,
         channel,
+        span: None,
         applied: None,
         active_link: None,
         mlme: super::assoc::Context::default(),
@@ -161,6 +272,16 @@ pub(super) fn validate_record(
     emission: Emission,
 ) -> Result<Values, &'static str> {
     let bytes = &source.bytes;
+    if let Emission::Features(bits) = emission {
+        if bits == 0
+            || bits & !feature::KNOWN != 0
+            || bits & feature::NESTED_BA != 0 && bits & feature::BA == 0
+            || bits & feature::VHT != 0 && bits & feature::HT40 == 0
+            || bits & feature::WIDTH_160 != 0 && bits & feature::VHT == 0
+        {
+            return Err("MVM feature program names an unsupported emission set");
+        }
+    }
     if !source.current() || source.signer.is_none() {
         return Err("MVM platform power qualification is unsigned or revoked");
     }
@@ -169,8 +290,12 @@ pub(super) fn validate_record(
         || bytes[4..8] != [1, 0, RECORD_LEN as u8, 0]
         || bytes[8..40] != binding
         || bytes[40..46] != mac
-        || bytes[46..48] != [emission as u8, 0]
-        || bytes[62..64] != [0; 2]
+        || bytes[46..48] != [emission.tag(), 0]
+        || bytes[62..64]
+            != match emission {
+                Emission::Features(bits) => bits.to_le_bytes(),
+                _ => [0; 2],
+            }
     {
         return Err("MVM platform power qualification format or identity mismatch");
     }
@@ -194,6 +319,7 @@ pub(in crate::iwlwifi) struct Fence {
     maximum: i16,
     gain: i16,
     channel: u8,
+    span: Option<Span>,
     applied: i16,
     stop: Option<Arc<AtomicBool>>,
 }
@@ -224,9 +350,8 @@ impl Fence {
                     {
                         return Err("MVM current station publication is closed");
                     }
-                    let power =
-                        super::super::connection::host_channel_power(self.domain, f.channel, true)
-                            .ok_or("MVM current publication channel prohibited")?;
+                    let power = span_power(self.domain, f.channel, f.span)
+                        .ok_or("MVM current publication channel prohibited")?;
                     let ceiling = (i16::from(power) * 8)
                         .checked_sub(f.gain)
                         .ok_or("MVM current publication power overflow")?
@@ -254,6 +379,7 @@ impl Prepared {
             maximum: self.maximum,
             gain: self.gain,
             channel: self.channel,
+            span: self.span,
             applied: self.applied.ok_or("MVM power not acknowledged")?,
             stop: self.stop.clone(),
         })
@@ -360,7 +486,13 @@ impl Owner {
             Emission::Ht20NestedBa => {
                 &b"NARF Intel MVM API77 qualified HT20 SISO MCS0-7 SGI20 WMM-BE TID0 TX-BA pipeline8 RX-BA32 nested-AMSDU3839 control power v4"[..]
             }
+            Emission::Features(_) => {
+                &b"NARF Intel MVM API77 qualified HT20 SISO MCS0-7 SGI20 WMM feature program power v5"[..]
+            }
         });
+        if let Emission::Features(bits) = emission {
+            hash.update(&bits.to_le_bytes());
+        }
         hash.update(&facts);
         hash.update(&mac);
         hash.update(&nvm.tx_chains.to_le_bytes());
@@ -449,10 +581,11 @@ impl Owner {
                 channel,
                 self.power.phy.emission(),
             )?
-        };
+        }
+        .with_span(self.power.phy.span());
         let domain = policy()?;
         if !domain.country_code.iter().all(u8::is_ascii_uppercase)
-            || super::super::connection::host_channel_power(&domain, channel, true).is_none()
+            || span_power(&domain, channel, self.power.phy.span()).is_none()
         {
             return Err("MVM platform power prohibited by current host policy");
         }
@@ -506,6 +639,19 @@ impl Owner {
             return Err(
                 "MVM current firmware channel prohibits initial transmit-power preparation",
             );
+        }
+        if let Some(span) = prepared.span {
+            // NVM_CHANNEL_40MHZ (bit 9) / 80MHZ (bit 10) on every
+            // subchannel, each with the same transmit permissions.
+            let required = required | (1 << (8 + span.width));
+            for sub in span.channels().ok_or("MVM current span is malformed")? {
+                let wide = super::super::station_api::channel_index(sub)
+                    .and_then(|index| permissions.get(index).copied())
+                    .ok_or("MVM current span subchannel absent from firmware")?;
+                if wide & required != required || wide & (1 << 4) != 0 {
+                    return Err("MVM current firmware channel prohibits the wide span");
+                }
+            }
         }
         prepared.host_ceiling(domain)
     }

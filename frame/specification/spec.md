@@ -73,6 +73,16 @@ allowed to use SIMD, so signal code edits this image instead of restoring
 hardware FP registers underneath compiler-held values. The scheduler consumes that
 shared type directly; it does not define or cast a mirror layout.
 
+On aarch64 the BSP selects the interrupt controller during early bring-up,
+before any IRQ is unmasked: it locates the boot devicetree
+(`narf_boot::aarch64::locate_dtb`), calls `narf_interrupts::aarch64::gic::probe`
+(GICv2 or GICv3 from the DT `compatible` / `reg`; QEMU `virt` GICv3 bases only
+when the tree has no GIC node and `ID_AA64PFR0_EL1.GIC` is set) and then
+`gic::init_bsp`. A probe failure leaves IRQs masked. The IRQ vector's Rust
+dispatcher (`rust_aarch64_irq`) acknowledges and EOIs through
+`narf_interrupts::aarch64::{ack_irq, iar_intid, eoi_for}` and never touches
+`ICC_*` system registers or `GICC` MMIO itself.
+
 On aarch64, restorer-based Linux signal handlers receive an `rt_sigframe`
 with Linux arm64 ucontext/GPR offsets and an FPSIMD context record. Delivery
 uses guarded user copies before publishing the handler's PC/SP/LR. `rt_sigreturn`
@@ -173,6 +183,13 @@ plus fatal-trap sinks remain unconditional.
   reading or replacing it. Frame must not independently clear TS for an
   own-stack task because that would make the scheduler skip the next save and
   could expose another task's register image.
+- **aarch64 IRQ acknowledge runs only after the prologue above.** The GIC
+  acknowledge (`ICC_IAR1_EL1` on GICv3, `GICC_IAR` MMIO on GICv2) is the
+  first device access of `rust_aarch64_irq`, i.e. after step 3; its backend
+  is fixed before the first IRQ unmask, so the per-trap cost is one load and
+  branch on a boot-time static. The GICv2 `GICC` window is a TTBR1
+  Device-nGnRE mapping (untagged, shared by every address space), so it is
+  reachable from Frame state whichever task was interrupted.
 - **NMI / double-fault / machine-check paths have their own IST-backed
   trap frames** and perform the same save/restore independently. They
   must not assume GS / TPIDR_EL1 is valid.
@@ -213,6 +230,11 @@ plus fatal-trap sinks remain unconditional.
   the exact state is restored on `eret`. This prevents
   the trap handler itself from faulting on tag mismatches while
   running in Frame context.
+- **Interrupt controller:** GICv3 (system-register CPU interface) or GICv2
+  (memory-mapped CPU interface; Qualcomm IPQ8074/IPQ6018/IPQ5018), chosen by
+  `gic::probe` from the devicetree in BSP bring-up. Per-AP `gic::init_ap`
+  runs in `_ap_start_rust` before the AP unmasks IRQs; the BSP maps each AP's
+  GICv3 redistributor (`gic::remap_mmio`) before `CPU_ON`.
 
 ## 6. Dependencies
 

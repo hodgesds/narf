@@ -160,7 +160,32 @@ pub(super) unsafe trait Registers: Send {
     ) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    /// Bind an N2xC/N2xQ continuation into the retained station gate.
+    fn station_bind_continuation(
+        &mut self,
+        _: alloc::sync::Arc<super::qualification::Grant>,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
     fn station_rts_request(&mut self) -> Result<super::RtsRequest, Error> {
+        Err(Error::Unsupported)
+    }
+    /// Load the exact separately signed continuation `kind` over the
+    /// current station gate (Registered source on real hardware).
+    fn station_continuation(
+        &mut self,
+        _: &'static super::qualification::Kind,
+    ) -> Result<Option<alloc::sync::Arc<super::qualification::Grant>>, Error> {
+        Ok(None)
+    }
+    fn station_continuation_request(
+        &mut self,
+        _: &'static super::qualification::Kind,
+    ) -> Result<super::ContinuationRequest, Error> {
+        Err(Error::Unsupported)
+    }
+    /// A clone of the current retained station gate.
+    fn station_gate(&mut self) -> Result<super::power_policy::Gate, Error> {
         Err(Error::Unsupported)
     }
     fn station_bind_tx_ba(
@@ -209,11 +234,21 @@ pub(super) unsafe trait Registers: Send {
     fn packet_submit(&mut self, _: &[u8], _: bool) -> Result<u64, super::packet_core::Error> {
         Err(super::packet_core::Error::State)
     }
+    fn packet_scan_address(&mut self, _: Option<[u8; 6]>) -> Result<(), super::packet_core::Error> {
+        Err(super::packet_core::Error::State)
+    }
     fn packet_poll(&mut self) -> Result<super::packet_core::Step, super::packet_core::Error> {
         Err(super::packet_core::Error::State)
     }
     fn packet_stop(&mut self) -> Result<(), super::packet_core::Error> {
         Err(super::packet_core::Error::State)
+    }
+    /// Native `rtw_pci_stop` and DMA idle proof over every non-beacon ring.
+    async fn quiesce_dma(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn dma_reclaimable(&self) -> bool {
+        false
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,6 +268,8 @@ pub(super) struct Backend<R: Registers, M: Memory> {
     published: bool,
     boundary: u16,
     completed: bool,
+    /// The completed beacon descriptor was zeroed under parked authority.
+    disarmed: bool,
 }
 impl<R: Registers, M: Memory> core::fmt::Debug for Backend<R, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -274,6 +311,7 @@ impl<R: Registers, M: Memory> Backend<R, M> {
             published: false,
             boundary,
             completed: false,
+            disarmed: false,
         })
     }
     fn word(memory: &mut M, offset: usize, value: u32) -> Result<(), Error> {
@@ -380,8 +418,29 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     ) -> Result<(), Error> {
         self.io.station_bind_protection(g)
     }
+    fn station_bind_continuation(
+        &mut self,
+        g: alloc::sync::Arc<super::qualification::Grant>,
+    ) -> Result<(), Error> {
+        self.io.station_bind_continuation(g)
+    }
     fn station_rts_request(&mut self) -> Result<super::RtsRequest, Error> {
         self.io.station_rts_request()
+    }
+    fn station_continuation(
+        &mut self,
+        kind: &'static super::qualification::Kind,
+    ) -> Result<Option<alloc::sync::Arc<super::qualification::Grant>>, Error> {
+        self.io.station_continuation(kind)
+    }
+    fn station_continuation_request(
+        &mut self,
+        kind: &'static super::qualification::Kind,
+    ) -> Result<super::ContinuationRequest, Error> {
+        self.io.station_continuation_request(kind)
+    }
+    fn station_gate(&mut self) -> Result<super::power_policy::Gate, Error> {
+        self.io.station_gate()
     }
     fn station_bind_tx_ba(
         &mut self,
@@ -555,6 +614,7 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
         if self.io.read8(0x383)? & 0x10 != 0 || self.io.read8(0x550)? & 8 != 0 {
             return Err(Error::Prerequisite);
         }
+        self.disarmed = true;
         self.io.finish_station8821c(gate)
     }
     fn begin_commands(&mut self) -> Result<(), Error> {
@@ -600,6 +660,7 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
             return Err(Error::Prerequisite);
         }
         self.state = PageState::Terminal;
+        self.disarmed = true;
         self.io.finish_radio(gate)
     }
 
@@ -641,11 +702,33 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     ) -> Result<u64, super::packet_core::Error> {
         self.io.packet_submit(frame, report)
     }
+    fn packet_scan_address(
+        &mut self,
+        address: Option<[u8; 6]>,
+    ) -> Result<(), super::packet_core::Error> {
+        self.io.packet_scan_address(address)
+    }
     fn packet_poll(&mut self) -> Result<super::packet_core::Step, super::packet_core::Error> {
         self.io.packet_poll()
     }
     fn packet_stop(&mut self) -> Result<(), super::packet_core::Error> {
         self.io.packet_stop()
+    }
+    async fn quiesce_dma(&mut self) -> Result<(), Error> {
+        // The beacon page must have completed (fresh BCN_VALID) or been
+        // disarmed; a poisoned or cancelled transfer stays retained.
+        if !self.published
+            || !(matches!(self.state, PageState::Idle | PageState::Continued) || self.disarmed)
+        {
+            return Err(Error::State);
+        }
+        self.state = PageState::Terminal;
+        self.io.quiesce_dma().await?;
+        self.published = false;
+        Ok(())
+    }
+    fn dma_reclaimable(&self) -> bool {
+        !self.published && (self.state == PageState::Unclaimed || self.io.dma_reclaimable())
     }
     async fn delay_us(&mut self, us: u64) {
         self.io.delay_us(us).await;

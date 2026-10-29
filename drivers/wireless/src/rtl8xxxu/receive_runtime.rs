@@ -57,6 +57,10 @@ pub struct Receiver<C: ControlIo, B: PacketIo> {
     wmm: Option<Arc<super::wmm_runtime::Proof>>,
     ht: Option<Arc<super::ht_runtime::Grant>>,
     ht_gains: Option<[u8; 8]>,
+    /// `priv->ra_info` while a station association is bound.
+    ra: Option<super::rate_adaptation::RateAdaptation>,
+    /// REG_TX_REPORT_TIME value owed to the async maintain path.
+    report_time: Option<u16>,
 }
 #[derive(Clone)]
 pub(super) struct Authority {
@@ -134,6 +138,8 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
             wmm: None,
             ht: None,
             ht_gains: None,
+            ra: None,
+            report_time: None,
         })
     }
     pub fn phase(&self) -> Phase {
@@ -266,7 +272,11 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
                             return Err(Error::State);
                         }
                     }
-                    let acm = self.firmware.read8(0x5c0).await.map_err(Error::Control)? & !0x0e;
+                    // rtl8xxxu_conf_tx: REG_ACM_HW_CTRL BK0/BE1/VI2/VO3
+                    // follow each AC's ACM. BE ACM was refused above, and
+                    // host classification already downgrades ACM traffic.
+                    let acm = (self.firmware.read8(0x5c0).await.map_err(Error::Control)? & !0x0f)
+                        | super::wmm_runtime::acm_bits(p);
                     self.firmware
                         .write8(0x5c0, acm)
                         .await
@@ -283,6 +293,71 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         if result.is_ok() {
             self.packets.qos = true;
             self.packets.ht = ht;
+            self.phase = Phase::Active;
+        } else {
+            self.fail();
+        }
+        result
+    }
+    /// Host aggregation facts for the packet owner; no device access.
+    pub(super) fn set_ampdu_tx(&mut self, value: Option<(u8, u8)>) {
+        self.packets.ampdu = value.filter(|_| self.ht_enabled());
+    }
+    /// `rtl8xxxu_set_ampdu_factor` + `rtl8xxxu_set_ampdu_min_space`, issued
+    /// by `rtl8xxxu_ampdu_action` TX_START (peer factor/density) and
+    /// TX_STOP (both 0). Every EP0 write has an exact readback; failure or
+    /// cancellation is terminal like every other EP0 configuration.
+    pub(super) async fn configure_ampdu(&mut self, factor: u8, density: u8) -> Result<(), Error> {
+        if self.phase() != Phase::Active || !self.ht_enabled() || factor > 3 || density > 7 {
+            return Err(Error::State);
+        }
+        let limit = (1u8 << (factor + 2)).min(0xf);
+        let values = [0x41u8, 0xa8, 0x72, 0xb9].map(|mut v| {
+            if v & 0xf0 > limit << 4 {
+                v = (v & 0x0f) | limit << 4;
+            }
+            if v & 0x0f > limit {
+                v = (v & 0xf0) | limit;
+            }
+            v
+        });
+        self.phase = Phase::Configuring;
+        let mut attempt = Attempt {
+            firmware: self.firmware.clone(),
+            armed: true,
+        };
+        let result = async {
+            // REG_AGGLEN_LMT 0x458..0x45b, REG_AMPDU_MIN_SPACE 0x45c.
+            for (i, value) in values.into_iter().enumerate() {
+                let register = 0x458 + i as u16;
+                self.firmware
+                    .write8(register, value)
+                    .await
+                    .map_err(Error::Control)?;
+                if self
+                    .firmware
+                    .read8(register)
+                    .await
+                    .map_err(Error::Control)?
+                    != value
+                {
+                    return Err(Error::State);
+                }
+            }
+            let space =
+                (self.firmware.read8(0x45c).await.map_err(Error::Control)? & 0xf8) | density;
+            self.firmware
+                .write8(0x45c, space)
+                .await
+                .map_err(Error::Control)?;
+            if self.firmware.read8(0x45c).await.map_err(Error::Control)? != space {
+                return Err(Error::State);
+            }
+            Ok(())
+        }
+        .await;
+        attempt.armed = false;
+        if result.is_ok() {
             self.phase = Phase::Active;
         } else {
             self.fail();
@@ -367,22 +442,62 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         }
         match self.authority().invoke(|| self.packets.poll_receive())? {
             Ok(None) => Ok(None),
-            Ok(Some(records)) => Ok(Some(
-                records
-                    .into_iter()
-                    .filter_map(|r| match r {
+            Ok(Some(records)) => {
+                let ht = self.ht_enabled();
+                let mut frames = Vec::new();
+                for record in records {
+                    match record {
                         // Hardware decryption is disabled. Never adopt unexpected
                         // plaintext metadata as a software-authenticated MPDU.
-                        Record::Frame(f) if f.admitted(self.ht_enabled()) => Some(f),
-                        _ => None,
-                    })
-                    .collect(),
-            )),
+                        Record::Frame(f) if f.admitted_or_aggregate(ht) => frames.push(f),
+                        // `rtl8188e_c2hcmd_callback` rpt_sel 2.
+                        Record::Report {
+                            kind: 2,
+                            bytes,
+                            length,
+                            valid,
+                        } => {
+                            if let Some(ra) = &mut self.ra {
+                                if let Some(time) = ra.report2(length & 0x3ff, valid, &bytes) {
+                                    self.report_time = Some(time);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Some(frames))
+            }
+            // A halted bulk-IN pipe is pending recovery, not a receipt.
+            Err(packet_transport::Error::Halted) => Ok(None),
             Err(error) => {
                 self.fail();
                 Err(Error::Packet(error))
             }
         }
+    }
+    /// True while a halted bulk pipe awaits `recover`.
+    pub(super) fn recovery_pending(&self) -> bool {
+        self.packets.is_halted()
+    }
+    /// Endpoint halt recovery for the running radio (Reset Endpoint + Set
+    /// TR Dequeue + CLEAR_FEATURE(ENDPOINT_HALT), then repost). Failure or
+    /// cancellation is terminal like every other packet-owner operation.
+    pub(super) async fn recover(&mut self) -> Result<packet_transport::Recovery, Error> {
+        self.current_wmm()?;
+        if !matches!(self.phase(), Phase::Receiving | Phase::Active) {
+            return Err(Error::State);
+        }
+        let mut attempt = Attempt {
+            firmware: self.firmware.clone(),
+            armed: true,
+        };
+        let result = self.packets.recover().await;
+        attempt.armed = false;
+        result.map_err(|error| {
+            self.fail();
+            Error::Packet(error)
+        })
     }
     pub async fn stop(&mut self) -> Result<(), Error> {
         if !matches!(self.phase(), Phase::Receiving | Phase::Active) {
@@ -573,6 +688,7 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         }
         match self.authority().invoke(|| self.packets.poll_transmit())? {
             Ok(result) => Ok(result),
+            Err(packet_transport::Error::Halted) => Ok(None),
             Err(error) => {
                 self.fail();
                 Err(Error::Packet(error))
@@ -593,10 +709,85 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
     pub(super) fn fail_terminal(&mut self) {
         self.fail();
     }
+    /// `rtl8188e_ra_info_init_all` + `rtl8188e_update_rate_mask` at
+    /// association (`rtl8xxxu_bss_info_changed` BSS_CHANGED_ASSOC).
+    pub(super) fn start_rate_adaptation(&mut self, mask: u32, sgi: bool) {
+        let mut ra = super::rate_adaptation::RateAdaptation::new();
+        ra.update_rate_mask(mask, sgi);
+        self.ra = Some(ra);
+        self.report_time = None;
+    }
+    pub(super) fn stop_rate_adaptation(&mut self) {
+        self.ra = None;
+        self.report_time = None;
+    }
+    pub(super) fn rate_adaptation(
+        &mut self,
+    ) -> Option<&mut super::rate_adaptation::RateAdaptation> {
+        self.ra.as_mut()
+    }
+    pub(super) fn rate_adaptation_state(&self) -> Option<&super::rate_adaptation::RateAdaptation> {
+        self.ra.as_ref()
+    }
+    pub(super) fn report_time_pending(&self) -> bool {
+        self.report_time.is_some()
+    }
+    /// Chip cut for `rtl8188e_cck_rssi`.
+    pub(super) fn cut(&self) -> u8 {
+        self.firmware.factory().map_or(0, |f| f.cut)
+    }
+    /// `rtl8188e_handle_ra_tx_report2`: `rtl8xxxu_write16(REG_TX_REPORT_TIME)`
+    /// with readback. Failure or cancellation is terminal.
+    pub(super) async fn apply_report_time(&mut self) -> Result<(), Error> {
+        let Some(time) = self.report_time else {
+            return Ok(());
+        };
+        if self.phase() != Phase::Active {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Configuring;
+        let mut attempt = Attempt {
+            firmware: self.firmware.clone(),
+            armed: true,
+        };
+        let result = async {
+            self.firmware
+                .write16(0x4f0, time)
+                .await
+                .map_err(Error::Control)?;
+            if self.firmware.read16(0x4f0).await.map_err(Error::Control)? != time {
+                return Err(Error::State);
+            }
+            Ok(())
+        }
+        .await;
+        attempt.armed = false;
+        if result.is_ok() {
+            self.phase = Phase::Active;
+            self.report_time = None;
+        } else {
+            self.fail();
+        }
+        result
+    }
+    /// DATA under host rate adaptation (`rtl8xxxu_fill_txdesc_v3`).
+    pub(super) fn submit_native_data_adaptive(&mut self, frame: &[u8]) -> Result<(), Error> {
+        let ra = self.ra.as_ref().ok_or(Error::State)?;
+        let (rate, pt_stage) = (ra.tx_rate(), ra.pt_stage);
+        self.submit_native_data_with(frame, rate, Some(pt_stage))
+    }
     pub(super) fn submit_native_data(&mut self, frame: &[u8]) -> Result<(), Error> {
         self.submit_native_data_rate(frame, 0)
     }
     pub(super) fn submit_native_data_rate(&mut self, frame: &[u8], rate: u8) -> Result<(), Error> {
+        self.submit_native_data_with(frame, rate, None)
+    }
+    fn submit_native_data_with(
+        &mut self,
+        frame: &[u8],
+        rate: u8,
+        adaptive: Option<u8>,
+    ) -> Result<(), Error> {
         self.current_wmm()?;
         if rate != 0 && self.wmm.is_none() {
             return Err(Error::State);
@@ -614,13 +805,54 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         let proof = self.authority();
         let submit = || {
             self.packets
-                .submit_rate(super::packet_codec::Kind::Data, frame, rate)
+                .submit_adaptive(super::packet_codec::Kind::Data, frame, rate, adaptive)
         };
         let result = proof.invoke(submit)?;
         if self.packets.is_failed() {
             self.fail();
         }
         result.map_err(Error::Packet)
+    }
+    /// mac80211 `ieee80211_set_disassoc` clears the link BSSID, so
+    /// `rtl8xxxu_bss_info_changed(BSS_CHANGED_BSSID)` runs
+    /// `rtl8xxxu_set_bssid(zero)` (REG_BSSID 0x618..0x61d): a stopped
+    /// receiver drops its bound peer and per-association rate state so a
+    /// later `prepare_station` may bind a new peer. Any EP0 failure is
+    /// terminal like every other runtime write.
+    pub(super) async fn release_station(&mut self) -> Result<(), Error> {
+        if self.phase() != Phase::Stopped || self.peer.is_none() {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Configuring;
+        let mut attempt = Attempt {
+            firmware: self.firmware.clone(),
+            armed: true,
+        };
+        let result = async {
+            for i in 0..6u16 {
+                let reg = 0x618 + i;
+                self.firmware.write8(reg, 0).await.map_err(Error::Control)?;
+                if self.firmware.read8(reg).await.map_err(Error::Control)? != 0 {
+                    return Err(Error::State);
+                }
+            }
+            Ok(())
+        }
+        .await;
+        attempt.armed = false;
+        match result {
+            Ok(()) => {
+                self.peer = None;
+                self.ra = None;
+                self.report_time = None;
+                self.phase = Phase::Stopped;
+                Ok(())
+            }
+            Err(error) => {
+                self.fail();
+                Err(error)
+            }
+        }
     }
     /// Serialized unicast station programming, from Linux set_linktype and
     /// set_bssid. This owner has no packet in flight during this transition.
@@ -821,6 +1053,8 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         }
     }
     fn fail(&mut self) {
+        self.ra = None;
+        self.report_time = None;
         self.phase = Phase::Failed;
         self.packets.fail();
         self.firmware.runtime_failed(ControlError::RuntimeState);

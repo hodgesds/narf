@@ -30,6 +30,25 @@ const QTXD: u64 = 0x880;
 const QSTS: u64 = 0xa00;
 const DIAG: u64 = 0x8048;
 const RX_PARK: u32 = 0x0200_0020;
+/// `reg.h::AR_RX_FILTER`; `ath_stoprecv` clears it before RX DMA stop.
+const RX_FILTER: u64 = 0x803c;
+/// `reg.h::AR_PCU_MISC` with `AR_PCU_FORCE_QUIET_COLL | AR_PCU_CLEAR_VMF`.
+const PCU_MISC: u64 = 0x8120;
+const PCU_QUIET: u32 = 0x0004_0000 | 0x0100_0000;
+/// `reg.h::AR_DIAG_FORCE_CH_IDLE_HIGH`.
+const DIAG_IDLE_HIGH: u32 = 0x0100_0000;
+/// `reg.h::AR_D_GBL_IFS_MISC` / `AR_D_GBL_IFS_MISC_IGNORE_BACKOFF`.
+const IFS_MISC: u64 = 0x10f0;
+const IGNORE_BACKOFF: u32 = 0x1000_0000;
+/// `ATH9K_NUM_TX_QUEUES`; `AR_Q_TXD_M` covers all ten DCUs.
+const QUEUES: u64 = 10;
+/// `hw.h::AH_RX_STOP_DMA_TIMEOUT / AH_TIME_QUANTUM` polls of 10 us.
+const RX_STOP_POLLS: u32 = 1000;
+/// `mac.c::ath9k_hw_abort_tx_dma` per-QCU `maxdelay` polls (full-rate channel).
+const TX_ABORT_POLLS: u32 = 1000;
+/// `reg.h::AR_MACMISC` / `AR_DMADBG_7` (RX DMA hang observation).
+const MACMISC: u64 = 0x0058;
+const DMADBG_7: u64 = 0x00fc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Error {
@@ -63,6 +82,9 @@ pub(super) trait Port {
     fn rx_ba_grant(&self) -> Option<alloc::sync::Arc<super::rx_ba::Grant>> {
         None
     }
+    fn qos_grant(&self) -> Option<alloc::sync::Arc<super::qos::Grant>> {
+        None
+    }
     fn transmit_allowed(&self) -> Result<(), Error>;
     /// Actual CPU payload/descriptor access occurs in current device invocation.
     fn access<T>(
@@ -75,6 +97,29 @@ pub(super) trait Port {
     fn allocate(&self, bytes: usize) -> Result<DmaBuffer, Error>;
     fn master(&self, enabled: bool) -> Result<(), Error>;
     fn now_us(&self) -> u64;
+    /// Linux `udelay` between DMA-stop polls.
+    fn delay_us(&self, us: u64) {
+        narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_us(us));
+    }
+    /// Receive every packet allocation after a quiescence proof. The native
+    /// port frees them; a model may retain them to observe late device access.
+    fn release(&self, buffers: Vec<DmaBuffer>) {
+        drop(buffers);
+    }
+    /// The flush-read proof needs PCIe ordering: a read completion may pass
+    /// earlier posted DMA writes only with Relaxed Ordering enabled.
+    fn ordered(&self) -> bool {
+        true
+    }
+    /// Wake source when this function's MSI vector is installed. `None`
+    /// keeps the owner on scheduled polling (no INTx route is claimed).
+    fn interrupt(&self) -> Option<alloc::sync::Arc<super::irq::Signal>> {
+        None
+    }
+    /// Open (or close) message delivery after (or before) the chip masks.
+    fn deliver(&self, _enabled: bool) -> Result<(), Error> {
+        Ok(())
+    }
 }
 struct Memory(DmaBuffer);
 impl Memory {
@@ -204,6 +249,7 @@ struct Pending {
     deadline: u64,
     original: Vec<u8>,
     dma: Vec<u8>,
+    queue: u64,
 }
 struct PairPending {
     slots: [usize; 2],
@@ -249,8 +295,12 @@ pub(super) struct Packet<P: Port> {
     ht: Option<super::ht::Profile>,
     slot_us: u32,
     edca: Option<u32>,
+    qos: Option<super::qos::Profile>,
     ba: bool,
     tx_ba: bool,
+    reclaimed: bool,
+    irq: Option<super::irq::Mask>,
+    full_imr: u32,
 }
 impl<P: Port> core::fmt::Debug for Packet<P> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -324,12 +374,21 @@ impl<P: Port> Packet<P> {
             ht: None,
             slot_us: 20,
             edca: None,
+            qos: None,
             ba: false,
             tx_ba: false,
+            reclaimed: false,
+            irq: None,
+            full_imr: 0,
         })
     }
     pub(super) fn phase(&self) -> Phase {
         self.phase
+    }
+    /// True only after the terminal stop proved every RX/TX DMA engine idle
+    /// with bus mastering off and released the packet allocations.
+    pub(super) fn reclaimed(&self) -> bool {
+        self.reclaimed
     }
     pub(super) fn check_transmit(&self) -> Result<(), Error> {
         self.port.transmit_allowed()?;
@@ -345,6 +404,10 @@ impl<P: Port> Packet<P> {
             if self.port.read(0x1040)? != word || self.port.read(0x10c0)? != 0 {
                 return Err(Error::Descriptor);
             }
+        }
+        if let Some(profile) = self.qos {
+            self.port.qos_grant().ok_or(Error::Access)?.check()?;
+            super::mac::check_data_queues(&self.port, &profile.words())?;
         }
         if self.ba {
             self.port
@@ -399,6 +462,54 @@ impl<P: Port> Packet<P> {
         }
         grant.readback(&self.port)?;
         self.tx_ba = true;
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    pub(super) fn qos_grant(&self) -> Option<alloc::sync::Arc<super::qos::Grant>> {
+        self.port.qos_grant()
+    }
+    pub(super) fn qos(&self) -> Option<super::qos::Profile> {
+        self.qos
+    }
+    /// `ath9k_conf_tx` for the three additional ACs on their own QCU/DCU,
+    /// under the measured N85Q program. BE/queue0 was already programmed by
+    /// [`Self::set_ht`] and must read back unchanged.
+    pub(super) fn enable_qos(
+        &mut self,
+        grant: &alloc::sync::Arc<super::qos::Grant>,
+        profile: super::qos::Profile,
+    ) -> Result<(), Error> {
+        if self.phase != Phase::Running
+            || self.ht.is_none()
+            || self.qos.is_some()
+            || self.pending.is_some()
+            || self.pair.is_some()
+            || self
+                .port
+                .qos_grant()
+                .is_none_or(|g| !alloc::sync::Arc::ptr_eq(&g, grant))
+            || self
+                .port
+                .ht_grant()
+                .is_none_or(|g| !alloc::sync::Arc::ptr_eq(&g, grant.base()))
+        {
+            return Err(Error::State);
+        }
+        let words = profile.words();
+        if self.edca != Some(words[0]) {
+            return Err(Error::Packet);
+        }
+        grant.check()?;
+        self.phase = Phase::Failed;
+        self.port.transmit_allowed()?;
+        for queue in 1..4u64 {
+            super::mac::data_queue(&self.port, queue, words[queue as usize])?;
+        }
+        if self.irq.is_some() {
+            super::irq::data_queues(&self.port)?;
+        }
+        super::mac::check_data_queues(&self.port, &words)?;
+        self.qos = Some(profile);
         self.phase = Phase::Running;
         Ok(())
     }
@@ -462,6 +573,11 @@ impl<P: Port> Packet<P> {
         }
         self.check_transmit()?;
         self.ht = Some(self.ht.ok_or(Error::State)?.observe(offer, ies, basic)?);
+        if let Some(profile) = self.qos {
+            if super::qos::Profile::parse(ies)? != profile {
+                return Err(Error::Packet);
+            }
+        }
         Ok(())
     }
     pub(super) fn set_peer(
@@ -571,8 +687,15 @@ impl<P: Port> Packet<P> {
         }
         let local = self.local;
         let profile = self.ht.ok_or(Error::State)?;
-        self.submit_inner(frame, |address| {
-            descriptor::transmit_ht(frame, local, address, mcs, basic, profile)
+        // QoS DATA leaves on its AC's QCU only under the N85Q program.
+        let tids = if self.qos.is_some() { 7 } else { 0 };
+        let queue = if self.qos.is_some() && frame.first() == Some(&0x88) && frame.len() > 24 {
+            super::qos::queue(frame[24] & 7)
+        } else {
+            0
+        };
+        self.submit_queue(frame, queue, |address| {
+            descriptor::transmit_ht_tid(frame, local, address, mcs, basic, profile, tids)
         })
     }
     pub(super) fn submit_sender_action(
@@ -731,6 +854,17 @@ impl<P: Port> Packet<P> {
         frame: &[u8],
         encode: impl FnOnce(u64) -> Result<[u32; WORDS], descriptor::Error>,
     ) -> Result<u64, Error> {
+        self.submit_queue(frame, 0, encode)
+    }
+    fn submit_queue(
+        &mut self,
+        frame: &[u8],
+        queue: u64,
+        encode: impl FnOnce(u64) -> Result<[u32; WORDS], descriptor::Error>,
+    ) -> Result<u64, Error> {
+        if queue != 0 && self.qos.is_none() || queue > 3 {
+            return Err(Error::State);
+        }
         if self.phase != Phase::Running {
             return Err(Error::State);
         }
@@ -744,7 +878,10 @@ impl<P: Port> Packet<P> {
         let dma = descriptor::dma_bytes(frame).map_err(|_| Error::Packet)?;
         self.phase = Phase::Failed;
         self.check_transmit()?;
-        if self.port.read(QTXE)? & 1 != 0 || self.port.read(QSTS)? & 3 != 0 {
+        if self.port.read(QTXE)? & 0xf != 0
+            || self.port.read(QSTS)? & 3 != 0
+            || self.qos.is_some() && !self.data_queues_idle()?
+        {
             // No Pending owner exists here. A live queue is ambiguous DMA,
             // not reusable credit after restoring a policy or status word.
             return Err(Error::Descriptor);
@@ -773,14 +910,16 @@ impl<P: Port> Packet<P> {
             deadline,
             original: frame.to_vec(),
             dma,
+            queue,
         });
+        let txdp = QTXDP + queue * 4;
         self.port
-            .write(QTXDP, storage.tx.address() + (slot * STRIDE) as u32)?;
-        if self.port.read(QTXDP)? != storage.tx.address() + (slot * STRIDE) as u32 {
+            .write(txdp, storage.tx.address() + (slot * STRIDE) as u32)?;
+        if self.port.read(txdp)? != storage.tx.address() + (slot * STRIDE) as u32 {
             return Err(Error::Descriptor);
         }
         self.port.transmit_allowed()?;
-        self.port.write(QTXE, 1)?;
+        self.port.write(QTXE, 1 << queue)?;
         self.phase = Phase::Running;
         Ok(id)
     }
@@ -824,7 +963,9 @@ impl<P: Port> Packet<P> {
                 }
                 return Ok(None);
             }
-            if self.port.read(QTXE)? & 1 != 0 || self.port.read(QSTS)? & 3 != 0 {
+            if self.port.read(QTXE)? & (1 << pending.queue) != 0
+                || self.port.read(QSTS + pending.queue * 4)? & 3 != 0
+            {
                 if self.port.now_us() >= pending.deadline {
                     return Err(Error::Timeout);
                 }
@@ -924,21 +1065,212 @@ impl<P: Port> Packet<P> {
         self.phase = Phase::Running;
         Ok(ReceiveStep { consumed, frame })
     }
+    /// Program the Linux station interrupt mask and open MSI delivery once
+    /// the rings run. Without an installed vector the owner stays polled.
+    pub(super) fn enable_interrupts(&mut self) -> Result<bool, Error> {
+        if self.phase != Phase::Running || self.irq.is_some() {
+            return Err(Error::State);
+        }
+        if self.port.interrupt().is_none() {
+            return Ok(false);
+        }
+        self.phase = Phase::Failed;
+        let ht = self.port.ht_grant().is_some();
+        let mask = super::irq::enable(&self.port, ht, true)?;
+        self.irq = Some(mask);
+        self.full_imr = mask.imr;
+        self.port.deliver(true)?;
+        self.phase = Phase::Running;
+        Ok(true)
+    }
+    /// The wake source, only while chip interrupts are programmed.
+    pub(super) fn interrupt(&self) -> Option<alloc::sync::Arc<super::irq::Signal>> {
+        self.irq.and_then(|_| self.port.interrupt())
+    }
+    /// `ath_isr` bottom half: read/clear causes and kill IER until
+    /// [`Self::service_end`]. FATAL (HOST1 fatal/PERR or completion timeout)
+    /// closes this owner, the native counterpart of Linux's chip reset.
+    pub(super) fn service_begin(&mut self) -> Result<Option<super::irq::Events>, Error> {
+        let Some(mask) = self.irq else {
+            return Ok(None);
+        };
+        if self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        let events = super::irq::cause(&self.port, mask.imr)?;
+        super::irq::kill(&self.port, mask.msi)?;
+        let Some(events) = events else {
+            return Ok(None);
+        };
+        if events.fatal {
+            self.phase = Phase::Failed;
+            return Err(Error::Access);
+        }
+        if events.rx_eol && mask.imr & super::irq::RX_EOL_ORN != 0 {
+            // ath_isr: drop RXEOL|RXORN until the RX tasklet ran.
+            let imr = mask.imr & !super::irq::RX_EOL_ORN;
+            self.port.write(super::irq::IMR, imr)?;
+            self.irq = Some(super::irq::Mask { imr, ..mask });
+        }
+        Ok(Some(events))
+    }
+    /// `ath9k_tasklet` tail: restore RXEOL|RXORN once RX was serviced, then
+    /// `ath9k_hw_resume_interrupts`.
+    pub(super) fn service_end(&mut self) -> Result<(), Error> {
+        let Some(mut mask) = self.irq else {
+            return Ok(());
+        };
+        if self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        if mask.imr != self.full_imr {
+            self.port.write(super::irq::IMR, self.full_imr)?;
+            mask.imr = self.full_imr;
+            self.irq = Some(mask);
+        }
+        super::irq::resume(&self.port, mask)
+    }
+
+    /// `mac.c::ath9k_hw_stopdmarecv` (AR_CR_RXD and an RXE poll).
+    fn stop_receive(&self) -> Result<(), Error> {
+        let diag = self.port.read(DIAG)?;
+        self.port.write(DIAG, diag | RX_PARK)?;
+        self.port.write(RX_FILTER, 0)?;
+        // DMA observation line 8 / misc observation bus 1 for DMADBG_7.
+        self.port.write(MACMISC, (8 << 5) | (1 << 15))?;
+        self.port.write(CR, 0x20)?;
+        let mut last = 0;
+        for _ in 0..RX_STOP_POLLS {
+            if self.port.read(CR)? & 4 == 0 {
+                return Ok(());
+            }
+            // Pre-AR9300 MAC hang signature: two consecutive 0x1c0 states.
+            // Linux reports `reset` and `ath_stoprecv` returns false.
+            let status = self.port.read(DMADBG_7)? & 0x7f0;
+            if status == 0x1c0 && status == last {
+                return Err(Error::Timeout);
+            }
+            last = status;
+            self.port.delay_us(10);
+        }
+        Err(Error::Timeout)
+    }
+    /// The additional data QCUs (1..3) have no pending frame.
+    fn data_queues_idle(&self) -> Result<bool, Error> {
+        for queue in 1..4 {
+            if self.port.read(QSTS + queue * 4)? & 3 != 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    /// `mac.c::ath9k_hw_numtxpending(q) == 0`.
+    fn tx_idle(&self, queue: u64) -> Result<bool, Error> {
+        Ok(self.port.read(QSTS + queue * 4)? & 3 == 0 && self.port.read(QTXE)? & (1 << queue) == 0)
+    }
+    /// `mac.c::ath9k_hw_abort_tx_dma`: disable every DCU, force quiet
+    /// collision/idle channel and ignore backoff, then poll each QCU up to
+    /// `maxdelay` times with 5 us between polls. The terminal owner keeps
+    /// AR_Q_TXD set instead of Linux's final re-enable write.
+    fn abort_transmit(&self) -> Result<(), Error> {
+        self.port.write(QTXD, 0x3ff)?;
+        let misc = self.port.read(PCU_MISC)?;
+        self.port.write(PCU_MISC, misc | PCU_QUIET)?;
+        let diag = self.port.read(DIAG)?;
+        self.port.write(DIAG, diag | DIAG_IDLE_HIGH)?;
+        let ifs = self.port.read(IFS_MISC)?;
+        self.port.write(IFS_MISC, ifs | IGNORE_BACKOFF)?;
+        let mut idle = true;
+        for queue in 0..QUEUES {
+            let mut drained = false;
+            for poll in 0..TX_ABORT_POLLS {
+                if poll != 0 {
+                    self.port.delay_us(5);
+                }
+                if self.tx_idle(queue)? {
+                    drained = true;
+                    break;
+                }
+            }
+            idle &= drained;
+        }
+        let misc = self.port.read(PCU_MISC)?;
+        self.port.write(PCU_MISC, misc & !PCU_QUIET)?;
+        let diag = self.port.read(DIAG)?;
+        self.port.write(DIAG, diag & !DIAG_IDLE_HIGH)?;
+        let ifs = self.port.read(IFS_MISC)?;
+        self.port.write(IFS_MISC, ifs & !IGNORE_BACKOFF)?;
+        if idle {
+            Ok(())
+        } else {
+            Err(Error::Timeout)
+        }
+    }
+    /// After verified BME-off, these non-posted BAR reads order behind any
+    /// earlier device-originated posted DMA write (PCIe completions never pass
+    /// posted requests), so idle engines here prove no outstanding access.
+    fn quiescent(&self) -> Result<bool, Error> {
+        if !self.port.ordered() {
+            return Ok(false);
+        }
+        if self.port.read(CR)? & 4 != 0 || self.port.read(DIAG)? & RX_PARK != RX_PARK {
+            return Ok(false);
+        }
+        for queue in 0..QUEUES {
+            if !self.tx_idle(queue)? {
+                return Ok(false);
+            }
+        }
+        Ok(self.port.read(0x24)? & 1 == 0)
+    }
     /// Close every independent packet gate, trying the PCI gate even if BAR
-    /// access failed. This terminal park never claims a reclamation proof.
+    /// access failed. Engines are stopped with bus mastering still on, as in
+    /// Linux `ath_stoprecv`/`ath_drain_all_txq`, so in-flight descriptors can
+    /// finish. Only a complete stop plus post-BME-off idle proof releases the
+    /// rings and buffers; otherwise they stay pinned for the rest of the boot.
     pub(super) fn stop(&mut self) -> Result<(), Error> {
         if self.phase == Phase::Stopped {
             return Err(Error::State);
         }
         self.phase = Phase::Stopped;
-        let diag = self
-            .port
-            .read(DIAG)
-            .and_then(|value| self.port.write(DIAG, value | RX_PARK));
-        let rx = self.port.write(CR, 0x20);
-        let tx = self.port.write(QTXD, 0x3ff);
-        let irq = self.port.write(0x24, 0);
+        let rx = self.stop_receive();
+        let tx = self.abort_transmit();
+        let irq = super::irq::kill(&self.port, self.irq.is_some_and(|m| m.msi)).and(
+            // An armed vector is torn down even if chip interrupts were
+            // never enabled (start failed before `enable_interrupts`).
+            if self.irq.take().is_some() || self.port.interrupt().is_some() {
+                self.port.deliver(false)
+            } else {
+                Ok(())
+            },
+        );
         let master = self.port.master(false);
-        diag.and(rx).and(tx).and(irq).and(master)
+        rx.and(tx).and(irq).and(master)?;
+        if !self.quiescent()? {
+            return Err(Error::Timeout);
+        }
+        self.reclaim();
+        Ok(())
+    }
+    fn reclaim(&mut self) {
+        self.pending = None;
+        self.pair = None;
+        self.held = None;
+        if let Some(storage) = self.storage.take() {
+            let mut buffers = Vec::new();
+            let Storage {
+                tx,
+                rx,
+                tx_bytes,
+                rx_bytes,
+            } = storage;
+            buffers.push(tx.0);
+            buffers.push(rx.0);
+            buffers.extend(tx_bytes.into_iter().map(|m| m.0));
+            buffers.extend(rx_bytes.into_iter().map(|m| m.0));
+            self.port.release(buffers);
+        }
+        self.published = false;
+        self.reclaimed = true;
     }
 }

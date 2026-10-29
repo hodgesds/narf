@@ -10,7 +10,7 @@ use crate::mt7921::{
     cmd, packet_tx,
 };
 use alloc::{collections::VecDeque, vec, vec::Vec};
-use narf_wireless::eapol::{EapolRx, EapolRxError, Gtk, KeyMgmt, RsnaParams, Supplicant};
+use narf_wireless::eapol::{EapolRx, EapolRxError, Gtk, RsnaParams, Supplicant};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Association-owned RSNA state. Key bytes are never included in driver
@@ -22,6 +22,21 @@ pub(super) struct StationSecurity {
     pub(super) pairwise: [u64; 17],
     group: [Option<[u64; 17]>; 4],
     pending: VecDeque<(Vec<u8>, bool)>,
+    /// PMF negotiated (`JoinPlan::pmf()`): robust management frames are
+    /// protected once the PTK is installed (mac80211 `sta->mfp`).
+    pub(super) pmf: bool,
+    /// The PTK is installed in WCID 1 (`ieee80211_drop_unencrypted_mgmt`
+    /// requires `rx->sta->ptk_idx` / a pairwise key before it drops).
+    ptk_installed: bool,
+    /// Received unicast robust-management CCMP PN (mac80211 security_idx
+    /// `IEEE80211_NUM_TIDS` for management frames).
+    management_pn: u64,
+    /// The installed IGTK for software BIP verification (mt76 hands BIP
+    /// group management frames to mac80211 `ieee80211_crypto_aes_cmac_decrypt`).
+    igtk: narf_wireless::mfp::MfpKeyStore,
+    /// The last installed CCMP group key index, repeated as `key[0]` of
+    /// the IGTK record (`sta_key_conf`).
+    gtk_id: u8,
 }
 
 impl core::fmt::Debug for StationSecurity {
@@ -41,11 +56,19 @@ impl StationSecurity {
         bss: &ScanBss,
         plan: &JoinPlan,
         own: [u8; 6],
-        psk: [u8; 32],
+        pmk: &[u8; 32],
     ) -> Result<Self, Error> {
         let body = plan.rsn_body().ok_or(Error::Bounds)?;
         let mut assoc_ie = vec![48, body.len() as u8];
         assoc_ie.extend_from_slice(&body);
+        // SAE repeats its RSNXE (SAE-H2E) in message 2/4 (wpa_supplicant
+        // `wpa_sm_set_assoc_rsnxe`).
+        if let Some(rsnxe) = plan.sae().and_then(|sae| sae.station_rsnxe()) {
+            assoc_ie.extend_from_slice(&[244, rsnxe.len() as u8]);
+            assoc_ie.extend_from_slice(&rsnxe);
+        }
+        let key_mgmt = plan.akm().ok_or(Error::Bounds)?;
+        let pmf = plan.pmf();
         let mut ies = &bss.information_elements[..];
         let mut ap_rsn_ie = None;
         let mut ap_rsnxe = None;
@@ -66,19 +89,24 @@ impl StationSecurity {
         Ok(Self {
             port_open: false,
             supplicant: Supplicant::new(bss.bssid, own, [0; 32]).with_rsna(RsnaParams {
-                key_mgmt: KeyMgmt::Psk,
-                pmk: psk.to_vec(),
+                key_mgmt,
+                pmk: pmk.to_vec(),
                 assoc_ie,
                 ap_rsn_ie: ap_rsn_ie.ok_or(Error::Bounds)?,
                 ap_rsnxe,
                 pairwise_key_len: 16,
                 group_key_len: 16,
-                mgmt_group_key_len: None,
-                pmf: false,
+                mgmt_group_key_len: pmf.then_some(16),
+                pmf,
             }),
             pairwise: [0; 17],
             group: [None; 4],
             pending: VecDeque::new(),
+            pmf,
+            ptk_installed: false,
+            management_pn: 0,
+            igtk: narf_wireless::mfp::MfpKeyStore::new(),
+            gtk_id: 0,
         })
     }
 
@@ -119,8 +147,92 @@ impl StationSecurity {
             return Err(Error::MalformedEvent);
         }
         self.group[usize::from(gtk.key_id)] = Some([u64::from_le_bytes(gtk.rsc); 17]);
+        self.gtk_id = gtk.key_id;
         self.supplicant.group_keys_installed(Some(&gtk.key), None);
         Ok(())
+    }
+
+    /// The firmware accepted the PTK record: WCID 1 now protects robust
+    /// management frames under PMF. A new PTK restarts the management PN.
+    pub(super) fn commit_pairwise(&mut self) {
+        self.supplicant.pairwise_key_installed();
+        self.pairwise.fill(0);
+        self.management_pn = 0;
+        self.ptk_installed = true;
+    }
+
+    /// The firmware accepted the IGTK record. The KDE IPN is the AP's last
+    /// IPN; mac80211 seeds the BIP replay counter with it.
+    pub(super) fn commit_igtk(&mut self, igtk: &narf_wireless::eapol::Igtk) -> Result<(), Error> {
+        let key: [u8; 16] = igtk
+            .key
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::MalformedEvent)?;
+        self.igtk
+            .install_active(key, igtk.key_id)
+            .map_err(|_| Error::MalformedEvent)?;
+        let mut ipn = [0; 8];
+        ipn[..6].copy_from_slice(&igtk.ipn);
+        if let Some(active) = self.igtk.active.as_mut() {
+            active.rx_pn = u64::from_le_bytes(ipn);
+        }
+        self.supplicant.group_keys_installed(None, Some(&igtk.key));
+        Ok(())
+    }
+
+    /// The installed GTK, for the IGTK record's BIP batch `key[0]`.
+    pub(super) fn gtk(&self) -> Option<(u8, &[u8])> {
+        self.supplicant
+            .gtk
+            .as_deref()
+            .filter(|gtk| gtk.len() == 16)
+            .map(|gtk| (self.gtk_id, gtk))
+    }
+
+    /// Robust management frames are CCMP/BIP protected (mac80211
+    /// `ieee80211_use_mfp` + an installed pairwise key).
+    pub(super) fn protects_management(&self) -> bool {
+        self.pmf && self.ptk_installed
+    }
+
+    /// mac80211 `ieee80211_drop_unencrypted_mgmt` and the CCMP/BIP
+    /// management receive paths, for one native management MPDU from the
+    /// AP. `None` drops the frame; `Some` is the admitted MPDU with the
+    /// Protected bit cleared and any MMIE removed. Non-robust frames and
+    /// frames before the PTK pass unchanged (protected ones are dropped).
+    pub(super) fn admit_management(
+        &mut self,
+        frame: &[u8],
+        ccmp: Option<super::scan::CcmpRx>,
+    ) -> Option<Vec<u8>> {
+        let protected = frame.get(1).is_some_and(|fc| fc & 0x40 != 0);
+        if !self.protects_management() || !robust_management(frame) {
+            return (!protected && ccmp.is_none()).then(|| frame.to_vec());
+        }
+        if frame[4] & 1 != 0 {
+            // Group-addressed robust frames are never CCMP protected; BIP
+            // (MMIE) under the installed IGTK (ieee80211_crypto_aes_cmac_decrypt).
+            if protected || ccmp.is_some() {
+                return None;
+            }
+            let body =
+                narf_wireless::mfp::verify_inbound(&mut self.igtk, &frame[..24], &frame[24..])
+                    .ok()?;
+            let mut out = frame[..24].to_vec();
+            out.extend_from_slice(body);
+            return Some(out);
+        }
+        // Unicast: hardware-decrypted under the pairwise key only, with a
+        // strictly increasing management PN (ieee80211_crypto_ccmp_decrypt).
+        let ccmp = ccmp?;
+        if !protected || ccmp.key_id != 0 || ccmp.pn <= self.management_pn {
+            return None;
+        }
+        self.management_pn = ccmp.pn;
+        let mut out = frame.to_vec();
+        out[1] &= !0x40;
+        Some(out)
     }
 }
 
@@ -144,7 +256,60 @@ impl Drop for StationSecurity {
         {
             key.zeroize();
         }
+        for igtk in [&mut self.igtk.active, &mut self.igtk.next]
+            .into_iter()
+            .flatten()
+        {
+            igtk.key.zeroize();
+        }
     }
+}
+
+/// Linux v7.2 include/linux/ieee80211.h `_ieee80211_is_robust_mgmt_frame`:
+/// Deauthentication, Disassociation and Action frames outside the
+/// non-robust categories (Public 4, HT 7, Unprotected WNM 11,
+/// Self-Protected 15, Unprotected DMG 20, VHT 21, Unprotected S1G 22,
+/// Vendor-specific 127); a protected Action frame is always robust.
+pub(crate) fn robust_management(frame: &[u8]) -> bool {
+    if frame.len() < 24 || frame[0] & 0x0c != 0 {
+        return false;
+    }
+    match frame[0] {
+        0xa0 | 0xc0 => true,
+        0xd0 => {
+            frame[1] & 0x40 != 0
+                || frame
+                    .get(24)
+                    .is_some_and(|c| !matches!(*c, 4 | 7 | 11 | 15 | 20 | 21 | 22 | 127))
+        }
+        _ => false,
+    }
+}
+
+/// mac80211 rx.c `ieee80211_process_sa_query_req`: a station answers an
+/// admitted SA Query Request (category 8, action 0) from its BSSID that is
+/// addressed to it with an SA Query Response carrying the same transaction
+/// identifier, DA = SA of the request and BSSID = the AP. `ieee80211_rx_h_action`
+/// requires `IEEE80211_MIN_ACTION_SIZE + sizeof(sa_query)` (28) octets.
+pub(crate) fn sa_query_response(frame: &[u8], own: [u8; 6], peer: [u8; 6]) -> Option<Vec<u8>> {
+    if frame.len() < 28
+        || frame[0] != 0xd0
+        || frame[1] & 0x40 != 0
+        || frame[4..10] != own
+        || frame[10..16] != peer
+        || frame[16..22] != peer
+        || frame[24..26] != [8, 0]
+    {
+        return None;
+    }
+    let mut response = vec![0; 28];
+    response[0] = 0xd0;
+    response[4..10].copy_from_slice(&peer);
+    response[10..16].copy_from_slice(&own);
+    response[16..22].copy_from_slice(&peer);
+    response[24..26].copy_from_slice(&[8, 1]);
+    response[26..28].copy_from_slice(&frame[26..28]);
+    Some(response)
 }
 
 pub(crate) fn extract_eapol(frame: &[u8]) -> Option<&[u8]> {
@@ -210,7 +375,32 @@ pub(crate) fn wrap_eapol_frame(own: [u8; 6], peer: [u8; 6], eapol: &[u8]) -> Vec
     frame
 }
 
-/// Convert an unfragmented native station RX frame with RFC1042 LLC/SNAP.
+/// RFC1042 LLC/SNAP header (`rfc1042_header`, IEEE 802.1H selective translation).
+const RFC1042: [u8; 6] = [0xaa, 0xaa, 3, 0, 0, 0];
+/// IEEE 802.1H bridge-tunnel LLC/SNAP header (`bridge_tunnel_header`).
+const BRIDGE_TUNNEL: [u8; 6] = [0xaa, 0xaa, 3, 0, 0, 0xf8];
+/// Largest 802.3 length-framed MSDU (`ETH_DATA_LEN`). Values 1501..1535 are
+/// neither lengths nor EtherTypes, so a longer LLC body cannot be framed.
+const MAX_LLC_BODY: usize = 1500;
+
+/// Linux `ieee80211_get_8023_tunnel_proto`: RFC1042 (except AARP/IPX, which
+/// 802.1H keeps LLC-encapsulated) or bridge-tunnel SNAP yields its EtherType.
+fn tunnel_protocol(body: &[u8]) -> Option<[u8; 2]> {
+    let snap = body.get(..8)?;
+    let protocol = [snap[6], snap[7]];
+    let rfc1042 = snap[..6] == RFC1042 && !matches!(u16::from_be_bytes(protocol), 0x80f3 | 0x8137);
+    // A tunnelled value below 0x0600 would be an 802.3 length, not an
+    // EtherType; keep such bodies LLC-encapsulated rather than misframing.
+    (rfc1042 || snap[..6] == BRIDGE_TUNNEL)
+        .then_some(protocol)
+        .filter(|protocol| u16::from_be_bytes(*protocol) >= 0x0600)
+}
+
+/// Convert an unfragmented native station RX frame to an Ethernet/802.3 frame,
+/// following Linux `ieee80211_data_to_8023_exthdr` for a non-A-MSDU, non-mesh
+/// station: RFC1042/bridge-tunnel SNAP is replaced by its EtherType, while any
+/// other LLC body (AARP/IPX SNAP, STP/NetBIOS LLC, other OUIs) is delivered as an
+/// 802.3 length-framed MSDU with its LLC header intact.
 /// The retained transport disables RX header translation. Rejected native
 /// frames must never be reinterpreted as an already translated Ethernet frame.
 pub fn to_ethernet(frame: &[u8]) -> Option<Vec<u8>> {
@@ -222,7 +412,7 @@ pub fn to_ethernet(frame: &[u8]) -> Option<Vec<u8>> {
     {
         return None;
     }
-    let snap_offset = if fc & 0x80 != 0 {
+    let body_offset = if fc & 0x80 != 0 {
         let qos = frame.get(24..26)?;
         if qos[0] & 0x80 != 0 {
             return None; // A-MSDU needs its own bounded deaggregation path.
@@ -231,30 +421,28 @@ pub fn to_ethernet(frame: &[u8]) -> Option<Vec<u8>> {
     } else {
         24
     };
-    let snap = frame.get(snap_offset..snap_offset + 8)?;
-    let protocol = u16::from_be_bytes([snap[6], snap[7]]);
-    if snap[..6] != [0xaa, 0xaa, 3, 0, 0, 0]
-        || protocol < 0x0600
-        || matches!(protocol, 0x80f3 | 0x8137)
-    {
-        // Linux's ieee80211_get_8023_tunnel_proto preserves LLC for AARP/IPX;
-        // that length-framed LLC path is not implemented by this profile.
-        return None;
-    }
-    let payload = &frame[snap_offset + 8..];
-    if payload.len() > 1500 {
+    let body = &frame[body_offset..];
+    let (type_or_length, payload) = match tunnel_protocol(body) {
+        Some(protocol) => (protocol, &body[8..]),
+        // An 802.3 MSDU carries at least the 802.2 DSAP/SSAP/control header.
+        None if body.len() >= 3 => (u16::try_from(body.len()).ok()?.to_be_bytes(), body),
+        None => return None,
+    };
+    if payload.len() > MAX_LLC_BODY {
         return None;
     }
     let mut eth = Vec::with_capacity(14 + payload.len());
     eth.extend_from_slice(&header[4..10]);
     eth.extend_from_slice(&header[16..22]);
-    eth.extend_from_slice(&snap[6..8]);
+    eth.extend_from_slice(&type_or_length);
     eth.extend_from_slice(payload);
     Some(eth)
 }
 
 impl<B: Backend> Session<B> {
     pub(super) fn renew_receive_epoch(&mut self) -> Result<(), Error> {
+        // No partial MSDU survives a key or association change.
+        self.rx_fragments.clear();
         self.backend.close_receive_capture(0);
         self.receive_epoch = 0;
         self.receive_epoch = super::NEXT_RECEIVE_EPOCH
@@ -327,6 +515,44 @@ impl<B: Backend> Session<B> {
             receiver.clear();
         }
         self.received_msdu.clear();
+        self.rx_fragments.clear();
+    }
+
+    /// Linux `ieee80211_rx_h_defragment` for the native station path. Each
+    /// hardware-decrypted fragment must beat the current per-queue replay
+    /// counter, and continuations must carry PN `last + 1`; only a complete
+    /// MSDU advances the counter (to the last fragment's PN). Fragments
+    /// bypass the BA reorder buffer, as in `ieee80211_rx_reorder_ampdu`.
+    /// The controlled port never accepts a fragmented EAPOL PDU.
+    fn receive_fragment(&mut self, native: &super::scan::NativeRx<'_>) -> Option<Vec<u8>> {
+        let frame = native.frame;
+        let header = frame.get(..24)?;
+        let fragmented = header[1] & 0x04 != 0 || header[22] & 15 != 0;
+        // Fragments are never A-MPDU subframes, and the RXD FRAG marker must
+        // agree with the MAC header before any PN is trusted.
+        if native.ampdu || native.amsdu != 0 || native.fragment != fragmented {
+            return None;
+        }
+        let pn = match (native.ccmp, self.security.as_ref()) {
+            (Some(ccmp), Some(_)) if ccmp.key_id == 0 => Some(ccmp.pn),
+            (None, None) => None,
+            _ => return None,
+        };
+        let (fragment, _) = super::fragment::Cache::parse(frame, pn)?;
+        if let (Some(pn), Some(security)) = (pn, self.security.as_ref()) {
+            if pn <= security.pairwise[fragment.queue] {
+                return None;
+            }
+        }
+        let complete = self.rx_fragments.insert(frame, pn, self.backend.now_ns())?;
+        let ethernet = to_ethernet(&complete.frame)?;
+        if ethernet[12..14] == [0x88, 0x8e] {
+            return None;
+        }
+        if let (Some(security), Some((_, last))) = (self.security.as_mut(), complete.pn) {
+            security.pairwise[complete.queue] = last;
+        }
+        Some(ethernet)
     }
 
     fn receive_aggregate(
@@ -455,6 +681,21 @@ impl<B: Backend> Session<B> {
             .map(|_| ())
     }
 
+    /// mt7921_set_key(WLAN_CIPHER_SUITE_AES_CMAC) after the GTK: the IGTK
+    /// record repeats the installed GTK as its BIP batch `key[0]`.
+    async fn install_igtk(
+        &mut self,
+        security: &StationSecurity,
+        igtk: &narf_wireless::eapol::Igtk,
+    ) -> Result<(), Error> {
+        let (gtk_id, gtk) = security.gtk().ok_or(Error::MalformedEvent)?;
+        let record = crate::mt7921::association::igtk_record(gtk_id, gtk, &igtk.key)
+            .map_err(|_| Error::MalformedEvent)?;
+        self.exchange_station(Command::Unified { id: 3 }, &record)
+            .await
+            .map(|_| ())
+    }
+
     /// Service authenticated PTK/GTK rekeys captured by the bounded RX step.
     /// The supplicant only reports a key when it differs from the installed
     /// one, so retransmissions cannot reset packet-number replay windows.
@@ -495,15 +736,23 @@ impl<B: Backend> Session<B> {
                 else {
                     continue;
                 };
-                let (reply, tk, gtk, authorize) = match result {
-                    EapolRx::Pairwise1(m1) => (m1.reply, None, None, false),
+                let (reply, tk, gtk, igtk, authorize) = match result {
+                    EapolRx::Pairwise1(m1) => (m1.reply, None, None, None, false),
                     EapolRx::Pairwise3(m3) => {
                         if !m3.secure {
                             return Err(Error::MalformedEvent);
                         }
-                        (m3.reply, m3.tk, m3.gtk, true)
+                        (m3.reply, m3.tk, m3.gtk, m3.igtk, true)
                     }
-                    EapolRx::Group1(group) => (group.reply, None, group.gtk, true),
+                    // An invalid IGTK KDE is "Failed to configure IGTK" and
+                    // not fatal in wpa_supplicant; the old IGTK stays.
+                    EapolRx::Group1(group) => (
+                        group.reply,
+                        None,
+                        group.gtk,
+                        group.igtk.and_then(|igtk| igtk.ok().flatten()),
+                        true,
+                    ),
                 };
                 self.send_management(&wrap_eapol_frame(info.capabilities.mac, peer, &reply), 1)
                     .await?;
@@ -512,12 +761,15 @@ impl<B: Backend> Session<B> {
                         .map_err(|_| Error::MalformedEvent)?;
                     self.exchange_station(Command::Unified { id: 3 }, &record)
                         .await?;
-                    security.supplicant.pairwise_key_installed();
-                    security.pairwise.fill(0);
+                    security.commit_pairwise();
                 }
                 if let Some(gtk) = gtk {
                     self.install_group_key(&gtk).await?;
                     security.commit_group(&gtk)?;
+                }
+                if let Some(igtk) = igtk.filter(|_| security.pmf) {
+                    self.install_igtk(&security, &igtk).await?;
+                    security.commit_igtk(&igtk)?;
                 }
                 security.port_open = authorize;
             }
@@ -533,6 +785,7 @@ impl<B: Backend> Session<B> {
             self.ht20_rx = None;
             self.ht20_profile = None;
             self.vht_profile = None;
+            self.he_profile = None;
             self.ap_phy = None;
             self.rx_ba.fence();
             self.tx_ba.fence();
@@ -599,6 +852,38 @@ impl<B: Backend> Session<B> {
                 self.clear_aggregate_receive();
                 continue;
             }
+            // PMF management admission before any MLME/BA consumer: mac80211
+            // `ieee80211_drop_unencrypted_mgmt` plus the CCMP (hardware) and
+            // BIP (software, `ieee80211_crypto_aes_cmac_decrypt`) management
+            // receive paths. Admitted frames continue as plain MPDUs.
+            let admitted;
+            let native = match self.security.as_mut() {
+                Some(security)
+                    if security.protects_management()
+                        && native.frame.first().is_some_and(|fc| fc & 0x0c == 0)
+                        && native.frame.get(10..16) == Some(&peer[..]) =>
+                {
+                    let Some(frame) = security.admit_management(native.frame, native.ccmp) else {
+                        self.clear_aggregate_receive();
+                        continue;
+                    };
+                    admitted = frame;
+                    super::scan::NativeRx {
+                        frame: &admitted,
+                        ccmp: None,
+                        ..native
+                    }
+                }
+                _ => native,
+            };
+            if native.ccmp.is_none() {
+                if let Some(response) = sa_query_response(native.frame, own, peer) {
+                    if self.control_pending.len() < 4 {
+                        self.control_pending.push_back(response);
+                    }
+                    continue;
+                }
+            }
             // Management and the retained supplicant still make progress
             // while ordinary RX is closed. Admission is decided from the
             // original copy and current port before any aggregate/replay work.
@@ -609,8 +894,24 @@ impl<B: Backend> Session<B> {
                 self.clear_aggregate_receive();
                 continue;
             }
+            // HE P-RXV modes (8..11) are admitted only by a negotiated HE
+            // profile; every other mode keeps the HT/VHT checks below.
+            let he_ppdu = native
+                .phy
+                .filter(|v| (8..=11).contains(&((v >> 24) & 15)))
+                .map(|v| {
+                    self.he_profile.is_some_and(|he| {
+                        crate::mt7921::he::receive_allowed(he.width(), v, he.rx_limits())
+                    })
+                });
+            if he_ppdu == Some(false) {
+                self.clear_aggregate_receive();
+                continue;
+            }
             if let Some(profile) = self.vht_profile {
-                if native.frame.len() > 3895 || !profile.receive_allowed(native.phy) {
+                if native.frame.len() > 3895
+                    || he_ppdu.is_none() && !profile.receive_allowed(native.phy)
+                {
                     self.clear_aggregate_receive();
                     continue;
                 }
@@ -635,6 +936,7 @@ impl<B: Backend> Session<B> {
             }
             if let Some(ap) = self.ap_phy {
                 if self.vht_profile.is_none()
+                    && he_ppdu.is_none()
                     && !crate::mt7921::vht::receive_allowed(
                         u8::from(
                             self.ht20_profile
@@ -663,7 +965,8 @@ impl<B: Backend> Session<B> {
                     && f[10..16] == peer
                     && f[16..22] == peer
                     && (f[4..10] == own || f[4..10] == [255; 6])
-                    && narf_wireless::association::phy::ApElements::parse(&f[36..]) != Ok(ap)
+                    && !narf_wireless::association::phy::ApElements::parse(&f[36..])
+                        .is_ok_and(|current| crate::mt7921::ht20::same_ap_phy(&ap, &current))
                 {
                     self.peer_lost = true;
                     self.rx_ba.fence();
@@ -698,9 +1001,9 @@ impl<B: Backend> Session<B> {
                     && header[16..22] == peer
                     && (header[4..10] == own || header[4..10] == [0xff; 6])
                     && frame.get(36..).is_some_and(|ies| {
-                        crate::mt7921::ht20::Profile::parse(ies, channel)
+                        !crate::mt7921::ht20::Profile::parse(ies, channel)
                             .and_then(|p| p.with_secondary(profile.negotiated_secondary()))
-                            != Ok(profile)
+                            .is_ok_and(|current| current.same_static(profile))
                     })
                 {
                     self.peer_lost = true;
@@ -765,6 +1068,12 @@ impl<B: Backend> Session<B> {
                 || header[16] & 1 != 0
                 || header[4] & 1 != 0 && header[16..22] == own
             {
+                continue;
+            }
+            if native.fragment || header[1] & 0x04 != 0 || header[22] & 15 != 0 {
+                if let Some(ethernet) = self.receive_fragment(&native) {
+                    return Ok(Some(ethernet));
+                }
                 continue;
             }
             let qos = (header[0] == 0x88).then(|| frame.get(24..26)).flatten();
@@ -902,6 +1211,26 @@ impl<B: Backend> Session<B> {
         frame: &[u8],
         wcid: u16,
     ) -> Result<packet_tx::Completion, Error> {
+        // mac80211 `ieee80211_tx_h_select_key`: under PMF every unicast
+        // robust management frame (deauth/disassoc, BA/SA Query actions)
+        // takes the pairwise key; mt76 then sets MT_TXD3_PROTECT_FRAME and
+        // the hardware inserts the CCMP header and MIC.
+        let protected;
+        let frame = if frame.get(1).is_some_and(|fc| fc & 0x40 == 0)
+            && frame.get(4).is_some_and(|a1| a1 & 1 == 0)
+            && robust_management(frame)
+            && self
+                .security
+                .as_ref()
+                .is_some_and(StationSecurity::protects_management)
+        {
+            let mut copy = frame.to_vec();
+            copy[1] |= 0x40;
+            protected = copy;
+            &protected[..]
+        } else {
+            frame
+        };
         self.backend
             .submit_management(frame, wcid, self.management_rate)?;
         let completion = self
@@ -938,6 +1267,7 @@ impl<B: Backend> Session<B> {
     }
 
     pub(super) fn fail_data(&mut self, error: Error) -> Error {
+        self.tx_fragments.clear();
         self.backend.close_receive_capture(self.receive_epoch);
         self.security = None;
         self.station_permission = None;
@@ -946,6 +1276,7 @@ impl<B: Backend> Session<B> {
         self.ht20_rx = None;
         self.ht20_profile = None;
         self.vht_profile = None;
+        self.he_profile = None;
         self.ap_phy = None;
         self.rx_ba.fence();
         self.tx_ba.fence();
@@ -991,11 +1322,35 @@ impl<B: Backend> Session<B> {
         {
             return Err(Error::Bounds);
         }
-        if self.data_pending.len() >= self.data_capacity() || self.data_controls_pending() {
+        if self.data_pending.len() >= self.data_capacity()
+            || self.data_controls_pending()
+            || !self.tx_fragments.is_empty()
+        {
             return Err(Error::Busy);
         }
         self.check_station_tx()?;
-        let result = if self.tx_ba.active() {
+        // cfg80211_classify8021d + ieee80211_downgrade_queue: QoS stations
+        // transmit on the frame's user priority/AC; non-QoS uses TID 0.
+        let tid = self
+            .wmm
+            .map_or(0, |wmm| super::super::tx_priority::select(frame, wmm.acm()));
+        // wcid->amsdu: set by the STA_REC_HW_AMSDU record of an HT peer and
+        // cleared by a TX BA agreement without the A-MSDU bit.
+        let amsdu = self.wmm.is_some()
+            && self.ht20_profile.is_some()
+            && (!self.tx_ba.active() || self.tx_ba.amsdu());
+        self.backend.set_hw_amsdu(amsdu);
+        if let Some(fragments) = self.fragments(frame, tid) {
+            return self.start_fragments(fragments, tid);
+        }
+        let result = if tid != 0 {
+            self.backend.submit_data_tid(
+                frame,
+                self.security.is_some(),
+                tid,
+                self.data_capacity() > 1,
+            )
+        } else if self.tx_ba.active() {
             self.backend
                 .submit_data_aggregated(frame, self.security.is_some())
         } else if self.data_capacity() > 1 {
@@ -1011,10 +1366,76 @@ impl<B: Backend> Session<B> {
             Err(error) => return Err(self.fail_data(error)),
         }
         self.data_pending.push_back(self.backend.now_ns());
-        if self.wmm.is_some() {
+        if self.wmm.is_some() && tid == 0 {
             self.tid0_used = true;
         }
         self.tx_ba.touch(self.backend.now_ns());
+        Ok(())
+    }
+
+    /// mac80211 `ieee80211_tx_h_fragment` / `ieee80211_fragment` for the
+    /// native station: with a wiphy threshold set, Linux disables 802.3
+    /// encapsulation offload (iface.c `ieee80211_set_sdata_offload_flags`:
+    /// mt76 lacks `SUPPORTS_TX_FRAG`) and splits each unicast MSDU whose
+    /// MPDU + FCS exceeds the threshold, unless it goes out as A-MPDU
+    /// (`IEEE80211_TX_CTL_DONTFRAG`). Every fragment repeats the
+    /// (QoS) DATA header with ToDS, Protected under a PTK, the fragment
+    /// number and MoreFrags on all but the last; each carries
+    /// `threshold - header - FCS` body octets (RFC1042 LLC/SNAP + payload).
+    pub(super) fn fragments(&self, frame: &[u8], tid: u8) -> Option<Vec<Vec<u8>>> {
+        let State::Associated { peer, .. } = self.state else {
+            return None;
+        };
+        let qos = self.wmm.is_some();
+        let header = if qos { 26 } else { 24 };
+        let threshold = usize::try_from(self.frag_threshold).ok()?;
+        let body = frame.len() - 14 + 8;
+        if self.frag_threshold == u32::MAX
+            || header + body + 4 <= threshold
+            || tid == 0 && self.tx_ba.active()
+        {
+            return None;
+        }
+        let per = threshold.checked_sub(header + 4).filter(|per| *per > 0)?;
+        let mut msdu = Vec::with_capacity(body);
+        msdu.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
+        msdu.extend_from_slice(&frame[12..]);
+        let count = msdu.len().div_ceil(per);
+        let mut out = Vec::with_capacity(count);
+        for (number, chunk) in msdu.chunks(per).enumerate() {
+            let mut mpdu = vec![0; header];
+            mpdu[0] = if qos { 0x88 } else { 0x08 };
+            mpdu[1] = 0x01
+                | if self.security.is_some() { 0x40 } else { 0 }
+                | if number + 1 < count { 0x04 } else { 0 };
+            mpdu[4..10].copy_from_slice(&peer);
+            mpdu[10..16].copy_from_slice(&frame[6..12]);
+            mpdu[16..22].copy_from_slice(&frame[..6]);
+            mpdu[22] = number as u8;
+            if qos {
+                mpdu[24] = tid;
+            }
+            mpdu.extend_from_slice(chunk);
+            out.push(mpdu);
+        }
+        Some(out)
+    }
+
+    fn start_fragments(&mut self, fragments: Vec<Vec<u8>>, tid: u8) -> Result<(), Error> {
+        let mut fragments = VecDeque::from(fragments);
+        let Some(first) = fragments.pop_front() else {
+            return Err(Error::Bounds);
+        };
+        match self.backend.submit_fragment(&first, 1) {
+            Ok(()) => {}
+            Err(Error::Busy) => return Err(Error::Busy),
+            Err(error) => return Err(self.fail_data(error)),
+        }
+        self.tx_fragments = fragments;
+        self.data_pending.push_back(self.backend.now_ns());
+        if self.wmm.is_some() && tid == 0 {
+            self.tid0_used = true;
+        }
         Ok(())
     }
 
@@ -1035,6 +1456,16 @@ impl<B: Backend> Session<B> {
                 if completion.status != 0 {
                     return Err(self.fail_data(Error::Rejected(completion.status)));
                 }
+                // The next fragment follows its predecessor's terminal TX.
+                if let Some(next) = self.tx_fragments.pop_front() {
+                    if let Err(error) = self.check_station_tx() {
+                        return Err(self.fail_data(error));
+                    }
+                    if let Err(error) = self.backend.submit_fragment(&next, 1) {
+                        return Err(self.fail_data(error));
+                    }
+                    self.data_pending.push_back(self.backend.now_ns());
+                }
                 continue;
             }
             if self.backend.now_ns().saturating_sub(started) >= TIMEOUT_MS * 1_000_000 {
@@ -1042,7 +1473,9 @@ impl<B: Backend> Session<B> {
             }
             break;
         }
-        Ok(self.data_pending.len() < self.data_capacity() && !self.data_controls_pending())
+        Ok(self.data_pending.len() < self.data_capacity()
+            && !self.data_controls_pending()
+            && self.tx_fragments.is_empty())
     }
 
     pub(super) fn step_network(&mut self, tx: Option<&[u8]>) -> Result<super::PacketStep, Error> {
@@ -1076,6 +1509,81 @@ impl<B: Backend> Session<B> {
         })
     }
 
+    /// WPA3-SAE Authentication (Linux leaves it to wpa_supplicant
+    /// `sme_sae_auth` over mac80211 `ieee80211_rx_mgmt_auth`, algorithm 3):
+    /// a Commit from the device CSPRNG, bounded anti-clogging retries,
+    /// Confirm, then the association request carrying the SAE PMKID. The
+    /// session (password element, scalars, PMK) stays boxed and is dropped
+    /// here; only the PMK leaves, zeroized on drop.
+    async fn authenticate_sae(
+        &mut self,
+        plan: &mut JoinPlan,
+        bss: &ScanBss,
+        ssid: &[u8],
+        own: [u8; 6],
+        password: crate::mt7921::association::SaePassword,
+        rx_channel: u8,
+    ) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>), Error> {
+        use narf_wireless::sae::{SaeError, SaeSession};
+        let join = plan.sae().ok_or(Error::MalformedEvent)?;
+        let (h2e, selector) = (join.h2e(), join.akm_suite_selector());
+        let mut session = if h2e {
+            SaeSession::new_h2e_bytes(ssid, password.as_bytes(), own, bss.bssid)
+        } else {
+            SaeSession::new_hunt_and_peck(password.as_bytes(), own, bss.bssid)
+        };
+        if let Some(selector) = selector {
+            session = session
+                .with_akm_suite_selector(selector)
+                .map_err(|_| Error::MalformedEvent)?;
+        }
+        let mut session = alloc::boxed::Box::new(session);
+        let mut failure = None;
+        session
+            .try_build_commit_with_entropy(|out| {
+                self.backend.random_bytes(out).map_err(|error| {
+                    failure = Some(error);
+                    SaeError::EntropyUnavailable
+                })
+            })
+            .map_err(|_| failure.unwrap_or(Error::EntropyUnavailable))?;
+        let mut frame = plan
+            .start_sae_authentication(&session)
+            .map_err(|_| Error::MalformedEvent)?
+            .to_vec();
+        // Commit, at most the shared plan's MAX_ANTI_CLOGGING (3) token
+        // retries, then Confirm; the plan fails any further token request.
+        for _ in 0..5 {
+            self.send_management(&frame, 1).await?;
+            let step = self
+                .wait(3_000, |backend| {
+                    for _ in 0..16 {
+                        let Some(packet) = backend.receive_data()? else {
+                            break;
+                        };
+                        if let Some(reply) = rx_on_channel(&packet, rx_channel) {
+                            if let Some(step) = plan
+                                .sae_authentication_response(reply, &mut session)
+                                .map_err(|_| Error::MalformedEvent)?
+                            {
+                                return Ok(Some(step));
+                            }
+                        }
+                    }
+                    Ok(None)
+                })
+                .await?;
+            match step {
+                crate::mt7921::association::SaeOutcome::Transmit(next) => frame = next,
+                crate::mt7921::association::SaeOutcome::Associate(request) => {
+                    let pmk = Zeroizing::new(*session.pmk().ok_or(Error::MalformedEvent)?);
+                    return Ok((request, pmk));
+                }
+            }
+        }
+        Err(Error::MalformedEvent)
+    }
+
     pub(super) async fn associate_station(
         &mut self,
         bss: &ScanBss,
@@ -1090,13 +1598,25 @@ impl<B: Backend> Session<B> {
             State::Associated { .. } => return Err(Error::Busy),
             _ => return Err(Error::Busy),
         };
-        let band = crate::mt7921::channel::band(bss.channel).ok_or(Error::Bounds)?;
-        if !permission.permits(bss.channel) {
+        let six = crate::mt7921::association::is_six_ghz(bss);
+        let band = if six {
+            // MT_NIC_CAP_6G gates the 6 GHz band (mt7921/mcu.c:595).
+            if !crate::mt7921::six_ghz::qualified(info) {
+                return Err(Error::InvalidIdentity);
+            }
+            crate::mt7921::channel::Band::Ghz6
+        } else {
+            crate::mt7921::channel::band(bss.channel).ok_or(Error::Bounds)?
+        };
+        if !permission.permits_bss(bss) || permission.band() != Some(band) {
             return Err(Error::Authority);
         }
-        if info.capabilities.phy.bands & band.capability() == 0 {
+        if !six && info.capabilities.phy.bands & band.capability() == 0 {
             return Err(Error::InvalidIdentity);
         }
+        // RXD3 CH_FREQ of the operating channel (mt792x_get_status_freq_info).
+        let rx_channel =
+            crate::mt7921::channel::rx_channel(band, bss.channel).ok_or(Error::Bounds)?;
         let initial_limits = permission
             .rate_limits_for_paths(info.capabilities.phy.spatial_streams)
             .ok_or(Error::Bounds)?;
@@ -1116,14 +1636,17 @@ impl<B: Backend> Session<B> {
         self.ht20_rx = None;
         self.ht20_profile = None;
         self.vht_profile = None;
+        self.he_profile = None;
         self.ap_phy = None;
         self.control_pending.clear();
+        self.tx_fragments.clear();
         self.received_msdu.clear();
         self.boot_started = Some(self.backend.now_ns());
         self.security = None;
         self.wmm = None;
         self.wmm_pending = None;
         self.station_permission = Some(permission);
+        let mut sae_pmk: Option<Zeroizing<[u8; 32]>> = None;
         let result = async {
             if setup {
                 self.stage(Stage::ScanSetup);
@@ -1131,6 +1654,13 @@ impl<B: Backend> Session<B> {
             }
             self.stage(Stage::ChannelSwitch);
             self.check_station_tx()?;
+            if let Some(grant) = permission.six {
+                // mt7921_mac_sta_add -> mt7921_regd_set_6ghz_power_type: the
+                // AP's power type reaches the CLC as env_6g before the peer.
+                self.program_6ghz_power_type(info, crate::mt7921::six_ghz::env_6g(grant.power))
+                    .await?;
+                self.check_station_tx()?;
+            }
             // 1. Authorize transmission on the target channel in channel domain (NO_IR = 0):
             let channels = permission.channels();
             let mut domain = vec![0u8; 12 + 8 * channels.len()];
@@ -1199,17 +1729,23 @@ impl<B: Backend> Session<B> {
 
             // 3. Send Authentication Request:
             self.stage(Stage::Authenticate);
-            let auth_req = plan.start_authentication().map_err(|_| Error::Busy)?;
-            self.send_management(auth_req, 1).await?;
+            let assoc_req = if let Security::Wpa3Sae { password } = security {
+                let (request, pmk) = self
+                    .authenticate_sae(&mut plan, bss, ssid, own, password, rx_channel)
+                    .await?;
+                sae_pmk = Some(pmk);
+                request
+            } else {
+                let auth_req = plan.start_authentication().map_err(|_| Error::Busy)?;
+                self.send_management(auth_req, 1).await?;
 
-            // 4. Wait for Authentication Response:
-            let assoc_req = self
-                .wait(3_000, |backend| {
+                // 4. Wait for Authentication Response:
+                self.wait(3_000, |backend| {
                     for _ in 0..16 {
                         let Some(packet) = backend.receive_data()? else {
                             break;
                         };
-                        if let Some(frame) = rx_on_channel(&packet, bss.channel) {
+                        if let Some(frame) = rx_on_channel(&packet, rx_channel) {
                             if let Some(assoc) = plan
                                 .authentication_response(frame)
                                 .map_err(|_| Error::MalformedEvent)?
@@ -1220,7 +1756,8 @@ impl<B: Backend> Session<B> {
                     }
                     Ok(None)
                 })
-                .await?;
+                .await?
+            };
 
             // 5. Send Association Request:
             self.stage(Stage::Associate);
@@ -1233,7 +1770,7 @@ impl<B: Backend> Session<B> {
                         let Some(packet) = backend.receive_data()? else {
                             break;
                         };
-                        if let Some(frame) = rx_on_channel(&packet, bss.channel) {
+                        if let Some(frame) = rx_on_channel(&packet, rx_channel) {
                             if let Some(aid) = plan
                                 .association_response(frame)
                                 .map_err(|_| Error::MalformedEvent)?
@@ -1282,11 +1819,25 @@ impl<B: Backend> Session<B> {
                         id: 0x1d,
                         query: false,
                     },
-                    &parameters.edca(),
+                    &parameters.edca_limited(self.station_permission.and_then(|p| p.wmm_rule())),
                 )
                 .await?;
                 self.confirm_command_progress().await?;
                 self.check_station_tx()?;
+                // mt7921_mcu_set_tx: SET_MU_EDCA_PARMS follows SET_EDCA_PARMS
+                // whenever he_support is set (no firmware reply either).
+                if let Some(he) = plan.he() {
+                    self.notify(
+                        Command::Ce {
+                            id: crate::mt7921::he::SET_MU_EDCA_PARMS,
+                            query: false,
+                        },
+                        &he.mu_edca_request(true),
+                    )
+                    .await?;
+                    self.confirm_command_progress().await?;
+                    self.check_station_tx()?;
+                }
             }
             let mut bss_record = crate::mt7921::association::bss_record_ht20(
                 bss,
@@ -1297,8 +1848,17 @@ impl<B: Backend> Session<B> {
             if plan.vht().is_some() {
                 bss_record[29] |= 1 << 5;
             } // PHY_MODE_AC.
+            if let Some(he) = plan.he() {
+                bss_record[29] |= he.phy_mode();
+            }
             self.exchange_station(Command::Unified { id: 2 }, &bss_record)
                 .await?;
+            if let Some(he) = plan.he() {
+                // mt7921_mac_sta_event(ASSOC) -> uni_add_bss(enable = true):
+                // HE_BASIC + BSS_COLOR follow BASIC/QBSS once he_support is set.
+                self.exchange_station(Command::Unified { id: 2 }, &he.bss(true))
+                    .await?;
+            }
             if let Some(profile) = plan.vht() {
                 self.exchange_station(
                     Command::Unified { id: 2 },
@@ -1313,6 +1873,19 @@ impl<B: Backend> Session<B> {
                     Command::Unified { id: 2 },
                     &profile.rlm(
                         bss.channel,
+                        (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
+                    ),
+                )
+                .await?;
+            } else if six {
+                // mt76_connac_mcu_uni_set_chctx with band = NL80211_BAND_6GHZ.
+                self.exchange_station(
+                    Command::Unified { id: 2 },
+                    &crate::mt7921::six_ghz::rlm(
+                        bss.channel,
+                        permission.center_channel(),
+                        permission.native_width(),
+                        plan.transmit_streams(),
                         (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
                     ),
                 )
@@ -1336,9 +1909,17 @@ impl<B: Backend> Session<B> {
                     self.exchange_station(Command::Unified { id: 3 }, &sta_rec)
                         .await?;
                 }
-                Security::Wpa2Psk { psk } => {
+                Security::Wpa2Psk { .. }
+                | Security::Wpa2PskPmf { .. }
+                | Security::Wpa3Sae { .. } => {
                     self.stage(Stage::EapolHandshake);
-                    let mut security = StationSecurity::new(bss, &plan, own, psk)?;
+                    let pmk = match security {
+                        Security::Wpa2Psk { psk } | Security::Wpa2PskPmf { psk, .. } => {
+                            Zeroizing::new(psk)
+                        }
+                        _ => sae_pmk.take().ok_or(Error::MalformedEvent)?,
+                    };
+                    let mut security = StationSecurity::new(bss, &plan, own, &pmk)?;
                     let mut established = false;
                     // Retry replies remain bounded by the operation's 30 s budget.
                     for _ in 0..16 {
@@ -1349,7 +1930,7 @@ impl<B: Backend> Session<B> {
                                         break;
                                     };
                                     if let Some(pdu) =
-                                        peer_eapol(&packet, own, bss.bssid, bss.channel)
+                                        peer_eapol(&packet, own, bss.bssid, rx_channel)
                                     {
                                         if let Some(result) =
                                             security.process(pdu, false, |out| {
@@ -1372,7 +1953,14 @@ impl<B: Backend> Session<B> {
                                 .await?;
                             }
                             EapolRx::Pairwise3(m3) => {
-                                if !m3.secure || m3.tk.is_none() || m3.gtk.is_none() {
+                                // PMF requires the IGTK KDE in message 3
+                                // (wpa_supplicant `ieee80211w_set_keys`; the
+                                // shared supplicant reports it when not in use).
+                                if !m3.secure
+                                    || m3.tk.is_none()
+                                    || m3.gtk.is_none()
+                                    || security.pmf && m3.igtk.is_none()
+                                {
                                     return Err(Error::MalformedEvent);
                                 }
                                 self.send_management(
@@ -1386,10 +1974,14 @@ impl<B: Backend> Session<B> {
                                     .map_err(|_| Error::MalformedEvent)?;
                                 self.exchange_station(Command::Unified { id: 3 }, &record)
                                     .await?;
-                                security.supplicant.pairwise_key_installed();
+                                security.commit_pairwise();
                                 let gtk = m3.gtk.as_ref().unwrap();
                                 self.install_group_key(gtk).await?;
                                 security.commit_group(gtk)?;
+                                if let Some(igtk) = m3.igtk.as_ref().filter(|_| security.pmf) {
+                                    self.install_igtk(&security, igtk).await?;
+                                    security.commit_igtk(igtk)?;
+                                }
                                 security.port_open = true;
                                 established = true;
                                 break;
@@ -1417,6 +2009,7 @@ impl<B: Backend> Session<B> {
                 self.wmm = plan.wmm();
                 self.ht20_profile = plan.ht20();
                 self.vht_profile = plan.vht();
+                self.he_profile = plan.he();
                 self.ap_phy = plan.ap_phy();
                 if let Some(receiver) = &mut self.ht20_rx {
                     receiver.active = true;
@@ -1424,7 +2017,7 @@ impl<B: Backend> Session<B> {
                 self.state = State::Associated {
                     info,
                     peer: bss.bssid,
-                    channel: bss.channel,
+                    channel: rx_channel,
                     aid,
                 };
                 if let Err(error) = self.sync_receive_capture() {
@@ -1440,6 +2033,7 @@ impl<B: Backend> Session<B> {
                 self.ht20_rx = None;
                 self.ht20_profile = None;
                 self.vht_profile = None;
+                self.he_profile = None;
                 self.ap_phy = None;
                 plan.cancel();
                 let stage = match self.state {
@@ -1455,11 +2049,19 @@ impl<B: Backend> Session<B> {
     pub(super) async fn disassociate_station(&mut self) -> Result<(), Error> {
         let (info, peer) = match self.state {
             State::Associated { info, peer, .. } => (info, peer),
-            State::RadioReady(_) | State::ScanReady(_) | State::Stopped => return Ok(()),
+            State::RadioReady(_) | State::ScanReady(_) | State::Suspended(_) | State::Stopped => {
+                return Ok(())
+            }
             _ => return Err(Error::Busy),
         };
         self.backend.close_receive_capture(self.receive_epoch);
         self.boot_started = Some(self.backend.now_ns());
+        // ieee80211_set_disassoc sends the deauthentication before the
+        // station's keys are flushed: under PMF it is CCMP protected.
+        let protect_deauth = self
+            .security
+            .as_ref()
+            .is_some_and(StationSecurity::protects_management);
         let secure = self.security.take().is_some();
         let had_wmm = self.wmm.take().is_some();
         self.wmm_pending = None;
@@ -1472,8 +2074,10 @@ impl<B: Backend> Session<B> {
         self.ht20_rx = None;
         self.ht20_profile = None;
         self.vht_profile = None;
+        let had_he = self.he_profile.take();
         self.ap_phy = None;
         self.control_pending.clear();
+        self.tx_fragments.clear();
         self.received_msdu.clear();
         let peer_lost = self.peer_lost;
         self.stage(Stage::StaRecord);
@@ -1488,6 +2092,7 @@ impl<B: Backend> Session<B> {
             if !peer_lost {
                 let mut deauth = vec![0u8; 26];
                 deauth[0] = 0xc0;
+                deauth[1] = if protect_deauth { 0x40 } else { 0 };
                 deauth[4..10].copy_from_slice(&peer);
                 deauth[10..16].copy_from_slice(&info.capabilities.mac);
                 deauth[16..22].copy_from_slice(&peer);
@@ -1520,6 +2125,12 @@ impl<B: Backend> Session<B> {
                 let record = crate::mt7921::association::bss_record_qos(bss, false, false)
                     .map_err(|_| Error::Bounds)?;
                 self.exchange(Command::Unified { id: 2 }, &record).await?;
+                // mt76_connac_mcu_uni_add_bss(enable = false) still sends the
+                // HE request while he_support is set, with BSS color disabled.
+                if let Some(he) = had_he {
+                    self.exchange(Command::Unified { id: 2 }, &he.bss(false))
+                        .await?;
+                }
             }
             if had_wmm {
                 self.notify(
@@ -1531,6 +2142,12 @@ impl<B: Backend> Session<B> {
                 )
                 .await?;
                 self.confirm_command_progress().await?;
+            }
+            if closing_permission.is_some_and(|p| p.six.is_some()) {
+                // mt7921_mac_sta_remove -> mt7921_regd_set_6ghz_power_type
+                // (is_add = false): IEEE80211_REG_UNSET_AP -> MT_AP_UNSET.
+                self.program_6ghz_power_type(info, crate::mt7921::six_ghz::MT_AP_UNSET)
+                    .await?;
             }
             Ok(())
         }
@@ -1563,10 +2180,12 @@ impl<B: Backend> Session<B> {
             self.ht20_rx = None;
             self.ht20_profile = None;
             self.vht_profile = None;
+            self.he_profile = None;
             self.ap_phy = None;
             self.rx_ba.fence();
             self.tx_ba.fence();
             self.control_pending.clear();
+            self.tx_fragments.clear();
             self.clear_aggregate_receive();
             let stage = match self.state {
                 State::Running(stage) | State::Failed { stage, .. } => stage,
@@ -1593,7 +2212,7 @@ impl<B: Backend> Session<B> {
         let limits = permission
             .rate_limits_for_paths(info.capabilities.phy.spatial_streams)
             .ok_or(Error::Bounds)?;
-        let band = crate::mt7921::channel::band(channel).ok_or(Error::Bounds)?;
+        let band = permission.band().ok_or(Error::Bounds)?;
         let channels = permission.channels();
         let mut domain = vec![0; 12 + 8 * channels.len()];
         domain[..2].copy_from_slice(&permission.country);
@@ -1691,11 +2310,13 @@ impl<B: Backend> Session<B> {
             self.station_permission = None;
             self.ht20_profile = None;
             self.vht_profile = None;
+            self.he_profile = None;
             self.ap_phy = None;
             self.ht20_rx = None;
             self.rx_ba.fence();
             self.tx_ba.fence();
             self.control_pending.clear();
+            self.tx_fragments.clear();
             self.received_msdu.clear();
             self.state = State::Failed {
                 stage: Stage::StaRecord,
@@ -1721,7 +2342,7 @@ impl<B: Backend> Session<B> {
                 id: 0x1d,
                 query: false,
             },
-            &parameters.edca(),
+            &parameters.edca_limited(self.station_permission.and_then(|p| p.wmm_rule())),
         )
         .await?;
         self.check_station_tx()?;

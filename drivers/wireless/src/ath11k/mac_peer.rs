@@ -1239,35 +1239,58 @@ pub fn he_limit(mut set: u16, limit: &[u16; 8]) -> u16 {
     set
 }
 
+/// `ath11k_mac_vht_mcs_range_present`: every per-NSS VHT mask is empty or
+/// one of the ranges the VHT-MCS map can encode (0-7, 0-8, 0-9; IEEE
+/// 802.11-2020 Figure 9-611 Max VHT-MCS For n SS).
+pub const fn vht_mcs_range_present(mask: &[u16; 8]) -> bool {
+    let mut i = 0;
+    while i < mask.len() {
+        if !matches!(mask[i], 0 | 0x00ff | 0x01ff | 0x03ff) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// `ath11k_mac_he_mcs_range_present`: every per-NSS HE mask is empty or one
+/// of the HE-MCS map ranges (0-7, 0-9, 0-11; IEEE 802.11ax-2021 Figure
+/// 9-788d). HE has no 0-8 or 0-10 encoding.
+pub const fn he_mcs_range_present(mask: &[u16; 8]) -> bool {
+    let mut i = 0;
+    while i < mask.len() {
+        if !matches!(mask[i], 0 | 0x00ff | 0x03ff | 0x0fff) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// Reject cfg80211 masks that ath11k cannot represent faithfully.  The
-/// target's peer-association format can carry VHT/HE contiguous ranges; a
-/// sparse multi-rate VHT/HE selection needs the unimplemented RATEMASK WMI
-/// command and therefore has the same `-EINVAL` result as Linux ath11k.
+/// target's peer-association format carries only the VHT/HE MCS-map
+/// ranges; a single rate goes to the peer fixed-rate parameter. Any other
+/// multi-rate VHT/HE selection is the non-contiguous case Linux
+/// `ath11k_mac_op_set_bitrate_mask` refuses with `-EINVAL` ("setting %d mcs
+/// values in bitrate mask not supported"): upstream never programs
+/// `WMI_VDEV_RATEMASK_CMDID` (its TODO), so no firmware ratemask layout
+/// exists to port.
 pub fn validate_tx_bitrate_band(mask: &TxBitrateBand) -> Result<(), ()> {
     if mask.gi == Some(2) {
         // `NL80211_TXRATE_FORCE_LGI` is explicitly refused by ath11k.
         return Err(());
     }
-    let contiguous = |value: u16, maximum: u16| {
-        value == 0
-            || value == 0x00ff
-            || value == 0x01ff
-            || (maximum == 0x0fff && value == 0x03ff)
-            || (maximum == 0x0fff && value == 0x07ff)
-            || value == maximum
-    };
+    let rates = |m: &[u16; 8]| m.iter().map(|value| value.count_ones()).sum::<u32>();
     if let Some(vht) = mask.vht_mcs {
         if vht.iter().any(|value| *value & !0x03ff != 0)
-            || vht.iter().map(|value| value.count_ones()).sum::<u32>() > 1
-                && vht.iter().any(|value| !contiguous(*value, 0x03ff))
+            || (rates(&vht) > 1 && !vht_mcs_range_present(&vht))
         {
             return Err(());
         }
     }
     if let Some(he) = mask.he_mcs {
         if he.iter().any(|value| *value & !0x0fff != 0)
-            || he.iter().map(|value| value.count_ones()).sum::<u32>() > 1
-                && he.iter().any(|value| !contiguous(*value, 0x0fff))
+            || (rates(&he) > 1 && !he_mcs_range_present(&he))
         {
             return Err(());
         }

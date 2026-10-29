@@ -17,6 +17,7 @@ fn frame(subtype: u8, receiver: [u8; 6]) -> Vec<u8> {
 fn mpdu(bytes: Vec<u8>) -> Mpdu {
     Mpdu {
         native: None,
+        ba: false,
         bytes,
         phy: Vec::new(),
         rate: 0,

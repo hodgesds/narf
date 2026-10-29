@@ -52,6 +52,8 @@ pub struct Runtime<T: PacketTransport> {
     tx_sequence: u8,
     tx_max: u8,
     flow_control: u8,
+    /// Current 802.1D-to-AC rank map from negotiated firmware WMM state.
+    ac_priority: [u8; 8],
     previous_rx: Option<u8>,
     transaction: u16,
     pending: Option<Pending>,
@@ -59,6 +61,7 @@ pub struct Runtime<T: PacketTransport> {
     events: VecDeque<Event>,
     data: VecDeque<Vec<u8>>,
     failed: bool,
+    vendor: super::fullmac::FirmwareVendor,
 }
 impl<T: PacketTransport> core::fmt::Debug for Runtime<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -79,6 +82,7 @@ impl<T: PacketTransport> Runtime<T> {
             tx_sequence: 0,
             tx_max: 0,
             flow_control: 0,
+            ac_priority: super::station::wmm::DEFAULT_AC_PRIORITY,
             previous_rx: None,
             transaction: 0,
             pending: None,
@@ -86,7 +90,19 @@ impl<T: PacketTransport> Runtime<T> {
             events: VecDeque::new(),
             data: VecDeque::new(),
             failed: false,
+            vendor: super::fullmac::FirmwareVendor::Wcc,
         }
+    }
+
+    /// Record the SDIO match's firmware vendor (Linux `brcmf_sdmmc_ids`:
+    /// Broadcom-ID 43439 is WCC, Cypress-ID 43439 is CYW).
+    pub fn with_firmware_vendor(mut self, vendor: super::fullmac::FirmwareVendor) -> Self {
+        self.vendor = vendor;
+        self
+    }
+
+    pub fn firmware_vendor(&self) -> super::fullmac::FirmwareVendor {
+        self.vendor
     }
 
     pub fn is_failed(&self) -> bool {
@@ -95,6 +111,12 @@ impl<T: PacketTransport> Runtime<T> {
 
     pub fn fail(&mut self) {
         self.failed = true;
+    }
+
+    /// Install the station's negotiated AC rank map. SDPCM `fc_mask` bits
+    /// name host precedences (`brcmf_map_prio_to_prec`), not 802.1D values.
+    pub fn set_ac_priority(&mut self, ac_priority: [u8; 8]) {
+        self.ac_priority = ac_priority;
     }
 
     pub fn pop_event(&mut self) -> Option<Event> {
@@ -123,8 +145,15 @@ impl<T: PacketTransport> Runtime<T> {
         let result = self.poll_inner();
         if result.is_err() {
             self.failed = true;
+        } else {
+            // The SDIO IRQ thread re-enables the card interrupt after its
+            // function handlers ran; a still-asserted line fires again.
+            self.transport.interrupt_serviced();
         }
         result
+    }
+    pub fn interrupt(&self) -> Option<alloc::sync::Arc<crate::brcmfmac::irq::Signal>> {
+        self.transport.interrupt()
     }
 
     fn poll_inner(&mut self) -> Result<usize, Error> {
@@ -360,7 +389,8 @@ impl<T: PacketTransport> Runtime<T> {
             return Err(Error::Malformed);
         }
         // Reserve two credits for control traffic, as Linux SDPCM does.
-        if self.credits() <= 2 || self.flow_control & (1 << priority) != 0 {
+        let precedence = super::station::wmm::precedence(&self.ac_priority, priority);
+        if self.credits() <= 2 || self.flow_control & (1 << precedence) != 0 {
             return Err(Error::Busy);
         }
         let length = 16 + ethernet.len();

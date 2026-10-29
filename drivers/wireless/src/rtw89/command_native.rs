@@ -94,6 +94,50 @@ pub struct Native {
     ordinary: Option<OrdinaryGrant>,
     full_qualification: Option<alloc::sync::Arc<super::radio_policy::Qualification>>,
     operating: Option<super::phy_operating::Operating>,
+    irq: Option<super::irq::Binding>,
+    /// RTL8852B HCI DMA-stop proof earned by the terminal closure.
+    dma_idle: Option<super::dma_stop::Idle>,
+    /// Every published ring, buffer and packet was released after the proof.
+    dma_reclaimed: bool,
+    /// Observed-FLR lifecycle that selects the signed radio identity.
+    lifecycle: super::radio_policy::Lifecycle,
+}
+/// Current-authority BAR/config adapter for the DMA-stop proof.
+struct StopPort<'a> {
+    io: &'a mut NativeIo,
+    device: &'a BusDevice,
+    authority: &'a Cap<BusDeviceCap, Write>,
+}
+impl super::dma_stop::Port for StopPort<'_> {
+    fn read32(&mut self, address: u32) -> Result<u32, super::power::Error> {
+        super::power::Io::read32(self.io, address)
+    }
+    fn write32(&mut self, address: u32, value: u32) -> Result<(), super::power::Error> {
+        super::power::Io::write32(self.io, address, value)
+    }
+    fn bus_master(&mut self) -> Result<bool, super::power::Error> {
+        let command = crate::rtw88::pci_park::invoke(self.authority, || {
+            narf_bus::pci::read_command(self.authority, self.device)
+        })
+        .map_err(|_| super::power::Error::Access)?
+        .map_err(|_| super::power::Error::Access)?;
+        if command == u16::MAX {
+            return Err(super::power::Error::Gone);
+        }
+        Ok(command & narf_bus::pci::cmd::BUS_MASTER != 0)
+    }
+    fn clear_bus_master(&mut self) -> Result<(), super::power::Error> {
+        crate::rtw88::pci_park::invoke(self.authority, || {
+            narf_bus::pci::clear_command(
+                self.authority,
+                self.device,
+                narf_bus::pci::cmd::BUS_MASTER,
+            )
+        })
+        .map_err(|_| super::power::Error::Access)?
+        .map_err(|_| super::power::Error::Access)
+        .map(|_| ())
+    }
 }
 fn barrier() {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -217,12 +261,16 @@ impl Native {
             scheduler: Some(super::scheduler_mailbox::Mailbox::default()),
             phycap: None,
             phycap_attempted: false,
+            dma_idle: None,
+            dma_reclaimed: false,
+            lifecycle: super::radio_policy::Lifecycle::Initial,
             gain_bases: None,
             radio_started: false,
             radio_shutdown: super::radio_shutdown::Shutdown::default(),
             ordinary: None,
             full_qualification: None,
             operating: Some(super::phy_operating::Operating::default()),
+            irq: None,
         })
     }
     pub(super) fn identity(&self) -> Option<super::factory::Identity> {
@@ -691,12 +739,26 @@ impl Native {
     /// register stop/BME-off alone does not prove posted transactions drained.
     pub(super) fn fail(&mut self) {
         self.state = State::Terminal;
+        // rtw89_pci_ops_stop + free_irq: HIMR and MSI off before BME clears.
+        self.irq_release();
         self.receive.fail();
         // Autonomous ACK/CTS does not depend on a packet DMA doorbell.
         if let Ok(value) = self.io.read32(0xc000) {
             if !matches!(value, u32::MAX | 0xeaea_eaea) {
                 let _ = self.io.write32(0xc000, value & !(1 << 29));
             }
+        }
+        if self.chip == ChipId::Rtl8852B {
+            // Linux stop/poll order with BME still on, then BME off and a
+            // flushing re-read. An earlier proof already cleared BME.
+            if self.dma_idle.is_none() && !self.dma_reclaimed {
+                self.dma_idle = super::dma_stop::stop(&mut self.stop_port()).ok();
+            }
+            if self.radio_started {
+                let _ = super::radio_stop::engines(&mut self.io);
+            }
+            let _ = super::radio_stop::clocks(&mut self.io);
+            return;
         }
         if let Ok(value) = self.io.read32(0x1010) {
             if value != u32::MAX {
@@ -974,6 +1036,64 @@ impl Native {
     pub async fn send(&mut self, kind: Kind, bytes: &[u8]) -> Result<(), Error> {
         self.send_permit(kind, bytes, station::Permit::Legacy).await
     }
+    fn stop_port(&mut self) -> StopPort<'_> {
+        StopPort {
+            io: &mut self.io,
+            device: &self.device,
+            authority: &self.authority,
+        }
+    }
+    /// Release CH12, RXQ/RPQ and every TX ring/packet once the terminal
+    /// closure earned `dma_stop::Idle`. The stopped/idle/BME-off state is
+    /// re-verified under current authority first; any failure keeps all
+    /// storage pinned for the boot. Returns the number of released buffers.
+    pub(super) fn reclaim_dma(&mut self) -> Result<usize, super::dma_stop::Error> {
+        if self.dma_reclaimed {
+            return Ok(0);
+        }
+        if self.state != State::Terminal || self.irq.is_some() || self.dma_idle.is_none() {
+            return Err(super::dma_stop::Error::Unproven);
+        }
+        super::dma_stop::verify(&mut self.stop_port())?;
+        let proof = self
+            .dma_idle
+            .take()
+            .ok_or(super::dma_stop::Error::Unproven)?;
+        Ok(self.release_proven(proof))
+    }
+    /// Consume the verified proof and free every published allocation.
+    fn release_proven(&mut self, _proof: super::dma_stop::Idle) -> usize {
+        let mut released = 0;
+        if let Some(core) = self.station_runtime.core.as_mut() {
+            // SAFETY: proof above covers every TX channel and BME-off.
+            released += unsafe { core.reclaim_fenced() }.len();
+        }
+        // SAFETY: the same proof covers RXQ/RPQ.
+        released += unsafe { self.receive.reclaim_fenced() }.len();
+        // SAFETY: CH12 is in the proof's TX stop/busy mask.
+        unsafe {
+            self.queue.reclaim_fenced();
+        }
+        released += usize::from(self.ring.take().is_some());
+        self.armed = false;
+        self.dma_reclaimed = true;
+        released
+    }
+    /// Set by Startup from its reset fence before any radio identity use.
+    pub(super) fn set_lifecycle(&mut self, lifecycle: super::radio_policy::Lifecycle) {
+        self.lifecycle = lifecycle;
+    }
+    pub(super) fn dma_reclaimed(&self) -> bool {
+        self.dma_reclaimed
+    }
+    /// Removal/re-initialization retirement: terminal closure (earning the
+    /// stop proof on RTL8852B), then reclamation. True only when nothing
+    /// this owner ever published remains pinned. CH12 is published before
+    /// RXQ/RPQ or any TX ring, so an unarmed owner published nothing.
+    pub(super) fn retire_dma(&mut self) -> bool {
+        self.fail();
+        self.dma_reclaimed || !self.armed || self.reclaim_dma().is_ok()
+    }
     /// # Safety
     /// Hardware stop/idle and all DMA/prefetch fences are complete. Neither
     /// capability revocation nor BME-off establishes this reclamation proof.
@@ -990,7 +1110,7 @@ impl Drop for Native {
     fn drop(&mut self) {
         if self.armed || self.radio_started {
             self.fail();
-            if self.armed {
+            if self.armed && self.reclaim_dma().is_err() {
                 if let Some(ring) = self.ring.take() {
                     core::mem::forget(ring);
                 }

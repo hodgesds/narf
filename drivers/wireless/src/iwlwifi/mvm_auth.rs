@@ -140,7 +140,7 @@ impl Owner {
             .await?;
         self.check_link_power(&policy()?)?;
         let (status, response) = self
-            .authentication_response(local, bssid, channel, policy)
+            .authentication_response(local, bssid, channel, 0, policy)
             .await?;
         // Closing needs no continuing transmit authority. A terminal receipt
         // must nevertheless precede returning to the ordinary active owner.
@@ -189,11 +189,39 @@ impl Owner {
         .await
     }
 
-    async fn authentication_response(
+    /// As [`Self::qualified_management_transmit`], for the close owner's own
+    /// final frame after host stop. Emission authority is still continuous.
+    pub(super) async fn qualified_closing_transmit(
+        &mut self,
+        queue: u16,
+        frame: &[u8],
+        rate: u32,
+        policy: &mut impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<(), &'static str> {
+        let power = self
+            .power
+            .prepared
+            .as_ref()
+            .ok_or("missing management qualification")?;
+        let mut tx = pin!(self.hardware.transmit_closing(queue, frame, 24, Some(rate)));
+        poll_fn(|cx| {
+            if let Err(error) = policy().and_then(|domain| power.check_applied(&domain)) {
+                return Poll::Ready(Err(error));
+            }
+            tx.as_mut().poll(cx)
+        })
+        .await
+    }
+
+    /// Wait for the AP's next Authentication frame of `algorithm`: open
+    /// system (0) must be transaction 2; SAE (3) frames are returned whole
+    /// for the JoinPlan's SAE state machine to validate.
+    pub(super) async fn authentication_response(
         &mut self,
         local: [u8; 6],
         bssid: [u8; 6],
         channel: u8,
+        algorithm: u16,
         policy: &mut impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(u16, alloc::vec::Vec<u8>), &'static str> {
         let deadline = narf_time::Deadline::after_ms(2000);
@@ -221,9 +249,11 @@ impl Owner {
                     || f[16..22] != bssid
                     || f[22] & 15 != 0
                     || mpdu.amsdu
-                    || mpdu
-                        .body(24, 0)
-                        .is_none_or(|body| body.len() < 6 || body[..4] != [0, 0, 2, 0])
+                    || mpdu.body(24, 0).is_none_or(|body| {
+                        body.len() < 6
+                            || body[..2] != algorithm.to_le_bytes()
+                            || algorithm == 0 && body[2..4] != [2, 0]
+                    })
                 {
                     continue;
                 }

@@ -658,6 +658,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                     }
                     if let Some(g) = m3.gtk.as_ref() {
                         self.install_key(aa, g.key_id, &g.key, false).await?;
+                        self.seed_group_rsc(aa, g.key_id, &g.rsc).await;
                         self.link.as_mut().unwrap().gtk_idx = Some(g.key_id);
                         sup.group_keys_installed(Some(&g.key), None);
                     }
@@ -800,6 +801,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                     self.supplicant_deauth(step::EAPOL_GTK, 0x200);
                     return;
                 }
+                self.seed_group_rsc(aa, g.key_id, &g.rsc).await;
                 if let Some(s) = self.sup.as_mut() {
                     s.group_keys_installed(Some(&g.key), None);
                 }
@@ -900,6 +902,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             if self.install_key(aa, g.key_id, &g.key, false).await.is_err() {
                 return Err(5);
             }
+            self.seed_group_rsc(aa, g.key_id, &g.rsc).await;
             if let Some(l) = self.link.as_mut() {
                 l.gtk_idx = Some(g.key_id);
             }
@@ -924,6 +927,20 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
     /// mac80211's MFP receive path for a robust frame from our AP while
     /// `sta->mfp` (see [`MfpState::rx`]), or from one of our MFP AP clients.
     /// `None` = the rules do not apply (no matching peer or no MFP).
+    /// `wpa_supplicant_install_gtk` passes the EAPOL-Key RSC
+    /// (`key_rsc_len` 6, little-endian) as the group key's receive sequence;
+    /// mac80211 seeds every TID's replay counter with it.
+    pub(super) async fn seed_group_rsc(&mut self, addr: [u8; 6], key_idx: u8, rsc: &[u8]) {
+        let seq = rsc
+            .iter()
+            .take(6)
+            .enumerate()
+            .fold(0u64, |seq, (i, b)| seq | (*b as u64) << (8 * i));
+        if let Some(vdev_id) = self.vif.as_ref().map(|vif| vif.vdev_id) {
+            self.dp.group_rx_seq(vdev_id, addr, key_idx, seq).await;
+        }
+    }
+
     pub(super) fn mfp_rx_filter(&mut self, f: &[u8]) -> Option<MfpRx> {
         if let Some(l) = self.link.as_ref() {
             if l.assoc && l.sta.mfp && f.len() >= frame::MGMT_HDR_LEN && f[10..16] == l.bss.bssid {

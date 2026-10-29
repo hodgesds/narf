@@ -231,7 +231,30 @@ pub fn build_keyboard_caps() -> narf_input::evdev::DeviceCaps {
             caps.add_key(code);
         }
     }
+    // Lock LEDs: the HID boot keyboard (and every descriptor
+    // modelled on it) declares an LED-page Output report, so the
+    // device advertises EV_LED. The pump only *sends* an output
+    // report when `narf_hid::keyboard::detect_led_output` found the
+    // profile in this device's actual descriptor.
+    caps.add_led(narf_input::evdev::led::LED_NUML);
+    caps.add_led(narf_input::evdev::led::LED_CAPSL);
+    caps.add_led(narf_input::evdev::led::LED_SCROLLL);
     caps
+}
+
+/// Encode the Output-report body for the input core's LED bitmap
+/// (`DeviceNode::led_state` — bit order is the Linux LED-code
+/// order) into the device's LED layout (HID usage order in the
+/// report body). The transport (`I2cHidDriver::set_output_report`)
+/// adds the report-ID framing.
+pub fn led_report_body(profile: &narf_hid::keyboard::LedOutputProfile, leds: u16) -> Vec<u8> {
+    use narf_input::evdev::led;
+    narf_hid::keyboard::encode_led_output(
+        profile,
+        leds & (1 << led::LED_NUML) != 0,
+        leds & (1 << led::LED_CAPSL) != 0,
+        leds & (1 << led::LED_SCROLLL) != 0,
+    )
 }
 
 /// Add the consumer (Fn/media) `KEY_*` codes to an existing caps set —

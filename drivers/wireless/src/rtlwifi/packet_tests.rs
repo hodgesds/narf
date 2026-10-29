@@ -271,11 +271,22 @@ impl Io for PacketPort {
     }
     fn write8(&self, reg: u16, value: u8) -> Result<(), AccessError> {
         self.check()?;
-        self.radio.write8(reg, value)
+        // HSISR (0x5c) is write-1-clear (`_rtl_pci_hs_interrupt`).
+        let old = self.radio.hardware_read8(reg);
+        self.radio.write8(reg, value)?;
+        if reg == 0x5c {
+            self.radio.hardware_byte(reg, old & !value);
+        }
+        Ok(())
     }
     fn write32(&self, reg: u16, value: u32) -> Result<(), AccessError> {
         self.check()?;
+        // HISR/HISRE are write-1-clear (`rtl88ee_interrupt_recognized`).
+        let old = self.radio.word(reg);
         self.radio.write32(reg, value)?;
+        if reg == 0xb4 || reg == 0xbc {
+            self.radio.hardware_word(reg, old & !value);
+        }
         let hold_cam = {
             let model = self.model.lock();
             model.wait && model.hold_command.is_none()
@@ -293,7 +304,7 @@ impl Io for PacketPort {
             // caller's source buffer. All extension lanes are observed too.
             let command = self.radio.hardware_read8(reg);
             let length = match command {
-                0 | 0x20 => 5,
+                0 | 0x20 | 0x84 => 5,
                 1 => 1,
                 3 => 2,
                 _ => return Err(AccessError::Unsupported),
@@ -381,7 +392,10 @@ impl Port for PacketPort {
         let (base, queue) = match bit {
             16 => (LINUX_TX_BASES[0], 0),
             64 => (LINUX_TX_BASES[1], 1),
+            1 => (LINUX_TX_BASES[5], 5),
             2 => (LINUX_TX_BASES[4], 4),
+            4 => (LINUX_TX_BASES[3], 3),
+            8 => (LINUX_TX_BASES[2], 2),
             _ => return Err(Error::Descriptor),
         };
         let (slot, complete) = {
@@ -399,12 +413,10 @@ impl Port for PacketPort {
         if control & 0x8c000000 != 0x8c000000
             || (control >> 16) & 255 != 32
             || word(&descriptor, 28) & 0xffff != length as u32
-            || (word(&descriptor, 4) >> 8) & 31
-                != match bit {
-                    64 => 0x12,
-                    16 => 0x10,
-                    _ => 0,
-                }
+            || !matches!(
+                ((word(&descriptor, 4) >> 8) & 31, bit),
+                (0x12, 64) | (0x10, 16) | (1 | 2, 1) | (0 | 3, 2) | (4 | 5, 4) | (6 | 7, 8)
+            )
             || word(&descriptor, 36) != 0
             || word(&descriptor, 40) != ring.address as u32 + (((slot + 1) % 4) * 64) as u32
         {
@@ -439,6 +451,15 @@ impl Port for PacketPort {
             // The command-beacon OWN bit may stay set even on completed
             // SRAM upload. Ordinary TX retirement must never consume it.
             return Ok(());
+        }
+        // Data QSEL is the exact QoS TID (non-QoS DATA uses0).
+        let tid = if bytes.first() == Some(&0x88) {
+            bytes.get(24).map_or(u32::MAX, |&q| u32::from(q))
+        } else {
+            0
+        };
+        if bit & 15 != 0 && (word(&descriptor, 4) >> 8) & 31 != tid {
+            return Err(Error::Descriptor);
         }
         self.model.lock().observed.push(bytes.clone());
         self.model.lock().descriptors.push(descriptor.clone());
@@ -504,7 +525,7 @@ fn frame(data: bool) -> Vec<u8> {
 }
 
 pub(crate) fn smoke_rtl8188ee_native_packets_use_actual_linux_descriptors_and_dma() -> TestResult {
-    let (mut owner, port) = owner();
+    let (mut owner, port) = self::owner();
     if owner.start_packets().is_err() {
         return TestResult::Fail("native packet admission failed");
     }
@@ -539,7 +560,7 @@ pub(crate) fn smoke_rtl8188ee_native_packets_use_actual_linux_descriptors_and_dm
         || port.radio.word(0xb8) != 0
         || port.radio.read8(0x680).unwrap() != 0
     {
-        return TestResult::Fail("polling profile enabled IRQ/HW crypto");
+        return TestResult::Fail("polling fallback enabled IRQ/HW crypto");
     }
     TestResult::Pass
 }
@@ -549,7 +570,7 @@ kernel_test_in!(
 );
 
 pub(crate) fn smoke_rtl8188ee_native_receive_offset_fcs_profiles_and_repost() -> TestResult {
-    let (mut owner, port) = owner();
+    let (mut owner, port) = self::owner();
     owner.start_packets().unwrap();
     let original = frame(false);
     let mut wire = original.clone();
@@ -646,6 +667,188 @@ kernel_test_in!(
     smoke_rtl8188ee_native_cancel_timeout_and_stop_retain_owners
 );
 
+pub(crate) fn smoke_rtl8188ee_native_irq_masks_and_w1c_recognition_match_linux() -> TestResult {
+    use super::super::super::irq::{IRQ_MASK0_88E, IRQ_MASK1_88E, SYS_IRQ_MASK_88E};
+    let (mut owner, port) = self::owner();
+    // A not-yet-running owner may never unmask (polling profile).
+    if owner.enable_interrupts() != Err(Error::State) || port.radio.word(0xb0) != 0 {
+        return TestResult::Fail("non-running EE owner unmasked HIMR");
+    }
+    owner.start_packets().unwrap();
+    if port.radio.word(0xb0) != 0 || port.radio.word(0xb8) != 0 {
+        return TestResult::Fail("polled start unmasked HIMR before vector bind");
+    }
+    port.radio.hardware_byte(0x1af, 0x5a);
+    let before = port.radio.trace().len();
+    if owner.enable_interrupts().is_err() || !owner.interrupts_enabled() {
+        return TestResult::Fail("running EE owner refused Linux interrupt masks");
+    }
+    // rtl88ee_enable_interrupt order: HIMR, HIMRE, C2HEVT_CLEAR, HSIMR.
+    let writes: Vec<(u8, u16, u32)> = port.radio.trace()[before..]
+        .iter()
+        .copied()
+        .filter(|(width, _, _)| *width != 0)
+        .collect();
+    if writes
+        != [
+            (32, 0xb0, IRQ_MASK0_88E),
+            (32, 0xb8, IRQ_MASK1_88E),
+            (8, 0x1af, 0),
+            (32, 0x58, SYS_IRQ_MASK_88E),
+        ]
+        || IRQ_MASK0_88E != 0x2000_84ff
+        || IRQ_MASK1_88E != 0x100
+        || SYS_IRQ_MASK_88E != 0xc0
+    {
+        return TestResult::Fail("EE interrupt enable differs from rtl88ee_enable_interrupt");
+    }
+    if owner.enable_interrupts() != Err(Error::State) {
+        return TestResult::Fail("EE interrupt masks were programmed twice");
+    }
+    // Pending: ROK|BEDOK|HSISR_IND plus unmasked BIT31; HISRE RXFOVW|BIT0.
+    port.radio.hardware_word(0xb4, 0x8000_8011);
+    port.radio.hardware_word(0xbc, 0x101);
+    // _rtl_pci_hs_interrupt writes back HSISR | sys mask: every pending
+    // bit (including unmasked GPIO BIT0) is W1C-cleared.
+    port.radio.hardware_byte(0x5c, 0xc1);
+    let recognized = owner.recognize_interrupts();
+    let Ok(recognized) = recognized else {
+        return TestResult::Fail("EE W1C recognition failed");
+    };
+    if recognized.inta != 0x8011
+        || recognized.intb != 0x100
+        || port.radio.word(0xb4) != 0x8000_0000
+        || port.radio.word(0xbc) != 1
+        || port.radio.hardware_read8(0x5c) != 0
+        || port.radio.word(0xb0) != IRQ_MASK0_88E
+        || port.radio.word(0xb8) != IRQ_MASK1_88E
+        || owner.phase() != Phase::Running
+    {
+        return TestResult::Fail("EE recognition differs from _rtl_pci_interrupt W1C");
+    }
+    // Ring service still runs after recognition: a TX completes normally.
+    let id = owner.submit(&frame(true), 0).unwrap();
+    if owner.poll_delivery().ok().flatten().map(|d| d.id) != Some(id) {
+        return TestResult::Fail("EE IRQ profile lost polled ring service");
+    }
+    // Teardown: the vector withdraw masks without leaving Running.
+    if owner.disable_interrupts().is_err()
+        || owner.interrupts_enabled()
+        || port.radio.word(0xb0) != 0
+        || port.radio.word(0xb8) != 0
+        || owner.recognize_interrupts() != Err(Error::State)
+    {
+        return TestResult::Fail("EE vector withdraw left HIMR armed");
+    }
+    owner.enable_interrupts().unwrap();
+    owner.stop_packets().unwrap();
+    if owner.interrupts_enabled() || port.radio.word(0xb0) != 0 || port.radio.word(0xb8) != 0 {
+        return TestResult::Fail("EE stop left interrupt masks armed");
+    }
+    // Failure: a vanished function (all-ones HISR) is terminal.
+    let (mut owner, port) = self::owner();
+    owner.start_packets().unwrap();
+    owner.enable_interrupts().unwrap();
+    port.radio.hardware_word(0xb4, u32::MAX);
+    if owner.recognize_interrupts().is_ok() || owner.phase() != Phase::Failed {
+        return TestResult::Fail("all-ones HISR was accepted as an interrupt");
+    }
+    owner.stop_packets().unwrap();
+    // Failure: a mask readback mismatch is terminal and never claims IRQs.
+    let (mut owner, port) = self::owner();
+    owner.start_packets().unwrap();
+    port.radio.ignore(0xb0);
+    if owner.enable_interrupts() != Err(Error::Readback) || owner.phase() != Phase::Failed {
+        return TestResult::Fail("EE IMR readback mismatch was accepted");
+    }
+    if port.drops.load(Ordering::SeqCst) != 0 {
+        return TestResult::Fail("EE IRQ teardown released retained DMA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/packet",
+    smoke_rtl8188ee_native_irq_masks_and_w1c_recognition_match_linux
+);
+
+pub(crate) fn smoke_rtl8188ee_native_leisure_power_save_matches_linux_fwlps() -> TestResult {
+    let (mut owner, port) = self::owner();
+    if run(owner.enter_leisure()) != Err(Error::State) {
+        return TestResult::Fail("EE LPS entered before packet service");
+    }
+    owner.start_packets().unwrap();
+    port.radio.hardware_word(0x6c, 1 << 31);
+    port.model.lock().commands.clear();
+    if run(owner.enter_leisure()).is_err() || !owner.leisure() {
+        return TestResult::Fail("running EE owner refused firmware LPS");
+    }
+    // rtl88e_set_fw_pwrmode_cmd(FW_PS_DTIM_MODE), then RPWM toggle.
+    if port.model.lock().commands != [(0x20, vec![1, 0x10, 5, 0, 0])]
+        || port.radio.read8(0x361).unwrap() != 0x80
+        || owner.phase() != Phase::Running
+    {
+        return TestResult::Fail("EE LPS enter differs from _rtl88ee_fwlps_enter");
+    }
+    if run(owner.enter_leisure()) != Err(Error::State) {
+        return TestResult::Fail("EE LPS entered twice");
+    }
+    // TX stays serviceable in non-low-power LPS (RF_OFF_88E = CLOCK_ON).
+    let id = owner.submit(&frame(true), 0).unwrap();
+    if owner.poll_delivery().ok().flatten().map(|d| d.id) != Some(id) {
+        return TestResult::Fail("EE LPS blocked native ring service");
+    }
+    if run(owner.leave_leisure()).is_err()
+        || owner.leisure()
+        || port.model.lock().commands.last() != Some(&(0x20, vec![0, 0x10, 5, 0, 0x0c]))
+        || port.radio.read8(0x361).unwrap() != 0
+    {
+        return TestResult::Fail("EE LPS leave differs from _rtl88ee_fwlps_leave");
+    }
+    if run(owner.leave_leisure()) != Err(Error::State) {
+        return TestResult::Fail("EE LPS left while active");
+    }
+    // Teardown: disconnect wakes the firmware before the join report.
+    run(owner.enter_leisure()).unwrap();
+    port.model.lock().commands.clear();
+    let _ = run(owner.disconnect_station_peer());
+    {
+        let model = port.model.lock();
+        if model.commands.first() != Some(&(0x20, vec![0, 0x10, 5, 0, 0x0c]))
+            || model.commands.get(1) != Some(&(1, vec![0]))
+        {
+            return TestResult::Fail("EE disconnect skipped the LPS leave");
+        }
+    }
+    if owner.leisure() || run(owner.enter_leisure()) != Err(Error::State) {
+        return TestResult::Fail("EE LPS survived terminal stop");
+    }
+    // Failure: a firmware that never consumes SETPWRMODE is terminal.
+    let (mut owner, port) = self::owner();
+    owner.start_packets().unwrap();
+    port.radio.hardware_word(0x6c, 1 << 31);
+    port.model.lock().hold_command = Some(0x20);
+    if run(owner.enter_leisure()) != Err(Error::CommandTimeout)
+        || owner.phase() != Phase::Failed
+        || owner.leisure()
+    {
+        return TestResult::Fail("EE stuck SETPWRMODE was accepted as LPS");
+    }
+    // Failure: radio off refuses LPS without touching the mailbox.
+    let (mut owner, port) = self::owner();
+    owner.start_packets().unwrap();
+    port.radio.hardware_word(0x6c, 0);
+    port.model.lock().commands.clear();
+    if run(owner.enter_leisure()) != Err(Error::RadioOff) || !port.model.lock().commands.is_empty()
+    {
+        return TestResult::Fail("EE radio-off LPS reached firmware");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/packet",
+    smoke_rtl8188ee_native_leisure_power_save_matches_linux_fwlps
+);
+
 pub(crate) fn smoke_rtl8188ee_native_rebinding_authority_and_terminal_failure() -> TestResult {
     // Recreate the formerly shared 8192EE register publication. A valid
     // allocation is insufficient if the actual EE queue map is rebound.
@@ -682,7 +885,7 @@ pub(crate) fn smoke_rtl8188ee_native_rebinding_authority_and_terminal_failure() 
             return TestResult::Fail("ambiguous DMA ownership was released");
         }
     }
-    let (mut owner, port) = owner();
+    let (mut owner, port) = self::owner();
     port.radio.ignore(0x301);
     if owner.start_packets().is_ok() || owner.phase() != Phase::Failed {
         return TestResult::Fail("ignored native DMA opening was reported ready");
@@ -731,12 +934,15 @@ pub(crate) fn smoke_rtl8188ee_station_native_mailbox_pages_match_original_linux(
         || owner.packet.reserved.is_none()
         || port.radio.word(0x608) != super::super::super::packet_mac::RCR | 0xc0
         || port.radio.word(0x508) != 0xa41c
+        // rtl_op_add_interface station HW_VAR_RETRY_LIMIT (0x30 short/long).
+        || port.radio.read8(0x42a).unwrap() != 0x30
+        || port.radio.read8(0x42b).unwrap() != 0x30
         || port.radio.read8(0x102).unwrap() & 3 != 2
         || port.radio.word(0x6a8) & 0x3fff != 42
         || port.radio.read8(0x20a).unwrap() & 1 != 0
     {
         return TestResult::Fail(
-            "native EE reserved body/legacy timing/media/peer commit mismatch",
+            "native EE reserved body/legacy timing/retry/media/peer commit mismatch",
         );
     }
     if run(owner.disconnect_station_peer()).is_err() {
@@ -872,3 +1078,232 @@ kernel_test_in!(
 
 #[path = "packet_station_tests.rs"]
 pub(crate) mod station_tests;
+
+/// `_rtl88ee_poweroff_adapter` idle proof: only a stopped owner whose TX
+/// packet buffer is empty and whose RXDMA reports idle may unmap its rings.
+pub(crate) fn smoke_rtl8188ee_native_card_disable_quiescence_reclaims_dma() -> TestResult {
+    let (mut owner, port) = self::owner();
+    if run(owner.quiesce()) != Err(Error::State) {
+        return TestResult::Fail("EE quiesced a never-started owner");
+    }
+    owner.start_packets().unwrap();
+    if run(owner.quiesce()) != Err(Error::State) {
+        return TestResult::Fail("EE quiesced a running owner");
+    }
+    port.model.lock().complete = false;
+    owner.submit(&frame(true), 0).unwrap();
+    owner.stop_packets().unwrap();
+    // A packet still in the TX buffer keeps every mapping.
+    port.radio.hardware_byte(0x286, 2);
+    port.radio.hardware_byte(0x5f9, 1);
+    if run(owner.quiesce()) != Err(Error::PacketTimeout) || owner.reclaimable() {
+        return TestResult::Fail("EE busy TX packet buffer was accepted as idle");
+    }
+    // RXDMA not idle keeps every mapping.
+    port.radio.hardware_byte(0x5f9, 0);
+    port.radio.hardware_byte(0x286, 0);
+    if run(owner.quiesce()) != Err(Error::PacketTimeout) || owner.reclaimable() {
+        return TestResult::Fail("EE busy RXDMA was accepted as idle");
+    }
+    // A reopened host DMA gate is not a stopped owner.
+    port.radio.hardware_byte(0x286, 2);
+    port.radio.hardware_byte(0x301, 0);
+    if run(owner.quiesce()) != Err(Error::Readback) {
+        return TestResult::Fail("EE quiesced with host TX DMA open");
+    }
+    port.radio.hardware_byte(0x301, 0xff);
+    if run(owner.quiesce()).is_err() || !owner.reclaimable() {
+        return TestResult::Fail("EE idle stopped owner was not proven quiescent");
+    }
+    if run(owner.quiesce()) != Err(Error::State) || owner.start_packets() != Err(Error::State) {
+        return TestResult::Fail("EE quiesced owner reopened");
+    }
+    drop(owner);
+    if !port.live_regions().is_empty() {
+        return TestResult::Fail("EE proven-idle owner retained DMA mappings");
+    }
+    // Teardown without proof still retains everything.
+    let (mut owner, port) = self::owner();
+    owner.start_packets().unwrap();
+    owner.stop_packets().unwrap();
+    drop(owner);
+    if port.live_regions().is_empty() || port.drops.load(Ordering::SeqCst) != 0 {
+        return TestResult::Fail("EE unproven stop released DMA mappings");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/packet",
+    smoke_rtl8188ee_native_card_disable_quiescence_reclaims_dma
+);
+
+/// Linux `rtl88ee_update_hal_rate_mask` + `rtl88ee_tx_fill_desc`: the RA
+/// mask is H2C 0x84, and only DATA after it clears DISDATAFB with the
+/// mask's RATE_ID. RX PHY status yields `_rtl88ee_query_rxphystatus` PWDB.
+pub(crate) fn smoke_rtl8188ee_native_rate_mask_enables_data_fallback() -> TestResult {
+    let (mut owner, port) = self::owner();
+    let mask = [0x05, 0xf0, 0x0f, 0x00, 0x80];
+    if run(owner.install_rate_mask(mask, None)) != Err(Error::State) {
+        return TestResult::Fail("EE RA mask installed before packet service");
+    }
+    owner.start_packets().unwrap();
+    port.radio.hardware_word(0x6c, 1 << 31);
+    // Before the mask: DATA keeps USE_RATE|DISDATAFB and RATE_ID 0.
+    let slot = owner.packet.next[4];
+    owner
+        .submit_aggregate(&frame(true), 11, None, true)
+        .unwrap();
+    let before = port.descriptor(4, slot);
+    if word(&before, 16) & (1 << 10) == 0 || word(&before, 4) & (15 << 16) != 0 {
+        return TestResult::Fail("DATA fallback enabled without a firmware RA mask");
+    }
+    owner.poll_delivery().unwrap().unwrap();
+    port.model.lock().commands.clear();
+    let beacon = port.radio.read8(0x550).unwrap();
+    if run(owner.install_rate_mask([0xf5, 0x0f, 0x00, 0x40, 0x80], None)).is_err()
+        || owner.rate_mask() != Some(4)
+        || port.model.lock().commands != [(0x84, vec![0xf5, 0x0f, 0x00, 0x40, 0x80])]
+        || port.radio.read8(0x550).unwrap() != beacon | 8
+    {
+        return TestResult::Fail("EE RA mask differs from H2C_88E_RA_MASK + BCN_CTRL BIT3");
+    }
+    // DATA: RATE_ID = ratr_index, DISDATAFB clear, USE_RATE kept.
+    let slot = owner.packet.next[4];
+    owner
+        .submit_aggregate(&frame(true), 11, None, true)
+        .unwrap();
+    let data = port.descriptor(4, slot);
+    if word(&data, 16) & (1 << 10) != 0
+        || word(&data, 16) & (1 << 8) == 0
+        || (word(&data, 4) >> 16) & 15 != 4
+        || word(&data, 20) & 63 != 11
+    {
+        return TestResult::Fail("DATA TXD differs from rtl88ee_tx_fill_desc with useramask");
+    }
+    owner.poll_delivery().unwrap().unwrap();
+    // Management and non-adaptive (special) frames keep the forced rate.
+    for (data, adaptive) in [(false, true), (true, false)] {
+        let queue = if data { 4 } else { 1 };
+        let slot = owner.packet.next[queue];
+        owner
+            .submit_aggregate(&frame(data), 0, None, adaptive)
+            .unwrap();
+        let other = port.descriptor(queue, slot);
+        if word(&other, 16) & (1 << 10) == 0 || word(&other, 4) & (15 << 16) != 0 {
+            return TestResult::Fail("non-adaptive frame lost DISDATAFB");
+        }
+        owner.poll_delivery().unwrap().unwrap();
+    }
+    // RX: OFDM PHY status (pwdb_all 0x8c -> 60) and CCK (BB 0x824 BIT9).
+    let mut phy = [0u8; 28];
+    phy[4] = 0x8c;
+    let mut beacon_frame = frame(false);
+    beacon_frame[0] = 0x80;
+    port.emit_native(&beacon_frame, 11, 0, Some(&phy)).unwrap();
+    if owner.poll_receive().unwrap().and_then(|p| p.pwdb()) != Some(60) {
+        return TestResult::Fail("OFDM RX PWDB differs from _rtl88ee_query_rxphystatus");
+    }
+    phy[5] = (4 << 5) | 7;
+    port.radio.hardware_word(0x824, 1 << 9);
+    port.emit_native(&beacon_frame, 0, 0, Some(&phy)).unwrap();
+    // LNA4 VGA7 high power: -30 -> 70+6 = 76 (no low-power expansion).
+    if owner.poll_receive().unwrap().and_then(|p| p.pwdb()) != Some(76) {
+        return TestResult::Fail("CCK high-power RX PWDB differs");
+    }
+    port.radio.hardware_word(0x824, 0);
+    port.emit_native(&beacon_frame, 0, 0, Some(&phy)).unwrap();
+    // Low power: 76 -> +3 = 79.
+    if owner.poll_receive().unwrap().and_then(|p| p.pwdb()) != Some(79) {
+        return TestResult::Fail("CCK low-power RX PWDB differs");
+    }
+    port.emit(&beacon_frame).unwrap();
+    if owner.poll_receive().unwrap().map(|p| p.pwdb()) != Some(None) {
+        return TestResult::Fail("RX without PHYST reported a PWDB");
+    }
+    // Teardown: a terminal stop withdraws the mask (fallback off again).
+    owner.stop_packets().unwrap();
+    if owner.rate_mask().is_some() {
+        return TestResult::Fail("RA mask survived terminal stop");
+    }
+    // Failure: a firmware that never consumes the mask is terminal and
+    // never enables fallback; radio off never reaches the mailbox.
+    let (mut owner, port) = self::owner();
+    owner.start_packets().unwrap();
+    port.radio.hardware_word(0x6c, 1 << 31);
+    port.model.lock().hold_command = Some(0x84);
+    if run(owner.install_rate_mask(mask, None)) != Err(Error::CommandTimeout)
+        || owner.phase() != Phase::Failed
+        || owner.rate_mask().is_some()
+    {
+        return TestResult::Fail("stuck RA mask H2C was accepted");
+    }
+    let (mut owner, port) = self::owner();
+    owner.start_packets().unwrap();
+    port.radio.hardware_word(0x6c, 0);
+    port.model.lock().commands.clear();
+    if run(owner.install_rate_mask(mask, None)) != Err(Error::RadioOff)
+        || !port.model.lock().commands.is_empty()
+    {
+        return TestResult::Fail("radio-off RA mask reached firmware");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/packet",
+    smoke_rtl8188ee_native_rate_mask_enables_data_fallback
+);
+
+/// Linux `rtl_op_bss_info_changed(!assoc)` on a live owner: JOINBSSRPT
+/// disconnect and NO_LINK MAC state with DMA still running; a device-owned
+/// frame keeps the terminal path; a stuck mailbox is terminal.
+pub(crate) fn smoke_rtl8188ee_native_leave_peer_keeps_dma_for_rejoin() -> TestResult {
+    let (mut owner, port) = self::owner();
+    if run(owner.leave_station_peer()) != Err(Error::State) || owner.rejoinable() {
+        return TestResult::Fail("EE left a peer before packet service");
+    }
+    owner.start_packets().unwrap();
+    port.radio.hardware_word(0x6c, 1 << 31);
+    run(owner.install_rate_mask([0x05, 0xf0, 0x0f, 0x00, 0x80], None)).unwrap();
+    for (index, byte) in [2u8, 9, 8, 7, 6, 5].into_iter().enumerate() {
+        port.radio.write8(0x618 + index as u16, byte).unwrap();
+    }
+    port.model.lock().commands.clear();
+    if !owner.rejoinable()
+        || run(owner.leave_station_peer()).is_err()
+        || port.model.lock().commands != [(1, vec![0])]
+        || owner.phase() != Phase::Running
+        || !port.model.lock().master
+        || owner.rate_mask().is_some()
+        || (0x618..0x61e).any(|reg| port.radio.read8(reg).unwrap() != 0)
+        || port.radio.read8(0x102).unwrap() & 3 != 0
+    {
+        return TestResult::Fail("EE leave differs from JOINBSSRPT + NO_LINK on a live owner");
+    }
+    // Ring service continues after leaving the peer.
+    let id = owner.submit(&frame(false), 0).unwrap();
+    if owner.poll_delivery().ok().flatten().map(|d| d.id) != Some(id) {
+        return TestResult::Fail("EE leave stopped native ring service");
+    }
+    // A frame without its host receipt keeps the terminal path.
+    port.model.lock().complete = false;
+    owner.submit(&frame(false), 0).unwrap();
+    if owner.rejoinable() || run(owner.leave_station_peer()) != Err(Error::State) {
+        return TestResult::Fail("EE left a peer with a device-owned frame");
+    }
+    // Failure: a firmware that never consumes JOINBSSRPT is terminal.
+    let (mut owner, port) = self::owner();
+    owner.start_packets().unwrap();
+    port.radio.hardware_word(0x6c, 1 << 31);
+    port.model.lock().hold_command = Some(1);
+    if run(owner.leave_station_peer()) != Err(Error::CommandTimeout)
+        || owner.phase() != Phase::Failed
+        || owner.rejoinable()
+    {
+        return TestResult::Fail("EE stuck JOINBSSRPT left a live owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/packet",
+    smoke_rtl8188ee_native_leave_peer_keeps_dma_for_rejoin
+);

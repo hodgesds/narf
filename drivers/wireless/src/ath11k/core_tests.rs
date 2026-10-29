@@ -694,7 +694,10 @@ fn smoke_ath11k_core_config_wcn6855() -> TestResult {
         "Linux timeouts"
     );
     let q = HwRev::Qcn9074Hw10.params().expect("qcn9074 params");
-    ensure!(CoreConfig::for_hw(&q).is_none(), "QCN9074 unsupported");
+    ensure!(
+        CoreConfig::for_hw(&q).is_some_and(|c| c.max_radios == 1 && !c.single_pdev_only),
+        "QCN9074 multi-pdev core config"
+    );
     let q = HwRev::Qca6390Hw20.params().expect("qca6390 params");
     ensure!(
         CoreConfig::for_hw(&q).is_some_and(|cfg| cfg.num_vdevs == 4 && cfg.num_rxdma_per_pdev == 2),

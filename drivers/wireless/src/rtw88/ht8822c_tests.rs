@@ -111,7 +111,158 @@ kernel_test_in!(
     "drivers/wireless/rtw88/tx_ba/rtl8822c",
     smoke_rtw8822ce_tx_ba_peer_delba_and_real_key_epoch
 );
+fn smoke_rtw8822ce_dm_open_watchdog_revocation_restore() -> TestResult {
+    result(|| crate::rtw88::dm_station_tests::composition::<Case>(false))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/dm/rtl8822c",
+    smoke_rtw8822ce_dm_open_watchdog_revocation_restore
+);
+fn smoke_rtw8822ce_dm_wpa2_watchdog_revocation_restore() -> TestResult {
+    result(|| crate::rtw88::dm_station_tests::composition::<Case>(true))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/dm/rtl8822c",
+    smoke_rtw8822ce_dm_wpa2_watchdog_revocation_restore
+);
+fn smoke_rtw8822ce_dm_refusals_and_unqualified_station() -> TestResult {
+    result(crate::rtw88::dm_station_tests::refusals::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/dm/rtl8822c",
+    smoke_rtw8822ce_dm_refusals_and_unqualified_station
+);
+fn smoke_rtw8822ce_ht_protection_modes_admitted() -> TestResult {
+    result(|| {
+        for mode in 1..=3 {
+            crate::rtw88::dm_station_tests::protection_modes::<Case>(mode)?;
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/ht_protection/rtl8822c",
+    smoke_rtw8822ce_ht_protection_modes_admitted
+);
+fn smoke_rtw8822ce_coding_ldpc_stbc_and_revocation() -> TestResult {
+    result(crate::rtw88::coding_tests::composition::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/coding/rtl8822c",
+    smoke_rtw8822ce_coding_ldpc_stbc_and_revocation
+);
+fn smoke_rtw8822ce_coding_not_granted_or_uncoded_peer() -> TestResult {
+    result(crate::rtw88::coding_tests::not_granted::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/coding/rtl8822c",
+    smoke_rtw8822ce_coding_not_granted_or_uncoded_peer
+);
+fn smoke_rtw8822ce_coding_refusals_and_teardown() -> TestResult {
+    result(crate::rtw88::coding_tests::refusals::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/coding/rtl8822c",
+    smoke_rtw8822ce_coding_refusals_and_teardown
+);
+fn smoke_rtw8822ce_qos_open_all_ac_tid_routing_and_revocation() -> TestResult {
+    result(|| crate::rtw88::qos_tests::composition::<Case>(false))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/qos/rtl8822c",
+    smoke_rtw8822ce_qos_open_all_ac_tid_routing_and_revocation
+);
+fn smoke_rtw8822ce_qos_wpa2_all_ac_tid_routing_and_revocation() -> TestResult {
+    result(|| crate::rtw88::qos_tests::composition::<Case>(true))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/qos/rtl8822c",
+    smoke_rtw8822ce_qos_wpa2_all_ac_tid_routing_and_revocation
+);
+fn smoke_rtw8822ce_qos_not_granted_and_subset() -> TestResult {
+    result(crate::rtw88::qos_tests::not_granted::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/qos/rtl8822c",
+    smoke_rtw8822ce_qos_not_granted_and_subset
+);
+fn smoke_rtw8822ce_qos_refusals() -> TestResult {
+    result(crate::rtw88::qos_tests::refusals::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/qos/rtl8822c",
+    smoke_rtw8822ce_qos_refusals
+);
+fn smoke_rtw8822ce_fallback_open_firmware_ra_and_revocation() -> TestResult {
+    result(|| crate::rtw88::fallback_tests::composition::<Case>(false))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/fallback/rtl8822c",
+    smoke_rtw8822ce_fallback_open_firmware_ra_and_revocation
+);
+fn smoke_rtw8822ce_fallback_wpa2_firmware_ra_and_revocation() -> TestResult {
+    result(|| crate::rtw88::fallback_tests::composition::<Case>(true))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/fallback/rtl8822c",
+    smoke_rtw8822ce_fallback_wpa2_firmware_ra_and_revocation
+);
+fn smoke_rtw8822ce_fallback_not_granted_stays_fixed_rate() -> TestResult {
+    result(crate::rtw88::fallback_tests::not_granted::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/fallback/rtl8822c",
+    smoke_rtw8822ce_fallback_not_granted_stays_fixed_rate
+);
+fn smoke_rtw8822ce_fallback_refusals() -> TestResult {
+    result(crate::rtw88::fallback_tests::refusals::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/fallback/rtl8822c",
+    smoke_rtw8822ce_fallback_refusals
+);
 impl cases::Fixture for Case {
+    fn kind_request(
+        &self,
+        kind: &'static crate::rtw88::qualification::Kind,
+    ) -> Result<crate::rtw88::ContinuationRequest, Error> {
+        self.e.h.model(|io| io.kind_request(kind))
+    }
+    fn stage_kind(
+        &self,
+        kind: &'static crate::rtw88::qualification::Kind,
+        bytes: Vec<u8>,
+        cap: Cap<FirmwareBlob, Read>,
+        signed: bool,
+    ) -> Result<(), Error> {
+        self.e.h.model(|io| {
+            io.qualify(
+                kind,
+                crate::rtw88::qualification::Source::Verified {
+                    bytes,
+                    cap,
+                    signer: signed.then_some([19; 32]),
+                },
+            )
+        })
+    }
+    fn dm_request(&self) -> Result<crate::rtw88::ContinuationRequest, Error> {
+        self.e.h.model(|io| io.dm_request())
+    }
+    fn stage_dm(
+        &self,
+        bytes: Vec<u8>,
+        cap: Cap<FirmwareBlob, Read>,
+        signed: bool,
+    ) -> Result<(), Error> {
+        self.e.h.model(|io| {
+            io.qualify_dm(crate::rtw88::qualification::Source::Verified {
+                bytes,
+                cap,
+                signer: signed.then_some([18; 32]),
+            })
+        })
+    }
     type Io = RadioIo;
     fn rts_request(&self) -> Result<crate::rtw88::RtsRequest, Error> {
         self.e.h.model(|io| io.rts_request())
@@ -205,6 +356,9 @@ impl cases::Fixture for Case {
     }
     fn inject(&self, b: &[u8], r: u8, w: u8) {
         self.e.h.model(|io| io.packets.receive_rate(b, r, w))
+    }
+    fn mailboxes(&self) -> Vec<[u8; 8]> {
+        self.e.h.model(|io| io.mailboxes.clone())
     }
     fn descriptor(&self) -> Option<[u8; 48]> {
         self.e.h.model(|io| io.packets.last_descriptor)

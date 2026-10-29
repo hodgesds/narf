@@ -48,6 +48,7 @@
 extern crate alloc;
 
 mod bdram;
+mod block_ack;
 mod bootstrap;
 pub mod btc;
 mod calibration_policy;
@@ -63,6 +64,7 @@ mod command_queue;
 pub mod datapath;
 mod ddv;
 pub mod dma;
+mod dma_stop;
 mod download_dma;
 mod download_plan;
 mod dpk;
@@ -79,6 +81,7 @@ pub mod fwdl;
 pub mod h2c;
 mod interface;
 mod iqk;
+mod irq;
 pub mod mac;
 pub mod mac_init;
 mod mac_runtime;
@@ -101,6 +104,7 @@ mod power_native;
 mod power_regs;
 mod power_tables;
 mod prepared;
+mod qos;
 mod radio_assets;
 mod radio_full;
 mod radio_gain;
@@ -126,6 +130,7 @@ mod station;
 mod station_composition_tests;
 pub(super) mod station_control;
 mod station_lifecycle;
+mod track;
 mod tssi;
 pub mod tx_transport;
 pub mod txrx;
@@ -190,6 +195,11 @@ pub const ALL_DEV_IDS: &[u16] = &[
 /// (one level up in `drivers/wireless/src/lib.rs`).
 pub fn register() {
     register_pci_driver();
+    // Linux `rtw89_pm_ops` + mac80211 stop/start; retirement is async.
+    narf_power::system_pm::register_async_system_pm(
+        "rtw89",
+        alloc::sync::Arc::new(bootstrap::SystemPm),
+    );
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

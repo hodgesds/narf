@@ -299,6 +299,8 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                 }
                 self.install_key_with_cipher(aa, k.idx, &k.key, false, suite)
                     .await?;
+                // `NL80211_ATTR_KEY_SEQ` → `ieee80211_key_alloc(seq)`.
+                self.seed_group_rsc(aa, k.idx, &k.seq).await;
                 if let Some(l) = self.link.as_mut() {
                     l.gtk_idx = Some(k.idx);
                 }

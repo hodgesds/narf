@@ -408,6 +408,7 @@ fn commit(
     }
     core::sync::atomic::fence(Ordering::SeqCst);
     *placement = destination.clone();
+    object.record_move();
     Ok(())
 }
 fn cpu_run(placement: &GemPlacement, offset: u64) -> Result<(u64, u64), FsError> {

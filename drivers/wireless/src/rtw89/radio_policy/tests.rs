@@ -438,3 +438,200 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_full_radio_publication_runs_inside_current_signed_scope
 );
+
+fn smoke_rtw8852b_operating_programs_each_require_their_own_signed_identity() -> TestResult {
+    let base = board();
+    let cap = authority();
+    // Unknown bits, missing base bits and QosAll without WMM are rejected.
+    for flags in [1u8, 11, 0x13, 0x83] {
+        if Program::valid(flags) {
+            return TestResult::Fail("invalid program flag combination accepted");
+        }
+    }
+    if !Program::valid(3) || !Program::valid(7) || !Program::valid(15) {
+        return TestResult::Fail("valid program flags rejected");
+    }
+    if Program::QosAll.flags() != 15 || Program::Wmm.flags() != 7 {
+        return TestResult::Fail("program flag bytes differ");
+    }
+    // WMM identity is unchanged by the generalization (frozen chain).
+    let mut wmm = narf_crypto::sha256::Sha256::new();
+    wmm.update(b"NARF RTL8852B WMM BE/TID0 legacy12 optional operating recipe v2");
+    wmm.update(&base.identity());
+    wmm.update(&super::super::station_control::wmm_fingerprint());
+    if base.wmm().identity() != wmm.finalize() {
+        return TestResult::Fail("WMM recipe identity changed");
+    }
+    let qos = base.with_programs(15);
+    if qos.identity() == base.wmm().identity() || qos.identity() == base.identity() {
+        return TestResult::Fail("all-AC program shares an existing identity");
+    }
+    // A flags7 record cannot be promoted to 15, and a 15 record needs the
+    // chained identity.
+    let mut bytes = image(base.wmm());
+    bytes[57] = 15;
+    if Qualification::from_verified(&bytes, Some([3; 32]), base, cap).is_ok() {
+        return TestResult::Fail("WMM record promoted to all-AC QoS");
+    }
+    let mut bytes = image(qos);
+    bytes[57] = 15;
+    let Ok(mut granted) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
+        return TestResult::Fail("genuine all-AC record rejected");
+    };
+    granted.model_domain = Some(domain());
+    if granted.allows(Program::QosAll) != Ok(true)
+        || granted.wmm_allowed() != Ok(true)
+        || !granted.matches(base)
+    {
+        return TestResult::Fail("all-AC record did not grant its programs");
+    }
+    let mut bytes = image(base.wmm());
+    bytes[57] = 7;
+    let Ok(mut wmm_only) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
+        return TestResult::Fail("WMM record rejected");
+    };
+    wmm_only.model_domain = Some(domain());
+    if wmm_only.allows(Program::QosAll) != Ok(false) {
+        return TestResult::Fail("WMM record granted all-AC QoS");
+    }
+    cap.revoke();
+    if granted.allows(Program::QosAll).is_ok() {
+        return TestResult::Fail("revoked record still grants all-AC QoS");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/radio",
+    smoke_rtw8852b_operating_programs_each_require_their_own_signed_identity
+);
+
+fn smoke_rtw8852b_he_program_requires_ht_and_its_own_signed_identity() -> TestResult {
+    let base = board();
+    let cap = authority();
+    let he = Program::He.flags();
+    let ht = Program::Ht.flags();
+    // He requires Ht, which requires WMM and firmware RA.
+    if he != 0x77 || ht != 0x37 || !Program::valid(he) {
+        return TestResult::Fail("HE program flag byte differs");
+    }
+    for flags in [0x47u8, 0x57, 0x67, 0x43] {
+        if Program::valid(flags) {
+            return TestResult::Fail("HE accepted without HT/firmware RA/WMM");
+        }
+    }
+    let chained = base.with_programs(he);
+    if chained.identity() == base.with_programs(ht).identity() {
+        return TestResult::Fail("HE program shares the HT identity");
+    }
+    // An HT20 record cannot be promoted to HE.
+    let mut bytes = image(base.with_programs(ht));
+    bytes[57] = he;
+    if Qualification::from_verified(&bytes, Some([3; 32]), base, cap).is_ok() {
+        return TestResult::Fail("HT record promoted to HE");
+    }
+    let mut bytes = image(chained);
+    bytes[57] = he;
+    let Ok(mut granted) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
+        return TestResult::Fail("genuine HE record rejected");
+    };
+    granted.model_domain = Some(domain());
+    if granted.allows(Program::He) != Ok(true) || granted.allows(Program::Ht) != Ok(true) {
+        return TestResult::Fail("HE record did not grant HE and HT");
+    }
+    let mut bytes = image(base.with_programs(ht));
+    bytes[57] = ht;
+    let Ok(mut ht_only) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
+        return TestResult::Fail("HT record rejected");
+    };
+    ht_only.model_domain = Some(domain());
+    if ht_only.allows(Program::He) != Ok(false) {
+        return TestResult::Fail("HT record granted HE");
+    }
+    cap.revoke();
+    if granted.allows(Program::He).is_ok() {
+        return TestResult::Fail("revoked record still grants HE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/radio",
+    smoke_rtw8852b_he_program_requires_ht_and_its_own_signed_identity
+);
+
+fn smoke_rtw8852b_repeat_flr_lifecycle_requires_its_own_signed_identity() -> TestResult {
+    let base = board();
+    let cap = authority();
+    let repeat = base.lifecycle(Lifecycle::Repeat);
+    let mut chain = narf_crypto::sha256::Sha256::new();
+    chain.update(
+        b"NARF RTL8852B repeat observed-FLR PCI lifecycle v1;SER-L2 reset or S3 resume;same boot",
+    );
+    chain.update(&base.identity());
+    if base.lifecycle(Lifecycle::Initial) != base
+        || repeat.identity() != chain.finalize()
+        || repeat.identity() == base.identity()
+        || repeat.wmm().identity() == base.wmm().identity()
+    {
+        return TestResult::Fail("repeat lifecycle identity is not a distinct frozen chain");
+    }
+    // An initial-lifecycle record never qualifies a reset/resumed generation.
+    if Qualification::from_verified(&image(base), Some([3; 32]), repeat, cap).is_ok() {
+        return TestResult::Fail("initial-lifecycle record qualified a repeat FLR lifecycle");
+    }
+    let Ok(granted) = Qualification::from_verified(&image(repeat), Some([3; 32]), repeat, cap)
+    else {
+        return TestResult::Fail("genuine repeat-lifecycle record rejected");
+    };
+    if !granted.matches(repeat) || granted.matches(base) {
+        return TestResult::Fail("repeat-lifecycle record matched the initial lifecycle");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/radio",
+    smoke_rtw8852b_repeat_flr_lifecycle_requires_its_own_signed_identity
+);
+
+fn smoke_rtw8852b_ampdu_program_requires_ht_and_its_own_signed_identity() -> TestResult {
+    let base = board();
+    let cap = authority();
+    let ampdu = Program::Ampdu.flags();
+    let ht = Program::Ht.flags();
+    // Ampdu requires HT20, which requires WMM and firmware RA.
+    if ampdu != 0xb7 || !Program::valid(ampdu) || !Program::valid(ampdu | Program::He.bit()) {
+        return TestResult::Fail("A-MPDU program flag byte differs");
+    }
+    for flags in [0x87u8, 0x97, 0xa7, 0x83] {
+        if Program::valid(flags) {
+            return TestResult::Fail("A-MPDU accepted without HT/firmware RA/WMM");
+        }
+    }
+    let chained = base.with_programs(ampdu);
+    if chained.identity() == base.with_programs(ht).identity() {
+        return TestResult::Fail("A-MPDU program shares the HT identity");
+    }
+    // An HT20 record cannot be promoted to A-MPDU.
+    let mut bytes = image(base.with_programs(ht));
+    bytes[57] = ampdu;
+    if Qualification::from_verified(&bytes, Some([3; 32]), base, cap).is_ok() {
+        return TestResult::Fail("HT record promoted to A-MPDU");
+    }
+    let mut bytes = image(chained);
+    bytes[57] = ampdu;
+    let Ok(mut granted) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
+        return TestResult::Fail("genuine A-MPDU record rejected");
+    };
+    granted.model_domain = Some(domain());
+    if granted.allows(Program::Ampdu) != Ok(true) || granted.allows(Program::He) != Ok(false) {
+        return TestResult::Fail("A-MPDU record grants differ");
+    }
+    cap.revoke();
+    if granted.allows(Program::Ampdu).is_ok() {
+        return TestResult::Fail("revoked record still grants A-MPDU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/radio",
+    smoke_rtw8852b_ampdu_program_requires_ht_and_its_own_signed_identity
+);

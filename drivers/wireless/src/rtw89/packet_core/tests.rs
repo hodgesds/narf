@@ -24,6 +24,14 @@ struct Region {
 #[derive(Clone, Copy, Debug)]
 pub(in crate::rtw89) struct Submission {
     pub(in crate::rtw89) legacy_rate: u16,
+    /// INFO0 USE_RATE: false when firmware RA owns the DATA rate.
+    pub(in crate::rtw89) fixed_rate: bool,
+    /// INFO1 DATA_RTY_LOWEST_RATE.
+    pub(in crate::rtw89) retry_lowest: u16,
+    /// INFO0 DATA_ER (HE extended-range SU, firmware RA data only).
+    pub(in crate::rtw89) er: bool,
+    /// BODY3 AGG_EN with (INFO1 MAX_AGGNUM, INFO2 AMPDU_DENSITY).
+    pub(in crate::rtw89) agg: Option<(u8, u8)>,
     pub(in crate::rtw89) sequence: u16,
     pub(in crate::rtw89) channel: u8,
     pub(in crate::rtw89) qsel: u8,
@@ -66,6 +74,8 @@ pub(in crate::rtw89) struct Model {
     pub(in crate::rtw89) publications: usize,
     pub(in crate::rtw89) transmitted: Vec<Vec<u8>>,
     pub(in crate::rtw89) last: Option<Submission>,
+    /// Every accepted publication, oldest first.
+    pub(in crate::rtw89) history: Vec<Submission>,
     pub(in crate::rtw89) reaction: Option<Arc<Reaction>>,
     pub(in crate::rtw89) consume: bool,
     pub(in crate::rtw89) release: bool,
@@ -85,7 +95,7 @@ impl Model {
             ))
         };
         let mut registers = vec![0; 65536];
-        registers[0x1010..0x1014].copy_from_slice(&STOP.to_le_bytes());
+        registers[0x1010..0x1014].copy_from_slice(&format::STOP_ALL.to_le_bytes());
         Self {
             registers,
             regions: Vec::new(),
@@ -102,7 +112,9 @@ impl Model {
             publications: 0,
             transmitted: Vec::new(),
             last: None,
+            history: Vec::new(),
             reaction: None,
+
             consume: false,
             release: false,
             ignore: false,
@@ -170,10 +182,26 @@ impl Model {
         Ok(unsafe { core::slice::from_raw_parts(pointer, length).to_vec() })
     }
     pub(in crate::rtw89) fn inject(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.inject_rate(bytes, 0)
+    }
+    /// Inject with an RXWD DWORD1 rate (e.g. `0x80` = HT MCS0).
+    pub(in crate::rtw89) fn inject_rate(&mut self, bytes: &[u8], rate: u16) -> Result<(), Error> {
+        self.inject_phy(bytes, rate, 0)
+    }
+    /// RXWD DWORD1 RX_DATARATE[24:16] plus RX_GI_LTF[27:25].
+    pub(in crate::rtw89) fn inject_phy(
+        &mut self,
+        bytes: &[u8],
+        rate: u16,
+        gi_ltf: u8,
+    ) -> Result<(), Error> {
         let mut wire = vec![0; 20];
         let size = (20 + bytes.len() + 4) as u32;
         wire[..4].copy_from_slice(&(size | 1 << 15 | 1 << 14).to_le_bytes());
         wire[4..8].copy_from_slice(&((bytes.len() + 4) as u32).to_le_bytes());
+        // RXWD DWORD1 (after the 4-byte RXBD info) carries RX_DATARATE[24:16].
+        wire[8..12]
+            .copy_from_slice(&(u32::from(rate) << 16 | u32::from(gi_ltf) << 25).to_le_bytes());
         wire.extend_from_slice(bytes);
         wire.extend_from_slice(&[0; 4]);
         let event = rx_packet::Assembler::default()
@@ -206,11 +234,16 @@ impl Model {
         Ok(())
     }
     pub(in crate::rtw89) fn consumed(&mut self, submission: Submission) {
-        let queue = if submission.channel == 0 {
-            format::Queue::Data
-        } else {
-            format::Queue::Management
-        };
+        let queue = [
+            format::Queue::Data,
+            format::Queue::Management,
+            format::Queue::Background,
+            format::Queue::Video,
+            format::Queue::Voice,
+        ]
+        .into_iter()
+        .find(|queue| queue.channel() == submission.channel)
+        .unwrap_or(format::Queue::Management);
         let index = queue.regs().idx as u32;
         self.put(
             index,
@@ -256,7 +289,19 @@ impl Model {
         // Decode independently from the descriptor: the raw QoS data header
         // contributes its two actual control bytes to ieee80211_hdrlen/2.
         let header_words = if body[0] & 0xfc == 0x88 {
-            if kind != format::Queue::Data || body.get(24..26) != Some(&[0, 0]) {
+            // Independent decode of the QoS TID -> AC -> ACH mapping.
+            let tid = body.get(24).copied().ok_or(Error::Packet)?;
+            let expected = match tid {
+                0 | 3 => format::Queue::Data,
+                1 | 2 => format::Queue::Background,
+                4 | 5 => format::Queue::Video,
+                6 | 7 => format::Queue::Voice,
+                _ => return Err(Error::Packet),
+            };
+            if kind != expected
+                || body.get(25) != Some(&0)
+                || (word(8) >> 23 & 1 == 1) != matches!(tid, 2 | 3 | 5 | 7)
+            {
                 return Err(Error::Packet);
             }
             13
@@ -276,15 +321,29 @@ impl Model {
         if word(0) != expected0
             || word(4) != 0
             || word(8) >> 24 != 0
+            || body[0] != 0x88 && word(8) >> 23 & 1 != 0
             || word(8) >> 17 & 0x3f != u32::from(kind.qsel())
             || header[16..24] != [0; 8]
-            || word(24) & !(0x1ff << 16) != 1 << 30 | 1 << 10
-            || (word(24) >> 16) & 0x1ff > 11
+            // Either a fixed source rate (USE_RATE|DISDATAFB, INFO1 zero) or
+            // firmware RA data (INFO0 zero, INFO1 lowest retry rate only).
+            || !(word(24) & !(0x1ff << 16) == 1 << 30 | 1 << 10
+                && (word(24) >> 16) & 0x1ff <= 11
+                && word(28) == 0
+                || kind != format::Queue::Management
+                    && word(24) & !(1 << 15) == 0
+                    && word(28) & !(0x1ff << 16 | 0xff) == 0
+                    && (word(28) >> 16) & 0x1ff <= 11)
             || kind == format::Queue::Management && word(24) & (0x1ff << 16) != 0
-            || word(28) != 0
-            || word(32) != 0
+            // A-MPDU fields only together on firmware-RA QoS DATA.
+            || word(12) & !(0xfff | 1 << 12) != 0
+            || !(word(12) & 1 << 12 == 0 && word(28) & 0xff == 0 && word(32) == 0
+                || word(12) & 1 << 12 != 0
+                    && body[0] == 0x88
+                    && word(24) & 1 << 30 == 0
+                    && word(32) & !(7 << 18) == 0)
             || word(36) & !(1 << 10) != 0
-            || word(40) != 1 << 31 | 1 << 27
+            // BMC (no ACK) only for a broadcast probe request.
+            || word(40) != 1 << 31 | if body[0] == 0x40 && body[4] & 1 != 0 { 0 } else { 1 << 27 }
             || word(44) != 0
             || sequence & 0x8000 == 0
             || sequence & 0x7fff >= 512
@@ -299,6 +358,12 @@ impl Model {
         }
         let submission = Submission {
             legacy_rate: ((word(24) >> 16) & 0x1ff) as u16,
+            fixed_rate: word(24) & 1 << 30 != 0,
+            retry_lowest: ((word(28) >> 16) & 0x1ff) as u16,
+            er: word(24) & 1 << 15 != 0,
+            agg: (word(12) & 1 << 12 != 0)
+                .then_some(((word(28) & 0xff) as u8, (word(32) >> 18) as u8)),
+
             sequence: sequence & 0x7fff,
             channel: kind.channel(),
             qsel: kind.qsel(),
@@ -310,6 +375,7 @@ impl Model {
         self.publications += 1;
         self.transmitted.push(body.clone());
         self.last = Some(submission);
+        self.history.push(submission);
         let (responses, hold) = if let Some(reaction) = self.reaction.clone() {
             reaction(&body)?
         } else {
@@ -363,7 +429,13 @@ impl power::Io for Model {
             self.registers[address as usize..address as usize + 2]
                 .copy_from_slice(&value.to_le_bytes());
         }
-        for kind in [format::Queue::Data, format::Queue::Management] {
+        for kind in [
+            format::Queue::Data,
+            format::Queue::Management,
+            format::Queue::Background,
+            format::Queue::Video,
+            format::Queue::Voice,
+        ] {
             if kind.regs().idx == u64::from(address) && !self.ignore {
                 self.doorbell(kind, value, previous)
                     .map_err(|_| power::Error::Access)?;
@@ -464,15 +536,18 @@ unsafe impl Port for Model {
             event,
         })
     }
-    fn start(&mut self) -> Result<(), Error> {
+    fn start(&mut self, open: u32) -> Result<(), Error> {
         self.ordinary_allowed()?;
-        self.put(0x1010, self.word(0x1010) & !STOP);
+        if open & STOP != STOP || open & !format::STOP_ALL != 0 {
+            return Err(Error::State);
+        }
+        self.put(0x1010, self.word(0x1010) & !open);
         self.put(0xc000, self.word(0xc000) | 1 << 29);
         Ok(())
     }
     fn stop(&mut self) -> Result<(), Error> {
         self.guard()?;
-        self.put(0x1010, self.word(0x1010) | STOP);
+        self.put(0x1010, self.word(0x1010) | format::STOP_ALL);
         self.put(0xc000, self.word(0xc000) & !(1 << 29));
         Ok(())
     }
@@ -633,7 +708,7 @@ fn smoke_rtw89_b_packet_current_epoch_rf_gate_and_stop_retention() -> TestResult
     core.submit(&mut model, &frame(), true).unwrap();
     let body = model.last.unwrap().body;
     if core.stop(&mut model).is_err()
-        || core.pending.is_none()
+        || core.pending.is_empty()
         || core.ready()
         || core
             .rings
@@ -706,7 +781,7 @@ fn smoke_rtw89_b_packet_rechecks_peer_rf_before_bd_and_retains_uncertain_doorbel
         if core.submit(&mut model, &frame(), true) != Err(Error::Access)
             || model.publications != 0
             || model.bytes(base, 8).unwrap() != [0; 8]
-            || core.pending.is_some()
+            || !core.pending.is_empty()
             || core.ready()
             || model.word(0x1010) & STOP != STOP
         {
@@ -718,8 +793,11 @@ fn smoke_rtw89_b_packet_rechecks_peer_rf_before_bd_and_retains_uncertain_doorbel
     if core.submit(&mut model, &frame(), true) != Err(Error::Access) {
         return TestResult::Fail("unacknowledged actual doorbell accepted");
     }
-    let pending = core.pending.as_ref().unwrap();
-    let ring = &mut core.rings[pending.queue.slot()];
+    let pending = core.pending.first().unwrap();
+    let queue = pending.queue;
+    let Some(ring) = core.rings.iter_mut().find(|ring| ring.kind == queue) else {
+        return TestResult::Fail("pending ring missing");
+    };
     let base = ring.descriptors.as_ref().unwrap().dma_addr().raw();
     if ring.queue.write_pointer() != 1
         || ring.queue.reserved_mut(pending.ticket).is_ok()
@@ -735,4 +813,145 @@ fn smoke_rtw89_b_packet_rechecks_peer_rf_before_bd_and_retains_uncertain_doorbel
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_packet_rechecks_peer_rf_before_bd_and_retains_uncertain_doorbell
+);
+
+fn smoke_rtw89_b_packet_reclaim_releases_rings_and_unretired_packets() -> TestResult {
+    let (mut core, mut model) = match fixture() {
+        Ok(value) => value,
+        Err(error) => return TestResult::Fail(error),
+    };
+    if core.submit(&mut model, &frame(), true).is_err() || core.stop(&mut model).is_err() {
+        return TestResult::Fail("packet reclaim baseline");
+    }
+    let rings = core.rings.len();
+    if core.reclaimed() {
+        return TestResult::Fail("bounded stop alone counted as reclamation");
+    }
+    // SAFETY: inert RAM model; there is no device or DMA producer.
+    let storage = unsafe { core.reclaim_fenced() };
+    // Every descriptor ring plus the in-flight header and body.
+    if storage.len() != rings + 2
+        || !core.reclaimed()
+        || !core.pending.is_empty()
+        || core.ready()
+        || core.submit(&mut model, &frame(), true) != Err(Error::State)
+        || core.poll(&mut model).is_ok()
+    {
+        return TestResult::Fail("packet reclamation kept, duplicated or reopened DMA storage");
+    }
+    // SAFETY: same inert model; nothing remains to release.
+    if !unsafe { core.reclaim_fenced() }.is_empty() {
+        return TestResult::Fail("packet reclamation released storage twice");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_packet_reclaim_releases_rings_and_unretired_packets
+);
+
+fn qos_frame(sequence: u16) -> Vec<u8> {
+    let mut bytes = frame();
+    bytes[0] = 0x88;
+    bytes[22..24].copy_from_slice(&(sequence << 4).to_le_bytes());
+    bytes[24..26].fill(0);
+    bytes
+}
+fn smoke_rtw89_b_packet_aggregate_window_multi_slot_rpq_retirement() -> TestResult {
+    let agg = format::Agg {
+        num: 63,
+        density: 5,
+    };
+    let rate = format::FIRMWARE_RA;
+    // Program not granted: no aggregation without enable_aggregation, and
+    // a legacy-only owner cannot enable it.
+    let (mut core, mut model) = fixture().unwrap();
+    if core.enable_aggregation().is_ok()
+        || core.submit_agg(&mut model, &qos_frame(1), false, rate, Some(agg)) != Err(Error::Packet)
+        || model.publications != 0
+    {
+        return TestResult::Fail("aggregation admitted without the signed program");
+    }
+    let mut model = Model::new();
+    let Ok(mut core) = Core::prepare_with(&mut model, OWN, 0, false, RxPhy::Ht) else {
+        return TestResult::Fail("HT packet preparation");
+    };
+    if core.enable_aggregation().is_err() || core.start(&mut model).is_err() {
+        return TestResult::Fail("aggregate packet start");
+    }
+    if core.enable_aggregation().is_ok() {
+        return TestResult::Fail("aggregation enabled after start");
+    }
+    // Success: AGG_WINDOW aggregated frames in flight, each in its own slot
+    // with AGG_EN/MAX_AGGNUM/AMPDU_DENSITY; the window then closes.
+    let mut ids = Vec::new();
+    for sequence in 0..AGG_WINDOW as u16 {
+        match core.submit_agg(&mut model, &qos_frame(sequence), false, rate, Some(agg)) {
+            Ok(id) => ids.push(id),
+            Err(_) => return TestResult::Fail("aggregated frame refused inside the window"),
+        }
+    }
+    let history = model.history.clone();
+    if history.len() != AGG_WINDOW
+        || history.iter().any(|s| s.agg != Some((63, 5)))
+        || core.ready_aggregate()
+        || core.ready()
+        || core.submit_agg(&mut model, &qos_frame(99), false, rate, Some(agg)) != Err(Error::Busy)
+    {
+        return TestResult::Fail("aggregate window or TXWD A-MPDU fields differ");
+    }
+    // A non-aggregated frame never joins aggregated frames in flight.
+    if core.submit_rate(&mut model, &frame(), false, rate) != Err(Error::Busy) {
+        return TestResult::Fail("non-aggregated frame joined the aggregate");
+    }
+    // Multi-entry RPQ retirement out of order, after the read pointer.
+    model.consumed(history[AGG_WINDOW - 1]);
+    for submission in history.iter().rev() {
+        if model.report(*submission, 0).is_err() {
+            return TestResult::Fail("fixture report");
+        }
+    }
+    let mut receipts = Vec::new();
+    for _ in 0..AGG_WINDOW * 2 {
+        match core.poll(&mut model) {
+            Ok(step) => receipts.extend(step.receipt.map(|r| r.id)),
+            Err(_) => return TestResult::Fail("multi-entry RPQ retirement failed"),
+        }
+    }
+    receipts.sort_unstable();
+    if receipts != ids || !core.ready() || !core.ready_aggregate() {
+        return TestResult::Fail("every in-flight frame did not retire exactly once");
+    }
+    // Failure: a duplicate report for an already retired frame closes it.
+    if core
+        .submit_agg(&mut model, &qos_frame(40), false, rate, Some(agg))
+        .is_err()
+    {
+        return TestResult::Fail("aggregate after retirement refused");
+    }
+    model.report(history[1], 0).unwrap();
+    if core.poll(&mut model).is_ok() || core.ready() {
+        return TestResult::Fail("stale multi-entry RPQ report accepted");
+    }
+    // Teardown: several unretired slots are all reclaimed.
+    let mut model = Model::new();
+    let mut core = Core::prepare_with(&mut model, OWN, 0, false, RxPhy::Ht).unwrap();
+    core.enable_aggregation().unwrap();
+    core.start(&mut model).unwrap();
+    for sequence in 0..3 {
+        core.submit_agg(&mut model, &qos_frame(sequence), false, rate, Some(agg))
+            .unwrap();
+    }
+    let rings = core.rings.len();
+    let _ = core.stop(&mut model);
+    // SAFETY: inert RAM model; there is no device or DMA producer.
+    let storage = unsafe { core.reclaim_fenced() };
+    if storage.len() != rings + 6 || !core.reclaimed() || !core.pending.is_empty() {
+        return TestResult::Fail("unretired aggregate slots not reclaimed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_packet_aggregate_window_multi_slot_rpq_retirement
 );

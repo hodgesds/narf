@@ -612,12 +612,17 @@ pub const SRNG_CONFIG_TEMPLATE: [SrngConfig; HAL_MAX_RING_TYPES] = [
 /// Linux `ath11k_hal_srng_create_config`: the template plus each
 /// ring type's R0 / R2 register bases and per-ring strides.
 pub fn create_config(r: &HalRegs) -> [SrngConfig; HAL_MAX_RING_TYPES] {
+    create_config_ce(r, ATH11K_CE_OFFSET_PCI)
+}
+
+/// [`create_config`] with `ATH11K_CE_OFFSET(ab)` = `ce_off` added to the
+/// CE ring register bases (IPQ5018's remapped CE window).
+pub fn create_config_ce(r: &HalRegs, ce_off: u32) -> [SrngConfig; HAL_MAX_RING_TYPES] {
     use HalRingType as T;
     let mut c = SRNG_CONFIG_TEMPLATE;
     let reo = HAL_SEQ_WCSS_UMAC_REO_REG;
     let tcl = HAL_SEQ_WCSS_UMAC_TCL_REG;
     let wbm = HAL_SEQ_WCSS_UMAC_WBM_REG;
-    let ce_off = ATH11K_CE_OFFSET_PCI;
 
     let s = &mut c[T::ReoDst.idx()];
     s.reg_start = [reo + r.hal_reo1_ring_base_lsb, reo + r.hal_reo1_ring_hp];
@@ -1270,7 +1275,7 @@ impl Hal {
         let regs = hw
             .regs
             .ok_or(TransportError::new(step::NO_REGS, 0, errno::EINVAL))?;
-        let config = create_config(regs);
+        let config = create_config_ce(regs, hw.ce_offset);
         let rdp = DmaMem::alloc(4 * HAL_SRNG_RING_ID_MAX as usize, 1)?;
         let wrp = DmaMem::alloc(4 * HAL_SRNG_NUM_LMAC_RINGS as usize, 1)?;
         let mut srngs = Vec::new();

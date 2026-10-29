@@ -43,6 +43,7 @@ mod firmware_assets;
 mod firmware_parser_tests;
 pub mod firmware_transport;
 pub mod fwdl;
+pub(crate) mod he;
 pub(crate) mod ht20;
 pub mod mac;
 pub mod mcu;
@@ -51,6 +52,8 @@ pub mod pci;
 mod registers;
 mod registers_tests;
 pub mod regs;
+pub(crate) mod six_ghz;
+pub(crate) mod tx_priority;
 pub mod txrx;
 pub(crate) mod vht;
 

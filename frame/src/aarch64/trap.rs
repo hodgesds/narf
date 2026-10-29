@@ -13,16 +13,22 @@ use narf_console::Writer;
 /// The architecture-owned layout saved by `vec.S`'s `SAVE_ALL_GPRS` macro.
 pub use narf_arch::aarch64::trap_frame::TrapFrame;
 
-/// Called from `__narf_vec_irq` in `vec.S`. Reads the GIC's ICC_IAR1_EL1
-/// to acknowledge the IRQ, dispatches to the registered handler by
-/// INTID, then writes ICC_EOIR1_EL1 to release the priority.
+/// Called from `__narf_vec_irq` in `vec.S`, after the prologue has saved
+/// the interrupted context; runs in `DomainId::FRAME`. Acknowledges the
+/// IRQ at the GIC, dispatches to the registered handler by INTID, then
+/// EOIs to release the priority. Ack / EOI go through
+/// `narf_interrupts::aarch64::{ack_irq, eoi_for}`, which use the backend
+/// `gic::probe` selected once at boot: `ICC_IAR1_EL1` / `ICC_EOIR1_EL1`
+/// (GICv3) or memory-mapped `GICC_IAR` / `GICC_EOIR` (GICv2; a TTBR1
+/// Device mapping, untagged, so reachable from FRAME in every task).
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_aarch64_irq(frame: &TrapFrame) {
     let hardirq_account =
         narf_scheduler::interrupt_account_enter(narf_scheduler::InterruptKind::HardIrq);
-    // SAFETY: we are in the IRQ handler by the vector-table contract.
-    let iar = unsafe { sysreg::read_icc_iar1_el1() };
-    let intid = (iar & 0x00FF_FFFF) as u32;
+    // SAFETY: we are in the IRQ handler by the vector-table contract, and
+    // IRQs are only unmasked after `gic::init_bsp` / `gic::init_ap`.
+    let iar = unsafe { narf_interrupts::aarch64::ack_irq() };
+    let intid = narf_interrupts::aarch64::iar_intid(iar);
 
     match intid {
         n if n < 16 => {
@@ -43,8 +49,8 @@ pub extern "C" fn rust_aarch64_irq(frame: &TrapFrame) {
                 narf_interrupts::aarch64::timer::rearm_timer(TIMER_TVAL_DEFAULT);
             }
         }
-        1023 => {
-            // Spurious: ICC_IAR1_EL1 returned the spurious INTID;
+        narf_interrupts::aarch64::SPURIOUS_INTID => {
+            // Spurious: the CPU interface returned the spurious INTID;
             // don't EOI, just return.
             return;
         }

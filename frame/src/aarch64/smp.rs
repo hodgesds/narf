@@ -266,7 +266,7 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
         narf_arch::aarch64::sysreg::write_vbar_el1(vbar);
     }
 
-    // 3. Per-CPU GICv3 init: cpu interface + redistributor wake +
+    // 3. Per-CPU GIC init (v2 or v3): cpu interface + SGI/PPI bank +
     //    timer-PPI enable.
     // SAFETY: distributor was already brought up by the BSP; this
     // CPU only touches its own redistributor + sysregs.

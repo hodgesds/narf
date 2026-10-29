@@ -6,8 +6,9 @@ use alloc::vec::Vec;
 use narf_wireless::wmm::{Parameters, INFORMATION};
 
 fn admit(parameters: Parameters) -> Result<Parameters, Error> {
-    // Ordinary Ethernet uses BE/TID0. No TSPEC admission or U-APSD is
-    // negotiated; an ACM-only BE queue cannot silently become usable.
+    // No TSPEC admission or U-APSD is negotiated. VO/VI/BK ACM is served by
+    // `tx_qos` downgrade (`ieee80211_downgrade_queue`); an ACM-only BE queue
+    // would push all ordinary traffic onto BK, so that BSS stays refused.
     if parameters.ac[0].admission_control {
         return Err(Error::Unsupported);
     }
@@ -41,6 +42,20 @@ pub(super) fn response(
         (None, None) => Ok(None),
         (Some(_), Some(parameters)) => admit(parameters).map(Some),
         _ => Err(Error::Unsupported),
+    }
+}
+
+/// mac80211 `ieee80211_sta_wmm_params` for a beacon from the associated AP:
+/// `Some` only for a WMM Parameter element whose Parameter Set Count differs
+/// from the programmed set. An absent or unparsable element changes nothing
+/// (mac80211 sees no `wmm_param`); a new set this owner cannot serve (BE ACM)
+/// is refused like the association response.
+pub(super) fn beacon(current: Parameters, ies: &[u8]) -> Result<Option<Parameters>, Error> {
+    match Parameters::parse(ies) {
+        Ok(Some(parameters)) if parameters.parameter_set_count != current.parameter_set_count => {
+            admit(parameters).map(Some)
+        }
+        _ => Ok(None),
     }
 }
 

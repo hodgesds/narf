@@ -89,6 +89,18 @@ pub(super) struct State<M: Memory> {
     reserved: Option<M>,
     pub(super) qos: bool,
     pub(super) ht: bool,
+    /// HIMR/HIMRE/HSIMR currently carry the Linux 88EE masks.
+    interrupts: bool,
+    /// Firmware leisure power save (fw_current_inpsmode) is active.
+    leisure: bool,
+    /// `sta_entry->ratr_index` of the installed `H2C_88E_RA_MASK`: DATA
+    /// rate fallback is only enabled while the firmware owns this mask
+    /// and the caller holds a current `NEFB` grant.
+    rate_mask: Option<u8>,
+    /// Reserved-page bodies of earlier associations on this claim. Each
+    /// upload was proven by BCN_VALID, but its command-beacon OWN bit may
+    /// stay set, so the body is only released with a quiescence proof.
+    retired: Vec<M>,
 }
 impl<M: Memory> State<M> {
     pub(super) fn new() -> Self {
@@ -102,6 +114,10 @@ impl<M: Memory> State<M> {
             reserved: None,
             qos: false,
             ht: false,
+            interrupts: false,
+            leisure: false,
+            rate_mask: None,
+            retired: Vec::new(),
         }
     }
     pub(super) fn retain(&mut self) {
@@ -109,6 +125,7 @@ impl<M: Memory> State<M> {
         // BME clear alone never permits releasing it at a terminal stop.
         core::mem::forget(self.pending.take());
         core::mem::forget(self.reserved.take());
+        core::mem::forget(core::mem::take(&mut self.retired));
     }
 }
 struct Pending<M: Memory> {
@@ -130,6 +147,11 @@ pub struct Mpdu {
     bytes: Vec<u8>,
     channel: u8,
     ht: bool,
+    /// Native RXD DW1 PAGGR/FAGGR: this MPDU arrived inside an A-MPDU.
+    aggregated: bool,
+    /// `_rtl88ee_query_rxphystatus` `rx_pwdb_all` when RXD PHYST carried
+    /// the 28-byte EE PHY status.
+    pwdb: Option<u8>,
 }
 /// Consuming a rejected packet/report is progress, never a receive-idle
 /// proof. Station output waits for a genuine OWN-owned next descriptor.
@@ -147,6 +169,13 @@ impl Mpdu {
     pub(super) fn ht(&self) -> bool {
         self.ht
     }
+    /// Only the station's recipient BA owner may admit such an MPDU.
+    pub(super) fn pwdb(&self) -> Option<u8> {
+        self.pwdb
+    }
+    pub(super) fn aggregated(&self) -> bool {
+        self.aggregated
+    }
 }
 impl narf_wireless::station_security::RawFrame for Mpdu {
     fn bytes(&self) -> &[u8] {
@@ -159,6 +188,8 @@ impl narf_wireless::station_security::RawFrame for Mpdu {
 
 const OWN: u32 = 1 << 31;
 const MAX_MPDU: usize = 2304;
+/// `rtl8188ee_tx_fill_desc`: `set_tx_desc_max_agg_num(pdesc, 0x14)`.
+const MAX_AGG_NUM: u32 = 0x14;
 
 fn queue(frame: &[u8], local: [u8; 6], qos: bool) -> Result<(usize, u16, u8), Error> {
     if !(24..=MAX_MPDU).contains(&frame.len()) || frame[10..16] != local || frame[22] & 15 != 0 {
@@ -173,20 +204,38 @@ fn queue(frame: &[u8], local: [u8; 6], qos: bool) -> Result<(usize, u16, u8), Er
             && (matches!((fc >> 4) & 15, 0 | 4 | 10 | 11 | 12)
                 || qos
                     && (fc >> 4) & 15 == 13
-                    && frame.len() == 33
-                    && frame[24..26] == [3, 1]
-                    && frame[27..29] == [37, 0]) =>
+                    && (frame.len() == 33 && matches!(frame[24..26], [3, 0] | [3, 1])
+                        || frame.len() == 30 && frame[24..26] == [3, 2])) =>
         {
             // MGMT vector1, Linux MGNT_QUEUE6, QSLT_MGNT0x12.
             Ok((1, 1 << 6, 0x12))
         }
-        2 if fc & 0x03f0 == 0x0100
-            || qos && fc & 0x03f0 == 0x0180 && frame.get(24..26) == Some(&[0, 0]) =>
-        {
-            // BE vector4, Linux BE_QUEUE1, firmware priority/TID0.
-            Ok((4, 1 << 1, 0))
-        }
+        // Non-QoS DATA: mac80211 skb->priority0 on BE.
+        2 if fc & 0x03f0 == 0x0100 => Ok((4, 1 << 1, 0)),
+        // QoS DATA TID0..7 with normal ACK, no EOSP/A-MSDU/TXOP/queue size.
+        // rtl_pci_tx queues `ieee802_1d_to_ac[priority]` on its own linked
+        // ring and rtl88ee `_rtl88ee_map_hwqueue_to_fwqueue` sets TXD1
+        // QSEL to skb->priority (the TID). Vectors follow TX_BASES; doorbells
+        // are REG_PCIE_CTRL BIT(hw_queue): BK0, BE1, VI2, VO3.
+        2 if qos && fc & 0x03f0 == 0x0180 => match frame.get(24..26) {
+            Some(&[tid, 0]) if tid & 0xf8 == 0 => {
+                let (vector, doorbell) = access_category_queue(tid);
+                Ok((vector, doorbell, tid))
+            }
+            _ => Err(Error::Packet),
+        },
         _ => Err(Error::Packet),
+    }
+}
+
+/// Linux `ieee802_1d_to_ac` followed by `_rtl_mac_to_hwqueue`: the EE
+/// linked-ring vector (TX_BASES order) and its REG_PCIE_CTRL doorbell.
+pub(super) const fn access_category_queue(tid: u8) -> (usize, u16) {
+    match tid & 7 {
+        1 | 2 => (5, 1 << 0), // BK_QUEUE0 at REG_BKQ_DESA.
+        4 | 5 => (3, 1 << 2), // VI_QUEUE2 at REG_VIQ_DESA.
+        6 | 7 => (2, 1 << 3), // VO_QUEUE3 at REG_VOQ_DESA.
+        _ => (4, 1 << 1),     // BE_QUEUE1 at REG_BEQ_DESA.
     }
 }
 
@@ -309,9 +358,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             }
             policy(self)?;
             let ring = &mut self.tx[0];
+            // A rejoin reuses the command-beacon descriptor whose previous
+            // upload BCN_VALID already proved (Linux rtl_cmd_send_packet
+            // reuses BEACON_QUEUE descriptor 0 the same way).
+            let proven = !self.packet.retired.is_empty();
             self.io.authority(true, || {
                 ring.sync();
-                if ring.read32(0)? & OWN != 0 {
+                if ring.read32(0)? & OWN != 0 && !proven {
                     return Err(Error::Descriptor);
                 }
                 for (index, value) in prefix.into_iter().enumerate() {
@@ -375,15 +428,205 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.phase = Phase::Running;
         Ok(())
     }
+    /// `sta_entry->ratr_index` of the installed RA mask, if any.
+    pub(crate) fn rate_mask(&self) -> Option<u8> {
+        self.packet.rate_mask
+    }
+    /// Linux `rtl88ee_update_hal_rate_mask`: `H2C_88E_RA_MASK` (0x84) with
+    /// the 5-byte mask, then `_rtl88ee_set_bcn_ctrl_reg(BIT(3), 0)`. Only a
+    /// running, awake owner (the watchdog skips the refresh in LPS) may
+    /// hand rate selection to the firmware; a mailbox failure is terminal.
+    pub(crate) async fn install_rate_mask(
+        &mut self,
+        payload: [u8; 5],
+        admission: Option<&super::station::Admission>,
+    ) -> Result<(), Error> {
+        if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        super::super::station_control::radio_on(&self.io)?;
+        self.packet
+            .mailbox
+            .send_admitted(
+                &self.io,
+                super::super::rate_adaptive::H2C_RA_MASK,
+                &payload,
+                admission,
+            )
+            .await?;
+        let beacon = self.io.read8(0x550)?;
+        self.io.write8(0x550, beacon | 8)?;
+        if self.io.read8(0x550)? != beacon | 8 {
+            return Err(Error::Readback);
+        }
+        self.packet.rate_mask = Some(payload[3] >> 4);
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    /// True while the firmware is in leisure power save.
+    pub(crate) fn leisure(&self) -> bool {
+        self.packet.leisure
+    }
+    /// Linux `rtl_lps_set_psmode(EAUTOPS)` → HW_VAR_FW_LPS_ACTION(true):
+    /// only a running, idle owner may hand the radio to firmware LPS.
+    pub(crate) async fn enter_leisure(&mut self) -> Result<(), Error> {
+        if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        self.packet.mailbox.doze(&self.io).await?;
+        self.packet.leisure = true;
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    /// Linux `rtl_lps_set_psmode(EACTIVE)` → HW_VAR_FW_LPS_ACTION(false):
+    /// `_rtl88ee_fwlps_leave` RPWM ALL_ON then H2C FW_PS_ACTIVE_MODE.
+    pub(crate) async fn leave_leisure(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Running || !self.packet.leisure {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        self.packet.mailbox.awake(&self.io).await?;
+        self.packet.leisure = false;
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    /// Linux `rtl_op_bss_info_changed(BSS_CHANGED_ASSOC)` with `!assoc` on a
+    /// live owner: leave LPS, `HW_VAR_H2C_FW_JOINBSSRPT(RT_MEDIA_DISCONNECT)`,
+    /// then the disconnected MSR/BSSID/AID/RCR/BCN_CTRL state
+    /// (`rtl88ee_set_network_type(NO_LINK)` and `HW_VAR_BSSID` zero). DMA,
+    /// rings and interrupts stay live (Linux never stops the PCI engines on
+    /// disassociation); an in-flight frame is first retired by its host
+    /// receipt (`rejoinable`). The firmware RA mask and the per-association
+    /// QoS/HT TXD profile are withdrawn; the reserved-page body is retired,
+    /// not freed. Any failure is terminal for the owner.
+    pub(crate) async fn leave_station_peer(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Running || self.packet.pending.is_some() {
+            return Err(Error::State);
+        }
+        self.packet
+            .retired
+            .try_reserve(1)
+            .map_err(|_| Error::Memory)?;
+        self.phase = Phase::Failed;
+        if core::mem::take(&mut self.packet.leisure) {
+            self.packet.mailbox.awake(&self.io).await?;
+        }
+        self.packet.mailbox.send(&self.io, 1, &[0]).await?;
+        super::super::station_control::disconnected(&self.io)?;
+        self.packet.rate_mask = None;
+        self.packet.qos = false;
+        self.packet.ht = false;
+        if let Some(reserved) = self.packet.reserved.take() {
+            self.packet.retired.push(reserved);
+        }
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    /// A running owner whose last frame has its host receipt may leave the
+    /// peer without stopping DMA. A frame still owned by the device (no
+    /// receipt) keeps the terminal `disconnect_station_peer` path.
+    pub(crate) fn rejoinable(&mut self) -> bool {
+        if self.phase != Phase::Running {
+            return false;
+        }
+        if self.packet.pending.is_some() && self.poll_delivery().is_err() {
+            return false;
+        }
+        self.phase == Phase::Running && self.packet.pending.is_none()
+    }
     pub(crate) async fn disconnect_station_peer(&mut self) -> Result<(), Error> {
         if !matches!(self.phase, Phase::Running | Phase::Failed) {
             return Err(Error::State);
         }
         self.phase = Phase::Failed;
-        let report = self.packet.mailbox.send(&self.io, 1, &[0]).await;
+        // mac80211 disassociation leaves PS before the join report clears.
+        let awake = if core::mem::take(&mut self.packet.leisure) {
+            self.packet.mailbox.awake(&self.io).await
+        } else {
+            Ok(())
+        };
+        let report = match awake {
+            Ok(()) => self.packet.mailbox.send(&self.io, 1, &[0]).await,
+            Err(error) => Err(error),
+        };
         let mac = super::super::station_control::disconnected(&self.io);
         let stopped = self.stop_packets();
+        if stopped.is_ok() {
+            // A missing idle proof keeps every mapping retained; it never
+            // turns a completed disconnect into a failure.
+            let _ = self.quiesce().await;
+        }
         report.and(mac).and(stopped)
+    }
+    /// Removal (`rtl_op_stop` → `rtl_pci_stop` → `rtl88ee_card_disable`):
+    /// stop a not-yet-stopped owner, then run the card-disable quiescence
+    /// proof. True when the owner may be dropped with its DMA released
+    /// (never published, or proven idle); false keeps every mapping pinned.
+    pub(crate) async fn retire(&mut self) -> bool {
+        if !self.published {
+            return true;
+        }
+        if self.phase != Phase::Stopped && self.stop_packets().is_err() {
+            return false;
+        }
+        self.quiesce().await.is_ok()
+    }
+    /// True once `quiesce` proved the stopped rings idle; Drop then
+    /// releases every DMA allocation instead of retaining it.
+    pub(crate) fn reclaimable(&self) -> bool {
+        self.phase == Phase::Stopped && !self.published
+    }
+    /// Card-disable DMA quiescence proof for a stopped owner (Linux
+    /// `rtl88ee_card_disable` → `_rtl88ee_poweroff_adapter` and
+    /// `RTL8188EE_TRANS_ACT_TO_LPS`): with TX paused (REG_TXPAUSE 0x522 =
+    /// 0xff), host TX DMA stopped (REG_PCIE_CTRL_REG+1 0x301 = 0xff) and
+    /// bus mastering cleared by `stop_packets`, poll 0x5f8..0x5fb (TX packet
+    /// buffer empty: "should be zero if no packet is transmitting", pwrseq
+    /// polling, 5000 x 10 us) and REG_RXDMA_CONTROL 0x286 BIT(1) RXDMA_IDLE
+    /// (100 x 10 us). Linux continues after an RXDMA timeout; here a
+    /// timeout leaves every mapping retained. Success is the retirement
+    /// proof that allows the published rings and buffers to be unmapped.
+    pub(crate) async fn quiesce(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Stopped || !self.published {
+            return Err(Error::State);
+        }
+        if self.io.read8(0x522)? != 0xff || self.io.read8(0x301)? != 0xff {
+            return Err(Error::Readback);
+        }
+        let mut empty = false;
+        for _ in 0..5000 {
+            let mut busy = false;
+            for reg in 0x5f8..=0x5fb {
+                let value = self.io.read8(reg)?;
+                if value == 0xff && reg == 0x5f8 && self.io.read32(0x5f8)? == u32::MAX {
+                    return Err(Error::Access(super::AccessError::Gone));
+                }
+                busy |= value != 0;
+            }
+            if !busy {
+                empty = true;
+                break;
+            }
+            self.io.delay_us(10).await;
+        }
+        if !empty {
+            return Err(Error::PacketTimeout);
+        }
+        let mut idle = false;
+        for _ in 0..100 {
+            if self.io.read8(0x286)? & 2 != 0 {
+                idle = true;
+                break;
+            }
+            self.io.delay_us(10).await;
+        }
+        if !idle {
+            return Err(Error::PacketTimeout);
+        }
+        self.published = false;
+        Ok(())
     }
     /// Open the already owned native rings. The one-shot operational MAC,
     /// factory IQ/LC calibration and opaque channel/power grant are required.
@@ -421,6 +664,80 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.phase = Phase::Running;
         Ok(())
     }
+    /// True while the Linux 88EE masks are programmed (IRQ profile).
+    pub(crate) fn interrupts_enabled(&self) -> bool {
+        self.packet.interrupts
+    }
+    /// Linux `rtl88ee_enable_interrupt`: HIMR/HIMRE = irq_mask[0]/[1],
+    /// clear firmware-notified C2H events (REG_C2HEVT_CLEAR = 0) so the
+    /// firmware keeps scheduling commands, then HSIMR = sys_irq_mask. Only
+    /// a running owner whose vector is bound may unmask; the polling
+    /// fallback keeps every mask clear.
+    pub(crate) fn enable_interrupts(&mut self) -> Result<(), Error> {
+        use super::super::irq::*;
+        if self.phase != Phase::Running || self.packet.interrupts {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        self.io.authority(true, || Ok(()))?;
+        self.io.write32(0xb0, IRQ_MASK0_88E)?;
+        self.io.write32(0xb8, IRQ_MASK1_88E)?;
+        self.packet.interrupts = true;
+        self.io.write8(REG_C2HEVT_CLEAR_88E, 0)?;
+        self.io.write32(REG_HSIMR_88E, SYS_IRQ_MASK_88E)?;
+        if self.io.read32(0xb0)? != IRQ_MASK0_88E
+            || self.io.read32(0xb8)? != IRQ_MASK1_88E
+            || self.io.read32(REG_HSIMR_88E)? != SYS_IRQ_MASK_88E
+        {
+            return Err(Error::Readback);
+        }
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    /// Linux `rtl88ee_disable_interrupt` (HIMR/HIMRE = IMR_DISABLED). Used
+    /// when the bound vector is withdrawn while the owner keeps polling.
+    pub(crate) fn disable_interrupts(&mut self) -> Result<(), Error> {
+        self.packet.interrupts = false;
+        self.io.write32(0xb0, 0)?;
+        self.io.write32(0xb8, 0)?;
+        if self.io.read32(0xb0)? != 0 || self.io.read32(0xb8)? != 0 {
+            return Err(Error::Readback);
+        }
+        Ok(())
+    }
+    /// One `_rtl_pci_interrupt` bottom-half pass: mask (disable_interrupt),
+    /// `rtl88ee_interrupt_recognized` W1C of HISR/HISRE under irq_mask,
+    /// `_rtl_pci_hs_interrupt` HSISR W1C when IMR_HSISR_IND_ON_INT is set,
+    /// then unmask (enable_interrupt). RX/TX ring service follows in the
+    /// caller's existing ring walk, exactly where Linux calls
+    /// `_rtl_pci_rx_interrupt`/`_rtl_pci_tx_isr`. An all-ones status means
+    /// the function vanished and is terminal.
+    pub(crate) fn recognize_interrupts(&mut self) -> Result<super::super::irq::Recognized, Error> {
+        use super::super::irq::*;
+        if self.phase != Phase::Running || !self.packet.interrupts {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        self.io.write32(0xb0, 0)?;
+        self.io.write32(0xb8, 0)?;
+        let raw = self.io.read32(0xb4)?;
+        if raw == u32::MAX {
+            return Err(Error::Access(super::AccessError::Gone));
+        }
+        let inta = raw & IRQ_MASK0_88E;
+        self.io.write32(0xb4, inta)?;
+        let intb = self.io.read32(0xbc)? & IRQ_MASK1_88E;
+        self.io.write32(0xbc, intb)?;
+        if inta & IMR_HSISR_IND_ON_INT != 0 {
+            let hsisr = self.io.read8(REG_HSISR_88E)?;
+            self.io
+                .write8(REG_HSISR_88E, hsisr | SYS_IRQ_MASK_88E as u8)?;
+        }
+        self.io.write32(0xb0, IRQ_MASK0_88E)?;
+        self.io.write32(0xb8, IRQ_MASK1_88E)?;
+        self.phase = Phase::Running;
+        Ok(Recognized { inta, intb })
+    }
     fn validate_rings(&self) -> Result<(), Error> {
         for (queue, ring) in self.tx.iter().enumerate() {
             ring.sync();
@@ -454,11 +771,35 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         Ok(())
     }
-    /// One outstanding native frame is retained across both active queues.
+    /// One outstanding native frame is retained across all active queues.
     /// A free descriptor alone cannot substitute a different pending payload.
     pub(crate) fn submit(&mut self, frame: &[u8], rate: u8) -> Result<u64, Error> {
+        self.submit_aggregate(frame, rate, None, false)
+    }
+    /// `submit` with `rtl8188ee_tx_fill_desc` aggregation fields for QoS
+    /// DATA to an HT station: `aggregate = (ampdu_density, ampdu)` sets
+    /// TXD DW2 AMPDU_DENSITY and, for an `IEEE80211_TX_CTL_AMPDU` frame,
+    /// DW2 AGG_EN + DW6 MAX_AGG_NUM 0x14. `adaptive` marks ordinary DATA
+    /// (Linux `rtl_get_tcb_desc` with a non-zero rix) under a current
+    /// separately signed `NEFB` fallback grant (checked by the caller):
+    /// once the firmware owns an RA mask, TXD DW1 RATE_ID = `ratr_index`
+    /// and DW4 DISDATAFB is clear (`rtl88ee_tx_fill_desc`), so the firmware
+    /// falls back from the highest rate (USE_RATE stays set: 88EE forces
+    /// use_driver_rate). Otherwise the frame keeps USE_RATE + DISFB.
+    pub(crate) fn submit_aggregate(
+        &mut self,
+        frame: &[u8],
+        rate: u8,
+        aggregate: Option<(u8, bool)>,
+        adaptive: bool,
+    ) -> Result<u64, Error> {
         if self.phase != Phase::Running || self.packet.pending.is_some() {
             return Err(Error::State);
+        }
+        if aggregate.is_some_and(|(density, _)| density > 7)
+            || aggregate.is_some() && !(self.packet.ht && frame.first() == Some(&0x88))
+        {
+            return Err(Error::Packet);
         }
         if rate > 11
             && !(self.packet.ht && (12..=19).contains(&rate) && frame.first() == Some(&0x88))
@@ -488,7 +829,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let slot = self.packet.next[queue];
         let mut prefix = [0; 10];
         prefix[0] = frame.len() as u32 | (32 << 16) | (1 << 26) | (1 << 27);
-        let destination = if queue == 4 {
+        let destination = if (2..=5).contains(&queue) {
             &frame[16..22]
         } else {
             &frame[4..10]
@@ -499,9 +840,24 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         prefix[1] = u32::from(selector) << 8; // MACID0, rateID0, security0.
         prefix[3] = u32::from(u16::from_le_bytes([frame[22], frame[23]]) >> 4) << 16;
         prefix[4] = (1 << 8) | (1 << 10); // forced checked rate, no fallback/BW/SGI/AGG.
+        if let Some(index) = self
+            .packet
+            .rate_mask
+            .filter(|_| adaptive && frame[0] & 0x0c == 8)
+        {
+            prefix[1] |= u32::from(index) << 16;
+            prefix[4] &= !(1 << 10);
+        }
         if frame[0] == 0x88 {
             prefix[4] |= 1 << 6;
         } // EE TXD.QOS; host SSN retained.
+        if let Some((density, ampdu)) = aggregate {
+            prefix[2] |= u32::from(density) << 20;
+            if ampdu {
+                prefix[2] |= 1 << 12;
+                prefix[6] |= MAX_AGG_NUM << 11;
+            }
+        }
         prefix[5] = u32::from(rate) | (0x1f << 8) | (15 << 13);
         prefix[7] = frame.len() as u32;
         prefix[8] = address;
@@ -653,13 +1009,17 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 && (12..=19).contains(&(report & 63))
                 && report & ((1 << 7) | (1 << 8) | (1 << 9)) == 0;
             let legacy_profile = !ht && report & (1 << 9) == 0 && report & 63 <= 11;
+            // DW1 PAGGR/FAGGR (rtl8188ee trx.h): A-MPDU membership is only
+            // admissible on the HT profile, where the station BA owner gates it.
+            let aggregated = extra & (3 << 14) != 0;
             if ordinary
                 && status & 0xc000 == 0
                 && status & 0x3000_0000 == 0x3000_0000
-                && extra & ((3 << 14) | (1 << 27)) == 0
+                && extra & (1 << 27) == 0
+                && (!aggregated || ht_profile)
                 && sequence & 0xf000 == 0
                 && (legacy_profile || ht_profile)
-                && (28..=if self.packet.ht {
+                && (24..=if self.packet.ht {
                     26 + 16 + narf_wireless::amsdu::MAX_BYTES + 4
                 } else {
                     MAX_MPDU + 4
@@ -669,6 +1029,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 buffer.sync();
                 // EE's PHY info is its own28-byte structure inside drvinfo,
                 // not rtw88 page1. RXD owns rate/BW; no channel field exists.
+                let mut pwdb = None;
                 if status & (1 << 26) != 0 {
                     let info = (((status >> 16) & 15) * 8) as usize;
                     if info < 28 {
@@ -687,6 +1048,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         ring.sync();
                         return Ok((true, None));
                     }
+                    // RX_HAL_IS_CCK_RATE(rxmcs): DESC92C_RATE1M..11M.
+                    let cck = !ht && report & 63 < 4;
+                    // trx.c reads RFPGA0_XA_HSSIPARAMETER2 BIT(9) with RF on.
+                    let high = cck && self.io.read32(0x824)? & (1 << 9) != 0;
+                    pwdb = Some(super::super::rate_adaptive::rx_pwdb(&phy, cck, high));
                 }
                 let mut bytes = Vec::new();
                 bytes
@@ -697,12 +1063,32 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 let fc = u16::from_le_bytes([bytes[0], bytes[1]]);
                 // Open frames may legitimately have SWDEC clear (Linux trx.c).
                 // Protected frames must retain their IV/CCMP ciphertext/MIC.
-                if fc & 0x400 == 0
+                if bytes.len() == 20 {
+                    // BlockAckReq: RCR_ACF stays set (rtl8188ee sw.c receive_config;
+                    // mac80211 never toggles FIF_CONTROL in station mode).
+                    if fc == 0x84 && !aggregated && status & (1 << 23) == 0 {
+                        packet = Some(Mpdu {
+                            bytes,
+                            channel,
+                            ht,
+                            aggregated,
+                            pwdb,
+                        });
+                    }
+                } else if bytes.len() >= 24
+                    && fc & 0x400 == 0
                     && bytes[22] & 15 == 0
                     && (status & (1 << 23) != 0) == (fc & 0x8c == 0x88)
                     && (fc & 0x4000 == 0 || status & (1 << 27) != 0)
+                    && (!aggregated || fc & 0xfc == 0x88)
                 {
-                    packet = Some(Mpdu { bytes, channel, ht });
+                    packet = Some(Mpdu {
+                        bytes,
+                        channel,
+                        ht,
+                        aggregated,
+                        pwdb,
+                    });
                 }
             }
             for word in 0..6 {
@@ -731,6 +1117,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return Err(Error::State);
         }
         self.phase = Phase::Stopping;
+        self.packet.interrupts = false;
+        self.packet.leisure = false;
+        self.packet.rate_mask = None;
         let mut result = Ok(());
         for operation in [
             self.io.write32(0xb0, 0).map_err(Error::from),

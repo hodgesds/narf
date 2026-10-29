@@ -143,12 +143,39 @@ bit selects writable leaves in this restricted path. EXECBUFFER2 currently
 returns NotImplemented even for a valid plan: a resident address space does not
 establish GT initialization, nonsecure execution, fence completion or reset.
 
+`ExecRequest::prepare(format, pat_index)` produces a `ResidentBatch` retaining
+its private tables, BOs and arbitrary batch VA/extent. The internal Gen12
+`RcsEngine::submit_resident` consumes this owner on an idle render context and
+returns a request ID plus `CompletionFence`. Resident admission refuses queued
+work as well as loaded work; root attach/detach also refuse queued work. The
+submitted root and all leaf objects stay pinned across fd/handle close,
+preemption and wait cancellation. A completed resident context's image root
+is cleared before releasing its page tables.
+
+Gen12 render breadcrumbs drain HDC, tile, render, depth and data caches with
+CS/depth stalls, then publish a separate GGTT QW post-sync breadcrumb. XCS uses
+MI_FLUSH_DW instead of render-only PIPE_CONTROL. Ring tails stay qword aligned;
+wrap admission accounts for NOOP padding before writing. CSB publication uses
+hardware release/acquire barriers. Retirement requires the active context's
+exact final breadcrumb and saved head at the submitted tail. Missing proof
+quarantines the engine (`CompletionLost`), refuses further submission and
+leaves fences pending. CSB software identities are not reused within an engine
+lifetime, including after slot reuse. The unsafe `release_after_reset` consumes
+the engine only after its GT owner proves all DMA agents stopped; outstanding
+fences then report `JobError::Reset`. Dropping an owner is not reset proof and
+deliberately retains published resident address spaces. `CompletionFence::wait`
+registers wakers; dropping that future removes only its waiter. First terminal
+result wins. This internal primitive is not yet a published DRM sync-file API.
+`wait_seqno_async` samples completion through timer awaits; the sync wrapper
+uses `block_on_spin` for lock/IRQ callers outside executor polls. Neither wait
+owns or cancels the request's residency.
+
 `SubmissionProfile::for_generation` selects Gen12 execlists for Tiger/Alder/
 Raptor Lake and a separate Xe-LPG GuC path for Meteor/Arrow Lake. Panther Lake
 has no submission profile. Existing default RCS/media production attach paths
 admit only Gen12 before any MMIO. A display gate cannot admit a render engine.
-GuC boot/registration/scheduling, render topology, full context setup, terminal
-fences, reset/loss retention, accelerated PRIME/KMS integration and Mesa interoperability
+GuC boot/context registration/scheduling, render topology, full context setup,
+hardware reset ownership, accelerated PRIME/KMS integration and Mesa interoperability
 remain required before exposing acceleration. Graphics APIs and shader/state
 generation belong in userspace.
 
@@ -181,6 +208,32 @@ poison the owner without advancing a receive head or releasing pending work.
 The platform owner must retain CT memory until confirmed deregistration/reset;
 these primitives do not load/authenticate firmware, register transport or wake
 an engine. Fixtures pin CSS/CTB wire cases and ownership failure behavior.
+
+`intel_gpu_guc_firmware::GuCFirmware::open` accepts Meteor/Arrow Lake and an
+existing `Cap<FirmwareRegistry, Read>`. Both registry open and immutable blob
+copy run through `Cap::invoke`. It selects `i915/mtl_guc_70.bin`, bounds and
+validates CSS before copying, requires the selected 70.53.0-or-newer ABI-70
+baseline and a 384-byte RSA signature, and retains the registry digest/signer.
+No ambient firmware authority or direct filesystem access is introduced.
+Registry authorization does not establish GuC boot-ROM authentication.
+
+`intel_gpu_guc_transport::XeLpgTransport` owns one six-page coherent GGTT
+allocation (H2G descriptor at 0, G2H at 0x800, 4-KiB send ring at 0x1000,
+16-KiB receive ring at 0x2000). Allocation gates Xe-LPG before MMIO and checks
+the GuC GGTT ceiling. `begin_enable` requires authenticated/ready firmware;
+MMIO SELF_CFG registers receive before send using 64-bit address KLVs and byte
+sizes, then CONTROL_CTB enables communication. Each bounded mailbox poll
+advances one state; BUSY/RETRY cannot extend its deadline and retries are
+bounded. `wait_transition` uses timer awaits without an IRQ lock. Cancellation
+preserves the transaction. Enabled `send` publishes CT memory before the
+graphics-GuC notification; `receive` owns the opposite head cursor. Transport
+errors stop admission. `release` returns a live owner intact until either
+publication never began or MMIO DISABLE completed successfully; timeouts and
+partial registration retain memory for the unsafe, proven-reset release path.
+A CT response acknowledges an action, never render completion. Production
+firmware upload/WOPCM setup, forcewake/IRQ ownership, GuC context scheduling
+and integration with the per-card GT owner remain open; transport readiness
+does not enable EXECBUFFER or advertise acceleration.
 
 ### Legacy framebuffers and native mode timing
 
@@ -292,7 +345,50 @@ fallback admits SMUIO 11.0.6 (captured RX 6750 XT) at discovered base index
 zero with ROM_INDEX/ROM_DATA dword offsets 0xe5/0xe6. SMUIO11's older
 callback and SMUIO14.0.2 retain 0xe4/0xe5; unrelated revisions remain rejected.
 
-### RX 6000 device queries, scheduling and memory pressure
+### RX 6000/RX 9000 device queries, scheduling and memory pressure
+
+Native RX 6000 and RX 9000 primary/render INFO ioctls serve TIMESTAMP and
+SENSOR through `amdgpu_info_stats` under their retained platform owner. RX 9000
+acquires a runtime-PM reference before OWNER, so suspended devices resume before
+MMIO. Timestamp sampling uses SMUIO11 bank 1 offsets 0x102/0x103 on discrete
+RDNA2 and SMUIO14.0.2 offsets 0x2d/0x2e on RDNA4. A bounded high/low/high sample
+with local interrupts masked handles carry; HDP liveness probes detect loss
+without reserving any counter bit pattern. RDNA2 probes HDP5's
+READ_CACHE_INVALIDATE (0xd1); RDNA4 probes HDP6's HOST_PATH_CNTL (0xcc),
+because HDP6 removed the invalidate register. All device accesses invoke
+current PCI authority, and the owner excludes reset/BAR teardown.
+
+SENSOR replies are u32: effective-average SCLK and instantaneous UCLK in MHz,
+edge temperature in mC, GPU load in percent, average socket power in watts and
+VDDGFX in mV. They refresh the actual SMU11/SMU14 telemetry transport instead
+of returning the power monitor's last good sample after a failed refresh.
+Stable/peak GFX/MCLK queries read the current DPM table endpoints using
+GetDpmFreqByIndex, masking bit 31 and refusing empty/oversized tables. Clock
+DPM disabled uses validated VBIOS boot clocks. RDNA2 standard clocks follow
+sienna_cichlid_populate_umd_state_clk (Navi21/22: 1825/1000 MHz, Navi23:
+1950/676 MHz, Navi24: 2200/1000 MHz); peaks are the table maxima. RDNA4 standard
+GFX and peak GFX follow the board's BaseClockAc/GameClockAc when nonzero and
+below the table maximum, otherwise that maximum; standard and peak UCLK use
+its maximum. These queries change no clock or power policy.
+
+DPM unavailable returns ENOENT before checking the sensor selector. VDDNB and
+GPU_INPUT_POWER remain EINVAL as in both Linux dGPU backends, which supply
+neither sensor. Unsupported selectors and clean SMU refusals return EINVAL;
+revocation/device loss returns ENODEV. Cancellation preserves the SMU's pending
+Runtime ownership; no partial or stale reply is copied. Replies retain the
+existing min(return_size, sizeof(reply)) copy and user-address validation.
+
+NUM_BYTES_MOVED and NUM_EVICTIONS are cumulative per-card GEM counters,
+retained across client-heap recovery. CPU, revocable-CPU-view and engine moves
+increment bytes only after backing commits; pressure/suspend evictions count
+only successful moves. Failed and no-op moves contribute nothing. Counter
+storage is retained by each GEM object before publication; frozen commits
+perform only atomic counter updates, with no new locks, allocation or callbacks.
+NUM_VRAM_CPU_PAGE_FAULTS is zero: this backend maps resident
+BAR/GTT pages and refuses CPU access to invisible VRAM, without a TTM fault
+migration callback. VRAM_LOST_COUNTER is a u32 reporting the native family's
+completed full GPU recoveries, the same events reported as VRAM loss to
+contexts. Existing heap-usage and per-open GPUVM_FAULT queries remain available.
 
 `amdgpu_rdna2::metadata::vram(table, module)` bounds atomfirmware
 VRAM_INFO 2.3/2.4/2.5/2.6 variable-length modules. Platform preparation reads
@@ -584,8 +680,16 @@ A bound Navi 22's `AMDGPU_INFO` replies come from `amdgpu_info_navi22`
 range), HW_IP_INFO with IP-block versions (GFX/compute 10.0, SDMA 5.2,
 VCN/JPEG 3.0) plus discovery versions and Linux IB alignments, HW_IP_COUNT,
 FW_VERSION from the loaded file headers and `GetSmuVersion`, READ_MMR_REG for
-GB_ADDR_CONFIG (0x263e; other offsets EFAULT) and MEMORY/VRAM_GTT with the
-8 MiB VM reservation. `Snapshot::navi22: Published { topology, pci_revision,
+GB_ADDR_CONFIG (0x263e; other offsets EFAULT). MEMORY/VRAM_GTT use the open's
+registered client VRAM heap for usable sizes and live allocation usage; physical
+totals still come from probe. Snapshot-only replies and cards without a heap
+retain the 8 MiB VM reservation. Both paths report the actual GEM system-memory
+limit (half of RAM) as GTT capacity, with live shared GEM system-memory usage in
+MEMORY. VRAM_USAGE and VIS_VRAM_USAGE report the open's card heap usage (zero
+without a registered heap); GTT_USAGE reports that shared system-memory usage.
+These are byte counts, not per-open allocations; retained PRIME/mmap/job owners
+continue to count after handle closure. Replies retain Linux's short-copy rule.
+`Snapshot::navi22: Published { topology, pci_revision,
 boot }` carries the inputs, published by `amdgpu_info::publish_navi22_topology`
 (cold-boot `Stage::ReadTopology`, appended after `FenceInterrupts`),
 `publish_navi22_pci_revision` (platform prepare) and `publish_navi22_boot`

@@ -119,6 +119,7 @@ impl Model {
             io: self,
             binding,
             phase: Phase::New,
+            lifecycle: super::super::radio_policy::Lifecycle::Initial,
         }
     }
     fn put16(&mut self, offset: u16, value: u16) {

@@ -64,6 +64,7 @@ pub struct Startup {
     full_radio: super::radio_full::Radio,
     station_controller: Option<super::station_control::Controller>,
     station_binding: Option<[u8; 6]>,
+    pub(super) lifecycle: super::radio_policy::Lifecycle,
 }
 impl core::fmt::Debug for Startup {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -135,6 +136,7 @@ impl Startup {
             full_radio: super::radio_full::Radio::default(),
             station_controller: None,
             station_binding: None,
+            lifecycle: super::radio_policy::Lifecycle::Initial,
         })
     }
     pub fn phase(&self) -> Phase {
@@ -389,7 +391,8 @@ impl Startup {
             .ok_or(Error::Terminal)?
             .into_prepared()
             .map_err(Error::Cold)?;
-        let native = Native::from_cold(prepared, 64).map_err(Error::Command)?;
+        let mut native = Native::from_cold(prepared, 64).map_err(Error::Command)?;
+        native.set_lifecycle(self.lifecycle);
         let identity = native.identity().ok_or(Error::Terminal)?;
         self.identity = Some(identity);
         self.native = Some(native);

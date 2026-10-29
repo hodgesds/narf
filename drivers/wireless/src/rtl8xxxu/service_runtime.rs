@@ -349,6 +349,51 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
         }
         result
     }
+    /// True when a connected station holds a live EDCA update that only the
+    /// async `maintain` path may program over EP0.
+    pub fn maintenance_pending(&self) -> bool {
+        match self.phase() {
+            Phase::Connected => self
+                .station
+                .as_ref()
+                .is_some_and(Station::maintenance_pending),
+            // Passive scanning owns the radio directly.
+            Phase::Passive => self.radio.as_ref().is_some_and(Receiver::recovery_pending),
+            _ => false,
+        }
+    }
+    /// Async counterpart of `poll` for EP0 work the synchronous network path
+    /// must not await (live `rtl8xxxu_conf_tx`). Failure is terminal.
+    pub async fn maintain(&mut self) -> Result<(), Error> {
+        if !self.maintenance_pending() {
+            return Ok(());
+        }
+        let mut attempt = Attempt {
+            failed: self.failed.clone(),
+            armed: true,
+        };
+        let result = if self.phase() == Phase::Passive {
+            self.radio
+                .as_mut()
+                .ok_or(Error::State)?
+                .recover()
+                .await
+                .map(|_| ())
+                .map_err(Error::Radio)
+        } else {
+            self.station
+                .as_mut()
+                .ok_or(Error::State)?
+                .maintain()
+                .await
+                .map_err(Error::Station)
+        };
+        attempt.armed = false;
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
     pub fn transmit_ready(&self) -> bool {
         self.phase() == Phase::Connected
             && self.station.as_ref().is_some_and(Station::transmit_ready)
@@ -383,17 +428,48 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
             failed: self.failed.clone(),
             armed: true,
         };
-        let result = self
-            .station
-            .as_mut()
-            .ok_or(Error::State)?
-            .disconnect()
-            .await
-            .map_err(Error::Station);
+        let result = async {
+            self.station
+                .as_mut()
+                .ok_or(Error::State)?
+                .disconnect()
+                .await
+                .map_err(Error::Station)?;
+            self.rejoin_passive().await
+        }
+        .await;
         attempt.armed = false;
         if result.is_err() {
             self.fail();
         }
+        result
+    }
+    /// Safe rejoin (mac80211 `ieee80211_set_disassoc` then a new scan): the
+    /// stopped station returns its receive owner, which drops the bound
+    /// peer (`rtl8xxxu_set_bssid(zero)`) and restarts RX-only reception, so
+    /// the service is Passive again and a later `connect` builds a fresh
+    /// station with fresh keys. Failure leaves the radio retained and the
+    /// caller marks the service failed.
+    async fn rejoin_passive(&mut self) -> Result<(), Error> {
+        if self
+            .station
+            .as_ref()
+            .is_none_or(|station| station.phase() != station_runtime::Phase::Stopped)
+        {
+            return Err(Error::State);
+        }
+        let mut radio = self.station.take().ok_or(Error::State)?.into_radio();
+        self.initial_nonce = None;
+        let result = async {
+            radio.release_station().await?;
+            let authority = radio.authority();
+            authority
+                .fence(radio.start(), core::convert::identity)
+                .await
+        }
+        .await
+        .map_err(Error::Radio);
+        self.radio = Some(radio);
         result
     }
 }

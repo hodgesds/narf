@@ -400,6 +400,22 @@ also consult upstream Linux GPL sources.
   rather than a silent no-op. `detach_serial` / `clear_serial` are the
   per-slot and controller-recovery teardowns. One port per device in
   this layer: multi-port chips bind their first interface.
+  Suspend/resume (#763): the `usb-serial-pm` Stage::Subsys initcall
+  registers an async system-PM hook (`serial::port::register_pm`).
+  Prepare quiesces `pump_all`; resume — after the synchronous
+  device fan-out restores xHCI — replays each bound port's bind-time
+  open plan (`resume_snapshot` / `resume_replay`), rebuilt from the
+  retained `settings` the reconfiguration path commits only on full
+  success, so line format, modem lines and flow state survive S3.
+  A port whose slot refuses the replay fails the hook with a typed
+  `DriverError` without stopping the other ports; a port that
+  detached while suspended is absent and gets no replay. Bind
+  records the (hub index, downstream port) a port sits behind, and
+  the supervisor wakes suspended hub ports for live serial bindings
+  before the pumps (`resume_suspended_hub_ports`), mirroring HID
+  (#840). Plan execution goes through the `ControlTransport` seam
+  (production: `Xhci`; fixtures: a recording fake), which
+  `cdc_acm`'s replay shares.
 - `ccid::devfs_bridge` publishes each bound CCID reader as `/dev/ccid<N>`
   (provider hooks installed by the `usb-ccid-devfs` Stage::Subsys
   initcall; node index = `CCID_READERS` index, assigned at bind). The
@@ -561,10 +577,20 @@ the USB download itself remains a target-silicon gate.
   + CDC-Data class-triple constants. Used by the per-subclass
   drivers below.
 - **CDC-ACM** (`cdc_acm`): Abstract Control Model (USB serial)
-  codec. `LineCoding` builder/parser (baud + data bits + parity +
+  codec + live driver. `LineCoding` builder/parser (baud + data bits + parity +
   stop bits), `SET_LINE_CODING` / `GET_LINE_CODING` /
   `SET_CONTROL_LINE_STATE` setup-packet builders, `SerialState`
   notification decoder, ACM functional-descriptor capability bits.
+  The live driver retains each bound device's line coding +
+  control-line state — the `CdcAcmPort` setters commit to the
+  record only on transfer success and surface failures as
+  `CdcError::Transfer` — and registers the `cdc-acm` async
+  system-PM hook (`cdc_acm::register_pm`, #763): prepare quiesces
+  the pump, resume replays `SET_LINE_CODING` →
+  `SET_CONTROL_LINE_STATE` per bound device from the saved state
+  (bind order) once xHCI is restored. Hub-attached bindings record
+  their (hub, port) and join the supervisor's hub-port wake step
+  (`resume_suspended_hub_ports`).
 - **DFU** (`dfu`): USB Device Firmware Upgrade 1.1 codec.
   Class triple constants for runtime + DFU modes, DFU Functional
   Descriptor parser (handles both 7-byte DFU-1.0 and 9-byte

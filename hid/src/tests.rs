@@ -383,6 +383,51 @@ fn smoke_hid_keyboard_detect_locates_collection() -> TestResult {
 }
 kernel_test_in!("hid", smoke_hid_keyboard_detect_locates_collection);
 
+fn smoke_hid_keyboard_led_output_profile() -> TestResult {
+    use crate::keyboard;
+    let blob = keyboard::__boot_keyboard_descriptor_blob();
+    let d = parse(blob).expect("parse");
+    // HID 1.11 §B.1 boot descriptor: the LED Output field is five
+    // 1-bit Variable items on the LED page (Usage Min 1 = Num Lock
+    // … Max 5 = Kana) at body offset 0, then 3 bits of constant
+    // padding — one body byte total.
+    let p = match keyboard::detect_led_output(&d) {
+        Some(p) => p,
+        None => return TestResult::Fail("boot keyboard LED output not detected"),
+    };
+    if p.report_id != 0 {
+        return TestResult::Fail("boot keyboard LED output uses no report id");
+    }
+    if p.num_bit != Some(0) || p.caps_bit != Some(1) || p.scroll_bit != Some(2) {
+        return TestResult::Fail("LED bits must follow HID usage order Num/Caps/Scroll");
+    }
+    if p.body_len != 1 {
+        return TestResult::Fail("boot LED output body must be exactly one byte");
+    }
+    // Encoding pins (HID usage order, NOT the Linux LED-code order):
+    // Num=bit0, Caps=bit1, Scroll=bit2.
+    if keyboard::encode_led_output(&p, true, false, false) != [0x01] {
+        return TestResult::Fail("Num Lock must encode as body byte 0x01");
+    }
+    if keyboard::encode_led_output(&p, false, true, false) != [0x02] {
+        return TestResult::Fail("Caps Lock must encode as body byte 0x02");
+    }
+    if keyboard::encode_led_output(&p, false, false, true) != [0x04] {
+        return TestResult::Fail("Scroll Lock must encode as body byte 0x04");
+    }
+    if keyboard::encode_led_output(&p, true, false, true) != [0x05] {
+        return TestResult::Fail("Num+Scroll must encode as body byte 0x05");
+    }
+    if keyboard::encode_led_output(&p, true, true, true) != [0x07] {
+        return TestResult::Fail("all three locks must encode as body byte 0x07");
+    }
+    if keyboard::encode_led_output(&p, false, false, false) != [0x00] {
+        return TestResult::Fail("all locks off must encode as body byte 0x00");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("hid", smoke_hid_keyboard_led_output_profile);
+
 fn smoke_hid_keyboard_usage_to_keycode_spot_checks() -> TestResult {
     use crate::keyboard::{hid_usage_to_keycode, modifier_bit_to_keycode};
     // (HID usage, expected Linux KEY_* code) — cross-checked against

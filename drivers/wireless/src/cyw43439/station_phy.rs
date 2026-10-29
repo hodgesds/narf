@@ -304,6 +304,38 @@ fn elements(mut ies: &[u8]) -> Result<Elements<'_>, Error> {
     })
 }
 
+/// Linux `brcmf_update_vht_cap` beamforming bits from the native
+/// `txbf_bfe_cap`/`txbf_bfr_cap` replies (`BRCMF_TXBF_{SU,MU}_{BFE,BFR}_CAP`
+/// are bits 0/1) and the native `txstreams` count.
+pub(super) fn beamforming_capability(bfe: u32, bfr: u32, txstreams: u32) -> u32 {
+    const SU_BEAMFORMER: u32 = 1 << 11;
+    const SU_BEAMFORMEE: u32 = 1 << 12;
+    const BEAMFORMEE_STS_SHIFT: u32 = 13;
+    const SOUNDING_DIMENSIONS_SHIFT: u32 = 16;
+    const MU_BEAMFORMER: u32 = 1 << 19;
+    const MU_BEAMFORMEE: u32 = 1 << 20;
+    const VHT_MRQ_MFB: u32 = 3 << 26;
+    let (bfe, bfr) = (bfe & 3, bfr & 3);
+    let mut cap = 0;
+    if bfe & 1 != 0 {
+        cap |= SU_BEAMFORMEE;
+    }
+    if bfe & 2 != 0 {
+        cap |= MU_BEAMFORMEE;
+    }
+    if bfr & 1 != 0 {
+        cap |= SU_BEAMFORMER;
+    }
+    if bfr & 2 != 0 {
+        cap |= MU_BEAMFORMER;
+    }
+    if (bfe != 0 || bfr != 0) && txstreams > 1 {
+        cap |=
+            2 << BEAMFORMEE_STS_SHIFT | (txstreams - 1) << SOUNDING_DIMENSIONS_SHIFT | VHT_MRQ_MFB;
+    }
+    cap
+}
+
 pub(super) async fn probe<R: Fullmac>(runtime: &mut R) -> Result<Option<Capabilities>, Error> {
     async fn optional<R: Fullmac>(runtime: &mut R, name: &str) -> Result<Option<u32>, Error> {
         match get_var(runtime, name, 4).await {
@@ -461,8 +493,18 @@ pub(super) async fn probe<R: Fullmac>(runtime: &mut R) -> Result<Option<Capabili
                 .map_err(|_| Error::Unsupported)?;
                 let local_vht = LocalVht::new(map(chains.count_ones()), map(tx), true, true, 0)
                     .map_err(|_| Error::Unsupported)?;
+                // Linux brcmf_setup_wiphybands queries both optional native
+                // beamforming iovars under vhtmode; an unsupported query is
+                // zero. Firmware owns sounding/steering; this only reports
+                // the capability its own association request carries.
+                let bfe = optional(runtime, "txbf_bfe_cap").await?.unwrap_or(0);
+                let bfr = optional(runtime, "txbf_bfr_cap").await?.unwrap_or(0);
+                let mut body = local_vht.capability_body();
+                let cap = u32::from_le_bytes(body[..4].try_into().unwrap())
+                    | beamforming_capability(bfe, bfr, tx);
+                body[..4].copy_from_slice(&cap.to_le_bytes());
                 Some((
-                    local_vht.capability_body(),
+                    body,
                     LocalPhy::vht80(local_ht, local_vht).map_err(|_| Error::Unsupported)?,
                 ))
             }

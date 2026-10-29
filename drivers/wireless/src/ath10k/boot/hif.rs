@@ -234,6 +234,10 @@ impl PciBoot {
         if !self.mmio.authorized() {
             return Err(BmiError::Pci);
         }
+        if self.hif.is_none() {
+            return Err(BmiError::BadResponse);
+        }
+        let service = self.service_begin()?;
         let hif = self.hif.as_mut().ok_or(BmiError::BadResponse)?;
         hif.poll(&mut self.mmio)?;
         let resources = &mut *self.resources;
@@ -251,7 +255,9 @@ impl PciBoot {
                 .map_err(|_| BmiError::NoMemory)?;
             hif.received.push_back((1, frame));
         }
-        Ok(hif.received.pop_front())
+        let frame = hif.received.pop_front();
+        self.service_finish(service);
+        Ok(frame)
     }
     pub fn hif_poll_now(&mut self) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
         if self.poisoned || !self.hif_live || self.hif.is_none() {
@@ -344,7 +350,9 @@ impl PciBoot {
         }
         self.poisoned = true; // A cancelled protocol wait requires reset, not replay.
         let deadline = narf_time::Deadline::after_ms(budget_ms);
+        let (signal, delivered) = self.interrupt();
         loop {
+            let seen = signal.count();
             if let Some(frame) = self.poll_packets()? {
                 self.poisoned = false;
                 return Ok(Some(frame));
@@ -353,7 +361,12 @@ impl PciBoot {
                 self.poisoned = false;
                 return Ok(None);
             }
-            PciBoot::delay(1).await;
+            // Interrupt wake (ath10k_pci_napi_poll scheduling); the timer is
+            // only a missed-edge backstop, clamped to the caller's budget.
+            let fallback = crate::ath10k::irq::fallback_ms(delivered).min(budget_ms.max(1));
+            signal
+                .wait(seen, core::pin::pin!(PciBoot::delay(fallback)))
+                .await;
         }
     }
 }

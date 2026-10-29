@@ -81,6 +81,12 @@ pub struct SeqLock<T: Copy>(…);            // T: Copy is load-bearing — see 
 pub struct Once<T>(…);                     // single-initialise
 ```
 
+`Mutex::try_lock_unqueued()` grants a guard only when the mutex is free and
+its waiter queue is empty, checked together under the existing internal lock.
+Failure does not enroll or select a waiter. Providers with an optional bounded
+optimistic wait can use it without bypassing queued sleepers; ordinary mutex
+acquisition, FIFO wake selection, and cancellation remain unchanged.
+
 **Typestate IRQ safety.** `SpinLockGuard<'_, T, I: IrqState>` makes
 mixed-IRQ-context use a compile error. Acquiring a `SpinLock` from a
 context tagged `IrqsDisabled` is a type-error; use `IrqSafeSpinLock`
