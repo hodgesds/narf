@@ -1,5 +1,20 @@
 //! `amdgpu_gfx_off_ctrl` semantics against a PMFW model.
 use super::*;
+
+fn navi22_gfxoff_leases_recheck_activation_and_reset_epoch() -> TestResult {
+    assert!(covers(None, false, false, 7));
+    assert!(!covers(None, true, false, 7));
+    assert!(covers(Some(7), true, false, 7));
+    assert!(!covers(Some(7), true, false, 8));
+    assert!(!covers(None, false, true, 7));
+    assert!(!covers(Some(7), true, true, 7));
+    assert!(covers(Some(7), false, false, 8));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-gfxoff",
+    navi22_gfxoff_leases_recheck_activation_and_reset_epoch
+);
 use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -117,16 +132,18 @@ fn navi22_gfxoff_fails_closed() -> TestResult {
     let mut pmfw = Pmfw::default();
     c.start().unwrap();
     let generation = c.allow().unwrap().unwrap();
-    // A rejected allow leaves GFX on and the controller usable.
+    // Control errors do not distinguish rejection from a lost reply.
     pmfw.reject = true;
     if run(c.delayed_allow(generation, &mut pmfw)) != Err(Error::Control)
         || c.status().off
-        || c.status().failed
+        || !c.status().failed
+        || run(c.disallow(&mut pmfw)) != Err(Error::Failed)
     {
         return TestResult::Fail("rejected allow");
     }
+    let mut c = Controller::new();
+    c.start().unwrap();
     pmfw.reject = false;
-    run(c.disallow(&mut pmfw)).unwrap();
     let generation = c.allow().unwrap().unwrap();
     run(c.delayed_allow(generation, &mut pmfw)).unwrap();
     // A rejected disallow: GC power unknown; every later request refused.
@@ -153,6 +170,22 @@ fn navi22_gfxoff_fails_closed() -> TestResult {
     }
     if !c.status().failed || run(c.disallow(&mut pmfw)) != Err(Error::Failed) {
         return TestResult::Fail("cancelled disallow");
+    }
+    let mut c = Controller::new();
+    c.start().unwrap();
+    let generation = c.allow().unwrap().unwrap();
+    {
+        let mut stall = Stall;
+        let mut future = core::pin::pin!(c.delayed_allow(generation, &mut stall));
+        assert!(future
+            .as_mut()
+            .poll(&mut core::task::Context::from_waker(
+                core::task::Waker::noop()
+            ))
+            .is_pending());
+    }
+    if !c.status().failed || run(c.disallow(&mut pmfw)) != Err(Error::Failed) {
+        return TestResult::Fail("cancelled allow");
     }
     TestResult::Pass
 }

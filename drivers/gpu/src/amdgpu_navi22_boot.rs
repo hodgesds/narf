@@ -2044,15 +2044,52 @@ impl ColdBoot {
         (rings != 0).then(|| (rings, media.fence_reader()))
     }
     /// Queue a client job on a verified media ring (`Media::submit`).
-    pub fn submit_media(
+    pub async fn submit_media(
         &mut self,
         ring: crate::amdgpu_navi22_submit::MediaRing,
         vm: crate::amdgpu_navi22_submit::VmRef,
         ibs: &[crate::amdgpu_navi22_submit::Ib],
         copies: &[alloc::vec::Vec<u32>],
     ) -> Result<u32, Error> {
-        let media = self.sequence.backend.media.as_mut().ok_or(Error::Invalid)?;
+        let h = &mut self.sequence.backend;
+        let media = h.media.as_mut().ok_or(Error::Invalid)?;
+        let mut control = crate::amdgpu_vcn_navi22::idle::Owned {
+            smu: h.smu.as_mut(),
+            psp: h.psp.as_mut().ok_or(Error::Invalid)?,
+        };
+        media
+            .begin_use(&mut control, ring, narf_time::monotonic_ns())
+            .await
+            .map_err(Error::Media)?;
         media.submit(ring, vm, ibs, copies).map_err(Error::Media)
+    }
+    pub(crate) async fn idle_media(&mut self, now: u64) -> Result<bool, Error> {
+        let h = &mut self.sequence.backend;
+        let Some(media) = h.media.as_mut() else {
+            return Ok(false);
+        };
+        let mut control = crate::amdgpu_vcn_navi22::idle::Owned {
+            smu: h.smu.as_mut(),
+            psp: h.psp.as_mut().ok_or(Error::Invalid)?,
+        };
+        media.idle(&mut control, now).await.map_err(Error::Media)
+    }
+    /// Stop owned media hardware before asking PMFW to gate VCN islands.
+    /// # Safety
+    /// Block new media publication and drain all JPEG jobs before this
+    /// call, as required by Media::stop. Retain its GPU mappings and PSP TMR.
+    pub async unsafe fn stop_media(&mut self) -> Result<(), Error> {
+        let h = &mut self.sequence.backend;
+        let media = h.media.as_mut().ok_or(Error::Invalid)?;
+        let active = media.active_instances();
+        let gated = media.vcn_power_gated();
+        // SAFETY: this cold-boot owner exclusively owns the matching media,
+        // PSP TMR and both hubs, with no competing publisher under OWNER.
+        unsafe { media.stop().await }.map_err(Error::Media)?;
+        if let Some(smu) = h.smu.as_mut().filter(|_| !gated) {
+            smu.set_vcn_power(active, false).await.map_err(Error::Smu)?;
+        }
+        Ok(())
     }
     /// (last completed, throttle) fence sequences of client media `ring`.
     pub fn media_fences(

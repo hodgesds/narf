@@ -239,6 +239,8 @@ impl Io for Fake {
                     assert!(matches!(self.argument, 0 | 0x20000));
                 } else if value == DPM_FREQ_BY_INDEX {
                     assert!(matches!(self.argument >> 16, 0 | 2));
+                } else if matches!(value, POWER_UP_VCN | POWER_DOWN_VCN) {
+                    assert!(matches!(self.argument, 0 | 0x10000));
                 } else if !matches!(
                     value,
                     ALLOWED_HIGH
@@ -291,6 +293,7 @@ impl Io for Fake {
                             0
                         }
                         ALLOW_GFXOFF | DISALLOW_GFXOFF => 0,
+                        POWER_UP_VCN | POWER_DOWN_VCN => 0,
                         SET_SOFT_MIN_BY_FREQ | SET_SOFT_MAX_BY_FREQ => 0,
                         GET_PPT_LIMIT => self.ppt_limit,
                         _ => panic!("unexpected SMU command"),
@@ -1073,6 +1076,57 @@ fn powered_engine(firmware: u32) -> (Engine<Fake>, crate::amdgpu_vram::Pool) {
     engine.io.flushes = 0;
     (engine, pool)
 }
+
+fn rdna2_vcn_runtime_power_obeys_running_features_and_cancellation() -> TestResult {
+    let (mut e, _pool) = powered_engine(0x413f00);
+    e.io.running &= !MM_DPM_PG;
+    e.io.writes.clear();
+    assert_eq!(run(e.set_vcn_power([true, true], false)), Ok(false));
+    assert_eq!(
+        commands(&e.io.writes),
+        [(RUNNING_LOW, 0), (RUNNING_HIGH, 0)]
+    );
+    e.io.running |= MM_DPM_PG;
+    for on in [false, true] {
+        e.io.writes.clear();
+        assert_eq!(run(e.set_vcn_power([true, true], on)), Ok(true));
+        let cmd = if on { POWER_UP_VCN } else { POWER_DOWN_VCN };
+        assert_eq!(
+            commands(&e.io.writes),
+            [
+                (RUNNING_LOW, 0),
+                (RUNNING_HIGH, 0),
+                (cmd, 0),
+                (cmd, 0x10000)
+            ]
+        );
+        assert_eq!(e.state, State::PowerReady);
+    }
+    e.io.reject = Some((POWER_DOWN_VCN, 0xfd));
+    assert_eq!(
+        run(e.set_vcn_power([true, false], false)),
+        Err(Error::Rejected(0xfd))
+    );
+    assert_eq!(e.state, State::PowerReady);
+    e.io.reject = None;
+    e.io.stall = Some(POWER_DOWN_VCN);
+    {
+        let mut f = alloc::boxed::Box::pin(e.set_vcn_power([true, false], false));
+        assert!(f
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    assert_eq!(e.state, State::Runtime);
+    let writes = e.io.writes.len();
+    assert_eq!(run(e.set_vcn_power([true, false], true)), Err(Error::Busy));
+    assert_eq!(e.io.writes.len(), writes);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi22",
+    rdna2_vcn_runtime_power_obeys_running_features_and_cancellation
+);
 
 fn rdna2_pstates_use_profile_clocks_and_live_dpm_endpoints() -> TestResult {
     for (profile, gfx, memory) in [

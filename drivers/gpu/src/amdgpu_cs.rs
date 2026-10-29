@@ -608,9 +608,10 @@ fn last_issued(card: u32, ring: u32) -> Option<u64> {
 /// no job (`None`, signalled), `!0` the ring's last job; a handle of another
 /// ring, or past the last job the ring emitted, is -EINVAL.
 ///
-/// LINUX-GAP: `!0` resolves to the ring's last job of any context, not the
-/// context's own last (tickets are per ring), which only waits longer.
-fn resolve_job(
+/// Legacy watermark fallback for entities without retained job history.
+/// Its `!0` is ring-wide; normal submissions resolve through History first
+/// and use the context entity's own last fence and original submitter.
+fn resolve_ticket(
     card: u32,
     engine: Option<&Arc<dyn Submitter>>,
     ctx: &crate::amdgpu_ctx::CtxState,
@@ -646,6 +647,30 @@ fn resolve_job(
         Some(last) if (handle as u32).wrapping_sub(last as u32) as i32 <= 0 => Ok(Some(handle)),
         _ => Err(FsError::InvalidData),
     }
+}
+
+#[path = "amdgpu_cs_history.rs"]
+mod history;
+pub(crate) use history::History;
+
+fn resolve_job(
+    card: u32,
+    engine: Option<&Arc<dyn Submitter>>,
+    ctx: &crate::amdgpu_ctx::CtxState,
+    ctx_id: u32,
+    ip: (u32, u32, u32),
+    handle: u64,
+    owner: u64,
+) -> Result<Option<Arc<JobFence>>, FsError> {
+    if ctx.get(ctx_id).is_none() {
+        return Err(FsError::InvalidData);
+    }
+    if let Some(recorded) = ctx.jobs.resolve(card, ctx_id, ip, handle) {
+        return recorded;
+    }
+    Ok(resolve_ticket(card, engine, ctx, ctx_id, ip, handle)?
+        .zip(engine)
+        .map(|(ticket, engine)| JobFence::new(engine, card, ticket, owner)))
 }
 
 /// A job's completion as a dma-fence, for the syncobjs a submission
@@ -877,9 +902,9 @@ async fn wait_kernel(
 
 /// `AMDGPU_CS`, `AMDGPU_WAIT_CS`, `AMDGPU_GEM_WAIT_IDLE`,
 /// `AMDGPU_WAIT_FENCES` and `AMDGPU_FENCE_TO_HANDLE` on DRM card `card`.
-/// CS, WAIT_CS and WAIT_IDLE need a registered submitter (`Unsupported`
-/// without one sends them to the synchronous paths); WAIT_FENCES and
-/// FENCE_TO_HANDLE answer either way, as a card with no engine has no jobs.
+/// CS and WAIT_IDLE need a registered submitter (`Unsupported` without one
+/// sends them to the synchronous paths). Fence queries also resolve retained
+/// context jobs while a reset has unregistered or replaced the submitter.
 pub async fn dispatch_async(
     card: u32,
     cmd: u32,
@@ -896,6 +921,9 @@ pub async fn dispatch_async(
     }
     if nr == drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_FENCE_TO_HANDLE {
         return fence_to_handle(card, engine.as_ref(), arg, open);
+    }
+    if nr == drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_WAIT_CS {
+        return wait_cs(card, engine.as_ref(), arg, open).await;
     }
     let Some(engine) = engine else {
         return Err(FsError::Unsupported);
@@ -937,35 +965,6 @@ pub async fn dispatch_async(
         out[4..8].copy_from_slice(&(object.preferred_domains() as u32).to_le_bytes());
         // SAFETY: as above.
         unsafe { copy_out(arg, &out)? };
-        return Ok(0);
-    }
-    if nr == drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_WAIT_CS {
-        // `drm_amdgpu_wait_cs_in { handle, timeout, ip_type, ip_instance,
-        // ring, ctx_id }`.
-        // SAFETY: `arg` is the ioctl pointer the trap layer validated.
-        let bytes = unsafe { copy_in(arg, 32)? };
-        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
-        let handle = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        let timeout = gem_deadline(u64::from_le_bytes(bytes[8..16].try_into().unwrap()));
-        let job = resolve_job(
-            card,
-            Some(&engine),
-            ctx,
-            word(28),
-            (word(16), word(20), word(24)),
-            handle,
-        )?;
-        let done = match job {
-            Some(ticket) => engine.wait(ticket, timeout).await?,
-            None => true,
-        };
-        // amdgpu_cs_wait_ioctl: a job that ended with an error reports it.
-        if let Some(error) = job.filter(|_| done).and_then(|t| engine.error(t)) {
-            return Err(error);
-        }
-        // `drm_amdgpu_wait_cs_out.status`: 0 completed, 1 still busy.
-        // SAFETY: as above; the out arm overlays the first 8 bytes.
-        unsafe { copy_out(arg, &u64::from(!done).to_le_bytes())? };
         return Ok(0);
     }
     if nr != drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_CS {
@@ -1051,9 +1050,10 @@ pub async fn dispatch_async(
             d.ctx_id,
             (d.ip_type, d.ip_instance, d.ring),
             d.handle,
+            vm.owner(),
         )?;
-        if let (Some(ticket), false) = (job, d.scheduled) {
-            after.push(ticket);
+        if let (Some(job), false) = (job, d.scheduled) {
+            after.push(job);
         }
     }
     // amdgpu_cs_p1_user_fence: a one-page buffer of this open, with the
@@ -1068,10 +1068,13 @@ pub async fn dispatch_async(
         }
         None => None,
     };
-    for handle in after {
-        while !engine.signalled(handle) {
+    for job in after {
+        while !job.engine.signalled(job.seq) {
             crate::amdgpu_gem::ensure_placement_live(card)?;
             nap().await;
+        }
+        if let Some(error) = job.engine.error(job.seq) {
+            return Err(error);
         }
     }
     for fence in waits {
@@ -1187,6 +1190,13 @@ pub async fn dispatch_async(
     // What this space drops from now on waits for this job.
     vm.note_job(seq);
     let job = JobFence::new(&engine, card, seq, own);
+    if let Some(first) = submission.ibs.first() {
+        ctx.jobs.record(
+            submission.ctx_id,
+            (first.ip_type, first.ip_instance, first.ring),
+            job.clone(),
+        );
+    }
     // amdgpu_cs_submit: the job is each locked buffer's writer.
     for object in &locked {
         object.dma_buf().resv.add_fence(
@@ -1223,6 +1233,38 @@ pub async fn dispatch_async(
 
 /// `drm_amdgpu_fence { ctx_id, ip_type, ip_instance, ring, seq_no }`.
 const FENCE_SIZE: usize = 24;
+
+async fn wait_cs(
+    card: u32,
+    engine: Option<&Arc<dyn Submitter>>,
+    arg: usize,
+    open: &CsOpen<'_>,
+) -> Result<u64, FsError> {
+    // SAFETY: bounded drm_amdgpu_wait_cs input from the ioctl caller.
+    let bytes = unsafe { copy_in(arg, 32)? };
+    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let handle = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let deadline = gem_deadline(u64::from_le_bytes(bytes[8..16].try_into().unwrap()));
+    let job = resolve_job(
+        card,
+        engine,
+        open.ctx,
+        word(28),
+        (word(16), word(20), word(24)),
+        handle,
+        open.vm.owner(),
+    )?;
+    let done = match &job {
+        Some(job) => job.engine.wait(job.seq, deadline).await?,
+        None => true,
+    };
+    if let Some(error) = job.filter(|_| done).and_then(|j| j.engine.error(j.seq)) {
+        return Err(error);
+    }
+    // SAFETY: the output overlays the bounded ioctl input.
+    unsafe { copy_out(arg, &u64::from(!done).to_le_bytes())? };
+    Ok(0)
+}
 
 fn fence_entry(b: &[u8]) -> (u32, (u32, u32, u32), u64) {
     let word = |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
@@ -1261,7 +1303,7 @@ async fn wait_fences(
     let raw = unsafe { copy_in(fences_ptr as usize, count * FENCE_SIZE)? };
     let resolve = |e: &[u8]| {
         let (ctx_id, ip, seq) = fence_entry(e);
-        resolve_job(card, engine, open.ctx, ctx_id, ip, seq)
+        resolve_job(card, engine, open.ctx, ctx_id, ip, seq, open.vm.owner())
     };
     let reply = |status: bool, first: u32| {
         let mut out = [0u8; 24];
@@ -1273,13 +1315,15 @@ async fn wait_fences(
     if wait_all {
         let mut status = true;
         for e in raw.chunks_exact(FENCE_SIZE) {
-            let Some(ticket) = resolve(e)? else {
+            let Some(job) = resolve(e)? else {
                 continue;
             };
-            let engine = engine.ok_or(FsError::InvalidData)?;
-            if !engine.wait(ticket, deadline).await? {
+            if !job.engine.wait(job.seq, deadline).await? {
                 status = false;
                 break;
+            }
+            if let Some(error) = job.engine.error(job.seq) {
+                return Err(error);
             }
         }
         return reply(status, 0);
@@ -1287,13 +1331,15 @@ async fn wait_fences(
     let mut tickets = Vec::with_capacity(count);
     for (i, e) in raw.chunks_exact(FENCE_SIZE).enumerate() {
         match resolve(e)? {
-            Some(ticket) => tickets.push(ticket),
+            Some(job) => tickets.push(job),
             None => return reply(true, i as u32),
         }
     }
-    let engine = engine.ok_or(FsError::InvalidData)?;
     loop {
-        if let Some(i) = tickets.iter().position(|&t| engine.signalled(t)) {
+        if let Some(i) = tickets.iter().position(|j| j.engine.signalled(j.seq)) {
+            if let Some(error) = tickets[i].engine.error(tickets[i].seq) {
+                return Err(error);
+            }
             return reply(true, i as u32);
         }
         if narf_time::monotonic_ns() >= deadline {
@@ -1317,13 +1363,11 @@ fn fence_to_handle(
     let b = unsafe { copy_in(arg, 32)? };
     let (ctx_id, ip, seq) = fence_entry(&b[0..FENCE_SIZE]);
     let what = u32::from_le_bytes(b[24..28].try_into().unwrap());
-    let fence: Arc<dyn crate::drm::syncobj::DmaFence> = match (
-        resolve_job(card, engine, open.ctx, ctx_id, ip, seq)?,
-        engine,
-    ) {
-        (Some(ticket), Some(engine)) => JobFence::new(engine, card, ticket, open.vm.owner()),
-        _ => crate::drm::syncobj::stub(),
-    };
+    let fence: Arc<dyn crate::drm::syncobj::DmaFence> =
+        match resolve_job(card, engine, open.ctx, ctx_id, ip, seq, open.vm.owner())? {
+            Some(job) => job,
+            None => crate::drm::syncobj::stub(),
+        };
     let report = |handle: u32| {
         // SAFETY: `out.handle` at offset 0.
         unsafe { copy_out(arg, &handle.to_le_bytes()) }

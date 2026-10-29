@@ -50,6 +50,7 @@ const DISABLE_FEATURES_HIGH: u32 = 0xb; // linux: PPSMC_MSG_DisableSmuFeaturesHi
 const ALLOW_GFXOFF: u32 = 0x28; // linux: PPSMC_MSG_AllowGfxOff
 const DISALLOW_GFXOFF: u32 = 0x29; // linux: PPSMC_MSG_DisallowGfxOff
 const POWER_UP_VCN: u32 = 0x2a; // linux: PPSMC_MSG_PowerUpVcn
+const POWER_DOWN_VCN: u32 = 0x2b; // linux: PPSMC_MSG_PowerDownVcn
 const POWER_UP_JPEG: u32 = 0x2c; // linux: PPSMC_MSG_PowerUpJpeg
                                  // linux-lit: 22=FEATURE_MM_DPM_PG_BIT
 const MM_DPM_PG: u64 = 1 << 22;
@@ -1118,6 +1119,27 @@ impl<I: Io> Engine<I> {
         self.command(POWER_UP_JPEG, 0).await?;
         Ok(true)
     }
+    async fn set_vcn_power(&mut self, instances: [bool; 2], on: bool) -> Result<bool, Error> {
+        let resume = self.begin_runtime()?;
+        let result = async {
+            if self.running().await? & MM_DPM_PG == 0 {
+                return Ok(false);
+            }
+            for (i, active) in instances.into_iter().enumerate() {
+                if active {
+                    self.command(
+                        if on { POWER_UP_VCN } else { POWER_DOWN_VCN },
+                        (i as u32) << 16,
+                    )
+                    .await?;
+                }
+            }
+            Ok(true)
+        }
+        .await;
+        self.end_runtime(resume, &result);
+        result
+    }
     async fn enable_display_power(&mut self) -> Result<(), Error> {
         if self.state == State::DisplayPowerReady {
             return self.access(|_| ());
@@ -1412,6 +1434,13 @@ impl Smu {
     /// runs (see [`Engine::power_up_media`]).
     pub(crate) async fn power_up_media(&mut self, instances: [bool; 2]) -> Result<bool, Error> {
         self.engine.power_up_media(instances).await
+    }
+    pub(crate) async fn set_vcn_power(
+        &mut self,
+        instances: [bool; 2],
+        on: bool,
+    ) -> Result<bool, Error> {
+        self.engine.set_vcn_power(instances, on).await
     }
     /// `power_dpm_force_performance_level` for GFXCLK; see
     /// [`Engine::set_gfx_level`]. Rejection leaves the owner reusable.

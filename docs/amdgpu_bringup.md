@@ -1,8 +1,9 @@
 # amdgpu bring-up: remaining work
 
-Status as of 2026-10-29, based on `main` at `8da5a8b52` (#1207), plus the
-VDDNB/input-power additions described below. Evidence below the "Verified on
-hardware" section comes from code review and software tests, including QEMU
+Status as of 2026-10-29, based on `main` at `0a0a8c90c` (#1209), plus the
+recovery/GFXOFF/VCN idle changes on `codex/amdgpu-recovery-and-idle`.
+Evidence below the "Verified on hardware" section comes from code review
+and software tests, including QEMU
 and register/fake-engine models.
 
 ## Verified on hardware (RX 6750 XT, Navi22, VFIO bench)
@@ -37,6 +38,13 @@ Rebuild from the checkout being validated and run
    fresh clocks/load/temperature/power/voltage, stable/peak P-states and
    memory movement/eviction counts. Repeat on RX 9000 when hardware is
    available; the Navi48/Navi44 coverage below is software-only.
+5. **Recovery and idle power.** Check WAIT_CS and both WAIT_FENCES modes
+   on jobs interrupted by recovery, including waits after submitter
+   replacement. On RX 6000, check repeated idle/render cycles with GFXOFF
+   admitted, and decode/encode workloads separated by more than one second
+   of idle. VCN must resume without losing sessions or fence progress;
+   JPEG must remain usable. Repeat with `amdgpu.rdna2_vcn_dpg=0` and, when
+   opted in, `amdgpu.rdna2_vcn_smu_pg=1` for PMFW power messages.
 
 ## Bare-metal boot
 
@@ -63,34 +71,40 @@ IOMMU and timers; xHCI keyboard input; NVMe on the real controller.
 
 1. **Remaining Mesa ABI gaps** (see
    `drivers/gpu/research/navi22-mesa-abi.md` §12):
-   - Fence errors after a GPU reset aren't reported through `WAIT_CS` or
-     `WAIT_FENCES`.
    - GDS/GWS/OA allocations are missing.
    - Native RX 6000 scanout supports linear modifiers only; tiled scanout
      needs a separate implementation and hardware validation.
-2. **GFXOFF.** Mark the command-submission path's GC MMIO GFXOFF-safe,
-   so the graphics block can power down when idle. Until then the power
-   policy refuses GFXOFF.
-3. **VCN power.** No idle work exists, so an instance stays DPG-paused
-   after its first encode use, and stop doesn't send `PowerDownVcn`.
-   Linux unpauses and gates an idle instance.
-4. **Multi-display.** Presentation on secondary CRTCs is still opt-in
+2. **Multi-display.** Presentation on secondary CRTCs is still opt-in
    (`amdgpu.rdna2_multi`).
-5. **GDDR6 short-training resume.** Needed for S3 and runtime resume.
+3. **GDDR6 short-training resume.** Needed for S3 and runtime resume.
    Boots that trained memory can't recover today.
-6. **DisplayPort on hardware.** Needs a DP monitor; test with
+4. **DisplayPort on hardware.** Needs a DP monitor; test with
    `NARF_BENCH_CMDLINE="amdgpu.rdna2_connector=dp"`.
-7. **Reset behaviour.** User CPU mappings of VRAM aren't revoked during a
+5. **Reset behaviour.** User CPU mappings of VRAM aren't revoked during a
    reset, matching Linux. Decide whether to keep that.
-8. **RX 9000 (Navi48, DCN 4.0.1).** Every Navi22 display fix has been
+6. **RX 9000 (Navi48, DCN 4.0.1).** Every Navi22 display fix has been
    ported, but only model tests cover them; there's no card. Port each
    later Navi22 fix too.
-9. **Documentation.** The `STATUS.md` "Open" list for RX 6000 still says
-   "any boot on RX 6000 silicon". The VFIO bench has done that, so update
-   it once the next run's results are in.
 
 ## Implemented since the older Mesa gap list
 
+- **Fence errors on both families.** WAIT_CS and WAIT_FENCES all/any use
+  the job's original submitter across reset/unregistration. Context-local
+  history also keeps FENCE_TO_HANDLE and dependencies tied to that job.
+  Native RX 6000 now tracks guilty hangs, cancellation and device loss;
+  observed completed work keeps success. Errors wake clients without
+  freeing resources whose physical completion is unconfirmed.
+- **RX 6000 GFXOFF admission.** Submission, register queries, TDR sampling
+  and kernel VRAM work hold GC disable references. The owner checks lease
+  activation/reset epoch before GC access, closing the enable race. Native
+  registration now declares these paths guarded; other policy prerequisites
+  still apply. Physical transitions remain unverified.
+- **RX 6000 VCN3 idle power.** After one second of inactivity and physical
+  fence completion, idle work releases encode DPG pause, stops VCN and sends
+  PowerDownVcn when MM_DPM_PG is enabled. Begin-use restores power/hardware
+  while preserving context and fence sequences; JPEG stays independent.
+  Cancelled/failed transitions prevent replay. PMFW media gating keeps its
+  existing opt-in. These changes do not add RX 9000 VCN5 idle work.
 - **Statistics on RX 6000 and RX 9000.** Native primary/render nodes answer
   TIMESTAMP and the supported Linux SENSOR selectors, including all four
   stable/peak GFX/MCLK queries. Measurements use fresh SMU telemetry; P-states
@@ -120,12 +134,14 @@ IOMMU and timers; xHCI keyboard input; NVMe on the real controller.
   advertisement, and device-info clock/VRAM/PCIe/MALL fields have code and
   model coverage. Their presence does not establish hardware acceptance.
 
-Validation for the statistics and memory changes: native ioctl, MMIO and SMU
-model regressions cover both families. `cargo xtask test --subsystem drivers/gpu`
-reports 2,652 pass / 0 fail / 5 skip with `--arch x86_64`, and 2,106 pass /
-0 fail / 1 skip with `--arch aarch64`. Regressions cover native VID and
-SOC-voltage decoding, sensor/hwmon units, missing values, short replies,
-refresh errors/cancellation and split timestamp register/loss handling.
+Validation for statistics, memory, recovery and idle changes: native ioctl,
+MMIO and SMU model regressions cover both families.
+`cargo xtask test --subsystem drivers/gpu` reports 2,661 pass / 0 fail /
+5 skip with `--arch x86_64`, and 2,115 pass / 0 fail / 1 skip with
+`--arch aarch64`. Coverage includes sensor/hwmon units and missing data,
+refresh cancellation, timestamp loss, original fence errors across engine
+replacement, GFXOFF activation/cancellation, physical VCN drain and static/DPG
+idle/resume failure paths. Focused reruns cover the final shutdown guard.
 GPU Clippy passes in all three feature contexts on both architectures;
 `cargo fmt --all -- --check` passes. Production boot-smoke and btrfs
 interoperability checks also pass on both architectures.

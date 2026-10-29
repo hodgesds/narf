@@ -14,8 +14,8 @@
 //!   ignores it); so does this.
 //!
 //! In Linux `PP_GFXOFF_MASK` gates all of it; here GFXOFF is disabled until
-//! the explicit `amdgpu.navi22_pg=gfxoff` opt-in started the controller, and
-//! while disabled [`Reference::acquire`] is a no-op that never touches the
+//! the admitted `amdgpu.rdna2_pg` policy starts the controller, and
+//! while cleanly disabled [`Reference::acquire`] is a no-op that never touches the
 //! SMU. Queue submission and every other GC MMIO path take a [`Reference`]
 //! for the duration of the access (doorbell writes alone wake GC in hardware,
 //! as in Linux; register reads and MMIO writes do not). Lock order: this
@@ -34,7 +34,7 @@ pub enum Error {
     Imbalance,
     /// The PMFW message failed.
     Control,
-    /// A disallow failed or was cancelled: GC power is unknown, so every
+    /// An allow/disallow failed or was cancelled: GC power is unknown, so every
     /// later request is refused until the device is reset.
     Failed,
     /// `start` on a controller that is running or was stopped this boot.
@@ -164,8 +164,11 @@ impl Controller {
         if s.failed || s.off || s.requests != 0 {
             return Err(Error::Failed);
         }
-        // A failed allow leaves GFX on (gfx_off_state stays false): safe.
+        // Cancellation/transport loss may happen after PMFW accepted the
+        // allow. Refuse later GC access until a reset establishes power.
+        self.status.failed = true;
         pmfw.control(true).await.map_err(|()| Error::Control)?;
+        self.status.failed = false;
         self.status.off = true;
         self.status.allows += 1;
         Ok(true)
@@ -189,8 +192,10 @@ impl Controller {
 }
 
 static CONTROLLER: Mutex<Controller> = Mutex::new(Controller::new());
-/// Fast path: false (the default) makes every reference a no-op.
+/// Fast path: false makes references inert unless a transition failed.
 static ENABLED: AtomicBool = AtomicBool::new(false);
+static ACTIVE_EPOCH: AtomicU64 = AtomicU64::new(0);
+static FAILED: AtomicBool = AtomicBool::new(false);
 /// Bumped by [`forget_for_reset`], which cannot wait for the mutex.
 static RESETS: AtomicU64 = AtomicU64::new(0);
 /// Set by the uapi/CS owner once every userspace GC MMIO path it serves
@@ -232,6 +237,9 @@ impl Reference {
     ///
     /// Must not be awaited while holding the platform owner lock.
     pub async fn acquire() -> Result<Self, Error> {
+        if FAILED.load(Ordering::Acquire) {
+            return Err(Error::Failed);
+        }
         if !ENABLED.load(Ordering::Acquire) {
             return Ok(Self { epoch: None });
         }
@@ -248,6 +256,20 @@ impl Reference {
     pub fn active(&self) -> bool {
         self.epoch.is_some()
     }
+    /// Recheck while holding OWNER. A no-op reference acquired before
+    /// GFXOFF startup must be retried if the controller became active while
+    /// the caller waited for OWNER. SMU transitions also take OWNER.
+    pub(crate) fn covers_access(&self) -> bool {
+        covers(
+            self.epoch,
+            ENABLED.load(Ordering::Acquire),
+            FAILED.load(Ordering::Acquire),
+            ACTIVE_EPOCH.load(Ordering::Acquire),
+        )
+    }
+}
+fn covers(lease: Option<u64>, enabled: bool, failed: bool, epoch: u64) -> bool {
+    !failed && (!enabled || lease == Some(epoch))
 }
 impl Drop for Reference {
     fn drop(&mut self) {
@@ -287,8 +309,12 @@ async fn delayed(epoch: u64, generation: u64) {
 /// allow is sent after [`DELAY_MS`]. The caller (opt-in path, owner lock
 /// released) already enabled `FEATURE_GFXOFF` and sent `DisallowGfxOff`.
 pub(crate) async fn start() -> Result<(), Error> {
+    if FAILED.load(Ordering::Acquire) {
+        return Err(Error::Failed);
+    }
     let mut c = controller().await;
     c.start()?;
+    ACTIVE_EPOCH.store(c.epoch, Ordering::Release);
     ENABLED.store(true, Ordering::Release);
     if let Some(generation) = c.allow()? {
         narf_scheduler::spawn(delayed(c.epoch, generation));
@@ -299,14 +325,24 @@ pub(crate) async fn start() -> Result<(), Error> {
 /// be). Owner lock must not be held.
 pub(crate) async fn stop() -> Result<(), Error> {
     let mut c = controller().await;
+    FAILED.store(true, Ordering::Release);
     ENABLED.store(false, Ordering::Release);
-    c.stop(&mut Platform).await
+    let result = c.stop(&mut Platform).await;
+    if result.is_ok() {
+        FAILED.store(false, Ordering::Release);
+    }
+    result
 }
 /// Recovery: the ASIC is about to be reset. Callable with the owner lock
 /// held; never waits.
 pub(crate) fn forget_for_reset() {
     ENABLED.store(false, Ordering::Release);
     RESETS.fetch_add(1, Ordering::AcqRel);
+    FAILED.store(false, Ordering::Release);
+}
+pub(crate) fn device_lost() {
+    FAILED.store(true, Ordering::Release);
+    ENABLED.store(false, Ordering::Release);
 }
 /// Diagnostics; None while a transition holds the controller.
 pub fn status() -> Option<Status> {

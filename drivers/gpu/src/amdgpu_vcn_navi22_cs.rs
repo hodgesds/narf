@@ -537,7 +537,10 @@ async fn queue(
                 // unfinished job; wait without the owner.
                 None => None,
                 Some(grant) => {
-                    match boot.submit_media(ring, vm_ref(&request, grant), ibs, copies) {
+                    match boot
+                        .submit_media(ring, vm_ref(&request, grant), ibs, copies)
+                        .await
+                    {
                         Ok(seq) => {
                             if let Some(m) = MEDIA.lock().as_mut() {
                                 m.vmids.commit(request, grant, ticket(seq));

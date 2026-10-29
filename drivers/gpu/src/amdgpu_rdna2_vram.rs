@@ -287,7 +287,7 @@ async fn readback(
             let _power = crate::amdgpu_navi22_gfxoff::Reference::acquire()
                 .await
                 .map_err(|_| FsError::NoDevice)?;
-            let owner = crate::amdgpu_navi22_platform::owner().await;
+            let (_gc, owner) = crate::amdgpu_navi22_platform::gc_owner().await?;
             if !engine().active.load(Ordering::Acquire)
                 || epoch != crate::amdgpu_fence_navi22::generation()
             {
@@ -412,7 +412,7 @@ async fn run(
     let (reader, epoch, seq) = loop {
         let observed = crate::amdgpu_fence_navi22::change_sequence();
         let result = {
-            let mut owner = crate::amdgpu_navi22_platform::owner().await;
+            let (_gc, mut owner) = crate::amdgpu_navi22_platform::gc_owner().await?;
             if !engine().active.load(Ordering::Acquire) {
                 return Err(FsError::NoDevice);
             }

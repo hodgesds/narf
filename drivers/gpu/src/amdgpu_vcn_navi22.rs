@@ -11,8 +11,8 @@
 //! PSP to fill in. On the RX 6750 XT the static path's direct writes to
 //! those VCPU registers never take (they read back as all ones) and the
 //! VCPU never boots. Encode needs the instance paused (`vcn_v3_0_pause_dpg_mode`);
-//! without Linux's idle work an instance stays paused after its first
-//! encode use. `amdgpu.rdna2_vcn_dpg=0` selects Linux's static path with
+//! idle work releases that pause after encode fences complete and stops
+//! drained VCN instances after one second. `amdgpu.rdna2_vcn_dpg=0` selects Linux's static path with
 //! `AMD_PG_SUPPORT_VCN` clear instead: every tile powered on through PGFSM
 //! and the registers written directly, clock gating as
 //! `vcn_v3_0_disable_clock_gating` programs it. MM_DPM_PG is outside the
@@ -20,7 +20,8 @@
 //! `sienna_cichlid_dpm_set_vcn_enable` does; with
 //! `amdgpu.rdna2_vcn_smu_pg=1` the boot sends it first, and a board where it
 //! runs unannounced is refused before any write. Firmware images come from
-//! the PSP-loaded TMR (`AMDGPU_FW_LOAD_PSP`). Only VMID0 kernel rings exist.
+//! the PSP-loaded TMR (`AMDGPU_FW_LOAD_PSP`). Client submissions use lent
+//! MMHUB VMIDs; startup proofs use VMID0.
 use crate::{
     amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_fence_navi22 as fence, amdgpu_vram::Pool,
     amdgpu_vram::Reservation,
@@ -43,6 +44,7 @@ pub enum Error {
     BootFailed(u8),
     /// The SMU runs MM_DPM_PG: Linux would send PowerUpVcn first.
     PowerGated,
+    Power(crate::amdgpu_smu_navi22::Error),
     /// The discovery harvest table could not be trusted.
     Harvest(ip::DiscoveryError),
     /// PSP refused the DPG register list (`amdgpu_vcn_psp_update_sram`).
@@ -1007,6 +1009,7 @@ impl Jpeg {
 
 #[derive(Debug)]
 pub(crate) struct Engine<I: Io> {
+    pub runtime: idle::Runtime,
     enc_count: usize,
     pub hw: Hw<I>,
     pub vcn: [Option<Instance>; 2],
@@ -1172,6 +1175,7 @@ impl<I: Io> Engine<I> {
         let gb_addr_config = self
             .hw
             .access(|io, l| checked(io.read(l.gc + u64::from(GB_ADDR_CONFIG) * 4)))?;
+        self.runtime.initialized(images, gb_addr_config);
         for (i, image) in images.into_iter().enumerate() {
             let Some(firmware) = image else {
                 continue;
@@ -1193,8 +1197,8 @@ impl<I: Io> Engine<I> {
             }
             self.proof.dec_ring[i] = true;
             if self.mode == StartMode::Dpg && self.enc_count > 0 {
-                // amdgpu_vcn_ring_begin_use on an encode ring. NARF has no
-                // VCN idle work, so the instance stays paused afterwards.
+                // amdgpu_vcn_ring_begin_use on an encode ring. Runtime idle
+                // work releases this pause after physical encode completion.
                 self.pause_dpg(i).await?;
             }
             for j in 0..self.enc_count {
@@ -1786,12 +1790,17 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     /// `vcn_v3_0_stop` for every started instance (`_stop_dpg_mode` in
-    /// DPG mode), and `jpeg_v3_0_stop` when JPEG runs. Static power gating
-    /// stays disabled, so its re-enable steps are skipped, as is the SMU
-    /// PowerDownVcn; nothing is restarted.
+    /// DPG mode), and `jpeg_v3_0_stop` when JPEG runs. This is the hardware
+    /// stop; the retained ColdBoot owner sends SMU PowerDownVcn afterwards
+    /// when MM_DPM_PG is enabled. Nothing is restarted here.
     pub(crate) async fn stop(&mut self) -> Result<(), Error> {
         if !matches!(self.state, State::Running | State::Verified) {
             return Err(Error::Busy);
+        }
+        // A cancelled idle/resume may have left a PMFW or PSP command in
+        // flight. Full shutdown cannot replay hardware writes in that state.
+        if !matches!(self.runtime.phase, idle::Phase::Awake | idle::Phase::Asleep) {
+            return Err(Error::DeviceGone);
         }
         self.state = State::Stopping;
         let result = self.stop_inner().await;
@@ -1812,6 +1821,12 @@ impl<I: Io> Engine<I> {
                 update(io, r(JPEG_POWER_STATUS), JPEG_POWER_STATUS_MASK, 1)
             })?;
             self.jpeg_state = JpegState::Stopped;
+        }
+        self.stop_instances().await
+    }
+    async fn stop_instances(&mut self) -> Result<(), Error> {
+        if self.runtime.phase == idle::Phase::Asleep {
+            return Ok(());
         }
         let instances: alloc::vec::Vec<usize> = self.active().collect();
         for i in instances {
@@ -2048,6 +2063,9 @@ pub struct Media {
     client: Option<Client>,
 }
 impl Media {
+    pub(crate) fn vcn_power_gated(&self) -> bool {
+        self.engine.runtime.gated()
+    }
     /// The unharvested VCN instances this owner programs.
     pub fn active_instances(&self) -> [bool; 2] {
         [self.engine.vcn[0].is_some(), self.engine.vcn[1].is_some()]
@@ -2089,6 +2107,7 @@ impl Media {
         Ok(Self {
             client,
             engine: Engine {
+                runtime: idle::Runtime::new(),
                 enc_count: if crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
                     .is_some_and(|p| p.asic == "navi24")
                 {
@@ -2319,6 +2338,9 @@ impl<I: Io> Engine<I> {
         ibs: &[Ib],
         copies: &[alloc::vec::Vec<u32>],
     ) -> Result<u32, Error> {
+        if ring != MediaRing::Jpeg && self.runtime.phase != idle::Phase::Awake {
+            return Err(Error::Busy);
+        }
         submit::validate_media(vm, ibs).map_err(|_| Error::Invalid)?;
         let jpeg_slot = if ring == MediaRing::Jpeg {
             let pool = client.jpeg_ibs.as_ref().ok_or(Error::Unsupported)?;
@@ -2435,6 +2457,21 @@ fn client_ring<'a>(
 }
 
 impl Media {
+    pub(crate) async fn begin_use(
+        &mut self,
+        control: &mut impl idle::Control,
+        ring: MediaRing,
+        now: u64,
+    ) -> Result<(), Error> {
+        self.engine.begin_use(control, ring, now).await
+    }
+    pub(crate) async fn idle(
+        &mut self,
+        control: &mut impl idle::Control,
+        now: u64,
+    ) -> Result<bool, Error> {
+        self.engine.idle(control, now).await
+    }
     /// Bit `MediaRing::index()` per ring that accepts client jobs.
     pub fn client_rings(&self) -> u8 {
         let Some(client) = self.client.as_ref() else {
@@ -2492,3 +2529,6 @@ impl Media {
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_vcn_navi22_tests.rs"]
 pub(crate) mod tests;
+
+#[path = "amdgpu_vcn_navi22_idle.rs"]
+pub(crate) mod idle;

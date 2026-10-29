@@ -577,6 +577,7 @@ fn engine(model: Model, instances: u8) -> (Pool, Engine<Model>) {
     (
         pool,
         Engine {
+            runtime: idle::Runtime::new(),
             enc_count: 2,
             hw: Hw {
                 io: model,
@@ -1597,6 +1598,177 @@ fn dpg_engine(instances: u8) -> (Pool, Engine<Model>, FakePsp) {
     e.mode = StartMode::Dpg;
     (pool, e, psp)
 }
+
+struct RuntimePm {
+    psp: FakePsp,
+    commands: Vec<([bool; 2], bool)>,
+    gated: bool,
+    stall: Option<bool>,
+    fail: bool,
+}
+impl SramLoader for RuntimePm {
+    async fn load_sram(&mut self, i: usize, words: &[u32]) -> Result<(), Error> {
+        self.psp.load_sram(i, words).await
+    }
+}
+impl idle::Control for RuntimePm {
+    async fn power(&mut self, instances: [bool; 2], on: bool) -> Result<bool, Error> {
+        self.commands.push((instances, on));
+        if self.stall == Some(on) {
+            core::future::pending::<()>().await;
+        }
+        if self.fail {
+            return Err(Error::Power(crate::amdgpu_smu_navi22::Error::Rejected(
+                0xfd,
+            )));
+        }
+        Ok(self.gated)
+    }
+}
+fn runtime_engine(mode: StartMode, gated: bool) -> (Pool, Engine<Model>, RuntimePm) {
+    let (pool, mut e, psp) = dpg_engine(3);
+    e.mode = mode;
+    let mut pm = RuntimePm {
+        psp,
+        commands: Vec::new(),
+        gated,
+        stall: None,
+        fail: false,
+    };
+    run(e.start(firmware(3), None, &mut pm)).unwrap();
+    run(e.start_jpeg()).unwrap();
+    run(e.test_ib()).unwrap();
+    (pool, e, pm)
+}
+fn vcn3_idle_resume_preserves_context_fences_and_jpeg() -> TestResult {
+    for mode in [StartMode::Dpg, StartMode::Static] {
+        for gated in [false, true] {
+            let (_pool, mut e, mut pm) = runtime_engine(mode, gated);
+            let marker = e.vcn[0].as_ref().unwrap().address(SHARED + 0x80);
+            e.hw.io.put(marker, 0x1234_5678);
+            let before = e.vcn[0].as_ref().unwrap();
+            let seq = [before.dec.seq, before.enc[0].seq, before.enc[1].seq];
+            assert!(!run(e.idle(&mut pm, 0)).unwrap());
+            assert!(!run(e.idle(&mut pm, 999_999_999)).unwrap());
+            assert!(pm.commands.is_empty());
+            assert!(run(e.idle(&mut pm, 1_000_000_000)).unwrap());
+            assert_eq!(e.runtime.phase, idle::Phase::Asleep);
+            assert_eq!(e.paused, [false; 2]);
+            assert_eq!(e.jpeg_state, JpegState::Verified);
+            assert_eq!(pm.commands, [([true, true], false)]);
+            run(e.begin_use(&mut pm, MediaRing::Enc(0), 2_000_000_000)).unwrap();
+            assert_eq!(e.runtime.phase, idle::Phase::Awake);
+            assert_eq!(e.hw.io.word(marker), 0x1234_5678);
+            let after = e.vcn[0].as_ref().unwrap();
+            assert_eq!([after.dec.seq, after.enc[0].seq, after.enc[1].seq], seq);
+            assert_eq!(pm.commands.len(), if gated { 2 } else { 1 });
+            if gated {
+                assert_eq!(pm.commands[1], ([true, true], true));
+            }
+            if mode == StartMode::Dpg {
+                assert!(e.paused[0]);
+            }
+            run(e.test_enc_ib(0, 0)).unwrap();
+            assert_ne!(e.vcn[0].as_ref().unwrap().enc[0].seq, seq[1]);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22",
+    vcn3_idle_resume_preserves_context_fences_and_jpeg
+);
+
+fn vcn3_idle_uses_physical_fences_and_releases_only_idle_encode_pause() -> TestResult {
+    let (_pool, mut e, mut pm) = runtime_engine(StartMode::Dpg, true);
+    let inst = e.vcn[0].as_mut().unwrap();
+    inst.enc[0].seq += 1;
+    let enc_seq = inst.enc[0].seq;
+    let enc_at = inst.address(FENCE[1]);
+    assert!(!run(e.idle(&mut pm, 0)).unwrap());
+    assert!(!run(e.idle(&mut pm, 1_000_000_000)).unwrap());
+    assert!(e.paused[0] && pm.commands.is_empty());
+    e.hw.io.put(enc_at, enc_seq);
+    let inst = e.vcn[0].as_mut().unwrap();
+    inst.dec.seq += 1;
+    let dec_seq = inst.dec.seq;
+    let dec_at = inst.address(FENCE[0]);
+    assert!(!run(e.idle(&mut pm, 1_000_000_000)).unwrap());
+    assert!(!e.paused[0] && pm.commands.is_empty());
+    e.hw.io.put(dec_at, dec_seq);
+    assert!(run(e.idle(&mut pm, 1_000_000_000)).unwrap());
+    assert_eq!(pm.commands, [([true, true], false)]);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22",
+    vcn3_idle_uses_physical_fences_and_releases_only_idle_encode_pause
+);
+
+fn vcn3_cancelled_idle_or_resume_never_replays_power_transitions() -> TestResult {
+    for on in [false, true] {
+        let (_pool, mut e, mut pm) = runtime_engine(StartMode::Dpg, true);
+        run(e.idle(&mut pm, 0)).unwrap();
+        if on {
+            assert!(run(e.idle(&mut pm, 1_000_000_000)).unwrap());
+        }
+        pm.stall = Some(on);
+        if on {
+            let mut f = alloc::boxed::Box::pin(e.begin_use(&mut pm, MediaRing::Dec, 2_000_000_000));
+            assert!(f
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+        } else {
+            let mut f = alloc::boxed::Box::pin(e.idle(&mut pm, 1_000_000_000));
+            assert!(f
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+        }
+        let writes = e.hw.io.writes.len();
+        let commands = pm.commands.len();
+        assert_eq!(run(e.stop()), Err(Error::DeviceGone));
+        assert_eq!(
+            run(e.begin_use(&mut pm, MediaRing::Dec, 3_000_000_000)),
+            Err(Error::DeviceGone)
+        );
+        assert_eq!(e.state, State::Failed);
+        assert_eq!(e.hw.io.writes.len(), writes);
+        assert_eq!(pm.commands.len(), commands);
+    }
+    let (_pool, mut e, mut pm) = runtime_engine(StartMode::Dpg, true);
+    run(e.idle(&mut pm, 0)).unwrap();
+    pm.fail = true;
+    assert!(run(e.idle(&mut pm, 1_000_000_000)).is_err());
+    assert_eq!(e.state, State::Failed);
+    // Hardware must be quiet before PMFW can cut power.
+    let (_pool, mut e, mut pm) = runtime_engine(StartMode::Static, true);
+    run(e.idle(&mut pm, 0)).unwrap();
+    e.hw.io.regs.insert(v(0, STATUS), 0x5);
+    assert_eq!(run(e.idle(&mut pm, 1_000_000_000)), Err(Error::Timeout));
+    assert!(pm.commands.is_empty());
+    assert_eq!(e.state, State::Failed);
+    // A lost power feature or a rejected PSP restore cannot reopen clients.
+    for lost_feature in [true, false] {
+        let (_pool, mut e, mut pm) = runtime_engine(StartMode::Dpg, true);
+        run(e.idle(&mut pm, 0)).unwrap();
+        assert!(run(e.idle(&mut pm, 1_000_000_000)).unwrap());
+        if lost_feature {
+            pm.gated = false;
+        } else {
+            pm.psp.refuse = true;
+        }
+        assert!(run(e.begin_use(&mut pm, MediaRing::Dec, 2_000_000_000)).is_err());
+        assert_eq!(e.state, State::Failed);
+        assert_eq!(e.runtime.phase, idle::Phase::Failed);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22",
+    vcn3_cancelled_idle_or_resume_never_replays_power_transitions
+);
 fn vcn_navi22_dpg_offsets_follow_soc15_dpg_mode_offset() -> TestResult {
     let l = layout(3);
     // Video registers of either instance share internal offsets from 0;

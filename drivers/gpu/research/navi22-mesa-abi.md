@@ -337,7 +337,10 @@ kernel queues pass their ring/IB tests. Implemented (software models only):
 | WAIT_FENCES, FENCE_TO_HANDLE, BO_LIST | generic `amdgpu_cs`, `amdgpu_bo_list` | Linux semantics and errnos; answered with or without a card engine |
 | Implicit sync | generic `amdgpu_cs` | as `amdgpu_cs_sync_rings`: listed BOs and the user-fence BO, skipping the open's own jobs (`AMDGPU_SYNC_NE_OWNER`) and EXPLICIT_SYNC BOs; unlisted BOs get no fence; GEM_WAIT_IDLE waits for the space's jobs only on VM_ALWAYS_VALID BOs (the root reservation) |
 
-Current gaps: native reset fence errors, GDS/GWS/OA and tiled RDNA2 scanout.
+Current gaps: GDS/GWS/OA and tiled RDNA2 scanout. Native reset fence errors
+now propagate through WAIT_CS and WAIT_FENCES all/any on both RX 6000 and
+RX 9000; per-context history retains the original job/submitter across
+unregistration and replacement. Physical acceptance remains pending.
 Statistics follow the live owner's generation and errors: DPM unavailable
 is ENOENT, failed refreshes publish no stale reply, and pending/cancelled
 SMU commands retain their Runtime ownership. Both Linux dGPU sensor switches
@@ -397,6 +400,11 @@ without the owner and retries.
 the recovery epoch. `FenceReader` samples each queue's fence writeback with
 its own capability and an HDP invalidate, so `signalled`, WAIT_CS and
 syncobj `JobFence`s never take the owner; each sample retires the job
-memory and user fences of completed jobs. After a recovery the submitter is
-re-registered; older tickets read as complete (abandoned) and contexts
-report the reset.
+memory and user fences of physically completed jobs. Per-context history
+retains original submitters across recovery. WAIT_CS and WAIT_FENCES all/any
+report the old job's error, while FENCE_TO_HANDLE preserves that original
+fence and dependencies check its error. Native RX 6000 records guilty
+timeouts, cancellation and loss; already observed completions retain
+success. Error signalling never proves memory retirement. Contexts also
+report the reset. Submission and other runtime GC access now use a GFXOFF
+reference checked under the platform owner before MMIO.

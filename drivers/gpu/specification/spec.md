@@ -7296,7 +7296,7 @@ and the contents are lost).
 `amdgpu_device_gpu_recover` for mode1 (`amdgpu_navi22_recovery::Recovery`, state
 stored outside the future). `check` refuses (`Unsupported`, no side effects) a
 boot that needed GDDR6 training (no short-training replay yet) or lacks a board
-table, PSP or IH. Quiesce stops TDR, telemetry and thermal, disables the IH ring
+table, PSP or IH. Quiesce stops VCN idle work, TDR, telemetry and thermal, disables the IH ring
 (every subscriber gets `Disabled`) and calls `amdgpu_fence_navi22::abandon_all`,
 which ends every pending fence wait with its error. Reinitialize consumes the
 owner (`ColdBoot::into_recovery`: same snapshot, authority, pool and prepared
@@ -7382,10 +7382,17 @@ supersedes one not yet started. Reads report the applied state.
 `amdgpu_navi22_gfxoff` mirrors `amdgpu_gfx_off_ctrl`: request count starting
 at 1, `DELAY_MS` (100) before `AllowGfxOff`, cancellation by a disable request,
 `DisallowGfxOff` before the count rises, imbalance refused, failed or cancelled
-disallow terminal. `Reference::acquire().await` is the disable reference every
+allow/disallow terminal. `Reference::acquire().await` is the disable reference every
 GC MMIO path (queue submission, `READ_MMR_REG`, the TDR sampler) holds; it is
 a no-op without the opt-in, and must not be awaited with the platform owner
-lock held. Recovery calls `forget_for_reset`; `status()` is diagnostic.
+lock held. Native submitter registration now declares these paths guarded.
+`amdgpu_navi22_platform::gc_owner().await` acquires the reference before
+OWNER and rechecks controller activation and reset epoch under OWNER,
+retrying a stale/no-op lease. Kernel SDMA VRAM work uses the same guard.
+This closes the race with enabling GFXOFF while a caller waits for OWNER.
+Failed/cancelled controller stop and device loss refuse GC access until
+reset; recovery calls `forget_for_reset`. `status()` is diagnostic. Physical
+GFXOFF transitions remain unverified.
 
 ### Navi 22 VCN 3.0 and JPEG 3.0
 
@@ -7425,9 +7432,9 @@ the fw_shared `rb` pointers, and every decode commit also writes UVD_SCRATCH2
 and fw_shared `rb.wptr`. No register boot poll exists; the decode ring test is
 the first proof. Before the encode ring tests the instance is paused
 (`vcn_v3_0_pause_dpg_mode`: POWER_STATUS 1, NJ_PAUSE_DPG_REQ/ACK, both encode
-rings programmed, decode pointers restored from fw_shared, POWER_STATUS 2) and
-stays paused (no idle work). `stop()` runs `vcn_v3_0_stop_dpg_mode` (unpause,
-ring drain, PG_MODE off) without PowerDownVcn.
+rings programmed, decode pointers restored from fw_shared, POWER_STATUS 2).
+Runtime idle work releases this pause once physical encode fences complete.
+`stop()` runs `vcn_v3_0_stop_dpg_mode` (unpause, ring drain, PG_MODE off).
 
 `StartMode::Static` runs `vcn_v3_0_start`'s static path with power
 gating disabled (PGFSM all tiles on before any UVD_STATUS read, no UVD_PG_EN),
@@ -7453,6 +7460,26 @@ published memory. `status()` returns `Status { state, jpeg, proof }`.
 `route_interrupts(ih, status)` subscribes the started rings' VCN/VCN1
 (client 0x10/0x0e: 124 decode, 119/120 encode) and JPEG (153) sources and
 forwards them to `amdgpu_fence_navi22::Engine::{Vcn0, Vcn1, Jpeg}`.
+
+The retained platform owner also runs VCN3 idle work at 100 ms intervals,
+with Linux's 1 s idle delay. It checks physical decode/encode writebacks
+on every active instance, independently of API error signalling. Encode
+completion releases DPG pause even while decode remains busy. Once all VCN
+work drains it runs the hardware stop and, only when SMU11 MM_DPM_PG is
+running, sends PowerDownVcn (0x2b, instance in bits 16+).
+`ColdBoot::submit_media(...).await` performs begin-use before publication:
+PowerUpVcn (0x2a) when previously gated, then static or PSP DPG restore and
+encode pause when required. It preserves VCPU context, firmware images,
+writebacks and logical fence sequences; cached GB_ADDR_CONFIG avoids GC
+MMIO during resume. JPEG stays independent of VCN idle.
+Quiescing/Waking markers precede the first await; cancellation, failed
+shutdown or failed restore prevents replay and keeps client VCN closed.
+Recovery stops the worker before replacing the owner. Owned full shutdown
+uses `unsafe ColdBoot::stop_media().await`: callers block new publication,
+drain JPEG and retain all mappings/TMR; hardware stop precedes conditional
+SMU power-down. The existing media-gating opt-in still controls MM_DPM_PG;
+idle work does not enable that feature. Model coverage is not physical
+power-transition acceptance.
 
 `amdgpu_video_caps_navi22::{codecs, caps}(kind, harvested)` return Linux's
 Sienna Cichlid `AMDGPU_INFO_VIDEO_CAPS` tables (decode VCN0 with AV1, or VCN1
@@ -7545,11 +7572,19 @@ and remaps again. Media jobs (VCN decode/encode, JPEG) run through
 last)`), whose PASID remap is honoured only together with a flush
 (`amdgpu_navi22_submit::media_grant`, as `amdgpu_vm_flush` on rings without
 `emit_pipeline_sync`) and written to `IH_VMID_<vmid>_LUT_MM`. Tickets are
-`ring_index(epoch, id) << 32 | seq` with three ring-id bits (`RING_IDS` 8);
-tickets of an earlier recovery epoch read as complete. `amdgpu_vm::VmState`
-tracks eight ring slots. Fences are read
+`ring_index(epoch, id) << 32 | seq` with four ring-id bits (`RING_IDS` 10,
+including SDMA2/3). `amdgpu_vm::VmState` tracks sixteen ring slots. Fences are read
 by `amdgpu_cp_navi22::FenceReader` (`ColdBoot::client_fence_reader`) without
 the owner. `unregister` runs at the start of recovery.
+
+The native submitter retains pending jobs and their context health. A TDR
+marks the oldest pending context on that ring guilty (`TimedOut`), with
+other unfinished work `Canceled`; explicit unregister/reset also cancels
+unfinished jobs and loss escalates them to `NoDevice`. Already observed
+physical completions retain success. Only same-generation physical
+writebacks permit retirement; error signalling and a replacement submitter
+never release old BOs, VMIDs or page tables. Late publication racing an error
+still returns its ticket so generic CS attaches resource retention.
 
 Generic paths it uses (shared with Navi48): the `FENCE` chunk
 (`Submission::user_fence`, written with the job's ticket when `retire` frees
@@ -8742,8 +8777,14 @@ paths; only the tables differ.
   forever, `amdgpu_gem_timeout`). Every `drm_amdgpu_fence`-shaped handle
   (WAIT_CS, WAIT_FENCES, FENCE_TO_HANDLE, DEPENDENCIES) resolves through
   `amdgpu_ctx_get_fence`'s rules: the context must be the open's and the
-  IP/ring one the engine runs (EINVAL), 0 is signalled, `!0` the ring's last
-  job, a handle of another ring or past the ring's last emitted job EINVAL.
+  IP/ring one the engine runs (EINVAL), 0 is signalled, `!0` the context
+  entity's last job, unknown/future handles outside recycled history EINVAL. `CtxState` retains each
+  submitted `JobFence` with its original submitter, so reset unregistration
+  or replacement cannot reinterpret the old ticket as a new queue's job.
+  Completed history targets 64 fences per logical entity; pending fences
+  are retained, and recycled completed handles are signalled. Context free
+  releases this history. A legacy issued-watermark fallback remains for
+  entities without recorded submissions.
   `AMDGPU_GEM_WAIT_IDLE` waits for the buffer's reservation fences, and for
   the open's last jobs (`VmState::last_jobs`) only on a `VM_ALWAYS_VALID`
   buffer (Linux's shared root reservation); unknown handles ENOENT.
@@ -8752,7 +8793,11 @@ paths; only the tables differ.
   EINVAL, all stops at the first timeout, any reports `first_signaled`,
   `!0` on timeout) and `AMDGPU_FENCE_TO_HANDLE` (GET_SYNCOBJ,
   GET_SYNCOBJ_FD, GET_SYNC_FILE_FD through `files`; other `what` EINVAL),
-  with or without a registered submitter. CS chunks: `SYNCOBJ_IN`/`OUT`,
+  with or without a registered submitter. WAIT_CS and WAIT_FENCES all/any
+  propagate the completed job's backend error (including reset, hang and
+  loss) through the original submitter; explicit dependencies also check
+  that error, and FENCE_TO_HANDLE preserves the original fence reference.
+  API completion is separate from physical resource retirement. CS chunks: `SYNCOBJ_IN`/`OUT`,
   `SYNCOBJ_TIMELINE_WAIT`/`SIGNAL` (`Submission::{in,out}_syncobjs` of
   `SyncobjPoint { handle, flags, point }`; one post-dependency chunk; an
   unknown out-syncobj EINVAL, in-syncobj ENOENT, no fence/point EINVAL or,
