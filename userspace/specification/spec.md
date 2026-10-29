@@ -739,10 +739,27 @@ consumed pages; only a mergeable tail accepts the write's page remainder.
 `tee` duplicates page references and clears the destination merge flag.
 `splice` moves whole buffers or shares a partial buffer reference, preserving
 packet flags and leaving append rights with only the source of a split.
-Both operations acquire per-pipe sleepable mutexes in address order. Payload
+Ordinary writes own page metadata inline. Tee and partial splice allocate
+shared-reference metadata only when a unique page first becomes shared;
+allocation failure leaves that source page intact and reports `ENOMEM` if no
+prefix was transferred. Whole-buffer splice moves ownership without promotion.
+Scalar and vector pipe writes guarded-copy directly into raw owned RAM. Fresh
+full pages skip pre-zeroing; they become readable only after every byte was
+initialized. Faulted incomplete pages are discarded, while earlier complete
+page buffers remain committed. Partial pages retain initialized backing and
+the user-copy trap fixups, packet atomicity, and error ordering are preserved.
+Scalar/vector syscalls resolve the concrete pipe endpoint once from the retained
+file reference and reuse it across capacity waits. Scalar pipe dispatch follows
+the common access/range/zero-count checks and precedes socket-family probes.
+Two-pipe operations acquire their sleepable mutexes in address order. Payload
+ownership first tries the mutex directly, then a single bounded optimistic
+wait before normal sleepable acquisition. Optimistic admission defers to queued
+waiters and never trusts the queue's busy hint as proof of ownership. Payload
 copies and allocations hold no pipe IRQ spinlock. Poll, FIONREAD, and endpoint
 closure use atomic queue snapshots; a per-pipe short publication lock orders
-readiness updates. Descriptor-table locks are released before pipe resizing
+readiness updates. First readiness activation and the inactive-publication
+decision use that same publication lock, so neither can miss the other's
+completed queue state. Descriptor-table locks are released before pipe resizing
 or transfers can wait. `splice` and `tee` flags use the low unsigned 32 bits.
 
 Linux `vmsplice(2)` preserves the kernel entry-point's observable validation

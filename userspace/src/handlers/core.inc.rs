@@ -5035,10 +5035,11 @@ const LINUX_IOV_MAX: usize = 1024;
 fn read_pipe_user(
     ctx: &mut dyn TrapContext,
     endpoint: &CopyFdEndpoint,
+    pipe: &crate::pipe::Endpoint<'_>,
     count: usize,
     copy: impl FnMut(usize, *const u8, usize) -> Result<(), u64>,
 ) {
-    match crate::pipe::read_to_iter(endpoint.ops.as_ref(), count, true, copy) {
+    match crate::pipe::read_endpoint(pipe, count, true, copy) {
         Ok(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
         Err(errno) if errno == EAGAIN as u64 && !endpoint.nonblocking() => {
             if has_interrupting_signal(current_task_id()) {
@@ -5054,16 +5055,22 @@ fn read_pipe_user(
 /// Native pipes consume scalar/vector iterators directly under their payload
 /// mutex. A blocked large write retains its accepted prefix on the task's
 /// kernel stack instead of restarting and duplicating bytes already sent.
-fn write_pipe_user(
+///
+/// # Safety
+/// `copy` must initialize all requested bytes on Ok, access only the supplied
+/// destination range, and retain no destination pointer after the callback.
+unsafe fn write_pipe_user(
     ctx: &mut dyn TrapContext,
     endpoint: &CopyFdEndpoint,
+    pipe: &crate::pipe::Endpoint<'_>,
     count: usize,
-    mut copy: impl FnMut(usize, &mut [u8]) -> Result<(), u64>,
+    mut copy: impl FnMut(usize, *mut u8, usize) -> Result<(), u64>,
 ) {
     let task = current_task_id();
     let mut total = 0;
     loop {
-        match crate::pipe::write_from_iter(endpoint.ops.as_ref(), count - total, |offset, bytes| copy(total + offset, bytes)) {
+        // SAFETY: the syscall adapter guarantees full initialization on Ok.
+        match unsafe { crate::pipe::write_from_raw_iter(pipe, count - total, |offset, ptr, len| copy(total + offset, ptr, len)) } {
             Ok((n, full)) => {
                 total += n;
                 if total == count || (n != 0 && !full) { break; }

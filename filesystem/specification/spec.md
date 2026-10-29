@@ -537,7 +537,14 @@ blocking `open`. A read-only handle opened before any writer suppresses
 `POLLHUP` until its own writer-presence snapshot changes, matching Linux's
 per-file `f_pipe`/`w_counter` rule. Data reads/writes arm the per-file readiness cell. Anonymous pipes and named
 FIFOs use `pipe_buffer::PipeBufs` and `pipe_queue::Queue`: a bounded buffer-slot
-ring with retained page references and a sleepable mutex. Queue guards publish
+ring with retained page references and a sleepable mutex. `Queue::try_lock_optimistic`
+permits one optional spinner per pipe for at most 32 pauses, then one authoritative
+mutex attempt only if the advisory busy hint clears. That attempt refuses queued
+waiters; failure returns to normal sleepable acquisition. The reservation is
+released on every return, before any sleep. No owner-running query is assumed,
+so preempted or faulting owners cannot extend the fixed spin bound. Busy hints
+never grant ownership, and guard release clears its hint before mutex release
+so it cannot clear a successor's hint. Queue guards publish
 atomic length/fullness/capacity snapshots before releasing the mutex. Pipe
 payload copies never hold the readiness publication spinlock.
 `FifoHandle::{read_to_user,vmsplice_to_user,write_from_user}` are async operations
@@ -549,9 +556,23 @@ FIFO handle discards queued data and restores the default capacity before a
 new opener can observe the inode. `FifoShared::queue` and `notify_transfer`
 allow anonymous/named transfers to use one ordered transaction.
 
-`PipeBufs` owns a bounded descriptor ring; owned payloads use allocator pages
-with reference-counted descriptors and one reusable drained page. Imported
+`PipeBufs` owns a bounded descriptor ring. Ordinary payload pages have inline
+unique ownership, with no per-page heap allocation for reference metadata.
+`copy_prefix_to(&mut self, ...)` and `move_prefix_to(&mut self, ...)` return
+`Result<usize, u64>`: tee or a partial move promotes unique backing to a shared
+reference only when needed. Promotion allocates before changing the source;
+failure returns `ENOMEM` without losing its page, or an already copied prefix.
+Whole-buffer moves transfer ownership without promotion. Up to two exclusively
+owned drained pages are reusable, matching Linux's bounded `tmp_page` cache;
+the final shared reference recovers unique ownership before reuse. Imported
 buffers carry `UserPagePin` references and cannot acquire append rights.
+`unsafe PipeBufs::write_with_raw` accepts an actor which initializes every
+requested byte on success without reading uninitialized destination RAM or
+retaining its pointer. Fresh full pages skip pre-zeroing and enter the ring
+only after successful complete copy. Failed fresh-page copies are freed and
+never cached; partial fresh pages and every reusable spare remain fully
+initialized for the ordinary slice-based actors. Errors after earlier complete
+buffers return that committed prefix. Packet and merge rules are unchanged.
 `fill_from` implements the single-copy buffered-provider fallback into fresh
 pipe pages. `with_front_raw` exposes a retained pointer only for a callback's
 duration, avoiding Rust references over externally mutable imported pages.

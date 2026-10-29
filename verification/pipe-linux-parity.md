@@ -111,11 +111,29 @@ allocation, shared-memory ownership and scheduler wakeups retain their own
 subsystem synchronization; per-pipe locking is not a claim of an entirely
 lock-free syscall path.
 
+Anonymous/named syscall pipe paths optionally wait up to 32 pauses for short
+mutex ownership before parking. One spinner per queue avoids a stampede;
+its retry refuses queued waiters and still acquires the authoritative sleepable
+mutex. The advisory busy bit never permits payload access. This borrows the
+purpose of Linux's optimistic mutex spinning, with a fixed bound in place of
+Linux's running-owner checks and MCS spinner queue. A preempted or faulting
+owner therefore retains the normal sleepable fallback.
+
 The buffer model removes eager 64-KiB payload allocation per empty pipe and
-payload copies from pipe-to-pipe splice/tee. One exclusively owned drained page
-can be reused for subsequent writes. Vector reads operate on page fragments
+payload copies from pipe-to-pipe splice/tee. Up to two exclusively owned drained
+pages can be reused for subsequent writes, matching Linux's `tmp_page` cache.
+Vector reads operate on page fragments
 without a payload-sized staging allocation. Ordinary and packet pipes share
 the same bounded ring implementation as named FIFOs.
+
+Scalar/vector user writes use guarded raw copies. Fresh full pages skip the
+initial clear, as in Linux's `alloc_page` / `copy_page_from_iter` path. They
+become pipe buffers only after the complete page copy succeeds; an incomplete
+fresh page is freed without entering the ring or spare cache. Partial fresh
+pages and all cached pages remain fully initialized, so safe slice actors can
+continue to use unpublished tails. A failed later page returns the previously
+committed prefix. The `filesystem/pipe` regression covers fresh-page faults,
+cached-page faults, and a raw partial write followed by safe tail merging.
 
 Throughput/latency parity requires the statistical protocol in
 `verification/specification/spec.md` §8. Functional QEMU runtimes are not
