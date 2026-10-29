@@ -72,13 +72,89 @@ kernel_test_in!(
     smoke_oneshot_intx_masks_on_delivery_and_unmasks_after_service
 );
 
-#[cfg(not(target_arch = "x86_64"))]
-fn smoke_oneshot_intx_unsupported_without_ioapic() -> TestResult {
+#[cfg(target_arch = "aarch64")]
+fn smoke_oneshot_spi_masks_on_delivery_and_unmasks_after_service() -> TestResult {
+    use crate::aarch64::gic;
+    use core::sync::atomic::AtomicU32;
+    static WAKES: AtomicU32 = AtomicU32::new(0);
+    WAKES.store(0, Ordering::Release);
+    // A high SPI whose dispatch slot is free (as gic_spi_tests does).
+    let mut bound = None;
+    for intid in (200u32..240).filter(|i| *i < gic::spi_limit()) {
+        let notify: Notify = Arc::new(|| {
+            WAKES.fetch_add(1, Ordering::AcqRel);
+        });
+        // SAFETY: the GIC is initialised at boot; the test owns this SPI.
+        if let Ok(line) = unsafe { Line::bind_spi(intid, "oneshot-spi-test", notify) } {
+            bound = Some(line);
+            break;
+        }
+    }
+    let Some(line) = bound else {
+        return TestResult::Skip("no free SPI dispatch slot");
+    };
+    let intid = line.source();
+    if !matches!(
+        // SAFETY: as above; the slot is already reserved by `line`.
+        unsafe { Line::bind_spi(intid, "oneshot-spi-test-2", Arc::new(|| {})) },
+        Err(Error::Shared)
+    ) {
+        return TestResult::Fail("reserved SPI slot was bound twice");
+    }
+    let wait = |target: u32| {
+        let start = narf_time::Instant::now();
+        while WAKES.load(Ordering::Acquire) < target
+            && narf_time::Instant::now().cycles_since(start) < narf_time::ns_to_cycles(200_000_000)
+        {
+            core::hint::spin_loop();
+        }
+    };
+    let was = narf_arch::interrupts_enabled();
+    // SAFETY: the GIC is initialised and the SPI is ours.
+    unsafe { narf_arch::enable_interrupts() };
+    // Pending while masked: no delivery.
+    let pended = gic::pend_spi(intid).is_ok();
+    wait(1);
+    let quiet = WAKES.load(Ordering::Acquire) == 0 && line.fires() == 0;
+    // Unmask: the pending SPI is delivered once and re-masked by the hard half.
+    line.unmask();
+    wait(1);
+    if !was {
+        // SAFETY: restore the caller's mask.
+        unsafe { narf_arch::disable_interrupts() };
+    }
+    if !pended || !quiet {
+        return TestResult::Fail("masked SPI was delivered");
+    }
+    if line.fires() != 1 || WAKES.load(Ordering::Acquire) != 1 || !line.masked() {
+        return TestResult::Fail("unmasked SPI did not deliver once and re-mask");
+    }
+    let vector = line.vector();
+    drop(line);
+    if !dispatch::installed_handler_names(vector).is_empty()
+        || crate::vector::reserve(vector).is_err()
+    {
+        return TestResult::Fail("drop left the handler or the slot reserved");
+    }
+    let _ = crate::vector::free(vector);
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!(
+    "interrupts",
+    smoke_oneshot_spi_masks_on_delivery_and_unmasks_after_service
+);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_oneshot_intx_gsi_unsupported_without_ioapic() -> TestResult {
     // SAFETY: refused before any controller access.
     match unsafe { Line::bind_exclusive(16, "oneshot-test", Arc::new(|| {})) } {
         Err(Error::Unsupported) => TestResult::Pass,
-        _ => TestResult::Fail("oneshot INTx bound without an IOAPIC"),
+        _ => TestResult::Fail("IOAPIC oneshot bound without an IOAPIC"),
     }
 }
-#[cfg(not(target_arch = "x86_64"))]
-kernel_test_in!("interrupts", smoke_oneshot_intx_unsupported_without_ioapic);
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!(
+    "interrupts",
+    smoke_oneshot_intx_gsi_unsupported_without_ioapic
+);

@@ -239,7 +239,14 @@ still-asserted line is delivered again. Mask transitions are serialized
 under an IRQ-safe lock, so an unmask cannot race a fresh delivery. `Drop`
 masks the route, removes and synchronizes the handler and frees the vector.
 Only exclusive GSIs are supported (masking a line shared with synchronous
-handlers would stall them). Other architectures return `Error::Unsupported`.
+handlers would stall them). On aarch64, `unsafe Line::bind_spi(intid, name,
+notify)` is the GIC backend: SPI INTIDs below 256 only (dispatch slots are
+`INTID & 0xff`), a reserved slot refuses with `Error::Shared`, the SPI is
+configured level-triggered and masked before the handler is installed, and
+the hard half masks it with ICENABLER (lock-free). EOI also deactivates
+(EOImode 0), so a level SPI masked before EOI stays pending and is delivered
+on unmask. Each constructor returns `Error::Unsupported` on the other
+architecture.
 
 ## 4. Invariants & safety properties
 
@@ -510,8 +517,9 @@ the rest of the cap bundle.
   redistributor lookup by `GICR_TYPER` affinity on multi-cluster v3
   silicon, and GICv2m MSI frames for PCIe on IPQ parts.
 
-- **aarch64 PCI INTx.** No PCI INTx-to-SPI (`interrupt-map`) routing
-  exists, so `oneshot::Line` is x86_64-only; aarch64 INTx clients poll.
+- **aarch64 PCI INTx behind bridges.** `firmware/fdt::pci::intx_route`
+  resolves root-bus functions only; bridge swizzle and nested
+  `interrupt-map` nexus nodes remain open.
 - **Shared oneshot lines.** A per-GSI registry with a mask refcount would
   let oneshot owners share a level line with each other (Linux requires
   matching `IRQF_ONESHOT` across sharers).
