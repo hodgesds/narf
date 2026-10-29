@@ -2973,19 +2973,8 @@ fn do_execve_resolved(
         drop(argv_strs);
         drop(envp_strs);
         drop(path_owned);
-        let _ = new_as.activate();
-        // Exec page-in clustering (#740): the new root is live on this
-        // CPU now — the bulk batch's contract — and the exec is long
-        // past its point of no return, so the advisory batch runs here:
-        // pages it installs are resident at first touch instead of
-        // faulting, and any page it skips faults exactly as it would
-        // have without the cluster. The installed count is deliberately
-        // discarded, and the plan is dropped by hand right after use,
-        // like every heap local on this diverging path.
-        // SAFETY: activate() above made `new_as` the live root, and
-        // the plan came from loading the image mapped in it.
-        unsafe { crate::loader::page_in_plan(&new_as, &page_in_plan) };
-        drop(page_in_plan);
+        narf_lib::sync::without_interrupts(|| {
+            let _ = new_as.activate();
         // Publish the new CR3 so a later preempt/park resume re-activates the
         // post-execve AS (not the pre-execve one) — see set_current_user_cr3.
         #[cfg(target_arch = "x86_64")]
@@ -3006,6 +2995,20 @@ fn do_execve_resolved(
                 "own-stack exec lost its published x86 FPU image"
             );
         }
+        });
+        // Exec page-in clustering (#740): the new root is live on this
+        // CPU and published for scheduler resumes before any I/O can
+        // park this task — the bulk batch's contract. The exec is long
+        // past its point of no return, so the advisory batch runs here:
+        // pages it installs are resident at first touch instead of
+        // faulting, and any page it skips faults exactly as it would
+        // have without the cluster. The installed count is deliberately
+        // discarded, and the plan is dropped by hand right after use,
+        // like every heap local on this diverging path.
+        // SAFETY: activate() above made `new_as` the live root, and
+        // the plan came from loading the image mapped in it.
+        unsafe { crate::loader::page_in_plan(&new_as, &page_in_plan) };
+        drop(page_in_plan);
         #[cfg(target_arch = "x86_64")]
         if let Some(fb) = fs_base {
             // SAFETY: canonical user vaddr from the new image's TLS staging.
