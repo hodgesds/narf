@@ -769,7 +769,9 @@ impl core::fmt::Debug for FrameBacking {
 }
 
 impl FrameBacking {
-    /// Publish WB CPU stores to firmware DMA, including non-LLC discrete GPUs.
+    /// Clean/invalidate exclusive WB backing for one-shot firmware DMA.
+    /// After a device write this is valid only if the CPU has not dirtied any
+    /// line since the pre-DMA clean. It does not make live CT memory coherent.
     pub(crate) fn publish_for_device(&self) -> bool {
         compiler_fence(Ordering::SeqCst);
         #[cfg(target_arch = "x86_64")]

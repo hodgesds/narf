@@ -267,7 +267,7 @@ concurrent CT coherence. `GpuBacking::coherent_for_device` defaults false.
 MMIO owner into the CT transport; discrete transport construction additionally
 requires a backing that explicitly guarantees coherent shared cache lines.
 The existing WB FrameBacking cannot admit discrete CT. A coherent discrete
-mapping/VRAM allocator, full GT/MOCS/IRQ ownership, hardware configuration and
+mapping/VRAM allocator, full GT/MOCS/IRQ ownership, active topology and
 submission contexts remain integration requirements.
 
 `intel_gpu_guc_gt::GuCGt::stage` owns the staged firmware bootstrap and its
@@ -299,9 +299,40 @@ retain the entire allocator/MMIO/bootstrap/CT object graph, preserving the
 wake request while DMA lifetime is uncertain. `release_after_gt_reset` is an
 unsafe escape requiring the PCI owner's external full-reset proof covering
 all owned DMA addresses and the wake request. Runtime idle, per-card probe
-installation, MOCS programming, hardware configuration and GuC context
+installation, MOCS programming, active topology and GuC context
 scheduling remain separate integration work; this owner does not publish
 userspace engines or enable EXECBUFFER2.
+
+`GuCGt::begin_hwconfig` retrieves the firmware HWCONFIG table while GuC is
+`Ready`, before CT owns the graphics MMIO mailbox. It sends GET_HWCONFIG
+0x4100 with zero address/size, bounds the returned byte count to 12..=1 MiB
+and dword alignment, allocates a separate GGTT destination above WOPCM,
+checks non-overlap, zeroes/cache-cleans it, invalidates the platform GuC TLB,
+then sends its address and exact length. Sizing/copying are bounded mailbox
+states; BUSY/RETRY cannot extend deadlines. Other CT/discovery operations
+cannot interleave. Any nonnegative copy reply completes the action, as in
+Linux; an all-ones scratch read is unavailable hardware, never success.
+
+`BootAllocator::sync_for_cpu` defaults to refusal. The SharedArena adapter
+cleans/invalidates the exclusive destination after the reply, using the
+existing architecture primitives. No CPU write occurs between the pre-DMA
+clean and post-DMA invalidation, so dirty CPU data cannot overwrite firmware
+output. It copies exact response bytes into an immutable `HardwareConfig`
+before publishing `GuCGt::hwconfig()`. The GGTT destination remains with the
+bootstrap until verified stop, including after successful acquisition.
+Timeout, cache failure, wake loss, malformed output, cancellation and
+unverified drop cannot release a possibly live DMA destination; late replies
+cannot revive a lost owner. The snapshot remains readable after stop.
+
+`intel_gpu_hwconfig::HardwareConfig::parse` validates KLV key/length/value
+records with dword lengths, nonempty values, checked extents, no trailing
+fragments, at most 4096 entries and unique keys. These are admission limits,
+not hardware ABI maxima. `as_bytes` preserves firmware order and unknown
+keys/vector values; the separate lookup index is sorted. `value_bytes`
+returns the exact value span, and `lookup_u32` returns only scalar values,
+distinguishing absent and nonscalar entries. Maximum capability values are
+not active/fused topology. HWCONFIG is not yet installed into per-card DRM
+queries, and its availability does not advertise userspace engines.
 
 `intel_gpu_guc_transport::XeLpgTransport` owns one six-page coherent GGTT
 allocation (H2G descriptor at 0, G2H at 0x800, 4-KiB send ring at 0x1000,

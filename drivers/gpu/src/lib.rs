@@ -730,6 +730,8 @@ pub mod intel_gpu_guc_transport;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_hdmi;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_hwconfig;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_media;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_modeset;

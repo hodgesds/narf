@@ -10,6 +10,7 @@ use crate::intel_gpu_gt::{GtPlatform, GUC_GGTT_MIN};
 use crate::intel_gpu_guc::CssImage;
 use crate::intel_gpu_guc_firmware::GuCFirmware;
 use crate::intel_gpu_guc_transport::{TransportError, XeLpgTransport};
+use crate::intel_gpu_hwconfig::{HardwareConfig, HwconfigError};
 use crate::intel_gpu_rcs::{GpuAllocator, GpuBacking, SubmitError};
 use alloc::vec::Vec;
 use core::mem::ManuallyDrop;
@@ -24,6 +25,18 @@ const ADS_PRIVATE: u32 = 0x6000;
 const LOG_BYTES: u32 = 0x115000; // state page + 16K crash + 64K events + 1M capture
 const POLICIES: u64 = 0x11dc;
 const SYSINFO: u64 = 0x123c;
+
+fn invalidate_guc_tlb(mmio: &impl MmioWindow, platform: GtPlatform) {
+    let _ = mmio.read32(0x1901f8);
+    if platform == GtPlatform::Battlemage {
+        mmio.write32(0xcf80, 1 << 6);
+        mmio.write32(0xcf7c, 1);
+        let _ = mmio.read32(0xcf7c);
+    } else {
+        mmio.write32(0xcee8, 1);
+        let _ = mmio.read32(0xcee8);
+    }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BootError {
@@ -42,6 +55,7 @@ pub enum BootError {
     Poisoned,
     Firmware { status: u32 },
     Transport(TransportError),
+    Hwconfig(HwconfigError),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -60,6 +74,13 @@ pub enum BootState {
 /// stores. Discrete GPUs cannot inherit an integrated-GPU LLC assumption.
 pub trait BootAllocator: GpuAllocator {
     fn sync_for_device(&mut self, backing: &Self::Backing) -> Result<(), BootError>;
+
+    /// Invalidate possible clean speculative CPU fills after exclusive device
+    /// writes have completed. No CPU writes may occur between the two syncs.
+    /// Default refusal prevents mistaking a one-way DMA adapter for a reader.
+    fn sync_for_cpu(&mut self, _backing: &Self::Backing) -> Result<(), BootError> {
+        Err(BootError::Cache)
+    }
 }
 
 impl BootAllocator for crate::intel_gpu_rcs::SharedArena {
@@ -69,6 +90,12 @@ impl BootAllocator for crate::intel_gpu_rcs::SharedArena {
         } else {
             Err(BootError::Cache)
         }
+    }
+
+    fn sync_for_cpu(&mut self, backing: &Self::Backing) -> Result<(), BootError> {
+        // This destination was cleaned before publication and is CPU-read-only
+        // afterwards, so no dirty CPU line can overwrite the device response.
+        self.sync_for_device(backing)
     }
 }
 
@@ -117,17 +144,26 @@ impl WopcmLayout {
     }
 }
 
+struct HwconfigDma<B: GpuBacking> {
+    backing: B,
+    bytes: u32,
+}
+
 struct Resources<A: BootAllocator> {
     allocator: A,
     image: A::Backing,
     ads: A::Backing,
     logs: A::Backing,
+    hwconfig: Option<HwconfigDma<A::Backing>>,
 }
 impl<A: BootAllocator> Resources<A> {
     fn free(mut self) {
         self.allocator.free(self.image);
         self.allocator.free(self.ads);
         self.allocator.free(self.logs);
+        if let Some(output) = self.hwconfig {
+            self.allocator.free(output.backing);
+        }
     }
 }
 
@@ -140,6 +176,7 @@ pub struct GuCBoot<M: MmioWindow, A: BootAllocator> {
     state: BootState,
     deadline: u64,
     released: bool,
+    hwconfig: Option<HardwareConfig>,
 }
 
 impl<M: MmioWindow, A: BootAllocator> core::fmt::Debug for GuCBoot<M, A> {
@@ -277,6 +314,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                 image: backing,
                 ads,
                 logs,
+                hwconfig: None,
             }),
             platform,
             config,
@@ -284,6 +322,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             state: BootState::Staged,
             deadline: 0,
             released: false,
+            hwconfig: None,
         })
     }
 
@@ -297,6 +336,65 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
 
     pub(crate) fn window(&self) -> &M {
         &self.mmio
+    }
+
+    pub(crate) fn hwconfig(&self) -> Option<&HardwareConfig> {
+        self.hwconfig.as_ref()
+    }
+
+    pub(crate) fn prepare_hwconfig(&mut self, bytes: u32) -> Result<u32, BootError> {
+        if self.state != BootState::Ready || self.resources.hwconfig.is_some() {
+            return Err(BootError::State);
+        }
+        self.awake()?;
+        crate::intel_gpu_hwconfig::validate_size(bytes).map_err(BootError::Hwconfig)?;
+        let pages = bytes.div_ceil(PAGE);
+        let r = &mut *self.resources;
+        let backing = r.allocator.alloc(pages).map_err(BootError::Allocation)?;
+        let base = backing.ggtt_offset();
+        let checked = extent(&backing, pages).and_then(|()| {
+            if [&r.image, &r.ads, &r.logs].iter().any(|old| {
+                (base as u64) < old.ggtt_offset() as u64 + old.size_pages() as u64 * 4096
+                    && (old.ggtt_offset() as u64) < base as u64 + pages as u64 * 4096
+            }) {
+                Err(BootError::Address)
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = checked {
+            r.allocator.free(backing);
+            return Err(error);
+        }
+        backing.zero_fill();
+        if let Err(error) = r.allocator.sync_for_device(&backing) {
+            r.allocator.free(backing);
+            return Err(error);
+        }
+        // The buffer stays with the bootstrap through timeout, cancellation
+        // and unverified drop. A mailbox reply never owns its lifetime.
+        r.hwconfig = Some(HwconfigDma { backing, bytes });
+        invalidate_guc_tlb(&self.mmio, self.platform);
+        Ok(base)
+    }
+
+    pub(crate) fn finish_hwconfig(&mut self) -> Result<(), BootError> {
+        if self.state != BootState::Ready || self.hwconfig.is_some() {
+            return Err(BootError::State);
+        }
+        self.awake()?;
+        let r = &mut *self.resources;
+        let output = r.hwconfig.as_ref().ok_or(BootError::State)?;
+        r.allocator.sync_for_cpu(&output.backing)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(output.bytes as usize)
+            .map_err(|_| BootError::Hwconfig(HwconfigError::Allocation))?;
+        for offset in (0..u64::from(output.bytes)).step_by(4) {
+            bytes.extend_from_slice(&output.backing.read32(offset).to_le_bytes());
+        }
+        self.hwconfig = Some(HardwareConfig::parse(bytes).map_err(BootError::Hwconfig)?);
+        Ok(())
     }
 
     /// ADS/private/log memory remains owned for the entire GuC lifetime.
@@ -420,16 +518,8 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         self.mmio.write32(0xa168, power_mask & !(1 << 9));
         // Posted-read barrier for newly installed GGTT entries, then the
         // platform's GuC TLB invalidation path, as xe_ggtt/xe_guc_tlb_inval.
-        let _ = self.mmio.read32(0x1901f8);
-        if self.platform == GtPlatform::Battlemage {
-            self.mmio.write32(0xcf80, 1 << 6);
-            self.mmio.write32(0xcf7c, 1);
-            let _ = self.mmio.read32(0xcf7c);
-        } else {
-            self.mmio.write32(0xcee8, 1);
-            let _ = self.mmio.read32(0xcee8);
-        }
         let image = r.image.ggtt_offset();
+        invalidate_guc_tlb(&self.mmio, self.platform);
         self.mmio.write32(0xc200, image + self.upload);
         self.mmio.write32(0xc300, image);
         self.mmio.write32(0xc304, 8 << 16);
@@ -592,7 +682,7 @@ mod tests {
     use super::*;
     use alloc::collections::{BTreeMap, BTreeSet};
     use alloc::rc::Rc;
-    use core::cell::RefCell;
+    use core::cell::{Cell, RefCell};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     type Words = Rc<RefCell<Vec<u32>>>;
@@ -606,6 +696,9 @@ mod tests {
         allocations: usize,
         fail_at: Option<usize>,
         fail_sync: bool,
+        fail_cpu_sync: bool,
+        cpu_ready: BTreeMap<u32, Rc<Cell<bool>>>,
+        cpu_synced: BTreeSet<u32>,
         reject_wopcm: bool,
         coherent: bool,
     }
@@ -639,6 +732,7 @@ mod tests {
         base: u32,
         words: Words,
         coherent: bool,
+        cpu_ready: Rc<Cell<bool>>,
     }
     impl GpuBacking for Backing {
         fn ggtt_offset(&self) -> u32 {
@@ -648,9 +742,17 @@ mod tests {
             self.words.borrow().len() as u32 / 1024
         }
         fn read32(&self, at: u64) -> u32 {
+            assert!(
+                self.cpu_ready.get(),
+                "CPU read before device-write synchronization"
+            );
             self.words.borrow()[at as usize / 4]
         }
         fn write32(&self, at: u64, word: u32) {
+            assert!(
+                self.cpu_ready.get(),
+                "CPU write during exclusive device DMA"
+            );
             self.words.borrow_mut()[at as usize / 4] = word;
         }
         fn coherent_for_device(&self) -> bool {
@@ -670,15 +772,20 @@ mod tests {
             let base = device.next;
             device.next += pages * 4096;
             let words = Rc::new(RefCell::new(alloc::vec![0;pages as usize*1024]));
+            let cpu_ready = Rc::new(Cell::new(true));
+            device.cpu_ready.insert(base, cpu_ready.clone());
             device.memory.insert(base, words.clone());
             Ok(Backing {
                 base,
                 words,
                 coherent: device.coherent,
+                cpu_ready,
             })
         }
         fn free(&mut self, backing: Backing) {
-            self.0.borrow_mut().memory.remove(&backing.base);
+            let mut device = self.0.borrow_mut();
+            device.memory.remove(&backing.base);
+            device.cpu_ready.remove(&backing.base);
         }
         fn live_allocations(&self) -> usize {
             self.0.borrow().memory.len()
@@ -699,6 +806,16 @@ mod tests {
                 return Err(BootError::Cache);
             }
             device.synced.insert(backing.base);
+            Ok(())
+        }
+
+        fn sync_for_cpu(&mut self, backing: &Backing) -> Result<(), BootError> {
+            let mut device = self.0.borrow_mut();
+            if device.fail_cpu_sync {
+                return Err(BootError::Cache);
+            }
+            backing.cpu_ready.set(true);
+            device.cpu_synced.insert(backing.base);
             Ok(())
         }
     }
@@ -1345,5 +1462,245 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_guc_gt",
         smoke_gt_platform_ack_and_discrete_coherence
+    );
+
+    fn hwconfig_device_write(window: &Window, words: &[u32]) -> u32 {
+        let device = window.0.borrow();
+        let base = *device.regs.get(&0x190244).unwrap();
+        assert!(device.synced.contains(&base));
+        device.memory.get(&base).unwrap().borrow_mut()[..words.len()].copy_from_slice(words);
+        device.cpu_ready.get(&base).unwrap().set(false);
+        base
+    }
+
+    fn hwconfig_stop(gt: &mut GuCGt<Window, Arena>, window: &Window, ack: u64) {
+        gt.begin_stop(20_000_000).unwrap();
+        assert!(gt.poll(20_000_001).is_pending());
+        reset_done(window);
+        window.0.borrow_mut().regs.insert(0xc314, 1);
+        assert!(gt.poll(20_000_002).is_pending());
+        window.0.borrow_mut().regs.insert(0xc314, 0);
+        assert!(gt.poll(20_000_003).is_pending());
+        window.0.borrow_mut().regs.insert(ack, 0);
+        assert_eq!(gt.poll(20_000_004), Poll::Ready(Ok(GtState::Stopped)));
+    }
+
+    fn smoke_hwconfig_snapshot_and_ct_handoff() -> TestResult {
+        for (platform, ack) in [
+            (
+                GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
+                0xdfc,
+            ),
+            (GtPlatform::Alchemist, 0x130044),
+            (GtPlatform::Battlemage, 0xdfc),
+        ] {
+            let (window, arena, mut gt) = gt_model(platform, ack);
+            gt_ready(&mut gt, &window, ack);
+            assert!(gt.hwconfig().is_none());
+            gt.begin_hwconfig(6).unwrap();
+            assert_eq!(gt.begin_ct(6), Err(GtError::State));
+            {
+                let d = window.0.borrow();
+                for (reg, value) in [
+                    (0x190240, 0x4100),
+                    (0x190244, 0),
+                    (0x190248, 0),
+                    (0x19024c, 0),
+                ] {
+                    assert_eq!(d.regs.get(&reg), Some(&value));
+                }
+            }
+            window.0.borrow_mut().regs.insert(0x190240, 0xf0000020);
+            assert!(gt.poll(7).is_pending());
+            assert_eq!(gt.state(), GtState::CopyingHwconfig);
+            assert_eq!(arena.live_allocations(), 4);
+            let base = hwconfig_device_write(
+                &window,
+                &[0x9000, 3, 0x00ffffff, 0xffffffff, 0xff000000, 7, 1, 8],
+            );
+            assert_eq!(base, 0x2011d000);
+            {
+                let d = window.0.borrow();
+                let tlb_reg = if platform == GtPlatform::Battlemage {
+                    0xcf7c
+                } else {
+                    0xcee8
+                };
+                assert_eq!(
+                    d.writes
+                        .iter()
+                        .filter(|(reg, value)| *reg == tlb_reg && *value == 1)
+                        .count(),
+                    2
+                );
+                let invalidate = d
+                    .writes
+                    .iter()
+                    .rposition(|(reg, _)| *reg == tlb_reg)
+                    .unwrap();
+                let notify = d
+                    .writes
+                    .iter()
+                    .rposition(|pair| *pair == (0x1901f0, 1))
+                    .unwrap();
+                assert!(invalidate < notify);
+            }
+            assert_eq!(window.0.borrow().regs.get(&0x19024c), Some(&32));
+            assert!(gt.hwconfig().is_none());
+            assert!(!window.0.borrow().cpu_synced.contains(&base));
+            // Linux accepts any nonnegative copy reply, not just zero.
+            window.0.borrow_mut().regs.insert(0x190240, 0xf0000007);
+            assert_eq!(gt.poll(8), Poll::Ready(Ok(GtState::Ready)));
+            assert!(window.0.borrow().cpu_synced.contains(&base));
+            let table = gt.hwconfig().unwrap();
+            assert_eq!(table.as_bytes().len(), 32);
+            assert_eq!(table.lookup_u32(7), Ok(Some(8)));
+            assert_eq!(table.lookup_u32(0x9000), Err(HwconfigError::NotScalar));
+            window.0.borrow().memory.get(&base).unwrap().borrow_mut()[7] = 99;
+            assert_eq!(gt.hwconfig().unwrap().lookup_u32(7), Ok(Some(8)));
+            assert_eq!(gt.begin_hwconfig(9), Err(GtError::State));
+            gt.begin_ct(9).unwrap();
+            for i in 0..6 {
+                window.0.borrow_mut().regs.insert(0x190240, 0xf0000001);
+                assert!(gt.poll(10 + i).is_pending());
+            }
+            window.0.borrow_mut().regs.insert(0x190240, 0xf0000000);
+            assert_eq!(gt.poll(16), Poll::Ready(Ok(GtState::CtReady)));
+            assert_eq!(gt.begin_hwconfig(17), Err(GtError::State));
+            assert_eq!(arena.live_allocations(), 5);
+            hwconfig_stop(&mut gt, &window, ack);
+            assert_eq!(arena.live_allocations(), 4);
+            assert_eq!(gt.hwconfig().unwrap().lookup_u32(7), Ok(Some(8)));
+            drop(gt);
+            assert_eq!(arena.live_allocations(), 0);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_hwconfig",
+        smoke_hwconfig_snapshot_and_ct_handoff
+    );
+
+    fn smoke_hwconfig_size_and_allocation_rollback() -> TestResult {
+        for failure in 0..6 {
+            let (window, arena, mut gt) = gt_model(GtPlatform::Alchemist, 0x130044);
+            gt_ready(&mut gt, &window, 0x130044);
+            gt.begin_hwconfig(6).unwrap();
+            let size = match failure {
+                0 => 0,
+                1 => 14,
+                2 => 0x100004,
+                _ => 12,
+            };
+            {
+                let mut d = window.0.borrow_mut();
+                match failure {
+                    3 => d.fail_at = Some(d.allocations + 1),
+                    4 => d.fail_sync = true,
+                    5 => d.next = 0x7ff000,
+                    _ => {}
+                }
+                d.regs.insert(0x190240, 0xf0000000 | size);
+            }
+            assert!(matches!(gt.poll(7), Poll::Ready(Err(_))));
+            assert_eq!(gt.state(), GtState::Lost);
+            assert!(gt.hwconfig().is_none());
+            assert_eq!(arena.live_allocations(), 3);
+            // No failing destination was ever published to firmware.
+            assert_eq!(window.0.borrow().regs.get(&0x190244), Some(&0));
+            hwconfig_stop(&mut gt, &window, 0x130044);
+            drop(gt);
+            assert_eq!(arena.live_allocations(), 0);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_hwconfig",
+        smoke_hwconfig_size_and_allocation_rollback
+    );
+
+    fn smoke_hwconfig_copy_faults_retain_dma() -> TestResult {
+        for failure in 0..6 {
+            let (window, arena, mut gt) = gt_model(GtPlatform::Battlemage, 0xdfc);
+            gt_ready(&mut gt, &window, 0xdfc);
+            gt.begin_hwconfig(6).unwrap();
+            window.0.borrow_mut().regs.insert(0x190240, 0xf000000c);
+            assert!(gt.poll(7).is_pending());
+            let words = if failure == 2 { [7, 2, 8] } else { [7, 1, 8] };
+            let base = hwconfig_device_write(&window, &words);
+            let response = match failure {
+                1 => 0xe0000001,
+                5 => u32::MAX,
+                _ => 0xf0000000,
+            };
+            window.0.borrow_mut().regs.insert(0x190240, response);
+            if failure == 3 {
+                window.0.borrow_mut().fail_cpu_sync = true;
+            }
+            if failure == 4 {
+                window.0.borrow_mut().regs.insert(0xdfc, 0);
+            }
+            let now = if failure == 0 { 10_000_007 } else { 8 };
+            assert!(matches!(gt.poll(now), Poll::Ready(Err(_))));
+            assert_eq!(gt.state(), GtState::Lost);
+            assert!(gt.hwconfig().is_none());
+            assert_eq!(arena.live_allocations(), 4);
+            if failure != 2 {
+                assert!(!window.0.borrow().cpu_synced.contains(&base));
+            }
+            window.0.borrow_mut().regs.insert(0xdfc, 1);
+            window.0.borrow_mut().regs.insert(0x190240, 0xf0000000);
+            assert_eq!(gt.poll(now + 1), Poll::Ready(Err(GtError::Poisoned)));
+            hwconfig_stop(&mut gt, &window, 0xdfc);
+            drop(gt);
+            assert_eq!(arena.live_allocations(), 0);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_hwconfig",
+        smoke_hwconfig_copy_faults_retain_dma
+    );
+
+    fn smoke_hwconfig_cancelled_wait_and_last_owner() -> TestResult {
+        use core::future::Future;
+        use core::task::{Context, Waker};
+        for copying in [false, true] {
+            let (window, arena, mut gt) = gt_model(GtPlatform::Alchemist, 0x130044);
+            gt_ready(&mut gt, &window, 0x130044);
+            let now = u64::MAX - 100_000_000;
+            gt.begin_hwconfig(now).unwrap();
+            if copying {
+                window.0.borrow_mut().regs.insert(0x190240, 0xf000000c);
+                assert!(gt.poll(now + 1).is_pending());
+            }
+            let state = gt.state();
+            {
+                let mut waiting = core::pin::pin!(gt.wait());
+                assert!(waiting
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending());
+            }
+            assert_eq!(gt.state(), state);
+            assert!(gt.hwconfig().is_none());
+            if copying {
+                let weak = Rc::downgrade(&window.0);
+                drop(window);
+                drop(arena);
+                drop(gt);
+                let retained = weak.upgrade().expect("quarantined HWCONFIG destination");
+                assert_eq!(retained.borrow().memory.len(), 4);
+            } else {
+                hwconfig_stop(&mut gt, &window, 0x130044);
+                drop(gt);
+                assert_eq!(arena.live_allocations(), 0);
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_hwconfig",
+        smoke_hwconfig_cancelled_wait_and_last_owner
     );
 }

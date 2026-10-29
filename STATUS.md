@@ -977,14 +977,26 @@ MTL/Arrow and BMG use 0xdfc, while DG2 uses 0x130044. The owner preserves other
 requestors, bounds wake waits, blocks admission after wake/CT loss, and
 retires CT only after GuC reset plus firmware DMA idle before releasing wake.
 Cancelled waiters and uncertain drops retain the owned resources. Per-card
-PCI/runtime-PM wiring, MOCS, runtime idle, HWCONFIG and GuC context scheduling
+PCI/runtime-PM wiring, MOCS, runtime idle and GuC context scheduling
 remain open; userspace submission remains disabled.
 
-The GuC bootstrap/GT follow-up passes 230 selected native GPU/DRM tests on
-x86_64 and 113 on aarch64, with zero failures/skips, including five bootstrap
-and five GT-owner smokes covering platform ACKs, wake ownership, DMA stop,
-CT faults, wait cancellation and last-owner quarantine. GT/firmware-profile
-identity coverage, the existing 25 RCS and six CT-owner smokes also pass.
+HWCONFIG discovery now uses the source-defined zero-address size query and
+GGTT copy through the GT owner's bounded MMIO mailbox before CT enablement.
+The destination is cache-cleaned before DMA and synchronized before CPU
+reads. Its exact KLV bytes are validated into an immutable snapshot while
+the DMA backing stays owned through verified stop. Malformed lengths,
+duplicate keys, cache failures, wake loss, timeouts and all-ones register
+reads fail acquisition without releasing uncertain DMA resources. Unknown
+keys and vectors are retained; capability maxima are not active topology.
+Per-card DRM query publication remains part of probe integration.
+
+The GuC bootstrap/GT/HWCONFIG follow-up passes 235 selected native GPU/DRM
+tests on x86_64 and 118 on aarch64, with zero failures/skips, including five
+bootstrap, five GT-owner and five HWCONFIG smokes covering platform ACKs,
+wake ownership, DMA stop, CT faults, KLV bounds, cache synchronization,
+allocation rollback, wait cancellation and last-owner quarantine.
+GT/firmware-profile identity coverage, the existing 25 RCS and six CT-owner
+smokes also pass.
 GPU CI Clippy passes all three
 resolved feature contexts on both targets; host all-target Clippy passes
 default, Intel-only, AMD-only and no-vendor configurations. Intel-only debug

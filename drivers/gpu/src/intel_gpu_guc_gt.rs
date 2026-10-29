@@ -10,7 +10,8 @@ use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_guc::GuCMessage;
 use crate::intel_gpu_guc_boot::{BootAllocator, BootConfig, BootError, BootState, GuCBoot};
 use crate::intel_gpu_guc_firmware::GuCFirmware;
-use crate::intel_gpu_guc_transport::{TransportError, TransportState, XeLpgTransport};
+use crate::intel_gpu_guc_transport::{Mailbox, TransportError, TransportState, XeLpgTransport};
+use crate::intel_gpu_hwconfig::HardwareConfig;
 use core::mem::ManuallyDrop;
 use core::task::Poll;
 
@@ -23,6 +24,8 @@ pub enum GtState {
     Waking,
     Booting,
     Ready,
+    SizingHwconfig,
+    CopyingHwconfig,
     EnablingCt,
     CtReady,
     Recovering,
@@ -47,6 +50,7 @@ pub enum GtError {
 struct Parts<M: MmioWindow, A: BootAllocator> {
     boot: GuCBoot<M, A>,
     ct: Option<XeLpgTransport<M, A>>,
+    discovery_mailbox: Option<Mailbox<M>>,
 }
 
 /// The sole owner of the GT kernel-request bit and graphics-GuC mailbox.
@@ -84,7 +88,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     pub(crate) fn from_staged(boot: GuCBoot<M, A>) -> Self {
         assert_eq!(boot.state(), BootState::Staged);
         Self {
-            parts: ManuallyDrop::new(Parts { boot, ct: None }),
+            parts: ManuallyDrop::new(Parts {
+                boot,
+                ct: None,
+                discovery_mailbox: None,
+            }),
             state: GtState::Staged,
             deadline: 0,
             requested: false,
@@ -94,6 +102,34 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
 
     pub fn state(&self) -> GtState {
         self.state
+    }
+
+    /// Last validated firmware table. It describes hardware capabilities, not
+    /// active engine/fuse masks or permission to admit userspace submissions.
+    pub fn hwconfig(&self) -> Option<&HardwareConfig> {
+        self.parts.boot.hwconfig()
+    }
+
+    /// Issue the zero-address size query before CT owns the MMIO mailbox.
+    /// Exactly one table may be acquired per bootstrap lifetime.
+    pub fn begin_hwconfig(&mut self, now: u64) -> Result<(), GtError>
+    where
+        M: Clone,
+    {
+        if self.state != GtState::Ready || self.parts.ct.is_some() || self.hwconfig().is_some() {
+            return Err(GtError::State);
+        }
+        if let Err(error) = self.awake() {
+            self.state = GtState::Lost;
+            return Err(error);
+        }
+        let mut mailbox = Mailbox::new(self.parts.boot.window().clone());
+        if let Err(error) = mailbox.begin(&[0x4100, 0, 0, 0], now) {
+            return Err(GtError::Transport(error));
+        }
+        self.parts.discovery_mailbox = Some(mailbox);
+        self.state = GtState::SizingHwconfig;
+        Ok(())
     }
 
     fn read_ack(&self) -> Result<u32, GtError> {
@@ -259,6 +295,38 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         }
         self.awake()?;
         match self.state {
+            GtState::SizingHwconfig | GtState::CopyingHwconfig => {
+                let response = match self
+                    .parts
+                    .discovery_mailbox
+                    .as_mut()
+                    .expect("discovery mailbox")
+                    .poll(now)
+                {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(GtError::Transport(error))),
+                    Poll::Ready(Ok(value)) => value,
+                };
+                if self.state == GtState::SizingHwconfig {
+                    let base = self
+                        .parts
+                        .boot
+                        .prepare_hwconfig(response)
+                        .map_err(GtError::Boot)?;
+                    self.parts
+                        .discovery_mailbox
+                        .as_mut()
+                        .expect("discovery mailbox")
+                        .begin(&[0x4100, base, 0, response], now)
+                        .map_err(GtError::Transport)?;
+                    self.state = GtState::CopyingHwconfig;
+                    return Poll::Pending;
+                }
+                // As in Linux, any nonnegative copy response is successful;
+                // its payload is not a second length negotiation.
+                self.parts.boot.finish_hwconfig().map_err(GtError::Boot)?;
+                self.state = GtState::Ready;
+            }
             GtState::Booting => match self.parts.boot.poll(now) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(GtError::Boot(error))),
@@ -358,7 +426,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     pub unsafe fn release_after_gt_reset(mut self) {
         self.released = true;
         // SAFETY: consumed once under the caller's full-reset proof.
-        let Parts { boot, ct } = unsafe { ManuallyDrop::take(&mut self.parts) };
+        let Parts { boot, ct, .. } = unsafe { ManuallyDrop::take(&mut self.parts) };
         if let Some(ct) = ct {
             // SAFETY: the caller's proof covers this owned CT allocation.
             unsafe { ct.release_after_reset() };

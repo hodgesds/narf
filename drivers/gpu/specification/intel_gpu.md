@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.13** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.14** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -1488,6 +1488,7 @@ advertised. Gen12 production execlists helpers no longer admit Meteor/Arrow
 Lake merely because those devices have a region map. Per-card GT/GuC integration,
 context registration, scheduling, completion and hardware reset ownership remain
 outstanding.
+
 `intel_gpu_guc` now supplies validated CSS component ranges and coherent CTB
 send/receive primitives. `intel_gpu_guc_firmware` acquires a bounded immutable
 MTL/Arrow, DG2 or BMG GuC-70 image through invoked registry/blob capabilities,
@@ -1522,6 +1523,19 @@ unverified drop retains the whole allocator/MMIO object graph. The owner is
 terminal after stop, and its reset proof does not cover render jobs. Per-card
 PCI/runtime-PM installation, MOCS, runtime idle and context scheduling remain
 outstanding.
+
+Before CT enablement, `GuCGt::begin_hwconfig` performs the source-defined
+GET_HWCONFIG size query and GGTT copy through the same bounded MMIO mailbox
+protocol. The destination is zeroed, cache-cleaned and GuC-TLB-invalidated
+before publication, then synchronized for CPU reads after the copy reply.
+All-ones scratch reads are rejected as unavailable hardware. A validated
+immutable `intel_gpu_hwconfig::HardwareConfig` preserves exact KLV bytes,
+unknown keys and vector values; scalar lookups reject vectors and duplicate
+keys/invalid extents fail acquisition. The DMA destination remains owned
+until verified stop, including on timeout, cancellation or cache failure.
+The snapshot is capability data, not an active engine/fuse inventory, and
+does not open the userspace submission gate. Per-card DRM query publication
+still requires probe integration.
 
 Gen12 owned resident submission, cache-flushed
 post-sync breadcrumbs, terminal fences and loss retention now have native
@@ -1560,7 +1574,8 @@ Primary references:
 GuC bootstrap and discrete identity were cross-checked against the local Linux
 checkout at `b90c984d615e8ce2af96f5b1411a962d83fed2ad`: MIT-licensed
 `include/drm/intel/pciids.h`, `drivers/gpu/drm/xe/{xe_uc_fw.c,xe_guc.c,xe_wopcm.c,
-xe_guc_ads.c,xe_guc_fwif.h,xe_guc_tlb_inval.c,xe_ggtt.c,xe_force_wake.c}` and
+xe_guc_ads.c,xe_guc_fwif.h,xe_guc_tlb_inval.c,xe_ggtt.c,xe_force_wake.c,
+xe_guc_hwconfig.c}`, `drivers/gpu/drm/i915/gt/uc/intel_guc_hwconfig.c` and
 `drivers/gpu/drm/xe/regs/{xe_guc_regs.h,xe_gt_regs.h}`. Native Rust models pin
 the register/ADS values, reset and DMA stop proofs, cache publication failures,
 allocation rollback and discrete CT coherence refusal. They do not establish

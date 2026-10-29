@@ -29,6 +29,7 @@ pub enum TransportError {
     State,
     NotReady,
     NonCoherent,
+    Unavailable,
     Timeout,
     Protocol(u32),
     Rejected(u32),
@@ -76,7 +77,7 @@ impl<B: GpuBacking> CtMemory for SharedCtb<B> {
     }
 }
 
-struct Mailbox<M: MmioWindow> {
+pub(crate) struct Mailbox<M: MmioWindow> {
     mmio: M,
     request: [u32; 4],
     length: usize,
@@ -86,7 +87,18 @@ struct Mailbox<M: MmioWindow> {
 }
 
 impl<M: MmioWindow> Mailbox<M> {
-    fn begin(&mut self, words: &[u32], now: u64) -> Result<(), TransportError> {
+    pub(crate) fn new(mmio: M) -> Self {
+        Self {
+            mmio,
+            request: [0; 4],
+            length: 0,
+            deadline: None,
+            retries: 0,
+            poisoned: false,
+        }
+    }
+
+    pub(crate) fn begin(&mut self, words: &[u32], now: u64) -> Result<(), TransportError> {
         if self.poisoned {
             return Err(TransportError::Poisoned);
         }
@@ -119,11 +131,16 @@ impl<M: MmioWindow> Mailbox<M> {
     }
 
     /// One bounded sample per call. BUSY/RETRY never starts a new timeout.
-    fn poll(&mut self, now: u64) -> Poll<Result<u32, TransportError>> {
+    pub(crate) fn poll(&mut self, now: u64) -> Poll<Result<u32, TransportError>> {
         let Some(deadline) = self.deadline else {
             return Poll::Ready(Err(TransportError::State));
         };
         let header = self.mmio.read32(SCRATCH);
+        if header == u32::MAX {
+            self.poisoned = true;
+            self.deadline = None;
+            return Poll::Ready(Err(TransportError::Unavailable));
+        }
         if now >= deadline {
             self.poisoned = true;
             self.deadline = None;
@@ -226,14 +243,7 @@ impl<M: MmioWindow, A: GpuAllocator> XeLpgTransport<M, A> {
         })
         .expect("fresh G2H CTB");
         Ok(Self {
-            mailbox: Mailbox {
-                mmio,
-                request: [0; 4],
-                length: 0,
-                deadline: None,
-                retries: 0,
-                poisoned: false,
-            },
+            mailbox: Mailbox::new(mmio),
             resources: ManuallyDrop::new(CtResources {
                 allocator,
                 blob,
