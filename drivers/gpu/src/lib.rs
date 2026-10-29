@@ -690,6 +690,8 @@ pub mod drm_registry;
 pub mod drm_sysfs_bridge;
 pub mod drm_uapi;
 #[cfg(feature = "intel")]
+pub mod intel_dpcd_bl;
+#[cfg(feature = "intel")]
 pub mod intel_gpu;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_audio;
