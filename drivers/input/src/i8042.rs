@@ -703,10 +703,11 @@ fn emit_key(code: KeyCode, pressed: bool) {
 /// emits the whole six-byte frame `E1 1D 45 E1 9D C5` and a release
 /// emits nothing. We mirror Linux atkbd: report the press when the
 /// `45` lands and the release when the trailing `C5` lands, so
-/// userspace sees a normal momentary key. Any byte that doesn't
-/// fit the frame aborts it silently — in particular the frame's
-/// `1D` must never leak out as a RightCtrl press.
-fn e1_step(byte: u8) {
+/// userspace sees a normal momentary key. A malformed tail releases an
+/// already-reported press. Return false on mismatch so the current byte
+/// can start a new key/prefix; bytes accepted as part of E1 never leak as
+/// unrelated Ctrl or NumLock events.
+fn e1_step(byte: u8) -> bool {
     let stage = STATE.e1_stage.load(Ordering::Acquire);
     let (next, emit) = match (stage, byte) {
         (E1_GOT_PREFIX, 0x1D) => (E1_GOT_MAKE_1D, None),
@@ -714,12 +715,19 @@ fn e1_step(byte: u8) {
         (E1_GOT_PRESS, 0xE1) => (E1_GOT_PREFIX2, None),
         (E1_GOT_PREFIX2, 0x9D) => (E1_GOT_REL_9D, None),
         (E1_GOT_REL_9D, 0xC5) => (E1_IDLE, Some(false)),
-        _ => (E1_IDLE, None),
+        _ => {
+            STATE.e1_stage.store(E1_IDLE, Ordering::Release);
+            if matches!(stage, E1_GOT_PRESS | E1_GOT_PREFIX2 | E1_GOT_REL_9D) {
+                emit_key(KeyCode::Pause, false);
+            }
+            return false;
+        }
     };
     STATE.e1_stage.store(next, Ordering::Release);
     if let Some(pressed) = emit {
         emit_key(KeyCode::Pause, pressed);
     }
+    true
 }
 
 /// Process one byte from the keyboard channel through the decode
@@ -728,13 +736,13 @@ fn e1_step(byte: u8) {
 /// the IRQ handler and the test-only synthetic byte stream, so
 /// fixtures exercise exactly the production pipeline.
 fn process_byte(byte: u8) {
-    // A byte belonging to an in-progress E1 frame is consumed by
-    // the matcher before anything else can see it.
-    if STATE.e1_stage.load(Ordering::Acquire) != E1_IDLE {
-        e1_step(byte);
+    // Consume valid E1 bytes, but retry mismatches as the start of a new
+    // key or prefix so a truncated frame cannot swallow the next key.
+    if STATE.e1_stage.load(Ordering::Acquire) != E1_IDLE && e1_step(byte) {
         return;
     }
     if byte == 0xE1 {
+        STATE.extended.store(false, Ordering::Release);
         STATE.e1_stage.store(E1_GOT_PREFIX, Ordering::Release);
         return;
     }

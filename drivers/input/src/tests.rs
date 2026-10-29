@@ -274,6 +274,55 @@ fn smoke_i8042_e1_pause_frame() -> TestResult {
 }
 kernel_test_in!("drivers/input", smoke_i8042_e1_pause_frame);
 
+fn smoke_i8042_e1_resynchronizes_without_stuck_keys() -> TestResult {
+    use crate::i8042;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global, KeyCode};
+
+    init_global_ring(16);
+    // An aborted prefix must not swallow the following A make/break.
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+    i8042::feed_bytes_for_test(&[0xE1, 0x1D, 0x1E, 0x9E]);
+    if !i8042_expect_key(KeyCode::A, true)
+        || !i8042_expect_key(KeyCode::A, false)
+        || pop_global().is_some()
+    {
+        return TestResult::Fail("aborted E1 prefix swallowed or contaminated the next key");
+    }
+
+    // If Pause was already reported, a malformed tail must release it
+    // before retrying the mismatching byte as an ordinary key.
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+    i8042::feed_bytes_for_test(&[0xE1, 0x1D, 0x45, 0x1E, 0x9E]);
+    if !i8042_expect_key(KeyCode::Pause, true)
+        || !i8042_expect_key(KeyCode::Pause, false)
+        || !i8042_expect_key(KeyCode::A, true)
+        || !i8042_expect_key(KeyCode::A, false)
+        || pop_global().is_some()
+    {
+        return TestResult::Fail("aborted E1 tail left Pause pressed or swallowed the next key");
+    }
+
+    // A prior incomplete E0 prefix must not survive a complete E1 frame.
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+    i8042::feed_bytes_for_test(&[0xE0, 0xE1, 0x1D, 0x45, 0xE1, 0x9D, 0xC5, 0x1E, 0x9E]);
+    if !i8042_expect_key(KeyCode::Pause, true)
+        || !i8042_expect_key(KeyCode::Pause, false)
+        || !i8042_expect_key(KeyCode::A, true)
+        || !i8042_expect_key(KeyCode::A, false)
+        || pop_global().is_some()
+    {
+        return TestResult::Fail("E0 latch leaked across an E1 Pause frame");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_e1_resynchronizes_without_stuck_keys
+);
+
 fn smoke_i8042_mouse_packet_decode() -> TestResult {
     use crate::i8042_mouse;
     use narf_input::{
