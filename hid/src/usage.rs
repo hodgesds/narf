@@ -67,6 +67,18 @@ pub mod digitizer {
     pub const DEVICE_IDENTIFIER: u16 = 0x53;
 }
 
+/// LED Page (HID Usage Tables 1.4). Keyboard lock indicators are
+/// Output items on this page; the canonical boot-keyboard descriptor
+/// (HID 1.11 §B.1) declares usages 1..=5 in this order.
+pub mod led {
+    pub const PAGE: u16 = 0x08;
+    pub const NUM_LOCK: u16 = 0x01;
+    pub const CAPS_LOCK: u16 = 0x02;
+    pub const SCROLL_LOCK: u16 = 0x03;
+    pub const COMPOSE: u16 = 0x04;
+    pub const KANA: u16 = 0x05;
+}
+
 /// Consumer Page (HID Usage Tables 1.4 §15). Media keys, brightness,
 /// volume.
 pub mod consumer {

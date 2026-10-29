@@ -33,7 +33,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use narf_arch::x86_64::io_port::{inb, outb};
 use narf_input::{
-    evdev::{dispatch_key_to_node, key, DeviceCaps, DeviceNode, ROUTER},
+    evdev::{dispatch_key_to_node, key, led, DeviceCaps, DeviceNode, ROUTER},
     push_key, KeyCode,
 };
 
@@ -43,6 +43,11 @@ use alloc::sync::Arc;
 /// PS/2 keyboard reply bytes (post-command).
 const KBD_ACK: u8 = 0xFA;
 const KBD_BAT_OK: u8 = 0xAA;
+
+/// PS/2 Set LEDs command byte (host → keyboard).
+const KBD_SET_LEDS: u8 = 0xED;
+/// PS/2 RESEND response (keyboard → host): retransmit the last byte.
+const KBD_RESEND: u8 = 0xFE;
 
 /// I/O ports.
 pub const PS2_DATA: u16 = 0x60;
@@ -396,8 +401,14 @@ pub unsafe fn init() -> Result<(), InitError> {
     ] {
         caps.add_key(c);
     }
+    // Lock LEDs: this keyboard answers the PS/2 Set-LEDs command;
+    // LED state changes on the node are driven to `on_led_state`.
+    caps.add_led(led::LED_NUML);
+    caps.add_led(led::LED_CAPSL);
+    caps.add_led(led::LED_SCROLLL);
     let _ = key::KEY_A; // ensure import is used
     let (_dev_id, node_arc) = ROUTER.register_device(caps);
+    node_arc.set_led_sink(on_led_state);
     KBD_NODE_PTR.store(Arc::as_ptr(&node_arc) as *mut DeviceNode, Ordering::Release);
     *KBD_EVDEV_NODE.lock() = Some(node_arc);
 
@@ -407,6 +418,201 @@ pub unsafe fn init() -> Result<(), InitError> {
 /// Return the evdev `DeviceNode` for the i8042 keyboard if registered.
 pub fn kbd_evdev_node() -> Option<Arc<DeviceNode>> {
     KBD_EVDEV_NODE.lock().clone()
+}
+
+// ── Keyboard LED output (PS/2 Set LEDs, command 0xED) ────────────
+//
+// The input core owns LED *state* (`DeviceNode::leds`); this driver
+// owns getting it onto the wire. The keyboard protocol (IBM PS/2
+// Hardware Interface Technical Reference, keyboard commands — the
+// same sequence Linux's `atkbd_set_leds` issues) is:
+//
+//   host → 0xED            keyboard → 0xFA (ACK)
+//   host → LED data byte   keyboard → 0xFA (ACK)
+//
+// The data byte is bit0=Scroll Lock, bit1=Num Lock, bit2=Caps Lock,
+// bits 3..=7 zero — a DIFFERENT bit order from the core bitmap
+// (Linux EV_LED codes: Num=0, Caps=1, Scroll=2); `ps2_led_byte`
+// converts explicitly. A keyboard may answer 0xFE (RESEND) instead
+// of ACK to request retransmission of the byte just sent.
+//
+// The exchange is receive-driven, never polled: `on_led_state` (the
+// core's LED sink, callable from IRQ or task context) records
+// intent and writes only the first command byte; each following
+// byte is written from the receive path when the response arrives
+// (`led_route_byte`, first step of `on_irq1` /
+// `feed_bytes_for_test`). No context spin-waits for an ACK, and a
+// wedged exchange (dead keyboard) aborts on the next received byte
+// and self-heals on the next LED state change.
+
+/// Retransmission budget per byte before the exchange aborts.
+const LED_RESEND_MAX: u8 = 3;
+
+/// Convert the input core's LED bitmap (Linux `EV_LED` code order:
+/// bit0 Num, bit1 Caps, bit2 Scroll) to the PS/2 Set-LEDs data byte
+/// (bit0 Scroll, bit1 Num, bit2 Caps; all other bits zero — LEDs
+/// with no PS/2 representation, e.g. Compose/Kana, are masked out).
+pub fn ps2_led_byte(leds: u16) -> u8 {
+    let mut b = 0u8;
+    if leds & (1 << led::LED_SCROLLL) != 0 {
+        b |= 1 << 0;
+    }
+    if leds & (1 << led::LED_NUML) != 0 {
+        b |= 1 << 1;
+    }
+    if leds & (1 << led::LED_CAPSL) != 0 {
+        b |= 1 << 2;
+    }
+    b
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum LedPhase {
+    Idle,
+    /// 0xED sent; waiting for its ACK.
+    AwaitCmdAck,
+    /// Data byte sent; waiting for its ACK.
+    AwaitDataAck,
+}
+
+#[derive(Debug)]
+struct LedTx {
+    phase: LedPhase,
+    /// Bitmap the in-flight data byte was encoded from.
+    inflight: u16,
+    /// Latest bitmap requested by the core; if it moved while an
+    /// exchange was in flight, a follow-up exchange starts when the
+    /// current one completes.
+    desired: u16,
+    /// RESEND retransmissions of the current byte.
+    retries: u8,
+}
+
+impl LedTx {
+    const fn new() -> Self {
+        Self {
+            phase: LedPhase::Idle,
+            inflight: 0,
+            desired: 0,
+            retries: 0,
+        }
+    }
+}
+
+static LED_TX: narf_lib::sync::IrqSafeSpinLock<LedTx> =
+    narf_lib::sync::IrqSafeSpinLock::new(LedTx::new());
+
+/// Every byte written to the keyboard for the LED exchange, in
+/// order. Production value: a bounded trace (recording stops at the
+/// cap). Test value: fixtures assert the exact byte stream without
+/// a port to observe.
+static LED_TX_LOG: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u8>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// Recording cap for `LED_TX_LOG`.
+const LED_TX_LOG_CAP: usize = 256;
+
+/// Write one byte of the LED exchange: recorded in `LED_TX_LOG`
+/// and, once the controller is initialised, driven onto the data
+/// port. In the test harness `init()` never ran, so fixtures
+/// exercise the full state machine with no port I/O.
+fn led_write_byte(byte: u8) {
+    {
+        let mut log = LED_TX_LOG.lock();
+        if log.len() < LED_TX_LOG_CAP {
+            log.push(byte);
+        }
+    }
+    if STATE.initialized.load(Ordering::Acquire) {
+        // SAFETY: 0x60 is the i8042 data port and init() has run, so
+        // the port is owned by this driver. The state machine
+        // serialises LED bytes against each other; interleaving
+        // into a polled init exchange cannot happen because the
+        // sink is only registered at the end of init().
+        unsafe { outb(PS2_DATA, byte) };
+    }
+}
+
+/// Input-core LED sink for the i8042 keyboard node (registered in
+/// `init()`). May run in IRQ context (physical lock-key press) or
+/// task context (evdev `write()`); it never waits — it records the
+/// new desired bitmap and, if no exchange is in flight, writes the
+/// Set-LEDs command byte. The rest of the exchange is driven by
+/// `led_route_byte` from the receive path.
+pub fn on_led_state(leds: u16) {
+    let mut tx = LED_TX.lock();
+    tx.desired = leds;
+    if tx.phase == LedPhase::Idle {
+        tx.phase = LedPhase::AwaitCmdAck;
+        tx.retries = 0;
+        led_write_byte(KBD_SET_LEDS);
+    }
+}
+
+/// Feed one received byte into the LED exchange. Returns `true`
+/// when the byte was a protocol response (ACK / RESEND) consumed by
+/// the exchange. A byte that is neither — e.g. a scancode arriving
+/// mid-exchange — aborts the exchange and returns `false`: it is
+/// NEVER swallowed; the caller decodes it as a key.
+fn led_route_byte(byte: u8) -> bool {
+    let mut tx = LED_TX.lock();
+    let phase = tx.phase;
+    if phase == LedPhase::Idle {
+        return false;
+    }
+    if byte == KBD_ACK {
+        match phase {
+            LedPhase::AwaitCmdAck => {
+                tx.inflight = tx.desired;
+                let data = ps2_led_byte(tx.desired);
+                tx.phase = LedPhase::AwaitDataAck;
+                tx.retries = 0;
+                led_write_byte(data);
+            }
+            _ => {
+                // Data byte ACKed: exchange complete. If the core
+                // state moved while we were in flight, immediately
+                // start a follow-up exchange with the new bitmap.
+                tx.phase = LedPhase::Idle;
+                tx.retries = 0;
+                if tx.desired != tx.inflight {
+                    tx.phase = LedPhase::AwaitCmdAck;
+                    led_write_byte(KBD_SET_LEDS);
+                }
+            }
+        }
+        true
+    } else if byte == KBD_RESEND {
+        if tx.retries < LED_RESEND_MAX {
+            tx.retries += 1;
+            let again = if phase == LedPhase::AwaitCmdAck {
+                KBD_SET_LEDS
+            } else {
+                ps2_led_byte(tx.inflight)
+            };
+            led_write_byte(again);
+        } else {
+            tx.phase = LedPhase::Idle;
+            tx.retries = 0;
+        }
+        true
+    } else {
+        tx.phase = LedPhase::Idle;
+        tx.retries = 0;
+        false
+    }
+}
+
+/// Test hook: snapshot of every LED-exchange byte written so far.
+#[doc(hidden)]
+pub fn __led_tx_log_for_test() -> alloc::vec::Vec<u8> {
+    LED_TX_LOG.lock().clone()
+}
+
+/// Test hook: `true` when no LED exchange is in flight.
+#[doc(hidden)]
+pub fn __led_tx_idle_for_test() -> bool {
+    LED_TX.lock().phase == LedPhase::Idle
 }
 
 /// Translate a single scancode-set-1 make/break byte (without the
@@ -439,6 +645,12 @@ pub unsafe fn on_irq1() {
     // SAFETY: 0x60 is the i8042 data port.
     let byte = unsafe { inb(PS2_DATA) };
 
+    // LED exchange responses (ACK / RESEND for an in-flight Set
+    // LEDs) are protocol bytes, not scancodes.
+    if led_route_byte(byte) {
+        return;
+    }
+
     if byte == 0xE0 {
         STATE.extended.store(true, Ordering::Release);
         return;
@@ -470,6 +682,9 @@ pub unsafe fn on_irq1() {
 /// global ring AND the evdev node.
 pub fn feed_bytes_for_test(bytes: &[u8]) {
     for &b in bytes {
+        if led_route_byte(b) {
+            continue;
+        }
         if b == 0xE0 {
             STATE.extended.store(true, Ordering::Release);
             continue;
@@ -492,4 +707,6 @@ pub fn feed_bytes_for_test(bytes: &[u8]) {
 pub fn __reset_for_test() {
     STATE.extended.store(false, Ordering::Release);
     narf_input::__reset_modifiers_for_test();
+    *LED_TX.lock() = LedTx::new();
+    LED_TX_LOG.lock().clear();
 }

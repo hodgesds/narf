@@ -1231,3 +1231,138 @@ fn smoke_input_console_input_wakes_every_reader() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("input", smoke_input_console_input_wakes_every_reader);
+
+// ── LED state (issue #768) ────────────────────────────────────────
+// The input core owns the per-device LED bitmap; producers either
+// register a sink (i8042) or poll `led_state` (I2C-HID pump).
+
+static LED_SINK_LAST: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+static LED_SINK_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn recording_led_sink(bitmap: u16) {
+    LED_SINK_LAST.store(bitmap, core::sync::atomic::Ordering::SeqCst);
+    LED_SINK_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+}
+
+fn smoke_input_evdev_led_caps_and_ev_led_state() -> TestResult {
+    use crate::evdev::{led, DeviceCaps, EvdevEvent, EventType, ROUTER};
+    use core::sync::atomic::Ordering;
+
+    // Caps: add_led publishes the ledbit + EV_LED in EVIOCGBIT terms.
+    let mut caps = DeviceCaps::new();
+    if caps.has(EventType::Led, led::LED_CAPSL) {
+        return TestResult::Fail("LED_CAPSL advertised before add_led");
+    }
+    caps.add_led(led::LED_NUML);
+    caps.add_led(led::LED_CAPSL);
+    caps.add_led(led::LED_SCROLLL);
+    if !caps.has(EventType::Led, led::LED_NUML)
+        || !caps.has(EventType::Led, led::LED_CAPSL)
+        || !caps.has(EventType::Led, led::LED_SCROLLL)
+    {
+        return TestResult::Fail("add_led did not set the ledbit bits");
+    }
+    if caps.has(EventType::Led, led::LED_MAIL) {
+        return TestResult::Fail("undeclared LED_MAIL advertised");
+    }
+    if caps.evbit & (1 << (EventType::Led as u16)) == 0 {
+        return TestResult::Fail("EV_LED missing from evbit after add_led");
+    }
+
+    LED_SINK_LAST.store(0, Ordering::SeqCst);
+    LED_SINK_CALLS.store(0, Ordering::SeqCst);
+    let (id, node) = ROUTER.register_device(caps);
+    node.set_led_sink(recording_led_sink);
+    let ev = |code: u16, value: i32| EvdevEvent {
+        time: 0,
+        type_: EventType::Led,
+        code,
+        value,
+    };
+
+    // EV_LED set: state bit lands, sink fires once with the bitmap.
+    node.dispatch(ev(led::LED_CAPSL, 1));
+    if node.led_state() != (1 << led::LED_CAPSL) {
+        return TestResult::Fail("EV_LED CAPSL=1 did not set the state bit");
+    }
+    if ROUTER.led_state(id) != Some(1 << led::LED_CAPSL) {
+        return TestResult::Fail("ROUTER.led_state disagrees with the node");
+    }
+    if LED_SINK_CALLS.load(Ordering::SeqCst) != 1
+        || LED_SINK_LAST.load(Ordering::SeqCst) != (1 << led::LED_CAPSL)
+    {
+        return TestResult::Fail("sink not fired exactly once with the new bitmap");
+    }
+    // Re-dispatching the same state is a no-op: no second sink call.
+    node.dispatch(ev(led::LED_CAPSL, 1));
+    if LED_SINK_CALLS.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail("idempotent EV_LED re-set fired the sink again");
+    }
+    // Clear, then an out-of-range code is ignored entirely.
+    node.dispatch(ev(led::LED_CAPSL, 0));
+    if node.led_state() != 0 || LED_SINK_CALLS.load(Ordering::SeqCst) != 2 {
+        return TestResult::Fail("EV_LED CAPSL=0 did not clear + fire");
+    }
+    node.dispatch(ev(led::LED_MAX + 1, 1));
+    if node.led_state() != 0 || LED_SINK_CALLS.load(Ordering::SeqCst) != 2 {
+        return TestResult::Fail("out-of-range EV_LED code changed state");
+    }
+    ROUTER.unregister_device(id);
+    TestResult::Pass
+}
+kernel_test_in!("input", smoke_input_evdev_led_caps_and_ev_led_state);
+
+fn smoke_input_evdev_lock_keys_toggle_leds() -> TestResult {
+    use crate::evdev::{key, led, DeviceCaps, EvdevEvent, EventType, ROUTER};
+    use core::sync::atomic::Ordering;
+
+    LED_SINK_LAST.store(0, Ordering::SeqCst);
+    LED_SINK_CALLS.store(0, Ordering::SeqCst);
+    let mut caps = DeviceCaps::new();
+    caps.add_key(key::KEY_CAPSLOCK);
+    caps.add_key(key::KEY_NUMLOCK);
+    caps.add_key(key::KEY_SCROLLLOCK);
+    caps.add_led(led::LED_NUML);
+    caps.add_led(led::LED_CAPSL);
+    caps.add_led(led::LED_SCROLLL);
+    let (id, node) = ROUTER.register_device(caps);
+    node.set_led_sink(recording_led_sink);
+    let key_ev = |code: u16, value: i32| EvdevEvent {
+        time: 0,
+        type_: EventType::Key,
+        code,
+        value,
+    };
+
+    // Press toggles on; release does not; autorepeat does not;
+    // a second press toggles off.
+    node.dispatch(key_ev(key::KEY_CAPSLOCK, 1));
+    if node.led_state() != (1 << led::LED_CAPSL) {
+        return TestResult::Fail("CapsLock press did not light LED_CAPSL");
+    }
+    node.dispatch(key_ev(key::KEY_CAPSLOCK, 0));
+    node.dispatch(key_ev(key::KEY_CAPSLOCK, 2));
+    if node.led_state() != (1 << led::LED_CAPSL) {
+        return TestResult::Fail("CapsLock release/repeat changed the LED state");
+    }
+    if LED_SINK_CALLS.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail("sink fired for a release/repeat");
+    }
+    node.dispatch(key_ev(key::KEY_CAPSLOCK, 1));
+    if node.led_state() != 0 {
+        return TestResult::Fail("second CapsLock press did not toggle off");
+    }
+    // NumLock and ScrollLock map to their own bits (Linux LED-code
+    // order: Num=bit0, Scroll=bit2).
+    node.dispatch(key_ev(key::KEY_NUMLOCK, 1));
+    node.dispatch(key_ev(key::KEY_SCROLLLOCK, 1));
+    if node.led_state() != ((1 << led::LED_NUML) | (1 << led::LED_SCROLLL)) {
+        return TestResult::Fail("Num/Scroll lock presses mapped to wrong LED bits");
+    }
+    if LED_SINK_LAST.load(Ordering::SeqCst) != node.led_state() {
+        return TestResult::Fail("sink bitmap disagrees with node state");
+    }
+    ROUTER.unregister_device(id);
+    TestResult::Pass
+}
+kernel_test_in!("input", smoke_input_evdev_lock_keys_toggle_leds);
