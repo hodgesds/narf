@@ -647,11 +647,11 @@ pub fn note_serial_state(index: usize, state: SerialState) {
         let prev = p.modem.unwrap_or(SerialState {
             rx_carrier: false,
             tx_carrier: false,
-            break_detect: false,
+            break_received: false,
             ring_signal: false,
             framing_error: false,
             parity_error: false,
-            overrun_error: false,
+            overrun: false,
         });
         if state.rx_carrier != prev.rx_carrier {
             p.icount.dcd_changes = p.icount.dcd_changes.wrapping_add(1);
@@ -662,7 +662,7 @@ pub fn note_serial_state(index: usize, state: SerialState) {
         if state.ring_signal != prev.ring_signal {
             p.icount.rng_changes = p.icount.rng_changes.wrapping_add(1);
         }
-        if state.break_detect && !prev.break_detect {
+        if state.break_received && !prev.break_received {
             p.icount.brk = p.icount.brk.wrapping_add(1);
         }
         if state.framing_error && !prev.framing_error {
@@ -671,7 +671,7 @@ pub fn note_serial_state(index: usize, state: SerialState) {
         if state.parity_error && !prev.parity_error {
             p.icount.parity = p.icount.parity.wrapping_add(1);
         }
-        if state.overrun_error && !prev.overrun_error {
+        if state.overrun && !prev.overrun {
             p.icount.overrun = p.icount.overrun.wrapping_add(1);
         }
         p.modem = Some(state);
@@ -1373,11 +1373,11 @@ mod tests {
             SerialState {
                 rx_carrier: true,
                 tx_carrier: true,
-                break_detect: false,
+                break_received: false,
                 ring_signal: false,
                 framing_error: false,
                 parity_error: false,
-                overrun_error: false,
+                overrun: false,
             },
         );
         if ioctl(&fd, TIOCMGET, FakeCtx::BASE, &ctx).is_err() {
@@ -1462,17 +1462,17 @@ mod tests {
         let mut s = SerialState {
             rx_carrier: true,
             tx_carrier: false,
-            break_detect: false,
+            break_received: false,
             ring_signal: false,
             framing_error: true,
             parity_error: false,
-            overrun_error: false,
+            overrun: false,
         };
         note_serial_state(idx, s); // DCD transition 1, frame 1
         note_serial_state(idx, s); // same report again: no new counts
         s.framing_error = false;
         s.parity_error = true;
-        s.break_detect = true;
+        s.break_received = true;
         note_serial_state(idx, s); // parity 1, brk 1
         if ioctl(&fd, TIOCGICOUNT, FakeCtx::BASE, &ctx).is_err() {
             return TestResult::Fail("TIOCGICOUNT failed");
