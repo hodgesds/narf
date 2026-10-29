@@ -7,11 +7,13 @@
 //!
 //! - `FakeHdaMmio`  — a 16 KiB `[u8; 16384]` that represents the controller
 //!   BAR0 register image.  Read/write at register offsets land in the array.
-//! - `FakeCodec`    — an ALC256 verb responder built on top of
-//!   `VerbRecorder`.  `detect()` is fed the ALC256 VENDOR_ID; all verbs
-//!   land in `history`.
 //! - DMA buffer     — `PcmSubstream::buffer` (the internal cyclic `Vec<u8>`)
 //!   acts as the fake DMA backing.  After `write()`, bytes are visible there.
+//!
+//! Codec detect/bring-up used to be faked here against the legacy
+//! in-crate codec model; that model was excised in #783 and codec
+//! bring-up is now covered in `narf-audio`, so smoke #1 registers
+//! the card directly under the ALC256 name.
 //!
 //! Linux refs used for value assertions:
 //! - `sound/pci/hda/hda_intel.c`
@@ -19,14 +21,12 @@
 //! - `include/sound/core.h` (SNDRV_MAJOR = 116)
 //! - `include/sound/minors.h` (minor-number scheme)
 
-use crate::codec::realtek::{bring_up, detect, RealtekChip, VerbRecorder};
 use crate::format::{pack_sdfmt, ChannelCount, HwParams, SampleFormat, SampleRate};
 use crate::hda::streams::{StreamDescriptor, SDCTL_RUN};
 use crate::mixer::{self, ControlKind, ControlValue};
 use crate::pcm::{PcmSubstream, SubstreamState};
 use crate::sysfs_bridge::{render_card_id_attr, SNDRV_MAJOR};
 use crate::{list_cards, mixer as mixer_open, open_playback, register_card, SoundError};
-use alloc::vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 // ── Fake HDA MMIO ────────────────────────────────────────────────────────
@@ -61,32 +61,17 @@ impl FakeHdaMmio {
     }
 }
 
-// ── Smoke #1: Card register — ALC256 detect → CardInfo registered ────────
+// ── Smoke #1: Card register — ALC256 card → CardInfo registered ──────────
 
 fn e2e_smoke_card_register_alc256() -> TestResult {
     crate::__reset_for_test();
     mixer::__reset_for_test();
 
-    // Simulate detect(): feed VENDOR_ID = 0x10EC0256 (ALC256).
-    let mut bus = VerbRecorder::with_initial_responses(vec![0x10EC_0256]);
-    let chip = match detect(&mut bus, 0) {
-        Ok(Some(c)) => c,
-        _ => return TestResult::Fail("ALC256 detect failed"),
-    };
-    if chip != RealtekChip::Alc256 {
-        return TestResult::Fail("detected chip != Alc256");
-    }
-
-    // Bring it up against a fresh recorder.
-    let mut bus2 = VerbRecorder::new();
-    if bring_up(&mut bus2, 0, 0x01, chip, 0x02, 0x14, 0x21).is_err() {
-        return TestResult::Fail("bring_up failed");
-    }
-
-    // Register the card using the codec name.
+    // Register the card using the codec name a native engine's probe
+    // would report for an ALC256 (visible in sysfs/procfs).
     let card_index = register_card(
         "hda-intel",
-        chip.name(), // "ALC256" — visible in sysfs/procfs
+        "ALC256",
         "HDA Intel PCH",
         /*controller=*/ 0,
         /*playback=*/ 1,
@@ -585,9 +570,9 @@ kernel_test_in!("drivers/sound", e2e_smoke_pcm_close_and_reopen);
 
 // ── Smoke #11: Mixer set Master Volume + read back ────────────────────────
 //
-// Drive Master Volume to 60, verify:
-//   1. mixer::get() returns 60/60.
-//   2. The codec verb buffer (VerbRecorder) received a SET_AMP_GAIN_MUTE.
+// Drive Master Volume to 60, verify mixer::get() returns 60/60.
+// (This layer is the mixer state model only; translating a write
+// into codec verbs is the native engine's job in `narf-audio`.)
 //
 // Linux ref: `sound/hda/codecs/realtek/realtek.c::alc_build_controls`
 // Realtek output amps are 7-bit, max = 87 (0x57) in NARF's range model.
@@ -766,7 +751,7 @@ kernel_test_in!("drivers/sound", e2e_smoke_jack_sense_unsolicited_response);
 // ── Smoke #14: /sys/class/sound/card0/id reads codec name "ALC256\n" ──────
 //
 // `render_card_id_attr` must return exactly `"ALC256\n"` when the card
-// was registered with id = chip.name() = "ALC256".
+// was registered with id = "ALC256".
 //
 // Linux ref: `Documentation/ABI/testing/sysfs-class-sound`
 //            `sound/core/init.c::snd_card_register` kobject population.
@@ -774,8 +759,7 @@ kernel_test_in!("drivers/sound", e2e_smoke_jack_sense_unsolicited_response);
 fn e2e_smoke_sysfs_card_id_reads_alc256() -> TestResult {
     crate::__reset_for_test();
     mixer::__reset_for_test();
-    let chip = RealtekChip::Alc256;
-    register_card("hda-intel", chip.name(), "HDA Intel PCH", 0, 1, 1);
+    register_card("hda-intel", "ALC256", "HDA Intel PCH", 0, 1, 1);
 
     let cards = list_cards();
     let card = match cards.first() {
