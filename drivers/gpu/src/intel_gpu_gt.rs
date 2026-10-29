@@ -1,6 +1,7 @@
 //! GT identity is separate from display admission. Reference checkout:
 //! ~/git/linux b90c984d615e8ce2af96f5b1411a962d83fed2ad,
-//! include/drm/intel/pciids.h and drivers/gpu/drm/xe/xe_uc_fw.c (MIT).
+//! include/drm/intel/pciids.h and drivers/gpu/drm/xe/{xe_uc_fw.c,
+//! xe_force_wake.c,regs/xe_gt_regs.h} (MIT).
 
 use crate::intel_gpu::Generation;
 
@@ -55,6 +56,16 @@ impl GtPlatform {
 
     pub const fn is_discrete(self) -> bool {
         matches!(self, Self::Alchemist | Self::Battlemage)
+    }
+
+    /// Graphics-GT forcewake ACK (xe_force_wake_init_gt / xe_gt_regs.h).
+    /// Gfx 12.70+ moved the GT ACK; DG2 retains the earlier address.
+    pub const fn guc_forcewake_ack(self) -> Option<u64> {
+        match self {
+            Self::Integrated(Generation::MeteorLake) | Self::Battlemage => Some(0xdfc),
+            Self::Alchemist => Some(0x130044),
+            _ => None,
+        }
     }
 
     /// Supported GuC boot ABI, not permission to publish a display or engine.

@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.12** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.13** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -1510,6 +1510,19 @@ that explicitly supplies coherent memory, and the current WB frame allocator
 refuses it. Arc identity does not add discrete cards to display probe admission
 or present system RAM as VRAM.
 
+`intel_gpu_guc_gt::GuCGt` joins the bootstrap, one CT transport and the GT
+kernel forcewake request under one owner. The correct ACK is 0x130044 on DG2
+and 0xdfc on MTL/Arrow/BMG (graphics IP 12.70+); a high value at the other
+address cannot authorize GT access. Wake acquisition refuses another kernel
+owner and preserves other requestors with masked writes. Ready/CT operations
+validate request and ACK; wake loss closes admission. Shutdown recovers wake,
+proves GuC reset and firmware DMA idle before retiring CT, then clears the
+request and waits for sleep ACK. Cancelled waiters preserve the transaction;
+unverified drop retains the whole allocator/MMIO object graph. The owner is
+terminal after stop, and its reset proof does not cover render jobs. Per-card
+PCI/runtime-PM installation, MOCS, runtime idle and context scheduling remain
+outstanding.
+
 Gen12 owned resident submission, cache-flushed
 post-sync breadcrumbs, terminal fences and loss retention now have native
 hardware models; full GT/context setup, topology, hardware reset, accelerated
@@ -1547,7 +1560,7 @@ Primary references:
 GuC bootstrap and discrete identity were cross-checked against the local Linux
 checkout at `b90c984d615e8ce2af96f5b1411a962d83fed2ad`: MIT-licensed
 `include/drm/intel/pciids.h`, `drivers/gpu/drm/xe/{xe_uc_fw.c,xe_guc.c,xe_wopcm.c,
-xe_guc_ads.c,xe_guc_fwif.h,xe_guc_tlb_inval.c,xe_ggtt.c}` and
+xe_guc_ads.c,xe_guc_fwif.h,xe_guc_tlb_inval.c,xe_ggtt.c,xe_force_wake.c}` and
 `drivers/gpu/drm/xe/regs/{xe_guc_regs.h,xe_gt_regs.h}`. Native Rust models pin
 the register/ADS values, reset and DMA stop proofs, cache publication failures,
 allocation rollback and discrete CT coherence refusal. They do not establish

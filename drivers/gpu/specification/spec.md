@@ -238,7 +238,9 @@ value 32, zero enabled engines, valid policies and owned private-data pointers.
 The log layout is one state page plus 16-KiB crash, 64-KiB event and 1-MiB
 capture buffers. Scheduler and verbose logging are disabled during bootstrap.
 
-`begin` and every active `poll` require GT forcewake acknowledged; the sole GT owner
+`begin` and every active `poll` require GT forcewake acknowledged at the
+platform-specific register: DG2 uses 0x130044, while MTL/Arrow and BMG use
+0xdfc (`xe_force_wake_init_gt`, graphics IP 12.70+). The sole GT owner
 holds forcewake/runtime-PM and serializes reset and firmware DMA across the
 entire operation. The state machine issues GuC-domain reset, requires reset
 self-clear **and** MIA-in-reset status, validates prelocked WOPCM or programs
@@ -267,6 +269,39 @@ requires a backing that explicitly guarantees coherent shared cache lines.
 The existing WB FrameBacking cannot admit discrete CT. A coherent discrete
 mapping/VRAM allocator, full GT/MOCS/IRQ ownership, hardware configuration and
 submission contexts remain integration requirements.
+
+`intel_gpu_guc_gt::GuCGt::stage` owns the staged firmware bootstrap and its
+optional CT transport together. It is an exclusive graphics-GT owner, not a
+second reference counter over the legacy Gen12 forcewake manager. The PCI
+owner must supply runtime-PM, physical-function admission and serialization
+with every other GT reset/firmware user. `begin` refuses an existing kernel
+request or stale kernel ACK, then sets only kernel request bit 0 at 0xa188
+using masked writes; other requestors' bits survive. `poll` waits for the
+selected ACK before starting GuC reset/DMA. Wake and sleep transitions have
+50-ms deadlines; `wait` cooperatively yields and uses timer awaits. Cancellation leaves the state,
+request and allocations owned by the GT.
+
+After authenticated `Ready`, `begin_ct` allocates and enables one owned CT;
+neither bootstrap nor transport escapes the owner. Discrete coherence or
+allocation refusal leaves the GuC ready for explicit stop. `send`/`receive`
+require `CtReady` and validate both the kernel request and ACK. CT ring full
+and malformed host messages are recoverable; corrupt device cursors, mailbox
+errors and wake loss stop admission. Unreadable registers never prove sleep
+or stop. `begin_stop` closes admission first, reasserts a lost wake request
+when registers remain readable, then resets GuC and requires MIA-in-reset
+plus firmware DMA idle. Only that proof retires even partial/poisoned CT
+registrations. It then clears the kernel request and awaits ACK deassertion.
+The stopped owner is terminal; no stale child can restart CT. This proof is
+limited to its GuC bootstrap/CT buffers and does not retire RCS jobs.
+
+Drop frees only unpublished or fully stopped GT owners. All other states
+retain the entire allocator/MMIO/bootstrap/CT object graph, preserving the
+wake request while DMA lifetime is uncertain. `release_after_gt_reset` is an
+unsafe escape requiring the PCI owner's external full-reset proof covering
+all owned DMA addresses and the wake request. Runtime idle, per-card probe
+installation, MOCS programming, hardware configuration and GuC context
+scheduling remain separate integration work; this owner does not publish
+userspace engines or enable EXECBUFFER2.
 
 `intel_gpu_guc_transport::XeLpgTransport` owns one six-page coherent GGTT
 allocation (H2G descriptor at 0, G2H at 0x800, 4-KiB send ring at 0x1000,

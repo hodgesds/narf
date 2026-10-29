@@ -291,6 +291,14 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         self.state
     }
 
+    pub(crate) fn platform(&self) -> GtPlatform {
+        self.platform
+    }
+
+    pub(crate) fn window(&self) -> &M {
+        &self.mmio
+    }
+
     /// ADS/private/log memory remains owned for the entire GuC lifetime.
     /// Discrete CT requires coherent live cursors, beyond cache-cleaned upload.
     pub fn allocate_transport(&self) -> Result<XeLpgTransport<M, A>, BootError>
@@ -311,7 +319,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
     }
 
     fn awake(&self) -> Result<(), BootError> {
-        let ack = self.mmio.read32(0x130044);
+        let ack = self.mmio.read32(
+            self.platform
+                .guc_forcewake_ack()
+                .ok_or(BootError::Unsupported)?,
+        );
         if ack == u32::MAX {
             Err(BootError::Unavailable)
         } else if ack & 1 == 0 {
@@ -608,7 +620,7 @@ mod tests {
             device.writes.push((offset, value));
             let actual = match offset {
                 0xc050 | 0xc340 if !device.reject_wopcm => value | 1,
-                0xc314 => {
+                0xc314 | 0xa188 => {
                     let mask = value >> 16;
                     let old = *device.regs.get(&offset).unwrap_or(&0);
                     if value == 0x00110011 {
@@ -697,6 +709,7 @@ mod tests {
             ..Device::default()
         };
         device.regs.insert(0x130044, 1);
+        device.regs.insert(0xdfc, 1);
         let shared = Rc::new(RefCell::new(device));
         (Window(shared.clone()), Arena(shared))
     }
@@ -1036,5 +1049,301 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_guc_boot",
         smoke_discrete_ct_needs_coherent_mapping
+    );
+
+    use crate::intel_gpu_guc_gt::{GtError, GtState, GuCGt};
+
+    fn gt_model(platform: GtPlatform, ack: u64) -> (Window, Arena, GuCGt<Window, Arena>) {
+        let (window, arena) = model();
+        window.0.borrow_mut().regs.insert(ack, 0);
+        // A separate hardware/user requestor must survive every masked write.
+        window.0.borrow_mut().regs.insert(0xa188, 2);
+        let boot = stage(window.clone(), arena.clone(), platform);
+        (window, arena, GuCGt::from_staged(boot))
+    }
+
+    fn gt_ready(gt: &mut GuCGt<Window, Arena>, window: &Window, ack: u64) {
+        gt.begin(0).unwrap();
+        assert!(gt.poll(1).is_pending());
+        assert!(!window
+            .0
+            .borrow()
+            .writes
+            .iter()
+            .any(|(reg, _)| *reg == 0x941c));
+        window.0.borrow_mut().regs.insert(ack, 1);
+        assert!(gt.poll(2).is_pending());
+        reset_done(window);
+        assert!(gt.poll(3).is_pending());
+        window.0.borrow_mut().regs.insert(0xc314, 0x10);
+        assert!(gt.poll(4).is_pending());
+        window.0.borrow_mut().regs.insert(0xc000, 0x8000f000);
+        assert_eq!(gt.poll(5), Poll::Ready(Ok(GtState::Ready)));
+    }
+
+    fn gt_ct(gt: &mut GuCGt<Window, Arena>, window: &Window) {
+        gt.begin_ct(6).unwrap();
+        for i in 0..6 {
+            window.0.borrow_mut().regs.insert(0x190240, 0xf0000001);
+            assert!(gt.poll(7 + i).is_pending());
+        }
+        window.0.borrow_mut().regs.insert(0x190240, 0xf0000000);
+        assert_eq!(gt.poll(13), Poll::Ready(Ok(GtState::CtReady)));
+    }
+
+    fn gt_stop(gt: &mut GuCGt<Window, Arena>, window: &Window, ack: u64) {
+        gt.begin_stop(100).unwrap();
+        assert!(gt.poll(101).is_pending());
+        reset_done(window);
+        assert!(gt.poll(102).is_pending());
+        assert_eq!(gt.state(), GtState::Releasing);
+        assert_eq!(window.0.borrow().regs.get(&0xa188), Some(&2));
+        assert!(gt.poll(103).is_pending());
+        window.0.borrow_mut().regs.insert(ack, 0);
+        assert_eq!(gt.poll(104), Poll::Ready(Ok(GtState::Stopped)));
+    }
+
+    fn smoke_gt_boot_ct_and_verified_stop() -> TestResult {
+        // xe_force_wake_init_gt selects MTL's 0xdfc for Gfx 12.70+;
+        // DG2 uses 0x130044. The unselected ACK deliberately remains high.
+        for (platform, ack) in [
+            (
+                GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
+                0xdfc,
+            ),
+            (GtPlatform::Alchemist, 0x130044),
+            (GtPlatform::Battlemage, 0xdfc),
+        ] {
+            let (window, arena, mut gt) = gt_model(platform, ack);
+            gt_ready(&mut gt, &window, ack);
+            assert_eq!(window.0.borrow().regs.get(&0xa188), Some(&3));
+            gt_ct(&mut gt, &window);
+            assert_eq!(gt.begin_ct(14), Err(GtError::State));
+            assert_eq!(arena.live_allocations(), 4);
+            // Invalid messages and ordinary ring backpressure do not poison
+            // the GT, unlike a broken firmware-owned descriptor.
+            assert_eq!(
+                gt.send(1, 0x1000, 0x1000, &[], true),
+                Err(GtError::Transport(TransportError::Ct(
+                    crate::intel_gpu_guc::GuCError::Message
+                )))
+            );
+            for id in 1..=3 {
+                gt.send(id, 0x1000, 0, &[0; 254], true).unwrap();
+            }
+            assert_eq!(
+                gt.send(4, 0x1000, 0, &[0; 254], true),
+                Err(GtError::Transport(TransportError::Ct(
+                    crate::intel_gpu_guc::GuCError::Full
+                )))
+            );
+            assert_eq!(gt.state(), GtState::CtReady);
+            assert_eq!(gt.receive(), Ok(None));
+            gt_stop(&mut gt, &window, ack);
+            assert_eq!(arena.live_allocations(), 3); // CT released only after reset
+            {
+                let device = window.0.borrow();
+                let reset = device
+                    .writes
+                    .iter()
+                    .rposition(|pair| *pair == (0x941c, 8))
+                    .unwrap();
+                let release = device
+                    .writes
+                    .iter()
+                    .rposition(|pair| *pair == (0xa188, 0x10000))
+                    .unwrap();
+                assert!(release > reset);
+            }
+            drop(gt);
+            assert_eq!(arena.live_allocations(), 0);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_gt",
+        smoke_gt_boot_ct_and_verified_stop
+    );
+
+    fn smoke_gt_wake_admission_and_timeouts() -> TestResult {
+        for failure in 0..4 {
+            let (window, arena, mut gt) = gt_model(GtPlatform::Battlemage, 0xdfc);
+            let (reg, value, error) = match failure {
+                0 => (0xa188, 3, GtError::Busy),
+                1 => (0xdfc, 1, GtError::Busy),
+                2 => (0xa188, u32::MAX, GtError::Unavailable),
+                _ => (0xdfc, u32::MAX, GtError::Unavailable),
+            };
+            window.0.borrow_mut().regs.insert(reg, value);
+            assert_eq!(gt.begin(0), Err(error));
+            assert!(window.0.borrow().writes.is_empty());
+            drop(gt);
+            assert_eq!(arena.live_allocations(), 0);
+        }
+        let (window, arena, mut gt) = gt_model(GtPlatform::Battlemage, 0xdfc);
+        gt.begin(0).unwrap();
+        assert!(gt.poll(49_999_999).is_pending());
+        assert_eq!(gt.poll(50_000_000), Poll::Ready(Err(GtError::WakeTimeout)));
+        assert_eq!(arena.live_allocations(), 3);
+        assert!(!window
+            .0
+            .borrow()
+            .writes
+            .iter()
+            .any(|(reg, _)| *reg == 0x941c));
+        gt.begin_stop(50_000_001).unwrap();
+        assert_eq!(gt.poll(50_000_002), Poll::Ready(Ok(GtState::Stopped)));
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_gt",
+        smoke_gt_wake_admission_and_timeouts
+    );
+
+    fn smoke_gt_loss_recovery_retains_dma() -> TestResult {
+        for failure in 0..5 {
+            let (window, arena, mut gt) = gt_model(GtPlatform::Alchemist, 0x130044);
+            gt_ready(&mut gt, &window, 0x130044);
+            match failure {
+                0 | 1 => {
+                    window.0.borrow_mut().regs.insert(
+                        if failure == 0 { 0x130044 } else { 0xa188 },
+                        if failure == 0 { 0 } else { 2 },
+                    );
+                    assert_eq!(gt.poll(6), Poll::Ready(Err(GtError::WakeLost)));
+                }
+                2 => {
+                    gt.begin_ct(6).unwrap();
+                    assert_eq!(
+                        gt.poll(10_000_006),
+                        Poll::Ready(Err(GtError::Transport(TransportError::Timeout)))
+                    );
+                }
+                3 => {
+                    gt_ct(&mut gt, &window);
+                    let memory = window.0.borrow().memory.last_key_value().unwrap().1.clone();
+                    memory.borrow_mut()[0x808 / 4] = 1;
+                    assert!(gt.receive().is_err());
+                }
+                _ => {
+                    window.0.borrow_mut().regs.insert(0x130044, u32::MAX);
+                    assert_eq!(gt.poll(6), Poll::Ready(Err(GtError::Unavailable)));
+                    let writes = window.0.borrow().writes.len();
+                    assert_eq!(gt.begin_stop(7), Err(GtError::Unavailable));
+                    assert_eq!(window.0.borrow().writes.len(), writes);
+                    window.0.borrow_mut().regs.insert(0x130044, 0);
+                }
+            }
+            assert_eq!(gt.state(), GtState::Lost);
+            let live = if failure == 2 || failure == 3 { 4 } else { 3 };
+            assert_eq!(arena.live_allocations(), live);
+            gt.begin_stop(100_000_000).unwrap();
+            if gt.state() == GtState::Recovering {
+                if failure == 0 || failure == 4 {
+                    assert!(gt.poll(100_000_001).is_pending());
+                    assert_eq!(arena.live_allocations(), live);
+                }
+                window.0.borrow_mut().regs.insert(0x130044, 1);
+                assert!(gt.poll(100_000_002).is_pending());
+            }
+            assert_eq!(gt.state(), GtState::Stopping);
+            assert_eq!(gt.begin_stop(100_000_003), Err(GtError::State));
+            reset_done(&window);
+            window.0.borrow_mut().regs.insert(0xc314, 1);
+            assert!(gt.poll(100_000_004).is_pending());
+            assert_eq!(window.0.borrow().regs.get(&0xa188), Some(&3));
+            assert_eq!(arena.live_allocations(), live);
+            window.0.borrow_mut().regs.insert(0xc314, 0);
+            assert!(gt.poll(100_000_005).is_pending());
+            assert_eq!(arena.live_allocations(), 3);
+            window.0.borrow_mut().regs.insert(0x130044, 0);
+            assert_eq!(gt.poll(100_000_006), Poll::Ready(Ok(GtState::Stopped)));
+            drop(gt);
+            assert_eq!(arena.live_allocations(), 0);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_gt",
+        smoke_gt_loss_recovery_retains_dma
+    );
+
+    fn smoke_gt_wait_cancellation_and_drop() -> TestResult {
+        use core::future::Future;
+        use core::task::{Context, Waker};
+        let (window, arena, mut gt) = gt_model(GtPlatform::Battlemage, 0xdfc);
+        // The injected deadline stays distant even under TCG clock jumps.
+        gt.begin(u64::MAX - 100_000_000).unwrap();
+        {
+            let mut waiting = core::pin::pin!(gt.wait());
+            assert!(waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+        }
+        assert_eq!(gt.state(), GtState::Waking);
+        assert_eq!(window.0.borrow().regs.get(&0xa188), Some(&3));
+        assert_eq!(arena.live_allocations(), 3);
+        gt.begin_stop(1).unwrap();
+        assert_eq!(gt.poll(2), Poll::Ready(Ok(GtState::Stopped)));
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+
+        let (window, arena, mut gt) = gt_model(GtPlatform::Alchemist, 0x130044);
+        gt_ready(&mut gt, &window, 0x130044);
+        gt_ct(&mut gt, &window);
+        let weak = Rc::downgrade(&window.0);
+        drop(window);
+        drop(arena);
+        drop(gt);
+        // Even the last allocator/MMIO reference survives an unverified drop.
+        let retained = weak.upgrade().expect("quarantined GT resource owner");
+        assert_eq!(retained.borrow().memory.len(), 4);
+        assert_eq!(retained.borrow().regs.get(&0xa188), Some(&3));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_gt",
+        smoke_gt_wait_cancellation_and_drop
+    );
+
+    fn smoke_gt_platform_ack_and_discrete_coherence() -> TestResult {
+        for (platform, ack) in [
+            (
+                GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
+                0xdfc,
+            ),
+            (GtPlatform::Alchemist, 0x130044),
+            (GtPlatform::Battlemage, 0xdfc),
+        ] {
+            let (window, arena) = model();
+            window.0.borrow_mut().regs.insert(ack, 0);
+            let mut boot = stage(window.clone(), arena.clone(), platform);
+            assert_eq!(boot.begin(0), Err(BootError::NotAwake));
+            assert!(window.0.borrow().writes.is_empty());
+            drop(boot);
+            assert_eq!(arena.live_allocations(), 0);
+        }
+        let (window, arena, mut gt) = gt_model(GtPlatform::Battlemage, 0xdfc);
+        window.0.borrow_mut().coherent = false;
+        gt_ready(&mut gt, &window, 0xdfc);
+        assert_eq!(
+            gt.begin_ct(6),
+            Err(GtError::Boot(BootError::Transport(
+                TransportError::NonCoherent
+            )))
+        );
+        assert_eq!(gt.state(), GtState::Ready);
+        assert_eq!(arena.live_allocations(), 3);
+        gt_stop(&mut gt, &window, 0xdfc);
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_gt",
+        smoke_gt_platform_ack_and_discrete_coherence
     );
 }

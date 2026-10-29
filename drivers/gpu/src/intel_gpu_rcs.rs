@@ -2069,6 +2069,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
 // ABI exists above it; nothing else in the tree calls it yet.
 
 /// `MmioWindow` over the controller's BAR0 mapping.
+#[derive(Clone)]
 pub struct BarWindow {
     bar: narf_bus::bar::MmioRegion,
 }

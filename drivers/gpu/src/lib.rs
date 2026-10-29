@@ -724,6 +724,8 @@ pub mod intel_gpu_guc_boot;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_guc_firmware;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_guc_gt;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_guc_transport;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_hdmi;

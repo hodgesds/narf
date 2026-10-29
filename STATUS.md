@@ -971,10 +971,21 @@ integration, discrete memory allocation, GuC context scheduling and silicon
 acceptance remain open; this does not enable EXECBUFFER2 or add Arc display
 binding.
 
-The GuC bootstrap follow-up passes 225 selected native GPU/DRM tests on x86_64
-and 108 on aarch64, with zero failures/skips, including five bootstrap smokes
-and GT/firmware-profile identity coverage, alongside the existing 25 RCS and
-six CT-owner smokes. GPU CI Clippy passes all three
+The same branch now joins bootstrap, CT and the kernel GT forcewake request
+in `GuCGt`. A Linux-source cross-check corrected the bootstrap ACK address:
+MTL/Arrow and BMG use 0xdfc, while DG2 uses 0x130044. The owner preserves other
+requestors, bounds wake waits, blocks admission after wake/CT loss, and
+retires CT only after GuC reset plus firmware DMA idle before releasing wake.
+Cancelled waiters and uncertain drops retain the owned resources. Per-card
+PCI/runtime-PM wiring, MOCS, runtime idle, HWCONFIG and GuC context scheduling
+remain open; userspace submission remains disabled.
+
+The GuC bootstrap/GT follow-up passes 230 selected native GPU/DRM tests on
+x86_64 and 113 on aarch64, with zero failures/skips, including five bootstrap
+and five GT-owner smokes covering platform ACKs, wake ownership, DMA stop,
+CT faults, wait cancellation and last-owner quarantine. GT/firmware-profile
+identity coverage, the existing 25 RCS and six CT-owner smokes also pass.
+GPU CI Clippy passes all three
 resolved feature contexts on both targets; host all-target Clippy passes
 default, Intel-only, AMD-only and no-vendor configurations. Intel-only debug
 builds pass on both architectures, and workspace formatting is clean. A
