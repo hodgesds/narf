@@ -957,15 +957,31 @@ quarantined allocation lifetime. These are native model/ownership paths, not
 working Mesa acceleration or a firmware boot claim.
 EXECBUFFER2 still refuses submission and queries expose no userspace engines.
 Full GT/context setup, hardware reset ownership, topology, accelerated PRIME/KMS,
-Mesa OpenGL/Vulkan acceptance and Xe-LPG GuC upload/context scheduling remain open.
+Mesa OpenGL/Vulkan acceptance and Xe-LPG GuC context scheduling remain open.
 Existing Gen12 RCS/media helpers refuse Xe-LPG before MMIO.
 
-The 2026-10-28 follow-up passes the selected native GPU/DRM suites in QEMU:
-219 tests on x86_64 and 102 on aarch64, with zero failures/skips. Both include
-25 RCS and six Xe-LPG CT-owner smokes. Intel-only debug builds pass on both
-architectures; GPU all-target clippy passes for default, Intel-only, AMD-only
-and no-vendor features, and workspace formatting is clean. These results do
-not validate Intel silicon, firmware boot or Mesa rendering.
+The `codex/intel-gt-bringup` follow-up adds exact Arc Alchemist/Battlemage PCI
+and firmware profiles alongside Xe-LPG. GuC bootstrap now owns reset, WOPCM,
+minimal ADS/logs, cache-cleaned firmware DMA, authentication and bounded waits.
+Uncertain DMA lifetime retains allocations until verified stop. Discrete CT
+requires explicitly coherent memory; ordinary WB frame backing is refused.
+The hardware protocol follows the local Linux source at
+`b90c984d615e8ce2af96f5b1411a962d83fed2ad`. Per-card forcewake/PM/IRQ and MOCS
+integration, discrete memory allocation, GuC context scheduling and silicon
+acceptance remain open; this does not enable EXECBUFFER2 or add Arc display
+binding.
+
+The GuC bootstrap follow-up passes 225 selected native GPU/DRM tests on x86_64
+and 108 on aarch64, with zero failures/skips, including five bootstrap smokes
+and GT/firmware-profile identity coverage, alongside the existing 25 RCS and
+six CT-owner smokes. GPU CI Clippy passes all three
+resolved feature contexts on both targets; host all-target Clippy passes
+default, Intel-only, AMD-only and no-vendor configurations. Intel-only debug
+builds pass on both architectures, and workspace formatting is clean. A
+vendor-only MST helper is now gated when both vendors and kernel tests are
+disabled. Production boot and both btrfs interoperability checks pass on both
+architectures. These results do not validate Intel silicon, firmware boot on
+hardware or Mesa rendering.
 
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI

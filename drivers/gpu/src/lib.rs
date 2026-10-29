@@ -714,9 +714,13 @@ pub mod intel_gpu_gem;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gmbus;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_gt;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_gtt;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_guc;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_guc_boot;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_guc_firmware;
 #[cfg(feature = "intel")]

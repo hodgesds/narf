@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.11** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.12** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -10,7 +10,8 @@
 > full single-stream landed — see §14; multi-pipe
 > display + DP MST landed — see §16).
 >
-> Driver for Intel integrated graphics from Tiger Lake through Meteor Lake.
+> Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
+> render foundations also cover Arc Alchemist and Battlemage.
 > References include Intel PRMs and the cited MIT-licensed Linux i915 ABI,
 > command and register definitions.
 
@@ -1484,17 +1485,32 @@ before shared DRM/KMS dispatch and acquire mmap backing atomically.
 This is **not a working Mesa 3D backend**. Validated execbuffer requests still
 return NotImplemented. No userspace engines or acceleration capabilities are
 advertised. Gen12 production execlists helpers no longer admit Meteor/Arrow
-Lake merely because those devices have a region map. The Xe-LPG GT/GuC owner
-still needs firmware upload/authentication, context registration, scheduling,
-completion and hardware reset integration.
+Lake merely because those devices have a region map. Per-card GT/GuC integration,
+context registration, scheduling, completion and hardware reset ownership remain
+outstanding.
 `intel_gpu_guc` now supplies validated CSS component ranges and coherent CTB
 send/receive primitives. `intel_gpu_guc_firmware` acquires a bounded immutable
-MTL/Arrow GuC-70 image through invoked registry/blob capabilities, preserving
-its identity. `intel_gpu_guc_transport` owns coherent GGTT CT memory and the
+MTL/Arrow, DG2 or BMG GuC-70 image through invoked registry/blob capabilities,
+preserving its identity. `intel_gpu_guc_transport` owns coherent GGTT CT memory and the
 graphics-GuC MMIO registration/enable/disable state machine. Its partial
 registration, timeout and broken-CT paths retain allocations until disable
-acknowledgment or proven reset. These do not upload/authenticate or schedule
-firmware by themselves. Gen12 owned resident submission, cache-flushed
+acknowledgment or proven reset. `intel_gpu_gt` provides exact DG2/BMG PCI identity
+and firmware profiles, separate from the integrated display table.
+
+`intel_gpu_guc_boot` owns the GuC reset, WOPCM layout, minimal ADS/log allocation,
+cache publication, firmware DMA and authentication state machine for these three
+profiles. Bootstrap disables scheduling and advertises no engines. The sole GT
+owner must hold forcewake/runtime-PM, serialize resets/DMA and program BMG's
+uncached MOCS entry. All allocations stay above the largest admitted WOPCM window
+and below the GuC GGTT ceiling. A timeout or failed authentication retains every
+potentially live allocation; release requires verified GuC reset plus firmware
+DMA idle, or an explicit unsafe proof from the GT owner. One-shot DMA publication
+does not make shared CT cursor lines coherent: discrete CT requires an allocator
+that explicitly supplies coherent memory, and the current WB frame allocator
+refuses it. Arc identity does not add discrete cards to display probe admission
+or present system RAM as VRAM.
+
+Gen12 owned resident submission, cache-flushed
 post-sync breadcrumbs, terminal fences and loss retention now have native
 hardware models; full GT/context setup, topology, hardware reset, accelerated
 PRIME/presentation and real Mesa acceptance remain outstanding.
@@ -1520,10 +1536,19 @@ Primary references:
   MIT; fixed encoding vectors also follow `gen8_ppgtt.c` and `intel_ggtt.c`.
 - [Logical context root registers](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/i915/gt/intel_lrc_reg.h), MIT.
 - [GuC/HuC firmware layout](https://docs.kernel.org/gpu/xe/xe_firmware.html),
-  required background for the Xe-LPG firmware owner; no loader is claimed here.
+  background for the GuC firmware owner.
 - [Gen12 render and XCS completion streams](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/i915/gt/gen8_engine_cs.c),
   MIT command ordering and generation workarounds, with `gen8_engine_cs.h` and
   `intel_gpu_commands.h` bitfields.
 - [GuC CT registration](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/i915/gt/uc/intel_guc_ct.c),
   MIT; `intel_guc.c` and the actions/KLV/message ABI headers specify the MMIO
   mailbox, receive-first registration and CONTROL_CTB acknowledgment protocol.
+
+GuC bootstrap and discrete identity were cross-checked against the local Linux
+checkout at `b90c984d615e8ce2af96f5b1411a962d83fed2ad`: MIT-licensed
+`include/drm/intel/pciids.h`, `drivers/gpu/drm/xe/{xe_uc_fw.c,xe_guc.c,xe_wopcm.c,
+xe_guc_ads.c,xe_guc_fwif.h,xe_guc_tlb_inval.c,xe_ggtt.c}` and
+`drivers/gpu/drm/xe/regs/{xe_guc_regs.h,xe_gt_regs.h}`. Native Rust models pin
+the register/ADS values, reset and DMA stop proofs, cache publication failures,
+allocation rollback and discrete CT coherence refusal. They do not establish
+firmware boot on Intel silicon.

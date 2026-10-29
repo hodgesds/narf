@@ -699,6 +699,11 @@ pub enum SubmitError {
 
 /// A CPU-addressable, GGTT-mapped allocation.
 pub trait GpuBacking {
+    /// True only for a CPU mapping whose concurrent shared cache lines are
+    /// coherent with the device. One-shot cache cleaning is insufficient.
+    fn coherent_for_device(&self) -> bool {
+        false
+    }
     /// GGTT offset of the allocation's first page.
     fn ggtt_offset(&self) -> u32;
     /// Size in 4 KiB pages.
@@ -764,6 +769,46 @@ impl core::fmt::Debug for FrameBacking {
 }
 
 impl FrameBacking {
+    /// Publish WB CPU stores to firmware DMA, including non-LLC discrete GPUs.
+    pub(crate) fn publish_for_device(&self) -> bool {
+        compiler_fence(Ordering::SeqCst);
+        #[cfg(target_arch = "x86_64")]
+        {
+            let caps = narf_arch::x86_64::cache::caps();
+            let line = caps.line_bytes as usize;
+            if !caps.clflush || !line.is_power_of_two() || line > 4096 {
+                return false;
+            }
+            for frame in &self.frames {
+                let base = frame.start_address().kernel_ptr::<u8>();
+                for offset in (0..4096usize).step_by(line) {
+                    compiler_fence(Ordering::SeqCst);
+                    // SAFETY: CLFLUSH was checked and this backing owns every
+                    // mapped page; each address stays within its page.
+                    unsafe {
+                        narf_arch::x86_64::cache::clflush(base.add(offset));
+                    }
+                    compiler_fence(Ordering::SeqCst);
+                }
+                narf_scheduler::sleep_pumps::run();
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        for frame in &self.frames {
+            // SAFETY: each range is one mapped frame owned by this backing.
+            unsafe {
+                narf_arch::aarch64::cache::clean_inval_to_poc(
+                    frame.start_address().kernel_ptr::<u8>() as usize,
+                    4096,
+                );
+            }
+            narf_scheduler::sleep_pumps::run();
+        }
+        fence(Ordering::SeqCst);
+        compiler_fence(Ordering::SeqCst);
+        true
+    }
+
     /// Raw pointer to the dword at `byte_off` inside the backing.
     ///
     /// # Safety

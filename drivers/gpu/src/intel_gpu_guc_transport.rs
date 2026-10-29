@@ -7,6 +7,7 @@
 
 use crate::intel_gpu::Generation;
 use crate::intel_gpu_aux::MmioWindow;
+use crate::intel_gpu_gt::{GtPlatform, GUC_GGTT_MIN};
 use crate::intel_gpu_guc::{CtMemory, CtReceiver, CtSender, GuCError, GuCMessage};
 use crate::intel_gpu_rcs::{GpuAllocator, GpuBacking, SubmitError};
 use alloc::sync::Arc;
@@ -27,6 +28,7 @@ pub enum TransportError {
     Address,
     State,
     NotReady,
+    NonCoherent,
     Timeout,
     Protocol(u32),
     Rejected(u32),
@@ -177,17 +179,25 @@ impl<M: MmioWindow, A: GpuAllocator> core::fmt::Debug for XeLpgTransport<M, A> {
 
 impl<M: MmioWindow, A: GpuAllocator> XeLpgTransport<M, A> {
     /// No MMIO is touched by allocation, including on unsupported hardware.
-    pub fn allocate(
-        generation: Generation,
+    pub fn allocate(generation: Generation, mmio: M, allocator: A) -> Result<Self, TransportError> {
+        Self::allocate_for_platform(GtPlatform::Integrated(generation), mmio, allocator)
+    }
+
+    pub fn allocate_for_platform(
+        platform: GtPlatform,
         mmio: M,
         mut allocator: A,
     ) -> Result<Self, TransportError> {
-        if generation != Generation::MeteorLake {
+        if platform.guc().is_none() {
             return Err(TransportError::Unsupported);
         }
         let backing = allocator.alloc(PAGES).map_err(TransportError::Allocation)?;
+        if platform.is_discrete() && !backing.coherent_for_device() {
+            allocator.free(backing);
+            return Err(TransportError::NonCoherent);
+        }
         let base = backing.ggtt_offset();
-        if base < 4096
+        if base < GUC_GGTT_MIN
             || base % 4096 != 0
             || backing.size_pages() != PAGES
             || base

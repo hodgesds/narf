@@ -1,8 +1,9 @@
-//! Xe-LPG GuC image acquisition. Registry authority and device authentication
+//! Xe-LPG and discrete GuC image acquisition. Registry authority and device authentication
 //! are separate: this module authorizes a bounded immutable copy; GuC boot ROM
 //! must authenticate the vendor RSA signature before transport is enabled.
 
 use crate::intel_gpu::Generation;
+use crate::intel_gpu_gt::{GtPlatform, GuCProfile};
 use crate::intel_gpu_guc::{CssImage, GuCError};
 use alloc::vec::Vec;
 use narf_capabilities::{Cap, CapError, CapOp, Read};
@@ -21,26 +22,27 @@ pub enum FirmwareError {
 #[derive(Debug)]
 pub struct GuCFirmware {
     bytes: Vec<u8>,
+    platform: GtPlatform,
     pub digest: [u8; 32],
     pub signer: Option<[u8; 32]>,
 }
 
-struct Open;
+struct Open(GuCProfile);
 impl CapOp<narf_firmware::FirmwareRegistry, Read> for Open {
     type Output = Result<GuCFirmware, FirmwareError>;
     fn execute(
         self,
         cap: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self::Output, CapError> {
-        let blob = match narf_firmware::open(XE_LPG_GUC_NAME, cap) {
+        let blob = match narf_firmware::open(self.0.firmware, cap) {
             Ok(blob) => blob,
             Err(error) => return Ok(Err(FirmwareError::Registry(error))),
         };
-        blob.invoke(CopyImage)
+        blob.invoke(CopyImage(self.0))
     }
 }
 
-struct CopyImage;
+struct CopyImage(GuCProfile);
 impl CapOp<narf_firmware::FirmwareBlob, Read> for CopyImage {
     type Output = Result<GuCFirmware, FirmwareError>;
     fn execute(
@@ -49,7 +51,7 @@ impl CapOp<narf_firmware::FirmwareBlob, Read> for CopyImage {
     ) -> Result<Self::Output, CapError> {
         Ok((|| {
             let view = narf_firmware::view_of(cap).map_err(FirmwareError::Registry)?;
-            validate(view.bytes)?;
+            validate(self.0, view.bytes)?;
             let mut bytes = Vec::new();
             bytes
                 .try_reserve_exact(view.bytes.len())
@@ -57,6 +59,7 @@ impl CapOp<narf_firmware::FirmwareBlob, Read> for CopyImage {
             bytes.extend_from_slice(view.bytes);
             Ok(GuCFirmware {
                 bytes,
+                platform: self.0.platform,
                 digest: view.sha256,
                 signer: view.signer,
             })
@@ -64,11 +67,11 @@ impl CapOp<narf_firmware::FirmwareBlob, Read> for CopyImage {
     }
 }
 
-fn validate(bytes: &[u8]) -> Result<CssImage<'_>, FirmwareError> {
+fn validate(profile: GuCProfile, bytes: &[u8]) -> Result<CssImage<'_>, FirmwareError> {
     let image = CssImage::parse(bytes, 70).map_err(FirmwareError::Image)?;
-    // Pin the supported MTL baseline (MIT i915 intel_uc_fw.c). A matching
+    // Pin each platform's baseline (MIT xe_uc_fw.c). A matching
     // major alone must not accept older firmware with missing actions/ABIs.
-    if image.version < (70, 53, 0) || image.signature.len() != 384 {
+    if image.version < profile.minimum_version || image.signature.len() != 384 {
         return Err(FirmwareError::Image(GuCError::FirmwareVersion));
     }
     Ok(image)
@@ -79,15 +82,29 @@ impl GuCFirmware {
         generation: Generation,
         authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self, FirmwareError> {
-        // Arrow Lake is classified as MeteorLake in the canonical device table.
-        if generation != Generation::MeteorLake {
-            return Err(FirmwareError::Unsupported);
-        }
-        authority.invoke(Open).map_err(|_| FirmwareError::Revoked)?
+        Self::open_for_platform(GtPlatform::Integrated(generation), authority)
+    }
+
+    pub fn open_for_platform(
+        platform: GtPlatform,
+        authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
+    ) -> Result<Self, FirmwareError> {
+        let profile = platform.guc().ok_or(FirmwareError::Unsupported)?;
+        authority
+            .invoke(Open(profile))
+            .map_err(|_| FirmwareError::Revoked)?
+    }
+
+    pub fn platform(&self) -> GtPlatform {
+        self.platform
     }
 
     pub fn image(&self) -> CssImage<'_> {
-        validate(&self.bytes).expect("immutable authorized GuC image")
+        validate(
+            self.platform.guc().expect("authorized platform"),
+            &self.bytes,
+        )
+        .expect("immutable authorized GuC image")
     }
 }
 
@@ -124,12 +141,15 @@ mod tests {
         ] {
             put32(&mut bytes, offset, value);
         }
-        if validate(&bytes).is_err() {
+        let profile = GtPlatform::Integrated(Generation::MeteorLake)
+            .guc()
+            .unwrap();
+        if validate(profile, &bytes).is_err() {
             return TestResult::Fail("supported CSS layout rejected");
         }
         put32(&mut bytes, 64, 0x0046_3400);
         if !matches!(
-            validate(&bytes),
+            validate(profile, &bytes),
             Err(FirmwareError::Image(GuCError::FirmwareVersion))
         ) {
             return TestResult::Fail("older Xe-LPG GuC firmware admitted");

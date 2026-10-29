@@ -174,7 +174,7 @@ owns or cancels the request's residency.
 Raptor Lake and a separate Xe-LPG GuC path for Meteor/Arrow Lake. Panther Lake
 has no submission profile. Existing default RCS/media production attach paths
 admit only Gen12 before any MMIO. A display gate cannot admit a render engine.
-GuC boot/context registration/scheduling, render topology, full context setup,
+Per-card GuC boot integration/context registration/scheduling, render topology, full context setup,
 hardware reset ownership, accelerated PRIME/KMS integration and Mesa interoperability
 remain required before exposing acceleration. Graphics APIs and shader/state
 generation belong in userspace.
@@ -217,12 +217,66 @@ baseline and a 384-byte RSA signature, and retains the registry digest/signer.
 No ambient firmware authority or direct filesystem access is introduced.
 Registry authorization does not establish GuC boot-ROM authentication.
 
+`intel_gpu_gt::GtPlatform::from_pci` separates integrated display generation
+from GT identity: the canonical integrated table plus exact Linux DG2 (25)
+and BMG (13) PCI IDs. `guc()` selects MTL/Arrow, Alchemist or Battlemage's
+firmware profile; other generations have no new GuC bootstrap profile.
+Identity discovery alone neither registers an Arc display driver nor reports
+system RAM as discrete GPU memory. `GuCFirmware::open_for_platform` uses the
+same invoked-capability acquisition for `i915/dg2_guc_70.bin` (70.53.0+) and
+`xe/bmg_guc_70.bin` (70.54.0+), retaining the selected platform with the bytes.
+
+`intel_gpu_guc_boot::GuCBoot::stage` consumes a GT `BootAllocator`, an invoked-
+authority firmware image and the actual PCI ID/revision, HuC upload extent and
+already-programmed uncached MOCS index (required for BMG). It validates the
+target, WOPCM fit, GGTT extents above the reserved 8-MiB WOPCM window and
+non-overlapping allocations before MMIO;
+partial allocation failure rolls back. Its three owned allocations contain
+CSS/uCode/RSA, minimal ADS plus firmware-private data, and log storage. Minimal
+ADS uses the source-defined 16-class/32-instance layout with invalid mapping
+value 32, zero enabled engines, valid policies and owned private-data pointers.
+The log layout is one state page plus 16-KiB crash, 64-KiB event and 1-MiB
+capture buffers. Scheduler and verbose logging are disabled during bootstrap.
+
+`begin` and every active `poll` require GT forcewake acknowledged; the sole GT owner
+holds forcewake/runtime-PM and serializes reset and firmware DMA across the
+entire operation. The state machine issues GuC-domain reset, requires reset
+self-clear **and** MIA-in-reset status, validates prelocked WOPCM or programs
+and verifies its write-once registers, publishes scratch parameters and cache-
+cleaned memory, selects generation-correct GuC TLB invalidation, then starts
+CSS+uCode DMA to WOPCM offset 0x2000 with the RSA GGTT pointer separate. Default
+WOPCM is 4 MiB with 36 KiB hardware-context reservation; a prelocked layout is
+validated against the source's 8-MiB bound. BMG uses MOCS and the DESC1/DESC0
+TLB sequence. Reset, DMA and authentication have bounded deadlines; `wait`
+uses timer awaits. DMA completion precedes authentication; only non-reset
+READY plus good hardware authentication establishes `BootState::Ready`.
+Boot-ROM/uKernel errors, unreadable registers, wake loss and timeout stop
+admission and retain all resources. Dropping a waiter cannot release the
+owning buffers. Staged owners reclaim memory on drop; published owners retain
+it until `begin_stop`/`poll` proves GuC reset **and** independent firmware DMA
+idle, or an unsafe full-GT-reset release supplies that proof. GuC reset is
+not a completion/reset proof for RCS jobs.
+
+`BootAllocator::sync_for_device` is mandatory before DMA. The SharedArena
+adapter cleans every owned CPU cache line through existing architecture
+primitives, with compiler and hardware fences; cache cleaning does not prove
+concurrent CT coherence. `GpuBacking::coherent_for_device` defaults false.
+`allocate_transport` requires authenticated boot and clones the shared arena/
+MMIO owner into the CT transport; discrete transport construction additionally
+requires a backing that explicitly guarantees coherent shared cache lines.
+The existing WB FrameBacking cannot admit discrete CT. A coherent discrete
+mapping/VRAM allocator, full GT/MOCS/IRQ ownership, hardware configuration and
+submission contexts remain integration requirements.
+
 `intel_gpu_guc_transport::XeLpgTransport` owns one six-page coherent GGTT
 allocation (H2G descriptor at 0, G2H at 0x800, 4-KiB send ring at 0x1000,
-16-KiB receive ring at 0x2000). Allocation gates Xe-LPG before MMIO and checks
-the GuC GGTT ceiling. `begin_enable` requires authenticated/ready firmware;
+16-KiB receive ring at 0x2000). Allocation gates the selected GuC profile before
+MMIO and checks both the WOPCM exclusion window and GuC GGTT ceiling.
+`begin_enable` requires authenticated/ready firmware;
 MMIO SELF_CFG registers receive before send using 64-bit address KLVs and byte
-sizes, then CONTROL_CTB enables communication. Each bounded mailbox poll
+sizes, then CONTROL_CTB enables communication. `allocate_for_platform` admits
+only the explicit MTL/DG2/BMG GuC profiles; DG2/BMG also require coherent backing.
+Each bounded mailbox poll
 advances one state; BUSY/RETRY cannot extend its deadline and retries are
 bounded. `wait_transition` uses timer awaits without an IRQ lock. Cancellation
 preserves the transaction. Enabled `send` publishes CT memory before the
@@ -230,9 +284,9 @@ graphics-GuC notification; `receive` owns the opposite head cursor. Transport
 errors stop admission. `release` returns a live owner intact until either
 publication never began or MMIO DISABLE completed successfully; timeouts and
 partial registration retain memory for the unsafe, proven-reset release path.
-A CT response acknowledges an action, never render completion. Production
-firmware upload/WOPCM setup, forcewake/IRQ ownership, GuC context scheduling
-and integration with the per-card GT owner remain open; transport readiness
+A CT response acknowledges an action, never render completion. Per-card
+boot/forcewake/IRQ ownership, GuC context scheduling and hardware validation
+remain open; transport readiness
 does not enable EXECBUFFER or advertise acceleration.
 
 ### Legacy framebuffers and native mode timing
