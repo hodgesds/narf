@@ -1145,6 +1145,12 @@ protection change; a changed HT Operation still closes the station
 (`matches_beacon`). Smoke:
 `smoke_ath10k_beacon_erp_protection_reprograms_cts_all_six_dialects`.
 
+**TSPEC is inapplicable** (row removed 2026-10-28): ath10k never sets
+`NL80211_FEATURE_SUPPORTS_WMM_ADMISSION`, so `nl80211_add_tx_ts` refuses
+ADD_TX_TS and mac80211 never originates ADDTS; ACM ACs keep the
+`ieee80211_downgrade_queue` behaviour in `tx_qos.rs`. (Of the upstream
+wireless drivers only iwlwifi mvm/mld set that feature.)
+
 ## 8. Remaining software and hardware acceptance
 
 The retained validation profile is calibrated BMI boot with a signed board
