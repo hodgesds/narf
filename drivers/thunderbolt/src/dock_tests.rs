@@ -1100,13 +1100,13 @@ fn cascade_behind_tunnel(endpoint: super::tunnel::Endpoint) -> bool {
         7, 0x05, 0x02, 0x02, 0x40, 0, 0, // bulk-OUT endpoint
     ];
     ok &= match find_acm_interfaces(acm_cfg) {
-        Some((comm, data, bulk_in, bulk_out)) => {
-            comm == 0
-                && data == 1
-                && bulk_in.ep_addr == 0x81
-                && bulk_in.max_packet == 0x40
-                && bulk_out.ep_addr == 0x02
-                && bulk_out.max_packet == 0x40
+        Some(ifaces) => {
+            ifaces.comm_iface == 0
+                && ifaces.data_iface == 1
+                && ifaces.bulk_in.ep_addr == 0x81
+                && ifaces.bulk_in.max_packet == 0x40
+                && ifaces.bulk_out.ep_addr == 0x02
+                && ifaces.bulk_out.max_packet == 0x40
         }
         None => false,
     };
