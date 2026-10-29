@@ -604,3 +604,43 @@ kernel_test_in!(
     "syscall_abi/populate/permissions",
     smoke_populate_permissions
 );
+
+// Shared guards retain their object-owned frame while removing its leaf.
+// A backing-only check must not mistake that retained frame for population.
+fn smoke_populate_shared_guard_is_not_resident() -> TestResult {
+    with_aspace(|aspace| {
+        let base = map_file(
+            u64::MAX,
+            PAGE,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED | MAP_ANONYMOUS,
+        )?;
+        if madvise(base, PAGE, MADV_POPULATE_WRITE) != Some(0) {
+            return Err("shared anonymous population failed");
+        }
+        if madvise(base, PAGE, 102) != Some(0) {
+            return Err("shared guard installation failed");
+        }
+        if !aspace.is_guard_page(VirtAddr::new(base)) || mapped_frame(aspace, base).is_none() {
+            return Err("fixture must retain shared backing behind a guard");
+        }
+        for advice in [MADV_POPULATE_READ, MADV_POPULATE_WRITE] {
+            if madvise(base, PAGE, advice) != Some(ENOMEM) {
+                return Err("guarded shared backing was reported as populated");
+            }
+            if !aspace.is_guard_page(VirtAddr::new(base)) {
+                return Err("population removed a guard marker");
+            }
+        }
+        if madvise(base, PAGE, 103) != Some(0)
+            || madvise(base, PAGE, MADV_POPULATE_WRITE) != Some(0)
+        {
+            return Err("population did not recover after guard removal");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/populate/shared_guard",
+    smoke_populate_shared_guard_is_not_resident
+);

@@ -1865,10 +1865,8 @@ fn resolve_cow_page(_aspace: &AddressSpace, _va: u64) -> bool {
 /// in by the walk (the single-fault path owns that transaction; a
 /// later touch faults them in), so a range containing one reports
 /// `ENOMEM` where Linux — which swaps in on populate — would
-/// succeed; and a guarded *shared* page keeps its frame behind the
-/// guard marker, so the backing check cannot distinguish it from an
-/// installed page (the guard set is `memory/`-internal). Both are
-/// recorded on #741 as follow-ups, not silently claimed.
+/// succeed. Guard markers are checked separately from backing: a shared
+/// page can retain its frame while its leaf is deliberately inaccessible.
 ///
 /// # Safety contract
 /// `aspace` must be the caller's own address space with its root live
@@ -1935,9 +1933,10 @@ pub(crate) fn populate_range(
         if write && perms.contains(RegionPerms::COW) {
             let mut va = cur;
             while va < seg_end {
-                if aspace
-                    .page_backing(VirtAddr::new(va))
-                    .is_some_and(|(_, phys)| phys.raw() != 0)
+                if !aspace.is_guard_page(VirtAddr::new(va))
+                    && aspace
+                        .page_backing(VirtAddr::new(va))
+                        .is_some_and(|(_, phys)| phys.raw() != 0)
                     && !resolve_cow_page(aspace, va)
                 {
                     note_populate_error(&mut first_error, PopulateError::NoMemory);
@@ -1947,6 +1946,11 @@ pub(crate) fn populate_range(
         }
         let mut va = cur;
         while va < seg_end {
+            if aspace.is_guard_page(VirtAddr::new(va)) {
+                note_populate_error(&mut first_error, PopulateError::NoMemory);
+                va = va.saturating_add(4096);
+                continue;
+            }
             match aspace.page_backing(VirtAddr::new(va)) {
                 Some((_, phys)) if phys.raw() != 0 => {}
                 _ => note_populate_error(&mut first_error, PopulateError::NoMemory),
