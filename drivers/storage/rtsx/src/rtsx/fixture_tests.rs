@@ -180,6 +180,7 @@ fn write_mbr_entry(sector: &mut [u8; 512], slot: usize, ty: u8, start: u32, coun
 /// written here from the MBR layout itself, not from the parser):
 /// - p1: type 0x83 (Linux), start LBA 2048, 4096 sectors.
 /// - p2: type 0x0C (FAT32, LBA), start LBA 8192, 2048 sectors.
+///
 /// Slots 3 and 4 stay zeroed (empty entries).
 fn partitioned_mbr_sector() -> [u8; 512] {
     let mut s = [0u8; 512];
