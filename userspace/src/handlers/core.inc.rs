@@ -12106,6 +12106,9 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         // program bias. The image itself is the parent's, already mapped
         // in the shared/copied AS.
         program_bias: 0,
+        // No page-in plan (#740): nothing was loaded for this task —
+        // its pages are the parent's, already resident or shared.
+        page_in_plan: alloc::vec::Vec::new(),
     };
     let _ = DEFAULT_USER_STACK_BYTES;
 

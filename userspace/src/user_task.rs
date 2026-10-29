@@ -882,6 +882,12 @@ pub struct ExecRequest {
     pub entry: u64,
     pub stack_top: u64,
     pub fs_base: Option<u64>,
+    /// Exec page-in plan (#740) for `new_as`, carried from the loader
+    /// through the handler. The polling routine moves it into the
+    /// future's `pending_page_in` when it applies this request; the
+    /// first Initial-state entry then drives it through the bulk fault
+    /// API, once the new root is the live one.
+    pub page_in_plan: crate::loader::PageInPlan,
 }
 
 /// Per-CPU in-flight-task slot. The polling routine on each CPU
@@ -2493,6 +2499,12 @@ pub struct UserTaskFuture {
     /// address space is active, immediately before its first userspace entry,
     /// matching Linux schedule_tail().
     set_child_tid: Option<u64>,
+    /// One-shot exec page-in plan (#740), delivered by the most recent
+    /// execve swap (`ExecRequest::page_in_plan`) and consumed at the
+    /// first Initial-state entry after the new AS is activated. Empty
+    /// for every non-exec lifecycle — spawn and fork/clone resumes
+    /// never fill it, so only an execve'd image is ever clustered.
+    pending_page_in: crate::loader::PageInPlan,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2534,6 +2546,7 @@ impl UserTaskFuture {
             sleep_handle: None,
             fpu,
             set_child_tid: None,
+            pending_page_in: alloc::vec::Vec::new(),
         }
     }
 
@@ -2588,6 +2601,7 @@ impl UserTaskFuture {
             sleep_handle: None,
             fpu,
             set_child_tid: None,
+            pending_page_in: alloc::vec::Vec::new(),
         }
     }
 
@@ -3174,6 +3188,22 @@ impl core::future::Future for UserTaskFuture {
         // MOV CR3 on x86_64.
         let _ = this.process.address_space.activate();
 
+        // Exec page-in clustering (#740): at the first Initial-state
+        // entry after an execve swap, the new root has just been
+        // activated — the bulk batch's live-root contract — so drive
+        // the one-shot plan the ExecRequest delivered. Advisory: the
+        // installed count is discarded, and any page the batch skipped
+        // faults on first touch exactly as it would have unclustered.
+        // The take() makes it exactly-once: later polls (and every
+        // non-exec lifecycle, whose plan is empty) skip this entirely.
+        if matches!(this.state, TaskState::Initial) && !this.pending_page_in.is_empty() {
+            let plan = core::mem::take(&mut this.pending_page_in);
+            // SAFETY: the process AS was activated immediately above,
+            // so its root is the live one on this CPU; the plan came
+            // from loading the image mapped in that AS.
+            unsafe { crate::loader::page_in_plan(&this.process.address_space, &plan) };
+        }
+
         // Own-stack model: publish the just-loaded CR3 so the scheduler can
         // re-activate this AS on every kernel_switch resume (preempt/park) —
         // the poll runs only ONCE, so this is the sole point that records it.
@@ -3472,6 +3502,13 @@ impl core::future::Future for UserTaskFuture {
                 this.process.entry = crate::EntryPoint(narf_memory::VirtAddr::new(req.entry));
                 this.process.stack_top = narf_memory::VirtAddr::new(req.stack_top);
                 this.process.fs_base = req.fs_base;
+                // Stash the exec page-in plan (#740): the next poll
+                // activates the new AS (state Initial below) and drives
+                // the plan there, where the batch's live-root contract
+                // holds. Here the OLD image's root is still the live
+                // one, so clustering from this branch would be a
+                // contract violation, not an optimisation.
+                this.pending_page_in = req.page_in_plan;
                 this.state = TaskState::Initial;
             }
             // Repoll — the next iteration runs the Initial-state
