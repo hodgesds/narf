@@ -24,7 +24,6 @@ pub mod alienware_wmi;
 pub mod amd_aoac;
 /// AMD ASF (Alert Standard Format) transport scaffold.
 pub mod amd_asf;
-pub mod backlight;
 /// Battery / lid / buttons all consume the EC's platform-event
 /// feed. On aarch64 the equivalent path goes through SoC-specific
 /// PMIC drivers (not yet ported) — gate these on x86_64 too.
@@ -224,10 +223,11 @@ pub fn register_initcalls() {
         ec_hotkeys::init();
         InitResult::Ok
     });
-    narf_init::register(Stage::Subsys, "acpi-backlight", || {
-        backlight::init();
-        InitResult::Ok
-    });
+    // No "acpi-backlight" registration here any more (#949): the
+    // platform crate's parallel `_BCL`/`_BCM`/`_BQC` registry was
+    // retired — the single ACPI brightness owner is
+    // `narf_drivers_backlight::acpi_video`, registered from the
+    // frame composition root and arbitrated there.
     narf_init::register(Stage::Subsys, "intel-hid", || {
         intel_hid::init();
         InitResult::Ok

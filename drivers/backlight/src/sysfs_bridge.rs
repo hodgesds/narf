@@ -8,6 +8,15 @@
 //! a loser would give userspace a path that drives hardware the
 //! subsystem has decided another device owns.
 //!
+//! Publication is **dynamic** (#952): [`sync_publication`] runs
+//! after every registry change (register, unregister, test reset),
+//! so the class always mirrors the current election — a device
+//! registered from a PCI probe appears immediately, a preempted
+//! owner disappears, and a promoted candidate takes its place. The
+//! earlier one-shot snapshot taken by a Stage::Device initcall
+//! could never publish probe-registered devices, because crate
+//! Device initcalls run before `probe_all_pci` within the stage.
+//!
 //! # Attributes exposed
 //!
 //! Per device directory `/sys/class/backlight/<name>/`:
@@ -71,27 +80,62 @@ impl BlPowerState {
     }
 }
 
-// ── populate ─────────────────────────────────────────────────────────
+// ── publication ──────────────────────────────────────────────────────
 
-/// Register `/sys/class/backlight/<name>/` for the panel owner.
+/// Reconcile `/sys/class/backlight` with the elected panel owner.
 ///
-/// Only the owner elected by the single-owner arbitration is
-/// published; deferred candidates get no directory. Publication is
-/// still a snapshot taken when this runs (dynamic publication on
-/// register/unregister is the #952 follow-up); arbitration decides
-/// *which* device the snapshot may contain.
+/// The class directory is created if absent (so it exists even on
+/// a panel-less machine), any published child that is not the
+/// current owner is removed, and the owner is published if it is
+/// not already. The reconciliation is derived from the kobject
+/// tree itself rather than shadow state, so it converges to the
+/// current election regardless of the order registrations,
+/// unregistrations, and test resets interleave.
 ///
-/// Called once from the `backlight/sysfs` initcall (Stage::Device,
-/// after all hardware drivers have run their own initcalls).
+/// Called from [`crate::register_backlight`] and
+/// [`crate::unregister_backlight`] after the registry lock is
+/// dropped; concurrent reconciliations are idempotent and the last
+/// one to run observes the final election.
 ///
-/// Linux ref: `backlight_register_attrs` called from
-/// `backlight_device_register` (`drivers/video/backlight/backlight.c`).
-pub fn populate_backlight_class() {
+/// Linux ref: `backlight_register_attrs` / `backlight_device_unregister`
+/// driven from `backlight_device_register`
+/// (`drivers/video/backlight/backlight.c`).
+pub fn sync_publication() {
     let class = class_register("backlight");
-
-    if let Some(owner) = panel_owner() {
-        register_one(class, owner);
+    let owner = panel_owner();
+    let owner_name = owner.as_ref().map(|d| d.name());
+    for child in class.child_names() {
+        if Some(child.as_str()) != owner_name {
+            class.remove_child(&child);
+        }
     }
+    if let Some(owner) = owner {
+        if class.get_child(owner.name()).is_none() {
+            register_one(class, owner);
+        }
+    }
+}
+
+/// Remove `name`'s sysfs directory if it is published.
+///
+/// Used when a same-name registration replaces the device object:
+/// the published attribute closures capture the superseded `Arc`,
+/// so the directory is dropped and the following
+/// [`sync_publication`] rebuilds it against the replacement.
+pub fn unpublish(name: &str) {
+    let class = class_register("backlight");
+    class.remove_child(name);
+}
+
+/// Populate `/sys/class/backlight` for the current panel owner.
+///
+/// Kept as the body of the `backlight/sysfs` initcall (Stage::Device):
+/// it guarantees the class directory exists from boot even before
+/// any device registers, and reconciles publication with whatever
+/// the initcalls registered. Probe-time registrations afterwards
+/// publish themselves via [`sync_publication`].
+pub fn populate_backlight_class() {
+    sync_publication();
 }
 
 fn register_one(class: Arc<narf_filesystem::sysfs::Kobject>, dev: Arc<dyn BacklightDevice>) {
@@ -192,7 +236,7 @@ pub mod tests {
 
     use alloc::string::ToString;
     use alloc::sync::Arc;
-    use core::sync::atomic::Ordering;
+    use core::sync::atomic::{AtomicU32, Ordering};
 
     use narf_filesystem::sysfs::__reset_for_test as sysfs_reset;
     use narf_kernel_test::{kernel_test_in, TestResult};
@@ -390,4 +434,182 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/backlight", smoke_bl_brightness_clamp);
+
+    // ── dynamic publication fixtures (#952) ────────────────────────
+
+    /// Minimal panel stub for the publication fixtures: the ACPI
+    /// test device is always Firmware-kind, so exercising
+    /// preemption needs a stub that can present a Raw candidate.
+    #[derive(Debug)]
+    struct StubPanel {
+        name: &'static str,
+        kind: crate::BacklightKind,
+        level: AtomicU32,
+    }
+
+    impl StubPanel {
+        fn new(name: &'static str, kind: crate::BacklightKind) -> Arc<Self> {
+            Arc::new(Self {
+                name,
+                kind,
+                level: AtomicU32::new(0),
+            })
+        }
+    }
+
+    impl BacklightDevice for StubPanel {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn max_brightness(&self) -> u32 {
+            100
+        }
+        fn current_brightness(&self) -> u32 {
+            self.level.load(Ordering::Acquire)
+        }
+        fn set_brightness(&self, level: u32) {
+            self.level.store(level.min(100), Ordering::Release);
+        }
+        fn kind(&self) -> crate::BacklightKind {
+            self.kind
+        }
+    }
+
+    // ── smoke 7: publication follows registration (probe order) ───
+
+    fn smoke_bl_dynamic_publication_on_register() -> TestResult {
+        reset();
+        // A firmware candidate registers (its Stage::Device initcall
+        // on a real boot) and is published immediately — no populate
+        // call anywhere in this fixture.
+        let fw = StubPanel::new("acpi_video0", crate::BacklightKind::Firmware);
+        crate::register_backlight(fw as Arc<dyn BacklightDevice>);
+        let class = narf_filesystem::sysfs::class_register("backlight");
+        if class.get_child("acpi_video0").is_none() {
+            reset();
+            return TestResult::Fail("owner not published on register");
+        }
+        // A raw candidate arriving later (the PCI-probe order that
+        // defeated the old one-shot snapshot) preempts, and the
+        // publication swaps with the election.
+        let raw = StubPanel::new("amdgpu_bl0", crate::BacklightKind::Raw);
+        crate::register_backlight(raw.clone() as Arc<dyn BacklightDevice>);
+        if class.get_child("acpi_video0").is_some() {
+            reset();
+            return TestResult::Fail("preempted owner still published");
+        }
+        let kobj = match class.get_child("amdgpu_bl0") {
+            Some(k) => k,
+            None => {
+                reset();
+                return TestResult::Fail("preempting owner not published");
+            }
+        };
+        // The swapped-in directory is live, not a tombstone.
+        if !matches!(kobj.attr_store("brightness", b"33\n"), Some(Ok(()))) {
+            reset();
+            return TestResult::Fail("brightness store on swapped owner failed");
+        }
+        let lvl = raw.level.load(Ordering::Acquire);
+        reset();
+        if lvl != 33 {
+            return TestResult::Fail("store did not reach the swapped owner");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/backlight",
+        smoke_bl_dynamic_publication_on_register
+    );
+
+    // ── smoke 8: publication follows unregistration / promotion ───
+
+    fn smoke_bl_dynamic_publication_on_unregister() -> TestResult {
+        reset();
+        let fw = StubPanel::new("acpi_video0", crate::BacklightKind::Firmware);
+        let raw = StubPanel::new("amdgpu_bl0", crate::BacklightKind::Raw);
+        crate::register_backlight(fw as Arc<dyn BacklightDevice>);
+        crate::register_backlight(raw as Arc<dyn BacklightDevice>);
+        let class = narf_filesystem::sysfs::class_register("backlight");
+        // The owner unregisters (GPU unbind): the promoted
+        // candidate is published in its place, again with no
+        // populate call.
+        crate::unregister_backlight("amdgpu_bl0");
+        if class.get_child("amdgpu_bl0").is_some() {
+            reset();
+            return TestResult::Fail("unregistered owner still published");
+        }
+        if class.get_child("acpi_video0").is_none() {
+            reset();
+            return TestResult::Fail("promoted candidate not published");
+        }
+        // The last candidate leaves: no children remain, but the
+        // class directory itself persists.
+        crate::unregister_backlight("acpi_video0");
+        let empty = class.child_names().is_empty();
+        reset();
+        if !empty {
+            return TestResult::Fail("class not empty after last unregister");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/backlight",
+        smoke_bl_dynamic_publication_on_unregister
+    );
+
+    // ── smoke 9: Intel install publishes through arbitration (#1021)
+
+    fn smoke_bl_intel_install_publishes_via_arbitration() -> TestResult {
+        reset();
+        // Fake BAR0 covering the BXT PWM registers (the same
+        // heap-buffer pattern as the Intel PWM round-trip smoke in
+        // crate::tests — a stack array this size would overflow).
+        let buf: alloc::boxed::Box<[u8]> = alloc::vec![0u8; 0xC9000].into_boxed_slice();
+        let raw = alloc::boxed::Box::leak(buf);
+        let phys = narf_memory::PhysAddr::new(raw.as_ptr() as u64);
+        let mmio = narf_driver_runtime::MmioRegion {
+            phys,
+            virt: phys.raw(),
+            len: raw.len() as u64,
+            kind: narf_driver_runtime::BarKind::Mmio32 {
+                prefetchable: false,
+            },
+        };
+        // Seed BXT_BLC_PWM_FREQ1 (byte offset 0xC8254) with a period.
+        // SAFETY: the buffer backs the whole register window the
+        // install path touches (SOUTH_CHICKEN1 + the BXT PWM block).
+        unsafe {
+            core::ptr::write_volatile((raw.as_ptr() as *mut u32).add(0xC8254 / 4), 0x1000);
+        }
+        // The production caller: the Intel GPU probe's install hook.
+        crate::intel_bl::install(mmio);
+        // Exactly one arbitrated path: the device is the panel
+        // owner and is published with no populate call.
+        match crate::panel_owner() {
+            Some(o) if o.name() == "intel_backlight" => {}
+            _ => {
+                reset();
+                return TestResult::Fail("intel device is not the panel owner");
+            }
+        }
+        let class = narf_filesystem::sysfs::class_register("backlight");
+        let kobj = match class.get_child("intel_backlight") {
+            Some(k) => k,
+            None => {
+                reset();
+                return TestResult::Fail("intel_backlight not published on install");
+            }
+        };
+        let got = read_attr(&kobj, "type").trim().to_string();
+        reset();
+        if got != "raw" {
+            return TestResult::Fail("intel_backlight type != raw");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/backlight",
+        smoke_bl_intel_install_publishes_via_arbitration
+    );
 }
