@@ -73,6 +73,14 @@ pub enum FpVendor {
     /// bulk pair fails with `EndpointsMissing` and falls through
     /// the cascade rather than mis-binding.
     Validity,
+    /// WBDI-recognised sensor (MS OS 2.0 WINUSB/WBDI Compatible-ID,
+    /// see `wbdi`). Vendor unknown by construction: the WBDI path
+    /// runs only after the VID/PID table missed, so no vendor label
+    /// is available. Transport shape is discovered generically —
+    /// bulk pair preferred, interrupt-IN fallback — and recorded in
+    /// the device's endpoint fields, which is what `read_response`
+    /// dispatches on for this variant (#919).
+    Wbdi,
 }
 
 /// Look up a (VID, PID) pair in the single match authority and
@@ -139,6 +147,13 @@ pub enum FpEndpoints {
 /// - Synaptics / Goodix / Validity: require bulk-IN + bulk-OUT.
 /// - ELAN: require interrupt-IN (may also have bulk pair; we take
 ///   interrupt-IN because that is the polling path libfprint uses).
+/// - WBDI (vendor unknown): prefer a bulk-IN + bulk-OUT pair — the
+///   normal WinUSB sensor shape — and fall back to interrupt-IN
+///   when no bulk pair exists. The preference order is a design
+///   choice, not a spec claim: no public spec pins a WBDI sensor's
+///   endpoint shape, and both shapes are observable on real
+///   sensors. A device with neither shape is refused
+///   (`EndpointsMissing`); no endpoint is ever hallucinated.
 pub fn find_fp_endpoints(cfg: &[u8], vendor: FpVendor) -> Result<FpEndpoints, FpError> {
     if cfg.len() < 9 || cfg[1] != 0x02 {
         return Err(FpError::NotFingerprint);
@@ -230,6 +245,24 @@ pub fn find_fp_endpoints(cfg: &[u8], vendor: FpVendor) -> Result<FpEndpoints, Fp
                 config_value,
             })
         }
+        FpVendor::Wbdi => {
+            if let (Some(bi), Some(bo)) = (bulk_in, bulk_out) {
+                Ok(FpEndpoints::Bulk {
+                    bulk_in: bi,
+                    bulk_out: bo,
+                    interface: iface,
+                    config_value,
+                })
+            } else if let Some(intr) = intr_in {
+                Ok(FpEndpoints::InterruptIn {
+                    intr_in: intr,
+                    interface: iface,
+                    config_value,
+                })
+            } else {
+                Err(FpError::EndpointsMissing)
+            }
+        }
     }
 }
 
@@ -279,43 +312,64 @@ impl FingerprintDevice {
     ///
     /// For ELAN (interrupt-IN) this arms the endpoint on the first
     /// call and thereafter polls it. For Goodix / Synaptics /
-    /// Validity (bulk-IN) it issues a bulk transfer directly.
+    /// Validity (bulk-IN) it issues a bulk transfer directly. For
+    /// WBDI the transport shape is what the device was bound with:
+    /// a bulk pair reads via bulk-IN, an interrupt-only binding
+    /// reads via the interrupt path — the vendor label carries no
+    /// transport information for this variant, so dispatch is on
+    /// `bulk_out_ep` (0 = interrupt-only, exactly the ELAN
+    /// encoding).
     ///
     /// Caller must hold an `Arc<Xhci>` — call from async context or
     /// via `narf_scheduler::block_on`.
     pub async fn read_response(&self, xhci: &Xhci, buf: &mut [u8]) -> Result<usize, FpError> {
         match self.vendor {
-            FpVendor::Elan => {
-                // Arm interrupt-IN once, then poll. `poll_interrupt_in`
-                // stages the next TRB after every completed transfer, so
-                // keep exactly one TRB outstanding for this endpoint's
-                // persistent DMA buffer.
-                if !self.armed.swap(true, Ordering::AcqRel) {
-                    xhci.arm_interrupt_in(
-                        self.slot_id,
-                        self.bulk_in_ep,
-                        self.in_max_packet.min(64) as u32,
-                    )
-                    .map_err(|_| FpError::EndpointConfig)?;
-                }
-                let deadline = narf_time::Deadline::after_ms(500);
-                loop {
-                    match xhci.poll_interrupt_in(self.slot_id, self.bulk_in_ep, buf) {
-                        Ok(Some(n)) => return Ok(n),
-                        Ok(None) => {
-                            if deadline.expired() {
-                                return Ok(0);
-                            }
-                            narf_scheduler::yield_now().await;
-                        }
-                        Err(_) => return Err(FpError::EndpointConfig),
-                    }
-                }
-            }
+            // Elan dispatches through the branch's `read_interrupt_in`
+            // helper, whose body is identical to the inlined arm it
+            // replaces (arm-once + 500 ms poll loop); no behavior change.
+            FpVendor::Elan => self.read_interrupt_in(xhci, buf).await,
             FpVendor::Synaptics | FpVendor::Goodix | FpVendor::Validity => xhci
                 .bulk_in(self.slot_id, self.bulk_in_ep, buf)
                 .await
                 .map_err(|_| FpError::EndpointConfig),
+            FpVendor::Wbdi => {
+                if self.bulk_out_ep == 0 {
+                    self.read_interrupt_in(xhci, buf).await
+                } else {
+                    xhci.bulk_in(self.slot_id, self.bulk_in_ep, buf)
+                        .await
+                        .map_err(|_| FpError::EndpointConfig)
+                }
+            }
+        }
+    }
+
+    /// Interrupt-IN read path shared by ELAN and interrupt-bound
+    /// WBDI devices: arm the endpoint on the first call, then poll.
+    /// `poll_interrupt_in` stages the next TRB after every completed
+    /// transfer, so keep exactly one TRB outstanding for this
+    /// endpoint's persistent DMA buffer.
+    async fn read_interrupt_in(&self, xhci: &Xhci, buf: &mut [u8]) -> Result<usize, FpError> {
+        if !self.armed.swap(true, Ordering::AcqRel) {
+            xhci.arm_interrupt_in(
+                self.slot_id,
+                self.bulk_in_ep,
+                self.in_max_packet.min(64) as u32,
+            )
+            .map_err(|_| FpError::EndpointConfig)?;
+        }
+        let deadline = narf_time::Deadline::after_ms(500);
+        loop {
+            match xhci.poll_interrupt_in(self.slot_id, self.bulk_in_ep, buf) {
+                Ok(Some(n)) => return Ok(n),
+                Ok(None) => {
+                    if deadline.expired() {
+                        return Ok(0);
+                    }
+                    narf_scheduler::yield_now().await;
+                }
+                Err(_) => return Err(FpError::EndpointConfig),
+            }
         }
     }
 
@@ -638,15 +692,18 @@ impl narf_filesystem::FileOps for FpFileNode {
             match cmd {
                 FP_IOC_GET_INFO => {
                     // Vendor codes follow FpVendor declaration order
-                    // (Synaptics, Goodix, Elan, Validity); Validity
-                    // arrived with main's single-authority rewrite
-                    // after this match was written, so it takes the
-                    // next code rather than colliding with Synaptics.
+                    // (Synaptics, Goodix, Elan, Validity, Wbdi);
+                    // Validity arrived with main's single-authority
+                    // rewrite after this match was written, so it
+                    // takes the next code rather than colliding with
+                    // Synaptics; Wbdi likewise takes the next code
+                    // after Validity (#919).
                     let vendor_code = match dev.vendor {
                         FpVendor::Synaptics => 0u64,
                         FpVendor::Goodix => 1u64,
                         FpVendor::Elan => 2u64,
                         FpVendor::Validity => 3u64,
+                        FpVendor::Wbdi => 4u64,
                     };
                     Ok(u64::from(dev.slot_id)
                         | (vendor_code << 8)
@@ -778,6 +835,46 @@ pub fn enumerate_fp() -> Vec<(alloc::string::String, narf_filesystem::FileType)>
 
 // ── Bind entry point ──────────────────────────────────────────────────
 
+/// Build a `FingerprintDevice` record from resolved endpoints.
+/// Shared by the VID/PID bind path and the WBDI bridge so the DCI
+/// encoding is computed exactly once: bulk-IN DCI for the primary
+/// IN endpoint, bulk-OUT DCI (0 when the binding is interrupt-only).
+fn device_from_endpoints(slot_id: u8, vendor: FpVendor, eps: &FpEndpoints) -> FingerprintDevice {
+    let (bulk_in_dci, bulk_out_dci, in_max_packet) = match eps {
+        FpEndpoints::Bulk {
+            bulk_in, bulk_out, ..
+        } => {
+            let bi_dci = ep_dci(bulk_in.ep_addr, true);
+            let bo_dci = ep_dci(bulk_out.ep_addr, false);
+            (bi_dci, bo_dci, bulk_in.max_packet)
+        }
+        FpEndpoints::InterruptIn { intr_in, .. } => {
+            let dci = ep_dci(intr_in.ep_addr, true);
+            (dci, 0, intr_in.max_packet)
+        }
+    };
+    FingerprintDevice {
+        slot_id,
+        vendor,
+        bulk_in_ep: bulk_in_dci,
+        bulk_out_ep: bulk_out_dci,
+        in_max_packet,
+        armed: AtomicBool::new(false),
+    }
+}
+
+/// Register a bound device: append to [`FP_DEVICES`] and return its
+/// registry index. Publication is via the devfs provider registry
+/// (`lookup_fp` / `enumerate_fp`, installed by the `usb-fp-devfs`
+/// initcall), so every bound reader publishes as `/dev/fp<N>` by
+/// index — the first-only `/dev/fp0` special case is gone (#920),
+/// and no per-device node is installed here.
+fn register_bound_device(dev: Arc<FingerprintDevice>) -> usize {
+    let idx = FP_DEVICES.lock().len();
+    FP_DEVICES.lock().push(dev);
+    idx
+}
+
 /// Post-address fingerprint bind.
 ///
 /// Caller has already driven: port_reset → enable_slot →
@@ -830,19 +927,7 @@ pub async fn try_bind_fingerprint_already_addressed(
         .map_err(|_| FpError::SetConfiguration)?;
 
     // Build the FingerprintDevice record.
-    let (bulk_in_dci, bulk_out_dci, in_max_packet) = match eps {
-        FpEndpoints::Bulk {
-            bulk_in, bulk_out, ..
-        } => {
-            let bi_dci = ep_dci(bulk_in.ep_addr, true);
-            let bo_dci = ep_dci(bulk_out.ep_addr, false);
-            (bi_dci, bo_dci, bulk_in.max_packet)
-        }
-        FpEndpoints::InterruptIn { intr_in, .. } => {
-            let dci = ep_dci(intr_in.ep_addr, true);
-            (dci, 0, intr_in.max_packet)
-        }
-    };
+    let dev = Arc::new(device_from_endpoints(slot_id, vendor, &eps));
 
     {
         use core::fmt::Write as _;
@@ -851,6 +936,7 @@ pub async fn try_bind_fingerprint_already_addressed(
             FpVendor::Goodix => "Goodix",
             FpVendor::Elan => "ELAN",
             FpVendor::Validity => "Validity",
+            FpVendor::Wbdi => "WBDI",
         };
         let _ = writeln!(
             narf_console::Writer,
@@ -859,19 +945,10 @@ pub async fn try_bind_fingerprint_already_addressed(
             slot_id,
             vid,
             pid,
-            bulk_in_dci,
-            bulk_out_dci
+            dev.bulk_in_ep,
+            dev.bulk_out_ep
         );
     }
-
-    let dev = Arc::new(FingerprintDevice {
-        slot_id,
-        vendor,
-        bulk_in_ep: bulk_in_dci,
-        bulk_out_ep: bulk_out_dci,
-        in_max_packet,
-        armed: AtomicBool::new(false),
-    });
 
     // No per-device registration here: publication is via the
     // devfs provider registry (`lookup_fp` / `enumerate_fp`,
@@ -882,6 +959,81 @@ pub async fn try_bind_fingerprint_already_addressed(
     // ccid/ttyUSB, so the deferred scheme is just fp joining it.
     FP_DEVICES.lock().push(dev);
     Ok(())
+}
+
+/// WBDI transport bridge (#919).
+///
+/// Called by the attach cascade AFTER `wbdi` recognition succeeds
+/// for a device the VID/PID table missed. Recognition alone used to
+/// strand the reader: the match was logged into `WBDI_DEVICES`, a
+/// registry nothing read, and no endpoint was ever configured — the
+/// slot stayed alive but no driver could talk to the device.
+///
+/// The bridge gives the recognised reader the same transport the
+/// table path gives a known reader: generic endpoint discovery for
+/// the `Wbdi` vendor (bulk pair preferred, interrupt-IN fallback),
+/// xHC endpoint configuration, SET_CONFIGURATION, and a
+/// `FingerprintDevice` in [`FP_DEVICES`] — the surface a userspace
+/// daemon drives vendor commands through. It publishes as
+/// `/dev/fp<N>` by registry index via the devfs provider registry,
+/// exactly like a table-bound reader; the first bound reader is
+/// `fp0` automatically (#920).
+///
+/// Non-fatal by design: if endpoint discovery or configuration
+/// fails, the error propagates to the cascade, which logs it and
+/// still returns `WbdiFingerprint` — the slot stays alive exactly
+/// as recognition alone left it. A transport-less reader is never
+/// registered: `EndpointsMissing` means no `FingerprintDevice` is
+/// created, so no hallucinated device reaches the daemon.
+///
+/// Returns the registry index of the registered device; it
+/// publishes as `/dev/fp<N>` via the devfs provider registry.
+pub async fn try_bridge_wbdi_already_addressed(
+    xhci_dev: &Xhci,
+    slot_id: u8,
+    cfg: &[u8],
+) -> Result<usize, FpError> {
+    let eps = find_fp_endpoints(cfg, FpVendor::Wbdi)?;
+
+    let ep_configs: alloc::vec::Vec<EndpointConfig> = match eps {
+        FpEndpoints::Bulk {
+            bulk_in, bulk_out, ..
+        } => alloc::vec![bulk_in, bulk_out],
+        FpEndpoints::InterruptIn { intr_in, .. } => alloc::vec![intr_in],
+    };
+    xhci_dev
+        .configure_endpoints(slot_id, &ep_configs)
+        .await
+        .map_err(|_| FpError::EndpointConfig)?;
+
+    let cfg_value = match eps {
+        FpEndpoints::Bulk { config_value, .. } => config_value,
+        FpEndpoints::InterruptIn { config_value, .. } => config_value,
+    };
+    xhci_dev
+        .control_out(
+            slot_id,
+            0x00,
+            STD_REQ_SET_CONFIGURATION,
+            cfg_value as u16,
+            0,
+            &[],
+        )
+        .await
+        .map_err(|_| FpError::SetConfiguration)?;
+
+    let dev = Arc::new(device_from_endpoints(slot_id, FpVendor::Wbdi, &eps));
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  usb-fp: WBDI fingerprint reader slot={} iface bridged in_dci={} out_dci={}",
+            slot_id,
+            dev.bulk_in_ep,
+            dev.bulk_out_ep
+        );
+    }
+    Ok(register_bound_device(dev))
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────
@@ -1451,5 +1603,128 @@ mod tests {
             write_fut.as_mut().poll(&mut cx),
             Poll::Ready(Err(narf_filesystem::FsError::Io(_)))
         ));
+    }
+
+    // ── WBDI bridge (#919) ───────────────────────────────────────
+
+    #[test]
+    fn wbdi_bulk_pair_preferred() {
+        // WBDI-style blob: vendor-class interface + bulk pair.
+        let cfg = make_cfg_bulk(0xFF);
+        let eps = find_fp_endpoints(&cfg, FpVendor::Wbdi).expect("should find bulk pair");
+        match eps {
+            FpEndpoints::Bulk {
+                bulk_in, bulk_out, ..
+            } => {
+                assert_eq!(bulk_in.ep_addr, 0x81);
+                assert_eq!(bulk_out.ep_addr, 0x01);
+            }
+            _ => panic!("expected Bulk endpoints"),
+        }
+        // DCI encoding (xHCI §4.8.1): IN ep 1 -> 3, OUT ep 1 -> 2.
+        let dev = device_from_endpoints(5, FpVendor::Wbdi, &eps);
+        assert_eq!(dev.vendor, FpVendor::Wbdi);
+        assert_eq!(dev.slot_id, 5);
+        assert_eq!(dev.bulk_in_ep, 3);
+        assert_eq!(dev.bulk_out_ep, 2);
+    }
+
+    #[test]
+    fn wbdi_interrupt_fallback() {
+        // Interrupt-only WBDI sensor: no bulk pair, so the bridge
+        // must take the interrupt path, not fail or hallucinate.
+        let cfg = make_cfg_intr(0xFF);
+        let eps = find_fp_endpoints(&cfg, FpVendor::Wbdi).expect("should find intr-IN");
+        match eps {
+            FpEndpoints::InterruptIn { intr_in, .. } => {
+                assert_eq!(intr_in.ep_addr, 0x81);
+            }
+            _ => panic!("expected InterruptIn endpoints"),
+        }
+        let dev = device_from_endpoints(5, FpVendor::Wbdi, &eps);
+        assert_eq!(dev.bulk_out_ep, 0);
+        // bulk_out_ep == 0 is exactly what read_response dispatches
+        // on for the interrupt path.
+    }
+
+    #[test]
+    fn wbdi_bulk_preferred_over_interrupt() {
+        // Blob with both a bulk pair and an interrupt-IN endpoint:
+        // the bridge must prefer bulk (the normal WinUSB shape).
+        let mut v = alloc::vec![0u8; 39];
+        v[0] = 9;
+        v[1] = 0x02;
+        v[2] = 39;
+        v[5] = 1;
+        v[9] = 9;
+        v[10] = 0x04;
+        v[13] = 2;
+        v[14] = 0xFF;
+        // bulk-IN @ ep 0x81
+        v[18] = 7;
+        v[19] = 0x05;
+        v[20] = 0x81;
+        v[21] = 0x02;
+        v[23] = 0x02;
+        // bulk-OUT @ ep 0x01
+        v[25] = 7;
+        v[26] = 0x05;
+        v[27] = 0x01;
+        v[28] = 0x02;
+        v[30] = 0x02;
+        // interrupt-IN @ ep 0x83
+        v[32] = 7;
+        v[33] = 0x05;
+        v[34] = 0x83;
+        v[35] = 0x03;
+        v[37] = 0x40;
+        let eps = find_fp_endpoints(&v, FpVendor::Wbdi).expect("should find endpoints");
+        assert!(matches!(eps, FpEndpoints::Bulk { .. }));
+    }
+
+    #[test]
+    fn wbdi_no_endpoints_refused() {
+        // Vendor interface with no endpoints at all: the bridge
+        // must refuse, never register a transport-less device.
+        let mut v = alloc::vec![0u8; 18];
+        v[0] = 9;
+        v[1] = 0x02;
+        v[2] = 18;
+        v[5] = 1;
+        v[9] = 9;
+        v[10] = 0x04;
+        v[13] = 1;
+        v[14] = 0xFF;
+        assert!(matches!(
+            find_fp_endpoints(&v, FpVendor::Wbdi),
+            Err(FpError::EndpointsMissing)
+        ));
+        // Non-vendor interface: same refusal.
+        let cfg = make_cfg_bulk(0x03);
+        assert!(matches!(
+            find_fp_endpoints(&cfg, FpVendor::Wbdi),
+            Err(FpError::EndpointsMissing)
+        ));
+    }
+
+    #[test]
+    fn wbdi_bridge_registers_and_publishes() {
+        // The bridge's registration step, without xHCI: the first
+        // WBDI device lands in FP_DEVICES at index 0, is readable
+        // via with_device, and publishes as /dev/fp0 through the
+        // provider registry; the second lands at index 1 (fp1).
+        __reset_fp_for_test();
+        let cfg = make_cfg_bulk(0xFF);
+        let eps = find_fp_endpoints(&cfg, FpVendor::Wbdi).expect("should find bulk pair");
+        let dev = Arc::new(device_from_endpoints(7, FpVendor::Wbdi, &eps));
+        assert_eq!(register_bound_device(dev), 0);
+        assert_eq!(attached_fp_count(), 1);
+        let seen = with_device(0, |d| (d.vendor, d.slot_id, d.bulk_in_ep, d.bulk_out_ep));
+        assert_eq!(seen, Some((FpVendor::Wbdi, 7, 3, 2)));
+        let eps2 = find_fp_endpoints(&cfg, FpVendor::Wbdi).expect("should find bulk pair");
+        let dev2 = Arc::new(device_from_endpoints(8, FpVendor::Wbdi, &eps2));
+        assert_eq!(register_bound_device(dev2), 1);
+        assert_eq!(attached_fp_count(), 2);
+        __reset_fp_for_test();
     }
 }

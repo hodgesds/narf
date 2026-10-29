@@ -34,13 +34,22 @@
 //!    descriptor set. Walk it for a `FEATURE_COMPATIBLE_ID` (type
 //!    0x03, length 20) whose compatible_id is `b"WINUSB\0\0"` AND
 //!    sub_compatible_id is `b"WBDI\0\0\0\0"`.
-//! 4. On match: log + push a registry entry. Slot stays alive.
+//! 4. On match: log + return the recognition record. The attach
+//!    cascade hands it to the fingerprint transport bridge
+//!    (`fingerprint::try_bridge_wbdi_already_addressed`), which
+//!    configures the endpoints and registers the reader in
+//!    `FP_DEVICES` with a `/dev/fp0` node when first. Slot stays
+//!    alive either way (#919).
+//!
+//! There is deliberately no WBDI registry anymore: the pre-#919
+//! `WBDI_DEVICES` list had no consumer anywhere in the tree, so a
+//! recognised reader sat in it unreachable while no endpoint was
+//! ever configured. Recognition now flows directly into binding;
+//! the record below is the return value, not a registry entry.
 
 extern crate alloc;
 
 use crate::xhci::Xhci;
-use alloc::vec::Vec;
-use narf_lib::sync::IrqSafeSpinLock;
 
 /// MS OS 2.0 Platform Capability UUID, encoded as a 16-byte
 /// little-endian GUID per the MS OS 2.0 spec §3.4 Table 4.
@@ -76,17 +85,17 @@ const MS_OS_20_MAX_LEN: usize = 4096;
 const COMPATIBLE_ID_WINUSB: [u8; 8] = *b"WINUSB\0\0";
 const SUB_COMPATIBLE_ID_WBDI: [u8; 8] = *b"WBDI\0\0\0\0";
 
-/// Registry entry for a recognised WBDI sensor.
+/// Recognition record for a WBDI sensor, returned to the attach
+/// cascade so it can bridge the reader into the fingerprint stack.
+/// Not a registry entry: nothing retains these beyond the bind
+/// step (see the module docs — the pre-#919 registry had no
+/// consumer and stranded every recognised reader).
 #[derive(Debug)]
 pub struct WbdiDevice {
     pub slot_id: u8,
     /// USB interface number that carries the vendor (0xFF) class.
     pub vendor_iface: u8,
 }
-
-/// Global registry of bound WBDI sensors. Append-only — a userland
-/// fingerprint driver attaches by slot_id when it loads.
-pub static WBDI_DEVICES: IrqSafeSpinLock<Vec<WbdiDevice>> = IrqSafeSpinLock::new(Vec::new());
 
 #[derive(Copy, Clone, Debug)]
 pub enum WbdiBindError {
@@ -243,13 +252,18 @@ pub(crate) fn is_wbdi_descriptor_set(blob: &[u8]) -> bool {
 /// something other than a fingerprint sensor (plain WinUSB, MTP,
 /// etc.) — the dispatcher continues to the UnknownClass log path.
 ///
+/// Recognition only: this function configures no endpoint and
+/// registers nothing. The caller (the attach cascade) bridges a
+/// recognised reader into the fingerprint stack; see
+/// `fingerprint::try_bridge_wbdi_already_addressed`.
+///
 /// **Slot lifecycle**: does NOT call `disable_slot` on failure. The
 /// dispatcher owns the slot.
 pub async fn try_bind_wbdi_already_addressed(
     xhci_dev: &Xhci,
     slot_id: u8,
     cfg: &[u8],
-) -> Result<usize, WbdiBindError> {
+) -> Result<WbdiDevice, WbdiBindError> {
     let vendor_iface = find_vendor_interface(cfg).ok_or(WbdiBindError::NoVendorInterface)?;
     let (vendor_code, total_set) = fetch_ms_os_20_platform_cap(xhci_dev, slot_id)
         .await
@@ -283,23 +297,10 @@ pub async fn try_bind_wbdi_already_addressed(
         slot_id,
         vendor_iface
     );
-    let mut g = WBDI_DEVICES.lock();
-    let idx = g.len();
-    g.push(WbdiDevice {
+    Ok(WbdiDevice {
         slot_id,
         vendor_iface,
-    });
-    Ok(idx)
-}
-
-/// Number of WBDI sensors currently registered.
-pub fn attached_wbdi_count() -> usize {
-    WBDI_DEVICES.lock().len()
-}
-
-#[doc(hidden)]
-pub fn __reset_wbdi_for_test() {
-    WBDI_DEVICES.lock().clear();
+    })
 }
 
 #[cfg(test)]
@@ -323,6 +324,30 @@ mod tests {
         blob[12..14].copy_from_slice(&FEATURE_COMPATIBLE_ID.to_le_bytes());
         blob[14..22].copy_from_slice(b"WINUSB\0\0");
         blob[22..30].copy_from_slice(b"WBDI\0\0\0\0");
+        assert!(is_wbdi_descriptor_set(&blob));
+    }
+
+    #[test]
+    fn is_wbdi_set_finds_wbdi_after_other_feature() {
+        // A non-WBDI Compatible-ID feature precedes the WBDI one:
+        // the walk must not stop at the first feature. The bridge
+        // depends on this gate: a reader whose set lists another
+        // compatible ID first is still a WBDI sensor.
+        let mut blob = alloc::vec![0u8; 50];
+        blob[0..2].copy_from_slice(&10u16.to_le_bytes());
+        blob[2..4].copy_from_slice(&0u16.to_le_bytes());
+        blob[4..8].copy_from_slice(&0x06030000u32.to_le_bytes());
+        blob[8..10].copy_from_slice(&50u16.to_le_bytes());
+        // Feature 1: WINUSB with an unrelated sub-ID.
+        blob[10..12].copy_from_slice(&20u16.to_le_bytes());
+        blob[12..14].copy_from_slice(&FEATURE_COMPATIBLE_ID.to_le_bytes());
+        blob[14..22].copy_from_slice(b"WINUSB\0\0");
+        blob[22..30].copy_from_slice(b"OTHER\0\0\0");
+        // Feature 2: WINUSB / WBDI.
+        blob[30..32].copy_from_slice(&20u16.to_le_bytes());
+        blob[32..34].copy_from_slice(&FEATURE_COMPATIBLE_ID.to_le_bytes());
+        blob[34..42].copy_from_slice(b"WINUSB\0\0");
+        blob[42..50].copy_from_slice(b"WBDI\0\0\0\0");
         assert!(is_wbdi_descriptor_set(&blob));
     }
 

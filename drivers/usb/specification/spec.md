@@ -220,9 +220,8 @@ also consult upstream Linux GPL sources.
   installed the capability hook. The capability choice is a
   design decision, not a spec claim: no Linux capability names
   fingerprint sensors, and the raw sensor command channel is
-  raw-hardware access. (Merge interaction: #1237's WBDI bridge
-  registers `fp0` via the deleted `register_fp` API and must
-  rebase onto the provider — its first device then gets `fp0`
+  raw-hardware access. (#1237's WBDI bridge rebased onto the
+  provider in the same change — its first device then gets `fp0`
   automatically.)
 - `Xhci::get_device_descriptor(slot_id)` first reads the mandatory 8-byte
   descriptor prefix, validates and applies `bMaxPacketSize0` through Evaluate
@@ -599,6 +598,30 @@ also consult upstream Linux GPL sources.
   endpoint's DMA page; polling reports bytes consumed or a
   controller error; the pipe bounds its poll loop and surfaces
   exhaustion as a CTAP Timeout rather than blocking.
+- WBDI fingerprint readers (issue #919): `wbdi` recognises a
+  sensor by its MS OS 2.0 Compatible-ID (WINUSB with a WBDI
+  sub-compatible-ID) and runs last in the attach cascade, after
+  the VID/PID table bind — it catches only readers the table
+  missed and never shadows a table bind. Recognition alone
+  configures nothing; the cascade bridges a recognised reader
+  into the fingerprint stack via
+  `fingerprint::try_bridge_wbdi_already_addressed`, which
+  discovers endpoints generically for the `FpVendor::Wbdi`
+  vendor (bulk-IN + bulk-OUT preferred, interrupt-IN fallback —
+  a design choice, not a spec claim, since no public spec pins
+  a WBDI sensor's endpoint shape), issues SET_CONFIGURATION,
+  configures the endpoints, and registers a
+  `FingerprintDevice` in `FP_DEVICES`, which publishes as
+  `/dev/fp<N>` by registry index via the devfs provider
+  registry — the same consumer surface a table-bound reader
+  gets. The bridge is non-fatal: on failure the outcome is
+  still `WbdiFingerprint` and the slot stays alive as
+  recognition alone left it, and a reader with no usable
+  endpoint is never registered. The pre-#919 `WBDI_DEVICES`
+  registry was deleted in the same change: it had no consumer
+  anywhere in the tree, so it stranded every recognised reader.
+  Detach removal for `FP_DEVICES` is the #922 follow-up, shared
+  with the table path (append-only for now).
 
 ## Scope
 
