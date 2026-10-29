@@ -43,9 +43,13 @@ narf-kernel-test  = { path = "../../verification/kernel-test" }
 # Each storage controller is a selectable dual-build crate. `default` enables
 # them all, so the built kernel compiles the same set as before the split.
 default = ["ahci", "megaraid", "mpt3sas", "rtsx", "sdhci", "smartpqi", "vmd"]
-# Declared so frame's `narf-drivers-storage/kernel-test` dep resolves; the only
-# source-level consumer is rtsx's block_bridge, so propagate there.
-kernel-test = ["narf-drivers-storage-rtsx?/kernel-test"]
+# Declared so frame's `narf-drivers-storage/kernel-test` dep resolves; the
+# source-level consumers are rtsx's block_bridge / fixture tests and
+# sdhci's fixture tests, so propagate to both.
+kernel-test = [
+    "narf-drivers-storage-rtsx?/kernel-test",
+    "narf-drivers-storage-sdhci?/kernel-test",
+]
 ahci = ["dep:narf-drivers-storage-ahci"]
 megaraid = ["dep:narf-drivers-storage-megaraid"]
 mpt3sas = ["dep:narf-drivers-storage-mpt3sas"]

@@ -20,6 +20,8 @@ builtin = [
     "dep:narf-lib", "dep:narf-memory", "dep:narf-scheduler", "dep:narf-time",
 ]
 module = []
+# Source-level cfg in sdhci.rs; declared to satisfy unexpected_cfgs.
+kernel-test = []
 [dependencies]
 narf-driver-macros = { path = "../../../driver-macros" }
 narf-drivers-storage-core = { path = "../core", optional = true }

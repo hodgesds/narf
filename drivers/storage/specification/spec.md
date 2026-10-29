@@ -88,7 +88,17 @@ All driver code is derived strictly from the references below.
   power on at 3.3 V, supply 400 kHz init clock, run the SD
   identification sequence (CMD0 / CMD8 / ACMD41 / CMD2 / CMD3 / CMD7
   / CMD16), single-block PIO `read_block` / `write_block` on top of
-  CMD17 / CMD24, error reporting via NIS_ERROR + EIS.
+  CMD17 / CMD24, error reporting via NIS_ERROR + EIS. Identified
+  cards are published as `sdhci0` with a partition scan
+  (`sdhci0p<m>`) (#834). Register access runs through an
+  `SdhciTransport` seam (BAR0 MMIO in production), so the
+  identify → publish conversation is fixture-modelled end to end.
+- **RTSX** (`rtsx`): Realtek PCIe SD card reader — probe, card
+  identify (real CID/CSD decoded via `sd_proto`), single-block
+  CMD17 / CMD24 block I/O over the ping-pong buffer. Cards are
+  published as `mmcblk0` with real CID sysfs identity and a
+  partition scan (`mmcblk0p<m>`); card removal withdraws the
+  partitions together with the parent (#834).
 - **eMMC EXT_CSD** (`emmc`): clean-room JEDEC JESD84-B51 EXT_CSD
   register decoder. Parses revision, CARD_TYPE flags (HS_26 /
   HS_52 / HS200 / HS400 with 1V8 + 1V2 variants), bus width,
