@@ -248,11 +248,14 @@ pub const CTRL_RTS: u16 = 1 << 1;
 // ── Live driver: discovery + bind + bulk-IN pump ──────────────────
 
 extern crate alloc;
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::cdc::{CDC_SUBCLASS_ACM, USB_CLASS_CDC_COMM, USB_CLASS_CDC_DATA};
+use crate::serial::port::{apply_plan, ControlTransport, ControlXfer};
 use crate::xhci::{EndpointConfig, EndpointKind, PortSpeed, Xhci, XhciError};
 
 /// `bmRequestType` for ACM class requests (Host-to-Device, Class,
@@ -276,8 +279,20 @@ pub struct AcmDevice {
     pub bulk_in_dci: u8,
     /// DCI of the bulk-OUT endpoint (host-to-device bytes).
     pub bulk_out_dci: u8,
-    /// Cached negotiated line coding for diagnostics + GET retries.
-    pub line_coding: LineCoding,
+    /// Live line coding: the bind default, updated by every
+    /// successful `CdcAcmPort::set_line_coding`. This is the
+    /// state the suspend/resume replay replays (#763), so it
+    /// tracks actuations, not just the bind.
+    pub line_coding: IrqSafeSpinLock<LineCoding>,
+    /// Last control-line bitmask (`CTRL_DTR` / `CTRL_RTS`)
+    /// successfully driven via `SET_CONTROL_LINE_STATE`;
+    /// replayed with the line coding on resume (#763).
+    pub control_lines: AtomicU16,
+    /// (hub registry index, downstream port) this device sits
+    /// behind, when bound through a hub — the wake target for
+    /// runtime hub-port resume (#763, mirroring #840 for HID).
+    /// `None` for root-hub devices.
+    pub hub_port: Option<(usize, u8)>,
 }
 
 /// Global registry of bound CDC-ACM devices. Populated by
@@ -422,7 +437,7 @@ impl CdcAcmPort {
         parity: u8,
         stop: u8,
     ) -> Result<(), CdcError> {
-        let coding_bytes = LineCoding {
+        let coding = LineCoding {
             baud_rate: baud,
             data_bits: bits,
             parity: match parity {
@@ -439,18 +454,17 @@ impl CdcAcmPort {
                 2 => StopBits::Two,
                 _ => return Err(CdcError::MalformedField),
             },
-        }
-        .encode();
-        // Build the SETUP packet — the actual submit is async but
-        // we can't have an async fn here without making this the
-        // whole CdcAcmPort `set_line_coding` a future.  Encode the
-        // SETUP payload and return an error token so the caller can
-        // `block_on` / `.await` the real control_out when ready.
-        // For now, the control transfer is issued synchronously
-        // by parking on the xHCI command ring via `block_on`.
-        narf_scheduler::block_on(async {
-            let _ = self
-                .xhci
+        };
+        let coding_bytes = coding.encode();
+        // The transfer is issued synchronously by parking on the
+        // xHCI command ring via `block_on`. The cached line
+        // coding updates only on success: the suspend/resume
+        // replay (#763) replays the cache, so it must describe
+        // the state the device is actually in — never a request
+        // the device refused. A failed transfer is a typed
+        // error, not the old silent `Ok`.
+        let sent = narf_scheduler::block_on(async {
+            self.xhci
                 .control_out(
                     self.dev.slot_id,
                     RT_HOST_TO_DEV_CLASS_IFACE,
@@ -459,18 +473,23 @@ impl CdcAcmPort {
                     self.dev.comm_iface as u16,
                     &coding_bytes,
                 )
-                .await;
+                .await
         });
-        Ok(())
+        match sent {
+            Ok(_) => {
+                *self.dev.line_coding.lock() = coding;
+                Ok(())
+            }
+            Err(_) => Err(CdcError::Transfer),
+        }
     }
 
     /// Send `SET_CONTROL_LINE_STATE` — sets DTR (`bit 0`) and RTS
     /// (`bit 1`) in the `wValue` field per PSTN 1.2 §6.3.12.
     pub fn set_control_lines(&self, dtr: bool, rts: bool) -> Result<(), CdcError> {
         let state: u16 = if dtr { CTRL_DTR } else { 0 } | if rts { CTRL_RTS } else { 0 };
-        narf_scheduler::block_on(async {
-            let _ = self
-                .xhci
+        let sent = narf_scheduler::block_on(async {
+            self.xhci
                 .control_out(
                     self.dev.slot_id,
                     RT_HOST_TO_DEV_CLASS_IFACE,
@@ -479,9 +498,17 @@ impl CdcAcmPort {
                     self.dev.comm_iface as u16,
                     &[],
                 )
-                .await;
+                .await
         });
-        Ok(())
+        match sent {
+            Ok(_) => {
+                // Recorded for the resume replay (#763) only once
+                // the device has actually taken the state.
+                self.dev.control_lines.store(state, Ordering::SeqCst);
+                Ok(())
+            }
+            Err(_) => Err(CdcError::Transfer),
+        }
     }
 
     /// Receive up to `buf.len()` bytes from the device's bulk-IN
@@ -514,6 +541,7 @@ pub async fn try_bind_cdc_acm_already_addressed(
     slot_id: u8,
     cfg: &[u8],
     speed: PortSpeed,
+    hub_port: Option<(usize, u8)>,
 ) -> Result<(), CdcError> {
     let _ = speed; // reserved for future MaxPacketSize-aware setup
     let (comm_iface, data_iface, bulk_in, bulk_out) =
@@ -589,7 +617,9 @@ pub async fn try_bind_cdc_acm_already_addressed(
         comm_iface,
         bulk_in_dci,
         bulk_out_dci,
-        line_coding: coding,
+        line_coding: IrqSafeSpinLock::new(coding),
+        control_lines: AtomicU16::new(CTRL_DTR | CTRL_RTS),
+        hub_port,
     });
     if should_announce_attach(slot_id) {
         use core::fmt::Write as _;
@@ -620,12 +650,173 @@ pub fn clear_acm() {
     ACM_DEVICES.lock().clear();
 }
 
+// ── Suspend / resume (system PM) ──────────────────────────────────
+//
+// #763: before this lane nothing replayed ACM state after S3 —
+// the bind-time SET_LINE_CODING / SET_CONTROL_LINE_STATE ran
+// once, ever, so a dongle that lost power in S3 came back with
+// its UART unconfigured and DTR dropped (modems lose carrier,
+// dev-board consoles die, no error anywhere). The class
+// registers an async system-PM hook (`narf_power::system_pm`):
+// prepare latches the pump quiesced before the synchronous
+// device fan-out gates the controller; resume (which runs after
+// the fan-out restored xHCI) replays each bound device's saved
+// line coding + control lines in bind order. State is saved
+// continuously — the `CdcAcmPort` setters commit to the device
+// record only on transfer success — so prepare has nothing to
+// snapshot.
+
+/// Pump quiesce latch: set by the PM prepare hook, cleared when
+/// the resume replay settles. While set, `pump_all` leaves every
+/// endpoint alone.
+static ACM_PM_SUSPENDED: AtomicBool = AtomicBool::new(false);
+
+/// True while the class is quiesced for system suspend.
+pub fn pm_quiesced() -> bool {
+    ACM_PM_SUSPENDED.load(Ordering::SeqCst)
+}
+
+fn pm_prepare() {
+    ACM_PM_SUSPENDED.store(true, Ordering::SeqCst);
+}
+
+fn pm_finish_resume() {
+    ACM_PM_SUSPENDED.store(false, Ordering::SeqCst);
+}
+
+/// The bind-time control sequence for one device, rebuilt from
+/// its saved state: `SET_LINE_CODING` then
+/// `SET_CONTROL_LINE_STATE`, the order bind issues them (PSTN
+/// 1.2 §6.3.10 / §6.3.12). Pure — the fixtures pin it
+/// byte-for-byte.
+pub fn resume_plan(dev: &AcmDevice) -> Vec<ControlXfer> {
+    let coding = *dev.line_coding.lock();
+    let state = dev.control_lines.load(Ordering::SeqCst);
+    alloc::vec![
+        ControlXfer::with_data(
+            RT_HOST_TO_DEV_CLASS_IFACE,
+            REQ_SET_LINE_CODING,
+            0,
+            dev.comm_iface as u16,
+            &coding.encode(),
+        ),
+        ControlXfer::new(
+            RT_HOST_TO_DEV_CLASS_IFACE,
+            REQ_SET_CONTROL_LINE_STATE,
+            state,
+            dev.comm_iface as u16,
+        ),
+    ]
+}
+
+/// Replay every bound device's saved state over `transport`.
+/// A device that detached while suspended is absent from the
+/// registry and gets no replay; a device whose slot refuses the
+/// transfers fails typed (`DriverError`) without stopping the
+/// remaining devices' replays.
+pub async fn resume_replay<T: ControlTransport + ?Sized>(
+    transport: &T,
+) -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    let devs: Vec<Arc<AcmDevice>> = ACM_DEVICES.lock().clone();
+    let mut failed = false;
+    for dev in &devs {
+        if apply_plan(transport, dev.slot_id, &resume_plan(dev))
+            .await
+            .is_err()
+        {
+            failed = true;
+        }
+    }
+    if failed {
+        Err(narf_power::device_pm::DeviceSuspendError::DriverError)
+    } else {
+        Ok(())
+    }
+}
+
+struct AcmSystemPm;
+
+impl narf_power::system_pm::AsyncSystemPm for AcmSystemPm {
+    fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        Box::pin(async {
+            pm_prepare();
+            Ok(())
+        })
+    }
+
+    fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        Box::pin(async {
+            let result = match crate::xhci::controller() {
+                Some(xhci) => resume_replay(xhci.as_ref()).await,
+                None => {
+                    if attached_count() == 0 {
+                        Ok(())
+                    } else {
+                        Err(narf_power::device_pm::DeviceSuspendError::DriverError)
+                    }
+                }
+            };
+            pm_finish_resume();
+            result
+        })
+    }
+}
+
+/// Register the class's async system-PM hook. Called once from
+/// the USB crate's Stage::Subsys initcalls; registration is
+/// idempotent on the hook name.
+pub fn register_pm() {
+    narf_power::system_pm::register_async_system_pm("cdc-acm", Arc::new(AcmSystemPm));
+}
+
+/// (hub index, port) pairs with a live ACM binding — the
+/// pure-filter input for the supervisor's hub-port wake step.
+pub fn hub_ports() -> Vec<(usize, u8)> {
+    let mut v: Vec<(usize, u8)> = {
+        let g = ACM_DEVICES.lock();
+        g.iter().filter_map(|d| d.hub_port).collect()
+    };
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Supervisor wake step for hub-attached ACM, run immediately
+/// before `pump_all` each cycle (#763; the #840 HID pattern). A
+/// suspended hub port gates the device's endpoints, so an ACM
+/// console behind an autosuspended port would stay dead even
+/// though it is bound and pumped every cycle. The wake opens a
+/// fresh idle window, so a silent device re-suspends after a
+/// full idle window rather than being held awake.
+pub async fn resume_suspended_hub_ports(xhci_dev: &Xhci) {
+    // Collect binding contexts first, then snapshot the hub
+    // registry — never hold HUBS across the ACM registry lock
+    // (the pumps nest the other way via `mark_port_activity`).
+    let ports = hub_ports();
+    let targets = {
+        let g = crate::attach::HUBS.lock();
+        crate::attach::suspended_ports_among(&g[..], &ports)
+    };
+    for (hub_idx, port) in targets {
+        crate::attach::resume_port(xhci_dev, hub_idx, port).await;
+        if !crate::attach::hub_port_is_suspended(hub_idx, port) {
+            crate::attach::mark_port_activity(hub_idx, port);
+        }
+    }
+}
+
 /// Drain one report from each bound ACM device's bulk-IN endpoint
 /// and forward the bytes to the global input ring as
 /// [`narf_input::InputEvent::AsciiByte`] events. `/dev/console` reads
 /// pop these the same way it consumes UART input — so a USB serial
 /// adaptor wired to a debug header becomes a kernel console source.
 pub fn pump_all(xhci_dev: &Xhci) -> usize {
+    // Quiesced for system suspend (#763): the PM prepare hook
+    // latches this before the controller fan-out; leave every
+    // endpoint alone until the resume replay settles.
+    if pm_quiesced() {
+        return 0;
+    }
     let devs: Vec<Arc<AcmDevice>> = {
         let g = ACM_DEVICES.lock();
         g.clone()
@@ -895,7 +1086,9 @@ pub mod tests {
             comm_iface: 0,
             bulk_in_dci: 3,
             bulk_out_dci: 2,
-            line_coding: LineCoding::N_115200_8N1,
+            line_coding: IrqSafeSpinLock::new(LineCoding::N_115200_8N1),
+            control_lines: AtomicU16::new(CTRL_DTR | CTRL_RTS),
+            hub_port: None,
         }));
         if attached_count() != baseline + 1 {
             return TestResult::Fail("fabricated binding not registered");
@@ -1130,4 +1323,269 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/cdc_acm", smoke_iad_acm_data_bind_detect);
+
+    // ── Suspend / resume replay (#763) ───────────────────────
+
+    use crate::serial::port::PortError;
+
+    /// Recording `ControlTransport` fake (the serial layer's
+    /// seam): logs every transfer as (slot, xfer) and refuses
+    /// transfers for scripted dead slots.
+    struct FakeTransport {
+        log: IrqSafeSpinLock<Vec<(u8, ControlXfer)>>,
+        dead: Vec<u8>,
+    }
+
+    impl FakeTransport {
+        fn new(dead: Vec<u8>) -> Self {
+            FakeTransport {
+                log: IrqSafeSpinLock::new(Vec::new()),
+                dead,
+            }
+        }
+    }
+
+    impl ControlTransport for FakeTransport {
+        async fn control_out(
+            &self,
+            slot_id: u8,
+            bm_request_type: u8,
+            b_request: u8,
+            w_value: u16,
+            w_index: u16,
+            data: &[u8],
+        ) -> Result<(), PortError> {
+            if self.dead.contains(&slot_id) {
+                return Err(PortError::Transfer);
+            }
+            let mut x = ControlXfer::new(bm_request_type, b_request, w_value, w_index);
+            x.data.extend_from_slice(data);
+            self.log.lock().push((slot_id, x));
+            Ok(())
+        }
+    }
+
+    fn fabricate_acm(
+        slot_id: u8,
+        comm_iface: u8,
+        coding: LineCoding,
+        control_lines: u16,
+    ) -> Arc<AcmDevice> {
+        let dev = Arc::new(AcmDevice {
+            slot_id,
+            data_iface: comm_iface + 1,
+            comm_iface,
+            bulk_in_dci: 3,
+            bulk_out_dci: 2,
+            line_coding: IrqSafeSpinLock::new(coding),
+            control_lines: AtomicU16::new(control_lines),
+            hub_port: None,
+        });
+        ACM_DEVICES.lock().push(dev.clone());
+        dev
+    }
+
+    fn smoke_acm_resume_plan_byte_exact() -> TestResult {
+        // Saved state deliberately NOT the bind default: 9600
+        // 7E2 (PSTN Table 17 encoding: dwDTERate 9600 LE =
+        // 80 25 00 00, bCharFormat 2 = 2 stop bits, bParityType
+        // 2 = Even, bDataBits 7) and DTR only on iface 2.
+        let dev = fabricate_acm(
+            231,
+            2,
+            LineCoding {
+                baud_rate: 9_600,
+                stop_bits: StopBits::Two,
+                parity: Parity::Even,
+                data_bits: 7,
+            },
+            CTRL_DTR,
+        );
+        let plan = resume_plan(&dev);
+        detach_acm(231);
+        if plan.len() != 2 {
+            return TestResult::Fail("resume plan must be the two bind transfers");
+        }
+        let lc = &plan[0];
+        if lc.bm_request_type != RT_HOST_TO_DEV_CLASS_IFACE
+            || lc.b_request != REQ_SET_LINE_CODING
+            || lc.w_value != 0
+            || lc.w_index != 2
+            || lc.data != [0x80, 0x25, 0x00, 0x00, 2, 2, 7]
+        {
+            return TestResult::Fail("resume SET_LINE_CODING step is not byte-exact");
+        }
+        let cls = &plan[1];
+        if cls.bm_request_type != RT_HOST_TO_DEV_CLASS_IFACE
+            || cls.b_request != REQ_SET_CONTROL_LINE_STATE
+            || cls.w_value != CTRL_DTR
+            || cls.w_index != 2
+            || !cls.data.is_empty()
+        {
+            return TestResult::Fail("resume SET_CONTROL_LINE_STATE step is not byte-exact");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_acm", smoke_acm_resume_plan_byte_exact);
+
+    fn smoke_acm_resume_plan_devices_do_not_cross() -> TestResult {
+        // Masking-defeating: two devices whose saved states
+        // differ in every field. Each plan must carry its own
+        // device's iface, coding bytes and control lines — a
+        // replay that mixed them would still "succeed" on the
+        // wire, so the plans themselves are asserted.
+        let a = fabricate_acm(231, 0, LineCoding::N_115200_8N1, CTRL_DTR | CTRL_RTS);
+        let b = fabricate_acm(
+            232,
+            3,
+            LineCoding {
+                baud_rate: 9_600,
+                stop_bits: StopBits::Two,
+                parity: Parity::Even,
+                data_bits: 7,
+            },
+            CTRL_DTR,
+        );
+        let pa = resume_plan(&a);
+        let pb = resume_plan(&b);
+        detach_acm(231);
+        detach_acm(232);
+        if pa[0].w_index != 0
+            || pa[0].data != [0x00, 0xC2, 0x01, 0x00, 0, 0, 8]
+            || pa[1].w_value != 3
+        {
+            return TestResult::Fail("device A plan lost its own state");
+        }
+        if pb[0].w_index != 3
+            || pb[0].data != [0x80, 0x25, 0x00, 0x00, 2, 2, 7]
+            || pb[1].w_value != 1
+        {
+            return TestResult::Fail("device B plan lost its own state");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/cdc_acm",
+        smoke_acm_resume_plan_devices_do_not_cross
+    );
+
+    fn smoke_acm_resume_replay_fake_conversation() -> TestResult {
+        let a = fabricate_acm(231, 0, LineCoding::N_115200_8N1, CTRL_DTR | CTRL_RTS);
+        let b = fabricate_acm(
+            232,
+            3,
+            LineCoding {
+                baud_rate: 9_600,
+                stop_bits: StopBits::Two,
+                parity: Parity::Even,
+                data_bits: 7,
+            },
+            CTRL_DTR,
+        );
+        let plan_a = resume_plan(&a);
+        let plan_b = resume_plan(&b);
+        let fake = FakeTransport::new(Vec::new());
+        let result = narf_scheduler::block_on_spin(resume_replay(&fake));
+        detach_acm(231);
+        detach_acm(232);
+        if result.is_err() {
+            return TestResult::Fail("resume replay over a healthy fake must succeed");
+        }
+        // Transcript: device A's two transfers (slot 231) then
+        // device B's (slot 232) — registry order, bind order
+        // within each device.
+        let log = fake.log.lock();
+        let mut expected: Vec<(u8, &ControlXfer)> = Vec::new();
+        for x in &plan_a {
+            expected.push((231, x));
+        }
+        for x in &plan_b {
+            expected.push((232, x));
+        }
+        if log.len() != expected.len()
+            || !log
+                .iter()
+                .zip(expected.iter())
+                .all(|((slot, got), (want_slot, want))| slot == want_slot && got == *want)
+        {
+            return TestResult::Fail("resume transcript is not the two plans in order");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/cdc_acm",
+        smoke_acm_resume_replay_fake_conversation
+    );
+
+    fn smoke_acm_resume_replay_dead_and_detached() -> TestResult {
+        let a = fabricate_acm(231, 0, LineCoding::N_115200_8N1, CTRL_DTR | CTRL_RTS);
+        let _b = fabricate_acm(232, 3, LineCoding::N_9600_8N1, CTRL_DTR | CTRL_RTS);
+        let plan_a = resume_plan(&a);
+        // Dead slot: 232's device vanished across the sleep
+        // without a detach (slot refuses every transfer). The
+        // replay must fail typed, deliver 231's plan in full,
+        // and put nothing on the dead slot.
+        let fake = FakeTransport::new(alloc::vec![232]);
+        let result = narf_scheduler::block_on_spin(resume_replay(&fake));
+        match result {
+            Err(narf_power::device_pm::DeviceSuspendError::DriverError) => {}
+            _ => return TestResult::Fail("dead slot must fail the replay typed DriverError"),
+        }
+        {
+            let log = fake.log.lock();
+            if log.iter().any(|(slot, _)| *slot == 232) {
+                return TestResult::Fail("dead slot must receive no transfers");
+            }
+            if log.len() != plan_a.len()
+                || !log
+                    .iter()
+                    .zip(plan_a.iter())
+                    .all(|((slot, got), want)| *slot == 231 && got == want)
+            {
+                return TestResult::Fail("surviving device's plan must replay in full");
+            }
+        }
+        // Detached while suspended: 232 leaves the registry, so
+        // the next replay has nothing to replay into the void —
+        // it succeeds with only 231's transfers.
+        detach_acm(232);
+        let fake2 = FakeTransport::new(Vec::new());
+        let result2 = narf_scheduler::block_on_spin(resume_replay(&fake2));
+        detach_acm(231);
+        if result2.is_err() {
+            return TestResult::Fail("replay after detach must succeed");
+        }
+        let log2 = fake2.log.lock();
+        if log2.len() != plan_a.len()
+            || !log2
+                .iter()
+                .zip(plan_a.iter())
+                .all(|((slot, got), want)| *slot == 231 && got == want)
+        {
+            return TestResult::Fail("detached device must get no replay");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/cdc_acm",
+        smoke_acm_resume_replay_dead_and_detached
+    );
+
+    fn smoke_acm_pm_latch() -> TestResult {
+        // The latch the prepare/resume hooks drive: the pump
+        // consults `pm_quiesced` before touching any endpoint.
+        if pm_quiesced() {
+            return TestResult::Fail("pm latch must start clear");
+        }
+        pm_prepare();
+        if !pm_quiesced() {
+            return TestResult::Fail("pm_prepare must latch the quiesce");
+        }
+        pm_finish_resume();
+        if pm_quiesced() {
+            return TestResult::Fail("pm_finish_resume must clear the quiesce");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_acm", smoke_acm_pm_latch);
 }
