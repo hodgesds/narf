@@ -315,6 +315,28 @@ pub(crate) async fn owner() -> narf_lib::mutex::MutexGuard<'static, Option<boot:
     OWNER.lock().await
 }
 
+/// Controller before OWNER, with an activation/epoch recheck under OWNER.
+/// A transition cannot power GC down while the returned owner is held.
+pub(crate) async fn gc_owner() -> Result<
+    (
+        crate::amdgpu_navi22_gfxoff::Reference,
+        narf_lib::mutex::MutexGuard<'static, Option<boot::ColdBoot>>,
+    ),
+    narf_filesystem::FsError,
+> {
+    loop {
+        let power = crate::amdgpu_navi22_gfxoff::Reference::acquire()
+            .await
+            .map_err(|_| narf_filesystem::FsError::NoDevice)?;
+        let owner = OWNER.lock().await;
+        if power.covers_access() {
+            return Ok((power, owner));
+        }
+        drop(owner);
+        drop(power);
+    }
+}
+
 /// Runtime services of a completed (or recovered) owner: PMFW telemetry and
 /// hwmon, then the SMU11 thermal interrupts. They run as executor tasks that
 /// take the owner lock per refresh. Failures are reported, never fatal.
@@ -328,6 +350,7 @@ async fn start_services(boot: &mut boot::ColdBoot) {
         crate::amdgpu_navi22_cs::register(boot).await;
     }
     start_hotplug(boot);
+    crate::amdgpu_vcn_navi22::idle::start();
     if boot.queues_verified() {
         crate::amdgpu_navi22_tdr::start();
     }
@@ -411,10 +434,9 @@ pub(crate) fn display_engines_requested() -> bool {
 pub(crate) async fn queue_progress(
 ) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_tdr::Progress>, boot::Error> {
     // The sample reads CP registers: hold GC powered (no-op without GFXOFF).
-    let _gc = crate::amdgpu_navi22_gfxoff::Reference::acquire()
-        .await
-        .map_err(|_| boot::Error::Busy)?;
-    let mut owner = OWNER.lock().await;
+    // A failed power lease is terminal, not temporary owner contention;
+    // the watchdog must abandon waiters instead of retrying forever.
+    let (_gc, mut owner) = gc_owner().await.map_err(|_| boot::Error::Invalid)?;
     owner.as_mut().ok_or(boot::Error::Invalid)?.queue_progress()
 }
 
@@ -438,6 +460,7 @@ impl crate::amdgpu_navi22_recovery::Backend for Recovering<'_> {
         }
     }
     async fn quiesce(&mut self) -> Result<(), boot::Error> {
+        crate::amdgpu_vcn_navi22::idle::stop();
         crate::amdgpu_navi22_tdr::stop();
         crate::amdgpu_navi22_thermal::stop();
         crate::amdgpu_navi22_power::stop(None);
@@ -469,6 +492,9 @@ impl crate::amdgpu_navi22_recovery::Backend for Recovering<'_> {
         relight_after_recovery();
     }
     fn lose(&mut self) {
+        crate::amdgpu_vcn_navi22::idle::stop();
+        crate::amdgpu_navi22_gfxoff::device_lost();
+        crate::amdgpu_navi22_cs::abandon(narf_filesystem::FsError::NoDevice);
         crate::amdgpu_navi22_tdr::stop();
         crate::amdgpu_navi22_thermal::stop();
         crate::amdgpu_navi22_power::stop(Some(crate::amdgpu_smu_navi22::Error::DeviceGone));

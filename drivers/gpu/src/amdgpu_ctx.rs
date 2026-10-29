@@ -126,6 +126,7 @@ type Contexts = BTreeMap<u32, (Context, Arc<Health>)>;
 pub struct CtxState {
     contexts: IrqSafeSpinLock<Option<Contexts>>,
     next_id: AtomicU32,
+    pub(crate) jobs: crate::amdgpu_cs::History,
 }
 
 impl Default for CtxState {
@@ -138,6 +139,7 @@ impl CtxState {
     pub const fn new() -> Self {
         CtxState {
             contexts: IrqSafeSpinLock::new(None),
+            jobs: crate::amdgpu_cs::History::new(),
             // Linux allocates from `xa_limit_32b`, which starts at 0. Start at
             // 1 so a zeroed `ctx_id` in a request cannot name a live context
             // by accident — a client that forgot to set it gets ENOENT rather
@@ -188,8 +190,13 @@ impl CtxState {
 
     fn free(&self, id: u32) -> Result<(), FsError> {
         let mut g = self.contexts.lock();
-        match g.as_mut().and_then(|m| m.remove(&id)) {
-            Some(_) => Ok(()),
+        let removed = g.as_mut().and_then(|m| m.remove(&id));
+        drop(g);
+        match removed {
+            Some(_) => {
+                self.jobs.forget(id);
+                Ok(())
+            }
             None => Err(FsError::NotFound),
         }
     }

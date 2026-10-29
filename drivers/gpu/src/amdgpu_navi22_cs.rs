@@ -31,8 +31,9 @@
 //!
 //! Tickets are `ring << 32 | sequence`; the ring index carries the GPU
 //! recovery epoch above its four ring-id bits, so a ticket from before a
-//! recovery names a ring no current queue has and reads as complete
-//! (abandoned) instead of being compared with the new queues' sequences.
+//! recovery retains its original submitter and terminal error instead of
+//! being compared with the new queues' sequences. Only writebacks observed
+//! before abandonment permit memory retirement.
 //!
 //! A recovery registers a new submitter with a fresh manager, so every VMID
 //! is flushed and remapped before its next use, as `amdgpu_vm_flush` does
@@ -44,7 +45,7 @@
 //! IRQ or its hard deadline, with per-future wakers and cancellation cleanup.
 //! Dependencies wait in the ioctl (generic `dispatch_async`).
 use alloc::boxed::Box;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
@@ -55,6 +56,36 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::amdgpu_cp_navi22::FenceReader;
 use crate::amdgpu_navi22_submit::{Ib, Ring, RingState, VmRef};
 use crate::amdgpu_uapi as uapi;
+
+#[path = "amdgpu_navi22_jobs.rs"]
+mod jobs;
+static CURRENT: IrqSafeSpinLock<Option<Weak<Submitter>>> = IrqSafeSpinLock::new(None);
+
+pub(crate) fn abandon(error: FsError) {
+    let current = CURRENT.lock().as_ref().and_then(Weak::upgrade);
+    if let Some(current) = current {
+        current.jobs.lock().finish(error);
+    }
+    crate::amdgpu_fence_navi22::notify_all();
+}
+pub(crate) fn hung(engine: crate::amdgpu_fence_navi22::Engine) {
+    use crate::amdgpu_fence_navi22::Engine;
+    let ring = match engine {
+        Engine::Gfx => 0,
+        Engine::Compute => 1,
+        Engine::Sdma0 => 2,
+        Engine::Sdma1 => 3,
+        Engine::Sdma2 => 8,
+        Engine::Sdma3 => 9,
+        _ => return,
+    };
+    let current = CURRENT.lock().as_ref().and_then(Weak::upgrade);
+    if let Some(current) = current {
+        let _ = current.progress();
+        current.jobs.lock().hang(ring);
+    }
+    crate::amdgpu_fence_navi22::notify_all();
+}
 
 const RINGS: [Option<Ring>; 10] = [
     Some(Ring::Gfx),
@@ -165,6 +196,7 @@ pub struct Submitter {
     vmids: IrqSafeSpinLock<crate::amdgpu_vmid::VmidManager>,
     rings: IrqSafeSpinLock<[RingState; RING_IDS]>,
     admission: [crate::amdgpu_admission::Queue; RING_IDS],
+    jobs: IrqSafeSpinLock<jobs::Jobs>,
 }
 
 impl Submitter {
@@ -181,8 +213,41 @@ impl Submitter {
     /// and writing their user fences. None when the device stopped answering.
     fn progress(&self) -> Option<[u32; RING_IDS]> {
         if self.epoch != crate::amdgpu_fence_navi22::generation() {
+            self.jobs.lock().finish(FsError::Canceled);
             return None;
         }
+        if self.jobs.lock().terminal.is_some() {
+            return None;
+        }
+        let completed = match self.sample_progress() {
+            Some(completed) => completed,
+            None => {
+                self.jobs.lock().finish(FsError::NoDevice);
+                crate::amdgpu_fence_navi22::notify_all();
+                return None;
+            }
+        };
+        if self.epoch != crate::amdgpu_fence_navi22::generation() {
+            self.jobs.lock().finish(FsError::Canceled);
+            return None;
+        }
+        {
+            let mut jobs = self.jobs.lock();
+            // Unregister may have withdrawn a media reader while this
+            // sample was in flight. Do not use that partial snapshot as a
+            // retirement witness after abandonment.
+            if jobs.terminal.is_some() {
+                return None;
+            }
+            jobs.observe(completed);
+        }
+        let epoch = self.epoch;
+        crate::amdgpu_cs::retire(self.card, &|t| {
+            (t >> 32) as u32 & !15 == ring_index(epoch, 0) && job_done(epoch, completed, t)
+        });
+        Some(completed)
+    }
+    fn sample_progress(&self) -> Option<[u32; RING_IDS]> {
         let mut completed = [0; RING_IDS];
         for (i, c) in completed.iter_mut().enumerate() {
             *c = if let Some(slot) = fence_slot(i) {
@@ -196,14 +261,19 @@ impl Submitter {
                     .ok()?
             };
         }
-        let epoch = self.epoch;
-        crate::amdgpu_cs::retire(self.card, &|t| job_done(epoch, completed, t));
         Some(completed)
     }
     async fn wait_for(&self, ticket: u64, deadline_ns: u64) -> Result<bool, FsError> {
         loop {
             let observed = crate::amdgpu_fence_navi22::change_sequence();
-            let completed = self.progress().ok_or(FsError::NoDevice)?;
+            let completed = self.progress();
+            if let Some(error) = self.jobs.lock().error(ticket) {
+                return Err(error);
+            }
+            if self.jobs.lock().retired(ticket) {
+                return Ok(true);
+            }
+            let completed = completed.ok_or(FsError::NoDevice)?;
             if job_done(self.epoch, completed, ticket) {
                 return Ok(true);
             }
@@ -216,6 +286,9 @@ impl Submitter {
 }
 
 impl crate::amdgpu_cs::Submitter for Submitter {
+    fn validate_submission(&self, _: &crate::amdgpu_cs::Submission) -> Result<(), FsError> {
+        self.jobs.lock().terminal.map_or(Ok(()), Err)
+    }
     fn ring_for(&self, ip_type: u32, ip_instance: u32, ring: u32) -> Option<u32> {
         ring_id(ip_type, ip_instance, ring)
             .filter(|id| fence_slot(*id).is_none_or(|slot| self.reader.present(slot)))
@@ -227,13 +300,28 @@ impl crate::amdgpu_cs::Submitter for Submitter {
         self.progress()
             .is_none_or(|completed| job_done(self.epoch, completed, ticket))
     }
+    fn retired(&self, ticket: u64) -> bool {
+        let _ = self.progress();
+        self.jobs.lock().retired(ticket)
+    }
+    fn error(&self, ticket: u64) -> Option<FsError> {
+        let _ = self.progress();
+        self.jobs.lock().error(ticket)
+    }
     fn submit<'a>(
         &'a self,
         vm: &'a crate::amdgpu_vm::VmState,
         submission: &'a crate::amdgpu_cs::Submission,
-        _health: &'a alloc::sync::Arc<crate::amdgpu_ctx::Health>,
+        health: &'a alloc::sync::Arc<crate::amdgpu_ctx::Health>,
     ) -> Pin<Box<dyn Future<Output = Result<u64, FsError>> + Send + 'a>> {
         Box::pin(async move {
+            if health.reset_epoch() != crate::amdgpu_ctx::recoveries() {
+                health.mark_canceled();
+                return Err(FsError::Canceled);
+            }
+            if let Some(error) = health.error().or(self.jobs.lock().terminal) {
+                return Err(error);
+            }
             let first = submission.ibs.first().ok_or(FsError::InvalidData)?;
             let id = ring_id(first.ip_type, first.ip_instance, first.ring)
                 .ok_or(FsError::InvalidData)?;
@@ -291,6 +379,9 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                     vm, submission, request, self.epoch, &progress,
                 )
                 .await?;
+                self.jobs
+                    .lock()
+                    .emitted(u64::from(index) << 32 | u64::from(seq), health);
                 let _ = self.progress();
                 return Ok(u64::from(index) << 32 | u64::from(seq));
             }
@@ -301,8 +392,15 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             let seq = loop {
                 let observed = crate::amdgpu_fence_navi22::change_sequence();
                 let throttle = {
-                    let mut owner = crate::amdgpu_navi22_platform::owner().await;
+                    let (gc, mut owner) = crate::amdgpu_navi22_platform::gc_owner().await?;
                     let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
+                    if health.reset_epoch() != crate::amdgpu_ctx::recoveries() {
+                        health.mark_canceled();
+                        return Err(FsError::Canceled);
+                    }
+                    if let Some(error) = health.error().or(self.jobs.lock().terminal) {
+                        return Err(error);
+                    }
                     let completed = self.progress().ok_or(FsError::NoDevice)?;
                     let vm_completed = self.vm_progress().ok_or(FsError::NoDevice)?;
                     let epoch = self.epoch;
@@ -318,6 +416,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                         // amdgpu_vmid_grab_idle: every client VMID still has
                         // an unfinished job; wait without the owner.
                         drop(owner);
+                        drop(gc);
                         if narf_time::monotonic_ns() >= deadline {
                             return Err(FsError::Busy);
                         }
@@ -337,6 +436,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                                 ticket,
                                 ticket | (1 << 63),
                             );
+                            self.jobs.lock().emitted(ticket, health);
                             break seq;
                         }
                         Err(crate::amdgpu_navi22_boot::Error::Queues(
@@ -443,19 +543,20 @@ pub async fn register(boot: &mut crate::amdgpu_navi22_boot::ColdBoot) {
         }
     }
     crate::amdgpu_vcn_navi22_cs::register(boot, first, last);
-    crate::amdgpu_cs::register_submitter(
+    let submitter = Arc::new(Submitter {
         card,
-        Arc::new(Submitter {
-            card,
-            // The fence generation advances during quiesce, before restart
-            // registers this submitter. The recovery counter advances later.
-            epoch: crate::amdgpu_fence_navi22::generation(),
-            reader,
-            vmids: IrqSafeSpinLock::new(vmids),
-            rings: IrqSafeSpinLock::new([RingState::new(); RING_IDS]),
-            admission: [const { crate::amdgpu_admission::Queue::new() }; RING_IDS],
-        }),
-    );
+        // The fence generation advances during quiesce, before restart
+        // registers this submitter. The recovery counter advances later.
+        epoch: crate::amdgpu_fence_navi22::generation(),
+        reader,
+        vmids: IrqSafeSpinLock::new(vmids),
+        rings: IrqSafeSpinLock::new([RingState::new(); RING_IDS]),
+        admission: [const { crate::amdgpu_admission::Queue::new() }; RING_IDS],
+        jobs: IrqSafeSpinLock::new(jobs::Jobs::new(crate::amdgpu_fence_navi22::generation())),
+    });
+    *CURRENT.lock() = Some(Arc::downgrade(&submitter));
+    crate::amdgpu_cs::register_submitter(card, submitter);
+    crate::amdgpu_navi22_gfxoff::declare_submission_guarded();
     // A recovery also replays the still-unsignalled front clear. The queue's
     // pulse closes the race with a drain noticing the old fence generation.
     crate::amdgpu_rdna2_vram::engine().kick();
@@ -465,6 +566,8 @@ pub async fn register(boot: &mut crate::amdgpu_navi22_boot::ColdBoot) {
 /// lent VMIDs belonged to the old memory owner and are dropped with it; the
 /// next `register` starts a fresh manager (every VMID flushes again).
 pub fn unregister() {
+    crate::amdgpu_vcn_navi22::idle::stop();
+    abandon(FsError::Canceled);
     crate::amdgpu_rdna2_vram::suspend();
     if let Some(card) = drm_card() {
         crate::amdgpu_cs::unregister_submitter(card);

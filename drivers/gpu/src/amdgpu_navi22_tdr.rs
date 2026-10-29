@@ -204,6 +204,7 @@ pub(crate) async fn monitor(epoch: u64) {
             Ok(samples) => samples,
             Err(crate::amdgpu_navi22_boot::Error::Busy) => continue, // owner busy
             Err(_) => {
+                crate::amdgpu_navi22_cs::abandon(narf_filesystem::FsError::NoDevice);
                 STATUS.lock().device_lost = true;
                 return;
             }
@@ -213,6 +214,7 @@ pub(crate) async fn monitor(epoch: u64) {
         }
         let now_ms = narf_time::wall::cycles_to_ns(narf_time::now_cycles()) / 1_000_000;
         for hang in record(&mut watchdog, &samples, now_ms) {
+            crate::amdgpu_navi22_cs::hung(hang.engine);
             let _ = writeln!(
                 narf_console::Writer,
                 "amdgpu: navi22 ring {:?} timeout, signaled seq={}, emitted seq={} ({} ms)",

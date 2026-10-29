@@ -1578,10 +1578,7 @@ pub(crate) async fn dispatch_live(card: u32, cmd: u32, arg: usize) -> Option<Res
                 u32::from_le_bytes(bytes[16 + i * 4..20 + i * 4].try_into().unwrap())
             });
             crate::amdgpu_rdna2_mmr::validate(payload)?;
-            let _power = crate::amdgpu_navi22_gfxoff::Reference::acquire()
-                .await
-                .map_err(|_| FsError::NoDevice)?;
-            let owner = crate::amdgpu_navi22_platform::owner().await;
+            let (_power, owner) = crate::amdgpu_navi22_platform::gc_owner().await?;
             let boot = owner.as_ref().ok_or(FsError::NoDevice)?;
             let reply = boot.read_mmr(payload, snap.navi22.topology.map(|t| t.gb_addr_config))?;
             // SAFETY: nonzero user pointer, bounded by the caller's return_size;

@@ -1918,6 +1918,19 @@ sample and can match average power; there is no separate instantaneous
 measurement. Hwmon also exposes in1_input/in1_label (vddsoc) and power1_input.
 Missing/invalid data stays unavailable. Physical validation remains pending.
 
+Shared WAIT_CS and WAIT_FENCES all/any now preserve the original job's
+submitter across reset on RX 6000 and RX 9000 and report its terminal error.
+Native RX 6000 tracks guilty timeouts, cancellation and loss without treating
+errors as physical retirement. Completed observed jobs retain success.
+RX 6000 submission, register queries, TDR and kernel VRAM work now guard GC
+access with GFXOFF references and recheck activation/reset epoch under the
+owner, enabling the existing admission path. VCN3 gains delayed idle work:
+physical encode completion releases DPG pause, all VCN work must drain before
+stop/conditional SMU power-down, and begin-use restores hardware while keeping
+context and fence sequences. JPEG stays independent; MM_DPM_PG remains
+opt-in. Failed/cancelled transitions stay closed. These paths have model
+coverage; physical reset/power-transition acceptance remains pending.
+
 Ordinary VRAM-preferred creation now permits Linux's GTT fallback when VRAM
 is unavailable, preserving reported preferences and discardable-domain rules.
 Visible client VRAM now supports pressure eviction to GTT and promotion back
@@ -1963,17 +1976,21 @@ the entries below are a dated log.
   GPU-mapped, CPU-mapped, invisible VRAM), power telemetry and thermal
   shutdown, hang detection and mode1 recovery.
 - On by default, each with an off switch: native display, accel, hardware
-  cursor, power saving (each feature still admission-gated; GFXOFF stays
-  refused until the CS path declares its GC MMIO GFXOFF-safe) and automatic
+  cursor, power saving (each feature still admission-gated; the native CS
+  path now declares its GC MMIO GFXOFF-safe) and automatic
   recovery (`amdgpu.gpu_recovery=0`; at most 3 per boot, because each one
   quarantines VRAM).
 - Runtime controls: `power_dpm_force_performance_level` (`auto|low|high`,
   GFXCLK only) and `pp_features` (Linux's PMFW table; policy-owned bits only),
   on `card<N>/` and `card<N>/device/`.
-- Open: any boot on RX 6000 silicon; multi-display presentation on secondary
+- Hardware evidence: RX 6750 XT VFIO firmware/queue startup, HDMI to the
+  CachyOS login screen, damage copies and JPEG ring proof. Bare-metal boot,
+  Mesa rendering/video and reset/power acceptance remain pending; see
+  `docs/amdgpu_bringup.md`.
+- Open: multi-display presentation on secondary
   CRTCs (opt-in until then); GDDR6 short-training resume (training boots
-  cannot recover); VCN dynamic power gating; declaring CS GC MMIO
-  GFXOFF-safe; user CPU mappings of VRAM are not revoked during a reset
+  cannot recover); physical VCN idle/resume and GFXOFF validation;
+  user CPU mappings of VRAM are not revoked during a reset
   (Linux behaviour).
 
 RX 6000 runtime power controls and recovery: the DRM card exposes writable
@@ -2231,8 +2248,8 @@ hdp_v5_0/navi10_ih/sdma_v5_2/smuio CG with nv.c's navy_flounder flags,
 `amdgpu_gfx_off_ctrl` GFXOFF with its 100 ms delay and disable references,
 runtime PMFW feature bits, DCN3.0 PMFW watermark table, UCLK/FCLK floors). They
 run for the features `amdgpu.rdna2_pg=` names (all of them by default) that the
-policy admits. GFXOFF stays refused until the CS path declares its GC MMIO
-GFXOFF-safe; GC clock gating needs only RLC safe mode; the watermark-dependent
+policy admits. The native CS path now declares GC MMIO GFXOFF-safe;
+GC clock gating needs only RLC safe mode; the watermark-dependent
 features (hub CG/PG, memory/fabric DPM, deep sleep) follow the live DML30
 admission of the native display, and the boot log names each refusal.
 VCN 3.0 now starts both discovered instances after the fence stage (Linux's
