@@ -807,7 +807,10 @@ async fn dispatch_after_address(
                 hid_off,
                 &cfg_blob,
                 ep,
-                parent_hub_slot.map(|slot| (slot, port)),
+                hid::identity::BindTopology {
+                    port,
+                    hub_port: parent_hub_slot.map(|slot| (slot, port)),
+                },
             )
             .await
             .is_ok()
@@ -841,6 +844,7 @@ async fn dispatch_after_address(
                 xhci_dev,
                 slot_id,
                 speed,
+                port,
                 parent_hub_slot.map(|slot| (slot, port)),
             )
             .await

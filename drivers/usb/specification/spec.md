@@ -186,6 +186,26 @@ also consult upstream Linux GPL sources.
   Context, then returns only a complete 18-byte Device Descriptor. Callers may
   therefore read `idVendor`/`idProduct` at offsets 8..12 without accepting a
   zero-filled short response.
+- USB HID evdev identity (`hid::identity`, issue #874): the mouse,
+  touchpad, generic, and evdev-registering keyboard binders resolve
+  identity at bind time via `resolve_usb_identity` — `idVendor` /
+  `idProduct` / `bcdDevice` from the device descriptor (USB 2.0
+  §9.6.1 offsets 8..14), the product string via `GET_DESCRIPTOR
+  (STRING)` (LANGID from string-0, en-US 0x0409 fallback; `iProduct
+  == 0` or any fetch failure falls back to a per-class name), and a
+  NARF-local phys (`usb-{port}` on a root port, `usb-{hub}-{port}`
+  downstream, where `hub` is the parent hub's xHCI slot id at bind
+  time) — applied with `DeviceCaps::set_identity` on `BUS_USB`,
+  `uniq` empty. Binders pass the topology as `hid::identity::
+  BindTopology { port, hub_port }` where their parameter count
+  would otherwise exceed clippy's argument limit (touchpad), or as
+  separate `port` + `hub_port` arguments elsewhere. Resolution is
+  best-effort: on descriptor-fetch failure the binder keeps
+  synthetic caps and the bind proceeds, so identity can never
+  regress a working bind. Deliberately out of
+  scope: the live boot-keyboard path feeds the shared input ring
+  and owns no evdev node by design, and no USB MT publication
+  exists (the USB touchpad is relative-mode only).
 - `Xhci::control_in` and `Xhci::control_out` identify Data and Status Stage
   completion events by their originating control-ring TRB and drain both before
   returning. A queued Status completion may never satisfy the next control TD.
