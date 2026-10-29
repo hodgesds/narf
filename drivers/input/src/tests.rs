@@ -71,6 +71,209 @@ fn smoke_i8042_modifier_tracking() -> TestResult {
 }
 kernel_test_in!("drivers/input", smoke_i8042_modifier_tracking);
 
+/// Pop the next global-ring event, expecting a key event for
+/// `want` with pressed state `pressed`. Shared by the i8042 E0/E1
+/// smokes below.
+fn i8042_expect_key(want: narf_input::KeyCode, pressed: bool) -> bool {
+    use narf_input::{pop_global, InputEvent};
+    matches!(
+        pop_global(),
+        Some(InputEvent::Key(k)) if k.code == want && k.pressed == pressed
+    )
+}
+
+fn smoke_i8042_e0_navigation_cluster() -> TestResult {
+    // E0-prefixed navigation cluster, scancode set 1 (IBM PS/2
+    // set-1 table): Home E0 47, Insert E0 52, Delete E0 53,
+    // End E0 4F, PageUp E0 49, PageDown E0 51. Break = the make
+    // code | 0x80 behind a fresh E0 prefix. All of these decoded
+    // to Unknown before the E0 table was completed.
+    use crate::i8042;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, KeyCode};
+
+    init_global_ring(32);
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+
+    let cases: [(u8, KeyCode); 6] = [
+        (0x47, KeyCode::Home),
+        (0x52, KeyCode::Insert),
+        (0x53, KeyCode::Delete),
+        (0x4F, KeyCode::End),
+        (0x49, KeyCode::PageUp),
+        (0x51, KeyCode::PageDown),
+    ];
+    for (make, want) in cases {
+        i8042::feed_bytes_for_test(&[0xE0, make, 0xE0, make | 0x80]);
+        if !i8042_expect_key(want, true) {
+            return TestResult::Fail("E0 navigation press decoded wrong");
+        }
+        if !i8042_expect_key(want, false) {
+            return TestResult::Fail("E0 navigation release decoded wrong");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_e0_navigation_cluster);
+
+fn smoke_i8042_e0_original_six_regression() -> TestResult {
+    // The six E0 keys that already decoded before the table was
+    // completed must not regress: RightCtrl E0 1D, RightAlt E0 38,
+    // Up E0 48, Left E0 4B, Right E0 4D, Down E0 50.
+    use crate::i8042;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, KeyCode};
+
+    init_global_ring(32);
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+
+    let cases: [(u8, KeyCode); 6] = [
+        (0x1D, KeyCode::RightCtrl),
+        (0x38, KeyCode::RightAlt),
+        (0x48, KeyCode::Up),
+        (0x4B, KeyCode::Left),
+        (0x4D, KeyCode::Right),
+        (0x50, KeyCode::Down),
+    ];
+    for (make, want) in cases {
+        i8042::feed_bytes_for_test(&[0xE0, make, 0xE0, make | 0x80]);
+        if !i8042_expect_key(want, true) {
+            return TestResult::Fail("original E0 press regressed");
+        }
+        if !i8042_expect_key(want, false) {
+            return TestResult::Fail("original E0 release regressed");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_e0_original_six_regression);
+
+fn smoke_i8042_e0_keypad_and_meta_keys() -> TestResult {
+    // Remaining set-1 E0 keys: keypad Enter E0 1C, keypad Divide
+    // E0 35, LeftMeta E0 5B, RightMeta E0 5C, Menu E0 5D.
+    use crate::i8042;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, KeyCode};
+
+    init_global_ring(32);
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+
+    let cases: [(u8, KeyCode); 5] = [
+        (0x1C, KeyCode::KpEnter),
+        (0x35, KeyCode::KpSlash),
+        (0x5B, KeyCode::LeftMeta),
+        (0x5C, KeyCode::RightMeta),
+        (0x5D, KeyCode::Menu),
+    ];
+    for (make, want) in cases {
+        i8042::feed_bytes_for_test(&[0xE0, make, 0xE0, make | 0x80]);
+        if !i8042_expect_key(want, true) {
+            return TestResult::Fail("E0 keypad/meta press decoded wrong");
+        }
+        if !i8042_expect_key(want, false) {
+            return TestResult::Fail("E0 keypad/meta release decoded wrong");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_e0_keypad_and_meta_keys);
+
+fn smoke_i8042_print_screen_wire_frame() -> TestResult {
+    // Print Screen's set-1 wire frame, byte-for-byte per the IBM
+    // set-1 table: make = E0 2A E0 37, break = E0 B7 E0 AA. The
+    // 2A/AA pair is the keyboard's "fake shift" wrapper, NOT a
+    // LeftShift keystroke: the whole frame must yield exactly one
+    // SysRq press and one SysRq release, nothing else.
+    use crate::i8042;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global, KeyCode};
+
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+
+    i8042::feed_bytes_for_test(&[0xE0, 0x2A, 0xE0, 0x37]);
+    if !i8042_expect_key(KeyCode::SysRq, true) {
+        return TestResult::Fail("Print Screen make did not yield SysRq press");
+    }
+    if pop_global().is_some() {
+        return TestResult::Fail("Print Screen make leaked extra events (fake shift)");
+    }
+    i8042::feed_bytes_for_test(&[0xE0, 0xB7, 0xE0, 0xAA]);
+    if !i8042_expect_key(KeyCode::SysRq, false) {
+        return TestResult::Fail("Print Screen break did not yield SysRq release");
+    }
+    if pop_global().is_some() {
+        return TestResult::Fail("Print Screen break leaked extra events (fake shift)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_print_screen_wire_frame);
+
+fn smoke_i8042_e0_prefix_changes_meaning() -> TestResult {
+    // Masking-defeating: these make codes mean one key plain and a
+    // different key behind E0. A decoder that consumes the prefix
+    // but then decodes the byte through the plain table (or masks
+    // the prefix away) fails every pair:
+    //   0x47 = Kp7        vs E0 47 = Home
+    //   0x52 = Kp0        vs E0 52 = Insert
+    //   0x37 = KpAsterisk vs E0 37 = Print Screen (SysRq)
+    //   0x1C = Enter      vs E0 1C = keypad Enter
+    //   0x35 = Slash      vs E0 35 = keypad Slash
+    use crate::i8042;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, KeyCode};
+
+    init_global_ring(64);
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+
+    let cases: [(u8, KeyCode, KeyCode); 5] = [
+        (0x47, KeyCode::Kp7, KeyCode::Home),
+        (0x52, KeyCode::Kp0, KeyCode::Insert),
+        (0x37, KeyCode::KpAsterisk, KeyCode::SysRq),
+        (0x1C, KeyCode::Enter, KeyCode::KpEnter),
+        (0x35, KeyCode::Slash, KeyCode::KpSlash),
+    ];
+    for (make, plain, extended) in cases {
+        i8042::feed_bytes_for_test(&[make, make | 0x80, 0xE0, make, 0xE0, make | 0x80]);
+        if !i8042_expect_key(plain, true) || !i8042_expect_key(plain, false) {
+            return TestResult::Fail("plain keypad decode changed by E0 work");
+        }
+        if !i8042_expect_key(extended, true) || !i8042_expect_key(extended, false) {
+            return TestResult::Fail("E0 decode fell through to the plain table");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_e0_prefix_changes_meaning);
+
+fn smoke_i8042_e1_pause_frame() -> TestResult {
+    // Pause's set-1 frame is a single six-byte sequence with no
+    // separate break code: E1 1D 45 E1 9D C5 (IBM set-1 table).
+    // Expect exactly a Pause press (when the 45 lands) and a Pause
+    // release (when the C5 lands) — and in particular no RightCtrl
+    // event from the frame's 1D byte, which is what the old
+    // E1-unaware path emitted.
+    use crate::i8042;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global, KeyCode};
+
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+
+    i8042::feed_bytes_for_test(&[0xE1, 0x1D, 0x45, 0xE1, 0x9D, 0xC5]);
+    if !i8042_expect_key(KeyCode::Pause, true) {
+        return TestResult::Fail("Pause frame did not yield Pause press");
+    }
+    if !i8042_expect_key(KeyCode::Pause, false) {
+        return TestResult::Fail("Pause frame did not yield Pause release");
+    }
+    if pop_global().is_some() {
+        return TestResult::Fail("Pause frame leaked extra events");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_e1_pause_frame);
+
 fn smoke_i8042_mouse_packet_decode() -> TestResult {
     use crate::i8042_mouse;
     use narf_input::{
