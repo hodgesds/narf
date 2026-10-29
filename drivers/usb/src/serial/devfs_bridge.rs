@@ -140,6 +140,22 @@ impl SerialRing {
     pub fn has_data(&self) -> bool {
         self.count > 0
     }
+
+    /// Discard every queued byte (the TCFLSH primitive).
+    pub fn clear(&mut self) {
+        self.head = 0;
+        self.count = 0;
+    }
+
+    /// Number of bytes currently queued (the FIONREAD primitive).
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// `true` when no byte is queued.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
 }
 
 impl Default for SerialRing {
