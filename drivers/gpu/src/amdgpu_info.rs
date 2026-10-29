@@ -248,6 +248,13 @@ pub fn reference_clock_10khz(vbios: &[u8], navi: bool) -> Option<u32> {
 /// firmware_info v3's `bootup_mclk_in10khz` (byte 12), which
 /// smu_v14_0_get_vbios_bootup_values reads for every v3 content revision.
 pub fn boot_mclk_10khz(vbios: &[u8]) -> Option<u32> {
+    boot_clock_10khz(vbios, 12)
+}
+/// firmware_info v3's bootup_sclk_in10khz, as the SMU boot-value reader.
+pub(crate) fn boot_sclk_10khz(vbios: &[u8]) -> Option<u32> {
+    boot_clock_10khz(vbios, 8)
+}
+fn boot_clock_10khz(vbios: &[u8], offset: usize) -> Option<u32> {
     use crate::atombios::{header::parse_rom_header, tables::MasterDataTable};
     let header = parse_rom_header(vbios).ok()?;
     let tables = MasterDataTable::parse(vbios, &header).ok()?;
@@ -255,7 +262,7 @@ pub fn boot_mclk_10khz(vbios: &[u8]) -> Option<u32> {
     if *info.get(2)? != 3 {
         return None;
     }
-    info.get(12..16)
+    info.get(offset..offset + 4)
         .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
 }
 
@@ -855,6 +862,36 @@ pub fn dispatch_for(
             out.extend_from_slice(&f.status.to_le_bytes());
             out.extend_from_slice(&f.vmhub.to_le_bytes());
             out
+        }
+        (uapi::AMDGPU_INFO_NUM_BYTES_MOVED | uapi::AMDGPU_INFO_NUM_EVICTIONS, Some(vm)) => {
+            snapshot().ok_or(FsError::NotFound)?;
+            let stats = vm
+                .card()
+                .map(crate::amdgpu_gem::stats::counters)
+                .unwrap_or_default();
+            let value = if which == uapi::AMDGPU_INFO_NUM_BYTES_MOVED {
+                stats.bytes_moved
+            } else {
+                stats.evictions
+            };
+            value.to_le_bytes().to_vec()
+        }
+        (uapi::AMDGPU_INFO_NUM_VRAM_CPU_PAGE_FAULTS, Some(_)) => {
+            snapshot().ok_or(FsError::NotFound)?;
+            // GEM resolves resident BAR/GTT pages at mmap time. This backend
+            // has no TTM VRAM CPU-fault migration callback to count.
+            0u64.to_le_bytes().to_vec()
+        }
+        (uapi::AMDGPU_INFO_VRAM_LOST_COUNTER, Some(_)) => {
+            let snap = snapshot().ok_or(FsError::NotFound)?;
+            let count = if answers_navi22(&snap) {
+                crate::amdgpu_navi22_recovery::recoveries()
+            } else if rdna4(&snap).is_some() {
+                crate::amdgpu_navi48_platform::recoveries()
+            } else {
+                return Err(FsError::InvalidData);
+            };
+            (count as u32).to_le_bytes().to_vec()
         }
         // The open's card's client VRAM heap, where it has one. RDNA2's
         // snapshot fallback cannot account for the native owner's reserved
@@ -1494,17 +1531,17 @@ pub(crate) fn sample_rdna2_board(
     publish_rdna2_board(module, pcie, memory);
 }
 
-/// Live RDNA2 register reads sleep for GC power and the retained owner.
-/// Other INFO queries use the ordinary pure snapshot dispatcher.
+/// Live RX 6000/9000 statistics serialize with their retained owner. RDNA2
+/// GC register reads additionally need a GFXOFF reference.
 pub(crate) async fn dispatch_live(card: u32, cmd: u32, arg: usize) -> Option<Result<u64, FsError>> {
     if drm_uapi::ioc_nr(cmd) != drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_INFO {
         return None;
     }
-    if crate::amdgpu_navi22_cs::drm_card() != Some(card) {
-        return None;
-    }
     let snap = snapshot()?;
-    if !answers_navi22(&snap) {
+    let rdna2 = answers_navi22(&snap) && crate::amdgpu_navi22_cs::drm_card() == Some(card);
+    let rdna4 = rdna4(&snap).is_some()
+        && crate::drm_registry::pci_id(card) == Some((crate::amdgpu::AMD_VENDOR, snap.did as u16));
+    if !rdna2 && !rdna4 {
         return None;
     }
     // SAFETY: same bounded ioctl copy as dispatch_for.
@@ -1512,7 +1549,14 @@ pub(crate) async fn dispatch_live(card: u32, cmd: u32, arg: usize) -> Option<Res
         Ok(bytes) => bytes,
         Err(error) => return Some(Err(error)),
     };
-    if u32::from_le_bytes(bytes[12..16].try_into().unwrap()) != uapi::AMDGPU_INFO_READ_MMR_REG {
+    let which = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    if !matches!(
+        which,
+        uapi::AMDGPU_INFO_READ_MMR_REG | uapi::AMDGPU_INFO_TIMESTAMP | uapi::AMDGPU_INFO_SENSOR
+    ) {
+        return None;
+    }
+    if which == uapi::AMDGPU_INFO_READ_MMR_REG && !rdna2 {
         return None;
     }
     Some(
@@ -1521,6 +1565,14 @@ pub(crate) async fn dispatch_live(card: u32, cmd: u32, arg: usize) -> Option<Res
             let size = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
             if pointer == 0 || size == 0 {
                 return Err(FsError::InvalidData);
+            }
+            if which != uapi::AMDGPU_INFO_READ_MMR_REG {
+                if rdna4 {
+                    return crate::amdgpu_navi48_platform::dispatch_info_stats(&bytes).await;
+                }
+                let mut owner = crate::amdgpu_navi22_platform::owner().await;
+                let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
+                return crate::amdgpu_info_stats::dispatch(&bytes, boot).await;
             }
             let payload = core::array::from_fn(|i| {
                 u32::from_le_bytes(bytes[16 + i * 4..20 + i * 4].try_into().unwrap())

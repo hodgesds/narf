@@ -1980,6 +1980,18 @@ impl crate::amdgpu_cs::Submitter for Submitter {
     }
 }
 
+/// Live INFO statistics with runtime PM resumed before the retained owner lock.
+pub(crate) async fn dispatch_info_stats(bytes: &[u8]) -> Result<u64, narf_filesystem::FsError> {
+    use narf_filesystem::FsError;
+    // Resume before taking OWNER: the resume callback needs that same lock.
+    let _rpm = crate::amdgpu_navi48_runtime_pm::access()
+        .await
+        .map_err(|_| FsError::NoDevice)?;
+    let mut owner = OWNER.lock().await;
+    let boot = owner.as_deref_mut().ok_or(FsError::NoDevice)?;
+    crate::amdgpu_info_stats::dispatch(bytes, boot).await
+}
+
 /// One PMFW telemetry refresh, serialized with every retained owner user.
 pub(crate) async fn power_sample_with<T>(
     publish: impl FnOnce(Result<crate::amdgpu_navi48_power::Sample, boot::Error>) -> T,

@@ -392,6 +392,19 @@ fallbacks retain the 8 MiB VRAM reservation and now report nonzero GTT capacity.
 Native ioctl regressions cover RDNA2 and RDNA4 allocations, release, shared
 ownership and bounded copies. Mesa hardware validation remains outstanding.
 
+Both RX 6000 and RX 9000 expose native TIMESTAMP and Linux dGPU SENSOR
+statistics on primary/render nodes: effective SCLK, current MCLK, edge
+temperature, load, average socket power, VDDGFX, and stable/peak GFX/MCLK.
+Each query takes the retained owner; RX 9000 resumes runtime PM first.
+P-state endpoints come from SMU DPM tables with boot-clock fallback when DPM
+is disabled; standard GFX/MCLK follow Linux's ASIC rules on RDNA2 and the
+board's Base/Game clocks plus UCLK maximum on RDNA4. Neither backend has
+Linux VDDNB/GPU_INPUT_POWER sensors. Errors/cancellation publish no reply.
+GEM reports per-card bytes moved and successful evictions after backing
+commits, plus the native recovery count as VRAM_LOST_COUNTER. CPU VRAM-fault
+migrations remain zero because invisible VRAM mappings are refused. Physical
+statistics acceptance remains separate from software-model checks.
+
 Native submissions use FIFO ring admission and IRQ-driven fence/VMID waits.
 VM programming has a separate completion writeback before the client IB;
 its completion cannot release a VMID whose job is still running. Reset

@@ -48,6 +48,7 @@ struct Fake {
     policy: u32,
     uploaded: Vec<u8>,
     metrics: Vec<u8>,
+    dpm_count: u32,
 }
 impl Io for Fake {
     fn wait_poll_limit(&self) -> Option<u32> {
@@ -119,6 +120,9 @@ impl Io for Fake {
             0x1e if p >> 16 == 2 => 1258,
             0x1d => 500,
             0x1e => 3100,
+            0x1f if p & 0xffff == 0xff => self.dpm_count,
+            0x1f if p >> 16 == 2 => 1258,
+            0x1f => 3100,
             0x4d | 0x36 | 6 | 0x19 | 0x1a | 0x2a..=0x2d | 0x32 | 0x15..=0x17 => 0,
             8 => {
                 self.enabled |= p as u64;
@@ -190,6 +194,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
                 policy: 0,
                 uploaded: Vec::new(),
                 metrics: vec![0; METRICS_BYTES],
+                dpm_count: 0x8000_0002,
             },
             authority: Cap::bootstrap(),
             memory,
@@ -209,6 +214,91 @@ fn fixture() -> (Pool, Engine<Fake>) {
 fn run<T>(f: impl Future<Output = T>) -> T {
     narf_scheduler::block_on_spin(f)
 }
+fn pstate_engine() -> (Pool, Engine<Fake>) {
+    let (pool, mut e) = fixture();
+    e.io.board[3948..3950].copy_from_slice(&2400u16.to_le_bytes());
+    e.io.board[3950..3952].copy_from_slice(&2800u16.to_le_bytes());
+    run(e.verify()).unwrap();
+    run(e.read_board()).unwrap();
+    run(e.upload_board()).unwrap();
+    run(e.configure_power()).unwrap();
+    run(e.enable_display_power()).unwrap();
+    (pool, e)
+}
+fn rdna4_pstates_use_board_base_game_and_live_dpm_tables() -> TestResult {
+    let (_pool, mut e) = pstate_engine();
+    let before = e.io.commands.len();
+    let p = run(e.read_pstates(None, None)).unwrap();
+    assert_eq!(
+        (p.gfx_standard, p.memory_standard, p.gfx_peak, p.memory_peak),
+        (2400, 1258, 2800, 1258)
+    );
+    assert_eq!(
+        &e.io.commands[before..],
+        &[
+            (0xc, 0),
+            (0xd, 0),
+            (0x1f, 0xff),
+            (0x1f, 1),
+            (0x1f, 0x200ff),
+            (0x1f, 0x20001)
+        ]
+    );
+    e.board[3948..3950].copy_from_slice(&0u16.to_le_bytes());
+    e.board[3950..3952].copy_from_slice(&3200u16.to_le_bytes());
+    let p = run(e.read_pstates(None, None)).unwrap();
+    assert_eq!((p.gfx_standard, p.gfx_peak), (3100, 3100));
+    e.io.enabled &= !FEATURE_DPM_UCLK;
+    let before = e.io.commands.len();
+    let p = run(e.read_pstates(None, Some(900))).unwrap();
+    assert_eq!((p.memory_standard, p.memory_peak), (900, 900));
+    assert!(!e.io.commands[before..]
+        .iter()
+        .any(|&(msg, arg)| msg == 0x1f && arg >> 16 == 2));
+    e.io.enabled &= !(1 << 1);
+    let p = run(e.read_pstates(Some(700), Some(900))).unwrap();
+    assert_eq!((p.gfx_standard, p.gfx_peak), (700, 700));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48",
+    rdna4_pstates_use_board_base_game_and_live_dpm_tables
+);
+
+fn rdna4_pstate_errors_and_cancellation_keep_native_mailbox_ownership() -> TestResult {
+    let (_pool, mut e) = pstate_engine();
+    for count in [0, 0x8000_0000, 0x100, u32::MAX] {
+        e.io.dpm_count = count;
+        assert_eq!(run(e.read_pstates(None, None)), Err(Error::Invalid));
+        assert_eq!(e.state, State::DisplayPowerReady);
+    }
+    e.io.dpm_count = 2;
+    e.io.reject = Some(0x1f);
+    assert_eq!(run(e.read_pstates(None, None)), Err(Error::Rejected(0xfd)));
+    assert_eq!(e.state, State::DisplayPowerReady);
+    e.io.reject = None;
+    e.io.stall = Some(0x1f);
+    {
+        let mut future = alloc::boxed::Box::pin(e.read_pstates(None, None));
+        assert!(future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    assert_eq!(e.state, State::Runtime);
+    let before = e.io.commands.len();
+    assert_eq!(run(e.read_pstates(None, None)), Err(Error::Busy));
+    assert_eq!(e.io.commands.len(), before);
+    let (_pool, mut e) = pstate_engine();
+    e.io.revoke = Some((0x1f, e.authority));
+    assert_eq!(run(e.read_pstates(None, None)), Err(Error::Revoked));
+    assert_eq!(e.state, State::Failed);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48",
+    rdna4_pstate_errors_and_cancellation_keep_native_mailbox_ownership
+);
 fn smu14_board_roundtrip_and_protection_policy() -> TestResult {
     let (pool, mut e) = fixture();
     if run(e.verify())

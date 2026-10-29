@@ -1255,6 +1255,7 @@ fn userptr_backing_follows_pins_and_refuses_mmap_export_and_moves() -> TestResul
         card: Some(0xfee5),
         dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
         pin_count: AtomicU32::new(0),
+        stats: None,
     });
     assert!(object.is_userptr());
     assert_eq!(object.frames(0, 2 * 4096).unwrap(), [a, b]);

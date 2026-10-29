@@ -322,6 +322,8 @@ kernel queues pass their ring/IB tests. Implemented (software models only):
 | `GET_CAP` without KMS state | `drm_ioctl_bridge::without_kms` | the amdgpu table (`drm_ioctl_bridge::amdgpu_cap_value`): SYNCOBJ 1, SYNCOBJ_TIMELINE 1, PRIME 3 |
 | ACCEL_WORKING, DEV_INFO, READ_MMR_REG 0x263e, HW_IP_INFO/COUNT 0–9, FW_VERSION, MEMORY, VRAM_GTT, VIDEO_CAPS (192 B), MAX_IBS (40 B) | `amdgpu_info_navi22` | §3–§8; ACCEL/rings/counts/GANG_SUBMIT follow `SUBMISSION` (wired) and the cold boot's ring/IB proof |
 | Live MEMORY/VRAM_GTT, VRAM_USAGE, VIS_VRAM_USAGE, GTT_USAGE | `amdgpu_info::dispatch_for` | registered client VRAM heap and shared GEM system-memory budget; retained owners still count after handle closure |
+| TIMESTAMP, SENSOR, stable/peak GFX/MCLK | `amdgpu_info_stats`, SMU11/SMU14 owners | both RX 6000 and RX 9000; real SMUIO counters, fresh telemetry and DPM table endpoints; standard clocks use Linux ASIC/board rules |
+| NUM_BYTES_MOVED, NUM_EVICTIONS, NUM_VRAM_CPU_PAGE_FAULTS, VRAM_LOST_COUNTER | `amdgpu_gem::stats`, `amdgpu_info::dispatch_for` | cumulative committed movement/eviction counts; no invisible-VRAM CPU fault path; native completed full recoveries as u32 |
 | CTX | `amdgpu_ctx` | priority permits as Linux (HIGH needs CAP_SYS_NICE or master → EACCES); QUERY_STATE/QUERY_STATE2 report GPU recoveries (`UNKNOWN_RESET`, `RESET`+`VRAMLOST`) |
 | GEM_CREATE (VRAM heap / system), GEM_MMAP, GEM_VA, GEM_WAIT_IDLE, GEM_OP, GEM_CLOSE | generic `amdgpu_gem` / `amdgpu_vm` | Navi22 registers its heap from the cold-boot pool; GEM_MMAP's out arm fixed to offset 0 of the 8-byte union |
 | GEM_METADATA | generic `amdgpu_gem` | stored on the object, visible to PRIME importers |
@@ -335,14 +337,26 @@ kernel queues pass their ring/IB tests. Implemented (software models only):
 | WAIT_FENCES, FENCE_TO_HANDLE, BO_LIST | generic `amdgpu_cs`, `amdgpu_bo_list` | Linux semantics and errnos; answered with or without a card engine |
 | Implicit sync | generic `amdgpu_cs` | as `amdgpu_cs_sync_rings`: listed BOs and the user-fence BO, skipping the open's own jobs (`AMDGPU_SYNC_NE_OWNER`) and EXPLICIT_SYNC BOs; unlisted BOs get no fence; GEM_WAIT_IDLE waits for the space's jobs only on VM_ALWAYS_VALID BOs (the root reservation) |
 
-Current gaps: native reset fence errors, GDS/GWS/OA, RDNA2 TIMESTAMP/SENSOR,
-movement/eviction counters and tiled RDNA2 scanout. The older gap list's
+Current gaps: native reset fence errors, GDS/GWS/OA and tiled RDNA2 scanout.
+Statistics follow the live owner's generation and errors: DPM unavailable
+is ENOENT, failed refreshes publish no stale reply, and pending/cancelled
+SMU commands retain their Runtime ownership. Both Linux dGPU backends refuse
+VDDNB and GPU_INPUT_POWER; no measurement is invented for those selectors.
+The older gap list's
 GEM_USERPTR, PRT/sparse, SET_PLACEMENT, linear KMS modifiers, per-client
 VMID/PASID and GPUVM_FAULT now have implementations and model coverage.
 MEMORY/VRAM_GTT and the three memory-usage queries now report GEM's real
 heaps/accounting. VCN/JPEG submission and its MMHUB VMID/PASID mapping are
 wired (`amdgpu_vcn_navi22_cs`). Mesa and media hardware acceptance remain
 separate bench work; this source audit does not establish them.
+
+P-state sources: Linux
+[`sienna_cichlid_populate_umd_state_clk`](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c)
+and [`smu_v14_0_2_populate_umd_state_clk`](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_2_ppt.c).
+RDNA2 standard clocks are the per-ASIC profiling constants; RDNA4 reads
+BaseClockAc/GameClockAc from the retained validated board table. Peak clocks
+use actual GetDpmFreqByIndex table endpoints; disabled clock DPM uses the
+VBIOS boot value. This is read-only metadata, not a forced performance state.
 
 ## 13. Navi 22 card backend design
 

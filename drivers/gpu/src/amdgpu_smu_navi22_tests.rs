@@ -114,6 +114,7 @@ struct Fake {
     running: u64,
     gfx_limits: (u32, u32),
     uclk_limits: (u32, u32),
+    dpm_count: u32,
     /// Retained transfer buffer contents and the PMFW metrics it receives.
     buffer: Vec<u8>,
     metrics: Vec<u8>,
@@ -236,6 +237,8 @@ impl Io for Fake {
                     self.buffer[..metrics.len()].copy_from_slice(&metrics);
                 } else if matches!(value, MIN_DPM_FREQ | MAX_DPM_FREQ) {
                     assert!(matches!(self.argument, 0 | 0x20000));
+                } else if value == DPM_FREQ_BY_INDEX {
+                    assert!(matches!(self.argument >> 16, 0 | 2));
                 } else if !matches!(
                     value,
                     ALLOWED_HIGH
@@ -270,6 +273,9 @@ impl Io for Fake {
                         MAX_DPM_FREQ if self.argument == 2 << 16 => self.uclk_limits.1,
                         MIN_DPM_FREQ => self.gfx_limits.0,
                         MAX_DPM_FREQ => self.gfx_limits.1,
+                        DPM_FREQ_BY_INDEX if self.argument & 0xffff == 0xff => self.dpm_count,
+                        DPM_FREQ_BY_INDEX if self.argument >> 16 == 2 => self.uclk_limits.1,
+                        DPM_FREQ_BY_INDEX => self.gfx_limits.1,
                         TRANSFER_TO_DRIVER | REENABLE_ACDC_INTERRUPT => 0,
                         ENABLE_FEATURES_LOW
                         | ENABLE_FEATURES_HIGH
@@ -318,6 +324,7 @@ fn engine() -> Engine<Fake> {
                 .allowed(),
             gfx_limits: (500, 2600),
             uclk_limits: (96, 1000),
+            dpm_count: 0x8000_0002,
             buffer: vec![0x5a; 4096],
             metrics: Vec::new(),
             flushes: 0,
@@ -1065,6 +1072,95 @@ fn powered_engine(firmware: u32) -> (Engine<Fake>, crate::amdgpu_vram::Pool) {
     engine.io.flushes = 0;
     (engine, pool)
 }
+
+fn rdna2_pstates_use_profile_clocks_and_live_dpm_endpoints() -> TestResult {
+    for (profile, gfx, memory) in [
+        (&crate::amdgpu_rdna2::NAVI21, 1825, 1000),
+        (&crate::amdgpu_rdna2::NAVI22, 1825, 1000),
+        (&crate::amdgpu_rdna2::NAVI23, 1950, 676),
+        (&crate::amdgpu_rdna2::NAVI24, 2200, 1000),
+    ] {
+        let (mut e, _pool) = powered_engine(0x413f00);
+        e.profile = profile;
+        e.io.running |= (1 << 1) | (1 << 3);
+        let before = e.io.writes.len();
+        let p = run(e.read_pstates(None, None)).unwrap();
+        assert_eq!(
+            (p.gfx_standard, p.memory_standard, p.gfx_peak, p.memory_peak),
+            (gfx, memory, 2600, 1000)
+        );
+        assert_eq!(
+            commands(&e.io.writes[before..]),
+            vec![
+                (RUNNING_LOW, 0),
+                (RUNNING_HIGH, 0),
+                (DPM_FREQ_BY_INDEX, 0xff),
+                (DPM_FREQ_BY_INDEX, 1),
+                (DPM_FREQ_BY_INDEX, 0x200ff),
+                (DPM_FREQ_BY_INDEX, 0x20001),
+            ]
+        );
+        e.io.running &= !(1 << 3);
+        let before = e.io.writes.len();
+        assert_eq!(
+            run(e.read_pstates(None, Some(900))).unwrap().memory_peak,
+            900
+        );
+        assert!(!commands(&e.io.writes[before..])
+            .iter()
+            .any(|&(msg, arg)| msg == DPM_FREQ_BY_INDEX && arg >> 16 == 2));
+        e.io.running &= !(1 << 1);
+        let p = run(e.read_pstates(Some(600), Some(900))).unwrap();
+        assert_eq!((p.gfx_peak, p.memory_peak), (600, 900));
+        assert_eq!(e.state, State::PowerReady);
+        assert_eq!(run(e.read_pstates(None, None)), Err(Error::Invalid));
+        assert_eq!(e.state, State::PowerReady);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi22",
+    rdna2_pstates_use_profile_clocks_and_live_dpm_endpoints
+);
+
+fn rdna2_pstate_failures_do_not_publish_or_replay_pending_commands() -> TestResult {
+    let (mut e, _pool) = powered_engine(0x413f00);
+    e.io.running |= 1 << 1;
+    for count in [0, 0x8000_0000, 0x100, u32::MAX] {
+        e.io.dpm_count = count;
+        assert_eq!(run(e.read_pstates(None, Some(1000))), Err(Error::Invalid));
+        assert_eq!(e.state, State::PowerReady);
+    }
+    e.io.dpm_count = 2;
+    e.io.reject = Some((DPM_FREQ_BY_INDEX, 0xfd));
+    assert_eq!(
+        run(e.read_pstates(None, Some(1000))),
+        Err(Error::Rejected(0xfd))
+    );
+    assert_eq!(e.state, State::PowerReady);
+    e.io.reject = None;
+    e.io.stall = Some(DPM_FREQ_BY_INDEX);
+    {
+        let mut future = alloc::boxed::Box::pin(e.read_pstates(None, Some(1000)));
+        assert!(future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    assert_eq!(e.state, State::Runtime);
+    let before = e.io.writes.len();
+    assert_eq!(run(e.read_pstates(None, Some(1000))), Err(Error::Busy));
+    assert_eq!(e.io.writes.len(), before);
+    let (mut e, _pool) = powered_engine(0x413f00);
+    e.io.revoke_on = Some((DPM_FREQ_BY_INDEX, e.authority));
+    assert_eq!(run(e.read_pstates(None, Some(1000))), Err(Error::Revoked));
+    assert_eq!(e.state, State::Failed);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi22",
+    rdna2_pstate_failures_do_not_publish_or_replay_pending_commands
+);
 fn commands(writes: &[(u32, u32)]) -> Vec<(u32, u32)> {
     // (message, argument) of each RESPONSE/ARGUMENT/MESSAGE publication.
     writes

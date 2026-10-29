@@ -345,7 +345,50 @@ fallback admits SMUIO 11.0.6 (captured RX 6750 XT) at discovered base index
 zero with ROM_INDEX/ROM_DATA dword offsets 0xe5/0xe6. SMUIO11's older
 callback and SMUIO14.0.2 retain 0xe4/0xe5; unrelated revisions remain rejected.
 
-### RX 6000 device queries, scheduling and memory pressure
+### RX 6000/RX 9000 device queries, scheduling and memory pressure
+
+Native RX 6000 and RX 9000 primary/render INFO ioctls serve TIMESTAMP and
+SENSOR through `amdgpu_info_stats` under their retained platform owner. RX 9000
+acquires a runtime-PM reference before OWNER, so suspended devices resume before
+MMIO. Timestamp sampling uses SMUIO11 bank 1 offsets 0x102/0x103 on discrete
+RDNA2 and SMUIO14.0.2 offsets 0x2d/0x2e on RDNA4. A bounded high/low/high sample
+with local interrupts masked handles carry; HDP liveness probes detect loss
+without reserving any counter bit pattern. RDNA2 probes HDP5's
+READ_CACHE_INVALIDATE (0xd1); RDNA4 probes HDP6's HOST_PATH_CNTL (0xcc),
+because HDP6 removed the invalidate register. All device accesses invoke
+current PCI authority, and the owner excludes reset/BAR teardown.
+
+SENSOR replies are u32: effective-average SCLK and instantaneous UCLK in MHz,
+edge temperature in mC, GPU load in percent, average socket power in watts and
+VDDGFX in mV. They refresh the actual SMU11/SMU14 telemetry transport instead
+of returning the power monitor's last good sample after a failed refresh.
+Stable/peak GFX/MCLK queries read the current DPM table endpoints using
+GetDpmFreqByIndex, masking bit 31 and refusing empty/oversized tables. Clock
+DPM disabled uses validated VBIOS boot clocks. RDNA2 standard clocks follow
+sienna_cichlid_populate_umd_state_clk (Navi21/22: 1825/1000 MHz, Navi23:
+1950/676 MHz, Navi24: 2200/1000 MHz); peaks are the table maxima. RDNA4 standard
+GFX and peak GFX follow the board's BaseClockAc/GameClockAc when nonzero and
+below the table maximum, otherwise that maximum; standard and peak UCLK use
+its maximum. These queries change no clock or power policy.
+
+DPM unavailable returns ENOENT before checking the sensor selector. VDDNB and
+GPU_INPUT_POWER remain EINVAL as in both Linux dGPU backends, which supply
+neither sensor. Unsupported selectors and clean SMU refusals return EINVAL;
+revocation/device loss returns ENODEV. Cancellation preserves the SMU's pending
+Runtime ownership; no partial or stale reply is copied. Replies retain the
+existing min(return_size, sizeof(reply)) copy and user-address validation.
+
+NUM_BYTES_MOVED and NUM_EVICTIONS are cumulative per-card GEM counters,
+retained across client-heap recovery. CPU, revocable-CPU-view and engine moves
+increment bytes only after backing commits; pressure/suspend evictions count
+only successful moves. Failed and no-op moves contribute nothing. Counter
+storage is retained by each GEM object before publication; frozen commits
+perform only atomic counter updates, with no new locks, allocation or callbacks.
+NUM_VRAM_CPU_PAGE_FAULTS is zero: this backend maps resident
+BAR/GTT pages and refuses CPU access to invisible VRAM, without a TTM fault
+migration callback. VRAM_LOST_COUNTER is a u32 reporting the native family's
+completed full GPU recoveries, the same events reported as VRAM loss to
+contexts. Existing heap-usage and per-open GPUVM_FAULT queries remain available.
 
 `amdgpu_rdna2::metadata::vram(table, module)` bounds atomfirmware
 VRAM_INFO 2.3/2.4/2.5/2.6 variable-length modules. Platform preparation reads
