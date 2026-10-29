@@ -4278,7 +4278,7 @@ fn smoke_fp_provider_publishes_every_reader() -> TestResult {
     use crate::fingerprint::{
         __reset_fp_for_test, __test_register_device, enumerate_fp, lookup_fp, FpVendor,
     };
-    use narf_filesystem::{FileOps, FileType};
+    use narf_filesystem::FileType;
     __reset_fp_for_test();
     let mut fail: Option<&str> = None;
     __test_register_device(3, FpVendor::Synaptics, 3, 2);
@@ -4338,7 +4338,7 @@ kernel_test_in!(
 /// other smokes.
 fn smoke_fp_open_requires_rawio_cap() -> TestResult {
     use crate::fingerprint::{__reset_fp_for_test, __test_register_device, lookup_fp, FpVendor};
-    use narf_filesystem::{FileOps, FsError};
+    use narf_filesystem::FsError;
     fn deny(_cap: u32) -> bool {
         false
     }
@@ -4497,7 +4497,7 @@ fn smoke_fp_ctrl_transfer_ioctl() -> TestResult {
         FpVendor, __reset_fp_for_test, __test_fp_node, __test_register_device, FP_DEVICES,
         FP_IOC_CTRL_TRANSFER, FP_IOC_GET_INFO,
     };
-    use narf_filesystem::{FileOps, FsError};
+    use narf_filesystem::FsError;
     __reset_fp_for_test();
     let idx = __test_register_device(7, FpVendor::Goodix, 3, 2);
     let dev = match FP_DEVICES.lock().get(idx).cloned() {
