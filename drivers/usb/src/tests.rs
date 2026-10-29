@@ -4278,6 +4278,7 @@ kernel_test_in!("drivers/usb/fingerprint", smoke_fp_no_reader_on_qemu);
 /// unregister call on the true path is the same one-line call
 /// `__reset_fp_for_test` already exercises. Globals are reset at
 /// start and end so the empty-registry smokes stay valid.
+#[cfg(feature = "kernel-test")]
 fn smoke_fp_detach_removes_slot_and_node_flag() -> TestResult {
     use crate::fingerprint::{
         __test_make_device, __test_push, attached_fp_count, detach_fp, with_device, FpVendor,
@@ -4311,6 +4312,7 @@ fn smoke_fp_detach_removes_slot_and_node_flag() -> TestResult {
     crate::fingerprint::__reset_fp_for_test();
     TestResult::Pass
 }
+#[cfg(feature = "kernel-test")]
 kernel_test_in!(
     "drivers/usb/fingerprint",
     smoke_fp_detach_removes_slot_and_node_flag
@@ -4319,6 +4321,7 @@ kernel_test_in!(
 /// Lifecycle (#922): detaching a non-owner leaves the node flag
 /// false — the node belongs to the index-0 entry, not to every
 /// detached device.
+#[cfg(feature = "kernel-test")]
 fn smoke_fp_detach_non_owner_keeps_node_flag() -> TestResult {
     use crate::fingerprint::{
         __test_make_device, __test_push, attached_fp_count, detach_fp, with_device, FpVendor,
@@ -4338,6 +4341,7 @@ fn smoke_fp_detach_non_owner_keeps_node_flag() -> TestResult {
     crate::fingerprint::__reset_fp_for_test();
     TestResult::Pass
 }
+#[cfg(feature = "kernel-test")]
 kernel_test_in!(
     "drivers/usb/fingerprint",
     smoke_fp_detach_non_owner_keeps_node_flag
@@ -4348,6 +4352,7 @@ kernel_test_in!(
 /// takes. Seeding slot 200 (the sentinel the unbind smoke uses)
 /// and dispatching must remove the seeded device however many
 /// times the hook is registered (idempotent by contract).
+#[cfg(feature = "kernel-test")]
 fn smoke_fp_detach_via_unbind_dispatch() -> TestResult {
     use crate::fingerprint::{__test_make_device, __test_push, attached_fp_count, FpVendor};
     crate::fingerprint::__reset_fp_for_test();
@@ -4362,6 +4367,7 @@ fn smoke_fp_detach_via_unbind_dispatch() -> TestResult {
     crate::fingerprint::__reset_fp_for_test();
     TestResult::Pass
 }
+#[cfg(feature = "kernel-test")]
 kernel_test_in!(
     "drivers/usb/fingerprint",
     smoke_fp_detach_via_unbind_dispatch
@@ -4371,6 +4377,7 @@ kernel_test_in!(
 /// absent with a bound device fails loudly without touching the
 /// arming flag; controller present resets it; controller absent
 /// with an empty registry succeeds.
+#[cfg(feature = "kernel-test")]
 fn smoke_fp_resume_decision_and_rearm() -> TestResult {
     use crate::fingerprint::{
         __test_make_device, __test_push, attached_fp_count, resume_fp_devices, FpVendor,
@@ -4399,6 +4406,7 @@ fn smoke_fp_resume_decision_and_rearm() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "kernel-test")]
 kernel_test_in!(
     "drivers/usb/fingerprint",
     smoke_fp_resume_decision_and_rearm
@@ -4406,6 +4414,7 @@ kernel_test_in!(
 
 /// Lifecycle (#922): wholesale teardown clears both registries
 /// (the `detach_all_bindings` path on controller recovery).
+#[cfg(feature = "kernel-test")]
 fn smoke_fp_unbind_all_clears() -> TestResult {
     use crate::fingerprint::{FpVendor, __test_make_device, __test_push};
     crate::fingerprint::__reset_fp_for_test();
@@ -4427,6 +4436,7 @@ fn smoke_fp_unbind_all_clears() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "kernel-test")]
 kernel_test_in!("drivers/usb/fingerprint", smoke_fp_unbind_all_clears);
 
 /// Lifecycle (#922): WBDI detach removes only the slot's entries
