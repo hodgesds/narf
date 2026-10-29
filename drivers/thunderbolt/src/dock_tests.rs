@@ -71,20 +71,19 @@
 use super::cm::CfgSpace;
 use super::control::Config;
 use super::retimer::{
-    self, OP_ENUMERATE_RETIMERS, OP_ERR, OP_GET_NVM_SECTOR_SIZE, OP_NVM_AUTH_WRITE,
+    self, Retimer, OP_ENUMERATE_RETIMERS, OP_ERR, OP_GET_NVM_SECTOR_SIZE, OP_NVM_AUTH_WRITE,
     OP_NVM_BLOCK_WRITE, OP_NVM_READ, OP_NVM_SET_OFFSET, OP_ONS, OP_QUERY_CABLE_RETIMER,
-    OP_QUERY_LAST_RETIMER, OP_SET_INBOUND_SBTX, OP_UNSET_INBOUND_SBTX, Retimer, SB_DATA,
-    SB_FW_VERSION, SB_LINK_CONF, SB_METADATA, SB_OPCODE, SB_PRODUCT_ID, SB_VENDOR_ID,
+    OP_QUERY_LAST_RETIMER, OP_SET_INBOUND_SBTX, OP_UNSET_INBOUND_SBTX, SB_DATA, SB_FW_VERSION,
+    SB_LINK_CONF, SB_METADATA, SB_OPCODE, SB_PRODUCT_ID, SB_VENDOR_ID,
 };
 use super::ring::Error;
 use super::topology::{Domain, Router};
 use super::tunnel::tests::Model;
-use super::xdomain::{Engine, PKG_XDOMAIN_RESP, PeerInfo, ROUTE_REPLY_BIT, XdChannel};
+use super::xdomain::{Engine, PeerInfo, XdChannel, PKG_XDOMAIN_RESP, ROUTE_REPLY_BIT};
 use alloc::collections::BTreeMap;
 use alloc::{boxed::Box, rc::Rc, sync::Arc, vec::Vec};
 use core::cell::RefCell;
-use narf_kernel_test::{TestResult, kernel_test_in};
-use narf_net::Interface as _;
+use narf_kernel_test::{kernel_test_in, TestResult};
 
 /// The composed scenario's domain (the native CM's NHI) and the
 /// peer host's domain, as published in the tunnel / peer
@@ -395,7 +394,6 @@ impl SbLink {
 /// semantics the tunnels were proven against) with the USB4
 /// Port Capability range of the two trained lane ports routed
 /// to per-link sideband responders.
-#[derive(Debug)]
 struct DockModel {
     inner: Model,
     links: BTreeMap<(u64, u8), SbLink>,
@@ -865,9 +863,9 @@ fn run<T>(future: impl core::future::Future<Output = T>) -> T {
 /// The composed dock scenario. See this module's documentation
 /// for the stage list and the two named cross-crate boundaries.
 fn usb4_dock_composed_end_to_end() -> TestResult {
-    use super::icm::{CmMode, FW_STS_ICM_EN, FW_STS_NVM_AUTH_DONE, classify};
-    use super::tunnel::{Endpoint, Protocol, displays, pcie_tunnels, usb3_tunnels};
-    use narf_power::device_pm::{DeviceSuspendError, suspend_all_devices};
+    use super::icm::{classify, CmMode, FW_STS_ICM_EN, FW_STS_NVM_AUTH_DONE};
+    use super::tunnel::{displays, pcie_tunnels, usb3_tunnels, Endpoint, Protocol};
+    use narf_power::device_pm::{suspend_all_devices, DeviceSuspendError};
 
     reset_world();
 
