@@ -362,6 +362,19 @@ SENSOR replies are u32: effective-average SCLK and instantaneous UCLK in MHz,
 edge temperature in mC, GPU load in percent, average socket power in watts and
 VDDGFX in mV. They refresh the actual SMU11/SMU14 telemetry transport instead
 of returning the power monitor's last good sample after a failed refresh.
+VDDNB exposes the dGPU VDD_SOC rail in mV: SMU11's live
+CurrSocVoltageOffset VID at metrics byte 68 uses Linux gpu_metrics' conversion
+(155000 - 625 * VID) / 100; VID zero is unreported and underflowing encodings
+are rejected. SMU14 uses AvgVoltage[SVI_PLANE_VDD_SOC] at byte 110; all-ones
+is unavailable, while a reported zero remains a valid off-rail value.
+GPU_INPUT_POWER returns the latest AverageSocketPower in watts on both
+families. This is a NARF extension of selectors that these Linux dGPU sensor
+switches do not implement: power is firmware-averaged over its sampling
+interval, and can equal GPU_AVG_POWER. It does not claim a separate
+instantaneous measurement or substitute total board power or a configured
+power cap. All-ones power is unavailable. The shared hwmon node also exposes
+in1_input/in1_label (mV, vddsoc) and power1_input (microWatts) from these
+sources; absent data reads empty there, as for other hwmon measurements.
 Stable/peak GFX/MCLK queries read the current DPM table endpoints using
 GetDpmFreqByIndex, masking bit 31 and refusing empty/oversized tables. Clock
 DPM disabled uses validated VBIOS boot clocks. RDNA2 standard clocks follow
@@ -371,9 +384,8 @@ GFX and peak GFX follow the board's BaseClockAc/GameClockAc when nonzero and
 below the table maximum, otherwise that maximum; standard and peak UCLK use
 its maximum. These queries change no clock or power policy.
 
-DPM unavailable returns ENOENT before checking the sensor selector. VDDNB and
-GPU_INPUT_POWER remain EINVAL as in both Linux dGPU backends, which supply
-neither sensor. Unsupported selectors and clean SMU refusals return EINVAL;
+DPM unavailable returns ENOENT before checking the sensor selector.
+Unavailable measurements, unsupported selectors and clean SMU refusals return EINVAL;
 revocation/device loss returns ENODEV. Cancellation preserves the SMU's pending
 Runtime ownership; no partial or stale reply is copied. Replies retain the
 existing min(return_size, sizeof(reply)) copy and user-address validation.
@@ -1289,7 +1301,8 @@ store validates synchronously and `amdgpu_navi48_platform::set_power_cap(w)`
 applies SetPptLimit (0x32) on the executor, which needs the PPT feature
 (FEATURE_THROTTLERS_BIT); the next sample's GetPptLimit is what `power1_cap`
 reads. `amdgpu_hwmon::publish_writable` adds writable attributes to the shared
-hwmon node. `power1_input` is absent. Values read empty
+hwmon node. `power1_input` uses the latest firmware-averaged socket-power
+sample, and `in1_input` reports VDD_SOC as described above. Values read empty
 until a sample or board limit exists, never as a fake zero. The monitor logs
 throttlers starting and ending, loss of a recorded protection, the first
 failed refresh, and hotspot reaching `software_shutdown_temp`. A fresh
@@ -6999,8 +7012,9 @@ features running at boot still run. `ColdBoot::power_limits()` and
 monitor that takes the owner lock per refresh. Attributes are the Linux SMU11
 dGPU set, read-only: `temp1..3` (edge/junction/mem) with crit/crit_hyst
 (-273150)/emergency; with a fan `pwm1` (register duty), `pwm1_enable` 2,
-`pwm1_min/max`, `fan1_input/min/max/target`, `fan1_enable` 0; `in0` vddgfx;
-`power1_average/cap/cap_default` (µW; default is the first PMFW limit, else the
+`pwm1_min/max`, `fan1_input/min/max/target`, `fan1_enable` 0; `in0` vddgfx and
+`in1` vddsoc; `power1_average/input/cap/cap_default` (µW; input uses the
+latest firmware-averaged sample; default is the first PMFW limit, else the
 table's AC limit); `freq1` sclk and `freq2` mclk (Hz). Fan control stays in
 PMFW automatic mode. The monitor logs throttling start/end, lost protection,
 the first failed refresh and hotspot at `software_shutdown_temp`; shutdown

@@ -175,6 +175,8 @@ struct Fake {
     samples: usize,
     states: usize,
     gfx: u32,
+    soc_voltage: Option<u32>,
+    input_power: Option<u32>,
 }
 impl Fake {
     fn new() -> Self {
@@ -187,6 +189,8 @@ impl Fake {
             samples: 0,
             states: 0,
             gfx: 2554,
+            soc_voltage: Some(950),
+            input_power: Some(171),
         }
     }
 }
@@ -221,6 +225,8 @@ impl Backend for Fake {
             load: 81,
             power_w: 171,
             voltage_mv: 1150,
+            soc_voltage_mv: self.soc_voltage,
+            input_power_w: self.input_power,
         })
     }
     async fn pstates(&mut self) -> Result<Pstates, FsError> {
@@ -260,11 +266,13 @@ fn stats_ioctl_units_pstates_and_short_replies() -> TestResult {
         (3, 52000),
         (4, 81),
         (5, 171),
+        (6, 950),
         (7, 1150),
         (8, 1825),
         (9, 1000),
         (10, 2600),
         (11, 1125),
+        (12, 171),
     ] {
         for size in [1, 3, 4, 16] {
             let mut out = [0xa5u8; 16];
@@ -275,7 +283,7 @@ fn stats_ioctl_units_pstates_and_short_replies() -> TestResult {
             assert!(out[n..].iter().all(|&b| b == 0xa5));
         }
     }
-    assert_eq!((backend.samples, backend.states), (24, 16));
+    assert_eq!((backend.samples, backend.states), (32, 16));
     for size in [3, 8, 16] {
         let mut out = [0xa5u8; 16];
         let req = request(&mut out, u::AMDGPU_INFO_TIMESTAMP, 0, size);
@@ -294,7 +302,7 @@ kernel_test_in!(
 
 fn stats_ioctl_refuses_unavailable_data_and_bad_copies() -> TestResult {
     let mut backend = Fake::new();
-    for sensor in [0, 6, 12, u32::MAX] {
+    for sensor in [0, 13, u32::MAX] {
         let mut out = [0xa5u8; 16];
         let req = request(&mut out, u::AMDGPU_INFO_SENSOR, sensor, 16);
         backend.enabled = true;
@@ -311,7 +319,7 @@ fn stats_ioctl_refuses_unavailable_data_and_bad_copies() -> TestResult {
         (smu::Error::Revoked, FsError::NoDevice),
         (smu::Error::DeviceGone, FsError::NoDevice),
     ] {
-        for sensor in [1, 8] {
+        for sensor in [1, 6, 8, 12] {
             backend.error = Some(error);
             let mut out = [0xa5u8; 16];
             let req = request(&mut out, u::AMDGPU_INFO_SENSOR, sensor, 16);
@@ -341,7 +349,7 @@ kernel_test_in!(
 );
 
 fn stats_pending_queries_do_not_publish_and_samples_are_fresh() -> TestResult {
-    for sensor in [1, 8] {
+    for sensor in [1, 6, 8, 12] {
         let mut backend = Fake::new();
         backend.pending = true;
         let mut out = [0xa5u8; 16];
@@ -371,4 +379,51 @@ fn stats_pending_queries_do_not_publish_and_samples_are_fresh() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/stats",
     stats_pending_queries_do_not_publish_and_samples_are_fresh
+);
+
+fn stats_soc_voltage_and_input_power_are_fresh_and_optional() -> TestResult {
+    let mut backend = Fake::new();
+    for (sensor, first, next) in [(6, 950u32, 1000u32), (12, 171, 203)] {
+        let mut out = [0xa5u8; 16];
+        let req = request(&mut out, u::AMDGPU_INFO_SENSOR, sensor, 4);
+        assert_eq!(run(dispatch(&req, &mut backend)), Ok(0));
+        assert_eq!(&out[..4], &first.to_le_bytes());
+        if sensor == 6 {
+            backend.soc_voltage = Some(next);
+        } else {
+            backend.input_power = Some(next);
+        }
+        assert_eq!(run(dispatch(&req, &mut backend)), Ok(0));
+        assert_eq!(&out[..4], &next.to_le_bytes());
+        if sensor == 6 {
+            backend.soc_voltage = None;
+        } else {
+            backend.input_power = None;
+        }
+        out.fill(0xa5);
+        assert_eq!(run(dispatch(&req, &mut backend)), Err(FsError::InvalidData));
+        assert_eq!(out, [0xa5; 16]);
+        backend.enabled = false;
+        let samples = backend.samples;
+        assert_eq!(run(dispatch(&req, &mut backend)), Err(FsError::NotFound));
+        assert_eq!(backend.samples, samples);
+        backend.enabled = true;
+        // A reported off/idle zero is a value; missing data stays an error.
+        if sensor == 6 {
+            backend.soc_voltage = Some(0);
+        } else {
+            backend.input_power = Some(0);
+        }
+        assert_eq!(run(dispatch(&req, &mut backend)), Ok(0));
+        assert_eq!(&out[..4], &[0; 4]);
+        assert_eq!(&out[4..], &[0xa5; 12]);
+    }
+    assert_eq!(latest_power_w(0), Some(0));
+    assert_eq!(latest_power_w(287), Some(287));
+    assert_eq!(latest_power_w(u16::MAX), None);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/stats",
+    stats_soc_voltage_and_input_power_are_fresh_and_optional
 );

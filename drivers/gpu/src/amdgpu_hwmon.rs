@@ -20,8 +20,12 @@ pub(crate) struct Reading {
     pub fan_rpm: Option<u16>,
     pub fan_max_rpm: Option<u16>,
     pub vddgfx_mv: Option<u16>,
+    /// dGPU SoC rail, also exposed through INFO_SENSOR_VDDNB.
+    pub vddsoc_mv: Option<u16>,
     /// Watts.
     pub power_average_w: Option<u32>,
+    /// Latest SMU socket-power sample; firmware-averaged over its interval.
+    pub power_input_w: Option<u32>,
     pub power_cap_w: Option<u32>,
     pub power_cap_default_w: Option<u32>,
     /// The settable `power1_cap` range, watts; None hides nothing but reads
@@ -36,8 +40,8 @@ pub(crate) struct Reading {
 /// Visible attribute names for a dGPU. `fan` hides every fan attribute when
 /// the board has no PMFW fan control (`adev->pm.no_fan`). `rpm_mode` adds the
 /// `fan1_target`/`fan1_enable` pair that SMU11 exposes (it has RPM setters);
-/// SMU14 has none. `power1_input` and the overdrive-dependent
-/// `power1_cap_{min,max}` are not provided.
+/// SMU14 has none. Power input uses the latest firmware-averaged sample.
+/// The overdrive-dependent `power1_cap_{min,max}` are added by their owner.
 pub(crate) fn attributes(fan: bool, rpm_mode: bool) -> Vec<&'static str> {
     let mut names = Vec::new();
     for t in [
@@ -82,7 +86,10 @@ pub(crate) fn attributes(fan: bool, rpm_mode: bool) -> Vec<&'static str> {
     names.extend_from_slice(&[
         "in0_input",
         "in0_label",
+        "in1_input",
+        "in1_label",
         "power1_average",
+        "power1_input",
         "power1_cap",
         "power1_cap_default",
         "power1_label",
@@ -107,6 +114,7 @@ pub(crate) fn show(r: &Reading, name: &str) -> String {
         "temp2_label" => return "junction\n".into(),
         "temp3_label" => return "mem\n".into(),
         "in0_label" => return "vddgfx\n".into(),
+        "in1_label" => return "vddsoc\n".into(),
         "power1_label" => return "PPT\n".into(),
         "freq1_label" => return "sclk\n".into(),
         "freq2_label" => return "mclk\n".into(),
@@ -132,8 +140,10 @@ pub(crate) fn show(r: &Reading, name: &str) -> String {
         "fan1_input" | "fan1_target" => r.fan_rpm.map(Into::into),
         "fan1_max" => r.fan_max_rpm.map(Into::into),
         "in0_input" => r.vddgfx_mv.map(Into::into),
+        "in1_input" => r.vddsoc_mv.map(Into::into),
         // Microwatts, from PMFW watts.
         "power1_average" => r.power_average_w.map(|w| i64::from(w) * 1_000_000),
+        "power1_input" => r.power_input_w.map(|w| i64::from(w) * 1_000_000),
         "power1_cap" => r.power_cap_w.map(|w| i64::from(w) * 1_000_000),
         "power1_cap_default" => r.power_cap_default_w.map(|w| i64::from(w) * 1_000_000),
         "power1_cap_min" => r.power_cap_min_w.map(|w| i64::from(w) * 1_000_000),

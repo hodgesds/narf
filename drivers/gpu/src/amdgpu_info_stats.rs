@@ -112,6 +112,8 @@ enum Sensor {
     Load,
     Power,
     Voltage,
+    SocVoltage,
+    InputPower,
     StableSclk,
     StableMclk,
     PeakSclk,
@@ -126,24 +128,27 @@ impl Sensor {
             u::AMDGPU_INFO_SENSOR_GPU_LOAD => Ok(Self::Load),
             u::AMDGPU_INFO_SENSOR_GPU_AVG_POWER => Ok(Self::Power),
             u::AMDGPU_INFO_SENSOR_VDDGFX => Ok(Self::Voltage),
+            u::AMDGPU_INFO_SENSOR_VDDNB => Ok(Self::SocVoltage),
+            u::AMDGPU_INFO_SENSOR_GPU_INPUT_POWER => Ok(Self::InputPower),
             u::AMDGPU_INFO_SENSOR_STABLE_PSTATE_GFX_SCLK => Ok(Self::StableSclk),
             u::AMDGPU_INFO_SENSOR_STABLE_PSTATE_GFX_MCLK => Ok(Self::StableMclk),
             u::AMDGPU_INFO_SENSOR_PEAK_PSTATE_GFX_SCLK => Ok(Self::PeakSclk),
             u::AMDGPU_INFO_SENSOR_PEAK_PSTATE_GFX_MCLK => Ok(Self::PeakMclk),
-            // Neither Linux dGPU backend supplies VDDNB or GPU_INPUT_POWER.
             _ => Err(FsError::InvalidData),
         }
     }
-    fn value(self, t: &Sensors) -> u32 {
-        match self {
+    fn value(self, t: &Sensors) -> Result<u32, FsError> {
+        Ok(match self {
             Self::Sclk => t.gfx_mhz,
             Self::Mclk => t.memory_mhz,
             Self::Temperature => t.temperature_milli,
             Self::Load => t.load,
             Self::Power => t.power_w,
             Self::Voltage => t.voltage_mv,
+            Self::SocVoltage => t.soc_voltage_mv.ok_or(FsError::InvalidData)?,
+            Self::InputPower => t.input_power_w.ok_or(FsError::InvalidData)?,
             _ => unreachable!("P-state queries use the DPM table"),
-        }
+        })
     }
 }
 
@@ -172,6 +177,13 @@ pub(crate) struct Sensors {
     pub load: u32,
     pub power_w: u32,
     pub voltage_mv: u32,
+    pub soc_voltage_mv: Option<u32>,
+    /// Latest SMU socket-power sample, in watts. Firmware averages over its
+    /// sampling interval; this is not a separate instantaneous measurement.
+    pub input_power_w: Option<u32>,
+}
+pub(crate) fn latest_power_w(socket_power_w: u16) -> Option<u32> {
+    (socket_power_w != u16::MAX).then_some(u32::from(socket_power_w))
 }
 pub(crate) trait Backend {
     fn timestamp(&mut self) -> Result<u64, FsError>;
@@ -210,6 +222,8 @@ impl Backend for crate::amdgpu_navi22_boot::ColdBoot {
             load: u32::from(t.metrics.gfx_activity),
             power_w: u32::from(t.metrics.socket_power_w),
             voltage_mv: u32::from(t.vddgfx_mv),
+            soc_voltage_mv: t.metrics.vddsoc_mv.map(u32::from),
+            input_power_w: latest_power_w(t.metrics.socket_power_w),
         })
     }
     async fn pstates(&mut self) -> Result<Pstates, FsError> {
@@ -237,6 +251,8 @@ impl Backend for crate::amdgpu_navi48_boot::ColdBoot {
             load: u32::from(t.metrics.gfx_activity),
             power_w: u32::from(t.metrics.socket_power_w),
             voltage_mv: u32::from(t.metrics.vddgfx_mv),
+            soc_voltage_mv: t.metrics.vddsoc_mv.map(u32::from),
+            input_power_w: latest_power_w(t.metrics.socket_power_w),
         })
     }
     async fn pstates(&mut self) -> Result<Pstates, FsError> {
@@ -281,7 +297,7 @@ pub(crate) async fn dispatch(bytes: &[u8], backend: &mut impl Backend) -> Result
                         _ => p.memory_peak,
                     }
                 }
-                _ => sensor.value(&backend.telemetry().await?),
+                _ => sensor.value(&backend.telemetry().await?)?,
             };
             value.to_le_bytes().to_vec()
         }

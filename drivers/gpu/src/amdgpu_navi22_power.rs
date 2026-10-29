@@ -217,7 +217,9 @@ fn reading(snapshot: Option<&Snapshot>) -> crate::amdgpu_hwmon::Reading {
         fan_rpm: m.map(|m| m.fan_rpm),
         fan_max_rpm: l.and_then(|l| l.fan_max_rpm),
         vddgfx_mv: t.map(|t| t.vddgfx_mv),
+        vddsoc_mv: m.and_then(|m| m.vddsoc_mv),
         power_average_w: m.map(|m| m.socket_power_w.into()),
+        power_input_w: m.and_then(|m| crate::amdgpu_info_stats::latest_power_w(m.socket_power_w)),
         power_cap_w: t.map(|t| t.ppt_limit_w),
         power_cap_default_w: snapshot
             .and_then(|s| s.ppt_default_w)

@@ -118,6 +118,8 @@ pub struct Metrics {
     pub board_power_w: u16,
     /// Average VDDGFX, in millivolts (hwmon `in0_input`).
     pub vddgfx_mv: u16,
+    /// Average VDD_SOC, in millivolts. 0xffff means unavailable.
+    pub vddsoc_mv: Option<u16>,
     /// Effective average GFXCLK (`METRICS_AVERAGE_GFXCLK`), in MHz.
     pub gfx_mhz: u16,
     /// Effective average FCLK/UCLK (busy-threshold selection), in MHz.
@@ -168,6 +170,10 @@ impl Metrics {
             socket_power_w: u16_at(b, SOCKET_POWER),
             board_power_w: u16_at(b, BOARD_POWER),
             vddgfx_mv: u16_at(b, VOLTAGE),
+            vddsoc_mv: {
+                let value = u16_at(b, VOLTAGE + 2); // SVI_PLANE_VDD_SOC
+                (value != u16::MAX).then_some(value)
+            },
             gfx_mhz: idle(gfx_activity, GFX_POST_DS, GFX_PRE_DS),
             fclk_mhz: idle(mem_activity, FCLK_POST_DS, FCLK_PRE_DS),
             mem_mhz: idle(mem_activity, MEM_POST_DS, MEM_PRE_DS),

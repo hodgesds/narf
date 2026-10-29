@@ -22,6 +22,7 @@ fn table(layout: Layout) -> Vec<u8> {
     put16(&mut b, 62, 1000); // AverageUclkFrequencyPostDs
     put16(&mut b, 64, 40); // AverageGfxActivity
     put16(&mut b, 66, 7); // AverageUclkActivity
+    b[68] = 88; // CurrSocVoltageOffset: SVI VID, 1000 mV
     put16(&mut b, 72, 186); // AverageSocketPower
     put16(&mut b, 74, 51); // TemperatureEdge
     put16(&mut b, 76, 63); // TemperatureHotspot
@@ -66,6 +67,7 @@ fn navi22_metrics_decode_both_linux_layouts() -> TestResult {
             vr_soc_milli: 44_000,
             fan_rpm: 1350,
             socket_power_w: 186,
+            vddsoc_mv: Some(1000),
             gfx_mhz: 2450,
             fclk_mhz: 1900,
             mem_mhz: 1000,
@@ -100,6 +102,30 @@ fn navi22_metrics_decode_both_linux_layouts() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/smu-navi22",
     navi22_metrics_decode_both_linux_layouts
+);
+
+fn rdna2_soc_voltage_uses_live_vid_and_rejects_invalid_encodings() -> TestResult {
+    for layout in [Layout::V1, Layout::V2, Layout::V3] {
+        let mut bytes = table(layout);
+        for (vid, expected) in [
+            (0, None),
+            (1, Some(1543)),
+            (64, Some(1150)),
+            (88, Some(1000)),
+            (97, Some(943)),
+            (248, Some(0)),
+            (249, None),
+            (255, None),
+        ] {
+            bytes[68] = vid;
+            assert_eq!(Metrics::decode(&bytes, layout).vddsoc_mv, expected);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi22",
+    rdna2_soc_voltage_uses_live_vid_and_rejects_invalid_encodings
 );
 
 fn pptable(fan: bool) -> Vec<u8> {

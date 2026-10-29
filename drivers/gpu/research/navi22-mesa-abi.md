@@ -340,8 +340,18 @@ kernel queues pass their ring/IB tests. Implemented (software models only):
 Current gaps: native reset fence errors, GDS/GWS/OA and tiled RDNA2 scanout.
 Statistics follow the live owner's generation and errors: DPM unavailable
 is ENOENT, failed refreshes publish no stale reply, and pending/cancelled
-SMU commands retain their Runtime ownership. Both Linux dGPU backends refuse
-VDDNB and GPU_INPUT_POWER; no measurement is invented for those selectors.
+SMU commands retain their Runtime ownership. Both Linux dGPU sensor switches
+refuse VDDNB and GPU_INPUT_POWER; NARF now extends them using live VDD_SOC
+and the latest firmware-averaged socket-power sample. SMU11 VDD_SOC follows
+sienna_cichlid_get_gpu_metrics' CurrSocVoltageOffset VID conversion, not an
+offset added to a guessed voltage. SMU14 uses AvgVoltage[SVI_PLANE_VDD_SOC].
+Input power can equal GPU_AVG_POWER and is not a separate instantaneous
+measurement. Missing/invalid readings remain unavailable. Hwmon shares the
+sources through in1_input (vddsoc) and power1_input.
+Voltage sources are Linux
+[`sienna_cichlid_get_gpu_metrics`](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c)
+and the SMU14
+[`SmuMetrics_t`/`SVI_PLANE_e`](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if/smu14_driver_if_v14_0.h).
 The older gap list's
 GEM_USERPTR, PRT/sparse, SET_PLACEMENT, linear KMS modifiers, per-client
 VMID/PASID and GPUVM_FAULT now have implementations and model coverage.

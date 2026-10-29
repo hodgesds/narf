@@ -1,7 +1,7 @@
 # amdgpu bring-up: remaining work
 
-Status as of 2026-10-28, based on `main` at `404b23e59` (#1202), plus the
-statistics fixes described below. Evidence below the "Verified on
+Status as of 2026-10-29, based on `main` at `8da5a8b52` (#1207), plus the
+VDDNB/input-power additions described below. Evidence below the "Verified on
 hardware" section comes from code review and software tests, including QEMU
 and register/fake-engine models.
 
@@ -95,9 +95,13 @@ IOMMU and timers; xHCI keyboard input; NVMe on the real controller.
   TIMESTAMP and the supported Linux SENSOR selectors, including all four
   stable/peak GFX/MCLK queries. Measurements use fresh SMU telemetry; P-states
   use actual DPM endpoints and Linux's per-ASIC/board standard-clock rules.
-  RX 9000 queries resume the GPU before taking the owner. VDDNB and separate
-  GPU_INPUT_POWER are unsupported by both Linux dGPU backends and return
-  EINVAL. DPM unavailable returns ENOENT; loss/revocation never returns stale
+  RX 9000 queries resume the GPU before taking the owner. VDDNB now exposes
+  live VDD_SOC on both families (SMU11 VID, SMU14 average voltage).
+  GPU_INPUT_POWER returns the latest firmware-averaged socket-power sample,
+  which can equal GPU_AVG_POWER; a separate instantaneous measurement is
+  unavailable. Both are also exposed through hwmon in1_input (vddsoc) and
+  power1_input. Missing/invalid measurements return EINVAL through INFO.
+  DPM unavailable returns ENOENT; loss/revocation never returns stale
   successful data. These paths still need physical Mesa validation.
 - **Memory counters on both families.** NUM_BYTES_MOVED and NUM_EVICTIONS
   count committed GEM moves and successful pressure/suspend evictions per
@@ -118,10 +122,10 @@ IOMMU and timers; xHCI keyboard input; NVMe on the real controller.
 
 Validation for the statistics and memory changes: native ioctl, MMIO and SMU
 model regressions cover both families. `cargo xtask test --subsystem drivers/gpu`
-reports 2,650 pass / 0 fail / 5 skip with `--arch x86_64`, and 2,104 pass /
-0 fail / 1 skip with `--arch aarch64`.
-Focused `drivers/gpu/amdgpu/stats,drivers/gpu/gfx12` runs pass 49 / 0 / 0 on
-both architectures, including the final HDP6 register/loss regressions.
+reports 2,652 pass / 0 fail / 5 skip with `--arch x86_64`, and 2,106 pass /
+0 fail / 1 skip with `--arch aarch64`. Regressions cover native VID and
+SOC-voltage decoding, sensor/hwmon units, missing values, short replies,
+refresh errors/cancellation and split timestamp register/loss handling.
 GPU Clippy passes in all three feature contexts on both architectures;
 `cargo fmt --all -- --check` passes. Production boot-smoke and btrfs
 interoperability checks also pass on both architectures.
