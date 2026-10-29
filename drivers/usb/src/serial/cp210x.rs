@@ -96,6 +96,17 @@ pub const GET_MDMSTS: u8 = 0x08;
 /// Linux: cp210x.c l.364 `CP210X_SET_BAUDRATE`
 pub const SET_BAUDRATE: u8 = 0x1E;
 
+/// Set/clear the break condition. AN571 §5.20 `SET_BREAK`:
+/// bmRequestType 0x41, wValue = break state ([`BREAK_ON`] /
+/// [`BREAK_OFF`]), wIndex = interface, no data stage.
+pub const SET_BREAK: u8 = 0x05;
+
+/// AN571 §5.20: `SET_BREAK` wValue that starts transmitting a break.
+pub const BREAK_ON: u16 = 0x0001;
+
+/// AN571 §5.20: `SET_BREAK` wValue that resets (clears) the break.
+pub const BREAK_OFF: u16 = 0x0000;
+
 // ── IFC_ENABLE wValue constants ───────────────────────────────────
 
 /// Enable the UART (`wValue` for `IFC_ENABLE`).

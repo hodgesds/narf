@@ -416,6 +416,23 @@ also consult upstream Linux GPL sources.
   (#840). Plan execution goes through the `ControlTransport` seam
   (production: `Xhci`; fixtures: a recording fake), which
   `cdc_acm`'s replay shares.
+- `serial::devfs_bridge` implements the ttyUSB termios + modem ioctl
+  surface (#756) via `FileOps::ioctl_user`, at parity with ttyS0's
+  devfs contract: TCGETS / TCSETS(W)(F) and the termios2 forms
+  (BOTHER rates ride `c_ospeed`), TIOCMGET / TIOCMSET / TIOCMBIS /
+  TIOCMBIC, TCSBRK, TIOCSBRK / TIOCCBRK, TCFLSH, TCXONC, FIONREAD,
+  TIOCGWINSZ / TIOCSWINSZ; anything else returns `Unsupported`
+  (ENOTTY). The node keeps the 36-byte kernel termios image verbatim
+  (line-discipline bits round-trip; this pipe has no ldisc) and
+  decodes its hardware-facing subset — baud, data bits, parity,
+  stop bits, CRTSCTS — into `port::LineSettings`, actuated on the
+  bound device via `serial::port::set_line_settings` /
+  `set_modem_lines` / `set_break_state`; B0 drops DTR/RTS as a
+  hangup without reprogramming the baud. Break is grounded for FTDI
+  (SET_DATA bit 14) and CP210x (AN571 `SET_BREAK`); PL2303 and
+  CH341 break encodings are not modelled and return a typed
+  `PortError::Unsupported`. TCXONC's TCOOFF parks the pump's TX
+  drain via the node's `tx_stopped` flag.
 - `ccid::devfs_bridge` publishes each bound CCID reader as `/dev/ccid<N>`
   (provider hooks installed by the `usb-ccid-devfs` Stage::Subsys
   initcall; node index = `CCID_READERS` index, assigned at bind). The
