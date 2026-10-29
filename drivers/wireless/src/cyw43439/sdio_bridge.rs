@@ -12,6 +12,7 @@ use narf_drivers_sdio::sdhci::cmd::{cmd52_arg, cmd53_arg};
 use narf_drivers_sdio::sdio::function::{SdioError, SdioFunction};
 
 use super::transport::{Function, PacketTransport, Transport, TransportError};
+use super::{chipclk, sdio};
 
 /// Maximum byte-mode CMD53 command extent (zero count encodes512).
 pub const CYW43439_F2_MAX_BURST: usize = 512;
@@ -73,6 +74,37 @@ pub struct SdioTransport<F: SdioFunction> {
     failed: bool,
     /// Card-interrupt wake when the host delivers F1/F2 interrupts.
     interrupt: Option<alloc::sync::Arc<crate::brcmfmac::irq::Signal>>,
+    /// Save-restore idle dongle sleep (`brcmf_sdio_bus_sleep`), when enabled.
+    sleep: Option<Sleep>,
+}
+
+/// `bus->sleeping` plus the watchdog idle accounting.
+#[derive(Clone, Copy, Debug)]
+struct Sleep {
+    asleep: bool,
+    /// Last bus activity, ms.
+    active_ms: u64,
+    /// Card-interrupt count when the dongle went to sleep.
+    interrupts_at_sleep: u64,
+}
+
+/// `SBSDIO_FUNC1_WAKEUPCTRL` and its HT-wait bit.
+const F1_WAKEUP_CTRL: u32 = 0x1_001e;
+const WAKEUP_HT_WAIT: u8 = 1 << 1;
+/// `SDIO_CCCR_BRCM_CARDCAP`: CMD14 support + extension (no AOS no-decode).
+const CCCR_BRCM_CARDCAP: u32 = 0xf0;
+const CARDCAP_CMD14: u8 = (1 << 1) | (1 << 2);
+/// Chipcommon `pmucapabilities` (PMU rev in [7:0]) and `sr_control1`.
+const CC_PMU_CAPABILITIES: u32 = 0x1800_0604;
+const CC_SR_CONTROL1: u32 = 0x1800_0508;
+/// `BRCMF_WD_POLL` (10 ms) x (`BRCMF_IDLE_INTERVAL` 1 + 1): the watchdog
+/// sleeps once `idlecount > idletime`.
+const IDLE_MS: u64 = 20;
+/// KSO readback bounded by sdio.c `PMU_MAX_TRANSITION_DLY` (1 s).
+const KSO_TIMEOUT_US: u64 = 1_000_000;
+
+fn now_ms() -> u64 {
+    narf_time::monotonic_ns() / 1_000_000
 }
 
 impl<F: SdioFunction> core::fmt::Debug for SdioTransport<F> {
@@ -93,6 +125,7 @@ impl<F: SdioFunction> SdioTransport<F> {
             flow_stopped: false,
             failed: false,
             interrupt: None,
+            sleep: None,
         }
     }
     pub(crate) fn qualify(
@@ -174,6 +207,140 @@ impl<F: SdioFunction> SdioTransport<F> {
             self.interrupt = Some(signal);
         }
         Ok(())
+    }
+    /// Linux `brcmf_sdio_kso_init` + `brcmf_chip_sr_capable` (43439: PMU
+    /// rev >= 17 and chipcommon `sr_control1` != 0) + `brcmf_sdio_sr_init`,
+    /// enabling idle dongle sleep. Only with delivered card interrupts: a
+    /// polled bus would wake the dongle on every poll. `Ok(false)` leaves
+    /// the dongle awake (non-SR chips' clock-drop idle is not ported).
+    pub fn initialize_sleep(&mut self, sdio_core_rev: u8) -> Result<bool, TransportError> {
+        if self.interrupt.is_none() || self.packet_core.is_none() {
+            return Ok(false);
+        }
+        if sdio_core_rev >= 12 {
+            let value = self
+                .func
+                .cmd52_read(1, sdio::F1_SLEEP_CSR)
+                .map_err(map_err)?;
+            if value & chipclk::sleep::KSO == 0 {
+                self.func
+                    .cmd52_write(1, sdio::F1_SLEEP_CSR, value | chipclk::sleep::KSO)
+                    .map_err(map_err)?;
+            }
+        } else {
+            return Ok(false);
+        }
+        let pmu_rev = self.read_backplane(CC_PMU_CAPABILITIES)? & 0xff;
+        if pmu_rev < 17 || self.read_backplane(CC_SR_CONTROL1)? == 0 {
+            return Ok(false);
+        }
+        let wake = self.func.cmd52_read(1, F1_WAKEUP_CTRL).map_err(map_err)?;
+        self.func
+            .cmd52_write(1, F1_WAKEUP_CTRL, wake | WAKEUP_HT_WAIT)
+            .map_err(map_err)?;
+        self.func
+            .cmd52_write(0, CCCR_BRCM_CARDCAP, CARDCAP_CMD14)
+            .map_err(map_err)?;
+        self.func
+            .cmd52_write(1, sdio::F1_CHIPCLK_CTRL, chipclk::FORCE_HT_REQ)
+            .map_err(map_err)?;
+        self.sleep = Some(Sleep {
+            asleep: false,
+            active_ms: now_ms(),
+            interrupts_at_sleep: 0,
+        });
+        Ok(true)
+    }
+    /// `brcmf_sdio_kso_control`: write KSO, then read back (synced to the
+    /// 32 kHz PMU clock) until KSO (and DEVON on wake) match.
+    fn kso(&mut self, on: bool) -> Result<(), TransportError> {
+        let value = if on { chipclk::sleep::KSO } else { 0 };
+        self.func
+            .cmd52_write(1, sdio::F1_SLEEP_CSR, value)
+            .map_err(map_err)?;
+        let (mask, expected) = if on {
+            let both = chipclk::sleep::KSO | chipclk::sleep::DEV_ON;
+            // usleep_range(2000, 3000) before the first readback.
+            let settle = narf_time::Deadline::after_us(2_000);
+            narf_scheduler::responsive_spin_until(|| false, settle);
+            (both, both)
+        } else {
+            (chipclk::sleep::KSO, 0)
+        };
+        let mut failure = None;
+        let ok = narf_scheduler::responsive_spin_until(
+            || match self.func.cmd52_read(1, sdio::F1_SLEEP_CSR) {
+                Ok(read) => read & mask == expected,
+                Err(error) => {
+                    failure = Some(error);
+                    true
+                }
+            },
+            narf_time::Deadline::after_us(KSO_TIMEOUT_US),
+        );
+        if let Some(error) = failure {
+            return Err(map_err(error));
+        }
+        if !ok {
+            return Err(TransportError::Timeout);
+        }
+        Ok(())
+    }
+    /// `brcmf_sdio_bus_sleep(.., false, ..)`: KSO wake, then HT available.
+    fn wake(&mut self) -> Result<(), TransportError> {
+        let Some(sleep) = self.sleep else {
+            return Ok(());
+        };
+        if sleep.asleep {
+            self.kso(true)?;
+            let mut failure = None;
+            let ok = narf_scheduler::responsive_spin_until(
+                || match self.func.cmd52_read(1, sdio::F1_CHIPCLK_CTRL) {
+                    Ok(read) => read & chipclk::HT_AVAIL != 0,
+                    Err(error) => {
+                        failure = Some(error);
+                        true
+                    }
+                },
+                narf_time::Deadline::after_us(KSO_TIMEOUT_US),
+            );
+            if let Some(error) = failure {
+                return Err(map_err(error));
+            }
+            if !ok {
+                return Err(TransportError::Timeout);
+            }
+        }
+        self.sleep = Some(Sleep {
+            asleep: false,
+            active_ms: now_ms(),
+            ..sleep
+        });
+        Ok(())
+    }
+    /// `brcmf_sdio_bus_sleep(.., true, ..)` on SR chips: keep an ALP request
+    /// if none is outstanding, then clear KSO.
+    fn enter_sleep(&mut self) -> Result<(), TransportError> {
+        let clock = self
+            .func
+            .cmd52_read(1, sdio::F1_CHIPCLK_CTRL)
+            .map_err(map_err)?;
+        if clock & 0x1f == 0 {
+            self.func
+                .cmd52_write(1, sdio::F1_CHIPCLK_CTRL, 0x08)
+                .map_err(map_err)?;
+        }
+        self.kso(false)?;
+        let interrupts = self.interrupt.as_ref().map_or(0, |s| s.count());
+        if let Some(sleep) = self.sleep.as_mut() {
+            sleep.asleep = true;
+            sleep.interrupts_at_sleep = interrupts;
+        }
+        Ok(())
+    }
+    /// Whether the dongle is in save-restore sleep.
+    pub fn asleep(&self) -> bool {
+        self.sleep.is_some_and(|s| s.asleep)
     }
     fn mailbox(&mut self) -> Result<(), TransportError> {
         let core = self.packet_core.ok_or(TransportError::NotReady)?;
@@ -369,11 +536,36 @@ impl<F: SdioFunction + Send> PacketTransport for SdioTransport<F> {
             self.func.rearm_card_interrupt();
         }
     }
+    /// `brcmf_sdio_bus_watchdog` idle path: sleep once the bus has been
+    /// idle for `IDLE_MS`.
+    fn idle(&mut self) {
+        let Some(sleep) = self.sleep else {
+            return;
+        };
+        if self.failed || sleep.asleep || now_ms().saturating_sub(sleep.active_ms) < IDLE_MS {
+            return;
+        }
+        if self.enter_sleep().is_err() {
+            self.failed = true;
+        }
+    }
     fn receive_packet(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
         if self.failed {
             return Err(TransportError::NotReady);
         }
-        let result = self.receive_inner(buffer);
+        // A sleeping dongle raises a card interrupt when it has work; the
+        // backstop timer alone must not wake it.
+        if let Some(sleep) = self.sleep.filter(|s| s.asleep) {
+            if self.interrupt.as_ref().map_or(0, |s| s.count()) == sleep.interrupts_at_sleep {
+                return Ok(0);
+            }
+        }
+        let result = self.wake().and_then(|()| self.receive_inner(buffer));
+        if let (Ok(n), Some(sleep)) = (&result, self.sleep.as_mut()) {
+            if *n != 0 {
+                sleep.active_ms = now_ms();
+            }
+        }
         if result.is_err() {
             self.failed = true;
         }
@@ -386,7 +578,7 @@ impl<F: SdioFunction + Send> PacketTransport for SdioTransport<F> {
         if packet.len() < 12 || packet.len() > super::runtime::MAX_PACKET || packet.len() % 4 != 0 {
             return Err(TransportError::LengthOverflow);
         }
-        if let Err(error) = self.mailbox() {
+        if let Err(error) = self.wake().and_then(|()| self.mailbox()) {
             self.failed = true;
             return Err(error);
         }
