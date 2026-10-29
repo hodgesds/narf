@@ -752,6 +752,13 @@ struct SdhciBlockDevice {
 }
 
 impl narf_block::registry::BlockDeviceSync for SdhciBlockDevice {
+    // NOTE (#841): flush/capabilities/write_fua are intentionally
+    // the trait defaults. This driver binds SD memory cards only,
+    // and the SD protocol exposes no host-visible volatile-write-
+    // cache flush: a write is durable once the card leaves
+    // programming state, so the no-op flush is the write-through
+    // treatment, not a vacuous advertisement — and default
+    // write_fua (write + flush) is sound for the same reason.
     fn lba_size(&self) -> u32 {
         512
     }

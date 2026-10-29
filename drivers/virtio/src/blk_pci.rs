@@ -34,6 +34,15 @@ pub const VIRTIO_BLK_PCI_DEVICE: u16 = 0x1042;
 /// virtio-blk request types.
 pub const VIRTIO_BLK_T_IN: u32 = 0;
 pub const VIRTIO_BLK_T_OUT: u32 = 1;
+/// virtio-blk cache-flush request type (VirtIO 1.2 §5.2.6; mirrors
+/// `crate::blk::VIRTIO_BLK_T_FLUSH` — this file keeps its own copy
+/// by the same convention as T_IN/T_OUT above).
+pub const VIRTIO_BLK_T_FLUSH: u32 = 4;
+
+/// virtio-blk feature bit for cache-flush support (VirtIO 1.2
+/// §5.2.3). Negotiated when the device offers it; `flush_cache`
+/// issues T_FLUSH only then (#841).
+pub const VIRTIO_BLK_F_FLUSH: u64 = 9;
 
 /// Max sectors per virtio-blk read round-trip. 128 × 512 B = 64 KiB, the
 /// size of one contiguous coherent payload (order-4 buddy block). Bounds
@@ -113,12 +122,18 @@ pub struct VirtioBlkPci {
     /// True once the wire-up is done. `false` when the device
     /// rejected our feature set or the queue couldn't be sized.
     pub ready: bool,
+    /// True when the device offered VIRTIO_BLK_F_FLUSH and the
+    /// driver negotiated it. `flush_cache` issues T_FLUSH only
+    /// then; otherwise the device has no guest-drainable cache
+    /// and the write-through treatment is honest (#841).
+    flush_supported: bool,
 }
 
 impl core::fmt::Debug for VirtioBlkPci {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("VirtioBlkPci")
             .field("ready", &self.ready)
+            .field("flush_supported", &self.flush_supported)
             .field("qsize", &self.qsize)
             .finish_non_exhaustive()
     }
@@ -178,13 +193,22 @@ impl VirtioBlkPci {
         if feats & (1u64 << VIRTIO_F_VERSION_1) == 0 {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
-        // Driver agrees only to VERSION_1 — minimal, predictable
-        // behaviour. Stage-4 follow-ups can opt into RING_PACKED,
-        // VIRTIO_BLK_F_SIZE_MAX, VIRTIO_BLK_F_FLUSH, etc.
+        // Driver agrees to VERSION_1 plus VIRTIO_BLK_F_FLUSH when
+        // the device offers it. Without the flush negotiation the
+        // driver could not drain a device write cache, and the
+        // SyncBlock Flush/Fua advertisement would be a lie (#841).
+        // Stage-4 follow-ups can opt into RING_PACKED,
+        // VIRTIO_BLK_F_SIZE_MAX, etc. Bit 9 sits in the low word.
+        let flush_supported = feats & (1u64 << VIRTIO_BLK_F_FLUSH) != 0;
+        let driver_feats_lo: u32 = if flush_supported {
+            1u32 << (VIRTIO_BLK_F_FLUSH as u32)
+        } else {
+            0
+        };
         // SAFETY: same.
         unsafe {
             common.write32(CC_DRIVER_FEATURE_SELECT, 0);
-            common.write32(CC_DRIVER_FEATURE, 0);
+            common.write32(CC_DRIVER_FEATURE, driver_feats_lo);
             common.write32(CC_DRIVER_FEATURE_SELECT, 1);
             common.write32(CC_DRIVER_FEATURE, 1u32 << (VIRTIO_F_VERSION_1 - 32));
             common.write8(
@@ -272,6 +296,7 @@ impl VirtioBlkPci {
             irq_vector: None,
             msix: None,
             ready: true,
+            flush_supported,
         })
     }
 
@@ -469,6 +494,139 @@ impl VirtioBlkPci {
             q.free_chain(head);
         }
         let _ = payload;
+        Ok(())
+    }
+
+    /// Whether VIRTIO_BLK_F_FLUSH was negotiated at probe time.
+    /// The sync wrapper reports it as `volatile_cache` so the
+    /// advertisement always matches what `flush_cache` can do (#841).
+    pub fn flush_supported(&self) -> bool {
+        self.flush_supported
+    }
+
+    /// Drain the device's volatile write cache with a
+    /// VIRTIO_BLK_T_FLUSH request (VirtIO 1.2 §5.2.6): a header-only
+    /// chain, no payload. Returns Ok(()) without touching the
+    /// device when flush was not negotiated — the device then has
+    /// no guest-drainable cache and the write-through treatment is
+    /// honest. A device status other than S_OK maps to an error:
+    /// a flush that did not happen must surface, never report
+    /// success (#841). Submission mirrors `write_sector` (pool
+    /// slot 0, notify, polled used-ring wait).
+    pub fn flush_cache(&self) -> Result<(), VirtioPciError> {
+        if !self.flush_supported {
+            return Ok(());
+        }
+        // Build header into the per-request pool slot 0.
+        let pool_phys = self.pool.dma_addr().raw();
+        let header_phys = pool_phys;
+        let status_phys = pool_phys + 16;
+        // SAFETY: identity-mapped DMA buffer.
+        unsafe {
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(header_phys).kernel_mut_ptr::<BlkHeader>(),
+                BlkHeader {
+                    type_tag: VIRTIO_BLK_T_FLUSH,
+                    _resv: 0,
+                    sector: 0,
+                },
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(status_phys).kernel_mut_ptr::<u8>(),
+                0xFFu8,
+            );
+        }
+        // Flush carries no payload: header + device-written status.
+        let descs = [
+            VirtqDesc {
+                addr: header_phys,
+                len: 16,
+                flags: 0,
+                next: 0,
+            },
+            VirtqDesc {
+                addr: status_phys,
+                len: 1,
+                flags: VIRTQ_DESC_F_WRITE,
+                next: 0,
+            },
+        ];
+        let mut q_err = false;
+        let head = {
+            let mut g = self.queue.lock();
+            let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
+            q.add_buffer(&descs).ok_or(VirtioPciError::QueueTooSmall)?
+        };
+        let notify_off = (self.queue_notify_off as u64) * (self.notify_off_multiplier as u64);
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped notify region.
+        unsafe {
+            self.notify.write16(notify_off, 0);
+        }
+        // Same no-abandon rule as `write_sector`: a submitted chain
+        // stays owned until the device publishes its used-ring
+        // entry, however many 1 s slices the wait takes.
+        let done = loop {
+            let completed = narf_scheduler::responsive_spin_until(
+                || {
+                    let elem = {
+                        let mut g = self.queue.lock();
+                        match g.as_mut() {
+                            Some(q) => q.poll_used(),
+                            None => {
+                                q_err = true;
+                                return true;
+                            }
+                        }
+                    };
+                    matches!(elem, Some((id, _)) if id == head as u32)
+                },
+                narf_time::Deadline::after_ms(1_000),
+            );
+            if completed || q_err {
+                break completed;
+            }
+            let (avail, last_used, device_used, free) = {
+                let g = self.queue.lock();
+                g.as_ref()
+                    .map(Virtqueue::diagnostic_snapshot)
+                    .unwrap_or((0, 0, 0, 0))
+            };
+            // SAFETY: `status_phys` is the live DMA status byte allocated for
+            // this request; the descriptor chain remains owned until the
+            // device completes it, so the byte is valid for this diagnostic
+            // volatile read.
+            let status = unsafe {
+                core::ptr::read_volatile(narf_memory::PhysAddr::new(status_phys).kernel_ptr::<u8>())
+            };
+            STALLED_REQUEST.store(((status as u64) << 8) | head as u64, Ordering::Relaxed);
+            STALLED_QUEUE_STATE.store(
+                ((avail as u64) << 48)
+                    | ((last_used as u64) << 32)
+                    | ((device_used as u64) << 16)
+                    | free as u64,
+                Ordering::Release,
+            );
+        };
+        if q_err {
+            return Err(VirtioPciError::NoQueues);
+        }
+        debug_assert!(done);
+        // SAFETY: identity-mapped DMA.
+        let status = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(status_phys).kernel_ptr::<u8>())
+        };
+        if status != VIRTIO_BLK_S_OK {
+            let mut g = self.queue.lock();
+            if let Some(q) = g.as_mut() {
+                q.free_chain(head);
+            }
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        let mut g = self.queue.lock();
+        if let Some(q) = g.as_mut() {
+            q.free_chain(head);
+        }
         Ok(())
     }
 
@@ -1305,6 +1463,32 @@ impl narf_block::BlockDeviceSync for VirtioBlkBlockSync {
         let (_gate, dev) = probed_device().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
         dev.write_sector(lba, &buf)
             .map_err(|_| narf_block::BlockIoError::DriverError)
+    }
+    /// Drain the device write cache via T_FLUSH when negotiated
+    /// (#841). A failed flush surfaces as `DriverError`, never as
+    /// silent success — the SyncBlock Flush advertisement is only
+    /// honest if this is real.
+    fn flush(&self) -> Result<(), narf_block::BlockIoError> {
+        let (_gate, dev) = probed_device().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        dev.flush_cache()
+            .map_err(|_| narf_block::BlockIoError::DriverError)
+    }
+    /// `volatile_cache` tracks negotiation exactly: a device that
+    /// offered F_FLUSH may cache writes, and `flush` drains it; a
+    /// device that did not offer it has no guest-drainable cache,
+    /// so the write-through treatment is honest. `fua` is never
+    /// native — the trait default (write + flush) is the emulation,
+    /// sound exactly because `flush` is now real when negotiated.
+    /// Unprobed, there is no device to describe: the default
+    /// (write-through, emulated FUA) is reported.
+    fn capabilities(&self) -> narf_block::BlockCaps {
+        let flush_supported = probed_device()
+            .map(|(_gate, dev)| dev.flush_supported())
+            .unwrap_or(false);
+        narf_block::BlockCaps {
+            volatile_cache: flush_supported,
+            fua: false,
+        }
     }
 }
 
