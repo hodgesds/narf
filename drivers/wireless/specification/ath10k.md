@@ -1151,6 +1151,15 @@ ADD_TX_TS and mac80211 never originates ADDTS; ACM ACs keep the
 `ieee80211_downgrade_queue` behaviour in `tx_qos.rs`. (Of the upstream
 wireless drivers only iwlwifi mvm/mld set that feature.)
 
+**Station U-APSD is not reachable upstream** (row folded into `ap`
+2026-10-28): mac80211 starts every station with
+`IEEE80211_DEFAULT_UAPSD_QUEUES` 0, no driver sets `hw.uapsd_queues`, and
+only the mac80211 debugfs `uapsd_queues` file changes it, so
+`IEEE80211_STA_UAPSD_ENABLED` is never set and `ath10k_conf_tx_uapsd` only
+ever programs U-APSD off. Every nl80211 U-APSD control
+(`NL80211_STA_WME_UAPSD_QUEUES`, `WIPHY_FLAG_AP_UAPSD`) is AP-side, which
+belongs to the `ap` row.
+
 ## 8. Remaining software and hardware acceptance
 
 The retained validation profile is calibrated BMI boot with a signed board
