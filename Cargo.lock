@@ -2478,6 +2478,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-watchdog"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-arch",
+ "narf-init",
+ "narf-kernel-test",
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-drivers-wireless"
 version = "0.0.0"
 dependencies = [
@@ -2732,6 +2743,7 @@ dependencies = [
  "narf-drivers-usbpd",
  "narf-drivers-video",
  "narf-drivers-virtio",
+ "narf-drivers-watchdog",
  "narf-drivers-wireless",
  "narf-drivers-wwan",
  "narf-edid",
