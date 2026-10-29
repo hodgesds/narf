@@ -2825,7 +2825,7 @@ fn smoke_usb_uvc_probe_commit_round_trip() -> TestResult {
         max_payload_transfer_size: 1024,
         ..Default::default()
     };
-    let bytes = src.encode();
+    let bytes = src.encode_v10();
     if bytes.len() != VsProbeCommit::LEN_V10 {
         return TestResult::Fail("encoded length wrong");
     }
@@ -2840,6 +2840,187 @@ fn smoke_usb_uvc_probe_commit_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/uvc", smoke_usb_uvc_probe_commit_round_trip);
+
+fn smoke_usb_uvc_probe_commit_v15_wire_frame() -> TestResult {
+    use crate::uvc::VsProbeCommit;
+    let src = VsProbeCommit {
+        hint: 0x0001,
+        format_index: 1,
+        frame_index: 1,
+        frame_interval: 333_333,
+        key_frame_rate: 30,
+        max_video_frame_size: 614_400,
+        max_payload_transfer_size: 1024,
+        clock_frequency: 48_000_000,
+        framing_info: 0,
+        preferred_version: 0x10,
+        min_version: 0x10,
+        max_version: 0x10,
+        ..Default::default()
+    };
+    let bytes = src.encode_v15();
+    // Pinned byte-for-byte: the 26-byte 1.0 block, then the clock LE
+    // at [26..30] (48_000_000 = 0x02DC6C00), then framing/versions.
+    let mut expect = [0u8; 34];
+    expect[0..2].copy_from_slice(&0x0001u16.to_le_bytes());
+    expect[2] = 1;
+    expect[3] = 1;
+    expect[4..8].copy_from_slice(&333_333u32.to_le_bytes());
+    expect[8..10].copy_from_slice(&30u16.to_le_bytes());
+    expect[18..22].copy_from_slice(&614_400u32.to_le_bytes());
+    expect[22..26].copy_from_slice(&1024u32.to_le_bytes());
+    expect[26..30].copy_from_slice(&48_000_000u32.to_le_bytes());
+    expect[30] = 0;
+    expect[31] = 0x10;
+    expect[32] = 0x10;
+    expect[33] = 0x10;
+    if bytes != expect {
+        return TestResult::Fail("34-byte wire frame mismatch");
+    }
+    let back = VsProbeCommit::decode(&bytes).expect("decode");
+    if back != src {
+        return TestResult::Fail("34-byte round-trip lost fields");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_usb_uvc_probe_commit_v15_wire_frame);
+
+fn smoke_usb_uvc_probe_commit_v10_decode_zeroes_v15() -> TestResult {
+    use crate::uvc::VsProbeCommit;
+    let src = VsProbeCommit {
+        hint: 1,
+        format_index: 1,
+        frame_index: 1,
+        frame_interval: 333_333,
+        ..Default::default()
+    };
+    let back = VsProbeCommit::decode(&src.encode_v10()).expect("decode");
+    if back.clock_frequency != 0
+        || back.framing_info != 0
+        || back.preferred_version != 0
+        || back.min_version != 0
+        || back.max_version != 0
+    {
+        return TestResult::Fail("26-byte decode must zero the 1.1+ fields");
+    }
+    if back != src {
+        return TestResult::Fail("26-byte round-trip lost fields");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_probe_commit_v10_decode_zeroes_v15
+);
+
+fn smoke_usb_uvc_probe_commit_len_for() -> TestResult {
+    use crate::uvc::VsProbeCommit;
+    if VsProbeCommit::len_for(0x0100) != 26
+        || VsProbeCommit::len_for(0x0109) != 26
+        || VsProbeCommit::len_for(0x0110) != 34
+        || VsProbeCommit::len_for(0x0150) != 34
+    {
+        return TestResult::Fail("len_for gate wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_usb_uvc_probe_commit_len_for);
+
+fn smoke_uvc_streamon_v15_negotiation() -> TestResult {
+    narf_drivers_video::devfs_bridge::__reset_for_test();
+    crate::uvc::__reset_uvc_for_test();
+    let transport = Arc::new(FixtureTransport::new(
+        false,
+        false,
+        uvc_fixture_frame_packets(),
+    ));
+    // The modelled 1.5 device's VC HEADER clock (48 MHz) deliberately
+    // differs from the 1.0 fixture's 4.68 MHz: the PROBE clock must
+    // come from the bound device's header, not a constant.
+    transport.set_clock(48_000_000);
+    let blob = uvc_fixture_config_blob_versioned(0x0150, 48_000_000);
+    let idx = match narf_scheduler::block_on(crate::uvc::try_bind_video_with_transport(
+        &*transport,
+        7,
+        &blob,
+    )) {
+        Ok(idx) => idx,
+        Err(_) => return TestResult::Fail("bind against the modelled 1.5 camera failed"),
+    };
+    // Drive the production desired-construction path, not a
+    // hand-built payload.
+    let desired = {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        let device = match devices.get(idx) {
+            Some(d) => d,
+            None => return TestResult::Fail("bound device missing"),
+        };
+        if device.uvc_version != 0x0150 || device.clock_frequency != 48_000_000 {
+            return TestResult::Fail("bind should record bcdUVC + VC clock");
+        }
+        let format = narf_drivers_video::v4l2_ioctl::PixFormat {
+            width: 640,
+            height: 480,
+            fourcc: u32::from_le_bytes(*b"YUYV"),
+        };
+        match crate::uvc::desired_probe_commit(device, format) {
+            Some(d) => d,
+            None => return TestResult::Fail("desired_probe_commit failed"),
+        }
+    };
+    let negotiated = match narf_scheduler::block_on(
+        crate::uvc::negotiate_and_activate_video_stream_with(&*transport, idx, desired),
+    ) {
+        Ok(n) => n,
+        Err(_) => return TestResult::Fail("1.5 negotiation failed"),
+    };
+    let log = transport.log();
+    let probe = match log.iter().find_map(|x| match x {
+        FixtureXfer::SetCurProbe { payload } => Some(payload.clone()),
+        _ => None,
+    }) {
+        Some(p) => p,
+        None => return TestResult::Fail("no SET_CUR(PROBE) logged"),
+    };
+    if probe.len() != 34 {
+        return TestResult::Fail("SET_CUR(PROBE) to a 1.5 device must be 34 bytes");
+    }
+    if u32::from_le_bytes(probe[26..30].try_into().unwrap()) != 48_000_000 {
+        return TestResult::Fail("PROBE clock must be the VC HEADER clock");
+    }
+    if probe[31] != 0x10 || probe[32] != 0x10 || probe[33] != 0x10 {
+        return TestResult::Fail("PROBE must declare 1.0 payload versions");
+    }
+    let commit = match log.iter().find_map(|x| match x {
+        FixtureXfer::SetCurCommit { payload } => Some(payload.clone()),
+        _ => None,
+    }) {
+        Some(p) => p,
+        None => return TestResult::Fail("no SET_CUR(COMMIT) logged"),
+    };
+    if commit.len() != 34 {
+        return TestResult::Fail("SET_CUR(COMMIT) to a 1.5 device must be 34 bytes");
+    }
+    if u32::from_le_bytes(commit[18..22].try_into().unwrap()) != 614_400
+        || u32::from_le_bytes(commit[22..26].try_into().unwrap()) != 1024
+    {
+        return TestResult::Fail("COMMIT must carry the device-accepted sizes");
+    }
+    if u32::from_le_bytes(commit[26..30].try_into().unwrap()) != 48_000_000
+        || commit[31] != 0x10
+        || commit[32] != 0x10
+        || commit[33] != 0x10
+    {
+        return TestResult::Fail("COMMIT must carry the device clock + versions");
+    }
+    if negotiated.control.clock_frequency != 48_000_000
+        || negotiated.control.max_payload_transfer_size != 1024
+    {
+        return TestResult::Fail("negotiated control must carry the device values");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_streamon_v15_negotiation);
 
 fn smoke_usb_uvc_reassembler_completes_two_packet_frame() -> TestResult {
     use crate::uvc::{bfh, ReassemblerOutcome, UvcFrameReassembler};
@@ -6060,12 +6241,14 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// One recorded transfer in the modelled device conversation.
+/// Probe/commit payloads are variable-length: 26 bytes for a 1.0
+/// device, 34 for a 1.1+ device.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum FixtureXfer {
     SetConfiguration,
-    SetCurProbe { payload: [u8; 26] },
+    SetCurProbe { payload: Vec<u8> },
     GetCurProbe,
-    SetCurCommit { payload: [u8; 26] },
+    SetCurCommit { payload: Vec<u8> },
     ConfigureEndpoints { ep_addr: u8 },
     SetInterface { interface: u16, alt: u16 },
     IsochIn,
@@ -6076,7 +6259,10 @@ enum FixtureXfer {
 struct FixtureState {
     log: Vec<FixtureXfer>,
     /// Last SET_CUR(PROBE) payload; GET_CUR(PROBE) answers from it.
-    probe: Option<[u8; 26]>,
+    probe: Option<Vec<u8>>,
+    /// The modelled device's clock (its VC HEADER clock), answered in
+    /// the 1.1+ extension block of GET_CUR(PROBE).
+    clock_frequency: u32,
     fail_probe: bool,
     fail_set_interface: bool,
     packets: VecDeque<Vec<u8>>,
@@ -6086,7 +6272,9 @@ struct FixtureState {
 /// Its GET_CUR(PROBE) behaves like a real device: it accepts the
 /// host's format/frame/interval and fills in its own
 /// `dwMaxVideoFrameSize` (640×480 YUYV) and
-/// `dwMaxPayloadTransferSize` (1024, matching the alt-1 endpoint).
+/// `dwMaxPayloadTransferSize` (1024, matching the alt-1 endpoint);
+/// for a 34-byte probe it additionally answers its clock and the
+/// 1.0 payload versions it accepts.
 struct FixtureTransport {
     state: IrqSafeSpinLock<FixtureState>,
 }
@@ -6097,6 +6285,7 @@ impl FixtureTransport {
             state: IrqSafeSpinLock::new(FixtureState {
                 log: Vec::new(),
                 probe: None,
+                clock_frequency: 0,
                 fail_probe,
                 fail_set_interface,
                 packets: packets.into(),
@@ -6106,6 +6295,12 @@ impl FixtureTransport {
 
     fn log(&self) -> Vec<FixtureXfer> {
         self.state.lock().log.clone()
+    }
+
+    /// Set the modelled device's VC HEADER clock, answered in the
+    /// 1.1+ extension block of GET_CUR(PROBE).
+    fn set_clock(&self, hz: u32) {
+        self.state.lock().clock_frequency = hz;
     }
 
     /// Stage a packet for the modelled device to source, as if it
@@ -6174,9 +6369,10 @@ impl crate::uvc::UvcTransport for FixtureTransport {
             return Ok(data.len());
         }
         if b_request == crate::uvc::VS_REQ_SET_CUR && w_value == crate::uvc::VS_PROBE_CONTROL {
-            let mut payload = [0u8; 26];
-            payload.copy_from_slice(&data[..26.min(data.len())]);
-            state.log.push(FixtureXfer::SetCurProbe { payload });
+            let payload = data.to_vec();
+            state.log.push(FixtureXfer::SetCurProbe {
+                payload: payload.clone(),
+            });
             if state.fail_probe {
                 return Err(XhciError::CmdFailed(0xE2));
             }
@@ -6184,9 +6380,9 @@ impl crate::uvc::UvcTransport for FixtureTransport {
             return Ok(data.len());
         }
         if b_request == crate::uvc::VS_REQ_SET_CUR && w_value == crate::uvc::VS_COMMIT_CONTROL {
-            let mut payload = [0u8; 26];
-            payload.copy_from_slice(&data[..26.min(data.len())]);
-            state.log.push(FixtureXfer::SetCurCommit { payload });
+            state.log.push(FixtureXfer::SetCurCommit {
+                payload: data.to_vec(),
+            });
             return Ok(data.len());
         }
         state.log.push(FixtureXfer::OtherControlOut {
@@ -6208,11 +6404,22 @@ impl crate::uvc::UvcTransport for FixtureTransport {
         let mut state = self.state.lock();
         if b_request == crate::uvc::VS_REQ_GET_CUR && w_value == crate::uvc::VS_PROBE_CONTROL {
             state.log.push(FixtureXfer::GetCurProbe);
-            let mut accepted = state.probe.unwrap_or([0u8; 26]);
+            let mut accepted = state.probe.clone().unwrap_or_default();
             // The device fills in its own frame size + payload size.
-            accepted[18..22].copy_from_slice(&614_400u32.to_le_bytes());
-            accepted[22..26].copy_from_slice(&1024u32.to_le_bytes());
-            let n = out.len().min(26);
+            if accepted.len() >= 26 {
+                accepted[18..22].copy_from_slice(&614_400u32.to_le_bytes());
+                accepted[22..26].copy_from_slice(&1024u32.to_le_bytes());
+            }
+            // A 1.1+ device answers the extension block: its clock and
+            // the 1.0 payload versions it accepts.
+            if accepted.len() >= 34 {
+                accepted[26..30].copy_from_slice(&state.clock_frequency.to_le_bytes());
+                accepted[30] = 0;
+                accepted[31] = 0x10;
+                accepted[32] = 0x10;
+                accepted[33] = 0x10;
+            }
+            let n = out.len().min(accepted.len());
             out[..n].copy_from_slice(&accepted[..n]);
             return Ok(n);
         }
@@ -6292,14 +6499,23 @@ fn uvc_fixture_stream_ops() -> narf_drivers_video::v4l2_ioctl::StreamOps {
 /// 0, VS interface 1 with one uncompressed YUYV 640×480 @30 fps format
 /// and an isochronous alt-1 endpoint (0x81, 1024-byte packets).
 fn uvc_fixture_config_blob() -> Vec<u8> {
+    uvc_fixture_config_blob_versioned(0x0100, 0x0047_9C40)
+}
+
+/// Modelled camera config blob with a chosen VC HEADER version/clock.
+/// The 1.0 form keeps the original bytes: bcdUVC 1.00, 4.68 MHz clock.
+fn uvc_fixture_config_blob_versioned(bcd_uvc: u16, clock_hz: u32) -> Vec<u8> {
     let mut cfg = alloc::vec::Vec::new();
     // Configuration header (wTotalLength patched at the end).
     cfg.extend_from_slice(&[9, 2, 0, 0, 2, 1, 0, 0x80, 50]);
     // Interface 0: VideoControl.
     cfg.extend_from_slice(&[9, 4, 0, 0, 0, 0x0E, 0x01, 0x00, 0]);
-    // VC_HEADER (13 bytes): bcdUVC 1.0, wTotalLength 13,
+    // VC_HEADER (13 bytes): bcdUVC, wTotalLength 13,
     // dwClockFrequency (4 bytes), one streaming interface (1).
-    cfg.extend_from_slice(&[13, 0x24, 0x01, 0x00, 0x01, 13, 0, 0x40, 0x9C, 0x47, 0, 1, 1]);
+    let mut vc_header = [13u8, 0x24, 0x01, 0, 0, 13, 0, 0, 0, 0, 0, 1, 1];
+    vc_header[3..5].copy_from_slice(&bcd_uvc.to_le_bytes());
+    vc_header[7..11].copy_from_slice(&clock_hz.to_le_bytes());
+    cfg.extend_from_slice(&vc_header);
     // Interface 1 alt 0: VideoStreaming, zero bandwidth.
     cfg.extend_from_slice(&[9, 4, 1, 0, 0, 0x0E, 0x02, 0x00, 0]);
     // VS_INPUT_HEADER: 1 format, CS total 71, endpoint 0x81, terminal 1.
@@ -6459,6 +6675,26 @@ fn uvc_fixture_bound(
     ),
     &'static str,
 > {
+    uvc_fixture_bound_with_blob(fail_probe, fail_set_interface, &uvc_fixture_config_blob())
+}
+
+/// Bind against a modelled camera described by `blob` (same flow as
+/// [`uvc_fixture_bound`], so the 1.5 test shares the S_FMT/REQBUFS
+/// setup and only the VC HEADER version/clock differ).
+fn uvc_fixture_bound_with_blob(
+    fail_probe: bool,
+    fail_set_interface: bool,
+    blob: &[u8],
+) -> Result<
+    (
+        Arc<FixtureTransport>,
+        usize,
+        FixtureDevice,
+        FixtureCtx,
+        FixtureEvents,
+    ),
+    &'static str,
+> {
     narf_drivers_video::devfs_bridge::__reset_for_test();
     crate::uvc::__reset_uvc_for_test();
     let transport = Arc::new(FixtureTransport::new(
@@ -6468,11 +6704,10 @@ fn uvc_fixture_bound(
     ));
     *UVC_FIXTURE_TRANSPORT.lock() = Some(transport.clone());
 
-    let blob = uvc_fixture_config_blob();
     let idx = narf_scheduler::block_on(crate::uvc::try_bind_video_with_transport(
         &*transport,
         7,
-        &blob,
+        blob,
     ))
     .map_err(|_| "bind against the modelled camera failed")?;
     let (node, format_count) = {
@@ -6658,17 +6893,26 @@ fn smoke_uvc_streamon_composition_e2e() -> TestResult {
     accepted.max_video_frame_size = 614_400;
     accepted.max_payload_transfer_size = 1024;
     let probe_payload = log.iter().find_map(|x| match x {
-        FixtureXfer::SetCurProbe { payload } => Some(*payload),
+        FixtureXfer::SetCurProbe { payload } => Some(payload.clone()),
         _ => None,
     });
-    if probe_payload != Some(desired.encode()) {
+    // The 1.0 fixture device (bcdUVC 0x0100) must receive exactly the
+    // 26-byte form — a 34-byte probe here would be the truncation bug
+    // in reverse.
+    if probe_payload.as_ref().map(|p| p.len()) != Some(26) {
+        return TestResult::Fail("SET_CUR(PROBE) to a 1.0 device must be 26 bytes");
+    }
+    if probe_payload != Some(desired.encode_for(0x0100)) {
         return TestResult::Fail("SET_CUR(PROBE) should carry the desired stream parameters");
     }
     let commit_payload = log.iter().find_map(|x| match x {
-        FixtureXfer::SetCurCommit { payload } => Some(*payload),
+        FixtureXfer::SetCurCommit { payload } => Some(payload.clone()),
         _ => None,
     });
-    if commit_payload != Some(accepted.encode()) {
+    if commit_payload.as_ref().map(|p| p.len()) != Some(26) {
+        return TestResult::Fail("SET_CUR(COMMIT) to a 1.0 device must be 26 bytes");
+    }
+    if commit_payload != Some(accepted.encode_for(0x0100)) {
         return TestResult::Fail("SET_CUR(COMMIT) should carry the device-accepted parameters");
     }
     let pos = |needle: &FixtureXfer| fixture_log_pos(&log, needle);

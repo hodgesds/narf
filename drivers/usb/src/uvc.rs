@@ -717,6 +717,13 @@ pub struct UvcDevice {
     /// and exits, consuming it. A new activation supersedes it: it
     /// targeted the stream being replaced, so activation clears it.
     pub capture_stop_requested: bool,
+    /// `bcdUVC` from the VC HEADER descriptor (0x0100 when the header
+    /// could not be parsed). Drives the PROBE/COMMIT wire length:
+    /// 34 bytes for UVC 1.1+, 26 bytes otherwise.
+    pub uvc_version: u16,
+    /// Device clock frequency in Hz from the VC HEADER descriptor
+    /// (0 when unknown). Offered as `dwClockFrequency` on 1.1+ PROBE.
+    pub clock_frequency: u32,
 }
 
 /// System-wide registry of bound UVC devices.
@@ -905,12 +912,21 @@ pub async fn try_bind_video_with_transport<T: UvcTransport>(
     // (inside register_video_with_formats) if the probe or parse yields nothing.
     // The parsed table itself is retained on the device: STREAMON maps the
     // S_FMT-committed format back to UVC indices through it.
-    let stream_formats = narf_drivers_video::uvc::probe_uvc(cfg)
-        .ok()
+    let probe = narf_drivers_video::uvc::probe_uvc(cfg).ok();
+    let stream_formats = probe
+        .as_ref()
         .map(|p| {
             narf_drivers_video::uvc::parse_streaming_descriptors(&p.vs_cs_blob).unwrap_or_default()
         })
         .unwrap_or_default();
+    // The VC HEADER is the first class-specific VC descriptor; its bcdUVC
+    // selects the PROBE/COMMIT wire length and its clock feeds
+    // dwClockFrequency on 1.1+ PROBE. Unparseable → 1.0 behaviour.
+    let (uvc_version, clock_frequency) = probe
+        .as_ref()
+        .and_then(|p| VcHeader::parse(&p.vc_cs_blob).ok())
+        .map(|h| (h.bcd_uvc, h.clock_frequency))
+        .unwrap_or((0x0100, 0));
     let formats = narf_drivers_video::v4l2_ioctl::uvc_to_v4l2_formats(&stream_formats);
     let video_node =
         narf_drivers_video::devfs_bridge::register_video_with_formats("USB Video Device", formats);
@@ -927,6 +943,8 @@ pub async fn try_bind_video_with_transport<T: UvcTransport>(
         stream_generation: 0,
         capture_pump_generation: 0,
         capture_stop_requested: false,
+        uvc_version,
+        clock_frequency,
     });
     Ok(idx)
 }
@@ -1212,8 +1230,9 @@ pub struct UvcNegotiatedStream {
     pub endpoint: UvcStreamingEndpoint,
 }
 
-/// Run the UVC 1.0/1.1 26-byte negotiation sequence, then configure and
-/// select the least-bandwidth isochronous alternate that satisfies the
+/// Run the version-aware negotiation sequence (26-byte UVC 1.0,
+/// 34-byte UVC 1.1+ per the device's VC HEADER `bcdUVC`), then configure
+/// and select the least-bandwidth isochronous alternate that satisfies the
 /// device-accepted maximum payload size, and start the capture pump.
 pub async fn negotiate_and_activate_video_stream(
     xhci_dev: &crate::xhci::Xhci,
@@ -1236,18 +1255,22 @@ pub async fn negotiate_and_activate_video_stream_with<T: UvcTransport>(
     idx: usize,
     desired: VsProbeCommit,
 ) -> Result<UvcNegotiatedStream, UvcError> {
-    let (slot_id, vs_iface) = {
+    let (slot_id, vs_iface, uvc_version) = {
         let devices = UVC_DEVICES.lock();
         let device = devices.get(idx).ok_or(UvcError::NotVideo)?;
-        (device.slot_id, device.vs_iface)
+        (device.slot_id, device.vs_iface, device.uvc_version)
     };
+    // The wire length follows the device's VC HEADER bcdUVC, not the
+    // caller's struct: a 1.1+ device must never receive a truncated
+    // 26-byte PROBE, and a 1.0 device must never receive 34 bytes.
+    let probe_len = VsProbeCommit::len_for(uvc_version);
     let request_type_out = crate::control::RT_DIR_OUT
         | crate::control::RT_TYPE_CLASS
         | crate::control::RT_RECIP_INTERFACE;
     let request_type_in = crate::control::RT_DIR_IN
         | crate::control::RT_TYPE_CLASS
         | crate::control::RT_RECIP_INTERFACE;
-    let desired_bytes = desired.encode();
+    let desired_bytes = desired.encode_for(uvc_version);
     transport
         .control_out(
             slot_id,
@@ -1260,7 +1283,7 @@ pub async fn negotiate_and_activate_video_stream_with<T: UvcTransport>(
         .await
         .map_err(|_| UvcError::ProbeFailed)?;
 
-    let mut accepted_bytes = [0u8; VsProbeCommit::LEN_V10];
+    let mut accepted_bytes = [0u8; VsProbeCommit::LEN_V15];
     let accepted_len = transport
         .control_in(
             slot_id,
@@ -1272,11 +1295,14 @@ pub async fn negotiate_and_activate_video_stream_with<T: UvcTransport>(
         )
         .await
         .map_err(|_| UvcError::ProbeFailed)?;
-    if accepted_len < VsProbeCommit::LEN_V10 {
+    if accepted_len < probe_len {
         return Err(UvcError::ProbeFailed);
     }
-    let accepted = VsProbeCommit::decode(&accepted_bytes).map_err(|_| UvcError::ProbeFailed)?;
-    let accepted_encoded = accepted.encode();
+    let accepted = VsProbeCommit::decode(&accepted_bytes[..accepted_len])
+        .map_err(|_| UvcError::ProbeFailed)?;
+    // COMMIT carries the device-accepted values at the same version
+    // length — including the device's 1.1+ clock and version fields.
+    let accepted_encoded = accepted.encode_for(uvc_version);
     transport
         .control_out(
             slot_id,
@@ -1550,7 +1576,13 @@ pub fn uvc_index_for_video_node(node: usize) -> Option<usize> {
 /// frame-rate surface reaches STREAMON — `VIDIOC_S_PARM` is
 /// report-only in the V4L2 layer — so the frame's interval nearest
 /// 30 fps is requested, with the hint bit set for `dwFrameInterval`.
-fn desired_probe_commit(
+/// On UVC 1.1+ devices the 1.1+ fields are filled from the device
+/// record (VC-header clock; 1.0 payload-version declaration — the only
+/// payload format this driver's reassembler implements); on 1.0
+/// devices they stay zero and are never sent.
+/// `pub(crate)` so the negotiation fixture drives the production
+/// desired-construction path instead of hand-building a payload.
+pub(crate) fn desired_probe_commit(
     device: &UvcDevice,
     format: narf_drivers_video::v4l2_ioctl::PixFormat,
 ) -> Option<VsProbeCommit> {
@@ -1572,11 +1604,17 @@ fn desired_probe_commit(
         .find(|candidate| candidate.pixel_fmt == pixel)?;
     let (frame_index, frame_interval) =
         stream_format.find_frame(format.width as u16, format.height as u16, 30)?;
+    let v15 = device.uvc_version >= 0x0110;
     Some(VsProbeCommit {
         hint: 1,
         format_index: stream_format.format_index,
         frame_index,
         frame_interval,
+        clock_frequency: if v15 { device.clock_frequency } else { 0 },
+        framing_info: 0,
+        preferred_version: if v15 { 0x10 } else { 0 },
+        min_version: if v15 { 0x10 } else { 0 },
+        max_version: if v15 { 0x10 } else { 0 },
         ..Default::default()
     })
 }
@@ -1775,7 +1813,18 @@ pub const VS_REQ_GET_DEF: u8 = 0x87;
 pub const VS_PROBE_CONTROL: u16 = 0x0100;
 pub const VS_COMMIT_CONTROL: u16 = 0x0200;
 
-/// VS Probe/Commit Control payload (UVC 1.0/1.1 — 26 bytes).
+/// VS Probe/Commit Control payload: 26 bytes for UVC 1.0, 34 bytes for
+/// UVC 1.1+.
+///
+/// Wire layout (little-endian) per UVC 1.5 §4.3.1.1 table 4-47 and
+/// Linux `struct uvc_streaming_control`
+/// (`include/uapi/linux/usb/video.h`): bytes 0..26 are the 1.0 block;
+/// bytes 26..34 are the extension block. The extension block arrived
+/// with UVC 1.1, not 1.5 — the original Linux driver sizes the transfer
+/// `uvc_version >= 0x0110 ? 34 : 26` (`uvc_video.c`, 2008), and UVC 1.5
+/// devices are covered by the same rule. (An earlier in-tree codec
+/// comment claimed a 0x0150 gate; that claim was single-sourced and
+/// unverifiable, and the 0x0110 gate covers the 1.5 case identically.)
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub struct VsProbeCommit {
     /// Bit-field — bit 0 = hint dwFrameInterval, etc. Caller usually
@@ -1795,13 +1844,40 @@ pub struct VsProbeCommit {
     pub delay: u16,
     pub max_video_frame_size: u32,
     pub max_payload_transfer_size: u32,
+    // ── UVC 1.1+ extension fields (bytes 26..34) ────────────────────
+    /// Device clock frequency in Hz, from the VC HEADER descriptor.
+    /// The host offers the device's own clock on PROBE; the device's
+    /// GET_CUR value is what gets committed.
+    pub clock_frequency: u32,
+    /// Framing-information bitmap. The host declares no framing
+    /// requirement (0); the device's GET_CUR value is committed.
+    pub framing_info: u8,
+    /// Preferred payload-format version. This driver implements the
+    /// 1.0 payload header only, so it declares 1.0 (0x10, BCD nibble
+    /// encoding as in `bcdUVC`) for preferred, min, and max; the
+    /// device's GET_CUR values are what get committed. A device
+    /// requiring 1.5 payloads needs reassembler work first.
+    pub preferred_version: u8,
+    pub min_version: u8,
+    pub max_version: u8,
 }
 
 impl VsProbeCommit {
     pub const LEN_V10: usize = 26;
+    pub const LEN_V15: usize = 34;
 
-    /// Serialise into a 26-byte buffer for SET_CUR(PROBE/COMMIT).
-    pub fn encode(&self) -> [u8; Self::LEN_V10] {
+    /// Wire length for a device advertising `bcd_uvc`: 34 bytes for
+    /// UVC 1.1+, 26 bytes otherwise.
+    pub fn len_for(bcd_uvc: u16) -> usize {
+        if bcd_uvc >= 0x0110 {
+            Self::LEN_V15
+        } else {
+            Self::LEN_V10
+        }
+    }
+
+    /// Serialise the 26-byte (UVC 1.0) form for SET_CUR(PROBE/COMMIT).
+    pub fn encode_v10(&self) -> [u8; Self::LEN_V10] {
         let mut b = [0u8; Self::LEN_V10];
         b[0..2].copy_from_slice(&self.hint.to_le_bytes());
         b[2] = self.format_index;
@@ -1817,12 +1893,38 @@ impl VsProbeCommit {
         b
     }
 
-    /// Parse a 26-byte GET_CUR/MIN/MAX/DEF response.
+    /// Serialise the 34-byte (UVC 1.1+) form: the 26-byte block plus
+    /// the extension fields.
+    pub fn encode_v15(&self) -> [u8; Self::LEN_V15] {
+        let mut b = [0u8; Self::LEN_V15];
+        b[..26].copy_from_slice(&self.encode_v10());
+        b[26..30].copy_from_slice(&self.clock_frequency.to_le_bytes());
+        b[30] = self.framing_info;
+        b[31] = self.preferred_version;
+        b[32] = self.min_version;
+        b[33] = self.max_version;
+        b
+    }
+
+    /// Serialise at the length a device advertising `bcd_uvc` expects.
+    /// There is deliberately no bare `encode()`: a length-blind encode
+    /// silently truncates the 1.1+ fields (the defect this lane fixes).
+    pub fn encode_for(&self, bcd_uvc: u16) -> Vec<u8> {
+        if bcd_uvc >= 0x0110 {
+            self.encode_v15().to_vec()
+        } else {
+            self.encode_v10().to_vec()
+        }
+    }
+
+    /// Parse a GET_CUR/MIN/MAX/DEF response of either length. A 26-byte
+    /// response zeroes the extension fields — a 1.0 device's reply must
+    /// never carry stale 1.1+ values into COMMIT.
     pub fn decode(buf: &[u8]) -> Result<Self, UvcError> {
         if buf.len() < Self::LEN_V10 {
             return Err(UvcError::Short);
         }
-        Ok(Self {
+        let mut s = Self {
             hint: u16::from_le_bytes([buf[0], buf[1]]),
             format_index: buf[2],
             frame_index: buf[3],
@@ -1834,7 +1936,16 @@ impl VsProbeCommit {
             delay: u16::from_le_bytes([buf[16], buf[17]]),
             max_video_frame_size: u32::from_le_bytes(buf[18..22].try_into().unwrap()),
             max_payload_transfer_size: u32::from_le_bytes(buf[22..26].try_into().unwrap()),
-        })
+            ..Self::default()
+        };
+        if buf.len() >= Self::LEN_V15 {
+            s.clock_frequency = u32::from_le_bytes(buf[26..30].try_into().unwrap());
+            s.framing_info = buf[30];
+            s.preferred_version = buf[31];
+            s.min_version = buf[32];
+            s.max_version = buf[33];
+        }
+        Ok(s)
     }
 }
 

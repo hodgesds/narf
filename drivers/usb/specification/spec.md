@@ -551,7 +551,9 @@ the USB download itself remains a target-silicon gate.
   FORMAT_UNCOMPRESSED with 16-byte Format-GUIDs (YUY2, NV12), VS
   FRAME_UNCOMPRESSED with both discrete and continuous frame-
   interval forms, VS FORMAT_MJPEG. Bind retains each VideoStreaming alternate's
-  endpoint and bandwidth metadata; the negotiation path performs PROBE/COMMIT,
+  endpoint and bandwidth metadata; the negotiation path performs version-aware
+  PROBE/COMMIT — 26-byte UVC 1.0 for bcdUVC < 0x0110, 34-byte UVC 1.1+
+  (VC HEADER device clock + 1.0 payload-version declaration) otherwise —
   configures the smallest fitting isochronous alternate, and issues
   SET_INTERFACE. Its capture task reassembles UVC payloads and delivers complete
   frames to the registered `/dev/video<N>` queue. STREAMOFF/cancellation and
