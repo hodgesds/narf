@@ -70,6 +70,8 @@ use crate::drm_ioctl_bridge::{copy_in, copy_out};
 use crate::drm_uapi;
 #[path = "amdgpu_cpu_mapping.rs"]
 pub(crate) mod cpu_mapping;
+#[path = "amdgpu_gem_stats.rs"]
+pub(crate) mod stats;
 pub use cpu_mapping::{release_cpu_frame, retain_cpu_frame};
 
 /// First amdgpu GEM handle. Chosen above any plausible dumb-buffer handle so
@@ -247,6 +249,7 @@ static HEAPS: IrqSafeSpinLock<Vec<(u32, VramHeap)>> = IrqSafeSpinLock::new(Vec::
 /// Let clients of DRM card `card` place buffers in `heap`, replacing any
 /// earlier heap. Buffers already created keep their placement.
 pub fn register_vram_heap(card: u32, heap: VramHeap) {
+    stats::register(card);
     let mut heaps = HEAPS.lock();
     heaps.retain(|(c, _)| *c != card);
     heaps.push((card, heap));
@@ -553,6 +556,7 @@ pub struct GemObject {
     /// `tbo.pin_count`: live [`ScanoutPin`]s. A pinned buffer never moves
     /// (no eviction, demotion or suspend eviction) until the last unpin.
     pin_count: AtomicU32,
+    stats: Option<Arc<stats::CardStats>>,
 }
 
 /// One address-stable backing generation. Retain an Arc while raw CPU frames,
@@ -642,6 +646,16 @@ struct Metadata {
 }
 
 impl GemObject {
+    fn record_move(&self) {
+        if let Some(stats) = &self.stats {
+            stats.moved(self.byte_len);
+        }
+    }
+    fn record_eviction(&self) {
+        if let Some(stats) = &self.stats {
+            stats.evicted();
+        }
+    }
     /// Refuse CPU/deferred/unregistered leases before asynchronous copying,
     /// not only at commit: a deferred CPU writer could race staging reads.
     pub(crate) fn check_transfer_source(
@@ -704,6 +718,7 @@ impl GemObject {
             return Err(FsError::Busy);
         }
         *placement = destination;
+        self.record_move();
         Ok(())
     }
     pub fn preferred_domains(&self) -> u64 {
@@ -816,7 +831,12 @@ impl GemObject {
         {
             return Err(FsError::Busy);
         }
-        backing.relocate(to_vram, self.card, self.alignment, self.flags)
+        let before = backing.system;
+        backing.relocate(to_vram, self.card, self.alignment, self.flags)?;
+        if before != backing.system {
+            self.record_move();
+        }
+        Ok(())
     }
 
     pub fn phys(&self) -> u64 {
@@ -1409,7 +1429,9 @@ fn evict_visible_locked(gate: &PlacementGuard, fits: impl Fn() -> bool) {
     let card = gate.card();
     for object in eviction_candidates(card) {
         if !object.system() && !object.pinned() {
-            let _ = object.relocate(false);
+            if object.relocate(false).is_ok() {
+                object.record_eviction();
+            }
             if fits() {
                 return;
             }
@@ -1444,6 +1466,7 @@ pub(crate) async fn evict_all(
         if let Err(error) = crate::amdgpu_vm::relocate(gate, &object, false).await {
             return (touched, Err(error));
         }
+        object.record_eviction();
     }
     (touched, Ok(()))
 }
@@ -1476,7 +1499,12 @@ async fn reclaim_vram_locked(
         if object.system() || excluded.iter().any(|target| Arc::ptr_eq(target, &object)) {
             continue;
         }
-        let _ = crate::amdgpu_vm::relocate(gate, &object, false).await;
+        if crate::amdgpu_vm::relocate(gate, &object, false)
+            .await
+            .is_ok()
+        {
+            object.record_eviction();
+        }
         if reserve_visible(heap, Some(card), flags, size, align).is_ok()
             || (no_cpu
                 && heap.unmapped.as_ref().is_some_and(|u| {
@@ -1758,7 +1786,8 @@ impl GemState {
         }
     }
 
-    fn insert(&self, object: GemObject) -> Result<u32, FsError> {
+    fn insert(&self, mut object: GemObject) -> Result<u32, FsError> {
+        object.stats = stats::for_card(object.card);
         let object = Arc::new(object);
         if let Some(card) = object.card {
             let mut all = CARD_OBJECTS.lock();
@@ -1848,6 +1877,7 @@ impl GemState {
             card: self.card,
             dma_buf,
             pin_count: AtomicU32::new(0),
+            stats: None,
         })
     }
 
@@ -1990,6 +2020,7 @@ impl GemState {
             card: self.card,
             dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
             pin_count: AtomicU32::new(0),
+            stats: None,
         })?;
         Ok((handle, pitch, byte_len))
     }
@@ -2015,6 +2046,7 @@ impl GemState {
             card: self.card,
             dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
             pin_count: AtomicU32::new(0),
+            stats: None,
         };
         let handle = self.insert(object)?;
         Ok((
@@ -2280,6 +2312,7 @@ fn create_locked(
             card: state.card,
             dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
             pin_count: AtomicU32::new(0),
+            stats: None,
         };
         object
             .dma_buf
@@ -2330,6 +2363,7 @@ fn create_locked(
                 card: state.card,
                 dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
                 pin_count: AtomicU32::new(0),
+                stats: None,
             }
         }
         None if domains == u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
@@ -2360,6 +2394,7 @@ fn create_locked(
                 card: state.card,
                 dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
                 pin_count: AtomicU32::new(0),
+                stats: None,
             }
         }
     };
@@ -2449,6 +2484,7 @@ fn userptr(state: &GemState, arg: usize) -> Result<u64, FsError> {
         card: state.card,
         dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
         pin_count: AtomicU32::new(0),
+        stats: None,
     };
     let handle = state.insert(object)?;
     // SAFETY: as above; `handle` is the struct's last field.

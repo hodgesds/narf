@@ -360,6 +360,8 @@ pub mod amdgpu_rdna2_ih;
 pub use amdgpu_rdna2_ih as amdgpu_ih_navi22;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_info;
+#[cfg(feature = "amdgpu")]
+pub(crate) mod amdgpu_info_stats;
 #[path = "amdgpu_info_navi22.rs"]
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_info;

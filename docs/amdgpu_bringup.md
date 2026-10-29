@@ -1,7 +1,7 @@
 # amdgpu bring-up: remaining work
 
-Status as of 2026-10-28, based on `main` at `7542d15c9` (#1197), plus the
-memory-query fixes described below. Evidence below the "Verified on
+Status as of 2026-10-28, based on `main` at `404b23e59` (#1202), plus the
+statistics fixes described below. Evidence below the "Verified on
 hardware" section comes from code review and software tests, including QEMU
 and register/fake-engine models.
 
@@ -32,6 +32,11 @@ Rebuild from the checkout being validated and run
      desktop is up.
 3. **Video.** Once VCN passes: `vainfo --display drm --device
    /dev/dri/renderD128` and `/mesa-amd-video.sh` (prints `VIDEO-OK`).
+4. **Statistics.** Exercise INFO queries through both primary and render
+   nodes at idle and under a rendering workload. Check advancing timestamps,
+   fresh clocks/load/temperature/power/voltage, stable/peak P-states and
+   memory movement/eviction counts. Repeat on RX 9000 when hardware is
+   available; the Navi48/Navi44 coverage below is software-only.
 
 ## Bare-metal boot
 
@@ -58,10 +63,9 @@ IOMMU and timers; xHCI keyboard input; NVMe on the real controller.
 
 1. **Remaining Mesa ABI gaps** (see
    `drivers/gpu/research/navi22-mesa-abi.md` §12):
-   - RDNA2 `TIMESTAMP` and `SENSOR` aren't answered.
    - Fence errors after a GPU reset aren't reported through `WAIT_CS` or
      `WAIT_FENCES`.
-   - GDS/GWS/OA allocations are missing, as are movement/eviction counters.
+   - GDS/GWS/OA allocations are missing.
    - Native RX 6000 scanout supports linear modifiers only; tiled scanout
      needs a separate implementation and hardware validation.
 2. **GFXOFF.** Mark the command-submission path's GC MMIO GFXOFF-safe,
@@ -87,6 +91,20 @@ IOMMU and timers; xHCI keyboard input; NVMe on the real controller.
 
 ## Implemented since the older Mesa gap list
 
+- **Statistics on RX 6000 and RX 9000.** Native primary/render nodes answer
+  TIMESTAMP and the supported Linux SENSOR selectors, including all four
+  stable/peak GFX/MCLK queries. Measurements use fresh SMU telemetry; P-states
+  use actual DPM endpoints and Linux's per-ASIC/board standard-clock rules.
+  RX 9000 queries resume the GPU before taking the owner. VDDNB and separate
+  GPU_INPUT_POWER are unsupported by both Linux dGPU backends and return
+  EINVAL. DPM unavailable returns ENOENT; loss/revocation never returns stale
+  successful data. These paths still need physical Mesa validation.
+- **Memory counters on both families.** NUM_BYTES_MOVED and NUM_EVICTIONS
+  count committed GEM moves and successful pressure/suspend evictions per
+  card. NUM_VRAM_CPU_PAGE_FAULTS is zero because invisible VRAM cannot be
+  CPU-mapped and there is no fault-driven TTM migration path. The u32
+  VRAM_LOST_COUNTER reports completed full native recoveries. Counters
+  survive heap re-registration; failed or no-op moves do not increase them.
 - **Memory queries.** MEMORY and VRAM_GTT report the real
   GEM GTT capacity instead of zero. Live queries use the open's registered
   client VRAM heap for usable sizes and usage instead of assuming all VRAM
@@ -98,9 +116,12 @@ IOMMU and timers; xHCI keyboard input; NVMe on the real controller.
   advertisement, and device-info clock/VRAM/PCIe/MALL fields have code and
   model coverage. Their presence does not establish hardware acceptance.
 
-Validation for the memory changes: the ioctl regression fails before the fix.
-`cargo xtask test --subsystem drivers/gpu` reports 2,640 pass / 0 fail / 5 skip
-with `--arch x86_64`, and 2,094 pass / 0 fail / 1 skip with `--arch aarch64`.
+Validation for the statistics and memory changes: native ioctl, MMIO and SMU
+model regressions cover both families. `cargo xtask test --subsystem drivers/gpu`
+reports 2,650 pass / 0 fail / 5 skip with `--arch x86_64`, and 2,104 pass /
+0 fail / 1 skip with `--arch aarch64`.
+Focused `drivers/gpu/amdgpu/stats,drivers/gpu/gfx12` runs pass 49 / 0 / 0 on
+both architectures, including the final HDP6 register/loss regressions.
 GPU Clippy passes in all three feature contexts on both architectures;
 `cargo fmt --all -- --check` passes. Production boot-smoke and btrfs
 interoperability checks also pass on both architectures.

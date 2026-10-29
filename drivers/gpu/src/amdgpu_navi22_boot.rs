@@ -1072,6 +1072,39 @@ impl ColdBoot {
         let h = &self.sequence.backend;
         crate::amdgpu_rdna2_mmr::read(&h.gpu, &h.authority, payload, cached_gb)
     }
+    pub(crate) fn read_timestamp(&self) -> Result<u64, narf_filesystem::FsError> {
+        if !matches!(self.sequence.state, State::FirmwareReady(_)) {
+            return Err(narf_filesystem::FsError::NoDevice);
+        }
+        let h = &self.sequence.backend;
+        crate::amdgpu_info_stats::timestamp_rdna2(&h.gpu, &h.authority)
+    }
+    pub(crate) fn sensor_dpm_enabled(&self) -> Result<bool, narf_filesystem::FsError> {
+        if !matches!(self.sequence.state, State::FirmwareReady(_)) {
+            return Err(narf_filesystem::FsError::NoDevice);
+        }
+        Ok(self.sequence.backend.power_status.is_some() && self.sequence.backend.smu.is_some())
+    }
+    pub(crate) async fn sensor_pstates(
+        &mut self,
+    ) -> Result<crate::amdgpu_info_stats::Pstates, narf_filesystem::FsError> {
+        if !self.sensor_dpm_enabled()? {
+            return Err(narf_filesystem::FsError::NotFound);
+        }
+        let h = &mut self.sequence.backend;
+        let boot_gfx = h
+            .gpu
+            .vbios
+            .as_ref()
+            .and_then(|v| crate::amdgpu_info::boot_sclk_10khz(v.bytes()))
+            .map(|v| v / 100);
+        h.smu
+            .as_mut()
+            .ok_or(narf_filesystem::FsError::NotFound)?
+            .read_pstates(boot_gfx, u32::try_from(self.boot_mclk_khz / 1000).ok())
+            .await
+            .map_err(crate::amdgpu_info_stats::smu_error)
+    }
     /// # Safety
     /// Caller exclusively owns this physical Navi22 GPU (not an SR-IOV VF), its
     /// PSP/MP1/GC/HDP mailboxes and reset/power controls. Mappings are permanent,

@@ -135,6 +135,43 @@ fn memory_info_tracks_allocations_and_retained_owners() -> TestResult {
         let system = create(&state, 8193, u::AMDGPU_GEM_DOMAIN_GTT);
         let hidden_allocation = hidden.reserve_aligned(4096, 4096).unwrap();
         check(4096, 4096, baseline + 12288);
+        let moved = words(&vm, u::AMDGPU_INFO_NUM_BYTES_MOVED, 1)[0];
+        let evicted = words(&vm, u::AMDGPU_INFO_NUM_EVICTIONS, 1)[0];
+        let object = state.object(vram).unwrap();
+        object.store_u64(0, 0x0123_4567_89ab_cdef).unwrap();
+        let lease = object.mapping();
+        assert_eq!(object.relocate(false), Err(FsError::Busy));
+        assert_eq!(words(&vm, u::AMDGPU_INFO_NUM_BYTES_MOVED, 1), [moved]);
+        drop(lease);
+        object.relocate(false).unwrap();
+        check(0, 4096, baseline + 16384);
+        assert_eq!(
+            words(&vm, u::AMDGPU_INFO_NUM_BYTES_MOVED, 1),
+            [moved + 4096]
+        );
+        assert_eq!(words(&vm, u::AMDGPU_INFO_NUM_EVICTIONS, 1), [evicted]);
+        object.relocate(true).unwrap();
+        assert_eq!(object.load_u64(0), Some(0x0123_4567_89ab_cdef));
+        // Real visible-VRAM pressure evicts the old buffer to make room for
+        // a four-page allocation. An explicit placement move is not eviction.
+        let big = create(&state, 16384, u::AMDGPU_GEM_DOMAIN_VRAM);
+        assert!(object.system());
+        assert_eq!(words(&vm, u::AMDGPU_INFO_NUM_EVICTIONS, 1), [evicted + 1]);
+        close(&state, big);
+        object.relocate(true).unwrap();
+        assert_eq!(object.load_u64(0), Some(0x0123_4567_89ab_cdef));
+        assert_eq!(
+            words(&vm, u::AMDGPU_INFO_NUM_BYTES_MOVED, 1),
+            [moved + 16384]
+        );
+        assert_eq!(words(&vm, u::AMDGPU_INFO_NUM_VRAM_CPU_PAGE_FAULTS, 1), [0]);
+        let lost = ask(&vm, u::AMDGPU_INFO_VRAM_LOST_COUNTER, 16).unwrap();
+        assert!(lost[4..].iter().all(|&b| b == 0xa5));
+        let other = VmState::for_card(CARD + 1);
+        assert_eq!(words(&other, u::AMDGPU_INFO_NUM_BYTES_MOVED, 1), [0]);
+        assert_eq!(words(&other, u::AMDGPU_INFO_NUM_EVICTIONS, 1), [0]);
+        drop(object);
+        check(4096, 4096, baseline + 12288);
         // PRIME import shares the object; handle closure cannot reduce usage
         // until the last owner drops. A foreign open has no VRAM usage.
         let peer = GemState::for_card(CARD);

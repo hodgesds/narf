@@ -1903,6 +1903,14 @@ exercise RDNA2/RDNA4 visible and hidden heaps, GEM allocation/release, retained
 PRIME ownership and short replies. These are software checks; Mesa acceptance
 on the physical GPU remains pending.
 
+RX 6000/RX 9000 statistics now share the native INFO ioctl path for timestamps,
+fresh SMU sensors and all stable/peak GFX/MCLK queries. Each family uses its
+own SMUIO/SMU layout and Linux standard-clock rules; RX 9000 resumes runtime
+PM before taking its owner. Per-card GEM movement/eviction counters record
+only completed backing changes, and recovery counters expose native full
+GPU recoveries. These additions require physical Mesa validation; unsupported
+Linux dGPU sensor selectors remain explicit errors.
+
 Ordinary VRAM-preferred creation now permits Linux's GTT fallback when VRAM
 is unavailable, preserving reported preferences and discardable-domain rules.
 Visible client VRAM now supports pressure eviction to GTT and promotion back

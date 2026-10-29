@@ -577,6 +577,63 @@ impl<I: Io> Engine<I> {
     }
     /// Runtime commands start from a powered state and leave `Runtime` set
     /// while in flight, so cancellation forbids reuse.
+    async fn pstate_max(&mut self, clock: u32, fallback: Option<u32>) -> Result<u32, Error> {
+        if let Some(mhz) = fallback {
+            return crate::amdgpu_info_stats::dpm_mhz(mhz).ok_or(Error::Invalid);
+        }
+        let raw = self.command(0x1f, clock << 16 | 0xff).await?; // GetDpmFreqByIndex
+        let last = crate::amdgpu_info_stats::last_dpm_index(raw).ok_or(Error::Invalid)?;
+        let raw = self.command(0x1f, clock << 16 | last).await?;
+        crate::amdgpu_info_stats::dpm_mhz(raw).ok_or(Error::Invalid)
+    }
+    async fn read_pstates(
+        &mut self,
+        boot_gfx: Option<u32>,
+        boot_memory: Option<u32>,
+    ) -> Result<crate::amdgpu_info_stats::Pstates, Error> {
+        let resume = self.begin_runtime()?;
+        let result = async {
+            let low = u64::from(self.command(0xc, 0).await?);
+            let enabled = low | u64::from(self.command(0xd, 0).await?) << 32;
+            let gfx_fallback = if enabled & (1 << 1) == 0 {
+                Some(boot_gfx.ok_or(Error::Invalid)?)
+            } else {
+                None
+            };
+            let memory_fallback = if enabled & FEATURE_DPM_UCLK == 0 {
+                Some(boot_memory.ok_or(Error::Invalid)?)
+            } else {
+                None
+            };
+            let gfx_max = self.pstate_max(PPCLK_GFXCLK, gfx_fallback).await?;
+            let memory_peak = self.pstate_max(PPCLK_UCLK, memory_fallback).await?;
+            // smu_v14_0_2_populate_umd_state_clk. DriverReportedClocks_t is
+            // 28 bytes immediately before MsgLimits (combo offset 3976).
+            let base = u32::from(u16_at(&self.board, 3948)); // BaseClockAc
+            let game = u32::from(u16_at(&self.board, 3950)); // GameClockAc
+            Ok(crate::amdgpu_info_stats::Pstates {
+                gfx_standard: if base != 0 && base < gfx_max {
+                    base
+                } else {
+                    gfx_max
+                },
+                memory_standard: memory_peak,
+                gfx_peak: if game != 0 && game < gfx_max {
+                    game
+                } else {
+                    gfx_max
+                },
+                memory_peak,
+            })
+        }
+        .await;
+        if result == Err(Error::Invalid) {
+            self.state = resume;
+        } else {
+            self.end_runtime(resume, &result);
+        }
+        result
+    }
     fn begin_runtime(&mut self) -> Result<State, Error> {
         let resume = self.state;
         if !matches!(resume, State::PowerReady | State::DisplayPowerReady) {
@@ -922,6 +979,7 @@ pub struct Smu {
     engine: Engine<Mmio>,
     /// The VBIOS boot UCLK (firmware_info), in MHz.
     boot_uclk_mhz: Option<u32>,
+    boot_gfx_mhz: Option<u32>,
 }
 
 /// `AMDGPU_INFO_DEV_INFO`'s clocks under DPM (amdgpu_dpm_get_sclk/mclk,
@@ -1019,6 +1077,11 @@ impl Smu {
                 .as_ref()
                 .and_then(|v| crate::amdgpu_info::boot_mclk_10khz(v.bytes()))
                 .map(|clock| clock / 100),
+            boot_gfx_mhz: gpu
+                .vbios
+                .as_ref()
+                .and_then(|v| crate::amdgpu_info::boot_sclk_10khz(v.bytes()))
+                .map(|clock| clock / 100),
         })
     }
     pub fn state(&self) -> State {
@@ -1029,6 +1092,13 @@ impl Smu {
     }
     pub fn power_status(&self) -> Option<PowerStatus> {
         self.engine.power
+    }
+    pub(crate) async fn read_pstates(
+        &mut self,
+    ) -> Result<crate::amdgpu_info_stats::Pstates, Error> {
+        self.engine
+            .read_pstates(self.boot_gfx_mhz, self.boot_uclk_mhz)
+            .await
     }
     pub async fn verify(&mut self) -> Result<Versions, Error> {
         self.engine.verify().await
