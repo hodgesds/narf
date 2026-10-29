@@ -461,7 +461,11 @@ factory/PG gain and current power/source admission. The submit path is the
 highest rate (`rtl_get_tcb_desc` hw_rate); once the firmware owns an RA mask
 (below) and a separately signed NEFB grant is current, ordinary DATA may
 fall back to lower rates of that same mask. No
-additional response rate is inferred.
+additional response rate is inferred. The operational MAC also programs Linux's station
+`rtl_op_add_interface` `HW_VAR_RETRY_LIMIT`: `REG_RL` (0x42a) = short 0x30
+[15:8] | long 0x30 [7:0] with readback (`packet_mac::configure`), so the
+firmware RA/NEFB fallback chain runs on Linux's retry limits rather than the
+reset values (closes `adaptive_retry_control`).
 The exact retained signed calibration invocation encloses allocation,
 descriptor/body publication and doorbell, with fresh host policy inside it.
 

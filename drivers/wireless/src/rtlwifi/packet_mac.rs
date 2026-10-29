@@ -8,6 +8,9 @@ use super::{efuse::Factory, firmware_transport::Io, prepare::Error, radio};
 // APPFCS is explicit: the native RX adapter removes exactly four FCS bytes.
 pub(super) const RCR: u32 = 0xf000_780e;
 pub(super) const TCR: u32 = (1 << 9) | (1 << 15);
+/// `REG_RL` and the station `retry_limit` (0x30) in both short and long.
+pub(super) const REG_RL: u16 = 0x042a;
+pub(super) const RETRY_LIMIT: u16 = (0x30 << 8) | 0x30;
 
 fn word(io: &impl Io, reg: u16, value: u16) -> Result<(), Error> {
     io.write_bytes(reg, &value.to_le_bytes())?;
@@ -64,6 +67,9 @@ pub(super) fn configure(io: &impl Io, factory: &Factory) -> Result<(), Error> {
     byte(io, 0x4d0, 0)?; // No AMPDU/early-mode prefix in this profile.
     byte(io, 0x4d3, 0)?;
     byte(io, 0x652, 235)?; // Linux NAV upper bound ceil(30000/128).
+                           // rtl_op_add_interface (station): HW_VAR_RETRY_LIMIT with retry_limit
+                           // 0x30 -> REG_RL short [15:8] | long [7:0] (rtl8188ee/hw.c set_hw_reg).
+    word(io, REG_RL, RETRY_LIMIT)?;
     for (offset, value) in factory.mac.iter().copied().enumerate() {
         byte(io, 0x610 + offset as u16, value)?;
     }
