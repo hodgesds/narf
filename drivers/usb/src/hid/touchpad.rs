@@ -53,6 +53,7 @@ use narf_input::{
 };
 use narf_lib::sync::IrqSafeSpinLock;
 
+use crate::hid::identity::{apply_identity, resolve_usb_identity, BindTopology};
 use crate::hid::HidError;
 use crate::xhci::{EndpointConfig, EndpointKind, Xhci};
 
@@ -203,7 +204,7 @@ pub async fn try_bind_touchpad_already_addressed(
     hid_desc_off: usize,
     cfg: &[u8],
     ep: EndpointConfig,
-    hub_port: Option<(usize, u8)>,
+    topo: BindTopology,
 ) -> Result<(), HidError> {
     let report_len = report_descriptor_length(cfg, hid_desc_off).ok_or(HidError::NoInterruptIn)?;
     if report_len == 0 || report_len > 4096 {
@@ -326,16 +327,31 @@ pub async fn try_bind_touchpad_already_addressed(
     // Register with the evdev ROUTER as a relative-motion pointer device.
     // The PTP driver emits relative (dx, dy) via the first-contact diff,
     // so REL_X/REL_Y is the right evdev type. Mirrors i8042_mouse.rs::init().
+    // Identity (#874) is best-effort: on descriptor-fetch failure
+    // the synthetic caps below stand and the bind proceeds.
+    // No MT adoption: this touchpad is relative-mode only;
+    // MtEvdevState is used only by the I2C-HID touch driver.
     let mut caps = DeviceCaps::new();
     caps.add_rel(rel::REL_X);
     caps.add_rel(rel::REL_Y);
+    if let Some(id) = resolve_usb_identity(
+        xhci_dev,
+        slot_id,
+        topo.port,
+        topo.hub_port,
+        "USB HID Touchpad",
+    )
+    .await
+    {
+        apply_identity(&mut caps, &id);
+    }
     let (evdev_id, evdev_node) = ROUTER.register_device(caps);
 
     let pad = Arc::new(PtpTouchpad {
         slot_id,
         interrupt_in_dci: dci,
         interface_num,
-        hub_port,
+        hub_port: topo.hub_port,
         profile,
         last_xy: IrqSafeSpinLock::new(None),
         last_button: IrqSafeSpinLock::new(false),
