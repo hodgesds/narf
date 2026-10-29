@@ -152,8 +152,9 @@ fn smoke_port_kind_exhaustive() -> TestResult {
         WwanPortKind::Mbim,
         WwanPortKind::Qmi,
         WwanPortKind::Data,
+        WwanPortKind::Dss,
     ];
-    let expected_names = ["AtCmd", "Mbim", "Qmi", "Data"];
+    let expected_names = ["AtCmd", "Mbim", "Qmi", "Data", "Dss"];
 
     for (kind, expected) in kinds.iter().zip(expected_names.iter()) {
         // Exhaustive match — compiler errors if a variant is missing.
@@ -162,6 +163,7 @@ fn smoke_port_kind_exhaustive() -> TestResult {
             WwanPortKind::Mbim => "Mbim",
             WwanPortKind::Qmi => "Qmi",
             WwanPortKind::Data => "Data",
+            WwanPortKind::Dss => "Dss",
         };
         if name != *expected {
             return TestResult::Fail("WwanPortKind name mismatch");
@@ -1087,7 +1089,9 @@ fn smoke_mbim_dss_datapath() -> TestResult {
 
     // RX: DSS datagram for session 3 lands in the DSS queue, and
     // partial reads preserve the datagram remainder in order.
-    bearer::deliver_ntb(bearer_idx, &dss_ntb).map_err(|_| "deliver DSS NTB failed")?;
+    if bearer::deliver_ntb(bearer_idx, &dss_ntb).is_err() {
+        return TestResult::Fail("deliver DSS NTB failed");
+    }
     let mut buf = [0u8; 32];
     match port.recv(&mut buf[..3]) {
         Ok(3) if &buf[..3] == b"AT+" => {}
@@ -1104,8 +1108,9 @@ fn smoke_mbim_dss_datapath() -> TestResult {
 
     // An IPS datagram at the SAME numeric session id does not land
     // in the DSS queue: separate namespaces, no cross-delivery.
-    bearer::deliver_ntb(bearer_idx, &fake_ntb(3, b"10.0.0.1"))
-        .map_err(|_| "deliver IPS NTB failed")?;
+    if bearer::deliver_ntb(bearer_idx, &fake_ntb(3, b"10.0.0.1")).is_err() {
+        return TestResult::Fail("deliver IPS NTB failed");
+    }
     match port.recv(&mut buf) {
         Ok(0) => {}
         _ => return TestResult::Fail("IPS datagram leaked into the DSS queue"),
@@ -1114,7 +1119,9 @@ fn smoke_mbim_dss_datapath() -> TestResult {
     // DSS for an unregistered session is dropped + counted, never
     // misrouted into the session-3 queue.
     let dss4 = bearer::build_mbim_dss_ntb(10, 4, b"noise");
-    bearer::deliver_ntb(bearer_idx, &dss4).map_err(|_| "deliver unregistered DSS NTB failed")?;
+    if bearer::deliver_ntb(bearer_idx, &dss4).is_err() {
+        return TestResult::Fail("deliver unregistered DSS NTB failed");
+    }
     if bearer::bearer_dss_drop_counters(bearer_idx) != Some(1) {
         return TestResult::Fail("unregistered DSS drop not counted");
     }
@@ -1124,8 +1131,9 @@ fn smoke_mbim_dss_datapath() -> TestResult {
     }
 
     // TX: the port's payload leaves DSS-signed on the data channel.
-    port.send(b"hello-dss")
-        .map_err(|_| "DSS port send failed")?;
+    if port.send(b"hello-dss").is_err() {
+        return TestResult::Fail("DSS port send failed");
+    }
     let sent = sent.lock();
     if sent.len() != 1 {
         return TestResult::Fail("DSS TX produced no NTB");
